@@ -443,16 +443,22 @@ def _digest(v: Any) -> str:
     return json.dumps(v, sort_keys=True)
 
 
-def _set_since(key_ts: float) -> bool:
-    """Whether the key was set (or cleared) again after `key_ts`, by the account settings log."""
+def _last_set() -> str:
+    """The account settings log's last line for the key (its digest; "" for none): a record keeps the one it
+    began under, so a new line re-arms it whatever the clocks say (the log rounds its stamps to the ms)."""
     from . import accountset
     rec = accountset.last(KEY)
-    return bool(rec) and float(rec.get("ts") or 0) > key_ts
+    return _digest(rec) if rec else ""
 
 
 def _armed(b: dict) -> bool:
     """Whether breaker record `b` is stale: the key's value changed, or it was set again, since it began."""
-    return _digest(_raw()) != b.get("value") or _set_since(float(b.get("since") or 0))
+    if _digest(_raw()) != b.get("value"):
+        return True
+    if "set" in b:
+        return _last_set() != b["set"]
+    from . import accountset   # a record from before "set" was kept: by the log line's stamp
+    return float((accountset.last(KEY) or {}).get("ts") or 0) > float(b.get("since") or 0)
 
 
 def tripped() -> dict | None:
@@ -481,7 +487,7 @@ def _breaker(start_fail: dict | None, now: float | None = None) -> dict | None:
         fcntl.flock(lk, fcntl.LOCK_EX)
         b = _read(d / BREAKER)
         if not b or _armed(b):
-            b = {"since": now, "value": _digest(_raw()), "count": 0, "jobs": []}
+            b = {"since": now, "value": _digest(_raw()), "set": _last_set(), "count": 0, "jobs": []}
         if b.get("tripped"):
             return None   # paused: only the user's setting re-arms it, never a job that still ended
         if start_fail is None:

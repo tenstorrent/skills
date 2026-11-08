@@ -1652,7 +1652,7 @@ def status_text(p: Project, verbose: bool = False) -> str:
     # Routine diagnostics print only with --verbose; a line that reports an anomaly always prints.
     from . import checkcap, checkjoin, checklane, checkspill, heal, locks, shared, slurmcheck, testslots
     if verbose:
-        if host := checkcap.line():
+        if host := checkcap.line(activity=True):
             lines.append(host)
         lines.extend(testslots.use_lines())
         lines.extend(checklane.lane_lines(p.name, p.config(), now))
@@ -1691,8 +1691,7 @@ def status_text(p: Project, verbose: bool = False) -> str:
     from . import eta
     try:   # urgent tasks and open promises with their expected finish (critical path)
         lane = {t["id"] for t in db.q("SELECT id FROM tasks WHERE status IN ('queued','review')")}
-        got = ["  " + x[2:] for x in eta.state_lines(db, p, now)[1:]   # the urgent lane below shows its own
-               if not (m := re.match(r"- #(\d+) ", x)) or int(m[1]) not in lane]
+        got = ["  " + x[2:] for x in eta.state_lines(db, p, now, skip=lane)[1:]]   # the urgent lane below shows its own
         if got:
             lines += ["expected finish (critical path, measured medians):"] + got
     except Exception as e:
@@ -2159,9 +2158,10 @@ def cmd_eta(a) -> None:
         die("no tt-project project here; name one: `ttp eta <task> <name>`")
     ref, now = str(a.target).lstrip("#"), time.time()
     if ref.isdigit():
-        e = eta.estimate(p.db, int(ref), now, core=eta.core_of(p))
+        e = eta.estimate(p.db, int(ref), now, core=eta.core_of(p), delivery=p.config().get("delivery"))
     elif (o := obligations.get(p.db, ref)) is not None:
-        e = eta.obligation_estimate(p.db, o, now, eta._Est(p.db, now, core=eta.core_of(p)))
+        e = eta.obligation_estimate(p.db, o, now, eta._Est(p.db, now, core=eta.core_of(p),
+                                                           delivery=p.config().get("delivery")))
     else:
         die(f"not a task id or obligation: {a.target}")
     if a.json:
@@ -3022,8 +3022,9 @@ def _commands_hash(cmds: list) -> str:
     return hashlib.sha256(json.dumps([_command_key(c) for c in cmds]).encode()).hexdigest()
 
 
-def _spill_to(todo: list, host: str, cfg: dict | None = None) -> list:
-    """`todo` run on spill host `host` (checkspill, push.spill_to), each local check marked `spilled`: its
+def _spill_to(todo: list, host: str, cfg: dict | None = None, workers: int = 0) -> list:
+    """`todo` run on spill host `host` (checkspill, push.spill_to), with `workers` test workers there when
+    given (checkspill.workers_env, exported as is and no part of the pass key), each local check marked `spilled`: its
     pass is recorded, and found, under the same key as a run here (_command_key), so a later local `ttp checks`
     of the same tree (a review's pre-started checks, the reviewer's own) reuses it instead of running
     the suite again. A check that may not spill (it runs an agent CLI or says "host": "local":
@@ -3040,6 +3041,8 @@ def _spill_to(todo: list, host: str, cfg: dict | None = None) -> list:
         c = push.spill_to([was], host, cfg)[0]
         if not push.remote_host(was) and isinstance(c, push.Check):
             c.spilled = True
+            if grant := checkspill.workers_env(workers):   # the check's own literal env wins
+                c.literal_env = tuple(sorted({**grant, **dict(getattr(c, "literal_env", ()) or ())}.items()))
         out.append(c)
     return out
 
@@ -3080,6 +3083,47 @@ def _recorded_pass(p: Project | None, tree: str, cmds: list, purpose: str = "can
                 envs is None or (isinstance(e.get("envs"), list) and e["envs"][:len(envs)] == list(envs))):
             return e
     return None
+
+
+CHECKS_RESUME_DIR = "checks_resume"   # under the project's state: a `ttp checks` check's passed test files
+
+
+def _checks_resumes(c) -> bool:
+    """Whether check `c` resumes from its passed files after a preemption (_checks_resume): one plain local
+    pytest run (pushpass.resumable) with no pytest-xdist option in it or PYTEST_ADDOPTS (the resume plugin
+    is off under xdist)."""
+    import shlex
+    from . import push, pushpass, testslots
+    if not pushpass.resumable(c) or push.remote_host(c) or getattr(c, "slurm", None):
+        return False
+    try:
+        words = shlex.split(f"{c} {os.environ.get('PYTEST_ADDOPTS', '')}")
+    except ValueError:
+        return False
+    return not any(w in testslots.XDIST_OPTS or w.startswith(("--numprocesses=", "--dist=", "--maxprocesses="))
+                   or w.startswith("-n") and not w.startswith("--") for w in words)
+
+
+def _checks_resume(p: Project | None, top: str | Path, tree: str, c, run_env: dict) -> tuple[dict, int]:
+    """(the variables that load the resume plugin for check `c`, how many of its test files it skips). Its
+    record (pushpass.resume_env) is keyed on the tree, the command and its env as a pass records it
+    (pushpass.check_envs), so a changed tree or env starts afresh. Only a preempted run's rerun
+    (checkcap.RESUME_ENV) skips the files passed there; any other run starts the record empty, so a failed
+    or cut run's rerun runs everything. ({}, 0) for a check that cannot resume (_checks_resumes)."""
+    from . import checkcap, pushpass
+    if not p or not tree or not _checks_resumes(c):
+        return {}, 0
+    try:
+        eid = pushpass.check_envs(Path(top), [c], run_env)[0]
+    except (OSError, ValueError, TypeError):
+        return {}, 0
+    path = p.state / CHECKS_RESUME_DIR / f"{pushpass.key(tree, str(c), eid)}.txt"
+    if not os.environ.get(checkcap.RESUME_ENV):
+        path.unlink(missing_ok=True)
+    try:
+        return pushpass.resume_env(path, run_env), len(pushpass.resumed(path))
+    except OSError:
+        return {}, 0
 
 
 def _suite_pass(p: Project | None, tree: str, cmd, purpose: str, env: str | None) -> dict | None:
@@ -3438,6 +3482,17 @@ def cmd_checks(a) -> None:
         sys.exit(0 if checkgaps.ready(p, a.gap, getattr(a, "gap_config", None)) else 1)
     if a.result:
         sys.exit(_checks_passed(Path(a.result)) if a.passed else _checks_result(Path(a.result)))
+    if getattr(a, "reap", False):
+        from . import leftoverchecks
+        p = here()
+        if not p:
+            die("ttp checks --reap: no project found")
+        from .daemon import log as daemon_log
+        for r in leftoverchecks.reap(p, dry_run=a.dry_run):
+            print(r["text"])
+            if not a.dry_run:
+                daemon_log(p, r["text"])   # as the daemon's pass logs it
+        sys.exit(0)
     if getattr(a, "settle", None):
         sys.exit(_checks_settle(Path(a.settle), a.head))
     if a.cmd[:1] and a.cmd[0] in checksqueue.ACTIONS:   # park, cancel, resume a queued run; list the queue
@@ -3449,9 +3504,10 @@ def cmd_checks(a) -> None:
     if getattr(a, "env_ok", None) is not None:
         sys.exit(_checks_env_ok(here(), a.env_ok))
     if getattr(a, "preempt", None):
-        from . import checkcap
+        from . import checkcap, checklane
         p = here()
-        ok, line = checkcap.ask_preempt(a.preempt, checkcap.label(p.name if p else None, "ttp checks --preempt"))
+        ok, line = checkcap.ask_preempt(a.preempt, checkcap.label(p.name if p else None, "ttp checks --preempt"),
+                                        checklane.run_owners(p.name, a.preempt) if p else ())
         print(f"ttp checks: {line}")
         sys.exit(0 if ok else 1)
     if getattr(a, "freeze_lock", None):
@@ -3473,6 +3529,8 @@ def cmd_checks(a) -> None:
     cfg = p.config() if p and p.exists() else {}
     if not (p and p.exists()):
         p = None
+    from . import checkcap
+    checkcap.adopt_identity(p.base if p else None)   # no TTP_TASK: the project run it was started under, if any
     from . import hostcycle
     if cyc := hostcycle.hold(p):   # a planned cycle of this host would cut them short
         print(f"ttp checks: not started, {hostcycle.hold_line(cyc, p)}. Commit and hand off `waiting` with a "
@@ -3589,13 +3647,16 @@ def cmd_checks(a) -> None:
     fallback, fb_lane, fell_back = ("", (), ""), (), {}
     if mine:   # checks.wrap_cmd: the project's own lock or queue wrapper (never the project checks)
         try:
-            wrap, after = push.wrap_of(cfg), push.wrap_lane_of(cfg) == "after"
+            wrap, after = push.wrap_of(cfg, top, p), push.wrap_lane_of(cfg) == "after"
         except ValueError as e:
             die(f"ttp checks: {e}; the commands after `--` were not run", 1)
         from . import checklane
         # checks.wrap_lane "after": the wrapper lock's lane is taken inside the wrapper, once it holds its lock.
         # A command that needs no device (--no-device, checks.no_device_cmds) runs without the wrapper.
         nodev = lambda c: checklane.no_device(c, cfg, bool(getattr(a, "no_device", False)))
+        if not wrap and push.wrap_of(cfg):
+            print(f"ttp checks: {push.WRAP_KEY} is scoped to other repositories (its repos): the commands after "
+                  "`--` run here without it")
         mine = push.with_wrap(mine, wrap, _wrap_lane_step(p, Path(run_dir), wrap) if wrap and after and p else (),
                               nodev)
         wrapped = {str(c) for c in mine if getattr(c, "wrap", None)}   # their run takes the lock's lane
@@ -3906,7 +3967,7 @@ def cmd_checks(a) -> None:
         if spilled:
             if slurm := getattr(spilled, "slurm", None):   # one batch job per check, --time from the run's median
                 minutes = slurmcheck.time_min(checklane.median_s(p.state, _commands_hash(todo)), slurm)
-            todo = _spill_to(todo, spilled.host, cfg)
+            todo = _spill_to(todo, spilled.host, cfg, getattr(spilled, "workers", 0))
             for c in todo if slurm else []:
                 if getattr(c, "spill_host", ""):   # a check split off to run here stays off Slurm
                     c.slurm, c.time_min = slurm, minutes
@@ -3971,7 +4032,9 @@ def cmd_checks(a) -> None:
                     said_last = (f"this task's last checks run (run {last.get('run') or '?'} on "
                                  f"{str(last.get('head') or '')[:12]}) was stopped "
                                  + (f"after no output for {checkwall.span(float(last['silent_s']))}"
-                                    if last.get("silent_s") else "at the wall-time cap") + ": a timeout, not a pass")
+                                    if last.get("silent_s") else "behind checks.wrap_cmd at the wall-time cap before "
+                                    "any test started" if last.get("queued") else "at the wall-time cap")
+                                 + ": a timeout, not a pass")
                     print(f"ttp checks: {said_last}", flush=True)
                     out.write(f"ttp checks: {said_last}\n")
             # Once they all passed, each check's pass is recorded before the rerun of the added tests (a
@@ -4002,6 +4065,14 @@ def cmd_checks(a) -> None:
                        "PWD": cwd, **({checkreap.MARKER: reap_tok} if reap_tok else {}),
                        **({pooladmit.WALL_ENV: f"{ran_since:.0f}:{wall:.0f}"} if deadline else {})}
                 judge_env = dict(env)   # a rerun of the failing tests records no suite durations
+                # A plain local pytest run records the files it passed: a preempted run's rerun skips them.
+                resume_vars, resumed_files = _checks_resume(p, top, tree, c, run_env)
+                env |= resume_vars
+                if resumed_files:
+                    line = (f"resuming {c}: {resumed_files} test file(s) passed on tree {tree[:12]} before the preemption; "
+                            "running the rest")
+                    print(f"ttp checks: {line}", flush=True)
+                    out.write(f"ttp checks: {line}\n")
                 if pushpass.resumable(c) and not push.remote_host(c):   # one plain local pytest run
                     env |= slowtests.env(Path(run_dir) / slowtests.FILE, env)
                 def said(line: str) -> None:   # a script it runs was rewritten as it ran: once more
@@ -4012,11 +4083,17 @@ def cmd_checks(a) -> None:
                     check_start = out.tell()
                 began = time.monotonic()
                 loss_reruns = torn_reruns = setup_reruns = 0
-                took = [0.0]
+                took, runs = [0.0], [0]
 
                 def run_once():   # one run of the check; the run's deadline moves by any cap extension
                     nonlocal deadline
                     t0 = time.monotonic()
+                    if runs[0] and (record := resume_vars.get("TTP_PYTEST_RESUME")):
+                        try:   # a rerun after a fault in this run runs every file again
+                            durable_write(Path(record), "")
+                        except OSError:
+                            pass
+                    runs[0] += 1
                     try:
                         return _run_check(_low_priority(push.check_argv(c, cwd, env, commit=head)), group, record=reap_rec, cwd=cwd,
                                           stdout=out,
@@ -4087,12 +4164,15 @@ def cmd_checks(a) -> None:
                     break
                 except subprocess.TimeoutExpired:
                     # Past the wall-time cap: _run_check ended its group and what it left; never a pass.
+                    # Behind checks.wrap_cmd with no test started yet: it only queued (a wrapper or queue timeout).
                     passed, failed, rc = False, c, checkwall.RC
                     ext_s = wall_ext.granted if wall_ext else 0.0
                     how = wall_how + (f", extended by {checkwall.span(ext_s)}" if ext_s else "")
                     timed_out = {"check": str(c), "cap_s": wall + ext_s, "how": how, "head": head,
-                                 "run": os.environ.get("TTP_RUN_ID") or "?"}
-                    out.write(f"ttp checks: {checkwall.said(str(c), wall + ext_s, how, head)}\n")
+                                 "run": os.environ.get("TTP_RUN_ID") or "?",
+                                 **({"queued": True} if str(c) in wrapped and not push.remote_host(c)
+                                    and not checkwall.test_started(_log_since(out, log, check_start)) else {})}
+                    out.write(f"ttp checks: {checkwall.said_for(timed_out)}\n")
                     out.write(_check_took(c, rc, began))
                     break
                 if rc != 0:
@@ -4202,6 +4282,7 @@ def cmd_checks(a) -> None:
             out.flush()
             print(f"ttp checks: {said}", flush=True)
             os.environ[checkcap.PREEMPTED_ENV] = preempted_by
+            os.environ[checkcap.RESUME_ENV] = "1"   # its plain pytest checks resume from their passed files
             try:   # its task's notes: the run is told, and its own retry (this rerun) goes on
                 durable_append(Path(run_dir) / "progress.md", f"{timefmt.clock()} checks: {said}\n")
             except OSError:
@@ -4297,6 +4378,15 @@ def cmd_checks(a) -> None:
                                                              "commands": todo, "skipped": skipped, "ts": time.time(),
                                                              "purpose": purpose, "infra_fault": setupfault.INFRA})
             print(f"ttp checks: {said}", file=sys.stderr)
+            sys.exit(75)
+        # Behind checks.wrap_cmd, stopped at the wall-time cap before any test started: no verdict (checkwall).
+        if timed_out and timed_out.get("queued") and not passed and not _CHECK_STOP.get("stopped"):
+            said = checkwall.said_for(timed_out)
+            write_json(Path(run_dir) / prguard.CHECKS_FILE, {"head": head, "worktree": top, "passed": False,
+                                                             "commands": todo, "skipped": skipped, "ts": time.time(),
+                                                             "purpose": purpose, "timed_out": timed_out,
+                                                             "infra_fault": checkwall.QUEUED_INFRA})
+            print(f"ttp checks: {said} (full output: {log})", file=sys.stderr)
             sys.exit(75)
         # The gate's rerun found no slot (an admission timeout): no verdict, never a failure of the head.
         if gate_busy is not None and not passed and not _CHECK_STOP.get("stopped"):
@@ -4926,8 +5016,9 @@ def _checks_lane_status(as_json: bool) -> int:
     top = subprocess.run(["git", "-C", str(Path.cwd()), "rev-parse", "--show-toplevel"], capture_output=True,
                          text=True).stdout.strip()
     here_repo = testslots.repo_key(top) if top else ""
-    from . import checkjoin, checkspill, diskgate, hostload, slurmcheck
+    from . import checkcap, checkjoin, checkspill, diskgate, hostload, slurmcheck
     followers = checkjoin.status_lines(p.state)
+    holders = checkcap.holder_activity()   # whether each host-wide slot holder runs tests now
     disk = diskgate.reading()   # new local runs held while the disk is saturated: why, with the values   # joined or superseded waiters: they run no suite of their own
     load = hostload.snapshot(p.config())
     names = {"": p.root.name, **({here_repo: testslots.repo_name(top) or here_repo} if here_repo else {})}
@@ -4940,6 +5031,7 @@ def _checks_lane_status(as_json: bool) -> int:
                           "slurm_paused": slurmcheck.tripped(),
                           "hosts": {**load, "overloaded": hostload.overloaded(load)},
                           "disk": disk,
+                          "host_holders": holders,
                           "followers": [x.strip() for x in followers]},
                          indent=2))
     else:
@@ -4950,6 +5042,9 @@ def _checks_lane_status(as_json: bool) -> int:
         print("check runs per host:")
         print("\n".join(f"  {line}" for line in hostload.lines(s=load)))
         print(f"  {diskgate.line(disk)}")
+        if holders:
+            print("host-wide checks slot holders:")
+            print("\n".join(f"  {checkcap.activity_text(a)}" for a in holders))
         if followers:
             print("following another run of their task (checkjoin), no suite of their own:")
             print("\n".join(followers))
@@ -5016,7 +5111,7 @@ def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: boo
         tell("light checks only (syntax, lint, format or validation: checklane, checks.light_cmds, --light): "
              "running now, outside the project's checks slot")
         return checkcap.Slot()
-    prio, owns = checkcap.task_rank(p)
+    prio, owns = checkcap.task_rank(p or checkcap.adopted_project())
     cfg = p.config() if p else {}
     from . import testslots
     repo = testslots.repo_key(top) if p else ""
@@ -5033,21 +5128,27 @@ def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: boo
     first = True
     # An urgent run never waits behind routine ones (checkcap: urgent slots): it tries the pool's hosts at once
     # (a first bound of 0 s here), then, with none free, a reserved urgent slot here, before the Slurm overflow.
-    urgent = checkcap.is_urgent(prio)
+    urgent = checkcap.is_urgent(prio) and p is not None   # an adopted task's run never takes an urgent slot
     pool_first = urgent and spill_to and bool(checkspill.hosts(cfg))
     moved = _HeadMoved(top, head)   # its task replacing the head while it waits drops the run
     while True:
         limit = max(0.0, checkcap.FOREGROUND_WAIT_S - (time.time() - start)) if foreground and p else None
         spill_cfg = p.config() if spill_to else {}
-        # A disk saturated by writes holds new local runs (diskgate): the spill hosts are tried before any
-        # wait here; after it, each bound below tries them again.
-        if spill_to and first and checkspill.hosts(spill_cfg) and (disk := diskgate.saturated()):
-            tell(f"{disk}: trying the spill hosts first")
+        # Spill first (checkspill.first), and while this host's disk is saturated by writes (diskgate, which
+        # holds new local runs): the spill hosts are tried before any place here; after it, each bound below
+        # tries them again, so a run held here by the load guard or a cap still goes to a host with room.
+        if spill_to and first and checkspill.hosts(spill_cfg) and (
+                (disk := diskgate.saturated()) or checkspill.first(spill_cfg)):
+            why_here = (f"{disk}: trying the spill hosts first" if disk else
+                        f"spill first (delivery.{checkspill.FIRST_KEY}): this machine keeps only checks that cannot spill")
+            if disk:
+                tell(why_here)
             if (claim := checkspill.pick(p, spill_cfg, lambda line: line in told or (told.add(line), tell(line)),
-                                         what, spill_off)) is not None:
+                                         what, spill_off, why_here)) is not None:
                 slot = checkcap.Slot()
                 slot.spill = claim
                 return slot
+            pool_first = False   # the pool was just tried: an urgent run takes its urgent slot here next
         first = False
         if spill_to:   # a bounded wait here, then the spill hosts, then wait again in the same place
             bound = 0.0 if pool_first else checkspill.after_s(spill_cfg)
@@ -5181,7 +5282,7 @@ def _checks_slot_take(p, run_dir: Path, out, head: str, tell, waiting, limit: fl
             raise checksqueue.Parked()
         if restart and (new := checkcap.upgraded()):
             raise checkcap.Upgraded(new)
-        if restart and (rank := checkcap.reranked(p, prio)) is not None:   # its task turned urgent: queue as urgent
+        if restart and (rank := checkcap.reranked(p, prio)) is not None:   # its task's priority changed: queue at it
             raise checkcap.Reranked(str(rank))
         return (yielder() if yielder else "") or ""
 
@@ -5267,15 +5368,15 @@ def _checks_slot_take(p, run_dir: Path, out, head: str, tell, waiting, limit: fl
             left = max(0.0, limit - (time.time() - t0)) if limit is not None else None
             testslots.lane_waits(suite, "a host-wide checks slot")   # held, not running yet: status says why
             lane_at = time.time()   # the waits log counts only the time after it as the host's (throughput)
-            slot = kept_slot if kept_slot is not None else checkcap.acquire(checkcap.label(p.name if p else None), f"ttp checks on {head[:12]}", tell,
+            slot = kept_slot if kept_slot is not None else checkcap.acquire(checkcap.label(checkcap.queue_name(p)), f"ttp checks on {head[:12]}", tell,
                                     waiting, left, arrived,
-                                    p.name if p else None, prio, same, done, stop,
+                                    checkcap.queue_name(p), prio, same, done, stop,
                                     p.state if p else None, owns, cap=checklane.project_cap(cfg), lane_at=lane_at,
                                     startable=startable,
                                     parks=lambda on: testslots.lane_waits(
                                         suite, testslots.PARKED_WAITS if on else "a host-wide checks slot"),
                                     urgent=urgent, preemptible=checkcap.preemptible(cmds, lock),
-                                    small=checkcap.is_small(run_cost))
+                                    small=checkcap.is_small(run_cost), progress=_checks_progress(out, cmds))
             kept_slot = None
             if slot is None or slot.served:
                 suite.close()
@@ -5285,7 +5386,7 @@ def _checks_slot_take(p, run_dir: Path, out, head: str, tell, waiting, limit: fl
             # in the foreground none free by the end of the same wait hands over to detached checks too.
             left = max(0.0, limit - (time.time() - t0)) if limit is not None else None
             testslots.lane_waits(suite, testslots.SLOT_WAITS)
-            slot.tests = testslots.acquire(checkcap.label(p.name if p else None), tell, left,
+            slot.tests = testslots.acquire(checkcap.label(checkcap.queue_name(p)), tell, left,
                                            p.config() if p else {}, p.name if p else "",
                                            push_key=checkcap.urgent_key(slot), priority=prio, stop=stop,
                                            since=arrived, full=True,   # a full run waits for checks.test_run_min
@@ -5315,7 +5416,7 @@ def _checks_slot_take(p, run_dir: Path, out, head: str, tell, waiting, limit: fl
                 time.sleep(testslots.poll_s(testslots.POLL_S))
         slot.tests.files += suite.files   # the suite lock ends with the run's test slots
         slot.suite = suite   # its label shows the run's wall-time cap (testslots.suite_running)
-        if not os.environ.get(testslots.HELD_ENV) and (ports := testslots.port_block(checkcap.label(p.name if p else None))):
+        if not os.environ.get(testslots.HELD_ENV) and (ports := testslots.port_block(checkcap.label(checkcap.queue_name(p)))):
             slot.tests.files.append(ports[0])   # the run's own ports, freed with its test slots
             slot.tests.extra.update(ports[1])
         return slot
@@ -5365,8 +5466,8 @@ def _checks_reexec(new: str, arrived: float | None, prio, spill: bool, tell, out
     granted (`slot`, checkcap.keep_slot: no other waiter takes it in between) and queues again for the
     rest at its arrival time `arrived` and its task's priority `prio`, so it keeps its place. Called only
     while it waits, holding nothing else; returns only when the exec failed, with the lanes and the slot
-    let go (freed as a dead holder's are). With `rerank` (checkcap.Reranked) its task turned urgent (`new` is
-    its new priority): the same runtime re-executes once (RERANK_ENV) and reads that priority at its start."""
+    let go (freed as a dead holder's are). With `rerank` (checkcap.Reranked) its task's priority changed (`new`
+    is the new one): the same runtime re-executes (RERANK_ENV: once per priority) and reads it at its start."""
     from . import checkcap, checkspill, testslots
     if arrived is not None:
         os.environ[checkcap.ARRIVED_ENV] = repr(arrived)
@@ -5385,8 +5486,9 @@ def _checks_reexec(new: str, arrived: float | None, prio, spill: bool, tell, out
     elif slot is not None:   # no lane to keep it with: the new process queues for both
         slot.close()
         slot = None
-    tell((f"its task turned urgent (priority {new}) while these checks waited at priority "
-          f"{prio if prio is not None else '-'}: re-executing to queue as urgent " if rerank else
+    tell((f"its task {'turned urgent' if checkcap.is_urgent(int(new)) else 'changed priority'} (priority {new}) while "
+          f"these checks waited at priority {prio if prio is not None else '-'}: re-executing "
+          if rerank else
           f"runtime {__version__} was upgraded to {new} while these checks waited: re-executing with it ")
          + f"(same pid{', keeping its checks lane' if os.environ.get(testslots.LANE_ENV) else ''}"
          f"{' and its host-wide checks slot' if os.environ.get(checkcap.KEPT_ENV) else ''}), "
@@ -5409,7 +5511,7 @@ def _checks_reexec(new: str, arrived: float | None, prio, spill: bool, tell, out
         if slot is not None:
             slot.close()
         tell(f"could not re-execute with runtime {new} ({e.strerror or e}): waiting on with {__version__}")
-        # (a failed rank re-execution keeps RERANK_ENV: it is not tried again, the run waits on at its priority)
+        # (a failed rank re-execution keeps RERANK_ENV: that priority is not tried again, the run waits on at its own)
 
 
 def _checks_tip_ref(p: Project | None, top: Path) -> str:
@@ -5625,6 +5727,13 @@ _CHECK_PREEMPT: dict = {"since": None}
 
 # The running checks' slot while their commands may give it up and take it back (checkcap.serve_yield).
 _CHECK_YIELD: dict = {"slot": None}
+
+
+def _checks_progress(out, cmds) -> str:
+    """The run's log, for preempt to read how far it is, when one of `cmds` cannot resume from its passed
+    files after a preemption (_checks_resumes); "" when every one can."""
+    name = getattr(out, "name", "")
+    return name if isinstance(name, str) and not all(_checks_resumes(c) for c in cmds or []) else ""
 
 
 def _checks_preempt_stop() -> None:
@@ -6018,6 +6127,7 @@ def _checks_detach(a, run_dir: Path, p: Project | None, top: str = "", head: str
     env = dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parents[1]))
     if arrived is not None:
         env[checkcap.ARRIVED_ENV] = repr(arrived)
+    env.update(checkcap.adopted_env())   # its parent ends: the identity it adopted goes along
     if no_spill:   # the rerun of checks that did not pass on a spill host keeps off those hosts (checkspill)
         from . import checkspill
         env[checkspill.OFF_ENV] = no_spill
@@ -6234,9 +6344,24 @@ def _checks_child(a) -> int:
                 checkdirs.finish(Path(info['check_run_dir']))
             _checks_tmp_cleanup(rc_file.parent)
         if released:
+            _checks_mask_logs(rc_file.parent)
             durable_write(rc_file, f"{code}\n")
         _checks_names_off()
     return code if isinstance(code, int) else 1
+
+
+def _checks_mask_logs(run_dir: Path) -> None:
+    """Mask checks.log and checks.out as the detached checks end, before checks.rc: while they ran,
+    redact.scrub_run left them whole (live_job_logs), and nothing masks them after. A bigger file is masked
+    by a detached job (scrub.log). Nothing of these checks writes either file after this."""
+    from . import redact
+    try:
+        left: list = []
+        for name in ("checks.log", CHECKS_OUT):
+            redact.scrub_file(run_dir / name, left=left)
+        redact.scrub_later(left, run_dir / "scrub.log")
+    except Exception as e:   # checks.rc is still written
+        print(f"ttp checks: masking the logs failed: {e}", file=sys.stderr, flush=True)
 
 
 def _checks_env_ok(p: Project | None, sigs: list | None = None) -> int:
@@ -6545,7 +6670,8 @@ def cmd_clip(a) -> None:
     run's failures, else the head and tail, plus the file's path. Exits with the command's code.
     Inside a run the file goes in the run's folder (out/), else in a temporary one. A build (make, ninja,
     cmake --build) first takes this run's share of the host's build slots (testslots.BUILDS) and runs
-    with that many jobs, at a lower priority; none free within CLIP_WAIT_S: one job."""
+    with that many jobs, at a lower priority; none free within CLIP_WAIT_S: one job. A worker's pytest
+    run asking more than one worker takes them from the host's test pool (testslots.direct)."""
     from . import testslots, trim
     cmd = a.cmd[1:] if a.cmd[:1] == ["--"] else a.cmd
     if not cmd:
@@ -6555,11 +6681,12 @@ def cmd_clip(a) -> None:
         if dropped:
             print(f"ttp clip: {dropped}", flush=True)
     line, env, grant, argv = shlex.join(cmd) if len(cmd) > 1 else cmd[0], None, None, None
+
+    def tell(msg: str) -> None:
+        print(f"ttp clip: {msg}", flush=True)
+    who = f"ttp clip (task #{os.environ.get('TTP_TASK') or '?'}, pid {os.getpid()}): {line[:80]}"
     if testslots.builds(line):
-        def tell(msg: str) -> None:
-            print(f"ttp clip: {msg}", flush=True)
-        grant = testslots.acquire(f"ttp clip (task #{os.environ.get('TTP_TASK') or '?'}, pid {os.getpid()}): "
-                                  f"{line[:80]}", tell, testslots.CLIP_WAIT_S, kind=testslots.BUILDS)
+        grant = testslots.acquire(who, tell, testslots.CLIP_WAIT_S, kind=testslots.BUILDS)
         if grant is None:
             tell(f"no host build slot free after {testslots.CLIP_WAIT_S:.0f} s: building with 1 job")
             grant = testslots.Grant(1, kind=testslots.BUILDS)
@@ -6568,6 +6695,11 @@ def cmd_clip(a) -> None:
                 tell(f"build jobs capped at -j {grant.k} (this run's share of the host's build slots): {capped}")
             line, env = capped, {**os.environ, **grant.env()}
             argv = testslots.low_priority(["/bin/sh", "-c", line])
+    elif (grant := testslots.direct(line, who, tell)) is not None:   # held by the tests too: free when they end
+        if (capped := testslots.clamp(line, grant.k)) != line:
+            tell(f"pytest workers lowered to -n {grant.k} (this run's host test slots): {capped}")
+        line, env = capped, {**os.environ, **grant.env()}
+        argv = testslots.low_priority(["/bin/sh", "-c", line])
     run_dir = os.environ.get("TTP_RUN_DIR")
     folder = Path(run_dir) / "out" if run_dir else Path(tempfile.mkdtemp(prefix="ttp-clip-"))
     folder.mkdir(parents=True, exist_ok=True)
@@ -6576,7 +6708,7 @@ def cmd_clip(a) -> None:
     try:
         with open(log, "w") as out:
             rc = subprocess.run(argv or line, shell=argv is None, stdout=out, stderr=subprocess.STDOUT,
-                                env=env).returncode
+                                env=env, pass_fds=grant.fds() if grant and grant.kind is testslots.TESTS else ()).returncode
     finally:
         if grant is not None:
             grant.close()
@@ -6637,6 +6769,29 @@ def _since_s(v: str) -> float:
     if not m or float(m.group(1)) <= 0:
         die(f"--since: give a duration such as 24h, 90m or 2d, not {v!r}")
     return float(m.group(1)) * {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400}[m.group(2)]
+
+
+def cmd_model_trip(a) -> None:
+    """`ttp model-trip`: the strata the model-pick tripwire holds on core (modeltrip.py); --h2h records a
+    head-to-head result for one, and a passing one newer than its trip turns routing back on."""
+    from . import modeltrip
+    p = need(a.name, sys.argv[1:]) if a.name else here()
+    if p is None:
+        die("ttp model-trip: no project here (run it in a project or its run, or name one)")
+    if a.h2h:
+        if a.ok == a.worse or not a.ref:
+            die("ttp model-trip --h2h <kind/tier/label>: give exactly one of --ok or --worse, and --ref", 2)
+        rec = modeltrip.head_to_head(p.db, a.h2h, a.ok, a.ref)
+        print(f"ttp model-trip: head-to-head for {a.h2h} recorded ({'passed' if rec['ok'] else 'worse'})")
+        return
+    trips, h2h = p.db.kv(modeltrip.TRIPS) or {}, p.db.kv(modeltrip.H2H) or {}
+    for k in sorted(set(trips) | set(h2h)):
+        held = k in trips and not modeltrip._rearmed(trips[k], h2h.get(k))
+        print(f"{k}: {'on core' if held else 'routed'}"
+              + (f"; tripped at routed {trips[k]['routed']}, core {trips[k]['core']} (bad, n)" if k in trips else "")
+              + (f"; head-to-head {'passed' if h2h[k]['ok'] else 'worse'} ({h2h[k]['ref']})" if k in h2h else ""))
+    if not trips and not h2h:
+        print("ttp model-trip: no stratum tripped")
 
 
 def cmd_throughput(a) -> None:
@@ -8723,7 +8878,8 @@ def _own_ttp_word(p: Project | None) -> str:
 # operating ----------------------------------------------------------------------------------------
 def cmd_ci(a) -> None:
     """CI probe for `retry_when`: exit 0 once the commit's GitHub Actions runs completed or one of
-    their jobs hung (in progress past 3x its recent median), 1 while they run, 75 when gh cannot
+    their jobs hung (in progress past 3x its recent median), 1 while they run, 4 when gh is not logged
+    in (a broken probe: the host's gh-auth alert says so), 75 when gh cannot
     answer. Prints one line per run (`done:`, `hung:`, `running:`); see ciwait."""
     from . import ciwait
     rc, lines = ciwait.probe(repo=a.repo, branch=a.branch, sha=a.sha, workflow=a.workflow, run=a.run,
@@ -11127,8 +11283,8 @@ def _take_over_finish(p: Project, holder: dict, overdue: bool = False) -> bool:
 def _upgrade(p: Project, auto: bool = False, explicit: bool = False, took_over: bool = False,
              parked: dict | None = None) -> None:
     """`explicit`: run by hand on the host, not --auto and not from one of the project's runs. A conflict
-    then queues the merge task once the last one ended upgrade.merge_retry_h ago (`took_over`: at once,
-    the last one was just superseded), not only once a day. `parked`: the project is paused and this finish
+    queues the merge task at once (`took_over`: the last one was just superseded), held off only by one that
+    ended without landing the same release on the same own files. `parked`: the project is paused and this finish
     task holds the merge: a clean merge supersedes it and lands (the daemon restarts, still paused); a
     conflict retargets it and exits 75, the task finishing it once the project is resumed."""
     from . import release, upjournal
@@ -11177,41 +11333,30 @@ def _upgrade(p: Project, auto: bool = False, explicit: bool = False, took_over: 
     if problem:
         holder = release.finish_holder(p)
         tid = holder["task"] if holder else None
-        # One task per batching window (upgrade.task_every_h), whatever it did: a project whose local edits
-        # conflict on every release would otherwise pay one model task per release.
-        last = None if tid else release.recent_upgrade_task(p)
-        sooner = None       # an explicit host-side upgrade may queue the merge task this soon
-        if last and explicit:
-            ended = release.task_ended(p.db, last["id"])
-            sooner = None if ended is None else ended + release.merge_retry_s(p.config())
-            if took_over or (sooner is not None and time.time() >= sooner):
-                last = None
-        if last:        # the release on hand when the window is up gets the next task: one merge for all
-            window = release.task_every_s(p.config())
-            until = float(last["created"]) + window
-            release.note_deferred(p, problem, last["id"])
+        # No timer: the open task (tid) is the one merge at a time. The last one holds the next off only when it
+        # ended without landing this release on these same own files; a newer release or a local edit queues
+        # the next at once.
+        files = _own_files(h, base)
+        last = None if tid or took_over else release.unchanged_merge(p, f"{new_v} ({new_c})", files)
+        if last:
+            until = time.time() + release.CHECK_S      # the daemon looks again then, for a local edit
+            release.note_deferred(p, problem, last)
             release.defer(p, auto, f"{new_v} {new_c}", f"{old_v} ({old_c})", f"{new_v} ({new_c})", until,
                           problem[:300])
-            at = timefmt.long(until, p)
-            took = (f"upgrade not applied; the running harness is unchanged. {problem}\nHarness task "
-                    f"#{last['id']} took on a template merge less than {window / 3600:g} h ago, so none is queued "
-                    f"now; ")
-            # Exit 75 (deferred) only when the project takes it on itself: its daemon retries after `until`.
-            if sooner is not None and sooner < until:
-                at = timefmt.long(sooner, p)    # a host-side rerun queues it before the daemon's retry
-                took += f"a host-side `ttp upgrade {p.name}` queues one from {at}; "
+            took = (f"upgrade not applied; the running harness is unchanged. {problem}\nHarness task #{last} took "
+                    f"on this merge of {new_v} ({new_c}) on the same local files and ended without landing it, so "
+                    f"none is queued again for it; a newer release or a change to {p.name}'s own runtime or "
+                    f"template files queues the next at once; ")
             if release.retried({"newer": release.is_newer(new_v, old_v)}, p.config()):
-                print(took + f"upgrade deferred: owner: this project's daemon (upgrade.auto), which tries again "
-                             f"after the window is up; resumes at {timefmt.long(until, p)}.")
+                print(took + f"upgrade deferred: owner: this project's daemon (upgrade.auto), which looks again "
+                             f"at {timefmt.long(until, p)}.")
                 sys.exit(75)
-            if p.db.kv("paused", False):    # deferred, not failed: a takeover after the resume queues the merge
-                print(took + f"{p.name} paused; upgrades when resumed: a host-side `ttp upgrade {p.name}` after "
-                             f"the resume queues the merge task from {at}.")
+            if p.db.kv("paused", False):
+                print(took + f"{p.name} paused; upgrades when resumed.")
                 sys.exit(75)
             why = ("upgrade.auto is off" if release.is_newer(new_v, old_v)
                    else f"the daemon retries only a newer version, and this is {new_v} again from another commit")
-            print(took + f"{why}, so nothing retries it: rerun `ttp upgrade {p.name}` after {at} "
-                         f"to queue a harness task for the merge.")
+            print(took + f"{why}, so nothing retries it: rerun `ttp upgrade {p.name}` after such a change.")
             sys.exit(1)
         target = f"{new_v} ({new_c})"
         if not tid:
@@ -11220,6 +11365,8 @@ def _upgrade(p: Project, auto: bool = False, explicit: bool = False, took_over: 
             release.UPGRADE_TASK_TITLE, _UPGRADE_TASK.format(problem=problem, name=p.name, target=target,
                                                              state=shlex.quote(str(p.state))),
             kind="harness", tier="standard", priority=2, origin="user")
+        if not holder:
+            p.db.set_kv(release.KV_MERGE_BASIS, {"task": int(tid), "files": files})
         release.take_finish_lock(p, tid, f"{new_v} {new_c}", target)     # it holds the live harness until it ends
         release.note_deferred(p, problem, tid)
         if auto:
@@ -11657,6 +11804,11 @@ def _tell_harness_tasks(p: Project, sha: str, files: list[str]) -> None:
 
 class ReleaseMoved(RuntimeError):
     """The release an upgrade snapshot copied from changed under it (a `ttp setup` or its recovery)."""
+
+
+def _own_files(h: Path, base: str) -> str:
+    """A fingerprint of the project's own runtime and template files at `base`: the parts a release merges into."""
+    return _git(h, "ls-tree", base, "--", "runtime", "prompts", "bin", *HARNESS_ROOT_FILES)
 
 
 def _snapshot_upstream(p: Project, src: Path, new_v: str, new_c: str, ident: list[str]) -> None:
@@ -12548,7 +12700,8 @@ COMMAND_GROUPS = (
                                          "deployed", "goal", "hours")),
     ("admin", ("setup", "upgrade", "start", "stop", "restart", "adopt", "prune", "secret", "consent",
                "notifier", "schedules", "heal", "upstream", "lease", "replicate", "check-plan", "stats", "audit",
-               "push-audit", "ttr", "selfchange", "spend-today", "throughput", "echoes", "course", "uninstall", "bench")),
+               "push-audit", "ttr", "selfchange", "spend-today", "throughput", "model-trip", "echoes", "course",
+               "uninstall", "bench")),
 )
 
 
@@ -12884,6 +13037,10 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--passed", action="store_true",
                    help="with --result: exit 0 only when they finished and passed, 1 when they failed, died "
                         "or still run (for an on_pass_cmd; a wait keeps plain --result)")
+    s.add_argument("--reap", action="store_true",
+                   help="run nothing: stop this user's leftover ttp checks runs (their run ended or their folder "
+                        "is gone) that hold or wait for a host checks slot, as the daemon does (leftoverchecks)")
+    s.add_argument("--dry-run", action="store_true", help="with --reap: only list what it would stop")
     s.add_argument("--settle", metavar="RUN_DIR",
                    help="an on_pass_cmd: on a pass of the run's detached checks on --head, write the final "
                         "hand-off to $TTP_RESULT; else exit 1 writing nothing")
@@ -13114,6 +13271,15 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--days", type=float, default=0, help="look back only this many days (default: all)")
     s.add_argument("--json", action="store_true", help="print the matches as JSON")
     s.set_defaults(fn=cmd_said)
+
+    s = sub.add_parser("model-trip", help="strata the model-pick tripwire sent back to the core model; --h2h "
+                                          "records a head-to-head result (a passing one re-enables routing)")
+    s.add_argument("name", nargs="?", help="project (default: the one here)")
+    s.add_argument("--h2h", metavar="KIND/TIER/LABEL", help="the stratum ('*' label: any) a head-to-head result is for")
+    s.add_argument("--ok", action="store_true", help="routed held up against core in the head-to-head")
+    s.add_argument("--worse", action="store_true", help="routed did worse than core in the head-to-head")
+    s.add_argument("--ref", help="where the head-to-head result is (a path or task id)")
+    s.set_defaults(fn=cmd_model_trip)
 
     s = sub.add_parser("throughput", help="waits per lane (worker, resource, checks, review, push, chains, deferrals, "
                                           "provider) against their limits; --apply raises the limits that held work "
@@ -13438,7 +13604,7 @@ def main(argv: list[str] | None = None) -> None:
 
     from . import ciwait
     s = sub.add_parser("ci", help="exit 0 once a commit's CI runs completed or a job hung, 1 while they run, "
-                                  "75 if gh cannot answer (for retry_when)")
+                                  "75 if gh cannot answer, 4 if gh is not logged in (for retry_when)")
     s.add_argument("--repo", help="owner/repo (default: the repository of the current directory)")
     s.add_argument("--branch", help="the branch whose newest commit's runs to wait for")
     s.add_argument("--sha", help="wait for this commit's runs instead of the branch's newest")

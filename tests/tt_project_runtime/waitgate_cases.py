@@ -594,3 +594,27 @@ def test_a_probe_stall_re_check_pass_on_a_probe_match_wait_output_sleeps_on(env,
     dm._probe_stall_act(p.db.task(tid), "passed", "")
     task = p.db.task(tid)
     assert task["status"] == "queued" and not _ready(p, tid) and "woke" not in json.loads(task["result"]), task["result"]
+
+
+def test_a_gate_skip_sleeps_on_a_new_answer_that_fails_for_gh_login_while_the_host_says_logged_out(
+        env, monkeypatch, tmp_path):
+    """`ttp ci` moving from not yet to gh's exit 4 during a logout wakes no model per task: the host's
+    gh-auth alert covers it. Once the host check says logged in, the same answer wakes as before."""
+    p = make(env)
+    from ttp import daemon as dmod, ghauth, waitgate
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
+    home = tmp_path / "ghhome"
+    (home / "gh").mkdir(parents=True)
+    for var in ("HOME", "XDG_CONFIG_HOME"):
+        monkeypatch.setenv(var, str(home))
+    monkeypatch.setenv("GH_CONFIG_DIR", str(home / "gh"))   # never the real gh login
+    dm = dmod.Daemon(p.base)
+    ghauth._write(None, {"ok": False, "since": time.time(), "checked_at": time.time(), "error": "x"})
+    tid = _gate_task(p, tmp_path, "echo 'broken: gh is not logged in'; exit 4")
+    _gate_set(p, tid, wake_gate={"seen": waitgate.evidence(1, "running: ci"), "log": [1]})
+    _settle_probe(dm, tid)
+    assert not _ready(p, tid), json.loads(p.db.task(tid)["result"]).get("woke")
+    ghauth._write(None, {"ok": True, "checked_at": time.time()})
+    _gate_set(p, tid, wake_gate={"seen": waitgate.evidence(1, "running: ci"), "log": [1]})
+    _settle_probe(dm, tid)
+    assert _ready(p, tid) and json.loads(p.db.task(tid)["result"])["woke"] == "its probe's answer changed (exit 4)"

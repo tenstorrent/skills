@@ -546,6 +546,29 @@ def test_speed_complaint_detector_matches_complaints_not_plain_messages():
         assert not sc.detect(text), text
 
 
+def test_speed_complaint_detector_skips_product_speed_wording_unless_it_names_the_projects_work():
+    """A product spec or feature request about the built product's throughput, latency or real time is no
+    complaint about the project's pace; a complaint naming the project or its tasks still is."""
+    from ttp import slowcomplaint as sc
+    for text in ("add a low-latency flag; throughput faster than realtime by generating several videos at a time",
+                 "the model should decode faster than real-time", "Can you add a low-latency flag so throughput is realtime?",
+                 "implement a feature to stream frames faster", "make inference faster",
+                 # Common verbs (runs, work, fix, build) do not name the project's work beside product wording.
+                 "add a low-latency flag so the model runs faster than real time",
+                 "fix the flag so throughput is realtime", "make the low-latency mode work with higher throughput",
+                 "the build should have a low-latency flag for faster decode",
+                 "please add the low-latency flag asap"):
+        assert not sc.detect(text), text
+    for text in ("why is this so slow", "Fix your throughput asap, especially on the most time sensitive tasks!",
+                 "the low-latency flag task is still waiting for hours", "your work on the video feature is so slow",
+                 # Pace and delay words, or a named piece of work, count beside a model, kernel, feature or image.
+                 "still waiting on the kernel fix for hours", "the model bringup is so slow",
+                 "why is the model run taking so long", "why is the feature still not done after hours",
+                 "the image build is stuck", "stuck on the decode bug for hours",
+                 "the inference perf work is too slow, speed up", "speed it up"):
+        assert sc.detect(text), text
+
+
 def test_speed_complaint_on_the_turn_start_runs_the_review_applies_and_queues_p1_followups(env, monkeypatch):
     from ttp import throughput
     from ttp.daemon import Daemon
@@ -1307,3 +1330,65 @@ def test_throughput_checks_waits_under_a_small_test_worker_budget_name_that_budg
     t = p.db.one("SELECT title, spec FROM tasks WHERE id=?", (fid,))
     assert "checks.test_project_slots not raised" in t["title"], t["title"]
     assert "limit checks.test_project_slots=8" in t["spec"], t["spec"]
+
+
+def test_throughput_checks_lane_settled_in_the_ledger_opens_no_followup_until_a_new_own_wait(
+        env, monkeypatch, tmp_path):
+    """A rejected 'raise checks.slots' in the tried-work ledger, or a done follow-up that listed the checks
+    lane, from the last 24 h holds the lane's follow-up (information only) until a wait held at the
+    project's own limits starts after it; an entry older than 24 h holds nothing."""
+    from ttp import checkcap, slowcomplaint, testslots, throughput
+    from ttp.daemon import Daemon
+    monkeypatch.setattr(checkcap, "grants_dir", lambda: tmp_path / "host")
+    monkeypatch.setattr(checkcap, "cores", lambda: 64)
+    for k in ("POOL", "RUN_MAX", "RUN_MIN", "PROJECT_SLOTS", "PROJECT_WORKERS"):
+        monkeypatch.delenv(f"TTP_TEST_{k}", raising=False)
+    monkeypatch.setattr(testslots, "project_workers", lambda cfg=None, cores=None, project_name=None: 32)
+    p = make(env)
+    d, now = Daemon(p.base), time.time()
+    p.set_config("checks.test_project_max", 4)
+    p.set_config("checks.slots", 3)
+
+    def own_wait(i, w0):
+        t = _tp_checks_requeue(p, d, monkeypatch, tmp_path, f"own wait {i}", w0, 2400)
+        _tp_checks_run(p, monkeypatch, w0 - 60, 2500)
+        _tp_slot_wait(p, monkeypatch, t, w0, w0 + 2390, cap=4, lane_at=w0 + 2300)
+
+    def finished(title, at, result):
+        tid = p.db.add_task(title, "s", kind="code", priority=1, origin="daemon")
+        p.db.update_task(tid, status="done", attempts=1, result=json.dumps(result))
+        p.db.x("UPDATE tasks SET updated=? WHERE id=?", (at, tid))
+        return tid
+
+    def checks_kept():
+        rep = throughput.measure(p.db, p.config(), now=now, gates={})
+        (k,) = [k for k in throughput.plan(p.db, p.config(), rep)[1] if k["lane"] == "checks_slots"]
+        return rep, k
+
+    for i, w0 in enumerate((now - 10 * 3600, now - 8 * 3600)):
+        own_wait(i, w0)
+    rep, k = checks_kept()
+    assert k["key"] == "checks.slots" and not k.get("info"), k
+    assert _tp_lane(rep, "checks_slots")["own_wait_last"] >= now - 8 * 3600 - 60, _tp_lane(rep, "checks_slots")
+    rejected = finished("checks lane waits", now - 6 * 3600, {"status": "done", "summary": "host pool waits", "tried": [
+        {"title": "raise checks.slots", "outcome": "rejected", "result": "the waits were on the host-wide pool"}]})
+    rep, k = checks_kept()
+    assert k.get("info") and f"ledger #{rejected} (rejected: raise checks.slots)" in k["why"], k
+    assert slowcomplaint._followups(p.db, {**rep, "kept": [k]}, [1], now)["opened"] is None
+    # A wait at the project's own limits after the rejection is new evidence: the follow-up opens.
+    own_wait(2, now - 4 * 3600)
+    rep, k = checks_kept()
+    assert k["key"] == "checks.slots" and not k.get("info"), k
+    fid = slowcomplaint._followups(p.db, {**rep, "kept": [k]}, [2], now)["opened"]
+    title = p.db.one("SELECT title FROM tasks WHERE id=?", (fid,))["title"]
+    assert title == "throughput: checks_slots waits over threshold; checks.slots not raised", title
+    # That follow-up done since the last own wait holds the lane again; a done one listing other lanes does not.
+    p.db.update_task(fid, status="done", attempts=1, result=json.dumps({"status": "done", "summary": "measured"}))
+    p.db.x("UPDATE tasks SET updated=? WHERE id=?", (now - 3600, fid))
+    assert f"ledger #{fid} (done: {title})" in checks_kept()[1]["why"]
+    p.db.x("UPDATE tasks SET title=? WHERE id=?", ("throughput: review_sweep waits over threshold; not raised", fid))
+    assert not checks_kept()[1].get("info")
+    # Older than 24 h: the rejection holds nothing.
+    p.db.x("UPDATE tasks SET updated=? WHERE id IN (?,?)", (now - throughput.DAY - 60, rejected, fid))
+    p.db.x("UPDATE tasks SET title=? WHERE id=?", (title, fid))
+    assert not checks_kept()[1].get("info")

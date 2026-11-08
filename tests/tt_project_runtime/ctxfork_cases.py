@@ -255,3 +255,160 @@ def test_a_rejected_fork_requeues_free_and_the_next_start_takes_the_disk_block(e
     p.db.x("UPDATE runs SET note=? WHERE id=?", (json.dumps(note), rid))
     assert ctxfork.prepare(p, d.cfg, dmod.get_provider("claude"), "claude", str(p.root), None,
                            task=tid)["how"] == "fork"
+
+
+def _worker_session(cfg_dir, cwd, sid, said="I changed daemon.py and handed off"):
+    """A finished worker run's transcript: its prompt and its last answer, a text."""
+    folder = cfg_dir / "projects" / re.sub(r"[^a-zA-Z0-9]", "-", str(cwd))
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / f"{sid}.jsonl"
+    path.write_text("\n".join([_fork_line("user", sid, "the task's prompt"),
+                               _fork_line("assistant", sid, [{"type": "text", "text": said}])]) + "\n")
+    return path
+
+
+def _ok_run(p, tid, sid, provider="claude", ended=None, role="worker"):
+    ended = time.time() - 60 if ended is None else ended
+    return p.db.x("INSERT INTO runs(task, role, provider, started, ended, status, session_id, note) "
+                  "VALUES(?,?,?,?,?,'ok',?,?)", (tid, role, provider, ended - 600, ended, sid,
+                                                json.dumps({"session_id": sid})))
+
+
+def _start(p, d, tid, role="worker", provider="claude"):
+    rid = d.start_run(role, "TASK PROMPT", provider, "standard", str(p.root), task=p.db.task(tid))
+    spec = json.loads((p.runs / str(rid) / "run.json").read_text())
+    row = p.db.one("SELECT note, session_id FROM runs WHERE id=?", (rid,))
+    return (rid, spec["argv"], (p.runs / str(rid) / "prompt.md").read_text(),
+            json.loads(row["note"] or "{}").get("coord_context"), row["session_id"])
+
+
+def test_follow_ups_resume_the_session_of_the_run_they_carry_on(env, monkeypatch, tmp_path):
+    """Owner's order (user msg #2210): continue hops, review fixes, rebases and re-reviews start from a copy
+    of the session of the last ok run of the task they carry on, never writing into it, with the
+    coordinator's newer context as a delta. A first review stays independent of its author's session."""
+    from ttp import coordsession, ctxfork, obligations
+    p, d, cfg_dir, _run = _fork_daemon(env, monkeypatch, tmp_path)
+    coord = str(uuid.uuid4())
+    _fork_transcript(cfg_dir, p.base, coord)
+    p.db.set_kv(coordsession.KEY, {"id": coord, "provider": "claude", "context_tokens": 5000})
+    code = p.db.add_task("the change", "do it", kind="code", origin="user")
+    s_code = str(uuid.uuid4())
+    src = _worker_session(cfg_dir, tmp_path / "wt-code", s_code)
+    before = src.read_bytes()
+    r_code = _ok_run(p, code, s_code, ended=time.time() - 3600)
+    p.db.x("INSERT INTO messages(ts,direction,chat,kind,text,handled) VALUES(?,?,?,?,?,1)",
+           (time.time() - 7200, "in", "web", "user", "an order from before the run"))
+    p.db.x("INSERT INTO messages(ts,direction,chat,kind,text,handled) VALUES(?,?,?,?,?,1)",
+           (time.time() - 60, "in", "web", "user", "a newer order: use threads"))
+    obligations.add(p, "split independent parts into threads")
+
+    def resumed(tid, run, role="worker"):
+        rid, argv, prompt, got, session = _start(p, d, tid, role)
+        assert got["how"] == "resume" and got["run"] == run, got
+        assert session == got["session"] and session not in (s_code, coord)
+        assert argv[argv.index("--resume") + 1] == session
+        assert prompt.startswith(ctxfork.RESUME_HEAD) and prompt.rstrip().endswith("TASK PROMPT")
+        assert "a newer order: use threads" in prompt and "an order from before the run" not in prompt
+        assert "split independent parts into threads" in prompt
+        assert ctxfork.forked({ctxfork.KEY: got})
+        return session
+
+    hop = p.db.add_task("continue: the change", "the rest", kind="code", origin="coordinator",
+                        labels=[f"continues:{code}"])
+    session = resumed(hop, r_code)
+    copy = cfg_dir / "projects" / re.sub(r"[^a-zA-Z0-9]", "-", str(p.root)) / f"{session}.jsonl"
+    rows = [json.loads(x) for x in copy.read_text().splitlines()]
+    assert rows[-1]["message"]["content"][0]["text"] == "I changed daemon.py and handed off"
+    assert {r["sessionId"] for r in rows} == {session}
+    assert src.read_bytes() == before   # the earlier run's session is untouched
+    # A first review is independent: it forks the coordinator, never the author's session; so does a
+    # review a coordinator labelled as continuing the code task.
+    review = p.db.add_task("Review #x", "review it", kind="review", origin="daemon", labels=[f"auto_review:{code}"])
+    odd = p.db.add_task("Review again", "review it", kind="review", origin="coordinator",
+                        labels=[f"continues:{code}"])
+    for t in (review, odd):
+        got = _start(p, d, t, "reviewer")[3]
+        assert got["how"] == "fork" and "run" not in got, got
+    fix = p.db.add_task(f"Fix review #{review}: the change", "fix", kind="code", origin="daemon",
+                        labels=[f"continues:{code}", f"review_fix:{review}"])
+    resumed(fix, r_code)
+    s_rev = str(uuid.uuid4())
+    _worker_session(cfg_dir, tmp_path / "wt-review", s_rev, "verdict: fail")
+    r_rev = _ok_run(p, review, s_rev, ended=time.time() - 3600, role="reviewer")
+    rereview = p.db.add_task(f"Re-review #{review}: x", "again", kind="review", origin="daemon",
+                             labels=[f"auto_review:{fix}", f"continues:{review}"])
+    resumed(rereview, r_rev, "reviewer")
+    rebase = p.db.add_task("Rebase b onto the push branch", "rebase", kind="review", origin="daemon",
+                           labels=[f"continues:{review}", "push_rebase:abc"])
+    resumed(rebase, r_rev, "reviewer")
+    # A follow-up's later run resumes its own last ok run, not the source again.
+    s_hop = str(uuid.uuid4())
+    _worker_session(cfg_dir, tmp_path / "wt-hop", s_hop, "first half done")
+    r_hop = _ok_run(p, hop, s_hop, ended=time.time() - 3600)
+    resumed(hop, r_hop)
+
+
+def test_a_follow_up_falls_back_to_the_coordinator_fork_then_disk(env, monkeypatch, tmp_path):
+    from ttp import coordsession, ctxfork
+    from ttp import daemon as dmod
+    p, d, cfg_dir, _run = _fork_daemon(env, monkeypatch, tmp_path)
+    coord = str(uuid.uuid4())
+    _fork_transcript(cfg_dir, p.base, coord)
+    p.db.set_kv(coordsession.KEY, {"id": coord, "provider": "claude", "context_tokens": 5000})
+    code = p.db.add_task("the change", "do it", kind="code", origin="user")
+    hop = p.db.add_task("continue", "the rest", kind="code", origin="user", labels=[f"continues:{code}"])
+    # No ok run to resume: the coordinator fork, as before.
+    got = _start(p, d, hop)[3]
+    assert got["how"] == "fork" and "no resume" not in got["why"], got
+    # Its run was on a provider whose sessions this one cannot read.
+    s = str(uuid.uuid4())
+    _worker_session(cfg_dir, tmp_path / "wt", s)
+    r = _ok_run(p, code, s, provider="codex")
+    got = _start(p, d, hop)[3]
+    assert got["how"] == "fork" and f"no resume: run {r} ran on codex" in got["why"], got
+    # Its transcript is gone.
+    p.db.x("UPDATE runs SET provider='claude', session_id=?, note='{}' WHERE id=?", (str(uuid.uuid4()), r))
+    got = _start(p, d, hop)[3]
+    assert got["how"] == "fork" and "not on disk" in got["why"], got
+    # Nor can the coordinator's be forked: the disk block, naming both reasons.
+    p.db.set_kv(coordsession.KEY, {})
+    got = _start(p, d, hop)[3]
+    assert got["how"] == "disk" and "no resume" in got["why"] and "no coordinator session" in got["why"], got
+    # mode off: neither.
+    monkeypatch.setenv("TTP_TEST_WORKER_CONTEXT", "off")
+    assert _start(p, d, hop)[3]["how"] == "none"
+    monkeypatch.delenv("TTP_TEST_WORKER_CONTEXT")
+    # A rejected resume is never retried: then a rejected fork ends on the disk block, never a loop.
+    p.db.set_kv(coordsession.KEY, {"id": coord, "provider": "claude", "context_tokens": 5000})
+    p.db.x("UPDATE runs SET session_id=? WHERE id=?", (s, r))
+    hop2 = p.db.add_task("continue 2", "the rest", kind="code", origin="user", labels=[f"continues:{code}"])
+    usage = types.SimpleNamespace(cost_usd=0.0, output_tokens=0)
+    seen = []
+    for _ in range(4):
+        rid, _a, _pr, got, _s = _start(p, d, hop2)
+        seen.append(got["how"])
+        note = json.loads(p.db.one("SELECT note FROM runs WHERE id=?", (rid,))["note"])
+        if not dmod._resume_never_started(note, usage):
+            break
+        note.update(not_waste="resume", resume_error="No conversation found")
+        p.db.x("UPDATE runs SET status='failed', ended=?, note=? WHERE id=?", (time.time(), json.dumps(note), rid))
+    assert seen == ["resume", "fork", "disk"], seen
+
+
+def test_stats_show_how_worker_runs_started_and_follow_ups_resumed(env):
+    from ttp import coordstats, ctxfork
+    p = make(env)
+    a = p.db.add_task("a", "x", kind="code", origin="user")
+    b = p.db.add_task("b", "x", kind="code", origin="user", labels=[f"continues:{a}"])
+    c = p.db.add_task("c", "x", kind="code", origin="user", labels=[f"continues:{a}"])
+    now = time.time()
+    for tid, how in ((a, "fork"), (b, "resume"), (c, "fork"), (a, "disk"), (a, None)):
+        note = {ctxfork.KEY: {"how": how}} if how else {}
+        p.db.x("INSERT INTO runs(task, role, started, status, note) VALUES(?, 'worker', ?, 'ok', ?)",
+               (tid, now - 10, json.dumps(note)))
+    s = coordstats.report(p.db, p.runs, "UTC", 1, now=now)
+    (day,) = s["worker_context"]
+    assert day["runs"] == 5 and day["how"] == {"fork": 2, "resume": 1, "disk": 1, "unrecorded": 1}
+    assert day["follow_ups"] == 2 and day["resumed"] == 1
+    text = coordstats.text(s)
+    assert "fork 2 (40%)" in text and "follow-ups resumed 1 of 2" in text

@@ -1217,3 +1217,26 @@ def test_a_stateless_coordinator_turn_without_tool_hooks_gets_its_charter_put_ba
     assert rc == 1 and coordtools.PUSH_REFUSAL in err and where.startswith(str(p.harness)), acts["git"]
     rc, err, where = acts["ttp"]
     assert rc not in (0, None) and coordtools.PUSH_REFUSAL in err, acts["ttp"]
+
+
+def test_a_full_task_cap_denial_names_the_next_slot_and_asks_the_wake_instead_of_a_resend(env, tmp_path, monkeypatch):
+    """A cap refusal said 'resend it unchanged' to get the retry wake, so a full cap cost a resend each time:
+    the denial names the next free slot, says to drop it and asks the same wake itself."""
+    from ttp import coordinator as coord
+    from ttp import coordprecheck
+    p = make(env)
+    p.set_config("coordinator.max_new_tasks_per_day", 2)
+    for i in range(2):
+        p.db.add_task(f"made {i}", "s", origin="coordinator")
+    add = {"type": "task_add", "title": "one more", "spec": "s"}
+    (why,) = [w for _, w in coordprecheck.problems(p, [add])]
+    assert "the next slot frees at" in why and "drop it" in why and "resend" not in why and "unchanged" not in why
+    assert not p.db.kv(coord.RETRY_WAKE_KEY), "problems alone writes nothing"
+    decision, reason = _answer(p, tmp_path, monkeypatch, [add])
+    assert decision == "deny" and "the next slot frees at" in reason
+    wake = p.db.kv(coord.RETRY_WAKE_KEY)
+    assert wake and abs(float(wake["at"]) - coord.next_task_slot(p.db, 2)) < 1 and wake["review"] is False
+    # Reviews have their own cap and slot; a cap of 0 has no slot to wait for.
+    p.set_config("coordinator.max_new_tasks_per_day", 0)
+    (why,) = [w for _, w in coordprecheck.problems(p, [add])]
+    assert "is 0" in why and "unchanged" not in why

@@ -48,6 +48,7 @@ only the project's own database and harness files."""
 from __future__ import annotations
 
 import json
+import statistics
 import time
 from typing import Any
 
@@ -258,14 +259,21 @@ def context_gaps(db: DB, since: float) -> list[dict]:
 def no_change_code(db: DB, since: float) -> dict:
     """Code tasks done since `since` after a worker run that left nothing to review: no review covers
     them (an `auto_review:<id>` label or a dependency) and their result names no PR or published
-    change. Most were premise checks run at the code tier. With the code tasks a premise check
-    (premise.py) closed before any code run: {n, usd, rows, premise_closed}."""
-    rows = db.q("SELECT id, title, spent_usd, result, labels FROM tasks t WHERE kind='code' AND status='done' "
+    change. Most were premise checks run at the code tier. With the code tasks a premise check or
+    premise command (premise.py) closed before any code run, and the $ that saved, estimated at the
+    median spend of the window's done code tasks of the same tier that ran (any tier where it has none):
+    {n, usd, rows, premise_closed, premise_saved_usd}."""
+    rows = db.q("SELECT id, title, tier, spent_usd, result, labels FROM tasks t WHERE kind='code' AND status='done' "
                 "AND updated>=? AND EXISTS (SELECT 1 FROM runs r WHERE r.task=t.id AND r.role!='coordinator') "
                 "ORDER BY spent_usd DESC", (since,))
-    closed = db.one("SELECT COUNT(*) n FROM tasks t WHERE kind='code' AND status='done' AND updated>=? "
-                    "AND labels LIKE '%\"premise:%:fails\"%' AND NOT EXISTS "
-                    "(SELECT 1 FROM runs r WHERE r.task=t.id AND r.role!='coordinator')", (since,))
+    closed = db.q("SELECT tier FROM tasks t WHERE kind='code' AND status='done' AND updated>=? "
+                  "AND labels LIKE '%\"premise:%:fails\"%' AND NOT EXISTS "
+                  "(SELECT 1 FROM runs r WHERE r.task=t.id AND r.role!='coordinator')", (since,))
+    spent: dict[str, list[float]] = {}
+    for r in rows:
+        for key in {"", str(r["tier"] or "")}:
+            spent.setdefault(key, []).append(float(r["spent_usd"] or 0))
+    saved = sum(statistics.median(spent.get(str(c["tier"] or "")) or spent[""]) for c in closed) if rows else 0.0
     covered: set[int] = set()
     if rows:
         for r in db.q("SELECT labels, depends_on FROM tasks WHERE kind='review' AND id>?", (min(t["id"] for t in rows),)):
@@ -286,7 +294,7 @@ def no_change_code(db: DB, since: float) -> dict:
             continue
         out.append({"id": t["id"], "title": t["title"], "usd": float(t["spent_usd"] or 0)})
     return {"n": len(out), "usd": sum(t["usd"] for t in out), "rows": out,
-            "premise_closed": int((closed or {}).get("n") or 0)}
+            "premise_closed": len(closed), "premise_saved_usd": saved}
 
 
 def unpriced_runs(db: DB, done: list[dict]) -> dict[int, int]:
@@ -595,6 +603,8 @@ def lines(db: DB, now: float | None = None, window_s: float = WINDOW_S, blocked_
     if idle["n"] or idle["premise_closed"]:
         out.append(f"code runs with no code change: {idle['n']}, ${idle['usd']:.2f}"
                    + (f"; {idle['premise_closed']} closed by a premise check before any code run"
+                      + (f" (about ${idle['premise_saved_usd']:.2f} saved at the tier's median code run)"
+                         if idle["premise_saved_usd"] else "")
                       if idle["premise_closed"] else "")
                    + "".join(f"{', ' if i else ': '}#{t['id']} {_short(t['title'], 50)} ${t['usd']:.2f}"
                              for i, t in enumerate(idle["rows"][:TOP])) + _more(idle["rows"]))

@@ -42,7 +42,7 @@ def test_task_add_warns_when_another_open_code_task_names_the_same_new_file(env)
     whose spec names a file an open code task's spec names is still added, and its result and its
     open-tasks line in the digest name the other task and the shared path; a file already on the base
     is no build dependency, so it runs beside; once it waits on that task the digest line drops the warning."""
-    from ttp import coordinator as coord
+    from ttp import coordinator as coord, overlap
     p = make(env)
     _on_base(p, "runtime/ttp/progress.py")
     first = p.db.add_task("progress check", "Add runtime/ttp/progress.py and tests/tt_project_runtime/"
@@ -53,11 +53,17 @@ def test_task_add_warns_when_another_open_code_task_names_the_same_new_file(env)
     want = f"overlaps #{first} (runtime/ttp/progress.py): {_plain()}"
     assert f"task_add: #{new} added; {want}" in p.db.kv(coord.NOTES_KEY)
     assert _labels(p, new) == [f"overlap:{first}:{want}"]
-    line = next(x for x in coord.digest(p, {}, [], []).splitlines() if x.startswith(f"- #{new} |"))
-    assert line.endswith(f"| driver reports | {want}"), line
+    text = coord.digest(p, {}, [], [])
+    line = next(x for x in text.splitlines() if x.startswith(f"- #{new} |"))
+    # The row names the task and path; the advice every overlap note repeats is said once, in the header.
+    assert line.endswith(f"| driver reports | overlaps #{first} (runtime/ttp/progress.py)"), line
+    head = next(x for x in text.splitlines() if x.startswith("## Open tasks"))
+    open_tasks = text.split("## Open tasks", 1)[1].split("\n## ", 1)[0]
+    assert head.endswith(f"; {overlap.ADVICE})") and open_tasks.count("conflicts settle at landing") == 1, head
     p.db.update_task(new, depends_on=json.dumps([first]))
-    line = next(x for x in coord.digest(p, {}, [], []).splitlines() if x.startswith(f"- #{new} |"))
-    assert "overlaps" not in line, line
+    text = coord.digest(p, {}, [], [])
+    line = next(x for x in text.splitlines() if x.startswith(f"- #{new} |"))
+    assert "overlaps" not in line and overlap.ADVICE not in text.split("## Open tasks", 1)[1].split("\n## ", 1)[0], line
     # A plan or question task, or a code task that names other files, gets no warning.
     for title, kind, spec in (("plan it", "plan", "Plan runtime/ttp/progress.py."),
                               ("other file", "code", "Change runtime/ttp/relay.py only.")):

@@ -15,7 +15,11 @@ last WINDOW_S days), never a worst case or padding:
   median push-queue row from approval to pushed or landed, each only when the project did one in the
   window (else the leg is not part of its path). A task in review or with an approved row has only
   what is left of those; a done one whose open review task (db.reviews_task) has not approved it yet
-  lands at that review task's own estimate plus the landing leg.
+  lands at that review task's own estimate plus the landing leg. An approved row still waiting for a
+  batch instead counts the approvals ahead of it in the queue's order (pushq._approved, aging
+  included): it lands once the running batch ends and then (ahead // push_batch_max + 1) more batches
+  of the median batch time ran (history(): push_batches started to finalized); with no measured
+  batch it falls back to the median landing.
 - landing wait: a queued or waiting task whose start_when waits only on other tasks' landings (exactly
   `landed:#N`, or `ttp landed --task N` terms joined by `&&`, optionally ending `|| exit 1`) starts no
   earlier than the latest of those tasks' own expected landing (their finish plus their review and
@@ -95,7 +99,7 @@ def history(db, now: float | None = None) -> dict:
     lock label and overall, review and landing times."""
     now = time.time() if now is None else now
     t0 = now - WINDOW_S
-    h = {"run": {}, "kind": {}, "queue": {}, "wait": [], "review": [], "land": []}
+    h = {"run": {}, "kind": {}, "queue": {}, "wait": [], "review": [], "land": [], "batch": []}
     for r in db.q("SELECT r.started s, r.ended e, t.kind k, t.tier tr FROM runs r JOIN tasks t ON t.id=r.task "
                   "WHERE r.role!='coordinator' AND r.ended>? AND r.started IS NOT NULL AND r.ended>r.started "
                   "ORDER BY r.id DESC LIMIT ?", (t0, ROWS)):
@@ -118,6 +122,9 @@ def history(db, now: float | None = None) -> dict:
         for r in db.q("SELECT created c, updated u FROM push_queue WHERE status IN ('pushed','landed') AND created>? "
                       "LIMIT ?", (t0, ROWS)):
             h["land"].append(max(0.0, float(r["u"]) - float(r["c"])))
+        for r in db.q("SELECT started s, COALESCE(after_finalized, finalized, ended) e FROM push_batches "
+                      "WHERE started>? AND COALESCE(after_finalized, finalized, ended) IS NOT NULL LIMIT ?", (t0, ROWS)):
+            h["batch"].append(max(0.0, float(r["e"]) - float(r["s"])))
     except Exception:   # a database from before the push queue
         pass
     return h
@@ -177,8 +184,10 @@ def outside_wait(t: dict, now: float, reports=None) -> dict | None:
 
 
 class _Est:
-    def __init__(self, db, now: float, hist: dict | None = None, core: str | None = None):
+    def __init__(self, db, now: float, hist: dict | None = None, core: str | None = None,
+                 delivery: dict | None = None):
         self.db, self.now = db, now
+        self.delivery = delivery or {}   # the project's delivery config: push_batch_max, push_age_s (_push_ahead)
         self.h = history(db, now) if hist is None else hist
         self.memo: dict[int, dict] = {}
         self._review_since = None
@@ -272,6 +281,23 @@ class _Est:
         return {"done": self.now, "end": end, "path": [tid] + e["path"], "legs": legs, "why": None,
                 "overrun": e["overrun"]}
 
+    def _push_ahead(self, tid: int, target: str) -> tuple[int, float] | None:
+        """For task `tid`'s approved row on `target`: (the approvals ahead of it in the queue's order,
+        seconds until the batch that takes it ends), or None with no measured batch or no such row."""
+        from . import pushq
+        if not self.h.get("batch"):
+            return None
+        d = self.delivery
+        rows = pushq._approved(self.db, target, self.now, pushq._num(d.get("push_age_s"), pushq.DEFAULT_AGE_S, float, 0))
+        ahead = next((i for i, r in enumerate(rows) if r["task"] == tid), None)
+        if ahead is None:
+            return None
+        cap = int(pushq._num(d.get("push_batch_max"), pushq.DEFAULT_BATCH_MAX, int, 1))
+        med = _med(self.h["batch"])
+        live = self.db.one("SELECT started FROM push_batches WHERE after_finalized IS NULL ORDER BY started LIMIT 1")
+        left = max(0.0, med - (self.now - float(live["started"]))) if live else 0.0
+        return ahead, left + (ahead // cap + 1) * med
+
     def _cycle(self, tid, seen: tuple, d: int) -> dict:
         return self._none(tid, "dependency cycle " + "→".join(f"#{i}" for i in seen[seen.index(d):] + (d,)))
 
@@ -290,15 +316,19 @@ class _Est:
         code = t["kind"] == "code"
         if st == "done" or st == "pushing":
             row = None
-            if code:
+            if code or t["kind"] == "review":   # a review owns its approval's push-queue row
                 try:
-                    row = self.db.one("SELECT created, status FROM push_queue WHERE task=? ORDER BY id DESC LIMIT 1", (tid,))
+                    row = self.db.one("SELECT created, status, target FROM push_queue WHERE task=? ORDER BY id DESC LIMIT 1", (tid,))
                 except Exception:
                     row = None
             if not row and code and st == "done" and (rv := self._open_review(t)):
                 return self._after_review(tid, rv, seen)
             if not row or row["status"] in PUSH_FINAL:
                 return {"done": now, "end": now, "path": [tid], "legs": [], "why": None, "overrun": False}
+            if row["status"] == "approved" and (q := self._push_ahead(tid, row["target"])):
+                n, left = q
+                return {"done": now, "end": now + left, "path": [tid], "why": None, "overrun": False,
+                        "legs": [(f"landing ({n} approval{'' if n == 1 else 's'} ahead)", left)]}
             if not self.h["land"]:
                 return self._none(tid, "no measured landing yet")
             left, over = self._left(self.h["land"], now - float(row["created"]))
@@ -393,8 +423,9 @@ class _Est:
         return {"done": done, "end": end, "path": path, "legs": legs, "why": None, "overrun": over, "start": begin}
 
 
-def estimate(db, tid: int, now: float | None = None, hist: dict | None = None, core: str | None = None) -> dict:
-    return _Est(db, time.time() if now is None else now, hist, core).task(int(tid))
+def estimate(db, tid: int, now: float | None = None, hist: dict | None = None, core: str | None = None,
+             delivery: dict | None = None) -> dict:
+    return _Est(db, time.time() if now is None else now, hist, core, delivery).task(int(tid))
 
 
 def core_of(where) -> str | None:
@@ -541,21 +572,32 @@ def justify(p, oid: str, why: str, now: float | None = None) -> str:
     return f"obligation {oid}: long due justified ({why[:120]})"
 
 
-def state_lines(db, where, now: float | None = None, host=None) -> list[str]:
+def state_lines(db, where, now: float | None = None, host=None, skip=()) -> list[str]:
     """The STATE section: each urgent open task and each open promise with its expected finish. `host`:
-    a task's started-on-host state (onhost.line), shown after its estimate."""
+    a task's started-on-host state (onhost.line), shown after its estimate. `skip`: task ids shown
+    elsewhere, left out before tasks with one reason share a line."""
     from . import urgent
     from .obligations import open_promises
     now = time.time() if now is None else now
     hot = [t for t in db.q("SELECT * FROM tasks WHERE status NOT IN ('done','failed','cancelled') "
-                           "ORDER BY priority, id LIMIT 60") if urgent.is_urgent(t)]
+                           "ORDER BY priority, id LIMIT 60") if urgent.is_urgent(t) and t["id"] not in skip]
     proms = open_promises(db)
     if not hot and not proms:
         return []
     est = _Est(db, now, core=core_of(where))
     out = ["## Expected finish (critical path, measured medians; quote these, never padded worst cases)"]
+    same: dict[str, list[tuple[dict, dict]]] = {}   # no estimate for one reason: one line (titles in Open tasks)
     for t in hot[:10]:
         on = host(t) if host else ""
-        out.append(f"- #{t['id']} {t['title'][:80]}: {field(est.task(t['id']), where, now)}" + (f"; {on}" if on else ""))
+        e = est.task(t['id'])
+        why = str(e["why"] or "").removeprefix(f"#{t['id']} ")
+        if why and not on:
+            same.setdefault(why, []).append((t, e))
+            continue
+        out.append(f"- #{t['id']} {t['title'][:80]}: {field(e, where, now)}" + (f"; {on}" if on else ""))
+    for why, got in same.items():
+        ids = ", ".join(f"#{t['id']}" for t, _ in got)
+        out.append(f"- {ids}: ETA: no estimate yet ({why})" if len(got) > 1 else
+                   f"- #{got[0][0]['id']} {got[0][0]['title'][:80]}: {field(got[0][1], where, now)}")
     out += [f"- promise {o['id']}: {field(obligation_estimate(db, o, now, est), where, now)}" for o in proms[:10]]
     return out

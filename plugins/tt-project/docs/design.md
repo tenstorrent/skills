@@ -32,9 +32,9 @@ The host-wide checks queue (`runtime/ttp/checkcap.py`, ordered by `locks.fair_or
 on their own slots, then urgent runs, then routine ones by project turns. A run waiting past
 `checks.starve_s` goes ahead only of later arrivals at its priority or lower; it passes more urgent ones
 once N of them started meanwhile (`checks.priority_turns`, default 3), so urgency holds under a backlog
-and every run still starts within a bound. A priority-1 run leaves less urgent aged runs of its project
-one shared turn per N urgent starts (counted since the project's last routine start), taken by the oldest,
-so a long routine backlog never holds it longer.
+and every run still starts within a bound. A priority-0 or priority-1 run is never held by a less urgent
+aged run of its project (unless `checks.priority_turns` is 0), and a waiting run whose task's priority
+changes re-queues at the new one, so a stale priority never holds it either.
 
 Detached checks keep durable reports in `state/check-reports/<id>/` and managed scratch in
 `state/check-runs/<id>/checks-tmp`. Only check subprocesses holding the lifetime guard receive
@@ -326,9 +326,10 @@ What each supported CLI offers, with doc links: [providers.md](providers.md).
   Each release is tried once: conflicts that need no judgment (both sides only added at
   one spot, or upstream already ships the project's change) are settled without a model; any
   other conflict, or a merged runtime that fails the check, leaves one harness task and no hourly
-  retries. At most one such task is queued per `upgrade.task_every_h` (6) hours, whatever the last
-  one did; a conflict inside that window waits, later releases only record the wait, and the next
-  task merges the newest release. An open task takes newer releases on instead of a second task. `ttp config <name> upgrade.auto false` opts out; `ttp upgrade <name>` then applies it.
+  retries. The task is queued at once, never on a timer: at most one is open, and it takes newer
+  releases on instead of a second task. One that ended without landing the release holds off the next
+  only until a newer release or an edit to the project's own runtime or template files; the deploying
+  project's coordinator gets one event naming the project and the conflicting files, to take it over. `ttp config <name> upgrade.auto false` opts out; `ttp upgrade <name>` then applies it.
 - Power-cycle notices (cyclenotice.py). A device broker on the same host announces a pending power
   cycle in a notice file, by default `/run/tt-device-broker/power-cycle-pending.json` (JSON with
   `state` "possible" or "requested", `reason`, `earliest_cycle_at` and `updated_at`). While one holds,
@@ -348,7 +349,7 @@ What each supported CLI offers, with doc links: [providers.md](providers.md).
   finishes a cut-short copy from the same plugin folder or, with that gone or now holding another
   version, rolls back to the release before. A post-push deploy a reboot cut short is run once more by the daemon.
   An explicit host-side `ttp upgrade <name>` (not `--auto`, not from one of the project's runs) queues
-  the merge task once the last one ended `upgrade.merge_retry_h` (6) hours ago, and takes the finish
+  the merge task at once on the same rule, and takes the finish
   lock over from a finish task that is blocked or has had no run or update for 6 h: that task is
   cancelled (superseded) and the lock's generation goes up, so its later `--apply` is refused. A
   finish task stuck that long is reported once to the maintainers' upstream inbox; a restart does not

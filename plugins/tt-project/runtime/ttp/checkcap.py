@@ -51,11 +51,10 @@ first), so it starts within a bound. A run parked outside the queue for its
 test slots (acquire's `startable`) holds a PARKED ticket meanwhile, so the wait is visible: once it has
 waited that long, later runs of its project at its priority or lower leave it their project's next free test
 slots, more urgent ones after aged_turns() of them started (testslots.pool_room, starved_ahead; push checks
-count as least urgent, priority 0 is never held by a less urgent run, and a less urgent task run leaves its
-project's next free test slots to the project's parked priority-0 runs, whatever their arrival: owed_ahead). An urgent run (locks.URGENT_PRIORITY or
-better) leaves less urgent aged runs one shared turn per aged_turns() urgent starts since its project's last
-routine start, and then only to the oldest of them (_routine_turn), so a routine backlog never holds it longer
-while it still starts one run per N urgent ones. Push checks run on their branch's reserved test lane alone
+count as least urgent, and a less urgent task run leaves its project's next free test slots to the project's
+parked priority-0 runs, whatever their arrival: owed_ahead). An owed or urgent run (locks.URGENT_PRIORITY or
+better) is never held by a less urgent one, however long that one waited (unless checks.priority_turns is 0:
+no urgent precedence). Push checks run on their branch's reserved test lane alone
 while any run waits for test slots (testslots.acquire), so a stream of pushes never holds them all.
 
 An urgent run (priority locks.URGENT_PRIORITY or better: an obligation owner, a user-ordered or `urgent:` task)
@@ -84,8 +83,10 @@ open obligation (owed: the slot label's "owed") asks an urgent run that owes not
 so an owed run never waits behind urgent work that owes nothing; an owed holder is never asked. `ttp checks
 --preempt <run>` writes the same request by hand, logged with who asked (ask_preempt). A freed reserved urgent
 slot goes to the urgent waiter that ranks first (URGENT_WAIT tickets: an owed one, then the oldest), not to
-whichever polls first. A routine run whose task turns urgent
-while it waits sees it within RERANK_S (reranked) and re-executes as an urgent run (cli._checks_reexec).
+whichever polls first. A run whose task's priority changes
+while it waits (raised to urgent, or lowered) sees it within RERANK_S (reranked) and re-executes to queue
+again at the new priority, keeping its arrival (cli._checks_reexec), so a queued or parked ticket never
+keeps a priority its task no longer has.
 
 While the host is lightly loaded (1-minute load average under half its cores) up to `checks.load_extra`
 slots (TTP_CHECKS_LOAD_EXTRA, default EXTRA_SLOTS; 0 turns it off) open beyond the cap: two below a quarter of the cores, one
@@ -190,12 +191,24 @@ PARKED_CLAIM_S = 60.0   # an asker that asked while parked renews its claim park
 HANDOVER_S = 3.0   # a parked asker that still cannot start this long after the asked run let go drops its claim
 # The run a preempt would stop: testslots counts the test slots it holds as free (preempt's `startable`).
 FREEING: contextvars.ContextVar[dict | None] = contextvars.ContextVar("checkcap_freeing", default=None)
-RERANK_ENV = "TTP_CHECKS_RERANKED"   # these waiting checks re-executed once as urgent (reranked)
-RERANK_S = 30.0   # a waiting routine run reads its task's priority again at most this often (reranked)
+RERANK_ENV = "TTP_CHECKS_RERANKED"   # the priority these waiting checks last re-executed at (reranked)
+RERANK_S = 30.0   # a waiting run reads its task's priority again at most this often (reranked)
+# A preempted run's rerun resumes each plain local pytest check from the files it passed (cli._checks_resume).
+RESUME_ENV = "TTP_CHECKS_RESUME"
+SHIELD_PCT = 90   # a run that cannot resume is never asked once its log's last pytest `[ NN%]` is this far (preempt)
 # What only this `ttp checks` run reads (its own re-queue, re-execution and label): never passed to the check
 # commands it starts (push.check_env), so a `ttp checks` nested in them is not labelled preempted nor kept from
 # its own rerank or re-execution.
-RUN_ONLY_ENV = (REEXEC_ENV, PREEMPT_ASKED_ENV, PREEMPTED_ENV, RERANK_ENV)
+RUN_ONLY_ENV = (REEXEC_ENV, PREEMPT_ASKED_ENV, PREEMPTED_ENV, RERANK_ENV, RESUME_ENV)
+BARE_SLOTS = 1   # default checks.bare_slots: host-wide slots held at once by runs with no project (acquire)
+BARE_SLOTS_ENV = "TTP_CHECKS_BARE_SLOTS"
+INHERIT_DEPTH = 64   # ancestors read at most for the project run a `ttp checks` was started under (inherited)
+NO_INHERIT_ENV = "TTP_TEST_NO_INHERIT"   # tests: never take the identity of the process running them
+ADOPTED_ENV = "TTP_CHECKS_ADOPTED"   # the identity a detached run's parent adopted (adopted_env)
+IDLE_HOLD_S = 600.0   # default checks.idle_hold_s: a slot held this long with no test running is flagged (line)
+IDLE_HOLD_ENV = "TTP_CHECKS_IDLE_HOLD_S"
+ACTIVE_SAMPLE_S = 0.5   # holder_activity reads each holder's tests' CPU twice, this far apart
+ACTIVE_FRAC = 0.05      # ... and counts them running at this share of one core or more
 
 
 def slot_dir() -> Path:
@@ -433,17 +446,20 @@ _RERANK: dict = {"at": 0.0}
 
 
 def reranked(p, prio: int | None, now: float | None = None) -> int | None:
-    """The task's priority read again (task_rank), at most every RERANK_S: the new one once the task of these
-    waiting routine checks (`prio`) turned urgent, else None. Once per run (RERANK_ENV): its re-execution reads
-    the new priority at its start."""
-    if p is None or is_urgent(prio) or os.environ.get(RERANK_ENV):
+    """The task's priority read again (task_rank), at most every RERANK_S: the new one once it differs from
+    the priority these waiting checks queued at (`prio`: raised, lowered, or now none), else None. Once per
+    priority (RERANK_ENV holds the one it last re-executed at, or failed to): its re-execution reads the new
+    priority at its start, and a later change re-ranks it again."""
+    if p is None:
         return None
     now = time.time() if now is None else now
     if now - _RERANK["at"] < RERANK_S:
         return None
     _RERANK["at"] = now
     new = task_rank(p)[0]
-    return new if is_urgent(new) else None
+    if new is None or new == prio or os.environ.get(RERANK_ENV) == str(new):
+        return None
+    return new
 
 
 def urgent_paths() -> list[Path]:
@@ -516,8 +532,28 @@ def is_small(cost: dict | None) -> bool:
 
 
 def order() -> dict:
-    """locks.fair_order's (and my_turn's) ordering arguments for the checks queue."""
-    return {"urgent_max": priority_turns(), "aged_before": aged_before(), "aged_turns": aged_turns()}
+    """locks.fair_order's (and my_turn's) ordering arguments for the checks queue: runs with no project last."""
+    return {"urgent_max": priority_turns(), "aged_before": aged_before(), "aged_turns": aged_turns(),
+            "bare_last": True}
+
+
+def bare_slots() -> int:
+    """Host-wide slots runs with no project hold at once: TTP_CHECKS_BARE_SLOTS, else the account's
+    checks.bare_slots, else BARE_SLOTS; at least 1. The cap binds only while a project's run waits (_take)."""
+    for v in (os.environ.get(BARE_SLOTS_ENV), (project.load_account_settings().get("checks") or {}).get("bare_slots")):
+        if v not in (None, "") and (n := _number(v)) is not None:
+            return max(n, 1)
+    return BARE_SLOTS
+
+
+def _bare_held(every: list[Path]) -> int:
+    """Slots among `every` held now by a run with no project (its label's checks_project empty)."""
+    return sum(1 for r in locks.holder_records(every) if "checks_project" in r and not r["checks_project"])
+
+
+def _project_waits() -> bool:
+    """A run of some project waits in the host-wide queue (its ticket has a group)."""
+    return any(locks.ticket_group(t) for t in locks.queued(slot_dir(), RESOURCE))
 
 
 def aged_before(now: float | None = None) -> float:
@@ -530,10 +566,10 @@ def starved_ahead(project_name: str | None, since: float | None = None, now: flo
     """The other parked runs of `project_name` (PARKED tickets) that have waited starve_s() or longer, arrived
     before the asking run (its own PARKED ticket's arrival, else `since`, else now: a newcomer's) and go before
     it: those at its priority or a more urgent one, and a less urgent one only on its turn (_aged_turn: after
-    aged_turns() more urgent starts), so urgent runs keep their precedence under a backlog. An urgent asking
-    run (locks.URGENT_PRIORITY or better) is held by a less urgent one only on the routine runs' shared turn,
-    and then only by the oldest (_routine_turn). The asking run's priority is its PARKED ticket's, else
-    `priority`; none (push checks) is the least urgent. A priority-0 run is never held by a less urgent one.
+    aged_turns() more urgent starts), so urgent runs keep their precedence under a backlog. An owed or urgent
+    asking run (locks.URGENT_PRIORITY or better) is never held by a less urgent one, unless aged_turns() is 0
+    (checks.priority_turns 0: no urgent precedence). The asking run's priority is its PARKED ticket's, else
+    `priority`; none (push checks) is the least urgent.
     A run of `cost` (checklane.cost) is not held by one at its priority or less urgent whose run costs
     CHEAP_FACTOR times as much (checklane.much_cheaper: a targeted run beside full suites), its run's lane
     label's cost by the run id in its ticket; a short one (is_small: shortest first) is held there only by
@@ -559,7 +595,7 @@ def starved_ahead(project_name: str | None, since: float | None = None, now: flo
     out = [t for t in aged if locks.ticket_priority(t) <= rank]
     passed = [t for t in aged if t not in out] if rank > 0 else []
     if passed and rank <= locks.URGENT_PRIORITY:
-        return out + _routine_turn(project_name, passed, now)
+        return out + (passed if aged_turns() <= 0 else [])
     return out + (_aged_turn(project_name, passed, now) if passed else [])
 
 
@@ -582,25 +618,6 @@ def owed_ahead(project_name: str | None, priority: int | None = None) -> list[Pa
     gid = locks.group_id(project_name)
     return [t for t in q if t != mine and locks.ticket_group(t) == gid
             and locks.ticket_priority(t) <= OBLIGATION_PRIORITY]
-
-
-def _routine_turn(project_name: str | None, aged: list[Path], now: float) -> list[Path]:
-    """For an urgent asking run (locks.URGENT_PRIORITY or better): the oldest of `aged` (less urgent PARKED
-    tickets of `project_name` past starve_s()) once the routine runs' shared turn has come: since the oldest
-    aged and since its project last started a routine run (a queue grant above locks.URGENT_PRIORITY),
-    aged_turns() or more urgent runs of the project took a host-wide checks slot. So an urgent run is held
-    by at most one aged routine run per aged_turns() urgent starts however long the routine backlog, and
-    that backlog still starts one run per aged_turns() urgent starts (the bound: a steady urgent stream
-    takes N of every N + 1 turns). aged_turns() 0: they all go first, as _aged_turn."""
-    n = aged_turns()
-    if n <= 0:
-        return aged
-    oldest = min(aged, key=locks._arrival)
-    rows = [(r["ts"], r["priority"]) for r in grant_records(now, now - locks._arrival(oldest))
-            if r.get("project") == project_name and r.get("slot") == "queue"
-            and isinstance(r.get("priority"), int)]
-    start = max([locks._arrival(oldest) + starve_s()] + [ts for ts, pr in rows if pr > locks.URGENT_PRIORITY])
-    return [oldest] if sum(1 for ts, pr in rows if pr <= locks.URGENT_PRIORITY and ts >= start) >= n else []
 
 
 def _ticket_run(t: Path) -> str:
@@ -770,8 +787,8 @@ class Upgraded(Exception):
 
 
 class Reranked(Upgraded):
-    """A waiting detached routine `ttp checks` whose task turned urgent (reranked; the message is its new
-    priority): it re-executes as Upgraded does, with the same runtime, and queues again as an urgent run."""
+    """A waiting detached `ttp checks` whose task's priority changed (reranked; the message is its new
+    priority): it re-executes as Upgraded does, with the same runtime, and queues again at that priority."""
 
 
 _SEEN: dict = {}   # upgraded(): the installed version it last saw differ, and since when
@@ -818,9 +835,85 @@ def upgraded(init: Path | None = None, now: float | None = None, settle: float |
     return new if now - _SEEN["since"] >= (UPGRADE_SETTLE_S if settle is None else settle) else ""
 
 
+_IDENT: dict = locks.IDENTITY   # adopt_identity() (shared with locks: queue tickets record it): the project run a `ttp checks` with no TTP_TASK was started under
+
+
+def inherited(pid: int, base: Path | None = None, depth: int = INHERIT_DEPTH) -> dict:
+    """The task of the nearest of `pid` and its ancestors that names a project (TTP_PROJECT): with TTP_TASK set
+    there and the project existing (and, with `base`, being that one), {"task", "run", "base", "project"}
+    (project: its name). {} otherwise: that nearest project context decides, no further ancestor (procfs shows
+    each process's starting environment, which can name a task its parent has since left). An unreadable
+    process (another user's, no /proc) also ends the walk."""
+    from . import jobuse, procowner
+    for _ in range(depth):
+        if pid <= 1 or (env := procowner.environ(pid)) is None:
+            return {}
+        if env.get("TTP_PROJECT"):
+            there = procowner.base_of(env["TTP_PROJECT"])
+            if not env.get("TTP_TASK") or not there or (base is not None and there != procowner.base_of(base)):
+                return {}
+            p = project.Project(there)
+            return {"task": env["TTP_TASK"], "run": env.get("TTP_RUN_ID") or "", "base": str(there),
+                    "project": p.name} if p.exists() else {}
+        try:
+            pid = int((jobuse._stat(pid) or ["", "0"])[1])
+        except ValueError:
+            return {}
+    return {}
+
+
+def adopt_identity(base: Path | None = None) -> dict:
+    """For a `ttp checks` run with no TTP_TASK (a tool that cleared its environment, a temp clone outside the
+    project): the task, run and project of the project run it was started under (inherited from its parent
+    up; with `base`, its own project's only), which its slot label, priority and queue group then are
+    (label, task_rank, queue_name). {} with its own TTP_TASK set or no such run: it queues as a run with no
+    project, behind every project's waiter (fair_order's bare_last, bare_slots)."""
+    _IDENT.clear()
+    if not os.environ.get("TTP_TASK") and not os.environ.get(NO_INHERIT_ENV):
+        _IDENT.update(_handed(base) or inherited(os.getppid(), base))
+    return dict(_IDENT)
+
+
+def adopted_env() -> dict:
+    """The environment that hands the adopted identity to the background run a detached `ttp checks` starts
+    (its parent, and with it the ancestor chain, ends)."""
+    return {ADOPTED_ENV: json.dumps(_IDENT)} if _IDENT else {}
+
+
+def _handed(base: Path | None) -> dict:
+    """The identity adopted_env handed over, when its project still exists (and is `base`, with one)."""
+    from . import procowner
+    try:
+        got = json.loads(os.environ.get(ADOPTED_ENV) or "{}")
+    except ValueError:
+        return {}
+    there = procowner.base_of(got.get("base")) if isinstance(got, dict) and got.get("task") else None
+    if not there or (base is not None and there != procowner.base_of(base)) or not project.Project(there).exists():
+        return {}
+    return {k: str(got.get(k) or "") for k in ("task", "run", "base", "project")}
+
+
+def _task_run() -> tuple[str | None, str | None]:
+    """The task and run this process runs for: TTP_TASK and TTP_RUN_ID, else the adopted ones (adopt_identity)."""
+    if task := os.environ.get("TTP_TASK"):
+        return task, os.environ.get("TTP_RUN_ID")
+    return _IDENT.get("task"), _IDENT.get("run")
+
+
+def queue_name(p) -> str | None:
+    """The project a `ttp checks` run queues for host-wide slots as: its own (`p`), else the adopted one
+    (adopt_identity); None: a run with no project."""
+    return p.name if p else _IDENT.get("project")
+
+
+def adopted_project():
+    """The adopted project (adopt_identity) as a Project, for its task's priority (task_rank); None without."""
+    return project.Project(_IDENT["base"]) if _IDENT.get("base") else None
+
+
 def label(project_name: str | None, what: str = "") -> str:
     """Who holds or waits for a slot, as status lines show it: the project and the task's run."""
-    task, run = os.environ.get("TTP_TASK"), os.environ.get("TTP_RUN_ID")
+    task, run = _task_run()
     who = f"{project_name or 'no project'}" + (f" task #{task} (run {run or '?'})" if task else "")
     return who + requeued() + (f" {what}" if what else "")
 
@@ -842,7 +935,7 @@ def task_rank(p) -> tuple[int | None, list[str]]:
     """(task_priority(p), the ids of the open obligations behind an OBLIGATION_PRIORITY boost, else []).
     An urgent task (urgent.is_urgent) ranks at least urgent.PRIORITY, a user-ordered one (a fresh `urgent:`
     line) urgent.ORDERED_PRIORITY, as an obligation owner."""
-    task = os.environ.get("TTP_TASK") or ""
+    task = _task_run()[0] or ""
     if p is None or not task.isdigit():
         return None, []
     try:
@@ -881,9 +974,38 @@ def priority_paths() -> list[Path]:
         return []
 
 
+def host_holders(n: int | None = None) -> list[str]:
+    """The labels of every check run holding a host-wide checks slot right now, each run once: the cap's
+    slots and the ones load opened beyond it, the push priority slots, the urgent slots and the shared
+    holders. A run seen on several slots (same holder, pid and since) counts once; a taken slot whose label
+    does not read counts as "". The one reading the queue-wait report (state's "held") and the slot status
+    (hostload) count, so the two never disagree."""
+    n = limit() if n is None else n
+    if not n:
+        return []
+    every, seen, out = all_paths(n), set(), []
+    for path in every + priority_paths() + urgent_paths():
+        if not locks._slot_labels([path]):
+            continue
+        try:
+            h = locks.read_label(path)
+        except (OSError, ValueError):
+            h = {}
+        k = (h.get("holder"), h.get("pid"), h.get("since")) if h else ("unread", path.name)
+        if k not in seen:
+            seen.add(k)
+            out.append(str(h.get("holder") or ""))
+    for h in locks.shared_holders(every):
+        if (k := (h.get("holder"), h.get("pid"), h.get("since"))) not in seen:
+            seen.add(k)
+            out.append(str(h.get("holder") or ""))
+    return out
+
+
 def state() -> dict:
     """Who runs checks host-wide now and who waits: {"limit", "running": [labels], "queued": [labels],
-    "priority": [labels of push checks on their priority slots]}."""
+    "priority": [labels of push checks on their priority slots], "held": [every slot holder once]
+    (host_holders: what reports count as running)}."""
     n = limit()
     running = locks.held_labels(all_paths(n)) if n else []
     priority = locks.held_labels(priority_paths()) if n else []
@@ -906,7 +1028,8 @@ def state() -> dict:
             continue
     return {"limit": n, "extra": extra(n), "running": running, "queued": queued, "priority": priority,
             "ahead": ahead, "queued_at": arrived, "priority_since": since, "parked": parked,
-            "pool": len(pool_runs()) if n else 0, "urgent": locks.held_labels(urgent_paths()) if n else []}
+            "pool": len(pool_runs()) if n else 0, "urgent": locks.held_labels(urgent_paths()) if n else [],
+            "held": host_holders(n)}
 
 
 def _project(holder: str) -> str:
@@ -914,8 +1037,73 @@ def _project(holder: str) -> str:
     return holder.split(" task #", 1)[0].split(" ttp checks", 1)[0]
 
 
-def line() -> str:
-    """One status line, or "" when nothing runs or waits."""
+def idle_hold_s() -> float:
+    """Seconds a host-wide slot is held with no test running before status flags it (holder_activity):
+    TTP_CHECKS_IDLE_HOLD_S, else the account's checks.idle_hold_s, else IDLE_HOLD_S. Zero, negative,
+    infinite or unreadable: the default."""
+    try:
+        v = float(os.environ.get(IDLE_HOLD_ENV)
+                  or (project.load_account_settings().get("checks") or {}).get("idle_hold_s") or IDLE_HOLD_S)
+    except (TypeError, ValueError):
+        v = IDLE_HOLD_S
+    return v if 0 < v < math.inf else IDLE_HOLD_S
+
+
+def tests_cpu_s(pid: int) -> float | None:
+    """The CPU seconds of what process `pid` started (its live descendants', with every reaped child's), not its
+    own: the checks process's commands. None when it cannot be read (gone, another PID namespace, no /proc)."""
+    from . import jobuse
+    tree, own = jobuse._tree(pid), jobuse._stat(pid)
+    if not tree or not own:
+        return None
+    hz = jobuse._hz()
+    try:
+        reaped = sum(int(x) for x in own[13:15]) / hz
+    except (ValueError, IndexError):
+        return None
+    return reaped + sum(jobuse._cpu(x, hz) for x in tree[1:])
+
+
+def holder_activity(now: float | None = None, cpu: Callable[[int], float | None] | None = None,
+                    sample_s: float = ACTIVE_SAMPLE_S) -> list[dict]:
+    """Each holder of a host-wide checks slot (the cap's and the ones load opened beyond it) with whether its
+    process tree runs tests now: {"holder", "pid", "held_s", "tests", "idle"}. `tests`: what it started used
+    ACTIVE_FRAC of one core or more over `sample_s` (tests_cpu_s read twice), None when that cannot be read;
+    `idle`: no test running and held idle_hold_s() or longer, so status flags it. Status only: it stops,
+    preempts or asks nothing (accepted gap: one sample, so a suite between steps may read idle)."""
+    n = limit()
+    recs = [r for r in locks.holder_records(all_paths(n)) if not r.get("shared")] if n else []
+    if not recs:
+        return []
+    cpu = cpu or tests_cpu_s
+    pids = [r.get("pid") if isinstance(r.get("pid"), int) else None for r in recs]
+    first = [cpu(p) if p else None for p in pids]
+    if sample_s > 0 and any(x is not None for x in first):
+        time.sleep(sample_s)
+    now = time.time() if now is None else now
+    bound, out = idle_hold_s(), []
+    for r, p, a in zip(recs, pids, first):
+        b = cpu(p) if p and a is not None else None
+        # a drop: a process left the tree (an orphan of its commands), so they ran
+        tests = None if a is None or b is None else b < a or b - a >= max(ACTIVE_FRAC * sample_s, 1e-9)
+        held = max(0.0, now - float(r.get("since") or now))
+        out.append({"holder": str(r.get("holder") or ""), "pid": p, "held_s": held, "tests": tests,
+                    "idle": tests is False and held >= bound})
+    return out
+
+
+def activity_text(a: dict) -> str:
+    """One holder of holder_activity, as status says it."""
+    what = {True: "tests running", False: "no test running", None: "its processes cannot be read"}[a["tests"]]
+    out = f"{a['holder']}: {what}, held {_dur(a['held_s'])}"
+    return out + (f"; IDLE: it holds one of the host's checks slots with no test running (over "
+                  f"{_dur(idle_hold_s())}); a check that waits on something else gives the slot up meanwhile "
+                  "with `ttp checks-yield`" if a["idle"] else "")
+
+
+def line(activity: bool = False) -> str:
+    """One status line, or "" when nothing runs or waits. With `activity` it also names each slot holder that
+    has held its slot idle_hold_s() or longer with no test running (holder_activity)."""
     s = state()
     if not s["running"] and not s["queued"] and not s["priority"] and not s["parked"] and not s["urgent"]:
         return ""
@@ -935,6 +1123,10 @@ def line() -> str:
                 + _some([_aged(h, t, now) for h, t in s["parked"]]))
     if s["running"]:
         out += f" (running: {_some(s['running'])})"
+    if activity and s["running"] and (idle := [a for a in holder_activity(now) if a["idle"]]):
+        out += ("; holding a slot with no test running: " + _some([f"{a['holder']} (held {_dur(a['held_s'])})"
+                                                                     for a in idle])
+                + " (a check waiting on something else gives its slot up with `ttp checks-yield`)")
     if s["ahead"]:
         out += "; next per project: " + ", ".join(f"{k} {v} ahead" for k, v in list(s["ahead"].items())[:6])
     return out
@@ -1077,7 +1269,7 @@ def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = No
             owns: list[str] | tuple = (), cap: int | None = None, lane_at: float | None = None,
             startable: Callable[[], bool] | None = None,
             parks: Callable[[bool], None] | None = None, urgent: bool = False,
-            preemptible: bool = False, small: bool = False) -> Slot | None:
+            preemptible: bool = False, small: bool = False, progress: str = "") -> Slot | None:
     """Take a host-wide checks slot, waiting while all are held. Waiters take turns by project
     (`project_name`; none form their own group), within one by task priority (`priority`, 1 first;
     OBLIGATION_PRIORITY before it, its ticket marked OBLIGATION_MARK; none last), then arrival (locks.fair_order),
@@ -1111,13 +1303,16 @@ def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = No
     `preemptible`: the caller stops its checks when asked (preempted), so its slot's label says it may be
     asked; Slot.since is when it was granted. It asks only once it waited preempt_after_s() from `since`.
     `small` (is_small): its queue and PARKED tickets mark a short run (locks.SMALL_TICKET), which goes first
-    among its project's waiters at its priority; the cap and every other rule hold it as any run."""
+    among its project's waiters at its priority; the cap and every other rule hold it as any run.
+    `progress`: the log of a preemptible run that cannot resume from its passed files, so preempt never asks
+    it once it is past SHIELD_PCT."""
     n = limit()
     was_preempted = bool(os.environ.get(PREEMPTED_ENV))   # preempted once: queues at its place, asked again last
     label = {"priority": priority, "checks_project": project_name, "owed": bool(owns),
-             **({"preemptible": True} if preemptible else {}), **({"preempted": True} if was_preempted else {})}
+             **({"preemptible": True} if preemptible else {}), **({"preempted": True} if was_preempted else {}),
+             **({"progress_log": progress} if preemptible and progress else {})}
     again = {"holder": holder, "what": what, "project_name": project_name, "priority": priority, "owns": owns,
-             "cap": cap, "preemptible": preemptible}
+             "cap": cap, "preemptible": preemptible, "progress": progress}
     if not n or os.environ.get(HELD_ENV):
         return Slot()
     since = time.time() if since is None else since
@@ -1346,7 +1541,10 @@ def preempt(by: str, every: list[Path], project_name: str | None = None,
     an owed run never waits behind urgent work that owes nothing. With `startable` (the asker waits for its test slots) only a run whose stop lets it start:
     `startable()` true with that run's test slots counted free (FREEING), else nobody is asked. With `claim`
     the slot it frees is the asker's (claims): no other waiter takes it while the claim lives, and the request
-    lapses with it (preempted). Returns the holder asked, or ""."""
+    lapses with it (preempted). Never a run whose label names a progress log (acquire's `progress`: it cannot
+    resume from its passed files) once that log's last pytest `[ NN%]` is SHIELD_PCT or more: a restart from
+    zero there loses nearly all its work. Returns the holder asked, or ""."""
+    from . import checkwall
     found = []
     for path in every:
         if not locks.held_labels([path]):
@@ -1356,6 +1554,8 @@ def preempt(by: str, every: list[Path], project_name: str | None = None,
         except (OSError, ValueError):
             continue
         if not isinstance(h, dict) or not h.get("preemptible") or h.get("urgent"):
+            continue
+        if (log := h.get("progress_log")) and (checkwall._percent(log, 0) or 0) >= SHIELD_PCT:
             continue
         band = is_urgent(h.get("priority"))
         if band and not (owed and h.get("owed") is False):
@@ -1392,8 +1592,10 @@ def preempt(by: str, every: list[Path], project_name: str | None = None,
 PREEMPT_LOG = "preempt-asks.jsonl"   # check-slots/preempt-asks.jsonl: who asked by hand (ask_preempt), one line each
 
 
-def ask_preempt(run: str, by: str) -> tuple[bool, str]:
-    """`ttp checks --preempt <run>`: ask the checks of run `run` (its slot label's run_id) to give up their
+def ask_preempt(run: str, by: str, owners: list[dict] | tuple = ()) -> tuple[bool, str]:
+    """`ttp checks --preempt <run>`: ask the checks of run `run` (its slot label's run_id, or a slot held by
+    one of `owners`: the run's lane holders as `ttp checks --slot-status` names them, checklane.run_owners,
+    which also finds a run the daemon relaunched under another run_id) to give up their
     slot of the cap, with the request preempt() writes (no claim: the freed slot goes to the queue's next
     waiter in its order), and log who asked (PREEMPT_LOG). Refused for push checks (a priority slot, or a push
     turn on the cap), a reserved urgent slot's run, an owed holder (its task owns an open obligation; an urgent
@@ -1401,7 +1603,9 @@ def ask_preempt(run: str, by: str) -> tuple[bool, str]:
     or an older ttp: preemptible). Returns (asked, the line to print)."""
     for path in all_paths() + urgent_paths() + priority_paths():
         h = _read(path)
-        if str(h.get("run_id") or "") != str(run) or not locks.held_labels([path]):
+        if str(h.get("run_id") or "") != str(run) and not any(same_owner(h, o) for o in owners):
+            continue
+        if not locks.held_labels([path]):
             continue
         who = str(h.get("holder") or f"run {run}")
         if path.name.startswith(PRIORITY + ".") or str(h.get("command") or "").startswith("push checks"):
@@ -1704,6 +1908,10 @@ def _take(n: int, ps: list[Path], every: list[Path], holder: str, what: str, sam
     room = _room(n, every, mine) if room is None else room
     if room <= 0 or cores_short(every) or diskgate.saturated():
         return None
+    if label is not None and "checks_project" in label and not label["checks_project"] \
+            and _bare_held(every) >= bare_slots() and _project_waits():
+        # a run with no project: at most bare_slots() at once while a project's run waits
+        return None
     f = locks.try_take(ps, holder, what, key=same, extra=label)
     if f is None and (x := extra(n)):
         f = locks.try_take(every[n:n + x], holder, what, key=same, extra=label)
@@ -1781,9 +1989,10 @@ def record_wait(state: Path | None, project_name: str | None, priority: int | No
     0: none), stored as "cap" so throughput judges the wait by it; None (no project lane): no field.
     `lane_at`: when the run got its repository's lane (`ttp checks` queues for it before this slot, from
     the same `queued_at`), stored as "lane_at": only the time after it waited for the host."""
-    task = os.environ.get("TTP_TASK") or ""
+    task, run = _task_run()
+    task = task or ""
     rec = {"project": project_name, "task": int(task) if task.isdigit() else None,
-           "run": os.environ.get("TTP_RUN_ID") or None, "priority": priority, "slot": slot,
+           "run": run or None, "priority": priority, "slot": slot,
            "queued_at": round(queued_at, 3), "granted_at": round(granted_at, 3)}
     if cap is not None:
         rec["cap"] = int(cap)
@@ -1948,10 +2157,18 @@ def urgent_waits(project_name: str | None, now: float | None = None, min_s: floa
 
 def urgent_wait_text(w: dict) -> str:
     """One urgent_waits entry in words: the queue, the waiter, how long and what holds it."""
+    f = urgent_wait_fold(w)
+    return f"urgent checks {f['item']} in {f['group']}; {f['ctx']}"
+
+
+def urgent_wait_fold(w: dict) -> dict:
+    """urgent_wait_text's parts, the event's `fold` data (coordinator.fold_events): one NEW EVENTS line per
+    queue names each waiter and what holds the queue now once."""
     held = "; ".join(w["held_by"][:8]) + (f"; and {len(w['held_by']) - 8} more" if len(w["held_by"]) > 8 else "")
-    head = (f"urgent checks {w['holder']} (priority {w['priority']:g}) have waited {w['waited_s'] / 60:.0f} min in "
-            f"the host-wide {w['queue']} queue; held by: ")
     if w.get("load"):   # the load guard, not the pool's slots: name it and its passes' holders
-        return (head + f"the host load guard ({w['load']}); its load passes held by: "
-                + (held or "none right now (its next try takes one)"))
-    return head + (held or 'nothing held right now (the next turn is due)')
+        ctx = (f"held by: the host load guard ({w['load']}); its load passes held by: "
+               + (held or "none right now (its next try takes one)"))
+    else:
+        ctx = "held by: " + (held or 'nothing held right now (the next turn is due)')
+    return {"group": f"the host-wide {w['queue']} queue", "ctx": ctx,
+            "item": f"{w['holder']} (priority {w['priority']:g}) have waited {w['waited_s'] / 60:.0f} min"}

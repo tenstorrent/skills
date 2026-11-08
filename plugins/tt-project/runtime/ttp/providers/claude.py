@@ -164,7 +164,9 @@ class Claude(Provider):
         else:
             argv += ["--permission-mode", "bypassPermissions"]
         if schema:
-            argv += ["--json-schema", json.dumps(strict_schema(schema))]
+            # Only each object's own required fields: requiring all of them made every answer pad its
+            # unused fields with null (most of a coordinator answer). parse() reads it as sparse.
+            argv += ["--json-schema", json.dumps(strict_schema(schema, require_all=False))]
         if not read_only:
             web = web and not restrictions.get("no_internet")
             if self.supports(TOOLS):
@@ -482,6 +484,7 @@ class Claude(Provider):
         cache_keys = ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
         cache_complete = False
         tool_ids: set[str] = set()   # tool calls, each block once (a streamed message repeats its blocks)
+        pending: tuple[str, dict] | None = None   # the newest main-agent StructuredOutput call not run yet
         for n, ev in enumerate(self._events(output_path)):
             t = ev.get("type")
             if t == "rate_limit_event":
@@ -514,12 +517,21 @@ class Claude(Provider):
                                 and isinstance((last_json_object(block["text"]) or {}).get("actions"), list):
                             u.actions_text = block["text"]
                     elif isinstance(block, dict) and block.get("type") == "tool_use" \
+                            and block.get("name") == "StructuredOutput" and not ev.get("parent_tool_use_id") \
+                            and isinstance(block.get("input"), dict):
+                        pending = (str(block.get("id") or ""), block["input"])
+                    elif isinstance(block, dict) and block.get("type") == "tool_use" \
                             and self.is_connector(str(block.get("name") or "")):
                         # Its workers then keep the connectors (Daemon._connectors_needed).
                         used = u.extra.setdefault("connectors_used", [])
                         name = str(block["name"]).split("__")[1]
                         if name not in used:
                             used.append(name)
+            elif t == "user" and pending:
+                # The answer call ran (taken, refused by the schema or denied by a hook): never kept below.
+                if any(isinstance(b, dict) and b.get("type") == "tool_result" and str(b.get("tool_use_id")) == pending[0]
+                       for b in (ev.get("message") or {}).get("content") or []):
+                    pending = None
             elif t == "system" and ev.get("subtype") == "init":
                 if "model" in u.extra:   # a later init: the CLI started again, on the login it found then
                     u.extra["reinit"] = True
@@ -538,13 +550,17 @@ class Claude(Provider):
                 if isinstance(thinking, int) and not isinstance(thinking, bool):
                     u.extra["thinking_tokens"] = thinking   # part of output_tokens (effortab.report)
                 u.final_text = ev.get("result") if isinstance(ev.get("result"), str) else json.dumps(ev.get("result"))
-                u.structured = drop_nulls(ev.get("structured_output"))
+                u.structured = drop_nulls(ev.get("structured_output"), sparse=True)
                 if ev.get("is_error"):
                     u.error = f"{ev.get('subtype')}: {str(ev.get('result'))[:300]}"
                     typed += [str(e) for e in ev.get("errors") or []] + [str(ev.get("result") or "")]
                 else:
                     typed = []   # the CLI got past the errors it streamed
                 u.extra["subtype"] = ev.get("subtype")
+                if ev.get("subtype") == "error_max_budget_usd" and pending and not u.structured:
+                    # The budget ran out on the call that gave the final answer, so the CLI never ran it.
+                    # A tool block streams whole: the daemon may apply it (Daemon._finish_coordinator).
+                    u.answer = drop_nulls(pending[1], sparse=True)
                 u.session_id = ev.get("session_id", u.session_id)
         if not saw_result:
             # Ended before the result line (killed, lost): the tokens the stream showed are all there

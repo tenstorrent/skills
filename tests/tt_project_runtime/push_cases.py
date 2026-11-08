@@ -2198,6 +2198,48 @@ def test_the_daily_audit_names_the_time_from_approval_to_landing(env, monkeypatc
     assert "approval to landing: 4 landed" in "\n".join(audit.lines(s.p.db, now=now))
 
 
+def test_a_rescue_requeues_only_the_entries_that_build_on_the_blamed_one_and_lands_the_rest(env, monkeypatch, capsys):
+    """The first entry breaks the checks and the second is built on its branch: without it the second
+    would replay its commits, so only the second is requeued; the independent third and fourth are
+    replayed onto the tip without them, checked once and pushed (never all requeued for one dependent)."""
+    p, repo, origin, other = _bump_setup(env, monkeypatch, ["test ! -e plugins/p/bad.txt"])
+    e1 = _entry(repo, "e1", {"plugins/p/bad.txt": "1\n"})
+    _git_out(repo, "checkout", "-q", "-B", "e2", e1)
+    (repo / "plugins/p/f2.txt").write_text("2\n")
+    _git_out(repo, "add", "plugins/p/f2.txt")
+    _git_out(repo, "commit", "-qm", "e2: on e1")
+    e2 = _git_out(repo, "rev-parse", "HEAD")
+    heads = [e1, e2] + [_entry(repo, f"e{n}", {f"plugins/p/f{n}.txt": f"{n}\n"}) for n in (3, 4)]
+    rc, m = _run_batch(p, _batch_marker(p, heads), monkeypatch)
+    assert rc == 0 and m["outcome"] == "pushed", m
+    assert _statuses(m) == ["check_failed", "requeued", "pushed", "pushed"], m
+    assert [_git_out(origin, "show", f"proj:plugins/p/f{n}.txt") for n in (3, 4)] == ["3", "4"]
+    assert _git_out(origin, "ls-tree", "--name-only", "proj", "plugins/p/").split() == [
+        "plugins/p/.claude-plugin", "plugins/p/f3.txt", "plugins/p/f4.txt", "plugins/p/rt"], "neither e1 nor e2"
+    out = capsys.readouterr().out
+    assert "entry 2 after 1 does not replay without it; requeued" in out
+    assert "checking the 2 entries after 1 without it" in out
+
+
+def test_a_rescue_lands_a_later_entry_that_shares_only_an_earlier_entry_with_the_blamed_one(env, monkeypatch):
+    """The blamed (second) entry is built on the first, which passes: a later entry built on the first
+    only is not built on the blamed one and goes; one built on the blamed one is requeued."""
+    p, repo, origin, other = _bump_setup(env, monkeypatch, ["test ! -e plugins/p/bad.txt"])
+
+    def on(parent, name, path):
+        _git_out(repo, "checkout", "-q", "-B", name, parent)
+        (repo / path).write_text(name + "\n")
+        _git_out(repo, "add", path)
+        _git_out(repo, "commit", "-qm", f"{name}: {path}")
+        return _git_out(repo, "rev-parse", "HEAD")
+    e1 = _entry(repo, "e1", {"plugins/p/f1.txt": "e1\n"})
+    e2 = on(e1, "e2", "plugins/p/bad.txt")
+    heads = [e1, e2, on(e1, "e3", "plugins/p/f3.txt"), on(e2, "e4", "plugins/p/f4.txt")]
+    rc, m = _run_batch(p, _batch_marker(p, heads), monkeypatch)
+    assert rc == 0 and _statuses(m) == ["pushed", "check_failed", "pushed", "requeued"], m
+    assert [_git_out(origin, "show", f"proj:plugins/p/f{n}.txt") for n in (1, 3)] == ["e1", "e3"]
+
+
 def test_the_entries_an_urgent_approval_stopped_a_search_for_are_searched_again_and_the_culprit_blamed(env, monkeypatch):
     """Blame stays right: the entries a search stopped for an urgent approval go in a later batch of
     their own (the urgent one is never among them), whose search blames the entry that broke the checks."""
@@ -3716,6 +3758,55 @@ def test_an_approval_sent_back_by_a_conflict_leads_its_priority_in_the_next_batc
                  (task, s.branch, s.head, "origin/proj", status, now - 600, now - 300))
     got, why = pushq.due(s.p, now)
     assert [r["id"] for r in got] == [hot, back, *older, carried], why
+
+
+def test_a_stream_of_priority_two_approvals_cannot_keep_an_old_priority_three_one_out_of_batches(env, monkeypatch):
+    """#6857: priority 3-4 approvals waited about 10.7 h while priority 1-2 approvals refilled every batch.
+    delivery.push_age_s ages an approval one priority per period waited, never past priority 2: once it
+    reaches the priority-2 lane it is older than the stream and leads it; priority 1 still goes first."""
+    from ttp import pushq
+    s = _pq(env, monkeypatch, push_batch_s=0, push_batch_max=2, push_age_s=3600)
+    s.p.db.update_task(s.review, status="done")
+    now = time.time() + 1
+    _pq_last_batch(s, "tip_failed", now - 4000)   # past the gap; not clean, so the cap stays 2
+    _pq_earlier(s)                                # none independent: only priority and age decide
+    old = _pq_review(s, priority=3)[1]
+    s.p.db.x("UPDATE push_queue SET created=? WHERE id=?", (now, old))
+    taken_at = None
+    for k in range(6):   # every 20 min two more priority-2 approvals arrive; each batch takes two
+        t = now + 1200 * k
+        for _ in range(2):
+            s.p.db.x("UPDATE push_queue SET created=? WHERE id=?", (t, _pq_review(s, priority=2)[1]))
+        got = [r["id"] for r in pushq.due(s.p, t)[0]]
+        assert len(got) == 2
+        if old in got:
+            taken_at = k
+            assert got[0] == old, "aged to priority 2, the older approval leads the stream"
+            break
+        s.p.db.x(f"DELETE FROM push_queue WHERE id IN ({','.join('?' * len(got))})", got)
+    assert taken_at == 3, "taken by the first batch once it waited push_age_s, never before"
+    # Priority 1 (urgent) still goes first: an aged approval never passes priority 2.
+    s.p.db.x("UPDATE push_queue SET created=? WHERE id=?", (now - 10 * 3600, old))
+    hot = _pq_review(s, priority=1)[1]
+    got = [r["id"] for r in pushq.due(s.p, now)[0]]
+    assert got == [hot, old], got
+    assert [r["aged_priority"] for r in pushq._approved(s.p.db, "origin/proj", now, 3600)][:2] == [1, 2]
+    # Priority 4 needs two periods; push_age_s 0 turns aging off.
+    s.p.db.x("DELETE FROM push_queue WHERE id IN (?,?)", (hot, old))
+    four = _pq_review(s, priority=4)[1]
+    for age, rank in ((3599, 4), (3600, 3), (7200, 2), (10 ** 6, 2)):
+        s.p.db.x("UPDATE push_queue SET created=? WHERE id=?", (now - age, four))
+        [r] = [r for r in pushq._approved(s.p.db, "origin/proj", now, 3600) if r["id"] == four]
+        assert (r["priority"], r["aged_priority"]) == (4, rank), age
+        assert (pushq._prio(r) <= pushq.FAST_PRIORITY) == (rank == 2)
+    [r] = [r for r in pushq._approved(s.p.db, "origin/proj", now, 0) if r["id"] == four]
+    assert r["aged_priority"] == 4, "push_age_s 0: no aging"
+    s.p.db.x("UPDATE push_queue SET created=? WHERE id=?", (now + 7200, four))   # a clock step back
+    [r] = [r for r in pushq._approved(s.p.db, "origin/proj", now, 3600) if r["id"] == four]
+    assert r["aged_priority"] == 4, "a future approval time never makes it worse or better"
+    s.p.set_config("delivery.push_age_s", 0)
+    s.p.db.x("UPDATE push_queue SET created=? WHERE id=?", (now - 10 ** 6, four))
+    assert four not in [r["id"] for r in pushq.due(s.p, now)[0]], "off: the priority-2 approvals keep it out"
 
 
 def test_an_approval_sent_back_by_a_conflict_keeps_its_lead_over_an_older_peer_sharing_its_files(env, monkeypatch):
@@ -8200,6 +8291,120 @@ def test_missing_program_resolves_the_program_a_launcher_runs_in_the_checks_env(
     assert envfault.missing_program("true && mylint", tmp_path, off) == "mylint"   # past a builtin
 
 
+def test_checks_wrap_cmd_scoped_to_its_repos_wraps_only_their_checks(env, tmp_path, monkeypatch, capsys):
+    """A wrapper scoped to the repositories it serves ({"cmd", "repos"}) wraps only their checks: a check in
+    another repository runs unwrapped and says so; a plain string still wraps every repository."""
+    from ttp import cli, project, push
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    log = tmp_path / "wrap.log"
+    wrapper = str(_arg_logging_wrapper(tmp_path / "lock.sh", log))
+    calls = lambda: log.read_text().splitlines().count("CALL") if log.exists() else 0
+    tree = subprocess.run([*git, "worktree", "add", "-q", "-b", "side", str(tmp_path / "side")], capture_output=True)
+    assert tree.returncode == 0, tree.stderr
+    # Scoped by folder name, by absolute path, by a path relative to the project root, or a list mixing them.
+    for repos in ("work", [str(repo)], [os.path.relpath(repo, p.root)], ["other", "work"]):
+        p.set_config("checks.wrap_cmd", {"cmd": wrapper, "repos": repos})
+        before = calls()
+        cli.main(["checks", "--fresh", "--", "true"])
+        assert calls() == before + 1, repos
+        assert "run behind checks.wrap_cmd" in capsys.readouterr().out
+    # A worktree of a named repository is that repository.
+    monkeypatch.chdir(tmp_path / "side")
+    before = calls()
+    cli.main(["checks", "--fresh", "--", "true"])
+    assert calls() == before + 1
+    monkeypatch.chdir(repo)
+    # Another repository's checks run unwrapped, even when the wrapper is missing.
+    for cmd in (wrapper, str(tmp_path / "nope.sh")):
+        p.set_config("checks.wrap_cmd", {"cmd": cmd, "repos": ["other-repo", str(tmp_path / "elsewhere")]})
+        capsys.readouterr()
+        before = calls()
+        cli.main(["checks", "--fresh", "--", "true"])
+        assert calls() == before and "scoped to other repositories" in capsys.readouterr().out
+        assert json.loads((run / "checks.json").read_text())["passed"] is True
+    # A plain string applies everywhere, as before.
+    p.set_config("checks.wrap_cmd", wrapper)
+    before = calls()
+    cli.main(["checks", "--fresh", "--", "true"])
+    assert calls() == before + 1
+    # Without a repository: the wrapper itself (its lock's identity), whatever its scope.
+    scoped = {"checks": {"wrap_cmd": {"cmd": "w --x", "repos": "work"}}}
+    assert push.wrap_of(scoped) == ("w", "--x") and push.wrap_of(scoped, repo, p) == ("w", "--x")
+    assert push.wrap_of(scoped, tmp_path, p) == ()
+    assert push.wrap_of({"checks": {"wrap_cmd": "w"}}, tmp_path, p) == ("w",)
+    # Malformed maps are refused by the config check, naming the key.
+    for bad in ({"cmd": "w"}, {"cmd": "w", "repos": []}, {"cmd": "w", "repos": [""]}, {"cmd": "", "repos": ["a"]},
+                {"cmd": "'unclosed", "repos": ["a"]}, {"cmd": "w", "repos": ["a"], "lane": "x"}, {"repos": ["a"]}):
+        assert any("checks.wrap_cmd" in x for x in project.config_problems({"checks": {"wrap_cmd": bad}})), bad
+    assert not [x for x in project.config_problems({"checks": {"wrap_cmd": {"cmd": "w", "repos": ["a"]}}})
+                if "wrap" in x]
+
+
+def test_push_own_runs_extras_unwrapped_in_a_repository_the_scoped_wrapper_does_not_serve(
+        env, monkeypatch, capsys, tmp_path):
+    p, repo, origin, other = _push_setup(env, monkeypatch, [COND])
+    run = tmp_path / "run"
+    run.mkdir()
+    monkeypatch.setenv("TTP_RUN_DIR", str(run))
+    monkeypatch.setenv("TTP_TASK", "60")
+    _git_out(repo, "checkout", "-q", "-b", "ttp/t60-exp")
+    _commit(repo, "mine.dat", "mine\n")
+    head = _git_out(repo, "rev-parse", "HEAD")
+    (run / "checks.json").write_text(json.dumps({"head": head, "passed": True, "commands": ["true"],
+                                                 "skipped": [], "ts": 0}))
+    # A missing wrapper scoped to another repository is not this one's: the extras run, unwrapped.
+    p.set_config("checks.wrap_cmd", {"cmd": str(tmp_path / "nope.sh"), "repos": ["not-this-repo"]})
+    assert _ttp("push", "--own") == 0
+    assert _git_out(origin, "rev-parse", "ttp/t60-exp") == head
+    # Scoped to this repository: it applies (a missing one fails, never runs unwrapped).
+    _commit(repo, "more.dat", "more\n")
+    head = _git_out(repo, "rev-parse", "HEAD")
+    (run / "checks.json").write_text(json.dumps({"head": head, "passed": True, "commands": ["true"],
+                                                 "skipped": [], "ts": 0}))
+    p.set_config("checks.wrap_cmd", {"cmd": str(tmp_path / "nope.sh"), "repos": [str(repo)]})
+    capsys.readouterr()
+    assert _ttp("push", "--own") == 4 and "checks.wrap_cmd" in capsys.readouterr().err
+
+
+def test_a_wrapped_check_the_wall_cap_stops_before_any_test_started_is_a_queue_timeout_not_a_failure(
+        env, tmp_path, monkeypatch, capsys):
+    from ttp import checkwall, cli
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    monkeypatch.setenv("TTP_TASK", "7")
+    p.set_config("checks.wall_cap_s", 2)
+    queue = tmp_path / "queue.sh"   # a wrapper that only says where it waits in its queue
+    queue.write_text('#!/bin/sh\nwhile :; do echo "waiting in the queue, position 8"; sleep 0.2; done\n')
+    queue.chmod(0o755)
+    p.set_config("checks.wrap_cmd", str(queue))
+    with pytest.raises(SystemExit) as e:
+        cli.main(["checks", "--", "true"])
+    err = capsys.readouterr().err
+    assert e.value.code == 75, err
+    assert "before any test started: a wrapper or queue timeout, not a test failure" in err, err
+    rec = json.loads((run / "checks.json").read_text())
+    assert rec["passed"] is False and rec["infra_fault"] == checkwall.QUEUED_INFRA and rec["timed_out"]["queued"]
+    assert checkwall.last_timeout(p.state, "7")["queued"]
+    # A wrapped check whose tests had started is a plain timeout of the run (exit 1), never a queue timeout.
+    started = tmp_path / "started.sh"
+    started.write_text('#!/bin/sh\necho "============ test session starts ============"\nexec sleep 300\n')
+    started.chmod(0o755)
+    p.set_config("checks.wrap_cmd", str(started))
+    with pytest.raises(SystemExit) as e:
+        cli.main(["checks", "--fresh", "--", "true"])
+    err = capsys.readouterr().err
+    assert e.value.code == 1 and "a wrapper or queue timeout" not in err, err
+    assert "queued" not in json.loads((run / "checks.json").read_text())["timed_out"]
+    # An unwrapped check stopped at the cap with no output is a plain timeout too.
+    p.set_config("checks.wrap_cmd", "")
+    with pytest.raises(SystemExit) as e:
+        cli.main(["checks", "--fresh", "--", "sleep 300"])
+    assert e.value.code == 1 and "a wrapper or queue timeout" not in capsys.readouterr().err
+    # What counts as a test start: a runner header, collection or a verdict; a queue's own words do not.
+    assert checkwall.test_started("collected 3 items\n") and checkwall.test_started("1 passed in 0.1s\n")
+    assert checkwall.test_started("1..4\nok 1\n")
+    assert not checkwall.test_started("waiting in the queue, position 8\nno verdict yet\n")
+
+
 def test_push_own_reruns_recorded_extras_behind_checks_wrap_cmd(env, monkeypatch, capsys, tmp_path):
     log = tmp_path / "wrap.log"
     p, repo, origin, other = _push_setup(env, monkeypatch, [COND])
@@ -12381,7 +12586,8 @@ def test_push_solo_paths_is_off_by_default_and_when_set_holds_a_routine_change_o
     """Prompt changes that fit a size cap alone but not together are found by the batch's cap probes, so
     by default a batch takes every prompt change. Set, delivery.push_solo_paths lets a batch take at most
     one routine approval touching it: the oldest leads the next batch, newer ones of a better priority
-    never pass it, and priority 1-2 ones are never held."""
+    never pass it, and priority 1-2 ones are never held. An approval aged to priority 2 (push_age_s; every
+    one here, 10**6 s on) is still held by its own priority, and leads the next batch after them."""
     from ttp import pushq
     s = _pq(env, monkeypatch, push_batch_max=3)
     _git_out(s.repo, "fetch", "-q", "origin")
@@ -12412,7 +12618,8 @@ def test_push_solo_paths_is_off_by_default_and_when_set_holds_a_routine_change_o
     assert [r["id"] for r in rows][:3] == [e, f, c] and g not in [r["id"] for r in rows], \
         "the held one leads the routine part of the next batch, after the fast ones; newer routine ones wait"
     s.p.set_config("delivery.push_solo_paths", [])
-    assert [r["id"] for r in pushq.due(s.p, time.time() + 10 ** 6)[0]] == [e, f, c, g]
+    assert [r["id"] for r in pushq.due(s.p, time.time() + 10 ** 6)[0]] == [e, c, f, g], \
+        "off: none held; aged to priority 2 (delivery.push_age_s), c is older than f and leads it"
 
 
 def test_cap_failure_reads_only_a_complete_list_of_prompt_cap_test_failures_and_their_overshoots():

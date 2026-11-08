@@ -74,6 +74,7 @@ DEFAULT_BATCH_MAX = 8           # delivery.push_batch_max: start at once with th
 DEFAULT_MIN_GAP_S = 1800        # delivery.push_min_gap_s: after a batch that did not end clean, the least time to the next start
 CLEAN_OUTCOMES = ("pushed", "landed", "nothing")   # the tip passed and the push went: no gap after these
 FAST_PRIORITY = 2               # an approval of this priority or better goes in the next batch, ahead of routine ones (fast_ids)
+DEFAULT_AGE_S = 14400           # delivery.push_age_s: an approval sorts one priority better per this many seconds waited (_approved; 0 = off)
 OPEN_ROWS = ("approved", "batched", "held")   # rows approved but not landed nor sent back
 # delivery.push_solo_paths: git pathspecs; a batch takes at most one routine approval whose change touches
 # them (fast ones are never held). Off by default: two prompt changes that fit a size cap alone but not
@@ -929,15 +930,32 @@ def yields_to(p: Project, name: str) -> list[int]:
     return urgent.approvals_waiting(p.db, name)
 
 
-def _approved(db, name: str) -> list[dict]:
-    """The approved rows for target `name`, best priority first; within a priority an approval an earlier
+def _approved(db, name: str, now: float | None = None, age_s: float = DEFAULT_AGE_S) -> list[dict]:
+    """The approved rows for target `name`, best aged priority first; within it an approval an earlier
     batch sent back as a conflict leads, then by age. A re-approved head would otherwise queue behind
     the newer approvals of its priority, and a peer ahead of it in the batch touching its lines sends
     it back again: each repeat costs another conflict fix and review. Leading, it loses at most to
-    what landed before it."""
-    return db.q("SELECT q.*, t.priority FROM push_queue q JOIN tasks t ON t.id=q.task WHERE q.status='approved' "
-                "AND t.status='pushing' AND q.target=? ORDER BY t.priority, NOT EXISTS (SELECT 1 FROM push_queue c "
-                "WHERE c.task=q.task AND c.status='conflict'), q.id", (name,))
+    what landed before it.
+    Aging (`aged_priority`): an approval worse than FAST_PRIORITY sorts one priority better per `age_s`
+    (delivery.push_age_s) it has waited since approval, never better than FAST_PRIORITY, so a steady
+    stream of priority 1-2 approvals cannot keep it out of batches: priority k joins the priority-2
+    lane after (k - 2) * age_s and, older than the stream, leads it. Urgent ones (priority 1 or better)
+    stay ahead. Aging over a reserved slot per batch: no batch carries a routine change it does not
+    need, and the bound holds whatever the batch size."""
+    now = time.time() if now is None else now
+    age_s = float(age_s or 0)
+    aged = ("CASE WHEN ? > 0 AND t.priority > ? THEN MAX(?, t.priority - CAST(MAX(0, ? - q.created) / ? AS INTEGER)) "
+            "ELSE t.priority END")
+    return db.q(f"SELECT q.*, t.priority, {aged} AS aged_priority FROM push_queue q JOIN tasks t ON t.id=q.task "
+                "WHERE q.status='approved' AND t.status='pushing' AND q.target=? ORDER BY aged_priority, "
+                "NOT EXISTS (SELECT 1 FROM push_queue c WHERE c.task=q.task AND c.status='conflict'), q.id",
+                (age_s, FAST_PRIORITY, FAST_PRIORITY, now, age_s or 1, name))
+
+
+def _prio(r: dict) -> int:
+    """A row's priority for the batch order: its aged priority (_approved), else its task's (9 if none)."""
+    v = r.get("aged_priority", r.get("priority"))
+    return int(v if v is not None else 9)
 
 
 def _sent_back(db, rows: list[dict]) -> set[int]:
@@ -1112,8 +1130,9 @@ def due(p: Project, now: float | None = None, cfg: dict | None = None) -> tuple[
     the batch is full or holds one the last batch requeued untested, it waits for
     delivery.push_min_gap_s since the last one. Approvals that waited while the last batch ran, clean
     or not, start the next one as soon as it ends (not the ones it held itself). Fast approvals
-    (fast_ids: urgent, priority 1-2, or sharing no file with an earlier unlanded approval) wait for
-    neither: they start a train at once and lead it, and every other approval rides in it. After a batch a
+    (fast_ids: urgent, priority 1-2 or aged to it (delivery.push_age_s: _approved), or sharing no file
+    with an earlier unlanded approval) wait for neither: they start a train at once and lead it, and
+    every other approval rides in it. After a batch a
     reboot cut short its members still approved go again at once, alone and in its order (_cut_members)."""
     now = time.time() if now is None else now
     if not enabled(p, cfg):
@@ -1126,7 +1145,8 @@ def due(p: Project, now: float | None = None, cfg: dict | None = None) -> tuple[
     live = db.one("SELECT id FROM push_batches WHERE after_finalized IS NULL ORDER BY started LIMIT 1")
     if live:
         return [], f"batch {live['id']} is still going"
-    rows = _approved(db, f"{remote}/{branch}")
+    d = _delivery(p, cfg)
+    rows = _approved(db, f"{remote}/{branch}", now, _num(d.get("push_age_s"), DEFAULT_AGE_S, float, 0))
     if not rows:
         return [], "nothing approved"
     deps = dep_waits(p, rows, now)
@@ -1162,7 +1182,6 @@ def due(p: Project, now: float | None = None, cfg: dict | None = None) -> tuple[
             return [], (f"held: the tip {_short(bad['tip'])} fails its checks on its own and every approval was "
                         f"tried on it; next try {_at(until, now, p)} unless the tip or the approvals change")
         rows = fresh + [r for r in rows if r["id"] in tried]
-    d = _delivery(p, cfg)
     window = _num(d.get("push_batch_s"), DEFAULT_BATCH_S, float, 0)
     cap = int(_num(d.get("push_batch_max"), DEFAULT_BATCH_MAX, int, 1))   # starts a train; caps none
     gap = _num(d.get("push_min_gap_s"), DEFAULT_MIN_GAP_S, float, 0)
@@ -1223,7 +1242,9 @@ def due(p: Project, now: float | None = None, cfg: dict | None = None) -> tuple[
         rows = _ordered(rows, before, approved)
         if not rows:
             return [], "overlapping approvals wait for a batch that takes them in order"
-    taken, held = _one_solo(p, rows, len(rows), _solo_paths(d), _tracking_tip(p, remote, branch), fast)
+    tip = _tracking_tip(p, remote, branch)
+    solo = _solo_paths(d)   # aging lets a routine approval lead, never skip the one-per-batch hold
+    taken, held = _one_solo(p, rows, len(rows), solo, tip, fast_ids(p, rows, tip, skip=tried, aged=False) if solo else fast)
     if held:
         why += (f"; {len(held)} more approval{'s' if len(held) != 1 else ''} touching delivery.push_solo_paths "
                 f"wait{'s' if len(held) == 1 else ''} for a later batch (one per batch)")
@@ -1274,19 +1295,21 @@ def _changed(p: Project, tip: str, head: str) -> frozenset | None:
     return got
 
 
-def fast_ids(p: Project, rows: list[dict], tip: str, skip: set = frozenset()) -> set[int]:
+def fast_ids(p: Project, rows: list[dict], tip: str, skip: set = frozenset(), aged: bool = True) -> set[int]:
     """The ids of `rows` (approved, same target) that go in a batch of their own at once: urgent
-    (urgent.covers_urgent), of priority FAST_PRIORITY or better, or changing no file that an earlier
+    (urgent.covers_urgent), of priority FAST_PRIORITY or better (aged: _approved), or changing no file that an earlier
     row still in the queue (approved, batched or held) changes. Files overlap.ignore lists
     (changesets, changelogs, manifests) do not count. A row sent back as a conflict counts as earlier
     than every routine row of its priority or worse (it leads them: _approved), so an older peer sharing
     its files never goes ahead of it. A row git cannot read is not independent, nor is any with no
-    fetched tip; rows in `skip` (already tried on a failing tip) are never fast."""
+    fetched tip; rows in `skip` (already tried on a failing tip) are never fast. `aged` False: by the
+    task's own priority, not the aged one (the push_solo_paths hold: _one_solo)."""
     if not rows:
         return set()
     db = p.db
     out = {r["id"] for r in rows if r["id"] not in skip and (
-        int(r["priority"] if r["priority"] is not None else 9) <= FAST_PRIORITY or urgent.covers_urgent(db, db.task(r["task"])))}
+        (_prio(r) if aged else _prio({"priority": r.get("priority")})) <= FAST_PRIORITY
+        or urgent.covers_urgent(db, db.task(r["task"])))}
     if not tip:
         return out
     globs = overlap.settings(p).get("ignore")
@@ -1297,7 +1320,7 @@ def fast_ids(p: Project, rows: list[dict], tip: str, skip: set = frozenset()) ->
         got = _changed(p, tip, e["head"]) if e["head"] else None
         files[e["id"]] = None if got is None else frozenset(f for f in got if not overlap._ignored(f, globs))
     back = _sent_back(db, rows)
-    prio = {r["id"]: int(r["priority"] if r["priority"] is not None else 9) for r in rows}
+    prio = {r["id"]: _prio(r) for r in rows}
     for r in rows:
         mine = files.get(r["id"])
         if r["id"] in skip or r["id"] in out or not mine:
@@ -1320,7 +1343,7 @@ def _one_solo(p: Project, rows: list[dict], cap: int, paths: list[str], tip: str
     """Up to `cap` of `rows` in order, at most one routine one (not in `fast`) a change touching `paths`
     since it left `tip`: (taken, the touching ones left for a later batch). The oldest touching one
     (one sent back as a conflict before any other: _approved) leads the routine part, so each waits at most one batch per older one, never behind newer ones of
-    a better priority. Fast rows are never held. A row git cannot tell about counts as touching (one
+    a better priority. Fast rows (by their own priority: due) are never held and lead. A row git cannot tell about counts as touching (one
     per batch is the safe side)."""
     if not paths or len(rows) < 2:
         return rows[:cap], []

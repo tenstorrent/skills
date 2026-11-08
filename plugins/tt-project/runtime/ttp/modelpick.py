@@ -11,7 +11,8 @@ the core pick is the tier's own route-free start.
 
 Rules (model-free) send to core: any kind but code, work and harness; a deep task; a retry or a task
 started before; a device task; a conclusion run (tierfloor.reasons); an urgent task; a task labelled
-`untrusted_input`; a spec naming optimization, performance, architecture or hard-debugging work. A light
+`untrusted_input`; a spec naming optimization, performance, architecture or hard-debugging work; a stratum
+the tripwire holds on core (modeltrip.py). A light
 task follows the light tier's own route, and a task pinning a provider or model keeps its pin (no pick).
 The rest are open: Jev answers a `choice` over the option keys from a redacted state capped near
 STATE_CHARS (kind, tier, labels, title, the spec's head, the paths it names and their count, a
@@ -181,6 +182,9 @@ def rules(db: DB, cfg: dict, task: dict, tier: str) -> str | None:
             return "conclusion"
     except Exception:   # an unreadable floor keeps the task on core
         return "conclusion"
+    from .modeltrip import tripped
+    if tripped(db, task, tier):
+        return "tripwire"
     return ""
 
 

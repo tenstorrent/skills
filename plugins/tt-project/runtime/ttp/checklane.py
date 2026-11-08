@@ -883,11 +883,7 @@ def _stalled(rec: dict, now: float, cfg: dict | None = None) -> str:
 
 
 def _ticket_task(t: Path) -> str:
-    try:
-        m = re.search(r"task #(\d+)", t.read_text())
-    except OSError:
-        return ""
-    return m.group(1) if m else ""
+    return locks.ticket_task(t)
 
 
 def waits(project_name: str, cfg: dict | None, now: float | None = None, over_s: float = 0.0) -> list[dict]:
@@ -1097,6 +1093,18 @@ def _precheck_of(text) -> str:
     return m.group(1) if m else ""
 
 
+def run_owners(project_name: str, run) -> list[dict]:
+    """The owner fields (checkcap.OWNER_KEYS) of project `project_name`'s lane holders whose run is `run`, as
+    lane_status names it: the run folder's name, also for checks the daemon started again under another
+    run_id (relaunch-t<task>). `ttp checks --preempt` finds that run's host-wide slot by them."""
+    out = []
+    for base in testslots.suite_bases(project_name):
+        for r in locks.holder_records(testslots._lanes_of(base)):
+            if str(run) and _run_of(r.get("holder")) == str(run) and r.get("pid"):
+                out.append({k: r.get(k) for k in checkcap.OWNER_KEYS})
+    return out
+
+
 def _run_of(text: str) -> str:
     m = re.search(r"\brun (\d+)", str(text or ""))
     return m.group(1) if m else ""
@@ -1130,7 +1138,7 @@ def lane_status(project_name: str, now: float | None = None, cfg: dict | None = 
         for r in recs[base]:
             t = holder_times(r, now)
             running = t["running_s"]
-            lanes.append({"task": str(r.get("task") or ""), "run": _run_of(r.get("holder")), "pid": r.get("pid"),
+            lanes.append({"task": _holder_task(r), "run": _run_of(r.get("holder")), "pid": r.get("pid"),
                           "priority": r.get("priority"), "age_s": t["held_s"], "queued_s": t["queued_s"],
                           "alive": r.get("alive"), "children": t["children"],
                           "running_s": running, "cap_s": float(r.get("cap_s") or 0),
@@ -1162,6 +1170,12 @@ def lane_status(project_name: str, now: float | None = None, cfg: dict | None = 
                         "kind": "wrapper lock" if key.startswith("w") else "repository" if key else "project",
                         "lanes": lanes, "waiters": waiters})
     return out
+
+
+def _holder_task(rec: dict) -> str:
+    """The task a lane holder runs for: its "task" field, else its run record's task_id (locks.run_ids)."""
+    task = str(rec.get("task") or rec.get("task_id") or "")
+    return task if task.isdigit() else ""
 
 
 def _why(text) -> str:

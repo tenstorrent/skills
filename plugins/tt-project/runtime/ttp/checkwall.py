@@ -15,6 +15,11 @@ RECENT completed runs (RUNS_LOG; a timed-out run is not one), within FLOOR_S and
 MIN_RUNS of them; DEFAULT_S before that. `checks.wall_cap_s` (seconds; in project.json, else the account
 settings, else TTP_CHECKS_WALL_CAP_S) sets it; 0 turns it off.
 
+A command behind checks.wrap_cmd (the project's own lock or queue) stopped at the cap before any test
+started (test_started: no test output yet) waited in that wrapper's queue the whole time: a wrapper or
+queue timeout (its record says "queued"), no verdict, never a test failure of the head (`ttp checks`
+exits 75 with infra_fault QUEUED_INFRA).
+
 A hang need not wait for the cap: a command whose output has not grown for its silence limit (SILENT_S,
 10 min; a check object's `"silent_s"` sets it, 0 turns it off) is stopped the same way and recorded as a
 timeout with "silent_s" (wait, said_silent). A check that is silent longer by design raises its silent_s.
@@ -55,6 +60,10 @@ RUNS_MAX_BYTES = 64 * 1024
 TIMEOUTS = "checks-timeouts.json"
 TIMEOUTS_MAX = 50
 RC = 124   # a timed-out check's exit code in the log and records (as timeout(1)'s)
+QUEUED_INFRA = "wrapper-queue-timeout"   # checks.json infra_fault of a wrapped command the cap stopped before any test
+# A test runner's first words (pytest's session header or collection, a TAP plan, a ctest or go test start);
+# a verdict line (setupfault.VERDICT) counts too.
+STARTED = re.compile(r"test session starts|^collect(?:ing|ed)\b|^\d+\.\.\d+$|^Test project |^=== RUN ", re.M)
 SILENT_S = 600.0   # a command whose output has not grown this long is a hang (Check.silent_s; 0: off)
 POLL_S = 5.0       # how often wait() looks at the output's size
 clock = time.monotonic   # wait()'s clock; tests swap in a test clock
@@ -285,7 +294,18 @@ def span(s: float) -> str:
     return f"{s:.0f} s" if s < 60 else _mins(s)
 
 
-def said(check: str, cap_s: float, how: str, head: str) -> str:
+def test_started(output: str) -> bool:
+    """Whether a check's output shows a test runner started (STARTED) or gave a verdict (setupfault.VERDICT)."""
+    from . import setupfault
+    return bool(STARTED.search(output) or setupfault.scan(output).verdict)
+
+
+def said(check: str, cap_s: float, how: str, head: str, queued: bool = False) -> str:
+    if queued:
+        return (f"{check!r} waited behind checks.wrap_cmd (the project's own lock or queue) until the checks "
+                f"wall-time cap of {_mins(cap_s)} ({how}) stopped it on {head[:12]} before any test started: a "
+                f"wrapper or queue timeout, not a test failure; the change is neither passed nor failed (run the "
+                f"checks again later; a repository the wrapper does not serve: scope it with checks.wrap_cmd's repos)")
     return (f"{check!r} was stopped on {head[:12]} at the checks wall-time cap of {_mins(cap_s)} ({how}): a timeout, "
             f"not a pass; its process group was ended and the checks slot released (a stuck or slow suite: find "
             f"what hangs, or raise checks.wall_cap_s)")
@@ -302,7 +322,8 @@ def said_for(rec: dict) -> str:
     """What a timed-out run's record (checks.json "timed_out") says: no output, else the wall-time cap."""
     if rec.get("silent_s"):
         return said_silent(str(rec.get("check")), float(rec["silent_s"]), str(rec.get("head") or ""))
-    return said(str(rec.get("check")), float(rec.get("cap_s") or 0), str(rec.get("how") or ""), str(rec.get("head") or ""))
+    return said(str(rec.get("check")), float(rec.get("cap_s") or 0), str(rec.get("how") or ""), str(rec.get("head") or ""),
+                bool(rec.get("queued")))
 
 
 def record_timeout(state: Path | None, task: str | None, rec: dict) -> None:

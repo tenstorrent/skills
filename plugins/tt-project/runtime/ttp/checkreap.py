@@ -98,9 +98,20 @@ def tied(pid: int, tok: str, pgids=(), root: str = "") -> bool:
     return False
 
 
+def _inside_run(tok: str) -> bool:
+    """Whether this process itself was started carrying run `tok` (its environment at exec, which a
+    later os.environ change never alters): one of that run's checks, never its runner."""
+    try:
+        return f"{MARKER}={tok}".encode() in (PROC / "self" / "environ").read_bytes().split(b"\0")
+    except OSError:
+        return False
+
+
 def members(tok: str, pgids=(), root: str = "") -> list[int]:
-    """The live processes tied to run `tok` (never this process or its ancestors)."""
-    if not tok or not PROC.is_dir():
+    """The live processes tied to run `tok` (never this process or its ancestors). None when this
+    process is itself inside run `tok`: the runner never carries its own token, so a check (or a test
+    worker under it) that reaps its own run would only end its siblings, e.g. the other test workers."""
+    if not tok or not PROC.is_dir() or _inside_run(tok):
         return []
     mine = _ancestors()
     out = []

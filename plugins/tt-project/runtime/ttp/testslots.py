@@ -31,7 +31,9 @@ off. A project's own checks.test_pool / checks.test_run_max may only lower them.
 (`full`) waits in line until at least run_min() slots are free in both the pool and its project's
 budget, then starts with at least that many, so a suite never runs for half an hour on one or two
 workers; with a pool or budget smaller than that it starts with what they can give. Pre-stages, push
-checks and builds keep at least one.
+checks and builds keep at least one. A worker's own pytest asking for more than one worker takes slots
+through `ttp clip` or `ttp sandbox` (direct): at most its TTP_TEST_SLOTS, fewer while others hold them,
+held by the test process itself, so they free when it ends or dies.
 
 One project holds at most project_max() slots at once over all its runs, as per-project lock files
 beside the pool's, so a burst of one project's checks leaves room for the others. Its default is the
@@ -544,10 +546,59 @@ def build_env(k: int) -> dict[str, str]:
 
 
 def worker_env(cfg: dict | None) -> dict[str, str]:
-    """A worker's environment: tests and builds it runs directly in its shell start at most one run's share."""
+    """A worker's environment: tests and builds it runs directly in its shell start at most one run's share.
+    SLOTS_ENV is the most test workers one of its pytest runs may ask for; a run takes them from the host's
+    pool through `ttp clip` or `ttp sandbox` (direct), so a bare `pytest -n auto` starts one (XDIST_ENV 1)."""
     s, b = sizes(cfg), sizes(cfg, kind=BUILDS)
     k = min(s[1], project_max(cfg, s)) if s else 0
-    return {**({XDIST_ENV: str(k), SLOTS_ENV: str(k)} if s else {}), **(build_env(b[1]) if b else {})}
+    return {**({XDIST_ENV: "1", SLOTS_ENV: str(k)} if s else {}), **(build_env(b[1]) if b else {})}
+
+
+DIRECT_WAIT_S = 240.0   # a worker's own pytest waits this long for a host test slot, then runs on one worker
+
+
+def asked(cmd: str, share: int) -> int | None:
+    """The most test workers a pytest run in shell line `cmd` starts: its explicit -n N / --numprocesses N,
+    `share` for -n auto or logical, 1 with none (or -n 0); None when `cmd` runs no pytest."""
+    most = None
+    for seg in _segments(cmd):
+        words = [w for *_, w in seg]
+        if (tool := next((i for i, w in enumerate(words) if _is_tool(words, i, False)), None)) is None:
+            continue
+        n = 1
+        for i in range(tool + 1, len(words)):
+            if words[i] == "--":
+                break
+            if not (m := re.fullmatch(r"(-n|--numprocesses)(=?)(.*)", words[i])):
+                continue
+            v = m.group(3) or (words[i + 1] if not m.group(2) and i + 1 < len(words) else "")
+            n = int(v) if v.isdigit() else share if v in ("auto", "logical") else n
+        most = max(most or 0, n, 1)
+    return most
+
+
+def direct(cmd: str, holder: str, tell: Callable[[str], None]) -> Grant | None:
+    """A worker's own pytest run (`ttp clip`, `ttp sandbox`) takes its test workers from the host's pool,
+    as a `ttp checks` run does: in a worker run (SLOTS_ENV, its share) not inside a run that holds slots,
+    for a pytest asking more than one worker (asked), up to that many, at most the share. With too few
+    free it starts with fewer; with none it waits (in line, under the load guard and its project's budget,
+    as acquire) up to DIRECT_WAIT_S, then runs on one worker without a slot. The caller lowers -n to
+    grant.k (clamp) and runs the command with grant.env() and the grant's files (inheritable here), so
+    the test process holds the slots and its end or death frees them. None: nothing to take."""
+    share = _number(os.environ.get(SLOTS_ENV))
+    if not share or os.environ.get(HELD_ENV) or os.environ.get(checkcap.HELD_ENV):
+        return None
+    if (n := asked(cmd, share) or 0) <= 1:
+        return None
+    grant = acquire(holder, tell, DIRECT_WAIT_S, most=min(n, share))
+    if grant is None:
+        tell(f"no host test slot free after {DIRECT_WAIT_S:.0f} s: running on 1 test worker")
+        return Grant(1)
+    if not grant.k:   # the pool is off
+        return None
+    for f in grant.files:
+        os.set_inheritable(f.fileno(), True)
+    return grant
 
 
 def paths(pool: int, kind: Kind = TESTS):
@@ -560,6 +611,10 @@ class Grant:
     def __init__(self, k: int = 0, files=(), waited: float = 0.0, kind: Kind = TESTS):
         self.k, self.files, self.waited, self.kind = k, list(files), waited, kind
         self.extra: dict[str, str] = {}   # more variables for the commands, e.g. the run's ports (port_block)
+
+    def fds(self) -> tuple[int, ...]:
+        """The held slot files' descriptors, for a command that should hold them for its life (pass_fds)."""
+        return tuple(f.fileno() for f in self.files)
 
     def env(self) -> dict[str, str]:
         if not self.k:
@@ -650,7 +705,8 @@ def _pass_told(what: str, passed, load: str) -> str:
 def acquire(holder: str, tell: Callable[[str], None] | None = None, wait_s: float | None = None,
             cfg: dict | None = None, project_name: str | None = None, push_key: str = "",
             kind: Kind = TESTS, priority: int | None = None, stop: Callable[[], str] | None = None,
-            since: float | None = None, full: bool = False, waits: Callable[[str], None] | None = None) -> Grant | None:
+            since: float | None = None, full: bool = False, waits: Callable[[str], None] | None = None,
+            most: int | None = None) -> Grant | None:
     """Take this run's test slots (above); waits while none is free, urgent runs of any project first
     (locks.urgent_order: priority 1 or better, by priority then arrival), the rest first-come, telling why every
     TELL_S. None only once `wait_s` passed with none free (a foreground caller hands over). Nested in a
@@ -671,7 +727,8 @@ def acquire(holder: str, tell: Callable[[str], None] | None = None, wait_s: floa
     (load_guard), except one run per load pass at a time (load_pass_paths: a priority-0 run's, an urgent or
     push run's, the floor's; it holds the pass with its grant): it waits, telling why and passing the reason
     to `waits` (its lanes' wait note, lane_waits), and `waits` gets "host test slots" again once the load drops. A push check's wait there is bounded
-    (push_load_wait_s): past it, it starts on its branch's reserved lane alone."""
+    (push_load_wait_s): past it, it starts on its branch's reserved lane alone. `most`: a run's most slots
+    below run_max (a worker's own pytest -n N, direct)."""
     tell = tell or (lambda _line: None)
     what = f"{kind.name} slots"
     for env in (kind.held_env, HELD_ENV):   # HELD_ENV: a build in a check builds on the check's slots
@@ -728,6 +785,7 @@ def acquire(holder: str, tell: Callable[[str], None] | None = None, wait_s: floa
             if s is None:
                 return Grant(kind=kind)
             pool, top = s
+            top = max(1, min(top, most)) if most else top
             guard = _grant_guard(kind)   # let go once it took its slots or found none (below)
             # Slots in use over every pool file there may be (a pool that shrank leaves holders past its end).
             used = len(locks._slot_labels(paths(max(pool, checkcap.cores()), kind)))
@@ -1190,9 +1248,9 @@ def pool_gate(cfg: dict | None, project_name: str | None, full: bool = False, pr
     its urgent slots instead (urgent_paths), as acquire takes them. A run of the project parked past
     checkcap.starve_s() that arrived before `since` (this run's arrival; default now) goes first
     (checkcap.starved_ahead), unless this run is more urgent and that one's turn (one per
-    checkcap.aged_turns() urgent starts) has not come, or this run, of `cost`, is much cheaper than that one's; an urgent run leaves that turn only to the oldest
-    less urgent one, once per checkcap.aged_turns() urgent starts since its project's last routine start. A less urgent
-    run leaves them to its project's parked owed (priority-0) runs whatever its wait (checkcap.owed_ahead). A run leaves `need` slots of the pool to each urgent
+    checkcap.aged_turns() urgent starts) has not come, or this run, of `cost`, is much cheaper than that one's;
+    an owed or urgent run is never held by a less urgent one. A less urgent run leaves them to its project's
+    parked owed (priority-0) runs whatever its wait (checkcap.owed_ahead). A run leaves `need` slots of the pool to each urgent
     run of another project parked for its test slots ahead of it (urgent_parked: a routine run to every one,
     an urgent run to those more urgent or as urgent and older), so a freed slot goes to the urgent one, not
     to whichever polls first; one its own gate holds otherwise keeps none. A routine run also leaves `need`
@@ -1590,7 +1648,7 @@ def suite_hold(project_name: str | None, tell: Callable[[str], None] | None = No
     count = slots if callable(slots) else (lambda _held, n=max(1, int(slots or 1)): n)
     base = suite_base(project_name, repo)
     extra_lanes = lane_paths(project_name, 1, repo, overflow=True)
-    task = os.environ.get("TTP_TASK") or ""
+    task = str(checkcap._task_run()[0] or "")   # TTP_TASK, else the adopted one (checkcap.adopt_identity)
     label = f"{project_name}: full checks ({who + ', ' if who else ''}pid {os.getpid()})"
     ns = locks._pid_ns()
     text = ((f"task #{task} {label}" if task.isdigit() else label) + (f" [check {check}]" if check else "")
@@ -1944,6 +2002,14 @@ def _apply(cmd: str, edits) -> str:
 def over(cmd: str, k: int) -> list[int]:
     """The explicit pytest `-n N` / `--numprocesses N` values in `cmd` above `k` (as clamp() finds them)."""
     return [n for *_, n in _edits(cmd, k, False)]
+
+
+def unpooled(cmd: str) -> list[int]:
+    """The explicit pytest `-n N` values above 1 in `cmd` whose command no `ttp clip` or `ttp sandbox`
+    wraps, so no host test slots are taken for them (direct)."""
+    wrapped = [(seg[0][0], seg[-1][1]) for seg in _segments(cmd)
+               if any(_base(a) == "ttp" and b in ("clip", "sandbox") for (*_, a), (*_, b) in zip(seg, seg[1:]))]
+    return [n for start, *_, n in _edits(cmd, 1, False) if not any(lo <= start <= hi for lo, hi in wrapped)]
 
 
 def clamp(cmd: str, k: int) -> str:

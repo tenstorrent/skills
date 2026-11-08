@@ -444,6 +444,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # dead_dep_h blocked on a failed or cancelled dependency (0: off). Urgent, user-ordered, review and
     # obligation-owner tasks never expire.
     "queue": {"expire_h": 48, "dead_dep_h": 24},
+    # A code task's `premise_cmd:` (premise.py) runs model-free before each dispatch, killed after
+    # cmd_timeout_s; an exit 0 lets the task dispatch for recheck_min minutes, then it runs again.
+    "premise": {"cmd_timeout_s": 60, "recheck_min": 30},
     # Builtin watchers (prs, logfile): one run stops at deadline_s (capped at 1800), keeps what it read
     # and reports one error saying it was cut short; each gh call times out after gh_timeout_s, cut to
     # the time left. The prs watcher reads pr_workers PRs at once, each within pr_timeout_s, each PR once
@@ -470,10 +473,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # daemon (`ttp upgrade`, once per release, never inside a push step; pushes hold it push_hold_min at
     # most, then it starts between their steps), which then restarts keeping workers.
     # A clean merge whose runtime compiles and imports lands with no model task. A conflict or a failed
-    # check queues one harness task per task_every_h at most, whatever the last one did; releases meanwhile
-    # wait and the next task merges the newest. A host-side `ttp upgrade` queues it once the last one ended
-    # merge_retry_h ago.
-    "upgrade": {"auto": True, "merge_retry_h": 6, "task_every_h": 6, "push_hold_min": 30},
+    # check queues one harness task at once, never on a timer: one at most is open, and a newer release
+    # retargets it. One that ended without landing holds off the next only until a newer release or a
+    # change to the project's own runtime or template files.
+    "upgrade": {"auto": True, "push_hold_min": 30},
     # Upstream notes (hand-off follow-ups titled `upstream: ...`) are filed in the user's inbox
     # ~/.tt-project/upstream.jsonl. With ingest on, this project's coordinator gets them as events.
     "upstream": {"ingest": False},
@@ -612,7 +615,7 @@ EXTRA_KEYS = {
     # (--own) or a reboot that cut it short (push.retries_of; default 2, 0: never).
     "delivery": {"base_ref", "push_branch", "landed_probe", "push_checks", "push_checks_by_repo", "push_exclude_paths", "push_rounds", "push_wait_s",
                  "push_checks_timeout_s", "push_pool_wait_s", "push_retries",
-                 "version_bump", "push_queue", "push_batch_s", "push_batch_max", "push_min_gap_s", "push_landing_alert_h", "push_script_torn_escalate_after",
+                 "version_bump", "push_queue", "push_batch_s", "push_batch_max", "push_min_gap_s", "push_age_s", "push_landing_alert_h", "push_script_torn_escalate_after",
                  "push_setup_fault_escalate_after", "after_push",
                  "push_solo_paths", "push_cap_tests", "push_rerun_s", "mechanical_merge_paths",
                  "after_push_timeout_s", "backup_remote", "fast_forward_also", "mirror_remotes",
@@ -621,7 +624,7 @@ EXTRA_KEYS = {
                  "checks_targeted", "checks_targeted_always",   # a task's `ttp checks` runs the tests its diff reaches (testpick)
                  "checks_task_full",   # the user's own: a task's `ttp checks --full` runs with the push queue on (testpick.full_refusal)
                  "checks_host",   # where checks run (remotecheck)
-                 "checks_spill_hosts", "checks_spill_after_s",   # where busy checks may spill to (checkspill)
+                 "checks_spill_hosts", "checks_spill_after_s", "checks_spill_first",   # where busy checks may spill to (checkspill)
                  "check_prestage",   # a short foreground run before `ttp checks --detach` (checkprestage)
                  "pr_body_check",   # a project's own PR body check before gh pr create/edit (prbody)
                  "ai_tag",   # the AI-authorship tag a post to others ends with (aitag)
@@ -716,7 +719,8 @@ def _known_keys(path: list[str]) -> set[str] | None:
         return {"claude", "codex", "cursor", "fake", "chat"} if len(path) == 1 else PROVIDER_KEYS if len(path) == 2 else None
     if path == ["checks"]:
         # wrap_cmd: the project's own lock or queue command the commands after `ttp checks --` run
-        # behind (push.wrap_of; default "", none); delivery.push_checks never go through it.
+        # behind (push.wrap_of; default "", none); delivery.push_checks never go through it. A map
+        # {"cmd": ..., "repos": [repo keys]} scopes it to those repositories; others run unwrapped.
         # wrap_lane: where those runs take its lane, before the wrapper starts or after (push.wrap_lane_of).
         # no_device_cmds: commands that need no device, run without wrap_cmd (checklane.no_device).
         # fallback_lane: where those run while wrap_cmd's lock is paused, a wrapper or "unwrapped" (push.fallback_lane_of;
@@ -725,7 +729,8 @@ def _known_keys(path: list[str]) -> set[str] | None:
         # test_project_max, done_holder_flag_s, done_holder_grace_s: the checks lanes (checklane);
         # test_project_slots: the project's test-worker budget (testslots.project_max); test_project_workers:
         # its ceiling on test workers over all its suites (testslots.project_workers); test_run_max: one
-        # suite's most workers, only lowering the account's (testslots.sizes);
+        # suite's most workers, only lowering the account's (testslots.sizes); test_run_min: a full run's
+        # fewest workers (testslots.run_min);
         # stall_s: a running check's log silence that makes it stalled (checkstall.stall_s);
         # push_load_wait_s: push checks' longest wait under the load guard (testslots.push_load_wait_s).
         # wrap_needs_device: false says the commands behind wrap_cmd need no device, so they may spill (checkspill).
@@ -736,7 +741,7 @@ def _known_keys(path: list[str]) -> set[str] | None:
         return {"nice", "python_lock", "ionice", "wall_cap_s", "wrap_cmd", "wrap_lane", "wrap_needs_device", "spill_wrap_cmd",
                 "spill_beside_device", "fallback_lane", "no_device_cmds", "slots", "light_cmds", "max_wait_s", "wait_event_s",
                 "wait_escalate_s", "wait_hang_factor", "priority_age_s", "test_project_max", "test_project_slots",
-                "test_project_workers", "test_run_max",
+                "test_project_workers", "test_run_max", "test_run_min",
                 "done_holder_flag_s", "done_holder_grace_s", "stall_s", "push_load_wait_s"}
     if len(path) == 1 and isinstance(DEFAULT_CONFIG.get(path[0]), dict):
         return set(DEFAULT_CONFIG[path[0]]) | EXTRA_KEYS.get(path[0], set())
@@ -850,6 +855,8 @@ RETIRED_KEYS = {
     "coordinator.session.mode": "the coordinator session is always on, with no off switch",
     "coordinator.session.pause_h": "the session spend guard is gone: the dollar caps are the cost limits",
     "budget.hourly_coordinator_usd": "the coordinator's hourly dollar guard is gone: the dollar caps are the cost limits",
+    "upgrade.merge_retry_h": "a conflicting upgrade queues its merge task at once, never on a timer",
+    "upgrade.task_every_h": "a conflicting upgrade queues its merge task at once, never on a timer",
 }
 
 
@@ -902,18 +909,22 @@ def code_tasks_may_push(cfg: dict) -> bool:
 # waited push_batch_s, push_batch_max are waiting or approvals waited out the last batch; after a batch
 # that did not end clean, not before push_min_gap_s passed since it ended unless it is full, priority
 # 1-2 or they waited it out; a batch, one train, takes every approval due, push_batch_max caps none)
+# push_age_s: an approval sorts one priority better per this many seconds waited, never past priority 2
+# (pushq._approved; 0 = off), so a stream of priority 1-2 approvals cannot starve a routine one.
 # and then runs after_push (commands like push_checks), killed after after_push_timeout_s.
 # push_landing_alert_h: approvals waiting this long with nothing landed raise a high alert (0 = off).
 # push_script_torn_escalate_after: batches held script_torn on one check this many times in a row raise a
 # high alert (pushq._held_told; 0 = off); push_setup_fault_escalate_after: the same for batches held
 # setup_fault (a check that failed before any test ran, after its reruns).
 PUSH_QUEUE_DEFAULTS = {"push_queue": False, "push_batch_s": 300, "push_batch_max": 8, "push_min_gap_s": 1800,
+                       "push_age_s": 14400,
                        "push_landing_alert_h": 4, "push_script_torn_escalate_after": 3,
                        "push_setup_fault_escalate_after": 3,
                        "after_push_timeout_s": 1800, "deploy_restart_wait_s": 900}
 # key: (minimum, whether the minimum itself is allowed, whole numbers only)
 PUSH_QUEUE_NUMBERS = {"push_batch_s": (0, True, False), "push_batch_max": (1, True, True),
-                      "push_min_gap_s": (0, True, False), "push_landing_alert_h": (0, True, False),
+                      "push_min_gap_s": (0, True, False), "push_age_s": (0, True, False),
+                      "push_landing_alert_h": (0, True, False),
                       "push_script_torn_escalate_after": (0, True, True),
                       "push_setup_fault_escalate_after": (0, True, True),
                       "after_push_timeout_s": (0, False, False), "deploy_restart_wait_s": (0, True, False)}
@@ -2943,8 +2954,8 @@ def unregister(name: str) -> None:
 ACCOUNT_KEYS = {"budget": {"global_daily_usd", "day_start", "timezone", "push_spend_to"}, "pricing": {"claude", "codex"},
                 "guards": {"protected_paths"},   # paths no run on the host writes (pathguard)
                 "route": {"host_max"},   # routed runs per provider at once on this host (route.host_limit)
-                "checks": {"host_max", "load_extra", "live_cores", "nice", "ionice", "priority_turns", "urgent_slots", "preempt_after_s", "test_pool", "test_run_max",
-                           "test_project_max", "test_project_slots", "test_project_workers", "load_guard", "build_pool", "build_run_max", "build_project_max", "wall_cap_s",
+                "checks": {"host_max", "bare_slots", "idle_hold_s", "load_extra", "live_cores", "nice", "ionice", "priority_turns", "urgent_slots", "preempt_after_s", "test_pool", "test_run_max",
+                           "test_run_min", "test_project_max", "test_project_slots", "test_project_workers", "load_guard", "build_pool", "build_run_max", "build_project_max", "wall_cap_s",
                            "slots", "light_cmds", "max_wait_s", "wait_event_s", "priority_age_s",
                            "wait_escalate_s", "wait_hang_factor", "done_holder_flag_s", "done_holder_grace_s", "stall_s", "starve_s", "small_tests",
                            "push_load_wait_s",

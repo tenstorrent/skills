@@ -830,7 +830,7 @@ def test_checks_log_records_each_check_commands_wall_clock_seconds_and_exit(env,
 
 # Host-wide test-worker slots (testslots) --------------------------------------------------------
 _SLOT_HOLDER = """
-import os, sys, time
+import json, os, sys, time
 from pathlib import Path
 from ttp import testslots
 g = testslots.acquire("holder " + sys.argv[1])
@@ -903,7 +903,7 @@ def test_test_slots_project_config_can_only_lower_the_host_limits(env, monkeypat
     assert testslots.sizes({"checks": {"test_pool": 0}}) == (16, 8), "a project cannot turn the host's pool off"
     got = testslots.worker_env({"checks": {"test_run_max": 3}})
     assert {k: got[k] for k in ("PYTEST_XDIST_AUTO_NUM_WORKERS", "TTP_TEST_SLOTS")} == {
-        "PYTEST_XDIST_AUTO_NUM_WORKERS": "3", "TTP_TEST_SLOTS": "3"}
+        "PYTEST_XDIST_AUTO_NUM_WORKERS": "1", "TTP_TEST_SLOTS": "3"}, "a bare -n auto: one worker; more through clip or sandbox"
     assert got["CMAKE_BUILD_PARALLEL_LEVEL"] == "8", "the build pool keeps its own limits"
 
 
@@ -1432,12 +1432,161 @@ def test_a_pytest_n_above_the_budget_is_lowered_with_a_line_saying_so_and_refuse
     assert "lowered to -n 3" in r.stderr and r.returncode == 0
     monkeypatch.setenv("TTP_TEST_SLOTS", "4")
     assert "budget of 4" in hook.too_many_workers("python3 -m pytest -n 16 tests/a.py")
-    assert hook.too_many_workers("pytest -n 4 tests/a.py") is None
-    assert hook.too_many_workers("pytest -n auto tests/a.py") is None
+    assert hook.too_many_workers("ttp clip -- ttp sandbox -- pytest -n 4 tests/a.py") is None
+    assert hook.too_many_workers("pytest -n auto tests/a.py") is None, "a bare -n auto starts one worker"
     assert hook.too_many_workers("ttp checks -- 'pytest -n 16 tests/a.py'") is None, "ttp checks lowers it"
     assert hook.too_many_workers("head -n 50 f && sort -n 99 g") is None
     monkeypatch.delenv("TTP_TEST_SLOTS")
     assert hook.too_many_workers("pytest -n 64 tests") is None, "outside a worker run: no budget"
+
+
+@pytest.mark.parametrize("cmd", ["pytest -n 4 tests/a.py", "cd x && python3 -m pytest -n4 tests",
+                                 "ttp detach t -- pytest --numprocesses=3 tests", "ttp clip -- true; pytest -n 2 t"])
+def test_a_workers_pytest_n_outside_clip_or_sandbox_is_refused_as_it_holds_no_host_test_slots(env, monkeypatch, cmd):
+    from ttp import hook, testslots
+    monkeypatch.setenv("TTP_TEST_SLOTS", "4")
+    assert "holds none of this shared host's test slots" in (hook.too_many_workers(cmd) or "")
+    for ok in ("pytest tests/a.py", "pytest -n 1 tests", "pytest -n 0 t", "ttp sandbox -- pytest -n 4 t",
+               "ttp clip -- pytest -n 4 t", "ttp detach t -- ttp clip -- pytest -n 4 t"):
+        assert hook.too_many_workers(ok) is None, ok
+    monkeypatch.setenv(testslots.HELD_ENV, "4")
+    assert hook.too_many_workers(cmd) is None, "inside a run that holds slots (a check) it runs on them"
+
+
+def test_asked_reads_a_pytest_runs_worker_count(env):
+    from ttp import testslots
+    a = testslots.asked
+    assert a("pytest -n 8 t", 4) == 8 and a("python3 -m pytest -n6 t", 4) == 6
+    assert a("pytest --numprocesses=3 t", 4) == 3 and a("pytest --numprocesses 5 t", 4) == 5
+    assert a("pytest -n auto t", 4) == 4 and a("pytest -n logical t", 4) == 4
+    assert a("pytest t", 4) == 1 and a("pytest -n 0 t", 4) == 1
+    assert a("nice -n 19 pytest t", 4) == 1, "a -n before the pytest word is not its"
+    assert a("pytest t -- -n 9", 4) == 1, "nor one after --"
+    assert a("head -n 50 f", 4) is None and a("make -j 8", 4) is None
+
+
+def _direct_env(monkeypatch, pool=4, share=4):
+    monkeypatch.setenv("TTP_TEST_POOL", str(pool))
+    monkeypatch.setenv("TTP_TEST_RUN_MAX", str(pool))
+    monkeypatch.setenv("TTP_CHECKS_LIVE_CORES", "0")
+    monkeypatch.setenv("TTP_TEST_SLOTS", str(share))
+    for v in ("TTP_TEST_SLOTS_HELD", "TTP_CHECKS_SLOT", "TTP_PROJECT"):
+        monkeypatch.delenv(v, raising=False)
+
+
+def test_a_workers_own_pytest_takes_host_test_slots_and_shrinks_to_what_is_free(env, monkeypatch):
+    from ttp import locks, testslots
+    _direct_env(monkeypatch)
+    other = testslots.acquire("a ttp checks run", most=3)
+    told: list = []
+    try:
+        assert other.k == 3
+        g = testslots.direct("pytest -n 8 tests", "worker pytest", told.append)
+        assert g is not None and g.k == 1 and len(g.files) == 1, "one slot left: it starts with one"
+        assert g.env()[testslots.XDIST_ENV] == "1" and testslots.clamp("pytest -n 8 tests", g.k) == "pytest -n 1 tests"
+        assert all(os.get_inheritable(fd) for fd in g.fds()), "the test process keeps them past an exec"
+        assert len(locks.held_labels(testslots.paths(4))) == 4
+        g.close()
+        assert testslots.direct("pytest tests", "serial", told.append) is None, "a one-process run takes none"
+        assert testslots.direct("make -j 4", "build", told.append) is None
+        monkeypatch.setenv(testslots.HELD_ENV, "2")
+        assert testslots.direct("pytest -n 8 tests", "nested", told.append) is None, "a check's own runs use its grant"
+    finally:
+        other.close()
+    monkeypatch.delenv(testslots.HELD_ENV)
+    g = testslots.direct("pytest -n 8 tests", "worker pytest", told.append)
+    assert g.k == 4, "at most its share (TTP_TEST_SLOTS), never the -n it asked"
+    g.close()
+    monkeypatch.delenv("TTP_TEST_SLOTS")
+    assert testslots.direct("pytest -n 8 tests", "no worker", told.append) is None, "outside a worker run: as before"
+
+
+def test_a_workers_own_pytest_waits_for_a_full_pool_then_runs_on_one_worker(env, monkeypatch):
+    import threading
+    from ttp import testslots
+    _direct_env(monkeypatch, pool=2, share=2)
+    full = testslots.acquire("a ttp checks run", most=2)
+    got, told = [], []
+    monkeypatch.setattr(testslots, "DIRECT_WAIT_S", 30.0)
+    t = threading.Thread(target=lambda: got.append(testslots.direct("pytest -n 2 t", "waiter", told.append)))
+    t.start()
+    try:
+        assert _wait_for(lambda: any("waiting for a host-wide test slot" in m for m in told)), told
+        assert not got, "a full pool: it waits"
+    finally:
+        full.close()
+    t.join(30)
+    assert got and got[0].k == 2 and got[0].files, "the freed slots go to the waiter"
+    got[0].close()
+    full = testslots.acquire("a ttp checks run", most=2)
+    monkeypatch.setattr(testslots, "DIRECT_WAIT_S", 0.2)
+    try:
+        g = testslots.direct("pytest -n 2 t", "waiter", told.append)
+        assert g.k == 1 and not g.files and "running on 1 test worker" in told[-1], "bounded: then one worker, no slot"
+    finally:
+        full.close()
+
+
+_FAKE_PYTEST = """#!{python}
+import json, os, sys, time
+from pathlib import Path
+out = Path(os.environ["FAKE_OUT"])
+Path(f"{{out}}.tmp").write_text(json.dumps([" ".join(sys.argv[1:]), os.environ.get("PYTEST_XDIST_AUTO_NUM_WORKERS", "")]))
+os.replace(f"{{out}}.tmp", out)
+while not Path(os.environ["FAKE_STOP"]).exists():
+    time.sleep(0.05)
+"""
+
+
+@pytest.mark.parametrize("wrapper", [["sandbox", "--"], ["clip", "--"]])
+def test_a_workers_own_pytest_holds_its_slots_until_the_test_process_ends_or_is_killed(env, tmp_path, monkeypatch, wrapper):
+    import signal
+    from ttp import locks, testslots
+    _direct_env(monkeypatch, pool=4, share=3)
+    bin_dir, xdist = tmp_path / "bin", tmp_path / "site" / "xdist"
+    bin_dir.mkdir()
+    xdist.mkdir(parents=True)
+    (xdist / "__init__.py").write_text("")   # drop_xdist keeps -n: the fake's interpreter finds xdist
+    fake = bin_dir / "pytest"
+    fake.write_text(_FAKE_PYTEST.format(python=sys.executable))
+    fake.chmod(0o755)
+    out, stop = tmp_path / "fake-pytest.txt", tmp_path / "stop"
+    run_env = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}", "FAKE_OUT": str(out), "FAKE_STOP": str(stop),
+               "PYTHONPATH": f"{RUNTIME}:{tmp_path / 'site'}", "TTP_RUN_DIR": str(tmp_path)}
+    held = lambda: len(locks.held_labels(testslots.paths(4)))  # noqa: E731
+    for end in ("exit", "kill"):
+        for f in (out, stop):
+            f.unlink(missing_ok=True)
+        proc = subprocess.Popen([sys.executable, "-m", "ttp", *wrapper, "pytest", "-n", "8", "tests"], env=run_env,
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
+        try:
+            if not _wait_for(lambda: out.exists() or proc.poll() is not None) \
+                    or proc.poll() is not None:
+                proc.kill()
+                raise AssertionError(proc.communicate()[0])
+            assert json.loads(out.read_text()) == ["-n 3 tests", "3"], "-n lowered to its grant, -n auto's variable set to it"
+            assert held() == 3, "the test process holds its slots"
+            if end == "kill":
+                os.killpg(proc.pid, signal.SIGKILL)   # the wrapper and the tests die at once: nothing cleans up
+            else:
+                stop.write_text("")
+            proc.wait(30)
+            assert _wait_for(lambda: held() == 0, 10), f"{end}: its slots are free again"
+        finally:
+            stop.write_text("")
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait(10)
+
+
+def test_config_takes_checks_test_run_min_per_project_and_account(env, monkeypatch):
+    from ttp import cli, testslots
+    p = make(env)
+    monkeypatch.delenv("TTP_TEST_RUN_MIN", raising=False)
+    cli.main(["config", "--account", "checks.test_run_min", "3"])
+    assert testslots.run_min({}, 8) == 3
+    cli.main(["config", p.name, "checks.test_run_min", "5"])
+    assert testslots.run_min(p.config(), 8) == 5, "the project's wins"
 
 
 def _build_share(monkeypatch, k):
@@ -2243,7 +2392,7 @@ def test_suite_slot_wait_line_of_ttp_checks_names_this_run_s_priority_and_rank(e
 
 
 _SUITE_RUNNER = """
-import os, sys, time
+import json, os, sys, time
 from pathlib import Path
 from ttp import checkcap, locks, testslots
 if sys.argv[3] == "hold":
@@ -5136,7 +5285,7 @@ def test_a_drained_checks_queue_ends_its_incident_and_a_new_queue_wakes_afresh(e
 
 
 _RUN_HOLDER = """
-import os, sys, time
+import json, os, sys, time
 from pathlib import Path
 from ttp import checklane, cli
 from ttp.project import Project
@@ -5362,7 +5511,7 @@ def test_a_lane_held_by_a_finished_task_s_check_is_flagged_then_only_its_own_che
 
 # A review precheck as `ttp checks --detach` holds its lane: cli._checks_slot under Daemon._start_checks' env.
 _PRECHECK_HOLDER = """
-import os, sys, time
+import json, os, sys, time
 from pathlib import Path
 from ttp import checklane, cli
 from ttp.project import Project
@@ -6780,7 +6929,9 @@ def test_a_project_s_concurrent_suites_share_its_worker_ceiling_and_its_push_lan
     assert b and b.k == 4, "another project has its own ceiling"
     push = testslots.acquire("push", project_name="pa", push_key="origin feature", wait_s=0)
     assert push and push.k == 4, "the reserved push lane makes up one per-run grant (4), not run_max (8)"
-    assert testslots.worker_env(None)[testslots.XDIST_ENV] == "4", "a worker's own shell starts at most the ceiling"
+    own = testslots.worker_env(None)
+    assert own[testslots.SLOTS_ENV] == "4", "a worker's own pytest asks at most the ceiling"
+    assert own[testslots.XDIST_ENV] == "1", "a bare -n auto in a worker's shell takes no slots, so starts one worker"
     cmd = "python3 -m pytest -q -n auto tests"
     assert testslots.clamp_for(cmd, a.env()) == cmd, "the command text stays: -n auto reads the environment"
     for g in (a, b, push):
@@ -7723,11 +7874,11 @@ def test_a_run_parked_past_the_starve_bound_gets_its_projects_next_test_slots(en
             s and s.close()
 
 
-def test_aged_parked_routine_runs_hold_a_later_urgent_run_of_their_project_only_on_their_turn(env, monkeypatch):
+def test_aged_parked_routine_runs_never_hold_a_later_urgent_run_of_their_project(env, monkeypatch):
     # #6033: three p2 runs parked past checks.starve_s and an aged p1 run that arrived after them: the p1 run
-    # goes first (starved_ahead holds only later arrivals at the aged run's priority or lower). Once
-    # checkcap.aged_turns() p1 runs of the project took a slot since the p2s aged, the oldest p2's turn comes
-    # (the bound); a p2 start resets it. Priority 0 is never held, push checks (no priority) are as before.
+    # goes first (starved_ahead holds only later arrivals at the aged run's priority or lower). #6907: however
+    # many p1 runs of the project took a slot since the p2s aged, an owed or urgent run is never held by them
+    # (only checks.priority_turns 0 lets them go first). Push checks (no priority) are as before.
     from ttp import checkcap, locks, testslots
     monkeypatch.setenv(checkcap.STARVE_ENV, "3600")
     monkeypatch.setenv("TTP_TEST_POOL", "8")
@@ -7751,15 +7902,13 @@ def test_aged_parked_routine_runs_hold_a_later_urgent_run_of_their_project_only_
         checkcap.record_wait(None, "pa", 1, aged_at - 600, aged_at - 300)   # before they aged: not a pass
         checkcap.record_wait(None, "pb", 1, aged_at, aged_at + 60)   # another project's: not this one's turn
         checkcap.record_wait(None, "pa", None, aged_at, aged_at + 60, "push")   # push checks: not a turn
-        for k in range(checkcap.AGED_TURNS):
-            assert checkcap.starved_ahead("pa", late, now, priority=1) == [], f"{k} urgent starts: not yet"
+        for k in range(3 * checkcap.AGED_TURNS):
             checkcap.record_wait(None, "pa", 1, aged_at + k, aged_at + 100 + k)
-        assert checkcap.starved_ahead("pa", late, now, priority=1) == p2s[:1], "after N urgent starts: the oldest's turn"
-        assert not testslots.pool_room({}, "pa", priority=1, since=late)
+            assert checkcap.starved_ahead("pa", late, now, priority=1) == [], f"{k + 1} urgent starts: still not held"
+        assert testslots.pool_room({}, "pa", priority=1, since=late)
         assert checkcap.starved_ahead("pa", late, now, priority=0) == [], "priority 0 keeps its precedence"
-        locks.dequeue(p2s[0])
-        checkcap.record_wait(None, "pa", 2, now - 9000, aged_at + 200)   # the oldest p2 started: the turn is used
-        assert checkcap.starved_ahead("pa", late, now, priority=1) == [], "urgent first again for N more starts"
+        monkeypatch.setenv("TTP_CHECKS_PRIORITY_TURNS", "0")   # no urgent precedence: aged ones go first
+        assert checkcap.starved_ahead("pa", late, now, priority=1) == p2s
     finally:
         for t in p2s + [p1]:
             locks.dequeue(t)
@@ -7768,7 +7917,7 @@ def test_aged_parked_routine_runs_hold_a_later_urgent_run_of_their_project_only_
 def test_a_parked_owed_run_takes_its_projects_next_freed_slot_before_older_aged_lower_priority_ones(env, monkeypatch):
     # #7318: with the pool full, two p2 runs parked past checks.starve_s and a newer p0 (owed) run of the same
     # project wait. The freed slot goes to the p0 run: the aged p2s leave it (checkcap.owed_ahead) instead of
-    # taking it by polling first. Aging among the p2s, a p1 asker's routine turn, push checks, a landing and
+    # taking it by polling first. Aging among the p2s, push checks, a landing and
     # other projects are unchanged.
     from ttp import checkcap, locks, testslots
     monkeypatch.setenv(checkcap.STARVE_ENV, "3600")
@@ -7819,11 +7968,11 @@ def test_a_parked_owed_run_takes_its_projects_next_freed_slot_before_older_aged_
             locks.dequeue(t)
 
 
-def test_an_urgent_run_is_held_by_at_most_the_oldest_aged_routine_run_on_its_shared_turn(env, monkeypatch):
+def test_an_urgent_run_is_never_held_by_aged_routine_runs_whose_own_turn_came(env, monkeypatch):
     # #6999: a priority-1 run behind 11 aged p2 runs and 4 aged p3 runs of its project. Routine (p2) starts
     # made the p3s' own turn come (more urgent than p3), which used to hold the p1 run behind all of them.
-    # Now an urgent run is held only on the routine runs' shared turn (aged_turns() urgent starts since the
-    # project's last routine start), and then only by the oldest; fairness among p2+ runs is unchanged.
+    # #6907: an urgent run is not held by them however many urgent starts went since the project's last
+    # routine start; fairness among p2+ runs is unchanged.
     from ttp import checkcap, locks, testslots
     monkeypatch.setenv(checkcap.STARVE_ENV, "3600")
     monkeypatch.setenv("TTP_TEST_POOL", "8")
@@ -7846,19 +7995,13 @@ def test_an_urgent_run_is_held_by_at_most_the_oldest_aged_routine_run_on_its_sha
         assert testslots.pool_room({}, "pa", priority=1, since=late), "so it gets the next free slots"
         assert checkcap.starved_ahead("pa", now, now, priority=2) == p2s + p3s, "p2 fairness: p2s, then p3s' turn"
         assert before == p2s, "before the routine starts: the older p2s only"
-        for k in range(checkcap.AGED_TURNS):   # the bound: N urgent starts since the last routine start
-            assert checkcap.starved_ahead("pa", late, now, priority=1) == [], f"{k} urgent starts: not yet"
+        for k in range(2 * checkcap.AGED_TURNS):   # past the old bound: N urgent starts since the last routine one
             checkcap.record_wait(None, "pa", 0 if k % 2 else 1, late, now - 2000 + k)
-        held = checkcap.starved_ahead("pa", late, now, priority=1)
-        assert held == p3s[:1], "the routine turn: only the oldest aged routine run goes first"
-        assert not testslots.pool_room({}, "pa", priority=1, since=late)
-        assert testslots.pool_gate({}, "pa", priority=1, since=late).startswith("1 run(s) of its project parked")
+        assert checkcap.starved_ahead("pa", late, now, priority=1) == [], "no routine turn ahead of an urgent run"
+        assert testslots.pool_room({}, "pa", priority=1, since=late)
         assert checkcap.starved_ahead("pa", late, now, priority=0) == [], "priority 0 is never held"
-        locks.dequeue(p3s[0])
-        checkcap.record_wait(None, "pa", 3, now - 20000, now - 1000)   # it started: the turn is used
-        assert checkcap.starved_ahead("pa", late, now, priority=1) == [], "urgent first again for N more starts"
         monkeypatch.setenv("TTP_CHECKS_PRIORITY_TURNS", "0")   # no urgent precedence: aged ones go first
-        assert checkcap.starved_ahead("pa", late, now, priority=1) == p3s[1:] + p2s
+        assert checkcap.starved_ahead("pa", late, now, priority=1) == p3s + p2s
     finally:
         for t in p3s + p2s + [p1]:
             locks.dequeue(t)
@@ -9601,6 +9744,51 @@ def test_ttp_checks_preempt_asks_a_run_by_hand_and_refuses_owed_push_and_locked_
             h.close()
 
 
+def test_ttp_checks_preempt_finds_a_relaunched_run_by_the_run_slot_status_names(env, tmp_path, monkeypatch, capsys):
+    """#7190 (2): checks the daemon started again after a reboot hold their host-wide slot under the run_id
+    relaunch-t<task>, while `ttp checks --slot-status` names them by their run folder (run 13549).
+    `ttp checks --preempt 13549` finds that slot through the run's lane holder and asks it; a run no lane
+    holder names is still not found, and the run_id still works."""
+    from ttp import checkcap, checklane, cli, testslots
+    p, repo, _, _ = _checks_repo(env, tmp_path, monkeypatch)
+    _lane_env(monkeypatch)
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "5")
+    monkeypatch.setenv("TTP_CHECKS_LOAD_EXTRA", "0")
+    run_dir = p.runs / "13549"
+    run_dir.mkdir(parents=True)
+    monkeypatch.setenv("TTP_RUN_DIR", str(run_dir))
+    monkeypatch.setenv("TTP_RUN_ID", "relaunch-t6862")
+    monkeypatch.setenv("TTP_TASK", "6862")
+    lane = testslots.suite_hold(p.name, wait_s=0, who=f"run {run_dir.name}", priority=2,
+                                repo=testslots.repo_key(str(repo)))
+    slot = checkcap.acquire(checkcap.label(p.name), "ttp checks on abc", priority=2, project_name=p.name,
+                            preemptible=True)
+    monkeypatch.setenv("TTP_RUN_ID", "r-asker")
+    monkeypatch.setenv("TTP_TASK", "91")
+
+    def ask(run):
+        with pytest.raises(SystemExit) as e:
+            cli.main(["checks", "--preempt", run])
+        return e.value.code, capsys.readouterr().out
+
+    try:
+        assert slot.f is not None and lane is not None
+        (row,) = checklane.lane_status(p.name)
+        assert [h["run"] for h in row["lanes"]] == ["13549"], row
+        rc, out = ask("13550")
+        assert rc == 1 and "no checks of run 13550" in out, out
+        rc, out = ask("13549")
+        assert rc == 0 and "task #6862 (run relaunch-t6862)" in out and "asked" in out, out
+        assert checkcap.preempted(slot.since) == "urgent #91"
+        checkcap.clear_preempt()
+        rc, out = ask("relaunch-t6862")
+        assert rc == 0 and checkcap.preempted(slot.since), out
+    finally:
+        checkcap.clear_preempt()
+        slot.close()
+        lane.close()
+
+
 def test_no_preemption_within_the_grace_and_it_counts_from_the_arrival(env, monkeypatch):
     """#6246 (3): an urgent waiter asks nobody while it has waited less than checks.preempt_after_s (default
     PREEMPT_AFTER_S); one that arrived longer ago (a re-execution keeps its arrival) asks at once."""
@@ -9632,7 +9820,7 @@ def test_no_preemption_within_the_grace_and_it_counts_from_the_arrival(env, monk
 
 def test_a_waiting_routine_checks_run_whose_task_turns_urgent_re_executes_once_as_urgent(env, monkeypatch):
     """#6246: the checks of a task raised to urgent while they wait read its priority again (reranked, at most
-    every RERANK_S) and re-execute once to queue as urgent, keeping their arrival; never for an urgent run."""
+    every RERANK_S) and re-execute once to queue as urgent, keeping their arrival; not while it stays urgent."""
     import io
     from ttp import checkcap, cli
     monkeypatch.setenv(checkcap.RERANK_ENV, "")
@@ -9658,7 +9846,50 @@ def test_a_waiting_routine_checks_run_whose_task_turns_urgent_re_executes_once_a
     cli._checks_reexec("1", 1234.5, 3, True, told.append, io.StringIO(), rerank=True)
     assert seen == {"rerank": "1", "reexec": "", "arrived": "1234.5"}, seen
     assert told[0].startswith("its task turned urgent (priority 1) while these checks waited at priority 3"), told
-    assert checkcap.reranked(p, 3, now=9000.0) is None, "once per run"
+    assert checkcap.reranked(p, 3, now=9000.0) is None, "once per priority"
+
+
+def test_a_waiting_checks_run_re_ranks_whenever_its_task_priority_changes_so_a_stale_ticket_holds_nobody(
+        env, monkeypatch):
+    """#6907: a run whose task is lowered while it waits (urgent 1 to routine 2) re-executes to queue at the
+    new priority too, and again on a later change; a failed re-execution is not retried at that priority. A
+    ticket left at the old priority would keep holding a later urgent waiter of its project as urgent."""
+    import io
+    from ttp import checkcap, cli, locks
+    monkeypatch.setenv(checkcap.RERANK_ENV, "")
+    monkeypatch.setattr(checkcap, "_RERANK", {"at": 0.0})
+    rank = [(2, [])]
+    monkeypatch.setattr(checkcap, "task_rank", lambda p: rank[0])
+    p = object()
+    assert checkcap.reranked(p, 1, now=1000.0) == 2, "an urgent run lowered to 2"
+    monkeypatch.setenv(checkcap.RERANK_ENV, "2")   # re-executed at 2
+    assert checkcap.reranked(p, 2, now=2000.0) is None, "queued at its priority"
+    rank[0] = (1, [])
+    assert checkcap.reranked(p, 2, now=3000.0) == 1, "raised again: re-ranked again"
+    monkeypatch.setenv(checkcap.RERANK_ENV, "1")   # that re-execution failed: waits on at 2
+    assert checkcap.reranked(p, 2, now=4000.0) is None, "not retried at the same priority"
+    rank[0] = (None, [])
+    assert checkcap.reranked(p, 2, now=5000.0) is None, "no task: as it queued"
+    monkeypatch.setattr(os, "execv", lambda *a: (_ for _ in ()).throw(OSError("no exec in a test")))
+    monkeypatch.setenv(checkcap.ARRIVED_ENV, "")
+    told = []
+    cli._checks_reexec("2", 1234.5, 1, True, told.append, io.StringIO(), rerank=True)
+    assert told[0].startswith("its task changed priority (priority 2) while these checks waited at priority 1"), told
+    assert "queueing again at their arrival" in told[0] and os.environ[checkcap.RERANK_ENV] == "2", told
+    monkeypatch.setenv(checkcap.STARVE_ENV, "3600")
+    now = time.time()
+    d, P = checkcap.slot_dir(), checkcap.PARKED
+    stale = locks.enqueue(d, P, "pa task #1 (run 1)", since=now - 9000, group="pa", priority=1)
+    try:
+        assert checkcap.starved_ahead("pa", now - 60, now, priority=1) == [stale], "left at 1: holds an urgent run"
+    finally:
+        locks.dequeue(stale)
+    ranked = locks.enqueue(d, P, "pa task #1 (run 1)", since=now - 9000, group="pa", priority=2)
+    try:
+        assert checkcap.starved_ahead("pa", now - 60, now, priority=1) == [], "re-ranked to 2: holds nobody urgent"
+        assert checkcap.starved_ahead("pa", now - 60, now, priority=0) == [], "nor an owed one"
+    finally:
+        locks.dequeue(ranked)
 
 
 def _yield_setup(monkeypatch, cap: str = "1"):
@@ -10003,8 +10234,8 @@ def locks_queued(checkcap):
 
 def test_a_claim_lapses_when_its_asker_dies_or_stops_renewing_and_its_request_then_asks_nothing(env, monkeypatch):
     """#6842 (1): a claim lives only while its asker lives and renews it (while the asked run holds its
-    slot and the asker is not parked), for at most CLAIM_MAX_S; a request whose claim lapsed or was dropped
-    preempts nobody, and the slot goes back to the normal turn."""
+    slot and the asker is not parked, or asked parked within PARKED_CLAIM_S), for at most CLAIM_MAX_S; a
+    request whose claim lapsed or was dropped preempts nobody, and the slot goes back to the normal turn."""
     from ttp import checkcap, locks
     monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "1")
     monkeypatch.setenv("TTP_CHECKS_LOAD_EXTRA", "0")
@@ -10023,12 +10254,17 @@ def test_a_claim_lapses_when_its_asker_dies_or_stops_renewing_and_its_request_th
         checkcap.renew_claim("tok1", parked=False)
         assert checkcap.claims() == 0, "a lapsed claim is not renewed"
         assert checkcap.preempted(victim.since) == "", "its request asks nothing any more"
-        checkcap._write(path, {**rec, "at": time.time()})
-        checkcap.renew_claim("tok1", parked=True)
-        assert json.loads(path.read_text())["at"] == pytest.approx(time.time(), abs=5)
         checkcap._write(path, {**rec, "at": old + 1})
         checkcap.renew_claim("tok1", parked=True)
         assert json.loads(path.read_text())["at"] == old + 1, "a parked asker does not renew it"
+        checkcap._write(path, {**rec, "at": (stale := time.time() - 1)})
+        checkcap.renew_claim("tok1", parked=True)
+        assert json.loads(path.read_text())["at"] == stale, "nor a live one it did not ask parked"
+        checkcap.renew_claim("tok1", parked=True, asked_parked=True)
+        assert json.loads(path.read_text())["at"] > stale, "one that asked parked renews it while the asked run holds"
+        checkcap._write(path, {**rec, "at": stale, "made": time.time() - checkcap.PARKED_CLAIM_S - 1})
+        checkcap.renew_claim("tok1", parked=True, asked_parked=True)
+        assert json.loads(path.read_text())["at"] == stale, "for at most PARKED_CLAIM_S from the ask"
         checkcap._write(path, {**rec, "at": time.time() - 1})
         checkcap.renew_claim("tok1", parked=False)
         assert json.loads(path.read_text())["at"] > time.time() - 1, "renewed while the asked run holds"
@@ -10045,9 +10281,69 @@ def test_a_claim_lapses_when_its_asker_dies_or_stops_renewing_and_its_request_th
         checkcap.clear_preempt()
         assert checkcap.preempt("urgent u", checkcap.all_paths(1)) == "victim"
         assert checkcap.preempted(victim.since) == "urgent urgent u", "a request with no claim asks as before"
+        victim.close()
+        for holder in ("", "another run"):   # its slot freed, then taken by another run
+            checkcap.drop_claim("tok1")
+            other = checkcap.acquire(holder, max_wait_s=10) if holder else checkcap.Slot()
+            if holder:
+                locks.relabel(other.f, {"pid": 4242, "pid_start": "s1", "ns_pid": None})
+            try:
+                checkcap._write(path, {**rec, "at": (stale := time.time() - 1)})
+                checkcap.renew_claim("tok1", parked=False)
+                assert json.loads(path.read_text())["at"] == stale, f"not renewed: {holder or 'freed'}"
+            finally:
+                other.close()
     finally:
         checkcap.clear_preempt()
         victim.close()
+
+
+def test_a_parked_asker_keeps_its_claim_while_the_asked_run_takes_longer_than_claim_s_to_free_its_slot(env, monkeypatch):
+    """#6907 (review #6873): a parked urgent asker did not renew its claim, so a victim slower than CLAIM_S
+    to end its command freed its slot after the claim had lapsed, and the waiter first in line took it. A
+    parked asker renews it while the asked run still holds its slot (PARKED_CLAIM_S from the ask at most); it
+    then takes the slot once unparked."""
+    import threading
+    from ttp import checkcap
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "1")
+    monkeypatch.setenv("TTP_CHECKS_LOAD_EXTRA", "0")
+    monkeypatch.setenv(checkcap.URGENT_SLOTS_ENV, "0")
+    monkeypatch.setenv(checkcap.PREEMPT_AFTER_ENV, "0")
+    monkeypatch.setenv(checkcap.PREEMPT_ASKED_ENV, "")
+    monkeypatch.setattr(checkcap, "POLL_S", 0.1)
+    monkeypatch.setattr(checkcap, "CLAIM_S", 1.0)
+    routine = checkcap.acquire("routine", project_name="pa", priority=3, preemptible=True)
+    freed = threading.Event()
+    startable = lambda: freed.is_set() or (checkcap.FREEING.get() or {}).get("holder") == "routine"  # noqa: E731
+    told, got, other = [], [], []
+    t_other = threading.Thread(target=lambda: other.append(checkcap.acquire(
+        "first in line", priority=1, since=time.time() - 600, max_wait_s=8)))
+    t_other.start()
+    assert _wait_for(lambda: locks_queued(checkcap)), "the other waiter is first in line"
+    t = threading.Thread(target=lambda: got.append(checkcap.acquire(
+        "urgent", project_name="pa", priority=1, urgent=True, tell=told.append, startable=startable,
+        max_wait_s=30)))
+    t.start()
+    try:
+        assert _wait_for(lambda: checkcap.PREEMPT_LINE.format("routine") in told), told
+        assert checkcap.PARKED_LINE in told, "the asker waits for its test slots"
+        time.sleep(3 * checkcap.CLAIM_S)   # the asked run is slow to end its command
+        assert checkcap.claims() == 1, "renewed while parked and the asked run holds its slot"
+        assert checkcap.preempted(routine.since) == "urgent urgent", "so its request still asks"
+        routine.close()
+        time.sleep(0.3)   # its test slots free a little after its cap slot
+        freed.set()
+        t.join(30)
+        t_other.join(30)
+        assert got and got[0] is not None and got[0].f is not None, "the parked asker took the freed slot"
+        assert other == [None], "the waiter first in line did not take it"
+        assert checkcap.claims() == 0 and not list(checkcap.slot_dir().glob(f"{checkcap.CLAIM}.*.json"))
+    finally:
+        freed.set()
+        checkcap.clear_preempt()
+        for h in [routine, *got, *other]:
+            if h is not None:
+                h.close()
 
 
 def test_a_parked_urgent_run_preempts_only_a_run_whose_stop_lets_it_start(env, monkeypatch):
@@ -10331,6 +10627,7 @@ def test_checks_park_frees_the_queue_place_and_resumes_at_its_first_arrival_once
 
 
 def test_a_parked_checks_run_is_no_leader_to_join_until_it_resumes(env, tmp_path, monkeypatch):
+    import contextlib
     import threading
     from ttp import checkcap, checkjoin, checksqueue, cli, locks
     p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
@@ -10349,7 +10646,7 @@ def test_a_parked_checks_run_is_no_leader_to_join_until_it_resumes(env, tmp_path
             done.append(cli.main(["checks", "--", "true"]))
         except SystemExit as e:
             done.append(e.code)
-    t = threading.Thread(target=go)
+    t = threading.Thread(target=go, daemon=True)   # a stuck thread never holds the test worker past its exit
     t.start()
     try:
         # Its queue ticket is taken before its wait is recorded: park only once both show (as the park test does).
@@ -10369,6 +10666,10 @@ def test_a_parked_checks_run_is_no_leader_to_join_until_it_resumes(env, tmp_path
         got = checkjoin.target(b, checkjoin.records(p.state, prune=False))
         assert got and got[0]["id"] == a["id"] and got[1] == checkjoin.JOINED, got
         b_path.unlink()
+    except BaseException:
+        with contextlib.suppress(Exception):   # never left queued; the assert's own error still shows
+            checksqueue.act(p, run, "cancel", "the test", "a failed assert", "")
+        raise
     finally:
         flag.touch()   # a failed assert never leaves the thread parked or queued past teardown
         held.close()
@@ -10600,3 +10901,344 @@ def test_session_coordinator_may_run_queue_commands_with_quoted_reasons_and_read
     assert coordtools.queue_refusal("ttp checks park 5 --reason='a b' --task=6 --json") is None
     rules = coordtools._rules("demo")
     assert "Bash(ttp checks park *)" in rules and "Bash(ttp checks queue)" in rules
+
+
+def test_a_preempted_checks_run_resumes_its_pytest_check_from_the_files_it_passed(env, tmp_path, monkeypatch, capsys):
+    """#7218: a routine `ttp checks` run preempted mid-pytest queues again and its rerun skips the test files
+    that passed before the preemption on the same tree and env (pushpass.resume_env, ttp_pytest_resume); the
+    file cut short and the rest run, and the run passes as a full one."""
+    from ttp import checkcap, checkwall, cli
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "1")
+    monkeypatch.setattr(checkwall, "POLL_S", 0.1)
+    monkeypatch.setenv(checkcap.PREEMPTED_ENV, "")
+    monkeypatch.delenv(checkcap.RESUME_ENV, raising=False)
+    monkeypatch.delenv("PYTEST_ADDOPTS", raising=False)
+    monkeypatch.delenv("VIRTUAL_ENV", raising=False)
+    ran, mark = tmp_path / "ran.txt", tmp_path / "preempted-once"
+    req = checkcap.slot_dir() / f"{checkcap.PREEMPT}.{os.getpid()}.json"
+    suite = repo / "suite"
+    suite.mkdir()
+    for name in ("a", "b"):
+        (suite / f"test_{name}.py").write_text(f"def test_{name}():\n    open({str(ran)!r}, 'a').write('{name}\\n')\n")
+    (suite / "test_c.py").write_text(
+        "import json, os, time\n"
+        "def test_c():\n"
+        f"    open({str(ran)!r}, 'a').write('c\\n')\n"
+        f"    if os.path.exists({str(mark)!r}):\n        return\n"
+        f"    open({str(mark)!r}, 'w').close()\n"
+        f"    open({str(req)!r}, 'w').write(json.dumps({{'by': 'urgent u', 'task': '77', 'at': time.time() + 1}}))\n"
+        "    time.sleep(60)\n")
+    subprocess.run([*git, "add", "suite"], check=True)
+    subprocess.run([*git, "commit", "-qm", "suite"], check=True)
+    t0 = time.time()
+    cli.main(["checks", "--", "python3", "-m", "pytest", "-q", "-p", "no:cacheprovider", "suite"])
+    out = capsys.readouterr().out
+    assert time.time() - t0 < 50, "its command ended once asked"
+    assert "preempted by urgent #77" in out, out
+    after = out.rsplit("preempted by", 1)[1]
+    assert "resuming" in after and "2 test file(s) passed" in after, after
+    assert "passed" in after.rsplit("resuming", 1)[1], "the resumed run ran to its pass"
+    assert ran.read_text().split() == ["a", "b", "c", "c"], "only the file cut short ran again"
+    assert checkcap.RESUME_ENV in checkcap.RUN_ONLY_ENV, "a nested `ttp checks` in a check never resumes"
+    assert not req.exists()
+
+
+def test_a_checks_resume_record_is_kept_only_for_a_preempted_rerun_on_the_same_tree_and_env(env, tmp_path, monkeypatch):
+    """#7218: a check's resume record (cli._checks_resume) is keyed on the tree, the command and its env, so a
+    changed tree or env skips nothing; any run but a preempted run's rerun starts it empty; a check that cannot
+    resume (not one plain local pytest run, or under pytest-xdist) gets none."""
+    from ttp import checkcap, cli
+    p = make(env)
+    monkeypatch.delenv("PYTEST_ADDOPTS", raising=False)
+    top, c = tmp_path, "python3 -m pytest -q suite"
+    run_env = {k: v for k, v in os.environ.items() if k not in ("PYTEST_ADDOPTS", "PYTHONPATH")}
+
+    def record(tree, e=run_env):
+        vars_, _ = cli._checks_resume(p, top, tree, c, e)
+        return Path(vars_["TTP_PYTEST_RESUME"])
+
+    monkeypatch.setenv(checkcap.RESUME_ENV, "1")
+    record("t1").write_text("suite/test_a.py\nsuite/test_b.py\n")
+    assert cli._checks_resume(p, top, "t1", c, run_env)[1] == 2, "the preempted rerun skips its passed files"
+    assert cli._checks_resume(p, top, "t2", c, run_env)[1] == 0, "another tree skips nothing"
+    other = {**run_env, "PYTEST_PLUGINS": "some_plugin"}
+    assert record("t1", other) != record("t1"), "another env keys another record"
+    assert cli._checks_resume(p, top, "t1", c, other)[1] == 0, "another env skips nothing"
+    monkeypatch.delenv(checkcap.RESUME_ENV)
+    assert cli._checks_resume(p, top, "t1", c, run_env)[1] == 0, "a run not preempted starts afresh"
+    monkeypatch.setenv(checkcap.RESUME_ENV, "1")
+    assert cli._checks_resume(p, top, "t1", c, run_env)[1] == 0, "its record was emptied"
+    for cannot in ("sh -c 'pytest -q'", "pytest -q a.py && pytest -q b.py", f"{c} -n 4", f"{c} -nauto",
+                   f"{c} --numprocesses=2", f"{c} --dist load"):
+        assert cli._checks_resume(p, top, "t1", cannot, run_env) == ({}, 0), cannot
+    monkeypatch.setenv("PYTEST_ADDOPTS", "-n 3")
+    assert not cli._checks_resumes(c), "xdist from PYTEST_ADDOPTS turns the resume plugin off"
+
+
+def test_a_checks_run_that_cannot_resume_is_never_preempted_past_90_percent(env, tmp_path, monkeypatch):
+    """#7218: a run whose checks cannot resume from their passed files labels its slot with its log
+    (cli._checks_progress); preempt never asks it once the log's last pytest `[ NN%]` is SHIELD_PCT or more,
+    and asks the other run instead, or nobody. A run that can resume carries no log and is asked as before."""
+    from ttp import checkcap, cli
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "2")
+    monkeypatch.setenv("TTP_CHECKS_LOAD_EXTRA", "0")
+    monkeypatch.setenv(checkcap.URGENT_SLOTS_ENV, "0")
+    monkeypatch.setenv(checkcap.PREEMPTED_ENV, "")
+    monkeypatch.delenv("PYTEST_ADDOPTS", raising=False)
+    log = tmp_path / "checks.log"
+    with open(log, "w") as out:
+        assert cli._checks_progress(out, ["sh -c 'pytest -q'", "python3 -m pytest -q"]) == str(log)
+        assert cli._checks_progress(out, ["python3 -m pytest -q -n 4"]) == str(log)
+        assert cli._checks_progress(out, ["python3 -m pytest -q"]) == "", "it resumes: no shield"
+    log.write_text("$ pytest -q\n........ [ 50%]\n........ [ 91%]\n")
+    late = checkcap.acquire("late run", project_name="other", priority=5, preemptible=True, progress=str(log))
+    early = checkcap.acquire("early run", project_name="other", priority=2, preemptible=True)
+
+    def ask():
+        try:
+            return checkcap.preempt("urgent", checkcap.all_paths(2), "mine")
+        finally:
+            for f in checkcap.slot_dir().glob(f"{checkcap.PREEMPT}.*.json"):
+                f.unlink()
+    try:
+        assert ask() == "early run", "the lower-priority run is past 90% and cannot resume: the other is asked"
+        early.close()
+        assert ask() == "", "nobody else: it is still not asked"
+        log.write_text("$ pytest -q\n........ [ 89%]\n")
+        assert ask() == "late run", "below 90% it is asked as before"
+    finally:
+        early.close()
+        late.close()
+
+
+def test_a_rerun_within_one_checks_run_runs_every_test_file_again(env, tmp_path, monkeypatch, capsys):
+    """#7218: the resume record a check keeps in a run never thins a rerun the same run makes after a fault
+    (a rewritten script, a torn file, a lost worker): that rerun runs every file again."""
+    from ttp import checkcap, cli, scriptwatch
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    monkeypatch.delenv(checkcap.RESUME_ENV, raising=False)
+    monkeypatch.delenv("PYTEST_ADDOPTS", raising=False)
+    monkeypatch.delenv("VIRTUAL_ENV", raising=False)
+    monkeypatch.setattr(scriptwatch, "rerun", lambda run_once, *a, **k: (run_once(), run_once())[1])
+    ran = tmp_path / "ran.txt"
+    suite = repo / "suite"
+    suite.mkdir()
+    for name in ("a", "b"):
+        (suite / f"test_{name}.py").write_text(f"def test_{name}():\n    open({str(ran)!r}, 'a').write('{name}\\n')\n")
+    subprocess.run([*git, "add", "suite"], check=True)
+    subprocess.run([*git, "commit", "-qm", "suite"], check=True)
+    cli.main(["checks", "--", "python3", "-m", "pytest", "-q", "-p", "no:cacheprovider", "suite"])
+    out = capsys.readouterr().out
+    assert "passed" in out, out
+    assert sorted(ran.read_text().split()) == ["a", "a", "b", "b"], ran.read_text()
+
+
+def test_checks_with_no_task_started_under_a_project_run_queue_as_that_run(env, tmp_path):
+    # A `ttp checks` whose environment names no task (a tool started it from a temp clone with the run's
+    # variables cleared) under a project's run counts as that run: its queue group, label and task are the run's.
+    import json
+    import os
+    import sys
+    p = make(env)
+    code = ("import json, os; from ttp import checkcap; i = checkcap.adopt_identity(); n = checkcap.queue_name(None); "
+            "print(json.dumps({'name': n, 'label': checkcap.label(n, 'w'), 'task': checkcap._task_run()[0], "
+            "'other': checkcap.inherited(os.getppid(), base=os.environ['ELSEWHERE'])}))")
+    base = {k: v for k, v in os.environ.items() if k != "TTP_TEST_NO_INHERIT"}
+    run = lambda e: json.loads(subprocess.run(   # noqa: E731
+        ["sh", "-c", 'env -u TTP_TASK -u TTP_RUN_ID -u TTP_PROJECT "$0" -c "$1"; :', sys.executable, code],
+        env={**base, "PYTHONPATH": str(RUNTIME), "ELSEWHERE": str(tmp_path / "elsewhere"), **e},
+        capture_output=True, text=True, timeout=60, check=True).stdout)
+    got = run({"TTP_TASK": "42", "TTP_RUN_ID": "9", "TTP_PROJECT": str(p.base)})
+    assert got["name"] == p.name and got["task"] == "42"
+    assert got["label"] == f"{p.name} task #42 (run 9) w"
+    assert got["other"] == {}, "with its own project named, another project's run is not adopted"
+    bare = run({"TTP_RUN_ID": "9", "TTP_PROJECT": str(p.base)})   # no task above it: no project
+    assert bare["name"] is None and bare["label"] == "no project w"
+    gone = run({"TTP_TASK": "42", "TTP_PROJECT": str(tmp_path / "no-such-project")})
+    assert gone["name"] is None, "a run of a project that does not exist is not adopted"
+
+
+def test_checks_with_no_project_queue_behind_every_project_waiter(env, monkeypatch):
+    import time
+    from ttp import checkcap, locks
+    d = checkcap.slot_dir()
+    now = time.time()
+    bare = locks.enqueue(d, checkcap.RESOURCE, "no project w", since=now - 7200)   # aged, and first to arrive
+    a = locks.enqueue(d, checkcap.RESOURCE, "pa task #1 w", since=now - 60, group="pa", priority=3)
+    b = locks.enqueue(d, checkcap.RESOURCE, "pb task #2 w", since=now - 30, group="pb")
+    try:
+        assert locks.fair_order(d, checkcap.RESOURCE, **checkcap.order()) == [a, b, bare]
+        assert checkcap.state()["queued"] == ["pa task #1 w", "pb task #2 w", "no project w"]
+        assert not locks.my_turn(d, checkcap.RESOURCE, bare, 2, fair=True, **checkcap.order())
+        assert locks.my_turn(d, checkcap.RESOURCE, bare, 3, fair=True, **checkcap.order())
+        assert locks.fair_order(d, checkcap.RESOURCE, aged_before=now - 3600)[0] == bare, "only with bare_last"
+    finally:
+        for t in (bare, a, b):
+            locks.dequeue(t)
+
+
+def test_checks_with_no_project_hold_at_most_bare_slots_at_once(env, monkeypatch):
+    from ttp import checkcap, locks
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "3")
+    first = checkcap.acquire(checkcap.label(None, "w"))
+    try:
+        assert first.f is not None
+        alone = checkcap.acquire(checkcap.label(None, "w2"), max_wait_s=5)
+        assert alone is not None and alone.f is not None, "with no project's run waiting the cap does not bind"
+        alone.close()
+        waiter = locks.enqueue(checkcap.slot_dir(), checkcap.RESOURCE, "pa task #1 w", group="pa")
+        try:
+            assert checkcap.acquire(checkcap.label(None, "w2"), max_wait_s=0.2) is None, \
+                "one run with no project at once while a project's run waits"
+            monkeypatch.setenv(checkcap.BARE_SLOTS_ENV, "2")
+            second = checkcap.acquire(checkcap.label(None, "w2"), max_wait_s=5)
+            assert second is not None and second.f is not None, "checks.bare_slots raises the cap"
+            second.close()
+        finally:
+            locks.dequeue(waiter)
+    finally:
+        first.close()
+
+
+def test_checks_status_flags_a_slot_holder_running_no_test(env, monkeypatch):
+    # Status reads whether each host-wide slot holder's commands use CPU: one held for idle_hold_s() with none
+    # running is flagged with `ttp checks-yield`, a busy one is not. Nothing is stopped or asked.
+    import os
+    import sys
+    import time
+    from ttp import checkcap
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "3")
+    code = ("import sys; from ttp import checkcap; s = checkcap.acquire(checkcap.label(sys.argv[1], 'w'), "
+            "project_name=sys.argv[1]); print('held', flush=True); sys.stdin.read()")
+    procs = {}
+    try:
+        for name in ("pa", "pb"):
+            procs[name] = subprocess.Popen([sys.executable, "-c", code, name], stdin=subprocess.PIPE,
+                                           stdout=subprocess.PIPE, text=True,
+                                           env={**os.environ, "PYTHONPATH": str(RUNTIME)})
+            assert procs[name].stdout.readline().strip() == "held"
+        busy, idle = procs["pa"].pid, procs["pb"].pid
+        reads = {busy: iter([10.0, 11.0, 12.0, 13.0]), idle: iter([5.0, 5.0, 5.0, 5.0])}
+        monkeypatch.setattr(checkcap, "tests_cpu_s", lambda pid: next(reads[pid]))
+        later = time.time() + checkcap.IDLE_HOLD_S + 60
+        got = {a["holder"]: a for a in checkcap.holder_activity(now=later, sample_s=0)}
+        assert got["pa w"]["tests"] is True and not got["pa w"]["idle"]
+        assert got["pb w"]["tests"] is False and got["pb w"]["idle"]
+        assert "ttp checks-yield" in checkcap.activity_text(got["pb w"])
+        assert "IDLE" not in checkcap.activity_text(got["pa w"])
+        now = {a["holder"]: a for a in checkcap.holder_activity(sample_s=0)}
+        assert not now["pb w"]["idle"], "held under idle_hold_s(): not flagged yet"
+        reads = {busy: iter([10.0, 11.0]), idle: iter([5.0, 5.0])}
+        monkeypatch.setenv(checkcap.IDLE_HOLD_ENV, "0.001")
+        line = checkcap.line(activity=True)
+        assert "no test running: pb w" in line and "pa w (held" not in line and "ttp checks-yield" in line
+        assert "no test running" not in checkcap.line(), "without activity the line reads no process"
+        assert all(p.poll() is None for p in procs.values()), "status stops nothing"
+    finally:
+        for p in procs.values():
+            p.kill()
+            p.wait()
+
+
+def test_checks_tests_cpu_counts_what_a_holder_started_not_itself(tmp_path):
+    import sys
+    import time
+    from ttp import checkcap
+    burn = f"{sys.executable} -c 'import time\nwhile time.process_time() < 0.6: pass'"
+    sh = subprocess.Popen(["sh", "-c", f"{burn}; touch {tmp_path / 'done'}; sleep 30"])
+    try:
+        deadline = time.time() + 60
+        while not (tmp_path / "done").exists() and time.time() < deadline:
+            time.sleep(0.05)
+        assert checkcap.tests_cpu_s(sh.pid) >= 0.5, "a reaped command's CPU counts (0.6 s, in clock ticks)"
+        assert checkcap.tests_cpu_s(2 ** 22 + 7) is None, "a pid that is gone reads None"
+    finally:
+        sh.kill()
+        sh.wait()
+
+
+def test_detached_checks_keep_the_identity_their_parent_adopted(env, monkeypatch, tmp_path):
+    # The background run of a detached `ttp checks` outlives its parent, so it cannot walk up to the run: the
+    # parent hands what it adopted over in the environment, honoured only for an existing project.
+    from ttp import checkcap
+    p = make(env)
+    monkeypatch.setattr(checkcap, "_IDENT", {})
+    monkeypatch.setattr(checkcap, "inherited", lambda pid, base=None: {})
+    assert checkcap.adopted_env() == {}
+    checkcap._IDENT.update(task="42", run="9", base=str(p.base), project=p.name)
+    monkeypatch.setenv(checkcap.ADOPTED_ENV, checkcap.adopted_env()[checkcap.ADOPTED_ENV])
+    monkeypatch.delenv(checkcap.NO_INHERIT_ENV)
+    assert checkcap.adopt_identity()["task"] == "42" and checkcap.queue_name(None) == p.name
+    assert checkcap.adopt_identity(tmp_path / "other") == {}, "another project's run is not taken"
+    monkeypatch.setenv(checkcap.ADOPTED_ENV, '{"task": "42", "base": "%s"}' % (tmp_path / "gone"))
+    assert checkcap.adopt_identity() == {}
+    monkeypatch.setenv(checkcap.ADOPTED_ENV, "not json")
+    assert checkcap.adopt_identity() == {}
+
+
+def test_a_lane_waiter_is_named_by_the_task_in_its_run_record(env, tmp_path, monkeypatch):
+    # A detached candidate run started by a task: its lane ticket's record (locks.waiter_ids) names the task,
+    # so the wait event and the lane status name it even when the ticket's text does not; a run with no task
+    # in its record still reads "no task". An adopted identity (checkcap.adopt_identity) is recorded too.
+    from ttp import checkcap, checklane, locks, testslots
+    p = make(env)
+    _lane_env(monkeypatch)
+    holder = _lane_holder(tmp_path, p.name, _LANE_REPO)
+    base = testslots.suite_base(p.name, _LANE_REPO)
+    now = time.time()
+    monkeypatch.setenv("TTP_TASK", "71")
+    monkeypatch.setenv("TTP_RUN_ID", "501")
+    tasked = locks.enqueue(checkcap.slot_dir(), base, f"{p.name}: full checks (run 501, pid 1)", now - 900, priority=2)
+    monkeypatch.delenv("TTP_TASK")
+    monkeypatch.delenv("TTP_RUN_ID")
+    bare = locks.enqueue(checkcap.slot_dir(), base, f"{p.name}: full checks (pid 2)", now - 800, priority=2)
+    monkeypatch.setattr(locks, "IDENTITY", {"task": "73", "run": "502"})
+    adopted = locks.enqueue(checkcap.slot_dir(), base, f"{p.name}: full checks (pid 3)", now - 700, priority=2)
+    try:
+        assert [locks.ticket_task(t) for t in (tasked, bare, adopted)] == ["71", "", "73"]
+        texts = [e["text"] for e in checklane.wait_events(p.name, {"checks": {"wait_event_s": 600}}, now)]
+        assert any(t.startswith("Checks lane wait: #71 has waited") for t in texts), texts
+        assert any(t.startswith("Checks lane wait: #73 has waited") for t in texts), texts
+        assert any(t.startswith("Checks lane wait: a run with no task (full checks (pid 2)) has waited") for t in texts), texts
+        waiters = [w["task"] for r in checklane.lane_status(p.name, now) for w in r["waiters"]]
+        assert sorted(waiters) == ["", "71", "73"], waiters
+        assert checklane._who({"task": "", "pid": 2}) == "no task pid 2"
+        assert checklane._holder_task({"task_id": "74"}) == "74" and checklane._holder_task({"task_id": "x"}) == ""
+    finally:
+        for t in (tasked, bare, adopted):
+            locks.dequeue(t)
+        _stop(holder)
+
+
+def test_the_queue_wait_report_and_slot_status_count_the_same_host_wide_slot_holders(env, monkeypatch):
+    # The queue-wait report once read 5 running against cap 4 while slot status read 2: it added the push
+    # priority and urgent slots to the cap's, and a run seen on several slots counted each time. Both now
+    # read checkcap.host_holders: every holder once, the same count in both.
+    import time
+    from ttp import checkcap, hostload, locks, queuewait
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "2")
+    monkeypatch.setenv(checkcap.URGENT_SLOTS_ENV, "1")
+    p = make(env)
+    held = [locks.try_take(checkcap.paths(), "acme task #71 (run 5)"),
+            locks.try_take(checkcap.paths(), "acme task #71 (run 5)"),   # the same run seen on a second slot
+            locks.try_take(checkcap.urgent_paths(), "acme task #72 (run 6)"),
+            locks.try_take([checkcap.priority_path("acme/branch")], "push batch b1")]
+    try:
+        assert all(held)
+        paths = checkcap.paths()
+        paths[1].write_text(paths[0].read_text())   # the same label: holder, pid and since
+        names = sorted(checkcap.state()["held"])
+        assert names == ["acme task #71 (run 5)", "acme task #72 (run 6)", "push batch b1"]
+        assert hostload.snapshot()["running"] == 3, "slot status counts what the report counts"
+        tid = p.db.add_task("waits", "s", kind="code")
+        now = time.time()
+        host = {**checkcap.state(), "queued": [f"{p.name} task #{tid} (run 3) ttp checks"], "queued_at": [now - 600]}
+        waits = queuewait.collect(p, {"coordinator": {"queue_wait_escalate_min": 5}}, now, host)
+        assert [sorted(w["running"]) for w in waits if w["queue"] == "checks"] == [names]
+        legacy = {k: v for k, v in host.items() if k != "held"}   # an older daemon's state: the old sum
+        assert len([w for w in queuewait.collect(p, {}, now, legacy) if w["queue"] == "checks"][0]["running"]) == 4
+    finally:
+        for f in held:
+            if f is not None:
+                f.close()

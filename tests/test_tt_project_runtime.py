@@ -505,12 +505,13 @@ def env(tmp_path, monkeypatch, _git_session, _short_tmp):
     # The outer checks' output directory and lifetime descriptor belong to that invocation.
     for var in ("TTP_RUN_DIR", "TTP_TASK", "TTP_RUN_ID", "TTP_PROJECT", "TTP_DETACHED", "TTP_OUTLIVES_RUN", "TTP_CHECK_WAITS", "TTP_LOCKS_HELD", "TTP_PIDNS",
                 "TTP_OUTLIVES_RUN", "TTP_CGROUP", "TTP_CHECK_OUTPUT_DIR", "TTP_CHECKS_TMP_FD", "TTP_PUSH_OWN_BRANCH", "TTP_DETACH_RC",
-                "TTP_CHECKS_SLOT", "TTP_CHECKS_HOST_MAX", "TTP_ROUTE_HOST_MAX", "TTP_WAITS_IDLE", "TTP_TEST_SLOTS_HELD", "TTP_TEST_POOL", "TTP_TEST_RUN_MAX",
+                "TTP_CHECKS_SLOT", "TTP_CHECKS_HOST_MAX", "TTP_ROUTE_HOST_MAX", "TTP_WAITS_IDLE", "TTP_TEST_SLOTS_HELD", "TTP_TEST_SLOTS", "TTP_TEST_POOL", "TTP_TEST_RUN_MAX",
                 "TTP_BUILD_SLOTS_HELD", "TTP_BUILD_POOL", "TTP_BUILD_RUN_MAX", "TTP_BUILD_PROJECT_MAX", "MAKEFLAGS",
                 "TTP_NO_USER_POST",   # a light-tier or chat-routed run's mark (workernotify.ENV)
                 "CMAKE_BUILD_PARALLEL_LEVEL"):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setenv("TTP_CHECKS_LOAD_EXTRA", "0")   # the checks cap never grows with this host's load
+    monkeypatch.setenv("TTP_TEST_NO_INHERIT", "1")   # `ttp checks` never takes the task of the run running the tests (checkcap.adopt_identity)
     monkeypatch.setenv("TTP_CHECKS_LIVE_CORES", "0")   # nor waits on this host's busy cores
     monkeypatch.setenv("TTP_CHECKS_DIRTY_MAX_MB", "0")   # nor on its disk (diskgate)
     monkeypatch.setenv("TTP_CHECKS_IO_FULL_MAX", "0")
@@ -10604,37 +10605,59 @@ def test_an_upgrade_hands_two_versions_of_one_added_line_to_a_harness_task(env, 
     assert p.db.one("SELECT id FROM tasks WHERE kind='harness'")
 
 
-def test_a_conflicting_upgrade_queues_at_most_one_task_a_day(env, monkeypatch, capsys):
-    """Each release would otherwise queue its own model task for the same conflict: within a day of
-    the last one, the upgrade only records that it waits, and the daemon tries again after."""
+def test_a_conflicting_upgrade_queues_its_next_merge_task_at_once_on_any_change(env, monkeypatch, capsys):
+    """No timer holds a merge task off (it was up to 6 h): a newer release queues the next one at once
+    after the last ended, one stays open at a time, and only the same release on the same local files
+    waits, until the project's own files change."""
     from ttp import cli, release
     p, restarts = _conflicting_upgrade(env, monkeypatch)
+    harness = lambda: [t["id"] for t in p.db.q("SELECT id FROM tasks WHERE kind='harness' ORDER BY id")]
     with pytest.raises(SystemExit):
         cli.main(["upgrade", "demo"])
-    first = p.db.one("SELECT id FROM tasks WHERE kind='harness'")["id"]
+    first = harness()[0]
     p.db.update_task(first, status="done")
-    _next_release(env)      # the next release, the same conflict
+    p.db.x("UPDATE tasks SET updated=? WHERE id=?", (time.time() - 60, first))     # ended 1 minute ago
+    _next_release(env)
+    with pytest.raises(SystemExit) as e:
+        cli.main(["upgrade", "demo", "--auto", "--project-dir", str(p.base)])
+    tids = harness()
+    assert e.value.code == 75 and len(tids) == 2 and release.finish_holder(p)["task"] == tids[1]
+    _next_release(env)                                  # one open merge task at most: it is retargeted
+    with pytest.raises(SystemExit) as e:
+        cli.main(["upgrade", "demo"])
+    newest = cli._runtime_version(env["home"] / "lib" / "current" / "runtime")
+    assert e.value.code == 75 and harness() == tids
+    assert f"Target release: tt-project {newest} (" in p.db.task(tids[1])["spec"]
+    p.db.update_task(tids[1], status="failed")         # ends without landing; nothing changed since
     capsys.readouterr()
     with pytest.raises(SystemExit) as e:
         cli.main(["upgrade", "demo"])
     out = capsys.readouterr().out
-    assert e.value.code == 75 and f"Harness task #{first} took on a template merge" in out
-    assert "upgrade deferred" in out and "tries again after" in out and "owner: this project's daemon" in out
-    assert "resumes at" in out
-    assert [t["id"] for t in p.db.q("SELECT id FROM tasks WHERE kind='harness'")] == [first] and not restarts
+    assert e.value.code == 75 and harness() == tids, out
+    assert f"Harness task #{tids[1]} took on this merge" in out and "queues the next at once" in out
+    assert "upgrade deferred" in out and "looks again at" in out and "owner: this project's daemon" in out
     rec = p.db.kv(release.KV_AUTO)
-    assert rec["outcome"] == "deferred" and rec["key"].endswith(" bbbb2222") and rec["until"] > time.time()
-    d = {"key": rec["key"]}
-    assert "less than 6 h ago" in release.hold_reason(p, d)
-    p.db.set_kv(release.KV_RELEASE, {"installed": "x (bbbb2222)", "current": "y", "key": rec["key"], "newer": True})
-    assert "owner: this project's daemon; resumes at" in release.line(p, p.db, {})
-    # a day later the conflict gets a task of its own again
-    p.db.x("UPDATE tasks SET created=created-? WHERE id=?", (release.task_every_s({}) + 60, first))
-    p.db.set_kv(release.KV_AUTO, {**rec, "until": time.time() - 1})
-    assert release.hold_reason(p, d) == ""
-    with pytest.raises(SystemExit):
+    assert rec["outcome"] == "deferred" and time.time() < rec["until"] <= time.time() + release.CHECK_S + 5
+    assert "nothing changed since" in release.hold_reason(p, {"key": rec["key"]})
+    (p.harness / "prompts" / "worker.md").write_text("# Worker, edited here\n")    # a local edit
+    _git_out(p.harness, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qam", "local edit")
+    with pytest.raises(SystemExit) as e:
         cli.main(["upgrade", "demo"])
-    assert len(p.db.q("SELECT id FROM tasks WHERE kind='harness'")) == 2
+    assert e.value.code == 75 and len(harness()) == 3 and not restarts
+
+
+def test_no_runtime_code_reads_the_retired_merge_timers():
+    """upgrade.merge_retry_h and upgrade.task_every_h are gone: only the retired-key list names them,
+    so a project that still sets one gets one hint and nothing else."""
+    from ttp import project
+    rt = RUNTIME
+    hits = [f"{f.relative_to(rt)}:{n}" for f in sorted(rt.rglob("*.py"))
+            for n, line in enumerate(f.read_text().splitlines(), 1)
+            if ("merge_retry" in line or "task_every" in line) and f.name != "project.py"]
+    assert not hits, hits
+    assert {"upgrade.merge_retry_h", "upgrade.task_every_h"} <= set(project.RETIRED_KEYS)
+    found = project.config_problems({"upgrade": {"auto": True, "merge_retry_h": 6}})
+    assert [f for f in found if "upgrade.merge_retry_h is retired" in f], found
 
 
 def _next_release(env, newer=True):
@@ -10650,7 +10673,8 @@ def _next_release(env, newer=True):
 
 
 def _deferred_conflict(env, monkeypatch, name="demo", newer=True, source=None):
-    """A project whose template merge conflicts again within a day of its last harness task (done).
+    """A project whose template merge conflicts again on the release its last harness task took on and ended
+    (done) without landing, on the same local files: nothing changed, so no task is queued.
     `source` forces the source commit the harness records (as "unknown" outside a git checkout)."""
     import shutil
     from ttp import cli
@@ -10670,7 +10694,18 @@ def _deferred_conflict(env, monkeypatch, name="demo", newer=True, source=None):
     first = p.db.one("SELECT id FROM tasks WHERE kind='harness'")["id"]
     p.db.update_task(first, status="done")
     _next_release(env, newer)
+    _retargeted(p, env, first)
     return p, first
+
+
+def _retargeted(p, env, tid):
+    """Task `tid` was retargeted to the installed release (as an open task is by each new one)."""
+    import re
+    from ttp import cli
+    rt = env["home"] / "lib" / "current" / "runtime"
+    spec = re.sub(r"^Target release: .*$", f"Target release: tt-project {cli._runtime_version(rt)} "
+                  f"({cli.recorded_commit(rt)})", p.db.task(tid)["spec"], count=1, flags=re.M)
+    p.db.x("UPDATE tasks SET spec=? WHERE id=?", (spec, tid))
 
 
 def test_a_conflict_handed_to_a_harness_task_is_deferred_with_exit_75(env, monkeypatch, capsys):
@@ -10721,7 +10756,7 @@ def test_a_conflict_on_a_newer_version_is_deferred_as_the_daemon_retries_it(env,
     with pytest.raises(SystemExit) as e:
         cli.main(["upgrade", "demo"])
     out = capsys.readouterr().out
-    assert e.value.code == 75 and "upgrade deferred" in out and "tries again after" in out
+    assert e.value.code == 75 and "upgrade deferred" in out and "looks again at" in out
 
 
 def test_a_same_version_conflict_from_another_commit_is_a_failure_nothing_retries(env, monkeypatch, capsys):
@@ -10823,7 +10858,7 @@ def test_two_failed_harness_retries_of_the_same_conflict_are_reported_once(env, 
             tids.append(tid)
         assert len(_stuck_events(p)) == (1 if n >= 2 else 0), n
         p.db.update_task(tid, status="failed")
-        p.db.x("UPDATE tasks SET created=? WHERE id=?", (time.time() - 2 * release.task_every_s({}), tid))
+        _next_release(env)          # a newer release queues the next merge task at once
     assert len(tids) == 4
     text = _stuck_events(p)[0]["text"]
     assert f"#{tids[0]}, #{tids[1]} ended without landing it" in text and "0.0 days" in text
@@ -11068,7 +11103,7 @@ def test_the_finish_task_locks_the_live_harness_until_it_ends(env, monkeypatch, 
 
 def test_with_no_open_finish_task_a_conflict_queues_a_task_that_takes_the_lock(env, monkeypatch, capsys):
     """No open finish task: a conflict queues one as before (exit 75) and only then is the harness held;
-    once it ended more than a day ago, the next conflict queues a new task that takes the lock over."""
+    once it ended, the next release's conflict queues a new task at once that takes the lock over."""
     from ttp import cli, release
     p, restarts = _conflicting_upgrade(env, monkeypatch)
     assert release.finish_holder(p) is None and not release.finish_lock(p).exists()
@@ -11079,7 +11114,6 @@ def test_with_no_open_finish_task_a_conflict_queues_a_task_that_takes_the_lock(e
     assert e.value.code == 75 and f"Harness task #{tid} finishes it" in out and "now targets" not in out
     assert release.finish_holder(p)["task"] == tid and not restarts
     p.db.update_task(tid, status="failed")
-    p.db.x("UPDATE tasks SET created=? WHERE id=?", (time.time() - 2 * release.task_every_s({}), tid))
     _next_release(env)
     with pytest.raises(SystemExit) as e:
         cli.main(["upgrade", "demo"])
@@ -11273,38 +11307,6 @@ def test_a_paused_projects_stuck_merge_owner_is_taken_over_and_the_project_stays
     row = overview.deployed(names=["demo"])["projects"][0]
     assert "paused" in row["reason"] and row["resumes"] == "when demo is resumed", row["line"]
     assert "take it over" not in row["line"]
-
-
-def test_a_host_upgrade_queues_the_merge_task_once_the_last_ended_6h_ago(env, monkeypatch):
-    """The once-a-day merge task limit counted from the last task's creation, also for a host-side
-    upgrade: a project with local edits trailed each release by up to a day. Now a host-side upgrade
-    queues the task once the last one ended 6 h ago (upgrade.merge_retry_h); --auto keeps the daily
-    limit, and there is never more than one open merge task."""
-    from ttp import cli, release
-    p, restarts = _conflicting_upgrade(env, monkeypatch)
-    with pytest.raises(SystemExit):
-        cli.main(["upgrade", "demo"])
-    first = p.db.one("SELECT id FROM tasks WHERE kind='harness'")["id"]
-    p.db.update_task(first, status="done")
-    p.db.x("UPDATE tasks SET created=?, updated=? WHERE id=?", (time.time() - 8 * 3600, time.time() - 7 * 3600, first))
-    _next_release(env)
-    p.set_config("upgrade.task_every_h", 24)        # a window longer than merge_retry_h
-    harness = lambda: [t["id"] for t in p.db.q("SELECT id FROM tasks WHERE kind='harness' ORDER BY id")]
-    with pytest.raises(SystemExit) as e:
-        cli.main(["upgrade", "demo", "--auto", "--project-dir", str(p.base)])
-    assert e.value.code == 75 and harness() == [first]          # the daemon keeps its window
-    p.set_config("upgrade.merge_retry_h", 8)
-    with pytest.raises(SystemExit) as e:
-        cli.main(["upgrade", "demo"])
-    assert e.value.code == 75 and harness() == [first]          # configurable: 8 h not up yet
-    p.set_config("upgrade.merge_retry_h", 6)
-    with pytest.raises(SystemExit) as e:
-        cli.main(["upgrade", "demo"])
-    tids = harness()
-    assert e.value.code == 75 and len(tids) == 2 and release.finish_holder(p)["task"] == tids[1]
-    with pytest.raises(SystemExit) as e:                       # still one open merge task
-        cli.main(["upgrade", "demo"])
-    assert e.value.code == 75 and harness() == tids and not restarts
 
 
 def test_check_release_runs_on_the_first_tick_after_a_resume(env, monkeypatch):
@@ -27248,6 +27250,7 @@ DURABLE_EXEMPT = {
     ("batch.py", "(Path(d) / name).write_bytes(text)"): "git merge-file --diff3's inputs to read a shared doc's conflict hunks (_doc_hunks), in a temporary directory removed after",
     ("batch.py", "open(f, 'w').writelines(keep)"): "the sequence editor of a batch's rebase rewrites git's own todo file of that rebase in the push worktree, which git reads right after; a crash aborts the rebase and the next batch makes the worktree anew",
     ("daemon.py", "runner.log"): "a log",
+    ("redact.py", 'with open(log, "ab") as out:'): "a detached masking job's log (scrub.log), appended to",
     ("daemon.py", "ON_PASS_LOG"): "a log (an on_pass command's output, read only for its tail)",
     ("daemon.py", "pidfile.write_text"): "names a process, which a reboot ends",
     ("live.py", 'os.replace(os.path.join(d, "rc.tmp")'): "the CLI watch's live row's exit code, written fsynced by its detached runner (WATCH_RUNNER, no runtime import); one lost to a crash is reported as a killed run once overdue",
@@ -27435,6 +27438,7 @@ def test_an_empty_run_json_fails_the_run_without_crashing_its_supervisor(env):
     ("push_queue", [True, False], ["yes", 1]),
     ("push_batch_s", [0, 900, 1.5], [-1, "soon", True, None, float("nan"), float("inf")]),
     ("push_batch_max", [1, 8, 8.0], [0, 2.5, "eight", False]),
+    ("push_age_s", [0, 14400, 1.5], [-1, "4h", True, None]),
     ("after_push", [[], ["true", "./deploy.sh x"], "make deploy"], [["Deploy everything now"]]),
     ("after_push_timeout_s", [1, 1800], [0, -5, "long"]),
 ])
@@ -38564,6 +38568,9 @@ def test_a_work_task_with_its_own_worktree_is_guarded_like_a_code_task(env, monk
     head = _git_out(path, "rev-parse", "HEAD")
     more = p.db.add_task("more", "s", kind="work", tier="light", origin="user", labels=[f"continues:{work}"])
     assert worktree.continued_head(p, p.db.task(more)) == head
+    # While open it owns the work, as for a code task (Daemon._stale_source); cancelled, it owns nothing.
+    assert d._stale_source(p.db.task(work)) == f"open task #{more} continues it"
+    p.db.update_task(more, status="cancelled")
     # A done one is lined up for the backup push; an unfinished one's worktree is in the integrity check.
     p.set_config("delivery.backup_remote", "origin")
     d.cfg = p.config()
@@ -44415,8 +44422,9 @@ def test_sweep_digest_and_budget_digest_list_credits_as_a_provider_holds_unblock
     assert "free window resets and paid credits are an unblock path" in " ".join(src.split())
 
 
-def _assert_openai_strict_schema(schema):
-    """Check the conservative subset used by every coordinator schema adapter."""
+def _assert_openai_strict_schema(schema, all_required=True):
+    """Check the conservative subset used by every coordinator schema adapter (all_required=False:
+    Claude's sparse form, which requires only each object's own fields)."""
     allowed = {'type', 'properties', 'required', 'additionalProperties', 'items', 'enum',
                'anyOf', '$defs', '$ref', 'description', 'title'}
     assert set(schema) <= allowed, schema
@@ -44424,15 +44432,18 @@ def _assert_openai_strict_schema(schema):
     types = [types] if isinstance(types, str) else types
     if 'object' in types or 'properties' in schema:
         assert schema.get('additionalProperties') is False, schema
-        assert set(schema.get('required', [])) == set(schema.get('properties', {})), schema
+        if all_required:
+            assert set(schema.get('required', [])) == set(schema.get('properties', {})), schema
+        else:
+            assert set(schema.get('required', [])) <= set(schema.get('properties', {})), schema
         for sub in schema.get('properties', {}).values():
-            _assert_openai_strict_schema(sub)
+            _assert_openai_strict_schema(sub, all_required)
     if 'items' in schema:
-        _assert_openai_strict_schema(schema['items'])
+        _assert_openai_strict_schema(schema['items'], all_required)
     for sub in schema.get('anyOf', []):
-        _assert_openai_strict_schema(sub)
+        _assert_openai_strict_schema(sub, all_required)
     for sub in schema.get('$defs', {}).values():
-        _assert_openai_strict_schema(sub)
+        _assert_openai_strict_schema(sub, all_required)
 
 
 def test_strict_schema_visits_anyof_definitions_and_refuses_free_objects():

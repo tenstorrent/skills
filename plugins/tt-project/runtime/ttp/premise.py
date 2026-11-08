@@ -30,6 +30,20 @@ Model-free, from Daemon.reconcile_tasks and the start of each dispatch pass (ten
 - a pending question whose code task ended (done, failed, cancelled) and that has not started is
   cancelled: nobody reads its answer.
 
+A premise command (model-free): a code spec line `premise_cmd: <read-only shell command>` (only
+that key runs; a `premise:` line is always words for the light question) is run by the daemon itself
+(Daemon._premise_cmds), from the project root with devices masked, before each dispatch: a ready code
+task with one starts only once the command exited 0 within `premise.recheck_min` (default 30) minutes,
+so the first dispatch and every later one after a longer wait, retries included, re-run it first.
+Exit 0: the premise holds and the task dispatches. Exit 1: the premise is false: the task closes done
+as not needed without a worker run (cmd_false: outcome rejected, the command, its exit code and
+output tail in its result, label `premise:cmd:fails`, one task_done event). Any other exit, a
+timeout (`premise.cmd_timeout_s`, default 60), a command that cannot start or one guard() refuses
+(it must be one local, read-only command: no remote or machine access, no file writes) is unknown
+(cmd_unknown): the task gets the `premise-cmd:unknown` label, runs no command again and takes
+today's path (the light question, or its own first step when urgent or already checked once).
+Projects map their own scripts onto 0 and 1 with a wrapper.
+
 A premise a check proved false (a "fails" that closes its code task) is remembered for REPEAT_DAYS:
 the coordinator's task_add refuses a new task whose `premise:` line repeats it (`repeat`: every
 commit it names is one the failed premise named, or the same words where it names none), naming the
@@ -57,6 +71,11 @@ LABEL = "premise:"                # on the code task: + the question's id, then 
 PENDING = re.compile(r"^premise:(\d+)$")
 VERDICTS = {"holds": "holds", "held": "holds", "true": "holds", "yes": "holds",
             "fails": "fails", "failed": "fails", "false": "fails", "no": "fails"}
+CMD_LINE = re.compile(r"(?im)^[ \t]*(?:[-*][ \t]+)?premise_cmd:[ \t]*(\S.*?)[ \t]*$")
+CMD_FAILS = f"{LABEL}cmd:fails"        # a code task its premise command closed
+CMD_UNKNOWN = "premise-cmd:unknown"    # its premise command gave no verdict: today's path takes over
+CMD_TIMEOUT_S = 60
+RECHECK_MIN = 30
 CITE = re.compile(r"[\w+-][\w./+-]*[./][\w+-]+:\d+")   # file:line, a path with a dot or a slash
 SPEC_CHARS = 1500   # of the code spec quoted in the question, for context
 SUMMARY_CHARS = 800  # of the question's summary carried into the code spec
@@ -66,6 +85,115 @@ def line(spec: str | None) -> str:
     """The check a spec's first `premise:` line names, or ""."""
     m = LINE.search(spec or "")
     return m.group(1) if m else ""
+
+
+def command(spec: str | None) -> str:
+    """The shell command a spec's first `premise_cmd:` line names, or ""."""
+    m = CMD_LINE.search(spec or "")
+    return m.group(1) if m else ""
+
+
+def check_text(spec: str | None) -> str:
+    """What a light question checks: the `premise:` line, else the premise command's own claim."""
+    cmd = command(spec)
+    return line(spec) or (f"the premise command `{cmd}` would exit 0 (the premise holds), not 1 (it is false)"
+                          if cmd else "")
+
+
+# Remote or machine access, and writes: a premise command reads local state only.
+_REMOTE = re.compile(r"\b(?:ssh|scp|rsync|docker|kubectl|srun|sbatch|salloc|devq|tt-smi)\b|--remote\b|--host\b")
+_WRITES = re.compile(
+    r"(?<![<>&])\d*>>?(?![&>])\s*(?!/dev/null\b)[^\s&|;)]|\btee\b|"
+    r"\b(?:rm|mv|cp|dd|chmod|chown|truncate|install|mkdir|touch|ln)\b(?![.-])|\bsed\s+(?:-\w*\s+)*-i|"
+    r"\bgit(?:\s+-[Cc]\s+\S+|\s+--?[\w-]+(?:=\S+)?)*\s+(?:push|commit|reset|checkout|switch|merge|rebase|pull|"
+    r"fetch|tag|stash|clean|am|apply|cherry-pick|branch\s+-[dDmM]|worktree\s+(?:add|remove|prune)|update-ref|gc)"
+    r"(?![\w-])|\bttp\s+(?!landed\b|task\s+\S+\s+(?:show|list)\b|lock\s+--probe\b|checks\s+--result\b)\w")
+
+
+def guard(cmd: str) -> str:
+    """Why premise command `cmd` may not run (the start_when probe checks: one POSIX sh command, not
+    always true; and local and read-only: no remote or machine access, no file writes), or ""."""
+    from .coordinator import check_probe
+    try:
+        check_probe(cmd, "premise_cmd")
+    except ValueError as e:
+        return str(e)
+    if m := _REMOTE.search(cmd):
+        return f"premise_cmd runs locally only: it may not reach a machine or device ({m.group(0).strip()!r})"
+    if m := _WRITES.search(cmd):
+        return f"premise_cmd must be read-only: it may not write ({m.group(0).strip()!r})"
+    return ""
+
+
+def cmd_config(cfg: dict | None) -> tuple[float, float]:
+    """(timeout s, recheck s) of premise commands from config `premise`."""
+    c = (cfg or {}).get("premise") or {}
+    try:
+        timeout = float(c.get("cmd_timeout_s") or CMD_TIMEOUT_S)
+        recheck = float(c.get("recheck_min") or RECHECK_MIN) * 60
+    except (TypeError, ValueError):
+        timeout, recheck = CMD_TIMEOUT_S, RECHECK_MIN * 60
+    return max(1.0, timeout), max(0.0, recheck)
+
+
+def runs_cmd(task: dict) -> str:
+    """The premise command the daemon runs before dispatching `task`, or "": a code task's, until it
+    gave no verdict once."""
+    if task.get("kind") != "code" or CMD_UNKNOWN in map(str, _labels(task)):
+        return ""
+    return command(task.get("spec"))
+
+
+def _event(db, t: dict, kind: str, severity: str, text: str, status: str, now: float) -> None:
+    db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+         (now, f"task:{t['id']}" if kind == "task_done" else "daemon", kind, severity, text[:1500], status, t["id"]))
+
+
+def cmd_false(db, task: dict, cmd: str, rc, tail: str, now: float | None = None) -> bool:
+    """Close queued code task `task` as not needed: its premise command exited 1. False when it is no
+    longer queued (another pass, a cancel or a start won)."""
+    from . import pushq
+    now = time.time() if now is None else now
+    tail = (tail or "").strip()[-600:]
+    words = (f"Not needed: its premise command exited {rc}, so the premise is false: `{cmd[:300]}`"
+             + (f". Its output: {tail}" if tail else ""))
+    result = {"status": "done", "outcome": "rejected", "summary": words[:1500],
+              "premise_cmd": {"cmd": cmd, "rc": rc, "tail": tail}}
+    with db.tx():
+        t = db.task(task["id"])
+        if not t or t["status"] != "queued":
+            return False
+        db.update_task(t["id"], status="done", blocked_reason=None, labels=[*_labels(t), CMD_FAILS],
+                       result=dump_result(result))
+        _event(db, t, "task_done", "normal", f"#{t['id']} {t['title']} → done, not run ({words})", "queued", now)
+        pushq._reply(db, t, "done", result["summary"])
+    return True
+
+
+def cmd_unknown(db, task: dict, cmd: str, why: str, now: float | None = None) -> bool:
+    """Premise command `cmd` of `task` gave no verdict (`why`): label it CMD_UNKNOWN, so tend takes
+    today's path. A task whose premise was already checked once (a `premise:` label) instead checks it
+    as its own first step. False when it is no longer queued or was handled already."""
+    now = time.time() if now is None else now
+    with db.tx():
+        t = db.task(task["id"])
+        labels = _labels(t) if t else []
+        if not t or t["status"] != "queued" or CMD_UNKNOWN in labels:
+            return False
+        upd: dict = {"labels": [*labels, CMD_UNKNOWN]}
+        # tend splits only a task never run nor checked: any other checks its premise in its own run
+        checked = any(str(x).startswith((LABEL, "continues:")) for x in labels) or bool(int(t["attempts"] or 0)) \
+            or bool(db.one("SELECT 1 FROM runs WHERE task=? AND role!='coordinator' LIMIT 1", (t["id"],)))
+        if checked:
+            upd["spec"] = (f"{t['spec'].rstrip()}\n\nPremise command `{cmd[:300]}` gave no verdict ({why[:300]}): "
+                           f"as your first step, check that the premise still holds. If it does not, change no "
+                           f"file and hand off done with outcome rejected and the evidence.")
+        db.update_task(t["id"], **upd)
+        _event(db, t, "premise_check", "low",
+               f"#{t['id']} {t['title']}: its premise command gave no verdict ({why[:300]}); "
+               + ("it checks the premise as its own first step" if checked else
+                  "it falls back to the premise check"), "handled", now)
+    return True
 
 
 def _labels(task: dict) -> list:
@@ -145,11 +273,21 @@ def repeat(db, spec: str, now: float | None = None) -> dict | None:
     `premise:` line repeats, or None: a done check whose "fails" closes its code task (verdict and
     gaps, as _settle reads it), whose premise names every commit the new one names (or, naming none,
     has the same words). {id, task, ts, summary}."""
-    check = line(spec)
-    if not check:
+    check, cmd = line(spec), command(spec)
+    if not check and not cmd:
         return None
     mine, said = _commits(check), _words(check)
     since = (time.time() if now is None else now) - REPEAT_DAYS * 86400
+    if cmd:   # a premise command that exited 1 for another task: the same command (spacing aside)
+        for t in db.q("SELECT id, title, result, COALESCE(updated, created, 0) ts FROM tasks WHERE kind='code' "
+                      "AND status='done' AND labels LIKE ? AND COALESCE(updated, created, 0) >= ? "
+                      "ORDER BY ts DESC, id DESC LIMIT 400", (f'%"{CMD_FAILS}"%', since)):
+            res = load_result(t["result"])
+            if " ".join(str((res.get("premise_cmd") or {}).get("cmd") or "").split()) == " ".join(cmd.split()):
+                return {"id": t["id"], "task": "", "ts": float(t["ts"]), "cmd": True,
+                        "summary": str(res.get("summary") or "").strip()}
+    if not check:
+        return None
     for q in db.q("SELECT id, spec, labels, result, COALESCE(updated, created, 0) ts FROM tasks WHERE "
                   "kind='question' AND status='done' AND labels LIKE ? AND COALESCE(updated, created, 0) >= ? "
                   "ORDER BY ts DESC, id DESC LIMIT 400", (f'%"{CHECK_LABEL}%', since)):
@@ -166,7 +304,8 @@ def repeat(db, spec: str, now: float | None = None) -> dict | None:
 
 def rejection(hit: dict) -> str:
     """task_add's refusal of a premise `repeat` found."""
-    return (f"premise already proved false by premise check #{hit['id']}"
+    return (f"premise already proved false by "
+            + (f"task #{hit['id']}'s premise command" if hit.get("cmd") else f"premise check #{hit['id']}")
             + (f" (for #{hit['task']})" if hit["task"] else "")
             + f": {hit['summary'][:300]}. Do not queue it again; if this is really new, add "
               f"'differs from #{hit['id']}: <how>' to the spec and resend with force: true")
@@ -323,18 +462,18 @@ def tend(db) -> list[tuple[int, str]]:
     """Split, settle and clean up premise checks (see the module doc); (code task id, what) per action."""
     done: list[tuple[int, str]] = []
     for t in db.q("SELECT * FROM tasks WHERE kind='code' AND status IN ('queued','blocked') "
-                  "AND (spec LIKE '%premise:%' OR labels LIKE '%\"premise:%')"):
+                  "AND (spec LIKE '%premise%' OR labels LIKE '%\"premise:%')"):
         labels = [str(x) for x in _labels(t)]
         pend = pending(t)
         if pend is not None:
-            if is_urgent(t) and (check := line(t["spec"])) and _self(db, t, check, pend):
+            if is_urgent(t) and (check := check_text(t["spec"])) and _self(db, t, check, pend):
                 done.append((t["id"], f"premise checked in its own run (#{pend} cancelled)"))
             elif (got := _settle(db, t, pend)) is not None:
                 done.append((t["id"], f"premise {got} (#{pend})"))
             continue
         if t["status"] != "queued" or any(x.startswith((LABEL, "continues:")) for x in labels) \
-                or int(t["attempts"] or 0) or not (check := line(t["spec"])):
-            continue
+                or int(t["attempts"] or 0) or runs_cmd(t) or not (check := check_text(t["spec"])):
+            continue   # a premise command runs model-free first (Daemon._premise_cmds)
         if db.one("SELECT 1 FROM runs WHERE task=? AND role!='coordinator' LIMIT 1", (t["id"],)):
             continue
         if is_urgent(t):

@@ -22828,3 +22828,516 @@ def test_coordinator_running_workers_fold_unchanged_rows_on_session_wakes(env):
     # Measured on this fixture (8 runs): the full section and a delta where no row changed.
     tokens = len(full) / 4
     assert tokens <= 300, (tokens, full)
+
+
+def test_digest_labels_several_action_notes_once(env):
+    """Notes on the previous turn's applied actions: a lone note keeps its inline label; several share
+    one label line with each note under it, so the label is not paid once per note on every turn."""
+    from ttp import coordinator as coord
+    p = make(env)
+    p.db.set_kv(coord.NOTES_KEY, ["first applied note"])
+    d = coord.digest(p, {}, [], [])
+    assert "- [note on your previous turn's action: applied, nothing to fix] first applied note" in d
+    p.db.set_kv(coord.NOTES_KEY, ["first applied note", "second applied note"])
+    d = coord.digest(p, {}, [], [])
+    assert d.count("applied, nothing to fix") == 1
+    assert ("- [notes on your previous turn's actions: applied, nothing to fix]\n  - first applied note\n"
+            "  - second applied note") in d
+
+
+def _fold_event(p, kind, text, fold=None, fp=None, severity="normal", task=None, extra=None):
+    data = {**(extra or {}), **({"fold": fold} if fold else {})}
+    p.db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status,task,data) VALUES(?,?,?,?,?,?,?,?,?)",
+           (time.time(), "daemon", kind, fp or f"{kind}:{time.time()}:{text[:20]}", severity, text, "queued", task,
+            json.dumps(data) if data else None))
+    return p.db.one("SELECT MAX(id) id FROM events")["id"]
+
+
+def test_digest_folds_queue_waits_into_one_line_per_queue_keeping_keys_and_options(env):
+    """Several queue_wait events on one queue share one NEW EVENTS line: the queue's newest state once, the
+    options every item has once, then each item with its key and its own options. Must act now still names
+    every key. Another queue keeps its own line; a lone event keeps its own text."""
+    from ttp import coordinator as coord, mustact, queuewait
+    p = make(env)
+    ids = []
+    for tid, mins, ctx in ((7, 228, "4 running (cap 4), 22 queued. Holding: old."),
+                           (8, 53, "4 running (cap 4), 21 queued. Holding: run A; run B.")):
+        opts = ["cut the stale queued tail: cancel this project's older queued checks runs",
+                f"cancel it if it is no longer needed: task_update {tid} status cancelled"]
+        w = {"task": tid, "queue": "checks", "res": "", "since": time.time() - mins * 60}
+        ids.append(_fold_event(p, "queue_wait", queuewait.text(w, opts, time.time()) + f" {ctx}",
+                               {"group": "the checks queue", "item": f"qwait-{tid}-checks: #{tid} has waited {mins} min",
+                                "ctx": ctx, "opts": opts}, severity="high",
+                               extra={"must_act": {"key": f"qwait-{tid}-checks", "chat": "all", "tasks": [tid],
+                                                   "kind": "queue_wait"}}))
+    ids.append(_fold_event(p, "queue_wait", "qwait-9-push: #9 has waited 40 min on the push queue: LONE TEXT",
+                           {"group": "the push queue", "item": "qwait-9-push: #9 has waited 40 min", "ctx": "c",
+                            "opts": ["o"]}, severity="high"))
+    d = coord.digest(p, {}, ids, [])
+    ev = d.split("# NEW EVENTS", 1)[1]
+    lines = [ln for ln in ev.split("\n") if ln.startswith("- [queue_wait")]
+    assert len(lines) == 2, lines
+    one = lines[0]
+    assert one.startswith("- [queue_wait from daemon, 2 folded into one line, severity high]"), one
+    assert "on the checks queue, now: 4 running (cap 4), 21 queued. Holding: run A; run B." in one
+    assert "Holding: old." not in one   # the older state is not repeated
+    assert one.count("cut the stale queued tail") == 1 and "Options for each: cut the stale queued tail" in one
+    assert ("qwait-7-checks: #7 has waited 228 min (options: cancel it if it is no longer needed: task_update 7 "
+            "status cancelled)") in one and "task_update 8 status cancelled" in one
+    assert "LONE TEXT" in lines[1]   # alone on its queue: shown as raised
+    block = mustact.block(p.db, ids)
+    assert "qwait-7-checks" in block and "qwait-8-checks" in block
+
+
+def test_digest_folds_urgent_check_and_stale_waits_and_slot_wait_incident_wakes(env):
+    """urgent_check_wait: one line per queue, what holds it once, each waiter named. wait_stale: the shared
+    decide words once, each wait's own words kept. checks_slot_wait: of several wakes of one queue incident
+    the newest is shown whole; another incident keeps its line. Events with no fold data show as before."""
+    from ttp import checkcap, coordinator as coord
+    p = make(env)
+    ws = [{"holder": f"demo task #{t} (run {t}0)", "priority": 1, "waited_s": 660, "queue": "checks-parked",
+           "held_by": ["demo task #5 (run 50) (x4)", "other task #6 (run 60) (x8)"]} for t in (1, 2, 3)]
+    ids = [_fold_event(p, checkcap.URGENT_WAIT, checkcap.urgent_wait_text(w), checkcap.urgent_wait_fold(w))
+           for w in ws]
+    assert checkcap.urgent_wait_text(ws[0]) == (
+        "urgent checks demo task #1 (run 10) (priority 1) have waited 11 min in the host-wide checks-parked "
+        "queue; held by: demo task #5 (run 50) (x4); other task #6 (run 60) (x8)")
+    shared = ("Each keeps sleeping and no worker run is spent. Decide for each: fix its probe (`ttp task set-when "
+              "<id> \"<cmd>\"`), clear it (\"\") so it wakes at its timer, or cancel the task.")
+    for t in (4, 5):
+        ids.append(_fold_event(p, "wait_stale", f"#{t} t has waited 6 h for x. Decide: ...",
+                               {"group": "probe waits past max_hold_s", "item": f"#{t} t has waited 6 h for x{t}.",
+                                "ctx": shared}))
+    for n, start in ((1, 100), (2, 100), (3, 200)):
+        ids.append(_fold_event(p, "checks_slot_wait", f"Checks queue: wake {n} of incident {start}.",
+                               fp=f"checks_slot_wait:incident:{start}:escalate:{n}"))
+    ev = coord.digest(p, {}, ids, []).split("# NEW EVENTS", 1)[1]
+    urgent = [ln for ln in ev.split("\n") if ln.startswith("- [urgent_check_wait")]
+    assert len(urgent) == 1 and urgent[0].count("held by:") == 1, urgent
+    assert all(f"demo task #{t} (run {t}0) (priority 1) have waited 11 min" in urgent[0] for t in (1, 2, 3))
+    stale = [ln for ln in ev.split("\n") if ln.startswith("- [wait_stale")]
+    assert len(stale) == 1 and stale[0].count("Decide for each") == 1 and "x4." in stale[0] and "x5." in stale[0]
+    slot = [ln for ln in ev.split("\n") if ln.startswith("- [checks_slot_wait")]
+    assert len(slot) == 2 and "wake 2 of incident 100" in slot[0] and "the newest of 2 wakes" in slot[0], slot
+    assert "wake 1 of" not in ev and "wake 3 of incident 200" in slot[1]
+
+
+_STEPS_SPEC = ("Goal: speed up the loader.\nSteps:\n1. profile it\n2. run the device benchmark\n3. report the commit\n\n"
+               "Restrictions:\n- keep content generic\n- deliver through review\n\nnever push to main\n"
+               "guards: keep the lock on the board")
+
+
+def test_task_update_replace_withdraws_or_rewrites_one_step_and_keeps_the_old_text(env, tmp_path):
+    # Appending could never take a requirement back: `replace` changes one quoted step, records the old
+    # text as a spec_step_replaced event, and tells a running worker which step no longer applies.
+    p = make(env)
+    from ttp import coordinator as coord
+    tid = p.db.add_task("loader", _STEPS_SPEC, kind="work")
+    assert coord.apply(p, [{"type": "task_update", "id": tid, "replace": {"old": "2. run the device benchmark\n"}}]) == []
+    spec = p.db.task(tid)["spec"]
+    assert "device benchmark" not in spec.split("## Update")[0] and "1. profile it\n3. report the commit" in spec
+    assert "Step withdrawn (no longer required): '2. run the device benchmark'" in spec
+    assert "Restrictions:\n- keep content generic" in spec and "never push to main" in spec
+    [ev] = p.db.q("SELECT * FROM events WHERE kind=? AND task=?", (coord.STEP_REPLACED_KIND, tid))
+    assert json.loads(ev["data"]) == {"old": "2. run the device benchmark\n", "new": ""}
+    p.db.update_task(tid, status="running")
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    p.db.x("INSERT INTO runs(task,role,provider,started,status,dir) VALUES(?,?,?,?,?,?)",
+           (tid, "worker", "fake", time.time(), "running", str(run_dir)))
+    assert coord.apply(p, [{"type": "task_update", "id": tid,
+                            "replace": {"old": "3. report the commit", "new": "3. report the commit and its timing"}}]) == []
+    assert "3. report the commit and its timing" in p.db.task(tid)["spec"].split("## Update")[0]
+    assert "Step replaced (the earlier text no longer applies): '3. report the commit'" in (run_dir / "steer.md").read_text()
+
+
+@pytest.mark.parametrize("old, why", [
+    ("2. run the board benchmark", "0 times"),
+    ("the", "times, not once"),
+    ("- keep content generic", "touches a safety line"),             # a line of a Restrictions block
+    ("Restrictions:", "touches a safety line"),
+    ("never push to main", "touches a safety line"),
+    ("guards: keep the lock", "touches a safety line"),
+    ("3. report the commit\n\nRestrictions:", "touches a safety line"),   # a step reaching into the block
+])
+def test_task_update_replace_is_refused_off_one_exact_step_or_on_a_safety_line(env, old, why):
+    p = make(env)
+    from ttp import coordinator as coord
+    tid = p.db.add_task("loader", _STEPS_SPEC, kind="work")
+    problems = coord.apply(p, [{"type": "task_update", "id": tid, "replace": {"old": old, "new": ""}}])
+    assert problems and why in " ".join(map(str, problems)), problems
+    assert p.db.task(tid)["spec"] == _STEPS_SPEC
+    assert p.db.q("SELECT 1 FROM events WHERE kind=?", (coord.STEP_REPLACED_KIND,)) == []
+
+
+_QUOTED = 'In the user\'s words: "run the full sweep tonight"'
+
+
+def _spec_edit_running(p, tid, tmp_path):
+    p.db.update_task(tid, status="running")
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    p.db.x("INSERT INTO runs(task,role,provider,started,status,dir) VALUES(?,?,?,?,?,?)",
+           (tid, "worker", "fake", time.time(), "running", str(run_dir)))
+    return run_dir / "steer.md"
+
+
+def test_task_update_spec_retire_line_drops_every_copy_and_keeps_the_history(env, tmp_path):
+    # A re-sent update repeats a quotation: `retire:` drops each copy from the live spec, the worker is told
+    # it no longer applies, and the earlier text stays in the events.
+    p = make(env)
+    from ttp import coordinator as coord
+    tid = p.db.add_task("sweep", _STEPS_SPEC + "\n\n## Update\n" + _QUOTED + "\n\n## Update\n" + _QUOTED, kind="work")
+    steer = _spec_edit_running(p, tid, tmp_path)
+    upd = 'retire: "' + _QUOTED + '"\nRun only the quick sweep.'
+    assert coord.apply(p, [{"type": "task_update", "id": tid, "spec": upd}]) == []
+    spec = p.db.task(tid)["spec"]
+    # The live spec never repeats the retired quote (a fresh run never saw it); only the running worker is told.
+    assert "full sweep" not in spec and spec.count(coord.RETIRED_LIVE) == 1 and coord.RETIRED_TOLD not in spec
+    assert spec.endswith("Run only the quick sweep.") and "never push to main" in spec and "1. profile it" in spec
+    told = steer.read_text()
+    assert "Retired (this earlier text no longer applies; do not act on it)" in told and "full sweep tonight" in told
+    assert 'retire: "' not in told and "Run only the quick sweep." in told
+    [ev] = p.db.q("SELECT * FROM events WHERE kind=? AND task=?", (coord.STEP_REPLACED_KIND, tid))
+    assert json.loads(ev["data"]) == {"old": _QUOTED, "new": "", "how": "retire", "copies": 2}
+
+
+def test_task_update_spec_replace_line_makes_the_whole_spec_and_keeps_safety_lines(env, tmp_path):
+    p = make(env)
+    from ttp import coordinator as coord
+    tid = p.db.add_task("sweep", _STEPS_SPEC + "\n\n## Update\n" + _QUOTED, kind="work")
+    steer = _spec_edit_running(p, tid, tmp_path)
+    upd = "replace:\nGoal: run the quick sweep and report its numbers.\n- keep content generic"
+    assert coord.apply(p, [{"type": "task_update", "id": tid, "spec": upd}]) == []
+    spec = p.db.task(tid)["spec"]
+    assert spec.startswith("Goal: run the quick sweep and report its numbers.")
+    assert "full sweep" not in spec and "profile it" not in spec and "## Update" not in spec
+    kept = spec.split("Kept from the earlier spec (safety lines change only through the charter):\n")[1]
+    assert kept.split("\n") == ["Restrictions:", "- deliver through review", "never push to main",
+                                "guards: keep the lock on the board"]   # "- keep content generic" is already there
+    told = steer.read_text()
+    assert coord.WHOLE_SPEC_REPLACED in told and "quick sweep" in told and "replace:" not in told
+    [ev] = p.db.q("SELECT * FROM events WHERE kind=? AND task=?", (coord.STEP_REPLACED_KIND, tid))
+    data = json.loads(ev["data"])
+    assert data["how"] == "replace" and data["old"] == _STEPS_SPEC + "\n\n## Update\n" + _QUOTED and data["new"] == spec
+
+
+def _with_obligation(p, tid):
+    """The task's spec once an obligation with a milestone is attached, and its appended block."""
+    import time
+    from ttp import obligations
+    from ttp.coordinator import _obligation_spans
+    oid = obligations.add(p, "ship the quick sweep numbers (user msg #1)", owners=[tid],
+                          milestones=[{"key": "m1", "due": time.time() + 7200, "evidence_required": "a result"}])
+    spec = p.db.task(tid)["spec"]
+    [(a, b)] = _obligation_spans(spec)
+    block = spec[a:b]
+    assert block.startswith(f"## Obligation {oid} ") and f"### Obligation {oid} milestone m1" in block, spec
+    return oid, spec, block
+
+
+@pytest.mark.parametrize("then", ["", "\n\n## Update\nRun only the quick sweep."])
+def test_task_update_spec_replace_line_keeps_an_attached_obligation_block_byte_for_byte(env, tmp_path, then):
+    # obligations._attach never re-appends a block for an owner it has: a whole replace carries it over.
+    p = make(env)
+    from ttp import coordinator as coord, obligations
+    tid = p.db.add_task("sweep", _STEPS_SPEC, kind="work")
+    oid, _, block = _with_obligation(p, tid)
+    if then:
+        p.db.update_task(tid, spec=p.db.task(tid)["spec"] + then)
+    upd = "replace:\nGoal: run the quick sweep and report its numbers."
+    assert coord.apply(p, [{"type": "task_update", "id": tid, "spec": upd}]) == []
+    spec = p.db.task(tid)["spec"]
+    assert spec.startswith("Goal: run the quick sweep") and spec.count(block) == 1 and spec.endswith(block)
+    assert "Run only the quick sweep." not in spec and "profile it" not in spec
+    assert obligations.attach(p, oid, [tid]) == [] and p.db.task(tid)["spec"] == spec, "never appended twice"
+    # Sent again with the block already quoted in the new text: it is not added a second time.
+    assert coord.apply(p, [{"type": "task_update", "id": tid, "spec": "replace:\nGoal: y\n\n" + block}]) == []
+    assert p.db.task(tid)["spec"].count(block) == 1, p.db.task(tid)["spec"]
+
+
+@pytest.mark.parametrize("quote", ["ttp obligation progress", "This task is a required owner.", "--milestone m1",
+                                   "(urgent, owed to the user)"])
+def test_task_update_retire_or_replace_inside_an_obligation_block_is_refused(env, quote):
+    p = make(env)
+    from ttp import coordinator as coord
+    tid = p.db.add_task("sweep", _STEPS_SPEC, kind="work")
+    oid, spec, _ = _with_obligation(p, tid)
+    for act in ({"spec": f'retire: "{quote}"'}, {"replace": {"old": quote, "new": "x"}}):
+        problems = coord.apply(p, [{"type": "task_update", "id": tid, **act}])
+        assert problems and "ttp obligation" in " ".join(map(str, problems)), (act, problems)
+        assert p.db.task(tid)["spec"] == spec
+    # Text outside the block still retires, and the block stays.
+    assert coord.apply(p, [{"type": "task_update", "id": tid, "spec": 'retire: "Goal: speed up the loader."'}]) == []
+    assert "speed up" not in p.db.task(tid)["spec"] and f"## Obligation {oid} " in p.db.task(tid)["spec"]
+
+
+@pytest.mark.parametrize("upd, why", [
+    ('retire: "run the whole sweep tonight"', "matches no earlier spec text"),
+    ('retire: "sweep"', "too short"),
+    ('retire: "never push to main"', "touches a safety line"),
+    ('retire: "- keep content generic"', "touches a safety line"),
+    ("Do this first.\nreplace:\nGoal: x", "must be the update's first line"),
+    ("replace:\n\n", "needs the new spec"),
+    ('replace:\nGoal: x\nretire: "1. profile it"', "drop its `retire:` lines"),
+])
+def test_task_update_spec_retire_or_replace_line_is_refused_not_ignored(env, upd, why):
+    p = make(env)
+    from ttp import coordinator as coord
+    tid = p.db.add_task("sweep", _STEPS_SPEC, kind="work")
+    problems = coord.apply(p, [{"type": "task_update", "id": tid, "spec": upd}])
+    assert problems and why in " ".join(map(str, problems)) and f"#{tid} rejected" in " ".join(map(str, problems))
+    assert p.db.task(tid)["spec"] == _STEPS_SPEC
+    assert p.db.q("SELECT 1 FROM events WHERE kind=?", (coord.STEP_REPLACED_KIND,)) == []
+
+
+@pytest.mark.parametrize("upd", ["Replace: the loader with the streaming one.", "Retire: the old flag.",
+                                 'retire "1. profile it"', "replace: the loader"])
+def test_task_update_spec_without_an_exact_edit_line_is_appended_as_before(env, tmp_path, upd):
+    p = make(env)
+    from ttp import coordinator as coord
+    tid = p.db.add_task("loader", _STEPS_SPEC, kind="work")
+    steer = _spec_edit_running(p, tid, tmp_path)
+    assert coord.apply(p, [{"type": "task_update", "id": tid, "spec": upd}]) == []
+    assert p.db.task(tid)["spec"] == _STEPS_SPEC + "\n\n## Update\n" + upd
+    assert upd in steer.read_text() and coord.WHOLE_SPEC_REPLACED not in steer.read_text()
+    assert p.db.q("SELECT 1 FROM events WHERE kind=?", (coord.STEP_REPLACED_KIND,)) == []
+
+
+@pytest.mark.parametrize("how", ["retire", "replace"])
+def test_a_retired_quotation_leaves_the_readback_and_the_worker_prompt(env, capsys, monkeypatch, how):
+    # Witness: a task's readback kept its older broad quotation after a later explicit replacement retired it,
+    # so a worker (and an active-rule check) kept seeing it. After `retire:` or `replace:` neither shows it.
+    p = make(env)
+    from ttp import cli, prompts
+    from ttp import coordinator as coord
+    broad = 'In the user\'s words: "re-run every benchmark on every board before each push"'
+    tid = p.db.add_task("bench", _STEPS_SPEC + "\n\n## Update\n" + broad, kind="work")
+    upd = ('retire: "' + broad + '"\nBenchmark only the changed model.' if how == "retire"
+           else "replace:\nGoal: benchmark only the changed model.")
+    assert coord.apply(p, [{"type": "task_update", "id": tid, "spec": upd}]) == []
+    monkeypatch.setenv("TTP_PROJECT", str(p.base))
+    capsys.readouterr()
+    cli.main(["task", "show", str(tid)])
+    readback = capsys.readouterr().out
+    prompt = prompts.worker_task(p, p.db.task(tid), str(p.root), None)
+    for text in (readback, prompt):
+        assert "every benchmark on every board" not in text and "only the changed model" in text
+        assert "never push to main" in text
+    [ev] = p.db.q("SELECT * FROM events WHERE kind=? AND task=?", (coord.STEP_REPLACED_KIND, tid))
+    assert broad in json.loads(ev["data"])["old"]
+
+
+# A coordinator turn whose budget ended it on its whole final answer: the answer is applied, not wasted.
+SALVAGE_ANSWER = {"actions": [{"type": "reply", "chat": "c1", "text": "ok", "severity": None, "title": None}],
+                  "summary": "s"}
+
+
+def _answer_call(tid="t1", inp=None, parent=None):
+    return {"type": "assistant", "parent_tool_use_id": parent,
+            "message": {"id": f"m-{tid}", "usage": {}, "content": [
+                {"type": "tool_use", "id": tid, "name": "StructuredOutput", "input": inp or SALVAGE_ANSWER}]}}
+
+
+def _claude_result(subtype="error_max_budget_usd", structured=None):
+    return {"type": "result", "subtype": subtype, "is_error": subtype != "success", "total_cost_usd": 1.3,
+            "usage": {"input_tokens": 1, "output_tokens": 1}, "result": "", "structured_output": structured}
+
+
+def _claude_parse(tmp_path, events):
+    from ttp.providers.claude import Claude
+    path = tmp_path / "output.jsonl"
+    path.write_text("".join(json.dumps(e) + "\n" for e in events))
+    return Claude().parse(path)
+
+
+def test_claude_keeps_an_unrun_final_answer_at_budget_end_without_nulls(tmp_path):
+    init = {"type": "system", "subtype": "init", "session_id": "s"}
+    u = _claude_parse(tmp_path, [init, _answer_call(), _claude_result()])
+    assert u.answer == {"actions": [{"type": "reply", "chat": "c1", "text": "ok"}], "summary": "s"}
+    assert u.structured is None
+    # A retry after a refused first call: the newest one, still unrun, is the answer.
+    refused = {"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "t1", "is_error": True}]}}
+    newer = {"actions": [{"type": "reply", "chat": "c1", "text": "second"}]}
+    assert _claude_parse(tmp_path, [_answer_call(), refused, _answer_call("t2", newer), _claude_result()]).answer == newer
+
+
+def test_claude_keeps_no_answer_that_ran_was_denied_came_from_a_subagent_or_ended_otherwise(tmp_path):
+    ran = {"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "t1", "content": "ok"}]}}
+    denied = {"type": "user", "message": {"content": [
+        {"type": "tool_result", "tool_use_id": "t1", "is_error": True, "content": "denied by hook"}]}}
+    assert _claude_parse(tmp_path, [_answer_call(), ran, _claude_result()]).answer is None
+    assert _claude_parse(tmp_path, [_answer_call(), denied, _claude_result()]).answer is None
+    assert _claude_parse(tmp_path, [_answer_call(parent="sub1"), _claude_result()]).answer is None
+    for subtype in ("error_max_turns", "error_during_execution", "success"):
+        assert _claude_parse(tmp_path, [_answer_call(), _claude_result(subtype)]).answer is None, subtype
+    # A result that carried the answer anyway: that one stands, nothing is salvaged.
+    assert _claude_parse(tmp_path, [_answer_call(), _claude_result(structured=SALVAGE_ANSWER)]).answer is None
+    assert _claude_parse(tmp_path, [_answer_call()]).answer is None   # cut before any result line
+
+
+def test_codex_and_cursor_keep_a_whole_answer_cut_off_by_the_runners_budget_check(tmp_path):
+    from ttp.providers import get_provider
+    text = json.dumps(SALVAGE_ANSWER)
+    msg = {"type": "item.completed", "item": {"type": "agent_message", "text": text}}
+    done = {"type": "turn.completed", "usage": {"input_tokens": 1, "cached_input_tokens": 0, "output_tokens": 1}}
+    out = tmp_path / "codex.jsonl"
+    out.write_text(json.dumps(msg) + "\n")
+    assert get_provider("codex").parse(out).answer == {"actions": [{"type": "reply", "chat": "c1", "text": "ok"}],
+                                                       "summary": "s"}
+    out.write_text(json.dumps(msg) + "\n" + json.dumps(done) + "\n")
+    assert get_provider("codex").parse(out).answer is None   # its turn completed: a plain answer
+    out.write_text(json.dumps({**msg, "item": {"type": "agent_message", "text": text[:-5]}}) + "\n")
+    assert get_provider("codex").parse(out).answer is None   # a cut-off message never parses
+    cur = tmp_path / "cursor.jsonl"
+    said = {"type": "assistant", "message": {"content": [{"type": "text", "text": text}]}}
+    cur.write_text(json.dumps(said) + "\n")
+    assert get_provider("cursor").parse(cur).answer["actions"][0]["text"] == "ok"
+    cur.write_text(json.dumps(said) + "\n" + json.dumps({"type": "result", "result": text}) + "\n")
+    assert get_provider("cursor").parse(cur).answer is None
+
+
+def test_only_a_stateless_coordinator_turn_over_its_budget_is_salvageable(tmp_path):
+    from ttp.daemon import _salvageable_answer
+    u = _claude_parse(tmp_path, [_answer_call(), _claude_result()])
+    stateless = {"turn": {"session": {"mode": "stateless"}}}
+    assert _salvageable_answer("failed", u, stateless) and _salvageable_answer("failed", u, {})
+    assert _salvageable_answer("budget", u, {})
+    for mode in ("new", "resume"):   # a session wake's cut-off answer is applied too; its session resumes
+        assert _salvageable_answer("failed", u, {"turn": {"session": {"mode": mode}}}), mode
+    other = _claude_parse(tmp_path, [_answer_call(), _claude_result("error_max_turns")])
+    other.answer = u.answer
+    assert not _salvageable_answer("failed", other, stateless)   # another ending
+    u.answer = {"summary": "no actions"}
+    assert not _salvageable_answer("failed", u, stateless)
+
+
+@pytest.mark.parametrize("prior", ["none", "resumable"])
+def test_a_salvaged_coordinator_session_wake_is_applied_not_wasted_and_its_session_resumes(env, prior):
+    """A session wake (new, or a resume of a saved session) cut off at its budget end on its unrun final
+    StructuredOutput call: its answer is applied, not counted as waste, and the next wake resumes the
+    same session, told the answer was applied (never a fresh seeded session or a stateless turn)."""
+    from ttp import budget as bud
+    from ttp import coordsession as cs
+    from ttp.daemon import Daemon
+    p = make(env)
+    key, model, effort = "k1", "m", "high"
+    if prior == "resumable":
+        p.db.set_kv(cs.KEY, {"id": "s1", "key": key, "model": model, "effort": effort, "last_ok": True,
+                             "provider": "claude", "wakes": 2})
+    mode, why = cs.decide(p.config(), p.db.kv(cs.KEY), key, model, effort, lambda sid: True, time.time())
+    assert mode == ("resume" if prior == "resumable" else "new"), (mode, why)
+    session = {"mode": mode, "why": why, "key": key, "model": model, "effort": effort, "provider": "claude"}
+    answer = {"actions": [{"type": "task_add", "title": "salvaged task", "spec": "s", "kind": None, "tier": None}],
+              "summary": "s"}
+    rid = p.db.x("INSERT INTO runs(role,provider,model,started,status,note,session_id) VALUES('coordinator',"
+                 "'claude','m',?,'running',?,?)", (time.time() - 60, json.dumps({"turn": {"session": session}}),
+                                                   "s1" if mode == "resume" else None))
+    run_dir = p.runs / str(rid)
+    run_dir.mkdir(parents=True)
+    (run_dir / "run.json").write_text(json.dumps({"budget_usd": 1.0, "timeout_s": 600}))
+    (run_dir / "output.jsonl").write_text("".join(json.dumps(e) + "\n" for e in [
+        {"type": "system", "subtype": "init", "session_id": "s1"}, _answer_call(inp=answer), _claude_result()]))
+    Daemon(p.base).finish_run(p.db.one("SELECT * FROM runs WHERE id=?", (rid,)),
+                              {"rc": 1, "started": time.time() - 60, "ended": time.time()})
+    run = p.db.one("SELECT * FROM runs WHERE id=?", (rid,))
+    assert json.loads(run["note"])["not_waste"] == "answer" and not bud.wasted(run), run
+    assert len(p.db.q("SELECT id FROM tasks WHERE title='salvaged task'")) == 1
+    st = p.db.kv(cs.KEY)
+    assert st["id"] == "s1" and st["last_ok"] and st["salvaged"] == 1 and not st.get("rerun"), st
+    nxt = cs.decide(p.config(), st, key, model, effort, lambda sid: True, time.time())
+    assert nxt[0] == "resume", nxt
+    # The next wake that ends ok was told; a later one is not told again.
+    st = cs.record(st, None, "s1", {**session, "mode": "resume", "why": nxt[1]}, True, time.time())
+    assert "salvaged" not in st
+
+
+def test_claude_schema_requires_only_each_objects_own_fields_and_codex_stays_all_required(tmp_path):
+    from ttp import coordinator as coord
+    from ttp.providers import get_provider
+    from ttp.providers.base import strict_schema
+    loose = strict_schema(coord.ACTIONS_SCHEMA, require_all=False)
+    item = loose["properties"]["actions"]["items"]
+    assert loose["required"] == ["actions"] and item["required"] == ["type"]
+    assert item["additionalProperties"] is False and "null" in item["properties"]["severity"]["type"]
+    assert item["properties"]["claims"]["items"]["required"] == ["text"]
+    strict = strict_schema(coord.ACTIONS_SCHEMA)
+    assert set(strict["properties"]["actions"]["items"]["required"]) == set(item["properties"])
+    kw = dict(role="coordinator", model="", effort="low", cwd=str(tmp_path), budget_usd=1, read_only=True,
+              schema=coord.ACTIONS_SCHEMA, restrictions={})
+    for name in ("claude", "chat"):
+        argv, _ = get_provider(name).build(**kw)
+        assert json.loads(argv[argv.index("--json-schema") + 1]) == loose, name
+    argv, _ = get_provider("codex").build(**kw)
+    assert json.loads(pathlib.Path(argv[argv.index("--output-schema") + 1]).read_text()) == strict
+
+
+def test_an_answer_without_nulls_parses_to_the_same_actions_as_a_padded_one(tmp_path):
+    """Under the sparse schema a null is padding, as under the all-required one: a schedule field is
+    cleared only through clear_fields, and left-out fields keep their values."""
+    from ttp import coordinator as coord
+    props = coord.ACTIONS_SCHEMA["properties"]["actions"]["items"]["properties"]
+    bare = [{"type": "reply", "chat": "c1", "text": "ok"},
+            {"type": "schedule_set", "name": "n", "probe": "true"},
+            {"type": "schedule_set", "name": "n", "clear_fields": ["debounce_h"]},
+            {"type": "task_update", "id": 3, "status": "queued", "heal": {"preset": "x"}}]
+    padded = [{**dict.fromkeys(props), **a} for a in bare]
+    padded[3]["heal"] = {"preset": "x", "pattern": None}
+    sparse_null = [*bare[:1], {**bare[1], "debounce_h": None, "precheck": None}, *bare[2:]]
+    got = [_claude_parse(tmp_path, [_claude_result("success", {"actions": acts, "summary": "s"})]).structured
+           for acts in (bare, padded, sparse_null)]
+    assert got[0] == got[1] == got[2], got
+    assert got[0]["actions"][1] == {"type": "schedule_set", "name": "n", "probe": "true"}
+    assert got[0]["actions"][2] == {"type": "schedule_set", "name": "n", "debounce_h": None}
+    # A sparse answer outside any schema (text) keeps its legacy explicit-null clear, as before.
+    from ttp.providers.base import drop_nulls
+    assert drop_nulls({"type": "schedule_set", "debounce_h": None}) == {"type": "schedule_set", "debounce_h": None}
+
+
+def test_a_spec_naming_a_closed_delivered_or_order_owned_key_is_a_citation(env, monkeypatch):
+    """18 of 51 rejected actions in a day were 'its spec names obligation oN, which #N does not own', most on
+    done tasks naming keys no one owed any more: closed and delivered keys are citations, an order's own
+    tasks own it, and STATE's open-task rows show the open keys each task owns."""
+    from ttp import coordinator as coord
+    from ttp import obligations as ob
+    p, d, now, tid, check = _ob_setup(env, monkeypatch)
+    other = p.db.add_task("other work", "s", origin="coordinator")
+    gone, kept, sent, owed = (ob.add(p, f"report {i}", now=now) for i in range(4))
+    ob.drop(p, gone, "no longer wanted")
+    ob.record(p, kept, "receipt", "docs/report.md", None)
+    assert ob.get(p.db, kept)["receipt"]
+    st = ob._load(p.db)
+    st["items"][sent]["delivered"] = {"message": 1, "chat": "c", "at": now}
+    st["items"][owed]["promise"] = {"tasks": [other], "chat": "c", "message": 2, "due": now + 3600, "timed": True}
+    p.db.set_kv(ob.KV, st)
+    for key in (gone, kept, sent):
+        spec = f"Background: obligation {key} was settled earlier."
+        assert coord.apply(p, [{"type": "task_update", "id": tid, "spec": spec}]) == [], key
+    assert coord.apply(p, [{"type": "task_update", "id": other, "spec": f"Record obligation {owed} progress."}]) == []
+    out = coord.apply(p, [{"type": "task_update", "id": tid, "spec": f"Also obligation {owed}."}])
+    assert len(out) == 1 and "does not own" in out[0], "an open key still needs its owner"
+    assert ob.open_keys_by_task(p.db) == {other: [owed]}
+    row = next(x for x in coord.digest(p, {}, [], []).splitlines() if x.startswith(f"- #{other} |"))
+    assert f"(owns {owed})" in row
+
+
+def test_state_shows_the_24h_task_caps_near_and_at_the_limit(env):
+    """13 cap refusals in a day were learned only by refusal: STATE's budget lines show each rolling 24 h
+    cap once it is near, and the next free slot once it is full."""
+    from ttp import coordinator as coord
+    p = make(env)
+    p.set_config("coordinator.max_new_tasks_per_day", 5)
+    p.set_config("coordinator.max_review_tasks_per_day", 10)
+    now = time.time()
+    assert coord.task_cap_lines(p.db, p.config(), now, p) == [], "far below the caps: no line"
+    for i in range(4):
+        p.db.add_task(f"made {i}", "s", origin="coordinator")
+    (line,) = coord.task_cap_lines(p.db, p.config(), now, p)
+    assert "max_new_tasks_per_day): 4 of 5 used, 1 left" in line
+    p.db.add_task("made 4", "s", origin="coordinator")
+    (line,) = coord.task_cap_lines(p.db, p.config(), time.time(), p)
+    assert "5 of 5 used, FULL: the next slot frees at" in line
+    assert "24 h cap on new tasks" in coord.digest(p, {}, [], [])
+    p.set_config("coordinator.max_review_tasks_per_day", 0)
+    assert any("review tasks (max_review_tasks_per_day): 0" in x
+               for x in coord.task_cap_lines(p.db, p.config(), time.time(), p))

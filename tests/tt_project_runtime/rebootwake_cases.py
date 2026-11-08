@@ -419,3 +419,55 @@ def test_each_skipped_job_relaunch_says_why_in_the_daemon_log(env, tmp_path):
     _boot_daemon(p)
     text = (p.logs / "daemon.log").read_text()
     assert f"task {tid}: detached jobs job not relaunched: detached job job is not resumable" in text, text[-2000:]
+
+
+def test_a_reboot_never_relaunches_checks_of_a_deferred_or_closed_task(env, tmp_path):
+    """#7190 (1): the checks a reboot killed start again (relaunch-t<task>) only for a task still open and not
+    deferred. A start_when not yet met, a start_after still to come, or a task cancelled or done by the time
+    the daemon looks: nothing starts and the task is not woken (a wake would drop its start_after timer); its
+    checks run when it next starts. An open task, or one whose start_after has passed, is relaunched as before."""
+    from ttp import cli
+    from ttp.daemon import Daemon
+    p = make(env)
+    d = Daemon(p.base)
+    d.boot_at = time.time() - 300
+    when = p.db.add_task("waits on a probe", "s", kind="code", tier="light", origin="user")
+    _checks_killed_by_reboot(p, tmp_path, when)
+    p.db.update_task(when, labels=json.dumps(["start_when:false"]))
+    later = p.db.add_task("starts later", "s", kind="code", tier="light", origin="user")
+    _checks_killed_by_reboot(p, tmp_path, later)
+    p.db.update_task(later, labels=json.dumps([f"start_after:{time.time() + 7200}"]))
+    racing = {}
+    for status in ("cancelled", "done"):
+        tid = p.db.add_task(status, "s", kind="code", tier="light", origin="user")
+        _, run_dir = _checks_killed_by_reboot(p, tmp_path, tid)
+        racing[tid] = (p.db.task(tid), run_dir)
+        p.db.update_task(tid, status=status)   # closed after the boot scan read it
+    fine = p.db.add_task("open", "s", kind="code", tier="light", origin="user")
+    _, fine_dir = _checks_killed_by_reboot(p, tmp_path, fine)
+    passed = p.db.add_task("start_after passed", "s", kind="code", tier="light", origin="user")
+    _, passed_dir = _checks_killed_by_reboot(p, tmp_path, passed)
+    p.db.update_task(passed, labels=json.dumps([f"start_after:{time.time() - 60}"]))
+    d.wake_after_reboot()
+    for tid in (when, later):
+        t = p.db.task(tid)
+        assert not _relaunches(p, tid), f"#{tid}: a deferred task's checks were started again"
+        assert t["not_before"] and "woke" not in json.loads(t["result"]), f"#{tid} was woken"
+        assert not (p.runs / f"checks-{tid}" / cli.CHECKS_RC).exists()
+    for tid, (t, run_dir) in racing.items():
+        assert d._relaunch_checks(t, json.loads(t["result"])) == (True, 0)
+        assert not _relaunches(p, tid) and not (run_dir / cli.CHECKS_RC).exists(), p.db.task(tid)["status"]
+        assert "woke" not in json.loads(p.db.task(tid)["result"])
+    log_text = (p.logs / "daemon.log").read_text()
+    for tid in (when, later):
+        # The boot scan skips a task deferred when it reads it; one deferred after that read is caught again
+        # where its checks would start (_no_relaunch).
+        assert f"task {tid}: deferred (start_when or start_after); the work the reboot cut short" in log_text
+        t = p.db.task(tid)
+        assert d._relaunch_checks(t, json.loads(t["result"])) == (True, 0) and not _relaunches(p, tid)
+    log_text = (p.logs / "daemon.log").read_text()
+    assert f"task {when}: the reboot killed its checks, not started again: the task is deferred" in log_text
+    assert f"task {later}: the reboot killed its checks, not started again: the task is deferred" in log_text
+    for tid, run_dir in ((fine, fine_dir), (passed, passed_dir)):
+        assert len(_relaunches(p, tid)) == 1, f"#{tid}: an open task's checks were not started again"
+        assert _wait_precheck(run_dir) == "0"

@@ -22,9 +22,9 @@ from .project import HOME_DIR, Project, durable_write, fsync_dir, open_append_or
 CHECK_S = 3600          # how often the daemon compares the installed release with its harness
 HELD_RECHECK_S = 300    # a release held back by a push or an upgrade in flight is looked at again this soon
 UPGRADE_TASK_TITLE = "Finish the tt-project template upgrade"
-TASK_EVERY_H = 6        # upgrade.task_every_h: at most one upgrade task per project this often; a conflict meanwhile waits
+FENCED_PREFIX = "superseded by host upgrade"   # fence()'s blocked_reason: the harness, not the project, cancelled it
 STALE_S = 6 * 3600      # a finish task blocked, or with no run or update this long, no longer holds off a host upgrade
-MERGE_RETRY_H = 6       # upgrade.merge_retry_h: a host-side upgrade queues a merge task once the last ended this long ago
+KV_MERGE_BASIS = "upgrade_merge_basis"   # {task, files}: the project's own files the last merge task was queued on
 KV_RELEASE, KV_AUTO = "release", "upgrade_auto"
 KV_CHECKED = "release_checked"   # {}: its row time is when the daemon last compared releases (check_release)
 SETUP_JOURNAL = ".setup.journal"   # in HOME_DIR/lib while `ttp setup` copies a release in (cli._recover_setup)
@@ -247,7 +247,7 @@ def fence(p: Project, task: int, target: str) -> int:
     gen = int(rec.get("gen") or 0)
     fenced = {**(rec.get("fenced") or {}), str(int(task)): gen}
     durable_write(finish_lock(p), json.dumps({"gen": gen + 1, "fenced": dict(list(fenced.items())[-20:])}) + "\n")
-    p.db.update_task(int(task), status="cancelled", blocked_reason=f"superseded by host upgrade to {target}")
+    p.db.update_task(int(task), status="cancelled", blocked_reason=f"{FENCED_PREFIX} to {target}")
     return gen + 1
 
 
@@ -299,30 +299,6 @@ def holder_line(p: Project, h: dict, db=None) -> str:
             f"{timefmt.long(max(at, time.time()), p)} when a host-side `ttp upgrade {p.name}` may take it over")
 
 
-def merge_retry_s(cfg: dict) -> float:
-    try:
-        return max(0.0, float((cfg.get("upgrade") or {}).get("merge_retry_h", MERGE_RETRY_H))) * 3600
-    except (TypeError, ValueError):
-        return MERGE_RETRY_H * 3600
-
-
-def task_every_s(cfg: dict) -> float:
-    """The batching window: one upgrade task per project at most this often, whatever each task did. Every
-    release inside it is merged model-free; a conflict waits and the newest release is merged once it is up."""
-    try:
-        return max(0.0, float((cfg.get("upgrade") or {}).get("task_every_h", TASK_EVERY_H))) * 3600
-    except (TypeError, ValueError):
-        return TASK_EVERY_H * 3600
-
-
-def task_ended(db, tid: int) -> float | None:
-    """When task `tid` ended (its last update or run end); None while it is open."""
-    t, last = task_activity(db, tid)
-    if t and t["status"] not in ("done", "failed", "cancelled"):
-        return None
-    return last
-
-
 def finish_holder(p: Project, db=None, clean: bool = False) -> dict | None:
     """The open finish task that holds the live harness, {"task", "key", "target"}; None when none does.
     A record whose task has ended counts as released and, with `clean` (only under the upgrade lock),
@@ -347,21 +323,30 @@ def finish_holder(p: Project, db=None, clean: bool = False) -> dict | None:
     tid = open_upgrade_task(p, db)
     if tid and fenced(p, tid):      # a crash between fencing it and cancelling it
         if clean:
-            db.update_task(tid, status="cancelled", blocked_reason="superseded by host upgrade")
+            db.update_task(tid, status="cancelled", blocked_reason=FENCED_PREFIX)
         return None
     return {"task": tid, "key": None, "target": None} if tid else None
 
 
-def recent_upgrade_task(p: Project) -> dict | None:
-    """The newest upgrade task queued inside the batching window (task_every_s), whatever its status."""
-    t = p.db.one("SELECT id, created FROM tasks WHERE kind='harness' AND title=? AND created > ? "
-                 "ORDER BY id DESC LIMIT 1", (UPGRADE_TASK_TITLE, time.time() - task_every_s(p.config())))
-    return dict(t) if t else None
+def unchanged_merge(p: Project, target: str, files: str) -> int | None:
+    """The newest merge task when it ended without landing and was queued for this same release `target`
+    and these same own files: another would end the same way, so none is queued until either changes. No
+    timer holds a merge off: a newer release or a local edit queues the next at once. None otherwise (also
+    for a cancelled task, which merged nothing, and one queued before its files were recorded)."""
+    t = p.db.one("SELECT id, status, spec FROM tasks WHERE kind='harness' AND title=? ORDER BY id DESC LIMIT 1",
+                 (UPGRADE_TASK_TITLE,))
+    if not t or t["status"] not in ("done", "failed"):
+        return None
+    m = re.search(r"^Target release: tt-project (.+)$", t["spec"] or "", re.M)
+    rec = p.db.kv(KV_MERGE_BASIS) or {}
+    if not m or m[1].strip() != target or rec.get("task") != int(t["id"]) or rec.get("files") != files:
+        return None
+    return int(t["id"])
 
 
 def defer(p: Project, auto: bool, key: str, frm: str, to: str, until: float, why: str) -> None:
-    """A conflicting merge queues no task before `until`: record it so the daemon tries this
-    release again then (hold_reason), and status says why it waits."""
+    """A conflicting merge queues no task: record it so the daemon looks at this release again at `until`
+    (hold_reason), and status says why it waits."""
     rec = (p.db.kv(KV_AUTO) or {}) if auto else {"key": key, "from": frm, "to": to, "ts": time.time()}
     p.db.set_kv(KV_AUTO, {**rec, "outcome": "deferred", "ended": time.time(), "until": until, "why": why})
 
@@ -603,12 +588,28 @@ def hold_reason(p: Project, d: dict) -> str:
         return ""
     if rec.get("key") == d["key"] and rec.get("outcome") == "deferred":
         if time.time() < float(rec.get("until") or 0):
-            return (f"the merge needs a harness task and one was queued less than {task_every_s(p.config()) / 3600:g} h "
-                    f"ago (owner: this project's daemon; resumes at {timefmt.long(float(rec.get('until') or 0), p)})")
+            return (f"the last merge task ended without landing this release and nothing changed since (owner: "
+                    f"this project's daemon; looks again at {timefmt.long(float(rec.get('until') or 0), p)})")
         return ""
+    if rec.get("key") == d["key"] and rec.get("outcome") == "conflict" and own_files_moved(p):
+        return ""       # its merge task ended unlanded and the project's own files changed since: merge again
     if rec.get("key") == d["key"] and rec.get("outcome") != "held":
         return "already tried for this release"
     return ""
+
+
+def own_files_moved(p: Project) -> bool:
+    """The project's own runtime and template files at the harness HEAD differ from those the last merge
+    task was queued on (KV_MERGE_BASIS): `ttp upgrade --auto` then queues the next merge, or defers it
+    through unchanged_merge when they match again. False when no basis was recorded or git fails."""
+    from . import cli
+    files = (p.db.kv(KV_MERGE_BASIS) or {}).get("files")
+    if not files:
+        return False
+    try:
+        return cli._own_files(p.harness, "HEAD") != files
+    except (subprocess.SubprocessError, OSError):
+        return False
 
 
 CYCLE_HELD = "held until it is gone"   # the tail of hold_reason's power-cycle line: rechecked soon
@@ -668,8 +669,9 @@ def line(p: Project, db, cfg: dict) -> str:
             return text + " (the automatic upgrade did not finish: see logs/upgrade.log)"
         if rec.get("outcome") == "deferred":
             at = timefmt.long(float(rec.get("until") or 0), p)
-            return text + (f" (the merge needs judgment; one harness task per {task_every_s(cfg) / 3600:g} h at most; "
-                           f"owner: this project's daemon; resumes at {at})")
+            return text + (f" (the merge needs judgment; the last merge task ended without landing it and nothing "
+                           f"changed since; a newer release or a local edit queues the next; owner: this project's "
+                           f"daemon; looks again at {at})")
         if rec.get("outcome") == "failed":
             return text + f" (the automatic upgrade failed: {rec.get('why') or 'see logs/upgrade.log'})"
         if rec.get("outcome") == "held" and rec.get("why"):

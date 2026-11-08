@@ -478,8 +478,12 @@ def checks_consumer(p: Project, run_dir: Path) -> str | None:
     names them (`<run>/checks.rc`, `<run>/checks` or the run's folder, as `ttp checks --result` does), or
     another `ttp checks` run that joined them (checkjoin: a review precheck, a reviewer's or a push's
     checks of the same tree) and still follows them."""
-    from . import checkjoin
-    from .cli import CHECKS_RC, _read_checks_pid
+    return checks_waiter(p, run_dir) or checks_joiner(p.state, run_dir)
+
+
+def checks_waiter(p: Project, run_dir: Path) -> str | None:
+    """checks_consumer's database half: an open task whose hand-off names the run's detached checks."""
+    from .cli import CHECKS_RC
     run_dir = Path(run_dir)
     rc = run_dir / CHECKS_RC
     marks = ",".join("?" * len(OPEN_WAITER_SKIP))
@@ -488,8 +492,16 @@ def checks_consumer(p: Project, run_dir: Path) -> str | None:
         r = load_result(t["result"])
         if names_job(r, rc) or _names_run(r, run_dir):
             return f"open task #{t['id']} waits on them"
+    return None
+
+
+def checks_joiner(state: Path, run_dir: Path) -> str | None:
+    """checks_consumer's file and /proc half (no database): another live `ttp checks` run that joined them."""
+    from . import checkjoin
+    from .cli import _read_checks_pid
+    run_dir = Path(run_dir)
     pid = _read_checks_pid(run_dir).get("pid")
-    recs = checkjoin.records(p.state, prune=False)
+    recs = checkjoin.records(state, prune=False)
     ids = {r.get("id") for r in recs if r.get("pid") == pid and str(r.get("run")) == run_dir.name}
     for r in recs:
         if r.get("follows") in ids and not r.get("outcome") and r.get("alive") is not False:

@@ -2923,22 +2923,32 @@ class Batch:
         return hi - 1
 
     def _rescue(self, tip: str, carried: list, k: int, checks: list[str]) -> str | None:
-        """After _judge blamed carried entry k+1: replay the later carried entries onto the first k
-        (the tip when k is 0) and check that head once, in this batch. Returns the head that pushes the
-        first k entries and the replayed ones (self.rescued), or None (nothing after the blamed entry,
-        a replay that conflicts or adds nothing, or a failing check: those entries are requeued). A
-        batch makes at most RESCUES such checks, whatever their outcome."""
+        """After _judge blamed carried entry k+1: replay the later carried entries in order onto the
+        first k (the tip when k is 0) and check that head once, in this batch. An entry built on the
+        blamed one (it would replay its commits) or whose replay conflicts or adds nothing without it is
+        skipped and requeued; the others still go. Returns the head that pushes the first k entries and
+        the replayed ones (self.rescued), or None (nothing after the blamed entry, none replays, or a
+        failing check: those entries are requeued). A batch makes at most RESCUES such checks, whatever
+        their outcome."""
         later = carried[k + 1:]
         if not later or self.detail_tip is not None or self.rescues >= RESCUES:
             return None
         h = carried[k - 1][1] if k else tip
         replayed: list[tuple[int, str]] = []
+        skipped: list = []
+        b = self.info[carried[k][0]]   # its own commits: not those of an earlier entry it was built on
+        own = set(_git(self.repo, "rev-list", b["top"], f"^{b['base']}",
+                       *(f"^{self.info[j]['top']}" for j, _ in carried[:k])).stdout.split())
         for i, _ in later:
+            if own & set(_git(self.repo, "rev-list", self.info[i]["top"], f"^{h}").stdout.split()):
+                skipped.append(self.entries[i].get("id"))     # built on the blamed entry: it would replay it too
+                continue
             self._settling = ([], set(), [])
             new, files = self._rebase(h, self.info[i]["top"])
             if files is not None or new == h or ("union" in self._settling[1] and self._union_lost(
                     {}, self.info[i]["base"], self.info[i]["top"], h, new)):
-                break
+                skipped.append(self.entries[i].get("id"))
+                continue
             carry = self.settled.pop(i, {}).get("approval_carried")
             if self._settling[0]:
                 self.settled[i] = self._settled_now()
@@ -2946,11 +2956,14 @@ class Batch:
                     self.settled[i]["approval_carried"] = carry
             replayed.append((i, new))
             h = new
-        if len(replayed) < len(later):
-            say(f"the entries after {self.entries[carried[k][0]].get('id')} do not replay without it; requeued")
+        blamed = self.entries[carried[k][0]].get("id")
+        if skipped:
+            say(f"entr{'y' if len(skipped) == 1 else 'ies'} {', '.join(map(str, skipped))} after {blamed} "
+                f"{'does' if len(skipped) == 1 else 'do'} not replay without it; requeued")
+        if not replayed:
             return None
         say(f"checking the {len(replayed)} entr{'y' if len(replayed) == 1 else 'ies'} after "
-            f"{self.entries[carried[k][0]].get('id')} without it")
+            f"{blamed} without it")
         try:
             head = self._head(tip, carried[:k] + replayed, k + len(replayed))
         except Refused:

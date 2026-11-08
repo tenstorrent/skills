@@ -65,23 +65,30 @@ def normalize_action(action: dict) -> dict:
     return out
 
 
-def drop_nulls(value):
+def drop_nulls(value, sparse: bool = False):
+    """`sparse`: an answer under a schema that lets unused fields be left out (strict_schema with
+    require_all=False). A null there is padding too, as under the all-required schema: only
+    clear_fields clears a schedule field, so a left-out clear_fields is not the legacy form."""
     if isinstance(value, dict):
         if value.get("type") and ("clear_fields" in value or any(k in value for k in NULL_OPERATIONS)):
+            if sparse and "clear_fields" not in value:
+                value = {**value, "clear_fields": None}
             try:
                 return normalize_action(value)
             except ValueError:
                 return value   # the application boundary rejects an invalid clear operation
-        return {k: drop_nulls(v) for k, v in value.items() if v is not None}
+        return {k: drop_nulls(v, sparse) for k, v in value.items() if v is not None}
     if isinstance(value, list):
-        return [drop_nulls(v) for v in value]
+        return [drop_nulls(v, sparse) for v in value]
     return value
 
 
-def strict_schema(schema):
+def strict_schema(schema, require_all: bool = True):
     """Close every object (including nullable objects and anyOf branches), and require all
-    properties. Optional properties are nullable. Pattern validation stays in the local parser
-    so the wire schema also works with providers/models that do not accept that keyword.
+    properties (require_all=False: only each object's own `required`, so an answer leaves unused
+    fields out instead of padding them with nulls). Optional properties are nullable either way.
+    Pattern validation stays in the local parser so the wire schema also works with
+    providers/models that do not accept that keyword.
     Unspecified free-form objects are refused instead of silently losing their keys.
     """
     if not isinstance(schema, dict):
@@ -89,11 +96,11 @@ def strict_schema(schema):
     out = {k: v for k, v in schema.items() if k != "pattern"}
     for key in ("items",):
         if key in out:
-            out[key] = strict_schema(out[key])
+            out[key] = strict_schema(out[key], require_all)
     if "anyOf" in out:
-        out["anyOf"] = [strict_schema(s) for s in out["anyOf"]]
+        out["anyOf"] = [strict_schema(s, require_all) for s in out["anyOf"]]
     if "$defs" in out:
-        out["$defs"] = {k: strict_schema(v) for k, v in out["$defs"].items()}
+        out["$defs"] = {k: strict_schema(v, require_all) for k, v in out["$defs"].items()}
     types = schema.get("type", [])
     types = [types] if isinstance(types, str) else types
     if "object" in types or "properties" in schema:
@@ -101,9 +108,9 @@ def strict_schema(schema):
         if not isinstance(props, dict):
             raise ValueError("strict output requires a full object properties schema")
         required = set(schema.get("required") or [])
-        out["properties"] = {k: strict_schema(v) if k in required else _nullable(strict_schema(v))
-                             for k, v in props.items()}
-        out["required"] = list(props)
+        out["properties"] = {k: strict_schema(v, require_all) if k in required
+                             else _nullable(strict_schema(v, require_all)) for k, v in props.items()}
+        out["required"] = list(props) if require_all else [k for k in props if k in required]
         out["additionalProperties"] = False
     return out
 
@@ -204,6 +211,7 @@ class RunUsage:
     final_text: str = ""             # the agent's last message
     structured: dict | None = None   # schema-validated output, when requested and supported
     actions_text: str = ""           # the newest main-agent text holding an {"actions": [...]} object
+    answer: dict | None = None       # a whole final answer the run's budget end kept from being applied
     auth_failed: bool = False        # the provider is logged out or its credentials are invalid
     limited: bool = False            # the provider refused for quota/limit reasons
     limit_note: str = ""

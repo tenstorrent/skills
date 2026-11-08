@@ -1360,23 +1360,262 @@ def test_a_run_that_prints_a_private_key_keeps_it_out_of_every_copy(env, monkeyp
     assert _no_key(dump, lines) and _masked(dump)
     outbox.add("peer", ["say", "the key: " + block], outbox.new_id(), None)
     assert _no_key(outbox.path("peer").read_text(), lines) and _masked(outbox.path("peer").read_text())
-    (run_dir / "progress.md").write_text("15:00 note: " + block + "x" * 7990 + "\n")   # a live run: not masked yet
     if _sockets_refused():
         return
     from ttp import web
     port = _start_web(p)
-    for path in (f"/api/run/{run['id']}", "/api/state"):
-        req = urllib.request.Request(f"http://127.0.0.1:{port}{path}", headers={"X-TTP-Token": web.token(p)})
-        for _ in range(50):
-            try:
-                body = urllib.request.urlopen(req, timeout=5).read().decode()
-                break
-            except urllib.error.URLError:
-                time.sleep(0.1)
-        assert _no_key(body, lines), path
-        json.loads(body)
+    # A live run's progress.md (not masked yet): the block inside the 8000-character tail /api/run shows,
+    # then one the tail cut lands inside, mid-line, which only masking before the cut catches.
+    lead = "15:00 note: "
+    cut = block.index(lines[3]) + 10
+    for pad in (100, 8000 + cut - len(block) - 1):
+        (run_dir / "progress.md").write_text(lead + block + "x" * pad + "\n")
+        for path in (f"/api/run/{run['id']}", "/api/state"):
+            req = urllib.request.Request(f"http://127.0.0.1:{port}{path}", headers={"X-TTP-Token": web.token(p)})
+            for _ in range(50):
+                try:
+                    body = urllib.request.urlopen(req, timeout=5).read().decode()
+                    break
+                except urllib.error.URLError:
+                    time.sleep(0.1)
+            assert _no_key(body, lines) and not _key_piece(body, lines), (path, pad)
+            view = json.loads(body)
+            if path.startswith("/api/run"):
+                assert "x" * 50 in view["progress"], "the view shows the progress tail"
+
+
+def _key_piece(text, lines, n=20):
+    """Whether any `n` characters in a row of the key's body show in `text` (a line cut mid-way)."""
+    return any(ln[i:i + n] in text for ln in lines for i in range(0, len(ln) - n + 1))
 
 
 def _masked(text):
     from ttp import redact
     return redact.KEY_MASK in text
+
+
+def test_prose_after_a_lone_key_marker_line_survives_and_a_cut_block_is_still_masked(env):
+    """Review #6952: a raw BEGIN line with no END after it masked everything up to the next quote, so a
+    stored chat message or task spec that quoted the marker lost its prose for good (Db.x scrubs every
+    string). In raw text a cut-off block ends at its last key line; in a JSON string, at the string's end."""
+    from ttp import redact
+    block, lines = _key_block("RSA", "Proc-Type: 4,ENCRYPTED\nDEK-Info: AES-128-CBC,0A1B\n\n")
+    begin = block.splitlines()[0]
+    prose = "This line, with text: (more) and 2.5 words.\n\nAnother paragraph. Done"
+    for text in (begin + "\n" + prose, "see " + begin + " in the file.\n" + prose, begin + "\r\n" + prose,
+                 begin + "\nNote: a header-like line\n" + prose):
+        out = redact.scrub(text)
+        assert out.endswith(prose) and "PRIVATE" not in out and redact.KEY_MASK in out, out
+    cut = block.index(lines[2]) + 30   # cut mid-line, then prose or a trimming mark
+    for tail in ("", "\n" + prose, "...\n" + prose, "\n\n" + prose):
+        out = redact.scrub("x " + block[:cut] + tail)
+        assert _no_key(out, lines) and not _key_piece(out, lines) and "DEK-Info" not in out, out
+        assert out.endswith(tail.lstrip(".")) if tail else out == "x " + redact.KEY_MASK, out
+    for sep in ("\t", "\u2192"):   # numbered lines (`cat -n`, a file viewer), cut before the END line
+        numbered = "".join(f"{i + 1:6}{sep}{ln}\n" for i, ln in enumerate(block.splitlines()[:6]))
+        out = redact.scrub(numbered + prose)
+        assert out.endswith("\n" + prose) and not _key_piece(out, lines), out
+    t0 = time.monotonic()   # space-only lines match one way: no backtracking blow-up before prose
+    for filler in ("\n   ", "\n  7\t  ", "\nAAAA   \n   "):
+        assert redact.scrub(begin + filler * 3000 + "\nx y").endswith("\nx y")
+    assert time.monotonic() - t0 < 5
+    squashed = begin + " " + " ".join(lines[:4]) + "\n" + prose   # one line, cut before its END
+    out = redact.scrub(squashed)
+    assert out == redact.KEY_MASK + "\n" + prose and not _key_piece(out, lines)
+    js = json.dumps({"t": "x " + block[:cut] + " then prose, all one string"}) + "\n" + json.dumps({"n": 1})
+    out = redact.scrub(js)   # JSON-escaped: to the end of its string, and the JSONL stays valid
+    assert [json.loads(x) for x in out.splitlines()] == [{"t": "x " + redact.KEY_MASK}, {"n": 1}]
+    p = make(env)
+    tid = p.db.add_task("quote", "The file starts with " + begin + "\n" + prose, kind="work", origin="user")
+    spec = p.db.task(tid)["spec"]
+    assert spec == "The file starts with " + redact.KEY_MASK + "\n" + prose, spec
+
+
+@pytest.mark.parametrize("name,mark", [("job", "job.started"), ("job", "job.queued"), ("checks", "checks.pid")])
+def test_scrub_run_leaves_a_live_detached_jobs_log_whole_and_masks_it_once_the_job_ends(env, monkeypatch, name, mark):
+    """Review #6952: scrub_run renamed a new file over a log a `ttp detach` or `ttp checks --detach` job still
+    wrote, so the job's later lines went to the unlinked file and vanished from the log."""
+    from ttp import detach, project, redact
+    monkeypatch.setattr(project, "HOME_DIR", env["tmp"] / "empty-home")
+    block, lines = _key_block()
+    run = env["tmp"] / "runs" / "13"
+    run.mkdir(parents=True)
+    (run / mark).write_text("1\n")
+    (run / "stderr.log").write_text(block)
+    log = run / f"{name}.log"
+    with open(log, "w") as w:   # as the job wrapper's `>"$log"`: one open file, its own offset
+        w.write("line 0\n" + block)
+        w.flush()
+        masked = redact.scrub_run(run)
+        for i in range(1, 50):
+            w.write(f"line {i}\n")
+            w.flush()
+    text = log.read_text()
+    assert all(f"line {i}\n" in text for i in range(50)), text[-200:]
+    assert masked == 1   # stderr.log only
+    assert _masked((run / "stderr.log").read_text())
+    rc = run / f"{name}.rc"
+    if name == "job":   # the daemon's sweep closes the job's record once it ended: its log is masked then
+        (run / "detached.json").write_text(json.dumps([{"rc": str(rc), "status": "running"}]))
+        rc.write_text("0\n")
+        assert detach.close(rc)["status"] == "ended"
+        logs = [log]
+    else:   # review #7153: the detached checks themselves mask checks.log and checks.out as they end
+        import signal
+        import types
+        from ttp import cli
+        (run / cli.CHECKS_OUT).write_text("out 0\n" + block)
+        monkeypatch.setitem(cli._CHECK_STOP, "stopped", None)
+        handlers = {sig: signal.getsignal(sig) for sig in cli._CHECK_STOP_SIGNALS}
+        monkeypatch.setattr(cli, "_checks_released", lambda go, d: True)
+        monkeypatch.setattr(cli, "cmd_checks", lambda _a: [(run / n).open("a").write(f"{n} end\n")
+                                                           for n in ("checks.log", cli.CHECKS_OUT)])
+        monkeypatch.setattr(cli.sys, "stdin", io.TextIOWrapper(io.BytesIO(b"go\n")))
+        monkeypatch.setenv("TTP_CHECK_OUTPUT_DIR", str(run))
+        monkeypatch.delenv("TTP_CHECKS_TMP_FD", raising=False)
+        try:
+            assert cli._checks_child(types.SimpleNamespace(rc=str(rc))) == 0
+        finally:
+            for sig, h in handlers.items():
+                signal.signal(sig, h)
+        assert rc.read_text() == "0\n"
+        logs = [log, run / cli.CHECKS_OUT]
+    for f in logs:
+        text = f.read_text()
+        assert _no_key(text, lines) and _masked(text), f
+    assert "line 49\n" in log.read_text()
+    if name == "checks":
+        assert "checks.log end\n" in log.read_text() and (run / "checks.out").read_text().startswith("out 0\n")
+
+
+def test_close_masks_a_jobs_log_once_a_leftover_process_frees_its_lock(env, monkeypatch):
+    """Review #7153: a job closed while a leftover child still held its job lock kept its log unmasked for good."""
+    import fcntl
+    from ttp import detach, locks, project
+    monkeypatch.setattr(project, "HOME_DIR", env["tmp"] / "empty-home")
+    block, lines = _key_block()
+    p = make(env)
+    run = p.runs / "21"
+    run.mkdir(parents=True)
+    rc, log = run / "job.rc", run / "job.log"
+    (run / "job.started").write_text("1\n")
+    log.write_text("line 0\n" + block + "line 1\n")
+    (run / "detached.json").write_text(json.dumps([{"rc": str(rc), "status": "running"}]))
+    rc.write_text("0\n")
+    with open(locks.job_lock(rc), "w") as held:
+        fcntl.flock(held, fcntl.LOCK_EX)
+        assert detach.close_records(p) == 1
+        assert block in log.read_text()   # still written to: left whole
+        assert detach.close(rc).get("unmasked") is True
+        fcntl.flock(held, fcntl.LOCK_UN)
+    (p.state / "detach-closed.at").unlink()
+    assert detach.close_records(p) == 0   # closed before: counted once, masked now
+    text = log.read_text()
+    assert _no_key(text, lines) and _masked(text) and "line 1\n" in text
+    assert "unmasked" not in detach.close(rc)
+
+
+class _TrackedRead:
+    """An open file that records how many bytes each read asks for (a whole-file read: the file's size)."""
+
+    def __init__(self, fh, size, reads):
+        self._fh, self._size, self._reads = fh, size, reads
+
+    def read(self, n=-1):
+        self._reads.append(self._size if n is None or n < 0 else n)
+        return self._fh.read(n)
+
+    def readlines(self, *a):
+        self._reads.append(self._size)
+        return self._fh.readlines(*a)
+
+    def __iter__(self):
+        self._reads.append(self._size)
+        return iter(self._fh)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self._fh.close()
+
+    def __getattr__(self, name):
+        return getattr(self._fh, name)
+
+
+def test_ending_a_run_with_a_large_output_file_reads_it_capped_and_a_detached_job_masks_its_key(env, monkeypatch):
+    """User msg #1918: the daemon's run-end masking (reap_runs, finish_run) reads each run file within a
+    fixed cap and each run within a time limit; a file over the cap is masked by a detached job, every
+    line kept, and so is a big detached-job log the sweep closes (detach.close)."""
+    import builtins
+    from ttp import daemon as dm
+    from ttp import detach, project, redact
+    monkeypatch.setattr(project, "HOME_DIR", env["tmp"] / "empty-home")
+    p = make(env)
+    block, lines = _key_block()
+    run_dir = env["tmp"] / "big-run"
+    run_dir.mkdir()
+    (run_dir / "output.jsonl").write_text(json.dumps({"actions": [], "_cost": 0.01}))
+    (run_dir / "exit.json").write_text(json.dumps({"rc": 0, "ended": time.time()}))
+    filler = "".join(f"step {i}: " + "y" * 90 + "\n" for i in range(15000))   # about 1.5 MiB
+    big, bg = run_dir / "job.log", run_dir / "bg.log"
+    for f in (big, bg):
+        f.write_text(filler + block + filler + "last line\n")
+    before = big.read_text()
+    (run_dir / "bg.started").write_text("1\n")   # a detached job, still writing bg.log at the run's end
+    rid = p.db.x("INSERT INTO runs(role,provider,started,status,dir,boot_id,note) VALUES(?,?,?,?,?,?,?)",
+                 ("coordinator", "fake", time.time(), "running", str(run_dir), "x", "{}"))
+    cap = 1 << 20
+    monkeypatch.setattr(redact, "STEP_FILE_BYTES", cap, raising=False)
+    reads: list[int] = []
+    watched = {str(big), str(bg)}
+    real_open, real_rb, real_rt = builtins.open, pathlib.Path.read_bytes, pathlib.Path.read_text
+
+    def tracked_open(file, *a, **k):
+        fh = real_open(file, *a, **k)
+        return _TrackedRead(fh, os.path.getsize(file), reads) if str(file) in watched else fh
+
+    def whole(real):
+        def read(self, *a, **k):
+            if str(self) in watched:
+                reads.append(self.stat().st_size)
+            return real(self, *a, **k)
+        return read
+
+    def in_step(fn):
+        with monkeypatch.context() as m:
+            m.setattr(builtins, "open", tracked_open)
+            m.setattr(pathlib.Path, "read_bytes", whole(real_rb))
+            m.setattr(pathlib.Path, "read_text", whole(real_rt))
+            return fn()
+
+    d = dm.Daemon(p.base)
+    t0 = time.monotonic()
+    in_step(lambda: d._run_step(d.reap_runs))
+    assert time.monotonic() - t0 < dm.STEP_BUDGET_S
+    assert p.db.one("SELECT status FROM runs WHERE id=?", (rid,))["status"] != "running"
+    assert max(reads, default=0) <= cap + 1, f"the daemon step read {max(reads)} bytes of a big run file"
+
+    def masked(f):
+        for _ in range(300):
+            if redact.KEY_MASK in f.read_text():
+                return True
+            time.sleep(0.1)
+        return False
+    assert masked(big), (run_dir / "scrub.log").read_text() if (run_dir / "scrub.log").exists() else "no scrub.log"
+    assert big.read_text() == before.replace(block.rstrip("\n"), redact.KEY_MASK), "a line was lost"
+    assert "detached job" in (p.logs / "daemon.log").read_text()
+    assert redact.KEY_MASK not in bg.read_text()   # left whole while its job ran
+    rc = run_dir / "bg.rc"
+    (run_dir / "detached.json").write_text(json.dumps([{"rc": str(rc), "status": "running"}]))
+    rc.write_text("0\n")
+    reads.clear()
+    assert in_step(lambda: detach.close(rc))["status"] == "ended"
+    assert max(reads, default=0) <= cap + 1, f"the sweep read {max(reads)} bytes of a big job log"
+    assert masked(bg) and bg.read_text() == before.replace(block.rstrip("\n"), redact.KEY_MASK)
+    assert _no_key((run_dir / "scrub.log").read_text(), lines)
+    left: list = []   # past its time limit, the whole folder is left for the detached job
+    monkeypatch.setattr(redact, "STEP_SCRUB_S", 0.0, raising=False)
+    (run_dir / "late.log").write_text(block)
+    assert redact.scrub_run(run_dir, step=True, left=left) == 0 and left == [run_dir]
+    assert redact.main([str(run_dir)]) == 0 and _no_key((run_dir / "late.log").read_text(), lines)

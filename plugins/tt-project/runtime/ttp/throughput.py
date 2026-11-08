@@ -232,6 +232,32 @@ def thresholds(spans: list[tuple[float, float]]) -> tuple[float, float]:
 
 CAP_KEY = "checks.test_project_max"
 SLOTS_KEY = "checks.slots"
+TASK_TITLE = "throughput: "   # slowcomplaint's follow-up tasks: `throughput: <lane>[, <lane>] waits over threshold; ...`
+
+
+def _settled(db: DB, ln: dict, now: float) -> str:
+    """Why the checks lane opens no follow-up, or '': the tried-work ledger holds, from the last DAY, a
+    rejected 'raise <its limit key>' or a done follow-up task that listed the lane, and no wait held at the
+    project's own limits (own_wait_last, ck_holder) started after it."""
+    key, name = ln.get("limit_key"), ln["lane"]
+    raise_rx = re.compile(rf"\braise\w*\s+(?:the\s+)?{re.escape(key)}(?![\w.])", re.I) if key else None
+    try:
+        from . import tried
+        ledger = tried.entries(db, now=now, days=1)
+    except Exception:   # an unreadable ledger holds nothing back
+        return ""
+    for e in ledger:   # newest first
+        title = e["title"] or ""
+        lanes = title[len(TASK_TITLE):].split(" waits over threshold", 1)[0].split(", ") \
+            if title.startswith(TASK_TITLE) else []
+        if not (now - DAY <= e["ts"] <= now and (e["outcome"] == "rejected" and raise_rx and raise_rx.search(title)
+                                               or e["status"] == "done" and name in lanes)):
+            continue
+        if float(ln.get("own_wait_last") or 0) > e["ts"]:
+            return ""   # a new wait at the project's own limits since: new evidence
+        return (f"ledger #{e['id']} ({e['outcome']}: {title[:80]}) settled it on {e['date']} and no wait "
+                "held at the project's own limits started since: not reopened")
+    return ""
 
 
 def slot_limit(text: str) -> str:
@@ -609,7 +635,10 @@ def measure(db: DB, cfg: dict, since_s: float = DAY, now: float | None = None, g
                     ln[state] += bool(cap_n)
                     held = ln.setdefault("held_by", {"own": 0, HOST_CORES: 0, OTHER_PROJECTS: 0})
                     if key:
-                        held[ck_holder(t["id"], w0, w1, state)] += 1
+                        who = ck_holder(t["id"], w0, w1, state)
+                        held[who] += 1
+                        if who == "own" and state != "serialized":   # held at the project's own limits
+                            ln["own_wait_last"] = max(ln.get("own_wait_last", 0.0), w0)
             elif selfw or "detach" in reason or "ttp checks" in reason or "own job" in reason:
                 lane("own_job", None, None)["note"] = "the task's own detached job or checks ran: no limit"
                 add(lanes["own_job"], w1 - w0, prio, w0, w1, None, queued)
@@ -781,7 +810,8 @@ def headroom(db: DB, cfg: dict, report: dict) -> tuple[bool, str]:
 
 def plan(db: DB, cfg: dict, report: dict) -> tuple[list[dict], list[dict]]:
     """(changes [{key, old, new, why}], kept [{lane, key, why, info?}]) for the slow lanes; `info` marks a
-    kept lane reported as information only (no change is ever proposed from it: it opens no task)."""
+    kept lane reported as information only (no change is ever proposed from it: it opens no task), as is the
+    checks lane the tried-work ledger settled in the last day with no own wait since (_settled)."""
     ok, why_not = headroom(db, cfg, report)
     try:
         paused = set(db.paused_resources())
@@ -805,6 +835,9 @@ def plan(db: DB, cfg: dict, report: dict) -> tuple[list[dict], list[dict]]:
         if ln.get("holder"):
             # Checks waits the host held, not the project's limits: information only, no raise, no task.
             kept.append({"lane": name, "key": None, "info": True, "why": ln["note"]})
+            continue
+        if name == "checks_slots" and (why := _settled(db, ln, float(report.get("ts") or time.time()))):
+            kept.append({"lane": name, "key": key, "info": True, "why": why})
             continue
         if name.split(":", 1)[0] in ("resource", "device") and name.split(":", 1)[1] in paused:
             kept.append({"lane": name, "key": key, "why": f"{name.split(':', 1)[1]} is paused: its lane is not raised"})
