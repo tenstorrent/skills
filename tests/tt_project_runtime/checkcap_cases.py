@@ -10091,9 +10091,11 @@ def test_a_parked_checks_run_is_no_leader_to_join_until_it_resumes(env, tmp_path
     t = threading.Thread(target=go)
     t.start()
     try:
-        assert _wait_for(lambda: len(tickets()) == 1 and len(mine()) == 1)
+        # Its queue ticket is taken before its wait is recorded: park only once both show (as the park test does).
+        assert _wait_for(lambda: (run / cli.CHECKS_SLOT_WAIT).exists() and len(tickets()) == 1 and len(mine()) == 1)
         a = mine()[0]
-        assert checksqueue.act(p, run, "park", "the coordinator", "user msg #1: p1 first", f"test -e {flag}")[0] == 0
+        code, text = checksqueue.act(p, run, "park", "the coordinator", "user msg #1: p1 first", f"test -e {flag}")
+        assert code == 0, text
         assert _wait_for(lambda: not tickets() and mine()[0].get("phase") == checkjoin.PARKED)
         # Another task's run of the same checks (same key, through the real writer) queues after it.
         b_path = checkjoin.register(p.state, task="999", head=a["head"], commit_ts=a["commit_ts"], key=a["key"],
