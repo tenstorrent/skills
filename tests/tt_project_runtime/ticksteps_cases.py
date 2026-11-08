@@ -1795,3 +1795,132 @@ def test_h_the_warm_up_reads_what_the_finish_reads_not_every_follow_ups_overlaps
     assert s.p.db.task(s.code)["status"] == "done" and s.p.db.task(s.review)["status"] == "pushing"
     assert len(holds) == 2 and all(ok for _, ok in holds), holds
     assert "rounds 1, live git 0 " in lines[0], lines[0][-400:]
+
+
+def _hung_ssh(tmp_path):
+    """A fake `ssh` that writes its arguments to ssh.argv and hangs."""
+    d = tmp_path / "sshbin"
+    d.mkdir(exist_ok=True)
+    exe, argv = d / "ssh", tmp_path / "ssh.argv"
+    exe.write_text(f'#!/bin/sh\necho "$@" > {argv}\nexec sleep 300\n')
+    exe.chmod(0o755)
+    return exe, argv
+
+
+def test_every_tick_step_keeps_the_step_budget_with_a_hung_stub_and_runs_again_next_tick(env, monkeypatch, tmp_path):
+    """Each step the real tick runs, swapped for a hung stub in turn (a child with no timeout that leaves a
+    grandchild, an ssh that never answers, a body that sleeps), returns within the budget plus a small
+    slack; the tick completes, every hung child is killed whole, ssh got its options, and the next tick
+    runs every step again."""
+    p = make(env)
+    from ttp import daemon as dmod
+    from ttp import stepclock
+    d = dmod.Daemon(p.base)
+    monkeypatch.setattr(dmod, "STEP_BUDGET_S", 0.05)
+    monkeypatch.setattr(dmod, "STEP_HARD_SLACK_S", 0.1)
+    ssh, argv = _hung_ssh(tmp_path)
+    real = d._run_step
+    names, took, pids, mode = [], {}, [], {"hung": True}
+
+    def stub(i):
+        def hung():
+            if i % 3 == 0:
+                exe, pidf = _hung_child(tmp_path, f"hung{i}")
+                pids.append(pidf)
+                subprocess.run([str(exe)])
+            elif i % 3 == 1:
+                subprocess.run([str(ssh), "box", "true"], stdout=subprocess.DEVNULL)
+            else:
+                time.sleep(30)
+        return hung
+
+    def run_step(step, name="", default=None):
+        names.append(name or step.__name__)
+        if not mode["hung"]:
+            return real(lambda: None, names[-1], default)
+        t0 = time.monotonic()
+        out = real(stub(len(names)), names[-1], default)
+        took[names[-1]] = time.monotonic() - t0
+        return out
+    monkeypatch.setattr(d, "_run_step", run_step)
+    stepclock.install()
+    try:
+        d.tick()
+        first = list(names)
+        mode["hung"], names[:] = False, []
+        d.tick()
+    finally:
+        stepclock.uninstall()
+    assert len(first) > 50 and len(set(first)) == len(first), first
+    slow = {n: round(t, 2) for n, t in took.items() if t > dmod.STEP_BUDGET_S + dmod.STEP_HARD_SLACK_S + 2}
+    assert not slow, f"steps held past the budget: {slow}"
+    assert "probe_waiting" in first and "reap_runs" in first
+    assert names == first, "the next tick runs every step again"
+    assert pids and all(_grandchild_gone(f) for f in pids), "a hung step's grandchild outlived it"
+    said = argv.read_text()
+    assert "ConnectTimeout=" in said and "ServerAliveInterval=" in said and "ServerAliveCountMax=" in said
+
+
+def test_the_tick_runs_every_step_through_run_step():
+    """Only the tick's own plumbing is called outside _run_step: a step called directly would escape the budget."""
+    import ast
+    from ttp import daemon as dmod
+    tree = ast.parse(pathlib.Path(dmod.__file__).read_text())
+    [tick] = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "tick"]
+    inside = {id(x) for c in ast.walk(tick) if isinstance(c, ast.Call) and getattr(c.func, "attr", "") == "_run_step"
+              for x in ast.walk(c)}
+    direct = {c.func.attr for c in ast.walk(tick) if isinstance(c, ast.Call) and id(c) not in inside
+              and isinstance(c.func, ast.Attribute) and isinstance(c.func.value, ast.Name) and c.func.value.id == "self"}
+    assert direct <= {"_check_sleep", "_load_config", "lease_held", "tend_lease"}, direct
+    assert "stepclock.install()" in pathlib.Path(dmod.__file__).read_text().split("def main()")[1][:300]
+
+
+def test_a_step_stopped_at_its_budget_resumes_after_the_row_it_was_on(env, monkeypatch):
+    p = make(env)
+    from ttp import daemon as dmod
+    d = dmod.Daemon(p.base)
+    monkeypatch.setattr(dmod, "STEP_BUDGET_S", 0.05)
+    monkeypatch.setattr(dmod, "STEP_HARD_SLACK_S", 0.05)
+    done = []
+
+    def step():
+        for r in d._resume_order("rows", [{"id": n} for n in (1, 2, 3, 4)]):
+            if r["id"] == 2 and 2 not in done:
+                done.append(2)
+                time.sleep(30)   # stopped here, mid-row, with no safe point to stop at
+            done.append(r["id"])
+    t0 = time.monotonic()
+    d._run_step(step, "rows")
+    assert time.monotonic() - t0 < 3 and done == [1, 2]
+    d._run_step(step, "rows")
+    assert done[2:] == [3, 4, 1, 2], "it resumes after the row it was stopped on, that row last"
+    [ev] = p.db.q("SELECT * FROM events WHERE kind='tick_step_slow'")
+    assert "stopped at its budget" in ev["text"] and ev["status"] == "handled"
+
+
+@pytest.mark.parametrize("call", ["run", "check_output", "call", "wait", "communicate"])
+def test_every_way_a_step_waits_on_a_child_is_capped_and_the_child_killed_whole(env, monkeypatch, tmp_path, call):
+    p = make(env)
+    from ttp import daemon as dmod
+    from ttp import stepclock
+    d = dmod.Daemon(p.base)
+    monkeypatch.setattr(dmod, "STEP_BUDGET_S", 0.05)
+    monkeypatch.setattr(dmod, "STEP_HARD_SLACK_S", 0.1)
+    exe, pidf = _hung_child(tmp_path)
+    stepclock.install()
+    try:
+        def step():
+            if call in ("wait", "communicate"):
+                proc = subprocess.Popen([str(exe)], stdout=subprocess.PIPE, start_new_session=call == "wait")
+                getattr(proc, call)(timeout=600)   # longer than the budget: capped too
+            else:
+                getattr(subprocess, call)([str(exe)])
+        t0 = time.monotonic()
+        d._run_step(step, f"hung_{call}")
+        assert time.monotonic() - t0 < 3
+        assert subprocess.run(["true"]).returncode == 0, "off a step a call is left as it is"
+    finally:
+        stepclock.uninstall()
+    assert _grandchild_gone(pidf)
+    [ev] = p.db.q("SELECT * FROM events WHERE kind='tick_step_slow'")
+    assert f"killed {exe}" in ev["text"]

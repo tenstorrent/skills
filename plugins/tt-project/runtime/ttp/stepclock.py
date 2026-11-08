@@ -12,7 +12,8 @@ step is open, on the thread that opened it:
   transaction's commit or rollback, a git write) the stop waits until the section ends.
 - every child it waits on (subprocess.run, call, check_output, Popen.wait and communicate) waits at
   most until then: no timeout, or a longer one, gets the time left. On expiry the child's whole tree is
-  killed and StepBudgetSpent names the command. A wait inside critical() keeps its own timeout.
+  killed and StepBudgetSpent names the command. A wait inside critical() keeps its own timeout
+  (CRITICAL_WAIT_S when it names none).
 
 Every ssh started in an installed process gets ConnectTimeout and ServerAlive options unless it names
 its own. install() patches subprocess.Popen once per process (the daemon, at start); off a step, or on
@@ -29,6 +30,7 @@ import time
 from typing import Iterator
 
 SSH_OPTS = ("-o", "ConnectTimeout=15", "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=4")
+CRITICAL_WAIT_S = 120   # a wait inside critical() that names no timeout
 MIN_WAIT_S = 0.5   # a wait past the deadline still gets this long, so a child that already ended is reaped
 
 
@@ -49,6 +51,7 @@ class _State:
     depth = 0
     pending = fired = armed = False
     prev = None
+    timer: tuple[float, float] | None = None   # another user's ITIMER_REAL left, and when: put back by end()
 
 
 _s = _State()
@@ -85,6 +88,8 @@ def _arm(t: float) -> None:
         return
     try:
         if not _s.armed:
+            left_s = signal.getitimer(signal.ITIMER_REAL)[0]
+            _s.timer = (left_s, time.monotonic()) if left_s > 0 else None
             _s.prev = signal.signal(signal.SIGALRM, _on_alarm)
         _s.armed = True
         signal.setitimer(signal.ITIMER_REAL, max(t, 0.001))
@@ -99,6 +104,8 @@ def _disarm() -> None:
     try:
         signal.setitimer(signal.ITIMER_REAL, 0)
         signal.signal(signal.SIGALRM, _s.prev if _s.prev is not None else signal.SIG_DFL)
+        if _s.timer:
+            signal.setitimer(signal.ITIMER_REAL, max(_s.timer[0] - (time.monotonic() - _s.timer[1]), 0.001))
     except (ValueError, OSError):
         pass
 
@@ -154,8 +161,10 @@ def _init(self, args, *a, **kw):
 
 
 def _bounded(proc, call, timeout):
-    if not active() or (_s.depth and timeout is not None):
+    if not active():
         return call(timeout)
+    if _s.depth:   # a git write or a commit keeps its own timeout, never none
+        return call(CRITICAL_WAIT_S if timeout is None else timeout)
     room = max(_s.hard - time.monotonic(), MIN_WAIT_S)
     capped = timeout is None or timeout > room
     try:

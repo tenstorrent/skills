@@ -46,7 +46,7 @@ _memo: contextvars.ContextVar[dict | None] = contextvars.ContextVar("ttp_gitmemo
 # (per-call seconds for a read, monotonic deadline for every call or None) of the bounded() scope
 _cap: contextvars.ContextVar[tuple[float, float | None] | None] = contextvars.ContextVar("ttp_gitcap", default=None)
 
-TICK_GIT_S = 45.0   # one git read a daemon tick step makes, at most (Daemon._run_step)
+TICK_GIT_S = 25.0   # one git read a daemon tick step makes, at most (Daemon._run_step)
 TX_GIT_S = 20.0     # all git a finish write transaction makes, together (Daemon._finish_tx)
 HOLD_SLICE_S = 1.5  # live git one strict round of a finish transaction may run (strict())
 MAX_ROUNDS = 50     # rounds of one finish before its last, which never aborts (Daemon._finish_rounds)

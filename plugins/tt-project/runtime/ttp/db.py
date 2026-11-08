@@ -739,15 +739,21 @@ END""")
         if self.conn.in_transaction:
             yield
             return
-        retry_busy(lambda: self.conn.execute("BEGIN IMMEDIATE"))
+        from . import stepclock
+        stepclock.hold()   # a tick step's budget stops it only inside the body: never with a BEGIN left open
+        try:
+            retry_busy(lambda: self.conn.execute("BEGIN IMMEDIATE"))
+        except BaseException:
+            stepclock.release()
+            raise
         _hook()
         began = time.monotonic()
         outer = getattr(_tx_local, "spawns", None)   # another connection's transaction on this thread
         spawns = _tx_local.spawns = []
-        from . import stepclock
         try:
+            stepclock.release()
             yield
-            stepclock.hold()   # a tick step's budget never stops a commit or a rollback midway
+            stepclock.hold()   # nor a commit or a rollback midway
         except BaseException:
             with stepclock.critical():
                 _tx_local.spawns = outer

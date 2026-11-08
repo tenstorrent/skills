@@ -461,7 +461,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "health": {"exclude_machines": []},
     # A daemon that is alive but completes no tick (heartbeat untouched) for hang_s (never below 600) is
     # dumped and restarted by ttp.watchdog; each restart within window_s doubles the wait before the next,
-    # and the `restarts`-th in that window sends one high alert.
+    # and the `restarts`-th in that window sends one high alert. step_budget_s (unset: daemon.STEP_BUDGET_S,
+    # 30): the time each tick step may run; past it a step stops at its next item, a few seconds later
+    # wherever it is (a child it waits on killed whole), and resumes next tick (ttp.stepclock).
     "watchdog": {"hang_s": 900, "restarts": 3, "window_s": 21600},
     # A newer tt-project installed with `ttp setup` is merged into this project's own harness by its
     # daemon (`ttp upgrade`, once per release, never inside a push step; pushes hold it push_hold_min at
