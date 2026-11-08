@@ -2055,8 +2055,7 @@ def test_the_slurm_breaker_trips_after_three_start_deaths_in_a_row_and_only_the_
     assert slurmcheck.pick(None, {}, told.append) is None and "paused itself" in told[-1], told
     assert "paused itself" in slurmcheck.paused_line() and "re-arms it" in slurmcheck.paused_line()
     assert slurmcheck.alert_due("a") and slurmcheck.alert_due("a") is None and slurmcheck.alert_due("b") is None
-    # The user setting the same value again re-arms it (its log line is newer than the trip).
-    time.sleep(0.01)
+    # The user setting the same value again re-arms it (a new log line, whatever its stamp).
     cli.main(["config", "--account", slurmcheck.KEY, json.dumps(_SLURM_SET)])
     assert slurmcheck.tripped() is None and slurmcheck.paused_line() == ""
     assert slurmcheck._breaker(died(6)) is None and slurmcheck._breaker(died(7)) is None
@@ -2064,6 +2063,34 @@ def test_the_slurm_breaker_trips_after_three_start_deaths_in_a_row_and_only_the_
     # A changed value re-arms it too.
     project.set_account_setting(slurmcheck.KEY, {**_SLURM_SET, "max_jobs": 1})
     assert slurmcheck.tripped() is None and slurmcheck._breaker(died(9)) is None
+
+
+def test_the_slurm_breaker_tells_a_re_arm_by_the_log_line_not_by_comparing_clocks(env, capsys):
+    """The settings log stamps a change rounded to the millisecond, so a breaker record begun within half
+    a millisecond after a re-arm could read as older than it and start over on every death (never tripping
+    again); and a trip stamped later than the user's setting (a clock step) must still be re-armed by it.
+    The record keeps the log line it began under: only a new line for the key re-arms it."""
+    from ttp import accountset, cli, project, slurmcheck
+    project.set_account_setting(slurmcheck.KEY, dict(_SLURM_SET))
+    died = lambda n: {"job": str(n), "state": "FAILED", "code": "1:0", "elapsed_s": 0}
+    ahead = time.time() + 3600   # the breaker's clock well past any log stamp
+    assert [slurmcheck._breaker(died(n), now=ahead + n) for n in (1, 2)] == [None, None]
+    assert slurmcheck._breaker(died(3), now=ahead + 3) and slurmcheck.tripped()
+    cli.main(["config", "--account", slurmcheck.KEY, json.dumps(_SLURM_SET)])
+    assert slurmcheck.tripped() is None, "the user's setting re-arms a trip stamped after it"
+    ts = float(accountset.last(slurmcheck.KEY)["ts"])
+    early = ts - 0.0004   # the log rounded its stamp up past these ends
+    assert slurmcheck._breaker(died(4), now=early) is None and slurmcheck._breaker(died(5), now=early) is None
+    trip = slurmcheck._breaker(died(6), now=early)
+    assert trip and [j["job"] for j in trip["jobs"]] == ["4", "5", "6"], "counted, not started over each time"
+    # A record kept from before it named its log line: by the line's stamp, as then.
+    path = slurmcheck.slurm_dir() / slurmcheck.BREAKER
+    old = {k: v for k, v in json.loads(path.read_text()).items() if k != "set"}
+    path.write_text(json.dumps({**old, "since": ts + 1}))
+    assert slurmcheck.tripped()
+    path.write_text(json.dumps({**old, "since": ts - 1}))
+    assert slurmcheck.tripped() is None
+    capsys.readouterr()
 
 
 def test_overflow_jobs_dying_at_start_pause_it_with_one_alert_and_the_runs_stay_local_never_failed(
