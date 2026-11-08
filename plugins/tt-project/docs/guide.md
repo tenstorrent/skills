@@ -2563,7 +2563,8 @@ session and stateless coordinators on every provider.
   sent back as a conflict leads, so a peer ahead of it cannot send it back a second time: an older
   routine approval sharing its files is not independent of it, and a solo-path batch takes it first. `push_solo_paths` (default `[]`, off:
   git pathspecs a batch takes at most one routine approved change touching; the oldest such change
-  leads the next batch and priority 1-2 ones are never held. Two prompt changes that fit a size cap
+  leads the next batch and priority 1-2 ones are never held (by their own priority: one aged by
+  `push_age_s` is still held, one per batch). Two prompt changes that fit a size cap
   alone but not together need no such rule: the batch's cap probes find the one that breaks it),
   `push_cap_tests` (a regex of prompt size cap test names, default `(?i)prompt\w*_(?:stays_small|under_its_cap|size)$`; the `$` anchor means a
   parametrized cap test id (`name[param]`) needs a custom `push_cap_tests`:

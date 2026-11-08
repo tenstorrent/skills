@@ -1242,7 +1242,9 @@ def due(p: Project, now: float | None = None, cfg: dict | None = None) -> tuple[
             return [], "overlapping approvals wait for a batch that takes them in order"
     if clean and len(rows) > cap:
         cap = min(len(rows), cap * BATCH_GROW)   # one merged-result check run covers the backlog
-    taken, held = _one_solo(p, rows, cap, _solo_paths(d), _tracking_tip(p, remote, branch), fast)
+    tip = _tracking_tip(p, remote, branch)
+    solo = _solo_paths(d)   # aging lets a routine approval lead, never skip the one-per-batch hold
+    taken, held = _one_solo(p, rows, cap, solo, tip, fast_ids(p, rows, tip, skip=tried, aged=False) if solo else fast)
     if held:
         why += (f"; {len(held)} more approval{'s' if len(held) != 1 else ''} touching delivery.push_solo_paths "
                 f"wait{'s' if len(held) == 1 else ''} for a later batch (one per batch)")
@@ -1293,19 +1295,21 @@ def _changed(p: Project, tip: str, head: str) -> frozenset | None:
     return got
 
 
-def fast_ids(p: Project, rows: list[dict], tip: str, skip: set = frozenset()) -> set[int]:
+def fast_ids(p: Project, rows: list[dict], tip: str, skip: set = frozenset(), aged: bool = True) -> set[int]:
     """The ids of `rows` (approved, same target) that go in a batch of their own at once: urgent
     (urgent.covers_urgent), of priority FAST_PRIORITY or better (aged: _approved), or changing no file that an earlier
     row still in the queue (approved, batched or held) changes. Files overlap.ignore lists
     (changesets, changelogs, manifests) do not count. A row sent back as a conflict counts as earlier
     than every routine row of its priority or worse (it leads them: _approved), so an older peer sharing
     its files never goes ahead of it. A row git cannot read is not independent, nor is any with no
-    fetched tip; rows in `skip` (already tried on a failing tip) are never fast."""
+    fetched tip; rows in `skip` (already tried on a failing tip) are never fast. `aged` False: by the
+    task's own priority, not the aged one (the push_solo_paths hold: _one_solo)."""
     if not rows:
         return set()
     db = p.db
     out = {r["id"] for r in rows if r["id"] not in skip and (
-        _prio(r) <= FAST_PRIORITY or urgent.covers_urgent(db, db.task(r["task"])))}
+        (_prio(r) if aged else _prio({"priority": r.get("priority")})) <= FAST_PRIORITY
+        or urgent.covers_urgent(db, db.task(r["task"])))}
     if not tip:
         return out
     globs = overlap.settings(p).get("ignore")
@@ -1339,7 +1343,7 @@ def _one_solo(p: Project, rows: list[dict], cap: int, paths: list[str], tip: str
     """Up to `cap` of `rows` in order, at most one routine one (not in `fast`) a change touching `paths`
     since it left `tip`: (taken, the touching ones left for a later batch). The oldest touching one
     (one sent back as a conflict before any other: _approved) leads the routine part, so each waits at most one batch per older one, never behind newer ones of
-    a better priority. Fast rows are never held. A row git cannot tell about counts as touching (one
+    a better priority. Fast rows (by their own priority: due) are never held and lead. A row git cannot tell about counts as touching (one
     per batch is the safe side)."""
     if not paths or len(rows) < 2:
         return rows[:cap], []

@@ -12441,7 +12441,8 @@ def test_push_solo_paths_is_off_by_default_and_when_set_holds_a_routine_change_o
     """Prompt changes that fit a size cap alone but not together are found by the batch's cap probes, so
     by default a batch takes every prompt change. Set, delivery.push_solo_paths lets a batch take at most
     one routine approval touching it: the oldest leads the next batch, newer ones of a better priority
-    never pass it, and priority 1-2 ones are never held."""
+    never pass it, and priority 1-2 ones are never held. An approval aged to priority 2 (push_age_s; every
+    one here, 10**6 s on) is still held by its own priority, and leads the next batch after them."""
     from ttp import pushq
     s = _pq(env, monkeypatch, push_batch_max=3)
     _git_out(s.repo, "fetch", "-q", "origin")
@@ -12472,7 +12473,8 @@ def test_push_solo_paths_is_off_by_default_and_when_set_holds_a_routine_change_o
     assert [r["id"] for r in rows][:3] == [e, f, c] and g not in [r["id"] for r in rows], \
         "the held one leads the routine part of the next batch, after the fast ones; newer routine ones wait"
     s.p.set_config("delivery.push_solo_paths", [])
-    assert [r["id"] for r in pushq.due(s.p, time.time() + 10 ** 6)[0]] == [e, f, c, g]
+    assert [r["id"] for r in pushq.due(s.p, time.time() + 10 ** 6)[0]] == [e, c, f, g], \
+        "off: none held; aged to priority 2 (delivery.push_age_s), c is older than f and leads it"
 
 
 def test_cap_failure_reads_only_a_complete_list_of_prompt_cap_test_failures_and_their_overshoots():
