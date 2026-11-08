@@ -626,14 +626,12 @@ def test_a_phrase_a_live_memory_entry_states_whole_is_advisory_never_a_fix_order
     assert sorted(h["key"] for h in echoes.scan(p) if h["class"] == "directive") == sorted(
         hits[k]["key"] for k in (f"task:{retired}:spec", f"memory:{fact.stem}"))
     # A superseder that still holds a retired phrase whole (not in the retirement's replacing text, nor skipped)
-    # makes it current everywhere, in the superseder itself too.
+    # makes it current everywhere, in the superseder itself too: no phrase of the retired rule (_superseders).
     sup = p.add_memory("Deploys: keep the `pre-flight-gate` step.", kind="decision")
     echoes.record(p.db, f"memory [{old.stem}] superseded by [{sup.stem}]", "Run the `pre-flight-gate` step.",
                   "", found=["pre-flight-gate"])
-    kept = p.db.add_task("kept", "Do the pre-flight-gate step.")
-    gate = [h for h in echoes.scan(p) if h["phrase"] == "pre-flight-gate"]
-    assert {h["key"].split(":", 1)[1] for h in gate} == {f"task:{kept}:spec", f"memory:{sup.stem}"}, gate
-    assert {h["class"] for h in gate} == {"advisory"}, gate
+    p.db.add_task("kept", "Do the pre-flight-gate step.")
+    assert [h for h in echoes.scan(p) if h["phrase"] == "pre-flight-gate"] == []
     # A second live entry holding the phrase makes each one's copy current too.
     p.add_memory("Staging checklist: `ship-it --canary` before the demo.", kind="fact")
     assert hits[f"memory:{fact.stem}"]["key"] not in {h["key"] for h in echoes.scan(p) if h["class"] == "directive"}
