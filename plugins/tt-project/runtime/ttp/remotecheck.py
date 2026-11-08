@@ -11,7 +11,8 @@ output streams back and its exit code is the check's. A stopped check (a timeout
 its command there too (_run_script). The temporary directory is always removed.
 
 ssh failing (an unreachable host, a refused key, a dropped connection) or a host that cannot take
-the tree is an environment fault, not the change's, and so is a host that is paused (paused: this
+the tree is an environment fault, not the change's (ssh's shared connection refusing one more session
+first tries the check again from the start on a connection of its own, MUX_BACKOFF_S), and so is a host that is paused (paused: this
 project's, a shared or another project's pause; nothing reaches it over ssh): this exits FAULT_RC, which the callers
 (`ttp checks`, `ttp push`, the push queue) treat as envfault does a missing runner. A command's own
 exit FAULT_RC is reported as 1, so it never reads as a fault. A check spilled with a remote wrapper
@@ -32,6 +33,7 @@ import shlex
 import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 FAULT_RC = 75
@@ -43,8 +45,16 @@ LOCAL = "local"      # a check's `host` that keeps it here when delivery.checks_
 HOST_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.@+:-]{0,252}")
 ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 # A link that drops mid-check ends in exit 255 within about a minute, never hangs to the wall-time cap.
-SSH = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", "-o", "ServerAliveInterval=15",
-       "-o", "ServerAliveCountMax=4"]
+# A keepalive every 5 s: a proxy in the path may cut a link idle for 15 s, as when a test suite prints
+# nothing for a while on a connection of its own (DIRECT, or ssh's own fallback when its shared one refuses).
+SSH = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", "-o", "ServerAliveInterval=5",
+       "-o", "ServerAliveCountMax=12"]
+# A connection of its own, never ssh's shared one (ControlMaster), whose sessions the host caps (MaxSessions).
+DIRECT = ["-o", "ControlMaster=no", "-o", "ControlPath=none"]
+# ssh's words when the shared connection refuses one more session: not the host's fault. The check is
+# tried again from the start on a connection of its own after each wait here, then it is a fault.
+MUX_REFUSED = "Session open refused by peer"
+MUX_BACKOFF_S = (2, 5)
 SETUP_TIMEOUT_S = 900
 CLEANUP_TIMEOUT_S = 120
 PROBE_TIMEOUT_S = 45
@@ -82,9 +92,9 @@ def argv(cmd: str, host: str, env: dict | None = None, commit: str = "", wrap: t
             *(["--literal", json.dumps(literal, sort_keys=True)] if literal else []), "--", cmd]
 
 
-def _ssh(host: str, script: str) -> list[str]:
+def _ssh(host: str, script: str, direct: bool = False) -> list[str]:
     # The login shell parses the command line: hand it one quoted word for sh, whatever that shell is.
-    return [*SSH, host, f"sh -c {shlex.quote(script)}"]
+    return [*SSH, *(DIRECT if direct else []), host, f"sh -c {shlex.quote(script)}"]
 
 
 def paused(host: str, where: str | Path | None = None) -> str:
@@ -267,20 +277,45 @@ def main(args: list[str]) -> int:
         _say(f"no commit {commit[:12]} in this checkout; nothing to copy" if commit and top
              else "not in a git checkout with a commit; nothing to copy")
         return 2
+    why = ""
+    for wait in (None, *MUX_BACKOFF_S):
+        if wait is not None:
+            _say(f"ssh's shared connection to {host} refused a session ({MUX_REFUSED}): trying again "
+                 f"in {wait} s on a connection of its own")
+        rc, why = _attempt(host, top, head, env, extra, cmd, mark, wrap, wait)
+        if not why:
+            return rc
+    return _fault(host, f"{why}; ssh's shared connection refused a session ({MUX_REFUSED}) on each of "
+                        f"{1 + len(MUX_BACKOFF_S)} tries")
+
+
+def _refused(text: str | bytes) -> bool:
+    return MUX_REFUSED in (text.decode(errors="replace") if isinstance(text, bytes) else text or "")
+
+
+def _attempt(host, top, head, env, extra, cmd, mark, wrap, wait) -> tuple[int, str]:
+    """One try of the check on `host` (main), after `wait` s on a connection of its own when given:
+    (exit code, ""), or (FAULT_RC, why) when ssh failed after its shared connection refused a session."""
     for s in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
         signal.signal(s, _stop)
+    direct = wait is not None
     tmp, proc = "", None
     try:
+        if direct:
+            time.sleep(wait)
         try:
-            made = subprocess.run(_ssh(host, mktemp_cmd()),
+            made = subprocess.run(_ssh(host, mktemp_cmd(), direct),
                                   stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=PROBE_TIMEOUT_S)
         except subprocess.TimeoutExpired:
-            return _fault(host, f"ssh timed out after {PROBE_TIMEOUT_S} s")
+            return _fault(host, f"ssh timed out after {PROBE_TIMEOUT_S} s"), ""
         tmp = made.stdout.strip()
         if made.returncode != 0 or not _TMP.fullmatch(tmp):
             tmp = ""
-            return _fault(host, f"cannot make a temporary directory there (ssh exit {made.returncode}: "
-                                f"{(made.stderr.strip().splitlines() or [''])[-1][:200]})")
+            why = (f"cannot make a temporary directory there (ssh exit {made.returncode}: "
+                   f"{(made.stderr.strip().splitlines() or [''])[-1][:200]})")
+            if made.returncode == 255 and _refused(made.stderr):
+                return FAULT_RC, why
+            return _fault(host, why), ""
         _say(f"checking {head[:12]} on {host} in {tmp}")
         q = shlex.quote(tmp)
         setup = (f"set -e; cd {q}; tar -xf -; git -c init.defaultBranch=main init -q; git add -A -f .; "
@@ -288,31 +323,35 @@ def main(args: list[str]) -> int:
                  f"--no-verify --allow-empty -m {shlex.quote('ttp check of ' + head)}")
         archive = subprocess.Popen(["git", "-C", top, "archive", "--format=tar", head], stdout=subprocess.PIPE)
         try:
-            copied = subprocess.run(_ssh(host, setup), stdin=archive.stdout, capture_output=True, text=True,
+            copied = subprocess.run(_ssh(host, setup, direct), stdin=archive.stdout, capture_output=True, text=True,
                                     timeout=SETUP_TIMEOUT_S)
         except subprocess.TimeoutExpired:
             archive.kill()
-            return _fault(host, f"copying the tree timed out after {SETUP_TIMEOUT_S} s")
+            return _fault(host, f"copying the tree timed out after {SETUP_TIMEOUT_S} s"), ""
         finally:
             archive.stdout.close()
             archive.wait()
         # ssh or the host failing mid-copy kills git archive with SIGPIPE: that is the host, not the
         # change. Only git archive failing on its own while the copy went through is the checkout's.
         if copied.returncode != 0 or archive.returncode == -signal.SIGPIPE:
-            return _fault(host, f"cannot unpack the tree into a git checkout there (exit {copied.returncode}: "
-                                f"{(copied.stderr.strip().splitlines() or [''])[-1][:200]})")
+            why = (f"cannot unpack the tree into a git checkout there (exit {copied.returncode}: "
+                   f"{(copied.stderr.strip().splitlines() or [''])[-1][:200]})")
+            if copied.returncode == 255 and _refused(copied.stderr):
+                return FAULT_RC, why
+            return _fault(host, why), ""
         if archive.returncode != 0:
             _say(f"git archive of {head[:12]} failed (exit {archive.returncode})")
-            return 2
+            return 2, ""
         from . import testslots
         script = _run_script(q, exports(env) + extra, cmd, mark, wrap, testslots.priority_args(testslots._cfg()))
         # stdin stays open and unwritten: its end on the host (we stopped, died or lost ssh) stops the command.
-        proc = subprocess.Popen(_ssh(host, script), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        proc = subprocess.Popen(_ssh(host, script, direct), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT)
-        rc, held, no_wrap = None, b"", False
+        rc, held, no_wrap, refused = None, b"", False, False
         out = sys.stdout.buffer
         for raw in iter(proc.stdout.readline, b""):
             text = raw.decode(errors="replace").strip()
+            refused = refused or _refused(text)
             if text.startswith(mark) and text[len(mark):].isdigit():
                 rc = int(text[len(mark):])
                 held = b""   # the blank line printed before the marker is ours
@@ -329,18 +368,21 @@ def main(args: list[str]) -> int:
         proc.wait()
         if no_wrap == NO_ENV:
             return _fault(host, "the checks' pinned Python env could not be made there (its error is above), "
-                                "so the check did not run (never with that host's user site)")
+                                "so the check did not run (never with that host's user site)"), ""
         if no_wrap:
             return _fault(host, f"the spill wrapper {wrap[0]!r} is missing or not executable there, so the "
-                                "check did not run (never unwrapped)")
+                                "check did not run (never unwrapped)"), ""
         if rc is None:
-            return _fault(host, f"ssh ended before the command reported its exit code (ssh exit {proc.returncode})")
+            why = f"ssh ended before the command reported its exit code (ssh exit {proc.returncode})"
+            if proc.returncode == 255 and refused:
+                return FAULT_RC, why
+            return _fault(host, why), ""
         if rc == FAULT_RC:
             _say(f"the command exited {FAULT_RC}; reported as 1, so it does not read as an unreachable host")
-            return 1
-        return rc
+            return 1, ""
+        return rc, ""
     except _Stop:
-        return 143
+        return 143, ""
     finally:
         for s in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
             signal.signal(s, signal.SIG_IGN)
@@ -354,7 +396,7 @@ def main(args: list[str]) -> int:
             proc.stdin.close()
         if tmp:
             try:
-                subprocess.run(_ssh(host, f"rm -rf {shlex.quote(tmp)}"), stdin=subprocess.DEVNULL,
+                subprocess.run(_ssh(host, f"rm -rf {shlex.quote(tmp)}", direct), stdin=subprocess.DEVNULL,
                                capture_output=True, timeout=CLEANUP_TIMEOUT_S)
             except (OSError, subprocess.SubprocessError):
                 _say(f"could not remove {tmp} on {host}")

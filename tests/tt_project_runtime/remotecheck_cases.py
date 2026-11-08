@@ -8,13 +8,28 @@ _RC_FAKE_SSH = r'''#!/bin/sh
 # A fake ssh: drops -o options and the host, runs the last argument with sh -c. Host "down" is
 # unreachable; FAKE_SSH_FAIL=<text> exits 255 at once on a script holding it (reading nothing);
 # FAKE_SSH_DROP=<text> runs such a script, then drops the connection before its exit-code marker.
-# FAKE_SSH_LOG=<file> gets one line per call naming the host.
+# FAKE_SSH_LOG=<file> gets one line per call naming the host. FAKE_SSH_MUX=<file> holding a count (or
+# "always"): on a script holding FAKE_SSH_MUX_ON (default: the run step) the shared connection refuses
+# the session while the count lasts, and the link drops (exit 255); <file>.log gets "shared" or "direct".
+all="$*"
 while [ "$1" = "-o" ]; do shift 2; done
 host=$1
 shift
 [ -n "$FAKE_SSH_LOG" ] && echo "$host" >> "$FAKE_SSH_LOG"
 if [ "$host" = down ]; then echo "ssh: connect to host down port 22: Connection refused" >&2; exit 255; fi
 [ -n "$FAKE_REMOTE_TMP" ] && export TMPDIR="$FAKE_REMOTE_TMP"
+if [ -n "$FAKE_SSH_MUX" ]; then
+  case "$1" in *"${FAKE_SSH_MUX_ON:-ttp-remote-rc}"*)
+    case "$all" in *ControlPath=none*) echo direct >> "$FAKE_SSH_MUX.log";; *) echo shared >> "$FAKE_SSH_MUX.log";; esac
+    left=$(cat "$FAKE_SSH_MUX")
+    if [ "$left" = always ] || [ "$left" -gt 0 ]; then
+      [ "$left" = always ] || echo $((left - 1)) > "$FAKE_SSH_MUX"
+      echo "mux_client_request_session: session request failed: Session open refused by peer" >&2
+      echo "client_loop: send disconnect: Broken pipe" >&2
+      exit 255
+    fi;;
+  esac
+fi
 case "$1" in *"${FAKE_SSH_FAIL:-@none@}"*) echo "ssh: connection to $host lost" >&2; exit 255;; esac
 case "$1" in *"${FAKE_SSH_DROP:-@none@}"*) sh -c "$1" | sed '/ttp-remote-rc:/d'; exit 255;; esac
 exec sh -c "$1"
@@ -152,6 +167,48 @@ def test_ssh_failing_at_any_step_of_a_remote_check_is_an_environment_fault(tmp_p
     monkeypatch.setenv("PATH", f"{bin_}{os.pathsep}{os.environ['PATH']}")
     assert remotecheck.reachable("box1") == ""
     assert "cannot reach down" in remotecheck.reachable("down")
+
+
+def test_a_remote_check_tries_again_on_its_own_connection_when_the_shared_one_refuses_a_session(tmp_path):
+    """ssh's shared connection refusing a session (MaxSessions) at the run step, the copy or the temp dir
+    is not the host's fault: the check runs again from the start there on a connection of its own and
+    its result counts; nothing is left on the host."""
+    from ttp import remotecheck
+    repo = _rc_repo(tmp_path)
+    mux = tmp_path / "mux"
+    for on in ("ttp-remote-rc", "tar -xf", "mktemp"):
+        mux.write_text("1")
+        Path(f"{mux}.log").unlink(missing_ok=True)
+        rc, said = _rc_run(tmp_path, repo, "echo ran-here; exit 3", FAKE_SSH_MUX=str(mux), FAKE_SSH_MUX_ON=on)
+        assert rc == 3 and "ran-here" in said, (on, said)
+        assert remotecheck.MUX_REFUSED in said and "trying again in 2 s on a connection of its own" in said, said
+        assert remotecheck.SIG not in said, said
+        assert Path(f"{mux}.log").read_text().split() == ["shared", "direct"], on
+        assert _rc_left(tmp_path) == []
+
+
+def test_a_remote_check_whose_shared_ssh_connection_refuses_every_try_is_a_fault_naming_the_refusal(
+        tmp_path, monkeypatch):
+    """Bounded: refused on every try, the check is today's environment fault after 1 + len(MUX_BACKOFF_S)
+    tries, and its message names the refusal; an ssh drop with no refusal is a fault at once."""
+    from ttp import remotecheck
+    repo = _rc_repo(tmp_path)
+    mux = tmp_path / "mux"
+    mux.write_text("always")
+    rc, said = _rc_run(tmp_path, repo, "echo ran-here", FAKE_SSH_MUX=str(mux))
+    assert rc == remotecheck.FAULT_RC and "ran-here" not in said, said
+    assert f"{remotecheck.SIG}box1" in said and f"refused a session ({remotecheck.MUX_REFUSED}) on each of 3 tries" in said
+    assert Path(f"{mux}.log").read_text().split() == ["shared", "direct", "direct"]
+    assert _rc_left(tmp_path) == []
+    rc, said = _rc_run(tmp_path, repo, "true", FAKE_SSH_DROP="ttp-remote-rc")
+    assert rc == remotecheck.FAULT_RC and "trying again" not in said, said
+    # The keepalive outpaces a proxy that cuts a link idle for 15 s; drops still end in about a minute.
+    opts = dict(w.split("=", 1) for w in remotecheck.SSH if "=" in w)
+    alive = int(opts["ServerAliveInterval"])
+    assert alive < 15 and 30 <= alive * int(opts["ServerAliveCountMax"]) <= 90, opts
+    direct = remotecheck._ssh("h", "true", direct=True)
+    assert "ControlPath=none" in direct and "ControlMaster=no" in direct and direct[-2] == "h"
+    assert "ControlPath=none" not in remotecheck._ssh("h", "true")
 
 
 def _rc_gone(pid, within=10.0):
@@ -592,6 +649,39 @@ def test_a_run_that_does_not_pass_on_a_spill_host_runs_again_here(env, tmp_path,
         where = log.read_text().splitlines()
         assert where and "/ttp-check." not in where[-1], where
         assert not any(k.startswith("env:check-host:") for k in envfault.open_faults(p))
+
+
+def test_a_spilled_run_stays_on_its_spill_host_when_the_shared_ssh_connection_refuses_a_session(
+        env, tmp_path, monkeypatch):
+    """A spill host whose shared ssh connection refuses one session keeps the run: it passes there and
+    counts. Refused on every try, the run comes back here as for any host fault, and the log names it."""
+    import threading
+    from ttp import cli, envfault, remotecheck
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a"])
+    log = tmp_path / "where.log"
+    p.set_config("delivery.push_checks", [f"pwd >> {log}"])
+    mux = tmp_path / "mux"
+    monkeypatch.setenv("FAKE_SSH_MUX", str(mux))
+    for refusals in ("1", "always"):
+        mux.write_text(refusals)
+        log.write_text("")
+        lane = _spill_lane(p, repo)
+        if refusals == "always":   # frees the lane here for the run that comes back
+            threading.Timer(2.0, lane.close).start()
+        cli.main(["checks", "--fresh"])
+        lane.close()
+        rec = json.loads((run / "checks.json").read_text())
+        text = (run / "checks.log").read_text()
+        assert rec["passed"] is True and remotecheck.MUX_REFUSED in text, (refusals, rec)
+        where = log.read_text().splitlines()
+        if refusals == "1":
+            assert rec["spilled_to"] == "check-host-a" and len(where) == 1 and "/ttp-check." in where[0], rec
+            assert "did not pass on spill host" not in text, text
+        else:
+            assert "spilled_to" not in rec and "/ttp-check." not in where[-1], (rec, where)
+            assert "did not pass on spill host check-host-a" in text and "on each of 3 tries" in text, text
+        assert not any(k.startswith("env:check-host:") for k in envfault.open_faults(p))
+        assert _rc_left(tmp_path) == []
 
 
 def test_a_run_with_the_host_wide_cap_full_spills_to_a_free_host_past_a_paused_one(env, tmp_path, monkeypatch):
@@ -1164,7 +1254,7 @@ def test_a_spill_run_past_the_wall_cap_or_on_a_stalled_link_runs_again_here(env,
     timeout stays recorded. The check-host ssh ends a dropped link through keepalives."""
     import threading
     from ttp import checkwall, cli, remotecheck
-    assert "ServerAliveInterval=15" in remotecheck.SSH and "ServerAliveCountMax=4" in remotecheck.SSH
+    assert "ServerAliveInterval=5" in remotecheck.SSH and "ServerAliveCountMax=12" in remotecheck.SSH
     p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a"])
     monkeypatch.setenv("TTP_TASK", "4212")
     monkeypatch.setenv(checkwall.ENV, "3")
