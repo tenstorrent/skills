@@ -3960,7 +3960,7 @@ class Daemon:
             return
         self._rank_tried = now
         if not (key := rankfresh.api_key()):
-            self.alert(rankfresh.NEEDS_KEY, rankfresh.NEEDS_KEY_TEXT, severity="normal", every_s=0)
+            self.alert(rankfresh.NEEDS_KEY, rankfresh.NEEDS_KEY_TEXT, severity="normal")   # its open episode keeps a repeat quiet
             return
         where = self.p
 
@@ -3969,6 +3969,7 @@ class Daemon:
                 self._rank_out = rankfresh.refresh(served, trigger, time.time(), key)
             except Exception as e:   # a local fault (an unwritable account home): the type only
                 log(where, f"model ranking: refresh failed: {type(e).__name__}")
+                self._rank_tried = time.time() + rankfresh.RETRY_S - 300   # retried hourly, not every 5 minutes
 
         self._rank_job = threading.Thread(target=work, name="model-ranking", daemon=True)
         self._rank_job.start()

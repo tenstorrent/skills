@@ -2887,21 +2887,26 @@ def test_a_newly_served_model_refreshes_the_ranking_through_the_daemon(env, monk
     d = Daemon(p.base)
     d._load_config()
     posted, seen = [], []
-    monkeypatch.setattr(d, "alert", lambda key, text, severity="high", **k: posted.append((key, text, severity)))
-    monkeypatch.setattr(d, "observe", lambda source, text, **k: seen.append((source, text, k)))
     index = [_fake_index(("rank-a", 70), ("rank-b", 60))]
     monkeypatch.setattr(rankfresh, "_get", lambda url, key: index[0])
 
     def tick():
-        d._rank_tried = 0.0
+        d._rank_tried = 0.0   # past the 5-minute gate
         d.refresh_model_ranking()
         if d._rank_job:
             d._rank_job.join(10)
         d.refresh_model_ranking()   # posts what the thread found
     route.write_served(p.state, "chat", True, "HTTP 200", ["rank-b"], time.time())
-    tick()   # no key: nothing fetched, one user-only item
-    assert posted == [(rankfresh.NEEDS_KEY, rankfresh.NEEDS_KEY_TEXT, "normal")] and not (home / rankfresh.STATE).exists()
+    for _ in range(4):
+        tick()   # no key: nothing fetched, one user-only item, however often it is tried
+    d = Daemon(p.base)   # a restart says nothing new either
+    d._load_config()
+    tick()
+    rows = p.db.q("SELECT severity FROM messages WHERE ref=?", (rankfresh.NEEDS_KEY,))
+    assert [r["severity"] for r in rows] == ["normal"] and not (home / rankfresh.STATE).exists()
     assert alerts.holds(p.db, rankfresh.NEEDS_KEY, 0, time.time())
+    monkeypatch.setattr(d, "alert", lambda key, text, severity="high", **k: posted.append((key, text, severity)))
+    monkeypatch.setattr(d, "observe", lambda source, text, **k: seen.append((source, text, k)))
     keyfile = env["tmp"] / "aa-key"
     keyfile.write_text("file-key\n")
     from ttp import project
@@ -2925,5 +2930,12 @@ def test_a_newly_served_model_refreshes_the_ranking_through_the_daemon(env, monk
     d.refresh_model_ranking()   # not due again within the hour
     assert modelrank.ranking(d.cfg) == ["rank-a", "rank-b"] and len(posted) == 2
     assert len(seen) == 1 and seen[0][0] == "model-ranking" and seen[0][1].startswith("error:")
+    # A local fault in the thread (an unwritable account home): retried hourly, not every 5 minutes.
+    calls = []
+    monkeypatch.setattr(rankfresh, "refresh", lambda *a: calls.append(a) or 1 / 0)
+    monkeypatch.setattr(rankfresh, "due", lambda served, now: "weekly")
+    tick()
+    d.refresh_model_ranking()
+    assert len(calls) == 1 and d._rank_tried > time.time() + rankfresh.RETRY_S - 400
     # A project with no chat endpoint never refreshes.
     assert not rankfresh.configured({"providers": {"chat": {"model_ranking": ["x"]}}}) and not rankfresh.configured({})
