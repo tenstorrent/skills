@@ -6078,9 +6078,9 @@ def test_an_unanswered_ask_resolves_to_its_recommendation_at_the_deadline(env):
     mem = p.memory_dir.glob("*.md")
     assert any("auto-resolved to its default: use option A" in f.read_text() for f in mem), "no decision memory"
     assert coord.expire_asks(p, now=ask["ts"] + 99 * 3600) == [], "an ask expired twice"
-    problems, again = _ask(p, q, **_OWN_ACCESS, recommendation="use option B")
-    assert problems and "auto-resolved unanswered" in " ".join(problems), "a re-ask of a resolved ask was sent"
-    assert again["id"] == ask["id"]
+    problems, again = _ask(p, q, **_OWN_ACCESS, recommendation="use option B")   # sent, flagged (#2116)
+    assert problems == [] and "auto-resolved unanswered" in _flagged(p), "a re-ask of a resolved ask not flagged"
+    assert again["id"] != ask["id"]
 
 
 @pytest.mark.parametrize("blocking,rec,kind", [
@@ -22001,6 +22001,7 @@ def test_an_ask_repeating_a_corrected_value_is_refused_naming_the_correction(env
     said, name = _corrected(p)
     problems, _ = _ask(p, "Should the coordinator drop to low effort while idle to save spend?", blocking="access")
     assert problems == [] and f"already settled by memory [{name}] (user msg #{said} corrected 'low')" in _flagged(p)
+    p.db.x("UPDATE messages SET handled=1 WHERE kind='ask'")   # answered: a resend is no duplicate open ask
     problems, sent = _ask(p, "Should the coordinator drop to low effort while idle to save spend?",
                           blocking="access", not_covered=_NEW)
     assert problems == [] and sent["text"].startswith("Should the coordinator drop"), problems

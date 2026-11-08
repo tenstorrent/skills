@@ -2810,7 +2810,7 @@ def test_coordsession_each_label_form_is_checked_and_unlabelled_data_survives_th
 
 
 def test_coordsession_memory_add_stores_a_quoted_term_on_an_unlabelled_line(env):
-    from ttp import coordinator as coord
+    from ttp import coordinator as coord, coordsession
     p = make(env)
     p.db.x("INSERT INTO chats(id,created,label,last_active,last_read) VALUES('c1',?,?,?,0)",
            (time.time(), "t", time.time()))
@@ -2820,7 +2820,9 @@ def test_coordsession_memory_add_stores_a_quoted_term_on_an_unlabelled_line(env)
     assert any("'GLM routing' section" in e["line"] for e in p._memory_entries())
     out = coord.apply(p, [{"type": "memory_add", "memory_kind": "decision",
                            "text": f"Per the user (msg #{real}): 'GLM routing first'"}])
-    assert any("memory_add rejected" in x and "backticks" in x for x in out), out
+    assert out == [] and "stored as data" in _flagged(p), out   # kept as data, never as the user's words
+    [kept] = [e for e in p._memory_entries() if "'GLM routing first'" in e["line"]]
+    assert coordsession.DATA_LABEL in kept["line"], kept
 
 
 def test_coordsession_the_wake_after_a_compaction_carries_the_user_s_orders_from_the_record(env, monkeypatch):

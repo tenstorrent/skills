@@ -123,8 +123,9 @@ def test_the_ask_gate_refuses_leave_the_users_newer_request_gave_naming_it(env):
     old, new = _said_fixture(p)
     problems, sent = _ask(p, _RE_ASK, **_OWN_ACCESS)
     assert problems == [] and f"already settled by user msg #{new}:" in _flagged(p), problems
-    assert "Fix the stale nightly report watcher on box-a1 yourself" in problems[0]
-    # Other forms of asking leave: refused too.
+    assert "Fix the stale nightly report watcher on box-a1 yourself" in _flagged(p)
+    p.db.x("UPDATE messages SET handled=1 WHERE kind='ask'")   # answered: a resend is no duplicate open ask
+    # Other forms of asking leave: settled too.
     for ask in ("Can we fix the stale nightly report watcher on box-a1?",
                 "OK to fix the stale nightly report watcher on box-a1?",
                 "Do you want me to fix the stale nightly report watcher on box-a1?"):
