@@ -461,6 +461,45 @@ def test_throughput_review_sweep_is_not_lowered_for_waits_the_checks_held(env, m
     assert {(c["key"], c["old"], c["new"]) for c in changes if c["key"] in levers} == {("review.sweep_after_s", 1800, 900)}
 
 
+def test_throughput_review_sweep_names_the_backstop_whatever_the_provider_gate(env):
+    from ttp import throughput
+    p = make(env)
+    now = time.time()
+    prov = p.config().get("core_provider", "claude")
+    p.set_config("review.sweep_after_s", 1200)
+    # The finish queued no review (its git read timed out); the unreviewed backstop queued it 5 h later.
+    t0 = now - 8 * 3600
+    code, rv = _tp_review(p, t0 - 1800, t0, t0 + 5 * 3600, t0 + 5 * 3600 + 60)
+    p.db.x("INSERT INTO events(ts, source, kind, severity, text, status, task) VALUES(?,?,?,?,?,?,?)",
+           (t0 + 5 * 3600, "daemon", "review_unqueued", "low", f"#{code} x: its commits had no review and were "
+            f"not landed; review #{rv} queued by the daemon.", "handled", code))
+    # One queued at finish, at once.
+    _tp_review(p, now - 3 * 3600, now - 2 * 3600, now - 2 * 3600, now - 2 * 3600 + 60)
+    red = {prov: {"level": "red", "allow_new_work": False, "max_parallel": 2}}
+    for gates in ({}, red):
+        rep = throughput.measure(p.db, p.config(), now=now, gates=gates)
+        rs = _tp_lane(rep, "review_sweep")
+        assert rs["slow"] and (rs["backstop_count"], rs["swept_count"], rs["slot_held"]) == (1, 0, 0)
+        changes, kept = throughput.plan(p.db, p.config(), rep)
+        assert not [c for c in changes if c["key"] == "review.sweep_after_s"], changes
+        why = [k["why"] for k in kept if k["lane"] == "review_sweep"]
+        assert len(why) == 1, why
+        assert "1 of 2 review(s) were queued at finish" in why[0] and "1 queued late by the unreviewed backstop" \
+            in why[0], why[0]
+        assert "provider gate" not in why[0], "no change is proposed, so the gate is not the cause"
+    # A change the gate holds keeps the diagnosis too, in the same one entry.
+    p.db.x("INSERT INTO events(ts, source, kind, severity, text, status, task) VALUES(?,?,?,?,?,?,?)",
+           (t0 + 5 * 3600, "daemon", "review_swept", "normal", f"#{code} x; review #{rv} queued by the daemon.",
+            "handled", code))
+    rep = throughput.measure(p.db, p.config(), now=now, gates=red)
+    changes, kept = throughput.plan(p.db, p.config(), rep)
+    assert not [c for c in changes if c["key"] == "review.sweep_after_s"], changes
+    why = [k["why"] for k in kept if k["lane"] == "review_sweep"]
+    assert why == ["the provider gate is red (spend or plan window): never raised here"], why
+    changes, _ = throughput.plan(p.db, p.config(), throughput.measure(p.db, p.config(), now=now, gates={}))
+    assert [(c["key"], c["new"]) for c in changes if c["key"] == "review.sweep_after_s"] == [("review.sweep_after_s", 600)]
+
+
 def test_throughput_never_proposes_a_review_stall_change(env, monkeypatch):
     from ttp import throughput
     p = make(env)

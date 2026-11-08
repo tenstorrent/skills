@@ -21,7 +21,9 @@ to its first run, or to now for one still queued:
 - review_sweep: a code task's hand-off into review (its task_review or task_done event; else its last
   run's end, when a model-free on_pass finished it later) to its review task being queued. Limits
   review.sweep_after_s, judged only on the reviews the sweep queued (its review_swept events), and
-  review.unreviewed_per_pass (against the backlog of tasks in review now).
+  review.unreviewed_per_pass (against the backlog of tasks in review now). A review the unreviewed
+  backstop queued (its review_unqueued event: the finish queued none, Daemon.sweep_unreviewed found it
+  later) is counted apart (backstop): no limit holds it, so plan() names it whatever the provider gate.
 - review_stall: the same end to the review's first run, against coordinator.review_stall_s (the age at
   which a waiting review is raised). Reported only: plan() never lowers it, since a sooner alarm starts
   no review sooner. Its waits the checks did not hold (free) are reported apart, as information.
@@ -652,9 +654,11 @@ def measure(db: DB, cfg: dict, since_s: float = DAY, now: float | None = None, g
     per_pass = int(_cfg(cfg, "review.unreviewed_per_pass", 2) or 0)
     stall_s = float(_cfg(cfg, "coordinator.review_stall_s", 14400) or 0)
     rs, rt = lane("review_sweep", "review.sweep_after_s", sweep_s), lane("review_stall", "coordinator.review_stall_s", stall_s)
-    swept = {int(m.group(1)) for e in db.q("SELECT text FROM events WHERE kind='review_swept' AND ts>?", (t0,))
-             if (m := re.search(r"review #(\d+) queued", e["text"] or ""))}
-    rs["swept"], rs["slot_held"], rt["free"], rt["slot_held"] = [], 0, [], 0
+    queued_by = {kind: {int(m.group(1)) for e in db.q("SELECT text FROM events WHERE kind=? AND ts>?", (kind, t0))
+                        if (m := re.search(r"review #(\d+) queued", e["text"] or ""))}
+                 for kind in ("review_swept", "review_unqueued")}
+    swept, backstop = queued_by["review_swept"], queued_by["review_unqueued"]
+    rs["swept"], rs["backstop"], rs["slot_held"], rt["free"], rt["slot_held"] = [], [], 0, [], 0
     # A code task's hand-off into review: the task_review/task_done event Daemon's finish writes, which
     # a model-free on_pass may write long after its last run ended (its own checks ran in between).
     handoff: dict[int, list[float]] = {}
@@ -676,6 +680,8 @@ def measure(db: DB, cfg: dict, since_s: float = DAY, now: float | None = None, g
             rs["slot_held"] += 1
         elif t["id"] in swept:
             rs["swept"].append(float(t["created"]) - done)
+        elif t["id"] in backstop:
+            rs["backstop"].append(float(t["created"]) - done)
         start = first.get(t["id"])
         w1 = start if start is not None else now
         add(rt, w1 - done, prio, done, w1, None, start is None)
@@ -768,7 +774,7 @@ def measure(db: DB, cfg: dict, since_s: float = DAY, now: float | None = None, g
     out = []
     for ln in lanes.values():
         w, p1 = ln.pop("waits"), ln.pop("p1")
-        for k in ("swept", "window", "free"):
+        for k in ("swept", "backstop", "window", "free"):
             if k in ln:
                 v = ln.pop(k)
                 ln.update({f"{k}_count": len(v), f"{k}_p90_s": round(_pct(v, 0.9))})
@@ -850,7 +856,7 @@ def plan(db: DB, cfg: dict, report: dict) -> tuple[list[dict], list[dict]]:
                 kept[-1]["why"] += (f"; {ln['serialized']} wait(s) serialized: runs went one at a time back to "
                                     "back, so the queue held them, not the cap")
             continue
-        if not ok:
+        if not ok and name != "review_sweep":
             kept.append({"lane": name, "key": key, "why": why_not})
             continue
         if name == "worker_slots":
@@ -870,22 +876,35 @@ def plan(db: DB, cfg: dict, report: dict) -> tuple[list[dict], list[dict]]:
                 else:
                     kept.append({"lane": name, "key": key, "why": f"already at the host's share of cores ({cur})"})
         elif name == "review_sweep":
-            per = ln.get("per_pass") or 0
+            # Its diagnosis stands whatever the provider gate; only a change it proposes waits on the gate.
+            mine, per = [], ln.get("per_pass") or 0
             if per and ln.get("backlog", 0) > per:
                 new = load_size(per, ln["backlog"] - per, ln["backlog"])
-                changes.append({"key": "review.unreviewed_per_pass", "old": per, "new": new,
-                                "why": f"{ln['backlog']} task(s) in review without one, {per} per pass; p90 {p90}s"})
+                mine.append({"key": "review.unreviewed_per_pass", "old": per, "new": new,
+                             "why": f"{ln['backlog']} task(s) in review without one, {per} per pass; p90 {p90}s"})
             n, sp90 = ln.get("swept_count", 0), ln.get("swept_p90_s", 0)
+            b, bp90 = ln.get("backstop_count", 0), ln.get("backstop_p90_s", 0)
+            why = ""
             if cur and cur > FLOORS[key] and n and sp90 > cur:
-                changes.append({"key": key, "old": int(cur), "new": int(max(FLOORS[key], cur // 2)),
-                                "why": f"{n} review(s) the sweep queued, p90 {sp90}s after the work ended, "
-                                       f"sweep every {int(cur)}s"})
+                mine.append({"key": key, "old": int(cur), "new": int(max(FLOORS[key], cur // 2)),
+                             "why": f"{n} review(s) the sweep queued, p90 {sp90}s after the work ended, "
+                                    f"sweep every {int(cur)}s"})
             else:
                 held = ln.get("slot_held", 0)
-                kept.append({"lane": name, "key": key, "why": f"{ln['count'] - n - held} of {ln['count']} review(s) "
-                             f"were queued at finish, not by the sweep, and {held} held by the checks ({n} swept, "
-                             f"p90 {sp90}s): {key} did not hold them" if cur and cur > FLOORS[key]
-                             else f"{key} is at its floor"})
+                why = (f"{ln['count'] - n - held - b} of {ln['count']} review(s) were queued at finish, not by the "
+                       f"sweep, and {held} held by the checks ({n} swept, p90 {sp90}s): {key} did not hold them"
+                       if cur and cur > FLOORS[key] else f"{key} is at its floor")
+                if b:
+                    why += (f"; {b} queued late by the unreviewed backstop (p90 {bp90}s): their finish queued no "
+                            "review (its git read timed out or the review cap was full) and sweep_unreviewed found "
+                            "them later: see the daemon log's 'no review queued' and 'tick step sweep_unreviewed "
+                            "stopped at its budget' lines")
+            if mine and not ok:
+                why = f"{why}; {why_not}" if why else why_not
+            else:
+                changes += mine
+            if why:
+                kept.append({"lane": name, "key": key, "why": why})
         elif name == "push_batch":
             n, wp90 = ln.get("window_count", 0), ln.get("window_p90_s", 0)
             target = max(FLOORS[key], int(cur // 2))
