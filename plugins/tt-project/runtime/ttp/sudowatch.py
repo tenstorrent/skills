@@ -95,6 +95,9 @@ class Watch:
 
         # Lives only as long as the suite, so no sync: a crash loses only that suite's run.
         durable_write(bin_dir / "sudo", WRAPPER, mode=0o755, sync=False)
+        if not os.access(bin_dir / "sudo", os.X_OK):   # a noexec temp folder: no wrapper rather than no sudo
+            shutil.rmtree(self.dir, ignore_errors=True)
+            raise OSError(f"the sudo wrapper in {self.dir} cannot run (noexec?)")
         self.log = self.dir / "calls.log"
         self.log.touch()
         keep = [d for d in env.get("PATH", os.defpath).split(os.pathsep) if os.path.basename(d) != DIR_NAME]

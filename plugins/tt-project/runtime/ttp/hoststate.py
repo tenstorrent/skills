@@ -54,6 +54,7 @@ from pathlib import Path
 MARKER = "TTP_HOSTSTATE_FAKE"
 NAMES = ("crontab", "systemctl", "loginctl", "at", "atq", "atrm", "batch", "reboot", "shutdown",
          "poweroff", "halt", "ipmitool", "tt-smi", "sudo")
+SUDO_WRAPPER_DIR = "ttp-sudowatch"   # sudowatch.DIR_NAME (this file also loads outside the package)
 SHIMS = ".ttp-shims"   # in each stand-in folder, so a nested run and the stand-ins skip every such folder
 OWN_CRON = "# tt-project:"
 OWN_UNIT = "tt-project-"
@@ -113,7 +114,11 @@ def fake_env(env: dict, store: str | Path | None = None) -> dict:
     except OSError:
         return env
     rest = [d for d in env.get("PATH", os.defpath).split(os.pathsep) if d and d != str(bin_dir)]
-    return {**env, MARKER: str(store), "PATH": os.pathsep.join([str(bin_dir), *rest])}
+    # A sudo wrapper (sudowatch) stays ahead of the stand-ins: it records the call, then the sudo stand-in
+    # refuses host writes and its real-command lookup skips the wrapper, so neither runs the other twice.
+    first = [d for d in rest if os.path.basename(d) == SUDO_WRAPPER_DIR]
+    rest = [d for d in rest if os.path.basename(d) != SUDO_WRAPPER_DIR]
+    return {**env, MARKER: str(store), "PATH": os.pathsep.join([*first, str(bin_dir), *rest])}
 
 
 def _faked() -> Path | None:

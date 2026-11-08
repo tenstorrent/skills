@@ -160,7 +160,10 @@ def _real(store, name, args):
     if mine in keys:   # after this folder first: one before it was already passed by a PATH lookup
         i = keys.index(mine) + 1
         dirs, keys = dirs[i:] + dirs[:i], keys[i:] + keys[:i]
-    ok = [d for d, k in zip(dirs, keys) if k != mine and not os.path.exists(os.path.join(d, ".ttp-shims"))]
+    # A sudo wrapper folder (sudowatch.DIR_NAME) is skipped too: it already ran before this stand-in (it
+    # stays first on PATH), and it would run this stand-in again, an endless exec loop.
+    ok = [d for d, k in zip(dirs, keys) if k != mine and os.path.basename(d) != "ttp-sudowatch"
+          and not os.path.exists(os.path.join(d, ".ttp-shims"))]
     real = None if hops >= MAX_HOPS else shutil.which(name, path=os.pathsep.join(
         d for d in ok if os.path.realpath(d) not in seen))
     if not real:

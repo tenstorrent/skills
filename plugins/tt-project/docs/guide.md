@@ -2294,7 +2294,9 @@ the pick order, so it takes the first starts. A resumed resource ramps only its 
   `ttp config <project> checks.refuse_sudo true`) makes the wrapper refuse instead: exit 126, a message
   naming the key, no real sudo. Commands outside test suites are untouched. A PATH wrapper is no fence:
   a suite that calls `/usr/bin/sudo` by its absolute path, or resets PATH first (`env -i`, `command -p`),
-  bypasses it, unrecorded and unrefused.
+  bypasses it, unrecorded and unrefused. Checks sent to a spill host, and a suite whose temp folder is
+  mounted noexec, get no wrapper. With the host-state stand-ins also on PATH the wrapper stays first:
+  it records the call, then the sudo stand-in refuses host writes and passes the rest to the real sudo.
 - A waiting hand-off on the run's own detached checks (`retry_when` `ttp checks --result <run dir>`)
   wakes a model only on a failure, a broken probe or a timeout. With an `on_pass` the pass records it;
   a plain code task with a summary and nothing left records `done` (the default on_pass). Any other

@@ -8,7 +8,7 @@ def _sudo_path(tmp_path, stub: bool = True) -> tuple[str, pathlib.Path]:
     tools, stub_dir = tmp_path / "tools", tmp_path / "stub"
     tools.mkdir(parents=True)
     stub_dir.mkdir()
-    for name in ("tr", "date", "sh", "cat", "true"):
+    for name in ("tr", "date", "sh", "cat", "true", "timeout"):
         (tools / name).symlink_to(shutil.which(name))
     if stub:
         s = stub_dir / "sudo"
@@ -190,11 +190,63 @@ def test_ttp_sandbox_reports_the_commands_sudo_on_stderr_and_keeps_its_exit_code
     monkeypatch.setattr(sudowatch, "observe", lambda lines, key: False)
     monkeypatch.setenv("PATH", path)
     monkeypatch.setenv("TTP_REFUSE_SUDO", "0")
-    assert sandbox.run(["sh", "-c", "sudo -n ipmitool sel elist; exit 5"]) == 5
+    # Under `timeout`: a wrapper and a sudo stand-in that run each other would hang here, not fail.
+    assert sandbox.run(["timeout", "20", "sh", "-c", "sudo -n ipmitool sel elist; exit 5"]) == 5
     assert calls.read_text() == "-n ipmitool sel elist\n"
     assert "ttp sandbox: sudo: the command called sudo 1 time" in capfd.readouterr().err
     monkeypatch.setenv("TTP_REFUSE_SUDO", "1")
     calls.unlink()
-    assert sandbox.run(["sh", "-c", "sudo -n ipmitool sel elist"]) == 126 and not calls.exists()
+    assert sandbox.run(["timeout", "20", "sh", "-c", "sudo -n ipmitool sel elist"]) == 126 and not calls.exists()
     assert "checks.refuse_sudo" in capfd.readouterr().err
     assert sandbox.run(["true"]) == 0 and "sudo" not in capfd.readouterr().err   # no call: nothing said
+
+
+def _with_stand_ins(tmp_path, path, wrapper_first_applied):
+    """The sudo wrapper and the host-state stand-ins (hoststate.fake_env) on one PATH, applied in either order."""
+    from ttp import hoststate, sudowatch
+    store = tmp_path / "store"
+    if wrapper_first_applied:
+        w = sudowatch.Watch({"PATH": path}, refuse=False)
+        w.env = hoststate.fake_env(w.env, store)
+    else:
+        w = sudowatch.Watch(hoststate.fake_env({"PATH": path}, store), refuse=False)
+    return w, store
+
+
+@pytest.mark.parametrize("wrapper_first_applied", [True, False])
+def test_sudowatch_and_the_sudo_stand_in_run_the_real_sudo_once_in_either_order(tmp_path, wrapper_first_applied):
+    import sys
+    path, calls = _sudo_path(tmp_path)
+    (tmp_path / "tools" / "python3").symlink_to(sys.executable)
+    w, store = _with_stand_ins(tmp_path, path, wrapper_first_applied)
+    try:
+        assert w.env["PATH"].split(os.pathsep)[0].endswith("/ttp-sudowatch")   # the wrapper stays first
+        # Bounded: the wrapper and the stand-in once took each other for the real sudo and looped forever.
+        r = subprocess.run(["sudo", "-n", "echo", "hi"], env=w.env, capture_output=True, text=True, timeout=20)
+        assert r.returncode == 3, r.stderr
+        assert calls.read_text() == "-n echo hi\n"   # the stub (real) sudo ran exactly once
+        assert [c["args"] for c in w.calls()] == ["-n echo hi"]
+        # A host write is still refused by the stand-in, and the wrapper still records it.
+        r = subprocess.run(["sudo", "-n", "systemctl", "enable", "x"], env=w.env, capture_output=True, text=True,
+                           timeout=20)
+        assert r.returncode == 1 and "refused" in r.stderr, r.stderr
+        assert calls.read_text() == "-n echo hi\n"
+        assert [c["args"] for c in w.calls()] == ["-n echo hi", "-n systemctl enable x"]
+        logged = [json.loads(ln) for ln in (store / "calls.jsonl").read_text().splitlines()]
+        assert [(c["cmd"], c["write"]) for c in logged if c["cmd"] == "sudo"] == [("sudo", False), ("sudo", True)]
+    finally:
+        w.close()
+
+
+def test_sudowatch_gives_no_wrapper_when_its_folder_cannot_run(tmp_path, monkeypatch):
+    from ttp import sudowatch
+    monkeypatch.setattr(sudowatch.os, "access", lambda p, mode: False)   # as on a noexec TMPDIR
+    with pytest.raises(OSError, match="cannot run"):
+        sudowatch.Watch({"PATH": "/nonexistent", "TMPDIR": str(tmp_path)})
+    assert not [p for p in tmp_path.iterdir() if p.name.startswith("ttp-sudo-")]
+
+
+def test_hoststate_and_hostshim_name_the_sudo_wrapper_folder_as_sudowatch_does():
+    from ttp import hostshim, hoststate, sudowatch
+    assert hoststate.SUDO_WRAPPER_DIR == sudowatch.DIR_NAME
+    assert f'"{sudowatch.DIR_NAME}"' in pathlib.Path(hostshim.__file__).read_text()
