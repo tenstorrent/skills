@@ -5016,7 +5016,7 @@ def _checks_lane_status(as_json: bool) -> int:
                          indent=2))
     else:
         print(checklane.status_text(p.name, p.config(), here_repo, names=names, db=p.db))
-        for line in [*checkspill.status_lines(p.name), *slurmcheck.probe_lines(), *slurmcheck.status_lines(p.name),
+        for line in [*checkspill.status_lines(p.name), *checkspill.pick_lines(p.name), *slurmcheck.probe_lines(), *slurmcheck.status_lines(p.name),
                      *filter(None, [slurmcheck.paused_line()])]:
             print(f"  {line}")
         print("check runs per host:")
@@ -5450,13 +5450,15 @@ def _checks_reexec(new: str, arrived: float | None, prio, spill: bool, tell, out
     rest at its arrival time `arrived` and its task's priority `prio`, so it keeps its place. Called only
     while it waits, holding nothing else; returns only when the exec failed, with the lanes and the slot
     let go (freed as a dead holder's are). With `rerank` (checkcap.Reranked) its task's priority changed (`new`
-    is the new one): the same runtime re-executes (RERANK_ENV: once per priority) and reads it at its start."""
+    is the new one): the same runtime re-executes (RERANK_ENV: once per priority) and reads it at its start.
+    An upgrade drops the spill hosts a rerun kept off (`spill_off`): the checks may pass there with the new
+    runtime, so a run parked here spills again at its next bound."""
     from . import checkcap, checkspill, testslots
     if arrived is not None:
         os.environ[checkcap.ARRIVED_ENV] = repr(arrived)
     if not spill:   # what cmd_checks took out of the environment: no spill host for these checks
         os.environ[checkspill.OFF_ENV] = "1"
-    elif spill_off:   # or the spill hosts a rerun keeps off
+    elif spill_off and rerank:   # or the spill hosts a rerun keeps off; a new runtime tries them all again
         os.environ[checkspill.OFF_ENV] = spill_off
     if rerank:
         os.environ[checkcap.RERANK_ENV] = new

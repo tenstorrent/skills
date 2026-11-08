@@ -963,7 +963,8 @@ def pick(p, cfg: dict, tell, what: str = "", off: str = "", why_here: str = "") 
     rec = {"project": p.name, "task": os.environ.get("TTP_TASK") or "", "run": os.environ.get("TTP_RUN_ID") or "",
            "pid": os.getpid(), "since": time.time(), "what": what[:300]}
     skipped, keep = [], kept_off(off)
-    for alias in hosts(cfg):
+    mine = [r.get("host") for r in holders()]
+    for alias in sorted(hosts(cfg), key=mine.count):   # spread: hosts running fewer of this machine's checks first
         machine, host = target(alias)
         if alias in keep or host in keep:
             skipped.append(f"{alias} (these checks did not pass there in this run)")
@@ -1005,12 +1006,48 @@ def pick(p, cfg: dict, tell, what: str = "", off: str = "", why_here: str = "") 
                  + (f"; {note}, so its device locks alone decided" if note else "")
                  + (f"; beside a device job (checks.{BESIDE_KEY} lists it): {dev}" if dev else "")
                  + (f"; skipped: {'; '.join(skipped)}" if skipped else ""))
+            _note_pick(p.name, alias, skipped)
             return got
         skipped.append(f"{alias} ({why or 'this machine holds its free slots'}"
                        + (f"; {note}" if note else "") + ")")
     if skipped:
         tell("no spill host could take the checks, waiting here: " + "; ".join(skipped))
+    _note_pick(p.name, "", skipped)
     return None
+
+
+def _pick_file(project_name: str) -> Path:
+    return claim_dir().parent / "spill-picks" / f"{re.sub(r'[^A-Za-z0-9_.-]', '_', project_name)}.json"
+
+
+def _note_pick(project_name: str, took: str, skipped: list[str]) -> None:
+    """Record the project's last pick: the host it took ("" none) and each host skipped with why (pick_lines)."""
+    f = _pick_file(project_name)
+    try:
+        f.parent.mkdir(parents=True, exist_ok=True)
+        from . import project
+        project.durable_write(f, json.dumps({"at": time.time(), "took": took,
+                                             "skipped": [w[:300] for w in skipped]}), sync=False)
+    except OSError:
+        pass
+
+
+def pick_lines(project_name: str, now: float | None = None) -> list[str]:
+    """`ttp checks status` lines: the project's last spill pick in the last SKIP_SHOW_S, and each host it
+    skipped with why."""
+    now = time.time() if now is None else now
+    try:
+        r = json.loads(_pick_file(project_name).read_text() or "{}")
+        at = float(r.get("at") or 0)
+    except (OSError, ValueError, TypeError, AttributeError):
+        return []
+    if now - at > SKIP_SHOW_S:
+        return []
+    ago = f"{max(0, int((now - at) // 60))} min ago"
+    return ([f"last spill pick ({ago}) took {r['took']}" if r.get("took")
+             else f"last spill pick ({ago}) found no spill host with room"]
+            + [f"  spill host {w.partition(' (')[0]} took no run: {w.partition(' (')[2].removesuffix(')')}"
+               for w in r.get("skipped") or []])
 
 
 def _alive(pid: Any) -> bool:

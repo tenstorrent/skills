@@ -895,6 +895,9 @@ def test_spill_keeps_new_runs_off_a_host_whose_device_lock_is_held_and_shows_why
     told: list[str] = []
     before = checkspill.pick(p, cfg, told.append, "pytest -q")   # a run already on the host
     assert before is not None and before.host == "check-host-a"
+    # One run on each host: pick() spreads runs, so with equal runs it tries them in their listed order.
+    on_b = checkspill.pick(p, cfg, told.append, "pytest -q")
+    assert on_b is not None and on_b.host == "check-host-b"
     dev = _device_hold(p, "check-host-a-device")
     try:
         got = checkspill.pick(p, cfg, told.append, "pytest -q")
@@ -924,6 +927,7 @@ def test_spill_keeps_new_runs_off_a_host_whose_device_lock_is_held_and_shows_why
     finally:
         again.close()
         before.close()
+        on_b.close()
 
 
 def test_spill_beside_device_takes_a_listed_host_with_a_device_job_but_keeps_pauses_and_lock_holds(
@@ -2976,3 +2980,56 @@ def test_a_spill_wrapper_that_puts_its_own_venv_first_never_hides_the_pinned_che
         assert r.returncode == 0, r.stdout + r.stderr
         first = r.stdout.split("first=", 1)[1].split()[0]
         assert first != str(venv) and first.endswith("/bin") and "nousersite=1" in r.stdout, (w, r.stdout)
+
+
+def test_spill_pick_spreads_runs_across_hosts_with_room_and_checks_status_says_why_each_took_none(
+        env, tmp_path, monkeypatch, capsys):
+    """pick() sends a new run to a host running fewer of this machine's checks first, never piling every run
+    on the first listed host while others with room run nothing; its last pick shows in `ttp checks status`
+    with each host it skipped and why."""
+    from ttp import checkspill, cli
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["down", "check-host-a", "check-host-b"])
+    told = []
+    first = checkspill.pick(p, p.config(), told.append, "pytest -q")
+    second = checkspill.pick(p, p.config(), told.append, "pytest -q")
+    try:
+        assert first is not None and second is not None
+        assert (first.host, second.host) == ("check-host-a", "check-host-b"), told
+        lines = checkspill.pick_lines(p.name)
+        assert lines[0] == "last spill pick (0 min ago) took check-host-b", lines
+        assert any(line.startswith("  spill host down took no run: ssh cannot reach it") for line in lines), lines
+        off = ",".join(f"{h}:fail" for h in ("down", "check-host-a", "check-host-b"))
+        assert checkspill.pick(p, p.config(), told.append, "pytest -q", off) is None
+        lines = checkspill.pick_lines(p.name)
+        assert lines[0] == "last spill pick (0 min ago) found no spill host with room", lines
+        assert "  spill host check-host-b took no run: these checks did not pass there in this run" in lines
+        with pytest.raises(SystemExit):
+            cli.main(["checks", "status"])
+        assert "spill host check-host-a took no run: these checks did not pass there" in capsys.readouterr().out
+        assert checkspill.pick_lines(p.name, now=time.time() + checkspill.SKIP_SHOW_S + 1) == [], "old picks age out"
+    finally:
+        first and first.close()
+        second and second.close()
+
+
+@pytest.mark.parametrize("rerank", [False, True])
+def test_a_parked_run_re_executed_for_an_upgrade_tries_every_spill_host_again(env, monkeypatch, rerank):
+    """A run parked here whose spilled checks failed on every spill host keeps them off only within one
+    runtime: re-executed for an upgrade (a fix of what failed there), it tries them all again at its next
+    bound; a priority change (same runtime) keeps them off."""
+    import io
+    from ttp import checkcap, checkspill, cli
+
+    class _Exec(Exception):
+        pass
+
+    def fake_exec(*_a):
+        raise _Exec(os.environ.get(checkspill.OFF_ENV))
+    for k in (checkspill.OFF_ENV, checkcap.REEXEC_ENV, checkcap.RERANK_ENV, checkcap.ARRIVED_ENV):
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setattr(cli.os, "execv", fake_exec)
+    off = "host-a:fail,host-b:fail"
+    with pytest.raises(_Exec) as e:
+        cli._checks_reexec("2" if rerank else "99.0.0", time.time(), 3, True, lambda _l: None, io.StringIO(),
+                           rerank=rerank, spill_off=off)
+    assert e.value.args[0] == (off if rerank else None)
