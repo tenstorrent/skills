@@ -1909,6 +1909,8 @@ def cmd_status(a) -> None:
         from . import gatetime
         if ln := gatetime.status_line(p.state, p.config()):
             print(ln)
+        if ln := gatetime.waits_line(p.db, p.state):
+            print(ln)
         from . import notifier
         for ln in notifier.status_lines():   # this machine's notifier: on old code, or failing to deliver
             print(ln)
@@ -3959,6 +3961,11 @@ def cmd_checks(a) -> None:
                 said = f"on {spilled.host} the checks run behind their spill wrapper {shlex.join(w)}"
                 print(f"ttp checks: {said}", flush=True)
                 out.write(f"ttp checks: {said}\n")
+        # How long it queued (`ttp status` waits), once per run: a rerun here after a spill host keeps its arrival.
+        if p and todo and not hit and not handover and not light and not os.environ.get("TTP_CHECKS_WAIT_KEPT"):
+            from . import gatetime
+            gatetime.record_wait(p.state, time.time() - arrived)
+            os.environ["TTP_CHECKS_WAIT_KEPT"] = "1"
         if join_rec and todo and not hit and not handover:
             checkjoin.update(join_rec, phase=checkjoin.RUNNING, run_since=time.time())
         child_env = {"PWD": top, **venv_vars, **(slot.env() if slot else {})}

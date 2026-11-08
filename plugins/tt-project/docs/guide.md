@@ -1760,7 +1760,8 @@ session and stateless coordinators on every provider.
   their host (aim 5) and put slower tests in `delivery.post_land_checks`. `ttp status` and the daily
   review show the landing check time (median and p90, last 24 h and last 10 runs); over
   `checks.smoke_max_s` (default 600 s) the project's coordinator gets one observation a day naming the
-  slowest tests (push-checks reference, "Smoke before landing").
+  slowest tests (push-checks reference, "Smoke before landing"). `ttp status` also shows the waits:
+  checks wait to start and approval to landed (median and p90, last 24 h).
 - Where reviewed changes go straight to a shared branch, `ttp push` publishes them guarded: it
   refuses uncommitted changes, rebases onto the latest tip, runs `delivery.push_checks` on the
   exact commit it pushes, starts over if the branch moved meanwhile, and never forces. A

@@ -13,6 +13,9 @@ aim 5. Slower tests belong in delivery.post_land_checks, which run after landing
   `checks.smoke_max_s` (seconds; default DEFAULT_MAX_S, 0: off), one `gate_slow` observation goes to the
   project's own coordinator per day. It names the slowest tests the newest push log shows (pytest's
   --durations lines) and suggests a smoke split; the project changes its own push checks.
+- Waits (waits_line()): how long full `ttp checks` runs waited to start (WAIT_LOG, record_wait(), from the run's
+  arrival to its start here or on a spill host) and approval to landed (pushq.landing_times), median and p90
+  over the last 24 h: the hours a slow landing spends queued, not testing.
 """
 from __future__ import annotations
 
@@ -26,6 +29,7 @@ from pathlib import Path
 from .project import durable_append, durable_write
 
 LOG = "push-check-times.jsonl"
+WAIT_LOG = "checks-wait-times.jsonl"
 KEEP = 200
 DAY_S = 86400.0
 LAST_N = 10
@@ -38,11 +42,11 @@ SLOWEST = 10
 _DURATION = re.compile(r"^(?:ttp-suite:)?\s*(\d+(?:\.\d+)?)s\s+(?:(?:call|setup|teardown)\s+)?(\S+::\S+)", re.M)
 
 
-def record(state: Path | None, seconds: float, now: float | None = None) -> None:
-    """Keep one passing push check run's wall time; a failed write only loses a sample."""
-    if state is None or not seconds or seconds <= 0:
+def record(state: Path | None, seconds: float, now: float | None = None, log: str = LOG) -> None:
+    """Keep one passing push check run's wall time (or, in WAIT_LOG, one wait); a failed write only loses a sample."""
+    if state is None or seconds is None or seconds < 0 or not seconds and log == LOG:
         return
-    path = Path(state) / LOG
+    path = Path(state) / log
     try:
         if path.exists() and path.stat().st_size > KEEP * 64:
             lines = path.read_text().splitlines()
@@ -53,9 +57,14 @@ def record(state: Path | None, seconds: float, now: float | None = None) -> None
         pass
 
 
-def _rows(state: Path | None) -> list[tuple[float, float]]:
+def record_wait(state: Path | None, seconds: float, now: float | None = None) -> None:
+    """Keep how long one full `ttp checks` run waited from its arrival to its start (0: it started at once)."""
+    record(state, max(0.0, seconds), now, WAIT_LOG)
+
+
+def _rows(state: Path | None, log: str = LOG) -> list[tuple[float, float]]:
     try:
-        lines = (Path(state) / LOG).read_text().splitlines() if state is not None else []
+        lines = (Path(state) / log).read_text().splitlines() if state is not None else []
     except OSError:
         return []
     out = []
@@ -65,7 +74,7 @@ def _rows(state: Path | None) -> list[tuple[float, float]]:
             ts, s = float(r["ts"]), float(r["s"])
         except (ValueError, KeyError, TypeError):
             continue
-        if s > 0:
+        if s > 0 or s == 0 and log != LOG:
             out.append((ts, s))
     return out
 
@@ -109,6 +118,23 @@ def status_line(state: Path | None, cfg: dict | None, now: float | None = None) 
     over = f"; over the {_m(lim)} smoke limit (checks.smoke_max_s): move slow tests to delivery.post_land_checks" \
         if lim and st["last"]["median_s"] > lim else ""
     return "landing checks: " + "; ".join(parts) + over
+
+
+def _hm(s: float) -> str:
+    return f"{s / 60:.0f} min" if s < 3600 else f"{int(s // 3600)} h {int(s % 3600 // 60):02d} min"
+
+
+def waits_line(db, state: Path | None, now: float | None = None, landed: bool = True) -> str:
+    """The last 24 h's waits: full checks runs' wait to start and (`landed`) approval to landed, median and
+    p90 each; '' with neither."""
+    from . import pushq
+    now = time.time() if now is None else now
+    parts = []
+    if w := _summary([s for ts, s in _rows(state, WAIT_LOG) if now - DAY_S <= ts <= now]):
+        parts.append(f"checks to start median {_hm(w['median_s'])}, p90 {_hm(w['p90_s'])} ({w['n']} runs)")
+    if landed and db is not None and (lt := pushq.landing_times(db, now - DAY_S))["n"]:
+        parts.append(f"approved to landed median {_hm(lt['median_s'])}, p90 {_hm(lt['p90_s'])} ({lt['n']} changes)")
+    return ("waits (24 h): " + "; ".join(parts)) if parts else ""
 
 
 def slowest(log_dir: Path | None, n: int = SLOWEST) -> list[tuple[float, str]]:

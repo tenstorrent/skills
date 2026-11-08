@@ -63,3 +63,30 @@ def test_post_land_checks_and_smoke_max_s_are_known_settings_and_post_land_check
 def gatetime_default_is_ten_minutes() -> bool:
     from ttp import gatetime
     return gatetime.max_s({}) == 600 == gatetime.max_s({"checks": {"smoke_max_s": "x"}}) and gatetime.AIM_S == 300
+
+
+def test_waits_line_gives_checks_wait_to_start_and_approved_to_landed_and_a_checks_run_records_its_wait(
+        env, tmp_path, monkeypatch, capsys):
+    from ttp import audit, cli, gatetime
+    p = make(env)
+    now = time.time()
+    assert gatetime.waits_line(p.db, p.state, now) == ""
+    for i, s in enumerate([0, 60, 600, 7200, 8100]):   # 0: started at once, still a sample
+        gatetime.record_wait(p.state, s, now=now - 3600 + i)
+    gatetime.record_wait(p.state, 99999, now=now - 2 * 86400)   # older than a day
+    q = "INSERT INTO push_queue(task,branch,head,target,status,created,updated) VALUES(?,?,?,?,?,?,?)"
+    for t, (created, st) in enumerate([(now - 7200, "landed"), (now - 3600, "pushed"), (now - 60, "approved")], 1):
+        p.db.x(q, (t, f"b{t}", f"h{t}", "main", st, created, now - 10))
+    line = gatetime.waits_line(p.db, p.state, now)
+    assert line == ("waits (24 h): checks to start median 10 min, p90 2 h 15 min (5 runs); "
+                    "approved to landed median 1 h 29 min, p90 1 h 59 min (2 changes)"), line
+    assert any(x.startswith("waits (24 h): checks to start") and "approved" not in x
+               for x in audit.lines(p.db, now=now, p=p))
+    # A full `ttp checks` run keeps how long it waited from its arrival to its start.
+    p2, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    before = len(gatetime._rows(p2.state, gatetime.WAIT_LOG))
+    monkeypatch.setenv("TTP_CHECKS_WAIT_KEPT", "")   # restored after: the run sets it
+    monkeypatch.setattr(cli, "_checks_arrived", lambda: time.time() - 120)
+    cli.main(["checks", "--", "true"])
+    rows = gatetime._rows(p2.state, gatetime.WAIT_LOG)
+    assert len(rows) == before + 1 and 119 <= rows[-1][1] < 200, rows

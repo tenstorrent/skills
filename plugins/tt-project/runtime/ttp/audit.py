@@ -559,6 +559,8 @@ def lines(db: DB, now: float | None = None, window_s: float = WINDOW_S, blocked_
         out.append(landed)
     if p is not None and (gate := gatetime.status_line(p.state, p.config(), now)):
         out.append(gate)
+    if p is not None and (waits := gatetime.waits_line(db, p.state, now, landed=False)):
+        out.append(waits)   # approval to landed: landing_line
     if pre := checkprestage.audit_line(db, since):
         out.append(pre)
     if plain := plainreply.audit_line(db, since):
