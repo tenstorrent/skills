@@ -2908,7 +2908,7 @@ def test_coordsession_the_wake_after_a_compaction_carries_the_user_s_orders_from
 
 def test_coordsession_each_wake_s_prompt_names_its_real_mode_and_today_s_counts(env, monkeypatch):
     """The prompt's mode line comes from the wake's own record, not the coordinator.session.mode setting:
-    a retired "off" setting still reads new, then resumed."""
+    a retired "off" setting still reads new, then resumed. The line names only resumed or new."""
     from ttp import coordsession, wakemode
     p, holder, sessions, turn, head, context = _cs_daemon(env, monkeypatch)
     cfg = p.raw_config()
@@ -2916,13 +2916,28 @@ def test_coordsession_each_wake_s_prompt_names_its_real_mode_and_today_s_counts(
     p.config_path.write_text(json.dumps(cfg))
     _, _, prompt, session = turn("EVENTS 1")
     assert session["mode"] == "new"
-    assert wakemode.HEAD + " this wake started a new session (new: no session); today 0 resumed, 1 new, " \
-        "0 stateless." in prompt, prompt[-600:]
+    assert wakemode.HEAD + " this wake started a new session (new: no session); today 0 resumed, 1 new.\n" \
+        in prompt, prompt[-600:]
     _, _, prompt, session = turn("EVENTS 2")
     assert session["mode"] == "resume"
     line = [x for x in prompt.splitlines() if x.startswith(wakemode.HEAD)]
-    assert line == [wakemode.HEAD + " this wake resumed its session; today 1 resumed, 1 new, 0 stateless."], line
+    assert line == [wakemode.HEAD + " this wake resumed its session; today 1 resumed, 1 new."], line
     assert prompt.rstrip().endswith("EVENTS 2")
+
+
+def test_coordsession_wake_mode_line_names_no_stateless_or_spend_guard_mode(env):
+    """Every wake resumes or starts a session: the line and its counts say nothing of a stateless or
+    spend-guard mode, and the module keeps only those two modes."""
+    from ttp import wakemode
+    p = make(env)
+    _wm_run(p, "new", "no session")
+    _wm_run(p, "resume")
+    for got in (wakemode.prompt_line(p.db, "UTC", "resume", "continued"),
+                wakemode.prompt_line(p.db, "UTC", "new", "resume failed")):
+        assert "stateless" not in got.lower() and "spend guard" not in got.lower(), got
+    assert wakemode.prompt_line(p.db, "UTC", "new", "resume failed").endswith(
+        "this wake started a new session (new: resume rejected); today 1 resumed, 2 new."), "this wake counted"
+    assert wakemode.MODES == ("resume", "new")
 
 
 def _wm_run(p, mode, why="continued", started=None, status="ok"):
@@ -2940,16 +2955,18 @@ def _wm_sent(p, kind):
                     (kind,))["text"]
 
 
-def test_coordsession_a_session_claim_on_a_stateless_wake_is_sent_unverified_with_the_recorded_mode(env):
+def test_coordsession_a_session_claim_on_a_wake_without_a_session_is_sent_unverified(env):
+    """Only a wake with no session record (an older row, or a provider that keeps none) leaves a claim
+    unverified; a resumed or new latest wake lets it pass, whatever earlier wakes recorded."""
     from ttp import coordinator as coord, wakemode
     p = make(env)
-    for _ in range(3):
-        _wm_run(p, "stateless", "spend guard tripped")
+    _wm_run(p, "new", "no session")
+    _wm_run(p, None, "mode off")
     coord.apply(p, [{"type": "reply", "text": _WM_CLAIM + " Next: #12.", "chat": "c1"}], turn=1)
     got = _wm_sent(p, "reply")
     assert got.startswith(_WM_CLAIM[:-1] + ". " + wakemode.UNVERIFIED + " Next: #12."), got
-    assert got.endswith(wakemode.HEAD + " this wake is STATELESS (spend guard): it does not run in the always-on "
-                        "session; today 0 resumed, 0 new, 3 stateless."), got
+    assert got.endswith(wakemode.HEAD + " this wake runs without a session (mode off); today 0 resumed, 1 new, "
+                        "1 without a session."), got
     assert any("wakemode:" in n for n in p.db.kv(coord.NOTES_KEY, [])), "the coordinator hears of it next turn"
     # The notify and the ask paths take the same check; another sentence is left as written.
     coord.apply(p, [{"type": "notify", "text": "Status: I'm running in my persistent session now."}], turn=2)
@@ -2960,36 +2977,14 @@ def test_coordsession_a_session_claim_on_a_stateless_wake_is_sent_unverified_wit
     assert "Persistent coordinator: on. (unverified) The deploy needs a sign-in" in asked and wakemode.HEAD in asked
     coord.apply(p, [{"type": "reply", "text": "The review passed.", "chat": "c1"}], turn=4)
     assert _wm_sent(p, "reply") == "The review passed."
-    # A wake with the mode off (no session record) is stateless too.
-    _wm_run(p, None, "mode off")
+    # A provider that keeps no session (its decide() mode) is labelled as such, never as a mode of its own.
+    _wm_run(p, "stateless", "chat: the coordinator session is not enabled on this provider yet")
     coord.apply(p, [{"type": "reply", "text": "This turn runs in its own session.", "chat": "c1"}], turn=5)
-    assert wakemode.UNVERIFIED in _wm_sent(p, "reply") and "(mode off)" in _wm_sent(p, "reply")
-
-
-def test_coordsession_a_resumed_wake_s_claim_passes_unless_most_of_today_fell_back(env):
-    from ttp import coordinator as coord, wakemode
-    p = make(env)
-    _wm_run(p, "stateless", "spend guard tripped", started=time.time() - 3 * 86400)   # another day
-    _wm_run(p, "new", "no session")
-    _wm_run(p, "resume")
-    coord.apply(p, [{"type": "reply", "text": _WM_CLAIM, "chat": "c1"}], turn=1)
-    assert _wm_sent(p, "reply") == _WM_CLAIM
-    for _ in range(2):
-        _wm_run(p, "stateless", "spend guard tripped")
-    _wm_run(p, "resume")   # resumed now, but 2 of today's 4 session wakes is not more than half
-    coord.apply(p, [{"type": "reply", "text": _WM_CLAIM, "chat": "c1"}], turn=2)
-    assert _wm_sent(p, "reply") == _WM_CLAIM
-    _wm_run(p, "stateless", "spend guard tripped")
-    _wm_run(p, "resume")   # 3 of 6 stateless: still not more than half
-    _wm_run(p, "stateless", "spend guard tripped")
-    _wm_run(p, "resume")   # 4 of 8
-    for why in ("rerun: resume failed", "spend guard tripped", "paused after 3 failed resumes"):
-        _wm_run(p, "stateless", why)
-    _wm_run(p, "resume")   # 7 of 13: most of today fell back
-    coord.apply(p, [{"type": "reply", "text": _WM_CLAIM, "chat": "c1"}], turn=3)
-    got = _wm_sent(p, "reply")
-    assert wakemode.UNVERIFIED in got and "this wake resumed its session; today 5 resumed, 1 new, 7 stateless" \
-        in got, got
+    assert "this wake runs without a session (provider keeps no session)" in _wm_sent(p, "reply")
+    for mode in ("resume", "new"):   # the latest wake resumed or started a session: the claim stands
+        _wm_run(p, mode, "no session")
+        coord.apply(p, [{"type": "reply", "text": _WM_CLAIM, "chat": "c1"}], turn=6)
+        assert _wm_sent(p, "reply") == _WM_CLAIM
 
 
 def test_coordsession_wakemode_claims_reads_each_clause_and_skips_honest_or_planned_sentences():
@@ -3008,7 +3003,7 @@ def test_coordsession_wakemode_claims_reads_each_clause_and_skips_honest_or_plan
 def test_coordsession_wakemode_guard_posts_the_text_when_its_check_breaks(env, monkeypatch):
     from ttp import coordinator as coord, wakemode
     p = make(env)
-    _wm_run(p, "stateless", "spend guard tripped")
+    _wm_run(p, None, "mode off")
     monkeypatch.setattr(wakemode, "doubtful", lambda *a, **k: 1 / 0)
     coord.apply(p, [{"type": "reply", "text": _WM_CLAIM, "chat": "c1"}], turn=1)
     assert _wm_sent(p, "reply") == _WM_CLAIM

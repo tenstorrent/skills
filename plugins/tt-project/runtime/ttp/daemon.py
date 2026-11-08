@@ -3643,7 +3643,7 @@ class Daemon:
                 except Exception as e:   # the wake runs; the saved copy stays, so the next ok wake sends it
                     prefix_now = None
                     log(self.p, f"coordinator session changed block failed: {type(e).__name__}: {e}"[:300])
-            prompt = self._wake_mode_line(session_mode, why, True, prompt)   # before the seed cap counts it
+            prompt = self._wake_mode_line(session_mode, why, prompt)   # before the seed cap counts it
             compact_at = 0   # the agent's own compaction switch, at the size the session compacts at
             if session_mode in ("new", "resume"):   # never below this wake's own prompt, whatever the state knows
                 fixed = sum(len(t or "") for t in (system, context, append_system, prompt)) // CHARS_PER_TOKEN \
@@ -5444,11 +5444,11 @@ class Daemon:
             (before if before is not None else 1 << 62, task, session, f"%{session}%"))
             if o["session_id"] == session or json.loads(o["note"] or "{}").get("session_id") == session)
 
-    def _wake_mode_line(self, mode: str, why: str, session: bool, prompt: str) -> str:
+    def _wake_mode_line(self, mode: str, why: str, prompt: str) -> str:
         """The coordinator wake's prompt led by its real mode and today's counts, from the record `ttp stats
         --coord-session` reads, never the mode setting (wakemode.py). A fault runs the wake without it."""
         try:
-            return wakemode.prompt_line(self.p.db, timefmt.home(self.p), mode, why, session=session) + "\n\n" + prompt
+            return wakemode.prompt_line(self.p.db, timefmt.home(self.p), mode, why) + "\n\n" + prompt
         except Exception as e:
             log(self.p, f"coordinator wake mode line failed: {type(e).__name__}: {e}"[:300])
             return prompt

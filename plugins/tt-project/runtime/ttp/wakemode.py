@@ -3,21 +3,19 @@
 """A coordinator wake's real mode, and what the coordinator may say about its always-on session. Model-free.
 
 The mode is read from the record `ttp stats --coord-session` reads (coordstats): each coordinator run's
-turn.session (mode "resume", "new" or "stateless" with the daemon's why) or turn.session_off (the mode
-off, or an agent that cannot resume), never from the coordinator.session.mode setting: a setting that
-is on says nothing of whether this wake resumed (the spend guard, a failed resume or a pause make it
-stateless). A run with neither record counts as stateless, not recorded.
+turn.session (mode "resume" or "new" with the daemon's why), never from the coordinator.session.mode
+setting. Every coordinator wake resumes its session or starts a new one (coordsession.py); a run with
+no such record (an older row, or a provider that keeps no session) is counted apart, without a session.
 
 line() is the one prompt line the daemon puts first in each coordinator wake's prompt: this wake's mode
-with its fallback reason, and today's resumed / new / stateless counts in the home zone, this wake
-included.
+with its reason, and today's resumed / new counts in the home zone, this wake included.
 
 guard() checks a coordinator reply, notify or ask before it is posted. When the latest coordinator wake
-(the one whose actions are being applied) is stateless, or more than half of today's session wakes fell
-back to stateless, a sentence claiming the always-on or persistent coordinator is on, or that this turn
-runs in its session (claims()), is kept but marked UNVERIFIED and the recorded mode line is appended.
+(the one whose actions are being applied) ran without a session, a sentence claiming the always-on or
+persistent coordinator is on, or that this turn runs in its session (claims()), is kept but marked
+UNVERIFIED and the recorded mode line is appended.
 Nothing else in the message changes and it is posted at once, so a message is never lost to the check.
-Accepted gap: a sentence that only names the session ('the coordinator session spend guard is ...')
+Accepted gap: a sentence that only names the session ('the coordinator session cache is ...')
 can be marked too; the mark adds words and drops none."""
 from __future__ import annotations
 
@@ -29,7 +27,7 @@ from . import coordstats, timefmt
 
 UNVERIFIED = "(unverified)"
 HEAD = "Coordinator wake mode (from ttp stats --coord-session's record, not the setting):"
-MODES = ("resume", "new", "stateless")
+MODES = ("resume", "new")
 
 # The always-on session named, then a present state word; or 'runs in its/the ... session'.
 _SESSION = re.compile(r"(?i)\b(?:always[- ]on|persistent)\b(?:\s+(?:coordinator|session|chat|mode))?")
@@ -56,22 +54,22 @@ def _turn(note) -> dict:
 
 
 def of_note(note, status: str = "ok") -> tuple[str, str]:
-    """(mode, reason) of one coordinator run's note: mode "resume", "new" or "stateless"; the reason is
-    coordstats.reason's label for a session wake, the session_off why, or 'not recorded'."""
+    """(mode, reason) of one coordinator run's note: mode "resume" or "new" with coordstats.reason's label,
+    else "off" (no session) with that label, its session_off why or 'not recorded'."""
     t = _turn(note)
     s = t.get("session")
-    if isinstance(s, dict) and s.get("mode") in MODES:
-        return s["mode"], coordstats.reason(s, status)
+    if isinstance(s, dict) and s.get("mode"):
+        return (s["mode"] if s["mode"] in MODES else "off"), coordstats.reason(s, status)
     off = str(t.get("session_off") or "").strip()
-    return "stateless", off or "not recorded"
+    return "off", off or "not recorded"
 
 
 def today_counts(db, tz: str, now: float | None = None) -> dict:
     """Today's coordinator wakes in the home zone `tz` by mode, as `ttp stats --coord-session` counts them
-    (session wakes only), plus "off": wakes with the mode off or no record."""
+    (resumed or new), plus "off": wakes without a session."""
     now = time.time() if now is None else now
     start, end = coordstats._day_bounds(timefmt.today(now, tz), tz)
-    out = {"resume": 0, "new": 0, "stateless": 0, "off": 0}
+    out = {"resume": 0, "new": 0, "off": 0}
     for r in db.q("SELECT note FROM runs WHERE role='coordinator' AND started>=? AND started<?", (start, end)):
         s = _turn(r["note"]).get("session")
         mode = s.get("mode") if isinstance(s, dict) else None
@@ -90,28 +88,27 @@ def _label(mode: str, why: str) -> str:
         return "this wake resumed its session" + (f" ({why})" if why and why != "resumed" else "")
     if mode == "new":
         return f"this wake started a new session ({why})"
-    return f"this wake is STATELESS ({why}): it does not run in the always-on session"
+    return f"this wake runs without a session ({why})"
 
 
 def _counts(c: dict) -> str:
-    text = f"today {c['resume']} resumed, {c['new']} new, {c['stateless']} stateless"
-    return text + (f", {c['off']} with the mode off" if c.get("off") else "")
+    text = f"today {c['resume']} resumed, {c['new']} new"
+    return text + (f", {c['off']} without a session" if c.get("off") else "")
 
 
 def line(mode: str, why: str, counts: dict) -> str:
     """The prompt line: this wake's mode and reason, today's counts (this wake included in `counts`)."""
-    tail = ". Say you run in the session only on a resumed or new wake." if mode == "stateless" else "."
+    tail = "." if mode in MODES else ". Say you run in the session only on a resumed or new wake."
     return f"{HEAD} {_label(mode, why)}; {_counts(counts)}{tail}"
 
 
-def prompt_line(db, tz: str, mode: str, why: str, session: bool = True, now: float | None = None) -> str:
-    """line() for a wake not yet in the runs table: today's recorded counts plus this one (`session`: a
-    session wake, recorded in turn.session; else one with the mode off, recorded in turn.session_off)."""
+def prompt_line(db, tz: str, mode: str, why: str, now: float | None = None) -> str:
+    """line() for a wake not yet in the runs table (coordsession.decide's mode and why): today's recorded
+    counts plus this one."""
     c = today_counts(db, tz, now)
-    c[mode if session and mode in MODES else "off"] += 1
-    if session:   # the label `ttp stats --coord-session` gives it ("spend guard", "new: no session")
-        why = coordstats.reason({"mode": mode, "why": why}, "running")
-    return line(mode if session else "stateless", why, c)
+    c[mode if mode in MODES else "off"] += 1
+    # the label `ttp stats --coord-session` gives it ("new: no session", "provider keeps no session")
+    return line(mode, coordstats.reason({"mode": mode, "why": why}, "running"), c)
 
 
 def claims(sentence: str) -> bool:
@@ -130,16 +127,11 @@ def claims(sentence: str) -> bool:
 
 
 def doubtful(db, tz: str, now: float | None = None) -> tuple[str, str] | None:
-    """The mode line when a session claim cannot stand (the latest wake is stateless, or more than half
-    of today's session wakes were), else None."""
+    """The mode line when a session claim cannot stand (the latest wake ran without a session), else None."""
     got = latest(db)
-    if got is None:
+    if got is None or got[0] in MODES:
         return None
-    c = today_counts(db, tz, now)
-    wakes = c["resume"] + c["new"] + c["stateless"]
-    if got[0] != "stateless" and not (wakes and c["stateless"] * 2 > wakes):
-        return None
-    return got[0], f"{HEAD} {_label(*got)}; {_counts(c)}."
+    return got[0], f"{HEAD} {_label(*got)}; {_counts(today_counts(db, tz, now))}."
 
 
 def guard(db, tz: str, text: str, now: float | None = None) -> tuple[str, list[str]]:

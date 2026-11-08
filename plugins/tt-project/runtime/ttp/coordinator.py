@@ -2585,8 +2585,8 @@ def _onhost_checked(p: Project, text: str, chat: str | None, a: dict, rest: list
 
 def _wakemode_checked(p: Project, text: str, notes: list) -> str:
     """A reply, notify or ask as wakemode.guard posts it: a claim that the coordinator runs in its always-on
-    session is sent marked (unverified) with the recorded wake mode when the wake is stateless or most of
-    today's wakes were. Any fault posts the text unchanged: a message is never lost to this check.
+    session is sent marked (unverified) with the recorded wake mode when the wake ran without a session.
+    Any fault posts the text unchanged: a message is never lost to this check.
     Kept apart so the live-state claim check can take it in as one of its claims."""
     try:
         text, why = wakemode.guard(p.db, timefmt.home(p), text)
