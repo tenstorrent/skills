@@ -2918,7 +2918,7 @@ def test_a_newly_served_model_refreshes_the_ranking_through_the_daemon(env, monk
     tick()   # nothing new: no refresh, no line
     assert len(posted) == 1
     route.write_served(p.state, "chat", True, "HTTP 200", ["rank-b", "rank-a"], time.time())
-    assert rankfresh.due(modelrank.served(p.state), time.time()) == "new model"
+    assert rankfresh.due(modelrank.served(p.state, time.time()), time.time()) == "new model"
     tick()
     assert modelrank.ranking(d.cfg) == ["rank-a", "rank-b"] and len(posted) == 2
     assert json.loads((home / rankfresh.LOG).read_text().splitlines()[-1])["trigger"] == "new model"

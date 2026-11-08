@@ -3955,7 +3955,7 @@ class Daemon:
         if (not rankfresh.configured(self.cfg) or now - self._rank_tried < 300
                 or self._rank_job is not None and self._rank_job.is_alive()):
             return
-        served = modelrank.served(self.p.state)
+        served = modelrank.served(self.p.state, now)   # None when unknown or stale: nothing to refresh against
         if not served or not (trigger := rankfresh.due(served, now)):
             return
         self._rank_tried = now
