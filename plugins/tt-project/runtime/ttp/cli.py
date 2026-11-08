@@ -1958,6 +1958,16 @@ def daemon_state(p: Project) -> str:
     return "NOT RUNNING"
 
 
+def _log_tail(log: Path, n: int = 65536) -> str:
+    """The last `n` bytes of a checks log, as text ("" when it does not read)."""
+    try:
+        with open(log, "rb") as f:
+            f.seek(max(0, f.seek(0, 2) - n))
+            return f.read().decode("utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
 def here() -> Project | None:
     """The project this process runs in (project.here)."""
     return project_here()
@@ -3792,6 +3802,13 @@ def cmd_checks(a) -> None:
         sys.exit(_checks_lane_status(bool(getattr(a, "json", False)) or "--json" in a.cmd))
     if getattr(a, "env_ok", None) is not None:
         sys.exit(_checks_env_ok(here(), a.env_ok))
+    if getattr(a, "spill_back", None):
+        from . import checkspill
+        if (p := here()) is None:
+            die("ttp checks --spill-back: not in a project")
+        was = checkspill.lift(p, a.spill_back)
+        print(f"ttp checks: spill host {a.spill_back} " + ("is back in the spill pool" if was else "was not quarantined"))
+        sys.exit(0)
     if getattr(a, "preempt", None):
         from . import checkcap, checklane
         p = here()
@@ -4206,7 +4223,7 @@ def cmd_checks(a) -> None:
         # taken out of the environment so no check command or later in-process run inherits it.
         wait_kept = os.environ.pop(_WAIT_KEPT_ENV, "")
         retry = _retry_ids_of(os.environ.pop(_RETRY_IDS_ENV, ""))
-        from . import checkjoin, checklane, checkspill
+        from . import checkjoin, checklane, checkspill, remotecheck
         # A rerun of checks that did not pass on a spill host keeps off that host (checkspill.kept_off);
         # "1" keeps them off every spill host.
         no_spill = os.environ.pop(checkspill.OFF_ENV, "")
@@ -4674,6 +4691,9 @@ def cmd_checks(a) -> None:
                                                 p.config() if env_why else None, cfg=p.config())
             if env_why:
                 checkspill.env_event(p.db, no_spill, p.config())
+            elif executed and not timed_out and rc != 75:   # a strike there if the head then passes elsewhere
+                out.flush()
+                checkspill.strike_fail(p, spilled.host, head, remotecheck.fail_sig(_log_tail(log), rc))
             said = (f"the checks did not pass on spill host {spilled.host} ({how}"
                     + (f": {env_why.partition(';')[0]}, a fault of the spill env, not the change" if env_why else "")
                     + "); running them again on this machine, whose result counts, or on a free spill host "
@@ -4857,6 +4877,8 @@ def cmd_checks(a) -> None:
                                                      **({"excused": excused, "landing_only": True} if excused else {}),
                                                      **({"release": True} if getattr(a, "release", False) else {}),
                                                      **_spent(spent0)})
+    if p and passed and executed and head:   # spill hosts whose runs of this head failed take a strike
+        checkspill.strike_settle(p, cfg, head, spilled.host if spilled else "")
     if join_rec:   # the outcome the runs that joined this one report (checkjoin)
         from . import checkjoin, trim
         checkjoin.finish(join_rec, passed=passed, head=head, rc=0 if passed else 1, failed=str(failed or ""),
@@ -14052,6 +14074,8 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--env-ok", nargs="*", metavar="SIG", default=None,
                    help="run nothing: exit 0 once the named environment faults (or, with none named, every "
                         "open one) no longer hit a missing check runner, 1 while one does")
+    s.add_argument("--spill-back", metavar="ALIAS",
+                   help="run nothing: end spill host ALIAS's quarantine (checkspill.strike_settle) and its strikes")
     s.add_argument("--slot-status", action="store_true",
                    help="run nothing (also `ttp checks status`): print each repository's checks lanes, their "
                         "holders (pid, task, run, age, alive) and the waiters in queue order; never queues")

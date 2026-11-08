@@ -1435,6 +1435,9 @@ def pick(p, cfg: dict, tell, what: str = "", off: str = "", why_here: str = "") 
         if alias in keep or host in keep:
             skipped.append(f"{alias} (these checks did not pass there in this run)")
             continue
+        if why := quarantined(p, alias):
+            skipped.append(f"{alias} ({why})")
+            continue
         beside = beside_device(cfg, alias)   # the project lets its checks run there beside a device job
         why = allowed(p, cfg, alias)
         usable = not why   # past `allowed`, a skip is the host being busy unless it is out of reach
@@ -1706,3 +1709,164 @@ def _unspilled(c: Any, was: Any) -> Any:
     if getattr(c, "spilled", False):
         c.was = was
     return c
+
+
+# Quarantine of a spill host whose own environment fails runs (#2226): model-free, per project.
+STRIKES_KV = "checks_spill_strikes"   # project state: each spill host's strikes, recent spilled failures, quarantines
+QUARANTINE_KEY = "spill_quarantine_after"   # checks.spill_quarantine_after: strikes in a row that take a host off
+QUARANTINE_AFTER = 3
+QUARANTINE_MAX_S = 6 * 3600   # a quarantine's end: its ledger entry's auto-undo (`ttp checks --spill-back`) runs then
+CONFIG_WINDOW_S = 3600   # one failure on CONFIG_FAULT_HOSTS hosts within this, no spilled pass between: a config fault
+CONFIG_FAULT_HOSTS = 2
+FAILS_KEPT = 100
+
+
+def quarantine_after_of(v: Any) -> int:
+    """checks.spill_quarantine_after as set: a whole number from 1, else ValueError."""
+    try:
+        n = int(str(v).strip())
+    except ValueError:
+        raise ValueError("checks.spill_quarantine_after is a whole number of strikes, 1 or more") from None
+    if n < 1 or isinstance(v, bool) or isinstance(v, float) and v != n:
+        raise ValueError("checks.spill_quarantine_after is a whole number of strikes, 1 or more")
+    return n
+
+
+def quarantine_after(cfg: dict | None) -> int:
+    """checks.spill_quarantine_after; unset or malformed: QUARANTINE_AFTER."""
+    checks = (cfg or {}).get("checks")
+    v = checks.get(QUARANTINE_KEY) if isinstance(checks, dict) else None
+    try:
+        return quarantine_after_of(v) if v is not None else QUARANTINE_AFTER
+    except ValueError:
+        return QUARANTINE_AFTER
+
+
+def _strikes(db) -> dict:
+    doc = db.kv(STRIKES_KV, {}) or {}
+    return doc if isinstance(doc, dict) else {}
+
+
+def _event(db, now: float, fp: str, severity: str, text: str) -> None:
+    db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status) VALUES(?,?,?,?,?,?,?)",
+         (now, "checks", "observation", fp, severity, text, "queued"))
+
+
+def strike_fail(p, host: str, head: str, sig: str, now: float | None = None) -> None:
+    """A spilled run of `head` failed on `host` (no host fault, no timeout) with failure signature `sig`
+    (remotecheck.fail_sig): kept until `head` passes elsewhere (strike_settle). Never raises."""
+    now = time.time() if now is None else now
+    try:
+        with p.db.tx():
+            doc = _strikes(p.db)
+            doc["fails"] = [*(f for f in doc.get("fails") or [] if isinstance(f, dict)),
+                            {"host": host, "head": head, "sig": (sig or "")[:200], "at": now}][-FAILS_KEPT:]
+            p.db.set_kv(STRIKES_KV, doc)
+    except Exception:   # a strike never stops the rerun
+        pass
+
+
+def strike_settle(p, cfg: dict | None, head: str, passed_on: str = "", now: float | None = None) -> list[str]:
+    """`head` passed (on spill host `passed_on`, else here). `passed_on`'s strikes reset. Each spill host whose
+    run of `head` failed (strike_fail) takes a strike, unless that failure's signature hit CONFIG_FAULT_HOSTS
+    hosts within CONFIG_WINDOW_S with no spilled pass between: a project-wide config fault (one incident, no
+    strike, those hosts' strikes reset). A host at quarantine_after strikes in a row is quarantined until
+    QUARANTINE_MAX_S (pick skips it), with one event and a machine ledger entry whose auto-undo lifts it.
+    Returns the hosts quarantined now. Never raises."""
+    now = time.time() if now is None else now
+    took, after = [], quarantine_after(cfg)
+    try:
+        with p.db.tx():
+            doc = _strikes(p.db)
+            hosts = doc.setdefault("hosts", {})
+            if passed_on:
+                hosts.setdefault(passed_on, {})["n"] = 0
+                doc["pass_at"] = now
+            fails = [f for f in doc.get("fails") or [] if isinstance(f, dict) and f.get("host")]
+            since = max(now - CONFIG_WINDOW_S, float(doc.get("pass_at") or 0))
+            seen = {k: v for k, v in (doc.get("incidents") or {}).items() if now - float(v or 0) < CONFIG_WINDOW_S}
+            for f in fails:
+                if f.get("head") != head or f.get("settled"):
+                    continue
+                f["settled"] = now
+                if f["host"] == passed_on:   # failed, then passed on the same host: no strike either way
+                    continue
+                sig = str(f.get("sig") or "")
+                same = {g["host"] for g in fails if g.get("sig") == sig and float(g.get("at") or 0) >= since}
+                if len(same) >= CONFIG_FAULT_HOSTS:
+                    for h in same:
+                        hosts.setdefault(h, {})["n"] = 0
+                    if sig not in seen:
+                        seen[sig] = now
+                        _event(p.db, now, f"spill-config:{sig[:80]}:{now:.0f}", "high",
+                               f"Spill config fault: spilled checks failed the same way on {len(same)} spill hosts "
+                               f"({', '.join(sorted(same))}: {sig or 'no error line'}) and passed on this machine, "
+                               "so the fault is the project's spill setup (checks.spill_wrap_cmd, its env), not the "
+                               "hosts: no host is quarantined. Fix the setting; the reruns here keep the verdicts right.")
+                    continue
+                h = hosts.setdefault(f["host"], {})
+                h["n"] = int(h.get("n") or 0) + 1
+                if h["n"] >= after and float((h.get("off") or {}).get("until") or 0) <= now:
+                    h["off"] = {"since": now, "until": now + QUARANTINE_MAX_S, "n": h["n"], "sig": sig}
+                    took.append(f["host"])
+                    _event(p.db, now, f"spill-quarantine:{f['host']}:{now:.0f}", "normal",
+                           f"Spill host {f['host']} quarantined: {h['n']} spilled runs in a row failed there and "
+                           f"passed elsewhere (last: {sig or 'no error line'}); its checks run elsewhere until "
+                           f"`ttp checks --spill-back {f['host']}` (its machine ledger entry's auto-undo).")
+            doc.update(fails=fails[-FAILS_KEPT:], incidents=seen)
+            p.db.set_kv(STRIKES_KV, doc)
+    except Exception:
+        return []
+    from . import machine_ledger
+    for host in took:   # the ledger's file lock, outside the db transaction
+        try:
+            c = machine_ledger.add_change(
+                host, f"spill host quarantined for {p.name}'s checks: its spilled runs fail where they pass "
+                      "elsewhere", f"ttp checks --spill-back {host}", p.name, expires=now + QUARANTINE_MAX_S,
+                auto_undo=True, queue=p.state, extra={"kind": "spill_quarantine"})
+            with p.db.tx():
+                doc = _strikes(p.db)
+                if (off := (doc.get("hosts") or {}).get(host, {}).get("off")) is not None:
+                    off["change"] = c.get("id")
+                    p.db.set_kv(STRIKES_KV, doc)
+        except Exception:   # not in the machines list, the ledger unwritable: the quarantine's end still holds
+            pass
+    return took
+
+
+def quarantined(p, alias: str, now: float | None = None) -> str:
+    """Why `alias` is quarantined for project `p`'s checks ("" when it is not)."""
+    from . import timefmt
+    now = time.time() if now is None else now
+    try:
+        off = (_strikes(p.db).get("hosts") or {}).get(alias, {}).get("off") or {}
+    except Exception:
+        return ""
+    if float(off.get("until") or 0) <= now:
+        return ""
+    return (f"quarantined: {off.get('n')} spilled runs in a row failed there and passed elsewhere; "
+            f"back with `ttp checks --spill-back {alias}`, by itself at {timefmt.clock(now=float(off['until']))}")
+
+
+def lift(p, alias: str, now: float | None = None) -> bool:
+    """`ttp checks --spill-back <alias>`: end `alias`'s quarantine (one event, its ledger entry closed) and its
+    strikes. True when it was quarantined. Safe to run twice."""
+    now = time.time() if now is None else now
+    with p.db.tx():
+        doc = _strikes(p.db)
+        h = (doc.get("hosts") or {}).get(alias)
+        off = h.pop("off", None) if isinstance(h, dict) else None
+        if not isinstance(h, dict):
+            return False
+        h["n"] = 0
+        p.db.set_kv(STRIKES_KV, doc)
+        if off:
+            _event(p.db, now, f"spill-back:{alias}:{now:.0f}", "normal",
+                   f"Spill host {alias} is back in {p.name}'s spill pool (its quarantine ended).")
+    if off and off.get("change"):
+        from . import machine_ledger
+        try:
+            machine_ledger.close_change(int(off["change"]), "spill host back", p.name, now, queue=p.state)
+        except (ValueError, OSError):   # closed already (by hand, or by the auto-undo running this)
+            pass
+    return bool(off)

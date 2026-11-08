@@ -46,6 +46,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
+from typing import Any
 
 from . import sshagent, tailnet
 
@@ -169,6 +170,19 @@ def fault(host: str, cmd: str, cwd: str, why: str = "") -> dict:
 
 
 _TOLD: dict = {}   # what this run has said once (its priority line)
+
+
+_ERROR_LINE = re.compile(r"\b([A-Z][A-Za-z0-9_]*(?:Error|Exception)\b:?[^\n]*)")
+_NOISE = re.compile(r"(?:/[^\s'\"]+)+|0x[0-9a-fA-F]+|\d+")
+
+
+def fail_sig(text: str, rc: Any = None) -> str:
+    """A failed check's signature from its output's tail: its last error line (`ModuleNotFoundError: No module
+    named 'yaml'`), paths and numbers cut so the same fault on two hosts reads the same; else `exit <rc>`.
+    The harness's own `ttp ...:` lines never count (checkspill.strike_settle tells a config fault by it)."""
+    hits = [m.group(1) for line in (text or "")[-65536:].splitlines()
+            if not line.lstrip().startswith("ttp ") for m in _ERROR_LINE.finditer(line)]
+    return _NOISE.sub("#", hits[-1]).strip()[:200] if hits else f"exit {rc}"
 
 
 def _say(msg: str) -> None:

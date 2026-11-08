@@ -4462,3 +4462,113 @@ def test_a_new_mirror_is_seeded_from_the_clone_on_the_host_that_checks_seed_name
     assert len(_rc_sent(said)) == 1 and _rc_sent(said)[0] < 0.05, said
     assert subprocess.run(["git", "-C", str(clone), "for-each-ref"], capture_output=True, text=True).stdout == before
     assert _rc_left(tmp_path) == []
+
+
+def _spill_events(p, text):
+    return [r["text"] for r in p.db.q("SELECT text FROM events") if text in r["text"]]
+
+
+def test_a_spill_host_whose_runs_fail_where_the_head_passes_elsewhere_is_quarantined_until_lifted(
+        env, tmp_path, monkeypatch):
+    """Strikes: a spilled failure counts against its host only once the same head passes elsewhere; a pass
+    there resets them; a head that never passes is no strike. At checks.spill_quarantine_after in a row the
+    host is quarantined: pick skips it, one event and one ledger entry (auto-undo `ttp checks --spill-back`);
+    lift puts it back with one event and closes the entry."""
+    from ttp import checkspill, machine_ledger
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a", "check-host-b"])
+    cfg = p.config()
+    sig = "OSError: no space left on device"
+
+    def strike(head, passed_on=""):
+        checkspill.strike_fail(p, "check-host-a", head, sig)
+        return checkspill.strike_settle(p, p.config(), head, passed_on)
+
+    def n(host="check-host-a"):
+        return checkspill._strikes(p.db)["hosts"].get(host, {}).get("n")
+
+    checkspill.strike_fail(p, "check-host-a", "h0", sig)   # the change's own failure: it never passes
+    assert checkspill.strike_settle(p, cfg, "other") == [] and n() is None
+    assert strike("h1") == [] and strike("h2") == [] and n() == 2
+    assert checkspill.strike_settle(p, cfg, "h3", passed_on="check-host-a") == [] and n() == 0, "a pass resets"
+    assert strike("h4") == [] and strike("h5") == [] and not checkspill.quarantined(p, "check-host-a")
+    assert strike("h6") == ["check-host-a"] and "quarantined: 3 spilled runs" in checkspill.quarantined(p, "check-host-a")
+    assert strike("h7") == [], "already off: no second change"
+    assert len(_spill_events(p, "Spill host check-host-a quarantined")) == 1
+    entry = [c for c in machine_ledger.changes(["check-host-a"]) if c.get("kind") == "spill_quarantine"]
+    assert len(entry) == 1 and entry[0]["auto_undo"] and entry[0]["undo"] == "ttp checks --spill-back check-host-a"
+    told = []
+    got = checkspill.pick(p, cfg, told.append, "pytest -q")
+    try:
+        assert got is not None and got.host == "check-host-b" and "check-host-a (quarantined" in told[0], told
+    finally:
+        got.close()
+    assert checkspill.lift(p, "check-host-a") is True and not checkspill.quarantined(p, "check-host-a")
+    assert checkspill.lift(p, "check-host-a") is False, "safe to run twice"
+    assert len(_spill_events(p, "Spill host check-host-a is back")) == 1
+    assert not [c for c in machine_ledger.changes(["check-host-a"]) if c.get("kind") == "spill_quarantine"]
+    assert n() == 0
+    p.set_config("checks.spill_quarantine_after", 1)
+    assert strike("h8") == ["check-host-a"], "checks.spill_quarantine_after"
+    assert checkspill.quarantine_after({"checks": {"spill_quarantine_after": 0}}) == 3
+    with pytest.raises(ValueError):
+        checkspill.quarantine_after_of("x")
+
+
+def test_a_failure_every_spill_host_shares_is_one_config_incident_and_quarantines_no_host(env, tmp_path, monkeypatch):
+    """The spill setup broke for all hosts (the pinned env lost: the same import error everywhere, passing here):
+    one high incident, no strike, no quarantine, however many runs; a second host failing differently, or a
+    pass on another spill host in between, is no config fault: strikes as before."""
+    from ttp import checkspill
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a", "check-host-b"])
+    cfg = p.config()
+    sig = "ModuleNotFoundError: No module named 'yaml'"
+    for i in range(5):
+        for host in ("check-host-a", "check-host-b"):
+            checkspill.strike_fail(p, host, f"h{i}", sig)
+        assert checkspill.strike_settle(p, cfg, f"h{i}") == []
+    hosts = checkspill._strikes(p.db)["hosts"]
+    assert all(not h.get("n") and not h.get("off") for h in hosts.values()), hosts
+    assert len(_spill_events(p, "Spill config fault")) == 1 and "No module named 'yaml'" in _spill_events(
+        p, "Spill config fault")[0]
+    p.set_config("checks.spill_quarantine_after", 1)
+    cfg = p.config()
+    checkspill.strike_settle(p, cfg, "x", passed_on="check-host-b")   # a spilled pass: the hosts work again
+    checkspill.strike_fail(p, "check-host-a", "g1", sig)
+    assert checkspill.strike_settle(p, cfg, "g1") == ["check-host-a"], "one host failing now is the host's fault"
+    checkspill.lift(p, "check-host-a")
+    checkspill.strike_fail(p, "check-host-a", "g2", "OSError: disk full")
+    checkspill.strike_fail(p, "check-host-b", "g2", "ImportError: libfoo")
+    assert sorted(checkspill.strike_settle(p, cfg, "g2")) == ["check-host-a", "check-host-b"], "different faults"
+
+
+def test_fail_sig_reads_the_last_error_line_without_paths_or_numbers():
+    from ttp import remotecheck
+    a = "E   ModuleNotFoundError: No module named 'yaml'\nImportError while loading conftest '/tmp/ttp-check.ab12/x.py'.\n" \
+        "E   ModuleNotFoundError: No module named 'yaml'\nttp checks: SomeError: ours\n"
+    assert remotecheck.fail_sig(a, 4) == "ModuleNotFoundError: No module named 'yaml'"
+    assert remotecheck.fail_sig("FAILED t.py::x - AssertionError: 12 != 3 in /h/a/b.py", 1) == \
+        remotecheck.fail_sig("FAILED t.py::x - AssertionError: 7 != 3 in /h/c/b.py", 1)
+    assert remotecheck.fail_sig("all quiet", 2) == "exit 2"
+
+
+def test_a_spilled_failure_strikes_its_host_once_the_run_passes_here_and_a_host_fault_does_not(
+        env, tmp_path, monkeypatch):
+    """`ttp checks`: a run failing on the spill host and passing here strikes that host (with the error line
+    as its signature); one the host's own fault ended (exit 75) strikes nothing."""
+    import threading
+    from ttp import checkspill, cli
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a"])
+    cmd = 'case "$PWD" in */ttp-check.*) echo "E   ModuleNotFoundError: No module named yaml"; exit 1;; esac'
+    p.set_config("delivery.push_checks", [cmd])
+    for fake, want in (({"FAKE_SSH_FAIL": "mktemp"}, None), ({}, 1)):
+        for k, v in fake.items():
+            monkeypatch.setenv(k, v)
+        lane = _spill_lane(p, repo)
+        threading.Timer(2.0, lane.close).start()
+        cli.main(["checks", "--fresh"])
+        for k in fake:
+            monkeypatch.delenv(k)
+        assert json.loads((run / "checks.json").read_text())["passed"] is True
+        doc = checkspill._strikes(p.db)
+        assert doc.get("hosts", {}).get("check-host-a", {}).get("n") == want, (fake, doc)
+    assert doc["fails"][-1]["sig"] == "ModuleNotFoundError: No module named yaml" and doc["fails"][-1]["settled"]

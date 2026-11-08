@@ -462,6 +462,8 @@ USER_SETTABLE = {
     "delivery.checks_remote_only": lambda v: "auto" if (r := checkspill.remote_only_of(v)) is None else r,
     # Spill hosts (or "*") the project lets its checks run on beside a device job (checkspill.beside_device).
     "checks.spill_beside_device": lambda v: checkspill.beside_of(v),
+    # Strikes in a row (spilled runs failing where the head passes elsewhere) that quarantine a spill host.
+    "checks.spill_quarantine_after": lambda v: checkspill.quarantine_after_of(v),
     # The files holding the version that `ttp push` bumps once above the tip, plus a changeset.
     "delivery.version_bump": lambda v: push.bump_of(v),
     # The daemon-owned push queue: reviews approve, the daemon pushes in batches, then runs after_push.
