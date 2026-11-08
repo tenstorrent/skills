@@ -1311,6 +1311,7 @@ class Daemon:
         self._unreviewed_swept = 0.0   # when sweep_unreviewed last ran
         self._unreviewed_at = 0   # the task sweep_unreviewed stopped at (time or budget): the next pass resumes after it
         self._unreviewed_every = float(REVIEW_SWEEP_EVERY_S)   # until its next pass (UNREVIEWED_BACKLOG_EVERY_S on a backlog)
+        self._unreviewed_why: dict[int, str] = {}   # urgent or owed tasks' last skip reason sweep_unreviewed logged
         self._continues_checked = 0.0   # when check_unqueued_continues last ran
         self._stale_checked = 0.0   # when check_stale_duplicates last ran
         self._supersede_checked = 0.0   # when stop_superseded last ran
@@ -18008,7 +18009,9 @@ class Daemon:
         recorded reason (superseded or rejected, a `no_push`, a diff all under push_exclude_paths, a
         head its PR carries, a push branch no push can reach, a landing `ttp landed` records). At most
         review.unreviewed_per_pass reviews per pass, only tasks updated within
-        review.unreviewed_max_age_h, and one head gets one review (_auto_review's own check).
+        review.unreviewed_max_age_h (or whose continuer was cancelled within it: the age runs from the later of
+        the two), and one head gets one review (_auto_review's own check). An urgent or owed task (an open
+        obligation's owner) left alone logs why, once per task per reason change.
         Every REVIEW_SWEEP_EVERY_S from the tick (UNREVIEWED_BACKLOG_EVERY_S after a pass cut short that
         queued a review: a backlog drains at more than two reviews per five minutes), and at once (`force`)
         in the blocker sweep's data pass; returns the tasks it queued a review for. The first pass after an upgrade (a runtime version
@@ -18036,6 +18039,7 @@ class Daemon:
             todo = db.q("SELECT * FROM tasks WHERE kind='code' AND status IN ('done','queued') AND branch IS NOT NULL "
                         "AND branch!='' AND updated>=? AND updated<=? ORDER BY id",
                         (now - age, now - UNREVIEWED_GRACE_S))
+            todo = self._late_continued(todo, now - age, now - UNREVIEWED_GRACE_S)
             self._count_unreviewed(todo)
             if not todo:
                 return []
@@ -18048,7 +18052,7 @@ class Daemon:
                           [r["id"] for r in reviews]) if reviews else []:
                 rows.setdefault(x["task"], []).append(x)
             covers: dict[int, set[int]] = {}
-            live = db.q("SELECT id, branch, labels FROM tasks WHERE status NOT IN (?,?,?)", TERMINAL_TASK_STATES)
+            live = db.q("SELECT id, kind, branch, labels FROM tasks WHERE status NOT IN (?,?,?)", TERMINAL_TASK_STATES)
             ref = landed._push_ref(self.p, self.p.root) if d.get("push_branch") else ""
             never = push.push_branch_problem(d["push_branch"], self.p.root, push.allow_protected(d)) \
                 if d.get("push_branch") and d.get("push_allowed", True) else ""
@@ -18069,8 +18073,13 @@ class Daemon:
                 break
             last = self._unreviewed_at = t["id"]   # kept if the step is stopped mid-task
             try:
-                if self._unreviewed_skip(t, reviews, rows, covers, code, live, ref, never,
-                                         0 if urgent.is_urgent(t) else waited, now):
+                why = self._unreviewed_skip(t, reviews, rows, covers, code, live, ref, never,
+                                            0 if urgent.is_urgent(t) else waited, now)
+                if why and self._unreviewed_why.get(t["id"]) != why and (
+                        urgent.is_urgent(t) or obligations.owned_open(db, t["id"])):
+                    self._unreviewed_why[t["id"]] = why
+                    log(self.p, f"task {t['id']}: {t['status']}, no review queued by the unreviewed sweep: {why}")
+                if why:
                     continue
                 review = self._auto_review(t, str(load_result(t["result"]).get("summary") or ""), add=True)
             except Exception as e:
@@ -18088,6 +18097,20 @@ class Daemon:
         else:
             self._unreviewed_at = 0   # an uncut pass leaves no place to resume at
         return done
+
+    def _late_continued(self, todo: list[dict], since: float, until: float) -> list[dict]:
+        """sweep_unreviewed's `todo` plus the done or queued code tasks with a branch whose own update is older
+        than `since` but whose continuer (its `continues:` label names them) was cancelled from `since` to
+        `until`: while that continuer was open it held their review ('an open task continues it'), so their
+        age runs from its cancel. In id order."""
+        db, have = self.p.db, {t["id"] for t in todo}
+        ids = {continues_id(x) for x in db.q("SELECT labels FROM tasks WHERE status='cancelled' AND labels LIKE ? "
+                                             "AND updated>=? AND updated<=?", ('%"continues:%', since, until))}
+        ids = sorted(i for i in ids - have if isinstance(i, int))
+        late = [r for i in range(0, len(ids), 500) for r in db.q(
+            "SELECT * FROM tasks WHERE kind='code' AND status IN ('done','queued') AND branch IS NOT NULL AND branch!='' "
+            "AND updated<? AND id IN (%s)" % ",".join("?" * len(ids[i:i + 500])), [since, *ids[i:i + 500]])]
+        return sorted(todo + late, key=lambda t: t["id"]) if late else todo
 
     def _count_unreviewed(self, todo: list[dict]) -> None:
         """Once per runtime version (KV_UNREVIEWED_COUNTED), log how many of sweep_unreviewed's tasks are done
@@ -18129,7 +18152,10 @@ class Daemon:
         # A task that waits on this one landing (a deploy or live check) carries none of its work: counted
         # as its continuation, a head no review lands would hold it forever.
         # Nor does one that stalls on the user or a long deferral (chaincap.hop_stall): the head is reviewed now.
-        if any(x["id"] != tid and (continues_id(x) == tid or x["branch"] == t["branch"])
+        # Nor a continuer working in the project root (_continuation_owner's rule): its review never covers this branch.
+        if any(x["id"] != tid and (continues_id(x) == tid and (worktree.gets_worktree(self.p, x.get("kind") or "")
+                                                               or worktree.carried_branch(db.task(x["id"]) or x))
+                                   or x["branch"] == t["branch"])
                and not self._waits_landing(x, tid) and not chaincap.hop_stall(db.task(x["id"]), now) for x in live):
             return "an open task continues it"
         if chaincap.split_head(t) and any(
@@ -18244,19 +18270,22 @@ class Daemon:
         result = load_result(row["result"]) if row and row["status"] not in TERMINAL_TASK_STATES else {}
         return result.get("status") == "waiting" and chaincap.waits_landing(result.get("retry_when"), tid)
 
-    def _continuation_owner(self, task: dict) -> dict | None:
+    def _continuation_owner(self, task: dict, fixes: bool = True) -> dict | None:
         """The open task, oldest first, that continues task `task` (its `continues:` label names it): the
         sole owner of its work from here, whose own finished work gets its own review. A review, a task
         that waits on `task` landing (it carries none of its work) and a stalled hop (chaincap.hop_stall)
         own nothing, nor does one that works in the project root (no worktree of its own: worktree.gets_worktree,
-        carried_branch), which never starts from its branch, so its review would not cover that work. None when
-        there is none."""
+        carried_branch), which never starts from its branch, so its review would not cover that work. With `fixes`
+        off (a failed review's path), an open fix of another review or of a PR (review_fix:, pr_fix: labels) owns
+        nothing either: that fix has its own re-review, so this failed review gets its own fix and re-review and
+        moves its dependents. None when there is none."""
         tid, now = task["id"], time.time()
         return next((x for x in self.p.db.q(
             "SELECT * FROM tasks WHERE kind!='review' AND status NOT IN (?,?,?) AND id!=? AND labels LIKE ? ORDER BY id",
             (*TERMINAL_TASK_STATES, tid, f'%"continues:{tid}"%'))
             if continues_id(x) == tid and not self._waits_landing(x, tid) and not chaincap.hop_stall(x, now)
-            and (worktree.gets_worktree(self.p, x["kind"]) or worktree.carried_branch(x))), None)
+            and (worktree.gets_worktree(self.p, x["kind"]) or worktree.carried_branch(x))
+            and (fixes or not any(lb.startswith(("review_fix:", "pr_fix:")) for lb in push._labels(x)))), None)
 
     def _stale_source(self, task: dict) -> str:
         """Why no review of task `task` may be queued now, read live from the records ('' when one may):
@@ -19257,7 +19286,7 @@ class Daemon:
             # no fix or re-review: its findings go to that owner, whose own work gets its own review.
             row = db.one("SELECT status FROM tasks WHERE id=?", (code["id"],))
             gone = bool(row and row["status"] == "cancelled")
-            owner = self._continuation_owner(code) if gone or not (prfix or hop) else None
+            owner = self._continuation_owner(code, fixes=False) if gone or not (prfix or hop) else None
             if gone or owner:
                 why = ("it was cancelled" if gone else "") + (" and " if gone and owner else "") \
                     + (f"open task #{owner['id']} continues it" if owner else "")

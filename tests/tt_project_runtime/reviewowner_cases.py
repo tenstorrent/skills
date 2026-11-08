@@ -188,3 +188,86 @@ def test_o424_a_done_code_task_whose_review_enqueue_timed_out_gets_its_review_fr
     assert d.sweep_unreviewed() == [tid]
     assert len(_owner_reviews_of(p, tid)) == 1 and branch in _owner_reviews_of(p, tid)[0]["spec"]
     assert d.sweep_unreviewed(force=True) == []
+
+
+def _owner_aged(p, tid, when):
+    p.db.x("UPDATE tasks SET updated=? WHERE id=?", (when, tid))
+    p.db.x("UPDATE runs SET ended=? WHERE task=?", (when, tid))
+
+
+def test_the_sweep_ignores_a_root_continuer_and_logs_an_urgent_tasks_skip_once_per_reason(env, monkeypatch):
+    """The unreviewed sweep's 'an open task continues it' skip follows _continuation_owner: a continuer that
+    works in the project root holds no review. An urgent task it leaves alone logs why once per reason, again
+    only when the reason changes; a routine task's skip logs nothing."""
+    from ttp import daemon as dm
+    p = _owner_project(env)
+    lines = []
+    monkeypatch.setattr(dm, "log", lambda proj, msg: lines.append(msg))
+    a, _ = _owner_unreviewed(env, p, "urgent swept")
+    p.db.update_task(a, priority=1)
+    _owner_aged(p, a, time.time() - 600)
+    c = p.db.add_task("carry it", "s", kind="code", origin="coordinator", labels=[f"continues:{a}"])
+    d = dm.Daemon(p.base)
+    assert d.sweep_unreviewed(force=True) == [] and not _owner_reviews_of(p, a)
+    held = [ln for ln in lines if f"task {a}:" in ln and "an open task continues it" in ln]
+    assert len(held) == 1, lines
+    assert d.sweep_unreviewed(force=True) == []
+    assert [ln for ln in lines if f"task {a}:" in ln and "no review queued" in ln] == held
+    # A routine task held the same way logs nothing.
+    b, _ = _owner_unreviewed(env, p, "routine swept")
+    _owner_aged(p, b, time.time() - 600)
+    p.db.add_task("carry b", "s", kind="code", origin="coordinator", labels=[f"continues:{b}"])
+    assert d.sweep_unreviewed(force=True) == [] and not [ln for ln in lines if f"task {b}:" in ln and "no review queued" in ln]
+    # The code continuer becomes a root-working one: it holds nothing, the urgent task is reviewed.
+    p.db.update_task(c, kind="work")
+    assert d.sweep_unreviewed(force=True) == [a] and len(_owner_reviews_of(p, a)) == 1
+
+
+def test_a_done_task_whose_continuer_was_cancelled_late_is_still_reviewed(env):
+    """A done code task older than review.unreviewed_max_age_h whose continuer held its review until it was
+    cancelled within that window gets its review: its age runs from the continuer's cancel. A continuer
+    cancelled long ago, or a task with no continuer, leaves an old task out of the window as before."""
+    from ttp.daemon import Daemon
+    p = _owner_project(env)
+    p.set_config("review.unreviewed_max_age_h", 2)
+    old = time.time() - 5 * 3600
+    a, _ = _owner_unreviewed(env, p, "held long")
+    _owner_aged(p, a, old)
+    c = p.db.add_task("carry held", "s", kind="code", origin="coordinator", labels=[f"continues:{a}"])
+    b, _ = _owner_unreviewed(env, p, "cancelled early")
+    _owner_aged(p, b, old)
+    e = p.db.add_task("carry early", "s", kind="code", origin="coordinator", labels=[f"continues:{b}"])
+    n, _ = _owner_unreviewed(env, p, "no continuer")
+    _owner_aged(p, n, old)
+    p.db.update_task(c, status="cancelled")
+    p.db.x("UPDATE tasks SET updated=? WHERE id=?", (time.time() - 600, c))
+    p.db.update_task(e, status="cancelled")
+    p.db.x("UPDATE tasks SET updated=? WHERE id=?", (old, e))
+    d = Daemon(p.base)
+    assert d.sweep_unreviewed(force=True) == [a]
+    assert len(_owner_reviews_of(p, a)) == 1 and not _owner_reviews_of(p, b) and not _owner_reviews_of(p, n)
+
+
+def test_a_second_failed_review_with_an_open_fix_gets_its_own_fix_and_re_review(env):
+    """An open fix of an earlier failed review (review_fix:) or of a PR (pr_fix: on another stack) continues
+    the code task, but owns no later failed review's findings: that fix has its own re-review, so the later
+    review gets its own fix and re-review and moves its dependents. A plain open continuer still takes the
+    findings (test (c) above)."""
+    from ttp.daemon import Daemon
+    p = _owner_project(env)
+    d = Daemon(p.base)
+    fups = [{"title": "bug", "spec": "fix it"}]
+    cid, branch, _, (rev,) = _finish_code(env, p, "twice", {"twice.py": 20})
+    p.db.update_task(rev["id"], status="failed")
+    fid, rrid, _ = d._fix_failed_review(p.db.task(rev["id"]), fups, "bug")
+    assert d._continuation_owner(p.db.task(cid))["id"] == fid
+    assert d._continuation_owner(p.db.task(cid), fixes=False) is None
+    # A second review of the same change fails while the first fix is still open, with a task waiting on it.
+    rev2 = p.db.add_task(f"Review #{cid}: twice again", f"Review branch {branch}.", kind="review",
+                         origin="coordinator", depends_on=[cid], labels=[f"auto_review:{cid}"])
+    dep = p.db.add_task("after twice", "s", kind="work", origin="coordinator", depends_on=[rev2])
+    p.db.update_task(rev2, status="failed")
+    out = d._fix_failed_review(p.db.task(rev2), [{"title": "other", "spec": "the second finding"}], "other")
+    assert out and out[0] != fid and dep in out[2], out
+    assert "the second finding" not in p.db.task(fid)["spec"]
+    assert f'"review_fix:{rev2}"' in p.db.task(out[0])["labels"]
