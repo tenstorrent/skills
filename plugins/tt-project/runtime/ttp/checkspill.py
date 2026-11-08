@@ -1744,7 +1744,10 @@ def quarantine_after(cfg: dict | None) -> int:
 
 def _strikes(db) -> dict:
     doc = db.kv(STRIKES_KV, {}) or {}
-    return doc if isinstance(doc, dict) else {}
+    doc = doc if isinstance(doc, dict) else {}
+    doc["hosts"] = {k: v for k, v in (doc.get("hosts") or {}).items() if isinstance(v, dict)} \
+        if isinstance(doc.get("hosts"), dict) else {}
+    return doc
 
 
 def _event(db, now: float, fp: str, severity: str, text: str) -> None:
@@ -1826,7 +1829,7 @@ def strike_settle(p, cfg: dict | None, head: str, passed_on: str = "", now: floa
                 auto_undo=True, queue=p.state, extra={"kind": "spill_quarantine"})
             with p.db.tx():
                 doc = _strikes(p.db)
-                if (off := (doc.get("hosts") or {}).get(host, {}).get("off")) is not None:
+                if (off := doc["hosts"].get(host, {}).get("off")) is not None:
                     off["change"] = c.get("id")
                     p.db.set_kv(STRIKES_KV, doc)
         except Exception:   # not in the machines list, the ledger unwritable: the quarantine's end still holds
@@ -1839,10 +1842,10 @@ def quarantined(p, alias: str, now: float | None = None) -> str:
     from . import timefmt
     now = time.time() if now is None else now
     try:
-        off = (_strikes(p.db).get("hosts") or {}).get(alias, {}).get("off") or {}
+        off = _strikes(p.db)["hosts"].get(alias, {}).get("off") or {}
+        if float(off.get("until") or 0) <= now:
+            return ""
     except Exception:
-        return ""
-    if float(off.get("until") or 0) <= now:
         return ""
     return (f"quarantined: {off.get('n')} spilled runs in a row failed there and passed elsewhere; "
             f"back with `ttp checks --spill-back {alias}`, by itself at {timefmt.clock(now=float(off['until']))}")
@@ -1854,10 +1857,11 @@ def lift(p, alias: str, now: float | None = None) -> bool:
     now = time.time() if now is None else now
     with p.db.tx():
         doc = _strikes(p.db)
-        h = (doc.get("hosts") or {}).get(alias)
+        h = doc["hosts"].get(alias)
         off = h.pop("off", None) if isinstance(h, dict) else None
         if not isinstance(h, dict):
             return False
+        off = off if isinstance(off, dict) else None
         h["n"] = 0
         p.db.set_kv(STRIKES_KV, doc)
         if off:

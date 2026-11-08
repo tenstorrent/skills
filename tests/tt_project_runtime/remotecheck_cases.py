@@ -4572,3 +4572,11 @@ def test_a_spilled_failure_strikes_its_host_once_the_run_passes_here_and_a_host_
         doc = checkspill._strikes(p.db)
         assert doc.get("hosts", {}).get("check-host-a", {}).get("n") == want, (fake, doc)
     assert doc["fails"][-1]["sig"] == "ModuleNotFoundError: No module named yaml" and doc["fails"][-1]["settled"]
+
+
+def test_spill_strikes_read_malformed_state_as_none(env, tmp_path, monkeypatch):
+    from ttp import checkspill
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a"])
+    for bad in ([1], {"hosts": [1]}, {"hosts": {"check-host-a": "x"}}, {"hosts": {"check-host-a": {"off": "x"}}}):
+        p.db.set_kv(checkspill.STRIKES_KV, bad)
+        assert checkspill.quarantined(p, "check-host-a") == "" and checkspill.lift(p, "check-host-a") is False
