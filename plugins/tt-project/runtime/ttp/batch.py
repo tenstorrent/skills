@@ -91,6 +91,8 @@ YIELD_WAIT_S = 900.0               # delivery.push_yield_wait_s: an urgent appro
 YIELD_RESTARTS = 0                 # delivery.push_yield_restarts: searches one set of approvals may stop for urgent ones (0: none, they join the next check)
 RERUN_IDS = 10                     # a check failing more tests than this is not rerun: that is no flake
 TIP_RERUNS = 3                     # reruns on the tip alone of a blamed failure's failing tests: one failing clears the entry
+TIP_RESEARCH = 3                   # searches run again in one round once the tip alone fails more tests (_research)
+HARD_TESTS = r"leak"               # delivery.push_hard_tests: failing test ids never excused as the tip's own (the leak scan)
 HOST_FAULTS = (envfault.Fault, workerloss.Infra, syntaxfault.Infra, setupfault.Infra)   # the host's, never an entry's
 CARRY_TRIES = 5                    # recorded passes of one check on other tips tried for a carry (verdictcarry)
 OVER = re.compile(r"^E\s+assert (\d[\d_]*) <= (\d[\d_]*)\s*$")   # pytest's size-over-cap line
@@ -1498,6 +1500,9 @@ class Batch:
         self.flaky: list[dict] = []            # failures whose tests passed on that rerun: {ids, head, cmd}
         self.pre_existing: list[dict] = []     # failures whose tests failed on the tip alone too: {ids, tip, cmd, entry, runs}
         self.fail_rc: dict[str, int] = {}      # a failed check's output tail -> its exit code (_tip_ids)
+        self.tip_bad: dict[str, set[str]] = {}  # tip -> test ids failing on it alone: pre-existing in this batch (_tip_excused)
+        self.researched = 0                    # searches run again in this round for those (_research, TIP_RESEARCH)
+        self.failed_runs: dict[tuple[str, str], tuple[int | None, str]] = {}   # (tree, check) -> a failed run (_check)
         self.yielded_to: list[int] = []        # queue ids of urgent approvals the search stopped for (_yield_now)
         self.checks_at: float | None = None    # when this batch's first check began (_check): the yield grace counts from it
         self.waited: list[int] = []            # urgent approvals that wait for this search's verdict (_yield_now)
@@ -1663,6 +1668,7 @@ class Batch:
         """One round on `tip`: replay, bump, check, push. "moved" when the tip moved meanwhile."""
         self.tip_passed = False
         self.tip_tried = 0
+        self.researched = 0
         self.rescued, self.retried = {}, False
         carried = self._replay(tip, checks)
         if not carried:
@@ -2308,10 +2314,16 @@ class Batch:
                     say(f"resuming {cmd}: {len(done)} test file(s) passed in an earlier run on tree {tree[:10]}; running the rest")
                 if push.remote_host(cmd):
                     say(f"running {cmd}{push.where(cmd)}")
-                rc, tail = self._run_check(cmd, {**env, **extra, **slot.env()}, env)
+                if self.researched and (reuse := self.failed_runs.pop((tree, str(cmd)), None)):
+                    rc, tail = reuse   # a search run again (_research) judges this tree's failed run again
+                    say(f"{head[:10]} failed {cmd} earlier in this batch (tree {tree[:10]}): judging that run again")
+                else:
+                    rc, tail = self._run_check(cmd, {**env, **extra, **slot.env()}, env)
+                    if fault := push.remote_fault(cmd, rc, self.wt):
+                        raise envfault.Fault(fault)   # the check host, not this head: push_phase holds the batch
+                    if rc != 0 and tree:
+                        self.failed_runs[(tree, str(cmd))] = (rc, tail)
                 suite_out.append(tail)
-                if fault := push.remote_fault(cmd, rc, self.wt):
-                    raise envfault.Fault(fault)   # the check host, not this head: push_phase holds the batch
                 if rc != 0:
                     say(f"check failed on {head[:10]}: {cmd}{push.where(cmd)}")
                     self.fail_rc[tail] = rc
@@ -2473,7 +2485,7 @@ class Batch:
         ids = self._rerun_ids(cmd, rc, tail)
         if not ids:
             return False
-        todo = [i for i in ids if (head, i) not in self.judged]
+        todo = [i for i in ids if (head, i) not in self.judged and i not in self._excused()]
         if todo:
             say(f"judging the {len(todo)} failing test(s) on {head[:10]}: a rerun there, then on the tip "
                 f"{(self.tip or '')[:10]} the ones failing again: {' '.join(todo)}")
@@ -2485,7 +2497,7 @@ class Batch:
                 say(line)
             for i in todo:
                 self.judged[(head, i)] = i in v["new"] or i in v["busy"]
-        new = [i for i in ids if self.judged[(head, i)]]
+        new = [i for i in ids if i not in self._excused() and self.judged[(head, i)]]
         if new:
             self.new_ids[tail] = new
             say(f"new on {head[:10]}, the failure stands: {' '.join(new)}")
@@ -2524,10 +2536,77 @@ class Batch:
         if v["flaky"] and s["on"]:
             gatejudge.quarantine(self.p.state, v["flaky"], {"head": head, "check": str(cmd), "host": where,
                                                             "batch": self.id}, now, s["days"])
+        if base and base == self.tip:
+            # The leak scan blocks even when the tip fails it too; any other test the tip fails on its own
+            # (another way than here, or here being the tip) is the tip's, not the batch's (_tip_excused).
+            hard = [i for i in v["pre_existing"] + v["quarantined"] if self._hard(i)]
+            v["pre_existing"] = [i for i in v["pre_existing"] if i not in hard]
+            v["quarantined"] = [i for i in v["quarantined"] if i not in hard]
+            v["new"] = v["new"] + hard
+            if hard:
+                say(f"the leak scan blocks even when the tip fails it too: {' '.join(hard)}")
+            own = v["other_failure"] if head != base else v["new"] + v["pre_existing"]
+            gone = set(self._tip_excused(base, [i for i in own if i not in v["busy"]], cmd,
+                                         "checked alone" if head == base else "another way than on this head"))
+            v["new"] = [i for i in v["new"] if i not in gone]
+            v["proven"] = [i for i in v["proven"] if i not in gone]
+            v["pre_existing"] = [i for i in v["pre_existing"] if i not in gone]
         if v["pre_existing"]:
             self.pre_existing.append({"ids": v["pre_existing"], "tip": base, "cmd": str(cmd), "entry": None,
                                       "head": head, "runs": self.tip_runs, "of": TIP_RERUNS})
         return v
+
+    def _hard(self, test_id: str) -> bool:
+        """A failing test never excused because the tip fails it too: delivery.push_hard_tests (HARD_TESTS, the
+        leak scan). plugin validate and every other check that is no plain pytest run have no ids, so they block."""
+        rx = self.d.get("push_hard_tests") or HARD_TESTS
+        try:
+            return bool(re.search(rx, test_id, re.I))
+        except (re.error, TypeError):
+            return bool(re.search(HARD_TESTS, test_id, re.I))
+
+    def _excused(self) -> set[str]:
+        """The test ids the round's tip fails on its own (_tip_excused): failing on a head, they block nothing."""
+        return self.tip_bad.get(self.tip or "", set())
+
+    def _tip_excused(self, tip: str, ids, cmd, why: str) -> list[str]:
+        """Test ids `ids` of check `cmd` failed on `tip` alone: those not yet known and not hard (_hard) are
+        pre-existing for this batch (self.tip_bad, the marker's pre_existing, one log line): no entry is blamed
+        for them and they block no push. A test failing on a head and passing on the tip still blocks.
+        Returns the ids added."""
+        new = [i for i in sorted({str(i) for i in ids or []} - self.tip_bad.get(tip, set())) if not self._hard(i)]
+        if not new:
+            return []
+        self.tip_bad.setdefault(tip, set()).update(new)
+        self.pre_existing.append({"ids": new, "tip": tip, "cmd": str(cmd), "entry": None, "tip_alone": why,
+                                  "runs": self.tip_runs, "of": TIP_RERUNS})
+        say(f"pre-existing in this batch: the tip {tip[:10]} fails these tests on its own ({why}), so no entry "
+            f"is blamed for them and they block no push: {' '.join(new)}")
+        return new
+
+    def _research(self, tip: str, before: set[str], tf: tuple[str, str] | None = None, why: str = "") -> bool:
+        """The search reached the tip failing on its own. Its failing tests in `tf` (cmd, output tail) become
+        the tip's (_tip_excused). True when the tip's own tests grew since `before` and fewer than TIP_RESEARCH
+        searches ran again this round: _judge then searches again with them excused, each failed run of a
+        tree judged again once (_check), not run again. False: the batch ends tip_failed (a hard or non-pytest
+        failure, or nothing new)."""
+        if tf is not None:
+            self._tip_excused(tip, self._rerun_ids(tf[0], self.fail_rc.get(tf[1]), tf[1]), tf[0], why)
+        if not self._excused() - before or self.researched >= TIP_RESEARCH:
+            return False
+        self.researched += 1
+        self.tip_tried = 0
+        say(f"searching again with the tip's own failing tests excused ({self.researched} of {TIP_RESEARCH})")
+        return True
+
+    def _known_excused(self, tip: str, known: dict) -> bool:
+        """A tip the queue knows fails on its own (pushq._known_bad) only in the test ids it recorded, none
+        hard: those are the tip's own in this batch (_tip_excused) and the tip is searched as any other."""
+        ids = [str(i) for i in known.get("ids") or [] if i]
+        if not ids or any(self._hard(i) for i in ids) or not pushpass.resumable(str(known.get("cmd") or "")):
+            return False
+        self._tip_excused(tip, ids, known.get("cmd"), "in earlier batches")
+        return True
 
     def _ids_check(self, head: str, fail: tuple[str, str], ids: list[str]) -> tuple[str, str] | bool | None:
         """A split probe of `head`: only the tests `ids` new in failure `fail` (_judged), not its whole suite.
@@ -2674,6 +2753,10 @@ class Batch:
         is broken (tip_failed); passing every time, entry 1 is blamed; only when that cannot tell is the
         tip checked alone in full. For a later entry: failing there once, the failure is pre-existing
         (_pre_existing): the prefix that passed goes and nothing is blamed; else it is blamed as before.
+        Each test the tip fails on its own (its rerun, its check alone, or a judge's base run that failed
+        it another way) is pre-existing in the whole batch (_tip_excused), except the leak scan (_hard):
+        when the search reaches the tip failing on its own and such tests were added, it runs again with
+        them excused (_research) instead of ending tip_failed.
 
         A tip the queue knows fails on its own (the marker's "bad_tip", pushq._known_bad) is never
         checked alone again: no prefix passes unless it fixes the tip. The prefix of entries not yet
@@ -2689,7 +2772,8 @@ class Batch:
         check of any head that breaks one. A full failure of that prefix searches below it in full."""
         m = len(carried)
         known = self.m.get("bad_tip") if isinstance(self.m.get("bad_tip"), dict) else {}
-        bad = known.get("tip") == tip
+        bad = known.get("tip") == tip and not self._known_excused(tip, known)
+        before = set(self._excused())
         lo, hi = 0, m
         capped = not bad and m > 1 and isinstance(cap := self._caps(heads[m], checks, carried[m - 1][1]), tuple)
         if capped:
@@ -2784,6 +2868,8 @@ class Batch:
             if tf is True:
                 say(f"they pass on the tip {tip[:10]}: the failure is entry 1's own")
                 return 0, None, fails[1]
+            if self._research(tip, before, tf, "its failing tests rerun on it"):
+                return self._judge(tip, carried, heads, checks)
             self.message = f"the tip of {self.target} fails its checks on its own: {tf[0]} (its failing tests rerun on it)"
             say(self.message)
             self.detail_tip = {"cmd": tf[0], "tail": tf[1]}
@@ -2792,7 +2878,10 @@ class Batch:
             return 0, None, None
         if hi == 1:
             say(f"checking the tip {tip[:10]} alone")
-            if (tf := self._check(tip, checks)) is not None:
+            tf = self._check(tip, checks)
+            if self._research(tip, before, tf, "checked alone"):
+                return self._judge(tip, carried, heads, checks)
+            if tf is not None:
                 self.message = f"the tip of {self.target} fails its checks on its own: {tf[0]}"
                 say(self.message)
                 self.detail_tip = {"cmd": tf[0], "tail": tf[1]}

@@ -1360,7 +1360,8 @@ def _known_bad(db, rows: list[dict]) -> dict | None:
         return None
     tried = set(bad.get("tried") or [])
     fresh = next((n for n, r in enumerate(rows) if r["id"] in tried), len(rows))
-    return {"tip": bad["tip"], "fresh": fresh, "cmd": bad.get("cmd")}
+    return {"tip": bad["tip"], "fresh": fresh, "cmd": bad.get("cmd"),
+            "ids": [str(i) for i in bad.get("ids") or []] if isinstance(bad.get("ids"), list) else []}
 
 
 def bad_tip_ids(db) -> list[str]:
