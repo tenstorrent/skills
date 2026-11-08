@@ -134,6 +134,7 @@ from . import hostrun
 from . import userorder
 from . import turnrules
 from .db import (
+    DB,
     PAUSE_REMOVED_KIND,
     PAUSED_RESOURCES_KEY,
     SEVERITY_RANK,
@@ -2941,7 +2942,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 try:   # a spec missing its order's words or the earlier findings: a note, never a refusal
                     notes.extend(ctxblock.spec_notes(p, new_id))
                 except Exception as e:
-                    log(p, f"task_add #{new_id}: context check failed: {type(e).__name__}: {e}")
+                    notes.append(f"task_add #{new_id}: context check failed: {type(e).__name__}: {str(e)[:200]}")
                 if followup:
                     notes.append(f"task_add: #{followup['id']} is done; added #{new_id} as its follow-up")
                 if pub:

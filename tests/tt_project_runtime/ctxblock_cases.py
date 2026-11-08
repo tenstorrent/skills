@@ -217,6 +217,28 @@ def test_task_add_notes_a_spec_missing_its_orders_words_and_earlier_findings(env
     assert ctxblock.spec_notes(p, named) == []
 
 
+def test_task_add_context_check_failure_adds_the_task_with_a_note(env, monkeypatch):
+    # A failing spec_notes is a note on the added task, never a NameError that rejects the task_add.
+    from ttp import coordinator as coord, ctxblock
+    p = make(env)
+
+    def boom(p, tid):
+        raise RuntimeError("records unreadable")
+    monkeypatch.setattr(ctxblock, "spec_notes", boom)
+    assert coord.apply(p, [{"type": "task_add", "title": "context check breaks", "kind": "code",
+                            "spec": "Build it."}]) == []
+    new = p.db.one("SELECT id FROM tasks WHERE title='context check breaks'")["id"]
+    notes = p.db.kv(coord.NOTES_KEY, [])
+    assert any(f"task_add #{new}: context check failed: RuntimeError: records unreadable" in n
+               for n in notes), notes
+
+
+def test_coordinator_annotations_resolve():
+    # Every name an annotation uses is imported: _false_login_ask's `db: DB` resolves.
+    import typing
+    from ttp import coordinator as coord
+    assert typing.get_type_hints(coord._false_login_ask)["db"].__name__ == "DB"
+
 def test_audit_counts_context_gaps_from_hand_offs(env):
     from ttp import audit
     p = make(env)
