@@ -245,6 +245,7 @@ class Babysitter:
         wrapped Jev, or answers None when Jev is off (the caller's no-answer path)."""
         wake_only = bool(questions) and all(isinstance(q, dict) and q.get("type") == "noul"
                                             for q in questions.values())
+        unparsed = False
         if wake_only and self._chat_on():
             try:
                 out = {}
@@ -259,7 +260,8 @@ class Babysitter:
                 self.last_cost = 0.0
                 return out
             except Exception as e:   # down, cut off or malformed: cool down, say so, fall back
-                if not isinstance(e, Unparsed):
+                unparsed = isinstance(e, Unparsed)
+                if not unparsed:
                     self.pause.until = time.time() + COOL_S
                 self.fell_back(purpose, f"{type(e).__name__}: {e}")
         elif wake_only and settings(self.cfg) is not None:
@@ -271,6 +273,9 @@ class Babysitter:
         if not wake_only:
             self.last_cost = 0.0
             return None
+        if unparsed:   # the endpoint answered, but nothing it said settles: a wake (logged above)
+            self.last_cost = 0.0
+            return {name: {"noul": 1.0} for name in questions}
         raise Unavailable("chat provider down and Jev off")
 
 
