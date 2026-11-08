@@ -411,7 +411,7 @@ def _py_refusal(code: str, ctx, fed: str | None = None):
         """For an open-like call: whether it writes (None: not one)."""
         if _py_leaf(n.func) not in PY_OPENERS:
             return None
-        own = isinstance(n.func, ast.Attribute) and not is_mod(n.func.value)   # Path(p).open('w')
+        own = isinstance(n.func, ast.Attribute) and not is_mod(n.func.value)   # a path's own open method, mode first
         modes = n.args[0 if own else 1:][:1] + [k.value for k in n.keywords if k.arg in ("mode", "flags", None)]
         return any(not isinstance(m, ast.Constant) or isinstance(m.value, str) and MODE_RE.fullmatch(m.value)
                    for m in modes)
@@ -463,7 +463,7 @@ def _py_refusal(code: str, ctx, fed: str | None = None):
             if (w := opens(n)) is not None:
                 path = [k.value for k in n.keywords if k.arg in ("file", "path", "name")] + n.args[:0 if recv else 1]
                 targets = [recv] + path if w else []
-            elif name in PY_DATA_WRITES and recv is not None:   # f.write(data), p.write_text(data)
+            elif name in PY_DATA_WRITES and recv is not None:   # data writes: the file or path object is the target
                 targets = [recv]
             elif name == "print":
                 targets = [k.value for k in n.keywords if k.arg == "file"]
