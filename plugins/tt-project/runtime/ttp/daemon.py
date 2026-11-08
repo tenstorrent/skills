@@ -376,9 +376,11 @@ def precheck_run_id(out: Path) -> str:
     so labels built from it (checkcap.label) name the folder, as checklane.open_precheck reads them."""
     return f"precheck-{Path(out).name}"
 PRECHECK_HOLD_S, PRECHECK_KEEP_S = 3600, 7 * 86400
-# A failed review with fix specs gets its fix and re-review from the daemon this many rounds per stack;
-# the re-review repeats the failed review's spec (its push and after-push steps) up to this length.
-AUTO_FIX_ROUNDS, REVIEW_FIX_SPEC_CHARS = 2, 8000
+# A failed review with fix specs gets its fix and re-review from the daemon this many rounds per stack
+# (review.auto_fix_rounds, unset or unreadable): one, so a failed re-review (a third round) goes to the
+# coordinator as one review_nofix event instead of being queued; the re-review repeats the failed
+# review's spec (its push and after-push steps) up to this length.
+AUTO_FIX_ROUNDS, REVIEW_FIX_SPEC_CHARS = 1, 8000
 FIX_BASE_LABEL = "fix_base:"   # a re-review: fix_base:<the head its failed review saw>; its fix must add commits to it
 # The daemon's review spec embeds the code task's spec and hand-off, then this line; its own steps
 # follow it. A re-review reads the first review's `ttp push --own` step only there, as this sentence.
@@ -667,6 +669,7 @@ UNREVIEWED_MAX_AGE_H = 72      # review.unreviewed_max_age_h: tasks last updated
 UNREVIEWED_GRACE_S = 120       # a task updated more recently than this is still settling
 UNREVIEWED_WAIT_S = 1800.0     # review.unreviewed_wait_s: an external wait (a busy lock too) this long gets its head reviewed
 UNREVIEWED_PASS_S = 20         # the pass stops looking after this long, so the tick stays short
+KV_UNREVIEWED_COUNTED = "unreviewed_counted"   # kv: the runtime version whose first sweep logged its count
 PUSH_REFS_EVERY_S = 600   # how often the push queue's pins (refs/ttp/push/<id>) of settled rows are pruned
 
 
@@ -15953,7 +15956,9 @@ class Daemon:
         review.unreviewed_per_pass reviews per pass, only tasks updated within
         review.unreviewed_max_age_h, and one head gets one review (_auto_review's own check).
         Every REVIEW_SWEEP_EVERY_S from the tick, and at once (`force`) in the blocker sweep's data
-        pass; returns the tasks it queued a review for."""
+        pass; returns the tasks it queued a review for. The first pass after an upgrade (a runtime version
+        it has not counted for: KV_UNREVIEWED_COUNTED) also logs how many done code tasks in the window
+        have no landing, push-queue entry or superseded record, so a backlog of finished changes shows."""
         now = time.time()
         if not force and now - self._unreviewed_swept < REVIEW_SWEEP_EVERY_S:
             return []
@@ -15976,6 +15981,7 @@ class Daemon:
             todo = db.q("SELECT * FROM tasks WHERE kind='code' AND status IN ('done','queued') AND branch IS NOT NULL "
                         "AND branch!='' AND updated>=? AND updated<=? ORDER BY id",
                         (now - age, now - UNREVIEWED_GRACE_S))
+            self._count_unreviewed(todo)
             if not todo:
                 return []
             code = pushq.BranchIndex(db.q("SELECT id, branch, labels FROM tasks WHERE kind='code' "
@@ -16017,6 +16023,23 @@ class Daemon:
                       f"#{t['id']} {headline.clip(t['title'], 160)}: its commits had no review and were not landed; "
                       f"review #{review[0]} queued by the daemon.", "handled", t["id"]))
         return done
+
+    def _count_unreviewed(self, todo: list[dict]) -> None:
+        """Once per runtime version (KV_UNREVIEWED_COUNTED), log how many of sweep_unreviewed's tasks are done
+        with no landing, push-queue entry or superseded record: the backlog its passes work through."""
+        from . import __version__
+        db = self.p.db
+        if db.kv(KV_UNREVIEWED_COUNTED) == __version__:
+            return
+        ids = [t["id"] for t in todo if t["status"] == "done"]
+        held = {r["task"] for i in range(0, len(ids), 500) for r in db.q(
+            "SELECT task FROM task_superseded WHERE task IN ({0}) UNION SELECT task FROM task_landings WHERE task IN ({0}) "
+            "UNION SELECT task FROM push_queue WHERE task IN ({0})".format(",".join("?" * len(ids[i:i + 500]))),
+            ids[i:i + 500] * 3)}
+        log(self.p, f"unreviewed sweep, first pass at {__version__}: {len(set(ids) - held)} done code task(s) in the "
+                    f"window have no landing, push-queue entry or superseded record; each without a review gets "
+                    f"one, review.unreviewed_per_pass per pass")
+        db.set_kv(KV_UNREVIEWED_COUNTED, __version__)
 
     def _unreviewed_skip(self, t: dict, reviews: list[dict], rows: dict, covers: dict, code, live: list[dict],
                          ref: str, never: str, waited: float, now: float) -> str:
@@ -16976,7 +16999,7 @@ class Daemon:
         """A review that failed with fix specs, handled the way the coordinator would: one code task
         fixes them all on top of the reviewed branch, and a re-review that waits on it takes over the
         failed review's dependents: (fix id, re-review id, the dependents moved). None when auto
-        reviews are off, the review covers no single code branch, AUTO_FIX_ROUNDS reviews of this
+        reviews are off, the review covers no single code branch, review.auto_fix_rounds reviews of this
         stack already failed, a task cap is reached or a task already continues it: the coordinator
         then decides, and the dependents are blocked as before. Why no fix was queued is left in
         self._nofix ('' when nothing needs raising: auto reviews off, a task already continues it,
@@ -17002,8 +17025,12 @@ class Daemon:
         if db.one("SELECT id FROM tasks WHERE labels LIKE ? OR (title LIKE ? AND status!='cancelled')",
                   (f'%"continues:{review["id"]}"%', f'Fix review #{review["id"]}:%')):
             return None
-        if rounds > AUTO_FIX_ROUNDS:
-            self._nofix = f"{rounds} reviews of this stack failed (the daemon fixes at most {AUTO_FIX_ROUNDS} rounds)"
+        try:
+            cap = int((cfg.get("review") or {}).get("auto_fix_rounds", AUTO_FIX_ROUNDS))
+        except (TypeError, ValueError):
+            cap = AUTO_FIX_ROUNDS
+        if rounds > cap:
+            self._nofix = f"{rounds} reviews of this stack failed (the daemon fixes at most {cap} round(s))"
             return None
         if coord.next_task_slot(db, coord.task_cap(cfg)) is not None \
                 or coord.next_task_slot(db, coord.task_cap(cfg, True), review=True) is not None:

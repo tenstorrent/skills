@@ -15281,13 +15281,14 @@ def test_a_failed_review_with_no_fix_follow_ups_gets_no_fix_or_re_review_and_one
     assert only["id"] == ev["id"] and "No automatic fix: it proposed no fix follow-ups" in only["text"]
 
 
-def test_a_third_failed_review_round_gets_no_fix_or_re_review_and_one_nofix_event(env):
-    from ttp.daemon import AUTO_FIX_ROUNDS
+def test_a_failed_re_review_gets_no_third_round_only_one_nofix_event(env):
+    """A third review round on the same change goes to the coordinator as one event: the first failed
+    review gets its fix and re-review, a failed re-review gets neither."""
     p = make(env)
     p.set_config("review.area_fail_cap", 10)   # the round cap alone, not the area cap
     _, _, _, (rev,) = _finish_code(env, p, "feature", {"a.py": 40})
     rid = rev["id"]
-    for n in range(AUTO_FIX_ROUNDS):
+    for n in range(1):
         _fail_review(env, p, rid, [{"title": f"bug {n}", "spec": f"fix bug {n}"}])
         fid, rid = _fix_and_re_review(p, rid)
         _hop(env, p, fid, {f"fix{n}.py": 3}, {"status": "done", "summary": f"fixed bug {n}"})
@@ -15296,7 +15297,7 @@ def test_a_third_failed_review_round_gets_no_fix_or_re_review_and_one_nofix_even
     assert p.db.one("SELECT COUNT(*) n FROM tasks")["n"] == tasks, "a fix or re-review past the round cap"
     from ttp import deadwait
     nofix = [e for e in _review_events(p, rid) if e["kind"] == deadwait.NOFIX_EVENT]
-    assert len(nofix) == 1 and f"{AUTO_FIX_ROUNDS + 1} reviews of this stack failed" in nofix[0]["text"]
+    assert len(nofix) == 1 and "2 reviews of this stack failed" in nofix[0]["text"]
 
 
 def test_a_failed_review_at_the_review_area_cap_gets_no_fix_or_re_review_and_one_area_event(env):

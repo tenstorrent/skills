@@ -336,7 +336,9 @@ only in the feed and never under "needs you".
   a low feed line, at most `review.unreviewed_per_pass` (default: the project's
   `budget.max_parallel_workers`, 0 off) per pass, for tasks
   updated within `review.unreviewed_max_age_h` (default 72); it runs every 5 minutes and in the
-  blocker sweep, reads local refs only, and never queues a second review of one head. A code task still in review
+  blocker sweep, reads local refs only, and never queues a second review of one head. Its first pass
+  after an upgrade logs how many done code tasks in that window have no landing, push-queue entry
+  or superseded record, so a backlog of finished changes shows. A code task still in review
   with no review `review.sweep_after_s` (default 300, 0 off) after its last run gets its review
   from the daemon. The sweep only queues reviews and never closes a task, so a task whose
   continuation already passed review still gets its own review (one review each, no work lost).
@@ -372,8 +374,9 @@ only in the feed and never under "needs you".
   follow-ups gets one fix task on the reviewed branch and a re-review from the daemon, and the
   tasks waiting on the failed review wait on the re-review instead of being blocked. The re-review
   depends on the fix; a fix that ends with no new commits on the reviewed head blocks it and wakes
-  the coordinator, so the same head is never re-reviewed (at most two
-  rounds per stack; a failure without fix follow-ups still blocks them, and `upstream:` notes and
+  the coordinator, so the same head is never re-reviewed (`review.auto_fix_rounds`, default 1,
+  rounds per stack: a failed re-review, which would start a third review round, goes to the
+  coordinator as one `review_nofix` event instead of being queued; a failure without fix follow-ups still blocks them, and `upstream:` notes and
   deferred follow-ups stay with the coordinator). Across stacks, once `review.area_fail_cap` (3; 0
   off) reviews of one area failed within 48 h (a lineage linked by `continues`, follow-ups,
   `depends_on` and `Review #N` / `Fix review #N` titles, or overlapping changes to the same main file), the
@@ -385,6 +388,10 @@ only in the feed and never under "needs you".
   project may word the rule that way. The rule sits in its own block of `prompts/kind-review.md`,
   between `<!-- ttp:result-rule -->` marker lines the prompt leaves out: a project that rewords it
   keeps its wording through template upgrades without merge conflicts.
+- A review judges the diff plus the gate results that already exist for the head it reviews, and
+  never starts or waits on a repeat of a test that passed on that head: a further test it wants is a
+  finding, and its verdict still goes out. Only the required checks (the suite and any smoke test)
+  and the review's verdict hold a landing (`prompts/kind-review.md`, `prompts/kind-code.md`).
 - A failed or `changes_needed` review is closed as superseded, keeping its verdict: automatically,
   model-free, once a later re-review in its chain passes; or by hand with
   `ttp task <project> superseded <id> --by-review <passed re-review id>` or
@@ -2983,6 +2990,7 @@ is open raises one `cap_wait` event naming the key.
 |---|---|---|---|
 | `device.max_tasks` | one per device resource, at most the worker slots, at least 2 (old: 2) | device tasks preparing at once | convenience |
 | `review.unreviewed_per_pass` | `budget.max_parallel_workers` (old: 2) | reviews the backstop sweep queues per pass | convenience |
+| `review.auto_fix_rounds` | 1 (old: 2) | daemon-queued fix and re-review rounds per stack before the coordinator decides | convenience |
 | `review.sweep_after_s` | 300 s (old: 1800) | a code task left in review before its review is queued | convenience |
 | `review.unreviewed_wait_s` | 1800 s | a code task waiting externally (a busy lock too) before the backstop reviews its head | convenience |
 | review sweep cadence (`REVIEW_SWEEP_EVERY_S`) | 300 s | how often both review sweeps look | convenience |

@@ -49,6 +49,8 @@
 - Only when the delivery policy line says "code tasks may land on <branch> with ttp push=True"
   AND your spec asks you to land on that branch. Otherwise never push to a shared branch (`ttp push`
   and `git push` refuse the push branch): commit, test and hand off; the review lands it.
+- A landing waits only on the required checks (the suite and any smoke test) and the review's
+  verdict. A test that already passed on the head is never repeated for it.
 - Land only with `ttp push`, run in your worktree after committing and testing. NEVER use
   `git push` to a shared branch. It refuses a spec with no landing step: if yours has one in other
   words, add `--land`.

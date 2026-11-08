@@ -594,6 +594,19 @@ def test_review_lists_every_blocking_finding_and_fixes_test_each_bug_class():
     assert "test each class of bug found, not only the reported case" in code
 
 
+def test_reviews_and_landings_never_wait_on_a_repeat_of_a_passed_test():
+    """A review judges the diff plus the gate results for its head and never waits on a repeat of a
+    passed test; only the required checks and the verdict hold a landing."""
+    prompts = PLUGIN / "template" / "prompts"
+    review = " ".join((prompts / "kind-review.md").read_text(encoding="utf-8").split())
+    assert "Judge the diff plus the gate results that already exist for the head you review" in review
+    assert "Never start or wait on a repeat of a test that already passed on that head" in review
+    assert "a further test you want is a finding in your verdict, and the verdict still goes out" in review
+    assert "Only the required checks and your verdict hold a landing." in review
+    code = " ".join((prompts / "kind-code.md").read_text(encoding="utf-8").split())
+    assert "A landing waits only on the required checks (the suite and any smoke test) and the review's verdict." in code
+
+
 
 def test_code_workers_get_the_exact_checks_commands_and_no_unconditional_pytest_n():
     """The code prompt names each `ttp checks` form a worker needs (start, detached, result probe, the

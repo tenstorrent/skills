@@ -24,6 +24,7 @@ def test_a_priority_1_change_keeps_priority_1_through_review_fix_and_re_review(e
     from ttp import chainprio
     from ttp.daemon import Daemon
     p = make(env)
+    p.set_config("review.auto_fix_rounds", 2)   # a project that allows a second automatic round
     _with_origin(env, clone=False)
     cid, rev, fix, rr = _failed_chain(env, p, 1)
     assert [rev["priority"], fix["priority"], rr["priority"]] == [1, 1, 1], (rev, fix, rr)

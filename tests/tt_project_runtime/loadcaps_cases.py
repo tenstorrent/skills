@@ -48,6 +48,27 @@ def test_the_unreviewed_sweep_queues_one_review_per_worker_slot_by_default(env):
     assert dm.Daemon(p.base).sweep_unreviewed(force=True) == more[1:]
 
 
+def test_the_first_unreviewed_sweep_after_an_upgrade_logs_its_backlog_once(env):
+    """The first pass at a runtime version logs how many done code tasks have no landing, push-queue
+    entry or superseded record (a task the queue holds is not one); later passes and restarts at the
+    same version log nothing more, and an upgrade counts again."""
+    from ttp import daemon as dm
+    p = make(env)
+    p.set_config("review.unreviewed_per_pass", 1)
+    tids = [_unreviewed(env, p, f"change {i}")[0] for i in range(3)]
+    p.db.x("INSERT INTO push_queue(task, branch, head, target, status, created, updated) VALUES(?,?,?,?,?,?,?)",
+           (tids[0], p.db.task(tids[0])["branch"], "0" * 40, "origin/main", "approved", time.time(), time.time()))
+    log = lambda: (p.logs / "daemon.log").read_text() if (p.logs / "daemon.log").exists() else ""
+    dm.Daemon(p.base).sweep_unreviewed(force=True)
+    counted = [ln for ln in log().splitlines() if "unreviewed sweep, first pass" in ln]
+    assert len(counted) == 1 and "2 done code task(s)" in counted[0], counted
+    dm.Daemon(p.base).sweep_unreviewed(force=True)
+    assert log().count("unreviewed sweep, first pass") == 1, "a restart at the same version counted again"
+    p.db.set_kv(dm.KV_UNREVIEWED_COUNTED, "0.0.1")
+    dm.Daemon(p.base).sweep_unreviewed(force=True)
+    assert log().count("unreviewed sweep, first pass") == 2, "an upgrade did not count"
+
+
 def test_device_max_tasks_is_derived_from_the_projects_devices_and_worker_slots(env):
     from ttp import loadcaps
     from ttp.daemon import Daemon

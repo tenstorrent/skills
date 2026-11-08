@@ -32026,6 +32026,7 @@ def test_a_passed_review_names_its_consumers_for_a_spec_only_update(env):
 
 def test_a_failed_review_with_fixes_moves_its_dependents_onto_the_re_review(env):
     p = make(env)
+    p.set_config("review.auto_fix_rounds", 2)   # a project that allows a second automatic round
     from ttp import worktree
     from ttp.db import continues_id, dependency_ids
     code, branch, _, (rev,) = _finish_code(env, p, "feature", {"app.py": 40})
