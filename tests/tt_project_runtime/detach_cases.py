@@ -3327,6 +3327,29 @@ def test_guard_or_lets_a_failed_detach_check_exit_4_past_its_fallback_and_leaves
         assert (r.returncode, r.stdout.strip()) == (rc, out), (a, b, r)
 
 
+def test_guard_or_reads_a_redirects_ampersand_as_part_of_the_redirect_not_a_separator():
+    """`2>&1`, `>&2`, `&>f` and `|&` carry an `&` that is no command separator: guarded, each probe still
+    parses (`bash -n`), a check exiting 4 exits 4, and other exits reach the fallback."""
+    from ttp import detach
+    g = detach.guard_or
+    chk = 'sh -c "exit $0" detach --check'
+    for probe in (f"{chk} || ssh-stand-in test -e /m >/dev/null 2>&1",
+                  f"{chk} 2>&1 || echo fb >&2",
+                  f"{chk} &>/dev/null || echo fb 2>&1 <&0"):
+        guarded = g(probe)
+        assert guarded != probe and guarded.count("exit 4") == 1 and g(guarded) == guarded, guarded
+        assert subprocess.run(["bash", "-n", "-c", guarded]).returncode == 0, guarded
+        for code, want in (("4", 4), ("0", None), ("1", None)):
+            r = subprocess.run(["bash", "-c", guarded.replace("$0", code)], capture_output=True, text=True)
+            o = subprocess.run(["bash", "-c", probe.replace("$0", code)], capture_output=True, text=True)
+            assert r.returncode == (want if want is not None else o.returncode), (probe, code, r)
+    # `|&` pipes: the pipeline's exit (cat's) feeds `||`, so the guard parses and changes no outcome
+    pipe = f"{chk} |& cat || echo fb >&2"
+    assert subprocess.run(["bash", "-n", "-c", g(pipe)]).returncode == 0 and g(pipe).count("exit 4") == 1
+    assert subprocess.run(["bash", "-c", g(pipe).replace("$0", "4")]).returncode == 0
+    assert g("ttp detach --check a.rc 2>&1 & wait") == "ttp detach --check a.rc 2>&1 & wait"
+
+
 def test_a_hand_offs_detach_check_feeding_a_fallback_is_stored_guarded_with_its_own_text_kept(env, monkeypatch,
                                                                                               tmp_path):
     """The daemon stores a waiting hand-off's `detach --check x.rc || <time>` guarded (retry_when_orig keeps

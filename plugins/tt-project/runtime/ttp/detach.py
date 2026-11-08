@@ -87,7 +87,8 @@ def failed_check(probe: str, rc) -> bool:
     return rc == FAILED_RC and bool(CHECK_RE.search(probe or ""))
 def _top_ops(text: str) -> list[tuple[int, str]]:
     """(index, operator) of each `||`, `&&`, `;`, `&`, newline and closing `)`/`}` of `text` outside
-    quotes, backslash escapes and nested parentheses or braces; a closer ends the list."""
+    quotes, backslash escapes and nested parentheses or braces; a closer ends the list. The `&` of a
+    redirect or `|&` is not an operator."""
     out, depth, i, q = [], 0, 0, ""
     while i < len(text):
         c = text[i]
@@ -110,6 +111,8 @@ def _top_ops(text: str) -> list[tuple[int, str]]:
         elif depth == 0 and text.startswith(("||", "&&"), i):
             out.append((i, text[i:i + 2]))
             i += 1
+        elif c == "&" and (text[i - 1:i] in (">", "<", "|") or text[i + 1:i + 2] == ">"):
+            pass   # a redirect (`2>&1`, `<&3`, `&>f`, `&>>f`) or bash's `|&` pipe, not a separator
         elif depth == 0 and c in ";&\n":
             out.append((i, c))
         i += 1
