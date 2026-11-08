@@ -3067,8 +3067,9 @@ after that line merges cleanly. A block that already sits right after upstream's
 is moved after that line by the upgrade itself, keeping both import lists. When a project only added
 lines to a template prompt, the upgrade fences them that way itself. Only a real overlap, such as
 the project and upstream rewording the same line, or each adding its own version of one line (the
-same leading key, or most of the text alike), goes to a harness task, at most one per
-`upgrade.task_every_h` (6) hours; releases meanwhile wait and the next task merges the newest.
+same leading key, or most of the text alike), goes to a harness task, queued at once with at most one
+open; a newer release retargets it. One that ended without landing holds off the next only until a
+newer release or an edit to the project's own runtime or template files, never on a timer.
 The same conflict deferred past 48 h, or past two harness tasks that ended without landing it,
 reaches the coordinator once as a normal observation, not once per deploy.
 

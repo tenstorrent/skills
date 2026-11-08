@@ -11230,8 +11230,8 @@ def _take_over_finish(p: Project, holder: dict, overdue: bool = False) -> bool:
 def _upgrade(p: Project, auto: bool = False, explicit: bool = False, took_over: bool = False,
              parked: dict | None = None) -> None:
     """`explicit`: run by hand on the host, not --auto and not from one of the project's runs. A conflict
-    then queues the merge task once the last one ended upgrade.merge_retry_h ago (`took_over`: at once,
-    the last one was just superseded), not only once a day. `parked`: the project is paused and this finish
+    queues the merge task at once (`took_over`: the last one was just superseded), held off only by one that
+    ended without landing the same release on the same own files. `parked`: the project is paused and this finish
     task holds the merge: a clean merge supersedes it and lands (the daemon restarts, still paused); a
     conflict retargets it and exits 75, the task finishing it once the project is resumed."""
     from . import release, upjournal
@@ -11280,41 +11280,30 @@ def _upgrade(p: Project, auto: bool = False, explicit: bool = False, took_over: 
     if problem:
         holder = release.finish_holder(p)
         tid = holder["task"] if holder else None
-        # One task per batching window (upgrade.task_every_h), whatever it did: a project whose local edits
-        # conflict on every release would otherwise pay one model task per release.
-        last = None if tid else release.recent_upgrade_task(p)
-        sooner = None       # an explicit host-side upgrade may queue the merge task this soon
-        if last and explicit:
-            ended = release.task_ended(p.db, last["id"])
-            sooner = None if ended is None else ended + release.merge_retry_s(p.config())
-            if took_over or (sooner is not None and time.time() >= sooner):
-                last = None
-        if last:        # the release on hand when the window is up gets the next task: one merge for all
-            window = release.task_every_s(p.config())
-            until = float(last["created"]) + window
-            release.note_deferred(p, problem, last["id"])
+        # No timer: the open task (tid) is the one merge at a time. The last one holds the next off only when it
+        # ended without landing this release on these same own files; a newer release or a local edit queues
+        # the next at once.
+        files = _own_files(h, base)
+        last = None if tid or took_over else release.unchanged_merge(p, f"{new_v} ({new_c})", files)
+        if last:
+            until = time.time() + release.CHECK_S      # the daemon looks again then, for a local edit
+            release.note_deferred(p, problem, last)
             release.defer(p, auto, f"{new_v} {new_c}", f"{old_v} ({old_c})", f"{new_v} ({new_c})", until,
                           problem[:300])
-            at = timefmt.long(until, p)
-            took = (f"upgrade not applied; the running harness is unchanged. {problem}\nHarness task "
-                    f"#{last['id']} took on a template merge less than {window / 3600:g} h ago, so none is queued "
-                    f"now; ")
-            # Exit 75 (deferred) only when the project takes it on itself: its daemon retries after `until`.
-            if sooner is not None and sooner < until:
-                at = timefmt.long(sooner, p)    # a host-side rerun queues it before the daemon's retry
-                took += f"a host-side `ttp upgrade {p.name}` queues one from {at}; "
+            took = (f"upgrade not applied; the running harness is unchanged. {problem}\nHarness task #{last} took "
+                    f"on this merge of {new_v} ({new_c}) on the same local files and ended without landing it, so "
+                    f"none is queued again for it; a newer release or a change to {p.name}'s own runtime or "
+                    f"template files queues the next at once; ")
             if release.retried({"newer": release.is_newer(new_v, old_v)}, p.config()):
-                print(took + f"upgrade deferred: owner: this project's daemon (upgrade.auto), which tries again "
-                             f"after the window is up; resumes at {timefmt.long(until, p)}.")
+                print(took + f"upgrade deferred: owner: this project's daemon (upgrade.auto), which looks again "
+                             f"at {timefmt.long(until, p)}.")
                 sys.exit(75)
-            if p.db.kv("paused", False):    # deferred, not failed: a takeover after the resume queues the merge
-                print(took + f"{p.name} paused; upgrades when resumed: a host-side `ttp upgrade {p.name}` after "
-                             f"the resume queues the merge task from {at}.")
+            if p.db.kv("paused", False):
+                print(took + f"{p.name} paused; upgrades when resumed.")
                 sys.exit(75)
             why = ("upgrade.auto is off" if release.is_newer(new_v, old_v)
                    else f"the daemon retries only a newer version, and this is {new_v} again from another commit")
-            print(took + f"{why}, so nothing retries it: rerun `ttp upgrade {p.name}` after {at} "
-                         f"to queue a harness task for the merge.")
+            print(took + f"{why}, so nothing retries it: rerun `ttp upgrade {p.name}` after such a change.")
             sys.exit(1)
         target = f"{new_v} ({new_c})"
         if not tid:
@@ -11323,6 +11312,8 @@ def _upgrade(p: Project, auto: bool = False, explicit: bool = False, took_over: 
             release.UPGRADE_TASK_TITLE, _UPGRADE_TASK.format(problem=problem, name=p.name, target=target,
                                                              state=shlex.quote(str(p.state))),
             kind="harness", tier="standard", priority=2, origin="user")
+        if not holder:
+            p.db.set_kv(release.KV_MERGE_BASIS, {"task": int(tid), "files": files})
         release.take_finish_lock(p, tid, f"{new_v} {new_c}", target)     # it holds the live harness until it ends
         release.note_deferred(p, problem, tid)
         if auto:
@@ -11760,6 +11751,11 @@ def _tell_harness_tasks(p: Project, sha: str, files: list[str]) -> None:
 
 class ReleaseMoved(RuntimeError):
     """The release an upgrade snapshot copied from changed under it (a `ttp setup` or its recovery)."""
+
+
+def _own_files(h: Path, base: str) -> str:
+    """A fingerprint of the project's own runtime and template files at `base`: the parts a release merges into."""
+    return _git(h, "ls-tree", base, "--", "runtime", "prompts", "bin", *HARNESS_ROOT_FILES)
 
 
 def _snapshot_upstream(p: Project, src: Path, new_v: str, new_c: str, ident: list[str]) -> None:

@@ -88,10 +88,9 @@ def test_a_clean_merge_that_fails_the_runtime_check_takes_one_task_and_leaves_th
 
 
 @pytest.mark.parametrize("argv", [["--auto"], []])
-def test_releases_inside_the_window_share_one_task_even_after_the_last_one_landed(env, monkeypatch, argv):
-    """A project whose local edits conflict on every release ran one model task per release: a task that
-    landed its release lifted the once-a-day limit. Now one task per upgrade.task_every_h (6 h) whatever
-    the last one did; releases meanwhile only record the wait, and the next task targets the newest."""
+def test_each_newer_release_queues_its_merge_task_at_once_after_the_last_one_ended(env, monkeypatch, argv):
+    """No window of hours between merge tasks: a merge task that ended (landed or not) a minute ago does
+    not hold off the next release's merge, which is queued at once and targets the newest release."""
     from ttp import cli, release
     p, restarts = _conflicting_upgrade(env, monkeypatch)
     with pytest.raises(SystemExit):
@@ -99,27 +98,22 @@ def test_releases_inside_the_window_share_one_task_even_after_the_last_one_lande
     first = p.db.one("SELECT id FROM tasks WHERE kind='harness'")["id"]
     rt = p.harness / "runtime"      # it landed: done, and the harness runs the release it targeted
     landed = f"Target release: tt-project {cli._runtime_version(rt)} ({cli.recorded_commit(rt)})"
-    p.db.x("UPDATE tasks SET status='done', spec=? WHERE id=?", (f"merge it\n\n{landed}\n", first))
+    p.db.x("UPDATE tasks SET status='done', spec=?, updated=? WHERE id=?",
+           (f"merge it\n\n{landed}\n", time.time() - 60, first))
     if argv:
         argv += ["--project-dir", str(p.base)]
-    for _ in range(3):      # three releases inside the window
+    tids = [first]
+    for _ in range(2):
         _next_release(env)
         with pytest.raises(SystemExit) as e:
             cli.main(["upgrade", "demo", *argv])
-        assert e.value.code == 75 and _harness_tasks(p) == [first]
-        rec = p.db.kv(release.KV_AUTO)
-        assert rec["outcome"] == "deferred" and rec["until"] <= time.time() + 6 * 3600 + 5
-    newest = cli._runtime_version(env["home"] / "lib" / "current" / "runtime")
-    p.db.x("UPDATE tasks SET created=created-? WHERE id=?", (2 * 3600, first))
-    with pytest.raises(SystemExit):
-        cli.main(["upgrade", "demo", *argv])
-    assert _harness_tasks(p) == [first], "6 h not up yet"
-    p.set_config("upgrade.task_every_h", 1)
-    with pytest.raises(SystemExit) as e:
-        cli.main(["upgrade", "demo", *argv])
-    tids = _harness_tasks(p)
-    assert e.value.code == 75 and len(tids) == 2 and release.finish_holder(p)["task"] == tids[1]
-    assert f"Target release: tt-project {newest} (" in p.db.task(tids[1])["spec"] and not restarts
+        assert e.value.code == 75 and len(_harness_tasks(p)) == len(tids) + 1
+        tids = _harness_tasks(p)
+        newest = cli._runtime_version(env["home"] / "lib" / "current" / "runtime")
+        assert release.finish_holder(p)["task"] == tids[-1]
+        assert f"Target release: tt-project {newest} (" in p.db.task(tids[-1])["spec"]
+        p.db.update_task(tids[-1], status="failed")
+    assert not restarts
 
 
 def test_an_open_upgrade_task_absorbs_a_newer_release(env, monkeypatch, capsys):
@@ -136,13 +130,6 @@ def test_an_open_upgrade_task_absorbs_a_newer_release(env, monkeypatch, capsys):
     assert e.value.code == 75 and _harness_tasks(p) == tids and not restarts
     assert release.finish_holder(p)["target"].startswith(newest + " ")
     assert f"Target release: tt-project {newest} (" in p.db.task(tids[0])["spec"]
-
-
-def test_task_every_h_reads_the_setting_with_a_6h_default():
-    from ttp import release
-    assert release.task_every_s({}) == 6 * 3600
-    assert release.task_every_s({"upgrade": {"task_every_h": 2}}) == 2 * 3600
-    assert release.task_every_s({"upgrade": {"task_every_h": "x"}}) == 6 * 3600
 
 
 _PUSH_LAST = "from . import batch, cli, pushpass, verdictcarry  # noqa: E402\n"
@@ -302,3 +289,29 @@ def test_an_upgrade_snapshot_whose_release_changes_under_the_copy_commits_nothin
     assert _git_out(p.harness, "rev-parse", "HEAD").strip() == head
     rec = p.db.kv(release.KV_AUTO)
     assert rec["outcome"] == "failed" and "ReleaseMoved" in rec["why"], rec
+
+
+def test_a_merge_that_ends_without_landing_raises_one_event_naming_the_project_and_files(env, monkeypatch):
+    """The deploying project's coordinator hears once, per merge task, that a project's template merge
+    failed or ended unlanded, with the conflicting files, so it takes it over at once."""
+    import sqlite3
+    from ttp import cli, deploy, overview, release
+    p, first = _deferred_conflict(env, monkeypatch)
+    with pytest.raises(SystemExit):
+        cli.main(["upgrade", "demo"])
+    target = cli._runtime_version(env["home"] / "lib" / "current" / "runtime")
+    conn = sqlite3.connect(f"file:{p.db.path}?mode=ro", uri=True)
+    db = overview._RO(conn)
+    m = overview._merge_unlanded(db, target, {})
+    assert m == {"task": first, "status": "done", "files": "conflicting files: prompts/kind-harness.md"}, m
+    assert overview._merge_unlanded(db, "0.0.1", {}) is None        # another release's task
+    rec, row = {"name": "demo", "target": target}, {"merge_unlanded": m}
+    for _ in range(2):
+        deploy._merge_event(p, rec, row, time.time())
+    ev = p.db.q("SELECT text FROM events WHERE source='deploy' AND kind='observation'")
+    assert len(ev) == 1 and "demo's template merge to tt-project" in ev[0]["text"], ev
+    assert f"#{first} done" in ev[0]["text"] and "prompts/kind-harness.md" in ev[0]["text"]
+    p.db.x("UPDATE tasks SET status='cancelled', blocked_reason=? WHERE id=?",
+           (f"{release.FENCED_PREFIX} to x", first))
+    assert overview._merge_unlanded(db, target, {}) is None          # the harness superseded it: not unlanded
+    conn.close()

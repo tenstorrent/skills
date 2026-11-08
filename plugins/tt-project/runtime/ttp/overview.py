@@ -15,6 +15,7 @@ write) and no lock is taken. Projects on other machines are listed as not checke
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import time
 from pathlib import Path
@@ -404,6 +405,21 @@ def _contains(commit: str | None, running: str | None) -> bool | None:
     return {0: True, 1: False}.get(r.returncode)
 
 
+def _merge_unlanded(db: _RO, target: str, auto: dict) -> dict | None:
+    """The newest template-merge task when it ended (failed, done or cancelled by the project) without
+    landing `target`: {"task", "status", "files"}, the conflicting files (else the merge's problem), or None."""
+    from .release import FENCED_PREFIX, KV_STUCK, UPGRADE_TASK_TITLE
+    t = db.one("SELECT id, status, blocked_reason, spec FROM tasks WHERE kind='harness' AND title=? "
+               "ORDER BY id DESC LIMIT 1", (UPGRADE_TASK_TITLE,))
+    if (not t or t["status"] not in ("done", "failed", "cancelled")
+            or str(t["blocked_reason"] or "").startswith(FENCED_PREFIX)
+            or not re.search(rf"^Target release: tt-project {re.escape(target)} ", t["spec"] or "", re.M)):
+        return None
+    why = (db.kv(KV_STUCK)[0] or {}).get("why") or auto.get("why") or "unknown (see its logs/upgrade.log)"
+    m = re.match(r"the merge conflicts in (.+)", why)
+    return {"task": int(t["id"]), "status": t["status"], "files": f"conflicting files: {m[1].strip()}" if m else why}
+
+
 def deploy_status(name: str, entry: dict, target: str, commit: str | None, now: float, here: str,
                   fresh_s: float = DEPLOY_FRESH_S, allow_newer: bool = False) -> dict:
     """Whether project `name` runs `target` (and `commit`, when given): {"name", "state": OK, PENDING or
@@ -446,6 +462,8 @@ def deploy_status(name: str, entry: dict, target: str, commit: str | None, now: 
         # Its own upgrade restarts the daemon: down meanwhile is a step, not a fault (as release.line).
         row["upgrading"] = (auto.get("outcome") == "running" and bool(auto.get("key")) and
                             _concerns(auto, target, commit) and now - float(auto.get("ts") or 0) < UPGRADE_RUN_S)
+        if not tid and not at_target:
+            row["merge_unlanded"] = _merge_unlanded(db, target, cur)
         if tid:
             from .release import STALE_S, task_activity
             task, last = task_activity(db, tid)

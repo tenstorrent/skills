@@ -470,10 +470,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # daemon (`ttp upgrade`, once per release, never inside a push step; pushes hold it push_hold_min at
     # most, then it starts between their steps), which then restarts keeping workers.
     # A clean merge whose runtime compiles and imports lands with no model task. A conflict or a failed
-    # check queues one harness task per task_every_h at most, whatever the last one did; releases meanwhile
-    # wait and the next task merges the newest. A host-side `ttp upgrade` queues it once the last one ended
-    # merge_retry_h ago.
-    "upgrade": {"auto": True, "merge_retry_h": 6, "task_every_h": 6, "push_hold_min": 30},
+    # check queues one harness task at once, never on a timer: one at most is open, and a newer release
+    # retargets it. One that ended without landing holds off the next only until a newer release or a
+    # change to the project's own runtime or template files.
+    "upgrade": {"auto": True, "push_hold_min": 30},
     # Upstream notes (hand-off follow-ups titled `upstream: ...`) are filed in the user's inbox
     # ~/.tt-project/upstream.jsonl. With ingest on, this project's coordinator gets them as events.
     "upstream": {"ingest": False},
@@ -849,6 +849,8 @@ RETIRED_KEYS = {
     "coordinator.session.mode": "the coordinator session is always on, with no off switch",
     "coordinator.session.pause_h": "the session spend guard is gone: the dollar caps are the cost limits",
     "budget.hourly_coordinator_usd": "the coordinator's hourly dollar guard is gone: the dollar caps are the cost limits",
+    "upgrade.merge_retry_h": "a conflicting upgrade queues its merge task at once, never on a timer",
+    "upgrade.task_every_h": "a conflicting upgrade queues its merge task at once, never on a timer",
 }
 
 
