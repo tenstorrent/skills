@@ -6259,6 +6259,13 @@ class Daemon:
         basis = _cost_basis(usage)
         self._book_cost(r, usage, run_dir / "output.jsonl")
         stopped = exit_info.get("stopped")
+        if stopped == "lost" and exit_info.get("orphan") and r["task"] and r["role"] != "coordinator" \
+                and self._this_boot(r["boot_id"]) and (run_dir / "STOP").is_file() \
+                and runner.stop_reason(run_dir) == "stopped":
+            # Its STOP file asked it to end for good (a cancel, a superseded or parked run) and its supervisor
+            # died before writing exit.json: it ends as that stop does with a live supervisor, never as a
+            # crash restarted free (lost_to_crash below). A project stop or preemption keeps its own path.
+            stopped = "stopped"
         refused = str(exit_info.get("refused") or "")
         if refused and not usage.error:
             usage.error = str(exit_info.get("error") or refused)[:400]
