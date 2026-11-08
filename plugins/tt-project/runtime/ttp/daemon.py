@@ -404,7 +404,8 @@ ESCALATE_READ_MAX = 1 << 16       # bytes of ESCALATE_FILE read; lines past it c
 # What a waiting hand-off keeps across a run the account refused (limit, auth).
 WAIT_KEYS = ("retry_when", "retry_after_s", "waiting_for", "wake_tier", "next_step", "survives_reboot", "waits",
              "waiting_since", "stale_wakes", "wait_key", "on_pass_cmd", refwaits.FACTS_KEY, "spec_seen", "spec_wakes",
-             "spec_hold", "spec_urgent", "spec_urgent_woke", thenwaits.KEY, thenwaits.STAGE_KEY, probematch.KEY)
+             "spec_hold", "spec_urgent", "spec_urgent_woke", thenwaits.KEY, thenwaits.STAGE_KEY, probematch.KEY,
+             waketier.PLAN, waketier.PLAN_SET)
 MAX_FOLLOWUPS, FOLLOWUP_SPEC_CHARS = 12, 4000   # per hand-off; each follow-up is its own event
 # What a review the daemon queues repeats of the code task's spec and hand-off.
 AUTO_REVIEW_SPEC_CHARS, AUTO_REVIEW_SUMMARY_CHARS = 2000, 1000
@@ -7475,6 +7476,17 @@ class Daemon:
             else:
                 not_before = time.time() + waitpoll.capped(self.cfg, task, result, _retry_s(result))
                 extra["waiting_since"] = time.time()
+                # Its check plan (waketier): the checks its model makes of this wait, the first one sooner.
+                if isinstance(prev_res.get(waketier.PLAN_SET), dict):
+                    extra[waketier.PLAN_SET] = prev_res[waketier.PLAN_SET]
+                try:
+                    same = isinstance(prev_res.get(waketier.PLAN), dict) and (prev_res.get("wait_key") or {}).get("key") == key["key"]
+                    # The same wait handed back keeps its plan (and its checks done), so checks never multiply.
+                    if cp := prev_res[waketier.PLAN] if same else waketier.plan(
+                            self.p.db, self.cfg, result, extra["waiting_since"], prev_res.get(waketier.PLAN_SET)):
+                        extra[waketier.PLAN] = cp
+                except Exception as e:   # a wait without a plan still sleeps on its probe
+                    log(self.p, f"task {task['id']}: no check plan: {type(e).__name__}: {e}")
                 reason = f"waiting for {what}; next try {timefmt.short(not_before, self.p)}"
             if new == "queued" and "waiting_since" in extra and isinstance(result.get("on_pass_cmd"), str):
                 result, summary = self._dry_run_verdict(r, task, result, run_dir, extra, summary)
@@ -9053,6 +9065,10 @@ class Daemon:
                     jev_lines.append(gate_line)
             except Exception as e:   # a metric must not keep the review from starting
                 log(self.p, f"wake gate line failed: {type(e).__name__}: {e}")
+            try:
+                spec += "\n\nCheck plans (waketier):\n" + "\n".join(f"- {x}" for x in waketier.plan_lines(db, self.cfg))
+            except Exception as e:   # a metric must not keep the review from starting
+                log(self.p, f"check plan lines failed: {type(e).__name__}: {e}")
         if jev_lines:
             spec += (f"\n\nJev uses over the last {jevuse.window_s(self.cfg) / 86400:g} d (calls, cost, estimated "
                      f"savings, net, error rate; a use with no net saving is switched off by itself):\n"
@@ -13645,6 +13661,8 @@ class Daemon:
                 continue
             if t["not_before"] > now and self._spec_wake(t, prev, probe, now):
                 continue
+            if t["not_before"] > now and self._plan_check(t, prev, now):
+                continue
             self._drop_stale_probe(t["id"], probe)
             if t["not_before"] <= now:
                 # Hand-offs from before the hold, and tasks already woken, keep their timer.
@@ -14824,6 +14842,20 @@ class Daemon:
                 chat=None, kind="info", severity="low", ref=f"devq_runner:{runner}")
         log(self.p, f"device runner {runner} {why}: queued task {fid}")
 
+    def _plan_check(self, task: dict, prev: dict, now: float) -> bool:
+        """Wake a waiting task for its planned check (waketier.due) once its probe's latest answer since
+        the wait began says "not yet"; True when it woke. "jev" and "plain" checks go through the wake
+        gate, "model" always runs, each at the plan's tier."""
+        rc, at, probe = self._probe_rc.get(task["id"], (None, 0.0, ""))
+        if rc not in NOT_YET_RCS or probe != prev.get("retry_when") or at < float(prev.get("waiting_since") or 0) \
+                or prev.get("woke") or not (chk := waketier.due(prev, now)):
+            return False
+        self._wake_waiting(task, f"its planned {chk['what']} check ({chk['n']} of {chk['of']}): is the wait still "
+                           f"on track (started, running, no errors)?", now,
+                           {waketier.PLAN: chk["plan"], waketier.PLAN_BY: chk["by"], waketier.PLAN_TIER: chk["tier"]},
+                           kind="plan_check")
+        return True
+
     def _hold_waiting(self, task: dict, prev: dict, now: float) -> bool:
         """A waiting task whose timer ran out: wake it, or put it back to sleep while its probe says
         "not yet". True when a probe must run before that can be decided."""
@@ -14849,6 +14881,8 @@ class Daemon:
                                + (f" ({raw[:300]})" if raw else ""), now, {"probe_raw": raw} if raw else None, kind="probe_broken")
         elif fresh and (dirs := self._checks_gone(tid, str(prev.get("retry_when") or ""), now)):
             self._checks_gone_release(task, dirs, now)
+        elif fresh and self._plan_check(task, prev, now):
+            pass
         elif fresh:
             # 75 is EX_TEMPFAIL (e.g. a busy `ttp lock`); 255 is ssh failing to reach the host
             # (a reboot or a network blip). Both mean "not yet". A model run cannot make a "not yet"
@@ -15508,6 +15542,10 @@ class Daemon:
         checks (userstep.probe_passed)."""
         if why.startswith("probe passed"):
             prev = load_result(task["result"])
+            try:   # its measured length sets the expected end of the next check plan of its kind
+                waketier.record_wait(self.p.db, prev, now)
+            except Exception as e:
+                log(self.p, f"task {task['id']}: could not record its wait: {type(e).__name__}: {e}")
             try:
                 if done := userstep.probe_passed(self.p.db, task, {prev.get("retry_when"), prev.get("retry_when_orig")}, now):
                     log(self.p, f"task {task['id']}: user step(s) {', '.join(done)} done: its retry_when passed")
@@ -20659,7 +20697,8 @@ def _stale_wakes(prev: dict, key: dict, escalate: bool) -> int:
     if not isinstance(prev, dict) or prev.get("status") != "waiting":
         return 0
     n = bud.stale_wakes(prev)
-    if escalate or str(prev.get("woke") or "").startswith("the host rebooted") or prev.get(onpassdry.KEY):
+    if escalate or str(prev.get("woke") or "").startswith("the host rebooted") or prev.get(onpassdry.KEY) \
+            or prev.get(waketier.KEY) == "plan_check":   # a planned check is expected to hand the wait back
         return n
     before = prev.get("wait_key")
     if not isinstance(before, dict):

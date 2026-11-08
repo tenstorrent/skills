@@ -22,9 +22,22 @@ A light pick books as avoided the measured mean cost of a wake at its from-tier 
 (tier_cost; LIGHT_SHARE of jevuse's fallback price per tier step while either is unmeasured), so
 jevuse.review keeps the use on while it pays. Each Jev call is settled when its run ends: a light pick
 whose run asked for more is wrong, and its avoided cost becomes minus the light run it added.
+
+Check plans (PLAN in the hand-off): a waiting hand-off with a retry_when gets planned checks, so its
+model looks at the wait a known number of times, not on every timer. By default one interim check soon
+after the wait starts (did it start, does it run, no early errors) and one at its expected end, the
+measured median wait of its kind (wait_kind: own checks, a detached job, a push, another probe;
+record_wait keeps them as probes pass, END_FALLBACK_S while fewer than `min_samples` are measured). In
+between, only a changed probe answer wakes it (the probe loop and waitgate). Each check wakes at the
+plan's tier, `by`: "model" (always a run), "jev" (the wake gate's Jev step judges it, its mechanical
+"still pending" rules skipped) or "plain" (the whole wake gate: a job still running is no turn). The
+coordinator's task_update `check_plan` (PLAN_SET: checks, at_s, tier, by) overrides the defaults for
+that task's waits; `waiting.check_plan` holds the defaults the daily review tunes (plan_lines).
 """
 from __future__ import annotations
 
+import re
+import statistics
 import time
 from pathlib import Path
 
@@ -38,8 +51,14 @@ PICK = "wake_pick"            # the hand-off's record of a lowered tier, copied 
 FIX = frozenset({"checks_failed", "tests_failed", "job_failed", "match_fail", "push_unlanded",
                  "on_pass_failed", "probe_broken", "asked", "underuse"})
 JUDGE = frozenset({"spec_change"})
-KINDS = FIX | JUDGE | {"timer", "probe_passed", "probe_changed", "wake_now", "checks_gone",
+KINDS = FIX | JUDGE | {"timer", "probe_passed", "probe_changed", "wake_now", "checks_gone", "plan_check",
                        "stale_release", "reboot", "other"}
+PLAN, PLAN_SET, PLAN_BY, PLAN_TIER = "check_plan", "check_plan_set", "plan_by", "plan_tier"
+BYS = ("jev", "plain", "model")
+PLAN_DEFAULTS = {"enabled": True, "interim_share": 0.15, "interim_min_s": 120.0, "interim_max_s": 900.0,
+                 "tier": "light", "by": "jev", "min_samples": 3}
+END_FALLBACK_S = {"checks": 1800.0, "job": 3600.0, "push": 900.0, "probe": 3600.0}
+WAITS_KV, WAITS_KEEP = "wait_durations", 40
 DEFAULT_LIGHT_BELOW = 0.3
 LIGHT_SHARE = 0.25            # a light wake's price as a share of a standard one while unmeasured
 JEV_TIMEOUT_S = 10.0
@@ -217,3 +236,118 @@ def text(s: dict) -> str:
     if not s["per_day"]:
         lines.append("  no task wakes recorded")
     return "\n".join(lines)
+
+
+def wait_kind(probe) -> str:
+    s = str(probe or "")
+    for kind, pat in (("checks", r"\bchecks\s+--result\b"), ("job", r"\bdetach\s+--check\b"),
+                      ("push", r"\bpush\s+--result\b")):
+        if re.search(pat, s):
+            return kind
+    return "probe"
+
+
+def plan_settings(cfg: dict) -> dict:
+    raw = ((cfg or {}).get("waiting") or {}).get("check_plan")
+    out = dict(PLAN_DEFAULTS, enabled=raw is not False)
+    for k, v in (raw.items() if isinstance(raw, dict) else ()):
+        if k == "enabled":
+            out[k] = v is not False and str(v).lower() not in ("off", "false", "0", "no")
+        elif k in ("tier", "by"):
+            out[k] = v if v in (bud.TIER_ORDER if k == "tier" else BYS) else out[k]
+        elif k in PLAN_DEFAULTS:
+            try:
+                out[k] = max(0.0, float(v))
+            except (TypeError, ValueError):
+                pass
+    return out
+
+
+def record_wait(db: DB, prev: dict, now: float | None = None) -> None:
+    """Keep how long a wait of its kind took, from its waiting hand-off to its probe passing."""
+    cp = prev.get(PLAN) if isinstance(prev.get(PLAN), dict) else {}
+    since, probe = cp.get("since", prev.get("waiting_since")), prev.get("retry_when")
+    if not isinstance(since, (int, float)) or not isinstance(probe, str) or not probe.strip():
+        return
+    got = db.kv(WAITS_KV, {}) or {}
+    kind = wait_kind(probe)
+    got[kind] = list(got.get(kind) or [])[-(WAITS_KEEP - 1):] + [round(max(0.0, (time.time() if now is None else now) - since))]
+    db.set_kv(WAITS_KV, got)
+
+
+def median_s(db: DB, kind: str) -> tuple[float | None, int]:
+    xs = [float(x) for x in ((db.kv(WAITS_KV, {}) or {}).get(kind) or []) if isinstance(x, (int, float))]
+    return (statistics.median(xs) if xs else None), len(xs)
+
+
+def override(raw) -> dict | None:
+    """A task_update `check_plan`, kept to its known fields; None or an empty one clears it."""
+    if not isinstance(raw, dict):
+        return None
+    out: dict = {}
+    if isinstance(raw.get("checks"), (int, float)) and not isinstance(raw.get("checks"), bool):
+        out["checks"] = max(0, min(12, int(raw["checks"])))
+    if isinstance(raw.get("at_s"), list):
+        out["at_s"] = sorted(float(x) for x in raw["at_s"][:12] if isinstance(x, (int, float)) and x > 0)
+    out.update({k: raw[k] for k in ("tier", "by") if raw.get(k) in (bud.TIER_ORDER if k == "tier" else BYS)})
+    return out or None
+
+
+def plan(db: DB, cfg: dict, result: dict, since: float, over: dict | None = None,
+         now: float | None = None) -> dict | None:
+    """The check plan of a waiting hand-off whose wait starts at `since` (None: no retry_when, or plans
+    are off and the coordinator set none). Checks already past `now` count as done."""
+    probe = result.get("retry_when") if isinstance(result, dict) else None
+    s, o = plan_settings(cfg), over if isinstance(over, dict) else {}
+    if not isinstance(probe, str) or not probe.strip() or not (s["enabled"] or o):
+        return None
+    kind = wait_kind(probe)
+    med, n = median_s(db, kind)
+    end = med if med is not None and n >= s["min_samples"] else END_FALLBACK_S[kind]
+    first = min(max(end * s["interim_share"], s["interim_min_s"]), s["interim_max_s"])
+    if o.get("at_s"):
+        offs = list(o["at_s"])
+    else:
+        offs = [first] + ([end] if end > first else [])
+        want = o.get("checks", len(offs))
+        offs = offs[:want] + [max(end, first) * (1 + 0.5 * k) for k in range(1, want - len(offs) + 1)]
+    at = [round(since + x) for x in offs]
+    now = time.time() if now is None else now
+    return {"kind": kind, "since": round(since), "at": at, "done": sum(1 for t in at if t <= now),
+            "end_s": round(end), "measured": n, "tier": o.get("tier") or s["tier"], "by": o.get("by") or s["by"],
+            "src": "coordinator" if o else "default"}
+
+
+def next_at(prev: dict) -> float | None:
+    cp = prev.get(PLAN) if isinstance(prev, dict) else None
+    try:
+        return float(cp["at"][int(cp["done"])]) if isinstance(cp, dict) and int(cp["done"]) < len(cp["at"]) else None
+    except (KeyError, TypeError, ValueError, IndexError):
+        return None
+
+
+def due(prev: dict, now: float) -> dict | None:
+    """The planned check due now: {n, of, what (interim, end or late), tier, by, plan (advanced)}."""
+    at = next_at(prev)
+    if at is None or at > now:
+        return None
+    cp = prev[PLAN]
+    off = at - float(cp.get("since") or at)
+    what = "interim" if off < float(cp.get("end_s") or 0) - 1 else "end" if off <= float(cp.get("end_s") or 0) + 1 else "late"
+    return {"n": int(cp["done"]) + 1, "of": len(cp["at"]), "what": what, "tier": cp.get("tier"), "by": cp.get("by"),
+            "plan": {**cp, "done": int(cp["done"]) + 1}}
+
+
+def plan_lines(db: DB, cfg: dict, days: float = 1, now: float | None = None) -> list[str]:
+    """For the daily review: the defaults, the measured waits per kind and what planned checks found."""
+    s, got = plan_settings(cfg), stats(db, "UTC", days, now)["per_day"]
+    rows = [v["plan_check"] for v in got.values() if "plan_check" in v]
+    wakes, back, usd = (sum(r[k] for r in rows) for k in ("wakes", "rewaited", "usd"))
+    out = [f"check plans {'on' if s['enabled'] else 'off'}: interim {s['interim_share']:g} of the expected end "
+           f"({s['interim_min_s']:g}-{s['interim_max_s']:g} s), {s['tier']} by {s['by']}; last {days:g} d: "
+           f"{wakes} planned-check runs, ${usd:.2f}, {back} only handed the wait back"]
+    for kind in END_FALLBACK_S:
+        med, n = median_s(db, kind)
+        low = "" if n >= s["min_samples"] else f" (fallback {END_FALLBACK_S[kind] / 60:.0f} min below {s['min_samples']:g} samples)"
+        out.append(f"{kind} waits: median {f'{med / 60:.0f} min over {n}' if med is not None else 'unmeasured'}{low}")
+    return out

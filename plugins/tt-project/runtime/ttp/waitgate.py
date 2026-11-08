@@ -292,6 +292,9 @@ def decide(p, cfg: dict, task: dict, prev: dict, now: float, probe: tuple | None
     except (ValueError, TypeError):
         last = {}
     woke = str(prev.get("woke") or "").strip().rstrip(".")
+    planby = prev.get("plan_by") if prev.get("plan_by") in ("jev", "plain") else None
+    if planby:   # a planned check the gate judges (waketier): no event on its own
+        woke = ""
     ended = float(last_run["ended"] or last_run["started"] or now) if last_run else float(prev["waiting_since"])
     # Its probe_match reads the probe's "not yet" output as a wait: a changed progress line is no event.
     matchwait = bool(probe and probe[0] in _not_yet() and probematch.verdict(prev, probe[1] if match_out is None else match_out) == "wait")
@@ -319,7 +322,7 @@ def decide(p, cfg: dict, task: dict, prev: dict, now: float, probe: tuple | None
     else:
         try:
             why = ("its probe's output still matches its probe_match wait" if matchwait
-                   else pending(p, cfg, prev.get("retry_when")))
+                   else None if planby == "jev" else pending(p, cfg, prev.get("retry_when")))
         except Exception:   # a rule that cannot tell decides nothing
             why = None
         if why:
@@ -366,7 +369,7 @@ def skipped(prev: dict, d: Decision, now: float) -> dict:
     """The hand-off a skip leaves on the task: the same wait, no wake reason (the probe loop treats it
     as asleep again), and the gate's memory: its skips' log ids and the evidence it saw."""
     gate = prev.get("wake_gate") if isinstance(prev.get("wake_gate"), dict) else {}
-    out = {k: v for k, v in prev.items() if k not in ("woke", "wake_reason")}
+    out = {k: v for k, v in prev.items() if k not in ("woke", "wake_reason", "plan_by", "plan_tier")}
     pending = bool(d.extra.get("pending"))   # waiting for Haiku's answer is no skip: never counted as one
     out["wake_gate"] = {"log": list(gate.get("log") or []) + ([] if pending else [d.log_id]), "seen": d.seen,
                         "since": gate.get("since") or now, "by": d.by, "reason": d.reason[:200]}

@@ -618,3 +618,132 @@ def test_a_gate_skip_sleeps_on_a_new_answer_that_fails_for_gh_login_while_the_ho
     _gate_set(p, tid, wake_gate={"seen": waitgate.evidence(1, "running: ci"), "log": [1]})
     _settle_probe(dm, tid)
     assert _ready(p, tid) and json.loads(p.db.task(tid)["result"])["woke"] == "its probe's answer changed (exit 4)"
+
+
+# Check plans (waketier: a waiting hand-off's planned checks) and their daemon, gate and coordinator hooks.
+
+def test_a_check_plan_puts_an_interim_check_soon_and_one_at_the_measured_end(env):
+    p = make(env)
+    from ttp import waketier as wt
+    cfg, since = p.config(), 1_000_000.0
+    job = {"retry_when": "ttp detach --check /tmp/j.rc"}
+    cp = wt.plan(p.db, cfg, job, since, now=since)
+    assert cp["kind"] == "job" and cp["at"] == [since + 540, since + 3600] and cp["done"] == 0, cp   # unmeasured: fallback
+    assert (cp["tier"], cp["by"], cp["src"]) == ("light", "jev", "default")
+    for n in (600, 700, 800):   # three measured checks waits: the end is their median
+        wt.record_wait(p.db, {"retry_when": "ttp checks --result /r", "waiting_since": since}, since + n)
+    cp = wt.plan(p.db, cfg, {"retry_when": "ttp checks --result /r2"}, since, now=since)
+    assert cp["at"] == [since + 120, since + 700] and cp["measured"] == 3, cp
+    assert wt.plan(p.db, cfg, {"waiting_for": "x"}, since) is None, "no retry_when: no plan"
+    assert wt.plan(p.db, {"waiting": {"check_plan": False}}, job, since) is None
+    over = wt.plan(p.db, {"waiting": {"check_plan": False}}, job, since, {"checks": 1, "by": "model"}, now=since)
+    assert over["at"] == [since + 540] and over["by"] == "model" and over["src"] == "coordinator", "an override plans anyway"
+    assert wt.plan(p.db, cfg, job, since, {"checks": 3}, now=since)["at"] == [since + 540, since + 3600, since + 5400]
+    assert wt.plan(p.db, cfg, job, since, {"checks": 0}, now=since)["at"] == []
+    assert wt.plan(p.db, cfg, job, since, {"at_s": [60.0]}, now=since + 100)["done"] == 1, "a past check counts as done"
+    # due: each check once, in order, named by where it falls against the expected end
+    prev = {wt.PLAN: wt.plan(p.db, cfg, job, since, {"checks": 3}, now=since)}
+    assert wt.due(prev, since + 500) is None and wt.next_at(prev) == since + 540
+    seen = []
+    for t in (since + 600, since + 3700, since + 5500):
+        chk = wt.due(prev, t)
+        seen.append(chk["what"])
+        prev = {wt.PLAN: chk["plan"]}
+    assert seen == ["interim", "end", "late"] and wt.due(prev, since + 99999) is None
+
+
+def test_the_check_plan_override_keeps_only_known_fields():
+    from ttp import waketier as wt
+    assert wt.override(None) is None and wt.override("3") is None
+    assert wt.override({"checks": 99, "at_s": [600, -5, "x", 60], "tier": "huge", "by": "jev", "x": 1}) == \
+        {"checks": 12, "at_s": [60.0, 600.0], "by": "jev"}
+    assert wt.override({"checks": True}) is None and wt.override({}) is None, "a bool is no count; {} clears"
+
+
+def test_a_planned_check_wakes_once_at_its_tier_and_the_same_wait_keeps_its_plan(env, monkeypatch, tmp_path):
+    """The waiting hand-off gets a plan; a due check on a "not yet" probe wakes the task light as a
+    plan_check; its run handing back the same wait keeps the plan (no new checks) and counts no stale wake."""
+    p = make(env)
+    from ttp import budget as bud, daemon as dmod, waketier as wt
+    d, tid, flag, runs, idle = _deferred_flow(p, monkeypatch, tmp_path / "plan")
+    res = json.loads(p.db.task(tid)["result"])
+    cp = res[wt.PLAN]
+    assert cp["kind"] == "probe" and len(cp["at"]) == 2 and cp["done"] == 0, cp
+    assert p.db.task(tid)["not_before"] > time.time() + 3000, "the hand-off's own timer is left alone"
+    _settle_probe(d, tid)
+    assert idle(), "not due yet: it sleeps"
+    _gate_set(p, tid, **{wt.PLAN: {**cp, "at": [time.time() - 1, cp["at"][1]]}})
+    d._probe_rc[tid] = (1, time.time(), res["retry_when"])
+    d.probe_waiting()
+    t = p.db.task(tid)
+    res = json.loads(t["result"])
+    assert t["not_before"] <= time.time() and res[wt.KEY] == "plan_check" and res[wt.PLAN]["done"] == 1, res
+    assert res[wt.PLAN_BY] == "jev" and "planned interim check (1 of 2)" in res["woke"]
+    assert bud.wake_tier("deep", res) == "light"
+    assert _run_until(d, p, lambda: runs() == 2 and idle()), "the planned check did not run and sleep again"
+    res = json.loads(p.db.task(tid)["result"])
+    assert res[wt.PLAN]["done"] == 1 and res[wt.PLAN]["at"][1] == cp["at"][1], "the same wait keeps its plan"
+    assert res.get("stale_wakes", 0) == 0 and wt.PLAN_BY not in res
+    d._probe_rc[tid] = (1, time.time(), res["retry_when"])
+    d.probe_waiting()
+    assert idle(), "the end check is not due yet"
+
+
+@pytest.mark.parametrize("rc", [0, 2])
+def test_a_planned_check_needs_a_not_yet_answer_since_the_wait_began(env, tmp_path, rc):
+    p = make(env)
+    from ttp import daemon as dmod, waketier as wt
+    dm = dmod.Daemon(p.base)
+    tid = _gate_task(p, tmp_path)
+    prev = json.loads(p.db.task(tid)["result"])
+    _gate_set(p, tid, **{wt.PLAN: wt.plan(p.db, p.config(), prev, prev["waiting_since"], {"at_s": [1.0]}, now=0)})
+    task = p.db.task(tid)
+    assert not dm._plan_check(task, json.loads(task["result"]), time.time()), "no answer yet"
+    dm._probe_rc[tid] = (1, prev["waiting_since"] - 5, "exit 1")
+    assert not dm._plan_check(task, json.loads(task["result"]), time.time()), "an answer from before the wait"
+    dm._probe_rc[tid] = (rc, time.time(), "exit 1")
+    assert not dm._plan_check(task, json.loads(task["result"]), time.time()), "a pass or a broken probe takes its own path"
+
+
+@pytest.mark.parametrize("by, wake, gate_by", [("model", True, "event"), ("jev", False, "jev"), ("plain", False, "rule")])
+def test_the_wake_gate_judges_a_planned_check_by_its_plan(env, tmp_path, by, wake, gate_by):
+    """model: always a turn; jev: Jev judges even while the job runs; plain: a running job is no turn."""
+    p = make(env)
+    rc, lk = _running_job(tmp_path)
+    tid = _gate_task(p, tmp_path, f"ttp detach --check {rc}")
+    _gate_set(p, tid, woke="its planned interim check (1 of 2): ...", wake_reason="plan_check", plan_by=by, plan_tier="light")
+    jev = _GateJev(needed=0.05)
+    d = _gate_decide(p, tid, jev=jev)
+    assert (d.wake, d.by) == (wake, gate_by), d
+    assert jev.calls == (1 if by == "jev" else 0)
+    from ttp import waitgate
+    assert not {"plan_by", "plan_tier", "woke"} & set(waitgate.skipped(json.loads(p.db.task(tid)["result"]), d, time.time()))
+    lk.close()
+
+
+def test_the_coordinator_sets_and_clears_a_tasks_check_plan(env, tmp_path):
+    p = make(env)
+    from ttp import coordinator as coord, waketier as wt
+    tid = _gate_task(p, tmp_path)
+    nb = p.db.task(tid)["not_before"]
+    assert coord.apply(p, [{"type": "task_update", "id": tid,
+                            "check_plan": {"checks": 1, "at_s": [1800], "tier": "standard", "by": "model"}}]) == []
+    res = json.loads(p.db.task(tid)["result"])
+    assert res[wt.PLAN_SET] == {"checks": 1, "at_s": [1800.0], "tier": "standard", "by": "model"}
+    assert res[wt.PLAN]["at"] == [round(res["waiting_since"] + 1800)] and res[wt.PLAN]["src"] == "coordinator"
+    assert res["status"] == "waiting" and p.db.task(tid)["not_before"] == nb
+    notes = coord.apply(p, [{"type": "task_update", "id": tid, "check_plan": {}}])
+    assert notes == [], notes
+    res = json.loads(p.db.task(tid)["result"])
+    assert wt.PLAN_SET not in res and res[wt.PLAN]["src"] == "default"
+
+
+def test_a_passed_probe_records_its_wait_for_the_daily_review(env, tmp_path):
+    p = make(env)
+    from ttp import daemon as dmod, waketier as wt
+    dm = dmod.Daemon(p.base)
+    tid = _gate_task(p, tmp_path, "ttp push --result /x", ended_ago=300)
+    dm._probe_passed(p.db.task(tid), time.time())
+    assert wt.median_s(p.db, "push") == (300.0, 1)
+    lines = wt.plan_lines(p.db, p.config())
+    assert lines[0].startswith("check plans on: interim 0.15") and "push waits: median 5 min over 1" in "\n".join(lines)

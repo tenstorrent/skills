@@ -118,6 +118,7 @@ from . import (   # one name per line: two changes adding names merge without a 
 )
 from . import untrusted
 from . import urgent
+from . import waketier
 from . import replan
 from . import topup
 from . import probevars
@@ -251,6 +252,9 @@ ACTIONS_SCHEMA: dict[str, Any] = {
             "wake_now": {"anyOf": [{"type": "boolean"}, {"type": "string", "enum": list(bud.TIER_ORDER)}]},
             "replace": {"type": "object", "properties": {"old": {"type": "string"}, "new": {"type": "string"}},
                         "required": ["old"]},
+            "check_plan": {"type": ["object", "null"], "properties": {
+                "checks": {"type": "integer"}, "at_s": {"type": "array", "items": {"type": "number"}},
+                "tier": {"type": "string", "enum": list(bud.TIER_ORDER)}, "by": {"type": "string", "enum": list(waketier.BYS)}}},
             "owners": {"type": "array", "items": {"type": "integer"}}, "evidence": {"type": "string"},
             "milestone": {"type": "string"}, "promise": {"type": "string"}, "justify": {"type": "string"},
             "delivers": {"type": "array", "items": {"type": "string"}},
@@ -3285,6 +3289,16 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     else:
                         notes.append(f"task_update: #{task['id']} wake_now ignored: it is not asleep on a retry_when "
                                      f"(a start_when deferral wakes by `start_when` \"\"; a blocked task by status queued)")
+                if "check_plan" in a:
+                    # The task's own check plan (waketier): kept for its waits; a live wait re-plans now.
+                    prev = load_result(upd.get("result") or task["result"])
+                    over = waketier.override(a["check_plan"])
+                    new = {k: v for k, v in prev.items() if k not in (waketier.PLAN_SET, waketier.PLAN)}
+                    new.update({waketier.PLAN_SET: over} if over is not None else {})
+                    if prev.get("status") == "waiting" and isinstance(prev.get("waiting_since"), (int, float)) \
+                            and (cp := waketier.plan(db, cfg, prev, prev["waiting_since"], over)):
+                        new[waketier.PLAN] = cp
+                    upd["result"] = dump_result(new)
                 if waits or upd.get("status", "blocked") != "blocked":
                     labels = upd.get("labels")
                     labels = json.loads(task["labels"] or "[]") if labels is None else labels

@@ -167,6 +167,15 @@ disk untouched, with no migration; nothing else is reclaimed by check recovery.
    mean cost of a wake at its tier less a light one (fallback prices while unmeasured), so the use
    stays on while it pays; one whose run asked for more settles as wrong, minus the light run it added. `ttp stats --wakes` shows task wakes per day by reason, with their $, how many
    only handed the wait back and who chose the tier.
+   A waiting hand-off with a `retry_when` gets a check plan (`check_plan`): one interim check soon
+   after the wait starts (`waiting.check_plan.interim_share` of the expected end, 2-15 min) and one
+   at the expected end, the measured median wait of its kind (own checks, a detached job, a push,
+   another probe; a fallback below `min_samples`). In between only a changed probe answer wakes it.
+   A check wakes at the plan's `tier` (light), `by` `jev` (the wake gate's Jev step judges it),
+   `plain` (the whole gate: a job still running is no turn) or `model` (always a run). The same wait
+   handed back keeps its plan, and a planned check never counts as a stale wake. The coordinator's
+   `task_update` `check_plan` overrides a task's plan; the daily review gets `Check plans` lines to
+   tune the defaults.
 8. The project folder ignores itself; nothing of a project is ever committed to the user's repo.
 9. Secrets live only in the machine's secret store (`~/.tt-project/secrets.json`, 0600, by default; a
    keychain, a fetch command or the environment where `ttp secret store` says so). Never in argv, logs
