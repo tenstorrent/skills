@@ -51,7 +51,8 @@ first), so it starts within a bound. A run parked outside the queue for its
 test slots (acquire's `startable`) holds a PARKED ticket meanwhile, so the wait is visible: once it has
 waited that long, later runs of its project at its priority or lower leave it their project's next free test
 slots, more urgent ones after aged_turns() of them started (testslots.pool_room, starved_ahead; push checks
-count as least urgent, priority 0 is never held by a less urgent run). An urgent run (locks.URGENT_PRIORITY or
+count as least urgent, priority 0 is never held by a less urgent run, and a less urgent task run leaves its
+project's next free test slots to the project's parked priority-0 runs, whatever their arrival: owed_ahead). An urgent run (locks.URGENT_PRIORITY or
 better) leaves less urgent aged runs one shared turn per aged_turns() urgent starts since its project's last
 routine start, and then only to the oldest of them (_routine_turn), so a routine backlog never holds it longer
 while it still starts one run per N urgent ones. Push checks run on their branch's reserved test lane alone
@@ -556,6 +557,27 @@ def starved_ahead(project_name: str | None, since: float | None = None, now: flo
     if passed and rank <= locks.URGENT_PRIORITY:
         return out + _routine_turn(project_name, passed, now)
     return out + (_aged_turn(project_name, passed, now) if passed else [])
+
+
+def owed_ahead(project_name: str | None, priority: int | None = None) -> list[Path]:
+    """The other parked runs of `project_name` (PARKED tickets) at OBLIGATION_PRIORITY (an obligation owner's
+    or a user-ordered urgent task's) that a less urgent asking run leaves its project's next free test slots
+    to, whatever their arrival or its own wait: a freed slot goes to them by priority, never to an older
+    parked run of lower priority that polls first. starved_ahead never holds them behind a less urgent run,
+    so the two never wait on each other; aging still orders runs of one priority and lifts aged routine runs
+    above other less urgent ones. The asking run's priority is its PARKED ticket's, else `priority`; push
+    checks (none), a landing's ticket and priority 0 are held by none."""
+    try:
+        q = locks.queued(slot_dir(), PARKED)
+    except OSError:
+        return []
+    mine = getattr(_PARKS, "park", None)
+    rank = locks.ticket_priority(mine) if mine in q else math.inf if priority is None else float(priority)
+    if rank <= OBLIGATION_PRIORITY or math.isinf(rank) or (mine in q and locks.is_landing(mine)):
+        return []
+    gid = locks.group_id(project_name)
+    return [t for t in q if t != mine and locks.ticket_group(t) == gid
+            and locks.ticket_priority(t) <= OBLIGATION_PRIORITY]
 
 
 def _routine_turn(project_name: str | None, aged: list[Path], now: float) -> list[Path]:

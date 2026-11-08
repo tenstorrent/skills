@@ -296,6 +296,7 @@ LOAD_OWED = "test-slots-load-owed"   # the one priority-0 run (owed to the user)
 LOAD_FLOOR = "test-slots-load-floor"   # the one run of any priority past it, so the queue keeps moving
 LOAD_GATE = "host load: "   # pool_gate's reason while the load guard holds a run (gate_lanes records it)
 STARVED_GATE = " run(s) of its project parked longer go first (checkcap.starved_ahead)"   # its reason's end there
+OWED_GATE = " owed run(s) of its project parked go first by priority (checkcap.owed_ahead)"   # its reason's end there
 BUDGET_GATE = "its project's test-worker budget: "   # its reason's start while the project's budget holds the run
 
 
@@ -1189,7 +1190,8 @@ def pool_gate(cfg: dict | None, project_name: str | None, full: bool = False, pr
     checkcap.starve_s() that arrived before `since` (this run's arrival; default now) goes first
     (checkcap.starved_ahead), unless this run is more urgent and that one's turn (one per
     checkcap.aged_turns() urgent starts) has not come, or this run, of `cost`, is much cheaper than that one's; an urgent run leaves that turn only to the oldest
-    less urgent one, once per checkcap.aged_turns() urgent starts since its project's last routine start. A run leaves `need` slots of the pool to each urgent
+    less urgent one, once per checkcap.aged_turns() urgent starts since its project's last routine start. A less urgent
+    run leaves them to its project's parked owed (priority-0) runs whatever its wait (checkcap.owed_ahead). A run leaves `need` slots of the pool to each urgent
     run of another project parked for its test slots ahead of it (urgent_parked: a routine run to every one,
     an urgent run to those more urgent or as urgent and older), so a freed slot goes to the urgent one, not
     to whichever polls first; one its own gate holds otherwise keeps none. The reason names the term that failed, for status (checklane._parked)."""
@@ -1197,6 +1199,8 @@ def pool_gate(cfg: dict | None, project_name: str | None, full: bool = False, pr
         return f"{LOAD_GATE}{why}"
     if (ahead := checkcap.starved_ahead(project_name, since, priority=priority, cost=cost)):
         return f"{len(ahead)}{STARVED_GATE}"
+    if (owed := checkcap.owed_ahead(project_name, priority)):
+        return f"{len(owed)}{OWED_GATE}"
     if full and admitted_ahead(project_name, priority):
         return "a run of its project as urgent or more holds a host-wide checks slot and waits for its test slots"
     s = sizes(cfg)
@@ -1234,7 +1238,7 @@ def urgent_parked(project_name: str | None, priority: int | None = None, since: 
     """How many urgent runs (locks.URGENT_PRIORITY or better) of other projects than `project_name` are parked
     for their test slots now (checkcap.PARKED tickets) ahead of a run at `priority` that arrived at `since`
     (default now): every one for a routine run, else those more urgent, or as urgent and older. A run whose
-    own gate (pool_gate's reason its lane records: gate_lanes) is its project's aged turn (STARVED_GATE), its
+    own gate (pool_gate's reason its lane records: gate_lanes) is its project's aged turn (STARVED_GATE) or owed runs (OWED_GATE), its
     project's budget (BUDGET_GATE) or the load guard (LOAD_GATE) is not counted: it could not take the slots
     kept for it, so they would sit idle. One whose lane names no reason, or only the pool, still counts.
     With a `budget` (the account's project_max), each project counts at most the runs of `need` slots its
@@ -1254,7 +1258,7 @@ def urgent_parked(project_name: str | None, priority: int | None = None, since: 
     if not ahead:
         return 0
     held = {r.get("pid") for r in locks.holder_records(sorted(d.glob(f"{SUITE}.*.lock")))
-            if (g := str(r.get("gate") or "")).startswith((LOAD_GATE, BUDGET_GATE)) or g.endswith(STARVED_GATE)}
+            if (g := str(r.get("gate") or "")).startswith((LOAD_GATE, BUDGET_GATE)) or g.endswith((STARVED_GATE, OWED_GATE))}
     held.discard(None)
     ahead = sorted((t for t in ahead if ticket_pid(t) not in held),
                    key=lambda t: (locks.ticket_priority(t), locks._arrival(t)))

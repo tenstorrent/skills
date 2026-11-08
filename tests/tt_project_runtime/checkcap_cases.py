@@ -7698,6 +7698,60 @@ def test_aged_parked_routine_runs_hold_a_later_urgent_run_of_their_project_only_
             locks.dequeue(t)
 
 
+def test_a_parked_owed_run_takes_its_projects_next_freed_slot_before_older_aged_lower_priority_ones(env, monkeypatch):
+    # #7318: with the pool full, two p2 runs parked past checks.starve_s and a newer p0 (owed) run of the same
+    # project wait. The freed slot goes to the p0 run: the aged p2s leave it (checkcap.owed_ahead) instead of
+    # taking it by polling first. Aging among the p2s, a p1 asker's routine turn, push checks, a landing and
+    # other projects are unchanged.
+    from ttp import checkcap, locks, testslots
+    monkeypatch.setenv(checkcap.STARVE_ENV, "3600")
+    monkeypatch.setenv("TTP_TEST_POOL", "8")
+    monkeypatch.setenv("TTP_TEST_RUN_MAX", "4")
+    monkeypatch.setattr(testslots, "load_guard", lambda: "")
+    used = [8]
+    monkeypatch.setattr(testslots, "_held", lambda paths: min(used[0], len(paths)))
+    now = time.time()
+    d, P = checkcap.slot_dir(), checkcap.PARKED
+    p2s = [locks.enqueue(d, P, f"pa task #{i} (run {i})", since=now - 9000 + i, group="pa", priority=2)
+           for i in range(2)]
+    p0 = locks.enqueue(d, P, "pa task #9 (run 9)", since=now - 60, group="pa", priority=0)
+    at = [locks._arrival(t) for t in p2s + [p0]]
+    try:
+        assert not any(testslots.pool_room({}, "pa", priority=p, since=a) for p, a in zip((2, 2, 0), at))
+        used[0] = 4   # a run ended: its slots are free
+        assert testslots.pool_room({}, "pa", priority=0, since=at[2]), "the owed run takes the freed slot"
+        for a in at[:2]:
+            assert not testslots.pool_room({}, "pa", priority=2, since=a), "older aged p2s leave it to it"
+        assert testslots.pool_gate({}, "pa", priority=2, since=at[0]).endswith(testslots.OWED_GATE), "status says why"
+        assert checkcap.owed_ahead("pa", 2) == [p0] and checkcap.owed_ahead("pa", 1) == [p0]
+        assert checkcap.owed_ahead("pa", 0) == [], "same priority: by arrival and aging as before"
+        assert checkcap.owed_ahead("pa") == [], "push checks (no priority): not held"
+        assert checkcap.owed_ahead("pb", 2) == [] and testslots.pool_room({}, "pb", priority=2), "other projects"
+        assert checkcap.starved_ahead("pa", at[1], now, priority=2) == p2s[:1], "aging among p2s: unchanged"
+        assert checkcap.starved_ahead("pa", now, now, priority=2) == p2s, "a later p2 still waits on aged p2s"
+        locks.dequeue(p0)
+        assert testslots.pool_room({}, "pa", priority=2, since=at[0]), "the oldest p2 next once the p0 started"
+        assert not testslots.pool_room({}, "pa", priority=2, since=at[1]), "the next p2 after it, as before"
+        p0s = [locks.enqueue(d, P, f"pa task #{i} (run {i})", since=now - 8000 + i, group="pa", priority=0)
+               for i in (20, 21)]
+        assert checkcap.starved_ahead("pa", locks._arrival(p0s[1]), now, priority=0) == p0s[:1], \
+            "same-priority aging among p0 runs: unchanged"
+        for t in p0s:
+            locks.dequeue(t)
+        landing = locks.enqueue(d, P, "pa task #30 (run 30)", since=now - 30, group="pa", priority=2, landing=True)
+        late = locks.enqueue(d, P, "pa task #31 (run 31)", since=now - 20, group="pa", priority=0)
+        checkcap._PARKS.park = landing
+        try:
+            assert checkcap.owed_ahead("pa", 2) == [], "a landing's own ticket is not held"
+        finally:
+            checkcap._PARKS.park = None
+        locks.dequeue(landing)
+        locks.dequeue(late)
+    finally:
+        for t in p2s + [p0]:
+            locks.dequeue(t)
+
+
 def test_an_urgent_run_is_held_by_at_most_the_oldest_aged_routine_run_on_its_shared_turn(env, monkeypatch):
     # #6999: a priority-1 run behind 11 aged p2 runs and 4 aged p3 runs of its project. Routine (p2) starts
     # made the p3s' own turn come (more urgent than p3), which used to hold the p1 run behind all of them.
