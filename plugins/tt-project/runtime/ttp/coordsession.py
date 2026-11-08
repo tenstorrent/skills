@@ -218,7 +218,7 @@ def decide(cfg: dict, state, prefix_key: str, model: str, effort: str, saved, no
     restart or a reboot changes nothing here: the saved session is resumed by its id. `state`
     is kv KEY (None: none yet), `saved(session_id)` says the agent can still resume that session,
     `no_session` is gap() of the wake's provider: only a provider that keeps no session at all gets
-    "stateless". No setting in `cfg` changes the mode; it only sizes the rollover (limit()). A changed
+    "stateless". No setting in `cfg` changes the mode; it only sizes compaction (limit()). A changed
     `prefix_key` resumes ("prompt changed": the wake leads with changed_block()) unless the wake's
     `provider` differs from the session's or cannot resume with a changed prompt (`prompt_resumes`
     False: Provider.resume_new_prompt "")."""

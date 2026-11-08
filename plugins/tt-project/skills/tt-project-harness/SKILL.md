@@ -34,7 +34,7 @@ read the one for the lever you change.
 | Lever | File |
 |---|---|
 | Coordinator rules | `prompts/coordinator.md` |
-| Coordinator session | Always on, no setting: one persistent session per project (`prompts/coordinator-session.md`). A failed resume or a rollover starts the next session seeded with the hand-off (`state/coord-session/`); it never falls back to a stateless turn. `coordinator.session` in `project.json` only sizes the rollover and tools |
+| Coordinator session | Always on, no setting: one persistent session per project (`prompts/coordinator-session.md`). A restart or reboot resumes the same session and a full context compacts in place; only a resume the provider rejects (or an expired session) starts a new session seeded with the hand-off (`state/coord-session/`), never a stateless turn. `coordinator.session` in `project.json` only sizes compaction (`compact_growth_tokens` past the first prompt or last compaction, capped by the context window less `compact_margin_tokens`; `compact_tokens` fixes it) and tools |
 | Worker contract, per-kind rules | `prompts/worker.md`, `prompts/kind-*.md` |
 | A hand-off rule that must hold every time | `worker.handoff_checks` in `project.json` (see docs/guide.md): a command run on each hand-off before it is accepted or its reply posts; exit 1 sends the run back with the output. Use it instead of a `worker.md` rule when a script can test the rule; a prompt rule gets missed, and a schedule backstop catches the miss only after the reply went out |
 | Tiers, caps, debounce, idle wake, resources | `project.json` (defaults: `runtime/ttp/project.py`) |

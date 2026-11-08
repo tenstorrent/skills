@@ -3187,3 +3187,20 @@ def test_every_session_provider_resumes_with_a_changed_prompt_and_stats_name_eac
     assert coordstats.reason({"mode": "new", "why": coordsession.PROMPT_NEW}) == \
         "new: prompt changed, provider cannot resume with it"
     assert coordstats.reason({"mode": "new", "why": "prefix changed"}) == "new: prompt, charter or schema changed"
+
+
+def test_coordsession_installed_docs_say_restart_resumes_and_full_context_compacts():
+    # User orders: always on, compaction in place, no rollover. The README, the harness skill and
+    # coordtools' docstring must not describe a restart, reboot, full context or failed wake as
+    # starting the next session.
+    plugin = RUNTIME.parent
+    texts = {p: (plugin / p).read_text() for p in
+             ("README.md", "skills/tt-project-harness/SKILL.md", "runtime/ttp/coordtools.py")}
+    stale = ("fills up, fails or is lost", "A failed resume or a rollover", "only sizes the rollover",
+             "reruns its batch\nas the next session")
+    for path, text in texts.items():
+        for phrase in stale:
+            assert phrase not in text, (path, phrase)
+    for path in ("README.md", "skills/tt-project-harness/SKILL.md"):
+        assert "resumes the same session" in texts[path] and "compacts in place" in texts[path], path
+    assert "same session (coordsession.fail)" in texts["runtime/ttp/coordtools.py"]
