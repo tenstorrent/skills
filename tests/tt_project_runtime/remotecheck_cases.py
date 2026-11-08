@@ -1754,6 +1754,32 @@ def test_an_agent_cli_or_host_local_check_splits_off_to_run_here_while_the_rest_
     assert not any(x in checkspill._probe_script() for x in checkspill.AGENT_CLIS)
 
 
+def test_a_check_naming_a_path_of_this_machine_never_spills_and_splits_off_to_run_here(env):
+    """A check running a script of this machine by absolute path (a project's harness/bin scanner: exabox jobs
+    exited 127 on it, #7451), or naming a `~`/`$HOME` path, an input file or a `VAR=`/`--opt=` path outside the
+    system folders, never goes to a spill host or a Slurm node, which get a copy of the commit only, not even
+    with `"spill": true`. A cheap one splits off to run here beside the spilled suite; a suite naming one keeps
+    its whole run here. System paths, output redirections and URLs still spill."""
+    from ttp import checkspill, cli, push
+    scan, test = "/srv/proj/harness/bin/public-commit-scan", "python3 -m pytest -q tests/"
+    for cmd in (scan, f"timeout 60 {scan} --base x", "~/bin/scan", "$HOME/bin/scan", "cat < /srv/in.txt",
+                "PYTHONPATH=/srv/lib sh tools/lint.sh", "sh tools/lint.sh --config=/srv/lint.cfg", f"bash -lc 'cd x && {scan}'",
+                f'sh -e -c "{scan}"'):
+        assert checkspill.host_path(cmd), cmd
+        c = push.check_list([cmd])[0]
+        assert not checkspill.check_spills(c) and checkspill.stays_here(c), cmd
+        assert checkspill.spillable(push.check_list([test]) + [c]), cmd
+        assert not checkspill.check_spills(push.check_list([{"run": cmd, "spill": True}])[0]), cmd
+    for cmd in (test, "/usr/bin/python3 -m pytest -q tests/ 2>/dev/null >/tmp/out.log", "sh tools/lint.sh",
+                "curl -fsS https://example.invalid/x", "/bin/sh -c 'make lint'", "git diff --quiet"):
+        assert not checkspill.host_path(cmd), cmd
+    suite = push.check_list(["python3 -m pytest -q --rootdir=/srv/proj tests/"])[0]
+    assert not checkspill.check_spills(suite) and not checkspill.stays_here(suite)
+    assert not checkspill.spillable(push.check_list(["make lint"]) + [suite]), "a suite naming one keeps the run here"
+    out = cli._spill_to(push.check_list([test, scan]), "check-host-a")
+    assert push.remote_host(out[0]) == "check-host-a" and push.remote_host(out[1]) == "" and push.where(out[1]) == ""
+
+
 def test_a_check_chaining_tests_and_the_claude_cli_never_sends_either_to_a_spill_host():
     """A single check that runs a test suite and then the claude CLI (`pytest ... && claude plugin validate
     ...`) never spills: it needs the CLI, and as a test suite it may not split off to run here, so its whole
@@ -2382,6 +2408,18 @@ def test_a_slurm_job_runs_the_check_on_a_copy_of_head_as_one_cpu_job_with_its_ti
     rc, out = _slurm_run(tmp_path, repo, "exit 3", fake)
     assert rc == 3 and slurmcheck.jobs()[-1]["rc"] == 3, out
     assert "--time=30 " in (d / "sbatch.log").read_text().splitlines()[-1], "max_time_s with no median"
+
+
+def test_a_slurm_job_logs_the_node_it_ran_on_for_a_cluster_without_accounting(env, tmp_path):
+    """jobs.jsonl names the node each job ran on (sacct may be off and scontrol forgets a job), read from the
+    `node` file the job writes first."""
+    from ttp import slurmcheck
+    repo = _rc_repo(tmp_path)
+    fake, d = _slurm_fakes(tmp_path)
+    fake = {**fake, "SLURMD_NODENAME": "cpu-node-07", "FAKE_SLURM_NOACCT": "1"}
+    rc, out = _slurm_run(tmp_path, repo, "true", fake)
+    assert rc == 0 and slurmcheck.jobs()[-1].get("node") == "cpu-node-07", (out, slurmcheck.jobs()[-1])
+    assert "node" in slurmcheck.job_script("/q", "", "true")
 
 
 def test_a_slurm_job_the_cluster_ends_runs_again_once_and_a_refused_one_is_a_fault(env, tmp_path):

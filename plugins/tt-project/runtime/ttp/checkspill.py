@@ -80,6 +80,10 @@ a check that is no test suite or build (checklane.run_class), unwrapped and in a
 this way; any other check that may not spill keeps the whole run here. So a spill host needs only what the
 checks it gets run (git and tar, and python3 with the checks environment for pytest), never an agent CLI or
 its sign-in.
+
+A check whose command names a path of this machine (host_path: an absolute, `~` or `$HOME` path outside
+the system folders, such as a project's harness/bin script) cannot run on a spill host or a Slurm node, which
+get a copy of the commit only, so it never spills either; it splits off to run here the same way.
 """
 from __future__ import annotations
 
@@ -118,6 +122,8 @@ _JOB_ONE = ("current_job", "active_job", "running_job")   # broker status: the o
 _RUNNING = {"running", "active", "started", "in_progress", "in-progress", "busy"}   # a `jobs` row's state that runs
 AGENT_CLIS = ("claude", "codex", "cursor-agent")   # agent CLIs a spill host lacks: a check running one stays here
 _SHELLS = ("sh", "bash", "dash", "zsh")   # needs_cli reads their -c script too
+# Absolute paths every host has: a check naming only these may still spill (host_path).
+_SYSTEM_DIRS = ("/usr/", "/bin/", "/sbin/", "/lib/", "/lib64/", "/lib32/", "/etc/", "/dev/", "/proc/", "/sys/")
 RUNNING_MAX_AGE_MIN = 720   # a remote ttp-check.* folder older than this is a leftover, not a running check
 _PROBE = ("command -v git >/dev/null 2>&1 && command -v tar >/dev/null 2>&1 || exit 3\n"
           "c=$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)\n"
@@ -481,6 +487,8 @@ def check_spills(c: Any, cfg: dict | None = None) -> bool:
         return False
     if (getattr(c, "host", "") == remotecheck.LOCAL or needs_cli(c) or needs_history(c)) and opt is not True:
         return False
+    if host_path(c):   # `"spill": true` cannot make a path of this machine exist there
+        return False
     try:
         remote_wrap = push.spill_wrap_of(c, cfg)
     except ValueError:
@@ -513,16 +521,53 @@ def needs_cli(c: Any) -> bool:
     return False
 
 
+def _host_word(w: str) -> bool:
+    """Whether word `w` (or the value of a `VAR=` / `--opt=` word) is a path of this machine: absolute,
+    `~` or `$HOME`, outside _SYSTEM_DIRS."""
+    for v in (w, w.split("=", 1)[1] if "=" in w else ""):
+        if v.startswith(("~", "$HOME", "${HOME}")):
+            return True
+        if v.startswith("/") and not v.startswith("//") and not (v + "/").startswith(_SYSTEM_DIRS) \
+                and v not in ("/", "/dev/null"):
+            return True
+    return False
+
+
+def host_path(c: Any) -> bool:
+    """Whether check `c` names a path of this machine (_host_word) in any simple command or a shell's -c
+    script, which a spill host or a Slurm node, given a copy of the commit only, lacks; a line that does not
+    parse counts (it stays here). A path inside the checkout counts too: the copy there sits elsewhere."""
+    from . import testslots
+    try:
+        segs = testslots._segments(str(c))
+    except (ValueError, IndexError):
+        return True
+    for seg in segs:
+        words = [w for _, _, w in seg]
+        for j, w in enumerate(words):
+            if re.match(r"\d*>", w):   # an output redirection writes there: any host can
+                continue
+            if _host_word(w[1:] if w.startswith("<") else w):
+                return True
+            if testslots._base(w) in _SHELLS:   # its -c script (`bash -lc '...'`) is read the same way
+                opt = next((k for k in range(j + 1, len(words)) if re.fullmatch(r"-[a-z]*c[a-z]*", words[k])), None)
+                if opt is not None and opt + 1 < len(words) and host_path(words[opt + 1]):
+                    return True
+    return False
+
+
 def stays_here(c: Any, cfg: dict | None = None) -> bool:
     """Whether check `c` runs on this machine while the rest of its run spills: it may not spill only because
-    it says `"host": "local"` or runs an agent CLI (needs_cli), and it is cheap enough to run beside the
+    it says `"host": "local"`, runs an agent CLI (needs_cli), reads commits with git (needs_history) or names a path of
+    this machine (host_path), and it is cheap enough to run beside the
     spilled part without a checks slot here (no test suite or build: checklane.run_class), unwrapped and in a
     clean checkout."""
     from . import checklane, cleantree, push
     if getattr(c, "spill", None) is not None or getattr(c, "keep_here", False) or push.remote_host(c) \
             or cleantree.authoring(c) or getattr(c, "wrap", ()):
         return False
-    if getattr(c, "host", "") != remotecheck.LOCAL and not needs_cli(c) and not needs_history(c):
+    if getattr(c, "host", "") != remotecheck.LOCAL and not needs_cli(c) and not needs_history(c) \
+            and not host_path(c):
         return False
     return checklane.run_class([c], cfg) != checklane.SUITE
 
