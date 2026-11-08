@@ -49,6 +49,7 @@ KEEP_S = 6 * 3600.0     # a record with an outcome stays this long for its follo
 FOREIGN_S = 4 * CEILING_S
 DEPTH = 8               # the longest chain of followers resolved
 WAITING, RUNNING, JOINED, SUPERSEDED = "waiting", "running", "joined", "superseded"
+PARKED = "parked"   # parked out of the queue (checksqueue): never a leader to join; waiting again on resume
 
 
 class Yield(Exception):
@@ -211,7 +212,8 @@ def target(me: dict, recs: list[dict]) -> tuple[dict, str] | None:
     Superseded: the same task's group, or its lane when both are worker runs (whatever their commands),
     on another head with a later commit time, live now or ended
     while this run waited (never one that ended before it queued: that older head runs its own checks).
-    Joined: the same key (any task's), waiting ahead of it or running now (a running one first). A run
+    Joined: the same key (any task's), waiting ahead of it or running now (a running one first), never a
+    parked one (PARKED: it holds nothing until it resumes, so nobody waits behind it). A run
     whose liveness is unknown here (another PID namespace) is never followed: if it died, nothing here
     would see it end, so this run queues on its own."""
     if not me.get("task"):

@@ -238,6 +238,9 @@ def bash_refusal(cmd: str) -> str | None:
     return f"`ttp {' '.join(argv[1:3])}` is not one of the coordinator's read-only commands"
 
 
+QUEUE_OPTIONS = ("--task", "--reason", "--until", "--json")   # the first three take a value
+
+
 def queue_refusal(cmd: str) -> str | None:
     """Why a read-only session coordinator may not run `cmd` as a queue command (None: `ttp checks
     park|cancel|resume ...`, shell characters only inside quotes, a `--until` probe of PROBES)."""
@@ -249,9 +252,17 @@ def queue_refusal(cmd: str) -> str | None:
         return "the command does not parse"
     if argv[:1] != ["ttp"] or tuple(argv[1:3]) not in QUEUE_COMMANDS:
         return "not a queue command"
-    for i, w in enumerate(argv):
-        probe = w.removeprefix("--until=") if w.startswith("--until=") else (
-            argv[i + 1] if w == "--until" and i + 1 < len(argv) else None)
+    i = 3
+    while i < len(argv):
+        w, probe = argv[i], None
+        name = w.split("=", 1)[0]
+        if w.startswith("-") and name not in QUEUE_OPTIONS:
+            return f"unknown option {name} (only {', '.join(QUEUE_OPTIONS)}, written in full)"
+        if name in QUEUE_OPTIONS[:3] and "=" not in w and argv[i + 1:i + 2] and argv[i + 1].startswith("-"):
+            return f"{name}'s value starts with '-': write it as {name}=<value>"
+        if name == "--until":
+            probe = w[len("--until="):] if "=" in w else (argv[i + 1] if i + 1 < len(argv) else None)
+        i += 2 if name in QUEUE_OPTIONS[:3] and "=" not in w else 1
         if probe is not None and not _TIME_PROBE.fullmatch(probe.strip()):
             words = shlex.split(probe) if not SHELL_META.search(probe) else []
             if words[:1] != ["ttp"] or not any(tuple(words[1:1 + len(p)]) == p for p in PROBES) and bash_refusal(probe):

@@ -10053,6 +10053,65 @@ def test_checks_park_frees_the_queue_place_and_resumes_at_its_first_arrival_once
     assert "resumed from parking: queuing again at its first arrival" in (run / "checks.log").read_text()
 
 
+def test_a_parked_checks_run_is_no_leader_to_join_until_it_resumes(env, tmp_path, monkeypatch):
+    import threading
+    from ttp import checkcap, checkjoin, checksqueue, cli, locks
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    monkeypatch.setenv("TTP_TASK", str(p.db.add_task("t", "s", kind="code")))
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "1")
+    monkeypatch.setattr(checksqueue, "PROBE_S", 0)
+    monkeypatch.setattr(checksqueue, "POLL_S", 0.05)
+    tickets = lambda: locks.queued(checkcap.slot_dir(), checkcap.RESOURCE)
+    held = checkcap.acquire("other")
+    flag, done = tmp_path / "flag", []
+    mine = lambda: [r for r in checkjoin.records(p.state, prune=False) if r.get("run") == run.name]
+
+    def go():
+        try:
+            done.append(cli.main(["checks", "--", "true"]))
+        except SystemExit as e:
+            done.append(e.code)
+    t = threading.Thread(target=go)
+    t.start()
+    try:
+        assert _wait_for(lambda: len(tickets()) == 1 and len(mine()) == 1)
+        a = mine()[0]
+        assert checksqueue.act(p, run, "park", "the coordinator", "user msg #1: p1 first", f"test -e {flag}")[0] == 0
+        assert _wait_for(lambda: not tickets() and mine()[0].get("phase") == checkjoin.PARKED)
+        # Another task's run of the same checks (same key, through the real writer) queues after it.
+        b_path = checkjoin.register(p.state, task="999", head=a["head"], commit_ts=a["commit_ts"], key=a["key"],
+                                    group="other-group", run="77", arrived=time.time() + 5)
+        b = checkjoin.read(b_path)
+        assert checkjoin.target(b, checkjoin.records(p.state, prune=False)) is None, "a parked run is never joined"
+        flag.touch()
+        assert _wait_for(lambda: len(tickets()) == 1 and mine()[0].get("phase") == checkjoin.WAITING)
+        assert mine()[0]["arrived"] == a["arrived"], "it waits again at its first arrival"
+        got = checkjoin.target(b, checkjoin.records(p.state, prune=False))
+        assert got and got[0]["id"] == a["id"] and got[1] == checkjoin.JOINED, got
+        b_path.unlink()
+    finally:
+        held.close()
+    t.join(30)
+    assert not t.is_alive() and done in ([0], [None]), done
+
+
+def test_a_run_that_joined_one_later_parked_queues_again_at_its_place(env, tmp_path, monkeypatch):
+    import io
+    from ttp import checkjoin, cli
+    p = make(env)
+    monkeypatch.setenv("TTP_DETACHED", "1")
+    lead = checkjoin.register(p.state, task="1", head="h", commit_ts=0, key="k", group="g1", run="11", arrived=1)
+    me = checkjoin.register(p.state, task="2", head="h", commit_ts=0, key="k", group="g2", run="12", arrived=2)
+    got = checkjoin.target(checkjoin.read(me), checkjoin.records(p.state, prune=False))
+    assert got and got[1] == checkjoin.JOINED
+    checkjoin.update(lead, phase=checkjoin.PARKED)   # parked after this run joined it
+    run = tmp_path / "run"
+    run.mkdir()
+    out = io.StringIO()
+    assert cli._checks_follow(p, run, out, "h", me, checkjoin.Yield(*got), detached=True) is None
+    assert "was parked; queueing again at the same place" in out.getvalue()
+
+
 def test_checks_resume_lets_a_parked_run_queue_again(env, tmp_path, monkeypatch):
     from ttp import checksqueue
     from ttp.runner import proc_start
@@ -10222,6 +10281,16 @@ def test_a_precheck_stops_counting_as_read_once_its_review_is_pushing_and_may_th
     assert code == 3 and "still reads" in text, text
 
 
+def test_checks_queue_commands_take_full_option_names_only(env, capsys):
+    import pytest
+    from ttp import checksqueue
+    p = make(env)
+    for cmd in (["park", "5", "--reason", "x", "--unti", "touch /tmp/pwn"], ["park", "5", "--u=touch /tmp/pwn"]):
+        with pytest.raises(SystemExit) as e:
+            checksqueue.main(p, cmd)
+        assert e.value.code == 2 and "unrecognized arguments" in capsys.readouterr().err, cmd
+
+
 def test_session_coordinator_may_run_queue_commands_with_quoted_reasons_and_read_only_probes():
     from ttp import coordtools
     ok = ["ttp checks queue", "ttp checks park 14111 --reason 'user msg #1972: p1 first'",
@@ -10235,8 +10304,14 @@ def test_session_coordinator_may_run_queue_commands_with_quoted_reasons_and_read
     bad = ["ttp checks park 5 --reason x; rm -rf /tmp/x", "ttp checks park 5 --reason \"$(id)\"",
            "ttp checks park 5 --reason x --until 'rm -f /tmp/x'", "ttp checks park 5 --reason x --until 'ttp push'",
            "ttp checks park 5 --reason x --until 'ttp checks --result a; touch b'", "ttp checks --detach",
-           "ttp push --detach", "ttp checks park 5 --reason x > /tmp/f"]
+           "ttp push --detach", "ttp checks park 5 --reason x > /tmp/f",
+           # argparse abbreviations of --until and unknown options never slip past (review #7268)
+           "ttp checks park 5 --reason x --unti 'touch /tmp/pwn'", "ttp checks park 5 --reason x --u='touch /tmp/pwn'",
+           "ttp checks park 5 --reason x --un 'touch /tmp/pwn'", "ttp checks park 5 --reason x --fresh",
+           "ttp checks park 5 --reason x -h", "ttp checks park 5 --reason x -- 'touch /tmp/pwn'",
+           "ttp checks park 5 --reason --until 'touch /tmp/pwn'"]
     for cmd in bad:
         assert coordtools.queue_refusal(cmd) is not None, cmd
+    assert coordtools.queue_refusal("ttp checks park 5 --reason='a b' --task=6 --json") is None
     rules = coordtools._rules("demo")
     assert "Bash(ttp checks park *)" in rules and "Bash(ttp checks queue)" in rules

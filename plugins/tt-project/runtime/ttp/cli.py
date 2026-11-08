@@ -3824,7 +3824,7 @@ def cmd_checks(a) -> None:
                                     todo, light, str(top),
                                     checklane.wrap_key(wrap) if any(str(c) in wrapped for c in todo) else "",
                                     spill_ok, (lambda: _checks_yield(p, join_rec)) if join_rec else None,
-                                    no_spill)
+                                    no_spill, join_rec)
             except checkjoin.Yield as y:
                 slot = None
                 joined = _checks_follow(p, Path(run_dir), out, head, join_rec, y, bool(getattr(a, "own_group", False)))
@@ -4788,6 +4788,9 @@ def _checks_follow(p: Project, run_dir: Path, out, head: str, me: Path | None, y
             if got == "lost":
                 tell(f"run {lead.get('run') or '?'} ended without a result; queueing again at the same place")
                 return None
+            if got == "wait" and how == checkjoin.JOINED and (rec or {}).get("phase") == checkjoin.PARKED:
+                tell(f"run {rec.get('run') or '?'} was parked; queueing again at the same place")
+                return None
             if foreground and time.time() - start >= checkcap.FOREGROUND_WAIT_S:
                 return "handover", None
             if time.time() - told >= checklane.TELL_S:
@@ -4912,7 +4915,7 @@ def _checks_lane_status(as_json: bool) -> int:
 def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: bool = False,
                  arrived: float | None = None, same: str = "", done=None, cmds: list | None = None,
                  light: bool = False, top: str = "", lock: str = "", spill: bool = False, yielder=None,
-                 spill_off: str = ""):
+                 spill_off: str = "", join_rec: Path | None = None):
     """Wait for a host-wide checks slot (checkcap). The wait is told in the log, the run's notes
     (progress.md) and CHECKS_SLOT_WAIT, which the `--result` probe and `ttp status` read. In the
     foreground it is recorded like a `ttp lock` wait, so it does not count toward the run's wall
@@ -5012,6 +5015,7 @@ def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: boo
         except checksqueue.Parked:
             # Parked: it waits outside the queue holding nothing, then queues again at its first arrival.
             arrived = start if arrived is None else arrived
+            checkjoin.update(join_rec, phase=checkjoin.PARKED)   # no run joins it while parked (checkjoin.target)
             if why := checksqueue.hold(p, run_dir, head, checksqueue.request(run_dir) or {},
                                        lambda: _checks_cancelled(run_dir) or (moved() or ""),
                                        lambda d: write_json(run_dir / CHECKS_SLOT_WAIT, d)):
@@ -5022,6 +5026,7 @@ def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: boo
                 if _read_checks_pid(run_dir).get("pid") == os.getpid():
                     _checks_drop(run_dir, why, rc=False)
                 die(f"ttp checks: {said}", 1)
+            checkjoin.update(join_rec, phase=checkjoin.WAITING)   # its record keeps its first arrival
             tell(f"resumed from parking: queuing again at its first arrival ({timefmt.clock(now=arrived)})")
             continue
         except checkcap.Upgraded as e:

@@ -278,7 +278,7 @@ def queued(p) -> list[dict]:
 def main(p, argv: list[str]) -> int:
     """`ttp checks park|cancel|resume <run> --reason ... [--until ...] [--task <id>]` and `ttp checks queue`."""
     import argparse
-    ap = argparse.ArgumentParser(prog=f"ttp checks {argv[0]}")
+    ap = argparse.ArgumentParser(prog=f"ttp checks {argv[0]}", allow_abbrev=False)   # coordtools.queue_refusal reads the full names
     ap.add_argument("run", nargs="?", default="")
     ap.add_argument("--task", default="")
     ap.add_argument("--reason", default="")
