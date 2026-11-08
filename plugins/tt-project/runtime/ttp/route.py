@@ -75,7 +75,9 @@ names the provider, tier and model. The hold ends (release, each daemon tick) on
 configured model changes or the daemon's model-free /models check (at most hourly while a tier routes:
 MODELS_EVERY_S) lists the model again. That check writes the served ids, its time and HTTP status to
 the project state dir's MODELS_FILE, never the key or URL; `ttp status` and doctor show holds and ids
-(model_lines), so a worker can pick a replacement without the key.
+(model_lines), so a worker can pick a replacement without the key. With providers.chat.model_ranking
+set, a routed start whose model is held or unlisted runs the highest-ranked served model instead
+(modelrank.py), and its entry names the model it stands in for (modelrank.KEY).
 
 Salvage: a routed run on the endpoint that exited cleanly without a result.json but printed its
 hand-off in its final reply keeps it (salvage): exactly one top-level JSON object in that reply,
@@ -352,15 +354,25 @@ def refresh_served(state: Path, alias: str) -> bool:
     return True
 
 
-def models_due(cfg: dict, state: Path, now: float) -> str:
-    """The endpoint alias whose /models check is due (a tier routes to it and the last check is
-    MODELS_EVERY_S old), else ''."""
+def models_due(cfg: dict, state: Path, now: float, db=None) -> str:
+    """The endpoint alias whose /models check is due (a tier routes to it, or with a model ranking set
+    a queued or running task pins a model on it, and the last check is MODELS_EVERY_S old), else ''."""
     entry = (cfg.get("providers") or {}).get(TO) or {}
     alias = str(entry.get("endpoint") or "") if isinstance(entry, dict) else ""
-    if not alias or not any(target(cfg, t) for t in (entry.get("tiers") or {})):
+    if not alias or not (any(target(cfg, t) for t in (entry.get("tiers") or {})) or _ranked_pin(cfg, db)):
         return ""
     last = read_served(state).get(TO) or {}
     return alias if now - float(last.get("checked") or 0) >= MODELS_EVERY_S else ""
+
+
+def _ranked_pin(cfg: dict, db) -> bool:
+    """A model ranking is set and a queued or running task pins a model on the endpoint (modelrank.py)."""
+    from . import modelrank
+    if db is None or not modelrank.ranking(cfg):
+        return False
+    core = (cfg.get("core_provider") or "claude") == TO
+    return bool(db.q("SELECT 1 FROM tasks WHERE status IN ('queued','running') AND COALESCE(model,'')!='' "
+                     "AND (provider=? OR (? AND provider IS NULL)) LIMIT 1", (TO, int(core))))
 
 
 def model_lines(db, cfg: dict, state: Path, now: float, at) -> list[str]:
@@ -737,6 +749,11 @@ def config_problems(raw: dict) -> list[str]:
     v = chat.get("route_cooldown_s")
     if v is not None and (isinstance(v, bool) or not isinstance(v, (int, float)) or v < 0):
         out.append(f"providers.{TO}.route_cooldown_s: give seconds (0 or more); {COOLDOWN_S} is used")
+    from .modelrank import ranking_of
+    try:
+        ranking_of(chat.get("model_ranking"))
+    except ValueError as e:
+        out.append(f"{e}; nothing is ranked")
     return out
 
 

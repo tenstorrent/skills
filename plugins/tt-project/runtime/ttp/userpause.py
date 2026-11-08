@@ -140,12 +140,10 @@ def user_gate(probe: object, cfg: dict | None = None) -> list[str]:
     return got
 
 
-def user_gated(probe: object, cfg: dict | None = None, root: Path | str | None = None) -> bool:
-    """Whether `probe` cannot pass until the user's word: a user pause (is_probe), or a probe that
-    requires a user marker (user_gate) that is missing now (relative paths from `root`, where probes
-    run). A path that still holds a variable after expansion is unknown: not gated."""
-    if is_probe(probe, cfg):
-        return True
+def _gate_paths(probe: object, cfg: dict | None, root: Path | str | None) -> list[Path]:
+    """The user-marker paths `probe` requires (user_gate), relative ones from `root`; a path that still
+    holds a variable after expansion, or a relative one with no `root`, is unknown and left out."""
+    out = []
     for raw in user_gate(probe, cfg):
         path = os.path.expanduser(os.path.expandvars(raw))
         if "$" in path:
@@ -155,9 +153,32 @@ def user_gated(probe: object, cfg: dict | None = None, root: Path | str | None =
             if root is None:
                 continue
             p = Path(root) / p
-        if not p.exists():
-            return True
-    return False
+        out.append(p)
+    return out
+
+
+def user_gated(probe: object, cfg: dict | None = None, root: Path | str | None = None) -> bool:
+    """Whether `probe` cannot pass until the user's word: a user pause (is_probe), or a probe that
+    requires a user marker (user_gate) that is missing now (relative paths from `root`, where probes
+    run). A path that still holds a variable after expansion is unknown: not gated."""
+    if is_probe(probe, cfg):
+        return True
+    return any(not p.exists() for p in _gate_paths(probe, cfg, root))
+
+
+def gate_opened(probe: object, cfg: dict | None = None, root: Path | str | None = None,
+                now: float | None = None) -> float | None:
+    """When the user's word opened `probe`'s user-marker gate (user_gate): the latest mtime of its
+    markers, all present, at most `now`. None when it has no gate or one is missing. Its live part is
+    timed from there, so a wait held by the user is not stale the moment the marker appears."""
+    at = None
+    for p in _gate_paths(probe, cfg, root):
+        try:
+            m = p.stat().st_mtime
+        except OSError:
+            return None
+        at = m if at is None else max(at, m)
+    return at if at is None or now is None else min(at, now)
 
 
 def probe_of(task: dict, cfg: dict | None = None) -> str | None:

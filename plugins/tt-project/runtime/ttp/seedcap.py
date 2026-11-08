@@ -14,8 +14,10 @@ the per-wake cap plus the expected seed cost:
   CACHE_WRITE_1H). Never the project-wide rate of budget.estimate_cost, which averages mostly workers
   booked far below a coordinator wake. Never its whole cost either, which also holds the wake's own
   work under the cap raised here, so each raise would feed the next. Part of its cache writes are
-  its own work too, so the seed counts at most SEED_FACTOR times that wake's own prompt size
-  (turn.prompt_bytes, else this wake's): the cap then stays bounded however much each wake spends.
+  its own work too, so the seed counts at most SEED_FACTOR times that wake's own seeded prompt size
+  (turn.session.seed_chars: system, context and prompt with the seed; an older row without it,
+  turn.prompt_bytes, the size before the seed; neither, this wake's): the cap then stays bounded
+  however much each wake spends, and a seed that grew with chat and the handover note is not clipped.
   A wake that reported no cache writes is skipped. Without such a wake, the seed prompt's size at
   the model's prices (budget.estimate_cost: this project's own rate on the provider, else the
   configured fallback).
@@ -31,15 +33,25 @@ import json
 HISTORY = 3
 CHARS_PER_TOKEN = 4
 CACHE_WRITE_1H = 2.0   # a 1h cache write costs 2x input (cachettl.py); the 5m weight is TOKEN_WEIGHTS'
-# A past seed counts at most this many times its wake's prompt size in tokens: the agent's own system
-# prompt and tool definitions, which the prompt size leaves out, and a denser text than CHARS_PER_TOKEN
-# (a live new-session wake wrote 2.6 times its prompt bytes / 4), but not a wake's whole work.
+# A past seed counts at most this many times its wake's prompt size in tokens: room for the agent's own
+# system prompt and tool definitions, which that size leaves out, and a denser text than CHARS_PER_TOKEN,
+# but not a wake's whole work. Calibrated on one live new-session wake, against the size before its seed
+# (turn.prompt_bytes): it wrote 2.6 times that size / 4 to the cache. Its seeded size was not recorded,
+# so the ratio to seed_chars, which includes the seed, is lower by an unmeasured amount.
 SEED_FACTOR = 3.0
+
+
+def _size(v) -> int:
+    try:
+        return max(int(v or 0), 0)
+    except (TypeError, ValueError, OverflowError):
+        return 0
 
 
 def _seed(r, turn: dict, cfg: dict, chars: int) -> float:
     """Run row r's seed: its cache writes and uncached input at its own booked rate, at most
-    SEED_FACTOR times its prompt size (turn.prompt_bytes, else `chars`), never more than it booked."""
+    SEED_FACTOR times its prompt size (the larger of turn.session.seed_chars and turn.prompt_bytes,
+    else `chars`), never more than it booked."""
     from .budget import TOKEN_WEIGHTS
     w = {**TOKEN_WEIGHTS, **((cfg.get("budget") or {}).get("estimate_weights") or {})}
     if turn.get("cache_ttl") == "1h":
@@ -48,10 +60,9 @@ def _seed(r, turn: dict, cfg: dict, chars: int) -> float:
     units = sum(n[k] * w[k] for k in n)
     if units <= 0:
         return 0.0
-    try:
-        size = int(turn.get("prompt_bytes") or 0)
-    except (TypeError, ValueError):
-        size = 0
+    session = turn.get("session")
+    size = max(_size(turn.get("prompt_bytes")),
+               _size(session.get("seed_chars") if isinstance(session, dict) else None))
     size = size if size > 0 else int(chars)
     seed = n["cache_write"] * w["cache_write"] + n["input"] * w["input"]
     if size > 0:

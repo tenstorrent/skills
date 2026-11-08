@@ -27208,6 +27208,7 @@ def test_durable_write_syncs_renames_and_keeps_the_mode(env, monkeypatch):
 # else goes through project.durable_write / durable_append / write_json.
 DURABLE_EXEMPT = {
     ("shorttmp.py", "with os.fdopen(out, 'w') as f:"): "marks a check's scratch dir on the RAM disk with its allocation, which a reboot clears anyway; a lost mark only counts the dir as live for a few minutes",
+    ("benchrun.py", 'open(run / "runner.log", "wb")'): "the supervisor's stdout in a bench cell's temp folder, copied out after the cell; a cut log costs only the log",
     ("ttp_pytest_durations.py", 'open(tmp, "w")'): "runs inside the checked repo's pytest, not the runtime: a timing note written whole to a temp file, then renamed; a lost one costs only the note",
     ("ttp_pytest_durations.py", "os.replace(tmp, self.path)"): "renames that timing note into place: a rename lost to a crash leaves the old note or none",
     ("ttp_pytest_durations.py", 'open(self.live, "a")'): "runs inside the checked repo's pytest, not the runtime: appends one timing line per test start and end; a cut last line is ignored on read, a lost one costs only the note",
@@ -27312,6 +27313,12 @@ DURABLE_EXEMPT = {
     ("cursorhook.py", 'with open(path, "a") as f:'): "info/exclude lines for a Cursor run's hooks file, re-added by the next run that finds them missing; never state",
     ("cursorhook.py", "tmp.write_text(text)"): "a Cursor run's hooks file or its sidecar in the run's cwd, rewritten by each run that joins or leaves; never state",
     ("cursorhook.py", "os.replace(tmp, path)"): "places that hooks file or sidecar atomically; same lifetime as above",
+    ("runnerenv.py", '.lock", "a") as fh'): "the checks env build's flock guard file, never written",
+    ("runnerenv.py", "(new / INFO).write_text("): "inside a new env folder not yet linked in; a torn one is never linked, and a linked env missing its info is rebuilt",
+    ("runnerenv.py", "os.replace(tmp, link)"): "moves the env's symlink atomically to a fully built env (no new data); one lost to a crash leaves the old link and the next run rebuilds",
+    ("runnerenv.py", "tmp.write_bytes(r.stdout)"): "a run-dir copy of the checked commit's checks.python_lock, read again from git by each run; never state",
+    ("runnerenv.py", "os.replace(tmp, path)"): "moves that run-dir lock copy into place whole (no new data)",
+    ("runnerenv.py", "Path(out).write_text("): "`ttp checks --freeze-lock` writes a lock file the user named and commits; never state",
     ("hostrun.py", 'os.replace(q, folder / f"{rid}.running")'): "claims a queued host-run request (a rename, no new data): one lost to a crash leaves the request queued, and the restarted daemon runs it or drops it once its client gave up",
 }
 
@@ -38599,6 +38606,7 @@ _forbid = os.path.realpath(os.environ["TTP_TEST_FORBID_ROOT"])
 _allow = [os.path.realpath(x) for x in os.environ["TTP_TEST_ALLOW_ROOT"].split(os.pathsep) if x]
 _log = os.environ["TTP_TEST_FORBID_LOG"]
 _WRITE = os.O_WRONLY | os.O_RDWR | os.O_CREAT
+_busy = []   # set while the hook logs: its own log write must not re-enter it
 
 
 def _under(path, root):
@@ -38606,6 +38614,8 @@ def _under(path, root):
 
 
 def _hook(event, args):
+    if _busy:
+        return
     if event == "open":
         path, mode, flags = args
         if not (isinstance(flags, int) and flags & _WRITE) and not any(c in str(mode or "") for c in "wax+"):
@@ -38620,8 +38630,12 @@ def _hook(event, args):
         return
     real = os.path.realpath(path)
     if _under(real, _forbid) and not any(_under(real, a) for a in _allow):
-        with open(_log, "a") as f:
-            f.write(f"{event} {real}\\n")
+        _busy.append(1)
+        try:
+            with open(_log, "a") as f:
+                f.write(f"{event} {real}\\n")
+        finally:
+            _busy.clear()
 
 
 sys.addaudithook(_hook)
@@ -38637,7 +38651,9 @@ def _forbid_audit_plugin(where: pathlib.Path) -> pathlib.Path:
 def test_the_forbidden_root_audit_logs_writes_outside_the_allowed_root(tmp_path):
     # Negative control for the audit the isolation regression relies on, with a forbidden root of its
     # own (never /tmp): writes outside the allowed roots are logged, writes inside either are not.
-    forbid, log = tmp_path / "forbid", tmp_path / "audit.log"
+    # The log itself sits under the forbidden root: logging a write must not re-enter the hook.
+    forbid = tmp_path / "forbid"
+    log = forbid / "audit.log"
     allow, allow2 = forbid / "allow", forbid / "checkout"
     allow.mkdir(parents=True)
     allow2.mkdir()
@@ -38685,8 +38701,8 @@ def test_checks_isolate_run_local_tmpdir_from_enclosing_git_and_project(env, tmp
         "test_status_without_a_name_uses_the_project_of_the_current_folder",
         "test_check_commands_have_first_failure_semantics",
     )]
-    p.set_config("delivery.push_checks", [shlex.join([
-        sys.executable, "-m", "pytest", "-q", "-p", "ttp_forbid_audit", "-o", "tmp_path_retention_policy=all",
+    p.set_config("delivery.push_checks", [shlex.join([   # python3: the checks' pinned env's (its test stand-in)
+        "python3", "-m", "pytest", "-q", "-p", "ttp_forbid_audit", "-o", "tmp_path_retention_policy=all",
         *targets,
     ])])
     # The child run's TMPDIR is the deep run-local folder itself, with no short alias elsewhere; the
@@ -38695,9 +38711,10 @@ def test_checks_isolate_run_local_tmpdir_from_enclosing_git_and_project(env, tmp
     plugin = _forbid_audit_plugin(tmp_path / "audit-plugin")
     monkeypatch.setenv("PYTHONPATH", os.pathsep.join(filter(None, [str(plugin), os.environ.get("PYTHONPATH")])))
     monkeypatch.setenv("TTP_TEST_FORBID_ROOT", "/tmp")
-    # The child pytest's own bytecode and cache in the checkout are not temp files: allow the checkout,
-    # so a checkout under /tmp audits exactly what one elsewhere does.
-    monkeypatch.setenv("TTP_TEST_ALLOW_ROOT", os.pathsep.join([str(nested_tmp), str(RUNTIME.parents[2])]))
+    # The child pytest's own bytecode and cache in the checkout are not temp files, nor is the run
+    # folder (the durable record, e.g. slowest-tests.json): allow both, so a checkout or suite tmp
+    # under /tmp audits exactly what one elsewhere does.
+    monkeypatch.setenv("TTP_TEST_ALLOW_ROOT", os.pathsep.join([str(nested_tmp), str(RUNTIME.parents[2]), str(run)]))
     monkeypatch.setenv("TTP_TEST_FORBID_LOG", str(audit_log))
     monkeypatch.setenv("TTP_TEST_SHORT_TMP_ROOT", str(nested_tmp))   # the child suite's own short-dir folder
     for var in ("TMPDIR", "TMP", "TEMP"):

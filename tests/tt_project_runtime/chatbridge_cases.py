@@ -1170,14 +1170,15 @@ def test_a_start_whose_tier_leaves_the_route_rechecks_the_core_slots(env, monkey
     assert _route_slots(p, d, monkeypatch, 2, chat_max=2, tag="free") == [(core, None)]
 
 
-def _route_finish(p, d, tid, exit_info, provider="chat", result=None, reply=None, earlier=None, is_error=False):
+def _route_finish(p, d, tid, exit_info, provider="chat", result=None, reply=None, earlier=None, is_error=False,
+                  routed=None):
     """`reply`: the run's final reply text (its output.jsonl result line, an error one with `is_error`);
-    `earlier`: an earlier turn's text."""
+    `earlier`: an earlier turn's text; `routed`: the run's route entry (default: light on _RT_MODEL)."""
     p.db.update_task(tid, status="running")
-    note = {"route": {"tier": "light", "to": "chat", "model": _RT_MODEL, "fallback": "none"}}
+    note = {"route": routed or {"tier": "light", "to": "chat", "model": _RT_MODEL, "fallback": "none"}}
     rid = p.db.x("INSERT INTO runs(task,role,provider,model,started,status,boot_id,note) "
                  "VALUES(?,'worker',?,?,?,'running',?,?)",
-                 (tid, provider, _RT_MODEL, time.time() - 30, d.boot, json.dumps(note)))
+                 (tid, provider, note["route"]["model"], time.time() - 30, d.boot, json.dumps(note)))
     rd = p.runs / str(rid)
     rd.mkdir(parents=True)
     if result is not None:
@@ -1542,6 +1543,208 @@ def test_a_model_missing_hold_ends_when_the_endpoint_lists_it_or_the_config_chan
     route.refresh_served(p.state, "placeholder")
     rec = route.read_served(p.state)["chat"]
     assert not rec["ok"] and rec["ids"] == ["example-org/model-b", _RT_MODEL] and up.url not in json.dumps(rec)
+
+
+def _ranked(p, d, monkeypatch, ids, ranking=("rank-a", "rank-b")):
+    """A routed light tier with a model ranking, the endpoint's last /models check listing `ids`."""
+    from ttp import route
+    _route_config(p, model_ranking=list(ranking))
+    d._load_config()
+    route.write_served(p.state, "chat", True, "HTTP 200", list(ids), time.time())
+    alerts = []
+    monkeypatch.setattr(d, "observe", lambda *a, **k: None)
+    monkeypatch.setattr(d, "alert", lambda key, text, severity="high", **k: alerts.append((key, text, severity)))
+    return alerts
+
+
+def test_a_routed_tier_whose_model_is_down_runs_the_top_ranked_served_model(env, monkeypatch, mock_chat):
+    """User's rule: if a model goes down, use the smartest model still served, by the project's ranking."""
+    from ttp import modelpick, modelrank, route
+    from ttp.daemon import Daemon
+    p = make(env)
+    d = Daemon(p.base)
+    alerts = _ranked(p, d, monkeypatch, ["rank-b", "rank-a", _RT_MODEL])
+    # Up: the tier's own model, nothing ranked.
+    prov, _, note = _route_dispatch(p, d, monkeypatch, title="up")
+    assert prov == "chat" and note[route.KEY]["model"] == _RT_MODEL and modelrank.KEY not in note[route.KEY]
+    # Refused (the model_missing hold): the top-ranked served model, one low alert, the hold's notice skipped.
+    tid = p.db.add_task("build", "", kind="work", tier="light", priority=3, budget_usd=8.0, labels=[])
+    run, _ = _route_finish(p, d, tid, {"bridge": _model_missing_run(p, d, monkeypatch, mock_chat)})
+    assert route.of(run["note"])["fallback"] == "model_missing" and route.held(p.db, d.cfg, "light") == _RT_MODEL
+    assert alerts == []
+    p.db.update_task(tid, status="done")
+    for title in ("down", "still down"):
+        prov, tier, note = _route_dispatch(p, d, monkeypatch, title=title)
+        assert (prov, tier) == ("chat", "light"), note
+        assert note[route.KEY] == {"tier": "light", "to": "chat", "model": "rank-a", "fallback": "none",
+                                   modelrank.KEY: {"from": _RT_MODEL, "why": "refused"}}
+    assert modelpick.run_model(note, "chat", _RT_MODEL, "low") == ("rank-a", "low")   # start_run runs it
+    assert modelpick.run_model(note, "claude", "sonnet", "low") == ("sonnet", "low")
+    assert len(alerts) == 1 and alerts[0][2] == "low" and "rank-a" in alerts[0][1] and _RT_MODEL in alerts[0][1]
+    # The stand-in is refused too: it is skipped, the next ranked one runs, the tier's hold is unchanged.
+    tid = p.db.add_task("build2", "", kind="work", tier="light", priority=3, budget_usd=8.0, labels=[])
+    run, task = _route_finish(p, d, tid, {"bridge": {"last_fault": "model_missing"}}, routed=note[route.KEY])
+    assert run["status"] == "fallback" and task["status"] == "queued" and int(task["attempts"] or 0) == 0
+    assert route.held(p.db, d.cfg, "light") == _RT_MODEL and modelrank.down(p.db, d.cfg, p.state, "rank-a", time.time())
+    p.db.update_task(tid, status="done")
+    prov, _, note = _route_dispatch(p, d, monkeypatch, title="next ranked")
+    assert prov == "chat" and note[route.KEY]["model"] == "rank-b" and len(alerts) == 2
+    # Back: the endpoint lists the model again after a check that left it out, so the hold ends and
+    # the tier's own model runs again; the switch record ends with it.
+    now = time.time()
+    route.write_served(p.state, "chat", True, "HTTP 200", ["rank-b"], now + 1)
+    route.release(p.db, d.cfg, route.read_served(p.state), now + 1)
+    route.write_served(p.state, "chat", True, "HTTP 200", ["rank-b", _RT_MODEL], now + 2)
+    assert route.release(p.db, d.cfg, route.read_served(p.state), now + 2)[0][2] == "the endpoint lists it again"
+    prov, _, note = _route_dispatch(p, d, monkeypatch, title="back")
+    assert prov == "chat" and note[route.KEY] == {"tier": "light", "to": "chat", "model": _RT_MODEL, "fallback": "none"}
+    assert p.db.kv(modelrank.SWITCH + "light") is None and "back on " + _RT_MODEL in (p.logs / "daemon.log").read_text()
+
+
+def test_rule_routes_of_one_tier_keep_their_own_model_ranking_switch(env, monkeypatch):
+    """Two models of one tier (its own route and a providers.chat.routes rule) both down: each start
+    keeps its own switch record, so alternating starts raise one low alert per switch, not one each."""
+    from ttp import modelrank, route
+    from ttp.daemon import Daemon
+    p = make(env)
+    d = Daemon(p.base)
+    alerts = _ranked(p, d, monkeypatch, ["rank-a"])
+    _route_config(p, model_ranking=["rank-a"], routes=[{"labels_any": ["bulk"], "model": "rule-model-b"}])
+    d._load_config()
+    task = {"id": None, "kind": "work"}
+    for _ in range(3):
+        own = d._route_entry(task, "light", "chat", _RT_MODEL, time.time())
+        by_rule = d._route_entry(task, "light", "chat", "rule-model-b", time.time(), 0)
+        assert own["model"] == by_rule["model"] == "rank-a" and by_rule["rule"] == 0
+        assert by_rule[modelrank.KEY] == {"from": "rule-model-b", "why": "not listed"}
+    assert len(alerts) == 2 and {a[2] for a in alerts} == {"low"}
+    assert p.db.kv(modelrank.SWITCH + "light")["from"] == _RT_MODEL
+    assert p.db.kv(modelrank.SWITCH + "light:rule0")["from"] == "rule-model-b"
+    # The rule's model is served again: only its own record ends.
+    route.write_served(p.state, "chat", True, "HTTP 200", ["rank-a", "rule-model-b"], time.time())
+    assert d._route_entry(task, "light", "chat", "rule-model-b", time.time(), 0)["model"] == "rule-model-b"
+    assert p.db.kv(modelrank.SWITCH + "light:rule0") is None and p.db.kv(modelrank.SWITCH + "light")
+
+
+def test_a_model_left_out_of_the_served_list_is_ranked_and_an_empty_ranking_changes_nothing(env, monkeypatch):
+    from ttp import modelrank, route
+    from ttp.daemon import Daemon
+    p = make(env)
+    d = Daemon(p.base)
+    alerts = _ranked(p, d, monkeypatch, ["rank-b"])
+    prov, _, note = _route_dispatch(p, d, monkeypatch, title="unlisted")
+    assert prov == "chat" and note[route.KEY]["model"] == "rank-b"
+    assert note[route.KEY][modelrank.KEY] == {"from": _RT_MODEL, "why": "not listed"}
+    # A model pick to another provider is never ranked against the chat endpoint's list.
+    assert modelrank.KEY not in d._route_entry({"id": None, "kind": "work"}, "light", "codex", "gpt-x", time.time())
+    # Nothing ranked is served: the tier's own model, as before (a refusal then holds it as usual).
+    route.write_served(p.state, "chat", True, "HTTP 200", ["other"], time.time())
+    assert _route_dispatch(p, d, monkeypatch, title="none served")[2][route.KEY]["model"] == _RT_MODEL
+    # A failed /models check proves nothing is served: nothing is swapped.
+    route.write_served(p.state, "chat", False, "HTTP 503", None, time.time())
+    assert modelrank.pick(p.db, d.cfg, p.state, _RT_MODEL, time.time()) is None
+    # A cool-down (the whole endpoint faulted) swaps nothing: the core provider, as before.
+    route.write_served(p.state, "chat", True, "HTTP 200", ["rank-b"], time.time())
+    route.cool(p.db, d.cfg, "chat", "down", 1, time.time())
+    prov, _, note = _route_dispatch(p, d, monkeypatch, title="cooling")
+    assert prov != "chat" and note[route.KEY]["fallback"] == "down" and modelrank.KEY not in note[route.KEY]
+    p.db.x("DELETE FROM kv WHERE key=?", (route.COOL + "chat",))
+    # Empty ranking: today's behaviour, held or unlisted alike.
+    for empty in ([], "", None):
+        _route_config(p, model_ranking=empty)
+        d._load_config()
+        assert modelrank.ranking(d.cfg) == [] and modelrank.down(p.db, d.cfg, p.state, _RT_MODEL, time.time()) == ""
+        assert _route_dispatch(p, d, monkeypatch, title=f"empty {empty!r}", force=True)[2][route.KEY] == \
+            {"tier": "light", "to": "chat", "model": _RT_MODEL, "fallback": "none"}
+        route.hold(p.db, "light", _RT_MODEL, 1, time.time())
+        prov, _, note = _route_dispatch(p, d, monkeypatch, title=f"held {empty!r}", force=True)
+        assert prov != "chat" and note[route.KEY]["fallback"] == "model_missing" and modelrank.KEY not in note[route.KEY]
+        p.db.x("DELETE FROM kv WHERE key=?", (route.MISSING + "light",))
+    assert len(alerts) == 1
+    # The setting is checked: a malformed ranking is named and ranks nothing.
+    assert modelrank.ranking_of("a, b,a") == ["a", "b"]
+    for bad in (3, {"a": 1}, ["a", 2]):
+        assert any("model_ranking" in x for x in route.config_problems({"providers": {"chat": {"model_ranking": bad}}}))
+        assert modelrank.ranking({"providers": {"chat": {"model_ranking": bad}}}) == []
+
+
+def test_a_required_model_pin_that_is_down_waits_and_a_preference_pin_is_swapped(env, monkeypatch):
+    from ttp import daemon as dmod
+    from ttp import failover, modelrank, route
+    p = make(env)
+    d = dmod.Daemon(p.base)
+    alerts = _ranked(p, d, monkeypatch, ["rank-a"])
+    req = p.db.add_task("required", "s", kind="work", tier="light", priority=3, provider="chat", model=_RT_MODEL,
+                        labels=[failover.REQUIRED_LABEL])
+    pref = p.db.add_task("preferred", "s", kind="work", tier="light", priority=3, provider="chat", model=_RT_MODEL,
+                         labels=[])
+    ctx = {"now": time.time(), "paused": {}, "logged_out": {}, "busy": {}, "committed": None}
+    assert d._start_hold(p.db.task(req), "chat", ctx) == "held"
+    assert "required model " + _RT_MODEL + " is down" in ctx["held_by"][req]
+    assert d._required_model_down(p.db.task(pref), "chat", time.time()) == ""
+    assert d._required_model_down(p.db.task(req), "claude", time.time()) == ""   # no served list there
+
+    class Proc:   # never a real runner
+        pid = 4242
+    real = subprocess.Popen
+    monkeypatch.setattr(dmod.subprocess, "Popen",
+                        lambda argv, *a, **k: Proc() if "ttp.runner" in argv else real(argv, *a, **k))
+    rid = d.start_run("worker", "go", "chat", "light", str(p.root), task=p.db.task(pref))
+    row = p.db.one("SELECT model, note FROM runs WHERE id=?", (rid,))
+    assert row["model"] == "rank-a" and json.loads(row["note"])[modelrank.KEY] == {"from": _RT_MODEL, "why": "not listed"}
+    assert [a[2] for a in alerts] == ["low"]
+    # Served again: the required pin starts, the preference pin runs its own model again.
+    route.write_served(p.state, "chat", True, "HTTP 200", ["rank-a", _RT_MODEL], time.time())
+    assert d._required_model_down(p.db.task(req), "chat", time.time()) == ""
+    rid = d.start_run("worker", "go", "chat", "light", str(p.root), task=p.db.task(pref))
+    assert p.db.one("SELECT model FROM runs WHERE id=?", (rid,))["model"] == _RT_MODEL
+    assert p.db.kv(modelrank.SWITCH + "pin:" + _RT_MODEL) is None
+
+
+def test_a_stale_served_list_holds_and_swaps_nothing_and_a_pinned_chat_task_keeps_it_fresh(env, monkeypatch):
+    """A /models check over modelrank.STALE_S old is unknown: no required-pin hold, no swap; with a
+    ranking set, a queued pinned chat task makes the check due though no tier routes to chat."""
+    from ttp import daemon as dmod
+    from ttp import failover, modelrank, route
+    p = make(env)
+    d = dmod.Daemon(p.base)
+    alerts = _ranked(p, d, monkeypatch, ["rank-a"])
+    req = p.db.add_task("required", "s", kind="work", tier="light", priority=3, provider="chat", model=_RT_MODEL,
+                        labels=[failover.REQUIRED_LABEL])
+    now = time.time()
+    assert d._required_model_down(p.db.task(req), "chat", now)   # a fresh 'not listed' holds it
+    old = now - modelrank.STALE_S - 60
+    route.write_served(p.state, "chat", True, "HTTP 200", ["rank-a"], old)
+    assert modelrank.served(p.state, now) is None and modelrank.down(p.db, d.cfg, p.state, _RT_MODEL, now) == ""
+    assert d._required_model_down(p.db.task(req), "chat", now) == ""
+    assert d._rank_pick("tier light", "light", _RT_MODEL, now) is None and alerts == []
+    # No tier routes to chat: due only with the ranking set and a pinned chat task queued.
+    _route_config(p, route=None, model_ranking=["rank-a"])
+    d._load_config()
+    assert not any(route.target(d.cfg, t) for t in ("light", "standard", "deep"))
+    assert route.models_due(d.cfg, p.state, now) == ""                 # the daemon's db not given
+    assert route.models_due(d.cfg, p.state, now, p.db) == "placeholder"
+    p.db.x("UPDATE tasks SET status='done' WHERE id=?", (req,))
+    assert route.models_due(d.cfg, p.state, now, p.db) == ""           # no pinned chat task left
+    p.db.x("UPDATE tasks SET status='queued', provider=NULL WHERE id=?", (req,))
+    assert route.models_due(d.cfg, p.state, now, p.db) == ""           # an unset provider runs on the core one
+    assert route.models_due({**d.cfg, "core_provider": "chat"}, p.state, now, p.db) == "placeholder"
+    _route_config(p, route=None)
+    d._load_config()
+    assert route.models_due(d.cfg, p.state, now, p.db) == ""           # no ranking: as before
+
+
+def test_a_model_down_with_no_ranked_model_served_keeps_its_switch(env, monkeypatch):
+    from ttp import daemon as dmod
+    from ttp import modelrank
+    p = make(env)
+    d = dmod.Daemon(p.base)
+    _ranked(p, d, monkeypatch, ["rank-a"])
+    now = time.time()
+    assert d._rank_pick("tier light", "light", _RT_MODEL, now)[0] == "rank-a"
+    modelrank.refused(p.db, "rank-a", None, now)   # the stand-in refused too: none served
+    assert d._rank_pick("tier light", "light", _RT_MODEL, now) is None
+    assert p.db.kv(modelrank.SWITCH + "light") and "back on" not in (p.logs / "daemon.log").read_text()
 
 
 def test_a_routed_run_with_a_refused_key_goes_through_the_auth_gate_then_falls_back(env, monkeypatch):

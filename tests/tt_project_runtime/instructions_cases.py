@@ -81,20 +81,56 @@ def test_codex_finds_the_runs_developer_instructions_in_its_rollout_head(tmp_pat
     assert get_provider("claude").instructions_recorded(out, argv, SYSTEM_TEXT, env) is None
 
 
-def _runner_run(tmp_path, monkeypatch, rollout, task="7", run_s=30):
+def _runner_run(tmp_path, monkeypatch, rollout, task="7", run_s=30, until_verdict=None):
     """Supervise a stand-in Codex child that prints its thread id, writes `rollout` (None: none) and
-    runs `run_s` seconds; returns exit.json."""
+    runs `run_s` seconds; returns exit.json. With `until_verdict` (a ROLLOUT_WAIT_S) the run's awake
+    time is a test clock (FileClock) the child moves past that wait once its thread id is out; it then
+    runs until the watch thread gave a verdict and looked 3 more times, so no scheduling delay decides
+    the outcome. exit.json then also has "looks_after_verdict" (rollout parses after the verdict)."""
     from ttp import runner
     monkeypatch.setenv("TTP_TEST_POLL_S", "0.1")
     monkeypatch.setattr(runner, "INSTRUCTIONS_EVERY_S", 0.1)
+    monkeypatch.delenv(runner.TEST_CLOCK_ENV, raising=False)
     home, sid = tmp_path / "codex", "0199abcd-0002"
     child = tmp_path / "child.py"
     write = "" if rollout is None else (
         f"from pathlib import Path\nroll = Path({str(home)!r}) / 'sessions/2026/11/02/rollout-x-{sid}.jsonl'\n"
         f"roll.parent.mkdir(parents=True)\nroll.write_text({rollout!r})\n")
+    run = f"time.sleep({run_s})\n"
+    seen = {"verdict": None, "ticks": 0, "parses": 0}
+    if until_verdict is not None:
+        clock, done = tmp_path / "awake-clock", tmp_path / "verdict-seen"
+        monkeypatch.setenv(runner.TEST_CLOCK_ENV, str(clock))
+        monkeypatch.setattr(runner, "ROLLOUT_WAIT_S", until_verdict)
+        # The thread id is in output.jsonl (a file) before the clock moves: the verdict sees the session.
+        run = (f"from pathlib import Path\nPath({str(clock)!r}).write_text({str(until_verdict)!r})\n"
+               f"end = time.time() + 30\n"
+               f"while time.time() < end and not Path({str(done)!r}).exists():\n    time.sleep(0.05)\n")
+        real_check, real_stop = runner.check_instructions, runner.stop_reason
+        from ttp.providers import codex as cx
+        real_parse = cx.Codex.instructions_recorded
+
+        def parse(self, *a, **k):
+            seen["parses"] += 1
+            return real_parse(self, *a, **k)
+
+        def check(*a, **k):
+            got = real_check(*a, **k)
+            if got is not None and seen["verdict"] is None:
+                seen["verdict"] = seen["parses"]
+            return got
+
+        def stop_reason(rd):   # once per watch look
+            if seen["verdict"] is not None:
+                seen["ticks"] += 1
+                if seen["ticks"] >= 3:
+                    done.touch()
+            return real_stop(rd)
+        monkeypatch.setattr(cx.Codex, "instructions_recorded", parse)
+        monkeypatch.setattr(runner, "check_instructions", check)
+        monkeypatch.setattr(runner, "stop_reason", stop_reason)
     child.write_text("import json, time\n" + write +
-                     f"print(json.dumps({{'type': 'thread.started', 'thread_id': {sid!r}}}), flush=True)\n"
-                     f"time.sleep({run_s})\n")
+                     f"print(json.dumps({{'type': 'thread.started', 'thread_id': {sid!r}}}), flush=True)\n" + run)
     run_dir = tmp_path / "run"
     run_dir.mkdir()
     (run_dir / "prompt.md").write_text("x")
@@ -108,6 +144,8 @@ def _runner_run(tmp_path, monkeypatch, rollout, task="7", run_s=30):
     runner.supervise(run_dir)
     info = json.loads((run_dir / "exit.json").read_text())
     info["took"] = time.time() - started
+    if until_verdict is not None:
+        info["looks_after_verdict"] = None if seen["verdict"] is None else seen["parses"] - seen["verdict"]
     return info
 
 
@@ -149,8 +187,7 @@ def test_a_coordinator_codex_run_lacking_its_instructions_is_only_reported(tmp_p
 
 def test_a_codex_run_whose_rollout_never_appears_is_reported_not_stopped(tmp_path, monkeypatch):
     from ttp import runner
-    monkeypatch.setattr(runner, "ROLLOUT_WAIT_S", 0.5)
-    info = _runner_run(tmp_path, monkeypatch, None, run_s=2)
+    info = _runner_run(tmp_path, monkeypatch, None, until_verdict=5)
     assert info["rc"] == 0 and info["stopped"] is None and "refused" not in info, info
     assert info["instructions"] == {"state": "no_rollout", "seen": "no_rollout"}
     # A run that ends before the wait is up: no verdict, nothing reported.
@@ -166,20 +203,16 @@ def test_a_codex_run_whose_rollout_stays_pending_is_reported_unchecked_once(tmp_
     # is not parsed again for the rest of the run.
     from ttp import runner
     from ttp.providers import codex as cx
-    monkeypatch.setattr(runner, "ROLLOUT_WAIT_S", 0.5)
-    looks = []
-    real = cx.Codex.instructions_recorded
-    monkeypatch.setattr(cx.Codex, "instructions_recorded",
-                        lambda self, *a, **k: looks.append(time.time()) or real(self, *a, **k))
+    real_check = runner.check_instructions
     info = _runner_run(tmp_path, monkeypatch, _rollout_lines("0199abcd-0002", developer=False, answered=False),
-                       run_s=3)
+                       until_verdict=5)
     assert info["rc"] == 0 and info["stopped"] is None and "refused" not in info, info
     assert info["instructions"] == {"state": "unchecked", "cli_version": "0.160.0"}
-    assert looks and max(looks) - min(looks) < 2, f"polled on after the verdict: {len(looks)} looks"
+    assert info["looks_after_verdict"] == 0, "the rollout was parsed again after the verdict (3 more watch looks)"
     # Before the wait is up a pending rollout gets no verdict, and the end-of-run look gives none either.
-    assert runner.check_instructions(cx.Codex(), tmp_path / "run", tmp_path / "run" / "output.jsonl",
-                                     json.loads((tmp_path / "run" / "run.json").read_text())["argv"],
-                                     {"CODEX_HOME": str(tmp_path / "codex")}, 0.4) is None
+    assert real_check(cx.Codex(), tmp_path / "run", tmp_path / "run" / "output.jsonl",
+                      json.loads((tmp_path / "run" / "run.json").read_text())["argv"],
+                      {"CODEX_HOME": str(tmp_path / "codex")}, 4.9) is None
 
 
 def test_the_daemon_blocks_a_task_whose_codex_run_lacked_its_instructions_without_an_attempt(env, monkeypatch):

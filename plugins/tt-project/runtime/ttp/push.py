@@ -42,7 +42,7 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import quote, unquote
 
-from . import (checkcap, checkdirs, checkwait, checklane, cleantree, envfault, gitcache, gitmemo, landed, landmark, leakfile, locks, machines, pooladmit, prguard, prhead, remotecheck, repoid, runner,
+from . import (checkcap, checkdirs, checkwait, checklane, cleantree, envfault, gitcache, gitmemo, landed, landmark, leakfile, locks, machines, pooladmit, prguard, prhead, remotecheck, repoid, runner, runnerenv,
                sandbox, scriptwatch, settinghold, setupfault, shorttmp, slurmcheck, syntaxfault, testslots, timefmt, workerloss, worktree)
 from .budget import DOC_SUFFIXES
 from .db import continues_id, dependency_ids, load_result
@@ -837,7 +837,8 @@ def venv_cmd(cmd: str, top: str | Path, env: dict | None = None) -> str:
     return f"printf '%s\\n' {shlex.quote('ttp: ' + why)} >&2\n{out}" if why else out
 
 
-ENV_FIX = "check command lacks dependencies: point delivery checks at a venv"
+ENV_FIX = ("check command lacks dependencies: point delivery checks at a venv, or pin them in the "
+           "checks' Python lock (checks.python_lock; `ttp checks --freeze-lock <file>` writes one)")
 _NO_MODULE = re.compile(r"(?:ModuleNotFoundError|ImportError): No module named '?([A-Za-z0-9_.]+)'?")
 _NO_PYTEST = re.compile(r"No module named '?pytest'?$|\bpy(?:test|\.test): (?:command )?not found", re.M)
 
@@ -893,6 +894,20 @@ def runner_wait(cmds: list, repo: Path, env: dict, say: Callable[[str], None], p
         if p:
             envfault.recheck(p)
         return 0
+    envfault.record(p, fault, os.environ.get("TTP_TASK"))
+    say(f"{envfault.line(fault)}; not pushing. Hand off `waiting`; retry_when: {envfault.retry_when(p, fault)}")
+    return BUSY
+
+
+def env_wait(p: Project | None, repo: Path, base: str, head: str, err: Exception, say: Callable[[str], None]) -> int:
+    """The checks' pinned Python env could not be made (`err`, runnerenv.Unavailable): CHECKS_FAILED when
+    `head` changed checks.python_lock in `repo` from `base` itself (runnerenv.changed_by), else BUSY, a
+    host fault recorded and said with its retry_when as runner_wait does: nothing counted against the change."""
+    cfg = p.config() if p else {}
+    if runnerenv.changed_by(repo, cfg, base, head):
+        say(f"{err}; this change edits checks.python_lock; not pushing")
+        return CHECKS_FAILED
+    fault = runnerenv.fault(runnerenv.lock_of(cfg, repo), err)
     envfault.record(p, fault, os.environ.get("TTP_TASK"))
     say(f"{envfault.line(fault)}; not pushing. Hand off `waiting`; retry_when: {envfault.retry_when(p, fault)}")
     return BUSY
@@ -959,7 +974,11 @@ def own_lane_key(repo: Path, remote: str, cfg: dict | None) -> str:
     return priority_key(repo, remote, OWN_LANE)
 
 
-def check_env(mode: str, tip: str = "", run_dir: str | None = None, branch: str = "") -> dict[str, str]:
+check_lock: Path | None = None   # the lock check_env uses when given none: the project's (`ttp push` sets it)
+
+
+def check_env(mode: str, tip: str = "", run_dir: str | None = None, branch: str = "",
+              lock: Path | None = None) -> dict[str, str]:
     """The environment push_checks run in. TTP_PUSH_MODE says what they gate: `target` (`ttp push`
     or the push queue, to delivery.push_branch), `own` (`ttp push --own`, the task's own branch) or
     `checks` (`ttp checks`, which pushes nothing). TTP_PUSH_TIP is the tip of the branch pushed to,
@@ -967,14 +986,16 @@ def check_env(mode: str, tip: str = "", run_dir: str | None = None, branch: str 
     TTP_PUSH_BRANCH is the name of that branch on the remote (or the local branch `ttp land` moves),
     short, without refs/heads/, so a check can refuse content by where it goes rather than by the
     branch checked out; empty for `ttp checks`. TTP_LEAK_PATTERNS_FILE names the account's local
-    leak-pattern file when it has one (leakfile)."""
+    leak-pattern file when it has one (leakfile). Every check runs in the pinned Python env built
+    from `lock` (default runnerenv.LOCK), the user site off: runnerenv.Unavailable when it cannot be made."""
     output = checkdirs.writable(run_dir if run_dir is not None else os.environ.get("TTP_RUN_DIR"))
     env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH" and k not in checkcap.RUN_ONLY_ENV}  # a `ttp checks` run's own state stays out of its checks
     if pp := check_pythonpath(os.environ):
         env["PYTHONPATH"] = pp
     env = leakfile.with_path(env)   # the account's leak-pattern file, by path, for a check's temp HOME
-    return checkdirs.for_check({**env, "TTP_RUN_DIR": output, "TTP_PUSH_MODE": mode, "TTP_PUSH_TIP": tip or "",
-                               "TTP_PUSH_BRANCH": short_branch(branch)})
+    return runnerenv.apply(checkdirs.for_check({**env, "TTP_RUN_DIR": output, "TTP_PUSH_MODE": mode,
+                                                "TTP_PUSH_TIP": tip or "", "TTP_PUSH_BRANCH": short_branch(branch)}),
+                           lock or check_lock)
 
 
 def short_branch(ref: str) -> str:
@@ -3570,7 +3591,7 @@ def _reused(repo: Path, head: str, todo: list, run_dir: str | None, reuse: Calla
     try:
         parts = pushpass.check_env_parts(repo, todo, check_env("own", "", run_dir)) if tree else []
         return reuse(tree, todo, [pushpass.digest(x) for x in parts], parts) if tree else ""
-    except (OSError, ValueError):
+    except (OSError, ValueError, runnerenv.Unavailable):
         return ""
 
 
@@ -4377,6 +4398,14 @@ def _run(p: Project, repo: Path, own: bool = False, recorded: dict | None = None
     global last_ff, last_reach, last_after, pending_after, check_limit_s, check_queue_s, pool_wait_s
     last_ff, last_reach, last_after, pending_after = [], None, None, None
     check_limit_s, check_queue_s, pool_wait_s = limit_s, wait_s, pool_s
+    global check_lock
+    check_lock = runnerenv.lock_of(p.config(), repo)
+    try:   # the checks' pinned Python env, made first (runnerenv): no check runs without it
+        if checks:
+            print(f"ttp push: {runnerenv.describe(runnerenv.ensure(check_lock))}", file=sys.stderr)
+    except runnerenv.Unavailable as e:
+        tracked = _git(repo, "rev-parse", "--verify", "-q", f"refs/remotes/{remote}/{branch}").stdout.strip()
+        return env_wait(p, repo, tracked, "HEAD", e, lambda m: print(f"ttp push: {m}", file=sys.stderr))
     if own:   # delivery.push_exclude_paths guards the push branch only
         say_target(repo, remote, branch)
         # The docs-only test, if_changed scopes and the project's own checks may all compare with the

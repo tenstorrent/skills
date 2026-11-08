@@ -621,6 +621,8 @@ def probe_stalls(db: DB, s: dict, st: dict, now: float, current_probe: Callable[
             continue
         if rec.pop("held", None):
             rec.update(first=now, n=0)   # the user's pause lifted: the clock starts again from the lift
+        if (opened := userpause.gate_opened(rec["probe"], cfg, root, now)) and opened > float(rec["first"]):
+            rec.update(first=opened, n=0)   # the user's marker appeared: the live gate is timed from then
         if not s["probe_n"] or OWN_WAIT_RE.search(rec["probe"]) or ackwait.is_probe(rec["probe"], cfg, harness) \
                 or int(rec["n"]) < s["probe_n"] \
                 or now - float(rec["first"]) < s["probe_h"] * 3600:

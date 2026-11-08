@@ -163,7 +163,10 @@ def _checks(p: Project, wt: Path, new: str, base: str, say: Callable[[str], None
             return 0
         say(f"{new[:10]}: {push.NONE_APPLY}; not landing: {push.NONE_APPLY_FIX}")
         return CHECKS_FAILED
-    env = push.check_env("target", base, branch=branch)
+    try:
+        env = push.check_env("target", base, branch=branch, lock=push.runnerenv.lock_of(p.config(), wt))
+    except push.runnerenv.Unavailable as e:   # the host's fault (BUSY) unless `new` edited the lock
+        return push.env_wait(p, wt, base, new, e, lambda m: say(m.replace("not pushing", "not landing")))
     steps.between()
     if why := push.runner_wait(todo, wt, env, say, p):
         return why

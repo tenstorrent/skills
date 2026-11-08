@@ -523,7 +523,12 @@ only in the feed and never under "needs you".
   memory` is unchanged. Known gaps: only quotes are checked, so unquoted text on a labelled line
   with a checked quote is carried; a claim phrased past those label forms ("the user ordered
   '...'", "as the user put it", "User:", another language) is not checked and is carried as data
-  under the header above. A resumed wake sends only the digest sections
+  under the header above. A new session's first wake's dollar cap is the per-wake cap plus the expected seed cost, within the
+  dollar and hourly caps (seedcap.py): the dearest of the last 3 new-session wakes' seeds (their
+  cache writes and uncached input at their own booked rate), each counted at most 3 times its
+  seeded prompt size (`turn.session.seed_chars`; older wakes without it, their size before the
+  seed) / 4 in tokens. The factor 3 rests on one measured wake, which wrote 2.6 times its size
+  before the seed; its ratio to the seeded size is lower and was not measured. A resumed wake sends only the digest sections
   that changed since the session's last wake that ended ok, each whole, plus the new events and one
   line naming the sections left out. Only the Open tasks section, keyed by task id, and the Course
   check, keyed by sign and task id (`- costly: #<id>`), go row by row (`row_delta`, default on; `false` sends every changed section whole): the added and changed rows,
@@ -1025,6 +1030,63 @@ the user reads. `--severity high` still reaches the coordinator, and the daemon'
 notices are unaffected. The route is a refusal rather than a relay through a standard run: the
 hand-off already reaches the coordinator, so a relay would add a paid run for no new path.
 
+### Replay bench for model comparisons
+
+`ttp bench prep --since <date> --out <dir>` builds, without a model call, the task set a later run
+uses to compare two models or efforts on this project's own work. `--since` is the later of the
+compared models' release dates, so neither saw the changes. It keeps done code and work tasks created
+since then whose change landed through one push queue row and adds or changes tests; their landed
+tests are held out as graders. It excludes, with the reason, a task whose spec quotes 3 or more lines
+of the fix, whose held-out tests use a repository symbol the base lacks and the spec does not name, or
+whose landing range on the push branch is unclear (a fast-forward, a squash, several pushes). Each
+kept task gets `<id>/workspace`, the base commit's tracked files in a fresh repository with one commit
+and no remotes, tags or reflog, and `<id>/heldout`, the landed copy of its held-out test files; the
+manifest records its spec, base, landed commit, stratum (small up to 150 changed non-test lines, else
+large) and each held-out file's sha256, and `manifest.sha256` pins the manifest. The bench names no
+model.
+
+`ttp bench run --bench <dir> --out <dir>` then runs a head-to-head of two or more model arms on it.
+An arm is a provider, model and effort: `bench.arms` in the project's config
+(`{"<name>": {"provider": ..., "model": ..., "effort": ...}}`, none shipped) or `--arm
+name=provider:model:effort`. Each task runs once per arm per repeat (`--reps`), the arms of one task
+back to back in an order drawn from `--seed` (random when unset; recorded in `plan.json`). Every cell
+gets a fresh copy of the base workspace in a new temporary folder, the same prompt (the spec under a
+fixed preamble) and the same limits, enforced by the daemon's own run supervisor: `bench.timeout_s`,
+`bench.stall_s` and `bench.budget_usd` (where the provider caps dollars). Before a run the workspace
+must hold one commit on one branch with no remote, reflog or alternates, neither the base nor the
+landed commit and no held-out test content. The agent's reads are denied, and its transcript is
+audited for, the bench and results folders, the source repository (recorded by `prep`, or `--repo`,
+default the project root) with its git dir and every worktree, the project's state folder, and the
+providers' plugin caches and saved transcripts (`~/.claude/plugins`, `~/.claude/projects`, and
+`plugins` and `sessions` under `$CODEX_HOME`): these hold the landed commit, later code or the
+original task's run. The audit matches each path as a prefix, resolved and as named, also written
+with `~/` or `$HOME/`, and skips the provider's own system records. The cell's own Claude Code
+session folder (`~/.claude/projects/<its cwd with each non-alphanumeric character as ->`, where a
+large tool output is saved for the agent to read) is neither denied nor flagged: of that folder's
+siblings, the reads denied are those of sessions started in another hidden path and of earlier
+cells, and naming any other one is flagged. A cell whose runner hangs keeps its spend so far. The agent's environment carries no `PYTHONPATH` to the
+harness runtime. A transcript that names a denied path or the landed commit, or runs history or
+forge commands (`git fetch`, `git log --all`, `gh api`), flags the cell as failed. Otherwise the
+held-out files are copied in and the held-out tests run (`--test-cmd`, default `python3 -m pytest`;
+wrap it in `ttp sandbox --` to run candidate code sandboxed). The agent, with everything it starts,
+and then the grade each run in a fresh virtualenv in the cell's own temporary folder, never shared
+between cells: its bin first on `PATH`, `VIRTUAL_ENV` set, `PYTHONNOUSERSITE=1` and
+`PIP_REQUIRE_VIRTUALENV=1`, `PIP_USER` unset and `PYTHONUSERBASE` in the cell. So no cell installs
+into or imports from the user site (`~/.local`) the host's other projects share, and nothing the agent
+installed runs the held-out tests. Each venv sees the OS's packages and gets a copy of the harness's
+installed pytest and what it requires. A cell whose agent venv cannot be built runs no agent and is
+recorded `isolation_failed`. Each cell appends a row to
+`results.jsonl` (cost, tokens, wall time, hand-off status, pass or fail, flags, and the sha256 of its
+transcript and diff) and keeps its transcript, diff and test log under `cells/`; a rerun into the same
+folder skips recorded cells and refuses a different plan. A cell whose hand-off is not a JSON
+object is still graded (hand-off `invalid`); any other fault after its agent ran records the cell
+as `error` with its cost and wall time, so the bench moves on and a rerun does not pay for it again. `--dry-run` runs every arm on the fake agent:
+no model call and no spend. The cells run as the same user as the command with the real home
+folder, so the denial and the audit, not the operating system, keep a candidate from those paths: a
+read the audit cannot see (a path built at run time, or one under another name) stays a gap. A
+scratch home folder holding only the provider's login would close more of it, but it is not used:
+the providers keep their login in the home folder, and the harness copies no credentials.
+
 ### OpenAI-compatible endpoints (the `chat` provider)
 
 The `chat` provider runs Claude Code workers against any endpoint that speaks the OpenAI Chat
@@ -1065,7 +1127,21 @@ Messages calls into `<base url>/chat/completions` calls and back, and ends with 
    cool-down, but that tier's route holds, with one normal notice naming the provider, tier and model,
    until `providers.chat.tiers.<tier>.model` changes or the daemon's model-free /models check (at
    most hourly while a tier routes) lists the model again. That check stores only the served ids and
-   its time in the project state folder; `ttp status` and `ttp doctor` show them and any hold. Routed runs take worker slots under the `chat` gate (its
+   its time in the project state folder; `ttp status` and `ttp doctor` show them and any hold.
+   To keep work on the endpoint instead, set `providers.chat.model_ranking` to its model ids, smartest
+   first (for example by a public intelligence ranking you trust; empty by default, and nothing changes
+   without it). A routed start whose model is down, held as above or left out of the last good /models
+   check, then runs the highest-ranked model that check lists and that no run was refused, at the
+   tier's effort; its run's `route` record names the model it stands in for (`model_rank`). A stand-in
+   that is refused too is skipped for a day and the next one runs. A task's own model pin on `chat`
+   is swapped the same way, unless the pin is required (`pin_required`): such a task waits until its
+   model is served again. With a ranking set, a queued or running task that pins a model on `chat`
+   also keeps the hourly check running, and a check over two hours old counts as none: nothing is
+   swapped or held on it. Each switch is one low alert; once the model is served again (the hold ends
+   or the check lists it) the next start runs it. With no ranked model served, or the whole endpoint
+   cooling down, runs start on the core provider as before. Only `chat` has a served list: Claude
+   Code, Codex and Cursor models are not ranked (provider failover covers a provider that cannot start
+   work). Routed runs take worker slots under the `chat` gate (its
    `max_parallel`), not the core provider's; when `chat` has no free slot the run starts on the core
    provider instead, under its gate, with the reason `busy`. An answer that is not JSON is an
    endpoint fault too (`malformed`). A routed run that ends without a hand-off on its own (it timed
@@ -1592,7 +1668,11 @@ session and stateless coordinators on every provider.
   queue holds the batch (`setup_fault`) and tries it again after 10 min; held this way 3 times in a
   row on one check (`delivery.push_setup_fault_escalate_after`, 0 = off), one high
   `push_setup_fault` alert names the check, the fault lines and the batches, and clears once that
-  check passes or a batch pushes. It never counts as passed.
+  check passes or a batch pushes. Until it clears, that check's next setup fault on a batch head
+  is a failed check of that head instead of a hold: the batch's entry search sends back the entry
+  that brings it and pushes the rest, so one entry whose check names a missing dir or setup outside
+  the repository cannot hold every other approval. One on the tip alone (every head fails so) or no
+  free pool slot still holds the batch and blames no entry. It never counts as passed.
   Any test verdict in the output keeps a failure a failure. A gate of your own that knows it ran
   nothing can say so directly: exit 75. A job a check detaches makes its work dir inside the job,
   after it is detached, so it outlives the check (see `ttp detach` above).
@@ -1832,7 +1912,12 @@ session and stateless coordinators on every provider.
   lets a run that has waited `delivery.checks_spill_after_s` (default 60 s) here run on the first listed host the
   charter names, the machines list holds, no pause covers and whose `ttp lock <alias>` nobody else holds (the run
   holds it shared while it runs), where no device job runs, that ssh reaches and that has a free slot; others
-  are skipped with the reason and the run keeps its place here. A device job means one of the host's device
+  are skipped with the reason and the run keeps its place here. A check that runs an agent CLI (`claude`, `codex`,
+  `cursor-agent`, also inside `sh -c`), such as `claude plugin validate --strict`, or says `"host": "local"`, stays
+  on this machine while the run's other checks (pytest) spill, and the run gives one verdict for both parts. A
+  failure of the part kept here counts at once. Only a check that is not a test suite or build splits off this
+  way, so a spill host needs git, tar and what its checks run (python3 and the checks env for pytest), never an
+  agent CLI or its sign-in. A check whose script file calls one says `"host": "local"`. A device job means one of the host's device
   locks (`<alias>-device`, the device names of its machines-list `shared` entry, `device.locks` names on it)
   is held, reserved or waited for (a pool check run's own hold of the host's lock is none, even when `device.locks`
   lists the bare alias), or a broker heal check (preset broker) of the project on that machine
@@ -1946,7 +2031,11 @@ session and stateless coordinators on every provider.
   order. A hung command need not wait for the cap: one whose output has not grown for 10 min is stopped the
   same way and reported as "no output for 10 min" (a timeout, never a pass). A check object's `"silent_s"`
   (seconds) sets that limit for a check that is silent longer by design, and 0 turns it off. A full run of
-  the tt-project test suite lists its 15 slowest test calls just above its `ttp-suite:` line. `checks.wrap_cmd` (project setting, default unset) runs each command given after `ttp checks --`
+  the tt-project test suite lists its 15 slowest test calls just above its `ttp-suite:` line. Every check runs in a
+  pinned Python env the harness owns, the user site off, so `pip install --user` never changes what a check imports;
+  `checks.python_lock` (project setting, default the plugin's lock of pytest and pytest-xdist) names its lock, and
+  `ttp checks --freeze-lock <file>` writes one that pins the user site's packages too (tt-project-harness
+  push-checks reference, "The pinned Python env"). `checks.wrap_cmd` (project setting, default unset) runs each command given after `ttp checks --`
   behind the project's own lock or queue command, the command passed as separate arguments; a missing wrapper
   fails the checks, and `delivery.push_checks` never go through it. A wrapper running its own test pool starts
   each shard, local or over ssh, as `ttp checks-shard -- <cmd>`, so the shard counts toward that host's checks slots.
@@ -2077,8 +2166,10 @@ session and stateless coordinators on every provider.
   review or harness task, or with no task); a candidate that is
   not an ancestor of the head (a fork point rebased away) is skipped, and a later candidate that
   descends from the first (the head merged or was rebased onto a newer tip) wins. The check output and
-  its excused record name the base and why. Failing on both is pre-existing and does not block (reported by
-  name); passing on the head rerun is flaky: it goes into the project's quarantine
+  its excused record name the base and why. Failing on both the same way (the same first error line or
+  summary message, and the same failing statement) is pre-existing and does not block (reported by name);
+  failing on the base another way blocks. A rerun's selection stays in its own pytest process: a pytest a
+  test starts never inherits it. Passing on the head rerun is flaky: it goes into the project's quarantine
   (`state/test_quarantine.json`: first seen, evidence, expiry after `checks.quarantine_days`, default 7),
   which `ttp status` shows, one fix note goes to the coordinator, and it does not block. Failing on the
   head rerun and passing on (or missing from) the base blocks, as does a rerun that cannot tell. Only the
@@ -2376,7 +2467,8 @@ session and stateless coordinators on every provider.
   transient syntax error in a script outside the change, one high `push_script_torn` alert names the
   check, the scripts and the batches; each check counts on its own, and the alert clears once that
   check passes or a batch pushes; 0 = off), `push_setup_fault_escalate_after` (default 3: the same
-  for batches held because one check failed before any test ran, after its reruns), `after_push`
+  for batches held because one check failed before any test ran, after its reruns; once alerted, that
+  check's next such fault isolates the entry that brings it instead), `after_push`
   (commands in the same form as `push_checks`, for example a deploy) and `after_push_timeout_s`
   (default 1800). A batch that ends without writing an outcome is retried with a growing pause,
   and three such batches in a row raise a high alert, unless the host rebooted while it ran: then

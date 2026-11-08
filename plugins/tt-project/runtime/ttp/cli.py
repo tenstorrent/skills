@@ -36,7 +36,7 @@ from . import __version__, poll_s  # noqa: E402
 from .db import CHANGES_NEEDED, SUPERSEDED, chat_floor, task_outcome
 from . import outbox, redact
 from .devq import unmask_devices
-from . import chatgone, checkwait, scriptwatch, setupfault, sshcmd, syntaxfault, timefmt, workerloss
+from . import chatgone, checkwait, runnerenv, scriptwatch, setupfault, sshcmd, syntaxfault, timefmt, workerloss
 from . import schedule as sched
 from .project import here as project_here
 from .project import (NAME_RE, Project, hostname, load_registry, load_secrets, register, save_secret,
@@ -2997,12 +2997,21 @@ def _spill_to(todo: list, host: str, cfg: dict | None = None) -> list:
     """`todo` run on spill host `host` (checkspill, push.spill_to), each local check marked `spilled`: its
     pass is recorded, and found, under the same key as a run here (_command_key), so a later local `ttp checks`
     of the same tree (a review's pre-started checks, the reviewer's own) reuses it instead of running
-    the suite again."""
-    from . import push
-    out = push.spill_to(todo, host, cfg)
-    for was, c in zip(todo, out):
+    the suite again. A check that may not spill (it runs an agent CLI or says "host": "local":
+    checkspill.stays_here) runs here in the same run, as a push.Check (a command after `--` may be a plain str)."""
+    from . import checkspill, push
+    out = []
+    for was in todo:
+        if not checkspill.check_spills(was, cfg):
+            c = push.Check(str(was))
+            if isinstance(was, push.Check):
+                c.__dict__.update(was.__dict__)
+            out.append(c)
+            continue
+        c = push.spill_to([was], host, cfg)[0]
         if not push.remote_host(was) and isinstance(c, push.Check):
             c.spilled = True
+        out.append(c)
     return out
 
 
@@ -3404,6 +3413,15 @@ def cmd_checks(a) -> None:
         ok, line = checkcap.ask_preempt(a.preempt, checkcap.label(p.name if p else None, "ttp checks --preempt"))
         print(f"ttp checks: {line}")
         sys.exit(0 if ok else 1)
+    if getattr(a, "freeze_lock", None):
+        try:   # a lock pinning what the checks import from the user site (runnerenv.freeze)
+            added = runnerenv.freeze(Path(a.freeze_lock))
+        except (OSError, subprocess.SubprocessError, runnerenv.Unavailable) as e:
+            die(f"ttp checks: --freeze-lock: {e}")
+        print(f"ttp checks: wrote {a.freeze_lock}: the default pins plus {len(added)} from the user site"
+              + (f" ({', '.join(added)})" if added else "") + "; review it, commit it to the checkout and set "
+              f"`ttp config <project> checks.python_lock <path in the checkout>`")
+        sys.exit(0)
     run_dir = os.environ.get("TTP_RUN_DIR")
     if not run_dir:
         die("ttp checks only works inside a tt-project run")
@@ -3479,9 +3497,28 @@ def cmd_checks(a) -> None:
         worktree.prepare(p, top)   # a worktree a reviewer made itself gets the .venv its checks may run
     # Every check, extras too, runs in the project's environment: its venv active (VIRTUAL_ENV, PATH)
     # when this shell has none, as a run has (worktree.project_venv).
+    # And in the pinned Python env, the user site off (runnerenv): made first when missing, never skipped.
+    # Its lock as committed at `head` (runnerenv.at_commit), never the worktree's edited copy. One that
+    # cannot be made is the host's fault, waited for as a missing runner is, unless `head` changed the lock.
+    lock = None
+    try:
+        lock = runnerenv.at_commit(cfg, top, head, run_dir)
+        pyenv = runnerenv.ensure(lock)
+    except runnerenv.Unavailable as e:
+        print(f"ttp checks: not run: {e}", flush=True)
+        if lock is None or runnerenv.changed_by(top, cfg, _checks_base(p, Path(top), own), head):
+            sys.exit(1)
+        from . import envfault
+        fault = runnerenv.fault(lock, e)
+        envfault.record(p, fault, os.environ.get("TTP_TASK"))
+        envfault.write_marker(run_dir, fault)
+        print(f"ttp checks: {envfault.line(fault)}. Hand off `waiting`; retry_when: "
+              f"{envfault.retry_when(p, fault)}", file=sys.stderr)
+        sys.exit(75)
+    print(f"ttp checks: {runnerenv.describe(pyenv)}", flush=True)
     venv_vars = {}
     if p and not os.environ.get("VIRTUAL_ENV") and (pv := worktree.project_venv(p, top)):
-        venv_vars = worktree.venv_env(pv, os.environ.get("PATH", ""))
+        venv_vars = worktree.venv_env(pv, runnerenv.apply(dict(os.environ), lock)["PATH"])
     # The python a bare pytest runs with (push.venv_cmd): an extra spelled with it runs the same tests.
     vpy = str(push.venv_python(top, {**os.environ, **venv_vars}) or "")
     mine, dropped = _extra_checks(a.cmd[1:] if a.cmd[:1] == ["--"] else a.cmd, own, vpy, top)
@@ -3568,7 +3605,7 @@ def cmd_checks(a) -> None:
                     and not _checks_owner(Path(run_dir), top, purpose):
                 ids = checkprestage.derived(p, own, say) if pre is None else None
                 if pre is not None or ids:
-                    pre_env = {**push.check_env("checks"), "PWD": top, **venv_vars}
+                    pre_env = {**push.check_env("checks", lock=lock), "PWD": top, **venv_vars}
                     if why := _prestage_skip(a, p, top, head, tree, cmds, own, vpy, purpose):
                         print(f"ttp checks: pre-stage (delivery.{checkprestage.KEY}) skipped: {why}", flush=True)
                     elif checkprestage.run(pre, top, pre_env, say) if pre is not None else \
@@ -3608,6 +3645,7 @@ def cmd_checks(a) -> None:
     with open_append_or_null(log, text=f"ttp checks: in {top} on {head[:12]}\n", p=p) as out:
         out.write(f"ttp checks: in {top} on {head[:12]}" + (" (purpose harness)" if purpose == "harness" else "")
                   + "\n")
+        out.write(f"ttp checks: {runnerenv.describe(pyenv)}\n")
         if warn:
             out.write(f"{warn}\n")
         for line in not_run:
@@ -3667,7 +3705,7 @@ def cmd_checks(a) -> None:
             hit = _recorded_pass(p, tree, todo, purpose)
         # A plain pytest check the push queue passed on exactly this tree, with the same command and
         # env_id (pushpass.queued), is not run again; the batch it came from is named and kept.
-        queue_hits = _queue_passes(p, top, tree, todo, {**push.check_env("checks", run_dir=getattr(a, "check_run_dir", None)),
+        queue_hits = _queue_passes(p, top, tree, todo, {**push.check_env("checks", run_dir=getattr(a, "check_run_dir", None), lock=lock),
                                                         "PWD": top, **venv_vars}) \
             if passed and todo and not hit and not a.fresh and not fast_cmds and purpose == "candidate" else []
         queue_cmds = [c for c, _ in queue_hits]
@@ -3748,7 +3786,7 @@ def cmd_checks(a) -> None:
         # A runner the host lacks (pytest wiped from the python a check runs with) is an environment
         # fault, not this head's: wait for it, counting nothing against the change (envfault).
         from . import envfault
-        pre_env = {**push.check_env("checks", run_dir=getattr(a, "check_run_dir", None)), "PWD": top, **venv_vars}
+        pre_env = {**push.check_env("checks", run_dir=getattr(a, "check_run_dir", None), lock=lock), "PWD": top, **venv_vars}
         if todo and not hit and (fault := envfault.precheck(todo, top, pre_env)):
             envfault.record(p, fault, os.environ.get("TTP_TASK"))
             envfault.write_marker(run_dir, fault)
@@ -3825,15 +3863,16 @@ def cmd_checks(a) -> None:
                 minutes = slurmcheck.time_min(checklane.median_s(p.state, _commands_hash(todo)), slurm)
             todo = _spill_to(todo, spilled.host, cfg)
             for c in todo if slurm else []:
-                c.slurm, c.time_min = slurm, minutes
-            for w in dict.fromkeys(c.remote_wrap for c in todo if c.remote_wrap):
+                if getattr(c, "spill_host", ""):   # a check split off to run here stays off Slurm
+                    c.slurm, c.time_min = slurm, minutes
+            for w in dict.fromkeys(w for c in todo if (w := getattr(c, "remote_wrap", ()))):
                 said = f"on {spilled.host} the checks run behind their spill wrapper {shlex.join(w)}"
                 print(f"ttp checks: {said}", flush=True)
                 out.write(f"ttp checks: {said}\n")
         if join_rec and todo and not hit and not handover:
             checkjoin.update(join_rec, phase=checkjoin.RUNNING, run_since=time.time())
         child_env = {"PWD": top, **venv_vars, **(slot.env() if slot else {})}
-        run_env = {**push.check_env("checks", run_dir=getattr(a, "check_run_dir", None)), **child_env}
+        run_env = {**push.check_env("checks", run_dir=getattr(a, "check_run_dir", None), lock=lock), **child_env}
         for line in [] if hit or handover else push.sandbox_lines(todo):
             print(f"ttp checks: {line}", flush=True)
             out.write(f"ttp checks: {line}\n")
@@ -3914,7 +3953,7 @@ def cmd_checks(a) -> None:
                 check_start = out.tell()
                 # A detached run gives each check a group of its own, so a stop ends it with ttp checks.
                 group = bool(getattr(a, "own_group", False))
-                env = {**push.check_env("checks", run_dir=getattr(a, "check_run_dir", None)), **child_env,
+                env = {**push.check_env("checks", run_dir=getattr(a, "check_run_dir", None), lock=lock), **child_env,
                        "PWD": cwd, **({checkreap.MARKER: reap_tok} if reap_tok else {}),
                        **({pooladmit.WALL_ENV: f"{ran_since:.0f}:{wall:.0f}"} if deadline else {})}
                 judge_env = dict(env)   # a rerun of the failing tests records no suite durations
@@ -4058,7 +4097,7 @@ def cmd_checks(a) -> None:
                         _record_pass(p, tree, [c], purpose, run_dir, [run_envs[n]], [run_parts[n]], suite=True)
                 cwd = top if _in_place(py_check) else str(clean.path)
                 tmp_fd = bool(getattr(a, "own_group", False)) and getattr(a, "tmp_fd", None) is not None
-                env = {**push.check_env("checks", run_dir=getattr(a, "check_run_dir", None)), **child_env,
+                env = {**push.check_env("checks", run_dir=getattr(a, "check_run_dir", None), lock=lock), **child_env,
                        "PWD": cwd, **({checkreap.MARKER: reap_tok} if reap_tok else {})}
                 print(f"ttp checks: rerunning {len(new_tests)} added test(s) {addedtests.ROUNDS} times each "
                       f"with: {py_check}", flush=True)
@@ -4158,7 +4197,9 @@ def cmd_checks(a) -> None:
             out.write(f"ttp checks: {said}\n")
             out.flush()
             print(f"ttp checks: {said}", flush=True)
-        elif spilled and not passed and (executed or timed_out) and not _CHECK_STOP.get("stopped"):
+        # Nor when a check split off to run here failed or timed out (checkspill.stays_here): that counts as is.
+        elif spilled and not passed and (executed or timed_out) and not _CHECK_STOP.get("stopped") \
+                and not (failed in todo and not getattr(failed, "spill_host", "")):
             how = f"past the {timed_out['cap_s']:g} s wall-time cap" if timed_out else f"exit {rc}"
             no_spill = checkspill.spill_off_add(no_spill, spilled.host, rc == 75 and not timed_out)
             said = (f"the checks did not pass on spill host {spilled.host} ({how}); running them again on "
@@ -4311,6 +4352,7 @@ def cmd_checks(a) -> None:
                                                          for c, e in queue_hits]} if queue_hits else {}),
                                                      "purpose": purpose, "checks_from": source,
                                                      **({"scope": scope_lines} if scope_lines else {}),
+                                                     "python_env": {k: pyenv.get(k) for k in ("key", "lock_sha256", "python", "pytest")},
                                                      **({"fast_path": True, "skipped_project_checks": fast_skipped}
                                                         if fast_cmds else {}),
                                                      **({"not_run": not_run} if not_run else {}),
@@ -7447,6 +7489,55 @@ def cmd_land(a) -> None:
     if not p:
         die("ttp land: no project here (run it in a project or with TTP_PROJECT set)")
     sys.exit(land.run(p, a))
+
+
+def cmd_bench(a) -> None:
+    """`ttp bench prep --since <date> --out <dir>`: pick the landed tasks a model comparison can
+    replay, with clean base workspaces and held-out tests, model-free (bench.py)."""
+    from . import bench
+    p = here() or die("bench: no project here (run it in a project or with TTP_PROJECT set)")
+    if a.action == "run":
+        return _bench_run(p, a)
+    if not a.since:
+        die("bench prep: --since is required")
+    try:
+        when = _dt.datetime.fromisoformat(a.since)
+    except ValueError:
+        die(f"bench: --since {a.since!r} is not a date (YYYY-MM-DD, or with a time)")
+    out = Path(a.out).expanduser().resolve()
+    if out.exists():
+        die(f"bench: {out} exists; name a new folder")
+    m = bench.prep(p.db, Path(a.repo or p.root).resolve(), out, when.timestamp(), limit=a.limit)
+    print(f"ttp bench: {len(m['tasks'])} task(s) kept ({m['counts']['small']} small, {m['counts']['large']} large), "
+          f"{len(m['excluded'])} excluded; manifest {out / 'manifest.json'}")
+
+
+def _bench_run(p, a) -> None:
+    """`ttp bench run --bench <dir> --out <dir>`: the head-to-head of bench.arms (or --arm) (benchrun.py)."""
+    from . import benchrun
+    cfg = p.config()
+    conf = cfg.get("bench") or {}
+    arms = {k: {"provider": v.get("provider", ""), "model": v.get("model", ""), "effort": v.get("effort", "")}
+            for k, v in (conf.get("arms") or {}).items()}
+    try:
+        if a.arm:
+            arms = dict(benchrun.parse_arm(x) for x in a.arm)
+        if not a.bench:
+            raise benchrun.BenchError("--bench <dir> (a `ttp bench prep` folder) is required")
+        seed = a.seed if a.seed is not None else int.from_bytes(os.urandom(4), "big")
+        opts = {"timeout_s": a.timeout or conf.get("timeout_s", 3600), "stall_s": conf.get("stall_s", 900),
+                "budget_usd": a.budget or conf.get("budget_usd", 8.0), "test_cmd": a.test_cmd or benchrun.TEST_CMD,
+                "test_timeout_s": conf.get("test_timeout_s", 900), "dry_run": a.dry_run,
+                "repo": Path(a.repo or p.root).expanduser().resolve(), "state": p.state}
+        rows = benchrun.run(Path(a.bench).expanduser().resolve(), Path(a.out).expanduser().resolve(), arms,
+                            a.reps or conf.get("reps", 1), seed, opts, cfg, limit=a.limit)
+    except (benchrun.BenchError, OSError, ValueError) as e:
+        die(f"bench run: {e}")
+    for r in rows:
+        print(f"task {r['task']} rep {r['rep']} {r['arm']}: {r['outcome']}, ${r.get('cost_usd', 0):.2f}, "
+              f"{r.get('wall_s', 0):.0f} s" + (f" ({'; '.join(r.get('flagged') or r.get('why') or [])})"
+                                              if r['outcome'] in ("flagged", "isolation_failed") else ""))
+    print(f"ttp bench run: {len(rows)} cell(s) run, seed {seed}; results {Path(a.out).expanduser().resolve() / 'results.jsonl'}")
 
 
 def cmd_landed(a) -> None:
@@ -12316,7 +12407,7 @@ COMMAND_GROUPS = (
                                          "deployed", "goal", "hours")),
     ("admin", ("setup", "upgrade", "start", "stop", "restart", "adopt", "prune", "secret", "consent",
                "notifier", "schedules", "heal", "upstream", "lease", "replicate", "check-plan", "stats", "audit",
-               "push-audit", "ttr", "selfchange", "spend-today", "throughput", "echoes", "course", "uninstall")),
+               "push-audit", "ttr", "selfchange", "spend-today", "throughput", "echoes", "course", "uninstall", "bench")),
 )
 
 
@@ -12619,6 +12710,9 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--gap", metavar="SIG", help="read-only probe: exit 0 when a missing check's config changed")
     s.add_argument("--gap-config", metavar="FINGERPRINT",
                    help="with --gap: the push_checks fingerprint the waiter failed under")
+    s.add_argument("--freeze-lock", metavar="FILE",
+                   help="write a checks Python lock (checks.python_lock) to FILE: the default pins plus "
+                        "the user site's packages, at their installed versions; runs no check")
     s.add_argument("--fresh", action="store_true",
                    help="run the checks even when they already passed on this tree")
     s.add_argument("--full", action="store_true",
@@ -13067,6 +13161,28 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("test_id", nargs="?", help="lift: the pytest id, as `ttp quarantine list` shows it")
     s.add_argument("--why", help="lift: why it may go (a fix landed, the test was removed, ...)")
     s.set_defaults(fn=cmd_quarantine)
+
+    s = sub.add_parser("bench", help="replay bench, model-free part: `prep` picks landed tasks newer than --since "
+                                      "that add tests, builds a clean one-commit workspace at each base and holds "
+                                      "out the landed tests, with a hash-pinned manifest")
+    s.add_argument("action", choices=["prep", "run"], help="prep: build the bench in --out; run: the head-to-head "
+                                                            "of two or more arms on --bench, results in --out")
+    s.add_argument("--since", help="keep tasks created on or after this date (YYYY-MM-DD): the "
+                                                  "later of the compared models' release dates")
+    s.add_argument("--out", required=True, help="a new folder for the workspaces, held-out tests and manifest")
+    s.add_argument("--repo", help="the repository the tasks landed in (default: the project root); `run` also "
+                   "denies it, its git dir and worktrees to the cells")
+    s.add_argument("--limit", type=int, default=0, help="keep (prep) or run (run) at most this many tasks (default: all)")
+    s.add_argument("--bench", help="run: the `ttp bench prep` folder to replay")
+    s.add_argument("--arm", action="append", help="run: name=provider:model:effort, repeatable (default: bench.arms)")
+    s.add_argument("--reps", type=int, default=0, help="run: repeats per task and arm (default: bench.reps, 1)")
+    s.add_argument("--seed", type=int, help="run: the arm-order seed (default: a random one, recorded)")
+    s.add_argument("--timeout", type=float, default=0, help="run: wall-clock limit per cell in s (default: bench.timeout_s)")
+    s.add_argument("--budget", type=float, default=0, help="run: dollar budget per cell (default: bench.budget_usd)")
+    s.add_argument("--test-cmd", help="run: the command the held-out test ids are appended to "
+                                            "(default: python3 -m pytest -q -p no:cacheprovider)")
+    s.add_argument("--dry-run", action="store_true", help="run: every arm on the fake agent, no model call")
+    s.set_defaults(fn=cmd_bench)
 
     s = sub.add_parser("ack-wait", help="wait model-free for another project's reply to a `ttp note --to`: probe "
                                         "(a retry_when: 0 once replied, 1 while not, 2 if it cannot tell) or settle "

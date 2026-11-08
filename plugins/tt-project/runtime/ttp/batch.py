@@ -89,6 +89,7 @@ RERUN_S = 600.0                    # delivery.push_rerun_s: the time limit of on
 YIELD_GRACE_S = 300.0              # delivery.push_yield_grace_s: an urgent approval stops a batch only if approved this soon after its checks began
 RERUN_IDS = 10                     # a check failing more tests than this is not rerun: that is no flake
 TIP_RERUNS = 3                     # reruns on the tip alone of a blamed failure's failing tests: one failing clears the entry
+HOST_FAULTS = (envfault.Fault, workerloss.Infra, syntaxfault.Infra, setupfault.Infra)   # the host's, never an entry's
 CARRY_TRIES = 5                    # recorded passes of one check on other tips tried for a carry (verdictcarry)
 OVER = re.compile(r"^E\s+assert (\d[\d_]*) <= (\d[\d_]*)\s*$")   # pytest's size-over-cap line
 SECTION = re.compile(r"^_{3,} (\S.*?) _{3,}$")                     # pytest's per-test failure header
@@ -604,8 +605,8 @@ def _edge_ok(k: int, new: list[str], e1: int, e2: int, edit: list[str], old: lis
 def _import_stmts(lines: list[str]) -> list[tuple[tuple, list[str], int, int]] | None:
     """The import statements that make up `lines`, each as (key, names as written, first line, last
     line): key ("from", level, module) or ("import",), a name `a` or `a as b`. None when the lines
-    hold anything else (other code, `;`, a line continuation, a star import, a name twice) or do
-    not parse on their own. Comments may sit among them: names are placed only where the name
+    hold anything else (other code, `;`, a line continuation, a star import, a name twice), hold
+    no import statement at all (only comments) or do not parse on their own. Comments may sit among them: names are placed only where the name
     before them reads once in the statement."""
     text = "".join(lines)
     if not text.strip() or any(c in text for c in ";\\"):
@@ -623,7 +624,7 @@ def _import_stmts(lines: list[str]) -> list[tuple[tuple, list[str], int, int]] |
             return None
         key = ("from", node.level, node.module or "") if isinstance(node, ast.ImportFrom) else ("import",)
         out.append((key, names, node.lineno - 1, node.end_lineno - 1))
-    return out
+    return out or None
 
 
 def _imports(mine: list[str], old: list[str], theirs: list[str]) -> list[str] | None:
@@ -1439,6 +1440,8 @@ class Batch:
         self.landed_at: dict[int, str] = {}    # entry index -> its own commit on the branch (pushed or landed)
         self._heads: dict[str, str] | None = None   # push.landed_heads, read once per batch
         self.check_run_dir = m.get("check_run_dir")
+        self.isolate = {str(c) for c in m.get("setup_isolate") or []}   # alerted setup_fault checks (pushq)
+        self.at = ""                            # the head _check runs on
         self.checks = {"runs": 0, "seconds": 0.0, "flaky": False}
         self.tip = self.pushed_sha = self.version = None
         self.reach: dict | None = None          # push.reach of what it pushed or found landed
@@ -1585,6 +1588,7 @@ class Batch:
             except setupfault.Infra as e:
                 # A check that failed before any test ran, again on its reruns (or no free pool slot): the
                 # host or its pool, never the entries; every one goes back, retried after setupfault.RETRY_S.
+                # A check the queue alerted on reaches here only from the tip alone or a pool (_run_check).
                 self.checks["setup_fault"] = {"check": e.check, **e.fault}
                 return self._all("requeued", "setup_fault", f"{e}; the batch is held, not failed, and retried later",
                                  keep=("landed", "refused"))
@@ -1757,112 +1761,155 @@ class Batch:
         h = tip
         self.info, self.settled, self.conflicted, self.dropped = {}, {}, set(), {}
         csdir = self.cfg["changeset_dir"] if self.cfg else ""
+        self._faults: list[str] = []    # where each entry before this one raised, "" for one that did not
         for i, e in enumerate(self.entries):
-            sha = str(e.get("head") or "")
-            if not re.fullmatch(r"[0-9a-f]{7,64}", sha) or \
-                    _git(self.repo, "cat-file", "-e", f"{sha}^{{commit}}").returncode != 0:
-                self._set(i, "refused", message=f"the reviewed head {sha[:10] or '(none)'} is not in {self.repo}")
-                continue
-            base = _git(self.repo, "merge-base", tip, sha).stdout.strip()
-            if not base:
-                self._set(i, "refused", message=f"{sha[:10]} shares no history with {self.target}")
-                continue
-            top = sha
-            while top != base and re.search(rf"^{push.BUMP_TRAILER}: ",
-                                            _git(self.repo, "log", "-1", "--format=%B", top).stdout, re.M):
-                parent = _git(self.repo, "rev-parse", "--verify", "--quiet", f"{top}^").stdout.strip()
-                if not parent:
-                    break
-                top = parent
-            if i in self.held:   # its push needs a token scope the credential lacks (_hold_scoped)
-                continue
-            if top == base or (on := self._on_tip(tip, base, top, str(e.get("branch") or ""))):
-                say(f"entry {e.get('id')} ({e.get('branch')}): already on {self.target}"
-                    + (f" (carried by {on[:10]})" if top != base and on != tip else ""))
-                self._set(i, "landed")
-                self.landed_at[i] = tip if top == base else on
-                continue
-            subjects = [s for s in _git(self.repo, "log", "--no-merges", "--reverse", "--format=%s",
-                                        f"{base}..{top}").stdout.splitlines() if s.strip()]
-            brings = bool(csdir) and any(f.endswith(".md") for f in _git(
-                self.repo, "diff", "--name-only", "--diff-filter=A", base, top, "--", csdir).stdout.split())
-            if csdir and (csfile := self.cfg.get("changeset_file") or "") and not brings:
-                # an entry that edits the release changeset itself brings its own changeset
-                brings = csfile in _git(self.repo, "diff", "--name-only", base, top, "--", csfile).stdout.split()
-            self.info[i] = {"subjects": subjects, "changeset": brings, "top": top, "base": base}
-            if not checks and (code := push.code_paths(self.repo, base, top)):
-                more = f" and {len(code) - 3} more" if len(code) > 3 else ""
-                self._set(i, "refused", message=f"no checks configured, and this change touches more than "
-                                                f"docs ({', '.join(code[:3])}{more}): " + push.NO_CHECKS)
-                continue
-            if why := push.scalar_problem(self.d.get("push_exclude_paths")):   # never push unguarded
-                self._set(i, "refused", message=f"delivery.push_exclude_paths: {why}")
-                continue
-            if bad := push.excluded(self.repo, tip, top, push.exclude_list(self.d.get("push_exclude_paths"))):
-                self._set(i, "refused", message=push.excluded_refusal(bad, self.target))
-                continue
-            self._settling = ([], set(), [])
-            resolved: dict[str, list[str]] = {}
-            own, gone = self._landed(h, base, top, resolved, str(e.get("branch") or ""))
-            if hits := self._markers([c for c in own if c not in gone]):
-                # A commit with a conflict marker never lands: sent back as a non-textual conflict, its
-                # fix runs at standard (conflictfix.tier_for) and rewrites the commits.
-                say(f"entry {e.get('id')} ({e.get('branch')}): {hits[0]}: a commit adds a conflict marker")
-                self._set(i, "conflict", files=[f"(the rebase stopped: {conflictfix.marker_refusal(hits)})"],
-                          onto=h, _after=len(carried))
-                continue
-            if gone:
-                left = len(own) - len(gone)
-                say(f"entry {e.get('id')} ({e.get('branch')}): {len(gone)} of its {len(own)} commits are on "
-                    f"{h[:10]} already (" + ", ".join(f"{c[:10]} as {v[:10]}" for c, v in list(gone.items())[:5])
-                    + (f", +{len(gone) - 5} more" if len(gone) > 5 else "")
-                    + (f"); replaying the other {left}" if left else ")"))
-            if resolved := {c: v for c, v in resolved.items() if c in gone}:
-                self.dropped[i] = [{"commit": c, "as": gone[c], "files": v} for c, v in resolved.items()]
-                for c, v in resolved.items():
-                    say(f"entry {e.get('id')}: left out {c[:10]} as landed by {gone[c][:10]}, which resolved a "
-                        f"conflict in its lines of {', '.join(v)} and accounts for every line it adds there")
-            new, files = (h, None) if gone and len(gone) == len(own) else self._rebase(h, top, drop=set(gone))
-            if files is None and self._settling[0]:
-                self.settled[i] = self._settled_now()
-                if not gone and all(release_kind(f, self.cfg) for f in self._settling[0]) \
-                        and own_diff(self.repo, h, new, self.cfg) != own_diff(self.repo, base, top, self.cfg):
-                    # Only release files conflicted, so the approval holds only while the change itself
-                    # is the one reviewed; a replay that changed it goes back as a conflict.
-                    new, files = h, ["(the rebase settled only release files, but the change's own diff "
-                                     "is no longer the approved one)"]
-                    self.settled.pop(i)
-                elif "union" in self._settling[1]:
-                    if why := self._union_lost(gone, base, top, h, new):
-                        new, files = h, [f"(the rebase kept both sides' lines of {', '.join(self._union_files())}, "
-                                         f"but {why})"]
-                        self.settled.pop(i)
-                    else:
-                        self.settled[i]["approval_carried"] = (
-                            f"its only conflicts were in shared docs ({', '.join(self._union_files())}), settled by "
-                            "keeping the lines both sides added; its own diff outside them is the approved one")
-                        say(f"entry {e.get('id')} ({e.get('branch')}): approval carried: "
-                            + self.settled[i]["approval_carried"])
-            if files is not None:
-                say(f"entry {e.get('id')} ({e.get('branch')}) conflicts with {h[:10]} in {', '.join(files)}")
-                self._set(i, "conflict", files=files, onto=h, _after=len(carried))
-                if not files[0].startswith("(the rebase"):
-                    self.conflicted.add(i)
-            elif new == h:
-                on_tip = h == tip or not any(line.startswith("+") for line in _git(
-                    self.repo, "cherry", tip, top, base).stdout.splitlines())
-                say(f"entry {e.get('id')} ({e.get('branch')}): adds nothing to "
-                    + (self.target if on_tip else "the entries before it"))
-                if on_tip:
-                    self._set(i, "landed")
-                    self.landed_at[i] = tip
-                else:
-                    self._set(i, "rider", _after=len(carried))
-            else:
-                carried.append((i, new))
-                self._set(i, "carried")
-                h = new
+            try:
+                h = self._replay_one(i, e, h, carried, tip, checks, csdir)
+                self._faults.append("")
+            except HOST_FAULTS:
+                raise
+            except Exception as ex:     # one entry's fault takes only it out, never the whole batch
+                self._replay_fault(i, e, h, carried, ex)
         return carried
+
+    def _replay_one(self, i: int, e: dict, h: str, carried: list[tuple[int, str]], tip: str, checks: list[str],
+                    csdir: str) -> str:
+        """Replay entry `i` onto the batch head `h` and give it its status; the batch head after it
+        (`h` unless it is carried, when it is also added to `carried`)."""
+        sha = str(e.get("head") or "")
+        if not re.fullmatch(r"[0-9a-f]{7,64}", sha) or \
+                _git(self.repo, "cat-file", "-e", f"{sha}^{{commit}}").returncode != 0:
+            self._set(i, "refused", message=f"the reviewed head {sha[:10] or '(none)'} is not in {self.repo}")
+            return h
+        base = _git(self.repo, "merge-base", tip, sha).stdout.strip()
+        if not base:
+            self._set(i, "refused", message=f"{sha[:10]} shares no history with {self.target}")
+            return h
+        top = sha
+        while top != base and re.search(rf"^{push.BUMP_TRAILER}: ",
+                                        _git(self.repo, "log", "-1", "--format=%B", top).stdout, re.M):
+            parent = _git(self.repo, "rev-parse", "--verify", "--quiet", f"{top}^").stdout.strip()
+            if not parent:
+                break
+            top = parent
+        if i in self.held:   # its push needs a token scope the credential lacks (_hold_scoped)
+            return h
+        if top == base or (on := self._on_tip(tip, base, top, str(e.get("branch") or ""))):
+            say(f"entry {e.get('id')} ({e.get('branch')}): already on {self.target}"
+                + (f" (carried by {on[:10]})" if top != base and on != tip else ""))
+            self._set(i, "landed")
+            self.landed_at[i] = tip if top == base else on
+            return h
+        subjects = [s for s in _git(self.repo, "log", "--no-merges", "--reverse", "--format=%s",
+                                    f"{base}..{top}").stdout.splitlines() if s.strip()]
+        brings = bool(csdir) and any(f.endswith(".md") for f in _git(
+            self.repo, "diff", "--name-only", "--diff-filter=A", base, top, "--", csdir).stdout.split())
+        if csdir and (csfile := self.cfg.get("changeset_file") or "") and not brings:
+            # an entry that edits the release changeset itself brings its own changeset
+            brings = csfile in _git(self.repo, "diff", "--name-only", base, top, "--", csfile).stdout.split()
+        self.info[i] = {"subjects": subjects, "changeset": brings, "top": top, "base": base}
+        if not checks and (code := push.code_paths(self.repo, base, top)):
+            more = f" and {len(code) - 3} more" if len(code) > 3 else ""
+            self._set(i, "refused", message=f"no checks configured, and this change touches more than "
+                                            f"docs ({', '.join(code[:3])}{more}): " + push.NO_CHECKS)
+            return h
+        if why := push.scalar_problem(self.d.get("push_exclude_paths")):   # never push unguarded
+            self._set(i, "refused", message=f"delivery.push_exclude_paths: {why}")
+            return h
+        if bad := push.excluded(self.repo, tip, top, push.exclude_list(self.d.get("push_exclude_paths"))):
+            self._set(i, "refused", message=push.excluded_refusal(bad, self.target))
+            return h
+        self._settling = ([], set(), [])
+        resolved: dict[str, list[str]] = {}
+        own, gone = self._landed(h, base, top, resolved, str(e.get("branch") or ""))
+        if hits := self._markers([c for c in own if c not in gone]):
+            # A commit with a conflict marker never lands: sent back as a non-textual conflict, its
+            # fix runs at standard (conflictfix.tier_for) and rewrites the commits.
+            say(f"entry {e.get('id')} ({e.get('branch')}): {hits[0]}: a commit adds a conflict marker")
+            self._set(i, "conflict", files=[f"(the rebase stopped: {conflictfix.marker_refusal(hits)})"],
+                      onto=h, _after=len(carried))
+            return h
+        if gone:
+            left = len(own) - len(gone)
+            say(f"entry {e.get('id')} ({e.get('branch')}): {len(gone)} of its {len(own)} commits are on "
+                f"{h[:10]} already (" + ", ".join(f"{c[:10]} as {v[:10]}" for c, v in list(gone.items())[:5])
+                + (f", +{len(gone) - 5} more" if len(gone) > 5 else "")
+                + (f"); replaying the other {left}" if left else ")"))
+        if resolved := {c: v for c, v in resolved.items() if c in gone}:
+            self.dropped[i] = [{"commit": c, "as": gone[c], "files": v} for c, v in resolved.items()]
+            for c, v in resolved.items():
+                say(f"entry {e.get('id')}: left out {c[:10]} as landed by {gone[c][:10]}, which resolved a "
+                    f"conflict in its lines of {', '.join(v)} and accounts for every line it adds there")
+        new, files = (h, None) if gone and len(gone) == len(own) else self._rebase(h, top, drop=set(gone))
+        if files is None and self._settling[0]:
+            self.settled[i] = self._settled_now()
+            if not gone and all(release_kind(f, self.cfg) for f in self._settling[0]) \
+                    and own_diff(self.repo, h, new, self.cfg) != own_diff(self.repo, base, top, self.cfg):
+                # Only release files conflicted, so the approval holds only while the change itself
+                # is the one reviewed; a replay that changed it goes back as a conflict.
+                new, files = h, ["(the rebase settled only release files, but the change's own diff "
+                                 "is no longer the approved one)"]
+                self.settled.pop(i)
+            elif "union" in self._settling[1]:
+                if why := self._union_lost(gone, base, top, h, new):
+                    new, files = h, [f"(the rebase kept both sides' lines of {', '.join(self._union_files())}, "
+                                     f"but {why})"]
+                    self.settled.pop(i)
+                else:
+                    self.settled[i]["approval_carried"] = (
+                        f"its only conflicts were in shared docs ({', '.join(self._union_files())}), settled by "
+                        "keeping the lines both sides added; its own diff outside them is the approved one")
+                    say(f"entry {e.get('id')} ({e.get('branch')}): approval carried: "
+                        + self.settled[i]["approval_carried"])
+        if files is not None:
+            say(f"entry {e.get('id')} ({e.get('branch')}) conflicts with {h[:10]} in {', '.join(files)}")
+            self._set(i, "conflict", files=files, onto=h, _after=len(carried))
+            if not files[0].startswith("(the rebase"):
+                self.conflicted.add(i)
+        elif new == h:
+            on_tip = h == tip or not any(line.startswith("+") for line in _git(
+                self.repo, "cherry", tip, top, base).stdout.splitlines())
+            say(f"entry {e.get('id')} ({e.get('branch')}): adds nothing to "
+                + (self.target if on_tip else "the entries before it"))
+            if on_tip:
+                self._set(i, "landed")
+                self.landed_at[i] = tip
+            else:
+                self._set(i, "rider", _after=len(carried))
+        else:
+            carried.append((i, new))
+            self._set(i, "carried")
+            return new
+        return h
+
+    def _replay_fault(self, i: int, e: dict, h: str, carried: list[tuple[int, str]], ex: Exception) -> None:
+        """Entry `i` raised while it was replayed: abort what it left in the worktree and send it
+        back as a conflict that is no textual one (its fix rebases it onto `h` by hand), naming the
+        error, so the entries after it still go and the error is never every batch's. The batch's
+        own fault is raised instead (an error of the whole batch, every entry requeued): the same
+        error in every entry so far (two or more), or a worktree it cannot reset."""
+        import traceback
+        where = traceback.extract_tb(ex.__traceback__)[-1:]
+        at = f" at {Path(where[0].filename).name}:{where[0].lineno}" if where else ""
+        why = f"{type(ex).__name__}: {ex}{at}"
+        key = f"{type(ex).__name__}{at}"
+        if self._faults and all(k == key for k in self._faults):
+            raise ex
+        self._faults.append(key)
+        say(f"entry {e.get('id')} ({e.get('branch')}): the batch could not replay it ({why}); sent back, "
+            "the rest goes on")
+        carried[:] = [c for c in carried if c[0] != i]
+        self.settled.pop(i, None)
+        self.dropped.pop(i, None)
+        self.conflicted.discard(i)
+        try:
+            if _rebasing(self.wt):
+                _git(self.wt, "rebase", "--abort")
+            self._checkout(h)
+        except Exception as e2:     # a broken worktree is the batch's fault, not the entry's
+            raise ex from e2
+        self._set(i, "conflict", files=[f"(the rebase could not run in the batch: {why[:400]})"], onto=h,
+                  error=why[:2000], _after=len(carried))
 
     def _settled_now(self) -> dict:
         """The settled detail of the replay just run: files, kinds and, for shared docs, each one's
@@ -2136,6 +2183,19 @@ class Batch:
         self.steps.go("checks")
         return slot
 
+    def _check_env(self, head: str = "") -> dict:
+        """The env the batch's checks run in (push.check_env), in the project's pinned Python env. One
+        that cannot be made is the host's fault (envfault.Fault: the batch is held, not failed), unless
+        `head` changed checks.python_lock itself (runnerenv.changed_by): runnerenv.Unavailable then."""
+        cfg = self.p.config()
+        lock = push.runnerenv.lock_of(cfg, self.wt)
+        try:
+            return push.check_env("target", self.tip, self.check_run_dir, self.branch, lock=lock)
+        except push.runnerenv.Unavailable as e:
+            if head and push.runnerenv.changed_by(self.wt, cfg, self.tip or "", head):
+                raise
+            raise envfault.Fault(push.runnerenv.fault(lock, e)) from e
+
     def _check(self, head: str, checks: list[str]) -> tuple[str, str] | None:
         """Check `head` in the worktree: None when it passes, else (command, output tail). The stale
         version guard (push.stale_versions, with `delivery.plugin_version_guard` on) comes first and
@@ -2143,6 +2203,7 @@ class Batch:
         if self.checks_at is None:
             self.checks_at = time.time()
         self._checkout(head)
+        self.at = head
         stale = push.stale_versions(self.wt, self.tip) if push.version_guard(self.d) else []
         if stale:
             msg = (f"{', '.join(stale)}: this change edits the plugin but keeps the version already on "
@@ -2168,7 +2229,11 @@ class Batch:
             return push.NONE_APPLY, ""
         say(f"checking {head[:10]}")
         self.checks["runs"] += 1
-        env = push.check_env("target", self.tip, self.check_run_dir, self.branch)
+        try:
+            env = self._check_env(head)
+        except push.runnerenv.Unavailable as e:   # its own checks.python_lock edit
+            say(f"{head[:10]}: {e}")
+            return "python env", str(e)
         tree, run = pushpass.tree_of(self.wt, head), []
         for n, cmd in enumerate(todo):
             parts = pushpass.env_parts(self.wt, cmd, env, self.tip or "")
@@ -2249,7 +2314,10 @@ class Batch:
         workerloss.Infra: the host, never a failure of the batch's entries. A failure on a transient syntax
         error in a script outside the change runs once more too (syntaxfault); so again, it raises
         syntaxfault.Infra. One that failed before any test ran runs again up to setupfault.RERUNS times (a pool
-        with no free slot not at all); still so, it raises setupfault.Infra."""
+        with no free slot not at all); still so, it raises setupfault.Infra, unless the check is one whose
+        setup_fault holds the queue already alerted on (self.isolate) and it ran on a head with entries: then
+        its setup fault is that head's failed check, so the entry search isolates the entry it follows (the
+        tip alone failing so too, or a pool fault, still raises it: no entry's own)."""
         collect = workerloss.Collector()
 
         def once():
@@ -2271,6 +2339,9 @@ class Batch:
                 continue
             if rc != push.BUSY and (fault := setupfault.found(collect.setup, self.wt)):
                 if fault["kind"] == "pool" or setup >= setupfault.RERUNS:
+                    if fault["kind"] == "setup" and str(cmd) in self.isolate and self.at != self.tip:
+                        say(setupfault.isolate_line(fault, str(cmd)))
+                        return rc, f"{setupfault.isolate_line(fault, str(cmd))}\n{tail}"
                     raise setupfault.Infra(fault, str(cmd))
                 setup += 1
                 say(setupfault.rerun_line(fault, str(cmd), setup))
@@ -2471,7 +2542,7 @@ class Batch:
             return None
         say(f"rerunning the {len(ids)} failing test(s) on the tip {tip[:10]} alone, up to {TIP_RERUNS} times: "
             f"{' '.join(ids)}")
-        env = push.check_env("target", self.tip, self.check_run_dir, self.branch)
+        env = self._check_env()
         self._runners([cmd], env)
         slot = self._slot(tip)
         try:
@@ -2517,7 +2588,10 @@ class Batch:
         todo = [c for c in todo if pushpass.resumable(c)]
         if not todo:
             return False
-        env = push.check_env("target", self.tip, self.check_run_dir, self.branch)
+        try:
+            env = self._check_env(head)
+        except push.runnerenv.Unavailable:
+            return False
         self._runners(todo, env)
         tree, slot, started = pushpass.tree_of(self.wt, plain), None, time.time()
         try:

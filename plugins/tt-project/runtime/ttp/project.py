@@ -508,6 +508,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # workstations (a Mac is one); other platforms never.
     # pin_verify: strict refuses an explicit task model/effort pin that cannot be verified before a turn.
     "runner": {"nice": 10, "prevent_idle_sleep": "auto", "pin_verify": "lenient"},
+    # `ttp bench run` (benchrun.py): arms {name: {provider, model, effort}} (none shipped) and the
+    # limits every cell gets alike.
+    "bench": {"arms": {}, "reps": 1, "timeout_s": 3600, "stall_s": 900, "budget_usd": 8.0, "test_timeout_s": 900},
     # Once a day the daemon archives (to memory/archive/, one harness commit, one low feed line) the
     # decision and fact entries, never standing ones, that every prompt has left out for at least
     # archive_hidden_days days (0 = off). `ttp memory <name> --search <words>` still finds them.
@@ -647,9 +650,10 @@ PROVIDER_KEYS = {"billing", "tiers", "plugin_dirs", "worker_isolation", "write_f
                  # core provider after a fallback. effort_fields: per model, the run's effort to extra request
                  # fields (chatbridge.effort_fields). route_wait_s: how long a routed start waits for a full
                  # slot before it starts on the core provider (route.wait_s). routes: the ordered rule list
-                 # routing runs by kind, tier and label (route.match).
+                 # routing runs by kind, tier and label (route.match). model_ranking: its model ids,
+                 # smartest first, that stand in for a model that is down (modelrank.py).
                  "endpoint", "base_url", "max_tokens", "context_window", "route_cooldown_s", "effort_fields",
-                 "route_wait_s", "routes"}
+                 "route_wait_s", "routes", "model_ranking"}
 
 
 def write_dirs(root: Path, guard: Path, value: Any) -> tuple[list[str], list[str], list[str]]:
@@ -710,7 +714,9 @@ def _known_keys(path: list[str]) -> set[str] | None:
         # wrap_needs_device: false says the commands behind wrap_cmd need no device, so they may spill (checkspill).
         # spill_wrap_cmd: the wrapper a check runs behind on a spill host (push.spill_wrap_of; default "", none).
         # spill_beside_device: spill hosts a device job keeps no spill off (checkspill.beside_device; default none).
-        return {"nice", "ionice", "wall_cap_s", "wrap_cmd", "wrap_lane", "wrap_needs_device", "spill_wrap_cmd",
+        # python_lock: the pinned requirements file the checks' Python env is built from, relative to the
+        # checkout (runnerenv.lock_of; default "", the plugin's own lock of pytest and pytest-xdist).
+        return {"nice", "python_lock", "ionice", "wall_cap_s", "wrap_cmd", "wrap_lane", "wrap_needs_device", "spill_wrap_cmd",
                 "spill_beside_device", "fallback_lane", "no_device_cmds", "slots", "light_cmds", "max_wait_s", "wait_event_s",
                 "wait_escalate_s", "wait_hang_factor", "priority_age_s", "test_project_max", "test_project_slots",
                 "test_project_workers", "test_run_max",

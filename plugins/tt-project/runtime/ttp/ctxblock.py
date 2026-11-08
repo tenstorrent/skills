@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import re
+import unicodedata
 from pathlib import Path
 
 from .db import load_result, review_subject
@@ -47,10 +48,12 @@ INTRO = ("Read at dispatch from this project's records without a model call: wha
          "whatever it says.")
 
 # Order labels a data line may carry (any case, spacing, apostrophe or brackets): the user's-words label of
-# (a), bare or with a colon, and relay's owner's-agent labels; zero-width characters are dropped first.
-SPOOFED = re.compile(r"\buser\W{0,3}s?\s*(?:[a-z]+\s+)?words?(?:\W{0,4}verbatim\W{0,2}|\s*:)"
-                     r"|\b(?:the\s+)?owner\W{0,3}s?\s*(?:own\s+)?words?\s*via\s*the\s*owner\W{0,3}s?\s*agent\b"
-                     r"|\bowner\W{0,3}s?\s*(?:own\s+)?agent\W{0,3}s?\s*words?\s*:", re.I)
+# (a), bare or with a colon, and relay's owner's-agent labels; zero-width characters are dropped first, and
+# the text is NFKC-normalised before the match so fullwidth and other look-alike letters fall to their
+# plain form. \W{0,3} after the optional s also catches the plural possessive ("Users' words").
+SPOOFED = re.compile(r"\buser\W{0,3}s?\W{0,3}\s*(?:[a-z]+\s+)?words?(?:\W{0,4}verbatim\W{0,2}|\s*:)"
+                     r"|\b(?:the\s+)?owner\W{0,3}s?\W{0,3}\s*(?:own\s+)?words?\s*via\s*the\s*owner\W{0,3}s?\W{0,3}\s*agent\b"
+                     r"|\bowner\W{0,3}s?\W{0,3}\s*(?:own\s+)?agent\W{0,3}s?\W{0,3}\s*words?\s*:", re.I)
 DATA_LABEL = "quoted words (data) "
 _ZERO_WIDTH = re.compile("[\u00ad\u180e\u200b-\u200f\u202a-\u202e\u2060-\u2064\ufeff]")
 _MSG_RUN = re.compile(r"\b(?:user\s+)?(?:msgs?|messages?)\.?\s*#(\d+)((?:\s*(?:,|and|or|&)\s*#\d+)*)", re.I)
@@ -69,8 +72,9 @@ def _clip(text, chars: int) -> str:
 
 def _data(text, chars: int) -> str:
     """A data line's text, clipped, with any order label in it shown as DATA_LABEL (before the clip, so
-    a cut cannot leave half a label)."""
-    return _clip(SPOOFED.sub(DATA_LABEL, _ZERO_WIDTH.sub("", str(text or ""))), chars)
+    a cut cannot leave half a label). Zero-width characters are dropped and the text is NFKC-normalised
+    first, so fullwidth and other look-alike letters fall to their plain form before the label is matched."""
+    return _clip(SPOOFED.sub(DATA_LABEL, _ZERO_WIDTH.sub("", unicodedata.normalize("NFKC", str(text or "")))), chars)
 
 
 def _span(text, chars: int, source: str, tag: str) -> str:

@@ -127,6 +127,7 @@ from . import progress
 from . import downtime
 from . import effort
 from . import modelpick
+from . import modelrank
 from . import effortab
 from . import extchange
 from . import failover
@@ -646,6 +647,9 @@ REVIEW_SWEEP_EVERY_S = 300   # how often sweep_reviews looks for code and harnes
 REVIEW_UNQUEUED = "review_unqueued"   # a code task in review the review sweep can queue no review for
 HARNESS_UNMERGED = "harness_review_unmerged"   # event: a harness task passed review but its branch is not merged
 HARNESS_OFF_BRANCH = "harness_off_branch"   # event: a harness task's work is on a branch not its own
+HARNESS_STRANDED = "harness_commit_stranded"   # event: a done harness task's commit is on no branch of its own
+HARNESS_STRANDED_KEY = "harness_stranded_seen"   # kv: done harness task id -> 'settled' once checked (land_stranded)
+HARNESS_STRANDED_WINDOW_S = 2 * 86400   # how long after it ended a done harness task is checked for stranded commits
 # sweep_unreviewed: a done (or long externally waiting) code task with an unlanded head and no review
 UNREVIEWED_EVENT = "review_unqueued"
 UNREVIEWED_PER_PASS = 2        # review.unreviewed_per_pass unreadable: most reviews one pass queues (unset: loadcaps)
@@ -2955,6 +2959,10 @@ class Daemon:
                 model, effort = by_rule   # a providers.chat.routes rule's model and effort (route.run_model)
             model = pin.get("model") or model
             effort = pin.get("effort") or effort
+            if provider == modelrank.TO and pin.get("model") and not failover.required(self.p.db, task) and (
+                    got := self._rank_pick(f"task #{task.get('id')}'s pin", f"pin:{pin['model']}", pin["model"], time.time())):
+                model = pin["model"] = got[0]   # a preference pin on a model that is down (modelrank.py)
+                note = {**(note or {}), modelrank.KEY: got[1]}
             ab = (note or {}).get(effortab.KEY)
             if not pin.get("effort") and isinstance(ab, dict) and ab.get("effort"):
                 effort = str(ab["effort"])   # the task's effort A/B arm or Jev's pick (effortab.assign)
@@ -3085,11 +3093,11 @@ class Daemon:
                 env = {**env, **prov.compact_env(compact_at)}
                 argv = _before_stdin(argv, prov.compact_args(compact_at))
             seed_usd = None
+            # The seeded prompt's size: a later new session's seed cap bounds this wake's seed by it (seedcap.py).
+            seed_chars = sum(len(t or "") for t in (system, context, append_system, prompt))
             if session_mode == "new" and budget_usd is not None and prov.caps_budget:
                 try:   # the seed rides on this wake: its cap covers it, within the dollar caps (seedcap.py)
-                    seed_usd, seed_basis = seedcap.expected(
-                        self.p.db, self.cfg, provider, model,
-                        sum(len(t or "") for t in (system, context, append_system, prompt)))
+                    seed_usd, seed_basis = seedcap.expected(self.p.db, self.cfg, provider, model, seed_chars)
                     g = self.gates.get(provider)
                     room = turnsize.headroom(self.cfg, dict(g.numbers) if g else {})
                     session_cap = seedcap.cap(float(budget_usd), seed_usd, room)
@@ -3106,6 +3114,7 @@ class Daemon:
                    if (state or {}).get("rerun") else {}),
                 **({"restore": True} if restoring else {}),
                 **({"compact_at": compact_at} if compact_at else {}),
+                **({"seed_chars": seed_chars} if session_mode == "new" else {}),
                 **({"sent": sent_why, "sent_chars": len(prompt)} if sent_why else {})}}}
         if role != "coordinator":
             window = self.cfg["budget"].get("compact_window_tokens") or 0   # 0: off for every tier
@@ -3809,7 +3818,7 @@ class Daemon:
             log(self.p, f"route: tier {tier} routes again ({model}: {why})")
         if os.environ.get("TTP_TEST_NO_MODELS_PROBE") or (self._models_probe and self._models_probe.is_alive()):
             return
-        if now - self._models_tried < 300 or not (alias := route.models_due(self.cfg, self.p.state, now)):
+        if now - self._models_tried < 300 or not (alias := route.models_due(self.cfg, self.p.state, now, self.p.db)):
             return
         self._models_tried = now
         state, where = self.p.state, self.p
@@ -4666,16 +4675,20 @@ class Daemon:
                     db.set_kv(seen, {"run": r["id"], "ts": time.time()})   # logged once per model and effort
                     log(self.p, f"route: {r['model']} rejected its effort_fields at effort "
                                 f"{sent['effort'] or '-'} ({', '.join(sent['fields'])}); run {r['id']} went on without them")
-            if fell == "model_missing":   # only this tier's route holds, until its model is served or changed
+            if fell == "model_missing" and routed.get(modelrank.KEY):   # a ranked stand-in refused: skip it
+                modelrank.refused(db, r["model"] or routed["model"], r["id"], time.time())
+                log(self.p, f"model ranking: {routed['to']} refused {r['model'] or routed['model']} (run {r['id']})")
+            elif fell == "model_missing":   # only this tier's route holds, until its model is served or changed
                 model = r["model"] or routed["model"]
                 if route.hold(db, routed["tier"], model, r["id"], time.time()):
                     log(self.p, f"route: {routed['to']} does not serve {model}; tier {routed['tier']} held (run {r['id']})")
-                    self.alert(f"route-model-missing:{routed['tier']}",
-                               f"The {routed['to']} provider no longer serves model {model} "
-                               f"(providers.{routed['to']}.tiers.{routed['tier']}.model). {routed['tier'].capitalize()} "
-                               f"runs now start on the core provider; routing resumes on its own once the model is "
-                               f"served again (checked hourly) or the tier's model is changed. Served models: "
-                               f"`ttp status`.", severity="normal", every_s=0)
+                    if not modelrank.pick(db, self.cfg, self.p.state, model, time.time()):   # else its switch alerts
+                        self.alert(f"route-model-missing:{routed['tier']}",
+                                   f"The {routed['to']} provider no longer serves model {model} "
+                                   f"(providers.{routed['to']}.tiers.{routed['tier']}.model). {routed['tier'].capitalize()} "
+                                   f"runs now start on the core provider; routing resumes on its own once the model is "
+                                   f"served again (checked hourly) or the tier's model is changed. Served models: "
+                                   f"`ttp status`.", severity="normal", every_s=0)
             elif fell and not own:   # an endpoint fault cools the endpoint; a run's own end only its task
                 route.cool(db, self.cfg, routed["to"], fell, r["id"], time.time())
         if "split" not in note:   # the split steer may have fired after `r` was read
@@ -10000,6 +10013,9 @@ class Daemon:
         if self._precheck_holds(task, now):
             ctx["held_by"][task["id"]] = self._precheck_words(task)
             return "held"
+        if why := self._required_model_down(task, provider, now):
+            ctx["held_by"][task["id"]] = why
+            return "held"
         if coord.task_resources(task) & ctx["paused"].keys():
             ctx["holds"][task["id"]] = {"kind": "pause", "resource": sorted(coord.task_resources(task)
                                                                             & ctx["paused"].keys())[0]}
@@ -10182,9 +10198,47 @@ class Daemon:
         if esc:   # urgent, user-ordered, a fix of a routed change or a lineage's misses: the core provider
             return {"tier": tier, "to": name, "model": model, **rule, "fallback": route.ESCALATED, **esc}
         why = "model_missing" if route.held(self.p.db, self.cfg, tier) == model else route.cooling(self.p.db, name, now)
+        where, key = (f"tier {tier}", tier) if rule_i is None else (f"tier {tier} rule {rule_i}", f"{tier}:rule{rule_i}")
+        ranked = self._rank_pick(where, key, model, now) \
+            if name == modelrank.TO and why in ("", "model_missing") else None   # one switch record per rule
+        if ranked:   # its model is down: the smartest model still served (modelrank.py)
+            model, why = ranked[0], ""
         if not why and self._logged_out(name) and not self._may_probe(name, now):
             why = "auth"   # the auth gate holds it; its one login check may be a routed run
-        return {"tier": tier, "to": name, "model": model, **rule, "fallback": why or "none"}
+        return {"tier": tier, "to": name, "model": model, **rule, "fallback": why or "none",
+                **({modelrank.KEY: ranked[1]} if ranked else {})}
+
+    def _required_model_down(self, task: dict, provider: str, now: float) -> str:
+        """Why a task whose required model pin (failover.required) on chat is down (modelrank.down) waits,
+        else '': such a pin is never swapped for a ranked model."""
+        model = str(task.get("model") or "")
+        if provider != route.TO or not model:
+            return ""
+        try:
+            why = modelrank.down(self.p.db, self.cfg, self.p.state, model, now)
+            return f"its required model {model} is down on {route.TO} ({why}); it waits until that is served again" \
+                if why and failover.required(self.p.db, task) else ""
+        except Exception as e:   # the ranking must never hold a task back
+            log(self.p, f"task {task.get('id')}: model ranking not checked: {type(e).__name__}: {e}")
+            return ""
+
+    def _rank_pick(self, where: str, key: str, model: str, now: float) -> tuple[str, dict] | None:
+        """(the model to run, {"from", "why"}) when `model` is down and the ranking (modelrank.py) names one
+        served, with one low alert per switch of `key`; else None, and a switch kept for `key` ends."""
+        try:
+            got = modelrank.pick(self.p.db, self.cfg, self.p.state, model, now)
+            if not got:   # up again ends its switch; still down with none ranked served keeps it
+                if not modelrank.down(self.p.db, self.cfg, self.p.state, model, now) and (
+                        last := modelrank.back(self.p.db, key)):
+                    log(self.p, f"model ranking: {where} back on {last.get('from')} (was {last.get('to')})")
+                return None
+            if modelrank.switch(self.p.db, key, model, got[0], now):
+                log(self.p, f"model ranking: {where} moves from {model} ({got[1]}) to {got[0]}")
+                self.alert(f"model-rank:{key}", modelrank.text(where, model, got[0], got[1]), severity="low", every_s=0)
+            return got[0], {"from": model, "why": got[1]}
+        except Exception as e:   # the ranking must never hold a task back
+            log(self.p, f"model ranking not applied ({where}): {type(e).__name__}: {e}")
+            return None
 
     def _slot_provider(self, task: dict, provider: str, ctx: dict) -> str:
         """The provider whose worker slots a start of `task` takes: the one its tier is routed to
@@ -12957,6 +13011,8 @@ class Daemon:
             # (a reboot or a network blip). Both mean "not yet". A model run cannot make a "not yet"
             # probe pass, so past `max_hold_s` the coordinator decides instead of a wake.
             start, peer = self._peer_hold(task, prev, since, max_hold, now)
+            if now >= start + max_hold:   # a user-marker gate is timed from when the marker appeared
+                start = max(start, userpause.gate_opened(prev.get("retry_when"), self.cfg, self.p.root, now) or 0)
             held = now >= start + max_hold
             gate = time_gate(str(prev.get("retry_when") or ""))
             # A pure time gate whose epoch is still ahead is not stuck: no turn could make it pass sooner.
@@ -16867,8 +16923,11 @@ class Daemon:
         """Merge the commits of harness tasks that worked in a worktree of their own, once their run ended
         (harnesstree.sweep); one that git refused is tried again next tick, a conflict once its branch or
         the harness moved. It holds the upgrade lock meanwhile and waits while `ttp upgrade` holds it:
-        either one's merge in the live checkout would leave MERGE_HEAD in the way of the other."""
-        if not (self.p.state / harnesstree.DIR).is_dir():
+        either one's merge in the live checkout would leave MERGE_HEAD in the way of the other. Done harness
+        tasks whose commits sit outside the harness HEAD and outside a worktree of their own are landed or
+        raised too (_land_stranded_harness)."""
+        stranded = self._stranded_harness_tasks()
+        if not ((self.p.state / harnesstree.DIR).is_dir() or stranded):
             return
         held = locks.try_take([release.upgrade_lock(self.p)], f"daemon (pid {os.getpid()}): landing harness worktrees",
                               "harness worktree landing")
@@ -16880,10 +16939,57 @@ class Daemon:
             for tid, got in harnesstree.sweep(self.p, running).items():
                 if got in ("merged", "conflict"):
                     log(self.p, f"harness worktree of task {tid}: {got}")
+            self._land_stranded_harness(stranded)
         except Exception:  # never in the way of the tick
             log(self.p, "harness worktree landing error: " + traceback.format_exc().replace("\n", " | ")[:2000])
         finally:
             held.close()
+
+    def _stranded_harness_tasks(self) -> list[dict]:
+        """Done harness tasks that ended within HARNESS_STRANDED_WINDOW_S and are not settled yet
+        (HARNESS_STRANDED_KEY); the key drops tasks that left the window."""
+        db = self.p.db
+        rows = db.q("SELECT * FROM tasks WHERE kind='harness' AND status='done' AND updated>=? ORDER BY id",
+                    (time.time() - HARNESS_STRANDED_WINDOW_S,))
+        seen = db.kv(HARNESS_STRANDED_KEY, {}) or {}
+        kept = {k: v for k, v in seen.items() if int(k) in {t["id"] for t in rows}}
+        if kept != seen:
+            db.set_kv(HARNESS_STRANDED_KEY, kept)
+        return [t for t in rows if str(t["id"]) not in kept]
+
+    def _land_stranded_harness(self, tasks: list[dict]) -> None:
+        """For each done harness task in `tasks` (_stranded_harness_tasks), land its named commits that
+        are on a ttp/t<id>-<slug> branch outside a worktree of its own (harnesstree.land_stranded), and
+        raise one HARNESS_STRANDED event naming each commit that is on no such branch, with the branches
+        holding it, so the coordinator can queue a land. A task is settled once nothing is left to merge
+        (a busy or conflicting merge is tried again on a later pass; a conflict is raised by land)."""
+        db = self.p.db
+        for t in tasks:
+            if harnesstree.path(self.p, t["id"]).exists():
+                continue   # land merges its own worktree's branch; checked once that worktree is gone
+            try:
+                got, alone = harnesstree.land_stranded(self.p, t)
+            except Exception:
+                log(self.p, f"task {t['id']}: stranded harness commits check failed: "
+                            + traceback.format_exc().replace("\n", " | ")[:1500])
+                continue
+            if got == "merged":
+                log(self.p, f"task {t['id']}: merged its harness commits from a branch of its own outside its worktree")
+            if got not in ("", "merged"):
+                continue
+            with db.tx():
+                if alone and not db.one("SELECT id FROM events WHERE kind=? AND task=?", (HARNESS_STRANDED, t["id"])):
+                    where = "; ".join(f"{sha[:10]} on {', '.join(bs) if bs else 'no local branch'}" for sha, bs in alone)
+                    db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+                         (time.time(), "daemon", HARNESS_STRANDED, "normal",
+                          f"#{t['id']} {t['title']} ended done, but its commits are not in the harness HEAD "
+                          f"({self.p.harness}) and on no branch of its own: {where}. Queue a harness task to "
+                          f"land them (merge or cherry-pick into the main line, keeping both sides' intents), "
+                          f"or leave them if they are not wanted.", "queued", t["id"]))
+                    log(self.p, f"task {t['id']}: done but its harness commits are stranded ({where}); told the coordinator")
+                seen = db.kv(HARNESS_STRANDED_KEY, {}) or {}
+                seen[str(t["id"])] = "settled"
+                db.set_kv(HARNESS_STRANDED_KEY, seen)
 
     def _workdir_for(self, task: dict) -> tuple[str, str | None]:
         if task["kind"] == "harness":   # its own worktree of the harness while another works there

@@ -278,7 +278,9 @@ def precheck(cmds: list, top: str | Path, env: dict | None = None) -> dict | Non
 
 
 def line(f: dict) -> str:
-    what = (f"{f['python']} has {f['runner']} {f['version']}, below the repository's minversion {f.get('min')}"
+    what = (f"the checks' pinned Python env cannot be made from {f.get('lock')}: {f.get('why')}"
+            if f.get("kind") == "pyenv" else
+            f"{f['python']} has {f['runner']} {f['version']}, below the repository's minversion {f.get('min')}"
             if f.get("version") else
             f"{f['python']} cannot import {f['runner']}" if f.get("kind") == "module" and f.get("python")
             else f"check host {f.get('host')} is {f['why']}" if f.get("kind") == "host"
@@ -308,7 +310,7 @@ def record(p, f: dict, task: str | None = None, queue: bool = False) -> bool:
             if task and task not in tasks:
                 tasks = (tasks + [task])[-20:]
             keep = {k: f.get(k) for k in ("kind", "name", "python", "module", "path", "cwd", "cmd", "runner",
-                                          "min", "version", "host", "why") if f.get(k) is not None}
+                                          "min", "version", "host", "why", "lock") if f.get(k) is not None}
             if old and old.get("queue") and not queue:
                 keep = {k: old[k] for k in keep.keys() | old.keys() if k in old}
             faults[sig] = {**keep, "since": (old or {}).get("since") or now, "last": now, "tasks": tasks,
@@ -323,6 +325,10 @@ def record(p, f: dict, task: str | None = None, queue: bool = False) -> bool:
                           "Make the host reachable by ssh without a prompt, with git and tar, or change "
                           "delivery.checks_host or the check's host")
                          if f.get("kind") == "host" else
+                         (f"the checks' pinned Python env cannot be made from {f.get('lock')} ({f.get('why')})",
+                          "Restore what its build needs on the host (python3's venv module, the package index "
+                          "pip reads, or the lock file)")
+                         if f.get("kind") == "pyenv" else
                          (f"the check runner {f.get('runner')} cannot be found or imported{py}",
                           "Restore the runner on the host (reinstall it for that python, or point the checks "
                           "at a venv)"))
@@ -350,6 +356,10 @@ def _still(f: dict) -> dict | None:
     checkout is gone (a removed worktree and its venv: nothing there to wait for)."""
     if f.get("kind") == "host":   # the host, wherever the check was started
         return probe(f)
+    if f.get("kind") == "pyenv":   # its build, started in the background when none runs: never waited for
+        from . import runnerenv
+        lock = Path(str(f.get("lock") or ""))
+        return None if not lock.is_file() or runnerenv.ready(lock) else f
     cwd = str(f.get("cwd") or "")
     if not cwd or not Path(cwd).is_dir():
         return None

@@ -162,7 +162,7 @@ def test_repeated_setup_fault_holds_of_one_check_raise_one_alert_until_that_chec
     fault lines and the batches. Another check's hold neither counts nor clears it. A batch that passes the
     check clears its count and the alert; a pushed batch clears every count. delivery.push_setup_fault_escalate_after
     0 turns it off."""
-    from ttp import alerts, coordinator, pushq
+    from ttp import alerts, coordinator, push, pushq
     s = _pq(env, monkeypatch)
     db = s.p.db
     _pq_hand_off(env, s)
@@ -191,16 +191,18 @@ def test_repeated_setup_fault_holds_of_one_check_raise_one_alert_until_that_chec
     [msg] = alerted(a)
     assert a in msg["text"] and "/srv/gate/head" in msg["text"] and "tar archive" in msg["text"], msg
     assert all(str(r) in msg["text"] for r in runs) and holds(a) and not holds(b)
-    held(a)
+    isolate = lambda bid: push._read(s.p.state / push.DETACHED / f"{bid}.json").get("setup_isolate")
+    assert isolate(runs[-1]) is None, "the batch before the alert holds as before"
+    assert isolate(held(a)) == [a], "after the alert, the next batch isolates on that check's setup fault"
     assert count(a) == 4 and len(alerted(a)) == 1, "one alert, not one per hold"
     assert "torn" not in db.kv(pushq.KV), "a setup_fault hold is no script_torn one"
     ran("moved", "requeued", [b])   # passing the other check clears only that one
     assert (count(a), count(b), holds(a)) == (4, 0, True)
     ran("moved", "requeued", [a])
     assert (count(a), holds(a)) == (0, False), "a pass of the check clears it"
+    assert isolate(held(b)) is None, "and its isolation"
     held(a), held(a)
     assert count(a) == 2 and len(alerted(a)) == 1, "counting starts again after a pass"
-    held(b)
     ran("pushed", "pushed", [])
     assert "setup" not in db.kv(pushq.KV), "a pushed batch clears every count"
     for bad in (-1, 1.5, "x"):
@@ -218,3 +220,60 @@ def test_setup_fault_escalation_off_raises_nothing(env, monkeypatch):
         _pq_batch(s)
         _pq_tend(s)
     assert not s.p.db.q("SELECT id FROM messages WHERE kind='alert' AND ref=?", (pushq.setup_key("make test"),))
+
+
+def test_after_the_setup_fault_alert_the_batch_isolates_the_entry_whose_check_hits_one(env, monkeypatch, capsys):
+    """Entry 2's check always fails in setup (a dir outside the repository gone) while entries 1 and 3 are
+    clean. Before the queue alerted on that check, the batch holds and requeues all three. Once it did
+    (the marker's setup_isolate), the setup fault is the head's failed check: the search isolates entry 2,
+    entries 1 and 3 push."""
+    from ttp import push, setupfault
+    d = env["tmp"] / "setup"
+    d.mkdir()
+    argv, ran = _setup_check(d, [_head_gone(d)])
+    cmd = f"[ -e plugins/p/f2.txt ] || exit 0; {' '.join(argv)}"
+    p, repo, origin, other = _bump_setup(env, monkeypatch, [cmd])
+    heads = [_entry(repo, f"e{n}", {f"plugins/p/f{n}.txt": f"{n}\n"}) for n in (1, 2, 3)]
+    rc, m = _run_batch(p, _batch_marker(p, heads, bid="b1"), monkeypatch)
+    assert rc == push.BUSY and m["outcome"] == "setup_fault" and _statuses(m) == ["requeued"] * 3, m
+    marker = _batch_marker(p, heads, bid="b2")
+    m = push._read(marker)
+    m["setup_isolate"] = [cmd]
+    marker.write_text(json.dumps(m))
+    capsys.readouterr()
+    rc, m = _run_batch(p, marker, monkeypatch)
+    assert rc == 0 and m["outcome"] == "pushed", m
+    assert _statuses(m) == ["pushed", "check_failed", "pushed"], m
+    failed = m["results"][1]
+    assert "its setup failed before any test ran" in str(failed), failed
+    files = _git_out(origin, "ls-tree", "-r", "--name-only", "proj").split()
+    assert "plugins/p/f1.txt" in files and "plugins/p/f3.txt" in files and "plugins/p/f2.txt" not in files
+    assert "setup_fault" not in m["checks"], m["checks"]
+    assert "isolates the entry that brings it" in capsys.readouterr().out
+
+
+def test_after_the_setup_fault_alert_a_fault_on_every_head_or_a_pool_still_holds_the_batch(env, monkeypatch):
+    """The check alerted on fails in setup on every head, the tip alone too (the host or its pool, not an
+    entry): the batch is held setup_fault and blames no entry. No free pool slot holds it at once."""
+    from ttp import push, setupfault
+    for name, text, kind in (("everywhere", None, "setup"), ("pool", _STARVED, "pool")):
+        d = env["tmp"] / name
+        d.mkdir()
+        argv, ran = _setup_check(d, [text or _head_gone(d)])
+        cmd = " ".join(argv)
+        if name == "everywhere":
+            p, repo, origin, other = _bump_setup(env, monkeypatch, [cmd])
+            heads = [_entry(repo, f"e{n}", {f"plugins/p/f{n}.txt": f"{n}\n"}) for n in (1, 2, 3)]
+        else:
+            p.set_config("delivery.push_checks", [cmd])
+        before = _git_out(origin, "rev-parse", "proj")
+        marker = _batch_marker(p, heads, bid=name)
+        m = push._read(marker)
+        m["setup_isolate"] = [cmd]
+        marker.write_text(json.dumps(m))
+        rc, m = _run_batch(p, marker, monkeypatch)
+        assert rc == push.BUSY and m["outcome"] == "setup_fault", (name, m)
+        assert _statuses(m) == ["requeued"] * 3 and m["checks"]["setup_fault"]["kind"] == kind, (name, m)
+        assert _git_out(origin, "rev-parse", "proj") == before, name
+        n = setupfault.RERUNS + 1   # runs of one check that failed in setup
+        assert ran() == 1 if kind == "pool" else ran() % n == 0 and ran() >= 2 * n, (name, ran())

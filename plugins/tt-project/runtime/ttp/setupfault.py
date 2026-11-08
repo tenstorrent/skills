@@ -13,7 +13,9 @@ or FAIL word on a line not saying `no verdict`, a Python traceback): a check who
 a failure. The runners (`ttp push`, `ttp land`, `ttp checks`, the push queue) rerun a setup fault up to RERUNS
 times; still so, or a pool with no free slot at once, it is an infrastructure fault: no verdict, never passed
 and never failed (`ttp push` and `ttp land` exit BUSY, `ttp checks` 75 with infra_fault INFRA in checks.json,
-the push queue holds the batch and tries it again after RETRY_S).
+the push queue holds the batch and tries it again after RETRY_S). Once that check's holds raised the queue's
+push_setup_fault alert, its next setup fault on a head with entries is a failed check instead (isolate_line),
+so the batch isolates the entry that brings it; on the tip alone, or a pool fault, it still holds the batch.
 """
 from __future__ import annotations
 
@@ -111,6 +113,11 @@ def line(fault: dict, check: str) -> str:
     again = "" if fault["kind"] == "pool" else f" after {RERUNS} reruns"
     return (f"infrastructure fault: {check}: {_what(fault)}{again}; no test ran, so the change is neither "
             "passed nor failed")
+
+
+def isolate_line(fault: dict, check: str) -> str:
+    return (f"{check}: {_what(fault)} after {RERUNS} reruns, on a check whose holds were already alerted: "
+            "a failure of this head, so the batch isolates the entry that brings it")
 
 
 class Infra(Exception):

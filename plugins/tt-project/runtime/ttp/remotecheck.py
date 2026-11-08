@@ -35,7 +35,9 @@ import sys
 from pathlib import Path
 
 FAULT_RC = 75
+ENV_DIR = ".git/ttp-env"   # the pinned Python env's maker and lock in the run folder (runnerenv.remote_lines)
 SHIP_DIR = ".git/ttp-py"   # where shipped Python files go in the run folder: never in the tree the check sees
+NO_ENV = "no-env"     # ... and when the pinned Python env cannot be made there (runnerenv.remote_lines): a host fault
 NO_WRAP = "no-wrap"   # the exit marker's form when the remote wrapper is missing there: a host fault
 LOCAL = "local"      # a check's `host` that keeps it here when delivery.checks_host is set
 HOST_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.@+:-]{0,252}")
@@ -247,8 +249,11 @@ def main(args: list[str]) -> int:
         _say(f"usage: --host <ssh alias> [--env <json>] -- <command> "
              f"({host_problem(host) or env_problem(env) or env_problem(literal)})")
         return 2
-    try:
-        extra = shipped(py, literal)
+    mark = f"ttp-remote-rc:{secrets.token_hex(8)}:"
+    try:   # the pinned Python env there, as here (runnerenv): no env, no run (NO_ENV)
+        from . import runnerenv
+        extra = shipped(py, literal) + runnerenv.remote_lines(os.environ.get(runnerenv.LOCK_ENV), ENV_DIR,
+                                                               f"printf '\\n%s%s\\n' {mark} {NO_ENV}; exit 95")
     except OSError as e:
         _say(f"cannot read a file to copy there: {e}")
         return 2
@@ -299,7 +304,6 @@ def main(args: list[str]) -> int:
         if archive.returncode != 0:
             _say(f"git archive of {head[:12]} failed (exit {archive.returncode})")
             return 2
-        mark = f"ttp-remote-rc:{secrets.token_hex(8)}:"
         from . import testslots
         script = _run_script(q, exports(env) + extra, cmd, mark, wrap, testslots.priority_args(testslots._cfg()))
         # stdin stays open and unwritten: its end on the host (we stopped, died or lost ssh) stops the command.
@@ -313,8 +317,8 @@ def main(args: list[str]) -> int:
                 rc = int(text[len(mark):])
                 held = b""   # the blank line printed before the marker is ours
                 continue
-            if text == mark + NO_WRAP:
-                no_wrap, held = True, b""
+            if text in (mark + NO_WRAP, mark + NO_ENV):
+                no_wrap, held = text[len(mark):], b""
                 continue
             if held:
                 out.write(held)
@@ -323,6 +327,9 @@ def main(args: list[str]) -> int:
                 out.write(raw)
             out.flush()
         proc.wait()
+        if no_wrap == NO_ENV:
+            return _fault(host, "the checks' pinned Python env could not be made there (its error is above), "
+                                "so the check did not run (never with that host's user site)")
         if no_wrap:
             return _fault(host, f"the spill wrapper {wrap[0]!r} is missing or not executable there, so the "
                                 "check did not run (never unwrapped)")

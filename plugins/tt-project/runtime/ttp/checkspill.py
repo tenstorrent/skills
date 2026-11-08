@@ -58,6 +58,16 @@ its failures new there (they pass on the base on that host: gatejudge.known_new)
 as any run does and may spill to another listed host, never back to one its checks failed on (spill_off_add): a host fault
 there (exit 75: the host paused, its lock or a tool gone mid-run) leaves that host one more try, once pick finds it free.
 With none left it runs here, whose result counts.
+
+A check that runs an agent CLI (AGENT_CLIS, the claude CLI among them, in command position after its
+wrappers: needs_cli), which a spill host neither has nor is logged in to, never spills unless it says
+`"spill": true`. Such a check, and one with `"host": "local"`, does not keep the rest of its run here: the
+run splits (stays_here). Its other checks go to the spill host and it runs on this machine in the same run,
+whose one verdict needs every part to pass; a failure here counts at once (it never reruns elsewhere). Only
+a check that is no test suite or build (checklane.run_class), unwrapped and in a clean checkout splits off
+this way; any other check that may not spill keeps the whole run here. So a spill host needs only what the
+checks it gets run (git and tar, and python3 with the checks environment for pytest), never an agent CLI or
+its sign-in.
 """
 from __future__ import annotations
 
@@ -90,6 +100,8 @@ SKIP_SHOW_S = 900   # a host skipped for a device job shows in `ttp status` and 
 _JOB_LISTS = ("jobs", "running_jobs", "active_jobs", "running")   # broker status: job rows (a list) or a count
 _JOB_ONE = ("current_job", "active_job", "running_job")   # broker status: the one job under way
 _RUNNING = {"running", "active", "started", "in_progress", "in-progress", "busy"}   # a `jobs` row's state that runs
+AGENT_CLIS = ("claude", "codex", "cursor-agent")   # agent CLIs a spill host lacks: a check running one stays here
+_SHELLS = ("sh", "bash", "dash", "zsh")   # needs_cli reads their -c script too
 RUNNING_MAX_AGE_MIN = 720   # a remote ttp-check.* folder older than this is a leftover, not a running check
 _PROBE = ("command -v git >/dev/null 2>&1 && command -v tar >/dev/null 2>&1 || exit 3\n"
           "c=$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)\n"
@@ -295,15 +307,15 @@ def after_s(cfg: dict | None) -> float:
 
 
 def check_spills(c: Any, cfg: dict | None = None) -> bool:
-    """Whether check `c` may run on a spill host: it would run on this machine (its host "local" only
-    with `"spill": true`), in a clean checkout, does not say `"spill": false`, and is unwrapped unless it
+    """Whether check `c` may run on a spill host: it would run on this machine (its host "local", or an agent
+    CLI it runs (needs_cli), only with `"spill": true`), in a clean checkout, does not say `"spill": false`, and is unwrapped unless it
     has a remote wrapper (push.spill_wrap_of; one that does not parse keeps it here) or `cfg` says its
     wrappers need no device (wrapped_ok)."""
     from . import cleantree, push
     opt = getattr(c, "spill", None)
     if opt is False or getattr(c, "keep_here", False) or push.remote_host(c) or cleantree.authoring(c):
         return False
-    if getattr(c, "host", "") == remotecheck.LOCAL and opt is not True:
+    if (getattr(c, "host", "") == remotecheck.LOCAL or needs_cli(c)) and opt is not True:
         return False
     try:
         remote_wrap = push.spill_wrap_of(c, cfg)
@@ -312,9 +324,50 @@ def check_spills(c: Any, cfg: dict | None = None) -> bool:
     return bool(remote_wrap) or wrapped_ok(cfg) or not getattr(c, "wrap", ())
 
 
+def needs_cli(c: Any) -> bool:
+    """Whether a simple command of check `c` runs an agent CLI (AGENT_CLIS) after its wrappers, or in a
+    shell's -c script; a line that does not parse counts (it stays here). A script file that runs one is
+    not seen: such a check says `"host": "local"`."""
+    from . import testslots
+    try:
+        segs = testslots._segments(str(c))
+    except (ValueError, IndexError):
+        return True
+    for seg in segs:
+        words = [w for _, _, w in seg]
+        i = 0
+        while i < len(words) and (re.match(r"[A-Za-z_]\w*=|-|\d", words[i])
+                                  or testslots._base(words[i]) in testslots._WRAPPERS):
+            i += 1
+        if i < len(words) and testslots._base(words[i]) in AGENT_CLIS:
+            return True
+        # A shell's -c script (`sh -c "claude ..."`, `bash -lc ...`) is read the same way.
+        if i < len(words) and testslots._base(words[i]) in _SHELLS:
+            opt = next((j for j in range(i + 1, len(words)) if re.fullmatch(r"-[a-z]*c[a-z]*", words[j])), None)
+            if opt is not None and opt + 1 < len(words) and needs_cli(words[opt + 1]):
+                return True
+    return False
+
+
+def stays_here(c: Any, cfg: dict | None = None) -> bool:
+    """Whether check `c` runs on this machine while the rest of its run spills: it may not spill only because
+    it says `"host": "local"` or runs an agent CLI (needs_cli), and it is cheap enough to run beside the
+    spilled part without a checks slot here (no test suite or build: checklane.run_class), unwrapped and in a
+    clean checkout."""
+    from . import checklane, cleantree, push
+    if getattr(c, "spill", None) is not None or getattr(c, "keep_here", False) or push.remote_host(c) \
+            or cleantree.authoring(c) or getattr(c, "wrap", ()):
+        return False
+    if getattr(c, "host", "") != remotecheck.LOCAL and not needs_cli(c):
+        return False
+    return checklane.run_class([c], cfg) != checklane.SUITE
+
+
 def spillable(cmds: list, cfg: dict | None = None) -> bool:
-    """Whether every check of `cmds` may run on a spill host (check_spills)."""
-    return bool(cmds) and all(check_spills(c, cfg) for c in cmds)
+    """Whether a run of `cmds` may spill: one check at least may (check_spills) and each other one runs
+    here beside it (stays_here)."""
+    spills = [check_spills(c, cfg) for c in cmds]
+    return any(spills) and all(ok or stays_here(c, cfg) for ok, c in zip(spills, cmds))
 
 
 def _charter_names(p, alias: str) -> bool:

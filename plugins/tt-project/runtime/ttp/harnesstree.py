@@ -164,20 +164,21 @@ def held(p: Project, tid: int) -> str | None:
 LAND_LOCK_WAIT_S = 5.0   # land's wait for the memory index lock (Project.memory_locked) before 'busy'
 
 
-def land(p: Project, tid: int) -> str:
+def land(p: Project, tid: int, other: str = "") -> str:
     """Merge harness task `tid`'s worktree branch into the harness checkout (call it when no run of
     the task is live); remove the worktree and branch once nothing is left in them and nothing holds
-    them (held). Returns what happened: '' (no worktree), 'merged' (and removed), 'kept' (its commits
+    them (held). With `other`, a branch of the task's outside its own worktree (land_stranded), merge
+    that branch the same way and remove nothing. Returns what happened: '' (no worktree), 'merged' (and removed), 'kept' (its commits
     landed; the worktree stays, for the open task or its live jobs, or with uncommitted changes for
     the task's next run), 'busy' (git refused, e.g. over the checkout's own changes), 'conflict' (new)
     or 'conflict-known' (the same branch head and harness HEAD as last time: not merged again). While
     the checkout sits on a harness task's branch, not its main line, nothing is merged ('busy')."""
     own = path(p, tid)
-    if not own.exists():
+    if not (other or own.exists()):
         return ""
     if not _is_repo(p) or TASK_BRANCH_RE.fullmatch(on_branch(p.harness)):
         return "busy"   # never merged into another task's branch the checkout was left on
-    b = branch(tid)
+    b = other or branch(tid)
     ahead = _git(p.harness, "rev-list", "--count", f"HEAD..{b}")
     outcome = ""
     if ahead.returncode == 0 and int(ahead.stdout.strip() or 0) > 0:
@@ -219,7 +220,7 @@ def land(p: Project, tid: int) -> str:
                 if last == seen:
                     return "conflict-known"
                 _set_conflicted(p, tid, seen)
-                _report_conflict(p, tid, said)
+                _report_conflict(p, tid, said, b)
                 return "conflict"
             return "busy"
         _set_conflicted(p, tid, None)
@@ -230,6 +231,8 @@ def land(p: Project, tid: int) -> str:
                           json.dumps({"at": time.time(), "pid": os.getpid(),
                                       "why": f"harness task #{tid}'s merged commits changed runtime/"}))
         outcome = "merged"
+    if other:
+        return outcome
     if dirty(own) or held(p, tid):
         return "kept"
     from .worktree import unkeep
@@ -400,6 +403,46 @@ def merged_commit(p: Project, task: dict) -> str:
     return found
 
 
+def stranded(p: Project, task: dict) -> list[tuple[str, list[str]]]:
+    """Harness task `task`'s named commits (named_commits) the harness has but its HEAD lacks, each
+    with the local branches that contain it: [(full sha, [branch, ...])]. [] with no harness repo,
+    while the task has a worktree of its own (land merges that), or when each named commit the harness
+    has is in HEAD."""
+    if not _is_repo(p) or path(p, task["id"]).exists():
+        return []
+    out = []
+    for c in named_commits(task):
+        full = _git(p.harness, "rev-parse", "--verify", "-q", f"{c}^{{commit}}")
+        if full.returncode != 0:
+            continue   # another repository's commit
+        sha = full.stdout.strip()
+        if _git(p.harness, "merge-base", "--is-ancestor", sha, "HEAD").returncode == 0:
+            continue
+        r = _git(p.harness, "branch", "--format=%(refname:short)", "--contains", sha)
+        out.append((sha, r.stdout.split() if r.returncode == 0 else []))
+    return out
+
+
+def land_stranded(p: Project, task: dict) -> tuple[str, list[tuple[str, list[str]]]]:
+    """Land a done harness task's named commits that sit outside the harness HEAD and outside a worktree
+    of its own (stranded): each on a branch of the task's own, ttp/t<id>-<slug> (a worker that
+    committed in another worktree of the harness repo), is merged as land merges ttp/harness-t<id>.
+    Returns (outcome, the commits on no such branch, with their branches): outcome '' (nothing to do),
+    'merged', or land's 'busy' / 'conflict' / 'conflict-known' (tried again on a later pass)."""
+    left = stranded(p, task)
+    if not left:
+        return "", []
+    own = re.compile(rf"ttp/t{int(task['id'])}-.+")
+    alone = [(sha, bs) for sha, bs in left if not any(own.fullmatch(b) for b in bs)]
+    outcome = ""
+    for b in dict.fromkeys(b for _, bs in left for b in bs if own.fullmatch(b)):
+        got = land(p, task["id"], b)
+        if got not in ("", "merged"):
+            return got, alone
+        outcome = got or outcome
+    return outcome, alone
+
+
 def handoff_landing(p: Project, task: dict) -> tuple[str, str]:
     """Whether harness task `task`'s hand-off commits land, for a hand-off check (handoffcheck): ("merged",
     why) when each named commit the harness has is in its HEAD; ("lands", why) when some are only on the
@@ -479,9 +522,11 @@ def _set_conflicted(p: Project, tid: int, seen: list[str] | None) -> None:
         p.db.set_kv(CONFLICT_KEY, known)
 
 
-def _report_conflict(p: Project, tid: int, why: str) -> None:
-    """Tell the coordinator once per branch head: the task's commits wait on the branch."""
-    head = _git(p.harness, "rev-parse", branch(tid)).stdout.strip()
+def _report_conflict(p: Project, tid: int, why: str, b: str = "") -> None:
+    """Tell the coordinator once per branch head: the task's commits wait on the branch (`b`, default
+    its own)."""
+    b = b or branch(tid)
+    head = _git(p.harness, "rev-parse", b).stdout.strip()
     seen = p.db.kv(REPORTED_KEY, {}) or {}
     if seen.get(str(tid)) == head:
         return
@@ -490,9 +535,9 @@ def _report_conflict(p: Project, tid: int, why: str) -> None:
         p.db.set_kv(REPORTED_KEY, seen)
         p.db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
                (time.time(), "harness", "harness_merge_conflict", "normal",
-                f"Harness task #{tid}'s commits on branch {branch(tid)} do not merge into the harness checkout; "
-                f"they wait in {path(p, tid)}. A harness task should merge them by hand "
-                f"(`git merge {branch(tid)}` in the harness) and resolve, keeping both sides' intents. "
+                f"Harness task #{tid}'s commits on branch {b} do not merge into the harness checkout; "
+                f"they wait {f'in {path(p, tid)}' if b == branch(tid) else 'on that branch'}. A harness task "
+                f"should merge them by hand (`git merge {b}` in the harness) and resolve, keeping both sides' intents. "
                 f"git said: {why[-400:]}", "queued", tid))
 
 

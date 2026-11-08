@@ -977,7 +977,8 @@ def test_user_gate_names_only_markers_every_path_to_a_pass_needs(probe, needs):
 def test_a_user_gated_wait_is_live_again_once_its_marker_exists_and_unknown_paths_are_not_gated(env):
     """While its user marker is missing, a `marker && gate` wait raises neither a probe stall nor
     wait_stale (the daemon logs 'wait_stale not raised: user hold' once); once the user's word wrote the
-    marker, the gate is a live probe: both raise. A marker path that still holds a variable is unknown:
+    marker, the gate is a live probe timed from the marker's mtime: both raise once the stall threshold
+    (or max_hold_s) has passed since then, not before. A marker path that still holds a variable is unknown:
     not gated."""
     from ttp import progress, userpause
     from ttp.daemon import Daemon
@@ -1003,10 +1004,46 @@ def test_a_user_gated_wait_is_live_again_once_its_marker_exists_and_unknown_path
     log = (p.logs / "daemon.log").read_text()
     assert log.count(f"task {wid} wait_stale not raised: user hold") == 1, log[-2000:]
     (p.root / "state/user-words").mkdir(parents=True)
-    (p.root / "state/user-words/user-go").write_text("")
-    got = progress.check(p.db, p.config(), p.state, now + 60, where=p)
+    go = p.root / "state/user-words/user-go"
+    go.write_text("")
+    os.utime(go, (now + 30, now + 30))
+    # The live gate is timed from the marker: its earlier held not-yets raise nothing yet.
+    assert progress.check(p.db, p.config(), p.state, now + 60, where=p) == []
+    assert not stale_after_probe()
+    for i in range(10):
+        progress.note_probe(p.db, wid, probe, 1, "not yet", now + 100 + i * 60)
+    assert progress.check(p.db, p.config(), p.state, now + 3600, where=p) == [], "under an hour since the marker"
+    got = progress.check(p.db, p.config(), p.state, now + 3700, where=p)
     assert [e["keys"] for e in got] == [[f"probe:#{wid}"]], got
+    max_hold = float((p.config().get("waiting") or {}).get("max_hold_s") or 6 * 3600)
+    at = time.time() - max_hold + 600
+    os.utime(go, (at, at))
+    assert not stale_after_probe(), "under max_hold_s since the marker"
+    at -= 1200
+    os.utime(go, (at, at))
     assert stale_after_probe()
+
+
+def test_a_user_gate_opens_at_its_latest_marker_mtime_capped_at_now(env):
+    """userpause.gate_opened: None with no gate, a missing marker or an unknown path; else the latest
+    mtime of its markers, never later than `now` (a marker written with a clock ahead)."""
+    from ttp import userpause
+    p = make(env)
+    (p.root / "state/user-words").mkdir(parents=True)
+    a, b = p.root / "state/user-words/user-a", p.root / "state/user-words/user-b"
+    probe = "test -e state/user-words/user-a && [ -f state/user-words/user-b ] && true"
+    now = time.time()
+    assert userpause.gate_opened("test -e state/out-ready", None, p.root, now) is None
+    a.write_text("")
+    os.utime(a, (now - 500, now - 500))
+    assert userpause.gate_opened(probe, None, p.root, now) is None, "user-b missing"
+    b.write_text("")
+    os.utime(b, (now - 200, now - 200))
+    assert userpause.gate_opened(probe, None, p.root, now) == pytest.approx(now - 200)
+    assert userpause.gate_opened(probe, None, None, now) is None, "relative path, no root: unknown"
+    os.utime(a, (now + 900, now + 900))
+    assert userpause.gate_opened(probe, None, p.root, now) == now
+    assert userpause.gate_opened("test -e state/user-words/user-a || true", None, p.root, now) is None
 
 
 @pytest.mark.parametrize("case", ["wait_kind user", "user-paused resource"])

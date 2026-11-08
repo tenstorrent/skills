@@ -386,22 +386,27 @@ def test_a_detached_release_check_keeps_release_across_a_daemon_restart(env, mon
     # checks.pid records --release and the daemon's restart (reboot, shared failure, rebase) passes it
     # on: a restarted release run that lost it would excuse failures and exit 0.
     import argparse
-    from ttp import cli, worktree
+    from ttp import checkdirs, cli, worktree
     from ttp import daemon as dmod
     p = make(env)
     run_dir = env["tmp"] / "rel"
     run_dir.mkdir()
-    argvs = []
+    argvs, children = [], []
     real = subprocess.Popen
 
     def popen(argv, **kw):   # the launcher's child: recorded, then a stand-in that waits for its go
         argvs.append(list(argv))
-        return real([sys.executable, "-c", "import sys; sys.stdin.read()"], **kw)
+        children.append(real([sys.executable, "-c", "import sys; sys.stdin.read()"], **kw))
+        return children[-1]
     monkeypatch.setattr(cli.subprocess, "Popen", popen)
+    # The launcher returns only once its child ended (as on a loaded host), so its dropped Popen reaps
+    # the child: the test waits through its own handle, never os.waitpid(pid), which then has none.
+    cleanup = checkdirs.cleanup
+    monkeypatch.setattr(checkdirs, "cleanup", lambda *x, **k: (children[0].wait(timeout=60), cleanup(*x, **k)))
     a = argparse.Namespace(fresh=False, full=False, light=False, no_device=False, release=True, purpose=None,
                            cmd=["true"])
     pid = cli._checks_start(a, run_dir, "", "a" * 40, {**os.environ, "TTP_PROJECT": str(p.base)})
-    os.waitpid(pid, 0)
+    assert children[0].pid == pid and children[0].wait(timeout=60) == 0
     info = cli._read_checks_pid(run_dir)
     assert "--release" in argvs[0] and info["release"] is True
     monkeypatch.setattr(worktree, "is_git", lambda _p: True)
@@ -874,3 +879,117 @@ def test_ttp_quarantine_lists_and_lifts_by_hand(env, monkeypatch, capsys):
     assert ttp("list") == 0
     out = capsys.readouterr().out
     assert "quarantine lifted" in out and "its fix landed" in out and "quarantined test" not in out
+
+
+def _tb(i: str, line: str, at: str, src: str = "assert r.returncode == 0") -> str:
+    # pytest's FAILURES block for id `i`: the failing statement, its first `E` line and its location.
+    name = i.rpartition("::")[2]
+    return f"_____ {name} _____\n\n    def {name}():\n>       {src}\nE       {line}\n\n{at}: AssertionError\n"
+
+
+def _fails(blocks: dict) -> tuple[int, str]:
+    # A rerun exiting 1 with a FAILURES block and a summary line per failing id.
+    out = "=== FAILURES ===\n" + "".join(_tb(i, *b) for i, b in blocks.items()) + "=== short test summary info ===\n"
+    out += "".join(f"FAILED {i} - AssertionError: {b[0]}\n" for i, b in blocks.items())
+    return 1, out + f"=== {len(blocks)} failed in 0.1s ===\n"
+
+
+def test_gate_judge_calls_a_failure_pre_existing_only_when_base_and_head_fail_the_same_way(tmp_path):
+    from ttp import gatejudge
+    a = "tests/test_a.py::test_pre"
+    same = ("assert 1 == 0", "tests/test_a.py:1368")
+    # (b) The same assert, on the base at another line (the change moved it) and in another checkout: not blocking.
+    v = gatejudge.judge([a], lambda at, ids: _fails({a: same if at == "head" else ("assert 1 == 0", "/tmp/co9/tests/test_a.py:1360")}),
+                        tmp_path / "b", "b1", "host-a", 1000.0)
+    assert v["pre_existing"] == [a] and not gatejudge.blocks(v)
+    # (c) Another first error line on the base (the rerun's nested pytest exit 5 there, 1 on the head): blocking,
+    # never proven new (the base failed it too), and said so.
+    for n, base_fail in enumerate((("assert 5 == 0", "tests/test_a.py:1368"), ("KeyError: 'x'", "tests/test_a.py:1384"),
+                                   # the same text from another assert (another statement failed)
+                                   ("assert 1 == 0", "tests/test_a.py:1384", "assert out.returncode == 0"))):
+        v = gatejudge.judge([a], lambda at, ids: _fails({a: same if at == "head" else base_fail}),
+                            tmp_path / f"c{n}", "b1", "host-a", 1000.0)
+        assert v["new"] == [a] and v["pre_existing"] == [] and v["other_failure"] == [a] and gatejudge.blocks(v)
+        assert gatejudge.proven(v) == []
+        assert "another way" in " ".join(gatejudge.lines(v))
+    # The saved base failure keeps its mark: a later judge compares with it without a rerun, both ways.
+    calls = []
+
+    def head_only(at, ids):
+        calls.append(at)
+        return _fails({a: same}) if at == "head" else (None, "")
+    assert gatejudge.judge([a], head_only, tmp_path / "b", "b1", "host-a", 1001.0)["pre_existing"] == [a]
+    assert gatejudge.judge([a], head_only, tmp_path / "c0", "b1", "host-a", 1001.0)["other_failure"] == [a]
+    assert calls == ["head", "head"]
+    # A base failure saved without a mark (before marks were kept) proves nothing: the base runs again.
+    gatejudge.save_base(tmp_path / "old", "host-a", "b1", {a: True}, 1000.0)
+    calls.clear()
+    v = gatejudge.judge([a], head_only, tmp_path / "old", "b1", "host-a", 1001.0)
+    assert calls == ["head", "base"] and v["new"] == [a] and v["pre_existing"] == []
+    # Marks that share nothing (a base rerun showing neither a traceback nor a summary message) prove nothing.
+    assert not gatejudge.same_failure({"line": "assert 0"}, {"at": "test_a.py:3: AssertionError"})
+    assert not gatejudge.same_failure({}, {})
+    assert not gatejudge.same_failure({"msg": "x", "src": "f()"}, {"msg": "x", "src": "g()"})
+    assert gatejudge.same_failure({"msg": "x", "src": "f()"}, {"msg": "x"})
+    # Temp folders and addresses are not a difference; the numbers of an assert are.
+    m = gatejudge.marks(_fails({a: ("assert '/tmp/pytest-of-u/pytest-41/t0' at 0x7f01", "t.py:3")})[1], [a])[a]
+    m2 = gatejudge.marks(_fails({a: ("assert '/tmp/pytest-of-u/pytest-42/t0' at 0x7f99", "t.py:3")})[1], [a])[a]
+    assert gatejudge.same_failure(m, m2) and m["at"] == "t.py:3: AssertionError"
+    # A base rerun that errors (exit 4) or selects nothing (exit 5, a test the base does not have) never
+    # makes the failure pre-existing.
+    for n, rc in enumerate((4, 5)):
+        v = gatejudge.judge([a], lambda at, ids: _fails({a: same}) if at == "head" else (rc, "no tests ran\n"),
+                            tmp_path / f"rc{n}", "b1", "host-a", 1000.0)
+        assert v["new"] == [a] and v["pre_existing"] == [] and gatejudge.blocks(v)
+
+
+_NESTED = '''import json, os, subprocess, sys
+
+
+def test_nested(tmp_path):
+    (tmp_path / "pytest.ini").write_text("[pytest]\\n")
+    (tmp_path / "test_inner.py").write_text("def test_inner():\\n    {body}\\n")
+    (tmp_path / "test_more.py").write_text("def test_more():\\n    pass\\n")
+    r = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", str(tmp_path)],
+                       cwd=str(tmp_path), capture_output=True, text=True)
+    seen = {k: v for k, v in os.environ.items() if k.startswith(("TTP_PYTEST_SELECT", "PYTEST_ADDOPTS"))}
+    with open(os.environ["NESTED_ENV_OUT"], "a") as f:
+        f.write(json.dumps({"env": seen, "rc": r.returncode, "out": r.stdout[-300:]}) + "\\n")
+    assert r.returncode == 0
+'''
+
+
+def test_gate_rerun_selection_never_reaches_a_pytest_the_test_starts(tmp_path):
+    """(d) The rerun's selection (the select plugin's variables and its -p load) stays in the rerun's own
+    pytest: a pytest a test starts runs its own tests, all of them."""
+    from ttp import gatejudge
+    proj = tmp_path / "proj"
+    (proj / "tests").mkdir(parents=True)
+    (proj / "pytest.ini").write_text("[pytest]\n")
+    (proj / "tests" / "test_n.py").write_text(_NESTED.replace("{body}", "pass"))
+    seen = tmp_path / "seen.jsonl"
+    clean = {k: v for k, v in os.environ.items() if not k.startswith(("PYTEST_", "TTP_PYTEST_"))}
+    e = {**clean, **gatejudge.select_env(["tests/test_n.py::test_nested"], clean), "NESTED_ENV_OUT": str(seen)}
+    e["PYTEST_ADDOPTS"] = "-p no:randomly " + e["PYTEST_ADDOPTS"]
+    r = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", f"--rootdir={proj}"],
+                       cwd=str(proj), env=e, capture_output=True, text=True, timeout=120)
+    assert r.returncode == 0, r.stdout + r.stderr
+    got = json.loads(seen.read_text())
+    assert got["rc"] == 0 and "2 passed" in got["out"], got
+    assert got["env"] == {"PYTEST_ADDOPTS": "-p no:randomly"}, got
+
+
+def test_ttp_checks_blocks_a_nested_pytest_test_new_on_the_head(env, tmp_path, monkeypatch, capsys):
+    """(a) A test that starts its own pytest fails on the head and passes on the base. The gate's rerun of it
+    must not leak its selection into that pytest (which then selects nothing and fails the test the same way
+    on both): it is new on the head and blocks, never pre-existing."""
+    from ttp import cli
+    monkeypatch.setenv("NESTED_ENV_OUT", str(tmp_path / "seen.jsonl"))
+    p, run = _gate_repo(env, tmp_path, monkeypatch, _NESTED.replace("{body}", "pass"),
+                        _NESTED.replace("{body}", "assert False"))
+    with pytest.raises(SystemExit) as e:
+        cli.main(["checks", "--", _FAIL])
+    assert e.value.code == 1
+    out = capsys.readouterr().out
+    assert "new on this head" in out and "pre-existing" not in out, out
+    assert not json.loads((run / "checks.json").read_text())["passed"]

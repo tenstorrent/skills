@@ -58,7 +58,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from . import remotecheck
+from . import remotecheck, runnerenv
 
 KEY = "checks.slurm_overflow"
 DEFAULT_WORKDIR = "~/ttp-checks"
@@ -479,16 +479,18 @@ def argv(cmd: str, s: dict, env: dict | None = None, commit: str = "", minutes: 
             "--env", json.dumps(env or {}, sort_keys=True), *(["--commit", commit] if commit else []), "--", cmd]
 
 
-def job_script(q: str, exports_: str, cmd: str) -> str:
-    """The batch script, run on a compute node in folder `q`: unpack the tree into a git checkout, run
-    the command, leave its exit code in `rc` ("fault" when the node could not set the tree up)."""
+def job_script(q: str, exports_: str, cmd: str, lock: str | None = None) -> str:
+    """The batch script, run on a compute node in folder `q`: unpack the tree into a git checkout, put
+    the checks' pinned Python env made from `lock` (default runnerenv.LOCK) in force, run the command,
+    leave its exit code in `rc` ("fault" when the node could not set the tree or the env up)."""
     return ("#!/bin/sh\nrc=fault\n"
             f"trap 'printf \"%s\\n\" \"$rc\" > {q}/rc.part && mv -f {q}/rc.part {q}/rc' EXIT\n"
             f"cd {q} || exit 1\nrm -rf src && mkdir src && tar -xf tree.tar -C src && cd src && "
             "git -c init.defaultBranch=main init -q && git add -A -f . && "
             "git -c user.name=ttp -c user.email=ttp@localhost -c commit.gpgsign=false commit -q --no-verify "
             "--allow-empty -m 'ttp check' || exit 1\n"
-            f"{exports_}rc=killed\n"
+            # The pinned Python env (runnerenv), made on the node: none is a fault there, as an unpacking one is.
+            f"{exports_}{runnerenv.remote_lines(lock, '../ttp-env', 'exit 1')}rc=killed\n"
             f"if command -v bash >/dev/null 2>&1; then bash -e -o pipefail -c {shlex.quote(cmd)} </dev/null; "
             f"else sh -e -c {shlex.quote(cmd)} </dev/null; fi\nrc=$?\nexit 0\n")
 
@@ -606,7 +608,11 @@ def main(args: list[str]) -> int:
         if archive.returncode != 0:
             _say(f"git archive of {head[:12]} failed (exit {archive.returncode})")
             return 2
-        script = job_script(q, remotecheck.exports(env), cmd).encode()
+        try:
+            script = job_script(q, remotecheck.exports(env), cmd, os.environ.get(runnerenv.LOCK_ENV)).encode()
+        except OSError as e:
+            _say(f"cannot read the checks' Python lock: {e}")
+            return 2
         try:
             put = _ssh(host, f"cat > {q}/tree.tar", remotecheck.SETUP_TIMEOUT_S, archive.stdout)
             put2 = _ssh(host, f"cat > {q}/job.sh", CALL_TIMEOUT_S, script) if put.returncode == 0 else put
