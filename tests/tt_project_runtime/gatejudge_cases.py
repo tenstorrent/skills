@@ -998,6 +998,38 @@ def test_gate_judge_same_failure_ignores_a_venv_path_and_reads_long_pytest_heade
     assert calls == ["head", "base"] and v["pre_existing"] == [a], (calls, v)
 
 
+def _narrow_fails(i: str, line: str) -> tuple[int, str]:
+    # A rerun over ssh with no tty (80 columns): a test name wider than that gets one `_` on each side, the
+    # traceback has a `_ _ _` frame separator and the summary line has no room for the message.
+    name = i.rpartition("::")[2]
+    out = (f"{'=' * 30} FAILURES {'=' * 30}\n_ {name} _\n\n    def {name}():\n>       helper()\n\nt.py:9: \n"
+           f"{'_ ' * 40}\n\n    def helper():\n>       assert r.returncode == 0\nE       {line}\n\n"
+           f"t.py:3: AssertionError\n{'=' * 20} short test summary info {'=' * 20}\nFAILED {i}\n")
+    return 1, out + "=== 1 failed in 0.1s ===\n"
+
+
+def test_gate_judge_reads_a_narrow_terminals_failure_and_never_reuses_a_saved_base_mark_it_could_not_read(tmp_path):
+    from ttp import gatejudge, sharedchecks
+    a = "tests/test_a.py::test_" + "a_name_wider_than_an_ssh_terminal_of_eighty_columns_" * 2
+    m = gatejudge.marks(_narrow_fails(a, "assert 1 == 0")[1], [a])[a]
+    assert m["line"] == "assert 1 == 0" and m["src"] == "assert r.returncode == 0" and m["at"] == "t.py:3: AssertionError"
+    assert "def helper" in sharedchecks.failure_blocks(_narrow_fails(a, "assert 1 == 0")[1], [a])[a]
+    # Base and head failing the same way on a spill host: pre-existing, not "another way".
+    calls = []
+
+    def run(at, ids):
+        calls.append(at)
+        return _narrow_fails(a, "assert 1 == 0")
+    v = gatejudge.judge([a], run, tmp_path / "s", "b1", "host-a", 1000.0)
+    assert v["pre_existing"] == [a] and not gatejudge.blocks(v)
+    # A base failure saved with a mark that shows nothing (from output marks() could not read) proves
+    # nothing: the base runs again instead of the empty mark calling every failure another way for days.
+    gatejudge.save_base(tmp_path / "e", "host-a", "b1", {a: True}, 1000.0, {a: {"line": "", "msg": "", "src": "", "at": ""}})
+    calls.clear()
+    v = gatejudge.judge([a], run, tmp_path / "e", "b1", "host-a", 1001.0)
+    assert calls == ["head", "base"] and v["pre_existing"] == [a] and v["other_failure"] == []
+
+
 _NESTED = '''import json, os, subprocess, sys
 
 
