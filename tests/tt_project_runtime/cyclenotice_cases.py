@@ -441,7 +441,7 @@ def _cycle_probe(p, out, name="broker", ago=30, **spec):
     """A heal check `name` whose last run `ago` s back printed `out`."""
     from ttp import heal
     from ttp import schedule as sched
-    sched.upsert(p.db, name, "command", "5m", payload={"heal": {"check": "true", **spec}})
+    sched.upsert(p.db, name, "command", "5m", payload={"heal": spec if spec.get("preset") else {"check": "true", **spec}})
     p.db.set_kv(heal.STATE_KEY + name, {"last_check": time.time() - ago, "last_rc": 1, "last_out": out})
 
 
@@ -468,6 +468,13 @@ def test_a_probe_announcing_a_power_cycle_holds_until_its_output_clears(env, mon
     "power_cycle_pending: false",
     "last power cycle: 3 days ago",
     "Power cycle completed",
+    "no power cycle scheduled in 90 s",
+    "power cycle pending: no",
+    "power cycle requested: none",
+    "next: power cycle disabled",
+    "power cycle pending: 0",
+    "auto power cycle: scheduled on chip loss",          # a setting: no time or countdown
+    "next: power cycle",                                 # no time or countdown either
 ])
 def test_probe_text_that_names_no_pending_cycle_holds_nothing(env, monkeypatch, out):
     from ttp import cyclenotice as cn
@@ -475,6 +482,42 @@ def test_probe_text_that_names_no_pending_cycle_holds_nothing(env, monkeypatch, 
     _notice(env, monkeypatch, None)
     _cycle_probe(p, out)
     assert cn.project_held(p) is None, out
+
+
+def test_a_probe_line_that_stays_past_the_bound_releases_its_hold_and_is_told_once(env, monkeypatch):
+    from ttp import cyclenotice as cn
+    p = make(env)
+    _notice(env, monkeypatch, None)
+    _cycle_probe(p, _ANNOUNCED)
+    t0 = time.time()
+    assert cn.probe_held(p, now=t0), "a fresh announcement holds"
+    _cycle_probe(p, _ANNOUNCED, ago=-(cn.PROBE_MAX_HOLD_S - 90))   # rerun since: the same line again
+    assert cn.probe_held(p, now=t0 + cn.PROBE_MAX_HOLD_S - 60), "still within the bound"
+    _cycle_probe(p, _ANNOUNCED, ago=-cn.PROBE_MAX_HOLD_S)      # rerun since: the same line again
+    for _ in range(3):
+        assert cn.probe_held(p, now=t0 + cn.PROBE_MAX_HOLD_S + 60) is None, "past the bound the line is stuck"
+    ev = p.db.q("SELECT severity, text FROM events WHERE fingerprint LIKE 'cycle-probe-stuck:%'")
+    assert len(ev) == 1 and ev[0]["severity"] == "low" and "heal check broker" in ev[0]["text"] \
+        and "chip 7 lost" in ev[0]["text"], ev
+    # The output changes: a new announcement holds again, from its own start.
+    _cycle_probe(p, "next: power cycle of this host in 60 s (chip 3 lost)\n", ago=-cn.PROBE_MAX_HOLD_S)
+    assert cn.probe_held(p, now=t0 + cn.PROBE_MAX_HOLD_S + 90)
+
+
+def test_a_broker_check_on_another_box_holds_nothing_here(env, monkeypatch):
+    from ttp import cyclenotice as cn
+    from ttp import machines
+    p = make(env)
+    _notice(env, monkeypatch, None)
+    monkeypatch.setattr(machines, "load", lambda: {"box-a": {"hostname": "box-a.example"},
+                                                   "box-b": {"hostname": "box-b.example"}})
+    monkeypatch.setattr(machines, "here", lambda: ("box-a", {"hostname": "box-a.example"}))
+    _cycle_probe(p, _ANNOUNCED, preset="broker", resource="box-b-device",
+                status_command="example-broker status")
+    assert cn.project_held(p) is None, "a broker check of another box says nothing about this host"
+    _cycle_probe(p, _ANNOUNCED, preset="broker", resource="box-a-device",
+                status_command="example-broker status")
+    assert cn.project_held(p), "the same check on this host's box holds"
 
 
 def test_probe_patterns_and_checks_are_configurable_and_a_remote_check_holds_nothing_here(env, monkeypatch):

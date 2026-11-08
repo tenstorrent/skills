@@ -1343,20 +1343,32 @@ def test_a_reboot_after_a_shutdown_record_requeues_the_cut_short_run_that_held_a
 
 
 # A kernel fault before the reboot (initiator.kernel_fault): fixture journal text only.
-@pytest.mark.parametrize("line,label", [
-    ("Oct 25 21:59:30 testhost kernel: Kernel panic - not syncing: Fatal exception", "kernel panic"),
-    ("Oct 25 21:59:30 testhost kernel: Out of memory: Killed process 4242 (python3)", "out of memory"),
-    ("Oct 25 21:59:30 testhost systemd-oomd[90]: Killed /user.slice/x.scope due to memory pressure", "out of memory"),
-    ("Oct 25 21:59:30 testhost kernel: mce: [Hardware Error]: Machine check events logged", "machine check"),
-    ("Oct 25 21:59:30 testhost kernel: watchdog: BUG: soft lockup - CPU#3 stuck for 22s!", "lockup"),
-    ("Oct 25 21:59:30 testhost kernel: watchdog: watchdog0: watchdog did not stop!", ""),   # a normal shutdown
-    ("Oct 25 21:59:30 testhost systemd[1]: Started Shutdown watchdog.", ""),        # not the kernel's own line
-    ("Oct 25 21:59:30 testhost example-app[7]: Out of memory: Killed process 1", ""),   # an app quoting it
+@pytest.mark.parametrize("ident,msg,label", [
+    ("kernel", "Kernel panic - not syncing: Fatal exception", "kernel panic"),
+    ("kernel", "Out of memory: Killed process 4242 (python3)", "out of memory"),
+    ("systemd-oomd", "Killed /user.slice/x.scope due to memory pressure", "out of memory"),
+    ("kernel", "mce: [Hardware Error]: Machine check: Processor context corrupt, fatal", "machine check"),
+    ("kernel", "mce: [Hardware Error]: Machine check events logged", ""),     # corrected errors: routine
+    ("kernel", "watchdog: BUG: soft lockup - CPU#3 stuck for 22s!", "lockup"),
+    ("kernel", "watchdog: watchdog0: watchdog did not stop!", ""),             # a normal shutdown
+    ("systemd", "Started Shutdown watchdog.", ""),                             # not the kernel's own line
+    ("example-app", "Out of memory: Killed process 1", ""),                    # an app quoting it
 ])
-def test_the_kernel_fault_read_names_only_the_kernels_own_fault_lines(line, label):
+def test_the_kernel_fault_read_names_only_the_kernels_own_fault_lines(ident, msg, label):
     from ttp import initiator
-    got = initiator.kernel_fault(line + "\n")
+    got = initiator.kernel_fault(_j(-40, msg, ident=ident) + "\n", _T0)
     assert got.startswith(label + ": ") if label else got == "", got
+
+
+@pytest.mark.parametrize("dt,named", [(-40, True), (-3 * 3600, False), (-2 * 86400, False)])
+def test_a_kernel_fault_counts_only_in_the_window_before_the_shutdown(dt, named):
+    from ttp import initiator
+    oom = _j(dt, "Out of memory: Killed process 4242 (python3)", ident="kernel")
+    later = _j(-10, "e1000e: link down", ident="kernel")
+    for at in (_T0, None):     # the marker's time, else the newest line read
+        got = initiator.kernel_fault(oom + "\n" + later + "\n", at)
+        assert got.startswith("out of memory: ") if named else got == "", (dt, at, got)
+    assert initiator.kernel_fault(oom + "\n", None).startswith("out of memory"), "alone, it is the newest line"
 
 
 def test_the_kernel_read_selects_kernel_and_oomd_lines_of_the_ended_boot(env, monkeypatch):

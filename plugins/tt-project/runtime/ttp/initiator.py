@@ -71,7 +71,9 @@ KERNEL_IDENTS = ("kernel", "systemd-oomd")
 KERNEL_FAULTS = (
     ("kernel panic", re.compile(r"Kernel panic|\bpanic\b.*not syncing", re.I)),
     ("out of memory", re.compile(r"Out of memory:|invoked oom-killer|oom-kill:|due to memory pressure", re.I)),
-    ("machine check", re.compile(r"Machine check|\bmce: |\[Hardware Error\]", re.I)),
+    # A fatal or uncorrected one: the routine 'Machine check events logged' summary of corrected errors is none.
+    ("machine check", re.compile(r"(?=.*\b(?:fatal|uncorrect\w*|panic)\b).*(?:Machine check|\bmce: |\[Hardware Error\])",
+                                 re.I)),
     ("lockup", re.compile(r"soft lockup|hard lockup|watchdog: BUG|NMI watchdog: .*lockup", re.I)),
 )
 _SYSTEMCTL_STOPS = {"reboot", "poweroff", "halt", "kexec"}
@@ -137,9 +139,14 @@ def kernel_args() -> list[str]:
     return ["-n", str(KERNEL_ENTRIES), "_TRANSPORT=kernel", "+", "SYSLOG_IDENTIFIER=systemd-oomd"]
 
 
-def kernel_fault(out: str | None) -> str:
-    """'<kind>: <line>' for the last kernel fault line in `out` (KERNEL_FAULTS), or ''."""
-    for e in reversed(_entries(out or "")):
+def kernel_fault(out: str | None, at: float | None = None) -> str:
+    """'<kind>: <line>' for the last kernel fault line in `out` (KERNEL_FAULTS) in the WINDOW_S up to `at`
+    (the shutdown marker; else the newest line of `out`), or '': an older one did not end the boot."""
+    rows = _entries(out or "")
+    at = at if at is not None else max((e["ts"] for e in rows if e["ts"] is not None), default=None)
+    for e in reversed(rows):
+        if e["ts"] is None or at is None or not at - WINDOW_S <= e["ts"] <= at + 1:
+            continue
         if e["ident"] in KERNEL_IDENTS:
             for label, rx in KERNEL_FAULTS:
                 if rx.search(e["msg"]):
@@ -421,7 +428,9 @@ def find(p, boot: str | None, boot_at: float | None, last_heartbeat: float | Non
             window = commands = None
             if ask:
                 k = ask(kernel_args())
-                if fault := kernel_fault(k[1] if k and k[0] == 0 else None):
+                ends = [e["ts"] for e in _entries(got[1]) if e["ts"] is not None]
+                at = marker_at(got[1]) or (max(ends) if ends else None)
+                if fault := kernel_fault(k[1] if k and k[0] == 0 else None, at):
                     kern = {"kernel": fault}
                 c = ask(command_args())
                 commands = c[1] if c and c[0] == 0 else None

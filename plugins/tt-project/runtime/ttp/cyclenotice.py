@@ -26,8 +26,9 @@ without) a notice file, e.g. 'next: power cycle ...'. The project's heal checks 
 output; project_held also holds while one that watches this host (no `machine` or `host`, or one naming
 this host) printed a line matching `upgrade.cycle_patterns` (regexes, case-insensitive; default
 DEFAULT_PATTERNS, [] turns it off) within PROBE_FRESH_S of its last run. `upgrade.cycle_checks` names
-the checks to read (default: every local one). It clears as soon as the check's next output no longer
-matches. While either source holds, besides the maintenance above, the push queue starts no new batch
+the checks to read (default: every local one). A default match needs a time or countdown in the line and
+no 'no', 'none', 'disabled' and the like beside it. It clears as soon as the check's next output no longer
+matches, or once the same line has held PROBE_MAX_HOLD_S (told once as a low event). While either source holds, besides the maintenance above, the push queue starts no new batch
 (its checks would be cut), `ttp checks` starts none and `ttp detach` starts no local job (each exits 75). `ttp upgrade --ignore-cycle-notice`
 (and `ttp setup --ignore-cycle-notice`) proceeds anyway, with a warning.
 """
@@ -50,6 +51,12 @@ BUSY = 75                    # the exit code of a held `ttp upgrade` or `ttp set
 DEFAULT_PATTERNS = (r"\bnext:\s*power[ -]?cycle\b",
                     r"\bpower[ -]?cycle\b[^\n]{0,40}\b(?:pending|requested|scheduled|imminent)\b")
 PROBE_FRESH_S = 900          # a probe output older than this says nothing about now
+# A default match is no announcement when a 'no' or a setting sits beside it, or the line gives no time or
+# countdown ('auto power cycle: scheduled on chip loss' is a setting); configured patterns are taken as given.
+_NEGATED = re.compile(r"\b(?:no|none|not|never|false|disabled|off)\b|[:=]\s*0\b", re.I)
+_WHEN = re.compile(r"\b\d{1,2}:\d{2}\b|\b\d+(?:\.\d+)?\s*(?:s|secs?|seconds?|m|mins?|minutes?|h|hrs?|hours?)\b", re.I)
+PROBE_MAX_HOLD_S = 1800      # no real cycle is announced this long ahead: the same line past it is stuck
+SEEN_KEY = "cyclenotice_probe_seen"   # {line fingerprint: when it first held}
 TEST_ENV = "TTP_TEST_CYCLE_NOTICES"   # tests: the default paths (os.pathsep-separated), never the real one
 
 
@@ -171,11 +178,28 @@ def patterns(cfg: dict | None) -> list[re.Pattern]:
     return out
 
 
+def _announces(ln: str, pats: list[re.Pattern], strict: bool) -> bool:
+    """Whether line `ln` announces a cycle: a pattern matches it (with `strict`, the defaults: no negation
+    or setting beside the match, and a time or countdown in the line)."""
+    for x in pats:
+        m = x.search(ln)
+        if m and (not strict or _WHEN.search(ln)
+                  and not _NEGATED.search(ln[max(0, m.start() - 16):m.start()] + " " + ln[m.end():m.end() + 24])):
+            return True
+    return False
+
+
 def _local(spec: dict) -> bool:
-    """Whether a heal check watches this host: it names no other machine or ssh host."""
-    from . import machines
+    """Whether a heal check watches this host: it names no other machine (`machine`, a broker or outage
+    check's `resource`: heal.machine_of) or ssh host."""
+    from . import heal, machines
     from .project import hostname
     names = [str(spec.get(k)).strip().lower() for k in ("machine", "host") if spec.get(k)]
+    try:
+        if m := heal.machine_of(spec):
+            names.append(str(m).strip().lower())
+    except Exception:
+        pass
     if not names:
         return True
     me = {hostname().lower()}
@@ -188,7 +212,10 @@ def _local(spec: dict) -> bool:
 
 
 def probe_held(p, cfg: dict | None = None, now: float | None = None) -> dict | None:
-    """A hold (as read() returns) from a heal check whose fresh last output announces a cycle, or None."""
+    """A hold (as read() returns) from a heal check whose fresh last output announces a cycle, or None.
+    The same line (by check and text) holds at most PROBE_MAX_HOLD_S: past it, it is released, told once
+    as a low event, and holds again only after the output changed."""
+    import hashlib
     from . import heal
     now = time.time() if now is None else now
     cfg = p.config() if cfg is None else cfg
@@ -196,6 +223,10 @@ def probe_held(p, cfg: dict | None = None, now: float | None = None) -> dict | N
     names = ((cfg or {}).get("upgrade") or {}).get("cycle_checks")
     if not pats:
         return None
+    strict = not isinstance(((cfg or {}).get("upgrade") or {}).get("cycle_patterns"), (list, str))
+    seen = p.db.kv(SEEN_KEY) or {}
+    seen = seen if isinstance(seen, dict) else {}
+    keep, hold = {}, None
     for r, spec in heal.checks(p.db):
         if isinstance(names, list) and r["name"] not in names or names is None and not _local(spec):
             continue
@@ -203,10 +234,26 @@ def probe_held(p, cfg: dict | None = None, now: float | None = None) -> dict | N
         if now - float(st.get("last_check") or 0) >= PROBE_FRESH_S:
             continue
         for ln in str(st.get("last_out") or "").splitlines():
-            if any(x.search(ln) for x in pats):
-                return {"path": f"heal check {r['name']}", "state": "announced", "reason": " ".join(ln.split())[:200],
-                        "earliest": None, "malformed": False}
-    return None
+            if not _announces(ln, pats, strict):
+                continue
+            text = " ".join(ln.split())[:200]
+            fp = hashlib.sha1(f"{r['name']}\n{text}".encode()).hexdigest()[:16]
+            was = seen.get(fp) if isinstance(seen.get(fp), dict) else {}
+            keep[fp] = {"first": float(was.get("first") or now), "told": bool(was.get("told"))}
+            if now - keep[fp]["first"] > PROBE_MAX_HOLD_S:
+                if not keep[fp]["told"]:
+                    keep[fp]["told"] = True
+                    p.db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status) VALUES(?,?,?,?,?,?,?)",
+                           (now, "daemon", "observation", f"cycle-probe-stuck:{fp}", "low",
+                            f"heal check {r['name']} has announced a power cycle for over "
+                            f"{PROBE_MAX_HOLD_S // 60} min with the same line, so it no longer holds work: {text}",
+                            "queued"))
+                continue
+            hold = hold or {"path": f"heal check {r['name']}", "state": "announced", "reason": text,
+                            "earliest": None, "malformed": False}
+    if keep != seen:
+        p.db.set_kv(SEEN_KEY, keep)
+    return hold
 
 
 def project_held(p, cfg: dict | None = None, now: float | None = None) -> dict | None:
