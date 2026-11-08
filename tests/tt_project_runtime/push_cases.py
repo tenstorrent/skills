@@ -2198,6 +2198,48 @@ def test_the_daily_audit_names_the_time_from_approval_to_landing(env, monkeypatc
     assert "approval to landing: 4 landed" in "\n".join(audit.lines(s.p.db, now=now))
 
 
+def test_a_rescue_requeues_only_the_entries_that_build_on_the_blamed_one_and_lands_the_rest(env, monkeypatch, capsys):
+    """The first entry breaks the checks and the second is built on its branch: without it the second
+    would replay its commits, so only the second is requeued; the independent third and fourth are
+    replayed onto the tip without them, checked once and pushed (never all requeued for one dependent)."""
+    p, repo, origin, other = _bump_setup(env, monkeypatch, ["test ! -e plugins/p/bad.txt"])
+    e1 = _entry(repo, "e1", {"plugins/p/bad.txt": "1\n"})
+    _git_out(repo, "checkout", "-q", "-B", "e2", e1)
+    (repo / "plugins/p/f2.txt").write_text("2\n")
+    _git_out(repo, "add", "plugins/p/f2.txt")
+    _git_out(repo, "commit", "-qm", "e2: on e1")
+    e2 = _git_out(repo, "rev-parse", "HEAD")
+    heads = [e1, e2] + [_entry(repo, f"e{n}", {f"plugins/p/f{n}.txt": f"{n}\n"}) for n in (3, 4)]
+    rc, m = _run_batch(p, _batch_marker(p, heads), monkeypatch)
+    assert rc == 0 and m["outcome"] == "pushed", m
+    assert _statuses(m) == ["check_failed", "requeued", "pushed", "pushed"], m
+    assert [_git_out(origin, "show", f"proj:plugins/p/f{n}.txt") for n in (3, 4)] == ["3", "4"]
+    assert _git_out(origin, "ls-tree", "--name-only", "proj", "plugins/p/").split() == [
+        "plugins/p/.claude-plugin", "plugins/p/f3.txt", "plugins/p/f4.txt", "plugins/p/rt"], "neither e1 nor e2"
+    out = capsys.readouterr().out
+    assert "entry 2 after 1 does not replay without it; requeued" in out
+    assert "checking the 2 entries after 1 without it" in out
+
+
+def test_a_rescue_lands_a_later_entry_that_shares_only_an_earlier_entry_with_the_blamed_one(env, monkeypatch):
+    """The blamed (second) entry is built on the first, which passes: a later entry built on the first
+    only is not built on the blamed one and goes; one built on the blamed one is requeued."""
+    p, repo, origin, other = _bump_setup(env, monkeypatch, ["test ! -e plugins/p/bad.txt"])
+
+    def on(parent, name, path):
+        _git_out(repo, "checkout", "-q", "-B", name, parent)
+        (repo / path).write_text(name + "\n")
+        _git_out(repo, "add", path)
+        _git_out(repo, "commit", "-qm", f"{name}: {path}")
+        return _git_out(repo, "rev-parse", "HEAD")
+    e1 = _entry(repo, "e1", {"plugins/p/f1.txt": "e1\n"})
+    e2 = on(e1, "e2", "plugins/p/bad.txt")
+    heads = [e1, e2, on(e1, "e3", "plugins/p/f3.txt"), on(e2, "e4", "plugins/p/f4.txt")]
+    rc, m = _run_batch(p, _batch_marker(p, heads), monkeypatch)
+    assert rc == 0 and _statuses(m) == ["pushed", "check_failed", "pushed", "requeued"], m
+    assert [_git_out(origin, "show", f"proj:plugins/p/f{n}.txt") for n in (1, 3)] == ["e1", "e3"]
+
+
 def test_the_entries_an_urgent_approval_stopped_a_search_for_are_searched_again_and_the_culprit_blamed(env, monkeypatch):
     """Blame stays right: the entries a search stopped for an urgent approval go in a later batch of
     their own (the urgent one is never among them), whose search blames the entry that broke the checks."""
