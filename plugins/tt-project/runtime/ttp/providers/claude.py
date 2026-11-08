@@ -548,6 +548,8 @@ class Claude(Provider):
                 u.output_tokens = int(usage.get("output_tokens") or 0)
                 u.cache_read_tokens = int(usage.get("cache_read_input_tokens") or 0)
                 u.cache_write_tokens = int(usage.get("cache_creation_input_tokens") or 0)
+                if ids := model_usage_ids(ev):   # the model ids the run really used (pricing: daemon._list_cost)
+                    u.extra["model_usage"] = ids
                 thinking = (usage.get("output_tokens_details") or {}).get("thinking_tokens")
                 if isinstance(thinking, int) and not isinstance(thinking, bool):
                     u.extra["thinking_tokens"] = thinking   # part of output_tokens (effortab.report)
@@ -619,6 +621,42 @@ class Claude(Provider):
         except (OSError, ValueError):
             return ""
         return str((data.get("oauthAccount") or {}).get("billingType") or data.get("billingType") or "")
+
+
+def model_usage_ids(ev: dict) -> list[str]:
+    """The model ids a result event's modelUsage names, the most used (output, then input tokens) first."""
+    mu = ev.get("modelUsage")
+    if not isinstance(mu, dict):
+        return []
+
+    def used(k):
+        v = mu[k] if isinstance(mu[k], dict) else {}
+        return (int(v.get("outputTokens") or 0), int(v.get("inputTokens") or 0) + int(v.get("cacheReadInputTokens") or 0))
+    return [str(k) for k in sorted(mu, key=used, reverse=True) if k][:8]
+
+
+def result_models(path: Path) -> tuple[list[str], str]:
+    """(modelUsage ids of the last result, the init event's model) read from a run's output.jsonl, or
+    ([], '') when it has none; for runs booked before the ids were recorded."""
+    ids, init = [], ""
+    try:
+        with open(path, errors="replace") as f:
+            for line in f:
+                if '"modelUsage"' not in line and not (not init and '"init"' in line):
+                    continue
+                try:
+                    ev = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(ev, dict):
+                    continue
+                if ev.get("type") == "result":
+                    ids = model_usage_ids(ev) or ids
+                elif ev.get("type") == "system" and ev.get("subtype") == "init" and not init:
+                    init = str(ev.get("model") or "")
+    except OSError:
+        return [], ""
+    return ids, init
 
 
 def _whole_answer(row: dict) -> bool:

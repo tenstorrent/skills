@@ -207,3 +207,89 @@ def test_a_cut_off_codex_run_priced_from_its_rollout_tokens_is_booked_as_tokens(
     assert run["cost_estimated"] == 1 and run["cost_basis"] == "tokens", dict(run)
     assert run["cost_usd"] == pytest.approx(priced), dict(run)
     assert run["cost_usd"] != pytest.approx(2.0), "priced from its tokens, not the elapsed half of its budget"
+
+
+# A Claude run's own tokens priced at the model its result names, never the alias it asked for -------
+
+def _alias_lines(model_usage, init="claude-opus-5-5", out_tokens=20_000, total=12.0):
+    """A Claude stream: init on `init`, a result reporting `total` and naming `model_usage` ids."""
+    return [{"type": "system", "subtype": "init", "session_id": "F1", "model": init},
+            {"type": "result", "subtype": "success", "total_cost_usd": total, "result": "ok",
+             "usage": {"input_tokens": 0, "output_tokens": out_tokens},
+             "modelUsage": {m: {"outputTokens": out_tokens - i, "inputTokens": 0} for i, m in enumerate(model_usage)}}]
+
+
+def test_an_opus_alias_fork_books_the_rates_of_the_model_its_result_names(env):
+    """A run that asked for 'opus' (no price row) books its own tokens at the row of the model its
+    result's modelUsage names, not the dearest row; an id the table lacks keeps the dearest row and is
+    told once."""
+    p = make(env)
+    from ttp import localspend
+    from ttp.daemon import Daemon
+    from ttp.providers import get_provider
+    d = Daemon(p.base)
+    _, r = _fork_run(d)
+    d.p.db.x("UPDATE runs SET model='opus' WHERE id=?", (r["id"],))
+    r = d.p.db.one("SELECT * FROM runs WHERE id=?", (r["id"],))
+    out = d.p.runs / "alias.jsonl"
+    out.write_text("".join(json.dumps(x) + "\n" for x in _alias_lines(["claude-opus-5-5", "claude-haiku-5-5"])))
+    u = get_provider("claude").parse(out)
+    assert u.extra["model_usage"] == ["claude-opus-5-5", "claude-haiku-5-5"]
+    want = 20_000 * 20.0 / 1e6   # Opus 5.5 output rate, not Opus 4's $75
+    assert abs(d._net_of_session(r, u) - want) < 1e-6, "the alias was priced at the dearest row"
+    # the session's own model wins over a more used subagent model; with no modelUsage the init model
+    u = _reported(12.0, output_tokens=20_000)
+    u.extra.update(model_usage=["claude-haiku-5-5", "claude-opus-5-5"], model="claude-opus-5-5")
+    assert abs(d._net_of_session(r, u) - want) < 1e-6
+    u = _reported(12.0, output_tokens=20_000)
+    u.extra.update(model="claude-opus-5-5")
+    assert abs(d._net_of_session(r, u) - want) < 1e-6
+    usd, est = localspend.price("claude-haiku-5-5", {"input_tokens": 1_000_000, "output_tokens": 1_000_000,
+                                                    "cache_read_input_tokens": 1_000_000})
+    assert not est and abs(usd - 0.61) < 1e-9
+    for _ in range(2):
+        u = _reported(30.0, output_tokens=20_000)
+        u.extra.update(model_usage=["claude-unheard-9"])
+        d._net_of_session(r, u)
+    told = d.p.db.q("SELECT * FROM messages WHERE kind='alert' AND text LIKE '%claude-unheard-9%'")
+    assert len(told) == 1 and told[0]["severity"] == "low"
+
+
+def test_alias_priced_fork_rows_are_re_booked_once_at_their_runs_time(env):
+    p = make(env)
+    import datetime
+    from ttp import daemon as dmod, timefmt
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    db = d.p.db
+    at = datetime.datetime(2026, 11, 8, 10, 0, tzinfo=timefmt.zone(p)).timestamp()
+    wrong, right = 20_000 * 75.0 / 1e6, 20_000 * 20.0 / 1e6
+
+    def booked(lines, ended=at):
+        tid, r = _fork_run(d, cost=wrong, out_tokens=20_000, status="done")
+        note = {**json.loads(r["note"]), "session_cost_usd": 12.0, "fork_base_usd": 12.0 - wrong}
+        db.x("UPDATE runs SET model='opus', ended=?, note=? WHERE id=?", (ended, json.dumps(note), r["id"]))
+        run_dir = d.p.runs / str(r["id"])
+        run_dir.mkdir(parents=True)
+        (run_dir / "output.jsonl").write_text("".join(json.dumps(x) + "\n" for x in lines))
+        return tid, r["id"]
+
+    tid, fixed = booked(_alias_lines(["claude-opus-5-5"]))
+    _, bare = booked(_alias_lines([])[:1])   # no modelUsage: keeps its booking
+    _, old = booked(_alias_lines(["claude-opus-5-5"]), ended=at - 3 * 86400)   # before the window
+    changed = d.reprice_alias_runs()
+    assert [c[0] for c in changed] == [fixed] and abs(changed[0][2] - right) < 1e-6
+    row = db.one("SELECT cost_usd, note FROM runs WHERE id=?", (fixed,))
+    note = json.loads(row["note"])
+    assert abs(row["cost_usd"] - right) < 1e-6 and note["repriced_model"] == "claude-opus-5-5"
+    assert abs(note["fork_base_usd"] - (12.0 - right)) < 1e-6
+    assert abs(db.task(tid)["spent_usd"] - right) < 1e-6, "the task kept the phantom spend"
+    fix = db.q("SELECT ts, usd FROM ledger WHERE usd<0")
+    assert len(fix) == 1 and fix[0]["ts"] == at and abs(fix[0]["usd"] + (wrong - right)) < 1e-6
+    for rid in (bare, old):
+        assert abs(db.one("SELECT cost_usd FROM runs WHERE id=?", (rid,))["cost_usd"] - wrong) < 1e-9
+    assert db.kv(dmod.MODEL_REPRICE_KEY)["runs"] == 1
+    assert d.reprice_alias_runs() is None, "a second pass ran again"
+    db.set_kv(dmod.MODEL_REPRICE_KEY, None)
+    assert d.reprice_alias_runs() == [], "a re-priced row was re-booked again"
+    assert len(db.q("SELECT 1 FROM ledger WHERE usd<0")) == 1

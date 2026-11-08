@@ -15,6 +15,7 @@ from __future__ import annotations
 import contextlib
 import contextvars
 import copy
+import datetime
 import faulthandler
 import hashlib
 import json
@@ -635,6 +636,8 @@ SESSION_NET_AGREE = 0.5
 SESSION_NET_SLACK_USD = 0.05
 COORD_RENET_KEY = "coord_session_renet"   # Daemon.renet_coord_sessions ran (once per project)
 FORK_RENET_KEY = "fork_run_renet"   # Daemon.renet_fork_runs ran (once per project)
+MODEL_REPRICE_KEY = "model_alias_reprice"   # Daemon.reprice_alias_runs ran (once per project)
+MODEL_REPRICE_SINCE = (2026, 11, 7)   # its window's first day, in the home zone: the days the dollar caps over-counted
 REACH_EVERY_S = 30      # while a provider is held offline, how often its API host is resolved again
 REACH_TIMEOUT_S = 5
 NET_HOLD_MAX_S = 900    # a held provider still lets one run try this often: a lookup that keeps failing never holds forever
@@ -1351,6 +1354,14 @@ class Daemon:
                             + ", ".join(f"run {i} ${a:.2f}->${b:.2f}" for i, a, b in changed[:40]) + ")")
         except Exception:   # a spend correction must never keep the daemon from starting
             log(self.p, "forked run re-net error: " + traceback.format_exc().replace("\n", " | ")[:2000])
+        try:   # forked runs priced at the dearest row for a model alias ('opus'), once
+            changed = self.reprice_alias_runs()
+            if changed is not None:
+                log(self.p, f"re-booked {len(changed)} run(s) priced from a model alias at their real model's rates: "
+                            f"${sum(c[1] for c in changed):.2f} booked -> ${sum(c[2] for c in changed):.2f} ("
+                            + ", ".join(f"run {i} ${a:.2f}->${b:.2f}" for i, a, b in changed[:40]) + ")")
+        except Exception:   # a spend correction must never keep the daemon from starting
+            log(self.p, "alias re-price error: " + traceback.format_exc().replace("\n", " | ")[:2000])
         try:   # push batch files left `running` by a batch whose row is final (pushq.close_strays)
             if closed := pushq.close_strays(self.p):
                 log(self.p, f"closed {len(closed)} stray push batch file(s)")
@@ -4714,7 +4725,7 @@ class Daemon:
             # The fork's report carries the coordinator session's whole cost up to the fork: book this
             # run's own tokens at list price (the project's measured rate is itself inflated by forks
             # booked before this fix). With no priced tokens nothing is netted (over-booking is safe).
-            own = _list_cost(r, usage) or own
+            own = _list_cost(r, usage, on_unknown=self._unpriced_model) or own
             if own > 0 and reported > own:
                 usage.extra["session_cost_usd"] = reported
                 usage.extra["fork_base_usd"] = round(reported - own, 6)
@@ -4812,7 +4823,8 @@ class Daemon:
             usage = RunUsage(cost_usd=float(r["cost_usd"]), input_tokens=r["input_tokens"] or 0,
                              output_tokens=r["output_tokens"] or 0, cache_read_tokens=r["cache_read_tokens"] or 0,
                              cache_write_tokens=r["cache_write_tokens"] or 0,
-                             estimated=bool(r["cost_estimated"]) or (r["cost_basis"] or "reported") != "reported")
+                             estimated=bool(r["cost_estimated"]) or (r["cost_basis"] or "reported") != "reported",
+                             extra=self._output_models(r))
             before = usage.cost_usd
             if self._net_of_session(r, usage) >= before or "session_cost_usd" not in usage.extra:
                 continue
@@ -4830,6 +4842,62 @@ class Daemon:
                                    "usd_before": round(sum(c[1] for c in changed), 6),
                                    "usd_after": round(sum(c[2] for c in changed), 6)})
         return changed
+
+    def reprice_alias_runs(self) -> list[tuple[int, float, float]] | None:
+        """Once per project (kv MODEL_REPRICE_KEY): forked runs booked from MODEL_REPRICE_SINCE on had their
+        own tokens priced at the run's model alias ('opus'), which no price row names, so at the dearest
+        row. Re-price each at the model its output's modelUsage names (_list_cost), the way
+        _net_of_session books one now; take the difference off its task's spend and book it as a negative
+        ledger row at the run's time. A run whose output names no model keeps its booking; a re-priced row
+        is marked (note repriced_model), so a second pass changes nothing. Returns (run id, booked before,
+        booked after) of each row changed, or None when it already ran."""
+        db = self.p.db
+        if db.kv(MODEL_REPRICE_KEY):
+            return None
+        since = datetime.datetime(*MODEL_REPRICE_SINCE, tzinfo=timefmt.zone(self.p)).timestamp()
+        changed = []
+        for r in db.q("SELECT * FROM runs WHERE provider='claude' AND task IS NOT NULL AND status!='running' "
+                      "AND cost_usd>0 AND COALESCE(ended, started)>=? AND note LIKE ? ORDER BY id",
+                      (since, f'%{ctxfork.KEY}%')):
+            note = json.loads(r["note"] or "{}")
+            if "repriced_model" in note or not ctxfork.forked(note) or (note.get("resumes") or {}).get("session"):
+                continue
+            extra = self._output_models(r)
+            if not extra.get("model_usage"):
+                continue
+            before = float(r["cost_usd"])
+            usage = RunUsage(cost_usd=float(note.get("session_cost_usd") or before),
+                             input_tokens=r["input_tokens"] or 0, output_tokens=r["output_tokens"] or 0,
+                             cache_read_tokens=r["cache_read_tokens"] or 0, cache_write_tokens=r["cache_write_tokens"] or 0,
+                             estimated=bool(r["cost_estimated"]) or (r["cost_basis"] or "reported") != "reported",
+                             extra=extra)
+            after = self._net_of_session(r, usage)
+            if after >= before - 1e-6 or "session_cost_usd" not in usage.extra:
+                continue
+            note.update(session_cost_usd=usage.extra["session_cost_usd"], fork_base_usd=usage.extra["fork_base_usd"],
+                        repriced_model=_priced_model(r, usage))
+            db.x("UPDATE runs SET cost_usd=?, note=? WHERE id=?", (after, json.dumps(note), r["id"]))
+            db.x("UPDATE tasks SET spent_usd=MAX(COALESCE(spent_usd,0)-?,0) WHERE id=?", (before - after, r["task"]))
+            db.spend(r["provider"], -(before - after), self._source_for(r), account=r["account"] or "",
+                     estimated=usage.estimated, ts=float(r["ended"] or r["started"] or time.time()))
+            changed.append((r["id"], before, after))
+        db.set_kv(MODEL_REPRICE_KEY, {"at": time.time(), "runs": len(changed),
+                                      "usd_before": round(sum(c[1] for c in changed), 6),
+                                      "usd_after": round(sum(c[2] for c in changed), 6)})
+        return changed
+
+    def _output_models(self, r: dict) -> dict:
+        """A booked Claude run's model ids from its output (RunUsage.extra keys model_usage and model)."""
+        from .providers import claude
+        ids, init = claude.result_models(self._run_dir(r) / "output.jsonl")
+        return {k: v for k, v in (("model_usage", ids), ("model", init)) if v}
+
+    def _unpriced_model(self, model: str) -> None:
+        """A Claude model id no price row names: told once (low); its runs book at the dearest row."""
+        self.alert(f"unpriced-model:{model[:80]}",
+                   f"Claude model {model[:80]!r} has no row in the price table: its runs book at the dearest row "
+                   "(over-counted) until the table or a pricing.claude override names it.",
+                   severity="low", every_s=30 * 86400)
 
     def _outside_writes(self, r: dict, run_dir: Path) -> None:
         """A run that ended without a valid hand-off: what it touched outside its working directory and
@@ -18475,19 +18543,34 @@ def _resumed_coord_session(r: dict, note: dict) -> str:
     return str(r["session_id"] or "") if session.get("mode") == "resume" else ""
 
 
-def _list_cost(r: dict, usage) -> float:
-    """A Claude run's own tokens at list price (localspend's table; an unknown model gets the dearest
-    row, so it over-books), or 0 for another provider or no tokens."""
+def _priced_model(r: dict, usage) -> str:
+    """The model id a Claude run's tokens are priced at: the one its result's modelUsage names (the
+    session's own model when listed, else the most used), else the model its init event reported, and
+    only then the model the run asked for, which may be an alias ('opus') no price row names."""
+    ids = [str(i) for i in usage.extra.get("model_usage") or [] if i]
+    init = str(usage.extra.get("model") or "")
+    if ids:
+        return init if init in ids else ids[0]
+    return init or r["model"] or ""
+
+
+def _list_cost(r: dict, usage, on_unknown=None) -> float:
+    """A Claude run's own tokens at list price (localspend's table, at _priced_model; an unknown model gets
+    the dearest row, so it over-books, and `on_unknown` is called with its id), or 0 for another provider
+    or no tokens."""
     if (r["provider"] or "") != "claude" or not _has_tokens(usage):
         return 0.0
     from . import localspend
+    model = _priced_model(r, usage)
     try:
-        usd, _ = localspend.price(r["model"] or "", {
+        usd, est = localspend.price(model, {
             "input_tokens": usage.input_tokens, "output_tokens": usage.output_tokens,
             "cache_read_input_tokens": usage.cache_read_tokens,
             "cache_creation_input_tokens": usage.cache_write_tokens}, overrides=localspend.overrides())
     except Exception:
         return 0.0
+    if est and on_unknown is not None:
+        on_unknown(model)
     return round(float(usd), 6)
 
 
