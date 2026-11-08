@@ -20,6 +20,9 @@ def _fake_host(tmp_path, monkeypatch, tab: str | None = None):
     # Its own fake store: the session's is shared by every test worker, whose crontab -r would race this one
     monkeypatch.delenv(hoststate.MARKER, raising=False)
     monkeypatch.delenv("TTP_RUN_DIR", raising=False)
+    # Its own reap token: the outer run's is on every test worker, so a check's reap would end them all
+    from ttp import checkreap
+    monkeypatch.setenv(checkreap.MARKER, f"hoststate-test-{os.getpid()}-{tmp_path.name}")
     monkeypatch.setattr(hoststate, "_real_dir", lambda: units)
     monkeypatch.setattr(hoststate, "_real", lambda name: str(cron) if name == "crontab" else None)
     return cron, tabf, units
