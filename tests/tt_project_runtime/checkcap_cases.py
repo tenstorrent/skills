@@ -10944,7 +10944,7 @@ def test_a_lane_waiter_is_named_by_the_task_in_its_run_record(env, tmp_path, mon
         texts = [e["text"] for e in checklane.wait_events(p.name, {"checks": {"wait_event_s": 600}}, now)]
         assert any(t.startswith("Checks lane wait: #71 has waited") for t in texts), texts
         assert any(t.startswith("Checks lane wait: #73 has waited") for t in texts), texts
-        assert any(t.startswith("Checks lane wait: a run with no task has waited") for t in texts), texts
+        assert any(t.startswith("Checks lane wait: a run with no task (full checks (pid 2)) has waited") for t in texts), texts
         waiters = [w["task"] for r in checklane.lane_status(p.name, now) for w in r["waiters"]]
         assert sorted(waiters) == ["", "71", "73"], waiters
         assert checklane._who({"task": "", "pid": 2}) == "no task pid 2"
