@@ -259,6 +259,8 @@ def main(args: list[str]) -> int:
         _say(f"usage: --host <ssh alias> [--env <json>] -- <command> "
              f"({host_problem(host) or env_problem(env) or env_problem(literal)})")
         return 2
+    from . import testslots   # a fixed `-n N` above the host's worker grant (checkspill.workers_env) is lowered to it
+    cmd = testslots.clamp_for(cmd, literal)
     mark = f"ttp-remote-rc:{secrets.token_hex(8)}:"
     try:   # the pinned Python env there, as here (runnerenv): no env, no run (NO_ENV)
         from . import runnerenv

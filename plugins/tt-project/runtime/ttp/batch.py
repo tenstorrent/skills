@@ -53,7 +53,7 @@ import tokenize
 from collections import Counter, deque
 from pathlib import Path
 
-from . import (checkcap, checkdirs, cleantree, conflictfix, cyclenotice, envfault, gatejudge, landmark, locks, push, pushpass, runner, scopehold,
+from . import (checkcap, checkdirs, checkspill, cleantree, conflictfix, cyclenotice, envfault, gatejudge, landmark, locks, push, pushpass, runner, scopehold,
                scriptwatch, setupfault, syntaxfault, testslots, workerloss, urgent,
                sharedchecks, slowtests, suitecost, verdictcarry, worktree)
 from .project import Project, command_env, durable_write, write_json
@@ -1470,6 +1470,7 @@ class Batch:
         self._heads: dict[str, str] | None = None   # push.landed_heads, read once per batch
         self.check_run_dir = m.get("check_run_dir")
         self.isolate = {str(c) for c in m.get("setup_isolate") or []}   # alerted setup_fault checks (pushq)
+        self.spill_off = ""   # the spill hosts this batch's checks keep off (checkspill.spill_off_add, _respill)
         self.at = ""                            # the head _check runs on
         self.checks = {"runs": 0, "seconds": 0.0, "flaky": False}
         self.tip = self.pushed_sha = self.version = None
@@ -2297,7 +2298,9 @@ class Batch:
             return None
         self._runners([c for c, _, _ in run], env)
         suite_out: list[str] = []
-        slot = self._slot(head)
+        claims: list = []   # spill host claims (_spill), closed with the slot
+        run = [(c2, eid, parts) for c2, (_, eid, parts) in zip(self._spill([c for c, _, _ in run], head, claims), run)]
+        slot = self._slot(head) if not all(push.remote_host(c) for c, _, _ in run) else self._no_slot()
         started = time.time()   # a wait for the host-wide slot is not check time
         slow = Path(self.check_run_dir) / slowtests.FILE if self.check_run_dir else None
         if slow:
@@ -2306,7 +2309,8 @@ class Batch:
             for line in push.sandbox_lines([cmd for cmd, _, _ in run]):
                 say(line)
             for cmd, eid, parts in run:
-                resume = pushpass.resume_file(self.p, tree, str(cmd), eid) if tree and pushpass.resumable(cmd) else None
+                resume = (pushpass.resume_file(self.p, tree, str(cmd), eid)
+                          if tree and pushpass.resumable(cmd) and not push.remote_host(cmd) else None)
                 extra = pushpass.resume_env(resume, env) if resume else {}
                 if slow and pushpass.resumable(cmd) and not push.remote_host(cmd):
                     extra |= slowtests.env(slow, {**env, **extra})
@@ -2319,6 +2323,12 @@ class Batch:
                     say(f"{head[:10]} failed {cmd} earlier in this batch (tree {tree[:10]}): judging that run again")
                 else:
                     rc, tail = self._run_check(cmd, {**env, **extra, **slot.env()}, env)
+                    while getattr(cmd, "spilled", False) and (fault := push.remote_fault(cmd, rc, self.wt)):
+                        cmd = self._respill(cmd, head, fault, claims)   # the next spill host, else here
+                        if not push.remote_host(cmd) and slot.f is None and not slot.tests:
+                            slot.close()
+                            slot = self._slot(head)
+                        rc, tail = self._run_check(cmd, {**env, **slot.env()}, env)
                     if fault := push.remote_fault(cmd, rc, self.wt):
                         raise envfault.Fault(fault)   # the check host, not this head: push_phase holds the batch
                     if rc != 0 and tree:
@@ -2340,6 +2350,8 @@ class Batch:
                     resume.unlink(missing_ok=True)
         finally:
             slot.close()
+            for claim in claims:
+                claim.close()
             self.checks["seconds"] = round(self.checks["seconds"] + time.time() - started, 1)
         push.record_check_s(self.p, time.time() - started)
         for line in slowtests.lines(slow) if slow else []:
@@ -2349,6 +2361,36 @@ class Batch:
         except Exception as e:   # a cost note never fails a batch
             say(f"suite cost not recorded: {e}")
         return None
+
+    def _spill(self, cmds: list, head: str, claims: list) -> list:
+        """`cmds` with those that may spill sent to a spill host (checkspill.spill_run, with its worker grant, as
+        `ttp checks` spills them), the rest here; its claim joins `claims`. Never fails the batch."""
+        try:
+            claim, out = checkspill.spill_run(self.p, self.p.config(), cmds, say,
+                                              f"push batch {self.id} checks on {head[:10]}", self.spill_off)
+        except Exception as e:   # the spill hosts are a speed-up: the checks run here instead
+            say(f"spill hosts not tried ({e}): the checks run here")
+            return cmds
+        if claim is not None:
+            claims.append(claim)
+        return out
+
+    def _respill(self, cmd, head: str, fault: dict, claims: list):
+        """Check `cmd`, whose spill host failed (`fault`: ssh or the host, never the change), on the next spill
+        host free, else here: the host's fault never fails or holds the batch. A host faulting
+        checkspill.HOST_FAULT_TRIES times is kept off the rest of the batch (spill_off)."""
+        host, was = push.remote_host(cmd), getattr(cmd, "was", cmd)
+        self.spill_off = checkspill.spill_off_add(self.spill_off, host, True)
+        say(f"spill host {host} could not run {was} ({fault.get('why') or 'ssh or the host failed'}): "
+            "trying the next spill host, else here")
+        nxt = self._spill([was], head, claims)[0]
+        return nxt if push.remote_host(nxt) else was
+
+    def _no_slot(self) -> checkcap.Slot:
+        """No slot here: every check spilled. The checks step is marked as _slot marks it."""
+        self.steps.between()
+        self.steps.go("checks")
+        return checkcap.Slot()
 
     def _passed(self, cmd) -> None:
         """Note a check that passed (ran, reused or carried) in checks.passed: its script_torn count clears (pushq)."""
