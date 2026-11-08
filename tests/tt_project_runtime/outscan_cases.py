@@ -331,9 +331,11 @@ def test_runs_git_push_passes_clean_and_already_pushed_commits_and_keeps_refusin
     # new name, or a clean commit on top of it, passes.
     _git_out(repo, "checkout", "-q", "-b", "old", "main")
     _commit(repo, "old.txt", f"{_OUT_SHAPE}\n")
-    # Outside a run: no TTP_TASK, so a harness git wrapper first on PATH (a run host) does not scan it.
-    subprocess.run(["git", "-C", str(repo), "push", "-q", "--no-verify", "origin", "old"], check=True,
-                   capture_output=True, env={k: v for k, v in os.environ.items() if k != "TTP_TASK"})
+    # Outside a run: no TTP_TASK, TTP_ROLE or TTP_COORD_FULL_TOOLS, so a harness git wrapper first on PATH
+    # (a worker's or coordinator's run host) does not scan it.
+    outside = {k: v for k, v in os.environ.items() if k not in ("TTP_TASK", "TTP_ROLE", "TTP_COORD_FULL_TOOLS")}
+    subprocess.run(["git", "-C", str(repo), "push", "-q", "--no-verify", "origin", "old"], env=outside,
+                   capture_output=True, text=True, check=True)
     assert push("origin", "old:refs/heads/copy").returncode == 0
     _commit(repo, "new.txt", "clean\n")
     out = push("origin", "old")
