@@ -316,6 +316,8 @@ def test_config_setter_is_recorded_shown_and_survives_a_restart_and_an_upgrade_m
     cli.main(["config", p.name, "get", "--why", "delivery.channel_tags"])
     cli.main(["config", p.name, "--why", "coordinator.effort"])   # never set: the default
     out = capsys.readouterr().out.splitlines()
+    assert any(line.startswith("  budget.max_parallel_workers: ") and "-> 2 by user" in line for line in out), out
+    out = [line for line in out if not line.startswith(("changes (", "  "))]
     assert out[0].startswith(f"budget.max_parallel_workers: set by user (message #{m}) via chat, 20"), out
     assert out[1].startswith("delivery.channel_tags: set by coordinator via config_set"), out
     assert out[2] == "coordinator.effort: set by default (never set)", out
@@ -390,10 +392,11 @@ def test_config_writers_outside_the_cli_record_a_harness_setter_never_the_user(e
         return configwho.lookup(p.db, key, p.raw_config())
 
     # Upgrade: the load-caps migration removes an old fixed default; the load-sized default applies.
-    p.set_config("device.max_tasks", 2, by=configwho.by("user", via="cli"))
+    # (One the user or a coordinator set stays: configlog_cases.)
+    p.set_config("device.max_tasks", 2)
     assert "device.max_tasks 2" in cli._migrate_load_caps(p)
     rec = who("device.max_tasks")
-    assert (rec["by"], rec["via"]) == ("default", "upgrade: load-sized default"), rec
+    assert (rec["by"], rec["via"]) == ("migration", "upgrade: load-sized default"), rec
     # The home zone follows a machine's clock (ttp connect, a spend push): the harness, both keys.
     assert timefmt.set_home(p, "Asia/Tokyo", "box-a", "ttp connect from box-a")
     for key in (timefmt.KEY, timefmt.FROM_KEY):
@@ -469,18 +472,19 @@ def test_load_caps_migration_removing_two_keys_of_one_section_keeps_the_sections
     def who(key):
         return configwho.lookup(p.db, key, p.raw_config())
 
-    p.set_config("review", {"sweep_after_s": 1800, "unreviewed_per_pass": 2, "max_rounds": 5},
-                 by=configwho.by("user", msgs=[9], via="cli"))
+    p.set_config("review", {"sweep_after_s": 1800, "unreviewed_per_pass": 2, "max_rounds": 4},
+                 by=configwho.by("default", via="template"))
+    p.set_config("review.max_rounds", 5, by=configwho.by("user", msgs=[9], via="cli"))
     note = cli._migrate_load_caps(p)
     assert "review.sweep_after_s 1800" in note and "review.unreviewed_per_pass 2" in note, note
     review = p.raw_config()["review"]
     assert "sweep_after_s" not in review and "unreviewed_per_pass" not in review, review
     rec = who("review.max_rounds")
     assert (rec["by"], rec.get("msgs")) == ("user", [9]), rec
-    assert configwho.role(who("review")) == "user"
+    assert configwho.role(who("review")) == "default"
     for key in ("review.sweep_after_s", "review.unreviewed_per_pass"):
         rec = who(key)
-        assert (rec["by"], rec["via"]) == ("default", "upgrade: load-sized default"), (key, rec)
+        assert (rec["by"], rec["via"]) == ("migration", "upgrade: load-sized default"), (key, rec)
     # A section edited by hand before the migration stays unknown: the stepwise records never launder it.
     p.set_config("review", {"sweep_after_s": 1800, "unreviewed_per_pass": 2, "max_rounds": 5},
                  by=configwho.by("user", msgs=[9], via="cli"))

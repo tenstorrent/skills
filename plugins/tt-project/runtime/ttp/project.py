@@ -1633,15 +1633,30 @@ class Project:
                 node[p] = {}
             node = node[p]
         node[parts[-1]] = value
+        if self._guarded(dotted, by, before, raw):
+            return
         if self.config_status == "fallback":
             self.keep_broken_config()
         write_json(self.config_path, raw)
         if self.established():   # a project still being made has no database to record it in yet
             try:
                 from . import configwho
-                configwho.record(self.db, dotted, by, before=before, after=raw)
+                configwho.changed(self, dotted, by, before, raw)
             except Exception:   # the setting is written; a busy or broken database only loses its setter
                 pass
+
+    def _guarded(self, dotted: str, by: dict | None, before: dict, after: dict) -> bool:
+        """configwho.guard: raises configwho.Protected when an automated setter would change a value the
+        user or a coordinator set; True when there is nothing to write."""
+        if not self.established():
+            return False
+        from . import configwho
+        try:
+            return configwho.guard(self, dotted, by, before, after)
+        except configwho.Protected:
+            raise
+        except Exception:   # a busy or broken database never stops the change itself
+            return False
 
     def unset_config(self, dotted: str, by: dict | None = None) -> bool:
         """Remove one key from project.json, so it reads its default again, and record who did; sections
@@ -1665,13 +1680,14 @@ class Project:
             if trail[i]:
                 break
             del trail[i - 1][parts[i - 1]]
+        self._guarded(dotted, by, before, raw)
         if self.config_status == "fallback":
             self.keep_broken_config()
         write_json(self.config_path, raw)
         if self.established():
             try:
                 from . import configwho
-                configwho.record(self.db, dotted, by, before=before, after=raw)
+                configwho.changed(self, dotted, by, before, raw)
             except Exception:   # as in set_config: the removal is written; only its setter is lost
                 pass
         return True

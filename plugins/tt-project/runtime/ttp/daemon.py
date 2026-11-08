@@ -38,6 +38,7 @@ from pathlib import Path
 from . import runtimeload   # first of its own: its LOADED_AT is when the daemon imported its code
 from . import ackwait
 from . import claimcheck
+from . import configwho
 from . import sidefx
 from . import cursorhook
 from . import pausegone
@@ -1955,6 +1956,7 @@ class Daemon:
         self._run_step(self.watch_cli_versions)
         self._run_step(self.reap_locks)
         self._run_step(self.reap_task_records)
+        self._run_step(lambda: configwho.watch(self.p), "config_breakage")   # a config change that broke the checks
         settling = self._run_step(self.settling, default=False)
         core = self.cfg.get("core_provider") or "claude"
         core_held = self._run_step(lambda: self.net_held(core) and not self._net_may_probe(core), "net_held", default=False)
@@ -8062,6 +8064,13 @@ class Daemon:
                              + "\n".join(f"- {line}" for line in gone))
             except Exception as e:   # nor must the machine ledger
                 log(self.p, f"quiet outage lines failed: {type(e).__name__}: {e}")
+            try:
+                changes = configwho.review_lines(self.p)
+                if changes:
+                    spec += ("\n\nConfig changes not made by the user (last 24 h; refusals included; undo any "
+                             "that is wrong):\n" + "\n".join(f"- {line}" for line in changes))
+            except Exception as e:   # nor must the config log
+                log(self.p, f"config change lines failed: {type(e).__name__}: {e}")
             try:
                 from . import hostload
                 spec += ("\n\nCheck runs per host now, with this host's load (hostload; an overloaded host "

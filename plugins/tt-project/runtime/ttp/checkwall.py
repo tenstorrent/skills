@@ -141,10 +141,12 @@ def cap(p, now: float | None = None) -> tuple[float, str]:
             f"{FACTOR:g}x the longest of the last {len(runs)} runs, within {FLOOR_S / 3600:g}-{CEILING_S / 3600:g} h")
 
 
-def record_run(state: Path | None, seconds: float, passed: bool, key: str = "", scratch: str = "") -> None:
+def record_run(state: Path | None, seconds: float, passed: bool, key: str = "", scratch: str = "",
+               host: str = "", task: str = "") -> None:
     """Keep one completed run's wall time for cap(), with `key` (its command list's hash, for
-    checklane.median_s) and `scratch` (where its scratch was: 'tmpfs' or 'disk') when given; a
-    failed write only loses a sample. Older rows lack both keys."""
+    checklane.median_s), `scratch` (where its scratch was: 'tmpfs' or 'disk'), `host` (the spill host
+    it ran on; none: this one) and `task` when given, for configwho.watch too; a failed write only loses
+    a sample. Older rows lack them."""
     if state is None or seconds <= 0:
         return
     path = Path(state) / RUNS_LOG
@@ -153,7 +155,9 @@ def record_run(state: Path | None, seconds: float, passed: bool, key: str = "", 
             durable_write(path, "".join(f"{x}\n" for x in path.read_text().splitlines()[-RECENT:]))
         durable_append(path, json.dumps({"ts": time.time(), "s": round(seconds, 3), "passed": bool(passed),
                                             **({"k": key} if key else {}),
-                                            **({"scratch": scratch} if scratch else {})}) + "\n")
+                                            **({"scratch": scratch} if scratch else {}),
+                                            **({"host": host} if host else {}),
+                                            **({"task": str(task)} if task else {})}) + "\n")
     except OSError:
         pass
 

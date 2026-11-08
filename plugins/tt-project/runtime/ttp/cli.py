@@ -4287,7 +4287,8 @@ def cmd_checks(a) -> None:
                         checkcap.record_cost(checkcap.child_cpu_s() - ran_cpu, time.time() - ran_since)
                     checkwall.record_run(p.state, time.time() - ran_since, passed,
                                          _commands_hash(todo) if passed and executed == todo else "",
-                                         "" if spilled else "tmpfs" if shorttmp.on_tmpfs(run_env.get("TMPDIR")) else "disk")
+                                         "" if spilled else "tmpfs" if shorttmp.on_tmpfs(run_env.get("TMPDIR")) else "disk",
+                                         spilled.host if spilled else "", os.environ.get("TTP_TASK") or "")
                 # A completed run no longer reports the task's old wall-time timeout (TIMEOUTS entry).
                 checkwall.clear_timeout(p.state, os.environ.get("TTP_TASK"))
         if slot and not passed:
@@ -10571,6 +10572,11 @@ def cmd_config_why(words: list[str], key: str) -> None:
     raw = p.raw_config()
     rec = configwho.lookup(p.db if p.established() else None, key, None if p.config_status == "unavailable" else raw)
     print(f"{key}: set by {configwho.describe(rec, p)}")
+    rows = configwho.history(p, key)
+    if rows:
+        print(f"changes ({len(rows)}, the last {min(len(rows), 20)} shown; {p.state / configwho.LOG}):")
+        for r in rows[-20:]:
+            print(f"  {configwho.line(r, p)}")
 
 
 SECRET_KINDS = ("jev", "slack", "endpoint", "show", "check", "env", "push", "set", "generate")
@@ -11444,7 +11450,7 @@ def _strongest_coordinator(p: Project) -> str:
             return ""
         verdict, why = coordmodel.migrate(raw)
         if verdict == "set":
-            p.set_config("coordinator.model_tier", coordmodel.STRONGEST, by={"by": "default", "via": "upgrade"})
+            p.set_config("coordinator.model_tier", coordmodel.STRONGEST, by={"by": "upgrade", "via": "upgrade"})
         route = coord.route_line(p.config()).removeprefix("coordinator: ")
         p.db.set_kv(STRONGEST_COORD_KEY, {"ts": time.time(), "verdict": verdict or "already", "why": why})
     except Exception:
@@ -11469,7 +11475,7 @@ def _auto_cache_ttl(p: Project) -> str:
         coord = p.raw_config().get("coordinator")
         if not (isinstance(coord, dict) and "cache_ttl" in coord and not str(coord["cache_ttl"] or "").strip()):
             return ""
-        p.set_config("coordinator.cache_ttl", "auto", by={"by": "default", "via": "upgrade"})
+        p.set_config("coordinator.cache_ttl", "auto", by={"by": "upgrade", "via": "upgrade"})
     except Exception:
         return ""
     return 'upgrade note: coordinator.cache_ttl was "" (from an older template) and is now "auto"'
@@ -11485,6 +11491,14 @@ def _migrate_load_caps(p: Project) -> str:
         if p.config_status == "unavailable":
             return ""
         new, done = loadcaps.migrate(raw)
+        if p.established():   # a value the user or a coordinator set stays, whatever it is (configwho.guard)
+            from . import configwho
+            for key in loadcaps.OLD_DEFAULTS:
+                section, leaf = key.split(".", 1)
+                if configwho.at(raw, key) != configwho.at(new, key) \
+                        and configwho.role(configwho.lookup(p.db, key, raw)) in configwho.OWNERS:
+                    new[section][leaf] = raw[section][leaf]
+                    done = [d for d in done if not d.startswith(key + " ")]
         if not done:
             return ""
         if p.config_status == "fallback":
@@ -11500,8 +11514,7 @@ def _migrate_load_caps(p: Project) -> str:
                     continue
                 section, leaf = key.split(".", 1)
                 step = {**state, section: {k: v for k, v in state[section].items() if k != leaf}}
-                configwho.record(p.db, key, {"by": "default", "via": "upgrade: load-sized default"},
-                                 before=state, after=step)
+                configwho.changed(p, key, {"by": "migration", "via": "upgrade: load-sized default"}, state, step)
                 state = step
     except Exception:
         return ""
@@ -14007,8 +14020,9 @@ def main(argv: list[str] | None = None) -> None:
                    help="check, without setting it, whether a coordinator config_set accepts KEY (and VALUE): "
                         "ttp config --chat-settable KEY [VALUE]; KEY `list` prints every accepted key")
     s.add_argument("--why", metavar="KEY",
-                   help="who set KEY (user with the message id, coordinator, worker task, harness or default) and "
-                        "when; keys set before this was recorded show unknown: ttp config [NAME] get --why KEY")
+                   help="who set KEY (user with the message id, coordinator, worker task, harness, default, upgrade "
+                        "or migration) and when, then its logged changes (old -> new, setter, undo); keys set before "
+                        "this was recorded show unknown: ttp config [NAME] get --why KEY")
     s.set_defaults(fn=cmd_config)
 
     s = sub.add_parser("secret", help="store per-user credentials (read from stdin)")
