@@ -378,6 +378,7 @@ def test_bench_cells_get_venvs_of_their_own_with_the_user_site_off_and_pip_user_
     import importlib.util
     from ttp import cellenv
     monkeypatch.setenv("PIP_USER", "1")
+    monkeypatch.delenv("PIP_REQUIRE_VIRTUALENV", raising=False)   # cellenv must set it, not the caller's env
     monkeypatch.setenv("PYTEST_ADDOPTS", "-p ttp_no_such_plugin")
     monkeypatch.setenv("PYTEST_PLUGINS", "ttp_no_such_plugin")
     one, two = cellenv.make(tmp_path / "c1" / "venv"), cellenv.make(tmp_path / "c2" / "venv", seed=())
@@ -402,10 +403,13 @@ def test_bench_cells_get_venvs_of_their_own_with_the_user_site_off_and_pip_user_
     r = subprocess.run(["python3", "-c", "import pytest; print(pytest.__file__)"], env=cellenv.env(one, dict(os.environ)),
                        capture_output=True, text=True, timeout=60)
     assert pathlib.Path(r.stdout.strip()).is_relative_to(one), r
-    if importlib.util.find_spec("pip"):   # an interpreter outside the cell's venv: pip wants one
+    if importlib.util.find_spec("pip"):   # an interpreter outside the cell's venv
+        env = cellenv.env(two, dict(os.environ))
         r = subprocess.run([sys.executable, "-m", "pip", "install", "--user", "--no-index", "nopkg"],
-                           env=cellenv.env(two, dict(os.environ)), capture_output=True, text=True, timeout=120)
-        assert r.returncode and re.search(r"--user|virtualenv", r.stderr), r
+                           env=env, capture_output=True, text=True, timeout=120)
+        assert r.returncode and not pathlib.Path(env["PYTHONUSERBASE"]).exists(), r
+        if sys.prefix == sys.base_prefix:   # outside any venv pip wants one; inside one (ttp checks' own) it may not
+            assert re.search(r"--user|virtualenv", r.stderr), r
 
 
 def test_bench_run_agent_and_grade_of_each_cell_run_in_venvs_of_their_own(env, tmp_path, monkeypatch):
