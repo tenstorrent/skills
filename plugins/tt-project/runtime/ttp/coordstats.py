@@ -86,7 +86,9 @@ def tool_calls(r, runs_dir: Path) -> int | None:
 
 NEW_WHY = {"no session": "new: no session", "prefix changed": "new: prompt, charter or schema changed",
            "model or effort changed": "new: model or effort changed", "last run not ok": "new: last wake failed",
-           "session not saved": "new: transcript gone", "resume failed": "new: resume rejected"}
+           "session not saved": "new: transcript gone", "resume failed": "new: resume rejected",
+           "provider changed": "new: provider changed",
+           "prompt changed, provider cannot resume with it": "new: prompt changed, provider cannot resume with it"}
 
 
 def _provider_gaps() -> set:
@@ -104,7 +106,8 @@ def reason(s: dict, status: str = "ok") -> str:
             return "resume failed"
         # "handover" and "context reached" (below) are older releases' rollovers, kept for their days.
         return ("handover" if why == "handover" else "compacted in place" if why == "compact"
-                else "resumed after a failed resume" if why == "rerun" else "resumed")
+                else "resumed after a failed resume" if why == "rerun"
+                else "resumed with a changed prompt" if why == "prompt changed" else "resumed")
     if mode == "new":
         return "rollover" if why.startswith("context reached") else NEW_WHY.get(why, "new: other")
     if why == "spend guard tripped":

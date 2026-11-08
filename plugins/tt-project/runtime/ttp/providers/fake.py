@@ -23,6 +23,7 @@ from .base import Provider, RunUsage
 class Fake(Provider):
     name = "fake"
     coord_session = "agent"
+    resume_new_prompt = "reread"
     efforts = ("minimal", "low", "medium", "high", "xhigh", "max")
 
     def credential_files(self) -> list[str]:

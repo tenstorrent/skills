@@ -256,6 +256,11 @@ class Provider:
     # provider only; every agent CLI the coordinator runs on keeps one).
     coord_session = ""
     session_gap = "its CLI keeps no session the harness can resume"
+    # How a resumed coordinator session takes a changed system prompt, charter or schema
+    # (coordsession.decide, changed_block): "reread", the resumed run takes this run's system prompt
+    # and schema; "diff", the harness also sends the system prompt's diff, as the resume may keep the
+    # old one; "": it cannot resume with a changed prompt, and a change starts a new session.
+    resume_new_prompt = ""
     # The CLI runs ttp's PreToolUse/PostToolUse hooks (coordtools.hook_settings): the coordinator's tool
     # policy and per-call protected-file guard. Without them the daemon guards the protected files
     # around the whole coordinator wake (coordtools.wake_snapshot, wake_guard).

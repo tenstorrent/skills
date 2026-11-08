@@ -514,8 +514,12 @@ coordinator with that evidence.
   Code, Codex and Cursor, with per-provider tools and guards in providers.md). An old
   `coordinator.session.mode` value in a project's config is ignored, and `config_set` refuses it. A
   daemon restart or a host reboot resumes the same session id (kept in the project's kv table) and
-  never starts a new session. A new session starts only when there is none, the system prompt,
-  stable context or action schema changed, the model or effort changed, a new session's first wake
+  never starts a new session. A changed system prompt, charter or action schema resumes the session
+  too: the wake runs with the new prompt and schema and leads with a model-free "Changed since your
+  last wake" block (a prompt version line and the charter's unified diff against the copy the last ok
+  wake saved; on Codex also the system prompt's diff). A new session starts only when there is none,
+  the provider changed, the prompt changed on a provider that cannot resume with a changed prompt
+  (`Provider.resume_new_prompt`; none shipped), the model or effort changed, a new session's first wake
   did not end ok and did no work (one that did, then hit its dollar cap or timeout, keeps its session:
   the next wake resumes it), its transcript is gone (a host move or a provider-side expiry), or the provider
   rejected a resume. A full context never starts a new session: the session compacts in place and

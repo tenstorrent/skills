@@ -141,6 +141,7 @@ class Claude(Provider):
 
     caps_budget = True   # --max-budget-usd
     coord_session = "agent"   # --resume <session id>
+    resume_new_prompt = "reread"   # --system-prompt-file and --json-schema are per run, --resume or not
     session_format = "claude-code"   # projects/<cwd slug>/<id>.jsonl (fork_session); the chat provider's too
     tool_hooks = True
     fence_optional = True   # the Bash sandbox (fence_args)

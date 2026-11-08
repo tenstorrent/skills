@@ -13,8 +13,9 @@ and neither seeds a new session. "stateless" is left only for a provider that ke
 (Provider.session_gap: the chat provider, whose coordinator use is out of scope here), named in the
 wake's `why`.
 
-A new session starts only when: there is none; the prefix key changed (system prompt, stable
-context, action schema or agent); the model or effort changed; the last new session's first wake did
+A new session starts only when: there is none; the provider changed; the prompt changed (system
+prompt, stable context or action schema) on a provider that cannot resume with a changed prompt
+(Provider.resume_new_prompt ""); the model or effort changed; the last new session's first wake did
 not end ok and did no work in it (one that did, then hit its dollar cap or timeout, is kept like a
 failed resume: the next wake resumes it); its transcript is no longer saved (a host move or the provider's session expiry); or the
 provider rejected the resume (resume failed, below). Never because the context grew: the session
@@ -79,10 +80,14 @@ section (memory, user corrections, promises, chats) is hashed raw and sent whole
 whose only change is an age goes whole too."""
 from __future__ import annotations
 
+import difflib
 import hashlib
 import json
+import os
 import re
+import shutil
 import time
+from pathlib import Path
 
 from . import cachettl, spans
 
@@ -114,6 +119,9 @@ CHAT_EXCHANGES = 20       # the chat exchanges a new or compacted session's firs
 CHAT_CHARS = 60000        # their cap: the oldest whole exchanges go first, the newest always stays
 NOTE_DIR = "coord-session"
 HANDOFF_SUFFIX = ".handoff.md"
+PREFIX_FILE = "prefix.json"   # under NOTE_DIR, and each session wake's run dir: the prompt it ran with
+CHANGED_HEAD = "## Changed since your last wake"
+PROMPT_NEW = "prompt changed, provider cannot resume with it"   # decide()'s own reason (Provider.resume_new_prompt)
 # Every provider runs the session, with no opt-out. Each provider says how it keeps it
 # (providers/base.Provider.coord_session): "agent" resumes the agent CLI's own saved session
 # (claude, codex, cursor; the fake in tests); the chat provider keeps none (Provider.session_gap).
@@ -207,19 +215,25 @@ def prefix_key(system: str | None, context: str | None, schema: dict | None, pro
 
 
 def decide(cfg: dict, state, prefix_key: str, model: str, effort: str, saved, now: float,
-           no_session: str = "") -> tuple[str, str]:
+           no_session: str = "", provider: str = "", prompt_resumes: bool = True) -> tuple[str, str]:
     """(mode, why) of one wake: "resume" or "new" (the next session, seeded with the hand-off). A daemon
     restart or a reboot changes nothing here: the saved session is resumed by its id. `state`
     is kv KEY (None: none yet), `saved(session_id)` says the agent can still resume that session,
     `no_session` is gap() of the wake's provider: only a provider that keeps no session at all gets
-    "stateless". No setting in `cfg` changes the mode; it only sizes the rollover (limit())."""
+    "stateless". No setting in `cfg` changes the mode; it only sizes the rollover (limit()). A changed
+    `prefix_key` resumes ("prompt changed": the wake leads with changed_block()) unless the wake's
+    `provider` differs from the session's or cannot resume with a changed prompt (`prompt_resumes`
+    False: Provider.resume_new_prompt "")."""
     if no_session:
         return "stateless", no_session
     st = state if isinstance(state, dict) else {}
     if not st.get("id"):
         return "new", "no session"
-    if st.get("key") != prefix_key:
-        return "new", "prefix changed"
+    if provider and st.get("provider") and str(st["provider"]) != str(provider):
+        return "new", "provider changed"
+    changed = st.get("key") != prefix_key
+    if changed and not prompt_resumes:
+        return "new", PROMPT_NEW
     if str(st.get("model") or "") != str(model or "") or str(st.get("effort") or "") != str(effort or ""):
         return "new", "model or effort changed"
     if st.get("rerun") and st.get("rejected"):
@@ -232,7 +246,65 @@ def decide(cfg: dict, state, prefix_key: str, model: str, effort: str, saved, no
         return "resume", "rerun"
     if _num(st.get("context_tokens"), 0) >= limit(cfg, st, model):
         return "resume", "compact"   # the same session compacts in place (agent switch or session_note)
-    return "resume", "continued"
+    return "resume", "prompt changed" if changed else "continued"
+
+
+def prefix_record(key: str, system: str | None, context: str | None, schema: dict | None) -> dict:
+    """What a session wake's changed_block() compares: the prompt texts and the schema's hash."""
+    return {"key": key, "system": system or "", "context": context or "",
+            "schema": _sha(json.dumps(schema, sort_keys=True))}
+
+
+def acked_prefix(p) -> dict:
+    """prefix_record() of the last session wake that ended ok ({} when none is saved)."""
+    try:
+        got = json.loads((p.state / NOTE_DIR / PREFIX_FILE).read_text())
+    except (OSError, ValueError):
+        return {}
+    return got if isinstance(got, dict) else {}
+
+
+def ack_prefix(p, run_dir) -> None:
+    """After a session wake that ended ok: the prompt it ran with (its run dir's PREFIX_FILE) is the one
+    the next wake compares with. A failed wake leaves the saved one, so its changes are sent again."""
+    src = Path(run_dir) / PREFIX_FILE
+    if not src.is_file():
+        return
+    dst = p.state / NOTE_DIR / PREFIX_FILE
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dst.with_name(f"{dst.name}.{os.getpid()}.tmp")
+    shutil.copyfile(src, tmp)
+    os.replace(tmp, dst)
+
+
+def changed_block(before: dict, now: dict, version: str, with_system: bool, last_key: str = "") -> str:
+    """The resumed wake's lead when its prompt changed since the last wake that ended ok (`before`,
+    acked_prefix(); `now`, prefix_record()), model-free: a prompt version line, the charter's unified
+    diff (the changed text whole where that is shorter) and, with `with_system` (a provider whose resume
+    keeps the old system prompt, Provider.resume_new_prompt "diff"), the system prompt's too. Memory is
+    not here: resume_memory() leads every resumed wake with its changes. With no saved copy, only a key
+    that differs from the session's `last_key` counts as a change, and the changed parts go whole. ""
+    when nothing changed."""
+    if before.get("key", last_key) == now["key"]:
+        return ""
+    lines = [f"{CHANGED_HEAD} (model-free; the session continues)",
+             f"Prompt version: {str(before.get('key') or last_key or 'unknown')[:16]} -> {now['key'][:16]} "
+             f"(tt-project {version}). The new system prompt and action schema apply from this wake."]
+    if not before:
+        lines.append("The earlier prompt is not on disk, so the current text follows whole.")
+    parts = [("Charter", "context")] + ([("System prompt", "system")] if with_system else [])
+    for name, k in parts:
+        if before and before.get(k) == now[k]:
+            continue
+        diff = "\n".join(difflib.unified_diff(str(before.get(k) or "").splitlines(), now[k].splitlines(),
+                                              f"{name} (last wake)", f"{name} (now)", n=1, lineterm=""))
+        whole = not before or len(diff) >= len(now[k])
+        lines += [f"{name} ({'whole' if whole else 'unified diff'}):", "```", now[k] if whole else diff, "```"]
+    if not with_system and before and before.get("system") != now["system"]:
+        lines.append("System prompt: changed (the new one is in effect).")
+    if before and before.get("schema") != now["schema"]:
+        lines.append("Action schema: changed (the new one is in effect).")
+    return "\n".join(lines)
 
 
 def salvaged_line(n) -> str:

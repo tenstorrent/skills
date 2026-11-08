@@ -3550,7 +3550,8 @@ class Daemon:
                 session_mode, why = coordsession.decide(
                     self.cfg, self.p.db.kv(coordsession.KEY), key, model, effort,
                     lambda s: bool(prov.resume_args(s)) and prov.session_saved(s, cwd, env), time.time(),
-                    no_session=coordsession.gap(prov))
+                    no_session=coordsession.gap(prov), provider=provider,
+                    prompt_resumes=bool(prov.resume_new_prompt))
             except Exception as e:   # the next session, seeded with the hand-off: never a stateless turn
                 session_mode, why = "new", f"decide failed: {type(e).__name__}: {e}"[:200]
                 log(self.p, f"coordinator session {why}")
@@ -3583,6 +3584,7 @@ class Daemon:
         # The environment and any cache mark below take the same lifetime: a mismatch is an API error.
         env = {**env, **prov.cache_env(cache_ttl)}
         thread = ""
+        prefix_now = None   # a session wake's prompt (coordsession.prefix_record), saved in its run dir
         if session_on:
             state = self.p.db.kv(coordsession.KEY)
             session_cap = None
@@ -3630,6 +3632,17 @@ class Daemon:
                         prompt = prompt + "\n\n" + coordsession.compact_ask(state)
                 except Exception:   # the digest alone still runs the wake
                     log(self.p, "coordinator session seed failed: " + traceback.format_exc().replace("\n", " | ")[:1000])
+                try:   # a changed prompt, charter or schema: the session continues, told what changed
+                    from . import __version__
+                    prefix_now = coordsession.prefix_record(key, system, context, schema)
+                    if session_mode == "resume" and (block := coordsession.changed_block(
+                            coordsession.acked_prefix(self.p), prefix_now, __version__,
+                            prov.resume_new_prompt == "diff", str((state or {}).get("key") or ""))):
+                        prompt = block + "\n\n" + prompt
+                        note = {**(note or {}), "prompt_changed": len(block)}
+                except Exception as e:   # the wake runs; the saved copy stays, so the next ok wake sends it
+                    prefix_now = None
+                    log(self.p, f"coordinator session changed block failed: {type(e).__name__}: {e}"[:300])
             prompt = self._wake_mode_line(session_mode, why, True, prompt)   # before the seed cap counts it
             compact_at = 0   # the agent's own compaction switch, at the size the session compacts at
             if session_mode in ("new", "resume"):   # never below this wake's own prompt, whatever the state knows
@@ -3825,6 +3838,9 @@ class Daemon:
                        self.boot, "running", json.dumps(note or {}), session_id or None))
         run_dir = self.p.runs / str(run_id)
         prompt = prompt.replace(RUN_DIR_MARK, str(run_dir))
+        if prefix_now is not None:   # acknowledged once the wake ends ok (coordsession.ack_prefix)
+            run_dir.mkdir(parents=True, exist_ok=True)
+            (run_dir / coordsession.PREFIX_FILE).write_text(json.dumps(prefix_now))
         # Raising from here on means nothing was launched: the run row must not stay "running".
         tmp_env: dict = {}
         try:
@@ -6464,6 +6480,8 @@ class Daemon:
                 compacted = pre if pre is not None else {"pre_tokens": 0} if (ctx or {}).get("compacted") else None
             state = coordsession.record(state, usage, r.get("session_id") or "", session, ok, now,
                                         summary=str((out or {}).get("summary") or ""), compacted=compacted)
+            if ok and session.get("mode") in ("new", "resume"):
+                coordsession.ack_prefix(self.p, r.get("dir") or self.p.runs / str(r["id"]))
             if ok and (state.get("compactions") or [{}])[-1].get("at") == now:
                 c = state["compactions"][-1]
                 log(self.p, f"coordinator run {r['id']}: session {c['session'][:8]} compacted in place "

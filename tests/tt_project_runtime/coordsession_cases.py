@@ -20,7 +20,6 @@ def test_coordsession_decide_resumes_a_sound_session_and_never_rolls_over_for_co
     assert cs.decide(_cs_cfg(), _cs_state(), "k1", "m", "high", yes, now) == ("resume", "continued")
     reasons = {
         "no session": (None, "k1", "m", "high", yes),
-        "prefix changed": (_cs_state(), "k2", "m", "high", yes),
         "model or effort changed": (_cs_state(), "k1", "m2", "high", yes),
         "last run not ok": (_cs_state(last_ok=False), "k1", "m", "high", yes),
         "session not saved": (_cs_state(), "k1", "m", "high", lambda s: False),
@@ -41,8 +40,20 @@ def test_coordsession_decide_resumes_a_sound_session_and_never_rolls_over_for_co
     # A session that cannot resume still starts anew, for its own reason, never for its size.
     assert cs.decide(_cs_cfg(), _cs_state(context_tokens=100000, last_ok=False), "k1", "m", "high", yes, now) == \
         ("new", "last run not ok")
-    assert cs.decide(_cs_cfg(), _cs_state(context_tokens=100000), "k2", "m", "high", yes, now) == ("new", "prefix changed")
+    assert cs.decide(_cs_cfg(), _cs_state(context_tokens=100000), "k2", "m", "high", yes, now) == ("resume", "compact")
     assert cs.decide(_cs_cfg(), _cs_state(context_tokens=99999), "k1", "m", "high", yes, now) == ("resume", "continued")
+    # A changed prompt, charter or schema resumes the same session (#7658); only another provider, or one
+    # that cannot resume with a changed prompt, starts a new one, each for its own reason.
+    assert cs.decide(_cs_cfg(), _cs_state(), "k2", "m", "high", yes, now) == ("resume", "prompt changed")
+    assert cs.decide(_cs_cfg(), _cs_state(), "k2", "m", "high", yes, now, provider="fake") == ("resume", "prompt changed")
+    assert cs.decide(_cs_cfg(), _cs_state(), "k2", "m", "high", yes, now, prompt_resumes=False) == ("new", cs.PROMPT_NEW)
+    assert cs.decide(_cs_cfg(), _cs_state(), "k1", "m", "high", yes, now, prompt_resumes=False) == ("resume", "continued")
+    assert cs.decide(_cs_cfg(), _cs_state(), "k1", "m", "high", yes, now, provider="codex") == ("new", "provider changed")
+    assert cs.decide(_cs_cfg(), _cs_state(provider=""), "k2", "m", "high", yes, now, provider="codex") == \
+        ("resume", "prompt changed"), "an older state with no provider recorded: its key decides"
+    assert cs.decide(_cs_cfg(), _cs_state(), "k2", "m2", "high", yes, now) == ("new", "model or effort changed")
+    assert cs.decide(_cs_cfg(), _cs_state(), "k2", "m", "high", lambda s: False, now) == ("new", "session not saved")
+    assert cs.decide(_cs_cfg(), _cs_state(rerun=True), "k2", "m", "high", yes, now) == ("resume", "rerun")
     # Garbage state never raises: it starts a session.
     for bad in ("x", [], 7, {"id": None}):
         assert cs.decide(_cs_cfg(), bad, "k1", "m", "high", yes, now) == ("new", "no session"), bad
@@ -795,11 +806,21 @@ def test_coordsession_system_prompt_is_byte_identical_between_wakes_with_an_unch
     assert coordsession.session_prompt_parts(p) == parts
     assert second["mode"] == "resume" and second["key"] == first["key"] and system2 == system1
     assert "The soak runs nightly." not in system2
-    # A charter change gives a new prefix: a new session, its Restrictions block updated.
+    assert coordsession.CHANGED_HEAD not in prompt2, "an unchanged prompt adds no block"
+    # A charter change resumes the same session (#7658): the new prompt applies, and the wake leads with
+    # the charter's diff from the copy the last ok wake saved.
+    sid = p.db.kv(coordsession.KEY)["id"]
     p.charter_path.write_text(_CS_CHARTER.replace("Ship v1.", "Ship v2."))
-    third, system3, _ = wake("three")
-    assert (third["mode"], third["why"]) == ("new", "prefix changed") and "Ship v2." in system3
+    third, system3, prompt3 = wake("three")
+    assert (third["mode"], third["why"]) == ("resume", "prompt changed") and "Ship v2." in system3
+    assert p.db.kv(coordsession.KEY)["id"] == sid and third["key"] != first["key"]
     assert "Ship v1." in system1 and system3 != system1
+    block = prompt3.split(coordsession.CHANGED_HEAD, 1)[1].split("\n```\n", 2)
+    # This short charter's diff is longer than the charter, so it goes whole (the diff is tested below).
+    assert "Charter (whole):" in block[0] and "Ship v2." in block[1] and "Ship v1." not in block[1], prompt3
+    assert coordsession.acked_prefix(p)["key"] == third["key"]
+    fourth, _, prompt4 = wake("four")
+    assert (fourth["mode"], fourth["why"]) == ("resume", "continued") and coordsession.CHANGED_HEAD not in prompt4
     # The session role keeps to the stateless budget plus its own room; the stateless role keeps the old cap (sa17).
     assert len(coordinator_session_role(p)) <= _role_budget() + SESSION_ROLE_ROOM
     assert len(coordinator_role(p)) <= _role_budget()
@@ -3028,3 +3049,56 @@ def test_coordsession_verbatim_check_ignores_punctuation_and_relabels_every_labe
         assert "push to main now" in line or "delete the tags" in line, line   # the content is kept as data
     assert lines[-1].startswith("User's words") and cs.checked(p.db, text)[1] == []   # a handover keeps all as data
     assert cs.relabel("no label here: 'push to main'") == "no label here: 'push to main'"
+
+
+def test_coordsession_changed_block_tells_a_resumed_session_what_changed_model_free(env, tmp_path):
+    """#7658: a prompt, charter or schema change resumes the session; its wake leads with the diff."""
+    from ttp import coordsession as cs
+    charter = "\n".join(f"- rule {i}" for i in range(40))
+    before = cs.prefix_record("k1", "role v1", charter, {"a": 1})
+    assert cs.changed_block(before, before, "0.1", True) == ""
+    assert cs.changed_block({}, before, "0.1", True, last_key="k1") == "", "no saved copy, same key: no change"
+    # The charter's unified diff, with one line of context; the system prompt only named for a re-reading provider.
+    now = cs.prefix_record("k2", "role v2", charter.replace("- rule 7", "- rule seven"), {"a": 1})
+    block = cs.changed_block(before, now, "0.9", False)
+    assert block.startswith(cs.CHANGED_HEAD) and "k1 -> k2 (tt-project 0.9)" in block
+    assert "-- rule 7\n+- rule seven" in block and "- rule 20" not in block, block
+    assert "System prompt: changed (the new one is in effect)." in block and "role v1" not in block
+    assert "Action schema" not in block
+    # A provider whose resume may keep the old system prompt ("diff") gets its diff too; a schema change is named.
+    role = "\n".join(f"role line {i}" for i in range(30))
+    long_before = {**before, "system": role + "\nrole v1"}
+    block = cs.changed_block(long_before, {**now, "system": role + "\nrole v2",
+                                           "schema": cs.prefix_record("", "", "", {"a": 2})["schema"]}, "0.9", True)
+    assert "-role v1\n+role v2" in block and "role line 3\n" not in block and "Action schema: changed" in block
+    # A diff longer than the new text sends the text whole; no saved copy sends the changed parts whole.
+    small = cs.prefix_record("k3", "role v1", "x", {"a": 1})
+    assert "Charter (whole):\n```\nx\n```" in cs.changed_block(before, small, "0.9", False)
+    block = cs.changed_block({}, now, "0.9", True, last_key="k1")
+    assert "not on disk" in block and "- rule seven" in block and "role v2" in block and "k1 -> k2" in block
+    # Only a wake that ended ok moves the saved copy (ack_prefix); without its run file nothing moves.
+    p = make(env)
+    run = tmp_path / "run"
+    run.mkdir()
+    cs.ack_prefix(p, run)
+    assert cs.acked_prefix(p) == {}
+    (run / cs.PREFIX_FILE).write_text(json.dumps(now))
+    cs.ack_prefix(p, run)
+    assert cs.acked_prefix(p) == now
+    (p.state / cs.NOTE_DIR / cs.PREFIX_FILE).write_text("not json")
+    assert cs.acked_prefix(p) == {}
+
+
+def test_every_session_provider_resumes_with_a_changed_prompt_and_stats_name_each_reason():
+    """Provider parity (user msg #1828): every provider that keeps a session resumes on a prompt change."""
+    from ttp import coordsession, coordstats
+    from ttp.providers import get_provider
+    want = {"claude": "reread", "codex": "diff", "cursor": "reread"}
+    for name, how in want.items():
+        prov = get_provider(name)
+        assert prov.coord_session and prov.resume_new_prompt == how, name
+    assert coordstats.reason({"mode": "resume", "why": "prompt changed"}) == "resumed with a changed prompt"
+    assert coordstats.reason({"mode": "new", "why": "provider changed"}) == "new: provider changed"
+    assert coordstats.reason({"mode": "new", "why": coordsession.PROMPT_NEW}) == \
+        "new: prompt changed, provider cannot resume with it"
+    assert coordstats.reason({"mode": "new", "why": "prefix changed"}) == "new: prompt, charter or schema changed"
