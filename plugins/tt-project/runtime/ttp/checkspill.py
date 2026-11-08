@@ -82,7 +82,7 @@ checks it gets run (git and tar, and python3 with the checks environment for pyt
 its sign-in.
 
 A check whose command names a path of this machine (host_path: an absolute, `~` or `$HOME` path outside
-the system folders, such as a project's harness/bin script) cannot run on a spill host or a Slurm node, which
+the system folders, such as a project's own harness scripts) cannot run on a spill host or a Slurm node, which
 get a copy of the commit only, so it never spills either; it splits off to run here the same way.
 """
 from __future__ import annotations
