@@ -5221,9 +5221,17 @@ class Daemon:
         default_chat = note.get("default_chat")
         applied: list = []
         skip, on_action = self._coord_journal(r)
-        problems = coord.apply(self.p, actions, default_chat=default_chat, user_turn=coord.user_turn(db, note.get("messages") or []),
-                               turn=r.get("id"), messages=note.get("messages") or [], lean=self._lean_reap,
-                               applied=applied, skip_actions=skip, on_action=on_action)
+        try:
+            problems = coord.apply(self.p, actions, default_chat=default_chat,
+                                   user_turn=coord.user_turn(db, note.get("messages") or []),
+                                   turn=r.get("id"), messages=note.get("messages") or [], lean=self._lean_reap,
+                                   applied=applied, skip_actions=skip, on_action=on_action)
+        except (Exception, gitmemo.GitMiss, StopRequested):
+            # The live daemon left the apply (a round rolled back on a git miss, a stop, an error): no cut-off.
+            # Only a reap the process died in leaves "on" set for the next reap to count.
+            if on_action is not None:
+                on_action(None)
+            raise
         chaincap.clear_notices(db, float(r.get("started") or 0))   # this turn's digest showed them
         ids = note.get("messages", [])
         problems = list(problems)

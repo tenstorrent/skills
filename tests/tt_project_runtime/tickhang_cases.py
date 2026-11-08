@@ -443,3 +443,30 @@ def test_a_coordinator_turn_whose_run_dir_is_missing_writes_no_apply_journal(env
     dm.Daemon(p.base)._finish_coordinator({"dir": "gone"}, turn, "ok", {})
     assert _titles(p, "only") == [1]
     assert not (tmp_path / "gone").exists(), "the reap created a run dir to journal into"
+
+
+def test_a_finish_round_rolled_back_by_a_git_miss_is_never_counted_as_a_cut_off_action(env, tmp_path, monkeypatch):
+    from ttp import coordinator as coord
+    from ttp import daemon as dm
+    from ttp import gitmemo
+    p = make(env)
+    rid = _coordinator_run(p, tmp_path, _adds("before", "misses", "after"))
+    real, misses = coord.apply, []
+
+    def apply(*a, **kw):
+        inner = kw["on_action"]
+
+        def on(i):
+            inner(i)
+            if i == 1 and len(misses) < 2:   # a cold git cache in action 1, twice in one live reap
+                misses.append(i)
+                raise gitmemo.GitMiss(["git", "-C", str(p.base), "rev-parse", "HEAD"], {"capture_output": True},
+                                      None, True, "miss", True)
+        return real(*a, **{**kw, "on_action": on})
+    monkeypatch.setattr(coord, "apply", apply)
+    dm.Daemon(p.base).reap_runs()
+    assert misses == [1, 1]
+    assert p.db.one("SELECT status FROM runs WHERE id=?", (rid,))["status"] == "ok"
+    assert _titles(p, "before", "misses", "after") == [1, 1, 1], "a rolled-back round lost an action"
+    assert not any("cut off twice" in x for x in p.db.kv(coord.REJECTED_KEY, []))
+    assert not json.loads((tmp_path / "coord-run" / dm.COORD_JOURNAL).read_text()).get("cuts")
