@@ -1691,7 +1691,8 @@ def status_text(p: Project, verbose: bool = False) -> str:
     from . import screen as scr
     for m in scr.mutes(db, now):
         lines.append(f"muted: {scr.mute_line(m, now, p)}")
-    if h.get("host") and (verbose or re.search(r": [1-9]\d* lost", h["host"])):   # runs a reboot lost: always
+    if h.get("host") and (verbose or re.search(r" [1-9]\d* not restarted|\$(?!0\.00 )[\d.]+ of work lost", h["host"])):
+        # runs a reboot cut short that nothing restarted, or whose work was not kept: always
         lines.append(h["host"])
     if h.get("idle_sleep"):
         lines.append(h["idle_sleep"])
@@ -6495,9 +6496,9 @@ def cmd_broker_released(a) -> None:
 
 
 def cmd_sandbox(a) -> None:
-    """Run one command in a process sandbox (sandbox.py): its own PID namespace and /proc, so it
-    cannot see or signal any other process on the host, and nothing it started outlives it. Where
-    the host allows no sandbox it runs as it is and says why. Exits with the command's code."""
+    """Run one command as it is, by default (a pass-through; the tool hook's refusals apply to it as to
+    any command). Where the project turned the process sandbox on (sandbox.py, sandbox.checks) it runs
+    in its own PID namespace and /proc instead, or as it is with a line why. Exits with the command's code."""
     from . import sandbox
     cmd = a.cmd[1:] if a.cmd[:1] == ["--"] else a.cmd
     if not cmd:
@@ -12835,8 +12836,8 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("cmd", nargs=argparse.REMAINDER, help="the shard's command, after --")
     s.set_defaults(fn=cmd_pool_shard)
 
-    s = sub.add_parser("sandbox", help="run a command (a test suite); in its own PID namespace only where the project "
-                                       "turned it on (sandbox.checks) or, under TTP_NO_DEVICE=1, to hide device nodes")
+    s = sub.add_parser("sandbox", help="run a command as it is (a pass-through, by default); in its own PID namespace only "
+                                       "where the project turned it on (sandbox.checks)")
     s.add_argument("cmd", nargs=argparse.REMAINDER, help="the command, after --")
     s.set_defaults(fn=cmd_sandbox)
 

@@ -20,6 +20,25 @@ def refusal(cmd):
     return "wiping scratch is not allowed here" if "wipe-scratch" in cmd else None
 ```
 
+## Device refusals
+
+Device safety is no sandbox. Under `TTP_NO_DEVICE=1` on a host tagged `device` the built-in hook
+refuses reset, flash and power tools, device node paths and changes to the `TT_VISIBLE_DEVICES` mask
+outside a device `ttp lock` (refused itself on a held or paused device) or `ttp devq`. A project adds
+its own device commands here, keyed only on what it holds (`TTP_NO_DEVICE`), never on a machine's
+neighbours, serving state or site:
+
+```python
+# guards/no_board_tool.py
+import os, re
+
+def refusal(cmd):
+    if os.environ.get("TTP_NO_DEVICE") == "1" and re.search(r"\bmy-board-tool\b", cmd) \
+            and not re.search(r"\bttp (lock \S*-device|devq)\b", cmd):
+        return "my-board-tool reaches a device: run it under `ttp lock <device> --`"
+    return None
+```
+
 ## What the harness does
 
 - The worker hook (`hook.pre_tool_use`) asks the listed guards after the built-in guards, as does a

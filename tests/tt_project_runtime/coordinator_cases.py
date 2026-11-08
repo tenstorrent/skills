@@ -8662,7 +8662,7 @@ def test_a_reboot_is_recorded_with_the_runs_it_cut_and_the_locks_held(env, tmp_p
     assert len(note) == 1 and note[0]["severity"] == "normal", note
     assert "1st reboot in 24 h" in note[0]["text"] and "board: task #7" in note[0]["text"], note
     from ttp import timefmt
-    line = f"host: 1 reboot in 24 h (last {timefmt.short(booted, p)}), 2 runs cut short: 2 lost ($53.00), 0 resumed with work kept ($0.00)"
+    line = f"host: 1 reboot in 24 h (last {timefmt.short(booted, p)}), 2 runs cut short: 1 resumed (0 with work kept, $0.00), 1 not restarted, $53.00 of work lost"
     assert health(p, p.db)["host"] == line
     assert line in status_text(p).splitlines()
     digest = coord.digest(p, {}, [], [])

@@ -86,7 +86,6 @@ def test_loopproxy_claude_worker_env_names_the_script(monkeypatch):
     from ttp.providers.claude import Claude
     monkeypatch.delenv("CLAUDE_ENV_FILE", raising=False)
     monkeypatch.setattr(Claude, "supports", lambda self, flag: False)
-    monkeypatch.setattr(Claude, "hook_rewrites", lambda self: False)
     for read_only in (False, True):
         _, env = Claude().build(role="worker", model="m", effort="high", cwd="/tmp", budget_usd=1.0,
                                 read_only=read_only, schema=None, restrictions={})

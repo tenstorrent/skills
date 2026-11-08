@@ -1005,8 +1005,6 @@ def tend(p: Project) -> None:
                         cmd, env = list(m["command"]), _job_env(m.get("env"))
                         if isinstance(m.get("bound"), dict):   # a check's: recorded first, so a crash leaves no unbounded job
                             write_json(p.state / BOUND / q.name, {**m["bound"], "rc": str(rc)})
-                            from . import sandbox   # a CPU-only check's job sees no device node, as the check did
-                            cmd = sandbox.wrap(cmd, True, {k: v for k, v in env.items() if k != sandbox.ENV})
                         pid = start(rc, log, cmd, m["cwd"], env, lock)
                         renice(pid, nice_level(p.config().get("runner"))[0])
                         from .runner import boot_id

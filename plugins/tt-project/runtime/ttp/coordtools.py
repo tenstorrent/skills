@@ -27,8 +27,7 @@ not compared, as the daemon writes it all the time: only the command-text refusa
 at run time is refused again at run time: `ttp push` (cli.cmd_push) and the harness's git
 wrapper (gitguard.main) refuse a landing or any `git push` in a coordinator run (coordinator_run: FULL_ENV,
 or ROLE_ENV, which the daemon sets for every run). A coordinator run also holds no device
-(TTP_NO_DEVICE=1), so the worker device-run rule binds it; hook_settings sets no hook.HOOK_REWRITE, so
-a device test run is denied with the `ttp sandbox` form as its hint, never rewritten (heavy device work
+(TTP_NO_DEVICE=1), so the worker device-command refusals (hook.device_command) bind it (heavy device work
 goes to a worker). Event text stays untrusted data (later hardening: #6095, #6098). A stateless turn
 (a provider with no session) never gets them.
 

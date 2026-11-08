@@ -212,12 +212,14 @@ read the one for the lever you change.
   the lists per repo with the `ttp_device_fixtures` / `ttp_device_markers` ini keys or the `TTP_DEVICE_FIXTURES` /
   `TTP_DEVICE_MARKERS` variables (comma-separated).
 - Do not rely on `-m 'not device'` alone: a marker the repo does not define deselects nothing.
-- `TT_VISIBLE_DEVICES` only asks: a raw open or reset code still reaches the device. Under
-  `TTP_NO_DEVICE=1`, `ttp sandbox` also hides the device nodes (an empty tmpfs over
-  `/dev/tenstorrent`), and on a host tagged `device` the worker hook refuses pytest and ctest runs
-  outside it. On a Claude Code that applies a hook's rewritten input, a test run that is the
-  command's last part (after `;`, `&&`, `||` or a new line) is run as `ttp clip -- ttp sandbox -- <cmd>`
-  instead, with a one-line note. A power command sent over the network to a board management controller is not stopped.
+- Nothing runs in a namespace sandbox by default: tests run as they are. `TT_VISIBLE_DEVICES` only
+  asks, so under `TTP_NO_DEVICE=1` on a host tagged `device` the tool hook refuses device commands
+  outside a device `ttp lock` (itself refused on a held or paused device) or `ttp devq`: reset, flash
+  and power tools (`tt-smi` resets, `tt-flash`, `tt-topology`, `ipmitool power`),
+  a path under `/dev/tenstorrent` (listing it with `ls` or `stat` passes), and a change to the mask
+  (`TT_VISIBLE_DEVICES=`, `unset`, `env -u`, `env -i`), also behind `sudo`, wrappers and `sh -c`.
+  It guards against accidents: code that opens a device from a script or inline code is not read.
+  Add project-specific refusals in project.json `guards.local` (references/local-guards.md).
 
 ## Test runs never reach other processes
 
@@ -232,8 +234,8 @@ read the one for the lever you change.
   `flock -n` (`ttp detach --check <dir>` reads `<dir>/lock` so), or is started with `ttp detach`,
   which a check hands to the daemon. A gate that yields (exit 75) writes its exit code and stays
   queued, never deleted as dead.
-- Run other test commands the same way: `ttp sandbox -- <command>` (a plain run unless the project
-  turned the sandbox on, or `TTP_NO_DEVICE=1` hides the device nodes).
+- `ttp sandbox -- <command>` stays for existing configs: a plain run unless the project turned the
+  sandbox on.
 - A reaper or cleanup script signals only processes it can prove are this project's: `TTP_PROJECT`
   (the full path of `<root>/tt-project`) or a `TTP_RUN_DIR` inside it, or its own run record with pid
   and start time. Never by a task or run id in an env, command line, run folder name or log: ids

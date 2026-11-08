@@ -1,10 +1,12 @@
 """A process sandbox for check and test commands: `ttp sandbox -- <cmd...>`, and every check the
 runtime runs (push.check_argv).
 
-Off by default: commands run as they are, unsandboxed, and see the host's processes, network and sudo.
-A project turns it on with project.json `sandbox.checks: true` (the daemon passes TTP_SANDBOX_CHECKS=1 to
-its runs and checks). One case stays on by default, the device gate: a run that holds no device
-(TTP_NO_DEVICE=1) on a host with device nodes still runs its commands in the sandbox that hides them.
+Off by default, with no exception: commands run as they are, unsandboxed, and see the host's processes,
+network and sudo, and `ttp sandbox -- <cmd>` is a plain pass-through. A project turns it on with
+project.json `sandbox.checks: true` (the daemon passes TTP_SANDBOX_CHECKS=1 to its runs and checks).
+Device safety is no sandbox: a run that holds no device (TTP_NO_DEVICE=1) gets the TT_VISIBLE_DEVICES
+mask and the tool hook refuses its device commands outside a device `ttp lock` or `ttp devq`
+(hook.device_command); a project adds its own refusals in guards.local.
 
 When on, the command runs in a PID namespace of its own with a private /proc, so it sees only its own process
 tree: a kill, pkill or os.kill aimed at any other pid on the host reaches nothing, and every process
@@ -13,7 +15,7 @@ are. It needs unprivileged user namespaces and util-linux `unshare` or bubblewra
 neither works (a sysctl or AppArmor setting, a missing tool, not Linux) commands run as before and
 `notice` says why, once per run. A command already in a sandbox runs as it is.
 
-Under `TTP_NO_DEVICE=1` (a run that holds no device) the device driver's nodes
+In a sandbox the project turned on, under `TTP_NO_DEVICE=1` (a run that holds no device) the device driver's nodes
 (machines.device_nodes()) are hidden too: an empty tmpfs over each that exists (bwrap --tmpfs; under
 unshare, sandbox_init mounts it in the namespace's own mounts and then drops the capabilities), so a
 raw open, or reset code that ignores TT_VISIBLE_DEVICES, finds no device. A sandbox nested in one
@@ -164,11 +166,11 @@ def _visible(paths: list[str]) -> bool:
 
 
 def wrap(argv: list[str], on: bool = True, env: dict | None = None) -> list[str]:
-    """`argv` run in a sandbox where one works, `on`, and the project opted in (opted_in) or device
-    nodes must be hidden (device_nodes); as it is otherwise or when already in one that hides what this
-    run must not see. `env` is the command's environment (default this process's)."""
+    """`argv` run in a sandbox where one works, `on`, and the project opted in (opted_in), hiding the
+    device nodes there (device_nodes); as it is otherwise, by default, or when already in one that hides
+    what this run must not see. `env` is the command's environment (default this process's)."""
     hide = device_nodes(env) if on else []
-    if not on or not (hide or opted_in(env)) or (inside() and not _visible(hide)):
+    if not on or not opted_in(env) or (inside() and not _visible(hide)):
         return list(argv)
     pre, _ = status()
     if not pre:
@@ -183,8 +185,8 @@ def wrap(argv: list[str], on: bool = True, env: dict | None = None) -> list[str]
 
 def notice(on: bool = True) -> str:
     """One line for a run's output when its commands run without the sandbox it should have; "" when
-    they run in one, or by default (the project did not opt in and no device nodes are to be hidden)."""
-    if not opted_in() and not device_nodes():
+    they run in one, or by default (the project did not opt in)."""
+    if not opted_in():
         return ""
     if not on:
         return ("sandbox off (\"sandbox\": false): this check sees and can signal every process of "
@@ -199,8 +201,9 @@ def notice(on: bool = True) -> str:
 
 
 def run(argv: list[str]) -> int:
-    """`ttp sandbox -- <cmd...>`: run `argv` sandboxed and return its exit code. A SIGTERM or SIGHUP
-    to this process (a `timeout`, a closed terminal) ends the whole namespace. A pytest run's xdist
+    """`ttp sandbox -- <cmd...>`: run `argv` and return its exit code; by default it runs as it is (a
+    pass-through: existing configs that call it keep working), in a sandbox only where the project
+    turned one on. A SIGTERM or SIGHUP to this process (a `timeout`, a closed terminal) ends the whole namespace. A pytest run's xdist
     options are dropped where xdist is not installed (testslots.drop_xdist). The command gets the
     account's leak-pattern file by path (leakfile), as checks do."""
     from . import leakfile, testslots

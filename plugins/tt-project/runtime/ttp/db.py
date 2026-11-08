@@ -990,6 +990,12 @@ END""")
             for x in b.get("lost") or []:
                 if isinstance(x, dict) and "run" in x:
                     x["kept"] = int(x["run"]) in kept
+                    # Restarted: a later run of its task (a coordinator turn: a later turn) ran, fresh or resumed.
+                    x["restarted"] = x["kept"] or bool(self.one(
+                        "SELECT id FROM runs WHERE id>? AND task=? LIMIT 1", (int(x["run"]), x["task"]))
+                        if x.get("task") else self.one(
+                        "SELECT id FROM runs WHERE id>? AND role='coordinator' LIMIT 1", (int(x["run"]),))
+                        if x.get("role") == "coordinator" else None)
         return out
 
     def resumed_run_ids(self, after_id: int) -> set[int]:
@@ -1295,14 +1301,16 @@ def unplanned_abrupt(boot: dict) -> bool:
 
 
 def host_line(boots: list[dict], where=None) -> str:
-    """'host: N reboots in 24 h (K planned: by <project>) (last HH:MM <zone>), M runs cut short: L lost
-    ($A), K resumed with work kept ($B)' for the boots of the last day, as DB.boots returns them, in
-    the home zone `where`; '' when there were none. A run a later run resumed kept its work."""
+    """'host: N reboots in 24 h (K planned: by <project>) (last HH:MM <zone>), M runs cut short: R resumed
+    (K with work kept, $B), L not restarted, $A of work lost' for the boots of the last day, as DB.boots
+    returns them, in the home zone `where`; '' when there were none. A run a later run resumed kept its
+    work; one a later run of its task followed was restarted."""
     if not boots:
         return ""
     runs = [x for b in boots for x in b.get("lost") or [] if isinstance(x, dict)]
     kept = [x for x in runs if x.get("kept")]
-    gone = [x for x in runs if not x.get("kept")]
+    gone = [x for x in runs if not x.get("kept") and not x.get("restarted")]
+    resumed = len(runs) - len(gone)
     kept_usd = sum(float(x.get("usd") or 0) for x in kept)
     lost_usd = max(0.0, sum(float(b.get("lost_usd") or 0) for b in boots) - kept_usd)
     planned = [b for b in boots if b.get("planned")]
@@ -1314,7 +1322,8 @@ def host_line(boots: list[dict], where=None) -> str:
     return (f"host: {len(boots)} reboot{'' if len(boots) == 1 else 's'} in 24 h"
             + (f" ({len(planned)} planned" + (f": by {', '.join(by)}" if by else "") + ")" if planned else "")
             + f" (last {last}), {n} run{'' if n == 1 else 's'} cut short"
-            + (f": {len(gone)} lost (${lost_usd:.2f}), {len(kept)} resumed with work kept (${kept_usd:.2f})" if n else ""))
+            + (f": {resumed} resumed ({len(kept)} with work kept, ${kept_usd:.2f}), {len(gone)} not restarted, "
+               f"${lost_usd:.2f} of work lost" if n else ""))
 
 
 def chat_floor(chat_min: str | None, project_min: str | None) -> str:

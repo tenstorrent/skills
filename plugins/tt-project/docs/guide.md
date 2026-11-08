@@ -52,9 +52,17 @@ sent. A failure to read replies is reported on stderr and never stops the messag
   is retried without spending an attempt and is not counted as waste. After a wake, nothing new
   starts until the host has been awake for `budget.wake_settle_s` (default 300 s), so a laptop's
   brief maintenance wakes start nothing. Messages from people are still answered at once.
-  A run a reboot, a sleep or a lost supervisor cut short after real progress
-  (`budget.resume_lost`, default $0.50 or 10 min) continues its agent session in the same
-  working directory with a short prompt, instead of starting over.
+  A run a reboot cut short, or whose process died without a result (a crash), continues its agent
+  session in the same working directory with a short prompt, instead of starting over, and spends
+  no attempt (a second crash in a row counts one). A run a sleep or the network cut short does so
+  after real progress (`budget.resume_lost`, default $0.50 or 10 min; `false` turns resumes off).
+  After a reboot the daemon also starts again, once per boot and model-free, a task's own detached
+  `ttp checks` and a review's precheck (only while that review is open), on the same head and at
+  their old place in the host's checks queue. A task deferred since its hand-off (`start_when`,
+  `start_after`) gets nothing restarted; its start gate decides. A resumable `ttp detach` job is
+  relaunched even after a probe marked it lost to the reboot, or when the wait is `survives_reboot`;
+  each relaunch not made says why in daemon.log. The Host line counts runs cut short as resumed
+  (restarted, with or without their work) or not restarted.
   A task lost to `budget.max_reboot_losses` abrupt reboots is blocked, as it may cause them. So is,
   at once, a task whose run or detached job held a `ttp lock` resource of this host (a device, a
   machine; not a push lock) when the host went down abruptly: the coordinator requeues it once the
@@ -564,9 +572,9 @@ only in the feed and never under "needs you".
   check covers it. Any raw `git push` and any `ttp push` that lands or moves a tag is denied, by the hook and again
   at run time by `ttp push` and the harness's `git` wrapper: code goes through a work branch, a
   worker task, review and the push queue, and a channel tag moves only in a release cut task. A
-  coordinator run holds no device (`TTP_NO_DEVICE=1`), so the worker device-run rule binds it: a
-  device test run outside `ttp sandbox` is denied with the sandboxed form as its hint, never
-  rewritten as a worker's is, since heavy device work goes to a worker task. A
+  coordinator run holds no device (`TTP_NO_DEVICE=1`), so the worker device-command refusals bind
+  it: a reset, flash or power tool, a device node path or a change to the device mask outside a
+  device `ttp lock` or `ttp devq` is denied, since heavy device work goes to a worker task. A
   foreground command stops at `tool_timeout_s` (300, at most 600); a longer or background one is
   denied with a pointer to `ttp detach` or a worker task. Each mutating call (the command or file,
   its exit code) goes to the run's `tool-audit.jsonl` and `progress.md`, which the web run view

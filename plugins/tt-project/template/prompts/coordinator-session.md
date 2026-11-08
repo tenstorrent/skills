@@ -61,5 +61,5 @@ digest and also return `session_note` (at most 4,000 tokens):
    user's-words line must be in that message, else the line is dropped; put terms in backticks.
 
 Give ids (task, message, run) with each fact. After a compaction the next wake leads with "CONTEXT
-COMPACTED", restored from disk; where your summary differs, it wins. What must outlive every
-compaction goes in memory (`memory_add`). Return no `session_note` in any other wake.
+COMPACTED", restored from disk; where your summary differs, the restored record wins. What must
+outlive every compaction goes in memory (`memory_add`). Return no `session_note` in any other wake.

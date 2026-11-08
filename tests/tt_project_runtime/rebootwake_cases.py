@@ -277,3 +277,145 @@ def test_a_reboot_wakes_a_run_folder_script_wait_only_when_its_script_probes_tra
     _waiting_from_before_the_boot(p, tid, job=False, retry_when=str(_probe_script(run_dir, how)))
     _boot_daemon(p)
     assert _woken(p, tid) is wakes, dict(p.db.task(tid))
+
+
+def _precheck_killed_by_reboot(p, tmp_path, tid):
+    """A review precheck of code task tid (state/prechecks/t<tid>-<head12>) that the reboot killed, and the
+    open review that reads it. Returns (its folder, the review's id)."""
+    from ttp import cli
+    from ttp.daemon import PRECHECKS_DIR
+    wt, run_dir = _checks_killed_by_reboot(p, tmp_path, tid)
+    p.db.update_task(tid, not_before=None, result="{}")   # only the precheck runs: the task waits on nothing
+    info = json.loads((run_dir / cli.CHECKS_PID).read_text())
+    out = p.state / PRECHECKS_DIR / f"t{tid}-{info['head'][:12]}"
+    out.mkdir(parents=True)
+    (out / cli.CHECKS_PID).write_text(json.dumps({**info, "arrived": info["ts"] - 60}))
+    rid = p.db.add_task("review", "r", kind="review", labels=[f"precheck:{out.name}"])
+    return out, rid
+
+
+def _record_starts(monkeypatch, d):
+    starts = []
+    monkeypatch.setattr(d, "_start_checks", lambda path, out, run_id, tid, extra, arrived=None:
+                        starts.append((out, run_id, arrived)) or True)
+    return starts
+
+
+def test_a_review_precheck_a_reboot_killed_restarts_once_at_its_old_queue_place(env, tmp_path, monkeypatch):
+    from ttp.daemon import Daemon
+    p = make(env)
+    tid = p.db.add_task("feature", "s", kind="code", tier="light", origin="user")
+    p.db.update_task(tid, status="review")
+    out, _ = _precheck_killed_by_reboot(p, tmp_path, tid)
+    arrived = json.loads((out / "checks.pid").read_text())["arrived"]
+    d = Daemon(p.base)
+    d.boot_at = time.time() - 300
+    starts = _record_starts(monkeypatch, d)
+    d.wake_after_reboot()
+    assert starts == [(out, f"precheck-{out.name}", arrived)], starts
+    assert len(p.db.q("SELECT id FROM events WHERE fingerprint LIKE ?", (f"precheck_relaunched:{out.name}:%",))) == 1
+    again = Daemon(p.base)   # a daemon restart within the same boot starts nothing again
+    again.boot_at = d.boot_at
+    starts2 = _record_starts(monkeypatch, again)
+    again.wake_after_reboot()
+    assert starts2 == [], starts2
+
+
+def test_a_precheck_whose_review_was_cancelled_stays_stopped_after_a_reboot(env, tmp_path, monkeypatch):
+    from ttp.daemon import Daemon
+    p = make(env)
+    tid = p.db.add_task("feature", "s", kind="code", tier="light", origin="user")
+    out, rid = _precheck_killed_by_reboot(p, tmp_path, tid)
+    p.db.update_task(rid, status="cancelled")
+    d = Daemon(p.base)
+    d.boot_at = time.time() - 300
+    starts = _record_starts(monkeypatch, d)
+    d.wake_after_reboot()
+    assert starts == [] and not p.db.q("SELECT id FROM events WHERE kind='checks_relaunched'")
+
+
+def test_relaunched_task_checks_keep_their_place_in_the_host_queue(env, tmp_path, monkeypatch):
+    from ttp.daemon import Daemon
+    p = make(env)
+    tid = p.db.add_task("feature", "s", kind="code", tier="light", origin="user")
+    wt, run_dir = _checks_killed_by_reboot(p, tmp_path, tid)
+    ts = json.loads((run_dir / "checks.pid").read_text())["ts"]
+    d = Daemon(p.base)
+    d.boot_at = time.time() - 300
+    starts = _record_starts(monkeypatch, d)
+    d.wake_after_reboot()
+    assert starts == [(run_dir, f"relaunch-t{tid}", ts)], starts
+    assert len(_relaunches(p, tid)) == 1
+
+
+def test_a_run_whose_process_died_restarts_once_free_then_counts(env, tmp_path, monkeypatch):
+    # A supervisor that died on this boot (crash, OOM kill): the first loss requeues with no attempt and
+    # resumes the session; a second loss in a row counts an attempt, so a crash loop still ends.
+    from ttp.daemon import Daemon
+    p = make(env)
+    _sessions(env, monkeypatch, "s")
+    d = Daemon(p.base)
+    tid = p.db.add_task("crashy", "s", kind="work", tier="light", origin="user")
+    _lost_with_session(p, d, tmp_path, tid, name="a", session="s", boot=None)
+    t = p.db.task(tid)
+    assert t["attempts"] == 0 and t["status"] == "queued", t
+    assert d._resumable(t, "fake")["cause"] == "crash"
+    _lost_with_session(p, d, tmp_path, tid, name="b", session="s", boot=None)
+    assert p.db.task(tid)["attempts"] == 1
+
+
+def test_a_deferred_tasks_killed_checks_and_jobs_are_not_relaunched(env, tmp_path, monkeypatch):
+    # A task deferred after its hand-off (start_when) waits on its start gate: the checks and resumable
+    # jobs the reboot killed are not started for it (no host checks slot taken), and it is not woken.
+    from ttp.daemon import Daemon
+    p = make(env)
+    chk = p.db.add_task("checks", "s", kind="code", tier="light", origin="user")
+    _checks_killed_by_reboot(p, tmp_path, chk)
+    job = p.db.add_task("job", "s", kind="work", tier="light", origin="user")
+    rc, counter = _resumable_job_cut_by_reboot(p, tmp_path, job)
+    for tid in (chk, job):
+        p.db.update_task(tid, labels=json.dumps(["start_when:test -e /nonexistent/gate"]))
+    d = Daemon(p.base)
+    d.boot, d.boot_at = "a-later-boot", time.time() - 300
+    starts = _record_starts(monkeypatch, d)
+    d.wake_after_reboot()
+    assert starts == [] and not _relaunches(p, chk)
+    assert not _job_relaunches(p, job) and counter.read_text().split() == ["run"]
+    for tid in (chk, job):
+        assert not _woken(p, tid) and p.db.task(tid)["not_before"], dict(p.db.task(tid))
+    assert "deferred" in (p.logs / "daemon.log").read_text()
+
+
+def test_a_resumable_job_a_probe_marked_lost_to_the_reboot_is_relaunched(env, tmp_path):
+    # A probe or status read marked the job .lost with the reboot as its reason before the daemon's boot
+    # pass ran (or with a clock that puts it before boot_at): still the reboot's cut, so it relaunches.
+    from ttp import detach
+    p = make(env)
+    tid = p.db.add_task("soak", "s", kind="work", tier="light", origin="user")
+    rc, counter = _resumable_job_cut_by_reboot(p, tmp_path, tid)
+    lost = detach.lost(rc)
+    lost.write_text("the driver died with the host reboot: the host restarted while it ran (its boot id changed)")
+    os.utime(lost, (time.time() - 3600, time.time() - 3600))
+    _boot_daemon(p)
+    assert not _woken(p, tid) and len(_job_relaunches(p, tid)) == 1
+    assert _wait_for_path(rc) and counter.read_text().split() == ["run", "run"]
+
+
+def test_a_survives_reboot_wait_still_relaunches_its_local_resumable_job(env, tmp_path):
+    p = make(env)
+    tid = p.db.add_task("soak", "s", kind="work", tier="light", origin="user")
+    rc, counter = _resumable_job_cut_by_reboot(p, tmp_path, tid)
+    prev = json.loads(p.db.task(tid)["result"])
+    p.db.update_task(tid, result=json.dumps({**prev, "survives_reboot": True}))
+    _boot_daemon(p)
+    assert not _woken(p, tid) and len(_job_relaunches(p, tid)) == 1
+    assert _wait_for_path(rc) and counter.read_text().split() == ["run", "run"]
+
+
+def test_each_skipped_job_relaunch_says_why_in_the_daemon_log(env, tmp_path):
+    p = make(env)
+    tid = p.db.add_task("plain", "s", kind="work", tier="light", origin="user")
+    _resumable_job_cut_by_reboot(p, tmp_path, tid, resumable=False)
+    _boot_daemon(p)
+    text = (p.logs / "daemon.log").read_text()
+    assert f"task {tid}: detached jobs job not relaunched: detached job job is not resumable" in text, text[-2000:]
