@@ -18,8 +18,10 @@ tier of an escalated wake that does run (the hand-off asked for the task's own t
   wake_tier) once it finds real work. Jev off, unreachable or unsure: the wake's tier, as before.
 - Anything else: the wake's tier.
 
-Each Jev call is settled when its run ends: a light pick whose run asked for more is wrong, so
-jevuse.review switches the use off when it does not pay.
+A light pick books as avoided the measured mean cost of a wake at its from-tier less a light wake
+(tier_cost; LIGHT_SHARE of jevuse's fallback price per tier step while either is unmeasured), so
+jevuse.review keeps the use on while it pays. Each Jev call is settled when its run ends: a light pick
+whose run asked for more is wrong, and its avoided cost becomes minus the light run it added.
 """
 from __future__ import annotations
 
@@ -39,6 +41,7 @@ JUDGE = frozenset({"spec_change"})
 KINDS = FIX | JUDGE | {"timer", "probe_passed", "probe_changed", "wake_now", "checks_gone",
                        "stale_release", "reboot", "other"}
 DEFAULT_LIGHT_BELOW = 0.3
+LIGHT_SHARE = 0.25            # a light wake's price as a share of a standard one while unmeasured
 JEV_TIMEOUT_S = 10.0
 
 
@@ -57,6 +60,35 @@ def _light_below(cfg: dict) -> float:
                                                                           DEFAULT_LIGHT_BELOW))
     except (TypeError, ValueError, AttributeError):
         return DEFAULT_LIGHT_BELOW
+
+
+def tier_cost(db: DB, cfg: dict, tier: str, now: float | None = None) -> float | None:
+    """The mean cost of a finished task wake at `tier` over jevuse's window (its run note's wake), or
+    None while none was measured."""
+    import json as _json
+    now = time.time() if now is None else now
+    got = []
+    for r in db.q("SELECT cost_usd, note FROM runs WHERE role!='coordinator' AND status!='running' AND cost_usd>0 "
+                  "AND started>=? AND note LIKE '%\"wake\"%' ORDER BY id DESC LIMIT 500", (now - jevuse.window_s(cfg),)):
+        try:
+            if (_json.loads(r["note"] or "{}").get("wake") or {}).get("tier") == tier:
+                got.append(float(r["cost_usd"]))
+        except (ValueError, TypeError, AttributeError):
+            continue
+    return sum(got) / len(got) if got else None
+
+
+def _fallback(tier: str) -> float:
+    """An unmeasured wake's price: jevuse's fallback for standard, LIGHT_SHARE of it per tier below,
+    and as much again per tier above."""
+    step = bud.TIER_ORDER.index(tier) - bud.TIER_ORDER.index("standard") if tier in bud.TIER_ORDER else 0
+    return jevuse.WAKE_COST_FALLBACK_USD * (LIGHT_SHARE ** -step if step < 0 else 1 + step)
+
+
+def avoided(db: DB, cfg: dict, tier: str, now: float | None = None) -> float:
+    """What a light wake saves against one at `tier`: their measured mean costs, else the fallbacks."""
+    hi, lo = tier_cost(db, cfg, tier, now), tier_cost(db, cfg, bud.TIER_ORDER[0], now)
+    return max(0.0, (hi if hi is not None else _fallback(tier)) - (lo if lo is not None else _fallback(bud.TIER_ORDER[0])))
 
 
 def pick(db: DB, cfg: dict, task: dict, prev: dict, jev=None, now: float | None = None) -> dict | None:
@@ -92,7 +124,8 @@ def pick(db: DB, cfg: dict, task: dict, prev: dict, jev=None, now: float | None 
         return None
     light = score < _light_below(cfg)
     call = jevuse.record(db, USE, {"task": task["id"], "judgment": round(score, 2), "light": light},
-                         getattr(jev, "last_cost", 0.0), ref=f"task:{task['id']}", changed=light,
+                         getattr(jev, "last_cost", 0.0), avoided(db, cfg, tier, now) if light else 0.0,
+                         ref=f"task:{task['id']}", changed=light,
                          settle_s=None, now=now)
     if not light:
         return None
@@ -114,7 +147,11 @@ def settle(db: DB, note: dict, result: dict, now: float | None = None) -> None:
         return
     more = (isinstance(result, dict) and result.get("status") == "waiting"
             and str(result.get("retry_after_s")) in ("0", "0.0") and result.get("wake_tier") in bud.TIER_ORDER[1:])
-    jevuse.resolve(db, int(got["call"]), not more, "its light run asked for more" if more else "", now)
+    if jevuse.resolve(db, int(got["call"]), not more, "its light run asked for more" if more else "", now) and more:
+        # the light run it added is extra cost: a negative saving still counts against the use
+        lo = tier_cost(db, {}, bud.TIER_ORDER[0], now)
+        db.x("UPDATE jev_calls SET avoided_usd=? WHERE id=?",
+             (-(lo if lo is not None else _fallback(bud.TIER_ORDER[0])), int(got["call"])))
 
 
 def stats(db: DB, tz: str, days: float = 7, now: float | None = None) -> dict:

@@ -815,10 +815,35 @@ def test_a_spec_change_wake_runs_light_when_jev_finds_no_judgment_needed(env, mo
     assert call["ref"] == f"task:{tid}"
     if tier == "light":
         assert wake["pick"]["from"] == "standard" and wake["pick"]["call"] == call["id"]
+        assert call["avoided_usd"] > 0 and call["changed"] == 1, "a light pick books the wake it saved"
         assert _run_until(d, p, lambda: runs() == 3), "the light run's ask for more did not run it again"
-        assert p.db.one("SELECT outcome FROM jev_calls WHERE id=?", (call["id"],))["outcome"] == "wrong", \
-            "a light run that asked for more settles Jev's pick as wrong"
+        got = p.db.one("SELECT outcome, avoided_usd FROM jev_calls WHERE id=?", (call["id"],))
+        assert got["outcome"] == "wrong", "a light run that asked for more settles Jev's pick as wrong"
+        assert got["avoided_usd"] < 0, "the extra light run counts against the use"
+    else:
+        assert call["avoided_usd"] == 0 and call["changed"] == 0, "a kept tier saves nothing"
         assert _last_wake(p, tid)["tier"] == "standard"
+
+
+def test_the_wake_tier_jev_use_stays_on_while_its_light_picks_settle_right(env):
+    """Review #7542: a light pick books the measured cost of a wake at its from-tier less a light one
+    (fallback prices while unmeasured), so jevuse.review keeps wake_tier on after min_calls right picks."""
+    from ttp import jevuse, waketier
+    p = make(env)
+    cfg = p.config()
+    tid = p.db.add_task("t", "s", kind="work", tier="standard", origin="user")
+    prev = {"status": "waiting", "retry_when": "exit 1", "escalated_wake": True, "wake_tier": "standard",
+            waketier.KEY: "spec_change"}
+    for _ in range(jevuse.min_calls(cfg)):
+        got = waketier.pick(p.db, cfg, p.db.task(tid), prev, jev=_TierJev(0.0))
+        waketier.settle(p.db, {"wake": {"pick": got}}, {"status": "done"})
+    assert jevuse.review(p.db, cfg) == [] and jevuse.allowed(p.db, cfg, waketier.USE)
+    assert waketier.avoided(p.db, cfg, "standard") > 0, "unmeasured: the fallback prices still save"
+    now = time.time()
+    for tier, usd in (("standard", 2.0), ("light", 0.5)):   # measured wakes replace the fallbacks
+        p.db.x("INSERT INTO runs(task, role, started, status, cost_usd, note) VALUES(?,?,?,?,?,?)",
+               (tid, "worker", now, "ok", usd, json.dumps({"wake": {"tier": tier}})))
+    assert waketier.avoided(p.db, cfg, "standard") == pytest.approx(1.5)
 
 
 @pytest.mark.parametrize("kind", ["checks_failed", "job_failed", "match_fail", "asked", "wake_now"])

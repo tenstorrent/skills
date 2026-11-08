@@ -152,8 +152,9 @@ disk untouched, with no migration; nothing else is reclaimed by check recovery.
    fix, an ask for more) keeps its tier by rule. One for a spec change that slept with the wait asks
    Jev, where its `wake_tier` use is on, whether the run needs judgment; below
    `waiting.wake_tier.jev_light_below` (0.3) it runs light as a plain wake, so it can still ask for
-   its own tier. Jev off, unsure or failing keeps the tier; a light pick whose run asked for more
-   settles as wrong. `ttp stats --wakes` shows task wakes per day by reason, with their $, how many
+   its own tier. Jev off, unsure or failing keeps the tier. A light pick books as saved the measured
+   mean cost of a wake at its tier less a light one (fallback prices while unmeasured), so the use
+   stays on while it pays; one whose run asked for more settles as wrong, minus the light run it added. `ttp stats --wakes` shows task wakes per day by reason, with their $, how many
    only handed the wait back and who chose the tier.
 8. The project folder ignores itself; nothing of a project is ever committed to the user's repo.
 9. Secrets live only in `~/.tt-project/secrets.json` (0600). Never in argv, logs or projects.
