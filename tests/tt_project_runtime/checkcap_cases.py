@@ -3376,7 +3376,8 @@ def test_a_truly_taskless_waiter_is_named_by_pid_command_folder_and_first_queued
     try:
         (ev,) = checklane.wait_events("pa", cfg)
         assert ev["task"] is None and ev["fingerprint"].startswith("checks_slot_wait:run:"), ev
-        who = (f"a run with no task (pid {waiter.pid} '{sys.executable} -c " )
+        # the command is cut to 80 characters, so a long interpreter path may leave out " -c"
+        who = f"a run with no task (pid {waiter.pid} '{(sys.executable + ' -c ')[:40]}"
         assert who in ev["text"], ev["text"]
         assert f" in {cwd}, first queued {timefmt.short(since, cfg)})" in ev["text"], ev["text"]
         (line,) = checklane.long_wait_lines("pa", cfg, over_s=0)
