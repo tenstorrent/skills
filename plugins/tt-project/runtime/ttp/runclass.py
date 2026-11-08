@@ -14,7 +14,8 @@ Routing: `route.classes` {class: "chat" | "core"} (account-level, then the proje
 over DEFAULT: when the chat provider has a model (chat_model), every class in CHAT goes to chat and
 coordinator and hard stay on core; the coordinator never moves, whatever the map says. A task's own
 provider or model pin wins (route.eligible); a task the rule list keeps on core (route.kept_core: urgent,
-needs_deep, user_deep, review_fix, untrusted_input) stays on core. The model is the run tier's chat
+needs_deep, user_deep, review_fix, untrusted_input) stays on core, and so does a task the daemon made
+from outside input (untrusted) until the untrusted-input hook guards are live. The model is the run tier's chat
 model, else the light tier's, else the standard tier's; picking among models is route.py's and the
 failover's job, not this module's. A tier whose `providers.chat.tiers.<tier>.route` is false routes
 no class.
@@ -125,7 +126,7 @@ def target(cfg: dict, task: dict, tier: str, cls: str, picked: dict | None = Non
     (core): its class maps to core, no chat model, the task pins a provider or model, the start is a
     tier-up retry, or the task stays on core (route.kept_core)."""
     from .route import TO, kept_core
-    if routes(cfg).get(cls) != "chat" or kept_core(task) or str(task.get("provider") or "") \
+    if routes(cfg).get(cls) != "chat" or kept_core(task) or untrusted(task) or str(task.get("provider") or "") \
             or str(task.get("model") or "") or (picked or {}).get("by") == "retry":
         return None
     t = ((((cfg.get("providers") or {}).get(TO) or {}).get("tiers") or {}).get(tier) or {})
@@ -133,6 +134,13 @@ def target(cfg: dict, task: dict, tier: str, cls: str, picked: dict | None = Non
         return None   # the user turned this tier's routing off
     model = chat_model(cfg, tier)
     return {"to": TO, "model": model, "rule": f"class:{cls}"} if model else None
+
+
+def untrusted(task: dict) -> bool:
+    """A task whose run may read untrusted text with tools: labelled untrusted_input, or one the daemon
+    made from outside input (PR comments, CI, alerts, notes), a review of this project's own diff
+    apart. It stays on core until the untrusted-input hook guards are live."""
+    return task.get("origin") == "daemon" and task.get("kind") != "review"
 
 
 def by_class(db, cfg: dict, since: float, until: float | None = None) -> dict:

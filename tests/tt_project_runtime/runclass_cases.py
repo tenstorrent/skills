@@ -60,6 +60,8 @@ def test_class_target_pins_and_kept_core_tasks_stay_on_core():
     assert runclass.target(cfg, t, "standard", "status_report", {"by": "retry"}) is None
     # Untrusted input (and the rest of route.KEEP_CORE) stays on core until its guards are live.
     assert runclass.target(cfg, {**t, "labels": '["untrusted_input"]'}, "standard", "status_report") is None
+    assert runclass.target(cfg, {**t, "origin": "daemon"}, "standard", "status_report") is None
+    assert runclass.target(cfg, {**t, "origin": "daemon", "kind": "review"}, "standard", "review_small")
     off = {"providers": {"chat": {**_RC_CHAT, "tiers": {"light": {"model": "m", "route": False}}}}}
     assert runclass.target(off, t, "light", "light") is None             # the user turned the tier off
     assert runclass.target(off, t, "standard", "status_report")["model"] == "m"
