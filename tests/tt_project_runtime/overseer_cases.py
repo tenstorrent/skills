@@ -235,3 +235,68 @@ def test_ensure_overseer_restarts_its_systemd_unit_or_spawns_one(env, monkeypatc
     assert service.ensure_overseer(p) == "restarted its unit"
     name = service._overseer_unit(p).name
     assert ("systemctl", "--user", "restart", name) in ran and service._overseer_unit(p).exists()
+
+
+def test_a_look_the_coordinator_sets_replaces_the_idle_wake_and_wakes_it_once(env, monkeypatch):
+    from ttp import coordinator as coord
+    from ttp import looks
+    from ttp.daemon import idle_wake
+    p, d, clock, starts = _wake_setup(env, monkeypatch)
+    assert coord.apply(p, [{"type": "look", "at": "45m", "text": "did the soak finish? it gates the merge"}]) == []
+    at = clock[0] + 45 * 60
+    w = idle_wake(p, p.config(), {}, clock[0])
+    assert w["at"] == at and w["look"].startswith("did the soak"), w
+    assert _first_turn(d, clock, starts, at - 30) is None, "woke before the look was due"
+    fired = _first_turn(d, clock, starts, at + 120)
+    assert fired is not None and fired >= at, (fired, at)
+    assert looks.pending(p.db) == [] and p.db.kv(looks.DONE_KEY)[-1]["status"] == "woken"
+    starts.clear()
+    assert _first_turn(d, clock, starts, clock[0] + 1800) is None, "a settled look woke it again"
+    assert idle_wake(p, p.config(), {}, clock[0]).get("look") is None, "no look: back to the idle wake"
+
+
+def test_a_look_whose_check_says_nothing_changed_starts_no_turn(env, monkeypatch):
+    from ttp import coordinator as coord
+    from ttp import looks
+    p, d, clock, starts = _wake_setup(env, monkeypatch)
+    assert coord.apply(p, [{"type": "look", "at": "10m", "text": "same", "precheck": "true"},
+                           {"type": "look", "at": "20m", "text": "changed", "precheck": "exit 3"}]) == []
+    _first_turn(d, clock, starts, clock[0] + 15 * 60)
+    assert not starts and p.db.kv(looks.DONE_KEY)[-1]["status"] == "skipped"
+    assert _first_turn(d, clock, starts, clock[0] + 15 * 60) is not None, "a check that saw a change did not wake"
+    assert [x["text"] for x in p.db.kv(looks.DONE_KEY) if x["status"] == "woken"] == ["changed"]
+    assert coord.apply(p, [{"type": "look", "at": "1h", "text": "x"}, {"type": "look", "enabled": False}]) == []
+    assert looks.pending(p.db) == []
+    assert coord.apply(p, [{"type": "look", "at": "9d", "text": "x"}]), "a look past the horizon was taken"
+
+
+def test_the_overseer_wakes_a_due_look_the_stuck_loop_missed_and_the_paths_never_start_two(env, monkeypatch):
+    from ttp import looks
+    from ttp import overseer as ov
+    from ttp.daemon import Daemon
+    p = make(env)
+    _no_events(p)
+    clock = [time.time()]
+    starts = []
+    monkeypatch.setattr(time, "time", lambda: clock[0])
+    monkeypatch.setattr(Daemon, "start_run", lambda self, *a, **k: starts.append(clock[0]))
+    p.db.set_kv("last_coordinator_turn", clock[0])
+    looks.add(p.db, clock[0] + 60, "check the soak")
+    # The tick loop is stuck: nothing calls maybe_coordinate; the overseer's wake runs it in-process here.
+    monkeypatch.setattr(ov, "spawn_wake", lambda p: ov.wake(str(p.base)))
+    clock[0] += 60 + ov.LOOK_GRACE_S - 5
+    ov.check(p, clock[0])
+    assert not starts, "the overseer woke inside the loop's grace"
+    clock[0] += 10
+    h = ov.check(p, clock[0])
+    assert len(starts) == 1 and h["wake"]["rc"] == 0, h.get("wake")
+    assert looks.pending(p.db) == [] and p.db.kv(looks.DONE_KEY)[-1]["status"] == "woken"
+    looks.add(p.db, clock[0], "again")
+    clock[0] += ov.LOOK_GRACE_S + 10
+    ov.check(p, clock[0])
+    assert len(starts) == 1, "woke twice within WAKE_EVERY_S"
+    # The loop starting a turn at the same moment holds the start lock: the other path starts none.
+    with looks.start_lock(p.state) as mine:
+        assert mine
+        Daemon(p.base).maybe_coordinate()
+    assert len(starts) == 1, "two paths started two turns"

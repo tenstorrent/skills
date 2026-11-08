@@ -38,6 +38,7 @@ from pathlib import Path
 from . import runtimeload   # first of its own: its LOADED_AT is when the daemon imported its code
 from . import ackwait
 from . import sidefx
+from . import looks
 from . import cursorhook
 from . import pausegone
 from . import usersite
@@ -9571,6 +9572,12 @@ class Daemon:
         log(self.p, f"task {tid} start_when stale: released once by the blocker sweep")
 
     def maybe_coordinate(self) -> None:
+        # The tick loop and the overseer's wake (overseer.wake) both start turns: one at a time.
+        with looks.start_lock(self.p.state) as mine:
+            if mine:
+                self._maybe_coordinate()
+
+    def _maybe_coordinate(self) -> None:
         if not self.lease_held():
             return
         db, c = self.p.db, self.cfg["coordinator"]
@@ -9579,6 +9586,8 @@ class Daemon:
         now = time.time()
         if now < float(db.kv("coordinator_backoff_until", 0)):
             return
+        # Due looks the coordinator set itself (looks.py); a look whose check exits 0 is skipped.
+        fire = looks.screen(db, self.p.base, looks.due(db, now), now) if looks.pending(db) else []
         msgs = db.q("SELECT id, ts, chat FROM messages WHERE direction='in' AND handled=0 ORDER BY id")
         queued = db.q("SELECT id, ts, kind, severity, task, source, data FROM events WHERE status='queued' ORDER BY id")
         # A failed resume of the persistent session (coordsession.py) reruns its batch at once: no hold or gate.
@@ -9618,7 +9627,9 @@ class Daemon:
         rides = [e for e in evs if pagesev.rides_along(e)]
         if not msgs and len(rides) == len(evs) and (
                 not rides or now - min(e["ts"] for e in rides) < pagesev.RIDE_ALONG_MAX_S):
-            if coord.rejection_due(db, now):
+            if fire:
+                w, wake = {"due": "look"}, db.kv("idle_wake", {}) or {}
+            elif coord.rejection_due(db, now):
                 # A rejection no turn carried in coord.REJECTION_WAIT_S starts one, so none is dropped.
                 w, wake = {"due": coord.REJECTION_DUE}, db.kv("idle_wake", {}) or {}
             else:
@@ -9646,7 +9657,7 @@ class Daemon:
                 return
             if not msgs and not rerun and not urgent and self._event_hold(own, now):
                 return
-        if not msgs and not rerun:
+        if not msgs and not rerun and not fire:
             try:
                 # Every open task held by what no turn lifts, and nothing new since the last turn: a
                 # routine batch or wake is settled without a model run (quietgate.py).
@@ -9741,10 +9752,12 @@ class Daemon:
             must = mustact.block(db, [e["id"] for e in evs])
             parts = ([(mustact.SECTION, must)] if must else []) + parts
             parts += [(slowcomplaint.SECTION, speed)] if speed else []
+            seen_looks = [("looks", looks.digest(fire, lambda t: timefmt.short(t, self.p)))] if fire else []
+            parts += seen_looks
             prompt = "\n".join(text for _, text in parts)
             # A session wake may send only what changed.
             full = (([(mustact.SECTION, must)] if must else []) + coord.split_cached(whole)[1]
-                    + ([(slowcomplaint.SECTION, speed)] if speed else []))
+                    + ([(slowcomplaint.SECTION, speed)] if speed else []) + seen_looks)
             session_digest = {"parts": parts, "full": full, "seen": coordsession.fingerprint(baseline),
                               "shown": coordsession.fingerprint(shown)}
             head, context = coord.prompt_parts(self.p)
@@ -9764,6 +9777,7 @@ class Daemon:
                                  **({"carried": carried} if carried else {}),
                                  **({"corrections": {str(k): v for k, v in flagged.items()}} if flagged else {}),
                                  **({"wake_due": due} if due else {}),
+                                 **({"looks": [x["id"] for x in fire]} if fire else {}),
                                  "digest": {**coord.digest_size(parts), "cached_chars": len(cached)}, **({"gate": seen_now} if seen_now else {}),
                                  **({"burst": burst} if burst else {})})
         except Exception as e:
@@ -9772,6 +9786,7 @@ class Daemon:
             self._coordinator_failed(f"could not start: {type(e).__name__}: {e}"[:250])
             return
         db.set_kv("last_coordinator_turn", now)
+        looks.settle(db, [x["id"] for x in fire], "woken", rid, now)
         quietgate.started(db)
         bursthold.started(db, evs, rid, now)
         db.set_kv(coord.EFFORT_SEEN_KEY, seen)
@@ -17747,6 +17762,9 @@ def idle_wake(p: Project, cfg: dict, gates: dict[str, dict], now: float, db=None
     # `db` is the caller's own connection: the web app calls this from its request threads, and an
     # SQLite connection works only in the thread that opened it.
     db, c = db or p.db, cfg["coordinator"]
+    if nxt := looks.pending(db):   # the coordinator chose its next look: no fixed wake meanwhile
+        return {"at": nxt[0]["at"], "due": None, "held": None, "wake": db.kv("idle_wake", {}) or {},
+                "starve": None, "look": nxt[0]["text"]}
     gate = gates.get(cfg.get("core_provider", "claude"))
     last = float(db.kv("last_coordinator_turn", 0))
     idle_s = float(c.get("idle_wake_s", 3600))
