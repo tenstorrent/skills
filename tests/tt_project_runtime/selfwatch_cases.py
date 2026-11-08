@@ -42,16 +42,16 @@ def _sw_world(tmp_path, n_own, n_other=None):
 
 def test_selfwatch_stops_its_own_runaway_run_after_the_window_and_leaves_other_processes_alone(tmp_path):
     from ttp import selfwatch
-    s = {**selfwatch.DEFAULTS, "spawn_s": 100.0, "procs": 0, "load_x": 0}
+    s = {**selfwatch.DEFAULTS, "procs": 0, "load_x": 0}
     root = tmp_path / "proc"
     base, procs = _sw_world(tmp_path, 3)
     _sw_proc(root, 1000, procs)
-    w = selfwatch.Watch(base, proc=root, daemon_pid=100, cores=64)
+    w = selfwatch.Watch(base, proc=root, daemon_pid=100, cores=64, sleep=lambda _s: None)
     first = w.step(s, 0.0)
     assert first["sampled"] and first["runaway"] == [] and first["host"]["forks_s"] is None, "no rate before two samples"
     assert first["tree"]["procs"] == 2 + 5 and first["tree"]["runs"] == 1, first["tree"]   # daemon 2 + run 7 (500, 951 and 3)
-    # Run 7 itself storms (about 13 new processes of its own seen per second, past a tenth of the
-    # limit), while another project's and another user's groups grow too.
+    # Run 7 itself storms (5 of every 6 new processes seen are its own), while another project's and
+    # another user's groups grow too.
     for t, n in ((30.0, 400), (60.0, 800), (90.0, 1200)):
         base, procs = _sw_world(tmp_path, n, n // 10)
         _sw_proc(root, 1000 + int(t) * 3400, procs, load="158")
@@ -83,7 +83,7 @@ def test_selfwatch_never_acts_on_churn_it_cannot_attribute_or_on_a_burst_shorter
     root = tmp_path / "proc"
     base, procs = _sw_world(tmp_path, 3)
     _sw_proc(root, 0, procs)
-    w = selfwatch.Watch(base, proc=root, daemon_pid=100, cores=64)
+    w = selfwatch.Watch(base, proc=root, daemon_pid=100, cores=64, sleep=lambda _s: None)
     w.step(s, 0.0)
     # Another project's group grows by thousands: the host churns, this project's tree does not.
     procs.update({20000 + i: (1, 900, 10, {"TTP_PROJECT": str(tmp_path / "other")}) for i in range(4000)})
@@ -153,7 +153,7 @@ def test_selfwatch_never_puts_a_storm_it_does_not_see_its_run_make_on_that_run(t
     root = tmp_path / "proc"
     base, procs = _sw_world(tmp_path, 0)
     _sw_proc(root, 0, procs)
-    w = selfwatch.Watch(base, proc=root, daemon_pid=100, cores=64)
+    w = selfwatch.Watch(base, proc=root, daemon_pid=100, cores=64, sleep=lambda _s: None)
     w.step(s, 0.0)
     for k in range(1, 13):
         base, procs = _sw_world(tmp_path, k, 0)
@@ -161,5 +161,42 @@ def test_selfwatch_never_puts_a_storm_it_does_not_see_its_run_make_on_that_run(t
         snap = w.step(s, k * 10.0)
         assert snap["host"]["forks_s"] == 3000.0
         assert not snap["breach"] and snap["runaway"] == [], (k, snap["breach"])
-        assert snap["tree"]["spawn_s"] < 1 and snap["foreign_churn"], snap["tree"]
-    assert "not from this project's processes" in selfwatch.line(snap, 120.0)
+        assert snap["tree"]["spawn_s"] < 1 and snap["churn"] == "unattributed" and not snap["foreign_churn"], snap
+    line = selfwatch.line(snap, 120.0)
+    assert "not attributed" in line and "not from this project's" not in line, line
+
+
+def test_selfwatch_stops_its_own_storm_of_short_lived_processes_at_the_default_limits(tmp_path):
+    """Review #7226: run 7 makes all of the host's 1000 forks/s, each process living 2 s (2000 fresh ones
+    of its own at every 30 s sample, no other new ones): stopped after the window, never called foreign.
+    Then a storm whose processes live too briefly to be at the sample is caught by the pid burst."""
+    from ttp import selfwatch
+    s = dict(selfwatch.DEFAULTS)
+    root = tmp_path / "proc"
+    base, world = _sw_world(tmp_path, 0, 0)
+    mine = {"TTP_PROJECT": str(base), "TTP_RUN_ID": "7", "TTP_TASK_ID": "42"}
+    _sw_proc(root, 0, world)
+    w = selfwatch.Watch(base, proc=root, daemon_pid=100, cores=64, sleep=lambda _s: None)
+    w.step(s, 0.0)
+    for k in range(1, 4):
+        _sw_proc(root, k * 30000, {**world, **{100000 * k + i: (500, 500, 1, mine) for i in range(2000)}})
+        snap = w.step(s, k * 30.0)
+        assert snap["host"]["forks_s"] == 1000.0 and [b["run"] for b in snap["breach"]] == ["7"], snap
+        assert snap["churn"] is None and "not from this project's" not in selfwatch.line(snap, k * 30.0)
+    assert [r["run"] for r in snap["runaway"]] == ["7"] and snap["runaway"][0]["spawn_s"] == 1000.0
+
+    # Only 5 of its new processes are left at each sample; 40 more appear and exit during the burst.
+    calls = []
+    def blink(_s):
+        calls.append(1)
+        for i in range(40):
+            d = root / str(700000 + 1000 * len(calls) + i)
+            d.mkdir()
+            (d / "stat").write_text(f"{d.name} (x) S 500 500 0 0 0 0 0 0 0 0 1 0 0 0 20 0 1 0 9 0 256\n")
+            (d / "environ").write_bytes(b"\0".join(f"{a}={b}".encode() for a, b in mine.items()) + b"\0")
+    w2 = selfwatch.Watch(base, proc=root, daemon_pid=100, cores=64, sleep=blink)
+    _sw_proc(root, 0, world)
+    w2.step(s, 0.0)
+    _sw_proc(root, 30000, {**world, **{900000 + i: (500, 500, 1, mine) for i in range(5)}})
+    snap = w2.step(s, 30.0)
+    assert snap["breach"] and snap["breach"][0]["run"] == "7" and snap["breach"][0]["spawn_s"] == 1000.0, snap

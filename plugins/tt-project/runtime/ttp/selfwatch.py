@@ -7,11 +7,13 @@ from `processes` in /proc/stat, available memory, free disk under the project) a
 process tree: every process whose environment marks it as this project's (procowner.owns_env: its
 TTP_PROJECT, else its TTP_RUN_DIR) and the daemon with its own children. They are grouped by run
 (TTP_RUN_ID, with TTP_TASK_ID) and counted: processes, spawn rate, CPU cores used and memory (RSS).
-A run's spawn rate is the new processes of its own seen per second since the last sample. Only when
-that alone reaches SPAWN_SEEN of the spawn limit is the run also given its share of the host's fork
-rate (from /proc/stat, which counts every process and thread any user creates), so a storm's
-short-lived processes count once the run is seen forking, and a storm the watch does not see the run
-make is never put on it.
+A run's spawn rate is the new processes of its own seen per second since the last sample. While the
+host's fork rate (from /proc/stat, which counts every process and thread any user creates) is at or
+above the spawn limit, the watch also takes BURST_N quick pid listings over BURST_S (environ read only
+for new pids) and gives each run that rate times its share of the new pids seen then and at the
+sample, but only when they number at least BURST_MIN: a storm of short-lived processes is put on the
+run that makes it however briefly they live, and churn the watch does not see the run make is never
+put on it. Too few new pids seen leaves the churn unattributed; mostly others' is reported as foreign.
 A run runs away when, at every sample for WINDOW_S, one limit holds: its spawn rate is at or above
 SPAWN_S, its processes at or above PROCS, or the host's load is at least LOAD_X times its cores while
 the run uses at least LOAD_SHARE of them. Then the daemon (act()) asks the run's supervisor to stop,
@@ -44,7 +46,8 @@ EVERY_S = 30.0
 BREACH_EVERY_S = 10.0   # sampled faster while a limit holds, so a runaway is stopped near WINDOW_S
 WINDOW_S = 60.0
 SPAWN_S = 1000.0        # new processes per second from one run
-SPAWN_SEEN = 0.1        # host forks are shared out to a run only while its own seen ones reach this share of SPAWN_S
+BURST_N, BURST_S = 20, 1.0   # pid listings over seconds taken while the host forks at or above SPAWN_S ...
+BURST_MIN = 20          # ... whose new pids share out the host's fork rate only when at least this many
 PROCS = 3000            # live processes of one run
 LOAD_X = 2.0            # host load over its cores ...
 LOAD_SHARE = 0.5        # ... while the run uses this share of them
@@ -111,8 +114,9 @@ class Watch:
     """Samples kept across daemon ticks. step() returns the snapshot, with `runaway`: the runs past a
     limit for the whole window (each once per episode)."""
 
-    def __init__(self, base, proc: Path = PROC, daemon_pid: int | None = None, cores: int | None = None):
-        self.base, self.proc = Path(base), Path(proc)
+    def __init__(self, base, proc: Path = PROC, daemon_pid: int | None = None, cores: int | None = None,
+                 sleep: Callable[[float], None] = time.sleep):
+        self.base, self.proc, self.sleep = Path(base), Path(proc), sleep
         self.daemon_pid = daemon_pid or os.getpid()
         self.cores = cores or os.cpu_count() or 1
         self.env: dict[tuple[int, int], tuple] = {}     # (pid, start) -> (owned, run, task)
@@ -145,6 +149,28 @@ class Watch:
             out[pid] = (*self._whose(pid, start, ppid, out), ppid, pgid, start, ticks, rss)
         return out
 
+    def burst(self, procs: dict) -> dict:
+        """Run (None: not this project's) -> new pids seen at the sample (against the last one) and in
+        BURST_N pid listings over BURST_S after it; environ is read only for pids not seen before."""
+        old = (self.last or {}).get("procs", {})
+        seen: dict[int, tuple] = dict(procs)
+        counts: dict = {}
+        for pid, v in procs.items():
+            if (pid, v[5]) not in old:
+                counts[v[1]] = counts.get(v[1], 0) + 1
+        for _ in range(BURST_N):
+            self.sleep(BURST_S / BURST_N)
+            try:
+                pids = [int(d) for d in os.listdir(self.proc) if d.isdigit()]
+            except OSError:
+                break
+            for pid in pids:
+                if pid in seen or (st := _stat(self.proc, pid)) is None:
+                    continue
+                seen[pid] = self._whose(pid, st[2], st[0], seen)
+                counts[seen[pid][1]] = counts.get(seen[pid][1], 0) + 1
+        return counts
+
     def step(self, s: dict, now: float | None = None) -> dict:
         now = time.time() if now is None else now
         h = host(self.proc, self.base, self.cores)
@@ -155,7 +181,10 @@ class Watch:
         dt = max(1e-3, now - prev.get("ts", now - 1))
         forks_s = max(0.0, (h["forks"] - prev["forks"]) / dt) if prev.get("forks") is not None and h["forks"] is not None else None
         old = prev.get("procs", {})
-        new_all = sum(1 for k in live if k not in old)
+        storm = bool(forks_s and s["spawn_s"] and forks_s >= s["spawn_s"])
+        seen_new = self.burst(procs) if storm and self.last else {}
+        new_all = sum(seen_new.values())
+        attributed = new_all >= BURST_MIN
         runs: dict[str, dict] = {}
         for pid, (who, run, task, _pp, pgid, start, ticks, rss) in procs.items():
             if not who:
@@ -168,9 +197,8 @@ class Watch:
             r["ticks"] += ticks - old.get((pid, start), 0 if self.last else ticks)
             r["new"] += (pid, start) not in old if self.last else 0
         for r in runs.values():
-            seen_s = r["new"] / dt
-            backed = new_all and s["spawn_s"] and seen_s >= SPAWN_SEEN * s["spawn_s"]
-            r["spawn_s"] = round(max(seen_s, (forks_s or 0) * r["new"] / new_all) if backed else seen_s, 1)
+            share = forks_s * seen_new.get(r["run"], 0) / new_all if attributed else 0.0
+            r["spawn_s"] = round(max(r["new"] / dt, share), 1)
             r["cpu"] = round(max(0, r["ticks"]) / TICK / dt, 2)
             r["why"] = _past(r, h, s) if r["run"] != "daemon" else ""
         self.last = {"ts": now, "forks": h["forks"], "procs": {(pid, v[5]): v[6] for pid, v in procs.items()}}
@@ -189,11 +217,14 @@ class Watch:
         tree = {"procs": sum(r["procs"] for r in runs.values()), "spawn_s": round(mine, 1),
                 "cpu": round(sum(r["cpu"] for r in runs.values()), 2), "rss_gb": round(sum(r["rss"] for r in runs.values()) / 2**30, 2),
                 "runs": len([r for r in runs if r not in ("daemon", "other")])}
-        foreign = bool(forks_s and s["spawn_s"] and forks_s >= s["spawn_s"] and mine < s["spawn_s"] / 2)
+        churn = None
+        if storm and mine < s["spawn_s"] / 2:
+            others = seen_new.get(None, 0)
+            churn = "foreign" if attributed and others * 2 > new_all else "unattributed"
         top = max(runs.values(), key=lambda r: (r["spawn_s"], r["procs"]), default=None)
         return {"ts": now, "host": {**h, "forks_s": None if forks_s is None else round(forks_s, 1)}, "tree": tree,
                 "top": _public(top) if top else None, "breach": [_public(r) for r in runs.values() if r["why"]],
-                "foreign_churn": foreign, "runaway": runaway, "sampled": bool(procs)}
+                "foreign_churn": churn == "foreign", "churn": churn, "runaway": runaway, "sampled": bool(procs)}
 
 
 def _past(r: dict, h: dict, s: dict) -> str:
@@ -264,6 +295,8 @@ def line(snap: dict | None, now: float | None = None) -> str:
         out += "; past a limit: " + ", ".join(f"run {b['run']} ({b['why']})" for b in snap["breach"][:3])
     if snap.get("foreign_churn"):
         out += "; the host's process churn is not from this project's processes (reported, not acted on)"
+    elif snap.get("churn") == "unattributed":
+        out += "; the host's process churn is not attributed: too few of its new processes were seen (reported, not acted on)"
     last = snap.get("stopped") or {}
     if last and now - float(last.get("ts", 0)) < 3600:
         out += f"; stopped runaway run {last['run']} (task #{last.get('task')}): {last['why']}"

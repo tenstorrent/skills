@@ -6,9 +6,11 @@ Each daemon runs `Daemon.check_self_watch` (runtime `selfwatch.py`) about every 
   available memory and free disk under the project.
 - Own tree: every process whose environment carries this project's `TTP_PROJECT` (or a `TTP_RUN_DIR`
   inside it), and the daemon with its children, grouped by `TTP_RUN_ID`: processes, spawn rate (its own
-  new processes seen per second; only once that reaches a tenth of `spawn_s` is it also given its share of
-  the host's fork rate, so host churn the watch does not see the run make is never put on it), CPU cores
-  and RSS.
+  new processes seen per second; while the host forks at or above `spawn_s`, about 20 quick pid listings
+  over 1 s, environ read only for new pids, give each run the host's fork rate times its share of the new
+  pids seen then and at the sample, only when at least 20 were seen: a storm is put on the run making it
+  however briefly its processes live, and host churn the watch does not see the run make is never put on
+  it), CPU cores and RSS.
 
 A run past a limit at every sample for `selfwatch.window_s` (60 s) is a runaway:
 
@@ -25,7 +27,8 @@ STOP, each of the run's process groups whose members are all this project's gets
 with any other process gets only the owned members), the kernel drops their flock locks, the task gets one
 `selfwatch_runaway` event with the reason and numbers, and the user one notify. The daemon's own processes are
 never signalled; a process with another project's or no readable environment (another user's) is never ours.
-Churn on the host that this project's processes do not account for is reported in the line, never acted on.
+Churn on the host that this project's processes do not account for is reported in the line, never acted on:
+as not from this project's processes when most new pids seen are others', else as not attributed.
 
 The snapshot is db kv `selfwatch`; its one line shows in `ttp status`, the web app and the coordinator digest's
 Host section. Tests feed a fake /proc tree and a fake signal function; the suite's `env` fixture sets
