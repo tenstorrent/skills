@@ -95,6 +95,39 @@ def test_throughput_measures_waits_per_lane_from_task_run_and_push_records(env, 
     assert "worker_slots SLOW" in txt and "limit budget.max_parallel_workers=2" in txt
 
 
+def test_throughput_judges_worker_waits_against_the_slot_limit_in_force_then_not_a_later_raise(env, monkeypatch):
+    """Waits that met every slot of a cap throughput has since raised are neither at the new cap nor idle
+    capacity: they count as `raised`, propose no second raise and the kept line names the raise."""
+    from ttp import throughput
+    p = make(env)
+    now = time.time()
+    _tp_busy_fixture(p, now)   # 3 waits over threshold, all 2 slots busy
+    monkeypatch.setattr(throughput, "cpu_free", lambda: (True, ""))
+    monkeypatch.setattr(throughput.os, "cpu_count", lambda: 64)
+    p.set_config("budget.max_parallel_workers", 4)
+    # No record of the raise: judged against 4, the waits look like idle capacity (the old reading).
+    w = _tp_lane(throughput.measure(p.db, p.config(), now=now, gates={}), "worker_slots")
+    assert (w["at_limit"], w["idle"], w.get("raised")) == (0, 3, None)
+    # A raise recorded before the waits began changes nothing; one after them is the limit then.
+    for ts, want in ((now - 9 * 3600, (0, 3, None)), (now - 60, (0, 0, 3))):
+        p.db.set_kv(throughput.KV, [{"id": 1, "ts": ts, "key": "budget.max_parallel_workers", "old": 2, "new": 4}])
+        rep = throughput.measure(p.db, p.config(), now=now, gates={})
+        w = _tp_lane(rep, "worker_slots")
+        assert (w["at_limit"], w["idle"], w.get("raised")) == want, (ts, w)
+    assert w["raised_by"]["id"] == 1 and "3 at the limit before raise #1" in throughput.text(
+        {**rep, "changes": [], "kept": []})
+    changes, kept = throughput.plan(p.db, p.config(), rep)
+    assert not [c for c in changes if c["key"] == "budget.max_parallel_workers"], changes
+    why = next(k["why"] for k in kept if k["lane"] == "worker_slots")
+    assert "met all 2 slots before throughput #1 raised" in why and "idle" not in why
+    # An undone raise: after its undo the old value is in force again, so a wait after it is at the limit.
+    p.set_config("budget.max_parallel_workers", 2)
+    p.db.set_kv(throughput.KV, [{"id": 1, "ts": now - 10 * 3600, "key": "budget.max_parallel_workers", "old": 2,
+                                 "new": 4, "undone": now - 9 * 3600}])
+    w = _tp_lane(throughput.measure(p.db, p.config(), now=now, gates={}), "worker_slots")
+    assert (w["at_limit"], w["idle"], w.get("raised")) == (3, 0, None)
+
+
 def test_throughput_apply_raises_only_at_limit_with_headroom_bounded_by_load_and_undoes(env, monkeypatch):
     from ttp import throughput
     p = make(env)

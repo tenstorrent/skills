@@ -175,6 +175,29 @@ def _peak(spans: list[tuple[float, float]], t0: float, t1: float) -> int:
     return max((sum(1 for s, e in spans if s <= x < e) for x in pts), default=0)
 
 
+def _limit_then(db: DB, key: str, cur: int, t0: float, t1: float) -> tuple[int, dict | None]:
+    """(the lowest value `key` had during [t0, t1], the throughput change that raised it from there), from
+    this module's own change records (KV): a wait before a raise is judged against the limit then in force.
+    (cur, None) when no recorded change touches the span."""
+    evs = []
+    for c in db.kv(KV) or []:
+        if isinstance(c, dict) and c.get("key") == key and isinstance(c.get("old"), int) \
+                and isinstance(c.get("new"), int):
+            evs.append((float(c.get("ts") or 0), c["new"], c["old"], c))
+            if c.get("undone"):
+                evs.append((float(c["undone"]), c["old"], c["new"], None))
+    evs.sort(key=lambda e: e[0])
+    # The value at t0: the last event's value at or before it, else the first event's prior value.
+    val = next((e[1] for e in reversed(evs) if e[0] <= t0), evs[0][2] if evs else cur)
+    low, by = val, None
+    for ts, new, old, c in evs:
+        if t0 < ts <= t1 and new < low:
+            low = new
+    if low < cur:
+        by = next((c for ts, new, old, c in evs if c and ts > t0 and old <= low < new), None)
+    return low, by
+
+
 def _wait_for(t: dict, e: dict) -> str:
     """What a task_waiting event waits for, lower case: its data's "for", else its text without the
     "#<id> <title>: " prefix (a title may name checks the task does not wait on)."""
@@ -340,7 +363,15 @@ def measure(db: DB, cfg: dict, since_s: float = DAY, now: float | None = None, g
             ln["p1"].append(w)
         ln["waiting_now"] += queued
         if limit and w > (p1_s if prio <= 1 else other_s):
-            ln["at_limit" if _peak(spans, start, end) >= limit else "idle"] += 1
+            then, by = _limit_then(db, ln["limit_key"], limit, start, end) if ln["limit_key"] else (limit, None)
+            peak = _peak(spans, start, end)
+            if peak < limit and by and peak >= then:
+                # Every slot of a lower limit then in force was busy: a wait the raise since then is for,
+                # neither at the current limit nor idle capacity.
+                ln["raised"] = ln.get("raised", 0) + 1
+                ln["raised_by"] = {"id": by.get("id"), "old": by.get("old"), "new": by.get("new"), "ts": by.get("ts")}
+            else:
+                ln["at_limit" if peak >= limit else "idle"] += 1
 
     tasks = db.q("SELECT * FROM tasks WHERE created>? OR status IN ('queued','blocked','waiting') OR id IN "
                  "(SELECT task FROM runs WHERE ended IS NULL OR ended>?) ORDER BY id DESC LIMIT ?", (t0, t0, ROWS))
@@ -912,6 +943,11 @@ def plan(db: DB, cfg: dict, report: dict) -> tuple[list[dict], list[dict]]:
             if ln.get("gate_max"):
                 kept.append({"lane": name, "key": key, "why": f"the provider gate holds parallel work at "
                              f"{ln['gate_max']} (spend or plan window), below {cur}: never raised here"})
+            elif not ln["at_limit"] and ln.get("raised"):
+                rb = ln["raised_by"]
+                kept.append({"lane": name, "key": key, "why": f"{ln['raised']} wait(s) met all {rb['old']} slots "
+                             f"before throughput #{rb['id']} raised {key} to {rb['new']}; none met the {cur} now: "
+                             "the raise is in force, measure again once the window runs under it"})
             elif not (cpu := cpu_free())[0]:
                 kept.append({"lane": name, "key": key, "why": cpu[1]})
             elif not ln["at_limit"]:
@@ -1050,7 +1086,8 @@ def text(rep: dict) -> str:
             continue
         if not ln["count"]:
             continue
-        extra = "".join(f", {k} {ln[k]}" for k in ("peak", "gate_max", "backlog") if ln.get(k) is not None)
+        extra = "".join(f", {k} {ln[k]}" for k in ("peak", "gate_max", "backlog") if ln.get(k) is not None) \
+            + (f", {ln['raised']} at the limit before raise #{ln['raised_by']['id']}" if ln.get("raised") else "")
         out.append(f"- {ln['lane']}{' SLOW' if ln['slow'] else ''}: {ln['count']} wait(s), median {_dur(ln['median_s'])}, "
                    f"p90 {_dur(ln['p90_s'])}" + (f" (priority 1: {ln['p1_count']}, p90 {_dur(ln['p1_p90_s'])})"
                                                  if ln["p1_count"] else "")
