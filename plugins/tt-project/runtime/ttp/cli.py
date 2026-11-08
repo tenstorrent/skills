@@ -1242,6 +1242,15 @@ def _secret_value_argv(argv: list[str]) -> list[str]:
     return ["secret", *pos, *stray[:1], *opts]
 
 
+def _bench_blind_argv(argv: list[str]) -> list[str]:
+    """`ttp bench blind <words...>`: the words are benchblind's own (prep, review, score, reveal and
+    their options), so each rides as given in a hidden --blind-word=:<word> (the ':' keeps argparse from
+    reading it as an option of `ttp bench`)."""
+    if argv[:2] != ["bench", "blind"]:
+        return argv
+    return [*argv[:2], *(f"--blind-word=:{w}" for w in argv[2:])]
+
+
 def _secret_env_argv(argv: list[str]) -> list[str]:
     """`ttp secret env [alias] --secret <name>[:<key>]=<VAR> ... -- <command...>`: argparse takes no
     positional after an option and drops a '--' inside the command, so the options go first and each
@@ -7538,8 +7547,15 @@ def cmd_land(a) -> None:
 def cmd_bench(a) -> None:
     """`ttp bench prep --since <date> --out <dir>`: pick the landed tasks a model comparison can
     replay, with clean base workspaces and held-out tests, model-free (bench.py)."""
+    if a.action == "blind":   # the blind review needs no project: `python3 -m ttp.benchblind` as given
+        from . import benchblind
+        if rc := benchblind.main([w[1:] for w in a.blind_word or []]):
+            raise SystemExit(rc)
+        return
     from . import bench
     p = here() or die("bench: no project here (run it in a project or with TTP_PROJECT set)")
+    if not a.out:
+        die(f"bench {a.action}: --out is required")
     if a.action == "run":
         return _bench_run(p, a)
     if not a.since:
@@ -13260,11 +13276,15 @@ def main(argv: list[str] | None = None) -> None:
     s = sub.add_parser("bench", help="replay bench, model-free part: `prep` picks landed tasks newer than --since "
                                       "that add tests, builds a clean one-commit workspace at each base and holds "
                                       "out the landed tests, with a hash-pinned manifest")
-    s.add_argument("action", choices=["prep", "run"], help="prep: build the bench in --out; run: the head-to-head "
-                                                            "of two or more arms on --bench, results in --out")
+    s.add_argument("action", choices=["prep", "run", "blind"],
+                   help="prep: build the bench in --out; run: the head-to-head of two or more arms on --bench, "
+                        "results and the blind review's cells.json in --out; blind: the blind review "
+                        "(`ttp bench blind prep <run folder> --out <dir>`, then review, score, reveal; "
+                        "`ttp bench blind --help`)")
+    s.add_argument("--blind-word", action="append", help=argparse.SUPPRESS)
     s.add_argument("--since", help="keep tasks created on or after this date (YYYY-MM-DD): the "
                                                   "later of the compared models' release dates")
-    s.add_argument("--out", required=True, help="a new folder for the workspaces, held-out tests and manifest")
+    s.add_argument("--out", help="prep, run: a new folder for the workspaces, held-out tests and manifest (required)")
     s.add_argument("--repo", help="the repository the tasks landed in (default: the project root); `run` also "
                    "denies it, its git dir and worktrees to the cells")
     s.add_argument("--limit", type=int, default=0, help="keep (prep) or run (run) at most this many tasks (default: all)")
@@ -13891,8 +13911,8 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("dir", help="the project's tt-project folder")
     s.set_defaults(fn=cmd_daemon)
 
-    a = ap.parse_args(_project_name_argv(sub, _say_finding_argv(_say_all_argv(_secret_value_argv(_secret_env_argv(
-        sys.argv[1:] if argv is None else list(argv)))))))
+    a = ap.parse_args(_project_name_argv(sub, _say_finding_argv(_say_all_argv(_secret_value_argv(_secret_env_argv(_bench_blind_argv(
+        sys.argv[1:] if argv is None else list(argv))))))))
     dry_run_stub(a)
     try:
         _recover_setup()     # a `ttp setup` a reboot cut short: finished or rolled back before anything else

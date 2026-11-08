@@ -151,3 +151,64 @@ def test_benchblind_reviewer_call_runs_unsandboxed_like_other_decision_only_runs
         benchblind.provider_ask("codex", "", "", 1.0)("score this")
     argv = seen[0]
     assert "danger-full-access" in argv and not any(a == "-s" and b == "read-only" for a, b in zip(argv, argv[1:]))
+
+
+def test_bench_blind_scores_a_head_to_head_run_folder_blind_end_to_end(env, tmp_path, monkeypatch, capsys):
+    # `ttp bench run` writes cells.json; `ttp bench blind` preps, reviews, scores and reveals it, and the
+    # reviewer call (provider_ask, on the fake provider) never sees an arm token, though each arm's diff
+    # names its own model.
+    from ttp import benchblind, benchrun, cli
+    p, tid, task = _bench_built(env, tmp_path)
+    arms = {"opus-medium": {"provider": "claude", "model": "claude-opus-5-5", "effort": "medium"},
+            "glm-top": {"provider": "chat", "model": "GLM-5.3", "effort": "max"}}
+    sign = ("python3 -c \"import json, os; print('# written by ' + json.load(open(os.environ['TTP_RUN_DIR'] + "
+            "'/run.json'))['model'])\" >> mod.py && ")
+    monkeypatch.setenv("TTP_FAKE_SHELL", _BENCH_FIX.replace(" && git", " && " + sign + "git"))
+    out = tmp_path / "h2h"
+    rows = benchrun.run(tmp_path / "bench", out, arms, 2, 7, _bench_opts(tmp_path), p.config())
+    assert len(rows) == 4 and all(r["outcome"] == "pass" and r["session_id"] for r in rows), rows
+    cells = json.loads((out / "cells.json").read_text())["cells"]
+    assert [c["task"] for c in cells] == [f"{tid}-r1", f"{tid}-r2"]
+    for c in cells:
+        assert c["criteria"] == "Add new() returning 2." and set(c["arms"]) == set(arms)
+        for a, side in c["arms"].items():
+            assert "+    return 2" in side["diff"] and f"+# written by {arms[a]['model']}" in side["diff"]
+            assert {k: side[k] for k in ("provider", "model", "effort")} == arms[a]
+            assert side["run_id"] == f"{tid}-r{c['task'][-1]}-{a}" and side["session_id"]
+            assert side["transcript"] == str(out / "cells" / side["run_id"] / "output.jsonl")
+    assert benchrun.criteria("Goal: x\nAcceptance:\n- a works\n- b: too\nReturn: the commit") == \
+        "Acceptance:\n- a works\n- b: too"
+    seen = []
+
+    def run(argv, **kw):   # the provider CLI the reviewer runs: record what it is given, answer a score
+        seen.append((list(argv), kw["input"].decode()))
+        return subprocess.CompletedProcess(argv, 0, json.dumps(
+            {"scores": {"criteria": 4, "correctness": 3, "tests": 2, "scope": 2}, "notes": "fine"}).encode(), b"")
+    monkeypatch.setattr(benchblind.subprocess, "run", run)
+    blind = tmp_path / "blind"
+    cli.main(["bench", "blind", "prep", str(out), "--out", str(blind), "--seed", "3"])
+    items = json.loads((blind / "batch.json").read_text())["items"]
+    assert len(items) == 4
+    cli.main(["bench", "blind", "score", str(blind), items[0]["id"],
+              json.dumps({"scores": {"criteria": 1, "correctness": 1, "tests": 0, "scope": 1}, "notes": "by hand"})])
+    cli.main(["bench", "blind", "review", str(blind), "--provider", "fake"])
+    assert len(seen) == 3
+    tokens = benchblind.arm_tokens(cells)
+    for t in ("opus-medium", "glm-top", "claude-opus-5-5", "GLM-5.3", "claude", "chat", rows[0]["session_id"]):
+        assert t in tokens, t
+    for argv, text in seen:
+        assert "+    return 2" in text and "Add new() returning 2." in text
+        for shown in (text, " ".join(argv)):
+            assert benchblind.leaks(shown, tokens) == [], shown
+            for t in ("opus", "glm", "claude", "medium", "effort", "max", "session", ".jsonl", str(out)):
+                assert t not in shown.lower(), (t, shown)
+    with pytest.raises(SystemExit) as e:
+        cli.main(["bench", "blind", "score", str(blind), items[0]["id"], json.dumps(
+            {"scores": {"criteria": 4, "correctness": 4, "tests": 2, "scope": 2}, "notes": "again"})])
+    assert e.value.code == 2
+    capsys.readouterr()
+    cli.main(["bench", "blind", "reveal", str(blind)])
+    shown = json.loads(capsys.readouterr().out)
+    assert shown["seed"] == 3 and set(shown["arms"]) == set(arms)
+    b = json.loads((blind / "batch.json").read_text())
+    assert b["phase"] == "revealed" and set(b["labels"].values()) == set(arms)

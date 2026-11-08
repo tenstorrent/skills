@@ -2,7 +2,8 @@
 shuffled with a recorded seed, a reviewer scores each against the task's acceptance criteria on a
 fixed rubric, and the arm labels are revealed only once every score of the batch is recorded.
 
-    python3 -m ttp.benchblind prep <cells.json> --out <dir> [--seed N]
+    python3 -m ttp.benchblind prep <cells.json | `ttp bench run` folder> --out <dir> [--seed N]
+    (or `ttp bench blind <the same words>`)
     python3 -m ttp.benchblind review <dir> [--provider claude] [--model M] [--effort E] [--budget-usd 2]
     python3 -m ttp.benchblind score <dir> <item> '<{"scores": {...}, "notes": "..."}>'
     python3 -m ttp.benchblind reveal <dir>
@@ -270,7 +271,8 @@ def main(argv: list[str] | None = None) -> int:
     a = ap.parse_args(argv)
     try:
         if a.cmd == "prep":
-            b = prep(json.loads(Path(a.cells).read_text())["cells"], Path(a.out), a.seed)
+            src = Path(a.cells) / "cells.json" if Path(a.cells).is_dir() else Path(a.cells)   # a `ttp bench run` folder
+            b = prep(json.loads(src.read_text())["cells"], Path(a.out), a.seed)
             print(f"benchblind: {len(b['items'])} item(s) sealed in {a.out}")
         elif a.cmd == "review":
             got = review(Path(a.dir), provider_ask(a.provider, a.model, a.effort, a.budget_usd))

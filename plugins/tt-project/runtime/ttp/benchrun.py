@@ -19,7 +19,10 @@ tests run (the grade). The agent and the grade each run in a fresh venv in the c
 the user site off, pip refused outside a venv), so no cell installs into or imports from ~/.local
 and nothing the agent installed runs the held-out tests. Each cell appends one row to <out>/results.jsonl: cost, tokens, wall time,
 hand-off status, the grade and the sha256 of its transcript and diff; its files go to <out>/cells.
-A rerun with the same plan skips the cells already recorded. `dry_run` swaps every arm's provider
+A rerun with the same plan skips the cells already recorded. <out>/cells.json is the blind review's
+input (`ttp bench blind prep <out>`, benchblind.py): per task and repeat whose arms all ran, the task id,
+the acceptance criteria from its spec and each arm's diff with the metadata that names it (provider,
+model, effort, run and session id, transcript path). `dry_run` swaps every arm's provider
 for the fake agent: no model call, no spend."""
 from __future__ import annotations
 
@@ -348,7 +351,7 @@ def _finish(row: dict, bench_dir: Path, task: dict, ws: Path, run: Path, keep: P
     """Audit and grade a cell whose agent has run, filling `row` as it goes (its cost first)."""
     u = prov.parse(run / "output.jsonl", run / "stderr.log")
     row.update(cost_usd=u.cost_usd, cost_estimated=u.estimated, input_tokens=u.input_tokens,
-               output_tokens=u.output_tokens, cache_read_tokens=u.cache_read_tokens)
+               output_tokens=u.output_tokens, cache_read_tokens=u.cache_read_tokens, session_id=u.session_id)
     transcript = (run / "output.jsonl").read_bytes() if (run / "output.jsonl").exists() else b""
     ended, handoff = _read_json(run / "exit.json"), _read_json(run / "result.json")
     ended = ended if isinstance(ended, dict) else {}
@@ -374,6 +377,47 @@ def _finish(row: dict, bench_dir: Path, task: dict, ws: Path, run: Path, keep: P
     durable_write(keep / "diff.patch", diff.decode(errors="replace"))
     durable_write(keep / "tests.log", log_tail)
     return row
+
+
+def criteria(spec: str) -> str:
+    """The spec's acceptance section (from a line starting 'Acceptance' to the next 'Word:' heading),
+    else the whole spec: what the blind reviewer scores each arm's diff against."""
+    lines = spec.splitlines()
+    start = next((i for i, x in enumerate(lines) if re.match(r"(?i)\s*(#+\s*)?acceptance\b", x)), None)
+    if start is None:
+        return spec.strip()
+    end = next((i for i in range(start + 1, len(lines))
+                if re.match(r"\s*(#+\s*)?[A-Z][\w ()#,'-]{0,40}:(\s|$)", lines[i])), len(lines))
+    return "\n".join(lines[start:end]).strip()
+
+
+def blind_cells(out: Path, tasks: dict, arms: dict, cells: list[dict]) -> dict:
+    """The blind review's input from <out>/results.jsonl: one cell per task and repeat whose arms all
+    have a row (a repeat's task id gets '-r<rep>' when the plan has several). Each arm carries its diff
+    and only what names the arm, so prep masks those tokens; run stats stay in results.jsonl."""
+    rows = {}
+    for line in (out / "results.jsonl").read_text().splitlines() if (out / "results.jsonl").exists() else []:
+        try:
+            r = json.loads(line)
+            rows[(r["task"], r["rep"], r["arm"])] = r
+        except (ValueError, KeyError, TypeError):
+            continue
+    reps = sorted({c["rep"] for c in cells})
+    got = []
+    for tid, task in tasks.items():
+        for rep in reps:
+            if any((tid, rep, a) not in rows for a in arms):
+                continue
+            side = {}
+            for a in sorted(arms):
+                r, keep = rows[(tid, rep, a)], out / "cells" / f"{tid}-r{rep}-{a}"
+                diff = (keep / "diff.patch").read_text(errors="replace") if (keep / "diff.patch").exists() else ""
+                side[a] = {"diff": diff, **{k: arms[a].get(k, "") for k in ("provider", "model", "effort")},
+                           "run_id": keep.name, "session_id": r.get("session_id") or "",
+                           "transcript": str(keep / "output.jsonl")}
+            got.append({"task": str(tid) if len(reps) == 1 else f"{tid}-r{rep}",
+                        "criteria": criteria(str(task.get("spec") or "")), "arms": side})
+    return {"cells": got}
 
 
 def run(bench_dir: Path, out: Path, arms: dict, reps: int, seed: int, opts: dict, cfg: dict,
@@ -414,4 +458,5 @@ def run(bench_dir: Path, out: Path, arms: dict, reps: int, seed: int, opts: dict
             f.flush()
             os.fsync(f.fileno())
         added.append(row)
+    durable_write(out / "cells.json", json.dumps(blind_cells(out, tasks, arms, plan["cells"]), indent=1) + "\n")
     return added

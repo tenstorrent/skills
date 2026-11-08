@@ -1090,7 +1090,13 @@ recorded `isolation_failed`. Each cell appends a row to
 transcript and diff) and keeps its transcript, diff and test log under `cells/`; a rerun into the same
 folder skips recorded cells and refuses a different plan. A cell whose hand-off is not a JSON
 object is still graded (hand-off `invalid`); any other fault after its agent ran records the cell
-as `error` with its cost and wall time, so the bench moves on and a rerun does not pay for it again. `--dry-run` runs every arm on the fake agent:
+as `error` with its cost and wall time, so the bench moves on and a rerun does not pay for it again. Each run
+also writes `cells.json`, the blind review's input: per task and repeat whose arms all ran (task id
+`<id>-r<rep>` when there are several repeats), the acceptance section of its spec (the whole spec when
+it has none) and each arm's diff with the provider, model, effort, run id (its `cells/` folder name),
+session id and transcript path, which prep masks. `ttp bench blind <words>` runs
+`python3 -m ttp.benchblind <words>` (Blind review for model comparisons), and its prep also takes the
+run folder: `ttp bench blind prep <run folder> --out <dir>`, then `review`, `score` and `reveal`. `--dry-run` runs every arm on the fake agent:
 no model call and no spend. The cells run as the same user as the command with the real home
 folder, so the denial and the audit, not the operating system, keep a candidate from those paths: a
 read the audit cannot see (a path built at run time, or one under another name) stays a gap. A
