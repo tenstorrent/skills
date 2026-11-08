@@ -619,7 +619,7 @@ def test_code_workers_get_the_exact_checks_commands_and_no_unconditional_pytest_
     worker = " ".join((PLUGIN / "template" / "prompts" / "worker.md").read_text(encoding="utf-8").split())
     assert "Cap pytest -n at $TTP_TEST_SLOTS." not in worker
     assert "Cap pytest -n at $TTP_TEST_SLOTS" not in worker, "a bare -n $TTP_TEST_SLOTS holds no host test slots"
-    assert "A pytest -n above 1 (only with xdist) runs inside `ttp clip -- ttp sandbox --`, at most $TTP_TEST_SLOTS." in worker
+    assert "pytest -n N (xdist): `ttp clip -- ttp sandbox --`, N <= $TTP_TEST_SLOTS." in worker
 
 
 def test_code_workers_try_to_break_their_change_before_the_hand_off():

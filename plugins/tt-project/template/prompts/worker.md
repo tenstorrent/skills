@@ -50,8 +50,7 @@
   min; exit 1: never start or send it on a timer, wait on that check.
 - Make durable progress early (commit, or write to the output folder): a killed run keeps what's on disk.
 - Run builds and test suites as `ttp clip -- <command>` (failures or head and tail, and the log's
-  path). A pytest -n above 1 (only with xdist) runs inside `ttp clip -- ttp sandbox --`, at most
-  $TTP_TEST_SLOTS.
+  path). pytest -n N (xdist): `ttp clip -- ttp sandbox --`, N <= $TTP_TEST_SLOTS.
 - Read files narrowly: `grep -n` first, then only the ranges you need (`sed -n 'a,bp'`, or Read with
   offset and limit). Do not re-read a range: later calls pay it again.
 <!-- ttp:if harness -->
