@@ -1556,8 +1556,7 @@ def status_text(p: Project, verbose: bool = False) -> str:
     head = f"{p.name}: daemon {state}" + (f" ({projpause.describe(pause, p, now)})" if pause else "")
     head += " · tasks: " + (", ".join(f"{k} {v}" for k, v in sorted(counts.items())) if counts else "none yet")
     head += " · " + timefmt.long(now, p)
-    from . import overseer
-    lines = [head, "  " + overseer.line(overseer.read(p), now)]
+    lines = [head]
     for m in attention(db, now, p)[:6]:
         text = " ".join(m["text"].split())
         what = (f"ask {m['id']}" + (f"; {m['auto']}" if m.get("auto") else "")) if m["kind"] == "ask" else f"alert {m['id']}"
@@ -1608,6 +1607,8 @@ def status_text(p: Project, verbose: bool = False) -> str:
     from . import lease
     if lease_line := lease.status_line(p, p.config(), now):
         lines.append(lease_line)
+    from . import overseer   # the tick loop judged by its results, read from the overseer's file
+    lines.append(overseer.line(overseer.read(p), now))
     lines.append("budget: " + h["spend"]["headline"])
     lines += h["spend"].get("slot_lines") or []
     c = h["coordinator"]
