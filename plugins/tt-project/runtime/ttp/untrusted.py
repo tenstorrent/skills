@@ -20,7 +20,8 @@ set TTP_UNTRUSTED_INPUT=1 (a benchmark cell without a project). Then, model-free
 - reads of credential files outside the run's worktree are refused (cred_path): a path whose folder
   is a credential store (CRED_DIRS), whose name is a credential file (CRED_FILES), a private key or
   certificate (CRED_SUFFIXES, id_* but .pub), or names a token, secret, credential, password or API
-  key, a process's environ file; named in a Bash command's words or a Read, Grep or Glob path.
+  key, a process's environ file; named in a Bash command's words or a Read, Grep or Glob path, or
+  looked for by a find from outside the worktree (`find ~ -name '*.pem'`).
   So are environment dumps (printenv, a bare env, export or set), which print tokens.
 Not covered: a path or command built at run time inside a script or inline code (except git and gh,
 whose wrappers run anyway), other HTTP clients (httpie, python requests), GET requests that carry
@@ -182,17 +183,47 @@ def cred_path(word: str, cwd: str) -> bool:
     word = word.lstrip("@<")
     if not word or ("/" not in word and not word.startswith(("~", "."))):
         return False
-    path = os.path.normpath(os.path.join(cwd, os.path.expandvars(os.path.expanduser(word))))
-    top = _top(cwd)
-    if path == top or path.startswith(top + os.sep):
+    if not _outside(word, cwd):
         return False
+    path = os.path.normpath(os.path.join(cwd, os.path.expandvars(os.path.expanduser(word))))
     if re.fullmatch(r"/proc/[^/]+/environ", path):
         return True
     rel = path.replace(os.sep, "/")
     if any(f"/{d}/" in rel + "/" for d in CRED_DIRS):
         return True
-    name = os.path.basename(path)
+    return cred_name(os.path.basename(path))
+
+
+def cred_name(name: str) -> bool:
+    """A file name (or a find -name pattern, its wildcards dropped) a credential file has."""
+    name = name.strip("*?")
     return name in CRED_FILES or name.endswith(CRED_SUFFIXES) or bool(CRED_NAME_RE.search(name))
+
+
+def _outside(path: str, cwd: str) -> bool:
+    path, top = os.path.normpath(os.path.join(cwd, os.path.expandvars(os.path.expanduser(path)))), _top(cwd)
+    return path != top and not path.startswith(top + os.sep)
+
+
+def _find_refusal(argv: list[str], cwd: str) -> bool:
+    """A find from a folder outside the worktree looking for a credential file by name."""
+    roots = []
+    for w in argv[1:]:
+        if w.startswith(("-", "(", "!")):
+            break
+        roots.append(w)
+    if not any(_outside(r, cwd) for r in roots or ["."]):
+        return False
+    return any(argv[i] in ("-name", "-iname", "-path", "-ipath", "-wholename") and cred_name(
+        os.path.basename(argv[i + 1])) for i in range(1, len(argv) - 1))
+
+
+def _words(s: list[str]) -> list[str]:
+    """A segment's words to check: its first too unless it is a program (a split `$(...)` leaves a path)."""
+    if not s:
+        return []
+    first = os.path.expanduser(s[0])
+    return s[1:] if "/" not in s[0] or (os.path.isfile(first) and os.access(first, os.X_OK)) else s
 
 
 def _env_dump(argv: list[str]) -> bool:
@@ -217,7 +248,8 @@ def bash_refusal(segments: list[list[str]], raw: list[list[str]], cwd: str) -> s
     if any(_env_dump(s) for s in raw if s):
         return WHY(label=LABEL, what="never dumps its environment, which holds tokens") + \
             "Print one harmless variable by name with `echo \"$NAME\"`"
-    if any(cred_path(w, cwd) for s in segments for w in s[1:]):
+    if any(cred_path(w, cwd) for s in segments for w in _words(s)) or any(
+            _find_refusal(s, cwd) for s in segments if s and os.path.basename(s[0]) == "find"):
         return WHY(label=LABEL, what="never reads credential, token or secret files outside its worktree") + \
             "ssh, git and gh read their own credentials; give a stored secret to a command with `ttp secret env`"
     allowed = writes_allowed()

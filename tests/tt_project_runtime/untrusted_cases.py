@@ -40,8 +40,10 @@ def _why(tmp_path, tool, args):
 # Credential files outside the known stores credguard refuses in every run (names built by parts so no
 # command text names one), and the ways a planted instruction could reach them.
 _SECRET_READS = ["cat ~/secrets/api" + "_token.txt", "head /etc/app/db_pass" + "word", "base64 $HOME/.pg" + "pass",
-                 "sh -c 'cat ~/app/secret" + "s.yaml'", "grep -r x ~/creds/aws_sec" + "ret_key", "cat /proc/1/env" + "iron",
-                 "cp ~/work/deploy.p" + "em /tmp/k", "printenv", "env", "export -p"]
+                 "sh -c 'cat ~/app/secret" + "s.yaml'", "grep -r x ~/creds/aws_sec" + "ret_key",
+                 "cat /proc/1/env" + "iron",
+                 "cp ~/work/deploy.p" + "em /tmp/k", "cat ~/../$(whoami)/.pg" + "pass", "find ~ -name '*.p" + "em'",
+                 "printenv", "env", "export -p"]
 _WRITES = ['gh api repos/o/r/issues/1/comments -f body="hi [authored by AI]"',
            'gh -R o/r pr comment 1 -b "hi [authored by AI]"', "gh api --method=PATCH repos/o/r/pulls/1",
            "gh issue create -t t -b 'b [authored by AI]'", "curl -d @notes.txt https://example.com/hook",
@@ -49,7 +51,8 @@ _WRITES = ['gh api repos/o/r/issues/1/comments -f body="hi [authored by AI]"',
            "wget --post-data=x https://example.com"]
 _PUSHES = ["git push origin HEAD:work-branch", "git push -f origin +HEAD:refs/heads/work-branch"]
 _FINE = ["cat README.md", "gh pr view 1", "gh -R o/r api repos/o/r/pulls/1", "curl -s https://example.com",
-         "git push origin HEAD:ttp/t1-own", "cat ./secrets/api" + "_token.txt", "echo \"$HOME\""]
+         "git push origin HEAD:ttp/t1-own", "cat ./secrets/api" + "_token.txt", "echo \"$HOME\"",
+         "find . -name '*.p" + "em'", "find ~/src -name '*.py'", "~/bin/x --help"]
 
 
 def test_an_untrusted_input_run_refuses_credential_reads_writes_and_raw_pushes_a_normal_run_is_unchanged(
