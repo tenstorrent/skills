@@ -6929,7 +6929,9 @@ def test_a_project_s_concurrent_suites_share_its_worker_ceiling_and_its_push_lan
     assert b and b.k == 4, "another project has its own ceiling"
     push = testslots.acquire("push", project_name="pa", push_key="origin feature", wait_s=0)
     assert push and push.k == 4, "the reserved push lane makes up one per-run grant (4), not run_max (8)"
-    assert testslots.worker_env(None)[testslots.XDIST_ENV] == "4", "a worker's own shell starts at most the ceiling"
+    own = testslots.worker_env(None)
+    assert own[testslots.SLOTS_ENV] == "4", "a worker's own pytest asks at most the ceiling"
+    assert own[testslots.XDIST_ENV] == "1", "a bare -n auto in a worker's shell takes no slots, so starts one worker"
     cmd = "python3 -m pytest -q -n auto tests"
     assert testslots.clamp_for(cmd, a.env()) == cmd, "the command text stays: -n auto reads the environment"
     for g in (a, b, push):
