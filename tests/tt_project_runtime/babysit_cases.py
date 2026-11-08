@@ -1,6 +1,6 @@
 # Babysitting-decision tests of tests/test_tt_project_runtime.py, which runs this file in its own namespace
 # (see _include_cases there): helpers, fixtures and imports come from that file, and pytest collects
-# these tests under its name. Add new tests of babysit.py, routeguard.py and budget.daily_target_usd here.
+# these tests under its name. Add new tests of babysit.py, routeguard.py, budget.daily_target_usd and dailyspend.py here.
 from __future__ import annotations
 
 _BS_CHAT = {"endpoint": "placeholder", "base_url": "https://chat.example.invalid/v1",
@@ -164,6 +164,56 @@ def test_the_daily_target_shows_claude_spend_today_against_it(env):
     assert audit.target_line(p.db, p.config()) == "daily target $330: Claude $400.00 today, $70.00 over"
     assert audit.lines(p.db, p=p)[0] == "daily target $330: Claude $400.00 today, $70.00 over"
 
+
+
+def test_daily_spend_splits_each_project_by_class_real_beside_booked_against_the_target(env, tmp_path):
+    from ttp import audit, dailyspend
+    import json as _json
+    p = make(env)
+    review = p.db.x("INSERT INTO tasks(title, kind) VALUES('review it','review')")
+    code = p.db.x("INSERT INTO tasks(title, kind) VALUES('change it','code')")
+    now = 100000.0
+
+    def run(task, role, provider, model, cost, out=None, status=None, ended=now - 60, state="ok", **toks):
+        d = tmp_path / f"run{task}-{role}-{cost}-{state}"
+        d.mkdir()
+        if out:
+            (d / "output.jsonl").write_text(_json.dumps({"type": "result", "modelUsage": out}) + "\n")
+        if status:
+            (d / "result.json").write_text(_json.dumps({"status": status}))
+        p.db.x("INSERT INTO runs(task, role, provider, model, cost_usd, input_tokens, output_tokens, status, "
+               "started, ended, dir) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+               (task, role, provider, model, cost, toks.get("inp", 0), toks.get("outp", 0), state,
+                (ended or now) - 30, ended, str(d)))
+    # booked at the alias's dearest row; its output names the model it used: real is its tokens there
+    run(None, "coordinator", "claude", "opus", 10.0, out={"claude-opus-5-5": {"outputTokens": 1}}, inp=1_000_000)
+    run(review, "reviewer", "claude", "claude-sonnet-5-5", 1.0, outp=100_000)    # booked right: one figure
+    run(code, "worker", "codex", "gpt-x", 2.0, status="waiting", inp=5)          # another provider: booked
+    run(code, "worker", "claude", "opus", 3.0, status="done", inp=5)             # only an alias: booked
+    run(code, "worker", "claude", "opus", 50.0, state="running", ended=None)     # still running: not yet
+    run(code, "worker", "claude", "opus", 70.0, ended=now - 90000)              # before the window
+    projects = [("demo", Path(p.db.path))]
+    s = dailyspend.project_split(Path(p.db.path), now - 86400, now)
+    assert {k: (round(v["real"], 2), round(v["booked"], 2), v["runs"]) for k, v in s.items()} == {
+        "coordinator": (4.0, 10.0, 1), "reviews": (1.0, 1.0, 1), "waiting": (2.0, 2.0, 1), "workers": (3.0, 3.0, 1)}
+    assert dailyspend.lines({}, now - 86400, now, projects) == []                 # unset by default: no line
+    assert [dailyspend.target({"daily_target_usd": v}) for v in ("x", -5, None, [1])] == [0.0] * 4
+    assert dailyspend.lines({"daily_target_usd": 12}, now - 86400, now, projects) == [
+        "spend demo: real $10.00 (booked $16.00): coordinator $4.00 (booked $10.00) in 1, reviews $1.00 in 1, "
+        "runs ended waiting $2.00 in 1, other workers $3.00 in 1",
+        "daily target $12: real $10.00 (booked $16.00) in the last 24 h across 1 project(s) on this machine, $2.00 under"]
+    assert dailyspend.lines({"daily_target_usd": 9}, now - 86400, now, projects)[-1].endswith("$1.00 over")
+    gone = dailyspend.lines({"daily_target_usd": 9}, now - 86400, now, projects + [("lost", tmp_path / "no.db")])
+    assert "1 project(s)" in gone[-1] and "unread: lost:" in gone[-1]
+    p.set_config("budget.daily_target_usd", 12.0, by={"by": "user"})
+    import ttp.globalcap as _gc
+    orig = _gc.local_projects
+    _gc.local_projects = lambda skip=None: projects
+    try:
+        got = audit.lines(p.db, now=now, p=p)
+    finally:
+        _gc.local_projects = orig
+    assert got[0].startswith("spend demo: real $10.00") and got[1].startswith("daily target $12: real $10.00")
 
 class _BsTypedJev(_BsJev):
     """Answers each question in its own type's shape, as the live Jev does."""

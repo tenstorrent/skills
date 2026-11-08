@@ -143,6 +143,12 @@ only in the feed and never under "needs you".
   in but names none. While the status says logged out or cannot be read, the last label seen
   stands; before any is seen (after a restart) the account is unknown, so neither is an account
   switch.
+- Daily spend target (a goal, not a cap; unset by default): with `ttp config --account
+  budget.daily_target_usd <usd>`, `ttp status` shows today's Claude spend against it, and the daily
+  review's self-efficiency audit (`ttp audit`) lists each project on this machine with the last 24 h's
+  spend by class (coordinator, reviews, worker runs that ended waiting, other workers), then the total
+  against the target. Each figure is real spend (a Claude run's own tokens priced at the model it
+  actually used) with the booked figure beside it where they differ.
 - Global daily cap (usage-billed, $200/day by default): `budget.global_daily_usd` stops new work in
   every usage-billed project on the account once the whole account's tt-project spend today reaches
   it. "Today" is the rolling 24 hours unless `budget.day_start` is set. Change it for every project
