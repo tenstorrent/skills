@@ -205,6 +205,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # in the lock order a lock-cycle alert checks, beside the words of lockcycle.WIDE_WORDS.
     "locks": {"pre_grant_check": "", "pre_grant_timeout_s": 10, "wait_alert_min": 30, "wide": []},
     "shared_resources": [],             # resources whose slots and pause all the user's projects share
+    # Machines in the user's list (ttp machines) this project uses, beside those its resources and
+    # shared_resources name: the change ledger, health coverage and idle capacity read only these.
+    "machines": {"allowed": []},
     # model / effort, when set, override the coordinator's defaults. Unset, every coordinator turn
     # runs at coordinator.DEFAULT_EFFORT (xhigh, or the provider's highest effort below it) on
     # model_tier's model: the strongest tier's ("deep", read from the provider's tier table; "" = its
@@ -454,8 +457,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # reused, a half-made one remade); then the task is queued again create_retries times, after
     # retry_backoff_s (doubling), before it is blocked for the coordinator. root_branch: the branch the
     # project root's checkout belongs on (unset: the one the daemon last saw it on); a root left
-    # detached or off it is put back when clean, else alerted, and never branched from.
-    "worktree": {"venv": "auto", "link_paths": [".venv"], "kinds": [], "root_branch": "", "git_timeout_s": 120,
+    # detached or off it is put back when clean, else alerted, and never branched from. shared_branches:
+    # more branches many tasks start from (beside main, master, the push branch and delivery.base_ref),
+    # which no task claims as its own.
+    "worktree": {"venv": "auto", "link_paths": [".venv"], "kinds": [], "root_branch": "", "shared_branches": [],
+                 "git_timeout_s": 120,
                  "git_timeout_max_s": 900, "create_attempts": 2, "create_retries": 3, "retry_backoff_s": 120},
     # Commits of the harness's own files (charter, memory, schedules): each git command gets timeout_s.
     # A lock file in its .git older than stale_lock_s (unset: 600 s; 0: off) that no process holds (one a

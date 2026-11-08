@@ -966,7 +966,7 @@ coordinator with that evidence.
   follow-up as announced work from when its run ended: its owner is a later task titled as the step
   (with or without `ready:`) or whose spec quotes it, `none` until one exists.
 - Idle capacity (model-free): a device resource of the project (its device lock, a `*-device` name its
-  config or recent tasks use, or a machine tagged `device` that its charter's Resources names) that
+  config or recent tasks use, or a machine tagged `device` that its config allows, `machines.allowed`) that
   no open task, `ttp lock` slot, reservation or detached-job hold uses for `coordinator.idle_capacity_s`
   (1500; 0 turns it off), while a worker slot is free, the gate is green or yellow and dispatch would
   start nothing, raises one `idle_capacity` event naming it, the running work and the next scheduled
@@ -1891,9 +1891,19 @@ session and stateless coordinators on every provider.
   --machine <alias>`, or a message to any project's coordinator). The setter's daemon checks
   its end, or the machine's recovery owner when the setter cannot act.
 - Each task edits only its own worktree. A code task branches from the first of:
-  `delivery.base_ref`; `delivery.push_branch`, then a branch the charter names as
-  `branch <name>`, each only if it exists here or on origin; the remote's default branch
-  (`origin/HEAD`); the checked-out branch.
+  `delivery.base_ref`; `delivery.push_branch`, only if it exists here or on origin; the remote's
+  default branch (`origin/HEAD`); the checked-out branch. `worktree.shared_branches` lists more
+  branches many tasks start from, which no task claims as its own.
+- Gates that place work or pick its branch read structured settings, never the charter's wording,
+  so rewording, reordering or deleting charter text changes none of them. A project's machines are
+  those its config names (`machines.allowed`, `resources`, `shared_resources`; the change ledger,
+  health coverage, time to recover and idle capacity read these). Settings older harnesses read
+  from charter prose move into the config once, model-free, at the daemon's first start with this
+  release (logged, with a `harness` setter record; `ttp config <key> ''` reverts one, and the charter
+  never fills it again): the Resources machines into `machines.allowed` when the config names none,
+  the first existing charter `branch <name>` into `delivery.base_ref` when neither it nor an existing
+  `delivery.push_branch` is set, and the charter's other branches into `worktree.shared_branches`.
+  Nothing moves that the old reader did not use; `delivery.push_branch` is never written.
   Other kinds run in the project root unless `worktree.kinds` lists them (say `["work"]`); they
   must not move its HEAD. A run that leaves the root on another branch or with new uncommitted
   changes raises an alert naming it. Before a worktree is made, a root left detached or off its

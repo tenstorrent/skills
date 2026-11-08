@@ -473,12 +473,11 @@ def _project_aliases(harness: Path, known: dict) -> list[str]:
     """The machines of the project whose harness folder is `harness` (machine_ledger.project_machines),
     read without touching its state."""
     from . import machine_ledger
-    charter = (harness / "CHARTER.md").read_text()
     try:
         cfg = json.loads((harness / "project.json").read_text())
     except (OSError, ValueError):
         cfg = {}
-    return machine_ledger.project_machines(charter, cfg if isinstance(cfg, dict) else {}, known)
+    return machine_ledger.project_machines(cfg if isinstance(cfg, dict) else {}, known)
 
 
 def machine_status(alias: str | None = None, now: float | None = None) -> list[dict]:

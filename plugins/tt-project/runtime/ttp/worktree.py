@@ -64,22 +64,10 @@ def slug(text: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")[:40] or "task"
 
 
-# "branch <name>", "branch: <name>" or "branch `<name>`" in the charter.
-CHARTER_BRANCH = re.compile(r"\bbranch\b[:\s]+`?([A-Za-z0-9][\w./-]*[\w-])`?")
-
-
-def charter_branches(p: Project) -> list[str]:
-    """Branch names the charter gives as `branch <name>`, in order of appearance, without main,
-    master and HEAD (a charter says those to forbid them)."""
-    try:
-        text = p.charter_path.read_text()
-    except OSError:
-        return []
-    out: list[str] = []
-    for name in CHARTER_BRANCH.findall(text):
-        if name not in ("HEAD", "main", "master") and name not in out:
-            out.append(name)
-    return out
+def shared_branches(p: Project) -> list[str]:
+    """`worktree.shared_branches`: more branches many tasks start from, which none claims alone."""
+    v = (p.config().get("worktree") or {}).get("shared_branches") or []
+    return [str(x).strip() for x in (v if isinstance(v, list) else [v]) if str(x).strip()]
 
 
 def _has(p: Project, ref: str) -> bool:
@@ -88,8 +76,7 @@ def _has(p: Project, ref: str) -> bool:
 
 def base_ref(p: Project) -> str:
     """Where code tasks branch from, the first of: `delivery.base_ref` as set; the project's working
-    branch, `delivery.push_branch`, then a branch the charter names (`branch <name>`), each as
-    origin/<name> when the remote has it (a local branch of that name may be behind; ensure()
+    branch, `delivery.push_branch`, as origin/<name> when the remote has it (a local branch of that name may be behind; ensure()
     fetches first), else the local name; the remote's default branch (origin/HEAD); the
     checked-out branch, never a detached HEAD or a branch the root was moved to (root_base)."""
     return named_base(p) or root_base(p)
@@ -126,10 +113,10 @@ def named_base(p: Project) -> str:
     d = p.config().get("delivery") or {}
     if d.get("base_ref"):
         return d["base_ref"]
-    for ref in [str(d.get("push_branch") or "").strip(), *charter_branches(p)]:
-        for cand in (f"origin/{ref}", ref) if ref else ():
-            if _has(p, cand):
-                return cand
+    ref = str(d.get("push_branch") or "").strip()
+    for cand in (f"origin/{ref}", ref) if ref else ():
+        if _has(p, cand):
+            return cand
     return _git(p.root, "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD", check=False)
 
 
@@ -728,10 +715,10 @@ def lineage_hold(task: dict) -> int | None:
 
 def _shared_branches(p: Project) -> set[str]:
     """Branches many tasks start from without working on them alone: main, master, the push branch,
-    delivery.base_ref and the charter's branches, with and without `origin/`. No git command."""
+    delivery.base_ref and `worktree.shared_branches`, with and without `origin/`. No git command."""
     d = p.config().get("delivery") or {}
     out = {"main", "master"}
-    for ref in (str(d.get("push_branch") or "").strip(), str(d.get("base_ref") or "").strip(), *charter_branches(p)):
+    for ref in (str(d.get("push_branch") or "").strip(), str(d.get("base_ref") or "").strip(), *shared_branches(p)):
         if ref:
             out |= {ref, ref[7:] if ref.startswith("origin/") else ref}
     return out

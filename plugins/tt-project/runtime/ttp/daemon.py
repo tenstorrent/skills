@@ -42,6 +42,7 @@ from . import sshmux
 from . import tailnet
 from . import sshagent
 from . import ackwait
+from . import charterset
 from . import claimcheck
 from . import dispatchguard
 from . import runclass
@@ -1528,6 +1529,11 @@ class Daemon:
                 self._load_config()
         except (OSError, RuntimeError) as e:
             log(self.p, f"home time zone not set: {e}")
+        try:   # settings older harnesses read from charter prose move into the config, once (charterset)
+            if charterset.migrate(self.p, log=lambda m: log(self.p, m)):
+                self._load_config()
+        except Exception:
+            log(self.p, "charter settings move error: " + traceback.format_exc().replace("\n", " | ")[:2000])
         try:   # coordinator turns from before runs recorded cache telemetry (bud.backfill_cache_telemetry)
             filled = bud.backfill_cache_telemetry(self.p.db, self.p.runs)
             if any(filled.values()):

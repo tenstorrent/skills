@@ -2290,34 +2290,37 @@ def charter_machines(charter: str, known) -> list[str]:
 
 
 def configured_machines(cfg: dict, known) -> list[str]:
-    """The machines in `known` the project's config authorizes explicitly: a `resources` limit or a
-    `shared_resources` entry that is the alias or a resource on it (`<alias>-device`)."""
+    """The machines in `known` the project's config authorizes explicitly: `machines.allowed`, a
+    `resources` limit or a `shared_resources` entry that is the alias or a resource on it
+    (`<alias>-device`)."""
     res = cfg.get("resources")
     shared = cfg.get("shared_resources")
+    allowed = (cfg.get("machines") or {}).get("allowed") if isinstance(cfg.get("machines"), dict) else None
     names = [str(x) for x in (res if isinstance(res, dict) else {})]
     names += [x for x in (shared if isinstance(shared, list) else []) if isinstance(x, str)]
+    names += [x for x in (allowed if isinstance(allowed, list) else []) if isinstance(x, str)]
     return sorted(a for a in known if any(n == a or n.startswith((a + "-", a + ":")) for n in names))
 
 
-def project_machines(charter: str, cfg: dict, known) -> list[str]:
-    """A project's machines: those its config authorizes explicitly when it names any, else those its
-    charter's Resources section names outside a prohibition. A machine whose list entry is retired
-    (machines.retired) is never one."""
-    live = [a for a in known if not machines.retired(known.get(a) if isinstance(known, dict) else None)]
-    return configured_machines(cfg, live) or charter_machines(charter, live)
+def live_machines(known) -> list[str]:
+    """The machines in `known` whose list entry is not retired (machines.retired)."""
+    return [a for a in known if not machines.retired(known.get(a) if isinstance(known, dict) else None)]
+
+
+def project_machines(cfg: dict, known) -> list[str]:
+    """A project's machines: those its config authorizes (configured_machines), never one whose list
+    entry is retired. The charter's prose is never read: charterset moved its Resources list into
+    `machines.allowed` once."""
+    return configured_machines(cfg, live_machines(known))
 
 
 def resource_machines(p) -> list[str]:
     """The machines in the user's list that are the project's (project_machines)."""
     try:
-        charter = p.charter_path.read_text()
-    except OSError:
-        charter = ""
-    try:
         cfg = p.raw_config()
     except Exception:
         cfg = {}
-    return project_machines(charter, cfg if isinstance(cfg, dict) else {}, machines.load())
+    return project_machines(cfg if isinstance(cfg, dict) else {}, machines.load())
 
 
 def digest_lines(p, now: float | None = None) -> list[str]:

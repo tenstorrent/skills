@@ -9178,7 +9178,8 @@ def test_task_branches_start_from_a_remote_only_base(env):
 
 
 def test_task_branches_start_from_the_working_branch_before_origin_head(env):
-    """base_ref unset: delivery.push_branch, then a branch the charter names, then origin/HEAD."""
+    """base_ref unset: delivery.push_branch, then origin/HEAD. A branch the charter names moves into
+    delivery.base_ref once (charterset); after that its wording changes nothing."""
     p = make(env)
     from ttp import worktree
     repo = env["repo"]
@@ -9195,12 +9196,18 @@ def test_task_branches_start_from_the_working_branch_before_origin_head(env):
     assert worktree.base_ref(p) == default
     p.charter_path.write_text(p.charter_path.read_text() + "\nNever push to main. Each change is made on "
                               "a work branch, then pushed to branch gone/away, then branch `team/work`.\n")
-    assert worktree.base_ref(p) == "origin/team/work", "the charter's existing branch, not main or a missing one"
-    assert worktree.resolve_base(p) == "origin/team/work"
+    assert worktree.base_ref(p) == default, "charter prose never picks the base"
+    from ttp import charterset
+    assert charterset.migrate(p) == {"delivery.base_ref": "origin/team/work",
+                                     "worktree.shared_branches": ["gone/away"]}, "the old reader's pick, once"
+    assert worktree.base_ref(p) == "origin/team/work" and worktree.resolve_base(p) == "origin/team/work"
+    p.charter_path.write_text(p.charter_path.read_text().replace("team/work", "push/target"))
+    assert charterset.migrate(p) == {} and worktree.base_ref(p) == "origin/team/work", "rewording moves nothing"
+    p.set_config("delivery.base_ref", "")
     p.set_config("delivery.push_branch", "origin/push/target")
     assert worktree.base_ref(p) == "origin/push/target"
     p.set_config("delivery.push_branch", "not/there")
-    assert worktree.base_ref(p) == "origin/team/work", "a push branch that does not exist yet is skipped"
+    assert worktree.base_ref(p) == default, "a push branch that does not exist yet is skipped"
     _git_out(repo, "branch", "local/only")
     p.set_config("delivery.push_branch", "local/only")
     assert worktree.base_ref(p) == "local/only", "a branch only this clone has is used by its own name"
@@ -39816,8 +39823,15 @@ def test_heal_outage_check_whose_adopted_task_fails_raises_one_high_alert(env):
 # shared machines: recovery owner and change ledger (machine_ledger.py) -----------------------------
 
 def _resources(p, text):
+    """The charter's Resources gain `text`, and `machines.allowed` the listed machines it names (as the
+    coordinator records a Resources change with config_set: the charter's prose is never read)."""
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
     c = p.charter_path.read_text()
     p.charter_path.write_text(c.replace("## Resources\n", f"## Resources\n{text}\n", 1))
+    known = mm.load()
+    if names := ml.charter_machines(p.charter_path.read_text(), ml.live_machines(known)):
+        p.set_config("machines.allowed", names)
 
 
 def test_machines_set_names_a_recovery_owner_that_an_update_keeps(env, capsys):
