@@ -369,7 +369,7 @@ def test_the_daily_review_reports_the_wake_gate(env):
     waitgate.log(p.db, 1, waitgate.Decision(False, "jev", "jev needed=0.10", jev_call=call), avoided_usd=0.4)
     waitgate.log(p.db, 1, waitgate.Decision(True, "fallback", "no rule or Jev decided"))
     line = waitgate.line(p.db, p.config())
-    assert line.startswith("Wait-wake gate over the last 7 d: 3 decisions, 2 skipped (1 by rules, 1 by Jev), 1 woke")
+    assert line.startswith("Wait-wake gate over the last 7 d: 3 decisions, 2 skipped (1 by rules, 0 by the watcher, 1 by Jev), 1 woke")
     assert "Jev 1 calls $0.01" in line and "estimated saving $0.80, net $0.79" in line, line
     s = {"name": "daily-review", "budget_usd_day": None, "last_run": None, "description": "review"}
     assert dm._schedule_llm(s, {}) == "queued"
