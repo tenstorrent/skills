@@ -3101,15 +3101,13 @@ class SecretsUnreadable(OSError):
 
 
 def load_secrets() -> dict:
-    """Per-user credentials shared by every project of this user on this machine (mode 0600).
-    Never copied into a project folder, never printed. A store that is there but cannot be read raises
-    SecretsUnreadable, so a caller that needs a secret fails clearly; read-only status uses secrets_state."""
-    try:
-        return json.loads(secrets_path().read_text())
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
-    except (OSError, UnicodeDecodeError) as e:   # bad bytes: as unreadable as a hidden store
-        raise SecretsUnreadable(f"cannot read the secrets store at {secrets_path()}: {getattr(e, 'strerror', None) or e}") from None
+    """Per-user credentials shared by every project of this user on this machine, read at run time from
+    this machine's store (secretstore: secrets.json mode 0600 by default, or the keychain, a fetch
+    command, the environment). Never copied into a project folder, never printed. A store that is there
+    but cannot be read raises SecretsUnreadable, so a caller that needs a secret fails clearly; read-only
+    status uses secrets_state."""
+    from . import secretstore
+    return secretstore.load()
 
 
 def secrets_state() -> dict:
@@ -3123,8 +3121,9 @@ def secrets_state() -> dict:
 
 
 def save_secret(key: str, value: Any) -> None:
-    HOME_DIR.mkdir(parents=True, exist_ok=True)
-    os.chmod(HOME_DIR, 0o700)
+    """One slot into this machine's store; secretstore.ReadOnly where it takes no writes (a fetch
+    command, the environment, or plaintext on a host marked shared)."""
+    from . import secretstore
     data = load_secrets()
     data[key] = value
-    durable_write(secrets_path(), json.dumps(data), mode=0o600)
+    secretstore.save(data)

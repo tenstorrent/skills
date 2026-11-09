@@ -77,14 +77,6 @@ def custom(slot: str) -> bool:
     return slot not in BUILTIN and not slot.startswith(PREFIX)
 
 
-def _sig(path: Path):
-    try:
-        st = path.stat()
-    except OSError:
-        return None
-    return (str(path), st.st_mtime_ns, st.st_size, st.st_ino)
-
-
 def _collect(slot: str, v: Any, field: str, out: list[tuple[str, str]], every: bool = False) -> None:
     if isinstance(v, dict):
         for k, x in v.items():
@@ -101,9 +93,10 @@ def pairs() -> list[tuple[str, str]]:
     Re-read only when the store changes. Never raises: every DB write and daemon log line calls this,
     so a store it cannot read or parse (wrong owner or mode, a folder, bad bytes, not a JSON object)
     keeps the last good pairs (none if never read) and is read again on the next call."""
-    from .project import load_secrets, secrets_path
+    from .project import load_secrets
+    from . import secretstore
     try:
-        sig = _sig(secrets_path())
+        sig = secretstore.signature()   # the file's stat, or a time bucket for a keychain or fetched store
         if sig == _cache["sig"]:
             return _cache["pairs"]
         data = load_secrets() if sig else {}

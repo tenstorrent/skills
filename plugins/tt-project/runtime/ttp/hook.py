@@ -823,7 +823,7 @@ WEB_TOKEN_RE = re.compile(r"state/+web\.token\b")
 # output stays in the run's log and its agent's transcript, so a run tests a key with
 # `ttp secret check` and gives one to a command with `ttp secret env` (also `--secret`) instead.
 SECRET_FILE_RE = re.compile(r"(?:\.tt-project|TTP_HOME\}?)/+secrets\.json\b")
-SECRET_CALL_RE = re.compile(r"(?<!def )\b(?:credentials|load_secrets|env_for)\s*\(|\bendpoint\.saved\s*\(|\bsecrets_path\s*\(")
+SECRET_CALL_RE = re.compile(r"(?<!def )\b(?:credentials|load_secrets|env_for)\s*\(|\bendpoint\.saved\s*\(|\bsecrets_path\s*\(|\bsecretstore\.(?:load|BACKENDS|_\w+_load)\b")
 
 
 def secret_read(cmd: str, segments: list[list[str]], cwd: str) -> str | None:
@@ -838,8 +838,9 @@ def secret_read(cmd: str, segments: list[list[str]], cwd: str) -> str | None:
         return why
     try:
         from .project import secrets_path
-        if str(secrets_path()) in cmd:
-            return why
+        from .secretstore import ENV_VAR, command_words
+        if any(w and w in cmd for w in (str(secrets_path()), ENV_VAR, *command_words())):
+            return why   # also the keychain item or this machine's fetch command, run directly
     except Exception:
         pass
     runs = [s for s in segments if s and _interpreter_args(s) is not None]
