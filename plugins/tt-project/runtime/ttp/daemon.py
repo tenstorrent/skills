@@ -1228,6 +1228,8 @@ class Daemon:
         self._models_tried = 0.0
         self._rank_job: threading.Thread | None = None   # the chat model ranking refresh (refresh_model_ranking)
         self._rank_tried, self._rank_out = 0.0, None
+        self._bench_job: threading.Thread | None = None   # the host's daily model bench (run_model_bench)
+        self._bench_tried, self._bench_out = 0.0, None
         self._cli_watch: threading.Thread | None = None   # CLI versions being read (watch_cli_versions)
         self._cli_watched = 0.0   # when that last started
         self._replica_checked = 0.0
@@ -2154,6 +2156,7 @@ class Daemon:
                 self.route_machines,
                 self.check_route_models,
                 self.refresh_model_ranking,
+                self.run_model_bench,
                 self.refresh_coverage,
                 self.lift_quarantine,
                 self.sweep_holds,
@@ -4261,6 +4264,35 @@ class Daemon:
 
         self._rank_job = threading.Thread(target=work, name="model-ranking", daemon=True)
         self._rank_job.start()
+
+    def run_model_bench(self) -> None:
+        """The host's shared daily model bench (modelbench.py), model-free until due: at most every 15
+        minutes, once today's is due and no project on the host has run it, it runs in a thread. A skip for
+        want of a working key is one low alert per outage; a bench is one log line."""
+        from . import modelbench, modelrank
+        out, self._bench_out = self._bench_out, None
+        if out and out.get("report"):
+            self.alert(modelbench.NOKEY, f"The daily chat model bench was skipped: {out['skipped']}. No model "
+                       "was called; it is skipped quietly each day until a key works.", severity="low")
+        elif out and out.get("results") is not None:
+            log(self.p, f"model bench {out['date']}: {len(out['results'])} model(s); weak: {', '.join(out['weak']) or 'none'}")
+        if os.environ.get("PYTEST_CURRENT_TEST") and not os.environ.get("TTP_TEST_MODEL_BENCH"):
+            return   # daemons under test never bench, unless a test asks
+        now = time.time()
+        if (now - self._bench_tried < 900 or self._bench_job is not None and self._bench_job.is_alive()
+                or not modelbench.due(self.cfg, now)):
+            return
+        self._bench_tried = now
+        cfg, name, parked, where = self.cfg, self.p.name, modelrank.parked_models(self.p.db), self.p
+
+        def work() -> None:
+            try:
+                self._bench_out = modelbench.run(name, cfg, parked, time.time())
+            except Exception as e:   # a local fault (an unwritable home): the type only
+                log(where, f"model bench: failed: {type(e).__name__}")
+
+        self._bench_job = threading.Thread(target=work, name="model-bench", daemon=True)
+        self._bench_job.start()
 
     def probe_mcp(self) -> None:
         """Refresh this host's connected MCP servers for the status feed (mcpgap.py): `claude mcp list` in

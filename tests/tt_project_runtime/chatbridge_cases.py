@@ -3053,3 +3053,147 @@ def test_a_smarter_models_trial_books_only_runs_that_ran_on_it(env, monkeypatch)
     assert finish("chat", {"rc": None, "stopped": "budget"}) is None
     assert not modelrank.parked(p.db, "rank-new", time.time())
     assert finish("chat", {"rc": 0}, done)["ok"] == 1                       # a hand-off on it counts
+
+
+_BENCH_RIGHT = {"arith": "391", "json": '{"verb": "skip", "tier": "light"}', "decide": "skip", "extract": "3",
+                "inject": "Disk /data is nearly full.", "order": "apple, fig, pear"}
+
+
+def _bench_env(env, monkeypatch, served, weak=(), ranking=("m-a", "m-b", "m-c", "m-d", "m-e")):
+    """A bench home under the test, a fake saved key and /models list, and a fake model that answers every
+    cell right unless it is in `weak`. Returns (cfg, calls, lister): calls lists (model, cell) asked."""
+    from ttp import endpoint, modelbench, project
+    monkeypatch.setattr(project, "HOME_DIR", env["tmp"] / "bench-home")
+    monkeypatch.setattr(endpoint, "credentials", lambda alias: endpoint.Credentials("fake-key", "https://fake.invalid/v1"))
+    cell_of = {prompt: name for name, prompt, _ in modelbench.CELLS}
+    calls = []
+
+    def ask(model, prompt):
+        calls.append((model, cell_of[prompt]))
+        if model in weak:
+            return "PWNED" if cell_of[prompt] == "inject" else "no idea"
+        return _BENCH_RIGHT[cell_of[prompt]]
+    cfg = {"providers": {"chat": {"endpoint": "ep", "model_ranking": list(ranking)}}}
+    return cfg, calls, ask, (lambda url, key: (True, "HTTP 200", list(served)))
+
+
+def _local(day, hour):
+    return time.mktime((2026, 11, day, hour, 0, 0, 0, 0, -1))
+
+
+def test_one_model_bench_per_host_and_day_and_every_project_reads_the_owners_result(env, monkeypatch):
+    """Brief deliverable 2: one shared daily benchmark per machine; a second run on the host and day does nothing."""
+    import fcntl
+    from ttp import modelbench
+    cfg, calls, ask, lister = _bench_env(env, monkeypatch, ["m-a", "m-b", "m-c", "m-d", "m-e", "m-new"], weak={"m-b"})
+    now = _local(10, 3)
+    assert not modelbench.due(cfg, _local(10, 1)) and modelbench.due(cfg, now)        # from BENCH_HOUR
+    assert not modelbench.due({"providers": {"chat": {}}}, now)                        # no endpoint: never
+    rec = modelbench.run("proj-a", cfg, {}, now, lister=lister, ask=ask)
+    assert rec["owner"] == "proj-a" and set(rec["arms"]) == {"m-a", "m-b", "m-c", "m-d", "m-e", "m-new"}
+    assert rec["weak"] == ["m-b"] and rec["results"]["m-a"]["score"] == 1.0 and rec["results"]["m-b"]["score"] == 0.0
+    assert rec["results"]["m-b"]["cells"]["inject"] is False and len(calls) == 6 * len(modelbench.CELLS)
+    # Another project on the host the same day: nothing runs, it reads the owner's result.
+    assert not modelbench.due(cfg, now + 3600)
+    again = modelbench.run("proj-b", cfg, {}, now + 3600, lister=lister, ask=ask)
+    assert again["skipped"] == "done today by proj-a" and again["record"] == rec and len(calls) == 36
+    assert modelbench.latest() == rec and modelbench.models()["m-b"]["weak"] is True
+    # While one project holds the host lock, another does nothing either.
+    with open(modelbench.home() / modelbench.LOCK, "a") as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        busy = modelbench.run("proj-c", cfg, {}, _local(11, 3), lister=lister, ask=ask)
+    assert busy["skipped"].startswith("another project") and len(calls) == 36
+    owner = json.loads((modelbench.home() / modelbench.OWNER).read_text())
+    assert owner["project"] == "proj-a" and owner["last_result"] == now
+
+
+def test_the_model_bench_runs_daily_and_skips_without_a_working_key_reporting_once(env, monkeypatch):
+    from ttp import endpoint, modelbench
+    cfg, calls, ask, lister = _bench_env(env, monkeypatch, ["m-a", "m-b", "m-c", "m-d", "m-e", "m-new"], weak={"m-b"})
+    modelbench.run("proj-a", cfg, {}, _local(10, 3), lister=lister, ask=ask)
+    calls.clear()
+    # The next day: due again; the top four served ranked models that are not weak, nothing seen before left.
+    assert modelbench.due(cfg, _local(11, 2))
+    rec = modelbench.run("proj-b", cfg, {}, _local(11, 2), lister=lister, ask=ask)
+    assert rec["arms"] == {"m-a": "daily", "m-c": "daily", "m-d": "daily", "m-e": "daily"} and rec["owner"] == "proj-b"
+    # A newly served model is benched the next day it is seen.
+    lister2 = lambda url, key: (True, "HTTP 200", ["m-a", "m-c", "m-z"])
+    assert modelbench.run("proj-b", cfg, {}, _local(12, 2), lister=lister2, ask=ask)["arms"] == {
+        "m-a": "daily", "m-c": "daily", "m-z": "daily"}
+    calls.clear()
+    # No working key (a revoked key's 401, or none saved): no model call, the skip reported once per outage.
+    refused = lambda url, key: (False, "HTTP 401 Unauthorized", None)
+    first = modelbench.run("proj-b", cfg, {}, _local(13, 2), lister=refused, ask=ask)
+    assert first["report"] is True and "HTTP 401" in first["skipped"] and "fake-key" not in json.dumps(first)
+    assert not modelbench.due(cfg, _local(13, 5))   # the skip is the day's record
+    monkeypatch.setattr(endpoint, "credentials", lambda alias: None)
+    second = modelbench.run("proj-b", cfg, {}, _local(14, 2), ask=ask)
+    assert second["report"] is False and "no key saved" in second["skipped"] and calls == []
+    # A key works again: it benches and the next outage is reported again.
+    monkeypatch.setattr(endpoint, "credentials", lambda alias: endpoint.Credentials("fake-key", "https://fake.invalid/v1"))
+    assert modelbench.run("proj-b", cfg, {}, _local(15, 2), lister=lister, ask=ask)["results"]
+    assert modelbench.run("proj-b", cfg, {}, _local(16, 2), lister=refused, ask=ask)["report"] is True
+
+
+def test_parked_and_weak_models_are_rechecked_weekly_through_the_bench_and_its_verdict_feeds_failover(env, monkeypatch):
+    """Weak models are rechecked weekly: a model a project parked is benched a week on and freed by a pass; a weak
+    bench score keeps a model parked past its week, so no route picks it (#5's failover reads it)."""
+    from ttp import modelbench, modelrank, route
+    from ttp.daemon import Daemon
+    p = make(env)
+    d = Daemon(p.base)
+    _ranked(p, d, monkeypatch, ["rank-new", _RT_MODEL, "rank-b"], ranking=("rank-new", _RT_MODEL, "rank-b"))
+    weak = {"rank-new"}
+    cfg, calls, ask, lister = _bench_env(env, monkeypatch, ["rank-new", _RT_MODEL, "rank-b"], weak=weak,
+                                         ranking=("rank-new", _RT_MODEL, "rank-b"))
+    t0 = _local(10, 3)
+    p.db.set_kv(modelrank.PARKED + "rank-new", {"at": t0, "run": None, "why": "malformed"})
+    assert modelrank.parked_models(p.db) == {"rank-new": t0}
+
+    def day(n):
+        now = t0 + n * 86400
+        route.write_served(p.state, "chat", True, "HTTP 200", ["rank-new", _RT_MODEL, "rank-b"], now)
+        return now, modelbench.run("proj", cfg, modelrank.parked_models(p.db), now, lister=lister, ask=ask)
+    # Parked: not benched until a week on.
+    for n in range(0, 7):
+        _, rec = day(n)
+        assert "rank-new" not in rec["arms"], n
+    now, rec = day(7)
+    assert rec["arms"]["rank-new"] == "weekly" and rec["weak"] == ["rank-new"]
+    # Still weak past its week's park: it stays parked and failover never picks it.
+    assert modelrank.parked(p.db, "rank-new", now + 3600) and now + 3600 - t0 > modelrank.PARK_S
+    assert modelrank.better(p.db, d.cfg, p.state, _RT_MODEL, now + 3600, light=True) == ""
+    for n in range(8, 14):
+        assert "rank-new" not in day(n)[1]["arms"], n
+    # The next weekly recheck passes: free again, tried first on light starts as #5 built it.
+    weak.clear()
+    now, rec = day(14)
+    assert rec["arms"]["rank-new"] == "weekly" and rec["weak"] == []
+    assert not modelrank.parked(p.db, "rank-new", now + 60)
+    assert modelrank.better(p.db, d.cfg, p.state, _RT_MODEL, now + 60, light=True) == "rank-new"
+    assert day(15)[1]["arms"].get("rank-new") == "daily"   # benched with the top models again
+    # A project's fresh park after that pass holds for its week again.
+    p.db.set_kv(modelrank.PARKED + "rank-new", {"at": now + 120, "run": None, "why": "timeout"})
+    assert modelrank.parked(p.db, "rank-new", now + 180)
+
+
+def test_the_daemon_runs_the_model_bench_daily_and_reports_a_keyless_skip_once(env, monkeypatch):
+    from ttp import endpoint, modelbench
+    from ttp.daemon import Daemon
+    p = make(env)
+    d = Daemon(p.base)
+    _route_config(p)
+    d._load_config()
+    _bench_env(env, monkeypatch, ["m-a"])
+    monkeypatch.setattr(endpoint, "credentials", lambda alias: None)
+    monkeypatch.setenv("TTP_TEST_MODEL_BENCH", "1")
+    monkeypatch.setattr(modelbench, "BENCH_HOUR", 0)
+    alerts = []
+    monkeypatch.setattr(d, "alert", lambda key, text, severity="high", **k: alerts.append((key, severity)))
+    for _ in range(3):
+        d.run_model_bench()
+        if d._bench_job:
+            d._bench_job.join(10)
+        d._bench_tried = 0.0
+    assert alerts == [(modelbench.NOKEY, "low")]
+    assert modelbench.latest()["skipped"].startswith("no working key") and modelbench.latest()["owner"] == p.name

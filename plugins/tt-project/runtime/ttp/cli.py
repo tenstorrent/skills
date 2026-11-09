@@ -7811,6 +7811,21 @@ def cmd_land(a) -> None:
     sys.exit(land.run(p, a))
 
 
+def cmd_model_bench(a) -> None:
+    """`ttp model-bench run|show`: the host's shared daily chat model bench (modelbench.py)."""
+    import time as _t
+    from . import modelbench, modelrank
+    if a.action == "show":
+        print(json.dumps({"owner": json.loads((modelbench.home() / modelbench.OWNER).read_text())
+                          if (modelbench.home() / modelbench.OWNER).exists() else {},
+                          "latest": modelbench.latest(), "models": modelbench.models()}, indent=1))
+        return
+    p = here() or die("model-bench: no project here (run it in a project or with TTP_PROJECT set)")
+    now = _t.time()
+    out = modelbench.run(p.name, p.config(), modelrank.parked_models(p.db), now, force=a.force)
+    print(json.dumps(out, indent=1))
+
+
 def cmd_bench(a) -> None:
     """`ttp bench prep --since <date> --out <dir>`: pick the landed tasks a model comparison can
     replay, with clean base workspaces and held-out tests, model-free (bench.py)."""
@@ -13673,6 +13688,14 @@ def main(argv: list[str] | None = None) -> None:
                                             "(default: python3 -m pytest -q -p no:cacheprovider)")
     s.add_argument("--dry-run", action="store_true", help="run: every arm on the fake agent, no model call")
     s.set_defaults(fn=cmd_bench)
+
+    s = sub.add_parser("model-bench", help="the host's shared daily chat model bench: `run` benches the served "
+                                            "models once per host and day (a second run does nothing; the "
+                                            "daemon runs it daily), `show` prints the owner, latest result and "
+                                            "per-model scores")
+    s.add_argument("action", choices=["run", "show"])
+    s.add_argument("--force", action="store_true", help="run: bench again though today's result exists")
+    s.set_defaults(fn=cmd_model_bench)
 
     s = sub.add_parser("ack-wait", help="wait model-free for another project's reply to a `ttp note --to`: probe "
                                         "(a retry_when: 0 once replied, 1 while not, 2 if it cannot tell) or settle "

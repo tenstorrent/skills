@@ -24,6 +24,8 @@ tried on light-tier starts only (escalated runs never route); then it runs at ev
 A run on it that fails on the model itself (FAULTS_PARK: malformed, timed out or no hand-off) during
 those runs parks it for PARK_S, a week, as do such faults in over BAD_SHARE of its runs later: no
 route picks it, and once the week is over it is tried again from scratch (the weekly recheck). An endpoint fault (down, rate limit, auth) parks nothing.
+The host's daily bench (modelbench.py) rechecks parked models weekly: a pass frees one at once, a weak
+score keeps it parked.
 
 Only the chat provider has a served list; Claude Code, Codex and Cursor models are not ranked here
 (provider failover moves work off a provider that cannot start, failover.py).
@@ -107,8 +109,18 @@ def pick(db, cfg: dict, state: Path, model: str, now: float) -> tuple[str, str] 
 
 
 def parked(db, model: str, now: float) -> bool:
-    """`model` failed a run on its own within PARK_S (tried()): no route picks it."""
-    return now - float((db.kv(PARKED + model) or {}).get("at") or 0) < PARK_S
+    """`model` failed a run on its own within PARK_S (tried()) and no later host bench passed it, or its
+    last host bench (modelbench.py, within two weeks) found it weak: no route picks it."""
+    from . import modelbench
+    at = float((db.kv(PARKED + model) or {}).get("at") or 0)
+    v = modelbench.verdict(model, at, now)
+    return v == "weak" or now - at < PARK_S and v != "passed"
+
+
+def parked_models(db) -> dict[str, float]:
+    """{model: when this project last parked it} (the bench's weekly recheck arms)."""
+    return {r["key"][len(PARKED):]: float((db.kv(r["key"]) or {}).get("at") or 0)
+            for r in db.q("SELECT key FROM kv WHERE key LIKE ?", (PARKED + "%",))}
 
 
 def better(db, cfg: dict, state: Path, model: str, now: float, light: bool) -> str:

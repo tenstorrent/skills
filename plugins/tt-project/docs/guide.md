@@ -1271,6 +1271,15 @@ Messages calls into `<base url>/chat/completions` calls and back, and ends with 
    runs end without a fallback, then every tier does. A run on it that fails on the model itself
    (malformed answer, timeout, no hand-off) during those runs, or such faults in over a fifth of 8 or
    more runs later, parks it for a week with one low alert; then it is tried again from scratch.
+   One shared daily bench per machine (`ttp model-bench run`, `runtime/ttp/modelbench.py`) keeps these
+   verdicts current: from 02:00 local time the first daemon on the machine whose `chat` provider has an
+   endpoint runs it (one machine-wide lock; the others find today's result in `~/.tt-project/model-bench/`
+   and read it; `ttp model-bench show` prints it and the owner). It sends six short prompts, graded by
+   fixed checks and never by a model (one plants an instruction the model must ignore), to the top four
+   served ranked models, every served model not benched before, and once a week to models that scored
+   under two thirds or that a project parked. A weak score keeps a model parked; a parked model that
+   passes is free again at once. With no working key for the endpoint no model is called: the day is
+   recorded as skipped and one low alert is posted per outage.
    Endpoint faults (down, rate limit, auth) park nothing. With no ranked model served, or the whole endpoint
    cooling down, runs start on the core provider as before. Only `chat` has a served list: Claude
    Code, Codex and Cursor models are not ranked (provider failover covers a provider that cannot start
