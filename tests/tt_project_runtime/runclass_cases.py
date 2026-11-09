@@ -197,7 +197,9 @@ def test_a_cheap_class_falls_back_to_a_cheap_claude_model_at_low_effort_and_back
     assert runclass.core_cheap({}, t, "status_report", "light", "claude") is None
     assert runclass.core_cheap({}, t, "status_report", "standard", "codex") is None
     assert runclass.core_cheap({}, {**t, "model": "opus"}, "status_report", "standard", "claude") is None
-    assert runclass.core_cheap({}, {**t, "priority": 0}, "status_report", "standard", "claude") is None
+    # An urgent task sets order only: its run takes the same cheap model (a wrong cheap run is retried a tier up).
+    u = runclass.core_cheap({}, {**t, "priority": 0}, "status_report", "standard", "claude")
+    assert (u["model"], u["effort"]) == ("sonnet", "low")
     assert runclass.core_cheap({}, t, "status_report", "standard", "claude", None, {"by": "retry"}) is None
     # Config: all off, one class off, one class's model changed, or the class kept on core.
     assert runclass.core_cheap({"route": {"core_cheap": False}}, t, "status_report", "standard", "claude") is None
@@ -282,3 +284,54 @@ def test_a_cheap_class_run_starts_claude_on_its_cheap_model_at_its_effort_or_the
 
     assert argv("sonnet") == ("sonnet", "low")
     assert argv("haiku", min_effort="high") == ("haiku", "high")
+
+
+def test_an_urgent_task_takes_its_class_cheap_route_in_every_cheap_class_and_hard_work_keeps_core():
+    from ttp import route, runclass
+    cfg = _rc_cfg()
+    t = {"kind": "question", "tier": "standard", "title": "why", "spec": "s"}
+    urgent = [{**t, "priority": 1}, {**t, "spec": "urgent: yes\nwhy"}]
+    for cls in ("wake_decision", "screening", "worker_wake", "status_report", "rebase", "review_small", "light"):
+        for u in urgent:
+            assert route.kept_core(u, urgency=False) is False, (cls, u)
+            assert runclass.routable(u), (cls, u)
+            assert runclass.target(cfg, u, "light", cls) is not None, (cls, u)
+    for cls in ("wake_decision", "screening", "worker_wake", "status_report", "rebase", "review_small"):
+        c = runclass.core_cheap({}, urgent[0], cls, "standard", "claude")
+        assert c and c["effort"] == "low" and c["model"] in ("haiku", "sonnet"), cls
+    # Urgency still keeps a non-cheap class (hard work, the coordinator) and an escalation on core.
+    assert route.kept_core(urgent[0]) and route.kept_core(urgent[1])
+    for cls in ("coordinator", "hard"):
+        assert runclass.core_cheap({}, urgent[0], cls, "standard", "claude") is None, cls
+        assert runclass.target(cfg, urgent[0], "standard", cls) is None, cls
+    # A hard task (a needs_deep label) stays on core even in a cheap class.
+    hard = {**t, "labels": ["needs_deep"]}
+    assert route.kept_core(hard, urgency=False) and not runclass.routable(hard)
+
+
+def test_an_urgent_status_report_dispatches_to_the_tt_model_and_an_urgent_hard_task_to_the_core_model(env, monkeypatch):
+    from ttp import route, runclass
+    from ttp.daemon import Daemon
+    p = make(env)
+    _route_config(p, route=None)
+    d = Daemon(p.base)
+    prov, tier, note = _route_dispatch(p, d, monkeypatch, title="why is it slow", kind="question", priority=1)
+    assert prov == "chat" and note[runclass.KEY] == "status_report", (prov, note)
+    assert note[route.KEY]["model"] == _RT_MODEL
+    # Urgent work of the hard class (a code task at the standard tier) keeps the core provider.
+    p2 = make(env)
+    _route_config(p2, route=None)
+    d2 = Daemon(p2.base)
+    got = _route_dispatch(p2, d2, monkeypatch, title="build it", kind="code", tier="standard", priority=1)
+    assert got[0] == d2.cfg.get("core_provider", "claude")
+
+
+def test_wake_keeps_effort_is_only_a_code_task_worker_wake_with_no_chat_reply():
+    from ttp import tierfloor
+    code = {"kind": "code"}
+    assert tierfloor.wake_keeps_effort(code, "worker_wake") is True
+    assert tierfloor.wake_keeps_effort(code, "status_report") is False
+    assert tierfloor.wake_keeps_effort(code, "hard") is False
+    assert tierfloor.wake_keeps_effort({"kind": "review"}, "worker_wake") is False
+    assert tierfloor.wake_keeps_effort({"kind": "question"}, "worker_wake") is False
+    assert tierfloor.wake_keeps_effort({**code, "reply_chat": "c1"}, "worker_wake") is False

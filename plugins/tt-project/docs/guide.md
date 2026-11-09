@@ -1254,7 +1254,8 @@ Messages calls into `<base url>/chat/completions` calls and back, and ends with 
    --runs`. Each fallback's reason (and, for a run's own end, a short `cause`) is in
    the run's `route` record. A run that hands off, even `failed`, is retried a tier up as usual.
    Some starts stay on the core provider before they run, with the reason `escalated`, its kind and
-   a short `cause`: an urgent or user-ordered task (landing in minutes outweighs the saving), a
+   a short `cause`: an urgent task of a hard class or a user-ordered task (landing in minutes outweighs the saving; an urgent
+   task's run in a cheap class, runclass.CHAT, keeps that class's cheap route: urgency only orders it), a
    review fix or failed-checks wake of a change its lineage wrote on the routed provider, and every
    later run of a lineage with two routed misses (routed runs that fell back on their own or handed
    off `failed`, and routed changes a review or failed checks sent back). The `routed 24h:` phrase
@@ -1271,7 +1272,8 @@ Messages calls into `<base url>/chat/completions` calls and back, and ends with 
    applies. Rules never route reviews, coordinator turns, pinned tasks, tier-up retries or conclusion
    and device runs, and while a rule list is set, urgent tasks, tasks whose hand-off asked for deep and
    tasks labelled `urgent`, `needs_deep`, `user_deep`, `review_fix` or `untrusted_input` stay on the
-   core provider, the tier's own route included. A missing-model hold applies to that tier's runs
+   core provider, the tier's own route included (a run class that is cheap by class takes no such
+   urgency: it routes by its class). A task labelled `untrusted_input` is never routed, by rule, tier or class. A missing-model hold applies to that tier's runs
    routed to that model only. The coordinator can set the list with `config_set` on your word.
    Routed spend uses the `pricing.chat` row for the model (or its `default` row:
    `[$/M input, cached input, output]`); with no row it is zero and labelled unpriced. Without a row

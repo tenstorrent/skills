@@ -13,8 +13,9 @@ without one is classified the same way at read time from its note.
 Routing: `route.classes` {class: "chat" | "core"} (account-level, then the project's value over it)
 over DEFAULT: when the chat provider has a model (chat_model), every class in CHAT goes to chat and
 coordinator and hard stay on core; the coordinator never moves, whatever the map says. A task's own
-provider or model pin wins (route.eligible); a task the rule list keeps on core (route.kept_core: urgent,
-needs_deep, user_deep, review_fix, untrusted_input) stays on core, and so does a task the daemon made
+provider or model pin wins (route.eligible); a task the rule list keeps on core (route.kept_core: needs_deep,
+user_deep, review_fix, untrusted_input) stays on core; urgency is no such reason here (it orders the run and
+nothing else: an urgent task's cheap-class run takes the class's cheap route), and so does a task the daemon made
 from outside input (untrusted) until the untrusted-input hook guards are live. The model is the run tier's chat
 model, else the light tier's, else the standard tier's; picking among models is route.py's and the
 failover's job, not this module's. A tier whose `providers.chat.tiers.<tier>.route` is false routes
@@ -151,7 +152,7 @@ def target(cfg: dict, task: dict, tier: str, cls: str, picked: dict | None = Non
     (core): its class maps to core, no chat model, the task pins a provider or model, the start is a
     tier-up retry, or the task stays on core (route.kept_core)."""
     from .route import TO, kept_core
-    if routes(cfg).get(cls) != "chat" or kept_core(task) or untrusted(task) or str(task.get("provider") or "") \
+    if routes(cfg).get(cls) != "chat" or kept_core(task, urgency=False) or untrusted(task) or str(task.get("provider") or "") \
             or str(task.get("model") or "") or (picked or {}).get("by") == "retry":
         return None
     t = ((((cfg.get("providers") or {}).get(TO) or {}).get("tiers") or {}).get(tier) or {})
@@ -213,7 +214,7 @@ def routable(task: dict | None, note: dict | None = None) -> bool:
     if not task:
         return True
     from .route import kept_core
-    return not (kept_core(task) or untrusted(task) or str(task.get("provider") or "") or str(task.get("model") or "")
+    return not (kept_core(task, urgency=False) or untrusted(task) or str(task.get("provider") or "") or str(task.get("model") or "")
                 or ((note or {}).get("pick") or {}).get("by") == "retry")
 
 

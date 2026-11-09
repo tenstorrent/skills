@@ -24,7 +24,9 @@ only a poll stays a light check: a stale wake (the same wait handed back) or a w
 for `wake_tier: light` and was not escalated (poll_wake; the daemon's own light relaunch after a reboot
 too). Such a wake gets neither the floor tier nor its effort; its prompt tells it to hand off `waiting`
 with `retry_after_s: 0` at the task's own tier, not the final hand-off, once the wait is over, so the
-run that writes the conclusion is an escalated wake at the floor. A budget gate whose max_tier is
+run that writes the conclusion is an escalated wake at the floor. A worker_wake run of a code task (not
+one a chat reads) keeps the floor's tier but starts at its class's own effort (wake_keeps_effort): the
+floor's effort holds for the task's first run and its independent review. A budget gate whose max_tier is
 below the floor tier does not clamp a conclusion run: the run waits queued (HELD_NOTE) until the gate
 allows the floor, so it spends nothing extra and the gate keeps its cap.
 
@@ -166,6 +168,13 @@ def poll_wake(prev: dict) -> bool:
     `wake_tier` is light and no light wake escalated it since. The floor leaves such a wake light."""
     return (isinstance(prev, dict) and prev.get("status") == "waiting" and prev.get("wake_tier") == "light"
             and not prev.get("escalated_wake"))
+
+
+def wake_keeps_effort(task: dict, cls: str | None) -> bool:
+    """A worker_wake run (runclass) of a code task starts at its class's own effort, not the floor's: the
+    task's first run and its independent review carry the floor, and a wake-up only resumes it. A task a
+    chat or the user reads (reply_chat) or any other kind keeps the floor's effort."""
+    return cls == "worker_wake" and task.get("kind") == "code" and not task.get("reply_chat")
 
 
 def target(db, cfg: dict, task: dict) -> dict | None:

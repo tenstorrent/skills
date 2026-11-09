@@ -189,11 +189,15 @@ def _has(labels: list[str], names) -> bool:
     return any(lb == n or lb.startswith(n + ":") for lb in labels for n in names)
 
 
-def kept_core(task: dict) -> bool:
+def kept_core(task: dict, urgency: bool = True) -> bool:
     """A task the rule list never routes (KEEP_CORE): an urgent one (urgent.is_urgent too), one whose
-    hand-off asked for deep (needs_deep), or one labelled user_deep, review_fix or untrusted_input."""
+    hand-off asked for deep (needs_deep), or one labelled user_deep, review_fix or untrusted_input.
+    `urgency` False leaves urgency out: a cheap run class (runclass.CHAT) is ordered by it, never moved
+    to the core model by it."""
     from . import effort, urgent
-    return _has(_labels(task), KEEP_CORE) or urgent.is_urgent(task) or effort.wants_deep(task.get("result"))
+    keys = KEEP_CORE if urgency else tuple(k for k in KEEP_CORE if k != "urgent")
+    return _has(_labels(task), keys) or (urgency and urgent.is_urgent(task)) \
+        or effort.wants_deep(task.get("result"))
 
 
 def match(cfg: dict, task: dict, tier: str) -> dict | None:
@@ -243,9 +247,12 @@ def timeout_s(cfg: dict, tier: str, rule: int | None = None) -> float | None:
 
 
 def eligible(task: dict, picked: dict | None) -> bool:
-    """A worker run that may be routed: no review, no provider or model pin, no tier-up retry."""
+    """A worker run that may be routed: no review, no provider or model pin, no tier-up retry, and no
+    untrusted_input label (a run that read outside text keeps the core provider's enforced powers)."""
+    from . import untrusted
     return (task.get("kind") != "review" and not str(task.get("provider") or "")
-            and not str(task.get("model") or "") and (picked or {}).get("by") != "retry")
+            and not str(task.get("model") or "") and (picked or {}).get("by") != "retry"
+            and not untrusted.labelled(task))
 
 
 def cooldown_s(cfg: dict) -> float:
@@ -526,17 +533,17 @@ def misses(db, ch: list[dict]) -> list[str]:
     return out
 
 
-def escalation(db, task: dict) -> dict:
+def escalation(db, task: dict, urgency: bool = True) -> dict:
     """Why a routable start of `task` stays on the core provider ({"escalated": kind, "cause"}, with
     `sent_back` and `after` for a checks fix), or {} to route: an urgent task (urgent.is_urgent) or a
     user-ordered one (added by the user or answering a chat) must land in minutes; a review fix
     (chaincap.is_review_fix) of a lineage or a checks-fix wake (CHECKS_WOKE) of a task that ran on the
     routed-to provider gets its fix there; a lineage with LINEAGE_MISSES routed misses (misses) stays
-    there for its remaining runs."""
+    there for its remaining runs. `urgency` False (a cheap run class) skips the urgent case alone."""
     from . import urgent
     from .chaincap import chain, is_review_fix
     from .db import load_result
-    if urgent.is_urgent(task):
+    if urgency and urgent.is_urgent(task):
         return {"escalated": "urgent", "cause": f"urgent: {urgent.why(task)}"[:120]}
     if task.get("origin") == "user" or urgent.user_ordered(task):
         return {"escalated": "user-ordered", "cause": "ordered by the user"}

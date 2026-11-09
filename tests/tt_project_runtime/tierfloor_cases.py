@@ -458,3 +458,27 @@ def test_a_light_or_chat_routed_runs_notify_is_refused_and_a_standard_runs_is_qu
     assert json.loads((run_dir / NOTIFY_FILE).read_text().splitlines()[0])["text"] == "done: 3 files"
     rc, out = notify(run_dir, "  ", "--severity", "low", "fyi")   # a blank value marks nothing
     assert rc == 0 and len((run_dir / NOTIFY_FILE).read_text().splitlines()) == 2
+
+
+def test_a_worker_wake_of_a_code_task_with_a_conclusion_line_starts_at_its_class_effort_but_a_review_keeps_the_floor(env, monkeypatch):
+    """B: a code task's worker_wake does not take the conclusion floor's effort (run 40: Sonnet at high);
+    its first run, a review and a non-code task's wake keep it."""
+    from ttp.daemon import SPEC_SEEN_KEY
+    from ttp.prompts import spec_digest
+    p, d, started = _floor_daemon(env, monkeypatch)
+    spec = "Build it.\nconclusion: did the fix help?"
+    waits = {"status": "waiting", "summary": "x", "retry_when": "test -e /nonexistent/done", "waiting_for": "x"}
+
+    def run(kind, result=None, **kw):
+        t = p.db.add_task("Measure the fix", spec, kind=kind, tier="standard", origin="coordinator",
+                          provider="claude", budget_usd=8.0, **kw)
+        if result is not None:
+            p.db.update_task(t, status="queued", result=json.dumps({**result, SPEC_SEEN_KEY: spec_digest(p.db.task(t))}))
+        started.clear()
+        d.dispatch()
+        return [(k["min_effort"], (k.get("note") or {}).get("wake") is not None) for a, k in started if k.get("task")["id"] == t]
+
+    assert run("code", dict(waits, escalated_wake=True)) == [(None, True)], "a code task's wake: the class's effort"
+    assert run("work", dict(waits, escalated_wake=True)) == [("high", True)], "a non-code wake keeps the floor"
+    assert run("code") == [("high", False)], "a first run keeps the floor"
+    assert run("review") == [("high", False)], "a review keeps the floor"

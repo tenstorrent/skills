@@ -10652,7 +10652,8 @@ class Daemon:
                                         timeout_s=(routed or {}).get("timeout_s"),
                                         read_only=False, append_system=system, note=note,
                                         resume=lost["session"] if lost else None,
-                                        min_effort=(need or {}).get("effort") or None)
+                                        min_effort=None if tierfloor.wake_keeps_effort(task, run_cls)
+                                        else (need or {}).get("effort") or None)
                 if lease:   # the lease now names the run's supervisor in place of the daemon
                     self._route_lease(task, routed, tier, now, run_id=run_id)
             except Exception as e:
@@ -11006,14 +11007,14 @@ class Daemon:
         if not to and dp is None and cls:
             to = runclass.target(self.cfg, task, tier, cls, picked)
             if to:
-                return self._route_entry(task, tier, to["to"], to["model"], now, to["rule"])
+                return self._route_entry(task, tier, to["to"], to["model"], now, to["rule"], cls)
         if not to or not route.eligible(task, picked) or (dp is None and self._floor_keeps_core(task, tier, picked)):
             return None
         name, model = to["to"], to["model"]
         if dp is not None:
             return {**self._route_entry(task, tier, name, model, now), "model_pick": True,
                     **({"pick_effort": got["effort"]} if got["effort"] else {})}
-        return self._route_entry(task, tier, name, model, now, to["rule"])
+        return self._route_entry(task, tier, name, model, now, to["rule"], cls)
 
     def _model_pick(self, task: dict, tier: str, peek: bool = False) -> dict | None:
         """This start's model pick (modelpick.pick), or None: the tier's own route decides. `peek`
@@ -11030,13 +11031,14 @@ class Daemon:
             log(self.p, f"task {task.get('id')}: model not picked: {e}")
             return None
 
-    def _route_entry(self, task: dict, tier: str, name: str, model: str, now: float, rule_i: int | str | None = None) -> dict:
+    def _route_entry(self, task: dict, tier: str, name: str, model: str, now: float, rule_i: int | str | None = None,
+                     cls: str | None = None) -> dict:
         rule = {} if rule_i is None else {"rule": rule_i}   # the providers.chat.routes rule it matched
         after = route.fell_back_before(self.p.db, task["id"]) if task.get("id") else None
         if after:   # the task fell back on its own once: the rest of its runs stay on the core provider
             return {"tier": tier, "to": name, "model": model, **rule, "fallback": "rerun", "after": after}
         try:
-            esc = route.escalation(self.p.db, task) if task.get("id") else {}
+            esc = route.escalation(self.p.db, task, urgency=cls not in runclass.CHAT) if task.get("id") else {}
         except Exception as e:   # escalation must never hold a task back
             log(self.p, f"task {task['id']}: route escalation not checked: {type(e).__name__}: {e}")
             esc = {}
