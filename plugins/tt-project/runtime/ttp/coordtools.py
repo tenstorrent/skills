@@ -221,11 +221,11 @@ def session_tool_args(cfg: dict, *, project: str = "", root: str = "", denied_re
         # Claude Code's full standard tool set, Agent included, as a worker's (user msg #2302): no --tools
         # list. Withheld only: the web tools where the project may not use the web, and the project's
         # own providers.claude.disallowed_tools. The hook (pre_tool_use) and the deny rules hold the rest.
-        from .providers.claude import WEB_TOOLS
+        from .providers.claude import WEB_TOOLS, lean_settings
         deny = [*([] if web else WEB_TOOLS), *[t for t in disallowed_tools if t not in WEB_TOOLS], *deny]
         return [*(["--disallowedTools", ",".join(deny)] if deny else []),
-                "--settings", json.dumps(hook_settings(denied_reads, full=True, protected=protected,
-                                                       timeout_s=tool_timeout_s(cfg)))]
+                "--settings", json.dumps({**hook_settings(denied_reads, full=True, protected=protected,
+                                                          timeout_s=tool_timeout_s(cfg)), **lean_settings()})]
     allow = [f"Read(/{os.path.abspath(root)}/**)"] if root else []
     args = ["--tools", ",".join(CLI_TOOLS), "--allowedTools", ANSWER_TOOL, *allow, *_rules(project or "*")]
     if deny:   # one comma-separated value, so a later flag is no rule

@@ -662,3 +662,67 @@ def test_a_resumed_runs_delta_shows_only_triaged_chat_and_none_when_chat_is_off(
     off = ctxfork.delta_block(p, {"coordinator": {"session": {"worker_chat_chars": 0}}}, since)
     assert "### Chat since then" not in off and "a triaged order" not in off
     assert "### Order ledger" in off
+
+
+def test_forked_runs_send_the_coordinator_prefix_and_keep_their_own_text_after_it(env, monkeypatch, tmp_path):
+    """Task #49: the cache matches tools, then the system prompt, then the history. Two forks with a
+    different task, run id and worktree send the coordinator's last launch's system prompt, answer
+    schema and Bash timeouts byte for byte; their own system prompt and task follow in the prompt."""
+    from ttp import coordsession, ctxfork
+    p, d, cfg_dir, _run = _fork_daemon(env, monkeypatch, tmp_path)
+    from ttp.providers import claude
+    monkeypatch.setattr(claude, "_FLAGS", {**claude._FLAGS, claude.APPEND_SYSTEM_FILE: True})
+    sid = str(uuid.uuid4())
+    _fork_transcript(cfg_dir, p.base, sid)
+    p.db.set_kv(coordsession.KEY, {"id": sid, "provider": "claude", "context_tokens": 50000})
+
+    def start(cwd, own="# WORKER RULES\nwrite result.json"):
+        tid = p.db.add_task(f"t {uuid.uuid4().hex[:6]}", "do the one thing", kind="code", origin="user")
+        rid = d.start_run("worker", f"TASK PROMPT {tid}", "claude", "standard", str(cwd), task=p.db.task(tid),
+                          append_system=own)
+        rd = p.runs / str(rid)
+        note = json.loads(p.db.one("SELECT note FROM runs WHERE id=?", (rid,))["note"] or "{}")
+        return (json.loads((rd / "run.json").read_text())["argv"], (rd / "prompt.md").read_text(),
+                (rd / "system.md").read_text(), note.get("coord_context") or {})
+
+    argv, prompt, system, ctx = start(p.root)   # no coordinator run yet: the run's own system prompt
+    assert system.startswith("# WORKER RULES") and "prefix" not in ctx and "--json-schema" not in argv
+    # The coordinator's last launch, as a full-tools session wake records it: the worker's tools plus its
+    # answer schema and the Bash timeouts of its tool hooks.
+    coord_dir = tmp_path / "coord-run"
+    coord_dir.mkdir()
+    (coord_dir / "system.md").write_text("# Role\nYou coordinate.")
+    settings = json.loads(argv[argv.index("--settings") + 1])
+    settings = {**settings, "hooks": {"PreToolUse": []},
+                "env": {"TTP_COORD_FULL_TOOLS": "1", "BASH_DEFAULT_TIMEOUT_MS": "300000", "BASH_MAX_TIMEOUT_MS": "300000"}}
+    coord = [a for a in argv if a != "-"]
+    i = coord.index("--append-system-prompt-file")
+    del coord[i:i + 2]   # the coordinator's own, below
+    coord[coord.index("--settings") + 1] = json.dumps(settings)
+    coord += ["--json-schema", '{"type": "object"}', "--append-system-prompt-file", str(coord_dir / "system.md")]
+    p.db.x("INSERT INTO runs(role,status,started,dir) VALUES('coordinator','ok',?,?)", (time.time(), str(coord_dir)))
+    (coord_dir / "run.json").write_text(json.dumps({"argv": coord}))
+    runs = []
+    for wt in ("wt1", "wt2"):
+        (tmp_path / wt).mkdir()
+        runs.append(start(tmp_path / wt))
+    for argv, prompt, system, ctx in runs:
+        assert ctx["how"] == "fork" and ctx["prefix"] == "coordinator", ctx
+        assert system == "# Role\nYou coordinate."
+        assert argv[argv.index("--json-schema") + 1] == '{"type": "object"}'
+        got = json.loads(argv[argv.index("--settings") + 1])
+        assert got["env"]["BASH_MAX_TIMEOUT_MS"] == "300000" and "TTP_COORD_FULL_TOOLS" not in got["env"]
+        assert got["hooks"] != {"PreToolUse": []}   # the run keeps its own hooks
+        lead, _, rest = prompt.partition("# WORKER RULES\nwrite result.json")
+        assert lead.startswith(ctxfork.FORK_HEAD) and "StructuredOutput" in lead and "TASK PROMPT" in rest
+    # Up to the per-run part, the two requests are the same: model, tools' settings, schema, system prompt.
+    shape = lambda a: ({k: v for k, v in json.loads(a[a.index("--settings") + 1]).items() if k != "hooks"},  # noqa: E731
+                       a[a.index("--model") + 1] if "--model" in a else "", a[a.index("--json-schema") + 1])
+    assert shape(runs[0][0]) == shape(runs[1][0]) and runs[0][2] == runs[1][2]
+    assert runs[0][1].split("TASK PROMPT")[0] == runs[1][1].split("TASK PROMPT")[0]
+    # Another model cannot read the coordinator's cache: the run keeps its own prefix and says why.
+    other = [*coord, "--model", "other-model"] if "--model" not in coord else \
+        [("other-model" if i and coord[i - 1] == "--model" else a) for i, a in enumerate(coord)]
+    (coord_dir / "run.json").write_text(json.dumps({"argv": other}))
+    argv, prompt, system, ctx = start(p.root)
+    assert system.startswith("# WORKER RULES") and "--json-schema" not in argv and "differs" in ctx["prefix"]

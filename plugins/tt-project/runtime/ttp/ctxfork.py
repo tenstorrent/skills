@@ -28,10 +28,19 @@ session cannot be copied, the run falls back to the coordinator fork, then to di
 
 A continued run (a lost run's own session) keeps its session and gets neither. The run note's KEY
 records how the run started ({"how": "fork" | "resume" | "disk" | "none", "why", "session", "tokens",
-"run": a resume's source run, "from": the provider whose session a fork copied}), so
-`ttp stats --coord-session` can show the share of each and the fork rate per provider."""
+"run": a resume's source run, "from": the provider whose session a fork copied, "prefix": "coordinator"
+when the fork sends the coordinator's own request prefix (coord_shape)}), so `ttp stats --coord-session`
+can show the share of each and the fork rate per provider.
+
+The prompt cache matches a request's tools, then its system prompt, then its messages. A fork whose tools
+or system prompt differ from the coordinator's writes the whole copied history to the cache again
+(task #49, measured: Claude Code reported tools_changed; a forked Opus worker wrote about 50k tokens on
+its first call and read none). So a fork on the coordinator's model sends the coordinator's last launch's
+prefix (coord_shape, shape_argv): its system prompt, its answer schema and the settings that change the
+tools' text; the run's own system prompt leads its prompt instead (shared_lead)."""
 from __future__ import annotations
 
+import json
 import os
 import time
 import uuid
@@ -257,3 +266,89 @@ def _fork_gap(p, cfg: dict, prov, provider: str, cwd: str, env: dict | None, now
     if cap > 0 and tokens > cap:
         return f"the coordinator session holds {tokens} tokens, over worker_fork_max_tokens {cap:.0f}"
     return ""
+
+
+# Settings env that changes the Bash tool's description, so the tools' text (coordtools.hook_settings).
+_TOOL_ENV = ("BASH_DEFAULT_TIMEOUT_MS", "BASH_MAX_TIMEOUT_MS")
+
+
+def _arg(argv: list[str], flag: str) -> str | None:
+    return argv[argv.index(flag) + 1] if flag in argv[:-1] else None
+
+
+def _settings(argv: list[str]) -> dict:
+    try:
+        got = json.loads(_arg(argv, "--settings") or "{}")
+    except ValueError:
+        return {}
+    return got if isinstance(got, dict) else {}
+
+
+def _bare_denied(argv: list[str]) -> set[str]:
+    """The whole tools a launch withholds (rules like Read(/x) leave the tool list as it is)."""
+    out: set[str] = set()
+    for i, a in enumerate(argv):
+        if a == "--disallowedTools":
+            for b in argv[i + 1:]:
+                if b.startswith("--") or b == "-":
+                    break
+                out |= {t.strip() for t in b.split(",") if t.strip() and "(" not in t}
+    return out
+
+
+def coord_shape(p) -> dict | None:
+    """The parts of the coordinator's latest launch that make its request's cached prefix: its argv
+    and its system prompt text. None when it has none to share (no run, or its system prompt went
+    into the prompt, too long for a file argument)."""
+    try:
+        r = p.db.one("SELECT id, dir FROM runs WHERE role='coordinator' ORDER BY id DESC LIMIT 1")
+        if not r:
+            return None
+        from pathlib import Path
+        d = Path(r["dir"]) if r.get("dir") else p.runs / str(r["id"])
+        argv = json.loads((d / "run.json").read_text()).get("argv") or []
+        path = _arg(argv, "--append-system-prompt-file")
+        if not path or "--json-schema" not in argv:
+            return None
+        return {"run": r["id"], "argv": argv, "system": Path(path).read_text()}
+    except (OSError, ValueError, TypeError, AttributeError):
+        return None
+
+
+def shape_argv(argv: list[str], shape: dict) -> tuple[list[str] | None, str]:
+    """A Claude Code fork's `argv` sending the coordinator's tools (`shape`, coord_shape): its answer
+    schema (the CLI's StructuredOutput tool) and its Bash timeouts; the caller swaps the system prompt.
+    (None, why) where the tools would still differ: another model, setting sources, sandbox, MCP or
+    plugin directories, or withheld tools."""
+    coord = shape["argv"]
+    mine, theirs = _settings(argv), _settings(coord)
+    for what, a, b in (("model", _arg(argv, "--model"), _arg(coord, "--model")),
+                       ("setting sources", _arg(argv, "--setting-sources"), _arg(coord, "--setting-sources")),
+                       ("sandbox", mine.get("sandbox"), theirs.get("sandbox")),
+                       ("withheld tools", _bare_denied(argv), _bare_denied(coord)),
+                       ("skill listing", mine.get("skillOverrides"), theirs.get("skillOverrides"))):
+        if a != b:
+            return None, f"its {what} differs from the coordinator's"
+    # Tools of their own on either side (never compared: their text depends on what they load), or a
+    # schema of the run's own.
+    for flag in ("--mcp-config", "--plugin-dir", "--tools"):
+        if flag in argv or flag in coord:
+            return None, f"{flag} differs from the coordinator's"
+    if "--json-schema" in argv or "--settings" not in argv:
+        return None, "it has an answer schema of its own" if "--json-schema" in argv else "it has no --settings"
+    env = {k: v for k, v in (theirs.get("env") or {}).items() if k in _TOOL_ENV}
+    mine["env"] = {**{k: v for k, v in (mine.get("env") or {}).items() if k not in _TOOL_ENV}, **env}
+    i = argv.index("--settings") + 1
+    out = [*argv[:i], json.dumps(mine), *argv[i + 1:]]
+    extra = ["--json-schema", _arg(coord, "--json-schema")]
+    return (out[:-1] + extra + ["-"] if out[-1:] == ["-"] else out + extra), ""
+
+
+def shared_lead(own_system: str) -> str:
+    """What follows fork_lead in a fork sending the coordinator's prefix: why its system prompt and
+    answer tool are the coordinator's, then the run's own system prompt."""
+    return ("The system prompt you were given is the coordinator's, and the StructuredOutput tool is its "
+            "answer tool: both are there only so this run reads the coordinator's cached context, and "
+            "neither applies to you. Your own rules follow and take their place. When your work is done and "
+            'your hand-off written, the CLI asks for StructuredOutput: call it once with {"actions": []}.\n\n'
+            + own_system)

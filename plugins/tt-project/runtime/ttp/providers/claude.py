@@ -1007,13 +1007,18 @@ def sandbox_settings(dirs, freed=()) -> dict:
             "network": {"allowAllUnixSockets": True}}
 
 
+def lean_settings() -> dict:
+    """Bundled skills by name only, no auto-memory: a worker's, and a full-tools coordinator's, so a
+    fork of its session lists the same skills (ctxfork.shape_argv)."""
+    return {"skillOverrides": {name: "name-only" for name in BUNDLED_SKILLS}, "autoMemoryEnabled": False}
+
+
 def worker_settings(denied_reads=()) -> dict:
     """The hook, plus a leaner context: bundled skills by name only, no auto-memory (the project
     keeps its own). Skills from a project's plugin dirs stay fully listed. Each absolute path in
     `denied_reads` gets a Read deny rule (`//` starts an absolute path in a rule); deny rules hold
     under bypassPermissions."""
-    out = {**hook_settings(), "skillOverrides": {name: "name-only" for name in BUNDLED_SKILLS},
-           "autoMemoryEnabled": False,
+    out = {**hook_settings(), **lean_settings(),
            # No Bash sandbox, even one the user's own settings turn on; fence_args replaces this when the
            # project turns the write fence on (providers.claude.write_fence).
            "sandbox": {"enabled": False}}

@@ -3558,10 +3558,20 @@ class Daemon:
                 got = ctxfork.prepare(self.p, self.cfg, prov, provider, str(cwd), env, task=task["id"])
                 if got.get("session"):
                     resume, resume_extra = got["session"], prov.resume_args(got["session"])
+                prefix_by = ""
+                if got.get("how") == "fork" and prov.tool_hooks and append_system is not None and \
+                        prov.append_system_args(Path("system.md"))[:1] == ["--append-system-prompt-file"] and \
+                        (shape := ctxfork.coord_shape(self.p)):
+                    # The coordinator's tools and system prompt, so the copied history is read from the
+                    # cache, not written again; the run's own system prompt leads its prompt (ctxfork.py).
+                    shaped, prefix_by = ctxfork.shape_argv(argv, shape)
+                    if shaped:
+                        argv, got["lead"] = shaped, got["lead"] + "\n\n" + ctxfork.shared_lead(append_system)
+                        append_system, prefix_by = shape["system"], "coordinator"
                 if got.get("lead"):
                     prompt = got["lead"] + "\n\n" + prompt
-                note = {**(note or {}), ctxfork.KEY: {k: got[k] for k in ("how", "why", "session", "tokens", "run", "from")
-                                                      if k in got}}
+                note = {**(note or {}), ctxfork.KEY: {**{k: got[k] for k in ("how", "why", "session", "tokens", "run", "from")
+                                                         if k in got}, **({"prefix": prefix_by} if prefix_by else {})}}
             elif task and role in ctxfork.ROLES:   # a lost run continued in its own session (_resumable)
                 note = {**(note or {}), ctxfork.KEY: {"how": "resume", "why": "continues its own session",
                                                       "session": resume} if resume_extra else
@@ -3650,6 +3660,12 @@ class Daemon:
                     full = role == "coordinator" and coordtools.full_tools(self.cfg, session_mode)
                     if full:   # a worker's tools and permission mode (coordtools.full_argv)
                         argv = coordtools.full_argv(argv)
+                        iso = prov.isolation_args()
+                        if (self.cfg["providers"].get(provider, {}).get("worker_isolation") and "--setting-sources"
+                                in iso and "--setting-sources" not in argv):
+                            # The workers' setting sources, so they list the same tools: a fork of this
+                            # session then reads its cached prefix (ctxfork.shape_argv).
+                            argv = _before_stdin(argv, iso[iso.index("--setting-sources"):][:2])
                     argv, inline = _with_system_prompt(prov, argv, run_dir / "system.md", tools, append=full)
                     if not inline:   # too long for the command line: it leads what the agent reads
                         if stdin is not None:
