@@ -1625,7 +1625,7 @@ def test_ending_a_run_with_a_large_output_file_reads_it_capped_and_a_detached_jo
 _STORE_KEY = "fake-store-value-0123456789abcdef"
 
 
-def _store_home(env, monkeypatch):
+def _runtime_store_home(env, monkeypatch):
     from ttp import secretstore
     project = _endpoint_home(env, monkeypatch)
     secretstore._mem.update(key=None, data=None)
@@ -1641,7 +1641,7 @@ def _fetch_script(env, body: str):
 
 
 def test_a_command_store_is_read_at_run_time_cached_in_memory_and_never_written(env, monkeypatch, capsys):
-    project, secretstore = _store_home(env, monkeypatch)
+    project, secretstore = _runtime_store_home(env, monkeypatch)
     calls = env["tmp"] / "calls"
     fetch = _fetch_script(env, f'echo x >> "{calls}"\necho \'{{"jev": {{"key": "{_STORE_KEY}"}}}}\'\n')
     assert _custom(monkeypatch, capsys, "store", "command", "--", str(fetch))[0] == 0
@@ -1657,7 +1657,7 @@ def test_a_command_store_is_read_at_run_time_cached_in_memory_and_never_written(
 
 
 def test_a_failing_fetch_command_names_no_output_and_status_still_runs(env, monkeypatch):
-    project, secretstore = _store_home(env, monkeypatch)
+    project, secretstore = _runtime_store_home(env, monkeypatch)
     fetch = _fetch_script(env, f'echo "{_STORE_KEY}" >&2\nexit 7\n')
     secretstore.set_config("command", [str(fetch)])
     with pytest.raises(project.SecretsUnreadable) as e:
@@ -1671,7 +1671,7 @@ def test_a_failing_fetch_command_names_no_output_and_status_still_runs(env, monk
 
 
 def test_an_env_store_is_read_once_and_removed_from_the_environment(env, monkeypatch):
-    project, secretstore = _store_home(env, monkeypatch)
+    project, secretstore = _runtime_store_home(env, monkeypatch)
     secretstore.set_config("env")
     monkeypatch.setenv(secretstore.ENV_VAR, json.dumps({"slack": {"bot_token": _STORE_KEY}}))
     assert project.load_secrets()["slack"]["bot_token"] == _STORE_KEY
@@ -1681,7 +1681,7 @@ def test_an_env_store_is_read_once_and_removed_from_the_environment(env, monkeyp
 
 
 def test_a_keychain_store_round_trips_and_the_value_is_never_on_a_command_line(env, monkeypatch):
-    project, secretstore = _store_home(env, monkeypatch)
+    project, secretstore = _runtime_store_home(env, monkeypatch)
     bindir, kc, argv_log = env["tmp"] / "fakebin", env["tmp"] / "kc.hex", env["tmp"] / "argv.log"
     bindir.mkdir()
     # a stand-in for macOS `security`: -i reads `add-generic-password ... -X <hex>` on stdin
@@ -1702,7 +1702,7 @@ def test_a_keychain_store_round_trips_and_the_value_is_never_on_a_command_line(e
 
 
 def test_a_shared_host_never_gets_a_plaintext_key_file(env, monkeypatch, capsys):
-    project, secretstore = _store_home(env, monkeypatch)
+    project, secretstore = _runtime_store_home(env, monkeypatch)
     code, out = _custom(monkeypatch, capsys, "store", "file", "--shared")
     assert code and "no plaintext" in out
     project.HOME_DIR.mkdir(parents=True, exist_ok=True)
@@ -1714,7 +1714,7 @@ def test_a_shared_host_never_gets_a_plaintext_key_file(env, monkeypatch, capsys)
 
 
 def test_a_left_plaintext_key_file_is_reported_never_deleted(env, monkeypatch, capsys):
-    project, secretstore = _store_home(env, monkeypatch)
+    project, secretstore = _runtime_store_home(env, monkeypatch)
     project.save_secret("peer-key", _CUSTOM)   # the old default: plaintext
     assert secretstore.plaintext_report() == ""
     code, out = _custom(monkeypatch, capsys, "store", "env", "--shared")
@@ -1731,7 +1731,7 @@ def test_keys_reach_another_machine_only_on_request_and_never_a_shared_one(env, 
     import subprocess as sp
     from types import SimpleNamespace
     from ttp import cli, coordinator, machines, timefmt
-    project, secretstore = _store_home(env, monkeypatch)
+    project, secretstore = _runtime_store_home(env, monkeypatch)
     project.save_secret("peer-key", _CUSTOM)
     remote = tmp_path / "remote"
     (remote / ".tt-project").mkdir(parents=True)
@@ -1775,7 +1775,7 @@ def test_keys_reach_another_machine_only_on_request_and_never_a_shared_one(env, 
 ])
 def test_hook_refuses_runs_that_read_the_run_time_store_directly(env, monkeypatch, backend, cmd, refused):
     from ttp import hook
-    project, secretstore = _store_home(env, monkeypatch)
+    project, secretstore = _runtime_store_home(env, monkeypatch)
     project.HOME_DIR.mkdir(parents=True, exist_ok=True)
     secretstore.config_path().write_text(json.dumps(backend))
     monkeypatch.setenv("TTP_RUN_DIR", str(env["tmp"]))
