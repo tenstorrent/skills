@@ -5157,8 +5157,8 @@ class Daemon:
         In slices: with `max_s` or `max_runs` (the tick step, rebook_per_call_step) it stops after the
         session whose runs pass either bound, or at the step's budget (`in_step`), and keeps its place in kv
         CALLS_REBOOK_PROGRESS_KEY: the window fixed at its first slice (since, the highest run id then), the
-        last session done (sessions in key order) and the sums so far. The slice that finishes sets
-        CALLS_REBOOK_KEY (the done marker) and logs one line for the project. With `dry_run` all of it runs
+        first run id of the last session done (sessions go by their first run) and the sums so far. The
+        slice that finishes sets CALLS_REBOOK_KEY (the done marker) and logs one line for the project. With `dry_run` all of it runs
         at once, nothing is written and neither kv is read. Returns (run id, booked before, booked after)
         of each row this slice changed, by run id, or None when it already ran."""
         from . import localspend
@@ -5171,7 +5171,7 @@ class Daemon:
         if not prog:
             prog = {"since": time.time() - CALLS_REBOOK_DAYS * 86400,
                     "upto": int((db.one("SELECT COALESCE(MAX(id),0) m FROM runs") or {}).get("m") or 0),
-                    "cursor": "", "runs": 0, "usd_before": 0.0, "usd_after": 0.0, "slices": 0}
+                    "cursor": 0, "runs": 0, "usd_before": 0.0, "usd_after": 0.0, "slices": 0}
         overrides = localspend.overrides()
         sessions: dict[str, list] = {}
         for r in db.q("SELECT * FROM runs WHERE provider='claude' AND status!='running' AND id<=? "
@@ -5179,12 +5179,11 @@ class Daemon:
             note = json.loads(r["note"] or "{}")
             if CALLS_NOTE not in note:
                 sid = str(r["session_id"] or note.get("session_id") or "")
-                key = sid or f"run:{r['id']}"
-                if key > prog["cursor"]:
-                    sessions.setdefault(key, []).append((r, note))
+                sessions.setdefault(sid or f"run:{r['id']}", []).append((r, note))
         changed, done, seen = [], True, 0
-        for key in sorted(sessions):
-            runs = sessions[key]
+        for key, runs in sessions.items():   # by each session's first run, the order a task's $0 floor applies in
+            if runs[0][0]["id"] <= prog["cursor"]:
+                continue
             if (not dry_run and seen and ((max_s is not None and time.monotonic() - t0 >= max_s)
                                           or (max_runs is not None and seen >= max_runs)
                                           or (in_step and self._step_over(f"per-call re-book {key}")))):
@@ -5226,7 +5225,7 @@ class Daemon:
                              (after - before, r["task"]))
                     db.spend(r["provider"], after - before, self._source_for(r), account=r["account"] or "",
                              estimated=bool(r["cost_estimated"]), ts=float(r["ended"] or r["started"] or time.time()))
-            prog["cursor"] = key
+            prog["cursor"] = runs[0][0]["id"]
         changed.sort()
         if dry_run:
             return changed

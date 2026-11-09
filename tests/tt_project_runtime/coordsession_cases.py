@@ -2007,7 +2007,7 @@ def test_the_per_call_re_book_of_a_large_backlog_runs_in_slices_with_the_totals_
         else:
             changed, slices = d.rebook_per_call(max_runs=4), 1
             assert len(changed) == 4 and p.db.kv(CALLS_REBOOK_KEY) is None
-            assert p.db.kv(CALLS_REBOOK_PROGRESS_KEY)["cursor"] == "S03"
+            assert p.db.kv(CALLS_REBOOK_PROGRESS_KEY)["cursor"] == rows[3]["id"]
             late = _pc_run(p, "Z", 3.0, {}, [_pc_call("z", output_tokens=1000)])   # ends meanwhile
             p.db.x("UPDATE runs SET cost_usd=3.0, status='ok' WHERE id=?", (late["id"],))
             while True:
