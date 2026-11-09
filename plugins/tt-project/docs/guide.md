@@ -3398,14 +3398,26 @@ Workers can read Slack links you paste, using your Slack connector if you have o
     as one JSON object on stdout and exits 0. Read-only: ttp never writes to it. Its stderr is never
     repeated, and a failure names only the program and its exit code.
   - `env`: `TTP_SECRETS_JSON`, read once and removed from the process environment so no child
-    inherits it. Read-only.
+    inherits it. Read-only. It serves only the one process given the variable (a script, a CI job):
+    a process not given it reads the store as unreadable, never as empty. The daemon refuses to start
+    on a machine whose store is `env` (exit 2, and drops the variable either way): its runs and the
+    hooks the agent CLI starts (outbound scans, the pre-push scan) are not its children and could
+    never see it. Where a daemon runs, use `keychain` or `command`, which every process reads itself.
   Keys read from a keychain, command or env store live only in the process's memory and are read
   again at most every 60 s.
+- Masking fails closed. When the store cannot be read and no value was ever read in that process, a
+  run's last masking step prints `runner: could not mask stored secrets in the run: <cause>` in its
+  log and records `unmasked` (the cause, never a value) in `exit.json`; if the daemon cannot read it
+  either, it logs that and raises one `secrets_unmasked` event per cause. Outbound posts (`ttp notify`,
+  `ttp note --to`, `gh` from a run) and the pre-push scan are refused while the store cannot be read,
+  except in a run whose sandbox hides the store by design (the write fence), which is scanned as before.
 - A shared or build host keeps no plaintext keys: `ttp secret store <keychain|command|env> --shared`
   marks it. There the file store refuses to save, `ttp new --host --copy-secrets` and `ttp secret push`
   to it are refused on the far side (exit 3), and a `secrets.json` already there is reported by
   `ttp secret store`, `ttp secret show` and `ttp status` (never deleted: move its keys to the store,
-  then delete it yourself). `ttp new --host` copies no keys unless `--copy-secrets` asks for it.
+  then delete it yourself). A `secrets.json` on a host marked shared whose store is still `file` (the
+  marker written by hand) is still read, never written, and reported as such.
+  `ttp new --host` copies no keys unless `--copy-secrets` asks for it.
 - A central secrets service (a company's vault or broker) plugs in as a `command` store: any program
   that authenticates the way the service wants (a short-lived machine or user identity, not a key
   file) and prints the JSON object. A service needing more (writes, per-key reads) is one more entry in

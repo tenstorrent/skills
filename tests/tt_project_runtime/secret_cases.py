@@ -1782,3 +1782,94 @@ def test_hook_refuses_runs_that_read_the_run_time_store_directly(env, monkeypatc
     out, _ = hook.pre_tool_use({"tool_name": "Bash", "tool_input": {"command": cmd}, "cwd": str(env["tmp"])})
     denied = bool(out) and out["hookSpecificOutput"].get("permissionDecision") == "deny"
     assert denied == refused, out
+
+
+def _fresh_masking(monkeypatch):
+    """A process that never read the store (a run, a hook), outside a sandboxed run."""
+    from ttp import redact
+    monkeypatch.setattr(redact, "_cache", {"sig": None, "pairs": [], "error": None, "ever": False})
+    for var in ("TTP_RUN_DIR", "SANDBOX_RUNTIME"):
+        monkeypatch.delenv(var, raising=False)
+    return redact
+
+
+def test_a_daemon_refuses_the_env_store_and_its_runs_never_inherit_or_miss_it_silently(env, monkeypatch, capsys):
+    from ttp import outscan
+    from ttp.daemon import Daemon
+    p = make(env)
+    project, secretstore = _runtime_store_home(env, monkeypatch)
+    code, out = _custom(monkeypatch, capsys, "store", "env")
+    assert code == 0 and "a daemon refuses to start with it" in out
+    monkeypatch.setenv(secretstore.ENV_VAR, json.dumps({"jev": {"key": _STORE_KEY}}))
+    assert Daemon(p.base).run() == 2
+    err = capsys.readouterr().err
+    assert "daemon refused" in err and "keychain or command" in err and _STORE_KEY not in err
+    assert secretstore.ENV_VAR not in os.environ, "no run started by it inherits the keys"
+    assert not (p.state / "daemon.pid").exists()
+    # A process started without the variable (a run, a hook): the store is unreadable, never empty
+    secretstore._env.clear()
+    redact = _fresh_masking(monkeypatch)
+    assert redact.pairs() == [] and redact.blind() and secretstore.ENV_VAR in redact.store_error()
+    assert "secrets store could not be read" in outscan.problem("ttp notify", "hello", p=p)
+
+
+def test_a_store_unreadable_at_the_runs_end_flags_the_run_and_says_so(env, monkeypatch, capsys):
+    from ttp import runner
+    project, secretstore = _runtime_store_home(env, monkeypatch)
+    secretstore.set_config("command", [str(_fetch_script(env, f'echo "{_STORE_KEY}" >&2\nexit 7\n'))])
+    redact = _fresh_masking(monkeypatch)
+    run_dir = env["tmp"] / "run"
+    run_dir.mkdir()
+    (run_dir / "output.jsonl").write_text(json.dumps({"text": "hello"}) + "\n")
+    exit_info: dict = {"rc": 0}
+    runner._mask_run(run_dir, exit_info)
+    out = capsys.readouterr().out
+    assert "exited 7" in exit_info["unmasked"] and _STORE_KEY not in exit_info["unmasked"]
+    assert "runner: could not mask stored secrets in the run: secret fetch command" in out and _STORE_KEY not in out
+    assert redact.pairs() == [], "pairs() still never raises"
+    # A store read once in this process keeps masking its values: not flagged
+    _fetch_script(env, f'echo \'{{"jev": {{"key": "{_STORE_KEY}"}}}}\'\n')
+    secretstore._mem.update(key=None, data=None)
+    redact._cache["sig"] = None
+    (run_dir / "output.jsonl").write_text(json.dumps({"text": f"leaked {_STORE_KEY}"}) + "\n")
+    exit_info = {"rc": 0}
+    runner._mask_run(run_dir, exit_info)
+    assert "unmasked" not in exit_info and _STORE_KEY not in (run_dir / "output.jsonl").read_text()
+
+
+def test_outscan_refuses_while_the_store_is_unreadable_and_passes_once_it_reads(env, monkeypatch):
+    from ttp import outscan
+    project, secretstore = _runtime_store_home(env, monkeypatch)
+    secretstore.set_config("command", [str(_fetch_script(env, "exit 3\n"))])
+    redact = _fresh_masking(monkeypatch)
+    why = outscan.problem("ttp note --to", "a clean note")
+    assert why and "secrets store could not be read" in why and "nothing was sent" in why
+    _fetch_script(env, f'echo \'{{"jev": {{"key": "{_STORE_KEY}"}}}}\'\n')
+    secretstore._mem.update(key=None, data=None)
+    redact._cache["sig"] = None
+    assert outscan.problem("ttp note --to", "a clean note") is None
+    assert "a stored secret" in outscan.problem("ttp note --to", f"note {_STORE_KEY}")
+
+
+def test_a_shared_host_still_reading_its_plaintext_file_is_reported_truthfully(env, monkeypatch):
+    project, secretstore = _runtime_store_home(env, monkeypatch)
+    project.save_secret("peer-key", _CUSTOM)
+    secretstore.config_path().write_text(json.dumps({"backend": "file", "shared": True}))   # written by hand
+    assert project.load_secrets() == {"peer-key": _CUSTOM}, "the file backend still reads it"
+    line = secretstore.plaintext_report()
+    assert "still reads it" in line and "no longer reads" not in line and _CUSTOM not in line
+    secretstore.config_path().write_text(json.dumps({"backend": "keychain"}))
+    assert "no longer reads or writes it" in secretstore.plaintext_report()
+
+
+@pytest.mark.parametrize("user,account", [("alice.b", "alice.b"), ('ev il" -A', "tt-project"),
+                                          ("a\nadd-internet-password", "tt-project"), ("", "tt-project")])
+def test_the_keychain_line_never_splits_on_the_users_name(env, monkeypatch, user, account):
+    project, secretstore = _runtime_store_home(env, monkeypatch)
+    monkeypatch.setenv("USER", user)
+    seen = []
+    monkeypatch.setattr(secretstore.subprocess, "run", lambda argv, **k: (
+        seen.append(k["input"]), types.SimpleNamespace(returncode=0, stdout="", stderr=""))[1])
+    secretstore._keychain_save({}, {"peer-key": _CUSTOM})
+    words = seen[0].split()
+    assert seen[0].count("\n") == 1 and words[words.index("-a") + 1] == account and len(words) == 8

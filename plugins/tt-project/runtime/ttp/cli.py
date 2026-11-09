@@ -10662,6 +10662,9 @@ def cmd_secret_store(a) -> None:
     except Exception as e:
         die(str(e))
     print(f"this machine now reads ttp secrets from {a.alias}" + (" (marked shared)" if a.shared else ""))
+    if a.alias == "env":
+        print(f"env serves only the one process given {secretstore.ENV_VAR} (a script, a CI job): a daemon "
+              "refuses to start with it; choose keychain or command where a daemon runs")
     if ln := secretstore.plaintext_report():
         print(ln)
 

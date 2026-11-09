@@ -8,7 +8,10 @@ The choice is per machine, in secret-store.json in the ttp home (it holds no sec
   {"backend": "command", "command": [argv]}  a fetch command that prints the whole store as one
                                              JSON object on stdout (exit 0); read-only
   {"backend": "env"}                         TTP_SECRETS_JSON, read once and removed from this
-                                             process's environment so no child inherits it; read-only
+                                             process's environment so no child inherits it; read-only.
+                                             It serves that one process only (a script, a CI job): a
+                                             daemon refuses to start with it, since its runs and the
+                                             hooks the agent CLI starts would see no store
 and "shared": true on a shared or build host: there no key is ever written in plaintext, so the file
 backend refuses to save and `ttp secret push` to it is refused. A central mechanism plugs in as a
 `command` (any program that prints the JSON) or as one more entry in BACKENDS. Values read from a
@@ -18,6 +21,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import time
 from pathlib import Path
@@ -95,7 +99,10 @@ def _file_save(c: dict, data: dict) -> None:
 
 
 def _account() -> str:
-    return os.environ.get("USER") or "tt-project"
+    # The keychain item's account, also a word in the `security -i` line: a $USER that could split or
+    # quote that line (spaces, quotes, a newline) is never put in it.
+    user = os.environ.get("USER") or ""
+    return user if re.fullmatch(r"[A-Za-z0-9._@-]{1,64}", user) else "tt-project"
 
 
 def _keychain_load(c: dict) -> dict:
@@ -131,7 +138,11 @@ def _command_load(c: dict) -> dict:
 def _env_load(c: dict) -> dict:
     if ENV_VAR in os.environ:
         _env["text"] = os.environ.pop(ENV_VAR)
-    return _parse(_env.get("text", ""), ENV_VAR)
+    if "text" not in _env:   # never given to this process: unreadable, not empty, so masking fails closed
+        raise project.SecretsUnreadable(
+            f"{ENV_VAR} was not given to this process: the env store serves only the one process it is "
+            "given to (a script, a CI job), never a daemon's runs or hooks; choose keychain or command there")
+    return _parse(_env["text"], ENV_VAR)
 
 
 def _read_only(c: dict, data: dict) -> None:
@@ -188,9 +199,12 @@ def plaintext_report() -> str:
             return ""
     except (OSError, project.SecretsUnreadable):
         return ""
-    why = "this host is marked shared" if c.get("shared") else f"this machine reads keys from {c['backend']}"
-    return (f"plaintext key file left at {p} ({why}): ttp no longer reads or writes it; move its keys to the "
-            "store, then delete it yourself")
+    if c["backend"] == "file":   # shared: still read, never written
+        return (f"plaintext key file at {p} on a host marked shared: ttp still reads it but writes no key "
+                "here; move its keys to a run-time store (`ttp secret store keychain|command`), then delete "
+                "it yourself")
+    return (f"plaintext key file left at {p} (this machine reads keys from {c['backend']}): ttp no longer "
+            "reads or writes it; move its keys to the store, then delete it yourself")
 
 
 def command_words() -> list[str]:

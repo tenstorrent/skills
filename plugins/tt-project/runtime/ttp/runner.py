@@ -725,16 +725,27 @@ def supervise(run_dir: Path) -> int:
             print(f"runner: credential files changed during the run: {changed}", flush=True)
     if bridge is not None:
         exit_info["bridge"] = bridge.stats()   # endpoint fault kinds for routing's fallback (route.py)
-    try:   # before exit.json: the daemon reads the run's output and hand-off only after it
+    _mask_run(run_dir, exit_info)   # before exit.json: the daemon reads the run's output and hand-off only after it
+    _write_exit(run_dir, exit_info)
+    return rc
+
+
+def _mask_run(run_dir: Path, exit_info: dict) -> None:
+    """Mask stored secrets and private keys in the run's files. A store it could not read, with no value
+    ever read here, masks nothing: said in the run's log and flagged in exit_info["unmasked"] (the cause,
+    never a value) for the daemon, never passed as masked."""
+    try:
         from . import redact
         left: list = []
         redact.scrub_run(run_dir, left=left)
         for f in left:
             print(f"runner: not masked, over {redact.MAX_FILE_BYTES >> 20} MiB: {f}", flush=True)
+        if redact.blind():
+            exit_info["unmasked"] = redact.store_error()
     except Exception as e:
-        print(f"runner: could not mask stored secrets in the run: {type(e).__name__}", flush=True)
-    _write_exit(run_dir, exit_info)
-    return rc
+        exit_info["unmasked"] = type(e).__name__
+    if exit_info.get("unmasked"):
+        print(f"runner: could not mask stored secrets in the run: {exit_info['unmasked']}", flush=True)
 
 
 def check_pin(run_dir: Path, spec: dict, env: dict) -> dict | None:

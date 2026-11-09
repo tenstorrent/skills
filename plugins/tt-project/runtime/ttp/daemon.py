@@ -1330,6 +1330,19 @@ class Daemon:
     # lifecycle ------------------------------------------------------------------------------------
     def run(self) -> int:
         self.p.state.mkdir(parents=True, exist_ok=True)
+        from . import secretstore
+        from .project import SecretsUnreadable
+        # The env store serves only the process it is given to: never kept here for runs to inherit,
+        # and refused, since the hooks the agent CLI starts could never see it.
+        os.environ.pop(secretstore.ENV_VAR, None)
+        try:
+            backend = secretstore.config()["backend"]
+        except SecretsUnreadable:
+            backend = ""   # status and doctor report it; runs that need a key fail on their own
+        if backend == "env":
+            print(f"daemon refused: this machine's secret store is env ({secretstore.ENV_VAR}), which reaches "
+                  "no run or hook of a daemon; choose keychain or command (`ttp secret store`)", file=sys.stderr)
+            return 2
         pidfile = self.p.state / "daemon.pid"
         if not self._single_instance():
             print(f"daemon already running (pid {_read_pid(pidfile)})", file=sys.stderr)
@@ -5122,6 +5135,14 @@ class Daemon:
                        + (f"masked by detached job {pid} (scrub.log)" if pid else "the detached masking job did not start"))
         except Exception:
             log(p, f"run {r['id']}: masking stored secrets failed\n" + traceback.format_exc())
+        if exit_info.get("unmasked") and redact.blind():   # neither the runner nor the daemon could read the store
+            text = (f"run {r['id']}: could not mask stored secrets in the run (the secrets store could not be "
+                    f"read: {redact.store_error()}); its log and hand-off may hold a stored value")
+            log(p, text)
+            if getattr(self, "_unmasked_said", None) != redact.store_error():   # one event per cause, not per run
+                self._unmasked_said = redact.store_error()
+                db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+                     (time.time(), "daemon", "secrets_unmasked", "high", text[:500], "queued", r["task"]))
         if exit_info.get("cred_changed"):
             try:
                 credwatch.observe(db, r, exit_info["cred_changed"], time.time(), run_dir, p,

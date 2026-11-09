@@ -74,9 +74,12 @@ def in_run() -> bool:
 def matcher(p=None) -> Callable[[str], str | None]:
     """A function giving the class of the first leak in a text, or None. Reads the stored secrets and the
     project's patterns once. An invalid or unreadable forbidden-data pattern raises ValueError (fails
-    closed, as forbidden.py does)."""
-    from . import redact
-    values = [(v, slot) for value, slot in redact.pairs() for v in redact._variants(value)]
+    closed, as forbidden.py does), and so does a secrets store it cannot read: it could not tell a stored
+    value. A run whose sandbox hides the store by design (secretroute.routed) is scanned as before."""
+    from . import redact, secretroute
+    if (err := redact.store_error()) and not secretroute.routed():
+        raise ValueError(f"the secrets store could not be read ({err}), so it cannot be checked for stored secrets")
+    values =[(v, slot) for value, slot in redact.pairs() for v in redact._variants(value)]
     forbidden: list[tuple[str, re.Pattern]] = []
     if p is not None:
         from .forbidden import declared
