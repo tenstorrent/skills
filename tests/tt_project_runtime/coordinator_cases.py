@@ -20298,9 +20298,11 @@ def test_every_worker_prompt_carries_every_standing_entry_for_workers(env, kind,
     assert "STANDING-" not in pointers, "a pointer stands in for none of them"
 
 
-def test_standing_worker_memory_past_its_room_is_kept_whole_and_alerts_once(env):
-    """Standing entries for workers that alone outgrow the workers' pinned room are all kept, whole,
-    ahead of every other entry, and the coordinator is told once."""
+def test_standing_worker_memory_past_its_room_is_pointed_to_and_alerts_once(env):
+    """Standing entries for workers that outgrow the workers' pinned room (user msg #2271: memory within
+    its budget, pinned ones included) are shown whole, oldest first, while they fit; each of the rest is
+    a pointer (its name, first sentence and where it is in full), never dropped; the coordinator is
+    told once."""
     p = make(env)
     from ttp import coordinator as coord
     from ttp.prompts import worker_context, worker_system
@@ -20308,17 +20310,21 @@ def test_standing_worker_memory_past_its_room_is_kept_whole_and_alerts_once(env)
                            standing=True) for i in range(8)]
     p.add_memory("FACT-1 the nightly run took 2 h.", title="fact 1")
     text, mem, use = worker_context(p)
-    assert use["kept_chars"] > use["memory_limit"] and use["pinned_dropped"] == 0, use
+    assert use["pinned_dropped"] and use["kept"] == 0 and not use["kept_over"], use
     shown = {e["name"] for e in mem}
-    assert {d.stem for d in duties} <= shown and use["kept_over"]
+    pointed = [x["name"] for x in use["pointers"]]
+    assert shown and set(pointed) == {d.stem for d in duties} - shown
+    assert pointed == [d.stem for d in duties][len(duties) - len(pointed):], "the oldest are shown whole"
     system = worker_system(p)
-    for i in range(8):
-        assert f"DUTY-{i:02} report it each time. " + "s" * 900 in system, i
+    for i, d in enumerate(duties):
+        assert (f"DUTY-{i:02} report it each time. " + "s" * 900 in system) == (d.stem in shown), i
+        assert f"[{d.stem}] DUTY-{i:02} report it each time." in system, i
+    assert sum(len(e["line"]) + 1 for e in mem) <= use["memory_limit"]
     alerts = lambda: p.db.q("SELECT text FROM events WHERE kind='memory_over_budget'")
     coord.memory_budget_check(p)
     coord.memory_budget_check(p)
     assert len(alerts()) == 1, alerts()
-    assert "8 restriction, resource and standing entries for workers" in alerts()[0]["text"], alerts()
+    assert f"so {len(pointed)} of them reach workers only as a pointer" in alerts()[0]["text"], alerts()
     for d in duties[1:]:   # fits again: re-armed, silent
         p.forget_memory(d.stem, why="test")
     coord.memory_budget_check(p)
@@ -20568,9 +20574,10 @@ def test_every_worker_prompt_carries_a_resource_entry_that_is_not_standing(env, 
 
 
 def test_the_reported_light_harness_run_carries_every_restriction_resource_and_standing_entry(env):
-    """The reported case: 14 entries, a light-tier harness run. Every restriction, resource and standing
-    entry is there, whole; the entry tagged for workers that no longer fits is pointed to, never dropped
-    silently, and the coordinator and `ttp doctor` are told the kept ones outgrow the room."""
+    """The reported case: 14 entries, a light-tier harness run. Every restriction and resource entry is
+    there, whole; the standing entries and the one tagged for workers have only the room left
+    (user msg #2271: memory within its budget, pinned ones included), so those past it are pointed to,
+    never dropped silently, and the coordinator and `ttp doctor` are told."""
     p, pins, tagged = _pinned_kinds_project(env)
     from ttp import coordinator as coord
     from ttp.prompts import worker_context, worker_system
@@ -20578,21 +20585,24 @@ def test_the_reported_light_harness_run_carries_every_restriction_resource_and_s
             "spec": "Shorten the watcher's log lines."}
     text, mem, use = worker_context(p, task)
     shown = {e["name"] for e in mem}
-    assert {f.stem for f in pins.values()} <= shown, shown
+    always = {k: f for k, f in pins.items() if not k.startswith("DUTY")}
+    assert {f.stem for f in always.values()} <= shown, shown
     block = _memory_block(worker_system(p, task))
-    for f in pins.values():
+    for f in always.values():
         line = next(e["line"] for e in p._memory_entries() if e["name"] == f.stem)
         assert line in block, f.stem
     assert "COORD-DECISION" not in block and "FACT-2" not in block
-    assert tagged.stem not in shown and use["pinned_dropped"] == 1
+    pointed = {x["name"] for x in use["pointers"]}
+    assert {pins["DUTY-1"].stem, pins["DUTY-2"].stem, tagged.stem} <= pointed | shown
+    assert pointed and use["pinned_dropped"] == len(pointed) and not pointed & shown
     assert f"Shortened for room, each in full in {p.memory_dir}/<name>.md" in block
-    assert f"\n[{tagged.stem}] " in block
+    for name in pointed:
+        assert f"\n[{name}] " in block, name
     line = coord.worker_pinned_line(p)
-    assert line.startswith("pinned worker memory over budget: ") and "1 of 6 pinned entries" in line, line
-    assert f"where it is in full): {tagged.stem};" in line, line
+    assert line.startswith("pinned worker memory over budget: ") and f"{len(pointed)} of 6 pinned entries" in line
     coord.memory_budget_check(p)
     alerts = p.db.q("SELECT text FROM events WHERE kind='memory_over_budget'")
-    assert len(alerts) == 1 and "so 1 of them reach workers only as a pointer" in alerts[0]["text"], alerts
+    assert len(alerts) == 1 and f"so {len(pointed)} of them reach workers only as a pointer" in alerts[0]["text"]
 
 
 def test_pinned_worker_memory_is_the_same_in_light_standard_and_deep_runs(env):

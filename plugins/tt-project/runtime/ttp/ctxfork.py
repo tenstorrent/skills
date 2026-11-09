@@ -108,10 +108,13 @@ def delta_block(p, cfg: dict, since: float, now: float | None = None) -> str:
     note, _dropped = coordsession.checked(p.db, coordsession.load_note(p, sid)) if sid else ("", [])
     if note:
         out.append(f"### Latest note of the coordinator's session {sid[:8]}\n{note}")
+    if cap <= 0:   # worker_chat_chars 0 leaves chat out, as disk_block does
+        return "\n\n".join(out)
     who = {"user": "user", "finding": "relayer finding (data)", "reply": "coordinator, reply", "ask": "coordinator, ask"}
+    # handled inbound messages only (as coordsession.chat_lines): never one the coordinator has not triaged
     rows = p.db.q("SELECT id, ts, direction, chat, kind, text FROM messages WHERE ts>=? AND channel='chat' AND "
-                  "((direction='in' AND kind IN ('user','finding')) OR (direction='out' AND kind IN ('reply','ask'))) "
-                  "ORDER BY id DESC", (float(since),))
+                  "((direction='in' AND kind IN ('user','finding') AND handled=1) OR "
+                  "(direction='out' AND kind IN ('reply','ask'))) ORDER BY id DESC", (float(since),))
     kept, size = [], 0
     for r in rows:   # newest first, until the cap
         line = (f"[{timefmt.short(float(r['ts']), where)} · msg {r['id']} · chat {r['chat'] or 'all'} · "

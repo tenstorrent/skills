@@ -1436,7 +1436,7 @@ _WORKER_WORD = re.compile(r"\bworkers?\b", re.I)
 
 def worker_memory(e: dict) -> int:
     """Where memory entry `e` stands in a worker's prompt: 1, pinned (tagged for workers,
-    restrictions, resources, standing entries; worker_always says which of them no limit drops); 2,
+    restrictions, resources, standing entries; worker_always says which of them no limit shortens); 2,
     shown first while they fit (entries that speak of workers); 3, then the newest facts that fit; 0,
     never (the rest, written for the coordinator:
     decisions and preferences that are not standing, and anything tagged for the coordinator but a
@@ -1449,10 +1449,11 @@ def worker_memory(e: dict) -> int:
 
 
 def worker_always(e: dict) -> bool:
-    """Whether a worker's prompt carries pinned entry `e` whatever its limits: the set the coordinator
-    always shows (restrictions, resources, standing entries). Other pinned ones (tagged for workers)
-    fill the room left."""
-    return bool(e["kind"] in ("restriction", "resource") or e.get("standing"))
+    """Whether a worker's prompt carries pinned entry `e` whatever its limits: restrictions and resources
+    (a worker that misses one breaks a rule or acts on the wrong machine or folder). Standing entries
+    and the others tagged for workers fill the room left, standing ones first; past it each is a
+    pointer (memory_pointer) to where it is in full."""
+    return bool(e["kind"] in ("restriction", "resource"))
 
 
 def coordinator_memory(e: dict) -> bool:
@@ -2107,9 +2108,10 @@ class Project:
     def worker_memory_select(self, limit_chars: int, task: dict | None = None, pinned_limit: int | None = None,
                              restated=None, entries: list[dict] | None = None) -> tuple[list[dict], dict]:
         """The entries a worker's prompt gets, whole, oldest first: those worker_memory pins, the
-        restrictions, resources and standing ones always (worker_always), whatever the limits, then the
+        restrictions and resources always (worker_always), whatever the limits, then the
         others while they fit `pinned_limit` (None:
-        all; when not all fit, those that share the most words with `task` first, then the oldest);
+        all; when not all fit, those that share the most words with `task` first, then standing ones,
+        then the oldest);
         then, only if every pinned one fits: for `task`, the
         others that share words with its title and spec (task_words; a word few entries share weighs
         more), most shared first, then newest, each that fits; then those that speak of workers and
@@ -2138,8 +2140,8 @@ class Project:
                 for w in ws:
                     df[w] = df.get(w, 0) + 1
             return {n: sum(1 / df[w] for w in ws) for n, ws in words.items()}
-        # Restrictions, resources and standing entries first, every one whatever the limits: a worker that
-        # misses one breaks a rule or acts on the wrong machine or folder.
+        # Restrictions and resources first, every one whatever the limits: a worker that misses one breaks
+        # a rule or acts on the wrong machine or folder. Standing entries lead the rest, within the room.
         kept = [e for e in pinned if worker_always(e)]
         used = kept_chars = sum(len(e["line"]) + 1 for e in kept)
         chosen = {e["name"] for e in kept}
@@ -2149,7 +2151,8 @@ class Project:
         # then each shown whole (in place of its pointer) while that fits.
         short = {e["name"]: memory_pointer(e) for e in pinned if over and e["name"] not in chosen}
         used += sum(len(x) + 1 for x in short.values())
-        for _, e in sorted(enumerate(pinned), key=lambda x: (-score.get(x[1]["name"], 0), x[0])):
+        for _, e in sorted(enumerate(pinned), key=lambda x: (-score.get(x[1]["name"], 0),
+                                                             not x[1].get("standing"), x[0])):
             if e["name"] in chosen:
                 continue
             ptr = len(short[e["name"]]) + 1 if e["name"] in short else 0
