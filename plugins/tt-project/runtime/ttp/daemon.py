@@ -1972,6 +1972,7 @@ class Daemon:
         self._run_step(self.review_jev)
         self._run_step(self.end_effort_ab)
         self._run_step(self.trip_model_routing)
+        self._run_step(self.watch_run_classes)
         self._run_step(self.watch_cli_versions)
         self._run_step(self.reap_locks)
         self._run_step(self.reap_task_records)
@@ -2076,6 +2077,25 @@ class Daemon:
             self._load_config()
             self.alert("effort-ab-decided", f"Effort A/B ended: {got} effort is now the standard for code tasks "
                        f"(`ttp stats --effort-ab`).", severity="low", every_s=0)
+
+    def watch_run_classes(self, every_s: float = 300, window_s: float = 3600) -> None:
+        """Model-free alarm (runclass.quiet_classes): a class routed to the chat provider that had at least
+        runclass.ALARM_MIN eligible runs in the last hour and none there, or a wake gate with no chat
+        decision, raises one coordinator event per class per window (kv-deduped). Reads only."""
+        from . import runclass
+        now = time.time()
+        if now - getattr(self, "_run_class_checked", 0.0) < every_s:
+            return
+        self._run_class_checked = now
+        s = runclass.by_class(self.p.db, self.cfg, now - window_s, now)
+        for q in runclass.quiet_classes(s):
+            key = f"run_class_alarm:{q['class']}"
+            if now - float(self.p.db.kv(key, 0) or 0) < window_s:
+                continue
+            self.p.db.set_kv(key, now)
+            self.p.db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
+                        (now, "daemon", "run_class_quiet", "normal", runclass.alarm_text(q, window_s / 3600)[:500],
+                         "new"))
 
     def trip_model_routing(self, every_s: float = 3600) -> None:
         """The model-pick tripwire (modeltrip.check): a stratum whose routed tasks go wrong more often than

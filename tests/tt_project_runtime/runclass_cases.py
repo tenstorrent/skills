@@ -17,7 +17,8 @@ def test_run_classes_cover_every_kind_of_run():
     assert c(None, {"role": "coordinator"}) == "coordinator"
     assert c({"kind": "code", "tier": "light", "title": "x"}, {"role": "coordinator"}) == "coordinator"
     assert c({"kind": "review", "tier": "standard", "title": "r"}, {"note": {"conflict_fix": {"tier": "light"}}}) == "rebase"
-    assert c({"kind": "code", "tier": "standard", "title": "rebase #12 onto the branch"}) == "rebase"
+    assert c({"kind": "code", "tier": "standard", "title": "x", "labels": '["rebase"]'}) == "rebase"
+    assert c({"kind": "code", "tier": "standard", "title": "rebase #12 onto the branch"}) == "hard"   # never by title
     assert c({"kind": "review", "tier": "standard", "title": "r"}, {"note": {"review_tier": {"lines": 120}}}) == "review_small"
     assert c({"kind": "review", "tier": "standard", "title": "r"}, {"note": {"review_tier": {"lines": 900}}}) == "hard"
     assert c({"kind": "review", "tier": "standard", "title": "r"}, {"note": {}}) == "hard"   # size unknown
@@ -113,3 +114,59 @@ def test_stats_by_class_counts_runs_per_class_per_model_and_the_alarm_names_a_qu
     cli.main(["stats", p.name, "--by-class", "--since", "1h"])
     out = capsys.readouterr().out
     assert "status_report [chat]" in out and "chat:example-org/small-model 1" in out, out
+
+
+def test_deep_plan_and_device_runs_stay_hard_and_on_core_whatever_their_title_or_wake():
+    from ttp import runclass
+    cfg = _rc_cfg()
+    wake = {"note": {"wake": {"tier": "light"}}}
+    cases = [
+        ({"kind": "code", "tier": "deep", "title": "push queue: stop the rebase step dropping commits"}, None),
+        ({"kind": "code", "tier": "deep", "title": "x", "labels": '["rebase"]'}, None),
+        ({"kind": "work", "tier": "standard", "title": "check the box", "spec": "power cycle the box, then soak 2 h"}, wake),
+        ({"kind": "plan", "tier": "deep", "title": "plan"}, wake),
+        ({"kind": "plan", "tier": "standard", "title": "plan"}, wake),
+        ({"kind": "code", "tier": "standard", "title": "x"}, {"note": {"wake": {}, "tier": "deep"}}),
+        ({"kind": "review", "tier": "deep", "title": "r"}, {"note": {"conflict_fix": {"tier": "light"}}}),
+    ]
+    for task, run in cases:
+        assert runclass.classify(task, run, cfg) == "hard", task
+        assert runclass.target(cfg, task, str(task["tier"]), runclass.classify(task, run, cfg)) is None, task
+    # A push-conflict fix review below deep stays a rebase and routes to chat.
+    r = {"kind": "review", "tier": "standard", "title": "r"}
+    assert runclass.classify(r, {"note": {"conflict_fix": {"tier": "light"}}}, cfg) == "rebase"
+
+
+def test_the_quiet_class_alarm_raises_one_coordinator_event_per_window_with_counts_and_last_error(env):
+    from ttp import runclass
+    from ttp.daemon import Daemon
+    p = make(env)
+    p.set_config("providers.chat", _RC_CHAT)
+    now = time.time()
+    t = p.db.add_task("why", "", kind="question", tier="standard", priority=3, budget_usd=1.0)
+    pinned = p.db.add_task("why pinned", "", kind="question", tier="standard", priority=3, budget_usd=1.0)
+    p.db.x("UPDATE tasks SET provider='claude' WHERE id=?", (pinned,))
+    for i in range(8):   # pinned runs never count toward the alarm
+        p.db.x("INSERT INTO runs(task,role,provider,model,started,status,cost_usd,note) VALUES(?,?,?,?,?,?,?,?)",
+               (pinned, "worker", "claude", "opus", now - 60 - i, "ok", 0.5, "{}"))
+    d = Daemon(p.base)
+    events = lambda: p.db.q("SELECT text FROM events WHERE kind='run_class_quiet'")
+    d.watch_run_classes()
+    assert events() == []
+    note = '{"route": {"fallback": "timeout"}}'
+    for i in range(5):
+        p.db.x("INSERT INTO runs(task,role,provider,model,started,status,cost_usd,note) VALUES(?,?,?,?,?,?,?,?)",
+               (t, "worker", "claude", "opus", now - 30 - i, "ok", 0.5, note))
+    d._run_class_checked = 0.0
+    d.watch_run_classes()
+    rows = [r["text"] for r in events()]
+    assert len(rows) == 1 and "status_report" in rows[0] and "5 eligible runs (13 in all)" in rows[0] \
+        and "Last fallback: route fallback: timeout" in rows[0], rows
+    d._run_class_checked = 0.0
+    d.watch_run_classes()   # not repeated within the window
+    assert len(events()) == 1
+    # Quiet once the class ran on chat, and with no chat provider.
+    p.db.x("INSERT INTO runs(task,role,provider,model,started,status,cost_usd,note) VALUES(?,?,?,?,?,?,?,?)",
+           (t, "worker", "chat", "example-org/small-model", now - 5, "ok", 0.0, "{}"))
+    assert runclass.quiet_classes(runclass.by_class(p.db, _rc_cfg(), now - 3600, now + 1)) == []
+    assert runclass.quiet_classes(runclass.by_class(p.db, {}, now - 3600, now + 1)) == []

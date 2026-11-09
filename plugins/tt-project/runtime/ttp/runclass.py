@@ -40,7 +40,6 @@ SCREEN_USES = ("screen",)
 SMALL_LINES = 300
 ALARM_MIN = 5
 REPORT = re.compile(r"(?i)\b(status|report|measure(?:d|ment|s)?|count|stats|summar(?:y|ise|ize)|digest|brief)\b")
-REBASE = re.compile(r"(?i)\b(rebase|merge[- ]conflict|push[- ]conflict)\b")
 
 
 def _note(run: dict | None) -> dict:
@@ -59,8 +58,9 @@ def _labels(task: dict) -> list[str]:
 
 def classify(task: dict | None, run: dict | None = None, cfg: dict | None = None) -> str:
     """The run's class (CLASSES). `run` is its row (role, note) or the note being written; a recorded
-    class (KEY) wins. Order: coordinator, rebase, review (small or hard), device work (hard), wake,
-    light tier, status or report, hard."""
+    class (KEY) wins. Order: coordinator, hard by structure (deep tier, plan, device
+    action), rebase (a conflict-fix note or a rebase label), review (small or hard), wake, light tier,
+    status or report, hard."""
     note = _note(run)
     if note.get(KEY) in CLASSES:
         return note[KEY]
@@ -71,18 +71,21 @@ def classify(task: dict | None, run: dict | None = None, cfg: dict | None = None
     from . import conflictfix, tierfloor
     kind = str(task.get("kind") or "")
     title = str(task.get("title") or "")
-    if note.get(conflictfix.KEY) or REBASE.search(title) or any(lb.startswith("rebase") for lb in _labels(task)):
+    tier = str((note.get("tier") if isinstance(note.get("tier"), str) else "") or task.get("tier") or "")
+    # Hard by structure, before any cheaper class: deep work, plans and device actions stay on core.
+    if "deep" in (tier, task.get("tier")) or kind == "plan" or tierfloor.device_run(task, cfg) \
+            or tierfloor.DEVICE_SPEC.search(str(task.get("spec") or "")):
+        return "hard"
+    # Rebase by structure only (a push-conflict fix, a rebase label), never by title words.
+    if note.get(conflictfix.KEY) or any(lb.startswith("rebase") for lb in _labels(task)):
         return "rebase"
     if kind == "review":
         lines = (note.get("review_tier") or {}).get("lines")
         small = small_lines(cfg)
         return "review_small" if isinstance(lines, (int, float)) and lines < small and task.get("tier") != "deep" \
             else "hard"
-    if tierfloor.device_run(task, cfg):
-        return "hard"
     if note.get("wake"):
         return "worker_wake"
-    tier = str((note.get("tier") if isinstance(note.get("tier"), str) else "") or task.get("tier") or "")
     if tier == "light":
         return "light"
     if kind == "question" or (kind == "work" and REPORT.search(title)):
@@ -136,6 +139,22 @@ def target(cfg: dict, task: dict, tier: str, cls: str, picked: dict | None = Non
     return {"to": TO, "model": model, "rule": f"class:{cls}"} if model else None
 
 
+def routable(task: dict | None, note: dict | None = None) -> bool:
+    """A run class routing could move (target's task-side exclusions): no provider or model pin, not
+    kept on core, no outside input, not a tier-up retry. A run with no task (a watcher) counts."""
+    if not task:
+        return True
+    from .route import kept_core
+    return not (kept_core(task) or untrusted(task) or str(task.get("provider") or "") or str(task.get("model") or "")
+                or ((note or {}).get("pick") or {}).get("by") == "retry")
+
+
+def alarm_text(q: dict, hours: float) -> str:
+    return (f"Run class {q['class']} is routed to the chat provider but none of its {q['eligible']} eligible runs "
+            f"({q['runs']} in all) in the last {hours:g} h ran there; they ran on {', '.join(q['models'])}. "
+            f"Last fallback: {q['last_error'] or 'none recorded'}.")
+
+
 def untrusted(task: dict) -> bool:
     """A task whose run may read untrusted text with tools: labelled untrusted_input, or one the daemon
     made from outside input (PR comments, CI, alerts, notes), a review of this project's own diff
@@ -152,25 +171,38 @@ def by_class(db, cfg: dict, since: float, until: float | None = None) -> dict:
         "SELECT * FROM tasks WHERE id IN (SELECT task FROM runs WHERE started>=? AND started<?)", (since, until))}
     rows: dict = {}
 
-    def add(cls: str, model: str, usd: float) -> None:
+    eligible: dict = {}
+    last_error: dict = {}
+    from .route import KEY as ROUTE_KEY
+
+    def add(cls: str, model: str, usd: float, ok: bool = True) -> None:
         r = rows.setdefault(cls, {}).setdefault(model or "?", {"runs": 0, "usd": 0.0})
         r["runs"] += 1
         r["usd"] = round(r["usd"] + usd, 4)
-    for r in db.q("SELECT task, role, provider, model, cost_usd, note FROM runs WHERE started>=? AND started<?",
-                  (since, until)):
+        eligible[cls] = eligible.get(cls, 0) + int(ok)
+    for r in db.q("SELECT task, role, provider, model, cost_usd, note FROM runs WHERE started>=? AND started<? "
+                  "ORDER BY started", (since, until)):
         r = dict(r)
-        add(classify(tasks.get(r["task"]), r, cfg), f"{r['provider'] or '?'}:{r['model'] or '?'}",
-            float(r["cost_usd"] or 0))
+        task, note = tasks.get(r["task"]), _note(r)
+        cls = classify(task, r, cfg)
+        add(cls, f"{r['provider'] or '?'}:{r['model'] or '?'}", float(r["cost_usd"] or 0), routable(task, note))
+        rn = note.get(ROUTE_KEY)
+        fell = str(rn.get("fallback") or "") if isinstance(rn, dict) else ""
+        if fell and fell != "none":
+            last_error[cls] = f"route fallback: {fell}"
     for r in db.q("SELECT use, decision, cost_usd FROM jev_calls WHERE ts>=? AND ts<?", (since, until)):
         use = str(r["use"] or "")
         cls = "wake_decision" if use in DECISION_USES else "screening" if use in SCREEN_USES else None
         if cls:
             add(cls, decider(r["decision"]), float(r["cost_usd"] or 0))
+    for r in db.q("SELECT source FROM ledger WHERE ts>=? AND ts<? AND source LIKE 'babysit_fallback:%' "
+                  "ORDER BY ts", (since, until)):
+        last_error["wake_decision"] = f"chat decision fell back ({r['source']})"
     rt = routes(cfg)
     total = sum(m["runs"] for c in rows.values() for m in c.values())
     chat = sum(m["runs"] for c, ms in rows.items() if rt.get(c) == "chat" for m in ms.values())
     return {"since": since, "until": until, "hours": round(hours, 3), "routes": rt, "classes": rows,
-            "runs": total, "share": round(chat / total, 3) if total else 0.0}
+            "eligible": eligible, "last_error": last_error, "runs": total, "share": round(chat / total, 3) if total else 0.0}
 
 
 def decider(decision) -> str:
@@ -209,9 +241,11 @@ def quiet_classes(s: dict, n: int = ALARM_MIN) -> list[dict]:
         if s["routes"].get(cls) != "chat":
             continue
         runs = sum(v["runs"] for v in ms.values())
+        ok = (s.get("eligible") or {}).get(cls, runs)   # runs class routing would have moved
         chat = sum(v["runs"] for m, v in ms.items() if on_chat(m))
-        if runs >= n and not chat:
-            out.append({"class": cls, "runs": runs, "chat": 0, "models": sorted(ms)})
+        if ok >= n and not chat:
+            out.append({"class": cls, "runs": runs, "eligible": ok, "chat": 0, "models": sorted(ms),
+                        "last_error": (s.get("last_error") or {}).get(cls, "")})
     return out
 
 
