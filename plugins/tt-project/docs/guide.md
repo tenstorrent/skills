@@ -115,6 +115,16 @@ and records one incident in that line until the results are good again. The daem
 overseer whose heartbeat is over 5 min old. Idle cost: no model call, a few read-only queries a
 minute.
 
+The coordinator decides when it looks next: a `look` action sets a time, what to check and why,
+and optionally a shell check that skips the wake when it exits 0 (nothing changed). While a look
+is pending it replaces the fixed idle and idle-slot wakes; with none, those come back. A due look
+starts a turn in the same session. If the tick loop leaves a look pending 3 min past due, the
+overseer starts that turn itself (at most one every 10 min); the loop and the overseer share one
+start lock, so they never start two turns. A tick step over its budget in 3 of its last 10 runs
+sits out the next 10 ticks (never the steps that reap, start turns, dispatch or deliver). It is
+one incident in `state/overseer-incidents.jsonl` with the daemon's stacks, and a look wakes the
+coordinator with that evidence.
+
 ## Budget
 
 - Subscription plans: a plan's capacity is lost at each reset, so the project uses it. Below the

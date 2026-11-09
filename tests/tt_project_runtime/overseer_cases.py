@@ -235,3 +235,177 @@ def test_ensure_overseer_restarts_its_systemd_unit_or_spawns_one(env, monkeypatc
     assert service.ensure_overseer(p) == "restarted its unit"
     name = service._overseer_unit(p).name
     assert ("systemctl", "--user", "restart", name) in ran and service._overseer_unit(p).exists()
+
+
+def test_a_look_the_coordinator_sets_replaces_the_idle_wake_and_wakes_it_once(env, monkeypatch):
+    from ttp import coordinator as coord
+    from ttp import looks
+    from ttp.daemon import idle_wake
+    p, d, clock, starts = _wake_setup(env, monkeypatch)
+    assert coord.apply(p, [{"type": "look", "at": "45m", "text": "did the soak finish? it gates the merge"}]) == []
+    at = clock[0] + 45 * 60
+    w = idle_wake(p, p.config(), {}, clock[0])
+    assert w["at"] == at and w["look"].startswith("did the soak"), w
+    assert _first_turn(d, clock, starts, at - 30) is None, "woke before the look was due"
+    fired = _first_turn(d, clock, starts, at + 120)
+    assert fired is not None and fired >= at, (fired, at)
+    assert looks.pending(p.db) == [] and p.db.kv(looks.DONE_KEY)[-1]["status"] == "woken"
+    starts.clear()
+    assert _first_turn(d, clock, starts, clock[0] + 1800) is None, "a settled look woke it again"
+    assert idle_wake(p, p.config(), {}, clock[0]).get("look") is None, "no look: back to the idle wake"
+
+
+def test_a_look_whose_check_says_nothing_changed_starts_no_turn(env, monkeypatch):
+    from ttp import coordinator as coord
+    from ttp import looks
+    p, d, clock, starts = _wake_setup(env, monkeypatch)
+    assert coord.apply(p, [{"type": "look", "at": "10m", "text": "same", "precheck": "true"},
+                           {"type": "look", "at": "20m", "text": "changed", "precheck": "exit 3"}]) == []
+    _first_turn(d, clock, starts, clock[0] + 15 * 60)
+    assert not starts and p.db.kv(looks.DONE_KEY)[-1]["status"] == "skipped"
+    assert _first_turn(d, clock, starts, clock[0] + 15 * 60) is not None, "a check that saw a change did not wake"
+    assert [x["text"] for x in p.db.kv(looks.DONE_KEY) if x["status"] == "woken"] == ["changed"]
+    assert coord.apply(p, [{"type": "look", "at": "1h", "text": "x"}, {"type": "look", "enabled": False}]) == []
+    assert looks.pending(p.db) == []
+    assert coord.apply(p, [{"type": "look", "at": "9d", "text": "x"}]), "a look past the horizon was taken"
+
+
+def test_the_overseer_wakes_a_due_look_the_stuck_loop_missed_and_the_paths_never_start_two(env, monkeypatch):
+    from ttp import looks
+    from ttp import overseer as ov
+    from ttp.daemon import Daemon
+    p = make(env)
+    _no_events(p)
+    clock = [time.time()]
+    starts = []
+    monkeypatch.setattr(time, "time", lambda: clock[0])
+    monkeypatch.setattr(Daemon, "start_run", lambda self, *a, **k: starts.append(clock[0]))
+    p.db.set_kv("last_coordinator_turn", clock[0])
+    looks.add(p.db, clock[0] + 60, "check the soak")
+    # The tick loop is stuck: nothing calls maybe_coordinate; the overseer's wake runs it in-process here.
+    monkeypatch.setattr(ov, "spawn_wake", lambda p: ov.wake(str(p.base)))
+    clock[0] += 60 + ov.LOOK_GRACE_S - 5
+    ov.check(p, clock[0])
+    assert not starts, "the overseer woke inside the loop's grace"
+    clock[0] += 10
+    h = ov.check(p, clock[0])
+    assert len(starts) == 1 and h["wake"]["rc"] == 0, h.get("wake")
+    assert looks.pending(p.db) == [] and p.db.kv(looks.DONE_KEY)[-1]["status"] == "woken"
+    looks.add(p.db, clock[0], "again")
+    clock[0] += ov.LOOK_GRACE_S + 10
+    ov.check(p, clock[0])
+    assert len(starts) == 1, "woke twice within WAKE_EVERY_S"
+    # The loop starting a turn at the same moment holds the start lock: the other path starts none.
+    with looks.start_lock(p.state) as mine:
+        assert mine
+        Daemon(p.base).maybe_coordinate()
+    assert len(starts) == 1, "two paths started two turns"
+
+
+def _slow_daemon(p, monkeypatch, ran):
+    """A Daemon on `p` whose tick steps have a 0.01 s budget, and a step that overruns it into `ran`."""
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    monkeypatch.setattr(d, "_step_budget", lambda: 0.01)
+
+    def slow():
+        ran.append(1)
+        time.sleep(0.03)
+    return d, slow
+
+
+def _degraded_events(p):
+    return p.db.q("SELECT * FROM events WHERE kind='tick_step_degraded'")
+
+
+def test_a_step_that_keeps_overrunning_sits_out_ticks_is_one_incident_and_one_ride_along_event(env, monkeypatch):
+    from ttp import looks, pagesev
+    from ttp import overseer as ov
+    from ttp.daemon import DEGRADE_AFTER, DEGRADE_TICKS
+    p = make(env)
+    _no_events(p)
+    ran = []
+    d, slow = _slow_daemon(p, monkeypatch, ran)
+    for _ in range(DEGRADE_AFTER + DEGRADE_TICKS):
+        d._run_step(slow, "sweep_unreviewed")
+        d._run_step(lambda: None, "quick_step")
+    assert len(ran) == DEGRADE_AFTER, "the degraded step was not skipped for its ticks"
+    d._run_step(slow, "sweep_unreviewed")
+    assert len(ran) == DEGRADE_AFTER + 1, "the step did not come back after its ticks"
+    incs = [json.loads(x) for x in (p.state / ov.INCIDENTS_FILE).read_text().splitlines()]
+    assert [i["step"] for i in incs] == ["sweep_unreviewed"], incs
+    assert incs[0]["overruns"]["sweep_unreviewed"] == DEGRADE_AFTER and Path(incs[0]["stacks"]).read_text()
+    [ev] = _degraded_events(p)
+    assert ev["severity"] == "low" and ev["status"] == "queued" and pagesev.rides_along(ev), ev
+    assert looks.pending(p.db) == [], "a degraded step forced a coordinator turn"
+
+
+def test_a_step_degraded_for_hours_and_across_a_restart_adds_no_look_and_one_event(env, monkeypatch):
+    from ttp import looks
+    from ttp.daemon import DEGRADE_AFTER, DEGRADE_TICKS
+    p = make(env)
+    _no_events(p)
+    real, shift = time.time, [0.0]
+    monkeypatch.setattr(time, "time", lambda: real() + shift[0])
+    ran = []
+    d, slow = _slow_daemon(p, monkeypatch, ran)
+    for hour in range(3):
+        if hour == 2:   # a daemon restart: a new Daemon on the same project
+            d, slow = _slow_daemon(p, monkeypatch, ran)
+        before = len(ran)
+        for _ in range(2 * (DEGRADE_AFTER + DEGRADE_TICKS)):
+            d._run_step(slow, "sweep_unreviewed")
+        assert len(ran) - before < 2 * (DEGRADE_AFTER + DEGRADE_TICKS), "the step was never degraded"
+        shift[0] += 3600
+    assert looks.pending(p.db) == [], "a degraded step added a look that forces a coordinator turn"
+    assert len(_degraded_events(p)) <= 1, "the same degrade was raised again"
+
+
+def test_a_step_that_recovered_and_degrades_again_raises_one_more_event(env, monkeypatch):
+    from ttp.daemon import DEGRADE_AFTER, DEGRADE_TICKS, DEGRADE_WINDOW
+    p = make(env)
+    _no_events(p)
+    ran = []
+    d, slow = _slow_daemon(p, monkeypatch, ran)
+    for _ in range(DEGRADE_AFTER + DEGRADE_TICKS):
+        d._run_step(slow, "blocker_sweep")
+    assert len(_degraded_events(p)) == 1
+    for _ in range(DEGRADE_AFTER + DEGRADE_TICKS):   # still slow: the same condition, no new event
+        d._run_step(slow, "blocker_sweep")
+    assert len(_degraded_events(p)) == 1
+    for _ in range(DEGRADE_WINDOW):   # it recovered
+        d._run_step(lambda: None, "blocker_sweep")
+    for _ in range(DEGRADE_AFTER):
+        d._run_step(slow, "blocker_sweep")
+    assert len(_degraded_events(p)) == 2, "a new degrade after a recovery was not raised"
+
+
+def test_a_slow_push_step_still_runs_every_tick(env, monkeypatch):
+    from ttp.daemon import DEGRADE_AFTER, DEGRADE_TICKS
+    p = make(env)
+    _no_events(p)
+    for name in ("tend_pushes", "reap_runs", "some_new_step"):
+        ran = []
+        d, slow = _slow_daemon(p, monkeypatch, ran)
+        for _ in range(DEGRADE_AFTER + DEGRADE_TICKS):
+            d._run_step(slow, name)
+        assert len(ran) == DEGRADE_AFTER + DEGRADE_TICKS, f"slow {name} sat out ticks"
+        assert not d._degraded.get(name)
+    assert _degraded_events(p) == []
+
+
+def test_only_observe_only_tick_steps_may_be_degraded(env):
+    import ast
+    import inspect
+    import textwrap
+    from ttp.daemon import DEGRADE_OK, Daemon
+    tree = ast.parse(textwrap.dedent(inspect.getsource(Daemon.tick)))
+    steps = {n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute)
+             and isinstance(n.value, ast.Name) and n.value.id == "self" and callable(getattr(Daemon, n.attr, None))}
+    steps |= {c.args[1].value for c in ast.walk(tree) if isinstance(c, ast.Call) and getattr(c.func, "attr", "") == "_run_step"
+              and len(c.args) > 1 and isinstance(c.args[1], ast.Constant)}
+    assert {"tend_pushes", "dispatch", "maybe_coordinate", "reap_runs", "deliver_outbound"} <= steps, "the walk lost steps"
+    assert DEGRADE_OK <= steps, f"DEGRADE_OK names no tick step: {DEGRADE_OK - steps}"
+    bad = [s for s in DEGRADE_OK if s.startswith("reap_") or any(w in s for w in ("push", "meter", "dispatch", "start",
+                                                                                  "deliver", "coordinat"))]
+    assert not bad, f"steps the loop needs are allowed to sit out ticks: {bad}"

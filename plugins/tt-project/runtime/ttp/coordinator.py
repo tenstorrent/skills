@@ -181,7 +181,7 @@ from .providers.base import NULL_OPERATIONS, normalize_action
 
 ACTION_TYPES = ("reply", "task_add", "task_update", "ask_user", "resolve", "notify", "memory_add", "memory_forget",
                 "charter_update", "schedule_set", "config_set", "resource_pause", "observation_mute", "pr_approve",
-                "sweep", "obligation", "self_change", "noop")
+                "sweep", "obligation", "self_change", "look", "noop")
 
 # A deferred task's `start_after`: `now`, a delay (`90m`, `3d`) or an ISO date or time (in the
 # project's home zone unless it names one). Plain character classes, so every provider's schema engine takes it.
@@ -4023,6 +4023,15 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
             elif t == "self_change":
                 notes.append(selfimprove.add(p, a, parse_start_after(a.get("start_after") or selfimprove.DEFAULT_CHECK,
                                                                      tz=timefmt.home(p)), settable=settable))
+            elif t == "look":
+                from . import looks
+                if a.get("enabled") is False:   # clears every pending look: back to the idle wake
+                    notes.append(f"look: cleared {looks.clear(db)}")
+                else:
+                    if not str(a.get("at") or "").strip():
+                        raise ValueError("look: give `at`: a delay such as 45m or a time in the home zone")
+                    at = parse_start_after(str(a["at"]), tz=timefmt.home(p)) or time.time()
+                    looks.add(db, at, str(a.get("text") or ""), a.get("precheck"))
             elif t in ("noop", None):
                 pass
             else:

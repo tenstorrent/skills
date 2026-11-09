@@ -42,6 +42,7 @@ from . import claimcheck
 from . import dispatchguard
 from . import runclass
 from . import sidefx
+from . import looks
 from . import cursorhook
 from . import pausegone
 from . import usersite
@@ -349,6 +350,15 @@ STEP_SLOW_EVERY_S = 3600
 # coordinator (Daemon._step_incident), raised once per incident.
 STEP_INCIDENT_N = 3
 STEP_INCIDENT_WINDOW_S = 600
+# A tick step over its budget DEGRADE_AFTER of its last DEGRADE_WINDOW runs sits out DEGRADE_TICKS ticks
+# (_step_degrade), only if it is in DEGRADE_OK: an allowlist of steps that only observe, report or are a
+# backstop that finds the same items on its next pass, so skipping them a few ticks loses nothing. Every
+# other step (reaping, pushes, spend meters, dispatch, turn starts, delivery, and any new step) always
+# runs, slow or not. kv DEGRADE_KV holds the steps whose degrade was reported: one ride-along event per
+# condition, raised again only after DEGRADE_WINDOW clean runs in a row; it never forces a turn.
+DEGRADE_WINDOW, DEGRADE_AFTER, DEGRADE_TICKS = 10, 3, 10
+DEGRADE_OK = frozenset({"blocker_sweep", "sweep_unreviewed"})
+DEGRADE_KV = "degraded_steps"
 WATCHER_MAX_S = HEARTBEAT_STALE_S - 60   # a command watcher's timeout_s is capped here, well below WATCHDOG_S
 # Schedule runs go on off the tick (schedrun); a tick waits this long for them, so quick ones are recorded
 # in the tick that started them and a slow one never holds it.
@@ -1168,6 +1178,9 @@ class Daemon:
         self._step_slow_said: dict[str, float] = {}   # step -> when its last tick_step_slow was raised
         self._step_overruns: dict[str, dict] = {}   # step -> its recent overruns and slowest call (_step_incident)
         self._step_incident_said: dict[str, float] = {}   # step -> when its last tick_step_incident was raised
+        self._overruns: dict[str, list[bool]] = {}   # step -> over its budget, its last DEGRADE_WINDOW runs
+        self._degraded: dict[str, int] = {}   # step -> ticks it still sits out
+        self._degrade_said: dict[str, float] | None = None   # kv DEGRADE_KV, read once: step -> when reported
         self._overrun: dict | None = None   # the running or last tick that passed TICK_OVERRUN_S or stalled
         self._last_prune = 0.0
         self._last_leftovers = 0.0   # when prune_leftovers last ran
@@ -1776,6 +1789,9 @@ class Daemon:
         if self.stopping:   # a stop skips the tick's remaining steps; each is its own transaction
             self._stop_skipped.append(name)
             return default
+        if self._degraded.get(name):   # it kept overrunning: it sits out a few ticks (_step_degrade)
+            self._degraded[name] -= 1
+            return default
         self._step_name = name
         self._step_began = self._step_mark = time.monotonic()
         self._step_holder, self._step_task, self._step_worst = "", None, (0.0, "", None)
@@ -1813,6 +1829,7 @@ class Daemon:
                     log(self.p, "tick step clear error: " + traceback.format_exc().replace("\n", " | ")[:2000])
         try:
             self._step_slow(name)
+            self._step_degrade(name)
         except Exception:
             log(self.p, "tick step slow error: " + traceback.format_exc().replace("\n", " | ")[:2000])
         self._step_holder, self._step_began = "", None
@@ -1843,6 +1860,49 @@ class Daemon:
         at = self._step_cursor.pop(step, 0)
         rows = sorted(rows, key=lambda r: r["id"])
         return _Resumable([r for r in rows if r["id"] > at] + [r for r in rows if r["id"] <= at], self._step_at, step)
+
+    def _step_degrade(self, name: str) -> None:
+        """Degrade a DEGRADE_OK step that keeps overrunning: one at a time, it sits out DEGRADE_TICKS ticks.
+        Once per condition (kv DEGRADE_KV, so a restart does not raise it again) it is one overseer incident
+        with this daemon's stacks and one low ride-along event (pagesev.RIDE_ALONG) that joins the next
+        coordinator turn and starts none. DEGRADE_WINDOW clean runs in a row end the condition."""
+        took = 0.0 if self._step_began is None else time.monotonic() - self._step_began
+        runs = self._overruns[name] = (self._overruns.get(name, []) + [took >= self._step_budget()])[-DEGRADE_WINDOW:]
+        if name not in DEGRADE_OK:
+            return
+        if self._degrade_said is None:
+            said = self.p.db.kv(DEGRADE_KV, {})
+            self._degrade_said = said if isinstance(said, dict) else {}
+        if len(runs) == DEGRADE_WINDOW and not any(runs):
+            if self._degrade_said.pop(name, None) is not None:   # it recovered: a new degrade is reported again
+                self.p.db.set_kv(DEGRADE_KV, self._degrade_said)
+            return
+        if sum(runs) < DEGRADE_AFTER or any(self._degraded.values()):
+            return
+        self._degraded[name] = DEGRADE_TICKS
+        counts = {k: sum(v) for k, v in self._overruns.items() if sum(v)}
+        self._overruns[name] = []
+        why = (f"tick step {name} ran past its {self._step_budget():g} s budget in {counts[name]} of its last "
+               f"{DEGRADE_WINDOW} runs: it sits out the next {DEGRADE_TICKS} ticks")
+        log(self.p, why)
+        if name in self._degrade_said:
+            return
+        now = time.time()
+        stacks = self.p.logs / f"degraded-{name}-{int(now)}.txt"
+        stacks.parent.mkdir(parents=True, exist_ok=True)
+        durable_write(stacks, "\n".join(f"Thread {t}:\n" + "".join(traceback.format_stack(fr))
+                                         for t, fr in sys._current_frames().items()))
+        from .overseer import INCIDENTS_FILE
+        durable_append(self.p.state / INCIDENTS_FILE, json.dumps(
+            {"at": now, "why": why, "step": name, "overruns": counts, "stacks": str(stacks)}) + "\n")
+        self._degrade_said[name] = now
+        db = self.p.db
+        with db.tx():
+            db.set_kv(DEGRADE_KV, self._degrade_said)
+            db.x("INSERT INTO events(ts,source,kind,severity,text,status,data) VALUES(?,?,?,?,?,?,?)",
+                 (now, "daemon", "tick_step_degraded", "low",
+                  f"Degraded: {why}. Overruns per step: {counts}. Stacks: {stacks}. Fix the step or change "
+                  f"its budget.", "queued", json.dumps({pagesev.RIDE_ALONG: True, "step": name})))
 
     def _step_slow(self, name: str) -> None:
         """One handled tick_step_slow event when step `name` ran past STEP_BUDGET_S, naming the item that
@@ -10035,6 +10095,12 @@ class Daemon:
         log(self.p, f"task {tid} start_when stale: released once by the blocker sweep")
 
     def maybe_coordinate(self) -> None:
+        # The tick loop and the overseer's wake (overseer.wake) both start turns: one at a time.
+        with looks.start_lock(self.p.state) as mine:
+            if mine:
+                self._maybe_coordinate()
+
+    def _maybe_coordinate(self) -> None:
         if not self.lease_held():
             return
         db, c = self.p.db, self.cfg["coordinator"]
@@ -10043,6 +10109,8 @@ class Daemon:
         now = time.time()
         if now < float(db.kv("coordinator_backoff_until", 0)):
             return
+        # Due looks the coordinator set itself (looks.py); a look whose check exits 0 is skipped.
+        fire = looks.screen(db, self.p.base, looks.due(db, now), now) if looks.pending(db) else []
         msgs = db.q("SELECT id, ts, chat FROM messages WHERE direction='in' AND handled=0 ORDER BY id")
         queued = db.q("SELECT id, ts, kind, severity, task, source, data FROM events WHERE status='queued' ORDER BY id")
         # A failed resume of the persistent session (coordsession.py) reruns its batch at once: no hold or gate.
@@ -10086,7 +10154,9 @@ class Daemon:
             self._plain_done_held(evs, now, unsized[1])
         if not msgs and len(rides) + len(held) == len(evs) and (
                 not rides or now - min(e["ts"] for e in rides) < pagesev.RIDE_ALONG_MAX_S):
-            if coord.rejection_due(db, now):
+            if fire:
+                w, wake = {"due": "look"}, db.kv("idle_wake", {}) or {}
+            elif coord.rejection_due(db, now):
                 # A rejection no turn carried in coord.REJECTION_WAIT_S starts one, so none is dropped.
                 w, wake = {"due": coord.REJECTION_DUE}, db.kv("idle_wake", {}) or {}
             else:
@@ -10114,7 +10184,7 @@ class Daemon:
                 return
             if not msgs and not rerun and not urgent and self._event_hold(own, now):
                 return
-        if not msgs and not rerun:
+        if not msgs and not rerun and not fire:
             try:
                 # Every open task held by what no turn lifts, and nothing new since the last turn: a
                 # routine batch or wake is settled without a model run (quietgate.py).
@@ -10220,10 +10290,12 @@ class Daemon:
             must = mustact.block(db, [e["id"] for e in evs])
             parts = ([(mustact.SECTION, must)] if must else []) + parts
             parts += [(slowcomplaint.SECTION, speed)] if speed else []
+            seen_looks = [("looks", looks.digest(fire, lambda t: timefmt.short(t, self.p)))] if fire else []
+            parts += seen_looks
             prompt = "\n".join(text for _, text in parts)
             # A session wake may send only what changed.
             full = (([(mustact.SECTION, must)] if must else []) + coord.split_cached(whole)[1]
-                    + ([(slowcomplaint.SECTION, speed)] if speed else []))
+                    + ([(slowcomplaint.SECTION, speed)] if speed else []) + seen_looks)
             session_digest = {"parts": parts, "full": full, "seen": coordsession.fingerprint(baseline),
                               "shown": coordsession.fingerprint(shown)}
             head, context = coord.prompt_parts(self.p)
@@ -10243,6 +10315,7 @@ class Daemon:
                                  **({"carried": carried} if carried else {}),
                                  **({"corrections": {str(k): v for k, v in flagged.items()}} if flagged else {}),
                                  **({"wake_due": due} if due else {}),
+                                 **({"looks": [x["id"] for x in fire]} if fire else {}),
                                  "digest": {**coord.digest_size(parts), "cached_chars": len(cached)}, **({"gate": seen_now} if seen_now else {}),
                                  **({"burst": burst} if burst else {})})
         except Exception as e:
@@ -10251,6 +10324,7 @@ class Daemon:
             self._coordinator_failed(f"could not start: {type(e).__name__}: {e}"[:250])
             return
         db.set_kv("last_coordinator_turn", now)
+        looks.settle(db, [x["id"] for x in fire], "woken", rid, now)
         quietgate.started(db)
         bursthold.started(db, evs, rid, now)
         db.set_kv(coord.EFFORT_SEEN_KEY, seen)
@@ -18521,6 +18595,9 @@ def idle_wake(p: Project, cfg: dict, gates: dict[str, dict], now: float, db=None
     # `db` is the caller's own connection: the web app calls this from its request threads, and an
     # SQLite connection works only in the thread that opened it.
     db, c = db or p.db, cfg["coordinator"]
+    if nxt := looks.pending(db):   # the coordinator chose its next look: no fixed wake meanwhile
+        return {"at": nxt[0]["at"], "due": None, "held": None, "wake": db.kv("idle_wake", {}) or {},
+                "starve": None, "look": nxt[0]["text"]}
     gate = gates.get(cfg.get("core_provider", "claude"))
     last = float(db.kv("last_coordinator_turn", 0))
     idle_s = float(c.get("idle_wake_s", 3600))

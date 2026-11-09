@@ -55,6 +55,9 @@ HEARTBEAT_FILE = "overseer.heartbeat"
 INCIDENTS_FILE = "overseer-incidents.jsonl"
 LOCK_FILE = "overseer.lock"
 PYSPY_S = 30
+LOOK_GRACE_S = 180      # a look still pending this long after it fell due: the tick loop missed it
+WAKE_EVERY_S = 600      # at most one overseer wake per this long
+WAKE_TIMEOUT_S = 180
 
 
 def _ro_db(path: Path):
@@ -257,12 +260,48 @@ def check(p: Project, now: float | None = None) -> dict:
         inc = None
     if inc:
         h["incident"] = inc
+    h["wake"] = prev.get("wake")
+    try:
+        if (late := overdue_look(p, now)) and now - float((h["wake"] or {}).get("at") or 0) >= WAKE_EVERY_S:
+            h["wake"] = {"at": now, "look": late["id"], "rc": spawn_wake(p)}
+    except Exception as e:   # a failed wake is recorded; the next pass after WAKE_EVERY_S retries
+        h["wake"] = {"at": now, "error": f"{type(e).__name__}: {e}"[:300]}
     durable_write(p.state / HEALTH_FILE, json.dumps(h, default=str))
     durable_write(p.state / HEARTBEAT_FILE, json.dumps({"pid": os.getpid(), "at": now}))
     return h
 
 
+def overdue_look(p: Project, now: float) -> dict | None:
+    """A look the coordinator set (looks.py) that the tick loop left pending LOOK_GRACE_S past due."""
+    from . import looks
+    db = _ro_db(p.state / "project.db")
+    try:
+        return next((x for x in looks.pending(db) if x["at"] + LOOK_GRACE_S < now), None)
+    finally:
+        db.conn.close()
+
+
+def spawn_wake(p: Project) -> int:
+    """Start the coordinator turn the stuck tick loop owes, in a child of its own: the overseer stays a
+    read-only reader of project.db. Both paths take looks.start_lock, so only one starts a turn."""
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join(
+        x for x in (str(Path(__file__).resolve().parents[1]), os.environ.get("PYTHONPATH")) if x)}
+    return subprocess.run([sys.executable, "-m", "ttp.overseer", "wake", str(p.base)], env=env,
+                          capture_output=True, timeout=WAKE_TIMEOUT_S).returncode
+
+
+def wake(base: str) -> int:
+    from .daemon import Daemon, _saved_gate
+    d = Daemon(base)
+    # The gates the loop last saved: re-evaluating them here would raise its budget events twice.
+    d.gates = {k: g for k, v in (d.p.db.kv("gates") or {}).items() if (g := _saved_gate(v))}
+    d.maybe_coordinate()
+    return 0
+
+
 def main() -> int:
+    if sys.argv[1:2] == ["wake"]:
+        return wake(sys.argv[2])
     p = Project(sys.argv[1] if len(sys.argv) > 1 else os.getcwd())
     lock = open(p.state / LOCK_FILE, "a")
     try:   # one overseer per project: a second start (the daemon's restart racing systemd's) exits
