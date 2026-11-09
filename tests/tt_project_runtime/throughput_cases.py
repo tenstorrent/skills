@@ -1433,3 +1433,27 @@ def test_throughput_checks_lane_settled_in_the_ledger_opens_no_followup_until_a_
     p.db.x("UPDATE tasks SET updated=? WHERE id IN (?,?)", (now - throughput.DAY - 60, rejected, fid))
     p.db.x("UPDATE tasks SET title=? WHERE id=?", (title, fid))
     assert not checks_kept()[1].get("info")
+
+
+def test_throughput_books_a_passed_start_when_wait_to_its_gate_not_worker_slots(env, monkeypatch):
+    # A landed:# chain's labels are gone once its probe passes: the wait up to the pass is the chain's,
+    # only the rest a slot wait.
+    from ttp import throughput
+    from ttp.daemon import Daemon
+    p = make(env)
+    now = time.time()
+    tid = _tp_task(p, "after #3", now - 3000, labels=["start_when:landed:#3", f"deferred_since:{now - 3000}"])
+    Daemon(p.base)._start_verdict(p.db.task(tid), 0, now - 100)
+    assert "start_when" not in json.dumps(p.db.task(tid)["labels"])
+    _tp_run(p, tid, now - 40, now - 10)
+    # Any other path that drops the gate (here an edit) is recorded the same way.
+    ed = _tp_task(p, "gated", now - 2000, labels=["start_when:test -f x", f"deferred_since:{now - 2000}", "keep"])
+    with monkeypatch.context() as m:
+        m.setattr(time, "time", lambda: now - 50)
+        p.db.update_task(ed, labels=["keep"])
+    _tp_run(p, ed, now - 45, now - 10)
+    rep = throughput.measure(p.db, p.config(), now=now, gates={})
+    lc, df, w = _tp_lane(rep, "landed_chain"), _tp_lane(rep, "deferral"), _tp_lane(rep, "worker_slots")
+    assert lc["count"] == 1 and abs(lc["p90_s"] - 2900) < 2
+    assert df["count"] == 1 and abs(df["p90_s"] - 1950) < 2
+    assert w["count"] == 2 and w["p90_s"] <= 61 and not w["slow"]

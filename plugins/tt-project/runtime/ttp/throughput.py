@@ -88,7 +88,7 @@ import time
 from pathlib import Path
 
 from . import loadcaps
-from .db import DB, deferral
+from .db import DB, START_PASSED, deferral
 
 KV = "throughput_changes"   # kv: [{"id", "ts", "key", "old", "new", "why", "undo", "trigger", "undone"}], newest last
 LAST_KV = "throughput_last"  # kv: the last measured review: {"ts", "trigger", "lanes", "changes", "kept"}
@@ -406,6 +406,15 @@ def measure(db: DB, cfg: dict, since_s: float = DAY, now: float | None = None, g
             holds.setdefault(name, []).append((float((v or {}).get("since") or now), now))
     except Exception:   # an unreadable shared or fleet file leaves the ended pauses
         pass
+    # When a start_when gate ended (db.record_start_passed): its deferral labels are gone by then.
+    passed: dict[int, list[tuple[float, dict]]] = {}
+    for e in db.q("SELECT ts, task, data FROM events WHERE kind=? AND task IS NOT NULL AND ts>?",
+                  (START_PASSED, t0 - DAY)):
+        try:
+            v = json.loads(e["data"] or "{}")
+        except (ValueError, TypeError):
+            v = {}
+        passed.setdefault(e["task"], []).append((float(e["ts"]), v if isinstance(v, dict) else {}))
     res_held: dict[int, list[tuple[float, str]]] = {}
     for e in db.q("SELECT ts, task, data FROM events WHERE kind='dispatch_hold' AND task IS NOT NULL AND ts>?",
                   (t0 - DAY,)):
@@ -591,6 +600,14 @@ def measure(db: DB, cfg: dict, since_s: float = DAY, now: float | None = None, g
     for t in tasks:
         start = first.get(t["id"])
         d = deferral(t)
+        gate_end, gd = None, d
+        if not d.get("when"):
+            # A start_when that passed before this wait's end: the wait up to its passing was the gate's.
+            lim = first.get(t["id"]) if first.get(t["id"]) is not None else now
+            got = [(ts, v) for ts, v in passed.get(t["id"], ()) if ts <= lim]
+            if got:
+                gate_end, v = max(got, key=lambda x: x[0])
+                gd = {**d, "when": str(v.get("when") or "start_when"), "since": v.get("since")}
         prio = int(t["priority"] or 3)
         why = (t.get("blocked_reason") or "").lower()
         if (start is not None or (t["status"] in ("queued", "blocked") and t["id"] not in last_run)) \
@@ -600,6 +617,13 @@ def measure(db: DB, cfg: dict, since_s: float = DAY, now: float | None = None, g
             end, queued = (start if start is not None else now), start is None
             if not d.get("when") and None in dones:
                 add(lane("dependency", None, None), max(0.0, end - base), prio, base, end, None, queued)
+            elif gate_end is not None:
+                ready = max([base, *[x for x in dones if x is not None]])
+                by_rule(t, gd, why, ready, min(gate_end, end), prio, False)
+                if end > max(gate_end, ready):   # from the gate's passing to its start: a slot wait
+                    w0 = max(gate_end, ready)
+                    add(lane("worker_slots", "budget.max_parallel_workers", workers), end - w0, prio, w0,
+                        end, workers, queued)
             elif not by_rule(t, d, why, max([base, *[x for x in dones if x is not None]]), end, prio, queued):
                 ready = max([base, *[x for x in dones if x is not None]])
                 add(lane("worker_slots", "budget.max_parallel_workers", workers), max(0.0, end - ready), prio, ready,

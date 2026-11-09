@@ -1107,8 +1107,13 @@ END""")
             if k in kw and not isinstance(kw[k], str):
                 kw[k] = json.dumps(list(kw[k]))
         kw["updated"] = time.time()
+        # A start_when dropped by any path (its probe passed, an urgent release, an edit): recorded, as the
+        # labels that held the task are gone after.
+        old = self.task(task_id) if "labels" in kw else None
         sets = ",".join(f"{k}=?" for k in kw)
         self.x(f"UPDATE tasks SET {sets} WHERE id=?", [*kw.values(), task_id])
+        if old and (d := deferral(old)).get("when") and not deferral({"labels": kw["labels"]}).get("when"):
+            record_start_passed(self, old, d, kw["updated"])
 
     def requeue(self, task_id: int) -> str:
         """Put a task that is not running back in the queue (the user's decision to run it: the web app,
@@ -1529,6 +1534,19 @@ def waiting_handoff(task) -> dict:
 
 def without_deferral(labels: list) -> list:
     return [lb for lb in labels if not (isinstance(lb, str) and lb.partition(":")[0] in DEFER_LABELS)]
+
+
+START_PASSED = "start_when_passed"
+
+
+def record_start_passed(db, task: dict, d: dict, now: float) -> None:
+    """Record, handled, that task's start_when gate ended at `now` (its probe passed or it was released):
+    clearing its deferral labels leaves no other trace, and the throughput review (`ttp throughput`)
+    reads this to book the wait before `now` to the landed_chain or deferral lane, not worker slots."""
+    data = json.dumps({"since": d.get("since") or task.get("created"), "when": str(d.get("when") or "")[:200]})
+    db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,data,status,task) VALUES(?,?,?,?,?,?,?,?,?)",
+         (now, "daemon", START_PASSED, f"{START_PASSED}:{task['id']}:{now:.0f}", "low",
+          f"#{task['id']} start_when passed", data, "handled", task["id"]))
 
 
 def _first_dead(deps: list, states: dict) -> tuple[Any, str] | None:
