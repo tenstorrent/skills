@@ -2112,7 +2112,7 @@ class Daemon:
             self.p.db.set_kv(key, now)
             self.p.db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
                         (now, "daemon", "run_class_quiet", "normal", runclass.alarm_text(q, window_s / 3600)[:500],
-                         "new"))
+                         "queued"))
 
     def trip_model_routing(self, every_s: float = 3600) -> None:
         """The model-pick tripwire (modeltrip.check): a stratum whose routed tasks go wrong more often than

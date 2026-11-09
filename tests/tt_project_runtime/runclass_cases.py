@@ -150,7 +150,7 @@ def test_the_quiet_class_alarm_raises_one_coordinator_event_per_window_with_coun
         p.db.x("INSERT INTO runs(task,role,provider,model,started,status,cost_usd,note) VALUES(?,?,?,?,?,?,?,?)",
                (pinned, "worker", "claude", "opus", now - 60 - i, "ok", 0.5, "{}"))
     d = Daemon(p.base)
-    events = lambda: p.db.q("SELECT text FROM events WHERE kind='run_class_quiet'")
+    events = lambda: p.db.q("SELECT text FROM events WHERE kind='run_class_quiet' AND status='queued'")
     d.watch_run_classes()
     assert events() == []
     note = '{"route": {"fallback": "timeout"}}'
