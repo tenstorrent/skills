@@ -31,6 +31,9 @@ from . import anchors, obligations
 
 RIDE_ALONG = "ride_along"        # event data flag: starts no turn by itself (rides_along)
 RIDE_ALONG_MAX_S = 3600          # a ride-along event waits at most this long for a turn
+# A slow tick step's reports (Daemon._step_slow, _step_degrade, _step_incident): ride-alongs that never start a
+# turn, not even past RIDE_ALONG_MAX_S; the overseer's health line and the next turn carry them.
+TICK_KINDS = frozenset({"tick_step_slow", "tick_step_degraded", "tick_step_incident"})
 REPEAT_WINDOW_S = 6 * 3600       # task_blocked: the same (task, reason) again within this is a repeat
 URGENT_LINE = re.compile(r"^\s*urgent:", re.I | re.M)
 SERVING_TAG = re.compile(r"^(serving|live|server)$", re.I)   # machines.json tags of a live serving machine

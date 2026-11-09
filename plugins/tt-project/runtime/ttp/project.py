@@ -275,6 +275,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
                     # wake at most once per this long after the last turn ended, a free slot included;
                     # user messages and immediate events wake at once (eventhold.gap_until; 0: off).
                     "wake_gap_s": 300,
+                    # Relayed messages (`ttp say` from another agent) with no order or question wait up to
+                    # this long after the oldest, so a burst starts one turn; an order or a question, and
+                    # the user's own channels, wake at the debounce (msgwake.py; 0: off).
+                    "relay_window_s": 90,
                     # The watcher model (babysit.ask) folds such a batch into the next wake, kept on disk;
                     # a folded batch wakes once its oldest event is wake_triage_max_s old (waketriage.py).
                     "wake_triage": True,

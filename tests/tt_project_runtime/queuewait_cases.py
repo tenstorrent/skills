@@ -92,16 +92,19 @@ def test_queue_wait_settle_records_an_act_or_raises_again_at_the_next_mark(env):
     mustact.settle(p, [ev["id"]], [{"type": "reply", "chat": "all", "text": "ok"}], [0], now)
     assert not p.db.q("SELECT id FROM events WHERE kind='must_act_rewake'")
     assert queuewait.scan(p, QW_CFG, now + 5 * 60, host) == []   # the same mark
-    assert queuewait.scan(p, QW_CFG, now + 30 * 60, host) == []   # the next mark, nothing it says changed
+    assert queuewait.scan(p, QW_CFG, now + 30 * 60, host) == []   # the next mark, the wait not yet doubled
+    # #7778 part B: a changed holder alone is no new state (one wake per state change), the doubled wait is.
     moved = {**host, "running": host["running"][1:] + ["other task #99 (run 2)"]}
-    assert len(queuewait.scan(p, QW_CFG, now + 31 * 60, moved)) == 1   # a holder changed: raised again
+    assert queuewait.scan(p, QW_CFG, now + 31 * 60, moved) == []
+    assert len(queuewait.scan(p, QW_CFG, now + 41 * 60, moved)) == 1   # waited 81 min, twice the 40 of the raise
+    assert queuewait.scan(p, QW_CFG, now + 42 * 60, moved) == [] and len(_qw_events(p)) == 2
     ev2 = _qw_events(p)[-1]
     p.db.x("UPDATE events SET status='handled' WHERE id=?", (ev2["id"],))
     act = {"type": "reply", "chat": "all", "text": "qwait-7-checks: held by the host checks cap, a safety cap"}
-    mustact.settle(p, [ev2["id"]], [act], [0], now + 32 * 60)
-    assert queuewait.scan(p, QW_CFG, now + 70 * 60, host) == []
-    line = queuewait.daily_line(p.db, QW_CFG, now + 70 * 60)
-    assert "median 42" in line and "0 with none" in line, line
+    mustact.settle(p, [ev2["id"]], [act], [0], now + 42 * 60)
+    assert queuewait.scan(p, QW_CFG, now + 170 * 60, host) == []
+    line = queuewait.daily_line(p.db, QW_CFG, now + 170 * 60)
+    assert "median 52" in line and "0 with none" in line, line
     it = {"key": "qwait-7-checks", "chat": "all", "tasks": [7], "kind": mustact.QUEUE_KIND}
     assert mustact.acted(it, [{"type": "config_set", "key": "x", "value": 1}], [0]) == "config_set"
     assert mustact.acted(it, [{"type": "notify", "text": "busy"}], [0]) is None

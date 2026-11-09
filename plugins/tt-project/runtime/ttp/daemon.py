@@ -97,6 +97,7 @@ from . import probespawn
 from . import probevars
 from . import urgent
 from . import eventhold
+from . import msgwake
 from . import waketriage
 from . import convgate
 from . import unstarted
@@ -1984,8 +1985,8 @@ class Daemon:
 
     def _step_incident(self, name: str, now: float) -> None:
         """Count an overrun of step `name`; at STEP_INCIDENT_N within STEP_INCIDENT_WINDOW_S, one queued
-        tick_step_incident event for the coordinator naming the step, its overrun count and the slowest
-        call over them, once per incident (until the step runs within budget again) and at most once per
+        tick_step_incident event (a ride-along: it starts no turn by itself) naming the step, its overrun
+        count and the slowest call over them, once per incident (until the step runs within budget again) and at most once per
         STEP_SLOW_EVERY_S per step: a step that overruns every tick is one incident, not one per tick."""
         spent, holder, task = self._step_worst
         killed = getattr(self, "_step_killed", "")
@@ -2003,8 +2004,10 @@ class Daemon:
                 f"{STEP_INCIDENT_WINDOW_S // 60:g} min; slowest call: {slowest}. It resumes where it stopped each "
                 f"tick; this is raised once per incident.")
         log(self.p, text)
-        self.p.db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
-                    (now, "daemon", "tick_step_incident", "normal", text[:1500], "queued", task))
+        # A ride-along like tick_step_degraded: a slow tick step never starts a coordinator turn by itself.
+        self.p.db.x("INSERT INTO events(ts,source,kind,severity,text,status,task,data) VALUES(?,?,?,?,?,?,?,?)",
+                    (now, "daemon", "tick_step_incident", "normal", text[:1500], "queued", task,
+                     json.dumps({pagesev.RIDE_ALONG: True, "step": name})))
 
     def _log_step_error(self, label: str, err: Exception, limit: int = 2000) -> None:
         """Log `label error:` and the traceback of `err` (call it in its except block) once per step and
@@ -10472,7 +10475,8 @@ class Daemon:
             return
         # Due looks the coordinator set itself (looks.py); a look whose check exits 0 is skipped.
         fire = looks.screen(db, self.p.base, looks.due(db, now), now) if looks.pending(db) else []
-        msgs = db.q("SELECT id, ts, chat FROM messages WHERE direction='in' AND handled=0 ORDER BY id")
+        msgs = db.q("SELECT id, ts, chat, provenance, text, context FROM messages WHERE direction='in' AND handled=0 "
+                    "ORDER BY id")
         queued = db.q("SELECT id, ts, kind, severity, task, source, data FROM events WHERE status='queued' ORDER BY id")
         # A failed resume of the persistent session (coordsession.py) reruns its batch at once: no hold or gate.
         rerun = bool((db.kv(coordsession.KEY) or {}).get("rerun"))
@@ -10513,8 +10517,10 @@ class Daemon:
         # So do plain hand-offs (_plain_done_held), up to coordinator.plain_done_hold_max_s.
         held = [] if msgs or unsized[0] or rerun or len(rides) == len(evs) else \
             self._plain_done_held(evs, now, unsized[1])
+        # A slow tick step's report (pagesev.TICK_KINDS) never ages into a turn of its own.
+        aging = [e for e in rides if e["kind"] not in pagesev.TICK_KINDS]
         if not msgs and len(rides) + len(held) == len(evs) and (
-                not rides or now - min(e["ts"] for e in rides) < pagesev.RIDE_ALONG_MAX_S):
+                not aging or now - min(e["ts"] for e in aging) < pagesev.RIDE_ALONG_MAX_S):
             if fire:
                 w, wake = {"due": "look"}, db.kv("idle_wake", {}) or {}
             elif coord.rejection_due(db, now):
@@ -10539,6 +10545,9 @@ class Daemon:
             own = [e for e in queued if not pagesev.rides_along(e)]   # ride-alongs neither hold nor start a turn
             # An overdue promise or order, or a failed claim, wakes the coordinator at once (mustact.py).
             urgent = any(e["kind"] in mustact.KINDS for e in evs)
+            # Relayed messages with no order or question wait out the relay window, so a burst is one turn.
+            if msgs and not rerun and not any(eventhold.immediate(e) for e in evs) and self._relay_hold(msgs, now):
+                return
             if not msgs and not rerun and not urgent and self._burst_hold(own, now):
                 return
             if not msgs and not rerun and not urgent and self._batch_hold(own, now):
@@ -10693,6 +10702,22 @@ class Daemon:
         db.set_kv("idle_wake", wake)
         if logged_out:
             db.set_kv(f"auth_probe:{provider}", now)
+
+    def _relay_hold(self, msgs: list, now: float) -> bool:
+        """Unhandled relayed messages with no order or question wait up to coordinator.relay_window_s after
+        the oldest, so one turn reads the burst (msgwake.py). They stay unhandled, so a restart keeps them."""
+        try:
+            end = msgwake.until(self.cfg, msgs, now)
+        except Exception:   # the hold only saves money: a failure runs the turn
+            log(self.p, "coordinator relay hold failed: " + traceback.format_exc().replace("\n", " | ")[:1500])
+            return False
+        if end is None:
+            return False
+        if self.p.db.kv("relay_hold_logged") != [m["id"] for m in msgs]:
+            self.p.db.set_kv("relay_hold_logged", [m["id"] for m in msgs])
+            log(self.p, f"coordinator wake held for the relay window: messages {[m['id'] for m in msgs]} "
+                f"(no order or question) share one turn in {int(end - now)} s")
+        return True
 
     def _burst_hold(self, queued: list[dict], now: float) -> bool:
         """High events within coordinator.burst_window_s after the turn high events woke wait for one

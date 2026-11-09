@@ -100,3 +100,74 @@ def test_waketriage_a_watcher_error_wakes_and_logs_the_model(env, monkeypatch, c
     _event(p, clock, "task_done")
     assert _turn_within(d, clock, starts, 60), "a watcher error held the wake"
     assert any("triage failed" in t and "example-org/small-model" in t and "HTTP 503" in t for t in lines), lines
+
+
+def _wg_msg(p, clock, text, provenance="cli-peer", context=None):
+    p.db.x("INSERT INTO messages(ts,direction,chat,text,handled,provenance,context) VALUES(?,?,?,?,0,?,?)",
+           (clock[0], "in", "web", text, provenance, context))
+
+
+def test_wakegap_a_burst_of_relayed_status_messages_is_one_wake(env, monkeypatch):
+    """#7778 part A: relayed messages with no order or question share one turn within relay_window_s."""
+    p, d, clock, starts, _ = _wg_setup(env, monkeypatch)
+    assert float(p.config()["coordinator"]["relay_window_s"]) == 90
+    first = clock[0]
+    for text, ctx in (("status: the train is green, 3 changes landed", None), ("ok, thanks", None),
+                      ("", "finding: the box is reachable again")):
+        _wg_msg(p, clock, text, context=ctx)
+        assert not _turn_within(d, clock, starts, 25), f"{text or ctx!r} woke a turn inside the relay window"
+    assert _turn_within(d, clock, starts, 60), "the relay window ran past relay_window_s"
+    assert len(starts) == 1 and first + 90 <= starts[0] < first + 100
+    # Off (0): the same burst wakes at the debounce, one turn per spaced message as before.
+    p, d, clock, starts, _ = _wg_setup(env, monkeypatch)
+    p.set_config("coordinator.relay_window_s", 0)
+    d.cfg = p.config()
+    _wg_msg(p, clock, "status: the train is green")
+    assert _turn_within(d, clock, starts, 25)
+
+
+def test_wakegap_a_relayed_order_or_question_or_the_users_own_message_still_wakes_within_the_window(env, monkeypatch):
+    from ttp import msgwake
+    for text, prov, ctx in (("Please stop task 12 now", "cli-peer", None), ("is the train green?", "cli-legacy", None),
+                            ("thanks. Deploy the release to the box", "cli-peer", None),
+                            ("as said", "cli-peer", "the user asks: why did 7 fail?"),
+                            ("status: all green", "slack", None), ("ok", "web", None)):
+        p, d, clock, starts, _ = _wg_setup(env, monkeypatch)
+        _wg_msg(p, clock, "status: the train is green")   # a waiting status message comes first
+        clock[0] += 10
+        _wg_msg(p, clock, text, prov, ctx)
+        assert _turn_within(d, clock, starts, 25), f"{text!r} via {prov} waited on the relay window"
+    m = lambda text, ctx=None: {"provenance": "cli-peer", "text": text, "context": ctx}   # noqa: E731
+    assert not any(msgwake.urgent(m(t)) for t in ("ok, thanks", "noted", "status: 3 landed, train green",
+                                                  "landed the fix; all checks pass"))
+    assert all(msgwake.urgent(m(t)) for t in ("you must keep it under $300", "run the smoke suite",
+                                              "check #7 and then fix it", "Never push to main", "why?"))
+
+
+def test_wakegap_a_slow_tick_step_never_forces_a_coordinator_turn(env, monkeypatch):
+    """#7778: a slow tick step's reports (slow, degraded, incident) ride along and never age into a turn."""
+    from ttp import pagesev
+    p, d, clock, starts, _ = _wg_setup(env, monkeypatch)
+    for kind, status in (("tick_step_slow", "handled"), ("tick_step_degraded", "queued"),
+                         ("tick_step_incident", "queued")):
+        p.db.x("INSERT INTO events(ts,source,kind,severity,text,status,data) VALUES(?,?,?,?,?,?,?)",
+               (clock[0] - pagesev.RIDE_ALONG_MAX_S - 600, "daemon", kind, "low", "slow", status,
+                json.dumps({pagesev.RIDE_ALONG: True})))
+    assert not _turn_within(d, clock, starts, 120), "a slow tick step's report started a turn"
+    # Another ride-along that old still starts its own turn, as before.
+    p.db.x("INSERT INTO events(ts,source,kind,severity,text,status,data) VALUES(?,?,?,?,?,?,?)",
+           (clock[0] - pagesev.RIDE_ALONG_MAX_S - 600, "daemon", "note", "low", "x", "queued",
+            json.dumps({pagesev.RIDE_ALONG: True})))
+    assert _turn_within(d, clock, starts, 120)
+
+
+def test_a_tick_step_incident_rides_along(env, monkeypatch):
+    from ttp import pagesev
+    from ttp.daemon import Daemon
+    d = Daemon(make(env).base)
+    from ttp import daemon as dmod
+    d._step_worst = (90.0, "item x", None)
+    for i in range(dmod.STEP_INCIDENT_N):
+        d._step_incident("probe", time.time() + i)
+    (ev,) = d.p.db.q("SELECT severity, data FROM events WHERE kind='tick_step_incident'")
+    assert pagesev.rides_along(dict(ev)) and json.loads(ev["data"])["step"] == "probe"
