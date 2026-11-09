@@ -1929,7 +1929,8 @@ def _coord_pre_tool_use(payload: dict):
     return coordtools.pre_tool_use(payload)
 
 
-HANDLERS[COORD_EVENT := "CoordPreToolUse"] = _coord_pre_tool_use   # a session coordinator's tools (coordtools.py)
+COORD_EVENT = "CoordPreToolUse"   # a session coordinator's tools (coordtools.py)
+HANDLERS[COORD_EVENT] = _coord_pre_tool_use
 
 
 def _coord_post(failed: bool):

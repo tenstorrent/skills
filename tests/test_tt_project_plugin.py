@@ -238,6 +238,81 @@ def test_runtime_is_standard_library_only_and_python39_compatible():
             assert "from __future__ import annotations" in src, f"{py}: PEP 604 unions need the future import on 3.9"
 
 
+def _unparenthesized_walrus_needing_310(src: str) -> list:
+    """Line numbers of `:=` that Python 3.9 rejects unparenthesized but 3.10 accepts: as a subscript
+    index (`d[k := v]`, `d[1, k := v]`) or a set element (`{k := v}`). ast.parse(feature_version=(3, 9))
+    lets these through on a newer Python; an expression's position excludes its parentheses."""
+    raw = src.encode("utf-8")
+    starts = [0]
+    for line in raw.splitlines(keepends=True):
+        starts.append(starts[-1] + len(line))
+
+    def bare(node) -> bool:   # col_offset counts UTF-8 bytes
+        i = starts[node.lineno - 1] + node.col_offset - 1
+        while i >= 0 and raw[i:i + 1].isspace():
+            i -= 1
+        return raw[i:i + 1] != b"("
+
+    found = []
+    for node in ast.walk(ast.parse(src)):
+        if isinstance(node, ast.Subscript):
+            s = node.slice
+            items = [s] if isinstance(s, ast.NamedExpr) else (
+                s.elts if isinstance(s, ast.Tuple) and raw[starts[s.lineno - 1] + s.col_offset:][:1] != b"(" else [])
+        elif isinstance(node, ast.Set):
+            items = node.elts
+        elif isinstance(node, ast.SetComp):
+            items = [node.elt]
+        else:
+            continue
+        found += [e.lineno for e in items if isinstance(e, ast.NamedExpr) and bare(e)]
+    return found
+
+
+def test_the_walrus_check_finds_what_python39_rejects_and_passes_what_it_takes():
+    rejected = ['h[k := 1] = 2', 'h[1, k := 2]', '{k := 1}', '{1, k := 2}', '{k := x for x in y}',
+                'h[\n    k := 1]']
+    accepted = ['h[(k := 1)] = 2', 'h[ ( k := 1 ) ]', 'h[(1, k := 2)]', 'h[1, (k := 2)]', '{(k := 1)}',
+                '{(k := x) for x in y}', '[k := 1]', 'f(k := 1)', 'if (k := 1): pass', 'h["é", (k := 1)]',
+                'h["é"] = [k := 1]']
+    assert [s for s in rejected if not _unparenthesized_walrus_needing_310(s)] == []
+    assert [s for s in accepted if _unparenthesized_walrus_needing_310(s)] == []
+
+
+def test_runtime_has_no_walrus_python39_rejects_and_compiles_under_a_real_39():
+    bad = [f"{py.relative_to(PLUGIN)}:{n}" for py in sorted(RUNTIME.rglob("*.py"))
+           for n in _unparenthesized_walrus_needing_310(py.read_text(encoding="utf-8"))]
+    assert bad == [], f"unparenthesized := is a SyntaxError before Python 3.10: {bad}"
+    # The real check, where a 3.9 is installed (macOS Command Line Tools ship one, and a launchd service
+    # may run it): compile every runtime file and import every ttp module under it.
+    import shutil
+    import subprocess
+    py39 = next((p for p in ("/Library/Developer/CommandLineTools/usr/bin/python3.9", shutil.which("python3.9"))
+                 if p and os.access(p, os.X_OK)), None)
+    if not py39:
+        return
+    code = ("import compileall, importlib, pkgutil, sys\n"
+            "assert sys.version_info[:2] == (3, 9), sys.version\n"
+            "root = sys.argv[1]\n"
+            "if not compileall.compile_dir(root, quiet=1, legacy=True, force=True, ddir=root, workers=1):\n"
+            "    sys.exit('compile failed')\n"
+            "sys.path.insert(0, root)\n"
+            "import ttp\n"
+            "bad = []\n"
+            "for m in pkgutil.walk_packages(ttp.__path__, 'ttp.'):\n"
+            "    try:\n"
+            "        importlib.import_module(m.name)\n"
+            "    except Exception as e:\n"
+            "        bad.append(f'{m.name}: {type(e).__name__}: {e}')\n"
+            "print('\\n'.join(bad)); sys.exit(1 if bad else 0)\n")
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:   # compileall writes .pyc files: never into the plugin
+        shutil.copytree(RUNTIME, pathlib.Path(tmp) / "ttp")
+        r = subprocess.run([py39, "-I", "-c", code, tmp], capture_output=True, text=True, timeout=300,
+                           env={"PATH": "/usr/bin:/bin", "HOME": tmp, "PYTHONDONTWRITEBYTECODE": ""})
+    assert r.returncode == 0, f"under {py39}:\n{r.stdout[-3000:]}{r.stderr[-3000:]}"
+
+
 def test_no_secrets_or_personal_paths():
     assert_no_leaks([re.compile(p) for p in FORBIDDEN], plugin_text_files())
     # The plugin's tests ship in the same open-source repository, the runtime tests' area case files
