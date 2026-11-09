@@ -1727,6 +1727,10 @@ def test_a_stale_served_list_holds_and_swaps_nothing_and_a_pinned_chat_task_keep
     _route_config(p, route=None, model_ranking=["rank-a"])
     d._load_config()
     assert not any(route.target(d.cfg, t) for t in ("light", "standard", "deep"))
+    assert route.models_due(d.cfg, p.state, now) == "placeholder"     # cheap run classes route to it
+    from ttp import runclass
+    p.set_config("route.classes", {c: "core" for c in runclass.CHAT})   # and no run class either
+    d._load_config()
     assert route.models_due(d.cfg, p.state, now) == ""                 # the daemon's db not given
     assert route.models_due(d.cfg, p.state, now, p.db) == "placeholder"
     p.db.x("UPDATE tasks SET status='done' WHERE id=?", (req,))
@@ -3211,7 +3215,8 @@ def test_parked_and_weak_models_are_rechecked_weekly_through_the_bench_and_its_v
     assert rec["arms"]["rank-new"] == "weekly" and rec["weak"] == []
     assert not modelrank.parked(p.db, "rank-new", now + 60)
     assert modelrank.better(p.db, d.cfg, p.state, _RT_MODEL, now + 60, light=True) == "rank-new"
-    assert day(15)[1]["arms"].get("rank-new") == "daily"   # benched with the top models again
+    now, rec = day(15)
+    assert rec["arms"].get("rank-new") == "daily"   # benched with the top models again
     # A project's fresh park after that pass holds for its week again.
     p.db.set_kv(modelrank.PARKED + "rank-new", {"at": now + 120, "run": None, "why": "timeout"})
     assert modelrank.parked(p.db, "rank-new", now + 180)

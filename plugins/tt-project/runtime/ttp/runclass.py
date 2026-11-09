@@ -47,6 +47,9 @@ KEY = "run_class"
 CLASSES = ("coordinator", "wake_decision", "screening", "worker_wake", "status_report", "rebase",
            "review_small", "light", "hard")
 CHAT = ("wake_decision", "screening", "worker_wake", "status_report", "rebase", "review_small", "light")
+# The cheap classes an urgent task does not lift to core (urgency sets order only, decision 2026-11-08 23:55
+# PST); a light-tier first run is not one of them: an urgent one starts on core.
+ORDER_ONLY = tuple(c for c in CHAT if c != "light")
 DECISION_USES = ("wake_gate", "wake_tier", "babysit")
 SCREEN_USES = ("screen",)
 SMALL_LINES = 300
@@ -152,7 +155,7 @@ def target(cfg: dict, task: dict, tier: str, cls: str, picked: dict | None = Non
     (core): its class maps to core, no chat model, the task pins a provider or model, the start is a
     tier-up retry, or the task stays on core (route.kept_core)."""
     from .route import TO, kept_core
-    if routes(cfg).get(cls) != "chat" or kept_core(task, urgency=False) or untrusted(task) or str(task.get("provider") or "") \
+    if routes(cfg).get(cls) != "chat" or kept_core(task, urgency=cls not in ORDER_ONLY) or untrusted(task) or str(task.get("provider") or "") \
             or str(task.get("model") or "") or (picked or {}).get("by") == "retry":
         return None
     t = ((((cfg.get("providers") or {}).get(TO) or {}).get("tiers") or {}).get(tier) or {})
@@ -214,7 +217,7 @@ def routable(task: dict | None, note: dict | None = None) -> bool:
     if not task:
         return True
     from .route import kept_core
-    return not (kept_core(task, urgency=False) or untrusted(task) or str(task.get("provider") or "") or str(task.get("model") or "")
+    return not (kept_core(task, urgency=(note or {}).get(KEY) not in (None, *ORDER_ONLY)) or untrusted(task) or str(task.get("provider") or "") or str(task.get("model") or "")
                 or ((note or {}).get("pick") or {}).get("by") == "retry")
 
 

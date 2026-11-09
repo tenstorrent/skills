@@ -27360,6 +27360,8 @@ DURABLE_EXEMPT = {
     ("hostshim.py", 'with open(tab + ".tmp", "w") as f'): "a test run's fake crontab, thrown away with the run; never state",
     ("hostshim.py", 'os.replace(tab + ".tmp", tab)'): "places that fake crontab atomically; same lifetime as above",
     ("overseer.py", 'lock = open(p.state / LOCK_FILE, "a")'): "the overseer's flock guard file, never written",
+    ("modelbench.py", 'with open(d / LOCK, "a") as lk:'): "the host bench's flock guard file, never written",
+    ("untrusted.py", 'with open(path, "a") as f:'): "a run's untrusted-source marks in its own run dir, read when that run ends; a crash that loses one ends the run too; never project state",
 }
 
 

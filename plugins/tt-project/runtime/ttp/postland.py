@@ -26,6 +26,7 @@ import sys
 import time
 from pathlib import Path
 
+from . import gitmemo
 from .project import Project, durable_write
 
 KEY = "post_land"
@@ -40,7 +41,13 @@ def driver_argv(job: Path) -> list[str]:
 
 
 def _git(repo, *args) -> subprocess.CompletedProcess:
-    return subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True)
+    """git in `repo` through gitmemo.run (its cap per verb); one past the cap reads as failed (rc 124)."""
+    argv = ["git", "-C", str(repo), *args]
+    try:
+        return gitmemo.run(argv, capture_output=True, text=True, stdin=subprocess.DEVNULL,
+                           env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(argv, 124, "", "git timed out")
 
 
 def _event(db, text: str, kind: str = "observation", queued: bool = True) -> None:
@@ -132,6 +139,7 @@ def spawn(p: Project, job: Path) -> int:
     from .project import nice_level, renice
     from .pushq import _child_env
     with open(job.with_suffix(".log"), "ab") as out:
+        # own session: the post-land driver outlives this tick; tend() follows it by its pid and job file
         child = subprocess.Popen(driver_argv(job), cwd=str(p.root), env=_child_env(p, str(job.parent)),
                                  stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT, start_new_session=True)
     renice(child.pid, nice_level(p.config().get("runner"))[0])

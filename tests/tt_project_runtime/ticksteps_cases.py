@@ -901,8 +901,11 @@ def test_ttp_logs_reads_only_the_tail_and_spans_the_rotation(env, monkeypatch):
     assert cli.log_tail(p.logs, 5) == "éé"
     big = p.logs / "daemon.log"
     big.write_bytes(b"y" * 1_000_000 + b"\nthe end\n")
-    monkeypatch.setattr(pathlib.Path, "read_text", lambda *a, **k: pytest.fail("read the whole file"))
-    monkeypatch.setattr(pathlib.Path, "read_bytes", lambda *a, **k: pytest.fail("read the whole file"))
+    # Only the logs count: masking the tail reads the secret store's small config (item 7).
+    for name in ("read_text", "read_bytes"):
+        real = getattr(pathlib.Path, name)
+        monkeypatch.setattr(pathlib.Path, name, lambda self, *a, _real=real, **k: (
+            pytest.fail("read the whole file") if self.parent == p.logs else _real(self, *a, **k)))
     assert cli.log_tail(p.logs, 8) == "the end\n"
 
 

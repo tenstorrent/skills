@@ -192,7 +192,7 @@ def _has(labels: list[str], names) -> bool:
 def kept_core(task: dict, urgency: bool = True) -> bool:
     """A task the rule list never routes (KEEP_CORE): an urgent one (urgent.is_urgent too), one whose
     hand-off asked for deep (needs_deep), or one labelled user_deep, review_fix or untrusted_input.
-    `urgency` False leaves urgency out: a cheap run class (runclass.CHAT) is ordered by it, never moved
+    `urgency` False leaves urgency out: a cheap run class (runclass.ORDER_ONLY) is ordered by it, never moved
     to the core model by it."""
     from . import effort, urgent
     keys = KEEP_CORE if urgency else tuple(k for k in KEEP_CORE if k != "urgent")

@@ -11565,7 +11565,7 @@ class Daemon:
         if after:   # the task fell back on its own once: the rest of its runs stay on the core provider
             return {"tier": tier, "to": name, "model": model, **rule, "fallback": "rerun", "after": after}
         try:
-            esc = route.escalation(self.p.db, task, urgency=cls not in runclass.CHAT) if task.get("id") else {}
+            esc = route.escalation(self.p.db, task, urgency=cls not in runclass.ORDER_ONLY) if task.get("id") else {}
         except Exception as e:   # escalation must never hold a task back
             log(self.p, f"task {task['id']}: route escalation not checked: {type(e).__name__}: {e}")
             esc = {}
