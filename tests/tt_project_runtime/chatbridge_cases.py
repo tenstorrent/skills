@@ -2944,3 +2944,87 @@ def test_a_newly_served_model_refreshes_the_ranking_through_the_daemon(env, monk
     assert len(calls) == 1 and d._rank_tried > time.time() + rankfresh.RETRY_S - 400
     # A project with no chat endpoint never refreshes.
     assert not rankfresh.configured({"providers": {"chat": {"model_ranking": ["x"]}}}) and not rankfresh.configured({})
+
+
+def test_the_served_model_list_is_polled_every_minute_while_a_tier_or_run_class_routes(env, monkeypatch):
+    """User's rule: models come and go on the endpoint all the time, so the served list is checked often."""
+    from ttp import configwho, route
+    from ttp.daemon import Daemon
+    p = make(env)
+    _route_config(p, route=None)   # no tier route: the default run-class routing alone sends work to chat
+    d = Daemon(p.base)
+    assert route.models_every(d.cfg) == route.MODELS_EVERY_S == 60
+    t0 = time.time()
+    route.write_served(p.state, "chat", True, "HTTP 200", [_RT_MODEL], t0)
+    assert route.models_due(d.cfg, p.state, t0 + 59) == "" and route.models_due(d.cfg, p.state, t0 + 60) == "placeholder"
+    p.set_config("route.classes", {c: "core" for c in ("wake_decision", "screening", "worker_wake", "status_report",
+                                                       "rebase", "review_small", "light")}, by=configwho.by("user", via="cli"))
+    d._load_config()
+    assert route.models_due(d.cfg, p.state, t0 + 600) == ""   # nothing routes to chat: no check
+    _route_config(p, models_every_s=300)
+    d._load_config()
+    assert route.models_every(d.cfg) == 300 and route.models_due(d.cfg, p.state, t0 + 60) == ""
+    # The daemon's own retry gate follows the same interval (a failed check retries a minute later).
+    _route_config(p)
+    d._load_config()
+    calls = []
+    monkeypatch.delenv("TTP_TEST_NO_MODELS_PROBE", raising=False)
+    monkeypatch.setattr(route, "refresh_served", lambda state, alias: calls.append(alias))
+    route.write_served(p.state, "chat", False, "HTTP 503", [], time.time() - 60)
+    for tried_ago in (30, 61):
+        d._models_tried = time.time() - tried_ago
+        d.check_route_models()
+        if d._models_probe:
+            d._models_probe.join(10)
+    assert calls == ["placeholder"]
+
+
+def test_a_gone_model_is_swapped_within_a_minute_and_a_smarter_new_one_is_tried_then_parked_and_rechecked_weekly(
+        env, monkeypatch):
+    """User's rule: if one goes down, the next best is ready within a minute; an even better model that
+    comes online is used by default; weak or buggy ones are skipped and re-evaluated weekly."""
+    from ttp import modelrank, route
+    from ttp.daemon import Daemon
+    p = make(env)
+    d = Daemon(p.base)
+    alerts = _ranked(p, d, monkeypatch, [_RT_MODEL, "rank-b"], ranking=("rank-new", _RT_MODEL, "rank-b"))
+    prov, _, note = _route_dispatch(p, d, monkeypatch, title="up")
+    assert prov == "chat" and note[route.KEY]["model"] == _RT_MODEL and modelrank.KEY not in note[route.KEY]
+    # Gone: the next minute's check leaves it out and the next start runs the next ranked model.
+    t0 = time.time()
+    assert route.models_due(d.cfg, p.state, t0 + 60) == "placeholder"
+    route.write_served(p.state, "chat", True, "HTTP 200", ["rank-b"], t0 + 1)
+    prov, _, note = _route_dispatch(p, d, monkeypatch, title="gone")
+    assert note[route.KEY]["model"] == "rank-b" and note[route.KEY][modelrank.KEY] == {"from": _RT_MODEL, "why": "not listed"}
+    # A smarter model comes online: the next light start tries it, before it runs at other tiers.
+    route.write_served(p.state, "chat", True, "HTTP 200", ["rank-new", _RT_MODEL, "rank-b"], time.time())
+    prov, _, note = _route_dispatch(p, d, monkeypatch, title="new")
+    assert note[route.KEY]["model"] == "rank-new" and note[route.KEY][modelrank.KEY] == {"from": _RT_MODEL, "why": "better"}
+    assert "tries rank-new, ranked above " + _RT_MODEL in (p.logs / "daemon.log").read_text()
+    now = time.time()
+    assert modelrank.better(p.db, d.cfg, p.state, _RT_MODEL, now, light=False) == ""
+    # Three runs on it end well: it runs by default at every tier.
+    for i in range(modelrank.TRIES):
+        tid = p.db.add_task(f"try{i}", "", kind="work", tier="light", priority=3, budget_usd=8.0, labels=[])
+        run, _ = _route_finish(p, d, tid, {"rc": 0}, result={"status": "done", "summary": "ok"}, routed=note[route.KEY])
+        assert "fallback" not in route.of(run["note"]), run["note"]
+    assert "rank-new proven" in (p.logs / "daemon.log").read_text()
+    assert modelrank.better(p.db, d.cfg, p.state, _RT_MODEL, now, light=False) == "rank-new"
+    # Nothing ranks above the top model; an endpoint fault parks nothing.
+    assert modelrank.better(p.db, d.cfg, p.state, "rank-new", now, light=True) == ""
+    assert modelrank.tried(p.db, "rank-new", "rate_limit", None, now) == ""
+    # Its own faults past a fifth of its runs park it for a week; then it is tried again from scratch.
+    verdicts = [modelrank.tried(p.db, "rank-new", fell, None, now) for fell in ("", "", "", "no_handoff", "malformed")]
+    assert verdicts == ["", "", "", "", "parked"] and modelrank.parked(p.db, "rank-new", now)
+    assert modelrank.better(p.db, d.cfg, p.state, _RT_MODEL, now, light=True) == ""
+    week = now + modelrank.PARK_S + 1
+    route.write_served(p.state, "chat", True, "HTTP 200", ["rank-new", _RT_MODEL, "rank-b"], week)
+    assert modelrank.better(p.db, d.cfg, p.state, _RT_MODEL, week, light=True) == "rank-new"
+    assert modelrank.better(p.db, d.cfg, p.state, _RT_MODEL, week, light=False) == ""
+    # During its trial runs one own fault parks it at once, with one low alert.
+    tid = p.db.add_task("canary", "", kind="work", tier="light", priority=3, budget_usd=8.0, labels=[])
+    p.db.x("DELETE FROM kv WHERE key=?", (modelrank.PARKED + "rank-new",))
+    run, _ = _route_finish(p, d, tid, {"rc": 1}, routed=note[route.KEY])
+    assert route.of(run["note"])["fallback"] in modelrank.FAULTS_PARK, run["note"]
+    assert modelrank.parked(p.db, "rank-new", time.time())
+    assert [a for a in alerts if a[0] == "model-rank-park:rank-new" and a[2] == "low"]

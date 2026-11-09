@@ -72,8 +72,8 @@ handed off failed, and routed changes a review or checks sent back); such a line
 Missing model: a model_missing fallback cools nothing; it holds that tier's route alone (MISSING kv,
 hold), so its runs start on the core provider with fallback `model_missing` and one normal notice
 names the provider, tier and model. The hold ends (release, each daemon tick) once the tier's
-configured model changes or the daemon's model-free /models check (at most hourly while a tier routes:
-MODELS_EVERY_S) lists the model again. That check writes the served ids, its time and HTTP status to
+configured model changes or the daemon's model-free /models check (every minute while a tier or run class
+routes: models_every, providers.chat.models_every_s) lists the model again. That check writes the served ids, its time and HTTP status to
 the project state dir's MODELS_FILE, never the key or URL; `ttp status` and doctor show holds and ids
 (model_lines), so a worker can pick a replacement without the key. With providers.chat.model_ranking
 set, a routed start whose model is held or unlisted runs the highest-ranked served model instead
@@ -108,7 +108,7 @@ REJECTED = "route_effort_rejected:"   # kv: <model>|<effort> whose effort_fields
 COOLDOWN_S = 900
 MISSING = "route_model_missing:"   # kv per routed tier: {"model", "since", "run"} while its model is not served
 MODELS_FILE = "endpoint-models.json"   # under the project state dir: {provider: {"ids", "checked", "ok", "check"}}
-MODELS_EVERY_S = 3600       # the daemon's model-free /models check runs at most this often per provider
+MODELS_EVERY_S = 60         # the daemon's model-free /models check runs this often per provider (models_every)
 RETRY_QUIET_S = 86400       # a re-hold of the same model this soon after its quiet retry sends no new notice
 FAULTS = ("down", "error", "rate_limit", "auth", "malformed", "model_missing")
 RUN_CAUSES = ("timeout", "failed", "no_handoff")   # a routed run's own end without a hand-off (own_cause)
@@ -354,15 +354,23 @@ def refresh_served(state: Path, alias: str) -> bool:
     return True
 
 
+def models_every(cfg: dict) -> int:
+    """Seconds between /models checks: providers.chat.models_every_s (a positive int), else MODELS_EVERY_S."""
+    v = ((cfg.get("providers") or {}).get(TO) or {}).get("models_every_s")
+    return v if isinstance(v, int) and not isinstance(v, bool) and v > 0 else MODELS_EVERY_S
+
+
 def models_due(cfg: dict, state: Path, now: float, db=None) -> str:
-    """The endpoint alias whose /models check is due (a tier routes to it, or with a model ranking set
-    a queued or running task pins a model on it, and the last check is MODELS_EVERY_S old), else ''."""
+    """The endpoint alias whose /models check is due (a tier or run class routes to it, or with a model
+    ranking set a queued or running task pins a model on it, and the last check is models_every old), else ''."""
+    from . import runclass
     entry = (cfg.get("providers") or {}).get(TO) or {}
     alias = str(entry.get("endpoint") or "") if isinstance(entry, dict) else ""
-    if not alias or not (any(target(cfg, t) for t in (entry.get("tiers") or {})) or _ranked_pin(cfg, db)):
+    if not alias or not (any(target(cfg, t) for t in (entry.get("tiers") or {}))
+                         or "chat" in runclass.routes(cfg).values() or _ranked_pin(cfg, db)):
         return ""
     last = read_served(state).get(TO) or {}
-    return alias if now - float(last.get("checked") or 0) >= MODELS_EVERY_S else ""
+    return alias if now - float(last.get("checked") or 0) >= models_every(cfg) else ""
 
 
 def _ranked_pin(cfg: dict, db) -> bool:
@@ -384,7 +392,7 @@ def model_lines(db, cfg: dict, state: Path, now: float, at) -> list[str]:
         if held(db, cfg, tier):
             out.append(f"routing: {tier} held since {at(float(h.get('since') or now))}: {TO} does not serve "
                        f"{h.get('model')}; runs start on the core provider until providers.{TO}.tiers.{tier}.model "
-                       f"changes or the endpoint lists it (checked hourly)")
+                       f"changes or the endpoint lists it (checked every minute)")
     if rec:
         ids = rec.get("ids") or []
         state_txt = "" if rec.get("ok") else f" (failed: {rec.get('check') or '?'}; ids from the last good check)"

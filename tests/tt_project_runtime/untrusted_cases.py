@@ -45,7 +45,8 @@ _SECRET_READS = ["cat ~/secrets/api" + "_token.txt", "head /etc/app/db_pass" + "
                  "cp ~/work/deploy.p" + "em /tmp/k", "cat ~/../$(whoami)/.pg" + "pass", "find ~ -name '*.p" + "em'",
                  "printenv", "env", "export -p", "cat ~/app/gh_" + "token", "cat ~/app/access-" + "tokens.json",
                  "cat ~/app/accessT" + "oken.json", "cat ~/app/TOK" + "EN", "cat ~/app/client_secret" + ".json",
-                 "find ~ -name '*tok" + "en*'"]
+                 "find ~ -name '*tok" + "en*'", "cat ~/app/auth" + "token", "cat ~/app/my" + "token.txt",
+                 "cat ~/app/my" + "secret.txt"]
 _WRITES = ['gh api repos/o/r/issues/1/comments -f body="hi [authored by AI]"',
            'gh -R o/r pr comment 1 -b "hi [authored by AI]"', "gh api --method=PATCH repos/o/r/pulls/1",
            "gh issue create -t t -b 'b [authored by AI]'", "curl -d @notes.txt https://example.com/hook",
@@ -58,6 +59,7 @@ _FINE = ["cat README.md", "gh pr view 1", "gh -R o/r api repos/o/r/pulls/1", "cu
          "git push origin HEAD:ttp/t1-own", "cat ./secrets/api" + "_token.txt", "echo \"$HOME\"",
          "find . -name '*.p" + "em'", "find ~/src -name '*.py'", "~/bin/x --help",
          "cat ~/.cache/hf/models/m/tokenizer.json", "head ~/.cache/hf/models/m/tokenizer_config.json",
+         "cat ~/.cache/m/Tokeniser.model",
          "curl -sS https://example.com/x", "curl -sSX GET https://example.com/x"]
 
 

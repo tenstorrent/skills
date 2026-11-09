@@ -676,9 +676,10 @@ PROVIDER_KEYS = {"billing", "tiers", "plugin_dirs", "worker_isolation", "write_f
                  # fields (chatbridge.effort_fields). route_wait_s: how long a routed start waits for a full
                  # slot before it starts on the core provider (route.wait_s). routes: the ordered rule list
                  # routing runs by kind, tier and label (route.match). model_ranking: its model ids,
-                 # smartest first, that stand in for a model that is down (modelrank.py).
+                 # smartest first, that stand in for a model that is down (modelrank.py). models_every_s:
+                 # seconds between the model-free /models checks (route.models_every).
                  "endpoint", "base_url", "max_tokens", "context_window", "route_cooldown_s", "effort_fields",
-                 "route_wait_s", "routes", "model_ranking",
+                 "route_wait_s", "routes", "model_ranking", "models_every_s",
                  # providers.chat only: the rules-first model pick (modelpick.py); its keys (enabled, min_p,
                  # options) are checked by modelpick.config_problems.
                  "dispatch"}

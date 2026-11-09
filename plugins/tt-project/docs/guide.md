@@ -1198,8 +1198,9 @@ Messages calls into `<base url>/chat/completions` calls and back, and ends with 
    tier's runs start on the core provider. A 404 for a model the endpoint does not serve (its wording
    names the model, or the endpoint's /models list leaves it out) is `model_missing` instead: no
    cool-down, but that tier's route holds, with one normal notice naming the provider, tier and model,
-   until `providers.chat.tiers.<tier>.model` changes or the daemon's model-free /models check (at
-   most hourly while a tier routes) lists the model again. That check stores only the served ids and
+   until `providers.chat.tiers.<tier>.model` changes or the daemon's model-free /models check (every
+   minute while a tier or run class routes to `chat`; `providers.chat.models_every_s`) lists the model
+   again. That check stores only the served ids and
    its time in the project state folder; `ttp status` and `ttp doctor` show them and any hold.
    To keep work on the endpoint instead, the daemon keeps a ranking of its model ids, smartest first,
    in `providers.chat.model_ranking`: account-wide (`ttp config --account providers.chat.model_ranking
@@ -1230,9 +1231,14 @@ Messages calls into `<base url>/chat/completions` calls and back, and ends with 
    that is refused too is skipped for a day and the next one runs. A task's own model pin on `chat`
    is swapped the same way, unless the pin is required (`pin_required`): such a task waits until its
    model is served again. With a ranking set, a queued or running task that pins a model on `chat`
-   also keeps the hourly check running, and a check over two hours old counts as none: nothing is
+   also keeps the check running, and a check over two hours old counts as none: nothing is
    swapped or held on it. Each switch is one low alert; once the model is served again (the hold ends
-   or the check lists it) the next start runs it. With no ranked model served, or the whole endpoint
+   or the check lists it) the next start runs it. A served model ranked above a route's own model
+   (tier, rule or run class; never a task's pin) is tried at once: light starts run it until 3 of its
+   runs end without a fallback, then every tier does. A run on it that fails on the model itself
+   (malformed answer, timeout, no hand-off) during those runs, or such faults in over a fifth of 8 or
+   more runs later, parks it for a week with one low alert; then it is tried again from scratch.
+   Endpoint faults (down, rate limit, auth) park nothing. With no ranked model served, or the whole endpoint
    cooling down, runs start on the core provider as before. Only `chat` has a served list: Claude
    Code, Codex and Cursor models are not ranked (provider failover covers a provider that cannot start
    work). Routed runs take worker slots under the `chat` gate (its

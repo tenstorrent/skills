@@ -48,7 +48,7 @@ CRED_FILES = {".netrc", "_netrc", ".git-credentials", ".npmrc", ".pypirc", ".pgp
 CRED_SUFFIXES = (".pem", ".key", ".p12", ".pfx", ".jks", ".keystore", ".ppk", ".gpg", ".asc")
 # token and secret only as a whole word (api_token.txt, access-tokens.json, accessToken), so a model's
 # tokenizer.json is no credential
-CRED_NAME_RE = re.compile(r"(?:(?<![a-z0-9])|(?-i:(?<=[a-z])(?=[TS])))(?:tokens?|secrets?)(?![a-z])|credential"
+CRED_NAME_RE = re.compile(r"token(?!i[sz])|secret|credential"   # anywhere in the name, but not a tokenizer
                           r"|passw(or)?d|api[_-]?key|^id_(?!.*\.pub$)|^\.env\.", re.I)
 WHY = ("this task reads untrusted input (label {label}), which may carry planted instructions, so its run "
        "{what}. ").format

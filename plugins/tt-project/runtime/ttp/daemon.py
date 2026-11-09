@@ -4021,15 +4021,15 @@ class Daemon:
             db.x("DELETE FROM kv WHERE key=?", (downtime.LINGER_KV,))
 
     def check_route_models(self) -> None:
-        """The routed endpoint's model-free /models check (route.py): at most hourly while a tier routes
-        to it, in a thread, its served ids written to the state dir's route.MODELS_FILE for workers,
+        """The routed endpoint's model-free /models check (route.py): every route.models_every seconds while
+        a tier or run class routes to it, in a thread, its served ids written to the state dir's route.MODELS_FILE for workers,
         `ttp status` and doctor; then each tier hold its answer or a config change ends is released."""
         now = time.time()
         for tier, model, why in route.release(self.p.db, self.cfg, route.read_served(self.p.state), now):
             log(self.p, f"route: tier {tier} routes again ({model}: {why})")
         if os.environ.get("TTP_TEST_NO_MODELS_PROBE") or (self._models_probe and self._models_probe.is_alive()):
             return
-        if now - self._models_tried < 300 or not (alias := route.models_due(self.cfg, self.p.state, now, self.p.db)):
+        if now - self._models_tried < route.models_every(self.cfg) or not (alias := route.models_due(self.cfg, self.p.state, now, self.p.db)):
             return
         self._models_tried = now
         state, where = self.p.state, self.p
@@ -5250,6 +5250,13 @@ class Daemon:
                     db.set_kv(seen, {"run": r["id"], "ts": time.time()})   # logged once per model and effort
                     log(self.p, f"route: {r['model']} rejected its effort_fields at effort "
                                 f"{sent['effort'] or '-'} ({', '.join(sent['fields'])}); run {r['id']} went on without them")
+            if (routed.get(modelrank.KEY) or {}).get("why") == modelrank.BETTER and (verdict := modelrank.tried(
+                    db, ran := r["model"] or routed["model"], fell, r["id"], time.time())):   # a smarter model's try
+                log(self.p, f"model ranking: {ran} {verdict} (run {r['id']}{': ' + fell if fell else ''})")
+                if verdict == "parked":
+                    self.alert(f"model-rank-park:{ran}", f"Model {ran} on the {routed['to']} provider failed run "
+                               f"{r['id']} on its own ({fell}); routes skip it for a week, then try it again.",
+                               severity="low", every_s=0)
             if fell == "model_missing" and routed.get(modelrank.KEY):   # a ranked stand-in refused: skip it
                 modelrank.refused(db, r["model"] or routed["model"], r["id"], time.time())
                 log(self.p, f"model ranking: {routed['to']} refused {r['model'] or routed['model']} (run {r['id']})")
@@ -5262,7 +5269,7 @@ class Daemon:
                                    f"The {routed['to']} provider no longer serves model {model} "
                                    f"(providers.{routed['to']}.tiers.{routed['tier']}.model). {routed['tier'].capitalize()} "
                                    f"runs now start on the core provider; routing resumes on its own once the model is "
-                                   f"served again (checked hourly) or the tier's model is changed. Served models: "
+                                   f"served again (checked every minute) or the tier's model is changed. Served models: "
                                    f"`ttp status`.", severity="normal", every_s=0)
             elif fell and not own:   # an endpoint fault cools the endpoint; a run's own end only its task
                 route.cool(db, self.cfg, routed["to"], fell, r["id"], time.time())
@@ -11024,6 +11031,8 @@ class Daemon:
             if name == modelrank.TO and why in ("", "model_missing") else None   # one switch record per rule
         if ranked:   # its model is down: the smartest model still served (modelrank.py)
             model, why = ranked[0], ""
+        elif name == modelrank.TO and not why and (up := self._rank_better(where, key, model, tier, now)):
+            model, ranked = up, (up, {"from": model, "why": modelrank.BETTER})   # a smarter one is served
         if not why and self._logged_out(name) and not self._may_probe(name, now):
             why = "auth"   # the auth gate holds it; its one login check may be a routed run
         return {"tier": tier, "to": name, "model": model, **rule, "fallback": why or "none",
@@ -11060,6 +11069,18 @@ class Daemon:
         except Exception as e:   # the ranking must never hold a task back
             log(self.p, f"model ranking not applied ({where}): {type(e).__name__}: {e}")
             return None
+
+    def _rank_better(self, where: str, key: str, model: str, tier: str, now: float) -> str:
+        """A served model ranked above the up `model` to run instead (modelrank.better: light starts only
+        until it has proven itself), logged once per change of `key`; else ''."""
+        try:
+            up = modelrank.better(self.p.db, self.cfg, self.p.state, model, now, light=tier == "light")
+            if up and modelrank.switch(self.p.db, f"{modelrank.BETTER}:{key}", model, up, now):
+                log(self.p, f"model ranking: {where} tries {up}, ranked above {model}")
+            return up
+        except Exception as e:   # the ranking must never hold a task back
+            log(self.p, f"model ranking: better model not checked ({where}): {type(e).__name__}: {e}")
+            return ""
 
     def _slot_provider(self, task: dict, provider: str, ctx: dict) -> str:
         """The provider whose worker slots a start of `task` takes: the one its tier is routed to

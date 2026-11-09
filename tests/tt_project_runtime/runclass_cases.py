@@ -253,3 +253,32 @@ def test_cheap_core_runs_keep_the_alarm_quiet_and_tt_unavailable_is_told_once(en
     d._run_class_checked = 0.0
     d.watch_run_classes()
     assert not p.db.kv("tt_unavailable_told", "") and len(told) == 1
+
+
+def test_a_cheap_class_run_starts_claude_on_its_cheap_model_at_its_effort_or_the_floors(env, monkeypatch):
+    """The run note's cheap model (runclass.CHEAP_KEY) reaches the Claude command line, and a conclusion
+    run's effort floor (min_effort) still lifts its low effort."""
+    from ttp import runclass
+    from ttp.daemon import Daemon
+    from ttp.providers import claude as claude_provider
+
+    class Built(Exception):
+        pass
+    real = claude_provider.Claude.build
+
+    def build(self, **kw):   # the real command line; no agent process starts
+        raise Built(real(self, **kw)[0])
+    monkeypatch.setattr(claude_provider.Claude, "build", build)
+    p = make(env)
+    q = p.db.add_task("Why?", "x", kind="question", tier="standard", origin="coordinator")
+    d = Daemon(p.base)
+
+    def argv(model, **kw):
+        note = {runclass.CHEAP_KEY: {"provider": "claude", "model": model, "effort": "low", "why": "no chat model"}}
+        with pytest.raises(Built) as got:
+            d.start_run("worker", "go", "claude", "standard", str(p.root), task=p.db.task(q), note=note, **kw)
+        a = list(got.value.args[0])
+        return a[a.index("--model") + 1], (a[a.index("--effort") + 1] if "--effort" in a else "")
+
+    assert argv("sonnet") == ("sonnet", "low")
+    assert argv("haiku", min_effort="high") == ("haiku", "high")
