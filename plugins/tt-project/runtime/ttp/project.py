@@ -67,7 +67,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # rolling by default; plan windows never count toward it.
         "global_daily_usd": 200.0,
         # A spend goal, not a cap: ttp status and the daily review show today's Claude spend against it
-        # (0 = unset, the default; `ttp config --account budget.daily_target_usd 330`).
+        # (0 = unset, the default; `ttp config --account budget.daily_target_usd <usd>`).
         "daily_target_usd": 0.0,
         "day_start": "",
         "timezone": "",
