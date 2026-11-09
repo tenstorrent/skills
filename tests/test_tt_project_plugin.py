@@ -300,6 +300,8 @@ def test_runtime_has_no_walrus_python39_rejects_and_compiles_under_a_real_39():
             "import ttp\n"
             "bad = []\n"
             "for m in pkgutil.walk_packages(ttp.__path__, 'ttp.'):\n"
+            "    if m.name.endswith('.__main__'):\n"   # importing it runs the CLI
+            "        continue\n"
             "    try:\n"
             "        importlib.import_module(m.name)\n"
             "    except Exception as e:\n"
