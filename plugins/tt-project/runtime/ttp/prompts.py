@@ -707,26 +707,34 @@ def worker_corrections(p: Project) -> list[dict]:
 
 def worker_system(p: Project, task: dict | None = None) -> str:
     """The part of a worker's prompt shared by every worker and reviewer of the project until the
-    charter, memory or its machines change: sent as the system prompt where the agent allows it, so
-    the provider caches it across concurrent runs. It never reads `task` (kept for callers): the rules
-    and memory a task alone needs go in its own prompt (worker_rules)."""
+    charter, its rules or its machines change: sent as the system prompt where the agent allows it, so
+    the provider caches it across runs (back to back, same model). It never reads `task` (kept for
+    callers), nor memory, which changes far more often: worker_memory_block, in the run's own prompt."""
     f = p.harness / "prompts" / "worker.md"
     parts = [restrictions_block(p), split_rules(f.read_text(), project_features(p), set())[0] if f.exists() else ""]
     # The one copy of the restrictions (the task prompt only points back at it); a second inside the
     # charter only costs tokens.
-    # The rest of the charter and memory is mostly the coordinator's: workers get their digest of it.
-    charter, mem, use = worker_context(p, reserve=WORKER_RANKED_MIN_CHARS)   # the task's own: worker_rules
+    # The rest of the charter is mostly the coordinator's: workers get their digest of it.
+    charter, _, use = worker_context(p, reserve=WORKER_RANKED_MIN_CHARS)
+    parts.append(_worker_heads(p, use["charter_dropped"], 0)[0] + (charter or "(none)"))
+    return "\n\n".join(x for x in parts if x.strip())
+
+
+def worker_memory_block(p: Project) -> str:
+    """The user's corrections and the project memory for workers (worker_context's task-free choice),
+    leading a run's own prompt: one new entry must not change the system prompt every worker and
+    reviewer shares, which would make each one's first call write the cache afresh (task #51)."""
+    _, mem, use = worker_context(p, reserve=WORKER_RANKED_MIN_CHARS)   # the task's own: worker_rules
     # The user's corrections come before the rest of memory, outside its budget (Project.user_corrections).
     fixed = worker_corrections(p)
     p.note_memory_shown([e["name"] for e in fixed + mem + use["pointers"]])
-    head, mem_head = _worker_heads(p, use["charter_dropped"], len(p._memory_entries()))
-    parts.append(head + (charter or "(none)"))
+    parts = []
     if fixed:
         parts.append(f"# {CORRECTIONS_HEADER.upper()}\n" + "\n".join(e["line"] for e in fixed))
     more = [_PINNED_MORE.format(path=p.memory_dir)] + [x["line"] for x in use["pointers"]] if use["pointers"] else []
     if mem or more:
-        parts.append(mem_head + "\n".join([e["line"] for e in mem] + more))
-    return "\n\n".join(x for x in parts if x.strip())
+        parts.append(_worker_heads(p, 0, len(p._memory_entries()))[1] + "\n".join([e["line"] for e in mem] + more))
+    return "\n\n".join(parts)
 
 
 def _zone_line(p: Project, now: float | None = None) -> str:
@@ -797,7 +805,7 @@ def worker_task(p: Project, task: dict, cwd: str, branch: str | None, wake: dict
     if conflict and cmark and conflict.get("tier") == "light":
         short = (delta_review_task(p, task, cwd, branch, cmark, conflict["model_free"])
                  if isinstance(conflict.get("model_free"), dict) else conflict_fix_task(p, task, cwd, branch, cmark))
-        return "\n\n".join(x for x in (worker_rules(p, task), short) if x.strip())
+        return "\n\n".join(x for x in (worker_memory_block(p), worker_rules(p, task), short) if x.strip())
     if prev:
         history = f"\nPrevious attempt ended '{prev.get('status')}': {str(prev.get('summary') or '')[:1500]}\n"
         if prev.get("woke"):
@@ -898,6 +906,7 @@ def worker_task(p: Project, task: dict, cwd: str, branch: str | None, wake: dict
         restart_block(p, prev),
         streamguard.prompt_block(prev),
         _sections(_raw(p, f"kind-{kind}.md"), cfg),
+        worker_memory_block(p),
         worker_rules(p, task),
         f"# YOUR TASK #{task['id']}: {task['title']}\n"
         f"kind: {kind} · tier: {task['tier']}" + (f" · this run: {run_tier} wake" if wake else "")

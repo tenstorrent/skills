@@ -732,6 +732,13 @@ def make(env, name="demo"):
     return p
 
 
+def _worker_text(p, task=None):
+    """The shared system prompt and the memory block that leads each run's own prompt (task #51), as one
+    text: what worker_system returned while it carried memory."""
+    from ttp.prompts import worker_memory_block, worker_system
+    return "\n\n".join(x for x in (worker_system(p, task), worker_memory_block(p)) if x)
+
+
 # make() bootstraps each project once per test process and clones it after that: a bootstrap is about
 # 15 git processes and 3 MB of copies, and most tests start with one. The clone gets the project's own
 # root, creation time and id, the git history a bootstrap at that root writes (commits rewritten in
@@ -6226,8 +6233,9 @@ def test_claude_workers_get_the_stable_prompt_as_a_cacheable_system_prompt(env, 
     assert argv[argv.index("--append-system-prompt-file") + 1] == str(run_dir / "system.md")
     system = (run_dir / "system.md").read_text()
     assert system.startswith("# BINDING RESTRICTIONS")
-    assert "Go fast." in system and "MEMORY-MARKER" in system and "TASK-SPEC-MARKER" not in system
-    assert "TASK-SPEC-MARKER" in prompt and "Go fast." not in prompt and "MEMORY-MARKER" not in prompt
+    assert "Go fast." in system and "MEMORY-MARKER" not in system and "TASK-SPEC-MARKER" not in system
+    # memory changes far more often than the charter: it leads the run's own prompt (task #51)
+    assert "TASK-SPEC-MARKER" in prompt and "Go fast." not in prompt and "MEMORY-MARKER" in prompt
     assert prompt.rstrip().endswith(restrictions_pointer(p)), "a pointer at the restrictions closes the prompt"
     assert "Never merge to main (user msg #1)." not in prompt, "the restrictions are in the system prompt only"
 
@@ -6266,8 +6274,9 @@ def test_every_worker_gets_the_same_system_prompt_so_its_cache_is_shared(env, mo
     assert set(dirs) == {a, b}, [p.db.task(t)["blocked_reason"] for t in (a, b)]
     sys_a, sys_b = ((dirs[t] / "system.md").read_bytes() for t in (a, b))
     assert sys_a == sys_b, "a per-task byte in the system prompt makes every worker re-write the cache"
-    assert b"MEMORY-MARKER" in sys_a and b"RULES" not in sys_a
+    assert b"Go fast." in sys_a and b"MEMORY-MARKER" not in sys_a and b"RULES" not in sys_a
     prompt_a, prompt_b = ((dirs[t] / "prompt.md").read_text() for t in (a, b))
+    assert "MEMORY-MARKER" in prompt_a and "MEMORY-MARKER" in prompt_b
     assert prompt_a.startswith("QUESTION-RULES") and "SPEC-A" in prompt_a and "PLAN-RULES" not in prompt_a
     assert prompt_b.startswith("PLAN-RULES") and "SPEC-B" in prompt_b
 

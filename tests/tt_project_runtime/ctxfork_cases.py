@@ -726,3 +726,34 @@ def test_forked_runs_send_the_coordinator_prefix_and_keep_their_own_text_after_i
     (coord_dir / "run.json").write_text(json.dumps({"argv": other}))
     argv, prompt, system, ctx = start(p.root)
     assert system.startswith("# WORKER RULES") and "--json-schema" not in argv and "differs" in ctx["prefix"]
+
+
+def test_sonnet_workers_and_reviewers_share_one_system_prompt_while_memory_changes(env, monkeypatch, tmp_path):
+    """Task #51: the cache matches tools, then the system prompt. A worker and a reviewer run on the same
+    model, with a different task, run id and worktree, and a memory entry added between them, send the
+    same settings and system prompt byte for byte; memory, which changes most often, leads each run's
+    own prompt after it."""
+    from ttp.prompts import worker_system, worker_task
+    p, d, _cfg_dir, _run = _fork_daemon(env, monkeypatch, tmp_path)
+    from ttp.providers import claude
+    monkeypatch.setattr(claude, "_FLAGS", {**claude._FLAGS, claude.APPEND_SYSTEM_FILE: True})
+    p.add_memory("MEM-ONE the nightly report goes to notes/.", kind="decision", title="one", audience="workers")
+
+    def start(role, wt, kind):
+        (tmp_path / wt).mkdir()
+        tid = p.db.add_task(f"{kind} {uuid.uuid4().hex[:6]}", f"do the {wt} thing", kind=kind, origin="user")
+        task = p.db.task(tid)
+        rid = d.start_run(role, worker_task(p, task, str(tmp_path / wt), f"ttp/t{tid}"), "claude", "standard",
+                          str(tmp_path / wt), task=task, append_system=worker_system(p, task))
+        rd = p.runs / str(rid)
+        return json.loads((rd / "run.json").read_text())["argv"], (rd / "prompt.md").read_text(), \
+            (rd / "system.md").read_text()
+
+    a = start("worker", "wtA", "code")
+    p.add_memory("MEM-TWO the bench box is shared.", kind="fact", title="two", audience="workers")
+    b = start("reviewer", "wtB", "review")
+    shape = lambda a: ({k: v for k, v in json.loads(a[a.index("--settings") + 1]).items() if k != "hooks"},  # noqa: E731
+                       a[a.index("--model") + 1] if "--model" in a else "")
+    assert shape(a[0]) == shape(b[0]) and a[2] == b[2]
+    assert "MEM-ONE" not in a[2] and "PROJECT MEMORY" not in a[2]
+    assert "MEM-ONE" in a[1] and "MEM-TWO" not in a[1] and "MEM-TWO" in b[1]

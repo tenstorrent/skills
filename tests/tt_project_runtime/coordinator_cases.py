@@ -8232,7 +8232,7 @@ def test_pinned_memory_overflow_is_marked_in_the_prompt_and_alerts_the_coordinat
     big = [("decision", f"RULE-{i} " + "y" * 900, "workers") for i in range(10)]
     _memories(p, [("fact", "OLD-FACT")] + big)
     assert coord.apply(p, [{"type": "memory_add", "text": "NEW-FACT"}], turn=1) == []
-    system = worker_system(p)
+    system = _worker_text(p)
     use = worker_context(p)[2]
     n = use["pinned_dropped"]
     shown = [i for i in range(10) if f"RULE-{i} " + "y" * 900 in system]
@@ -8268,7 +8268,7 @@ def test_workers_get_a_charter_and_memory_digest_with_every_restriction_verbatim
                             "audience": "coordinator"},
                            {"type": "memory_add", "text": "TAGGED-RESTRICTION: never delete the datasets.",
                             "memory_kind": "restriction", "audience": "coordinator"}], turn=1) == []
-    system = worker_system(p)
+    system = _worker_text(p)
     full = len(_BIG_CHARTER) + sum(len(e["line"]) + 1 for e in p._memory_entries())
     block = system[system.index("# CHARTER"):]
     assert full > 20000 and len(block) <= 8000, (full, len(block))
@@ -8577,7 +8577,7 @@ def test_a_restriction_memory_reaches_running_workers_and_new_prompts(env, tmp_p
     assert coord.apply(p, [{"type": "memory_add", "text": "Never reboot box A.",
                             "memory_kind": "restriction"}], turn=1) == []
     assert "Never reboot box A." in (run_dir / "steer.md").read_text()
-    assert "Never reboot box A." in worker_system(p)
+    assert "Never reboot box A." in _worker_text(p)
 
 
 
@@ -18458,7 +18458,7 @@ def test_pinned_worker_memory_past_its_room_shows_the_task_s_entries_and_a_plain
     assert 0 < n < 20 and len(shown) == 20 - n and use["memory_limit"] < use["pinned_chars"], use
     assert pinned[17].stem in shown and pinned[0].stem in shown and pinned[19].stem not in shown, shown
     assert not any("FACT-NEWEST" in e["line"] for e in mem)
-    system = worker_system(p, task)
+    system = _worker_text(p, task)
     # The task's own entry comes whole in its own prompt; the shared system prompt keeps the oldest.
     whole = system + worker_rules(p, task)
     assert "WORKER-17 uses rack-17 " + "w" * 600 in whole and "WORKER-19 uses rack-19 " + "w" * 600 not in whole
@@ -18484,7 +18484,7 @@ def test_worker_memory_keeps_charter_policies_drops_restated_restrictions_and_ma
                   ("restriction", "Never push."),   # not what the charter says: kept
                   ("fact", "FACT-NEWEST workers may reuse the build cache.")]
               + [("decision", f"RULE-{i:02} " + "r" * 900, "workers") for i in range(30)])
-    system = worker_system(p)
+    system = _worker_text(p)
     block = system[system.index("# CHARTER"):]
     text, mem, use = worker_context(p)
     for policy in ("- Delivery: workers commit on their own branch", "- Style: workers keep answers short"):
@@ -18535,7 +18535,7 @@ def test_pinned_memory_counts_each_entry_against_the_budget_of_the_prompt_that_s
     work = worker_context(p)[2]
     _, wuse = p.worker_memory_select(10 ** 6)
     assert wuse["pinned_chars"] == size({"W-PREF", "W-RES", "W-RULE", "C-RULE", "D-RES"}) == work["pinned_chars"]
-    system = worker_system(p)
+    system = _worker_text(p)
     assert "W-RULE never reboot" in system and "C-RULE never open" in system and "C-PREF" not in system
     context = coord.prompt_state(p)[0]["context"]
     assert "W-PREF" not in context and "W-RES" not in context
@@ -18568,7 +18568,7 @@ def test_pinned_worker_memory_past_its_room_shows_or_points_to_every_entry_and_n
                       + [("decision", f"TAG-{i:02} workers use queue {i}. " + "t" * 700, "workers") for i in range(12)]
                       + [("preference", "LONG-PREF " + "x" * 3000, "workers")])
     _, mem, use = worker_context(p)
-    system = worker_system(p)
+    system = _worker_text(p)
     block = system[system.index("# PROJECT MEMORY"):]
     whole = {e["name"] for e in mem}
     pointed = {x["name"] for x in use["pointers"]}
@@ -19083,7 +19083,7 @@ def test_worker_policies_keep_their_own_room_beside_long_goals_and_large_pinned_
     for item in policies + ["- Delivery: workers commit on their own branch", "- Style: workers keep answers short"]:
         assert item in text, item[:20]
     assert 0 < use["pinned_dropped"] == len(use["pointers"]) <= 30   # 30 pointers alone fill the room
-    block = worker_system(p)
+    block = _worker_text(p)
     assert "Policy 9: workers open a draft PR" in block and "Shortened for room, each in full in" in block
 
 
@@ -19144,7 +19144,7 @@ def test_a_user_correction_leads_worker_prompts_and_the_digest_and_outlives_memo
     assert "PLAIN-FACT" not in digest.split(f"## {CORRECTIONS_HEADER}")[1].split("\n## ")[0]
     # A worker: its own block before the rest of memory, outside the memory budget.
     assert fix.stem not in [e["name"] for e in worker_context(p)[1]]
-    system = worker_system(p)
+    system = _worker_text(p)
     block = f"# {CORRECTIONS_HEADER.upper()}\n[{fix.stem}] Correction (user msg #12)"
     assert block in system and system.count("Correction (user msg #12)") == 1, system
     assert system.index(block) < system.index("# PROJECT MEMORY")
@@ -19153,7 +19153,7 @@ def test_a_user_correction_leads_worker_prompts_and_the_digest_and_outlives_memo
     p.forget_memory(fix.stem)
     assert f"[{fix.stem}] retired, ignore" in coord.digest(p, {}, [], [])
     p.db.set_kv(coord.PROMPT_REFRESH_KEY, 1)
-    assert CORRECTIONS_HEADER not in coord.digest(p, {}, [], []) and CORRECTIONS_HEADER.upper() not in worker_system(p)
+    assert CORRECTIONS_HEADER not in coord.digest(p, {}, [], []) and CORRECTIONS_HEADER.upper() not in _worker_text(p)
 
 
 def test_user_corrections_drop_past_30_days_and_past_their_cap_oldest_first(env):
@@ -20286,7 +20286,7 @@ def test_every_worker_prompt_carries_every_standing_entry_for_workers(env, kind,
     from ttp.prompts import worker_context, worker_system
     task = {"id": 1, "kind": kind, "tier": tier, "title": f"{kind}: tidy the nightly report",
             "spec": "Edit notes/report.md only."}
-    system = worker_system(p, task)
+    system = _worker_text(p, task)
     block = system[system.index("# PROJECT MEMORY"):]
     for want in ("STANDING-PLAIN-1", "STANDING-PLAIN-2", "STANDING-WORKERS-3", "STANDING-TAGGED-4"):
         assert want in block, (want, block[:2000])
@@ -20315,7 +20315,7 @@ def test_standing_worker_memory_past_its_room_is_pointed_to_and_alerts_once(env)
     pointed = [x["name"] for x in use["pointers"]]
     assert shown and set(pointed) == {d.stem for d in duties} - shown
     assert pointed == [d.stem for d in duties][len(duties) - len(pointed):], "the oldest are shown whole"
-    system = worker_system(p)
+    system = _worker_text(p)
     for i, d in enumerate(duties):
         assert (f"DUTY-{i:02} report it each time. " + "s" * 900 in system) == (d.stem in shown), i
         assert f"[{d.stem}] DUTY-{i:02} report it each time." in system, i
@@ -20568,7 +20568,7 @@ def test_every_worker_prompt_carries_a_resource_entry_that_is_not_standing(env, 
     use = worker_context(p, task)[2]
     standing = sum(len(e["line"]) + 1 for e in p._memory_entries() if e["standing"])
     assert standing > use["memory_limit"], "the fixture must make the standing entries alone outgrow the workers' room"
-    block = _memory_block(worker_system(p, task))
+    block = _memory_block(_worker_text(p, task))
     for want in ("HOST-RESOURCE box A (alias box-a) is the project's host", "RULE-PLAIN never reboot box A"):
         assert want in block, (want, block[:1500])
 
@@ -20587,7 +20587,7 @@ def test_the_reported_light_harness_run_carries_every_restriction_resource_and_s
     shown = {e["name"] for e in mem}
     always = {k: f for k, f in pins.items() if not k.startswith("DUTY")}
     assert {f.stem for f in always.values()} <= shown, shown
-    block = _memory_block(worker_system(p, task))
+    block = _memory_block(_worker_text(p, task))
     for f in always.values():
         line = next(e["line"] for e in p._memory_entries() if e["name"] == f.stem)
         assert line in block, f.stem
@@ -20614,7 +20614,7 @@ def test_pinned_worker_memory_is_the_same_in_light_standard_and_deep_runs(env):
     for tier in ("light", "standard", "deep"):
         task = {"id": 1, "kind": "code", "tier": tier, "title": "code: fix the report script",
                 "spec": "Change scripts/report.py."}
-        block = _memory_block(worker_system(p, task))
+        block = _memory_block(_worker_text(p, task))
         blocks[tier] = {n for n, f in pins.items() if n + " " in block}
     assert blocks["light"] == blocks["standard"] == blocks["deep"] == set(pins), blocks
 
