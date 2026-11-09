@@ -645,6 +645,9 @@ SESSION_REBOOK_KEY = "session_total_rebook"   # Daemon.rebook_session_totals ran
 SESSION_REBOOK_DAYS = 7   # its window: runs that ended this many days back or less
 CALLS_REBOOK_KEY = "per_call_rebook"   # Daemon.rebook_per_call ran (once per project)
 CALLS_REBOOK_DAYS = 7   # its window: Claude runs that ended this many days back or less
+CALLS_REBOOK_PROGRESS_KEY = "per_call_rebook_progress"   # its place while it runs in slices (window, cursor, sums)
+CALLS_REBOOK_SLICE_S = 2.0      # a tick's slice of it stops after the session that passes this many seconds
+CALLS_REBOOK_SLICE_RUNS = 200   # or this many runs, so no tick step runs long (a 7-day re-book of a busy project ~50 s)
 CALLS_NOTE = "cost_calls"   # a Claude run's note: booked at its calls' list price (how many calls)
 MODEL_REPRICE_SINCE = (2026, 11, 7)   # its window's first day, in the home zone: the days the dollar caps over-counted
 REACH_EVERY_S = 30      # while a provider is held offline, how often its API host is resolved again
@@ -1128,6 +1131,7 @@ class Daemon:
         self._reap_errors: dict[int, int] = {}
         self._lean_reap = False   # this reap retries one an earlier daemon was cut off in: optional checks skipped
         self._metered: dict[int, tuple[int, float]] = {}   # run id -> (output size, when) last priced
+        self._meter_tails: dict[int, object] = {}   # run id -> its session logs' claude.LogTail (meter_running)
         self._steer_unread: dict[int, dict] = {}   # run id -> its unread steer.md stretch (steerack)
         self._runwatch_at = 0.0   # when watch_runs last refreshed state/runwatch.json
         self._window_provs: dict[int, tuple] = {}            # run id -> (provider, env) reading its windows
@@ -1404,14 +1408,8 @@ class Daemon:
                             + ", ".join(f"run {i} ${a:.2f}->${b:.2f}" for i, a, b in changed[:40]) + ")")
         except Exception:   # a spend correction must never keep the daemon from starting
             log(self.p, "session total re-book error: " + traceback.format_exc().replace("\n", " | ")[:2000])
-        try:   # Claude runs booked from Claude Code's reported total, at their own calls' list price, once
-            changed = self.rebook_per_call()
-            if changed is not None:
-                log(self.p, f"re-booked {len(changed)} Claude run(s) of the last {CALLS_REBOOK_DAYS} days at their "
-                            f"per-call cost: ${sum(c[1] for c in changed):.2f} booked -> "
-                            f"${sum(c[2] for c in changed):.2f}")
-        except Exception:   # a spend correction must never keep the daemon from starting
-            log(self.p, "per-call re-book error: " + traceback.format_exc().replace("\n", " | ")[:2000])
+        # The per-call re-book of the last 7 days runs as a tick step in slices (rebook_per_call_step), never
+        # here: read whole at start it held a busy project's start for tens of seconds.
         try:   # push batch files left `running` by a batch whose row is final (pushq.close_strays)
             if closed := pushq.close_strays(self.p):
                 log(self.p, f"closed {len(closed)} stray push batch file(s)")
@@ -1984,7 +1982,7 @@ class Daemon:
         self.tend_lease()
         # Compared as callables, not by name, so a step replaced on the instance is gated the same way.
         lease_off = [] if self.lease_held() else [getattr(self, n) for n in LEASE_STEPS]
-        for step in (self.lift_boot_pause, self.reap_runs, self.reap_waiting_checks, self.wake_after_reboot, self.meter_running, self.watch_runs, self.check_steer_reads, self.relay_escalations, self.post_held_notifies, self.reconcile_tasks, self.retry_workspaces, self.tend_pushes,
+        for step in (self.lift_boot_pause, self.reap_runs, self.reap_waiting_checks, self.wake_after_reboot, self.meter_running, self.rebook_per_call_step, self.watch_runs, self.check_steer_reads, self.relay_escalations, self.post_held_notifies, self.reconcile_tasks, self.retry_workspaces, self.tend_pushes,
                      self.sweep_sandbox_trees,
                      self.verify_pushes,
                      self.prune_worktrees, self.prune_leftovers, self.land_harness_worktrees, self.backup_branches, self.replicate_state, self.check_local_only, self.check_disk,
@@ -4665,6 +4663,7 @@ class Daemon:
         running = self.p.db.q("SELECT * FROM runs WHERE status='running'")
         ids = {r["id"] for r in running}
         self._metered = {k: v for k, v in self._metered.items() if k in ids}
+        self._meter_tails = {k: v for k, v in self._meter_tails.items() if k in ids}
         self._window_provs = {k: v for k, v in self._window_provs.items() if k in ids}
         for r in running:
             out = self._run_dir(r) / "output.jsonl"
@@ -4679,7 +4678,7 @@ class Daemon:
             try:
                 usage = get_provider(r["provider"]).parse(out)
                 basis = _cost_basis(usage)
-                cost = self._book_cost(r, usage, out)
+                cost = self._book_cost(r, usage, out, metering=True)
             except Exception:
                 continue
             # The tokens also show a run on a logged-out provider got past the login (alerts.holds).
@@ -4782,7 +4781,7 @@ class Daemon:
                 "cache_read": usage.cache_read_tokens, "cache_write": usage.cache_write_tokens})
         return usage.cost_usd
 
-    def _book_cost(self, r: dict, usage, out: Path) -> float:
+    def _book_cost(self, r: dict, usage, out: Path, metering: bool = False) -> float:
         """What run `r` books, set on `usage.cost_usd`. A Claude run books its own API calls, each once at
         list price (claude.calls_cost: the calls `out`, its output.jsonl, names, at the final usage Claude
         Code's session log recorded, _transcripts), whatever Claude Code's total_cost_usd says: in a resumed
@@ -4792,15 +4791,21 @@ class Daemon:
         --max-budget-usd base, _session_total_before). A resumed or forked run with no answer at all, a
         report and no tokens, never reached the API: $0. Other providers, and a Claude output with no
         per-call usage (an old Claude Code, a run cut off before its first answer), book the old way:
-        the report, netted (_net_of_session), or the token or elapsed estimate."""
+        the report, netted (_net_of_session), or the token or elapsed estimate. A resumed or forked run whose
+        stream shows Claude Code started (init) but no call that answered books $0 whatever its result
+        reports (a lost or failed fork carries the parent session's total and its tokens): never the old way.
+        With `metering` (meter_running, a run still going) the session logs are read incrementally
+        (claude.LogTail kept per run), never whole each minute."""
         if (r["provider"] or "") == "claude":
             from . import localspend
             from .providers import claude
             session = _continues_session(r, json.loads(r["note"] or "{}"))
             reported = None if usage.estimated else float(usage.cost_usd or 0)
+            tail = self._meter_tails.setdefault(r["id"], claude.LogTail()) if metering else None
             try:
                 got = claude.calls_cost(out, localspend.overrides(),
-                                        self._transcripts(r, out.parent, usage.session_id or r["session_id"] or ""))
+                                        self._transcripts(r, out.parent, usage.session_id or r["session_id"] or ""),
+                                        tail=tail, empty_ok=session)
             except Exception as e:   # the old way books it
                 log(self.p, f"run {r['id']}: per-call cost not read: {type(e).__name__}: {e}"[:300])
                 got = None
@@ -5129,35 +5134,66 @@ class Daemon:
                                            "usd_after": round(sum(c[2] for c in changed), 6)})
         return changed
 
-    def rebook_per_call(self, dry_run: bool = False) -> list[tuple[int, float, float]] | None:
+    def rebook_per_call_step(self) -> None:
+        """Tick step: the next slice of the one-time per-call re-book (rebook_per_call), until it is done."""
+        if getattr(self, "_calls_rebook_done", False):
+            return
+        if self.rebook_per_call(max_s=CALLS_REBOOK_SLICE_S, max_runs=CALLS_REBOOK_SLICE_RUNS,
+                                in_step=True) is None:
+            self._calls_rebook_done = True
+
+    def rebook_per_call(self, dry_run: bool = False, max_s: float | None = None, max_runs: int | None = None,
+                        in_step: bool = False) -> list[tuple[int, float, float]] | None:
         """Once per project (kv CALLS_REBOOK_KEY): Claude runs that ended in the last CALLS_REBOOK_DAYS days,
         booked before _book_cost from Claude Code's total_cost_usd (netted or not), re-booked the way
         _book_cost books one now: at their own calls' list price (claude.calls_cost, each session's log read
-        once for all its runs), and a resumed or forked run that made no call at $0. The correction goes
-        either way: the run's cost_usd is set, its task's spend moves by the difference (never below $0),
+        once for all its runs in a slice), and a resumed or forked run that made no call at $0. The correction
+        goes either way: the run's cost_usd is set, its task's spend moves by the difference (never below $0),
         and a ledger row of the signed difference is booked at the run's end, so the dollar caps and the
         global daily total sum the per-call cost. A run whose output is gone or has no per-call usage
         keeps its booking; so does one cut off before its first call (its token or elapsed estimate
         stands). Each row changed is marked (note cost_calls, and calls_rebooked the old figure), so a
-        second pass changes nothing. With `dry_run` nothing is written and the kv is not read. Returns
-        (run id, booked before, booked after) of each row changed, by run id, or None when it already ran."""
+        second pass changes nothing.
+        In slices: with `max_s` or `max_runs` (the tick step, rebook_per_call_step) it stops after the
+        session whose runs pass either bound, or at the step's budget (`in_step`), and keeps its place in kv
+        CALLS_REBOOK_PROGRESS_KEY: the window fixed at its first slice (since, the highest run id then), the
+        last session done (sessions in key order) and the sums so far. The slice that finishes sets
+        CALLS_REBOOK_KEY (the done marker) and logs one line for the project. With `dry_run` all of it runs
+        at once, nothing is written and neither kv is read. Returns (run id, booked before, booked after)
+        of each row this slice changed, by run id, or None when it already ran."""
         from . import localspend
         from .providers import claude
         db = self.p.db
         if not dry_run and db.kv(CALLS_REBOOK_KEY):
             return None
+        t0 = time.monotonic()
+        prog = {} if dry_run else dict(db.kv(CALLS_REBOOK_PROGRESS_KEY) or {})
+        if not prog:
+            prog = {"since": time.time() - CALLS_REBOOK_DAYS * 86400,
+                    "upto": int((db.one("SELECT COALESCE(MAX(id),0) m FROM runs") or {}).get("m") or 0),
+                    "cursor": "", "runs": 0, "usd_before": 0.0, "usd_after": 0.0, "slices": 0}
         overrides = localspend.overrides()
         sessions: dict[str, list] = {}
-        for r in db.q("SELECT * FROM runs WHERE provider='claude' AND status!='running' "
-                      "AND COALESCE(ended, started)>=? ORDER BY id", (time.time() - CALLS_REBOOK_DAYS * 86400,)):
+        for r in db.q("SELECT * FROM runs WHERE provider='claude' AND status!='running' AND id<=? "
+                      "AND COALESCE(ended, started)>=? ORDER BY id", (prog["upto"], prog["since"])):
             note = json.loads(r["note"] or "{}")
             if CALLS_NOTE not in note:
                 sid = str(r["session_id"] or note.get("session_id") or "")
-                sessions.setdefault(sid or f"run:{r['id']}", []).append((r, note))
-        changed = []
-        for key, runs in sessions.items():
+                key = sid or f"run:{r['id']}"
+                if key > prog["cursor"]:
+                    sessions.setdefault(key, []).append((r, note))
+        changed, done, seen = [], True, 0
+        for key in sorted(sessions):
+            runs = sessions[key]
+            if (not dry_run and seen and ((max_s is not None and time.monotonic() - t0 >= max_s)
+                                          or (max_runs is not None and seen >= max_runs)
+                                          or (in_step and self._step_over(f"per-call re-book {key}")))):
+                done = False
+                break
+            seen += len(runs)
             outs = [self._run_dir(r) / "output.jsonl" for r, _ in runs]
-            streams = [claude.stream_calls(out) if out.is_file() else None for out in outs]
+            streams = [claude.stream_calls(out, _continues_session(r, note)) if out.is_file() else None
+                       for (r, note), out in zip(runs, outs)]
             wanted = set().union(*(st[0] for st in streams if st))
             session = "" if key.startswith("run:") else key
             session = session or next((st[1] for st in streams if st and st[1]), "")
@@ -5167,7 +5203,7 @@ class Daemon:
                 reported = claude.result_total(out) if out.is_file() else None
                 if st is not None:
                     got = claude.price_calls(st[0], overrides, logged)
-                    if not got.calls and reported is None:
+                    if not got.calls and reported is None and not _continues_session(r, note):
                         continue   # cut off before its first call: its estimate stands
                 elif reported is not None and _continues_session(r, note) \
                         and not _has_tokens(get_provider("claude").parse(out)):
@@ -5190,11 +5226,21 @@ class Daemon:
                              (after - before, r["task"]))
                     db.spend(r["provider"], after - before, self._source_for(r), account=r["account"] or "",
                              estimated=bool(r["cost_estimated"]), ts=float(r["ended"] or r["started"] or time.time()))
+            prog["cursor"] = key
         changed.sort()
-        if not dry_run:
-            db.set_kv(CALLS_REBOOK_KEY, {"at": time.time(), "runs": len(changed),
-                                         "usd_before": round(sum(c[1] for c in changed), 6),
-                                         "usd_after": round(sum(c[2] for c in changed), 6)})
+        if dry_run:
+            return changed
+        prog.update(runs=prog["runs"] + len(changed), slices=prog["slices"] + 1,
+                    usd_before=round(prog["usd_before"] + sum(c[1] for c in changed), 6),
+                    usd_after=round(prog["usd_after"] + sum(c[2] for c in changed), 6))
+        if not done:
+            db.set_kv(CALLS_REBOOK_PROGRESS_KEY, prog)
+            return changed
+        db.set_kv(CALLS_REBOOK_KEY, {"at": time.time(), "runs": prog["runs"], "slices": prog["slices"],
+                                     "usd_before": prog["usd_before"], "usd_after": prog["usd_after"]})
+        db.set_kv(CALLS_REBOOK_PROGRESS_KEY, None)
+        log(self.p, f"re-booked {prog['runs']} Claude run(s) of the last {CALLS_REBOOK_DAYS} days at their per-call "
+                    f"cost in {prog['slices']} slice(s): ${prog['usd_before']:.2f} booked -> ${prog['usd_after']:.2f}")
         return changed
 
     def _output_models(self, r: dict) -> dict:

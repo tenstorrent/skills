@@ -1930,6 +1930,104 @@ def test_claude_runs_are_re_booked_once_at_their_per_call_cost(env, tmp_path):
     assert ledger() == 9.9
 
 
+def test_a_running_runs_session_log_is_read_from_where_the_last_pass_ended(tmp_path):
+    """Metering a run still going reads each session log once, then only the bytes added since (a line still
+    being written waits for the next pass); a log that shrank or was replaced is read again from its start."""
+    from ttp.providers import claude
+    log = tmp_path / "S.jsonl"
+    line = lambda mid, out: (json.dumps({"type": "assistant", "message": {"id": mid, "model": "claude-opus-5-5",
+                                                                         "usage": {"output_tokens": out}}}) + "\n")
+    old = "".join(line(f"old{i}", 9) for i in range(200))   # the session's earlier calls
+    log.write_text(old + line("m1", 7))
+    tail = claude.LogTail()
+    assert tail.usage([log], {"m1"}) == {"m1": {"output_tokens": 7}}
+    assert tail.read_bytes == log.stat().st_size
+    added = line("m1", 500) + line("m2", 40)
+    with log.open("a") as f:
+        f.write(added + line("m3", 1)[:20])   # m3 still being written
+    assert tail.usage([log], {"m1", "m2"}) == {"m1": {"output_tokens": 500}, "m2": {"output_tokens": 40}}
+    assert tail.read_bytes == len(old) + len(line("m1", 7)) + len(added), "a second pass re-read the log"
+    assert tail.usage([log], {"m1", "m2"}) == {"m1": {"output_tokens": 500}, "m2": {"output_tokens": 40}}
+    assert tail.read_bytes == len(old) + len(line("m1", 7)) + len(added), "a pass with nothing new read bytes"
+    log.write_text(line("m1", 600))   # shrank: read again from its start
+    assert tail.usage([log], {"m1"}) == {"m1": {"output_tokens": 600}}
+    new = tmp_path / "new.jsonl"
+    new.write_text(old + old + line("m1", 700))
+    new.replace(log)   # replaced by a longer file (another inode)
+    assert tail.usage([log], {"m1"}) == {"m1": {"output_tokens": 700}}
+
+
+def test_a_lost_or_failed_fork_or_resume_books_nothing_whatever_its_result_reports(env):
+    """A forked or resumed run that started (init) but made no call books $0 at its end, even when its result
+    carries the parent session's running total and its tokens; a fresh run that made calls and then failed
+    books those calls."""
+    p = make(env)
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    carried = {"input_tokens": 900, "output_tokens": 50_000, "cache_read_input_tokens": 10 ** 6,
+               "cache_creation_input_tokens": 0}
+    fork = _pc_run(p, "G", 38.26, {"coord_context": {"how": "fork"}}, [], task=None, role="worker",
+                   result_usage=carried)
+    resume = _pc_run(p, "R", 12.0, {"turn": {"session": {"mode": "resume", "why": "continued"}}}, [],
+                     result_usage=carried)
+    failed = _pc_run(p, "N", 5.0, {}, [_pc_call("n", output_tokens=100_000)], role="worker")
+    for r in (fork, resume, failed):
+        out = p.runs / str(r["id"]) / "output.jsonl"
+        events = [json.loads(x) for x in out.read_text().splitlines()]
+        events[-1].update(subtype="error_during_execution", is_error=True)
+        out.write_text("".join(json.dumps(e) + "\n" for e in events))
+    assert (_cs_finish(p, d, fork), _cs_finish(p, d, resume), _cs_finish(p, d, failed)) == (0.0, 0.0, 2.0)
+
+
+def test_the_per_call_re_book_of_a_large_backlog_runs_in_slices_with_the_totals_of_one_pass(env, tmp_path):
+    """The one-time re-book runs as a tick step in bounded slices: each stops after its run cap, keeps its place,
+    and the slice that ends sets the done marker; the runs, their costs and the ledger end as one pass leaves
+    them, and runs ending meanwhile are not part of it."""
+    import shutil
+    from ttp.daemon import CALLS_REBOOK_KEY, CALLS_REBOOK_PROGRESS_KEY, Daemon
+    results = []
+    for sliced in (False, True):
+        p = make(env) if not sliced else p
+        if sliced:   # the same backlog again: reset what the one pass wrote
+            shutil.rmtree(p.runs)
+            p.db.x("DELETE FROM runs")
+            p.db.x("DELETE FROM ledger")
+            p.db.x("DELETE FROM kv WHERE key IN (?,?)", (CALLS_REBOOK_KEY, CALLS_REBOOK_PROGRESS_KEY))
+        d = Daemon(p.base)
+        rows = []
+        for i in range(30):
+            r = _pc_run(p, f"S{i:02d}", 3.0, {"turn": {"session": {"mode": "resume", "why": "continued"}}},
+                        [_pc_call(f"m{i}", output_tokens=1000 * (i + 1))])
+            p.db.x("UPDATE runs SET cost_usd=3.0, status='ok' WHERE id=?", (r["id"],))
+            p.db.spend("claude", 3.0, "x", ts=r["ended"])
+            rows.append(r)
+        if not sliced:
+            changed = d.rebook_per_call()
+            slices = 1
+        else:
+            changed, slices = d.rebook_per_call(max_runs=4), 1
+            assert len(changed) == 4 and p.db.kv(CALLS_REBOOK_KEY) is None
+            assert p.db.kv(CALLS_REBOOK_PROGRESS_KEY)["cursor"] == "S03"
+            late = _pc_run(p, "Z", 3.0, {}, [_pc_call("z", output_tokens=1000)])   # ends meanwhile
+            p.db.x("UPDATE runs SET cost_usd=3.0, status='ok' WHERE id=?", (late["id"],))
+            while True:
+                got = d.rebook_per_call(max_runs=4)
+                if got is None:
+                    break
+                changed, slices = changed + got, slices + 1
+                assert slices < 20
+            assert p.db.one("SELECT cost_usd FROM runs WHERE id=?", (late["id"],))["cost_usd"] == 3.0
+            assert p.db.kv(CALLS_REBOOK_PROGRESS_KEY) is None
+        done = p.db.kv(CALLS_REBOOK_KEY)
+        cost = [round(p.db.one("SELECT cost_usd FROM runs WHERE id=?", (r["id"],))["cost_usd"], 6) for r in rows]
+        ledger = round(p.db.one("SELECT SUM(usd) s FROM ledger")["s"], 6)
+        results.append((sorted(changed), cost, ledger, done["runs"], round(done["usd_after"], 6), slices))
+    whole, sliced = results
+    assert whole[5] == 1 and sliced[5] == 8 and d.rebook_per_call() is None
+    assert [x[1:] for x in whole[0]] == [x[1:] for x in sliced[0]] and whole[1:5] == sliced[1:5]
+    assert whole[3] == 30 and whole[1][0] == 0.02
+
+
 def test_coordsession_wakes_booked_at_the_running_total_are_re_netted_once(env):
     p = make(env)
     p.set_config("budget.estimate_usd_per_mtok", 1.0)
