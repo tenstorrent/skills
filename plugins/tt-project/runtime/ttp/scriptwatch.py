@@ -61,6 +61,14 @@ def _is_script(path: Path) -> bool:
         return False
 
 
+def _is_file(p: Path) -> bool:
+    """Whether `p` is a file; a word too long for a file name (a pytest `-k` expression) is none, never an error."""
+    try:
+        return p.is_file()
+    except OSError:
+        return False
+
+
 def scripts(cmd: str, cwd: str | Path, env: dict | None = None) -> list[Path]:
     """The script files `cmd` (run in `cwd`) names, and the scripts beside them that they name, recursively."""
     path_var = (env if env is not None else os.environ).get("PATH")
@@ -70,7 +78,7 @@ def scripts(cmd: str, cwd: str | Path, env: dict | None = None) -> list[Path]:
             continue
         p = Path(os.path.expanduser(w))
         p = p if p.is_absolute() else Path(cwd) / p
-        if "/" in w or p.is_file():   # `bash check.sh` reads check.sh from cwd
+        if "/" in w or _is_file(p):   # `bash check.sh` reads check.sh from cwd
             named.append(p)
         elif found := shutil.which(w, path=path_var):
             named.append(Path(found))

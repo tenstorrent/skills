@@ -365,3 +365,13 @@ def test_script_writes_rename_a_new_file_into_place_keep_the_mode_and_leave_no_p
     cli._copy_tree(src, f.parent)
     assert f.stat().st_ino != ino and f.read_text() == "#!/bin/sh\necho installed\n"
     assert stat.S_IMODE(f.stat().st_mode) == 0o755 and [x.name for x in f.parent.iterdir()] == ["check"]
+
+
+def test_scriptwatch_ignores_a_word_too_long_for_a_file_name(tmp_path):
+    """A pytest `-k` expression over 255 characters is not a script: watching it must not raise (it made
+    `ttp checks` die on macOS before any check ran)."""
+    from ttp import scriptwatch
+    expr = " and ".join(f"not test_{i}_" + "x" * 40 for i in range(8))
+    assert len(expr) > 255 and "/" not in expr
+    assert scriptwatch.scripts(f"pytest -q -k '{expr}' tests/a.py", tmp_path) == []
+    assert scriptwatch.watch(f"pytest -q -k '{expr}' tests/a.py", tmp_path) == {}
