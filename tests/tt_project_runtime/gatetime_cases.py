@@ -235,6 +235,71 @@ def test_post_land_check_on_a_busy_test_lock_backs_off_and_still_checks_the_land
     assert not p.db.q("SELECT id FROM events WHERE kind='observation'"), "a busy lock raises nothing"
 
 
+def _pl_stub(monkeypatch, plan):
+    """spawn() stub: each call takes the next of `plan`: 'busy' writes a busy result for that attempt's own
+    file; 'running' writes nothing and reports this (live) process as the driver. Returns the spawned paths."""
+    import json as _json
+    import os as _os
+    from ttp import postland
+    spawned = []
+
+    def stub(p_, job):
+        spawned.append(job)
+        if plan.pop(0) == "busy":
+            job.with_suffix(".result.json").write_text(_json.dumps({"outcome": "busy", "why": "lock"}))
+        return _os.getpid()
+    monkeypatch.setattr(postland, "spawn", stub)
+    return spawned
+
+
+def test_post_land_busy_retry_never_reads_an_earlier_attempts_result_and_ends_unattributed_once(
+        env, tmp_path, monkeypatch):
+    import json as _json
+    from ttp import postland
+    p, g, pushed, _ = _pl_land(env, tmp_path, monkeypatch, _PL_PASS)
+    plan = ["busy", "running"]
+    spawned = _pl_stub(monkeypatch, plan)
+    for _ in range(3):   # the first busy result reruns the landing (within a pass or two)
+        postland.tend(p, p.config())
+        if len(spawned) == 2:
+            break
+    assert len(spawned) == 2 and spawned[0] != spawned[1], "each attempt has its own job file"
+    for _ in range(3):   # the new driver still runs: the earlier attempt's busy result is never read again
+        assert postland.tend(p, p.config()) == ""
+    assert p.db.kv(postland.KEY)["busy"] == 1 and len(spawned) == 2, "no second driver while one is alive"
+    spawned[1].with_suffix(".result.json").write_text(_json.dumps({"outcome": "busy", "why": "lock"}))
+    plan.append("busy")
+    assert "busy, retried" in postland.tend(p, p.config()) and p.db.kv(postland.KEY)["busy"] == 2
+    out = postland.tend(p, p.config())
+    st = p.db.kv(postland.KEY)
+    assert st["last"]["outcome"] == "unattributed" and st["job"] is None and st["busy"] == 0, (out, st)
+    assert len(p.db.q("SELECT id FROM events WHERE text LIKE '%busy for 3 passes%'")) == 1
+    assert postland.tend(p, p.config()) == "" and len(spawned) == 3, "applied once; the landing is settled"
+    assert len(p.db.q("SELECT id FROM events WHERE text LIKE '%busy for 3 passes%'")) == 1
+
+
+def test_post_land_busy_retry_on_the_first_run_keeps_that_landings_range(env, tmp_path, monkeypatch):
+    import json as _json
+    from ttp import postland
+    p, g, pushed, entries = _pl_land(env, tmp_path, monkeypatch, _PL_PASS)
+    now, root = time.time(), g("rev-list", "--max-parents=0", "HEAD")
+    for i, ago in enumerate((600, 300)):   # two earlier landings, before post_land_checks ran at all
+        p.db.x("INSERT INTO push_batches(id,marker,target,started,ended,outcome,pushed_sha,tip,finalized) "
+               "VALUES(?,?,?,?,?,?,?,?,?)", (f"b0{i}", "m", "up/main", now - ago - 10, now - ago, "pushed",
+                                             p._pl_tip if i else root, root if i else "", now - ago))
+    spawned = _pl_stub(monkeypatch, ["busy", "running"])
+    postland.tend(p, p.config())
+    first = _json.loads(spawned[0].read_text())
+    assert first["good"] == p._pl_tip and first["sha"] == pushed
+    for _ in range(2):
+        postland.tend(p, p.config())
+        if len(spawned) == 2:
+            break
+    again = _json.loads(spawned[1].read_text())
+    assert again["good"] == p._pl_tip and again["sha"] == pushed, "the retry keeps only this landing's range"
+    assert [x["sha"] for x in again["points"]] == [x["sha"] for x in first["points"]] == [*entries, pushed]
+
+
 def test_post_land_failure_that_passes_on_rerun_is_flaky_quarantined_and_never_reverted(env, tmp_path, monkeypatch):
     from ttp import gatejudge, postland
     n = tmp_path / "count"

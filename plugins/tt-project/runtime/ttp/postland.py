@@ -70,9 +70,10 @@ def tend(p: Project, cfg: dict, now: float | None = None) -> str:
         else:
             got = {"outcome": "error", "why": "the driver ended without a result (a reboot, a kill or a crash)"}
         busy = int(st.get("busy") or 0) + 1 if got.get("outcome") == "busy" else 0
-        if busy and busy < BUSY_PASSES:   # the test lock admitted nothing: the next pass checks this landing again
-            db.set_kv(KEY, {**st, "job": None, "busy": busy})
-            return f"post-landing checks on {job['sha'][:10]}: busy, retried next pass"
+        if busy and busy < BUSY_PASSES:   # the test lock admitted nothing: rerun this very job (same range)
+            again = retry(p, job, busy)
+            db.set_kv(KEY, {**st, "job": again, "busy": busy})
+            return f"post-landing checks on {job['sha'][:10]}: busy, retried"
         if busy:
             got = {"outcome": "unattributed", "why": f"the test lock stayed busy for {busy} passes"}
         db.set_kv(KEY, {**st, "job": None, "busy": 0, "since": job["ended"], "last": {**got, "sha": job["sha"]}})
@@ -100,12 +101,23 @@ def tend(p: Project, cfg: dict, now: float | None = None) -> str:
     folder = p.state / FOLDER
     folder.mkdir(parents=True, exist_ok=True)
     path = folder / f"{batches[-1]['id']}.json"
-    job = {"path": str(path), "sha": batches[-1]["pushed_sha"], "good": batches[0]["tip"] or "", "points": points,
+    job = {"path": str(path), "batch": batches[-1]["id"], "sha": batches[-1]["pushed_sha"], "good": batches[0]["tip"] or "", "points": points,
            "target": batches[-1]["target"], "ended": batches[-1]["ended"], "repo": str(p.root)}
     durable_write(path, json.dumps(job))
     job["pid"] = spawn(p, path)
     db.set_kv(KEY, {**st, "job": job, "since": st.get("since", 0)})
     return f"post-landing checks started on {job['sha'][:10]}"
+
+
+def retry(p: Project, job: dict, attempt: int) -> dict:
+    """The same job (its sha, range and points) again under its own attempt's file, so its result, log and
+    driver never meet an earlier attempt's: the result the next pass reads is this attempt's own."""
+    base = Path(job["path"])
+    path = base.parent / f"{job.get('batch') or base.stem.split('.')[0]}.{attempt}.json"
+    again = {k: v for k, v in job.items() if k != "pid"} | {"path": str(path)}
+    durable_write(path, json.dumps(again))
+    again["pid"] = spawn(p, path)
+    return again
 
 
 def _alive(pid) -> bool:
