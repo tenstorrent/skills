@@ -25,7 +25,11 @@ def test_smoke_list_names_existing_tests_and_covers_each_area():
     assert not missing, f"tests/tt_project_smoke.txt names tests that no longer exist: {missing[:10]}"
     # each area's case file, the plugin manifests and catalogue, and the leak scan are in the smoke suite
     smoked = by_file["tests/test_tt_project_runtime.py"]
-    bare = [c.stem for c in sorted(_CASES.glob("*_cases.py")) if not defined(c) & smoked and defined(c) & here]
+    # checkreap_cases reads other processes' environments (/proc), which macOS lacks: every test in it fails
+    # on the Mac gate even on the base, so it runs after landing (delivery.post_land_checks) instead.
+    mac_exempt = {"checkreap_cases"}
+    bare = [c.stem for c in sorted(_CASES.glob("*_cases.py"))
+            if c.stem not in mac_exempt and not defined(c) & smoked and defined(c) & here]
     assert not bare, (f"case files with no test in the smoke list: {bare}; add at least one fast test "
                       "of each to tests/tt_project_smoke.txt")
     assert {"test_no_local_leak_patterns_in_plugin"} <= by_file["tests/test_tt_project_plugin.py"]

@@ -3,7 +3,7 @@
 # after landing (delivery.post_land_checks: `pytest -m "not tt_smoke"`).
 # One test per line (file::name, all its parametrizations); a renamed or removed test fails
 # test_smoke_list_names_existing_tests_and_covers_each_area. Each case file keeps at least one test here.
-# Left out (they fail on the base branch on the Mac too; they run after landing): test_the_sweep_leaves_a_running_sandbox_alone, test_kill_guard_allows_a_group_its_tasks_earlier_run_detached_and_nothing_forged, test_the_dry_run_can_be_switched_off.
+# Left out (they fail on the base branch on the Mac too; they run after landing): test_the_sweep_leaves_a_running_sandbox_alone, test_kill_guard_allows_a_group_its_tasks_earlier_run_detached_and_nothing_forged, test_the_dry_run_can_be_switched_off. All of checkreap_cases fails on the Mac (needs /proc), so it has no entry here.
 tests/test_plugin_catalogue.py::test_codex_manifests_have_complete_install_surfaces
 tests/test_plugin_catalogue.py::test_each_plugin_has_matching_host_manifests
 tests/test_plugin_catalogue.py::test_finder_catalogues_every_optional_plugin
@@ -305,3 +305,5 @@ tests/test_tt_project_runtime.py::test_user_site_guard_refuses_installs_outside_
 tests/test_tt_project_runtime.py::test_wakegap_user_messages_and_urgent_events_wake_at_once
 tests/test_tt_project_runtime.py::test_worker_loss_alone_with_clean_exits_is_infra_and_nothing_else_is
 tests/test_tt_project_runtime.py::test_workers_gh_never_requests_human_reviewers_over_any_api_route
+tests/test_tt_project_runtime.py::test_kill_guard_skips_redirection_fd_numbers
+tests/test_tt_project_runtime.py::test_the_dry_run_check_reads_programs_scripts_and_variables_without_running_them

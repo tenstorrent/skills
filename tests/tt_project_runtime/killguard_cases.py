@@ -24,11 +24,11 @@ def kill_tree(tmp_path, monkeypatch):
         orphans.append(int(out.stdout))
         return orphans[-1]
     t = SimpleNamespace(run_dir=run_dir, child=procs[0].pid, group=procs[1].pid,
-                        outside=orphan({}), outside_group=orphan({}, "setsid sleep 60"),
+                        outside=orphan({}), outside_group=orphan({}, "python3 -c \"import os; os.setsid(); os.execvp('sleep', ['sleep', '60'])\""),
                         by_env=orphan({"TTP_RUN_DIR": str(run_dir)}))
     (run_dir / "job.pid").write_text(f"{t.child}\n")
     (run_dir / "other.pid").write_text(f"{t.outside}\n")
-    deadline = time.time() + 10   # setsid execs in the orphan: wait until it leads its own group
+    deadline = time.time() + 10   # the orphan's setsid runs in it: wait until it leads its own group
     while os.getpgid(t.outside_group) != t.outside_group and time.time() < deadline:
         time.sleep(0.01)
     yield t
