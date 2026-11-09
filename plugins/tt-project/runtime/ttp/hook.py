@@ -1108,6 +1108,10 @@ def pre_tool_use(payload: dict) -> tuple[dict | None, None]:
         from . import credguard
         why = credguard.tool_refusal(str(payload["tool_name"]), payload.get("tool_input") or {},
                                      str(payload.get("cwd") or os.getcwd()))
+        if not why:   # a run reading untrusted input: a credential file outside its worktree
+            from . import untrusted
+            why = untrusted.tool_refusal(str(payload["tool_name"]), payload.get("tool_input") or {},
+                                         str(payload.get("cwd") or os.getcwd()))
         why = why or local_guard(payload)
         return (_deny(why) if why else None), None
     if str(payload.get("tool_name") or "").startswith("mcp__"):   # a connector post to others (aitag)
@@ -1143,6 +1147,10 @@ def pre_tool_use(payload: dict) -> tuple[dict | None, None]:
     if not why:
         from . import credguard
         why = credguard.bash_refusal(cmd, _all_segments(commands))
+    if not why:   # a run reading untrusted input: no foreign push, write or credential read
+        from . import untrusted
+        why = untrusted.bash_refusal(_all_segments(commands), _segments(commands, strip=False),
+                                     str(payload.get("cwd") or os.getcwd()))
     if not why:
         why = git_push_bypass(segments)
     if not why:
@@ -1589,7 +1597,7 @@ def too_many_workers(cmd: str) -> str | None:
         return (f"pytest -n {max(big)} is above this run's test-worker budget of {k} on this shared host. "
                 f"Use -n {k} or fewer (or `-n auto`) through {how}")
     if not os.environ.get(testslots.HELD_ENV) and (bare := testslots.unpooled(cmd)):
-        return (f"pytest -n {max(bare)} outside `ttp clip` or `ttp sandbox` holds none of this shared host's "
+        return (f"pytest -n {bare[0]} outside `ttp clip` or `ttp sandbox` holds none of this shared host's "
                 f"test slots. Run it as {how}, or with no -n")
     return None
 

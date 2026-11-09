@@ -1441,13 +1441,17 @@ def test_a_pytest_n_above_the_budget_is_lowered_with_a_line_saying_so_and_refuse
 
 
 @pytest.mark.parametrize("cmd", ["pytest -n 4 tests/a.py", "cd x && python3 -m pytest -n4 tests",
-                                 "ttp detach t -- pytest --numprocesses=3 tests", "ttp clip -- true; pytest -n 2 t"])
+                                 "ttp detach t -- pytest --numprocesses=3 tests", "ttp clip -- true; pytest -n 2 t",
+                                 "pytest -n $TTP_TEST_SLOTS tests", 'pytest -n "${TTP_TEST_SLOTS}" t',
+                                 "python3 -m pytest -n$(nproc) t", "pytest --numprocesses=$N t",
+                                 "ttp clip -- true; pytest -n `nproc` t"])
 def test_a_workers_pytest_n_outside_clip_or_sandbox_is_refused_as_it_holds_no_host_test_slots(env, monkeypatch, cmd):
     from ttp import hook, testslots
     monkeypatch.setenv("TTP_TEST_SLOTS", "4")
     assert "holds none of this shared host's test slots" in (hook.too_many_workers(cmd) or "")
     for ok in ("pytest tests/a.py", "pytest -n 1 tests", "pytest -n 0 t", "ttp sandbox -- pytest -n 4 t",
-               "ttp clip -- pytest -n 4 t", "ttp detach t -- ttp clip -- pytest -n 4 t"):
+               "ttp clip -- pytest -n 4 t", "ttp detach t -- ttp clip -- pytest -n 4 t",
+               "ttp clip -- ttp sandbox -- pytest -n $TTP_TEST_SLOTS t", "head -n $N f", "nice -n $N pytest t"):
         assert hook.too_many_workers(ok) is None, ok
     monkeypatch.setenv(testslots.HELD_ENV, "4")
     assert hook.too_many_workers(cmd) is None, "inside a run that holds slots (a check) it runs on them"

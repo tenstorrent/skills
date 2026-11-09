@@ -2013,12 +2013,30 @@ def over(cmd: str, k: int) -> list[int]:
     return [n for *_, n in _edits(cmd, k, False)]
 
 
-def unpooled(cmd: str) -> list[int]:
-    """The explicit pytest `-n N` values above 1 in `cmd` whose command no `ttp clip` or `ttp sandbox`
+def _shell_counts(cmd: str) -> list[tuple[int, str]]:
+    """(start, value) for each pytest `-n` / `--numprocesses` in `cmd` whose value the shell fills in
+    ($VAR, ${VAR}, $(...), `...`): its count is unknown before it runs, so it may be above 1."""
+    out = []
+    for seg in _segments(cmd):
+        words = [w for _, _, w in seg]
+        tool = next((i for i, w in enumerate(words) if _is_tool(words, i, False)), None)
+        for i in range(tool + 1, len(seg)) if tool is not None else ():
+            if not (m := re.fullmatch(r"(-n|--numprocesses)(=?)(.*)", words[i])):
+                continue
+            value = m.group(3) or (words[i + 1] if not m.group(2) and i + 1 < len(words) else "")
+            if _shell_value(value):
+                out.append((seg[i][0], value))
+    return out
+
+
+def unpooled(cmd: str) -> list[str]:
+    """The pytest `-n` values in `cmd` that may start more than one worker (an explicit N above 1, or a
+    value the shell fills in such as `-n $TTP_TEST_SLOTS`) whose command no `ttp clip` or `ttp sandbox`
     wraps, so no host test slots are taken for them (direct)."""
     wrapped = [(seg[0][0], seg[-1][1]) for seg in _segments(cmd)
                if any(_base(a) == "ttp" and b in ("clip", "sandbox") for (*_, a), (*_, b) in zip(seg, seg[1:]))]
-    return [n for start, *_, n in _edits(cmd, 1, False) if not any(lo <= start <= hi for lo, hi in wrapped)]
+    found = [(start, str(n)) for start, *_, n in _edits(cmd, 1, False)] + _shell_counts(cmd)
+    return [v for start, v in sorted(found) if not any(lo <= start <= hi for lo, hi in wrapped)]
 
 
 def clamp(cmd: str, k: int) -> str:
