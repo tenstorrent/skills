@@ -15347,7 +15347,7 @@ class Daemon:
                 fp = False
             if fp:
                 return "unclear", ("the checks were a fast-path pass (docs/data-only diff; the project's checks did "
-                                   "not run); run `ttp checks --full`")
+                                   "not run); run `ttp checks --fresh`")
             return "unclear", ("the checked commit is no longer the head of its worktree and branch, or it is not clean, "
                                "or its checks were a harness qualification (`ttp checks --purpose harness`)")
         return "pass", r, run_dir, with_waiting_followups(on_pass, full), head

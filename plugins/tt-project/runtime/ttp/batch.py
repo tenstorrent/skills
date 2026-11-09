@@ -1493,6 +1493,7 @@ class Batch:
         self.held: dict[int, dict] = {}        # entry index -> the token scope a refused push needs for it
         self.scopes: list[dict] = []           # those refusals: scope, files, entry ids, check (scopehold)
         self.retried = False                   # this round checked the entries after a blamed one (_rescue)
+        self.early = False                     # a prefix passed and pushes; the later entries ride the next train (_lands)
         self.rescues = 0                       # such checks in the batch: at most RESCUES
         self.reran: dict[str, set[str]] = {"head": set(), "tip": set()}   # failing test ids rerun there (_run_ids)
         self.judged: dict[tuple[str, str], bool] = {}   # (head, failing test id) -> new on that head (_judged)
@@ -1507,7 +1508,6 @@ class Batch:
         self.checks_at: float | None = None    # when this batch's first check began (_check): the yield grace counts from it
         self.waited: list[int] = []            # urgent approvals that wait for this search's verdict (_yield_now)
         self.full_fail: tuple[str, str] | None = None  # the full head's failure (_judge): a stop carries it (_known_fail)
-        self.known_failed = False              # the full head's failure came from a stopped search, not checked here
 
     # results
 
@@ -1669,7 +1669,7 @@ class Batch:
         self.tip_passed = False
         self.tip_tried = 0
         self.researched = 0
-        self.rescued, self.retried = {}, False
+        self.rescued, self.retried, self.early = {}, False, False
         carried = self._replay(tip, checks)
         if not carried:
             return self._close(0, "nothing")
@@ -1779,8 +1779,9 @@ class Batch:
             elif self.yielded_to:
                 self._set(i, "requeued", yielded=True, restarts=self._restarts() + 1,   # stopped for an urgent approval
                           **self._fail_carried(carried, k, failed))
-            elif failed and not self.retried:
-                self._set(i, "requeued", untested=True)    # after the blamed entry, never checked without it
+            elif (failed or self.early) and not self.retried:
+                # after the blamed entry, never checked without it, or after a prefix that passed (_lands)
+                self._set(i, "requeued", untested=True)
             else:
                 self._set(i, "requeued")
         for i, st in list(self.status.items()):
@@ -2743,16 +2744,16 @@ class Batch:
         """Check the full head; when it fails, find the first failing entry by a binary search over
         prefixes (each prefix: entries 1..k plus a bump), checking the tip alone only when prefix 1
         fails. Returns (entries to push, head to push or None, (cmd, tail) of the blamed entry's
-        failure or None). When every prefix passes and the full head passes on a rerun, the failure
-        was flaky: the full head goes. A failing check none of whose failing pytest ids is new at its head
+        failure or None). The first prefix that passes every check in full pushes at once (_lands, user
+        msg #2317): the later entries go untested and unblamed to the next train, and no entry joins or
+        rejoins a head that passed, so a search blames only entry 1 of the entries it searches. A failing check none of whose failing pytest ids is new at its head
         (gatejudge: flaky, pre-existing on the tip or quarantined) passes there (_judged). When the full
         head's failure names new ids, the search probes each prefix with only those ids (_ids_check) and
-        checks the highest prefix they pass on in full once; a full failure there searches below it in
-        full. Before an entry is blamed, its failing ids are rerun on the tip alone up to TIP_RERUNS
+        checks the highest prefix they pass on in full once: it pushes when it passes, else the search
+        goes below it in full. Before an entry is blamed, its failing ids are rerun on the tip alone up to TIP_RERUNS
         times unless the tip's result is saved already (_tip_ids). For entry 1: failing there once, the tip
         is broken (tip_failed); passing every time, entry 1 is blamed; only when that cannot tell is the
-        tip checked alone in full. For a later entry: failing there once, the failure is pre-existing
-        (_pre_existing): the prefix that passed goes and nothing is blamed; else it is blamed as before.
+        tip checked alone in full.
         Each test the tip fails on its own (its rerun, its check alone, or a judge's base run that failed
         it another way) is pre-existing in the whole batch (_tip_excused), except the leak scan (_hard):
         when the search reaches the tip failing on its own and such tests were added, it runs again with
@@ -2760,8 +2761,8 @@ class Batch:
 
         A tip the queue knows fails on its own (the marker's "bad_tip", pushq._known_bad) is never
         checked alone again: no prefix passes unless it fixes the tip. The prefix of entries not yet
-        tried on that tip ("fresh") is checked first; when it passes, it fixed the tip and the search
-        runs above it, else inside it, as a fix may come before an entry that breaks the checks. A
+        tried on that tip ("fresh") is checked first; when it passes, it fixed the tip and pushes, else
+        the search runs inside it, as a fix may come before an entry that breaks the checks. A
         search that ends at prefix 1 failing shows only that entry 1 does not fix the tip: the batch
         ends tip_failed and names the entries up to it ("tip_tried"), so the later ones stay untried
         and go first in the next batch. A batch with none untried ends at once and names none.
@@ -2800,7 +2801,7 @@ class Batch:
         elif not bad and (kf := self._known_fail(carried)):
             say(f"the full head of these {m} entries failed {kf[0]} in a search stopped for an urgent approval: "
                 "the search resumes without checking it again")
-            self.known_failed, self.full_fail, fails = True, kf, {m: kf}
+            self.full_fail, fails = kf, {m: kf}
         else:
             fail = self._check(heads[m], checks)
             if fail is None:
@@ -2808,12 +2809,11 @@ class Batch:
             self.full_fail, fails = fail, {m: fail}
         # A failure whose new tests are known (_judged) is searched on those tests alone (_ids_check), then
         # the longest prefix that passed them is checked in full once; failing there, the search goes below.
-        full_lo = 0
         while not bad and hi - lo > 1 and (ids := self.new_ids.get(fails[hi][1])):
             top = hi
             while hi - lo > 1:
                 if self._yield_now((hi - lo - 1).bit_length() + 1):
-                    return full_lo, heads[full_lo] if full_lo else None, None
+                    return 0, None, None
                 mid = (lo + hi) // 2
                 heads[mid] = self._head(tip, carried, mid)
                 f = self._ids_check(heads[mid], fails[top], ids)
@@ -2823,16 +2823,15 @@ class Batch:
                     hi, fails[mid] = mid, f
                 else:
                     break
-            if hi - lo > 1 or lo == full_lo:
-                lo = full_lo          # a probe that cannot tell, or nothing new passed them: the full checks decide
+            if hi - lo > 1 or lo == 0:
+                lo = 0                # a probe that cannot tell, or nothing new passed them: the full checks decide
                 break
             if self._yield_now():
-                return full_lo, heads[full_lo] if full_lo else None, None
+                return 0, None, None
             say(f"checking the {lo} entr{'y' if lo == 1 else 'ies'} that passed the split probes in full")
             if (f := self._check(heads[lo], checks)) is None:
-                full_lo = lo
-                break
-            hi, fails[lo], lo = lo, f, full_lo
+                return self._lands(lo, heads, m)
+            hi, fails[lo], lo = lo, f, 0
         if bad and fails[m][0] != STALE:
             fresh = sum(1 for i, _ in carried if i < int(known.get("fresh") or 0))
             if not fresh:
@@ -2841,7 +2840,7 @@ class Batch:
                 say(f"checking the {fresh} entr{'y' if fresh == 1 else 'ies'} not yet tried on the failing tip {tip[:10]}")
                 heads[fresh] = self._head(tip, carried, fresh)
                 if (f := self._check(heads[fresh], checks)) is None:
-                    lo = fresh
+                    return self._lands(fresh, heads, m)
                 else:
                     hi, fails[fresh] = fresh, f
         while hi - lo > 1:
@@ -2851,9 +2850,8 @@ class Batch:
             heads[mid] = self._head(tip, carried, mid)
             f = self._check(heads[mid], checks)
             if f is None:
-                lo = mid
-            else:
-                hi, fails[mid] = mid, f
+                return self._lands(mid, heads, m)
+            hi, fails[mid] = mid, f
         if hi == 1 and fails[1][0] == STALE:
             return 0, None, fails[1]        # the version guard blames entry 1 without running anything
         if hi == 1:
@@ -2888,50 +2886,29 @@ class Batch:
                 return 0, None, None
             self.tip_passed = True
             return 0, None, fails[1]
-        # A failure with tests new on its head already failed twice there (_judged): no full rerun.
-        rerun = hi == m and fails[m][0] != STALE and fails[m][1] not in self.new_ids
-        if rerun and self._yield_now():
-            return lo, heads[lo] if lo else None, None
-        if rerun:
-            say(f"every prefix passed; checking {heads[m][:10]} again")
-            f = self._check(heads[m], checks)
-            if f is None and self.known_failed:
-                say("the full head passes on this tip: the stopped search's failure is gone")
-                return m, heads[m], None
-            if f is None:
-                self.checks["flaky"] = True
-                say("the full head passed on the rerun: the failure was flaky")
-                return m, heads[m], None
-            fails[m] = f
-        # A tip the queue knows fails is not rerun: the prefix that passed fixed it, the entry may break it again.
-        if not bad and fails[hi][0] not in (STALE, push.NONE_APPLY) \
-                and isinstance(tf := self._tip_ids(tip, fails[hi]), tuple):
-            return self._pre_existing(tip, carried, hi, tf), heads[hi - 1], None
+        # Unreached: a prefix that passed in full returned above (_lands), so the search ends at hi 1.
         return hi - 1, heads[hi - 1], fails[hi]
 
-    def _pre_existing(self, tip: str, carried: list, hi: int, tf: tuple[str, str]) -> int:
-        """Carried entry `hi` (not the first) failed a check whose failing tests fail on `tip` alone too
-        (_tip_ids): the failure is the tip's own, flaky or already failing. The entry is not blamed: the
-        prefix before it (which passed) goes, it and the later ones are requeued, and the failure is
-        recorded (the marker's pre_existing; the queue tells the coordinator once per test)."""
-        entry = self.entries[carried[hi - 1][0]].get("id")
-        ids = sharedchecks.failing_ids(tf[1])[0]
-        self.pre_existing.append({"ids": ids, "tip": tip, "cmd": tf[0], "entry": entry,
-                                  "runs": self.tip_runs, "of": TIP_RERUNS})
-        say(f"entry {entry} is not sent back: its failing tests fail on the tip {tip[:10]} alone too "
-            f"(pre-existing); the {hi - 1} entr{'y' if hi == 2 else 'ies'} before it go, it and the later ones are requeued")
-        return hi - 1
+    def _lands(self, k: int, heads: dict, m: int):
+        """A prefix of `k` of the `m` carried entries passed every push check in full: it pushes at once
+        (user msg #2317). The later entries are requeued untested and unblamed for the next train on the
+        new tip; no entry joins this head and it is not checked again."""
+        say(f"{heads[k][:10]} passed every push check: pushing its {k} entr{'y' if k == 1 else 'ies'} now; "
+            f"the other {m - k} go in the next train")
+        self.early = True
+        return k, heads[k], None
 
     def _rescue(self, tip: str, carried: list, k: int, checks: list[str]) -> str | None:
-        """After _judge blamed carried entry k+1: replay the later carried entries in order onto the
-        first k (the tip when k is 0) and check that head once, in this batch. An entry built on the
-        blamed one (it would replay its commits) or whose replay conflicts or adds nothing without it is
-        skipped and requeued; the others still go. Returns the head that pushes the first k entries and
+        """After _judge blamed carried entry 1 (k 0): replay the later carried entries in order onto the
+        tip and check that head once, in this batch. With k entries before the blamed one that passed
+        (k > 0), none: their head pushes at once and the later entries go to the next train, as no
+        entry joins a head that passed (user msg #2317). An entry built on the blamed one (it would
+        replay its commits) or whose replay conflicts or adds nothing without it is skipped and requeued; the others still go. Returns the head that pushes the first k entries and
         the replayed ones (self.rescued), or None (nothing after the blamed entry, none replays, or a
         failing check: those entries are requeued). A batch makes at most RESCUES such checks, whatever
         their outcome."""
         later = carried[k + 1:]
-        if not later or self.detail_tip is not None or self.rescues >= RESCUES:
+        if not later or k or self.detail_tip is not None or self.rescues >= RESCUES:
             return None
         h = carried[k - 1][1] if k else tip
         replayed: list[tuple[int, str]] = []
@@ -3036,7 +3013,7 @@ class Batch:
     def _known_fail(self, carried: list) -> tuple[str, str] | None:
         """The (cmd, tail) a stopped search saw the full head of exactly these entries (same queue ids and
         heads, same order) fail with (the marker's "known_fail"): this batch takes it as its own full head's
-        failure, so it never checks that head again unless every prefix passes (_judge's rerun). None for
+        failure, so it never checks that head again (a prefix that passes pushes at once). None for
         one entry (its blame needs a check on this tip) or any other set."""
         kf = self.m.get("known_fail")
         if not isinstance(kf, dict) or len(carried) < 2 or not kf.get("cmd"):

@@ -223,15 +223,15 @@ def test_setup_fault_escalation_off_raises_nothing(env, monkeypatch):
 
 
 def test_after_the_setup_fault_alert_the_batch_isolates_the_entry_whose_check_hits_one(env, monkeypatch, capsys):
-    """Entry 2's check always fails in setup (a dir outside the repository gone) while entries 1 and 3 are
+    """Entry 1's check always fails in setup (a dir outside the repository gone) while entries 2 and 3 are
     clean. Before the queue alerted on that check, the batch holds and requeues all three. Once it did
-    (the marker's setup_isolate), the setup fault is the head's failed check: the search isolates entry 2,
-    entries 1 and 3 push."""
+    (the marker's setup_isolate), the setup fault is the head's failed check: the search isolates entry 1,
+    entries 2 and 3 push."""
     from ttp import push, setupfault
     d = env["tmp"] / "setup"
     d.mkdir()
     argv, ran = _setup_check(d, [_head_gone(d)])
-    cmd = f"[ -e plugins/p/f2.txt ] || exit 0; {' '.join(argv)}"
+    cmd = f"[ -e plugins/p/f1.txt ] || exit 0; {' '.join(argv)}"
     p, repo, origin, other = _bump_setup(env, monkeypatch, [cmd])
     heads = [_entry(repo, f"e{n}", {f"plugins/p/f{n}.txt": f"{n}\n"}) for n in (1, 2, 3)]
     rc, m = _run_batch(p, _batch_marker(p, heads, bid="b1"), monkeypatch)
@@ -243,11 +243,11 @@ def test_after_the_setup_fault_alert_the_batch_isolates_the_entry_whose_check_hi
     capsys.readouterr()
     rc, m = _run_batch(p, marker, monkeypatch)
     assert rc == 0 and m["outcome"] == "pushed", m
-    assert _statuses(m) == ["pushed", "check_failed", "pushed"], m
-    failed = m["results"][1]
+    assert _statuses(m) == ["check_failed", "pushed", "pushed"], m
+    failed = m["results"][0]
     assert "its setup failed before any test ran" in str(failed), failed
     files = _git_out(origin, "ls-tree", "-r", "--name-only", "proj").split()
-    assert "plugins/p/f1.txt" in files and "plugins/p/f3.txt" in files and "plugins/p/f2.txt" not in files
+    assert "plugins/p/f2.txt" in files and "plugins/p/f3.txt" in files and "plugins/p/f1.txt" not in files
     assert "setup_fault" not in m["checks"], m["checks"]
     assert "isolates the entry that brings it" in capsys.readouterr().out
 

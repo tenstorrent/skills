@@ -46,7 +46,7 @@ A wrapped command that the wrapper's `ttp lock` refuses as paused (its stderr sa
 
 Opt-in, off by default: with no `delivery.checks_fast_globs`, every diff runs the full checks.
 A project that lists globs there gets it: a diff whose paths all match them (never code, tests, templates, skills: `delivery.checks_fast_exclude`) runs only the whitespace and CRLF checks; the pass is not a full pass and never counts for a PR or `on_pass`.
-`ttp checks --full` runs everything, also when queued or relaunched; a recorded full pass is reused.
+`ttp checks --fresh` skips the fast path; `--full` runs everything (refused for a task's run with the push queue on; `--release` always runs in full), also when queued or relaunched; a recorded full pass is reused.
 Known gap: the project owns its globs; one covering installed or test-asserted content (such as a plugin README that tests read) skips the checks those changes need.
 
 ## Pre-stage before detached checks

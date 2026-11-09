@@ -19498,25 +19498,29 @@ def test_a_push_batch_takes_both_changes_of_adjacent_lines_and_sends_back_only_a
 def test_a_push_batch_sends_back_an_entry_whose_merged_changes_fail_the_checks(env, monkeypatch):
     """The checks fail only on the result of taking both sides' changes of different lines: the entry
     whose replay merged them goes back as a conflict (the merge may be the cause), not check_failed,
-    and counts as sent back, not as resolved."""
+    and counts as sent back, not as resolved. Entry 1 passed alone: it pushes at once and entry 2 goes
+    to the next train (user msg #2317), where it is judged on its own."""
     p, repo, origin, other = _push_setup(env, monkeypatch, ["! grep -q A1 notes.txt || ! grep -q B2 notes.txt"])
     _commit(other, "notes.txt", "a\nb\nc\n")
     _git_out(other, "push", "-q", "origin", "HEAD:proj")
     heads = [_entry(repo, "e1", {"notes.txt": "A1\nb\nc\n"}), _entry(repo, "e2", {"notes.txt": "a\nB2\nc\n"})]
     rc, m = _run_batch(p, _batch_marker(p, heads), monkeypatch)
-    assert m["outcome"] == "pushed" and _statuses(m) == ["pushed", "conflict"], m
-    d = m["results"][1]["detail"]
+    assert m["outcome"] == "pushed" and _statuses(m) == ["pushed", "requeued"], m
+    rc, m = _run_batch(p, _batch_marker(p, heads[1:], bid="b2"), monkeypatch)
+    assert _statuses(m) == ["conflict"], m
+    d = m["results"][0]["detail"]
     assert d["files"] == ["notes.txt"] and d["settled_by"] == ["hunks"] and d["cmd"].startswith("! grep"), d
     assert _git_out(origin, "show", "proj:notes.txt") == "A1\nb\nc"
-    assert m["conflicts"] == {"entries": 2, "conflicted": 1, "auto_resolved": 0, "by_hunks": 0, "sent_back": 1}
+    assert m["conflicts"] == {"entries": 1, "conflicted": 1, "auto_resolved": 0, "by_hunks": 0, "sent_back": 1}
 
 
 @pytest.mark.parametrize("passes", [True, False])
 def test_a_push_batch_keeps_parallel_test_additions_only_when_the_checks_pass(env, monkeypatch, passes):
     """Two changes each append a new test function at the end of one test file: a conflict to git
     that the batch settles without a model by keeping both. With checks that pass on the result both
-    land; when the checks fail only on the merged file, the second entry goes back as a conflict (for
-    a rebase), not check_failed, and the first lands alone."""
+    land; when the checks fail only on the merged file, the first lands alone at once and the second
+    goes to the next train (user msg #2317), where it goes back as a conflict (for a rebase), not
+    check_failed."""
     check = "true" if passes else "! (grep -q test_one test_x.py && grep -q test_two test_x.py)"
     p, repo, origin, other = _push_setup(env, monkeypatch, [check])
     _commit(other, "test_x.py", "def test_base():\n    assert True\n")
@@ -19531,8 +19535,10 @@ def test_a_push_batch_keeps_parallel_test_additions_only_when_the_checks_pass(en
         assert m["results"][1]["detail"] == {"settled": ["test_x.py"], "settled_by": ["added"]}
         assert "def test_one" in landed and "def test_two" in landed
     else:
-        assert _statuses(m) == ["pushed", "conflict"], m
-        d = m["results"][1]["detail"]
+        assert _statuses(m) == ["pushed", "requeued"], m
+        rc, m = _run_batch(p, _batch_marker(p, heads[1:], bid="b2"), monkeypatch)
+        assert _statuses(m) == ["conflict"], m
+        d = m["results"][0]["detail"]
         assert d["files"] == ["test_x.py"] and d["settled_by"] == ["added"] and d["cmd"] == check, d
         assert "def test_one" in landed and "def test_two" not in landed
         assert m["conflicts"]["sent_back"] == 1 and m["conflicts"]["auto_resolved"] == 0
@@ -19586,20 +19592,25 @@ def _reused(capsys, cmd):
 
 @pytest.mark.parametrize("bad", [1, 3, 4])
 def test_a_push_batch_blames_the_first_failing_entry_and_pushes_the_ones_before_it(env, monkeypatch, capsys, bad):
-    """Four entries, one of which breaks the checks: a binary search over prefixes finds it in at most
-    three more check runs (ceil(log2 4) + 1). The entries before it go, and the later ones too after
-    one more check of them replayed without it."""
+    """Four entries, one of which breaks the checks. Entry 1 breaking them: the search finds it in at
+    most three more check runs and the later ones go after one more check of them replayed without it.
+    A later one: the first prefix that passes (entries 1-2) pushes at once, no further check runs, and
+    the rest go untested and unblamed to the next train (user msg #2317)."""
     log = env["tmp"] / "checks.log"
     p, repo, origin, other = _bump_setup(env, monkeypatch, [f"echo run >> {log}", "test ! -e plugins/p/bad.txt"])
     heads = [_entry(repo, f"e{n}", {f"plugins/p/{'bad' if n == bad else f'f{n}'}.txt": f"{n}\n"}) for n in (1, 2, 3, 4)]
     rc, m = _run_batch(p, _batch_marker(p, heads), monkeypatch)
-    good = [n for n in (1, 2, 3, 4) if n != bad]
-    assert _statuses(m) == ["check_failed" if n == bad else "pushed" for n in (1, 2, 3, 4)], m
-    assert m["results"][bad - 1]["detail"]["cmd"] == "test ! -e plugins/p/bad.txt"
+    good = [2, 3, 4] if bad == 1 else [1, 2]
     runs = len(log.read_text().split()) + _reused(capsys, f"echo run >> {log}")   # a recheck of a tree reuses its passes
-    assert runs == m["checks"]["runs"] and runs - 1 <= 3 + (bad < 4), runs
+    assert runs == m["checks"]["runs"], runs
     if bad == 1:
-        assert m["tip_passed"] is True, "the tip passed alone: the queue may forget it as failing"
+        assert _statuses(m) == ["check_failed", "pushed", "pushed", "pushed"], m
+        assert m["results"][0]["detail"]["cmd"] == "test ! -e plugins/p/bad.txt"
+        assert runs - 1 <= 4 and m["tip_passed"] is True, "the tip passed alone: the queue may forget it as failing"
+    else:
+        assert _statuses(m) == ["pushed", "pushed", "requeued", "requeued"], m
+        assert runs == 2, "the full head, then prefix 2, which passed and pushed"
+        assert all(r["detail"] == {"untested": True} for r in m["results"][2:]), "requeued, never blamed"
     assert rc == 0 and m["outcome"] == "pushed" and _versions(origin) == ("0.1.1", "0.1.1")
     more = f"; +{len(good) - 1} more" if len(good) > 1 else ""
     assert _bump_commits(origin) == [f"p: 0.1.1 (e{good[0]}: edit plugins/p/f{good[0]}.txt{more})"]
@@ -48654,7 +48665,7 @@ def test_prguard_fast_path_remedy_names_a_working_flag(env, tmp_path, monkeypatc
     cli, p, run, mark = _fast_cli(env, tmp_path, monkeypatch, {"docs/n.md": "hi\n"}, True)
     cli.main(["checks"])
     msg = prguard._checks_problem(os.getcwd())
-    assert "ttp checks --full" in msg and "unset" not in msg
+    assert "ttp checks --fresh" in msg and "unset" not in msg   # --full is refused with the push queue on (#7629)
 
 
 def test_fast_path_skipped_when_a_scoped_check_applies(env, tmp_path, monkeypatch, capsys):

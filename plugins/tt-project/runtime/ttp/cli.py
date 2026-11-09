@@ -1926,6 +1926,11 @@ def cmd_stats(a) -> None:
         s["winner"] = effortab.winner(p.config())
         print(json.dumps(s, indent=1) if a.json else effortab.report_text(s))
         return
+    if a.landing:
+        from . import trainstats
+        s = trainstats.report(p.db, p.runs, timefmt.home(p), a.days)
+        print(json.dumps(s, indent=1) if a.json else trainstats.text(s, p.name))
+        return
     if a.coord_session:
         from . import coordstats
         s = coordstats.report(p.db, p.runs, timefmt.home(p), a.days)
@@ -3437,6 +3442,15 @@ def _prestage_skip(a, p: Project | None, top: str, head: str, tree: str, cmds: l
     return ""
 
 
+def _spent(t0) -> dict:
+    """Wall and CPU seconds since `t0` ((monotonic, os.times())): this process plus the check
+    commands it waited for, so `ttp stats` sums CPU-hours per landed change."""
+    w0, c0 = t0
+    c1 = os.times()
+    cpu = sum(getattr(c1, k) - getattr(c0, k) for k in ("user", "system", "children_user", "children_system"))
+    return {"wall_s": round(time.monotonic() - w0, 1), "cpu_s": round(max(cpu, 0.0), 1)}
+
+
 def cmd_checks(a) -> None:
     """(inside a run) Run the local checks on this worktree's commit and record the result in the
     run's directory: the harness's gh opens a PR (even a draft) only after they passed on HEAD. The
@@ -3480,6 +3494,7 @@ def cmd_checks(a) -> None:
     from . import addedtests, checkcap, checkdirs, checkprestage, cleantree, prguard, push, pushpass, slowtests
     from . import gatejudge
     from . import shorttmp
+    spent0 = (time.monotonic(), os.times())   # wall_s, cpu_s in checks.json (ttp stats' CPU-hours per landing)
     if getattr(a, "gap", None):
         from . import checkgaps
         p = here()
@@ -3543,6 +3558,10 @@ def cmd_checks(a) -> None:
               "`retry_when` that exits 0 once this host is back, and run them after the cycle", file=sys.stderr)
         sys.exit(75)
     purpose = getattr(a, "purpose", None) or "candidate"
+    if a.full and purpose == "candidate" and not getattr(a, "release", False):
+        from . import testpick   # a release run (the release cut's required suite) always runs in full
+        if why := testpick.full_refusal(cfg):   # the push train is the only full run
+            die(f"ttp checks: {why}")
     d = cfg.get("delivery") or {}
     checks_host = d.get("checks_host")   # where checks without a host run
     # The checks run at the top of the worktree being checked, as `ttp push` runs them, wherever in
@@ -3771,7 +3790,7 @@ def cmd_checks(a) -> None:
                 print(f"ttp checks: {said}")
                 out.write(f"{said}\n")
             fcfg = p.config() if p else None
-            if todo and purpose == "candidate" and not a.full and not a.fresh \
+            if todo and purpose == "candidate" and not a.full and not a.fresh and not getattr(a, "release", False) \
                     and not any(getattr(c, "if_changed", ()) for c in todo) \
                     and not _recorded_pass(p, tree, todo, purpose) \
                     and push.fast_path(Path(top), base, head, push.fast_globs(fcfg), push.fast_exclude(fcfg)):
@@ -3780,7 +3799,7 @@ def cmd_checks(a) -> None:
                 fast_cmds = push.fast_checks(base)
                 todo = [c for c in todo if str(c) not in own_s] + fast_cmds
                 said = ("FAST PATH: the diff changes only docs/data paths, so the project's checks were NOT run; "
-                        "only the whitespace and CRLF checks run; `ttp checks --full` runs them all (delivery.checks_fast_globs sets the paths, "
+                        "only the whitespace and CRLF checks run; `ttp checks --fresh` runs them (delivery.checks_fast_globs sets the paths, "
                         "delivery.checks_fast_exclude the paths that never take it)"
                         + (f"; commands after `--` still run" if len(todo) > len(fast_cmds) else ""))
                 print(f"ttp checks: {said}")
@@ -3830,7 +3849,8 @@ def cmd_checks(a) -> None:
         # never comes here and runs the full suite. A narrowed check's pass is its own (its env is in its key).
         if todo and passed and not hit and not fast_cmds and purpose == "candidate":
             from . import testpick
-            todo, scope_lines = testpick.narrow(Path(top), base, head, todo, own, fcfg, full=a.full)
+            todo, scope_lines = testpick.narrow(Path(top), base, head, todo, own, fcfg,
+                                              full=a.full or getattr(a, "release", False))
             for said in scope_lines:
                 print(f"ttp checks: {said}")
                 out.write(f"{said}\n")
@@ -4515,7 +4535,8 @@ def cmd_checks(a) -> None:
                                                      **({"authoring_tree": in_authoring} if in_authoring else {}),
                                                      **({"added_tests": rerun} if rerun else {}),
                                                      **({"excused": excused, "landing_only": True} if excused else {}),
-                                                     **({"release": True} if getattr(a, "release", False) else {})})
+                                                     **({"release": True} if getattr(a, "release", False) else {}),
+                                                     **_spent(spent0)})
     if join_rec:   # the outcome the runs that joined this one report (checkjoin)
         from . import checkjoin, trim
         checkjoin.finish(join_rec, passed=passed, head=head, rc=0 if passed else 1, failed=str(failed or ""),
@@ -13126,6 +13147,9 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--coord-session", action="store_true",
                    help="the persistent coordinator session instead, per day: wakes, $/wake, context growth and tool "
                         "calls per wake, rollovers, cache-read share, against the stateless baseline and break-even")
+    s.add_argument("--landing", action="store_true",
+                   help="per landed change instead, per day: test runs and full suites, CPU-hours, $, and "
+                        "approved to landed (median, p90)")
     s.add_argument("--runs", action="store_true",
                    help="worker runs instead: provider, model, tier, outcome (with any route fallback), wall time, cost")
     s.add_argument("--tier", help="with --runs: only this tier's runs (implies --runs)")
