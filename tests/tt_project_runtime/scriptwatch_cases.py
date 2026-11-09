@@ -373,5 +373,6 @@ def test_scriptwatch_ignores_a_word_too_long_for_a_file_name(tmp_path):
     from ttp import scriptwatch
     expr = " and ".join(f"not test_{i}_" + "x" * 40 for i in range(8))
     assert len(expr) > 255 and "/" not in expr
-    assert scriptwatch.scripts(f"pytest -q -k '{expr}' tests/a.py", tmp_path) == []
+    # An empty PATH: `pytest` itself is then no script on any machine (a host may have one on PATH).
+    assert scriptwatch.scripts(f"pytest -q -k '{expr}' tests/a.py", tmp_path, env={"PATH": str(tmp_path)}) == []
     assert scriptwatch.watch(f"pytest -q -k '{expr}' tests/a.py", tmp_path) == {}
