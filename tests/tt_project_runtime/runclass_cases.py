@@ -291,11 +291,15 @@ def test_an_urgent_task_takes_its_class_cheap_route_in_every_cheap_class_and_har
     cfg = _rc_cfg()
     t = {"kind": "question", "tier": "standard", "title": "why", "spec": "s"}
     urgent = [{**t, "priority": 1}, {**t, "spec": "urgent: yes\nwhy"}]
-    for cls in ("wake_decision", "screening", "worker_wake", "status_report", "rebase", "review_small", "light"):
+    for cls in ("wake_decision", "screening", "worker_wake", "status_report", "rebase", "review_small"):
         for u in urgent:
             assert route.kept_core(u, urgency=False) is False, (cls, u)
-            assert runclass.routable(u), (cls, u)
+            assert runclass.routable(u, {runclass.KEY: cls}), (cls, u)
             assert runclass.target(cfg, u, "light", cls) is not None, (cls, u)
+    # The decision (2026-11-08 23:55 PST) names those six: an urgent light-tier first run starts on core.
+    for u in urgent:
+        assert runclass.target(cfg, u, "light", "light") is None and not runclass.routable(u, {runclass.KEY: "light"})
+        assert runclass.target(cfg, {**t, "tier": "light"}, "light", "light") is not None   # not urgent: routed
     for cls in ("wake_decision", "screening", "worker_wake", "status_report", "rebase", "review_small"):
         c = runclass.core_cheap({}, urgent[0], cls, "standard", "claude")
         assert c and c["effort"] == "low" and c["model"] in ("haiku", "sonnet"), cls
