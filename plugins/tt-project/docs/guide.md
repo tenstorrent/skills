@@ -1801,9 +1801,12 @@ session and stateless coordinators on every provider.
   branch (`worktree.root_branch`, else the one it was last seen on) is put back when it has no
   uncommitted changes, else alerted; worktrees never start from such a HEAD.
 - Smoke before landing: `delivery.push_checks` gate every landing, so keep them under 10 min on
-  their host (aim 5). Slower tests belong in `delivery.post_land_checks`, but nothing runs that list
-  yet: keep them running elsewhere (a schedule on the push branch tip) before you shorten
-  `push_checks`. `ttp status` and the daily
+  their host (aim 5). Slower tests belong in `delivery.post_land_checks`, which run after landing:
+  the daemon runs them detached on each new pushed sha, without a model. A failing test that passes on
+  a rerun is flaky (quarantined, not reverted); one failing before the landing too is not its. A new
+  failure is bisected over the landed changes to the guilty one, which is reverted forward on the
+  push branch through the push queue (never forced), and one code task is queued to fix it on its
+  failing tests alone. `ttp status` and the daily
   review show the landing check time (median and p90, last 24 h and last 10 runs); over
   `checks.smoke_max_s` (default 600 s) the project's coordinator gets one observation a day naming the
   slowest tests (push-checks reference, "Smoke before landing"). `ttp status` also shows the waits:

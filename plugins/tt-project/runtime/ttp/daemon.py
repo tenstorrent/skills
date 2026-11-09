@@ -189,6 +189,7 @@ from . import projpause
 from . import push
 from . import pushclaim
 from . import pushq
+from . import postland
 from . import rebootwait
 from . import refwaits
 from . import release
@@ -2899,6 +2900,11 @@ class Daemon:
         except Exception:
             log(self.p, "push queue: finalize failed\n" + traceback.format_exc())
             return
+        try:
+            if did := postland.tend(self.p, self.cfg):
+                log(self.p, f"post-landing checks: {did}")
+        except Exception:
+            log(self.p, "post-landing checks failed\n" + traceback.format_exc())
         now = time.time()
         if changed or now - self._push_refs_at > PUSH_REFS_EVERY_S:
             self._push_refs_at = now
