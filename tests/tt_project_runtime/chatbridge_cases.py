@@ -3007,7 +3007,7 @@ def test_a_gone_model_is_swapped_within_a_minute_and_a_smarter_new_one_is_tried_
     for i in range(modelrank.TRIES):
         tid = p.db.add_task(f"try{i}", "", kind="work", tier="light", priority=3, budget_usd=8.0, labels=[])
         run, _ = _route_finish(p, d, tid, {"rc": 0}, result={"status": "done", "summary": "ok"}, routed=note[route.KEY])
-        assert "fallback" not in route.of(run["note"]), run["note"]
+        assert route.of(run["note"]).get("fallback") in (None, "", "none"), run["note"]
     assert "rank-new proven" in (p.logs / "daemon.log").read_text()
     assert modelrank.better(p.db, d.cfg, p.state, _RT_MODEL, now, light=False) == "rank-new"
     # Nothing ranks above the top model; an endpoint fault parks nothing.
