@@ -51,9 +51,10 @@ def make(path: Path, seed=SEED, timeout_s: float = 300) -> Path:
         if r.returncode:
             raise Unavailable(f"the OS's site directories could not be read: {(r.stderr or r.stdout).strip()[-500:]}")
         for site in path.glob("lib/python*/site-packages"):
-            # addsitedir, not bare paths: the OS's own .pth files (namespace packages) still apply.
+            # addsitedir, not bare paths: the OS's own .pth files (namespace packages) still apply. map,
+            # not a comprehension: before 3.12 one cannot see `site` in the exec'd line's scope.
             (site / "ttp-system-site.pth").write_text(
-                f"import site; [site.addsitedir(p) for p in {r.stdout.strip()}]\n")
+                f"import site; list(map(site.addsitedir, {r.stdout.strip()}))\n")
         cell = env(path, base)
         py = str(path / "bin" / "python")
         if subprocess.run([py, "-c", "import pip"], capture_output=True, timeout=timeout_s, env=cell).returncode:
