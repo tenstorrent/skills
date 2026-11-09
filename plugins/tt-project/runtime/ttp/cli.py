@@ -3943,6 +3943,9 @@ def cmd_checks(a) -> None:
         # "1" keeps them off every spill host.
         no_spill = os.environ.pop(checkspill.OFF_ENV, "")
         spill_ok = not checkspill.all_off(no_spill) and checkspill.spillable(todo, cfg)
+        if p and todo and not spill_ok and checkspill.hosts(cfg):   # `ttp checks status` says why it stays here
+            checkspill.note_here(p.name, "kept off every spill host" if checkspill.all_off(no_spill) else
+                                 "its checks cannot spill (an agent CLI, \"host\": \"local\" or a wrapper)")
         fresh_ok = not a.fresh
         slot = None
         light = bool(todo) and checklane.all_light(todo, cfg, mine + [h for _, h in held] if getattr(a, "light", False) else ())
@@ -5085,6 +5088,7 @@ def _checks_lane_status(as_json: bool) -> int:
                           "project_max": checklane.project_cap(p.config()), "this_repo": here_repo,
                           "repos": checklane.lane_status(p.name, cfg=p.config(), names=names, db=p.db),
                           "spilled": checkspill.holders(p.name),
+                          "here": checkspill.here_records(p.name),
                           "slurm_overflow": slurmcheck.holders(p.name),
                           "slurm_paused": slurmcheck.tripped(),
                           "hosts": {**load, "overloaded": hostload.overloaded(load)},
@@ -5094,7 +5098,7 @@ def _checks_lane_status(as_json: bool) -> int:
                          indent=2))
     else:
         print(checklane.status_text(p.name, p.config(), here_repo, names=names, db=p.db))
-        for line in [*checkspill.status_lines(p.name), *checkspill.pick_lines(p.name), *slurmcheck.probe_lines(), *slurmcheck.status_lines(p.name),
+        for line in [*checkspill.status_lines(p.name), *checkspill.pick_lines(p.name), *checkspill.here_lines(p.name), *slurmcheck.probe_lines(), *slurmcheck.status_lines(p.name),
                      *filter(None, [slurmcheck.paused_line()])]:
             print(f"  {line}")
         print("check runs per host:")

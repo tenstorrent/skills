@@ -53,7 +53,7 @@ import tokenize
 from collections import Counter, deque
 from pathlib import Path
 
-from . import (checkcap, checkdirs, cleantree, conflictfix, cyclenotice, envfault, gatejudge, landmark, locks, push, pushpass, runner, scopehold,
+from . import (checkcap, checkdirs, checkspill, cleantree, conflictfix, cyclenotice, envfault, gatejudge, landmark, locks, push, pushpass, runner, scopehold,
                scriptwatch, setupfault, syntaxfault, testslots, workerloss, urgent,
                sharedchecks, slowtests, suitecost, verdictcarry, worktree)
 from .project import Project, command_env, durable_write, write_json
@@ -215,6 +215,12 @@ def _kill(proc: subprocess.Popen) -> None:
         proc.wait(timeout=5)
     except subprocess.TimeoutExpired:
         pass
+
+
+def _here(cmd):
+    """The check `cmd` stands for here: a spilled one's local original (checkspill: `was`), judged and
+    rerun as that original is; any other check itself (one with its own host keeps it)."""
+    return getattr(cmd, "was", cmd) if getattr(cmd, "spilled", False) else cmd
 
 
 def _check_argv(cmd, wt: Path) -> list[str]:
@@ -1470,6 +1476,7 @@ class Batch:
         self._heads: dict[str, str] | None = None   # push.landed_heads, read once per batch
         self.check_run_dir = m.get("check_run_dir")
         self.isolate = {str(c) for c in m.get("setup_isolate") or []}   # alerted setup_fault checks (pushq)
+        self.spill_off = ""   # the spill hosts this batch's checks keep off (checkspill.spill_off_add, _respill)
         self.at = ""                            # the head _check runs on
         self.checks = {"runs": 0, "seconds": 0.0, "flaky": False}
         self.tip = self.pushed_sha = self.version = None
@@ -2298,8 +2305,17 @@ class Batch:
             return None
         self._runners([c for c, _, _ in run], env)
         suite_out: list[str] = []
-        slot = self._slot(head)
-        started = time.time()   # a wait for the host-wide slot is not check time
+        claims: list = []   # spill host claims (_spill), closed with the slot
+        run = [(c2, eid, parts) for c2, (_, eid, parts) in zip(self._spill([c for c, _, _ in run], head, claims), run)]
+        slot, held = self._no_slot(), [False]   # the host-wide slot, taken only for what runs here
+
+        def here(slot):   # `slot`, or the host-wide slot once a check (or a spilled one's reruns) runs here
+            if held[0]:
+                return slot
+            slot.close()
+            held[0] = True
+            return self._slot(head)
+        started = time.time()
         slow = Path(self.check_run_dir) / slowtests.FILE if self.check_run_dir else None
         if slow:
             slow.unlink(missing_ok=True)   # this head's run only
@@ -2307,7 +2323,8 @@ class Batch:
             for line in push.sandbox_lines([cmd for cmd, _, _ in run]):
                 say(line)
             for cmd, eid, parts in run:
-                resume = pushpass.resume_file(self.p, tree, str(cmd), eid) if tree and pushpass.resumable(cmd) else None
+                resume = (pushpass.resume_file(self.p, tree, str(cmd), eid)
+                          if tree and pushpass.resumable(cmd) and not push.remote_host(cmd) else None)
                 extra = pushpass.resume_env(resume, env) if resume else {}
                 if slow and pushpass.resumable(cmd) and not push.remote_host(cmd):
                     extra |= slowtests.env(slow, {**env, **extra})
@@ -2319,7 +2336,12 @@ class Batch:
                     rc, tail = reuse   # a search run again (_research) judges this tree's failed run again
                     say(f"{head[:10]} failed {cmd} earlier in this batch (tree {tree[:10]}): judging that run again")
                 else:
+                    slot = slot if push.remote_host(cmd) else here(slot)
                     rc, tail = self._run_check(cmd, {**env, **extra, **slot.env()}, env)
+                    while getattr(cmd, "spilled", False) and (fault := push.remote_fault(cmd, rc, self.wt)):
+                        cmd = self._respill(cmd, head, fault, claims)   # the next spill host, else here
+                        slot = slot if push.remote_host(cmd) else here(slot)
+                        rc, tail = self._run_check(cmd, {**env, **slot.env()}, env)
                     if fault := push.remote_fault(cmd, rc, self.wt):
                         raise envfault.Fault(fault)   # the check host, not this head: push_phase holds the batch
                     if rc != 0 and tree:
@@ -2328,6 +2350,8 @@ class Batch:
                 if rc != 0:
                     say(f"check failed on {head[:10]}: {cmd}{push.where(cmd)}")
                     self.fail_rc[tail] = rc
+                    if self._rerun_ids(cmd, rc, tail):
+                        slot = here(slot)   # its failing tests rerun here (_judged), a spilled check's too
                     if self._judged(head, cmd, rc, tail, env, slot.env()):
                         if resume:
                             resume.unlink(missing_ok=True)
@@ -2341,6 +2365,8 @@ class Batch:
                     resume.unlink(missing_ok=True)
         finally:
             slot.close()
+            for claim in claims:
+                claim.close()
             self.checks["seconds"] = round(self.checks["seconds"] + time.time() - started, 1)
         push.record_check_s(self.p, time.time() - started)
         for line in slowtests.lines(slow) if slow else []:
@@ -2350,6 +2376,36 @@ class Batch:
         except Exception as e:   # a cost note never fails a batch
             say(f"suite cost not recorded: {e}")
         return None
+
+    def _spill(self, cmds: list, head: str, claims: list) -> list:
+        """`cmds` with those that may spill sent to a spill host (checkspill.spill_run, with its worker grant, as
+        `ttp checks` spills them), the rest here; its claim joins `claims`. Never fails the batch."""
+        try:
+            claim, out = checkspill.spill_run(self.p, self.p.config(), cmds, say,
+                                              f"push batch {self.id} checks on {head[:10]}", self.spill_off)
+        except Exception as e:   # the spill hosts are a speed-up: the checks run here instead
+            say(f"spill hosts not tried ({e}): the checks run here")
+            return cmds
+        if claim is not None:
+            claims.append(claim)
+        return out
+
+    def _respill(self, cmd, head: str, fault: dict, claims: list):
+        """Check `cmd`, whose spill host failed (`fault`: ssh or the host, never the change), on the next spill
+        host free, else here: the host's fault never fails or holds the batch. A host faulting
+        checkspill.HOST_FAULT_TRIES times is kept off the rest of the batch (spill_off)."""
+        host, was = push.remote_host(cmd), getattr(cmd, "was", cmd)
+        self.spill_off = checkspill.spill_off_add(self.spill_off, host, True)
+        say(f"spill host {host} could not run {was} ({fault.get('why') or 'ssh or the host failed'}): "
+            "trying the next spill host, else here")
+        nxt = self._spill([was], head, claims)[0]
+        return nxt if push.remote_host(nxt) else was
+
+    def _no_slot(self) -> checkcap.Slot:
+        """No slot here: every check spilled. The checks step is marked as _slot marks it."""
+        self.steps.between()
+        self.steps.go("checks")
+        return checkcap.Slot()
 
     def _passed(self, cmd) -> None:
         """Note a check that passed (ran, reused or carried) in checks.passed: its script_torn count clears (pushq)."""
@@ -2376,8 +2432,9 @@ class Batch:
         while True:
             rc, tail, _ = scriptwatch.rerun(once, lambda r: r[0] != 0, None if push.remote_host(cmd) else str(cmd),
                                             self.wt, env, say, on_pass=True)
-            if rc == 0 or push.remote_host(cmd):
-                return rc, tail
+            if rc == 0 or push.remote_host(cmd) and (not getattr(cmd, "spilled", False)
+                                                    or rc == push.remotecheck.FAULT_RC):
+                return rc, tail   # a spilled check's infra reruns run again on its spill host; its host fault: _check
             if found := syntaxfault.transient(collect.text(), self.wt, self.tip):
                 if torn:
                     raise syntaxfault.Infra(found, str(cmd))
@@ -2449,9 +2506,10 @@ class Batch:
 
     def _rerun_ids(self, cmd, rc: int | None, tail: str) -> list[str]:
         """The failing pytest ids of a failed check to rerun: none when the check is not one plain local
-        pytest run (pushpass.resumable), it did not exit 1 (tests failed; `rc` None: not known) or pytest
+        pytest run (pushpass.resumable; a spilled check: its local original, _here), it did not exit 1 (tests failed; `rc` None: not known) or pytest
         stopped early (-x, --maxfail, an interrupt: sharedchecks.stopped_early, so later tests never ran),
         its list of failing ids is incomplete (sharedchecks.failing_ids) or it names more than RERUN_IDS."""
+        cmd = _here(cmd)
         if cmd == STALE or push.remote_host(cmd) or not pushpass.resumable(cmd):
             return []
         if rc not in (1, None) or sharedchecks.stopped_early(tail):
@@ -2465,6 +2523,7 @@ class Batch:
         """Run only `ids` of check `cmd` once at commit `at`: the check's own command, its other tests
         deselected by name (pushpass.select_env), killed after delivery.push_rerun_s. (pytest's exit
         code, None when it ran out of time; the output tail)."""
+        cmd = _here(cmd)   # only a check's first full run spills: every rerun runs here
         self.reran.setdefault(where, set()).update(ids)
         self._checkout(at)
         self.checks["reruns"] = self.checks.get("reruns", 0) + 1
@@ -2491,7 +2550,7 @@ class Batch:
             say(f"judging the {len(todo)} failing test(s) on {head[:10]}: a rerun there, then on the tip "
                 f"{(self.tip or '')[:10]} the ones failing again: {' '.join(todo)}")
             try:
-                v = self._verdict(head, cmd, todo, env, slot_env)
+                v = self._verdict(head, _here(cmd), todo, env, slot_env)   # reruns here, as its local original
             finally:
                 self._checkout(head)
             for line in gatejudge.lines(v):
@@ -2616,7 +2675,7 @@ class Batch:
         full checks decide then."""
         cmd = fail[0]
         env = push.check_env("target", self.tip, self.check_run_dir, self.branch)
-        self._runners([cmd], env)
+        self._runners([_here(cmd)], env)
         slot = self._slot(head)
         started = time.time()
         try:
@@ -2658,7 +2717,7 @@ class Batch:
         say(f"rerunning the {len(ids)} failing test(s) on the tip {tip[:10]} alone, up to {TIP_RERUNS} times: "
             f"{' '.join(ids)}")
         env = self._check_env()
-        self._runners([cmd], env)
+        self._runners([_here(cmd)], env)
         slot = self._slot(tip)
         try:
             for n in range(1, TIP_RERUNS + 1):

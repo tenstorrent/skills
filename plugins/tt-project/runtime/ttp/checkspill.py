@@ -1052,6 +1052,7 @@ def pick(p, cfg: dict, tell, what: str = "", off: str = "", why_here: str = "") 
             from . import testslots
             top = testslots.sizes(cfg, cores) if cores > 0 else None   # one run's limit, sized to that host
             got.workers = workers(cores, load, max(0, _ours(host) - 1), top[1] if top else 0)
+            note_here(p.name, "")   # this run is on a spill host now: no reason to show it here
             tell(f"spilling to {alias}: "
                  + (why_here or f"the slots here stayed busy for {after_s(cfg):g} s")
                  + f" ({_source(cfg, alias)}); the checks run there on a copy of the commit"
@@ -1066,6 +1067,7 @@ def pick(p, cfg: dict, tell, what: str = "", off: str = "", why_here: str = "") 
                        + (f"; {note}" if note else "") + ")")
     if skipped:
         tell("no spill host could take the checks, waiting here: " + "; ".join(skipped))
+        note_here(p.name, "no spill host could take them: " + "; ".join(skipped), what)
     _note_pick(p.name, "", skipped)
     return None
 
@@ -1137,3 +1139,80 @@ def status_lines(project_name: str, now: float | None = None) -> list[str]:
                    + (f" (beside a device job, checks.{BESIDE_KEY}: {r['beside']})" if r.get("beside") else "")
                    + (f" (claim's pid {r.get('pid')}: {FOREIGN})" if pid_state(r.get("pid")) == UNKNOWN else ""))
     return out
+
+
+def here_dir() -> Path:
+    from . import checkcap
+    return checkcap.slot_dir() / "spill-here"
+
+
+def note_here(project_name: str, why: str, what: str = "") -> None:
+    """Record why this process's checks run on the project host, not a spill host (here_lines shows it while
+    the process lives); "" clears it. Records of dead processes go at each write. Never raises."""
+    d = here_dir()
+    try:
+        for g in d.glob("*.json") if d.is_dir() else []:
+            if g.stem != str(os.getpid()) and g.stem.isdigit() and not _alive(int(g.stem)):
+                g.unlink(missing_ok=True)
+        f = d / f"{os.getpid()}.json"
+        if not why:
+            f.unlink(missing_ok=True)
+            return
+        d.mkdir(parents=True, exist_ok=True)
+        from . import project
+        project.durable_write(f, json.dumps({"project": project_name, "task": os.environ.get("TTP_TASK") or "",
+                                             "pid": os.getpid(), "why": why[:300], "what": what[:200],
+                                             "at": time.time()}), sync=False)
+    except OSError:
+        pass
+
+
+def here_records(project_name: str) -> list[dict]:
+    """The live note_here records of `project_name`'s runs. Read only."""
+    out = []
+    for f in sorted(here_dir().glob("*.json")) if here_dir().is_dir() else []:
+        try:
+            r = json.loads(f.read_text() or "{}")
+        except (OSError, ValueError):
+            continue
+        if isinstance(r, dict) and r.get("project") == project_name and r.get("why") and _alive(r.get("pid")):
+            out.append(r)
+    return out
+
+
+def here_lines(project_name: str) -> list[str]:
+    """`ttp checks status` lines: each of this project's runs that stays on the project host, and why."""
+    out = []
+    for r in here_records(project_name):
+        who = f"task #{r['task']}" if r.get("task") else f"pid {r.get('pid')}"
+        out.append(f"checks of {who} run on the project host: {r['why']}" + (f" ({r['what']})" if r.get("what") else ""))
+    return out
+
+
+def spill_run(p, cfg: dict, cmds: list, tell, what: str = "", off: str = "", why_here: str = "") -> tuple[Any, list]:
+    """For a run that takes no `ttp checks` slot here (the push batch's suite, an after-landing suite):
+    (claim, `cmds`) with each check that may spill sent to the spill host checkspill.pick claimed, sized to its
+    worker grant (cli._spill_to, as `ttp checks` spills), the rest here; (None, `cmds`) when it stays here,
+    with why recorded (note_here). Tried only with spill hosts set and spill first on (first); `off` as pick's.
+    The caller closes the claim once the run ends."""
+    if not hosts(cfg):
+        return None, cmds
+    why = ("spill first is off (delivery." + FIRST_KEY + ")" if not first(cfg) else
+           "kept off every spill host" if all_off(off) else
+           "" if spillable(cmds, cfg) else "its checks cannot spill (an agent CLI, \"host\": \"local\" or a wrapper)")
+    if why:
+        note_here(p.name, why, what)
+        return None, cmds
+    claim = pick(p, cfg, tell, what, off, why_here or f"spill first (delivery.{FIRST_KEY}): the project host "
+                                                       "keeps only checks that cannot spill")
+    if claim is None:
+        return None, cmds
+    from .cli import _spill_to
+    return claim, [_unspilled(c, was) for c, was in zip(_spill_to(cmds, claim.host, cfg, claim.workers), cmds)]
+
+
+def _unspilled(c: Any, was: Any) -> Any:
+    """`c` (spilled from `was`) remembering `was`, so a spill host's fault reruns the check elsewhere."""
+    if getattr(c, "spilled", False):
+        c.was = was
+    return c

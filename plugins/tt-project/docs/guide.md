@@ -2646,8 +2646,16 @@ session and stateless coordinators on every provider.
   passes on its rerun is flaky (quarantined), one that fails on the tip too is pre-existing, and a
   quarantined test the batch does not touch is excused at once: when none is new the check passes,
   the batch goes on and the coordinator is told once per test so a fix gets queued. A check that did
-  not exit 1, or that pytest stopped early (`-x`, `--maxfail`, an interrupt), is never rerun. The
-  search runs only the new failing tests at each prefix and the full suite once, at the prefix they
+  not exit 1, or that pytest stopped early (`-x`, `--maxfail`, an interrupt), is never rerun. A test
+  the tip fails on its own is pre-existing for the whole batch, so it blocks none of its changes; tests
+  whose id matches `push_hard_tests` (a regex, default `leak`: the leak scan) and a failed check that
+  names no test ids still block. The batch's checks spill as `ttp checks` does: with
+  `delivery.checks_spill_hosts` set and spill first on, each check that may spill runs on the first free
+  spill host with that host's worker grant (a fixed `-n N` above it is lowered to it), the rest here; a
+  spill host's own fault (ssh, the host) reruns that check on the next free spill host, else here, and
+  never fails or holds the batch. Only a check's first full run spills: every rerun of its failing tests
+  (the judge's, the search's) runs here, with its test selection. `ttp checks status` shows each run on a spill host, and each run that
+  stayed on the project host with why. The search runs only the new failing tests at each prefix and the full suite once, at the prefix they
   pass on, which then pushes. Keys, all under `delivery`: `push_batch_s` (default 300: with
   no review running or ready an approval starts a batch at once; otherwise the batch starts once the
   oldest approval waited this long; 0 = at once), `push_batch_max`
