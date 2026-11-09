@@ -37692,6 +37692,9 @@ class _FakeCaffeinate:
         return 0
 
 
+ON = {"runner": {"prevent_idle_sleep": "on"}}   # keep-awake is off by default (user msg #2295): these tests turn it on
+
+
 def _idle_hold(platform="darwin", ac=True, lid=None):
     from ttp import awake
     _FakeCaffeinate.started = []
@@ -37714,7 +37717,7 @@ def _idle_hold(platform="darwin", ac=True, lid=None):
 
 def test_idle_sleep_held_on_ac_with_work_by_caffeinate_i_s_tied_to_the_daemon(env):
     h, _, shown = _idle_hold()
-    h.update({}, lambda: True)
+    h.update(ON, lambda: True)
     [c] = _FakeCaffeinate.started
     assert c.argv == ["caffeinate", "-i", "-s", "-w", "777"], "idle and system (maintenance) sleep, on AC"
     assert not {"-d", "-u", "-m"} & set(c.argv), "the display may sleep and no user activity is faked"
@@ -37724,12 +37727,16 @@ def test_idle_sleep_held_on_ac_with_work_by_caffeinate_i_s_tied_to_the_daemon(en
 
 
 @pytest.mark.parametrize("platform,ac,work,cfg,why", [
-    ("darwin", False, True, {}, "on battery power"),
-    ("darwin", True, False, {}, ""),
+    ("darwin", False, True, ON, "on battery power"),
+    ("darwin", True, False, ON, ""),
     ("darwin", True, True, {"runner": {"prevent_idle_sleep": "off"}}, "off by config (runner.prevent_idle_sleep)"),
     ("darwin", True, True, {"runner": {"prevent_idle_sleep": False}}, "off by config (runner.prevent_idle_sleep)"),
     ("darwin", True, True, {"power": {"keep_awake": "off"}}, "off by config (runner.prevent_idle_sleep)"),
+    ("darwin", True, True, {}, "off by config (runner.prevent_idle_sleep)"),
+    ("darwin", True, True, {"runner": {"nice": 5}}, "off by config (runner.prevent_idle_sleep)"),
+    ("darwin", True, True, {"runner": {"prevent_idle_sleep": "sometimes"}}, "off by config (runner.prevent_idle_sleep)"),
     ("linux", True, True, {}, None),
+    ("linux", True, True, ON, None),
 ])
 def test_idle_sleep_not_held_on_battery_without_work_config_off_or_off_macos(env, platform, ac, work, cfg, why):
     h, power, shown = _idle_hold(platform, ac)
@@ -37746,29 +37753,29 @@ def test_idle_sleep_not_held_on_battery_without_work_config_off_or_off_macos(env
 def test_idle_sleep_released_when_work_ends_or_on_battery_and_never_held_twice(env):
     h, power, shown = _idle_hold()
     for _ in range(5):
-        h.update({}, lambda: True)
+        h.update(ON, lambda: True)
     assert len(_FakeCaffeinate.started) == 1, "one assertion at a time"
     first = _FakeCaffeinate.started[0]
     assert power["reads"] == 1, "the power source is read at most every POWER_EVERY_S"
-    h.update({}, lambda: False)
+    h.update(ON, lambda: False)
     assert first.ended and first.reaped and h.proc is None
     assert shown[-1] is None
-    h.update({}, lambda: True)
+    h.update(ON, lambda: True)
     second = _FakeCaffeinate.started[-1]
     assert len(_FakeCaffeinate.started) == 2 and not second.ended
     power["ac"] = False
     h._fresh()
-    h.update({}, lambda: True)
+    h.update(ON, lambda: True)
     assert second.ended and second.reaped and h.proc is None
     assert shown[-1]["why"] == "on battery power" and not shown[-1]["held"]
     h.update({"runner": {"prevent_idle_sleep": "on"}}, lambda: True)
     assert len(_FakeCaffeinate.started) == 2
     power["ac"] = True
     h._fresh()
-    h.update({}, lambda: True)
+    h.update(ON, lambda: True)
     third = _FakeCaffeinate.started[-1]
     third.ended = True   # someone killed it: the next tick holds again
-    h.update({}, lambda: True)
+    h.update(ON, lambda: True)
     assert len(_FakeCaffeinate.started) == 4 and not _FakeCaffeinate.started[-1].ended
     h.release()
     assert _FakeCaffeinate.started[-1].ended and _FakeCaffeinate.started[-1].reaped and shown[-1] is None
@@ -37828,13 +37835,13 @@ def test_lid_read_from_ioreg_and_unreadable_means_no_lid(env):
 def test_closed_lid_that_sleeps_the_mac_is_recorded_while_there_is_work(env, lid, ac, says):
     from ttp import awake
     h, power, shown = _idle_hold(ac=ac, lid=lid)
-    h.update({}, lambda: True)
+    h.update(ON, lambda: True)
     assert bool(shown and shown[-1] and shown[-1].get("lid_closed")) is says
     assert awake.pause_line(awake.line(shown[-1], 777)) is says
     assert ("battery" in awake.line(shown[-1], 777)) is (says and not ac), "a lid closed on battery says so"
     assert [c.argv for c in _FakeCaffeinate.started] == ([["caffeinate", "-i", "-s", "-w", "777"]] if ac else []), \
         "the lid changes what status says, not what is held"
-    h.update({}, lambda: False)
+    h.update(ON, lambda: False)
     assert shown[-1] is None, "no work, nothing to say about the lid"
 
 
@@ -37843,17 +37850,17 @@ def test_closed_lid_line_clears_when_the_lid_opens_and_off_by_config_still_says_
     h, power, shown = _idle_hold(lid={"closed": True, "causes_sleep": True})
     h.update({"runner": {"prevent_idle_sleep": "off"}}, lambda: True)
     assert _FakeCaffeinate.started == [] and awake.line(shown[-1], 777) == awake.LID_LINE
-    h.update({}, lambda: True)
+    h.update(ON, lambda: True)
     assert power["lid_reads"] == 1, "the lid is read at most every POWER_EVERY_S"
     assert awake.line(shown[-1], 777) == awake.LID_LINE and shown[-1]["held"]
     power["lid"] = {"closed": False, "causes_sleep": True}
     h._fresh()
-    h.update({}, lambda: True)
+    h.update(ON, lambda: True)
     assert "lid_closed" not in shown[-1]
     assert awake.line(shown[-1], 777).startswith("idle sleep: held while there is work")
     power["lid"] = {"closed": True, "causes_sleep": True}
     h._fresh()
-    h.update({}, lambda: True)
+    h.update(ON, lambda: True)
     h.release()
     assert shown[-1] is None, "shutdown clears the lid line too"
 
@@ -37888,7 +37895,7 @@ def test_idle_sleep_released_on_daemon_shutdown_and_shown_in_status(env, monkeyp
     seen = []
 
     def tick():
-        d._idle.update(d.cfg, lambda: True)
+        d._idle.update({**d.cfg, **ON}, lambda: True)
         seen.append(status_text(p))
         d.stopping = True
 
@@ -37937,14 +37944,14 @@ def test_closed_lid_says_work_pauses_in_status_and_web_instead_of_just_woke(env)
 def test_battery_power_is_named_as_why_keep_awake_is_not_held(env):
     from ttp import awake
     h, power, shown = _idle_hold(ac=False)
-    h.update({}, lambda: True)
+    h.update(ON, lambda: True)
     assert _FakeCaffeinate.started == [] and shown[-1]["why"] == awake.BATTERY
     assert awake.line(shown[-1], 777) == awake.BATTERY_LINE
     assert "AC power" in awake.BATTERY_LINE and not awake.pause_line(awake.BATTERY_LINE), \
         "an open lid on battery works until the Mac sleeps"
     power["lid"] = {"closed": True, "causes_sleep": True}
     h._fresh()
-    h.update({}, lambda: True)
+    h.update(ON, lambda: True)
     assert awake.line(shown[-1], 777) == awake.LID_BATTERY_LINE and awake.pause_line(awake.LID_BATTERY_LINE)
     assert "battery" in awake.LID_BATTERY_LINE and "battery" not in awake.LID_LINE
     assert awake.pause_line(awake.LID_LINE) and not awake.pause_line("")
@@ -37987,12 +37994,28 @@ def test_host_slept_alert_says_why_keep_awake_did_not_stop_the_sleep(env, state,
     assert says in al["text"] and not_says not in al["text"], al["text"]
 
 
+def test_idle_sleep_off_by_default_and_explicit_on_or_auto_still_holds(env):
+    """User msg #2295: tt-project never keeps a Mac awake unless the user sets the key; an explicit
+    value set before an upgrade keeps working."""
+    from ttp import awake, project as pj
+    assert awake.mode({}) == awake.mode(pj.DEFAULT_CONFIG) == "off"
+    for cfg in ({}, pj.deep_merge(pj.DEFAULT_CONFIG, {}), pj.deep_merge(pj.DEFAULT_CONFIG, {"runner": {"nice": 3}})):
+        h, _, shown = _idle_hold()
+        h.update(cfg, lambda: True)
+        assert _FakeCaffeinate.started == [] and h.proc is None, "no inhibitor by default"
+    for v in ("on", "auto", True):
+        h, _, shown = _idle_hold()
+        h.update(pj.deep_merge(pj.DEFAULT_CONFIG, {"runner": {"prevent_idle_sleep": v}}), lambda: True)
+        [c] = _FakeCaffeinate.started
+        assert c.argv[:3] == ["caffeinate", "-i", "-s"] and shown[-1]["held"] is True, v
+
+
 def test_idle_sleep_config_key_is_known_and_checked(env):
     from ttp import project as pj
-    assert pj.DEFAULT_CONFIG["runner"]["prevent_idle_sleep"] == "auto"
+    assert pj.DEFAULT_CONFIG["runner"]["prevent_idle_sleep"] == "off"
     assert pj.unknown_key_hint("runner.prevent_idle_sleep") is None
     assert pj.unknown_key_hint("power.keep_awake") is None, "older configs stay quiet"
-    assert "runner.prevent_idle_sleep: 'sometimes' is not auto, on or off; auto is used" in \
+    assert "runner.prevent_idle_sleep: 'sometimes' is not auto, on or off; off is used" in \
         pj.config_problems({"runner": {"prevent_idle_sleep": "sometimes"}})
     assert not [x for x in pj.config_problems({"runner": {"prevent_idle_sleep": "off"}}) if "idle" in x]
 
