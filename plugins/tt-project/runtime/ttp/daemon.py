@@ -2113,6 +2113,15 @@ class Daemon:
             self.p.db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
                         (now, "daemon", "run_class_quiet", "normal", runclass.alarm_text(q, window_s / 3600)[:500],
                          "queued"))
+        # Cheap classes on Claude with none on a tt model: told once per outage, never as a repeating alarm.
+        down = runclass.tt_unavailable(s)
+        told = self.p.db.kv("tt_unavailable_told", "") or ""
+        if down and not told:
+            self.p.db.set_kv("tt_unavailable_told", now)
+            self.alert("tt-unavailable", runclass.tt_unavailable_text(s, down), severity="low", every_s=0)
+        elif told and not down and any(runclass.on_chat(m) for ms in s["classes"].values() for m in ms):
+            self.p.db.set_kv("tt_unavailable_told", "")   # a tt model served again: the next outage is told
+            log(self.p, "run classes: a tt model serves cheap classes again")
 
     def trip_model_routing(self, every_s: float = 3600) -> None:
         """The model-pick tripwire (modeltrip.check): a stratum whose routed tasks go wrong more often than
@@ -3130,6 +3139,8 @@ class Daemon:
                 note["turn"].update(timeout_s=timeout_s, wake_budget={"usd": budget_usd, "s": timeout_s})
         if role != "coordinator":   # a routed model pick runs its option's model and effort
             model, effort = modelpick.run_model(note, provider, model, effort)
+            if cheap := runclass.cheap_run(note, provider):   # a cheap class on core (runclass.core_cheap)
+                model, effort = cheap["model"], cheap.get("effort") or effort
         pin: dict = {}
         if role != "coordinator" and task:
             # The task's own pin (task_add model/effort) wins over its tier: a tier change (an effort
@@ -10598,8 +10609,12 @@ class Daemon:
                     note[route.KEY] = routed
                 if dp := self._model_pick(task, tier, peek=True):
                     note[modelpick.KEY] = {k: dp.get(k) for k in ("by", "pick", "p", "why", "tier") if k in dp}
-                try:   # a routed model pick runs its option's effort: no A/B arm
-                    ab = None if (routed or {}).get("model_pick") and run_prov == routed["to"] else \
+                # A cheap class on the Claude core provider (no tt model serves it): a cheap Claude model.
+                cheap = None if dp else runclass.core_cheap(self.cfg, task, run_cls, tier, run_prov, routed, picked)
+                if cheap:
+                    note[runclass.CHEAP_KEY] = cheap
+                try:   # a routed model pick runs its option's effort: no A/B arm; nor does a cheap core run
+                    ab = None if cheap or ((routed or {}).get("model_pick") and run_prov == routed["to"]) else \
                         effortab.assign(db, self.cfg, task, tier, run_prov, jev=self.jev)
                 except Exception as e:   # the A/B must never hold a task back
                     ab = None

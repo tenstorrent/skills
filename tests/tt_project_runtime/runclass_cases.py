@@ -101,8 +101,11 @@ def test_stats_by_class_counts_runs_per_class_per_model_and_the_alarm_names_a_qu
     assert "status_report [chat]: claude:opus 6 (6.0/h) $3.00" in out and "coordinator [core]" in out
     assert {q["class"] for q in runclass.quiet_classes(s)} == {"status_report", "wake_decision"}
     assert "routed but none on chat: " in runclass.summary(s)
-    # Quiet otherwise: no chat provider (nothing routed), or the routed class ran on chat.
-    assert runclass.quiet_classes(runclass.by_class(p.db, {}, now - 3600, now)) == []
+    # With no chat provider the class is still meant for a cheap core model: its Opus runs alarm, the wake
+    # gate's own decisions (jev) do not. Quiet with cheap core models off, or once the class ran on chat.
+    assert {q["class"] for q in runclass.quiet_classes(runclass.by_class(p.db, {}, now - 3600, now))} == {"status_report"}
+    off = {"route": {"core_cheap": False}}
+    assert runclass.quiet_classes(runclass.by_class(p.db, off, now - 3600, now)) == []
     jevuse.record(p.db, "wake_gate", {"task": t, "needed": 0.0, "model": "example-org/small-model"}, 0.0, now=now - 5)
     p.db.x("INSERT INTO runs(task,role,provider,model,started,status,cost_usd,note) VALUES(?,?,?,?,?,?,?,?)",
            (t, "worker", "chat", "example-org/small-model", now - 5, "ok", 0.0, "{}"))
@@ -170,3 +173,83 @@ def test_the_quiet_class_alarm_raises_one_coordinator_event_per_window_with_coun
            (t, "worker", "chat", "example-org/small-model", now - 5, "ok", 0.0, "{}"))
     assert runclass.quiet_classes(runclass.by_class(p.db, _rc_cfg(), now - 3600, now + 1)) == []
     assert runclass.quiet_classes(runclass.by_class(p.db, {}, now - 3600, now + 1)) == []
+
+
+def test_a_cheap_class_falls_back_to_a_cheap_claude_model_at_low_effort_and_back_to_tt_once_one_answers():
+    from ttp import runclass
+    t = {"kind": "question", "tier": "standard", "title": "why"}
+    # No tt model configured (or none reachable): a cheap class takes Haiku or Sonnet at low effort, not Opus.
+    c = runclass.core_cheap({}, t, "status_report", "standard", "claude")
+    assert (c["model"], c["effort"], c["why"]) == ("sonnet", "low", "no chat model")
+    assert runclass.core_cheap({}, t, "screening", "standard", "claude")["model"] == "haiku"
+    assert runclass.core_cheap({}, t, "wake_decision", "standard", "claude")["model"] == "haiku"
+    # The tt endpoint failed its probe (key refused, cooling): the same cheap model, naming why.
+    cfg = _rc_cfg()
+    fell = {"to": "chat", "fallback": "auth"}
+    assert runclass.core_cheap(cfg, t, "status_report", "standard", "claude", fell)["why"] == "auth"
+    # Once a tt endpoint answers with a working key the route has no fallback: the run goes to the tt model.
+    ok = {"to": "chat", "fallback": "none", "model": "example-org/small-model"}
+    assert runclass.core_cheap(cfg, t, "status_report", "standard", "claude", ok) is None
+    # Never for the coordinator or hard work, other tiers, other providers, pinned or urgent tasks.
+    for cls in ("coordinator", "hard", "light"):
+        assert runclass.core_cheap({}, t, cls, "standard", "claude") is None, cls
+    assert runclass.core_cheap({}, t, "status_report", "deep", "claude") is None
+    assert runclass.core_cheap({}, t, "status_report", "light", "claude") is None
+    assert runclass.core_cheap({}, t, "status_report", "standard", "codex") is None
+    assert runclass.core_cheap({}, {**t, "model": "opus"}, "status_report", "standard", "claude") is None
+    assert runclass.core_cheap({}, {**t, "priority": 0}, "status_report", "standard", "claude") is None
+    assert runclass.core_cheap({}, t, "status_report", "standard", "claude", None, {"by": "retry"}) is None
+    # Config: all off, one class off, one class's model changed, or the class kept on core.
+    assert runclass.core_cheap({"route": {"core_cheap": False}}, t, "status_report", "standard", "claude") is None
+    one = {"route": {"core_cheap": {"status_report": False, "rebase": {"model": "haiku", "effort": "medium"}}}}
+    assert runclass.core_cheap(one, t, "status_report", "standard", "claude") is None
+    assert runclass.core_cheap(one, t, "rebase", "standard", "claude")["effort"] == "medium"
+    assert runclass.core_cheap({"route": {"classes": {"screening": "core"}}}, t, "screening", "standard", "claude") is None
+    # The start applies it only to the provider it was chosen for.
+    note = {runclass.CHEAP_KEY: c}
+    assert runclass.cheap_run(note, "claude") == c and runclass.cheap_run(note, "chat") is None
+
+
+def test_a_question_with_no_tt_model_dispatches_to_sonnet_low_and_to_the_tt_model_once_configured(env, monkeypatch):
+    from ttp import route, runclass
+    from ttp.daemon import Daemon
+    p = make(env)
+    d = Daemon(p.base)
+    prov, tier, note = _route_dispatch(p, d, monkeypatch, title="why is it slow", kind="question", tier="standard")
+    assert prov == "claude" and note[runclass.KEY] == "status_report"
+    assert note[runclass.CHEAP_KEY]["model"] == "sonnet" and note[runclass.CHEAP_KEY]["effort"] == "low"
+    # A tt model appears: the next run goes there, with no edit to the class routes.
+    _route_config(p, route=None)
+    d = Daemon(p.base)
+    prov, tier, note = _route_dispatch(p, d, monkeypatch, title="why is it slower", kind="question", tier="standard")
+    assert prov == "chat" and runclass.CHEAP_KEY not in note and note[route.KEY]["model"] == _RT_MODEL
+
+
+def test_cheap_core_runs_keep_the_alarm_quiet_and_tt_unavailable_is_told_once(env, monkeypatch):
+    from ttp import runclass
+    from ttp.daemon import Daemon
+    p = make(env)
+    now = time.time()
+    t = p.db.add_task("why", "", kind="question", tier="standard", priority=3, budget_usd=1.0)
+    cheap = json.dumps({runclass.CHEAP_KEY: {"provider": "claude", "model": "sonnet", "effort": "low",
+                                             "class": "status_report", "why": "no chat model"}})
+    for i in range(6):
+        p.db.x("INSERT INTO runs(task,role,provider,model,started,status,cost_usd,note) VALUES(?,?,?,?,?,?,?,?)",
+               (t, "worker", "claude", "sonnet", now - 60 - i, "ok", 0.05, cheap))
+    s = runclass.by_class(p.db, {}, now - 3600, now)
+    assert s["cheap"] == {"status_report": 6} and runclass.quiet_classes(s) == []
+    assert runclass.tt_unavailable(s) == ["status_report"]
+    assert "move back by themselves" in runclass.tt_unavailable_text(s, ["status_report"])
+    d = Daemon(p.base)
+    told = []
+    monkeypatch.setattr(d, "alert", lambda key, text, **k: told.append((key, k.get("severity"))))
+    for _ in range(3):
+        d._run_class_checked = 0.0
+        d.watch_run_classes()
+    assert told == [("tt-unavailable", "low")]
+    # A tt model serves again: the flag clears, so the next outage is told again.
+    p.db.x("INSERT INTO runs(task,role,provider,model,started,status,cost_usd,note) VALUES(?,?,?,?,?,?,?,?)",
+           (t, "worker", "chat", "example-org/small-model", now - 5, "ok", 0.0, "{}"))
+    d._run_class_checked = 0.0
+    d.watch_run_classes()
+    assert not p.db.kv("tt_unavailable_told", "") and len(told) == 1
