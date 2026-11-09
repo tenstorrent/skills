@@ -741,8 +741,32 @@ def _slowest_lines(reports, n: int = SLOWEST) -> list[str]:
     return [f"ttp-suite: slowest {len(top)} test calls:"] + [f"ttp-suite: {r.duration:8.2f}s {r.nodeid}" for r in top]
 
 
+SMOKE_LIST = Path(__file__).with_name("tt_project_smoke.txt")
+SMOKE_MARK = "tt_smoke"
+
+
+def smoke_ids(path: Path = SMOKE_LIST) -> set[str]:
+    """The test ids SMOKE_LIST names (file::test, every parametrization included); '#' starts a comment."""
+    try:
+        lines = path.read_text().splitlines()
+    except OSError:
+        return set()
+    return {s for line in lines if (s := line.split("#", 1)[0].strip())}
+
+
+def pytest_collection_modifyitems(config, items):
+    """Mark the tests SMOKE_LIST names `tt_smoke`: `pytest -m tt_smoke` runs the smoke suite a landing waits
+    for (delivery.push_checks); the rest run after landing (delivery.post_land_checks)."""
+    if not (ids := smoke_ids()):
+        return
+    for item in items:
+        if item.nodeid.split("[", 1)[0] in ids:
+            item.add_marker(SMOKE_MARK)
+
+
 @pytest.hookimpl(trylast=True)   # after pytest's own tmpdir plugin made the factory _use_tmpfs patches
 def pytest_configure(config):
+    config.addinivalue_line("markers", f"{SMOKE_MARK}: in the smoke suite a landing waits for ({SMOKE_LIST.name})")
     config._ttp_started = time.monotonic()
     _use_tmpfs(config)
     try:   # the real stderr: capture is suspended here, as for pytest's own faulthandler plugin
