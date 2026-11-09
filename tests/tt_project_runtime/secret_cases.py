@@ -1808,6 +1808,7 @@ def test_a_daemon_refuses_the_env_store_and_its_runs_never_inherit_or_miss_it_si
     assert not (p.state / "daemon.pid").exists()
     # A process started without the variable (a run, a hook): the store is unreadable, never empty
     secretstore._env.clear()
+    secretstore._mem.update(key=None, data=None)
     redact = _fresh_masking(monkeypatch)
     assert redact.pairs() == [] and redact.blind() and secretstore.ENV_VAR in redact.store_error()
     assert "secrets store could not be read" in outscan.problem("ttp notify", "hello", p=p)
