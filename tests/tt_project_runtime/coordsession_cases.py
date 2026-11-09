@@ -1591,16 +1591,17 @@ def test_coordsession_a_resumed_wake_books_what_the_session_total_rose_by(env):
     assert d._net_of_session(dict(r, task=1), RunUsage(cost_usd=5.0)) == 5.0, "a task's run netted over the coordinator's"
 
 
-def _cs_claude_run(p, session, total, note, *, task=None, role="coordinator", out=20_000, ended=None):
+def _cs_claude_run(p, session, total, note, *, task=None, role="coordinator", out=20_000, ended=None, init=True):
     """A finished Claude run whose output.jsonl reports `total` as Claude Code does (a resumed or forked
-    session's running total) with this run's own `out` output tokens; returns its row."""
+    session's running total) with this run's own `out` output tokens and no per-call usage; returns its
+    row. Without `init` the stream has no init event either (a stream booked the old way)."""
     rid = p.db.x("INSERT INTO runs(task,role,provider,model,started,ended,status,session_id,cost_basis,note) "
                  "VALUES(?,?,'claude','opus',?,?,'running',?,'reported',?)",
                  (task, role, (ended or time.time()) - 60, ended or time.time(), session, json.dumps(note)))
     d = p.runs / str(rid)
     d.mkdir(parents=True, exist_ok=True)
     (d / "output.jsonl").write_text("\n".join(json.dumps(e) for e in (
-        {"type": "system", "subtype": "init", "session_id": session, "model": "claude-opus-5-5"},
+        *([{"type": "system", "subtype": "init", "session_id": session, "model": "claude-opus-5-5"}] if init else []),
         {"type": "result", "subtype": "success", "session_id": session, "total_cost_usd": total,
          "usage": {"input_tokens": 10, "output_tokens": out, "cache_read_input_tokens": 0,
                    "cache_creation_input_tokens": 0},
@@ -1626,28 +1627,32 @@ def _cs_finish(p, d, r):
 
 
 def test_resumed_and_forked_claude_sessions_book_only_their_own_cost(env):
-    """Claude Code reports a resumed or forked session's running total (total_cost_usd): three wakes of
-    the coordinator's session, a worker forked from it and that worker's resume each book only what the
+    """A stream with no per-call usage and no init event books the old way (the fallback): Claude Code
+    reports a resumed or forked session's running total (total_cost_usd), so three wakes of the
+    coordinator's session, a worker forked from it and that worker's resume each book only what the
     total rose by. A project rate that prices a wake's tokens above its delta once (the floor the old
     netting took) must not make every later wake book the whole running total; a fresh run books its
-    report as it stands."""
+    report as it stands. The same resumed or forked runs whose stream shows Claude Code started (init)
+    but no call that answered book $0 (a lost or failed fork): never the running total."""
     p = make(env)
     p.set_config("budget.estimate_usd_per_mtok", 100.0)   # the project's measured rate, inflated
     from ttp.daemon import Daemon
     d = Daemon(p.base)
     wake = lambda mode: {"turn": {"session": {"mode": mode, "why": "continued"}}}
-    got = [_cs_finish(p, d, _cs_claude_run(p, "C", 1.0, wake("new"))),
-           _cs_finish(p, d, _cs_claude_run(p, "C", 2.0, wake("resume")))]
-    fork = _cs_claude_run(p, "F", 2.6, {"coord_context": {"how": "fork"}}, task=7, role="worker")
+    run = lambda *a, **k: _cs_finish(p, d, _cs_claude_run(p, *a, init=False, **k))
+    got = [run("C", 1.0, wake("new")), run("C", 2.0, wake("resume"))]
+    fork = _cs_claude_run(p, "F", 2.6, {"coord_context": {"how": "fork"}}, task=7, role="worker", init=False)
     got.append(_cs_finish(p, d, fork))
-    got.append(_cs_finish(p, d, _cs_claude_run(p, "C", 2.5, wake("resume"))))
-    got.append(_cs_finish(p, d, _cs_claude_run(p, "F", 3.5, {"resumes": {"session": "F"},
-                                                             "coord_context": {"how": "resume", "run": fork["id"]}},
-                                               task=7, role="worker")))
-    got.append(_cs_finish(p, d, _cs_claude_run(p, "N", 0.7, {}, task=8, role="worker")))
+    got.append(run("C", 2.5, wake("resume")))
+    got.append(run("F", 3.5, {"resumes": {"session": "F"}, "coord_context": {"how": "resume", "run": fork["id"]}},
+                   task=7, role="worker"))
+    got.append(run("N", 0.7, {}, task=8, role="worker"))
     assert got == [1.0, 1.0, 0.40004, 0.5, 0.9, 0.7], got   # a fork's first run: its own tokens at list price
     assert d._session_total_before("C", 1 << 62) == 2.5, "the resumed wake's cap base is the session's last total"
     assert d._session_total_before("F", 1 << 62) == 3.5
+    lost = [_cs_finish(p, d, _cs_claude_run(p, "C", 3.0, wake("resume"))),
+            _cs_finish(p, d, _cs_claude_run(p, "G", 4.0, {"coord_context": {"how": "fork"}}, task=9, role="worker"))]
+    assert lost == [0.0, 0.0], lost
 
 
 
