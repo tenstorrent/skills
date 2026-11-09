@@ -12877,7 +12877,7 @@ COMMAND_GROUPS = (
     ("admin", ("setup", "upgrade", "start", "stop", "restart", "adopt", "prune", "secret", "consent",
                "notifier", "schedules", "heal", "upstream", "lease", "replicate", "check-plan", "stats", "audit",
                "push-audit", "ttr", "selfchange", "spend-today", "throughput", "model-trip", "echoes", "course",
-               "uninstall", "bench")),
+               "uninstall", "bench", "model-bench")),
 )
 
 
@@ -13693,7 +13693,8 @@ def main(argv: list[str] | None = None) -> None:
                                             "models once per host and day (a second run does nothing; the "
                                             "daemon runs it daily), `show` prints the owner, latest result and "
                                             "per-model scores")
-    s.add_argument("action", choices=["run", "show"])
+    s.add_argument("action", choices=["run", "show"], help="run: bench the served models (once per host and day); "
+                                                            "show: print the owner, latest result and per-model scores")
     s.add_argument("--force", action="store_true", help="run: bench again though today's result exists")
     s.set_defaults(fn=cmd_model_bench)
 
