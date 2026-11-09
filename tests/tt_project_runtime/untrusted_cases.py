@@ -155,3 +155,115 @@ def test_an_untrusted_input_runs_git_and_gh_wrappers_push_only_its_branches_and_
     assert out.returncode == 0, out.stderr
     assert gh("-R", "o/r", "pr", "comment", "1", "-b", "hi [authored by AI]").returncode == 0
     assert "comment" in (tmp_path / "gh.log").read_text()
+
+
+# The label per source (set model-free, inherited, never routed), ported from #6702/#7231.
+def _untrusted_labels(t):
+    return json.loads(t["labels"] or "[]")
+
+
+def test_the_daemon_labels_a_pr_findings_fix_and_a_shared_check_fix(env):
+    from ttp import sharedchecks, untrusted
+    from ttp.daemon import Daemon
+    p = make(env)
+    p.db.x("UPDATE tasks SET status='done'")
+    src = p.db.add_task("Speed up the loader", "s", kind="code")
+    p.db.update_task(src, status="done", pr_url="https://github.com/acme/widgets/pull/7")
+    fix, made = Daemon(p.base).pr_findings_owner("acme/widgets#7", {"task": src, "url": "https://github.com/acme/"
+                                                 "widgets/pull/7"}, "CI failing: tests")
+    assert made and untrusted.labelled(fix), "PR comments and CI logs are untrusted text"
+    t = p.db.task(p.db.add_task("Run checks", "s", kind="code"))
+    fid, opened = sharedchecks.incident(p.db, t, ["tests/x.py::test_a"], "E   boom", time.time(), {})
+    assert opened and untrusted.labelled(p.db.task(p.db.one("SELECT fix_task FROM checks_incidents WHERE id=?",
+                                                            (fid,))["fix_task"]))
+    assert not untrusted.labelled(t) and not untrusted.labelled(p.db.task(src)), "the source tasks keep theirs"
+
+
+def test_the_coordinator_sets_the_label_by_flag_or_peer_note_tag_and_continuations_inherit_it(env):
+    from ttp import coordinator as coord, untrusted
+    p = make(env)
+
+    def add(title, **a):
+        assert coord.apply(p, [{"type": "task_add", "title": title, "spec": a.pop("spec", "s"), **a}]) == []
+        return p.db.one("SELECT * FROM tasks WHERE title=?", (title,))
+
+    assert untrusted.labelled(add("triage the issue", untrusted_input=True))
+    assert untrusted.labelled(add("answer the peer", spec="The other project asks [note 3fa9c2e1] for a rerun."))
+    plain = add("plain work", spec="Rename the helper; see note 12 in the guide.")
+    assert not untrusted.labelled(plain), "no flag and no note tag: no label"
+    assert not untrusted.labelled(add("string flag", untrusted_input="yes")), "only a real true sets it"
+    src = add("read the logs", untrusted_input=True)
+    p.db.update_task(src["id"], status="failed")
+    redo = add("redo the logs", continues=src["id"])
+    assert untrusted.labelled(redo), "a continuation of a labelled task inherits the label"
+    p.db.update_task(plain["id"], status="failed")
+    assert not untrusted.labelled(add("redo plain", continues=plain["id"]))
+
+
+def test_a_review_fix_of_a_labelled_change_inherits_the_label(env):
+    from ttp import untrusted
+    from ttp.daemon import Daemon
+    p = make(env)
+    _with_origin(env, clone=False)
+    p.set_config("budget.max_tasks_per_24h", 1000)
+    cid, _, _, (rev,) = _finish_code(env, p, "triage change", {"app.py": 20}, before=lambda tid, head: p.db.update_task(
+        tid, labels=json.loads(p.db.task(tid)["labels"] or "[]") + [untrusted.LABEL]))
+    p.db.update_task(rev["id"], status="failed")
+    fid, rid, _ = Daemon(p.base)._fix_failed_review(p.db.task(rev["id"]), [{"title": "bug", "spec": "fix it"}], "bug")
+    assert untrusted.labelled(p.db.task(fid)) and f"continues:{cid}" in _untrusted_labels(p.db.task(fid))
+
+
+def test_a_run_that_reads_web_connector_or_downloaded_text_labels_its_task_when_it_ends(env, tmp_path, monkeypatch):
+    from ttp import coordtools, hook, untrusted
+    from ttp.daemon import Daemon
+    p = make(env)
+    tid = p.db.add_task("look it up", "s", kind="work")
+    monkeypatch.setenv("TTP_TASK", str(tid))
+    monkeypatch.setenv(coordtools.ROLE_ENV, "worker")
+    sources = {}
+    for i, (tool, inp, want) in enumerate([
+            ("WebFetch", {"url": "https://example.com"}, ["web"]),
+            ("mcp__atlassian__getJiraIssue", {"issueIdOrKey": "X-1"}, ["connector"]),
+            ("Bash", {"command": "curl -sL https://example.com/a.tar.gz -o a.tgz"}, ["download"]),
+            ("Bash", {"command": "cd x && wget --url=ftp://example.org/f"}, ["download"]),
+            ("Bash", {"command": "curl -s http://localhost:8080/status"}, []),
+            ("Bash", {"command": "git log -1"}, []),
+            ("Read", {"file_path": "/tmp/x"}, [])]):
+        d = tmp_path / str(i)
+        d.mkdir()
+        hook.mark_untrusted({"tool_name": tool, "tool_input": inp}, str(d))
+        hook.mark_untrusted({"tool_name": tool, "tool_input": inp}, str(d))   # once per source
+        assert untrusted.marked(d) == want, (tool, inp)
+        sources[i] = d
+    monkeypatch.setenv(coordtools.ROLE_ENV, "coordinator")
+    hook.mark_untrusted({"tool_name": "WebFetch", "tool_input": {}}, str(tmp_path / "6"))
+    assert untrusted.marked(tmp_path / "6") == [], "a coordinator run marks nothing"
+    d = Daemon(p.base)
+    d._carry_untrusted(tid, 1, untrusted.marked(sources[0]))
+    d._carry_untrusted(tid, 2, ["connector"])
+    assert _untrusted_labels(p.db.task(tid)).count(untrusted.LABEL) == 1
+    assert "labelled untrusted_input: its run 1 read web text" in _daemon_log_text(p)
+
+
+def test_a_labelled_task_never_routes_to_the_chat_provider_and_the_run_note_records_it(env, monkeypatch):
+    from ttp import route, untrusted
+    from ttp.daemon import Daemon
+    p = make(env)
+    p.db.x("UPDATE tasks SET status='done'")
+    d = Daemon(p.base)
+    d.cfg = dict(d.cfg, core_provider="claude", providers={**d.cfg["providers"], "chat": {
+        "tiers": {"light": {"route": True, "model": "glm-x"}, "standard": {"route": True, "model": "glm-x"}}}})
+    monkeypatch.setattr(d, "_workdir_for", lambda t: (str(p.base), None))
+    started = []
+    monkeypatch.setattr(d, "start_run", lambda *a, **k: started.append((a, k)) or 0)
+    now = time.time()
+    plain = p.db.task(p.db.add_task("Copy", "Copy the log.", tier="light", origin="coordinator"))
+    bad = p.db.task(p.db.add_task("Copy too", "Copy the log.", tier="light", origin="coordinator",
+                                  labels=[untrusted.LABEL]))
+    assert route.eligible(plain, None) and not route.eligible(bad, None)
+    assert d._route(plain, "light", None, now)["to"] == "chat"
+    assert d._route(bad, "light", None, now) is None
+    p.db.update_task(plain["id"], status="done")
+    d.dispatch()
+    (a, kw), = started
+    assert a[2] == "claude" and kw["note"][untrusted.KEY] == {"set": True, "kept_core": "chat:glm-x"}

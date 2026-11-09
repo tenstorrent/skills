@@ -37,6 +37,7 @@ import uuid
 from pathlib import Path
 
 from . import runtimeload   # first of its own: its LOADED_AT is when the daemon imported its code
+from . import untrusted
 from . import ackwait
 from . import claimcheck
 from . import dispatchguard
@@ -5109,6 +5110,8 @@ class Daemon:
         if r["role"] == "coordinator":
             self._coord_writes(r, run_dir, report=not self._lean_reap)   # before its output is applied
         runner.remove_private(run_dir)   # the runner removes them too, unless it died first
+        if r["role"] != "coordinator" and r["task"] and (read := untrusted.marked(run_dir)):
+            self._carry_untrusted(r["task"], r["id"], read)
         try:   # the runner masks them too, unless it died first: before the output or hand-off is read
             left: list = []   # within the step: each file capped, the run time-limited; the rest detached
             redact.scrub_run(run_dir, step=True, left=left)
@@ -10616,6 +10619,9 @@ class Daemon:
                     note[route.KEY] = routed
                 if dp := self._model_pick(task, tier, peek=True):
                     note[modelpick.KEY] = {k: dp.get(k) for k in ("by", "pick", "p", "why", "tier") if k in dp}
+                if untrusted.labelled(task):   # it never routes (route.eligible): the model it skipped, if any
+                    to = route.target(self.cfg, tier)
+                    note[untrusted.KEY] = {"set": True, **({"kept_core": f"{to[0]}:{to[1]}"} if to else {})}
                 # A cheap class on the Claude core provider (no tt model serves it): a cheap Claude model.
                 cheap = None if dp else runclass.core_cheap(self.cfg, task, run_cls, tier, run_prov, routed, picked)
                 if cheap:
@@ -10932,6 +10938,17 @@ class Daemon:
             return None
         log(self.p, f"task {task['id']}: {tierfloor.note(got)}")
         return {**got, "task": task}
+
+    def _carry_untrusted(self, tid: int, run_id: int, read: list[str]) -> None:
+        """A task run that read untrusted text (untrusted.RUN_MARK) labels its task, so its later runs and the
+        work that continues it get the narrowed policy and stay on the core provider."""
+        try:
+            t = self.p.db.task(tid)
+            if t and not untrusted.labelled(t):
+                self.p.db.update_task(tid, labels=json.loads(t["labels"] or "[]") + [untrusted.LABEL])
+                log(self.p, f"task {tid}: labelled {untrusted.LABEL}: its run {run_id} read {', '.join(read)} text")
+        except Exception as e:   # the label must never cost the run its end
+            log(self.p, f"task {tid}: {untrusted.LABEL} label not set: {e}")
 
     def _floor_keeps_core(self, task: dict, tier: str, picked: dict | None) -> str:
         """The routed model (route.py) a floor run (tierfloor.target) skips to run on the core provider,
@@ -17633,7 +17650,8 @@ class Daemon:
                 fid = db.add_task(f"Fix review #{review['id']}: {base_title}"[:200], "", kind="code", tier=tier,
                                   tier_source=tsrc, priority=chainprio.of(db, code, review), origin="daemon",
                                   budget_usd=float(cfg["budget"]["task_default_usd"].get(tier, 8.0)),
-                                  labels=[f"continues:{code['id']}", f"review_fix:{review['id']}"], **pin_of(code))
+                                  labels=untrusted.inherit([f"continues:{code['id']}", f"review_fix:{review['id']}"], code),
+                                  **pin_of(code))
                 fbranch = f"ttp/t{fid}-{worktree.slug(base_title)}"
             # The stack's pr_branch goes with its `ttp push --own` step: the re-review carries it as a label,
             # and its spec names the fix's branch to publish from (the reviewed branch lacks the fixes).
@@ -17753,7 +17771,8 @@ class Daemon:
             fid = db.add_task(f"Fix review #{review['id']}: {base_title}"[:200], "", kind="code", tier=tier,
                               tier_source=tsrc, priority=chainprio.of(db, code, review), origin="daemon",
                               budget_usd=float(cfg["budget"]["task_default_usd"].get(tier, 8.0)),
-                              labels=[f"continues:{code['id']}", f"review_fix:{review['id']}"], **pin_of(code))
+                              labels=untrusted.inherit([f"continues:{code['id']}", f"review_fix:{review['id']}"], code),
+                                  **pin_of(code))
             rid = db.add_task(
                 f"Re-review #{review['id']}: " + re.sub(r"^(?:Re-review #\d+: )+", "", review["title"]),
                 "\n".join([
@@ -17887,7 +17906,7 @@ class Daemon:
                               tier_source="parent_copy", priority=src["priority"], origin="daemon",
                               budget_usd=float(self.cfg["budget"]["task_default_usd"].get(tier, 8.0)),
                               branch=branch if branch and not held else None,
-                              labels=[f"continues:{src['id']}", f"pr_fix:{key}"]
+                              labels=[f"continues:{src['id']}", f"pr_fix:{key}", untrusted.LABEL]   # PR comments, CI logs
                               + ([f"pr_branch:{branch}"] if branch else []), **pin_of(src))
         log(self.p, f"{key}: open findings outlived task {src['id']}; queued fix #{fid}")
         return db.task(fid), True

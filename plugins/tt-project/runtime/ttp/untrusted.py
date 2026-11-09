@@ -38,6 +38,11 @@ import re
 LABEL = "untrusted_input"   # modelpick.UNTRUSTED
 WRITE_LABEL = "untrusted_write"
 ENV = "TTP_UNTRUSTED_INPUT"
+KEY = LABEL                    # the run note's entry
+RUN_MARK = "untrusted-input"   # in the run dir: one source per line (web, connector, download), read by the hook and the daemon
+SOURCES = ("pr_comments", "test_log", "peer_note", "coordinator", "web", "connector", "download", "inherited")
+NOTE_TAG_RE = re.compile(r"\[note [0-9a-f]{6,}\]")
+LOCAL_RE = re.compile(r"^(?:https?://)?(?:localhost|127(?:\.\d+){3}|\[::1\]|0\.0\.0\.0)(?:[:/]|$)")
 READ_VERBS = {"view", "list", "ls", "diff", "checks", "status", "download", "watch", "clone", "checkout",
               "verify", "search"}
 READ_GROUPS = {"search", "status", "help", "version", "completion", "browse"}
@@ -79,10 +84,61 @@ def _task(env: dict | None = None) -> tuple[str, str]:
     return str(env.get("TTP_TASK") or ""), str(env.get("TTP_PROJECT") or "")
 
 
+def labelled(task: dict | None) -> bool:
+    """A task record that carries the label."""
+    try:
+        return LABEL in json.loads((task or {}).get("labels") or "[]")
+    except (TypeError, ValueError):
+        return False
+
+
+def inherit(labels: list[str], *tasks: dict | None) -> list[str]:
+    """`labels` plus LABEL when it is missing and one of `tasks` (the work a new task continues) carries it."""
+    return labels + [LABEL] if LABEL not in labels and any(labelled(t) for t in tasks) else labels
+
+
+def spec_sources(spec: str) -> list[str]:
+    """The untrusted sources a coordinator's spec shows model-free: a peer note's `[note <fp>]` tag."""
+    return ["peer_note"] if NOTE_TAG_RE.search(spec or "") else []
+
+
+def mark(run_dir: str, source: str) -> None:
+    """Record in the run dir that this run read untrusted text from `source` (once per source)."""
+    path = os.path.join(run_dir, RUN_MARK)
+    try:
+        if source not in marked(run_dir):
+            with open(path, "a") as f:
+                f.write(source + "\n")
+    except OSError:
+        pass
+
+
+def marked(run_dir: str | None) -> list[str]:
+    try:
+        with open(os.path.join(run_dir, RUN_MARK)) as f:
+            return f.read().split()
+    except (OSError, TypeError):
+        return []
+
+
+def read_source(tool: str, segments: list[list[str]] | None = None) -> str:
+    """The untrusted source a tool call reads, or '': web pages, connector reads, remote downloads."""
+    if tool in ("WebFetch", "WebSearch"):
+        return "web"
+    if tool.startswith("mcp__"):
+        return "connector"
+    for seg in segments or []:
+        if seg and os.path.basename(seg[0]) in ("curl", "wget") and any(
+                re.match(r"(?:--url=)?(?:https?|ftp)://", a) and not LOCAL_RE.match(a.removeprefix("--url="))
+                for a in seg[1:]):
+            return "download"
+    return ""
+
+
 def active(env: dict | None = None) -> bool:
-    """This run's task reads untrusted input."""
+    """This run's task reads untrusted input: labelled, or its run read web, connector or downloaded text."""
     env = os.environ if env is None else env
-    return env.get(ENV) == "1" or LABEL in _labels(*_task(env))
+    return env.get(ENV) == "1" or LABEL in _labels(*_task(env)) or bool(marked(env.get("TTP_RUN_DIR")))
 
 
 def writes_allowed(env: dict | None = None) -> bool:

@@ -250,8 +250,24 @@ def _quiet(check: Callable[[Path], str | None], path: Path) -> str | None:
         return None
 
 
+def mark_untrusted(payload: dict, run_dir: str) -> None:
+    """Record that a task run (a subagent's call too) read web, connector or downloaded text (untrusted.py)."""
+    try:
+        from . import coordtools, untrusted
+        tool = str(payload.get("tool_name") or "")
+        if not os.environ.get("TTP_TASK") or os.environ.get(coordtools.ROLE_ENV) == "coordinator":
+            return
+        cmd = str((payload.get("tool_input") or {}).get("command") or "") if tool == "Bash" else ""
+        if src := untrusted.read_source(tool, _all_segments(_split(cmd)[0]) if cmd else None):
+            untrusted.mark(run_dir, src)
+    except Exception:   # fails open, as the hook does
+        pass
+
+
 def post_tool_use(payload: dict) -> tuple[dict | None, Callable[[], None] | None]:
     run_dir = os.environ.get("TTP_RUN_DIR")
+    if run_dir:
+        mark_untrusted(payload, run_dir)
     if not run_dir or payload.get("agent_id"):
         return None, None
     parts, marks = [], []
