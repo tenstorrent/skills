@@ -2578,7 +2578,8 @@ def _claims_checked(p: Project, a: dict, notes: list) -> tuple[str, list]:
 
 def apply(p: Project, actions: list[dict], default_chat: str | None = None, user_turn: bool = False,
           turn: int | None = None, messages: list[int] | None = None, lean: bool = False,
-          applied: list | None = None) -> list[str]:
+          applied: list | None = None, skip_actions: frozenset | set = frozenset(),
+          on_action=None) -> list[str]:
     """Apply validated actions. Returns human-readable notes about rejected ones, fed back next turn.
     Notes on actions applied with a change (NOTES_KEY) reach the next digest as information only.
     `messages`: the user messages the daemon started this turn for (a charter change they approved
@@ -2590,7 +2591,9 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
     text sent again by a later turn is still written. `lean`: the daemon applies this turn again after
     it was cut off applying it (Daemon._reap): the optional restriction checks, which may have held it,
     are skipped and a note says so. `applied`, when given, is filled with the indexes of the actions
-    that went through (mustact.settle)."""
+    that went through (mustact.settle). `on_action(i)` is called before action i is applied and the
+    indexes in `skip_actions` are refused unapplied (Daemon._coord_journal: an action the daemon was cut off
+    in twice is skipped, so the rest of the turn still applies)."""
     db, problems, notes = p.db, [], []
     cfg = p.config()
     # For the stale-restriction check (_restriction_conflicts): the restrictions before this turn's
@@ -2635,6 +2638,13 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
     for k, (i, a) in enumerate(order):
         t = a.get("type")
         key = f"{turn}.{i}" if turn is not None else None
+        if i in skip_actions:
+            failed.add(i)
+            problems.append(f"{t}: not applied: the daemon was cut off twice while applying it; the action "
+                            f"is still in turn {turn}'s output")
+            continue
+        if on_action is not None:
+            on_action(i)
         try:
             a = normalize_action(a)
             if t == "reply":
@@ -4052,6 +4062,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 _charter_retry_now(p, a, str(e), key, announced, filled=(filled[0], why) if filled else None)
             if t == "config_set" and a.get("key"):
                 cfg_refused[str(a["key"])] = str(e)
+    if on_action is not None:   # past the actions: a cut-off from here on blames none of them
+        on_action(None)
     plans = _apply_due_moves(p, actions, due_moves, failed, problems, notes, started, plan_before)
     for k, before, upd in new_ask_holds:
         ask = next((mid for at, mid in turn_asks if at > k), None)

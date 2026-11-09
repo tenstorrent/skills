@@ -606,7 +606,9 @@ EXTRA_KEYS = {
     # root_ref_lock_s: the age (unset: 3600 s; 0: off) past which a ref lock in the project root's repository
     # that nothing may own is moved aside by the daemon's harness sweep (gitlocks.clear_root_refs).
     "harness_git": {"stale_lock_s", "root_ref_lock_s"},
-    "watchdog": {"stale_git_lock_s", "step_budget_s"},   # step_budget_s: see DEFAULT_CONFIG; stale_git_lock_s: deprecated alias of harness_git.stale_lock_s, read only when that is unset
+    # stale_git_lock_s: deprecated alias of harness_git.stale_lock_s, read only when that is unset.
+    # step_budget_s: seconds each daemon tick step may run (unset: daemon.STEP_BUDGET_S; Daemon._step_budget).
+    "watchdog": {"stale_git_lock_s", "step_budget_s"},
     # push_queue..after_push_timeout_s: the daemon-owned push queue (see PUSH_QUEUE_DEFAULTS).
     # backup_remote: a git remote finished code tasks' branches are pushed to, fast-forward only (off: unset).
     # fast_forward_also: more branches each push moves to the pushed commit, fast-forward only (off: unset).
