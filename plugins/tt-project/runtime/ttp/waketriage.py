@@ -1,0 +1,59 @@
+"""Before an event-only coordinator wake, the watcher model decides whether it needs the coordinator now.
+
+The daemon asks babysit.ask(..., target="coordinator") once per set of queued events. "skip" folds the
+batch: no turn starts, the events stay queued on disk and ride the next wake's digest; the same set is
+not asked again, and it wakes without asking once its oldest event is coordinator.wake_triage_max_s old
+(default 1800). A new event changes the set and asks again. "wake" or "flag" wakes as before; the
+coordinator's effort tier never changes here. Any watcher error wakes and logs the model and the error.
+Off with coordinator.wake_triage false or without a chat provider (babysit.settings is None)."""
+from __future__ import annotations
+
+from . import babysit
+
+KEY = "wake_triage"
+MAX_S = 1800.0
+QUESTION = ("A batch of project events (below) would wake the project's coordinator, an expensive "
+            "model run. Answer skip when every event is routine progress the coordinator can read on "
+            "its next wake (a task finished as planned, a timer, a note). Answer wake coordinator when "
+            "any event needs a decision or action now (a failure, a blocker, a stuck or idle project, "
+            "something that would be lost or late if it waited).")
+
+
+def max_s(cfg: dict) -> float:
+    try:
+        return max(float((cfg.get("coordinator") or {}).get("wake_triage_max_s", MAX_S)), 0.0)
+    except (TypeError, ValueError):
+        return MAX_S
+
+
+def on(cfg: dict) -> bool:
+    return (cfg.get("coordinator") or {}).get("wake_triage", True) is not False and \
+        babysit.settings(cfg) is not None
+
+
+def state(db, ids: list[int]) -> str:
+    rows = db.q(f"SELECT id, kind, severity, task, text FROM events WHERE id IN ({','.join('?' * len(ids))}) "
+                "ORDER BY id", tuple(ids))
+    lines = [f"event {r['id']} {r['kind']} ({r['severity']})" + (f" task #{r['task']}" if r["task"] else "")
+             + f": {' '.join(str(r['text'] or '').split())[:300]}" for r in rows]
+    return "\n".join(lines)[:6000]
+
+
+def fold(db, cfg: dict, evs: list[dict], now: float, ask=babysit.ask) -> tuple[bool, str]:
+    """(True, log line) when this batch folds into the next wake, else (False, log line or "")."""
+    ids = sorted(e["id"] for e in evs)
+    seen = db.kv(KEY, {}) or {}
+    if seen.get("ids") == ids and seen.get("verb") == "skip":
+        if now - min(e["ts"] for e in evs) < max_s(cfg):
+            return True, ""
+        return False, f"coordinator wake: events {ids} waited {int(max_s(cfg))} s after a watcher skip, waking"
+    model = (babysit.settings(cfg) or {}).get("model") or "none"
+    try:
+        d = ask(cfg, state(db, ids), QUESTION, target="coordinator", db=db, purpose="coordinator_wake")
+    except Exception as e:   # the watcher only saves money: any error wakes
+        return False, f"coordinator wake triage failed, waking ({model}): {type(e).__name__}: {str(e)[:300]}"
+    db.set_kv(KEY, {"ids": ids, "verb": d["verb"], "at": now, "model": d.get("model") or model})
+    if d["verb"] == "skip":
+        return True, (f"coordinator wake folded by the watcher ({d.get('model') or model}): events {ids} "
+                      f"stay queued for the next wake, at most {int(max_s(cfg))} s")
+    return False, ""

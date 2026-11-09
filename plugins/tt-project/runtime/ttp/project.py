@@ -271,6 +271,14 @@ DEFAULT_CONFIG: dict[str, Any] = {
                     # waits) start no sooner than this long after the last turn ended, unless a slot is
                     # free with nothing ready to fill it (eventhold.py; 0: off).
                     "event_hold_s": 300,
+                    # Event-only batches with no immediate event (task ends, hand-offs, timers, waits)
+                    # wake at most once per this long after the last turn ended, a free slot included;
+                    # user messages and immediate events wake at once (eventhold.gap_until; 0: off).
+                    "wake_gap_s": 300,
+                    # The watcher model (babysit.ask) folds such a batch into the next wake, kept on disk;
+                    # a folded batch wakes once its oldest event is wake_triage_max_s old (waketriage.py).
+                    "wake_triage": True,
+                    "wake_triage_max_s": 1800,
                     # High events within this long after the turn high events woke (from its end) start
                     # no turn of their own: one follow-up turn reads them all when it ends. User
                     # messages, critical and safety-class events never wait (bursthold.py; 0: off).
