@@ -604,55 +604,35 @@ def _dispatch_one(p, monkeypatch, flags, **kw):
     return _dispatch_claude_worker(p, monkeypatch, flags, **kw)
 
 
-def test_claude_workers_get_a_tool_allowlist_with_web_tools_only_where_the_task_needs_them(env, monkeypatch, tmp_path):
-    """Workers and reviewers on Claude run with --tools (the built-in tools workers use, Skill for the
-    plugin skills, ToolSearch so MCP tools stay deferred) instead of the long denylist. The web tools
-    come with every kind but a review; a review gets them only when its spec links a page off GitHub."""
+def test_claude_workers_and_reviewers_get_the_full_tool_set(env, monkeypatch, tmp_path):
+    """Workers and reviewers on Claude run on the full Claude Code harness (user msg #2302): no --tools
+    allowlist, Agent included; ttp.hook holds the rules. Only the web tools under no_internet and the
+    project's own denylist are withheld."""
     from ttp.providers import claude
-    lean = ["Bash", "Read", "Edit", "Write", "Skill", "ToolSearch"]
     p = make(env)
-    # Default worker (a code task): the allowlist with the web tools, and no built-in denylist.
-    argv, _, _ = _dispatch_one(p, monkeypatch, {}, kind="code")
-    assert _claude_tools(argv) == [*lean, "WebFetch", "WebSearch"]
-    assert argv.count("--tools") == 1 and "--disallowedTools" not in argv, "nothing left to deny"
-    assert argv[argv.index("--tools") + 2].startswith("--"), "--tools takes several values: a flag must follow"
-    # Review: no web tools.
-    argv, run_dir, _ = _dispatch_one(p, monkeypatch, {}, kind="review")
-    assert p.db.one("SELECT role FROM runs WHERE dir=?", (str(run_dir),))["role"] == "reviewer"
-    assert _claude_tools(argv) == lean
-    argv, _, _ = _dispatch_one(p, monkeypatch, {}, kind="review",
-                                         spec="Check https://github.com/o/r/pull/1 and https://api.github.com/x")
-    assert _claude_tools(argv) == lean, "GitHub links are read with gh"
-    # A web-needing review: its spec links a page elsewhere.
-    argv, _, _ = _dispatch_one(p, monkeypatch, {}, kind="review",
-                                         spec="Check the flag against https://docs.example.com/cli")
-    assert _claude_tools(argv) == [*lean, "WebFetch", "WebSearch"]
-    # The no_internet restriction wins over the task's kind.
+    for kind in ("code", "review", "question", "plan"):
+        argv, _, _ = _dispatch_one(p, monkeypatch, {}, kind=kind)
+        assert _claude_tools(argv) is None and "--disallowedTools" not in argv, kind
+        hooks = json.loads(argv[argv.index("--settings") + 1])["hooks"]["PreToolUse"]
+        assert [h["matcher"] for h in hooks] == ["*"], "every tool, subagents' too, meets the hook"
+    # The no_internet restriction withholds the web tools only.
     p.set_config("restrictions.no_internet", True)
-    argv, _, _ = _dispatch_one(p, monkeypatch, {}, kind="question")
-    assert _claude_tools(argv) == lean and "WebFetch" not in argv
+    argv, _, _ = _dispatch_one(p, monkeypatch, {}, kind="review")
+    assert argv[argv.index("--disallowedTools") + 1:argv.index("--settings")] == list(claude.WEB_TOOLS)
     p.set_config("restrictions.no_internet", False)
-    # A project with MCP servers for its workers: they come through --mcp-config; --tools only limits
-    # built-in tools, and ToolSearch keeps their schemas deferred. The project's own denylist stays.
+    # The project's own denylist stays; its MCP servers come through --mcp-config.
     _claude_mcp_config(tmp_path, monkeypatch, p)
     p.set_config("providers.claude.worker_isolation", True)
     p.set_config("providers.claude.mcp_servers", ["docs"])
     p.set_config("providers.claude.disallowed_tools", ["mcp__docs__write_page"])
     argv, _, _ = _dispatch_one(p, monkeypatch, {}, kind="work")
-    assert _claude_tools(argv) == [*lean, "WebFetch", "WebSearch"]
+    assert _claude_tools(argv) is None
     assert "--strict-mcp-config" in argv and "--mcp-config" in argv
     assert argv[argv.index("--disallowedTools") + 1:argv.index("--settings")] == ["mcp__docs__write_page"]
     pathlib.Path(argv[argv.index("--mcp-config") + 1]).unlink()
-    # A CLI without --tools keeps the old denylist, the web tools on it where the task does not need them.
-    argv, _, _ = _dispatch_one(p, monkeypatch, {claude.TOOLS: False}, kind="review")
-    assert "--tools" not in argv
-    denied = argv[argv.index("--disallowedTools") + 1:argv.index("--settings")]
-    assert denied == [*claude.WORKER_DENIED_TOOLS, "WebFetch", "WebSearch", "mcp__docs__write_page"]
-    pathlib.Path(argv[argv.index("--mcp-config") + 1]).unlink()
 
 
-def test_the_tool_allowlist_leaves_coordinator_turns_codex_and_cursor_alone(env, monkeypatch):
-    from ttp import daemon as dmod
+def test_the_tool_set_change_leaves_coordinator_turns_codex_and_cursor_alone(env, monkeypatch):
     from ttp.providers import claude, get_provider
     monkeypatch.setattr(claude, "_FLAGS", {claude.TOOLS: True})
     kw = dict(model="opus", effort="low", cwd=".", budget_usd=1.0, schema=None, restrictions={})
@@ -662,9 +642,6 @@ def test_the_tool_allowlist_leaves_coordinator_turns_codex_and_cursor_alone(env,
         for role, read_only in (("worker", False), ("reviewer", False), ("coordinator", True)):
             with_web = get_provider(name).build(role=role, read_only=read_only, web=True, **kw)
             assert get_provider(name).build(role=role, read_only=read_only, web=False, **kw) == with_web, name
-    assert dmod.web_needed("worker", None) and dmod.web_needed("worker", {"kind": "code", "spec": ""})
-    assert not dmod.web_needed("reviewer", {"kind": "review", "title": "review #1", "spec": "diff"})
-    assert dmod.web_needed("reviewer", {"kind": "review", "title": "see http://example.org/a", "spec": ""})
 
 
 def _stub_runner(monkeypatch):

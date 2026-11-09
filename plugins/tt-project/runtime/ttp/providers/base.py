@@ -308,8 +308,8 @@ class Provider:
         """Return (argv, extra_env) for a headless run whose prompt arrives on stdin. A worker's run
         also denies `disallowed_tools` (the project's providers.<p>.disallowed_tools), and reads of the
         files in `denied_reads` (absolute paths: the user's credentials, such as the web token), where
-        the agent can. `web` False keeps the web tools from a task that does not need them
-        (daemon.web_needed), where the agent can."""
+        the agent can. `web` False keeps the web tools from the run (a benchmark arm), where the agent
+        can; the no_internet restriction does too."""
         raise NotImplementedError
 
     def parse(self, output_path: Path, stderr_path: Path | None = None) -> RunUsage:

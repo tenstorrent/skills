@@ -1,0 +1,5 @@
+---
+"tt-project": patch
+---
+
+`tt-project`: workers and reviews on Claude Code run on its full harness. They keep Claude Code's own system prompt (ours appended) and its full standard tool set, `Agent` included, with no `--tools` allowlist. `--disallowedTools` now names only the web tools under the `no_internet` restriction and the project's `providers.claude.disallowed_tools`; reviews get the web tools like every other run. The rules once kept by withholding a tool are held by the PreToolUse hook, whose matcher is now `*` so every tool and every subagent's call meets it: the tools that step outside the harness (`CronCreate`, `CronDelete`, `ScheduleWakeup`, `RemoteTrigger`, `EnterWorktree`, `ExitWorktree`, `PushNotification`) are refused with the harness's own way, a Grep or Glob from `/` or the home folder is refused, and a review's Edit, Write and NotebookEdit calls write only in its run folder or a temp folder, or while a merge or rebase is in progress. `docs/providers.md` lists the flags kept and why.

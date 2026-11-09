@@ -20232,20 +20232,19 @@ def test_claude_ai_connectors_stay_when_the_config_lists_one_or_runs_used_one(en
     assert "ENABLE_CLAUDEAI_MCP_SERVERS" not in _worker_env(p, monkeypatch)[1]
 
 
-def test_connector_rule_leaves_isolation_no_internet_and_the_tool_allowlist_alone(env, monkeypatch, tmp_path):
+def test_connector_rule_leaves_isolation_no_internet_and_the_tool_set_alone(env, monkeypatch, tmp_path):
     p = make(env)
     _claude_mcp_config(tmp_path, monkeypatch, p)
     argv, run_env = _worker_env(p, monkeypatch)
     assert "--strict-mcp-config" in argv and "ENABLE_CLAUDEAI_MCP_SERVERS" not in run_env, "isolated: as before"
     assert p.db.kv("connectors_used:claude") is None, "an isolated project never scans its runs"
-    tools = argv[argv.index("--tools") + 1]
-    assert tools == "Bash,Read,Edit,Write,Skill,ToolSearch,WebFetch,WebSearch"
+    assert "--tools" not in argv and "--disallowedTools" not in argv, "the full tool set"
     p.set_config("providers.claude.worker_isolation", False)
     argv, run_env = _worker_env(p, monkeypatch)
-    assert argv[argv.index("--tools") + 1] == tools and "--strict-mcp-config" not in argv
+    assert "--tools" not in argv and "--disallowedTools" not in argv and "--strict-mcp-config" not in argv
     p.set_config("restrictions.no_internet", True)
     argv, run_env = _worker_env(p, monkeypatch)
-    assert argv[argv.index("--tools") + 1] == "Bash,Read,Edit,Write,Skill,ToolSearch"
+    assert argv[argv.index("--disallowedTools") + 1:argv.index("--settings")] == ["WebFetch", "WebSearch"]
     assert run_env.get("ENABLE_CLAUDEAI_MCP_SERVERS") == "false"
 
 
