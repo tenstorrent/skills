@@ -1607,6 +1607,8 @@ def status_text(p: Project, verbose: bool = False) -> str:
     from . import lease
     if lease_line := lease.status_line(p, p.config(), now):
         lines.append(lease_line)
+    from . import overseer   # the tick loop judged by its results, read from the overseer's file
+    lines.append(overseer.line(overseer.read(p), now))
     lines.append("budget: " + h["spend"]["headline"])
     lines += h["spend"].get("slot_lines") or []
     c = h["coordinator"]

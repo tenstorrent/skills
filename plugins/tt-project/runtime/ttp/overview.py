@@ -554,9 +554,14 @@ def deploy_status(name: str, entry: dict, target: str, commit: str | None, now: 
                                  f"(over {_ago(fresh_s)}; daemon {daemon})", "this project's daemon",
                         "at its next completed tick")
         ago = _ago(max(now - tick, 0))
+        from . import overseer
+        try:
+            loop = "; " + overseer.line(json.loads((state / overseer.HEALTH_FILE).read_text()), now)
+        except (OSError, ValueError, AttributeError):
+            loop = "; " + overseer.line(None, now)
         if newer:
-            return done(OK, f"runs {rv} ({(rc or '?')[:12]}), which contains {target}, last tick {ago} ago")
-        return done(OK, f"running {target} ({(rc or '?')[:12]}), last tick {ago} ago")
+            return done(OK, f"runs {rv} ({(rc or '?')[:12]}), which contains {target}, last tick {ago} ago{loop}")
+        return done(OK, f"running {target} ({(rc or '?')[:12]}), last tick {ago} ago{loop}")
     except sqlite3.Error as e:
         return done(CANNOT, f"database unreadable: {e}")
     finally:

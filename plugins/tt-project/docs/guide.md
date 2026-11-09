@@ -102,6 +102,19 @@ project's daemon started after the alert). Other one-shot deploy and upgrade lin
 upgrade merge, a restored release, an upgrade recovered at start) are below high, so they appear
 only in the feed and never under "needs you".
 
+Each project also runs an overseer (`ttp.overseer`, its own service with `Restart=always`) beside
+the daemon. It shares no process, lock or tick step with it: once a minute it reads the database
+read-only (a short busy timeout, never waiting on the daemon's writes) and the run folders, and
+judges the tick loop by its results, not its heartbeat: the last dispatch, urgent work ready with
+a free slot, finished runs not reaped, coordinator answers not applied, events not delivered and
+slow tick steps per hour. That reading is one `loop health:` line in every coordinator digest,
+`ttp status` and `ttp deployed`. Urgent work waiting with a free slot, a run unreaped or an answer
+unapplied for over 5 min, or a stale heartbeat, is a results failure: the overseer saves the
+daemon's stacks under `state/incidents/` (py-spy when installed, else the daemon's own stack dump)
+and records one incident in that line until the results are good again. The daemon restarts an
+overseer whose heartbeat is over 5 min old. Idle cost: no model call, a few read-only queries a
+minute.
+
 ## Budget
 
 - Subscription plans: a plan's capacity is lost at each reset, so the project uses it. Below the

@@ -385,6 +385,22 @@ def precheck_run_id(out: Path) -> str:
     so labels built from it (checkcap.label) name the folder, as checklane.open_precheck reads them."""
     return f"precheck-{Path(out).name}"
 PRECHECK_HOLD_S, PRECHECK_KEEP_S = 3600, 7 * 86400
+
+
+def precheck_holds(state: Path, task: dict, now: float) -> bool:
+    """Review `task` waits for the checks the daemon started on its head (Daemon._precheck) while they
+    run, at most PRECHECK_HOLD_S after they started. Read-only: files under `state` only, so the
+    overseer reads the same hold (Daemon._precheck_holds)."""
+    if task["kind"] != "review":
+        return False
+    name = next((x[len(PRECHECK_LABEL):] for x in push._labels(task) if x.startswith(PRECHECK_LABEL)), "")
+    if not name or "/" in name:
+        return False
+    from .cli import CHECKS_RC, _checks_alive, _read_checks_pid
+    out = Path(state) / PRECHECKS_DIR / name
+    info = _read_checks_pid(out)
+    return (not (out / CHECKS_RC).exists() and _checks_alive(info)
+            and now - float(info.get("ts") or 0) < PRECHECK_HOLD_S)
 # A failed review with fix specs gets its fix and re-review from the daemon this many rounds per stack
 # (review.auto_fix_rounds, unset or unreadable): one, so a failed re-review (a third round) goes to the
 # coordinator as one review_nofix event instead of being queued; the re-review repeats the failed
@@ -1148,6 +1164,7 @@ class Daemon:
         self._sandbox_due = 0.0   # sweep_sandbox_trees: its first pass is at start
         self._step_cursor: dict[str, object] = {}   # step -> the last item done before its budget ran out
         self._step_at: dict[str, object] = {}   # step -> the _resume_order item it is on now
+        self._overseer_kicked = 0.0   # when check_overseer last started the overseer
         self._step_slow_said: dict[str, float] = {}   # step -> when its last tick_step_slow was raised
         self._step_overruns: dict[str, dict] = {}   # step -> its recent overruns and slowest call (_step_incident)
         self._step_incident_said: dict[str, float] = {}   # step -> when its last tick_step_incident was raised
@@ -1953,7 +1970,7 @@ class Daemon:
                      self.sweep_alerts, self.check_release, self.sync_shared_pauses, self.check_pause_ends,
                      self.check_integrity, self.heal_harness_git,
                      self.sync_schedules, self.lint_charter, self.tend_holds, self.record_ttr, self.alert_long_pause,
-                     self.check_linger, self.check_notifier, self.alert_slurm_paused, self.check_gh_auth, self.check_chats,
+                     self.check_linger, self.check_notifier, self.check_overseer, self.alert_slurm_paused, self.check_gh_auth, self.check_chats,
                      self.probe_mcp):
             if step in lease_off:
                 continue
@@ -4138,6 +4155,21 @@ class Daemon:
             self.alert(notifier.ALERT_KEY, f"Desktop notifications on {hostname()} fail since {since} "
                        f"({bad.get('backend')}: {str(bad.get('error'))[:160]}). Alerts still reach this chat and "
                        f"the web app. `ttp notifier test` on {hostname()} shows the fix.", severity="normal")
+
+    def check_overseer(self, now: float | None = None) -> str | None:
+        """The loop's half of the mutual check: start the overseer (ttp.overseer) again when its heartbeat
+        is older than overseer.STALE_S, at most once per STALE_S, only where a service keeps this daemon
+        (a test or a hand-run daemon starts none). The overseer's own service restarts it when it dies."""
+        from . import overseer, service
+        now = time.time() if now is None else now
+        age = overseer.heartbeat_age(self.p, now)
+        if (age is not None and age <= overseer.STALE_S) or now - self._overseer_kicked < overseer.STALE_S \
+                or not service.installed(self.p):
+            return None
+        self._overseer_kicked = now
+        how = service.ensure_overseer(self.p)
+        log(self.p, f"overseer heartbeat {'missing' if age is None else f'{age:.0f} s old'}: {how}")
+        return how
 
     def alert_slurm_paused(self) -> None:
         """One alert per trip of the Slurm checks overflow's start-failure breaker (slurmcheck.alert_due: the
@@ -17215,16 +17247,7 @@ class Daemon:
     def _precheck_holds(self, task: dict, now: float) -> bool:
         """A review waits for the checks the daemon started on its head (_precheck) while they run,
         at most PRECHECK_HOLD_S after they started: the reviewer then reads their result at once."""
-        if task["kind"] != "review":
-            return False
-        name = next((x[len(PRECHECK_LABEL):] for x in push._labels(task) if x.startswith(PRECHECK_LABEL)), "")
-        if not name or "/" in name:
-            return False
-        from .cli import CHECKS_RC, _checks_alive, _read_checks_pid
-        out = self.p.state / PRECHECKS_DIR / name
-        info = _read_checks_pid(out)
-        return (not (out / CHECKS_RC).exists() and _checks_alive(info)
-                and now - float(info.get("ts") or 0) < PRECHECK_HOLD_S)
+        return precheck_holds(self.p.state, task, now)
 
     def _precheck_words(self, task: dict) -> str:
         """What the checks _precheck_holds waits for are doing, in words: waiting for a host checks slot
