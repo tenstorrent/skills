@@ -45,7 +45,7 @@ STEP_FILE_BYTES = 8 << 20
 STEP_SCRUB_S = 10.0
 SESSION_HEAD_BYTES = 4 << 20     # session_id reads no more of a run's output than this
 BUILTIN = ("jev", "slack")       # slots whose other fields (via, user_id, url) are not secret
-_cache: dict[str, Any] = {"sig": None, "pairs": []}
+_cache: dict[str, Any] = {"sig": None, "pairs": [], "error": None, "ever": False}
 KEY_MASK = "[private key redacted]"
 _KEY_TYPE = r"(?:[A-Z0-9]+ )*PRIVATE KEY(?: BLOCK)?"
 # A key body: base64, PEM and PGP armor headers (Proc-Type, DEK-Info, Version, Comment) and line ends,
@@ -77,14 +77,6 @@ def custom(slot: str) -> bool:
     return slot not in BUILTIN and not slot.startswith(PREFIX)
 
 
-def _sig(path: Path):
-    try:
-        st = path.stat()
-    except OSError:
-        return None
-    return (str(path), st.st_mtime_ns, st.st_size, st.st_ino)
-
-
 def _collect(slot: str, v: Any, field: str, out: list[tuple[str, str]], every: bool = False) -> None:
     if isinstance(v, dict):
         for k, x in v.items():
@@ -100,23 +92,39 @@ def pairs() -> list[tuple[str, str]]:
     """(value, slot) for every stored secret, longest first so a value inside another is masked whole.
     Re-read only when the store changes. Never raises: every DB write and daemon log line calls this,
     so a store it cannot read or parse (wrong owner or mode, a folder, bad bytes, not a JSON object)
-    keeps the last good pairs (none if never read) and is read again on the next call."""
-    from .project import load_secrets, secrets_path
+    keeps the last good pairs (none if never read) and is read again on the next call. Why that read
+    failed stays in store_error() until a read succeeds: masking that must not fail open (a run's last
+    scrub, an outbound scan) checks it and blind()."""
+    from .project import SecretsUnreadable, load_secrets
+    from . import secretstore
     try:
-        sig = _sig(secrets_path())
+        sig = secretstore.signature()   # the file's stat, or a time bucket for a keychain or fetched store
         if sig == _cache["sig"]:
             return _cache["pairs"]
         data = load_secrets() if sig else {}
         if not isinstance(data, dict):
+            _cache["error"] = "the secrets store is not a JSON object"
             return _cache["pairs"]
         out: list[tuple[str, str]] = []
         for slot, v in data.items():
             _collect(str(slot), v, "key" if isinstance(v, str) else "", out, custom(str(slot)))
-    except Exception:
+    except Exception as e:   # a SecretsUnreadable names a path or a command, never a value
+        _cache["error"] = str(e)[:300] if isinstance(e, SecretsUnreadable) else type(e).__name__
         return _cache["pairs"]
     _cache["pairs"] = sorted(set(out), key=lambda p: -len(p[0]))
-    _cache["sig"] = sig
+    _cache.update(sig=sig, error=None, ever=True)
     return _cache["pairs"]
+
+
+def store_error() -> str | None:
+    """Why the latest read of the secrets store failed (read again if due), or None once one succeeds."""
+    pairs()
+    return _cache["error"]
+
+
+def blind() -> bool:
+    """The store cannot be read and no value was ever read in this process: masking masks nothing."""
+    return bool(store_error()) and not _cache["ever"]
 
 
 def mask(slot: str) -> str:

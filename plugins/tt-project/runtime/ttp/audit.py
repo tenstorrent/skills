@@ -40,6 +40,8 @@ the project could have saved. Model-free; the review grades it.
   and the failures it caught before detaching (each a worker wake saved).
 - context gaps: what workers' hand-offs (`context_gaps`) said they needed and their spec and context
   block (ctxblock) lacked, counted per task.
+- with budget.daily_target_usd set: each local project's spend by class, real beside booked, and the
+  account total against the target (dailyspend.py);
 - the outward leak scan's refusals (outscan.record), counted by route: gh, git push, ttp note --to,
   ttp notify.
 
@@ -52,7 +54,7 @@ import statistics
 import time
 from typing import Any
 
-from . import budget, chaincap, checkprestage, coordfix, coordmodel, correction, ends, gatejudge, gatetime, obligations, outscan, plainreply, quietgate, relay, replan, reviewstats, route, rulecite, schedule, sharedchecks, stalegate, suitecost, sweepskip, timefmt, turngate, unblock, upstream
+from . import budget, chaincap, dailyspend, checkprestage, coordfix, coordmodel, correction, ends, gatejudge, gatetime, obligations, outscan, plainreply, quietgate, relay, replan, reviewstats, route, rulecite, schedule, sharedchecks, stalegate, suitecost, sweepskip, timefmt, turngate, unblock, upstream
 from .db import DB, continues_id, load_result
 from .project import Project
 
@@ -478,6 +480,11 @@ def lines(db: DB, now: float | None = None, window_s: float = WINDOW_S, blocked_
     out: list[str] = []
     if p is not None and (tl := target_line(db, p.config())):
         out.append(tl)
+    if p is not None:
+        try:
+            out += dailyspend.lines(p.config().get("budget"), since, now)
+        except Exception:   # a busy or unreadable database: the review goes on without the split
+            pass
     sent = asks(db, since, now, p)
     for a in sent:
         rec = f"; recommended: {a['recommendation']}" if a["recommendation"] else ""

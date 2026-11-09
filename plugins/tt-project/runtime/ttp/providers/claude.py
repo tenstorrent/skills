@@ -44,6 +44,7 @@ import shlex
 import subprocess
 import sys
 from pathlib import Path
+from typing import NamedTuple
 
 from . import register
 from ..budget import Window
@@ -668,6 +669,202 @@ def result_total(path: Path) -> float | None:
     except OSError:
         return None
     return total
+
+
+class CallsCost(NamedTuple):
+    usd: float           # the run's Anthropic calls at list price
+    calls: int           # how many calls (message ids) that is
+    models: list[str]    # their model ids
+    unknown: list[str]   # those no price row names: priced at the dearest row (over-counted)
+    logged: int = 0      # calls whose final usage the session transcript gave
+
+
+_MSG_ID = re.compile(rb'"id"\s*:\s*"(msg_[^"]+)"')
+
+
+def _keep_highest(seen: dict, usage: dict) -> None:
+    """Merge one reading of a message's usage into `seen`: each count at its highest reading (a nested
+    one too, cache_creation's split and server_tool_use), any other value at its last one."""
+    for k, v in usage.items():
+        if isinstance(v, dict):
+            sub = seen[k] if isinstance(seen.get(k), dict) else {}
+            _keep_highest(sub, v)
+            seen[k] = sub
+        elif isinstance(v, (int, float)) and not isinstance(v, bool):
+            old = seen.get(k)
+            seen[k] = max(old, v) if isinstance(old, (int, float)) and not isinstance(old, bool) else v
+        elif v not in (None, ""):
+            seen[k] = v
+
+
+def _logged_line(line: bytes, wanted: set[str] | None, got: dict[str, dict]) -> None:
+    """Merge one session-log line's assistant usage into `got` (logged_usage, LogTail): only a message id
+    in `wanted`, or any when `wanted` is None."""
+    if b'"assistant"' not in line or b'"usage"' not in line:
+        return
+    if wanted is not None:
+        ids = {m.decode(errors="replace") for m in _MSG_ID.findall(line)}
+        if ids and not ids & wanted:   # most lines: another run's call, never parsed
+            return
+    try:
+        ev = json.loads(line)
+    except ValueError:
+        return
+    msg = ev.get("message") if isinstance(ev, dict) and isinstance(ev.get("message"), dict) else {}
+    ident = str(msg.get("id") or "")
+    if ev.get("type") == "assistant" and ident and (wanted is None or ident in wanted) \
+            and isinstance(msg.get("usage"), dict):
+        _keep_highest(got.setdefault(ident, {}), msg["usage"])
+
+
+def logged_usage(paths, wanted: set[str]) -> dict[str, dict]:
+    """The usage Claude Code's session transcripts (`paths`: the session's log and its subagents') recorded
+    for each message id in `wanted`, every count at its highest reading: a call's final counts, which its
+    stream line does not carry. Reads each file whole: for a run that is still going use a LogTail."""
+    got: dict[str, dict] = {}
+    for p in paths:
+        try:
+            f = open(p, "rb")
+        except OSError:
+            continue
+        with f:
+            for line in f:
+                _logged_line(line, wanted, got)
+    return got
+
+
+class LogTail:
+    """logged_usage for a run that is still going (Daemon.meter_running prices it every minute): each
+    session log is read once, then only from the byte offset its last read ended at (a whole line), so a
+    forked or resumed session's log of tens of MB is not read again each minute. A file that shrank or was
+    replaced (another inode) is read again from its start. The first read of a file keeps only the ids
+    `wanted` names (the session's earlier calls are not this run's); later reads keep every call's usage,
+    since a call's log line can come before its stream line names it. Its figures are an estimate: the
+    run's end books from a whole read (logged_usage)."""
+
+    def __init__(self) -> None:
+        self.files: dict[str, list] = {}   # path -> [(dev, inode), offset, {message id: usage}]
+        self.read_bytes = 0                # bytes read over all passes (for tests and timing)
+
+    def usage(self, paths, wanted: set[str]) -> dict[str, dict]:
+        out: dict[str, dict] = {}
+        live = set()
+        for p in paths:
+            key = str(p)
+            live.add(key)
+            try:
+                st = os.stat(p)
+            except OSError:
+                continue
+            ent = self.files.get(key)
+            if ent is None or ent[0] != (st.st_dev, st.st_ino) or st.st_size < ent[1]:
+                ent = self.files[key] = [(st.st_dev, st.st_ino), 0, {}]
+            if st.st_size > ent[1]:
+                first = ent[1] == 0
+                try:
+                    with open(p, "rb") as f:
+                        f.seek(ent[1])
+                        for line in f:
+                            if not line.endswith(b"\n"):   # a line still being written: read it next pass
+                                break
+                            ent[1] += len(line)
+                            self.read_bytes += len(line)
+                            _logged_line(line, wanted if first else None, ent[2])
+                except OSError:
+                    pass
+            for ident in wanted & ent[2].keys():
+                _keep_highest(out.setdefault(ident, {}), ent[2][ident])
+        for key in set(self.files) - live:
+            del self.files[key]
+        return out
+
+
+def stream_calls(path: Path, empty_ok: bool = False) -> tuple[dict[str, tuple[str, dict]], str] | None:
+    """A run's Anthropic API calls named in its own stream output (output.jsonl), {message id: (model,
+    usage)}, and the session id its init event names. Each assistant message is one call, streamed as one
+    line per content block, each repeating its usage: every count is kept at its highest reading. A
+    forked or resumed session's earlier calls are not in a run's stream; a subagent's calls are
+    (parent_tool_use_id). '<synthetic>' messages (no API call) and another vendor's models (a chat
+    endpoint's GLM) are not Anthropic spend. None when no assistant message carries usage, or one carries
+    usage with no model id (a Claude Code that streams none, a run that never got an answer). With
+    `empty_ok`, a stream with no assistant usage at all but an init event (Claude Code ran and made no
+    call that answered) is ({}, session): a resumed or forked run books $0, never the session's total."""
+    from .. import localspend
+    per: dict[str, tuple[str, dict]] = {}
+    saw, session = False, ""
+    try:
+        with open(path, "rb") as f:
+            for n, line in enumerate(f):
+                if not session and b'"init"' in line:
+                    with contextlib.suppress(ValueError, AttributeError):
+                        ev = json.loads(line)
+                        if ev.get("type") == "system" and ev.get("subtype") == "init":
+                            session = str(ev.get("session_id") or "")
+                if b'"assistant"' not in line or b'"usage"' not in line:
+                    continue
+                try:
+                    ev = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(ev, dict) or ev.get("type") != "assistant":
+                    continue
+                msg = ev.get("message") if isinstance(ev.get("message"), dict) else {}
+                usage = msg.get("usage")
+                if not isinstance(usage, dict):
+                    continue
+                model = str(msg.get("model") or "")
+                if not model:   # a call with no model id cannot be priced: the whole output is not per call
+                    return None
+                saw = True
+                if model == localspend.SYNTHETIC or "claude" not in model.lower():
+                    continue
+                ident = str(msg.get("id") or ev.get("uuid") or f"line-{n}")
+                _, seen = per.setdefault(ident, (model, {}))
+                _keep_highest(seen, usage)
+    except OSError:
+        return None
+    return (per, session) if saw or (empty_ok and session) else None
+
+
+def price_calls(per: dict[str, tuple[str, dict]], overrides: dict | None = None,
+                logged: dict[str, dict] | None = None) -> CallsCost:
+    """The calls `per` (stream_calls) at list price, each at its own model (localspend.price: 5-minute and
+    1-hour cache writes apart, web searches, fast mode), with `overrides` (the account's pricing.claude) on
+    the table. A call's stream lines carry the usage from its start (output_tokens a handful): its counts
+    in `logged` (logged_usage, the session log's final ones) are taken where higher."""
+    from .. import localspend
+    rows = localspend.table(overrides)
+    usd, models, unknown, found = 0.0, set(), set(), 0
+    for ident, (model, usage) in per.items():
+        if logged and ident in logged:
+            usage = dict(usage)
+            _keep_highest(usage, logged[ident])
+            found += 1
+        got, est = localspend.price(model, usage, rows=rows)
+        usd += got
+        models.add(model)
+        if est:
+            unknown.add(model)
+    return CallsCost(round(usd, 6), len(per), sorted(models), sorted(unknown), found)
+
+
+def calls_cost(path: Path, overrides: dict | None = None, transcripts=(), tail: LogTail | None = None,
+               empty_ok: bool = False) -> CallsCost | None:
+    """What a run's Anthropic API calls cost at list price, each call once: the way Anthropic bills, which
+    the session's total_cost_usd is not (in a resumed or forked session it is the running total, the
+    parent's calls included). The calls are those the run's own stream names (stream_calls), each at its
+    final usage from `transcripts`, Claude Code's session log and its subagents' logs (logged_usage;
+    without them output is under-counted), priced by price_calls. None when the stream has no per-call
+    usage: the caller books the old way. `tail` (a LogTail kept for a running run) reads the logs
+    incrementally; `empty_ok` as stream_calls."""
+    got = stream_calls(path, empty_ok)
+    if got is None:
+        return None
+    per = got[0]
+    logged = None
+    if per and transcripts:
+        logged = tail.usage(transcripts, set(per)) if tail is not None else logged_usage(transcripts, set(per))
+    return price_calls(per, overrides, logged)
 
 
 def _whole_answer(row: dict) -> bool:

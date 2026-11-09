@@ -250,8 +250,24 @@ def _quiet(check: Callable[[Path], str | None], path: Path) -> str | None:
         return None
 
 
+def mark_untrusted(payload: dict, run_dir: str) -> None:
+    """Record that a task run (a subagent's call too) read web, connector or downloaded text (untrusted.py)."""
+    try:
+        from . import coordtools, untrusted
+        tool = str(payload.get("tool_name") or "")
+        if not os.environ.get("TTP_TASK") or os.environ.get(coordtools.ROLE_ENV) == "coordinator":
+            return
+        cmd = str((payload.get("tool_input") or {}).get("command") or "") if tool == "Bash" else ""
+        if src := untrusted.read_source(tool, _all_segments(_split(cmd)[0]) if cmd else None):
+            untrusted.mark(run_dir, src)
+    except Exception:   # fails open, as the hook does
+        pass
+
+
 def post_tool_use(payload: dict) -> tuple[dict | None, Callable[[], None] | None]:
     run_dir = os.environ.get("TTP_RUN_DIR")
+    if run_dir:
+        mark_untrusted(payload, run_dir)
     if not run_dir or payload.get("agent_id"):
         return None, None
     parts, marks = [], []
@@ -807,7 +823,7 @@ WEB_TOKEN_RE = re.compile(r"state/+web\.token\b")
 # output stays in the run's log and its agent's transcript, so a run tests a key with
 # `ttp secret check` and gives one to a command with `ttp secret env` (also `--secret`) instead.
 SECRET_FILE_RE = re.compile(r"(?:\.tt-project|TTP_HOME\}?)/+secrets\.json\b")
-SECRET_CALL_RE = re.compile(r"(?<!def )\b(?:credentials|load_secrets|env_for)\s*\(|\bendpoint\.saved\s*\(|\bsecrets_path\s*\(")
+SECRET_CALL_RE = re.compile(r"(?<!def )\b(?:credentials|load_secrets|env_for)\s*\(|\bendpoint\.saved\s*\(|\bsecrets_path\s*\(|\bsecretstore\.(?:load|BACKENDS|_\w+_load)\b")
 
 
 def secret_read(cmd: str, segments: list[list[str]], cwd: str) -> str | None:
@@ -822,8 +838,9 @@ def secret_read(cmd: str, segments: list[list[str]], cwd: str) -> str | None:
         return why
     try:
         from .project import secrets_path
-        if str(secrets_path()) in cmd:
-            return why
+        from .secretstore import ENV_VAR, command_words
+        if any(w and w in cmd for w in (str(secrets_path()), ENV_VAR, *command_words())):
+            return why   # also the keychain item or this machine's fetch command, run directly
     except Exception:
         pass
     runs = [s for s in segments if s and _interpreter_args(s) is not None]
@@ -1180,7 +1197,9 @@ def _deny(why: str) -> dict:
 def pre_tool_use(payload: dict) -> tuple[dict | None, None]:
     if not os.environ.get("TTP_RUN_DIR"):
         return None, None
-    from . import pathguard
+    from . import pathguard, untrusted
+    if why := untrusted.mark_refusal(str(payload.get("tool_name") or ""), payload.get("tool_input") or {}):
+        return _deny(why), None   # the run's untrusted-input mark, marked or not
     if why := pathguard.refusal(payload):   # a write into a credential folder, on any tool
         return _deny(why), None
     if why := harness_tool(str(payload.get("tool_name") or "")):

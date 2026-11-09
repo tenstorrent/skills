@@ -166,6 +166,12 @@ coordinator with that evidence.
   in but names none. While the status says logged out or cannot be read, the last label seen
   stands; before any is seen (after a restart) the account is unknown, so neither is an account
   switch.
+- Daily spend target (a goal, not a cap; unset by default): with `ttp config --account
+  budget.daily_target_usd <usd>`, `ttp status` shows today's Claude spend against it, and the daily
+  review's self-efficiency audit (`ttp audit`) lists each project on this machine with the last 24 h's
+  spend by class (coordinator, reviews, worker runs that ended waiting, other workers), then the total
+  against the target. Each figure is real spend (a Claude run's own tokens priced at the model it
+  actually used) with the booked figure beside it where they differ.
 - Global daily cap (usage-billed, $200/day by default): `budget.global_daily_usd` stops new work in
   every usage-billed project on the account once the whole account's tt-project spend today reaches
   it. "Today" is the rolling 24 hours unless `budget.day_start` is set. Change it for every project
@@ -1224,8 +1230,9 @@ Messages calls into `<base url>/chat/completions` calls and back, and ends with 
    tier's runs start on the core provider. A 404 for a model the endpoint does not serve (its wording
    names the model, or the endpoint's /models list leaves it out) is `model_missing` instead: no
    cool-down, but that tier's route holds, with one normal notice naming the provider, tier and model,
-   until `providers.chat.tiers.<tier>.model` changes or the daemon's model-free /models check (at
-   most hourly while a tier routes) lists the model again. That check stores only the served ids and
+   until `providers.chat.tiers.<tier>.model` changes or the daemon's model-free /models check (every
+   minute while a tier or run class routes to `chat`; `providers.chat.models_every_s`) lists the model
+   again. That check stores only the served ids and
    its time in the project state folder; `ttp status` and `ttp doctor` show them and any hold.
    To keep work on the endpoint instead, the daemon keeps a ranking of its model ids, smartest first,
    in `providers.chat.model_ranking`: account-wide (`ttp config --account providers.chat.model_ranking
@@ -1256,9 +1263,14 @@ Messages calls into `<base url>/chat/completions` calls and back, and ends with 
    that is refused too is skipped for a day and the next one runs. A task's own model pin on `chat`
    is swapped the same way, unless the pin is required (`pin_required`): such a task waits until its
    model is served again. With a ranking set, a queued or running task that pins a model on `chat`
-   also keeps the hourly check running, and a check over two hours old counts as none: nothing is
+   also keeps the check running, and a check over two hours old counts as none: nothing is
    swapped or held on it. Each switch is one low alert; once the model is served again (the hold ends
-   or the check lists it) the next start runs it. With no ranked model served, or the whole endpoint
+   or the check lists it) the next start runs it. A served model ranked above a route's own model
+   (tier, rule or run class; never a task's pin) is tried at once: light starts run it until 3 of its
+   runs end without a fallback, then every tier does. A run on it that fails on the model itself
+   (malformed answer, timeout, no hand-off) during those runs, or such faults in over a fifth of 8 or
+   more runs later, parks it for a week with one low alert; then it is tried again from scratch.
+   Endpoint faults (down, rate limit, auth) park nothing. With no ranked model served, or the whole endpoint
    cooling down, runs start on the core provider as before. Only `chat` has a served list: Claude
    Code, Codex and Cursor models are not ranked (provider failover covers a provider that cannot start
    work). Routed runs take worker slots under the `chat` gate (its
@@ -1274,7 +1286,8 @@ Messages calls into `<base url>/chat/completions` calls and back, and ends with 
    --runs`. Each fallback's reason (and, for a run's own end, a short `cause`) is in
    the run's `route` record. A run that hands off, even `failed`, is retried a tier up as usual.
    Some starts stay on the core provider before they run, with the reason `escalated`, its kind and
-   a short `cause`: an urgent or user-ordered task (landing in minutes outweighs the saving), a
+   a short `cause`: an urgent task of a hard class or a user-ordered task (landing in minutes outweighs the saving; an urgent
+   task's run in a cheap class, runclass.CHAT, keeps that class's cheap route: urgency only orders it), a
    review fix or failed-checks wake of a change its lineage wrote on the routed provider, and every
    later run of a lineage with two routed misses (routed runs that fell back on their own or handed
    off `failed`, and routed changes a review or failed checks sent back). The `routed 24h:` phrase
@@ -1291,7 +1304,8 @@ Messages calls into `<base url>/chat/completions` calls and back, and ends with 
    applies. Rules never route reviews, coordinator turns, pinned tasks, tier-up retries or conclusion
    and device runs, and while a rule list is set, urgent tasks, tasks whose hand-off asked for deep and
    tasks labelled `urgent`, `needs_deep`, `user_deep`, `review_fix` or `untrusted_input` stay on the
-   core provider, the tier's own route included. A missing-model hold applies to that tier's runs
+   core provider, the tier's own route included (a run class that is cheap by class takes no such
+   urgency: it routes by its class). A task labelled `untrusted_input` is never routed, by rule, tier or class. A missing-model hold applies to that tier's runs
    routed to that model only. The coordinator can set the list with `config_set` on your word.
    Routed spend uses the `pricing.chat` row for the model (or its `default` row:
    `[$/M input, cached input, output]`); with no row it is zero and labelled unpriced. Without a row
@@ -3401,6 +3415,13 @@ Workers can read Slack links you paste, using your Slack connector if you have o
     `.jks`, `.ppk`, `.gpg`, `.asc`, `id_*` but `.pub`), a name with token, secret, credential,
     password or API key in it, a process's `environ`, and environment dumps (`printenv`, a bare `env`,
     `export` or `set`).
+  The label is set per source, model-free: on a PR-findings fix the daemon queues and on a shared check
+  failure's fix (they quote comments, CI and test logs); on a coordinator `task_add` that sends
+  `untrusted_input: true` or whose spec carries a peer note's `[note <fp>]` tag; and on the task of a run
+  that read web, connector or downloaded text (the hook records the source in the run dir's
+  `untrusted-input` file, the guards apply to the rest of that run at once, and the daemon labels the task
+  when the run ends). Continuations, review fixes and reopened copies of a labelled task inherit it, and
+  nothing clears it. A labelled task never routes to the chat provider; its run note records `untrusted_input`.
   The hook (Claude Code, Codex, Cursor and the stream guard) and the run's `bin/git` and `bin/gh`, which
   scripts reach too, apply them on every provider. Known gaps: a path or command a script or inline code
   builds at run time (git and gh stay guarded), other HTTP clients, a GET carrying data in its URL and
@@ -3427,6 +3448,44 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   only the secret names, the task and the time. A request the daemon has not started within 90 s, or
   when the worker's call is stopped (SIGINT or SIGTERM), is withdrawn and never runs later; one
   already started keeps running.
+- Where keys live is chosen per machine with `ttp secret store <backend>` (no argument: show it). It
+  writes `~/.tt-project/secret-store.json`, which holds no secret:
+  - `file` (the default): `secrets.json` in the ttp home, mode 0600.
+  - `keychain`: the macOS login keychain, service `tt-project-secrets`; written through `security -i`
+    on stdin, so no value is ever on a command line.
+  - `command -- <fetch command>`: a program run whenever ttp needs the keys; it prints the whole store
+    as one JSON object on stdout and exits 0. Read-only: ttp never writes to it. Its stderr is never
+    repeated, and a failure names only the program and its exit code.
+  - `env`: `TTP_SECRETS_JSON`, read once and removed from the process environment so no child
+    inherits it. Read-only. It serves only the one process given the variable (a script, a CI job):
+    a process not given it reads the store as unreadable, never as empty. The daemon refuses to start
+    on a machine whose store is `env` (exit 2, and drops the variable either way): its runs and the
+    hooks the agent CLI starts (outbound scans, the pre-push scan) are not its children and could
+    never see it. Where a daemon runs, use `keychain` or `command`, which every process reads itself.
+  Keys read from a keychain, command or env store live only in the process's memory and are read
+  again at most every 60 s.
+- Masking fails closed. When the store cannot be read and no value was ever read in that process, a
+  run's last masking step prints `runner: could not mask stored secrets in the run: <cause>` in its
+  log and records `unmasked` (the cause, never a value) in `exit.json`; if the daemon cannot read it
+  either, it logs that and raises one `secrets_unmasked` event per cause. Outbound posts (`ttp notify`,
+  `ttp note --to`, `gh` from a run) and the pre-push scan are refused while the store cannot be read,
+  except in a run whose sandbox hides the store by design (the write fence), which is scanned as before.
+- A shared or build host keeps no plaintext keys: `ttp secret store <keychain|command|env> --shared`
+  marks it. There the file store refuses to save, `ttp new --host --copy-secrets` and `ttp secret push`
+  to it are refused on the far side (exit 3), and a `secrets.json` already there is reported by
+  `ttp secret store`, `ttp secret show` and `ttp status` (never deleted: move its keys to the store,
+  then delete it yourself). A `secrets.json` on a host marked shared whose store is still `file` (the
+  marker written by hand) is still read, never written, and reported as such.
+  `ttp new --host` copies no keys unless `--copy-secrets` asks for it.
+- A central secrets service (a company's vault or broker) plugs in as a `command` store: any program
+  that authenticates the way the service wants (a short-lived machine or user identity, not a key
+  file) and prints the JSON object. A service needing more (writes, per-key reads) is one more entry in
+  `BACKENDS` in `runtime/ttp/secretstore.py`: a load function returning the dict, a save function or
+  the read-only one. The worker hook refuses Bash calls naming the keychain item, the configured fetch
+  command or `TTP_SECRETS_JSON`.
+- Pushes go out from a trusted machine (the owner's workstation) over HTTPS with the forge's own
+  credential helper (for GitHub: `git -c credential.helper='!gh auth git-credential' push`), so no
+  build box needs a push key; a build box's project hands its commits to that machine to push.
 - Workers run without a sandbox by default (no bwrap, no network or PID namespace; sudo works).
   When the agent ends, the runner ends what it left in its process group (but a pid the hand-off lists
   in `leftover_procs` with how and when it stops) and the run's own sandbox trees nothing owns any more:

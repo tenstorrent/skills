@@ -840,13 +840,18 @@ def _default_root() -> Path:
 
 
 def push_secrets(host: str) -> str:
-    """Copy this user's saved keys to another machine (same user), merging with what is there.
-    Travels over ssh stdin, lands mode 0600, never on a command line or in a project folder."""
+    """Copy this user's saved keys to another machine (same user), merging with what is there: only on
+    the owner's explicit `ttp secret push` or `ttp new --host --copy-secrets`. Travels over ssh stdin,
+    lands mode 0600, never on a command line or in a project folder. A machine whose secret-store.json
+    marks it shared or names a run-time store refuses it there (exit 3): no plaintext key lands on it."""
     sec = load_secrets()
     if not sec:
         return "no saved keys to copy"
     merge = ("import json,os,sys;h=os.path.expanduser('~/.tt-project');os.makedirs(h,mode=0o700,exist_ok=True);"
              "p=os.path.join(h,'secrets.json');old={}\n"
+             "try: c=json.load(open(os.path.join(h,'secret-store.json')))\nexcept Exception: c={}\n"
+             "if not isinstance(c,dict) or c.get('shared') or c.get('backend','file')!='file':"
+             "sys.stderr.write('refused: that machine is marked shared or reads keys from a run-time store');sys.exit(3)\n"
              "try: old=json.load(open(p))\nexcept Exception: pass\n"
              "new=json.load(sys.stdin);new.update({k:v for k,v in old.items() if k not in new});"
              "fd=os.open(p+'.tmp',os.O_WRONLY|os.O_CREAT|os.O_TRUNC,0o600);os.write(fd,json.dumps(new).encode());"
@@ -899,8 +904,11 @@ def new_remote(a, brief: str) -> None:
         die("--dir is required with --host (the project root on that machine)")
     host = a.host
     launcher = ship_runtime(host)
-    if load_secrets() and not a.no_secrets:
+    if getattr(a, "copy_secrets", False):
         print(push_secrets(host))
+    else:   # no long-lived keys on build boxes: that machine fetches them at run time (`ttp secret store`)
+        print(f"saved keys stay on this machine; to give {host} keys, set its run-time store there: "
+              "`ttp secret store command -- <fetch command>` (or --copy-secrets on a machine of your own)")
     from . import machines as mm
     print(mm.push(host))        # its daemon reads the machines list there
     args = [launcher, "new", a.name, "--dir", a.dir, "--provider", a.provider or detect_provider()]
@@ -1905,6 +1913,9 @@ def cmd_status(a) -> None:
         from .project import secrets_state
         if not (sec := secrets_state())["readable"]:
             print(f"secrets store: unreadable, skipped ({sec['error']})")
+        from . import secretstore
+        if ln := secretstore.plaintext_report():
+            print(ln)
         from . import throughput
         if ln := throughput.status_line(p.db):
             print(ln)
@@ -10666,12 +10677,56 @@ def cmd_config_why(words: list[str], key: str) -> None:
             print(f"  {configwho.line(r, p)}")
 
 
-SECRET_KINDS = ("jev", "slack", "endpoint", "show", "check", "env", "push", "set", "generate")
+SECRET_KINDS = ("jev", "slack", "endpoint", "show", "check", "env", "push", "set", "generate", "store")
 SECRET_NAME_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")
 SECRET_MAX_BYTES = 64 << 10
 
 
 def cmd_secret(a) -> None:
+    from . import secretstore
+    try:
+        _cmd_secret(a)
+    except secretstore.ReadOnly as e:
+        die(f"not saved: {e}")
+
+
+def cmd_secret_store(a) -> None:
+    """`ttp secret store`: this machine's store and any plaintext key file left behind;
+    `ttp secret store <backend> [--shared] [-- <fetch command>]` chooses it (no secret is written)."""
+    from . import secretstore
+    if a.alias is None:
+        try:
+            c = secretstore.config()
+        except Exception as e:
+            die(str(e))
+        print(f"secret store: {c['backend']}" + (" (shared host: no plaintext keys)" if c.get("shared") else "")
+              + (f", fetch command {c['command'][0]}" if c.get("command") else ""))
+        if ln := secretstore.plaintext_report():
+            print(ln)
+        return
+    if a.alias not in secretstore.BACKENDS:
+        die(f"unknown store {a.alias!r}: one of {', '.join(secretstore.BACKENDS)}")
+    if (a.alias == "command") != bool(a.command):
+        die("`ttp secret store command -- <fetch command>` (and only it) takes a command")
+    if a.shared and a.alias == "file":
+        die("a shared host keeps no plaintext keys: pick keychain, command or env")
+    try:
+        secretstore.set_config(a.alias, list(a.command) or None, a.shared)
+    except Exception as e:
+        die(str(e))
+    print(f"this machine now reads ttp secrets from {a.alias}" + (" (marked shared)" if a.shared else ""))
+    if a.alias == "env":
+        print(f"env serves only the one process given {secretstore.ENV_VAR} (a script, a CI job): a daemon "
+              "refuses to start with it; choose keychain or command where a daemon runs")
+    if ln := secretstore.plaintext_report():
+        print(ln)
+
+
+def _cmd_secret(a) -> None:
+    if a.kind == "store":
+        return cmd_secret_store(a)
+    if getattr(a, "shared", False):
+        die("--shared goes only with `ttp secret store <backend>`")
     if a.alias is not None and a.kind not in ("endpoint", "check", "env", "set", "generate"):
         die(f"`ttp secret {a.kind}` takes no alias (only endpoint, check, env, set and generate do)")
     if a.keys is not None and a.kind != "generate":
@@ -10751,6 +10806,9 @@ def cmd_secret(a) -> None:
                           if not k.startswith(endpoint.PREFIX)}))
         for line in endpoint.show_lines():
             print(line)
+        from . import secretstore
+        if ln := secretstore.plaintext_report():
+            print(ln)
 
 
 def _secret_name(name: str | None, usage: str) -> str:
@@ -12865,7 +12923,10 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--coordinator-effort", default="xhigh", choices=("minimal", "low", "medium", "high", "xhigh", "max"),
                    help="the effort the coordinator's turns run at (default: xhigh; each provider "
                         "takes its nearest level; later: ttp config <name> coordinator.effort LEVEL)")
-    s.add_argument("--no-secrets", action="store_true", help="with --host: do not copy your saved keys there")
+    s.add_argument("--no-secrets", action="store_true", help=argparse.SUPPRESS)   # the default now; old scripts pass it
+    s.add_argument("--copy-secrets", action="store_true",
+                   help="with --host: copy your saved keys there in plaintext (only a machine of your own; "
+                        "a shared or build box fetches them at run time instead: `ttp secret store`)")
     s.add_argument("--home-tz", help=argparse.SUPPRESS)     # with --host there: the workstation's zone
     s.add_argument("--home-from", help=argparse.SUPPRESS)   # and its name
     s.set_defaults(fn=cmd_new)
@@ -14133,10 +14194,15 @@ def main(argv: list[str] | None = None) -> None:
                         "(reachable, auth ok or auth failed; never the key); env <alias> -- <command>: run "
                         "a command with the key in OPENAI_API_KEY and the URL in OPENAI_BASE_URL, its output "
                         "masked; env --secret <name>[:<key>]=<VAR> -- <command>: the same with a secret of your own "
-                        "in VAR; push: copy your saved keys to --host; set <name>: a value of your own, "
+                        "in VAR; push: copy your saved keys to --host (refused where that machine is marked shared); "
+                        "store [file|keychain|command|env] [--shared] [-- <fetch command>]: show or choose where this "
+                        "machine reads keys at run time; set <name>: a value of your own, "
                         "read from stdin; generate <name> --keys a,b,c: a fresh random token per key, "
                         "stored as a JSON object. No command prints a saved key. "
-                        "Keys go to secrets.json in your ttp home (~/.tt-project, mode 0600)")
+                        "Keys go to this machine's store: by default secrets.json in your ttp home "
+                        "(~/.tt-project, mode 0600)")
+    s.add_argument("--shared", action="store_true",
+                   help="with store: this is a shared or build host, where no key is written in plaintext")
     s.add_argument("alias", nargs="?", help="with endpoint: a name for it (letters, digits, '-' and '_'); "
                                             "with check or env: the saved endpoint; with set or generate: "
                                             "the secret's name (lowercase letters, digits, '-' and '_')")

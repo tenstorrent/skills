@@ -1619,3 +1619,258 @@ def test_ending_a_run_with_a_large_output_file_reads_it_capped_and_a_detached_jo
     (run_dir / "late.log").write_text(block)
     assert redact.scrub_run(run_dir, step=True, left=left) == 0 and left == [run_dir]
     assert redact.main([str(run_dir)]) == 0 and _no_key((run_dir / "late.log").read_text(), lines)
+
+
+# The run-time store (secretstore): no long-lived plaintext keys on shared or build hosts.
+_STORE_KEY = "fake-store-value-0123456789abcdef"
+
+
+def _runtime_store_home(env, monkeypatch):
+    from ttp import secretstore
+    project = _endpoint_home(env, monkeypatch)
+    secretstore._mem.update(key=None, data=None)
+    secretstore._env.clear()
+    return project, secretstore
+
+
+def _fetch_script(env, body: str):
+    f = env["tmp"] / "fetch-keys"
+    f.write_text("#!/bin/sh\n" + body)
+    f.chmod(0o755)
+    return f
+
+
+def test_a_command_store_is_read_at_run_time_cached_in_memory_and_never_written(env, monkeypatch, capsys):
+    project, secretstore = _runtime_store_home(env, monkeypatch)
+    calls = env["tmp"] / "calls"
+    fetch = _fetch_script(env, f'echo x >> "{calls}"\necho \'{{"jev": {{"key": "{_STORE_KEY}"}}}}\'\n')
+    assert _custom(monkeypatch, capsys, "store", "command", "--", str(fetch))[0] == 0
+    assert _STORE_KEY not in secretstore.config_path().read_text()
+    assert project.load_secrets()["jev"]["key"] == _STORE_KEY
+    assert project.load_secrets()["jev"]["key"] == _STORE_KEY
+    assert calls.read_text().count("x") == 1, "a second read within the cache period reuses memory"
+    from ttp import redact
+    assert redact.scrub(f"value {_STORE_KEY}") == "value [secret:jev]"
+    code, out = _custom(monkeypatch, capsys, "set", "peer-key", stdin=_CUSTOM)
+    assert code and "not saved" in out and _CUSTOM not in out
+    assert not project.secrets_path().exists(), "a run-time store never leaves a plaintext file"
+
+
+def test_a_failing_fetch_command_names_no_output_and_status_still_runs(env, monkeypatch):
+    project, secretstore = _runtime_store_home(env, monkeypatch)
+    fetch = _fetch_script(env, f'echo "{_STORE_KEY}" >&2\nexit 7\n')
+    secretstore.set_config("command", [str(fetch)])
+    with pytest.raises(project.SecretsUnreadable) as e:
+        project.load_secrets()
+    assert "exited 7" in str(e.value) and _STORE_KEY not in str(e.value)
+    assert project.secrets_state()["readable"] is False
+    _fetch_script(env, "echo not-json\n")
+    secretstore._mem.update(key=None)
+    with pytest.raises(project.SecretsUnreadable):
+        project.load_secrets()
+
+
+def test_an_env_store_is_read_once_and_removed_from_the_environment(env, monkeypatch):
+    project, secretstore = _runtime_store_home(env, monkeypatch)
+    secretstore.set_config("env")
+    monkeypatch.setenv(secretstore.ENV_VAR, json.dumps({"slack": {"bot_token": _STORE_KEY}}))
+    assert project.load_secrets()["slack"]["bot_token"] == _STORE_KEY
+    assert secretstore.ENV_VAR not in os.environ, "no child process inherits the keys"
+    secretstore._mem.update(key=None)
+    assert project.load_secrets()["slack"]["bot_token"] == _STORE_KEY
+
+
+def test_a_keychain_store_round_trips_and_the_value_is_never_on_a_command_line(env, monkeypatch):
+    project, secretstore = _runtime_store_home(env, monkeypatch)
+    bindir, kc, argv_log = env["tmp"] / "fakebin", env["tmp"] / "kc.hex", env["tmp"] / "argv.log"
+    bindir.mkdir()
+    # a stand-in for macOS `security`: -i reads `add-generic-password ... -X <hex>` on stdin
+    (bindir / "security").write_text(
+        "#!/bin/sh\n"
+        f'echo "$@" >> "{argv_log}"\n'
+        'if [ "$1" = -i ]; then read -r line; echo "$line" | sed "s/.*-X //" > ' f'"{kc}"; exit 0; fi\n'
+        f'[ -f "{kc}" ] || exit 44\n'
+        f'python3 -c "import sys; print(bytes.fromhex(open(sys.argv[1]).read().strip()).decode())" "{kc}"\n')
+    (bindir / "security").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bindir}:{os.environ['PATH']}")
+    secretstore.set_config("keychain")
+    assert project.load_secrets() == {}
+    project.save_secret("peer-key", _STORE_KEY)
+    assert project.load_secrets() == {"peer-key": _STORE_KEY}
+    assert _STORE_KEY not in argv_log.read_text() and _STORE_KEY.encode().hex() not in argv_log.read_text()
+    assert not project.secrets_path().exists()
+
+
+def test_a_shared_host_never_gets_a_plaintext_key_file(env, monkeypatch, capsys):
+    project, secretstore = _runtime_store_home(env, monkeypatch)
+    code, out = _custom(monkeypatch, capsys, "store", "file", "--shared")
+    assert code and "no plaintext" in out
+    project.HOME_DIR.mkdir(parents=True, exist_ok=True)
+    secretstore.config_path().write_text(json.dumps({"backend": "file", "shared": True}))   # written by hand
+    code, out = _custom(monkeypatch, capsys, "set", "peer-key", stdin=_CUSTOM)
+    assert code and "marked shared" in out and not project.secrets_path().exists()
+    for bad in (["store", "nosuch"], ["store", "command"], ["store", "env", "--", "true"], ["show", "--shared"]):
+        assert _custom(monkeypatch, capsys, *bad)[0], bad
+
+
+def test_a_left_plaintext_key_file_is_reported_never_deleted(env, monkeypatch, capsys):
+    project, secretstore = _runtime_store_home(env, monkeypatch)
+    project.save_secret("peer-key", _CUSTOM)   # the old default: plaintext
+    assert secretstore.plaintext_report() == ""
+    code, out = _custom(monkeypatch, capsys, "store", "env", "--shared")
+    assert code == 0 and "plaintext key file left" in out and "delete it yourself" in out
+    code, out = _custom(monkeypatch, capsys, "store")
+    assert "secret store: env (shared host" in out and "plaintext key file left" in out and _CUSTOM not in out
+    assert project.secrets_path().exists()
+    monkeypatch.setenv(secretstore.ENV_VAR, "{}")
+    code, out = _custom(monkeypatch, capsys, "show")
+    assert code == 0 and "plaintext key file left" in out
+
+
+def test_keys_reach_another_machine_only_on_request_and_never_a_shared_one(env, monkeypatch, tmp_path, capsys):
+    import subprocess as sp
+    from types import SimpleNamespace
+    from ttp import cli, coordinator, machines, timefmt
+    project, secretstore = _runtime_store_home(env, monkeypatch)
+    project.save_secret("peer-key", _CUSTOM)
+    remote = tmp_path / "remote"
+    (remote / ".tt-project").mkdir(parents=True)
+    real_run = sp.run
+
+    def fake_ssh(argv, **k):   # runs the remote command here, with the remote machine's HOME
+        if argv[:1] != ["ssh"]:
+            return real_run(argv, **k)
+        return real_run(["sh", "-c", argv[-1]], env={"HOME": str(remote), "PATH": os.environ["PATH"]}, **k)
+    monkeypatch.setattr(cli.subprocess, "run", fake_ssh)
+    (remote / ".tt-project" / "secret-store.json").write_text(json.dumps({"backend": "command", "command": ["x"]}))
+    assert "could not copy" in cli.push_secrets("box") and not (remote / ".tt-project" / "secrets.json").exists()
+    (remote / ".tt-project" / "secret-store.json").write_text(json.dumps({"backend": "file", "shared": True}))
+    assert "could not copy" in cli.push_secrets("box") and not (remote / ".tt-project" / "secrets.json").exists()
+    (remote / ".tt-project" / "secret-store.json").unlink()
+    assert "copied keys" in cli.push_secrets("box")
+    assert json.loads((remote / ".tt-project" / "secrets.json").read_text()) == {"peer-key": _CUSTOM}
+    # ttp new --host copies nothing unless --copy-secrets
+    pushed = []
+    monkeypatch.setattr(cli, "push_secrets", lambda host: pushed.append(host) or "copied")
+    monkeypatch.setattr(cli, "ship_runtime", lambda host: "~/stage/bin/ttp")
+    monkeypatch.setattr(machines, "push", lambda host: "machines: pushed")
+    monkeypatch.setattr(timefmt, "in_ssh_login", lambda: True)
+    monkeypatch.setattr(cli, "register", lambda name, entry: None)
+    monkeypatch.setattr(cli, "detect_provider", lambda: "")
+    monkeypatch.setattr(cli.subprocess, "run", lambda argv, **k: SimpleNamespace(returncode=0, stdout="", stderr=""))
+    for copy in (False, True):
+        a = SimpleNamespace(dir="~/root", host="box", no_secrets=False, copy_secrets=copy, name="demo", provider="",
+                            no_service=True, coordinator_effort=coordinator.DEFAULT_EFFORT)
+        cli.new_remote(a, "brief")
+    assert pushed == ["box"] and "saved keys stay on this machine" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("backend, cmd, refused", [
+    ({"backend": "command", "command": ["/opt/it/fetch-keys", "--all"]}, "/opt/it/fetch-keys --all | head", True),
+    ({"backend": "keychain"}, "security find-generic-password -s tt-project-secrets -w", True),
+    ({"backend": "env"}, "printenv TTP_SECRETS_JSON", True),
+    ({"backend": "file"}, "python3 -c 'from ttp import secretstore; print(secretstore.load())'", True),
+    ({"backend": "command", "command": ["/opt/it/fetch-keys", "--all"]}, "ttp secret store", False),
+    ({"backend": "keychain"}, "security list-keychains", False),
+])
+def test_hook_refuses_runs_that_read_the_run_time_store_directly(env, monkeypatch, backend, cmd, refused):
+    from ttp import hook
+    project, secretstore = _runtime_store_home(env, monkeypatch)
+    project.HOME_DIR.mkdir(parents=True, exist_ok=True)
+    secretstore.config_path().write_text(json.dumps(backend))
+    monkeypatch.setenv("TTP_RUN_DIR", str(env["tmp"]))
+    out, _ = hook.pre_tool_use({"tool_name": "Bash", "tool_input": {"command": cmd}, "cwd": str(env["tmp"])})
+    denied = bool(out) and out["hookSpecificOutput"].get("permissionDecision") == "deny"
+    assert denied == refused, out
+
+
+def _fresh_masking(monkeypatch):
+    """A process that never read the store (a run, a hook), outside a sandboxed run."""
+    from ttp import redact
+    monkeypatch.setattr(redact, "_cache", {"sig": None, "pairs": [], "error": None, "ever": False})
+    for var in ("TTP_RUN_DIR", "SANDBOX_RUNTIME"):
+        monkeypatch.delenv(var, raising=False)
+    return redact
+
+
+def test_a_daemon_refuses_the_env_store_and_its_runs_never_inherit_or_miss_it_silently(env, monkeypatch, capsys):
+    from ttp import outscan
+    from ttp.daemon import Daemon
+    p = make(env)
+    project, secretstore = _runtime_store_home(env, monkeypatch)
+    code, out = _custom(monkeypatch, capsys, "store", "env")
+    assert code == 0 and "a daemon refuses to start with it" in out
+    monkeypatch.setenv(secretstore.ENV_VAR, json.dumps({"jev": {"key": _STORE_KEY}}))
+    assert Daemon(p.base).run() == 2
+    err = capsys.readouterr().err
+    assert "daemon refused" in err and "keychain or command" in err and _STORE_KEY not in err
+    assert secretstore.ENV_VAR not in os.environ, "no run started by it inherits the keys"
+    assert not (p.state / "daemon.pid").exists()
+    # A process started without the variable (a run, a hook): the store is unreadable, never empty
+    secretstore._env.clear()
+    secretstore._mem.update(key=None, data=None)
+    redact = _fresh_masking(monkeypatch)
+    assert redact.pairs() == [] and redact.blind() and secretstore.ENV_VAR in redact.store_error()
+    assert "secrets store could not be read" in outscan.problem("ttp notify", "hello", p=p)
+
+
+def test_a_store_unreadable_at_the_runs_end_flags_the_run_and_says_so(env, monkeypatch, capsys):
+    from ttp import runner
+    project, secretstore = _runtime_store_home(env, monkeypatch)
+    secretstore.set_config("command", [str(_fetch_script(env, f'echo "{_STORE_KEY}" >&2\nexit 7\n'))])
+    redact = _fresh_masking(monkeypatch)
+    run_dir = env["tmp"] / "run"
+    run_dir.mkdir()
+    (run_dir / "output.jsonl").write_text(json.dumps({"text": "hello"}) + "\n")
+    exit_info: dict = {"rc": 0}
+    runner._mask_run(run_dir, exit_info)
+    out = capsys.readouterr().out
+    assert "exited 7" in exit_info["unmasked"] and _STORE_KEY not in exit_info["unmasked"]
+    assert "runner: could not mask stored secrets in the run: secret fetch command" in out and _STORE_KEY not in out
+    assert redact.pairs() == [], "pairs() still never raises"
+    # A store read once in this process keeps masking its values: not flagged
+    _fetch_script(env, f'echo \'{{"jev": {{"key": "{_STORE_KEY}"}}}}\'\n')
+    secretstore._mem.update(key=None, data=None)
+    redact._cache["sig"] = None
+    (run_dir / "output.jsonl").write_text(json.dumps({"text": f"leaked {_STORE_KEY}"}) + "\n")
+    exit_info = {"rc": 0}
+    runner._mask_run(run_dir, exit_info)
+    assert "unmasked" not in exit_info and _STORE_KEY not in (run_dir / "output.jsonl").read_text()
+
+
+def test_outscan_refuses_while_the_store_is_unreadable_and_passes_once_it_reads(env, monkeypatch):
+    from ttp import outscan
+    project, secretstore = _runtime_store_home(env, monkeypatch)
+    secretstore.set_config("command", [str(_fetch_script(env, "exit 3\n"))])
+    redact = _fresh_masking(monkeypatch)
+    why = outscan.problem("ttp note --to", "a clean note")
+    assert why and "secrets store could not be read" in why and "nothing was sent" in why
+    _fetch_script(env, f'echo \'{{"jev": {{"key": "{_STORE_KEY}"}}}}\'\n')
+    secretstore._mem.update(key=None, data=None)
+    redact._cache["sig"] = None
+    assert outscan.problem("ttp note --to", "a clean note") is None
+    assert "a stored secret" in outscan.problem("ttp note --to", f"note {_STORE_KEY}")
+
+
+def test_a_shared_host_still_reading_its_plaintext_file_is_reported_truthfully(env, monkeypatch):
+    project, secretstore = _runtime_store_home(env, monkeypatch)
+    project.save_secret("peer-key", _CUSTOM)
+    secretstore.config_path().write_text(json.dumps({"backend": "file", "shared": True}))   # written by hand
+    assert project.load_secrets() == {"peer-key": _CUSTOM}, "the file backend still reads it"
+    line = secretstore.plaintext_report()
+    assert "still reads it" in line and "no longer reads" not in line and _CUSTOM not in line
+    secretstore.config_path().write_text(json.dumps({"backend": "keychain"}))
+    assert "no longer reads or writes it" in secretstore.plaintext_report()
+
+
+@pytest.mark.parametrize("user,account", [("alice.b", "alice.b"), ('ev il" -A', "tt-project"),
+                                          ("a\nadd-internet-password", "tt-project"), ("", "tt-project")])
+def test_the_keychain_line_never_splits_on_the_users_name(env, monkeypatch, user, account):
+    project, secretstore = _runtime_store_home(env, monkeypatch)
+    monkeypatch.setenv("USER", user)
+    seen = []
+    monkeypatch.setattr(secretstore.subprocess, "run", lambda argv, **k: (
+        seen.append(k["input"]), types.SimpleNamespace(returncode=0, stdout="", stderr=""))[1])
+    secretstore._keychain_save({}, {"peer-key": _CUSTOM})
+    words = seen[0].split()
+    assert seen[0].count("\n") == 1 and words[words.index("-a") + 1] == account and len(words) == 8

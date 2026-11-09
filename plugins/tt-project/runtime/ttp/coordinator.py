@@ -116,6 +116,7 @@ from . import (   # one name per line: two changes adding names merge without a 
     worktree,
     yesask,
 )
+from . import untrusted
 from . import urgent
 from . import replan
 from . import topup
@@ -234,7 +235,7 @@ ACTIONS_SCHEMA: dict[str, Any] = {
             "needs_device": {"type": "boolean"}, "user_deep": {"type": "boolean"}, "standing": {"type": "boolean"},
             "continues": {"type": "integer"}, "resource": {"type": "string"}, "machine": {"type": "string"}, "paused": {"type": "boolean"},
             "user_asked": {"type": "boolean"}, "user_end": {"type": "boolean"}, "outage": {"type": "boolean"},
-            "user_msg": {"type": "integer"},
+            "user_msg": {"type": "integer"}, "untrusted_input": {"type": "boolean"},
             "reason": {"type": "string"}, "supersedes": {"type": "array", "items": {"type": "string"}}, "permanent": {"type": "boolean"},
             "replaces": {"type": "string"}, "over": {"type": "string"}, "both_hold": {"type": "boolean"},
             "expires": {"type": "string"}, "until": {"type": "string"}, "until_probe": {"type": "string"},
@@ -2907,6 +2908,9 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                         raise ValueError(f"task_add rejected: its spec names order {oid}, and {why}")
                 pin = _task_pin(cfg, a, pin_of(old or followup))
                 labels += _pin_mark(db, a.get("pin_required"), pin, old or followup)
+                if a.get("untrusted_input") is True or untrusted.spec_sources(a.get("spec") or ""):
+                    labels.append(untrusted.LABEL)   # untrusted.py: its run's narrowed policy, no routing
+                labels = untrusted.inherit(labels, old, followup, carried and carried[0])
                 clash = _file_overlaps(p, kind, a.get("spec") or "", {old["id"]} if old else set())
                 if dropped := _exempt_overlap_deps(p, old or followup, deps):
                     deps = [d for d in deps if d not in dropped]

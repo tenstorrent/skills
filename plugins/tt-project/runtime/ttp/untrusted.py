@@ -23,6 +23,9 @@ set TTP_UNTRUSTED_INPUT=1 (a benchmark cell without a project). Then, model-free
   key, a process's environ file; named in a Bash command's words or a Read, Grep or Glob path, or
   looked for by a find from outside the worktree (`find ~ -name '*.pem'`).
   So are environment dumps (printenv, a bare env, export or set), which print tokens.
+Every task run, marked or not, is refused a Bash command naming the run's RUN_MARK file and an edit
+of that file (mark_refusal): removing it would lift these guards for the rest of the run and keep the
+daemon from labelling the task. A glob (`rm $TTP_RUN_DIR/*`) still gets around it.
 Not covered: a path or command built at run time inside a script or inline code (except git and gh,
 whose wrappers run anyway), other HTTP clients (httpie, python requests), GET requests that carry
 data in their URL, and connector (MCP) writes, which keep their AI-tag guard. A task record that
@@ -38,6 +41,11 @@ import re
 LABEL = "untrusted_input"   # modelpick.UNTRUSTED
 WRITE_LABEL = "untrusted_write"
 ENV = "TTP_UNTRUSTED_INPUT"
+KEY = LABEL                    # the run note's entry
+RUN_MARK = "untrusted-input"   # in the run dir: one source per line (web, connector, download), read by the hook and the daemon
+SOURCES = ("pr_comments", "test_log", "peer_note", "coordinator", "web", "connector", "download", "inherited")
+NOTE_TAG_RE = re.compile(r"\[note [0-9a-f]{6,}\]")
+LOCAL_RE = re.compile(r"^(?:https?://)?(?:localhost|127(?:\.\d+){3}|\[::1\]|0\.0\.0\.0)(?:[:/]|$)")
 READ_VERBS = {"view", "list", "ls", "diff", "checks", "status", "download", "watch", "clone", "checkout",
               "verify", "search"}
 READ_GROUPS = {"search", "status", "help", "version", "completion", "browse"}
@@ -48,7 +56,7 @@ CRED_FILES = {".netrc", "_netrc", ".git-credentials", ".npmrc", ".pypirc", ".pgp
 CRED_SUFFIXES = (".pem", ".key", ".p12", ".pfx", ".jks", ".keystore", ".ppk", ".gpg", ".asc")
 # token and secret only as a whole word (api_token.txt, access-tokens.json, accessToken), so a model's
 # tokenizer.json is no credential
-CRED_NAME_RE = re.compile(r"(?:(?<![a-z0-9])|(?-i:(?<=[a-z])(?=[TS])))(?:tokens?|secrets?)(?![a-z])|credential"
+CRED_NAME_RE = re.compile(r"token(?!i[sz])|secret|credential"   # anywhere in the name, but not a tokenizer
                           r"|passw(or)?d|api[_-]?key|^id_(?!.*\.pub$)|^\.env\.", re.I)
 WHY = ("this task reads untrusted input (label {label}), which may carry planted instructions, so its run "
        "{what}. ").format
@@ -79,10 +87,61 @@ def _task(env: dict | None = None) -> tuple[str, str]:
     return str(env.get("TTP_TASK") or ""), str(env.get("TTP_PROJECT") or "")
 
 
+def labelled(task: dict | None) -> bool:
+    """A task record that carries the label."""
+    try:
+        return LABEL in json.loads((task or {}).get("labels") or "[]")
+    except (TypeError, ValueError):
+        return False
+
+
+def inherit(labels: list[str], *tasks: dict | None) -> list[str]:
+    """`labels` plus LABEL when it is missing and one of `tasks` (the work a new task continues) carries it."""
+    return labels + [LABEL] if LABEL not in labels and any(labelled(t) for t in tasks) else labels
+
+
+def spec_sources(spec: str) -> list[str]:
+    """The untrusted sources a coordinator's spec shows model-free: a peer note's `[note <fp>]` tag."""
+    return ["peer_note"] if NOTE_TAG_RE.search(spec or "") else []
+
+
+def mark(run_dir: str, source: str) -> None:
+    """Record in the run dir that this run read untrusted text from `source` (once per source)."""
+    path = os.path.join(run_dir, RUN_MARK)
+    try:
+        if source not in marked(run_dir):
+            with open(path, "a") as f:
+                f.write(source + "\n")
+    except OSError:
+        pass
+
+
+def marked(run_dir: str | None) -> list[str]:
+    try:
+        with open(os.path.join(run_dir, RUN_MARK)) as f:
+            return f.read().split()
+    except (OSError, TypeError):
+        return []
+
+
+def read_source(tool: str, segments: list[list[str]] | None = None) -> str:
+    """The untrusted source a tool call reads, or '': web pages, connector reads, remote downloads."""
+    if tool in ("WebFetch", "WebSearch"):
+        return "web"
+    if tool.startswith("mcp__"):
+        return "connector"
+    for seg in segments or []:
+        if seg and os.path.basename(seg[0]) in ("curl", "wget") and any(
+                re.match(r"(?:--url=)?(?:https?|ftp)://", a) and not LOCAL_RE.match(a.removeprefix("--url="))
+                for a in seg[1:]):
+            return "download"
+    return ""
+
+
 def active(env: dict | None = None) -> bool:
-    """This run's task reads untrusted input."""
+    """This run's task reads untrusted input: labelled, or its run read web, connector or downloaded text."""
     env = os.environ if env is None else env
-    return env.get(ENV) == "1" or LABEL in _labels(*_task(env))
+    return env.get(ENV) == "1" or LABEL in _labels(*_task(env)) or bool(marked(env.get("TTP_RUN_DIR")))
 
 
 def writes_allowed(env: dict | None = None) -> bool:
@@ -271,6 +330,21 @@ def bash_refusal(segments: list[list[str]], raw: list[list[str]], cwd: str) -> s
                                      for w in rest if not w.startswith("-")):
                 return WHY(label=LABEL, what=f"pushes to the push branch {b} only through `ttp push`") + \
                     "Commit and hand off; the review lands the change"
+    return None
+
+
+MARK_WHY = "this run's untrusted-input file records the untrusted text it read; leave it as it is"
+
+
+def mark_refusal(tool: str, args: dict) -> str | None:
+    """Refuse a task run's Bash command naming RUN_MARK, or an edit or patch of that file."""
+    if tool == "Bash":
+        return MARK_WHY if RUN_MARK in str(args.get("command") or "") else None
+    if tool in ("Write", "Edit", "MultiEdit", "NotebookEdit"):
+        path = str(args.get("file_path") or args.get("notebook_path") or "")
+        return MARK_WHY if os.path.basename(path.rstrip("/")) == RUN_MARK else None
+    if tool == "apply_patch":
+        return MARK_WHY if RUN_MARK in json.dumps(args) else None
     return None
 
 

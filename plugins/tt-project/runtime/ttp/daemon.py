@@ -37,6 +37,7 @@ import uuid
 from pathlib import Path
 
 from . import runtimeload   # first of its own: its LOADED_AT is when the daemon imported its code
+from . import untrusted
 from . import ackwait
 from . import claimcheck
 from . import dispatchguard
@@ -663,6 +664,12 @@ FORK_RENET_KEY = "fork_run_renet"   # Daemon.renet_fork_runs ran (once per proje
 MODEL_REPRICE_KEY = "model_alias_reprice"   # Daemon.reprice_alias_runs ran (once per project)
 SESSION_REBOOK_KEY = "session_total_rebook"   # Daemon.rebook_session_totals ran (once per project)
 SESSION_REBOOK_DAYS = 7   # its window: runs that ended this many days back or less
+CALLS_REBOOK_KEY = "per_call_rebook"   # Daemon.rebook_per_call ran (once per project)
+CALLS_REBOOK_DAYS = 7   # its window: Claude runs that ended this many days back or less
+CALLS_REBOOK_PROGRESS_KEY = "per_call_rebook_progress"   # its place while it runs in slices (window, cursor, sums)
+CALLS_REBOOK_SLICE_S = 2.0      # a tick's slice of it stops after the session that passes this many seconds
+CALLS_REBOOK_SLICE_RUNS = 200   # or this many runs, so no tick step runs long (a 7-day re-book of a busy project ~50 s)
+CALLS_NOTE = "cost_calls"   # a Claude run's note: booked at its calls' list price (how many calls)
 MODEL_REPRICE_SINCE = (2026, 11, 7)   # its window's first day, in the home zone: the days the dollar caps over-counted
 REACH_EVERY_S = 30      # while a provider is held offline, how often its API host is resolved again
 REACH_TIMEOUT_S = 5
@@ -1146,6 +1153,7 @@ class Daemon:
         self._reap_errors: dict[int, int] = {}
         self._lean_reap = False   # this reap retries one an earlier daemon was cut off in: optional checks skipped
         self._metered: dict[int, tuple[int, float]] = {}   # run id -> (output size, when) last priced
+        self._meter_tails: dict[int, object] = {}   # run id -> its session logs' claude.LogTail (meter_running)
         self._steer_unread: dict[int, dict] = {}   # run id -> its unread steer.md stretch (steerack)
         self._runwatch_at = 0.0   # when watch_runs last refreshed state/runwatch.json
         self._window_provs: dict[int, tuple] = {}            # run id -> (provider, env) reading its windows
@@ -1357,6 +1365,19 @@ class Daemon:
     # lifecycle ------------------------------------------------------------------------------------
     def run(self) -> int:
         self.p.state.mkdir(parents=True, exist_ok=True)
+        from . import secretstore
+        from .project import SecretsUnreadable
+        # The env store serves only the process it is given to: never kept here for runs to inherit,
+        # and refused, since the hooks the agent CLI starts could never see it.
+        os.environ.pop(secretstore.ENV_VAR, None)
+        try:
+            backend = secretstore.config()["backend"]
+        except SecretsUnreadable:
+            backend = ""   # status and doctor report it; runs that need a key fail on their own
+        if backend == "env":
+            print(f"daemon refused: this machine's secret store is env ({secretstore.ENV_VAR}), which reaches "
+                  "no run or hook of a daemon; choose keychain or command (`ttp secret store`)", file=sys.stderr)
+            return 2
         pidfile = self.p.state / "daemon.pid"
         if not self._single_instance():
             print(f"daemon already running (pid {_read_pid(pidfile)})", file=sys.stderr)
@@ -1415,6 +1436,8 @@ class Daemon:
                             + ", ".join(f"run {i} ${a:.2f}->${b:.2f}" for i, a, b in changed[:40]) + ")")
         except Exception:   # a spend correction must never keep the daemon from starting
             log(self.p, "session total re-book error: " + traceback.format_exc().replace("\n", " | ")[:2000])
+        # The per-call re-book of the last 7 days runs as a tick step in slices (rebook_per_call_step), never
+        # here: read whole at start it held a busy project's start for tens of seconds.
         try:   # push batch files left `running` by a batch whose row is final (pushq.close_strays)
             if closed := pushq.close_strays(self.p):
                 log(self.p, f"closed {len(closed)} stray push batch file(s)")
@@ -2054,7 +2077,7 @@ class Daemon:
         self.tend_lease()
         # Compared as callables, not by name, so a step replaced on the instance is gated the same way.
         lease_off = [] if self.lease_held() else [getattr(self, n) for n in LEASE_STEPS]
-        for step in (self.lift_boot_pause, self.reap_runs, self.reap_waiting_checks, self.wake_after_reboot, self.meter_running, self.watch_runs, self.check_steer_reads, self.relay_escalations, self.post_held_notifies, self.reconcile_tasks, self.retry_workspaces, self.tend_pushes,
+        for step in (self.lift_boot_pause, self.reap_runs, self.reap_waiting_checks, self.wake_after_reboot, self.meter_running, self.rebook_per_call_step, self.watch_runs, self.check_steer_reads, self.relay_escalations, self.post_held_notifies, self.reconcile_tasks, self.retry_workspaces, self.tend_pushes,
                      self.sweep_sandbox_trees,
                      self.verify_pushes,
                      self.prune_worktrees, self.prune_leftovers, self.land_harness_worktrees, self.backup_branches, self.replicate_state, self.check_local_only, self.check_disk,
@@ -4171,15 +4194,15 @@ class Daemon:
             db.x("DELETE FROM kv WHERE key=?", (downtime.LINGER_KV,))
 
     def check_route_models(self) -> None:
-        """The routed endpoint's model-free /models check (route.py): at most hourly while a tier routes
-        to it, in a thread, its served ids written to the state dir's route.MODELS_FILE for workers,
+        """The routed endpoint's model-free /models check (route.py): every route.models_every seconds while
+        a tier or run class routes to it, in a thread, its served ids written to the state dir's route.MODELS_FILE for workers,
         `ttp status` and doctor; then each tier hold its answer or a config change ends is released."""
         now = time.time()
         for tier, model, why in route.release(self.p.db, self.cfg, route.read_served(self.p.state), now):
             log(self.p, f"route: tier {tier} routes again ({model}: {why})")
         if os.environ.get("TTP_TEST_NO_MODELS_PROBE") or (self._models_probe and self._models_probe.is_alive()):
             return
-        if now - self._models_tried < 300 or not (alias := route.models_due(self.cfg, self.p.state, now, self.p.db)):
+        if now - self._models_tried < route.models_every(self.cfg) or not (alias := route.models_due(self.cfg, self.p.state, now, self.p.db)):
             return
         self._models_tried = now
         state, where = self.p.state, self.p
@@ -4819,6 +4842,7 @@ class Daemon:
         running = self.p.db.q("SELECT * FROM runs WHERE status='running'")
         ids = {r["id"] for r in running}
         self._metered = {k: v for k, v in self._metered.items() if k in ids}
+        self._meter_tails = {k: v for k, v in self._meter_tails.items() if k in ids}
         self._window_provs = {k: v for k, v in self._window_provs.items() if k in ids}
         for r in running:
             out = self._run_dir(r) / "output.jsonl"
@@ -4833,8 +4857,7 @@ class Daemon:
             try:
                 usage = get_provider(r["provider"]).parse(out)
                 basis = _cost_basis(usage)
-                self._priced(r, usage)
-                cost = self._net_of_session(r, usage)
+                cost = self._book_cost(r, usage, out, metering=True)
             except Exception:
                 continue
             # The tokens also show a run on a logged-out provider got past the login (alerts.holds).
@@ -4937,6 +4960,75 @@ class Daemon:
                 "cache_read": usage.cache_read_tokens, "cache_write": usage.cache_write_tokens})
         return usage.cost_usd
 
+    def _book_cost(self, r: dict, usage, out: Path, metering: bool = False) -> float:
+        """What run `r` books, set on `usage.cost_usd`. A Claude run books its own API calls, each once at
+        list price (claude.calls_cost: the calls `out`, its output.jsonl, names, at the final usage Claude
+        Code's session log recorded, _transcripts), whatever Claude Code's total_cost_usd says: in a resumed
+        or forked session that is the session's running total, which netting against earlier runs kept
+        mis-booking, while the per-call count matched Anthropic's bill. The report stays
+        in the note (reported_usd; session_cost_usd for a resumed or forked run, the coordinator's
+        --max-budget-usd base, _session_total_before). A resumed or forked run with no answer at all, a
+        report and no tokens, never reached the API: $0. Other providers, and a Claude output with no
+        per-call usage (an old Claude Code, a run cut off before its first answer), book the old way:
+        the report, netted (_net_of_session), or the token or elapsed estimate. A resumed or forked run whose
+        stream shows Claude Code started (init) but no call that answered books $0 whatever its result
+        reports (a lost or failed fork carries the parent session's total and its tokens): never the old way.
+        With `metering` (meter_running, a run still going) the session logs are read incrementally
+        (claude.LogTail kept per run), never whole each minute."""
+        if (r["provider"] or "") == "claude":
+            from . import localspend
+            from .providers import claude
+            session = _continues_session(r, json.loads(r["note"] or "{}"))
+            reported = None if usage.estimated else float(usage.cost_usd or 0)
+            tail = self._meter_tails.setdefault(r["id"], claude.LogTail()) if metering else None
+            try:
+                got = claude.calls_cost(out, localspend.overrides(),
+                                        self._transcripts(r, out.parent, usage.session_id or r["session_id"] or ""),
+                                        tail=tail, empty_ok=session)
+            except Exception as e:   # the old way books it
+                log(self.p, f"run {r['id']}: per-call cost not read: {type(e).__name__}: {e}"[:300])
+                got = None
+            if got is None and session and reported is not None and not _has_tokens(usage):
+                got = claude.CallsCost(0.0, 0, [], [])   # a resume or fork that made no call
+            if got is not None:
+                for model in got.unknown:
+                    self._unpriced_model(model)
+                if reported is not None:
+                    usage.extra["reported_usd"] = reported
+                    if session and reported > 0:
+                        usage.extra["session_cost_usd"] = reported
+                usage.extra[CALLS_NOTE] = got.calls
+                usage.cost_usd = got.usd
+                return usage.cost_usd
+        self._priced(r, usage)
+        return self._net_of_session(r, usage)
+
+    def _transcripts(self, r: dict, run_dir: Path, session: str) -> list[Path]:
+        """Claude Code's session log of a Claude run's session and its subagents' logs (claude.calls_cost
+        reads each call's final usage there): under the run's own CLAUDE_CONFIG_DIR, else the daemon's, in
+        the folder its working directory names (run.json), else wherever session_paths finds them."""
+        from .providers import claude
+        if not session or not re.fullmatch(r"[A-Za-z0-9-]+", session):
+            return []
+        try:
+            spec = json.loads((run_dir / "run.json").read_text())
+        except (OSError, ValueError):
+            spec = {}
+        env = spec.get("env") if isinstance(spec.get("env"), dict) else {}
+        cwd = str(spec.get("cwd") or "")
+        if cwd:
+            slug = re.sub(r"[^a-zA-Z0-9]", "-", cwd)
+            own = env.get("CLAUDE_CONFIG_DIR")
+            for base in dict.fromkeys(([Path(own).expanduser()] if own else []) + [claude.claude_config_dir()]):
+                folder = base / "projects" / slug
+                if (folder / f"{session}.jsonl").is_file():
+                    sub = folder / session
+                    return [folder / f"{session}.jsonl", *(sorted(sub.glob("**/*.jsonl")) if sub.is_dir() else [])]
+        try:
+            return get_provider("claude").session_paths(session, cwd, env)
+        except Exception:
+            return []
+
     def _net_of_session(self, r: dict, usage) -> float:
         """A resumed Claude Code session reports the whole session's total_cost_usd, not this run's:
         book only what this run added beyond the earlier runs of the session. Netted only when the
@@ -4994,7 +5086,7 @@ class Daemon:
     def _session_total_before(self, session: str, before: int) -> float | None:
         """Session `session`'s running total as Claude Code last reported it before run `before`, from the
         newest earlier run of it (any task or role: a session id names one session) that shows it: its
-        note's session_cost_usd, else its output's last result, else, for the run that started the
+        note's session_cost_usd or reported_usd, else its output's last result, else, for the run that started the
         session (no earlier run of it, _session_runs_before), what it booked as reported. None when no
         recent run shows it (the caller then nets the old way). A run with no result is passed over: an older, lower total only books more."""
         from .providers import claude
@@ -5004,6 +5096,8 @@ class Daemon:
                 note = json.loads(o["note"] or "{}")
                 if note.get("session_cost_usd") is not None:
                     return float(note["session_cost_usd"])
+                if note.get("reported_usd") is not None:   # a run booked per call (_book_cost)
+                    return float(note["reported_usd"])
             except (ValueError, TypeError):
                 note = {}
             if (o["provider"] or "") == "claude" and \
@@ -5070,7 +5164,7 @@ class Daemon:
         for r in db.q("SELECT * FROM runs WHERE role='coordinator' AND task IS NULL AND session_id IS NOT NULL "
                       "AND status!='running' AND cost_usd>0 AND note LIKE '%\"resume\"%' ORDER BY id"):
             note = json.loads(r["note"] or "{}")
-            if "session_cost_usd" in note or not _resumed_coord_session(r, note):
+            if "session_cost_usd" in note or CALLS_NOTE in note or not _resumed_coord_session(r, note):
                 continue
             usage = RunUsage(cost_usd=float(r["cost_usd"]), input_tokens=r["input_tokens"] or 0,
                              output_tokens=r["output_tokens"] or 0, cache_read_tokens=r["cache_read_tokens"] or 0,
@@ -5102,7 +5196,8 @@ class Daemon:
         for r in db.q("SELECT * FROM runs WHERE task IS NOT NULL AND status!='running' AND cost_usd>0 "
                       "AND note LIKE ? ORDER BY id", (f'%{ctxfork.KEY}%',)):
             note = json.loads(r["note"] or "{}")
-            if "session_cost_usd" in note or not ctxfork.forked(note) or (note.get("resumes") or {}).get("session"):
+            if "session_cost_usd" in note or CALLS_NOTE in note or not ctxfork.forked(note) \
+                    or (note.get("resumes") or {}).get("session"):
                 continue
             usage = RunUsage(cost_usd=float(r["cost_usd"]), input_tokens=r["input_tokens"] or 0,
                              output_tokens=r["output_tokens"] or 0, cache_read_tokens=r["cache_read_tokens"] or 0,
@@ -5145,7 +5240,8 @@ class Daemon:
                       "AND cost_usd>0 AND (COALESCE(ended, started)>=? OR note LIKE '%fork_base_usd%') "
                       "AND note LIKE ? ORDER BY id", (since, f'%{ctxfork.KEY}%')):
             note = json.loads(r["note"] or "{}")
-            if "repriced_model" in note or not ctxfork.forked(note) or (note.get("resumes") or {}).get("session"):
+            if "repriced_model" in note or CALLS_NOTE in note or not ctxfork.forked(note) \
+                    or (note.get("resumes") or {}).get("session"):
                 continue
             extra = self._output_models(r)
             if not extra.get("model_usage") and not extra.get("model"):
@@ -5190,8 +5286,8 @@ class Daemon:
                       "AND cost_usd>0 AND COALESCE(ended, started)>=? ORDER BY id",
                       (time.time() - SESSION_REBOOK_DAYS * 86400,)):
             note = json.loads(r["note"] or "{}")
-            if "session_rebooked" in note or not ((note.get("resumes") or {}).get("session")
-                                                  or _resumed_coord_session(r, note)):
+            if "session_rebooked" in note or CALLS_NOTE in note or not ((note.get("resumes") or {}).get("session")
+                                                                        or _resumed_coord_session(r, note)):
                 continue
             before = float(r["cost_usd"])
             reported = claude.result_total(self._run_dir(r) / "output.jsonl")
@@ -5215,6 +5311,114 @@ class Daemon:
             db.set_kv(SESSION_REBOOK_KEY, {"at": time.time(), "runs": len(changed),
                                            "usd_before": round(sum(c[1] for c in changed), 6),
                                            "usd_after": round(sum(c[2] for c in changed), 6)})
+        return changed
+
+    def rebook_per_call_step(self) -> None:
+        """Tick step: the next slice of the one-time per-call re-book (rebook_per_call), until it is done."""
+        if getattr(self, "_calls_rebook_done", False):
+            return
+        if self.rebook_per_call(max_s=CALLS_REBOOK_SLICE_S, max_runs=CALLS_REBOOK_SLICE_RUNS,
+                                in_step=True) is None:
+            self._calls_rebook_done = True
+
+    def rebook_per_call(self, dry_run: bool = False, max_s: float | None = None, max_runs: int | None = None,
+                        in_step: bool = False) -> list[tuple[int, float, float]] | None:
+        """Once per project (kv CALLS_REBOOK_KEY): Claude runs that ended in the last CALLS_REBOOK_DAYS days,
+        booked before _book_cost from Claude Code's total_cost_usd (netted or not), re-booked the way
+        _book_cost books one now: at their own calls' list price (claude.calls_cost, each session's log read
+        once for all its runs in a slice), and a resumed or forked run that made no call at $0. The correction
+        goes either way: the run's cost_usd is set, its task's spend moves by the difference (never below $0),
+        and a ledger row of the signed difference is booked at the run's end, so the dollar caps and the
+        global daily total sum the per-call cost. A run whose output is gone or has no per-call usage
+        keeps its booking; so does one cut off before its first call (its token or elapsed estimate
+        stands). Each row changed is marked (note cost_calls, and calls_rebooked the old figure), so a
+        second pass changes nothing.
+        In slices: with `max_s` or `max_runs` (the tick step, rebook_per_call_step) it stops after the
+        session whose runs pass either bound, or at the step's budget (`in_step`), and keeps its place in kv
+        CALLS_REBOOK_PROGRESS_KEY: the window fixed at its first slice (since, the highest run id then), the
+        first run id of the last session done (sessions go by their first run) and the sums so far. The
+        slice that finishes sets CALLS_REBOOK_KEY (the done marker) and logs one line for the project. With `dry_run` all of it runs
+        at once, nothing is written and neither kv is read. Returns (run id, booked before, booked after)
+        of each row this slice changed, by run id, or None when it already ran."""
+        from . import localspend
+        from .providers import claude
+        db = self.p.db
+        if not dry_run and db.kv(CALLS_REBOOK_KEY):
+            return None
+        t0 = time.monotonic()
+        prog = {} if dry_run else dict(db.kv(CALLS_REBOOK_PROGRESS_KEY) or {})
+        if not prog:
+            prog = {"since": time.time() - CALLS_REBOOK_DAYS * 86400,
+                    "upto": int((db.one("SELECT COALESCE(MAX(id),0) m FROM runs") or {}).get("m") or 0),
+                    "cursor": 0, "runs": 0, "usd_before": 0.0, "usd_after": 0.0, "slices": 0}
+        overrides = localspend.overrides()
+        sessions: dict[str, list] = {}
+        for r in db.q("SELECT * FROM runs WHERE provider='claude' AND status!='running' AND id<=? "
+                      "AND COALESCE(ended, started)>=? ORDER BY id", (prog["upto"], prog["since"])):
+            note = json.loads(r["note"] or "{}")
+            if CALLS_NOTE not in note:
+                sid = str(r["session_id"] or note.get("session_id") or "")
+                sessions.setdefault(sid or f"run:{r['id']}", []).append((r, note))
+        changed, done, seen = [], True, 0
+        for key, runs in sessions.items():   # by each session's first run, the order a task's $0 floor applies in
+            if runs[0][0]["id"] <= prog["cursor"]:
+                continue
+            if (not dry_run and seen and ((max_s is not None and time.monotonic() - t0 >= max_s)
+                                          or (max_runs is not None and seen >= max_runs)
+                                          or (in_step and self._step_over(f"per-call re-book {key}")))):
+                done = False
+                break
+            seen += len(runs)
+            outs = [self._run_dir(r) / "output.jsonl" for r, _ in runs]
+            streams = [claude.stream_calls(out, _continues_session(r, note)) if out.is_file() else None
+                       for (r, note), out in zip(runs, outs)]
+            wanted = set().union(*(st[0] for st in streams if st))
+            session = "" if key.startswith("run:") else key
+            session = session or next((st[1] for st in streams if st and st[1]), "")
+            logs = self._transcripts(runs[0][0], outs[0].parent, session) if wanted else []
+            logged = claude.logged_usage(logs, wanted) if logs else {}
+            for (r, note), out, st in zip(runs, outs, streams):
+                reported = claude.result_total(out) if out.is_file() else None
+                if st is not None:
+                    got = claude.price_calls(st[0], overrides, logged)
+                    if not got.calls and reported is None and not _continues_session(r, note):
+                        continue   # cut off before its first call: its estimate stands
+                elif reported is not None and _continues_session(r, note) \
+                        and not _has_tokens(get_provider("claude").parse(out)):
+                    got = claude.CallsCost(0.0, 0, [], [])   # a resume or fork that made no call
+                else:
+                    continue
+                before, after = round(float(r["cost_usd"] or 0), 6), got.usd
+                if abs(after - before) < 1e-6:
+                    continue
+                changed.append((r["id"], before, after))
+                if dry_run:
+                    continue
+                note.update({CALLS_NOTE: got.calls, "calls_rebooked": before})
+                if reported is not None:
+                    note.setdefault("reported_usd", reported)
+                with db.tx():
+                    db.x("UPDATE runs SET cost_usd=?, note=? WHERE id=?", (after, json.dumps(note), r["id"]))
+                    if r["task"]:
+                        db.x("UPDATE tasks SET spent_usd=MAX(COALESCE(spent_usd,0)+?,0) WHERE id=?",
+                             (after - before, r["task"]))
+                    db.spend(r["provider"], after - before, self._source_for(r), account=r["account"] or "",
+                             estimated=bool(r["cost_estimated"]), ts=float(r["ended"] or r["started"] or time.time()))
+            prog["cursor"] = runs[0][0]["id"]
+        changed.sort()
+        if dry_run:
+            return changed
+        prog.update(runs=prog["runs"] + len(changed), slices=prog["slices"] + 1,
+                    usd_before=round(prog["usd_before"] + sum(c[1] for c in changed), 6),
+                    usd_after=round(prog["usd_after"] + sum(c[2] for c in changed), 6))
+        if not done:
+            db.set_kv(CALLS_REBOOK_PROGRESS_KEY, prog)
+            return changed
+        db.set_kv(CALLS_REBOOK_KEY, {"at": time.time(), "runs": prog["runs"], "slices": prog["slices"],
+                                     "usd_before": prog["usd_before"], "usd_after": prog["usd_after"]})
+        db.set_kv(CALLS_REBOOK_PROGRESS_KEY, None)
+        log(self.p, f"re-booked {prog['runs']} Claude run(s) of the last {CALLS_REBOOK_DAYS} days at their per-call "
+                    f"cost in {prog['slices']} slice(s): ${prog['usd_before']:.2f} booked -> ${prog['usd_after']:.2f}")
         return changed
 
     def _output_models(self, r: dict) -> dict:
@@ -5288,6 +5492,8 @@ class Daemon:
         if r["role"] == "coordinator":
             self._coord_writes(r, run_dir, report=not self._lean_reap)   # before its output is applied
         runner.remove_private(run_dir)   # the runner removes them too, unless it died first
+        if r["role"] != "coordinator" and r["task"] and (read := untrusted.marked(run_dir)):
+            self._carry_untrusted(r["task"], r["id"], read)
         try:   # the runner masks them too, unless it died first: before the output or hand-off is read
             left: list = []   # within the step: each file capped, the run time-limited; the rest detached
             redact.scrub_run(run_dir, step=True, left=left)
@@ -5298,6 +5504,14 @@ class Daemon:
                        + (f"masked by detached job {pid} (scrub.log)" if pid else "the detached masking job did not start"))
         except Exception:
             log(p, f"run {r['id']}: masking stored secrets failed\n" + traceback.format_exc())
+        if exit_info.get("unmasked") and redact.blind():   # neither the runner nor the daemon could read the store
+            text = (f"run {r['id']}: could not mask stored secrets in the run (the secrets store could not be "
+                    f"read: {redact.store_error()}); its log and hand-off may hold a stored value")
+            log(p, text)
+            if getattr(self, "_unmasked_said", None) != redact.store_error():   # one event per cause, not per run
+                self._unmasked_said = redact.store_error()
+                db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+                     (time.time(), "daemon", "secrets_unmasked", "high", text[:500], "queued", r["task"]))
         if exit_info.get("cred_changed"):
             try:
                 credwatch.observe(db, r, exit_info["cred_changed"], time.time(), run_dir, p,
@@ -5315,8 +5529,7 @@ class Daemon:
             seen = db.kv(key) or {"since": time.time()}
             db.set_kv(key, {**seen, "used": sorted(set(seen.get("used") or []) | set(usage.extra["connectors_used"]))})
         basis = _cost_basis(usage)
-        self._priced(r, usage)
-        self._net_of_session(r, usage)
+        self._book_cost(r, usage, run_dir / "output.jsonl")
         stopped = exit_info.get("stopped")
         refused = str(exit_info.get("refused") or "")
         if refused and not usage.error:
@@ -5429,6 +5642,16 @@ class Daemon:
                     db.set_kv(seen, {"run": r["id"], "ts": time.time()})   # logged once per model and effort
                     log(self.p, f"route: {r['model']} rejected its effort_fields at effort "
                                 f"{sent['effort'] or '-'} ({', '.join(sent['fields'])}); run {r['id']} went on without them")
+            # Only a run that ran on it counts: a hand-off is a good run, its own fault (FAULTS_PARK) a bad one;
+            # a start that fell back before it (no room, auth) or a run killed, capped or slept books nothing.
+            if (routed.get(modelrank.KEY) or {}).get("why") == modelrank.BETTER and on_route and (
+                    handed_off or fell in modelrank.FAULTS_PARK) and (verdict := modelrank.tried(
+                    db, ran := r["model"] or routed["model"], fell, r["id"], time.time())):   # a smarter model's try
+                log(self.p, f"model ranking: {ran} {verdict} (run {r['id']}{': ' + fell if fell else ''})")
+                if verdict == "parked":
+                    self.alert(f"model-rank-park:{ran}", f"Model {ran} on the {routed['to']} provider failed run "
+                               f"{r['id']} on its own ({fell}); routes skip it for a week, then try it again.",
+                               severity="low", every_s=0)
             if fell == "model_missing" and routed.get(modelrank.KEY):   # a ranked stand-in refused: skip it
                 modelrank.refused(db, r["model"] or routed["model"], r["id"], time.time())
                 log(self.p, f"model ranking: {routed['to']} refused {r['model'] or routed['model']} (run {r['id']})")
@@ -5441,7 +5664,7 @@ class Daemon:
                                    f"The {routed['to']} provider no longer serves model {model} "
                                    f"(providers.{routed['to']}.tiers.{routed['tier']}.model). {routed['tier'].capitalize()} "
                                    f"runs now start on the core provider; routing resumes on its own once the model is "
-                                   f"served again (checked hourly) or the tier's model is changed. Served models: "
+                                   f"served again (checked every minute) or the tier's model is changed. Served models: "
                                    f"`ttp status`.", severity="normal", every_s=0)
             elif fell and not own:   # an endpoint fault cools the endpoint; a run's own end only its task
                 route.cool(db, self.cfg, routed["to"], fell, r["id"], time.time())
@@ -5490,6 +5713,9 @@ class Daemon:
             note["model_used"] = str(usage.extra["model"])[:120]
         if "session_cost_usd" in usage.extra:
             note["session_cost_usd"] = usage.extra["session_cost_usd"]   # reported; cost_usd is this run's
+        for k in ("reported_usd", CALLS_NOTE):   # Claude Code's own total, kept beside the per-call booking
+            if k in usage.extra:
+                note[k] = usage.extra[k]
         # The runaway guard counts runs that ended without an outcome; a reboot, a host sleep or a
         # hand-off that stands is an outcome, not a loop.
         if status == "lost" and r["boot_id"] and not self._this_boot(r["boot_id"]):
@@ -5631,8 +5857,9 @@ class Daemon:
             return
         try:
             # A resumed coordinator wake's log holds its whole session: compared with the session's total.
-            got = localspend.calibrate(usage.session_id,
-                                       (getattr(usage, "extra", None) or {}).get("session_cost_usd", usage.cost_usd))
+            extra = getattr(usage, "extra", None) or {}
+            got = localspend.calibrate(usage.session_id, extra.get("session_cost_usd",
+                                                                   extra.get("reported_usd", usage.cost_usd)))
         except Exception as e:  # noqa: BLE001 - a price check never breaks finishing a run
             log(self.p, f"price table check failed: {e}")
             return
@@ -10851,6 +11078,9 @@ class Daemon:
                     note[route.KEY] = routed
                 if dp := self._model_pick(task, tier, peek=True):
                     note[modelpick.KEY] = {k: dp.get(k) for k in ("by", "pick", "p", "why", "tier") if k in dp}
+                if untrusted.labelled(task):   # it never routes (route.eligible): the model it skipped, if any
+                    to = route.target(self.cfg, tier)
+                    note[untrusted.KEY] = {"set": True, **({"kept_core": f"{to[0]}:{to[1]}"} if to else {})}
                 # A cheap class on the Claude core provider (no tt model serves it): a cheap Claude model.
                 cheap = None if dp else runclass.core_cheap(self.cfg, task, run_cls, tier, run_prov, routed, picked)
                 if cheap:
@@ -10881,7 +11111,8 @@ class Daemon:
                                         timeout_s=(routed or {}).get("timeout_s"),
                                         read_only=False, append_system=system, note=note,
                                         resume=lost["session"] if lost else None,
-                                        min_effort=(need or {}).get("effort") or None)
+                                        min_effort=None if tierfloor.wake_keeps_effort(task, run_cls)
+                                        else (need or {}).get("effort") or None)
                 if lease:   # the lease now names the run's supervisor in place of the daemon
                     self._route_lease(task, routed, tier, now, run_id=run_id)
             except Exception as e:
@@ -11168,6 +11399,17 @@ class Daemon:
         log(self.p, f"task {task['id']}: {tierfloor.note(got)}")
         return {**got, "task": task}
 
+    def _carry_untrusted(self, tid: int, run_id: int, read: list[str]) -> None:
+        """A task run that read untrusted text (untrusted.RUN_MARK) labels its task, so its later runs and the
+        work that continues it get the narrowed policy and stay on the core provider."""
+        try:
+            t = self.p.db.task(tid)
+            if t and not untrusted.labelled(t):
+                self.p.db.update_task(tid, labels=json.loads(t["labels"] or "[]") + [untrusted.LABEL])
+                log(self.p, f"task {tid}: labelled {untrusted.LABEL}: its run {run_id} read {', '.join(read)} text")
+        except Exception as e:   # the label must never cost the run its end
+            log(self.p, f"task {tid}: {untrusted.LABEL} label not set: {e}")
+
     def _floor_keeps_core(self, task: dict, tier: str, picked: dict | None) -> str:
         """The routed model (route.py) a floor run (tierfloor.target) skips to run on the core provider,
         or '' when its tier routes nowhere or it is no floor run."""
@@ -11224,14 +11466,14 @@ class Daemon:
         if not to and dp is None and cls:
             to = runclass.target(self.cfg, task, tier, cls, picked)
             if to:
-                return self._route_entry(task, tier, to["to"], to["model"], now, to["rule"])
+                return self._route_entry(task, tier, to["to"], to["model"], now, to["rule"], cls)
         if not to or not route.eligible(task, picked) or (dp is None and self._floor_keeps_core(task, tier, picked)):
             return None
         name, model = to["to"], to["model"]
         if dp is not None:
             return {**self._route_entry(task, tier, name, model, now), "model_pick": True,
                     **({"pick_effort": got["effort"]} if got["effort"] else {})}
-        return self._route_entry(task, tier, name, model, now, to["rule"])
+        return self._route_entry(task, tier, name, model, now, to["rule"], cls)
 
     def _model_pick(self, task: dict, tier: str, peek: bool = False) -> dict | None:
         """This start's model pick (modelpick.pick), or None: the tier's own route decides. `peek`
@@ -11248,13 +11490,14 @@ class Daemon:
             log(self.p, f"task {task.get('id')}: model not picked: {e}")
             return None
 
-    def _route_entry(self, task: dict, tier: str, name: str, model: str, now: float, rule_i: int | str | None = None) -> dict:
+    def _route_entry(self, task: dict, tier: str, name: str, model: str, now: float, rule_i: int | str | None = None,
+                     cls: str | None = None) -> dict:
         rule = {} if rule_i is None else {"rule": rule_i}   # the providers.chat.routes rule it matched
         after = route.fell_back_before(self.p.db, task["id"]) if task.get("id") else None
         if after:   # the task fell back on its own once: the rest of its runs stay on the core provider
             return {"tier": tier, "to": name, "model": model, **rule, "fallback": "rerun", "after": after}
         try:
-            esc = route.escalation(self.p.db, task) if task.get("id") else {}
+            esc = route.escalation(self.p.db, task, urgency=cls not in runclass.CHAT) if task.get("id") else {}
         except Exception as e:   # escalation must never hold a task back
             log(self.p, f"task {task['id']}: route escalation not checked: {type(e).__name__}: {e}")
             esc = {}
@@ -11266,6 +11509,8 @@ class Daemon:
             if name == modelrank.TO and why in ("", "model_missing") else None   # one switch record per rule
         if ranked:   # its model is down: the smartest model still served (modelrank.py)
             model, why = ranked[0], ""
+        elif name == modelrank.TO and not why and (up := self._rank_better(where, key, model, tier, now)):
+            model, ranked = up, (up, {"from": model, "why": modelrank.BETTER})   # a smarter one is served
         if not why and self._logged_out(name) and not self._may_probe(name, now):
             why = "auth"   # the auth gate holds it; its one login check may be a routed run
         return {"tier": tier, "to": name, "model": model, **rule, "fallback": why or "none",
@@ -11302,6 +11547,18 @@ class Daemon:
         except Exception as e:   # the ranking must never hold a task back
             log(self.p, f"model ranking not applied ({where}): {type(e).__name__}: {e}")
             return None
+
+    def _rank_better(self, where: str, key: str, model: str, tier: str, now: float) -> str:
+        """A served model ranked above the up `model` to run instead (modelrank.better: light starts only
+        until it has proven itself), logged once per change of `key`; else ''."""
+        try:
+            up = modelrank.better(self.p.db, self.cfg, self.p.state, model, now, light=tier == "light")
+            if up and modelrank.switch(self.p.db, f"{modelrank.BETTER}:{key}", model, up, now):
+                log(self.p, f"model ranking: {where} tries {up}, ranked above {model}")
+            return up
+        except Exception as e:   # the ranking must never hold a task back
+            log(self.p, f"model ranking: better model not checked ({where}): {type(e).__name__}: {e}")
+            return ""
 
     def _slot_provider(self, task: dict, provider: str, ctx: dict) -> str:
         """The provider whose worker slots a start of `task` takes: the one its tier is routed to
@@ -17848,7 +18105,8 @@ class Daemon:
                 fid = db.add_task(f"Fix review #{review['id']}: {base_title}"[:200], "", kind="code", tier=tier,
                                   tier_source=tsrc, priority=chainprio.of(db, code, review), origin="daemon",
                                   budget_usd=float(cfg["budget"]["task_default_usd"].get(tier, 8.0)),
-                                  labels=[f"continues:{code['id']}", f"review_fix:{review['id']}"], **pin_of(code))
+                                  labels=untrusted.inherit([f"continues:{code['id']}", f"review_fix:{review['id']}"], code),
+                                  **pin_of(code))
                 fbranch = f"ttp/t{fid}-{worktree.slug(base_title)}"
             # The stack's pr_branch goes with its `ttp push --own` step: the re-review carries it as a label,
             # and its spec names the fix's branch to publish from (the reviewed branch lacks the fixes).
@@ -17968,7 +18226,8 @@ class Daemon:
             fid = db.add_task(f"Fix review #{review['id']}: {base_title}"[:200], "", kind="code", tier=tier,
                               tier_source=tsrc, priority=chainprio.of(db, code, review), origin="daemon",
                               budget_usd=float(cfg["budget"]["task_default_usd"].get(tier, 8.0)),
-                              labels=[f"continues:{code['id']}", f"review_fix:{review['id']}"], **pin_of(code))
+                              labels=untrusted.inherit([f"continues:{code['id']}", f"review_fix:{review['id']}"], code),
+                                  **pin_of(code))
             rid = db.add_task(
                 f"Re-review #{review['id']}: " + re.sub(r"^(?:Re-review #\d+: )+", "", review["title"]),
                 "\n".join([
@@ -18102,7 +18361,7 @@ class Daemon:
                               tier_source="parent_copy", priority=src["priority"], origin="daemon",
                               budget_usd=float(self.cfg["budget"]["task_default_usd"].get(tier, 8.0)),
                               branch=branch if branch and not held else None,
-                              labels=[f"continues:{src['id']}", f"pr_fix:{key}"]
+                              labels=[f"continues:{src['id']}", f"pr_fix:{key}", untrusted.LABEL]   # PR comments, CI logs
                               + ([f"pr_branch:{branch}"] if branch else []), **pin_of(src))
         log(self.p, f"{key}: open findings outlived task {src['id']}; queued fix #{fid}")
         return db.task(fid), True
@@ -19084,6 +19343,12 @@ def _resumed_coord_session(r: dict, note: dict) -> str:
     turn = note.get("turn") if isinstance(note.get("turn"), dict) else {}
     session = turn.get("session") if isinstance(turn.get("session"), dict) else {}
     return str(r["session_id"] or "") if session.get("mode") == "resume" else ""
+
+
+def _continues_session(r: dict, note: dict) -> bool:
+    """A run that resumed a session (a worker's or review's, or a coordinator session wake) or started as a
+    fork of the coordinator's: Claude Code reports the session's running total, not the run's own cost."""
+    return bool((note.get("resumes") or {}).get("session") or _resumed_coord_session(r, note) or ctxfork.forked(note))
 
 
 def _priced_model(r: dict, usage) -> str:

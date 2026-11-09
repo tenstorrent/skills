@@ -1626,16 +1626,17 @@ def test_coordsession_a_resumed_wake_books_what_the_session_total_rose_by(env):
     assert d._net_of_session(dict(r, task=1), RunUsage(cost_usd=5.0)) == 5.0, "a task's run netted over the coordinator's"
 
 
-def _cs_claude_run(p, session, total, note, *, task=None, role="coordinator", out=20_000, ended=None):
+def _cs_claude_run(p, session, total, note, *, task=None, role="coordinator", out=20_000, ended=None, init=True):
     """A finished Claude run whose output.jsonl reports `total` as Claude Code does (a resumed or forked
-    session's running total) with this run's own `out` output tokens; returns its row."""
+    session's running total) with this run's own `out` output tokens and no per-call usage; returns its
+    row. Without `init` the stream has no init event either (a stream booked the old way)."""
     rid = p.db.x("INSERT INTO runs(task,role,provider,model,started,ended,status,session_id,cost_basis,note) "
                  "VALUES(?,?,'claude','opus',?,?,'running',?,'reported',?)",
                  (task, role, (ended or time.time()) - 60, ended or time.time(), session, json.dumps(note)))
     d = p.runs / str(rid)
     d.mkdir(parents=True, exist_ok=True)
     (d / "output.jsonl").write_text("\n".join(json.dumps(e) for e in (
-        {"type": "system", "subtype": "init", "session_id": session, "model": "claude-opus-5-5"},
+        *([{"type": "system", "subtype": "init", "session_id": session, "model": "claude-opus-5-5"}] if init else []),
         {"type": "result", "subtype": "success", "session_id": session, "total_cost_usd": total,
          "usage": {"input_tokens": 10, "output_tokens": out, "cache_read_input_tokens": 0,
                    "cache_creation_input_tokens": 0},
@@ -1645,41 +1646,48 @@ def _cs_claude_run(p, session, total, note, *, task=None, role="coordinator", ou
 
 
 def _cs_finish(p, d, r):
-    """Book run `r` the way finish_run does: parse its output, net it, record the reported total."""
+    """Book run `r` the way finish_run does: parse its output, book it (per call, else netted), record
+    the reported total."""
     from ttp.providers import get_provider
-    usage = get_provider("claude").parse(p.runs / str(r["id"]) / "output.jsonl")
-    cost = d._net_of_session(r, usage)
+    out = p.runs / str(r["id"]) / "output.jsonl"
+    usage = get_provider("claude").parse(out)
+    cost = d._book_cost(r, usage, out)
     note = json.loads(r["note"] or "{}")
-    if "session_cost_usd" in usage.extra:
-        note["session_cost_usd"] = usage.extra["session_cost_usd"]
+    for k in ("session_cost_usd", "reported_usd", "cost_calls"):
+        if k in usage.extra:
+            note[k] = usage.extra[k]
     p.db.x("UPDATE runs SET cost_usd=?, status='ok', note=? WHERE id=?", (cost, json.dumps(note), r["id"]))
     p.db.spend("claude", cost, "coordinator" if r["task"] is None else f"task:{r['task']}", ts=r["ended"])
     return round(cost, 6)
 
 
 def test_resumed_and_forked_claude_sessions_book_only_their_own_cost(env):
-    """Claude Code reports a resumed or forked session's running total (total_cost_usd): three wakes of
-    the coordinator's session, a worker forked from it and that worker's resume each book only what the
+    """A stream with no per-call usage and no init event books the old way (the fallback): Claude Code
+    reports a resumed or forked session's running total (total_cost_usd), so three wakes of the
+    coordinator's session, a worker forked from it and that worker's resume each book only what the
     total rose by. A project rate that prices a wake's tokens above its delta once (the floor the old
     netting took) must not make every later wake book the whole running total; a fresh run books its
-    report as it stands."""
+    report as it stands. The same resumed or forked runs whose stream shows Claude Code started (init)
+    but no call that answered book $0 (a lost or failed fork): never the running total."""
     p = make(env)
     p.set_config("budget.estimate_usd_per_mtok", 100.0)   # the project's measured rate, inflated
     from ttp.daemon import Daemon
     d = Daemon(p.base)
     wake = lambda mode: {"turn": {"session": {"mode": mode, "why": "continued"}}}
-    got = [_cs_finish(p, d, _cs_claude_run(p, "C", 1.0, wake("new"))),
-           _cs_finish(p, d, _cs_claude_run(p, "C", 2.0, wake("resume")))]
-    fork = _cs_claude_run(p, "F", 2.6, {"coord_context": {"how": "fork"}}, task=7, role="worker")
+    run = lambda *a, **k: _cs_finish(p, d, _cs_claude_run(p, *a, init=False, **k))
+    got = [run("C", 1.0, wake("new")), run("C", 2.0, wake("resume"))]
+    fork = _cs_claude_run(p, "F", 2.6, {"coord_context": {"how": "fork"}}, task=7, role="worker", init=False)
     got.append(_cs_finish(p, d, fork))
-    got.append(_cs_finish(p, d, _cs_claude_run(p, "C", 2.5, wake("resume"))))
-    got.append(_cs_finish(p, d, _cs_claude_run(p, "F", 3.5, {"resumes": {"session": "F"},
-                                                             "coord_context": {"how": "resume", "run": fork["id"]}},
-                                               task=7, role="worker")))
-    got.append(_cs_finish(p, d, _cs_claude_run(p, "N", 0.7, {}, task=8, role="worker")))
+    got.append(run("C", 2.5, wake("resume")))
+    got.append(run("F", 3.5, {"resumes": {"session": "F"}, "coord_context": {"how": "resume", "run": fork["id"]}},
+                   task=7, role="worker"))
+    got.append(run("N", 0.7, {}, task=8, role="worker"))
     assert got == [1.0, 1.0, 0.40004, 0.5, 0.9, 0.7], got   # a fork's first run: its own tokens at list price
     assert d._session_total_before("C", 1 << 62) == 2.5, "the resumed wake's cap base is the session's last total"
     assert d._session_total_before("F", 1 << 62) == 3.5
+    lost = [_cs_finish(p, d, _cs_claude_run(p, "C", 3.0, wake("resume"))),
+            _cs_finish(p, d, _cs_claude_run(p, "G", 4.0, {"coord_context": {"how": "fork"}}, task=9, role="worker"))]
+    assert lost == [0.0, 0.0], lost
 
 
 
@@ -1726,6 +1734,338 @@ def test_runs_booked_at_a_session_s_running_total_are_re_booked_once(env):
     p.db.x("DELETE FROM kv WHERE key=?", (SESSION_REBOOK_KEY,))
     assert d.rebook_session_totals() == [], "a re-booked row was re-booked again"
     assert ledger() == 18.7
+
+
+def _pc_call(mid, model="claude-opus-5-5", parent=None, **usage):
+    """One stream-json line of assistant message `mid` (one content block) with its usage."""
+    return {"type": "assistant", "parent_tool_use_id": parent, "session_id": "x",
+            "message": {"id": mid, "model": model, "role": "assistant", "content": [{"type": "text", "text": "."}],
+                        "usage": {"input_tokens": 0, "output_tokens": 0, "cache_read_input_tokens": 0,
+                                  "cache_creation_input_tokens": 0, **usage}}}
+
+
+def _pc_run(p, session, total, note, calls, *, task=None, role="coordinator", ended=None, result_usage=None):
+    """A finished Claude run whose output.jsonl streams `calls` (_pc_call lines) and then reports `total`
+    as Claude Code does (a resumed or forked session's running total); returns its row."""
+    r = _cs_claude_run(p, session, total, note, task=task, role=role, ended=ended)
+    out = p.runs / str(r["id"]) / "output.jsonl"
+    init, result = (json.loads(x) for x in out.read_text().splitlines())
+    if result_usage is not None:
+        result["usage"] = result_usage
+    out.write_text("\n".join(json.dumps(e) for e in (init, *calls, result)) + "\n")
+    return r
+
+
+def _pc_1h(tokens):
+    return {"cache_creation_input_tokens": tokens,
+            "cache_creation": {"ephemeral_5m_input_tokens": 0, "ephemeral_1h_input_tokens": tokens}}
+
+
+def test_claude_calls_cost_prices_every_anthropic_call_once(env):
+    """claude.calls_cost reads a run's stream: a message streamed over several lines counts once at its
+    final usage, 1-hour cache writes price at the 1-hour rate, a subagent's call counts, and '<synthetic>'
+    and GLM messages are not Anthropic spend. An output with no per-call usage gives None."""
+    from ttp.providers import claude
+    p = make(env)
+    out = p.base / "out.jsonl"
+    lines = [_pc_call("m1", output_tokens=10, cache_read_input_tokens=1_000_000),
+             _pc_call("m1", output_tokens=40_000, cache_read_input_tokens=1_000_000),
+             _pc_call("m1", output_tokens=100_000, cache_read_input_tokens=1_000_000),   # $2.00 + $0.20
+             _pc_call("m2", **_pc_1h(1_000_000)),   # $8.00 (a 5-minute write would be $5.00)
+             _pc_call("m3", "claude-sonnet-5-5", parent="toolu_1", output_tokens=100_000),   # a subagent's: $1.00
+             _pc_call("m4", "zai-org/GLM-5.3", output_tokens=1_000_000),
+             _pc_call("m5", "<synthetic>", output_tokens=1_000_000)]
+    out.write_text("\n".join(json.dumps(x) for x in lines) + "\n")
+    assert claude.calls_cost(out) == (11.2, 3, ["claude-opus-5-5", "claude-sonnet-5-5"], [], 0)
+    out.write_text(json.dumps(_pc_call("g", "zai-org/GLM-5.3", output_tokens=5)) + "\n")
+    assert claude.calls_cost(out) == (0.0, 0, [], [], 0), "a GLM-only run is no Anthropic spend"
+    out.write_text(json.dumps({"type": "result", "total_cost_usd": 3.0, "usage": {"output_tokens": 5}}) + "\n")
+    assert claude.calls_cost(out) is None and claude.calls_cost(p.base / "missing.jsonl") is None
+
+
+def test_a_fork_books_only_the_calls_in_its_own_output(env):
+    """A worker forked from the coordinator's session reports the parent's running total too ($50); its
+    stream holds only its own calls, which it books exactly: its 1-hour cache write at the 1-hour rate,
+    not the 5-minute one its result's token counts were priced at."""
+    p = make(env)
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    fork = _pc_run(p, "F", 50.0, {"coord_context": {"how": "fork"}},
+                   [_pc_call("a", output_tokens=100_000), _pc_call("b", **_pc_1h(500_000))], task=7, role="worker",
+                   result_usage={"input_tokens": 0, "output_tokens": 100_000, "cache_read_input_tokens": 0,
+                                 "cache_creation_input_tokens": 500_000})
+    assert _cs_finish(p, d, fork) == 6.0   # $2.00 + $4.00
+    note = json.loads(p.db.one("SELECT note FROM runs WHERE id=?", (fork["id"],))["note"])
+    assert (note["session_cost_usd"], note["reported_usd"], note["cost_calls"]) == (50.0, 50.0, 2)
+
+
+def test_a_resumed_coordinator_wake_books_its_calls_not_the_running_total(env):
+    """A resumed wake whose reported running total rose by $7 while its own calls cost $0.40 books $0.40;
+    the session's last reported total still bases the next wake's --max-budget-usd."""
+    p = make(env)
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    wake = lambda mode: {"turn": {"session": {"mode": mode, "why": "continued"}}}
+    assert _cs_finish(p, d, _pc_run(p, "C", 3.0, wake("new"), [_pc_call("n", output_tokens=150_000)])) == 3.0
+    resumed = _pc_run(p, "C", 10.0, wake("resume"), [_pc_call("r", output_tokens=20_000)])
+    assert _cs_finish(p, d, resumed) == 0.4
+    assert d._session_total_before("C", 1 << 62) == 10.0
+
+
+def test_a_claude_run_with_no_calls_books_nothing(env):
+    """A resumed session nothing earlier in the project reported and a fork, each ending with the session's
+    running total but no call of their own, book $0, not the total."""
+    p = make(env)
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    none = {"input_tokens": 0, "output_tokens": 0, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}
+    got = [_cs_finish(p, d, _pc_run(p, "W", 9.0, {"resumes": {"session": "W"}}, [], task=7, role="worker",
+                                    result_usage=none)),
+           _cs_finish(p, d, _pc_run(p, "F", 5.0, {"coord_context": {"how": "fork"}}, [], task=8, role="worker",
+                                    result_usage=none)),
+           _cs_finish(p, d, _pc_run(p, "G", 4.0, {"resumes": {"session": "G"}},
+                                    [_pc_call("s", "<synthetic>")], task=9, role="worker"))]
+    assert got == [0.0, 0.0, 0.0], got
+
+
+def test_one_hour_cache_writes_book_at_the_one_hour_rate(env):
+    p = make(env)
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    run = _pc_run(p, "N", 5.0, {}, [_pc_call("w", **_pc_1h(1_000_000))], task=8, role="worker")
+    assert _cs_finish(p, d, run) == 8.0, "a 1-hour cache write booked at the 5-minute rate ($5.00)"
+
+
+def test_a_message_streamed_over_several_lines_books_once_at_its_final_usage(env):
+    p = make(env)
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    lines = [_pc_call("m", output_tokens=n, cache_read_input_tokens=1_000_000) for n in (10, 40_000, 100_000)]
+    assert _cs_finish(p, d, _pc_run(p, "N", 1.0, {}, lines, task=8, role="worker")) == 2.2
+
+
+def test_a_subagent_call_books_with_its_run(env):
+    p = make(env)
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    lines = [_pc_call("main", output_tokens=100_000),
+             _pc_call("sub", "claude-sonnet-5-5", parent="toolu_9", output_tokens=100_000)]
+    assert _cs_finish(p, d, _pc_run(p, "N", 2.0, {}, lines, task=8, role="worker")) == 3.0
+
+
+def test_a_glm_message_in_a_claude_run_is_not_booked(env):
+    p = make(env)
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    lines = [_pc_call("c", output_tokens=100_000), _pc_call("g", "zai-org/GLM-5.3", output_tokens=1_000_000)]
+    assert _cs_finish(p, d, _pc_run(p, "N", 4.0, {}, lines, task=8, role="worker")) == 2.0
+
+
+def _pc_log(p, cfg, r, session, lines, sub=()):
+    """Claude Code's session log of run `r`'s session under CLAUDE_CONFIG_DIR `cfg` (its run.json names it and
+    the project as its working directory): `lines` and a subagent's `sub`, each (message id, model, output
+    tokens); returns the log's path."""
+    folder = cfg / "projects" / re.sub(r"[^a-zA-Z0-9]", "-", str(p.base))
+    (folder / session / "subagents").mkdir(parents=True, exist_ok=True)
+    log = lambda mid, model, out: json.dumps({"type": "assistant", "sessionId": session, "requestId": f"req_{mid}",
+                                              "message": {"id": mid, "model": model, "usage": {"output_tokens": out}}})
+    (folder / f"{session}.jsonl").write_text("".join(log(*x) + "\n" for x in lines))
+    (folder / session / "subagents" / "agent-a.jsonl").write_text("".join(log(*x) + "\n" for x in sub))
+    (p.runs / str(r["id"]) / "run.json").write_text(json.dumps({"cwd": str(p.base),
+                                                                "env": {"CLAUDE_CONFIG_DIR": str(cfg)}}))
+    return folder / f"{session}.jsonl"
+
+
+def test_a_call_books_at_the_final_usage_claude_code_logged(env, tmp_path):
+    """A call's stream lines carry the usage from its start (a handful of output tokens); Claude Code's session
+    log, under the run's CLAUDE_CONFIG_DIR and its working directory's folder, records the final counts: the
+    run books those. Another run's calls in that log (a resumed session's earlier wakes) are not booked."""
+    p = make(env)
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    r = _pc_run(p, "S1", 30.0, {"turn": {"session": {"mode": "resume", "why": "continued"}}},
+                [_pc_call("m1", output_tokens=7), _pc_call("m1", output_tokens=7),
+                 _pc_call("m2", "claude-sonnet-5-5", parent="toolu_1", output_tokens=3)])
+    path = _pc_log(p, tmp_path / "cfg", r, "S1", [("msg_old", "claude-opus-5-5", 900_000), ("m1", "claude-opus-5-5", 7),
+                                                  ("m1", "claude-opus-5-5", 100_000)],
+                   sub=[("m2", "claude-sonnet-5-5", 100_000)])
+    assert _cs_finish(p, d, r) == 3.0   # $2.00 + a subagent's $1.00, never the earlier wake's $18.00
+    assert d._transcripts(r, p.runs / str(r["id"]), "S1")[0] == path
+
+
+def test_a_finished_claude_resume_books_its_calls_to_its_task_and_the_ledger(env):
+    """End to end through finish_run: a resumed worker whose session reports $40 books its one $2.00 call to
+    the run, its task and the ledger, and keeps the report in its note."""
+    p = make(env)
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    tid, _, r = _session_runs(d, booked=6.0)
+    run_dir = d.p.runs / str(r["id"])
+    run_dir.mkdir(parents=True)
+    p.db.x("UPDATE runs SET dir=? WHERE id=?", (str(run_dir), r["id"]))
+    (run_dir / "output.jsonl").write_text("\n".join(json.dumps(e) for e in (
+        _pc_call("x", output_tokens=100_000),
+        {"type": "result", "subtype": "success", "is_error": False, "result": "ok", "session_id": "S",
+         "total_cost_usd": 40.0, "usage": {"input_tokens": 0, "output_tokens": 100_000}})) + "\n")
+    (run_dir / "stderr.log").write_text("")
+    before = p.db.one("SELECT COALESCE(SUM(usd),0) s FROM ledger")["s"]
+    d.finish_run(p.db.one("SELECT * FROM runs WHERE id=?", (r["id"],)),
+                 {"rc": 0, "started": time.time() - 60, "ended": time.time(), "stopped": None, "slept_s": 0})
+    run = p.db.one("SELECT * FROM runs WHERE id=?", (r["id"],))
+    note = json.loads(run["note"])
+    assert run["cost_usd"] == 2.0
+    assert (note["reported_usd"], note["session_cost_usd"], note["cost_calls"]) == (40.0, 40.0, 1)
+    assert abs(p.db.task(tid)["spent_usd"] - 2.0) < 1e-6
+    assert abs(p.db.one("SELECT COALESCE(SUM(usd),0) s FROM ledger")["s"] - before - 2.0) < 1e-6
+
+
+def test_claude_runs_are_re_booked_once_at_their_per_call_cost(env, tmp_path):
+    """The one-time re-book sets each Claude run of the last 7 days to its calls' list price, up or down,
+    with its task's spend (never below $0) and a signed ledger row at the run's end; a dry run writes
+    nothing, and a second pass changes nothing."""
+    p = make(env)
+    from ttp.daemon import CALLS_REBOOK_KEY, Daemon
+    d = Daemon(p.base)
+    wake = lambda mode: {"turn": {"session": {"mode": mode, "why": "continued"}}}
+    old = time.time() - 8 * 86400
+    p.db.x("INSERT INTO tasks(id,title,kind,status,spent_usd) VALUES(7,'t','code','done',1.0)")
+    p.db.x("INSERT INTO tasks(id,title,kind,status,spent_usd) VALUES(8,'u','code','done',0.5)")
+    rows = [_pc_run(p, "C", 3.0, wake("resume"), [_pc_call("o", output_tokens=10_000)], ended=old),   # outside
+            _pc_run(p, "W", 1.0, {}, [_pc_call("u", output_tokens=100_000)], task=7, role="worker"),   # under: $2.00
+            _pc_run(p, "C", 7.0, wake("resume"), [_pc_call("v", output_tokens=20_000)]),   # over: $0.40
+            _pc_run(p, "F", 9.0, {"coord_context": {"how": "fork"}}, [_pc_call("f", output_tokens=5_000)],
+                    task=8, role="worker"),   # over: $0.10, its task's $0.50 floors at $0
+            _pc_run(p, "M", 0.6, {}, [_pc_call("m", output_tokens=30_000)], task=7, role="worker"),   # right already
+            _cs_claude_run(p, "L", 2.5, {}, task=7, role="worker")]   # no per-call usage: kept
+    cut = _cs_claude_run(p, "K", 0.0, {}, task=7, role="worker")   # cut off before its first call: kept
+    (p.runs / str(cut["id"]) / "output.jsonl").write_text(json.dumps({"type": "system", "subtype": "init"}) + "\n")
+    none = {"input_tokens": 0, "output_tokens": 0, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}
+    lost = _pc_run(p, "G", 38.26, {"coord_context": {"how": "fork"}}, [], task=7, role="worker",
+                   result_usage=none)   # a fork that never reached the API: $0
+    logged = _pc_run(p, "T", 0.5, {}, [_pc_call("t", output_tokens=7)], task=7, role="worker")
+    _pc_log(p, tmp_path / "cfg", logged, "T", [("t", "claude-opus-5-5", 50_000)])   # its final usage: $1.00
+    rows += [cut, lost, logged]
+    for r, booked in zip(rows, (3.0, 1.0, 7.0, 9.0, 0.6, 2.5, 0.3, 38.26, 0.5)):
+        p.db.x("UPDATE runs SET cost_usd=?, status='ok' WHERE id=?", (booked, r["id"]))
+        p.db.spend("claude", booked, "x", ts=r["ended"])
+    ids = [r["id"] for r in rows]
+    ledger = lambda: round(p.db.one("SELECT SUM(usd) s FROM ledger")["s"], 6)
+    want = [(ids[1], 1.0, 2.0), (ids[2], 7.0, 0.4), (ids[3], 9.0, 0.1), (ids[7], 38.26, 0.0), (ids[8], 0.5, 1.0)]
+    assert d.rebook_per_call(dry_run=True) == want
+    assert ledger() == 62.16 and p.db.kv(CALLS_REBOOK_KEY) is None, "a dry run wrote"
+    assert d.rebook_per_call() == want
+    cost = {r["id"]: round(r["cost_usd"], 6) for r in p.db.q("SELECT id, cost_usd FROM runs")}
+    assert [cost[i] for i in ids] == [3.0, 2.0, 0.4, 0.1, 0.6, 2.5, 0.3, 0.0, 1.0]
+    assert ledger() == 9.9, "the ledger (dollar caps, global daily total) does not sum the per-call cost"
+    signed = sorted((round(x["usd"], 6), x["ts"]) for x in p.db.q("SELECT usd, ts FROM ledger WHERE source!='x'"))
+    assert signed == sorted([(1.0, rows[1]["ended"]), (-6.6, rows[2]["ended"]), (-8.9, rows[3]["ended"]),
+                             (-38.26, rows[7]["ended"]), (0.5, rows[8]["ended"])])
+    assert (round(p.db.task(7)["spent_usd"], 6), p.db.task(8)["spent_usd"]) == (0.5, 0.0), "below $0"
+    note = json.loads(p.db.one("SELECT note FROM runs WHERE id=?", (ids[2],))["note"])
+    assert (note["calls_rebooked"], note["cost_calls"], note["reported_usd"]) == (7.0, 1, 7.0)
+    assert p.db.kv(CALLS_REBOOK_KEY)["runs"] == 5
+    assert d.rebook_per_call() is None, "ran twice"
+    p.db.x("DELETE FROM kv WHERE key=?", (CALLS_REBOOK_KEY,))
+    assert d.rebook_per_call() == [], "a re-booked row was re-booked again"
+    assert ledger() == 9.9
+
+
+def test_a_running_runs_session_log_is_read_from_where_the_last_pass_ended(tmp_path):
+    """Metering a run still going reads each session log once, then only the bytes added since (a line still
+    being written waits for the next pass); a log that shrank or was replaced is read again from its start."""
+    from ttp.providers import claude
+    log = tmp_path / "S.jsonl"
+    line = lambda mid, out: (json.dumps({"type": "assistant", "message": {"id": mid, "model": "claude-opus-5-5",
+                                                                         "usage": {"output_tokens": out}}}) + "\n")
+    old = "".join(line(f"old{i}", 9) for i in range(200))   # the session's earlier calls
+    log.write_text(old + line("m1", 7))
+    tail = claude.LogTail()
+    assert tail.usage([log], {"m1"}) == {"m1": {"output_tokens": 7}}
+    assert tail.read_bytes == log.stat().st_size
+    added = line("m1", 500) + line("m2", 40)
+    with log.open("a") as f:
+        f.write(added + line("m3", 1)[:20])   # m3 still being written
+    assert tail.usage([log], {"m1", "m2"}) == {"m1": {"output_tokens": 500}, "m2": {"output_tokens": 40}}
+    assert tail.read_bytes == len(old) + len(line("m1", 7)) + len(added), "a second pass re-read the log"
+    assert tail.usage([log], {"m1", "m2"}) == {"m1": {"output_tokens": 500}, "m2": {"output_tokens": 40}}
+    assert tail.read_bytes == len(old) + len(line("m1", 7)) + len(added), "a pass with nothing new read bytes"
+    log.write_text(line("m1", 600))   # shrank: read again from its start
+    assert tail.usage([log], {"m1"}) == {"m1": {"output_tokens": 600}}
+    new = tmp_path / "new.jsonl"
+    new.write_text(old + old + line("m1", 700))
+    new.replace(log)   # replaced by a longer file (another inode)
+    assert tail.usage([log], {"m1"}) == {"m1": {"output_tokens": 700}}
+
+
+def test_a_lost_or_failed_fork_or_resume_books_nothing_whatever_its_result_reports(env):
+    """A forked or resumed run that started (init) but made no call books $0 at its end, even when its result
+    carries the parent session's running total and its tokens; a fresh run that made calls and then failed
+    books those calls."""
+    p = make(env)
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    carried = {"input_tokens": 900, "output_tokens": 50_000, "cache_read_input_tokens": 10 ** 6,
+               "cache_creation_input_tokens": 0}
+    fork = _pc_run(p, "G", 38.26, {"coord_context": {"how": "fork"}}, [], task=None, role="worker",
+                   result_usage=carried)
+    resume = _pc_run(p, "R", 12.0, {"turn": {"session": {"mode": "resume", "why": "continued"}}}, [],
+                     result_usage=carried)
+    failed = _pc_run(p, "N", 5.0, {}, [_pc_call("n", output_tokens=100_000)], role="worker")
+    for r in (fork, resume, failed):
+        out = p.runs / str(r["id"]) / "output.jsonl"
+        events = [json.loads(x) for x in out.read_text().splitlines()]
+        events[-1].update(subtype="error_during_execution", is_error=True)
+        out.write_text("".join(json.dumps(e) + "\n" for e in events))
+    assert (_cs_finish(p, d, fork), _cs_finish(p, d, resume), _cs_finish(p, d, failed)) == (0.0, 0.0, 2.0)
+
+
+def test_the_per_call_re_book_of_a_large_backlog_runs_in_slices_with_the_totals_of_one_pass(env, tmp_path):
+    """The one-time re-book runs as a tick step in bounded slices: each stops after its run cap, keeps its place,
+    and the slice that ends sets the done marker; the runs, their costs and the ledger end as one pass leaves
+    them, and runs ending meanwhile are not part of it."""
+    import shutil
+    from ttp.daemon import CALLS_REBOOK_KEY, CALLS_REBOOK_PROGRESS_KEY, Daemon
+    results = []
+    for sliced in (False, True):
+        p = make(env) if not sliced else p
+        if sliced:   # the same backlog again: reset what the one pass wrote
+            shutil.rmtree(p.runs)
+            p.db.x("DELETE FROM runs")
+            p.db.x("DELETE FROM ledger")
+            p.db.x("DELETE FROM kv WHERE key IN (?,?)", (CALLS_REBOOK_KEY, CALLS_REBOOK_PROGRESS_KEY))
+        d = Daemon(p.base)
+        rows = []
+        for i in range(30):
+            r = _pc_run(p, f"S{i:02d}", 3.0, {"turn": {"session": {"mode": "resume", "why": "continued"}}},
+                        [_pc_call(f"m{i}", output_tokens=1000 * (i + 1))])
+            p.db.x("UPDATE runs SET cost_usd=3.0, status='ok' WHERE id=?", (r["id"],))
+            p.db.spend("claude", 3.0, "x", ts=r["ended"])
+            rows.append(r)
+        if not sliced:
+            changed = d.rebook_per_call()
+            slices = 1
+        else:
+            changed, slices = d.rebook_per_call(max_runs=4), 1
+            assert len(changed) == 4 and p.db.kv(CALLS_REBOOK_KEY) is None
+            assert p.db.kv(CALLS_REBOOK_PROGRESS_KEY)["cursor"] == rows[3]["id"]
+            late = _pc_run(p, "Z", 3.0, {}, [_pc_call("z", output_tokens=1000)])   # ends meanwhile
+            p.db.x("UPDATE runs SET cost_usd=3.0, status='ok' WHERE id=?", (late["id"],))
+            while True:
+                got = d.rebook_per_call(max_runs=4)
+                if got is None:
+                    break
+                changed, slices = changed + got, slices + 1
+                assert slices < 20
+            assert p.db.one("SELECT cost_usd FROM runs WHERE id=?", (late["id"],))["cost_usd"] == 3.0
+            assert p.db.kv(CALLS_REBOOK_PROGRESS_KEY) is None
+        done = p.db.kv(CALLS_REBOOK_KEY)
+        cost = [round(p.db.one("SELECT cost_usd FROM runs WHERE id=?", (r["id"],))["cost_usd"], 6) for r in rows]
+        ledger = round(p.db.one("SELECT SUM(usd) s FROM ledger")["s"], 6)
+        results.append((sorted(changed), cost, ledger, done["runs"], round(done["usd_after"], 6), slices))
+    whole, sliced = results
+    assert whole[5] == 1 and sliced[5] == 8 and d.rebook_per_call() is None
+    assert [x[1:] for x in whole[0]] == [x[1:] for x in sliced[0]] and whole[1:5] == sliced[1:5]
+    assert whole[3] == 30 and whole[1][0] == 0.02
 
 
 def test_coordsession_wakes_booked_at_the_running_total_are_re_netted_once(env):
