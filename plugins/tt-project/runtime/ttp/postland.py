@@ -60,7 +60,10 @@ def tend(p: Project, cfg: dict, now: float | None = None) -> str:
     if job:
         res = Path(job["path"]).with_suffix(".result.json")
         if res.exists():
-            got = json.loads(res.read_text() or "{}")
+            try:
+                got = json.loads(res.read_text())
+            except ValueError:
+                got = {"outcome": "error", "why": f"{res} is not JSON"}
         elif _alive(job.get("pid")):
             return ""
         else:
