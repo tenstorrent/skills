@@ -64,7 +64,13 @@ disk untouched, with no migration; nothing else is reclaimed by check recovery.
    (eventhold.gap_until, waketriage.py). A ride-along event (data flag `ride_along`: a forgotten
    `continue:` follow-up, a repeat block of a non-urgent task) starts no turn alone: it joins the
    next turn something else starts, or starts one an hour after it was raised. It stays queued
-   in the database, so a restart keeps it (pagesev.py).
+   in the database, so a restart keeps it (pagesev.py). A slow tick step's reports
+   (tick_step_slow, tick_step_degraded, tick_step_incident: pagesev.TICK_KINDS) never start a turn,
+   not even after that hour. Relayed messages (`ttp say` from another agent) with no order or
+   question wait up to `coordinator.relay_window_s` (90 s; 0: off) after the oldest, so a burst is
+   one turn; an order, a question or a message from the user's own channel wakes at the debounce
+   (msgwake.py). An unacted queue_wait item is raised again only once its wait has doubled, not
+   per change of its holders (queuewait.scan).
    A batch of only plain hand-offs (a normal task_done of no review, with no follow-up proposed, no
    waiting parent, no live dependent and no text asking for a decision or naming a Restriction) does
    the same, for both coordinator modes and every provider: it joins the next wake of any other

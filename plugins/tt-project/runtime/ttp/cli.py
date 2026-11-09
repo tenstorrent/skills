@@ -13252,7 +13252,7 @@ def main(argv: list[str] | None = None) -> None:
                         "calls per wake, rollovers, cache-read share, against the stateless baseline and break-even")
     s.add_argument("--landing", action="store_true",
                    help="per landed change instead, per day: test runs and full suites, CPU-hours, $, and "
-                        "approved to landed (median, p90)")
+                        "approved to landed (median, p90); then $ per landed commit and subagents spawned over 24 h and 7 d")
     s.add_argument("--runs", action="store_true",
                    help="worker runs instead: provider, model, tier, outcome (with any route fallback), wall time, cost")
     s.add_argument("--tier", help="with --runs: only this tier's runs (implies --runs)")

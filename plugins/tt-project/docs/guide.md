@@ -2584,7 +2584,11 @@ session and stateless coordinators on every provider.
   and the scope line ends `; the push batch runs the rest: <reasons>`. With the push queue off a
   task's checks narrow and widen as before. Each checks run records its wall and CPU seconds
   (`wall_s`, `cpu_s`) in `checks.json`; `ttp stats <name> --landing` shows per day the test runs and
-  full suites, CPU-hours and $ per landed change, and approved to landed (median and p90). Checks already waiting for a slot re-execute on the new runtime
+  full suites, CPU-hours and $ per landed change, and approved to landed (median and p90), then over
+  the last 24 h and 7 d the booked spend over the commits landed on the push branch (merges and
+  version bumps left out) and the subagents those runs started (each run's note keeps
+  `subagents_spawned` and `subagent_types`, counted from its Agent calls; their cost is already in the
+  run's own). Checks already waiting for a slot re-execute on the new runtime
   and pick their scope again.
 - `ttp checks -- <cmd>` adds a check. Several words run as that argv (`ttp checks -- pytest -q`);
   one quoted string runs through the shell (`ttp checks -- 'FOO=1 pytest -q && ruff check .'`);
