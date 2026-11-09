@@ -643,6 +643,9 @@ FORK_RENET_KEY = "fork_run_renet"   # Daemon.renet_fork_runs ran (once per proje
 MODEL_REPRICE_KEY = "model_alias_reprice"   # Daemon.reprice_alias_runs ran (once per project)
 SESSION_REBOOK_KEY = "session_total_rebook"   # Daemon.rebook_session_totals ran (once per project)
 SESSION_REBOOK_DAYS = 7   # its window: runs that ended this many days back or less
+CALLS_REBOOK_KEY = "per_call_rebook"   # Daemon.rebook_per_call ran (once per project)
+CALLS_REBOOK_DAYS = 7   # its window: Claude runs that ended this many days back or less
+CALLS_NOTE = "cost_calls"   # a Claude run's note: booked at its calls' list price (how many calls)
 MODEL_REPRICE_SINCE = (2026, 11, 7)   # its window's first day, in the home zone: the days the dollar caps over-counted
 REACH_EVERY_S = 30      # while a provider is held offline, how often its API host is resolved again
 REACH_TIMEOUT_S = 5
@@ -1401,6 +1404,14 @@ class Daemon:
                             + ", ".join(f"run {i} ${a:.2f}->${b:.2f}" for i, a, b in changed[:40]) + ")")
         except Exception:   # a spend correction must never keep the daemon from starting
             log(self.p, "session total re-book error: " + traceback.format_exc().replace("\n", " | ")[:2000])
+        try:   # Claude runs booked from Claude Code's reported total, at their own calls' list price, once
+            changed = self.rebook_per_call()
+            if changed is not None:
+                log(self.p, f"re-booked {len(changed)} Claude run(s) of the last {CALLS_REBOOK_DAYS} days at their "
+                            f"per-call cost: ${sum(c[1] for c in changed):.2f} booked -> "
+                            f"${sum(c[2] for c in changed):.2f}")
+        except Exception:   # a spend correction must never keep the daemon from starting
+            log(self.p, "per-call re-book error: " + traceback.format_exc().replace("\n", " | ")[:2000])
         try:   # push batch files left `running` by a batch whose row is final (pushq.close_strays)
             if closed := pushq.close_strays(self.p):
                 log(self.p, f"closed {len(closed)} stray push batch file(s)")
@@ -4668,8 +4679,7 @@ class Daemon:
             try:
                 usage = get_provider(r["provider"]).parse(out)
                 basis = _cost_basis(usage)
-                self._priced(r, usage)
-                cost = self._net_of_session(r, usage)
+                cost = self._book_cost(r, usage, out)
             except Exception:
                 continue
             # The tokens also show a run on a logged-out provider got past the login (alerts.holds).
@@ -4772,6 +4782,69 @@ class Daemon:
                 "cache_read": usage.cache_read_tokens, "cache_write": usage.cache_write_tokens})
         return usage.cost_usd
 
+    def _book_cost(self, r: dict, usage, out: Path) -> float:
+        """What run `r` books, set on `usage.cost_usd`. A Claude run books its own API calls, each once at
+        list price (claude.calls_cost: the calls `out`, its output.jsonl, names, at the final usage Claude
+        Code's session log recorded, _transcripts), whatever Claude Code's total_cost_usd says: in a resumed
+        or forked session that is the session's running total, which netting against earlier runs kept
+        mis-booking, while the per-call count matched Anthropic's bill. The report stays
+        in the note (reported_usd; session_cost_usd for a resumed or forked run, the coordinator's
+        --max-budget-usd base, _session_total_before). A resumed or forked run with no answer at all, a
+        report and no tokens, never reached the API: $0. Other providers, and a Claude output with no
+        per-call usage (an old Claude Code, a run cut off before its first answer), book the old way:
+        the report, netted (_net_of_session), or the token or elapsed estimate."""
+        if (r["provider"] or "") == "claude":
+            from . import localspend
+            from .providers import claude
+            session = _continues_session(r, json.loads(r["note"] or "{}"))
+            reported = None if usage.estimated else float(usage.cost_usd or 0)
+            try:
+                got = claude.calls_cost(out, localspend.overrides(),
+                                        self._transcripts(r, out.parent, usage.session_id or r["session_id"] or ""))
+            except Exception as e:   # the old way books it
+                log(self.p, f"run {r['id']}: per-call cost not read: {type(e).__name__}: {e}"[:300])
+                got = None
+            if got is None and session and reported is not None and not _has_tokens(usage):
+                got = claude.CallsCost(0.0, 0, [], [])   # a resume or fork that made no call
+            if got is not None:
+                for model in got.unknown:
+                    self._unpriced_model(model)
+                if reported is not None:
+                    usage.extra["reported_usd"] = reported
+                    if session and reported > 0:
+                        usage.extra["session_cost_usd"] = reported
+                usage.extra[CALLS_NOTE] = got.calls
+                usage.cost_usd = got.usd
+                return usage.cost_usd
+        self._priced(r, usage)
+        return self._net_of_session(r, usage)
+
+    def _transcripts(self, r: dict, run_dir: Path, session: str) -> list[Path]:
+        """Claude Code's session log of a Claude run's session and its subagents' logs (claude.calls_cost
+        reads each call's final usage there): under the run's own CLAUDE_CONFIG_DIR, else the daemon's, in
+        the folder its working directory names (run.json), else wherever session_paths finds them."""
+        from .providers import claude
+        if not session or not re.fullmatch(r"[A-Za-z0-9-]+", session):
+            return []
+        try:
+            spec = json.loads((run_dir / "run.json").read_text())
+        except (OSError, ValueError):
+            spec = {}
+        env = spec.get("env") if isinstance(spec.get("env"), dict) else {}
+        cwd = str(spec.get("cwd") or "")
+        if cwd:
+            slug = re.sub(r"[^a-zA-Z0-9]", "-", cwd)
+            own = env.get("CLAUDE_CONFIG_DIR")
+            for base in dict.fromkeys(([Path(own).expanduser()] if own else []) + [claude.claude_config_dir()]):
+                folder = base / "projects" / slug
+                if (folder / f"{session}.jsonl").is_file():
+                    sub = folder / session
+                    return [folder / f"{session}.jsonl", *(sorted(sub.glob("**/*.jsonl")) if sub.is_dir() else [])]
+        try:
+            return get_provider("claude").session_paths(session, cwd, env)
+        except Exception:
+            return []
+
     def _net_of_session(self, r: dict, usage) -> float:
         """A resumed Claude Code session reports the whole session's total_cost_usd, not this run's:
         book only what this run added beyond the earlier runs of the session. Netted only when the
@@ -4829,7 +4902,7 @@ class Daemon:
     def _session_total_before(self, session: str, before: int) -> float | None:
         """Session `session`'s running total as Claude Code last reported it before run `before`, from the
         newest earlier run of it (any task or role: a session id names one session) that shows it: its
-        note's session_cost_usd, else its output's last result, else, for the run that started the
+        note's session_cost_usd or reported_usd, else its output's last result, else, for the run that started the
         session (no earlier run of it, _session_runs_before), what it booked as reported. None when no
         recent run shows it (the caller then nets the old way). A run with no result is passed over: an older, lower total only books more."""
         from .providers import claude
@@ -4839,6 +4912,8 @@ class Daemon:
                 note = json.loads(o["note"] or "{}")
                 if note.get("session_cost_usd") is not None:
                     return float(note["session_cost_usd"])
+                if note.get("reported_usd") is not None:   # a run booked per call (_book_cost)
+                    return float(note["reported_usd"])
             except (ValueError, TypeError):
                 note = {}
             if (o["provider"] or "") == "claude" and \
@@ -4905,7 +4980,7 @@ class Daemon:
         for r in db.q("SELECT * FROM runs WHERE role='coordinator' AND task IS NULL AND session_id IS NOT NULL "
                       "AND status!='running' AND cost_usd>0 AND note LIKE '%\"resume\"%' ORDER BY id"):
             note = json.loads(r["note"] or "{}")
-            if "session_cost_usd" in note or not _resumed_coord_session(r, note):
+            if "session_cost_usd" in note or CALLS_NOTE in note or not _resumed_coord_session(r, note):
                 continue
             usage = RunUsage(cost_usd=float(r["cost_usd"]), input_tokens=r["input_tokens"] or 0,
                              output_tokens=r["output_tokens"] or 0, cache_read_tokens=r["cache_read_tokens"] or 0,
@@ -4937,7 +5012,8 @@ class Daemon:
         for r in db.q("SELECT * FROM runs WHERE task IS NOT NULL AND status!='running' AND cost_usd>0 "
                       "AND note LIKE ? ORDER BY id", (f'%{ctxfork.KEY}%',)):
             note = json.loads(r["note"] or "{}")
-            if "session_cost_usd" in note or not ctxfork.forked(note) or (note.get("resumes") or {}).get("session"):
+            if "session_cost_usd" in note or CALLS_NOTE in note or not ctxfork.forked(note) \
+                    or (note.get("resumes") or {}).get("session"):
                 continue
             usage = RunUsage(cost_usd=float(r["cost_usd"]), input_tokens=r["input_tokens"] or 0,
                              output_tokens=r["output_tokens"] or 0, cache_read_tokens=r["cache_read_tokens"] or 0,
@@ -4980,7 +5056,8 @@ class Daemon:
                       "AND cost_usd>0 AND (COALESCE(ended, started)>=? OR note LIKE '%fork_base_usd%') "
                       "AND note LIKE ? ORDER BY id", (since, f'%{ctxfork.KEY}%')):
             note = json.loads(r["note"] or "{}")
-            if "repriced_model" in note or not ctxfork.forked(note) or (note.get("resumes") or {}).get("session"):
+            if "repriced_model" in note or CALLS_NOTE in note or not ctxfork.forked(note) \
+                    or (note.get("resumes") or {}).get("session"):
                 continue
             extra = self._output_models(r)
             if not extra.get("model_usage") and not extra.get("model"):
@@ -5025,8 +5102,8 @@ class Daemon:
                       "AND cost_usd>0 AND COALESCE(ended, started)>=? ORDER BY id",
                       (time.time() - SESSION_REBOOK_DAYS * 86400,)):
             note = json.loads(r["note"] or "{}")
-            if "session_rebooked" in note or not ((note.get("resumes") or {}).get("session")
-                                                  or _resumed_coord_session(r, note)):
+            if "session_rebooked" in note or CALLS_NOTE in note or not ((note.get("resumes") or {}).get("session")
+                                                                        or _resumed_coord_session(r, note)):
                 continue
             before = float(r["cost_usd"])
             reported = claude.result_total(self._run_dir(r) / "output.jsonl")
@@ -5050,6 +5127,74 @@ class Daemon:
             db.set_kv(SESSION_REBOOK_KEY, {"at": time.time(), "runs": len(changed),
                                            "usd_before": round(sum(c[1] for c in changed), 6),
                                            "usd_after": round(sum(c[2] for c in changed), 6)})
+        return changed
+
+    def rebook_per_call(self, dry_run: bool = False) -> list[tuple[int, float, float]] | None:
+        """Once per project (kv CALLS_REBOOK_KEY): Claude runs that ended in the last CALLS_REBOOK_DAYS days,
+        booked before _book_cost from Claude Code's total_cost_usd (netted or not), re-booked the way
+        _book_cost books one now: at their own calls' list price (claude.calls_cost, each session's log read
+        once for all its runs), and a resumed or forked run that made no call at $0. The correction goes
+        either way: the run's cost_usd is set, its task's spend moves by the difference (never below $0),
+        and a ledger row of the signed difference is booked at the run's end, so the dollar caps and the
+        global daily total sum the per-call cost. A run whose output is gone or has no per-call usage
+        keeps its booking; so does one cut off before its first call (its token or elapsed estimate
+        stands). Each row changed is marked (note cost_calls, and calls_rebooked the old figure), so a
+        second pass changes nothing. With `dry_run` nothing is written and the kv is not read. Returns
+        (run id, booked before, booked after) of each row changed, by run id, or None when it already ran."""
+        from . import localspend
+        from .providers import claude
+        db = self.p.db
+        if not dry_run and db.kv(CALLS_REBOOK_KEY):
+            return None
+        overrides = localspend.overrides()
+        sessions: dict[str, list] = {}
+        for r in db.q("SELECT * FROM runs WHERE provider='claude' AND status!='running' "
+                      "AND COALESCE(ended, started)>=? ORDER BY id", (time.time() - CALLS_REBOOK_DAYS * 86400,)):
+            note = json.loads(r["note"] or "{}")
+            if CALLS_NOTE not in note:
+                sid = str(r["session_id"] or note.get("session_id") or "")
+                sessions.setdefault(sid or f"run:{r['id']}", []).append((r, note))
+        changed = []
+        for key, runs in sessions.items():
+            outs = [self._run_dir(r) / "output.jsonl" for r, _ in runs]
+            streams = [claude.stream_calls(out) if out.is_file() else None for out in outs]
+            wanted = set().union(*(st[0] for st in streams if st))
+            session = "" if key.startswith("run:") else key
+            session = session or next((st[1] for st in streams if st and st[1]), "")
+            logs = self._transcripts(runs[0][0], outs[0].parent, session) if wanted else []
+            logged = claude.logged_usage(logs, wanted) if logs else {}
+            for (r, note), out, st in zip(runs, outs, streams):
+                reported = claude.result_total(out) if out.is_file() else None
+                if st is not None:
+                    got = claude.price_calls(st[0], overrides, logged)
+                    if not got.calls and reported is None:
+                        continue   # cut off before its first call: its estimate stands
+                elif reported is not None and _continues_session(r, note) \
+                        and not _has_tokens(get_provider("claude").parse(out)):
+                    got = claude.CallsCost(0.0, 0, [], [])   # a resume or fork that made no call
+                else:
+                    continue
+                before, after = round(float(r["cost_usd"] or 0), 6), got.usd
+                if abs(after - before) < 1e-6:
+                    continue
+                changed.append((r["id"], before, after))
+                if dry_run:
+                    continue
+                note.update({CALLS_NOTE: got.calls, "calls_rebooked": before})
+                if reported is not None:
+                    note.setdefault("reported_usd", reported)
+                with db.tx():
+                    db.x("UPDATE runs SET cost_usd=?, note=? WHERE id=?", (after, json.dumps(note), r["id"]))
+                    if r["task"]:
+                        db.x("UPDATE tasks SET spent_usd=MAX(COALESCE(spent_usd,0)+?,0) WHERE id=?",
+                             (after - before, r["task"]))
+                    db.spend(r["provider"], after - before, self._source_for(r), account=r["account"] or "",
+                             estimated=bool(r["cost_estimated"]), ts=float(r["ended"] or r["started"] or time.time()))
+        changed.sort()
+        if not dry_run:
+            db.set_kv(CALLS_REBOOK_KEY, {"at": time.time(), "runs": len(changed),
+                                         "usd_before": round(sum(c[1] for c in changed), 6),
+                                         "usd_after": round(sum(c[2] for c in changed), 6)})
         return changed
 
     def _output_models(self, r: dict) -> dict:
@@ -5160,8 +5305,7 @@ class Daemon:
             seen = db.kv(key) or {"since": time.time()}
             db.set_kv(key, {**seen, "used": sorted(set(seen.get("used") or []) | set(usage.extra["connectors_used"]))})
         basis = _cost_basis(usage)
-        self._priced(r, usage)
-        self._net_of_session(r, usage)
+        self._book_cost(r, usage, run_dir / "output.jsonl")
         stopped = exit_info.get("stopped")
         refused = str(exit_info.get("refused") or "")
         if refused and not usage.error:
@@ -5345,6 +5489,9 @@ class Daemon:
             note["model_used"] = str(usage.extra["model"])[:120]
         if "session_cost_usd" in usage.extra:
             note["session_cost_usd"] = usage.extra["session_cost_usd"]   # reported; cost_usd is this run's
+        for k in ("reported_usd", CALLS_NOTE):   # Claude Code's own total, kept beside the per-call booking
+            if k in usage.extra:
+                note[k] = usage.extra[k]
         # The runaway guard counts runs that ended without an outcome; a reboot, a host sleep or a
         # hand-off that stands is an outcome, not a loop.
         if status == "lost" and r["boot_id"] and not self._this_boot(r["boot_id"]):
@@ -5486,8 +5633,9 @@ class Daemon:
             return
         try:
             # A resumed coordinator wake's log holds its whole session: compared with the session's total.
-            got = localspend.calibrate(usage.session_id,
-                                       (getattr(usage, "extra", None) or {}).get("session_cost_usd", usage.cost_usd))
+            extra = getattr(usage, "extra", None) or {}
+            got = localspend.calibrate(usage.session_id, extra.get("session_cost_usd",
+                                                                   extra.get("reported_usd", usage.cost_usd)))
         except Exception as e:  # noqa: BLE001 - a price check never breaks finishing a run
             log(self.p, f"price table check failed: {e}")
             return
@@ -18911,6 +19059,12 @@ def _resumed_coord_session(r: dict, note: dict) -> str:
     turn = note.get("turn") if isinstance(note.get("turn"), dict) else {}
     session = turn.get("session") if isinstance(turn.get("session"), dict) else {}
     return str(r["session_id"] or "") if session.get("mode") == "resume" else ""
+
+
+def _continues_session(r: dict, note: dict) -> bool:
+    """A run that resumed a session (a worker's or review's, or a coordinator session wake) or started as a
+    fork of the coordinator's: Claude Code reports the session's running total, not the run's own cost."""
+    return bool((note.get("resumes") or {}).get("session") or _resumed_coord_session(r, note) or ctxfork.forked(note))
 
 
 def _priced_model(r: dict, usage) -> str:
