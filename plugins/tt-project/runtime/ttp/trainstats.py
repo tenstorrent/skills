@@ -10,6 +10,8 @@ run that started that day cost, and approval to landed (median, p90 by nearest r
 from __future__ import annotations
 
 import json
+import re
+import subprocess
 import time
 
 from . import timefmt
@@ -85,6 +87,61 @@ def report(db, runs_dir, tz: str, days: float = 7, now: float | None = None) -> 
     return {"days": rows, "since": since, "until": now}
 
 
+BUMP_RE = re.compile(r"^tt-project: \d+\.\d+\.\d+ \(")   # the push queue's version-bump commit
+WINDOWS = (("24 h", 86400.0), ("7 d", 7 * 86400.0))
+
+
+def landed_commits(repo, ref: str, since: float, until: float) -> int | None:
+    """Commits on `ref` committed in [since, until), merges and version bumps left out (None: git failed)."""
+    try:
+        out = subprocess.run(["git", "-C", str(repo), "log", "--no-merges", f"--max-age={int(since)}",
+                              "--format=%ct%x09%s", ref, "--"], capture_output=True, text=True, timeout=30,
+                             stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode:
+        return None
+    n = 0
+    for line in out.stdout.splitlines():
+        ts, _, subject = line.partition("\t")
+        if ts.isdigit() and since <= int(ts) < until and not BUMP_RE.match(subject):
+            n += 1
+    return n
+
+
+def per_landed(db, repo, ref: str, now: float | None = None) -> list[dict]:
+    """$ per landed change over the last 24 h and 7 d: the booked cost of the runs that started in the
+    window over the commits landed on the push branch then (landed_commits), and the subagents those
+    runs started (their run note's subagents_spawned, providers/claude.parse)."""
+    now = time.time() if now is None else now
+    rows = []
+    for label, secs in WINDOWS:
+        since = now - secs
+        usd, spawned, counted = 0.0, 0, 0
+        for r in db.q("SELECT cost_usd, note FROM runs WHERE started>=? AND started<?", (since, now)):
+            usd += float(r["cost_usd"] or 0)
+            if "subagents_spawned" in (r["note"] or ""):
+                try:
+                    got = json.loads(r["note"]).get("subagents_spawned")
+                except (ValueError, AttributeError):
+                    continue
+                if isinstance(got, int):
+                    spawned, counted = spawned + got, counted + 1
+        n = landed_commits(repo, ref, since, now) if repo and ref else None
+        rows.append({"window": label, "usd": round(usd, 2), "landed_commits": n,
+                     "usd_per_landed": round(usd / n, 2) if n else None,
+                     "subagents_spawned": spawned, "runs_counting_spawns": counted})
+    return rows
+
+
+def per_landed_lines(rows: list[dict], ref: str = "") -> list[str]:
+    return [f"{w['window']}: ${w['usd']:.2f} over {'?' if w['landed_commits'] is None else w['landed_commits']} "
+            f"commits landed{f' on {ref}' if ref else ''} = "
+            f"{'-' if w['usd_per_landed'] is None else '$' + format(w['usd_per_landed'], '.2f')} per landed change; "
+            f"{w['subagents_spawned']} subagents spawned ({w['runs_counting_spawns']} runs counted them)"
+            for w in rows]
+
+
 def text(r: dict, name: str) -> str:
     def f(v, unit=""):
         return "-" if v is None else f"{v}{unit}"
@@ -100,4 +157,7 @@ def text(r: dict, name: str) -> str:
             f"p90 {f(d['landing_p90_h'], ' h')}")
     if not r["days"]:
         lines.append("  nothing in the window")
+    if r.get("per_landed"):
+        lines.append("$ per landed change (booked spend over non-merge, non-bump commits on the push branch):")
+        lines += [f"  {x}" for x in per_landed_lines(r["per_landed"], r.get("ref", ""))]
     return "\n".join(lines)

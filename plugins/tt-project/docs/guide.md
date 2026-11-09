@@ -598,8 +598,9 @@ coordinator with that evidence.
   The session prompt's Tools section names only what the wake really gets on its provider
   (`Provider.coord_tool_set`): a worker's tools, read-only tools or none, with the reason, and hands
   what it cannot do to workers.
-  With `full` it gets a worker's tools (Bash, Read, Edit, Write, Skill, ToolSearch and the web
-  tools unless `no_internet`) under a worker's PreToolUse checks, so it can edit, build, ssh to the
+  With `full` it gets a worker's tools (on Claude Code its whole standard set, subagents
+  among them, and the web tools unless `no_internet`; its text is appended to Claude Code's own
+  system prompt) under a worker's PreToolUse checks, so it can edit, build, ssh to the
   machines its charter allows and run the `ttp` CLI. Direct writes to the charter, the memory
   files, `harness/project.json` and the state database are denied, each naming the action or
   command that applies the same checks (`charter_update`, `memory_add`, `config_set`, `ttp config`).

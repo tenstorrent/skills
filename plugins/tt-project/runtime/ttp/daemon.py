@@ -3632,12 +3632,13 @@ class Daemon:
                     tools = (coordtools.session_tool_args(self.cfg, project=self.p.name, root=str(self.p.root),
                                                           denied_reads=no_reads, session_mode=session_mode,
                                                           protected=coordtools.protected_paths(self.p),
-                                                          web=not restrictions.get("no_internet"))
+                                                          web=not restrictions.get("no_internet"),
+                                                          disallowed_tools=denied)
                              if role == "coordinator" else [])
-                    if role == "coordinator" and coordtools.full_tools(self.cfg, session_mode):
-                        # A worker's tools (coordtools.py): the read-only turn's Edit/Write deny goes.
-                        argv = coordtools.without_edit_deny(argv)
-                    argv, inline = _with_system_prompt(prov, argv, run_dir / "system.md", tools)
+                    full = role == "coordinator" and coordtools.full_tools(self.cfg, session_mode)
+                    if full:   # a worker's tools and permission mode (coordtools.full_argv)
+                        argv = coordtools.full_argv(argv)
+                    argv, inline = _with_system_prompt(prov, argv, run_dir / "system.md", tools, append=full)
                     if not inline:   # too long for the command line: it leads what the agent reads
                         if stdin is not None:
                             stdin = _lead_input(stdin, system)
@@ -5711,6 +5712,10 @@ class Daemon:
             note["thinking_tokens"] = usage.extra["thinking_tokens"]
         if usage.extra.get("model"):   # the model the agent's session reported, beside the requested one
             note["model_used"] = str(usage.extra["model"])[:120]
+        if isinstance(usage.extra.get("subagents_spawned"), int):   # Agent calls (providers/claude.parse)
+            note["subagents_spawned"] = usage.extra["subagents_spawned"]
+            if usage.extra.get("subagent_types"):
+                note["subagent_types"] = usage.extra["subagent_types"]
         if "session_cost_usd" in usage.extra:
             note["session_cost_usd"] = usage.extra["session_cost_usd"]   # reported; cost_usd is this run's
         for k in ("reported_usd", CALLS_NOTE):   # Claude Code's own total, kept beside the per-call booking
@@ -19177,16 +19182,23 @@ def _before_stdin(argv: list[str], extra: list[str]) -> list[str]:
     return argv[:-1] + extra + ["-"] if argv[-1:] == ["-"] else argv + extra
 
 
-def _with_system_prompt(prov, argv: list[str], path: Path, tools: list[str] | None = None) -> tuple[list[str], bool]:
+def _with_system_prompt(prov, argv: list[str], path: Path, tools: list[str] | None = None,
+                        append: bool = False) -> tuple[list[str], bool]:
     """`argv` for a run whose system prompt is the text in `path`, and whether the text is in it. The
     CLI reads the file itself where it can (--system-prompt-file): text past the per-argument limit
     on the command line fails the exec (E2BIG) before the agent starts. Where it cannot and the text
     is too long, it is left out and leads what the agent reads instead (stdin has no limit).
-    No tools, unless `tools` gives a session coordinator its read-only ones (coordtools); that run
-    leaves out --safe-mode, which turns hooks off, so its tool hook runs (--restricted still ignores
-    the user's and project's settings files)."""
+    No tools, unless `tools` gives a session coordinator its own (coordtools); that run leaves out
+    --safe-mode, which turns hooks off, so its tool hook runs. `append` (a full-tools session, user msg
+    #2302): the text is appended to Claude Code's own system prompt, as a worker's is, and the
+    per-directory sections stay out of it, so a resumed session's prompt stays cached across wakes."""
     if prov.name != "claude":
         return argv, False
+    if append:
+        from .providers.claude import EXCLUDE_DYNAMIC
+        sys_args = prov.append_system_args(path)
+        head = ["--strict-mcp-config", *(tools or []), *([EXCLUDE_DYNAMIC] if prov.supports(EXCLUDE_DYNAMIC) else [])]
+        return argv + [*head, *sys_args], bool(sys_args)
     sys_args = prov.system_prompt_args(path)
     head = ["--strict-mcp-config", *tools] if tools else ["--safe-mode", "--strict-mcp-config", "--tools", ""]
     return argv + [*head, *sys_args], bool(sys_args)

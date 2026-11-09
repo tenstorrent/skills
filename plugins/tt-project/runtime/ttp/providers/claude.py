@@ -43,6 +43,7 @@ import re
 import shlex
 import subprocess
 import sys
+from collections import Counter
 from pathlib import Path
 from typing import NamedTuple
 
@@ -93,6 +94,7 @@ CONNECTORS_OFF = {"ENABLE_CLAUDEAI_MCP_SERVERS": "false"}
 CONNECTOR_PREFIXES = ("claude.ai", "claude_ai_", "mcp__claude_ai_")   # server name, its tools' prefix
 WORKER_TOOLS = ("Bash", "Read", "Edit", "Write", "Skill", "ToolSearch")
 WEB_TOOLS = ("WebFetch", "WebSearch")
+SPAWN_TOOLS = ("Agent", "Task")   # Claude Code's subagent tool (older CLIs name it Task)
 
 
 @register
@@ -477,6 +479,9 @@ class Claude(Provider):
         cache_keys = ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
         cache_complete = False
         tool_ids: set[str] = set()   # tool calls, each block once (a streamed message repeats its blocks)
+        # Subagents the run started (an Agent call, Task in older CLIs), each call once, by subagent_type.
+        spawns: dict[str, str] = {}
+        u.extra["subagents_spawned"] = 0
         pending: tuple[str, dict] | None = None   # the newest main-agent StructuredOutput call not run yet
         for n, ev in enumerate(self._events(output_path)):
             t = ev.get("type")
@@ -502,6 +507,12 @@ class Claude(Provider):
                     if isinstance(block, dict) and block.get("type") == "tool_use":
                         tool_ids.add(str(block.get("id") or f"{ident}:{len(tool_ids)}"))
                         u.extra["tool_calls"] = len(tool_ids)
+                        if block.get("name") in SPAWN_TOOLS:
+                            args = block.get("input") if isinstance(block.get("input"), dict) else {}
+                            spawns[str(block.get("id") or f"{ident}:{len(spawns)}")] = \
+                                str(args.get("subagent_type") or "general-purpose")[:60]
+                            u.extra["subagents_spawned"] = len(spawns)
+                            u.extra["subagent_types"] = dict(Counter(spawns.values()))
                     if isinstance(block, dict) and block.get("type") == "text":
                         last_text = block.get("text") or last_text
                         # A coordinator that put its actions in an earlier message, then ended on prose

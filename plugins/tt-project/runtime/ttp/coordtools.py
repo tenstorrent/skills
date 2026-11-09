@@ -6,11 +6,16 @@ whole-wake guard (wake_snapshot, wake_guard) puts back protected files after any
 coordsession.keeps_session) runs a stateless turn with no tools.
 
 Full tools (coordinator.session.tools "full", the default): a session wake (a new or resumed session)
-gets a worker's tools (providers/claude.WORKER_TOOLS and its web tools) under a worker's guards: the
+gets a worker's tools under a worker's guards (user msg #2302). On Claude that is Claude Code's whole
+standard set, whatever the build ships (its subagent tool, Agent or Task, among them): no --tools list, no --restricted,
+bypassPermissions as a worker (full_argv), and its text appended to Claude Code's own system prompt
+(daemon._with_system_prompt). Withheld: the web tools under no_internet and the project's
+providers.claude.disallowed_tools (--disallowedTools), and the harness tools (hook.HARNESS_TOOLS:
+cron, wake-ups, remote triggers, worktree switches, push notifications), refused by the hook. The
 worker PreToolUse checks (hook.pre_tool_use: the PR draft and gh guards, no posting as the user, no
-credential reads, the kill guard, the device-run broker rule, no direct full suite) run on every Bash
-and file edit, the run's PATH starts with the harness's gh and git wrappers, and it runs unsandboxed
-as every coordinator turn does. On top of them (full_refusal): no direct write to the project's
+credential reads, the kill guard, the device-run broker rule, no direct full suite, no search from /
+or the home folder) run on every call, a subagent's too (the hook matches every tool), the run's PATH
+starts with the harness's gh and git wrappers, and it runs unsandboxed as every coordinator turn does. On top of them (full_refusal): no direct write to the project's
 charter, memory, project.json or state database (Edit/Write deny rules and the hook; the denial names
 the action or command that applies the same checks), no raw `git push` and no landing `ttp push` (a
 --land, --own, --detach or --move-tag push, or a plain one: code goes to a worker task, its review and
@@ -192,18 +197,33 @@ def without_edit_deny(argv: list[str]) -> list[str]:
     return argv
 
 
+def full_argv(argv: list[str]) -> list[str]:
+    """The read-only turn's `argv` (providers/claude.build) made a full-tools session's, as a worker's: no
+    Edit/Write deny, no --restricted (it drops Bash and the other code-running tools unless --tools names
+    them, and confines the file tools to the working directory), and bypassPermissions for dontAsk (which
+    refuses every tool no allow rule names). The rules hold through the hook on every tool and the deny
+    rules in --settings, which the CLI applies in every permission mode (user msg #2302)."""
+    out = [a for a in without_edit_deny(argv) if a != "--restricted"]
+    for i in range(len(out) - 1):
+        if out[i] == "--permission-mode":
+            out[i + 1] = "bypassPermissions"
+    return out
+
+
 def session_tool_args(cfg: dict, *, project: str = "", root: str = "", denied_reads=(), session_mode: str = "",
-                      protected=(), web: bool = True) -> list[str]:
+                      protected=(), web: bool = True, disallowed_tools=()) -> list[str]:
     """The CLI arguments that give a session coordinator its tools: the full set for a session wake
     (full_tools), else the read-only set."""
     if not session_on(cfg):
         return []
     deny = [f"Read(/{p})" for p in denied_reads if os.path.isabs(p)]
     if full_tools(cfg, session_mode):
-        from .providers.claude import WEB_TOOLS, WORKER_TOOLS
-        tools = [*WORKER_TOOLS, *(WEB_TOOLS if web else ())]
-        return ["--tools", ",".join(tools), "--allowedTools", ANSWER_TOOL, *tools,
-                *(["--disallowedTools", ",".join(deny)] if deny else []),
+        # Claude Code's full standard tool set, Agent included, as a worker's (user msg #2302): no --tools
+        # list. Withheld only: the web tools where the project may not use the web, and the project's
+        # own providers.claude.disallowed_tools. The hook (pre_tool_use) and the deny rules hold the rest.
+        from .providers.claude import WEB_TOOLS
+        deny = [*([] if web else WEB_TOOLS), *[t for t in disallowed_tools if t not in WEB_TOOLS], *deny]
+        return [*(["--disallowedTools", ",".join(deny)] if deny else []),
                 "--settings", json.dumps(hook_settings(denied_reads, full=True, protected=protected,
                                                        timeout_s=tool_timeout_s(cfg)))]
     allow = [f"Read(/{os.path.abspath(root)}/**)"] if root else []
@@ -393,16 +413,16 @@ def _full_pre_tool_use(tool: str, args: dict, payload: dict):
     if tool == ANSWER_TOOL:   # the turn's structured answer, checked as in read-only mode
         return _answer_check(payload)
     from . import pathguard
-    why = pathguard.refusal(payload) or full_refusal(tool, args, str(payload.get("cwd") or os.getcwd()))
+    why = (pathguard.refusal(payload) or hook.harness_tool(tool)
+           or full_refusal(tool, args, str(payload.get("cwd") or os.getcwd())))
     if why:
         return hook._deny(why)
-    if tool in EDITS or tool == "Bash":   # a worker's own checks
-        out = hook.pre_tool_use(payload)[0]
-        if tool == "Bash" and (out or {}).get("hookSpecificOutput", {}).get("permissionDecision") != "deny":
-            snapshot(payload)
-        return out
-    why = hook.local_guard(payload)   # the project's own guards (localguard.py) on its other tools
-    return hook._deny(why) if why else None
+    # A worker's own checks on every tool (Agent and its subagents' calls, MCP connector posts, the
+    # project's guards in localguard.py), as a worker's run meets them.
+    out = hook.pre_tool_use(payload)[0]
+    if tool == "Bash" and (out or {}).get("hookSpecificOutput", {}).get("permissionDecision") != "deny":
+        snapshot(payload)
+    return out
 
 
 def _guard_key(payload: dict) -> str:
@@ -596,8 +616,9 @@ def pre_tool_use(payload: dict) -> tuple[dict | None, None]:
             from .credguard import tool_refusal
             if path and (_denied_read(path, denied, search) or tool_refusal(tool, args)):
                 return _deny("that file holds a credential; a coordinator never reads it"), None
-            from .hook import local_guard   # the project's own guards, as on a worker's Read (localguard.py)
-            why = local_guard(payload)
+            from .hook import local_guard, search_scope   # the project's own guards, as on a worker's Read
+            why = search_scope(tool, args if isinstance(args, dict) else {}, str(payload.get("cwd") or os.getcwd()))
+            why = why or local_guard(payload)
             return (_deny(why) if why else None), None
         if tool == ANSWER_TOOL:   # the turn's structured answer (module doc)
             return _answer_check(payload), None

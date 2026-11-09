@@ -20,15 +20,20 @@ def _stub_agent(tmp_path):
     return stub
 
 
-def _start_coordinator(env, monkeypatch, flags, system, context=None, ttl=""):
+def _start_coordinator(env, monkeypatch, flags, system, context=None, ttl="", tools=None):
+    """A coordinator turn (never launched): its run.json and run dir. `tools`: coordinator.session.tools
+    (unset: full, whose text is appended to Claude Code's own system prompt; read_only replaces it)."""
     from ttp.daemon import Daemon
     from ttp.providers import claude
     monkeypatch.setattr(claude.Claude, "binary", lambda self: "/usr/bin/true")   # never a real agent
     monkeypatch.setattr(claude, "_FLAGS", {claude.INPUT_FORMAT: True, **flags})
     p = make(env)
     from ttp import coordinator as coord
-    rid = Daemon(p.base).start_run("coordinator", "EVENTS", "claude", "standard", str(p.root), read_only=True,
-                                   schema=coord.ACTIONS_SCHEMA, system=system, context=context, cache_ttl=ttl)
+    d = Daemon(p.base)
+    if tools:
+        d.cfg["coordinator"]["session"] = {"tools": tools}
+    rid = d.start_run("coordinator", "EVENTS", "claude", "standard", str(p.root), read_only=True,
+                      schema=coord.ACTIONS_SCHEMA, system=system, context=context, cache_ttl=ttl)
     run = p.runs / str(rid)
     (run / "STOP").touch()
     return json.loads((run / "run.json").read_text()), run
@@ -37,31 +42,41 @@ def _start_coordinator(env, monkeypatch, flags, system, context=None, ttl=""):
 def test_a_large_coordinator_system_prompt_goes_by_file_and_execs(env, monkeypatch, tmp_path):
     from ttp.providers import claude
     head = _big_text(200)
-    spec, run = _start_coordinator(env, monkeypatch, {claude.SYSTEM_PROMPT_FILE: True}, head)
+    spec, run = _start_coordinator(env, monkeypatch, {claude.APPEND_SYSTEM_FILE: True,
+                                                      claude.SYSTEM_PROMPT_FILE: True}, head)
     argv = spec["argv"]
-    assert argv[argv.index("--system-prompt-file") + 1] == str(run / "system.md")
-    assert "--system-prompt" not in argv and (run / "system.md").read_text() == head
+    # A full-tools session keeps Claude Code's own system prompt and appends ours (user msg #2302).
+    assert argv[argv.index("--append-system-prompt-file") + 1] == str(run / "system.md")
+    assert not [a for a in argv if a.startswith("--system-prompt")] and (run / "system.md").read_text() == head
     assert max(len(os.fsencode(a)) for a in argv) < ARG_STRLEN
     assert "EVENTS" == _unmoded((run / "prompt.md").read_text()), "the text is in the file, not the prompt"
     # The same argv execs: no E2BIG before the agent starts.
     stub = _stub_agent(tmp_path)
     done = subprocess.run([str(stub), *argv[1:]], env={**os.environ, **spec["env"]}, timeout=30)
     assert done.returncode == 0 and int(pathlib.Path(f"{stub}.args").read_text()) == len(argv) - 1
+    # A read-only coordinator's text stays its whole system prompt.
+    spec, run = _start_coordinator(env, monkeypatch, {claude.APPEND_SYSTEM_FILE: True,
+                                                      claude.SYSTEM_PROMPT_FILE: True}, head, tools="read_only")
+    argv = spec["argv"]
+    assert argv[argv.index("--system-prompt-file") + 1] == str(run / "system.md")
+    assert not [a for a in argv if a.startswith("--append-system-prompt")]
 
 
 def test_an_inline_system_prompt_past_the_argument_limit_leads_the_prompt(env, monkeypatch, tmp_path):
     from ttp.providers import base, claude
     head = _big_text(200)
-    spec, run = _start_coordinator(env, monkeypatch, {claude.SYSTEM_PROMPT_FILE: False}, head)
+    no_file = {claude.APPEND_SYSTEM_FILE: False, claude.APPEND_SYSTEM: True}
+    spec, run = _start_coordinator(env, monkeypatch, no_file, head)
     argv = spec["argv"]
-    assert not [a for a in argv if a.startswith("--system-prompt")], "no file flag and too long: not inline"
+    assert not [a for a in argv if a.startswith(("--system-prompt", "--append-system-prompt"))], \
+        "no file flag and too long: not inline"
     assert max(len(os.fsencode(a)) for a in argv) < ARG_STRLEN
     assert _unmoded((run / "prompt.md").read_text()) == head + "\n\nEVENTS", "the text leads what the agent reads"
     stub = _stub_agent(tmp_path)
     assert subprocess.run([str(stub), *argv[1:]], env={**os.environ, **spec["env"]}, timeout=30).returncode == 0
     # Text that fits one argument still goes inline on such a CLI.
-    spec, run = _start_coordinator(env, monkeypatch, {claude.SYSTEM_PROMPT_FILE: False}, "SHORT-HEAD")
-    assert spec["argv"][spec["argv"].index("--system-prompt") + 1] == "SHORT-HEAD"
+    spec, run = _start_coordinator(env, monkeypatch, no_file, "SHORT-HEAD")
+    assert spec["argv"][spec["argv"].index("--append-system-prompt") + 1] == "SHORT-HEAD"
     assert _unmoded((run / "prompt.md").read_text()) == "EVENTS"
     # The limit is the one guard: at it inline, one byte past it not.
     path = tmp_path / "edge.md"
@@ -75,17 +90,17 @@ def test_a_cached_coordinator_turn_keeps_a_too_long_head_in_its_input(env, monke
     from ttp.providers import claude
     head = _big_text(200)
     monkeypatch.setattr(claude.Claude, "own_cache_breakpoints", 3)   # an agent that leaves one free
-    spec, run = _start_coordinator(env, monkeypatch, {claude.SYSTEM_PROMPT_FILE: False}, head,
+    spec, run = _start_coordinator(env, monkeypatch, {claude.APPEND_SYSTEM_FILE: False}, head,
                                    context="STABLE-CONTEXT", ttl="1h")
     assert spec["stdin"] == "input.jsonl" and "--input-format" in spec["argv"]
-    assert not [a for a in spec["argv"] if a.startswith("--system-prompt")]
+    assert not [a for a in spec["argv"] if a.startswith(("--system-prompt", "--append-system-prompt"))]
     blocks = json.loads((run / "input.jsonl").read_text())["message"]["content"]
     assert [_unmoded(b["text"]) for b in blocks] == [head, "STABLE-CONTEXT", "EVENTS"]
     assert [("cache_control" in b) for b in blocks] == [False, True, False], "one breakpoint, after both"
     # With the file flag the head stays the system prompt and the input is unchanged.
-    spec, run = _start_coordinator(env, monkeypatch, {claude.SYSTEM_PROMPT_FILE: True}, head,
+    spec, run = _start_coordinator(env, monkeypatch, {claude.APPEND_SYSTEM_FILE: True}, head,
                                    context="STABLE-CONTEXT", ttl="1h")
-    assert "--system-prompt-file" in spec["argv"]
+    assert "--append-system-prompt-file" in spec["argv"]
     blocks = json.loads((run / "input.jsonl").read_text())["message"]["content"]
     assert [_unmoded(b["text"]) for b in blocks] == ["STABLE-CONTEXT", "EVENTS"]
 

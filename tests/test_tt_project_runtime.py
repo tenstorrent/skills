@@ -5821,7 +5821,7 @@ def test_coordinator_turns_pass_the_cache_settings_through(env, monkeypatch):
     monkeypatch.setattr(claude.Claude, "own_cache_breakpoints", 3)   # an agent that leaves one free
 
     def start(ttl, supported=True):
-        monkeypatch.setattr(claude, "_FLAGS", {claude.INPUT_FORMAT: supported})
+        monkeypatch.setattr(claude, "_FLAGS", {claude.INPUT_FORMAT: supported, claude.APPEND_SYSTEM: True})
         rid = d.start_run("coordinator", "EVENTS", "claude", "standard", str(p.root), read_only=True,
                           schema=coord.ACTIONS_SCHEMA, system=head, context=context, cache_ttl=ttl)
         run = p.runs / str(rid)
@@ -5831,14 +5831,14 @@ def test_coordinator_turns_pass_the_cache_settings_through(env, monkeypatch):
     spec, run = start("1h")
     assert spec["env"].get("CLAUDE_CODE_PROMPT_CACHE_TTL") == "1h"
     assert spec["stdin"] == "input.jsonl"
-    assert "--input-format" in spec["argv"] and spec["argv"][spec["argv"].index("--system-prompt") + 1] == head
+    assert "--input-format" in spec["argv"] and spec["argv"][spec["argv"].index("--append-system-prompt") + 1] == head
     blocks = json.loads((run / "input.jsonl").read_text())["message"]["content"]
     assert [_unmoded(b["text"]) for b in blocks] == [context, "EVENTS"]
     for ttl, supported in (("off", True), ("1h", False)):
         spec, run = start(ttl, supported)
         assert "stdin" not in spec and not (run / "input.jsonl").exists()
         assert "--input-format" not in spec["argv"]
-        assert spec["argv"][spec["argv"].index("--system-prompt") + 1] == coord.join_prompt(head, context)
+        assert spec["argv"][spec["argv"].index("--append-system-prompt") + 1] == coord.join_prompt(head, context)
         assert spec["env"].get("CLAUDE_CODE_PROMPT_CACHE_TTL") == (None if ttl == "off" else ttl)
 
 
@@ -6030,7 +6030,7 @@ def test_largest_coordinator_turn_stays_within_four_cache_breakpoints(env, monke
     from ttp.daemon import Daemon
     from ttp import coordinator as coord
     monkeypatch.setattr(claude.Claude, "binary", lambda self: "/usr/bin/true")   # never a real agent
-    monkeypatch.setattr(claude, "_FLAGS", {claude.INPUT_FORMAT: True})
+    monkeypatch.setattr(claude, "_FLAGS", {claude.INPUT_FORMAT: True, claude.APPEND_SYSTEM: True})
     p = make(env)
     d = Daemon(p.base)
     # Every optional block: memory of each kind, a user message, a steer on a running task, events.
@@ -6056,7 +6056,7 @@ def test_largest_coordinator_turn_stays_within_four_cache_breakpoints(env, monke
         marks = _coordinator_marks(run)
         assert marks + own <= base.MAX_CACHE_BREAKPOINTS, (own, marks)
         argv = json.loads((run / "run.json").read_text())["argv"]
-        system = argv[argv.index("--system-prompt") + 1]
+        system = argv[argv.index("--append-system-prompt") + 1]
         if marks:
             assert system == head, "with a breakpoint to spare the stable block is its own"
         else:

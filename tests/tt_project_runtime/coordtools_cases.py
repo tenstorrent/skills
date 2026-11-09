@@ -12,6 +12,7 @@ def _coord_argv(env, monkeypatch, session=None, budget=1.0):
     from ttp.providers import claude
     monkeypatch.setattr(claude.Claude, "binary", lambda self: "/usr/bin/true")
     monkeypatch.setattr(claude, "_FLAGS", {claude.INPUT_FORMAT: True, claude.SYSTEM_PROMPT_FILE: True,
+                                           claude.APPEND_SYSTEM_FILE: True, claude.EXCLUDE_DYNAMIC: True,
                                            claude.TOOLS: True})
     p = make(env)
     d = Daemon(p.base)
@@ -29,11 +30,13 @@ def _coord_argv(env, monkeypatch, session=None, budget=1.0):
 def test_no_session_setting_takes_the_coordinators_tools_away(env, monkeypatch):
     # User msg #2040: the session is always on; a leftover "mode" of any value keeps its tools.
     base = _coord_argv(env, monkeypatch, None)[0]
-    tools = base[base.index("--tools") + 1]
-    assert tools != "" and "--safe-mode" not in base
+    # The full set: no --tools list (Claude Code's own standard set), hooks on.
+    assert "--tools" not in base and "--safe-mode" not in base
+    assert json.loads(base[base.index("--settings") + 1])["env"]["TTP_COORD_FULL_TOOLS"] == "1"
     for cfg in ({"mode": "off"}, {"mode": "OFF "}, {"mode": "shadow"}, {"mode": ""}, {}, "on"):
         argv = _coord_argv(env, monkeypatch, cfg)[0]
-        assert argv[argv.index("--tools") + 1] == tools and "--safe-mode" not in argv, cfg
+        assert "--tools" not in argv and "--safe-mode" not in argv, cfg
+        assert json.loads(argv[argv.index("--settings") + 1])["env"]["TTP_COORD_FULL_TOOLS"] == "1", cfg
 
 
 def test_mode_on_coordinator_gets_only_read_only_tools(env, monkeypatch):
@@ -454,12 +457,19 @@ def _coord_settings(argv):
 def test_full_session_coordinator_gets_a_workers_tools_and_guards(env, monkeypatch):
     from ttp import coordsession
     argv, _, _, p = _coord_argv(env, monkeypatch, {"mode": "on"})
-    assert argv[argv.index("--tools") + 1] == "Bash,Read,Edit,Write,Skill,ToolSearch,WebFetch,WebSearch"
-    assert "--safe-mode" not in argv and "--restricted" in argv
+    # Claude Code's full standard tool set, Agent included, as a worker's (user msg #2302): no --tools list,
+    # no --restricted (it drops Bash unless --tools names it), no dontAsk (it refuses what no rule allows).
+    assert "--tools" not in argv and "--allowedTools" not in argv
+    assert "--safe-mode" not in argv and "--restricted" not in argv
+    assert argv[argv.index("--permission-mode") + 1] == "bypassPermissions"
     assert not any(argv[i:i + 3] == ["--disallowedTools", "Edit", "Write"] for i in range(len(argv))), \
         "the read-only turn's Edit/Write deny goes"
-    allowed = argv[argv.index("--allowedTools") + 1:argv.index("--allowedTools") + 10]
-    assert {"StructuredOutput", "Bash", "Edit", "Write"} <= set(allowed)
+    # Claude Code's own system prompt stays; ours is appended and the per-directory sections stay out.
+    assert "--append-system-prompt-file" in argv and "--exclude-dynamic-system-prompt-sections" in argv
+    assert not [a for a in argv if a.startswith("--system-prompt")]
+    assert "--json-schema" in argv and "--strict-mcp-config" in argv
+    withheld = argv[argv.index("--disallowedTools") + 1].split(",")
+    assert not [t for t in withheld if not t.startswith("Read(/")], "only credential reads are withheld"
     s = _coord_settings(argv)
     assert s["hooks"]["PreToolUse"][0]["hooks"][0]["command"].endswith("CoordPreToolUse")
     assert s["hooks"]["PostToolUse"][0]["hooks"][0]["command"].endswith("CoordPostToolUse")
@@ -473,6 +483,8 @@ def test_full_session_coordinator_gets_a_workers_tools_and_guards(env, monkeypat
     for cfg in ({"mode": "on", "tools": "read_only"}, {"mode": "on", "tools": "everything"}):
         argv, _, _, _ = _coord_argv(env, monkeypatch, cfg)
         assert argv[argv.index("--tools") + 1] == "Read,Bash", cfg
+        assert "--restricted" in argv and argv[argv.index("--permission-mode") + 1] == "dontAsk", cfg
+        assert "--system-prompt-file" in argv and "--append-system-prompt-file" not in argv, cfg
         assert "TTP_COORD_FULL_TOOLS" not in _coord_settings(argv)["env"]
     monkeypatch.setattr(coordsession, "decide", lambda *a, **k: ("stateless", "test"))
     argv, _, _, _ = _coord_argv(env, monkeypatch, {"mode": "on"})
@@ -549,6 +561,45 @@ def test_a_long_foreground_coordinator_command_is_cut_at_its_time_limit(tmp_path
     assert coordtools.tool_timeout_s({}) == 300
     assert coordtools.tool_timeout_s({"coordinator": {"session": {"tool_timeout_s": 5000}}}) == 600
     assert coordtools.tool_timeout_s({"coordinator": {"session": {"tool_timeout_s": "x"}}}) == 300
+
+
+def test_full_tools_hook_takes_agent_and_refuses_harness_tools_and_wide_searches(tmp_path, monkeypatch):
+    # User msg #2302: the coordinator has Claude Code's full set; the hook holds a worker's rules on it.
+    harness, state, _ = _full_env(tmp_path, monkeypatch)
+    for tool, args in (("Agent", {"description": "look", "prompt": "find x", "subagent_type": "general-purpose"}),
+                       ("Task", {"description": "look", "prompt": "find x", "subagent_type": "general-purpose"}),
+                       ("TodoWrite", {"todos": []}), ("Grep", {"pattern": "x", "path": str(tmp_path)}),
+                       ("Glob", {"pattern": "**/*.py"}), ("Grep", {"pattern": "x"})):
+        assert _decide(tmp_path, tool, **args) == "allow", tool
+    from ttp.hook import HARNESS_TOOLS
+    for tool in HARNESS_TOOLS:   # the tools that step outside the harness, refused as for a worker
+        assert _decide(tmp_path, tool) == "deny", tool
+    home = os.path.expanduser("~")
+    for tool, args in (("Grep", {"pattern": "x", "path": "/"}), ("Grep", {"pattern": "x", "path": home}),
+                       ("Glob", {"pattern": "/**/*.md"}), ("Glob", {"pattern": "*.md", "path": "~"})):
+        assert _decide(tmp_path, tool, **args) == "deny", (tool, args)
+    # A subagent's call (it carries agent_id) meets the same rules, project.db among them.
+    out, _ = __import__("ttp.coordtools", fromlist=["x"]).pre_tool_use(
+        {"tool_name": "Write", "agent_id": "a1", "cwd": str(tmp_path),
+         "tool_input": {"file_path": str(state / "project.db"), "content": "x"}})
+    assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+def test_full_tools_withhold_only_the_web_where_banned_and_the_projects_own_denylist(tmp_path):
+    from ttp import coordtools
+    cfg = {"coordinator": {"session": {"tools": "full"}}}
+    args = coordtools.session_tool_args(cfg, session_mode="resume", web=False, disallowed_tools=["NotebookEdit"],
+                                        denied_reads=["/x/token"])
+    assert "--tools" not in args and "--allowedTools" not in args
+    assert args[args.index("--disallowedTools") + 1].split(",") == ["WebFetch", "WebSearch", "NotebookEdit",
+                                                                     "Read(//x/token)"]
+    args = coordtools.session_tool_args(cfg, session_mode="new")
+    assert "--disallowedTools" not in args
+    # full_argv turns the read-only turn's flags into a worker's.
+    base = ["claude", "-p", "--restricted", "--permission-mode", "dontAsk", "--disallowedTools", "Edit", "Write",
+            "NotebookEdit", "--json-schema", "{}"]
+    assert coordtools.full_argv(base) == ["claude", "-p", "--permission-mode", "bypassPermissions",
+                                          "--json-schema", "{}"]
 
 
 def test_full_tools_log_each_mutating_call(tmp_path, monkeypatch):
