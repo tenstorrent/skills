@@ -145,9 +145,10 @@ _PL_FAIL = "printf 'FAILED tests/t.py::test_x - boom\\n= 1 failed in 0.1s =\\n';
 _PL_PASS = "echo '= 1 passed in 0.1s ='"
 
 
-def _pl_land(env, tmp_path, monkeypatch, check, n=3, bad_at=None):
+def _pl_land(env, tmp_path, monkeypatch, check, n=3, bad_at=None, rows_reversed=False):
     """A project whose push branch up/main got one batch of `n` entries (entry `bad_at` adds a file named bad)
-    plus a version bump, recorded as pushed; post_land_checks = [check]; the driver runs inline."""
+    plus a version bump, recorded as pushed; post_land_checks = [check]; the driver runs inline. rows_reversed:
+    the queue rows are added last entry first (a batch replays in priority order, not id order)."""
     import json as _json
     import subprocess as sp
     from ttp import postland
@@ -167,7 +168,7 @@ def _pl_land(env, tmp_path, monkeypatch, check, n=3, bad_at=None):
     now = time.time()
     p.db.x("INSERT INTO push_batches(id,marker,target,started,ended,outcome,pushed_sha,tip,finalized) "
            "VALUES(?,?,?,?,?,?,?,?,?)", ("b1", "m", "up/main", now - 60, now - 30, "pushed", pushed, tip, now - 30))
-    for i, sha in enumerate(entries):
+    for i, sha in (reversed if rows_reversed else list)(list(enumerate(entries))):
         t = p.db.add_task(f"change {i}", kind="review", status="done")
         p.db.x("INSERT INTO push_queue(task,branch,head,target,status,batch,created,updated,pushed_sha,landed_sha) "
                "VALUES(?,?,?,?,?,?,?,?,?,?)", (t, f"ch{i}", sha, "up/main", "landed", "b1", now, now, pushed, sha))
@@ -177,6 +178,7 @@ def _pl_land(env, tmp_path, monkeypatch, check, n=3, bad_at=None):
         job.with_suffix(".result.json").write_text(_json.dumps(postland.drive(p_, _json.loads(job.read_text()))))
         return 0
     monkeypatch.setattr(postland, "spawn", inline)
+    p._pl_tip = tip
     return p, g, pushed, entries
 
 
@@ -197,22 +199,40 @@ def test_post_land_failure_is_bisected_to_its_entry_reverted_through_the_push_qu
     import subprocess as sp
     from ttp import postland
     p, g, pushed, entries = _pl_land(env, tmp_path, monkeypatch,
-                                     f"sh -c \"grep -qs bad pl*.txt && {{ {_PL_FAIL}; }}; {_PL_PASS}\"", n=3, bad_at=1)
+                                     f"sh -c \"grep -qs bad pl*.txt && {{ {_PL_FAIL}; }}; {_PL_PASS}\"", n=3, bad_at=0,
+                                     rows_reversed=True)
     postland.tend(p, p.config())
     assert postland.tend(p, p.config()) == "guilty"
     fix = p.db.q("SELECT * FROM tasks WHERE title LIKE 'Fix #%'")
-    assert len(fix) == 1 and fix[0]["kind"] == "code" and "ch1" in fix[0]["title"], fix
+    assert len(fix) == 1 and fix[0]["kind"] == "code" and "ch0" in fix[0]["title"], fix
     assert "tests/t.py::test_x" in fix[0]["spec"] and "the only ones to rerun" in fix[0]["spec"]
     rev = p.db.q("SELECT * FROM tasks WHERE title LIKE 'Revert #%'")
     assert len(rev) == 1 and rev[0]["status"] == "pushing", rev
     rows = p.db.q("SELECT * FROM push_queue WHERE task=?", (rev[0]["id"],))
     assert len(rows) == 1 and rows[0]["status"] == "approved" and rows[0]["target"] == "up/main"
-    assert rows[0]["branch"] == f"ttp/postland-revert-{entries[1][:10]}"
+    assert rows[0]["branch"] == f"ttp/postland-revert-{entries[0][:10]}"
     head = rows[0]["head"]
     assert g("rev-parse", f"{head}^") == pushed, "a forward revert on the tip, never a rewrite"
-    assert "pl1.txt" in g("diff", "--name-only", pushed, head) and g("show", f"{head}:pl0.txt") == "ok"
-    assert sp.run(["git", "-C", str(p.root), "cat-file", "-e", f"{head}:pl1.txt"]).returncode != 0
-    assert p.db.q("SELECT id FROM events WHERE text LIKE '%fails tests/t.py::test_x; fix task%' AND status='queued'")
+    assert g("diff", "--name-only", pushed, head) == "pl0.txt", "only the guilty entry is reverted"
+    assert sp.run(["git", "-C", str(p.root), "cat-file", "-e", f"{head}:pl0.txt"]).returncode != 0
+    assert f"start_when:landed:#{rev[0]['id']}" in fix[0]["labels"], "the fix starts once the revert has landed"
+    assert fix[0]["id"] > rev[0]["id"] and f"{p._pl_tip[:10]}..{entries[0][:10]}" in fix[0]["spec"]
+    assert head[:10] in fix[0]["spec"] and "on top of the revert" in fix[0]["spec"]
+    assert p.db.q("SELECT id FROM events WHERE text LIKE '%fails tests/t.py::test_x; revert #%; fix task #% starts "
+                  "once it lands' AND status='queued'")
+
+
+def test_post_land_check_on_a_busy_test_lock_backs_off_and_still_checks_the_landing(env, tmp_path, monkeypatch):
+    from ttp import postland
+    n = tmp_path / "count"
+    check = f"sh -c \"c=\\$(cat {n} 2>/dev/null || echo 0); echo x >> {n}; [ \\$c = 0 ] && exit 75; {_PL_PASS}\""
+    p, g, pushed, _ = _pl_land(env, tmp_path, monkeypatch, check)
+    p.set_config("checks.judge_busy_wait_s", 0.05)
+    postland.tend(p, p.config())
+    assert postland.tend(p, p.config()) == f"post-landing checks passed on {pushed[:10]}"
+    assert len(n.read_text().split()) == 2, "the busy run is retried after the backoff"
+    assert p.db.kv(postland.KEY)["last"] == {"outcome": "pass", "sha": pushed}
+    assert not p.db.q("SELECT id FROM events WHERE kind='observation'"), "a busy lock raises nothing"
 
 
 def test_post_land_failure_that_passes_on_rerun_is_flaky_quarantined_and_never_reverted(env, tmp_path, monkeypatch):

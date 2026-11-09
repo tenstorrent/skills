@@ -31,6 +31,7 @@ from .project import Project, durable_write
 KEY = "post_land"
 FOLDER = "post-land"
 EVENT = "post_land"
+BUSY_PASSES = 3   # passes a landing waits on a busy test lock (each after gatejudge's backoff) before it is unattributed
 
 
 def driver_argv(job: Path) -> list[str]:
@@ -68,7 +69,13 @@ def tend(p: Project, cfg: dict, now: float | None = None) -> str:
             return ""
         else:
             got = {"outcome": "error", "why": "the driver ended without a result (a reboot, a kill or a crash)"}
-        db.set_kv(KEY, {**st, "job": None, "since": job["ended"], "last": {**got, "sha": job["sha"]}})
+        busy = int(st.get("busy") or 0) + 1 if got.get("outcome") == "busy" else 0
+        if busy and busy < BUSY_PASSES:   # the test lock admitted nothing: the next pass checks this landing again
+            db.set_kv(KEY, {**st, "job": None, "busy": busy})
+            return f"post-landing checks on {job['sha'][:10]}: busy, retried next pass"
+        if busy:
+            got = {"outcome": "unattributed", "why": f"the test lock stayed busy for {busy} passes"}
+        db.set_kv(KEY, {**st, "job": None, "busy": 0, "since": job["ended"], "last": {**got, "sha": job["sha"]}})
         return apply(p, job, got)
     batches = db.q("SELECT * FROM push_batches WHERE outcome='pushed' AND finalized IS NOT NULL AND ended>? "
                    "ORDER BY ended, started", (st.get("since") or 0,))
@@ -77,11 +84,19 @@ def tend(p: Project, cfg: dict, now: float | None = None) -> str:
     if "since" not in st:
         batches = batches[-1:]   # first run: this landing only, not the project's history
     points = []
-    for b in batches:
-        for r in db.q("SELECT id, task, branch, landed_sha FROM push_queue WHERE batch=? AND landed_sha IS NOT NULL "
-                      "AND status IN ('pushed','landed') ORDER BY id", (b["id"],)):
-            points.append({"sha": r["landed_sha"], "row": r["id"], "task": r["task"], "branch": r["branch"]})
-        points.append({"sha": b["pushed_sha"], "row": None})
+    for b in batches:   # by position on the branch (a batch replays in priority order, not id order)
+        line = _git(p.root, "rev-list", "--reverse", "--first-parent",
+                    f"{b['tip']}..{b['pushed_sha']}" if b["tip"] else b["pushed_sha"]).stdout.split()
+        at = {c: i for i, c in enumerate(line)}
+        rows = [r for r in db.q("SELECT id, task, branch, landed_sha FROM push_queue WHERE batch=? AND landed_sha "
+                                "IS NOT NULL AND status IN ('pushed','landed')", (b["id"],)) if r["landed_sha"] in at]
+        base = b["tip"] or ""
+        for r in sorted(rows, key=lambda r: at[r["landed_sha"]]):
+            points.append({"sha": r["landed_sha"], "base": base, "row": r["id"], "task": r["task"],
+                           "branch": r["branch"]})
+            base = r["landed_sha"]
+        if b["pushed_sha"] != base:
+            points.append({"sha": b["pushed_sha"], "base": base, "row": None})
     folder = p.state / FOLDER
     folder.mkdir(parents=True, exist_ok=True)
     path = folder / f"{batches[-1]['id']}.json"
@@ -128,21 +143,29 @@ def apply(p: Project, job: dict, got: dict) -> str:
         return str(out)
     e = got["entry"]
     who = f"#{e['task']} {e.get('branch') or '?'}" if e.get("task") else f"commit {e['sha'][:10]}"
-    fix = db.add_task(f"Fix {who}: post-landing tests fail", kind="code", spec=(
-        f"Post-landing checks (delivery.post_land_checks) failed after {who} landed as {e['sha'][:10]}; the change "
-        f"is reverted on {job['target']} by {got.get('revert_branch') or '(no revert: ' + str(got.get('why')) + ')'}. "
-        f"Re-land it fixed. Its failing tests, the only ones to rerun: {ids}\nCommand: {got.get('cmd')}\n"
-        f"Output tail:\n{str(got.get('tail') or '')[-2000:]}"))
-    text = f"Post-landing checks on {sha}: {who} fails {ids}; fix task #{fix}"
-    if got.get("revert_head"):
+    span = f"{str(e.get('base') or '')[:10]}..{e['sha'][:10]}"
+    tail = (f"Its failing tests, the only ones to rerun: {ids}\nCommand: {got.get('cmd')}\n"
+            f"Output tail:\n{str(got.get('tail') or '')[-2000:]}")
+    if got.get("revert_head"):   # the revert first; the fix starts once it has landed, on top of it
         with db.tx():
             tid = db.add_task(f"Revert {who}: post-landing tests fail", kind="review", status="pushing",
-                              spec=f"Forward revert by the post-landing checks; fix task #{fix}.")
+                              spec=f"Forward revert of {span} by the post-landing checks.")
             pushq.approve(p, tid, None, {"entries": [{"branch": got["revert_branch"], "head": got["revert_head"]}],
                                          "target": job["target"]})
-        text += f"; revert #{tid} ({got['revert_head'][:10]}) approved for {job['target']}"
+        fix = db.add_task(f"Fix {who}: post-landing tests fail", kind="code", labels=[
+            f"start_when:landed:#{tid}", f"start_why:revert #{tid} lands", f"deferred_since:{time.time():.0f}"],
+            spec=(f"Post-landing checks (delivery.post_land_checks) failed after {who} landed as {e['sha'][:10]}. "
+                  f"Revert #{tid} (commit {got['revert_head'][:10]}, branch {got['revert_branch']}) takes {span} "
+                  f"off {job['target']}; this starts once it has landed. Re-apply {span} on top of the revert "
+                  f"with its fix. {tail}"))
+        text = (f"Post-landing checks on {sha}: {who} fails {ids}; revert #{tid} ({got['revert_head'][:10]}) "
+                f"approved for {job['target']}; fix task #{fix} starts once it lands")
     else:
-        text += f"; not reverted: {got.get('why')}"
+        fix = db.add_task(f"Fix {who}: post-landing tests fail", kind="code", spec=(
+            f"Post-landing checks (delivery.post_land_checks) failed after {who} landed as {e['sha'][:10]} "
+            f"({span}). It is not reverted ({got.get('why')}): the change is still on {job['target']}; fix it "
+            f"forward. {tail}"))
+        text = f"Post-landing checks on {sha}: {who} fails {ids}; fix task #{fix}; not reverted: {got.get('why')}"
     _event(db, text)
     return "guilty"
 
@@ -150,7 +173,7 @@ def apply(p: Project, job: dict, got: dict) -> str:
 def drive(p: Project, job: dict, say=print) -> dict:
     """Run the checks on job['sha'] and, on a new failure, find and revert its change (see the module)."""
     from . import cleantree, gatejudge, push, sharedchecks, worktree
-    repo, sha, points = Path(job["repo"]), job["sha"], job["points"]
+    repo = Path(job["repo"])
     base = str(Path(job["path"]).parent)
     checks = push.check_list((p.config().get("delivery") or {}).get("post_land_checks"))
     try:
@@ -158,7 +181,16 @@ def drive(p: Project, job: dict, say=print) -> dict:
     except Exception:
         env = dict(os.environ)
 
+    busy = gatejudge.settings(p.config())
+
     def run(at: str, cmd, sel: list[str] | None = None) -> tuple[int | None, str]:
+        """One run, again after gatejudge's bounded backoff while the test lock is busy (it ran nothing)."""
+        got = gatejudge.rerun(lambda a, s: run_once(a, cmd, s), at, sel, busy["busy_tries"], busy["busy_wait_s"])
+        if got[0] == gatejudge.BUSY:
+            raise Busy(f"`{cmd}` at {at[:10]}")
+        return got
+
+    def run_once(at: str, cmd, sel: list[str] | None = None) -> tuple[int | None, str]:
         tree = cleantree.Checkout(repo, at, base)
         try:
             worktree.prepare(p, tree.path)
@@ -169,13 +201,26 @@ def drive(p: Project, job: dict, say=print) -> dict:
         finally:
             tree.close()
 
+    try:
+        return _drive(p, job, checks, run)
+    except Busy as ex:
+        return {"outcome": "busy", "why": f"the test lock stayed busy: {ex}"}
+
+
+class Busy(Exception):
+    """A run the test lock admitted nowhere after its backoff: nothing ran, nothing is known."""
+
+
+def _drive(p: Project, job: dict, checks: list, run) -> dict:
+    from . import gatejudge, sharedchecks
+    sha, points = job["sha"], job["points"]
     flaky: list[str] = []
     for cmd in checks:
         rc, text = run(sha, cmd)
         if rc == 0:
             continue
         ids, complete = sharedchecks.failing_ids(text)
-        if rc == gatejudge.BUSY or not ids or not complete:
+        if not ids or not complete:
             return {"outcome": "unattributed", "why": f"`{cmd}` exited {rc} without a complete list of failing tests",
                     "cmd": str(cmd), "tail": text[-3000:]}
         again = gatejudge.failed_of(*run(sha, cmd, ids), ids, at="head")
@@ -200,9 +245,8 @@ def drive(p: Project, job: dict, say=print) -> dict:
                         "ids": ids, "cmd": str(cmd)}
             lo, hi = (lo, mid) if f else (mid, hi)
         e = points[hi]
-        start = points[lo]["sha"] if lo >= 0 else job["good"]
         out = {"outcome": "guilty", "ids": ids, "cmd": str(cmd), "entry": e, "tail": text[-3000:]}
-        out.update(revert(p, repo, job, start, e, cmd, ids, run))
+        out.update(revert(p, Path(job["repo"]), job, e, cmd, ids, run))
         return out
     if flaky:
         s = gatejudge.settings(p.config())
@@ -212,8 +256,8 @@ def drive(p: Project, job: dict, say=print) -> dict:
     return {"outcome": "pass"}
 
 
-def revert(p: Project, repo: Path, job: dict, start: str, e: dict, cmd, ids: list[str], run) -> dict:
-    """A commit reverting start..e['sha'] on the target's current tip, as a local branch, once it passes `ids`."""
+def revert(p: Project, repo: Path, job: dict, e: dict, cmd, ids: list[str], run) -> dict:
+    """A commit reverting the entry's own commits (e['base']..e['sha']) on the target's current tip, as a local branch, once it passes `ids`."""
     from . import cleantree, push
     remote, _, branch = str(job["target"]).partition("/")
     try:
@@ -222,6 +266,9 @@ def revert(p: Project, repo: Path, job: dict, start: str, e: dict, cmd, ids: lis
         return {"why": f"could not read {job['target']}: {ex}"}
     if not e.get("row"):
         return {"why": "the first failing sha is the version bump, not an entry"}
+    start = e.get("base") or ""
+    if not start or start == e["sha"]:
+        return {"why": f"no commits of its own to revert ({start[:10] or 'no base'}..{e['sha'][:10]})"}
     tree = cleantree.Checkout(repo, tip, str(Path(job["path"]).parent))
     try:
         g = lambda *a: _git(tree.path, "-c", "user.name=ttp", "-c", "user.email=ttp@localhost", *a)
