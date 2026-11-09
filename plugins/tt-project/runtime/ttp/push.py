@@ -38,11 +38,12 @@ import sys
 import tempfile
 import threading
 import time
+from collections import deque
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import quote, unquote
 
-from . import (checkcap, checkdirs, checkwait, checklane, cleantree, envfault, gatetime, gitcache, gitmemo, hoststate, landed, landmark, leakfile, locks, machines, pooladmit, prguard, prhead, remotecheck, repoid, runner, runnerenv,
+from . import (checkcap, checkdirs, checkwait, checklane, cleantree, envfault, gatejudge, gatetime, gitcache, gitmemo, hoststate, landed, landmark, leakfile, locks, machines, pooladmit, prguard, prhead, remotecheck, repoid, runner, runnerenv,
                sandbox, scriptwatch, settinghold, setupfault, shorttmp, slurmcheck, syntaxfault, testslots, timefmt, workerloss, worktree)
 from .budget import DOC_SUFFIXES
 from .db import continues_id, dependency_ids, load_result
@@ -68,6 +69,7 @@ POOL_STATUS_SUFFIX = ".pool"     # beside a detached push's marker: its check's 
 QUEUED = 1075                    # once()'s answer for a check still queued at its outer bound: never a process's code
 POOL_STARVED = 1124              # _timed_wait's answer for a check ended at its pool-wait bound: never a process's code
 POOL_BUSY = 1175                 # _timed_wait's answer for a check still waiting for a pool slot at its limit: never a process's code
+GATE_LINES = 20000                # a failed check's last output lines the tests gate reads its failing ids from (_gate)
 QUEUED_RETRY_S = 1800            # a push whose check stayed queued is tried again after this
 TIMINGS = "push_checks.json"   # under the project's state: how long the last full check run took
 BUMP_TRAILER = "Ttp-Version-Bump"   # marks the bump commit ttp push made, so a rerun replaces it
@@ -3791,12 +3793,18 @@ def publish(repo: Path, remote: str, branch: str, checks: list[str],
             env = {**check_env("own", tip, check_run_dir, branch), **slot.env()}
             for line in sandbox_lines(todo):
                 say(line)
+            excused = False
             for cmd in todo:
-                if (rc := _run_one(cmd, repo, env, say)) != 0:
+                if (rc := _run_one(cmd, repo, env, say, seen := {})) != 0:
+                    if rc == CHECKS_FAILED:
+                        rc = _gate(cmd, repo, env, say, head, base or "", seen, p)
+                    if rc == 0:
+                        excused = True   # its reruns are no check time
+                        continue
                     if rc != BUSY:
                         say(f"check failed on {head[:10]}: {cmd}{where(cmd)}; not pushing")
                     return rc
-        if todo and timed:
+        if todo and timed and not excused:
             timed(time.time() - started)
         if _git(repo, "rev-parse", "HEAD").stdout.strip() != head:
             say(f"HEAD moved off {head[:10]} during the checks; not pushing")
@@ -4096,14 +4104,21 @@ def _rounds(repo: Path, remote: str, branch: str, checks: list[str], rounds: int
             env = {**check_env("target", tip, check_run_dir, branch), **slot.env()}
             for line in sandbox_lines(run):
                 say(line)
+            excused = set()
             for cmd in run:
-                if (rc := _run_one(cmd, repo, env, say)) != 0:
+                if (rc := _run_one(cmd, repo, env, say, seen := {})) != 0:
+                    if rc == CHECKS_FAILED:
+                        rc = _gate(cmd, repo, env, say, head, tip, seen)
+                    if rc == 0:
+                        excused.add(str(cmd))
+                        continue
                     if rc != BUSY:
                         say(f"check failed on {head[:10]}: {cmd}{where(cmd)}; not pushing")
                     return rc
-        if run and not carried and timed:
+        if run and not carried and timed and not excused:
             timed(time.time() - started)
-        passes = {str(cmd): (tip, head) for cmd in todo}
+        # A check the tests gate excused did not pass: no later round carries it.
+        passes = {str(cmd): (tip, head) for cmd in todo if str(cmd) not in excused}
         steps.go("push")
         if _fetch(repo, remote, branch) != tip:
             say(f"{upstream} moved during the checks; round {rnd + 1}")
@@ -4155,12 +4170,15 @@ def _end_group(pgid: int) -> None:
         pass
 
 
-def _copy_out(stream, collect: workerloss.Collector) -> None:
-    """A check's output into this process's output (the push log), each line also to `collect`."""
+def _copy_out(stream, collect: workerloss.Collector, keep: deque | None = None) -> None:
+    """A check's output into this process's output (the push log), each line also to `collect` (and its
+    last lines to `keep`, for the tests gate: _gate)."""
     try:
         for raw in iter(stream.readline, b""):
             line = raw.decode(errors="replace")
             collect.feed(line)
+            if keep is not None:
+                keep.append(line)
             try:
                 sys.stdout.write(line)
                 sys.stdout.flush()
@@ -4269,17 +4287,20 @@ def pool_status_words(marker: Path) -> str:
     return f"; check waited {s:.0f} s for a test-pool slot" if s >= 1 else ""
 
 
-def _run_one(cmd: Any, repo: Path, env: dict, say: Callable[[str], None]) -> int:
+def _run_one(cmd: Any, repo: Path, env: dict, say: Callable[[str], None], seen: dict | None = None) -> int:
     """Run one push check: 0 when it passes, CHECKS_FAILED when it fails, BUSY when it exits 75 itself (busy: a
     lock, a test pool or a tests gate's rerun gave it no slot, so it judged nothing), when its check host
     could not run it (an environment fault, recorded as runner_wait records a missing runner) or its
-    test workers were lost again on its one rerun, each exiting cleanly (workerloss): the host too."""
+    test workers were lost again on its one rerun, each exiting cleanly (workerloss): the host too.
+    A pass or failure fills `seen` with the check's own exit code and its last output lines (the tests gate: _gate)."""
     if remote_host(cmd):
         say(f"running {cmd}{where(cmd)}")
     collect = workerloss.Collector()
+    kept: deque = deque(maxlen=GATE_LINES)
 
     def once() -> int:
         collect.reset()
+        kept.clear()
         sys.stdout.flush()
         sys.stderr.flush()
         waits = Path(tempfile.mkdtemp(prefix="check-waits-", dir=env.get("TTP_RUN_DIR") or None)).resolve()
@@ -4302,7 +4323,7 @@ def _run_one(cmd: Any, repo: Path, env: dict, say: Callable[[str], None]) -> int
             if mark:
                 mark.close()
             raise
-        reader = threading.Thread(target=_copy_out, args=(proc.stdout, collect), daemon=True)
+        reader = threading.Thread(target=_copy_out, args=(proc.stdout, collect, kept), daemon=True)
         reader.start()
         try:
             rc = _timed_wait(proc, waits, cmd, say)
@@ -4327,6 +4348,8 @@ def _run_one(cmd: Any, repo: Path, env: dict, say: Callable[[str], None]) -> int
     while True:
         rc = scriptwatch.rerun(once, bool, None if remote_host(cmd) else str(cmd), repo, env, say, on_pass=True)
         if rc == 0:
+            if seen is not None:
+                seen.update(rc=0, text="".join(kept))
             return 0
         if rc in (QUEUED, POOL_BUSY):   # it never ran, or waited for a full pool at its limit: not the change
             say(f"{'queued, not run' if rc == QUEUED else 'busy, not failed'}: {cmd}{where(cmd)}; not pushing. "
@@ -4357,6 +4380,8 @@ def _run_one(cmd: Any, repo: Path, env: dict, say: Callable[[str], None]) -> int
         time.sleep(syntaxfault.SETTLE_S)
         rc = scriptwatch.rerun(once, bool, str(cmd), repo, env, say, on_pass=True)
         if rc == 0:
+            if seen is not None:
+                seen.update(rc=0, text="".join(kept))
             return 0
         if rc in (QUEUED, POOL_BUSY):
             say(f"{'queued, not run' if rc == QUEUED else 'busy, not failed'}: {cmd}{where(cmd)}; not pushing. "
@@ -4383,7 +4408,102 @@ def _run_one(cmd: Any, repo: Path, env: dict, say: Callable[[str], None]) -> int
         say(f"busy, not failed: {cmd}{where(cmd)} exited 75 (no free slot, lock or pool); not pushing. Hand off "
             f"`waiting`; retry_when: test \"$(date +%s)\" -ge {int(time.time()) + QUEUED_RETRY_S}")
         return BUSY
+    if seen is not None:
+        seen.update(rc=rc, text="".join(kept))
     return CHECKS_FAILED
+
+
+def _gated(cmd: Any) -> bool:
+    """Whether the tests gate (_gate) may judge check `cmd`: a local check that is no Slurm batch and runs
+    pytest once (pushpass.resumable), or a script whose pytest runs are not known (no `"pytest"` key, no pytest
+    in its words): its output tells, and its reruns select by the select plugin in PYTEST_ADDOPTS."""
+    if remote_host(cmd) or getattr(cmd, "slurm", None):
+        return False
+    said = getattr(cmd, "pytest", None)
+    return pushpass.resumable(cmd) or (said is None and pytest_runs(cmd) == 0
+                                       and not any(w in cmd for w in pushpass._OWN_ENV))
+
+
+def _gate(cmd: Any, repo: Path, env: dict, say: Callable[[str], None], head: str, target: str, seen: dict,
+          p: Project | None = None) -> int:
+    """The base-vs-head tests gate for a push check that failed (`seen`: _run_one's exit code and output), as
+    the push queue's batch and `ttp checks` judge one (gatejudge.judge): its failing pytest ids
+    (gatejudge.judgeable) rerun once at `head`, those failing again once at its merge base with `target` (the
+    push target's tip), in a temp checkout on this same host. 0 when none is new on the head (each flaky,
+    quarantined, or pre-existing: failing the same way on the base), each named; BUSY when a rerun found no
+    slot; else CHECKS_FAILED, the failure as it was. A failing id matching delivery.push_hard_tests (the leak
+    scan) is never excused. `p` (else TTP_PROJECT): its settings, base results and quarantine."""
+    if p is None and (at := os.environ.get("TTP_PROJECT")):
+        p = Project(at)
+    if p is None or not p.exists() or not _gated(cmd):
+        return CHECKS_FAILED
+    cfg = p.config()
+    ids = gatejudge.judgeable(seen.get("rc"), seen.get("text") or "", cfg)
+    if not ids:
+        return CHECKS_FAILED
+    s, now, host_ = gatejudge.settings(cfg), time.time(), gatejudge.host()
+    r = _git(repo, "merge-base", target, head) if target else None
+    mb = r.stdout.strip() if r is not None and r.returncode == 0 else ""
+    diff = _git(repo, "diff", "--name-only", f"{mb}..{head}") if mb else None
+    changed = diff.stdout.split() if diff is not None and diff.returncode == 0 else None
+
+    def touched(i: str) -> bool:   # the change touches the test's file (unknown: it does)
+        f = i.partition("::")[0]
+        return changed is None or any(x == f or x.endswith("/" + f) for x in changed)
+
+    say(f"judging the {len(ids)} failing test(s) on {head[:10]}: a rerun there, then on the base "
+        f"{mb[:10] or '(none)'} the ones failing again, on this host: {' '.join(ids)}")
+
+    def run(at: str, sel: list[str]) -> tuple[int | None, str]:
+        tree = None
+        try:
+            where_ = repo
+            if at == "base":
+                tree = cleantree.Checkout(repo, mb, env.get("TTP_RUN_DIR") or None)
+                worktree.prepare(p, tree.path)
+                where_ = tree.path
+            got: dict = {}
+            rc = _run_one(cmd, Path(where_), {**env, "PWD": str(where_), **gatejudge.select_env(sel, env)}, say, got)
+            return (BUSY if rc == BUSY else got.get("rc")), got.get("text") or ""
+        except (cleantree.Error, OSError, subprocess.SubprocessError) as e:
+            say(f"the rerun on the {at} could not tell: {e}")
+            return None, ""
+        finally:
+            if tree is not None:
+                tree.close()
+    v = gatejudge.judge(ids, run, p.state, mb, host_, now, touched, s["busy_tries"], s["busy_wait_s"])
+    rx = (cfg.get("delivery") or {}).get("push_hard_tests") or batch.HARD_TESTS
+    hard = [i for i in v["pre_existing"] + v["quarantined"] if _hard(rx, i)]
+    for k in ("pre_existing", "quarantined"):
+        v[k] = [i for i in v[k] if i not in hard]
+    v["new"] = v["new"] + hard
+    for line in gatejudge.lines(v):
+        say(line)
+    if hard:
+        say(f"never excused (delivery.push_hard_tests): {' '.join(hard)}")
+    if v["flaky"] and s["on"]:
+        new = gatejudge.quarantine(p.state, v["flaky"], {"head": head, "check": str(cmd), "host": host_,
+                                                         "task": os.environ.get("TTP_TASK") or ""}, now, s["days"])
+        if new:   # one fix note per newly quarantined test
+            # pushq._event's row, written here: pushq imports push (and landed) at import time, and a
+            # sibling import inside a function on the push path is refused
+            p.db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+                   (time.time(), "daemon", gatejudge.EVENT, "normal",
+                    gatejudge.note_text(new, head, str(cmd))[:6000], "queued", None))
+    if gatejudge.blocks(v):
+        say(f"new on {head[:10]}, the failure stands: {' '.join(v['new'])}")
+        return CHECKS_FAILED
+    if gatejudge.undecided(v):
+        return BUSY
+    say(f"none of the failing tests is new on {head[:10]}: {cmd}{where(cmd)} does not block the push")
+    return 0
+
+
+def _hard(rx: str, test_id: str) -> bool:
+    try:
+        return bool(re.search(rx, test_id, re.I))
+    except (re.error, TypeError):
+        return bool(re.search(batch.HARD_TESTS, test_id, re.I))
 
 
 def run(p: Project, repo: Path, own: bool = False, recorded: dict | None = None, after: bool = True) -> int:

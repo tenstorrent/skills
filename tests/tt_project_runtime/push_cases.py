@@ -19648,3 +19648,90 @@ def test_the_daily_audit_shows_approval_to_landed_median_and_p90(env):
     p.db.x("DELETE FROM push_queue")
     assert not [x for x in audit.lines(p.db, now) if "approval to landed" in x]
 
+
+_GATE_CHECK = "python3 -m pytest -p no:cacheprovider -q tests/"
+_GATE_BASE = "def test_ok():\n    pass\n\n\ndef test_pre():\n    assert False, 'broken before'\n\n\ndef test_x():\n    pass\n"
+
+
+def _gate_push_setup(env, monkeypatch, tmp_path, head_body: str):
+    # The target `proj` has tests/test_gate.py with test_pre failing; the task branch `own` writes `head_body` there.
+    p, repo, origin, other = _push_setup(env, monkeypatch, [])
+    (tmp_path / "run").mkdir()
+    monkeypatch.setenv("TTP_RUN_DIR", str(tmp_path / "run"))
+    (repo / "tests").mkdir(exist_ok=True)
+    _commit(repo, "tests/test_gate.py", _GATE_BASE)
+    _git_out(repo, "push", "-q", "origin", "HEAD:refs/heads/proj")
+    base = _git_out(repo, "rev-parse", "HEAD")
+    _git_out(repo, "checkout", "-q", "-b", "own")
+    _commit(repo, "tests/test_gate.py", head_body)
+    return p, repo, base, _git_out(repo, "rev-parse", "HEAD")
+
+
+def test_push_own_pushes_past_a_test_failing_on_its_base_too_and_names_it_pre_existing(env, monkeypatch, tmp_path):
+    # Landing and spend: a failure on both base and head never blocks an own push; the excused id is named.
+    from ttp import gatejudge, push
+    p, repo, base, head = _gate_push_setup(env, monkeypatch, tmp_path, _GATE_BASE + "\n\ndef helper():\n    return 1\n")
+    said: list[str] = []
+    rc = push.publish(repo, "origin", "own", push.check_list([_GATE_CHECK]), say=said.append, base=base, p=p)
+    assert rc == 0, said
+    assert _git_out(repo, "rev-parse", "origin/own") == head
+    text = "\n".join(said)
+    assert "pre-existing on the base" in text and "tests/test_gate.py::test_pre" in text, text
+    assert "check failed" not in text and not gatejudge.active(p.state)
+
+
+def test_push_own_still_refuses_a_test_failing_only_on_its_head(env, monkeypatch, tmp_path):
+    from ttp import push
+    p, repo, base, head = _gate_push_setup(env, monkeypatch, tmp_path,
+                                           _GATE_BASE.replace("def test_x():\n    pass", "def test_x():\n    assert False"))
+    said: list[str] = []
+    rc = push.publish(repo, "origin", "own", push.check_list([_GATE_CHECK]), say=said.append, base=base, p=p)
+    assert rc == push.CHECKS_FAILED, said
+    text = "\n".join(said)
+    assert "new on" in text and "tests/test_gate.py::test_x" in text and "check failed on" in text, text
+    assert "tests/test_gate.py::test_pre" in text   # the pre-existing one is still named apart
+    assert subprocess.run(["git", "-C", str(repo), "rev-parse", "-q", "--verify", "origin/own"],
+                          capture_output=True).returncode != 0, "nothing pushed"
+
+
+def test_push_own_quarantines_a_test_that_passes_on_its_rerun_and_pushes(env, monkeypatch, tmp_path):
+    # Flaky: fails once, passes on the head rerun. Quarantined as the batch does, and the push goes.
+    from ttp import gatejudge, push
+    mark = tmp_path / "flaked"
+    body = ("import pathlib\n\n\ndef test_ok():\n    pass\n\n\ndef test_flaky():\n"
+            f"    m = pathlib.Path({str(mark)!r})\n    if not m.exists():\n        m.write_text('1')\n"
+            "        assert False, 'first run'\n")
+    p, repo, base, head = _gate_push_setup(env, monkeypatch, tmp_path, body)
+    said: list[str] = []
+    rc = push.publish(repo, "origin", "own", push.check_list([_GATE_CHECK]), say=said.append, base=base, p=p)
+    assert rc == 0, said
+    assert "tests/test_gate.py::test_flaky" in gatejudge.active(p.state)
+    assert any("flaky" in m for m in said)
+
+
+def test_a_direct_push_to_the_target_pushes_past_a_failure_its_tip_has_too(env, monkeypatch, tmp_path):
+    # _rounds (a direct `ttp push`): the base is the target's tip it rebased onto.
+    from ttp import push
+    p, repo, base, head = _gate_push_setup(env, monkeypatch, tmp_path, _GATE_BASE + "\n\ndef helper():\n    return 1\n")
+    said: list[str] = []
+    rc = push.push(repo, "origin", "proj", push.check_list([_GATE_CHECK]), 1, say=said.append)
+    assert rc == 0, said
+    assert _git_out(repo, "rev-parse", "origin/proj") == head
+    assert any("pre-existing on the base" in m and "test_pre" in m for m in said), said
+
+
+def test_push_own_never_excuses_a_leak_scan_failure_its_base_has_too(env, monkeypatch, tmp_path):
+    # delivery.push_hard_tests (default: the leak scan) blocks even when the base fails it the same way.
+    from ttp import push
+    body = _GATE_BASE.replace("test_pre", "test_leak_scan")
+    p, repo, base, head = _gate_push_setup(env, monkeypatch, tmp_path, body)
+    _git_out(repo, "checkout", "-q", "proj" if False else base)
+    _commit(repo, "tests/test_gate.py", body)
+    _git_out(repo, "push", "-q", "origin", "HEAD:refs/heads/proj")
+    base = _git_out(repo, "rev-parse", "HEAD")
+    _git_out(repo, "checkout", "-q", "-B", "own")
+    _commit(repo, "tests/test_gate.py", body + "\n\ndef helper():\n    return 1\n")
+    said: list[str] = []
+    rc = push.publish(repo, "origin", "own", push.check_list([_GATE_CHECK]), say=said.append, base=base, p=p)
+    assert rc == push.CHECKS_FAILED, said
+    assert any("never excused" in m and "test_leak_scan" in m for m in said), said
