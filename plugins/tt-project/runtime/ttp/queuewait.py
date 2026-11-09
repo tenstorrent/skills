@@ -16,9 +16,9 @@ A wait whose cause an open task already owns (an active throughput-class mute's 
 item on the same queue was acted on with) folds into it: one act per queue cause, not per waiting task.
 The coordinator acts in that turn (mustact.acted: a config_set, a task_add or task_update naming the item's
 key or updating the task, or a reply or notify naming the key and the safety rule that holds it). Not acted
-on, it is raised again (fingerprint per mark) only once the wait has doubled since its last raise: one wake per
-state change (a new queue or task is a new episode, raised at its own first mark), never one per change of its
-holders or occupancy, which the unread item's text follows instead. With no option left the user is told once. Once the wait ends its open events are settled. daily_line() is the daily review's metric.
+on, a later threshold mark raises it again (fingerprint per mark), only once what it says changed (its
+holders, cap or options: sig()) or REPEAT_MARKS marks after its last raise. With no option left the user is told
+once. Once the wait ends its open events are settled. daily_line() is the daily review's metric.
 Each event's data carries `fold` (FOLD): the parts the coordinator's NEW EVENTS joins into one line per queue."""
 from __future__ import annotations
 
@@ -35,6 +35,7 @@ DEFAULT_MIN = 30.0
 HIST_KEEP_S = 7 * 86400.0
 HIST_MAX = 300
 MAX_RAISE = 3   # new items per scan, so a long queue never floods the coordinator with wakes
+REPEAT_MARKS = 4   # an unchanged, unacted wait is raised again at most every this many marks
 FOLD = "fold"   # in event data: {"group", "item", "ctx", "opts"} (coordinator.fold_events)
 NAMES = {"checks": "checks queue", "push": "push queue", "workers": "worker slots", "device": "device queue",
          "lock": "lock", "pool": "outside batch pool", "cpu": "CPU admission"}
@@ -315,15 +316,14 @@ def scan(p, cfg: dict, now: float | None = None, host: dict | None = None, devic
         if _cause_owner(db, st, w, now) is not None:
             continue   # one act per queue cause: its fix is already owned; raised again once that owner ends
         said = sig(w, opts)
-        waited = rec.get("waited", int(rec.get("mark") or 0) * thr or None)   # a record from before: its mark
-        if waited is not None and now - w["since"] < 2 * float(waited):
-            continue   # raised before: again only once the wait doubled, not per holder or occupancy change
+        if rec.get("sig") == said and mark - int(rec.get("mark") or 0) < REPEAT_MARKS:
+            continue   # raised before and nothing it says changed: no new wake for the same words
         data = {"must_act": {"key": k, "chat": "all", "tasks": [w["task"]], "kind": KIND, "episode": ep},
                 FOLD: fold(w, opts, now, spill_note(sp, cfg))}
         fp = f"{KIND}:{ep}:{mark}"
         if len(raised) < MAX_RAISE and obligations._raise(db, now, fp, KIND, msg, w["task"], data):
             raised.append(fp)   # the longest waits first; the rest at a later scan
-            rec.update(sig=said, mark=mark, waited=now - w["since"])
+            rec.update(sig=said, mark=mark)
         if not opts and ep not in told:
             told.append(ep)
             msgparts.post(db, f"#{w['task']} has waited {(now - w['since']) / 60:.0f} min on the "
