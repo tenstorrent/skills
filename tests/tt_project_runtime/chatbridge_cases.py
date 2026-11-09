@@ -3107,6 +3107,46 @@ def test_one_model_bench_per_host_and_day_and_every_project_reads_the_owners_res
     assert owner["project"] == "proj-a" and owner["last_result"] == now
 
 
+def test_the_model_bench_grades_right_answers_padded_with_whitespace_as_right(env, monkeypatch):
+    """Review #33: a right answer with a trailing newline or surrounding spaces passes every cell."""
+    from ttp import modelbench
+    cfg, calls, ask, lister = _bench_env(env, monkeypatch, ["m-a"])
+    pads = ["\n{}\n", "  {}  ", "{}\n", "\t{} \n", "\n\n{}", " {}\r\n"]
+    padded = lambda model, prompt: pads[len(calls) % len(pads)].format(ask(model, prompt))
+    padded_order = lambda model, prompt: (" apple ,\nfig , pear\n" if "Sort these" in prompt else padded(model, prompt))
+    rec = modelbench.run("proj-a", cfg, {}, _local(10, 3), lister=lister, ask=padded_order)
+    assert rec["results"]["m-a"]["score"] == 1.0 and rec["weak"] == [] and modelbench.models()["m-a"]["weak"] is False
+
+
+def test_an_endpoint_fault_makes_a_bench_inconclusive_and_never_weak(env, monkeypatch):
+    """Review #33: a rate limit (or any endpoint fault) says nothing about the model: inconclusive, its last
+    verdict kept, benched again next run, never parked."""
+    import urllib.error
+    from ttp import modelbench, modelrank
+    cfg, calls, ask, lister = _bench_env(env, monkeypatch, ["m-a", "m-b", "m-c"])
+    p = make(env)
+
+    def limited(model, prompt):
+        if model == "m-b":
+            raise OSError("HTTP Error 429")
+        if model == "m-c" and "17 * 23" in prompt:
+            raise urllib.error.URLError("timed out")
+        return ask(model, prompt)
+    now = _local(10, 3)
+    rec = modelbench.run("proj-a", cfg, {}, now, lister=lister, ask=limited)
+    assert rec["weak"] == [] and rec["inconclusive"] == ["m-b", "m-c"] and rec["results"]["m-b"]["faults"] == 6
+    assert rec["results"]["m-c"]["inconclusive"] is True and rec["results"]["m-a"]["inconclusive"] is False
+    assert set(modelbench.models()) == {"m-a"}                       # no entry written for the faulted models
+    for m in ("m-b", "m-c"):
+        assert modelbench.verdict(m, 0, now + 60) != "weak" and not modelrank.parked(p.db, m, now + 60)
+    # The next run benches them again; a model already seen keeps its old entry through a fault.
+    again = modelbench.run("proj-a", cfg, {}, _local(11, 3), lister=lister, ask=ask)
+    assert set(again["arms"]) >= {"m-b", "m-c"} and again["inconclusive"] == []
+    before = modelbench.models()["m-b"]
+    third = modelbench.run("proj-a", cfg, {}, _local(12, 3), lister=lister, ask=limited)
+    assert "m-b" in third["inconclusive"] and modelbench.models()["m-b"] == before
+
+
 def test_the_model_bench_runs_daily_and_skips_without_a_working_key_reporting_once(env, monkeypatch):
     from ttp import endpoint, modelbench
     cfg, calls, ask, lister = _bench_env(env, monkeypatch, ["m-a", "m-b", "m-c", "m-d", "m-e", "m-new"], weak={"m-b"})
