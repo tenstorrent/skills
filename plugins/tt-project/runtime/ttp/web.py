@@ -14,7 +14,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from . import alerts, awake, chatgone
+from . import alerts, awake, chatgone, configwho
 from . import budget as bud
 from . import globalcap as gcap
 from . import coordinator as coord
@@ -1021,8 +1021,8 @@ def bind(daemon, port: int | None = None) -> ThreadingHTTPServer:
         if not cfg.get("web", {}).get("port"):
             try:
                 p.set_config("web.port", port, by={"by": "default", "via": "web"})
-            except RuntimeError:
-                pass   # project.json unreadable with no last good copy: serve on this port without saving it
+            except (RuntimeError, configwho.Protected):
+                pass   # project.json unreadable with no last good copy, or an owner set a falsy web.port: serve on this port without saving it
     token(p)
     handler = type("Handler", (Handler,), {"daemon_ref": daemon})   # this server's own project, not the last one bound
     httpd = ThreadingHTTPServer((cfg.get("web", {}).get("bind", "127.0.0.1"), port), handler)

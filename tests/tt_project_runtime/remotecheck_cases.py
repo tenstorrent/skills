@@ -60,14 +60,14 @@ def _rc_repo(tmp_path, big=False):
     return repo
 
 
-def _rc_run(tmp_path, repo, cmd, host="box1", env=None, wait=True, commit="", **fake):
+def _rc_run(tmp_path, repo, cmd, host="box1", env=None, wait=True, commit="", literal=None, **fake):
     """remotecheck run as callers run it (push.check_argv's argv) in `repo` against the fake ssh:
     (exit code, output); with wait=False the Popen."""
     from ttp import remotecheck
     bin_, remote = _rc_fake_ssh(tmp_path)
     penv = {**os.environ, "PATH": f"{bin_}{os.pathsep}{os.environ['PATH']}", "FAKE_REMOTE_TMP": str(remote), **fake}
-    proc = subprocess.Popen(remotecheck.argv(cmd, host, env, commit), cwd=repo, env=penv, stdout=subprocess.PIPE,
-                            stderr=subprocess.STDOUT, text=True)
+    proc = subprocess.Popen(remotecheck.argv(cmd, host, env, commit, literal=literal), cwd=repo, env=penv,
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     if not wait:
         return proc
     out = proc.communicate(timeout=60)[0]
@@ -441,7 +441,7 @@ def test_check_host_settings_are_validated_and_local_keeps_a_check_here():
 
 
 def _spill_setup(env, tmp_path, monkeypatch, hosts, charter=("check-host-a", "check-host-b", "down")):
-    """A checks repo whose project allows `charter` (charter text and machines list), spills to `hosts`
+    """A checks repo whose machines list has `charter` (also written as charter text, which no gate reads), spills to `hosts`
     after 0.3 s, has one checks lane, and the fake ssh on PATH reporting an idle host."""
     from ttp import checkspill, machines
     p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
@@ -501,14 +501,13 @@ def test_busy_checks_spill_to_the_first_reachable_allowed_host_and_name_it(env, 
 
 
 def test_spill_skips_hosts_that_are_not_allowed_busy_or_down_and_keeps_waiting_here(env, tmp_path, monkeypatch):
-    """No listed host can take the run (not in the charter, not in the machines list, paused, unreachable,
-    every slot busy): the run says why for each, keeps its place and runs here once the lane frees."""
+    """No listed host can take the run (not in the machines list, paused, unreachable, every slot busy):
+    the run says why for each, keeps its place and runs here once the lane frees."""
     import threading
     from ttp import checklane, checkspill, cli, db as dbm, machines
     p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch,
-                                        ["outside", "unlisted", "check-host-c", "down", "check-host-a"],
+                                        ["unlisted", "check-host-c", "down", "check-host-a"],
                                         charter=("check-host-a", "check-host-c", "down", "unlisted"))
-    machines.add("outside")
     machines.remove("unlisted")
     p.db.set_kv(dbm.PAUSED_RESOURCES_KEY, {"check-host-c": {"reason": "user hold", "by": "user", "since": 1}})
     # Remote checks from other machines fill check-host-a: as many as its cores hold (checklane.host_slots).
@@ -523,7 +522,7 @@ def test_spill_skips_hosts_that_are_not_allowed_busy_or_down_and_keeps_waiting_h
     rec = json.loads((run / "checks.json").read_text())
     assert rec["passed"] is True and "spilled_to" not in rec and "hosts" not in rec, rec
     text = (run / "checks.log").read_text()
-    for why in ("outside (not named in the charter)", "unlisted (not in the machines list",
+    for why in ("unlisted (not in the machines list",
                 "check-host-c (paused: user hold)", "down (ssh cannot reach it", "check-host-a (its "):
         assert why in text, (why, text)
     assert "/ttp-check." not in log.read_text(), "it ran here"
@@ -1308,8 +1307,7 @@ def test_no_spill_hosts_keeps_todays_wait_and_unspillable_checks_never_spill(env
 def test_the_account_pool_spills_every_project_after_its_own_list_and_an_empty_own_list_keeps_it_here(
         env, tmp_path, monkeypatch):
     """checks.spill_hosts in the account settings: a project with no list of its own spills to the pool,
-    which needs no charter line (the account setting is the user's word for every project) but still the
-    machines list; a narrower own list is tried first, then the pool; an own [] keeps every run here."""
+    which needs the machines list; a narrower own list is tried first, then the pool; an own [] keeps every run here."""
     from ttp import checkspill, cli, machines, project
     p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, [], charter=())
     p.raw_config()
@@ -1321,7 +1319,7 @@ def test_the_account_pool_spills_every_project_after_its_own_list_and_an_empty_o
     machines.add("pool-b")
     assert checkspill.hosts(p.config()) == ["pool-a", "pool-b"]
     assert checkspill.allowed(p, p.config(), "pool-a").startswith("not in the machines list")
-    assert checkspill.allowed(p, p.config(), "pool-b") == "", "the pool needs no charter line"
+    assert checkspill.allowed(p, p.config(), "pool-b") == "", "the pool alone allows it"
     log = tmp_path / "where.log"
     p.set_config("delivery.push_checks", [f"pwd >> {log}"])
     lane = _spill_lane(p, repo)
@@ -1333,11 +1331,11 @@ def test_the_account_pool_spills_every_project_after_its_own_list_and_an_empty_o
     assert rec["passed"] is True and rec["spilled_to"] == "pool-b", rec
     text = (run / "checks.log").read_text()
     assert "pool-a (not in the machines list" in text and "checks.spill_hosts, the account's pool" in text, text
-    # A narrower own list goes first and the pool follows it; outside the pool the charter still decides.
+    # A narrower own list goes first and the pool follows it; the own list alone allows its hosts.
     p.set_config("delivery.checks_spill_hosts", ["check-host-a", "pool-b"])
     assert checkspill.hosts(p.config()) == ["check-host-a", "pool-b", "pool-a"]
     machines.add("check-host-a")
-    assert checkspill.allowed(p, p.config(), "check-host-a") == "not named in the charter"
+    assert checkspill.allowed(p, p.config(), "check-host-a") == ""
     assert checkspill._source(p.config(), "pool-b") == "delivery.checks_spill_hosts"
     # An own empty list opts out of the pool; a malformed own list spills nowhere.
     p.set_config("delivery.checks_spill_hosts", [])
@@ -1346,6 +1344,51 @@ def test_the_account_pool_spills_every_project_after_its_own_list_and_an_empty_o
         assert checkspill.hosts({"delivery": {"checks_spill_hosts": bad}}) == [], bad
     project.set_account_setting(checkspill.ACCOUNT_KEY, "pool-a")   # malformed pool: none
     assert checkspill.account_hosts() == [] and checkspill.hosts({}) == []
+
+
+def test_spill_gate_reads_only_structured_settings_never_charter_wording(env, tmp_path, monkeypatch):
+    """allowed() decides from delivery.checks_spill_hosts and the account's pool, never the charter: a listed
+    host with no charter line is allowed, a host the charter names but no setting lists is refused with the
+    setting to add it to, and the user's pauses still keep a listed host off."""
+    from ttp import checkspill, db as dbm, machines
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a"], charter=())
+    machines.add("check-host-a")
+    machines.add("named-only")
+    p.charter_path.write_text("# Charter\n## Resources\n- named-only, NAMED-ONLY: a check host\n")
+    assert checkspill.allowed(p, p.config(), "check-host-a") == "", "the setting alone allows it"
+    why = checkspill.allowed(p, p.config(), "named-only")
+    assert why.startswith("not a spill host of this project") and "charter" not in why, why
+    assert f"ttp config {p.name} delivery.checks_spill_hosts '[\"check-host-a\", \"named-only\"]'" in why, why
+    assert "named-only" not in checkspill.hosts(p.config())
+    # A user hold or pause still keeps a listed host off.
+    p.db.set_kv(dbm.PAUSED_RESOURCES_KEY, {"check-host-a": {"reason": "user hold", "by": "user", "since": 1}})
+    assert checkspill.allowed(p, p.config(), "check-host-a") == "paused: user hold"
+
+
+def test_a_machines_list_checks_tag_admits_no_spill_host(env, tmp_path, monkeypatch):
+    """Any run may tag a machine (`ttp machines add <alias> --tags checks`), so no tag widens spill hosts:
+    a host tagged `checks` in neither the project's list nor the account's pool is neither tried nor allowed."""
+    from ttp import checkspill, machines
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a"], charter=())
+    machines.add("check-host-a")
+    machines.add("tagged-host", tags=["x86", "checks"])
+    machines.add("tagged-upper", tags="CHECKS,x86")
+    assert checkspill.hosts(p.config()) == ["check-host-a"]
+    for host in ("tagged-host", "tagged-upper"):
+        why = checkspill.allowed(p, p.config(), host)
+        assert why.startswith("not a spill host of this project") and "delivery.checks_spill_hosts" in why, why
+
+
+def test_spill_hosts_accepted_through_the_charter_before_stay_allowed_without_it(env, tmp_path, monkeypatch):
+    """Upgrade: every host the old charter-matching gate accepted was already in the project's own list or
+    the account's pool (only hosts() is tried), so with the charter line gone it stays allowed and the
+    project's settings are left as they were: no seed is needed."""
+    from ttp import checkspill
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a", "check-host-b"])
+    before = p.config()["delivery"]["checks_spill_hosts"]
+    p.charter_path.write_text("# Charter\n")
+    assert [checkspill.allowed(p, p.config(), h) for h in checkspill.hosts(p.config())] == ["", ""]
+    assert p.config()["delivery"]["checks_spill_hosts"] == before
 
 
 def test_ttp_config_account_sets_the_spill_pool_validated_and_a_run_may_only_clear_it(env, capsys, monkeypatch):
@@ -1444,8 +1487,8 @@ def test_a_wrapped_check_kept_here_says_its_wrapper_keeps_it_and_names_the_setti
 
 
 def test_busy_checks_spill_to_one_host_of_a_machine_with_several_hosts(env, tmp_path, monkeypatch):
-    """A spill host `alias:host` is one host of machine `alias`: it is allowed when the machine is (machines
-    list, charter, no pause of the machine or of the host), ssh reaches the host, and the run, its claim and
+    """A spill host `alias:host` is one host of machine `alias`: it is allowed when listed (the project's
+    list or the pool), its machine is in the machines list, and neither is paused, ssh reaches the host, and the run, its claim and
     checks.json name the host. A plain alias reads as before; an unknown machine is not in the list."""
     from ttp import checkspill, cli, db as dbm, machines
     p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["cluster-a:host-b"], charter=("cluster-a",))
@@ -1456,7 +1499,7 @@ def test_busy_checks_spill_to_one_host_of_a_machine_with_several_hosts(env, tmp_
     assert checkspill.allowed(p, cfg, "cluster-a:host-b") == ""
     assert checkspill.allowed(p, cfg, "cluster-x:host-b").startswith("not in the machines list")
     machines.add("cluster-c")
-    assert checkspill.allowed(p, cfg, "cluster-c:host-b") == "not named in the charter"
+    assert checkspill.allowed(p, cfg, "cluster-c:host-b").startswith("not a spill host of this project")
     for n in ("host-b", "cluster-a"):
         p.db.set_kv(dbm.PAUSED_RESOURCES_KEY, {n: {"reason": "held", "by": "user", "since": 1}})
         assert checkspill.allowed(p, cfg, "cluster-a:host-b") == "paused: held", n
@@ -3090,3 +3133,176 @@ def test_the_same_import_failing_on_every_spill_host_is_one_config_fault_told_on
         assert got is not None
     finally:
         got and got.close()
+
+
+def test_a_spilled_checks_fixed_n_is_lowered_to_the_hosts_worker_grant(tmp_path):
+    """On a spill host a pytest check's fixed `-n N` above the grant checkspill.workers_env sends is
+    lowered to it; with no grant the command runs as written."""
+    from ttp import checkspill
+    repo = _rc_repo(tmp_path)
+    for literal, want in ((checkspill.workers_env(2), "pytest -n 2 -q"), (None, "pytest -n 8 -q")):
+        rc, out = _rc_run(tmp_path, repo, "echo pytest -n 8 -q", host="check-host-a", literal=literal)
+        assert rc == 0 and want in out.splitlines(), out
+        assert ("lowered to -n 2" in out) == bool(literal), out
+
+
+def test_spill_run_sends_what_may_spill_to_a_spill_host_and_records_why_a_run_stays_here(env, tmp_path,
+                                                                                      monkeypatch, capsys):
+    """checkspill.spill_run (the push batch's and an after-landing suite's way out): a pytest check
+    spills with its worker grant and remembers the check it came from, an agent CLI check stays here;
+    spill first off, a host list kept off or no host free keeps the run here, and `ttp checks status`
+    says why until the next spill clears it."""
+    from ttp import checkspill, cli, push, testslots
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a"])
+    said = []
+    cmds = push.check_list(["pytest -q tests", "claude plugin validate . --strict"])
+    claim, out = checkspill.spill_run(p, p.config(), cmds, said.append, "batch 1 checks")
+    try:
+        assert claim is not None and claim.host == "check-host-a", said
+        assert push.remote_host(out[0]) == "check-host-a" and out[0].was is cmds[0]
+        assert testslots.HELD_ENV in dict(out[0].literal_env or ()), out[0]
+        assert not push.remote_host(out[1]), "an agent CLI check never leaves the project host"
+    finally:
+        claim.close()
+    assert checkspill.here_lines(p.name) == []
+    p.set_config("delivery.checks_spill_first", False)
+    assert checkspill.spill_run(p, p.config(), cmds, said.append, "batch 2 checks") == (None, cmds)
+    assert any("spill first is off" in ln and "(batch 2 checks)" in ln for ln in checkspill.here_lines(p.name))
+    p.set_config("delivery.checks_spill_first", True)
+    assert checkspill.spill_run(p, p.config(), cmds, said.append, "batch 3", off="1")[0] is None
+    assert any("kept off every spill host" in ln for ln in checkspill.here_lines(p.name))
+    p.set_config("delivery.checks_spill_hosts", ["down"])
+    assert checkspill.spill_run(p, p.config(), cmds, said.append, "batch 4")[0] is None
+    lines = checkspill.here_lines(p.name)
+    assert len(lines) == 1 and "no spill host could take them" in lines[0], lines
+    monkeypatch.chdir(repo)
+    capsys.readouterr()
+    for args in (["checks", "status"], ["checks", "status", "--json"]):
+        with pytest.raises(SystemExit) as e:
+            cli.main(args)
+        assert e.value.code == 0
+    text, js = capsys.readouterr().out.split("\n{", 1)
+    assert lines[0] in text, text
+    assert "no spill host could take them" in json.loads("{" + js)["here"][0]["why"]
+    p.set_config("delivery.checks_spill_hosts", ["check-host-a"])
+    claim, _ = checkspill.spill_run(p, p.config(), cmds, said.append, "batch 5")
+    claim.close()
+    assert checkspill.here_lines(p.name) == [], "a run that spilled has no reason to show here"
+
+
+def _spill_batch(env, tmp_path, monkeypatch, cmd):
+    """A push queue project (_pq) whose batch checks may spill to the one allowed host check-host-a."""
+    from ttp import checkspill, machines
+    s = _pq(env, monkeypatch)
+    monkeypatch.setattr(checkspill, "_PROBE", checkspill._PROBE.replace("cut -d' ' -f1 /proc/loadavg", "echo 0"))
+    s.p.charter_path.write_text("# Charter\n## Resources\n- check-host-a: a check host\n")
+    machines.add("check-host-a")
+    s.p.set_config("delivery.push_checks", [cmd])
+    s.p.set_config("delivery.checks_spill_hosts", ["check-host-a"])
+    bin_, remote = _rc_fake_ssh(tmp_path)
+    monkeypatch.setenv("PATH", f"{bin_}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("FAKE_REMOTE_TMP", str(remote))
+    return s
+
+
+@pytest.mark.parametrize("fault", [False, True])
+def test_a_push_batch_spills_its_checks_first_and_a_spill_host_fault_reruns_them_here(env, tmp_path, monkeypatch,
+                                                                                        fault):
+    """delivery.checks_spill_first: the push batch's suite goes to a spill host before the project host,
+    under a claim freed after; a spill host's fault (the link drops twice) keeps that host off and the
+    check runs here, and the batch still pushes."""
+    from ttp import batch, checkspill, push, pushq
+    log = tmp_path / "where.log"
+    s = _spill_batch(env, tmp_path, monkeypatch, f"pwd >> {log}")
+    if fault:
+        monkeypatch.setenv("FAKE_SSH_DROP", str(log))
+    monkeypatch.setattr(pushq, "batch_argv", lambda marker: [sys.executable, "-c", "pass"])
+    _pq_hand_off(env, s)
+    bid = _pq_batch(s)
+    marker = pathlib.Path(s.p.db.one("SELECT marker FROM push_batches WHERE id=?", (bid,))["marker"])
+    monkeypatch.setattr(sys, "stdin", io.StringIO(""))
+    monkeypatch.setenv("TTP_RUN_DIR", push._read(marker)["check_report_dir"])
+    assert batch.run_batch(s.p, marker) == 0
+    assert push._read(marker)["outcome"] == "pushed", push._read(marker)
+    where = log.read_text().splitlines()
+    assert where and "/ttp-check." in where[0], where
+    if fault:
+        assert len(where) == 3 and "/ttp-check." not in where[-1], where
+    else:
+        assert len(where) == 1, where
+    assert checkspill.holders(s.p.name) == [], "the claim ends with the batch"
+
+
+
+@pytest.mark.parametrize("kind", ["pre_existing", "flaky"])
+def test_a_spilled_push_batch_suite_is_judged_as_its_local_original(env, tmp_path, monkeypatch, kind):
+    """A spilled suite's failing test reruns here at the head, then on the tip, as the local check's do
+    (Batch._judged): one failing on the tip too is pre-existing and one passing on its rerun is flaky
+    (quarantined); neither blocks the batch."""
+    from ttp import batch, push, pushq
+    count = tmp_path / "runs.txt"
+    body = "assert False" if kind == "pre_existing" else (
+        f"import pathlib\n    c = pathlib.Path({str(count)!r})\n    n = len(c.read_text()) if c.exists() else 0\n"
+        "    c.write_text('x' * (n + 1))\n    assert n")
+    s = _spill_batch(env, tmp_path, monkeypatch, "python3 -m pytest -q -p no:cacheprovider test_g.py")
+    (s.other / "test_g.py").write_text(f"def test_g():\n    {body}\n")
+    _git_out(s.other, "add", "test_g.py")
+    _git_out(s.other, "-c", "user.email=t@example.com", "-c", "user.name=t", "commit", "-qm", "g")
+    _git_out(s.other, "push", "-q", "origin", "HEAD:proj")
+    monkeypatch.setattr(pushq, "batch_argv", lambda marker: [sys.executable, "-c", "pass"])
+    _pq_hand_off(env, s)
+    marker = pathlib.Path(s.p.db.one("SELECT marker FROM push_batches WHERE id=?", (_pq_batch(s),))["marker"])
+    monkeypatch.setattr(sys, "stdin", io.StringIO(""))
+    monkeypatch.setenv("TTP_RUN_DIR", push._read(marker)["check_report_dir"])
+    assert batch.run_batch(s.p, marker) == 0
+    m = push._read(marker)
+    assert m["outcome"] == "pushed", m
+    [got] = m[{"flaky": "flaky_tests"}.get(kind, kind)]
+    assert got["ids"] == ["test_g.py::test_g"], got
+    if kind == "flaky":
+        assert count.read_text() == "xx", "the spilled run failed it and its one rerun here passed"
+
+
+
+def test_a_spilled_push_batch_check_reruns_only_here_with_its_selection(env, tmp_path, monkeypatch):
+    """Only a check's first full run spills: every rerun after it (the judge's, the search's split probe:
+    _ids_check) runs here, as its local original, with its selection env (_run_ids)."""
+    from ttp import batch, push, pushq
+    log = tmp_path / "where.log"
+    s = _spill_batch(env, tmp_path, monkeypatch, f'echo "$(pwd) ${{TTP_PYTEST_SELECT:-none}}" >> {log}; '
+                                                 "python3 -m pytest -q -p no:cacheprovider")
+    (s.other / "test_ok.py").write_text("def test_ok():\n    pass\n")
+    _git_out(s.other, "add", "test_ok.py")
+    _git_out(s.other, "-c", "user.email=t@example.com", "-c", "user.name=t", "commit", "-qm", "ok")
+    _git_out(s.other, "push", "-q", "origin", "HEAD:proj")
+    monkeypatch.setattr(pushq, "batch_argv", lambda marker: [sys.executable, "-c", "pass"])
+    _pq_hand_off(env, s)
+    code, path, branch = _code_task(s.p, "bad")
+    _commit(path, "test_g.py", "def test_g():\n    assert False\n")
+    review = s.p.db.add_task("review bad", "r", kind="review", tier="standard", origin="coordinator",
+                             depends_on=[code])
+    _pq_hand_off(env, s, task=review, push=[{"branch": branch, "head": _git_out(path, "rev-parse", "HEAD")}])
+    marker = pathlib.Path(s.p.db.one("SELECT marker FROM push_batches WHERE id=?", (_pq_batch(s),))["marker"])
+    monkeypatch.setattr(sys, "stdin", io.StringIO(""))
+    monkeypatch.setenv("TTP_RUN_DIR", push._read(marker)["check_report_dir"])
+    batch.run_batch(s.p, marker)
+    m = push._read(marker)
+    assert m["checks"].get("id_probes"), m
+    lines = log.read_text().splitlines()
+    first = next(n for n, ln in enumerate(lines) if "/ttp-check." in ln)
+    spilled = [ln for ln in lines if "/ttp-check." in ln]
+    assert len(spilled) == 2 and all(ln.endswith(" none") for ln in spilled), lines   # the two full runs only
+    reruns = [ln for ln in lines[first + 1:] if not ln.endswith(" none")]
+    assert len(reruns) >= 3, lines   # the judge's at the head and on the tip, the split probe's at entry 1
+    assert all("/ttp-check." not in ln and "test_g" in ln.split(" ", 1)[1] for ln in reruns), lines
+
+
+def test_push_hard_tests_is_a_known_delivery_key_the_batch_reads():
+    """delivery.push_hard_tests sets which failing tests a batch never excuses as the tip's own."""
+    from ttp import batch, project
+    assert project.unknown_key_hint("delivery.push_hard_tests") is None
+    b = batch.Batch.__new__(batch.Batch)
+    b.d = {}
+    assert b._hard("tests/x.py::test_no_leak_in_docs") and not b._hard("tests/x.py::test_other")
+    b.d = {"push_hard_tests": r"::test_other$"}
+    assert b._hard("tests/x.py::test_other") and not b._hard("tests/x.py::test_no_leak_in_docs")

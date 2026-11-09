@@ -643,3 +643,22 @@ def test_a_cut_off_codex_run_with_sub_agents_books_its_own_thread_and_theirs_onc
         "type": "turn.completed", "usage": {"input_tokens": 300_000, "cached_input_tokens": 0,
                                             "output_tokens": 1_000}}], started)
     assert done["cost_usd"] == pytest.approx(0.3 + 0.002 + sub), dict(done)
+
+
+def test_a_resumed_runs_delta_shows_only_triaged_chat_and_none_when_chat_is_off(env):
+    """A resumed worker sees only handled inbound chat (as coordsession.chat_lines), never a user message the
+    coordinator has not triaged; worker_chat_chars 0 leaves the chat section out, as disk_block does."""
+    from ttp import ctxfork
+    p = make(env)
+    since = time.time() - 600
+    for text, handled in (("a triaged order", 1), ("an untriaged order", 0)):
+        p.db.x("INSERT INTO messages(ts,direction,chat,kind,text,handled) VALUES(?,?,?,?,?,?)",
+               (time.time() - 60, "in", "web", "user", text, handled))
+    p.db.x("INSERT INTO messages(ts,direction,chat,kind,text,handled) VALUES(?,?,?,?,?,1)",
+           (time.time() - 30, "out", "web", "reply", "on it"))
+    got = ctxfork.delta_block(p, {}, since)
+    assert "a triaged order" in got and "on it" in got and "an untriaged order" not in got
+    assert "left out" not in got
+    off = ctxfork.delta_block(p, {"coordinator": {"session": {"worker_chat_chars": 0}}}, since)
+    assert "### Chat since then" not in off and "a triaged order" not in off
+    assert "### Order ledger" in off

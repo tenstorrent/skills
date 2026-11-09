@@ -41,7 +41,9 @@ from . import ackwait
 from . import claimcheck
 from . import dispatchguard
 from . import runclass
+from . import configwho
 from . import sidefx
+from . import looks
 from . import cursorhook
 from . import pausegone
 from . import usersite
@@ -94,6 +96,7 @@ from . import probespawn
 from . import probevars
 from . import urgent
 from . import eventhold
+from . import waketriage
 from . import convgate
 from . import unstarted
 from . import boundedchild
@@ -260,6 +263,7 @@ from .project import (
     disk_resume_gb,
     durable_append,
     durable_write,
+    write_json,
     open_append,
     git_fsync_env,
     file_tail,
@@ -348,6 +352,16 @@ STEP_SLOW_EVERY_S = 3600
 # coordinator (Daemon._step_incident), raised once per incident.
 STEP_INCIDENT_N = 3
 STEP_INCIDENT_WINDOW_S = 600
+# A tick step over its budget DEGRADE_AFTER of its last DEGRADE_WINDOW runs sits out DEGRADE_TICKS ticks
+# (_step_degrade), only if it is in DEGRADE_OK: an allowlist of steps that only observe, report or are a
+# backstop that finds the same items on its next pass, so skipping them a few ticks loses nothing. Every
+# other step (reaping, pushes, spend meters, dispatch, turn starts, delivery, and any new step) always
+# runs, slow or not. kv DEGRADE_KV holds the steps whose degrade was reported: one ride-along event per
+# condition, raised again only after DEGRADE_WINDOW clean runs in a row; it never forces a turn.
+DEGRADE_WINDOW, DEGRADE_AFTER, DEGRADE_TICKS = 10, 3, 10
+DEGRADE_OK = frozenset({"blocker_sweep", "sweep_unreviewed"})
+DEGRADE_KV = "degraded_steps"
+STEP_STUCK_N = 3   # a tick step stopped at its budget on the same item this often in a row: one tick_step_stuck event
 WATCHER_MAX_S = HEARTBEAT_STALE_S - 60   # a command watcher's timeout_s is capped here, well below WATCHDOG_S
 # Schedule runs go on off the tick (schedrun); a tick waits this long for them, so quick ones are recorded
 # in the tick that started them and a slow one never holds it.
@@ -384,6 +398,22 @@ def precheck_run_id(out: Path) -> str:
     so labels built from it (checkcap.label) name the folder, as checklane.open_precheck reads them."""
     return f"precheck-{Path(out).name}"
 PRECHECK_HOLD_S, PRECHECK_KEEP_S = 3600, 7 * 86400
+
+
+def precheck_holds(state: Path, task: dict, now: float) -> bool:
+    """Review `task` waits for the checks the daemon started on its head (Daemon._precheck) while they
+    run, at most PRECHECK_HOLD_S after they started. Read-only: files under `state` only, so the
+    overseer reads the same hold (Daemon._precheck_holds)."""
+    if task["kind"] != "review":
+        return False
+    name = next((x[len(PRECHECK_LABEL):] for x in push._labels(task) if x.startswith(PRECHECK_LABEL)), "")
+    if not name or "/" in name:
+        return False
+    from .cli import CHECKS_RC, _checks_alive, _read_checks_pid
+    out = Path(state) / PRECHECKS_DIR / name
+    info = _read_checks_pid(out)
+    return (not (out / CHECKS_RC).exists() and _checks_alive(info)
+            and now - float(info.get("ts") or 0) < PRECHECK_HOLD_S)
 # A failed review with fix specs gets its fix and re-review from the daemon this many rounds per stack
 # (review.auto_fix_rounds, unset or unreadable): one, so a failed re-review (a third round) goes to the
 # coordinator as one review_nofix event instead of being queued; the re-review repeats the failed
@@ -395,20 +425,6 @@ FIX_BASE_LABEL = "fix_base:"   # a re-review: fix_base:<the head its failed revi
 REVIEW_CHECK_LINE = ("Check that it does what its spec asks, is correct, keeps the charter's restrictions, and "
                      "that its tests fail without it.")
 INHERITED_COMMITS_MAX = 10   # commits per task an auto review's spec lists, as the queue's refusal does
-
-
-# A link a review's spec gives outside GitHub (which `gh` reads): the review may need to open it.
-_WEB_LINK = re.compile(r"https?://(?!(?:api\.)?github\.com\b)[\w.-]+", re.I)
-
-
-def web_needed(role: str, task: dict | None) -> bool:
-    """Whether a worker run gets the web tools (where the agent can take them away). Every kind of
-    task but a review does: workers looked up third-party docs and APIs in code and question tasks.
-    A review checks a diff and its tests (no review used the web in 14 days, ~1,300 runs), so it
-    gets them only when its spec links a page outside GitHub. The no_internet restriction wins."""
-    if role != "reviewer" and (task or {}).get("kind") != "review":
-        return True
-    return bool(_WEB_LINK.search(f"{(task or {}).get('title') or ''}\n{(task or {}).get('spec') or ''}"))
 
 
 def task_env(tid) -> dict[str, str]:
@@ -606,6 +622,11 @@ STALL_KEY = "stall"   # kv: {"run": the last worker run when a stall was raised}
 # kv: run id -> {pid, started, lean} of a reap in progress (Daemon._reap_mark). One an earlier daemon
 # left was cut off (a hang the watchdog restarted, a kill): reaped once more lean, then quarantined.
 REAP_KEY = "reaping"
+# In a coordinator run's dir: the action index its reap is applying ("on") and how often a reap was cut off
+# on each action ("cuts"; Daemon._coord_journal). The finish transaction commits the turn whole, so a cut-off
+# reap applied nothing; the next one applies the turn again, skipping an action cut off COORD_CUT_SKIP times.
+COORD_JOURNAL = "apply.json"
+COORD_CUT_SKIP = 2
 dbmod.DICT_KV.add(REAP_KEY)
 REAP_CHECKS_WINDOW_S = 7 * 86400   # reap_waiting_checks looks at the runs started this recently
 STALL_SETTLE_S = 600   # after a daemon start, dispatch gets this long before a stall is raised
@@ -684,6 +705,7 @@ UNREVIEWED_MAX_AGE_H = 72      # review.unreviewed_max_age_h: tasks last updated
 UNREVIEWED_GRACE_S = 120       # a task updated more recently than this is still settling
 UNREVIEWED_WAIT_S = 1800.0     # review.unreviewed_wait_s: an external wait (a busy lock too) this long gets its head reviewed
 UNREVIEWED_PASS_S = 20         # the pass stops looking after this long, so the tick stays short
+UNREVIEWED_BACKLOG_EVERY_S = 100   # after a cut pass that queued a review (a backlog): the next pass this soon
 KV_UNREVIEWED_COUNTED = "unreviewed_counted"   # kv: the runtime version whose first sweep logged its count
 PUSH_REFS_EVERY_S = 600   # how often the push queue's pins (refs/ttp/push/<id>) of settled rows are pruned
 
@@ -1161,9 +1183,14 @@ class Daemon:
         self._sandbox_due = 0.0   # sweep_sandbox_trees: its first pass is at start
         self._step_cursor: dict[str, object] = {}   # step -> the last item done before its budget ran out
         self._step_at: dict[str, object] = {}   # step -> the _resume_order item it is on now
+        self._overseer_kicked = 0.0   # when check_overseer last started the overseer
         self._step_slow_said: dict[str, float] = {}   # step -> when its last tick_step_slow was raised
         self._step_overruns: dict[str, dict] = {}   # step -> its recent overruns and slowest call (_step_incident)
         self._step_incident_said: dict[str, float] = {}   # step -> when its last tick_step_incident was raised
+        self._overruns: dict[str, list[bool]] = {}   # step -> over its budget, its last DEGRADE_WINDOW runs
+        self._degraded: dict[str, int] = {}   # step -> ticks it still sits out
+        self._degrade_said: dict[str, float] | None = None   # kv DEGRADE_KV, read once: step -> when reported
+        self._step_stuck: dict[str, tuple[str, int]] = {}   # step -> (item it was stopped on, times in a row)
         self._overrun: dict | None = None   # the running or last tick that passed TICK_OVERRUN_S or stalled
         self._last_prune = 0.0
         self._last_leftovers = 0.0   # when prune_leftovers last ran
@@ -1178,6 +1205,7 @@ class Daemon:
         self._review_swept = 0.0     # when sweep_reviews last ran
         self._unreviewed_swept = 0.0   # when sweep_unreviewed last ran
         self._unreviewed_at = 0   # the task sweep_unreviewed stopped at (time or budget): the next pass resumes after it
+        self._unreviewed_every = float(REVIEW_SWEEP_EVERY_S)   # until its next pass (UNREVIEWED_BACKLOG_EVERY_S on a backlog)
         self._continues_checked = 0.0   # when check_unqueued_continues last ran
         self._stale_checked = 0.0   # when check_stale_duplicates last ran
         self._queue_trimmed = 0.0   # when expire_queue last ran
@@ -1772,6 +1800,9 @@ class Daemon:
         if self.stopping:   # a stop skips the tick's remaining steps; each is its own transaction
             self._stop_skipped.append(name)
             return default
+        if self._degraded.get(name):   # it kept overrunning: it sits out a few ticks (_step_degrade)
+            self._degraded[name] -= 1
+            return default
         self._step_name = name
         self._step_began = self._step_mark = time.monotonic()
         self._step_holder, self._step_task, self._step_worst = "", None, (0.0, "", None)
@@ -1790,6 +1821,10 @@ class Daemon:
             if name in self._step_at:
                 self._step_cursor[name] = self._step_at[name]
             log(self.p, f"tick step {name} stopped at its budget ({e})")
+            try:
+                self._step_stuck_on(name)
+            except Exception:
+                log(self.p, "tick step stuck record error: " + traceback.format_exc().replace("\n", " | ")[:2000])
         except StopRequested as e:   # a stop ended it at a safe point: the next daemon picks it up
             log(self.p, f"stop: tick step {name} ended at a safe point ({e})")
         except Exception as e:  # one bad step must not stop the rest of the tick
@@ -1802,6 +1837,7 @@ class Daemon:
                 except Exception:
                     log(self.p, "tick step alert error: " + traceback.format_exc().replace("\n", " | ")[:2000])
         else:
+            self._step_stuck.pop(name, None)
             if self._step_fails.pop(name, None):
                 try:
                     self._clear_step(name)
@@ -1809,6 +1845,7 @@ class Daemon:
                     log(self.p, "tick step clear error: " + traceback.format_exc().replace("\n", " | ")[:2000])
         try:
             self._step_slow(name)
+            self._step_degrade(name)
         except Exception:
             log(self.p, "tick step slow error: " + traceback.format_exc().replace("\n", " | ")[:2000])
         self._step_holder, self._step_began = "", None
@@ -1830,6 +1867,21 @@ class Daemon:
         self._step_holder, self._step_task, self._step_mark = holder, task, t
         return self._stopping or (self._step_began is not None and t - self._step_began >= self._step_budget())
 
+    def _step_stuck_on(self, name: str) -> None:
+        """Step `name` was stopped at its budget: one handled tick_step_stuck event naming the item when
+        that was the same item STEP_STUCK_N times in a row (each such run of stops raises it once)."""
+        item = self._step_holder or ""
+        was, n = self._step_stuck.get(name, ("", 0))
+        n = n + 1 if item and item == was else 1
+        self._step_stuck[name] = (item, n)
+        if n != STEP_STUCK_N:
+            return
+        text = (f"Daemon tick step {name} was stopped at its budget ({self._step_budget():g} s) on {item} "
+                f"{n} times in a row.")
+        log(self.p, text)
+        self.p.db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+                    (time.time(), "daemon", "tick_step_stuck", "normal", text[:500], "handled", self._step_task))
+
     def _step_charge(self, t: float) -> None:
         if self._step_holder and t - self._step_mark > self._step_worst[0]:
             self._step_worst = (t - self._step_mark, self._step_holder, self._step_task)
@@ -1839,6 +1891,49 @@ class Daemon:
         at = self._step_cursor.pop(step, 0)
         rows = sorted(rows, key=lambda r: r["id"])
         return _Resumable([r for r in rows if r["id"] > at] + [r for r in rows if r["id"] <= at], self._step_at, step)
+
+    def _step_degrade(self, name: str) -> None:
+        """Degrade a DEGRADE_OK step that keeps overrunning: one at a time, it sits out DEGRADE_TICKS ticks.
+        Once per condition (kv DEGRADE_KV, so a restart does not raise it again) it is one overseer incident
+        with this daemon's stacks and one low ride-along event (pagesev.RIDE_ALONG) that joins the next
+        coordinator turn and starts none. DEGRADE_WINDOW clean runs in a row end the condition."""
+        took = 0.0 if self._step_began is None else time.monotonic() - self._step_began
+        runs = self._overruns[name] = (self._overruns.get(name, []) + [took >= self._step_budget()])[-DEGRADE_WINDOW:]
+        if name not in DEGRADE_OK:
+            return
+        if self._degrade_said is None:
+            said = self.p.db.kv(DEGRADE_KV, {})
+            self._degrade_said = said if isinstance(said, dict) else {}
+        if len(runs) == DEGRADE_WINDOW and not any(runs):
+            if self._degrade_said.pop(name, None) is not None:   # it recovered: a new degrade is reported again
+                self.p.db.set_kv(DEGRADE_KV, self._degrade_said)
+            return
+        if sum(runs) < DEGRADE_AFTER or any(self._degraded.values()):
+            return
+        self._degraded[name] = DEGRADE_TICKS
+        counts = {k: sum(v) for k, v in self._overruns.items() if sum(v)}
+        self._overruns[name] = []
+        why = (f"tick step {name} ran past its {self._step_budget():g} s budget in {counts[name]} of its last "
+               f"{DEGRADE_WINDOW} runs: it sits out the next {DEGRADE_TICKS} ticks")
+        log(self.p, why)
+        if name in self._degrade_said:
+            return
+        now = time.time()
+        stacks = self.p.logs / f"degraded-{name}-{int(now)}.txt"
+        stacks.parent.mkdir(parents=True, exist_ok=True)
+        durable_write(stacks, "\n".join(f"Thread {t}:\n" + "".join(traceback.format_stack(fr))
+                                         for t, fr in sys._current_frames().items()))
+        from .overseer import INCIDENTS_FILE
+        durable_append(self.p.state / INCIDENTS_FILE, json.dumps(
+            {"at": now, "why": why, "step": name, "overruns": counts, "stacks": str(stacks)}) + "\n")
+        self._degrade_said[name] = now
+        db = self.p.db
+        with db.tx():
+            db.set_kv(DEGRADE_KV, self._degrade_said)
+            db.x("INSERT INTO events(ts,source,kind,severity,text,status,data) VALUES(?,?,?,?,?,?,?)",
+                 (now, "daemon", "tick_step_degraded", "low",
+                  f"Degraded: {why}. Overruns per step: {counts}. Stacks: {stacks}. Fix the step or change "
+                  f"its budget.", "queued", json.dumps({pagesev.RIDE_ALONG: True, "step": name})))
 
     def _step_slow(self, name: str) -> None:
         """One handled tick_step_slow event when step `name` ran past STEP_BUDGET_S, naming the item that
@@ -1966,7 +2061,7 @@ class Daemon:
                      self.sweep_alerts, self.check_release, self.sync_shared_pauses, self.check_pause_ends,
                      self.check_integrity, self.heal_harness_git,
                      self.sync_schedules, self.lint_charter, self.tend_holds, self.record_ttr, self.alert_long_pause,
-                     self.check_linger, self.check_notifier, self.alert_slurm_paused, self.check_gh_auth, self.check_chats,
+                     self.check_linger, self.check_notifier, self.check_overseer, self.alert_slurm_paused, self.check_gh_auth, self.check_chats,
                      self.probe_mcp):
             if step in lease_off:
                 continue
@@ -1993,6 +2088,7 @@ class Daemon:
         self._run_step(self.watch_cli_versions)
         self._run_step(self.reap_locks)
         self._run_step(self.reap_task_records)
+        self._run_step(lambda: configwho.watch(self.p), "config_breakage")   # a config change that broke the checks
         settling = self._run_step(self.settling, default=False)
         core = self.cfg.get("core_provider") or "claude"
         core_held = self._run_step(lambda: self.net_held(core) and not self._net_may_probe(core), "net_held", default=False)
@@ -2018,6 +2114,7 @@ class Daemon:
                 self.check_checks_owner,
                 self.reap_leftover_checks,
                 self.check_checks_stall,
+                self.check_gate_time,
                 self.check_cap_wait,
                 self.check_progress,
                 self.check_churn,
@@ -3183,7 +3280,7 @@ class Daemon:
         argv, env = prov.build(role=role, model=model, effort=effort, cwd=cwd, budget_usd=budget_usd,
                                read_only=read_only, schema=schema, restrictions=restrictions,
                                disallowed_tools=denied, denied_reads=no_reads,
-                               web=role == "coordinator" or web_needed(role, task))
+                               web=True)   # every kind, reviews too (user msg #2302); no_internet still wins
         # The write fence counts only on the user's own word since runs went unsandboxed (sandboxstate): a
         # leftover true is ignored and told to the coordinator once, never rewritten in project.json.
         fence_on, fence_why, superseded = sandboxstate.fence(self.p, self.cfg, provider)
@@ -3873,7 +3970,11 @@ class Daemon:
                 alive = self._run_alive(r)
                 exit_file = self._run_dir(r) / "exit.json"
                 if exit_file.exists():
-                    self._reap(r, _read_result(exit_file) or {"rc": -1, "stopped": "lost", "ended": time.time()})
+                    info = _read_result(exit_file) or {"rc": -1, "stopped": "lost", "ended": time.time()}
+                    # A coordinator answer is applied whole in one go: the step budget never cuts it off
+                    # (its finish transaction rolls back whole, so a cut-off one would start over each tick).
+                    with stepclock.critical() if r["role"] == "coordinator" else contextlib.nullcontext():
+                        self._reap(r, info)
                 elif not alive:
                     self._end_orphan(r)
                     self._reap(r, {"rc": -1, "stopped": "lost", "ended": self._last_sign_of_life(r), "orphan": True})
@@ -3907,6 +4008,10 @@ class Daemon:
             self.finish_run(r, exit_info)
         except StopRequested:   # rolled back at a safe point, not cut off: the next daemon reaps it in full
             self._reap_unmark(r["id"])
+            self._coord_journal_off(r)
+            raise
+        except Exception:   # a reap error, not a cut-off: no action is blamed for it
+            self._coord_journal_off(r)
             raise
         finally:
             self._lean_reap = False
@@ -3920,8 +4025,8 @@ class Daemon:
         marks = db.kv(REAP_KEY) or {}
         was = marks.get(str(r["id"])) or {}
         mine = was and int(was.get("pid") or 0) == me["pid"] and was.get("started") == me["started"]
-        if was and not mine and was.get("lean"):
-            return "quarantine"
+        if was and not mine and was.get("lean") and self._coord_journal_read(r).get("on") is None:
+            return "quarantine"   # a coordinator run cut off inside its actions retries (_coord_journal)
         lean = bool(was.get("lean")) if mine else bool(was)
         db.set_kv(REAP_KEY, {**marks, str(r["id"]): {**me, "lean": lean, "at": time.time()}})
         if lean and not mine:
@@ -3940,6 +4045,51 @@ class Daemon:
         if was is not None:
             self.p.db.set_kv(REAP_KEY, marks)
         return bool((was or {}).get("lean"))
+
+    def _coord_answered(self, r: dict) -> bool:
+        """Coordinator run r exited 0 (its exit.json), so it ended with its answer."""
+        try:
+            return (_read_result(self._run_dir(r) / "exit.json") or {}).get("rc") == 0
+        except Exception:
+            return False
+
+    def _coord_journal_read(self, r: dict) -> dict:
+        if r.get("role", "coordinator") != "coordinator":
+            return {}
+        j = _read_result(self._run_dir(r) / COORD_JOURNAL) or {}
+        return j if isinstance(j.get("on"), int) or j.get("on") is None else {}
+
+    def _coord_journal(self, r: dict):
+        """For coordinator run r's coord.apply: the action indexes to skip, and the on_action callback that
+        writes the index applied now to its run dir's COORD_JOURNAL. An "on" left there by an earlier reap
+        means it was cut off on that action (a hang restart, a kill): counted, and an action cut off
+        COORD_CUT_SKIP times is skipped, so a turn whose one action hangs still applies all the others once.
+        A run with no run dir on disk keeps no journal: the reap never creates one."""
+        path = self._run_dir(r) / COORD_JOURNAL
+        if not path.parent.is_dir():
+            return set(), None
+        j = self._coord_journal_read(r)
+        cuts = {str(k): int(v) for k, v in (j.get("cuts") or {}).items() if str(v).isdigit()}
+        if j.get("on") is not None:
+            cuts[str(j["on"])] = cuts.get(str(j["on"]), 0) + 1
+            log(self.p, f"coordinator run {r['id']}: an earlier reap was cut off on action {j['on']} "
+                        f"({cuts[str(j['on'])]} time(s)); applying the turn again")
+        state = {"on": None, "cuts": cuts}
+
+        def on_action(i: int | None) -> None:
+            state["on"] = i
+            write_json(path, state)
+
+        on_action(None)
+        return {int(k) for k, n in cuts.items() if n >= COORD_CUT_SKIP}, on_action
+
+    def _coord_journal_off(self, r: dict) -> None:
+        """A reap that ended without a cut-off (an error, a stop at a safe point) blames no action."""
+        try:
+            if (j := self._coord_journal_read(r)).get("on") is not None:
+                write_json(self._run_dir(r) / COORD_JOURNAL, {**j, "on": None})
+        except Exception:
+            log(self.p, f"run {r['id']}: clearing its apply journal failed\n" + traceback.format_exc())
 
     def _quarantine_run(self, r: dict, how: str) -> None:
         """A run whose reap was cut off and whose lean retry failed too: closed by _abandon_run instead of
@@ -4162,6 +4312,21 @@ class Daemon:
                        f"({bad.get('backend')}: {str(bad.get('error'))[:160]}). Alerts still reach this chat and "
                        f"the web app. `ttp notifier test` on {hostname()} shows the fix.", severity="normal")
 
+    def check_overseer(self, now: float | None = None) -> str | None:
+        """The loop's half of the mutual check: start the overseer (ttp.overseer) again when its heartbeat
+        is older than overseer.STALE_S, at most once per STALE_S, only where a service keeps this daemon
+        (a test or a hand-run daemon starts none). The overseer's own service restarts it when it dies."""
+        from . import overseer, service
+        now = time.time() if now is None else now
+        age = overseer.heartbeat_age(self.p, now)
+        if (age is not None and age <= overseer.STALE_S) or now - self._overseer_kicked < overseer.STALE_S \
+                or not service.installed(self.p):
+            return None
+        self._overseer_kicked = now
+        how = service.ensure_overseer(self.p)
+        log(self.p, f"overseer heartbeat {'missing' if age is None else f'{age:.0f} s old'}: {how}")
+        return how
+
     def alert_slurm_paused(self) -> None:
         """One alert per trip of the Slurm checks overflow's start-failure breaker (slurmcheck.alert_due: the
         first project daemon to see the trip sends it); it clears once the user sets checks.slurm_overflow again."""
@@ -4322,6 +4487,19 @@ class Daemon:
                     self._reap_errors.pop(r["id"], None)
                     return
                 db.x("UPDATE runs SET status='failed', ended=? WHERE id=?", (now, r["id"]))
+                if answered := (r.get("role") == "coordinator" and self._coord_answered(r)):
+                    # It ended with its answer: a reap fault, not a loop, so never runaway waste (budget.wasted).
+                    try:
+                        note = json.loads(cur["note"] or "{}")
+                    except ValueError:
+                        note = {}
+                    note = note if isinstance(note, dict) else {}
+                    db.x("UPDATE runs SET note=? WHERE id=?",
+                         (json.dumps({**note, "not_waste": "coordinator answered; its reap failed"}), r["id"]))
+                    db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+                         (now, "daemon", "coordinator_reap_failed", "normal",
+                          f"Coordinator run {r['id']} answered (exit 0) but processing its answer failed: {why}"[:500],
+                          "handled", None))
                 cost = cur["cost_usd"] or 0
                 if cost:
                     db.spend(r["provider"], cost, source, account=r["account"] or "",
@@ -4336,7 +4514,8 @@ class Daemon:
                          (now, f"task:{r['task']}", "task_failed", "normal", f"#{r['task']}: {why}", "queued",
                           r["task"]))
             self._reap_errors.pop(r["id"], None)
-            log(self.p, f"run {r['id']} abandoned after repeated reap errors")
+            log(self.p, f"run {r['id']} abandoned after repeated reap errors"
+                        + (" (coordinator answered: not counted as waste)" if answered else ""))
         except Exception:
             log(self.p, f"run {r['id']} could not be abandoned: " + traceback.format_exc().replace("\n", " | ")[:2000])
 
@@ -5565,9 +5744,18 @@ class Daemon:
             claimcheck.prerun(self.p, actions, self._probe_env())
         except Exception:
             log(self.p, "claimcheck: claim probes not run\n" + traceback.format_exc())
-        problems = coord.apply(self.p, actions, default_chat=default_chat, user_turn=coord.user_turn(db, note.get("messages") or []),
-                               turn=r.get("id"), messages=note.get("messages") or [], lean=self._lean_reap,
-                               applied=applied)
+        skip, on_action = self._coord_journal(r)
+        try:
+            problems = coord.apply(self.p, actions, default_chat=default_chat,
+                                   user_turn=coord.user_turn(db, note.get("messages") or []),
+                                   turn=r.get("id"), messages=note.get("messages") or [], lean=self._lean_reap,
+                                   applied=applied, skip_actions=skip, on_action=on_action)
+        except (Exception, gitmemo.GitMiss, StopRequested):
+            # The live daemon left the apply (a round rolled back on a git miss, a stop, an error): no cut-off.
+            # Only a reap the process died in leaves "on" set for the next reap to count.
+            if on_action is not None:
+                on_action(None)
+            raise
         chaincap.clear_notices(db, float(r.get("started") or 0))   # this turn's digest showed them
         ids = note.get("messages", [])
         problems = list(problems)
@@ -5727,8 +5915,9 @@ class Daemon:
         return ctx
 
     def _compaction(self, r: dict) -> dict | None:
-        """{"pre_tokens": the size before} when the run's agent compacted its session (Claude's
-        stream-json `compact_boundary` and its compact_metadata; 0: not given), else None."""
+        """{"pre_tokens": the size before, "post_tokens": its history right after} when the run's agent
+        compacted its session (Claude's stream-json `compact_boundary` and its compact_metadata; 0: not
+        given), else None."""
         try:
             with open(self._run_dir(r) / "output.jsonl", "rb") as f:
                 lines = [line for line in f if b'"compact_boundary"' in line]
@@ -5739,9 +5928,11 @@ class Daemon:
         try:
             meta = json.loads(lines[0]).get("compact_metadata") or {}
             pre = meta.get("pre_tokens") or meta.get("preTokens")
+            post = meta.get("post_tokens") or meta.get("postTokens")
         except (ValueError, AttributeError):
-            pre = None
-        return {"pre_tokens": pre if isinstance(pre, int) and not isinstance(pre, bool) and pre > 0 else 0}
+            pre = post = None
+        ok = lambda v: v if isinstance(v, int) and not isinstance(v, bool) and v > 0 else 0
+        return {"pre_tokens": ok(pre), "post_tokens": ok(post)}
 
     def _compacted(self, r: dict) -> bool:
         """The agent compacted the run's session history (Claude's stream-json `compact_boundary`)."""
@@ -8299,6 +8490,13 @@ class Daemon:
             except Exception as e:   # nor must the machine ledger
                 log(self.p, f"quiet outage lines failed: {type(e).__name__}: {e}")
             try:
+                changes = configwho.review_lines(self.p)
+                if changes:
+                    spec += ("\n\nConfig changes not made by the user (last 24 h; refusals included; undo any "
+                             "that is wrong):\n" + "\n".join(f"- {line}" for line in changes))
+            except Exception as e:   # nor must the config log
+                log(self.p, f"config change lines failed: {type(e).__name__}: {e}")
+            try:
                 from . import hostload
                 spec += ("\n\nCheck runs per host now, with this host's load (hostload; an overloaded host "
                          "with no spill host taking runs needs runs moved off it):\n"
@@ -9438,6 +9636,17 @@ class Daemon:
             if h["stop"] and (r := checklane.stop_finished(self.p, h)):
                 log(self.p, r["text"])
 
+    def check_gate_time(self, every_s: float = 600, now: float | None = None) -> None:
+        """Model-free: once a day while the median of the project's last push check runs is over
+        checks.smoke_max_s, one `gate_slow` observation to its coordinator (gatetime.flag)."""
+        now = time.time() if now is None else now
+        if now - getattr(self, "_gate_time_checked", 0.0) < every_s:
+            return
+        self._gate_time_checked = now
+        from . import gatetime
+        if text := gatetime.flag(self.p.db, self.p.state, self.cfg, self.p.state / "pushes", now):
+            log(self.p, text[:300])
+
     def check_checks_stall(self, every_s: float = 60, now: float | None = None, cpu=None) -> None:
         """Model-free: a running `ttp checks` whose log has not grown for its stall threshold
         (checkstall.stall_s) raises one `checks_stalled` event per stall and marks its run folder; it is
@@ -10015,6 +10224,12 @@ class Daemon:
         log(self.p, f"task {tid} start_when stale: released once by the blocker sweep")
 
     def maybe_coordinate(self) -> None:
+        # The tick loop and the overseer's wake (overseer.wake) both start turns: one at a time.
+        with looks.start_lock(self.p.state) as mine:
+            if mine:
+                self._maybe_coordinate()
+
+    def _maybe_coordinate(self) -> None:
         if not self.lease_held():
             return
         db, c = self.p.db, self.cfg["coordinator"]
@@ -10023,6 +10238,8 @@ class Daemon:
         now = time.time()
         if now < float(db.kv("coordinator_backoff_until", 0)):
             return
+        # Due looks the coordinator set itself (looks.py); a look whose check exits 0 is skipped.
+        fire = looks.screen(db, self.p.base, looks.due(db, now), now) if looks.pending(db) else []
         msgs = db.q("SELECT id, ts, chat FROM messages WHERE direction='in' AND handled=0 ORDER BY id")
         queued = db.q("SELECT id, ts, kind, severity, task, source, data FROM events WHERE status='queued' ORDER BY id")
         # A failed resume of the persistent session (coordsession.py) reruns its batch at once: no hold or gate.
@@ -10066,7 +10283,9 @@ class Daemon:
             self._plain_done_held(evs, now, unsized[1])
         if not msgs and len(rides) + len(held) == len(evs) and (
                 not rides or now - min(e["ts"] for e in rides) < pagesev.RIDE_ALONG_MAX_S):
-            if coord.rejection_due(db, now):
+            if fire:
+                w, wake = {"due": "look"}, db.kv("idle_wake", {}) or {}
+            elif coord.rejection_due(db, now):
                 # A rejection no turn carried in coord.REJECTION_WAIT_S starts one, so none is dropped.
                 w, wake = {"due": coord.REJECTION_DUE}, db.kv("idle_wake", {}) or {}
             else:
@@ -10094,7 +10313,7 @@ class Daemon:
                 return
             if not msgs and not rerun and not urgent and self._event_hold(own, now):
                 return
-        if not msgs and not rerun:
+        if not msgs and not rerun and not fire:
             try:
                 # Every open task held by what no turn lifts, and nothing new since the last turn: a
                 # routine batch or wake is settled without a model run (quietgate.py).
@@ -10140,6 +10359,17 @@ class Daemon:
             except Exception:   # the gate only saves money: a failure runs the turn
                 log(self.p, "coordinator turn gate failed: " + traceback.format_exc().replace("\n", " | ")[:1500])
                 seen_now = {}
+        triage = [e for e in evs if not pagesev.rides_along(e)]
+        if triage and not msgs and not rerun and w is None and waketriage.on(self.cfg) and \
+                eventhold.can_wait(triage):
+            try:   # the watcher model decides whether this routine batch needs the coordinator now
+                folded, line = waketriage.fold(db, self.cfg, triage, now)
+            except Exception:   # the triage only saves money: a failure runs the turn
+                folded, line = False, "coordinator wake triage failed: " + traceback.format_exc().replace("\n", " | ")[:1500]
+            if line:
+                log(self.p, line)
+            if folded:
+                return
         hour_turns = db.one("SELECT COUNT(*) n FROM runs WHERE role='coordinator' AND started>?", (now - 3600,))["n"]
         if hour_turns >= int(c.get("max_turns_per_hour", 30)) and not msgs:
             return
@@ -10189,10 +10419,12 @@ class Daemon:
             must = mustact.block(db, [e["id"] for e in evs])
             parts = ([(mustact.SECTION, must)] if must else []) + parts
             parts += [(slowcomplaint.SECTION, speed)] if speed else []
+            seen_looks = [("looks", looks.digest(fire, lambda t: timefmt.short(t, self.p)))] if fire else []
+            parts += seen_looks
             prompt = "\n".join(text for _, text in parts)
             # A session wake may send only what changed.
             full = (([(mustact.SECTION, must)] if must else []) + coord.split_cached(whole)[1]
-                    + ([(slowcomplaint.SECTION, speed)] if speed else []))
+                    + ([(slowcomplaint.SECTION, speed)] if speed else []) + seen_looks)
             session_digest = {"parts": parts, "full": full, "seen": coordsession.fingerprint(baseline),
                               "shown": coordsession.fingerprint(shown)}
             head, context = coord.prompt_parts(self.p)
@@ -10212,6 +10444,7 @@ class Daemon:
                                  **({"carried": carried} if carried else {}),
                                  **({"corrections": {str(k): v for k, v in flagged.items()}} if flagged else {}),
                                  **({"wake_due": due} if due else {}),
+                                 **({"looks": [x["id"] for x in fire]} if fire else {}),
                                  "digest": {**coord.digest_size(parts), "cached_chars": len(cached)}, **({"gate": seen_now} if seen_now else {}),
                                  **({"burst": burst} if burst else {})})
         except Exception as e:
@@ -10220,6 +10453,7 @@ class Daemon:
             self._coordinator_failed(f"could not start: {type(e).__name__}: {e}"[:250])
             return
         db.set_kv("last_coordinator_turn", now)
+        looks.settle(db, [x["id"] for x in fire], "woken", rid, now)
         quietgate.started(db)
         bursthold.started(db, evs, rid, now)
         db.set_kv(coord.EFFORT_SEEN_KEY, seen)
@@ -10268,7 +10502,15 @@ class Daemon:
         no ready task to fill it."""
         try:
             row = self.p.db.one("SELECT MAX(ended) t FROM runs WHERE role='coordinator'")
-            end = eventhold.until(self.cfg, [], evs, row["t"] if row else None, now)
+            last_end = row["t"] if row else None
+            gap = eventhold.gap_until(self.cfg, evs, last_end, now)
+            if gap is not None:   # the wake gap: a free slot does not end it (dispatch fills slots model-free)
+                if self.p.db.kv("wake_gap_logged") != [e["id"] for e in evs]:
+                    self.p.db.set_kv("wake_gap_logged", [e["id"] for e in evs])
+                    log(self.p, f"coordinator wake held for the wake gap: events {[e['id'] for e in evs]} "
+                        f"share one turn in {int(gap - now)} s")
+                return True
+            end = eventhold.until(self.cfg, [], evs, last_end, now)
             if end is None:
                 return False
             busy, slots = self._worker_slots()
@@ -15376,7 +15618,7 @@ class Daemon:
                 fp = False
             if fp:
                 return "unclear", ("the checks were a fast-path pass (docs/data-only diff; the project's checks did "
-                                   "not run); run `ttp checks --full`")
+                                   "not run); run `ttp checks --fresh`")
             return "unclear", ("the checked commit is no longer the head of its worktree and branch, or it is not clean, "
                                "or its checks were a harness qualification (`ttp checks --purpose harness`)")
         return "pass", r, run_dir, with_waiting_followups(on_pass, full), head
@@ -16437,14 +16679,15 @@ class Daemon:
         head its PR carries, a push branch no push can reach, a landing `ttp landed` records). At most
         review.unreviewed_per_pass reviews per pass, only tasks updated within
         review.unreviewed_max_age_h, and one head gets one review (_auto_review's own check).
-        Every REVIEW_SWEEP_EVERY_S from the tick, and at once (`force`) in the blocker sweep's data
-        pass; returns the tasks it queued a review for. The first pass after an upgrade (a runtime version
+        Every REVIEW_SWEEP_EVERY_S from the tick (UNREVIEWED_BACKLOG_EVERY_S after a pass cut short that
+        queued a review: a backlog drains at more than two reviews per five minutes), and at once (`force`)
+        in the blocker sweep's data pass; returns the tasks it queued a review for. The first pass after an upgrade (a runtime version
         it has not counted for: KV_UNREVIEWED_COUNTED) also logs how many done code tasks in the window
         have no landing, push-queue entry or superseded record, so a backlog of finished changes shows."""
         now = time.time()
-        if not force and now - self._unreviewed_swept < REVIEW_SWEEP_EVERY_S:
+        if not force and now - self._unreviewed_swept < self._unreviewed_every:
             return []
-        self._unreviewed_swept = now
+        self._unreviewed_swept, self._unreviewed_every = now, float(REVIEW_SWEEP_EVERY_S)
         cfg, db, done = self.cfg, self.p.db, []
         rules, d = cfg.get("review") or {}, cfg.get("delivery") or {}
         try:
@@ -16491,6 +16734,8 @@ class Daemon:
             if len(done) - hot >= cap and not urgent.is_urgent(t) or last is not None and (
                     time.time() - now > UNREVIEWED_PASS_S or stepclock.over()):   # each pass gets one task further
                 self._unreviewed_at = at if last is None else last
+                if done:   # cut with more to look at after queuing one: a backlog, so look again sooner
+                    self._unreviewed_every = float(UNREVIEWED_BACKLOG_EVERY_S)
                 break
             last = self._unreviewed_at = t["id"]   # kept if the step is stopped mid-task
             try:
@@ -17212,16 +17457,7 @@ class Daemon:
     def _precheck_holds(self, task: dict, now: float) -> bool:
         """A review waits for the checks the daemon started on its head (_precheck) while they run,
         at most PRECHECK_HOLD_S after they started: the reviewer then reads their result at once."""
-        if task["kind"] != "review":
-            return False
-        name = next((x[len(PRECHECK_LABEL):] for x in push._labels(task) if x.startswith(PRECHECK_LABEL)), "")
-        if not name or "/" in name:
-            return False
-        from .cli import CHECKS_RC, _checks_alive, _read_checks_pid
-        out = self.p.state / PRECHECKS_DIR / name
-        info = _read_checks_pid(out)
-        return (not (out / CHECKS_RC).exists() and _checks_alive(info)
-                and now - float(info.get("ts") or 0) < PRECHECK_HOLD_S)
+        return precheck_holds(self.p.state, task, now)
 
     def _precheck_words(self, task: dict) -> str:
         """What the checks _precheck_holds waits for are doing, in words: waiting for a host checks slot
@@ -18495,6 +18731,9 @@ def idle_wake(p: Project, cfg: dict, gates: dict[str, dict], now: float, db=None
     # `db` is the caller's own connection: the web app calls this from its request threads, and an
     # SQLite connection works only in the thread that opened it.
     db, c = db or p.db, cfg["coordinator"]
+    if nxt := looks.pending(db):   # the coordinator chose its next look: no fixed wake meanwhile
+        return {"at": nxt[0]["at"], "due": None, "held": None, "wake": db.kv("idle_wake", {}) or {},
+                "starve": None, "look": nxt[0]["text"]}
     gate = gates.get(cfg.get("core_provider", "claude"))
     last = float(db.kv("last_coordinator_turn", 0))
     idle_s = float(c.get("idle_wake_s", 3600))

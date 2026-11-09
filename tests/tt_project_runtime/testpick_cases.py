@@ -165,23 +165,53 @@ def test_a_push_queue_project_narrows_a_wide_modules_module_level_and_checks_fun
     assert soft == ["the checks runner changed (plugins/x/runtime/ttp/bar.py)"]
 
 
-@pytest.mark.parametrize("rel, text, reason", [
-    ("tests/conftest.py", "X = 1\n", "conftest.py"),
-    ("tests/helpers.py", "def shared():\n    return 1\n", "tests/helpers.py"),
-    ("plugins/x/runtime/ttp/push.py", "def run():\n    return 1\n", "checks runner"),
-    ("plugins/x/.claude-plugin/plugin.json", '{"version": "1"}\n', "plugin.json"),
-    ("pyproject.toml", "[tool.pytest]\n", "pyproject.toml"),
+@pytest.mark.parametrize("rel, text, reason, extra", [
+    ("tests/conftest.py", "X = 1\n", "conftest.py", []),
+    ("tests/conftest.py", "import pytest\n\n\n@pytest.fixture\ndef bar_one():\n    return 1\n", "conftest.py",
+     ["tests/r/bar_cases.py"]),
+    ("tests/helpers.py", "def shared():\n    return 1\n", "tests/helpers.py", []),
+    ("plugins/x/runtime/ttp/push.py", "def run():\n    return 1\n", "checks runner", []),
+    ("plugins/x/.claude-plugin/plugin.json", '{"version": "1"}\n', "plugin.json", []),
+    ("pyproject.toml", "[tool.pytest]\n", "pyproject.toml", []),
     ("tests/test_r.py", "X = 1\n\n\ndef _h():\n    return 1\n\n\ndef test_top():\n    assert _h()\n\n\n"
-                        "def test_alone():\n    pass\n", "module-level code of tests/test_r.py"),
+                        "def test_alone():\n    pass\n", "module-level code of tests/test_r.py",
+     ["tests/test_r.py::test_alone", "tests/test_r.py::test_top"]),
+    ("tests/r/bar_cases.py", "N = 1\n\n\ndef test_bar_one():\n    pass\n", "module-level code of tests/r/bar_cases.py",
+     ["tests/r/bar_cases.py"]),
 ])
-def test_a_push_queue_project_still_runs_task_checks_in_full_where_the_whole_suite_is_affected(tmp_path, rel, text,
-                                                                                              reason):
+def test_a_push_queue_project_runs_only_what_a_whole_suite_change_reaches(tmp_path, rel, text, reason, extra):
+    """User msg #2220: with the push queue on, a task's checks never run the whole suite; a conftest, shared
+    helper, runner, manifest, config or module-level change widens only to the units importing or naming it
+    (or naming a function or fixture it changes), and the push train runs the rest. Without the push queue
+    the same change still runs in full."""
     from ttp import push, testpick
     repo, base = _pick_repo(tmp_path)
     head = _pick_change(repo, base, {rel: text, "plugins/x/runtime/ttp/foo.py": "def foo_one():\n    return 2\n"})
     own = push.check_list([_PICK_CMD])
     todo, lines = testpick.narrow(repo, base, head, list(own), own, _PICK_QUEUE)
+    assert todo[0].targeted and lines[0].startswith(f"{_PICK_CMD}: targeted: ") and reason in lines[0], lines
+    want = sorted({"tests/r/foo_cases.py", "tests/test_plugin_catalogue.py::test_cat", *extra})
+    assert dict(todo[0].env)[testpick.FILES_ENV].split("\n") == want
+    todo, lines = testpick.narrow(repo, base, head, list(own), own, None)
     assert todo == list(own) and lines[0].startswith(f"{_PICK_CMD}: full: ") and reason in lines[0], lines
+
+
+def test_a_tasks_ttp_checks_full_is_refused_with_the_push_queue_on_unless_the_user_allows_it(env, tmp_path,
+                                                                                           monkeypatch, capsys):
+    """User msg #2220: the push train is the only full run; `ttp checks --full` from a task or review is
+    refused with one line, unless the user set delivery.checks_task_full; the push queue off keeps it."""
+    from ttp import cli, testpick
+    assert testpick.full_refusal(None) == "" and testpick.full_refusal({"delivery": {"push_queue": False}}) == ""
+    assert "--full is refused" in testpick.full_refusal(_PICK_QUEUE)
+    assert testpick.full_refusal({"delivery": {**_PICK_QUEUE["delivery"], "checks_task_full": True}}) == ""
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    p.set_config("delivery.push_branch", "work")
+    p.set_config("delivery.push_queue", True)
+    with pytest.raises(SystemExit) as refused:
+        cli.main(["checks", "--full", "--", "true"])
+    err = capsys.readouterr().err
+    assert refused.value.code == 2 and "--full is refused" in err and len(err.strip().splitlines()) == 1, err
+    assert not (run / "checks.json").exists(), "nothing ran"
 
 
 def test_a_push_queue_project_keeps_a_selection_of_most_of_the_suite_targeted(tmp_path):
@@ -202,11 +232,11 @@ def test_a_push_queue_project_keeps_a_selection_of_most_of_the_suite_targeted(tm
     assert todo[0].targeted and lines == [f"{_PICK_CMD}: targeted: 1 case files, 1 tests in 1 test files"], lines
     todo, lines = testpick.narrow(repo, base, head, list(own), own, None)
     assert todo == list(own) and lines == [f"{_PICK_CMD}: full: the diff reaches 76% of the tests"], lines
-    # a conftest still runs the whole check with the push queue on
+    # a conftest with the push queue on runs only what it reaches and leaves the rest to the push train (#2220)
     head = _pick_change(repo, base, {"tests/r/other_cases.py": "def test_other_0():\n    pass\n",
                                      "tests/conftest.py": "X = 1\n"})
     todo, lines = testpick.narrow(repo, base, head, list(own), own, _PICK_QUEUE)
-    assert todo == list(own) and "conftest.py" in lines[0], lines
+    assert todo[0].targeted and "the push batch runs the rest: tests/conftest.py changed" in lines[0], lines
 
 
 def test_a_changed_case_file_helper_also_runs_the_case_files_and_tests_calling_it(tmp_path):
@@ -485,6 +515,7 @@ def test_only_a_tasks_ttp_checks_narrows_so_every_push_batch_runs_the_full_suite
 def test_delivery_checks_targeted_settings_are_validated():
     from ttp import project
     assert "checks_targeted" in project.EXTRA_KEYS["delivery"] and "checks_targeted_always" in project.EXTRA_KEYS["delivery"]
+    assert "checks_task_full" in project.EXTRA_KEYS["delivery"]
 
 
 def test_a_narrowed_check_spills_and_runs_its_selection_on_a_spill_host_or_the_slurm_overflow(tmp_path, monkeypatch):
@@ -518,3 +549,45 @@ def test_a_narrowed_check_spills_and_runs_its_selection_on_a_spill_host_or_the_s
     s.slurm, s.time_min = slurmcheck.settings_of({**_SLURM_SET, "workdir": str(tmp_path / "remote")}), 1
     r = subprocess.run(push.check_argv(s, commit=head), cwd=repo, env=run, capture_output=True, text=True, timeout=120)
     assert r.returncode == 0 and "1 passed, 2 deselected" in r.stdout, r.stdout + r.stderr
+
+
+@pytest.mark.parametrize("flags", [["--release", "--full"], ["--release"]])
+def test_a_release_check_runs_in_full_with_the_push_queue_on(env, tmp_path, monkeypatch, capsys, flags):
+    """Review #7629: the release cut's required suite runs through `ttp checks --release`; with the push queue
+    on it is never refused (--full), narrowed (testpick.narrow full=True) or fast-pathed."""
+    from ttp import testpick
+    cli, p, run, mark = _fast_cli(env, tmp_path, monkeypatch, {"docs/n.md": "hi\n"}, True)
+    p.set_config("delivery.push_queue", True)
+    calls, real = [], testpick.narrow
+    monkeypatch.setattr(testpick, "narrow", lambda *a, **k: (calls.append(k.get("full")), real(*a, **k))[1])
+    cli.main(["checks", *flags])
+    out = capsys.readouterr().out
+    assert "FAST PATH" not in out and mark.exists(), "the release check skipped the project's checks"
+    assert calls == [True], calls
+    rec = json.loads((run / "checks.json").read_text())
+    assert rec["passed"] is True and "fast_path" not in rec
+
+
+def test_the_fast_path_advice_names_a_command_the_push_queue_does_not_refuse(env, tmp_path, monkeypatch, capsys):
+    """Review #7629: the fast-path messages (ttp checks, prguard, the daemon's checks wait) named `ttp checks
+    --full`, which a push-queue project refuses; the command they name runs the project's checks there."""
+    import inspect
+    import re
+    from ttp import daemon, prguard
+    cli, p, run, mark = _fast_cli(env, tmp_path, monkeypatch, {"docs/n.md": "hi\n"}, True)
+    p.set_config("delivery.push_queue", True)
+    cli.main(["checks"])
+    out = capsys.readouterr().out
+    assert "FAST PATH" in out and not mark.exists()
+    named = set()
+    for said in (out, prguard._checks_problem(os.getcwd()), inspect.getsource(daemon.Daemon._checks_wait)):
+        said = said[re.search(r"fast.path", said, re.I).start():]   # the advice after the fast-path text
+        hits = re.findall(r"`ttp checks([^`]*)`", said)
+        assert hits, said
+        named.add(tuple(hits[0].split()))
+    assert len(named) == 1, named
+    [flags] = named
+    cli.main(["checks", *flags])
+    assert "FAST PATH" not in capsys.readouterr().out and mark.exists(), "the advice ran no project check"
+    rec = json.loads((run / "checks.json").read_text())
+    assert rec["passed"] is True and prguard.candidate_record(rec) and not rec.get("fast_path")

@@ -1926,6 +1926,33 @@ def test_every_way_a_step_waits_on_a_child_is_capped_and_the_child_killed_whole(
     assert f"killed {exe}" in ev["text"]
 
 
+def test_a_cut_unreviewed_pass_that_queued_a_review_looks_again_sooner(env, monkeypatch):
+    p = make(env)
+    from ttp import daemon as dmod
+    d = dmod.Daemon(p.base)
+    old = time.time() - dmod.UNREVIEWED_GRACE_S - 60
+    for n in range(3):
+        tid = p.db.add_task(f"work {n}", "edit it", kind="code", tier="light", origin="coordinator")
+        p.db.update_task(tid, status="done", branch=f"ttp/t{tid}-work-{n}")
+        p.db.x("UPDATE tasks SET updated=? WHERE id=?", (old, tid))
+    monkeypatch.setattr(d, "_unreviewed_skip", lambda t, *a: "")
+    monkeypatch.setattr(d, "_auto_review", lambda t, *a, **k: (t["id"] + 100, True))
+    monkeypatch.setattr(dmod, "UNREVIEWED_PASS_S", -1)   # spent after each task: a backlog of three
+    clock = [time.time()]
+    monkeypatch.setattr(dmod.time, "time", lambda: clock[0])
+    assert len(d.sweep_unreviewed()) == 1
+    clock[0] += dmod.UNREVIEWED_BACKLOG_EVERY_S + 1
+    assert len(d.sweep_unreviewed()) == 1, "a cut pass that queued a review runs again after the backlog period"
+    # A pass that queued none, though cut, waits the full period: no backlog of reviews to queue.
+    monkeypatch.setattr(d, "_unreviewed_skip", lambda t, *a: "looked")
+    clock[0] += dmod.UNREVIEWED_BACKLOG_EVERY_S + 1
+    assert d.sweep_unreviewed() == []
+    clock[0] += dmod.UNREVIEWED_BACKLOG_EVERY_S + 1
+    assert d.sweep_unreviewed() == [] and d._unreviewed_swept < clock[0] - dmod.UNREVIEWED_BACKLOG_EVERY_S, \
+        "no pass ran before REVIEW_SWEEP_EVERY_S"
+    assert dmod.UNREVIEWED_BACKLOG_EVERY_S < dmod.REVIEW_SWEEP_EVERY_S
+
+
 def test_a_cut_off_unreviewed_sweep_resumes_after_the_task_it_stopped_at(env, monkeypatch):
     p = make(env)
     from ttp import daemon as dmod

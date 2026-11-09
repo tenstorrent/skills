@@ -1607,6 +1607,8 @@ def status_text(p: Project, verbose: bool = False) -> str:
     from . import lease
     if lease_line := lease.status_line(p, p.config(), now):
         lines.append(lease_line)
+    from . import overseer   # the tick loop judged by its results, read from the overseer's file
+    lines.append(overseer.line(overseer.read(p), now))
     lines.append("budget: " + h["spend"]["headline"])
     lines += h["spend"].get("slot_lines") or []
     c = h["coordinator"]
@@ -1906,6 +1908,11 @@ def cmd_status(a) -> None:
         from . import throughput
         if ln := throughput.status_line(p.db):
             print(ln)
+        from . import gatetime
+        if ln := gatetime.status_line(p.state, p.config()):
+            print(ln)
+        if ln := gatetime.waits_line(p.db, p.state):
+            print(ln)
         from . import notifier
         for ln in notifier.status_lines():   # this machine's notifier: on old code, or failing to deliver
             print(ln)
@@ -1925,6 +1932,11 @@ def cmd_stats(a) -> None:
         s = effortab.report(p, a.days, _stats_time(a.since, tz, "--since"), _stats_time(a.until, tz, "--until"))
         s["winner"] = effortab.winner(p.config())
         print(json.dumps(s, indent=1) if a.json else effortab.report_text(s))
+        return
+    if a.landing:
+        from . import trainstats
+        s = trainstats.report(p.db, p.runs, timefmt.home(p), a.days)
+        print(json.dumps(s, indent=1) if a.json else trainstats.text(s, p.name))
         return
     if a.coord_session:
         from . import coordstats
@@ -3437,6 +3449,15 @@ def _prestage_skip(a, p: Project | None, top: str, head: str, tree: str, cmds: l
     return ""
 
 
+def _spent(t0) -> dict:
+    """Wall and CPU seconds since `t0` ((monotonic, os.times())): this process plus the check
+    commands it waited for, so `ttp stats` sums CPU-hours per landed change."""
+    w0, c0 = t0
+    c1 = os.times()
+    cpu = sum(getattr(c1, k) - getattr(c0, k) for k in ("user", "system", "children_user", "children_system"))
+    return {"wall_s": round(time.monotonic() - w0, 1), "cpu_s": round(max(cpu, 0.0), 1)}
+
+
 def cmd_checks(a) -> None:
     """(inside a run) Run the local checks on this worktree's commit and record the result in the
     run's directory: the harness's gh opens a PR (even a draft) only after they passed on HEAD. The
@@ -3480,6 +3501,7 @@ def cmd_checks(a) -> None:
     from . import addedtests, checkcap, checkdirs, checkprestage, cleantree, prguard, push, pushpass, slowtests
     from . import gatejudge
     from . import shorttmp
+    spent0 = (time.monotonic(), os.times())   # wall_s, cpu_s in checks.json (ttp stats' CPU-hours per landing)
     if getattr(a, "gap", None):
         from . import checkgaps
         p = here()
@@ -3543,6 +3565,10 @@ def cmd_checks(a) -> None:
               "`retry_when` that exits 0 once this host is back, and run them after the cycle", file=sys.stderr)
         sys.exit(75)
     purpose = getattr(a, "purpose", None) or "candidate"
+    if a.full and purpose == "candidate" and not getattr(a, "release", False):
+        from . import testpick   # a release run (the release cut's required suite) always runs in full
+        if why := testpick.full_refusal(cfg):   # the push train is the only full run
+            die(f"ttp checks: {why}")
     d = cfg.get("delivery") or {}
     checks_host = d.get("checks_host")   # where checks without a host run
     # The checks run at the top of the worktree being checked, as `ttp push` runs them, wherever in
@@ -3771,7 +3797,7 @@ def cmd_checks(a) -> None:
                 print(f"ttp checks: {said}")
                 out.write(f"{said}\n")
             fcfg = p.config() if p else None
-            if todo and purpose == "candidate" and not a.full and not a.fresh \
+            if todo and purpose == "candidate" and not a.full and not a.fresh and not getattr(a, "release", False) \
                     and not any(getattr(c, "if_changed", ()) for c in todo) \
                     and not _recorded_pass(p, tree, todo, purpose) \
                     and push.fast_path(Path(top), base, head, push.fast_globs(fcfg), push.fast_exclude(fcfg)):
@@ -3780,7 +3806,7 @@ def cmd_checks(a) -> None:
                 fast_cmds = push.fast_checks(base)
                 todo = [c for c in todo if str(c) not in own_s] + fast_cmds
                 said = ("FAST PATH: the diff changes only docs/data paths, so the project's checks were NOT run; "
-                        "only the whitespace and CRLF checks run; `ttp checks --full` runs them all (delivery.checks_fast_globs sets the paths, "
+                        "only the whitespace and CRLF checks run; `ttp checks --fresh` runs them (delivery.checks_fast_globs sets the paths, "
                         "delivery.checks_fast_exclude the paths that never take it)"
                         + (f"; commands after `--` still run" if len(todo) > len(fast_cmds) else ""))
                 print(f"ttp checks: {said}")
@@ -3830,7 +3856,8 @@ def cmd_checks(a) -> None:
         # never comes here and runs the full suite. A narrowed check's pass is its own (its env is in its key).
         if todo and passed and not hit and not fast_cmds and purpose == "candidate":
             from . import testpick
-            todo, scope_lines = testpick.narrow(Path(top), base, head, todo, own, fcfg, full=a.full)
+            todo, scope_lines = testpick.narrow(Path(top), base, head, todo, own, fcfg,
+                                              full=a.full or getattr(a, "release", False))
             for said in scope_lines:
                 print(f"ttp checks: {said}")
                 out.write(f"{said}\n")
@@ -3908,11 +3935,17 @@ def cmd_checks(a) -> None:
         if p:
             envfault.recheck(p)   # a runner back: its open fault closes
         arrived = _checks_arrived()
+        # This run's wait was already recorded by the run it reruns (set again only for that rerun),
+        # taken out of the environment so no check command or later in-process run inherits it.
+        wait_kept = os.environ.pop(_WAIT_KEPT_ENV, "")
         from . import checkjoin, checklane, checkspill
         # A rerun of checks that did not pass on a spill host keeps off that host (checkspill.kept_off);
         # "1" keeps them off every spill host.
         no_spill = os.environ.pop(checkspill.OFF_ENV, "")
         spill_ok = not checkspill.all_off(no_spill) and checkspill.spillable(todo, cfg)
+        if p and todo and not spill_ok and checkspill.hosts(cfg):   # `ttp checks status` says why it stays here
+            checkspill.note_here(p.name, "kept off every spill host" if checkspill.all_off(no_spill) else
+                                 "its checks cannot spill (an agent CLI, \"host\": \"local\" or a wrapper)")
         fresh_ok = not a.fresh
         slot = None
         light = bool(todo) and checklane.all_light(todo, cfg, mine + [h for _, h in held] if getattr(a, "light", False) else ())
@@ -3977,6 +4010,11 @@ def cmd_checks(a) -> None:
                 said = f"on {spilled.host} the checks run behind their spill wrapper {shlex.join(w)}"
                 print(f"ttp checks: {said}", flush=True)
                 out.write(f"ttp checks: {said}\n")
+        # How long it queued (`ttp status` waits), once per run: a rerun here after a spill host keeps its arrival.
+        if p and todo and not hit and not handover and not light and not wait_kept:
+            from . import gatetime
+            gatetime.record_wait(p.state, time.time() - arrived)
+            wait_kept = "1"
         if join_rec and todo and not hit and not handover:
             checkjoin.update(join_rec, phase=checkjoin.RUNNING, run_since=time.time())
         child_env = {"PWD": top, **venv_vars, **(slot.env() if slot else {})}
@@ -4292,6 +4330,8 @@ def cmd_checks(a) -> None:
             if slot:
                 slot.close()
             os.environ[checkcap.ARRIVED_ENV] = str(arrived)
+            if wait_kept:
+                os.environ[_WAIT_KEPT_ENV] = wait_kept
             if no_spill:
                 os.environ[checkspill.OFF_ENV] = no_spill
             if join_rec:
@@ -4308,7 +4348,8 @@ def cmd_checks(a) -> None:
                         checkcap.record_cost(checkcap.child_cpu_s() - ran_cpu, time.time() - ran_since)
                     checkwall.record_run(p.state, time.time() - ran_since, passed,
                                          _commands_hash(todo) if passed and executed == todo else "",
-                                         "" if spilled else "tmpfs" if shorttmp.on_tmpfs(run_env.get("TMPDIR")) else "disk")
+                                         "" if spilled else "tmpfs" if shorttmp.on_tmpfs(run_env.get("TMPDIR")) else "disk",
+                                         spilled.host if spilled else "", os.environ.get("TTP_TASK") or "")
                 # A completed run no longer reports the task's old wall-time timeout (TIMEOUTS entry).
                 checkwall.clear_timeout(p.state, os.environ.get("TTP_TASK"))
         if slot and not passed:
@@ -4351,6 +4392,8 @@ def cmd_checks(a) -> None:
             out.flush()
             print(f"ttp checks: {said}", flush=True)
             os.environ[checkcap.ARRIVED_ENV] = str(arrived)
+            if wait_kept:
+                os.environ[_WAIT_KEPT_ENV] = wait_kept
             os.environ[checkspill.OFF_ENV] = no_spill
             if join_rec:   # the run here registers again; its followers queue again and join that one (checkjoin)
                 checkjoin.forget(p.state)
@@ -4515,7 +4558,8 @@ def cmd_checks(a) -> None:
                                                      **({"authoring_tree": in_authoring} if in_authoring else {}),
                                                      **({"added_tests": rerun} if rerun else {}),
                                                      **({"excused": excused, "landing_only": True} if excused else {}),
-                                                     **({"release": True} if getattr(a, "release", False) else {})})
+                                                     **({"release": True} if getattr(a, "release", False) else {}),
+                                                     **_spent(spent0)})
     if join_rec:   # the outcome the runs that joined this one report (checkjoin)
         from . import checkjoin, trim
         checkjoin.finish(join_rec, passed=passed, head=head, rc=0 if passed else 1, failed=str(failed or ""),
@@ -4740,6 +4784,9 @@ CHECKS_SLOT_CANCEL = "checks-slot.cancel"
 # Written with a non-zero checks.rc, so `--result` answers and the run's owner wakes (_checks_drop).
 CHECKS_DROPPED = "checks.dropped"
 # (not "checks.queued": detach.queued(checks.rc) is the daemon's launch marker)
+
+
+_WAIT_KEPT_ENV = "TTP_CHECKS_WAIT_KEPT"   # a rerun's wait is its first run's (cmd_checks; never inherited)
 
 
 def _checks_arrived() -> float:
@@ -5041,6 +5088,7 @@ def _checks_lane_status(as_json: bool) -> int:
                           "project_max": checklane.project_cap(p.config()), "this_repo": here_repo,
                           "repos": checklane.lane_status(p.name, cfg=p.config(), names=names, db=p.db),
                           "spilled": checkspill.holders(p.name),
+                          "here": checkspill.here_records(p.name),
                           "slurm_overflow": slurmcheck.holders(p.name),
                           "slurm_paused": slurmcheck.tripped(),
                           "hosts": {**load, "overloaded": hostload.overloaded(load)},
@@ -5050,7 +5098,7 @@ def _checks_lane_status(as_json: bool) -> int:
                          indent=2))
     else:
         print(checklane.status_text(p.name, p.config(), here_repo, names=names, db=p.db))
-        for line in [*checkspill.status_lines(p.name), *checkspill.pick_lines(p.name), *slurmcheck.probe_lines(), *slurmcheck.status_lines(p.name),
+        for line in [*checkspill.status_lines(p.name), *checkspill.pick_lines(p.name), *checkspill.here_lines(p.name), *slurmcheck.probe_lines(), *slurmcheck.status_lines(p.name),
                      *filter(None, [slurmcheck.paused_line()])]:
             print(f"  {line}")
         print("check runs per host:")
@@ -10593,7 +10641,7 @@ def _config_remove(p, key: str, run) -> None:
         _refuse_user_only_in_run(k)
     try:
         removed = p.unset_config(key, by=configwho.from_env())
-    except RuntimeError as e:
+    except (RuntimeError, configwho.Protected) as e:   # project.json unreadable; a value its owner set
         die(str(e))
     node = p.config()
     for part in key.split("."):
@@ -10611,6 +10659,11 @@ def cmd_config_why(words: list[str], key: str) -> None:
     raw = p.raw_config()
     rec = configwho.lookup(p.db if p.established() else None, key, None if p.config_status == "unavailable" else raw)
     print(f"{key}: set by {configwho.describe(rec, p)}")
+    rows = configwho.history(p, key)
+    if rows:
+        print(f"changes ({len(rows)}, the last {min(len(rows), 20)} shown; {p.state / configwho.LOG}):")
+        for r in rows[-20:]:
+            print(f"  {configwho.line(r, p)}")
 
 
 SECRET_KINDS = ("jev", "slack", "endpoint", "show", "check", "env", "push", "set", "generate")
@@ -11484,7 +11537,7 @@ def _strongest_coordinator(p: Project) -> str:
             return ""
         verdict, why = coordmodel.migrate(raw)
         if verdict == "set":
-            p.set_config("coordinator.model_tier", coordmodel.STRONGEST, by={"by": "default", "via": "upgrade"})
+            p.set_config("coordinator.model_tier", coordmodel.STRONGEST, by={"by": "upgrade", "via": "upgrade"})
         route = coord.route_line(p.config()).removeprefix("coordinator: ")
         p.db.set_kv(STRONGEST_COORD_KEY, {"ts": time.time(), "verdict": verdict or "already", "why": why})
     except Exception:
@@ -11509,7 +11562,7 @@ def _auto_cache_ttl(p: Project) -> str:
         coord = p.raw_config().get("coordinator")
         if not (isinstance(coord, dict) and "cache_ttl" in coord and not str(coord["cache_ttl"] or "").strip()):
             return ""
-        p.set_config("coordinator.cache_ttl", "auto", by={"by": "default", "via": "upgrade"})
+        p.set_config("coordinator.cache_ttl", "auto", by={"by": "upgrade", "via": "upgrade"})
     except Exception:
         return ""
     return 'upgrade note: coordinator.cache_ttl was "" (from an older template) and is now "auto"'
@@ -11525,6 +11578,14 @@ def _migrate_load_caps(p: Project) -> str:
         if p.config_status == "unavailable":
             return ""
         new, done = loadcaps.migrate(raw)
+        if p.established():   # a value the user or a coordinator set stays, whatever it is (configwho.guard)
+            from . import configwho
+            for key in loadcaps.OLD_DEFAULTS:
+                section, leaf = key.split(".", 1)
+                if configwho.at(raw, key) != configwho.at(new, key) \
+                        and configwho.role(configwho.lookup(p.db, key, raw)) in configwho.OWNERS:
+                    new[section][leaf] = raw[section][leaf]
+                    done = [d for d in done if not d.startswith(key + " ")]
         if not done:
             return ""
         if p.config_status == "fallback":
@@ -11540,8 +11601,7 @@ def _migrate_load_caps(p: Project) -> str:
                     continue
                 section, leaf = key.split(".", 1)
                 step = {**state, section: {k: v for k, v in state[section].items() if k != leaf}}
-                configwho.record(p.db, key, {"by": "default", "via": "upgrade: load-sized default"},
-                                 before=state, after=step)
+                configwho.changed(p, key, {"by": "migration", "via": "upgrade: load-sized default"}, state, step)
                 state = step
     except Exception:
         return ""
@@ -13126,6 +13186,9 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--coord-session", action="store_true",
                    help="the persistent coordinator session instead, per day: wakes, $/wake, context growth and tool "
                         "calls per wake, rollovers, cache-read share, against the stateless baseline and break-even")
+    s.add_argument("--landing", action="store_true",
+                   help="per landed change instead, per day: test runs and full suites, CPU-hours, $, and "
+                        "approved to landed (median, p90)")
     s.add_argument("--runs", action="store_true",
                    help="worker runs instead: provider, model, tier, outcome (with any route fallback), wall time, cost")
     s.add_argument("--tier", help="with --runs: only this tier's runs (implies --runs)")
@@ -14055,8 +14118,9 @@ def main(argv: list[str] | None = None) -> None:
                    help="check, without setting it, whether a coordinator config_set accepts KEY (and VALUE): "
                         "ttp config --chat-settable KEY [VALUE]; KEY `list` prints every accepted key")
     s.add_argument("--why", metavar="KEY",
-                   help="who set KEY (user with the message id, coordinator, worker task, harness or default) and "
-                        "when; keys set before this was recorded show unknown: ttp config [NAME] get --why KEY")
+                   help="who set KEY (user with the message id, coordinator, worker task, harness, default, upgrade "
+                        "or migration) and when, then its logged changes (old -> new, setter, undo); keys set before "
+                        "this was recorded show unknown: ttp config [NAME] get --why KEY")
     s.set_defaults(fn=cmd_config)
 
     s = sub.add_parser("secret", help="store per-user credentials (read from stdin)")

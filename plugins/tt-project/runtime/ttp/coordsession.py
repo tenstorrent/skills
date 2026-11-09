@@ -21,7 +21,8 @@ provider rejected the resume (resume failed, below). Never because the context g
 compacts its own context in place and keeps its id (user order: every agent compacts its own
 context as needed). The context is the last model call's prompt and answer; limit() is the size
 it compacts at: the session's first prompt (or its size after the last compaction) plus
-compact_growth_tokens, at most the model's context window less compact_margin_tokens;
+compact_growth_tokens, and never so soon that it would free under compact_min_free of the context
+(30%), at most the model's context window less compact_margin_tokens, which always applies;
 compact_tokens above 0 sets a fixed size instead (the older rollover_* names are still read). A
 resumed wake that fails (provider down, a cap, a crash, its process lost) is rerun at once (rerun)
 on the same queued batch, resuming the same session; only a failure that says the provider rejected
@@ -87,7 +88,7 @@ from . import cachettl, spans
 
 KEY = "coord_session"
 DEFAULTS = {"compact_tokens": 0, "compact_growth_tokens": 100000, "context_window_tokens": 0,
-            "compact_margin_tokens": 40000, "row_delta": True,
+            "compact_margin_tokens": 40000, "compact_min_free": 0.3, "row_delta": True,
             # what a worker or reviewer run starts with (ctxfork.py); worker_fork_max_tokens 0: no cap
             "worker_context": "fork", "worker_fork_max_tokens": 0, "worker_fork_max_age_h": 12,
             "worker_chat_chars": 30000}
@@ -239,15 +240,22 @@ def salvaged_line(n) -> str:
 def limit(cfg: dict, state, model: str = "") -> float:
     """The context size at which the session compacts in place: compact_tokens when above 0, else the
     session's first prompt (base_tokens) or its size after its last compaction (compact_floor), the
-    larger, plus compact_growth_tokens, at most the context window (context_window_tokens; 0:
-    LONG_WINDOW for a "[1m]" model, else unknown) less compact_margin_tokens."""
+    larger, plus compact_growth_tokens, and at least compact_floor / (1 - compact_min_free), at most the
+    context window (context_window_tokens; 0: LONG_WINDOW for a "[1m]" model, else unknown) less
+    compact_margin_tokens."""
     s = settings(cfg)
     fixed = _num(s.get("compact_tokens"), 0)
     if fixed > 0:
         return fixed
     st = state if isinstance(state, dict) else {}
-    out = max(_num(st.get("base_tokens"), 0), _num(st.get("compact_floor"), 0)) \
+    floor = _num(st.get("compact_floor"), 0)
+    out = max(_num(st.get("base_tokens"), 0), floor) \
         + _num(s.get("compact_growth_tokens"), DEFAULTS["compact_growth_tokens"])
+    # A compaction is expected to come back to about the size the last one left (compact_floor): one
+    # sooner would free under compact_min_free of the context, so it waits. The window cap below still
+    # forces one.
+    free = min(max(_num(s.get("compact_min_free"), DEFAULTS["compact_min_free"]), 0.0), 0.9)
+    out = max(out, int(floor / (1 - free)))
     window = _num(s.get("context_window_tokens"), 0) or (LONG_WINDOW if str(model or "").endswith("[1m]") else 0)
     if window > 0:
         out = min(out, window - _num(s.get("compact_margin_tokens"), DEFAULTS["compact_margin_tokens"]))
@@ -272,7 +280,8 @@ def record(state, usage, session_id: str, turn: dict, ok: bool, now: float, summ
     """kv KEY after a wake that decided `turn` ({"mode", "why", "key", "model", "effort",
     "provider"}) ended, ok or not; `summary` is its answer's own summary, kept in `recent` for the next
     seed or restore. A provider gap's stateless wake leaves the session as it was. `compacted`: the
-    agent compacted the session during the wake ({"pre_tokens": its size before, when known}); a
+    agent compacted the session during the wake ({"pre_tokens": its size before, "post_tokens": its history
+    right after, when known}); a
     "compact" wake without it was the harness-supplied summary (its session_note). Either is kept in
     `compactions` and makes the next wake lead with restore()."""
     st = dict(state) if isinstance(state, dict) else {}
@@ -323,6 +332,10 @@ def record(state, usage, session_id: str, turn: dict, ok: bool, now: float, summ
             pre = _num(compacted.get("pre_tokens"), 0) if isinstance(compacted, dict) else 0
             row = {"at": now, "session": st["id"], "before": int(pre or before),
                    "after": st["context_tokens"], "how": "agent" if agent else "summary"}
+            # The agent's own count right after it compacted (its history, without the system prompt);
+            # `after` is the size at the wake's end, grown again by that wake.
+            if isinstance(compacted, dict) and (post := int(_num(compacted.get("post_tokens"), 0))) > 0:
+                row["post"] = post
             st["compactions"] = [*(st.get("compactions") or []), row][-COMPACTIONS_KEPT:]
             st.update({"restore": True, "compact_floor": st["context_tokens"]})
     return st

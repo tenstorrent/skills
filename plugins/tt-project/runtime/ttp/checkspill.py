@@ -5,8 +5,8 @@
 A project may list, in order, the ssh aliases of other machines its checks may run on. The account's
 pool, `checks.spill_hosts` in the account settings (`ttp config --account checks.spill_hosts '["pool-a"]'`,
 which a run may only clear), follows that list in every project on this machine, so each spills
-without a list of its own. A project's own empty list (`[]`) keeps its checks here, the pool too;
-with neither, checks never leave this machine. A `ttp checks` run that may spill tries the listed hosts in
+without a list of its own. No machines-list tag adds a host. A project's own empty list (`[]`)
+keeps its checks here, the pool too; with neither, checks never leave this machine. A `ttp checks` run that may spill tries the listed hosts in
 order before it takes a place here (`delivery.checks_spill_first`, default true: first), so this machine keeps
 only the checks that cannot spill, and runs on the first that is allowed, reachable and has a free slot, as a
 check with a check host does (remotecheck: a copy of exactly the commit, its output streamed back), with the
@@ -16,8 +16,8 @@ test-worker slots), tries them again after each `delivery.checks_spill_after_s` 
 checks_spill_first false it tries them only after that first wait. The run says where it went, checks.json records it (`hosts`, `spilled_to`), and `ttp status`
 and `ttp checks status` show it while it runs (status_lines).
 
-Allowed: named in the project's charter (a host of the account's pool needs no charter line: the
-account setting is the user's word for every project) and in the user's machines list (not retired), and not
+Allowed: listed in one of those structured settings (the project's own list or the account's pool),
+never by charter wording or a machines-list tag, and in the user's machines list (not retired), and not
 paused (a pause of its alias, or a fleet hold of the machine, or a pause of its alias or host name that any
 of the user's projects here set, shared or not: paused_elsewhere), and its machine lock (`ttp lock <alias>`)
 neither held nor reserved by anyone else. The run holds that lock while it runs, shared where the
@@ -240,8 +240,8 @@ def account_hosts() -> list[str]:
 
 
 def hosts(cfg: dict | None) -> list[str]:
-    """The project's spill hosts in order, then the account's pool; [] when the project's own list is
-    empty (it keeps its checks here) or malformed (config_problems names it)."""
+    """The project's spill hosts in order, then the account's pool;
+    [] when the project's own list is empty (it keeps its checks here) or malformed (config_problems names it)."""
     own = ((cfg or {}).get("delivery") or {}).get(KEY)
     try:
         mine = hosts_of(own) if own is not None else []
@@ -252,13 +252,18 @@ def hosts(cfg: dict | None) -> list[str]:
     return list(dict.fromkeys([*mine, *account_hosts()]))
 
 
+def _own(cfg: dict | None) -> list[str]:
+    try:
+        return hosts_of(((cfg or {}).get("delivery") or {}).get(KEY) or [])
+    except ValueError:
+        return []
+
+
 def _source(cfg: dict | None, alias: str) -> str:
     """Which setting lists `alias`: the project's own list, else the account's pool."""
-    try:
-        own = hosts_of(((cfg or {}).get("delivery") or {}).get(KEY) or [])
-    except ValueError:
-        own = []
-    return f"delivery.{KEY}" if alias in own else f"{ACCOUNT_KEY}, the account's pool"
+    if alias in _own(cfg):
+        return f"delivery.{KEY}"
+    return f"{ACCOUNT_KEY}, the account's pool"
 
 
 def wrapped_ok(cfg: dict | None) -> bool:
@@ -581,14 +586,6 @@ def spillable(cmds: list, cfg: dict | None = None) -> bool:
     return any(spills) and all(ok or stays_here(c, cfg) for ok, c in zip(spills, cmds))
 
 
-def _charter_names(p, alias: str) -> bool:
-    try:
-        text = p.charter_path.read_text()
-    except (OSError, AttributeError):
-        return False
-    return bool(re.search(rf"(?<![\w.@+:-]){re.escape(alias)}(?![\w@+-]|[.:]\w)", text))
-
-
 def target(spec: str, known: dict | None = None) -> tuple[str, str]:
     """(machine alias, ssh host) of spill host `spec`: an alias of the machines list is both; `alias:host`
     whose alias is in the list (and `spec` itself is not) is one host of that machine, which has several."""
@@ -602,7 +599,9 @@ def target(spec: str, known: dict | None = None) -> tuple[str, str]:
 
 def allowed(p, cfg: dict, alias: str) -> str:
     """"" when the project may run checks on spill host `alias`, else why not: its machine (target) must be
-    allowed, and neither the machine nor its host paused."""
+    allowed, and neither the machine nor its host paused. Only structured settings list a host (the
+    project's own list, the account's pool), never charter wording or a machines-list tag; the user's
+    pauses and holds still keep a listed host off."""
     from . import lockprobe, machines
     known = machines.load()
     machine, host = target(alias, known)
@@ -610,8 +609,10 @@ def allowed(p, cfg: dict, alias: str) -> str:
         return "not in the machines list (ttp machines add)"
     if machines.retired(known.get(machine)):
         return "retired in the machines list"
-    if not _charter_names(p, machine) and alias not in account_hosts() and machine not in account_hosts():
-        return "not named in the charter"
+    if alias not in _own(cfg) and alias not in account_hosts() and machine not in account_hosts():
+        name = getattr(p, "name", "") or "<project>"
+        return (f"not a spill host of this project (add it with `ttp config {name} delivery.{KEY} "
+                f"'{json.dumps([*_own(cfg), alias])}'`)")
     for n in dict.fromkeys([machine, host]):
         if (held := lockprobe.pause(p, cfg, n)) is not None:
             return f"paused{': ' + str(held.get('reason')) if isinstance(held, dict) and held.get('reason') else ''}"
@@ -1052,6 +1053,7 @@ def pick(p, cfg: dict, tell, what: str = "", off: str = "", why_here: str = "") 
             from . import testslots
             top = testslots.sizes(cfg, cores) if cores > 0 else None   # one run's limit, sized to that host
             got.workers = workers(cores, load, max(0, _ours(host) - 1), top[1] if top else 0)
+            note_here(p.name, "")   # this run is on a spill host now: no reason to show it here
             tell(f"spilling to {alias}: "
                  + (why_here or f"the slots here stayed busy for {after_s(cfg):g} s")
                  + f" ({_source(cfg, alias)}); the checks run there on a copy of the commit"
@@ -1066,6 +1068,7 @@ def pick(p, cfg: dict, tell, what: str = "", off: str = "", why_here: str = "") 
                        + (f"; {note}" if note else "") + ")")
     if skipped:
         tell("no spill host could take the checks, waiting here: " + "; ".join(skipped))
+        note_here(p.name, "no spill host could take them: " + "; ".join(skipped), what)
     _note_pick(p.name, "", skipped)
     return None
 
@@ -1137,3 +1140,80 @@ def status_lines(project_name: str, now: float | None = None) -> list[str]:
                    + (f" (beside a device job, checks.{BESIDE_KEY}: {r['beside']})" if r.get("beside") else "")
                    + (f" (claim's pid {r.get('pid')}: {FOREIGN})" if pid_state(r.get("pid")) == UNKNOWN else ""))
     return out
+
+
+def here_dir() -> Path:
+    from . import checkcap
+    return checkcap.slot_dir() / "spill-here"
+
+
+def note_here(project_name: str, why: str, what: str = "") -> None:
+    """Record why this process's checks run on the project host, not a spill host (here_lines shows it while
+    the process lives); "" clears it. Records of dead processes go at each write. Never raises."""
+    d = here_dir()
+    try:
+        for g in d.glob("*.json") if d.is_dir() else []:
+            if g.stem != str(os.getpid()) and g.stem.isdigit() and not _alive(int(g.stem)):
+                g.unlink(missing_ok=True)
+        f = d / f"{os.getpid()}.json"
+        if not why:
+            f.unlink(missing_ok=True)
+            return
+        d.mkdir(parents=True, exist_ok=True)
+        from . import project
+        project.durable_write(f, json.dumps({"project": project_name, "task": os.environ.get("TTP_TASK") or "",
+                                             "pid": os.getpid(), "why": why[:300], "what": what[:200],
+                                             "at": time.time()}), sync=False)
+    except OSError:
+        pass
+
+
+def here_records(project_name: str) -> list[dict]:
+    """The live note_here records of `project_name`'s runs. Read only."""
+    out = []
+    for f in sorted(here_dir().glob("*.json")) if here_dir().is_dir() else []:
+        try:
+            r = json.loads(f.read_text() or "{}")
+        except (OSError, ValueError):
+            continue
+        if isinstance(r, dict) and r.get("project") == project_name and r.get("why") and _alive(r.get("pid")):
+            out.append(r)
+    return out
+
+
+def here_lines(project_name: str) -> list[str]:
+    """`ttp checks status` lines: each of this project's runs that stays on the project host, and why."""
+    out = []
+    for r in here_records(project_name):
+        who = f"task #{r['task']}" if r.get("task") else f"pid {r.get('pid')}"
+        out.append(f"checks of {who} run on the project host: {r['why']}" + (f" ({r['what']})" if r.get("what") else ""))
+    return out
+
+
+def spill_run(p, cfg: dict, cmds: list, tell, what: str = "", off: str = "", why_here: str = "") -> tuple[Any, list]:
+    """For a run that takes no `ttp checks` slot here (the push batch's suite, an after-landing suite):
+    (claim, `cmds`) with each check that may spill sent to the spill host checkspill.pick claimed, sized to its
+    worker grant (cli._spill_to, as `ttp checks` spills), the rest here; (None, `cmds`) when it stays here,
+    with why recorded (note_here). Tried only with spill hosts set and spill first on (first); `off` as pick's.
+    The caller closes the claim once the run ends."""
+    if not hosts(cfg):
+        return None, cmds
+    why = ("spill first is off (delivery." + FIRST_KEY + ")" if not first(cfg) else
+           "kept off every spill host" if all_off(off) else
+           "" if spillable(cmds, cfg) else "its checks cannot spill (an agent CLI, \"host\": \"local\" or a wrapper)")
+    if why:
+        note_here(p.name, why, what)
+        return None, cmds
+    claim = pick(p, cfg, tell, what, off, why_here or f"spill first (delivery.{FIRST_KEY}): the project host "
+                                                       "keeps only checks that cannot spill")
+    if claim is None:
+        return None, cmds
+    from .cli import _spill_to
+    return claim, [_unspilled(c, was) for c, was in zip(_spill_to(cmds, claim.host, cfg, claim.workers), cmds)]
+
+
+def _unspilled(c: Any, was: Any) -> Any:
+    """`c` (spilled from `was`) remembering `was`, so a spill host's fault reruns the check elsewhere."""
+    if getattr(c, "spilled", False):
+        c.was = was
+    return c

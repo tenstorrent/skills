@@ -5506,7 +5506,6 @@ def test_claude_workers_get_the_update_hook_but_decisions_do_not(env):
 def test_claude_workers_get_a_lean_context_but_keep_plugin_skills(env, monkeypatch):
     from ttp.providers import claude, get_provider
     build = get_provider("claude").build
-    monkeypatch.setattr(claude, "_FLAGS", {claude.TOOLS: False})   # a CLI without --tools: the denylist
     worker, _ = build(role="worker", model="opus", effort="low", cwd=".", budget_usd=None, read_only=False,
                       schema=None, restrictions={"no_internet": True})
     settings = json.loads(worker[worker.index("--settings") + 1])
@@ -5517,15 +5516,11 @@ def test_claude_workers_get_a_lean_context_but_keep_plugin_skills(env, monkeypat
     assert settings["autoMemoryEnabled"] is False
     assert worker.count("--disallowedTools") == 1, "a second flag would hide part of the deny list"
     i = worker.index("--disallowedTools") + 1
-    denied = worker[i:worker.index("--settings", i)]
-    assert {"Workflow", "ScheduleWakeup", "CronCreate", "CronDelete", "CronList", "RemoteTrigger",
-            "PushNotification", "DesignSync", "NotebookEdit", "EnterWorktree", "ExitWorktree", "ListAgents",
-            "ReportFindings", "Task", "Agent", "SendMessage", "WebFetch", "WebSearch"} == set(denied)
-    # The tools workers do use stay, ToolSearch included (it loads deferred and MCP tools).
-    assert not {"Bash", "Read", "Edit", "Write", "Skill", "ToolSearch", "Monitor", "TaskStop"} & set(denied)
+    # The full tool set (user msg #2302): no_internet withholds only the web tools.
+    assert worker[i:worker.index("--settings", i)] == ["WebFetch", "WebSearch"] and "--tools" not in worker
     online, _ = build(role="worker", model="opus", effort="low", cwd=".", budget_usd=None, read_only=False,
                       schema=None, restrictions={})
-    assert "WebFetch" not in online and "Workflow" in online
+    assert "--disallowedTools" not in online and "--tools" not in online
     # Plugin skills (tt-project's own, a project's plugin dirs) are never overridden; of the namespaced
     # ones only the Anthropic skills a claude.ai account brings are.
     argv = online + get_provider("claude").plugin_args(["/p/plugin"])
@@ -6428,7 +6423,6 @@ def test_a_claude_worker_is_denied_reading_the_web_token(env, monkeypatch):
 
 def test_disallowed_tools_extend_the_workers_denylist_and_never_the_coordinators(env, monkeypatch):
     from ttp.providers import claude, get_provider
-    monkeypatch.setattr(claude, "_FLAGS", {claude.TOOLS: False})   # a CLI without --tools
     kw = dict(role="worker", model="opus", effort="low", cwd=".", budget_usd=None, schema=None,
               restrictions={"no_internet": True})
 
@@ -6436,19 +6430,19 @@ def test_disallowed_tools_extend_the_workers_denylist_and_never_the_coordinators
         i = argv.index("--disallowedTools")
         return argv[i + 1:argv.index("--settings")]
     worker, _ = get_provider("claude").build(read_only=False, **kw)
-    assert denied(worker) == [*claude.WORKER_DENIED_TOOLS, "WebFetch", "WebSearch"], "unset: the defaults only"
+    assert denied(worker) == ["WebFetch", "WebSearch"], "unset: no_internet's web tools only"
     worker, _ = get_provider("claude").build(read_only=False, disallowed_tools=["mcp__mail__*", "Task",
                                                                                 "mcp__docs__write_page"], **kw)
-    assert denied(worker) == [*claude.WORKER_DENIED_TOOLS, "WebFetch", "WebSearch", "mcp__mail__*",
-                              "mcp__docs__write_page"], "the defaults stay, each tool once"
+    assert denied(worker) == ["WebFetch", "WebSearch", "mcp__mail__*", "Task",
+                              "mcp__docs__write_page"], "the web tools stay, each tool once"
     assert worker.count("--disallowedTools") == 1
     turn, _ = get_provider("claude").build(read_only=True, disallowed_tools=["mcp__mail__*"], **kw)
     assert "mcp__mail__*" not in turn
     for name in ("codex", "cursor", "fake"):
         get_provider(name).build(read_only=False, disallowed_tools=["mcp__mail__*"], **kw)
-    # With the --tools allowlist, only the project's own list is denied (MCP tools are not built-in).
-    monkeypatch.setattr(claude, "_FLAGS", {claude.TOOLS: True})
-    worker, _ = get_provider("claude").build(read_only=False, disallowed_tools=["mcp__mail__*"], **kw)
+    # Online, only the project's own list is denied.
+    worker, _ = get_provider("claude").build(read_only=False, disallowed_tools=["mcp__mail__*"],
+                                             **{**kw, "restrictions": {}})
     assert denied(worker) == ["mcp__mail__*"]
 
 
@@ -19504,25 +19498,29 @@ def test_a_push_batch_takes_both_changes_of_adjacent_lines_and_sends_back_only_a
 def test_a_push_batch_sends_back_an_entry_whose_merged_changes_fail_the_checks(env, monkeypatch):
     """The checks fail only on the result of taking both sides' changes of different lines: the entry
     whose replay merged them goes back as a conflict (the merge may be the cause), not check_failed,
-    and counts as sent back, not as resolved."""
+    and counts as sent back, not as resolved. Entry 1 passed alone: it pushes at once and entry 2 goes
+    to the next train (user msg #2317), where it is judged on its own."""
     p, repo, origin, other = _push_setup(env, monkeypatch, ["! grep -q A1 notes.txt || ! grep -q B2 notes.txt"])
     _commit(other, "notes.txt", "a\nb\nc\n")
     _git_out(other, "push", "-q", "origin", "HEAD:proj")
     heads = [_entry(repo, "e1", {"notes.txt": "A1\nb\nc\n"}), _entry(repo, "e2", {"notes.txt": "a\nB2\nc\n"})]
     rc, m = _run_batch(p, _batch_marker(p, heads), monkeypatch)
-    assert m["outcome"] == "pushed" and _statuses(m) == ["pushed", "conflict"], m
-    d = m["results"][1]["detail"]
+    assert m["outcome"] == "pushed" and _statuses(m) == ["pushed", "requeued"], m
+    rc, m = _run_batch(p, _batch_marker(p, heads[1:], bid="b2"), monkeypatch)
+    assert _statuses(m) == ["conflict"], m
+    d = m["results"][0]["detail"]
     assert d["files"] == ["notes.txt"] and d["settled_by"] == ["hunks"] and d["cmd"].startswith("! grep"), d
     assert _git_out(origin, "show", "proj:notes.txt") == "A1\nb\nc"
-    assert m["conflicts"] == {"entries": 2, "conflicted": 1, "auto_resolved": 0, "by_hunks": 0, "sent_back": 1}
+    assert m["conflicts"] == {"entries": 1, "conflicted": 1, "auto_resolved": 0, "by_hunks": 0, "sent_back": 1}
 
 
 @pytest.mark.parametrize("passes", [True, False])
 def test_a_push_batch_keeps_parallel_test_additions_only_when_the_checks_pass(env, monkeypatch, passes):
     """Two changes each append a new test function at the end of one test file: a conflict to git
     that the batch settles without a model by keeping both. With checks that pass on the result both
-    land; when the checks fail only on the merged file, the second entry goes back as a conflict (for
-    a rebase), not check_failed, and the first lands alone."""
+    land; when the checks fail only on the merged file, the first lands alone at once and the second
+    goes to the next train (user msg #2317), where it goes back as a conflict (for a rebase), not
+    check_failed."""
     check = "true" if passes else "! (grep -q test_one test_x.py && grep -q test_two test_x.py)"
     p, repo, origin, other = _push_setup(env, monkeypatch, [check])
     _commit(other, "test_x.py", "def test_base():\n    assert True\n")
@@ -19537,8 +19535,10 @@ def test_a_push_batch_keeps_parallel_test_additions_only_when_the_checks_pass(en
         assert m["results"][1]["detail"] == {"settled": ["test_x.py"], "settled_by": ["added"]}
         assert "def test_one" in landed and "def test_two" in landed
     else:
-        assert _statuses(m) == ["pushed", "conflict"], m
-        d = m["results"][1]["detail"]
+        assert _statuses(m) == ["pushed", "requeued"], m
+        rc, m = _run_batch(p, _batch_marker(p, heads[1:], bid="b2"), monkeypatch)
+        assert _statuses(m) == ["conflict"], m
+        d = m["results"][0]["detail"]
         assert d["files"] == ["test_x.py"] and d["settled_by"] == ["added"] and d["cmd"] == check, d
         assert "def test_one" in landed and "def test_two" not in landed
         assert m["conflicts"]["sent_back"] == 1 and m["conflicts"]["auto_resolved"] == 0
@@ -19592,20 +19592,25 @@ def _reused(capsys, cmd):
 
 @pytest.mark.parametrize("bad", [1, 3, 4])
 def test_a_push_batch_blames_the_first_failing_entry_and_pushes_the_ones_before_it(env, monkeypatch, capsys, bad):
-    """Four entries, one of which breaks the checks: a binary search over prefixes finds it in at most
-    three more check runs (ceil(log2 4) + 1). The entries before it go, and the later ones too after
-    one more check of them replayed without it."""
+    """Four entries, one of which breaks the checks. Entry 1 breaking them: the search finds it in at
+    most three more check runs and the later ones go after one more check of them replayed without it.
+    A later one: the first prefix that passes (entries 1-2) pushes at once, no further check runs, and
+    the rest go untested and unblamed to the next train (user msg #2317)."""
     log = env["tmp"] / "checks.log"
     p, repo, origin, other = _bump_setup(env, monkeypatch, [f"echo run >> {log}", "test ! -e plugins/p/bad.txt"])
     heads = [_entry(repo, f"e{n}", {f"plugins/p/{'bad' if n == bad else f'f{n}'}.txt": f"{n}\n"}) for n in (1, 2, 3, 4)]
     rc, m = _run_batch(p, _batch_marker(p, heads), monkeypatch)
-    good = [n for n in (1, 2, 3, 4) if n != bad]
-    assert _statuses(m) == ["check_failed" if n == bad else "pushed" for n in (1, 2, 3, 4)], m
-    assert m["results"][bad - 1]["detail"]["cmd"] == "test ! -e plugins/p/bad.txt"
+    good = [2, 3, 4] if bad == 1 else [1, 2]
     runs = len(log.read_text().split()) + _reused(capsys, f"echo run >> {log}")   # a recheck of a tree reuses its passes
-    assert runs == m["checks"]["runs"] and runs - 1 <= 3 + (bad < 4), runs
+    assert runs == m["checks"]["runs"], runs
     if bad == 1:
-        assert m["tip_passed"] is True, "the tip passed alone: the queue may forget it as failing"
+        assert _statuses(m) == ["check_failed", "pushed", "pushed", "pushed"], m
+        assert m["results"][0]["detail"]["cmd"] == "test ! -e plugins/p/bad.txt"
+        assert runs - 1 <= 4 and m["tip_passed"] is True, "the tip passed alone: the queue may forget it as failing"
+    else:
+        assert _statuses(m) == ["pushed", "pushed", "requeued", "requeued"], m
+        assert runs == 2, "the full head, then prefix 2, which passed and pushed"
+        assert all(r["detail"] == {"untested": True} for r in m["results"][2:]), "requeued, never blamed"
     assert rc == 0 and m["outcome"] == "pushed" and _versions(origin) == ("0.1.1", "0.1.1")
     more = f"; +{len(good) - 1} more" if len(good) > 1 else ""
     assert _bump_commits(origin) == [f"p: 0.1.1 (e{good[0]}: edit plugins/p/f{good[0]}.txt{more})"]
@@ -27354,6 +27359,7 @@ DURABLE_EXEMPT = {
     ("hostshim.py", "os.replace(tmp, os.path.join(store, name))"): "places that fake store file atomically; same lifetime as above",
     ("hostshim.py", 'with open(tab + ".tmp", "w") as f'): "a test run's fake crontab, thrown away with the run; never state",
     ("hostshim.py", 'os.replace(tab + ".tmp", tab)'): "places that fake crontab atomically; same lifetime as above",
+    ("overseer.py", 'lock = open(p.state / LOCK_FILE, "a")'): "the overseer's flock guard file, never written",
 }
 
 
@@ -29558,7 +29564,7 @@ def test_claude_hook_denies_ways_around_the_gh_guard(env, monkeypatch, tmp_path)
     worker, _ = get_provider("claude").build(role="worker", model="opus", effort="low", cwd=".", budget_usd=None,
                                              read_only=False, schema=None, restrictions={})
     pre = json.loads(worker[worker.index("--settings") + 1])["hooks"]["PreToolUse"][0]
-    assert pre["matcher"] == "Bash|Edit|Write|MultiEdit|NotebookEdit|Read|Grep|Glob|mcp__.*"
+    assert pre["matcher"] == "*", "every tool, subagents' calls included"
     assert pre["hooks"][0]["command"].endswith("ttp.hook PreToolUse")
 
 
@@ -37686,6 +37692,9 @@ class _FakeCaffeinate:
         return 0
 
 
+ON = {"runner": {"prevent_idle_sleep": "on"}}   # keep-awake is off by default (user msg #2295): these tests turn it on
+
+
 def _idle_hold(platform="darwin", ac=True, lid=None):
     from ttp import awake
     _FakeCaffeinate.started = []
@@ -37708,7 +37717,7 @@ def _idle_hold(platform="darwin", ac=True, lid=None):
 
 def test_idle_sleep_held_on_ac_with_work_by_caffeinate_i_s_tied_to_the_daemon(env):
     h, _, shown = _idle_hold()
-    h.update({}, lambda: True)
+    h.update(ON, lambda: True)
     [c] = _FakeCaffeinate.started
     assert c.argv == ["caffeinate", "-i", "-s", "-w", "777"], "idle and system (maintenance) sleep, on AC"
     assert not {"-d", "-u", "-m"} & set(c.argv), "the display may sleep and no user activity is faked"
@@ -37718,12 +37727,16 @@ def test_idle_sleep_held_on_ac_with_work_by_caffeinate_i_s_tied_to_the_daemon(en
 
 
 @pytest.mark.parametrize("platform,ac,work,cfg,why", [
-    ("darwin", False, True, {}, "on battery power"),
-    ("darwin", True, False, {}, ""),
+    ("darwin", False, True, ON, "on battery power"),
+    ("darwin", True, False, ON, ""),
     ("darwin", True, True, {"runner": {"prevent_idle_sleep": "off"}}, "off by config (runner.prevent_idle_sleep)"),
     ("darwin", True, True, {"runner": {"prevent_idle_sleep": False}}, "off by config (runner.prevent_idle_sleep)"),
     ("darwin", True, True, {"power": {"keep_awake": "off"}}, "off by config (runner.prevent_idle_sleep)"),
+    ("darwin", True, True, {}, "off by config (runner.prevent_idle_sleep)"),
+    ("darwin", True, True, {"runner": {"nice": 5}}, "off by config (runner.prevent_idle_sleep)"),
+    ("darwin", True, True, {"runner": {"prevent_idle_sleep": "sometimes"}}, "off by config (runner.prevent_idle_sleep)"),
     ("linux", True, True, {}, None),
+    ("linux", True, True, ON, None),
 ])
 def test_idle_sleep_not_held_on_battery_without_work_config_off_or_off_macos(env, platform, ac, work, cfg, why):
     h, power, shown = _idle_hold(platform, ac)
@@ -37740,29 +37753,29 @@ def test_idle_sleep_not_held_on_battery_without_work_config_off_or_off_macos(env
 def test_idle_sleep_released_when_work_ends_or_on_battery_and_never_held_twice(env):
     h, power, shown = _idle_hold()
     for _ in range(5):
-        h.update({}, lambda: True)
+        h.update(ON, lambda: True)
     assert len(_FakeCaffeinate.started) == 1, "one assertion at a time"
     first = _FakeCaffeinate.started[0]
     assert power["reads"] == 1, "the power source is read at most every POWER_EVERY_S"
-    h.update({}, lambda: False)
+    h.update(ON, lambda: False)
     assert first.ended and first.reaped and h.proc is None
     assert shown[-1] is None
-    h.update({}, lambda: True)
+    h.update(ON, lambda: True)
     second = _FakeCaffeinate.started[-1]
     assert len(_FakeCaffeinate.started) == 2 and not second.ended
     power["ac"] = False
     h._fresh()
-    h.update({}, lambda: True)
+    h.update(ON, lambda: True)
     assert second.ended and second.reaped and h.proc is None
     assert shown[-1]["why"] == "on battery power" and not shown[-1]["held"]
     h.update({"runner": {"prevent_idle_sleep": "on"}}, lambda: True)
     assert len(_FakeCaffeinate.started) == 2
     power["ac"] = True
     h._fresh()
-    h.update({}, lambda: True)
+    h.update(ON, lambda: True)
     third = _FakeCaffeinate.started[-1]
     third.ended = True   # someone killed it: the next tick holds again
-    h.update({}, lambda: True)
+    h.update(ON, lambda: True)
     assert len(_FakeCaffeinate.started) == 4 and not _FakeCaffeinate.started[-1].ended
     h.release()
     assert _FakeCaffeinate.started[-1].ended and _FakeCaffeinate.started[-1].reaped and shown[-1] is None
@@ -37822,13 +37835,13 @@ def test_lid_read_from_ioreg_and_unreadable_means_no_lid(env):
 def test_closed_lid_that_sleeps_the_mac_is_recorded_while_there_is_work(env, lid, ac, says):
     from ttp import awake
     h, power, shown = _idle_hold(ac=ac, lid=lid)
-    h.update({}, lambda: True)
+    h.update(ON, lambda: True)
     assert bool(shown and shown[-1] and shown[-1].get("lid_closed")) is says
     assert awake.pause_line(awake.line(shown[-1], 777)) is says
     assert ("battery" in awake.line(shown[-1], 777)) is (says and not ac), "a lid closed on battery says so"
     assert [c.argv for c in _FakeCaffeinate.started] == ([["caffeinate", "-i", "-s", "-w", "777"]] if ac else []), \
         "the lid changes what status says, not what is held"
-    h.update({}, lambda: False)
+    h.update(ON, lambda: False)
     assert shown[-1] is None, "no work, nothing to say about the lid"
 
 
@@ -37837,17 +37850,17 @@ def test_closed_lid_line_clears_when_the_lid_opens_and_off_by_config_still_says_
     h, power, shown = _idle_hold(lid={"closed": True, "causes_sleep": True})
     h.update({"runner": {"prevent_idle_sleep": "off"}}, lambda: True)
     assert _FakeCaffeinate.started == [] and awake.line(shown[-1], 777) == awake.LID_LINE
-    h.update({}, lambda: True)
+    h.update(ON, lambda: True)
     assert power["lid_reads"] == 1, "the lid is read at most every POWER_EVERY_S"
     assert awake.line(shown[-1], 777) == awake.LID_LINE and shown[-1]["held"]
     power["lid"] = {"closed": False, "causes_sleep": True}
     h._fresh()
-    h.update({}, lambda: True)
+    h.update(ON, lambda: True)
     assert "lid_closed" not in shown[-1]
     assert awake.line(shown[-1], 777).startswith("idle sleep: held while there is work")
     power["lid"] = {"closed": True, "causes_sleep": True}
     h._fresh()
-    h.update({}, lambda: True)
+    h.update(ON, lambda: True)
     h.release()
     assert shown[-1] is None, "shutdown clears the lid line too"
 
@@ -37882,7 +37895,7 @@ def test_idle_sleep_released_on_daemon_shutdown_and_shown_in_status(env, monkeyp
     seen = []
 
     def tick():
-        d._idle.update(d.cfg, lambda: True)
+        d._idle.update({**d.cfg, **ON}, lambda: True)
         seen.append(status_text(p))
         d.stopping = True
 
@@ -37931,14 +37944,14 @@ def test_closed_lid_says_work_pauses_in_status_and_web_instead_of_just_woke(env)
 def test_battery_power_is_named_as_why_keep_awake_is_not_held(env):
     from ttp import awake
     h, power, shown = _idle_hold(ac=False)
-    h.update({}, lambda: True)
+    h.update(ON, lambda: True)
     assert _FakeCaffeinate.started == [] and shown[-1]["why"] == awake.BATTERY
     assert awake.line(shown[-1], 777) == awake.BATTERY_LINE
     assert "AC power" in awake.BATTERY_LINE and not awake.pause_line(awake.BATTERY_LINE), \
         "an open lid on battery works until the Mac sleeps"
     power["lid"] = {"closed": True, "causes_sleep": True}
     h._fresh()
-    h.update({}, lambda: True)
+    h.update(ON, lambda: True)
     assert awake.line(shown[-1], 777) == awake.LID_BATTERY_LINE and awake.pause_line(awake.LID_BATTERY_LINE)
     assert "battery" in awake.LID_BATTERY_LINE and "battery" not in awake.LID_LINE
     assert awake.pause_line(awake.LID_LINE) and not awake.pause_line("")
@@ -37981,12 +37994,28 @@ def test_host_slept_alert_says_why_keep_awake_did_not_stop_the_sleep(env, state,
     assert says in al["text"] and not_says not in al["text"], al["text"]
 
 
+def test_idle_sleep_off_by_default_and_explicit_on_or_auto_still_holds(env):
+    """User msg #2295: tt-project never keeps a Mac awake unless the user sets the key; an explicit
+    value set before an upgrade keeps working."""
+    from ttp import awake, project as pj
+    assert awake.mode({}) == awake.mode(pj.DEFAULT_CONFIG) == "off"
+    for cfg in ({}, pj.deep_merge(pj.DEFAULT_CONFIG, {}), pj.deep_merge(pj.DEFAULT_CONFIG, {"runner": {"nice": 3}})):
+        h, _, shown = _idle_hold()
+        h.update(cfg, lambda: True)
+        assert _FakeCaffeinate.started == [] and h.proc is None, "no inhibitor by default"
+    for v in ("on", "auto", True):
+        h, _, shown = _idle_hold()
+        h.update(pj.deep_merge(pj.DEFAULT_CONFIG, {"runner": {"prevent_idle_sleep": v}}), lambda: True)
+        [c] = _FakeCaffeinate.started
+        assert c.argv[:3] == ["caffeinate", "-i", "-s"] and shown[-1]["held"] is True, v
+
+
 def test_idle_sleep_config_key_is_known_and_checked(env):
     from ttp import project as pj
-    assert pj.DEFAULT_CONFIG["runner"]["prevent_idle_sleep"] == "auto"
+    assert pj.DEFAULT_CONFIG["runner"]["prevent_idle_sleep"] == "off"
     assert pj.unknown_key_hint("runner.prevent_idle_sleep") is None
     assert pj.unknown_key_hint("power.keep_awake") is None, "older configs stay quiet"
-    assert "runner.prevent_idle_sleep: 'sometimes' is not auto, on or off; auto is used" in \
+    assert "runner.prevent_idle_sleep: 'sometimes' is not auto, on or off; off is used" in \
         pj.config_problems({"runner": {"prevent_idle_sleep": "sometimes"}})
     assert not [x for x in pj.config_problems({"runner": {"prevent_idle_sleep": "off"}}) if "idle" in x]
 
@@ -48178,6 +48207,7 @@ def _turn_budget_rig(p, monkeypatch, cost_of, flaky=lambda note: False):
     from types import SimpleNamespace
     from ttp.daemon import Daemon
     p.set_config("coordinator.max_turns_per_hour", 100000)
+    p.set_config("coordinator.wake_gap_s", 0)   # back-to-back turns in real time: no wake gap (wakegap_cases.py)
     d = Daemon(p.base)
     turns = []
 
@@ -48660,7 +48690,7 @@ def test_prguard_fast_path_remedy_names_a_working_flag(env, tmp_path, monkeypatc
     cli, p, run, mark = _fast_cli(env, tmp_path, monkeypatch, {"docs/n.md": "hi\n"}, True)
     cli.main(["checks"])
     msg = prguard._checks_problem(os.getcwd())
-    assert "ttp checks --full" in msg and "unset" not in msg
+    assert "ttp checks --fresh" in msg and "unset" not in msg   # --full is refused with the push queue on (#7629)
 
 
 def test_fast_path_skipped_when_a_scoped_check_applies(env, tmp_path, monkeypatch, capsys):

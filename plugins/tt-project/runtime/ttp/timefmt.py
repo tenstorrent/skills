@@ -213,10 +213,14 @@ def set_home(p, tz: str | None, source: str = "", why: str = "") -> bool:
     changed = old != tz
     # The harness follows a machine's clock here (`ttp connect`, a spend push), never a typed choice.
     setter = {"by": "harness", "via": f"home zone ({why})"[:80] if why else "home zone"}
-    if changed:
-        p.set_config(KEY, tz, by=setter)
-    if source and raw.get(FROM_KEY) != source:
-        p.set_config(FROM_KEY, source, by=setter)
+    from .configwho import Protected
+    try:
+        if changed:
+            p.set_config(KEY, tz, by=setter)
+        if source and raw.get(FROM_KEY) != source:
+            p.set_config(FROM_KEY, source, by=setter)
+    except Protected:   # a zone the user or a coordinator set stays (refused and raised to the coordinator)
+        return False
     if changed and old:
         p.db.post("out", f"Home time zone {old} -> {tz}" + (f" ({why})" if why else "") + ".",
                   chat=None, kind="info", severity="low")

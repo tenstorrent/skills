@@ -271,6 +271,14 @@ DEFAULT_CONFIG: dict[str, Any] = {
                     # waits) start no sooner than this long after the last turn ended, unless a slot is
                     # free with nothing ready to fill it (eventhold.py; 0: off).
                     "event_hold_s": 300,
+                    # Event-only batches with no immediate event (task ends, hand-offs, timers, waits)
+                    # wake at most once per this long after the last turn ended, a free slot included;
+                    # user messages and immediate events wake at once (eventhold.gap_until; 0: off).
+                    "wake_gap_s": 300,
+                    # The watcher model (babysit.ask) folds such a batch into the next wake, kept on disk;
+                    # a folded batch wakes once its oldest event is wake_triage_max_s old (waketriage.py).
+                    "wake_triage": True,
+                    "wake_triage_max_s": 1800,
                     # High events within this long after the turn high events woke (from its end) start
                     # no turn of their own: one follow-up turn reads them all when it ends. User
                     # messages, critical and safety-class events never wait (bursthold.py; 0: off).
@@ -294,15 +302,17 @@ DEFAULT_CONFIG: dict[str, Any] = {
                     # one, seeded with the hand-off, only once the provider rejected it). The session
                     # never rolls over as its context grows: it compacts in place once its last call's
                     # context reaches its first prompt (or its size after the last compaction) plus
-                    # compact_growth_tokens, at most context_window_tokens (0: by model) less
-                    # compact_margin_tokens (compact_tokens above 0: a fixed size instead);
+                    # compact_growth_tokens, and never so soon that it would free under compact_min_free
+                    # of it, at most context_window_tokens (0: by model) less compact_margin_tokens
+                    # (compact_tokens above 0: a fixed size instead);
                     # row_delta false sends each changed digest section whole (else keyed lists go by row).
                     # worker_context: what a worker or reviewer run starts with (ctxfork.py): "fork" a copy of
                     # this session at any size (same provider, written within worker_fork_max_age_h; it
                     # compacts in place if it must; worker_fork_max_tokens above 0 caps it), else "disk" the
                     # ledger, its note and worker_chat_chars of chat; "off" neither.
                     "session": {"compact_tokens": 0, "compact_growth_tokens": 100000,
-                                "context_window_tokens": 0, "compact_margin_tokens": 40000, "row_delta": True,
+                                "context_window_tokens": 0, "compact_margin_tokens": 40000, "compact_min_free": 0.3,
+                                "row_delta": True,
                                 "worker_context": "fork", "worker_fork_max_tokens": 0,
                                 "worker_fork_max_age_h": 12, "worker_chat_chars": 30000},
                     "turn_budget_usd": 1.0,
@@ -526,9 +536,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # prevent_idle_sleep (auto/on/off): on macOS, while the project has work and the machine is on AC
     # power, the daemon keeps the machine from idle and maintenance sleep (`caffeinate -i -s`; a closed lid
     # without an external display, or a sleep the user asks for, still sleeps it). auto = on for
-    # workstations (a Mac is one); other platforms never.
+    # workstations (a Mac is one); other platforms never. off (the default): never held; the user keeps
+    # the machine awake themselves as needed.
     # pin_verify: strict refuses an explicit task model/effort pin that cannot be verified before a turn.
-    "runner": {"nice": 10, "prevent_idle_sleep": "auto", "pin_verify": "lenient"},
+    "runner": {"nice": 10, "prevent_idle_sleep": "off", "pin_verify": "lenient"},
     # `ttp bench run` (benchrun.py): arms {name: {provider, model, effort}} (none shipped) and the
     # limits every cell gets alike.
     "bench": {"arms": {}, "reps": 1, "timeout_s": 3600, "stall_s": 900, "budget_usd": 8.0, "test_timeout_s": 900},
@@ -598,7 +609,9 @@ EXTRA_KEYS = {
     # root_ref_lock_s: the age (unset: 3600 s; 0: off) past which a ref lock in the project root's repository
     # that nothing may own is moved aside by the daemon's harness sweep (gitlocks.clear_root_refs).
     "harness_git": {"stale_lock_s", "root_ref_lock_s"},
-    "watchdog": {"stale_git_lock_s", "step_budget_s"},   # step_budget_s: see DEFAULT_CONFIG; stale_git_lock_s: deprecated alias of harness_git.stale_lock_s, read only when that is unset
+    # stale_git_lock_s: deprecated alias of harness_git.stale_lock_s, read only when that is unset.
+    # step_budget_s: seconds each daemon tick step may run (unset: daemon.STEP_BUDGET_S; Daemon._step_budget).
+    "watchdog": {"stale_git_lock_s", "step_budget_s"},
     # push_queue..after_push_timeout_s: the daemon-owned push queue (see PUSH_QUEUE_DEFAULTS).
     # backup_remote: a git remote finished code tasks' branches are pushed to, fast-forward only (off: unset).
     # fast_forward_also: more branches each push moves to the pushed commit, fast-forward only (off: unset).
@@ -614,6 +627,7 @@ EXTRA_KEYS = {
     # push_solo_paths: pathspecs a batch takes at most one routine change touching (pushq.SOLO_PATHS, off); push_cap_tests:
     # the name regex of prompt size cap tests, whose lone failure sends a trim-to-fit fix (conflictfix.CAP_TESTS).
     # push_rerun_s: the time limit of one rerun of a failed push check's failing tests (batch.RERUN_S).
+    # push_hard_tests: the regex of failing test ids a batch never excuses as the tip's own (batch.HARD_TESTS, the leak scan).
     # mechanical_merge_paths: globs of shared docs whose push-rebase conflicts settle by keeping both sides'
     # lines, carrying the approval (batch.settle_union; default batch.MECHANICAL_PATHS, empty: off).
     # landed_probe: with no push_branch, the read-only command (`{id}`: the task id) that answers
@@ -622,15 +636,16 @@ EXTRA_KEYS = {
     # push_pool_wait_s: how long one push check may wait for test-pool slots in all (push.pool_wait_of; 0: no bound).
     # push_retries: how often a detached push retries a cause it clears itself, a non-fast-forward
     # (--own) or a reboot that cut it short (push.retries_of; default 2, 0: never).
-    "delivery": {"base_ref", "push_branch", "landed_probe", "push_checks", "push_checks_by_repo", "push_exclude_paths", "push_rounds", "push_wait_s",
+    "delivery": {"base_ref", "push_branch", "landed_probe", "push_checks", "post_land_checks", "push_checks_by_repo", "push_exclude_paths", "push_rounds", "push_wait_s",
                  "push_checks_timeout_s", "push_pool_wait_s", "push_retries",
                  "version_bump", "push_queue", "push_batch_s", "push_batch_max", "push_min_gap_s", "push_age_s", "push_landing_alert_h", "push_script_torn_escalate_after",
                  "push_setup_fault_escalate_after", "after_push",
-                 "push_solo_paths", "push_cap_tests", "push_rerun_s", "mechanical_merge_paths",
+                 "push_solo_paths", "push_cap_tests", "push_rerun_s", "push_hard_tests", "mechanical_merge_paths",
                  "after_push_timeout_s", "backup_remote", "fast_forward_also", "mirror_remotes",
                  "allow_protected_push_branch", "own_push", "own_push_remote", "own_push_reserved_lane", "deploy_restart_wait_s", "plugin_version_guard",
                  "checks_fast_globs", "checks_fast_exclude",   # these two: `ttp checks` fast path (push.FAST_GLOBS),
                  "checks_targeted", "checks_targeted_always",   # a task's `ttp checks` runs the tests its diff reaches (testpick)
+                 "checks_task_full",   # the user's own: a task's `ttp checks --full` runs with the push queue on (testpick.full_refusal)
                  "checks_host",   # where checks run (remotecheck)
                  "checks_spill_hosts", "checks_spill_after_s", "checks_spill_first",   # where busy checks may spill to (checkspill)
                  "check_prestage",   # a short foreground run before `ttp checks --detach` (checkprestage)
@@ -752,7 +767,8 @@ def _known_keys(path: list[str]) -> set[str] | None:
                 "spill_beside_device", "spill_pre_cmd", "fallback_lane", "no_device_cmds", "slots", "light_cmds", "max_wait_s", "wait_event_s",
                 "wait_escalate_s", "wait_hang_factor", "priority_age_s", "test_project_max", "test_project_slots",
                 "test_project_workers", "test_run_max", "test_run_min",
-                "done_holder_flag_s", "done_holder_grace_s", "stall_s", "push_load_wait_s"}
+                "done_holder_flag_s", "done_holder_grace_s", "stall_s", "push_load_wait_s",
+                "smoke_max_s"}   # the landing check time limit (gatetime.max_s; default 600 s, 0: off)
     if len(path) == 1 and isinstance(DEFAULT_CONFIG.get(path[0]), dict):
         return set(DEFAULT_CONFIG[path[0]]) | EXTRA_KEYS.get(path[0], set())
     return None
@@ -917,8 +933,8 @@ def code_tasks_may_push(cfg: dict) -> bool:
 # delivery.push_queue on: reviews approve into the daemon's queue, which pushes approved heads in
 # batches (a batch starts at once when no review is running or ready, else once the oldest approval
 # waited push_batch_s, push_batch_max are waiting or approvals waited out the last batch; after a batch
-# that did not end clean, not before push_min_gap_s passed since it ended unless it is full or priority
-# 1-2; after a clean one a backlog grows a batch up to pushq.BATCH_GROW times push_batch_max)
+# that did not end clean, not before push_min_gap_s passed since it ended unless it is full, priority
+# 1-2 or they waited it out; a batch, one train, takes every approval due, push_batch_max caps none)
 # push_age_s: an approval sorts one priority better per this many seconds waited, never past priority 2
 # (pushq._approved; 0 = off), so a stream of priority 1-2 approvals cannot starve a routine one.
 # and then runs after_push (commands like push_checks), killed after after_push_timeout_s.
@@ -1161,9 +1177,11 @@ def config_problems(raw: dict, root: Path | None = None) -> list[str]:
         out.append(str(e))
     out += [f"delivery.push_checks: {p}" for p in check_problems(delivery.get("push_checks"))]
     out += [f"delivery.push_checks: {p}" for p in applicability_problems(delivery.get("push_checks"), root)]
+    out += [f"delivery.post_land_checks: {p}" for p in check_problems(delivery.get("post_land_checks"))]
     out += [f"delivery.push_checks_by_repo: {p}" for p in by_repo_problems(delivery.get("push_checks_by_repo"))]
-    if delivery.get("checks_targeted") not in (None, True, False):
-        out.append("delivery.checks_targeted: not true or false")
+    for k in ("checks_targeted", "checks_task_full"):
+        if delivery.get(k) not in (None, True, False):
+            out.append(f"delivery.{k}: not true or false")
     for k in ("checks_fast_globs", "checks_fast_exclude", "checks_targeted_always"):
         v = delivery.get(k)
         if v is not None and not (isinstance(v, list) and all(isinstance(x, str) for x in v)):
@@ -1260,7 +1278,7 @@ def config_problems(raw: dict, root: Path | None = None) -> list[str]:
         out += [why for why in [nice_level(raw["runner"])[1]] if why]
     v = (raw.get("runner") or {}).get("prevent_idle_sleep") if isinstance(raw.get("runner"), dict) else None
     if v is not None and not isinstance(v, bool) and str(v).strip().lower() not in ("auto", "on", "off"):
-        out.append(f"runner.prevent_idle_sleep: {v!r} is not auto, on or off; auto is used")
+        out.append(f"runner.prevent_idle_sleep: {v!r} is not auto, on or off; off is used")
     v = (raw.get("runner") or {}).get("pin_verify") if isinstance(raw.get("runner"), dict) else None
     if v is not None and v not in ("strict", "lenient"):
         out.append(f"runner.pin_verify: {v!r} is not strict or lenient")
@@ -1419,7 +1437,7 @@ _WORKER_WORD = re.compile(r"\bworkers?\b", re.I)
 
 def worker_memory(e: dict) -> int:
     """Where memory entry `e` stands in a worker's prompt: 1, pinned (tagged for workers,
-    restrictions, resources, standing entries; worker_always says which of them no limit drops); 2,
+    restrictions, resources, standing entries; worker_always says which of them no limit shortens); 2,
     shown first while they fit (entries that speak of workers); 3, then the newest facts that fit; 0,
     never (the rest, written for the coordinator:
     decisions and preferences that are not standing, and anything tagged for the coordinator but a
@@ -1432,10 +1450,11 @@ def worker_memory(e: dict) -> int:
 
 
 def worker_always(e: dict) -> bool:
-    """Whether a worker's prompt carries pinned entry `e` whatever its limits: the set the coordinator
-    always shows (restrictions, resources, standing entries). Other pinned ones (tagged for workers)
-    fill the room left."""
-    return bool(e["kind"] in ("restriction", "resource") or e.get("standing"))
+    """Whether a worker's prompt carries pinned entry `e` whatever its limits: restrictions and resources
+    (a worker that misses one breaks a rule or acts on the wrong machine or folder). Standing entries
+    and the others tagged for workers fill the room left, standing ones first; past it each is a
+    pointer (memory_pointer) to where it is in full."""
+    return bool(e["kind"] in ("restriction", "resource"))
 
 
 def coordinator_memory(e: dict) -> bool:
@@ -1643,15 +1662,30 @@ class Project:
         from . import routeguard
         if why := routeguard.refusal(before, raw, by):
             raise ValueError(why)
+        if self._guarded(dotted, by, before, raw):
+            return
         if self.config_status == "fallback":
             self.keep_broken_config()
         write_json(self.config_path, raw)
         if self.established():   # a project still being made has no database to record it in yet
             try:
                 from . import configwho
-                configwho.record(self.db, dotted, by, before=before, after=raw)
+                configwho.changed(self, dotted, by, before, raw)
             except Exception:   # the setting is written; a busy or broken database only loses its setter
                 pass
+
+    def _guarded(self, dotted: str, by: dict | None, before: dict, after: dict) -> bool:
+        """configwho.guard: raises configwho.Protected when an automated setter would change a value the
+        user or a coordinator set; True when there is nothing to write."""
+        if not self.established():
+            return False
+        from . import configwho
+        try:
+            return configwho.guard(self, dotted, by, before, after)
+        except configwho.Protected:
+            raise
+        except Exception:   # a busy or broken database never stops the change itself
+            return False
 
     def unset_config(self, dotted: str, by: dict | None = None) -> bool:
         """Remove one key from project.json, so it reads its default again, and record who did; sections
@@ -1678,13 +1712,14 @@ class Project:
         from . import routeguard
         if why := routeguard.refusal(before, raw, by):
             raise ValueError(why)
+        self._guarded(dotted, by, before, raw)
         if self.config_status == "fallback":
             self.keep_broken_config()
         write_json(self.config_path, raw)
         if self.established():
             try:
                 from . import configwho
-                configwho.record(self.db, dotted, by, before=before, after=raw)
+                configwho.changed(self, dotted, by, before, raw)
             except Exception:   # as in set_config: the removal is written; only its setter is lost
                 pass
         return True
@@ -2074,9 +2109,10 @@ class Project:
     def worker_memory_select(self, limit_chars: int, task: dict | None = None, pinned_limit: int | None = None,
                              restated=None, entries: list[dict] | None = None) -> tuple[list[dict], dict]:
         """The entries a worker's prompt gets, whole, oldest first: those worker_memory pins, the
-        restrictions, resources and standing ones always (worker_always), whatever the limits, then the
+        restrictions and resources always (worker_always), whatever the limits, then the
         others while they fit `pinned_limit` (None:
-        all; when not all fit, those that share the most words with `task` first, then the oldest);
+        all; when not all fit, those that share the most words with `task` first, then standing ones,
+        then the oldest);
         then, only if every pinned one fits: for `task`, the
         others that share words with its title and spec (task_words; a word few entries share weighs
         more), most shared first, then newest, each that fits; then those that speak of workers and
@@ -2105,8 +2141,8 @@ class Project:
                 for w in ws:
                     df[w] = df.get(w, 0) + 1
             return {n: sum(1 / df[w] for w in ws) for n, ws in words.items()}
-        # Restrictions, resources and standing entries first, every one whatever the limits: a worker that
-        # misses one breaks a rule or acts on the wrong machine or folder.
+        # Restrictions and resources first, every one whatever the limits: a worker that misses one breaks
+        # a rule or acts on the wrong machine or folder. Standing entries lead the rest, within the room.
         kept = [e for e in pinned if worker_always(e)]
         used = kept_chars = sum(len(e["line"]) + 1 for e in kept)
         chosen = {e["name"] for e in kept}
@@ -2116,7 +2152,8 @@ class Project:
         # then each shown whole (in place of its pointer) while that fits.
         short = {e["name"]: memory_pointer(e) for e in pinned if over and e["name"] not in chosen}
         used += sum(len(x) + 1 for x in short.values())
-        for _, e in sorted(enumerate(pinned), key=lambda x: (-score.get(x[1]["name"], 0), x[0])):
+        for _, e in sorted(enumerate(pinned), key=lambda x: (-score.get(x[1]["name"], 0),
+                                                             not x[1].get("standing"), x[0])):
             if e["name"] in chosen:
                 continue
             ptr = len(short[e["name"]]) + 1 if e["name"] in short else 0
@@ -2977,7 +3014,8 @@ ACCOUNT_KEYS = {"budget": {"global_daily_usd", "daily_target_usd", "day_start", 
                            "push_priority_wait_s",   # a push's longest wait behind another priority holder (checkcap.priority_wait_s)
                            "dirty_max_mb", "io_full_max",   # the disk gate on new local runs (diskgate)
                            "spill_hosts",   # the spill pool every project's checks may use (checkspill.account_hosts)
-                           "slurm_overflow"}}   # a Slurm cluster the pool's overflow runs on (slurmcheck)
+                           "slurm_overflow",   # a Slurm cluster the pool's overflow runs on (slurmcheck)
+                           "smoke_max_s"}}   # the landing check time limit (gatetime.max_s), project first
 # Account keys a run may only clear (ttp config --account refuses setting them inside a run): remove them
 # ('') or set them to their off value (ACCOUNT_OFF_VALUE), which only reduces their reach.
 # The ranking's source and key file too: the key goes to that source, so only the user names either.

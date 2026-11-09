@@ -102,6 +102,29 @@ project's daemon started after the alert). Other one-shot deploy and upgrade lin
 upgrade merge, a restored release, an upgrade recovered at start) are below high, so they appear
 only in the feed and never under "needs you".
 
+Each project also runs an overseer (`ttp.overseer`, its own service with `Restart=always`) beside
+the daemon. It shares no process, lock or tick step with it: once a minute it reads the database
+read-only (a short busy timeout, never waiting on the daemon's writes) and the run folders, and
+judges the tick loop by its results, not its heartbeat: the last dispatch, urgent work ready with
+a free slot, finished runs not reaped, coordinator answers not applied, events not delivered and
+slow tick steps per hour. That reading is one `loop health:` line in every coordinator digest,
+`ttp status` and `ttp deployed`. Urgent work waiting with a free slot, a run unreaped or an answer
+unapplied for over 5 min, or a stale heartbeat, is a results failure: the overseer saves the
+daemon's stacks under `state/incidents/` (py-spy when installed, else the daemon's own stack dump)
+and records one incident in that line until the results are good again. The daemon restarts an
+overseer whose heartbeat is over 5 min old. Idle cost: no model call, a few read-only queries a
+minute.
+
+The coordinator decides when it looks next: a `look` action sets a time, what to check and why,
+and optionally a shell check that skips the wake when it exits 0 (nothing changed). While a look
+is pending it replaces the fixed idle and idle-slot wakes; with none, those come back. A due look
+starts a turn in the same session. If the tick loop leaves a look pending 3 min past due, the
+overseer starts that turn itself (at most one every 10 min); the loop and the overseer share one
+start lock, so they never start two turns. A tick step over its budget in 3 of its last 10 runs
+sits out the next 10 ticks (never the steps that reap, start turns, dispatch or deliver). It is
+one incident in `state/overseer-incidents.jsonl` with the daemon's stacks, and a look wakes the
+coordinator with that evidence.
+
 ## Budget
 
 - Subscription plans: a plan's capacity is lost at each reset, so the project uses it. Below the
@@ -338,7 +361,8 @@ only in the feed and never under "needs you".
   that carries the head, a push branch no push reaches, a recorded landing), gets its review and
   a low feed line, at most `review.unreviewed_per_pass` (default: the project's
   `budget.max_parallel_workers`, 0 off) per pass, for tasks
-  updated within `review.unreviewed_max_age_h` (default 72); it runs every 5 minutes and in the
+  updated within `review.unreviewed_max_age_h` (default 72); it runs every 5 minutes (every 100
+  seconds after a pass cut short that queued a review, so a backlog drains) and in the
   blocker sweep, reads local refs only, and never queues a second review of one head. Its first pass
   after an upgrade logs how many done code tasks in that window have no landing, push-queue entry
   or superseded record, so a backlog of finished changes shows. A code task still in review
@@ -483,8 +507,10 @@ only in the feed and never under "needs you".
   rejected a resume. A full context never starts a new session: the session compacts in place and
   keeps its id. The context is the last model call's prompt and answer; the compaction point is the
   session's first prompt (or its size after its last compaction, the larger) plus
-  `compact_growth_tokens` (100000), at most the model's context window (`context_window_tokens`; 0
-  reads it from a `[1m]` model id, else no cap) less `compact_margin_tokens` (40000).
+  `compact_growth_tokens` (100000), and never so soon that a compaction would free under
+  `compact_min_free` (0.3) of the context, judged by the size the last one left; at most the model's
+  context window (`context_window_tokens`; 0 reads it from a `[1m]` model id, else no cap) less
+  `compact_margin_tokens` (40000), which always forces one.
   `compact_tokens` above 0 (default 0) sets a fixed point instead. The older `rollover_tokens`,
   `rollover_growth_tokens` and `rollover_margin_tokens` names are still read for a project that sets
   no `compact_*` value. A resumed wake that fails is recorded as an event
@@ -1526,12 +1552,15 @@ session and stateless coordinators on every provider.
   changelogs, changesets, manifests, `__init__.py`), `hub_bytes` (tracked files larger than this,
   150000, touched by most changes, never count), `branch_days` (14) and `settled_days` (14). Folders and the files the
   check commands (`delivery.push_checks`) name never count either: specs cite those as the required suite.
-- On macOS, while the project has work (a running run or push, or queued work that can start now)
+- tt-project never keeps a machine awake by default: `runner.prevent_idle_sleep` is `off`, and you
+  keep your Mac awake yourself as needed. Set it to `on` (or `auto`, on for a Mac) with
+  `ttp config <name> runner.prevent_idle_sleep on`; a value you set stays across upgrades. Then,
+  on macOS, while the project has work (a running run or push, or queued work that can start now)
   and the machine is on AC power, the daemon keeps it from idle and maintenance sleep with
   `caffeinate -i -s`, tied to the daemon's process so it ends with it. A closed lid without an
   external display, or a sleep you ask for, still sleeps the machine; the harness never changes
-  `pmset` settings. It lets go when the work ends, on battery, or with `runner.prevent_idle_sleep` set
-  to `off` (`auto`, the default, is on for a Mac; other platforms never hold one). `ttp status` and
+  `pmset` settings. It lets go when the work ends, on battery, or with the key set back to `off`;
+  other platforms never hold one. `ttp status` and
   the web app say when it is held, or why not while there is work, and say "the lid is closed: work
   pauses while the Mac sleeps" while a closed lid will sleep it.
 - A shared device or machine is taken per command, through its own queue (for example a device
@@ -1756,6 +1785,14 @@ session and stateless coordinators on every provider.
   changes raises an alert naming it. Before a worktree is made, a root left detached or off its
   branch (`worktree.root_branch`, else the one it was last seen on) is put back when it has no
   uncommitted changes, else alerted; worktrees never start from such a HEAD.
+- Smoke before landing: `delivery.push_checks` gate every landing, so keep them under 10 min on
+  their host (aim 5). Slower tests belong in `delivery.post_land_checks`, but nothing runs that list
+  yet: keep them running elsewhere (a schedule on the push branch tip) before you shorten
+  `push_checks`. `ttp status` and the daily
+  review show the landing check time (median and p90, last 24 h and last 10 runs); over
+  `checks.smoke_max_s` (default 600 s) the project's coordinator gets one observation a day naming the
+  slowest tests (push-checks reference, "Smoke before landing"). `ttp status` also shows the waits:
+  checks wait to start and approval to landed (median and p90, last 24 h).
 - Where reviewed changes go straight to a shared branch, `ttp push` publishes them guarded: it
   refuses uncommitted changes, rebases onto the latest tip, runs `delivery.push_checks` on the
   exact commit it pushes, starts over if the branch moved meanwhile, and never forces. A
@@ -2502,8 +2539,8 @@ session and stateless coordinators on every provider.
   fast path: when every changed path matches one and none matches `delivery.checks_fast_exclude`
   (by default code, scripts, manifests, tests, templates and skill/prompt files; a list replaces
   it), `ttp checks` runs only the whitespace and CRLF checks and says so. That pass is not a full
-  pass: it never counts for a PR or `on_pass`. `ttp checks --full` runs the project's checks
-  anyway (it is kept when the checks are queued or relaunched after a reboot), and a full pass
+  pass: it never counts for a PR or `on_pass`. `ttp checks --fresh` (or `--full`, where it is not
+  refused) runs the project's checks anyway (it is kept when the checks are queued or relaunched after a reboot), and a full pass
   already recorded for the tree is reused. A scoped `push_checks` entry that applies also turns it
   off. Known gap: a project that opts in owns its globs. A glob that covers installed or
   test-asserted content (for example a plugin README that tests read) skips the checks those
@@ -2520,13 +2557,19 @@ session and stateless coordinators on every provider.
   A targeted pass counts only for that narrowed run: it never counts as the full check's pass and
   sets no verified-through marker. `ttp push` and the push queue never narrow: every batch runs the
   full required checks. `delivery.checks_targeted: false` (or `ttp checks --full`) restores full
-  runs. With the push queue on, the batch's full run on the merged tree (bisected to the changes at
-  fault when it fails) is the full-suite gate, so a task's own checks run in full only where the
-  whole suite is affected (a conftest, a shared test helper or fixture, the checks runner's own
-  files, a manifest, `__init__.py` or config file, a test file's module-level code); a selection of
-  half the suite or more stays targeted. A change only the full suite covers (a module's module-level code, the checks functions in
-  a module, something no test names) adds the tests it can place, and the scope line ends `; the push
-  batch runs the rest: <reasons>`. Checks already waiting for a slot re-execute on the new runtime
+  runs. With the push queue on, the push train's full run on the merged tree (bisected to the changes
+  at fault when it fails) is the only full suite, so a task's or review's own checks never run in
+  full: a change that would widen to the whole suite (a conftest, a shared test helper or fixture,
+  the checks runner's own files, a manifest, `__init__.py` or config file, a test file's module-level
+  code) runs only the units importing or naming the changed file, plus those naming a function or
+  fixture it changes, and a selection of half the suite or more stays targeted. A task's
+  `ttp checks --full` is refused with a one-line reason unless the user set
+  `delivery.checks_task_full: true`; `ttp checks --release` (the release cut's required suite) always
+  runs in full: never narrowed, refused or fast-pathed. A change only the full suite covers adds the tests it can place,
+  and the scope line ends `; the push batch runs the rest: <reasons>`. With the push queue off a
+  task's checks narrow and widen as before. Each checks run records its wall and CPU seconds
+  (`wall_s`, `cpu_s`) in `checks.json`; `ttp stats <name> --landing` shows per day the test runs and
+  full suites, CPU-hours and $ per landed change, and approved to landed (median and p90). Checks already waiting for a slot re-execute on the new runtime
   and pick their scope again.
 - `ttp checks -- <cmd>` adds a check. Several words run as that argv (`ttp checks -- pytest -q`);
   one quoted string runs through the shell (`ttp checks -- 'FOO=1 pytest -q && ruff check .'`);
@@ -2599,28 +2642,38 @@ session and stateless coordinators on every provider.
   since rewritten goes after that change (in the same batch when both are approved, else it waits
   for that landing, at most two hours), so it is rebased and re-reviewed once instead of losing
   its approval at each of the other's landings; a failed check fails the
-  review and wakes the coordinator. The batch finds the first change that fails by checking
-  prefixes, pushes the ones before it, and checks the ones after it once more without it, pushing
-  them too when they pass. A failed pytest check is judged as `ttp checks` judges one: its failing
+  review and wakes the coordinator. When the whole train fails, the batch checks prefixes, and the
+  first one that passes every push check pushes at once: it is never checked again and no change
+  joins it, and the changes after it go untested and unblamed into the next train on the new tip.
+  Only when even the first change fails alone is it blamed; the ones after it are then checked once
+  more without it and pushed when they pass. A failed pytest check is judged as `ttp checks` judges one: its failing
   tests (at most 10) not yet judged at that head rerun once there, within `push_rerun_s` (default
   600), and those failing again rerun on the tip alone, on the same host, up to 3 times. A test that
   passes on its rerun is flaky (quarantined), one that fails on the tip too is pre-existing, and a
   quarantined test the batch does not touch is excused at once: when none is new the check passes,
   the batch goes on and the coordinator is told once per test so a fix gets queued. A check that did
-  not exit 1, or that pytest stopped early (`-x`, `--maxfail`, an interrupt), is never rerun. The
-  search runs only the new failing tests at each prefix and the full suite once, at the prefix they
-  pass on. Keys, all under `delivery`: `push_batch_s` (default 300: with
+  not exit 1, or that pytest stopped early (`-x`, `--maxfail`, an interrupt), is never rerun. A test
+  the tip fails on its own is pre-existing for the whole batch, so it blocks none of its changes; tests
+  whose id matches `push_hard_tests` (a regex, default `leak`: the leak scan) and a failed check that
+  names no test ids still block. The batch's checks spill as `ttp checks` does: with
+  `delivery.checks_spill_hosts` set and spill first on, each check that may spill runs on the first free
+  spill host with that host's worker grant (a fixed `-n N` above it is lowered to it), the rest here; a
+  spill host's own fault (ssh, the host) reruns that check on the next free spill host, else here, and
+  never fails or holds the batch. Only a check's first full run spills: every rerun of its failing tests
+  (the judge's, the search's) runs here, with its test selection. `ttp checks status` shows each run on a spill host, and each run that
+  stayed on the project host with why. The search runs only the new failing tests at each prefix and the full suite once, at the prefix they
+  pass on, which then pushes. Keys, all under `delivery`: `push_batch_s` (default 300: with
   no review running or ready an approval starts a batch at once; otherwise the batch starts once the
   oldest approval waited this long; 0 = at once), `push_batch_max`
-  (default 8: start at once with this many; also the most one batch takes, except that after a
-  clean batch a bigger backlog grows the batch up to three times this), `push_min_gap_s`
+  (default 8: start at once with this many; it caps nothing: one train takes every approval due), `push_min_gap_s`
   (default 1800: after a batch that did not end clean, such as a failing tip or a dead batch, the
   next starts only once it ended at least this long ago, measured
   from its recorded end so a restart never stretches the wait; none after a clean batch, though a
   new batch never starts while the last one's after_push still runs; a full batch, a
   priority 1-2 review's approval, or one the last batch requeued unchecked after a failing change
-  starts at once; 0 = off). Approvals that waited while the last clean batch ran start the next one
-  at once, and priority 1-2 approvals always lead it. `push_age_s` (default 14400, 4 h; 0 = off):
+  starts at once; 0 = off). Approvals that waited while the last batch ran start the next one as
+  it ends, clean or not, and priority 1-2 approvals always lead it; when such fast approvals start a
+  train before the window, every other approval due rides in it. `push_age_s` (default 14400, 4 h; 0 = off):
   an approval of priority 3 or worse sorts one priority better per this many seconds it has waited,
   never better than priority 2, so a steady stream of priority 1-2 approvals cannot keep it out of
   batches; aged to priority 2 it is older than that stream and leads it, while priority 1 and urgent
@@ -3033,7 +3086,7 @@ is open raises one `cap_wait` event naming the key.
 | `coordinator.review_stall_s` | 1800 s (old: 14400) | a dependency in review before the coordinator hears of it | convenience |
 | `checks.test_project_max` | from cores and memory, at least 2 (`auto`) | a project's suites at once | convenience |
 | `delivery.push_batch_s` | 300 s, none after a clean batch | changes gathered into one push | convenience |
-| `delivery.push_batch_max` | 8 | most changes in one push batch (a full batch starts at once; a backlog after a clean batch grows it up to 3x) | convenience |
+| `delivery.push_batch_max` | 8 | approvals that start a push train at once; one train takes every approval due, so it caps nothing | convenience |
 | `delivery.push_age_s` | 14400 s (4 h) | a priority 3+ approval in the push queue sorts one priority better per period waited (never past 2) | convenience |
 | `coordinator.burst_window_s` | 120 s (0: off) | high events after a turn high events woke, until one follow-up turn reads them all; never user messages, critical or safety-class events | convenience |
 | `retry_when` / `start_when` probe (`waiting.poll_s`) | 90 s (20-180 s); only a `start_when` probe of an arbitrary command that keeps saying not-yet backs off, to at most 600 s (`MAX_EVERY_S`) with the wait's length; landing (`landed:#`, ttp landed), job (detach --check), checks --result, push --result, lock --probe, CI, ack-wait, upstream --fixed and date (`test "$(date ...`) probes, and every `retry_when` probe, keep `waiting.poll_s`; a pass wakes the task at once whatever its timer | a waiting or deferred task before its probe runs again | convenience |

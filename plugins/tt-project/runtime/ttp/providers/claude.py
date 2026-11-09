@@ -75,14 +75,13 @@ BUNDLED_SKILLS = ("dataviz", "update-config", "keybindings-help", "code-review",
                   "batch", "doctor", "run-skill-generator", "plugin-authoring",
                   *(f"anthropic-skills:{name}" for name in ("docs", "docx", "google-workspace", "import-memory",
                                                             "morning", "pdf", "pptx", "skill-creator", "xlsx")))
-# What a worker or reviewer may use, passed as --tools: the built-in tools workers called in the
-# 14 days to 2026-10-24 (~4,500 runs: Bash, Read, Edit, Write, the web tools in 8 runs; never Monitor,
-# TaskStop, NotebookEdit, subagents or scheduling), Skill for the plugin skills, and ToolSearch, which
-# loads MCP tools on demand: without it every MCP tool's full schema is sent on every call (measured:
-# 13.7k -> 28.3k tokens with three user servers). With nothing to defer it added no tokens
-# (measured), so it costs a worker without MCP servers nothing. MCP tools are not built-in, so --tools never
-# drops them; StructuredOutput comes with --json-schema. The allowlist replaces the old denylist
-# (WORKER_DENIED_TOOLS, kept for a CLI without --tools) and cuts ~0.6k tokens a call.
+# A CLI flag that limits the built-in tools. Workers and reviewers no longer get it (user msg #2302):
+# they run on Claude Code's full standard tool set, Agent included, so they can start subagents. The
+# harness's rules hold through ttp.hook's PreToolUse on every tool (subagents' calls included: their
+# payload carries `agent_id`, checked live, CLI 2.1.296) and through permission rules, never by
+# withholding a tool. The tools that would step outside the harness are refused by the hook with the
+# way the harness offers instead (hook.HARNESS_TOOLS). Only these are still withheld: the web tools
+# under the no_internet restriction, and a project's own providers.claude.disallowed_tools.
 TOOLS = "--tools"
 # The user's claude.ai connectors load in every run that is not isolated (--strict-mcp-config drops them
 # too): their deferred tool names and instructions, also for those that need a login. Measured on the
@@ -93,14 +92,6 @@ CONNECTORS_OFF = {"ENABLE_CLAUDEAI_MCP_SERVERS": "false"}
 CONNECTOR_PREFIXES = ("claude.ai", "claude_ai_", "mcp__claude_ai_")   # server name, its tools' prefix
 WORKER_TOOLS = ("Bash", "Read", "Edit", "Write", "Skill", "ToolSearch")
 WEB_TOOLS = ("WebFetch", "WebSearch")
-# Scheduling, remote and orchestration tools a headless worker must not use; their definitions
-# alone are ~3.7k tokens a call. Then tools no worker used in ~1,000 runs, or that would step outside
-# the harness (its own worktrees, other sessions). Measured on the first call of a 'reply OK' worker
-# run, CLI 2.1.285: 10.6k tokens -> 9.3k without the notebook/worktree/listing/findings tools, 7.9k
-# also without subagents ("Task" in the init event, "Agent" in tool calls).
-WORKER_DENIED_TOOLS = ("Workflow", "ScheduleWakeup", "CronCreate", "CronDelete", "CronList", "RemoteTrigger",
-                       "PushNotification", "DesignSync", "NotebookEdit", "EnterWorktree", "ExitWorktree",
-                       "ListAgents", "ReportFindings", "Task", "Agent", "SendMessage")
 
 
 @register
@@ -171,13 +162,11 @@ class Claude(Provider):
             # unused fields with null (most of a coordinator answer). parse() reads it as sparse.
             argv += ["--json-schema", json.dumps(strict_schema(schema, require_all=False))]
         if not read_only:
+            # The full standard tool set (TOOLS above): only the web tools where the run may not use the
+            # web, and the project's own denylist, are withheld.
             web = web and not restrictions.get("no_internet")
-            if self.supports(TOOLS):
-                argv += [TOOLS, ",".join([*WORKER_TOOLS, *(WEB_TOOLS if web else ())])]
-                denied = []
-            else:
-                denied = list(WORKER_DENIED_TOOLS) + ([] if web else list(WEB_TOOLS))
-            denied += [t for t in disallowed_tools if t not in denied]   # the project's own denylist
+            denied = [] if web else list(WEB_TOOLS)
+            denied += [t for t in disallowed_tools if t not in denied]
             if denied:
                 argv += ["--disallowedTools", *denied]
             argv += ["--settings", json.dumps(worker_settings(denied_reads))]
@@ -738,7 +727,9 @@ def hook_settings() -> dict:
                       # to the harness's gh wrapper and gh.d pre-hooks outside a harness task, and connector
                       # posts to others without the AI-authorship tag (aitag), and file tool reads of a
                       # credential store (credguard).
-                      "PreToolUse": [{"matcher": "Bash|Edit|Write|MultiEdit|NotebookEdit|Read|Grep|Glob|mcp__.*",
+                      # Every tool, so a tool the run has but no guard knows still meets the hook
+                      # (HARNESS_TOOLS, the reviewer's write rule), and subagents' calls too.
+                      "PreToolUse": [{"matcher": "*",
                                       "hooks": [{"type": "command", "command": f"{cmd} PreToolUse", "timeout": 20}]}],
                       # Refuses to end a task run whose result.json is missing or no hand-off (twice at most),
                       # or fails a hand-off check (the checks get handoffcheck.STOP_BUDGET_S in all).

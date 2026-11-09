@@ -181,7 +181,7 @@ from .providers.base import NULL_OPERATIONS, normalize_action
 
 ACTION_TYPES = ("reply", "task_add", "task_update", "ask_user", "resolve", "notify", "memory_add", "memory_forget",
                 "charter_update", "schedule_set", "config_set", "resource_pause", "observation_mute", "pr_approve",
-                "sweep", "obligation", "self_change", "noop")
+                "sweep", "obligation", "self_change", "look", "noop")
 
 # A deferred task's `start_after`: `now`, a delay (`90m`, `3d`) or an ISO date or time (in the
 # project's home zone unless it names one). Plain character classes, so every provider's schema engine takes it.
@@ -1380,6 +1380,8 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
                 f"tasks): " + clip(", ".join(f"#{t}" for t in kept), 200) if kept else "")
         lines.append(f"## Disk: {disk.get('free_gb')} GB free of {disk.get('total_gb')} GB; {guard}{held}")
     section("host", lines)
+    from . import overseer
+    section("loop_health", overseer.digest_lines(p, now))   # results, from the overseer's last pass
     lines = []
     if pause := projpause.current(db, now):
         lines.append(f"## Project {projpause.describe(pause, p, now)}: no new runs start until it resumes")
@@ -2576,7 +2578,8 @@ def _claims_checked(p: Project, a: dict, notes: list) -> tuple[str, list]:
 
 def apply(p: Project, actions: list[dict], default_chat: str | None = None, user_turn: bool = False,
           turn: int | None = None, messages: list[int] | None = None, lean: bool = False,
-          applied: list | None = None) -> list[str]:
+          applied: list | None = None, skip_actions: frozenset | set = frozenset(),
+          on_action=None) -> list[str]:
     """Apply validated actions. Returns human-readable notes about rejected ones, fed back next turn.
     Notes on actions applied with a change (NOTES_KEY) reach the next digest as information only.
     `messages`: the user messages the daemon started this turn for (a charter change they approved
@@ -2588,7 +2591,9 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
     text sent again by a later turn is still written. `lean`: the daemon applies this turn again after
     it was cut off applying it (Daemon._reap): the optional restriction checks, which may have held it,
     are skipped and a note says so. `applied`, when given, is filled with the indexes of the actions
-    that went through (mustact.settle)."""
+    that went through (mustact.settle). `on_action(i)` is called before action i is applied and the
+    indexes in `skip_actions` are refused unapplied (Daemon._coord_journal: an action the daemon was cut off
+    in twice is skipped, so the rest of the turn still applies)."""
     db, problems, notes = p.db, [], []
     cfg = p.config()
     # For the stale-restriction check (_restriction_conflicts): the restrictions before this turn's
@@ -2633,6 +2638,13 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
     for k, (i, a) in enumerate(order):
         t = a.get("type")
         key = f"{turn}.{i}" if turn is not None else None
+        if i in skip_actions:
+            failed.add(i)
+            problems.append(f"{t}: not applied: the daemon was cut off twice while applying it; the action "
+                            f"is still in turn {turn}'s output")
+            continue
+        if on_action is not None:
+            on_action(i)
         try:
             a = normalize_action(a)
             if t == "reply":
@@ -4021,6 +4033,15 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
             elif t == "self_change":
                 notes.append(selfimprove.add(p, a, parse_start_after(a.get("start_after") or selfimprove.DEFAULT_CHECK,
                                                                      tz=timefmt.home(p)), settable=settable))
+            elif t == "look":
+                from . import looks
+                if a.get("enabled") is False:   # clears every pending look: back to the idle wake
+                    notes.append(f"look: cleared {looks.clear(db)}")
+                else:
+                    if not str(a.get("at") or "").strip():
+                        raise ValueError("look: give `at`: a delay such as 45m or a time in the home zone")
+                    at = parse_start_after(str(a["at"]), tz=timefmt.home(p)) or time.time()
+                    looks.add(db, at, str(a.get("text") or ""), a.get("precheck"))
             elif t in ("noop", None):
                 pass
             else:
@@ -4041,6 +4062,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 _charter_retry_now(p, a, str(e), key, announced, filled=(filled[0], why) if filled else None)
             if t == "config_set" and a.get("key"):
                 cfg_refused[str(a["key"])] = str(e)
+    if on_action is not None:   # past the actions: a cut-off from here on blames none of them
+        on_action(None)
     plans = _apply_due_moves(p, actions, due_moves, failed, problems, notes, started, plan_before)
     for k, before, upd in new_ask_holds:
         ask = next((mid for at, mid in turn_asks if at > k), None)
@@ -5362,7 +5385,7 @@ def worker_pinned_line(p: Project, use: dict | None = None) -> str:
     from .prompts import worker_context
     use = use or worker_context(p)[2]
     if not use["pinned_dropped"]:
-        return (f"pinned worker memory over budget: the {use['kept']} restriction, resource and standing entries for "
+        return (f"pinned worker memory over budget: the {use['kept']} restriction and resource entries for "
                 f"workers ({use['kept_chars']} chars) outgrow their {use['memory_limit']} chars of room; every "
                 f"worker prompt still carries them whole; merge or shorten them") if use["kept_over"] else ""
     return (f"pinned worker memory over budget: {use['pinned_chars']} chars for {use['memory_limit']} of room "

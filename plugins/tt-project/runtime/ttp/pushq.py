@@ -70,8 +70,7 @@ from .worktree import fix_branches, named_refs
 REF_PREFIX = "refs/ttp/push/"   # + row id: pins the approved commit until its row is settled
 KV = "push_queue"               # kv: {"backoff_until", "deaths", "bad_tip": {"tip", "fails", "tried", "at", ...}, "tips_told"}
 DEFAULT_BATCH_S = 300           # delivery.push_batch_s: the oldest approval waits at most this long for running reviews
-DEFAULT_BATCH_MAX = 8           # delivery.push_batch_max: start at once with this many; a batch's most unless the backlog is bigger
-BATCH_GROW = 3                  # after a clean batch a backlog grows a batch up to this many times push_batch_max
+DEFAULT_BATCH_MAX = 8           # delivery.push_batch_max: start at once with this many (no longer a batch's most: one train takes every approval)
 DEFAULT_MIN_GAP_S = 1800        # delivery.push_min_gap_s: after a batch that did not end clean, the least time to the next start
 CLEAN_OUTCOMES = ("pushed", "landed", "nothing")   # the tip passed and the push went: no gap after these
 FAST_PRIORITY = 2               # an approval of this priority or better goes in the next batch, ahead of routine ones (fast_ids)
@@ -1121,19 +1120,19 @@ def _gap_left(db, now: float, gap: float) -> float:
 
 
 def due(p: Project, now: float | None = None, cfg: dict | None = None) -> tuple[list[dict], str]:
-    """The approved rows a batch should take now (at most delivery.push_batch_max, best priority
-    first) and why; or ([], why not). Only local state is read: no fetch, no checks (an open runner
+    """The approved rows a batch (a push train) should take now and why; or ([], why not). A train takes
+    every approval due at its start, best priority first: delivery.push_batch_max only starts one at
+    once (kept for compatibility), it caps nothing, so the full push checks run once for all of them. Only local state is read: no fetch, no checks (an open runner
     fault, envfault, is probed again at most once a minute and holds every batch). No batch starts
     while the last one or its after_push (the deploy) still runs. After a clean batch an approval
     starts one at once unless a review is running or ready, which it waits for at most
     delivery.push_batch_s. After a batch that did not end clean (a failing tip, a dead batch), unless
     the batch is full or holds one the last batch requeued untested, it waits for
-    delivery.push_min_gap_s since the last one. Approvals that waited while the last clean batch ran
-    start the next one at once (not the ones it held itself). Fast approvals (fast_ids: urgent, priority 1-2 or aged to it
-    (delivery.push_age_s: _approved), or sharing no file
-    with an earlier unlanded approval) wait for neither: while the routine ones wait they start a
-    batch of their own at once; when the routine ones are due too, they lead it. After a clean batch
-    a backlog bigger than push_batch_max grows the batch up to BATCH_GROW times it. After a batch a
+    delivery.push_min_gap_s since the last one. Approvals that waited while the last batch ran, clean
+    or not, start the next one as soon as it ends (not the ones it held itself). Fast approvals
+    (fast_ids: urgent, priority 1-2 or aged to it (delivery.push_age_s: _approved), or sharing no file
+    with an earlier unlanded approval) wait for neither: they start a train at once and lead it, and
+    every other approval rides in it. After a batch a
     reboot cut short its members still approved go again at once, alone and in its order (_cut_members)."""
     now = time.time() if now is None else now
     if not enabled(p, cfg):
@@ -1184,7 +1183,7 @@ def due(p: Project, now: float | None = None, cfg: dict | None = None) -> tuple[
                         f"tried on it; next try {_at(until, now, p)} unless the tip or the approvals change")
         rows = fresh + [r for r in rows if r["id"] in tried]
     window = _num(d.get("push_batch_s"), DEFAULT_BATCH_S, float, 0)
-    cap = int(_num(d.get("push_batch_max"), DEFAULT_BATCH_MAX, int, 1))
+    cap = int(_num(d.get("push_batch_max"), DEFAULT_BATCH_MAX, int, 1))   # starts a train; caps none
     gap = _num(d.get("push_min_gap_s"), DEFAULT_MIN_GAP_S, float, 0)
     last = db.one("SELECT id, outcome, COALESCE(after_finalized, finalized, ended, started) AS freed "
                   "FROM push_batches ORDER BY started DESC LIMIT 1")
@@ -1197,7 +1196,7 @@ def due(p: Project, now: float | None = None, cfg: dict | None = None) -> tuple[
         # The last batch stopped its search for these (batch.Batch._yield_now): they go alone, before
         # the approvals it requeued, so no routine one's failure costs them a bisect again. Its own
         # entries never count here, urgent or not: taking them again would only restart its search.
-        return hot[:cap], (f"{len(hot)} urgent or priority-1 approval{'s' if len(hot) != 1 else ''} that "
+        return hot, (f"{len(hot)} urgent or priority-1 approval{'s' if len(hot) != 1 else ''} that "
                            f"{last['id']} stopped its search for; its {len(yielded)} requeued approval"
                            f"{'s' if len(yielded) != 1 else ''} go next")
     if last and last["outcome"] == "rebooted" and (cut := _cut_members(db, last, rows)):
@@ -1212,11 +1211,12 @@ def due(p: Project, now: float | None = None, cfg: dict | None = None) -> tuple[
         why = f"{len(untested)} approval{'s' if len(untested) != 1 else ''} {last['id']} requeued untested"
     elif yielded:   # the urgent ones it stopped for were withdrawn: the search goes on at once
         why = f"{len(yielded)} approval{'s' if len(yielded) != 1 else ''} {last['id']} requeued for an urgent one"
-    elif not clean and (left := _gap_left(db, now, gap)) > 0:
-        wait = f"{left:.0f} s left of the {gap:.0f} s gap since the last batch ended"
     elif last and (n := sum(1 for r in rows if r["batch"] != last["id"]
                             and float(r["created"]) <= float(last["freed"] or 0))):
+        # Approved while the last train ran: the next one starts as it ends, clean or not.
         why = f"{n} approval{'s' if n != 1 else ''} waited out {last['id']}"
+    elif not clean and (left := _gap_left(db, now, gap)) > 0:
+        wait = f"{left:.0f} s left of the {gap:.0f} s gap since the last batch ended"
     elif now - min(r["created"] for r in rows) >= window:
         why = f"the oldest approval waited {window:.0f} s"
     elif not db.one("SELECT id FROM tasks WHERE kind='review' AND status='running' LIMIT 1") and not any(
@@ -1227,24 +1227,24 @@ def due(p: Project, now: float | None = None, cfg: dict | None = None) -> tuple[
     if wait and not fast:
         return [], wait
     if wait:
-        # Independent, urgent or priority 1-2 approvals go now, alone: no window, no gap, and no
-        # routine approval in the batch whose failure would cost them a bisect round.
-        rows = [r for r in rows if r["id"] in fast]
-        hot = sum(1 for r in rows if urgent.covers_urgent(db, db.task(r["task"])))
-        why = (f"{len(rows)} approval{'s' if len(rows) != 1 else ''} that "
-               f"{'is' if len(rows) == 1 else 'are'} urgent, priority 1-{FAST_PRIORITY} or share no file with an "
+        # Independent, urgent or priority 1-2 approvals start a train now (no window, no gap); every
+        # other approval rides in it, so the full checks run once for all (a failing one leaves the
+        # train by its failing tests alone).
+        lead = [r for r in rows if r["id"] in fast]
+        hot = sum(1 for r in lead if urgent.covers_urgent(db, db.task(r["task"])))
+        why = (f"{len(lead)} approval{'s' if len(lead) != 1 else ''} that "
+               f"{'is' if len(lead) == 1 else 'are'} urgent, priority 1-{FAST_PRIORITY} or share no file with an "
                f"earlier unlanded one" + (f" ({hot} an urgent review)" if hot else ""))
-    else:
-        rows = [r for r in rows if r["id"] in fast] + [r for r in rows if r["id"] not in fast]   # they lead
+        if len(rows) > len(lead):
+            why += f"; {len(rows) - len(lead)} more ride in the train"
+    rows = [r for r in rows if r["id"] in fast] + [r for r in rows if r["id"] not in fast]   # they lead
     if before:   # overlapping approvals: the one holding the newer commits goes first (overlap_waits)
         rows = _ordered(rows, before, approved)
         if not rows:
             return [], "overlapping approvals wait for a batch that takes them in order"
-    if clean and len(rows) > cap:
-        cap = min(len(rows), cap * BATCH_GROW)   # one merged-result check run covers the backlog
     tip = _tracking_tip(p, remote, branch)
     solo = _solo_paths(d)   # aging lets a routine approval lead, never skip the one-per-batch hold
-    taken, held = _one_solo(p, rows, cap, solo, tip, fast_ids(p, rows, tip, skip=tried, aged=False) if solo else fast)
+    taken, held = _one_solo(p, rows, len(rows), solo, tip, fast_ids(p, rows, tip, skip=tried, aged=False) if solo else fast)
     if held:
         why += (f"; {len(held)} more approval{'s' if len(held) != 1 else ''} touching delivery.push_solo_paths "
                 f"wait{'s' if len(held) == 1 else ''} for a later batch (one per batch)")
