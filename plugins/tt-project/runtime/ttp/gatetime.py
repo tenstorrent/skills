@@ -3,8 +3,8 @@
 """Each project's landing check time: how long its push checks (delivery.push_checks) take before a change lands.
 
 A landing waits for the project's push checks, so they are a smoke suite: under 10 minutes on their host,
-aim 5. Slower tests belong in delivery.post_land_checks, after landing, never holding the queue; until this
-release runs that list itself (POST_LAND_RUNS), the advice says so: moving tests there would stop them.
+aim 5. Slower tests belong in delivery.post_land_checks, which the daemon runs after each landing (postland),
+never holding the queue.
 
 - Record: each passing push check run's wall time is one row of LOG under the project's state (record(),
   from push.record_check_s), the newest KEEP rows kept.
@@ -31,9 +31,9 @@ from .project import durable_append, durable_write
 
 LOG = "push-check-times.jsonl"
 WAIT_LOG = "checks-wait-times.jsonl"
-# Whether this release runs delivery.post_land_checks after each landing. Until it does, the advice
-# (status_line, flag) never tells a coordinator to move tests there: nothing would run them.
-POST_LAND_RUNS = False
+# Whether this release runs delivery.post_land_checks after each landing (postland). While it did not, the
+# advice (status_line, flag) never told a coordinator to move tests there: nothing would have run them.
+POST_LAND_RUNS = True
 KEEP = 200
 DAY_S = 86400.0
 LAST_N = 10
