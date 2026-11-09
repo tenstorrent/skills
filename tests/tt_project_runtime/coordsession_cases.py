@@ -1647,6 +1647,20 @@ def test_resumed_and_forked_claude_sessions_book_only_their_own_cost(env):
     assert d._session_total_before("F", 1 << 62) == 3.5
 
 
+
+def test_resumed_wakes_that_never_reached_the_api_book_nothing(env):
+    """While the host has no internet, each retried wake of a resumed session ends without an API call
+    and reports the session's unchanged running total. Each books nothing (only its own few tokens),
+    never the running total again: an outage's retries once booked the same $38 total at every try."""
+    p = make(env)
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    wake = lambda mode: {"turn": {"session": {"mode": mode, "why": "continued"}}}
+    assert _cs_finish(p, d, _cs_claude_run(p, "C", 38.26, wake("new"))) == 38.26
+    retries = [_cs_finish(p, d, _cs_claude_run(p, "C", 38.26, wake("resume"), out=0)) for _ in range(3)]
+    assert all(c < 0.001 for c in retries), retries
+    assert d._session_total_before("C", 1 << 62) == 38.26
+
 def test_runs_booked_at_a_session_s_running_total_are_re_booked_once(env):
     p = make(env)
     from ttp.daemon import SESSION_REBOOK_KEY, Daemon
