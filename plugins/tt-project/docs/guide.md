@@ -3354,6 +3354,13 @@ Workers can read Slack links you paste, using your Slack connector if you have o
     `.jks`, `.ppk`, `.gpg`, `.asc`, `id_*` but `.pub`), a name with token, secret, credential,
     password or API key in it, a process's `environ`, and environment dumps (`printenv`, a bare `env`,
     `export` or `set`).
+  The label is set per source, model-free: on a PR-findings fix the daemon queues and on a shared check
+  failure's fix (they quote comments, CI and test logs); on a coordinator `task_add` that sends
+  `untrusted_input: true` or whose spec carries a peer note's `[note <fp>]` tag; and on the task of a run
+  that read web, connector or downloaded text (the hook records the source in the run dir's
+  `untrusted-input` file, the guards apply to the rest of that run at once, and the daemon labels the task
+  when the run ends). Continuations, review fixes and reopened copies of a labelled task inherit it, and
+  nothing clears it. A labelled task never routes to the chat provider; its run note records `untrusted_input`.
   The hook (Claude Code, Codex, Cursor and the stream guard) and the run's `bin/git` and `bin/gh`, which
   scripts reach too, apply them on every provider. Known gaps: a path or command a script or inline code
   builds at run time (git and gh stay guarded), other HTTP clients, a GET carrying data in its URL and
