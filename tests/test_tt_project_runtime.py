@@ -49819,7 +49819,7 @@ def test_a_resume_of_a_forked_session_nets_against_its_reported_total(env):
                "VALUES(?,'worker','claude','opus',?,'running',?,?)",
                (tid, time.time() - 60, d.boot, json.dumps({"resumes": {"run": r["id"], "session": "F1"}})))
     again = db.one("SELECT * FROM runs WHERE id=?", (rid,))
-    u = _reported(14.89, output_tokens=400_000)   # the session added $2.00; its tokens price near it
+    u = _reported(14.89, output_tokens=20_000)   # the session added $2.00; its own tokens list at $1.50
     assert abs(d._net_of_session(again, u) - 2.0) < 1e-6, "the resume re-booked the parent's cost"
 
 

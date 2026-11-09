@@ -639,6 +639,8 @@ SESSION_NET_SLACK_USD = 0.05
 COORD_RENET_KEY = "coord_session_renet"   # Daemon.renet_coord_sessions ran (once per project)
 FORK_RENET_KEY = "fork_run_renet"   # Daemon.renet_fork_runs ran (once per project)
 MODEL_REPRICE_KEY = "model_alias_reprice"   # Daemon.reprice_alias_runs ran (once per project)
+SESSION_REBOOK_KEY = "session_total_rebook"   # Daemon.rebook_session_totals ran (once per project)
+SESSION_REBOOK_DAYS = 7   # its window: runs that ended this many days back or less
 MODEL_REPRICE_SINCE = (2026, 11, 7)   # its window's first day, in the home zone: the days the dollar caps over-counted
 REACH_EVERY_S = 30      # while a provider is held offline, how often its API host is resolved again
 REACH_TIMEOUT_S = 5
@@ -1369,6 +1371,14 @@ class Daemon:
                             + ", ".join(f"run {i} ${a:.2f}->${b:.2f}" for i, a, b in changed[:40]) + ")")
         except Exception:   # a spend correction must never keep the daemon from starting
             log(self.p, "alias re-price error: " + traceback.format_exc().replace("\n", " | ")[:2000])
+        try:   # resumed Claude Code session runs booked at the session's running total, once
+            changed = self.rebook_session_totals()
+            if changed is not None:
+                log(self.p, f"re-booked {len(changed)} resumed session run(s) booked at the session's running total: "
+                            f"${sum(c[1] for c in changed):.2f} booked -> ${sum(c[2] for c in changed):.2f} ("
+                            + ", ".join(f"run {i} ${a:.2f}->${b:.2f}" for i, a, b in changed[:40]) + ")")
+        except Exception:   # a spend correction must never keep the daemon from starting
+            log(self.p, "session total re-book error: " + traceback.format_exc().replace("\n", " | ")[:2000])
         try:   # push batch files left `running` by a batch whose row is final (pushq.close_strays)
             if closed := pushq.close_strays(self.p):
                 log(self.p, f"closed {len(closed)} stray push batch file(s)")
@@ -3193,7 +3203,11 @@ class Daemon:
                 if thread and budget_usd is not None and prov.caps_budget:
                     # The CLI holds a resumed session's running total, not this wake's, to
                     # --max-budget-usd: the wake keeps its own cap on top of what the session booked.
-                    session_cap = round(self._session_booked(thread, None) + float(budget_usd), 2)
+                    # The session's last reported total, not what its wakes booked (an over-booking
+                    # would lift the cap far past the wake's own).
+                    base = self._session_total_before(thread, 1 << 62)
+                    base = self._session_booked(thread, None) if base is None else base
+                    session_cap = round(base + float(budget_usd), 2)
                     argv = _with_flag(argv, "--max-budget-usd", f"{session_cap:.2f}")
             ack, sent_why = None, ""
             if session_digest is not None and session_mode in ("resume", "new"):
@@ -4718,7 +4732,12 @@ class Daemon:
         A run that started as a fork of the coordinator's session (note coord_context.how 'fork') reports
         the parent session's total too: its first run books its own tokens priced (fork_base_usd keeps the
         rest), and a later resume of that session nets against the highest total an earlier run of it
-        reported, so the parent's cost is never booked again."""
+        reported, so the parent's cost is never booked again.
+        A resumed Claude Code run nets against the session's last reported running total
+        (_session_total_before), never the sum of what its earlier runs booked: that sum drifts above the
+        total once one run books above its delta, and then every later report reads as per-run and the
+        session's running total is booked again at each wake. It books what the total rose by, never
+        below its own tokens at list price; a report below the last total is booked as it stands (the CLI started its count over)."""
         note = json.loads(r["note"] or "{}")
         session = (note.get("resumes") or {}).get("session") or _resumed_coord_session(r, note)
         reported = float(usage.cost_usd or 0)
@@ -4739,6 +4758,11 @@ class Daemon:
                 usage.extra["fork_base_usd"] = round(reported - own, 6)
                 usage.cost_usd = round(own, 6)
             return usage.cost_usd
+        if (r["provider"] or "") == "claude" and (prior := self._session_total_before(session, r["id"])) is not None:
+            usage.extra["session_cost_usd"] = reported
+            added = reported - prior if reported - prior >= -1e-6 else reported   # below it: the CLI started over
+            usage.cost_usd = round(max(added, _list_cost(r, usage, on_unknown=self._unpriced_model), 0.0), 6)
+            return usage.cost_usd
         booked = max(self._session_booked(session, r["task"], r["id"]),
                      self._session_reported(session, r["task"], r["id"]))
         if booked <= 0:
@@ -4748,6 +4772,40 @@ class Daemon:
             usage.extra["session_cost_usd"] = reported
             usage.cost_usd = round(max(delta, own, 0.0), 6)
         return usage.cost_usd
+
+    def _session_total_before(self, session: str, before: int) -> float | None:
+        """Session `session`'s running total as Claude Code last reported it before run `before`, from the
+        newest earlier run of it (any task or role: a session id names one session) that shows it: its
+        note's session_cost_usd, else its output's last result, else, for the run that started the
+        session (no earlier run of it, _session_runs_before), what it booked as reported. None when no
+        recent run shows it (the caller then nets the old way). A run with no result is passed over: an older, lower total only books more."""
+        from .providers import claude
+        for o in self.p.db.q("SELECT * FROM runs WHERE session_id=? AND id<? AND status!='running' "
+                             "ORDER BY id DESC LIMIT 8", (session, before)):
+            try:
+                note = json.loads(o["note"] or "{}")
+                if note.get("session_cost_usd") is not None:
+                    return float(note["session_cost_usd"])
+            except (ValueError, TypeError):
+                note = {}
+            if (o["provider"] or "") == "claude" and \
+                    (got := claude.result_total(self._run_dir(o) / "output.jsonl")) is not None:
+                return got
+            if not ((note.get("resumes") or {}).get("session") or _resumed_coord_session(o, note)
+                    or ctxfork.forked(note)) and (o["cost_basis"] or "reported") == "reported" \
+                    and not o["cost_estimated"] and float(o["cost_usd"] or 0) > 0 \
+                    and not self._session_runs_before(session, o["id"]):
+                return float(o["cost_usd"])
+        return None
+
+    def _session_runs_before(self, session: str, before: int) -> bool:
+        """Whether any run of `session` (any task) came before run `before`: by runs.session_id, or for a
+        row from before that column, by the session id in its note. Such a run makes `before` a resume
+        whatever its note says, so its booking is not the session's total."""
+        return any(o["session_id"] == session or json.loads(o["note"] or "{}").get("session_id") == session
+                   for o in self.p.db.q("SELECT session_id, note FROM runs WHERE id<? AND "
+                                        "(session_id=? OR (session_id IS NULL AND note LIKE ?))",
+                                        (before, session, f"%{session}%")))
 
     def _session_reported(self, session: str, task, before: int) -> float:
         """The highest session total an earlier run of `session` (of `task`) reported (note
@@ -4801,8 +4859,8 @@ class Daemon:
                              cache_write_tokens=r["cache_write_tokens"] or 0,
                              estimated=bool(r["cost_estimated"]) or (r["cost_basis"] or "reported") != "reported")
             before = usage.cost_usd
-            if self._net_of_session(r, usage) == before or "session_cost_usd" not in usage.extra:
-                continue
+            if self._net_of_session(r, usage) >= before - 1e-6 or "session_cost_usd" not in usage.extra:
+                continue   # a re-net only ever lowers a booking
             note["session_cost_usd"] = usage.extra["session_cost_usd"]
             db.x("UPDATE runs SET cost_usd=?, note=? WHERE id=?", (usage.cost_usd, json.dumps(note), r["id"]))
             changed.append((r["id"], before, usage.cost_usd))
@@ -4893,6 +4951,52 @@ class Daemon:
         db.set_kv(MODEL_REPRICE_KEY, {"at": time.time(), "runs": len(changed),
                                       "usd_before": round(sum(c[1] for c in changed), 6),
                                       "usd_after": round(sum(c[2] for c in changed), 6)})
+        return changed
+
+    def rebook_session_totals(self, dry_run: bool = False) -> list[tuple[int, float, float]] | None:
+        """Once per project (kv SESSION_REBOOK_KEY): resumed Claude Code session runs (coordinator wakes,
+        resumed worker and review sessions, forks included) that ended in the last SESSION_REBOOK_DAYS days
+        and were booked at the session's running total, or above what it rose by, before _net_of_session
+        netted against the last reported total. Re-book each, oldest first, at what _net_of_session books
+        now from its output's reported total; take the difference off its task's spend and book it as a
+        negative ledger row at the run's time, so spend, the dollar caps and the global daily total count
+        each run once. Only ever lowers a booking; a re-booked row is marked (note session_rebooked), so a
+        second pass changes nothing. With `dry_run` nothing is written and the kv is not read. Returns
+        (run id, booked before, booked after) of each row changed, or None when it already ran."""
+        from .providers import claude
+        db = self.p.db
+        if not dry_run and db.kv(SESSION_REBOOK_KEY):
+            return None
+        changed = []
+        for r in db.q("SELECT * FROM runs WHERE provider='claude' AND session_id IS NOT NULL AND status!='running' "
+                      "AND cost_usd>0 AND COALESCE(ended, started)>=? ORDER BY id",
+                      (time.time() - SESSION_REBOOK_DAYS * 86400,)):
+            note = json.loads(r["note"] or "{}")
+            if "session_rebooked" in note or not ((note.get("resumes") or {}).get("session")
+                                                  or _resumed_coord_session(r, note)):
+                continue
+            before = float(r["cost_usd"])
+            reported = claude.result_total(self._run_dir(r) / "output.jsonl")
+            usage = RunUsage(cost_usd=reported if reported is not None else float(note.get("session_cost_usd") or before),
+                             input_tokens=r["input_tokens"] or 0, output_tokens=r["output_tokens"] or 0,
+                             cache_read_tokens=r["cache_read_tokens"] or 0, cache_write_tokens=r["cache_write_tokens"] or 0,
+                             estimated=bool(r["cost_estimated"]) or (r["cost_basis"] or "reported") != "reported",
+                             extra=self._output_models(r))
+            after = self._net_of_session(r, usage)
+            if after >= before - 1e-6 or "session_cost_usd" not in usage.extra:
+                continue
+            changed.append((r["id"], before, after))
+            if dry_run:
+                continue
+            note.update(session_cost_usd=usage.extra["session_cost_usd"], session_rebooked=before)
+            db.x("UPDATE runs SET cost_usd=?, note=? WHERE id=?", (after, json.dumps(note), r["id"]))
+            db.x("UPDATE tasks SET spent_usd=MAX(COALESCE(spent_usd,0)-?,0) WHERE id=?", (before - after, r["task"]))
+            db.spend(r["provider"], -(before - after), self._source_for(r), account=r["account"] or "",
+                     estimated=usage.estimated, ts=float(r["ended"] or r["started"] or time.time()))
+        if not dry_run:
+            db.set_kv(SESSION_REBOOK_KEY, {"at": time.time(), "runs": len(changed),
+                                           "usd_before": round(sum(c[1] for c in changed), 6),
+                                           "usd_after": round(sum(c[2] for c in changed), 6)})
         return changed
 
     def _output_models(self, r: dict) -> dict:
