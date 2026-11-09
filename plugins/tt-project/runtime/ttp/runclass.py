@@ -318,6 +318,8 @@ def quiet_classes(s: dict, n: int = ALARM_MIN) -> list[dict]:
             ms = {m: v for m, v in ms.items() if m != "jev"}
         runs = sum(v["runs"] for v in ms.values())
         ok = (s.get("eligible") or {}).get(cls, runs)   # runs class routing would have moved
+        if s["routes"].get(cls) != "chat":
+            ok = min(ok, runs)   # eligible counts jev's decisions too; they are not this class's runs
         chat = sum(v["runs"] for m, v in ms.items() if on_chat(m)) + (s.get("cheap") or {}).get(cls, 0)
         if ok >= n and not chat:
             out.append({"class": cls, "runs": runs, "eligible": ok, "chat": 0, "models": sorted(ms),
