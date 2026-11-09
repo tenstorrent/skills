@@ -5253,7 +5253,10 @@ class Daemon:
                     db.set_kv(seen, {"run": r["id"], "ts": time.time()})   # logged once per model and effort
                     log(self.p, f"route: {r['model']} rejected its effort_fields at effort "
                                 f"{sent['effort'] or '-'} ({', '.join(sent['fields'])}); run {r['id']} went on without them")
-            if (routed.get(modelrank.KEY) or {}).get("why") == modelrank.BETTER and (verdict := modelrank.tried(
+            # Only a run that ran on it counts: a hand-off is a good run, its own fault (FAULTS_PARK) a bad one;
+            # a start that fell back before it (no room, auth) or a run killed, capped or slept books nothing.
+            if (routed.get(modelrank.KEY) or {}).get("why") == modelrank.BETTER and on_route and (
+                    handed_off or fell in modelrank.FAULTS_PARK) and (verdict := modelrank.tried(
                     db, ran := r["model"] or routed["model"], fell, r["id"], time.time())):   # a smarter model's try
                 log(self.p, f"model ranking: {ran} {verdict} (run {r['id']}{': ' + fell if fell else ''})")
                 if verdict == "parked":

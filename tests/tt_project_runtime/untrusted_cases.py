@@ -267,3 +267,19 @@ def test_a_labelled_task_never_routes_to_the_chat_provider_and_the_run_note_reco
     d.dispatch()
     (a, kw), = started
     assert a[2] == "claude" and kw["note"][untrusted.KEY] == {"set": True, "kept_core": "chat:glm-x"}
+
+
+@pytest.mark.parametrize("labels", [[], ["untrusted_input"]])
+def test_a_task_run_may_not_remove_or_edit_its_untrusted_input_mark(env, tmp_path, monkeypatch, labels):
+    """Removing the run's untrusted-input file would lift the narrowed policy and the task's label at the
+    end: a Bash command naming it and an edit of it are refused, marked or not; other calls pass."""
+    from ttp import untrusted
+    _untrusted_run(env, tmp_path, monkeypatch, labels)
+    mark = str(tmp_path / untrusted.RUN_MARK)
+    for tool, args in [("Bash", {"command": f"rm {mark}"}), ("Bash", {"command": "rm $TTP_RUN_DIR/untrusted-input"}),
+                       ("Bash", {"command": "echo web > untrusted-input"}), ("Write", {"file_path": mark, "content": ""}),
+                       ("Edit", {"file_path": mark, "old_string": "web", "new_string": ""}),
+                       ("apply_patch", {"input": "*** Delete File: " + mark})]:
+        assert "leave it as it is" in _why(tmp_path, tool, args), (tool, args)
+    assert _why(tmp_path, "Bash", {"command": "ls $TTP_RUN_DIR/result.json"}) == ""
+    assert _why(tmp_path, "Write", {"file_path": str(tmp_path / "result.json"), "content": "{}"}) == ""

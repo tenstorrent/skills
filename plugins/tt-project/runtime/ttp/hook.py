@@ -1113,7 +1113,9 @@ def _deny(why: str) -> dict:
 def pre_tool_use(payload: dict) -> tuple[dict | None, None]:
     if not os.environ.get("TTP_RUN_DIR"):
         return None, None
-    from . import pathguard
+    from . import pathguard, untrusted
+    if why := untrusted.mark_refusal(str(payload.get("tool_name") or ""), payload.get("tool_input") or {}):
+        return _deny(why), None   # the run's untrusted-input mark, marked or not
     if why := pathguard.refusal(payload):   # a write into a credential folder, on any tool
         return _deny(why), None
     if payload.get("tool_name") in EDIT_TOOLS | PATCH_TOOLS:

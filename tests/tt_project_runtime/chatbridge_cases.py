@@ -3028,3 +3028,28 @@ def test_a_gone_model_is_swapped_within_a_minute_and_a_smarter_new_one_is_tried_
     assert route.of(run["note"])["fallback"] in modelrank.FAULTS_PARK, run["note"]
     assert modelrank.parked(p.db, "rank-new", time.time())
     assert [a for a in alerts if a[0] == "model-rank-park:rank-new" and a[2] == "low"]
+
+
+def test_a_smarter_models_trial_books_only_runs_that_ran_on_it(env, monkeypatch):
+    """A why=better start that fell back before the model ran (no free chat slot, the auth gate) and a
+    run killed, capped or lost on it book nothing; a hand-off books a good run."""
+    from ttp import modelrank, route
+    from ttp.daemon import Daemon
+    p = make(env)
+    _route_config(p)
+    d = Daemon(p.base)
+    monkeypatch.setattr(d, "observe", lambda *a, **k: None)
+    entry = {"tier": "light", "to": "chat", "model": "rank-new", modelrank.KEY: {"from": _RT_MODEL, "why": "better"}}
+    done = {"status": "done", "summary": "ok"}
+
+    def finish(provider, exit_info, result=None, **extra):
+        tid = p.db.add_task("t", "", kind="work", tier="light", priority=3, budget_usd=8.0, labels=[])
+        _route_finish(p, d, tid, exit_info, provider=provider, result=result, routed={**entry, **extra})
+        return p.db.kv(modelrank.TRIED + "rank-new")
+
+    assert finish("claude", {"rc": 0}, done, fallback="no_room") is None   # no free slot: ran on Claude
+    assert finish("claude", {"rc": 0}, done, why="auth") is None
+    assert finish("chat", {"rc": None, "stopped": "stopped"}) is None       # killed: not the model's fault
+    assert finish("chat", {"rc": None, "stopped": "budget"}) is None
+    assert not modelrank.parked(p.db, "rank-new", time.time())
+    assert finish("chat", {"rc": 0}, done)["ok"] == 1                       # a hand-off on it counts
