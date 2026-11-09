@@ -6,4 +6,4 @@
 
 `tt-project`: each Claude run's note records the subagents it started (`subagents_spawned`, `subagent_types`, counted once per Agent call from its output; their cost stays in the run's own), and `ttp stats --landing` adds the booked spend per landed commit and the subagents spawned over the last 24 h and 7 d.
 
-`tt-project`: fewer coordinator wakes. Relayed messages with no order or question wait up to `coordinator.relay_window_s` (90 s; 0: off) so a burst shares one turn, while an order, a question or the user's own message still wakes at the debounce; an unacted `queue_wait` item is raised again only once its wait has doubled; a slow tick step's reports never start a turn by themselves.
+`tt-project`: fewer coordinator wakes. Relayed messages with no order or question wait up to `coordinator.relay_window_s` (90 s; 0: off) so a burst shares one turn, while an order, a question or the user's own message still wakes at the debounce; a slow tick step's reports never start a turn by themselves.
