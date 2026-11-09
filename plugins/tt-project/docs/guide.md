@@ -361,7 +361,8 @@ coordinator with that evidence.
   that carries the head, a push branch no push reaches, a recorded landing), gets its review and
   a low feed line, at most `review.unreviewed_per_pass` (default: the project's
   `budget.max_parallel_workers`, 0 off) per pass, for tasks
-  updated within `review.unreviewed_max_age_h` (default 72); it runs every 5 minutes and in the
+  updated within `review.unreviewed_max_age_h` (default 72); it runs every 5 minutes (every 100
+  seconds after a pass cut short that queued a review, so a backlog drains) and in the
   blocker sweep, reads local refs only, and never queues a second review of one head. Its first pass
   after an upgrade logs how many done code tasks in that window have no landing, push-queue entry
   or superseded record, so a backlog of finished changes shows. A code task still in review

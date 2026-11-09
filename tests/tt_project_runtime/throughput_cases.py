@@ -480,6 +480,8 @@ def test_throughput_review_sweep_names_the_backstop_whatever_the_provider_gate(e
         rep = throughput.measure(p.db, p.config(), now=now, gates=gates)
         rs = _tp_lane(rep, "review_sweep")
         assert rs["slow"] and (rs["backstop_count"], rs["swept_count"], rs["slot_held"]) == (1, 0, 0)
+        assert rs["per_pass"] == p.config()["budget"].get("max_parallel_workers", 6), \
+            "an unset review.unreviewed_per_pass is the worker slots, as the daemon reads it, not 0 (off)"
         changes, kept = throughput.plan(p.db, p.config(), rep)
         assert not [c for c in changes if c["key"] == "review.sweep_after_s"], changes
         why = [k["why"] for k in kept if k["lane"] == "review_sweep"]
