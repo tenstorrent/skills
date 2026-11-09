@@ -1,0 +1,5 @@
+---
+"tt-project": patch
+---
+
+`ttp secret` keys now come from a per-machine store, read when a run needs them: `file` (the old 0600 file, the default), `keychain` (macOS login keychain, written over stdin), `command` (a fetch command that prints the keys as one JSON object; read-only, the plug-in point for a central secrets service) or `env` (`TTP_SECRETS_JSON`, read once and removed from the environment). `ttp secret store <backend> [--shared] [-- <fetch command>]` chooses it and `ttp secret store` shows it. A host marked `--shared` keeps no plaintext keys: the file store refuses to save there, and `ttp secret push` or `ttp new --host --copy-secrets` to it is refused on the far side. `ttp new --host` no longer copies keys unless `--copy-secrets` asks for it (`--no-secrets` is still accepted). A plaintext key file left where it should not be is reported by `ttp secret store`, `ttp secret show` and `ttp status`, never deleted. The worker hook refuses Bash calls that read the keychain item, the fetch command or the environment variable directly. The guide documents plugging in a central mechanism and pushing from a trusted machine over HTTPS.

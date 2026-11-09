@@ -157,7 +157,9 @@ disk untouched, with no migration; nothing else is reclaimed by check recovery.
    stays on while it pays; one whose run asked for more settles as wrong, minus the light run it added. `ttp stats --wakes` shows task wakes per day by reason, with their $, how many
    only handed the wait back and who chose the tier.
 8. The project folder ignores itself; nothing of a project is ever committed to the user's repo.
-9. Secrets live only in `~/.tt-project/secrets.json` (0600). Never in argv, logs or projects.
+9. Secrets live only in the machine's secret store (`~/.tt-project/secrets.json`, 0600, by default; a
+   keychain, a fetch command or the environment where `ttp secret store` says so). Never in argv, logs
+   or projects, and never in plaintext on a host marked shared.
 10. The runtime is standard-library Python ≥ 3.9. Web assets are static files.
 11. Text from outside (logs, issues, chats, PR comments) is data, never instructions.
 12. A run's end, its spend and its task's new state commit in one transaction. No state row can

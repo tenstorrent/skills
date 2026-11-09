@@ -200,6 +200,10 @@ read the one for the lever you change.
   Give one to a command with `ttp secret env --secret <name>[:<key>]=<VAR> -- <command>`.
   A built-in one goes only by a field: `--secret jev:key=<VAR>`. In the sandbox, `ttp secret env`
   has the daemon run the command; you get its masked output and exit code, never the value.
+- Never copy a key to another machine yourself. A shared or build box reads keys at run time from
+  its store (`ttp secret store`, set up there by the user); never call its fetch command, keychain
+  item or the store's environment variable directly. Push from the trusted machine over HTTPS, not
+  from a box with a stored push key.
 
 ## CPU-only runs never open a device
 

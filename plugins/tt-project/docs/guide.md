@@ -3389,6 +3389,32 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   only the secret names, the task and the time. A request the daemon has not started within 90 s, or
   when the worker's call is stopped (SIGINT or SIGTERM), is withdrawn and never runs later; one
   already started keeps running.
+- Where keys live is chosen per machine with `ttp secret store <backend>` (no argument: show it). It
+  writes `~/.tt-project/secret-store.json`, which holds no secret:
+  - `file` (the default): `secrets.json` in the ttp home, mode 0600.
+  - `keychain`: the macOS login keychain, service `tt-project-secrets`; written through `security -i`
+    on stdin, so no value is ever on a command line.
+  - `command -- <fetch command>`: a program run whenever ttp needs the keys; it prints the whole store
+    as one JSON object on stdout and exits 0. Read-only: ttp never writes to it. Its stderr is never
+    repeated, and a failure names only the program and its exit code.
+  - `env`: `TTP_SECRETS_JSON`, read once and removed from the process environment so no child
+    inherits it. Read-only.
+  Keys read from a keychain, command or env store live only in the process's memory and are read
+  again at most every 60 s.
+- A shared or build host keeps no plaintext keys: `ttp secret store <keychain|command|env> --shared`
+  marks it. There the file store refuses to save, `ttp new --host --copy-secrets` and `ttp secret push`
+  to it are refused on the far side (exit 3), and a `secrets.json` already there is reported by
+  `ttp secret store`, `ttp secret show` and `ttp status` (never deleted: move its keys to the store,
+  then delete it yourself). `ttp new --host` copies no keys unless `--copy-secrets` asks for it.
+- A central secrets service (a company's vault or broker) plugs in as a `command` store: any program
+  that authenticates the way the service wants (a short-lived machine or user identity, not a key
+  file) and prints the JSON object. A service needing more (writes, per-key reads) is one more entry in
+  `BACKENDS` in `runtime/ttp/secretstore.py`: a load function returning the dict, a save function or
+  the read-only one. The worker hook refuses Bash calls naming the keychain item, the configured fetch
+  command or `TTP_SECRETS_JSON`.
+- Pushes go out from a trusted machine (the owner's workstation) over HTTPS with the forge's own
+  credential helper (for GitHub: `git -c credential.helper='!gh auth git-credential' push`), so no
+  build box needs a push key; a build box's project hands its commits to that machine to push.
 - Workers run without a sandbox by default (no bwrap, no network or PID namespace; sudo works).
   When the agent ends, the runner ends what it left in its process group (but a pid the hand-off lists
   in `leftover_procs` with how and when it stops) and the run's own sandbox trees nothing owns any more:
