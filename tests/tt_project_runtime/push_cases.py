@@ -19824,7 +19824,8 @@ def _own_push(p, monkeypatch, task=7, status="queued", **more):
     monkeypatch.setenv("TTP_PROJECT", str(p.base))
     marker = (p.state / push.DETACHED / f"t{task}-20261110-1.json")
     marker.parent.mkdir(parents=True, exist_ok=True)
-    marker.write_text(json.dumps({"id": marker.stem, "task": task, "status": status, "repo": str(p.base), **more}))
+    marker.write_text(json.dumps({"id": marker.stem, "task": task, "status": status, "repo": str(p.base),
+                                  "queued": time.time(), **more}))
     marker.with_suffix(".log").write_text("waiting for the push lock\n")
     return marker.resolve()
 
