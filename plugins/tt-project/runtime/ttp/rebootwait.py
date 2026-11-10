@@ -31,6 +31,8 @@ _ASSIGN_RE = re.compile(r"[A-Za-z_]\w*=")
 # A probe script from a run folder larger than this is not read: it counts as a run-folder file.
 _SCRIPT_MAX = 64 * 1024
 _SHELLS = {"sh", "bash", "dash", "zsh", "ksh", ".", "source"}
+# An absolute .rc path within an inline shell command's text.
+_ABS_RC_RE = re.compile(r"(?<![\w.$}~-])/[^\s'\"]*\.rc(?![\w.])")
 
 
 def _commands(probe: str) -> list[list[str]] | None:
@@ -74,28 +76,32 @@ def _remote(words: list[str]) -> bool:
 def _named_rcs(words: list[str]) -> list[Path] | None:
     """The .rc paths any other local command names (`test -s <rc>`, `[ -e <rc> ]`, `grep -q 0 <rc>`, a
     script given `<rc>` or `--rc=<rc>`, `bash -c '<that>'`): a gate on a detached job whatever wraps it.
-    None when in doubt (a relative or unexpanded .rc word, a command substitution). echo, printf, true
-    and : gate on nothing; a --host command is remote."""
+    A doubtful word (a command substitution, a relative, unexpanded or glob .rc word) puts only this
+    command in doubt: None when it also names an absolute .rc (the whole probe is then in doubt), else
+    [] (it gates on no job, and the probe's other commands keep theirs). echo, printf, true and : gate
+    on nothing; a --host command is remote."""
     while words and _ASSIGN_RE.match(words[0]):
         words = words[1:]
-    if any("$(" in w or "`" in w for w in words):
-        return None
     if not words or words[0].rsplit("/", 1)[-1] in ("echo", "printf", "true", ":") or _remote(words):
         return []
     out: list[Path] = []
+    doubt = any("$(" in w or "`" in w for w in words)
     for i, w in enumerate(words):
         if i and words[i - 1] == "-c" and words[0].rsplit("/", 1)[-1] in _SHELLS:
             got = local_jobs(w)   # an inline shell command: its own commands, judged the same way
-            if got is None or (not got and ".rc" in w):
-                return None
+            if not got and _ABS_RC_RE.search(w):
+                return None   # it names an absolute .rc but in doubt
             out += got
             continue
         w = w.partition("=")[2] if w.startswith("-") and "=" in w else w
         if not w.endswith(".rc") or w.startswith("-"):
             continue
-        if not Path(w).is_absolute():
-            return None
+        if not Path(w).is_absolute() or "$" in w or any(c in w for c in "*?["):
+            doubt = True
+            continue
         out.append(Path(w))
+    if doubt:
+        return None if out else []
     return out
 
 

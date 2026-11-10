@@ -143,7 +143,16 @@ def test_any_local_gate_naming_a_jobs_rc_counts_as_waiting_on_that_job():
             (f"/x/bin/gate --host box {a}", []),
             ("test -s job.rc", []),
             ("test -s $TTP_RUN_DIR/job.rc", []),
-            (f"bash -c 'ssh box test -s {a}'", [])):
+            (f"bash -c 'ssh box test -s {a}'", []),
+            # doubt in one command that names no countable .rc leaves the others' jobs
+            (f"ttp detach --check {a} && test \"$(date +%s)\" -ge 5", [a]),
+            (f"ttp detach --check {a} && test -s $TTP_RUN_DIR/x.rc", [a]),
+            (f"ttp detach --check {a} || test -s x.rc", [a]),
+            (f"ttp detach --check {a} && test -s /r/*.rc", [a]),
+            (f"! test -s {a}", [a]),
+            # one naming an absolute .rc beside a substitution puts the whole probe in doubt
+            (f"ttp detach --check {b} && test -s {a} -a -n \"$(pgrep x)\"", []),
+            (f"bash -c 'test -s {a} -a -n \"$(pgrep x)\"'", [])):
         assert rw.local_jobs(probe) == [pathlib.Path(x) for x in want], probe
     assert rw.transient_besides_jobs(f"test -s {a} && test -s /x/state/runs/r1/rows") == ""
     assert rw.transient_besides_jobs(f"test -s {a} && pgrep soak") == "a process"
@@ -165,6 +174,17 @@ def test_a_reboot_relaunches_a_job_whose_gate_names_its_rc_in_any_form(env, tmp_
     else:
         probe = f"{form} {rc}"
     _wait_on(p, tid, probe)
+    _boot_daemon(p)
+    assert not _woken(p, tid) and p.db.task(tid)["not_before"], dict(p.db.task(tid))
+    assert _wait_for_path(rc) and counter.read_text().split() == ["run", "run"]
+    assert len(_job_relaunches(p, tid)) == 1
+
+
+def test_a_reboot_relaunches_a_detach_check_beside_a_command_substitution(env, tmp_path):
+    p = make(env)
+    tid = p.db.add_task("soak", "s", kind="work", tier="light", origin="user")
+    rc, counter = _resumable_job_cut_by_reboot(p, tmp_path, tid)
+    _wait_on(p, tid, f'ttp detach --check {rc} || test "$(date +%s)" -ge {int(time.time()) + 86400}')
     _boot_daemon(p)
     assert not _woken(p, tid) and p.db.task(tid)["not_before"], dict(p.db.task(tid))
     assert _wait_for_path(rc) and counter.read_text().split() == ["run", "run"]
