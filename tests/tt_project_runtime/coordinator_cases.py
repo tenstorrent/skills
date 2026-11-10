@@ -1008,6 +1008,29 @@ def test_config_refuses_user_only_keys_inside_a_run(env, capsys, monkeypatch, va
     assert p.raw_config()["budget"]["daily_usd"] == 12
 
 
+def test_account_config_reads_and_sets_a_key(env, capsys, tmp_path):
+    """`ttp config --account <key>` reads (the default, then the set value) and `<key> <value>` sets:
+    a local re-import of DEFAULT_CONFIG once made both raise UnboundLocalError."""
+    from ttp import cli
+    from ttp.project import load_account_settings
+    make(env)
+    capsys.readouterr()
+    cli.main(["config", "--account", "guards.protected_paths"])
+    assert json.loads(capsys.readouterr().out) == []
+    cli.main(["config", "--account", "guards"])                          # a whole section
+    assert json.loads(capsys.readouterr().out)["protected_paths"] == []
+    cli.main(["config", "--account", "checks.nice", "false"])
+    assert "checks.nice = false" in capsys.readouterr().out
+    assert load_account_settings()["checks"]["nice"] is False
+    cli.main(["config", "--account", "checks.nice"])
+    assert json.loads(capsys.readouterr().out) is False
+    path = str(tmp_path / "kept")
+    cli.main(["config", "--account", "guards.protected_paths", json.dumps([path])])
+    capsys.readouterr()
+    cli.main(["config", "--account", "guards.protected_paths"])
+    assert json.loads(capsys.readouterr().out) == [path]
+
+
 
 @pytest.mark.parametrize("text", [
     "claude's OAuth token is stale; please log in again.",
