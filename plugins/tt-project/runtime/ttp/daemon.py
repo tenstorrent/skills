@@ -12226,6 +12226,7 @@ class Daemon:
             self._workspace_tries(task["id"], clear=True)
             from .prompts import spec_digest, worker_resume, worker_system, worker_task
             probe_tried = probe_tried or probing == task["id"]   # this tick's one retry: the rest stay held
+            run_id = None
             try:
                 system = worker_system(self.p, task)
                 note = {"spec_sha": spec_digest(task), runclass.KEY: run_cls}
@@ -12310,6 +12311,15 @@ class Daemon:
                         batched.add(m["id"])
                     log(self.p, f"task {task['id']}: batch run b{task['id']} takes "
                                 + ", ".join(f"#{m['id']}" for m in members))
+            except StepBudgetSpent:
+                # The step's stop is no Exception: a task set running whose run never got recorded goes
+                # back to the queue, or it would stay 'running' with no run. One recorded keeps its run.
+                if run_id is None and not db.one("SELECT 1 FROM runs WHERE task=? AND status='running'",
+                                                 (task["id"],)):
+                    db.update_task(task["id"], status="queued")
+                    self._unreserve(task)
+                    self._route_unlease(lease)
+                raise
             except Exception as e:
                 self._start_failed(task, e)
                 self._unreserve(task)

@@ -2783,3 +2783,39 @@ def test_a_task_whose_last_runs_spent_money_with_no_progress_is_blocked(env):
     p.set_config("chains.max_idle_runs", 2)
     why = runcap.check(p, p.config(), p.db.task(tid))
     assert "last 2 runs spent $1.00 with no hand-off" in why and p.db.task(tid)["status"] == "blocked"
+
+
+@pytest.mark.parametrize("at", ["before_spawn", "after_record"])
+def test_a_step_stop_in_a_worker_start_never_leaves_its_task_running_with_no_run(
+        env, monkeypatch, tmp_path, reap_tmp_processes, at):
+    """The step's stop (StepBudgetSpent, no Exception) landing in start_run before the runner spawned puts
+    the task back to queued; one landing after the run was recorded keeps the task running with its run."""
+    from ttp import stepclock
+    from ttp.daemon import Daemon
+    p, d, drain, settle = _slot_setup(env, monkeypatch, tmp_path, slots=1)
+    tid = p.db.add_task("one", "s", kind="work", tier="light", origin="user")
+    real = Daemon.start_run
+
+    def start_run(self, *a, **k):
+        if at == "before_spawn":
+            stepclock._on_alarm(signal.SIGALRM, None)
+        rid = real(self, *a, **k)
+        stepclock._on_alarm(signal.SIGALRM, None)
+        return rid
+    monkeypatch.setattr(Daemon, "start_run", start_run)
+    monkeypatch.setattr(stepclock, "_arm", lambda t: None)   # no real SIGALRM: the test places the stop
+    try:
+        stepclock.begin("dispatch", 600, 5)
+        try:
+            with pytest.raises(stepclock.StepBudgetSpent):
+                d.dispatch()
+        finally:
+            stepclock.end()
+        status = p.db.task(tid)["status"]
+        if at == "before_spawn":
+            assert status == "queued" and not _slot_tasks(p), status
+        else:
+            assert status == "running" and _slot_tasks(p) == [tid], status
+    finally:
+        drain(d)
+        assert reap_tmp_processes(tmp_path) == [], "a stand-in run outlived the test"
