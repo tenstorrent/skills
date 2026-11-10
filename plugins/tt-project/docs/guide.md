@@ -3102,6 +3102,11 @@ the pick order, so it takes the first starts. A resumed resource ramps only its 
   project); another task's push is refused (exit 2). Exit 1 when it had already pushed.
   `ttp push --stop <marker>` is the narrower form: it ends only the caller's own push and refuses one
   already in its `git push` (exit 1).
+  A detached push still waiting for the push lock when a new runtime is installed (seen for 10 s)
+  re-executes itself with it (same pid and marker, one log line), keeping its run lock and its
+  place in the push lock's line (its arrival time); once it holds the push
+  lock it finishes on the runtime it has. `ttp push --stop <marker>` also works from a later run of
+  the task that started the push.
 - Inside a run, `ttp push --land` lands the task's own branch though its spec has no landing step,
   and skips the guard that wants `ttp checks` passed on HEAD. It never skips a review: when delivery
   has a review step (`delivery.review_before_pr`, on by default, or a `delivery.push_branch`; with

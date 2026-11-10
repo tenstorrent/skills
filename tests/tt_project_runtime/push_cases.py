@@ -20834,6 +20834,125 @@ def test_detach_stop_on_a_push_marker_stops_the_own_push(env, monkeypatch):
     assert cli._detach_stop(str(other)) == 2 and other.exists()   # push.REFUSED
 
 
+def test_a_later_run_of_the_task_stops_its_earlier_runs_waiting_push_and_frees_its_run_lock(env, monkeypatch, capsys):
+    p = make(env)
+    from ttp import locks, push
+    marker = _stoppable_push(p, monkeypatch, status="running", run="100")
+    monkeypatch.setenv("TTP_RUN_ID", "100")
+    proc = _waiting_push(marker)
+    try:
+        marker.write_text(json.dumps(json.loads(marker.read_text()) | {"pid": proc.pid}))
+        monkeypatch.setenv("TTP_RUN_ID", "200")   # the task's next run, after the first one ended
+        assert push.stop_own(p, marker) == 0
+        assert proc.wait(timeout=10) == -signal.SIGTERM
+        assert not marker.exists() and locks.any_free([push._run_lock(marker)])
+    finally:
+        proc.kill()
+        proc.wait()
+
+
+def _fresh_env(monkeypatch, *names):
+    for name in names:   # unset here, and as it was again after the test
+        monkeypatch.setenv(name, "")
+        monkeypatch.delenv(name)
+
+
+def test_a_detached_push_waiting_for_the_push_lock_reexecs_on_an_upgrade_keeping_pid_marker_run_lock_and_wait(
+        env, monkeypatch, capsys):
+    """A detached push waiting for the push lock runs again with an upgraded runtime as the same process
+    (exec: same pid, so its marker and `ttp push --stop` still name it), passing on its run lock and its wait's
+    start, so the new process waits only for what is left of `wait_s`. A failed exec waits on with this runtime."""
+    p = make(env)
+    from ttp import checkcap, locks, push
+    _fresh_env(monkeypatch, checkcap.REEXEC_ENV, push.WAIT_SINCE_ENV, push.RUN_LOCK_FD_ENV, "TTP_RUN_DIR")
+    for name, value in (("_marker_here", None), ("_git_pushed", False), ("_run_lock_fd", None), ("_wait_since", None)):
+        monkeypatch.setattr(push, name, value)
+    marker = _stoppable_push(p, monkeypatch, status="running", pid=os.getpid())
+    before = marker.read_text()
+    other = locks.try_take(push.lock_paths(p, "origin", "main"), "another push")
+    run_lock = locks.try_take([push._run_lock(marker)], "detached push")
+    try:
+        monkeypatch.setattr(checkcap, "upgraded", lambda: "9.9.9")
+        assert push.take(p, "origin", "main", 0.2, poll_s=0.01) is None, "not a detached push: it waits on"
+        monkeypatch.setattr(push, "_marker_here", marker)
+        news = iter(["", ""])
+        monkeypatch.setattr(checkcap, "upgraded", lambda: next(news, "9.9.9"))
+        t0 = time.time()
+        with pytest.raises(push._Upgraded) as up:
+            push.take(p, "origin", "main", 30, poll_s=0.01)
+        assert up.value.new == "9.9.9" and t0 <= up.value.since <= time.time() - 0.01
+        os.set_inheritable(run_lock.fileno(), False)   # as keep_run_lock_here leaves it
+        monkeypatch.setattr(push, "_run_lock_fd", run_lock.fileno())
+        seen = {}
+
+        def execv(exe, argv):
+            seen.update(argv=argv, inheritable=os.get_inheritable(run_lock.fileno()),
+                        env={k: os.environ.get(k) for k in (checkcap.REEXEC_ENV, push.WAIT_SINCE_ENV, push.RUN_LOCK_FD_ENV)})
+            raise OSError(8, "Exec format error")
+
+        monkeypatch.setattr(os, "execv", execv)
+        monkeypatch.setattr(sys, "argv", ["__main__.py", "push", "--marker", str(marker)])
+        push._reexec(up.value)
+        assert seen["argv"] == [sys.executable, "-m", "ttp", "push", "--marker", str(marker)]
+        assert seen["inheritable"], "the run lock passes on to the new process"
+        assert seen["env"] == {checkcap.REEXEC_ENV: "9.9.9", push.WAIT_SINCE_ENV: repr(up.value.since),
+                               push.RUN_LOCK_FD_ENV: str(run_lock.fileno())}
+        assert "re-executing with it (same pid, marker and run lock)" in capsys.readouterr().out
+        # The exec failed: the run lock is this process's alone again, and this version is never tried again.
+        assert not os.get_inheritable(run_lock.fileno()) and push.RUN_LOCK_FD_ENV not in os.environ
+        assert os.environ[checkcap.REEXEC_ENV] == "9.9.9" and push.WAIT_SINCE_ENV not in os.environ
+        assert marker.read_text() == before and not locks.any_free([push._run_lock(marker)])
+        # The new process: it holds the run lock it was passed and waits only for what is left of its wait.
+        monkeypatch.setattr(push, "_run_lock_fd", None)
+        os.environ[push.RUN_LOCK_FD_ENV] = str(run_lock.fileno())
+        os.environ[push.WAIT_SINCE_ENV] = repr(time.time() - 29.5)
+        os.set_inheritable(run_lock.fileno(), True)
+        push.keep_run_lock_here()
+        assert push._run_lock_fd == run_lock.fileno() and not os.get_inheritable(run_lock.fileno())
+        assert push.WAIT_SINCE_ENV not in os.environ and push._wait_since is not None
+        monkeypatch.setattr(checkcap, "upgraded", lambda: "")
+        t0 = time.time()
+        assert push.take(p, "origin", "main", 30, poll_s=0.05) is None
+        assert time.time() - t0 < 10 and push._wait_since is None
+        assert "stayed busy for 30 s" in capsys.readouterr().err
+    finally:
+        other.close()
+        run_lock.close()
+
+
+def test_a_detached_push_reexecs_from_its_push_lock_wait_and_waits_on_when_the_exec_fails(env, monkeypatch):
+    """run_detached re-executes on the upgrade its push lock wait saw (take raises _Upgraded), and when the
+    exec failed runs the push again with the same wait start, never recording a failure for it."""
+    import io
+    p = make(env)
+    from ttp import checkdirs, push
+    _fresh_env(monkeypatch, push.WAIT_SINCE_ENV, push.RUN_LOCK_FD_ENV)
+    for name, value in (("_marker_here", None), ("_wait_since", None), ("pool_status", push.pool_status)):
+        monkeypatch.setattr(push, name, value)
+    marker = _stoppable_push(p, monkeypatch, status="running", pid=os.getpid())
+    out = p.state / "out"
+    monkeypatch.setenv("TTP_RUN_DIR", str(out))
+    monkeypatch.setattr(checkdirs, "restore", lambda state, value: out)
+    monkeypatch.setattr(checkdirs, "reports", lambda output: output)
+    monkeypatch.setattr(checkdirs, "release", lambda output: None)
+    monkeypatch.setattr(push.signal, "signal", lambda *a: None)
+    monkeypatch.setattr(sys, "stdin", io.StringIO(""))
+    calls, execs = [], []
+
+    def run_retrying(*a):
+        calls.append(push._wait_since)
+        if len(calls) == 1:
+            raise push._Upgraded("9.9.9", 123.0)
+        return 1, "checks failed"
+
+    monkeypatch.setattr(push, "_run_retrying", run_retrying)
+    monkeypatch.setattr(push, "_reexec", lambda up: execs.append(up.new))
+    assert push.run_detached(p, p.base, marker) == 1
+    assert execs == ["9.9.9"] and calls == [None, 123.0]
+    m = json.loads(marker.read_text())
+    assert m["status"] == "failed" and m["reason"] == "checks failed" and "Upgraded" not in json.dumps(m)
+
+
 def test_kill_guard_names_push_stop_and_lets_it_through(tmp_path):
     from ttp import killguard
     assert "ttp push --stop <marker>" in killguard.ADVICE

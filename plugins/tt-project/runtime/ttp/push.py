@@ -3936,7 +3936,12 @@ def take(p: Project, remote: str, branch: str, wait_s: float, poll_s: float = 1.
     batch). Inside a run the wait is recorded, so it does not count against the run's wall clock.
     `who` labels the holder (default: the task and run, else the pid). A non-urgent push to the push
     queue's own target stands back while the queue reserves its next turn for a due batch
-    (`yield_turn` False: the batch itself)."""
+    (`yield_turn` False: the batch itself).
+    A detached push (run_detached) that sees the runtime upgraded while it waits raises _Upgraded to
+    re-execute with it; the new process waits on from the same start (WAIT_SINCE_ENV), so it keeps its
+    place in line."""
+    global _wait_since
+    since, _wait_since = _wait_since, None
     paths = lock_paths(p, remote, branch)
     locks_dir, resource = (p.state / "locks" if p else paths[0].parent), lock_resource(remote, branch)
     who = who or (f"task #{os.environ['TTP_TASK']} (run {os.environ.get('TTP_RUN_ID') or '?'})"
@@ -3949,7 +3954,7 @@ def take(p: Project, remote: str, branch: str, wait_s: float, poll_s: float = 1.
         if f or wait_s <= 0:
             return f
     name = lock_name(remote, branch)
-    started = time.time()
+    started = since if since is not None and since <= time.time() else time.time()
     try:
         ticket = locks.enqueue(locks_dir, resource, who, since=started, priority=_priority(p))
     except OSError:   # no queue: plain polling, in no fixed order
@@ -3981,6 +3986,8 @@ def take(p: Project, remote: str, branch: str, wait_s: float, poll_s: float = 1.
                 f = grab()
             if f or (first_at is not None and now - first_at >= wait_s):
                 break
+            if _marker_here is not None and not _git_pushed and (new := checkcap.upgraded()):
+                raise _Upgraded(new, started)   # holding nothing yet: run_detached re-executes
             time.sleep(max(0.0, poll_s if first_at is None else min(poll_s, wait_s - (now - first_at))))
     finally:
         locks.dequeue(mine)
@@ -5523,6 +5530,14 @@ class _Stopped(Exception):
     pass
 
 
+class _Upgraded(Exception):
+    """The runtime was upgraded to `new` while this detached push waited for the push lock since `since`."""
+
+    def __init__(self, new: str, since: float):
+        super().__init__(f"runtime upgraded to {new}")
+        self.new, self.since = new, since
+
+
 GIT_PUSH_SUFFIX = ".gitpush"   # beside a detached push's marker once its process began a `git push` (stop_own)
 _marker_here: Path | None = None   # the marker of this process when it is a detached push (run_detached)
 _git_pushed = False   # this process began a `git push`: from here on a stop signal never interrupts it
@@ -5549,18 +5564,60 @@ def _stop(sig, _frame) -> None:
 
 
 RUN_LOCK_FD_ENV = "TTP_PUSH_RUN_LOCK_FD"   # the fd of its run lock, which a detached push process inherits
+WAIT_SINCE_ENV = "TTP_PUSH_WAIT_SINCE"   # when a re-executed detached push began waiting for the push lock
+_run_lock_fd: int | None = None   # the run lock a detached push holds (keep_run_lock_here), kept across a re-exec
+_wait_since: float | None = None   # WAIT_SINCE_ENV as this process read it, for its first push lock wait (take)
 
 
 def keep_run_lock_here() -> None:
     """Make the run lock the push process inherited (RUN_LOCK_FD_ENV) close-on-exec, so it is held by this
     process alone: nothing it starts (git, a check, a hook, a shell) gets it, and a process one of those
     leaves running never makes a push that died look alive."""
+    global _run_lock_fd, _wait_since
     fd = os.environ.pop(RUN_LOCK_FD_ENV, "")
     if fd.isdigit():
         try:
             os.set_inheritable(int(fd), False)
+            _run_lock_fd = int(fd)
         except OSError:
             pass
+    try:
+        _wait_since = float(os.environ.pop(WAIT_SINCE_ENV, ""))
+    except ValueError:
+        pass
+
+
+def _reexec(up: _Upgraded) -> None:
+    """Run this detached push again with the runtime installed now (up.new), as the same process: exec keeps
+    its pid, so its marker, the launcher's stop (stop_own) and the run lock's label still name it, and the run
+    lock passes on (RUN_LOCK_FD_ENV). It waits for the push lock again from when it began (WAIT_SINCE_ENV).
+    Called only while it waits for the push lock, holding nothing else; returns only when the exec failed,
+    and then it waits on with this runtime (REEXEC_ENV: never for this version again)."""
+    from . import __version__
+    os.environ[checkcap.REEXEC_ENV] = up.new
+    os.environ[WAIT_SINCE_ENV] = repr(up.since)
+    if _run_lock_fd is not None:
+        try:
+            os.set_inheritable(_run_lock_fd, True)
+            os.environ[RUN_LOCK_FD_ENV] = str(_run_lock_fd)
+        except OSError:
+            pass
+    print(f"--- {time.strftime('%Y-%m-%dT%H:%M:%S')} runtime {__version__} was upgraded to {up.new} while this "
+          f"push waited for the push lock: re-executing with it (same pid, marker and run lock), waiting on "
+          f"from {time.strftime('%H:%M:%S', time.localtime(up.since))}", flush=True)
+    sys.stderr.flush()
+    try:
+        os.execv(sys.executable, [sys.executable, "-m", "ttp", *sys.argv[1:]])
+    except OSError as e:
+        os.environ.pop(RUN_LOCK_FD_ENV, None)
+        os.environ.pop(WAIT_SINCE_ENV, None)
+        if _run_lock_fd is not None:
+            try:
+                os.set_inheritable(_run_lock_fd, False)
+            except OSError:
+                pass
+        print(f"ttp push: could not re-execute with runtime {up.new} ({e.strerror or e}): waiting on with "
+              f"{__version__}", file=sys.stderr, flush=True)
 
 
 def run_detached(p: Project, repo: Path, marker: Path, own: bool = False) -> int:
@@ -5573,7 +5630,7 @@ def run_detached(p: Project, repo: Path, marker: Path, own: bool = False) -> int
     except (OSError, ValueError):
         pass
     print(f"--- {time.strftime('%Y-%m-%dT%H:%M:%S')} detached push, marker {marker}", flush=True)
-    global pool_status, _marker_here
+    global pool_status, _marker_here, _wait_since
     pool_status = marker.with_suffix(POOL_STATUS_SUFFIX)
     _marker_here = marker
     m = _read(marker)
@@ -5589,7 +5646,13 @@ def run_detached(p: Project, repo: Path, marker: Path, own: bool = False) -> int
         if os.environ.get("TTP_RUN_DIR") != str(checkdirs.reports(output)):
             raise OSError("TTP_RUN_DIR is missing or differs from the queued check output directory")
         rec = m.get("recorded_checks")
-        rc, reason = _run_retrying(p, repo, marker, own, rec if isinstance(rec, dict) else None)
+        while True:
+            try:
+                rc, reason = _run_retrying(p, repo, marker, own, rec if isinstance(rec, dict) else None)
+                break
+            except _Upgraded as up:   # waiting for the push lock: on with the new runtime, same pid
+                _reexec(up)
+                _wait_since = up.since   # the exec failed: wait on from the same start
     except Exception as e:     # recorded as a failure, never left as "running"
         print(f"ttp push: {type(e).__name__}: {e}", file=sys.stderr)
         reason = str(e) if isinstance(e, _Stopped) else None
