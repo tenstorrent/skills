@@ -1578,6 +1578,22 @@ session and stateless coordinators on every provider.
 - Up to 6 workers per project run side by side (`budget.max_parallel_workers`); on a plan, all of
   them until the last stretch before the line. When a plan is below its line, slots sit idle and
   nothing is queued, the coordinator is asked for more work, less often each time it finds none.
+- On a laptop or workstation, one machine-wide limit caps the workers of all tt-project projects on
+  it together, so several projects cannot overheat it or make a call stutter. Each project's
+  `budget.max_parallel_workers` stays its own ceiling; a project cap above the machine limit is
+  clipped to it. The base is `machine.max_workers` (unset: half the cores, from 2 to 8). The daemon
+  lowers it while the CPU is busy (75% of the cores: x0.75, 90%: x0.5), memory is short (under 20%
+  free, macOS memory pressure at warn, compressor at 30% of RAM, or Linux memory PSI at 5: x0.75;
+  under 10%, critical, 50% or 20: x0.5), a call app holds the display awake (macOS
+  `pmset -g assertions`: Zoom, Teams, Webex, FaceTime, Slack, or a WebRTC call in a browser: x0.5;
+  only names are read and only a yes/no is kept), or the machine is hot (macOS thermal pressure
+  moderate: x0.75, heavy or worse: x0.5; Linux: a thermal zone at 80 C or 90 C). The limit is never
+  below 1. An unreadable CPU or memory reading counts as moderately busy, never as free. The signals
+  are read at most every 30 s for the whole machine and shared, with each project's running workers,
+  in `TTP_HOME/machine-workers.json` under a file lock; the lowest limit a live project publishes
+  holds, and each start claims its place under the lock. `machine.worker_limit` is `auto` (on for
+  macOS or a machine with a battery; off on lab and build servers), `on` or `off`; turn it off with
+  `ttp config <name> machine.worker_limit off`. Set values stay across upgrades.
 - Workers, reviewers, everything they start (detached checks, tests, reference models) and the
   daemon's pushes run at low CPU priority, 10 nice levels below the daemon (`runner.nice`, 0-19;
   0 = normal priority), so they never slow the machine's own work. The daemon and the coordinator
@@ -3165,6 +3181,7 @@ is open raises one `cap_wait` event naming the key.
 | `checks.host_max` | from the host's cores and load | suites on one host | safety |
 | `delivery.push_min_gap_s` | 1800 s, only after a batch that did not end clean | the next push | safety |
 | `budget.max_parallel_workers` | 6 | worker runs at once | safety (spend) |
+| `machine.worker_limit` / `machine.max_workers` | auto (laptops and workstations) / half the cores, 2-8, paced down | worker runs at once across all projects on the machine | safety (host) |
 
 ### Queue waits over 30 minutes
 

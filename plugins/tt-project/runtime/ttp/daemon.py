@@ -48,6 +48,7 @@ from . import runclass
 from . import configwho
 from . import sidefx
 from . import looks
+from . import machinecap
 from . import cursorhook
 from . import pausegone
 from . import usersite
@@ -11153,6 +11154,10 @@ class Daemon:
         running = db.q("SELECT provider, COUNT(*) n FROM runs WHERE role!='coordinator' AND status='running' "
                        "GROUP BY provider")
         busy = {r["provider"]: r["n"] for r in running}
+        try:   # the other projects on this machine count this project's workers (machinecap.py)
+            machinecap.publish(self.p.name, self.cfg, sum(busy.values()))
+        except Exception as e:
+            log(self.p, f"machine-wide worker count not published: {e}")
         self.check_disk()
         try:
             self._slot_resv_pass = self._slot_reservations(time.time())
@@ -11694,13 +11699,35 @@ class Daemon:
                 ctx["committed"] = self._committed_usd()
             if not self._fits_caps(gate, ctx["committed"] + cost):
                 return "caps"
+        if why := self._machine_hold(ctx):   # all projects' workers on this laptop or workstation
+            ctx["held_by"][task["id"]] = why
+            return "held"
         # Checked last: a task that waits for its resource reserves it, and only a task that
         # would otherwise start now may hold others off the resource.
         why = self._resource_hold(task, reserve=reserve)
         if why:
             ctx["holds"][task["id"]] = why   # the recorded hold reason (kind, resource, holders)
             return "resource"
+        if reserve and (why := self._machine_hold(ctx, claim=True)):   # another project took the place
+            self._unreserve(task)
+            ctx["held_by"][task["id"]] = why
+            return "held"
         return None
+
+    def _machine_hold(self, ctx: dict, claim: bool = False) -> str | None:
+        """Why the machine-wide worker limit (machinecap.py) holds one more start now, or None. With
+        `claim` a None counts the start for the other projects on the machine. A failure to read or
+        write its shared state holds nothing: the project's own caps still apply."""
+        running = sum(ctx["busy"].values())
+        seen = ctx.setdefault("machine", {})   # read once per pass and running count; a claim always reads
+        if not claim and running in seen:
+            return seen[running]
+        try:
+            seen[running] = machinecap.check(self.p.name, self.cfg, running, claim=claim)
+            return seen[running]
+        except Exception as e:
+            log(self.p, f"machine-wide worker limit not checked: {e}")
+            return None
 
     def _pick_effort(self, task: dict, provider: str) -> dict | None:
         """The task's tier for this start (see effort.pick), stored on the task; None leaves it as it is."""

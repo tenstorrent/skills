@@ -552,6 +552,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # the machine awake themselves as needed.
     # pin_verify: strict refuses an explicit task model/effort pin that cannot be verified before a turn.
     "runner": {"nice": 10, "prevent_idle_sleep": "off", "pin_verify": "lenient"},
+    # One limit on concurrent workers across all projects on this machine (machinecap.py), paced by CPU,
+    # memory, a call in progress and heat. worker_limit: auto (on for laptops and workstations: macOS or
+    # a battery present; off on lab and build servers), on, off. max_workers: the base before pacing,
+    # null = half the cores, from 2 to 8. budget.max_parallel_workers stays each project's own ceiling.
+    "machine": {"worker_limit": "auto", "max_workers": None},
     # reuse: every ssh the project starts (probes, checks, workers, git over ssh) shares one connection per
     # host for 10 minutes (OpenSSH ControlMaster through the harness's bin/ssh; sockets in ~/.tt-project/cm),
     # so an ssh agent signs once, not per command. Off: each ssh opens its own connection (sshmux.py).
@@ -1297,6 +1302,13 @@ def config_problems(raw: dict, root: Path | None = None) -> list[str]:
     v = (raw.get("runner") or {}).get("prevent_idle_sleep") if isinstance(raw.get("runner"), dict) else None
     if v is not None and not isinstance(v, bool) and str(v).strip().lower() not in ("auto", "on", "off"):
         out.append(f"runner.prevent_idle_sleep: {v!r} is not auto, on or off; off is used")
+    m = raw.get("machine") if isinstance(raw.get("machine"), dict) else {}
+    v = m.get("worker_limit")
+    if v is not None and str(v).strip().lower() not in ("auto", "on", "off", "true", "false"):
+        out.append(f"machine.worker_limit: {v!r} is not auto, on or off; auto is used")
+    v = m.get("max_workers")
+    if v is not None and (isinstance(v, bool) or not isinstance(v, int) or v < 1):
+        out.append(f"machine.max_workers: {v!r} is not a whole number of at least 1 (or null)")
     v = (raw.get("runner") or {}).get("pin_verify") if isinstance(raw.get("runner"), dict) else None
     if v is not None and v not in ("strict", "lenient"):
         out.append(f"runner.pin_verify: {v!r} is not strict or lenient")

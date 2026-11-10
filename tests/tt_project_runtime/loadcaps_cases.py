@@ -179,3 +179,137 @@ def test_a_short_external_wait_keeps_its_unfinished_head_unreviewed_while_review
     long_wait, _, _ = _unreviewed(env, p, "waits long", status="queued", age=2400, result=busy)
     assert dm.Daemon(p.base).sweep_unreviewed(force=True) == [long_wait], "40 min: its head is reviewed"
     assert not _daemon_reviews(p, waiting)
+
+
+# -- the machine-wide worker limit (machinecap.py) -------------------------------------------------
+
+_IDLE = {"cpu_busy": 0.1, "mem_free": 0.6, "pressure": 1, "compressor": 0.05, "call": False, "thermal": 0}
+
+
+def _mcap_cfg(on="on", top=4):
+    return {"machine": {"worker_limit": on, "max_workers": top}}
+
+
+def test_machine_limit_sum_over_two_projects_never_passes_it(env, tmp_path):
+    """Two projects claiming starts in turn: the sum stops at the limit, whichever project asks."""
+    from ttp import machinecap as mc
+    home, cfg, now = tmp_path / "mhome", _mcap_cfg(top=5), time.time()
+    sig = dict(_IDLE, at=now)
+    running = {"a": 0, "b": 0}
+    for _ in range(10):
+        for name in running:
+            if mc.check(name, cfg, running[name], claim=True, now=now, home=home, read=lambda: sig) is None:
+                running[name] += 1
+            assert sum(running.values()) <= 5
+    assert sum(running.values()) == 5 and min(running.values()) >= 2
+    why = mc.check("b", cfg, running["b"], now=now, home=home, read=lambda: sig)
+    assert why and "5 of 5 running across all projects" in why and "machine.worker_limit" in why
+    # a finished worker (published each dispatch pass) frees a place for the other project
+    mc.publish("a", cfg, running["a"] - 1, now=now, home=home)
+    assert mc.check("b", cfg, running["b"], now=now, home=home, read=lambda: sig) is None
+    # a dead daemon's entry no longer counts
+    data = json.loads((home / mc.STATE).read_text())
+    data["projects"]["a"]["pid"] = 2 ** 22 + 12345
+    (home / mc.STATE).write_text(json.dumps(data))
+    assert mc.check("b", cfg, 4, now=now, home=home, read=lambda: sig) is None
+
+
+def test_machine_limit_project_cap_above_it_is_clipped(env, tmp_path):
+    """A project whose own cap (6) is above the machine limit (3) gets only the limit's places, and the
+    lowest limit a live project publishes binds the others."""
+    from ttp import machinecap as mc
+    home, now = tmp_path / "mhome", time.time()
+    sig = dict(_IDLE, at=now)
+    started = 0
+    for _ in range(6):   # budget.max_parallel_workers 6
+        if mc.check("big", _mcap_cfg(top=3), started, claim=True, now=now, home=home, read=lambda: sig) is None:
+            started += 1
+    assert started == 3
+    mc.publish("big", _mcap_cfg(top=3), 0, now=now, home=home)
+    mc.check("small", _mcap_cfg(top=2), 0, claim=True, now=now, home=home, read=lambda: sig)
+    assert mc.check("big", _mcap_cfg(top=8), 1, now=now, home=home, read=lambda: sig), \
+        "small's limit of 2 caps the machine: 1 + 1 running"
+
+
+def test_machine_limit_each_signal_lowers_it():
+    from ttp import machinecap as mc
+    assert mc.limit(8, _IDLE) == 8 and mc.words(_IDLE) == "nothing busy"
+    for change, want in [({"cpu_busy": 0.8}, 6), ({"cpu_busy": 0.95}, 4),
+                         ({"mem_free": 0.15}, 6), ({"mem_free": 0.05}, 4), ({"pressure": 2}, 6),
+                         ({"pressure": 4}, 4), ({"compressor": 0.35}, 6), ({"compressor": 0.6}, 4),
+                         ({"psi": 6.0}, 6), ({"psi": 25.0}, 4),
+                         ({"call": True}, 4), ({"thermal": 1}, 6), ({"thermal": 2}, 4)]:
+        assert mc.limit(8, {**_IDLE, **change}) == want, change
+    worst = {**_IDLE, "cpu_busy": 1.0, "mem_free": 0.01, "call": True, "thermal": 3}
+    assert mc.limit(8, worst) == 1 and mc.limit(2, worst) == 1, "never below one"
+    assert mc.words(worst) == "cpu heavy, memory heavy, call heavy, thermal heavy"
+
+
+def test_machine_limit_unreadable_signals_fall_back_to_a_lower_finite_limit(env, tmp_path):
+    from ttp import machinecap as mc
+    blind = {"cpu_busy": None, "mem_free": None, "pressure": None, "compressor": None, "call": None,
+             "thermal": None}
+    assert mc.levels(blind) == {"cpu": "moderate", "memory": "moderate"}
+    assert 1 <= mc.limit(8, blind) == 4 < 8 and mc.limit(8, {}) == 4, "unknown is never unlimited"
+    assert mc.base({}, cpus=64) == mc.BASE_MAX and mc.base({}, cpus=2) == mc.BASE_MIN
+    assert mc.base({"machine": {"max_workers": 0}}) == 1 and mc.base({"machine": {"max_workers": "x"}}, cpus=8) == 4
+    assert mc.psi(tmp_path / "none") is None and mc.linux_thermal(tmp_path / "none") is None
+    zone = tmp_path / "thermal" / "thermal_zone0"
+    zone.mkdir(parents=True)
+    (zone / "temp").write_text("85000\n")
+    assert mc.linux_thermal(tmp_path / "thermal") == 1
+    # a corrupt state file is replaced, never trusted
+    home = tmp_path / "mhome"
+    home.mkdir()
+    (home / mc.STATE).write_text("{not json")
+    assert mc.check("a", _mcap_cfg(top=2), 0, claim=True, home=home, read=lambda: dict(blind, at=time.time())) is None
+    assert json.loads((home / mc.STATE).read_text())["projects"]["a"]["running"] == 1
+
+
+def test_machine_limit_is_on_for_laptops_and_off_for_servers(tmp_path):
+    from ttp import machinecap as mc
+    assert mc.enabled({}, darwin=True, battery=lambda: False)
+    assert mc.enabled({}, darwin=False, battery=lambda: True)
+    assert not mc.enabled({}, darwin=False, battery=lambda: False)
+    assert not mc.enabled(_mcap_cfg("off"), darwin=True) and mc.enabled(_mcap_cfg("on"), darwin=False)
+    bat = tmp_path / "ps" / "BAT0"
+    bat.mkdir(parents=True)
+    (bat / "type").write_text("Battery\n")
+    assert mc.has_battery(tmp_path / "ps") and not mc.has_battery(tmp_path / "missing")
+    assert mc.check("a", _mcap_cfg("off", 1), 50, read=lambda: {}) is None, "off holds nothing"
+
+
+def test_machine_limit_reads_a_call_from_power_assertions():
+    from ttp import machinecap as mc
+    zoom = ("   pid 9149(zoom.us): [0x0001] 00:10:00 NoDisplaySleepAssertion named: \"zoom.us is "
+            "preventing display sleep\"\n")
+    meet = "   pid 77(Google Chrome): [0x02] 00:01:00 NoDisplaySleepAssertion named: \"WebRTC has active PeerConnections\"\n"
+    video = "   pid 77(Google Chrome): [0x02] 00:01:00 NoDisplaySleepAssertion named: \"Video Wake Lock\"\n"
+    idle = "   pid 120(powerd): [0x03] 00:00:00 PreventUserIdleSystemSleep named: \"Powerd - Prevent sleep\"\n"
+    assert mc.in_call(zoom) and mc.in_call(meet)
+    assert mc.in_call(video) is False and mc.in_call(idle) is False and mc.in_call("") is False
+
+
+def test_machine_limit_holds_a_dispatch_start_with_its_words(env, monkeypatch):
+    """The daemon checks the machine limit before each start and claims a place when it starts one."""
+    from ttp import machinecap as mc
+    from ttp.daemon import Daemon
+    p = make(env)
+    p.set_config("machine.worker_limit", "on")
+    p.set_config("machine.max_workers", 2)
+    monkeypatch.setattr(mc, "read_signals", lambda darwin=None: dict(_IDLE, at=time.time()))
+    d = Daemon(p.base)
+    core = d.cfg.get("core_provider", "claude")
+    t = p.db.task(p.db.add_task("light work", "s", kind="work", tier="light", origin="user", priority=2))
+
+    def ctx(n):
+        return {"now": time.time(), "paused": {}, "committed": None, "busy": {core: n}, "logged_out": {}}
+    c = ctx(2)
+    assert d._start_hold(t, core, c) == "held"
+    assert "machine-wide worker limit: 2 of 2" in d._hold_words(t, "held", c)
+    assert d._start_hold(t, core, ctx(1)) is None
+    assert d._start_hold(t, core, ctx(1), reserve=True) is None
+    entry = json.loads((mc._home() / mc.STATE).read_text())["projects"][p.name]
+    assert entry["running"] == 2 and entry["limit"] == 2, "a start claims its place"
+    p.set_config("machine.worker_limit", "off")
+    assert Daemon(p.base)._start_hold(t, core, ctx(5)) is None, "off: only the project's own cap"

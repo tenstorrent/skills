@@ -531,6 +531,9 @@ def env(tmp_path, monkeypatch, _git_session, _short_tmp):
     from ttp import hostcpu   # the fresh module tests import
     monkeypatch.setattr(hostcpu, "MEMINFO", tmp_path / "no-meminfo")   # memory reads as unknown: never this host's own
     monkeypatch.setattr(hostcpu, "mach_mem_free", lambda: None)   # (memory tests set it)
+    from ttp import machinecap   # the machine-wide worker limit: auto reads as a server (tests turn it on)
+    monkeypatch.setattr(machinecap, "DARWIN", False)
+    monkeypatch.setattr(machinecap, "has_battery", lambda root=None: False)
     monkeypatch.setattr(importlib.machinery.SourceFileLoader, "get_code",
                         _cached_get_code(importlib.machinery.SourceFileLoader.get_code))
     monkeypatch.setattr(gettext, "find", _cached_find(gettext.find))
