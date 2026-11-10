@@ -119,7 +119,7 @@ from . import eventhold
 from . import msgwake
 from . import waketriage
 from . import convgate
-from . import unstarted
+from . import readywait, unstarted
 from . import boundedchild
 from . import replymsg
 from . import msgparts
@@ -3972,6 +3972,12 @@ class Daemon:
                 self._root_home(root.get("branch") or "")
             if Path(cwd).resolve() == self.p.harness.resolve() and (hh := runtimeload.head(self.p.harness)):
                 note = {**(note or {}), "harness_head": hh}   # its end compares (runtimeload.check)
+            try:   # how long it waited ready, by hold cause (readywait.py; ttp stats --ready-wait)
+                note = {**(note or {}), "ready_wait": readywait.take(
+                    self.__dict__.setdefault("_ready_acc", {}), task["id"], time.time(),
+                    lambda: unstarted.ready_since(self.p.db, task), getattr(self, "_unstarted_checked", None))}
+            except Exception as e:   # a wait record never stops a start
+                log(self.p, f"task {task['id']}: ready wait not recorded: {e}")
         db = self.p.db
         # Where the worker pid it records means something: a reader elsewhere does not judge it (locks).
         note = {**(note or {}), "pid_where": {"node": os.uname().nodename, "pidns": locks._pid_ns()}}
@@ -10442,6 +10448,7 @@ class Daemon:
         self._unstarted_checked = now
         if self.cfg_status == "unavailable" or self.settling() or now - last > STALL_GAP_S:
             self._unstarted_seen, self._unstarted_held, self._unstarted_ready = {}, set(), None
+            self._ready_acc = {}   # readywait: no cause seen across the gap
             return
         db = self.p.db
         paused = db.paused_resources()
@@ -10458,6 +10465,8 @@ class Daemon:
         seen, held_before = getattr(self, "_unstarted_seen", {}), getattr(self, "_unstarted_held", set())
         was_ready = getattr(self, "_unstarted_ready", None)   # the previous check's ready ids; None: no such check
         self._unstarted_seen, self._unstarted_held, self._unstarted_ready = {}, set(), {t["id"] for t in ready}
+        acc = self.__dict__.setdefault("_ready_acc", {})   # readywait: each ready task's hold causes so far
+        readywait.prune(acc, self._unstarted_ready)
         kick = []   # urgent tasks past READY_P1_S that dispatch would start now
         backlog, drained = self._ready_backlog(ready, busy, core, now), {}
         gate_recs = db.kv_dict(unstarted.BACKLOG_KV)[0]   # when each provider's spend gate last cleared
@@ -10483,9 +10492,12 @@ class Daemon:
             if ((why in self.SKIP_HOLDS or not free) and not (hot and (slots_only or why is None))) \
                     or (t["kind"] == "review" and self._precheck_holds(t, now)) \
                     or (why is None and (why := self._own_checks_wait(t))):
+                self._ready_note(acc, t, readywait.cause(why, ctx.get("held_by", {}).get(tid), gate, free, held=True),
+                                 now, was_ready, last)
                 self._unstarted_held.add(tid)
                 obligations._retire(db, now, f"held: {why or 'no free slot'}", fp)
                 continue
+            self._ready_note(acc, t, readywait.cause(why, ctx.get("held_by", {}).get(tid), gate, free), now, was_ready, last)
             since = seen.get(tid) or (now if tid in held_before else unstarted.ready_since(db, t))
             if was_ready is not None and tid not in was_ready:
                 since = max(since, last)
@@ -10715,6 +10727,14 @@ class Daemon:
             return None
 
     # Holds with an alert of their own, or no free slot: ready_not_started leaves them out.
+    def _ready_note(self, acc: dict, t: dict, c: str, now: float, was_ready, last: float) -> None:
+        """readywait.note for one ready task; on its first sight it became ready by its records
+        (unstarted.ready_since), and not before the previous check when that one did not find it ready."""
+        def since() -> float:
+            at = unstarted.ready_since(self.p.db, t)
+            return max(at, last) if was_ready is not None and t["id"] not in was_ready else at
+        readywait.note(acc, t["id"], c, now, since)
+
     SKIP_HOLDS = frozenset({"paused", "resource", "device", "logged_out", "net", "gate", "optional", "caps"})
 
     def check_checks_wait(self, every_s: float = 60) -> None:

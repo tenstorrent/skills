@@ -5294,3 +5294,75 @@ def test_a_dollar_caps_orange_and_yellow_name_the_cap_the_cut_and_what_lifts_it(
                                                       "slots, standard tier at most until"), g.cause
     p.set_config("budget.weekly_usd", 0)   # unset: no 7-day figure, and a daily share under its line
     assert bud.evaluate(p.db, p.config(), "claude", []).level == "green"
+
+
+def test_ready_wait_cause_maps_each_start_hold():
+    from types import SimpleNamespace as NS
+    from ttp import readywait as rw
+    stopped, open_ = NS(allow_new_work=False), NS(allow_new_work=True)
+    assert rw.cause(None, None, open_, True) == "dispatch"
+    assert rw.cause(None, None, open_, True, held=True) == "checks"   # its own pre-review checks
+    assert rw.cause(None, None, open_, False) == "project_cap"
+    assert rw.cause("gate", None, stopped, False) == "budget_gate"
+    assert rw.cause("gate", None, open_, False) == "project_cap"
+    assert rw.cause("caps", None, open_, True) == rw.cause("budget", None, open_, True) == "budget_gate"
+    assert rw.cause("held", "the machine-wide worker limit: 6 of 6", open_, False) == "machine_limit"
+    assert rw.cause("held", "a branch clash", open_, True) == "other"
+    assert rw.cause("device", None, open_, True) == rw.cause("resource", None, open_, True) == "resource"
+    assert rw.cause("net", None, open_, True) == "other"
+    assert rw.cause("its own ttp checks run is queued", None, open_, True) == "checks"
+
+
+def test_ready_wait_sightings_split_the_wait_by_cause_and_gaps_are_unrecorded():
+    from ttp import readywait as rw
+    acc = {}
+    rw.note(acc, 7, "project_cap", 1000.0, lambda: 940.0)   # ready at 940, first seen at 1000
+    rw.note(acc, 7, "project_cap", 1060.0, 0)
+    rw.note(acc, 7, "machine_limit", 1120.0, 0)
+    rw.note(acc, 7, "dispatch", 1600.0, 0)                  # the host slept: 480 s no check saw
+    w = rw.take(acc, 7, 1630.0, 0, 1600.0)
+    assert w == {"since": 940.0, "causes": {"project_cap": 180.0, "unrecorded": 480.0, "dispatch": 30.0}}
+    assert 7 not in acc
+    # Never seen ready: a check 40 s ago bounds the wait, which is dispatch's; no recent check: unrecorded.
+    assert rw.take({}, 8, 2000.0, 1500.0, 1960.0) == {"since": 1960.0, "causes": {"dispatch": 40.0}}
+    assert rw.take({}, 9, 2000.0, 1500.0, None) == {"since": 1500.0, "causes": {"unrecorded": 500.0}}
+    acc = {1: {}, 2: {}}
+    rw.prune(acc, {2})
+    assert list(acc) == [2]
+
+
+def test_stats_ready_wait_reports_recorded_and_rebuilt_waits_by_cause(env, capsys):
+    from ttp import cli, readywait as rw
+    p = make(env)
+    now = time.time()
+    ins = ("INSERT INTO runs(task,role,provider,started,ended,status,note,boot_id) VALUES(?,?,?,?,?,?,?,?)")
+    # Recorded: ready 300 s, 240 of them behind the machine-wide limit.
+    a = p.db.add_task("a", "s")
+    p.db.x(ins, (a, "worker", "claude", now - 3000, now - 2900, "done",
+                 json.dumps({"ready_wait": {"since": now - 3300, "causes": {"machine_limit": 240, "dispatch": 60}}}), "x"))
+    # Rebuilt, first run: ready when its dependency was done; a queue_wait alert names the workers queue.
+    b = p.db.add_task("b", "s")
+    c = p.db.add_task("c", "s", depends_on=[b])
+    p.db.x("UPDATE tasks SET created=? WHERE id IN (?,?)", (now - 9000, b, c))
+    p.db.x("INSERT INTO events(ts,source,kind,text,task) VALUES(?,?,?,?,?)", (now - 2600, "daemon", "task_done", "done", b))
+    p.db.x("INSERT INTO events(ts,source,kind,text,data,task) VALUES(?,?,?,?,?,?)",
+           (now - 2200, "daemon", "queue_wait", "waits", json.dumps({"must_act": {"key": f"qwait-{c}-workers"}}), c))
+    p.db.x(ins, (c, "worker", "claude", now - 2000, now - 1900, "done", None, "x"))
+    # A resumed wait: woken from its own `waiting` hand-off, with no requeue event: no ready time.
+    p.db.x("INSERT INTO events(ts,source,kind,text,task) VALUES(?,?,?,?,?)", (now - 1900, "daemon", "task_waiting", "w", c))
+    p.db.x(ins, (c, "worker", "claude", now - 1000, None, "running", None, "x"))
+    s = rw.report(p.db.q, now - 86400, now, p.state)
+    assert (s["runs"], s["recorded"], s["no_ready_time"]) == (3, 1, 1)
+    assert s["wait"]["n"] == 2 and s["wait"]["max_s"] == 600.0
+    assert s["by_cause"]["machine_limit"]["max_s"] == 240.0
+    assert s["by_cause"]["project_cap"]["total_s"] == 600.0 and "unrecorded" not in s["by_cause"]
+    # A requeue after the earlier run ends the wait there; the cause no event names is unrecorded.
+    p.db.x("INSERT INTO events(ts,source,kind,text,task) VALUES(?,?,?,?,?)", (now - 1300, "daemon", "task_requeued", "q", c))
+    s = rw.report(p.db.q, now - 86400, now, p.state)
+    assert s["no_ready_time"] == 0 and s["by_cause"]["unrecorded"]["max_s"] == 300.0
+    cli.main(["stats", "demo", "--ready-wait"])
+    out = capsys.readouterr().out
+    assert "ready-to-start wait" in out and "machine-wide limit" in out and "1 with a ready_wait record" in out
+    cli.main(["stats", "--ready-wait", "--projects", "demo,nosuch", "--json"])
+    got = json.loads(capsys.readouterr().out)
+    assert got["demo"]["runs"] == 3 and "error" in got["nosuch"]

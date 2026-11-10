@@ -2109,9 +2109,19 @@ def cmd_status(a) -> None:
 def cmd_stats(a) -> None:
     """Context re-read (cache-read) tokens per run and per $, by role, kind, tier and effort."""
     from . import budget as bud
+    if getattr(a, "ready_wait", False) and (a.all or a.projects):
+        return _stats_ready_wait_all(a)
     p = need(a.name, sys.argv[1:]) if a.name else here()
     if not p:
         die("no tt-project project here; name one: `ttp stats <name>`")
+    if getattr(a, "ready_wait", False):
+        from . import readywait
+        tz = timefmt.home(p)
+        until = _stats_time(a.until, tz, "--until") or time.time()
+        since = _stats_time(a.since, tz, "--since") or until - a.days * 86400
+        s = {p.name: readywait.report(p.db.q, since, until, p.state)}
+        print(json.dumps(s, indent=1) if a.json else readywait.text(s))
+        return
     if a.effort_ab:
         from . import effortab
         tz = timefmt.home(p)
@@ -2182,6 +2192,40 @@ def cmd_stats(a) -> None:
         return
     s = bud.reread_stats(p.db, a.days, top=a.top, since=since, until=until)
     print(json.dumps(s, indent=1) if a.json else bud.reread_text(s, tz if since or until else None))
+
+
+def _stats_ready_wait_all(a) -> None:
+    """`ttp stats --ready-wait --all` (or --projects a,b): every named project on this machine, each
+    read only from its own state folder (a read-only db connection)."""
+    import sqlite3
+    from . import globalcap as gcap
+    from . import project as project_mod
+    from . import readywait
+    reg = load_registry().get("projects") or {}
+    names = [n.strip() for n in a.projects.split(",") if n.strip()] if a.projects else sorted(reg)
+    until = _stats_time(a.until, "UTC", "--until") or time.time()
+    since = _stats_time(a.since, "UTC", "--since") or until - a.days * 86400
+    out: dict = {}
+    for name in names:
+        e = reg.get(name)
+        if not isinstance(e, dict) or not e.get("dir"):
+            out[name] = {"error": "not registered on this machine"}
+            continue
+        state = Path(str(e["dir"])) / project_mod.FOLDER / "state"
+        try:
+            conn = gcap.connect_ro(state / "project.db", timeout=5)
+        except sqlite3.Error as err:
+            out[name] = {"error": str(err)}
+            continue
+        conn.row_factory = sqlite3.Row
+        try:
+            out[name] = readywait.report(lambda sql, args=(): [dict(r) for r in conn.execute(sql, tuple(args))],
+                                         since, until, state)
+        except sqlite3.Error as err:
+            out[name] = {"error": str(err)}
+        finally:
+            conn.close()
+    print(json.dumps(out, indent=1) if a.json else readywait.text(out))
 
 
 def _stats_time(v: str | None, tz: str, flag: str) -> float | None:
@@ -14768,6 +14812,12 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--split-at", help="compare runs before and after this time (a change landing)")
     s.add_argument("--top", type=int, default=10, help="how many of the costliest runs to list (default 10)")
     s.add_argument("--tools", action="store_true", help="tool output by category instead: the file-read share")
+    s.add_argument("--ready-wait", action="store_true",
+                   help="how long ready tasks waited for their run to start instead: median, p90, max, by hold "
+                        "cause (project cap, machine-wide limit, own checks, budget gate, resource, dispatch with a "
+                        "free place), and the host checks slot waits (readywait.py; --since/--until, else --days)")
+    s.add_argument("--all", action="store_true", help="with --ready-wait: every project on this machine, read only")
+    s.add_argument("--projects", help="with --ready-wait: these projects (comma-separated), read only")
     s.add_argument("--babysit", action="store_true",
                    help="the chat watcher instead: decisions it settled and fallbacks, per purpose, model and hour "
                         "(read-only; --since/--until, else the last --days)")
