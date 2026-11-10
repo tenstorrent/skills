@@ -4,8 +4,9 @@
 
 Every project's daemon whose chat provider has an endpoint asks, model-free, whether today's bench is due
 (due): it is BENCH_HOUR local time or later and no project on the host has written today's result
-(DIR/<date>.json). The first to get LOCK runs it and becomes the host's OWNER; a second run on the same
-host and day does nothing, and every project reads the owner's result (latest). No key saved for the
+(DIR/<date>.json). The project that owns the lease (OWNER, benchowner.py) runs it from a daily command
+schedule; a second run on the same host and day does nothing (LOCK), and every project reads the
+owner's result (latest). No key saved for the
 endpoint, or a /models check that refuses it: no model is called, the day is recorded as skipped and the
 skip is reported once per outage (NOKEY), not daily.
 
@@ -29,6 +30,7 @@ from pathlib import Path
 from typing import Callable
 
 DIR, LOCK, OWNER, MODELS = "model-bench", "bench.lock", "owner.json", "models.json"   # under project.HOME_DIR
+OWNER_LOCK = "owner.lock"       # every change to OWNER is made under it (owner_update)
 NOKEY = "model-bench-nokey"     # the alert key of a skip for want of a working key (reported once)
 BENCH_HOUR = 2                  # local hour from which today's bench is due
 DAILY = 4                       # top served ranked models benched every day
@@ -80,6 +82,19 @@ def _write(path: Path, data: dict) -> None:
     from .project import durable_write
     path.parent.mkdir(parents=True, exist_ok=True)
     durable_write(path, json.dumps(data, indent=1, sort_keys=True))
+
+
+def owner_update(step: Callable[[dict], dict]) -> dict:
+    """OWNER replaced by step(OWNER) under OWNER_LOCK, so concurrent daemons and runs never lose a field."""
+    d = home()
+    d.mkdir(parents=True, exist_ok=True)
+    with open(d / OWNER_LOCK, "a") as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        old = _read(d / OWNER)
+        new = step(old)
+        if new != old:
+            _write(d / OWNER, new)
+        return new
 
 
 def latest() -> dict:
@@ -168,12 +183,11 @@ def run(project: str, cfg: dict, parked: dict[str, float], now: float, *, force:
         alias = str(((cfg.get("providers") or {}).get("chat") or {}).get("endpoint") or "")
         got = endpoint.credentials(alias) if alias else None
         ok, msg, ids = (lister or endpoint.list_models)(got.url, got.key) if got else (False, "no key saved", None)
-        owner = _read(d / OWNER)
         if not ok or not ids:
             why = f"no working key for chat endpoint {alias or '(none)'}: {msg}"
-            report = not owner.get("nokey_since")
-            _write(d / OWNER, {**owner, "nokey_since": owner.get("nokey_since") or now})
-            _write(today, {"date": day(now), "owner": project, "at": now, "skipped": why})
+            report = not _read(d / OWNER).get("nokey_since")
+            owner_update(lambda o: {**o, "nokey_since": o.get("nokey_since") or now, "tried": now})
+            _write(today, {"date": day(now), "owner": project, "at": now, "skipped": why, "report": report})
             return {"skipped": why, "report": report}
         ask = ask or (lambda m, p: _post(got.url, got.key, m, p))
         picked = arms(modelrank.ranking(cfg), list(ids), parked, now)
@@ -187,8 +201,8 @@ def run(project: str, cfg: dict, parked: dict[str, float], now: float, *, force:
                "weak": sorted(m for m, r in results.items() if not r["inconclusive"] and r["score"] < PASS_MIN),
                "inconclusive": sorted(m for m, r in results.items() if r["inconclusive"])}
         _write(today, rec)
-        _write(d / OWNER, {"project": project, "since": owner.get("since") if owner.get("project") == project
-                           else now, "last_result": now})
+        owner_update(lambda o: {**{k: v for k, v in o.items() if k != "nokey_since"}, "project": o.get("project")
+                                or project, "since": o.get("since") or now, "last_result": now, "tried": now})
         return rec
 
 

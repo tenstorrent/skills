@@ -3556,7 +3556,7 @@ def test_parked_and_weak_models_are_rechecked_weekly_through_the_bench_and_its_v
 
 
 def test_the_daemon_runs_the_model_bench_daily_and_reports_a_keyless_skip_once(env, monkeypatch):
-    from ttp import endpoint, modelbench
+    from ttp import benchowner, endpoint, modelbench
     from ttp.daemon import Daemon
     p = make(env)
     d = Daemon(p.base)
@@ -3565,15 +3565,14 @@ def test_the_daemon_runs_the_model_bench_daily_and_reports_a_keyless_skip_once(e
     _bench_env(env, monkeypatch, ["m-a"])
     monkeypatch.setattr(endpoint, "credentials", lambda alias: None)
     monkeypatch.setenv("TTP_TEST_MODEL_BENCH", "1")
-    monkeypatch.setattr(modelbench, "BENCH_HOUR", 0)
+    monkeypatch.setattr(benchowner, "eligible", lambda now: [p.name])
     alerts = []
     monkeypatch.setattr(d, "alert", lambda key, text, severity="high", **k: alerts.append((key, severity)))
-    for _ in range(3):
-        d.run_model_bench()
-        if d._bench_job:
-            d._bench_job.join(10)
+    for day in range(3):
+        modelbench.run(p.name, d.cfg, {}, _local(10 + day, 3))   # what the owner's daily schedule runs
         d._bench_tried = 0.0
-    assert alerts == [(modelbench.NOKEY, "low")]
+        d.run_model_bench()
+    assert [a for a in alerts if a[0] == modelbench.NOKEY] == [(modelbench.NOKEY, "low")]
     assert modelbench.latest()["skipped"].startswith("no working key") and modelbench.latest()["owner"] == p.name
 
 
@@ -3662,3 +3661,93 @@ def test_the_launch_arms_stand_ins_except_for_a_required_pin_and_the_end_keeps_t
     assert json.loads(run["note"])[modelrank.KEY]["mid_run"] == mid
     assert [a[2] for a in alerts] == ["low"] and "rank-a" in alerts[0][1] and _RT_MODEL in alerts[0][1]
     assert modelrank.down(p.db, d.cfg, p.state, _RT_MODEL, time.time()) == "refused"
+
+
+def _bench_owners(env, names=("proj-a", "proj-b", "proj-c")):
+    """Fake projects on the machine, each with a live daemon heartbeat and a chat endpoint."""
+    ps = {}
+    for i, n in enumerate(names):
+        ps[n] = make(env, n) if i == 0 else _second_project(env, n)
+        _route_config(ps[n])
+        (ps[n].state / "heartbeat").write_text("{}")
+    return ps
+
+
+def _bench_lease():
+    from ttp import modelbench
+    return json.loads((modelbench.home() / modelbench.OWNER).read_text())
+
+
+def test_one_project_per_machine_owns_the_model_bench_and_a_paused_or_opted_out_one_never_does(env):
+    """Task #7699: the first eligible project by name owns the bench; a paused owner is replaced at once
+    and an opted-out project is never chosen."""
+    from ttp import benchowner, configwho
+    ps = _bench_owners(env)
+    ps["proj-a"].set_config("model_bench", {"opt_out": True}, by=configwho.by("user", via="cli"))
+    now = time.time()
+    assert benchowner.eligible(now) == ["proj-b", "proj-c"]
+    assert benchowner.check("proj-c", {}, now) == {"owner": None}            # not first by name: waits
+    assert benchowner.check("proj-b", {}, now) == {"owner": "proj-b", "took": ""}
+    assert benchowner.check("proj-c", {}, now + 60) == {"owner": "proj-b"}   # one owner
+    assert benchowner.check("proj-a", {}, now + 60) == {"owner": "proj-b"}   # opted out: never takes it
+    ps["proj-b"].db.set_kv("paused", True)
+    assert benchowner.eligible(now + 120) == ["proj-c"]
+    assert benchowner.check("proj-c", {}, now + 120) == {"owner": "proj-c", "took": "proj-b"}
+    assert _bench_lease() == {"project": "proj-c", "since": now + 120, "prev": "proj-b"}
+    os.utime(ps["proj-c"].state / "heartbeat", (now - 3600, now - 3600))   # a dead daemon is not eligible
+    assert benchowner.eligible(now) == []
+
+
+def test_a_stale_model_bench_pokes_its_owner_once_then_the_next_project_takes_it_over(env):
+    """Task #7699: 49 h without a result pokes the owner exactly once per episode; 73 h hands the lease to
+    the next project by name, with exactly one winner among concurrent daemons."""
+    from concurrent.futures import ThreadPoolExecutor
+    from ttp import benchowner, modelbench
+    names, t0 = ["proj-a", "proj-b", "proj-c"], time.time()
+    modelbench.owner_update(lambda o: {"project": "proj-a", "since": t0 - 100 * 3600, "last_result": t0})
+    now = t0 + 49 * 3600
+    assert benchowner.check("proj-a", {}, now, names) == {"owner": "proj-a"}   # the owner never pokes itself
+    got = [benchowner.check(n, {}, now + i, names) for i, n in enumerate(["proj-c", "proj-b", "proj-c"])]
+    assert got == [{"owner": "proj-a", "poked": "proj-a"}, {"owner": "proj-a"}, {"owner": "proj-a"}]
+    assert _bench_lease()["poke"] == {"ref": t0, "at": now, "by": "proj-c"}
+    modelbench.owner_update(lambda o: {**o, "last_result": now})               # a result: the episode ends
+    assert benchowner.check("proj-b", {}, now + 3600, names) == {"owner": "proj-a"}
+    assert benchowner.check("proj-b", {}, now + 49 * 3600, names)["poked"] == "proj-a"   # a new episode
+    late = now + 73 * 3600
+    with ThreadPoolExecutor(9) as ex:
+        res = list(ex.map(lambda n: benchowner.check(n, {}, late, names), names * 3))
+    assert [r for r in res if "took" in r] == [{"owner": "proj-b", "took": "proj-a"}]
+    assert _bench_lease() == {"project": "proj-b", "since": late, "prev": "proj-a"}
+    modelbench.owner_update(lambda o: {"project": "proj-c", "since": t0})       # wraps round to the first name
+    assert benchowner.check("proj-a", {}, t0 + 73 * 3600, names) == {"owner": "proj-a", "took": "proj-c"}
+
+
+def test_the_bench_owners_daemon_keeps_a_daily_command_schedule_and_runs_it_on_a_poke(env, monkeypatch):
+    """Task #7699: the owner's daemon keeps a model-free command schedule at bench_at and turns a poke into
+    one run now and one feed line; a project that loses the lease turns its schedule off."""
+    from ttp import benchowner, modelbench, schednow
+    from ttp.daemon import Daemon
+    p = make(env)
+    _route_config(p)
+    d = Daemon(p.base)
+    d._load_config()
+    monkeypatch.setenv("TTP_TEST_MODEL_BENCH", "1")
+    monkeypatch.setattr(benchowner, "eligible", lambda now: [p.name, "zz-other"])
+    asked, alerts = [], []
+    monkeypatch.setattr(schednow, "request", lambda proj, name, caller: asked.append(name) or "r1")
+    monkeypatch.setattr(d, "alert", lambda key, text, severity="high", **k: alerts.append((key, severity)))
+    row = lambda: p.db.one("SELECT kind, at, enabled, payload FROM schedules WHERE name=?", (benchowner.SCHEDULE,))
+    d.run_model_bench()
+    assert alerts == [("model-bench-owner", "low")] and asked == []
+    assert {**row(), "payload": json.loads(row()["payload"])} == {
+        "kind": "command", "at": "02:00", "enabled": 1, "payload": {"command": benchowner.COMMAND}}
+    modelbench.owner_update(lambda o: {**o, "poke": {"ref": 1.0, "at": time.time(), "by": "zz-other"}})
+    for _ in range(2):
+        d._bench_tried = 0.0
+        d.run_model_bench()
+    assert asked == [benchowner.SCHEDULE] and len(alerts) == 1
+    assert p.db.one("SELECT count(*) n FROM messages WHERE text LIKE '%poked this project%'")["n"] == 1
+    modelbench.owner_update(lambda o: {"project": "zz-other", "since": time.time()})
+    d._bench_tried = 0.0
+    d.run_model_bench()
+    assert row()["enabled"] == 0

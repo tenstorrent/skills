@@ -1285,8 +1285,7 @@ class Daemon:
         self._rank_tried, self._rank_out = 0.0, None
         self._scores_job: threading.Thread | None = None   # the model scoreboard (refresh_model_scores)
         self._scores_tried = 0.0
-        self._bench_job: threading.Thread | None = None   # the host's daily model bench (run_model_bench)
-        self._bench_tried, self._bench_out = 0.0, None
+        self._bench_tried = 0.0   # the last hourly model bench owner check (run_model_bench)
         self._cli_watch: threading.Thread | None = None   # CLI versions being read (watch_cli_versions)
         self._cli_watched = 0.0   # when that last started
         self._replica_checked = 0.0
@@ -4602,33 +4601,50 @@ class Daemon:
         self._scores_job.start()
 
     def run_model_bench(self) -> None:
-        """The host's shared daily model bench (modelbench.py), model-free until due: at most every 15
-        minutes, once today's is due and no project on the host has run it, it runs in a thread. A skip for
-        want of a working key is one low alert per outage; a bench is one log line."""
-        from . import modelbench, modelrank
-        out, self._bench_out = self._bench_out, None
-        if out and out.get("report"):
-            self.alert(modelbench.NOKEY, f"The daily chat model bench was skipped: {out['skipped']}. No model "
-                       "was called; it is skipped quietly each day until a key works.", severity="low")
-        elif out and out.get("results") is not None:
-            log(self.p, f"model bench {out['date']}: {len(out['results'])} model(s); weak: {', '.join(out['weak']) or 'none'}")
+        """The machine's shared daily model bench (benchowner.py), model-free, hourly: check the owner
+        lease (take it over or poke its owner when stale), keep this project's bench schedule on only
+        while it owns the lease, run it now on a poke, and report the owner's newest bench once: a
+        keyless skip is one low alert per outage, a bench one log line."""
+        from . import benchowner, modelbench, rankfresh, schednow
         if os.environ.get("PYTEST_CURRENT_TEST") and not os.environ.get("TTP_TEST_MODEL_BENCH"):
             return   # daemons under test never bench, unless a test asks
-        now = time.time()
-        if (now - self._bench_tried < 900 or self._bench_job is not None and self._bench_job.is_alive()
-                or not modelbench.due(self.cfg, now)):
+        now, db = time.time(), self.p.db
+        if now - self._bench_tried < 3600:
             return
         self._bench_tried = now
-        cfg, name, parked, where = self.cfg, self.p.name, modelrank.parked_models(self.p.db), self.p
-
-        def work() -> None:
-            try:
-                self._bench_out = modelbench.run(name, cfg, parked, time.time())
-            except Exception as e:   # a local fault (an unwritable home): the type only
-                log(where, f"model bench: failed: {type(e).__name__}")
-
-        self._bench_job = threading.Thread(target=work, name="model-bench", daemon=True)
-        self._bench_job.start()
+        me, cfg = self.p.name, self.cfg
+        if not rankfresh.configured(cfg):
+            return
+        got = benchowner.check(me, cfg, now)
+        lease = modelbench._read(modelbench.home() / modelbench.OWNER)
+        if got.get("took") is not None:
+            self.alert("model-bench-owner", f"This project now runs the machine's daily chat model bench "
+                       f"(was: {got['took'] or 'nobody'}).", severity="low")
+        if got.get("poked"):
+            db.post("out", f"The machine's daily chat model bench has no recent result; poked its owner "
+                    f"{got['poked']} to run it now.", chat=None, kind="info", severity="low")
+        owner = lease.get("project") == me
+        try:
+            benchowner.ensure(self.p, db, owner, benchowner.settings(cfg)["at"])
+        except ValueError as e:   # a broken schedules file: the next check tries again
+            log(self.p, f"model bench: schedule not changed: {e}")
+        seen = db.kv(benchowner.SEEN, {}) or {}
+        poke = lease.get("poke") or {}
+        if owner and float(poke.get("at") or 0) > float(seen.get("poke") or 0):
+            schednow.request(self.p, benchowner.SCHEDULE, "model-bench-poke")
+            db.post("out", f"{poke.get('by') or 'Another project'} poked this project to run the machine's "
+                    "daily chat model bench; running it now.", chat=None, kind="info", severity="low")
+            seen["poke"] = poke["at"]
+        rec = modelbench.latest()
+        if rec.get("owner") == me and float(rec.get("at") or 0) > float(seen.get("record") or 0):
+            seen["record"] = rec["at"]
+            if rec.get("skipped") and rec.get("report"):
+                self.alert(modelbench.NOKEY, f"The daily chat model bench was skipped: {rec['skipped']}. No "
+                           "model was called; it is skipped quietly each day until a key works.", severity="low")
+            elif rec.get("results") is not None:
+                log(self.p, f"model bench {rec['date']}: {len(rec['results'])} model(s); weak: "
+                    f"{', '.join(rec['weak']) or 'none'}")
+        db.set_kv(benchowner.SEEN, seen)
 
     def probe_mcp(self) -> None:
         """Refresh this host's connected MCP servers for the status feed (mcpgap.py): `claude mcp list` in

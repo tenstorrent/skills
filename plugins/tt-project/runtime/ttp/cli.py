@@ -8143,6 +8143,17 @@ def cmd_model_bench(a) -> None:
                           "latest": modelbench.latest(), "models": modelbench.models()}, indent=1))
         return
     p = here() or die("model-bench: no project here (run it in a project or with TTP_PROJECT set)")
+    if a.detach:   # the owner's daily command schedule: the bench outlives the schedule's time limit
+        log = modelbench.home() / "bench.log"
+        log.parent.mkdir(parents=True, exist_ok=True)
+        rt = str(Path(__file__).resolve().parent.parent)
+        env = {**os.environ, "PYTHONPATH": os.pathsep.join(filter(None, [rt, os.environ.get("PYTHONPATH")]))}
+        with open(log, "ab") as out:
+            child = subprocess.Popen([sys.executable, "-m", "ttp", "model-bench", "run", *(["--force"] if a.force else [])],
+                                     cwd=p.root, env=env, stdin=subprocess.DEVNULL, stdout=out,
+                                     stderr=subprocess.STDOUT, start_new_session=True)
+        print(f"model bench started (pid {child.pid}; log {log})", file=sys.stderr)
+        return
     now = _t.time()
     out = modelbench.run(p.name, p.config(), modelrank.parked_models(p.db), now, force=a.force)
     print(json.dumps(out, indent=1))
@@ -14358,13 +14369,15 @@ def main(argv: list[str] | None = None) -> None:
 
     s = sub.add_parser("model-bench", help="the host's shared daily chat model bench: `run` benches the served "
                                             "models once per host and day (a second run does nothing; the "
-                                            "daemon runs it daily), `show` prints the owner, latest result and "
+                                            "owner project's schedule runs it daily), `show` prints the owner, latest result and "
                                             "per-model scores")
     s.add_argument("action", choices=["run", "show", "scores"],
                    help="run: bench the served models (once per host and day); show: print the owner, latest "
                         "result and per-model scores; scores: the model scoreboard's per-class rankings")
     s.add_argument("--force", action="store_true", help="run: bench again though today's result exists")
     s.add_argument("--json", action="store_true", help="scores: print the board as JSON")
+    s.add_argument("--detach", action="store_true", help="run: start the bench in the background and return "
+                                                         "(the owner's daily schedule; output in the bench log)")
     s.set_defaults(fn=cmd_model_bench)
 
     s = sub.add_parser("ack-wait", help="wait model-free for another project's reply to a `ttp note --to`: probe "
