@@ -2411,13 +2411,35 @@ def _move_local(repo: Path, branch: str, head: str, say: Callable[[str], None]) 
 
 def own_base(p: Project, repo: Path, remote: str) -> str | None:
     """The tip of the shared branch work leaves from (delivery.push_branch) that `ttp push --own`
-    compares with: fetched, or the local branch of that name in a repo with no git remote. None
-    when there is none."""
+    compares with: fetched, or the local branch of that name in a repo with no git remote. A worktree
+    of another repository, whose remote has no such branch, compares with that remote's own default
+    branch instead (_default_base). None when there is none."""
     try:
         tgt = target(p, repo)
     except ValueError:
         return None
-    return (_local_tip(repo, tgt[1]) if remote == LOCAL else _fetch(repo, *tgt)) or None
+    if remote == LOCAL:
+        return _local_tip(repo, tgt[1]) or None
+    return _fetch(repo, *tgt) or _default_base(repo, *tgt) or None
+
+
+def _default_base(repo: Path, remote: str, branch: str) -> str:
+    """The tip of `remote`'s default branch (its HEAD), fetched, when `remote` has no branch `branch`:
+    the repo is not the one the push branch belongs to. "" when it has that branch (its fetch failed
+    for another reason), names no default branch, or cannot be read."""
+    ls = _git(repo, "ls-remote", "--symref", remote, "HEAD", f"refs/heads/{branch}")
+    lines = ls.stdout.splitlines()
+    if ls.returncode != 0 or any(ln.endswith(f"\trefs/heads/{branch}") for ln in lines):
+        return ""
+    head = next((ln.split()[1].removeprefix("refs/heads/") for ln in lines
+                 if ln.startswith("ref: refs/heads/") and ln.endswith("\tHEAD")), "")
+    return _fetch(repo, remote, head) if head else ""
+
+
+def no_checks_hint(repo: Path) -> str:
+    """NO_CHECKS, plus the delivery.push_checks_by_repo key that gives `repo` checks of its own."""
+    return (f"{NO_CHECKS}; for this repository alone, set delivery.push_checks_by_repo"
+            f"[{_repo_keys(repo)[1]!r}] instead")
 
 
 def own_ff_only(branch: str) -> bool:
@@ -3759,7 +3781,7 @@ def publish(repo: Path, remote: str, branch: str, checks: list[str],
     if not checks and (code := code_paths(repo, base) if base else ["(no push target to compare with)"]):
         more = f" and {len(code) - 3} more" if len(code) > 3 else ""
         say(f"no checks configured, and this change touches more than docs ({', '.join(code[:3])}{more}): "
-            + NO_CHECKS)
+            + no_checks_hint(repo))
         return REFUSED
     lock = hold() if hold else None
     if hold and lock is None:
@@ -4985,7 +5007,7 @@ def detach(p: Project, repo: Path, own: bool = False) -> int:
         if code := code_paths(top, base) if base else ["(no push target to compare with)"]:
             more = f" and {len(code) - 3} more" if len(code) > 3 else ""
             print(f"ttp push: no checks configured, and this change touches more than docs "
-                  f"({', '.join(code[:3])}{more}): " + NO_CHECKS, file=sys.stderr)
+                  f"({', '.join(code[:3])}{more}): " + no_checks_hint(top), file=sys.stderr)
             return REFUSED
     task = os.environ.get("TTP_TASK")
     rid = (f"t{task}-" if task else "") + time.strftime("%Y%m%d-%H%M%S") + f"-{os.getpid()}"

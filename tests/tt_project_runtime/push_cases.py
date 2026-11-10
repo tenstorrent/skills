@@ -19777,3 +19777,41 @@ def test_push_own_never_excuses_a_leak_scan_failure_its_base_has_too(env, monkey
     rc = push.publish(repo, "origin", "own", push.check_list([_GATE_CHECK]), say=said.append, base=base, p=p)
     assert rc == push.CHECKS_FAILED, said
     assert any("never excused" in m and "test_leak_scan" in m for m in said), said
+
+
+def test_own_push_from_another_repository_compares_with_its_own_default_branch(env, monkeypatch, capsys):
+    """A task worktree cloned from a repository other than the push branch's: `ttp push --own` compares
+    with that repository's default branch (its remote has no push branch), runs the required checks
+    and publishes the task branch there. With no checks for it, a code change is refused, naming
+    delivery.push_checks_by_repo; nothing is pushed unchecked, and the push branch is not touched."""
+    from ttp import push
+    p, repo, origin, _ = _push_setup(env, monkeypatch, ["true"])
+    tmp = env["tmp"]
+    lib_origin, lib = tmp / "lib-origin.git", tmp / "lib"
+    _bare_init(env, lib_origin)
+    subprocess.run(["git", "clone", "-q", str(lib_origin), str(lib)], check=True, capture_output=True)
+    _commit(lib, "README.md", "lib\n")
+    _git_out(lib, "push", "-q", "origin", "HEAD:refs/heads/trunk")
+    _git_out(lib_origin, "symbolic-ref", "HEAD", "refs/heads/trunk")
+    trunk = _git_out(lib, "rev-parse", "HEAD")
+    _git_out(lib, "checkout", "-q", "-b", "ttp/t40-feature")
+    _commit(lib, "code.py", "x = 1\n")
+    monkeypatch.chdir(lib)
+    assert push.own_base(p, lib, "origin") == trunk
+    assert push.own_base(p, repo, "origin") == _git_out(origin, "rev-parse", "proj")
+    heads = lambda r: _git_out(r, "for-each-ref", "--format=%(refname:short)", "refs/heads").split()
+    p.set_config("delivery.push_checks", [])
+    assert _ttp("push", "--own") == 2
+    err = capsys.readouterr().err
+    assert "no checks configured" in err and "code.py" in err and "push_checks_by_repo['lib']" in err
+    assert "no push target to compare with" not in err
+    assert "ttp/t40-feature" not in heads(lib_origin)
+    p.set_config("delivery.push_checks", ["true"])
+    p.set_config("delivery.push_checks_by_repo", {"lib": ["false"]})
+    assert _ttp("push", "--own") != 0
+    capsys.readouterr()
+    assert "ttp/t40-feature" not in heads(lib_origin)
+    p.set_config("delivery.push_checks_by_repo", {"lib": ["true"]})
+    assert _ttp("push", "--own") == 0, capsys.readouterr().err
+    assert _git_out(lib_origin, "rev-parse", "ttp/t40-feature") == _git_out(lib, "rev-parse", "HEAD")
+    assert heads(origin) == ["proj"] and sorted(heads(lib_origin)) == ["trunk", "ttp/t40-feature"]
