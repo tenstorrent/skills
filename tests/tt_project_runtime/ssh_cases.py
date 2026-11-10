@@ -331,6 +331,7 @@ def test_ttp_new_on_another_host_quotes_every_forwarded_word_so_empty_or_spaced_
 _FAKE_SSH = """#!/bin/sh
 printf '%s\\n' "$*" >> "$FAKE_LOG"
 case " $* " in *" -O stop "*) exit 0 ;; esac
+[ -n "$FAKE_NONSOCK" ] && echo "ControlSocket $FAKE_NONSOCK already exists, disabling multiplexing" >&2
 case " $* " in *"ControlMaster=auto"*) [ -n "$FAKE_MUX_FAIL" ] && { echo "mux_client_hello_exchange: write packet: Broken pipe" >&2; exit 255; } ;; esac
 exit "${FAKE_RC:-0}"
 """
@@ -387,6 +388,8 @@ def test_the_ssh_wrapper_adds_connection_reuse_in_a_private_folder(tmp_path):
     (["-N", "host-a"], {}),
     (["-G", "host-a"], {}),
     (["-p", "22", "-fN", "host-a"], {}),
+    (["-v", "host-a", "true"], {}),
+    (["-o", "BatchMode=yes", "-vvv", "host-a", "true"], {}),
 ])
 def test_the_ssh_wrapper_leaves_calls_that_set_their_own_sharing_or_forward(tmp_path, args, extra):
     r, log = _run_wrapper(tmp_path, args, **extra)
@@ -457,3 +460,21 @@ def test_project_commands_carry_the_ssh_reuse_switch(env):
     assert command_env(p).get("TTP_SSH_REUSE") == "1"
     p.set_config("ssh.reuse", False)
     assert command_env(p).get("TTP_SSH_REUSE") == "0"
+
+
+def test_the_ssh_wrapper_removes_a_non_socket_left_at_its_socket_path(tmp_path):
+    """ssh runs unshared past a plain file at the socket path; the wrapper removes it so the next call shares
+    again, but never a path outside its own folder."""
+    import shutil
+    import tempfile
+    cm = pathlib.Path(tempfile.mkdtemp(prefix="c", dir="/tmp"))   # short: the wrapper's folder limit is 45
+    try:
+        bad, outside = cm / ("a" * 40), tmp_path / "keep"
+        bad.write_text("")
+        outside.write_text("")
+        r, log = _run_wrapper(tmp_path, ["host-a", "true"], TTP_SSH_CM_DIR=cm, FAKE_NONSOCK=bad)
+        assert r.returncode == 0 and len(log) == 1 and not bad.exists()
+        r, _ = _run_wrapper(tmp_path, ["host-a", "true"], TTP_SSH_CM_DIR=cm, FAKE_NONSOCK=outside)
+        assert r.returncode == 0 and outside.exists()
+    finally:
+        shutil.rmtree(cm)

@@ -12,7 +12,8 @@
 # The user's ~/.ssh is never read or written here; -F, ProxyJump and BatchMode pass through.
 # Left as is: TTP_SSH_REUSE=0 (config ssh.reuse off); a call that sets its own sharing (-S, -M, -O,
 # ControlMaster, ControlPath) or forwards ports or stdio (-L -R -D -W -w -N -f: a forward added to a
-# shared connection would outlive the command); -G, -V, -Q.
+# shared connection would outlive the command); -v (a verbose master keeps the caller's stderr open for
+# its 10 minutes, so a captured call would hang); -G, -V, -Q.
 # A shared connection that fails before the command starts (ssh exits 255 naming mux_client or the
 # control socket) is stopped (ssh -O stop removes its socket) and the command reruns once over a
 # connection of its own. stderr passes through a pipe for that (prompts go to the terminal, not stderr).
@@ -63,7 +64,7 @@ for a in "$@"; do
             c=${flags%"${flags#?}"}
             flags=${flags#?}
             case $c in
-            [SMOLRDWwNfGVQ]) exec "$real" "$@" ;;
+            [SMOLRDWwNfGVQv]) exec "$real" "$@" ;;
             o) if [ -n "$flags" ]; then ! ctl "$flags" || exec "$real" "$@"; else want=1; fi
                break ;;
             [BbcEeFIiJlmPp]) [ -n "$flags" ] || want=0
@@ -92,6 +93,9 @@ trap 'exit 143' TERM
 { { "$real" $mux "$@"; echo $? > "$rcf"; } 2>&1 1>&3 3>&- | tee "$err" >&2; } 3>&1
 rc=$(cat "$rcf" 2>/dev/null)
 rc=${rc:-255}
+# A non-socket left at the socket path (ssh then runs unshared, every time) is removed for the next call.
+bad=$(sed -n 's/^ControlSocket \(.*\) already exists, disabling multiplexing.*/\1/p' "$err" | head -n 1)
+case $bad in "$dir"/*) [ -S "$bad" ] || [ -L "$bad" ] || rm -f "$bad" ;; esac
 if [ "$rc" = 255 ] && grep -qsE 'mux_client_(hello|request|forward)|[Cc]ontrol socket connect|master hello' "$err"; then
     "$real" $mux -O stop "$@" >/dev/null 2>&1
     "$real" -o ControlMaster=no -o ControlPath=none "$@"
