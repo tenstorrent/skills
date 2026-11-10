@@ -51,7 +51,7 @@ import time
 from pathlib import Path
 
 from . import timefmt
-from .project import FOLDER, durable_write, zombie
+from .project import FOLDER, durable_write, ps_rows, zombie
 
 RESERVE_STALE_S = 120
 
@@ -150,6 +150,15 @@ def start_time(pid, proc: str = "/proc") -> str | None:
             return Path(f"{proc}/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19]
         except (OSError, IndexError):
             return None
+    if (rows := ps_rows()) is not None:   # inside a ps_snapshot: its one `ps`, never one per pid
+        if pid in rows:
+            return rows[pid][1]
+        try:   # not in the snapshot: gone, or started since it was taken (then asked alone)
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return None
+        except OSError:
+            pass
     try:
         out = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True,
                              timeout=5).stdout.strip()

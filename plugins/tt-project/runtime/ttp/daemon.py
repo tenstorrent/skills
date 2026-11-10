@@ -258,7 +258,7 @@ from .db import (
     unplanned_abrupt,
     without_deferral,
 )
-from .project import rebase_replace, write_dirs
+from .project import ps_snapshot, rebase_replace, write_dirs
 from .project import (
     Project,
     bad_sections,
@@ -294,6 +294,13 @@ from .providers.jev import Jev, JevOutOfFunds, Pause as JevPause
 from .prompts import RUN_DIR_MARK
 
 TICK_S = 3.0
+# With no run, push or startable task the wait between ticks doubles each tick up to this (_between_ticks):
+# an idle daemon ticks, and starts its steps' git, ps and probe processes, a few times a minute, not 20.
+# At most Slack's default poll (notify.slack_poll_s), so an idle project still reads Slack as often.
+IDLE_TICK_MAX_S = 20.0
+IDLE_WATCH_S = 1.0   # an idle wait stats the project db this often: a write (a chat message, a new task) ends it
+SPAWN_LOG_EVERY_S = 600   # _log_spawns: how often the processes the daemon started are logged and kept
+SPAWN_KV = "spawns"   # kv: {ts, window_s, per_min, steps, programs} of the last window (_log_spawns)
 # Free plan-window meters (and credit readings) are read this often; a red provider's on every pass.
 METER_EVERY_S = 600
 # A red budget alert's episode (Daemon._red_episodes) ends only below this share of its limit, and
@@ -1340,6 +1347,9 @@ class Daemon:
         self._sched_read = 0.0   # monotonic time it was last read
         self._sched_problem: str | None = None   # what was wrong with it, last logged
         self._idle = awake.IdleHold(record=lambda state: self.p.db.set_kv(awake.KV, state))
+        self._busy: bool | None = None   # the last tick's _has_work, if it asked (_work_seen)
+        self._idle_s = TICK_S   # the last wait between ticks (_between_ticks)
+        self._spawn_logged = time.monotonic()   # when _log_spawns last took the counts
         self._note_boot()
 
     @property
@@ -1356,6 +1366,77 @@ class Daemon:
                 os.write(self._wake[1], b"s")
             except OSError:   # full (a byte already waits) or closed: the wait ends or is over anyway
                 pass
+
+    def _between_ticks(self) -> float:
+        """How long to wait before the next tick: TICK_S while a run (the coordinator's too), a push or a
+        task that could start now exists; with none, twice the last wait, up to IDLE_TICK_MAX_S."""
+        busy = self._busy
+        if busy is None:
+            try:
+                busy = self._has_work()
+            except Exception:   # unknown counts as busy: the usual pace
+                busy = True
+        self._busy = None
+        self._idle_s = TICK_S if busy else min(IDLE_TICK_MAX_S, max(TICK_S, self._idle_s * 2))
+        return self._idle_s
+
+    def _work_seen(self) -> bool:
+        """_has_work for the tick's IdleHold, kept for _between_ticks so it is asked once a tick."""
+        self._busy = self._has_work()
+        return self._busy
+
+    def _db_mark(self) -> tuple:
+        """The project db and its WAL's (mtime, size): another process's write (a chat message, a task
+        added or changed) moves it. A stat, never a process."""
+        out = []
+        for f in (self.p.db.path, self.p.db.path + "-wal"):
+            try:
+                st = os.stat(f)
+                out.append((st.st_mtime_ns, st.st_size))
+            except OSError:
+                out.append(None)
+        return tuple(out)
+
+    def _idle_nap(self, seconds: float) -> None:
+        """The wait between ticks. One longer than TICK_S (an idle daemon's) ends early, within
+        IDLE_WATCH_S, once the project db is written, and at once on a stop."""
+        if seconds <= TICK_S:
+            self._nap(seconds)
+            return
+        mark, end = self._db_mark(), time.monotonic() + seconds
+        while not self.stopping:
+            left = end - time.monotonic()
+            if left <= 0:
+                return
+            self._nap(min(IDLE_WATCH_S, left))
+            if self._db_mark() != mark:
+                self._idle_s = TICK_S   # something arrived: the next waits start short again
+                return
+
+    def _log_spawns(self, now: float | None = None) -> dict | None:
+        """Every SPAWN_LOG_EVERY_S: log the processes this daemon started in that window (stepclock
+        counts them where it is installed), per minute and by step and program, and keep it in kv
+        SPAWN_KV: how much process churn the daemon causes, and which step causes it."""
+        now = time.monotonic() if now is None else now
+        window = now - self._spawn_logged
+        if window < SPAWN_LOG_EVERY_S:
+            return None
+        self._spawn_logged = now
+        got = stepclock.spawns()
+        steps: dict[str, int] = {}
+        progs: dict[str, int] = {}
+        for (who, prog), n in got.items():
+            steps[who] = steps.get(who, 0) + n
+            progs[prog] = progs.get(prog, 0) + n
+        top = lambda d: dict(sorted(d.items(), key=lambda kv: -kv[1])[:8])
+        per_min = sum(got.values()) * 60 / window
+        rec = {"ts": time.time(), "window_s": round(window), "per_min": round(per_min, 1),
+               "steps": top(steps), "programs": top(progs)}
+        self.p.db.set_kv(SPAWN_KV, rec)
+        say = lambda d: ", ".join(f"{k} {v}" for k, v in d.items()) or "none"
+        log(self.p, f"spawns: {per_min:.1f}/min over {window / 60:.0f} min; steps: {say(rec['steps'])}; "
+                    f"programs: {say(rec['programs'])}")
+        return rec
 
     def _nap(self, seconds: float) -> None:
         """Wait between ticks, ending at once when a stop is asked for."""
@@ -1495,9 +1576,11 @@ class Daemon:
         self.check_integrity(start=True)
         while not self.stopping:
             try:
-                self.tick()
+                with ps_snapshot():   # every pid question of the tick shares one `ps` (per PS_SNAPSHOT_MAX_S)
+                    self.tick()
                 self._tick_ended()
                 self._beat()
+                self._log_spawns()
                 try:
                     service.reap_restart_request(self.p, self._started)   # a restart helper that left no result
                 except Exception:  # never in the way of a new restart request
@@ -1515,7 +1598,7 @@ class Daemon:
             if self._stop_skipped:
                 log(self.p, f"stop: skipped steps {', '.join(self._stop_skipped)}")
                 self._stop_skipped = []
-            self._nap(TICK_S)   # a stop signal ends the wait at once
+            self._idle_nap(self._between_ticks())   # a stop signal ends the wait at once
         log(self.p, "daemon stop")
         try:   # an orderly shutdown stops the daemon first: the next boot tells it from a crash
             self.p.db.set_kv(CLEAN_STOP_KEY, {"boot": self.boot, "ts": time.time(), "clean_stop": True})
@@ -2137,7 +2220,7 @@ class Daemon:
             if step in lease_off:
                 continue
             self._run_step(step)
-        self._idle.update(self.cfg, self._has_work)
+        self._idle.update(self.cfg, self._work_seen)
         if self.p.db.kv("paused", False):
             if not lease_off:
                 self._run_step(self.deliver_outbound)   # the long-pause alert, and what was posted before, still reach Slack

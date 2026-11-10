@@ -1331,7 +1331,10 @@ def _copy_tree(v: Any) -> Any:
 
 
 _PROC = Path("/proc/self/stat").exists()
-_PS = threading.local()   # this thread's open ps_snapshot: .on, and .rows once taken
+_PS = threading.local()   # this thread's open ps_snapshot: .on, and .rows (taken at .at) once taken
+# A snapshot older than this is taken again at the next question: a long block (a daemon tick holds one
+# open) never judges a process from a stale `ps`, yet its many questions still share one per window.
+PS_SNAPSHOT_MAX_S = 2.0
 
 
 @contextmanager
@@ -1342,7 +1345,7 @@ def ps_snapshot() -> Iterator[None]:
     if _PROC or getattr(_PS, "on", False):
         yield
         return
-    _PS.on, _PS.rows = True, None
+    _PS.on, _PS.rows, _PS.at = True, None, 0.0
     try:
         yield
     finally:
@@ -1354,7 +1357,7 @@ def ps_rows() -> dict[int, tuple[str, str]] | None:
     one, or when `ps` failed (the caller then asks per pid, as without a snapshot)."""
     if _PROC or not getattr(_PS, "on", False):
         return None
-    if _PS.rows is None:
+    if _PS.rows is None or time.monotonic() - _PS.at > PS_SNAPSHOT_MAX_S:
         rows: dict[int, tuple[str, str]] = {}
         try:
             out = subprocess.run(["ps", "-A", "-o", "pid=", "-o", "stat=", "-o", "lstart="], capture_output=True,
@@ -1366,6 +1369,7 @@ def ps_rows() -> dict[int, tuple[str, str]] | None:
             if len(parts) == 3 and parts[0].isdigit():
                 rows[int(parts[0])] = (parts[1], parts[2].strip())
         _PS.rows = rows or False   # ps lists itself: no rows at all means it failed
+        _PS.at = time.monotonic()
     return _PS.rows or None
 
 
