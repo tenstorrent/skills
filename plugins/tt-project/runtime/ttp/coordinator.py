@@ -80,6 +80,7 @@ from . import (   # one name per line: two changes adding names merge without a 
     premise,
     prguard,
     progress,
+    modeldemote,
     projpause,
     publishkind,
     push,
@@ -1475,6 +1476,7 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
     section("unexplained_fixes", coordfix.digest_lines(db, float(db.kv("last_coordinator_turn", 0) or 0), now))
     section("noisy_watchers", watchdup.digest_lines(db, float(db.kv("last_coordinator_turn", 0) or 0), now))
     section("queue_backlog", queuetrim.digest_lines(db, float(db.kv("last_coordinator_turn", 0) or 0), now))
+    section("model_demotions", modeldemote.digest_lines(db, float(db.kv("last_coordinator_turn", 0) or 0), now))
     section("coverage", responsibilities.digest_lines(db))
     section("blocker_sweep", sweep.digest_lines(db, event_ids, now, p.config()))
     section(rulecite.SECTION, safe_eta(lambda: rulecite.index_lines(p, now), []))

@@ -62,7 +62,7 @@ def class_of(kind: str | None, tier: str | None) -> str:
 
 def live_rows(p, now: float, days: int = DAYS) -> dict[str, dict[str, dict]]:
     """{model: {class: row}} of this project's chat runs started in the last `days`."""
-    from .modeltrip import mark_bad
+    from .modeltrip import mark_reworked
     from .prguard import CHECKS_FILE
     since, rows, samples, walls, seen = now - days * 86400, {}, {}, {}, set()
     for r in p.db.q("SELECT r.id, r.task, r.model, r.status, r.started, r.ended, r.output_tokens, r.note, t.kind, "
@@ -90,7 +90,7 @@ def live_rows(p, now: float, days: int = DAYS) -> dict[str, dict[str, dict]]:
                 ck = None
             samples[k] = {"first_done": r["status"] == "ok" and fell == "none", "failed": r["tstatus"] == "failed",
                           "checks_failed": isinstance(ck, dict) and ck.get("passed") is False}
-    mark_bad(p.db, {k[2]: v for k, v in samples.items()}, since)
+    mark_reworked(p.db, {k[2]: v for k, v in samples.items()}, since)
     for (m, cls, _), v in samples.items():
         s = rows[m][cls]
         s["n"] += 1

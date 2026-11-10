@@ -724,9 +724,10 @@ PROVIDER_KEYS = {"billing", "tiers", "plugin_dirs", "worker_isolation", "write_f
                  # slot before it starts on the core provider (route.wait_s). routes: the ordered rule list
                  # routing runs by kind, tier and label (route.match). model_ranking: its model ids,
                  # smartest first, that stand in for a model that is down (modelrank.py). models_every_s:
-                 # seconds between the model-free /models checks (route.models_every).
+                 # seconds between the model-free /models checks (route.models_every). demote: the live
+                 # demotion detector's thresholds (modeldemote.DEFAULTS).
                  "endpoint", "base_url", "max_tokens", "context_window", "route_cooldown_s", "effort_fields",
-                 "route_wait_s", "routes", "model_ranking", "models_every_s",
+                 "route_wait_s", "routes", "model_ranking", "models_every_s", "demote",
                  # providers.chat only: the rules-first model pick (modelpick.py); its keys (enabled, min_p,
                  # options) are checked by modelpick.config_problems.
                  "dispatch"}

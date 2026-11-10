@@ -93,10 +93,15 @@ def served(state: Path, now: float) -> list[str] | None:
     return list(rec.get("ids") or [])
 
 
-def down(db, cfg: dict, state: Path, model: str, now: float) -> str:
-    """Why `model` is down ('refused' or 'not listed'), else ''; always '' with no ranking."""
+def down(db, cfg: dict, state: Path, model: str, now: float, cls: str = "") -> str:
+    """Why `model` is down ('refused', 'not listed' or, for a class `cls`, 'demoted for <cls>'
+    (modeldemote.py)), else ''; always '' with no ranking."""
     if not ranking(cfg) or not model:
         return ""
+    if cls:
+        from . import modeldemote
+        if modeldemote.demoted(db, model, cls, now):
+            return f"demoted for {cls}"
     if any(h.get("model") == model and not h.get("retry") for h in route.holds(db).values()):
         return "refused"
     if now - float((db.kv(REFUSED + model) or {}).get("at") or 0) < route.RETRY_QUIET_S:
@@ -105,13 +110,13 @@ def down(db, cfg: dict, state: Path, model: str, now: float) -> str:
     return "not listed" if ids is not None and model not in ids else ""
 
 
-def pick(db, cfg: dict, state: Path, model: str, now: float) -> tuple[str, str] | None:
+def pick(db, cfg: dict, state: Path, model: str, now: float, cls: str = "") -> tuple[str, str] | None:
     """(the model to run in place of `model`, why `model` is down), or None: it is up, no ranking is
-    set, or no ranked model is served now."""
-    why = down(db, cfg, state, model, now)
+    set, or no ranked model is served now. A `cls` also counts demotions for that class."""
+    why = down(db, cfg, state, model, now, cls)
     ids = served(state, now) if why else None
     for m in ranking(cfg) if ids else ():
-        if m != model and m in ids and not down(db, cfg, state, m, now) and not parked(db, m, now):
+        if m != model and m in ids and not down(db, cfg, state, m, now, cls) and not parked(db, m, now):
             return m, why
     return None
 
@@ -143,14 +148,14 @@ def parked_models(db) -> dict[str, float]:
             for r in db.q("SELECT key FROM kv WHERE key LIKE ?", (PARKED + "%",))}
 
 
-def better(db, cfg: dict, state: Path, model: str, now: float, light: bool) -> str:
-    """The highest-ranked served model above `model` (up and ranked) that is neither down nor parked,
-    and on a non-`light` start has TRIES good runs; else ''."""
+def better(db, cfg: dict, state: Path, model: str, now: float, light: bool, cls: str = "") -> str:
+    """The highest-ranked served model above `model` (up and ranked) that is neither down nor parked
+    (nor demoted for `cls`), and on a non-`light` start has TRIES good runs; else ''."""
     rank = ranking(cfg)
-    if model not in rank or down(db, cfg, state, model, now) or (ids := served(state, now)) is None:
+    if model not in rank or down(db, cfg, state, model, now, cls) or (ids := served(state, now)) is None:
         return ""
     for m in rank[:rank.index(model)]:
-        if m in ids and not down(db, cfg, state, m, now) and not parked(db, m, now) and (
+        if m in ids and not down(db, cfg, state, m, now, cls) and not parked(db, m, now) and (
                 light or int((db.kv(TRIED + m) or {}).get("ok") or 0) >= TRIES):
             return m
     return ""

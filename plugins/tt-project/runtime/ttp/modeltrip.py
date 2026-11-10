@@ -67,8 +67,6 @@ def tripped(db: DB, task: dict, tier: str) -> str | None:
 
 def samples(p, cfg: dict, since: float, until: float) -> dict[int, dict]:
     """{task id: {side, strata, at, bad}} for the picked tasks that ended, first run started in the window."""
-    from .effortab import FAILED_REVIEWS
-    from .prguard import CHECKS_FILE
     from .route import TO
     db, opts = p.db, modelpick.options(cfg)
     out: dict[int, dict | None] = {}   # None: the task's first pick was forced to core by the rules
@@ -90,22 +88,26 @@ def samples(p, cfg: dict, since: float, until: float) -> dict[int, dict]:
                 out[r["task"]] = None
         if (s := out[r["task"]]) is None:
             continue
-        try:
-            rec = json.loads((p.runs / str(r["id"]) / CHECKS_FILE).read_text())
-        except (OSError, ValueError):
-            rec = None
-        s["bad"] |= isinstance(rec, dict) and rec.get("passed") is False
-    out = {i: s for i, s in out.items() if s}
-    mark_bad(db, out, since)
-    return out
+        s["bad"] |= checks_failed(p, r["id"])
+    return mark_reworked(db, {i: s for i, s in out.items() if s}, since)
 
 
-def mark_bad(db, out: dict[int, dict], since: float) -> None:
-    """Mark each sample of `out` (task id: sample) bad that a review since `since` failed (review_failed) or
-    that got rework (a review fix or a continuation of it: rework)."""
+def checks_failed(p, run_id: int) -> bool:
+    """The run's last `ttp checks` failed."""
+    from .prguard import CHECKS_FILE
+    try:
+        rec = json.loads((p.runs / str(run_id) / CHECKS_FILE).read_text())
+    except (OSError, ValueError):
+        rec = None
+    return isinstance(rec, dict) and rec.get("passed") is False
+
+
+def mark_reworked(db: DB, out: dict[int, dict], since: float) -> dict[int, dict]:
+    """Mark bad each sample {task id: {"bad", ...}} a review since `since` failed (review_failed) or that got
+    rework (a review fix or a continuation of it: rework)."""
     from .effortab import FAILED_REVIEWS
     if not out:
-        return
+        return out
     for rv in db.q("SELECT t.labels, t.title, s.outcome FROM review_stats s JOIN tasks t ON t.id=s.task WHERE s.ts>=?",
                    (since,)):
         if rv["outcome"] in FAILED_REVIEWS and (i := review_subject(dict(rv))) in out:
@@ -119,6 +121,7 @@ def mark_bad(db, out: dict[int, dict], since: float) -> None:
             i = review_subject(rv) if rv else None
         if i in out and i != t["id"]:
             out[i]["bad"] = out[i]["rework"] = True
+    return out
 
 
 def check(p, cfg: dict, now: float | None = None) -> list[dict]:

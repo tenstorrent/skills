@@ -147,6 +147,7 @@ from . import effort
 from . import modelpick
 from . import modelrank
 from . import modeltrip
+from . import modeldemote
 from . import effortab
 from . import extchange
 from . import failover
@@ -2438,6 +2439,13 @@ class Daemon:
             if t.get("memory_error"):
                 log(self.p, f"model trip {t['stratum']}: decision memory not written: {t['memory_error']}")
             self.alert(f"model-trip:{t['stratum']}", modeltrip.text(t), severity="low", every_s=0)
+        try:   # chat model vs the next eligible model per class (modeldemote.py)
+            for a in modeldemote.check(self.p, self.cfg, now) if modelrank.ranking(self.cfg) else ():
+                log(self.p, f"model demotion: {a['action']} {a['model']} ({a['class']}): {a['why']}")
+                self.alert(f"model-demote:{a['model']}|{a['class']}", modeldemote.text(a),
+                           severity="low", every_s=0)
+        except Exception as e:   # the detector must never stop the tick
+            log(self.p, f"model demotion not checked: {type(e).__name__}: {e}")
 
     def tend_holds(self) -> None:
         """Log each whole-run hold kept for detached jobs once it ends, and rebuild one whose keeper
@@ -12174,11 +12182,12 @@ class Daemon:
         where, key = (f"tier {tier}", tier) if rule_i is None else (f"tier {tier} rule {rule_i}", f"{tier}:rule{rule_i}")
         if pick:   # a model pick routes one tier to several models (modelpick.py): one switch per model
             key = f"{tier}:pick:{model}"
-        ranked = self._rank_pick(where, key, model, now) \
+        mcls = "review" if task.get("kind") == "review" else tier   # its class for demotions (modeldemote.py)
+        ranked = self._rank_pick(where, key, model, now, mcls) \
             if name == modelrank.TO and why in ("", "model_missing") else None   # one switch record per rule
         if ranked:   # its model is down: the smartest model still served (modelrank.py)
             model, why = ranked[0], ""
-        elif name == modelrank.TO and not why and (up := self._rank_better(where, key, model, tier, now)):
+        elif name == modelrank.TO and not why and (up := self._rank_better(where, key, model, tier, now, mcls)):
             model, ranked = up, (up, {"from": model, "why": modelrank.BETTER})   # a smarter one is served
         if not why and self._logged_out(name) and not self._may_probe(name, now):
             why = "auth"   # the auth gate holds it; its one login check may be a routed run
@@ -12223,13 +12232,13 @@ class Daemon:
                                                                             str(m.get("why") or "")),
                        severity="low", every_s=0)
 
-    def _rank_pick(self, where: str, key: str, model: str, now: float) -> tuple[str, dict] | None:
+    def _rank_pick(self, where: str, key: str, model: str, now: float, cls: str = "") -> tuple[str, dict] | None:
         """(the model to run, {"from", "why"}) when `model` is down and the ranking (modelrank.py) names one
         served, with one low alert per switch of `key`; else None, and a switch kept for `key` ends."""
         try:
-            got = modelrank.pick(self.p.db, self.cfg, self.p.state, model, now)
+            got = modelrank.pick(self.p.db, self.cfg, self.p.state, model, now, cls)
             if not got:   # up again ends its switch; still down with none ranked served keeps it
-                if not modelrank.down(self.p.db, self.cfg, self.p.state, model, now) and (
+                if not modelrank.down(self.p.db, self.cfg, self.p.state, model, now, cls) and (
                         last := modelrank.back(self.p.db, key)):
                     log(self.p, f"model ranking: {where} back on {last.get('from')} (was {last.get('to')})")
                 return None
@@ -12241,11 +12250,11 @@ class Daemon:
             log(self.p, f"model ranking not applied ({where}): {type(e).__name__}: {e}")
             return None
 
-    def _rank_better(self, where: str, key: str, model: str, tier: str, now: float) -> str:
+    def _rank_better(self, where: str, key: str, model: str, tier: str, now: float, cls: str = "") -> str:
         """A served model ranked above the up `model` to run instead (modelrank.better: light starts only
         until it has proven itself), logged once per change of `key`; else ''."""
         try:
-            up = modelrank.better(self.p.db, self.cfg, self.p.state, model, now, light=tier == "light")
+            up = modelrank.better(self.p.db, self.cfg, self.p.state, model, now, light=tier == "light", cls=cls)
             if up and modelrank.switch(self.p.db, f"{modelrank.BETTER}:{key}", model, up, now):
                 log(self.p, f"model ranking: {where} tries {up}, ranked above {model}")
             return up

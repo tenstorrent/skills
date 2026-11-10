@@ -7154,6 +7154,34 @@ def cmd_model_trip(a) -> None:
         print("ttp model-trip: no stratum tripped")
 
 
+def cmd_model(a) -> None:
+    """`ttp model demote|promote|park|unpark <model> [--class c]`: set a chat model's demotion or park by
+    hand (modeldemote.py), recorded with its setter (configwho.from_env); `ttp model` lists the records."""
+    from . import configwho, modeldemote, modelrank
+    p = need(a.project, sys.argv[1:]) if a.project else here()
+    if p is None:
+        die("ttp model: no project here (run it in a project or its run, or --project NAME)")
+    if a.action:
+        if not a.model:
+            die(f"ttp model {a.action}: name the model", 2)
+        if a.action in ("park", "unpark") and a.cls:
+            die(f"ttp model {a.action}: a park holds the model for every class; drop --class", 2)
+        why = modeldemote.set_state(p.db, a.model, a.cls or modeldemote.ANY, a.action, configwho.from_env(),
+                                    time.time(), a.why or "")
+        if why:
+            die(f"ttp model {a.action}: refused: {why}")
+        print(f"ttp model: {a.action} {a.model}" + (f" for {a.cls}" if a.cls else ""))
+        return
+    rows = [(r["key"], p.db.kv(r["key"]) or {}) for r in p.db.q(
+        "SELECT key FROM kv WHERE key LIKE ? OR key LIKE ? ORDER BY key",
+        (modeldemote.DEMOTED + "%", modelrank.PARKED + "%"))]
+    for k, rec in rows:
+        what = rec.get("state") or "parked"
+        print(f"{k.split(':', 1)[1]}: {what} by {configwho.role(rec.get('by'))} ({rec.get('why') or '?'})")
+    if not rows:
+        print("ttp model: no model demoted, promoted or parked")
+
+
 def cmd_throughput(a) -> None:
     """`ttp throughput`: where tasks waited over the window, per lane against its limit (throughput.py);
     --apply raises the sizing limits that held work while there was headroom; --undo N reverts one."""
@@ -14087,6 +14115,15 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--worse", action="store_true", help="routed did worse than core in the head-to-head")
     s.add_argument("--ref", help="where the head-to-head result is (a path or task id)")
     s.set_defaults(fn=cmd_model_trip)
+
+    s = sub.add_parser("model", help="chat model demotions and parks (modeldemote.py): demote, promote, park or "
+                                     "unpark one by hand, recorded with its setter; no action lists them")
+    s.add_argument("action", nargs="?", choices=("demote", "promote", "park", "unpark"))
+    s.add_argument("model", nargs="?", help="the chat model id")
+    s.add_argument("--class", dest="cls", help="the task class (babysit, light, standard, review); default every class")
+    s.add_argument("--why", help="the reason kept with the record")
+    s.add_argument("--project", help="project (default: the one here)")
+    s.set_defaults(fn=cmd_model)
 
     s = sub.add_parser("throughput", help="waits per lane (worker, resource, checks, review, push, chains, deferrals, "
                                           "provider) against their limits; --apply raises the limits that held work "
