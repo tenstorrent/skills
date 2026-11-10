@@ -20,6 +20,8 @@ the project could have saved. Model-free; the review grades it.
   change, with their spend, and the code tasks a premise check (premise.py) closed before any run;
 - spend per finished task: the workers' own, and the coordinator's day spread over them; $ per
   done task by kind and tier;
+- plan-billed providers (planuse.py): their dollars are virtual list price, shown apart with the points
+  their plan's windows rose in the window (user msg #140);
 - tasks blocked or waiting longer than `blocked_h` hours now, longest first;
 - push queue: approval to landed per entry that landed in the window, median and p90 (pushq.landing_times);
 - review loops: per change whose review moved in the window, its review rounds and their spend
@@ -54,7 +56,7 @@ import statistics
 import time
 from typing import Any
 
-from . import budget, chaincap, dailyspend, checkprestage, coordfix, coordmodel, correction, ends, gatejudge, gatetime, obligations, outscan, plainreply, quietgate, relay, replan, reviewstats, route, rulecite, schedule, sharedchecks, stalegate, suitecost, sweepskip, timefmt, turngate, unblock, upstream
+from . import budget, chaincap, dailyspend, checkprestage, coordfix, coordmodel, correction, ends, gatejudge, gatetime, obligations, outscan, plainreply, planuse, quietgate, relay, replan, reviewstats, route, rulecite, schedule, sharedchecks, stalegate, suitecost, sweepskip, timefmt, turngate, unblock, upstream
 from .db import DB, continues_id, load_result
 from .project import Project
 
@@ -625,6 +627,9 @@ def lines(db: DB, now: float | None = None, window_s: float = WINDOW_S, blocked_
                 + (f" ({g['unpriced']} unpriced, routed)" if g["unpriced"] else "") for g in groups))
         if bases := cost_bases(db, done):
             out.append("$ per done task by provider and cost basis: " + bases_text(bases))
+    if plan := planuse.summary(db, since, now, p.config() if p is not None else None):
+        out.append("plan-billed (its $ are virtual list price, not billed; the plan's window points count): "
+                   + planuse.text(plan))
     idle = no_change_code(db, since)
     if idle["n"] or idle["premise_closed"]:
         out.append(f"code runs with no code change: {idle['n']}, ${idle['usd']:.2f}"
@@ -720,6 +725,7 @@ def report(db: DB, now: float | None = None, window_s: float = WINDOW_S, blocked
             "coordinator_turns": coordinator_turns(db, since),
             "coordinator_cache": budget.coordinator_cache(db, now, window_s)["window"], "turns_skipped": turngate.skipped(db, since), "turns_quiet": quietgate.skipped(db, since), "sweeps": sweepskip.counts(db, since, now),
             "finished": done, "per_outcome": per_outcome(done, unpriced), "cost_bases": cost_bases(db, done),
+            "plan_usage": planuse.summary(db, since, now, p.config() if p is not None else None),
             "no_change_code": no_change_code(db, since), "stuck": stuck_long(db, now, blocked_h), "review_loops": review_loops(db, since),
             "reviews": {**reviewstats.summary(db, since), "rows": reviewstats.rows(db, since)},
             "overrides": overrides(p, db, now, blocked_h), "promises": obligations.promise_outcomes(db, since, now),

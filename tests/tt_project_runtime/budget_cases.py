@@ -5193,3 +5193,67 @@ def test_the_global_gate_records_its_burn_rate_across_ticks(env, monkeypatch):
         g = bud.evaluate(p.db, p.config(), "claude", [], now - (4 - i) * 900)
         p.db.set_kv("gates", {"claude": g.as_dict()})
     assert g.numbers["global_resets_at"] == reset and g.numbers["global_per_h"] == pytest.approx(86.0), g.numbers
+
+
+def _codex_plan_day(p, now):
+    """A day with Codex on a prepaid plan ($150 of list price in 3 runs, its 5h window rising 10 -> 30, a
+    reset, then 5; 7d 40 -> 52) and Claude billed by use ($4 in 2 runs)."""
+    p.set_config("providers.codex.billing", "plan")
+    p.set_config("providers.claude.billing", "usage")
+    for ts, win, util, resets in ((now - 30000, "5h", 10.0, now - 20000), (now - 25000, "5h", 30.0, now - 20000),
+                                  (now - 3000, "5h", 5.0, now + 15000), (now - 30000, "7d", 40.0, now + 86400),
+                                  (now - 3000, "7d", 52.0, now + 86400)):
+        p.db.x("INSERT INTO snapshots(ts,provider,account,window,utilization,resets_at) VALUES(?,?,?,?,?,?)",
+               (ts, "codex", "a", win, util, resets))
+    for i in range(3):
+        p.db.x("INSERT INTO runs(role,provider,account,status,started,ended,cost_usd) "
+               "VALUES('worker','codex','a','ok',?,?,50)", (now - 20000 + i, now - 19000 + i))
+    for i in range(2):
+        p.db.x("INSERT INTO runs(role,provider,account,status,started,ended,cost_usd) "
+               "VALUES('worker','claude','e','ok',?,?,2)", (now - 10000 + i, now - 9000 + i))
+
+
+def test_plan_billed_provider_reports_window_points_not_dollars(env):
+    """User msg #140: on a prepaid Codex plan (or Claude Max) the plan's windows are the usage that counts.
+    ttp stats --landing, the efficiency audit and the status line show its window share; its list-price
+    dollars are virtual and stay out of the billed dollars per landed change. Billed by use keeps dollars."""
+    p = make(env)
+    from ttp import audit, planuse, trainstats
+    from ttp.web import budget_line
+    now = time.time()
+    _codex_plan_day(p, now)
+    assert planuse.window_points(p.db, "codex", now - 86400, now) == {"5h": 25.0, "7d": 12.0}
+    rows = trainstats.per_landed(p.db, None, "", now, cfg=p.config())
+    day = rows[0]
+    assert day["usd"] == 4.0 and day["virtual_usd"] == 150.0, day
+    assert [(r["provider"], r["runs"], r["windows"]) for r in day["plan"]] == [("codex", 3, {"5h": 25.0, "7d": 12.0})]
+    line = trainstats.per_landed_lines(rows)[0]
+    assert line.startswith("24 h: $4.00 over ?") and "codex on a plan: 5h +25 points, 7d +12 points" in line, line
+    assert "$150.00 virtual (list price, not billed)" in line, line
+    rep = trainstats.report(p.db, p.root / "state" / "runs", "UTC", days=1, now=now, cfg=p.config())
+    assert sum(d["usd"] for d in rep["days"]) == 4.0 and sum(d["virtual_usd"] for d in rep["days"]) == 150.0
+    assert "virtual on a plan" in trainstats.text(rep, "t")
+    assert any(x.startswith("plan-billed") and "codex on a plan" in x for x in audit.lines(p.db, now, p=p))
+    assert "codex plan 5h 5%, 7d 52%" in budget_line(p.db, now, "claude"), budget_line(p.db, now, "claude")
+    # declared usage: the same runs are billed dollars, no plan line
+    p.set_config("providers.codex.billing", "usage")
+    day = trainstats.per_landed(p.db, None, "", now, cfg=p.config())[0]
+    assert day["usd"] == 154.0 and day["virtual_usd"] == 0 and day["plan"] == [], day
+
+
+def test_plan_billed_codex_dollars_never_trip_a_dollar_cap(env):
+    """A Codex plan's $150 of list price is far over a $10 daily cap and global cap, yet its gate stays on
+    its windows (5% and 52%) and green: virtual dollars hold no work."""
+    p = make(env)
+    from ttp import budget as bud
+    now = time.time()
+    _codex_plan_day(p, now)
+    for i in range(3):
+        p.db.spend("codex", 50.0, f"task:{i}")
+    p.set_config("budget.daily_usd", 10)
+    p.set_config("budget.global_daily_usd", 10)
+    wins = [w for w in bud.plan_windows(p.db, now) if w.provider == "codex"]
+    assert {w.window for w in wins} == {"5h", "7d"}
+    g = bud.evaluate(p.db, p.config(), "codex", wins, now)
+    assert g.regime in ("windows", "plan") and g.numbers["billing"] == "plan" and g.level == "green", g.reasons
+    assert not any("cap" in r for r in g.reasons), g.reasons

@@ -208,7 +208,8 @@ def budget_line(db: DB, now: float | None = None, core: str = "claude", gate: di
     billed by use, which counts only spend whose account was billed by use when it was spent
     (billing.py), not an earlier plan account's. Free window resets and paid credits follow
     ('2 free resets', 'paid credits'; another provider's with its fullest window: 'codex 7d 93%, 2 free
-    resets'). Every provider holding ready work, core or not, is named at the end (holding):
+    resets'), and every other provider on plan windows its share of them ('codex plan 5h 4%, 7d 21%').
+    Every provider holding ready work, core or not, is named at the end (holding):
     '..., codex 7d 93% holding 1 task'. An item without data is left out. Pacing, targets, caps
     and routing (the last 24 h of it, health()['spend']['route_line']) are in the Budget tab."""
     now = now or time.time()
@@ -228,7 +229,7 @@ def budget_line(db: DB, now: float | None = None, core: str = "claude", gate: di
     plan = gate["regime"] in ("windows", "plan") if (gate or {}).get("regime") else bool(wins)
     n = (gate or {}).get("numbers") or {}
     if not plan and ("spent_today" in n or "global_today" in n):
-        return ", ".join([usage_line(n, now, where), *held])
+        return ", ".join([usage_line(n, now, where), *other_plans(db, prov, now, []), *held])
     actual = db.spent_since(now - DAY, billed=True)
     if plan:
         total = db.spent_since(now - DAY) if spent_24h is None else spent_24h
@@ -240,7 +241,24 @@ def budget_line(db: DB, now: float | None = None, core: str = "claude", gate: di
         peaks = window_peaks(db, prov, names, now, span, account) if account is not None else []
         if peaks:
             parts.append(f"{label} {sum(peaks) / len(peaks):.0f}%")
-    return ", ".join(parts + credit_parts(db, prov, now) + held)
+    credit = credit_parts(db, prov, now)
+    return ", ".join(parts + credit + other_plans(db, prov, now, credit) + held)
+
+
+def other_plans(db: DB, shown: str, now: float, credit: list[str]) -> list[str]:
+    """Every other provider on plan windows, with its windows' share used: 'codex plan 5h 4%, 7d 21%'
+    (user msg #140: a prepaid plan's windows are the usage that counts, not its virtual dollars). A
+    provider credit_parts already named is left out."""
+    out, by = [], {}
+    for w in bud.plan_windows(db, now):
+        if w.provider != shown:
+            by.setdefault(w.provider, []).append(w)
+    for prov in sorted(by):
+        if any(c.startswith(f"{prov} ") for c in credit):
+            continue
+        ws = sorted(by[prov], key=lambda w: (w.window not in FIVE_HOUR, w.window not in SEVEN_DAY, w.window))
+        out.append(f"{prov} plan " + ", ".join(f"{_label(w.window)} {w.utilization:.0f}%" for w in ws))
+    return out
 
 
 def credit_parts(db: DB, shown: str, now: float) -> list[str]:

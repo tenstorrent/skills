@@ -1947,9 +1947,10 @@ def cmd_stats(a) -> None:
     if a.landing:
         from . import trainstats
         from . import landed
-        s = trainstats.report(p.db, p.runs, timefmt.home(p), a.days)
+        cfg = p.config()
+        s = trainstats.report(p.db, p.runs, timefmt.home(p), a.days, cfg=cfg)
         s["ref"] = landed._push_ref(p, p.root)
-        s["per_landed"] = trainstats.per_landed(p.db, p.root, s["ref"])
+        s["per_landed"] = trainstats.per_landed(p.db, p.root, s["ref"], cfg=cfg)
         print(json.dumps(s, indent=1) if a.json else trainstats.text(s, p.name))
         return
     if a.coord_session:

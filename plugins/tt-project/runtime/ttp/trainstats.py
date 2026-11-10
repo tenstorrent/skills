@@ -7,6 +7,8 @@ review `ttp checks` runs that ended (their checks.json: 'full' when a scope line
 check was narrowed), the push trains that ran checks and their check runs, the CPU-hours the checks runs
 recorded (cpu_s, from #2220 on; older runs recorded none), the train check hours (wall), the dollars every
 run that started that day cost, and approval to landed (median, p90 by nearest rank) of the day's landings.
+Dollars are billed dollars only: a plan-billed run's list price is `virtual_usd`, shown apart, and its
+plan's window points are shown per landed change instead (planuse.py; user msg #140).
 """
 from __future__ import annotations
 
@@ -15,7 +17,7 @@ import re
 import subprocess
 import time
 
-from . import timefmt
+from . import planuse, timefmt
 
 
 def _pct(secs: list[float], q: float) -> float | None:
@@ -33,16 +35,17 @@ def _full(rec: dict) -> bool:
     return not any(": targeted: " in x for x in scope) or any(": full: " in x for x in scope)
 
 
-def report(db, runs_dir, tz: str, days: float = 7, now: float | None = None) -> dict:
+def report(db, runs_dir, tz: str, days: float = 7, now: float | None = None, cfg=None) -> dict:
     from .prguard import CHECKS_FILE
     now = time.time() if now is None else now
     since = now - days * 86400
+    cls = planuse.Classifier(db, since, cfg)
     out: dict[str, dict] = {}
 
     def day(ts: float) -> dict:
         return out.setdefault(timefmt.today(ts, tz), {
             "landed": 0, "direct": 0, "checks_runs": 0, "full_runs": 0, "trains": 0, "train_check_runs": 0,
-            "cpu_s": 0.0, "cpu_unrecorded": 0, "train_check_s": 0.0, "usd": 0.0, "_wait": []})
+            "cpu_s": 0.0, "cpu_unrecorded": 0, "train_check_s": 0.0, "usd": 0.0, "virtual_usd": 0.0, "_wait": []})
 
     for r in db.q("SELECT q.created, COALESCE(b.ended, q.updated) at_ FROM push_queue q LEFT JOIN push_batches b "
                   "ON b.id=q.batch WHERE q.status IN ('pushed','landed') AND COALESCE(b.ended, q.updated)>=?",
@@ -62,9 +65,11 @@ def report(db, runs_dir, tz: str, days: float = 7, now: float | None = None) -> 
         d["trains"] += 1
         d["train_check_runs"] += int(r["check_runs"] or 0)
         d["train_check_s"] += float(r["check_s"] or 0)
-    for r in db.q("SELECT id, started, ended, cost_usd FROM runs WHERE COALESCE(ended, started)>=?", (since,)):
+    for r in db.q("SELECT id, provider, account, started, ended, cost_usd FROM runs WHERE COALESCE(ended, started)>=?",
+                  (since,)):
         if (r["started"] or 0) >= since:
-            day(float(r["started"]))["usd"] += float(r["cost_usd"] or 0)
+            plan = cls.is_plan(r["provider"], r["account"], r["started"])
+            day(float(r["started"]))["virtual_usd" if plan else "usd"] += float(r["cost_usd"] or 0)
         try:
             rec = json.loads((runs_dir / str(r["id"]) / CHECKS_FILE).read_text())
         except (OSError, ValueError):
@@ -117,17 +122,24 @@ def landed_commits(repo, ref: str, since: float, until: float) -> int | None:
     return n
 
 
-def per_landed(db, repo, ref: str, now: float | None = None) -> list[dict]:
+def per_landed(db, repo, ref: str, now: float | None = None, cfg=None) -> list[dict]:
     """$ per landed change over the last 24 h and 7 d: the booked cost of the runs that started in the
     window over the commits landed on the push branch then (landed_commits), and the subagents those
-    runs started (their run note's subagents_spawned, providers/claude.parse)."""
+    runs started (their run note's subagents_spawned, providers/claude.parse). Plan-billed runs' dollars
+    are virtual: left out of `usd`, summed in `virtual_usd`, and `plan` gives each plan provider's window
+    points per landed change (planuse.summary)."""
     now = time.time() if now is None else now
     rows = []
+    cls = planuse.Classifier(db, now - max(s for _, s in WINDOWS), cfg)
     for label, secs in WINDOWS:
         since = now - secs
-        usd, spawned, counted = 0.0, 0, 0
-        for r in db.q("SELECT cost_usd, note FROM runs WHERE started>=? AND started<?", (since, now)):
-            usd += float(r["cost_usd"] or 0)
+        usd, virtual, spawned, counted = 0.0, 0.0, 0, 0
+        for r in db.q("SELECT provider, account, started, cost_usd, note FROM runs WHERE started>=? AND started<?",
+                      (since, now)):
+            if cls.is_plan(r["provider"], r["account"], r["started"]):
+                virtual += float(r["cost_usd"] or 0)
+            else:
+                usd += float(r["cost_usd"] or 0)
             if "subagents_spawned" in (r["note"] or ""):
                 try:
                     got = json.loads(r["note"]).get("subagents_spawned")
@@ -138,7 +150,9 @@ def per_landed(db, repo, ref: str, now: float | None = None) -> list[dict]:
         n = landed_commits(repo, ref, since, now) if repo and ref else None
         rows.append({"window": label, "usd": round(usd, 2), "landed_commits": n,
                      "usd_per_landed": round(usd / n, 2) if n else None,
-                     "subagents_spawned": spawned, "runs_counting_spawns": counted})
+                     "subagents_spawned": spawned, "runs_counting_spawns": counted,
+                     "virtual_usd": round(virtual, 2),
+                     "plan": planuse.summary(db, since, now, cfg, landed=n, cls=cls) if virtual else []})
     return rows
 
 
@@ -147,6 +161,7 @@ def per_landed_lines(rows: list[dict], ref: str = "") -> list[str]:
             f"commits landed{f' on {ref}' if ref else ''} = "
             f"{'-' if w['usd_per_landed'] is None else '$' + format(w['usd_per_landed'], '.2f')} per landed change; "
             f"{w['subagents_spawned']} subagents spawned ({w['runs_counting_spawns']} runs counted them)"
+            + (f"; plan-billed, not in the $: {planuse.text(w['plan'])}" if w.get("plan") else "")
             for w in rows]
 
 
@@ -161,7 +176,7 @@ def text(r: dict, name: str) -> str:
             f"{f(d['full_per_landed'])} full suites/landed; {f(d['cpu_h_per_landed'])} CPU-h/landed"
             + (f" ({d['cpu_unrecorded']} runs recorded no CPU)" if d["cpu_unrecorded"] else "")
             + f", train checks {d['train_check_s'] / 3600:.1f} h wall; ${f(d['usd_per_landed'])}/landed "
-            f"(${d['usd']:.2f}); approved to landed median {f(d['landing_median_h'], ' h')}, "
+            f"(${d['usd']:.2f}{f' billed, ${v:.2f} virtual on a plan' if (v := d.get('virtual_usd')) else ''}); approved to landed median {f(d['landing_median_h'], ' h')}, "
             f"p90 {f(d['landing_p90_h'], ' h')}")
     if not r["days"]:
         lines.append("  nothing in the window")
