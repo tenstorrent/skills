@@ -18531,6 +18531,7 @@ def test_a_killed_push_frees_the_branch(env, monkeypatch):
         while not started.exists() and time.time() < deadline:
             time.sleep(0.05)
         assert started.exists()
+        p.set_config("delivery.push_wait_s", 0)   # it has kept the turn past the push wait
         assert _ttp("push", "--free") == 1
         proc.kill()     # only the push itself; its check lives on without the lock
         proc.wait(timeout=10)

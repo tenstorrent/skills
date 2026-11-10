@@ -2188,9 +2188,12 @@ the pick order, so it takes the first starts. A resumed resource ramps only its 
   is `delivery.push_branch`, which must be set explicitly; it refuses without one, without
   checks unless the change touches only docs (`*.md`, `*.rst`, `docs/`, ...), when
   `delivery.push_allowed` is false, and for `HEAD`, `main`, `master` or the
-  remote's default branch. Pushes to one branch take turns under a lock that a killed push or a
-  reboot frees. One that waits longer than `delivery.push_wait_s` exits 75 and prints a
-  `retry_when` for its hand-off: `ttp push --free`, which exits 0 once the turn is free. Unset,
+  remote's default branch. Pushes to one branch take turns, in arrival order, under a lock that a
+  killed push or a reboot frees. One whose wait sees a single holder keep the lock longer than
+  `delivery.push_wait_s` (the wait starts over each time the turn moves on; 4 h in all at most)
+  exits 75 and prints a `retry_when` for its hand-off: `ttp push --free`, which exits 0 once a
+  push started then would get its turn in time: it does not count detached pushes that only
+  queue for the turn, nor a holder still within the push wait. Unset,
   the wait is twice the last measured check run plus 60 s, at least 900 s and at most 2 h.
   Each check runs at most `delivery.push_checks_timeout_s` (unset: four times the last measured
   check run, at least 4 h; 0 for no limit): one past it is ended and the push fails, saying so.

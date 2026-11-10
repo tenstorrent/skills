@@ -1500,9 +1500,10 @@ def due(p: Project, now: float | None = None, cfg: dict | None = None, lock: boo
         return [], f"backing off until {_at(float(st['backoff_until']), now, p)}{why}"
     if held := envfault.held(p, now):   # a check runner the host lacks: checks would only fail on it
         return [], held
+    # A detached push that only queues for the turn does not hold it (push.busy_locks): the batch queues
+    # behind it in arrival order; while the batch's turn is reserved, run locks do not hold it back.
     if lock and (not locks.any_free(push.lock_paths(p, remote, branch)) or (
-            not turn_reserved(p, now) and any(
-                not locks.any_free([x]) for x in sorted((p.state / "locks").glob("push:run-*.lock"))))):
+            not turn_reserved(p, now) and push.busy_locks(p))):
         return [], LOCK_WHY
     bad = st.get("bad_tip") or {}
     tried: set = set()

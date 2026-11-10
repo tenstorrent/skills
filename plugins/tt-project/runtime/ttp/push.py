@@ -3706,6 +3706,13 @@ def default_wait(last_s: float | None) -> float:
     return min(float(MAX_DEFAULT_WAIT_S), max(float(DEFAULT_WAIT_S), 2 * last_s + WAIT_MARGIN_S))
 
 
+def push_wait(p: Project, d: dict) -> float:
+    """The seconds one holder may keep the push lock before a waiter gives up: `delivery.push_wait_s`
+    (`d` is the delivery config), else default_wait. ValueError when it is not a number."""
+    explicit = d.get("push_wait_s")
+    return default_wait(last_check_s(p)) if explicit in (None, "") else wait_of(explicit)
+
+
 def bump_of(v: Any) -> dict | None:
     """`delivery.version_bump` as {"files", "changeset_dir", "package", "paths"}, or None when unset;
     ValueError when it is malformed. `files` are repo-relative files holding the version; `paths`
@@ -5140,8 +5147,7 @@ def _run(p: Project, repo: Path, own: bool = False, recorded: dict | None = None
     try:
         remote, branch, own = resolve(p, repo, own)
         rounds = rounds_of(d.get("push_rounds"))
-        explicit = d.get("push_wait_s")
-        wait_s = default_wait(last_check_s(p)) if explicit in (None, "") else wait_of(explicit)
+        wait_s = push_wait(p, d)
         limit_s = check_limit_of(d.get("push_checks_timeout_s"), last_check_s(p))
         pool_s = pool_wait_of(d.get("push_pool_wait_s"))
         version_bump = bump_of(d.get("version_bump"))
@@ -5238,17 +5244,69 @@ def after_words(a: dict) -> str:
         f" (receipt {a['receipt']})" if a.get("receipt") and a.get("status") != "ok" else "")
 
 
+def _waiting_pids(locks_dir: Path) -> set[int]:
+    """Pids with a ticket in a push lock's arrival queue: pushes that only wait for their turn. Read
+    from the ticket names (`<arrival>-<pid>...`) without touching the queue, so the probe stays read-only."""
+    out = set()
+    for d in locks_dir.glob("push:*.queue"):
+        try:
+            names = os.listdir(d)
+        except OSError:
+            continue
+        for name in names:
+            m = re.match(r"\d[0-9.]*-(\d+)", name)   # not the owner records (.<ticket>...)
+            if m:
+                out.add(int(m.group(1)))
+    return out
+
+
+def busy_locks(p: Project, wait_s: float | None = None) -> list[Path]:
+    """The held push locks of the project that hold the push turn: every held branch lock (with `wait_s`,
+    only one whose holder kept it that long), and each detached push's run lock unless that push only
+    waits for its turn (a ticket in a push queue) or holds a branch lock (judged as such)."""
+    locks_dir = p.state / "locks"
+    waiting = _waiting_pids(locks_dir)
+    now, labels = time.time(), {}
+    for x in sorted(locks_dir.glob("push:*.lock")):
+        if locks.any_free([x]):
+            continue
+        try:
+            h = locks.read_label(x)
+        except (OSError, ValueError):
+            h = {}
+        labels[x] = h if isinstance(h, dict) else {}
+    turn_pids = {h.get("pid") for x, h in labels.items() if not x.name.startswith("push:run-")} - {None}
+    held = []
+    for x, h in labels.items():
+        since = h.get("since")
+        if x.name.startswith("push:run-"):
+            if h.get("pid") in waiting or h.get("pid") in turn_pids:
+                continue     # it only waits for its turn, or holds the branch lock, judged as such below
+        elif wait_s is not None and isinstance(since, (int, float)) and now - since < wait_s:
+            continue         # its holder is within the push wait: a push started now queues behind it
+        held.append(x)
+    return held
+
+
 def free(p: Project, repo: Path) -> int:
-    """`ttp push --free`: 0 when no push of this project holds a push lock, 1 while one does, 2 when
+    """`ttp push --free`: 0 when a push started now gets its turn in time, 1 while one holds it, 2 when
     there is no target. Read-only and instant, for a waiting task's `retry_when`. It checks every
     push lock of the project: the harness runs the probe in the project root, whose git remotes
-    may resolve `delivery.push_branch` differently from the worktree that pushes."""
+    may resolve `delivery.push_branch` differently from the worktree that pushes. Pushes take the
+    turn in arrival order (take), so it does not count what only waits: a detached push's run lock
+    while that push queues for the branch lock, nor a branch lock whose holder has kept it less than
+    the push wait (a push started now queues behind it and gets it). It counts a holder that kept the
+    branch lock that long, and a detached push that runs without the branch lock (fetching before it)."""
     try:
         target(p, repo)
     except ValueError as e:
         print(f"ttp push: {e}", file=sys.stderr)
         return REFUSED
-    held = [x for x in sorted((p.state / "locks").glob("push:*.lock")) if not locks.any_free([x])]
+    try:
+        wait_s = push_wait(p, p.config().get("delivery") or {})
+    except ValueError:
+        wait_s = float(DEFAULT_WAIT_S)
+    held = busy_locks(p, wait_s)
     if not held:
         return 0
     print(f"ttp push: a push holds its turn: {', '.join(locks.holders_now(held, p)) or 'another push'}",
@@ -5289,7 +5347,7 @@ NON_FF, REBOOT = "non_fast_forward", "reboot"
 
 def _run_lock(marker: Path) -> Path:
     """The run lock of a detached push. Its name starts with `push:`, so an upgrade waits for it
-    (release.push_in_flight) and `ttp push --free` counts it, also while it waits for its turn."""
+    (release.push_in_flight) and `ttp push --free` counts it, except while it only waits for its turn (free)."""
     return marker.parent.parent / "locks" / f"push:run-{marker.stem}.0.lock"
 
 

@@ -1156,6 +1156,8 @@ def test_push_free_tells_whether_a_push_holds_the_branch(env, monkeypatch):
     paths = push.lock_paths(p, "origin", "proj")
     assert _ttp("push", "--free") == 0 and not any(x.exists() for x in paths), "--free must not create the lock"
     held = locks.try_take(paths, "someone")
+    assert _ttp("push", "--free") == 0, "a push started now queues behind a holder within the push wait"
+    p.set_config("delivery.push_wait_s", 0)   # every holder has kept it past the wait now
     assert _ttp("push", "--free") == 1
     # The harness runs the probe in the project root, which need not have the pushing repo's remotes.
     elsewhere = env["tmp"] / "elsewhere"
@@ -1164,6 +1166,103 @@ def test_push_free_tells_whether_a_push_holds_the_branch(env, monkeypatch):
     assert _ttp("push", "--free") == 1
     held.close()
     assert _ttp("push", "--free") == 0
+
+
+def _taker(push, p, who, order, hold_s, wait_s, got):
+    """A thread that waits for the push turn of origin/proj, holds it hold_s and records its turn."""
+    def run():
+        f = push.take(p, "origin", "proj", wait_s, poll_s=0.02, say=lambda _m: None, who=who)
+        got[who] = f is not None
+        if f:
+            order.append(who)
+            time.sleep(hold_s)
+            f.close()
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    return t
+
+
+def _until_queued(locks, p, n):
+    from ttp import push
+    deadline = time.time() + 10
+    while len(locks.queued(p.state / "locks", push.lock_resource("origin", "proj"))) < n and time.time() < deadline:
+        time.sleep(0.01)
+    assert len(locks.queued(p.state / "locks", push.lock_resource("origin", "proj"))) >= n
+
+
+def test_pushes_waiting_for_the_turn_take_it_in_arrival_order(env, monkeypatch):
+    p, repo, origin, other = _push_setup(env, monkeypatch, [])
+    from ttp import locks, push
+    held = locks.try_take(push.lock_paths(p, "origin", "proj"), "first")
+    order, got, threads = [], {}, []
+    for i, who in enumerate(("A", "B", "C")):
+        threads.append(_taker(push, p, who, order, 0.1, 30, got))
+        _until_queued(locks, p, i + 1)
+        time.sleep(0.05)
+    held.close()
+    for t in threads:
+        t.join(20)
+    assert order == ["A", "B", "C"] and all(got.values()), (order, got)
+    assert not locks.queued(p.state / "locks", push.lock_resource("origin", "proj")), "every ticket goes"
+
+
+def test_a_push_queued_behind_moving_turns_is_never_sent_away(env, monkeypatch):
+    # One holder at a time stays under the 1 s wait, the queue as a whole far over it: the last
+    # waiter still gets its turn (no exit 75), as the wait starts over each time the turn moves on.
+    p, repo, origin, other = _push_setup(env, monkeypatch, [])
+    from ttp import locks, push
+    held = locks.try_take(push.lock_paths(p, "origin", "proj"), "first")
+    order, got, threads = [], {}, []
+    t0 = time.time()
+    for i, who in enumerate(("A", "B", "C")):
+        threads.append(_taker(push, p, who, order, 0.6, 1, got))
+        _until_queued(locks, p, i + 1)
+    time.sleep(0.6)
+    held.close()
+    for t in threads:
+        t.join(20)
+    assert got == {"A": True, "B": True, "C": True} and order == ["A", "B", "C"], (order, got)
+    assert time.time() - t0 > 1.5, "C waited longer than the push wait in all"
+    # One holder that keeps it past the wait still sends a waiter away.
+    held = locks.try_take(push.lock_paths(p, "origin", "proj"), "stuck")
+    try:
+        assert push.take(p, "origin", "proj", 0.3, poll_s=0.02, say=lambda _m: None) is None
+    finally:
+        held.close()
+
+
+def test_push_free_ignores_detached_pushes_that_only_wait_for_their_turn(env, monkeypatch):
+    p, repo, origin, other = _push_setup(env, monkeypatch, [])
+    from ttp import locks, push
+    ldir = p.state / "locks"
+    res = push.lock_resource("origin", "proj")
+    # Two detached pushes queued for the turn: their run locks are held, their pids hold tickets.
+    runs = [subprocess.Popen([sys.executable, "-c", (
+        "import sys, time; sys.path.insert(0, sys.argv[1]); from pathlib import Path; from ttp import locks; "
+        "d = Path(sys.argv[2]); r = locks.try_take([d / f'push:run-{sys.argv[3]}.0.lock'], 'detached push'); "
+        "t = locks.enqueue(d, sys.argv[4], 'detached push'); print('ok', flush=True); time.sleep(60)"),
+        str(RUNTIME), str(ldir), name, res], stdout=subprocess.PIPE, text=True) for name in ("a", "b")]
+    try:
+        for r in runs:
+            assert r.stdout.readline().strip() == "ok"
+        assert _ttp("push", "--free") == 0, "queued detached pushes only wait: a review's probe must not starve"
+        held = locks.try_take(push.lock_paths(p, "origin", "proj"), "running push")
+        assert _ttp("push", "--free") == 0, "a holder within the push wait: a new push queues behind it"
+        p.set_config("delivery.push_wait_s", 0)
+        assert _ttp("push", "--free") == 1, "a holder past the push wait holds the turn"
+        held.close()
+        p.set_config("delivery.push_wait_s", 900)
+        assert _ttp("push", "--free") == 0
+        # A detached push past its queue (fetching before it takes the branch lock) counts.
+        for d in ldir.glob("push:*.queue"):
+            for t in d.iterdir():
+                if not t.name.startswith(".") and t.name.split("-")[1].startswith(str(runs[0].pid)):
+                    t.unlink()
+        assert _ttp("push", "--free") == 1
+    finally:
+        for r in runs:
+            r.kill()
+            r.wait(10)
 
 
 def test_a_detached_push_returns_at_once_and_its_marker_reports_the_pushed_sha_and_version(env, monkeypatch, capsys):
@@ -1186,6 +1285,7 @@ def test_a_detached_push_returns_at_once_and_its_marker_reports_the_pushed_sha_a
             time.sleep(0.05)
         r = _probe(p, probe)
         assert r.returncode == 1 and "still running" in r.stdout, r
+        p.set_config("delivery.push_wait_s", 0)   # it has kept the turn past the push wait
         assert _ttp("push", "--free") == 1, "the detached push holds the branch's turn"
         from ttp import release
         assert release.push_in_flight(p), "an upgrade must not swap the runtime under a detached push"
@@ -1491,6 +1591,7 @@ def test_a_dead_detached_push_reads_as_failed_and_frees_the_branch(env, monkeypa
         while not started.exists() and time.time() < deadline:
             time.sleep(0.05)
         assert started.exists() and _probe(p, probe).returncode == 1
+        p.set_config("delivery.push_wait_s", 0)   # it has kept the turn past the push wait
         assert _ttp("push", "--free") == 1
         os.kill(pid, signal.SIGKILL)     # a crash or a reboot: no outcome is written
         deadline = time.time() + 10
