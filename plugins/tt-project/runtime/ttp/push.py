@@ -43,7 +43,7 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import quote, unquote
 
-from . import (checkcap, checkdirs, checkwait, checklane, cleantree, envfault, gatejudge, gatetime, gitcache, gitmemo, hoststate, landed, landmark, leakfile, locks, machines, pooladmit, prguard, prhead, remotecheck, remoteload, repoid, runner, runnerenv,
+from . import (checkcap, checkdirs, checkwait, checklane, cleantree, envfault, gatejudge, gatetime, gitcache, gitmemo, hoststate, landed, landmark, leakfile, locks, machines, outscan, pooladmit, prguard, prhead, remotecheck, remoteload, repoid, runner, runnerenv,
                sandbox, scriptwatch, settinghold, setupfault, shorttmp, slurmcheck, syntaxfault, testslots, timefmt, workerloss, worktree)
 from .budget import DOC_SUFFIXES
 from .db import continues_id, dependency_ids, load_result
@@ -4041,7 +4041,6 @@ def leak_step(repo: Path, tip: str, say: Callable[[str], None]) -> str | None:
     """The secret-shape scan of what this push sends (tip..HEAD), run as its own first step, before the
     rebase and the checks: a literal in the outgoing history fails in seconds, not after the smoke run
     when the pre-push hook refuses it. A scan that cannot run is said and left to that hook."""
-    from . import outscan
     started = time.time()
     try:
         why = outscan.history_problem(repo, tip, "HEAD", outscan._project())
