@@ -585,3 +585,22 @@ def test_the_appended_status_line_never_becomes_a_promise(env):
                      "chat": "c1", "owners": [tid]}], turn=2)
     (pr,) = [o for o in obligations.items(p.db) if o.get("promise")]
     assert "report back" in pr["text"] and onhost.STATUS_HEAD not in pr["text"]
+
+
+def test_a_false_started_claim_is_marked_whatever_its_tense_or_stated_time(env):
+    from ttp import onhost
+    p = make(env)
+    tid = _oh_task(p)
+    tasks = [p.db.task(tid)]
+    noon = _oh_noon(p)
+    # 'started' says work runs now: past tense and a stated time before the send time never clear it.
+    for text in (f"Started #{tid} on box1.", "Started the soak on box1.", f"#{tid} started on box1 at 11:50.",
+                 "The soak began on box1 at 11:30.", "Kicked off the soak on box1."):
+        got, notes = onhost.guard(p, text, tasks, now=noon)
+        assert got.startswith(onhost.MARK) and notes, text
+    # A hedged start is a plan, and a completed event ('restarted') is still a past report.
+    for text in (f"#{tid} will be started on box1 once a worker is free.", "Restarted box1; it came back cleanly."):
+        assert onhost.guard(p, text, tasks, now=noon) == (text, []), text
+    # A passing expect probe still clears a start claim.
+    text = "Started the soak on box1."
+    assert onhost.guard(p, text, tasks, proofs=[(text, "ok")], prove=lambda q: True, now=noon) == (text, [])
