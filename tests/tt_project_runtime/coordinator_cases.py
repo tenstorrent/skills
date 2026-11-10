@@ -15293,7 +15293,7 @@ def _plain_done_event(p, clock, text="done: all fine", severity="normal", kind="
 def test_a_plain_done_only_batch_waits_past_batch_s_for_the_next_wake_of_another_cause(env, monkeypatch):
     p, d, clock, turns = _plain_hold_setup(env, monkeypatch)
     batch = float(p.config()["coordinator"]["batch_s"])
-    assert p.config()["coordinator"]["plain_done_hold_max_s"] == 3600, "on by default, the idle wake interval"
+    assert p.config()["coordinator"]["plain_done_hold_max_s"] == 3000, "on by default, the idle wake interval"
     ev, _ = _plain_done_event(p, clock)
     assert not _turn_within(d, clock, turns, batch + 900, step=30), "a plain hand-off woke a turn after batch_s"
     assert p.db.one("SELECT status FROM events WHERE id=?", (ev,))["status"] == "queued", "the held event was dropped"
@@ -15327,6 +15327,48 @@ def test_a_held_plain_done_batch_rides_the_idle_wake(env, monkeypatch):
     ev, _ = _plain_done_event(p, clock)
     assert _turn_within(d, clock, turns, 3000, step=30)
     assert 1800 <= turns[0][1] - start < 1800 + 120 and ev in turns[0][0], "it did not ride the idle wake"
+
+
+def test_the_idle_wake_and_plain_done_hold_default_inside_the_1h_prompt_cache(env):
+    from ttp import coordinator as coord
+    c = make(env).config()["coordinator"]
+    ttl = coord.cache_ttl_s(c)
+    for key in ("idle_wake_s", "plain_done_hold_max_s", "cache_wake_s"):
+        assert 0 < c[key] <= ttl - 600, f"{key} {c[key]} leaves no room for dispatch before the {ttl}s cache ends"
+
+
+def test_a_cache_wake_keeps_the_prompt_cache_warm_while_work_is_running(env, monkeypatch):
+    from ttp.daemon import idle_wake
+    p, d, clock, turns = _plain_hold_setup(env, monkeypatch, idle=3000)
+    t0 = clock[0]
+    p.db.add_task("long run", "s", kind="work", status="running")
+    w = idle_wake(p, d.cfg, {}, t0 + 2990)
+    assert w["due"] is None and w["at"] == t0 + 3000, w
+    assert idle_wake(p, d.cfg, {}, t0 + 3030)["due"] == "cache"
+    assert idle_wake(p, d.cfg, {}, t0 + 3700)["due"] is None, "woke after the cache it keeps had expired"
+    # It counts from the last turn's end when that is later than its start.
+    p.db.x("INSERT INTO runs(role, started, ended, status) VALUES('coordinator', ?, ?, 'ok')", (t0, t0 + 300))
+    assert idle_wake(p, d.cfg, {}, t0 + 3030)["due"] is None
+    assert idle_wake(p, d.cfg, {}, t0 + 3330)["due"] == "cache"
+    # The daemon starts it; an unchanged state gets cache_wake_max of them in a row, then none.
+    for k in range(2):
+        clock[0] = float(p.db.kv("last_coordinator_turn")) + (300 if k == 0 else 0) + 2900
+        assert _turn_within(d, clock, turns, 240, step=30), f"cache wake {k + 1} did not start a turn"
+        p.db.set_kv("last_coordinator_turn", clock[0])
+    clock[0] += 2900
+    assert not _turn_within(d, clock, turns, 1200, step=30), "a third cache wake on an unchanged state"
+
+
+def test_cache_wake_s_0_or_a_5m_cache_turns_the_cache_wake_off(env, monkeypatch):
+    from ttp.daemon import idle_wake
+    p, d, clock, turns = _plain_hold_setup(env, monkeypatch)
+    p.db.add_task("long run", "s", kind="work", status="running")
+    now = clock[0] + 3030
+    for key, value in (("cache_wake_s", 0), ("cache_ttl", "5m")):
+        cfg = p.config()
+        cfg["coordinator"][key] = value
+        w = idle_wake(p, cfg, {}, now)
+        assert w["due"] is None and w["at"] is None, (key, w)
 
 
 def test_plain_done_hold_max_s_0_turns_the_hold_off(env, monkeypatch):

@@ -3598,7 +3598,8 @@ class Daemon:
             resume_extra = prov.resume_args(resume) if resume else []
             argv = _before_stdin(argv, extra)
             if task and role in ctxfork.ROLES and not resume:   # the coordinator's context (ctxfork.py)
-                got = ctxfork.prepare(self.p, self.cfg, prov, provider, str(cwd), env, task=task["id"])
+                got = ctxfork.prepare(self.p, self.cfg, prov, provider, str(cwd), env, task=task["id"],
+                                      model=ctxfork._arg(argv, "--model"))
                 if got.get("session"):
                     resume, resume_extra = got["session"], prov.resume_args(got["session"])
                 prefix_by = ""
@@ -10734,7 +10735,7 @@ class Daemon:
                 w, wake = {"due": coord.REJECTION_DUE}, db.kv("idle_wake", {}) or {}
             else:
                 last = float(db.kv("last_coordinator_turn", 0))
-                if now - last <= min(float(c.get("idle_wake_s", 3600)), float(c.get("starve_wake_s", 300))):
+                if now - last <= min(float(c.get("idle_wake_s", 3000)), float(c.get("starve_wake_s", 300))):
                     return
                 w = idle_wake(self.p, self.cfg, {k: g.as_dict() for k, g in self.gates.items()}, now)
                 if not w["due"]:
@@ -11012,7 +11013,7 @@ class Daemon:
         or the idle wake. They stay queued, so a restart keeps them and their clock. Any other queued
         event, even one turn sizing set aside or parked, releases the hold (the batch_s wake as before)."""
         try:
-            cap = float(self.cfg["coordinator"].get("plain_done_hold_max_s", 3600) or 0)
+            cap = float(self.cfg["coordinator"].get("plain_done_hold_max_s", 3000) or 0)
             own = [e for e in queued if not pagesev.rides_along(e)]
             mine = [e for e in evs if not pagesev.rides_along(e)]
             ids_all = {e.get("id") for e in own}
@@ -19270,7 +19271,10 @@ def idle_wake(p: Project, cfg: dict, gates: dict[str, dict], now: float, db=None
     without a turn is a repeat too, and the next wait counts from it. Explicit check-backs use
     schedules.
 
-    Returns `at` (next wake, possibly past), `due` ("idle", "starve" or None at `now`), `held`
+    While tasks are queued or running there is no idle wake, but the cache wake (cache_wake_at) can
+    come: a turn just before the coordinator's prompt cache expires, so the next turn reads it.
+
+    Returns `at` (next wake, possibly past), `due` ("idle", "starve", "cache" or None at `now`), `held`
     (why the idle wake cannot come), and the `wake` / `starve` kv values a starting turn stores."""
     # `db` is the caller's own connection: the web app calls this from its request threads, and an
     # SQLite connection works only in the thread that opened it.
@@ -19280,7 +19284,7 @@ def idle_wake(p: Project, cfg: dict, gates: dict[str, dict], now: float, db=None
                 "starve": None, "look": nxt[0]["text"]}
     gate = gates.get(cfg.get("core_provider", "claude"))
     last = float(db.kv("last_coordinator_turn", 0))
-    idle_s = float(c.get("idle_wake_s", 3600))
+    idle_s = float(c.get("idle_wake_s", 3000))
     fp = wake_fingerprint(p, gates, db, cfg.get("core_provider"))
     prev = db.kv("idle_wake", {}) or {}
     same = prev.get("fp") == fp
@@ -19291,19 +19295,48 @@ def idle_wake(p: Project, cfg: dict, gates: dict[str, dict], now: float, db=None
     cap = last + quietgate.max_age(cfg) if skipped > last and quietgate.max_age(cfg) else float("inf")
     last = max(last, skipped)
     backoff = min(idle_s * 2 ** min(repeats, 30), 86400.0) if repeats else 0.0
-    idle_at, held = None, None
+    idle_at, held, cache_at = None, None, None
     if not db.one("SELECT id FROM tasks WHERE status IN ('queued','running')"):
         if gate is None or gate["allow_optional"]:
             idle_at = min(last + max(idle_s, backoff), cap)
         else:
             held = f"held by the budget gate ({gate['level']})"
+    elif gate is None or gate["allow_optional"]:
+        cache_at = cache_wake_at(db, c, prev if same else {}, skipped)
     starve = starve_state(db, cfg, gate, now)
     starve_at = min(last + max(backoff, starve["wait"]), cap) if starve else None
     due = "idle" if idle_at is not None and now > idle_at else \
-        "starve" if starve_at is not None and now > starve_at else None
-    times = [t for t in (idle_at, starve_at) if t is not None]
+        "starve" if starve_at is not None and now > starve_at else \
+        "cache" if cache_at is not None and cache_at < now < cache_at + CACHE_WAKE_WINDOW_S else None
+    times = [t for t in (idle_at, starve_at) if t is not None] + \
+        ([cache_at] if cache_at is not None and now < cache_at + CACHE_WAKE_WINDOW_S else [])
     return {"at": min(times) if times else None, "due": due, "held": None if times else held,
             "wake": {"fp": fp, "n": repeats + 1}, "starve": starve}
+
+
+# A cache wake this late past its time no longer finds the cache: it is dropped (cache_wake_at).
+CACHE_WAKE_WINDOW_S = 600.0
+
+
+def cache_wake_at(db, c: dict, prev: dict, skipped: float) -> float | None:
+    """When a turn keeps the coordinator's prompt cache warm while work is queued or running (no
+    idle wake then), or None. The cache lives coord.cache_ttl_s after its last use, the later of the
+    last turn's start and end; a turn re-writing it costs ~7x one reading it (measured on the 1h
+    cache: ~$0.75 vs ~$0.10-0.20). So the wake comes coordinator.cache_wake_s (default 3000, 0: off)
+    after that use, inside the TTL with room for dispatch, and only within CACHE_WAKE_WINDOW_S of it
+    (later, the cache is likely gone). At most coordinator.cache_wake_max (default 2) such wakes run
+    in a row against an unchanged state (`prev`: the stored wake of the same fingerprint), and none
+    after a wake the quiet gate settled since the last use (`skipped`)."""
+    wait = float(c.get("cache_wake_s", 3000) or 0)
+    if wait <= 0 or wait + CACHE_WAKE_WINDOW_S > coord.cache_ttl_s(c) + 1:
+        return None
+    if int(prev.get("n", 0) or 0) >= int(c.get("cache_wake_max", 2) or 0):
+        return None
+    row = db.one("SELECT MAX(COALESCE(ended, started)) t FROM runs WHERE role='coordinator'")
+    used = max(float(db.kv("last_coordinator_turn", 0) or 0), float(row["t"] or 0) if row else 0.0)
+    if not used or skipped > used:
+        return None
+    return used + wait
 
 
 def wake_fingerprint(p: Project, gates: dict[str, dict], db=None, core: str | None = None) -> str:
@@ -19351,7 +19384,7 @@ def starve_state(db, cfg: dict, gate: dict | None, now: float) -> dict | None:
         return None
     if coord.next_task_slot(db, coord.task_cap(cfg)) is not None:
         return None
-    idle_s = float(c.get("idle_wake_s", 3600))
+    idle_s = float(c.get("idle_wake_s", 3000))
     base, cap = (idle_s, 86400.0) if held else (float(c.get("starve_wake_s", 300)), idle_s)
     newest = db.one("SELECT COALESCE(MAX(id),0) n FROM tasks")["n"]
     st = db.kv("starve") or {}

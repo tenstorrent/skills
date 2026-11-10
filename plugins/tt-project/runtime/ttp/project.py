@@ -222,7 +222,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
                     "repeat_fails_24h": 2, "repeat_waits_24h": 8, "live_waits_max": 6,
                     "effort_skip_triggers": [],
                     "debounce_s": 15, "max_events_per_turn": 40,
-                    "max_turns_per_hour": 30, "max_new_tasks_per_day": 200, "idle_wake_s": 3600,
+                    "max_turns_per_hour": 30, "max_new_tasks_per_day": 200, "idle_wake_s": 3000,
                     "starve_wake_s": 300,
                     # An event batch that a turn which decided nothing already met, against the same
                     # state, is settled without a model run for this long after it (turngate.py; 0: off).
@@ -267,7 +267,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
                     # A batch of only plain hand-offs (a normal task_done of no review with nothing to
                     # queue or decide) starts no turn: it joins the next wake of any other cause or the
                     # idle wake, at most this long after its oldest event (the idle_wake_s default; 0: off).
-                    "plain_done_hold_max_s": 3600,
+                    "plain_done_hold_max_s": 3000,
+                    # idle_wake_s (3000) and this hold sit inside the 1h prompt cache with room for
+                    # dispatch, so the turn they start reads the cache. While work is queued or running
+                    # (no idle wake), a turn comes this long after the coordinator's last cache use, at
+                    # most cache_wake_max times in a row on an unchanged state (daemon.cache_wake_at;
+                    # 0: off). A user's or coordinator's value wins over these defaults.
+                    "cache_wake_s": 3000, "cache_wake_max": 2,
                     # Routine event-only turns (task done, follow-ups, upstream notes, check-slot waits,
                     # waits) start no sooner than this long after the last turn ended, unless a slot is
                     # free with nothing ready to fill it (eventhold.py; 0: off).

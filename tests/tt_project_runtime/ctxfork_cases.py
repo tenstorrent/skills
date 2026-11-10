@@ -725,7 +725,12 @@ def test_forked_runs_send_the_coordinator_prefix_and_keep_their_own_text_after_i
         [("other-model" if i and coord[i - 1] == "--model" else a) for i, a in enumerate(coord)]
     (coord_dir / "run.json").write_text(json.dumps({"argv": other}))
     argv, prompt, system, ctx = start(p.root)
-    assert system.startswith("# WORKER RULES") and "--json-schema" not in argv and "differs" in ctx["prefix"]
+    assert system.startswith("# WORKER RULES") and "--json-schema" not in argv
+    if "--model" in argv:   # task #74: it takes the disk block, not a fork it would write again
+        assert ctx["how"] == "disk" and "is not the coordinator's other-model" in ctx["why"], ctx
+        assert prompt.startswith(ctxfork.DISK_HEAD)
+    else:
+        assert "differs" in ctx["prefix"]
 
 
 def test_sonnet_workers_and_reviewers_share_one_system_prompt_while_memory_changes(env, monkeypatch, tmp_path):
@@ -757,3 +762,28 @@ def test_sonnet_workers_and_reviewers_share_one_system_prompt_while_memory_chang
     assert shape(a[0]) == shape(b[0]) and a[2] == b[2]
     assert "MEM-ONE" not in a[2] and "PROJECT MEMORY" not in a[2]
     assert "MEM-ONE" in a[1] and "MEM-TWO" not in a[1] and "MEM-TWO" in b[1]
+
+
+def test_a_run_on_another_model_than_the_coordinators_takes_the_disk_block_not_a_fork(env, monkeypatch, tmp_path):
+    """Task #74: the prompt cache is per model, so a Sonnet fork of an Opus coordinator wrote the whole
+    copied history again (task #51: 10-69k tokens per run). It starts from the disk block instead; a run
+    on the coordinator's model (or its bare family alias) still forks."""
+    from ttp import coordsession, ctxfork
+    p, d, cfg_dir, _run = _fork_daemon(env, monkeypatch, tmp_path)
+    sid = str(uuid.uuid4())
+    _fork_transcript(cfg_dir, p.base, sid)
+    p.db.set_kv(coordsession.KEY, {"id": sid, "provider": "claude", "context_tokens": 50000})
+    coord_dir = tmp_path / "coord-run"
+    coord_dir.mkdir()
+    (coord_dir / "run.json").write_text(json.dumps({"argv": ["claude", "-p", "--model", "claude-opus-5-5"]}))
+    p.db.x("INSERT INTO runs(role,status,started,dir) VALUES('coordinator','ok',?,?)", (time.time(), str(coord_dir)))
+    from ttp.providers import get_provider
+    prov = get_provider("claude")
+    for model, how in (("sonnet", "disk"), ("claude-sonnet-5-5", "disk"), ("claude-opus-5-5", "fork"),
+                       ("opus", "fork"), (None, "fork")):
+        got = ctxfork.prepare(p, p.config(), prov, "claude", str(p.root), {}, model=model)
+        assert got["how"] == how, (model, got)
+        if how == "disk":
+            assert "not the coordinator's claude-opus-5-5" in got["why"] and got["lead"].startswith(ctxfork.DISK_HEAD)
+    assert ctxfork.same_model("opus", "claude-opus-5-5") and not ctxfork.same_model("sonnet", "claude-opus-5-5")
+    assert not ctxfork.same_model("claude-opus-4-1", "claude-opus-5-5")

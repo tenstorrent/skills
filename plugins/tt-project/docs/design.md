@@ -73,7 +73,7 @@ disk untouched, with no migration; nothing else is reclaimed by check recovery.
    A batch of only plain hand-offs (a normal task_done of no review, with no follow-up proposed, no
    waiting parent, no live dependent and no text asking for a decision or naming a Restriction) does
    the same, for both coordinator modes and every provider: it joins the next wake of any other
-   cause or the idle wake, at the latest `coordinator.plain_done_hold_max_s` (3600 s; 0: off) after
+   cause or the idle wake, at the latest `coordinator.plain_done_hold_max_s` (3000 s, inside the 1h prompt cache; 0: off) after
    its oldest event, and shows in Recently finished meanwhile (Daemon._plain_done_held). It judges
    every queued event and message, not only the batch turn sizing picked: any other one, even one
    sizing set aside or parked, wakes as before.

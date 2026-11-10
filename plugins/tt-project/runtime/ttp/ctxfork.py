@@ -37,7 +37,9 @@ or system prompt differ from the coordinator's writes the whole copied history t
 (task #49, measured: Claude Code reported tools_changed; a forked Opus worker wrote about 50k tokens on
 its first call and read none). So a fork on the coordinator's model sends the coordinator's last launch's
 prefix (coord_shape, shape_argv): its system prompt, its answer schema and the settings that change the
-tools' text; the run's own system prompt leads its prompt instead (shared_lead)."""
+tools' text; the run's own system prompt leads its prompt instead (shared_lead). A run on another model
+(a Sonnet worker of an Opus coordinator) cannot read that cache at all, so it takes the disk block
+instead of a fork (_model_gap); a follow-up still resumes its own earlier run's session."""
 from __future__ import annotations
 
 import json
@@ -167,7 +169,7 @@ def forked(note: dict | None) -> bool:
 
 
 def prepare(p, cfg: dict, prov, provider: str, cwd: str, env: dict | None, now: float | None = None,
-            task: int | None = None) -> dict:
+            task: int | None = None, model: str | None = None) -> dict:
     """What a new worker or reviewer run starts with: {"how", "why", "session" (a fork: the run's own
     new session id, to resume), "lead" (text before its prompt; a fork's goes after the copied
     history), "tokens"}. Never raises: a failure falls back to the disk block. When the task's last run
@@ -193,7 +195,8 @@ def prepare(p, cfg: dict, prov, provider: str, cwd: str, env: dict | None, now: 
         except Exception as e:   # the coordinator fork, then the disk block, is always tried
             gap = f"resume failed: {type(e).__name__}: {e}"[:200]
         try:
-            why = _fork_gap(p, cfg, prov, provider, cwd, env, now) or _fork_rejected(p, task, "fork")
+            why = _model_gap(p, model) or _fork_gap(p, cfg, prov, provider, cwd, env, now) \
+                or _fork_rejected(p, task, "fork")
             if not why:
                 st = p.db.kv(coordsession.KEY)
                 new = str(uuid.uuid4())
@@ -243,6 +246,44 @@ def _fork_rejected(p, task: int | None, how: str = "fork") -> str:
         if r["status"] == "failed" and forked(note) and note.get("not_waste") == "resume" \
                 and note[KEY].get("how") == how:
             return f"run {r['id']}'s {how} was rejected before it started: {note.get('resume_error') or 'no output'}"[:200]
+    return ""
+
+
+_FAMILIES = ("opus", "sonnet", "haiku", "fable")
+
+
+def coord_model(p) -> str:
+    """The --model of the coordinator's latest launch ("" when unknown)."""
+    try:
+        r = p.db.one("SELECT id, dir FROM runs WHERE role='coordinator' ORDER BY id DESC LIMIT 1")
+        if not r:
+            return ""
+        from pathlib import Path
+        d = Path(r["dir"]) if r.get("dir") else p.runs / str(r["id"])
+        return _arg(json.loads((d / "run.json").read_text()).get("argv") or [], "--model") or ""
+    except (OSError, ValueError, TypeError, AttributeError):
+        return ""
+
+
+def same_model(a: str, b: str) -> bool:
+    """Whether two --model values name one model: equal, or one is the other's bare family alias."""
+    a, b = (a or "").lower(), (b or "").lower()
+    if a == b:
+        return True
+    fam = [next((f for f in _FAMILIES if f in x), "") for x in (a, b)]
+    return bool(fam[0]) and fam[0] == fam[1] and (a in _FAMILIES or b in _FAMILIES)
+
+
+def _model_gap(p, model: str | None) -> str:
+    """Why a run on another model than the coordinator's takes the disk block, not a fork; "" otherwise.
+    The prompt cache is per model: the copied history was cached under the coordinator's model, so a
+    Sonnet fork wrote it again on its first call and read it on every later one (task #51 measured
+    10-69k tokens written per fork; task #74: about $0.025 per run at the median, $0.08 on average,
+    up to $0.40, against the ~7k token disk block). A run with no --model, or a coordinator whose
+    model is unknown, forks as before."""
+    cm = coord_model(p) if model else ""
+    if model and cm and not same_model(model, cm):
+        return f"its model {model} is not the coordinator's {cm}, whose cache holds the copied history"
     return ""
 
 
