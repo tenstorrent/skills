@@ -28,7 +28,7 @@
     {
       "name": "tt-train-bringup",
       "source": "./plugins/tt-train-bringup",
-      "description": "Staged tt-train training bring-up on one chip: plan, composite bring-up, optimisation loop with gradient PCC, MFU and Tracy op-class gates; requires tt-autodebug."
+      "description": "Staged tt-train training bring-up on the plan's chips: plan, composite bring-up with first-baseline checks and recipe-correct MFU, then optimisation with gradient PCC and Tracy gates; requires tt-autodebug."
     },
     {
       "name": "tt-debug-tools",

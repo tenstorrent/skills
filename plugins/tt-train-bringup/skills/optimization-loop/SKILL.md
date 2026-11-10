@@ -34,6 +34,11 @@ is the work; a stage review is a checkpoint inside it, not its end. Never end th
 review while the target is unmet and a candidate with a number remains: fix the findings, commit,
 and start the next iteration.
 
+Begin kernel optimisation after the composite phase passes its
+[first-baseline checks](../composite-bringup/SKILL.md#before-accepting-the-first-baseline).
+Use the plan's useful-FLOP count and actual-chip nominal denominator, keeping recompute overhead
+out of the useful numerator.
+
 Iteration 1 is the biggest math kernel. The matmuls are most of a transformer step (63 % in the
 reference bring-up, where they stayed untouched for 34 iterations while glue and small owned
 kernels returned a few percent each). Before any glue work, attribute the top ttnn op to its kernel

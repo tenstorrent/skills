@@ -27,6 +27,18 @@ any inference implementation of the same model under `models/`. Inference bring-
 kernels behind; those are free, and only their backwards need to be written. A forward that already
 exists in ttnn and a backward that is "two convs with a flag" is a different cost from a new fused op.
 
+Also inspect existing training implementations and shared modules in the repository for reuse,
+including packed projections, native GQA, fused activations and frozen-parameter paths. Record the
+selected implementation and source revision, and check its backward and shard-shape support; an
+inference graph alone does not supply autograd. Prefer compatible existing fused kernels over
+decomposing them into primitive ops. Record a concrete correctness, shape or layout reason for a
+fallback. Reuse is part of the first implementation, not deferred optimisation.
+
+For the selected paths, specify forward and backward layouts at module boundaries, logical versus
+padded shapes, and which constant transformations happen once at load time. Include the matmul
+orientation and program config at the actual sequence, batch and per-rank shapes. Explain which
+dominant shapes are compute-bound or bandwidth-bound; another model's initial MFU is not a target.
+
 For the three most expensive ops of the step (from the roofline below, normally the projection
 matmuls and attention) name the kernel that will actually be compiled: the program factory and
 kernel source files, including any fork a ttml path selects (a `_metal2` variant found on day 35 of
@@ -43,15 +55,31 @@ everything trains, so every weight gradient matmul is useful math. LoRA or parti
 frozen weights, norm gammas, embedding tables and conv taps never need a gradient tensor allocated,
 written or reduced. The map feeds `requires_grad` flags into every backward op in the composite
 phase and is the detector for the wasted class in the loop.
+Check that each backward actually skips the corresponding kernel, allocation and collective;
+discarding a computed gradient is not a skip. Frozen weights can still require input gradients
+to reach earlier trainable parameters: prune each gradient independently, never detach an entire
+frozen module just because its parameters do not train.
 
 ## 3. Roofline target
 
 For every useful op per layer kind: `max(FLOPs / peak FLOP/s, bytes / DRAM bandwidth)` on the target
-chips, counting forward, backward (dX and dW) and recompute if the memory budget forces it. Sum per
-layer, scale by layer counts, add the fixed costs (embedding, LM head, loss, optimiser) and, for a
+chips, counting forward, backward terms required by the freeze map and recompute if the memory
+budget forces it. Sum per layer, scale by layer counts, add the fixed costs (embedding, LM head,
+loss, optimiser) and, for a
 multi-chip layout, the collective bytes per step at the measured link bandwidth. The result is the
-achievable ms/step and MFU. Record the useful FLOPs per step (`6 × trainable params × tokens` plus
-attention terms) so MFU runs can be computed the same way later.
+achievable ms/step and MFU. Derive useful FLOPs from the reference forward and required backward:
+a dense projection contributes `2 × M × N × K` for its forward and for each required dX or dW
+product. Include attention and adapter work. For LoRA, include the frozen base's forward and
+required dX, exclude its dW, and include adapter gradients; `6 × trainable params × tokens` misses
+most of this work. The `6 × params × tokens` shortcut is valid only where the actual full-training
+graph supports it. Budget recompute in execution time but exclude repeated recompute FLOPs from
+the useful-work MFU numerator. Record the counting convention and derivation for later runs.
+
+For a distributed step count useful work over the global batch once: TP shards partition that work,
+while DP replicas process distinct samples. Derive the nominal denominator from the actual compute
+grid and participating chips at the documented precision/fidelity convention. Record these alongside
+batch, sequence, TP/DP and useful FLOPs; never copy a previous box's core count or multiply TP work
+by the chip count again. Cross-box comparisons report wall time and both denominators explicitly.
 
 The target is one wall-clock ms/step and one MFU figure against the nominal peak of the authorised
 chips (for example 1350 MHz, 148.5 TFLOP/s per chip; the box's sum for a TP run), the same number
@@ -66,7 +94,9 @@ clock). This number is the exit condition of the optimisation loop.
 
 Weights at their stored dtype, gradients, optimiser state (fp32 AdamW is 8 bytes per trainable
 parameter), saved activations at the target sequence length and batch, plus workspace, against the
-chip's DRAM. Decide from this the recompute policy (none, per block, per sub-module), whether the
+chip's DRAM. Include graph-retained activations, padding, temporary layout buffers, collective
+buffers and any additional stored weight orientations at their peak lifetime, per rank. Decide
+from this the recompute policy (none, per block, per sub-module), whether the
 optimiser state can be fp32, and whether the full model fits on one chip at the target sequence
 length at all. Recompute multiplies every forward cost in the loop, so it must be fixed here.
 
@@ -101,4 +131,6 @@ so the composite phase's layout choices already favour fewer bytes and fewer act
 reference commit and HF revision, the recipe, the chips and their firmware bundle. The roofline
 target is a single wall ms/step and MFU figure at the nominal peak with its derivation and the
 delivered-clock margin; the top three ops name their compiled kernel source and % of peak; the
-multi-chip fit decision is explicit. `stage-review` returns `clean-pass`.
+multi-chip fit decision is explicit. The inventory selects reusable training paths, layouts and
+one-time constant preparation for the first baseline; the useful-FLOP derivation follows the
+freeze map and the denominator uses the actual compute grid. `stage-review` returns `clean-pass`.
