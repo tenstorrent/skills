@@ -13910,7 +13910,7 @@ def cmd_doctor(a) -> None:
     print("process sandbox for checks: " + (sandbox.notice() or ("on (own PID namespace per check command)"
           if sandbox.opted_in() else "off (default; project.json sandbox.checks true turns it on)")))
     from .project import config_problems
-    for line in config_problems(p.raw_config(), p.root):
+    for line in config_problems(p.raw_config(), p.root, fetch=True):
         print(f"project.json: {line}")
     from .providers.chat import fallback_cap_line
     if line := fallback_cap_line(p.config()):

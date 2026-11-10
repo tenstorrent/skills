@@ -21271,3 +21271,66 @@ def test_a_raw_push_never_claims_an_approval_from_an_environment_variable(env, m
     monkeypatch.setenv("TTP_TASK", str(tid))
     out = _approved_child(repo, f"{other}:proj")
     assert out.returncode != 0 and _git_out(origin, "rev-parse", "proj") == shared, out.stderr
+
+
+def test_push_check_targets_are_looked_up_at_the_remote_tracking_push_branch(tmp_path):
+    """A push check's named targets are looked up at refs/remotes/<remote>/<branch> of
+    delivery.push_branch, fetched first by `ttp doctor`, never at the local branch of that name, which
+    drifts behind and raised false 'missing target at the tip' alerts. Only a repo with no remote falls
+    back to its local branch (else HEAD); a remote without the tracking ref skips the lookup."""
+    from ttp.project import config_problems
+    from ttp.push import targets_tip
+
+    def git(repo, *args):
+        return subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True,
+                              text=True).stdout.strip()
+
+    def repo_at(path):
+        subprocess.run(["git", "init", "-q", "-b", "feature", str(path)], check=True)
+        for k, v in (("user.name", "Test"), ("user.email", "test@example.com"), ("commit.gpgsign", "false")):
+            git(path, "config", k, v)
+        return path
+
+    def commit(repo, rel, text):
+        (repo / rel).parent.mkdir(parents=True, exist_ok=True)
+        (repo / rel).write_text(text)
+        git(repo, "add", rel)
+        git(repo, "commit", "-qm", rel)
+
+    raw = {"delivery": {"push_branch": "origin/feature", "push_checks": ["python3 -m pytest tests/test_new.py"]}}
+    missing = lambda root, **kw: [x for x in config_problems(raw, root, **kw) if "missing target" in x]
+    origin = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "-q", "--bare", "-b", "feature", str(origin)], check=True)
+    work = repo_at(tmp_path / "work")
+    git(work, "remote", "add", "origin", str(origin))
+    commit(work, "README.md", "hello\n")
+    git(work, "push", "-q", "origin", "feature")
+    other = tmp_path / "other"
+    subprocess.run(["git", "clone", "-q", str(origin), str(other)], check=True, capture_output=True)
+    for k, v in (("user.name", "Test"), ("user.email", "test@example.com"), ("commit.gpgsign", "false")):
+        git(other, "config", k, v)
+    commit(other, "tests/test_new.py", "def test_new(): pass\n")
+    git(other, "push", "-q", "origin", "feature")
+    # The local feature branch is stale; the target is only on the remote. doctor fetches first.
+    assert missing(work, fetch=True) == []
+    assert targets_tip(work, "origin/feature") == "refs/remotes/origin/feature"
+    assert "tests/test_new.py" not in git(work, "ls-tree", "-r", "--name-only", "feature")
+    # The daemon's start check reads the tracking ref as it is, without fetching.
+    git(work, "update-ref", "refs/remotes/origin/feature", git(work, "rev-parse", "feature"))
+    assert missing(work) and missing(work)[0].endswith("missing target at the tip: tests/test_new.py; "
+                                                       "use if_exists/if_changed to declare applicability")
+    git(work, "fetch", "-q", "origin")
+    assert missing(work) == []
+    # A remote without the tracking ref: nothing to look up at, so no alert.
+    git(work, "update-ref", "-d", "refs/remotes/origin/feature")
+    assert targets_tip(work, "origin/feature") == "" and missing(work) == []
+    # No remote: the local push branch, even when HEAD is elsewhere; else HEAD.
+    alone = repo_at(tmp_path / "alone")
+    commit(alone, "tests/test_new.py", "def test_new(): pass\n")
+    git(alone, "checkout", "-q", "--orphan", "bare-head")
+    git(alone, "rm", "-rqf", ".")
+    commit(alone, "README.md", "hello\n")
+    assert targets_tip(alone, "origin/feature") == "refs/heads/feature" and missing(alone) == []
+    git(alone, "branch", "-D", "feature")
+    assert targets_tip(alone, "origin/feature") == "HEAD"
+    assert missing(alone)

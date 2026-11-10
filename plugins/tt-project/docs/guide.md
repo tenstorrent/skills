@@ -2242,7 +2242,10 @@ the pick order, so it takes the first starts. A resumed resource ramps only its 
   touches only the version files and a changeset), with `(the task's own ttp checks run <id>)`
   added to the line. A targeted run, a single command's pass or a batch of several changes does not.
 - Config warnings flag checks that pin a full commit SHA, use an absolute temporary environment,
-  or name a target missing from the branch tip without `if_exists`. Declare applicability with
+  or name a target missing from the branch tip without `if_exists`. That tip is the remote-tracking
+  push branch (`refs/remotes/<remote>/<branch>` of `delivery.push_branch`, which `ttp push` advances;
+  `ttp doctor` fetches it first), not the local branch of that name, which drifts behind; a repo with
+  no remote uses its local branch (else HEAD), and one whose tracking ref is missing skips the lookup. Declare applicability with
   `if_exists`/`if_changed` and retain coverage for the code the check protects. Warnings do not skip
   commands. `ttp checks` records a missing-target failure only when the target is absent from the
   tested Git tree (Python cannot open it, pytest cannot find it, or collects no tests). A check-only
@@ -4180,7 +4183,11 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   (its pre-push hook, which `--no-verify` does not skip, runs before the repository's own): the
   messages, added lines and file paths of each commit the push sends, merges' own changes and
   annotated tags' messages, but nothing the remote already has (read from the remote with
-  `git ls-remote`, not from local tracking refs). A later commit that removes a leak does not clear
+  `git ls-remote`, not from local tracking refs). It reads only the commits from the remote's tips
+  to the pushed heads, stopping at the remote tips of the refs it updates, the remote's HEAD and its
+  branch tips (past 2000 branches, only the first two, which reads further back, never less), so a
+  remote with tens of thousands of refs (tags, pull refs) costs no more. A git read that outlasts its
+  timeout (longer for more tips) refuses the push. A later commit that removes a leak does not clear
   it, since the earlier commit still goes: rewrite that commit. A push whose remote or commits cannot
   be read is refused too. Each is checked for every stored secret
   value (as is and JSON-escaped), common credential shapes (forge, chat and cloud tokens, private-key

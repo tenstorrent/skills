@@ -1246,11 +1246,13 @@ def pin_verify_mode(value: Any) -> str:
     return value
 
 
-def config_problems(raw: dict, root: Path | None = None) -> list[str]:
+def config_problems(raw: dict, root: Path | None = None, fetch: bool = False) -> list[str]:
     """Unknown keys, non-command push_checks or after_push, a scalar push_exclude_paths, a malformed version_bump, push queue
     settings out of range and a push branch that can never be pushed to (push_branch_problem; with
     `root`, the code repo, its remotes are checked too) in a project's own settings, one line each. A
-    local push branch of a repo with no remote is not one: reviews land on it (lands_locally)."""
+    local push branch of a repo with no remote is not one: reviews land on it (lands_locally). Push
+    check targets are looked up at the remote-tracking push branch (targets_tip), fetched first when
+    `fetch`."""
     out: list[str] = [f"{k}: a section of settings holds {json.dumps(v)[:60]}, not an object: read as absent "
                       f"(set its keys one by one: ttp config {k}.<key> VALUE)" for k, v in bad_sections(raw).items()]
 
@@ -1263,7 +1265,7 @@ def config_problems(raw: dict, root: Path | None = None) -> list[str]:
                 walk(v, path + [str(k)])
     walk(raw, [])
     from .push import (allow_protected, applicability_problems, backup_problem, by_repo_problems,   # push imports this module
-                       bump_problems, check_problems,
+                       bump_problems, check_problems, targets_tip,
                        fast_forward_check, lands_locally, mirror_check, push_branch_problem, scalar_problem, wrap_lane_of,
                        wrap_of, fallback_lane_of)
     for read in (wrap_of, wrap_lane_of):
@@ -1285,7 +1287,8 @@ def config_problems(raw: dict, root: Path | None = None) -> list[str]:
     except ValueError as e:
         out.append(str(e))
     out += [f"delivery.push_checks: {p}" for p in check_problems(delivery.get("push_checks"))]
-    out += [f"delivery.push_checks: {p}" for p in applicability_problems(delivery.get("push_checks"), root)]
+    tip = targets_tip(root, delivery.get("push_branch"), fetch) if root else "HEAD"
+    out += [f"delivery.push_checks: {p}" for p in applicability_problems(delivery.get("push_checks"), root, tip)]
     out += [f"delivery.post_land_checks: {p}" for p in check_problems(delivery.get("post_land_checks"))]
     out += [f"delivery.task_checks: {p}" for p in check_problems(delivery.get("task_checks"))]
     out += [f"delivery.push_checks_by_repo: {p}" for p in by_repo_problems(delivery.get("push_checks_by_repo"))]

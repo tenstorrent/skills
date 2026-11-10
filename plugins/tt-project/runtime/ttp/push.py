@@ -1576,10 +1576,37 @@ def check_sig(check: Check) -> str:
     return hashlib.sha256(json.dumps(check.config(), sort_keys=True).encode()).hexdigest()[:20]
 
 
+TARGETS_FETCH_S = 30   # the fetch of the push branch before its targets are looked up
+
+
+def targets_tip(repo: Path, push_branch: Any, fetch: bool = False) -> str:
+    """Where `applicability_problems` looks up a push check's targets: the remote-tracking push branch
+    (refs/remotes/<remote>/<branch>, fetched first when `fetch`), since `ttp push` advances only that
+    ref and the local branch of the same name drifts behind it. The local branch only when the repo has
+    no remote (HEAD when that is missing too); "" (no lookup) when the remote's branch cannot be read."""
+    ref = str(push_branch or "").strip()
+    r = _git(repo, "remote")
+    remotes = r.stdout.split() if r.returncode == 0 else []
+    if not remotes:   # the branch as named, or without its remote part (origin/x names x)
+        names = dict.fromkeys(b for b in (ref.removeprefix("refs/heads/"), ref.partition("/")[2]) if b)
+        return next((f"refs/heads/{b}" for b in names
+                     if _git(repo, "rev-parse", "--verify", "-q", f"refs/heads/{b}").returncode == 0), "HEAD")
+    if not ref:
+        return "HEAD"
+    remote, branch = _split_target(ref, remotes)
+    if remote not in remotes:
+        return ""
+    tracking = tracking_ref(remote, branch)
+    if fetch:
+        _git_net(repo, "fetch", "--no-tags", remote, f"+refs/heads/{branch}:{tracking}", timeout_s=TARGETS_FETCH_S)
+    return tracking if _git(repo, "rev-parse", "--verify", "-q", tracking).returncode == 0 else ""
+
+
 def applicability_problems(v: Any, repo: Path | None = None, head: str = "HEAD") -> list[str]:
-    """Advisory lint only: these warnings never grant permission to skip a check."""
+    """Advisory lint only: these warnings never grant permission to skip a check. Targets are looked up
+    at `head` (targets_tip gives the push branch's); an empty `head` skips that lookup."""
     out = []
-    files = _git(repo, "ls-tree", "-r", "--name-only", head) if repo else None
+    files = _git(repo, "ls-tree", "-r", "--name-only", head) if repo and head else None
     for check in check_list(v):
         reasons = []
         if re.search(r"\b[0-9a-fA-F]{40}\b", check):

@@ -370,6 +370,8 @@ def gh_problem(args: list[str], stdin_text: str | None, real: str | None = None)
 # --- git push (the pre-push hook) ----------------------------------------------------------------
 
 LS_REMOTE_S = 120   # listing the refs of the remote a push goes to
+GIT_S = 60   # one local git read of the scan
+BRANCH_EXCLUDES_MAX = 2000   # remote branch tips a scan stops at; past it, only the updated refs' tips
 
 
 # What a push sends, never a replace ref's stand-in (pack-objects ignores replace refs; git log would not)
@@ -381,8 +383,8 @@ _LOOKUP_ENV = {**_GIT_ENV, "GIT_NO_LAZY_FETCH": "1"}
 _HEX = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?")
 
 
-def _git(*args: str, **kw) -> subprocess.CompletedProcess:
-    return subprocess.run(["git", *args], capture_output=True, text=True, errors="replace", timeout=60,
+def _git(*args: str, timeout: float = GIT_S, **kw) -> subprocess.CompletedProcess:
+    return subprocess.run(["git", *args], capture_output=True, text=True, errors="replace", timeout=timeout,
                           env={**os.environ, **_LOOKUP_ENV}, **kw)
 
 
@@ -417,18 +419,41 @@ def _prefetch(revs: str) -> None:
         return
 
 
-def _remote_has(url: str) -> dict[str, str]:
-    """{object: type} of the objects the remote at `url` advertises (tags also peeled) that this
-    repository has: what a push never sends again. Read from the remote itself, not from
-    remote-tracking refs a run can set to anything. Raises ValueError when it cannot be listed."""
+def _remote_refs(url: str) -> dict[str, str]:
+    """{ref: object} the remote at `url` advertises (a tag's peeled object as `<tag>^{}`). Read from the
+    remote itself, not from remote-tracking refs a run can set to anything. Raises ValueError when it
+    cannot be listed."""
     r = subprocess.run(["git", "ls-remote", url], capture_output=True, text=True, errors="replace",
                        timeout=LS_REMOTE_S, stdin=subprocess.DEVNULL, env={**os.environ, **_LOOKUP_ENV})
     if r.returncode:
         raise ValueError(f"could not list what the remote has (git ls-remote exited {r.returncode})")
-    shas = {w[0] for line in r.stdout.splitlines() if (w := line.split())}
+    return {w[1]: w[0] for line in r.stdout.splitlines() if len(w := line.split()) == 2}
+
+
+def _stops(refs: dict[str, str], lines: list[str]) -> set[str]:
+    """The remote's objects the scan of a push stops at: the remote tips of the refs it updates, the
+    remote's HEAD and, unless there are more than BRANCH_EXCLUDES_MAX of them, its branch tips. Never
+    every advertised ref: a remote with tens of thousands of tags or review refs made the type lookup
+    outlast its timeout and the push sent nothing. Stopping at fewer of the remote's commits scans more,
+    never less, so it fails closed."""
+    out = {parts[3] for line in lines if len(parts := line.split()) == 4 and parts[3].strip("0")}
+    out |= {refs[r] for r in ("HEAD",) if r in refs}
+    heads = [o for r, o in refs.items() if r.startswith("refs/heads/")]
+    if len(heads) <= BRANCH_EXCLUDES_MAX:
+        out |= set(heads)
+    return out & set(refs.values())   # only what the remote itself says it has
+
+
+def _types(shas: set[str]) -> dict[str, str]:
+    """{object: type} of the `shas` this repository has: one `cat-file --batch-check`, its timeout
+    scaled with the count; a timeout raises (the push fails closed)."""
     if not shas:
         return {}
-    out = _git("cat-file", "--batch-check", input="\n".join(sorted(shas)) + "\n").stdout
+    try:
+        out = _git("cat-file", "--batch-check", input="\n".join(sorted(shas)) + "\n",
+                   timeout=GIT_S + len(shas) / 100).stdout
+    except subprocess.TimeoutExpired:
+        raise ValueError(f"could not read the types of the remote's {len(shas)} tips in time") from None
     return {w[0]: w[1] for line in out.splitlines() if len(w := line.split()) == 3}
 
 
@@ -436,10 +461,12 @@ def push_problem(lines: list[str], url: str, p=None) -> str | None:
     """Why the push whose pre-push input is `lines` (`<local ref> <sha> <remote ref> <sha>`), going to
     `url`, must not run: a commit message, an added line or a file path of a commit it sends, or the
     message of an annotated tag it sends, holds a leak, or a ref it updates would send a blob or a tree
-    (which this scan does not read). Run in the repository. Raises ValueError when what it sends cannot
-    be read."""
+    (which this scan does not read). Run in the repository. Reads only what the push sends: the commits
+    from its tips back to the remote's tips (_stops). Raises ValueError when what it sends cannot be
+    read."""
     hit = matcher(p)
-    has = _remote_has(url)
+    refs = _remote_refs(url)
+    has = set(refs.values())   # what a push never sends again
     tips = []
     for line in lines:
         parts = line.split()
@@ -462,7 +489,8 @@ def push_problem(lines: list[str], url: str, p=None) -> str | None:
         tips.append(obj)
     if not tips:
         return None
-    revs = "".join(f"{t}\n" for t in tips) + "".join(f"^{h}\n" for h, kind in has.items() if kind == "commit")
+    stops = _types(_stops(refs, lines))
+    revs = "".join(f"{t}\n" for t in tips) + "".join(f"^{h}\n" for h, kind in stops.items() if kind == "commit")
     return _log_problem(revs, hit)
 
 

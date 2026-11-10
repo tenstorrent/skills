@@ -372,6 +372,67 @@ def test_runs_git_push_passes_clean_and_already_pushed_commits_and_keeps_refusin
     assert "could not list what the remote has" in capsys.readouterr().err
 
 
+def test_git_push_scan_looks_up_only_the_remote_tips_it_stops_at_and_fails_closed_on_a_timeout(
+        env, tmp_path, monkeypatch, capsys):
+    """A remote with many refs (here tags; reported: about 49k) made the scan's one type lookup of
+    every advertised object outlast its timeout, and the push sent nothing. It now looks up only what it
+    stops at: the remote tips of the refs it updates, the remote's HEAD and its branch tips (only the
+    first two past BRANCH_EXCLUDES_MAX, which scans more, never less). Its timeout grows with that count;
+    a timeout still refuses."""
+    import io
+    from ttp import outscan
+    p, repo, push = _push_run(env, tmp_path, monkeypatch)
+    origin = tmp_path / "leak-origin.git"
+    main = _git_out(repo, "rev-parse", "main")
+    for n in range(40):   # tags the scan must not look up, each on its own commit
+        _commit(repo, f"t{n}.txt", f"tag {n}\n")
+        _git_out(repo, "tag", f"t{n}")
+    _git_out(repo, "push", "-q", "--no-verify", "origin", "--tags")
+    tagged = {_git_out(repo, "rev-parse", f"t{n}") for n in range(40)}
+    _git_out(repo, "checkout", "-q", "-B", "old", "main")
+    _commit(repo, "old.txt", f"{_OUT_SHAPE}\n")   # a leak the remote already has, on another branch
+    subprocess.run(["git", "-C", str(repo), "push", "-q", "--no-verify", "origin", "old"], check=True,
+                   capture_output=True, env={k: v for k, v in os.environ.items() if k != "TTP_TASK"})
+    old = _git_out(repo, "rev-parse", "old")
+    _git_out(repo, "checkout", "-q", "-B", "work", "old")
+    _commit(repo, "new.txt", "clean\n")
+    work = _git_out(repo, "rev-parse", "work")
+    monkeypatch.chdir(repo)
+    looked, real = [], outscan._git
+
+    def spy(*args, **kw):
+        if args[:2] == ("cat-file", "--batch-check"):
+            looked.append((set(kw["input"].split()), kw["timeout"]))
+        return real(*args, **kw)
+    monkeypatch.setattr(outscan, "_git", spy)
+    lines = [f"refs/heads/work {work} refs/heads/work {'0' * 40}"]
+    # A new branch on a branch the remote has: it stops at that branch's tip, reads none of the tags.
+    assert outscan.push_problem(lines, str(origin), p) is None
+    assert looked == [({main, old}, outscan.GIT_S + 2 / 100)], looked
+    assert not tagged & looked[0][0]
+    # An update stops at the remote tip of the ref it updates.
+    _git_out(repo, "push", "-q", "--no-verify", "origin", "work")
+    _commit(repo, "more.txt", "clean\n")
+    more, looked[:] = _git_out(repo, "rev-parse", "work"), []
+    assert outscan.push_problem([f"refs/heads/work {more} refs/heads/work {work}"], str(origin), p) is None
+    assert looked and work in looked[0][0] and not tagged & looked[0][0]
+    # Past BRANCH_EXCLUDES_MAX the branch tips are left out: it reads further back and finds the old leak.
+    monkeypatch.setattr(outscan, "BRANCH_EXCLUDES_MAX", 0)
+    looked[:] = []
+    lines = [f"refs/heads/next {more} refs/heads/next {'0' * 40}"]   # work itself is on the remote now
+    why = outscan.push_problem(lines, str(origin), p)
+    assert why and "GitHub token shape" in why and looked == [({main}, outscan.GIT_S + 1 / 100)], (why, looked)
+    # A lookup that runs out of time refuses the push (fails closed).
+    def slow(*args, **kw):
+        if args[:2] == ("cat-file", "--batch-check"):
+            raise subprocess.TimeoutExpired(["git", *args], kw["timeout"])
+        return real(*args, **kw)
+    monkeypatch.setattr(outscan, "_git", slow)
+    monkeypatch.setattr(sys, "stdin", io.StringIO(lines[0] + "\n"))
+    assert outscan.pre_push(["origin", str(origin)]) == 1
+    assert "could not read the types of the remote's 1 tips in time" in capsys.readouterr().err
+
+
 def _wrapped_git(repo, tmp_path, *args):
     """`git <args>` in `repo` in a run, through the harness's git wrapper (as _push_run's push does)."""
     env = {**os.environ, "TTP_PYTHON": sys.executable, "TTP_RUN_DIR": str(tmp_path / "run")}
