@@ -4288,8 +4288,9 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
             if isinstance(e, subprocess.TimeoutExpired) and wrote_before is not None and actdefer.deferrable(
                     t, deferred_tries, db.conn.total_changes != wrote_before):
                 act = dict(order[k][1])
-                new_ask = t == "task_update" and str(act.get("waits_on") or "").strip().lower() == \
-                    f"ask:{anchors.NEW_ASK}"
+                kind, _, value = str(act.get("waits_on") or "").partition(":")   # as _hold_anchor reads it
+                new_ask = t == "task_update" and (kind.strip().lower(), value.strip().lower()) == (
+                    "ask", anchors.NEW_ASK)
                 if new_ask and turn_asks:   # this turn's newest ask so far, as _hold_anchor reads it
                     act["waits_on"], new_ask = f"ask:{turn_asks[-1][1]}", False
                 item, note = actdefer.defer(db, act, default_chat, str(e), deferred_tries, messages, user_turn)

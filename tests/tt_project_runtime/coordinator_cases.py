@@ -24253,7 +24253,7 @@ def test_a_deferred_task_update_on_ask_new_waits_on_the_ask_its_turn_sent(env, m
             raise subprocess.TimeoutExpired(["git", "merge-base"], 0)
         return real(*a, **k)
     monkeypatch.setattr(coord, "_landed_as_deps", slow)
-    upd = {"type": "task_update", "id": tid, "status": "blocked", "waits_on": "ask:new", "text": "needs the user"}
+    upd = {"type": "task_update", "id": tid, "status": "blocked", "waits_on": "Ask: new", "text": "needs the user"}
     ask = {"type": "ask_user", "text": "Which credential should the box use?", "severity": "normal",
            "blocking": "access", "recommendation": "token"}
     assert coord.apply(p, [upd, ask]) == []
