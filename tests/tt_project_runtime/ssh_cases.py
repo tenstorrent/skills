@@ -431,7 +431,7 @@ def _wrapper_env(tmp_path, **extra):
                           "TMPDIR": str(tmp_path), **{k: str(v) for k, v in extra.items()}}
 
 
-def _alive(pid):
+def _ssh_alive(pid):
     import os
     try:
         os.kill(pid, 0)
@@ -440,7 +440,7 @@ def _alive(pid):
     return True
 
 
-def _wait_for(path, s=10.0):
+def _ssh_pid_from(path, s=10.0):
     import time
     end = time.monotonic() + s
     while time.monotonic() < end:
@@ -459,12 +459,12 @@ def test_a_sigterm_to_the_ssh_wrapper_stops_the_real_ssh_at_once(tmp_path):
     w, e = _wrapper_env(tmp_path, FAKE_PID=tmp_path / "pid", FAKE_SLEEP=30)
     proc = subprocess.Popen([str(w), "host-a", "sleep 30"], env=e)
     try:
-        pid = _wait_for(tmp_path / "pid")
+        pid = _ssh_pid_from(tmp_path / "pid")
         assert pid == proc.pid                     # exec: no wrapper process between the caller and ssh
         t = time.monotonic()
         proc.send_signal(signal.SIGTERM)
         proc.wait(timeout=2)
-        assert time.monotonic() - t < 2 and not _alive(pid)
+        assert time.monotonic() - t < 2 and not _ssh_alive(pid)
     finally:
         proc.kill()
         proc.wait()
@@ -477,8 +477,8 @@ def test_a_timeout_kill_of_the_ssh_wrapper_leaves_no_real_ssh_running(tmp_path):
     w, e = _wrapper_env(tmp_path, FAKE_PID=tmp_path / "pid", FAKE_SLEEP=30)
     with pytest.raises(subprocess.TimeoutExpired):
         subprocess.run([str(w), "host-a", "sleep 30"], env=e, timeout=1)
-    pid = _wait_for(tmp_path / "pid")
-    assert not _alive(pid), f"real ssh {pid} outlived the kill"
+    pid = _ssh_pid_from(tmp_path / "pid")
+    assert not _ssh_alive(pid), f"real ssh {pid} outlived the kill"
 
 
 def test_the_ssh_wrapper_keeps_its_socket_path_under_the_unix_limit(tmp_path):
