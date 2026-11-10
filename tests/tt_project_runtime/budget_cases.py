@@ -5311,6 +5311,9 @@ def test_ready_wait_cause_maps_each_start_hold():
     assert rw.cause("device", None, open_, True) == rw.cause("resource", None, open_, True) == "resource"
     assert rw.cause("net", None, open_, True) == "other"
     assert rw.cause("its own ttp checks run is queued", None, open_, True) == "checks"
+    # A review held by its own pre-review checks: _start_hold answers "held" with the precheck words.
+    assert rw.cause("held", "its pre-review checks run", open_, True, held=True, precheck=True) == "checks"
+    assert rw.cause("held", "the disk guard", open_, True, held=True) == "other"
 
 
 def test_ready_wait_sightings_split_the_wait_by_cause_and_gaps_are_unrecorded():
@@ -5324,7 +5327,10 @@ def test_ready_wait_sightings_split_the_wait_by_cause_and_gaps_are_unrecorded():
     assert w == {"since": 940.0, "causes": {"project_cap": 180.0, "unrecorded": 480.0, "dispatch": 30.0}}
     assert 7 not in acc
     # Never seen ready: a check 40 s ago bounds the wait, which is dispatch's; no recent check: unrecorded.
-    assert rw.take({}, 8, 2000.0, 1500.0, 1960.0) == {"since": 1960.0, "causes": {"dispatch": 40.0}}
+    assert rw.take({}, 8, 2000.0, 1500.0, 1960.0, set()) == {"since": 1960.0, "causes": {"dispatch": 40.0}}
+    # A reset check (daemon start, settling, a gap: no ready set) or one that saw it ready bounds nothing.
+    assert rw.take({}, 8, 2000.0, 1500.0, 1960.0, None) == {"since": 1500.0, "causes": {"unrecorded": 500.0}}
+    assert rw.take({}, 8, 2000.0, 1500.0, 1960.0, {8}) == {"since": 1500.0, "causes": {"unrecorded": 500.0}}
     assert rw.take({}, 9, 2000.0, 1500.0, None) == {"since": 1500.0, "causes": {"unrecorded": 500.0}}
     acc = {1: {}, 2: {}}
     rw.prune(acc, {2})
@@ -5366,3 +5372,40 @@ def test_stats_ready_wait_reports_recorded_and_rebuilt_waits_by_cause(env, capsy
     cli.main(["stats", "--ready-wait", "--projects", "demo,nosuch", "--json"])
     got = json.loads(capsys.readouterr().out)
     assert got["demo"]["runs"] == 3 and "error" in got["nosuch"]
+
+
+def test_ready_wait_rebuild_starts_a_first_run_at_its_requeue_and_skips_a_silent_import(env):
+    from ttp import readywait as rw
+    p = make(env)
+    now = time.time()
+    ins = "INSERT INTO runs(task,role,provider,started,ended,status,note,boot_id) VALUES(?,?,?,?,?,?,?,?)"
+    ev = "INSERT INTO events(ts,source,kind,text,task) VALUES(?,?,?,?,?)"
+    # Blocked for a day, then requeued 600 s before its first run: the wait is 600 s, not a day.
+    a = p.db.add_task("a", "s")
+    p.db.x("UPDATE tasks SET created=? WHERE id=?", (now - 90000, a))
+    p.db.x(ev, (now - 89000, "daemon", "task_blocked", "b", a))
+    p.db.x(ev, (now - 2600, "daemon", "task_requeued", "q", a))
+    p.db.x(ins, (a, "worker", "claude", now - 2000, now - 1900, "done", None, "x"))
+    # Made 20 days ago with no record until a hold event 3 h before its run: no known ready time.
+    b = p.db.add_task("b", "s")
+    p.db.x("UPDATE tasks SET created=? WHERE id=?", (now - 20 * 86400, b))
+    p.db.x(ev, (now - 3 * 3600, "daemon", "dispatch_hold", "h", b))
+    p.db.x(ins, (b, "worker", "claude", now - 3000, now - 2900, "done", None, "x"))
+    s = rw.report(p.db.q, now - 86400, now, p.state)
+    assert (s["runs"], s["no_ready_time"]) == (2, 1), s
+    assert s["wait"]["n"] == 1 and abs(s["wait"]["max_s"] - 600.0) < 1, s
+    # The live first sighting (ready_since) is raised to the requeue too.
+    p.db.x("UPDATE tasks SET status='queued' WHERE id=?", (a,))
+    assert rw.ready_since(p.db, p.db.task(a)) >= now - 2600 - 1
+
+
+def test_a_run_started_on_the_daemon_s_first_tick_records_an_unrecorded_not_a_dispatch_wait(env, monkeypatch):
+    from ttp.daemon import Daemon
+    p = make(env)
+    monkeypatch.setenv("TTP_FAKE_RESULT", json.dumps({"status": "done", "summary": "ok"}))
+    tid = p.db.add_task("quick", "s", kind="work", tier="light", origin="user")
+    p.db.x("UPDATE tasks SET created=created-3600 WHERE id=?", (tid,))   # ready an hour before the start
+    d = Daemon(p.base)
+    assert _run_until(d, p, lambda: p.db.one("SELECT id FROM runs WHERE task=?", (tid,)))
+    rw = json.loads(p.db.one("SELECT note FROM runs WHERE task=?", (tid,))["note"])["ready_wait"]
+    assert "dispatch" not in rw["causes"] and rw["causes"].get("unrecorded", 0) >= 3500, rw

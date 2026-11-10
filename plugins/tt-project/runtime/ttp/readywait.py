@@ -16,9 +16,12 @@ Going forward the daemon records it on the run row itself (runs.note "ready_wait
 ready and the seconds each cause held it, as the ready check (daemon.check_unstarted, every minute)
 saw it): no write of its own. Runs that started before that record get a reconstruction from the
 task's records (as unstarted.ready_since) and events: their cause is the one the last
-ready_not_started, queue_wait or dispatch_hold event of the wait names, else "unrecorded"; a resumed
-wait (a run after a `waiting` hand-off) with no requeue event has no recorded ready time and is only
-counted (no_ready_time). Separately: the project's host checks slot waits (checkcap.wait_records),
+ready_not_started, queue_wait or dispatch_hold event of the wait names, else "unrecorded". A ready time
+is raised to the task's latest requeue, unblock or block before the start (REQUEUE). Counted only
+(no_ready_time), with no recorded ready time: a resumed wait (a run after a `waiting` hand-off) with no
+requeue event, and a first run whose rebuilt ready time is more than FIRST_EVENT_S before the task's
+first event in this db (imported or parked with no record: a ready held task gets a hold event within
+minutes, so that silence was not a wait). Separately: the project's host checks slot waits (checkcap.wait_records),
 which a running or waiting task spends after its start."""
 from __future__ import annotations
 
@@ -32,12 +35,32 @@ LABELS = {"project_cap": "project cap", "machine_limit": "machine-wide limit", "
           "budget_gate": "budget gate", "resource": "resource", "dispatch": "dispatch (free place)",
           "other": "other hold", "unrecorded": "unrecorded"}
 GAP_S = 180.0   # a gap between ready checks longer than this (daemon stopped, host asleep): no cause seen
-REQUEUE = ("task_requeued", "start_when_passed", "push_requeued")
+REQUEUE = ("task_requeued", "start_when_passed", "push_requeued", "hold_released", "task_blocked")
+FIRST_EVENT_S = 3600.0   # a rebuilt first-run ready time this long before the task's first event: unknown
 
 
-def cause(why, held_by: str | None, gate, free: bool, held: bool = False) -> str:
+def _requeued(q, tid: int, lo: float, hi: float) -> float | None:
+    """The latest requeue, unblock or block of task `tid` in [lo, hi]: it was not ready before it."""
+    row = q(f"SELECT MAX(ts) ts FROM events WHERE task=? AND kind IN ({','.join('?' * len(REQUEUE))}) "
+            "AND ts>=? AND ts<=?", (tid, *REQUEUE, lo, hi))
+    return float(row[0]["ts"]) if row and row[0]["ts"] is not None else None
+
+
+def ready_since(db, task: dict) -> float:
+    """unstarted.ready_since, raised to the task's latest requeue, unblock or block: a task that sat
+    blocked or deferred was not ready then. (unstarted's own alert timing is left as it is.)"""
+    from . import unstarted
+    at = unstarted.ready_since(db, task)
+    rq = _requeued(db.q, task["id"], at, time.time())
+    return max(at, rq) if rq is not None else at
+
+
+def cause(why, held_by: str | None, gate, free: bool, held: bool = False, precheck: bool = False) -> str:
     """The cause of `why` (daemon._start_hold's answer, or _own_checks_wait's words) for one ready task;
-    `free`: a worker place of its provider is free; `held`: check_unstarted holds it."""
+    `free`: a worker place of its provider is free; `held`: check_unstarted holds it; `precheck`: a review
+    whose own pre-review checks run (_start_hold answers "held" for it too)."""
+    if precheck:
+        return "checks"
     if why is None:
         if free:
             return "checks" if held else "dispatch"   # held with nothing else: its own pre-review checks
@@ -77,10 +100,11 @@ def prune(acc: dict, ready: set) -> None:
         del acc[tid]
 
 
-def take(acc: dict, tid: int, now: float, since, last_check: float | None) -> dict:
+def take(acc: dict, tid: int, now: float, since, last_check: float | None, last_ready: set | None = None) -> dict:
     """The run note's "ready_wait" for task `tid` starting now: {"since", "causes"} (seconds, rounded).
-    Without a sight of it, a ready check within GAP_S bounds its ready time (it was not ready then) and
-    the wait is dispatch's; with no such check the wait is unrecorded."""
+    Without a sight of it, a ready check within GAP_S that looked (`last_ready`, its ready ids, not None)
+    and did not find it ready bounds its ready time and the wait is dispatch's; else the wait is
+    unrecorded (a reset check after a daemon start, settling or a gap evaluates nothing)."""
     e = acc.pop(tid, None)
     causes: dict[str, float] = {}
 
@@ -97,7 +121,8 @@ def take(acc: dict, tid: int, now: float, since, last_check: float | None) -> di
         add(e["cause"] if tail <= GAP_S else "unrecorded", tail)
     else:
         start = float(since() if callable(since) else since)
-        recent = last_check is not None and 0 <= now - last_check <= GAP_S
+        recent = last_check is not None and last_ready is not None and tid not in last_ready \
+            and 0 <= now - last_check <= GAP_S
         if recent:
             start = max(start, last_check)
         add("dispatch" if recent else "unrecorded", now - start)
@@ -137,12 +162,11 @@ def _rebuild(q, r: dict) -> tuple[float | None, dict]:
              (r["task"], r["id"]))
     if prev:
         ended = float(prev[0]["ended"])
-        rq = q(f"SELECT MAX(ts) ts FROM events WHERE task=? AND kind IN ({','.join('?' * len(REQUEUE))}) "
-               "AND ts>=? AND ts<=?", (r["task"], *REQUEUE, ended, started))
+        rq = _requeued(q, r["task"], ended, started)
         waited = q("SELECT 1 FROM events WHERE task=? AND kind='task_waiting' AND ts>=? AND ts<=? LIMIT 1",
                    (r["task"], ended - 30, started))
-        if rq and rq[0]["ts"] is not None:
-            ready = float(rq[0]["ts"])
+        if rq is not None:
+            ready = rq
         elif waited:
             return None, {}   # woken from its own wait: when the wait ended is not recorded
         else:
@@ -162,6 +186,12 @@ def _rebuild(q, r: dict) -> tuple[float | None, dict]:
                (r["task"], started))
         if sw and sw[0]["ts"] is not None:
             ready = max(ready, float(sw[0]["ts"]))
+        rq = _requeued(q, r["task"], ready, started)
+        if rq is not None:
+            ready = max(ready, rq)
+        first = q("SELECT MIN(ts) ts FROM events WHERE task=? AND ts<=?", (r["task"], started))
+        if first and first[0]["ts"] is not None and float(first[0]["ts"]) - ready > FIRST_EVENT_S:
+            return None, {}   # silent long before its first event (imported, parked): no known ready time
     ready = min(ready, started)
     ev = q("SELECT kind, text, data FROM events WHERE task=? AND kind IN "
            "('ready_not_started','queue_wait','dispatch_hold') AND ts>=? AND ts<=? ORDER BY id DESC LIMIT 1",

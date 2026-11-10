@@ -3975,7 +3975,8 @@ class Daemon:
             try:   # how long it waited ready, by hold cause (readywait.py; ttp stats --ready-wait)
                 note = {**(note or {}), "ready_wait": readywait.take(
                     self.__dict__.setdefault("_ready_acc", {}), task["id"], time.time(),
-                    lambda: unstarted.ready_since(self.p.db, task), getattr(self, "_unstarted_checked", None))}
+                    lambda: readywait.ready_since(self.p.db, task), getattr(self, "_unstarted_checked", None),
+                    getattr(self, "_unstarted_ready", None))}
             except Exception as e:   # a wait record never stops a start
                 log(self.p, f"task {task['id']}: ready wait not recorded: {e}")
         db = self.p.db
@@ -10489,11 +10490,11 @@ class Daemon:
             hot = urgent.extra_ok(t, now) or tid in ctx["owners"]
             slots_only = hot and why == "gate" and tid in ctx.get("full", {}) and wait_s > 0 and self._start_hold(
                 t, prov, dict(ctx, busy={}, holds={}, full={}, branch={}, full_why={})) is None
+            pre = t["kind"] == "review" and self._precheck_holds(t, now)   # its own pre-review checks run
             if ((why in self.SKIP_HOLDS or not free) and not (hot and (slots_only or why is None))) \
-                    or (t["kind"] == "review" and self._precheck_holds(t, now)) \
-                    or (why is None and (why := self._own_checks_wait(t))):
-                self._ready_note(acc, t, readywait.cause(why, ctx.get("held_by", {}).get(tid), gate, free, held=True),
-                                 now, was_ready, last)
+                    or pre or (why is None and (why := self._own_checks_wait(t))):
+                self._ready_note(acc, t, readywait.cause(why, ctx.get("held_by", {}).get(tid), gate, free, held=True,
+                                                         precheck=pre), now, was_ready, last)
                 self._unstarted_held.add(tid)
                 obligations._retire(db, now, f"held: {why or 'no free slot'}", fp)
                 continue
@@ -10731,7 +10732,7 @@ class Daemon:
         """readywait.note for one ready task; on its first sight it became ready by its records
         (unstarted.ready_since), and not before the previous check when that one did not find it ready."""
         def since() -> float:
-            at = unstarted.ready_since(self.p.db, t)
+            at = readywait.ready_since(self.p.db, t)
             return max(at, last) if was_ready is not None and t["id"] not in was_ready else at
         readywait.note(acc, t["id"], c, now, since)
 
