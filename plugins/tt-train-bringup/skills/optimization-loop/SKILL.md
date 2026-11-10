@@ -48,7 +48,9 @@ the first rung. Glue, layout and small owned ops come in only when deleting them
 chain whose measured cost beats the kernel's expected gain.
 
 1. Measure. A cooled MFU run without the profiler, telemetry sampler running, gives wall ms/step,
-   MFU at the nominal peak, the per-chip settled clock and the critical chip. Tracy runs at four
+   MFU at the nominal peak, the per-chip settled clock and the critical chip. On a mesh, every chip
+   is profiled, not one: the step is as slow as its slowest chip, and the chip whose device time
+   plus collective wait is largest is named as the critical chip in the ranked table. Tracy runs at four
    doubling depths of whole blocks (real shapes, warm-up steps excluded, op-support count sized for
    the op count) give per-op device cycles, input shapes with padding, and core count; fit per-block
    and fixed cost and project to the full depth as in the
@@ -56,7 +58,8 @@ chain whose measured cost beats the kernel's expected gain.
 2. Attribute. Walk the op sequence of one step (forward, recompute, backward, optimiser) and map
    every op to the line of model code that emitted it. For the top three ops also map to the kernel:
    which program factory and kernel files compile, the sync mode, the core grid, the % of peak.
-3. Classify every op into one of the five classes below.
+3. Classify every op into one of the six classes below (five on one chip; collectives are the
+   sixth on a mesh).
 4. Cost every item in wall ms/step at full depth: microseconds per op × ops per layer × layers ×
    multiplicity, where multiplicity counts forward, recompute and the backward mirror, with Tracy's
    cycles converted at the delivered clock. Group ops into chains between two real ops and cost the
@@ -98,7 +101,8 @@ chain whose measured cost beats the kernel's expected gain.
 
 ## Op classes
 
-Every op in the profile falls into one of five classes. The class, not the op's size, determines how
+Every op in the profile falls into one of six classes (the sixth, collectives, exists only on a
+mesh). The class, not the op's size, determines how
 the op shows up, which fix applies and how much time it can return. Step time is the sum of the
 classes, but only the first is the model; the rest exists because of how we expressed it.
 
@@ -136,6 +140,19 @@ step time minus the sum of device kernel durations (converted to the delivered c
 equals the clock ratio is the power cap, not dispatch). Action: fewer ops (every overhead op removed also
 removes its launch), trace capture of the static part of the step, no host syncs inside the step.
 Ceiling: the device time itself.
+
+Collectives are the inter-chip work of a mesh layout: the DP gradient all-reduce, TP all-reduces
+and all-gathers in the forward and their mirrors in the backward, reduce-scatters, broadcasts.
+They show as CCL ops in each chip's profile (all-gather, reduce-scatter, all-reduce and their
+fabric workers) and as time a chip spends waiting for the slowest one. Cost them like any other
+item (microseconds per call x calls per block x blocks x multiplicity) and next to their floor
+(bytes at the measured link bandwidth). Actions, cheapest first: overlap with the backward (start
+a layer's gradient all-reduce as soon as its gradients exist, while the earlier layers' backward
+runs), bucketing (many small gradient all-reduces become a few large ones, so the per-call
+latency is paid once), a cheaper layout (DP instead of TP when the plan's other layout was close;
+sequence parallel so a TP all-reduce becomes a reduce-scatter plus all-gather around the norm),
+and fewer bytes (bf16 instead of fp32 on the wire where the numerics allow, reducing only
+trainable gradients). Ceiling: the part that cannot overlap, at the link bandwidth.
 
 ## Rules
 
@@ -396,6 +413,6 @@ failed to close the gap (a sweep of a library kernel's program configs is tuning
 Collectives count as a remaining item until overlap with compute was tried. Without these the loop
 is not closed; the next iteration starts. The README then holds the full result table and
 `doc/perf_analysis.md` the final ranked table, the gap decomposition (step time = roofline + math inefficiency + overhead
-+ dispatch), memory peak, and every rejected candidate with evidence. PCC harness and loss match
++ dispatch, plus a collective term on a mesh: collective time not hidden behind compute), memory peak, and every rejected candidate with evidence. PCC harness and loss match
 still pass on the final path. `doc/optimization/README.md` and `work_log.md` record commands,
 commits, before/after per iteration and artefacts. `stage-review` returns `clean-pass`.
