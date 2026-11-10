@@ -428,10 +428,7 @@ def find(p, boot: str | None, boot_at: float | None, last_heartbeat: float | Non
             window = commands = None
             if ask:
                 k = ask(kernel_args())
-                ends = [e["ts"] for e in _entries(got[1]) if e["ts"] is not None]
-                at = marker_at(got[1]) or (max(ends) if ends else None)
-                if fault := kernel_fault(k[1] if k and k[0] == 0 else None, at):
-                    kern = {"kernel": fault}
+                kout = k[1] if k and k[0] == 0 else None
                 c = ask(command_args())
                 commands = c[1] if c and c[0] == 0 else None
                 args = window_args(marker_at(got[1]))
@@ -439,6 +436,12 @@ def find(p, boot: str | None, boot_at: float | None, last_heartbeat: float | Non
                 window = w[1] if w and w[0] == 0 else None
                 if window is not None and "-r" in args:
                     window = "\n".join(reversed(window.splitlines()))   # read newest first
+                # The marker's time, else the boot's real end: the newest line of any read (after a
+                # crash the marker read's last line can be an old logind one, hours before the panic).
+                ends = [e["ts"] for o in (got[1], kout, commands, window) for e in _entries(o or "")
+                        if e["ts"] is not None]
+                if fault := kernel_fault(kout, marker_at(got[1]) or (max(ends) if ends else None)):
+                    kern = {"kernel": fault}
             seen = {}
 
             def own(unit):   # once per unit: its 'Starting' and 'Started' lines both ask

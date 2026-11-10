@@ -1371,6 +1371,24 @@ def test_a_kernel_fault_counts_only_in_the_window_before_the_shutdown(dt, named)
     assert initiator.kernel_fault(oom + "\n", None).startswith("out of memory"), "alone, it is the newest line"
 
 
+@pytest.mark.parametrize("panic_dt,named", [(0, True), (-3 * 3600, False)])
+def test_a_crash_with_no_shutdown_marker_anchors_the_kernel_window_to_the_boots_end(monkeypatch, panic_dt, named):
+    """No marker: the window ends at the newest line of any read, not the marker read's old logind line."""
+    from ttp import initiator
+    marker = _j(-3 * 3600, "New session 7 of user someuser.", "systemd-logind.service", "systemd-logind") + "\n"
+    kern = "\n".join([_j(panic_dt - 30, "watchdog: BUG: soft lockup - CPU#3 stuck for 22s!", ident="kernel"),
+                      _j(panic_dt, "Kernel panic - not syncing: Fatal exception", ident="kernel"),
+                      *([_j(0, "e1000e: link down", ident="kernel")] if panic_dt else [])]) + "\n"
+
+    def run(boot, extra=(), sudo=False):     # one answer per read: `journal=` would answer all the same
+        extra = list(extra)
+        return (0, kern if extra == initiator.kernel_args() else marker if extra == initiator.marker_args()
+                else "", "")
+    monkeypatch.setattr(initiator, "run_journal", run)
+    got = initiator.find(None, "boot-0", None, None)
+    assert got.get("kernel", "").startswith("kernel panic: ") if named else "kernel" not in got, got
+
+
 def test_the_kernel_read_selects_kernel_and_oomd_lines_of_the_ended_boot(env, monkeypatch):
     from ttp import initiator
     p = make(env)
