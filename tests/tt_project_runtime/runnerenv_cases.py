@@ -314,3 +314,30 @@ def test_a_pinned_env_fault_closes_once_its_env_is_made_or_its_lock_is_gone(tmp_
     assert envfault._still(f) == f, "not made: still open, the probe never waits for a build"
     lock.unlink()
     assert envfault._still(f) is None
+
+
+def test_runnerenv_key_skips_a_lock_line_for_another_platform_so_its_env_is_reused(tmp_path, monkeypatch):
+    # PyYAML is pinned for macOS only (its Pythons ship none; Linux distributions' do): adding that
+    # line must not change a Linux host's key, or a lab box with no package index could never rebuild.
+    from ttp import runnerenv
+    base = "pytest==8.4.2 --hash=sha256:aa\n# a comment; sys_platform == \"darwin\"\nexceptiongroup==1.3.1 ; python_version < \"3.11\"\n"
+    mac = ('pyyaml==6.0.3 ; sys_platform == "darwin" \\\n    --hash=sha256:bb \\\n    --hash=sha256:cc\n'
+           "colorama==0.4.6 ; sys_platform=='win32' --hash=sha256:dd\n")
+    both = "pyyaml==6.0.3 ; sys_platform == \"darwin\" and python_version >= \"3.9\"\n"
+    notmac = "pyyaml==6.0.3 ; sys_platform != 'darwin'\n"
+    for host, kept in (("linux", ""), ("darwin", mac.split("colorama")[0])):
+        monkeypatch.setattr(runnerenv.sys, "platform", host)
+        assert runnerenv._for_host((base + mac).encode()) == (base + kept).encode(), host
+        assert (runnerenv.key_of((base + mac).encode(), "/usr/bin/python3")
+                == runnerenv.key_of(base.encode(), "/usr/bin/python3")) == (host == "linux")
+        assert runnerenv._for_host((base + both).encode()) == (base + both).encode(), "a compound marker always counts"
+        assert runnerenv._for_host((base + notmac).encode()) == (base + notmac * (host == "linux")).encode()
+    # The shipped lock: on macOS it pins PyYAML (the smoke's yaml-importing tests collect there), with a
+    # hash for each macOS CPython wheel; on Linux it reads exactly as without that line.
+    text = runnerenv.LOCK.read_bytes()
+    monkeypatch.setattr(runnerenv.sys, "platform", "darwin")
+    yaml_line = [ln for ln in runnerenv._for_host(text).decode().splitlines() if ln.startswith("pyyaml==")]
+    assert len(yaml_line) == 1 and 'sys_platform == "darwin"' in yaml_line[0] and yaml_line[0].count("--hash=sha256:") >= 2
+    monkeypatch.setattr(runnerenv.sys, "platform", "linux")
+    assert b"pyyaml" not in runnerenv._for_host(text).lower()
+    assert runnerenv._for_host(text) == text.replace((yaml_line[0] + "\n").encode(), b"")

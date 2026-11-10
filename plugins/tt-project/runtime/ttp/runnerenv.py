@@ -6,7 +6,8 @@ upgraded in the user site (~/.local, `pip install --user`) never changes what a 
 A check runs with PYTHONNOUSERSITE=1 (the user site never loads), PIP_USER unset, and PATH fronted
 by a harness-owned virtualenv's bin, so `python3`, `python3 -m pytest` and `pytest` resolve there.
 The virtualenv sees the system's site-packages (packages the OS installs, such as PyYAML) below its
-own, so its pinned pytest wins over any other.
+own, so its pinned pytest wins over any other. macOS Pythons ship no PyYAML, so LOCK pins it for
+sys_platform darwin only; a line for another platform leaves this host's env key unchanged (_for_host).
 
 Its packages come from a lock: `checks.python_lock` (a requirements file with exact pins, hashes
 where possible; relative to the checkout) when the project sets it, else LOCK beside this file
@@ -147,9 +148,32 @@ def _base_python() -> str:
 
 
 def key_of(text: bytes, base: str) -> str:
-    """The env's key: the lock's content, and the base interpreter's path, version and machine."""
+    """The env's key: the lock's content as this host reads it (_for_host), and the base interpreter's
+    path, version and machine."""
     ident = f"{os.path.realpath(base)}\n{sys.version}\n{platform.machine()}\n".encode()
-    return hashlib.sha256(ident + text).hexdigest()[:16]
+    return hashlib.sha256(ident + _for_host(text)).hexdigest()[:16]
+
+
+_PLATFORM = re.compile(r"""\s*sys_platform\s*(==|!=)\s*["']([^"']*)["']\s*""")
+
+
+def _for_host(text: bytes) -> bytes:
+    """`text` without the requirements pip skips on this host for a lone `sys_platform` marker, each
+    with its continuation lines: a package pinned for one platform only (PyYAML on macOS, whose
+    Pythons ship none while Linux distributions do) leaves the other platforms' keys as they were, so
+    a host that cannot build a new env (a lab box without a package index) keeps the one it has."""
+    out, lines, i = [], text.splitlines(keepends=True), 0
+    while i < len(lines):
+        j = i
+        while lines[j].rstrip(b"\r\n").endswith(b"\\") and j + 1 < len(lines):
+            j += 1
+        req = b"".join(ln.rstrip(b"\r\n").rstrip(b"\\") for ln in lines[i:j + 1]).decode(errors="replace")
+        req = re.split(r"\s--hash[=\s]", req, maxsplit=1)[0]
+        m = None if req.lstrip().startswith("#") or ";" not in req else _PLATFORM.fullmatch(req.split(";", 1)[1])
+        if not m or (sys.platform == m.group(2)) == (m.group(1) == "=="):
+            out += lines[i:j + 1]
+        i = j + 1
+    return b"".join(out)
 
 
 def _clean(env: dict) -> dict:
