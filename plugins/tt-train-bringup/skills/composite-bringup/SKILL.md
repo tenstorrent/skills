@@ -45,6 +45,12 @@ loss log, fewer than N steps, or a NaN is a failed gate, never an empty file to 
 Never shrink hidden size, head counts, sequence length or weight shapes to make evidence easier to
 collect; small shapes are for debugging only.
 
+Build and verify one module or layer kind per scoped subagent (the plan's inventory rows for it,
+the layout contract, the freeze map entries, the harness command, the PCC table format to return);
+the main agent keeps the plan and the PCC summary table only. The composite README states, per
+module, what exists, its PCC and relative error, and the known layout cost in one line each, in the
+[loop's report style](../optimization-loop/SKILL.md#report-style).
+
 ## Baseline measurement
 
 Before leaving this phase, take the first measurement so the loop has a baseline: a cooled MFU run

@@ -69,6 +69,19 @@ target and the hard constraints are the scope, and "try both" means both are bui
 The agent ends its turn only when the gate is met or it is blocked on a decision only the user can
 make (a hardware limit, a constraint change).
 
+## Context budget
+
+The main agent is the state holder, not the worker. It keeps the hard constraints, the gates, the
+result and ranked tables and the next candidate, and delegates every unit of work to a scoped
+subagent (authorised by the goal prompts): one layer kind or module in the composite phase, one or
+two candidates per iteration in the loop, every stage review. A long main context gets compressed
+and its reasoning degrades, so logs, profiles, review reports and kernel sources are read by the
+subagent and come back as rows and one-line verdicts. The brief carries everything the subagent
+needs (candidate and number, constraints, exact commands, files it may touch, what was ruled out,
+return format); what comes back is the row, the SHA and the verdict. Independent analysis and
+code work may run in parallel; device runs are serialised. Reports follow the loop's report
+style: what changed, by how much, in or out.
+
 ## Execution
 
 From the target tt-metal checkout, first perform a no-model dry run:
