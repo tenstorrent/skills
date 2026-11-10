@@ -19817,7 +19817,7 @@ def test_own_push_from_another_repository_compares_with_its_own_default_branch(e
     assert heads(origin) == ["proj"] and sorted(heads(lib_origin)) == ["trunk", "ttp/t40-feature"]
 
 
-def _own_push(p, monkeypatch, task=7, status="queued", **more):
+def _stoppable_push(p, monkeypatch, task=7, status="queued", **more):
     """A detached push marker of task #`task` in project `p`, with this run as task #7 of `p`."""
     from ttp import push
     monkeypatch.setenv("TTP_TASK", "7")
@@ -19833,7 +19833,7 @@ def _own_push(p, monkeypatch, task=7, status="queued", **more):
 def test_push_stop_withdraws_the_own_tasks_queued_push_and_removes_its_marker(env, monkeypatch, capsys):
     p = make(env)
     from ttp import locks, push
-    marker = _own_push(p, monkeypatch)
+    marker = _stoppable_push(p, monkeypatch)
     assert push.stop_own(p, marker) == 0
     assert not marker.exists() and not marker.with_suffix(".log").exists()
     assert locks.any_free([push._run_lock(marker)])
@@ -19843,9 +19843,9 @@ def test_push_stop_withdraws_the_own_tasks_queued_push_and_removes_its_marker(en
 def test_push_stop_refuses_another_tasks_or_projects_push_a_batch_and_a_path_outside_pushes(env, monkeypatch, tmp_path):
     p = make(env)
     from ttp import push
-    other = _own_push(p, monkeypatch, task=8)
+    other = _stoppable_push(p, monkeypatch, task=8)
     assert push.stop_own(p, other) == push.REFUSED and other.exists()
-    mine = _own_push(p, monkeypatch)
+    mine = _stoppable_push(p, monkeypatch)
     monkeypatch.setenv("TTP_PROJECT", str(tmp_path / "another-project"))
     assert push.stop_own(p, mine) == push.REFUSED and mine.exists()
     monkeypatch.setenv("TTP_PROJECT", str(p.base))
@@ -19881,7 +19881,7 @@ def _waiting_push(marker):
 def test_push_stop_ends_the_own_tasks_running_push_waiting_for_the_lock(env, monkeypatch, capsys):
     p = make(env)
     from ttp import locks, push
-    marker = _own_push(p, monkeypatch, status="running")
+    marker = _stoppable_push(p, monkeypatch, status="running")
     proc = _waiting_push(marker)
     try:
         data = json.loads(marker.read_text()) | {"pid": proc.pid}
@@ -19898,7 +19898,7 @@ def test_push_stop_ends_the_own_tasks_running_push_waiting_for_the_lock(env, mon
 def test_push_stop_never_interrupts_a_git_push_and_says_so(env, monkeypatch, capsys):
     p = make(env)
     from ttp import push
-    marker = _own_push(p, monkeypatch, status="running")
+    marker = _stoppable_push(p, monkeypatch, status="running")
     proc = _waiting_push(marker)
     try:
         marker.write_text(json.dumps(json.loads(marker.read_text()) | {"pid": proc.pid}))
@@ -19923,9 +19923,9 @@ def test_a_detached_push_ignores_a_stop_signal_once_its_git_push_began(monkeypat
 def test_detach_stop_on_a_push_marker_stops_the_own_push(env, monkeypatch):
     p = make(env)
     from ttp import cli
-    marker = _own_push(p, monkeypatch)
+    marker = _stoppable_push(p, monkeypatch)
     assert cli._detach_stop(str(marker)) == 0 and not marker.exists()
-    other = _own_push(p, monkeypatch, task=8)
+    other = _stoppable_push(p, monkeypatch, task=8)
     assert cli._detach_stop(str(other)) == 2 and other.exists()   # push.REFUSED
 
 
