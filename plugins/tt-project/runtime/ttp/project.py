@@ -1135,7 +1135,8 @@ def renice(pid: int, n: int) -> None:
     if n <= 0:
         return
     try:
-        os.setpriority(os.PRIO_PROCESS, pid, min(os.nice(0) + n, 19))
+        # getpriority, not os.nice(0): macOS refuses that with EPERM at some levels.
+        os.setpriority(os.PRIO_PROCESS, pid, min(os.getpriority(os.PRIO_PROCESS, 0) + n, 19))
     except OSError:
         pass
 

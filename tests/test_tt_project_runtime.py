@@ -24273,8 +24273,8 @@ def test_a_host_sleep_does_not_time_out_or_stall_a_run(env, tmp_path, monkeypatc
 
 
 # The agent prints its own nice level and its child's (a detached job it starts, say).
-_NICE_AGENT = ("import os, subprocess, sys; print(os.nice(0)); sys.stdout.flush(); "
-               "subprocess.run([sys.executable, '-c', 'import os; print(os.nice(0))'])")
+_NICE_AGENT = ("import os, subprocess, sys; print(os.getpriority(os.PRIO_PROCESS, 0)); sys.stdout.flush(); "
+               "subprocess.run([sys.executable, '-c', 'import os; print(os.getpriority(os.PRIO_PROCESS, 0))'])")
 
 
 def _nice_run(tmp_path, nice):
@@ -24291,12 +24291,33 @@ def _nice_run(tmp_path, nice):
 
 
 def test_a_workers_agent_and_all_it_starts_run_niced_below_the_runner(env, tmp_path):
-    base = os.nice(0)
+    base = os.getpriority(os.PRIO_PROCESS, 0)
     (agent, grandchild), recorded = _nice_run(tmp_path, 7)
     assert agent == grandchild == recorded == min(base + 7, 19)
     # runner.nice 0: the agent keeps the runner's priority.
     (agent, grandchild), recorded = _nice_run(tmp_path, 0)
     assert agent == grandchild == recorded == base
+
+
+def test_a_run_goes_on_when_os_nice_refuses_with_eperm(env, tmp_path, monkeypatch, capsys):
+    """macOS refuses os.nice with EPERM at some levels (under `nice -n 10`, say): the priority
+    check only informs, so the run ends normally, and renice still lowers a waiting child."""
+    from ttp import project
+
+    def refuse(n):
+        raise PermissionError(1, "Operation not permitted")
+    monkeypatch.setattr(os, "nice", refuse)
+    base = os.getpriority(os.PRIO_PROCESS, 0)
+    (agent, grandchild), recorded = _nice_run(tmp_path, 7)
+    assert agent == grandchild == recorded == base, "the agent could not be niced, so it keeps the runner's level"
+    assert f"could not lower the agent's priority by 7 (it runs at nice {base})" in capsys.readouterr().out
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        project.renice(child.pid, 5)
+        assert os.getpriority(os.PRIO_PROCESS, child.pid) == min(base + 5, 19)
+    finally:
+        child.kill()
+        child.wait()
 
 
 def test_workers_and_reviewers_get_runner_nice_but_the_coordinator_does_not(env):

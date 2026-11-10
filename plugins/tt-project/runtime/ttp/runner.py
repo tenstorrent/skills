@@ -554,7 +554,10 @@ def supervise(run_dir: Path) -> int:
     guard, watchdog = _start_watchdog(child.pid)
     (run_dir / "child.pid").write_text(f"{child.pid}\n{proc_start(child.pid) or ''}\n")
     niceness = _niceness(child.pid)
-    if nice and niceness is not None and niceness < min(os.nice(0) + nice, 19):
+    # The runner's own level by getpriority: macOS refuses os.nice(0) with EPERM at some levels,
+    # and this check only informs, so it never ends a run.
+    own = _niceness(0)
+    if nice and niceness is not None and own is not None and niceness < min(own + nice, 19):
         print(f"runner: could not lower the agent's priority by {nice} (it runs at nice {niceness})", flush=True)
     reason: list[str] = []
     # The system prompt check (check_instructions): open until it has a verdict.
