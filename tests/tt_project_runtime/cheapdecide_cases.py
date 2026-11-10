@@ -88,17 +88,17 @@ def test_haiku_answers_only_decision_uses_and_never_reads_an_unparsed_answer_as_
     q = {"needed": {"type": "noul", "instructions": "?", "criteria": {"true": "y", "false": "n"}}}
     assert f.decide("s", q, purpose="effort") is None and not calls   # effort and model stay Jev-only
     # An unreadable answer is no answer: the caller keeps its own rules (which wake), never the top score.
-    assert f.decide("s", q, purpose="screen") is None
+    assert f.decide("s", q, purpose="wake_gate") is None
     sev = {"severity": {"type": "score", "instructions": "?", "criteria": ["a", "b", "c", "d"]}}
-    assert f.decide("s", sev, purpose="screen") is None
+    assert f.decide("s", sev, purpose="wake_gate") is None
     g, _ = _cd_fallback(monkeypatch, _CdJev(on=False), "1")
-    assert g.decide("s", sev, purpose="screen") == {"severity": {"score": 1.0}}
+    assert g.decide("s", sev, purpose="wake_gate") == {"severity": {"score": 1.0}}
     both = dict(q, **sev)
     h, hcalls = _cd_fallback(monkeypatch, _CdJev(on=False), "needed: no\nseverity: 2")
-    assert h.decide("s", both, purpose="screen") == {"needed": {"noul": 0.0}, "severity": {"score": 2.0}}
+    assert h.decide("s", both, purpose="wake_gate") == {"needed": {"noul": 0.0}, "severity": {"score": 2.0}}
     assert len(hcalls) == 1                                            # one CLI call for the whole set
     k, _ = _cd_fallback(monkeypatch, _CdJev(on=False), "needed: no\nseverity: very")
-    assert k.decide("s", both, purpose="screen") is None               # one unreadable answer: none at all
+    assert k.decide("s", both, purpose="wake_gate") is None               # one unreadable answer: none at all
     assert cheapdecide.wrap({"jev": {"haiku": False}}, None) is None  # the setting turns Haiku off
     assert cheapdecide.wrap({"core_provider": "codex"}, None) is None
     monkeypatch.setenv(cheapdecide.OFF_ENV, "1")
@@ -172,25 +172,44 @@ def test_a_background_haiku_answer_survives_the_daemon_rebuilding_its_decider(en
     other = type("OtherDB", (), {"path": "/elsewhere/project.db", "spend": lambda self, *a, **k: spent.append(a)})()
     f, calls = _cd_fallback(monkeypatch, _CdJev(on=False), "no", db=p.db, background=True)
     q = {"needed": {"type": "noul", "instructions": "?"}}
-    assert f.decide("s", q, purpose="screen") is None
+    assert f.decide("s", q, purpose="wake_gate") is None
     _cd_settle(f.haiku)
-    n = lambda db: db.q("SELECT count(*) n FROM ledger WHERE source='haiku:screen'")[0]["n"]
+    n = lambda db: db.q("SELECT count(*) n FROM ledger WHERE source='haiku:wake_gate'")[0]["n"]
     run = f.haiku.run
     elsewhere = cheapdecide.Haiku({}, other, run=run, binary="claude-stub")   # another project's ledger
-    assert elsewhere.decide("s", q, purpose="screen") is None and spent == []   # neither its answer nor its cost
+    assert elsewhere.decide("s", q, purpose="wake_gate") is None and spent == []   # neither its answer nor its cost
     _cd_settle(elsewhere)
     again = cheapdecide.Haiku({}, p.db, run=run, binary="claude-stub")   # a config reload's new decider
-    assert again.decide("s", q, purpose="screen") == {"needed": {"noul": 0.0}} and n(p.db) == 1
+    assert again.decide("s", q, purpose="wake_gate") == {"needed": {"noul": 0.0}} and n(p.db) == 1
 
 
-def test_an_unreadable_haiku_screening_answer_keeps_the_rules_severity_and_the_mute(env, monkeypatch):
-    from ttp import screen
+def test_screening_and_the_wake_tier_never_ask_haiku_for_an_answer_they_would_not_read(env, monkeypatch):
+    """Review #133: screening judges a new issue once and the wake tier is picked once per dispatch, so a
+    background Haiku answer for either would be booked and never read: Jev alone serves them."""
+    from ttp import cheapdecide, screen, waketier
     p = make(env)
-    f, calls = _cd_fallback(monkeypatch, _CdJev(on=False), "#%! garbage", db=p.db)
+    f, calls = _cd_fallback(monkeypatch, _CdJev(on=False), "needed: no\nseverity: 0", db=p.db, background=True)
+    assert f.enabled()                                     # Haiku is on: only its uses limit it
     src = "watcher:logs"
     screen.mute(p.db, src, "disk usage", 24, why="known")
     text = "disk usage at 71% on the build volume"
     v = screen.screen(p.db, {}, src, text, jev=f)
-    assert calls                                           # Haiku was asked
-    assert v.severity == screen.rule_severity(text) and v.severity != "critical"
-    assert not v.wake                                      # still muted
+    assert v.severity == screen.rule_severity(text) and not v.wake   # the rules decide; the mute holds
+    tid = p.db.add_task("t", "s", kind="work", tier="standard", origin="user")
+    prev = {"status": "waiting", "retry_when": "exit 1", "escalated_wake": True, "wake_tier": "standard",
+            waketier.KEY: "spec_change"}
+    assert waketier.pick(p.db, p.config(), p.db.task(tid), prev, jev=f) is None   # the tier stays
+    _cd_settle(f.haiku)
+    assert calls == [] and not f.haiku.pool.done and not f.haiku.pool.running
+    assert p.db.q("SELECT count(*) n FROM ledger WHERE source LIKE 'haiku:%'")[0]["n"] == 0
+    # Every use Haiku may answer asks again on a later tick (waitgate's one-look hold): only the wake gate.
+    assert cheapdecide.HAIKU_USES == ("wake_gate",)
+
+
+def test_the_haiku_timeout_default_is_above_its_live_latency(monkeypatch):
+    """Live Haiku decisions took 40-49 s: a 40 s cut-off paid for calls and threw their answers away."""
+    from ttp import cheapdecide
+    monkeypatch.delenv(cheapdecide.OFF_ENV, raising=False)
+    assert cheapdecide.TIMEOUT_S > 49
+    assert cheapdecide.settings({})["timeout_s"] == cheapdecide.TIMEOUT_S
+    assert cheapdecide.settings({"jev": {"haiku": {"timeout_s": 30}}})["timeout_s"] == 30.0
