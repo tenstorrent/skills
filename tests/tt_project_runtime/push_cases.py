@@ -8236,6 +8236,34 @@ def test_ttp_checks_drops_an_extra_pytest_run_of_paths_inside_a_project_pytest_p
     assert cli._extra_checks(["pytest -q tests/sub"], own, "", t) == ([], ["pytest -q tests/sub"])
 
 
+def test_ttp_checks_drops_an_extra_pytest_run_inside_a_project_pytest_run_behind_launchers(tmp_path, monkeypatch):
+    """A project check that runs pytest behind launchers' `--` (a throttle, a sharder) with the venv python
+    covers an extra `PYTHONPATH=. python3 -m pytest --rootdir=. --confcutdir=. -q <file>` inside its paths
+    where pyproject.toml makes the worktree the rootdir. A wrapped run with no paths (a script picking its
+    own tests), two pytest runs, `"pytest": false` or another interpreter covers nothing."""
+    from ttp import cli, push
+    monkeypatch.delenv("PYTEST_ADDOPTS", raising=False)
+    monkeypatch.delenv("PYTHONPATH", raising=False)
+    top = tmp_path / "wt"
+    (top / "tests").mkdir(parents=True)
+    (top / "tests/test_a.py").write_text("def test_x():\n    pass\n")
+    (top / "pyproject.toml").write_text("[project]\nname = 'x'\n")
+    t, py = str(top), str(top / ".venv/bin/python")
+    lead = "PATH=$PWD/.venv/bin:$PATH PYTHONPATH=. python3 /h/bin/throttle.py --rate 9 -- python3 /h/bin/shards.py -- "
+    extra = "PYTHONPATH=. python3 -m pytest --rootdir=. --confcutdir=. -q tests/test_a.py"
+    own = push.check_list([lead + ".venv/bin/python -m pytest -q tests/", lead.replace("shards", "docs") +
+                           ".venv/bin/python -m pytest -q"])
+    assert cli._extra_checks([extra], own, py, t) == ([], [extra])
+    assert cli._extra_checks(["PYTHONPATH=. python3 -m pytest -q tests/test_a.py"], own, py, t)[0] == []
+    for o in (lead + ".venv/bin/python -m pytest -q", lead + "/usr/bin/python3 -m pytest -q tests/",
+              lead + ".venv/bin/python -m pytest -q tests/ && pytest -q tests/",
+              {"run": lead + ".venv/bin/python -m pytest -q tests/", "pytest": False},
+              lead + ".venv/bin/python -m pytest -q -k slow tests/"):
+        assert cli._extra_checks([extra], push.check_list([o]), py, t) == ([extra], []), o
+    (top / "pyproject.toml").write_text("[tool.pytest.ini_options]\nrootdir = 'tests'\n")
+    assert cli._extra_checks([extra], own, py, t) == ([extra], [])
+
+
 def test_ttp_checks_run_drops_a_subset_pytest_extra_and_keeps_the_push_checks_commands(env, tmp_path, monkeypatch, capsys):
     from ttp import cli
     p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)

@@ -3197,7 +3197,7 @@ def _command_key(c) -> str:
     return c
 
 
-_PWD_PYTHONPATH = re.compile(r'[ \t]*PYTHONPATH=(?:\$PWD|"\$PWD"|\$\{PWD\}|"\$\{PWD\}")[ \t]+(?=\S)')
+_PWD_PYTHONPATH = re.compile(r'[ \t]*PYTHONPATH=(?:\.|\$PWD|"\$PWD"|\$\{PWD\}|"\$\{PWD\}")[ \t]+(?=\S)')
 _PYTEST_QUIET = re.compile(r"-q+|--quiet")
 _TOP_FLAGS = ("--rootdir=.", "--confcutdir=.")
 
@@ -3206,7 +3206,8 @@ def _top_flags_noop(top: str, paths: list[str]) -> bool:
     """`--rootdir=.` and `--confcutdir=.` change nothing in a pytest run of `paths` from the worktree
     `top`: push.venv_cmd sets both to `top` itself in a nested worktree, or else pytest takes `top`'s
     pytest.ini as its config (no other pytest file between the paths and `top`), so its rootdir and
-    default confcutdir are `top` already. Not when PYTEST_ADDOPTS or that pytest.ini names either."""
+    default confcutdir are `top` already (as they are with no pytest.ini when `top`'s pyproject.toml, tox.ini,
+    setup.cfg or setup.py makes it the rootdir). Not when PYTEST_ADDOPTS or that file names either."""
     from . import push
     if not top or os.environ.get("PYTEST_ADDOPTS"):
         return False
@@ -3214,7 +3215,9 @@ def _top_flags_noop(top: str, paths: list[str]) -> bool:
     try:
         if push.nested_pytest(t):
             return True
-        ini = next((t / n for n in ("pytest.ini", ".pytest.ini") if (t / n).is_file()), None)
+        # pytest.ini, else (no pytest config on the way: below) the file that makes `top` the rootdir
+        ini = next((t / n for n in ("pytest.ini", ".pytest.ini", "pyproject.toml", "tox.ini", "setup.cfg",
+                                    "setup.py") if (t / n).is_file()), None)
         if ini is None or re.search(r"rootdir|confcutdir", ini.read_text(errors="replace")):
             return False
         for w in paths:
@@ -3242,7 +3245,8 @@ def _same_run_key(c, py: str = "", top: str = "") -> str:
     venv_cmd puts in their place (venv_python). Any other interpreter (`/usr/bin/python3 -m pytest`,
     `.venv/bin/pytest`) runs as written, so stays distinct. Only for telling an extra command already run.
     Of such a run's own words, only what runs the same tests is made alike: `-q` (output only), the order
-    of its file and directory arguments (when it has no other option), a leading `PYTHONPATH=$PWD` where
+    of its file and directory arguments (when it has no other option), a leading `PYTHONPATH=$PWD` (or `=.`,
+    the worktree a check runs in) where
     `-m pytest` already puts the worktree first on sys.path and no outer PYTHONPATH the checks get
     (push.check_pythonpath: not the harness runtime's) is lost, and
     `--rootdir=.`/`--confcutdir=.` where they are the run's own (_top_flags_noop, for the worktree `top`).
@@ -3299,6 +3303,38 @@ def _pytest_args(key: str) -> list[str] | None:
     return words[1:] if words and words[0] == "pytest" and "--" not in words else None
 
 
+def _wrapped_pytest_args(o, py: str = "", top: str = "") -> list[str] | None:
+    """The words after `pytest` of a check that is one pytest run behind a launcher's `--`
+    (push._PYTEST_WRAPPED: `throttle.py -- shards.py -- .venv/bin/python -m pytest -q tests/`), without `-q`,
+    when that run's program is one _same_run_key makes `pytest` or the venv python `py` (by its path in the
+    worktree `top` or its main checkout), and its words are plain ones. None otherwise, and for a check that
+    says `"pytest": false`. Only for _within, whose drop stands only when that check runs in full."""
+    from . import push
+    if not isinstance(o, str) or getattr(o, "pytest", None) is False or push.pytest_runs(o) != 1:
+        return None
+    m = push._PYTEST_WRAPPED.search(o)
+    if not m or m.group(3).strip():
+        return None
+    try:
+        prog, rest = m.group(4).split(), shlex.split(o[m.end(4):])
+    except ValueError:
+        return None
+    if not all(_PLAIN_WORD.fullmatch(w) for w in rest) or "--" in rest:
+        return None
+    w = Path(prog[0])
+    if len(w.parts) > 1:
+        if not py or w.name not in ("python", "python3", "pytest") or ".." in w.parts:
+            return None
+        cand = w.parent / "python" if w.name == "pytest" else w
+        venv = Path(py) if w.name != "pytest" else Path(py).parent / "python"
+        if not (os.path.normpath(Path(top) / cand) == os.path.normpath(venv)
+                or (not w.is_absolute() and venv.parts[-len(cand.parts):] == cand.parts)):
+            return None
+    elif prog[0] not in ("pytest", "py.test", "python", "python3"):
+        return None
+    return [x for x in rest if not _PYTEST_QUIET.fullmatch(x)]
+
+
 def _inside(path: str, root: str, top: str) -> bool:
     """Whether a pytest run given `root` (a directory or file of the worktree `top`) already runs every test
     of `path` (a file, a directory or a node id) given alone: it lies inside `root`, a file is named as
@@ -3347,6 +3383,10 @@ def _within(c, checks: list, py: str = "", top: str = ""):
         if getattr(o, "if_exists", "") or getattr(o, "if_changed", ()) or not _plain_check(o):
             continue
         theirs = _pytest_args(_same_run_key(o, py, top))
+        if theirs is None:
+            theirs = _wrapped_pytest_args(o, py, top)
+            if theirs is not None and _top_flags_noop(top, [w for w in theirs if not w.startswith("-")]):
+                theirs = [w for w in theirs if w not in _TOP_FLAGS]
         if theirs is None or any("::" in w for w in theirs):
             continue
         roots = [w for w in theirs if not w.startswith("-")]
