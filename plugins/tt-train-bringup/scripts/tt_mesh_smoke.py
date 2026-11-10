@@ -25,7 +25,10 @@ import sys
 import time
 from pathlib import Path
 
-# Descriptors tt-train ships, by shape; the first that exists wins.
+# Descriptors by shape, the first that exists wins: tt-train's configs/mgd/, then this plugin's scripts/mgd/.
+# A QuietBox 2 (two p300c) opens 1x4 only as a line with 2 relaxed channels per link: tt-train's
+# bh_qb_1_4_ring_ring (4x p150) asks for 4 links between chips 0 and 3 and fails (bh-qbge-10, 2026-11-10);
+# pass --mgd scripts/mgd/bh_qb2_1_4_line_line.textproto there.
 BUNDLED_MGD = {
     (2, 2): ["bh_2_2_line_line.textproto"],
     (1, 4): ["bh_qb_1_4_ring_ring.textproto"],
@@ -35,6 +38,9 @@ BUNDLED_MGD = {
     (8, 4): ["bh_galaxy_8_4_ring_ring.textproto", "bh_galaxy_8_4_line_line.textproto"],
     (4, 8): ["bh_galaxy_4_8_ring_ring.textproto", "bh_galaxy_4_8_line_line.textproto"],
 }
+
+
+PLUGIN_MGD = Path(__file__).resolve().parent / "mgd"
 
 
 def parse_shape(text: str) -> tuple[int, int]:
@@ -53,9 +59,10 @@ def resolve_mgd(shape: tuple[int, int], explicit: str | None) -> str | None:
     if not home:
         return None
     for name in BUNDLED_MGD.get(shape, []):
-        path = Path(home) / "tt-train" / "configs" / "mgd" / name
-        if path.is_file():
-            return str(path)
+        for folder in (Path(home) / "tt-train" / "configs" / "mgd", PLUGIN_MGD):
+            path = folder / name
+            if path.is_file():
+                return str(path)
     return None
 
 

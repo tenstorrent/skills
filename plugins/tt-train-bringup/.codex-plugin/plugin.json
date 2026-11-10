@@ -1,6 +1,6 @@
 {
   "name": "tt-train-bringup",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "Bring up and optimise training of a Hugging Face model in tt-train on the plan's chips through three phases: plan (kernel inventory, freeze map, roofline target, memory budget), composite bring-up with a PCC harness on the forward and every gradient, and an optimisation loop that classifies every op as useful math, layout, glue, wasted or dispatch, costs it with training multiplicity and fixes it until the roofline target is met. Tracy runs at 1x, 2x and 4x the plan's representative slice for ranking and diffs, never on the full model and never projected to a full step; on an authorised box the plan costs DP, TP and DP x TP on every mesh shape. Also ships tt-train-pr-review, a strict pre-merge review skill for tt-metal PRs that touch tt-train/. Requires tt-autodebug.",
   "author": {
     "name": "Tenstorrent"

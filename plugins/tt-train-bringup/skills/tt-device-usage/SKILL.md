@@ -73,8 +73,11 @@ any of its chips while it runs.
   chip along every axis and checks every chip's result exactly; `--bandwidth-mib 16` also times
   the all-reduce per axis for the plan's collective cost. A shape whose smoke fails is not a
   candidate for the plan; record the failure and its reason rather than working around it.
-- A physical topology does not open every logical shape (a QuietBox wired as `2x2` may refuse
-  `1x4`). The smoke decides, not the descriptor's name.
+- A physical topology does not open every logical shape, and a descriptor written for one box may
+  not fit another: tt-train's `bh_qb_1_4_ring_ring` (a 4x p150 QuietBox) asks for 4 links between
+  the end chips and fails on a QuietBox 2 (two p300c), which opens `1x4` as a line with 2 relaxed
+  channels per link (this plugin's `scripts/mgd/bh_qb2_1_4_line_line.textproto`, passed with
+  `--mgd`). The smoke decides, not the descriptor's name; record the descriptor that opened.
 
 ## Telemetry And Clock
 
