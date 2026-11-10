@@ -7,16 +7,20 @@ from __future__ import annotations
 _SS_OLD, _SS_NEW = 4242, 4343
 
 
-def _slow_stop_service(env, monkeypatch, exits_at=120.2, ready_at=5.0, show="TimeoutStopUSec=2min\nMainPID=4242"):
+def _slow_stop_service(env, monkeypatch, exits_at=120.2, ready_at=5.0, show="TimeoutStopUSec=2min\nMainPID=4242",
+                       starts_at=0.0, load=0.0):
     """A systemd project whose old daemon takes exits_at s (fake clock) to stop after the restart call, as
     when systemd kills it at its 120 s stop timeout. `systemctl --user restart` times out after 60 s, and
     the stopping daemon removed its pid file at once. The new daemon starts as the old one is gone and
     completes its first tick ready_at s later (None: it dies 3 s in, never ready). Its restart after a rollback comes up at once.
+    `starts_at`: the seconds after the old daemon's exit before the new one writes its start marker (a slow
+    import); `load`: the host's 1-minute load per core while it starts.
     Returns (project, runtime head, clock, the waits_from each start check counted from)."""
     p = make(env)
     from ttp import daemon as dm, service
     monkeypatch.setenv("HOME", str(env["tmp"] / "userhome"))
     monkeypatch.setattr(service.sys, "platform", "linux")
+    monkeypatch.setattr(service, "load_per_core", lambda: load)
     service._unit(p).parent.mkdir(parents=True, exist_ok=True)
     service._unit(p).write_text(service._unit_text(p))
     h = p.harness
@@ -39,17 +43,17 @@ def _slow_stop_service(env, monkeypatch, exits_at=120.2, ready_at=5.0, show="Tim
             if not restarts:
                 return
             t0, since = restarts[0], self.now - restarts[0]
-            if len(restarts) == 1 and since >= exits_at and not (p.state / "daemon.start").exists():
+            if len(restarts) == 1 and since >= exits_at + starts_at and not (p.state / "daemon.start").exists():
                 (p.state / "daemon.pid").write_text(str(_SS_NEW))
                 (p.state / "daemon.start").write_text(json.dumps({"pid": _SS_NEW, "started": self.now}))
-            if len(restarts) == 1 and ready_at is not None and since >= exits_at + ready_at:
+            if len(restarts) == 1 and ready_at is not None and since >= exits_at + starts_at + ready_at:
                 if not (p.state / "heartbeat").exists():
-                    (p.state / "heartbeat").write_text(json.dumps({"pid": _SS_NEW, "started": t0 + exits_at}))
+                    (p.state / "heartbeat").write_text(json.dumps({"pid": _SS_NEW, "started": t0 + exits_at + starts_at}))
 
     clock = Clock()
     alive = lambda pid: (pid == _SS_OLD and (not restarts or clock.now < restarts[0] + exits_at)  # noqa: E731
                          or pid == _SS_NEW and len(restarts) == 1 and clock.now >= restarts[0] + exits_at
-                         and (ready_at is not None or clock.now < restarts[0] + exits_at + 3))
+                         and (ready_at is not None or clock.now < restarts[0] + exits_at + starts_at + 3))
     monkeypatch.setattr(service, "time", clock)
     monkeypatch.setattr(dm, "_alive", alive)
     monkeypatch.setattr(dm, "_is_daemon", alive)
@@ -104,6 +108,40 @@ def test_a_new_daemon_that_never_becomes_ready_after_a_slow_stop_still_rolls_bac
     assert _git_out(p.harness, "rev-parse", "HEAD") != head
     alert = p.db.one("SELECT text FROM messages WHERE kind='alert' AND severity='high'")
     assert alert and "Failed phase: the new daemon was not ready" in alert["text"]
+
+
+def test_a_new_daemon_slow_to_start_under_host_load_is_given_a_longer_window_not_rolled_back(env, monkeypatch):
+    # An upgrade on a laptop at load 57-78 on 14 cores: the new daemon had not written its start marker 61 s
+    # after the old one stopped, so its release was rolled back, yet the same runtime imported in 5 s from
+    # a copy. Under load the start window stretches with the load per core.
+    from ttp import service
+    p, head, clock, froms = _slow_stop_service(env, monkeypatch, exits_at=1.0, starts_at=150, ready_at=5.0,
+                                               load=78 / 14)
+    res = service.restart(p)
+    assert res.outcome == "running", res
+    _no_rollback(p, head)
+    assert service.start_window_s(60, 78 / 14) == service.START_WAIT_CAP_S
+    assert service.start_window_s(60, 0.3) == 60 and service.start_window_s(600, 9) == 600
+
+
+def test_an_idle_host_keeps_the_short_start_window_and_a_loaded_one_is_bounded(env, monkeypatch):
+    from ttp import service
+    p, head, clock, froms = _slow_stop_service(env, monkeypatch, exits_at=1.0, starts_at=150, ready_at=5.0)
+    t0 = clock.now
+    res = service.restart(p)
+    assert res.outcome == "rolled_back" and clock.now - t0 < 150, res
+    assert "load is 0.0 per core, so its start window was 60s" in res, res
+
+
+def test_a_new_daemon_that_never_starts_under_load_is_rolled_back_at_the_bound(env, monkeypatch):
+    from ttp import service
+    p, head, clock, froms = _slow_stop_service(env, monkeypatch, exits_at=1.0, starts_at=10_000, ready_at=5.0,
+                                               load=12.0)
+    t0 = clock.now
+    res = service.restart(p)
+    assert res.outcome == "rolled_back", res
+    assert service.START_WAIT_CAP_S <= clock.now - t0 <= service.START_WAIT_CAP_S + 70, clock.now - t0
+    assert f"so its start window was {service.START_WAIT_CAP_S}s" in res, res
 
 
 def test_an_old_daemon_that_outlives_its_stop_timeout_defers_without_rollback_within_the_bound(env, monkeypatch):

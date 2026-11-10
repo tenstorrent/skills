@@ -321,3 +321,62 @@ def test_a_push_queue_batch_past_the_bound_holds_the_upgrade_only_inside_its_ste
     for step in ("rebase", "checks", "push"):
         assert seen[step].startswith(f"{release.PUSH_HELD}in its {step} step since"), seen
     assert seen["slot wait"] == "", "waiting for a checks slot is between steps"
+
+
+def _rolled_back_release(env, monkeypatch):
+    """A project that merged a release (a new module, a new name in an old one), whose new daemon then did
+    not start, so service._roll_back put runtime/ back to the last good commit as a commit of its own."""
+    from ttp import cli, service
+    p = make(env)
+    h = p.harness
+    p.db.set_kv("harness_good", {"commit": _git_out(h, "rev-parse", "HEAD")})
+    monkeypatch.setattr(service, "restart", lambda p: "restarted")
+    _install_template(env)
+    lib = env["home"] / "lib" / "current" / "runtime" / "ttp"
+    (lib / "SOURCE_COMMIT").write_text("bbbb2222\n")
+    (lib / "relonly.py").write_text("RELEASE_ONLY = 1\n")
+    (lib / "hostload.py").write_text((lib / "hostload.py").read_text() + "\n\ndef release_only():\n    return 1\n")
+    cli.main(["upgrade", "demo"])
+    assert (h / "runtime" / "ttp" / "relonly.py").exists()
+    monkeypatch.setattr(service, "_judge_start", lambda *a, **k: ("running", 0.0, set()))
+    res = service._roll_back(p, "restarted", 61, 1, 20, 60, None, lambda p: "restarted")
+    assert res.outcome == "rolled_back", res
+    assert not (h / "runtime" / "ttp" / "relonly.py").exists()
+    return p, cli
+
+
+def test_a_rerun_upgrade_re_applies_the_release_its_restart_rolled_back(env, monkeypatch, capsys):
+    """A rerun after a rollback said "harness up to date" and kept the rolled-back modules as files main
+    changed, so the project could never get the release back without a hand edit."""
+    p, cli = _rolled_back_release(env, monkeypatch)
+    capsys.readouterr()
+    cli.main(["upgrade", "demo"])
+    out = capsys.readouterr().out
+    rt = p.harness / "runtime" / "ttp"
+    assert "re-applied the runtime a restart rolled back" in out, out
+    assert "kept runtime files main changed" not in out and "restored runtime files" not in out, out
+    assert (rt / "relonly.py").exists() and "def release_only" in (rt / "hostload.py").read_text()
+    assert (rt / "SOURCE_COMMIT").read_text().strip() == "bbbb2222"
+    assert _git_out(p.harness, "status", "--porcelain", "--", "runtime") == ""
+    capsys.readouterr()
+    cli.main(["upgrade", "demo"])         # once re-applied, the next run has nothing to undo
+    assert "re-applied" not in capsys.readouterr().out
+
+
+def test_a_rollback_of_a_local_runtime_edit_is_kept_by_the_upgrade(env, monkeypatch, capsys):
+    from ttp import cli, service
+    p = make(env)
+    h = p.harness
+    monkeypatch.setattr(service, "restart", lambda p: "restarted")
+    _install_template(env)
+    cli.main(["upgrade", "demo"])
+    p.db.set_kv("harness_good", {"commit": _git_out(h, "rev-parse", "HEAD")})
+    _runtime_change(h)                     # a harness task's own edit, not a template merge
+    monkeypatch.setattr(service, "_judge_start", lambda *a, **k: ("running", 0.0, set()))
+    assert service._roll_back(p, "restarted", 61, 1, 20, 60, None, lambda p: "restarted").outcome == "rolled_back"
+    rolled = _git_out(h, "rev-parse", "HEAD")
+    capsys.readouterr()
+    cli.main(["upgrade", "demo"])
+    assert "re-applied" not in capsys.readouterr().out
+    assert "# a runtime change" not in (h / "runtime" / "ttp" / "daemon.py").read_text()
+    assert _git_out(h, "log", "-1", "--format=%H", "--", "runtime") == rolled

@@ -11627,6 +11627,8 @@ def _upgrade(p: Project, auto: bool = False, explicit: bool = False, took_over: 
         with tree_writes(h):
             _git(h, "checkout", "HEAD", "--", *emptied)
         print("restored files a crash left empty: " + ", ".join(emptied))
+    if undone := _undo_template_rollback(h, ident):
+        print(undone)
     _restore_cut_runtime(h)
     left = _commit_local_changes(p, ident)
     _untrack_placeholders(p, ident)
@@ -12487,6 +12489,39 @@ def _cut_runtime(h: Path, have: str | None, ref: str) -> dict[str, str]:
 
 def _cut_list(cut: dict[str, str]) -> str:
     return ", ".join(f"{f} ({why})" for f, why in sorted(cut.items()))
+
+
+def _undo_template_rollback(h: Path, ident: list[str]) -> str:
+    """A restart whose new daemon did not start (service._roll_back) puts runtime/ back to the last commit a
+    daemon ran well on, as a commit of its own. That commit is the harness's, not a local edit: kept, a
+    rerun of `ttp upgrade` finds upstream already merged and keeps the old files as edits main made, so
+    the release never comes back. When the newest commit touching runtime/ is such a rollback, runtime/ is
+    clean and the commits it rolled back took in a template merge, runtime/ is put back to the rollback's
+    parent as a new commit (nothing is rewritten) before the merge. Returns what it did ("" otherwise)."""
+    from .runtimeload import ROLLBACK_RE
+
+    def git(*args: str) -> subprocess.CompletedProcess:
+        return subprocess.run(["git", "-C", str(h), *args], capture_output=True, text=True)
+
+    last = git("log", "-1", "--format=%H%x00%s", "HEAD", "--", "runtime").stdout.strip()
+    sha, _, subject = last.partition("\0")
+    m = ROLLBACK_RE.match(subject)
+    if not m or git("status", "--porcelain", "--", "runtime").stdout.strip():
+        return ""
+    good, before = m.group(1), f"{sha}^"
+    mb = git("merge-base", "upstream", before).stdout.strip()
+    if not mb or git("merge-base", "--is-ancestor", mb, good).returncode != 1:
+        return ""       # it rolled back no template merge (a local runtime edit): kept
+    with tree_writes(h):
+        if git("restore", f"--source={before}", "--staged", "--worktree", "--", "runtime").returncode != 0:
+            git("checkout", before, "--", "runtime")     # git older than 2.23
+        r = git(*ident, "commit", "-q", "-m", f"re-apply runtime rolled back by {sha[:10]}: ttp upgrade retries "
+                f"the template merge it undid")
+    if r.returncode != 0:
+        die(f"upgrade refused: could not re-apply the runtime rollback {sha[:10]} undid: "
+            f"{(r.stderr or r.stdout).strip()[-300:]}. Nothing was merged; rerun `ttp upgrade`.", 1)
+    return (f"re-applied the runtime a restart rolled back ({sha[:10]}: {subject}) so the template merge "
+            f"it undid is retried, not kept as local edits")
 
 
 def _restore_cut_runtime(h: Path) -> None:

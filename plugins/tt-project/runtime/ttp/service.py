@@ -627,6 +627,12 @@ RESTART_REQUEST, RESTART_RESULT = "restart.request", "restart.result"
 STOP_WAIT_CAP_S = 300
 STOP_MARGIN_S = 15
 LAUNCHD_EXIT_TIMEOUT_S = 20   # launchd's default ExitTimeOut: SIGKILL this long after SIGTERM (0: never)
+# The new daemon's start window (a restart's wait_s, from the moment the old daemon exited) stretches with
+# the host's load: with several runnable tasks per core its imports alone can take minutes (an upgrade on a
+# laptop at load 57-78 on 14 cores was rolled back 61 s in, yet the same runtime imported in 5 s from a
+# copy). It is wait_s times the highest 1-minute load per core seen while waiting (at least 1), at most
+# START_WAIT_CAP_S (a longer wait_s is kept).
+START_WAIT_CAP_S = 300
 # A restart deferred because the old daemon outlived its stop timeout (restart() could not judge the new
 # one) is recorded here; check_deferred judges the new daemon later, from the watchdog or its own start.
 RESTART_DEFERRED = "restart.deferred"
@@ -640,7 +646,7 @@ ROLLBACK_MIN_S = 90
 # daemon: its own handle says it ended, or its claim outlived HELPER_BOUND_S, longer than a restart's own
 # waits (the old daemon's stop, a new daemon's first tick, twice with a rollback, plus the service
 # manager's time).
-HELPER_BOUND_S = 2 * (STOP_WAIT_CAP_S + STOP_MARGIN_S + 60 + 300) + 300
+HELPER_BOUND_S = 2 * (STOP_WAIT_CAP_S + STOP_MARGIN_S + START_WAIT_CAP_S + 300) + 300
 HELPER_STARTED = "restart helper running"     # main() logs it first: the helper got past its imports
 _helpers: dict[str, subprocess.Popen] = {}    # the daemon's handle on the helper it started, per project
 # The service manager could not be reached from here, as opposed to it trying and the daemon failing.
@@ -846,17 +852,35 @@ def main() -> int:
     return 0 if out["outcome"] in ("running", "busy") else 1
 
 
+def load_per_core() -> float:
+    """The host's 1-minute load average per core (0 where it cannot be read)."""
+    try:
+        ld = os.getloadavg()[0]
+    except (OSError, AttributeError):
+        return 0.0
+    return ld / (os.cpu_count() or 1) if ld == ld and ld != float("inf") else 0.0
+
+
+def start_window_s(wait_s: float, load: float | None = None) -> float:
+    """How long a new daemon may take to start under `load` (per core; default: now): see START_WAIT_CAP_S."""
+    load = load_per_core() if load is None else load
+    return min(max(wait_s, START_WAIT_CAP_S), wait_s * max(1.0, load))
+
+
 def wait_for_start(p: Project, since: float, wait_s: float, tick_wait_s: float | None = None,
                    waits_from: float | None = None, until: float | None = None) -> str:
     """How a daemon started after `since` came up: "running" once it completed a tick; "busy" if it
     is alive and still in its first tick after tick_wait_s (a first tick may fetch and add worktrees),
     or if no new daemon started because the old one is still alive and holds the lock; otherwise
-    "broken": it did not start within wait_s, it exited, or its first tick failed twice. Both waits
-    count from `waits_from` (default `since`). "unconfirmed" when `until` passes before any of these."""
+    "broken": it did not start within its start window (wait_s stretched by the host's load, start_window_s),
+    it exited, or its first tick failed twice. Both waits count from `waits_from` (default `since`).
+    "unconfirmed" when `until` passes before any of these."""
     from .daemon import HEARTBEAT_STALE_S, _alive, _is_daemon, _read_pid, heartbeat, start_marker
     tick_wait_s = HEARTBEAT_STALE_S if tick_wait_s is None else tick_wait_s
     waits_from = since if waits_from is None else waits_from
+    window = wait_s
     while True:
+        window = max(window, start_window_s(wait_s))     # the highest load seen while it starts
         hb = heartbeat(p)
         if hb and float(hb.get("started") or 0) >= since:
             return "running"
@@ -868,7 +892,7 @@ def wait_for_start(p: Project, since: float, wait_s: float, tick_wait_s: float |
                 return "broken"
             if now >= waits_from + max(wait_s, tick_wait_s):
                 return "busy"
-        elif now >= waits_from + wait_s:
+        elif now >= waits_from + window:
             old = _read_pid(p.state / "daemon.pid")
             return "busy" if old and _is_daemon(old) or old_daemon_beats(p, since, after=since) else "broken"
         if until is not None and now >= until:
@@ -1043,8 +1067,10 @@ def _roll_back(p: Project, msg: str, judged: float, stopped: float, stop_s: floa
         if _git(h, "restore", f"--source={good}", "--staged", "--worktree", "--", "runtime").returncode != 0:
             _git(h, "checkout", good, "--", "runtime")    # git older than 2.23
     _git(h, "commit", "-q", "-m", f"roll back runtime to {good[:10]}: the daemon did not start with it")
+    load = load_per_core()
     phase = (note + f"Failed phase: the new daemon was not ready {judged:.0f}s after the old one "
-             f"stopped (the old daemon took {stopped:.0f}s to stop; its service's stop timeout is {stop_s:.0f}s). ")
+             f"stopped (the old daemon took {stopped:.0f}s to stop; its service's stop timeout is {stop_s:.0f}s; "
+             f"the host's load is {load:.1f} per core, so its start window was {start_window_s(wait_s, load):.0f}s). ")
     stop_s, main = _manager_view(p)
     failed = _running_daemons(p, main)
     t1 = time.time()
@@ -1130,7 +1156,7 @@ def check_deferred(p: Project, who: str = "watchdog", restart_fn=None, budget_s:
                 return "pending"
             path.unlink(missing_ok=True)
             return "busy"
-    elif now < gone + wait_s:
+    elif now < gone + start_window_s(wait_s):
         return "pending"
     until = None if budget_s is None else now + budget_s - JUDGE_MARGIN_S
     if until is not None and until - now < ROLLBACK_MIN_S:
