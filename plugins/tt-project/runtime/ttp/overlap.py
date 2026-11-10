@@ -263,6 +263,10 @@ def _on_push_branch(p, b: dict, seen: list, off: dict | None = None) -> bool:
         return True
     if off and off["tip"] and b["head"] in off["heads"]:
         return False
+    if off and off["tip"] and b["head"] in _carried(p, off):
+        off["heads"].append(b["head"])
+        off["dirty"] = True
+        return False
     from . import landed
 
     def read() -> bool:
@@ -292,9 +296,70 @@ def _load_off(p) -> dict:
         got = json.loads((p.state / OFF_CACHE).read_text())
     except (OSError, ValueError):
         got = None
-    heads = got["heads"] if isinstance(got, dict) and tip and got.get("tip") == tip \
-        and isinstance(got.get("heads"), list) else []
-    return {"tip": tip, "heads": heads, "dirty": not heads and bool(tip)}
+    ok = isinstance(got, dict) and isinstance(got.get("heads"), list) and isinstance(got.get("tip"), str)
+    heads = got["heads"] if ok and tip and got["tip"] == tip else []
+    prev = {"tip": got["tip"], "heads": got["heads"]} if ok and tip and got["tip"] != tip else None
+    return {"tip": tip, "heads": heads, "dirty": not heads and bool(tip), "prev": prev}
+
+
+def _carried(p, off: dict) -> set:
+    """The heads found off the push branch at its previous tip that stay off at the new one: none of
+    the commits the tip gained (old..new, no merges) is one of the head's own commits, names one in a
+    replay trailer, shares one's author, date and subject, or touches a file the head's commits touch,
+    which every check landed.py makes needs. Three git reads for all heads at once, read once per tip
+    move, instead of each branch's own landed reads at the first start after every landing."""
+    prev = off.get("prev")
+    if not prev or not prev["heads"]:
+        return set()
+    return gitmemo.cached(("overlap.carried", prev["tip"], off["tip"]),
+                          lambda: _carry(p, prev["tip"], off["tip"], prev["heads"]))
+
+
+def _commits(p, *revs: str) -> dict | None:
+    """{sha: (parents, identity, body, files)} of `git log revs`, or None if git failed."""
+    r = _git(p.root, "log", "--no-renames", "--name-only",
+             "--format=%x01%H%x00%P%x00%an%x00%ae%x00%at%x00%s%x00%B%x02", *revs)
+    if r.returncode != 0:
+        return None
+    out = {}
+    for chunk in r.stdout.split("\x01")[1:]:
+        head, _, files = chunk.partition("\x02")
+        parts = head.split("\x00")
+        if len(parts) != 7:
+            return None
+        out[parts[0]] = (parts[1].split(), "\x00".join(parts[2:6]), parts[6], set(files.split("\n")) - {""})
+    return out
+
+
+def _carry(p, t0: str, t1: str, heads: list) -> set:
+    from . import landed
+    try:
+        if _git(p.root, "merge-base", "--is-ancestor", t0, t1).returncode != 0:
+            return set()
+        new = _commits(p, f"{t0}..{t1}")
+        heads = [h for h in heads if re.fullmatch(r"[0-9a-f]{40,64}", str(h))]
+        mine = _commits(p, *heads, "--not", t0) if heads else {}
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return set()
+    if new is None or mine is None or any(len(c[0]) > 1 for c in new.values()):
+        return set()
+    names = {c[1] for c in new.values()}
+    files = set().union(*(c[3] for c in new.values()))
+    replayed = set(re.findall(rf"^{landed.REPLAYED}: ([0-9a-f]{{40,64}})[ \t]*$",
+                              "\n".join(c[2] for c in new.values()), re.M))
+    out = set()
+    for h in heads:
+        own, todo = set(), [h] if h in mine else []
+        while todo:
+            c = todo.pop()
+            if c in own or c not in mine:
+                continue
+            own.add(c)
+            todo += mine[c][0]
+        if own and not (own & (set(new) | replayed)) and all(
+                mine[c][1] not in names and not (mine[c][3] & files) for c in own):
+            out.add(h)
+    return out
 
 
 def _save_off(p, off: dict | None) -> None:

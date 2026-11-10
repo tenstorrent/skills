@@ -2371,16 +2371,28 @@ def test_a_workers_start_reads_no_git_per_unlanded_branch(env, monkeypatch):
     again = overlap.prompt_block(p, p.db.task(q))
     assert again == first and again.count("\n- #") == overlap.MAX_BRANCHES, again
     assert cold >= 24 and len(calls) <= 8, (cold, [" ".join(c[3:]) for c in calls])
-    # A new commit on the push branch's tip: the heads are read again, once.
+    # A new commit on the push branch's tip touching none of their files: the heads found off stay off,
+    # three batched reads for all of them instead of each branch's landed reads.
     (p.root / "other.txt").write_text("o\n")
     _git_out(p.root, "add", "other.txt")
     _git_out(p.root, "commit", "-qm", "other")
     _git_out(p.root, "update-ref", push_ref, "HEAD")
     calls.clear()
-    assert overlap.prompt_block(p, p.db.task(q)) == first and len(calls) >= 24
+    assert overlap.prompt_block(p, p.db.task(q)) == first
+    assert len(calls) <= 11, [" ".join(c[3:]) for c in calls]
     calls.clear()
     overlap.prompt_block(p, p.db.task(q))
     assert len(calls) <= 8, calls
+    # One branch lands as a rebased copy (same author, date and subject, same file): every head touching
+    # that file is read again, and that one is found on the push branch.
+    sha = next(ln.split()[0] for ln in _git_out(p.root, "log", "--all", "--format=%H %s").splitlines()
+               if ln.endswith(" lib 0"))
+    branch = _git_out(p.root, "branch", "--contains", sha, "--format=%(refname:short)").split()[0]
+    _git_out(p.root, "cherry-pick", sha)
+    _git_out(p.root, "update-ref", push_ref, "HEAD")
+    off = overlap._load_off(p)
+    assert off["prev"] and overlap._carried(p, off) == set()
+    assert overlap._on_push_branch(p, {"open": False, "head": sha, "branch": branch}, [], off)
 
 
 def test_slow_git_dispatch_starts_every_ready_task_in_one_step(env, monkeypatch, tmp_path, reap_tmp_processes):
