@@ -30,8 +30,11 @@ The per-wake cap itself, with coordinator.session.wake_budget_usd unset, is size
 (wake_usd): WAKE_FACTOR times the dearest of the last WAKES resumed wakes that ended ok (same
 provider, same model where there are any), never below the sized turn budget and never past what
 the dollar caps leave. Only ok wakes count, so a capped wake never raises the next cap by itself.
-A wake that still hits its cap is not lost: its session is kept and the next wake resumes it
-(coordsession.fail).
+With no such wake yet (a fresh project), NO_HISTORY_USD: a measured session wake costs about $0.6 to
+$2.4, over the $1 default turn budget most times. A wake that still hits its cap is not lost: its
+session is kept and the next wake reruns its batch resuming it (coordsession.fail), at RERUN_FACTOR
+times the capped wake's cap (rerun_usd), within the dollar caps only, so a rerun never repeats the
+cap that stopped it.
 
 The project and account caps stay hard, and the wake's whole cost is booked to the coordinator as
 before, so the spend guards count it."""
@@ -50,6 +53,8 @@ CACHE_WRITE_1H = 2.0   # a 1h cache write costs 2x input (cachettl.py); the 5m w
 SEED_FACTOR = 3.0
 WAKES = 20
 WAKE_FACTOR = 2.0   # room for a wake twice as dear as the dearest recent one
+NO_HISTORY_USD = 3.0   # the per-wake cap before any resumed wake ended ok: over the dearest measured wake
+RERUN_FACTOR = 2.0   # a capped wake's rerun gets this many times the cap that stopped it
 
 
 def _size(v) -> int:
@@ -140,9 +145,20 @@ def _wake_costs(db, provider: str, model: str | None) -> list[float]:
 
 def wake_usd(db, provider: str, model: str) -> float:
     """The per-wake cap a session wake's measured cost calls for: WAKE_FACTOR times the dearest of the
-    last WAKES resumed wakes that ended ok (this model's, else the provider's), 0 with none."""
+    last WAKES resumed wakes that ended ok (this model's, else the provider's), NO_HISTORY_USD with none."""
     costs = _wake_costs(db, provider, model or None) or _wake_costs(db, provider, None)
-    return round(WAKE_FACTOR * max(costs), 2) if costs else 0.0
+    return round(WAKE_FACTOR * max(costs), 2) if costs else NO_HISTORY_USD
+
+
+def rerun_usd(state) -> float:
+    """The per-wake cap the rerun of a wake that hit its dollar cap gets: RERUN_FACTOR times that cap
+    (coordsession.fail's capped_usd), 0 for any other wake."""
+    st = state if isinstance(state, dict) else {}
+    try:
+        capped = float(st.get("capped_usd") or 0) if st.get("rerun") else 0.0
+    except (TypeError, ValueError):
+        capped = 0.0
+    return round(RERUN_FACTOR * capped, 2) if capped > 0 else 0.0
 
 
 def cap(budget_usd: float, seed_usd: float, room: float | None) -> float:

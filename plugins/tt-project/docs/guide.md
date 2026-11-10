@@ -587,7 +587,11 @@ coordinator with that evidence.
   under the header above. A session wake's per-wake dollar cap, with `coordinator.session.wake_budget_usd` unset, is sized to
   the session: twice the dearest of the last 20 resumed wakes that ended ok, never below the sized turn
   budget (`coordinator.turn_budget_usd`) nor past what the project and account dollar caps leave; a set
-  value wins. A new session's first wake's dollar cap is the per-wake cap plus the expected seed cost,
+  value wins. With no such wake yet (a fresh project) it is $3, since a measured session wake costs
+  about $0.6 to $2.4. A wake stopped by its dollar cap reruns at once in the same session with twice
+  that cap, even over a set value, within the project and account dollar caps only, so it never stops
+  again at the cap that stopped it. A new session's first wake kept after its cap or timeout records
+  its seed's size, so its rerun compacts only once the session grows past that size. A new session's first wake's dollar cap is the per-wake cap plus the expected seed cost,
   within the project and account dollar caps only, never the hourly coordinator limit (seedcap.py): the dearest of the last 3 new-session wakes' seeds (their
   cache writes and uncached input at their own booked rate), each counted at most 3 times its
   seeded prompt size (`turn.session.seed_chars`; older wakes without it, their size before the

@@ -387,6 +387,7 @@ def record(state, usage, session_id: str, turn: dict, ok: bool, now: float, summ
     pending = st.pop("pending", None)   # this wake's memory_view hashes: sent once it ended ok
     st.pop("rerun", None)   # the failed resume's batch has run
     st.pop("fail_error", None)
+    st.pop("capped_usd", None)
     st.pop("rejected", None)
     if ok:
         st.pop("idle_fails", None)
@@ -434,6 +435,12 @@ def record(state, usage, session_id: str, turn: dict, ok: bool, now: float, summ
             st.update({"restore": True, "compact_floor": st["context_tokens"]})
         if mode == "resume" and turn.get("why") == "compact":
             st.pop("shrink", None)   # a wake-cost shrink request is asked once: that wake was its try
+    elif mode == "new" and st["id"]:   # a kept first wake (its cap, its timeout): its rerun resumes it
+        # with the seed's size, so limit() does not compact it in place right after the seed.
+        if base := _telemetry(usage, "first_context"):
+            st["base_tokens"] = base
+        if last := _telemetry(usage, "last_context"):
+            st["context_tokens"] = last
     return st
 
 
@@ -442,9 +449,11 @@ def rejected(error: str) -> bool:
     return bool(REJECTED.search(str(error or "")))
 
 
-def fail(cfg: dict, state, now: float, error: str = "", idle: bool = False) -> tuple[dict, bool]:
+def fail(cfg: dict, state, now: float, error: str = "", idle: bool = False,
+         capped_usd: float = 0) -> tuple[dict, bool]:
     """kv KEY after a resumed wake failed (`error`, kept for the rerun's note; `idle`: the agent did no
-    work in it): the next wake reruns its batch at once, resuming the same session (decide: "resume",
+    work in it; `capped_usd`: the per-wake cap it hit, which its rerun raises, seedcap.rerun_usd): the
+    next wake reruns its batch at once, resuming the same session (decide: "resume",
     "rerun"). Only when the provider rejected the session id (rejected()), or REJECT_AFTER idle failures
     of the same session came in a row, does it rerun as the next session seeded with the hand-off
     (decide: "new", "resume failed"). True when this failure is the FAIL_ALERT-th within the hour (the
@@ -455,6 +464,9 @@ def fail(cfg: dict, state, now: float, error: str = "", idle: bool = False) -> t
     run = int(_num(st.get("idle_fails"), 0)) + 1 if idle else 0
     st.update({"failures": fails, "rerun": True, "last_why": "resume failed", "fail_error": error,
                "idle_fails": run, "rejected": rejected(error) or run >= REJECT_AFTER})
+    st.pop("capped_usd", None)
+    if capped_usd and float(capped_usd) > 0:
+        st["capped_usd"] = round(float(capped_usd), 2)
     st.pop(DIGEST, None)
     st.pop("pending", None)
     st.pop("paused_until", None)   # an older daemon's pause: never read again

@@ -52,7 +52,10 @@ Budget: a wake stops at whichever comes first of coordinator.session.wake_budget
 --max-budget-usd) and wake_budget_s (the run's timeout); there is no tool-call cap. Unset, the dollar
 limit is sized to the session (seedcap.wake_usd: twice the dearest recent resumed wake that ended ok,
 never below the sized turn budget, coordinator.turn_budget_usd, default $1, nor past what the dollar
-caps leave), and the time limit is the effort-sized turn timeout (coordlimits.turn_timeout). A new
+caps leave; with no such wake yet, seedcap.NO_HISTORY_USD, sized to a measured session wake), and a
+wake its dollar cap stopped reruns with seedcap.RERUN_FACTOR times that cap, even over a set value,
+within the dollar caps only (seedcap.rerun_usd), so a rerun never repeats the cap that stopped it.
+The time limit is the effort-sized turn timeout (coordlimits.turn_timeout). A new
 session's first wake also gets its expected seed cost on top (seedcap.cap). A typical wake costs less
 than its ceiling: the session's cached context is read, not resent. A wake that hits either limit ends
 with what it has; once it did work in a saved session, the next wake reruns its batch resuming that

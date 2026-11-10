@@ -3595,6 +3595,15 @@ class Daemon:
                         measured = None
                         log(self.p, f"coordinator session wake cap failed: {type(e).__name__}: {e}"[:300])
                 budget_usd, timeout_s = coordtools.wake_budget(self.cfg, budget_usd, timeout_s, measured)
+                if budget_usd is not None:   # a capped wake's rerun never repeats the cap that stopped it
+                    try:
+                        if raised := seedcap.rerun_usd(self.p.db.kv(coordsession.KEY)):
+                            g = self.gates.get(provider)
+                            room = turnsize.dollar_room(dict(g.numbers) if g else {})
+                            raised = round(min(raised, room), 2) if room is not None else raised
+                            budget_usd = round(max(float(budget_usd), raised), 2)
+                    except Exception as e:   # the wake's own cap still bounds it
+                        log(self.p, f"coordinator session rerun cap failed: {type(e).__name__}: {e}"[:300])
                 note["turn"].update(timeout_s=timeout_s, wake_budget={"usd": budget_usd, "s": timeout_s})
         if role != "coordinator":   # a routed model pick runs its option's model and effort
             model, effort = modelpick.run_model(note, provider, model, effort)
@@ -6774,9 +6783,16 @@ class Daemon:
                         tail = ""
                     hit = next((ln.strip() for ln in tail.splitlines() if coordsession.rejected(ln)), "")
                     err = f"{err}; {hit[:200]}" if err and hit else err or hit[:200]
+                capped = 0.0   # the per-wake cap a dollar-capped wake hit: its rerun gets a raised one
+                if turnsize.over_budget(str(r.get("status") or ""), usage):
+                    try:
+                        capped = float(((json.loads(r.get("note") or "{}").get("turn") or {})
+                                        .get("wake_budget") or {}).get("usd") or 0)
+                    except (ValueError, TypeError, AttributeError):
+                        capped = 0.0
                 state, paused = coordsession.fail(
                     self.cfg, state, now, f"run {r['id']}: {err}",
-                    idle=not _has_tokens(usage) and not getattr(usage, "cost_usd", 0))
+                    idle=not _has_tokens(usage) and not getattr(usage, "cost_usd", 0), capped_usd=capped)
                 db.set_kv(coordsession.KEY, state)
                 text = (f"coordinator run {r['id']}: "
                         + ("the new session's first wake failed " if kept else "the session could not resume ")

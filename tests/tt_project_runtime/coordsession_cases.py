@@ -1487,9 +1487,13 @@ def _cs_book_tokens(p, rid, seed_usd, cost_usd, *, prompt_bytes=None, work="outp
            (cost_usd, cw, out, prompt_bytes or seed_tok * seedcap.CHARS_PER_TOKEN, rid))
 
 
-def _cs_seed_wakes(env, monkeypatch, seeds=(), **cfg):
+def _cs_seed_wakes(env, monkeypatch, seeds=(), no_history=0.0, **cfg):
     """A capped-fake session project whose earlier new-session wakes had `seeds` (oldest first): a seed
-    cost, or (seed cost, the wake's whole cost)."""
+    cost, or (seed cost, the wake's whole cost). `no_history`: the per-wake cap before any ok resumed
+    wake (seedcap.NO_HISTORY_USD; None: the shipped one), 0 by default so the sized turn budget shows."""
+    from ttp import seedcap
+    if no_history is not None:
+        monkeypatch.setattr(seedcap, "NO_HISTORY_USD", no_history, raising=False)
     p, holder, _, turn, _, _ = _cs_daemon(env, monkeypatch)
     _cs_capped_fake(monkeypatch)
     for k, v in cfg.items():
@@ -1686,15 +1690,92 @@ def test_coordsession_a_session_wake_over_the_old_one_dollar_cap_completes_and_t
     assert day["reasons"].get("resumed after a failed resume") == 1, day["reasons"]
 
 
+def test_coordsession_a_fresh_project_s_resumed_wake_over_one_dollar_completes_and_the_next_resumes(env, monkeypatch):
+    """With no ok resumed wake measured yet, the per-wake cap was the $1 turn budget, below a measured
+    session wake: a $1.50 resumed wake hit it, and its rerun hit the same cap. It now completes under
+    the shipped no-history cap, and the next wake resumes the same session."""
+    p, holder, turn = _cs_seed_wakes(env, monkeypatch, no_history=None)
+    monkeypatch.setenv("TTP_FAKE_COST", "0.5")
+    first, _, _, s0 = turn("EVENTS", budget_usd=1.0)
+    assert s0["mode"] == "new" and first["status"] == "ok", s0
+    runs = []
+    for total in (2.0, 3.5):   # the session's running total: a $1.50 wake, then at most its same-session rerun
+        monkeypatch.setenv("TTP_FAKE_COST", str(total))
+        runs.append(turn("EVENTS", budget_usd=1.0))
+        if runs[-1][0]["status"] == "ok":
+            break
+    done, _, _, s1 = runs[-1]
+    assert done["status"] == "ok" and s1["mode"] == "resume" and done["session_id"] == first["session_id"], \
+        [(r["status"], s) for r, _, _, s in runs]
+    monkeypatch.setenv("TTP_FAKE_COST", "4.2")
+    after, _, _, s2 = turn("EVENTS", budget_usd=1.0)
+    assert (s2["mode"], after["status"], after["session_id"]) == ("resume", "ok", first["session_id"]), s2
+
+
+def test_coordsession_a_capped_wake_s_rerun_gets_a_raised_cap_within_the_dollar_caps(env, monkeypatch):
+    """A resumed wake stopped by its per-wake cap reruns at once in the same session: at the same cap it
+    stopped again. The rerun gets seedcap.RERUN_FACTOR times that cap, bounded only by the dollar caps."""
+    from types import SimpleNamespace
+    from ttp import coordsession, seedcap
+    p, holder, turn = _cs_seed_wakes(env, monkeypatch)
+    p.set_config("coordinator.session.wake_budget_usd", 1.0)
+    monkeypatch.setenv("TTP_FAKE_COST", "0.5")
+    turn("EVENTS", budget_usd=1.0)
+    monkeypatch.setenv("TTP_FAKE_COST", "2.0")   # a $1.50 wake over its $1 cap (0.5 + 1.0)
+    capped, a1, _, _ = turn("EVENTS", budget_usd=1.0)
+    st = p.db.kv(coordsession.KEY)
+    assert capped["status"] != "ok" and _cs_cap(a1) == 1.5 and st["rerun"], st
+    monkeypatch.setenv("TTP_FAKE_COST", "3.5")   # the rerun does the $1.50 wake again on top of the capped one
+    rerun, a2, _, s2 = turn("EVENTS", budget_usd=1.0)
+    assert (s2["mode"], s2["why"], rerun["status"]) == ("resume", "rerun", "ok"), (rerun["status"], s2, a2)
+    assert _cs_cap(a2) == 4.0 and json.loads(rerun["note"])["turn"]["wake_budget"]["usd"] == 2.0, a2
+    assert st["capped_usd"] == 1.0 and seedcap.rerun_usd(st) == 2.0
+    assert "capped_usd" not in p.db.kv(coordsession.KEY), "an ok wake ends the raise"
+    # Capped again, with the dollar caps leaving $1.20: the raise stops there.
+    monkeypatch.setenv("TTP_FAKE_COST", "9.0")
+    turn("EVENTS", budget_usd=1.0)
+    holder["d"].gates = {"fake": SimpleNamespace(numbers={"daily_cap": 10.0, "spent_today": 8.8})}
+    monkeypatch.setenv("TTP_FAKE_COST", "9.1")
+    _, a4, _, s4 = turn("EVENTS", budget_usd=1.0)
+    assert s4["why"] == "rerun" and _cs_cap(a4) == round(9.0 + 1.2, 2), a4
+
+
+def test_coordsession_a_kept_new_session_s_rerun_compacts_above_its_seed(env, monkeypatch):
+    """A new session's first wake that hit its cap is kept, and its rerun resumes it. It did not record
+    the seed's size (base_tokens), so the rerun's compaction point sat under the seed it already holds
+    and the session compacted in place right after its seed."""
+    from ttp import coordsession
+    from ttp.providers.fake import Fake
+    seed = 400_000
+    parse = Fake.parse
+    def with_telemetry(self, *a, **kw):
+        u = parse(self, *a, **kw)
+        u.extra["cache_telemetry"] = {"first_context": seed, "last_context": seed + 5_000}
+        return u
+    monkeypatch.setattr(Fake, "parse", with_telemetry)
+    p, holder, turn = _cs_seed_wakes(env, monkeypatch)
+    monkeypatch.setenv("TTP_FAKE_COST", "9.0")
+    capped, _, _, s0 = turn("EVENTS", budget_usd=1.0)
+    assert s0["mode"] == "new" and capped["status"] != "ok" and capped["session_id"], s0
+    st = p.db.kv(coordsession.KEY)
+    assert st["base_tokens"] == seed and st["context_tokens"] == seed + 5_000, st
+    monkeypatch.setenv("TTP_FAKE_COST", "9.5")
+    rerun, a1, _, s1 = turn("EVENTS", budget_usd=1.0)
+    assert (s1["mode"], s1["why"]) == ("resume", "rerun"), s1
+    at = s1.get("compact_at") or json.loads(rerun["note"]).get("compact_at") \
+        or json.loads(rerun["note"]).get("turn", {}).get("compact_at")
+    assert at and at > seed + 5_000, (at, s1)
+
+
 def test_coordsession_the_per_wake_cap_is_sized_to_the_session_s_measured_wakes(env, monkeypatch):
     """With coordinator.session.wake_budget_usd unset, a wake's cap is twice the dearest recent ok resumed
     wake, never below the sized turn budget nor past what the dollar caps leave; a set value wins."""
     from types import SimpleNamespace
     from ttp import coordtools, seedcap
-    p, holder, turn = _cs_seed_wakes(env, monkeypatch)
+    p, holder, turn = _cs_seed_wakes(env, monkeypatch, no_history=None)
     wake = lambda r: json.loads(r["note"])["turn"]["wake_budget"]["usd"]
     first, *_ = turn("EVENTS", budget_usd=1.0)
-    assert wake(first) == 1.0, "no measured wake yet: the sized turn budget"
+    assert wake(first) == seedcap.NO_HISTORY_USD == 3.0, "no measured wake yet: the shipped session-wake default"
     for cost, status in ((0.7, "ok"), (1.5, "ok"), (6.0, "failed")):   # a capped wake never raises the cap
         rid = _cs_booked_run(p, "OLD", cost, "resume")
         p.db.x("UPDATE runs SET provider='fake', model='other', status=? WHERE id=?", (status, rid))
