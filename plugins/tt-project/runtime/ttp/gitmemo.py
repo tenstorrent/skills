@@ -305,6 +305,40 @@ MOVES = frozenset({"checkout", "switch", "reset", "rebase", "merge", "commit", "
                    "pull", "stash", "branch", "restore", "rm", "mv", "add", "apply", "symbolic-ref", "update-ref",
                    "fetch", "worktree", "submodule", "read-tree", "update-index"})
 _pass: contextvars.ContextVar[dict | None] = contextvars.ContextVar("ttp_gitpass", default=None)
+_kept: contextvars.ContextVar[bool] = contextvars.ContextVar("ttp_gitkept", default=False)
+kept_hits = [0]   # git reads kept_reads() answered without spawning git (Daemon._log_spawns takes it)
+
+
+@contextlib.contextmanager
+def kept_reads() -> Iterator[None]:
+    """Within it (outside an attempt), a git read whose answer gitreplay keeps across attempts (every rev
+    token a full id, or refs whose values are read from their files) is answered from that memo while
+    the refs are unchanged, and kept for the next time. The daemon's tick loop runs in it: its steps
+    asked git for the same heads, merge bases and trees every tick, most of its process starts. Worktree
+    and index reads, and every other volatile one, still run git each time."""
+    token = _kept.set(True)
+    try:
+        yield
+    finally:
+        _kept.reset(token)
+
+
+def _kept_run(argv, kw: dict, t: float | None) -> subprocess.CompletedProcess:
+    from . import gitreplay
+    k = gitreplay.key(argv, kw, is_read, _OPTS_WITH_VALUE)
+    if k is None:
+        return _spawn(argv, t, kw)
+    e = gitreplay.get(k, None, 0)
+    if e is not None and e.rc is not None:
+        kept_hits[0] += 1
+        return gitreplay.replay(e, argv, kw, t)
+    k.pre = gitreplay.classify(k)
+    check = bool(kw.pop("check", False))
+    r = _spawn(argv, t, kw)
+    gitreplay.put(k, r, None, 0)
+    if check and r.returncode:
+        raise subprocess.CalledProcessError(r.returncode, r.args, r.stdout, r.stderr)
+    return r
 
 
 @contextlib.contextmanager
@@ -406,6 +440,8 @@ keeps its own cap and makes the round's point of no return)."""
     args = git_args(argv)
     a = _att.get()
     if a is None:
+        if _kept.get() and is_read(args):
+            return _kept_run(argv, kw, _cap_timeout(timeout, args, read))
         return _spawn(argv, _cap_timeout(timeout, args, read), kw)
     rd = a.strict
     if rd:

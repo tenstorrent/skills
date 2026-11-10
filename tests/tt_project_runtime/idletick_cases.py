@@ -677,14 +677,17 @@ def test_the_spawn_counter_counts_children_by_step_and_program_and_resets_when_r
 
 
 def test_the_daemon_logs_its_spawns_per_window_by_step_and_program(env, monkeypatch):
-    from ttp import daemon as dmod, stepclock
+    from ttp import daemon as dmod, gitmemo, stepclock
     p = make(env)
     d = dmod.Daemon(p.base)
     t0 = d._spawn_logged
     assert d._log_spawns(t0 + 10) is None
     monkeypatch.setattr(stepclock, "spawns", lambda: {("reap_runs", "ps"): 30, ("dispatch", "git"): 20,
                                                       ("reap_runs", "git"): 10})
+    monkeypatch.setattr(gitmemo, "kept_hits", [7])
     rec = d._log_spawns(t0 + 600)
+    assert rec["git_kept"] == 7 and gitmemo.kept_hits == [0], "git reads the tick memo answered, per window"
+    assert "git reads answered from memory: 7" in (p.logs / "daemon.log").read_text()
     assert rec["per_min"] == 6.0 and rec["steps"] == {"reap_runs": 40, "dispatch": 20}
     assert rec["programs"] == {"ps": 30, "git": 30}
     assert p.db.kv(dmod.SPAWN_KV)["per_min"] == 6.0

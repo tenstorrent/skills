@@ -1187,6 +1187,84 @@ def test_gitreplay_answers_a_kept_read_without_git_and_drops_it_when_its_branch_
     assert st.returncode == 0 and len(spawns) == n + 3, "a worktree read is kept only within its attempt"
 
 
+def test_kept_reads_answer_a_tick_s_repeated_ref_read_without_git_until_the_ref_moves(tmp_path, monkeypatch):
+    """The daemon's tick loop runs in gitmemo.kept_reads(): a HEAD, branch or full-id read repeated
+    across ticks spawns git once while the refs (read from their files) are unchanged, and again once
+    the branch moves. A worktree read (status) runs git every time, takes no attempt's kept answer and
+    leaves it in place. Outside the mode nothing is kept."""
+    from ttp import gitmemo, gitreplay
+    repo = tmp_path / "r"
+    env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t",
+           "GIT_COMMITTER_EMAIL": "t@t"}
+    sh = lambda *a: subprocess.run(["git", "-C", str(repo), *a], check=True, capture_output=True,   # noqa: E731
+                                   text=True, env=env).stdout.strip()
+    repo.mkdir()
+    sh("init", "-q", "-b", "main")
+    sh("commit", "-q", "--allow-empty", "-m", "one")
+    first = sh("rev-parse", "HEAD")
+    gitreplay.clear()
+    spawns = _record_spawns(monkeypatch)
+    git = lambda *a: gitmemo.run(["git", "-C", str(repo), *a], capture_output=True, text=True)   # noqa: E731
+    assert git("rev-parse", "HEAD").stdout.strip() == first and len(spawns) == 1
+    assert git("rev-parse", "HEAD").stdout.strip() == first and len(spawns) == 2, "outside the mode: no memo"
+    hits = gitmemo.kept_hits[0]
+    for _tick in range(3):
+        with gitmemo.kept_reads():
+            assert git("rev-parse", "HEAD").stdout.strip() == first
+            assert git("rev-parse", "HEAD^{tree}").returncode == 0
+            assert git("rev-parse", first).stdout.strip() == first
+    assert len(spawns) == 5 and gitmemo.kept_hits[0] == hits + 6, "each read ran git once over three ticks"
+    sh("commit", "-q", "--allow-empty", "-m", "two")
+    second = sh("rev-parse", "HEAD")
+    with gitmemo.kept_reads():
+        assert git("rev-parse", "HEAD").stdout.strip() == second and len(spawns) == 6, "the branch moved"
+        assert git("rev-parse", first).stdout.strip() == first and len(spawns) == 6, "a full id's answer stays"
+        with pytest.raises(subprocess.CalledProcessError):
+            gitmemo.run(["git", "-C", str(repo), "rev-parse", "--verify", "nope"], capture_output=True,
+                        text=True, check=True)
+    with gitmemo.attempt():
+        git("status", "--porcelain")
+        n = len(spawns)
+    with gitmemo.kept_reads():
+        git("status", "--porcelain")
+        git("status", "--porcelain")
+    assert len(spawns) == n + 2, "a worktree read runs git every time"
+    k = gitreplay.key(["git", "-C", str(repo), "status", "--porcelain"], {"capture_output": True, "text": True},
+                      gitmemo.is_read, gitmemo._OPTS_WITH_VALUE)
+    assert gitreplay._memo.get(k.k) is not None and gitreplay._memo[k.k].kind == gitreplay.VOL, \
+        "the attempt's own worktree answer is left to it"
+
+
+def test_kept_reads_keep_no_large_or_volatile_answer(tmp_path, monkeypatch):
+    """A tick read keeps only small immutable or ref-dependent answers (MAX_TICK_ENTRY_BYTES), so the
+    daemon's memory does not grow with what its loop reads."""
+    from ttp import gitmemo, gitreplay
+    repo = tmp_path / "r"
+    env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t",
+           "GIT_COMMITTER_EMAIL": "t@t"}
+    repo.mkdir()
+    subprocess.run(["git", "-C", str(repo), "init", "-q", "-b", "main"], check=True)
+    (repo / "f").write_text("x" * 64)
+    subprocess.run(["git", "-C", str(repo), "add", "f"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "one"], check=True, env=env)
+    gitreplay.clear()
+    spawns = _record_spawns(monkeypatch)
+    monkeypatch.setattr(gitreplay, "MAX_TICK_ENTRY_BYTES", 32)
+    show = ["git", "-C", str(repo), "show", "HEAD:f"]
+    with gitmemo.kept_reads():
+        for _ in range(2):
+            assert gitmemo.run(show, capture_output=True, text=True).stdout == "x" * 64
+        for _ in range(2):
+            gitmemo.run(["git", "-C", str(repo), "ls-files"], capture_output=True, text=True)
+    assert len(spawns) == 4 and not gitreplay._memo, "an answer over the cap and a volatile one are not kept"
+    monkeypatch.setattr(gitreplay, "MAX_TICK_ENTRY_BYTES", 1024)
+    monkeypatch.setattr(gitreplay, "MAX_TICK_BYTES", 400)
+    with gitmemo.kept_reads():
+        gitmemo.run(show, capture_output=True, text=True)
+        gitmemo.run(["git", "-C", str(repo), "cat-file", "-p", "HEAD:f"], capture_output=True, text=True)
+    assert len(gitreplay._memo) == 1 and gitreplay._bytes[0] <= 400, "all tick answers stay under MAX_TICK_BYTES"
+
+
 def _record_spawns(monkeypatch) -> list:
     """Every git gitmemo spawns from here on. The system config lookup (gitcache._system_config, a
     `git var` asked once per process, before the first kept read) is pinned, so the count does not

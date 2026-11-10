@@ -1432,12 +1432,13 @@ class Daemon:
             progs[prog] = progs.get(prog, 0) + n
         top = lambda d: dict(sorted(d.items(), key=lambda kv: -kv[1])[:8])
         per_min = sum(got.values()) * 60 / window
+        kept, gitmemo.kept_hits[0] = gitmemo.kept_hits[0], 0
         rec = {"ts": time.time(), "window_s": round(window), "per_min": round(per_min, 1),
-               "steps": top(steps), "programs": top(progs)}
+               "steps": top(steps), "programs": top(progs), "git_kept": kept}
         self.p.db.set_kv(SPAWN_KV, rec)
         say = lambda d: ", ".join(f"{k} {v}" for k, v in d.items()) or "none"
         log(self.p, f"spawns: {per_min:.1f}/min over {window / 60:.0f} min; steps: {say(rec['steps'])}; "
-                    f"programs: {say(rec['programs'])}")
+                    f"programs: {say(rec['programs'])}; git reads answered from memory: {kept}")
         return rec
 
     def _nap(self, seconds: float) -> None:
@@ -1584,7 +1585,9 @@ class Daemon:
         self.check_integrity(start=True)
         while not self.stopping:
             try:
-                with ps_snapshot():   # every pid question of the tick shares one `ps` (per PS_SNAPSHOT_MAX_S)
+                # every pid question of the tick shares one `ps` (per PS_SNAPSHOT_MAX_S); ref and immutable git
+                # reads, repeated every tick, run git once per ref value (gitmemo.kept_reads)
+                with ps_snapshot(), gitmemo.kept_reads():
                     self.tick()
                 self._tick_ended()
                 self._beat()
@@ -1595,7 +1598,8 @@ class Daemon:
                     log(self.p, "restart reap error: " + traceback.format_exc().replace("\n", " | ")[:2000])
                 applyff.take(self.p)          # a sandboxed `ttp upgrade --apply` asks for its fast-forward
                 landff.take(self.p)           # a sandboxed `ttp land` asks for the fast-forward of a checkout
-                self._restart_on_moved_runtime()
+                with gitmemo.kept_reads():    # its HEAD and tree reads, every tick
+                    self._restart_on_moved_runtime()
                 service.take_restart_request(self.p, self._started)   # a sandboxed `ttp upgrade --apply` asked
             except Exception:  # a bad tick must never kill the daemon
                 log(self.p, "tick error: " + traceback.format_exc().replace("\n", " | ")[:2000])
