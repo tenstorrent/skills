@@ -10508,7 +10508,7 @@ def cmd_account_config(key: str, value: str | None) -> None:
     print(f"{key} = {json.dumps(val)} (account-level, every project on this machine{was})" if val != ""
           else f"{key} removed (account-level{was}); the default applies")
     if key in ("budget.daily_usd", "budget.weekly_usd"):
-        from .project import DEFAULT_CONFIG, weekly_below_daily, weekly_default
+        from .project import weekly_below_daily, weekly_default
         acct = load_account_settings().get("budget") or {}
         b = deep_merge(DEFAULT_CONFIG["budget"], acct)
         weekly_default(b, acct)
