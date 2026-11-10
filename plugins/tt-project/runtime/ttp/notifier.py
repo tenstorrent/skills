@@ -875,7 +875,7 @@ def refresh(send_test: bool, always: bool = False) -> list[str]:
     run = running()
     built = ensure_app()[1]
     out = ["desktop notifier: " + built] if built else []
-    if always or not run or run.get("code") != want:
+    if always or not run or run.get("code") != want or _background(agent_file()):
         out.append(f"desktop notifier: {install()} (runs ttp {want})")
     if send_test:
         if delivery().get("tested") == want and not built:
@@ -884,6 +884,17 @@ def refresh(send_test: bool, always: bool = False) -> list[str]:
         else:
             out += ["desktop notifier: " + ln if i == 0 else ln for i, ln in enumerate(test_once(want)[1])]
     return out
+
+
+def _background(f: Path | None) -> bool:
+    """An agent an older tt-project installed with launchd's ProcessType Background: install() rewrites it."""
+    if not f or f.suffix != ".plist":
+        return False
+    import plistlib
+    try:
+        return plistlib.loads(f.read_bytes()).get("ProcessType") == "Background"
+    except (OSError, ValueError, AttributeError, plistlib.InvalidFileException):
+        return False
 
 
 def test_once(want: str | None = None, ask=None) -> tuple[bool, list[str]]:
@@ -1008,7 +1019,7 @@ def install() -> str:
         durable_write(plist, plistlib.dumps({
             "Label": LABEL, "ProgramArguments": argv, "WorkingDirectory": str(HOME_DIR),
             "EnvironmentVariables": env, "RunAtLoad": True, "KeepAlive": True,
-            "ProcessType": "Background", "StandardOutPath": str(LOG), "StandardErrorPath": str(LOG)}))
+            "ProcessType": "Standard", "StandardOutPath": str(LOG), "StandardErrorPath": str(LOG)}))
         subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}/{LABEL}"], capture_output=True)
         r = subprocess.run(["launchctl", "bootstrap", f"gui/{os.getuid()}", str(plist)], capture_output=True, text=True)
         return "installed and started (launchd)" if r.returncode == 0 else f"launchd failed: {r.stderr.strip()[:200]}"

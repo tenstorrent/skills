@@ -5631,3 +5631,26 @@ def test_the_https_check_fails_fast_when_the_host_does_not_resolve(monkeypatch):
     monkeypatch.setattr(dm, "_resolves", lambda host: False)
     monkeypatch.setattr(urllib.request, "urlopen", lambda *a, **k: opened.append(a))
     assert dm._https_reaches("api.example.com") is False and opened == []
+
+
+def test_the_notifier_agent_runs_at_standard_priority_and_an_old_background_one_is_reinstalled(
+        env, monkeypatch, tmp_path):
+    import plistlib
+    from ttp import notifier
+    _install_template(env)
+    _notifier_files(monkeypatch, tmp_path)
+    monkeypatch.setenv("HOME", str(tmp_path / "userhome"))
+    monkeypatch.delenv("TTP_TEST_NO_NOTIFIER", raising=False)
+    monkeypatch.setattr(notifier.sys, "platform", "darwin")
+    monkeypatch.setattr(notifier.subprocess, "run", lambda args, **kw: subprocess.CompletedProcess(args, 0, "", ""))
+    assert notifier.install() == "installed and started (launchd)"
+    plist = notifier.agent_file()
+    assert plistlib.loads(plist.read_bytes())["ProcessType"] == "Standard"
+    # An agent an older tt-project installed at Background priority is reinstalled though it runs this code.
+    monkeypatch.setattr(notifier, "enabled", lambda max_age_s=0: True)
+    monkeypatch.setattr(notifier, "running", lambda: {"code": notifier.installed_code()})
+    monkeypatch.setattr(notifier, "ensure_app", lambda: (None, ""))
+    assert notifier.refresh(send_test=False) == []
+    plist.write_bytes(plistlib.dumps({**plistlib.loads(plist.read_bytes()), "ProcessType": "Background"}))
+    assert notifier.refresh(send_test=False)[0].startswith("desktop notifier: installed and started (launchd)")
+    assert plistlib.loads(plist.read_bytes())["ProcessType"] == "Standard"

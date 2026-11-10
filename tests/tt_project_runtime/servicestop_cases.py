@@ -264,3 +264,96 @@ def test_a_new_daemons_first_tick_ends_a_deferred_restart(env):
     assert json.loads((p.state / service.RESTART_DEFERRED).read_text())["runtime"]
     Daemon(p.base)._beat()
     assert not (p.state / service.RESTART_DEFERRED).exists(), "the new daemon's tick left the restart unjudged"
+
+
+
+def _launchd_calls(monkeypatch):
+    """service and tunnel on macOS with nothing run; returns the launchctl calls."""
+    from ttp import service, tunnel
+    calls = []
+    run = lambda *a: (a[0] == "launchctl" and calls.append(a)) or subprocess.CompletedProcess(a, 0, "", "")
+    monkeypatch.setattr(service, "_run", run)
+    monkeypatch.setattr(tunnel, "_run", run)
+    monkeypatch.setattr(service.sys, "platform", "darwin")
+    return calls
+
+
+def test_the_daemon_plist_runs_standard_and_the_watchdog_and_tunnels_stay_background(env, monkeypatch):
+    """ProcessType Background puts the daemon and every child (workers, git, pytest) on efficiency cores
+    with throttled I/O: the daemon is Standard (its workers and checks stay niced) and keeps
+    AbandonProcessGroup; the watchdog and kept tunnels stay Background (owner's agent msg #169)."""
+    import plistlib
+    from ttp import service, tunnel
+    p = make(env)
+    monkeypatch.setenv("HOME", str(env["tmp"] / "userhome"))
+    calls = _launchd_calls(monkeypatch)
+    assert service._install_launchd(p).endswith(" with a watchdog"), calls
+    daemon, watchdog = (plistlib.loads(service._agent(p, wd).read_bytes()) for wd in (False, True))
+    assert daemon["ProcessType"] == "Standard" and daemon["AbandonProcessGroup"] is True, daemon
+    assert watchdog["ProcessType"] == "Background", watchdog
+    assert tunnel.launchd_plist("host-a", ["ssh", "host-a"])["ProcessType"] == "Background"
+
+
+@pytest.mark.parametrize("old", [{"ProcessType": "Background", "AbandonProcessGroup": True},
+                                 {"ProcessType": "Background"}, {"ProcessType": "Standard"}])
+def test_an_upgrade_over_an_old_daemon_plist_rewrites_it_standard_and_reloads_it(env, monkeypatch, old):
+    """`ttp upgrade` restarts through restart_service: a daemon plist an older tt-project installed
+    (Background, or without AbandonProcessGroup) gets DAEMON_KEYS, keeps its other keys, and is
+    reloaded by bootout and bootstrap (kickstart keeps the loaded job). The watchdog's stays; a second
+    restart only kickstarts."""
+    import plistlib
+    from ttp import service
+    p = make(env)
+    monkeypatch.setenv("HOME", str(env["tmp"] / "userhome"))
+    monkeypatch.delenv("XPC_SERVICE_NAME", raising=False)
+    calls = _launchd_calls(monkeypatch)
+    for wd in (False, True):
+        f = service._agent(p, wd)
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_bytes(plistlib.dumps({"Label": service.launchd_label(p, wd), "Extra": "kept",
+                                      **(old if not wd else {"ProcessType": "Background"})}))
+    uid, label = os.getuid(), service.launchd_label(p)
+    assert service.restart_service(p) == "restarted"
+    job = plistlib.loads(service._agent(p).read_bytes())
+    assert job == {"Label": label, "Extra": "kept", "ProcessType": "Standard", "AbandonProcessGroup": True}, job
+    assert plistlib.loads(service._agent(p, True).read_bytes())["ProcessType"] == "Background"
+    assert calls == [("launchctl", "bootout", f"gui/{uid}/{label}"),
+                     ("launchctl", "bootstrap", f"gui/{uid}", str(service._agent(p)))], calls
+    calls.clear()
+    assert service.restart_service(p) == "restarted"
+    assert calls == [("launchctl", "kickstart", "-k", f"gui/{uid}/{label}")], calls
+
+
+def test_the_daemon_reloading_its_own_rewritten_plist_does_it_from_a_new_session(env, monkeypatch):
+    """The daemon (or a worker under it) restarting itself: bootout would end the caller before its
+    bootstrap, so both run in a new session. From the watchdog's job they run in the foreground, and a
+    bootstrap refused falls back to a hand start."""
+    import plistlib
+    from ttp import service
+    p = make(env)
+    monkeypatch.setenv("HOME", str(env["tmp"] / "userhome"))
+    calls = _launchd_calls(monkeypatch)
+    spawned, popen = [], []
+    monkeypatch.setattr(service, "_spawn", lambda p: spawned.append(p))
+    monkeypatch.setattr(service.subprocess, "Popen", lambda argv, **kw: popen.append((argv, kw)))
+
+    def old():
+        f = service._agent(p)
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_bytes(plistlib.dumps({"Label": service.launchd_label(p), "ProcessType": "Background"}))
+    label = service.launchd_label(p)
+    old()
+    service._agent(p, watchdog=True).write_bytes(plistlib.dumps({"Label": "w", "ProcessType": "Background"}))
+    monkeypatch.setenv("XPC_SERVICE_NAME", label)
+    assert service.restart_service(p) == "restarted" and not calls and not spawned
+    (argv, kw), = popen
+    assert argv[:2] == ["sh", "-c"] and kw["start_new_session"], popen
+    assert f"launchctl bootout gui/{os.getuid()}/{label};" in argv[2] and str(service._agent(p)) in argv[2]
+    old()
+    popen.clear()
+    monkeypatch.setenv("XPC_SERVICE_NAME", service.launchd_label(p, watchdog=True))
+    monkeypatch.setattr(service, "_run", lambda *a: (a[0] == "launchctl" and calls.append(a)) or subprocess.CompletedProcess(
+        a, 5 if a[1:2] == ("bootstrap",) else 0, "", "refused"))
+    assert service.restart_service(p) == "restarted" and spawned == [p] and not popen
+    assert [c[1] for c in calls] == ["bootout", "bootstrap"] and calls[0][2].endswith(f"/{label}"), calls
+    assert plistlib.loads(service._agent(p).read_bytes())["ProcessType"] == "Standard"

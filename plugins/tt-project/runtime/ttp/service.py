@@ -37,6 +37,11 @@ def unit_name(p: Project) -> str:
 
 
 WATCHDOG_EVERY_S = 300   # how often launchd and cron look for a stuck daemon
+# launchd's ProcessType Background runs an agent and every child (workers, git, pytest, ttp push) at
+# darwin background priority: efficiency cores only and throttled I/O. The daemon runs Standard; its
+# workers, reviewers and checks stay polite at runner.nice. The watchdog and tunnels stay Background.
+# An installed daemon plist lacking any of these keys is rewritten on upgrade (refresh).
+DAEMON_KEYS = {"ProcessType": "Standard", "AbandonProcessGroup": True}
 
 
 def daemon_argv(p: Project) -> list[str]:
@@ -306,8 +311,8 @@ def _install_launchd(p: Project) -> str:
     plist.parent.mkdir(parents=True, exist_ok=True)
     p.logs.mkdir(parents=True, exist_ok=True)
     job = {"Label": label, "ProgramArguments": daemon_argv(p), "WorkingDirectory": str(p.base),
-           "EnvironmentVariables": _env(p), "RunAtLoad": True, "KeepAlive": True, "ProcessType": "Background",
-           "ThrottleInterval": 10, "AbandonProcessGroup": True, "StandardOutPath": str(p.logs / "launchd.log"),
+           "EnvironmentVariables": _env(p), "RunAtLoad": True, "KeepAlive": True, **DAEMON_KEYS,
+           "ThrottleInterval": 10, "StandardOutPath": str(p.logs / "launchd.log"),
            "StandardErrorPath": str(p.logs / "launchd.log")}
     durable_write(plist, plistlib.dumps(job))
     uid = os.getuid()
@@ -438,9 +443,44 @@ def down_note(p: Project) -> str:
 _WATCHDOG_SEEN: dict[str, tuple[float, str | None]] = {}
 
 
-def refresh(p: Project) -> None:
+def update_plist(path: Path, want: dict) -> bool:
+    """Set `want`'s keys in an installed agent's plist, keeping its other keys; True when it changed.
+    launchd reads a plist only at bootstrap: reload the agent after."""
+    try:
+        job = plistlib.loads(path.read_bytes())
+    except (OSError, ValueError, plistlib.InvalidFileException):
+        return False
+    if not isinstance(job, dict) or all(job.get(k) == v for k, v in want.items()):
+        return False
+    job.update(want)
+    durable_write(path, plistlib.dumps(job))
+    return True
+
+
+def _reload_agent(label: str, plist: Path, inside: bool) -> subprocess.CompletedProcess:
+    """bootout, then bootstrap: how launchd takes a changed plist (kickstart keeps the loaded one).
+    From inside that agent's job (`inside`) both run in a new session, which outlives the bootout."""
+    target, domain = f"gui/{os.getuid()}/{label}", f"gui/{os.getuid()}"
+    if inside:
+        subprocess.Popen(["sh", "-c", f"launchctl bootout {shlex.quote(target)}; "
+                                      f"launchctl bootstrap {domain} {shlex.quote(str(plist))}"],
+                         start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return subprocess.CompletedProcess([], 0, "", "")
+    _run("launchctl", "bootout", target)
+    return _run("launchctl", "bootstrap", domain, str(plist))
+
+
+def _inside(p: Project, label: str) -> bool:
+    """This process runs in launchd job `label` (launchd names it in XPC_SERVICE_NAME) or is the daemon."""
+    from .daemon import _read_pid
+    return os.environ.get("XPC_SERVICE_NAME") == label or _read_pid(p.state / "daemon.pid") == os.getpid()
+
+
+def refresh(p: Project) -> bool:
     """Bring an installed service up to date with this runtime (a service installed before the
-    watchdog existed gets it) without starting or stopping anything."""
+    watchdog existed gets it) without starting or stopping anything. True when it rewrote the
+    daemon's launchd plist to DAEMON_KEYS (an older Background one): restart_service reloads it."""
+    rewrote = sys.platform == "darwin" and update_plist(_agent(p), DAEMON_KEYS)
     unit = _unit(p)
     if unit.exists():
         changed = unit.read_text(errors="replace") != _unit_text(p)
@@ -459,14 +499,19 @@ def refresh(p: Project) -> None:
             keep += _cron_lines(p)
             subprocess.run(hoststate.argv(["crontab", "-"]), input="\n".join(keep) + "\n", text=True, capture_output=True)
     _WATCHDOG_SEEN.pop(str(p.base), None)
+    return rewrote
 
 
 def restart_service(p: Project) -> str:
-    """Restart the daemon process. Running workers are not touched: the new daemon adopts them."""
-    refresh(p)
+    """Restart the daemon process. Running workers are not touched: the new daemon adopts them (they
+    run in sessions of their own, and the agent's AbandonProcessGroup keeps them through a bootout)."""
+    rewrote = refresh(p)
     label = launchd_label(p)
     if sys.platform == "darwin" and _agent(p).exists():
-        r = _run("launchctl", "kickstart", "-k", f"gui/{os.getuid()}/{label}")
+        if rewrote:
+            r = _reload_agent(label, _agent(p), _inside(p, label))
+        else:
+            r = _run("launchctl", "kickstart", "-k", f"gui/{os.getuid()}/{label}")
         if r.returncode == 0:
             return "restarted"
         # The agent is not loaded (its bootstrap failed): restart the daemon by hand like cron does.
