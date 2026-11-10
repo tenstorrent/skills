@@ -74,6 +74,8 @@ INSTRUCTIONS_PREFIX = 4096
 MODEL_ITEMS = ("reasoning", "function_call", "custom_tool_call", "local_shell_call", "web_search_call")
 # Tools a decision-only turn does without, switched off when this build lists them as features.
 READ_ONLY_OFF = ("shell_tool", "unified_exec", "web_search_request")
+# Codex adds its memories to the developer message after our instructions under this heading.
+CODEX_MEMORY_HEAD = "## Memory"
 HOOK_TRUST_BYPASS = "--dangerously-bypass-hook-trust"
 IGNORE_USER_CONFIG = "--ignore-user-config"
 IGNORE_RULES = "--ignore-rules"
@@ -191,41 +193,68 @@ class Codex(Provider):
         # `codex exec resume` keeps the developer messages saved in the rollout and takes no new
         # `-c developer_instructions` (0.160), and re-sends them after a compaction (each compacted
         # row's histories hold them too). A worker forked from a coordinator without tools so ran under
-        # "This session has no tools" and did no work. The run's text replaces the harness's own blocks
-        # in every developer message, wherever it is nested; Codex's own blocks (they start with "<",
-        # as <skills_instructions>) stay.
+        # "This session has no tools" and did no work. The run's text replaces the harness's block in
+        # every developer message, wherever it is nested: the part equal to the session's harness text
+        # (its first developer part of our own), else a message's first such part. Codex's own blocks
+        # (they start with "<", as <skills_instructions>, or are its "## Memory" block) and every other
+        # part stay as they were.
         src = self.session_paths(session_id, cwd, env)
         if not src:
             return ""   # nothing here to rewrite: the resume finds no session either, or one Codex keeps elsewhere
         path = max(src, key=lambda x: x.stat().st_mtime)
-        hits = [0]
+        hits, harness = [0], [None]
+
+        def ours(part):
+            if not (isinstance(part, dict) and isinstance(part.get("text"), str)):
+                return False
+            head = part["text"].lstrip()
+            return not (head.startswith("<") or head.startswith(CODEX_MEMORY_HEAD))
+
+        def developer(node):
+            return isinstance(node, dict) and node.get("role") == "developer" \
+                and isinstance(node.get("content"), list)
+
+        def find(node):   # the session's harness text: the first developer part of our own
+            if harness[0] is not None:
+                return
+            if developer(node):
+                harness[0] = next((x["text"] for x in node["content"] if ours(x)), None)
+            elif isinstance(node, (list, dict)):
+                for x in (node if isinstance(node, list) else node.values()):
+                    find(x)
 
         def swap(node):
             if isinstance(node, list):
                 return [swap(x) for x in node]
             if not isinstance(node, dict):
                 return node
-            if node.get("role") == "developer" and isinstance(node.get("content"), list):
-                content, mine = [], False
-                for part in node["content"]:
-                    if isinstance(part, dict) and isinstance(part.get("text"), str) \
-                            and not part["text"].lstrip().startswith("<"):
+            if developer(node):
+                parts = node["content"]
+                mine = [i for i, x in enumerate(parts) if ours(x) and x["text"] == harness[0]]
+                if not mine:
+                    mine = [i for i, x in enumerate(parts) if ours(x)][:1]
+                content = []
+                for i, part in enumerate(parts):
+                    if i in mine:
                         hits[0] += 1
-                        if mine:   # one harness block per message: the run's text once
+                        if i != mine[0]:   # the harness text twice in one message: the run's text once
                             continue
-                        part, mine = {**part, "text": text}, True
+                        part = {**part, "text": text}
                     content.append(part)
                 return {**node, "content": content}
             return {k: swap(v) for k, v in node.items()}
 
-        out = []
+        rows = []
         for line in path.read_text(errors="replace").split("\n"):
             try:
                 row = json.loads(line)
             except ValueError:
-                out.append(line)   # a partial or blank line stays as it was
-                continue
-            out.append(json.dumps(swap(row)) if isinstance(row, (dict, list)) else line)
+                row = None
+            rows.append((line, row if isinstance(row, (dict, list)) else None))
+            if rows[-1][1] is not None:
+                find(row)
+        # a partial or blank line stays as it was
+        out = [line if row is None else json.dumps(swap(row)) for line, row in rows]
         if not hits[0]:
             return "the session holds no developer instructions to replace"
         from ..project import durable_write

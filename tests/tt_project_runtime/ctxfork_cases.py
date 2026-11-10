@@ -908,20 +908,64 @@ def test_codex_own_instructions_replace_the_sessions_harness_text_everywhere(mon
     assert copy.stat().st_mode & 0o777 == 0o600 and src.read_bytes() == before
     rows = [json.loads(x) for x in text.splitlines()]
     assert rows[-1]["payload"]["type"] == "task_complete"
-    # Twice is the same; a message holding two harness blocks keeps the run's text once.
+    # Twice is the same; a message holding the harness text twice keeps the run's text once, and its
+    # other parts stay (task #210).
     assert codex.own_instructions(new, "/run", own, worker) == "" and copy.read_text().count("WORKER RULES") == 3
     two = str(uuid.uuid4())
     path = _fork_codex_rollout(home, two)
-    path.write_text(json.dumps({"type": "response_item", "payload": _dev("# a", "<x>", "# b")}) + "\n" + '{"partial')
+    path.write_text(json.dumps({"type": "response_item", "payload": _dev("# a", "<x>", "# a", "# b")}) + "\n" + '{"partial')
     assert codex.own_instructions(two, "/", None, worker) == ""
     lines = path.read_text().split("\n")
-    assert [c["text"] for c in json.loads(lines[0])["payload"]["content"]] == [worker, "<x>"]
+    assert [c["text"] for c in json.loads(lines[0])["payload"]["content"]] == [worker, "<x>", "# b"]
     assert lines[-1] == '{"partial'   # a line still being written stays as it was
     assert codex.own_instructions(str(uuid.uuid4()), "/", None, worker) == ""   # no session here: nothing to do
     bare = str(uuid.uuid4())
     _fork_codex_rollout(home, bare)
     assert "no developer instructions" in codex.own_instructions(bare, "/", None, worker)
     assert get("claude").own_instructions(sid, "/run", None, worker) == "" and src.read_bytes() == before
+
+
+def test_codex_own_instructions_keep_codexs_memory_block(monkeypatch, tmp_path):
+    """Task #210 (review #203 of #198): Codex appends its own "## Memory" block (no "<") to the developer
+    message after the harness text. The swap replaces only the harness text, at top level and inside
+    compactions; the Memory block, Codex's <...> blocks and their order stay exactly as they were."""
+    from ttp.providers import get_provider as get
+    codex = get("codex")
+    home = tmp_path / "codex-home"
+    monkeypatch.setenv("CODEX_HOME", str(home))
+    sid, new = str(uuid.uuid4()), str(uuid.uuid4())
+    path = _fork_codex_rollout(home, sid)
+    memory = "## Memory\n\nYou have notes from earlier sessions.\n- prefer short answers"
+    msg = _dev(_CODEX_COORD_TEXT, memory, "<skills_instructions>skills</skills_instructions>")
+    rows = [json.loads(x) for x in path.read_text().split("\n")[:4]]
+    compacted = {"type": "compacted", "payload": {"message": "", "replacement_history": [msg],
+                                                  "guardian_history": [{"items": [msg]}]}}
+    alone = _dev("  " + memory)   # a message holding only Codex's Memory block: nothing of ours to replace
+    path.write_text("\n".join(json.dumps(r) for r in rows[:1] + [{"type": "response_item", "payload": msg},
+                                                                  {"type": "response_item", "payload": alone}]
+                              + rows[1:3] + [compacted] + rows[3:]) + "\n")
+    before = path.read_bytes()
+    own = {"CODEX_HOME": str(tmp_path / "run-home")}
+    assert codex.fork_session(sid, "/run", own, new) == ""
+    worker = "# WORKER RULES\nuse your tools"
+    assert codex.own_instructions(new, "/run", own, worker) == ""
+    [copy] = list((tmp_path / "run-home" / "sessions").glob(f"*/*/*/rollout-*-{new}.jsonl"))
+    text = copy.read_text()
+    assert "no tools" not in text and "You coordinate" not in text and text.count("WORKER RULES") == 3
+    want = [worker, memory, "<skills_instructions>skills</skills_instructions>"]
+    got = []
+
+    def walk(node):
+        if isinstance(node, dict) and node.get("role") == "developer":
+            got.append([c["text"] for c in node["content"]])
+        elif isinstance(node, (list, dict)):
+            for x in (node if isinstance(node, list) else node.values()):
+                walk(x)
+    for line in text.splitlines():
+        walk(json.loads(line))
+    assert got == [want, ["  " + memory], want, want], got   # top level, alone, replacement, guardian
+    assert path.read_bytes() == before   # the coordinator's session is never written
+    assert codex.own_instructions(new, "/run", own, worker) == "" and copy.read_text() == text   # twice is the same
 
 
 def test_codex_worker_runs_start_with_their_own_instructions_and_the_coordinator_keeps_its(env, monkeypatch, tmp_path):
