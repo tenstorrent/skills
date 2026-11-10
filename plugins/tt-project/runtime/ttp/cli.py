@@ -12827,6 +12827,13 @@ def _apply_upgrade(p: Project, commit: str) -> None:
             f"worktree: `git merge main`, check again, commit, then rerun with the new commit.", 1)
     from . import applyff
     base = _git(h, "rev-parse", "HEAD")
+    if (dirty := applyff.foreign_edits(h, base, merged)):
+        # Another harness task (or a hand edit) left these uncommitted in the live checkout: git would refuse
+        # the fast-forward. Busy, not failed: nothing was changed and a rerun once they are committed applies.
+        die(f"--apply deferred: the live harness checkout has uncommitted changes this upgrade did not make "
+            f"to {len(dirty)} file(s) it would write ({', '.join(dirty[:5])}{', ...' if len(dirty) > 5 else ''}); "
+            f"nothing was changed and main is still {base[:12]}. Rerun `ttp upgrade {p.name} --apply {commit}` "
+            f"once they are committed or put back", UPGRADE_BUSY)
     # A worker sandbox writes the harness's .git but not its working tree: the daemon moves main instead.
     # A daemon older than that is restarted onto the runtime on disk first, before the journal names the
     # merge: the new daemon then finds no merge to recover.
@@ -12934,11 +12941,14 @@ In this harness repo:
    (a daemon too old to take its fast-forward request is restarted onto the runtime on disk first).
    Its exit code says what happened; act on it alone:
    - Exit 0: done, remove <tmp>.
-   - Exit 75: busy, nothing was changed (the daemon is landing harness worktrees, or another upgrade
-     runs): main is as it was and no restart is coming, so never wait on restart.request. Keep <tmp> and
+   - Exit 75: busy, nothing was changed (the daemon is landing harness worktrees, another upgrade
+     runs, or another task left uncommitted edits in the live checkout): main is as it was and no restart is coming, so never wait on restart.request. Keep <tmp> and
      rerun this step once the landing ends (a minute or two), or hand off `waiting` with
      retry_after_s 300 and retry_when `ttp lock --probe harness-upgrade` (tell it from exit 76 by its
-     "nothing was changed" line).
+     "nothing was changed" line). When its line says the live checkout has uncommitted changes this
+     upgrade did not make (another harness task's edit to files it would write), keep <tmp>, never commit,
+     revert or stash those changes, and hand off `waiting` with retry_after_s 300 and retry_when
+     `test "$(date +%s)" -ge <now + 300>`, then rerun this step.
    - Exit 76: main is applied and the restart deferred; the old daemon runs on and restarts when it
      takes the request: remove <tmp> and hand off `waiting` with retry_when
      `test ! -e {state}/restart.request -a ! -e {state}/restart.request.taken`. When it wakes you, read

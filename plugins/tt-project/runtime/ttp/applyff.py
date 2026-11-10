@@ -67,6 +67,14 @@ def unwritable(h: Path, base: str, merged: str) -> str:
     return ""
 
 
+def foreign_edits(h: Path, base: str, merged: str) -> list[str]:
+    """The files the fast-forward base..merged writes that hold an uncommitted change in the working tree
+    or index (or sit there untracked): someone else's edit, such as another harness task's, which git would
+    refuse to overwrite. [] when the fast-forward can run."""
+    from .upjournal import _differs, _touched
+    return sorted(_differs(h, _touched(h, base, merged)))
+
+
 def no_write(text: str) -> bool:
     """A failed fast-forward's output says the working tree could not be written."""
     return any(t in (text or "").lower() for t in _NO_WRITE_TEXT)

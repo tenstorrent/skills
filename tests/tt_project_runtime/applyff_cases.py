@@ -478,3 +478,44 @@ def test_a_fast_forward_git_refuses_over_a_local_edit_keeps_that_edit_byte_for_b
     assert _git_out(h, "rev-parse", "HEAD") == base and _git_out(h, "status", "--porcelain") == status
     assert (h / rel).read_bytes() == edit
     assert (h / "runtime" / "ttp" / "added.py").read_text() == "a local file\n"
+
+
+def test_apply_over_another_tasks_uncommitted_runtime_edit_is_busy_and_changes_nothing(
+        env, monkeypatch, tmp_path, capsys):
+    """Another harness task left an uncommitted edit in the live checkout to a runtime file the upgrade
+    writes, while the upgrade task held the harness: --apply exits 75 (busy, retry) before journaling the
+    merge, naming the file; main, the edit and the daemon stay as they were. Staged edits and untracked
+    files where the upgrade adds one are busy too. Once the edit is committed away, the rerun applies."""
+    from ttp import cli
+    p, merged, base, restarts = _landed_template_branch(env, monkeypatch, tmp_path)
+    h, rel = p.harness, "runtime/ttp/restriction_audit.py"
+    edit = (h / rel).read_bytes() + b"# another task's edit\n"
+    (h / rel).write_bytes(edit)
+    status = _git_out(h, "status", "--porcelain")
+    with pytest.raises(SystemExit) as e:
+        cli.main(["upgrade", "demo", "--apply", merged])
+    err = capsys.readouterr().err
+    assert e.value.code == 75, err
+    assert "uncommitted changes this upgrade did not make" in err and rel in err and "nothing was changed" in err
+    assert _git_out(h, "rev-parse", "HEAD") == base and not restarts
+    assert (h / rel).read_bytes() == edit and _git_out(h, "status", "--porcelain") == status
+    _hgit(h, "add", rel)
+    with pytest.raises(SystemExit) as e:
+        cli.main(["upgrade", "demo", "--apply", merged])
+    assert e.value.code == 75 and _git_out(h, "rev-parse", "HEAD") == base and not restarts
+    _hgit(h, "reset", "-q", "--", rel)
+    _hgit(h, "checkout", "-q", "--", rel)
+    wt = tmp_path / "merge"
+    (wt / "runtime" / "ttp" / "added.py").write_text("upstream's new file\n")
+    _hgit(wt, "add", "-A")
+    _hgit(wt, "commit", "-qm", "add a runtime file")
+    merged = _git_out(wt, "rev-parse", "HEAD")
+    (h / "runtime" / "ttp" / "added.py").write_text("a local file\n")
+    with pytest.raises(SystemExit) as e:
+        cli.main(["upgrade", "demo", "--apply", merged])
+    assert e.value.code == 75 and "runtime/ttp/added.py" in capsys.readouterr().err
+    assert (h / "runtime" / "ttp" / "added.py").read_text() == "a local file\n" and not restarts
+    (h / "runtime" / "ttp" / "added.py").unlink()
+    # The coordinator's uncommitted CHARTER and MEMORY edits are files the upgrade does not write: it applies.
+    cli.main(["upgrade", "demo", "--apply", merged])
+    assert _git_out(h, "rev-parse", "HEAD") == merged and restarts
