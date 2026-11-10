@@ -419,3 +419,29 @@ def test_the_watcher_lowers_an_escalated_wake_through_waketier(env):
     assert got and got["by"] == "babysit" and got["tier"] == "light" and b.jev.calls == 0
     b.post = _bs_reply("wake #1 standard")
     assert waketier.pick(p.db, cfg, task, prev, jev=b, now=100.0) is None and b.jev.calls == 0
+
+
+def test_a_babysit_call_every_candidate_failed_asks_the_next_ranked_served_model_once(env):
+    from ttp import babysit, route
+    babysit._REFUSED.clear()
+    seen = []
+
+    def post(s, messages, timeout):
+        seen.append(s["model"])
+        if s["model"] != "example-org/best":
+            raise babysit.Unavailable("HTTP 503: busy")
+        return _bs_reply("skip")(s, messages, timeout)
+    p, cfg, b, lines = _bs_gate(env, post, None)
+    cfg["providers"]["chat"]["model_ranking"] = ["example-org/unlisted", "example-org/best", "example-org/third"]
+    route.write_served(p.state, "chat", True, "HTTP 200", ["example-org/best", "example-org/third"], time.time())
+    d = babysit.ask(cfg, "s", "Is there work?", post=post, db=p.db, served=b._served())
+    assert seen == ["example-org/small-model", "example-org/best"] and d["model"] == "example-org/best"
+    seen.clear()
+    cfg["providers"]["chat"]["model_ranking"] = ["example-org/third"]   # the stand-in fails too: one try, then Unavailable
+    with pytest.raises(babysit.Unavailable, match="ranked stand-in example-org/third"):
+        babysit.ask(cfg, "s", "Is there work?", post=post, db=p.db, served=b._served())
+    assert seen == ["example-org/small-model", "example-org/third"]
+    seen.clear()
+    with pytest.raises(babysit.Unavailable):   # no served list known: unchanged
+        babysit.ask(cfg, "s", "Is there work?", post=post, db=p.db, served=None)
+    assert seen == ["example-org/small-model"]

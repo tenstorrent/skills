@@ -1337,7 +1337,17 @@ Messages calls into `<base url>/chat/completions` calls and back, and ends with 
    model is served again. With a ranking set, a queued or running task that pins a model on `chat`
    also keeps the check running, and a check over two hours old counts as none: nothing is
    swapped or held on it. Each switch (per tier, routes rule or picked model) is one low alert; once the model is served again (the hold ends
-   or the check lists it) the next start runs it. A served model ranked above a route's own model
+   or the check lists it) the next start runs it. A run already in flight swaps too: its bridge
+   knows the ranking's other unparked models, and once the endpoint refuses the run's model
+   (`model_not_found`, `unrecognized_model` or HTTP 404), or 3 errors in a row (5xx or timeouts)
+   come while the fresh /models check leaves it out, that call and the rest of the run go to the
+   highest-ranked one the check lists, with its own effort fields and context window. The run note
+   keeps each swap (`model_rank.mid_run`: from, to, at, why), each is one low alert, and a refused
+   model is down for new starts. Claude Code's compaction window (`CLAUDE_CODE_AUTO_COMPACT_WINDOW`)
+   is set once at start, so a smaller stand-in window relies on the bridge's "prompt is too long"
+   answer to compact. A required pin never swaps mid-run, and with no stand-in served the error goes
+   back as before (`model_missing`). A babysit decision every candidate failed asks the next ranked
+   served model once before it falls back. A served model ranked above a route's own model
    (tier, rule or run class; never a task's pin) is tried at once: light starts run it until 3 of its
    runs end without a fallback, then every tier does. A run on it that fails on the model itself
    (malformed answer, timeout, no hand-off) during those runs, or such faults in over a fifth of 8 or

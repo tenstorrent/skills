@@ -3451,3 +3451,90 @@ def test_the_daemon_runs_the_model_bench_daily_and_reports_a_keyless_skip_once(e
         d._bench_tried = 0.0
     assert alerts == [(modelbench.NOKEY, "low")]
     assert modelbench.latest()["skipped"].startswith("no working key") and modelbench.latest()["owner"] == p.name
+
+
+_MID_OK = (200, {"choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+                 "usage": {"prompt_tokens": 10, "completion_tokens": 2}})
+_MID_ASK = {"max_tokens": 5, "messages": [{"role": "user", "content": "hi"}]}
+
+
+def _mid_bridge(up, tmp_path, ids, **kw):
+    """A bridge on `run-model` with ranked stand-ins and a served list in tmp_path naming `ids`."""
+    from ttp import route
+    from ttp.chatbridge import Bridge
+    route.write_served(tmp_path, "chat", True, "HTTP 200", list(ids), time.time())
+    return Bridge(up.url, _CB_KEY, "run-model", context_window=200000, served=[str(tmp_path)],
+                  standins=[{"model": "gone-too"}, {"model": "alt-model", "fields": {"reasoning_effort": "high"},
+                                                    "context_window": 64000}], **kw)
+
+
+def test_a_model_refused_mid_run_moves_this_call_and_later_ones_to_the_ranked_stand_in(mock_chat, tmp_path):
+    """User's rule: tt models come and go on the console; when one goes away, the next best runs within a minute."""
+    up = mock_chat((404, {"error": {"message": "The model does not exist", "code": "model_not_found"}}), _MID_OK, _MID_OK)
+    with _mid_bridge(up, tmp_path, ["alt-model", "other"]) as b:
+        first = _post(b, _MID_ASK)
+        second = _post(b, _MID_ASK)
+        stats = b.stats()
+    assert first[0] == second[0] == 200
+    sent = [s["body"] for s in up.seen if "body" in s]
+    assert [s["model"] for s in sent] == ["run-model", "alt-model", "alt-model"]   # gone-too is not served
+    assert sent[1].get("reasoning_effort") == "high" and b.context_window == 64000   # the stand-in's own fields
+    assert stats["last_fault"] == "" and stats["model"] == "alt-model"
+    assert [(m["from"], m["to"], m["why"]) for m in stats["mid_run"]] == [("run-model", "alt-model", "refused")]
+
+
+def test_errors_while_the_model_is_still_listed_swap_nothing_and_unlisted_ones_swap(mock_chat, tmp_path):
+    up = mock_chat(*[(503, {"error": {"message": "busy"}})] * 3)
+    with _mid_bridge(up, tmp_path / "a", ["run-model", "alt-model"]) as b:
+        codes = [_post(b, _MID_ASK)[0] for _ in range(3)]
+        stats = b.stats()
+    assert codes == [529] * 3 and "mid_run" not in stats
+    assert {s["body"]["model"] for s in up.seen if "body" in s} == {"run-model"}
+    up = mock_chat(*[(503, {"error": {"message": "busy"}})] * 3, _MID_OK, _MID_OK)
+    with _mid_bridge(up, tmp_path / "b", ["alt-model"]) as b:
+        codes = [_post(b, _MID_ASK)[0] for _ in range(4)]
+        stats = b.stats()
+    assert codes == [529, 529, 200, 200]   # the third error's retry already ran on the stand-in
+    assert [s["body"]["model"] for s in up.seen if "body" in s] == ["run-model"] * 3 + ["alt-model"] * 2
+    assert stats["mid_run"][0]["why"] == "not listed"
+
+
+def test_a_refusal_with_no_stand_in_served_or_none_armed_answers_as_before(mock_chat, tmp_path):
+    from ttp.chatbridge import Bridge
+    refuse = (404, {"error": {"message": "The model does not exist", "code": "model_not_found"}})
+    up = mock_chat(refuse)
+    with _mid_bridge(up, tmp_path / "a", ["other"]) as b:
+        code, _ = _post(b, _MID_ASK)
+        stats = b.stats()
+    assert code == 404 and stats["last_fault"] == "model_missing" and "mid_run" not in stats
+    up = mock_chat(refuse)
+    with Bridge(up.url, _CB_KEY, "run-model") as b:   # a required pin: the launch names no stand-ins
+        assert _post(b, _MID_ASK)[0] == 404 and b.stats()["last_fault"] == "model_missing"
+    assert len([s for s in up.seen if "body" in s]) == 1
+
+
+def test_the_launch_arms_stand_ins_except_for_a_required_pin_and_the_end_keeps_the_swaps(env, monkeypatch):
+    from ttp import chatbridge, failover, modelrank
+    from ttp.daemon import Daemon
+    p = make(env)
+    d = Daemon(p.base)
+    alerts = _ranked(p, d, monkeypatch, ["rank-b", "rank-a", _RT_MODEL])
+    d.cfg["providers"]["chat"]["tiers"]["light"]["context_window"] = 128000
+    d.cfg["providers"]["chat"]["effort_fields"] = {"rank-a": {"*": {"reasoning_effort": "high"}}}
+    tid = p.db.add_task("build", "", kind="work", tier="light", priority=3, budget_usd=8.0, labels=[])
+    armed = d._bridge_ranked(p.db.task(tid), {}, _RT_MODEL)
+    assert armed == {"standins": ["rank-a", "rank-b"], "served": [str(p.state)]}
+    s = chatbridge.settings(d.cfg, "light", _RT_MODEL, "low", **armed)
+    assert s["context_window"] == 128000 and s["standins"][0] == {"model": "rank-a", "fields": {"reasoning_effort": "high"}}
+    pinned = p.db.add_task("pinned", "", kind="work", tier="light", priority=3, budget_usd=8.0,
+                           labels=[failover.REQUIRED_LABEL])
+    assert d._bridge_ranked(p.db.task(pinned), {"model": _RT_MODEL}, _RT_MODEL) == {}
+    assert "standins" not in chatbridge.settings(d.cfg, "light", _RT_MODEL, "low", **{})
+    mid = [{"from": _RT_MODEL, "to": "rank-a", "at": time.time(), "why": "refused"}]
+    run, task = _route_finish(p, d, tid, {"rc": 0, "bridge": {"last_fault": "", "faults": {"model_missing": 1},
+                                                              "mid_run": mid, "model": "rank-a"}},
+                              result={"status": "done", "summary": "built"})
+    assert run["status"] == "ok" and task["status"] != "queued", (run["status"], task["status"])
+    assert json.loads(run["note"])[modelrank.KEY]["mid_run"] == mid
+    assert [a[2] for a in alerts] == ["low"] and "rank-a" in alerts[0][1] and _RT_MODEL in alerts[0][1]
+    assert modelrank.down(p.db, d.cfg, p.state, _RT_MODEL, time.time()) == "refused"

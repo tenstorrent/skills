@@ -4028,7 +4028,9 @@ class Daemon:
                     "budget_usd": None if prov.caps_budget else budget_usd,
                     # The chat provider's loopback bridge (chatbridge.py): where its key is, never the key.
                     # Its effort_fields follow the effort the run launches at, whatever Claude Code asks for.
-                    **({"bridge": chatbridge.settings(self.cfg, tier, model, effort)} if provider == "chat" else {}),
+                    # Its ranked stand-ins swap a model that goes away mid-run (modelrank.standins), never a required pin.
+                    **({"bridge": chatbridge.settings(self.cfg, tier, model, effort, **self._bridge_ranked(task, pin, model))}
+                       if provider == "chat" else {}),
                     # A chat run that mostly sleep-polls is stalled too (runner.is_wait), so it falls back
                     # within stall_s instead of running to its route timeout.
                     **({"waits_idle": True} if provider == "chat" else {}),
@@ -6050,6 +6052,8 @@ class Daemon:
         elif r["provider"] in self._net_holds and (status == "ok" or _has_tokens(usage)):
             self._end_net_hold(r["provider"], f"run {r['id']} reached its API")
         note = json.loads(r["note"] or "{}")
+        if mid := (exit_info.get("bridge") or {}).get("mid_run"):
+            self._rank_mid_run(r, note, mid)
         if routed:
             note[route.KEY] = {**routed, **({"fallback": fell} if fell else {}), **({"salvaged": True} if salvaged else {}),
                                **({"cause": _route_cause(stopped or status, exit_info, usage, run_dir)} if own else {}),
@@ -12166,6 +12170,30 @@ class Daemon:
         except Exception as e:   # the ranking must never hold a task back
             log(self.p, f"task {task.get('id')}: model ranking not checked: {type(e).__name__}: {e}")
             return ""
+
+    def _bridge_ranked(self, task: dict | None, pin: dict, model: str) -> dict:
+        """A chat run's mid-run swap settings (chatbridge.settings): its ranked stand-ins and the served
+        list's state dir; {} for a required pin (failover.required) or no ranking."""
+        if pin.get("model") and task and failover.required(self.p.db, task):
+            return {}
+        got = modelrank.standins(self.p.db, self.cfg, model, time.time())
+        return {"standins": got, "served": [str(self.p.state)]} if got else {}
+
+    def _rank_mid_run(self, r: dict, note: dict, mid: list) -> None:
+        """Keep a run's mid-run swaps (chatbridge.py) in its note (model_rank.mid_run), one low alert and
+        log line each; a refused model is down for new starts (modelrank.refused)."""
+        rows = [m for m in mid if isinstance(m, dict) and m.get("from") and m.get("to")]
+        if not rows:
+            return
+        kept = note.get(modelrank.KEY) if isinstance(note.get(modelrank.KEY), dict) else {}
+        note[modelrank.KEY] = {**kept, "mid_run": rows}
+        for i, m in enumerate(rows):
+            if m.get("why") == "refused":
+                modelrank.refused(self.p.db, str(m["from"]), r["id"], float(m.get("at") or time.time()))
+            log(self.p, f"model ranking: run {r['id']} swapped {m['from']} for {m['to']} mid-run ({m.get('why')})")
+            self.alert(f"model-rank-mid:{r['id']}:{i}", modelrank.mid_text(r["id"], str(m["from"]), str(m["to"]),
+                                                                            str(m.get("why") or "")),
+                       severity="low", every_s=0)
 
     def _rank_pick(self, where: str, key: str, model: str, now: float) -> tuple[str, dict] | None:
         """(the model to run, {"from", "why"}) when `model` is down and the ranking (modelrank.py) names one

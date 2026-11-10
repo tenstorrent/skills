@@ -27,6 +27,13 @@ route picks it, and once the week is over it is tried again from scratch (the we
 The host's daily bench (modelbench.py) rechecks parked models weekly: a pass frees one at once, a weak
 score keeps it parked.
 
+A run in flight swaps too (chatbridge.py): its launch names the ranking's other unparked models
+(standins, best first; none for a required pin), and its bridge moves the call and the rest of the run
+to the first of them still served once the endpoint refuses its model, or errs SWAP_ERRORS times in a
+row while the served list leaves it out. The daemon keeps each swap in the run note (KEY "mid_run":
+[{from, to, at, why}]) with one low alert, and a refused model is down (refused()) for new starts.
+Babysit decisions (babysit.py) ask the next ranked served model once before they fall back.
+
 Only the chat provider has a served list; Claude Code, Codex and Cursor models are not ranked here
 (provider failover moves work off a provider that cannot start, failover.py).
 """
@@ -107,6 +114,18 @@ def pick(db, cfg: dict, state: Path, model: str, now: float) -> tuple[str, str] 
         if m != model and m in ids and not down(db, cfg, state, m, now) and not parked(db, m, now):
             return m, why
     return None
+
+
+def standins(db, cfg: dict, model: str, now: float) -> list[str]:
+    """The ranked models a run on `model` may swap to mid-run (chatbridge.py), best first: the ranking
+    less `model` and parked ones. The bridge checks each against the served list when it swaps."""
+    return [m for m in ranking(cfg) if m != model and not parked(db, m, now)]
+
+
+def mid_text(run_id, frm: str, to: str, why: str) -> str:
+    """A mid-run swap's low alert."""
+    return (f"Model {frm} went away on the {route.TO} provider during run {run_id} ({why}); the run went on "
+            f"with {to}, the highest-ranked model it serves (providers.{route.TO}.model_ranking), in the same session.")
 
 
 def parked(db, model: str, now: float) -> bool:
