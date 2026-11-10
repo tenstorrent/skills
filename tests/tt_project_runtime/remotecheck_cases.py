@@ -3233,6 +3233,71 @@ def test_a_push_batch_spills_its_checks_first_and_a_spill_host_fault_reruns_them
     assert checkspill.holders(s.p.name) == [], "the claim ends with the batch"
 
 
+def _spill_push(env, tmp_path, monkeypatch, cmd):
+    """A _push_setup project whose push checks (`cmd`) may spill to the one allowed host check-host-a."""
+    from ttp import checkspill, machines
+    p, repo, origin, other = _push_setup(env, monkeypatch, [cmd])
+    monkeypatch.setattr(checkspill, "_PROBE", checkspill._PROBE.replace("cut -d' ' -f1 /proc/loadavg", "echo 0"))
+    p.charter_path.write_text("# Charter\n## Resources\n- check-host-a: a check host\n")
+    machines.add("check-host-a")
+    p.set_config("delivery.checks_spill_hosts", ["check-host-a"])
+    bin_, remote = _rc_fake_ssh(tmp_path)
+    monkeypatch.setenv("PATH", f"{bin_}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("FAKE_REMOTE_TMP", str(remote))
+    (tmp_path / "run").mkdir()
+    monkeypatch.setenv("TTP_RUN_DIR", str(tmp_path / "run"))
+    _commit(repo, "change.txt", "new\n")
+    return p, repo
+
+
+@pytest.mark.parametrize("mode", ["first", "off", "fault", "pinned"])
+def test_a_direct_push_spills_its_checks_first_as_ttp_checks_does(env, tmp_path, monkeypatch, mode):
+    """delivery.checks_spill_first: a plain `ttp push` sends its push checks to a spill host before taking the
+    local priority slot, under a claim freed after; off, they run here. A spill host's fault (the link drops)
+    reruns the check here, and a check pinned to its own host keeps the run off the spill hosts."""
+    from ttp import checkspill, push
+    log = tmp_path / "where.log"
+    cmd = f"pwd >> {log}"
+    p, repo = _spill_push(env, tmp_path, monkeypatch, cmd)
+    if mode == "off":
+        p.set_config("delivery.checks_spill_first", False)
+    if mode == "fault":
+        monkeypatch.setenv("FAKE_SSH_DROP", str(log))
+    checks = push.check_list([cmd])
+    if mode == "pinned":
+        checks = push.check_list([{"run": cmd, "host": "local"}, {"run": f"echo pinned >> {log}", "host": "check-host-a"}])
+    said: list[str] = []
+    assert push.push(repo, "origin", "proj", checks, 1, say=said.append) == 0, said
+    assert _git_out(repo, "rev-parse", "origin/proj") == _git_out(repo, "rev-parse", "HEAD")
+    where = log.read_text().splitlines()
+    if mode == "first":
+        assert len(where) == 1 and "/ttp-check." in where[0], where
+    elif mode == "fault":
+        assert len(where) >= 2 and "/ttp-check." in where[0] and "/ttp-check." not in where[-1], where
+        assert any("running it here" in m for m in said), said
+    elif mode == "pinned":
+        assert "/ttp-check." not in where[0] and "pinned" in where, where
+    else:
+        assert where == [str(repo.resolve())] or where == [str(repo)], where
+    assert checkspill.holders(p.name) == [], "the claim ends with the push"
+
+
+def test_push_own_spills_its_checks_first_too(env, tmp_path, monkeypatch):
+    """`ttp push --own` (publish) takes the same spill-first route as a direct push."""
+    from ttp import checkspill, push
+    log = tmp_path / "where.log"
+    cmd = f"pwd >> {log}"
+    p, repo = _spill_push(env, tmp_path, monkeypatch, cmd)
+    base = _git_out(repo, "rev-parse", "origin/proj")
+    _git_out(repo, "checkout", "-q", "-b", "own")
+    _commit(repo, "own.txt", "own\n")
+    said: list[str] = []
+    assert push.publish(repo, "origin", "own", push.check_list([cmd]), say=said.append, base=base, p=p) == 0, said
+    where = log.read_text().splitlines()
+    assert len(where) == 1 and "/ttp-check." in where[0], where
+    assert checkspill.holders(p.name) == []
+
+
 
 @pytest.mark.parametrize("kind", ["pre_existing", "flaky"])
 def test_a_spilled_push_batch_suite_is_judged_as_its_local_original(env, tmp_path, monkeypatch, kind):

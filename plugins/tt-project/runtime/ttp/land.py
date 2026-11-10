@@ -171,7 +171,9 @@ def _checks(p: Project, wt: Path, new: str, base: str, say: Callable[[str], None
     if why := push.runner_wait(todo, wt, env, say, p):
         return why
     try:
-        slot = push.check_slot(new, say, proj=p, priority=_slot_key(wt, branch))
+        # Spill first (delivery.checks_spill_first): a spill host before the branch's priority slot here.
+        slot, todo = push.spill_slot(todo, new, say, p, "landing checks")
+        slot = slot or push.check_slot(new, say, proj=p, priority=_slot_key(wt, branch))
     except push.checkcap.Unavailable as e:
         say(f"{e}; not landing")
         return CHECKS_FAILED
@@ -182,7 +184,9 @@ def _checks(p: Project, wt: Path, new: str, base: str, say: Callable[[str], None
         for line in push.sandbox_lines(todo):
             say(line)
         for cmd in todo:
-            if (rc := push._run_one(cmd, wt, env, say)) != 0:
+            cmd, rc = push._run_or_here(cmd, wt, env, say, {},
+                                        lambda: push.check_slot(new, say, proj=p, priority=_slot_key(wt, branch)))
+            if rc != 0:
                 if rc != BUSY:
                     say(f"check failed on {new[:10]}: {cmd}{push.where(cmd)}; not landing")
                 return rc

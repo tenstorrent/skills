@@ -1004,6 +1004,50 @@ def run_slot(run: list, head: str, say: Callable[[str], None], priority: str = "
     return checkcap.Slot()
 
 
+def spill_slot(cmds: list, head: str, say: Callable[[str], None], proj: Project | None = None,
+               what: str = "push checks") -> tuple[Any, list]:
+    """With delivery.checks_spill_first on and spill hosts set, the push checks `cmds` go to a spill host
+    before any place here, as `ttp checks` and the push batch send theirs (checkspill.spill_run): (a slot
+    holding that host's claim and no slot here, `cmds` sent there; a check that may not spill but is cheap
+    runs here beside them), else (None, `cmds`): check_slot then. A check's own "host" stays its own. The
+    spill hosts are a speed-up: an error trying them keeps the checks here. Nested in a check that holds a
+    slot already (checkcap.HELD_ENV) it never spills. `proj` defaults to TTP_PROJECT's project."""
+    from . import checkspill
+    if proj is None and (base := os.environ.get("TTP_PROJECT")):
+        proj = Project(base)
+    if proj is None or not cmds or os.environ.get(checkcap.HELD_ENV):
+        return None, cmds
+    try:
+        claim, out = checkspill.spill_run(proj, proj.config(), cmds, say, f"{what} on {head[:10]}")
+    except Exception as e:   # noqa: BLE001
+        say(f"spill hosts not tried ({e}): the checks run here")
+        return None, cmds
+    if claim is None:
+        return None, cmds
+    slot = checkcap.Slot()
+    slot.spill = claim
+    return slot, out
+
+
+def _run_or_here(cmd: Any, repo: Path, env: dict, say: Callable[[str], None], seen: dict,
+                 here: Callable[[], Any]) -> tuple[Any, int]:
+    """_run_one, and a check spill_slot sent to a spill host that could not run it (BUSY: ssh, the host or
+    its pool, never the change) once more here, in the slot `here()` takes: (the check that ran last, its
+    exit code). A spill host's fault never holds the push."""
+    rc = _run_one(cmd, repo, env, say, seen)
+    if rc != BUSY or (was := getattr(cmd, "was", None)) is None:
+        return cmd, rc
+    say(f"spill host {remote_host(cmd)} could not run {was}: running it here")
+    seen.clear()
+    try:
+        slot = here()
+    except checkcap.Unavailable as e:
+        say(f"{e}; not pushing")
+        return was, CHECKS_FAILED
+    with slot:
+        return was, _run_one(was, repo, {**env, **slot.env()}, say, seen)
+
+
 def priority_key(repo: Path, remote: str, branch: str) -> str:
     """The push branch as one name host-wide, whichever project or clone pushes to it: the remote's
     URL (without a trailing .git or /) and the branch; the repository's path when it has no URL."""
@@ -3824,7 +3868,9 @@ def publish(repo: Path, remote: str, branch: str, checks: list[str],
         if todo and (why := runner_wait(todo, repo, check_env("own", tip, check_run_dir, branch), say)):
             return why
         try:
-            slot = run_slot(todo, head, say, priority=own_lane_key(repo, remote, cfg))
+            # Spill first (delivery.checks_spill_first): a spill host before the own-branch lane here.
+            slot, todo = spill_slot(todo, head, say, p)
+            slot = slot or run_slot(todo, head, say, priority=own_lane_key(repo, remote, cfg))
         except checkcap.Unavailable as e:
             say(f"{e}; not pushing")
             return CHECKS_FAILED
@@ -3835,7 +3881,9 @@ def publish(repo: Path, remote: str, branch: str, checks: list[str],
                 say(line)
             excused = False
             for cmd in todo:
-                if (rc := _run_one(cmd, repo, env, say, seen := {})) != 0:
+                cmd, rc = _run_or_here(cmd, repo, env, say, seen := {},
+                                       lambda: check_slot(head, say, priority=own_lane_key(repo, remote, cfg)))
+                if rc != 0:
                     if rc == CHECKS_FAILED:
                         rc = _gate(cmd, repo, env, say, head, base or "", seen, p)
                     if rc == 0:
@@ -4155,7 +4203,9 @@ def _rounds(repo: Path, remote: str, branch: str, checks: list[str], rounds: int
         if run and (why := runner_wait(run, repo, check_env("target", tip, check_run_dir, branch), say)):
             return why
         try:
-            slot = run_slot(run, head, say, priority=priority_key(repo, remote, branch))
+            # Spill first (delivery.checks_spill_first): a spill host before the push priority slot here.
+            slot, run = spill_slot(run, head, say)
+            slot = slot or run_slot(run, head, say, priority=priority_key(repo, remote, branch))
         except checkcap.Unavailable as e:
             say(f"{e}; not pushing")
             return CHECKS_FAILED
@@ -4167,7 +4217,9 @@ def _rounds(repo: Path, remote: str, branch: str, checks: list[str], rounds: int
                 say(line)
             excused = set()
             for cmd in run:
-                if (rc := _run_one(cmd, repo, env, say, seen := {})) != 0:
+                cmd, rc = _run_or_here(cmd, repo, env, say, seen := {},
+                                       lambda: check_slot(head, say, priority=priority_key(repo, remote, branch)))
+                if rc != 0:
                     if rc == CHECKS_FAILED:
                         rc = _gate(cmd, repo, env, say, head, tip, seen)
                     if rc == 0:
