@@ -57,14 +57,17 @@ def cause(why, held_by: str | None, gate, free: bool, held: bool = False) -> str
 
 def note(acc: dict, tid: int, c: str, now: float, since) -> None:
     """One ready check's sight of task `tid` held by cause `c`; `since` (a value or a callable) when it
-    became ready, read only on its first sight. The time since the previous sight goes to that sight's cause."""
+    became ready, read only on its first sight. The time since the previous sight goes to that sight's cause;
+    a gap over GAP_S goes to "unrecorded"."""
     e = acc.get(tid)
     if e is None:
         acc[tid] = {"since": float(since() if callable(since) else since), "first": now, "first_cause": c,
                     "last": now, "cause": c, "causes": {}}
         return
-    if 0 <= now - e["last"] <= GAP_S:
-        e["causes"][e["cause"]] = e["causes"].get(e["cause"], 0.0) + now - e["last"]
+    gap = now - e["last"]
+    k = e["cause"] if gap <= GAP_S else "unrecorded"   # a longer gap: no check saw why it waited
+    if gap > 0:
+        e["causes"][k] = e["causes"].get(k, 0.0) + gap
     e["last"], e["cause"] = now, c
 
 
