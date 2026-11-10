@@ -19271,8 +19271,8 @@ def idle_wake(p: Project, cfg: dict, gates: dict[str, dict], now: float, db=None
     without a turn is a repeat too, and the next wait counts from it. Explicit check-backs use
     schedules.
 
-    While tasks are queued or running there is no idle wake, but the cache wake (cache_wake_at) can
-    come: a turn just before the coordinator's prompt cache expires, so the next turn reads it.
+    While tasks are queued or running there is no idle wake, but while one runs the cache wake
+    (cache_wake_at) can come: a turn just before the coordinator's prompt cache expires, so the next turn reads it.
 
     Returns `at` (next wake, possibly past), `due` ("idle", "starve", "cache" or None at `now`), `held`
     (why the idle wake cannot come), and the `wake` / `starve` kv values a starting turn stores."""
@@ -19301,7 +19301,9 @@ def idle_wake(p: Project, cfg: dict, gates: dict[str, dict], now: float, db=None
             idle_at = min(last + max(idle_s, backoff), cap)
         else:
             held = f"held by the budget gate ({gate['level']})"
-    elif gate is None or gate["allow_optional"]:
+    elif (gate is None or gate["allow_optional"]) and db.one("SELECT id FROM tasks WHERE status='running'"):
+        # Only while a run is under way: its hand-off brings a turn soon. Work that only waits on its
+        # gates (start_after, start_when) may wait hours, and warming the cache for it costs more.
         cache_at = cache_wake_at(db, c, prev if same else {}, skipped)
     starve = starve_state(db, cfg, gate, now)
     starve_at = min(last + max(backoff, starve["wait"]), cap) if starve else None

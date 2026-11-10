@@ -15341,6 +15341,8 @@ def test_a_cache_wake_keeps_the_prompt_cache_warm_while_work_is_running(env, mon
     from ttp.daemon import idle_wake
     p, d, clock, turns = _plain_hold_setup(env, monkeypatch, idle=3000)
     t0 = clock[0]
+    p.db.add_task("in 3 days", "s", kind="work", status="queued")
+    assert idle_wake(p, d.cfg, {}, t0 + 3030)["due"] is None, "a cache wake for work that only waits"
     p.db.add_task("long run", "s", kind="work", status="running")
     w = idle_wake(p, d.cfg, {}, t0 + 2990)
     assert w["due"] is None and w["at"] == t0 + 3000, w

@@ -1384,7 +1384,8 @@ def test_the_idle_slot_wake_fires_below_the_line_and_backs_off(env):
     assert turn_after(301), "a new task resets the wait"
     d.gates[prov].level, d.gates[prov].max_parallel = "yellow", 3
     p.db.add_task("more work", "s", kind="work", tier="light", origin="coordinator", status="done")
-    assert not turn_after(3000), "a plan in its last stretch before the line needs no extra work"
+    # Just under idle_wake_s (3000): only an idle-slot wake could start a turn here.
+    assert not turn_after(2900), "a plan in its last stretch before the line needs no extra work"
 
 
 
