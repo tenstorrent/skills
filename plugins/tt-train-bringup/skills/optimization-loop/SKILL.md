@@ -85,10 +85,6 @@ chain whose measured cost beats the kernel's expected gain.
     A stage review runs every eight iterations or at a milestone (a kernel landed, a target
     crossed, a close claimed), not after every iteration.
 
-Steps 5 to 10 for one candidate are one scoped subagent's job (see [Delegation](#delegation));
-the main agent runs steps 1 to 4 once per iteration from the returned rows and picks the next
-candidate.
-
 ## Op classes
 
 Every op in the profile falls into one of five classes. The class, not the op's size, determines how
@@ -304,19 +300,6 @@ names; no invented abbreviations.
 
 The same style holds for the composite README, the plan's tables and the review verdicts: a
 finding is one line of what is wrong and one line of what to do.
-
-## Delegation
-
-The main agent keeps the state and stays small: the hard-constraints block, the result table, the
-ranked table, the next candidate. It does not read Tracy CSVs, logs, review reports or kernel
-sources into its own context; a context that fills up gets compressed and the reasoning degrades
-(the reference bring-up ran 51 iterations in one context). Each unit of work runs in a scoped
-subagent, one or two candidates per agent, with a brief that holds: the candidate row and its
-number, the hard constraints, the exact MFU, harness and profile commands, the files it may touch,
-what was already tried and ruled out, and the row format to return. The subagent returns the
-result row, the ranked-table rows that moved, the commit SHA and a one-line verdict, not the logs.
-Analysis and code work for independent candidates may run in parallel; device runs are serialised
-(one device user at a time, see `tt-device-usage`). A stage review is always its own subagent.
 
 ## Adding a kernel
 
