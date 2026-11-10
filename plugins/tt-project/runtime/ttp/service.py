@@ -42,46 +42,61 @@ WATCHDOG_EVERY_S = 300   # how often launchd and cron look for a stuck daemon
 # workers, reviewers and checks stay polite at runner.nice. The watchdog and tunnels stay Background.
 # An installed daemon plist lacking any of these keys is rewritten on upgrade (refresh).
 DAEMON_KEYS = {"ProcessType": "Standard", "AbandonProcessGroup": True}
-# Darwin background state is inherited: a daemon started by hand from the watchdog (a Background agent)
-# or any other background process runs at background priority too. leave_background() drops it at start.
+# Darwin background priority is inherited: a daemon started by hand from the watchdog (a Background agent)
+# runs at background priority too. launchd's ProcessType Background stays on its children through fork and
+# exec and no setpriority lifts it, so restart_service starts the daemon through launchd from its own plist;
+# leave_background() drops what it can (taskpolicy -b) and logs the priority the kernel applies.
 PRIO_DARWIN_PROCESS = 4   # <sys/resource.h>: the which of setpriority for darwin background state
+DARWIN_BG_PRI = 4         # `ps -o pri=` of a process at darwin background priority
 
 
-def _darwin_bg(set_to: int | None = None) -> int | None:
-    """This process's darwin background state (1 on, 0 off), after setting it to `set_to` when given;
-    None where it cannot be read (not macOS, no libc)."""
-    if sys.platform != "darwin":
+def _ps_pri(pid: int | None = None) -> int | None:
+    """A process's scheduling priority as the kernel applies it (`ps -o pri=`, 4 at darwin background
+    priority, whichever way it was set); None where ps cannot say."""
+    try:
+        r = subprocess.run(["ps", "-o", "pri=", "-p", str(pid or os.getpid())], capture_output=True,
+                           text=True, timeout=10)
+        return int(r.stdout.strip())
+    except (OSError, ValueError, subprocess.SubprocessError):
         return None
+
+
+def _leave_darwin_bg() -> None:
+    """setpriority(PRIO_DARWIN_PROCESS, 0, 0): clears the background state taskpolicy -b sets; launchd's
+    Background process type is not cleared by it."""
     try:
         import ctypes
         libc = ctypes.CDLL(None, use_errno=True)
-        libc.getpriority.argtypes = [ctypes.c_int, ctypes.c_uint]
         libc.setpriority.argtypes = [ctypes.c_int, ctypes.c_uint, ctypes.c_int]
-        if set_to is not None:
-            libc.setpriority(PRIO_DARWIN_PROCESS, 0, set_to)
-        return 1 if libc.getpriority(PRIO_DARWIN_PROCESS, 0) > 0 else 0
+        libc.setpriority(PRIO_DARWIN_PROCESS, 0, 0)
     except (OSError, AttributeError):
-        return None
+        pass
 
 
 def leave_background(plist: Path | None) -> str:
-    """Run at normal CPU priority whoever started this process (launchd, cron, the watchdog's or a hand
-    restart), unless its launchd plist sets ProcessType Background: a value the user or a coordinator
-    set there is kept. Returns the priority it runs at, for the start log."""
-    bg = _darwin_bg()
-    if bg is None:
+    """Leave darwin background priority where it can, unless this process's launchd plist sets ProcessType
+    Background (a value the user or a coordinator set there is kept). Returns the priority it runs at, as
+    `ps` reads it, for the start log: a warning when it still runs background without its plist saying so."""
+    if sys.platform != "darwin":
         return ""
     try:
         kept = bool(plist) and plistlib.loads(plist.read_bytes()).get("ProcessType") == "Background"
     except (OSError, ValueError, AttributeError, plistlib.InvalidFileException):
         kept = False
+    pri = _ps_pri()
+    if pri is None:
+        return "cpu priority: unknown (ps could not read it)"
+    if pri > DARWIN_BG_PRI:
+        return f"cpu priority: normal (pri {pri})"
     if kept:
-        return "cpu priority: background (its launchd plist sets ProcessType Background)"
-    if not bg:
-        return "cpu priority: normal"
-    bg = _darwin_bg(0)
-    return ("cpu priority: normal (left the background priority it inherited from its starter)" if bg == 0
-            else "cpu priority: background (inherited from its starter; leaving it failed)")
+        return f"cpu priority: background (pri {pri}; its launchd plist sets ProcessType Background)"
+    _leave_darwin_bg()
+    after = _ps_pri()
+    if after is not None and after > DARWIN_BG_PRI:
+        return f"cpu priority: normal (pri {after}; left the background priority it inherited from its starter)"
+    return (f"warning: cpu priority: background (pri {after}) though its launchd plist does not set ProcessType "
+            "Background: it inherited it from a background starter (a hand restart from the watchdog); "
+            "a restart through launchd (launchctl kickstart -k) runs it at its plist's priority")
 
 
 def daemon_argv(p: Project) -> list[str]:
@@ -554,9 +569,8 @@ def restart_service(p: Project) -> str:
             r = _run("launchctl", "kickstart", "-k", f"gui/{os.getuid()}/{label}")
         if r.returncode == 0:
             return "restarted"
-        # The agent is not loaded (its bootstrap failed): restart the daemon by hand like cron does.
-    unit = _unit(p)
-    if unit.exists():
+        # The agent is not loaded: stop the old daemon, then load the agent so launchd starts the new one.
+    elif (unit := _unit(p)).exists():
         try:
             r = _run("systemctl", "--user", "restart", unit.name)
         except subprocess.TimeoutExpired as e:
@@ -577,6 +591,21 @@ def restart_service(p: Project) -> str:
         while time.time() < deadline and _alive(pid):
             time.sleep(0.5)
     p.logs.mkdir(parents=True, exist_ok=True)
+    if sys.platform == "darwin":
+        why = "no launchd agent is installed"
+        if _agent(p).exists():
+            # launchd starts it at its plist's ProcessType; a hand start would run at the caller's
+            # priority, and the watchdog calling this runs Background.
+            domain = f"gui/{os.getuid()}"
+            r = _run("launchctl", "bootstrap", domain, str(_agent(p)))
+            if r.returncode == 0:
+                r = _run("launchctl", "kickstart", f"{domain}/{label}")
+            if r.returncode == 0:
+                return "restarted"
+            why = _manager_said("launchctl bootstrap and kickstart", r).replace("\n", " ")[:300]
+        with open(p.logs / "daemon.out", "a") as f:
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} restart by hand ({why}): the daemon runs at its "
+                    f"starter's CPU priority (background when the watchdog started it)\n")
     _spawn(p)
     return "restarted"
 
