@@ -357,12 +357,68 @@ def ledger_entry(path: str, start: float | None, now: float, home: str = "") -> 
     return max(hits, key=lambda c: float(c.get("added") or 0), default=None)
 
 
+_HITS: dict = {}   # transcript_hit's answers by (run dir, path, home, the transcript's and refusal log's stamps)
+HITS_KEPT = 512    # answers kept; the oldest go first
+# A word each writer's command holds (_writer), looked for as bytes before any line is parsed
+WRITER_WORDS = ((lambda p: "/.ssh/" in p, b"ssh-keygen"), (lambda p: p.endswith("hosts.yml"), b"auth"),
+                (lambda p: p.endswith((".git-credentials", ".netrc")), b"credential"))
+
+
+def _needles(path: str) -> list[bytes]:
+    """Bytes one of which a transcript holds wherever a call could name `path` (_is) or run a writer for
+    it (_writer): its file name (as is and JSON-escaped; every form of the path ends in it) and its
+    writer's command word."""
+    name = os.path.basename(path.rstrip("/")) or path
+    out = {name.encode(), json.dumps(name)[1:-1].encode()}
+    out.update(w for has, w in WRITER_WORDS if has(path))
+    return sorted(out)
+
+
+def _stamp(f: Path) -> tuple:
+    try:
+        st = f.stat()
+        return st.st_size, st.st_mtime_ns
+    except OSError:
+        return ()
+
+
+def _holds(f: Path, needles: list[bytes]) -> bool:
+    """Whether the file holds one of `needles`, read in chunks and never parsed."""
+    keep = max(map(len, needles)) - 1
+    try:
+        with open(f, "rb") as fh:
+            tail = b""
+            while chunk := fh.read(1 << 20):
+                buf = tail + chunk
+                if any(x in buf for x in needles):
+                    return True
+                tail = buf[-keep:] if keep else b""
+    except OSError:
+        return False
+    return False
+
+
 def transcript_hit(run_dir: str | Path | None, path: str, home: str = "") -> tuple[int, str] | None:
     """(line number, quote) of the first command or file edit the run issued (issued) that writes `path`
     (_writes, an editor tool's file) or a store like it (_writer), as one of its simple commands
-    (_commands); None when none does."""
+    (_commands); None when none does. A transcript and refusal log holding neither the file's name nor
+    the writer's command word are answered without parsing a line (_needles), and an answer is kept until
+    either file's size or mtime changes: this runs on the daemon's thread as runs end."""
     if not run_dir:
         return None
+    rd = Path(run_dir)
+    key = (str(rd), path, home, _stamp(rd / "output.jsonl"), _stamp(rd / "refusals.jsonl"))
+    if key in _HITS:
+        return _HITS[key]
+    needles = _needles(path)
+    hit = _scan(rd, path, home) if any(_holds(rd / f, needles) for f in ("output.jsonl", "refusals.jsonl")) else None
+    while len(_HITS) >= HITS_KEPT:
+        _HITS.pop(next(iter(_HITS)))
+    _HITS[key] = hit
+    return hit
+
+
+def _scan(run_dir: Path, path: str, home: str) -> tuple[int, str] | None:
     for n, kind, text in issued(run_dir):
         if kind == "file":
             if _is(text, path, home):

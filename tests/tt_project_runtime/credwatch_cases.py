@@ -570,3 +570,32 @@ def test_credwatch_blames_only_the_runs_own_unrefused_post_fork_write_calls(env,
     for cmd, hit in ((f"ssh-keygen -t ed25519 -f {key}", True), ("ssh-keygen -t ed25519 -f ~/.ssh/other", False),
                      ("ssh-keygen -t ed25519 -f /tmp/k", False), ("ssh-keygen -t ed25519 -N ''", True)):
         assert (verdict([use("k", cmd)], key) == credwatch.FAILS) is hit, cmd
+
+
+def test_credwatch_transcript_hit_skips_a_transcript_without_the_name_unparsed_and_caches_per_file(tmp_path, monkeypatch):
+    """A large transcript holding neither the store's file name nor its writer's command word is answered
+    with no parse of any line; a second call on the unchanged files is served from the cache, and a
+    transcript that changed is read again; a writer that names no file still hits."""
+    from ttp import credwatch
+    home = tmp_path / "acct"
+    key = str(home / ".ssh" / "id_example")
+    d = tmp_path / "run"
+    d.mkdir()
+    (d / "output.jsonl").write_text((json.dumps(_bash("echo " + "x" * 2_000_000)) + "\n") * 5)
+    scans = []
+    real = credwatch._scan
+    monkeypatch.setattr(credwatch, "_scan", lambda *a: scans.append(a) or real(*a))
+    assert credwatch.transcript_hit(d, key, str(home)) is None and scans == []
+    with open(d / "output.jsonl", "a") as f:
+        f.write(json.dumps(_bash("cp /tmp/k ~/.ssh/id_example")) + "\n")
+    first = credwatch.transcript_hit(d, key, str(home))
+    assert first and first[0] == 6 and "cp /tmp/k" in first[1] and len(scans) == 1, first
+    assert credwatch.transcript_hit(d, key, str(home)) == first and len(scans) == 1   # cached
+    with open(d / "output.jsonl", "a") as f:
+        f.write("\n")
+    assert credwatch.transcript_hit(d, key, str(home)) == first and len(scans) == 2   # changed: read again
+    (d / "output.jsonl").write_text(json.dumps(_bash("ssh-keygen -t ed25519 -N ''")) + "\n")   # the word alone
+    assert credwatch.transcript_hit(d, key, str(home))[0] == 1 and len(scans) == 3
+    gh = str(home / ".config" / "gh" / "hosts.yml")
+    (d / "output.jsonl").write_text(json.dumps(_bash("gh auth login --with-token")) + "\n")
+    assert credwatch.transcript_hit(d, gh, str(home))[0] == 1
