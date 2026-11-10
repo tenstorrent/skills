@@ -91,6 +91,11 @@ TOOLS = "--tools"
 # with ENABLE_CLAUDEAI_MCP_SERVERS=false, which keeps the user's, project's and plugins' own servers.
 # In the 14 days to 2026-10-24 no worker of three projects (~6,700 runs) called a connector's tool.
 CONNECTORS_OFF = {"ENABLE_CLAUDEAI_MCP_SERVERS": "false"}
+# A run that keeps them waits for their list before its first turn. By default the CLI loads them
+# fully async and a resumed worker often starts without them (init mcp_servers [] in 8 of 10 trays-mac
+# worker runs on 2026-11-09); blocking, every replay had them. 2.1.285 reads MCP_CONNECT_TIMEOUT_MS for
+# the connectors' wait (its changelog), MCP_TIMEOUT for the other servers.
+CONNECTORS_WAIT = {"MCP_CONNECTION_NONBLOCKING": "false", "MCP_CONNECT_TIMEOUT_MS": "20000"}
 CONNECTOR_PREFIXES = ("claude.ai", "claude_ai_", "mcp__claude_ai_")   # server name, its tools' prefix
 WORKER_TOOLS = ("Bash", "Read", "Edit", "Write", "Skill", "ToolSearch")
 WEB_TOOLS = ("WebFetch", "WebSearch")
@@ -355,7 +360,7 @@ class Claude(Provider):
         return found, [n for n in names if n not in found]
 
     def connector_env(self, keep: bool) -> dict[str, str]:
-        return {} if keep else dict(CONNECTORS_OFF)
+        return dict(CONNECTORS_WAIT) if keep else dict(CONNECTORS_OFF)
 
     def is_connector(self, name: str) -> bool:
         return str(name).lower().startswith(CONNECTOR_PREFIXES)

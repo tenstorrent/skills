@@ -3106,6 +3106,13 @@ class Daemon:
         return any(a < end and b > start for a, b in self.p.db.kv("host_sleeps", []) or [])
 
     # runs -----------------------------------------------------------------------------------------
+    @staticmethod
+    def _with_connector_wait(prov, env: dict) -> dict:
+        """`env` plus the wait for connectors a run that keeps them needs; a value already in the
+        run's or the host's environment stays."""
+        wait = prov.connector_env(True)
+        return {**wait, **{k: v for k, v in os.environ.items() if k in wait}, **env}
+
     def _connectors_needed(self, prov, provider: str) -> bool:
         """Whether a non-isolated worker keeps the user's account connectors (see Claude's
         CONNECTORS_OFF): the project lists one in `providers.<p>.mcp_servers`, or one of its runs
@@ -3538,9 +3545,11 @@ class Daemon:
                     extra += prov.isolation_args()
                 else:
                     argv = kept
+                    env = self._with_connector_wait(prov, env)
                 mcp_servers = {} if prov.mcp_by_args else self._approved_mcp(prov, provider, cwd)
             elif prov.connector_env(False):
-                env = {**env, **prov.connector_env(self._connectors_needed(prov, provider))}
+                keep = self._connectors_needed(prov, provider)
+                env = self._with_connector_wait(prov, env) if keep else {**env, **prov.connector_env(False)}
             if prov.mcp_by_args:
                 got, mcp_env, unknown = prov.mcp_args(self._mcp_names(provider), self._mcp_dirs(cwd), argv + extra,
                                                       {**os.environ, **env})

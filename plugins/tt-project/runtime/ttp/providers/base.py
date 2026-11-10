@@ -477,8 +477,8 @@ class Provider:
 
     def connector_env(self, keep: bool) -> dict[str, str]:
         """Environment that leaves the user's account connectors (servers the agent's account adds,
-        not the user's or project's own) out of a non-isolated worker unless `keep`; {} if this
-        agent has none to leave out."""
+        not the user's or project's own) out of a non-isolated worker unless `keep`; with `keep`, any
+        environment the agent needs to load them reliably. {} if this agent has none."""
         return {}
 
     def is_connector(self, name: str) -> bool:

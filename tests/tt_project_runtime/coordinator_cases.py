@@ -20232,6 +20232,26 @@ def test_claude_ai_connectors_stay_when_the_config_lists_one_or_runs_used_one(en
     assert "ENABLE_CLAUDEAI_MCP_SERVERS" not in _worker_env(p, monkeypatch)[1]
 
 
+def test_a_run_that_keeps_claude_ai_connectors_waits_for_them_and_one_that_leaves_them_out_does_not(env, monkeypatch, tmp_path):
+    from ttp import coordinator as coord
+    p = make(env)
+    _claude_mcp_config(tmp_path, monkeypatch, p)
+    p.set_config("providers.claude.worker_isolation", False)
+    wait = ("MCP_CONNECTION_NONBLOCKING", "MCP_CONNECT_TIMEOUT_MS")
+    monkeypatch.delenv("MCP_CONNECT_TIMEOUT_MS", raising=False)
+    monkeypatch.delenv("MCP_CONNECTION_NONBLOCKING", raising=False)
+    run_env = _worker_env(p, monkeypatch)[1]   # every connector left out: no wait
+    assert run_env.get("ENABLE_CLAUDEAI_MCP_SERVERS") == "false" and not any(k in run_env for k in wait)
+    assert coord.apply(p, [{"type": "config_set", "key": "providers.claude.mcp_servers",
+                            "value": ["claude.ai Search"]}]) == []
+    for kind in ("work", "review"):
+        run_env = _worker_env(p, monkeypatch, kind=kind)[1]
+        assert run_env["MCP_CONNECTION_NONBLOCKING"] == "false" and run_env["MCP_CONNECT_TIMEOUT_MS"] == "20000", kind
+    monkeypatch.setenv("MCP_CONNECT_TIMEOUT_MS", "5000")   # a value already present stays
+    run_env = _worker_env(p, monkeypatch)[1]
+    assert run_env["MCP_CONNECT_TIMEOUT_MS"] == "5000" and run_env["MCP_CONNECTION_NONBLOCKING"] == "false"
+
+
 def test_connector_rule_leaves_isolation_no_internet_and_the_tool_set_alone(env, monkeypatch, tmp_path):
     p = make(env)
     _claude_mcp_config(tmp_path, monkeypatch, p)
