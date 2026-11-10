@@ -331,7 +331,7 @@ def test_ttp_new_on_another_host_quotes_every_forwarded_word_so_empty_or_spaced_
 _FAKE_SSH = """#!/bin/sh
 printf '%s\\n' "$*" >> "$FAKE_LOG"
 case " $* " in *" -O stop "*) exit 0 ;; esac
-[ -n "$FAKE_NONSOCK" ] && echo "ControlSocket $FAKE_NONSOCK already exists, disabling multiplexing" >&2
+[ -n "$FAKE_PID" ] && { echo $$ > "$FAKE_PID"; exec sleep "${FAKE_SLEEP:-30}"; }
 case " $* " in *"ControlMaster=auto"*) [ -n "$FAKE_MUX_FAIL" ] && { echo "mux_client_hello_exchange: write packet: Broken pipe" >&2; exit 255; } ;; esac
 exit "${FAKE_RC:-0}"
 """
@@ -410,13 +410,75 @@ def test_the_ssh_wrapper_passes_the_remote_exit_code_without_a_retry(tmp_path):
     assert r.returncode == 255 and len(log) == 1
 
 
-def test_a_broken_shared_connection_falls_back_once_to_a_plain_one(tmp_path):
+def test_a_broken_shared_connection_is_left_to_ssh_itself(tmp_path):
+    """OpenSSH with ControlMaster=auto removes a stale socket and connects directly; the wrapper adds no retry
+    of its own and passes ssh's exit code and stderr through."""
     r, log = _run_wrapper(tmp_path, ["-o", "BatchMode=yes", "host-a", "exit 4"], FAKE_MUX_FAIL=1, FAKE_RC=4)
-    assert r.returncode == 4, r.stderr
-    assert len(log) == 3
-    assert "-O stop" in log[1] and "ControlMaster=auto" in log[1]   # the bad socket is removed
-    assert log[2] == "-o ControlMaster=no -o ControlPath=none -o BatchMode=yes host-a exit 4"
-    assert "mux_client_hello" in r.stderr                              # the first error still shows
+    assert r.returncode == 255 and len(log) == 1 and "ControlMaster=auto" in log[0]
+    assert "mux_client_hello" in r.stderr
+
+
+def _wrapper_env(tmp_path, **extra):
+    import shutil
+    wbin, rbin, home = tmp_path / "wbin", tmp_path / "rbin", tmp_path / "home"
+    for d in (wbin, rbin, home):
+        d.mkdir(exist_ok=True)
+    shutil.copy(RUNTIME.parent / "template" / "bin" / "ssh", wbin / "ssh")
+    (wbin / "ssh").chmod(0o755)
+    (rbin / "ssh").write_text(_FAKE_SSH)
+    (rbin / "ssh").chmod(0o755)
+    return wbin / "ssh", {"PATH": f"{wbin}:{rbin}:/usr/bin:/bin", "HOME": str(home), "FAKE_LOG": str(tmp_path / "log"),
+                          "TMPDIR": str(tmp_path), **{k: str(v) for k, v in extra.items()}}
+
+
+def _alive(pid):
+    import os
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def _wait_for(path, s=10.0):
+    import time
+    end = time.monotonic() + s
+    while time.monotonic() < end:
+        if path.exists() and path.read_text().strip():
+            return int(path.read_text())
+        time.sleep(0.02)
+    raise AssertionError(f"{path} never written")
+
+
+def test_a_sigterm_to_the_ssh_wrapper_stops_the_real_ssh_at_once(tmp_path):
+    """The wrapper execs the real ssh: the caller's pid is ssh's, so its SIGTERM reaches ssh, not a shell that
+    waits for its child (measured before the fix: 36 s for a 37 s child)."""
+    import signal
+    import subprocess
+    import time
+    w, e = _wrapper_env(tmp_path, FAKE_PID=tmp_path / "pid", FAKE_SLEEP=30)
+    proc = subprocess.Popen([str(w), "host-a", "sleep 30"], env=e)
+    try:
+        pid = _wait_for(tmp_path / "pid")
+        assert pid == proc.pid                     # exec: no wrapper process between the caller and ssh
+        t = time.monotonic()
+        proc.send_signal(signal.SIGTERM)
+        proc.wait(timeout=2)
+        assert time.monotonic() - t < 2 and not _alive(pid)
+    finally:
+        proc.kill()
+        proc.wait()
+
+
+def test_a_timeout_kill_of_the_ssh_wrapper_leaves_no_real_ssh_running(tmp_path):
+    """subprocess.run's timeout SIGKILLs the pid it started (stepclock.kill_tree on macOS has no /proc to
+    find descendants): that pid is the real ssh, so nothing is left under pid 1."""
+    import subprocess
+    w, e = _wrapper_env(tmp_path, FAKE_PID=tmp_path / "pid", FAKE_SLEEP=30)
+    with pytest.raises(subprocess.TimeoutExpired):
+        subprocess.run([str(w), "host-a", "sleep 30"], env=e, timeout=1)
+    pid = _wait_for(tmp_path / "pid")
+    assert not _alive(pid), f"real ssh {pid} outlived the kill"
 
 
 def test_the_ssh_wrapper_keeps_its_socket_path_under_the_unix_limit(tmp_path):
@@ -462,19 +524,44 @@ def test_project_commands_carry_the_ssh_reuse_switch(env):
     assert command_env(p).get("TTP_SSH_REUSE") == "0"
 
 
-def test_the_ssh_wrapper_removes_a_non_socket_left_at_its_socket_path(tmp_path):
-    """ssh runs unshared past a plain file at the socket path; the wrapper removes it so the next call shares
-    again, but never a path outside its own folder."""
+def test_the_ssh_wrapper_removes_a_non_socket_left_in_its_socket_folder(tmp_path):
+    """ssh runs unshared past a plain file or symlink at the socket path: the wrapper removes those from its own
+    folder before ssh starts, and keeps sockets, subfolders and anything outside the folder."""
     import shutil
+    import socket
     import tempfile
     cm = pathlib.Path(tempfile.mkdtemp(prefix="c", dir="/tmp"))   # short: the wrapper's folder limit is 45
+    s = socket.socket(socket.AF_UNIX)
     try:
-        bad, outside = cm / ("a" * 40), tmp_path / "keep"
-        bad.write_text("")
-        outside.write_text("")
-        r, log = _run_wrapper(tmp_path, ["host-a", "true"], TTP_SSH_CM_DIR=cm, FAKE_NONSOCK=bad)
-        assert r.returncode == 0 and len(log) == 1 and not bad.exists()
-        r, _ = _run_wrapper(tmp_path, ["host-a", "true"], TTP_SSH_CM_DIR=cm, FAKE_NONSOCK=outside)
-        assert r.returncode == 0 and outside.exists()
+        bad, link, hidden, outside = cm / ("a" * 40), cm / ("b" * 40), cm / ".x", tmp_path / "keep"
+        for f in (bad, hidden, outside):
+            f.write_text("")
+        link.symlink_to(outside)
+        s.bind(str(cm / ("c" * 40)))
+        (cm / "sub").mkdir()
+        r, log = _run_wrapper(tmp_path, ["host-a", "true"], TTP_SSH_CM_DIR=cm)
+        assert r.returncode == 0 and len(log) == 1
+        assert sorted(x.name for x in cm.iterdir()) == ["c" * 40, "sub"]
+        assert outside.exists()
     finally:
+        s.close()
         shutil.rmtree(cm)
+
+
+def test_ssh_reuse_off_reaches_the_daemons_own_ssh_calls(env, monkeypatch):
+    """launchd and systemd start the daemon without TTP_SSH_REUSE: each config load sets it from ssh.reuse, so a
+    daemon-side subprocess ssh with no env= runs the plain ssh while reuse is off and the wrapper while on."""
+    from ttp import daemon, sshmux, stepclock
+    seen = []
+    monkeypatch.setitem(stepclock._orig, "init", lambda self, args, *a, **kw: seen.append(args))
+    monkeypatch.setenv("TTP_SSH_REUSE", "1")   # recorded, so the value the daemon sets is undone after
+    monkeypatch.delenv("TTP_SSH_REUSE")
+    p = make(env)
+    p.set_config("ssh.reuse", False)
+    d = daemon.Daemon(p.base)
+    stepclock._init(None, ["ssh", "h", "true"])
+    assert seen[-1][0] == "ssh"
+    p.set_config("ssh.reuse", True)
+    d._load_config()
+    stepclock._init(None, ["ssh", "h", "true"])
+    assert seen[-1][0] == sshmux.wrapper()

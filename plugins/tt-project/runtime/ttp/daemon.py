@@ -1593,6 +1593,9 @@ class Daemon:
         # sandbox.checks true counts only on the user's own word since runs went unsandboxed (sandboxstate).
         # start_run tells the coordinator about a superseded one.
         os.environ[process_sandbox.ENV] = "1" if sandboxstate.state(self.p, self.cfg, sandboxstate.CHECKS_KEY)[0] else "0"
+        # ssh.reuse for this daemon's own ssh calls too: stepclock routes a bare `ssh` with no env= by
+        # this process's environment, which launchd and systemd start without the variable.
+        os.environ.update(sshmux.env(self.cfg))
         if status != self.cfg_status:
             log(self.p, {"ok": "project.json reads again",
                          "fallback": "project.json is missing or not valid JSON: its last good copy stays in force",

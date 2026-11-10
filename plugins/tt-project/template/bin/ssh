@@ -14,9 +14,11 @@
 # ControlMaster, ControlPath) or forwards ports or stdio (-L -R -D -W -w -N -f: a forward added to a
 # shared connection would outlive the command); -v (a verbose master keeps the caller's stderr open for
 # its 10 minutes, so a captured call would hang); -G, -V, -Q.
-# A shared connection that fails before the command starts (ssh exits 255 naming mux_client or the
-# control socket) is stopped (ssh -O stop removes its socket) and the command reruns once over a
-# connection of its own. stderr passes through a pipe for that (prompts go to the terminal, not stderr).
+# The real ssh replaces this script (exec), so the caller's pid is ssh's own: a kill of the caller
+# (SIGTERM, a timeout's SIGKILL) stops ssh and its remote command, never only the wrapper. A shared
+# connection that fails before the command starts is OpenSSH's own to handle: with ControlMaster=auto
+# it removes a stale socket and connects directly. A file in the folder that is no socket (ssh would
+# then run unshared on every call) is removed before ssh starts.
 set -f
 real=
 ifs=$IFS
@@ -85,20 +87,10 @@ if ! [ -d "$dir" ] || ! [ -O "$dir" ] || [ -L "$dir" ] || ! chmod 700 "$dir" 2>/
     exec "$real" "$@"
 fi
 mux="-o ControlMaster=auto -o ControlPath=$dir/%C -o ControlPersist=600 -o ServerAliveInterval=15 -o ServerAliveCountMax=3"
-err=$(mktemp "${TMPDIR:-/tmp}/ttp-ssh.XXXXXX") || exec "$real" $mux "$@"
-rcf=$err.rc
-trap 'rm -f "$err" "$rcf"' EXIT
-trap 'exit 130' INT
-trap 'exit 143' TERM
-{ { "$real" $mux "$@"; echo $? > "$rcf"; } 2>&1 1>&3 3>&- | tee "$err" >&2; } 3>&1
-rc=$(cat "$rcf" 2>/dev/null)
-rc=${rc:-255}
-# A non-socket left at the socket path (ssh then runs unshared, every time) is removed for the next call.
-bad=$(sed -n 's/^ControlSocket \(.*\) already exists, disabling multiplexing.*/\1/p' "$err" | head -n 1)
-case $bad in "$dir"/*) [ -S "$bad" ] || [ -L "$bad" ] || rm -f "$bad" ;; esac
-if [ "$rc" = 255 ] && grep -qsE 'mux_client_(hello|request|forward)|[Cc]ontrol socket connect|master hello' "$err"; then
-    "$real" $mux -O stop "$@" >/dev/null 2>&1
-    "$real" -o ControlMaster=no -o ControlPath=none "$@"
-    exit $?
-fi
-exit "$rc"
+set +f
+for f in "$dir"/* "$dir"/.[!.]*; do
+    [ -e "$f" ] || [ -L "$f" ] || continue
+    { [ -S "$f" ] && ! [ -L "$f" ]; } || [ -d "$f" ] || rm -f "$f"
+done
+set -f
+exec "$real" $mux "$@"

@@ -6,10 +6,10 @@ The harness's bin/ssh (template/bin/ssh) runs the real ssh with OpenSSH multiple
 project starts to one host shares one connection for ControlPersist (10 min): an ssh agent signs once,
 not per probe. It is first on PATH for workers, reviewers and the daemon's shell commands (probes, heal
 checks, checks-host runs, git over ssh); the daemon's own `subprocess` ssh calls reach it through
-stepclock (argv()). The wrapper reads TTP_SSH_REUSE (env()), so ssh.reuse off leaves every ssh as it was.
+stepclock (argv()), by the TTP_SSH_REUSE the daemon sets in its own environment on each config load.
+The wrapper reads TTP_SSH_REUSE too (env()), so ssh.reuse off leaves every ssh as it was.
 Sockets live in a folder of tt-project's (~/.tt-project/cm, mode 700), never in the user's ssh folder;
-the wrapper documents its opt-outs and its one plain retry when a shared connection fails before the
-command starts.
+the wrapper documents its opt-outs. It execs the real ssh, so a kill of the caller stops ssh itself.
 """
 from __future__ import annotations
 
