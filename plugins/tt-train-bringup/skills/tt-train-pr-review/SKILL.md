@@ -30,7 +30,7 @@ This skill is distilled from the tt-train fused kernels and about 1,000 review c
 ## 2. Is it worth it? Ask this first
 
 - **Step gain = share of step × achievable speedup.** Profile the consumer before touching a kernel. In Tracy, use `DEVICE KERNEL DURATION`, not FW duration.
-- **Profile at 2, 4 and 8 layers, never the full depth.** Tracy over every layer of an LLM is too expensive. Build the model at 2, 4 and 8 layers with real shapes, profile each, fit per-layer cost from the slope and fixed cost from the intercept, and extrapolate to the full layer count. Quote the share of step from the projection and say so. The three points must be collinear within noise; if they are not, the step has a term that does not scale with depth and the projection is not evidence. See the `optimization-loop` skill's measurement protocol in this plugin.
+- **Profile at 2, 4, 8 and 16 layers, never the full depth.** Tracy over every layer of an LLM is too expensive. Build the model at 2, 4, 8 and 16 layers with real shapes, profile each, fit a line (per-layer cost from the slope, fixed cost from the intercept) over the four points, and extrapolate to the full layer count. Quote the share of step from the projection and say so. Every point must sit on the line within noise; if one does not, the step has a term that does not scale with depth and the projection is not evidence. See the `optimization-loop` skill's measurement protocol in this plugin.
 - **An op at about 1–2% of the step** gets cheap structural wins only; micro-tuning isn't worth it. Sub-0.1% wins are below what a benchmark can resolve.
 - **Low-hanging fruit is often outside the kernel:**
   - Host dispatch: composite Muon issued about 4,000 dispatches, roughly 700 ms per step (#37127).

@@ -96,10 +96,10 @@ Composite bring-up:
   MFU FLOP count differs from the plan's;
 - `doc/perf_analysis.md` lacks the ranked cost table or the table lacks op
   attribution to model code;
-- Tracy was run on the full layer stack, or on fewer than the 2, 4 and 8 layer
-  depths, or the per-layer estimates from the two slopes disagree beyond the
-  stated tolerance without an explanation, or the projection was not validated
-  against the full-model MFU wall-clock.
+- Tracy was run on the full layer stack, or on fewer than the 2, 4, 8 and 16
+  layer depths, or a depth's residual from the fitted line exceeds the stated
+  tolerance without an explanation, or the projection was not validated against
+  the full-model MFU wall-clock.
 
 Optimisation loop:
 
