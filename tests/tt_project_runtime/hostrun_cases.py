@@ -523,7 +523,7 @@ def test_the_coordinator_sets_the_host_run_allowlist_through_config_set_and_chat
         env, monkeypatch, capsys):
     from ttp import cli, configwho, hostrun
     from ttp import coordinator as coord
-    p = _hostrun_setup(env, monkeypatch, [])
+    p = _hostrun_setup(env, monkeypatch, [], by="coordinator")   # a value the user set it never changes
     good = ["sudo -n /usr/sbin/tool status", {"cmd": "/usr/local/sbin/power-cycle", "timeout_s": 900}]
     assert coord.apply(p, [{"type": "config_set", "key": hostrun.KEY, "value": good}]) == []
     assert p.config()["runner"]["host_commands"] == good

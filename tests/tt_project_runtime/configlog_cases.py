@@ -151,9 +151,9 @@ def test_a_coordinator_config_set_never_changes_a_value_the_user_set(env, monkey
     probs = coord.apply(p, [{"type": "config_set", "key": key, "value": 6}], user_turn=True, messages=[sys_mid])
     assert probs and "a coordinator never changes a value the user set" in probs[0], probs
     # A value the coordinator set it still changes.
-    assert coord.apply(p, [{"type": "config_set", "key": "heal.escalate", "value": "coordinator"}]) == []
-    assert coord.apply(p, [{"type": "config_set", "key": "heal.escalate", "value": "user"}]) == []
-    assert p.raw_config()["heal"]["escalate"] == "user"
+    for value in (["codex"], ["claude"]):
+        assert coord.apply(p, [{"type": "config_set", "key": "coordinator.provider_failover_to", "value": value}]) == []
+    assert p.raw_config()["coordinator"]["provider_failover_to"] == ["claude"]
 
 
 def test_config_value_with_spaces_and_equals_round_trips_through_set_log_and_undo(env, monkeypatch):

@@ -14816,19 +14816,19 @@ def test_project_pin_verification_config_accepts_only_supported_modes(env, capsy
     from ttp.project import config_problems
     p = make(env)
     assert p.config()["runner"]["pin_verify"] == "lenient"
-    cli.main(["config", "demo", "runner.pin_verify", "strict"])
-    assert p.config()["runner"]["pin_verify"] == "strict"
-    with pytest.raises(SystemExit):
-        cli.main(["config", "demo", "runner.pin_verify", "strcit"])
-    assert "pin_verify" in capsys.readouterr().err
-    assert p.config()["runner"]["pin_verify"] == "strict"
-    for mode in ("strict", "lenient"):
+    for mode in ("strict", "lenient"):   # the coordinator first: it never changes a value the user set
         assert config_problems({"runner": {"pin_verify": mode}}) == []
         assert coord.apply(p, [{"type": "config_set", "key": "runner.pin_verify", "value": mode}]) == []
         assert p.config()["runner"]["pin_verify"] == mode
     assert "pin_verify" in " ".join(config_problems({"runner": {"pin_verify": "strcit"}}))
     assert "pin_verify" in " ".join(coord.apply(p, [{"type": "config_set", "key": "runner.pin_verify", "value": "strcit"}]))
     assert p.config()["runner"]["pin_verify"] == "lenient"
+    cli.main(["config", "demo", "runner.pin_verify", "strict"])
+    assert p.config()["runner"]["pin_verify"] == "strict"
+    with pytest.raises(SystemExit):
+        cli.main(["config", "demo", "runner.pin_verify", "strcit"])
+    assert "pin_verify" in capsys.readouterr().err
+    assert p.config()["runner"]["pin_verify"] == "strict"
 
 
 
