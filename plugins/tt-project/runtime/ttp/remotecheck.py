@@ -314,6 +314,12 @@ def shipped(files: list[str], literal: dict) -> str:
     return out + "".join(f"export {k}={shlex.quote(v)}\n" for k, v in sorted(literal.items()))
 
 
+# Over ssh a check's stdout is a pipe, so Python block-buffers it: pytest's progress then arrives only at
+# exit, and a run longer than the silence limit (checkwall.SILENT_S) was stopped as a hang while it was
+# passing. Unbuffered, each write streams back as it happens.
+UNBUFFERED = "PYTHONUNBUFFERED=1; export PYTHONUNBUFFERED\n"
+
+
 def _priority(prio: tuple[list, list] | None) -> str:
     """The host's lines that put the command (in "$@") behind `nice` and `ionice` (testslots.priority_args),
     each only where the host has it: the lowest priority there too, so its live services go first."""
@@ -360,7 +366,8 @@ def _run_script(q: str, exports_: str, cmd: str, mark: str, wrap: tuple[str, ...
     executable there prints the marker's NO_WRAP form instead of starting anything, and one that exits
     FAULT_RC after writing the file WRAP_REFUSED_ENV names prints its WRAP_REFUSED form. With `prio`, it all
     runs behind the host's `nice` and `ionice` (_priority). Behind a wrapper the pinned checks env
-    (TTP_CHECKS_ENV_BIN, runnerenv.remote_lines) goes first on PATH again, so a wrapper that puts its own env first never hides it."""
+    (TTP_CHECKS_ENV_BIN, runnerenv.remote_lines) goes first on PATH again, so a wrapper that puts its own env first never hides it.
+    Python's output is unbuffered there (UNBUFFERED, before the check's env, which may set it otherwise)."""
     if wrap:
         cmd = REFRONT + cmd
     w = " ".join(map(shlex.quote, wrap))
@@ -381,7 +388,7 @@ def _run_script(q: str, exports_: str, cmd: str, mark: str, wrap: tuple[str, ...
     stop = ("[ -n \"$pid\" ] && { kill -TERM -$pid 2>/dev/null || kill -TERM $pid 2>/dev/null; }; "
             "[ -n \"$watch\" ] && kill $watch 2>/dev/null; exit")
     traps = "".join(f"trap '{stop} {128 + n}' {sig}\n" for sig, n in (("HUP", 1), ("INT", 2), ("TERM", 15)))
-    return (f"cd {q} || exit 97\npid=; watch=\n{owner}{_END.replace('@Q@', q)}{traps}"
+    return (f"cd {q} || exit 97\npid=; watch=\n{owner}{UNBUFFERED}{_END.replace('@Q@', q)}{traps}"
             f"{{ echo $$ > {RUN_PID}; }} 2>/dev/null\n"
             f"{exports_}{has}"
             f"if command -v bash >/dev/null 2>&1; then set -- {run}; else set -- {w} sh -e -c {shlex.quote(cmd)}; fi\n"

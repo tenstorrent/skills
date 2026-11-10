@@ -120,6 +120,17 @@ def test_a_remote_check_runs_on_a_git_checkout_of_exactly_head_and_cleans_up(tmp
 
 
 
+def test_a_remote_check_s_python_output_is_unbuffered_unless_its_env_says_otherwise(tmp_path):
+    """Over ssh stdout is a pipe: Python there runs unbuffered, so pytest's progress streams back and a
+    passing run longer than the silence limit (checkwall.SILENT_S) is not stopped as a hang (live: about 30
+    spilled smoke runs stopped at 610-631 s); a check's own env still sets it otherwise."""
+    repo = _rc_repo(tmp_path)
+    rc, said = _rc_run(tmp_path, repo, 'echo "unbuf=$PYTHONUNBUFFERED"')
+    assert rc == 0 and "unbuf=1" in said, said
+    rc, said = _rc_run(tmp_path, repo, 'echo "unbuf=$PYTHONUNBUFFERED"', env={"PYTHONUNBUFFERED": ""})
+    assert rc == 0 and "unbuf=" in said and "unbuf=1" not in said, said
+
+
 def test_a_remote_check_runs_at_nice_19_and_idle_io_on_the_host(tmp_path):
     """The command on the host runs behind its `nice -n 19` and `ionice -c3` (testslots.priority_args), not
     only the local ssh client: its niceness there is 19, its IO class idle where the host has ionice."""
