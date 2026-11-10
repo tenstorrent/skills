@@ -39,7 +39,10 @@ its first call and read none). So a fork on the coordinator's model sends the co
 prefix (coord_shape, shape_argv): its system prompt, its answer schema and the settings that change the
 tools' text; the run's own system prompt leads its prompt instead (shared_lead). A run on another model
 (a Sonnet worker of an Opus coordinator) cannot read that cache at all, so it takes the disk block
-instead of a fork (_model_gap); a follow-up still resumes its own earlier run's session."""
+instead of a fork (_model_gap). For the same reason a follow-up never resumes a session another model
+made (Sonnet resuming an Opus run or the reverse, owner's order): it starts as a fresh run of its model
+does, from the coordinator fork (shaped) or the disk block, and its prompt carries the task it continues
+and that task's last hand-off (_cross_model)."""
 from __future__ import annotations
 
 import json
@@ -141,7 +144,7 @@ def delta_block(p, cfg: dict, since: float, now: float | None = None) -> str:
 
 
 def follow_source(p, task: int | None) -> dict | None:
-    """The run whose session a follow-up resumes: {"run", "task", "title", "session", "provider", "ended"},
+    """The run whose session a follow-up resumes: {"run", "task", "title", "session", "provider", "model", "ended"},
     or None for a task that continues none. Its own last ok run first (a later run of the follow-up), else
     the last ok run of the task it continues. A review that continues a task of another kind (its author's)
     never resumes it: a first review stays independent."""
@@ -152,12 +155,13 @@ def follow_source(p, task: int | None) -> dict | None:
     if not src or (t["kind"] == "review" and src["kind"] != "review"):
         return None
     for owner in (t, src):
-        for r in p.db.q("SELECT id, provider, ended, note, session_id FROM runs WHERE task=? AND role!='coordinator' "
-                        "AND status='ok' ORDER BY id DESC LIMIT 3", (owner["id"],)):
+        for r in p.db.q("SELECT id, provider, model, ended, note, session_id FROM runs WHERE task=? "
+                        "AND role!='coordinator' AND status='ok' ORDER BY id DESC LIMIT 3", (owner["id"],)):
             sid = r["session_id"] or json.loads(r["note"] or "{}").get("session_id")
             if sid:
                 return {"run": r["id"], "task": owner["id"], "title": owner["title"] or "", "session": str(sid),
-                        "provider": r["provider"] or "", "ended": float(r["ended"] or 0)}
+                        "provider": r["provider"] or "", "model": r["model"] or "",
+                        "ended": float(r["ended"] or 0)}
     return None
 
 
@@ -184,7 +188,8 @@ def prepare(p, cfg: dict, prov, provider: str, cwd: str, env: dict | None, now: 
     if m == "fork":
         try:
             src = follow_source(p, task)
-            gap = _resume_gap(src, prov, provider) or _fork_rejected(p, task, "resume") if src else ""
+            gap = _resume_gap(src, prov, provider) or _cross_model(src, model) or _fork_rejected(p, task, "resume") \
+                if src else ""
             if src and not gap:
                 new = str(uuid.uuid4())
                 gap = prov.start_from_session(src["provider"] or provider, src["session"], cwd, env, new)
@@ -227,6 +232,16 @@ def _resume_gap(src: dict, prov, provider: str) -> str:
             return f"run {src['run']} ran on {src['provider'] or 'another provider'}, this run on {provider}"
     if not prov.resume_args(src["session"]):
         return f"{provider} cannot resume a session"
+    return ""
+
+
+def _cross_model(src: dict, model: str | None) -> str:
+    """Why a follow-up on another model than the run it would resume starts fresh; "" otherwise. The
+    prompt cache is per model, so the copied history was written again in full on its first call and
+    never read (task #53: 4 of 10 cold resumes crossed models). A run or source with no known model
+    resumes as before."""
+    if model and src.get("model") and not same_model(model, src["model"]):
+        return f"run {src['run']} ran on {src['model']}, this run on {model}, whose cache cannot read its history"
     return ""
 
 

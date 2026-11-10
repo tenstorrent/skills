@@ -787,3 +787,77 @@ def test_a_run_on_another_model_than_the_coordinators_takes_the_disk_block_not_a
             assert "not the coordinator's claude-opus-5-5" in got["why"] and got["lead"].startswith(ctxfork.DISK_HEAD)
     assert ctxfork.same_model("opus", "claude-opus-5-5") and not ctxfork.same_model("sonnet", "claude-opus-5-5")
     assert not ctxfork.same_model("claude-opus-4-1", "claude-opus-5-5")
+
+
+def test_a_follow_up_on_another_model_starts_fresh_never_resuming_the_other_models_session(env, monkeypatch, tmp_path):
+    """Owner's order (msg #188, task #175): the prompt cache is per model, so a follow-up that resumed a
+    session another model made (Sonnet resuming an Opus run or the reverse) wrote its whole history again
+    and never read it (task #53: 4 of 10 cold resumes). It starts as a fresh run of its model does (the
+    coordinator fork, shaped, or the disk block), with the task it continues and that task's last
+    hand-off in its prompt and none of the other run's history. A same-model follow-up still resumes."""
+    from ttp import coordsession, ctxfork
+    from ttp.prompts import worker_task
+    from ttp.providers import get_provider
+    p, d, cfg_dir, _run = _fork_daemon(env, monkeypatch, tmp_path)
+    coord = str(uuid.uuid4())
+    _fork_transcript(cfg_dir, p.base, coord)
+    p.db.set_kv(coordsession.KEY, {"id": coord, "provider": "claude", "context_tokens": 5000})
+    code = p.db.add_task("the change", "do it", kind="code", origin="user")
+    p.db.update_task(code, status="done", result=json.dumps({"status": "done", "summary": "HANDOFF: half of it done"}))
+    s_code = str(uuid.uuid4())
+    _worker_session(cfg_dir, tmp_path / "wt-code", s_code, "OTHER MODEL'S HISTORY")
+    r_code = _ok_run(p, code, s_code, ended=time.time() - 60)
+    hop = p.db.add_task("continue: the change", "the rest", kind="code", origin="coordinator",
+                        labels=[f"continues:{code}"])
+    prov = get_provider("claude")
+
+    def prep(run_model, model):
+        p.db.x("UPDATE runs SET model=? WHERE id=?", (run_model, r_code))
+        return ctxfork.prepare(p, p.config(), prov, "claude", str(p.root), {}, task=hop, model=model)
+
+    # Same model, or one's bare family alias, or a model unknown on either side: it resumes as before.
+    for run_model, model in (("claude-opus-5-5", "claude-opus-5-5"), ("claude-opus-5-5", "opus"),
+                             ("sonnet", "claude-sonnet-5-5"), ("", "claude-sonnet-5-5"), ("claude-opus-5-5", None)):
+        got = prep(run_model, model)
+        assert got["how"] == "resume" and got["run"] == r_code, (run_model, model, got)
+    # Across models: never a resume. With no coordinator model known it forks the coordinator as a fresh run does.
+    for run_model, model in (("claude-opus-5-5", "claude-sonnet-5-5"), ("sonnet", "opus")):
+        got = prep(run_model, model)
+        assert got["how"] == "fork" and "run" not in got, got
+        assert f"no resume: run {r_code} ran on {run_model}, this run on {model}" in got["why"], got
+        assert not got["lead"].startswith(ctxfork.RESUME_HEAD)
+    # A coordinator on Opus: a Sonnet follow-up of an Opus run takes the disk block a fresh Sonnet run takes.
+    coord_dir = tmp_path / "coord-run"
+    coord_dir.mkdir()
+    (coord_dir / "run.json").write_text(json.dumps({"argv": ["claude", "-p", "--model", "claude-opus-5-5"]}))
+    p.db.x("INSERT INTO runs(role,status,started,dir) VALUES('coordinator','ok',?,?)", (time.time(), str(coord_dir)))
+    got = prep("claude-opus-5-5", "claude-sonnet-5-5")
+    assert got["how"] == "disk" and got["lead"].startswith(ctxfork.DISK_HEAD), got
+    assert "ran on claude-opus-5-5" in got["why"] and "not the coordinator's" in got["why"], got
+    assert prep("claude-sonnet-5-5", "claude-opus-5-5")["how"] == "fork"   # an Opus follow-up: the coordinator fork
+    # Through the daemon: the run's own model against the source run's, and its prompt carries the record.
+    p.db.x("DELETE FROM runs WHERE role='coordinator'")
+    (tmp_path / "wt-hop").mkdir()
+    task = p.db.task(hop)
+
+    def start():
+        rid = d.start_run("worker", worker_task(p, task, str(tmp_path / "wt-hop"), f"ttp/t{hop}"), "claude",
+                          "standard", str(p.root), task=task)
+        rd = p.runs / str(rid)
+        argv = json.loads((rd / "run.json").read_text())["argv"]
+        row = p.db.one("SELECT model, note, session_id FROM runs WHERE id=?", (rid,))
+        return argv, (rd / "prompt.md").read_text(), json.loads(row["note"] or "{}")["coord_context"], row
+    p.db.x("UPDATE runs SET model=NULL WHERE id=?", (r_code,))
+    _a, _pr, got, row = start()
+    assert got["how"] == "resume" and got["run"] == r_code, got   # the source has no model: as before
+    assert row["model"], "the run records its model, which the next follow-up compares"
+    p.db.x("UPDATE runs SET model=? WHERE id=?", (row["model"], r_code))
+    assert start()[2]["how"] == "resume"   # the same model: it resumes
+    p.db.x("UPDATE runs SET model=? WHERE id=?", ("some-other-model", r_code))
+    argv, prompt, got, row = start()
+    assert got["how"] == "fork" and f"run {r_code} ran on some-other-model" in got["why"], got
+    assert prompt.startswith(ctxfork.FORK_HEAD) and ctxfork.RESUME_HEAD not in prompt
+    assert f"This task continues #{code}" in prompt and "HANDOFF: half of it done" in prompt
+    copy = cfg_dir / "projects" / re.sub(r"[^a-zA-Z0-9]", "-", str(p.root)) / f"{got['session']}.jsonl"
+    assert "OTHER MODEL'S HISTORY" not in copy.read_text()
+    assert argv[argv.index("--resume") + 1] == got["session"] != s_code
