@@ -14,13 +14,13 @@ def _fg_run_env(monkeypatch, run_dir, **extra):
         monkeypatch.setenv(k, v)
 
 
-_FG_REMOTE = ("ttp lock blx06 -- ssh blx06 'cd /tmp/x && pytest -q'",
+_FG_REMOTE = ("ttp lock box-a -- ssh box-a 'cd /tmp/x && pytest -q'",
               "cd x && ttp lock rig-a,rig-b -- ./run_tests.sh",
-              "ssh blx06 'cd /dev/shm/t && python -m pytest tests -x'",
+              "ssh box-a 'cd /dev/shm/t && python -m pytest tests -x'",
               "ssh -o BatchMode=yes box make test", "ssh box \"a; ./run.sh\"",
               "true; ssh box ./bench.sh")
 _FG_POLL = ("while ! test -e done; do sleep 30; done", "sleep 600", "tail -f run.log")
-_FG_FINE = ("ttp lock --probe rig-a", "ttp lock --probe --json rig-a", "ssh blx06 uptime",
+_FG_FINE = ("ttp lock --probe rig-a", "ttp lock --probe --json rig-a", "ssh box-a uptime",
             "ttp detach t1 --lock rig-a -- ./run_tests.sh", "ttp checks --detach -- pytest -q",
             "ttp push --detach", "nohup ssh box ./bench.sh > log 2>&1 &", "ssh box uptime; pytest -q",
             "pytest -q tests/x.py", "sleep 2", "git status")
