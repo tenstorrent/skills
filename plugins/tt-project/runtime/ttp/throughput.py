@@ -47,7 +47,9 @@ to its first run, or to now for one still queued:
   force then: the most of them that ran at once for SUSTAIN_S in all while the queue stayed non-empty
   (a shorter peak is an urgent run past the cap), at most checklane.project_cap; a record that stores
   the cap in force at its grant ("cap", record_wait) is judged by that instead; no per-repository run
-  record exists;
+  record exists; a wait whose last logged slot was granted before it ended, with no later queueing, is a
+  checks wait only up to that grant and the rest goes on by its reason as below (its own checks run, its
+  retry condition, a worker slot), unless that rest is under the lane's threshold;
   `serialized` when they ran one at a time back to back, each start and the grant within SERIAL_S of a
   run's end, a queue served one run at a time rather than the cap; a wait over threshold neither is
   `held_by` the host when its waits-log time before the grant, or its events' lane holders all waiting
@@ -574,6 +576,16 @@ def measure(db: DB, cfg: dict, since_s: float = DAY, now: float | None = None, g
                 return key
         return SLOTS_KEY if w1 > w0 and _covered([*slot_log.get(task, ()), *extra], w0, w1) * 2 >= w1 - w0 else None
 
+    def slot_granted(task: int, w0: float, w1: float) -> float | None:
+        """When `task`'s last logged checks slot in (w0, w1) was granted, when nothing queued it for a slot
+        again after (no later record or checks_slot_wait event): the rest of the wait was its checks run
+        and whatever came after (a retry condition, a worker slot), never a checks slot. None: no grant."""
+        recs = slot_log.get(task, ())
+        g = max((b for a, b in recs if w0 < b < w1 and a < w1), default=None)
+        if g is None or any(g < a < w1 for a, _ in recs) or any(g < ts <= w1 for ts, _ in slot_ev.get(task, ())):
+            return None
+        return g
+
     def precheck_hold(t: dict) -> list[tuple[float, float]]:
         """The span review `t` was held for the checks the daemon started on its code task's head: from
         their start to their end, at most PRECHECK_HOLD_S (Daemon._precheck_holds)."""
@@ -644,35 +656,42 @@ def measure(db: DB, cfg: dict, since_s: float = DAY, now: float | None = None, g
             # Its hand-off is the last event after its last run started, when there is one.
             mine = bool(evs and trs and float(evs[-1]["ts"]) >= float(trs[-1]["started"]) and _self_wait(evs[-1]))
             spans_w.append((float(lr["ended"]), now, why, True, mine))
-        for w0, w1, reason, queued, selfw in spans_w:
-            if w1 <= t0 or w1 < w0:
+        for s0, s1, reason, queued, selfw in spans_w:
+            if s1 <= t0 or s1 < s0:
                 continue
-            key = slot_held(t["id"], w0, w1)
-            if "other full checks" in reason or "ttp checks: waiting" in reason or key is not None:
-                # Which of the two checks limits held it: a checks_slot_wait event or checkcap record
-                # names the limit; a reason text alone means the legacy default, the project cap. A wait
-                # the host's gate held (ck_holder counts it) or one about to start charges neither.
-                key = CAP_KEY if key is None else key
-                if key in slot_tally:
-                    slot_tally[key] += w1 - w0
-                ln = lane("checks_slots", CAP_KEY, cap_n)
-                add(ln, w1 - w0, prio, w0, w1, None, queued)
-                if w1 - w0 > (p1_s if prio <= 1 else other_s):
-                    state = cap_wait(t["id"], w0, w1) if cap_n else "idle"
-                    ln[state] += bool(cap_n)
-                    held = ln.setdefault("held_by", {"own": 0, HOST_CORES: 0, OTHER_PROJECTS: 0})
-                    if key:
-                        who = ck_holder(t["id"], w0, w1, state)
-                        held[who] += 1
-                        if who == "own" and state != "serialized":   # held at the project's own limits
-                            ln["own_wait_last"] = max(ln.get("own_wait_last", 0.0), w0)
-            elif selfw or "detach" in reason or "ttp checks" in reason or "own job" in reason:
-                lane("own_job", None, None)["note"] = "the task's own detached job or checks ran: no limit"
-                add(lanes["own_job"], w1 - w0, prio, w0, w1, None, queued)
-            elif not by_rule(t, d if queued else {}, reason, w0, w1, prio, queued):
-                lane("retry_wait", None, None)["note"] = ("its own retry condition, then a slot, not told apart: "
-                                                         "never counted against worker slots")
-                add(lanes["retry_wait"], w1 - w0, prio, w0, w1, None, queued)
+            key = slot_held(t["id"], s0, s1)
+            ck = "other full checks" in reason or "ttp checks: waiting" in reason or key is not None
+            cut = slot_granted(t["id"], s0, s1) if ck else None
+            if cut is not None and s1 - cut <= (p1_s if prio <= 1 else other_s):
+                cut = None   # a short tail (its checks run, then its next run) is not worth a wait of its own
+            for w0, w1, held_ck in ([(s0, s1, ck)] if cut is None else [(s0, cut, True), (cut, s1, False)]):
+                if w1 <= t0:
+                    continue
+                if held_ck:
+                    # Which of the two checks limits held it: a checks_slot_wait event or checkcap record
+                    # names the limit; a reason text alone means the legacy default, the project cap. A wait
+                    # the host's gate held (ck_holder counts it) or one about to start charges neither.
+                    key = CAP_KEY if key is None else key
+                    if key in slot_tally:
+                        slot_tally[key] += w1 - w0
+                    ln = lane("checks_slots", CAP_KEY, cap_n)
+                    add(ln, w1 - w0, prio, w0, w1, None, queued)
+                    if w1 - w0 > (p1_s if prio <= 1 else other_s):
+                        state = cap_wait(t["id"], w0, w1) if cap_n else "idle"
+                        ln[state] += bool(cap_n)
+                        held = ln.setdefault("held_by", {"own": 0, HOST_CORES: 0, OTHER_PROJECTS: 0})
+                        if key:
+                            who = ck_holder(t["id"], w0, w1, state)
+                            held[who] += 1
+                            if who == "own" and state != "serialized":   # held at the project's own limits
+                                ln["own_wait_last"] = max(ln.get("own_wait_last", 0.0), w0)
+                elif selfw or "detach" in reason or "ttp checks" in reason or "own job" in reason:
+                    lane("own_job", None, None)["note"] = "the task's own detached job or checks ran: no limit"
+                    add(lanes["own_job"], w1 - w0, prio, w0, w1, None, queued)
+                elif not by_rule(t, d if queued else {}, reason, w0, w1, prio, queued):
+                    lane("retry_wait", None, None)["note"] = ("its own retry condition, then a slot, not told apart: "
+                                                             "never counted against worker slots")
+                    add(lanes["retry_wait"], w1 - w0, prio, w0, w1, None, queued)
     # Reviews: a code task's last run ending to its review queued (sweep) and started (stall). A wait the
     # checks held is measured but judges neither limit (the swept and free lists plan() reads).
     sweep_s = float(_cfg(cfg, "review.sweep_after_s", 1800) or 0)

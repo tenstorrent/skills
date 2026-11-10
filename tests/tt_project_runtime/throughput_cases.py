@@ -889,7 +889,8 @@ def _tp_checks_run(p, monkeypatch, start, seconds):
 def test_throughput_checks_at_limit_counts_only_the_wait_before_the_grant(env, monkeypatch, tmp_path):
     """#4399's repro: cap 3, a p1 task waits 999 s for the checks, its own checks are granted at once at
     w0+5 and run 900 s beside two runs started at w0. Its waits-log record has no time before the grant,
-    so the wait is not at the limit and nothing is raised. A task queued 700 s while three runs ran is."""
+    so the wait is not at the limit and nothing is raised (#7793: only its 5 s before the grant is a checks
+    wait; the rest is its own checks run). A task queued 700 s while three runs ran is."""
     from ttp import throughput
     from ttp.daemon import Daemon
     p = make(env)
@@ -903,7 +904,8 @@ def test_throughput_checks_at_limit_counts_only_the_wait_before_the_grant(env, m
     _tp_checks_run(p, monkeypatch, w0 + 5, 900)
     rep = throughput.measure(p.db, p.config(), now=now, gates={})
     ck = _tp_lane(rep, "checks_slots")
-    assert (ck["limit"], ck["count"], ck["at_limit"], ck["idle"]) == (3, 1, 0, 1), ck
+    assert (ck["limit"], ck["count"], ck["at_limit"], ck["idle"], ck["median_s"]) == (3, 1, 0, 0, 5), ck
+    assert _tp_lane(rep, "own_job")["median_s"] == 994
     changes, _ = throughput.plan(p.db, p.config(), rep)
     assert not [c for c in changes if c["key"].startswith("checks.")], changes
     # A wait with no grant record at all is not at the limit either.
@@ -917,7 +919,7 @@ def test_throughput_checks_at_limit_counts_only_the_wait_before_the_grant(env, m
         _tp_checks_run(p, monkeypatch, w1 - 60, 1200)
     _tp_slot_wait(p, monkeypatch, q, w1, w1 + 700)
     ck = _tp_lane(throughput.measure(p.db, p.config(), now=now, gates={}), "checks_slots")
-    assert (ck["count"], ck["at_limit"], ck["idle"]) == (3, 1, 2), ck
+    assert (ck["count"], ck["at_limit"], ck["idle"]) == (3, 1, 1), ck   # the one granted at once: 5 s
     changes, _ = throughput.plan(p.db, p.config(), throughput.measure(p.db, p.config(), now=now, gates={}))
     assert not [c for c in changes if c["key"].startswith("checks.")], changes
 
@@ -1054,6 +1056,27 @@ def test_throughput_judges_a_checks_wait_by_the_cap_its_record_stored_else_the_e
     p.set_config("checks.test_project_max", 4)
     ck = _tp_lane(throughput.measure(p.db, p.config(), now=now, gates={}), "checks_slots")
     assert (ck["count"], ck["at_limit"], ck["idle"]) == (3, 2, 1), ck
+
+
+def test_throughput_charges_a_checks_wait_only_until_its_slot_grant(env, monkeypatch, tmp_path):
+    """#7793: a task that handed off waiting on its own checks got its slot 900 s in, at the project cap,
+    then waited 20 h more for its retry condition and a worker. Only the 900 s before the grant is a
+    checks_slots wait; the rest is its own checks run and after (own_job), never an at-the-limit checks
+    wait that asks to raise checks.slots or checks.test_project_max."""
+    from ttp import throughput
+    from ttp.daemon import Daemon
+    p = make(env)
+    p.set_config("checks.test_project_max", 3)
+    d, now = Daemon(p.base), time.time()
+    w0, wait_s = now - 21 * 3600, 20 * 3600
+    t = _tp_checks_requeue(p, d, monkeypatch, tmp_path, "granted early", w0, wait_s)
+    for s0 in (w0 - 60, w0 - 50, w0 - 40):
+        _tp_checks_run(p, monkeypatch, s0, 1200)
+    _tp_slot_wait(p, monkeypatch, t, w0, w0 + 900, cap=3)
+    rep = throughput.measure(p.db, p.config(), now=now, gates={})
+    ck, own = _tp_lane(rep, "checks_slots"), _tp_lane(rep, "own_job")
+    assert (ck["count"], ck["median_s"], ck["at_limit"]) == (1, 900, 1), ck
+    assert (own["count"], own["median_s"]) == (1, wait_s - 900), own
 
 
 def _tp_host_scene(p, monkeypatch, tmp_path, d, now, at_cap=False, other_grant=False):
