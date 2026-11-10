@@ -28,6 +28,29 @@ def _fake_host(tmp_path, monkeypatch, tab: str | None = None):
     return cron, tabf, units
 
 
+CHECK_TIMEOUT_S = 120   # far below ttp checks' silence limit (checkwall.SILENT_S, 10 min)
+
+
+def _run_check_ended(argv, timeout=CHECK_TIMEOUT_S, **kw):
+    """cli._run_check in its own group, ended (KILL) on the way out on pass, failure and timeout alike.
+    Its own session and reap token keep it out of the outer run's group stop and reap, so a hung check
+    once outlived a stopped test worker: its stand-ins spun for days on the test box."""
+    from ttp import cli
+    groups = []
+
+    class _Groups:
+        def group(self, pgid):
+            groups.append(pgid)
+    try:
+        return cli._run_check(argv, True, record=_Groups(), timeout=timeout, **kw)
+    finally:
+        for pgid in groups:
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except OSError:
+                pass
+
+
 def _ledger(monkeypatch):
     from ttp import machine_ledger, machines
     got = []
@@ -39,7 +62,7 @@ def _ledger(monkeypatch):
 
 def test_shimmed_crontab_systemctl_and_reboot_under_ttp_checks_leave_the_host_untouched_and_are_reported(
         tmp_path, monkeypatch):
-    from ttp import cli, hoststate, push
+    from ttp import hoststate, push
     _, tabf, units = _fake_host(tmp_path, monkeypatch, "0 1 * * * keep\n")
     env = push.check_env("checks", run_dir=str(tmp_path / "run"))
     assert env.get(hoststate.MARKER) and env["PATH"].split(os.pathsep)[0].endswith("bin")
@@ -49,7 +72,7 @@ def test_shimmed_crontab_systemctl_and_reboot_under_ttp_checks_leave_the_host_un
               "systemctl --user enable evil.service && systemctl --user is-enabled evil.service && "
               "reboot && at now < /dev/null")
     with open(log, "w") as out:
-        rc = cli._run_check(["sh", "-c", script], True, cwd=tmp_path, stdout=out, stderr=subprocess.STDOUT, env=env)
+        rc = _run_check_ended(["sh", "-c", script], cwd=tmp_path, stdout=out, stderr=subprocess.STDOUT, env=env)
     text = log.read_text()
     assert rc == 0, text
     assert tabf.read_text() == "0 1 * * * keep\n" and not list(units.iterdir())
@@ -60,7 +83,7 @@ def test_shimmed_crontab_systemctl_and_reboot_under_ttp_checks_leave_the_host_un
 
 
 def test_a_host_change_the_stand_ins_miss_fails_ttp_checks_and_is_restored_and_recorded(tmp_path, monkeypatch):
-    from ttp import cli, hoststate, push
+    from ttp import hoststate, push
     cron, tabf, units = _fake_host(tmp_path, monkeypatch, "0 1 * * * keep\n")
     (units / "a.service").write_text("[Service]\nExecStart=/bin/true\n")
     got = _ledger(monkeypatch)
@@ -71,7 +94,7 @@ def test_a_host_change_the_stand_ins_miss_fails_ttp_checks_and_is_restored_and_r
               f"mkdir {shlex.quote(str(units / 'default.target.wants'))} && "
               f"ln -s ../evil.service {shlex.quote(str(units / 'default.target.wants' / 'evil.service'))}")
     with open(log, "w") as out:
-        rc = cli._run_check(["sh", "-c", script], True, cwd=tmp_path, stdout=out, stderr=subprocess.STDOUT, env=env)
+        rc = _run_check_ended(["sh", "-c", script], cwd=tmp_path, stdout=out, stderr=subprocess.STDOUT, env=env)
     text = log.read_text()
     assert rc == 1, text
     assert "host guard: FAILED" in text and "@reboot evil" in text and "evil.service" in text, text
@@ -85,13 +108,13 @@ def test_a_host_change_the_stand_ins_miss_fails_ttp_checks_and_is_restored_and_r
 
 
 def test_a_failing_check_keeps_its_exit_code_when_it_also_changed_the_host(tmp_path, monkeypatch):
-    from ttp import cli, push
+    from ttp import push
     cron, tabf, _ = _fake_host(tmp_path, monkeypatch)
     _ledger(monkeypatch)
     env = push.check_env("checks", run_dir=str(tmp_path / "run"))
     with open(tmp_path / "log", "w") as out:
-        rc = cli._run_check(["sh", "-c", f"echo '@reboot x' | {shlex.quote(str(cron))} - ; exit 3"], True,
-                            cwd=tmp_path, stdout=out, stderr=subprocess.STDOUT, env=env)
+        rc = _run_check_ended(["sh", "-c", f"echo '@reboot x' | {shlex.quote(str(cron))} - ; exit 3"],
+                              cwd=tmp_path, stdout=out, stderr=subprocess.STDOUT, env=env)
     assert rc == 3 and not tabf.exists()   # there was no crontab before: removed again
 
 
@@ -115,9 +138,9 @@ def test_ttp_sandbox_fails_a_command_that_changed_the_host_and_restores_it(tmp_p
 
 
 def test_sudo_running_a_host_write_under_ttp_checks_is_refused_and_reported_and_other_sudo_calls_pass(
-        tmp_path, monkeypatch):
+        tmp_path, monkeypatch, leaked_tmp_processes):
     # sudo resets PATH (secure_path): the stand-ins never see what it runs, so the sudo stand-in refuses
-    from ttp import cli, push
+    from ttp import push
     _fake_host(tmp_path, monkeypatch)
     real, seen = tmp_path / "realsudo", tmp_path / "sudo-ran"
     real.mkdir()
@@ -135,13 +158,32 @@ def test_sudo_running_a_host_write_under_ttp_checks_is_refused_and_reported_and_
     script = "; ".join(f"{c} < /dev/null; echo \"rc=$?\"" for c in refused + allowed)
     log = tmp_path / "checks.log"
     with open(log, "w") as out:
-        rc = cli._run_check(["sh", "-c", script], True, cwd=tmp_path, stdout=out, stderr=subprocess.STDOUT, env=env)
+        rc = _run_check_ended(["sh", "-c", script], cwd=tmp_path, stdout=out, stderr=subprocess.STDOUT, env=env)
     text = log.read_text()
     assert rc == 0, text
     assert text.count("rc=1") == len(refused) and text.count("sudo: refused in a test run") == len(refused), text
     assert seen.read_text().splitlines() == [c[len("sudo "):] for c in allowed], "only the reads reached sudo"
     said = text[text.index("host guard: these calls went to the run's fake store"):]
     assert "sudo -n systemctl enable evil.service" in said and "sudo -n crontab -l" not in said, said
+    assert not leaked_tmp_processes(tmp_path), "no stand-in or sudo outlives the check"
+
+
+def test_a_hung_sudo_check_times_out_and_leaves_no_stand_in_or_sudo_running(tmp_path, monkeypatch,
+                                                                            leaked_tmp_processes):
+    # A read sudo passes on that never ends (the real sudo spinning): the check ends at its timeout with
+    # its whole group, so nothing naming the test's folder runs on once the test is over
+    from ttp import push
+    _fake_host(tmp_path, monkeypatch)
+    real = tmp_path / "realsudo"
+    real.mkdir()
+    (real / "sudo").write_text("#!/bin/sh\nwhile :; do :; done\n")
+    (real / "sudo").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{real}{os.pathsep}{os.environ['PATH']}")
+    env = push.check_env("checks", run_dir=str(tmp_path / "run"))
+    with open(tmp_path / "checks.log", "w") as out, pytest.raises(subprocess.TimeoutExpired):
+        _run_check_ended(["sh", "-c", "sudo -n true"], timeout=2, cwd=tmp_path, stdout=out,
+                         stderr=subprocess.STDOUT, env=env)
+    assert not leaked_tmp_processes(tmp_path)
 
 
 def test_a_host_restore_keeps_a_concurrent_unrelated_crontab_line(tmp_path, monkeypatch):
