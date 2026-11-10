@@ -5587,3 +5587,47 @@ def test_a_provider_whose_runs_make_no_model_call_stops_the_coordinator_until_a_
     _finished_run(d, [{"type": "assistant", "message": {"id": "m1", "model": "x"}}], provider="fake")
     _finished_run(d, no_call, provider="fake")
     assert not d._logged_out("fake")
+
+
+@pytest.mark.parametrize("exit_extra", [{"launched": False}, {"launch_error": "exec failed: no such file"},
+                                        {"stopped": "hung"}])
+def test_runs_that_never_tried_the_model_leave_the_no_call_streak_alone(env, monkeypatch, exit_extra):
+    """Review #110: a run refused before launch, one the runner could not exec and a supervisor stall
+    never asked the model, so NO_CALL_STREAK of them in a row open no breaker and raise no alert, and
+    they do not end a streak either."""
+    p = make(env)
+    from ttp.daemon import NO_CALL_KEY, NO_CALL_STREAK, Daemon
+    d = Daemon(p.base)
+    db = d.p.db
+
+    def finish(extra):
+        tid = db.add_task("build", "", kind="work", tier="standard", priority=3, budget_usd=8.0, labels=[])
+        db.update_task(tid, status="running")
+        rid = db.x("INSERT INTO runs(task,role,provider,model,started,status,boot_id,note) "
+                   "VALUES(?,'worker','fake','opus',?,'running',?,'{}')", (tid, time.time() - 600, d.boot))
+        run_dir = d.p.runs / str(rid)
+        run_dir.mkdir(parents=True)
+        db.x("UPDATE runs SET dir=? WHERE id=?", (str(run_dir), rid))
+        (run_dir / "output.jsonl").write_text("")
+        (run_dir / "stderr.log").write_text("")
+        d.finish_run(db.one("SELECT * FROM runs WHERE id=?", (rid,)),
+                     {"rc": 1, "started": time.time() - 600, "ended": time.time(), "stopped": None, **extra})
+
+    for _ in range(NO_CALL_STREAK + 1):
+        finish(exit_extra)
+    assert not d._logged_out("fake") and db.kv(NO_CALL_KEY + "fake") is None
+    assert not db.q("SELECT text FROM alerts WHERE key='auth:fake'")
+    finish({})   # a launched run with no call starts a streak; an untried one keeps it as it is
+    finish(exit_extra)
+    assert len((db.kv(NO_CALL_KEY + "fake") or {}).get("runs") or []) == 1
+
+
+def test_the_https_check_fails_fast_when_the_host_does_not_resolve(monkeypatch):
+    """Review #110: urlopen's timeout does not bound the DNS lookup, so a dead resolver is checked
+    first with the bounded _resolves and no HTTPS request is made."""
+    import urllib.request
+    from ttp import daemon as dm
+    opened = []
+    monkeypatch.setattr(dm, "_resolves", lambda host: False)
+    monkeypatch.setattr(urllib.request, "urlopen", lambda *a, **k: opened.append(a))
+    assert dm._https_reaches("api.example.com") is False and opened == []

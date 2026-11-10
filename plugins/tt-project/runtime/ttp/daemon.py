@@ -5932,7 +5932,11 @@ class Daemon:
                 self._dry_run_on_pass(r, run_dir, usage.session_id or note.get("session_id") or "")
         # A failed end that made no model call at all counts toward its provider's no-call streak.
         called = _has_tokens(usage) or _model_called(run_dir / "output.jsonl")
-        no_call = status in NO_CALL_STATUSES and not slept and not called
+        # Only a launched run that tried the model counts: a pin refusal, a launch error, a failed resume
+        # or a supervisor stall never asked it, so it neither extends nor ends the streak.
+        tried = exit_info.get("launched") is not False and not note.get("launch_error") \
+            and note.get("not_waste") not in ("refused", "resume") and stopped not in HUNG_STOPS
+        no_call = status in NO_CALL_STATUSES and not slept and not called and tried
         # Read before the transaction: it may read the provider's login files.
         read_as = (self._reading_account(r, usage.extra["windows"], bool(usage.extra.get("reinit")))
                    if usage.extra.get("windows") else r["account"] or "")
@@ -19727,6 +19731,8 @@ def _https_reaches(host: str, timeout: float = 5.0) -> bool | None:
     within `timeout` is reachable. None when there is no host to check."""
     if not host:
         return None
+    if not _resolves(host):   # urlopen's timeout does not bound the DNS lookup: a dead resolver stalls it
+        return False
     import urllib.error
     import urllib.request
     try:
