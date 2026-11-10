@@ -212,6 +212,47 @@ def test_pathguard_refuses_a_script_that_writes_a_protected_folder_it_reads(cred
     for cmd in ("python3 sync.py", "python3 dyn.py"):
         assert pathguard_why(_pg_bash(cmd, w), cfg), cmd
 
+PG_FAIL_CLOSED = [   # calls the read pass cannot prove are reads: the word check decides, and refuses
+    "python3 -c \"import os; open(os.path.expanduser(b'~/data/records/a'), 'w')\"",
+    f"python3 -c \"import os; fd = os.open({PG_DATA_FILE}, 1089); os.write(fd, b'x')\"",
+    f"python3 -c \"import os, shelve; shelve.open({PG_DATA_FILE})\"",
+    f"python3 -c \"import os, logging; logging.basicConfig(filename={PG_DATA_FILE})\"",
+    f"python3 -c \"import os\ndef read(q): return q\nopen(read({PG_DATA_FILE}), 'w')\"",
+    f"python3 -c \"import os\nexists = lambda q: q\nopen(exists({PG_DATA_FILE}), 'w')\"",
+]
+
+
+@pytest.mark.parametrize("cmd", PG_FAIL_CLOSED)
+def test_pathguard_read_pass_fails_closed(cred_home, cmd):
+    assert pathguard_why(_pg_bash(cmd, cred_home.work), {"guards": {"protected_paths": [PG_DATA]}}), cmd
+
+
+PG_CHDIR = [   # the working directory moves into the folder first: relative writes land there
+    "cd {d} && python3 -c \"open('k', 'w')\"",
+    "pushd {d} && python3 -c \"open('k', 'w')\"",
+    "env -C {d} python3 -c \"open('k', 'w')\"",
+    "(cd {d}; python3 -c \"open('k', 'w')\")",
+    "python3 -c \"import os; os.chdir(os.path.expanduser('{d}')); open('k', 'w')\"",
+    "cd {d} && perl -e 'open(F, \">k\")'",
+]
+
+
+@pytest.mark.parametrize("cmd", PG_CHDIR)
+@pytest.mark.parametrize("folder", ["default", "protected_paths"])
+def test_pathguard_changed_directory_keeps_the_whole_line_check(cred_home, cmd, folder):
+    d, cfg = ("~/." + "ssh", {}) if folder == "default" else (PG_DATA, {"guards": {"protected_paths": [PG_DATA]}})
+    assert pathguard_why(_pg_bash(cmd.format(d=d), cred_home.work), cfg), cmd
+
+
+def test_pathguard_default_folders_get_no_read_relief(cred_home):
+    """~/.ssh and the other default folders keep the whole-line word check: a read there with a write
+    word elsewhere on the line is refused, as before the read pass."""
+    k = "~/." + "ssh/id_x"
+    for cmd in (f"python3 -c \"import os; d = open(os.path.expanduser('{k}')).read(); open('out', 'w').write(d)\"",
+                f"python3 -c \"import os, json; json.dump(open(os.path.expanduser('{k}')).read(), open('o', 'w'))\""):
+        assert pathguard_why(_pg_bash(cmd, cred_home.work), {}), cmd
+
+
 def test_pathguard_list_adds_account_and_project_paths_never_drops_defaults(cred_home):
     from ttp import pathguard
     (cred_home.acct / "settings.json").write_text(json.dumps({"guards": {"protected_paths": ["~/.config/acct-access"]}}))

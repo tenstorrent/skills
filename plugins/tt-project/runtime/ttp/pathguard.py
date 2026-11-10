@@ -81,6 +81,21 @@ PY_INPUT = {"argv", "orig_argv", "stdin", "environ", "environb", "getenv", "inpu
 PY_DYNAMIC = {"exec", "eval", "compile", "getattr", "setattr", "__import__", "globals", "locals", "vars"}
 PY_DYNAMIC_ATTR = {"import_module", "__dict__", "__builtins__", "__getattribute__"}
 MODE_RE = re.compile(r"[rbtU]*[wax+][rwabxtU+]*")
+# Calls known to only read, test or build a path: the only ones a protected path may reach as an argument
+# or receiver (any other such call sends the code to the word check), unless the code defines the name
+PY_SAFE = PY_READS | {
+    "open", "Path", "PurePath", "PosixPath", "home", "expanduser", "expandvars", "join", "joinpath", "abspath",
+    "realpath", "normpath", "relpath", "dirname", "basename", "split", "splitext", "commonpath", "resolve",
+    "absolute", "with_name", "with_suffix", "relative_to", "as_posix", "fspath", "listdir", "scandir", "walk",
+    "glob", "iglob", "rglob", "iterdir", "fnmatch", "loads", "str", "repr", "bytes", "print", "format", "sorted",
+    "list", "tuple", "set", "frozenset", "dict", "enumerate", "zip", "map", "filter", "reversed", "iter", "next",
+    "any", "all", "min", "max", "sum", "isinstance", "int", "float", "bool", "startswith", "endswith", "strip",
+    "rstrip", "lstrip", "lower", "upper", "encode", "decode", "splitlines", "get", "keys", "values", "items"}
+# Openers that read in a read mode: the builtin, a path's own method and these modules' (shelve, dbm: any)
+PY_READ_OPENERS = {"io", "os", "codecs", "gzip", "bz2", "lzma", "tarfile", "zipfile"}
+# The code or the line changes the working directory: relative paths are the protected folder's
+CHDIR_RE = re.compile(r"chdir|\bpushd\b")
+CD_LINE_RE = re.compile(r"(?:^|[;&|(\s])(?:cd|pushd)(?:\s|$)|\benv\b[^;&|\n]*\s(?:-[a-zA-Z]*C|--chdir\b)")
 PY_TEXT_MAX = 2_000_000
 # Code that reads what the command line gives it (argv, stdin, the environment, a shell `$` word):
 # the line's words outside the code count as the code's
@@ -137,12 +152,12 @@ def expand(word: str, env, cwd: str, home: str | None = None, real: bool = True)
     return os.path.realpath(word) if real else os.path.normpath(word)
 
 
-def roots(env=None, cfg: dict | None = None) -> list[str]:
+def roots(env=None, cfg: dict | None = None, defaults: bool = False) -> list[str]:
     """Every protected path, real and as written, for HOME and the account's own home; gh's dir as the
-    environment moves it (GH_CONFIG_DIR, XDG_CONFIG_HOME) too."""
+    environment moves it (GH_CONFIG_DIR, XDG_CONFIG_HOME) too. `defaults`: DEFAULT_PATHS' only."""
     env = os.environ if env is None else env
     out = []
-    for p in paths(cfg) + ["$GH_CONFIG_DIR"]:
+    for p in (list(DEFAULT_PATHS) if defaults else paths(cfg)) + ["$GH_CONFIG_DIR"]:
         for home in _homes(env):
             for e in (env, {}):
                 out += [expand(p, e, "/", home), expand(p, e, "/", home, real=False)]
@@ -254,8 +269,9 @@ def _code_refusal(code: str, ctx, depth: int = 0, outside: str = "", py: bool = 
     variable may carry it), a redirect or open mode with one as its target, or a command the code runs
     (os.system, subprocess, exec, backticks) that writes one. Code that reads its input (argv, stdin,
     the environment) gets the command line `outside` it too. Reads pass, and so do mentions in data."""
-    fed = outside if outside and INPUT_RE.search(code) else ""
-    got = _py_refusal(code, ctx, _names(fed, ctx) if fed else None) if py else False
+    chd = bool(CHDIR_RE.search(code))
+    fed = outside if outside and (chd or INPUT_RE.search(code)) else ""
+    got = _py_refusal(code, ctx, _names(fed, ctx) if fed else None) if py and not chd else False
     code = code + "\n" + fed if fed else code
     if got:
         return got
@@ -324,6 +340,12 @@ def _names(code: str, ctx) -> str | None:
 
 def _py_leaf(n) -> str:
     return n.id if isinstance(n, ast.Name) else n.attr if isinstance(n, ast.Attribute) else ""
+
+
+def _py_root(n) -> str:
+    while isinstance(n, ast.Attribute):
+        n = n.value
+    return n.id if isinstance(n, ast.Name) else ""
 
 
 def _py_refusal(code: str, ctx, fed: str | None = None):
@@ -402,6 +424,10 @@ def _py_refusal(code: str, ctx, fed: str | None = None):
             for d in n.args.defaults + [d for d in n.args.kw_defaults if d is not None]:
                 bind(n.args, d)
 
+    def mine(f) -> bool:
+        """The called name is one the code defines or rebinds: never trusted as a read."""
+        return _py_leaf(f) in defs or _py_leaf(f) in funcs
+
     def is_mod(n) -> bool:
         while isinstance(n, ast.Attribute):
             n = n.value
@@ -412,15 +438,17 @@ def _py_refusal(code: str, ctx, fed: str | None = None):
         if _py_leaf(n.func) not in PY_OPENERS:
             return None
         own = isinstance(n.func, ast.Attribute) and not is_mod(n.func.value)   # a path's own open method, mode first
+        if mine(n.func) or isinstance(n.func, ast.Attribute) and not own and _py_root(n.func) not in PY_READ_OPENERS:
+            return True   # shelve.open, dbm.open, an open the code defines: may create
         modes = n.args[0 if own else 1:][:1] + [k.value for k in n.keywords if k.arg in ("mode", "flags", None)]
-        return any(not isinstance(m, ast.Constant) or isinstance(m.value, str) and MODE_RE.fullmatch(m.value)
+        return any(not isinstance(m, ast.Constant) or not isinstance(m.value, str) or MODE_RE.fullmatch(m.value)
                    for m in modes)
 
     def content(n) -> bool:
         """A call whose value is a file's content, a handle to read or a fact about it: no path."""
         if not isinstance(n, ast.Call) or any(_py_leaf(x) in PY_INPUT for x in ast.walk(n)):
             return False
-        return _py_leaf(n.func) in PY_READS or opens(n) is False
+        return not mine(n.func) and (_py_leaf(n.func) in PY_READS or opens(n) is False)
 
     memo, busy, size = {}, set(), [0]
 
@@ -433,8 +461,9 @@ def _py_refusal(code: str, ctx, fed: str | None = None):
                 continue
             todo += ast.iter_child_nodes(x)
             k = _py_leaf(x) or (x.arg if isinstance(x, ast.arg) else "")
-            if isinstance(x, ast.Constant) and isinstance(x.value, str):
-                out.append(repr(x.value) + (" " + repr(fed) if fed and "$" in x.value else ""))
+            if isinstance(x, ast.Constant) and isinstance(x.value, (str, bytes)):
+                v = x.value.decode("latin-1") if isinstance(x.value, bytes) else x.value
+                out.append(repr(v) + (" " + repr(fed) if fed and "$" in v else ""))
             elif k in PY_INPUT and fed:
                 out.append(repr(fed))
             elif k:
@@ -477,6 +506,9 @@ def _py_refusal(code: str, ctx, fed: str | None = None):
                                                      and MODE_RE.fullmatch(m.value) for m in args[1:]) else []
             else:
                 targets = []
+                if (mine(n.func) or name not in PY_SAFE) and (h := next(
+                        (h for a in args + [recv] if a is not None and (h := _names(text(a), ctx))), None)):
+                    return h   # a call not known to only read reaches a protected path: fail closed
             for t in targets:
                 if t is not None and (h := _names(text(t), ctx)):
                     return h
@@ -518,7 +550,16 @@ def shell_refusal(cmd: str, env, cwd: str, rts: list[str], depth: int = 0) -> st
                 h := shell_refusal(re.sub(r"\\(.)", r"\1", cmd), env, cwd, rts, depth + 1)):
             return h
     names = {os.path.basename(a[0]) for a in segments}
+    dflt = set(roots(env, defaults=True))
+    dctx, xctx = (env, cwd, [r for r in rts if r in dflt]), (env, cwd, [r for r in rts if r not in dflt])
+    cd = bool(CD_LINE_RE.search(scan))
     if any(INTERPRETER_RE.match(n) for n in names):
+        # The default credential folders keep the whole-line word check (no read relief for keys), and
+        # so does every folder when the line changes directory first (cd, pushd, env -C)
+        inline = [a[i + 1] for a in segments if INTERPRETER_RE.match(os.path.basename(a[0]))
+                  for i in range(1, len(a) - 1) if a[i] in ("-c", "-e", "-E", "--eval", "-p", "--print")]
+        if h := next((h for c in [scan, *inline] if (h := _code_refusal(c, ctx if cd else dctx, depth))), None):
+            return h
         # Each -c/-e code as the interpreter gets it (its string literals unquoted), and the heredocs it
         # reads on stdin; the line's other words are data unless the code reads its input. An interpreter
         # whose code does not show (-m, a pipe) gets the whole line.
@@ -539,7 +580,8 @@ def shell_refusal(cmd: str, env, cwd: str, rts: list[str], depth: int = 0) -> st
                 continue   # a script file: read below
             else:
                 chunks.append((scan, False))
-        if h := next((h for c, py in chunks if (h := _code_refusal(c, ctx, depth, scan, py))), None):
+        if not cd and xctx[2] and (
+                h := next((h for c, py in chunks if (h := _code_refusal(c, xctx, depth, scan, py))), None)):
             return h
     if depth < 2:
         for f in hook._scripts(segments, cwd):
@@ -552,8 +594,8 @@ def shell_refusal(cmd: str, env, cwd: str, rts: list[str], depth: int = 0) -> st
             # The shebang's interpreter (`#!/usr/bin/env bash`): a first line of code (import shutil) names none
             first = " ".join(os.path.basename(w) for w in text.split("\n", 1)[0][2:].split()) if text[:2] == "#!" else ""
             h = (shell_refusal(text, env, cwd, rts, depth + 1) if f.suffix == ".sh" or set(first.split()) & SHELLS
-                 else _code_refusal(text, ctx, depth + 1, scan,
-                                    f.suffix == ".py" or bool(re.search(r"python|pypy", first))))
+                 else _code_refusal(text, ctx if cd else dctx, depth + 1) or not cd and xctx[2] and _code_refusal(
+                     text, xctx, depth + 1, scan, f.suffix == ".py" or bool(re.search(r"python|pypy", first))))
             if h:
                 return h
     return None
