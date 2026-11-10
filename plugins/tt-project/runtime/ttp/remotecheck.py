@@ -6,9 +6,11 @@ Some projects may not run test suites on the machine that coordinates them. A ch
 runs there instead: the exact commit being checked (--commit, else HEAD of the checkout) goes to a bare
 mirror of the repository in the host's tt-project folder (check-mirrors/, keyed by the repository's root
 commits) as an incremental git bundle of only the commits it lacks (_push: a new mirror is seeded in steps
-a cut-short copy resumes), is checked out of it into a fresh temporary directory (a --shared clone) and
-its check ref deleted afterwards; a host without usable git gets the tree with `git archive` over a
-compressed ssh instead (_archive), made a git checkout there when it can. Every copy prints its progress,
+a cut-short copy resumes; first from a clone already there when `delivery.checks_seed` names one, so only
+what that clone lacks crosses the link), is checked out of it into a fresh temporary directory (a --shared
+clone) and its check ref deleted afterwards. No tree is sent from here: a host without usable git is a host
+fault, unless TTP_REMOTE_TREE_COPY=1 sends it the tree with `git archive` over a compressed ssh (_archive),
+made a git checkout there when it can. Every copy prints its progress,
 and one that overruns its limit or stalls is the host's fault (_copy). The command runs in it with
 the check's `env` exported (values expand in the remote shell, e.g. "$HOME/.local/bin:$PATH"). Its
 output streams back and its exit code is the check's. A stopped check (a timeout, a stop) stops
@@ -334,7 +336,8 @@ MIRROR_MARK, BASE_MARK = "ttp-mirror:", "ttp-base:"   # the probe's lines naming
 MIRROR_RE = re.compile(r"/[A-Za-z0-9._/+@-]*/" + MIRRORS + r"/[0-9a-f]{16}\.git")
 LINK, MUX = "link:", "mux:"   # a copy step's why: the link's fault, ssh's shared connection refusing a session
 PROGRESS_S = 30     # a copy prints how far it got this often, so the checks' silence limit never stops a live one
-STALL_S = 180       # ... and one whose progress has not moved this long is the link's fault
+STALL_S = 300       # ... and one whose progress has not moved this long is the link's fault (ssh's window,
+                    # a few MB written at once, drains at the link's pace after the last byte moves)
 SEED_STEP = 500     # first-parent commits per bundle while a mirror catches up: each lands, the next resumes there
 BASE_KEEP = 20      # base refs a mirror keeps (the newest)
 CHECK_REF_AGE_S = 2 * 86400   # a check ref left this long (a killed run) is removed
@@ -426,18 +429,42 @@ def _tail(f) -> str:
     return f.read().decode(errors="replace")
 
 
-def _host_step(host: str, script: str, direct: bool, deadline: float, label: str) -> str:
-    """Runs `script` on the host: "", or why it failed (LINK: ssh's, MUX: its shared connection refused)."""
+def _host_step(host: str, script: str, direct: bool, deadline: float, label: str, said: list | None = None) -> str:
+    """Runs `script` on the host: "", or why it failed (LINK: ssh's, MUX: its shared connection refused).
+    `said` gets what it printed."""
     with tempfile.TemporaryFile() as out:
         proc = subprocess.Popen(_ssh(host, script, direct), stdin=subprocess.DEVNULL, stdout=out, stderr=out)
         why = _watch(proc, lambda: "", label, deadline, None)
         text = _tail(out)
+    if said is not None:
+        said.append(text)
     last = (text.strip().splitlines() or [""])[-1][:200]
     if why or proc.returncode == 0:
         return why
     if proc.returncode == 255:
         return (MUX if _refused(text) else LINK) + f"{label} failed (ssh exit 255: {last})"
     return f"{label} failed (exit {proc.returncode}: {last})"
+
+
+SEED_RE = re.compile(r"/[A-Za-z0-9._/+@-]+")
+
+
+def seed_path(host: str) -> str:
+    """The clone already on `host` its new mirror is seeded from (`delivery.checks_seed`: {host: absolute
+    path}), so the first copy from here sends only what that clone lacks; "" when none is named."""
+    from . import testslots
+    seeds = ((testslots._cfg() or {}).get("delivery") or {}).get("checks_seed")
+    path = seeds.get(host) if isinstance(seeds, dict) else None
+    return path if isinstance(path, str) and SEED_RE.fullmatch(path) and ".." not in path else ""
+
+
+def _seed_script(mirror: str, seed: str) -> str:
+    """The host's side: fetches the seed clone's HEAD into the mirror as a base ref and prints it. A plain
+    fetch from that path reads it and never writes there."""
+    m, t = shlex.quote(mirror), "refs/heads/seed-in"
+    return (f"set -e; s={shlex.quote(seed)}; git -C \"$s\" rev-parse -q --verify HEAD >/dev/null; "
+            f"git -C {m} fetch -q --no-tags --no-write-fetch-head \"$s\" +HEAD:{t}; b=$(git -C {m} rev-parse {t}); "
+            f"git -C {m} update-ref refs/heads/base/$b $b; git -C {m} update-ref -d {t}; echo \"{BASE_MARK}$b\"")
 
 
 def _objects(top: str) -> str:
@@ -598,7 +625,19 @@ def _attempt(host, top, head, env, extra, cmd, mark, wrap, wait) -> tuple[int, s
         _say(f"checking {head[:12]} on {host} in {tmp}")
         q = shlex.quote(tmp)
         deadline = time.monotonic() + _knob("TTP_REMOTE_COPY_LIMIT_S", SETUP_TIMEOUT_S)
+        tree_copy = _knob("TTP_REMOTE_TREE_COPY", 0) == 1
         copied = False
+        if mirror and not bases and (seed := seed_path(host)):   # a new mirror: from the clone there first
+            said: list = []
+            why = _host_step(host, _seed_script(mirror, seed), direct, deadline,
+                             f"seeding {host}'s mirror from {seed} there", said)
+            if why.startswith(MUX):
+                return FAULT_RC, why[len(MUX):]
+            if why.startswith(LINK):
+                return _fault(host, why[len(LINK):]), ""
+            bases = [ln.strip()[len(BASE_MARK):] for ln in "".join(said).splitlines()
+                     if ln.strip().startswith(BASE_MARK)]
+            _say(f"{why}; sending the whole history instead" if why else f"seeded {host}'s mirror from {seed}")
         if mirror:
             ref = f"refs/heads/check/{int(time.time())}-{secrets.token_hex(6)}"
             why = _push(host, top, head, mirror, ref, bases, direct, deadline)
@@ -611,8 +650,13 @@ def _attempt(host, top, head, env, extra, cmd, mark, wrap, wait) -> tuple[int, s
                 return FAULT_RC, why[len(MUX):]
             if why.startswith(LINK):
                 return _fault(host, why[len(LINK):]), ""
+            if why and not tree_copy:
+                return _fault(host, f"the copy into its mirror failed ({why})"), ""
             if why:
                 _say(f"the mirror copy failed ({why}); sending the tree compressed instead")
+        if not copied and not tree_copy:   # trees go box to box, never from here, unless the project allows it
+            return _fault(host, "no usable git there for its mirror, and tree copies from here are off "
+                                "(TTP_REMOTE_TREE_COPY=1 allows them)"), ""
         if not copied:   # no mirror there (no usable git there), or it failed: the tree, compressed
             rc, why = _archive(host, top, head, q, direct, deadline)
             if why.startswith(MUX):

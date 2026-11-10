@@ -168,7 +168,7 @@ def test_ssh_failing_at_any_step_of_a_remote_check_is_an_environment_fault(tmp_p
     from ttp import remotecheck
     repo = _rc_repo(tmp_path, big=True)
     for fake in ({"FAKE_SSH_FAIL": "mktemp"}, {"FAKE_SSH_FAIL": "ttp-send"}, {"FAKE_SSH_FAIL": "--shared"},
-                 {"FAKE_SSH_FAIL": "tar -xf", "FAKE_SSH_NOGIT": "1"}, {"FAKE_SSH_DROP": "ttp-remote-rc"}):
+                 {"FAKE_SSH_FAIL": "tar -xf", "FAKE_SSH_NOGIT": "1", "TTP_REMOTE_TREE_COPY": "1"}, {"FAKE_SSH_DROP": "ttp-remote-rc"}):
         rc, said = _rc_run(tmp_path, repo, "true", **fake)
         assert rc == remotecheck.FAULT_RC, (fake, said)
         assert f"{remotecheck.SIG}box1" in said and "git archive" not in said, said
@@ -187,7 +187,7 @@ def test_a_remote_check_tries_again_on_its_own_connection_when_the_shared_one_re
     from ttp import remotecheck
     repo = _rc_repo(tmp_path)
     mux = tmp_path / "mux"
-    for on in ("ttp-remote-rc", "tar -xf", "mktemp"):
+    for on in ("ttp-remote-rc", "ttp-send", "mktemp"):
         mux.write_text("1")
         Path(f"{mux}.log").unlink(missing_ok=True)
         rc, said = _rc_run(tmp_path, repo, "echo ran-here; exit 3", FAKE_SSH_MUX=str(mux), FAKE_SSH_MUX_ON=on)
@@ -3904,7 +3904,7 @@ def test_the_tree_copy_to_a_check_host_is_compressed_and_a_stall_is_the_hosts_fa
     from ttp import checkwall, remotecheck
     repo = _rc_repo(tmp_path)
     args = tmp_path / "ssh.args"
-    rc, out = _rc_run(tmp_path, repo, "true", FAKE_SSH_ARGS=str(args))
+    rc, out = _rc_run(tmp_path, repo, "true", FAKE_SSH_ARGS=str(args), FAKE_SSH_NOGIT="1", TTP_REMOTE_TREE_COPY="1")
     assert rc == 0, out
     calls = args.read_text().splitlines()
     copy = [c for c in calls if "tar -xf -" in c]
@@ -3997,7 +3997,7 @@ def test_a_slow_copy_prints_progress_and_an_overrun_is_a_host_fault_not_a_timeou
     assert rc == 0 and "did-run" in said, said
     assert len(re.findall(r"sending [0-9a-f]{12} to box1's mirror: .*\(\d+ s\)", said)) >= 2, said
     _rc_commit(repo, "b.txt")
-    for fake in ({}, {"FAKE_SSH_NOGIT": "1"}):
+    for fake in ({}, {"FAKE_SSH_NOGIT": "1", "TTP_REMOTE_TREE_COPY": "1"}):
         slow = {"FAKE_SSH_SLOW": ("tar -xf" if fake else "ttp-send") + ":20", "TTP_REMOTE_COPY_LIMIT_S": "1"}
         t0 = time.monotonic()
         rc, said = _rc_run(tmp_path, repo, "echo did-run", **fake, **slow)
@@ -4007,12 +4007,36 @@ def test_a_slow_copy_prints_progress_and_an_overrun_is_a_host_fault_not_a_timeou
 
 
 def test_a_host_without_usable_git_gets_the_tree_over_a_compressed_ssh(tmp_path):
-    """No usable git there: no mirror, the tree goes as before (git archive over a compressed ssh)."""
+    """No usable git there: no mirror and, by default, no tree sent from here either (a host fault); with
+    TTP_REMOTE_TREE_COPY=1 the tree goes as before (git archive over a compressed ssh)."""
+    from ttp import remotecheck
     repo = _rc_repo(tmp_path)
     args = tmp_path / "args"
-    rc, said = _rc_run(tmp_path, repo, "cat a.txt", FAKE_SSH_NOGIT="1", FAKE_SSH_ARGS=str(args))
+    rc, said = _rc_run(tmp_path, repo, "cat a.txt", FAKE_SSH_NOGIT="1")
+    assert rc == remotecheck.FAULT_RC and "tree copies from here are off" in said and "tar" not in said, said
+    rc, said = _rc_run(tmp_path, repo, "cat a.txt", FAKE_SSH_NOGIT="1", FAKE_SSH_ARGS=str(args),
+                       TTP_REMOTE_TREE_COPY="1")
     assert rc == 0 and "a" in said and _rc_sent(said) == [], said
     assert "tree to box1 (ssh compresses it): done" in said
     assert any("Compression=yes" in ln and "tar -xf" in ln for ln in args.read_text().splitlines())
     assert _rc_mirror(tmp_path) == {} and _rc_left(tmp_path) == []
 
+
+def test_a_new_mirror_is_seeded_from_the_clone_on_the_host_that_checks_seed_names(tmp_path):
+    """`delivery.checks_seed` names a clone already on the host: a new mirror fetches its HEAD there first
+    (the clone is only read), and only the commits it lacks are sent from here."""
+    repo = _rc_repo(tmp_path)
+    for i in range(6):
+        _rc_commit(repo, f"s{i}.txt", os.urandom(20000))
+    clone = tmp_path / "host-clone"
+    subprocess.run(["git", "clone", "-q", str(repo), str(clone)], check=True)
+    before = subprocess.run(["git", "-C", str(clone), "for-each-ref"], capture_output=True, text=True).stdout
+    _rc_commit(repo, "new.txt")
+    proj = tmp_path / "proj" / "tt-project" / "harness"
+    proj.mkdir(parents=True)
+    (proj / "project.json").write_text(json.dumps({"delivery": {"checks_seed": {"box1": str(clone)}}}))
+    rc, said = _rc_run(tmp_path, repo, "cat new.txt", TTP_PROJECT=str(tmp_path / "proj"))
+    assert rc == 0 and "seeded box1's mirror from" in said, said
+    assert len(_rc_sent(said)) == 1 and _rc_sent(said)[0] < 0.05, said
+    assert subprocess.run(["git", "-C", str(clone), "for-each-ref"], capture_output=True, text=True).stdout == before
+    assert _rc_left(tmp_path) == []
