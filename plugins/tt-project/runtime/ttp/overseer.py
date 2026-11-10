@@ -267,6 +267,11 @@ def check(p: Project, now: float | None = None) -> dict:
     except Exception as e:   # a failed wake is recorded; the next pass after WAKE_EVERY_S retries
         h["wake"] = {"at": now, "error": f"{type(e).__name__}: {e}"[:300]}
     durable_write(p.state / HEALTH_FILE, json.dumps(h, default=str))
+    try:   # the hourly table's load history, kept while the tick loop stalls too
+        from . import hourly
+        hourly.sample(p.state, now)
+    except Exception:
+        pass
     durable_write(p.state / HEARTBEAT_FILE, json.dumps({"pid": os.getpid(), "at": now}))
     return h
 

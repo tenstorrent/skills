@@ -2383,6 +2383,7 @@ class Daemon:
                 self.check_gate_time,
                 self.check_cap_wait,
                 self.check_progress,
+                self.post_hourly_status,
                 self.check_churn,
                 self.check_self_watch,
                 self.check_host_load,
@@ -10024,6 +10025,17 @@ class Daemon:
             history = json.loads(r["history"] or "[]") + [{"ts": now, "action": "closed", "by": "daemon", "why": why}]
             db.x("UPDATE issues SET status='fixed', closed=?, cleared_why=?, history=? WHERE id=?",
                  (now, why, json.dumps(history), r["id"]))
+
+    def post_hourly_status(self) -> None:
+        """Model-free (hourly): sample this host's load (the overseer's pass samples it too, never twice within
+        hourly.SAMPLE_S) and post the status table to the main chat when it is due and changed."""
+        from . import hourly
+        now = time.time()
+        if now - getattr(self, "_hourly_checked", 0.0) < 60:
+            return
+        self._hourly_checked = now
+        hourly.sample(self.p.state, now)
+        hourly.post(self.p, now)
 
     def check_host_load(self) -> None:
         """Model-free host-load watch (hostload): this host's runnable CPU demand above the load guard's threshold

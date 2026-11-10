@@ -384,7 +384,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
                     # verdict and a device or machine run starts at least at this tier and effort, never
                     # on the chat provider ('standard/high'; 'off' turns the floor off).
                     "conclusion_floor": {"tier": "standard", "effort": "high"}},
-    "notify": {"slack": False, "slack_min_severity": "high", "chat_min_severity": "normal"},
+    "notify": {"slack": False, "slack_min_severity": "high", "chat_min_severity": "normal",
+               "hourly_status": True},   # hourly.py: the hourly status table in the main chat
     # gone_after_s: a relay chat with no `ttp listen` running that left a message unread this long
     # stops counting as a reader of asks and alerts until it reads again (chatgone.py). batch_s:
     # `ttp listen` holds broadcast alerts this long to print them together; lease_s: another relayer
@@ -424,7 +425,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "review": {"light_max_lines": 80, "risky_paths": [], "light_paths": [], "auto": True, "auto_notes": "",
                "area_fail_cap": 3, "blocked_long_h": 12, "rule_blocks_min": 3, "sweep_after_s": 300,
                "unreviewed_per_pass": None, "unreviewed_max_age_h": 72, "unreviewed_wait_s": 1800,
-               "carried_hold_max_h": 24, "auto_fix_rounds": 1},
+               "carried_hold_max_h": 24, "auto_fix_rounds": 1,
+               "fork_target": 0.9},   # hourly.py: the share of worker and review runs started from a fork or resume
     # Continue chains (chaincap): a task_add that continues a lineage past max_hops hops, max_stalls
     # failed or no-progress hops in a row or max_usd spent (0 turns one off), or one in an area under
     # review.area_fail_cap, is refused unless its `reason` names what changed in a tricky turn.

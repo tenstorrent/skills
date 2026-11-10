@@ -2055,6 +2055,10 @@ def cmd_status(a) -> None:
         p = here()
         if not p:
             die("no tt-project project here; name one: `ttp status <name>`")
+    if getattr(a, "hourly", False):   # the table the daemon posts hourly (hourly.py); model-free
+        from . import hourly
+        print(redact.scrub(hourly.table(p)))
+        return
     if a.json:
         from .web import state_payload
         print(redact.scrub(json.dumps(state_payload(p, p.db), default=str, indent=1)))
@@ -3836,6 +3840,13 @@ def _spent(t0) -> dict:
     return {"wall_s": round(time.monotonic() - w0, 1), "cpu_s": round(max(cpu, 0.0), 1)}
 
 
+def _spill_off() -> str:
+    """The spill hosts this run of the checks reran from (checkspill.OFF_ENV), for the hourly table's spill row."""
+    from .checkspill import OFF_ENV
+    off = os.environ.get(OFF_ENV, "")
+    return "" if off in ("", "1") else off
+
+
 def cmd_checks(a) -> None:
     """(inside a run) Run the local checks on this worktree's commit and record the result in the
     run's directory: the harness's gh opens a PR (even a draft) only after they passed on HEAD. The
@@ -5002,6 +5013,7 @@ def cmd_checks(a) -> None:
                                                      **({"env_problem": env_problem} if env_problem else {}),
                                                      **({"hosts": hosts} if (hosts := push.hosts_of(todo)) else {}),
                                                      **({"spilled_to": spilled.host} if spilled else {}),
+                                                     **({"spill_off": off} if (off := _spill_off()) else {}),
                                                      **({"fallback_lane": fell_back} if fell_back else {}),
                                                      **({"authoring_tree": in_authoring} if in_authoring else {}),
                                                      **({"added_tests": rerun} if rerun else {}),
@@ -14168,6 +14180,9 @@ def main(argv: list[str] | None = None) -> None:
             s.add_argument("--verbose", action="store_true",
                            help="also the routine diagnostics: coordinator cache, checks lanes and slots, free shared locks, "
                                 "self-review, health and coverage when fine, host reboots, unacked upstream fixes")
+            s.add_argument("--hourly", action="store_true",
+                           help="the status table the daemon posts to the main chat hourly or at a milestone: fork rate, "
+                                "host load and spill use, tests per landed change, queue, landing time (model-free)")
         if name == "prune":
             s.add_argument("--dry-run", action="store_true", help="change nothing; list what a sweep would do")
             s.add_argument("--archived", type=int, metavar="TASK",

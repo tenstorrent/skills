@@ -3726,6 +3726,15 @@ digest too, and so does the harness's own update on a late item the coordinator 
 A reminder of a step waiting on you keeps its full command and options in the digest.
 `ttp stats --chat` counts per chat the posts sent at once, held, digests posted and held now.
 
+Hourly status table: `ttp status --hourly` prints one table, built without a model call: the fork rate
+(worker and review runs started from a copy of a saved session, last hour and today, per provider,
+against `review.fork_target`, default 0.9), the project host's load per core and each spill host's use
+in 24 h (by machines-list alias), test runs, CPU-hours and $ per landed change, the queue (open tasks,
+push queue entries, oldest approval) and the approved-to-landed median with tasks created in 24 h. The
+daemon posts it to the main chat at most once an hour, sooner when a batch lands, a deploy finishes or
+an order closes, and only when a row changed (the load reading alone does not count).
+`ttp config <name> notify.hourly_status false` turns the post off.
+
 - Web app: the Notifications card on the Overview tab shows the browser's state (on, not allowed yet,
   blocked, unavailable on this address, unsupported), an Allow button and Send test. While the page
   is open in any tab, each new ask, problem and task ready for review pops up once and stays until
