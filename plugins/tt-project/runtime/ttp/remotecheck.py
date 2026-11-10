@@ -3,9 +3,13 @@
 """A check that runs on another machine over ssh: `delivery.checks_host`, or a check's own `host`.
 
 Some projects may not run test suites on the machine that coordinates them. A check with a host
-runs there instead: the exact commit being checked (--commit, else HEAD of the checkout) is
-copied with `git archive` over ssh into a fresh temporary directory, made a git checkout (`git init`
-and one commit of that tree, so tests that need a repository work), and the command runs in it with
+runs there instead: the exact commit being checked (--commit, else HEAD of the checkout) goes to a bare
+mirror of the repository in the host's tt-project folder (check-mirrors/, keyed by the repository's root
+commits) as an incremental git bundle of only the commits it lacks (_push: a new mirror is seeded in steps
+a cut-short copy resumes), is checked out of it into a fresh temporary directory (a --shared clone) and
+its check ref deleted afterwards; a host without usable git gets the tree with `git archive` over a
+compressed ssh instead (_archive), made a git checkout there when it can. Every copy prints its progress,
+and one that overruns its limit or stalls is the host's fault (_copy). The command runs in it with
 the check's `env` exported (values expand in the remote shell, e.g. "$HOME/.local/bin:$PATH"). Its
 output streams back and its exit code is the check's. A stopped check (a timeout, a stop) stops
 its command there too (_run_script). The temporary directory is always removed.
@@ -27,6 +31,7 @@ exported as given, never expanded there.
 `host` is an ssh alias (a machines-list alias is one): `ssh <host>` must reach it without a prompt."""
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -35,6 +40,8 @@ import shlex
 import signal
 import subprocess
 import sys
+import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -322,23 +329,259 @@ def _refused(text: str | bytes) -> bool:
     return MUX_REFUSED in (text.decode(errors="replace") if isinstance(text, bytes) else text or "")
 
 
+MIRRORS = "check-mirrors"   # under the host's tt-project folder (${TTP_HOME:-$HOME/.tt-project}), beside checks-env
+MIRROR_MARK, BASE_MARK = "ttp-mirror:", "ttp-base:"   # the probe's lines naming the mirror and its base refs
+MIRROR_RE = re.compile(r"/[A-Za-z0-9._/+@-]*/" + MIRRORS + r"/[0-9a-f]{16}\.git")
+LINK, MUX = "link:", "mux:"   # a copy step's why: the link's fault, ssh's shared connection refusing a session
+PROGRESS_S = 30     # a copy prints how far it got this often, so the checks' silence limit never stops a live one
+STALL_S = 180       # ... and one whose progress has not moved this long is the link's fault
+SEED_STEP = 500     # first-parent commits per bundle while a mirror catches up: each lands, the next resumes there
+BASE_KEEP = 20      # base refs a mirror keeps (the newest)
+CHECK_REF_AGE_S = 2 * 86400   # a check ref left this long (a killed run) is removed
+MIRROR_AGE_D = 30   # a mirror unused this many days is removed
+
+
+def _knob(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name) or default)
+    except ValueError:
+        return float(default)
+
+
+def mirror_key(top: str, head: str) -> str:
+    """The repository's identity on a check host: its root commits, the same in every clone of it."""
+    roots = sorted(_git("-C", top, "rev-list", "--max-parents=0", head).split())
+    return hashlib.sha256(" ".join(roots).encode()).hexdigest()[:16] if roots else ""
+
+
+def _mirror_probe(key: str) -> str:
+    """The host's side, after mktemp: makes the bare mirror of the repository keyed `key` (mirror_key) when
+    git is there, and prints its path and its newest base refs. Prints nothing (never fails) without git."""
+    if not key:
+        return "true"
+    return (f'if git --version >/dev/null 2>&1; then m="${{TTP_HOME:-$HOME/.tt-project}}/{MIRRORS}/{key}.git"; '
+            'if { [ -f "$m/HEAD" ] || { mkdir -p "$m" && git init -q --bare "$m"; }; } >/dev/null 2>&1 '
+            '&& m=$(cd "$m" && pwd -P) && [ "$(git -C "$m" rev-parse --is-bare-repository 2>/dev/null)" = true ]; '
+            f'then touch "$m"; echo "{MIRROR_MARK}$m"; git -C "$m" for-each-ref --sort=-committerdate --count=50 '
+            f"--format='{BASE_MARK}%(objectname)' refs/heads/base 2>/dev/null; fi; fi; true")
+
+
+def _mirror_cleanup(mirror: str, ref: str) -> str:
+    """The host's side after a check: its ref goes; so do check refs a killed run left, base refs past the
+    newest BASE_KEEP and mirrors unused for MIRROR_AGE_D days. gc (auto) runs only while no check holds a ref."""
+    m = shlex.quote(mirror)
+    return ("{ " f"m={m}; git -C \"$m\" update-ref -d {shlex.quote(ref)}; now=$(date +%s); "
+            "git -C \"$m\" for-each-ref --format='%(refname)' refs/heads/check | while read -r r; do "
+            "t=${r##*/}; t=${t%%-*}; case $t in ''|*[!0-9]*) continue;; esac; "
+            f"[ $((now - t)) -gt {CHECK_REF_AGE_S} ] && git -C \"$m\" update-ref -d \"$r\"; done; "
+            "git -C \"$m\" for-each-ref --sort=-committerdate --format='%(refname)' refs/heads/base "
+            f"| tail -n +{BASE_KEEP + 1} | while read -r r; do git -C \"$m\" update-ref -d \"$r\"; done; "
+            "[ -n \"$(git -C \"$m\" for-each-ref refs/heads/check)\" ] || git -C \"$m\" gc --auto --quiet; "
+            f"find \"${{m%/*}}\" -mindepth 1 -maxdepth 1 -name '*.git' -type d -mtime +{MIRROR_AGE_D} "
+            "-exec rm -rf {} +; true; } >/dev/null 2>&1")
+
+
+def _checkout_script(q: str, mirror: str, ref: str, head: str) -> str:
+    """The host's side once `head` is in its mirror at `ref`: a --shared clone of it checked out at `head` in
+    the run's folder `q` (a fresh one: the objects stay in the mirror), and `head` kept as a base ref there."""
+    m, branch = shlex.quote(mirror), shlex.quote(ref[len("refs/heads/"):])
+    return (f"set -e; cd {q}; git clone -q --shared --no-checkout --no-tags --single-branch --branch {branch} {m} .; "
+            f"git -c advice.detachedHead=false checkout -q --detach {head}; "
+            f'[ "$(git rev-parse HEAD)" = {head} ]; '
+            f"git -C {m} update-ref refs/heads/base/{head} {head} >/dev/null 2>&1 || true")
+
+
+def _watch(proc, progress, label: str, deadline: float, stall_s: float | None) -> str:
+    """Waits for `proc`, printing `progress()` every PROGRESS_S s: "" once it ended, else LINK and why after
+    killing it when it overran `deadline` (monotonic) or its progress has not moved for `stall_s` s."""
+    start = moved = time.monotonic()
+    seen, every = progress(), _knob("TTP_REMOTE_PROGRESS_S", PROGRESS_S)
+    say = start + every
+    try:
+        while proc.poll() is None:
+            try:
+                proc.wait(timeout=0.2)
+            except subprocess.TimeoutExpired:
+                pass
+            now, cur = time.monotonic(), progress()
+            if cur != seen:
+                seen, moved = cur, now
+            why = (f"{label} overran its limit after {now - start:.0f} s" if now >= deadline else
+                   f"{label} stalled: nothing moved for {now - moved:.0f} s" if stall_s and now - moved >= stall_s
+                   else "")
+            if why and proc.poll() is None:
+                return f"{LINK}{why} ({cur or 'nothing yet'})"
+            if now >= say:
+                _say(f"{label}: {cur or 'started'} ({now - start:.0f} s)")
+                say = now + every
+        return ""
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+
+
+def _tail(f) -> str:
+    f.seek(0)
+    return f.read().decode(errors="replace")
+
+
+def _host_step(host: str, script: str, direct: bool, deadline: float, label: str) -> str:
+    """Runs `script` on the host: "", or why it failed (LINK: ssh's, MUX: its shared connection refused)."""
+    with tempfile.TemporaryFile() as out:
+        proc = subprocess.Popen(_ssh(host, script, direct), stdin=subprocess.DEVNULL, stdout=out, stderr=out)
+        why = _watch(proc, lambda: "", label, deadline, None)
+        text = _tail(out)
+    last = (text.strip().splitlines() or [""])[-1][:200]
+    if why or proc.returncode == 0:
+        return why
+    if proc.returncode == 255:
+        return (MUX if _refused(text) else LINK) + f"{label} failed (ssh exit 255: {last})"
+    return f"{label} failed (exit {proc.returncode}: {last})"
+
+
+def _objects(top: str) -> str:
+    return str(Path(_git("-C", top, "rev-parse", "--path-format=absolute", "--git-common-dir")) / "objects")
+
+
+def _copy_argv(host: str, script: str, direct: bool, compress: bool) -> list[str]:
+    """The ssh that takes a bulk copy (a bundle, a tree): the one place its connection is chosen."""
+    return _ssh(host, script, direct, compress=compress)
+
+
+def _copy(host, source: list[str], script: str, direct: bool, deadline: float, label: str,
+          compress: bool = False) -> tuple[int, int, str, str]:
+    """Every bulk copy to a host: `source`'s output streamed into `script` there, printing the bytes sent
+    every PROGRESS_S s; killed at `deadline` or after STALL_S s with nothing sent. (source's exit, ssh's
+    exit, LINK and why when killed else "", the host's output)."""
+    sent = [0]
+    with tempfile.TemporaryFile() as out:
+        src = subprocess.Popen(source, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        proc = subprocess.Popen(_copy_argv(host, script, direct, compress), stdin=subprocess.PIPE, stdout=out,
+                                stderr=out)
+        pumper = threading.Thread(target=_pump, args=(src.stdout, proc.stdin, sent), daemon=True)
+        t0 = time.monotonic()
+        pumper.start()
+        why = _watch(proc, lambda: f"{sent[0] / 1e6:.2f} MB sent", label, deadline,
+                     _knob("TTP_REMOTE_COPY_STALL_S", STALL_S))
+        if why or proc.returncode:
+            src.kill()
+        pumper.join(timeout=10)
+        src.wait()
+        text = _tail(out)
+    if not why and proc.returncode == 0 and src.returncode == 0:
+        _say(f"{label}: done in {time.monotonic() - t0:.0f} s ({sent[0] / 1e6:.2f} MB)")
+    return src.returncode, proc.returncode, why, text
+
+
+def _send_bundle(host, top, sha, dst, have, mirror, direct, deadline) -> str:
+    """A git bundle of `sha` without what reaches from `have` (commits the host's mirror holds), streamed
+    over ssh into a file beside the mirror and fetched from there to `dst`: only objects it lacks travel.
+    The bundle is made in a scratch repository borrowing this one's objects, so no ref here moves."""
+    label = f"sending {sha[:12]} to {host}'s mirror"
+    m = shlex.quote(mirror)
+    incoming = shlex.quote(f"{mirror}.in-{secrets.token_hex(6)}.bundle")
+    script = (f"set -e; umask 077; f={incoming}; trap 'rm -f \"$f\"' EXIT; cat > \"$f\"; "
+              f"git -C {m} fetch -q --no-tags --no-write-fetch-head \"$f\" refs/heads/ttp-send:{shlex.quote(dst)}"
+              # another check seeding the same step got there first: its commit is what this one needs
+              + (f" || git -C {m} cat-file -e {sha}^{{commit}}" if dst.startswith("refs/heads/base/") else ""))
+    with tempfile.TemporaryDirectory(prefix="ttp-bundle.") as scratch:
+        subprocess.run(["git", "init", "-q", "--bare", scratch], check=True, capture_output=True)
+        Path(scratch, "objects", "info", "alternates").write_text(_objects(top) + "\n")
+        subprocess.run(["git", "--git-dir", scratch, "update-ref", "refs/heads/ttp-send", sha], check=True,
+                       capture_output=True)
+        src_rc, rc, why, text = _copy(host, ["git", "--git-dir", scratch, "bundle", "create", "-q", "-",
+                                             "refs/heads/ttp-send", *(["--not", *have] if have else [])],
+                                      script, direct, deadline, label)
+    if why:
+        return why
+    last = (text.strip().splitlines() or [""])[-1][:200]
+    if rc == 255:
+        return (MUX if _refused(text) else LINK) + f"{label} failed (ssh exit 255: {last})"
+    if src_rc or rc:
+        return f"{label} failed (bundle exit {src_rc}, host exit {rc}: {last})"
+    return ""
+
+
+def _pump(src, dst, sent) -> None:
+    """Copies `src` to `dst` (closing both), counting bytes in sent[0]: a copy's progress."""
+    try:
+        while chunk := src.read(65536):
+            dst.write(chunk)
+            sent[0] += len(chunk)
+    except (OSError, ValueError):
+        pass
+    finally:
+        src.close()
+        try:
+            dst.close()
+        except OSError:
+            pass
+
+
+def _push(host, top, head, mirror, ref, bases, direct, deadline) -> str:
+    """Puts `head` in the host's mirror at `ref`. A mirror far behind (a new one) catches up first in steps of
+    SEED_STEP first-parent commits, each kept as a base ref: a copy cut short resumes from the last step."""
+    have = []
+    if bases:
+        r = subprocess.run(["git", "-C", top, "cat-file", "--batch-check=%(objectname) %(objecttype)"],
+                           input="\n".join(bases) + "\n", capture_output=True, text=True)
+        have = [ln.split()[0] for ln in r.stdout.splitlines() if ln.endswith(" commit")]
+    behind = _git("-C", top, "rev-list", "--first-parent", "--reverse", head, "--not", *have).split()
+    if not behind:   # the mirror has it: a ref to it is all the check needs
+        return _host_step(host, f"git -C {shlex.quote(mirror)} update-ref {shlex.quote(ref)} {head}", direct, deadline,
+                          f"marking {head[:12]} in {host}'s mirror")
+    step = max(1, int(_knob("TTP_REMOTE_SEED_STEP", SEED_STEP)))
+    steps = [behind[i] for i in range(step - 1, len(behind) - 1, step)]
+    if steps:
+        _say(f"{host}'s mirror lacks {len(behind)} commits: sending them in {len(steps) + 1} steps")
+    for sha, dst in [*((s, f"refs/heads/base/{s}") for s in steps), (head, ref)]:
+        if why := _send_bundle(host, top, sha, dst, have, mirror, direct, deadline):
+            return why
+        have = [*have, sha]
+    return ""
+
+
+def _archive(host, top, head, q, direct, deadline) -> tuple[int, str]:
+    """The tree of `head` over a compressed ssh into the run's folder `q` (emptied first), made a git checkout
+    when the host has git: (0, ""), (2, "") when git archive failed here, else (0, why) as _host_step."""
+    setup = (f"set -e; rm -rf {q}; mkdir -m 700 {q}; cd {q}; tar -xf -; "
+             "if git --version >/dev/null 2>&1; then git -c init.defaultBranch=main init -q; git add -A -f .; "
+             f"git -c user.name=ttp -c user.email=ttp@localhost -c commit.gpgsign=false commit -q "
+             f"--no-verify --allow-empty -m {shlex.quote('ttp check of ' + head)}; fi")
+    src_rc, rc, why, text = _copy(host, ["git", "-C", top, "archive", "--format=tar", head], setup, direct, deadline,
+                                  f"sending {head[:12]}'s tree to {host} (ssh compresses it)", compress=True)
+    if why:
+        return 0, why
+    if rc != 0:
+        why = (f"cannot unpack the tree into a checkout there (exit {rc}: "
+               f"{(text.strip().splitlines() or [''])[-1][:200]})")
+        return 0, (MUX + why if rc == 255 and _refused(text) else why)
+    if src_rc != 0:
+        _say(f"git archive of {head[:12]} failed (exit {src_rc})")
+        return 2, ""
+    return 0, ""
+
+
 def _attempt(host, top, head, env, extra, cmd, mark, wrap, wait) -> tuple[int, str]:
     """One try of the check on `host` (main), after `wait` s on a connection of its own when given:
     (exit code, ""), or (FAULT_RC, why) when ssh failed after its shared connection refused a session."""
     for s in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
         signal.signal(s, _stop)
     direct = wait is not None
-    tmp, proc = "", None
+    tmp, proc, cleanup_ref = "", None, None
     try:
         if direct:
             time.sleep(wait)
+        key = mirror_key(top, head)
         try:
-            made = subprocess.run(_ssh(host, mktemp_cmd(), direct),
+            made = subprocess.run(_ssh(host, f"{mktemp_cmd()} && {{ {_mirror_probe(key)}; }}", direct),
                                   stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=PROBE_TIMEOUT_S)
         except subprocess.TimeoutExpired:
             return _fault(host, f"ssh timed out after {PROBE_TIMEOUT_S} s"
                           + (f": {sshagent.WHY}" if sshagent.password_manager() else "")), ""
-        tmp = made.stdout.strip()
+        lines = made.stdout.strip().splitlines()
+        tmp = lines[0].strip() if lines else ""
         if made.returncode != 0 or not _TMP.fullmatch(tmp):
             tmp = ""
             why = (f"cannot make a temporary directory there (ssh exit {made.returncode}: "
@@ -348,32 +591,36 @@ def _attempt(host, top, head, env, extra, cmd, mark, wrap, wait) -> tuple[int, s
             if made.returncode == 255 and sshagent.locked(made.stderr):
                 why = f"ssh failed: {sshagent.WHY}"
             return _fault(host, why), ""
+        mirror = next((ln[len(MIRROR_MARK):] for ln in lines if ln.startswith(MIRROR_MARK)), "")
+        bases = [ln[len(BASE_MARK):] for ln in lines if ln.startswith(BASE_MARK)]
+        if mirror and not MIRROR_RE.fullmatch(mirror):
+            mirror = ""
         _say(f"checking {head[:12]} on {host} in {tmp}")
         q = shlex.quote(tmp)
-        setup = (f"set -e; cd {q}; tar -xf -; git -c init.defaultBranch=main init -q; git add -A -f .; "
-                 f"git -c user.name=ttp -c user.email=ttp@localhost -c commit.gpgsign=false commit -q "
-                 f"--no-verify --allow-empty -m {shlex.quote('ttp check of ' + head)}")
-        archive = subprocess.Popen(["git", "-C", top, "archive", "--format=tar", head], stdout=subprocess.PIPE)
-        try:
-            copied = subprocess.run(_ssh(host, setup, direct, compress=True), stdin=archive.stdout, capture_output=True, text=True,
-                                    timeout=SETUP_TIMEOUT_S)
-        except subprocess.TimeoutExpired:
-            archive.kill()
-            return _fault(host, f"copying the tree timed out after {SETUP_TIMEOUT_S} s"), ""
-        finally:
-            archive.stdout.close()
-            archive.wait()
-        # ssh or the host failing mid-copy kills git archive with SIGPIPE: that is the host, not the
-        # change. Only git archive failing on its own while the copy went through is the checkout's.
-        if copied.returncode != 0 or archive.returncode == -signal.SIGPIPE:
-            why = (f"cannot unpack the tree into a git checkout there (exit {copied.returncode}: "
-                   f"{(copied.stderr.strip().splitlines() or [''])[-1][:200]})")
-            if copied.returncode == 255 and _refused(copied.stderr):
-                return FAULT_RC, why
-            return _fault(host, why), ""
-        if archive.returncode != 0:
-            _say(f"git archive of {head[:12]} failed (exit {archive.returncode})")
-            return 2, ""
+        deadline = time.monotonic() + _knob("TTP_REMOTE_COPY_LIMIT_S", SETUP_TIMEOUT_S)
+        copied = False
+        if mirror:
+            ref = f"refs/heads/check/{int(time.time())}-{secrets.token_hex(6)}"
+            why = _push(host, top, head, mirror, ref, bases, direct, deadline)
+            if not why:
+                cleanup_ref = (mirror, ref)
+                why = _host_step(host, _checkout_script(q, mirror, ref, head), direct, deadline,
+                                 f"checking {head[:12]} out of its mirror there")
+            copied = not why
+            if why.startswith(MUX):
+                return FAULT_RC, why[len(MUX):]
+            if why.startswith(LINK):
+                return _fault(host, why[len(LINK):]), ""
+            if why:
+                _say(f"the mirror copy failed ({why}); sending the tree compressed instead")
+        if not copied:   # no mirror there (no usable git there), or it failed: the tree, compressed
+            rc, why = _archive(host, top, head, q, direct, deadline)
+            if why.startswith(MUX):
+                return FAULT_RC, why[len(MUX):]
+            if why:
+                return _fault(host, why[len(LINK):] if why.startswith(LINK) else why), ""
+            if rc:
+                return rc, ""
         from . import testslots
         script = _run_script(q, exports(env) + extra, cmd, mark, wrap, testslots.priority_args(testslots._cfg()))
         # stdin stays open and unwritten: its end on the host (we stopped, died or lost ssh) stops the command.
@@ -435,7 +682,9 @@ def _attempt(host, top, head, env, extra, cmd, mark, wrap, wait) -> tuple[int, s
             proc.stdin.close()
         if tmp:
             try:
-                subprocess.run(_ssh(host, f"rm -rf {shlex.quote(tmp)}", direct), stdin=subprocess.DEVNULL,
+                subprocess.run(_ssh(host, f"rm -rf {shlex.quote(tmp)}"
+                                    + (f"; {_mirror_cleanup(*cleanup_ref)}" if cleanup_ref else ""), direct),
+                               stdin=subprocess.DEVNULL,
                                capture_output=True, timeout=CLEANUP_TIMEOUT_S)
             except (OSError, subprocess.SubprocessError):
                 _say(f"could not remove {tmp} on {host}")

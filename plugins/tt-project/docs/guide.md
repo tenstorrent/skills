@@ -2146,6 +2146,14 @@ session and stateless coordinators on every provider.
   checks wait there at most `checks.push_load_wait_s` seconds (default 300; `off`: no bound), then start on
   their branch's reserved lane alone, one per lane at a time. Heavy suites
   belong on another host where a project has one allowed (`delivery.checks_host`).
+  A check on another host gets its commit through a bare mirror of the repository kept in that host's
+  tt-project folder (`check-mirrors/`, beside `checks-env/`): each check streams a git bundle of only the
+  commits the mirror lacks over ssh (KBs once the mirror is seeded; a new mirror is seeded in steps, and a
+  check cut short resumes the seeding), checks it out into a fresh folder and removes the folder and its
+  ref afterwards. A host without usable git gets the tree over a compressed ssh instead. A copy prints its
+  progress every 30 s (`TTP_REMOTE_PROGRESS_S`); one past its limit (`TTP_REMOTE_COPY_LIMIT_S`, default
+  540 s) or with nothing moving for 180 s (`TTP_REMOTE_COPY_STALL_S`) is the host's fault: the check waits
+  or runs elsewhere, never failing the change.
   Checks that run on another host (a check's own `"host"`, `delivery.checks_host` or a spill host), with at most
   light checks here, use none of this host's CPU: push checks and `ttp checks` take no host-wide checks slot or
   test slots here and never wait for this host's guard. They wait instead while their host's runnable demand,

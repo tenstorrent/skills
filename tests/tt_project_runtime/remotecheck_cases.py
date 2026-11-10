@@ -11,6 +11,8 @@ _RC_FAKE_SSH = r'''#!/bin/sh
 # FAKE_SSH_LOG=<file> gets one line per call naming the host; FAKE_SSH_ARGS=<file> one with all its arguments. FAKE_SSH_MUX=<file> holding a count (or
 # "always"): on a script holding FAKE_SSH_MUX_ON (default: the run step) the shared connection refuses
 # the session while the count lasts, and the link drops (exit 255); <file>.log gets "shared" or "direct".
+# The host's tt-project folder (its mirrors) is FAKE_REMOTE_TMP/../host-home. FAKE_SSH_NOGIT=1: git there
+# is unusable. FAKE_SSH_SLOW=<text>:<s> sleeps <s> before a script holding <text> (a slow link).
 all="$*"
 while [ "$1" = "-o" ]; do shift 2; done
 host=$1
@@ -18,7 +20,14 @@ shift
 [ -n "$FAKE_SSH_LOG" ] && echo "$host" >> "$FAKE_SSH_LOG"
 [ -n "$FAKE_SSH_ARGS" ] && echo "$all" >> "$FAKE_SSH_ARGS"
 if [ "$host" = down ]; then echo "ssh: connect to host down port 22: Connection refused" >&2; exit 255; fi
-[ -n "$FAKE_REMOTE_TMP" ] && export TMPDIR="$FAKE_REMOTE_TMP"
+[ -n "$FAKE_REMOTE_TMP" ] && export TMPDIR="$FAKE_REMOTE_TMP" TTP_HOME="$FAKE_REMOTE_TMP/../host-home"
+if [ -n "$FAKE_SSH_NOGIT" ]; then
+  mkdir -p "$FAKE_REMOTE_TMP/../nogit" && printf '#!/bin/sh\nexit 127\n' > "$FAKE_REMOTE_TMP/../nogit/git"
+  chmod +x "$FAKE_REMOTE_TMP/../nogit/git" && export PATH="$FAKE_REMOTE_TMP/../nogit:$PATH"
+fi
+if [ -n "$FAKE_SSH_SLOW" ]; then
+  case "$1" in *"${FAKE_SSH_SLOW%:*}"*) sleep "${FAKE_SSH_SLOW##*:}";; esac
+fi
 if [ -n "$FAKE_SSH_MUX" ]; then
   case "$1" in *"${FAKE_SSH_MUX_ON:-ttp-remote-rc}"*)
     case "$all" in *ControlPath=none*) echo direct >> "$FAKE_SSH_MUX.log";; *) echo shared >> "$FAKE_SSH_MUX.log";; esac
@@ -158,7 +167,8 @@ def test_ssh_failing_at_any_step_of_a_remote_check_is_an_environment_fault(tmp_p
     buffer, where git archive dies of SIGPIPE) or mid-run exits 75, never the change's 1 or 2."""
     from ttp import remotecheck
     repo = _rc_repo(tmp_path, big=True)
-    for fake in ({"FAKE_SSH_FAIL": "mktemp"}, {"FAKE_SSH_FAIL": "tar -xf"}, {"FAKE_SSH_DROP": "ttp-remote-rc"}):
+    for fake in ({"FAKE_SSH_FAIL": "mktemp"}, {"FAKE_SSH_FAIL": "ttp-send"}, {"FAKE_SSH_FAIL": "--shared"},
+                 {"FAKE_SSH_FAIL": "tar -xf", "FAKE_SSH_NOGIT": "1"}, {"FAKE_SSH_DROP": "ttp-remote-rc"}):
         rc, said = _rc_run(tmp_path, repo, "true", **fake)
         assert rc == remotecheck.FAULT_RC, (fake, said)
         assert f"{remotecheck.SIG}box1" in said and "git archive" not in said, said
@@ -3901,3 +3911,108 @@ def test_the_tree_copy_to_a_check_host_is_compressed_and_a_stall_is_the_hosts_fa
     assert len(copy) == 1 and "Compression=yes" in copy[0], calls
     assert not [c for c in calls if "Compression=yes" in c and "tar -xf -" not in c], calls
     assert remotecheck.SETUP_TIMEOUT_S < checkwall.SILENT_S
+
+
+def _rc_mirror(tmp_path):
+    """The fake host's mirrors: {name: [its refs]}."""
+    found = {}
+    for m in sorted((tmp_path / "host-home" / "check-mirrors").glob("*.git")):
+        found[m.name] = subprocess.run(["git", "-C", str(m), "for-each-ref", "--format=%(refname)"],
+                                       capture_output=True, text=True, check=True).stdout.split()
+    return found
+
+
+def _rc_sent(said):
+    """MB each bundle took to the mirror, as the check printed them."""
+    return [float(x) for x in re.findall(r"to box1's mirror: done in \d+ s \(([\d.]+) MB\)", said)]
+
+
+def _rc_commit(repo, name, data=b"x\n"):
+    (repo / name).write_bytes(data)
+    git = ["git", "-C", str(repo), "-c", "user.email=t@example.com", "-c", "user.name=t"]
+    subprocess.run([*git, "add", "-A"], check=True)
+    subprocess.run([*git, "commit", "-qm", name], check=True)
+
+
+def test_a_remote_check_sends_only_new_objects_to_the_hosts_mirror_and_leaves_no_ref_or_checkout(tmp_path):
+    """The first check seeds the host's bare mirror (beside its checks env, keyed by the repository's root
+    commits) with the whole history; a later one sends a bundle of only the new commit. Each runs in a
+    fresh checkout of exactly its head; afterwards its checkout, its check ref and the bundle are gone and
+    the head stays as a base ref later bundles leave out."""
+    repo = _rc_repo(tmp_path, big=True)
+    rc, said = _rc_run(tmp_path, repo, "git rev-parse HEAD; test -f big.bin")
+    head = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+    assert rc == 0 and head in said, said
+    first = _rc_sent(said)
+    assert len(first) == 1 and first[0] > 1.5, said   # the 2 MB of history, once
+    (mirror, refs), = _rc_mirror(tmp_path).items()
+    assert re.fullmatch(r"[0-9a-f]{16}\.git", mirror) and refs == [f"refs/heads/base/{head}"], refs
+    _rc_commit(repo, "b.txt")
+    rc, said = _rc_run(tmp_path, repo, "cat b.txt; test -f big.bin")
+    assert rc == 0 and "x" in said, said
+    second = _rc_sent(said)
+    assert len(second) == 1 and second[0] < 0.01, said   # KBs: only the new commit
+    assert not [r for r in _rc_mirror(tmp_path)[mirror] if "/check/" in r]
+    assert _rc_left(tmp_path) == [] and not list((tmp_path / "host-home" / "check-mirrors").glob("*.bundle"))
+    rc, said = _rc_run(tmp_path, repo, "cat b.txt")   # nothing new: no bundle at all
+    assert rc == 0 and _rc_sent(said) == [] and "sending" not in said, said
+
+
+def test_a_new_mirror_far_behind_is_seeded_in_steps_that_a_cut_short_copy_resumes(tmp_path, monkeypatch):
+    """Seeding sends the history in SEED_STEP first-parent steps, each kept as a base ref there: a copy cut
+    off after the first step is a host fault, and the next check sends only the rest."""
+    from ttp import remotecheck
+    repo = _rc_repo(tmp_path)
+    for i in range(5):
+        _rc_commit(repo, f"c{i}.txt")
+    shas = subprocess.run(["git", "-C", str(repo), "rev-list", "--first-parent", "--reverse", "HEAD"],
+                          capture_output=True, text=True).stdout.split()
+    rc, said = _rc_run(tmp_path, repo, "true", TTP_REMOTE_SEED_STEP="2", FAKE_SSH_FAIL="ttp-send:refs/heads/check")
+    assert rc == remotecheck.FAULT_RC
+    refs = next(iter(_rc_mirror(tmp_path).values()))
+    assert {f"refs/heads/base/{shas[1]}", f"refs/heads/base/{shas[3]}"} <= set(refs), (refs, said)
+    rc, said = _rc_run(tmp_path, repo, "true", TTP_REMOTE_SEED_STEP="2")
+    assert rc == 0 and len(_rc_sent(said)) == 1, said
+
+
+def test_two_concurrent_remote_checks_share_one_mirror_and_both_pass(tmp_path):
+    repo = _rc_repo(tmp_path)
+    assert _rc_run(tmp_path, repo, "true")[0] == 0
+    _rc_commit(repo, "b.txt")
+    procs = [_rc_run(tmp_path, repo, f"cat b.txt; echo run{i}", wait=False) for i in range(2)]
+    outs = [p.communicate(timeout=60)[0] for p in procs]
+    assert [p.returncode for p in procs] == [0, 0], outs
+    assert "run0" in outs[0] and "run1" in outs[1]
+    assert not [r for r in next(iter(_rc_mirror(tmp_path).values())) if "/check/" in r]
+    assert _rc_left(tmp_path) == []
+
+
+def test_a_slow_copy_prints_progress_and_an_overrun_is_a_host_fault_not_a_timeout(tmp_path):
+    """A copy prints how far it got while it runs (the checks' silence limit never calls it a hang); one
+    past its limit is killed and is the host's fault (75, the unreachable-host wait), never the change's
+    failure or a timeout's 124."""
+    from ttp import remotecheck
+    repo = _rc_repo(tmp_path)
+    rc, said = _rc_run(tmp_path, repo, "echo did-run", FAKE_SSH_SLOW="ttp-send:2", TTP_REMOTE_PROGRESS_S="0.5")
+    assert rc == 0 and "did-run" in said, said
+    assert len(re.findall(r"sending [0-9a-f]{12} to box1's mirror: .*\(\d+ s\)", said)) >= 2, said
+    _rc_commit(repo, "b.txt")
+    for fake in ({}, {"FAKE_SSH_NOGIT": "1"}):
+        slow = {"FAKE_SSH_SLOW": ("tar -xf" if fake else "ttp-send") + ":20", "TTP_REMOTE_COPY_LIMIT_S": "1"}
+        t0 = time.monotonic()
+        rc, said = _rc_run(tmp_path, repo, "echo did-run", **fake, **slow)
+        assert rc == remotecheck.FAULT_RC and "did-run" not in said, (fake, said)
+        assert "overran its limit" in said and f"{remotecheck.SIG}box1" in said and time.monotonic() - t0 < 15, said
+    assert _rc_left(tmp_path) == []
+
+
+def test_a_host_without_usable_git_gets_the_tree_over_a_compressed_ssh(tmp_path):
+    """No usable git there: no mirror, the tree goes as before (git archive over a compressed ssh)."""
+    repo = _rc_repo(tmp_path)
+    args = tmp_path / "args"
+    rc, said = _rc_run(tmp_path, repo, "cat a.txt", FAKE_SSH_NOGIT="1", FAKE_SSH_ARGS=str(args))
+    assert rc == 0 and "a" in said and _rc_sent(said) == [], said
+    assert "tree to box1 (ssh compresses it): done" in said
+    assert any("Compression=yes" in ln and "tar -xf" in ln for ln in args.read_text().splitlines())
+    assert _rc_mirror(tmp_path) == {} and _rc_left(tmp_path) == []
+
