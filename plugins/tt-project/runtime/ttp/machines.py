@@ -761,16 +761,25 @@ def stats(db, now: float | None = None) -> dict[str, dict]:
     since = now - 86400
     stats: dict[str, dict] = {}
 
-    def bump(names, key):
+    from .localfault import local_for, tag
+
+    def bump(names, key, local=None):
         for n in names:
-            s = stats.setdefault(n, {"runs": 0, "handoffs": 0, "reboots": 0, "waits": 0})
-            s[key] += 1
-    for r in db.q("SELECT r.status, r.note, t.labels FROM runs r JOIN tasks t ON t.id=r.task "
+            s = stats.setdefault(n, {"runs": 0, "handoffs": 0, "reboots": 0, "waits": 0, "local": 0})
+            # A failure of the run's own (localfault) on a resource it never used is counted apart.
+            if local is not None and (got := local_for(local, n)):
+                s["local"] += 1
+                s.setdefault("local_kinds", {}).update(dict.fromkeys(got, True))
+            else:
+                s[key] += 1
+    runs = Path(getattr(db, "path", "") or ".").parent / "runs"
+    for r in db.q("SELECT r.id, r.dir, r.status, r.note, t.labels FROM runs r JOIN tasks t ON t.id=r.task "
                   f"WHERE r.role!='coordinator' AND r.ended>? AND r.status IN ({','.join('?' * len(BAD_RUNS))})",
                   (since, *BAD_RUNS)):
         if r["status"] == "lost" and "lost_to_reboot" in (r["note"] or ""):
             continue   # counted once, as the reboot below
-        bump(_labels(r), "runs")
+        names = _labels(r)
+        bump(names, "runs", tag(r["dir"] or runs / str(r["id"]), None, names))
     # Only what the task's own runs reported: a block the daemon set on a dead dependency says
     # nothing about the resource.
     # A self-wait (its own checks, jobs, push or planned window) says nothing about the resource either.
@@ -780,7 +789,8 @@ def stats(db, now: float | None = None) -> dict[str, dict]:
                   "AND e.kind IN ('task_failed','task_blocked','task_waiting')", (since,)):
         if e["kind"] == "task_waiting" and is_self_wait(e["data"]):
             continue
-        bump(_labels(e), "waits" if e["kind"] == "task_waiting" else "handoffs")
+        bump(_labels(e), "waits" if e["kind"] == "task_waiting" else "handoffs",
+             None if e["kind"] == "task_waiting" else e["data"])
     # Reboots count only against machines on the list (a lock such as push:<branch> is not a
     # machine), and only when most of the host's reboots happened while it was held: a host that
     # reboots on its own says nothing about what it held at the time. A planned reboot counts against nothing.
@@ -809,10 +819,15 @@ def trouble(db, now: float | None = None, seen: dict[str, dict] | None = None) -
 
 
 def trouble_line(name: str, s: dict, machines: dict[str, dict], avoid: set[str]) -> str:
+    from .localfault import KINDS
     parts = [f"{s[k]} {label}" for k, label in (("runs", "runs crashed, stalled or lost"),
                                                 ("handoffs", "hand-offs failed or blocked"),
                                                 ("reboots", "host reboots while held"),
                                                 ("waits", "waits")) if s.get(k)]
+    if s.get("local"):
+        kinds = ", ".join(KINDS[k] for k in KINDS if k in (s.get("local_kinds") or {}))
+        parts.append(f"{s['local']} local faults not counted ({kinds}; on runs that never used it: fix them "
+                     "where the run ran, never route around or pause the resource for them)")
     tasks = s.get("tasks") or []
     on = f"; open tasks on it: {', '.join(f'#{t}' for t in tasks[:10])}" if tasks else "; no open tasks on it"
     if name not in machines:
@@ -821,7 +836,8 @@ def trouble_line(name: str, s: dict, machines: dict[str, dict], avoid: set[str])
         alts = alternatives(name, machines, avoid)
         alt = (f"; machines sharing its tags: {', '.join(alts)}" if alts
                else "; no other machine shares its tags")
-    hint = "; waits only: it may be busy, not down, so do not pause it for this" if not s.get("failures") else ""
+    hint = ("; waits only: it may be busy, not down, so do not pause it for this"
+            if not s.get("failures") and s.get("waits") else "")
     return f"{name}: {', '.join(parts)}{on}{alt}{hint}"
 
 

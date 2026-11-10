@@ -588,6 +588,8 @@ def _read_project(name: str, db: ReadOnly, view: dict, now: float) -> None:
                 parts = [f"{s[k]} {label}" for k, label in (("runs", "lost, crashed or stalled runs"),
                                                             ("handoffs", "failed or blocked hand-offs"),
                                                             ("reboots", "host reboots while held")) if s.get(k)]
+                if parts and s.get("local"):
+                    parts.append(f"{s['local']} local faults of runs that never used it, not counted")
                 if parts:
                     v["problems"].append(f"{name}: {', '.join(parts)} (24 h, {res})")
 

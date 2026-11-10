@@ -40,6 +40,7 @@ from . import runtimeload   # first of its own: its LOADED_AT is when the daemon
 from . import batchrun
 from . import untrusted
 from . import branchcap
+from . import localfault
 from . import sshmux
 from . import wakecost
 from . import tailnet
@@ -8524,7 +8525,12 @@ class Daemon:
             chaincap.add_notice(db, text)
         if not approval:   # an approval has its push_queued event; the batch's outcome closes the task
             # A plain needs_review hand-off: the daemon reviews it, so it raises no effort (coordinator._routine_review).
-            data = json.dumps({"plain": True}) if outcome == "review" and plain else None
+            data = {"plain": True} if outcome == "review" and plain else {}
+            if outcome in ("failed", "blocked"):
+                # A failure of the run's own (a guard refusal, a credential alert, a check bootstrap fault)
+                # is counted apart from its resources' trouble unless the run used them (localfault).
+                data.update(localfault.tag(run_dir, result, coord.task_resources(task), self.cfg))
+            data = json.dumps(data) if data else None
             db.x("INSERT INTO events(ts,source,kind,severity,text,data,status,task) VALUES(?,?,?,?,?,?,?,?)",
                  (time.time(), f"task:{task['id']}", f"task_{outcome}", sev, text, data,
                   "handled" if quiet or routine else "queued", task["id"]))
