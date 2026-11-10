@@ -1256,6 +1256,24 @@ def test_the_daily_review_judges_a_cache_hit_drop_on_the_within_1h_rate():
     assert "not a regression: no friction task" in review
 
 
+def _nested_pytest_env(**extra):
+    """The environment of a pytest run a test starts on a copy of tests/conftest.py, without the outer
+    run's CI and xdist variables: under `pytest -n` the inherited PYTEST_XDIST_WORKER made the copy take
+    the nested run for an xdist worker, so it ran in one process with no session checks."""
+    env = {k: v for k, v in os.environ.items() if k != "CI" and not k.startswith("PYTEST_XDIST_")}
+    return {**env, **extra}
+
+
+def test_a_nested_pytest_run_never_inherits_the_outer_runs_xdist_or_ci_variables(monkeypatch):
+    """The forked-runner tests failed under `pytest -n` (blx06's -n 48 full suite) and passed on CI."""
+    for var, value in (("PYTEST_XDIST_WORKER", "gw3"), ("PYTEST_XDIST_WORKER_COUNT", "48"),
+                       ("PYTEST_XDIST_TESTRUNUID", "x"), ("CI", "true")):
+        monkeypatch.setenv(var, value)
+    env = _nested_pytest_env(TTP_TEST_JOBS="3")
+    assert env["TTP_TEST_JOBS"] == "3" and env["PATH"] == os.environ["PATH"]
+    assert not [k for k in env if k == "CI" or k.startswith("PYTEST_XDIST_")], env
+
+
 def test_the_forked_test_runner_reports_every_test_once_as_one_process_would(tmp_path):
     """tests/conftest.py runs the tt-project tests in forked workers: every test runs exactly once,
     failures, skips and warnings come back as in one process, other files stay in one worker in
@@ -1282,8 +1300,7 @@ def test_the_forked_test_runner_reports_every_test_once_as_one_process_would(tmp
     def run(jobs):
         out = tmp_path / f"out-{jobs}"
         out.mkdir()
-        env = {**os.environ, "TTP_TEST_JOBS": str(jobs), "OUT": str(out)}
-        env.pop("CI", None)
+        env = _nested_pytest_env(TTP_TEST_JOBS=str(jobs), OUT=str(out))
         r = subprocess.run([sys.executable, "-m", "pytest", "-q", "-rfEs", "-p", "no:cacheprovider", "-W",
                             "default", str(tmp_path)], cwd=str(tmp_path), env=env, capture_output=True,
                            text=True, timeout=120)
@@ -1343,8 +1360,7 @@ def test_the_forked_test_runner_names_a_test_that_closes_or_replaces_its_workers
         "def test_closes_out(request): os.close(_fd(request, 'out_w'))\n"
         "def test_replaces_out(request): _replace(request, 'out_w', os.O_WRONLY)\n"
         "def test_replaces_queue(request): _replace(request, 'work_r', os.O_RDONLY)\n")
-    env = {**os.environ, "TTP_TEST_JOBS": "3"}
-    env.pop("CI", None)
+    env = _nested_pytest_env(TTP_TEST_JOBS="3")
     status = 97
     for name, fd, how in (("test_closes_out", "out_w", "closed"), ("test_replaces_out", "out_w", "replaced"),
                           ("test_replaces_queue", "work_r", "replaced")):
@@ -1381,8 +1397,7 @@ def test_the_test_runner_restores_the_signal_handlers_and_mask_a_test_left_chang
         "    signal.signal(signal.SIGHUP, lambda s, f: None)\n"
         "    signal.signal(signal.SIGUSR1, signal.SIG_IGN)\n"
         "    signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT, signal.SIGUSR2})\n")
-    env = {**os.environ, "TTP_TEST_JOBS": str(jobs)}
-    env.pop("CI", None)
+    env = _nested_pytest_env(TTP_TEST_JOBS=str(jobs))
     r = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", str(tmp_path)],
                        cwd=str(tmp_path), env=env, capture_output=True, text=True, timeout=120)
     assert r.returncode == 0 and "60 passed" in r.stdout, r.stdout + r.stderr
@@ -1477,8 +1492,8 @@ def test_every_test_gets_its_own_temp_home_and_a_session_that_writes_outside_fai
         "        tmp.write_text(text + os.environ.get('REWRITE', ''))\n"
         "        os.replace(tmp, path)\n"
         "        os.utime(path, ns=(path.stat().st_atime_ns, path.stat().st_mtime_ns + 10**9))\n")
-    env = {**os.environ, "HOME": str(real), "REAL": str(real), "OUT": str(out), "TTP_TEST_JOBS": "3"}
-    for var in ("CI", "GIT_CONFIG_GLOBAL", "GH_CONFIG_DIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME"):
+    env = _nested_pytest_env(HOME=str(real), REAL=str(real), OUT=str(out), TTP_TEST_JOBS="3")
+    for var in ("GIT_CONFIG_GLOBAL", "GH_CONFIG_DIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME"):
         env.pop(var, None)
 
     def run(*args, **extra):
