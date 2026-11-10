@@ -7,7 +7,8 @@
 # none of them: ControlMaster=auto, ControlPath=<dir>/%C, ControlPersist=600, ServerAliveInterval=15,
 # ServerAliveCountMax=3 (a dead shared connection ends within a minute instead of hanging).
 # <dir> is $TTP_SSH_CM_DIR, else ~/.tt-project/cm (mode 700), else /tmp/ttp-cm-<uid> when the home path
-# is too long for a socket path (about 104 bytes, and ssh adds a 17-character suffix while it binds).
+# is too long for a socket path (104 bytes with its NUL on macOS: <dir>/ + 40 for %C + a 17-character
+# suffix ssh adds while it binds leaves 45 for <dir>).
 # The user's ~/.ssh is never read or written here; -F, ProxyJump and BatchMode pass through.
 # Left as is: TTP_SSH_REUSE=0 (config ssh.reuse off); a call that sets its own sharing (-S, -M, -O,
 # ControlMaster, ControlPath) or forwards ports or stdio (-L -R -D -W -w -N -f: a forward added to a
@@ -74,7 +75,7 @@ for a in "$@"; do
     esac
 done
 dir=${TTP_SSH_CM_DIR:-${HOME:-/nonexistent}/.tt-project/cm}
-if [ ${#dir} -gt 60 ] || ! { [ -d "$dir" ] || mkdir -p -m 700 "$dir" 2>/dev/null; }; then
+if [ ${#dir} -gt 45 ] || ! { [ -d "$dir" ] || mkdir -p -m 700 "$dir" 2>/dev/null; }; then
     dir=/tmp/ttp-cm-$(id -u)
     [ -d "$dir" ] || mkdir -m 700 "$dir" 2>/dev/null
 fi

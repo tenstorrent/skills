@@ -355,15 +355,23 @@ def _run_wrapper(tmp_path, args, **extra):
 
 
 def test_the_ssh_wrapper_adds_connection_reuse_in_a_private_folder(tmp_path):
+    import shutil
     import stat
-    r, log = _run_wrapper(tmp_path, ["-F", "cfg", "-J", "jump", "-o", "BatchMode=yes", "host-a", "true"])
+    import tempfile
+    home = pathlib.Path(tempfile.mkdtemp(prefix="h", dir="/tmp"))   # short: a pytest tmp_path may be over 45
+    try:
+        r, log = _run_wrapper(tmp_path, ["-F", "cfg", "-J", "jump", "-o", "BatchMode=yes", "host-a", "true"],
+                              HOME=home)
+        cm = home / ".tt-project" / "cm"
+        mode = stat.S_IMODE(cm.stat().st_mode)
+    finally:
+        shutil.rmtree(home)
     assert r.returncode == 0 and len(log) == 1
-    cm = tmp_path / "home" / ".tt-project" / "cm"
     for opt in ("ControlMaster=auto", f"ControlPath={cm}/%C", "ControlPersist=600",
                 "ServerAliveInterval=15", "ServerAliveCountMax=3"):
         assert f"-o {opt}" in log[0]
     assert log[0].endswith("-F cfg -J jump -o BatchMode=yes host-a true")   # -F, ProxyJump, BatchMode kept
-    assert stat.S_IMODE(cm.stat().st_mode) == 0o700
+    assert mode == 0o700
     assert "/.ssh" not in log[0]
     assert not list(tmp_path.glob("ttp-ssh.*"))                              # its stderr copy is removed
 
@@ -414,8 +422,11 @@ def test_the_ssh_wrapper_keeps_its_socket_path_under_the_unix_limit(tmp_path):
     want = f"/tmp/ttp-cm-{os.getuid()}"
     assert r.returncode == 0 and f"ControlPath={want}/%C" in log[0]
     # %C is 40 hex characters and ssh appends a 17-character suffix while it binds: a folder of at most
-    # 60 characters (the wrapper's limit) stays under the 104-byte socket path limit.
-    assert 60 + 1 + 40 + 17 < 104 and len(want) <= 60
+    # 45 characters (the wrapper's limit) keeps the path and its NUL within macOS's 104-byte limit.
+    assert 45 + 1 + 40 + 17 + 1 <= 104 and len(want) <= 45
+    r, log = _run_wrapper(tmp_path, ["host-a", "true"], TTP_SSH_CM_DIR="/tmp/" + "d" * 40)   # 45: kept
+    assert f"ControlPath=/tmp/{'d' * 40}/%C" in log[0]
+    os.rmdir("/tmp/" + "d" * 40)
 
 
 def test_sshmux_routes_bare_ssh_to_the_wrapper_unless_reuse_is_off():
