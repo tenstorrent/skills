@@ -84,7 +84,9 @@ Any phase:
   for evidence without being labelled as debugging only;
 - a material anomaly is dismissed with prose instead of investigation;
 - multi-device work appears without a multi-chip fit decision in the plan and a recorded user
-  authorisation; or the model does not fit one chip and the work is still single-chip.
+  authorisation; or the model does not fit one chip and the work is still single-chip;
+- on a mesh plan, the loss match (or a continuation) was run on a single chip and offered as
+  evidence for the mesh: a single-chip loss match never stands in for the plan's layout.
 
 Plan:
 
@@ -106,7 +108,10 @@ Plan:
 - the target is cycle time, a single-chip number for a model that needs the box, or MFU re-based to
   the delivered clock instead of the nominal peak with the delivered clock as a stated margin;
 - the top three ops of the step lack their compiled kernel source, sync mode and % of peak, or the
-  hard-constraints block is missing.
+  hard-constraints block is missing;
+- on an authorised box, a layout (shape and DP / TP / DP x TP) was chosen without the alternatives
+  costed: one shape costed, a layout missing from the table, or the slower layout chosen without a
+  stated reason.
 
 Composite bring-up:
 
@@ -130,6 +135,9 @@ Composite bring-up:
   never cut mid-block), or a depth's residual from the fitted line exceeds the
   stated tolerance without an explanation, or the projection was not validated
   against the full-model MFU wall-clock;
+- PCC was run without the shard shapes on a multi-chip layout (only full shapes on one chip);
+- DP syncs a frozen gradient: a gradient all-reduce over `dp` on a parameter the freeze map marks
+  frozen, or a sync over the whole parameter list instead of the trainable ones;
 - the plan's layout is multi-chip and the harness never ran the per-rank shard shapes, or the loss
   match ran on one chip instead of the layout, or the loss script can end without a log and still
   count as a pass;
@@ -160,6 +168,8 @@ Optimisation loop:
 - a useful-math kernel is called "near roofline" without the roofline figure
   and the measured fraction;
 - the host/dispatch gap is not measured, or it grew without explanation;
+- on a mesh, the ranked table or the gap decomposition has no collective term (collective time
+  not hidden behind compute), or the critical chip is not named;
 - the exit claim does not match the plan's target and margin, or the final MFU
   does not reproduce the best iteration's number;
 - the final path fails the PCC harness or loss match;
