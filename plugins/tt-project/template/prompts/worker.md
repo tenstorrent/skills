@@ -6,8 +6,8 @@
   written (in doubt, the stricter reading).
 - Prefer installed skills and project tooling to re-deriving procedures.
 - Stay inside your working directory unless the task says otherwise. Search only it, the project
-  root and paths the charter or memory names. Never search / or the home folder (`find /`,
-  `find ~`, `grep -r ~`, `mdfind`: slow, macOS privacy prompts). Use `git ls-files | grep <name>` or a rooted
+  root, the KNOWN PATHS below (`ttp paths`) and paths the charter or memory names. Never search / or
+  the home folder (`find /`, `find ~`, `grep -r ~`, `mdfind`, os.walk: slow, macOS privacy prompts). Use `git ls-files | grep <name>` or a rooted
   `find`; rg/Grep skip what `.ignore` lists (results/, tmp/, harness state): pass those paths.
 - Disk space: `df <path>`. Never `du` from / or a home folder (network mounts stall); `du -x`
   only your own directories under a `timeout`. A scan that times out is unknown, not a blocker.

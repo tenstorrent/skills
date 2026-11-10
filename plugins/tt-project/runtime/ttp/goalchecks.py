@@ -132,6 +132,10 @@ def artifact_fresh(pattern: str, max_age_h: float | None = None, newer_than_comm
                    now: float | None = None) -> list[dict]:
     key = f"artifact_fresh:{pattern}"
     now = time.time() if now is None else now
+    from .knownpaths import glob_root_ok
+    if not glob_root_ok(pattern):   # a walk of / or the home folder: slow, and macOS privacy prompts
+        return [observation("artifact_fresh", key, None, "refused: the pattern searches / or the home folder; "
+                            "start it at the folder the artifact is in")]
     paths = [p for p in glob.glob(os.path.expanduser(pattern), recursive=True) if os.path.isfile(p)]
     if not paths:
         return [observation("artifact_fresh", key, False, "missing")]

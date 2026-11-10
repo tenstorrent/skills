@@ -12,7 +12,7 @@ from pathlib import Path
 
 from . import budget as bud
 from . import chaincap, conflictfix, ctxblock, overlap, relay, replymsg, settinghold, settled, taskfacts, tierfloor, timefmt
-from . import preempt, sidefx, specfold, streamguard
+from . import knownpaths, preempt, sidefx, specfold, streamguard
 from .db import continues_id, load_result
 from .hook import unread_update
 from .project import rebase_replace
@@ -759,7 +759,8 @@ def worker_system(p: Project, task: dict | None = None) -> str:
     the provider caches it across runs (back to back, same model). It never reads `task` (kept for
     callers), nor memory, which changes far more often: worker_memory_block, in the run's own prompt."""
     f = p.harness / "prompts" / "worker.md"
-    parts = [restrictions_block(p), split_rules(f.read_text(), project_features(p), set())[0] if f.exists() else ""]
+    parts = [restrictions_block(p), split_rules(f.read_text(), project_features(p), set())[0] if f.exists() else "",
+             knownpaths.block(p)]
     # The one copy of the restrictions (the task prompt only points back at it); a second inside the
     # charter only costs tokens.
     # The rest of the charter is mostly the coordinator's: workers get their digest of it.

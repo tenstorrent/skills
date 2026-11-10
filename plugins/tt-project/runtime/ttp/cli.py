@@ -1917,6 +1917,19 @@ def _project_name_argv(sub, argv: list[str]) -> list[str]:
     return [argv[0], p.name, *argv[1:]]
 
 
+def cmd_paths(a) -> None:
+    """The folders a run would otherwise search the drive for (knownpaths.known): `label: path` per line."""
+    from .knownpaths import known
+    p = need(a.name, sys.argv[1:]) if a.name else here()
+    if not p:
+        die("no tt-project project here; name one: `ttp paths <name>`")
+    rows = known(p)
+    if a.json:
+        print(json.dumps({k: str(v) for k, v in rows}, indent=1))
+    else:
+        print("\n".join(f"{k}: {v}" for k, v in rows))
+
+
 def cmd_status(a) -> None:
     if a.name:
         p = need(a.name, sys.argv[1:])
@@ -13000,7 +13013,7 @@ COMMAND_GROUPS = (
                   "quarantine", "machines", "runs", "logs", "doctor")),
     ("inside a run", ("note", "steer", "notify", "progress", "checks", "checks-shard", "checks-yield", "lock",
                       "host-run", "detach", "devq", "push", "land", "clip", "sandbox", "pool-wait", "pool-admit",
-                      "pool-shard", "skill", "killscan", "svcscan", "leftover-procs", "said", "hostcheck")),
+                      "pool-shard", "skill", "killscan", "svcscan", "leftover-procs", "said", "hostcheck", "paths")),
     ("probes (retry_when, start_when)", ("landed", "alive", "eta", "ci", "ack-wait", "ssh-preflight", "broker-released",
                                          "deployed", "goal", "hours")),
     ("admin", ("setup", "upgrade", "start", "stop", "restart", "adopt", "prune", "secret", "consent",
@@ -13092,20 +13105,24 @@ def main(argv: list[str] | None = None) -> None:
     for name, fn, hlp in (("connect", cmd_connect, "attach this chat to a project; ends with its checked web app link "
                            "(exit 3: the link did not answer and the line says what is broken)"),
                           ("status", cmd_status, "one-screen status"),
+                          ("paths", cmd_paths, "the project's folders (state, runs, prechecks, pushes, worktrees, "
+                           "locks, push lock, checks queue and env, ~/.tt-project, this run): look here, never "
+                           "search / or the home folder"),
                           ("logs", cmd_logs, "daemon log tail"), ("doctor", cmd_doctor, "diagnose setup"),
                           ("prune", cmd_prune, "tidy finished tasks' worktrees now (branches are kept)")):
         s = sub.add_parser(name, help=hlp)
         # `ttp status` alone, inside a project's folder (or a run), is that project's status.
-        s.add_argument("name", nargs="?" if name in ("status", "doctor") else None,
+        s.add_argument("name", nargs="?" if name in ("status", "doctor", "paths") else None,
                        help="the project" + (" (default: the one this folder or run belongs to)"
-                                             if name in ("status", "doctor") else ""))
+                                             if name in ("status", "doctor", "paths") else ""))
         if name == "connect":
             s.add_argument("--chat", help="reuse this chat id (default: a new one)")
             s.add_argument("--label", help="a name for the chat, shown in the web app")
             s.add_argument("--home-tz", help=argparse.SUPPRESS)     # the connecting workstation's zone
             s.add_argument("--home-from", help=argparse.SUPPRESS)   # and its name
+        if name in ("status", "paths"):
+            s.add_argument("--json", action="store_true", help=f"print the {name} as JSON")
         if name == "status":
-            s.add_argument("--json", action="store_true", help="print the status as JSON")
             s.add_argument("--verbose", action="store_true",
                            help="also the routine diagnostics: coordinator cache, checks lanes and slots, free shared locks, "
                                 "self-review, health and coverage when fine, host reboots, unacked upstream fixes")

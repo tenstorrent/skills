@@ -23641,3 +23641,55 @@ def test_state_shows_the_24h_task_caps_near_and_at_the_limit(env):
     p.set_config("coordinator.max_review_tasks_per_day", 0)
     assert any("review tasks (max_review_tasks_per_day): 0" in x
                for x in coord.task_cap_lines(p.db, p.config(), time.time(), p))
+
+
+def test_every_run_kind_carries_the_no_drive_search_rule_and_the_known_paths(env, monkeypatch, capsys):
+    """User msg #212: a run searched / for the push lock and popped dozens of macOS privacy dialogs.
+    Every worker, review and coordinator prompt (both coordinator modes, either provider: the worker's
+    system prompt is provider-independent) leads with the rule and the paths, from the code's own functions."""
+    import json as _json
+    from ttp import cli, coordsession, knownpaths, push
+    from ttp.coordinator import _prompt_head
+    from ttp.daemon import PRECHECKS_DIR
+    from ttp.prompts import worker_system
+    p = make(env)
+    p.set_config("delivery.push_branch", "team/feature")
+    lock = push.lock_paths(p, *push.target(p, p.root))[0]
+    block = knownpaths.block(p)
+    wants = (knownpaths.HEADER, knownpaths.RULE, str(p.state.absolute()), "state/runs/", f"state/{PRECHECKS_DIR}/",
+             f"state/{push.DETACHED}/", str(lock.relative_to(p.base)), "check-slots/ (checks queue)")
+    for w in wants:
+        assert w in block, w
+    prompts = {kind: worker_system(p, {"kind": kind, "title": "t"}) for kind in ("code", "question", "review", "work")}
+    prompts["coordinator"] = _prompt_head(p)[1]
+    for prov in ("claude", "codex"):
+        prompts[f"session/{prov}"] = coordsession.session_prompt_parts(p, prov)[0]
+    for name, text in prompts.items():
+        assert block in text, name
+    # The rule names each walk the user's popups came from.
+    for walk in ("find", "du", "grep -r", "rg", "mdfind", "os.walk", "rglob", "glob **"):
+        assert walk in knownpaths.RULE, walk
+    # `ttp paths` prints the very lock file `ttp push` takes, and the run's own folder.
+    monkeypatch.setenv("TTP_RUN_DIR", str(p.runs / "7"))
+    cli.main(["paths", p.name, "--json"])
+    got = _json.loads(capsys.readouterr().out)
+    assert got["push lock"] == str(lock.absolute()) and got["this run"] == str((p.runs / "7").absolute())
+    assert got["prechecks"] == str((p.state / PRECHECKS_DIR).absolute()) and got["state"] == str(p.state.absolute())
+    cli.main(["paths", p.name])
+    assert f"push lock: {lock.absolute()}" in capsys.readouterr().out.splitlines()
+
+
+def test_runtime_walks_never_start_at_the_drive_root_or_the_home_folder(tmp_path, monkeypatch):
+    from ttp import goalchecks
+    from ttp.knownpaths import glob_root_ok, walk_root_ok
+    home = tmp_path / "home"
+    (home / "proj").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    assert not walk_root_ok("/") and not walk_root_ok(home) and not walk_root_ok(tmp_path)
+    assert walk_root_ok(home / "proj")
+    for bad in ("~/**/x.log", "/**/a", "~/*/x", "/*/x"):
+        assert not glob_root_ok(bad), bad
+    for ok in ("~/proj/**/x.log", "~/*.log", str(tmp_path / "*" / "a"), "results/**/x.json"):
+        assert glob_root_ok(ok), ok
+    [o] = goalchecks.artifact_fresh("~/**/x.log")
+    assert o.get("error") is True and "refused" in o["text"], o

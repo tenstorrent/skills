@@ -575,9 +575,11 @@ def session_prompt_parts(p, provider: str | None = None) -> tuple[str, str]:
     Rendered live from the charter, the prompt files and the tool state only, so two wakes with an
     unchanged charter and tool state get the same bytes."""
     from .coordinator import _prompt_head
+    from .knownpaths import block
     from .prompts import coordinator_session_role, session_tools
     rules, _, charter = _prompt_head(p)
-    return f"{rules}{coordinator_session_role(p, session_tools(p, provider))}", f"# CHARTER\n{charter}\n"
+    role = coordinator_session_role(p, session_tools(p, provider)).rstrip()
+    return f"{rules}{role}\n\n{block(p)}", f"# CHARTER\n{charter}\n"
 
 
 def _note_path(p, session_id: str):

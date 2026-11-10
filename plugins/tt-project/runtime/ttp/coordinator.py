@@ -797,8 +797,9 @@ PROMPT_MAX_AGE_S = 4 * 3600
 
 def _prompt_head(p: Project) -> tuple[str, str, str]:
     """The system prompt's parts other than memory: restrictions, role, charter."""
+    from .knownpaths import block
     from .prompts import charter_restrictions, charter_without_restrictions, coordinator_role, restrictions_block
-    role = coordinator_role(p)
+    role = f"{coordinator_role(p).rstrip()}\n\n{block(p)}"
     charter = p.charter_path.read_text() if p.charter_path.exists() else "(no charter yet)"
     rules = restrictions_block(p, advisory=False)   # the unsourced ones: standing_lines
     if rules:

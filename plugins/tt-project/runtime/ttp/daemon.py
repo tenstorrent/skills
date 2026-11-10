@@ -870,8 +870,8 @@ def network_mounts() -> list[Path]:
 def _scan_ok(d: Path, nets: list[Path]) -> bool:
     """A recursive scan of `d` stays on its own data: never / or a home folder (or above one),
     and no network or FUSE mount at or below it."""
-    home = Path(os.path.expanduser("~"))
-    if d == Path(d.anchor) or d == home or d in home.parents:
+    from .knownpaths import walk_root_ok
+    if not walk_root_ok(d):
         return False
     return not any(m == d or d in m.parents or m in d.parents for m in nets)
 
