@@ -710,6 +710,18 @@ def _read_inherited(p: Project, task: dict, entries: list[dict], tip: str, now: 
     return out
 
 
+def head_row(db, head: str) -> dict | None:
+    """The push queue's latest row for exactly commit `head` that it holds (OPEN_ROWS) or pushed or landed
+    (LANDED_OUTCOMES): its batch runs, or ran and passed, the project's checks on it, so a review precheck
+    of that head (daemon.Daemon._precheck) would only repeat them. None for any other head or status
+    (conflict, check_failed, refused, requeued, cancelled)."""
+    if not head:
+        return None
+    want = OPEN_ROWS + LANDED_OUTCOMES
+    return db.one(f"SELECT id, status, batch FROM push_queue WHERE head=? AND status IN ({','.join('?' * len(want))}) "
+                  "ORDER BY id DESC LIMIT 1", (head, *want))
+
+
 def carried(p: Project, task: dict, head: str, cfg: dict | None = None) -> dict[int, list[str]]:
     """What check_approval would refuse in a head the daemon is about to queue a review of: {task id:
     ["<short sha> <subject>", ...]} of the commits `head` carries from other tasks whose latest review

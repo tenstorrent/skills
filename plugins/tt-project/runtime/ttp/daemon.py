@@ -434,6 +434,7 @@ def precheck_run_id(out: Path) -> str:
     so labels built from it (checkcap.label) name the folder, as checklane.open_precheck reads them."""
     return f"precheck-{Path(out).name}"
 PRECHECK_HOLD_S, PRECHECK_KEEP_S = 3600, 7 * 86400
+PUSHQ_VERDICT = "pushq.json"   # in a precheck folder whose head the push queue held or pushed (_queue_verdict)
 
 
 def precheck_hold_s(state: Path, now: float | None = None) -> float:
@@ -19211,6 +19212,10 @@ class Daemon:
                        "Its pass is recorded, so `ttp checks` there reuses it. ")
                     + "The push queue runs the full checks again on the commit it pushes: run only focused tests "
                       "of what changed.")
+        if (checks / PUSHQ_VERDICT).exists():
+            return (f"The push queue already holds or pushed head {head}, so the daemon started no checks run for "
+                    f"this review: `ttp checks --result {checks}` prints the queue's verdict. The push queue runs "
+                    f"the full checks on the commit it pushes: run only focused tests of what changed.")
         return (f"The daemon started the project's checks (`ttp checks`) on head {head} in "
                 f"{self.p.worktrees / ('t' + str(task['id']))} as #{task['id']} finished. This review waits for them "
                 f"only while they run on a host, at most a typical checks run, and an urgent or owed review "
@@ -19363,9 +19368,34 @@ class Daemon:
         base = self.p.state / PRECHECKS_DIR
         self._prune_prechecks(base)
         out = base / f"t{task['id']}-{full[:12]}"
+        if row := pushq.head_row(self.p.db, full):
+            return self._queue_verdict(task, full, out, row)
         if not self._start_checks(path, out, precheck_run_id(out), task["id"], []):
             return None
         log(self.p, f"task {task['id']}: started the checks on {full[:12]} for its review ({out})")
+        return out
+
+    def _queue_verdict(self, task: dict, full: str, out: Path, row: dict) -> Path:
+        """_precheck on a head the push queue holds or pushed (pushq.head_row, `row`): no checks start, as
+        its batch runs them on the commit it pushes. Folder `out` records the queue's verdict as an ended
+        run, so `ttp checks --result` prints it: exit 0 once a batch pushed or landed the head, 75 (not run
+        here) while the queue holds it. A precheck still running there is left to end itself
+        (cli._QueuedHead stops its wait)."""
+        from .cli import CHECKS_OUT, CHECKS_RC, _checks_alive, _read_checks_pid
+        if _checks_alive(_read_checks_pid(out)):
+            return out
+        done = row["status"] in pushq.LANDED_OUTCOMES
+        said = (f"ttp checks: not run: the push queue's row {row['id']} for head {full[:12]} is {row['status']}"
+                + (f" (batch {row['batch']})" if row.get("batch") else "")
+                + (": its batch passed the project's checks on it" if done else
+                   ": its batch runs the project's checks on the commit it pushes") + "\n")
+        out.mkdir(parents=True, exist_ok=True)
+        (out / "check_failure.json").unlink(missing_ok=True)   # an earlier run's failure answers nothing here
+        (out / CHECKS_OUT).write_text(said)
+        (out / "checks.log").write_text(said)
+        (out / PUSHQ_VERDICT).write_text(json.dumps({**row, "head": full}))
+        (out / CHECKS_RC).write_text("0\n" if done else "75\n")
+        log(self.p, f"task {task['id']}: no checks started on {full[:12]} for its review: {said.strip()}")
         return out
 
     def _own_pass(self, task: dict, full: str, path: Path, checks: list) -> dict | None:

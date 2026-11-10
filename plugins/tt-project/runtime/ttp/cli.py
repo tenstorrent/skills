@@ -5688,6 +5688,8 @@ def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: boo
     except (ValueError, KeyError, TypeError):
         lane_wait = {"s": 0.0, "pool": 0.0, "at": None}
     moved = _TaskEnded(p, run_dir, moved)   # and so does its task ending with nobody to adopt them
+    if p is not None and os.environ.get("TTP_RUN_ID", "").startswith("precheck-"):
+        moved.queued = _QueuedHead(p, head)   # ... as does its review approving the head (a review precheck)
     while True:
         limit = max(0.0, checkcap.FOREGROUND_WAIT_S - (time.time() - start)) if foreground and p else None
         spill_cfg = p.config() if spill_to else {}
@@ -5811,6 +5813,29 @@ def _wrap_lane_after(cfg: dict) -> bool:
         return False
 
 
+class _QueuedHead:
+    """Asked while a review precheck (daemon.precheck_run_id) of `head` waits for a slot: "" until the
+    push queue holds or pushed exactly `head` (pushq.head_row), then why the run is dropped: its review
+    approved the head and the queue's batch runs the checks on it, so this run would only repeat them.
+    The project's database is asked at most every POLL_S seconds; an unreadable one ends nothing."""
+    POLL_S = 30.0
+
+    def __init__(self, p: Project, head: str):
+        self.p, self.head, self.at = p, head, 0.0
+
+    def __call__(self) -> str:
+        if not self.head or time.time() - self.at < self.POLL_S:
+            return ""
+        self.at = time.time()
+        from . import pushq
+        try:
+            row = pushq.head_row(self.p.db, self.head)
+        except Exception:
+            return ""
+        return (f"the push queue's row {row['id']} for head {self.head[:12]} is {row['status']}: its batch runs "
+                "the project's checks on it, so this review precheck would only repeat them") if row else ""
+
+
 class _HeadMoved:
     """Asked while checks of `head` wait for a slot: "" while the branch checked out at `top` still points
     at `head`, else why the run is dropped (its task replaced the head it was queued for, so its result
@@ -5820,11 +5845,13 @@ class _HeadMoved:
 
     def __init__(self, top: str, head: str):
         self.top, self.head, self.at = top, head, 0.0
-        self.ref = ""
+        self.ref, self.queued = "", None   # queued: a _QueuedHead asked first
         if top and head and _git_out(top, "rev-parse", "HEAD") == head:
             self.ref = _git_out(top, "symbolic-ref", "-q", "HEAD")
 
     def __call__(self) -> str:
+        if self.queued and (why := self.queued()):
+            return why
         if not self.ref or time.time() - self.at < self.HEAD_MOVED_S:
             return ""
         self.at = time.time()

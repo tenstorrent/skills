@@ -14445,6 +14445,82 @@ def _review_of_own_checks(env, monkeypatch, record):
     return p, tid, rev, started, _git_out(p.root, "rev-parse", branch).strip()
 
 
+@pytest.mark.parametrize("status,rc", [("approved", "75"), ("batched", "75"), ("held", "75"), ("landed", "0"),
+                                       ("pushed", "0"), ("check_failed", None), ("refused", None)])
+def test_a_review_precheck_of_a_head_the_push_queue_holds_or_pushed_starts_no_checks_and_shows_its_verdict(
+        env, monkeypatch, capsys, status, rc):
+    """Upstream note 440efdbbb71a1171: the daemon started a full `ttp checks` on a code task's head that the
+    push queue already held, so one head got two full suites. A head the queue holds (approved, batched,
+    held) or pushed starts none: its precheck folder records the queue's verdict, which `ttp checks
+    --result` prints (exit 0 once pushed, 75 while held), and the review's spec names it. A head the queue
+    sent back (check_failed, refused) starts the checks as before."""
+    from ttp import cli
+    from ttp.daemon import PRECHECK_LABEL, PRECHECKS_DIR, PUSHQ_VERDICT
+
+    def record(p, tid, head, path):
+        p.db.x("INSERT INTO push_queue(task,branch,head,target,status,batch,created,updated) VALUES(?,?,?,?,?,?,?,?)",
+               (tid, "b", head, "origin/work", status, "b7" if status != "approved" else None, time.time(), time.time()))
+    p, tid, rev, started, head = _review_of_own_checks(env, monkeypatch, record)
+    out = p.state / PRECHECKS_DIR / f"t{tid}-{head[:12]}"
+    assert f"{PRECHECK_LABEL}{out.name}" in json.loads(rev["labels"])
+    if rc is None:
+        assert started == [out] and not (out / PUSHQ_VERDICT).exists(), status
+        return
+    assert not started, "a full checks run started on a head the push queue already holds or pushed"
+    assert (out / cli.CHECKS_RC).read_text().strip() == rc
+    assert "already holds or pushed head" in rev["spec"] and f"ttp checks --result {out}" in rev["spec"]
+    assert cli._checks_result(out) == 0
+    said = capsys.readouterr().out
+    assert f"is {status}" in said and head[:12] in said and f"finished with exit code {rc}" in said, said
+    from ttp.daemon import Daemon, precheck_holds
+    assert not precheck_holds(p.state, p.db.task(rev["id"]), time.time()), "the review waits for nothing"
+    assert (cli._checks_passed(out) == 0) == (rc == "0")
+
+
+def test_a_waiting_review_precheck_ends_once_the_push_queue_holds_its_head(env, monkeypatch):
+    """Upstream note 440efdbbb71a1171: a review precheck still waiting for a slot kept waiting after its
+    review approved the head. cli._QueuedHead (set on a review precheck's _HeadMoved) names why the wait
+    ends once the push queue holds or pushed exactly that head, asking the database at most every POLL_S;
+    a sent-back row or another head ends nothing."""
+    from ttp import cli
+    p, head = make(env), "a" * 40
+    moved = cli._HeadMoved("", head)
+    moved.queued = cli._QueuedHead(p, head)
+    assert moved() == ""
+    add = lambda h, st: p.db.x("INSERT INTO push_queue(task,branch,head,target,status,created,updated) "
+                               "VALUES(1,'b',?,'origin/work',?,?,?)", (h, st, time.time(), time.time()))
+    add(head, "check_failed")
+    add("b" * 40, "approved")
+    moved.queued.at = 0
+    assert moved() == ""
+    add(head, "approved")
+    assert moved() == "", "asked again within POLL_S: the database is not read"
+    moved.queued.at = 0
+    why = moved()
+    assert head[:12] in why and "approved" in why and "review precheck" in why, why
+
+
+@pytest.mark.parametrize("run_id", ["precheck-t5-aaaaaaaaaaaa", "15"])
+def test_only_a_review_precheck_s_checks_wait_asks_the_push_queue_for_its_head(env, monkeypatch, tmp_path, run_id):
+    """The wait of `ttp checks` (cli._checks_slot) ends on a queued head only for a review precheck
+    (TTP_RUN_ID precheck-...): a code task's own checks, or the push batch's on its tip, keep waiting."""
+    from ttp import cli
+
+    class Seen(Exception):
+        pass
+
+    def take(*a, moved=None, **kw):
+        raise Seen(moved)
+    monkeypatch.setattr(cli, "_checks_slot_take", take)
+    monkeypatch.setenv("TTP_RUN_ID", run_id)
+    p = make(env)
+    with pytest.raises(Seen) as e:
+        cli._checks_slot(p, tmp_path, io.StringIO(), "a" * 40, detached=True)
+    moved = e.value.args[0]
+    assert isinstance(moved, cli._HeadMoved)
+    assert isinstance(moved.queued, cli._QueuedHead) == run_id.startswith("precheck-")
+
+
 @pytest.mark.parametrize("excused", [False, True])
 def test_a_review_of_a_head_its_code_task_passed_starts_no_checks_and_cites_that_run(env, monkeypatch, excused):
     """Review pre-checks ran the 40-minute suite again on the head the code task had just passed, one
