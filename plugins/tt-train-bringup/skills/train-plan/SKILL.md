@@ -48,6 +48,30 @@ FPU peak. These three ops are the loop's first candidates; "ttnn matmul, exists"
 When the layout of section 5 is multi-chip, list the per-rank shard shapes next to the full shapes;
 the composite harness and the loop's kernels work on the shard shapes.
 
+### Multichip reuse map
+
+On a multi-chip layout the inventory also has a reuse map of tt-train's own multichip pieces, so
+the first implementation starts from what exists instead of re-deriving it. For each piece, one
+row: the source path at the pinned revision, `used`, `extended` (and how) or `not used`, and why.
+At least:
+
+- the mesh API and DP gradient sync: `ttml.open_device_mesh` / `ttml.Mesh` / `ttml.sync_gradients`
+  (`sources/ttml/ttml/_mesh.py`) and the C++ side in `sources/ttml/core/distributed/`;
+- the collectives with autograd: `ttml.ops.distributed` (all-reduce, all-gather, reduce-scatter,
+  broadcast) and the raw `ttml.core.distributed` ones;
+- tensor sharding helpers: `sources/ttml/ttml/sharding.py` and the mesh mappers;
+- the TP Llama: `sources/ttml/models/distributed/llama.cpp` (column/row-parallel linears, the
+  head and vocabulary split) and its Python counterparts under `sources/ttml/ttml/models/`, as a
+  reference for the split even where the model itself is written fresh;
+- pipeline parallel: `sources/ttml/models/distributed/pipeline_parallel_llama.cpp`;
+- FSDP: `sources/ttml/ttml/fsdp.py` (`fully_shard`), with whether the plan's memory budget needs it;
+- the worked examples: `sources/examples/linear_regression_tp_dp`, `linear_regression_ddp`,
+  `qwen3` (TP with LoRA), `lora_llama`, `gsm8k_finetune`, and the ready-made training configs
+  and descriptors under `configs/` (for example `training_llama8b_tp4.yaml`, `configs/mgd/`).
+
+A piece marked `not used` needs a concrete reason (a shape it does not support, a missing
+backward, a numerics difference); "we wrote our own" is not one.
+
 ## 2. Freeze map
 
 For every parameter and every module input, record whether a gradient is needed. Full fine-tuning:
