@@ -3934,11 +3934,16 @@ def test_import_only_failure_reruns_once(env, tmp_path, monkeypatch):
     import threading
     from ttp import checkspill, cli
     p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a", "check-host-b"])
-    script = tmp_path / "check.sh"
-    script.write_text('case "$(pwd)" in */ttp-check.*)\n'
-                      "  printf 'ERROR collecting tests/test_x.py\\nE   ModuleNotFoundError: No module named '"
-                      "\\''nosuchpkg'\\''\\n'; exit 2;;\nesac\n")
-    cmd = f"sh {script}"
+    # The script is part of the commit, named by a relative path: a path of this machine (tmp_path is one,
+    # outside /dev/shm on Linux) would keep the check here (checkspill.host_path), never trying a spill host.
+    (repo / "check.sh").write_text('case "$(pwd)" in */ttp-check.*)\n'
+                                   "  printf 'ERROR collecting tests/test_x.py\\nE   ModuleNotFoundError: No module named '"
+                                   "\\''nosuchpkg'\\''\\n'; exit 2;;\nesac\n")
+    git = ["git", "-C", str(repo), "-c", "user.email=t@example.com", "-c", "user.name=t"]
+    subprocess.run([*git, "add", "check.sh"], check=True)
+    subprocess.run([*git, "commit", "-qm", "check"], check=True)
+    cmd = "sh check.sh"
+    assert not checkspill.host_path(cmd)
     p.set_config("delivery.push_checks", [cmd])
     lane = _spill_lane(p, repo)
     threading.Timer(6, lane.close).start()
