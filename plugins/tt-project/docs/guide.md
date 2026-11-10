@@ -1587,6 +1587,14 @@ session and stateless coordinators on every provider.
   other platforms never hold one. `ttp status` and
   the web app say when it is held, or why not while there is work, and say "the lid is closed: work
   pauses while the Mac sleeps" while a closed lid will sleep it.
+- Every ssh a project starts (probes, heal checks, checks-host runs, the daemon's own calls, and
+  workers' ssh and git over ssh) shares one connection per host for 10 minutes, so an ssh agent
+  that signs each new connection signs once per host, not once per command. The harness's `bin/ssh`
+  runs the real ssh with OpenSSH multiplexing (ControlMaster=auto, ControlPersist=600) and keeps
+  the sockets in `~/.tt-project/cm` (mode 700). Your ssh folder and config are never read or
+  changed, and `-F`, ProxyJump and BatchMode work as before. A call that sets its own sharing or
+  forwards ports is left as it is, and a shared connection that fails before the command starts
+  is retried once over a plain one. Turn it off with `ttp config <name> ssh.reuse false`.
 - A shared device or machine is taken per command, through its own queue (for example a device
   broker) or `ttp lock <resource> -- <command>`, so the rest of each task runs in parallel. A task
   marked exclusive holds the resource's lock for its whole run; while it waits for a slot, new
