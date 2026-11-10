@@ -5,10 +5,14 @@ loopback bridge (chatbridge.py). Off until a project configures `providers.chat`
 to it; the key stays in the `ttp secret endpoint <alias>` store."""
 from __future__ import annotations
 
+import re
+
 from ..project import secrets_path
 from . import register
 from .base import Provider
 from .claude import Claude
+
+LOGIN_CHECK_TIMEOUT_S = 5   # check_logins asks it in the daemon's loop
 
 
 @register
@@ -63,7 +67,31 @@ class Chat(Claude):
         return [str(secrets_path())]   # a key saved again ends a logged-out pause
 
     def login_check(self) -> bool | None:
-        return None   # the endpoint is asked by a run, through the bridge
+        """Model-free, given the project's providers.chat settings (`entry`): False while no key is saved
+        for its endpoint alias (or the key's URL is not providers.chat.base_url, which the bridge
+        refuses), or the endpoint's GET /models refuses the key (HTTP 401 or 403); True once it takes
+        it. None without settings, while the store is unreadable or the endpoint does not answer: a run
+        then checks. A logged-out breaker so never starts a run that fails at launch for want of a key."""
+        if self.entry is None:
+            return None
+        from .. import endpoint
+        from ..project import SecretsUnreadable
+        alias = str(self.entry.get("endpoint") or "")
+        try:
+            got = endpoint.credentials(alias) if endpoint.ALIAS_RE.match(alias) else None
+        except SecretsUnreadable:
+            return None
+        if got is None:
+            return False
+        try:
+            if self.entry.get("base_url") and endpoint.base_url(self.entry["base_url"]) != endpoint.base_url(got.url):
+                return False
+        except ValueError:
+            return False
+        ok, msg = endpoint.verify(got.url, got.key, timeout=LOGIN_CHECK_TIMEOUT_S)
+        if ok:
+            return True
+        return False if re.match(r"HTTP (401|403)\b", msg) else None
 
     def login_state(self, cfg: dict | None = None) -> bool | None:
         # No key saved for the configured alias, or one saved for another URL: the bridge refuses every

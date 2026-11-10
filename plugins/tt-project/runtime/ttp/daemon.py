@@ -8555,6 +8555,7 @@ class Daemon:
                 continue
             try:
                 agent = get_provider(prov)
+                agent.entry = dict((self.cfg.get("providers") or {}).get(prov) or {})   # a login check may need it
                 stamp = agent.credentials_stamp()
             except Exception:
                 agent, stamp = None, ""

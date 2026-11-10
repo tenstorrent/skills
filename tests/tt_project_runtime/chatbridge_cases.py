@@ -494,6 +494,52 @@ def test_a_chat_pause_without_a_saved_key_starts_no_probe_runs(env, monkeypatch)
     assert not d._logged_out("chat")
 
 
+def test_a_chat_logout_with_no_saved_key_starts_no_probe_runs_and_routes_to_core(env, monkeypatch):
+    # A breaker opened by 'no key saved' used to send one real run every AUTH_PROBE_S to find out (the
+    # chat provider had no login check): each failed at launch again. The check is model-free now.
+    from ttp import alerts, endpoint, project
+    from ttp.daemon import Daemon
+    from ttp.providers import get_provider
+    monkeypatch.setattr(project, "HOME_DIR", env["tmp"] / "secrets-home")
+    assert get_provider("chat").login_check() is None, "without the project's settings it cannot tell"
+    p = make(env)
+    _chat_config(p)
+    d = Daemon(p.base)
+    monkeypatch.setattr(d, "observe", lambda *a, **k: None)
+    for _ in range(2):   # the second failure (a run that slipped through) raises no second alert
+        tid = p.db.add_task("build", "", kind="work", tier="standard", priority=3, budget_usd=8.0, labels=[])
+        p.db.update_task(tid, status="running")
+        rid = p.db.x("INSERT INTO runs(task,role,provider,model,started,status,boot_id) "
+                     "VALUES(?,'worker','chat','org/Base-Model-2',?,'running',?)", (tid, time.time() - 5, d.boot))
+        rd = p.runs / str(rid)
+        rd.mkdir(parents=True)
+        p.db.x("UPDATE runs SET dir=? WHERE id=?", (str(rd), rid))
+        d.finish_run(p.db.one("SELECT * FROM runs WHERE id=?", (rid,)),
+                     {"rc": None, "started": time.time() - 5, "ended": time.time(), "launched": False,
+                      "launch_error": "could not start the agent: chat bridge: failed to authenticate: no key "
+                                      "saved for endpoint 'cloud'", "launch_auth": True})
+    assert len(p.db.q("SELECT id FROM messages WHERE ref='auth:chat'")) == 1, "one alert per logout"
+
+    def check(verify=None):
+        if verify:
+            monkeypatch.setattr(endpoint, "verify", lambda url, key, timeout=0: verify)
+        p.db.set_kv(alerts.BREAKER + "chat", {**alerts.breaker(p.db, "chat"), "next_check": 0})
+        d.check_logins()
+        return alerts.breaker(p.db, "chat")
+
+    far = time.time() + 10 * 86400
+    rec = check()
+    assert rec and rec.get("probe") is False and not d._may_probe("chat", far), "no key: no probe run, ever"
+    assert d._no_room("chat", {"now": time.time(), "busy": {}}) == "auth", "routed work falls back to core"
+    endpoint.save("other", "https://api.example.com/v1", _CB_KEY, True, "HTTP 200")
+    assert check() and not d._may_probe("chat", far), "a key for another alias does not end it"
+    endpoint.save("cloud", "https://api.example.com/v1", _CB_KEY, True, "HTTP 200")
+    assert check((False, "HTTP 401 Unauthorized")) and not d._may_probe("chat", far), "a refused key keeps it"
+    rec = check((False, "cannot reach the endpoint: timed out"))
+    assert rec and rec.get("probe") is True, "an endpoint that does not answer: one run checks, as before"
+    assert check((True, "HTTP 200")) is None and not d._logged_out("chat"), "a key the endpoint takes ends it"
+
+
 # Upstream model ids as chat endpoints name them: '/', '.', ':', '-', '_', '@' and uppercase.
 CHAT_MODELS = ("org-name/Model-V2.5-32B-Instruct:free", "accounts/acme/models/model_v3p1@2026-01", "Big.Model:Q4_K_M")
 

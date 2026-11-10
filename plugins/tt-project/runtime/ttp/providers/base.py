@@ -235,6 +235,7 @@ class Provider:
     model = ""                       # the run's model and the project's price rows, for providers
     prices: dict = {}                # whose cost is estimated from tokens (see use())
     billing = "auto"                 # the project's providers.<name>.billing (billing.declared)
+    entry: dict | None = None        # the project's providers.<name> settings, for a login check that needs them
     # Read-only turns run from scratch_dir(), not the project: this agent otherwise loads the
     # project's AGENTS.md or rules from its working directory into a decision-only turn.
     isolate_read_only = False
