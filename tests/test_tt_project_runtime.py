@@ -26814,18 +26814,18 @@ def test_the_light_tier_runs_a_cheaper_model_that_pins_config_and_retries_move_o
     assert run("standard") == ("opus", "high")
 
 
-def test_spending_caps_default_to_100_a_day_200_a_week_and_200_global(env, tmp_path):
+def test_spending_caps_default_to_100_a_day_700_a_week_and_200_global(env, tmp_path):
     """The documented defaults, and the lines `ttp setup` prints about them and about Jev."""
     from ttp.project import DEFAULT_CONFIG
     from ttp import cli
     b = DEFAULT_CONFIG["budget"]
-    assert (b["daily_usd"], b["weekly_usd"], b["global_daily_usd"]) == (100.0, 200.0, 200.0)
+    assert (b["daily_usd"], b["weekly_usd"], b["global_daily_usd"]) == (100.0, 700.0, 200.0)
     assert b["reserve_pct"] == 10 and b["reset_credits_auto"] is True
     r = subprocess.run([sys.executable, str(TTP), "setup", "--bin-dir", str(tmp_path / "bin")],
                        capture_output=True, text=True, timeout=60)
     assert r.returncode == 0, r.stderr
     out = " ".join(r.stdout.split())
-    assert "$100/day and $200/week per project, $200/day across all projects" in out
+    assert "$100/day and $700/week per project, $200/day across all projects" in out
     assert "used up to 90% of each window (budget.reserve_pct 10)" in out and "only that 10% is left" in out
     assert "free Codex window resets: used automatically, at most one per window" in out
     assert "Jev (optional add-on): off. It turns on only once you save a key" in out

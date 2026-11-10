@@ -148,8 +148,10 @@ coordinator with that evidence.
   the line holds new starts back; it clears by itself when the window resets. Budget alerts come
   only for what only you can clear (a dollar cap you set, funds), once it still holds new work two
   minutes on; they are withdrawn once it no longer does.
-- Usage-billed accounts: $100 per 24 hours and $200 per 7 days per project by default
-  (`budget.daily_usd`, `budget.weekly_usd`). With `budget.day_start` set, the daily cap counts
+- Usage-billed accounts: $100 per 24 hours per project by default (`budget.daily_usd`); the
+  7-day cap (`budget.weekly_usd`), when unset, is 7 times the daily cap in force ($700 by default),
+  so it never stops work before the daily cap would. `ttp config` and `ttp setup` warn when a weekly
+  cap you set is below the daily cap. With `budget.day_start` set, the daily cap counts
   the budget day instead of the last 24 hours. A new run
   starts only if its budget fits in what is left of both caps, each over that same window. At
   `budget.cap_yellow_pct` (60 by default) of a cap the gate turns yellow and halves the worker slots. A plan account whose successful

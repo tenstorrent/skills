@@ -58,7 +58,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "budget": {
         "reserve_pct": 10,              # plan windows: never take the account past 100 - reserve
         "daily_usd": 100.0,             # applied when the plan reports no window (usage-billed)
-        "weekly_usd": 200.0,
+        # Unset: WEEKS_OF_DAYS times the daily cap in force (weekly_default), never below it.
+        "weekly_usd": 700.0,
         # Usage-billed: all of the account's tt-project spend today, every project on every machine
         # tt-project can see (globalcap.py), stops new work at this many $ (0 = off). The day starts at
         # day_start ("HH:MM"; "" = rolling 24 h) in timezone (IANA name, never the host's own zone; "" =
@@ -3056,6 +3057,33 @@ HOST_WIDE_KEYS = {"checks.host_max", "route.host_max", "checks.spill_hosts", "ch
                   "checks.push_priority_wait_s"}
 
 
+WEEKS_OF_DAYS = 7   # an unset budget.weekly_usd: this many days at the daily cap, so it never stops work first
+
+
+def weekly_default(b: Any, *layers: Any) -> None:
+    """Fill an unset budget.weekly_usd in the merged budget `b` with WEEKS_OF_DAYS times its daily cap:
+    a fixed default below a raised daily cap stopped ordered work within hours. A weekly cap set in any
+    of `layers` (account settings, project.json) is kept as it is (config provenance)."""
+    if not isinstance(b, dict) or any(isinstance(x, dict) and x.get("weekly_usd") not in (None, "") for x in layers):
+        return
+    try:
+        b["weekly_usd"] = round(WEEKS_OF_DAYS * float(b.get("daily_usd") or 0), 2)
+    except (TypeError, ValueError):
+        pass
+
+
+def weekly_below_daily(b: Any) -> str:
+    """A warning when the merged budget's weekly cap is set below its daily cap ('' when not)."""
+    try:
+        day, week = float((b or {}).get("daily_usd") or 0), float((b or {}).get("weekly_usd") or 0)
+    except (TypeError, ValueError, AttributeError):
+        return ""
+    if day > 0 and 0 < week < day:
+        return (f"budget.weekly_usd ${week:g} is below budget.daily_usd ${day:g}: the weekly cap stops work "
+                f"before a day's spend is reached; raise it or remove it (unset: {WEEKS_OF_DAYS} x daily)")
+    return ""
+
+
 def layered(raw: dict) -> dict:
     """A project's settings: the defaults, then the account-level ones, then its project.json (a section
     holding no object read as absent: bad_sections). budget.timezone set nowhere is the project's home zone (UTC without one)."""
@@ -3070,6 +3098,7 @@ def layered(raw: dict) -> dict:
             else:
                 cfg[sec].pop(key, None)
     _chat_inherits(cfg)
+    weekly_default(cfg.get("budget"), account.get("budget"), raw.get("budget"))
     if isinstance(cfg.get("budget"), dict) and not cfg["budget"].get("timezone"):
         from .timefmt import zone_name
         cfg["budget"]["timezone"] = zone_name(raw)

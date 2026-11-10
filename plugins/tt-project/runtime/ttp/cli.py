@@ -792,6 +792,9 @@ def defaults_lines(budget: dict, jev_key: bool, name: str = "<name>") -> list[st
     else:
         out.append("Jev (optional add-on): off. It turns on only once you save a key (`ttp secret jev`), and then "
                    "sends log and alert text to an outside paid service")
+    from .project import weekly_below_daily
+    if warn := weekly_below_daily(budget):
+        out.append(f"warning: {warn}")
     return out
 
 
@@ -10489,6 +10492,13 @@ def cmd_account_config(key: str, value: str | None) -> None:
     was = f"; was {json.dumps(old)}" if key in ACCOUNT_USER_ONLY else ""
     print(f"{key} = {json.dumps(val)} (account-level, every project on this machine{was})" if val != ""
           else f"{key} removed (account-level{was}); the default applies")
+    if key in ("budget.daily_usd", "budget.weekly_usd"):
+        from .project import DEFAULT_CONFIG, weekly_below_daily, weekly_default
+        acct = load_account_settings().get("budget") or {}
+        b = deep_merge(DEFAULT_CONFIG["budget"], acct)
+        weekly_default(b, acct)
+        if warn := weekly_below_daily(b):
+            print(f"warning: {warn} (account-level)", file=sys.stderr)
     if key in ACCOUNT_USER_ONLY:   # who changed the account's pool or overflow, when (and slurmcheck's re-arm)
         _log_account_change(key, old, None if val == "" else val)
     if key == rankfresh.KEY:   # the ranking's change log, beside the refresher's own changes
@@ -10699,6 +10709,10 @@ def cmd_config(a) -> None:
         # one value; a list- or object-typed key given another form (key_type_problem)
         die(str(e))
     print(f"{a.key} = {json.dumps(val)}")
+    if a.key in ("budget", "budget.daily_usd", "budget.weekly_usd"):
+        from .project import weekly_below_daily
+        if warn := weekly_below_daily(p.config().get("budget")):
+            print(f"warning: {warn}", file=sys.stderr)
 
 
 def _config_remove(p, key: str, run) -> None:
@@ -11095,7 +11109,9 @@ def stale_install_warning(cwd: Path | None = None) -> str:
 def new_project_defaults_lines() -> list[str]:
     """The defaults a new project gets, with the account-level budget settings applied."""
     from .project import DEFAULT_CONFIG
+    from .project import weekly_default
     budget = deep_merge(DEFAULT_CONFIG["budget"], load_account_settings().get("budget") or {})
+    weekly_default(budget, load_account_settings().get("budget"))
     return defaults_lines(budget, bool((load_secrets().get("jev") or {}).get("key")))
 
 
