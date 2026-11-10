@@ -9891,6 +9891,9 @@ class Daemon:
         self._selfwatch_breach = bool(snap["breach"])
         db = self.p.db
         snap["stopped"] = (db.kv(selfwatch.KV) or {}).get("stopped")
+        if snap.pop("churn_new", False):
+            log(self.p, f"self-watch: unattributed churn, {snap['churn_s']:g} new processes/s on the host that this "
+                        "project's own counted processes do not explain; reported, not acted on")
         for r in snap.pop("runaway"):
             numbers = (f"{r['procs']} processes, {r['spawn_s']:g} new/s, {r['cpu']:g} cores, "
                        f"{r['rss'] / 2**30:.1f} GB; host load {snap['host'].get('load1')} on {snap['host']['cores']} cores")
