@@ -483,10 +483,13 @@ def test_a_pause_after_the_owner_was_paged_stops_the_next_step_and_its_undeliver
 def test_an_overdue_change_on_an_unpaused_machine_escalates_to_the_user(env):
     p, ml = _outage_box(env)
     t0 = time.time()
-    ml.add_change("box-a", "a scratch dir for a repro", "rm -rf /tmp/scratch", "gamma", expires="1h", now=t0)
+    ml.add_change("box-a", "stopped the recovery watchdog", "systemctl start watchdog", "gamma", expires="1h", now=t0)
     due = t0 + 3601
     got = [_change_pages(ml, due + k * ml.REPAGE_S) for k in range(4)]
-    assert got == [[("gamma", 0)], [("owner", 1)], [("beta", 2)], [(ml.USER, 3)]]
+    assert got == [[("gamma", 0)], [("owner", 1)], [("beta", 2)], [(ml.USER, 3)]]   # risky: the user at the end
+    ml.add_change("box-a", "a scratch dir for a repro", "rm -rf /tmp/scratch", "gamma", expires="1h", now=t0)
+    got = [_change_pages(ml, due + k * ml.REPAGE_S) for k in range(6)]
+    assert (ml.USER, 3) not in [x for g in got for x in g]   # harmless: never the user
 
 
 def _expired(ml, n, by="alpha", what="soak test drop-in", undo="rm -f /tmp/soak.conf", at=None, alias="box-a"):
@@ -531,7 +534,7 @@ def test_a_harmless_expired_change_never_pages_the_user(env):
     p, ml = _outage_box(env, "beta", **{"box-a": ("owner", "beta")})
     t0 = time.time()
     _expired(ml, 1, by="beta", at=t0)
-    assert ml.change_risk(ml.load()["changes"][0], {}) == ""
+    assert ml.change_risk(ml.changes(open_only=False)[0], {}) == ""
     able = {"beta": (False, "its daemon is stopped"), "owner": (False, "its daemon is stopped")}
     seen = []
     for h in range(0, 24 * 6):
@@ -545,7 +548,7 @@ def test_a_risky_expired_change_unhandled_for_a_day_pages_the_user_once(env):
     p, ml = _outage_box(env, "beta", **{"box-a": ("owner", "beta")})
     t0 = time.time()
     _expired(ml, 1, by="beta", what="stopped the recovery watchdog", undo="systemctl start watchdog", at=t0)
-    assert ml.change_risk(ml.load()["changes"][0], {})
+    assert ml.change_risk(ml.changes(open_only=False)[0], {})
     able = {"beta": (False, "its daemon is stopped"), "owner": (False, "its daemon is stopped")}
     users = []
     for h in range(0, 24 * 5):
@@ -570,7 +573,7 @@ def test_renew_close_or_undo_clears_an_expired_change_and_its_page(env, how):
         ml.edit_change(cid, "beta", expires="2d", now=t0 + 60)
     else:   # undo: its undo is run, then the entry closed
         ml.close_change(cid, "undone" if how == "undo" else "kept", by="beta", now=t0 + 60)
-    c = next(c for c in ml.load()["changes"] if c["id"] == cid)
+    c = next(c for c in ml.changes(open_only=False) if c["id"] == cid)
     assert not (c.get("page") or {}).get("pending")
     assert all(_route(ml, t0 + h * 3600, able) == [] for h in range(1, 30))
 
@@ -583,7 +586,8 @@ def test_an_expired_change_of_a_gone_or_paused_project_goes_to_the_recovery_owne
     _expired(ml, 1, by="gamma", at=t0)
     able = {"gamma": (False, why), "owner": (False, "its daemon is stopped"), "beta": (True, "")}
     assert [t for _, _, t, _ in _route(ml, t0, able)] == ["owner"]
-    assert [t for _, _, t, _ in _route(ml, t0 + ml.UNAVAILABLE_S + 60, able)] == ["beta"]
+    assert _route(ml, t0 + 60, able) == []   # the owner's daemon found stopped: passed over once it stays so
+    assert [t for _, _, t, _ in _route(ml, t0 + ml.UNAVAILABLE_S + 120, able)] == ["beta"]
 
 
 def test_a_relayed_batch_of_expired_changes_is_filed_once_per_change(env):

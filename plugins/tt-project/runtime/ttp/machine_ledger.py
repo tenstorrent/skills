@@ -1698,7 +1698,7 @@ def route(now: float | None = None, able: Callable[[str], tuple[bool, str]] | No
             gave_up = c.get("auto_undo_failed") or {}
             if target:
                 episode = float(c.get("page_from") or c["added"])
-                line = change_line(c, now, late, gave_up)
+                line = expired_line(c, now, late, gave_up)
                 if target == USER:
                     from . import outagemsg
                     text = (f"A risky machine change has had no answer for "
@@ -1729,7 +1729,7 @@ CHANGE_CHOICES = ("For each: renew it (`ttp machines change edit <id> --expires 
                   "no-op; or undo it (run its undo, then close it).")
 
 
-def change_line(c: dict, now: float, late: str = "", gave_up: dict | None = None) -> str:
+def expired_line(c: dict, now: float, late: str = "", gave_up: dict | None = None) -> str:
     """One expired change for its page: id, machine, author, age, what and why, its undo, and a gave-up auto-undo."""
     from . import outagemsg
     gave_up = gave_up or {}

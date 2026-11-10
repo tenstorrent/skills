@@ -5459,7 +5459,7 @@ def test_a_user_stage_machine_change_page_reaches_only_its_makers_chat(env):
     mm.add("box-1", tags="device")
     mm.set_recovery("box-1", owner="proj-a")
     now = time.time()
-    ml.add_change("box-1", "drop-in", "rm it", "proj-a", expires="1h", now=now - 3 * 86400)
+    ml.add_change("box-1", "stopped the recovery watchdog", "systemctl start watchdog", "proj-a", expires="1h", now=now - 3 * 86400)
     ok = lambda n: (True, "")   # noqa: E731
     t1 = now - ml.REPAGE_S - 60
     assert ml.route(t1, able=ok, claimer="proj-b") == [], "proj-a's own page"
@@ -5468,14 +5468,14 @@ def test_a_user_stage_machine_change_page_reaches_only_its_makers_chat(env):
     ml.delivered(first[0])
     assert ml.route(now - 30, able=ok, claimer="proj-b") == [], "a user page of proj-a's entry"
     Daemon(b.base).route_machines(every_s=0)   # the co-tenant's own tick: nothing reaches its chat
-    assert not b.db.one("SELECT id FROM messages WHERE kind='alert' AND text LIKE 'Outage: Machine change%'")
+    assert not b.db.one("SELECT id FROM messages WHERE kind='alert' AND text LIKE 'A risky machine change%'")
     pages = ml.route(now - 30 + ml.CLAIM_S, able=ok, claimer="proj-a")
     assert [x["target"] for x in pages] == [ml.USER]
     assert Daemon(a.base)._machine_page(pages[0], now)
     ml.delivered(pages[0])
-    got = a.db.one("SELECT text FROM messages WHERE kind='alert' AND text LIKE 'Outage: Machine change #1 %'")
+    got = a.db.one("SELECT text FROM messages WHERE kind='alert' AND text LIKE 'A risky machine change%#1 %'")
     assert got and "box-1" in got["text"], got
-    assert not b.db.one("SELECT id FROM messages WHERE kind='alert' AND text LIKE 'Outage: Machine change%'")
+    assert not b.db.one("SELECT id FROM messages WHERE kind='alert' AND text LIKE 'A risky machine change%'")
 
 
 def test_an_orphan_user_machine_page_reaches_no_unrelated_chat_and_shows_in_status(env):
@@ -5489,7 +5489,7 @@ def test_an_orphan_user_machine_page_reaches_no_unrelated_chat_and_shows_in_stat
     mm.add("box-1", tags="device")
     mm.set_recovery("box-1", owner="proj-y")
     now = time.time()
-    ml.add_change("box-1", "drop-in", "rm it", "proj-x", expires="1h", now=now - 5 * 86400)
+    ml.add_change("box-1", "stopped the recovery watchdog", "systemctl start watchdog", "proj-x", expires="1h", now=now - 5 * 86400)
     ok = lambda n: (True, "")   # noqa: E731
     for i, who in enumerate(("proj-x", "proj-y")):   # pages to projects not on this host are relayed, as before
         got = ml.route(now - (3 - i) * (ml.REPAGE_S + 60), able=ok, claimer="proj-b")
@@ -5500,11 +5500,11 @@ def test_an_orphan_user_machine_page_reaches_no_unrelated_chat_and_shows_in_stat
     assert ml.route(now - 60 + ml.CLAIM_S, able=ok, claimer="proj-b", log=said.append) == []
     assert len(said) == 1 and "proj-x, proj-y not registered on this host" in said[0], said
     Daemon(b.base).route_machines(every_s=0)   # proj-b's charter does not list box-1
-    assert not b.db.one("SELECT id FROM messages WHERE kind='alert' AND text LIKE 'Outage: Machine change%'")
+    assert not b.db.one("SELECT id FROM messages WHERE kind='alert' AND text LIKE 'A risky machine change%'")
     assert "undelivered machine page (no project here may deliver it" in status_text(b)
     c.charter_path.write_text("# proj-c\n\n## Goals\nGo.\n\n## Resources\n- box-1: a device machine.\n")
     Daemon(c.base).route_machines(every_s=0)   # a project whose charter lists the machine may deliver it
-    got = c.db.one("SELECT text FROM messages WHERE kind='alert' AND text LIKE 'Outage: Machine change #1 %'")
+    got = c.db.one("SELECT text FROM messages WHERE kind='alert' AND text LIKE 'A risky machine change%#1 %'")
     assert got, "the listing project's chat gets it"
     assert ml.orphan_lines() == []
 

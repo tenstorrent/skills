@@ -40187,6 +40187,7 @@ def test_an_overdue_machine_change_pages_its_project_then_the_owner(env):
     ml.route(now + 3700, able=able.get)
     pages = ml.route(now + 3700 + ml.UNAVAILABLE_S, able=able.get)
     assert [x["target"] for x in pages] == ["alpha"]
+    ml.delivered(pages[0])
     # A harmless change (a soak's drop-in) stays with its projects: the user is never paged for it.
     assert ml.route(now + 3700 + ml.UNAVAILABLE_S + 3 * ml.REPAGE_S, able=able.get) == []
     ml.close_change(1, "undone")
