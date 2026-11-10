@@ -3885,7 +3885,8 @@ def publish(repo: Path, remote: str, branch: str, checks: list[str],
                                        lambda: check_slot(head, say, priority=own_lane_key(repo, remote, cfg)))
                 if rc != 0:
                     if rc == CHECKS_FAILED:
-                        rc = _gate(cmd, repo, env, say, head, base or "", seen, p)
+                        rc = _gate_here(cmd, repo, env, say, head, base or "", seen, p,
+                                        lambda: check_slot(head, say, priority=own_lane_key(repo, remote, cfg)))
                     if rc == 0:
                         excused = True   # its reruns are no check time
                         continue
@@ -4221,7 +4222,8 @@ def _rounds(repo: Path, remote: str, branch: str, checks: list[str], rounds: int
                                        lambda: check_slot(head, say, priority=priority_key(repo, remote, branch)))
                 if rc != 0:
                     if rc == CHECKS_FAILED:
-                        rc = _gate(cmd, repo, env, say, head, tip, seen)
+                        rc = _gate_here(cmd, repo, env, say, head, tip, seen, None,
+                                        lambda: check_slot(head, say, priority=priority_key(repo, remote, branch)))
                     if rc == 0:
                         excused.add(str(cmd))
                         continue
@@ -4610,6 +4612,22 @@ def _gate(cmd: Any, repo: Path, env: dict, say: Callable[[str], None], head: str
         return BUSY
     say(f"none of the failing tests is new on {head[:10]}: {cmd}{where(cmd)} does not block the push")
     return 0
+
+
+def _gate_here(cmd: Any, repo: Path, env: dict, say: Callable[[str], None], head: str, target: str, seen: dict,
+               p: Project | None, here: Callable[[], Any]) -> int:
+    """_gate for a push check that failed; one spill_slot sent to a spill host is judged as its local
+    original (`was`, as the push batch's Batch._judged does), its reruns here in the slot `here()` takes."""
+    was = getattr(cmd, "was", None)
+    if was is None or not getattr(cmd, "spilled", False):
+        return _gate(cmd, repo, env, say, head, target, seen, p)
+    try:
+        slot = here()
+    except checkcap.Unavailable as e:
+        say(f"{e}; not pushing")
+        return CHECKS_FAILED
+    with slot:
+        return _gate(was, repo, {**env, **slot.env()}, say, head, target, seen, p)
 
 
 def _hard(rx: str, test_id: str) -> bool:

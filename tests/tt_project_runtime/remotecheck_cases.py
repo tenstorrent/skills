@@ -3299,6 +3299,44 @@ def test_push_own_spills_its_checks_first_too(env, tmp_path, monkeypatch):
 
 
 
+@pytest.mark.parametrize("route", ["push", "own"])
+@pytest.mark.parametrize("kind", ["pre_existing", "new"])
+def test_a_spilled_push_check_that_fails_goes_through_the_tests_gate_as_its_local_original(
+        env, tmp_path, monkeypatch, route, kind):
+    """A push check spill first sent to a spill host still meets the base-vs-head tests gate (_gate_here), as
+    the push batch judges one: its failing tests rerun here as the local check. A test failing on the base
+    too is pre-existing and the push (direct or --own) goes; one failing only on the head still fails it."""
+    from ttp import checkspill, push
+    p, repo = _spill_push(env, tmp_path, monkeypatch, _GATE_FAIL)
+    body = _GATE_PRE + "\n\ndef test_x():\n    pass\n"
+    (repo / "tests").mkdir(exist_ok=True)
+    _commit(repo, "tests/test_gate.py", body)
+    _git_out(repo, "push", "-q", "origin", "HEAD:refs/heads/proj")
+    base = _git_out(repo, "rev-parse", "HEAD")
+    _git_out(repo, "checkout", "-q", "-b", "own")
+    _commit(repo, "tests/test_gate.py", body.replace("def test_x():\n    pass", "def test_x():\n    assert False")
+            if kind == "new" else body + "\n\ndef helper():\n    return 1\n")
+    head = _git_out(repo, "rev-parse", "HEAD")
+    said: list[str] = []
+    checks = push.check_list([_GATE_FAIL])
+    rc = (push.push(repo, "origin", "proj", checks, 1, say=said.append) if route == "push" else
+          push.publish(repo, "origin", "own", checks, say=said.append, base=base, p=p))
+    text = "\n".join(said)
+    assert "check-host-a" in text, text   # it ran there first
+    assert "judging the" in text and "tests/test_gate.py::test_pre" in text, text
+    target = "origin/proj" if route == "push" else "origin/own"
+    if kind == "pre_existing":
+        assert rc == 0, text
+        assert "pre-existing on the base" in text and _git_out(repo, "rev-parse", target) == head
+    else:
+        assert rc == push.CHECKS_FAILED, text
+        assert "new on" in text and "tests/test_gate.py::test_x" in text, text
+        got = subprocess.run(["git", "-C", str(repo), "rev-parse", "-q", "--verify", target],
+                             capture_output=True, text=True).stdout.strip()
+        assert got != head, "nothing pushed"
+    assert checkspill.holders(p.name) == [], "the claim ends with the push"
+
+
 @pytest.mark.parametrize("kind", ["pre_existing", "flaky"])
 def test_a_spilled_push_batch_suite_is_judged_as_its_local_original(env, tmp_path, monkeypatch, kind):
     """A spilled suite's failing test reruns here at the head, then on the tip, as the local check's do
