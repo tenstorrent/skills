@@ -2008,10 +2008,11 @@ def test_charter_update_quote_removes_or_replaces_one_item(env):
     # One sentence inside a paragraph goes and the paragraph stays whole.
     assert coord.apply(p, [{**act, "quote": "Notify only for decisions."}], turn=2) == []
     assert "\n\nLabel every number.\n\n## Restrictions" in p.charter_path.read_text()
-    # Replace in place (guarded like an append: pushing weekly is about what "Never push." bans:
-    # the same action, and that item names no object).
-    assert "contradicts the Restrictions item \"Never push.\"" in coord.apply(
-        p, [{**act, "quote": "Push daily.", "text": "Push weekly."}], turn=3)[0]
+    # Replace in place (guarded like an append): a lift of "Never push." is refused, and so is an order
+    # to push in the coordinator's own words (the same action, and that item names no object).
+    for text in ("Pushing is allowed weekly.", "Push weekly."):
+        assert "contradicts the Restrictions item \"Never push.\"" in coord.apply(
+            p, [{**act, "quote": "Push daily.", "text": text}], turn=3)[0]
     act["both_hold"] = True
     assert coord.apply(p, [{**act, "quote": "Push daily.", "text": "Push weekly."}], turn=3) == []
     assert "## Policies\n- Push weekly.\n- Draft PRs." in p.charter_path.read_text()
@@ -2339,16 +2340,22 @@ def test_an_append_that_contradicts_a_standing_restriction_is_rejected_quoting_i
             ({"section": "Restrictions", "text": "Never push to the main branch, except hotfixes."}, False),
             ({"section": "Policies", "text": "Never push to the main branch without review, but hotfixes may "
                                              "be pushed to it."}, False),
-            ({"section": "Restrictions", "text": "Never push to the main branch on release days."}, False),
-            ({"section": "Policies", "text": "Workers may never push to the main branch."}, False),
-            ({"section": "Policies", "text": "Workers may not push to the main branch."}, False),
-            ({"section": "Goals", "text": "Pushing to the main branch is not allowed."}, False))):
+            ({"section": "Restrictions", "text": "Pushing hotfixes to the main branch is permitted."}, False))):
         db.x("DELETE FROM events")
         p.charter_path.write_text(base)
         err = coord.apply(p, [{"type": "charter_update", **act}], turn=10 + k, user_turn=user)
         assert len(err) == 1 and "contradicts the Restrictions item \"Never push to the main branch.\"" in err[0], err
         assert "`quote` \"Never push to the main branch.\"" in err[0] and "both_hold" in err[0], err
         assert p.charter_path.read_text() == base and conflicts() == []
+    # A new ban, a negated permission or a duty on the same thing loosens nothing: it goes in, and
+    # the old item stands beside it (outside a user turn too).
+    for k, (sec, text) in enumerate((("Policies", "Workers may never push to the main branch."),
+                                     ("Policies", "Workers may not push to the main branch."),
+                                     ("Goals", "Pushing to the main branch is not allowed."),
+                                     ("Goals", "Review every change made to the main branch."))):
+        p.charter_path.write_text(base)
+        assert coord.apply(p, [{"type": "charter_update", "section": sec, "text": text}], turn=20 + k) == []
+        assert text in p.charter_path.read_text() and "Never push to the main branch." in p.charter_path.read_text()
     assert "charter_conflict" in coord.UNBLOCK_KINDS
     # The live case: a lift appended next to the old ban. The user's yes is kept on record, so the
     # resend that quotes the old item goes through in a later turn without asking again.
@@ -2436,11 +2443,13 @@ def test_a_user_turn_duty_that_shares_words_with_bans_goes_in_with_its_source(en
     from ttp import coordinator as coord
     db = p.db
     add = {"type": "charter_update", "section": "Policies", "text": _SELF_HEALING}
-    # (b) Outside a user turn the same text is still refused, quoting the bans it shares words with.
+    # (b) Outside a user turn the same text goes in too: sharing words with a ban lifts nothing, and
+    # every ban stays in the charter beside it.
     p.charter_path.write_text(_BANS)
-    err = coord.apply(p, [add], turn=1)
-    assert len(err) == 1 and "contradicts the Restrictions item" in err[0], err
-    assert p.charter_path.read_text() == _BANS
+    assert coord.apply(p, [add], turn=1) == []
+    charter = p.charter_path.read_text()
+    assert _SELF_HEALING in charter and "Never push to main." in charter and "Never use a paused device." in charter
+    p.charter_path.write_text(_BANS)
     # (a) In the user's turn it goes in: it adds a duty and loosens nothing. Its source (the user's
     # message) is in the charter history, and the coordinator is told which items it overlaps.
     said = db.post("in", "new prime directive: self-healing ...", chat=None, channel="web", kind="user",
@@ -3963,9 +3972,18 @@ def test_a_charter_update_quoting_a_users_message_passes_in_a_turn_without_their
     said = db.post("in", _RELEASE, chat=None, channel="web", kind="user", provenance="web-session")
     found = db.post("in", "", chat=None, kind="finding", context="The demo box shows no tenant since noon.")
     goal = {"type": "charter_update", "section": "Goals", "text": _CYCLE_GOAL}
-    # No source: the coordinator's own text, refused while it shares the item's action and object.
-    err = coord.apply(p, [goal], turn=1, messages=[found])
-    assert len(err) == 1 and "contradicts the Restrictions item" in err[0], err
+    # No source: the coordinator's own text orders what the item bans, or says the hold was released,
+    # or permits it: each is refused without the user's word.
+    for text in (_CYCLE_GOAL, "Power cycle the demo box tonight.", "The hold on the demo box is over.",
+                 "Power cycling the demo box is allowed tonight."):
+        err = coord.apply(p, [{**goal, "text": text}], turn=1, messages=[found])
+        assert len(err) == 1 and "contradicts the Restrictions item" in err[0], (text, err)
+        assert p.charter_path.read_text() == _HOLD_CHARTER
+    # A new ban or a duty on something else goes in beside it.
+    for text in ("Never power cycle the demo box on weekends.", "Report the demo box status daily."):
+        assert coord.apply(p, [{**goal, "text": text}], turn=1, messages=[found]) == [], text
+        assert text in p.charter_path.read_text() and "Never power cycle" in p.charter_path.read_text()
+        p.charter_path.write_text(_HOLD_CHARTER)
     # Quoting the user's message verbatim (JSON text or an object): it goes in, cited to that message.
     for turn, src in ((2, json.dumps({"msg": said, "quote": "released from my hold, power cycle it"})),
                       (3, {"msg": f"#{said}", "quote": "Released from my HOLD,  power cycle it"})):
@@ -3974,6 +3992,65 @@ def test_a_charter_update_quoting_a_users_message_passes_in_a_turn_without_their
         assert _CYCLE_GOAL in p.charter_path.read_text()
         assert f"user message #{said}" in (p.harness / coord.CHARTER_HISTORY).read_text().split("### ")[-1]
     assert "Never power cycle the demo box" in p.charter_path.read_text()
+
+
+_WHOLE_ITEM_BANS = (("- Never reboot box-a, box-b or box-c.\n", ("Reboot box-c tonight.",)),
+                    ("- Do not reset, reboot or flash the galaxy.\n", ("Reboot the galaxy now.", "Flash the galaxy now.")),
+                    ("- Never push to main, the release branch.\n", ("Push the fix to the release branch.",)),
+                    ("- Push only to branch dev, not to main.\n", ("Push the fix to main.", "Push the fix to main now.")))
+
+
+@pytest.mark.parametrize("item,texts", _WHOLE_ITEM_BANS)
+def test_the_guard_judges_a_ban_item_whole_so_every_listed_object_and_action_stays_banned(env, item, texts):
+    """Replays review #7351: splitting an item at its commas dropped the ban from every list part after
+    the first, so the coordinator could order, in its own words, a reboot of a listed box or a listed
+    action on the galaxy. The guard reads each Restrictions item whole; with delivery.push_branch set,
+    a push to another target is still refused."""
+    p = make(env)
+    from ttp import coordinator as coord
+    p.set_config("delivery.push_branch", "dev")
+    charter = "# demo\n\n## Goals\nShip it.\n\n## Restrictions\n" + item + "\n## Policies\nReview first.\n"
+    p.charter_path.write_text(charter)
+    for text in texts:
+        err = coord.apply(p, [{"type": "charter_update", "section": "Policies", "text": text}], turn=1)
+        assert len(err) == 1 and "contradicts the Restrictions item" in err[0], (text, err)
+        assert p.charter_path.read_text() == charter
+
+
+_ONLY_ITEMS = (("- Push only to branch dev, not to main.\n", "dev"),
+               ("- Push only to branch team/proj-a of the repo, plus one tag on the repo: proj-a-1 at the verified "
+                "commit, pushed once and never moved; and rel, the release channel, moved only forward. Never push "
+                "to main.\n", "origin/team/proj-a"))
+
+
+@pytest.mark.parametrize("item,push_branch", _ONLY_ITEMS)
+def test_a_push_to_the_configured_push_branch_meets_no_push_ban(env, item, push_branch):
+    """Replays review #7332 through settings, not wording: beside an 'only X' item whose other words ban
+    a push ('not to main', 'never moved'), a sentence whose only push target is delivery.push_branch
+    (with or without its remote) or a delivery.channel_tags tag goes in on a turn without the user's
+    word. Without the setting it is judged like any order, and a push to main stays refused."""
+    p = make(env)
+    from ttp import coordinator as coord
+    charter = "# demo\n\n## Goals\nShip it.\n\n## Restrictions\n" + item + "\n## Policies\nReview first.\n"
+    branch = push_branch.partition("/")[2] if push_branch.startswith("origin/") else push_branch
+    oks = [("Policies", f"Push the fix to branch {branch} after review."),
+           ("Policies", f"Each change is pushed to {branch} after review through the push queue."),
+           ("Goals", f"Review every change before it is pushed to {branch}."), ("Policies", f"Push to branch {branch}.")]
+    p.charter_path.write_text(charter)
+    assert coord.apply(p, [{"type": "charter_update", "section": "Policies", "text": oks[0][1]}], turn=1) != []
+    assert p.charter_path.read_text() == charter
+    p.set_config("delivery.push_branch", push_branch)
+    if "rel," in item:
+        p.set_config("delivery.channel_tags", ["rel"])
+        oks.append(("Policies", "Push the tag rel after each release."))
+    for sec, text in oks:
+        assert coord.apply(p, [{"type": "charter_update", "section": sec, "text": text}], turn=1) == [], text
+        assert text in p.charter_path.read_text()
+        p.charter_path.write_text(charter)
+    for text in ("Push the fix to main.", "Push the fix to main now.", f"Push the fix to {branch} and to main."):
+        err = coord.apply(p, [{"type": "charter_update", "section": "Policies", "text": text}], turn=1)
+        assert len(err) == 1 and "contradicts the Restrictions item" in err[0], (text, err)
+        assert p.charter_path.read_text() == charter
 
 
 def test_a_charter_update_quote_that_is_not_the_users_verbatim_word_is_refused(env):

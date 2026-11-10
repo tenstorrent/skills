@@ -5957,8 +5957,9 @@ _PERMIT_RE = re.compile(r"\b(?:allow\w*|permit\w*|may|can|fine|ok(?:ay)?|lift\w*
                         r"no (?:problem|objection|issue)s?|objects|minds|stops)\b", re.I)
 # An item that names its own exception ("except as the dated section allows") has been reconciled.
 _OWN_EXCEPTION_RE = re.compile(r"\b(?:except|unless|other than|apart from|save for|excluding)\b", re.I)
-# A permit word negated is a ban: "an upgrade can never be blocked", "workers may not push".
-_NEGATED_PERMIT_RE = re.compile(r"\b(?:can|may)\s+(?:not|never)\b|\bcannot\b|\bcan['’]t\b", re.I)
+# A permit word negated is a ban: "an upgrade can never be blocked", "workers may not push", "pushing is not allowed".
+_NEGATED_PERMIT_RE = re.compile(r"\b(?:can|may)\s+(?:not|never)\b|\bcannot\b|\bcan['’]t\b|"
+                                r"\b(?:not|never)\s+(?:be\s+)?(?:allowed|permitted|fine|ok(?:ay)?)\b", re.I)
 # A clause that names an exception defined elsewhere: "except as the temporary exception (ask 12) allows".
 _EXCEPTION_REF_RE = re.compile(r"\b(?:exceptions?|temporary|dated|one-time|expir\w*|while it lasts)\b|"
                                r"\bask\s*#?\d+|#\d+", re.I)
@@ -5976,7 +5977,7 @@ _ACTIONS = {"push": {"push"}, "force-push": {"push"}, "modify": {"write"}, "modi
             "open": {"open"}, "creat": {"open"}, "deploy": {"deploy"}, "publish": {"deploy"},
             "install": {"install"}, "upgrad": {"install"}, "run": {"run"}, "runn": {"run"}, "start": {"run"},
             "submit": {"run"}, "restart": {"stop"}, "reboot": {"stop"}, "kill": {"stop"}, "cancel": {"stop"},
-            "stop": {"stop"}}
+            "stop": {"stop"}, "flash": {"install"}}
 _ANY = "any"
 _WRITES = {"write", "push", "merge", "delete", "install", "deploy"}
 # Words that are no target: rule, stance, actor and filler words, and verbs that let someone act.
@@ -5990,7 +5991,7 @@ _NOT_TARGET = {x for w in _RULE_STOP | {
     "ever", "pull", "request", "prs", "new", "same", "many", "few", "another", "plus", "name", "named", "msg",
     "message", "once"} for x in (w, _stem(w))}
 # Kinds of target: "the main branch" and "the release branch" share only a kind, which is no overlap.
-_KINDS = {_stem(w) for w in ("branch", "repo", "repository", "folder", "directory", "file", "path", "box",
+_KINDS = {_stem(w) for w in ("branch", "tag", "repo", "repository", "folder", "directory", "file", "path", "box",
                              "machine", "node", "host", "server", "service", "project")}
 
 
@@ -6299,10 +6300,12 @@ def _reject_contradicting_append(p: Project, section: str, text: str, user_turn:
                                  end: dict | None = None) -> str:
     """Refuse a charter_update that adds `text` (appended, or in place of `quote`) while a Restrictions
     item it is about would stay standing (_append_conflicts): workers obey that item as binding, so the
-    change may do nothing. The rejection quotes the item. With the user's word behind the change (a
-    user turn, or the approval it already carried) only a sentence that may lift what an item bans
-    (_may_lift) is refused: any other overlap is a duty, a goal or a ban added next to the item, both
-    hold, and the change goes through; the returned note names the items judged to overlap. A refused
+    change may do nothing. The rejection quotes the item. On any turn only a sentence that may lift
+    what an item bans (_may_lift) is refused: any other overlap is a duty, a goal, a ban or a resource
+    added next to the item, which shares words with it but loosens nothing, so both hold and the
+    change goes through; the returned note names the items judged to overlap. Without the user's
+    word (no user turn, no approval on record) text that orders what an item bans or says a hold or
+    ban was released (_orders_banned) is refused too. A refused
     change of the user's is recorded (_record_charter_approval), as sent and as the quoted resend of
     each item, so either fix goes through in a later turn without asking again; it is never raised
     again by itself (reraise_charter_changes). Text already in the charter (a retried turn) passes.
@@ -6321,13 +6324,23 @@ def _reject_contradicting_append(p: Project, section: str, text: str, user_turn:
         # It says it loosens nothing and no sentence takes the same action on what an item bans.
         return (f"charter_update: {clip(text, 120)!r} went in, taken as holding alongside the Restrictions item "
                 f"{named} (it says it loosens no restriction; workers obey both)")
-    if user_turn or ok is not None:
-        lifts = _append_conflicts(charter, section, text, quote, lifts_only=True)
-        if not lifts:
-            return (f"charter_update: {clip(text, 120)!r} went in on the user's word, taken as holding alongside "
-                    f"the Restrictions item {named} (it only shares words with them; workers obey both). If the "
-                    "user changed one of them, charter_update its section with `quote` set to it")
-        hits = lifts
+    # Only a sentence that may lift what an item bans is refused, on any turn: text that adds a duty,
+    # a ban, a goal or a resource (a host list) next to an item it only shares words with loosens
+    # nothing, and both hold. A lift still needs the user's word (below).
+    lifts = _append_conflicts(charter, section, text, quote, lifts_only=True)
+    if not (user_turn or ok is not None):
+        # Without the user's word, also refuse text that orders what an item bans (the same action on
+        # the same object, and no ban of its own) or says a hold or ban was released: it would lift
+        # the item in the coordinator's own words.
+        lifts += [h for h in _orders_banned(charter, section, text, quote, _delivery_names(p.config()))
+                  if h not in lifts]
+    if not lifts:
+        return (f"charter_update: {clip(text, 120)!r} went in"
+                + (" on the user's word" if user_turn or ok is not None else "")
+                + f", taken as holding alongside the Restrictions item {named} (it only shares words with them "
+                "and permits or loosens nothing; workers obey both). If the user changed one of them, "
+                "charter_update its section with `quote` set to it")
+    hits = lifts
     if user_turn:
         _record_charter_approval(p, said, section, quote, "", text, end, "the charter guard: " + GUARD_REJECTED)
     for item, sec in hits:
@@ -6353,6 +6366,75 @@ def _reject_contradicting_append(p: Project, section: str, text: str, user_turn:
           "resources, actions, a time window) while that item still holds elsewhere, resend it in Restrictions with "
           "`excepts` set to that item's clause and `source` their words (work they ordered that adds no new risk class needs no new words naming what the charter's Goals, Resources or Policies already name). Never drop a restriction the user did not "
           "change")
+
+
+# A sentence that says a hold or ban is gone: "the user released it from their hold", "the hold is over".
+_RELEASED_RE = re.compile(r"\b(?:released|unheld|un-held)\b|\b(?:hold|ban)\b[^.;:]{0,40}?\b(?:is|was|has\s+been|are)\s+"
+                          r"(?:now\s+)?(?:over|ended|gone|off|cleared|lifted)\b|\bno\s+longer\s+(?:held|on\s+hold|banned)\b",
+                          re.I)
+# A sentence that bans for itself ("Workers may never push", "Pushing is not allowed"). Narrower than
+# _BAN_RE: "must", "only" and "without" also fit an order to do the banned action.
+_OWN_BAN_RE = re.compile(r"\b(?:never|not|nobody|cannot|forbid\w*|prohibit\w*|ban(?:s|ned)?)\b|n['’]t\b", re.I)
+
+
+def _delivery_names(cfg: dict) -> tuple[str, ...]:
+    """Where this project delivers, from its settings, never from charter wording: delivery.push_branch
+    (with and without its remote) and the tags in delivery.channel_tags."""
+    ref = str((cfg.get("delivery") or {}).get("push_branch") or "").strip()
+    names = [ref, ref.partition("/")[2]] if ref else []
+    return tuple(n for n in dict.fromkeys(names + channeltag.channel_tags(cfg)) if n)
+
+
+# A push or a publish: the only actions a sentence takes when it delivers.
+_DELIVERY_ACTS = {"push", "deploy"}
+# What a delivery target reads as to the guard: an object word of its own, so "Push to branch dev"
+# still names a target beside a kind word ("branch"), one no Restrictions item names.
+_DELIVERED = " configured-delivery-target "
+
+
+def _undelivered(sentence: str, item: str, delivered: tuple[str, ...]) -> str:
+    """`sentence` with each of the project's own delivery targets (_delivery_names) put as an object no
+    item names (_DELIVERED), when it only pushes or publishes and `item` bans a push or publish: its push
+    to the configured branch or tag is what the setting allows, so only another target it names can
+    meet the ban. Else `sentence`."""
+    acts, iacts = (_target(restriction_source.bare(x), conditions=False)[0] for x in (sentence, item))
+    if not (delivered and acts and acts <= _DELIVERY_ACTS and iacts & _DELIVERY_ACTS):
+        return sentence
+    for name in sorted(delivered, key=len, reverse=True):
+        sentence = re.sub(r"(?<![\w/.-])" + re.escape(name) + r"(?![\w/-])(?!\.\w)", _DELIVERED, sentence, flags=re.I)
+    return sentence
+
+
+def _orders_banned(charter: str, section: str, text: str, quote: str = "",
+                   delivered: tuple[str, ...] = ()) -> list[tuple[str, str]]:
+    """The standing Restrictions items (as _append_conflicts) that a sentence of `text` orders done or
+    says were released, with no permit word: the same action on the same object as an item that bans
+    it (_OWN_BAN_RE: "Push only to branch x" bans no push to x) in a sentence that bans nothing itself
+    (_same_target), or a sentence that
+    overlaps the item and says a hold or ban is gone (_RELEASED_RE). Only the user's word adds one.
+    A sentence whose only push or publish target is one the project's settings deliver to
+    (`delivered`: _delivery_names) meets no push ban (_undelivered); every other target is judged."""
+    if not _DATED.sub("", section).lower().startswith(("restriction", "goal", "polic", "resource")):
+        return []
+    new, gone = _quoted_news(quote, _sentences(text.splitlines())), _loose(quote)
+    out: list[tuple[str, str]] = []
+    for item, sec, _ in _restriction_items(charter):
+        if (item, sec) in out or (gone and _loose(item) in gone) or _OWN_EXCEPTION_RE.search(item):
+            continue
+        if any(_RELEASED_RE.search(s) and _overlaps(item, s)
+               or _OWN_BAN_RE.search(item) and not _OWN_BAN_RE.search(s)
+               and _same_target(item, _undelivered(s, item, delivered)) for s in new):
+            out.append((item, sec))
+    return out
+
+
+def _same_target(item: str, sentence: str) -> bool:
+    """Whether a sentence takes the action of a ban `item` on its object: _overlaps strict, or, when
+    neither names an action it knows ("power cycle"), every object word of the item is in the sentence."""
+    if _overlaps(item, sentence, strict=True):
+        return True
+    (ia, io), (sa, so) = (_target(restriction_source.bare(x), conditions=False) for x in (item, sentence))
+    return not ia and not sa and bool(io) and io <= so
 
 
 def _conflict_reason(item: str, text: str, quote: str = "") -> str:
@@ -7957,13 +8039,14 @@ def _use_charter_approval(p: Project, rid: str, key: str | None) -> None:
 # with it: a test fails when the source of CHARTER_GUARD_FUNCS no longer has CHARTER_GUARD_PIN's
 # sha256. A user's change that failed under an older guard for another reason than the guard
 # (reraise_charter_changes) is then raised at once.
-CHARTER_GUARD_VERSION = 17
+CHARTER_GUARD_VERSION = 20
 CHARTER_GUARD_FUNCS = ("_reject_contradicting_append", "_append_conflicts", "_overlaps", "_on_object", "_quote_hits",
                        "_item_quote_hits", "_items", "_norm", "_may_lift", "_lifts_item", "_companion_clause",
                        "_ref_ids", "_companion_exception", "_changed_sentences", "_quoted_news",
                        "_charter_approval", "_ask_charter_approval", "_conflict_reason", "_scope_names",
-                       "_scoped_exception", "_excepted_item")
-CHARTER_GUARD_PIN = (17, "1a04da38f7231e8b05374a173b8b60a068d5c927886dcbe7f5e6f9800bbcc004")
+                       "_scoped_exception", "_excepted_item", "_orders_banned",
+                       "_same_target", "_delivery_names", "_undelivered")
+CHARTER_GUARD_PIN = (20, "b181c0cbb108c4d58eeda8ad3a52b88b14766a15bd679068638ea83ce1f10876")
 CHARTER_RERAISE_KEY = "charter_reraise"   # kv: {"version", "ts"} of the last re-raise pass
 
 
