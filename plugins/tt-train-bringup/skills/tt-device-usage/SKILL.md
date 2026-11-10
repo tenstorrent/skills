@@ -22,6 +22,20 @@ Use this skill for the hardware-facing parts of training bring-up. It covers onl
 - Before launching a bringup, keep the workspace, multigoal log directory, and `CODEX_HOME` on storage that survives reboot and, when applicable, container recreation. The runner defaults to `<repo>/bringup/artifacts/multigoal-runs/<timestamp>`; any `--log-dir` or `RUN_MULTIGOAL_LOG_DIR` override must also use persistent storage. Do not put resume state in `/tmp`: recovery needs both the manifest's stage/thread mapping and the Codex session state.
 - Preserve evidence before cleanup: work logs, README files, MFU logs, Tracy CSVs, PCC tables, compact perf summaries, and exact failing commands. Do not delete `CODEX_HOME`, auth/config, completed phase artifacts, or the repo state.
 
+## Long-Running Jobs
+
+- Run a device chain (build, tests, measurement, profile) as one script started in the background
+  by the agent harness (`run_in_background`), and wait for its completion notification. Never wait
+  with a shell loop that polls `pgrep -f <name>`: the loop's own command line contains the name,
+  matches itself and never ends; several such loops accumulate per session.
+- Never `pkill -f <pattern>` from a command whose text contains the pattern (heredocs included): it
+  kills the agent's own shell. Stop a background job through the harness, or `kill` a PID read from
+  the script's own pid file.
+- Every device command in a chain runs under `timeout` with a bound derived from its expected
+  duration, so a hang ends the chain instead of the session.
+- The chain writes its result markers (`rc=`, `passed`, `ms/step`) to the evidence log; the agent
+  reads the log once after the notification instead of tailing it.
+
 ## Reset And Health Checks
 
 Use bounded commands so a bad device state cannot consume the whole phase:

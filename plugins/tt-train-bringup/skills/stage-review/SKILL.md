@@ -124,7 +124,24 @@ Optimisation loop:
 - the host/dispatch gap is not measured, or it grew without explanation;
 - the exit claim does not match the plan's target and margin, or the final MFU
   does not reproduce the best iteration's number;
-- the final path fails the PCC harness or loss match.
+- the final path fails the PCC harness or loss match;
+- the loop is closed, or the turn ended after a review, with the target unmet and a remaining item
+  whose "near roofline" or "inherent" claim has no roofline figure, measured fraction and kernel
+  attempt (collectives: no overlap attempt);
+- an iteration carries no kernel-level change and the Python-level change did not delete a whole
+  op chain, with no reason stated;
+- the overhead classes are below the step's noise and the iteration still removes glue instead of
+  boosting one of the largest kernels; or a kernel rewrite starts without the roofline, byte and
+  core accounting of the "Kernel boost checklist", or lands below half the expected gain without the
+  reason and the next structural fix;
+- a precision mode, run type or configuration the hard-constraints block forbids was evaluated,
+  swept or recorded as a rejected candidate;
+- a subset-depth MFU run, a projection or a Tracy table appears in the MFU history or the report
+  as a result rather than as ranking evidence;
+- `doc/perf_analysis.md` deviates from the optimisation-loop document format (prose longer than
+  three lines, sentences in table cells, review caveats appended instead of cells corrected);
+- a commit bundles more than one change, or review fixes of several iterations, so the history
+  does not bisect.
 
 Do not return `more-work-needed` only because a stronger evidence format would
 be nice. If the skill accepts tests, logs and CSVs as evidence, do not invent a

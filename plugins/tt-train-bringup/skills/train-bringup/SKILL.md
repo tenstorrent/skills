@@ -49,9 +49,16 @@ The three [goal templates](../../prompts/train_bringup_multigoal) run in order:
 
 Step time is the sum of five op classes, and only the first is the model: useful math, layout
 overhead, glue overhead, wasted overhead, host/dispatch gap. The plan sets the roofline target, the
-composite bring-up makes the model correct, and the loop removes the four overhead classes and then
-brings the math kernels toward their roofline. The loop ends when the roofline target is met or
-every remaining item is a math kernel already near its own roofline.
+composite bring-up makes the model correct, and the loop removes the four overhead classes and
+brings the math kernels toward their roofline, with kernel work from the first iteration on. The
+loop ends when the roofline target is met or every remaining item is a math kernel proven near its
+own roofline (roofline figure, measured fraction, failed kernel attempt). Fusing and removing small
+ops is the opening of the loop, not its body: the body is rewriting the largest kernels' data flow
+toward their rooflines (optimization-loop, "Kernel boost checklist"), with each kernel measured
+standalone before the full-model run. A stage-review clean-pass
+closes a phase only when that phase's gate is met; in the loop it is a checkpoint, and the agent
+continues to the next iteration in the same turn instead of reporting and stopping. The agent ends
+its turn only when the gate is met or it is blocked on something only the user can decide.
 
 ## Execution
 
