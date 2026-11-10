@@ -74,7 +74,7 @@ import subprocess
 import time
 from pathlib import Path
 
-from . import detach, locks, procowner
+from . import detach, locks, procinfo, procowner
 from .db import load_result
 from .project import Project, durable_write, write_json
 
@@ -94,12 +94,15 @@ CANCEL_TERM_S = 5.0    # a cancelled task's checks: SIGKILL this long after SIGT
 QUEUE = "jobstop-queue"
 EVENT = "detached_job_stopped"
 BY = "jobstop"   # the sender component detach.signalled names
+_PROC = Path("/proc/self/stat").exists()   # Linux; without it (macOS) procinfo reads sysctl and ps
 
 
 # Process groups ---------------------------------------------------------------------------------
 
 def _stat(pid: int) -> tuple[int, int] | None:
-    """(pgid, uid) of a live process (not a zombie), else None. Linux /proc only."""
+    """(pgid, uid) of a live process (not a zombie), else None: /proc, else (macOS) ps."""
+    if not _PROC:
+        return procinfo.stat(pid)
     try:
         st = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
         if st[0] == "Z":
@@ -111,8 +114,10 @@ def _stat(pid: int) -> tuple[int, int] | None:
 
 
 def members(pgid: int) -> list[int]:
-    """The live processes of group pgid ([] where /proc cannot tell)."""
+    """The live processes of group pgid: /proc, else (macOS) one ps of every process; [] where neither tells."""
     out = []
+    if not _PROC:
+        return sorted(pid for pid, (g, _) in procinfo.table().items() if g == pgid)
     try:
         names = os.listdir("/proc")
     except OSError:
@@ -124,6 +129,8 @@ def members(pgid: int) -> list[int]:
 
 
 def _argv(pid: int) -> list[str]:
+    if not _PROC:
+        return procinfo.argv(pid)   # macOS: sysctl KERN_PROCARGS2
     try:
         return [a.decode(errors="replace") for a in Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")[:-1]]
     except OSError:
@@ -141,7 +148,7 @@ def group_of(rc: Path) -> int:
             pid = int(detach.started(rc).read_text().split()[0])
         except (OSError, ValueError, IndexError):
             return 0
-    if _stat(pid) is not None and Path("/proc").is_dir():
+    if _stat(pid) is not None:
         if str(rc) not in _argv(pid):
             return 0
         return pid
@@ -1212,6 +1219,8 @@ def read_pidfile(f: Path) -> list[tuple[int, str | None]]:
 
 
 def _environ(pid: int) -> dict[str, str] | None:
+    if not _PROC:
+        return procinfo.environ(pid)   # macOS: sysctl KERN_PROCARGS2
     try:
         raw = Path(f"/proc/{pid}/environ").read_bytes()
     except OSError:

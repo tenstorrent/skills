@@ -25,7 +25,8 @@ def kill_tree(tmp_path, monkeypatch):
         return orphans[-1]
     t = SimpleNamespace(run_dir=run_dir, child=procs[0].pid, group=procs[1].pid,
                         outside=orphan({}), outside_group=orphan({}, "python3 -c \"import os; os.setsid(); os.execvp('sleep', ['sleep', '60'])\""),
-                        by_env=orphan({"TTP_RUN_DIR": str(run_dir)}))
+                        # not sleep: macOS hides a platform binary's environment (SIP), so it reads as not own
+                        by_env=orphan({"TTP_RUN_DIR": str(run_dir)}, f"{sys.executable} -c 'import time; time.sleep(60)'"))
     (run_dir / "job.pid").write_text(f"{t.child}\n")
     (run_dir / "other.pid").write_text(f"{t.outside}\n")
     deadline = time.time() + 10   # the orphan's setsid runs in it: wait until it leads its own group
@@ -281,3 +282,53 @@ def test_kill_guard_allows_a_group_its_tasks_earlier_run_detached_and_nothing_fo
     finally:
         _end_group(pgid)
         _end_group(opgid)
+
+
+def test_procinfo_parses_kern_procargs2_into_argv_and_the_environment_up_to_its_end(monkeypatch):
+    """KERN_PROCARGS2 is argc, the exec path, NUL padding, argv, then the environment up to an empty
+    string (what follows, such as apple= strings, is not the environment)."""
+    import ctypes
+    from ttp import procinfo
+    raw = ((3).to_bytes(4, sys.byteorder) + b"/usr/bin/python3\0\0\0\0python3\0-c\0/x/rc.json\0"
+           b"FOO=bar\0TTP_RUN_DIR=/r\0\0apple=1\0")
+
+    class Libc:
+        def sysctl(self, mib, n, buf, size, *_):
+            if n == 2:
+                buf._obj.value = 4096
+            else:
+                ctypes.memmove(buf, raw, len(raw))
+                size._obj.value = len(raw)
+            return 0
+    monkeypatch.setattr(procinfo, "DARWIN", True)
+    monkeypatch.setattr(ctypes, "CDLL", lambda *a, **k: Libc())
+    assert procinfo.argv(4242) == ["python3", "-c", "/x/rc.json"]
+    assert procinfo.environ(4242) == {"FOO": "bar", "TTP_RUN_DIR": "/r"}
+    assert procinfo.argv(0) == [] and procinfo.environ(-1) is None
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS has no /proc: the sysctl and ps route")
+def test_macos_stop_paths_read_a_live_childs_argv_group_and_environment_without_proc(tmp_path, monkeypatch):
+    """jobstop and killguard read a process's arguments, (pgid, uid) and environment on macOS, so a pid
+    carrying the job's marker is found and one without it never is."""
+    from ttp import jobstop, killguard
+    rc = tmp_path / "job.rc"
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)", str(rc)], start_new_session=True,
+                             env={"PATH": os.environ["PATH"], "TTP_RUN_DIR": str(tmp_path)})
+    plain = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], start_new_session=True)
+    try:
+        assert _wait_for(lambda: str(rc) in jobstop._argv(child.pid), 10), jobstop._argv(child.pid)
+        assert jobstop._stat(child.pid) == (child.pid, os.getuid())
+        assert jobstop.members(child.pid) == [child.pid]
+        assert jobstop._environ(child.pid)["TTP_RUN_DIR"] == str(tmp_path)
+        rc.with_suffix(".started").write_text(f"{child.pid}\n")
+        assert jobstop.group_of(rc) == child.pid
+        rc.with_suffix(".started").write_text(f"{plain.pid}\n")
+        assert jobstop.group_of(rc) == 0, "a pid without the .rc in its arguments was taken"
+        assert jobstop._argv(1) == [] and jobstop._environ(1) is None   # another user's process
+        procs = killguard._Procs(str(tmp_path))
+        assert procs._env_own(child.pid) and not procs._env_own(plain.pid)
+    finally:
+        for c in (child, plain):
+            c.kill()
+            c.wait()

@@ -227,7 +227,8 @@ class _Procs:
         try:
             env = Path(f"/proc/{pid}/environ").read_bytes()
         except OSError:
-            return False
+            from . import procinfo   # macOS: sysctl KERN_PROCARGS2 (this user's processes only)
+            return (procinfo.environ(pid) or {}).get("TTP_RUN_DIR") == self.run_dir
         return f"TTP_RUN_DIR={self.run_dir}".encode() in env.split(b"\0")
 
     def task_job(self, pgid: int) -> bool:
