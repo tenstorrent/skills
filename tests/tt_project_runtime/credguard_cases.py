@@ -410,6 +410,57 @@ def _cred_ref_why():
     return REF_WHY
 
 
+SSH_OWN_FILE_ALLOWED = [
+    "ssh -F ~/.ssh/site.conf box uptime", 'ssh -F "$HOME/.ssh/site.conf" box true', "ssh -F~/.ssh/site.conf box",
+    "ssh -o UserKnownHostsFile=~/.ssh/site-hosts box true", "ssh -oGlobalKnownHostsFile=~/.ssh/site-hosts box",
+    "ssh -o 'UserKnownHostsFile ~/.ssh/site-hosts ~/.ssh/known_hosts' box",
+    "ssh -F ~/.ssh/site.conf -i ~/.ssh/work-key box true",
+    "ssh -F ~/.ssh/site.conf -o UserKnownHostsFile=~/.ssh/site-hosts -o IdentityFile=~/.ssh/work-key box",
+    "scp -F ~/.ssh/site.conf a box:/tmp/", "sftp -F ~/.ssh/site.conf -i ~/.ssh/work-key box",
+    "rsync -e 'ssh -F ~/.ssh/site.conf' a box:/tmp/", "rsync -e 'ssh -F ~/.ssh/site.conf -i ~/.ssh/work-key' a box:",
+    "git -c core.sshCommand='ssh -F ~/.ssh/site.conf' fetch origin",
+    "GIT_SSH_COMMAND='ssh -F ~/.ssh/site.conf -i ~/.ssh/work-key' git fetch origin",
+]
+SSH_OWN_FILE_REFUSED = [
+    # reads, copies and writes of the same files
+    "cat ~/.ssh/site.conf", "less ~/.ssh/site-hosts", "grep Host ~/.ssh/site.conf", "sed -n 1p ~/.ssh/site.conf",
+    "awk 1 ~/.ssh/site-hosts", "cp ~/.ssh/site.conf /tmp/x", "scp ~/.ssh/site.conf box:/tmp/",
+    "tee /tmp/x < ~/.ssh/site.conf", "cat < ~/.ssh/site-hosts", "python3 -c \"open('$HOME/.ssh/site.conf').read()\"",
+    "ssh -F ~/.ssh/site.conf box; cat ~/.ssh/site.conf", "ssh -F ~/.ssh/site.conf box cat ~/.ssh/site.conf",
+    # a key, or a file holding one, as the config or host list (ssh prints the lines it cannot parse)
+    "ssh -F ~/.ssh/id_ed25519 box", "ssh -F ~/.ssh/work-key box", "ssh -F ~/.ssh/../.ssh/id_ed25519 box",
+    "ssh -o UserKnownHostsFile=~/.ssh/id_ed25519 box", "ssh -o 'UserKnownHostsFile ~/.ssh/site-hosts ~/.ssh/work-key' box",
+    "ssh -F ~/.ssh/key-link box", "ssh -F ~/.ssh/missing.conf box", "ssh -F ~/.ssh/si*.conf box",
+    # the key still passes only when nothing runs a local program, a config from outside ~/.ssh included
+    "ssh -F ~/.ssh/site.conf -o ProxyCommand='cat ~/.ssh/id_ed25519' box", "ssh -F /tmp/c -i ~/.ssh/work-key box",
+    "rsync -e 'ssh -F ~/.ssh/site.conf -i ~/.ssh/work-key $(true)' a box:",
+    "python3 -c \"import os; os.system('ssh -F ' + os.path.expanduser('~/.ssh/site.conf') + ' box')\"",
+]
+
+
+def _own_file_home(tmp_path, monkeypatch):
+    home = _cred_home(tmp_path, monkeypatch)
+    (home / ".ssh" / "site.conf").write_text("Host box\n  User me\n")
+    (home / ".ssh" / "site-hosts").write_text("box ssh-ed25519 AAAA\n")
+    (home / ".ssh" / "work-key").write_text("-----BEGIN OPENSSH PRIVATE KEY-----\nx\n")
+    (home / ".ssh" / "key-link").symlink_to(home / ".ssh" / "id_ed25519")
+    return home
+
+
+def test_ssh_reads_its_own_config_and_host_lists_by_option_and_nothing_else_reads_them(env, tmp_path, monkeypatch):
+    """The class rule's other half: a settings file ssh reads itself (-F, -o UserKnownHostsFile=,
+    GlobalKnownHostsFile=) passes as that option's direct value, in ssh, scp, sftp and the ssh command rsync or git
+    runs, when it is no key and nothing runs a local program; every other mention of it stays a credential read."""
+    from ttp import credguard, hook
+    _own_file_home(tmp_path, monkeypatch)
+    for cmd in SSH_OWN_FILE_ALLOWED:
+        assert credguard.bash_refusal(cmd, hook._all_segments(hook._split(cmd)[0])) is None, cmd
+        assert _bash_why(tmp_path, cmd) == "", cmd
+    for cmd in SSH_OWN_FILE_REFUSED:
+        assert credguard.bash_refusal(cmd, hook._all_segments(hook._split(cmd)[0])), cmd
+        assert "credential stores" in _bash_why(tmp_path, cmd), cmd
+
+
 def test_ssh_host_key_lists_by_any_name_are_public_and_a_key_beside_or_under_one_is_not():
     """known_hosts anywhere in a file name (known_hosts_<site>, <site>_known_hosts) holds public host keys;
     a folder so named does not make the key in it public, nor does a path climbing out of one."""

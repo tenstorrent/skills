@@ -123,9 +123,10 @@ KEY_SAFE = {"echo", "printf", "true", "false", ":", "test", "[", "cd", "pwd", "l
 KEY_ROUTE = ("To use a key as an ssh identity, give it as the direct value of `ssh|scp|sftp -i KEY` or "
              "`-o IdentityFile=KEY`, or in a plain `ssh -i KEY` that `GIT_SSH_COMMAND=... git "
              "fetch|clone|ls-remote` or rsync's -e runs, as a plain shell command with no option that runs a local program (ProxyCommand, "
-             "LocalCommand, KnownHostsCommand, Match exec, -F) and nothing else in the line that runs a program or "
-             "writes, or name the key as IdentityFile in an ssh config, instead of calling them from inside "
-             "interpreter code")
+             "LocalCommand, KnownHostsCommand, Match exec, -F with a config outside ~/.ssh) and nothing else in the "
+             "line that runs a program or writes, or name the key as IdentityFile in an ssh config (given by -F, "
+             "-o UserKnownHostsFile= or GlobalKnownHostsFile= in the same call when it is in ~/.ssh), instead of "
+             "calling them from inside interpreter code")
 
 
 class KeyHit(str):
@@ -689,11 +690,14 @@ def _key_refusal(cmd: str, commands: str, ctx) -> str | None:
 def _ssh_key(argv: list[str], ctx) -> tuple[str | None, bool]:
     """(a protected path the options of ssh, scp or sftp `argv` name, whether they follow credguard's class rule:
     no option runs a local program, and each naming a protected path is its key, -i or -o IdentityFile). A control
-    socket or host list ssh keeps itself (-S, -o ControlPath=, credguard.ssh_public) is none."""
+    socket or host list ssh keeps itself (-S, -o ControlPath=, credguard.ssh_public) is none, and so is a settings
+    file ssh reads itself (-F, -o UserKnownHostsFile=, GlobalKnownHostsFile=, credguard.ssh_files)."""
     from . import credguard
     keys, hit, ok = credguard.ssh_keys(argv), None, not credguard.ssh_runs_local(argv)
+    files = credguard.ssh_files(argv)
     for o, val, word in credguard.ssh_options(argv):
-        own = o in "So" and word not in keys and credguard.ssh_public(os.path.basename(re.split(r"[\s=]", val)[-1]))
+        own = word in files or o in "So" and word not in keys and credguard.ssh_public(
+            os.path.basename(re.split(r"[\s=]", val)[-1]))
         if not own and (h := _names(val, ctx)):
             hit, ok = hit or h, ok and word in keys
     return hit, ok

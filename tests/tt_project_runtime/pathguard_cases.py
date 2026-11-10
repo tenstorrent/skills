@@ -224,6 +224,25 @@ def test_pathguard_names_the_shell_route_for_a_key_in_inline_code(cred_home):
     assert "IdentityFile" not in pathguard_why(_pg_bash("echo x > ~/.ssh/config", cred_home.work))
 
 
+def test_pathguard_lets_ssh_read_its_own_config_and_host_lists_by_option(cred_home):
+    """-F, -o UserKnownHostsFile= and GlobalKnownHostsFile= naming a settings file in ~/.ssh are ssh's own reads,
+    beside a key too (credguard.ssh_files); a key given as one, or a write beside it, is still refused."""
+    ssh = cred_home.home / ".ssh"
+    (ssh / "site.conf").write_text("Host box\n")
+    (ssh / "site-hosts").write_text("box ssh-ed25519 AAAA\n")
+    (ssh / "k").write_text("-----BEGIN OPENSSH PRIVATE KEY-----\n")
+    for cmd in ("ssh -F ~/.ssh/site.conf box true", "ssh -F ~/.ssh/site.conf -i ~/.ssh/k box true",
+                "ssh -o UserKnownHostsFile=~/.ssh/site-hosts -o GlobalKnownHostsFile=~/.ssh/site-hosts box",
+                "scp -F ~/.ssh/site.conf -i ~/.ssh/k a box:", "rsync -e 'ssh -F ~/.ssh/site.conf -i ~/.ssh/k' a box:",
+                "GIT_SSH_COMMAND='ssh -F ~/.ssh/site.conf -i ~/.ssh/k' git fetch",
+                "git -c core.sshCommand='ssh -F ~/.ssh/site.conf' fetch"):
+        assert pathguard_why(_pg_bash(cmd, cred_home.work)) is None, cmd
+    for cmd in ("ssh -F ~/.ssh/k box", "ssh -o UserKnownHostsFile=~/.ssh/k box",
+                "ssh -F ~/.ssh/site.conf box true > ~/.ssh/site.conf", "ssh -F ~/.ssh/site.conf box; cp a ~/.ssh/site.conf",
+                "ssh -F ~/.ssh/site.conf -o ProxyCommand=true -i ~/.ssh/k box"):
+        assert pathguard_why(_pg_bash(cmd, cred_home.work)), cmd
+
+
 def pathguard_why(payload, cfg=None):
     from ttp import pathguard
     return pathguard.refusal(payload, cfg=cfg or {})

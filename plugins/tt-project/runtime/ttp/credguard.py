@@ -18,9 +18,12 @@ stays in the run's log and transcript, so the stores are kept out of tool calls 
   (GIT_SSH_COMMAND right before git, `git -c core.sshCommand=`, for fetch, clone and ls-remote) or
   rsync (`-e`, `--rsh`, RSYNC_RSH right before rsync) runs, and only when nothing in that call runs a
   local program: no ProxyCommand, LocalCommand, KnownHostsCommand, Match exec, Include or provider
-  option, no `-F` with another config (ssh_runs_local), no shell separator or substitution inside the
-  ssh command, no git option that runs one (GIT_RUNS_RE). Every other mention of a key path is
-  refused (an exported GIT_SSH_COMMAND too). Also passing: a key path handed to ssh-add or
+  option, no `-F` with a config outside ~/.ssh (ssh_runs_local), no shell separator or substitution
+  inside the ssh command, no git option that runs one (GIT_RUNS_RE). Every other mention of a key
+  path is refused (an exported GIT_SSH_COMMAND too). The same calls may name ssh's own settings files
+  in ~/.ssh by any name (ssh_files): the direct value of `-F` or of `-o UserKnownHostsFile=` or
+  `GlobalKnownHostsFile=`, when each file exists and is no private key (ssh_own_file); any other
+  mention of such a file is refused like a key's. Also passing: a key path handed to ssh-add or
   ssh-keygen, a config given by its tool's option (`kubectl --kubeconfig`, CONFIG_OPTIONS) or
   variable (`KUBECONFIG=`, CONFIG_VARS), mkdir, chmod, chown, touch and test of them, and ls or stat
   of a store folder itself (any other mention of the folder, or a glob naming it, does not);
@@ -29,7 +32,8 @@ stays in the run's log and transcript, so the stores are kept out of tool calls 
   find whose name test matches a private key or credential file is refused. Known gaps, accepted: a
   path built at run time inside a script or inline code; a recursive read of all of HOME or
   ~/.config (`grep -r x ~`); programs git starts on its own that inherit its ssh command (hooks or
-  config an earlier call set up); ssh options in a config file an earlier call wrote; a key path
+  config an earlier call set up); ssh options in a config file an earlier call wrote, or in one in
+  ~/.ssh given by -F (a ProxyCommand there runs, as it does from ~/.ssh/config); a key path
   read back from the process table of a running ssh.
 Secrets stay reachable only through `ttp secret env` (hook.secret_read).
 
@@ -80,6 +84,9 @@ CONFIG_VARS = ("KUBECONFIG=", "DOCKER_CONFIG=", "AWS_SHARED_CREDENTIALS_FILE=", 
 SSH_FAMILY = {"ssh", "scp", "sftp", "autossh", "ssh-copy-id"}
 # The ssh -o option that names a key ssh reads itself
 SSH_KEY_OPTION_RE = re.compile(r"\s*IdentityFile[\s=]", re.I)
+# the host lists ssh reads (and adds to) itself: one or more files after the option name
+SSH_HOSTS_OPTION_RE = re.compile(r"(?i)\s*(?:user|global)knownhostsfile(?:\s*=\s*|\s+)(.*)")
+SSH_KEY_NAME_RE = re.compile(r"^id_(?!.*\.pub$)|\.(?:pem|key|ppk|p12|pfx)$")
 # ssh -o options that run a local program or read another config or library
 SSH_RUNS_RE = re.compile(r"(?i)\s*(?:proxycommand|localcommand|permitlocalcommand|knownhostscommand|match|include"
                          r"|pkcs11provider|securitykeyprovider|xauthlocation)\b")
@@ -204,7 +211,7 @@ def _passing_words(argv: list[str], hands_on: bool = True) -> list[str]:
     if option:
         return ([w for prev, w in zip(argv[1:], argv[2:]) if prev == option]
                 + [w for w in argv[1:] if w.startswith(option + "=")])
-    return ssh_keys(argv) if name in SSH_FAMILY else []
+    return ssh_keys(argv) + ssh_files(argv) if name in SSH_FAMILY else []
 
 
 def ssh_options(argv: list[str]) -> list[tuple[str, str, str]]:
@@ -232,11 +239,44 @@ def ssh_options(argv: list[str]) -> list[tuple[str, str, str]]:
     return out
 
 
+def ssh_own_file(value: str) -> bool:
+    """`value` names one of ssh's own settings files in ~/.ssh (a config or host list), which a run cannot
+    write (pathguard), as ~/, $HOME/ or an absolute path, and the file is no private key, neither by its
+    name (id_*, *.pem, *.key, ...) nor by its first bytes (ssh would print the lines it cannot parse)."""
+    home = os.path.expanduser("~")
+    path = re.sub(r"^\$(?:HOME|\{HOME\})(?=/)", lambda _: home, value)
+    if not path.startswith(("~/", "/")) or re.search(r"[*?\[%$`]", path):
+        return False
+    ssh, real = os.path.realpath(os.path.join(home, ".ssh")), os.path.realpath(os.path.expanduser(path))
+    if not real.startswith(ssh + os.sep) or SSH_KEY_NAME_RE.search(os.path.basename(real)) or os.path.isdir(real):
+        return False
+    try:
+        with open(real, "rb") as f:
+            head = f.read(4096)
+    except OSError:   # missing or unreadable: none (ssh would make a new host list there)
+        return False
+    return b"PRIVATE KEY" not in head and b"PuTTY-User-Key" not in head
+
+
+def ssh_files(argv: list[str]) -> list[str]:
+    """The words naming ssh's own settings files in an ssh, scp or sftp call: the value of -F, or of
+    -o UserKnownHostsFile= or GlobalKnownHostsFile=, when each file it names passes ssh_own_file."""
+    out = []
+    for o, v, word in ssh_options(argv):
+        m = SSH_HOSTS_OPTION_RE.match(v) if o == "o" else None
+        files = [v] if o == "F" else m[1].split() if m else []
+        if files and all(map(ssh_own_file, files)):
+            out.append(word)
+    return out
+
+
 def ssh_runs_local(argv: list[str]) -> bool:
-    """An ssh, scp or sftp call whose options run a local program or read another config (-F,
-    ProxyCommand, LocalCommand, KnownHostsCommand, Match exec, Include, a provider library, scp -S)."""
+    """An ssh, scp or sftp call whose options run a local program or read another config (-F with a
+    config outside ~/.ssh (ssh_own_file), ProxyCommand, LocalCommand, KnownHostsCommand, Match exec,
+    Include, a provider library, scp -S)."""
     runs = SSH_OPTS.get(os.path.basename(argv[0]), SSH_OPTS["ssh"])[1]
-    return any(o in runs or o == "o" and SSH_RUNS_RE.match(v) for o, v, _ in ssh_options(argv))
+    return any(o in runs and not (o == "F" and ssh_own_file(v)) or o == "o" and SSH_RUNS_RE.match(v)
+               for o, v, _ in ssh_options(argv))
 
 
 def ssh_keys(argv: list[str]) -> list[str]:

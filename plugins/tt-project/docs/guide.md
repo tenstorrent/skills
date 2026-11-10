@@ -3951,11 +3951,20 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   (`GIT_SSH_COMMAND` right before git, `-c core.sshCommand=`, for fetch, clone and ls-remote) or
   rsync (`-e`, `--rsh`, `RSYNC_RSH` right before rsync) runs, and nothing in that call runs a local
   program (no `ProxyCommand`, `LocalCommand`, `KnownHostsCommand`, `Match exec`, `Include`, `-F`
-  with another config, scp or sftp `-S`, no `;`, `|` or `$(...)` inside the ssh command, no git
-  `-c` alias or `--upload-pack`). Every other mention of a key path, an exported
-  `GIT_SSH_COMMAND` too, is refused as a credential-store read. Known gaps, accepted: programs git
-  starts on its own (hooks, config an earlier call wrote), an ssh config an earlier call wrote, and
-  a key path read back from a running ssh's process table. `ssh-add`, `ssh-keygen`, and chmod or
+  with a config outside `~/.ssh`, scp or sftp `-S`, no `;`, `|` or `$(...)` inside the ssh command,
+  no git `-c` alias or `--upload-pack`). Every other mention of a key path, an exported
+  `GIT_SSH_COMMAND` too, is refused as a credential-store read. The same rule lets ssh read its own
+  settings files in `~/.ssh` by any name: the direct value of `-F <config>`, `-o
+  UserKnownHostsFile=` or `-o GlobalKnownHostsFile=` (one or more files) passes in the same calls,
+  beside a key too, when the file exists and is no private key by name (`id_*`, `*.pem`, `*.key`,
+  ...) or content (ssh prints the lines of a config it cannot parse). `cat`, `grep`, `cp`, scp with
+  the file as a source, a redirect or inline code naming such a file stays refused. For the
+  harness's own host checks (`ttp hostcheck`), a route that needs its own ssh config is set as
+  `coordinator.session.host_access.<alias>`: a config file in the project folder, which the harness
+  passes as `ssh -F`. Known gaps, accepted: programs git starts on its own (hooks, config an earlier
+  call wrote), ssh options in a config in `~/.ssh` (a `ProxyCommand` there runs, as it does for
+  `~/.ssh/config`), an ssh config an earlier call wrote, and a key path read back from a running
+  ssh's process table. `ssh-add`, `ssh-keygen`, and chmod or
   test of a key pass; a `stat` with a format
   (`-c`, `--format`, `--printf`) passes when nothing pipes or redirects its output, and a path with a
   `..` part never counts as public. A command ssh runs on another host is checked the
