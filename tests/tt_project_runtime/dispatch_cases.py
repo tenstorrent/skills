@@ -2339,7 +2339,11 @@ def test_a_run_that_queued_its_task_again_itself_is_not_refused_past_its_attempt
 def _branch_calls(env, n):
     """A project with `n` finished code-task branches, each committing pkg/lib.py, and a queued code task
     whose spec names that file: (project, queued task id)."""
-    p = make(env)
+    return _branch_calls_named(env, n, "demo")
+
+
+def _branch_calls_named(env, n, name):
+    p = make(env, name)
     (p.root / "pkg").mkdir(exist_ok=True)
     (p.root / "pkg/lib.py").write_text("x = 0\n")
     _git_out(p.root, "add", "pkg/lib.py")
@@ -2393,6 +2397,31 @@ def test_a_workers_start_reads_no_git_per_unlanded_branch(env, monkeypatch):
     off = overlap._load_off(p)
     assert off["prev"] and overlap._carried(p, off) == set()
     assert overlap._on_push_branch(p, {"open": False, "head": sha, "branch": branch}, [], off)
+
+
+def test_the_first_start_after_a_tip_move_reads_the_same_git_for_4_or_12_branches(env, monkeypatch):
+    """Review #246: the carried heads were cached only inside a gitmemo scope, so a start outside one
+    (the worker-start prompt runs under a dispatch pass) reread them for every branch: the git count
+    after a tip move grew with the branch count. It is now read once per prompt build."""
+    from ttp import gitmemo, landed, overlap
+    counts = []
+    for n in (4, 12):
+        p, q = _branch_calls(env, n) if n == 4 else _branch_calls_named(env, n, f"demo{n}")
+        p.set_config("delivery.push_branch", "t79-push")
+        push_ref = landed._push_ref(p, p.root)
+        _git_out(p.root, "update-ref", push_ref, "HEAD")
+        overlap.prompt_block(p, p.db.task(q))
+        (p.root / f"other{n}.txt").write_text("o\n")
+        _git_out(p.root, "add", f"other{n}.txt")
+        _git_out(p.root, "commit", "-qm", "other")
+        _git_out(p.root, "update-ref", push_ref, "HEAD")
+        calls = []
+        real = gitmemo.run
+        monkeypatch.setattr(gitmemo, "run", lambda argv, *a, **k: calls.append(argv) or real(argv, *a, **k))
+        overlap.prompt_block(p, p.db.task(q))
+        monkeypatch.setattr(gitmemo, "run", real)
+        counts.append(len(calls))
+    assert counts[0] == counts[1] and counts[1] <= 11, counts
 
 
 def test_slow_git_dispatch_starts_every_ready_task_in_one_step(env, monkeypatch, tmp_path, reap_tmp_processes):

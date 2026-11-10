@@ -307,12 +307,15 @@ def _carried(p, off: dict) -> set:
     the commits the tip gained (old..new, no merges) is one of the head's own commits, names one in a
     replay trailer, shares one's author, date and subject, or touches a file the head's commits touch,
     which every check landed.py makes needs. Three git reads for all heads at once, read once per tip
-    move, instead of each branch's own landed reads at the first start after every landing."""
-    prev = off.get("prev")
-    if not prev or not prev["heads"]:
-        return set()
-    return gitmemo.cached(("overlap.carried", prev["tip"], off["tip"]),
-                          lambda: _carry(p, prev["tip"], off["tip"], prev["heads"]))
+    move, instead of each branch's own landed reads at the first start after every landing. Kept in
+    `off` itself, so every branch one _load_off result checks shares it with or without a gitmemo scope
+    (a worker's start builds its prompt under a dispatch pass, not a scope)."""
+    if "carried" not in off:
+        prev = off.get("prev")
+        off["carried"] = (gitmemo.cached(("overlap.carried", prev["tip"], off["tip"]),
+                                         lambda: _carry(p, prev["tip"], off["tip"], prev["heads"]))
+                          if prev and prev["heads"] else set())
+    return off["carried"]
 
 
 def _commits(p, *revs: str) -> dict | None:
