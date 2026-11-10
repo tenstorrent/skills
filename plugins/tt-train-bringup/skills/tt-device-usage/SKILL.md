@@ -55,6 +55,27 @@ Use this skill for the hardware-facing parts of training bring-up. It covers onl
   stderr line behind an environment variable in the new branch (how many tensors it batched, which
   config it chose) and read it in the run's log before believing the measurement.
 
+## Mesh Setup
+
+A multi-chip run opens a mesh, not a device, and the whole box is one job: nothing else may hold
+any of its chips while it runs.
+
+- The mesh graph descriptor (MGD) comes from tt-train's `configs/mgd/` (for example
+  `bh_2_2_line_line.textproto`, `bh_qb_1_4_ring_ring.textproto`) and is passed through
+  `TT_MESH_GRAPH_DESC_PATH`, set before the process creates its first device. Its
+  `device_topology` dims must equal the mesh shape the code opens; record the file and its dims
+  with every run.
+- Open with `ttml.open_device_mesh(ttml.Mesh((R, C), (axis0, axis1)))` and close with
+  `ttml.close_device_mesh()`. Name the axes after their use (`dp`, `tp`); `ttml.sync_gradients`
+  reduces over the axis named `dp`.
+- Before any model code on a shape, run this plugin's `scripts/tt_mesh_smoke.py --shape RxC` as
+  its own bounded device job (`timeout 900`). It opens the mesh, all-reduces a distinct integer per
+  chip along every axis and checks every chip's result exactly; `--bandwidth-mib 16` also times
+  the all-reduce per axis for the plan's collective cost. A shape whose smoke fails is not a
+  candidate for the plan; record the failure and its reason rather than working around it.
+- A physical topology does not open every logical shape (a QuietBox wired as `2x2` may refuse
+  `1x4`). The smoke decides, not the descriptor's name.
+
 ## Telemetry And Clock
 
 - Every MFU run carries the ARC telemetry sampler from this plugin,
@@ -100,6 +121,11 @@ timeout 60 tt-smi -ls --local
 ```
 
 After reset, check that the target chip is visible. If reset returns but the device is missing, run the bounded reset sequence one more time before escalating.
+
+On a mesh, a reset and the health check cover every chip of the mesh, not only the one that
+failed: `tt-smi -r` resets all of them, the list must show every chip of the shape, and the
+smoke afterwards is `scripts/tt_mesh_smoke.py --shape RxC` on the run's shape. A mesh with one
+missing chip is a missing mesh.
 
 When device listing looks healthy, prove the device can actually open and close before resuming the phase:
 
@@ -168,6 +194,11 @@ python -m pip install -r tools/triage/requirements.txt
 ```
 
 Read `tools/triage/tt-triage.md` for command details and available scripts. Keep the triage output with the phase evidence.
+
+A mesh hang is captured per chip: one capture covers every chip of the mesh, and the evidence
+names, for each chip, the running operation and its call stack, plus the Ethernet status of every
+link between the chips. A collective hangs on the chip that is waiting, not the one that is late;
+the late chip is the finding.
 
 After capturing triage, use `$autofix` for the failure if ordinary log reading does not explain it. `$autofix` will run `$autodebug` when needed. Give it the failing command, console log, `tt-triage.txt`, current phase work log, and relevant source paths. Do not declare a phase blocked for a hang until `$autofix` has tried and failed, unless the remaining blocker is unavailable hardware or operator-only recovery.
 
