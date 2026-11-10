@@ -11583,7 +11583,7 @@ def cmd_account_config(key: str, value: str | None) -> None:
     bad = setting_problems({k: val}) if sec == "budget" and val not in ("", None) else []
     if key == checkspill.ACCOUNT_KEY and val not in ("", None):
         try:
-            val = checkspill.hosts_of(val) or ""   # an empty pool is no pool: removed
+            val = checkspill.entries_of(val) or ""   # an empty pool is no pool: removed
         except ValueError as e:
             bad = [str(e).replace(f"delivery.{checkspill.KEY}", key)]
         if not bad and (why := checkspill.ban_refusal(key, val)):

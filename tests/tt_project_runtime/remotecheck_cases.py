@@ -3817,6 +3817,76 @@ def test_a_tasks_checks_never_start_anyway_on_an_overloaded_pinned_host(env, tmp
     assert slot.pinned == [] and checkspill._ours("check-host-a") == 0
 
 
+
+
+def test_spill_host_entries_take_their_own_max_runs_and_jobs_and_plain_aliases_still_work(env, capsys):
+    """A spill-host list may mix plain aliases with tables `{"host", "max_runs", "jobs"}` (checkspill.entries_of):
+    hosts_of reads the aliases as before, limits the table's numbers; a bad table is refused whole."""
+    from ttp import checkspill, cli
+    v = ["check-host-a", {"host": " check-host-b ", "max_runs": 1, "jobs": 6}, {"host": "check-host-c"},
+         "check-host-a"]
+    assert checkspill.entries_of(v) == ["check-host-a", {"host": "check-host-b", "max_runs": 1, "jobs": 6},
+                                        "check-host-c"]
+    assert checkspill.hosts_of(v) == ["check-host-a", "check-host-b", "check-host-c"]
+    assert checkspill.hosts_of(json.dumps(v)) == checkspill.hosts_of(v)
+    assert checkspill.hosts_of(["check-host-a", "check-host-b"]) == ["check-host-a", "check-host-b"]
+    cfg = {"delivery": {"checks_spill_hosts": v}}
+    assert checkspill.limits(cfg, "check-host-b") == {"max_runs": 1, "jobs": 6}
+    assert checkspill.limits(cfg, "check-host-a") == {} and checkspill.limits(cfg, "nope") == {}
+    for bad in ([{"host": "check-host-a", "max_runs": 0}], [{"host": "check-host-a", "jobs": True}],
+                [{"host": "check-host-a", "jobs": "4"}], [{"host": "check-host-a", "slots": 2}],
+                [{"max_runs": 1}], [{"host": "local"}]):
+        with pytest.raises(ValueError):
+            checkspill.entries_of(bad)
+    cli.main(["config", "--account", "checks.spill_hosts", '[{"host": "pool-a", "max_runs": 1, "jobs": 8}, "pool-b"]'])
+    assert checkspill.account_hosts() == ["pool-a", "pool-b"]
+    assert checkspill.limits({}, "pool-a") == {"max_runs": 1, "jobs": 8}, "the account's pool keeps its limits"
+    with pytest.raises(SystemExit):
+        cli.main(["config", "--account", "checks.spill_hosts", '[{"host": "pool-a", "max_runs": -1}]'])
+    assert "checks.spill_hosts" in capsys.readouterr().err
+    assert checkspill.limits({}, "pool-a") == {"max_runs": 1, "jobs": 8}
+
+
+def test_a_spill_host_capped_by_max_runs_refuses_a_second_run_and_the_next_host_takes_it(env, tmp_path, monkeypatch):
+    """max_runs 1: the host takes one of this machine's checks at once though its idle cores fit more; a second
+    run goes to the next host, and with none left it is told why and waits; freed, the host takes one again."""
+    from ttp import checkspill
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch,
+                                        [{"host": "check-host-a", "max_runs": 1}, "check-host-b"])
+    told: list[str] = []
+    first = checkspill.pick(p, p.config(), told.append, "pytest -q")
+    second = checkspill.pick(p, p.config(), told.append, "pytest -q")
+    try:
+        assert first is not None and first.host == "check-host-a", told
+        assert second is not None and second.host == "check-host-b", told
+        assert "check-host-a (its max_runs 1 of this machine's checks run there already" in told[-1], told
+        p.set_config("delivery.checks_spill_hosts", [{"host": "check-host-a", "max_runs": 1}])
+        assert checkspill.pick(p, p.config(), told.append, "pytest -q") is None
+        assert "max_runs 1" in told[-1], told
+    finally:
+        second.close()
+        first.close()
+    again = checkspill.pick(p, p.config(), told.append, "pytest -q")
+    assert again is not None and again.host == "check-host-a"
+    again.close()
+
+
+def test_a_spill_hosts_jobs_setting_is_the_test_workers_its_runs_get(env, tmp_path, monkeypatch):
+    """jobs 6: a run spilled there gets 6 test workers (the grant its xdist -n reads), not the host's idle cores
+    nor one run's usual limit, and the run says so."""
+    from ttp import checkspill, cli, testslots
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, [{"host": "check-host-a", "jobs": 6}])
+    monkeypatch.setattr(checkspill, "_PROBE", checkspill._PROBE.replace("c=$(nproc", "c=$(echo 64 || nproc"))
+    seen = tmp_path / "seen"
+    p.set_config("delivery.push_checks", [f"printf %s \"${testslots.SLOTS_ENV}\" > {seen}"])
+    p.set_config("checks.test_run_max", 4)
+    cli.main(["checks", "--fresh"])
+    rec = json.loads((run / "checks.json").read_text())
+    assert rec["passed"] is True and rec["spilled_to"] == "check-host-a", rec
+    assert seen.read_text() == "6", "the host's jobs, not its idle cores or test_run_max"
+    assert "with 6 test worker(s), its jobs setting" in (run / "checks.log").read_text()
+
+
 def test_a_check_reading_git_history_stays_here_and_the_rest_of_its_run_spills(env, tmp_path, monkeypatch):
     """Upstream note 92664c3b34114013: a spill host's copy has one commit, so `git diff --check <base>` exited 128
     there. A check that runs a git command reading commits (any form: options, an env prefix, a shell -c, an

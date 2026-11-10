@@ -66,6 +66,11 @@ take more. A claim whose remote ttp-check.* folder is not made yet (the few seco
 counted by neither, so the host can take one run more than its slots in that gap: a bound, not a guard.
 A run's folder that no process uses and whose run script is gone (its host or link died before it could
 clean up) does not count, and is removed once stale (_PROBE).
+An entry of either list may be a table instead of an alias, `{"host": "<alias>", "max_runs": 1, "jobs": 16}`
+(limits; both optional): max_runs caps this machine's checks running there at once (its claim files, which every
+project here shares) below what its idle cores allow, and jobs gives each run there that many test workers
+(the xdist -n its grant sets) instead of sizing them from the host's idle cores; a smaller box, or one whose
+tests time out under load, gets a lower jobs.
 
 Only a run whose every check may spill spills (check_spills): none with a host of its own (`host`,
 delivery.checks_host; `"host": "local"` too unless the check says `"spill": true`), none that says
@@ -246,9 +251,14 @@ def _device_holders(out: str) -> tuple[str, str]:
     return "", f"its device holder scan did not finish (exit {rc.group(1) if rc else 'unknown'})"
 
 
-def hosts_of(v: Any) -> list[str]:
-    """A `delivery.checks_spill_hosts` value set by `ttp config`: a list (or a JSON-encoded list) of ssh
-    aliases. ValueError for anything else: a scalar or a table is refused, never read as one host."""
+LIMIT_KEYS = ("max_runs", "jobs")   # a host entry's own limits (entries_of): runs at once, test workers per run
+
+
+def entries_of(v: Any) -> list:
+    """A `delivery.checks_spill_hosts` (or checks.spill_hosts) value set by `ttp config`, normalized: a list (or
+    a JSON-encoded list) of ssh aliases, each either a string or a table `{"host": "<alias>", "max_runs": N,
+    "jobs": N}` giving that host its own limits (both optional, positive integers; limits). ValueError for
+    anything else: a scalar or a table is refused, never read as one host; so is an unknown key in an entry."""
     if isinstance(v, str) and v.strip().startswith("["):
         try:
             v = json.loads(v)
@@ -257,10 +267,57 @@ def hosts_of(v: Any) -> list[str]:
     if not isinstance(v, (list, tuple)):
         raise ValueError(f"delivery.{KEY}: {v!r} is not a list of ssh aliases (e.g. [\"check-host-a\"]); "
                          "nothing was changed")
-    out = [str(x).strip() if isinstance(x, str) else x for x in v]
-    if bad := [why for x in out if (why := _host_problem(x))]:
+    out, bad, seen = [], [], set()
+    for x in v:
+        if isinstance(x, dict):
+            alias = x.get("host").strip() if isinstance(x.get("host"), str) else x.get("host")
+            extra = sorted(set(x) - {"host", *LIMIT_KEYS})
+            nums = [k for k in LIMIT_KEYS if k in x
+                    and (isinstance(x[k], bool) or not isinstance(x[k], int) or x[k] < 1)]
+            if why := _host_problem(alias):
+                bad.append(why)
+            elif extra:
+                bad.append(f"{alias!r}: unknown key(s) {', '.join(map(repr, extra))} (allowed: host, "
+                           + ", ".join(LIMIT_KEYS) + ")")
+            elif nums:
+                bad.append(f"{alias!r}: {', '.join(nums)} must be a positive whole number")
+            entry = {"host": alias, **{k: x[k] for k in LIMIT_KEYS if k in x}}
+            entry = alias if len(entry) == 1 else entry
+        else:
+            alias = entry = x.strip() if isinstance(x, str) else x
+            if why := _host_problem(alias):
+                bad.append(why)
+        if not bad and alias not in seen:
+            seen.add(alias)
+            out.append(entry)
+    if bad:
         raise ValueError(f"delivery.{KEY}: " + "; ".join(bad) + "; nothing was changed")
-    return list(dict.fromkeys(out))
+    return out
+
+
+def hosts_of(v: Any) -> list[str]:
+    """The ssh aliases of a spill-host list (entries_of), in order: the limits of a table entry left out."""
+    return [e["host"] if isinstance(e, dict) else e for e in entries_of(v)]
+
+
+def limits(cfg: dict | None, alias: str) -> dict:
+    """A spill host's own limits, `{"max_runs": N, "jobs": N}` or part of it, from the first entry naming it in
+    the project's list, else the account's pool; {} for a plain alias or a malformed list. max_runs: this
+    machine's checks running there at once, at most (pick: its claims, which every project here shares);
+    jobs: a run's test workers there, instead of the host's idle cores (workers)."""
+    from . import project
+    lists = [((cfg or {}).get("delivery") or {}).get(KEY) or [],
+             (project.load_account_settings().get("checks") or {}).get("spill_hosts") or []]
+    for v in lists:
+        try:
+            for e in entries_of(v):
+                if isinstance(e, dict) and e["host"] == alias:
+                    return {k: e[k] for k in LIMIT_KEYS if k in e}
+                if e == alias:
+                    return {}
+        except ValueError:
+            continue
+    return {}
 
 
 def excludes_of(v: Any) -> list[str]:
@@ -430,11 +487,11 @@ def banned_listed(cfg: dict | None) -> list[str]:
     return banned_in(list(dict.fromkeys([*mine, *account_hosts()])))
 
 
-def settable_hosts(v: Any) -> list[str]:
-    """hosts_of(v) for a config_set of delivery.checks_spill_hosts; ValueError also when it names a host the
-    account's checks.no_spill_hosts bans."""
-    got = hosts_of(v)
-    if why := ban_refusal(f"delivery.{KEY}", got):
+def settable_hosts(v: Any) -> list:
+    """entries_of(v) for a config_set of delivery.checks_spill_hosts (aliases and tables with limits); ValueError
+    also when it names a host the account's checks.no_spill_hosts bans."""
+    got = entries_of(v)
+    if why := ban_refusal(f"delivery.{KEY}", [e["host"] if isinstance(e, dict) else e for e in got]):
         raise ValueError(why)
     return got
 
@@ -1671,9 +1728,11 @@ def pick(p, cfg: dict, tell, what: str = "", off: str = "", why_here: str = "") 
     probed = _probe_all([(host, beside) for _, _, host, why, _, _, beside in gated if not why])
     cands = []
     for i, (alias, machine, host, why, usable, dev, beside) in enumerate(gated):
-        free, note, size = 0, "", (0, "")
+        free, note, size, lim = 0, "", (0, ""), limits(cfg, alias)
         if not why:
             free, why, note = probed[host]
+            if not why and "max_runs" in lim and (free := min(free, lim["max_runs"] - _ours(host))) <= 0:
+                why = f"its max_runs {lim['max_runs']} of this machine's checks run there already"
             if why.startswith(DEVICE_WHY):
                 _note_skip(host, why, p.name)
             if note.startswith(DEVICE_WHY):
@@ -1695,6 +1754,8 @@ def pick(p, cfg: dict, tell, what: str = "", off: str = "", why_here: str = "") 
                 LAST_BUSY.append(alias)
                 continue
             got.workers, sized = size
+            if jobs := limits(cfg, alias).get("jobs"):   # the host entry's own test workers, instead of its idle cores
+                got.workers, sized = jobs, f"{jobs} test worker(s), its jobs setting"
             got.note({**rec, "host": host, **({"beside": dev[:300]} if dev else {}),
                       **({"workers": got.workers} if got.workers else {})})   # its cores, for used_share
             note_here(p.name, "")   # this run is on a spill host now: no reason to show it here
