@@ -187,6 +187,51 @@ class Codex(Provider):
                       "".join(json.dumps(r) + "\n" for r in rows), mode=0o600)
         return ""
 
+    def own_instructions(self, session_id: str, cwd: str, env: dict | None, text: str) -> str:
+        # `codex exec resume` keeps the developer messages saved in the rollout and takes no new
+        # `-c developer_instructions` (0.160), and re-sends them after a compaction (each compacted
+        # row's histories hold them too). A worker forked from a coordinator without tools so ran under
+        # "This session has no tools" and did no work. The run's text replaces the harness's own blocks
+        # in every developer message, wherever it is nested; Codex's own blocks (they start with "<",
+        # as <skills_instructions>) stay.
+        src = self.session_paths(session_id, cwd, env)
+        if not src:
+            return ""   # nothing here to rewrite: the resume finds no session either, or one Codex keeps elsewhere
+        path = max(src, key=lambda x: x.stat().st_mtime)
+        hits = [0]
+
+        def swap(node):
+            if isinstance(node, list):
+                return [swap(x) for x in node]
+            if not isinstance(node, dict):
+                return node
+            if node.get("role") == "developer" and isinstance(node.get("content"), list):
+                content, mine = [], False
+                for part in node["content"]:
+                    if isinstance(part, dict) and isinstance(part.get("text"), str) \
+                            and not part["text"].lstrip().startswith("<"):
+                        hits[0] += 1
+                        if mine:   # one harness block per message: the run's text once
+                            continue
+                        part, mine = {**part, "text": text}, True
+                    content.append(part)
+                return {**node, "content": content}
+            return {k: swap(v) for k, v in node.items()}
+
+        out = []
+        for line in path.read_text(errors="replace").split("\n"):
+            try:
+                row = json.loads(line)
+            except ValueError:
+                out.append(line)   # a partial or blank line stays as it was
+                continue
+            out.append(json.dumps(swap(row)) if isinstance(row, (dict, list)) else line)
+        if not hits[0]:
+            return "the session holds no developer instructions to replace"
+        from ..project import durable_write
+        durable_write(path, "\n".join(out), mode=0o600)
+        return ""
+
     def build(self, *, role, model, effort, cwd, budget_usd, read_only, schema, restrictions,
               disallowed_tools=(), denied_reads=(), web=True):
         exe = self.binary() or "codex"

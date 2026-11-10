@@ -387,6 +387,13 @@ class Provider:
         written. "" once done, else why not (the caller then takes the disk block)."""
         return self.fork_gap(src_provider) or self.fork_session(session_id, cwd, env, new_id)
 
+    def own_instructions(self, session_id: str, cwd: str, env: dict | None, text: str) -> str:
+        """Give a worker or reviewer run that resumes a saved session (a fork of the coordinator's, a
+        follow-up's resume, its own continued one) `text`, this launch's system prompt, where the agent
+        keeps the session's first one on a resume. "" once done or not needed (default: the agent takes
+        each launch's system prompt, as Claude Code's --append-system-prompt-file), else why not."""
+        return ""
+
     def add_subagent_usage(self, usage: "RunUsage", output_path: Path, since: float | None = None,
                            env: dict | None = None) -> None:
         """Add to `usage` (parse's) what the run's sub-agents spent where the agent books them apart from

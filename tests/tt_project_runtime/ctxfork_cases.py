@@ -861,3 +861,107 @@ def test_a_follow_up_on_another_model_starts_fresh_never_resuming_the_other_mode
     copy = cfg_dir / "projects" / re.sub(r"[^a-zA-Z0-9]", "-", str(p.root)) / f"{got['session']}.jsonl"
     assert "OTHER MODEL'S HISTORY" not in copy.read_text()
     assert argv[argv.index("--resume") + 1] == got["session"] != s_code
+
+
+_CODEX_COORD_TEXT = "# Role\nYou coordinate.\nThis session has no tools: no files, shell, ssh or web; only your answer."
+
+
+def _dev(*texts):
+    return {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": t} for t in texts]}
+
+
+def _codex_rollout_with_instructions(home, sid, cwd="/coord"):
+    """A Codex coordinator rollout as `codex exec` saves it: the harness's developer instructions next to
+    Codex's own <...> blocks, a compaction whose histories carry them again, then a finished turn."""
+    path = _fork_codex_rollout(home, sid, cwd)
+    rows = [json.loads(x) for x in path.read_text().split("\n")[:4]]
+    dev = [{"type": "response_item", "payload": _dev(_CODEX_COORD_TEXT, "<skills_instructions>skills</skills_instructions>")},
+           {"type": "response_item", "payload": _dev("<multi_agent_role>root</multi_agent_role>")},
+           {"type": "response_item", "payload": {"type": "message", "role": "user",
+                                                 "content": [{"type": "input_text", "text": "# a user digest"}]}}]
+    compacted = {"type": "compacted", "payload": {"message": "", "replacement_history": [_dev(_CODEX_COORD_TEXT)],
+                                                  "guardian_history": [{"items": [_dev(_CODEX_COORD_TEXT)]}]}}
+    path.write_text("\n".join(json.dumps(r) for r in rows[:1] + dev + rows[1:3] + [compacted] + rows[3:]) + "\n")
+    return path
+
+
+def test_codex_own_instructions_replace_the_sessions_harness_text_everywhere(monkeypatch, tmp_path):
+    """Task #198 (user msg #208): `codex exec resume` keeps the rollout's developer messages and takes no new
+    developer_instructions, so a worker forked from a coordinator without tools ran under "This session has
+    no tools". The run's own text replaces the harness's blocks (top level and inside compactions); Codex's
+    own <...> blocks, user messages and the source session stay; Claude takes each launch's system prompt."""
+    from ttp.providers import get_provider as get
+    codex = get("codex")
+    home = tmp_path / "codex-home"
+    monkeypatch.setenv("CODEX_HOME", str(home))
+    sid, new = str(uuid.uuid4()), str(uuid.uuid4())
+    src = _codex_rollout_with_instructions(home, sid)
+    before = src.read_bytes()
+    own = {"CODEX_HOME": str(tmp_path / "run-home")}
+    assert codex.fork_session(sid, "/run", own, new) == ""
+    worker = "# WORKER RULES\nuse your tools"
+    assert codex.own_instructions(new, "/run", own, worker) == ""
+    [copy] = list((tmp_path / "run-home" / "sessions").glob(f"*/*/*/rollout-*-{new}.jsonl"))
+    text = copy.read_text()
+    assert "no tools" not in text and text.count("WORKER RULES") == 3   # top level, replacement and guardian
+    assert "<skills_instructions>" in text and "<multi_agent_role>" in text and "# a user digest" in text
+    assert copy.stat().st_mode & 0o777 == 0o600 and src.read_bytes() == before
+    rows = [json.loads(x) for x in text.splitlines()]
+    assert rows[-1]["payload"]["type"] == "task_complete"
+    # Twice is the same; a message holding two harness blocks keeps the run's text once.
+    assert codex.own_instructions(new, "/run", own, worker) == "" and copy.read_text().count("WORKER RULES") == 3
+    two = str(uuid.uuid4())
+    path = _fork_codex_rollout(home, two)
+    path.write_text(json.dumps({"type": "response_item", "payload": _dev("# a", "<x>", "# b")}) + "\n" + '{"partial')
+    assert codex.own_instructions(two, "/", None, worker) == ""
+    lines = path.read_text().split("\n")
+    assert [c["text"] for c in json.loads(lines[0])["payload"]["content"]] == [worker, "<x>"]
+    assert lines[-1] == '{"partial'   # a line still being written stays as it was
+    assert codex.own_instructions(str(uuid.uuid4()), "/", None, worker) == ""   # no session here: nothing to do
+    bare = str(uuid.uuid4())
+    _fork_codex_rollout(home, bare)
+    assert "no developer instructions" in codex.own_instructions(bare, "/", None, worker)
+    assert get("claude").own_instructions(sid, "/run", None, worker) == "" and src.read_bytes() == before
+
+
+def test_codex_worker_runs_start_with_their_own_instructions_and_the_coordinator_keeps_its(env, monkeypatch, tmp_path):
+    """Task #198: a Codex worker forked from a Codex coordinator, a follow-up resuming that worker's
+    session and the worker's own continued session all run under the worker's system prompt with none
+    of the coordinator-only text; a Codex coordinator run keeps its own."""
+    from ttp import coordsession
+    home = tmp_path / "codex-home"
+    monkeypatch.setenv("CODEX_HOME", str(home))
+    _fork_fake_codex(tmp_path, monkeypatch)
+    p, d, _cfg, _run = _fork_daemon(env, monkeypatch, tmp_path, provider="codex")
+    csid = str(uuid.uuid4())
+    coord_src = _codex_rollout_with_instructions(home, csid, str(p.base))
+    p.db.set_kv(coordsession.KEY, {"id": csid, "provider": "codex", "context_tokens": 7000})
+    worker = "# WORKER RULES\nuse your tools and write result.json"
+
+    def start(tid, **kw):
+        rid = d.start_run("worker", "TASK PROMPT", "codex", "standard", str(p.root), task=p.db.task(tid),
+                          append_system=worker, **kw)
+        argv = json.loads((p.runs / str(rid) / "run.json").read_text())["argv"]
+        got = json.loads(p.db.one("SELECT note FROM runs WHERE id=?", (rid,))["note"] or "{}").get("coord_context")
+        [path] = [f for f in tmp_path.rglob(f"rollout-*-{got['session']}.jsonl")]
+        return argv, got, path.read_text()
+
+    tid = p.db.add_task("the change", "do it", kind="code", origin="user")
+    argv, got, text = start(tid)
+    assert got["how"] == "fork" and argv[argv.index("resume") + 1] == got["session"], (got, argv)
+    assert "no tools" not in text and "WORKER RULES" in text and "<multi_agent_role>" in text
+    assert "This session has no tools" in coord_src.read_text()   # the coordinator's session is untouched
+    _argv, again, text = start(tid, resume=got["session"])   # its own session, continued
+    assert again["how"] == "resume" and "no tools" not in text and "WORKER RULES" in text
+    # A follow-up resumes a copy of an earlier run's session (whatever it held): it gets its own text too.
+    _ok_run(p, tid, csid, provider="codex", ended=time.time() - 60)
+    hop = p.db.add_task("continue: the change", "the rest", kind="code", origin="coordinator",
+                        labels=[f"continues:{tid}"])
+    _argv, follow, text = start(hop)
+    assert follow["how"] == "resume" and "no tools" not in text and "WORKER RULES" in text, follow
+    # A coordinator run keeps the coordinator's instructions, and no worker start rewrote its session.
+    rid = d.start_run("coordinator", "decide", "codex", "standard", str(p.base), read_only=True,
+                      append_system=_CODEX_COORD_TEXT)
+    argv = json.loads((p.runs / str(rid) / "run.json").read_text())["argv"]
+    assert any(a.startswith("developer_instructions=") and "This session has no tools" in a for a in argv)
+    assert coord_src.read_text().count("This session has no tools") == 3

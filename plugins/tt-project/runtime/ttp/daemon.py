@@ -3833,6 +3833,14 @@ class Daemon:
                     argv = _before_stdin(argv, sys_args)
                 else:
                     prompt = append_system + "\n\n" + prompt
+                if resume_extra and task and role in ctxfork.ROLES:
+                    # A resumed session may keep the system prompt it started with (Codex keeps the
+                    # coordinator's in a fork): the run's own replaces it, else it leads the prompt.
+                    why = prov.own_instructions(resume, str(cwd), env, append_system)
+                    if why:
+                        log(self.p, f"run {run_id}: system prompt not set in the resumed session ({why}); it leads the prompt")
+                        if sys_args:
+                            prompt = append_system + "\n\n" + prompt
             argv = _before_stdin(argv, resume_extra)
             (run_dir / "prompt.md").write_text(prompt)
             if stdin is not None:   # what the agent reads; prompt.md stays the readable digest
