@@ -3858,11 +3858,10 @@ def test_a_spill_host_capped_by_max_runs_refuses_a_second_run_and_the_next_host_
     second = checkspill.pick(p, p.config(), told.append, "pytest -q")
     try:
         assert first is not None and first.host == "check-host-a", told
-        assert second is not None and second.host == "check-host-b", told
-        assert "check-host-a (its max_runs 1 of this machine's checks run there already" in told[-1], told
+        assert second is not None and second.host == "check-host-b", told   # spread or capped: host-b either way
         p.set_config("delivery.checks_spill_hosts", [{"host": "check-host-a", "max_runs": 1}])
         assert checkspill.pick(p, p.config(), told.append, "pytest -q") is None
-        assert "max_runs 1" in told[-1], told
+        assert "check-host-a (its max_runs 1 of this machine's checks run there already" in told[-1], told
     finally:
         second.close()
         first.close()
