@@ -169,6 +169,13 @@ def _exec(argv: list) -> int:
         return 127 if isinstance(e, FileNotFoundError) else 126
 
 
+def _rmdir(d: Path) -> None:
+    try:
+        d.rmdir()
+    except OSError:
+        pass
+
+
 def main(args: list) -> int:
     """The wrapper: `<settings json> -- <command...>`. Exits with the command's code (128 + the signal)."""
     conf, argv = json.loads(args[0]), args[2:]
@@ -209,11 +216,28 @@ def main(args: list) -> int:
             return _exec(argv)
         apply(quota)
         procs = str(child / "cgroup.procs")
+        err_r, err_w = os.pipe()   # why the join failed, from the forked child
 
         def join():
-            with open(procs, "w") as f:
-                f.write("0")
-        proc = subprocess.Popen(argv, env=env, preexec_fn=_die_with_parent(join))
+            try:
+                with open(procs, "w") as f:
+                    f.write("0")
+            except OSError as e:
+                os.write(err_w, (e.strerror or str(e)).encode()[:200])
+                raise
+        try:
+            proc = subprocess.Popen(argv, env=env, preexec_fn=_die_with_parent(join))
+        except (OSError, subprocess.SubprocessError) as e:
+            # the command never ran: drop the empty group and run it without one
+            os.close(err_w)
+            joined = os.read(err_r, 256).decode(errors="replace")
+            os.close(err_r)
+            _rmdir(child)
+            if joined or not isinstance(e, OSError):
+                _say_once(f"cannot join a group in {conf['cgroup']}: {joined or e}")
+            return _exec(argv)
+        os.close(err_w)
+        os.close(err_r)
     else:
         _say_once(why + (f"; {cwhy}" if conf.get("cgroup") else ""))
         return _exec(argv)
@@ -239,8 +263,5 @@ def main(args: list) -> int:
                 print(f"ttp: host {'busy' if is_busy else 'idle'}: checks CPU quota now {_quota_text(quota)}",
                       file=sys.stderr, flush=True)
     if child is not None:
-        try:
-            child.rmdir()
-        except OSError:
-            pass
+        _rmdir(child)
     return rc if rc >= 0 else 128 - rc

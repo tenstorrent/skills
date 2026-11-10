@@ -135,3 +135,33 @@ def test_a_delegated_cgroup_v2_directory_holds_the_command_where_systemd_user_ca
     child, = [d for d in cg.iterdir() if d.is_dir()]
     assert (child / "cpu.max").read_text() == "50000 100000\n", "busy: half a core"
     assert (child / "cgroup.procs").read_text() == "0", "the command joined it before it ran"
+
+
+def test_a_delegated_cgroup_the_command_cannot_join_runs_it_without_one_and_leaves_no_child(env, tmp_path):
+    # a child whose cgroup.procs cannot be opened for write (as EACCES outside the delegated subtree, or
+    # EBUSY, would refuse it): the command still runs, with its own exit code, says why once, leaves no child.
+    # Run in its own process: the fallback execs the command in place of the wrapper.
+    from ttp import cpuquota
+    cg = tmp_path / "delegated"
+    cg.mkdir()
+    (cg / "cgroup.subtree_control").write_text("cpu memory\n")
+    conf = {"idle": 1, "busy": 1, "probe": "", "every": 30, "cgroup": str(cg)}
+    boot = ("import shutil, sys; sys.path.insert(0, sys.argv[1]); from pathlib import Path; from ttp import cpuquota\n"
+            "made = Path.mkdir\n"
+            "def mkdir(self, *a, **k):\n"
+            "    made(self, *a, **k)\n"
+            "    if self.parent == Path(sys.argv[2]): made(self / 'cgroup.procs')\n"
+            "Path.mkdir = mkdir\n"
+            "cpuquota._rmdir = shutil.rmtree   # cgroupfs drops a group's control files with it\n"
+            "cpuquota._systemd = lambda: 'no systemd --user manager'\n"
+            "sys.exit(cpuquota.main([sys.argv[3], '--', 'sh', '-c', 'echo ran; exit 6']))")
+    runtime = str(Path(cpuquota.__file__).resolve().parent.parent)
+    run_env = {**os.environ, "TTP_HOME": str(tmp_path / "home")}
+    for first in (True, False):
+        out = subprocess.run([sys.executable, "-c", boot, runtime, str(cg), json.dumps(conf)],
+                             env=run_env, capture_output=True, text=True, timeout=60)
+        assert out.returncode == 6 and out.stdout == "ran\n", out.stderr
+        assert "Traceback" not in out.stderr, out.stderr
+        assert [d.name for d in cg.iterdir() if d.is_dir()] == [], "no ttp-checks-* child left"
+        said = out.stderr.count(f"no CPU-quota group (cannot join a group in {cg}: Is a directory)")
+        assert said == (1 if first else 0), out.stderr
