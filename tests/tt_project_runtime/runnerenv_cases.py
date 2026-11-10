@@ -261,6 +261,7 @@ def test_ttp_checks_freeze_lock_pins_the_user_sites_packages_the_lock_does_not_n
     lines = [ln for ln in out.read_text().splitlines() if not ln.startswith("#")]
     assert "Some_Pkg==1.2.3" in lines and "pytest==8.4.2" in lines and "pytest==99.0" not in lines
     assert "--hash" not in out.read_text() and "Some_Pkg==1.2.3" in capsys.readouterr().out
+    assert "# requires-python: >=3.10" in out.read_text().splitlines(), "the frozen lock keeps the Python it needs"
     assert not (run / "checks.json").exists(), "it runs no check"
 
 
@@ -340,4 +341,62 @@ def test_runnerenv_key_skips_a_lock_line_for_another_platform_so_its_env_is_reus
     assert len(yaml_line) == 1 and 'sys_platform == "darwin"' in yaml_line[0] and yaml_line[0].count("--hash=sha256:") >= 2
     monkeypatch.setattr(runnerenv.sys, "platform", "linux")
     assert b"pyyaml" not in runnerenv._for_host(text).lower()
-    assert runnerenv._for_host(text) == text.replace((yaml_line[0] + "\n").encode(), b"")
+    req = b"# requires-python: >=3.10\n"   # picks the interpreter, which the key names itself
+    assert req in text and runnerenv._for_host(text) == text.replace((yaml_line[0] + "\n").encode(), b"").replace(req, b"")
+
+
+def test_runnerenv_makes_the_env_from_a_python_the_locks_requires_python_allows(tmp_path, monkeypatch):
+    # ttp under macOS's /usr/bin/python3 (3.9) made the default lock's env with it, and pip found no
+    # iniconfig 2.3.1 (it needs 3.10): the env is made from a Python that meets the lock's
+    # requires-python line instead, keyed by that Python, or nothing runs and the error names both.
+    runnerenv, builds = _fake_base(tmp_path, monkeypatch)
+    monkeypatch.setattr(runnerenv, "_found", {})
+    monkeypatch.setattr(runnerenv, "_PY_DIRS", ())
+    assert runnerenv.requires(runnerenv.LOCK.read_bytes()) == [(">=", (3, 10))]
+    assert runnerenv.requires(b"# Requires-Python:>=3.10, <3.14\npytest==1\n") == [(">=", (3, 10)), ("<", (3, 14))]
+    assert runnerenv.requires(b"pytest==1\n# requires-python is read by runnerenv\n") is None
+    for bad in (b"# requires-python: 3.10\n", b"# requires-python: >=3.10 (pluggy)\n", b"# requires-python:\n"):
+        with pytest.raises(runnerenv.Unavailable, match="requires-python line"):
+            runnerenv.requires(bad)
+    meets = runnerenv._meets
+    assert meets((3, 10, 0), [(">=", (3, 10))]) and not meets((3, 9, 6), [(">=", (3, 10))])
+    assert meets((3, 10, 4), [("==", (3, 10))]) and not meets((3, 11, 0), [("==", (3, 10))])
+    assert meets((3, 10, 5), [(">", (3, 10))]) and not meets((3, 13, 1), [("<", (3, 13))])
+    assert not meets((3, 12, 4), [("<=", (3, 12))]) and meets((3, 13, 0), [(">=", (3, 10)), ("!=", (3, 12))])
+    # Candidates: a PATH folder with a non-Python, a Python too old and one that meets the lock (its
+    # base is the stand-in base, so its env builds as _fake_base's do).
+    bin_ = tmp_path / "bin"
+    bin_.mkdir()
+    fake_base = runnerenv._base_python()
+    for name, body in (("python3", "exit 1"),
+                       ("python3.41", f'echo \'["{tmp_path}/py41", "41.0.0 (old)", [41, 0, 0]]\''),
+                       ("python3.17", f'echo \'["{fake_base}", "42.1.0 (new)", [42, 1, 0]]\'')):
+        (bin_ / name).write_text(f'#!/bin/sh\n[ "$3" = --interpreter ] || exit 2\n{body}\n')
+        (bin_ / name).chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_}{os.pathsep}{os.environ['PATH']}")
+    lock = tmp_path / "a.lock"
+    lock.write_text("# requires-python: >=42\npytest==1\n")
+    assert runnerenv.interpreter(lock.read_bytes()) == (fake_base, "42.1.0 (new)")
+    info = runnerenv.ensure(lock)
+    assert builds() == 1 and info["key"] == runnerenv.key_of(lock.read_bytes(), fake_base, "42.1.0 (new)")
+    assert info["key"] != runnerenv.key_of(lock.read_bytes(), fake_base), "the key names the Python it was made from"
+    runnerenv._ready.clear()
+    assert runnerenv.ensure(lock)["key"] == info["key"] and builds() == 1 and runnerenv.ready(lock)
+    # None meets it: nothing is built and the error names the Python needed and the one found.
+    lock.write_text("# requires-python: >=43\npytest==1\n")
+    with pytest.raises(runnerenv.Unavailable, match=r"needs Python >=43.*runs under Python \d+\.\d+.*install a Python >=43"):
+        runnerenv.ensure(lock)
+    assert builds() == 1 and not runnerenv.ready(lock)
+    # A lock without the line, or one this Python meets, keeps this Python and its key as before.
+    lock.write_text(f"# requires-python: >={sys.version_info[0]}.{sys.version_info[1]}\npytest==1\n")
+    assert runnerenv.interpreter(lock.read_bytes()) == (fake_base, sys.version)
+    assert runnerenv.key_of(lock.read_bytes(), fake_base) == runnerenv.key_of(b"pytest==1\n", fake_base)
+
+
+def test_runnerenv_probes_a_real_python_for_its_base_and_version(tmp_path, monkeypatch):
+    from ttp import runnerenv
+    monkeypatch.setattr(runnerenv, "_found", {})
+    base, version, info = runnerenv._probe(sys.executable)
+    assert info == tuple(sys.version_info[:3]) and version == sys.version
+    assert Path(base).resolve() == Path(runnerenv._base_python()).resolve(), "a venv's python gives its base"
+    assert runnerenv._probe(str(tmp_path / "nope")) is None

@@ -1,5 +1,6 @@
 # The pinned test runner every ttp checks run uses unless the project sets checks.python_lock
 # (runnerenv). Exact versions with hashes: pip installs in hash-checking mode.
+# requires-python: >=3.10
 pytest==8.4.2 --hash=sha256:872f880de3fc3a5bdc88a11b39c9710c3497a547cfa9320bc3c5e62fbf272e79
 pytest-xdist==3.8.0 --hash=sha256:202ca578cfeb7370784a8c33d6d05bc6e13b4f25b5053c30a152269fd10f0b88
 execnet==2.1.2 --hash=sha256:67fba928dd5a544b783f6056f449e5e3931a5c378b128bc18501f7ea79e296ec
