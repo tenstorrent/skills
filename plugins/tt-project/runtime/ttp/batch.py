@@ -2344,17 +2344,22 @@ class Batch:
         return slot
 
     def _check_env(self, head: str = "") -> dict:
-        """The env the batch's checks run in (push.check_env), in the project's pinned Python env. One
+        """The env the batch's checks run in (push.check_env), in the project's pinned Python env, with
+        the project's venv active as `ttp checks` has it (worktree.project_venv). One
         that cannot be made is the host's fault (envfault.Fault: the batch is held, not failed), unless
         `head` changed checks.python_lock itself (runnerenv.changed_by): runnerenv.Unavailable then."""
         cfg = self.p.config()
         lock = push.runnerenv.lock_of(cfg, self.wt)
         try:
-            return push.check_env("target", self.tip, self.check_run_dir, self.branch, lock=lock)
+            env = push.check_env("target", self.tip, self.check_run_dir, self.branch, lock=lock)
         except push.runnerenv.Unavailable as e:
             if head and push.runnerenv.changed_by(self.wt, cfg, self.tip or "", head):
                 raise
             raise envfault.Fault(push.runnerenv.fault(lock, e)) from e
+        # the project's venv, as `ttp checks` turns it on: a task's own pass then ran in this env (_task_carried)
+        if not os.environ.get("VIRTUAL_ENV") and (pv := worktree.project_venv(self.p, self.wt)):
+            env.update(worktree.venv_env(pv, env["PATH"]))
+        return env
 
     def _check(self, head: str, checks: list[str]) -> tuple[str, str] | None:
         """Check `head` in the worktree: None when it passes, else (command, output tail). The stale
@@ -2411,6 +2416,8 @@ class Batch:
             else:
                 if why := pushpass.missed(self.p, tree, str(cmd), parts):
                     say(f"not reusing a pass: {why}: {cmd}")
+                if self._declined:
+                    say(f"not carrying a pass: {self._declined}: {cmd}")
                 run.append((cmd, eid, parts))
         if not run:
             return None
@@ -2633,13 +2640,24 @@ class Batch:
         version bump (_bump_only): the bump is the batch's own mechanical edit of the version files and a
         changeset, so the change's patch must match the one that passed and the upstream delta must miss
         what the check covers; a batch of several entries has another patch than any one task's."""
-        if cmd == STALE or not (under := self._bump_only(head)):
+        self._declined = ""   # why none carried, for the batch's log
+        if cmd == STALE:
+            return ""
+        cmds = [*before, cmd]
+        if not (cands := pushpass.task_carriable(self.p, self.wt, cmds, parts, env)):
+            self._declined = pushpass.task_miss(self.p, self.wt, cmds, parts, env)
+            return ""
+        run = cands[0].get("run") or "?"
+        if not (under := self._bump_only(head)):
+            self._declined = f"the task's own ttp checks run {run}: this batch changes more than one entry and its version bump"
             return ""
         exclude = push.exclude_list(self.d.get("push_exclude_paths"))
-        for e in pushpass.task_carriable(self.p, self.wt, [*before, cmd], parts, env)[:CARRY_TRIES]:
+        for e in cands[:CARRY_TRIES]:
             delta = verdictcarry.carry(self.wt, cmd, e["tip"], e["head"], self.tip or "", under, exclude)
             if delta is not None:
                 return f"{verdictcarry.line(e['head'], delta)} (the task's own ttp checks run {e.get('run') or '?'})"
+        self._declined = (f"the task's own ttp checks run {run}: its patch differs from this head's, or the "
+                          "upstream delta since its tip touches what the check covers")
         return ""
 
     def _rerun_ids(self, cmd, rc: int | None, tail: str, cap: int = RERUN_IDS) -> list[str]:

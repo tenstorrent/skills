@@ -18316,7 +18316,7 @@ def test_a_push_batch_carries_a_pass_onto_a_tip_that_moved_only_in_ignored_paths
         assert len(runs) == 2 and "carried" not in m["checks"]
 
 
-def _task_pass(p, repo, cmds, targeted=False, suite=False):
+def _task_pass(p, repo, cmds, targeted=False, suite=False, venv=False):
     """Record a task's own `ttp checks` pass of `cmds` on HEAD as cli._record_pass does after a run: per
     command its check_env_parts, and the head and its merge base with the push target. `targeted`: the
     run was testpick's narrowed one (the check with a test-selecting env); `suite`: one command's suite pass."""
@@ -18328,6 +18328,9 @@ def _task_pass(p, repo, cmds, targeted=False, suite=False):
             c.env, c.targeted = ((testpick.FILES_ENV, "tests/test_a.py"),), True
     (run := repo.parent / "task-run").mkdir(exist_ok=True)
     run_env = push.check_env("checks", run_dir=str(run))
+    if venv:   # `ttp checks` turns on the project's venv when the shell has none
+        from ttp import worktree
+        run_env.update(worktree.venv_env(worktree.project_venv(p, repo), run_env["PATH"]))
     parts = pushpass.check_env_parts(repo, cmds, run_env)
     head = _git_out(repo, "rev-parse", "HEAD")
     cli._record_pass(p, pushpass.tree_of(repo, "HEAD"), cmds, "candidate", "", [pushpass.digest(x) for x in parts],
@@ -18364,6 +18367,40 @@ def test_a_push_batch_carries_a_tasks_own_full_checks_pass_of_the_same_change(en
         assert line in out
     else:
         assert len(ran) == 1 and not m["checks"].get("carried"), out
+
+
+@pytest.mark.parametrize("case", ["venv", "other_vars"])
+def test_a_push_batch_carries_a_tasks_pass_made_in_the_project_venv_and_says_why_one_does_not(
+        env, monkeypatch, capsys, case):
+    """A task's `ttp checks` pass ran with the project's venv on (worktree.project_venv): the batch's checks run
+    with it on too, so the pass carries. One recorded under other test-changing vars is not carried, and the
+    batch's log names that run and the parts that differ."""
+    log = env["tmp"] / "checked"
+    check = {"run": f"git rev-parse HEAD >> {log}", "ignore_paths": ["docs/**"]}
+    p, repo, origin, other = _bump_setup(env, monkeypatch, [check])
+    venv = p.root / ".venv"
+    (venv / "bin").mkdir(parents=True)
+    (venv / "pyvenv.cfg").write_text("home = /usr/bin\n")
+    for name in ("python", "python3"):
+        (venv / "bin" / name).symlink_to(sys.executable)
+    monkeypatch.delenv("VIRTUAL_ENV", raising=False)
+    heads = [_entry(repo, "e1", {"plugins/p/f1.txt": "1\n"})]
+    monkeypatch.setenv("TTP_RUN_ID", "41")
+    task = env["tmp"] / "t1"   # a task's own worktree: the project's venv lies outside it
+    _git_out(repo, "worktree", "add", "-q", "-b", "t1", str(task), "HEAD")
+    _task_pass(p, task, [check], venv=True)
+    if case == "other_vars":
+        monkeypatch.setenv("PYTEST_ADDOPTS", "-p no:cacheprovider")
+    rc, m = _run_batch(p, _batch_marker(p, heads), monkeypatch)
+    assert rc == 0 and m["outcome"] == "pushed", m
+    out = capsys.readouterr().out
+    ran = log.read_text().split() if log.exists() else []
+    if case == "venv":
+        assert ran == [] and "(the task's own ttp checks run 41)" in m["checks"]["carried"][0], out
+    else:
+        assert len(ran) == 1 and not m["checks"].get("carried"), out
+        assert ("not carrying a pass: the task's own ttp checks run 41 ran in another environment: "
+                "vars differ") in out
 
 
 def test_a_batch_judges_a_task_pass_without_its_own_version_bump_only(tmp_path):

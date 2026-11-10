@@ -328,6 +328,13 @@ def task_carriable(p: Project, wt: Path, cmds: list, parts: dict, env: dict) -> 
     every part but the tip. A targeted run (testpick: the check with a test-selecting env) or a reduced
     one records other commands, and a suite pass of one command keeps no head: neither carries. Its
     "tip" is the merge base of that head with the push target, so the upstream delta is from there."""
+    return [e for e, old, new in _task_passes(p, wt, cmds, parts, env) if old == new]
+
+
+def _task_passes(p: Project, wt: Path, cmds: list, parts: dict, env: dict) -> list[tuple[dict, dict | None, dict]]:
+    """(entry, its part digests for the last of `cmds`, the batch's) for each candidate pass in TASK_STORE,
+    newest first, that keeps its head and tip and whose commands began with `cmds` (or that check
+    alone), the tip left out of both: task_carriable keeps those equal, task_miss names what differs."""
     from .cli import _commands_hash
     if not cmds:
         return []
@@ -340,11 +347,24 @@ def task_carriable(p: Project, wt: Path, cmds: list, parts: dict, env: dict) -> 
         if e.get("suite") or e.get("purpose", "candidate") != "candidate" or not (e.get("head") and e.get("tip")):
             continue
         at = next((keys[k] for k in (e.get("commands"), *(e.get("prefixes") or ())) if k in keys), None)
+        if at is None:
+            continue
         got = e.get("env_parts")
-        old = got[at] if at is not None and isinstance(got, list) and at < len(got) else None
-        if isinstance(old, dict) and {k: v for k, v in old.items() if k != "tip"} == new:
-            out.append(e)
+        old = got[at] if isinstance(got, list) and at < len(got) and isinstance(got[at], dict) else None
+        out.append((e, {k: v for k, v in old.items() if k != "tip"} if old is not None else None, new))
     return out
+
+
+def task_miss(p: Project, wt: Path, cmds: list, parts: dict, env: dict) -> str:
+    """Why no pass a task's own `ttp checks` recorded is carriable (task_carriable) to the last of `cmds`:
+    the newest one of the same push checks ran in another environment (the parts it differs in) or kept
+    none; "" when no task recorded a pass of them."""
+    for e, old, new in _task_passes(p, wt, cmds, parts, env):
+        if old is None:
+            return f"the task's own ttp checks run {e.get('run') or '?'} kept no environment for it"
+        if why := differs(old, new):
+            return f"the task's own ttp checks run {e.get('run') or '?'} ran in another environment: {why} differ"
+    return ""
 
 
 def record(p: Project, tree: str, cmd: str, eid: str, batch: str, parts: dict | None = None,
