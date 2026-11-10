@@ -200,6 +200,100 @@ def test_the_wake_gate_backoff_doubles_within_max_backoff_s_and_the_cap(env, mon
     assert _gate_decide(p, tid, cfg=cfg).delay_s == 1000
 
 
+class _GateWatcher:
+    """Stands in for babysit.Babysitter: the watcher's verb (or None: it fell back) and the Jev behind it."""
+
+    def __init__(self, verb=None, delay_s=None, jev=None, model="example-org/watcher"):
+        self.verb, self.delay_s, self.jev, self.model, self.calls = verb, delay_s, jev, model, 0
+
+    def enabled(self):
+        return True
+
+    def decision(self, state, question, target="coordinator", purpose="decide"):
+        self.calls += 1
+        if self.verb is None:
+            return None
+        return {"verb": self.verb, "tier": "light", "parsed": True, "reason": "the build still runs",
+                "model": self.model, **({"delay_s": self.delay_s} if self.delay_s else {})}
+
+
+def test_the_wake_gate_cap_asks_the_watcher_which_may_skip_until_the_hard_ceiling(env, monkeypatch, tmp_path):
+    p = make(env)
+    from ttp import waitgate
+    monkeypatch.setattr(waitgate, "pending", lambda p_, cfg, probe: "its detached job still runs")
+    tid = _gate_task(p, tmp_path, ended_ago=4 * 3600 + 5)
+    w = _GateWatcher("skip", delay_s=120)
+    d = _gate_decide(p, tid, jev=w)   # at the soft cap the watcher, not the model-free rule, decides
+    assert not d.wake and d.by == "babysit" and w.calls == 1 and d.reason.startswith("at the cap (0 skip(s)"), d
+    assert d.delay_s == 600.0   # its next look, but at least backoff_s: no re-ask each minute
+    row = p.db.one("SELECT decision, by FROM wake_gate WHERE id=?", (d.log_id,))
+    assert dict(row) == {"decision": "skip", "by": "babysit"}
+    tid = _gate_task(p, tmp_path, ended_ago=4 * 3600 + 5)
+    _gate_set(p, tid, wake_gate={"log": [1, 2, 3, 4, 5, 6]})
+    d = _gate_decide(p, tid, jev=_GateWatcher("wake"))
+    assert d.wake and d.by == "babysit" and d.extra["tier"] == "light", d
+    # The watcher gave no answer and nothing stands behind it: the cap wakes as before.
+    tid = _gate_task(p, tmp_path, ended_ago=4 * 3600 + 5)
+    d = _gate_decide(p, tid, jev=_GateWatcher(None))
+    assert d.wake and d.by == "cap" and "the watcher gave no answer" in d.reason, d
+    assert _gate_decide(p, _gate_task(p, tmp_path, ended_ago=4 * 3600 + 5)).by == "cap"   # no watcher at all
+    # A probe that answered at the cap takes its model-free path: no watcher skip.
+    w = _GateWatcher("skip")
+    d = _gate_decide(p, _gate_task(p, tmp_path, ended_ago=4 * 3600 + 5), jev=w, probe=(4, "job failed"))
+    assert d.wake and d.by == "cap" and w.calls == 0
+    # Near the hard ceiling a skip ends at it; past it the task wakes with no question.
+    d = _gate_decide(p, _gate_task(p, tmp_path, ended_ago=24 * 3600 - 300), jev=_GateWatcher("skip", delay_s=3600))
+    assert not d.wake and 250 <= d.delay_s <= 300, d.delay_s
+    w = _GateWatcher("skip")
+    d = _gate_decide(p, _gate_task(p, tmp_path, ended_ago=24 * 3600 + 5), jev=w)
+    assert d.wake and d.by == "cap" and "hard ceiling" in d.reason and w.calls == 0, d
+    cfg = p.config()
+    cfg["waiting"]["wake_gate"] = {**cfg["waiting"]["wake_gate"], "cap_hard_h": 48}
+    assert not _gate_decide(p, _gate_task(p, tmp_path, ended_ago=24 * 3600 + 5), cfg=cfg, jev=_GateWatcher("skip")).wake
+
+
+def test_a_wake_regated_before_its_turn_starts_is_the_same_wake_with_no_new_row_or_question(env, monkeypatch, tmp_path):
+    p = make(env)
+    from ttp import daemon as dmod, waitgate
+    monkeypatch.setattr(waitgate, "pending", lambda p_, cfg, probe: "its detached job still runs")
+    dm = dmod.Daemon(p.base)
+    dm.jev = w = _GateWatcher("wake")
+    tid = _gate_task(p, tmp_path, ended_ago=4 * 3600 + 5)
+    p.db.update_task(tid, not_before=time.time() - 1)
+    notes = [dm._wake_gate(p.db.task(tid)) for _ in range(5)]   # the slots stay full: five ticks, no turn
+    assert all(not skipped and n["by"] == "babysit" and n["tier"] == "light" for skipped, n in notes), notes
+    assert len({n["log"] for _, n in notes}) == 1 and w.calls == 1
+    assert p.db.one("SELECT count(*) n FROM wake_gate WHERE task=?", (tid,))["n"] == 1
+    # The watcher fell back: the cap's wake is kept the same way, not re-logged every tick.
+    w.verb = None
+    tid = _gate_task(p, tmp_path, ended_ago=4 * 3600 + 5)
+    p.db.update_task(tid, not_before=time.time() - 1)
+    for _ in range(3):
+        assert dm._wake_gate(p.db.task(tid))[1]["by"] == "cap"
+    assert p.db.one("SELECT count(*) n FROM wake_gate WHERE task=?", (tid,))["n"] == 1 and w.calls == 2
+    # A new hand-off (its turn ran) is a new decision.
+    _gate_set(p, tid, waiting_since=time.time())
+    dm._wake_gate(p.db.task(tid))
+    assert p.db.one("SELECT count(*) n FROM wake_gate WHERE task=?", (tid,))["n"] == 2
+
+
+def test_the_wake_gates_jev_decision_names_the_model_that_answered(env, tmp_path):
+    p = make(env)
+    from ttp import waitgate
+    haiku = _GateJev(0.1)
+    haiku.last_by = "example-org/haiku-model"   # cheapdecide.Fallback after Jev was off: Haiku answered
+    tid = _gate_task(p, tmp_path)
+    d = _gate_decide(p, tid, jev=_GateWatcher(None, jev=haiku), probe=(1, "not yet"))
+    assert not d.wake and d.by == "jev" and d.reason == "jev needed=0.10 (example-org/haiku-model)", d
+    assert d.note({}, [])["model"] == "example-org/haiku-model"
+    assert json.loads(p.db.one("SELECT decision FROM jev_calls WHERE id=?", (d.jev_call,))["decision"])["model"] \
+        == "example-org/haiku-model"
+    jev = _GateJev(0.1)
+    jev.last_by = "jev"
+    d = _gate_decide(p, _gate_task(p, tmp_path), jev=jev, probe=(1, "not yet"))
+    assert d.reason == "jev needed=0.10" and d.extra["model"] == "jev"
+
+
 @pytest.mark.parametrize("jev, wake, by", [
     (_GateJev(0.1), False, "jev"),
     (_GateJev(0.9), True, "jev"),

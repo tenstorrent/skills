@@ -159,9 +159,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
                 # rules (job, lock, checks or push still pending; same probe answer) then Jev, and re-defers
                 # with a doubling backoff instead of a model turn that would only hand the wait back. Any
                 # event wakes at once; max_skips skips in a row or max_skip_h hours since the last turn
-                # force the wake. enabled false: every wake starts a turn, as before
-                "wake_gate": {"enabled": True, "max_skips": 4, "max_skip_h": 4.0, "backoff_s": 600,
-                              "max_backoff_s": 3600, "jev_skip_below": 0.25},
+                # re-ask the watcher (no answer wakes), and cap_hard_h hours force the wake. enabled
+                # false: every wake starts a turn, as before
+                "wake_gate": {"enabled": True, "max_skips": 4, "max_skip_h": 4.0, "cap_hard_h": 24.0,
+                              "backoff_s": 600, "max_backoff_s": 3600, "jev_skip_below": 0.25},
                 # every task that could start waits on hosts this machine cannot reach (probe exit 255),
                 # nothing runs: one normal alert this long into the outage (0: never); the outage ends
                 # once no probe has said unreachable for the debounce (netwait.py). Hosts whose ssh route

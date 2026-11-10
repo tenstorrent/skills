@@ -45,12 +45,16 @@ from .db import DB
 USE = "wake_gate"
 DEFAULTS = {"enabled": True,
             "max_skips": 4,          # skips in a row before the task wakes anyway
-            "max_skip_h": 4.0,       # hours since the last real turn before it wakes anyway
+            "max_skip_h": 4.0,       # hours since the last real turn before the watcher must re-decide
+            "cap_hard_h": 24.0,      # hours since the last real turn before it wakes with no question
             "backoff_s": 600,        # the first re-defer when the hand-off asked for less; doubles per skip
             "max_backoff_s": 3600,   # the longest one re-defer lasts
             "jev_skip_below": 0.25}  # Jev skips only when its "a turn would find work" score is below this
 SOFT_WOKE = ("", "probe passed")     # wake reasons that are no event on their own
 JEV_TIMEOUT_S = 10.0
+# A wake the daemon could not start yet (slots full, a hold): (db path, task) -> (fingerprint, at,
+# Decision). Re-gated before its turn starts, it is the same wake: no new row and no new watcher call.
+_WOKE: dict[tuple[str, int], tuple[tuple, float, "Decision"]] = {}
 EVIDENCE_CHARS = 4000
 # Clock times, dates and durations change on every probe run without saying anything new.
 _VOLATILE = re.compile(r"\d{4}-\d\d-\d\d[T ]\d\d:\d\d(:\d\d)?(\.\d+)?Z?|\b\d{1,2}:\d\d(:\d\d)?\b"
@@ -264,10 +268,12 @@ def _ask_jev(db: DB, cfg: dict, s: dict, jev, task: dict, prev: dict, probe: tup
         score = 0.5
     skip = score < float(s["jev_skip_below"])
     cost = getattr(jev, "last_cost", 0.0)
-    call = jevuse.record(db, USE, {"task": task["id"], "needed": round(score, 2), "skip": skip}, cost,
-                         avoided_usd=wake_cost(db, cfg, now) if skip else 0.0, ref=f"task:{task['id']}",
+    model = str(getattr(jev, "last_by", "") or "jev")   # cheapdecide.Fallback: "jev" or the Haiku model
+    call = jevuse.record(db, USE, {"task": task["id"], "needed": round(score, 2), "skip": skip, "model": model},
+                         cost, avoided_usd=wake_cost(db, cfg, now) if skip else 0.0, ref=f"task:{task['id']}",
                          changed=skip, now=now)
-    return Decision(not skip, "jev", f"jev needed={score:.2f}", jev_call=call)
+    return Decision(not skip, "jev", f"jev needed={score:.2f}" + ("" if model == "jev" else f" ({model})"),
+                    jev_call=call, extra={"model": model})
 
 
 def decide(p, cfg: dict, task: dict, prev: dict, now: float, probe: tuple | None = None,
@@ -284,6 +290,11 @@ def decide(p, cfg: dict, task: dict, prev: dict, now: float, probe: tuple | None
             or not isinstance(prev.get("waiting_since"), (int, float)):
         return None
     db = p.db
+    key = (str(getattr(db, "path", "")), int(task["id"]))
+    fp = (prev.get("waiting_since"), wait_key(prev), spec_sha, last_run["id"] if last_run else None,
+          hashlib.sha256(json.dumps(cfg, sort_keys=True, default=str).encode()).hexdigest())   # a settings change re-decides
+    if (got := _WOKE.get(key)) and got[0] == fp and now - got[1] < float(s["max_backoff_s"] or 3600):
+        return Decision(**{**got[2].__dict__, "extra": {**got[2].extra, "repeat": True}})
     gate = prev.get("wake_gate") if isinstance(prev.get("wake_gate"), dict) else {}
     skips = list(gate.get("log") or [])
     seen = evidence(*probe) if probe else ""
@@ -297,6 +308,8 @@ def decide(p, cfg: dict, task: dict, prev: dict, now: float, probe: tuple | None
         woke = ""
     ended = float(last_run["ended"] or last_run["started"] or now) if last_run else float(prev["waiting_since"])
     # Its probe_match reads the probe's "not yet" output as a wait: a changed progress line is no event.
+    over = len(skips) - int(gate.get("plan_skips") or 0) >= int(s["max_skips"]) or now - ended >= float(s["max_skip_h"]) * 3600
+    capped = f"{len(skips)} skip(s), {(now - ended) / 3600:.1f} h since its last turn"
     matchwait = bool(probe and probe[0] in _not_yet() and probematch.verdict(prev, probe[1] if match_out is None else match_out) == "wait")
     d = None
     if prev.get("escalated_wake"):
@@ -307,8 +320,17 @@ def decide(p, cfg: dict, task: dict, prev: dict, now: float, probe: tuple | None
         d = Decision(True, "event", "its spec changed since the last turn")
     elif gate.get("seen") and seen and gate["seen"] != seen and not matchwait:
         d = Decision(True, "event", "its probe's answer changed since the gate's last skip")
-    elif len(skips) - int(gate.get("plan_skips") or 0) >= int(s["max_skips"]) or now - ended >= float(s["max_skip_h"]) * 3600:
-        d = Decision(True, "cap", f"{len(skips)} skip(s), {(now - ended) / 3600:.1f} h since its last turn")
+    elif over and now - ended >= max(float(s["cap_hard_h"]), float(s["max_skip_h"])) * 3600:
+        d = Decision(True, "cap", f"{capped}: the hard ceiling (cap_hard_h)")
+    elif over and (woke == "probe passed" or probe and probe[0] != "timeout" and probe[0] not in _not_yet()):
+        d = Decision(True, "cap", capped)   # its probe answered: its model-free path, never a watcher skip
+    elif over:   # the cap re-asks the watcher, which may skip with a next look; no answer wakes as before
+        got = _ask_jev(db, cfg, s, jev, task, prev, probe, last_run, now)
+        if got is None or got.by == "fallback" or got.extra.get("pending") and gate.get("pending"):
+            d = Decision(True, "cap", capped + (f"; {got.reason}" if got and got.by == "fallback" else ""))
+        else:
+            d = got
+            d.reason = f"at the cap ({capped}): {got.reason}"[:300]
     elif woke == "probe passed":
         lg = last.get("wake_gate") if isinstance(last.get("wake_gate"), dict) else {}
         if seen and lg.get("seen") == seen and lg.get("key") == wait_key(prev):
@@ -345,10 +367,19 @@ def decide(p, cfg: dict, task: dict, prev: dict, now: float, probe: tuple | None
     if not d.wake:
         base = min(max(bud_retry_s(prev), float(s["backoff_s"])), float(s["max_backoff_s"]) or 3600)
         delay = min(base * 2 ** len(skips), float(s["max_backoff_s"]) or base)
-        cap_at = ended + float(s["max_skip_h"]) * 3600
-        d.delay_s = max(60.0, min(float(d.extra.get("delay_s") or delay), cap_at - now))
+        want = float(d.extra.get("delay_s") or delay)
+        if over and not d.extra.get("pending"):   # a skip at the cap is no re-ask each minute
+            want = max(want, float(s["backoff_s"]))
+        until = ended + max(float(s["cap_hard_h"]), float(s["max_skip_h"])) * 3600 if over \
+            else ended + float(s["max_skip_h"]) * 3600
+        d.delay_s = max(60.0, min(want, until - now))
     d.log_id = log(db, task["id"], d, wake_cost(db, cfg, now) if not d.wake and not d.extra.get("pending") else 0.0, now)
     d.extra = {**d.extra, "skips": skips}
+    _WOKE.pop(key, None)
+    if d.wake and d.by != "fallback":   # a fallback's next look may find a late answer to use
+        for k in [k for k, v in _WOKE.items() if now - v[1] >= float(s["max_backoff_s"] or 3600)]:
+            _WOKE.pop(k, None)
+        _WOKE[key] = (fp, now, d)
     return d
 
 

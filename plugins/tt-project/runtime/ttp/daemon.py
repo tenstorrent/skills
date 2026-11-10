@@ -12380,7 +12380,8 @@ class Daemon:
         if d is None:
             return False, None
         if d.wake:
-            log(self.p, f"task {tid} wake gate: wake ({d.by}: {d.reason})")
+            if not d.extra.get("repeat"):   # a wake re-gated before its turn starts is logged once
+                log(self.p, f"task {tid} wake gate: wake ({d.by}: {d.reason})")
             return False, d.note(prev, d.extra.get("skips") or [])
         nb = now + d.delay_s
         db.update_task(tid, not_before=nb, result=dump_result(waitgate.skipped(prev, d, now)), blocked_reason=(

@@ -150,8 +150,13 @@ disk untouched, with no migration; nothing else is reclaimed by check recovery.
    open task still waits on.
    Before a due wait starts a model turn, the wait-wake gate (`waitgate.py`) decides whether one
    is needed. Must-wake events always wake: an escalation, any wake reason but a timer or "probe
-   passed", a changed spec, a probe answer that changed since the last skip, and the cap
-   (`waiting.wake_gate.max_skips`, 4, or `max_skip_h`, 4 h, since the last turn). Model-free rules
+   passed", a changed spec, a probe answer that changed since the last skip, and the hard ceiling
+   (`waiting.wake_gate.cap_hard_h`, 24 h since the last turn). At the cap (`max_skips`, 4, or
+   `max_skip_h`, 4 h) the watcher is asked again with no model-free rule first: it may skip with a
+   next look (at least `backoff_s`, never past the ceiling); no answer, or a probe that answered,
+   wakes. A wake the daemon cannot start yet (slots full, a hold) is the same wake when re-gated
+   before its turn: no new row and no new question. Each decision names the model that answered
+   (the watcher's, Jev, or the Haiku fallback). Model-free rules
    then skip what is still pending (a detached job with no exit code, a lock still held, checks or
    a push still running or queued, a probe pass the last turn already saw); Jev, where its
    `wake_gate` use is on, judges the rest; anything else wakes as before. A skip re-defers the
