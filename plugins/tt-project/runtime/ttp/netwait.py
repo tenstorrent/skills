@@ -59,7 +59,7 @@ import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from . import outagemsg, sshfail, timefmt
+from . import outagemsg, sshagent, sshfail, timefmt
 
 KEY = "network:unreachable"
 STATE_KEY = "network_outage"   # kv: {since, last, alerted, tasks, hosts, tunnel, raised} of the open outage
@@ -73,6 +73,8 @@ _OUT_HOST = re.compile(r"(?:connect to host|resolve hostname|[Cc]onnection to|co
 _SSH_ARG_OPTS = set("BbcDEeFIiJLlmOoPpQRSWw")   # ssh options that take a value
 _SUBST = re.compile(r"^(?:[A-Za-z_][A-Za-z0-9_]*=)?(?:\$\(|`)+")   # `x=$(`, `$(` or a backtick before ssh
 REACH_THREADS = 32             # hosts checked at once in one reach() pass
+AGENT = "agent"               # answers(): the ssh agent here is locked or waiting, so the host says nothing
+AGENT_WHY = "exit 255: " + sshagent.WHY + ", counted as not yet"
 CONFIRM_TIMEOUT_S = 10         # ConnectTimeout of the check that a probe's host really is unreachable
 # ssh's own errors: a name that does not resolve, or no route out at all, means this machine is offline
 _OFFLINE = re.compile(r"[Cc]ould not resolve hostname|Name or service not known|nodename nor servname|"
@@ -135,10 +137,11 @@ def hosts(probe: str, output: str = "") -> list[str]:
     return out or list(dict.fromkeys(_OUT_HOST.findall(output or "")))
 
 
-def answers(alias: str, env: dict | None = None) -> bool:
+def answers(alias: str, env: dict | None = None) -> bool | str:
     """ssh reaches `alias`: anything but ssh's own 255 (or no answer at all) means the host answered.
     The machine this runs on (machines.own_host) answers without ssh: a missing route to itself never
-    reads as it being down."""
+    reads as it being down. AGENT (truthy, never "up" to confirm) when the failure is the ssh agent's
+    here (locked or waiting for approval, sshagent.py): it says nothing about the host."""
     if not alias or alias.startswith("-"):
         return False
     if own(alias):
@@ -146,9 +149,23 @@ def answers(alias: str, env: dict | None = None) -> bool:
     try:
         r = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", f"ConnectTimeout={CONFIRM_TIMEOUT_S}", alias, "true"],
                            env=env, stdin=subprocess.DEVNULL, capture_output=True, timeout=CONFIRM_TIMEOUT_S + 20)
+    except subprocess.TimeoutExpired:   # a BatchMode ssh that hangs: the agent waiting for approval, if one serves it
+        return AGENT if _pm_agent(alias, env) else False
     except (OSError, subprocess.SubprocessError):
         return False
+    if r.returncode == UNREACHABLE_RC and sshagent.locked((r.stderr or b"").decode(errors="replace")):
+        return AGENT
     return r.returncode != UNREACHABLE_RC
+
+
+def _pm_agent(alias: str, env: dict | None) -> bool:
+    """A password manager's agent serves ssh to `alias`: its IdentityAgent (read through `ssh -G` only)
+    or else SSH_AUTH_SOCK."""
+    agent = _ssh_config(alias).get("identityagent", "")
+    if agent and agent.lower() not in ("none", "ssh_auth_sock", "$ssh_auth_sock"):
+        return sshagent.password_manager(agent)
+    import os
+    return sshagent.password_manager((env or os.environ).get("SSH_AUTH_SOCK", ""))
 
 
 def own(alias: str) -> bool:
@@ -170,7 +187,8 @@ def reach(aliases: list[str], env: dict | None = None) -> dict[str, bool]:
 
 
 def confirm(probe: str, output: str = "", answered=None) -> str:
-    """Why a probe's exit 255 is not ssh's own ("" when every host it names is unreachable): it names
+    """Why a probe's exit 255 is not ssh's own ("" when every host it names is unreachable; AGENT_WHY,
+    "not yet", when the ssh agent here is locked or waiting): it names
     no ssh host, or this machine itself (own: it is up), or one answers, so its own remote command
     failed, or ssh says a name it needs does not exist (sshfail.unresolved). `answered(alias)` checks
     one host."""
@@ -186,7 +204,10 @@ def confirm(probe: str, output: str = "", answered=None) -> str:
     if not names:
         return "exit 255 from a probe that names no ssh host"
     with ThreadPoolExecutor(len(names)) as ex:   # at once: in an outage each waits out its timeout
-        up = [h for h, ok in zip(names, ex.map(answered or answers, names)) if ok]
+        got = list(zip(names, ex.map(answered or answers, names)))
+    if any(ok == AGENT for _, ok in got):   # the agent here refused or hangs: neither down nor up
+        return AGENT_WHY
+    up = [h for h, ok in got if ok]
     if up:
         return f"exit 255 though ssh reaches {', '.join(up)}: its remote command failed"
     return ""

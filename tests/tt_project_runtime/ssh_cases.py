@@ -645,6 +645,58 @@ def test_a_waiting_probe_refused_by_the_agent_sleeps_on_without_a_host_fault(env
     assert len(p.db.q("SELECT id FROM events WHERE kind=?", (sshagent.EVENT,))) == 1
 
 
+def _agent_stub_ssh(p, body):
+    b = p.harness / "bin"
+    b.mkdir(parents=True, exist_ok=True)
+    (b / "ssh").write_text("#!/bin/sh\n" + body)   # stub: never the real ssh, no key or agent read
+    (b / "ssh").chmod(0o755)
+    for tool in ("ssh-add", "ssh-keygen"):   # any call would be a bug: they leave a marker
+        (b / tool).write_text(f"#!/bin/sh\ntouch '{p.base}/{tool}-ran'\nexit 1\n")
+        (b / tool).chmod(0o755)
+
+
+def _assert_agent_not_host(p, d, tid):
+    from ttp import downwait, sshagent
+    assert d._probe_rc[tid][0] == 1 and not _ready(p, tid)   # not yet: it sleeps on
+    assert not downwait.episodes(p.db) and not p.db.kv("network_outage")
+    assert not p.db.q("SELECT id FROM events WHERE kind IN ('host_down','probe_broken')")
+    assert not p.db.q("SELECT id FROM alerts WHERE key LIKE 'machine%' OR key LIKE 'network%'")
+    assert len(p.db.q("SELECT id FROM alerts WHERE key=? AND cleared IS NULL", (sshagent.KEY,))) == 1
+    assert len(p.db.q("SELECT id FROM events WHERE kind=?", (sshagent.EVENT,))) == 1
+    assert not list(p.base.glob("ssh-*-ran"))
+
+
+def test_a_probe_that_drops_stderr_is_still_told_apart_by_the_daemons_own_host_check(env, monkeypatch):
+    """The probe's 255 carries no agent words (2>/dev/null): the daemon's confirm ssh (netwait.answers)
+    sees the agent's refusal, so the host is neither down nor up and the wait goes on."""
+    from ttp import daemon as dmod
+    p = make(env)
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
+    _agent_stub_ssh(p, "echo 'sign_and_send_pubkey: signing failed for ED25519 \"k\" from agent: "
+                       "agent refused operation' >&2\nexit 255\n")
+    d = dmod.Daemon(p.base)
+    tid = _due_waiting_task(p, "ssh box-a test -e /m 2>/dev/null")
+    p.db.update_task(tid, not_before=time.time() + 3600)
+    _settle_probe(d, tid)
+    _assert_agent_not_host(p, d, tid)
+
+
+def test_a_host_check_that_hangs_on_a_password_manager_agent_is_not_yet(env, monkeypatch):
+    """The probe exits 255 with no words; the confirm ssh hangs while SSH_AUTH_SOCK names a password
+    manager's agent (a made-up path): the agent waiting for approval, not the host."""
+    from ttp import daemon as dmod, netwait
+    p = make(env)
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
+    monkeypatch.setattr(netwait, "CONFIRM_TIMEOUT_S", -18)   # the confirm ssh is cut after 2 s
+    monkeypatch.setenv("SSH_AUTH_SOCK", "/fake-home/1password/agent.sock")
+    _agent_stub_ssh(p, 'case "$*" in *" true") exec sleep 30;; -G*) exit 0;; esac\nexit 255\n')
+    d = dmod.Daemon(p.base)
+    tid = _due_waiting_task(p, "ssh box-a test -e /m 2>/dev/null")
+    p.db.update_task(tid, not_before=time.time() + 3600)
+    _settle_probe(d, tid)
+    _assert_agent_not_host(p, d, tid)
+
+
 def test_a_heal_check_refused_by_the_agent_is_unknown_never_a_fault(env):
     from ttp import heal, sshagent
     p, d, up = _heal_setup(env)

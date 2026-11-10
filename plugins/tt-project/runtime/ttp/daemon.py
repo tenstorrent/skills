@@ -13638,6 +13638,12 @@ class Daemon:
         checked (netwait.confirm). One that names none, or whose host answers, failed its own remote
         command: why it is broken, which takes the broken-probe path, never the network outage."""
         why = netwait.confirm(probe, out, lambda h: self._host_answers(h, now))
+        if why == netwait.AGENT_WHY:   # the agent here, not the host: "not yet", noted once per episode
+            try:
+                sshagent.seen(self, f"task #{tid}'s probe", out, now)
+            except Exception as e:
+                log(self.p, f"task {tid}: ssh agent failure not noted: {type(e).__name__}: {e}")
+            return 1
         if why:
             log(self.p, f"task {tid} probe is broken, not waiting on an unreachable host: {why}")
         return why or netwait.UNREACHABLE_RC
@@ -13696,15 +13702,16 @@ class Daemon:
             for h, (ok, when) in list(self._host_up.items()) if eps else ():
                 alias = h.rsplit("@", 1)[-1]
                 ep = eps.get(alias)
-                if ok and ep and when >= float(ep.get("first") or ep.get("since") or 0) \
+                if ok is True and ep and when >= float(ep.get("first") or ep.get("since") or 0) \
                         and downwait.clear(self.p.db, alias):
                     eps.pop(alias, None)
                     log(self.p, f"machine {alias}: answers again (the daemon's ssh check); its down episode ended")
         except Exception:
             log(self.p, "down episodes: " + traceback.format_exc().replace("\n", " | ")[:1000])
 
-    def _host_answers(self, host: str, now: float) -> bool:
-        """ssh reaches `host`, asked at most once a minute for all the probes that name it."""
+    def _host_answers(self, host: str, now: float) -> bool | str:
+        """ssh reaches `host` (netwait.AGENT: the agent here failed), asked at most once a minute for all
+        the probes that name it."""
         self._check_hosts([host], now)
         return self._host_up[host][0]
 

@@ -7137,7 +7137,8 @@ def cmd_ssh_preflight(a) -> None:
     """Exit 0 once a host answers over ssh, 255 while it does not (for retry_when; 12 with
     --classified), 10 when its host key does not verify, 11 when authentication fails, 13 when this
     process cannot gain privileges (no_new_privs) and the host's ProxyCommand runs sudo (all three wake a
-    waiting task). ssh runs with strict host-key checking and no connection sharing. `@<resource>`
+    waiting task), 14 with --classified (else 1, "not yet") when the ssh agent here is locked or waiting
+    for approval (sshagent.py). ssh runs with strict host-key checking and no connection sharing. `@<resource>`
     finds the host in the project's config `device.hosts` (or `device.runners`) each time it runs,
     so a probe follows its resource to another box; an unknown resource exits 2."""
     from . import hostmap
@@ -13660,8 +13661,9 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("target", help="an ssh host, or @<resource> (config device.hosts or device.runners)")
     s.add_argument("--timeout", type=float, default=30.0, help="give up on ssh after this many seconds")
     s.add_argument("--classified", action="store_true",
-                   help="exit 12 instead of 255 when the host is not reachable (not for retry_when: "
-                        "only 255 keeps a waiting task asleep)")
+                   help="exit 12 instead of 255 when the host is not reachable, and 14 instead of 1 when "
+                        "the ssh agent here is locked or waiting (not for retry_when: only 255 keeps a "
+                        "waiting task asleep)")
     s.set_defaults(fn=cmd_ssh_preflight)
 
     s = sub.add_parser("land", help="land a reviewed head on a local push branch (code repo with no git remote): "

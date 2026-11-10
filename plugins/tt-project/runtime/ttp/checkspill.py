@@ -673,6 +673,9 @@ def probe(alias: str, beside_device: bool = False) -> tuple[int, str, str]:
     except OSError as e:
         return 0, f"cannot run ssh: {e}", ""
     if r.returncode == 255:
+        from . import sshagent
+        if sshagent.locked(r.stderr or ""):
+            return 0, f"ssh cannot reach it: {sshagent.WHY}", ""
         return 0, f"ssh cannot reach it: {(r.stderr.strip().splitlines() or ['exit 255'])[-1][:200]}", ""
     if r.returncode == 3:
         return 0, "it lacks git or tar", ""

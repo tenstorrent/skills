@@ -476,6 +476,7 @@ def env(tmp_path, monkeypatch, _git_session, _short_tmp):
     monkeypatch.setenv("TTP_TEST_SHORT_TMP", _short_tmp)   # never the real /tmp/ttp-<uid>
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
     monkeypatch.setenv("TTP_HOST", "testhost")
+    monkeypatch.delenv("SSH_AUTH_SOCK", raising=False)   # a password manager's agent here never changes a timeout test
     monkeypatch.setenv("TTP_TEST_LOCAL_TZ", "UTC")   # home zones: never the zone of the machine running the tests
     monkeypatch.setenv("TTP_TEST_CLEAR_HOLD_S", "0")   # alerts clear on the first healthy sweep (alerts_cases tests the window)
     monkeypatch.setenv("TTP_TEST_BUDGET_SETTLE_S", "0")   # a budget red alerts on its first read (budget_cases tests the settle)
