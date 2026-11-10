@@ -365,6 +365,10 @@ DEGRADE_WINDOW, DEGRADE_AFTER, DEGRADE_TICKS = 10, 3, 10
 DEGRADE_OK = frozenset({"blocker_sweep", "sweep_unreviewed"})
 DEGRADE_KV = "degraded_steps"
 STEP_STUCK_N = 3   # a tick step stopped at its budget on the same item this often in a row: one tick_step_stuck event
+# A step stopped at its budget on the same item twice in a row gets one pass of at least STEP_LONG_PASS_S:
+# an item that takes longer than the budget (run 247's end: 40 min of git under load) is otherwise cut off
+# and started over every tick and never finishes. Once per run of stops on that item.
+STEP_LONG_PASS_AFTER, STEP_LONG_PASS_S = 2, 300.0
 WATCHER_MAX_S = HEARTBEAT_STALE_S - 60   # a command watcher's timeout_s is capped here, well below WATCHDOG_S
 # Schedule runs go on off the tick (schedrun); a tick waits this long for them, so quick ones are recorded
 # in the tick that started them and a slow one never holds it.
@@ -716,6 +720,7 @@ UNREVIEWED_WAIT_S = 1800.0     # review.unreviewed_wait_s: an external wait (a b
 UNREVIEWED_PASS_S = 20         # the pass stops looking after this long, so the tick stays short
 UNREVIEWED_BACKLOG_EVERY_S = 100   # after a cut pass that queued a review (a backlog): the next pass this soon
 KV_UNREVIEWED_COUNTED = "unreviewed_counted"   # kv: the runtime version whose first sweep logged its count
+KV_REVIEW_UNREAD = "review_unread"   # kv: task ids whose review a timed-out git read left unqueued (retry_unread_reviews)
 PUSH_REFS_EVERY_S = 600   # how often the push queue's pins (refs/ttp/push/<id>) of settled rows are pruned
 
 
@@ -1201,6 +1206,8 @@ class Daemon:
         self._degraded: dict[str, int] = {}   # step -> ticks it still sits out
         self._degrade_said: dict[str, float] | None = None   # kv DEGRADE_KV, read once: step -> when reported
         self._step_stuck: dict[str, tuple[str, int]] = {}   # step -> (item it was stopped on, times in a row)
+        self._step_long: dict[str, str] = {}   # step -> the item its one long pass was for (STEP_LONG_PASS_S)
+        self._step_allow: float | None = None   # the budget of the step running now (_step_allowance)
         self._overrun: dict | None = None   # the running or last tick that passed TICK_OVERRUN_S or stalled
         self._last_prune = 0.0
         self._last_leftovers = 0.0   # when prune_leftovers last ran
@@ -1838,11 +1845,13 @@ class Daemon:
         result = default
         try:
             try:
-                stepclock.begin(name, self._step_budget(), STEP_HARD_SLACK_S)
+                self._step_allow = self._step_allowance(name)
+                stepclock.begin(name, self._step_allow, STEP_HARD_SLACK_S)
                 with gitmemo.bounded(gitmemo.TICK_GIT_S):   # one slow git read never holds the step long
                     result = step()
             finally:
                 stepclock.end()
+                self._step_allow = None
         except StepBudgetSpent as e:   # stopped where it was: next tick resumes after the item it was on
             self._step_killed = e.cmd or "-"
             if name in self._step_at:
@@ -1865,6 +1874,7 @@ class Daemon:
                     log(self.p, "tick step alert error: " + traceback.format_exc().replace("\n", " | ")[:2000])
         else:
             self._step_stuck.pop(name, None)
+            self._step_long.pop(name, None)
             if self._step_fails.pop(name, None):
                 try:
                     self._clear_step(name)
@@ -1892,7 +1902,20 @@ class Daemon:
         t = time.monotonic()
         self._step_charge(t)
         self._step_holder, self._step_task, self._step_mark = holder, task, t
-        return self._stopping or (self._step_began is not None and t - self._step_began >= self._step_budget())
+        return self._stopping or (self._step_began is not None
+                                  and t - self._step_began >= (self._step_allow or self._step_budget()))
+
+    def _step_allowance(self, name: str) -> float:
+        """The budget for step `name` now: _step_budget(), or once at least STEP_LONG_PASS_S when it was
+        stopped on the same item STEP_LONG_PASS_AFTER times in a row (that item then finishes)."""
+        budget = self._step_budget()
+        item, n = self._step_stuck.get(name, ("", 0))
+        if item and n >= STEP_LONG_PASS_AFTER and self._step_long.get(name) != item and budget < STEP_LONG_PASS_S:
+            self._step_long[name] = item
+            log(self.p, f"tick step {name}: one long pass ({STEP_LONG_PASS_S:g} s) for {item}, "
+                        f"stopped on it {n} times in a row at {budget:g} s")
+            return STEP_LONG_PASS_S
+        return budget
 
     def _step_stuck_on(self, name: str) -> None:
         """Step `name` was stopped at its budget: one handled tick_step_stuck event naming the item when
@@ -2161,6 +2184,7 @@ class Daemon:
                 self.refresh_coverage,
                 self.lift_quarantine,
                 self.sweep_holds,
+                self.retry_unread_reviews,
                 self.sweep_reviews,
                 self.sweep_unreviewed,
                 self.check_unqueued_continues,
@@ -17018,6 +17042,26 @@ class Daemon:
         log(self.p, f"task {task['id']}: queued review #{rid} of its harness commits ({tier})")
         return rid, True
 
+    def retry_unread_reviews(self) -> list[int]:
+        """Queue the review of each finished change whose diff a timed-out git read left unread
+        (_auto_review, KV_REVIEW_UNREAD) on the next tick. One whose read times out again stays for the
+        tick after; one no longer done, in review or a code change is dropped. The review ids queued."""
+        db, queued = self.p.db, []
+        ids = db.kv(KV_REVIEW_UNREAD, [])
+        for tid in (ids if isinstance(ids, list) else []):
+            if queued and stepclock.over():
+                break
+            left = db.kv(KV_REVIEW_UNREAD, [])
+            db.set_kv(KV_REVIEW_UNREAD, [i for i in (left if isinstance(left, list) else []) if i != tid])
+            t = db.task(tid) if isinstance(tid, int) else None
+            if not t or t["status"] not in ("done", "review") or not self._code_change(t):
+                continue
+            review = self._auto_review(t, str(load_result(t["result"]).get("summary") or ""), add=True)
+            if review and review[1]:
+                queued.append(review[0])
+                log(self.p, f"task {tid}: queued review #{review[0]} on the tick after its diff read timed out")
+        return queued
+
     def sweep_unreviewed(self, force: bool = False) -> list[int]:
         """Model-free invariant backstop: a code task that is done, or has waited externally for
         review.unreviewed_wait_s (not review.sweep_after_s: a busy lock is external too), whose branch head is on no push-branch ref (local refs and push_queue
@@ -17360,6 +17404,11 @@ class Daemon:
             head = full[:12]
         except Exception as e:
             log(self.p, f"task {task['id']}: no review queued, its diff was not read: {e}")
+            # A git read cut off by the step budget or a slow disk says nothing about the change: the next
+            # tick reads it again (retry_unread_reviews), not the unreviewed sweep hours later.
+            if add and isinstance(e, subprocess.TimeoutExpired):
+                ids = db.kv(KV_REVIEW_UNREAD, [])
+                db.set_kv(KV_REVIEW_UNREAD, sorted({*(ids if isinstance(ids, list) else []), task["id"]}))
             return None
         if (not changes and not ext) or coord.next_task_slot(db, coord.task_cap(cfg, True), review=True) is not None:
             return None

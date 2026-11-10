@@ -357,6 +357,32 @@ def test_the_head_a_review_is_said_to_review_counts_even_off_its_branch(env):
     assert built in worktree.named_refs(p, review)
 
 
+def test_a_review_spec_quoting_many_hashes_is_sorted_in_a_fixed_number_of_git_calls(env, monkeypatch):
+    """Run 247: the reap step re-ran `merge-base --is-ancestor` for every quoted hash against every
+    branch head, both ways (0.5-0.8 s each under load), and never finished within its budget. Now one
+    cat-file drops the hashes that name no commit, then two rev-lists per head sort the rest."""
+    from ttp import gitmemo, worktree
+    p = make(env)
+    tid, path, branch = _code_task(p, "the change")
+    first = _commit_files(path, {"daemon.py": "a\n"}, "change")
+    head = _commit_files(path, {"daemon.py": "a\nb\n"}, "more")
+    built = _git_out(path, "commit-tree", f"{head}^{{tree}}", "-p", head, "-m", "settle")
+    _git_out(path, "reset", "-q", "--hard", "HEAD~2")
+    off = _commit_files(path, {"other.py": "x\n"}, "elsewhere")
+    _git_out(path, "reset", "-q", "--hard", head)
+    missing = ["49572d71", "a2667391", "deadbeefcafe"]
+    spec = (f"Review #{tid}. Earlier {first[:10]}, fix {built[:10]}, unrelated {off[:10]}; "
+            + ", ".join(f"see {m}" for m in missing) + ".")
+    calls = []
+    real = gitmemo.run
+    monkeypatch.setattr(gitmemo, "run", lambda argv, **kw: calls.append(list(argv)) or real(argv, **kw))
+    refs = worktree._named_refs(p, p.db.task(_quoting_review(p, spec, (tid,))))
+    assert first[:10] in refs and built[:10] in refs, refs
+    assert off[:10] not in refs and not set(missing) & set(refs), refs
+    assert not [c for c in calls if "merge-base" in c], calls
+    assert len([c for c in calls if "cat-file" in c or "rev-list" in c]) <= 3, calls
+
+
 def test_a_review_spec_naming_only_a_hash_still_reviews_it(env):
     from ttp import worktree
     p = make(env)

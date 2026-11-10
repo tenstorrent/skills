@@ -2353,8 +2353,51 @@ def _named_refs(p: Project, task: dict) -> list[str]:
     if heads:
         said = {m.group(1) for b in branches for i in _find_all(spec, b)
                 if (m := _SAID_HEAD.match(spec, i + len(b)))}
-        hashes = [h for h in hashes if h in said or any(_on(p, h, tip) or _on(p, tip, h) for tip in heads)]
+        hashes = _on_heads(p, hashes, heads, said)
     return list(dict.fromkeys(branches + hashes))
+
+
+def _on_heads(p: Project, hashes: list[str], heads: list[str], said: set[str]) -> list[str]:
+    """The quoted `hashes` that are in `said`, or on one of `heads` (an ancestor) or build on one (a
+    descendant). A fixed number of git calls: one `cat-file --batch-check` drops the hashes that name no
+    commit here, then per head one `rev-list` of its ancestors and one `rev-list --ancestry-path` of
+    its descendants among the rest (a pairwise `merge-base --is-ancestor`, both ways, kept the daemon's
+    reap step on one review for 40 minutes, run 247). A git call that fails or hangs counts as no."""
+    todo = [h for h in hashes if h not in said and not any(tip.startswith(h) for tip in heads)]
+    full = _commit_ids(p, todo)
+    found: set[str] = set()
+    for tip in heads:
+        rest = [h for h in todo if h in full and h not in found]
+        if not rest:
+            break
+        anc = _rev_list(p, tip)
+        desc = _rev_list(p, "--ancestry-path", f"^{tip}", *dict.fromkeys(full[h] for h in rest))
+        found.update(h for h in rest if full[h] in anc or full[h] in desc)
+    return [h for h in hashes if h not in todo or h in found]
+
+
+def _commit_ids(p: Project, hashes: list[str]) -> dict[str, str]:
+    """{hash: full commit id} for the `hashes` that name one commit here, in one git call."""
+    if not hashes:
+        return {}
+    try:
+        out = gitmemo.run(["git", "-C", str(p.root), "cat-file", "--batch-check=%(objectname) %(objecttype)"],
+                          input="".join(f"{h}^{{commit}}\n" for h in hashes), capture_output=True, text=True,
+                          timeout=120, read=True)
+    except subprocess.TimeoutExpired:
+        return {}
+    lines = (out.stdout or "").splitlines() if out.returncode == 0 else []
+    return {h: ln.split()[0] for h, ln in zip(hashes, lines)
+            if ln.endswith(" commit") and ln.split()[0].startswith(h)}
+
+
+def _rev_list(p: Project, *args: str) -> set[str]:
+    try:
+        out = gitmemo.run(["git", "-C", str(p.root), "rev-list", *args], capture_output=True, text=True,
+                          timeout=120, read=True)
+    except subprocess.TimeoutExpired:
+        return set()
+    return set((out.stdout or "").split()) if out.returncode == 0 else set()
 
 
 def _branch_head(p: Project, branch: str) -> str:
@@ -2370,14 +2413,6 @@ def _find_all(text: str, sub: str) -> list[int]:
         out.append(i)
         i = text.find(sub, i + 1)
     return out
-
-
-def _on(p: Project, commit: str, tip: str) -> bool:
-    """Whether `commit` is `tip` or an ancestor of it; False when either does not resolve or git hangs."""
-    try:
-        return tip.startswith(commit) or is_ancestor(p, commit, tip)
-    except subprocess.TimeoutExpired:
-        return False
 
 
 # The code tasks that may carry one of the branches `names` (fix_branches), narrowed in SQLite so the

@@ -1,7 +1,8 @@
 """`ttp stats --landing`: what each landed change cost in tests, CPU and dollars, per day in the home zone
 (user msg #2220, #2221: one push train tested once; report test runs, CPU-hours and $ per landed change).
 
-Per day: the changes the push queue landed (a queue entry pushed or landed, on its batch's end), the task and
+Per day: the changes the push queue landed (a queue entry pushed or landed, on its batch's end) and the tasks
+that landed by a direct `ttp push` (task_landings, on their first landing; no approval wait), the task and
 review `ttp checks` runs that ended (their checks.json: 'full' when a scope line ran a check in full or no
 check was narrowed), the push trains that ran checks and their check runs, the CPU-hours the checks runs
 recorded (cpu_s, from #2220 on; older runs recorded none), the train check hours (wall), the dollars every
@@ -40,7 +41,7 @@ def report(db, runs_dir, tz: str, days: float = 7, now: float | None = None) -> 
 
     def day(ts: float) -> dict:
         return out.setdefault(timefmt.today(ts, tz), {
-            "landed": 0, "checks_runs": 0, "full_runs": 0, "trains": 0, "train_check_runs": 0,
+            "landed": 0, "direct": 0, "checks_runs": 0, "full_runs": 0, "trains": 0, "train_check_runs": 0,
             "cpu_s": 0.0, "cpu_unrecorded": 0, "train_check_s": 0.0, "usd": 0.0, "_wait": []})
 
     for r in db.q("SELECT q.created, COALESCE(b.ended, q.updated) at_ FROM push_queue q LEFT JOIN push_batches b "
@@ -49,6 +50,13 @@ def report(db, runs_dir, tz: str, days: float = 7, now: float | None = None) -> 
         d = day(float(r["at_"]))
         d["landed"] += 1
         d["_wait"].append(max(0.0, float(r["at_"]) - float(r["created"])))
+    # A review that lands its change itself (`ttp push`, no push queue) leaves only a task_landings row:
+    # count each such task once, on its first landing (a queue entry for the task already counted it).
+    for r in db.q("SELECT task, min(ts) ts FROM task_landings WHERE ts>=? AND task NOT IN (SELECT task FROM "
+                  "push_queue WHERE status IN ('pushed','landed')) GROUP BY task", (since,)):
+        d = day(float(r["ts"]))
+        d["landed"] += 1
+        d["direct"] += 1
     for r in db.q("SELECT started, check_runs, check_s FROM push_batches WHERE started>=? AND check_runs>0", (since,)):
         d = day(float(r["started"]))
         d["trains"] += 1
@@ -148,7 +156,7 @@ def text(r: dict, name: str) -> str:
     lines = [f"{name}: per landed change, per day (home zone)"]
     for d in r["days"]:
         lines.append(
-            f"  {d['day']}: {d['landed']} landed; {d['checks_runs']} task checks runs ({d['full_runs']} full) + "
+            f"  {d['day']}: {d['landed']} landed{f' ({x} by direct push)' if (x := d.get('direct')) else ''}; {d['checks_runs']} task checks runs ({d['full_runs']} full) + "
             f"{d['trains']} trains ({d['train_check_runs']} check runs): {f(d['runs_per_landed'])} runs and "
             f"{f(d['full_per_landed'])} full suites/landed; {f(d['cpu_h_per_landed'])} CPU-h/landed"
             + (f" ({d['cpu_unrecorded']} runs recorded no CPU)" if d["cpu_unrecorded"] else "")

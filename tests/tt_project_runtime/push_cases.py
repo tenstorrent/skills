@@ -19630,6 +19630,31 @@ def test_ttp_stats_landing_shows_runs_cpu_hours_and_dollars_per_landed_change(en
     p.db.x("DELETE FROM push_queue")
 
 
+def test_ttp_stats_landing_counts_a_review_that_landed_its_change_by_direct_push(env):
+    """A review that lands its change with `ttp push` (no push queue) leaves only a task_landings row:
+    `ttp stats --landing` counted 0 landed every day while such pushes landed. Each task counts once,
+    and a task the push queue already counted is not counted again."""
+    import datetime as dt
+    from ttp import timefmt, trainstats
+    p, rid = _pq_rows(env)
+    tz = timefmt.home(p)
+    now = dt.datetime(2026, 11, 8, 12, tzinfo=timefmt.tzinfo(tz)).timestamp()
+    other = p.db.add_task("review another", "spec", kind="review")
+    for marker, task, age in (("t1-a", rid, 3600), ("t1-b", rid, 1800), ("t2-a", other, 600),
+                              ("t2-old", other, 3 * 86400)):
+        p.db.x("INSERT INTO task_landings(marker, task, sha, target, ts) VALUES(?,?,?,?,?)",
+               (marker, task, "a" * 40, "origin/main", now - age))
+    (d,) = trainstats.report(p.db, p.runs, tz, days=1, now=now)["days"]
+    assert (d["landed"], d["direct"], d["landing_median_h"]) == (2, 2, None), d
+    assert "2 landed (2 by direct push)" in trainstats.text({"days": [d]}, p.name)
+    _pq_batch_row(p, "b0", now, age=3700, outcome="pushed", ended=now - 3600, check_runs=1, check_s=60.0)
+    _pq_row(p, rid, now, status="pushed", batch="b0", age=3660)
+    (d,) = trainstats.report(p.db, p.runs, tz, days=1, now=now)["days"]
+    assert (d["landed"], d["direct"]) == (2, 1), d
+    p.db.x("DELETE FROM push_queue")
+    p.db.x("DELETE FROM task_landings")
+
+
 def test_the_daily_audit_shows_approval_to_landed_median_and_p90(env):
     from ttp import audit, pushq
     p, rid = _pq_rows(env)

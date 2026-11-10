@@ -411,6 +411,7 @@ def test_a_step_stopped_on_the_same_item_three_times_in_a_row_raises_one_stuck_e
     d = dmod.Daemon(p.base)
     monkeypatch.setattr(dmod, "STEP_BUDGET_S", 0.05)
     monkeypatch.setattr(dmod, "STEP_HARD_SLACK_S", 0.05)
+    monkeypatch.setattr(dmod, "STEP_LONG_PASS_AFTER", 99)   # the long pass has its own test
 
     def on(item):
         def step():
@@ -432,6 +433,42 @@ def test_a_step_stopped_on_the_same_item_three_times_in_a_row_raises_one_stuck_e
     for _ in range(3):
         d._run_step(on("run 2's end"), "rows")
     assert len(stuck()) == 2
+
+
+def test_an_item_stopped_at_the_step_budget_twice_in_a_row_gets_one_long_pass(env, monkeypatch):
+    """Run 247: reaping one run's end took longer than the step budget, so the step was stopped on it and
+    started over every tick for 40 minutes. The second stop in a row on one item buys one long pass."""
+    p = make(env)
+    from ttp import daemon as dmod
+    d = dmod.Daemon(p.base)
+    monkeypatch.setattr(dmod, "STEP_BUDGET_S", 0.05)
+    monkeypatch.setattr(dmod, "STEP_HARD_SLACK_S", 0.05)
+    monkeypatch.setattr(dmod, "STEP_LONG_PASS_S", 3.0)
+    done = []
+
+    def slow(item, secs=0.6):
+        def step():
+            d._step_over(item, 7)
+            time.sleep(secs)
+            done.append(item)
+        return step
+    d._run_step(slow("run 1's end"), "reap")
+    d._run_step(slow("run 1's end"), "reap")
+    assert not done and d._step_stuck["reap"] == ("run 1's end", 2)
+    d._run_step(slow("run 1's end"), "reap")
+    assert done == ["run 1's end"], "the long pass let the item finish"
+    assert "reap" not in d._step_stuck and "reap" not in d._step_long and d._step_allow is None
+    # One long pass per run of stops: an item that outlasts it too is stopped again at the plain budget.
+    for _ in range(3):
+        d._run_step(slow("run 2's end", 30), "reap")
+    t = time.monotonic()
+    d._run_step(slow("run 2's end", 30), "reap")
+    assert time.monotonic() - t < 1.5 and d._step_stuck["reap"] == ("run 2's end", 4)
+    # The configured budget applies when it is longer than the long pass.
+    p.set_config("watchdog.step_budget_s", 3600)
+    d.cfg = p.config()
+    d._step_stuck["reap"], d._step_long = ("run 3's end", 2), {}
+    assert d._step_allowance("reap") == 3600
 
 
 def test_a_coordinator_turn_whose_run_dir_is_missing_writes_no_apply_journal(env, tmp_path, monkeypatch):
