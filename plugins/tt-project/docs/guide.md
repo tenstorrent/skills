@@ -3698,8 +3698,10 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   and the daemon log say so.
 - On Claude Code, worker, reviewer and every other run but the coordinator's write the prompt cache
   at `budget.worker_cache_ttl`: `5m` by default (a write at 1.25x input instead of 2x; calls within a
-  run are rarely 5 minutes apart), `1h`, or `off` (the agent's own default). The coordinator keeps
-  `coordinator.cache_ttl`. Codex and Cursor have no such switch.
+  run are rarely 5 minutes apart), `1h`, or `off` (the agent's own default, which on a Claude
+  subscription is 1h). A replay of a day of live runs found 1h cost 11% more for workers and 27% more
+  for reviews, and no rule picking 1h at a run's start saved more than 2%, so 5m stays set
+  explicitly. The coordinator keeps `coordinator.cache_ttl`. Codex and Cursor have no such switch.
 - Long command output stays out of a worker's context: `ttp clip -- <cmd>` and `ttp checks` keep
   it in a file and show a test run's failures (else head and tail). On Claude Code, Bash output
   past `budget.bash_output_max_chars` also goes to a file. A worker compacts its own context inside

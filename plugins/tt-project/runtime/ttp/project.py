@@ -103,7 +103,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "bash_output_max_chars": 12000,
         # Prompt cache lifetime of worker, reviewer and every other run but the coordinator's
         # (coordinator.cache_ttl): "5m" (a cache write at 1.25x input; calls within a run are rarely
-        # 5 min apart), "1h" (2x input), or "off" (the agent's own default).
+        # 5 min apart), "1h" (2x input), or "off" (the agent's own default: Claude Code picks 1h on
+        # a Claude subscription, which a replay of live runs found costs 11-27% more; cachettl.py).
         "worker_cache_ttl": "5m",
         "exclusive_wait_s": 600,        # an exclusive run waiting for its resource gives up after this
         "exclusive_reserve_s": 600,     # a higher-priority task's reservation of an exclusive resource lapses after
