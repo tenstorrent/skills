@@ -121,6 +121,33 @@ plan, with the table or figure attached:
   metric for a model that needs the box is the full-model run over the box; no single-chip subset
   number stands in for it.
 
+### Layout choice on an authorised box
+
+When the user authorises a box (`authorised_hardware`, or the shapes the pipeline lists as
+candidates), the layout is chosen by cost on that box, even if the model fits one chip: an
+authorised box is the result configuration, and a model that fits one chip can still be faster
+as DP over four. Cost every layout on every allowed shape that passed its mesh smoke
+(`tt-device-usage`, "Mesh Setup"): DP, TP, and DP x TP where the shape has two axes larger than
+one. For each (shape, layout) record, in one table:
+
+- per-rank memory: weights (sharded or replicated), gradients, optimiser state, saved activations
+  at the per-rank batch, collective buffers, against one chip's DRAM; a layout that does not fit
+  is listed with its overshoot, not dropped silently;
+- compute roofline per rank: the useful FLOPs each rank executes (TP partitions a layer's work,
+  DP partitions the batch) at one chip's nominal peak, and the per-rank shard shapes of the top
+  three ops, since a TP shard can fall below the shape a kernel runs well at;
+- collective bytes per step: DP all-reduces trainable gradients only (LoRA adapters are tiny,
+  full fine-tuning is the whole model); TP all-reduces or all-gathers activations in the forward
+  and their gradients in the backward, twice per block for a Megatron split; at the measured
+  link bandwidth per axis (the smoke's `--bandwidth-mib` figure until the plan measures better),
+  with whether it can overlap with compute;
+- the resulting step time and MFU over the box's nominal peak (chips x per-chip peak).
+
+The plan picks the fastest layout that fits, says why in one line, and names the runner-up with
+its number. Choosing a layout without the others costed, or costing only one shape, is a plan
+defect. The chosen shape, axis names (`dp`, `tp`) and layout go into a `mesh` block of
+`doc/plan.md` with the global batch (per-rank batch x DP size) the continuations will use.
+
 Under a power cap, bytes moved, cores spinning and DRAM traffic cost clock on every chip; the loop
 chooses kernel variants by cooled wall ms with telemetry attached, not by cycles. Say so in the plan
 so the composite phase's layout choices already favour fewer bytes and fewer active cores.
@@ -131,6 +158,7 @@ so the composite phase's layout choices already favour fewer bytes and fewer act
 reference commit and HF revision, the recipe, the chips and their firmware bundle. The roofline
 target is a single wall ms/step and MFU figure at the nominal peak with its derivation and the
 delivered-clock margin; the top three ops name their compiled kernel source and % of peak; the
-multi-chip fit decision is explicit. The inventory selects reusable training paths, layouts and
+multi-chip fit decision is explicit; on an authorised box every allowed shape and layout is costed
+and the fastest that fits is chosen. The inventory selects reusable training paths, layouts and
 one-time constant preparation for the first baseline; the useful-FLOP derivation follows the
 freeze map and the denominator uses the actual compute grid. `stage-review` returns `clean-pass`.
