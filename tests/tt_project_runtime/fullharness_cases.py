@@ -203,3 +203,59 @@ def test_daily_audit_shows_dollars_per_landed_change_over_24h_and_7d(env, monkey
     p.db.x("DELETE FROM runs")
     monkeypatch.setattr(trainstats, "landed_commits", lambda *a: 0)
     assert not any(x.startswith("$ per landed change") for x in audit.lines(p.db, now=now, p=p))
+
+
+# The same rules on the other providers (user msg #1828): chat runs Claude Code itself; Codex edits
+# through apply_patch (its reads go through its shell, the Bash rules); Cursor's hook translates its tools.
+def test_chat_workers_and_reviews_get_claudes_full_tool_set_and_hook(env, monkeypatch):
+    from ttp.providers import get_provider
+    kw = dict(model="m", effort="low", cwd=".", budget_usd=1.0, schema=None, restrictions={})
+    for role in ("worker", "reviewer"):
+        argv, _ = get_provider("chat").build(role=role, read_only=False, web=True, **kw)
+        ref, _ = get_provider("claude").build(role=role, read_only=False, web=True, **kw)
+        assert "--tools" not in argv and "--disallowedTools" not in argv, role
+        hooks = json.loads(argv[argv.index("--settings") + 1])["hooks"]
+        assert hooks == json.loads(ref[ref.index("--settings") + 1])["hooks"], role
+        assert [h["matcher"] for h in hooks["PreToolUse"]] == ["*"], role
+
+
+def _patch(*heads):
+    return {"command": "*** Begin Patch\n" + "".join(f"*** {h}\n+x\n" for h in heads) + "*** End Patch\n"}
+
+
+def test_a_codex_reviews_apply_patch_writes_only_in_its_run_folder_or_while_resolving_a_conflict(
+        env, monkeypatch, tmp_path):
+    from ttp.providers import codex
+    assert re.fullmatch(codex.PRE_TOOL_MATCHER, "apply_patch"), "Codex routes apply_patch through the hook"
+    run, home = _full_harness_run(env, monkeypatch, tmp_path, role="reviewer")
+    repo = home / "proj"
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    call = lambda inp: _hook_reason({"tool_name": "apply_patch", "tool_input": inp, "cwd": str(repo)})
+    for heads in (["Update File: a.py"], ["Add File: " + str(repo / "b.py")], ["Delete File: a.py"],
+                  [f"Update File: {run}/n.md", "Move to: c.py"], [f"Add File: {run}/n.md", "Add File: d.py"]):
+        reason = call(_patch(*heads))
+        assert reason and "never edits the change it judges" in reason, heads
+    assert call(_patch(f"Add File: {run}/notes.md", f"Add File: {tempfile.gettempdir()}/s.txt")) is None
+    (repo / ".git" / "MERGE_HEAD").write_text("0" * 40 + "\n")
+    assert call(_patch("Update File: a.py")) is None
+    (repo / ".git" / "MERGE_HEAD").unlink()
+    monkeypatch.setenv("TTP_ROLE", "worker")
+    assert call(_patch("Update File: a.py")) is None
+
+
+def test_cursor_tool_calls_meet_the_search_scope_and_review_write_rules(env, monkeypatch, tmp_path):
+    from ttp import cursorhook
+    run, home = _full_harness_run(env, monkeypatch, tmp_path, role="reviewer")
+    repo = home / "proj"
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    deny = lambda tool, inp: ((cursorhook.translate("preToolUse", {"tool_name": tool, "tool_input": inp,
+                                                                   "cwd": str(repo)})[0] or {}).get("permission")
+                              == "deny")
+    for inp in ({"pattern": "x", "file_path": "/"}, {"pattern": "x", "path": "~"}, {"pattern": "x", "file_path": ".."}):
+        assert deny("Grep", inp), inp
+    assert not deny("Grep", {"pattern": "x"}) and not deny("Grep", {"pattern": "x", "file_path": str(repo)})
+    for tool in ("Write", "Edit", "StrReplace", "Delete"):
+        assert deny(tool, {"file_path": str(repo / "a.py")}), tool
+        assert not deny(tool, {"file_path": str(run / "notes.md")}), tool
+    monkeypatch.setenv("TTP_ROLE", "worker")
+    assert not deny("Write", {"file_path": str(repo / "a.py")})

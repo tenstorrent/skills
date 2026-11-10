@@ -941,19 +941,24 @@ def _scratch_roots() -> list[str]:
 
 def reviewer_write(payload: dict) -> str | None:
     """Why a review's file-tool write is refused: a review never edits the change it judges, so its Edit,
-    Write and NotebookEdit calls write only in its run directory or a temporary folder, or in a
-    repository with a merge or rebase in progress (resolving its conflict is the one edit a review makes)."""
+    Write and NotebookEdit calls (and each file a Codex apply_patch names) write only in its run
+    directory or a temporary folder, or in a repository with a merge or rebase in progress (resolving
+    its conflict is the one edit a review makes)."""
     tool = str(payload.get("tool_name") or "")
-    if os.environ.get("TTP_ROLE") != "reviewer" or tool not in EDIT_TOOLS:
+    if os.environ.get("TTP_ROLE") != "reviewer" or tool not in EDIT_TOOLS | PATCH_TOOLS:
         return None
     args = payload.get("tool_input") if isinstance(payload.get("tool_input"), dict) else {}
-    path = os.path.expanduser(str(args.get("file_path") or args.get("notebook_path") or ""))
-    if not path:
-        return None
-    real = os.path.realpath(path if os.path.isabs(path) else os.path.join(str(payload.get("cwd") or os.getcwd()), path))
-    if any(r and (real + os.sep).startswith(os.path.realpath(r).rstrip(os.sep) + os.sep) for r in _scratch_roots()):
-        return None
-    if _git_op_in_progress(real):
+    names = patch_files(payload) if tool in PATCH_TOOLS else [str(args.get("file_path") or args.get("notebook_path") or "")]
+    roots = _scratch_roots()
+    cwd = str(payload.get("cwd") or os.getcwd())
+    for name in filter(None, names):
+        path = os.path.expanduser(name)
+        real = os.path.realpath(path if os.path.isabs(path) else os.path.join(cwd, path))
+        if any(r and (real + os.sep).startswith(os.path.realpath(r).rstrip(os.sep) + os.sep) for r in roots):
+            continue
+        if not _git_op_in_progress(real):
+            break
+    else:
         return None
     return ("a review never edits the change it judges: write notes and scratch files in your run directory "
             "($TTP_RUN_DIR); the one edit a review makes in the worktree, resolving a rebase or merge conflict, "

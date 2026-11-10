@@ -29,7 +29,8 @@ live, as no logged-in Cursor account was at hand):
   (TTP_DENIED_READS: the paths providers/cursor.py passes, joined by os.pathsep; Read and Grep).
 
 Mapping: Shell -> Bash; Write, Delete and Edit -> Write (the harness gh wrapper guard); MCP:<name> ->
-mcp__cursor__<name> (aitag); Read and Grep -> the denied-read check. A subagent's call
+mcp__cursor__<name> (aitag); Read and Grep -> the denied-read check, and Grep's file_path is its
+`path` for hook.search_scope (no search from / or the home folder). A subagent's call
 (parent_tool_call_id) counts as agent_id, so updates wait for the worker's own call. stop: a
 loop_count above 0 is stop_hook_active; a run that ended aborted or in error is not held.
 
@@ -80,6 +81,8 @@ def _claude_payload(event: str, p: dict) -> dict:
         name, inp = "Bash", {"command": str(inp.get("command") or "")}
     elif name in EDIT_TOOLS:
         name = "Write"
+    elif name == "Grep" and "path" not in inp and inp.get("file_path"):
+        inp = {**inp, "path": inp["file_path"]}   # where hook.search_scope reads a search's start
     elif name.startswith("MCP:"):
         name = "mcp__cursor__" + name[4:]
     out.update(tool_name=name, tool_input=inp)
