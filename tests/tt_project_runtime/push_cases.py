@@ -7384,6 +7384,23 @@ def test_a_daemon_queued_review_names_the_rejected_commits_its_head_carries(env,
     assert added and "unreviewed commits" not in s.p.db.task(rid)["spec"]
 
 
+def test_no_daemon_review_is_queued_while_an_open_task_re_lands_the_change(env, monkeypatch):
+    """#29 (Review #6) was queued after #27 was cancelled while #28 "Rebase #6's integration ..."
+    re-landed #6, whose own review covers it. While such a task is open no review is queued; once it
+    is cancelled the change gets its review again."""
+    from ttp.daemon import Daemon
+    s = _pq(env, monkeypatch)
+    monkeypatch.setattr(Daemon, "_precheck", lambda self, task, head: None)
+    c, _, _, _ = _pq_stacked(s, "relanded")
+    redo = s.p.db.add_task(f"Rebase #{c}'s integration onto the push branch", "Rebase it.",
+                           kind="code", status="queued")
+    d = Daemon(s.p.base)
+    assert d._auto_review(s.p.db.task(c), "made the change") is None
+    s.p.db.update_task(redo, status="cancelled")
+    rid, added = d._auto_review(s.p.db.task(c), "made the change")
+    assert added and rid
+
+
 def _held_review(env, monkeypatch, fix_status="queued", s=None, name="rejected"):
     """A code task stacked on a rejected one (#x, review failed) whose fix is `fix_status`, and the
     daemon's review of it: (s, daemon, x, fix, review id). With `s`, in that _pq project."""

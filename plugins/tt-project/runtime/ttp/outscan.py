@@ -430,6 +430,12 @@ def push_problem(lines: list[str], url: str, p=None) -> str | None:
     return _log_problem(revs, hit)
 
 
+# How to rewrite without leaving a temp dir in the worktree: filter-branch keeps its scratch tree in
+# .git-rewrite under the working tree unless -d names one, and a worker's drift check then flags it.
+REWRITE_TIP = (" (git rebase, or git filter-branch -d with a scratch dir outside the worktree, removed "
+               "afterwards: its default .git-rewrite stays in the worktree)")
+
+
 def history_problem(repo, base: str, head: str = "HEAD", p=None) -> str | None:
     """Why the commits `base..head` of `repo` must not be pushed: the same scan pre_push runs (a commit
     message, an added line or a file path holds a leak), read locally, so `ttp push` can refuse in
@@ -480,7 +486,7 @@ def _log_problem(revs_text: str, hit: Callable[[str], str | None], cwd: str | No
     if cls:
         where = f"commit {commit} " + (f"({path})" if state != "message" else "(its message)")
         return (refusal(what, cls, where) + "; rewrite that commit, since a later commit that "
-                "removes it still sends it")
+                "removes it still sends it" + REWRITE_TIP)
     if rc:
         raise ValueError(f"could not read the commits it sends (git log exited {rc})")
     return None

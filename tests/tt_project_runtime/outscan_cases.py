@@ -515,6 +515,8 @@ def test_ttp_push_scans_the_outgoing_history_first_and_runs_no_check_on_a_leak(e
     assert not ran.exists() and _remote_refs(repo) == before, said
     assert any("ttp push refused" in m and "GitHub token shape" in m and "not pushing" in m for m in said), said
     assert not any(_OUT_SHAPE in m for m in said)
+    from ttp import outscan
+    assert any(outscan.REWRITE_TIP in m for m in said), said   # how to rewrite without a .git-rewrite left behind
     _git_out(repo, "checkout", "-q", "-B", "clean", "main")
     _commit(repo, "ok.txt", "fine\n")
     said.clear()

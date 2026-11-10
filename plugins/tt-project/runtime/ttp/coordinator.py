@@ -2917,6 +2917,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 why_after = start_why(a, {}, when)
                 roots = {int(a["continues"])} if a.get("continues") is not None else set()
                 roots |= {t["id"] for t in (old, followup, carried and carried[0]) if t}
+                # A task that rebases or re-lands another's change carries it: it never waits on it landing.
+                roots |= {i for i in landed.redone(title, a.get("spec")) if db.task(i)}
                 tie = _overlap_chain(p, kind, a.get("spec") or "", clash, roots, {old["id"]} if old else set(), labels)
                 landing = landed.can_check(p)
                 if parallel := file_overlap.PARALLEL.search(a.get("spec") or ""):   # a no-op kept for old specs

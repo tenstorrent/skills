@@ -16713,6 +16713,18 @@ class Daemon:
             self.p.db.update_task(task["id"], tier=tier, tier_source="review_diff")
         return dict(task, tier=tier), pick
 
+    def _open_redo(self, task: dict) -> int | None:
+        """An open task that rebases or re-lands code task `task`'s change (its title or spec names it:
+        landed.redone, or it rebases `task`'s branch): `task` lands only through it, so a review of
+        `task`'s own head would refuse or repeat its push (review #29 after #27, Nov 9)."""
+        rebases = f'"rebases:{task["branch"]}"' if task.get("branch") else None
+        for t in self.p.db.q("SELECT id, title, spec, labels FROM tasks WHERE id!=? AND kind!='review' AND "
+                             "status IN ('queued','running','waiting','blocked','review') ORDER BY id DESC",
+                             (task["id"],)):
+            if task["id"] in landed.redone(t["title"], t["spec"]) or (rebases and rebases in (t["labels"] or "")):
+                return t["id"]
+        return None
+
     def _landed_elsewhere(self, task: dict) -> str:
         """The commit on the push branch that already carries code task `task`'s change under other
         commits (landed.equivalent: a fix or rebase of another task landed it), or "": then the caller
@@ -17529,6 +17541,10 @@ class Daemon:
                         self._name_new_head(task, t)
                         self._precheck_open(task, t)
                     return t["id"], False
+            if add and not ext and (redo := self._open_redo(task)):
+                log(self.p, f"task {task['id']}: no review queued, open task #{redo} re-lands its change "
+                            "and its own review covers it")
+                return None
             if ext and (seen := self._reviewed_external(task, ext)):
                 return seen, False
             # No branch on record: the change is the PR it published, read from the hosting service.

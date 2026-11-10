@@ -528,6 +528,28 @@ def test_overlap_chain_never_waits_on_a_task_that_waits_on_the_new_tasks_own_lin
     assert not deferral(add("other", f"Extend {hot}."))
 
 
+def test_a_task_that_rebases_or_re_lands_a_change_never_waits_on_that_change_landing(env, monkeypatch):
+    """#28 "Rebase #6's integration ..." was chained on landed:#6 by an overlap label though it carries
+    #6's change itself. A task whose title rebases #A, or whose spec re-lands #A, is not chained on A;
+    a plain task on the same file still is."""
+    from ttp import coordinator as coord, reviewcap
+    from ttp.db import deferral
+    p = make(env)
+    p.set_config("delivery.landed_probe", "test -e landed/{id}")
+    hot = "runtime/ttp/progress.py"
+    _on_base(p, "runtime/ttp/relay.py")
+    monkeypatch.setattr(reviewcap, "main_file", lambda p, r: hot)
+
+    def add(title, spec):
+        assert coord.apply(p, [{"type": "task_add", "title": title, "kind": "code", "spec": spec}]) == []
+        return p.db.one("SELECT * FROM tasks WHERE title=?", (title,))
+
+    a = p.db.add_task("A", f"Add {hot}.", kind="code", status="queued")
+    assert not deferral(add(f"Rebase #{a}'s integration onto the push branch", f"Rebase {hot}."))
+    assert not deferral(add("Carry it over", f"Re-land #{a}'s change to {hot}."))
+    assert deferral(add("other", f"Extend {hot}.")).get("when", "").startswith("landed:#")
+
+
 def test_an_automatic_chain_uses_depends_on_where_no_landing_can_be_checked(env, monkeypatch):
     """A project with no delivery.push_branch lands its work some other way, so `landed:#<id>` would
     exit 2 on every check. With no delivery.landed_probe either, task_add's automatic chain (a file

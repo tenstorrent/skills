@@ -254,11 +254,22 @@ def reconcile_pushes(p, tid: int) -> None:
 
 # A task title that redoes another task's change on a new branch: "rebase #12 onto ...", "rebased #12".
 _REBASE_TITLE = re.compile(r"\brebas(?:e|ed|es|ing)\s+(?:task\s+)?#(\d+)(?!\d)", re.I)
+_RELAND = re.compile(r"\bre-?land(?:s|ed|ing)?\s+(?:task\s+)?#(\d+)(?!\d)", re.I)
+
+
+def redone(title: str | None, spec: str | None = "") -> set[int]:
+    """The tasks a task re-lands by its own words: its title rebases one ("Rebase #6's integration ...")
+    or its title or spec re-lands one ("re-land #6"). Their change lands only through it, so it never
+    waits on their landing (task_add's overlap chain) and no second review of them is queued while
+    it is open (Daemon._auto_review)."""
+    return {int(x) for x in _REBASE_TITLE.findall(title or "")} \
+        | {int(x) for x in _RELAND.findall(f"{title or ''}\n{spec or ''}")}
 
 
 _CARRIER_SQL = ("SELECT id, kind, branch, labels, title FROM tasks WHERE id>? AND (kind='review' "
                 "OR labels LIKE '%continues:%' OR labels LIKE '%review_fix:%' OR labels LIKE '%rebases:%' "
                 "OR labels LIKE '%pr_branch:%' OR labels LIKE '%auto_review:%' OR title LIKE '%rebas%' "
+                "OR title LIKE '%re-land%' OR title LIKE '%reland%' "
                 "OR title LIKE '%review%') ORDER BY id")
 
 
@@ -280,7 +291,7 @@ def _links(db, after: int) -> list[tuple[int, str, str, set[int], set[str]]]:
                and lb.partition(":")[2].isdigit()}
         if (s := review_subject({"labels": r["labels"], "title": r["title"]})) is not None:
             ids.add(s)
-        ids |= {int(x) for x in _REBASE_TITLE.findall(r["title"] or "")}
+        ids |= redone(r["title"])
         names = {lb.partition(":")[2] for lb in labels if lb.startswith(("rebases:", "pr_branch:"))} - {""}
         links.append((r["id"], r["branch"] or "", r["kind"] or "", ids, names))
     return links
