@@ -112,7 +112,7 @@ def test_a_remote_check_runs_at_nice_19_and_idle_io_on_the_host(tmp_path):
     only the local ssh client: its niceness there is 19, its IO class idle where the host has ionice."""
     repo = _rc_repo(tmp_path)
     rc, said = _rc_run(tmp_path, repo, "echo nice=$(ps -o ni= -p $$ | tr -d ' '); command -v ionice >/dev/null && ionice -p $$ || true")
-    assert rc == 0 and "nice=19" in said, said
+    assert rc == 0 and (f"nice={max(19, os.getpriority(os.PRIO_PROCESS, 0))}" in said), said   # already above 19: stays
     if shutil.which("ionice"):
         assert "idle" in said, said
 

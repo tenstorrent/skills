@@ -1443,7 +1443,9 @@ def test_throughput_books_a_passed_start_when_wait_to_its_gate_not_worker_slots(
     p = make(env)
     now = time.time()
     tid = _tp_task(p, "after #3", now - 3000, labels=["start_when:landed:#3", f"deferred_since:{now - 3000}"])
-    Daemon(p.base)._start_verdict(p.db.task(tid), 0, now - 100)
+    with monkeypatch.context() as m:
+        m.setattr(time, "time", lambda: now - 100)
+        Daemon(p.base)._start_verdict(p.db.task(tid), 0, now - 100)
     assert "start_when" not in json.dumps(p.db.task(tid)["labels"])
     _tp_run(p, tid, now - 40, now - 10)
     # Any other path that drops the gate (here an edit) is recorded the same way.

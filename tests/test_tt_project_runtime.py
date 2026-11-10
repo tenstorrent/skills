@@ -24293,7 +24293,8 @@ def _nice_run(tmp_path, nice):
 def test_a_workers_agent_and_all_it_starts_run_niced_below_the_runner(env, tmp_path):
     base = os.getpriority(os.PRIO_PROCESS, 0)
     (agent, grandchild), recorded = _nice_run(tmp_path, 7)
-    assert agent == grandchild == recorded == min(base + 7, 19)
+    # a runner already at nice 19 or 20 (a niced Mac job) is never raised to a lower level
+    assert agent == grandchild == recorded == max(base, min(base + 7, 19))
     # runner.nice 0: the agent keeps the runner's priority.
     (agent, grandchild), recorded = _nice_run(tmp_path, 0)
     assert agent == grandchild == recorded == base
@@ -24310,7 +24311,8 @@ def test_a_run_goes_on_when_os_nice_refuses_with_eperm(env, tmp_path, monkeypatc
     base = os.getpriority(os.PRIO_PROCESS, 0)
     (agent, grandchild), recorded = _nice_run(tmp_path, 7)
     assert agent == grandchild == recorded == base, "the agent could not be niced, so it keeps the runner's level"
-    assert f"could not lower the agent's priority by 7 (it runs at nice {base})" in capsys.readouterr().out
+    if base < 19:   # at 19 or above there is nothing to lower, so no message
+        assert f"could not lower the agent's priority by 7 (it runs at nice {base})" in capsys.readouterr().out
     child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
     try:
         project.renice(child.pid, 5)
