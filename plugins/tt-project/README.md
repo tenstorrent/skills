@@ -6,21 +6,21 @@ Start a new project, give it a name and a description of what it should manage a
 Example 1: 
 
 ``` 
-new tt-project named ltx25 to manage all of my LTX 2.5 related work in the Metal repo. The project should run
+new tt-project named vidgen to manage all of my video-model related work in the Metal repo. The project should run
 on box-a, and can use box-a, box-b and exabox box-c for device work. Research and implement
 optimizations. Integrate relevant optimizations from other DIT models, and explore novel optimization ideas.
-Use profilers and profiling skills to pinpoint bottlenecks and address them. Babysit all of my LTX 2.5 related PRs.
+Use profilers and profiling skills to pinpoint bottlenecks and address them. Babysit all of my video-model related PRs.
 Any PR you open must stay in draft form until I review and move it out of draft. Only I'm allowed to merge.
-<these last two sentences are default, but doesn't hurt to be specific>. Watch git and Jira for LTX 2.5 related
+<these last two sentences are default, but doesn't hurt to be specific>. Watch git and Jira for video-model related
 issues and address them automatically.
 ```
 
 Example 2: 
 
 ```
-new tt-project named Tax to handle tax preparation. Running on this Mac.
-Look in the Downloads folder for the 2025 and 2024 tax returns. All of the supporting docs are in the
-Tax docs 2025 zip. Make sure there are no mistakes in the 2025 or 2024 return. Make a systematic plan and break
+new tt-project named Expenses to check expense reports. Running on this Mac.
+Look in the Documents folder for the 2025 and 2024 expense reports. All of the receipts are in the
+Receipts 2025 zip. Make sure there are no mistakes in the 2025 or 2024 reports. Make a systematic plan and break
 down the checks for several agents to do. Report to me if you find any mistakes. The task stops when you're
 satisfied that everything's been thoroughly checked.
 ```

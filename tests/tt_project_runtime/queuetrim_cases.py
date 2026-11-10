@@ -162,11 +162,11 @@ def test_queuetrim_repeated_report_task_is_merged_refused_or_forced(env):
 
 def test_queuetrim_targets_ignore_message_refs_dates_and_report_words(env):
     from ttp import queuetrim
-    assert queuetrim.same_target("TYO2 page (user msg #5642): read every result", "TYO2 page rows (owner msg #5726)")
+    assert queuetrim.same_target("SITE2 page (user msg #5642): read every result", "SITE2 page rows (owner msg #5726)")
     # Two targets of report words only are empty: they match nothing.
     assert not queuetrim.same_target("daily status report 2026-11-04", "Status report")
     assert not queuetrim.same_target("status of #9036", "status of #9040")
-    assert not queuetrim.same_target("TYO2 page rows", "TYO2 page consistency")
+    assert not queuetrim.same_target("SITE2 page rows", "SITE2 page consistency")
     assert queuetrim.is_report("[daily-review] summary of the day")
     assert not queuetrim.is_report("fix the parser: it drops the status field")
 
@@ -267,7 +267,7 @@ def test_queuetrim_report_targets_never_match_on_empty_or_one_word_subsets(env):
     assert not queuetrim.same_target("spend status", "spend chart axis status")
     assert queuetrim.same_target("galaxy box status", "galaxy box upgrade summary")
     # page and dashboard are no report kinds; a fix or code title is no report.
-    for title in ("fix the status page", "fix the dashboard spend chart", "TYO2 page rows", "spend dashboard",
+    for title in ("fix the status page", "fix the dashboard spend chart", "SITE2 page rows", "spend dashboard",
                   "the status page shows stale rows"):
         assert not queuetrim.is_report(title), title
     q = db.add_task("Status report: galaxy box upgrade", "Post it.", kind="work")
