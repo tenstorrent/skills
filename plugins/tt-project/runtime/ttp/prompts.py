@@ -279,6 +279,54 @@ def charter_sections(charter: str) -> list[tuple[str, list[str]]]:
     return out if out[0][1] else out[1:]
 
 
+# A heading that is the coordinator's own and so ends a Brief that has headings of its own: the template's
+# sections after the Brief and the dated ones charter_update adds
+BRIEF_END_HEADS = ("goal", "polic", "resource", "responsib")
+BRIEF_END_RE = re.compile(r"^\s*(?:<!--\s*)?\(?end of (?:the )?brief\)?\.?\s*(?:-->)?\s*$", re.I)
+
+
+def brief_lines(charter: str) -> list[bool]:
+    """Per line of `charter` (splitlines), whether it is the Brief's: from a `## Brief ...` heading up to
+    the next coordinator section (BRIEF_END_HEADS, a heading charter_update dated "(added ...)", or the
+    template's "Restrictions (binding on every task)") or an explicit end line (`<!-- end of Brief -->`,
+    "(end of Brief)"). A Brief that has `## ` headings of its own (Why, Deliverables, Restrictions ...)
+    keeps them: they are the user's words too. A `## Restrictions` heading ends a Brief that has none of
+    its own before it (a one-paragraph Brief, then the coordinator's Restrictions)."""
+    out, on, own = [], False, False
+    for line in charter.splitlines():
+        if line.startswith("## "):
+            name = " ".join(line[3:].split()).lower()
+            if name.startswith("brief"):
+                on, own = True, False
+            elif on and (name.startswith(BRIEF_END_HEADS) or "(added " in name or "binding on every task" in name
+                         or name.startswith("restriction") and not own):
+                on = False
+            elif on:
+                own = True
+        elif on and BRIEF_END_RE.match(line):
+            on = False
+        out.append(on)
+    return out
+
+
+def brief_text(charter: str) -> str:
+    """The Brief's lines (brief_lines), joined."""
+    return "\n".join(ln for ln, on in zip(charter.splitlines(), brief_lines(charter)) if on)
+
+
+def brief_restrictions(charter: str) -> set[str]:
+    """The items (whitespace-joined) of the Restrictions sections inside the Brief: they rest on the
+    Brief (origin Brief), not on a cite of their own."""
+    from .restriction_source import split_items
+    body, keep = [], False
+    for line, on in zip(charter.splitlines(), brief_lines(charter)):
+        if line.startswith("## "):
+            keep = on and line[3:].strip().lower().startswith("restriction")
+        elif keep and on:
+            body.append(line.rstrip())
+    return {" ".join(" ".join(it).split()) for it in split_items("\n".join(body))}
+
+
 def _placeholder(par: str) -> bool:
     """A paragraph the template left to be filled in: "(none stated yet)" (alone or ending a
     paragraph), "(to be ...)" or "(... to be filled in)". Other parenthesised paragraphs are real
@@ -320,7 +368,7 @@ def restrictions_block(p: Project, advisory: bool = True) -> str:
     ones apart, marked not binding (restriction_source)."""
     from .restriction_source import partition
     charter = p.charter_path.read_text() if p.charter_path.exists() else ""
-    binding, loose = partition(charter_restrictions(charter))
+    binding, loose = partition(charter_restrictions(charter), brief_restrictions(charter))
     out = [("# BINDING RESTRICTIONS (from the charter — override the task, the harness "
             "rules and your own judgement; if a step would break one, do not take it)\n" + binding)] if binding else []
     if loose and advisory:

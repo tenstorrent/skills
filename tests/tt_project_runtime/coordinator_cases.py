@@ -3338,6 +3338,30 @@ def test_a_restrictions_item_is_sourced_by_a_user_message_cite_or_an_origin_mark
         assert not rs.sourced(loose), loose
 
 
+def test_restrictions_inside_a_brief_with_its_own_headings_bind_as_origin_brief(env):
+    """A Brief the user wrote with `## ` headings of its own (Why, Deliverables, Restrictions) is the Brief
+    up to the coordinator's own sections (Goals, Policies, Resources, a dated "(added ...)" one, the
+    template's "Restrictions (binding on every task)") or an end line: its Restrictions items bind with
+    no cite of their own; an uncited item the coordinator wrote later stays advisory."""
+    from ttp import prompts, restriction_audit as ra, restriction_source as rs
+    charter = ("# demo - charter\n\n## Brief (verbatim from the user)\n\n# demo: build the widget\n\n"
+               "## Why this project exists\nThe old box is down.\n\n## Restrictions\n"
+               "- Never push to main.\n- Run tests only on box A,\n  niced.\n\n## Deliverables\n1. The widget.\n\n"
+               "## Goals and success criteria\nShip the widget.\n\n## Restrictions (binding on every task)\n"
+               "- Keep the cache warm.\n- Never open PRs (user msg #4)\n\n## Policies\n- Never merge.\n")
+    assert "## Deliverables" in prompts.brief_text(charter) and "Ship the widget" not in prompts.brief_text(charter)
+    assert prompts.brief_restrictions(charter) == {"- Never push to main.", "- Run tests only on box A, niced."}
+    assert rs.unsourced_items(charter) == ["- Keep the cache warm."]
+    assert ra.still_stated(charter, "- Never push to main.") == "Brief"
+    # an explicit end line ends a Brief whose next heading is not one of the coordinator's own
+    marked = charter.replace("1. The widget.\n", "1. The widget.\n<!-- end of Brief -->\n\n"
+                             "## Restrictions (scratch)\n- Uncited note.\n")
+    assert "- Uncited note." in rs.unsourced_items(marked) and "- Never push to main." not in rs.unsourced_items(marked)
+    # a Brief with no headings of its own reads as before: the next `## ` heading after it is not the Brief's
+    plain = "# demo\n\n## Brief\nBuild it.\n\n## Restrictions (added 2026-01-01)\n- Loose rule.\n"
+    assert prompts.brief_text(plain).strip().endswith("Build it.") and rs.unsourced_items(plain) == ["- Loose rule."]
+
+
 def test_an_approval_matches_its_text_with_or_without_the_source_cite(env):
     """The user's yes recorded in their turn holds the text with the cite charter_update added; a later
     turn resends the text without it (or with it). Each approval key (recorded, from an ask, an

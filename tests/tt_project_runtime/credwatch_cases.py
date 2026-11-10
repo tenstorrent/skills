@@ -117,6 +117,10 @@ def test_credwatch_covers_every_file_under_the_write_guards_protected_paths_by_s
     (access / "cache" / "c.json").write_text("{}")
     (home / ".ssh").mkdir()
     (home / ".ssh" / "known_hosts").write_text("h k\n")
+    for name in ("known_hosts_site2", "site2_known_hosts"):   # other sessions' host key lists: public, rewritten
+        (home / ".ssh" / name).write_text("h k\n")
+    (home / ".ssh" / "known_hosts.d").mkdir()
+    (home / ".ssh" / "known_hosts.d" / "id_site2").write_text("k\n")   # a key in a folder so named stays watched
     (home / ".ssh" / "config").write_text("Host x\n")
     (home / ".config" / "gh").mkdir()
     (home / ".config" / "gh" / "state.yml").write_text("checked: 1\n")
@@ -132,9 +136,11 @@ def test_credwatch_covers_every_file_under_the_write_guards_protected_paths_by_s
     before = credwatch.snapshot(watched)
     monkeypatch.undo()
     monkeypatch.setattr(pathguard, "_homes", lambda env: [str(home)])
-    assert {str(access / "token"), str(access / "sub" / "key"), str(home / ".ssh" / "config"),
+    assert {str(access / "token"), str(access / "sub" / "key"),
+            str(home / ".ssh" / "known_hosts.d" / "id_site2"),
             str(home / ".config" / "example-missing"), str(home / ".netrc")} <= set(watched), sorted(watched)
-    assert not any(p.endswith(("known_hosts", "state.yml", "c.json")) for p in watched), sorted(watched)
+    assert not any(p.endswith(("known_hosts", "hosts_site2", "state.yml", "c.json", "/config")) for p in watched), \
+        sorted(watched)   # ssh's client config holds settings, not keys (owner's agent, msg #131)
     assert credwatch.changes(before, credwatch.snapshot(watched)) == [], "an unchanged run passes"
     time.sleep(0.05)   # past the kernel's coarse ctime tick
     tok = access / "token"
@@ -146,6 +152,7 @@ def test_credwatch_covers_every_file_under_the_write_guards_protected_paths_by_s
     (home / ".config" / "example-missing").write_text("y\n")
     (access / "cache" / "c.json").write_text("{\"a\": 1}")
     (home / ".ssh" / "known_hosts").write_text("h k\nh2 k2\n")
+    (home / ".ssh" / "site2_known_hosts").write_text("h k\nh2 k2\n")
     after = credwatch.snapshot({p: "store" for p in credwatch.guarded_paths(env, cfg)})
     assert credwatch.changes(before, after) == sorted([
         [str(home / ".config" / "example-missing"), "created"], [str(access / "new"), "created"],
@@ -176,7 +183,9 @@ def test_credwatch_a_run_that_changes_a_protected_path_fails_its_hand_off_and_a_
     _finish_runs(p, d)
     assert p.db.task(quiet)["status"] == "done"
     assert not p.db.q("SELECT id FROM events WHERE fingerprint LIKE 'credwatch:%'")
-    monkeypatch.setenv("TTP_FAKE_SHELL", f"printf 'x\\n' > {shlex.quote(str(access / 'token'))}")
+    write = f"printf 'x\\n' > {shlex.quote(str(access / 'token'))}"
+    shown = json.dumps({"type": "assistant", "cmd": write})   # the run's own command, as its transcript shows it
+    monkeypatch.setenv("TTP_FAKE_SHELL", f"echo {shlex.quote(shown)}; {write}")
     tid = p.db.add_task("write the access token", "s", kind="work", tier="light", origin="user")
     d.dispatch()
     _finish_runs(p, d)
@@ -305,7 +314,7 @@ def test_credwatch_a_change_seen_by_overlapping_runs_is_told_once_outside_these_
     """A store rewritten in place while a run of another project (or another of this project's runs) was open
     too: no run can be tied to it. It is told once at normal severity as changed outside these runs, and the
     hand-off stands; the next run that saw the same change adds nothing. A store replaced (new inode) under the
-    same overlap, or rewritten to another size, keeps the high alarm but fails no run; a removal (no time to place it) still fails the run."""
+    same overlap, or rewritten to another size, keeps the high alarm but fails no run; a removal by the run's own command still fails it."""
     from ttp import credwatch
     from ttp.daemon import Daemon
     p = make(env)
@@ -350,8 +359,9 @@ def test_credwatch_a_change_seen_by_overlapping_runs_is_told_once_outside_these_
     _finish_runs(p, d)
     rows = p.db.q("SELECT severity FROM events WHERE fingerprint LIKE 'credwatch:%' ORDER BY id")
     assert [r["severity"] for r in rows] == ["normal", "high", "high"] and p.db.task(resize)["status"] == "done", rows
-    # Removed: no ctime places it, so the run that saw it fails as before.
-    monkeypatch.setenv("TTP_FAKE_SHELL", f"rm {shlex.quote(str(tok))}")
+    # Removed by the run's own command (its transcript names the path): the run fails as before.
+    rm = json.dumps({"type": "assistant", "cmd": f"rm {tok}"})
+    monkeypatch.setenv("TTP_FAKE_SHELL", f"echo {shlex.quote(rm)}; rm {shlex.quote(str(tok))}")
     gone = p.db.add_task("remove", "s", kind="work", tier="light", origin="user")
     d.dispatch()
     _finish_runs(p, d)
@@ -360,8 +370,9 @@ def test_credwatch_a_change_seen_by_overlapping_runs_is_told_once_outside_these_
 
 
 def test_credwatch_a_change_only_this_run_was_open_for_still_fails_it_and_a_planted_verdict_excuses_nothing(env, monkeypatch):
-    """The run alone was open when the store changed: it fails, high, even when other runs ended before the
-    change or started after it; a verdict file the agent wrote into its own run dir is overwritten."""
+    """The run alone was open when the store changed and its own command names it: it fails, high, even when
+    other runs ended before the change or started after it; a verdict file the agent wrote into its own run
+    dir is overwritten."""
     from ttp import credwatch
     from ttp.daemon import Daemon
     p = make(env)
@@ -375,7 +386,8 @@ def test_credwatch_a_change_only_this_run_was_open_for_still_fails_it_and_a_plan
     _overlap(other, now - 7200, now - 3600)   # ended before
     _overlap(other, now + 3600, now + 7200)   # starts after
     plant = json.dumps({str(key): ["shared", 0]})
-    monkeypatch.setenv("TTP_FAKE_SHELL", f"sleep 0.05; printf 'k2\\n' > {shlex.quote(str(key))}.n && "
+    mine = json.dumps({"type": "assistant", "cmd": f"mv /tmp/k {key}"})   # the run's own command names it
+    monkeypatch.setenv("TTP_FAKE_SHELL", f"echo {shlex.quote(mine)}; sleep 0.05; printf 'k2\\n' > {shlex.quote(str(key))}.n && "
                                          f"mv {shlex.quote(str(key))}.n {shlex.quote(str(key))} && "
                                          f"printf '%s' {shlex.quote(plant)} > \"$TTP_RUN_DIR/{credwatch.VERDICTS}\"")
     tid = p.db.add_task("rotate a key alone", "s", kind="work", tier="light", origin="user")
@@ -391,6 +403,45 @@ def test_credwatch_a_change_only_this_run_was_open_for_still_fails_it_and_a_plan
     _overlap(other, now - 60)
     other.db.x("UPDATE runs SET ended=NULL WHERE started=?", (now - 60,))
     assert credwatch.runs_at(now, [other.state / "project.db"]) == 1
+
+
+def test_credwatch_a_change_no_run_command_ties_is_told_and_the_run_goes_on(env, monkeypatch):
+    """Another process on the host (the user's own ssh setup) changes files under a temp HOME's .ssh while a
+    run is open alone, and the run's transcript never names them: the run passes. ssh's client config files
+    and their temp and backup copies (config, site_config, config.tmp.*, config.bak-*, site_config.bak-*) are
+    not watched at all (owner's agent, msg #131): removing them is not even told. A private key replaced the
+    same way stays watched: told high, still failing no run."""
+    from ttp import credwatch
+    from ttp.daemon import Daemon
+    p = make(env)
+    ssh = pathlib.Path(os.environ["HOME"]) / ".ssh"
+    ssh.mkdir(parents=True, exist_ok=True)
+    tmp, bak, key = ssh / "config.tmp.l1Seys", ssh / "config.bak-before-x", ssh / "id_example"
+    side = [ssh / "config", ssh / "site_config", ssh / "site_config.bak-1", ssh / "config~"]
+    for f in (tmp, bak, key, *side):
+        f.write_text("x\n")
+    watched = set(credwatch.guarded_paths({"HOME": str(ssh.parent)}, {}))
+    assert str(key) in watched and not watched & {str(f) for f in (tmp, bak, *side)}, sorted(watched)
+    quoted = " ".join(shlex.quote(str(f)) for f in (tmp, bak, *side))
+    monkeypatch.setenv("TTP_FAKE_SHELL", f"sleep 0.05; rm {quoted}")   # not echoed: no transcript line names them
+    tid = p.db.add_task("work while the user edits ssh config", "s", kind="work", tier="light", origin="user")
+    d = Daemon(p.base)
+    d.dispatch()
+    _finish_runs(p, d)
+    assert p.db.task(tid)["status"] == "done", p.db.task(tid)["result"]
+    rows = p.db.q("SELECT severity, text FROM events WHERE fingerprint LIKE 'credwatch:%' ORDER BY id")
+    assert rows == [], rows
+    monkeypatch.setenv("TTP_FAKE_SHELL", f"sleep 0.05; printf 'k2\\n' > {shlex.quote(str(key))}.n && "
+                                         f"mv {shlex.quote(str(key))}.n {shlex.quote(str(key))}")
+    swap = p.db.add_task("work while a key is replaced", "s", kind="work", tier="light", origin="user")
+    d.dispatch()
+    _finish_runs(p, d)
+    assert p.db.task(swap)["status"] == "done", p.db.task(swap)["result"]
+    rows = p.db.q("SELECT severity, text FROM events WHERE fingerprint LIKE 'credwatch:%' ORDER BY id")
+    assert [r["severity"] for r in rows] == ["high"] and "Not tied to this run's commands" in rows[0]["text"], rows
+    assert all(credwatch._ssh_config_side(str(f)) for f in (tmp, bak, *side))
+    assert not credwatch._ssh_config_side(str(key)) and credwatch.ssh_private("id_example")
+    assert not any(credwatch.ssh_private(f.name) for f in (tmp, bak, *side))
 
 
 def test_credwatch_a_shared_change_still_fails_the_run_whose_own_transcript_writes_that_store(env, monkeypatch):

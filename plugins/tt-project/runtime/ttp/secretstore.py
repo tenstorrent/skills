@@ -15,7 +15,9 @@ The choice is per machine, in secret-store.json in the ttp home (it holds no sec
 and "shared": true on a shared or build host: there no key is ever written in plaintext, so the file
 backend refuses to save and `ttp secret push` to it is refused. A central mechanism plugs in as a
 `command` (any program that prints the JSON) or as one more entry in BACKENDS. Values read from a
-non-file backend live only in this process's memory, refreshed every CACHE_S seconds.
+non-file backend live only in this process's memory, refreshed every CACHE_S seconds. A failed read
+is remembered (its error text, never a value) for FAIL_S seconds, so a burst of calls (masking each
+log line, a hook per tool call) does not run the fetch again each time.
 """
 from __future__ import annotations
 
@@ -29,10 +31,11 @@ from pathlib import Path
 from . import project
 
 CACHE_S = 60
+FAIL_S = 15   # a failed fetch is not retried sooner: the same error is raised again
 FETCH_TIMEOUT_S = 30
 KEYCHAIN_SERVICE = "tt-project-secrets"
 ENV_VAR = "TTP_SECRETS_JSON"
-_mem: dict = {"key": None, "at": 0.0, "data": None}
+_mem: dict = {"key": None, "at": 0.0, "data": None, "fail": ""}
 _env: dict = {}
 
 
@@ -160,10 +163,18 @@ def load() -> dict:
     if c["backend"] == "file":
         return BACKENDS["file"][0](c)
     key = json.dumps([str(config_path()), c], sort_keys=True)
-    if _mem["key"] == key and time.time() - _mem["at"] < CACHE_S:
-        return dict(_mem["data"])
-    data = BACKENDS[c["backend"]][0](c)
-    _mem.update(key=key, at=time.time(), data=dict(data))
+    if _mem["key"] == key:
+        age = time.time() - _mem["at"]
+        if _mem["data"] is not None and age < CACHE_S:
+            return dict(_mem["data"])
+        if _mem["data"] is None and _mem.get("fail") and age < FAIL_S:
+            raise project.SecretsUnreadable(_mem["fail"])   # the same text: one cause, one event
+    try:
+        data = BACKENDS[c["backend"]][0](c)
+    except project.SecretsUnreadable as e:   # its text names the command and exit code only, never output
+        _mem.update(key=key, at=time.time(), data=None, fail=str(e))
+        raise
+    _mem.update(key=key, at=time.time(), data=dict(data), fail="")
     return data
 
 

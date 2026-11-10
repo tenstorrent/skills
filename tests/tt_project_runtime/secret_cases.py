@@ -1670,6 +1670,67 @@ def test_a_failing_fetch_command_names_no_output_and_status_still_runs(env, monk
         project.load_secrets()
 
 
+def test_a_failed_fetch_is_not_retried_for_fail_s_and_keeps_no_value(env, monkeypatch):
+    """A burst of reads (masking each line, a hook per tool call) runs a failing fetch once per FAIL_S, not
+    per call; the remembered failure is its error text only; once due, the next read fetches again."""
+    project, secretstore = _runtime_store_home(env, monkeypatch)
+    calls = env["tmp"] / "calls"
+    fetch = _fetch_script(env, f'echo x >> "{calls}"\necho "{_STORE_KEY}" >&2\nexit 7\n')
+    secretstore.set_config("command", [str(fetch)])
+    for _ in range(5):
+        with pytest.raises(project.SecretsUnreadable) as e:
+            project.load_secrets()
+        assert "exited 7" in str(e.value) and _STORE_KEY not in str(e.value)
+    assert calls.read_text().count("x") == 1, "a failed fetch ran again within FAIL_S"
+    assert _STORE_KEY not in json.dumps(secretstore._mem) and not project.secrets_path().exists()
+    _fetch_script(env, f'echo x >> "{calls}"\necho \'{{"jev": {{"key": "{_STORE_KEY}"}}}}\'\n')
+    secretstore._mem["at"] -= secretstore.FAIL_S + 1   # the failure is due for a retry
+    assert project.load_secrets()["jev"]["key"] == _STORE_KEY
+    assert calls.read_text().count("x") == 2 and secretstore._mem["fail"] == ""
+    assert not project.secrets_path().exists(), "a fetched store is never written in plaintext"
+
+
+def test_a_run_the_daemon_cannot_mask_raises_one_secrets_unmasked_event_per_cause(env, monkeypatch, tmp_path):
+    """Deliverable 7: a run the runner flagged unmasked, with the store still unreadable in the daemon, is
+    logged and raised as one high secrets_unmasked event naming the cause (never a value); a second run
+    failing for the same cause adds none; a run the daemon can mask raises none."""
+    from ttp.daemon import Daemon
+    p = make(env)
+    project, secretstore = _runtime_store_home(env, monkeypatch)
+    d = Daemon(p.base)   # started while the store read (empty); it fails from here on
+    secretstore.set_config("command", [str(_fetch_script(env, f'echo "{_STORE_KEY}" >&2\nexit 7\n'))])
+    redact = _fresh_masking(monkeypatch)
+
+    def run(n, unmasked):
+        run_dir = tmp_path / f"run{n}"
+        run_dir.mkdir()
+        (run_dir / "output.jsonl").write_text(json.dumps({"type": "result", "result": "done", "usage": {},
+                                                          "subtype": "success", "total_cost_usd": 0}) + "\n")
+        p.db.x("INSERT INTO runs(role,provider,model,started,status,dir,boot_id) VALUES(?,?,?,?,?,?,?)",
+               ("worker", "fake", "", time.time(), "running", str(run_dir), "x"))
+        info = {"rc": 0, "ended": time.time(), **({"unmasked": unmasked} if unmasked else {})}
+        (run_dir / "exit.json").write_text(json.dumps(info))
+        d.reap_runs()
+
+    def events():
+        return p.db.q("SELECT severity, text FROM events WHERE kind='secrets_unmasked'")
+
+    run(1, "secret fetch command fetch-keys exited 7")
+    got = events()
+    assert len(got) == 1 and got[0]["severity"] == "high", got
+    assert "could not mask stored secrets" in got[0]["text"] and "exited 7" in got[0]["text"]
+    assert _STORE_KEY not in got[0]["text"]
+    secretstore._mem["at"] -= secretstore.FAIL_S + 1
+    redact._cache["sig"] = None
+    run(2, "secret fetch command fetch-keys exited 7")
+    assert len(events()) == 1, "one event per cause, not per run"
+    _fetch_script(env, f'echo \'{{"jev": {{"key": "{_STORE_KEY}"}}}}\'\n')
+    secretstore._mem.update(key=None, data=None)
+    redact._cache["sig"] = None
+    run(3, "secret fetch command fetch-keys exited 7")
+    assert len(events()) == 1, "a run the daemon could mask raises no event"
+
+
 def test_an_env_store_is_read_once_and_removed_from_the_environment(env, monkeypatch):
     project, secretstore = _runtime_store_home(env, monkeypatch)
     secretstore.set_config("env")

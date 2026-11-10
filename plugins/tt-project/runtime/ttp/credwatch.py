@@ -19,7 +19,8 @@ Two kinds of file (files()):
 - stores: gh's hosts file, git's and netrc's credential files, the ssh private keys, and every file
   under the write guard's protected paths (guarded_paths: pathguard.paths(), the folders walked). Nothing
   a run does rewrites them: created, removed or any change of size, mtime, ctime or inode counts. Files
-  their own tools rewrite in normal use are left out (CHURN: ssh's known_hosts, gh's state file, caches).
+  their own tools rewrite in normal use are left out (CHURN: ssh's host key lists, any name holding
+  known_hosts, gh's state file, caches).
 - logins: the providers' own login files (Provider.credential_files). Their CLIs rewrite them on every
   token refresh, so only a removal, or a rewrite to under half the size it had, counts.
 
@@ -42,15 +43,27 @@ from pathlib import Path
 SSH_PUBLIC = {"config", "known_hosts", "known_hosts.old", "authorized_keys", "authorized_keys2", "rc", "environment"}
 SHRINK = 0.5   # a login file rewritten below this share of its size counts as damaged
 CHURN_NAMES = ("known_hosts", "state.yml")   # file names (prefixes) their tools rewrite in normal use
+HOST_LIST = "known_hosts"   # in a file name: ssh's host key lists (known_hosts_<site>, <site>_known_hosts)
+                            # hold public host keys that ssh and other sessions add to
 CHURN_DIRS = {"cache", "http-cache"}          # folders of cached responses (aws sso and cli, kube)
 MAX_FILES = 2000                             # files walked per protected folder
 SNAP_SLACK_S = 5   # a run counts as having seen a change only from this long after its start (its first snapshot)
 VERDICTS = "credwatch.json"   # in the run dir: the daemon's verdict per change (classify), read at the hand-off
 
 
+def ssh_config(name: str) -> bool:
+    """A file name in ~/.ssh of ssh's client config (config, <site>_config) or a backup or temp copy of
+    one (config.bak-*, config.tmp.*, config~, <site>_config.bak-*): settings, not a credential."""
+    base = name.split(".", 1)[0].rstrip("~")
+    if name.endswith((".key", ".pem")):   # a key file, whatever its stem
+        return False
+    return base == "config" or base.endswith("_config") or name.startswith(("config-", "config~"))
+
+
 def ssh_private(name: str) -> bool:
     """A file name in ~/.ssh that may hold a private key."""
-    return not (name.endswith(".pub") or name in SSH_PUBLIC or name.startswith(("known_hosts", "cm-")) or "%" in name)
+    return not (name.endswith(".pub") or name in SSH_PUBLIC or HOST_LIST in name or name.startswith("cm-") or "%" in name
+                or ssh_config(name))
 
 
 def store_paths(home: str | Path | None = None, env=None) -> list[str]:
@@ -98,7 +111,7 @@ def _walk(top: str) -> list[str]:
     for root, dirs, names in os.walk(top):
         dirs[:] = sorted(d for d in dirs if d not in CHURN_DIRS)
         for name in sorted(names):
-            if name.startswith(CHURN_NAMES):
+            if name.startswith(CHURN_NAMES) or HOST_LIST in name or os.path.basename(root) == ".ssh" and ssh_config(name):
                 continue
             path = os.path.join(root, name)
             try:
@@ -283,34 +296,43 @@ def runs_at(t: float, dbs: list, own: tuple[str, int] | None = None) -> int:
 
 def classify(changed: list, marks: dict, start: float | None, end: float, dbs: list,
              own: tuple[str, int] | None = None, run_dir: str | Path | None = None, home: str = "") -> dict:
-    """{path: [verdict, change time ns]} for the changes of `changed` that do not fail the run; the rest
-    (removed, shrunk, any change without the runner's marks) fail it as before. `marks` is the runner's
-    {path: [before, after]} (exit.json cred_marks). Verdicts:
+    """{path: [verdict, change time ns]} for the changes of `changed` that do not fail the run. Only a change
+    tied to the run's own commands fails it: its transcript (output.jsonl in `run_dir`) names the path or runs
+    a writer for it (transcript_hit). `marks` is the runner's {path: [before, after]} (exit.json cred_marks).
+    Verdicts of the rest, each told once as an observation:
     - metadata: only ctime moved (changes()): nothing was written, told at normal severity.
     - shared: the change's time (the file's new ctime) lies inside this run's window and also inside
       the window of another run open then, of any project on the host (runs_at): the runs that saw it
-      cannot tell which, if any, made it. Told once as changed outside these runs: at normal severity
-      when rewritten in place at the same size, else high (shared_alarm: a store created, replaced by a
-      new inode, or rewritten to another size, as a lost or swapped key or login would be).
-    A change only this run was open for keeps failing it, and so does a shared one when this run's own
-    transcript (output.jsonl in `run_dir`) names the path or runs a writer for it (transcript_hit)."""
+      cannot tell which, if any, made it. Normal severity when rewritten in place at the same size, else
+      high (shared_alarm: a store created, replaced by a new inode, or rewritten to another size).
+    - outside: no other run saw it and this run's commands do not show it: another process on the host
+      (the user's own setup, another session) did it. Normal for a rewrite in place at the same size or
+      for ssh's client config and the temp and backup files beside it (config.tmp.*, config.bak*,
+      config~), else high (outside_alarm: a store created, replaced, resized, shrunk or removed)."""
     out, home = {}, home or os.environ.get("HOME") or os.path.expanduser("~")
     for path, how in changed:
         pair = marks.get(path) if isinstance(marks, dict) else None
         if how == "metadata":
             out[path] = ["metadata", (pair[1][3] if pair and pair[1] and len(pair[1]) > 3 else int(end * 1e9))]
             continue
-        if how not in ("changed", "created") or not pair or not pair[1] or len(pair[1]) < 4:
-            continue
-        before, after = pair
-        t = after[3] / 1e9
-        if not (start is not None and start <= t <= end) or runs_at(t, dbs, own) < 1:
-            continue
         if transcript_hit(run_dir, path, home):   # this run wrote it, whoever else saw it
             continue
-        same = before and before[0] == after[0] and before[2] == after[2]
-        out[path] = ["shared" if same else "shared_alarm", after[3]]
+        before, after = pair if isinstance(pair, list) and len(pair) == 2 else (None, None)
+        placed = how in ("changed", "created") and bool(after) and len(after) >= 4
+        t = after[3] / 1e9 if placed else end
+        same = bool(placed and before and before[0] == after[0] and before[2] == after[2])
+        if placed and start is not None and start <= t <= end and runs_at(t, dbs, own) >= 1:
+            out[path] = ["shared" if same else "shared_alarm", after[3]]
+        else:
+            out[path] = ["outside" if same or _ssh_config_side(path) else "outside_alarm", int(t * 1e9)]
     return out
+
+
+def _ssh_config_side(path: str) -> bool:
+    """ssh's client config or a temp or backup file its editors leave beside it (config.tmp.*,
+    config.bak*, config~, config-*): no key is in them."""
+    p = Path(path)
+    return p.parent.name == ".ssh" and ssh_config(p.name)
 
 
 def held(run_dir: str | Path) -> dict:
@@ -386,6 +408,13 @@ def _observe_seen(db, path: str, how: str, who: str, seen: list, now: float) -> 
     if kind == "metadata":
         sev, text = "normal", (f"Credential file attributes changed during {who}: {path} (only its ctime moved: "
                                f"mode, owner or links; size, mtime and inode the same). No run failed for it.")
+    elif kind in ("outside", "outside_alarm"):
+        sev = "high" if kind == "outside_alarm" else "normal"
+        text = (f"Credential file {how} during {who}: {path}. Not tied to this run's commands (its transcript "
+                f"neither names the file nor runs a writer for it) and no other run was open: another process "
+                f"on the host (the user's own setup, another session) did it, so no run failed for it. "
+                + ("A store is new, replaced, resized or removed: if a login no longer works, ask the user to "
+                   "log in again (for gh: `gh auth login`). " if sev == "high" else "") + "Nothing was restored.")
     else:
         sev = "high" if kind == "shared_alarm" else "normal"
         text = (f"Credential file {how} outside these runs: {path}, seen by {who} and other runs open at the "

@@ -687,7 +687,7 @@ def _runtime_version(runtime: Path) -> str:
 
 
 def bootstrap(root: Path, name: str, brief: str, provider: str, home_tz: str | None = None,
-              home_from: str = "") -> Project:
+              home_from: str = "", relayer: bool = False) -> Project:
     p = Project(root)
     if p.exists():
         if p.name != name:
@@ -740,6 +740,11 @@ def bootstrap(root: Path, name: str, brief: str, provider: str, home_tz: str | N
     sec = load_secrets()
     if (sec.get("slack") or {}).get("bot_token"):
         cfg["notify"] = {"slack": True}
+    # A project a relayer creates takes its agent's orders as the owner's; DEFAULT_CONFIG keeps it off
+    # for the rest. A new project has no value set yet to overwrite.
+    from . import relay
+    if relayer:
+        cfg["coordinator"] = {**cfg.get("coordinator", {}), relay.AGENT_KEY.split(".", 1)[1]: True}
     write_json(p.config_path, cfg)
     _git(p.harness, "add", "-A")
     _git(p.harness, "-c", "user.name=tt-project", "-c", "user.email=tt-project@localhost", "commit", "-q",
@@ -749,7 +754,11 @@ def bootstrap(root: Path, name: str, brief: str, provider: str, home_tz: str | N
     # the harness's defaults, never as unknown.
     from . import configwho
     for key in cfg:
-        configwho.record(db, key, configwho.by("default", via="project creation"), after=cfg)
+        if not (relayer and key == "coordinator"):
+            configwho.record(db, key, configwho.by("default", via="project creation"), after=cfg)
+    if relayer:
+        configwho.record(db, relay.AGENT_KEY, configwho.by("user", via="ttp new --relayer: the owner's agent created it"),
+                         after=cfg)
     for s in json.loads((template / "recurring.json").read_text()):
         sched.upsert(db, s["name"], s["kind"], s["every"], s.get("at"), s.get("enabled", True),
                      s.get("budget_usd_day"), s.get("description", ""), s.get("payload", {}), cfg[timefmt.KEY])
@@ -796,7 +805,8 @@ def cmd_new(a) -> None:
     if a.host and not machines.names_here(a.host):   # an alias for this machine creates it here
         return new_remote(a, brief)
     root = Path(a.dir).expanduser().resolve() if a.dir else _default_root()
-    p = bootstrap(root, a.name, brief, a.provider or detect_provider(), a.home_tz, a.home_from or "")
+    p = bootstrap(root, a.name, brief, a.provider or detect_provider(), a.home_tz, a.home_from or "",
+                  relayer=bool(getattr(a, "relayer", False)))
     register(a.name, {"host": hostname(), "dir": str(p.root)})
     from . import coordinator as coord
     if a.coordinator_effort != coord.DEFAULT_EFFORT:   # before the daemon starts, so its first turn has it
@@ -921,6 +931,8 @@ def new_remote(a, brief: str) -> None:
     from . import coordinator as coord
     if a.coordinator_effort != coord.DEFAULT_EFFORT:
         args += ["--coordinator-effort", a.coordinator_effort]
+    if getattr(a, "relayer", False):
+        args.append("--relayer")
     remote = remote_words(args) + " --describe-file -"
     from . import weblink
     r = subprocess.run(["ssh", "-o", "BatchMode=yes", host, remote], input=brief, text=True, stdout=subprocess.PIPE)
@@ -12976,6 +12988,9 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--copy-secrets", action="store_true",
                    help="with --host: copy your saved keys there in plaintext (only a machine of your own; "
                         "a shared or build box fetches them at run time instead: `ttp secret store`)")
+    s.add_argument("--relayer", action="store_true",
+                   help="an agent relaying for the user creates it: the project takes that agent's orders as the "
+                        "owner's (coordinator.agent_orders_as_user true; ttp config changes it)")
     s.add_argument("--home-tz", help=argparse.SUPPRESS)     # with --host there: the workstation's zone
     s.add_argument("--home-from", help=argparse.SUPPRESS)   # and its name
     s.set_defaults(fn=cmd_new)

@@ -316,17 +316,15 @@ def tool_hit(line: str, ids: set[str], words: set[str], exact: set[str] = frozen
 
 def still_stated(charter: str, old: str) -> str:
     """The binding charter section that still states every item of retired advisory text `old` (one
-    Restrictions item or a replaced section's items): "Brief" when one paragraph or bullet of a `## Brief`
-    section, else "Restrictions" when one sourced Restrictions item (restriction_source.sourced), holds
-    all of the item's identifiers (_TOOL_TERM_RE) and at least two of its rule words, and at least two
-    thirds of them. "" when an item is stated nowhere, or `old` names nothing to compare."""
+    Restrictions item or a replaced section's items): "Brief" when one paragraph or bullet of the Brief
+    (prompts.brief_text: its own headed sections too), else "Restrictions" when one sourced Restrictions
+    item (restriction_source.sourced), holds all of the item's identifiers (_TOOL_TERM_RE) and at least
+    two of its rule words, and at least two thirds of them. "" when an item is stated nowhere, or `old` names nothing to compare."""
     from .coordinator import _rule_words
-    from .prompts import charter_restrictions, charter_sections
+    from .prompts import brief_text, charter_restrictions
     from .restriction_source import sourced, split_items
-    units: list[tuple[str, str]] = []
-    for head, body in charter_sections(charter):
-        if " ".join(head[3:].split()).lower().startswith("brief"):
-            units += [("Brief", " ".join(" ".join(it).split())) for it in split_items("\n".join(body))]
+    units = [("Brief", " ".join(" ".join(it).split())) for it in split_items(brief_text(charter))
+             if not it[0].startswith("## ")]
     units += [("Restrictions", t) for t in (" ".join(" ".join(it).split())
                                             for it in split_items(charter_restrictions(charter))) if sourced(t)]
     found = []

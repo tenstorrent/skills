@@ -292,3 +292,30 @@ def test_the_web_app_serves_without_saving_its_port_over_an_owners_falsy_web_por
         httpd.server_close()
     assert p.raw_config()["web"]["port"] == 0
     assert configwho.role(configwho.lookup(p.db, "web.port", p.raw_config())) == "user"
+
+
+def test_a_relayer_created_project_takes_agent_orders_as_the_owners_with_its_setter_recorded(env, monkeypatch, capsys):
+    """`ttp new --relayer` (the relayer skill creates projects with it) turns coordinator.agent_orders_as_user
+    on, recorded as the owner's (their agent created it), so an upgrade's rewrite leaves it theirs; a project made
+    without it keeps the default (off). A value the user set later stays theirs."""
+    from ttp import cli, configwho, relay
+    _config_clear_run_env(monkeypatch)
+    plain = make(env)
+    assert not plain.config()["coordinator"].get("agent_orders_as_user")
+    assert "coordinator" not in plain.raw_config()
+    root = env["tmp"] / "relayed"
+    shutil.copytree(env["repo"], root, symlinks=True, ignore=shutil.ignore_patterns("tt-project"))
+    q = cli.bootstrap(root, "relayed", "A relayed brief.", "fake", relayer=True)
+    assert q.raw_config()["coordinator"] == {"agent_orders_as_user": True}
+    assert q.config()["coordinator"]["agent_orders_as_user"] is True
+    rec = configwho.lookup(q.db, relay.AGENT_KEY, q.raw_config())
+    assert configwho.role(rec) == "user" and "--relayer" in rec.get("via", "")
+    q.set_config(relay.AGENT_KEY, True, by=configwho.by("upgrade", via="upgrade"))   # an upgrade's rewrite
+    assert configwho.role(configwho.lookup(q.db, relay.AGENT_KEY, q.raw_config())) == "user", "it stays the owner's"
+    q.set_config(relay.AGENT_KEY, False, by=configwho.by("user", via="cli"))
+    assert q.config()["coordinator"]["agent_orders_as_user"] is False
+    assert cli.bootstrap(root, "relayed", "again", "fake", relayer=True).config()["coordinator"][
+        "agent_orders_as_user"] is False   # an existing project is never re-created over
+    with pytest.raises(SystemExit):
+        cli.main(["new", "--help"])
+    assert "--relayer" in capsys.readouterr().out

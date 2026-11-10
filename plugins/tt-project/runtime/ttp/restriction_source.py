@@ -82,20 +82,23 @@ def split_items(body: str) -> list[list[str]]:
     return out
 
 
-def partition(body: str) -> tuple[str, str]:
+def partition(body: str, brief: set[str] | frozenset = frozenset()) -> tuple[str, str]:
     """(the binding lines, the unsourced items) of a Restrictions body (prompts.charter_restrictions).
-    A sub-heading stays with the binding lines."""
+    A sub-heading stays with the binding lines; so does an item of `brief` (prompts.brief_restrictions:
+    a Restrictions item the user wrote inside the Brief, origin Brief)."""
     keep, drop = [], []
     for it in split_items(body):
         text = " ".join(it)
-        (keep if it[0].lstrip().startswith("#") or sourced(text) else drop).append("\n".join(it))
+        bound = it[0].lstrip().startswith("#") or sourced(text) or " ".join(text.split()) in brief
+        (keep if bound else drop).append("\n".join(it))
     return "\n".join(keep), "\n".join(drop)
 
 
 def unsourced_items(charter: str) -> list[str]:
     """The charter's unsourced Restrictions items, one line each."""
-    from .prompts import charter_restrictions
-    return [" ".join(" ".join(it).split()) for it in split_items(partition(charter_restrictions(charter))[1])]
+    from .prompts import brief_restrictions, charter_restrictions
+    return [" ".join(" ".join(it).split())
+            for it in split_items(partition(charter_restrictions(charter), brief_restrictions(charter))[1])]
 
 
 def _loose(text: str) -> str:
@@ -122,9 +125,8 @@ def check(db, charter: str, text: str, src, agent: bool = False, owners: list[st
             raise ValueError(f"charter_update rejected: origin check failed: `source.origin` must be brief, "
                              f"gate, record or relayer, got {origin!r}. {SOURCE_FORMS}")
         if origin == "brief":
-            from .prompts import charter_sections
-            brief = "\n".join(b for h, body in charter_sections(charter)
-                              if h[3:].strip().lower().startswith("brief") for b in body)
+            from .prompts import brief_text
+            brief = brief_text(charter)
             if len(quote) < 3 or _loose(quote) not in _loose(brief):
                 raise ValueError("charter_update rejected: quote check failed: `source.quote` is not in the Brief "
                                  "(the source itself was read); quote the Brief's own words exactly. " + SOURCE_FORMS)
