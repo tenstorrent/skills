@@ -11,7 +11,9 @@ task once more with that reason at the top of its next prompt, no attempt spent;
 blocks it for the coordinator.
 
 This is weaker than a hook's deny: the call is stopped once it has started, so a quick command may have
-run. Rewrites and hints the hook would add are not applied. Runs whose provider passes the harness hook
+run. A call whose result the runner reads in the same look as its start has finished, so stopping the run
+then protects nothing and loses its work: the runner records a warning instead (WARN_FILE), the run goes
+on, and the daemon turns the warnings into one event when the run ends. Rewrites and hints the hook would add are not applied. Runs whose provider passes the harness hook
 (Provider.harness_hook) or whose hook already ran when it started (hook.HOOKED_FILE) are left alone; the
 marker is read before the agent starts, since the agent could write it itself."""
 from __future__ import annotations
@@ -24,6 +26,7 @@ import time
 from pathlib import Path
 
 GUARD_FILE = "GUARD"     # in the run dir: why the runner stopped it ({"why", "tool", "at"})
+WARN_FILE = "GUARD_WARNINGS"   # in the run dir: refused calls that had already finished (JSON lines)
 KEY = "guard_stop"       # in the task's result: the refusal its next run's prompt starts with
 CHECK_TIMEOUT_S = 20     # as the hook's own timeout: a check that hangs lets the call through
 
@@ -52,6 +55,34 @@ def refusal(payload: dict, env: dict, cwd: str) -> str | None:
 def record(run_dir: Path, why: str, tool: str) -> None:
     from .project import durable_write
     durable_write(run_dir / GUARD_FILE, json.dumps({"why": why, "tool": tool, "at": time.time()}))
+
+
+def warn(run_dir: Path, why: str, tool: str, head: str = "") -> None:
+    """Record a call the hook refuses that had already finished when the runner read it."""
+    try:
+        with open(run_dir / WARN_FILE, "a") as f:
+            f.write(json.dumps({"why": why, "tool": tool, "head": head[:200], "at": time.time()}) + "\n")
+    except OSError:
+        pass
+
+
+def take_warnings(run_dir: Path) -> list[dict]:
+    """The warnings a run recorded (warn), oldest first, each taken once: the file is renamed aside."""
+    path = run_dir / WARN_FILE
+    try:
+        lines = path.read_text().splitlines()
+        path.replace(path.with_name(WARN_FILE + ".taken"))
+    except OSError:
+        return []
+    out = []
+    for line in lines:
+        try:
+            got = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(got, dict) and got.get("why"):
+            out.append(got)
+    return out
 
 
 def take(run_dir: Path) -> dict | None:

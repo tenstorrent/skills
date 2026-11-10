@@ -113,6 +113,35 @@ def test_a_hookless_codex_run_is_stopped_at_a_refused_command(tmp_path, monkeypa
         "web token", ""), "the guard names the reason, not the command"
 
 
+def test_a_codex_command_that_already_finished_is_warned_about_and_the_run_kept(tmp_path, monkeypatch):
+    """Stopping a run whose refused command has already run protects nothing: the runner records a warning
+    and the run goes on; a refused call seen only as started still stops it (above)."""
+    from ttp import streamguard
+    done = json.dumps({"type": "item.completed", "item": {"id": "item_1", "type": "command_execution",
+                                                          "command": f"bash -lc '{SG_DENIED}'", "exit_code": 0,
+                                                          "status": "completed"}})
+    ex, run_dir = _sg_run(tmp_path, monkeypatch, "codex", [_sg_codex_line(f"bash -lc '{SG_DENIED}'"), done])
+    assert ex["stopped"] is None and streamguard.take(run_dir) is None
+    warned = streamguard.take_warnings(run_dir)
+    assert len(warned) == 1 and warned[0]["tool"] == "Bash" and "web token" in warned[0]["why"]
+    assert streamguard.take_warnings(run_dir) == [], "taken once"
+
+
+def test_guard_warnings_become_one_low_event_and_the_task_is_not_requeued(env, tmp_path, monkeypatch):
+    from ttp import streamguard
+    from ttp.daemon import Daemon
+    p = make(env)
+    _rs_live(monkeypatch)
+    tid, rid, run_dir = _rs_running(p, tmp_path)
+    for _ in range(2):
+        streamguard.warn(run_dir, "tt-project: the web token is the user's credential.", "Bash", "cat x")
+    (run_dir / "exit.json").write_text(json.dumps({"rc": 0, "stopped": None, "ended": time.time()}))
+    Daemon(p.base).reap_runs()
+    ev = p.db.q("SELECT text,severity FROM events WHERE kind='guard_warning' AND task=?", (tid,))
+    assert len(ev) == 1 and ev[0]["severity"] == "low" and "2 call(s)" in ev[0]["text"]
+    assert not p.db.q("SELECT 1 FROM events WHERE kind='guard_stop' AND task=?", (tid,))
+
+
 def test_a_hook_marker_the_agent_writes_mid_run_does_not_turn_the_guard_off(tmp_path, monkeypatch):
     from ttp import streamguard
     run_dir = tmp_path / "run"

@@ -7058,6 +7058,13 @@ class Daemon:
         relay_worker_notifies(self.p, task, run_dir, handoff)
         _, past_cap = relay_worker_escalations(self.p, task, r.get("id"), run_dir)
         self._file_queued_notes(r.get("id"), task["id"], run_dir)
+        if warned := streamguard.take_warnings(run_dir):
+            # Calls the stream guard refuses that had already run when it read them: the run went on (streamguard).
+            text = (f"#{task['id']} {task['title']}: run {r['id']} ran {len(warned)} call(s) the harness refuses "
+                    f"before the stream guard saw them; the run was kept: {str(warned[0]['why'])[:400]}")
+            db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+                 (time.time(), f"task:{task['id']}", "guard_warning", "low", text[:1500], "handled", task["id"]))
+            log(self.p, text)
         if held:
             # Judged by the code it replaced, the hand-off could fail for the bug the run fixed: the
             # coordinator decides, no attempt spent. The hand-off stays in the run dir and the result.

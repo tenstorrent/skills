@@ -595,10 +595,16 @@ def supervise(run_dir: Path) -> int:
             # A run the harness hook does not reach: each tool call it starts is checked as the hook would.
             # Decided once, from the marker as it was before launch: the agent could write one itself.
             calls, guard["offset"] = prov.activity(out_path, guard["offset"])
+            # A call whose result is already in the stream has run: stopping the run then protects nothing.
+            done = {c["id"] for c in calls if c.get("kind") == "result" and c.get("id")}
             for c in (c for c in calls if c.get("kind") == "call"):
                 for payload in c.get("payloads") or []:
                     why = streamguard.refusal(payload, env, cwd)
-                    if why:
+                    if why and c.get("id") in done:
+                        streamguard.warn(run_dir, why, str(payload.get("tool_name") or ""), c.get("input_head") or "")
+                        print(f"runner: stream guard: a {payload.get('tool_name')} call it refuses had already "
+                              f"finished; the run goes on: {why}", flush=True)
+                    elif why:
                         guard["on"] = False
                         streamguard.record(run_dir, why, str(payload.get("tool_name") or ""))
                         print(f"runner: stream guard stopped the run at a {payload.get('tool_name')} call: {why}",
