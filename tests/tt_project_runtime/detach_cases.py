@@ -3202,6 +3202,36 @@ def test_last_progress_reads_a_live_jobs_newest_log_and_skips_ended_lost_and_rem
     assert abs(detach.last_progress(f"ttp detach --check {live.name}", live.parent) - (now - 120)) < 2
 
 
+def test_last_progress_of_a_remote_job_reads_its_mirrors_last_log_growth(env):
+    """#7433 follow-up: a `detach --check --host <alias> --mirror <dir>` wait had no progress, so a long
+    remote job raised wait_stale while its log still grew. Its progress is when its mirror last saw the
+    log size change (mirror_save's "moved"); an ended job, a probe with no mirror and a job never
+    mirrored have none."""
+    import json
+    from ttp import detach
+    p = make(env)
+    now = time.time()
+    m = p.root / "run-1"
+    m.mkdir()
+    job = "/tmp/ttp-detach/build"
+    detach.mirror_save(m, "build", "box-a", job, tail=b"x", size=10)
+    f = m / "build.remote.json"
+    old = json.loads(f.read_text())
+    old["moved"] = int(now) - 5000
+    f.write_text(json.dumps(old))
+    detach.mirror_save(m, "build", "box-a", job, size=10)   # same size: no progress
+    probe = f"ttp detach --check --host box-a --mirror {m} {job}"
+    assert abs(detach.last_progress(probe) - (now - 5000)) < 2
+    assert abs(detach.last_progress(f"ttp detach --check --host=box-a --mirror=run-1 {job} || exit 1",
+                                    p.root) - (now - 5000)) < 2
+    detach.mirror_save(m, "build", "box-a", job, size=20)   # its log grew
+    assert abs(detach.last_progress(probe) - now) < 5
+    assert detach.last_progress(f"ttp detach --check --host box-a {job}") is None, "no mirror folder"
+    assert detach.last_progress(f"ttp detach --check --host box-b --mirror {m} {job}") is None, "another host's job"
+    detach.mirror_save(m, "build", "box-a", job, end={"rc": 0})
+    assert detach.last_progress(probe) is None, "ended"
+
+
 @pytest.mark.parametrize("table", ["native", "ps"])
 def test_detach_stop_ends_the_jobs_helpers_in_other_groups_of_its_session_and_those_that_left_it(env, tmp_path,
                                                                                                  monkeypatch, table):

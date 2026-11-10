@@ -1979,6 +1979,39 @@ def test_wait_stale_on_own_live_checks_folds_into_one_backlog_line_once_per_wait
     assert len(rows) == 1 and rows[0]["text"].startswith("Checks backlog: 1 task(s)") and f"#{c} " in rows[0]["text"]
 
 
+def test_a_wait_on_running_checks_is_stale_only_once_their_log_stops_advancing(env):
+    """Review #7504 follow-up: a wait on `ttp checks --result <run dir>` (or its checks.rc) is judged by
+    the checks run's own log and heartbeat files while it is queued or running, never by the time since
+    the wait began: checks whose log advanced minutes ago raise no wait_stale; silent ones raise once."""
+    from ttp import checksgone
+    from ttp.daemon import Daemon
+    from ttp.runner import proc_start
+    p = make(env)
+    d, now = Daemon(p.base), time.time()
+    tids, dirs = {}, {}
+    for name, ago in (("moving", 300), ("silent", 8 * 3600)):
+        rd = dirs[name] = (p.runs / f"checks-{name}").resolve()
+        rd.mkdir(parents=True)
+        (rd / "checks.pid").write_text(json.dumps({"pid": os.getpid(), "started": proc_start(os.getpid())}))
+        (rd / "checks.log").write_text("120 passed\n")
+        for f in ("checks.pid", "checks.log"):
+            os.utime(rd / f, (now - 9 * 3600, now - 9 * 3600))
+        os.utime(rd / "checks.log", (now - ago, now - ago))
+        tids[name] = _due_waiting_task(p, f"test -e {rd}/checks.rc || exit 1", since_ago=7 * 24 * 3600)
+    assert abs(checksgone.last_progress(f"ttp checks --result {dirs['moving']}") - (now - 300)) < 2
+    (dirs["silent"] / "checks.rc").write_text("0\n")
+    assert checksgone.last_progress(f"ttp checks --result {dirs['silent']}") is None, "finished: no progress"
+    (dirs["silent"] / "checks.rc").unlink()
+    for tid in tids.values():
+        _settle_probe(d, tid)
+    for tid in tids.values():
+        p.db.update_task(tid, not_before=time.time() - 1)
+    d.probe_waiting()
+    raised = {n: bool(p.db.q("SELECT id FROM events WHERE task=? AND kind='wait_stale'", (tid,)))
+              for n, tid in tids.items()}
+    assert raised == {"moving": False, "silent": True}, raised
+
+
 def test_a_wait_on_a_live_detached_job_is_stale_only_once_its_log_stops_advancing(env):
     """wait_stale judges a wait on a detached job by the job's own progress, never by the time since the
     wait began: a gate waited on for days whose log advanced minutes ago raises nothing; one whose log

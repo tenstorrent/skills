@@ -1801,7 +1801,7 @@ def status_text(p: Project, verbose: bool = False) -> str:
     hot = [t for t in db.q("SELECT * FROM tasks WHERE status IN ('queued','review') ORDER BY priority, id")
            if urgent.is_urgent(t)]
     try:
-        est = eta._Est(db, now, core=eta.core_of(p))
+        est = eta._Est(db, now, core=eta.core_of(p), delivery=eta.delivery_of(p))
     except Exception:
         est = None
     for t in hot[:8]:   # the urgent lane: each waiting urgent task, with how long it has waited and its ETA

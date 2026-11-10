@@ -103,9 +103,9 @@ def last_progress(probe: str, cwd=None) -> float | None:
     """When a detached job this probe's local `detach --check` names last showed progress while it still
     runs or is queued: the newest mtime of its log, its .started and its .queued, else None (no such job,
     or all ended). A wait on a job is stale only once this is old, never by the time since the wait
-    began (daemon._hold_waiting). A job on another host (--host) reads None: the wait counts as before."""
+    began (daemon._hold_waiting). A job on another host (--host) reads its mirror instead (_remote_progress)."""
     if "--host" in (probe or ""):
-        return None
+        return _remote_progress(probe, cwd)
     best = None
     try:
         rcs = _checked(probe, cwd)
@@ -121,6 +121,52 @@ def last_progress(probe: str, cwd=None) -> float | None:
             except OSError:
                 continue
             best = t if best is None else max(best, t)
+    return best
+
+
+def _remote_progress(probe: str, cwd=None) -> float | None:
+    """last_progress for a `detach --check --host <alias> --mirror <dir> <path>...` probe: the newest time
+    a mirrored job not known to have ended last moved (its log grew, or it started: mirror_save's
+    "moved"; a mirror written before that key, its .remote.log's mtime). None without a mirror folder,
+    or when no named job has a live mirror: the wait counts as before."""
+    try:
+        words = shlex.split(probe or "")
+    except ValueError:
+        return None
+    host = mirror = None
+    paths: list[str] = []
+    for i, w in enumerate(words):
+        if w != "--check":
+            continue
+        rest = words[i + 1:]
+        while rest:
+            w = rest.pop(0)
+            key, eq, val = w.partition("=")
+            if key in ("--rows", "--after", "--host", "--mirror"):
+                if not eq:
+                    val = rest.pop(0) if rest else ""
+                host, mirror = (val, mirror) if key == "--host" else (host, val if key == "--mirror" else mirror)
+            elif w.startswith("-") or w in ("&&", "||", ";", "|"):
+                break
+            else:
+                paths.append(w)
+        break
+    if not host or not mirror:
+        return None
+    d = Path(cwd or ".") / mirror
+    best = None
+    for pre in paths:
+        name = mirror_name(pre)
+        m = mirror_read(d, name, host, pre)
+        if not m or m.get("end"):
+            continue
+        t = m.get("moved")
+        if not isinstance(t, (int, float)):
+            try:
+                t = (d / f"{name}.remote.log").stat().st_mtime
+            except OSError:
+                continue
+        best = t if best is None else max(best, float(t))
     return best
 
 
@@ -1391,12 +1437,15 @@ def mirror_save(d, name: str, host: str, pre: str, *, tail: bytes | None = None,
                 end: dict | None = None, probe: dict | None = None) -> None:
     """Record what a remote job's answer said in folder `d`: its log tail and size, and its end
     ({"rc": code} or {"gone": why}), which is kept once known; `probe`: the job sweep's last liveness
-    answer (onhost.refresh_remote)."""
+    answer (onhost.refresh_remote). "moved" is when it was first mirrored or its log size last changed."""
     d = Path(d)
-    m = mirror_read(d, name, host, pre) or {"host": host, "path": pre}
+    now = int(time.time())
+    m = mirror_read(d, name, host, pre) or {"host": host, "path": pre, "moved": now}
     if tail is not None:
         durable_write(d / f"{name}.remote.log", tail[-MIRROR_TAIL_BYTES:])
     if size is not None:
+        if str(size) != m.get("size"):   # its log grew: the job's progress (last_progress)
+            m["moved"] = now
         m["size"] = str(size)
     if end and not m.get("end"):
         m["end"] = end
@@ -1404,7 +1453,7 @@ def mirror_save(d, name: str, host: str, pre: str, *, tail: bytes | None = None,
             durable_write(d / f"{name}.remote.rc", f"{end['rc']}\n")
     if probe is not None:
         m["probe"] = probe
-    m["at"] = int(time.time())
+    m["at"] = now
     write_json(d / f"{name}.remote.json", m)
 
 

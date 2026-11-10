@@ -284,7 +284,7 @@ def state(p, task: dict, now: float | None = None, est=None, cfg: dict | None = 
                 "line": f"worker running, waiting for {', '.join(named)}"
                         + (f" since {timefmt.short(since, p, now)}" if since else "")}
     try:
-        e = (est.task(task["id"]) if est is not None else eta.estimate(p.db, task["id"], now, core=eta.core_of(cfg)))
+        e = (est.task(task["id"]) if est is not None else eta.estimate(p.db, task["id"], now, core=eta.core_of(cfg), delivery=eta.delivery_of(cfg)))
     except Exception:
         e = None
     return {"kind": "queued", "started": False, "line": queued_line(e, p, now)}
@@ -406,7 +406,7 @@ def guard(p, text: str, tasks: list[dict], now: float | None = None) -> tuple[st
     from . import eta
     try:
         cfg = p.config()
-        est = eta._Est(p.db, now, core=cfg.get("core_provider"))
+        est = eta._Est(p.db, now, core=cfg.get("core_provider"), delivery=eta.delivery_of(cfg))
     except Exception:
         return text, []
     waiting = []   # (task, honest status) of each covered task not started on its host

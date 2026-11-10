@@ -98,6 +98,9 @@ disk untouched, with no migration; nothing else is reclaimed by check recovery.
    `budget.max_waits` times, then asks the user. While its `retry_when` probe exits 1 ("not yet")
    or 255 (ssh could not reach the host) it sleeps on without a run; past `waiting.max_hold_s`
    after the hand-off it still sleeps, and the coordinator is asked once to fix the probe or cancel.
+   A wait on a live detached job or a queued or running `ttp checks` run counts that time from the
+   job's own last progress instead: its log, start and queue markers, a remote job's mirrored log
+   growth (`--mirror`), or the checks run's log, pid and slot-wait files.
    A probe that can never pass (command not found, a run dir or worktree that is gone, a devq job
    unknown to its runner) is raised once per wait when it is first seen.
    A spec update sleeps with it (a `task_update` by the coordinator or the user; the hand-off keeps

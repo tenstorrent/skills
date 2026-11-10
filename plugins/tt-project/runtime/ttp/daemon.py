@@ -13601,8 +13601,9 @@ class Daemon:
         NOT_YET_RCS: 1, 75 (a busy `ttp lock`) and 255 (ssh could not reach the host a remote marker
         lives on; only when the host named really does not answer, _own_255). A broken probe
         (any other exit, a timeout, a probe that cannot start) wakes it at its timer so a worker can
-        fix the probe. Past `waiting.max_hold_s` after the hand-off (for a wait on a live detached job, after
-        its log last advanced: detach.last_progress) a "not yet" keeps it asleep too (a model run cannot
+        fix the probe. Past `waiting.max_hold_s` after the hand-off (for a wait on a live detached job, local
+        or mirrored from another host, or on a queued or running `ttp checks` run, after its log last
+        advanced: detach.last_progress, checksgone.last_progress) a "not yet" keeps it asleep too (a model run cannot
         make the probe pass) and raises one `wait_stale` event for the coordinator.
         Tasks with the same probe share its runs."""
         db, now = self.p.db, time.time()
@@ -14963,8 +14964,9 @@ class Daemon:
             start, peer = self._peer_hold(task, prev, since, max_hold, now)
             if now >= start + max_hold:   # a user-marker gate is timed from when the marker appeared
                 start = max(start, userpause.gate_opened(prev.get("retry_when"), self.cfg, self.p.root, now) or 0)
-            if now >= start + max_hold:   # a wait on a live detached job is timed from its last progress
-                start = max(start, detach.last_progress(str(prev.get("retry_when") or ""), self.p.root) or 0)
+            if now >= start + max_hold:   # a wait on a live detached job or checks run: from its last progress
+                start = max(start, detach.last_progress(str(prev.get("retry_when") or ""), self.p.root) or 0,
+                            self._checks_progress(str(prev.get("retry_when") or "")) or 0)
             held = now >= start + max_hold
             gate = time_gate(str(prev.get("retry_when") or ""))
             # A pure time gate whose epoch is still ahead is not stuck: no turn could make it pass sooner.
@@ -15414,6 +15416,13 @@ class Daemon:
         except Exception as e:   # a bad run dir must never break a hand-off or a tick
             log(self.p, f"checks wait: could not read {probe[:200]!r}: {type(e).__name__}: {e}")
             return []
+
+    def _checks_progress(self, probe: str) -> float | None:
+        try:
+            return checksgone.last_progress(probe)
+        except Exception as e:   # a bad run dir counts the wait as before, never breaks a tick
+            log(self.p, f"checks wait: could not read progress of {probe[:200]!r}: {type(e).__name__}: {e}")
+            return None
 
     def _checks_gone(self, tid: int, probe: str, now: float) -> list[Path]:
         """A "not yet" probe on `ttp checks` runs that left the queue without a result (checksgone): once

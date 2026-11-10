@@ -1523,7 +1523,7 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
             held_on.setdefault(held, []).append(t)
     held_on = {k: ts for k, ts in held_on.items() if len(ts) > 1}
     grouped = {t["id"]: k for k, ts in held_on.items() for t in ts}
-    host_est = safe_eta(lambda: eta._Est(db, now, core=eta.core_of(p)), None) if any(onhost.resources(t) for t in rows) else None
+    host_est = safe_eta(lambda: eta._Est(db, now, core=eta.core_of(p), delivery=eta.delivery_of(p)), None) if any(onhost.resources(t) for t in rows) else None
     owns = obligations.open_keys_by_task(db)   # the open keys a task_update spec may name as its own
     for t in rows:
         if setting_held and settinghold.held_key(t):
