@@ -105,8 +105,55 @@ def test_an_automated_setter_may_turn_an_owners_switch_its_safe_way_only(env, mo
         with pytest.raises(configwho.Protected):
             p.set_config(key, on, by=worker)
         assert configwho.at(p.raw_config(), key) == off
-    p.set_config("sandbox.checks", True, by=configwho.by("coordinator"))
+    p.set_config("sandbox.checks", True, by=configwho.by("user"))
     assert p.unset_config("sandbox.checks", by=configwho.by("upgrade"))   # removing it is off too
+
+
+def test_a_coordinator_config_set_never_changes_a_value_the_user_set(env, monkeypatch):
+    """The user lowered a worker cap at a terminal; the coordinator's config_set raising or lowering it, or
+    removing it, is refused naming the user's value and when they set it, logged, and nothing is written;
+    the provenance record still names the user. A config_set in a turn carrying the user's own message is
+    theirs and passes; the coordinator writing the user's own value changes nothing; a coordinator's own
+    value it may still change; its `ttp config` from a run is refused the same way."""
+    from ttp import cli, configwho, coordinator as coord
+    p = make(env)
+    _config_clear_run_env(monkeypatch)
+    cli.main(["config", "demo", "budget.max_parallel_workers", "3"])
+    key = "budget.max_parallel_workers"
+    for value in (4, 2, ""):
+        probs = coord.apply(p, [{"type": "config_set", "key": key, "value": value}])
+        assert len(probs) == 1 and "a coordinator never changes a value the user set" in probs[0], probs
+        assert f"{key} is 3 (set by user via cli, " in probs[0] and "Only the user changes it" in probs[0], probs
+        assert p.raw_config()["budget"]["max_parallel_workers"] == 3
+        assert configwho.role(configwho.lookup(p.db, key, p.raw_config())) == "user"
+    refused = [r for r in configwho.history(p, key) if r.get("refused")]
+    assert [r.get("new") for r in refused] == [4, 2, None] and all(r["by"] == "coordinator" for r in refused)
+    # A whole-section write reaching the user's key under it is refused too.
+    with pytest.raises(configwho.Protected):
+        p.set_config("budget", {"max_parallel_workers": 5}, by=configwho.by("coordinator", via="config_set"))
+    # Writing the user's own value: nothing written, the user's record stays.
+    assert coord.apply(p, [{"type": "config_set", "key": key, "value": 3}]) == []
+    assert configwho.role(configwho.lookup(p.db, key, p.raw_config())) == "user"
+    # A coordinator run's `ttp config` is refused the same way.
+    monkeypatch.setattr(configwho, "from_env", lambda: configwho.by("coordinator", run="88", via="cli"))
+    with pytest.raises(SystemExit):
+        cli.main(["config", "demo", key, "6"])
+    assert p.raw_config()["budget"]["max_parallel_workers"] == 3
+    # The user's own message this turn carries their word: the change is theirs.
+    mid = p.db.x("INSERT INTO messages(ts, direction, kind, text) VALUES (?, 'in', 'user', 'raise the cap to 4')",
+                 (time.time(),))
+    assert coord.apply(p, [{"type": "config_set", "key": key, "value": 4}], user_turn=True, messages=[mid]) == []
+    rec = configwho.lookup(p.db, key, p.raw_config())
+    assert p.raw_config()["budget"]["max_parallel_workers"] == 4 and rec["by"] == "user" and rec["msgs"] == [mid]
+    # A harness-posted message is not the user's word.
+    sys_mid = p.db.x("INSERT INTO messages(ts, direction, kind, text, provenance) VALUES "
+                     "(?, 'in', 'user', 'raise it', 'system')", (time.time(),))
+    probs = coord.apply(p, [{"type": "config_set", "key": key, "value": 6}], user_turn=True, messages=[sys_mid])
+    assert probs and "a coordinator never changes a value the user set" in probs[0], probs
+    # A value the coordinator set it still changes.
+    assert coord.apply(p, [{"type": "config_set", "key": "heal.escalate", "value": "coordinator"}]) == []
+    assert coord.apply(p, [{"type": "config_set", "key": "heal.escalate", "value": "user"}]) == []
+    assert p.raw_config()["heal"]["escalate"] == "user"
 
 
 def test_config_value_with_spaces_and_equals_round_trips_through_set_log_and_undo(env, monkeypatch):

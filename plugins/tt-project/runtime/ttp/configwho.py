@@ -17,8 +17,8 @@ outside set_config (a hand edit) and reads as unknown, never as the old setter. 
 section moves the section's digest along only when the section still matched it before the write.
 
 Every change through set_config is also logged with its old and new values (LOG, below); an automated
-setter never changes a value the user or a coordinator set (guard), and a change that broke the
-checks raises a coordinator event (watch).
+setter never changes a value the user or a coordinator set, nor a coordinator one the user set (guard),
+and a change that broke the checks raises a coordinator event (watch).
 
 `ttp config get --why KEY` prints it and the key's log; selfblock.py checks a worker's 'this setting is the user's'
 against it.
@@ -182,7 +182,8 @@ def describe(rec: dict | None, where=None) -> str:
 # redacted, long ones cut) and the command that undoes it; a refused change gets one too, with "refused".
 # guard(): an automated setter (AUTOMATED: a worker, the harness, a default, an upgrade or a migration)
 # never changes a value whose setter is the user or a coordinator (OWNERS); the change is refused, logged
-# and raised to the coordinator, who (or the user) can still make it. watch(): a change followed within
+# and raised to the coordinator, who (or the user) can still make it; a coordinator never changes a value
+# whose setter is the user (refused and logged; only the user changes it). watch(): a change followed within
 # WATCH_S by FAIL_RUNS failed check runs of FAIL_TASKS tasks, on hosts that passed before and have not
 # passed since, raises one coordinator event naming the change and its undo.
 
@@ -314,8 +315,11 @@ def guard(p, key: str, setter: dict | None, before, after) -> bool:
     """Before set_config or unset_config writes `after` over `before`: True when there is nothing to
     write (an automated setter writing what an owner's value already is: the owner's record stays).
     An automated setter changing a value under `key` whose setter is the user or a coordinator raises
-    Protected (turning a switch its safe way, _safe_way, aside), logged and raised to the coordinator (once a day per key and role)."""
+    Protected (turning a switch its safe way, _safe_way, aside), logged and raised to the coordinator (once a day per
+    key and role). A coordinator changing a value the user set raises Protected too (_coordinator_guard)."""
     who = role(setter)
+    if who == "coordinator":
+        return _coordinator_guard(p, key, setter, before, after)
     if who not in AUTOMATED:
         return False
     hits = []
@@ -334,6 +338,26 @@ def guard(p, key: str, setter: dict | None, before, after) -> bool:
               f"Config change refused: {line(_row(p, key, setter, before, after, time.time()), p)}. {why}. "
               "Make it with config_set if it is right; else find and fix what tried.", REFUSAL_EVERY_S):
         log(p, _row(p, key, setter, before, after, time.time(), refused=why))
+    raise Protected(why)
+
+
+def _coordinator_guard(p, key: str, setter: dict | None, before, after) -> bool:
+    """guard() for a coordinator: it never changes a value under `key` whose recorded setter is the user,
+    raising or lowering it, safe way or not (only the user changes it: at a terminal, or in chat, where a
+    config_set in the turn carrying their own message is recorded as theirs). The refusal names the
+    user's value and when they set it, and is logged; the coordinator sees it as its rejected action.
+    True when the value is already the user's (nothing written, their record stays)."""
+    hits = []
+    for k in [key] + sorted(k for k in _all(p.db) if k.startswith(key + ".")):
+        if at(before, k) != at(after, k) and role(rec := lookup(p.db, k, before)) == "user":
+            old = at(before, k)
+            hits.append(f"{k} is {'unset' if old is _ABSENT else json.dumps(shown(k, old))} "
+                        f"(set by {describe(rec, p)})")
+    if not hits:
+        return at(before, key) == at(after, key) and role(lookup(p.db, key, before)) == "user"
+    why = (f"a coordinator never changes a value the user set: {'; '.join(hits)}. Only the user changes it "
+           f"(`ttp config` at a terminal, or their own message in chat asking for it)")
+    log(p, _row(p, key, setter, before, after, time.time(), refused=why))
     raise Protected(why)
 
 
