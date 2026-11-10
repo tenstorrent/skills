@@ -308,13 +308,39 @@ def test_a_pinned_env_fault_closes_once_its_env_is_made_or_its_lock_is_gone(tmp_
     lock = tmp_path / "py.lock"
     lock.write_text("# nothing pinned\n")
     f = runnerenv.fault(lock, "pip failed")
-    assert f["sig"] == runnerenv.FAULT + hashlib.sha256(lock.read_bytes()).hexdigest()[:12]
+    assert f["sig"].startswith(runnerenv.FAULT + hashlib.sha256(lock.read_bytes()).hexdigest()[:12] + "-py")
     assert "pinned Python env cannot be made" in envfault.line(f)
     assert envfault._still(f) is None, "the suite's ready stand-in env: made"
     monkeypatch.setenv("TTP_TEST_CHECKS_PYTHON_ENV", str(tmp_path / "none"))
     assert envfault._still(f) == f, "not made: still open, the probe never waits for a build"
     lock.unlink()
     assert envfault._still(f) is None
+
+
+def test_a_pinned_env_fault_names_its_python_and_never_holds_a_run_under_another(tmp_path, monkeypatch):
+    # A run under macOS's own python3 3.9 could not make the env of a lock needing 3.10; its fault
+    # was keyed on the lock alone, so it held every check run and the push queue, those under 3.12 too.
+    from ttp import envfault, runnerenv
+    lock = tmp_path / "py.lock"
+    lock.write_text("# nothing pinned\n")
+    monkeypatch.setenv("TTP_TEST_CHECKS_PYTHON_ENV", str(tmp_path / "none"))   # no env made: a fault stays
+    mine = runnerenv.fault(lock, "pip failed")
+    assert mine["python"] == runnerenv._base_python() and mine["python_version"] == sys.version.split()[0]
+    assert runnerenv.applies(mine) and envfault._still(mine) == mine, "this Python's own fault: open"
+    old = tmp_path / "py39" / "bin" / "python3"
+    old.parent.mkdir(parents=True)
+    old.write_text("")
+    monkeypatch.setattr(runnerenv, "_base_python", lambda: str(old))
+    monkeypatch.setattr(runnerenv.sys, "version", "3.9.6 (default)")
+    other = runnerenv.fault(lock, "pip failed")
+    assert other["python"] == str(old) and other["python_version"] == "3.9.6"
+    assert other["sig"] != mine["sig"] and other["sig"].split("-py")[0] == mine["sig"].split("-py")[0]
+    monkeypatch.undo()
+    monkeypatch.setenv("TTP_TEST_CHECKS_PYTHON_ENV", str(tmp_path / "none"))
+    assert not runnerenv.applies(other) and envfault._still(other) is None, "another Python's fault: not held here"
+    assert envfault._still(mine) == mine
+    legacy = {k: v for k, v in mine.items() if k not in ("python", "python_version")}
+    assert runnerenv.applies(legacy), "a fault recorded before faults named their Python: as before"
 
 
 def test_runnerenv_key_skips_a_lock_line_for_another_platform_so_its_env_is_reused(tmp_path, monkeypatch):

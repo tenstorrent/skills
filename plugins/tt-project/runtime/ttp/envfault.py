@@ -359,7 +359,8 @@ def _still(f: dict) -> dict | None:
     if f.get("kind") == "pyenv":   # its build, started in the background when none runs: never waited for
         from . import runnerenv
         lock = Path(str(f.get("lock") or ""))
-        return None if not lock.is_file() or runnerenv.ready(lock) else f
+        # one found under another Python than this process's env uses is not this host's fault here
+        return None if not lock.is_file() or not runnerenv.applies(f) or runnerenv.ready(lock) else f
     cwd = str(f.get("cwd") or "")
     if not cwd or not Path(cwd).is_dir():
         return None

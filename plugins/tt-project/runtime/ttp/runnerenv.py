@@ -97,14 +97,43 @@ FAULT = "env:python-env:"   # an envfault signature: the pinned env cannot be ma
 
 def fault(lock: Path | None, err: object, cmd: str = "") -> dict:
     """The envfault fault of the env of `lock` that could not be made: the host's, not the change's,
-    so checks wait for it (envfault.record) and nothing is counted against a change."""
+    so checks wait for it (envfault.record) and nothing is counted against a change. Its signature
+    names the lock and the Python the env is made from (_python_of): a run under another Python
+    (ttp under macOS's own 3.9 while the daemon runs 3.12) faults on its own, never holding the rest."""
     lock = Path(lock or LOCK)
     try:
-        sig = hashlib.sha256(lock.read_bytes()).hexdigest()[:12]
+        text = lock.read_bytes()
+        sig = hashlib.sha256(text).hexdigest()[:12]
     except OSError:
-        sig = lock.name
-    return {"kind": "pyenv", "sig": FAULT + sig, "runner": "pinned Python env", "lock": str(lock),
+        text, sig = b"", lock.name
+    base, version = _python_of(text, lock)
+    py = hashlib.sha256(f"{os.path.realpath(base)}\n{version}".encode()).hexdigest()[:6]
+    return {"kind": "pyenv", "sig": f"{FAULT}{sig}-py{py}", "runner": "pinned Python env", "lock": str(lock),
+            "python": base, "python_version": version.split()[0] if version else "",
             "why": str(err)[-600:], "cmd": cmd or "python env"}
+
+
+def _python_of(text: bytes, lock: Path | str) -> tuple[str, str]:
+    """(base interpreter, its sys.version) this process makes the env of lock `text` from
+    (interpreter), or its own base when none meets the lock."""
+    try:
+        return interpreter(text, lock)
+    except Unavailable:
+        return _base_python(), sys.version
+
+
+def applies(f: dict) -> bool:
+    """Whether pinned-env fault `f` is this process's: its env would be made from the Python `f`
+    names. A fault recorded under another Python (one the lock does not allow) holds nothing here."""
+    if not f.get("python"):
+        return True   # recorded before faults named their Python: as before
+    lock = Path(str(f.get("lock") or LOCK))
+    try:
+        base, version = _python_of(lock.read_bytes(), lock)
+    except OSError:
+        return True
+    return (os.path.realpath(base), version.split()[0]) == (
+        os.path.realpath(str(f["python"])), str(f.get("python_version") or version.split()[0]))
 
 
 def ready(lock: Path | None) -> bool:

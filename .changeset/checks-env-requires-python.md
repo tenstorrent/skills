@@ -9,3 +9,6 @@ Pythons with a `# requires-python: >=3.10` line (the default lock does): when th
 the env is made from the first Python on PATH or in the usual macOS and Linux install folders that meets it, and
 the env's key names that Python. When none does, nothing runs and the error names the Python needed and the one
 found. The line is left out of the key, so hosts whose envs already work keep them.
+The env's fault (env:python-env:<lock>-py<python>) now names the Python too: a run under a Python that could
+not make the env (the user's ~/.local/bin/ttp shim under the Command Line Tools' 3.9) no longer holds every
+other check run and the push queue, which make the env from another Python.
