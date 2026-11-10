@@ -324,3 +324,125 @@ def test_ttp_new_on_another_host_quotes_every_forwarded_word_so_empty_or_spaced_
     cli.new_remote(a, "brief")
     assert shlex.split(seen[-1][-1]) == ["$HOME/stage dir/bin/ttp", "new", "demo", "--dir", "$HOME/my project/root",
                                          "--provider", "", "--no-service", "--describe-file", "-"], seen[-1]
+
+
+# ssh connection reuse (template/bin/ssh, sshmux.py). A fake "real ssh" further down PATH records its
+# argv; the wrapper is a copy of the template's.
+_FAKE_SSH = """#!/bin/sh
+printf '%s\\n' "$*" >> "$FAKE_LOG"
+case " $* " in *" -O stop "*) exit 0 ;; esac
+case " $* " in *"ControlMaster=auto"*) [ -n "$FAKE_MUX_FAIL" ] && { echo "mux_client_hello_exchange: write packet: Broken pipe" >&2; exit 255; } ;; esac
+exit "${FAKE_RC:-0}"
+"""
+
+
+def _run_wrapper(tmp_path, args, **extra):
+    import shutil
+    import subprocess
+    wbin, rbin, home = tmp_path / "wbin", tmp_path / "rbin", tmp_path / "home"
+    for d in (wbin, rbin, home):
+        d.mkdir(exist_ok=True)
+    shutil.copy(RUNTIME.parent / "template" / "bin" / "ssh", wbin / "ssh")
+    (wbin / "ssh").chmod(0o755)
+    (rbin / "ssh").write_text(_FAKE_SSH)
+    (rbin / "ssh").chmod(0o755)
+    log = tmp_path / "log"
+    log.unlink(missing_ok=True)
+    e = {"PATH": f"{wbin}:{rbin}:/usr/bin:/bin", "HOME": str(home), "FAKE_LOG": str(log), "TMPDIR": str(tmp_path),
+         **{k: str(v) for k, v in extra.items()}}
+    r = subprocess.run([str(wbin / "ssh"), *args], env=e, capture_output=True, text=True, timeout=30)
+    return r, (log.read_text().splitlines() if log.exists() else [])
+
+
+def test_the_ssh_wrapper_adds_connection_reuse_in_a_private_folder(tmp_path):
+    import stat
+    r, log = _run_wrapper(tmp_path, ["-F", "cfg", "-J", "jump", "-o", "BatchMode=yes", "host-a", "true"])
+    assert r.returncode == 0 and len(log) == 1
+    cm = tmp_path / "home" / ".tt-project" / "cm"
+    for opt in ("ControlMaster=auto", f"ControlPath={cm}/%C", "ControlPersist=600",
+                "ServerAliveInterval=15", "ServerAliveCountMax=3"):
+        assert f"-o {opt}" in log[0]
+    assert log[0].endswith("-F cfg -J jump -o BatchMode=yes host-a true")   # -F, ProxyJump, BatchMode kept
+    assert stat.S_IMODE(cm.stat().st_mode) == 0o700
+    assert "/.ssh" not in log[0]
+    assert not list(tmp_path.glob("ttp-ssh.*"))                              # its stderr copy is removed
+
+
+@pytest.mark.parametrize("args,extra", [
+    (["host-a", "true"], {"TTP_SSH_REUSE": "0"}),
+    (["-S", "/x/sock", "host-a", "true"], {}),
+    (["-o", "ControlMaster=no", "host-a", "true"], {}),
+    (["-oControlPath=none", "host-a", "true"], {}),
+    (["-o", "controlpath=/x/%C", "host-a", "true"], {}),
+    (["-O", "check", "host-a"], {}),
+    (["-L", "8080:localhost:80", "host-a"], {}),
+    (["-N", "host-a"], {}),
+    (["-G", "host-a"], {}),
+    (["-p", "22", "-fN", "host-a"], {}),
+])
+def test_the_ssh_wrapper_leaves_calls_that_set_their_own_sharing_or_forward(tmp_path, args, extra):
+    r, log = _run_wrapper(tmp_path, args, **extra)
+    assert r.returncode == 0 and log == [" ".join(args)]
+
+
+def test_the_ssh_wrapper_reads_only_options_before_the_host(tmp_path):
+    """A remote command's words (-Rf) and an option's value (-i -N) are not read as ssh options."""
+    r, log = _run_wrapper(tmp_path, ["-i", "-N", "host-a", "rm", "-Rf", "/tmp/x"])
+    assert r.returncode == 0 and "ControlMaster=auto" in log[0]
+    assert log[0].endswith("-i -N host-a rm -Rf /tmp/x")
+
+
+def test_the_ssh_wrapper_passes_the_remote_exit_code_without_a_retry(tmp_path):
+    r, log = _run_wrapper(tmp_path, ["host-a", "exit 3"], FAKE_RC=3)
+    assert r.returncode == 3 and len(log) == 1
+    r, log = _run_wrapper(tmp_path, ["host-a", "false"], FAKE_RC=255)   # 255 without a sharing error
+    assert r.returncode == 255 and len(log) == 1
+
+
+def test_a_broken_shared_connection_falls_back_once_to_a_plain_one(tmp_path):
+    r, log = _run_wrapper(tmp_path, ["-o", "BatchMode=yes", "host-a", "exit 4"], FAKE_MUX_FAIL=1, FAKE_RC=4)
+    assert r.returncode == 4, r.stderr
+    assert len(log) == 3
+    assert "-O stop" in log[1] and "ControlMaster=auto" in log[1]   # the bad socket is removed
+    assert log[2] == "-o ControlMaster=no -o ControlPath=none -o BatchMode=yes host-a exit 4"
+    assert "mux_client_hello" in r.stderr                              # the first error still shows
+
+
+def test_the_ssh_wrapper_keeps_its_socket_path_under_the_unix_limit(tmp_path):
+    import os
+    r, log = _run_wrapper(tmp_path, ["host-a", "true"], TTP_SSH_CM_DIR=tmp_path / ("d" * 70))
+    want = f"/tmp/ttp-cm-{os.getuid()}"
+    assert r.returncode == 0 and f"ControlPath={want}/%C" in log[0]
+    # %C is 40 hex characters and ssh appends a 17-character suffix while it binds: a folder of at most
+    # 60 characters (the wrapper's limit) stays under the 104-byte socket path limit.
+    assert 60 + 1 + 40 + 17 < 104 and len(want) <= 60
+
+
+def test_sshmux_routes_bare_ssh_to_the_wrapper_unless_reuse_is_off():
+    from ttp import sshmux
+    assert sshmux.enabled(None) and sshmux.enabled({"ssh": {"reuse": True}})
+    assert not sshmux.enabled({"ssh": {"reuse": False}}) and not sshmux.enabled({"ssh": {"reuse": "off"}})
+    assert sshmux.env({"ssh": {"reuse": False}}) == {"TTP_SSH_REUSE": "0"}
+    w = sshmux.wrapper()
+    assert w and w.endswith("/bin/ssh")
+    assert sshmux.argv(["ssh", "-o", "BatchMode=yes", "h", "true"], {}) == [w, "-o", "BatchMode=yes", "h", "true"]
+    assert sshmux.argv(["ssh", "h"], {"TTP_SSH_REUSE": "0"}) == ["ssh", "h"]
+    assert sshmux.argv(["/usr/bin/ssh", "h"], {}) == ["/usr/bin/ssh", "h"]
+    assert sshmux.argv("ssh h", {}) == "ssh h"
+
+
+def test_stepclock_sends_the_daemons_ssh_through_the_wrapper(monkeypatch):
+    from ttp import sshmux, stepclock
+    seen = []
+    monkeypatch.setitem(stepclock._orig, "init", lambda self, args, *a, **kw: seen.append(args))
+    stepclock._init(None, ["ssh", "h", "true"], env={"TTP_SSH_REUSE": "1"})
+    stepclock._init(None, ["ssh", "h", "true"], env={"TTP_SSH_REUSE": "0"})
+    assert seen[0][0] == sshmux.wrapper() and seen[1][0] == "ssh"
+
+
+def test_project_commands_carry_the_ssh_reuse_switch(env):
+    from ttp.project import command_env
+    p = _device_project(env, device=False)
+    assert command_env(p).get("TTP_SSH_REUSE") == "1"
+    p.set_config("ssh.reuse", False)
+    assert command_env(p).get("TTP_SSH_REUSE") == "0"

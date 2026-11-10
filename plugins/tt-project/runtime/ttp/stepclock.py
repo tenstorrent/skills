@@ -16,7 +16,8 @@ step is open, on the thread that opened it:
   (CRITICAL_WAIT_S when it names none).
 
 Every ssh started in an installed process gets ConnectTimeout and ServerAlive options unless it names
-its own. install() patches subprocess.Popen once per process (the daemon, at start); off a step, or on
+its own, and runs through the harness's ssh wrapper (connection reuse, sshmux.py) while ssh.reuse is
+on. install() patches subprocess.Popen once per process (the daemon, at start); off a step, or on
 another thread, a wait is left as it is.
 """
 from __future__ import annotations
@@ -28,6 +29,8 @@ import subprocess
 import threading
 import time
 from typing import Iterator
+
+from . import sshmux
 
 SSH_OPTS = ("-o", "ConnectTimeout=15", "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=4")
 CRITICAL_WAIT_S = 120   # a wait inside critical() that names no timeout
@@ -156,7 +159,7 @@ def ssh_argv(argv):
 
 def _init(self, args, *a, **kw):
     if not kw.get("shell"):
-        args = ssh_argv(args)
+        args = sshmux.argv(ssh_argv(args), kw.get("env"))
     _orig["init"](self, args, *a, **kw)
 
 

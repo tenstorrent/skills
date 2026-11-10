@@ -545,6 +545,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # the machine awake themselves as needed.
     # pin_verify: strict refuses an explicit task model/effort pin that cannot be verified before a turn.
     "runner": {"nice": 10, "prevent_idle_sleep": "off", "pin_verify": "lenient"},
+    # reuse: every ssh the project starts (probes, checks, workers, git over ssh) shares one connection per
+    # host for 10 minutes (OpenSSH ControlMaster through the harness's bin/ssh; sockets in ~/.tt-project/cm),
+    # so an ssh agent signs once, not per command. Off: each ssh opens its own connection (sshmux.py).
+    "ssh": {"reuse": True},
     # `ttp bench run` (benchrun.py): arms {name: {provider, model, effort}} (none shipped) and the
     # limits every cell gets alike.
     "bench": {"arms": {}, "reps": 1, "timeout_s": 3600, "stall_s": 900, "budget_usd": 8.0, "test_timeout_s": 900},
@@ -2566,7 +2570,12 @@ def command_env(p: Project, base: dict | None = None) -> dict[str, str]:
             env[k] = user
     # This runtime only: an inherited PYTHONPATH may name another install's.
     home = owner_home(p, env)
-    return {**env, **({"HOME": home} if home else {}), "TTP_PROJECT": str(p.base),
+    from . import sshmux
+    try:
+        reuse = sshmux.env(p.config())
+    except Exception:   # an unreadable config keeps the default
+        reuse = sshmux.env(None)
+    return {**env, **reuse, **({"HOME": home} if home else {}), "TTP_PROJECT": str(p.base),
             "PYTHONPATH": str(Path(__file__).resolve().parent.parent),
             "PATH": ":".join(dict.fromkeys(d for d in dirs if d))}
 
