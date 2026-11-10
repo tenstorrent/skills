@@ -12107,8 +12107,13 @@ class Daemon:
                 log(self.p, held)
                 self._move_said = held
             return
+        # Each part names itself (_step_over), so a dispatch overrun names what held it; the per-task
+        # loop below names each task and stops at the budget.
+        self._step_over("premise checks")
         self._tend_premises()   # a code task queued this tick with a `premise:` line waits on its check
+        self._step_over("top-up hold release")
         self._release_topup_holds()   # an urgent or user-ordered task held on its spent budget goes back
+        self._step_over("the ready-task read")
         ready = db.ready_tasks()   # read after _slot_reservations, which may have woken a reserving task
         reached = set()     # tasks that got past the gates to the resource check
         paused = db.paused_resources()
@@ -12128,6 +12133,7 @@ class Daemon:
         fate: dict[int, str] = {}   # task id -> a schedlog reason, "full" or "picked" (_log_slot_fill)
         probing, probe_tried = None, False   # the task whose start retries an open run-start breaker this tick
         ready = startbreaker.probe_first(db, ready, now)   # a due retry goes to a task its cause has not failed
+        self._step_over("dispatch gates")
         # Tasks walked since the last whole walk (ticks cut short at the step budget, e.g. by slow git reads
         # under load) go after the ones not reached yet in their band (urgent.band), so every ready task of
         # a band is reached in turn, and an urgent or better-priority task walked but not started still

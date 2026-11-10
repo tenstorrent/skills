@@ -909,14 +909,11 @@ def covered_heads(p: Project, review: dict) -> list[str]:
     """The commits of the refs a review covers (reviewed_refs) that resolve here or on origin, without
     duplicates: the heads of the review's dependencies (the code tasks it reviews, and fix branches on
     them: dependency_refs) first, then the other spec-named ones."""
-    heads = []
-    for ref in _dependency_first(p, review, reviewed_refs(p, review)):
-        for cand in (ref,) if _HEX.fullmatch(ref) else (ref, f"origin/{ref}"):
-            head = _git(p.root, "rev-parse", "--verify", "--quiet", f"{cand}^{{commit}}", check=False)
-            if head:
-                heads.append(head)
-                break
-    return list(dict.fromkeys(heads))
+    cands = {ref: (ref,) if _HEX.fullmatch(ref) else (ref, f"origin/{ref}")
+             for ref in _dependency_first(p, review, reviewed_refs(p, review))}
+    found = _resolve(p, [c for cs in cands.values() for c in cs])
+    heads = [next((found[c] for c in cs if c in found), "") for cs in cands.values()]
+    return list(dict.fromkeys(h for h in heads if h))
 
 
 def is_ancestor(p: Project, older: str, newer: str) -> bool:
@@ -930,10 +927,63 @@ def reviewed_head(p: Project, review: dict) -> str | None:
     whose spec also names the old head), the first: its dependency's head over older spec-named ones.
     None when none resolves."""
     heads = covered_heads(p, review)
+    on = ancestry(p, [(h, tip) for tip in heads for h in heads], resolved=True)
     for tip in heads:
-        if all(is_ancestor(p, h, tip) for h in heads):
+        if all(on[(h, tip)] for h in heads):
             return tip
     return heads[0] if heads else None
+
+
+def ancestry(p: Project | None, pairs, resolved: bool = False, root: Path | None = None) -> dict[tuple[str, str], bool]:
+    """{(older, newer): older is newer or an ancestor of it} for rev names (full or short ids,
+    branches) here, in at most three git calls whatever the number of pairs (one
+    `merge-base --is-ancestor` per pair, under load over a second each, held the daemon's reap and
+    dispatch steps past their budgets): one `cat-file --batch-check` resolves every name (one naming
+    no commit here answers no), one `merge-base --octopus` finds a commit below every input, then one
+    `rev-list --parents` from the inputs down to it gives the graph each pair is answered from. An
+    input the walk does not reach is below that base, so an ancestor of every input. With no common
+    base (unrelated histories) the walk reads the inputs' whole history. A git call that fails or
+    times out answers no, as merge-base did. `resolved`: every input is already a full commit id here
+    (from _resolve), so the cat-file is skipped. In repo `root`, default the project root."""
+    pairs = list(dict.fromkeys(pairs))
+    names = list(dict.fromkeys(c for pair in pairs for c in pair))
+    root = root or p.root
+    full = {n: n for n in names} if resolved else _resolve(p, names, root)
+    out = {(a, b): a in full and b in full and full[a] == full[b] for a, b in pairs}
+    ids = list(dict.fromkeys(full.values()))
+    if len(ids) < 2:
+        return out
+    try:
+        mb = gitmemo.run(["git", "-C", str(root), "merge-base", "--octopus", *ids], capture_output=True,
+                         text=True, timeout=120, read=True)
+        base = (mb.stdout or "").strip() if mb.returncode == 0 else ""
+        if mb.returncode not in (0, 1) or (mb.returncode == 0 and not base):
+            return out
+        walk = gitmemo.run(["git", "-C", str(root), "rev-list", "--parents", *ids, *([f"^{base}"] if base else [])],
+                           capture_output=True, text=True, timeout=120, read=True)
+    except subprocess.TimeoutExpired:
+        return out
+    if walk.returncode != 0:
+        return out
+    graph = {ln.split()[0]: ln.split()[1:] for ln in (walk.stdout or "").splitlines() if ln.strip()}
+    reach: dict[str, set[str]] = {}
+    for x, y in pairs:
+        if out[(x, y)] or x not in full or y not in full:
+            continue
+        a, b = full[x], full[y]
+        if a not in graph:   # below the base: an ancestor of every input (no base: walked from every one)
+            out[(x, y)] = bool(base)
+            continue
+        if b not in reach:
+            seen, todo = set(), [b] if b in graph else []
+            while todo:
+                c = todo.pop()
+                if c not in seen:
+                    seen.add(c)
+                    todo.extend(q for q in graph[c] if q in graph)
+            reach[b] = seen
+        out[(x, y)] = a in reach[b]
+    return out
 
 
 def dependency_refs(p: Project, review: dict) -> list[str]:
@@ -2402,7 +2452,8 @@ def _named_refs(p: Project, task: dict) -> list[str]:
                                     (spec,))
         if r["id"] in ids or names_branch(spec, r["branch"])))
     hashes = list(dict.fromkeys(_HEX.findall(spec)))
-    heads = [h for h in (_branch_head(p, b) for b in branches) if h] if hashes else []
+    found = _resolve(p, [c for b in branches for c in (b, f"origin/{b}")]) if hashes else {}
+    heads = list(dict.fromkeys(h for b in branches if (h := found.get(b) or found.get(f"origin/{b}"))))
     if heads:
         said = {m.group(1) for b in branches for i in _find_all(spec, b)
                 if (m := _SAID_HEAD.match(spec, i + len(b)))}
@@ -2412,45 +2463,41 @@ def _named_refs(p: Project, task: dict) -> list[str]:
 
 def _on_heads(p: Project, hashes: list[str], heads: list[str], said: set[str]) -> list[str]:
     """The quoted `hashes` that are in `said`, or on one of `heads` (an ancestor) or build on one (a
-    descendant). A fixed number of git calls: one `cat-file --batch-check` drops the hashes that name no
-    commit here, then per head one `rev-list` of its ancestors and one `rev-list --ancestry-path` of
-    its descendants among the rest (a pairwise `merge-base --is-ancestor`, both ways, kept the daemon's
-    reap step on one review for 40 minutes, run 247). A git call that fails or hangs counts as no."""
+    descendant). At most three git calls however many hashes and heads: one `cat-file --batch-check`
+    drops the hashes that name no commit here, then ancestry answers every (hash, head) pair both ways
+    (a pairwise `merge-base --is-ancestor` kept the daemon's reap step on one review for 40 minutes,
+    run 247; one `rev-list` per head still read each head's whole history). A git call that fails or
+    hangs counts as no."""
     todo = [h for h in hashes if h not in said and not any(tip.startswith(h) for tip in heads)]
     full = _commit_ids(p, todo)
-    found: set[str] = set()
-    for tip in heads:
-        rest = [h for h in todo if h in full and h not in found]
-        if not rest:
-            break
-        anc = _rev_list(p, tip)
-        desc = _rev_list(p, "--ancestry-path", f"^{tip}", *dict.fromkeys(full[h] for h in rest))
-        found.update(h for h in rest if full[h] in anc or full[h] in desc)
+    on = ancestry(p, [pair for h in todo if h in full for tip in heads for pair in ((full[h], tip), (tip, full[h]))],
+                  resolved=True)
+    found = {h for h in todo if h in full and any(on[(full[h], tip)] or on[(tip, full[h])] for tip in heads)}
     return [h for h in hashes if h not in todo or h in found]
 
 
 def _commit_ids(p: Project, hashes: list[str]) -> dict[str, str]:
     """{hash: full commit id} for the `hashes` that name one commit here, in one git call."""
-    if not hashes:
+    return {h: c for h, c in _resolve(p, hashes).items() if c.startswith(h)}
+
+
+def _resolve(p: Project | None, names: list[str], root: Path | None = None) -> dict[str, str]:
+    """{name: full commit id} for the rev `names` (branches, hashes) that name one commit here (in repo
+    `root`, default the project root), as `rev-parse --verify <name>^{commit}` would, in one
+    `cat-file --batch-check` call for all of them; {} when it fails or times out."""
+    names = list(dict.fromkeys(n for n in names if n and not n.isspace() and "\n" not in n))
+    if not names:
         return {}
     try:
-        out = gitmemo.run(["git", "-C", str(p.root), "cat-file", "--batch-check=%(objectname) %(objecttype)"],
-                          input="".join(f"{h}^{{commit}}\n" for h in hashes), capture_output=True, text=True,
+        out = gitmemo.run(["git", "-C", str(root or p.root), "cat-file", "--batch-check=%(objectname) %(objecttype)"],
+                          input="".join(f"{n}^{{commit}}\n" for n in names), capture_output=True, text=True,
                           timeout=120, read=True)
     except subprocess.TimeoutExpired:
         return {}
     lines = (out.stdout or "").splitlines() if out.returncode == 0 else []
-    return {h: ln.split()[0] for h, ln in zip(hashes, lines)
-            if ln.endswith(" commit") and ln.split()[0].startswith(h)}
-
-
-def _rev_list(p: Project, *args: str) -> set[str]:
-    try:
-        out = gitmemo.run(["git", "-C", str(p.root), "rev-list", *args], capture_output=True, text=True,
-                          timeout=120, read=True)
-    except subprocess.TimeoutExpired:
-        return set()
-    return set((out.stdout or "").split()) if out.returncode == 0 else set()
+    if len(lines) != len(names):
+        return {}
+    return {n: ln.split()[0] for n, ln in zip(names, lines) if ln.endswith(" commit")}
 
 
 def _branch_head(p: Project, branch: str) -> str:
@@ -2533,12 +2580,11 @@ def diff_lines(p: Project, refs: list[str], base: str = "", root: Path | None = 
     root = root or p.root
     base = base or resolve_base(p)
     out: dict[str, int | None] = {}
-    base_sha = ""
+    found = _resolve(p, [*refs, base], root)   # one git call for all of them, not a rev-parse per ref
+    base_sha = found.get(base, "")
     for ref in refs:
-        sha = _git(root, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}", check=False)
-        if not sha:
+        if not (sha := found.get(ref)):
             continue
-        base_sha = base_sha or _git(root, "rev-parse", "--verify", "--quiet", f"{base}^{{commit}}", check=False)
         key = (str(root), base_sha, sha)
         stat = _NUMSTAT.get(key) if base_sha else None
         if stat is None:
@@ -2567,11 +2613,11 @@ def contains(root: Path, tip: str, commit: str) -> bool:
 def landed_from(root: Path, base: str, head: str) -> str:
     """The tip `base` had just before `head` landed on it, from its reflog in repo `root`: of the
     entries, newest first (REFLOG_SCAN at most), the first that does not contain `head`; '' when the
-    reflog does not reach back that far or `base` has none."""
-    for sha in _git(root, "reflog", "show", "--format=%H", f"-n{REFLOG_SCAN}", base, "--", check=False).split():
-        if not contains(root, sha, head):
-            return sha
-    return ""
+    reflog does not reach back that far or `base` has none. One ancestry batch for all the entries,
+    not a merge-base per entry."""
+    shas = _git(root, "reflog", "show", "--format=%H", f"-n{REFLOG_SCAN}", base, "--", check=False).split()
+    on = ancestry(None, [(head, sha) for sha in shas], root=root)
+    return next((sha for sha in shas if not on[(head, sha)]), "")
 
 
 def delta_lines(p: Project, failed: str, new: str) -> tuple[dict[str, int | None] | None, str]:

@@ -242,6 +242,27 @@ def test_a_slow_tick_step_raises_one_tick_step_slow_naming_what_held_it(env, mon
     assert len(p.db.q("SELECT * FROM events WHERE kind='tick_step_slow'")) == 1, "a fast step raises none"
 
 
+def test_a_slow_dispatch_step_names_the_task_it_was_on(env, monkeypatch):
+    """A dispatch step that overran its budget named no item ("it names no item it works on"): each
+    task it goes over now names itself, so tick_step_slow and the incident say which one held it."""
+    p = make(env)
+    from ttp import daemon as dmod
+    d = dmod.Daemon(p.base)
+    tid = p.db.add_task("slow to gate", "s", kind="work", tier="light", origin="user")
+    monkeypatch.setattr(dmod, "STEP_BUDGET_S", 0.05)
+    real = d.lease_held
+
+    def slow_lease():
+        if d._step_holder == f"task #{tid}":
+            time.sleep(0.1)
+            return False   # start nothing: only the record is under test
+        return real()
+    monkeypatch.setattr(d, "lease_held", slow_lease)
+    d._run_step(d.dispatch, "dispatch")
+    [ev] = p.db.q("SELECT * FROM events WHERE kind='tick_step_slow'")
+    assert f"held longest by task #{tid}" in ev["text"] and ev["task"] == tid, ev["text"]
+
+
 def test_the_daemons_checks_start_skips_a_pre_stage_longer_than_its_inline_bound(env, monkeypatch):
     """The daemon starts `ttp checks --detach` inline (its review precheck, a restart after a reboot),
     bounded well under a pre-stage's own limit: a slow delivery.check_prestage run there in the

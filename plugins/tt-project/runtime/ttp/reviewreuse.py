@@ -125,7 +125,9 @@ def rebased_away(p, review: dict, sha: str) -> str:
     branch as `sha`, by git patch-id, in order. A changed patch, an extra or missing commit, a merge
     in either range, or a base or patch that cannot be read refuses reuse."""
     from . import worktree
-    others = [h for h in worktree.covered_heads(p, review) if h != sha and not worktree.is_ancestor(p, h, sha)]
+    heads = [h for h in worktree.covered_heads(p, review) if h != sha]
+    on = worktree.ancestry(p, [(h, sha) for h in heads])
+    others = [h for h in heads if not on[(h, sha)]]
     if not others:
         return ""
     try:

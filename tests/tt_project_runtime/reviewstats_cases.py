@@ -379,8 +379,113 @@ def test_a_review_spec_quoting_many_hashes_is_sorted_in_a_fixed_number_of_git_ca
     refs = worktree._named_refs(p, p.db.task(_quoting_review(p, spec, (tid,))))
     assert first[:10] in refs and built[:10] in refs, refs
     assert off[:10] not in refs and not set(missing) & set(refs), refs
-    assert not [c for c in calls if "merge-base" in c], calls
-    assert len([c for c in calls if "cat-file" in c or "rev-list" in c]) <= 3, calls
+    assert not [c for c in calls if "--is-ancestor" in c], calls
+    assert len([c for c in calls if {"cat-file", "rev-list", "merge-base", "rev-parse"} & set(c)]) <= 4, calls
+
+
+def _ancestry_repo(p, path):
+    """Commits in `path` (a task worktree of p): a line c0-a1-a2, a side branch c0-b1, a merge m of a2
+    and b1, a commit after it, and an unrelated history r1-r2. {name: full id}."""
+    c = {"c0": _git_out(path, "rev-parse", "HEAD")}
+    c["a1"] = _commit_files(path, {"a.py": "1\n"}, "a1")
+    c["a2"] = _commit_files(path, {"a.py": "2\n"}, "a2")
+    _git_out(path, "reset", "-q", "--hard", c["c0"])
+    c["b1"] = _commit_files(path, {"b.py": "1\n"}, "b1")
+    tree = _git_out(path, "rev-parse", f"{c['a2']}^{{tree}}")
+    c["m"] = _git_out(path, *_IDENT, "commit-tree", tree, "-p", c["a2"], "-p", c["b1"], "-m", "merge")
+    _git_out(path, "reset", "-q", "--hard", c["m"])
+    c["after"] = _commit_files(path, {"c.py": "1\n"}, "after")
+    c["r1"] = _git_out(path, *_IDENT, "commit-tree", tree, "-m", "unrelated root")
+    c["r2"] = _git_out(path, *_IDENT, "commit-tree", tree, "-p", c["r1"], "-m", "unrelated")
+    return c
+
+
+def test_batched_ancestry_answers_every_pair_as_merge_base_is_ancestor_would(env):
+    """worktree.ancestry answers (older, newer) pairs in a fixed number of git calls: the same answer as
+    one `merge-base --is-ancestor` per pair, over branches, a merge, an unrelated history, short ids,
+    a branch name and names that name no commit, for random subsets (each has its own octopus base)."""
+    import random
+    import subprocess
+    from ttp import worktree
+    p = make(env)
+    _, path, branch = _code_task(p, "the change")
+    c = _ancestry_repo(p, path)
+    names = [*c.values(), c["a1"][:9], c["b1"][:12], branch,
+             "deadbeefcafe", "0" * 40, "no-such-branch"]
+
+    def one(a, b):
+        return subprocess.run(["git", "-C", str(p.root), "merge-base", "--is-ancestor", a, b],
+                              capture_output=True).returncode == 0
+    every = [(a, b) for a in names for b in names]
+    truth = {pair: one(*pair) for pair in every}
+    assert truth[(c["c0"], c["after"])] and truth[(c["b1"], c["m"])] and not truth[(c["b1"], c["a2"])]
+    assert not truth[(c["r1"], c["after"])] and truth[(c["r1"], c["r2"])]
+    assert worktree.ancestry(p, every) == truth
+    rng = random.Random(7815)
+    for _ in range(25):
+        pairs = rng.sample(every, rng.randint(1, 12))
+        assert worktree.ancestry(p, pairs) == {pair: truth[pair] for pair in pairs}, pairs
+    assert worktree.ancestry(p, []) == {}
+
+
+def test_batched_ancestry_spawns_a_fixed_number_of_git_calls_whatever_the_pairs(env, monkeypatch):
+    """At most three git calls (cat-file, merge-base --octopus, rev-list) for 1 pair or 200; reviewed_head
+    and a review naming many hashes the same: the count does not grow with the pairs. A call that times
+    out answers no."""
+    import subprocess
+    from ttp import gitmemo, worktree
+    p = make(env)
+    _, path, branch = _code_task(p, "the change")
+    c = _ancestry_repo(p, path)
+    ids = list(c.values())
+    calls = []
+    real = gitmemo.run
+    monkeypatch.setattr(gitmemo, "run", lambda argv, **kw: calls.append(list(argv)) or real(argv, **kw))
+
+    def count(pairs):
+        calls.clear()
+        worktree.ancestry(p, pairs)
+        return len(calls)
+    few = count([(c["a1"], c["m"])])
+    many = count([(a, b) for a in ids for b in ids] + [(a[:10], branch) for a in ids])
+    assert few <= 3 and many <= 3 and not [x for x in calls if "--is-ancestor" in x], calls
+
+    def slow(argv, **kw):
+        if "merge-base" in argv or "rev-list" in argv:
+            raise subprocess.TimeoutExpired(argv, kw.get("timeout") or 1)
+        return real(argv, **kw)
+    monkeypatch.setattr(gitmemo, "run", slow)
+    out = worktree.ancestry(p, [(c["a1"], c["m"]), (c["m"], c["m"]), ("deadbeefcafe", "deadbeefcafe")])
+    assert out == {(c["a1"], c["m"]): False, (c["m"], c["m"]): True, ("deadbeefcafe", "deadbeefcafe"): False}
+
+
+def test_a_review_with_many_heads_and_hashes_sorts_them_in_the_same_git_calls_as_with_few(env, monkeypatch):
+    """_named_refs and reviewed_head over a review with 1 dependency quoting 2 hashes, then 6
+    dependencies quoting 30: the git spawn count stays the same (it was 2 per hash per head)."""
+    from ttp import gitmemo, worktree
+    p = make(env)
+    calls = []
+    real = gitmemo.run
+    monkeypatch.setattr(gitmemo, "run", lambda argv, **kw: calls.append(list(argv)) or real(argv, **kw))
+
+    def count(n_deps, n_hashes):
+        deps, quoted = [], []
+        for i in range(n_deps):
+            tid, path, _ = _code_task(p, f"change {n_deps}-{i}")
+            quoted += [_commit_files(path, {f"f{i}.py": f"{k}\n"}, f"c{k}")[:10] for k in range(n_hashes // n_deps)]
+            deps.append(tid)
+        quoted += [f"{k:08x}" for k in range(5)]   # name no commit
+        review = p.db.task(_quoting_review(p, "Review it. " + ", ".join(quoted) + ".", deps))
+        calls.clear()
+        refs = worktree._named_refs(p, review)
+        assert set(quoted[:-5]) <= set(refs) and not set(quoted[-5:]) & set(refs), refs
+        named = len(calls)
+        calls.clear()
+        assert worktree.reviewed_head(p, review)
+        return named, len(calls)
+    small, large = count(1, 2), count(6, 30)
+    assert large[0] <= small[0] + 1 and large[1] <= small[1] + 1, (small, large)
+    assert large[0] <= 4 and large[1] <= 7, (large, [" ".join(x[3:5]) for x in calls])   # _named_refs, then +3
 
 
 def test_a_review_spec_naming_only_a_hash_still_reviews_it(env):
@@ -569,3 +674,22 @@ def test_a_harness_task_review_is_measured_in_the_harness_repo_against_its_main_
     row = reviewstats.record(p, p.db.task(rid), "done")
     assert (row["head"], row["lines"], row["areas"]) == (
         _git_out(h, "rev-parse", b), 9, "skills-prompts-config"), row
+
+
+def test_landed_from_reads_the_whole_reflog_in_a_fixed_number_of_git_calls(env, monkeypatch):
+    """The tip a head landed on, from the branch's reflog: one ancestry batch for every entry (it was a
+    merge-base per entry, up to 50, on each review the daemon records)."""
+    from ttp import gitmemo, worktree
+    p = make(env)
+    _, path, branch = _code_task(p, "the change")
+    before = _git_out(path, "rev-parse", "HEAD")
+    landed = _commit_files(path, {"a.py": "1\n"}, "landed")
+    for k in range(8):
+        _commit_files(path, {"b.py": f"{k}\n"}, f"later {k}")
+    calls = []
+    real = gitmemo.run
+    monkeypatch.setattr(gitmemo, "run", lambda argv, **kw: calls.append(list(argv)) or real(argv, **kw))
+    assert worktree.landed_from(p.root, branch, landed) == before
+    assert len(calls) <= 4 and not [c for c in calls if "--is-ancestor" in c], calls
+    assert worktree.landed_from(p.root, branch, "0" * 40) == _git_out(path, "rev-parse", "HEAD"), \
+        "a head that names no commit is on no entry: the newest"
