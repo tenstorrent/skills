@@ -412,6 +412,49 @@ def try_model_free(root: str, cf: dict, task_id: int) -> dict | None:
         return None
 
 
+def covered(root: str, cf: dict) -> str | None:
+    """The commit on the target's current tip that already carries a queued conflict fix's head, or
+    None: then the fix runs. The head counts as carried when every commit of merge-base..head is on
+    the tip (landed.on_branch: an ancestor, a patch-id or author/date/subject match, or a replay
+    trailer naming it), as when another batch squashed the branch in while this fix waited. The
+    carrier is the first tip commit by which replay trailers name all of them, else the newest one
+    naming any, else the tip (the head itself when it is an ancestor). A git read that fails is None."""
+    from pathlib import Path
+    from . import landed
+    head = str(cf.get("head") or "")
+    if not head:
+        return None
+    try:
+        tip, full = "", ""
+        for ref in (str(cf.get("target") or ""), str(cf.get("onto") or "")):
+            if ref and (r := _git(root, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}")).returncode == 0:
+                tip = r.stdout.strip()
+                break
+        if tip and (r := _git(root, "rev-parse", "--verify", "--quiet", f"{head}^{{commit}}")).returncode == 0:
+            full = r.stdout.strip()
+        if not tip or not full or not landed.on_branch(Path(root), full, tip):
+            return None
+        if _git(root, "merge-base", "--is-ancestor", full, tip).returncode == 0:
+            return full
+        base = _git(root, "merge-base", tip, full)
+        mine = _git(root, "log", "--no-merges", "--format=%H", f"{base.stdout.strip()}..{full}")
+        theirs = _git(root, "log", "--reverse", "--format=%x1e%H%n%B", f"{base.stdout.strip()}..{tip}")
+        if base.returncode or mine.returncode or theirs.returncode:
+            return None
+        want, seen, last = set(mine.stdout.split()), set(), ""
+        for rec in theirs.stdout.split("\x1e")[1:]:
+            sha, _, body = rec.partition("\n")
+            named = set(re.findall(rf"^{landed.REPLAYED}: ([0-9a-f]{{40,64}})[ \t]*$", body, re.M)) & want
+            if named:
+                seen |= named
+                last = sha.strip()
+                if seen >= want:
+                    return last
+        return last or tip
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
 def record(db, task_id: int, kind: str) -> None:
     """Note on the review's latest conflict rows how dispatch settles them (RESOLUTIONS); a later
     run of the same fix (an escalation) overwrites it."""

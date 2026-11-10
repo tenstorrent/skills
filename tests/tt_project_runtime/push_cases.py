@@ -18917,6 +18917,59 @@ def test_a_model_free_resolution_queues_a_light_review_of_its_delta_and_records_
     assert st["review_rerun"] == 1 and st["model_free"] == 0, st
 
 
+def _squashed_in(s, *heads):
+    """Someone else squashes the code branch's work onto origin/proj with a replay trailer per head
+    named; the project root fetches it. The target's tip before it."""
+    before = _git_out(s.repo, "rev-parse", "origin/proj")
+    (s.other / "feature.txt").write_text("feature\n")
+    _git_out(s.other, "add", "feature.txt")
+    trailers = "".join(f"\nTtp-Replayed-From: {h}" for h in heads)
+    _git_out(s.other, "commit", "-qm", f"squash: feature\n{trailers}")
+    _git_out(s.other, "push", "-q", "origin", "HEAD:proj")
+    _git_out(s.repo, "fetch", "-q", "origin")
+    return before
+
+
+def test_a_conflict_fix_whose_head_already_landed_closes_as_superseded_with_no_run(env, monkeypatch):
+    """A push-conflict fix queued (or held) while another batch squashed its branch into the target
+    ran over and over on work already landed. Dispatch now finds the target's replay trailers cover
+    every commit of the head and closes the review as superseded by that commit, recording the code
+    task too, with no run; a head the target carries only partly still gets its fix."""
+    from ttp import conflictfix
+    from ttp.daemon import Daemon
+    s = _pq(env, monkeypatch)
+    before = _squashed_in(s, s.head)
+    carrier = _git_out(s.repo, "rev-parse", "origin/proj")
+    cf = {"head": s.head, "branch": s.branch, "target": "origin/proj", "onto": before, "files": ["feature.txt"],
+          "n": 1}
+    assert conflictfix.covered(str(s.p.root), cf) == carrier
+    s.p.db.update_task(s.review, status="queued", result=json.dumps({"status": "queued", "conflict_fix": cf}))
+    assert Daemon(s.p.base)._landed_conflict_fix(s.p.db.task(s.review)) is True
+    review = s.p.db.task(s.review)
+    res = json.loads(review["result"])
+    assert review["status"] == "done" and res["superseded_by"] == carrier and "conflict_fix" not in res, res
+    rows = s.p.db.q("SELECT task, sha FROM task_superseded ORDER BY task")
+    assert {(r["task"], r["sha"]) for r in rows} == {(s.review, carrier), (s.code, carrier)}, rows
+    assert [e["kind"] for e in _pq_events(s.p, task=s.review)] == ["task_superseded"]
+
+
+def test_a_conflict_fix_whose_head_landed_only_in_part_still_runs(env, monkeypatch):
+    from ttp import conflictfix
+    from ttp.daemon import Daemon
+    s = _pq(env, monkeypatch)
+    first = s.head
+    _commit(s.path, "more.txt", "more\n")
+    head = _git_out(s.path, "rev-parse", "HEAD")
+    before = _squashed_in(s, first)
+    cf = {"head": head, "branch": s.branch, "target": "origin/proj", "onto": before, "files": ["feature.txt"],
+          "n": 1}
+    assert conflictfix.covered(str(s.p.root), cf) is None
+    s.p.db.update_task(s.review, status="queued", result=json.dumps({"status": "queued", "conflict_fix": cf}))
+    assert Daemon(s.p.base)._landed_conflict_fix(s.p.db.task(s.review)) is False
+    assert s.p.db.task(s.review)["status"] == "queued"
+    assert not s.p.db.q("SELECT 1 FROM task_superseded")
+
+
 def test_a_conflict_of_only_import_names_settles_model_free_in_the_tips_layout():
     """Two heads that each import a new name on one packed `from . import` line conflicted and voided
     an approval; so did a head that added a name to the packed line the tip had just split one name

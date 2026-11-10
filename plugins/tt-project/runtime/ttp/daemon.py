@@ -12177,7 +12177,7 @@ class Daemon:
                 task, prev = dict(task, result=dump_result(lowered)), lowered
                 need = self._floor_need(task, bud.wake_tier(task["tier"], prev, self.cfg, self.p.harness), prev)
             review_pick = None
-            if task["kind"] == "review" and self._reuse_review(task):
+            if task["kind"] == "review" and (self._landed_conflict_fix(task) or self._reuse_review(task)):
                 continue
             if task["kind"] == "review":
                 task, review_pick = self._size_review(task)
@@ -19093,6 +19093,41 @@ class Daemon:
                 extra["verified_through"] = m["sha"]
         except Exception as e:
             log(self.p, f"task {task['id']}: verified-through marker not recorded: {e}")
+
+    def _landed_conflict_fix(self, task: dict) -> bool:
+        """A queued push-conflict fix (conflictfix.of) whose head the target already carries
+        (conflictfix.covered, e.g. another batch squashed the branch in while it waited) closes with
+        no run: True. The review is done and recorded as superseded by the carrying commit, as is
+        each task it ships (pushq._covers) where landed.record_superseded accepts it. False whenever the fix runs."""
+        cf = conflictfix.of(task)
+        if not cf or not (sha := conflictfix.covered(str(self.p.root), cf)):
+            return False
+        db, now, head = self.p.db, time.time(), str(cf.get("head") or "")
+        line = (f"its head {head[:12]} is already on {cf.get('target') or cf.get('onto') or 'the target'} "
+                f"as {sha[:10]}, so no conflict fix ran")
+        with db.tx():
+            prev = load_result(task.get("result"))
+            result = {**{k: v for k, v in prev.items() if k != conflictfix.KEY}, "status": "done",
+                      "superseded_by": sha, "summary": f"Superseded: {line}."}
+            if not db.conn.execute("UPDATE tasks SET status='done', blocked_reason=NULL, result=?, updated=? "
+                                   "WHERE id=? AND status='queued'",
+                                   (dump_result(result), now, task["id"])).rowcount:
+                return False
+            db.x("INSERT INTO task_superseded(task, head, sha, ts) VALUES(?,?,?,?) ON CONFLICT DO NOTHING",
+                 (task["id"], head, sha, now))
+            db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+                 (now, f"task:{task['id']}", "task_superseded", "normal",
+                  f"#{task['id']} {task['title']}: {line}; closed as done."[:coord.EVENT_CHARS], "handled",
+                  task["id"]))
+            pushq._reply(db, task, "done", result["summary"])
+        words = ""
+        for sid in sorted(pushq._covers(db, task, [{"branch": cf.get("branch")}], follow=False) - {task["id"]}):
+            try:
+                words += "; " + landed.record_superseded(self.p, sid, sha)
+            except (ValueError, OSError, subprocess.SubprocessError) as e:
+                words += f"; task #{sid} not recorded: {e}"
+        log(self.p, f"review {task['id']}: {line}; closed as superseded{words}")
+        return True
 
     def _reuse_review(self, task: dict) -> bool:
         """A review about to start whose head (worktree.reviewed_head) a review already accepted under
