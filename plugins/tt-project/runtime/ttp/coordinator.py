@@ -5315,14 +5315,18 @@ def without_lock_probes(probe: Any, gone: set[str], canon: Any = None) -> str | 
 def _user_order(p: Project, a: dict, task_id: int, text: str, messages: list[int] | None) -> str:
     """Record task `task_id` as the latest user order on the resources it names (userorder.py) when the
     action carries the user's message (`user_msg`), or a task_add's text cites one of this turn's (a
-    re-spec of an older task citing it is no new order); its note, else ""."""
+    re-spec of an older task citing it is no new order); its note, else "". A cited message orders only
+    the resources its own words name: a task citing an order on another topic holds nothing."""
     try:
-        msg = int(a["user_msg"]) if a.get("user_msg") is not None else \
+        explicit = a.get("user_msg") is not None
+        msg = int(a["user_msg"]) if explicit else \
             userorder.cited(p.db, text, messages) if a.get("type") == "task_add" else None
     except (TypeError, ValueError):
         msg = None
     try:
         names = sorted(task_resources(p.db.task(task_id) or {})) if msg else []
+        if names and not explicit:
+            names = userorder.named(p.db, p.config(), msg, names)
         ordered = userorder.record(p.db, task_id, msg, names) if names else []
         if not ordered:
             return ""

@@ -425,3 +425,31 @@ def test_the_started_on_host_check_after_a_task_add_still_sees_the_rest_of_the_b
     assert p.db.task(1)["title"] == "power-cycle rig" and p.db.task(1)["status"] == "cancelled"
     assert [m["text"] for m in p.db.q("SELECT text FROM messages WHERE direction='out' AND chat='c1'")] == [text]
     assert not any("started-on-host check failed" in n for n in p.db.kv(coord.NOTES_KEY, []))
+
+
+def test_a_task_citing_a_user_message_on_another_topic_orders_only_the_resources_its_words_name(env):
+    """A task citing the user's message about prompt caching that lists the test boxes as resources is
+    no user order on them (it held every older task there); one naming a box orders that box only; a
+    task added with user_msg orders all its resources."""
+    from ttp import coordinator as coord, userorder
+    p = make(env)
+    coord.apply(p, [{"type": "task_add", "title": "old soak", "spec": "s", "resources": ["boxa", "boxb"]}])
+    old = p.db.one("SELECT id FROM tasks WHERE title='old soak'")["id"]
+    p.db.x("UPDATE tasks SET created=?", (time.time() - 600,))
+    msg = p.db.x("INSERT INTO messages(ts,direction,kind,text) VALUES(?,'in','user',?)",
+                 (time.time() - 60, "use the 5min cache for continuous work, the 1h cache otherwise"))
+    assert coord.apply(p, [{"type": "task_add", "title": "cache life", "spec": f"user msg #{msg}: cache life",
+                            "resources": ["boxa", "boxb"]}], messages=[msg]) == []
+    assert userorder.active(p.db) == {}
+    assert userorder.holding(p.db, p.config(), p.db.task(old), ["boxa", "boxb"]) is None
+    msg2 = p.db.x("INSERT INTO messages(ts,direction,kind,text) VALUES(?,'in','user',?)",
+                  (time.time() - 30, "reboot boxB-device, it hangs."))
+    assert coord.apply(p, [{"type": "task_add", "title": "reboot", "spec": f"user msg #{msg2}: reboot it",
+                            "resources": ["boxa", "boxb", "boxb-device"]}], messages=[msg2]) == []
+    assert sorted(userorder.active(p.db)) == ["boxb-device"]
+    assert userorder.named(p.db, None, msg2, ["boxb", "boxa", "box"]) == []
+    msg3 = p.db.x("INSERT INTO messages(ts,direction,kind,text) VALUES(?,'in','user',?)",
+                  (time.time() - 10, "do it now"))
+    assert coord.apply(p, [{"type": "task_add", "title": "now", "spec": "do it now", "resources": ["boxa"],
+                            "user_msg": msg3}]) == []
+    assert sorted(userorder.active(p.db)) == ["boxa", "boxb-device"]

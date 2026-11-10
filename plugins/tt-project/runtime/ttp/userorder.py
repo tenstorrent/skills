@@ -59,6 +59,21 @@ def cited(db, text: str, messages: list[int] | None) -> int | None:
     return max(ids) if ids else None
 
 
+def named(db, cfg: dict | None, msg_id: int, resources) -> list[str]:
+    """Those of `resources` that user message `msg_id`'s own words name (the name itself, or its machine
+    for `<alias>-device`/`<alias>:x`, or a device alias sharing its lock), as a whole word."""
+    from . import locks
+    row = db.one("SELECT text FROM messages WHERE id=? AND direction='in'", (int(msg_id),))
+    words = {w.lower() for w in re.findall(r"[A-Za-z0-9][\w.:-]*[A-Za-z0-9]|[A-Za-z0-9]", (row["text"] if row else "") or "")}
+
+    def says(res: str) -> bool:
+        names = {res, re.split(r"[-:]", res, maxsplit=1)[0]}
+        if cfg is not None:
+            names.add(locks.canonical(cfg, res))
+        return any(n and n.lower() in words for n in names)
+    return [r for r in resources if says(str(r))]
+
+
 def record(db, task_id: int, msg_id: int, resources, now: float | None = None) -> list[str]:
     """Make task `task_id` the latest user order on each of `resources`, timed at message `msg_id`;
     an order from an older message never replaces a newer one. Returns the resources it now orders."""
