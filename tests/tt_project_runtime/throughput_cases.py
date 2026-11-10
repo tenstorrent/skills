@@ -584,6 +584,38 @@ def test_throughput_review_sweep_names_the_backstop_whatever_the_provider_gate(e
     assert [(c["key"], c["new"]) for c in changes if c["key"] == "review.sweep_after_s"] == [("review.sweep_after_s", 600)]
 
 
+def test_throughput_review_waits_start_after_an_earlier_review_of_the_same_task(env):
+    from ttp import throughput
+    p = make(env)
+    now = time.time()
+    # Live shape: a review failed at push time 3 h after the code task ended; its push-conflict rebase
+    # review (continues it) was queued at once. And a fix's re-review sat queued 3 h, was cancelled, and
+    # the unreviewed backstop queued a review a minute later.
+    t0 = now - 6 * 3600
+    code, first = _tp_review(p, t0 - 600, t0, t0 + 1, t0 + 60)
+    p.db.x("UPDATE tasks SET status='failed', updated=? WHERE id=?", (t0 + 3 * 3600, first))
+    rebase = _tp_task(p, "Rebase after push conflicts", t0 + 3 * 3600 + 30, prio=1,
+                      labels=[f"auto_review:{code}", f"continues:{first}"])
+    p.db.x("UPDATE tasks SET kind='review' WHERE id=?", (rebase,))
+    _tp_run(p, rebase, t0 + 3 * 3600 + 90, t0 + 3 * 3600 + 600, role="reviewer")
+    fix = _tp_task(p, "fix", t0 - 600)
+    _tp_run(p, fix, t0 - 600, t0)
+    rr = _tp_task(p, "Re-review", t0 - 900)
+    p.db.x("UPDATE tasks SET kind='review', status='cancelled', depends_on=?, updated=? WHERE id=?",
+           (json.dumps([fix]), t0 + 3 * 3600, rr))
+    late = _tp_task(p, "Review", t0 + 3 * 3600 + 60, labels=[f"auto_review:{fix}"])
+    p.db.x("UPDATE tasks SET kind='review' WHERE id=?", (late,))
+    _tp_run(p, late, t0 + 3 * 3600 + 120, t0 + 3 * 3600 + 700, role="reviewer")
+    p.db.x("INSERT INTO events(ts, source, kind, severity, text, status, task) VALUES(?,?,?,?,?,?,?)",
+           (t0 + 3 * 3600 + 60, "daemon", "review_unqueued", "low", f"#{fix} x: its commits had no review and "
+            f"were not landed; review #{late} queued by the daemon.", "handled", fix))
+    rep = throughput.measure(p.db, p.config(), now=now, gates={})
+    rs, rt = _tp_lane(rep, "review_sweep"), _tp_lane(rep, "review_stall")
+    assert rs["p90_s"] <= 60 and rt["p90_s"] <= 120, (rs, rt)
+    assert rs["backstop_count"] == 1 and rs["backstop_p90_s"] <= 60, rs
+    assert not rs["slow"], rs
+
+
 def test_throughput_never_proposes_a_review_stall_change(env, monkeypatch):
     from ttp import throughput
     p = make(env)

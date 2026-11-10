@@ -28,6 +28,9 @@ to its first run, or to now for one still queued:
   review.unreviewed_per_pass (against the backlog of tasks in review now). A review the unreviewed
   backstop queued (its review_unqueued event: the finish queued none, Daemon.sweep_unreviewed found it
   later) is counted apart (backstop): no limit holds it, so plan() names it whatever the provider gate.
+  Both lanes start a re-review's wait (a fix's re-review, a push-conflict rebase review) no earlier than
+  the end of an earlier review of the same task: while that one was open the task was under review, and
+  its wait is counted on that review's own row.
 - review_stall: the same end to the review's first run, against coordinator.review_stall_s (the age at
   which a waiting review is raised). Reported only: plan() never lowers it, since a sooner alarm starts
   no review sooner. Its waits the checks did not hold (free) are reported apart, as information.
@@ -819,6 +822,13 @@ def measure(db: DB, cfg: dict, since_s: float = DAY, now: float | None = None, g
     for e in db.q("SELECT ts, task FROM events WHERE kind IN ('task_review','task_done') AND task IS NOT NULL "
                   "AND ts>?", (t0 - DAY,)):
         handoff.setdefault(e["task"], []).append(float(e["ts"]))
+    # Earlier reviews covering a target (a re-review, a push-conflict rebase review): while one was open,
+    # the target was under review, so a later review's waits start once it ended, not at the target's end.
+    covers: dict[int, list[tuple[float, float, str]]] = {}
+    for r in db.q("SELECT id, parent, labels, depends_on, status, created, updated FROM tasks WHERE kind='review' "
+                  "AND created>? LIMIT ?", (t0 - DAY, ROWS)):
+        for tg in {_reviewed(r), *_deps(r)} - {None}:
+            covers.setdefault(tg, []).append((float(r["created"] or 0), float(r["updated"] or 0), r["status"]))
     for t in tasks:
         target = _reviewed(t) if t["kind"] == "review" else None
         if not target or float(t["created"] or 0) < t0:
@@ -828,6 +838,10 @@ def measure(db: DB, cfg: dict, since_s: float = DAY, now: float | None = None, g
             continue
         # The finish queues the review just before it writes the hand-off event (milliseconds apart).
         done = min(max(ends + [h for h in handoff.get(target, ()) if h <= float(t["created"]) + 60]), float(t["created"]))
+        c = float(t["created"])
+        for c0, up, st in covers.get(target, ()):
+            if c0 < c:   # open at this one's creation: it covered the whole span
+                done = max(done, min(up if st in ("done", "failed", "cancelled") else c, c))
         prio = int(t["priority"] or 3)
         add(rs, float(t["created"]) - done, prio, done, float(t["created"]), None, False)
         if slot_held(target, done, float(t["created"])):
