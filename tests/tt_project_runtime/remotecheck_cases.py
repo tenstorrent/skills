@@ -440,13 +440,31 @@ def test_check_host_settings_are_validated_and_local_keeps_a_check_here():
         push.with_host(push.check_list(["make c"]), "a b")[0])
 
 
+# The fake ssh runs a spill host's probe and checks on this machine. On macOS its device holder scan cannot
+# run (no GNU find), and a check script under its temp folder (/private/var/...) is a path of this machine,
+# which never spills; the Linux test hosts keep their temp folder under /dev/shm, a system folder.
+_GNU_FIND = pytest.mark.skipif(sys.platform != "linux", reason="the fake spill host's device scan needs GNU find")
+_LINUX_TMP = pytest.mark.skipif(sys.platform != "linux", reason="a check script under the macOS temp folder never spills")
+
+def _idle_probe(cores="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 8)"):
+    """checkspill's slots probe for the fake ssh, run on this machine: an idle host of `cores` cores (no
+    load, memory unread) with its running ttp-check.* folders counted, using no /proc or GNU tools, so it
+    reads the same on macOS (whose wc pads its count) as on Linux."""
+    from ttp import checkspill
+    return ("command -v git >/dev/null 2>&1 && command -v tar >/dev/null 2>&1 || exit 3\n"
+            f"c={cores}\n"
+            "n=$(find \"${TMPDIR:-/tmp}\" -maxdepth 1 -name 'ttp-check.*' -type d "
+            f"-mmin -{checkspill.RUNNING_MAX_AGE_MIN} 2>/dev/null | wc -l | tr -d ' ')\n"
+            "echo \"ttp-spill $c 0 $n 0\"\n")
+
+
 def _spill_setup(env, tmp_path, monkeypatch, hosts, charter=("check-host-a", "check-host-b", "down")):
     """A checks repo whose machines list has `charter` (also written as charter text, which no gate reads), spills to `hosts`
     after 0.3 s, has one checks lane, and the fake ssh on PATH reporting an idle host."""
     from ttp import checkspill, machines
     p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
     # The fake ssh runs the probe here: read an idle load, not this machine's (a busy test host has none).
-    monkeypatch.setattr(checkspill, "_PROBE", checkspill._PROBE.replace("cut -d' ' -f1 /proc/loadavg", "echo 0"))
+    monkeypatch.setattr(checkspill, "_PROBE", _idle_probe())
     p.charter_path.write_text("# Charter\n## Resources\n" + "".join(f"- {h}: a check host\n" for h in charter))
     for h in charter:
         machines.add(h)
@@ -565,6 +583,7 @@ def test_spill_skips_a_host_another_project_paused_by_alias_or_host_name_until_t
     assert checkspill.paused_elsewhere(p, "check-host-a") is None
 
 
+@_GNU_FIND
 def test_spill_hosts_set_while_a_run_waits_take_it_at_its_next_bound(env, tmp_path, monkeypatch):
     """delivery.checks_spill_hosts set after a run began waiting here: the run reads the setting again
     at its next bound and spills, without waiting for the lane here to free. It still runs and records
@@ -705,6 +724,7 @@ def test_a_run_with_the_host_wide_cap_full_spills_to_a_free_host_past_a_paused_o
     assert "check-host-c (paused: user hold)" in text and "spilling to check-host-a" in text, text
 
 
+@_LINUX_TMP
 def test_a_rerun_after_a_spill_host_keeps_off_only_the_host_it_failed_on(env, tmp_path, monkeypatch):
     """#6379: checks that fail on one spill host run again on the next free one (a pass there counts),
     never back on the one they failed on; with every listed host kept off, paused or full they wait
@@ -1000,6 +1020,7 @@ def test_spill_beside_device_takes_a_listed_host_with_a_device_job_but_keeps_pau
                 if "spill_beside_device" in x], bad
 
 
+@_GNU_FIND
 def test_spill_beside_device_lets_a_listed_host_take_a_run_while_its_probe_finds_a_device_holder(
         env, tmp_path, monkeypatch):
     """A device test that takes no lock on a host checks.spill_beside_device lists: the probe's holder scan
@@ -1183,6 +1204,7 @@ def _node_holder(node, cwd=None, env=None):
     return proc
 
 
+@_GNU_FIND
 def test_spill_skips_a_host_where_a_process_outside_the_pool_holds_a_device_node_open(env, tmp_path, monkeypatch):
     """A device test that takes no lock: the host's probe finds a process holding one of its device nodes
     open, so a new run skips the host, saying which pid and command, and `ttp status` shows it. The pool's
@@ -1820,7 +1842,8 @@ def test_a_check_naming_a_path_of_this_machine_never_spills_and_splits_off_to_ru
         assert checkspill.spillable(push.check_list([test]) + [c]), cmd
         assert not checkspill.check_spills(push.check_list([{"run": cmd, "spill": True}])[0]), cmd
     for cmd in (test, "/usr/bin/python3 -m pytest -q tests/ 2>/dev/null >/tmp/out.log", "sh tools/lint.sh",
-                "curl -fsS https://example.invalid/x", "/bin/sh -c 'make lint'", "git diff --quiet"):
+                "curl -fsS https://example.invalid/x", "/bin/sh -c 'make lint'", "git diff --quiet",
+                "pwd >> /srv/out.log", "make lint 2> /srv/err.log &> /srv/all.log"):
         assert not checkspill.host_path(cmd), cmd
     suite = push.check_list(["python3 -m pytest -q --rootdir=/srv/proj tests/"])[0]
     assert not checkspill.check_spills(suite) and not checkspill.stays_here(suite)
@@ -2964,7 +2987,7 @@ def test_a_spilled_run_gets_test_workers_sized_to_the_hosts_idle_cores_outside_i
     assert checkspill.workers_env(0) == {}
     assert checkspill.workers_env(3) == {testslots.SLOTS_ENV: "3", testslots.HELD_ENV: "3", testslots.XDIST_ENV: "3"}
     p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a"])
-    monkeypatch.setattr(checkspill, "_PROBE", checkspill._PROBE.replace("c=$(nproc", "c=$(echo 64 || nproc"))
+    monkeypatch.setattr(checkspill, "_PROBE", _idle_probe(64))
     seen = tmp_path / "seen"
     p.set_config("delivery.push_checks", [f"printf %s \"${testslots.SLOTS_ENV}\" > {seen}"])
     p.set_config("checks.test_run_max", 4)
@@ -3089,6 +3112,7 @@ def test_a_parked_run_re_executed_for_an_upgrade_tries_every_spill_host_again(en
     assert e.value.args[0] == (off if rerank else None)
 
 
+@_LINUX_TMP
 def test_the_same_import_failing_on_every_spill_host_is_one_config_fault_told_once_not_hosts_kept_off(
         env, tmp_path, monkeypatch):
     """A package the spill hosts' checks env lacks fails the checks at collection on each spill host: that is
@@ -3194,7 +3218,7 @@ def _spill_batch(env, tmp_path, monkeypatch, cmd):
     """A push queue project (_pq) whose batch checks may spill to the one allowed host check-host-a."""
     from ttp import checkspill, machines
     s = _pq(env, monkeypatch)
-    monkeypatch.setattr(checkspill, "_PROBE", checkspill._PROBE.replace("cut -d' ' -f1 /proc/loadavg", "echo 0"))
+    monkeypatch.setattr(checkspill, "_PROBE", _idle_probe())
     s.p.charter_path.write_text("# Charter\n## Resources\n- check-host-a: a check host\n")
     machines.add("check-host-a")
     s.p.set_config("delivery.push_checks", [cmd])
@@ -3237,7 +3261,7 @@ def _spill_push(env, tmp_path, monkeypatch, cmd):
     """A _push_setup project whose push checks (`cmd`) may spill to the one allowed host check-host-a."""
     from ttp import checkspill, machines
     p, repo, origin, other = _push_setup(env, monkeypatch, [cmd])
-    monkeypatch.setattr(checkspill, "_PROBE", checkspill._PROBE.replace("cut -d' ' -f1 /proc/loadavg", "echo 0"))
+    monkeypatch.setattr(checkspill, "_PROBE", _idle_probe())
     p.charter_path.write_text("# Charter\n## Resources\n- check-host-a: a check host\n")
     machines.add("check-host-a")
     p.set_config("delivery.checks_spill_hosts", ["check-host-a"])
@@ -3592,3 +3616,4 @@ def test_workers_on_a_remote_only_workstation_are_told_to_run_tests_through_ttp_
     assert "never a plain pytest or build here" in prompts.remote_only_line(on)
     assert prompts.remote_only_line({**on, "delivery": {**on["delivery"], "checks_remote_only": False}}) == ""
     assert prompts.remote_only_line({}) == ""
+

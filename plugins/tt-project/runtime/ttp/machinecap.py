@@ -329,15 +329,18 @@ def _others(data: dict, project: str, now: float) -> tuple[int, list[int]]:
 
 def publish(project: str, cfg: dict, running: int, now: float | None = None, home: Path | None = None,
             pid: int | None = None) -> None:
-    """Record this project's running workers (each dispatch pass, the limit on or off); a project with
-    the limit off publishes no limit of its own."""
+    """Record this project's running workers (each dispatch pass, the limit on or off). A project with
+    the limit on also records its set base and its limit now (from the stored reading, none read here),
+    so a lower machine.max_workers binds the others before it starts anything; with it off, neither."""
     now = time.time() if now is None else now
+    on = enabled(cfg)
     with _locked(home) as data:
-        e = data["projects"].get(project)
-        on = enabled(cfg)
-        e = e if isinstance(e, dict) and on else {}
-        data["projects"][project] = {**e, "pid": pid or os.getpid(), "at": now, "running": running,
-                                     **({"base": set_base(cfg)} if on else {})}
+        own = {}
+        if on:
+            sig = data.get("signals") if isinstance(data.get("signals"), dict) else {}
+            mine = set_base(cfg)
+            own = {"base": mine, "limit": in_force(mine, [], sig)}
+        data["projects"][project] = {"pid": pid or os.getpid(), "at": now, "running": running, **own}
 
 
 def check(project: str, cfg: dict, running: int, claim: bool = False, now: float | None = None,

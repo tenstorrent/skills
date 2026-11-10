@@ -10749,6 +10749,12 @@ def cmd_config(a) -> None:
             val = provallow.of(val, p.config().get("providers"))
         except ValueError as e:
             die(str(e))
+    if a.key == "machine.max_workers":
+        from .coordinator import _max_workers
+        try:
+            val = _max_workers(val)
+        except ValueError as e:
+            die(str(e))
     if a.key == "coordinator.conclusion_floor":
         from . import tierfloor
         try:

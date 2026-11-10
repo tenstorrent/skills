@@ -421,3 +421,51 @@ def test_machine_limit_holds_a_dispatch_start_with_its_words(env, monkeypatch):
     assert entry["running"] == 2 and entry["limit"] == 2, "a start claims its place"
     p.set_config("machine.worker_limit", "off")
     assert Daemon(p.base)._start_hold(t, core, ctx(5)) is None, "off: only the project's own cap"
+
+
+@pytest.mark.parametrize("word", ["null", "none", "auto", "Auto", None])
+def test_machine_max_workers_can_be_unset_back_to_its_default(env, monkeypatch, word):
+    """machine.max_workers null, none or auto (config_set or ttp config) is unset: the default base (half
+    the cores, 2 to 8) applies again; 0, -1, 1.5, true and words stay refused."""
+    from ttp import cli
+    from ttp import coordinator as coord
+    from ttp import machinecap as mc
+    p = make(env)
+    _config_clear_run_env(monkeypatch)
+    assert coord.apply(p, [{"type": "config_set", "key": "machine.max_workers", "value": 3}]) == []
+    assert p.raw_config()["machine"]["max_workers"] == 3
+    assert coord.apply(p, [{"type": "config_set", "key": "machine.max_workers", "value": word}]) == []
+    assert p.raw_config()["machine"]["max_workers"] is None and mc.set_base(p.config()) is None
+    cli.main(["config", p.name, "machine.max_workers", "2"])
+    assert p.raw_config()["machine"]["max_workers"] == 2
+    cli.main(["config", p.name, "machine.max_workers", word or "null"])
+    assert p.raw_config()["machine"]["max_workers"] is None
+    for bad in (0, -1, 1.5, True, "lots"):
+        assert coord.apply(p, [{"type": "config_set", "key": "machine.max_workers", "value": bad}]), bad
+        with pytest.raises(SystemExit):
+            cli.main(["config", p.name, "machine.max_workers", json.dumps(bad) if bad != "lots" else bad])
+    assert p.raw_config()["machine"]["max_workers"] is None
+
+
+def test_machine_limit_publish_alone_binds_a_lower_base_and_records_its_limit(tmp_path):
+    """Each dispatch pass publishes a limit-on project's base and its limit from the stored reading, so a
+    lower machine.max_workers binds the others before that project starts anything (its entry dropped or
+    never claimed); with the limit off it publishes neither."""
+    from ttp import machinecap as mc
+    home, now = tmp_path / "mhome", time.time()
+    sig = dict(_IDLE, at=now)
+    assert mc.check("big", _mcap_cfg(top=8), 3, now=now, home=home, read=lambda: sig) is None, "alone: 3 < 8"
+    mc.publish("small", _mcap_cfg(top=2), 0, now=now, home=home)   # no claim, nothing started
+    entry = json.loads((home / mc.STATE).read_text())["projects"]["small"]
+    assert entry["base"] == 2 and entry["limit"] == 2, entry
+    assert mc.check("big", _mcap_cfg(top=8), 1, now=now, home=home, read=lambda: sig) is None
+    assert mc.check("big", _mcap_cfg(top=8), 2, now=now, home=home, read=lambda: sig), "small's 2 binds"
+    data = json.loads((home / mc.STATE).read_text())   # a heavy reading stored: the limit published is cut
+    data["signals"] = _sustained(mc, dict(_IDLE, cpu_busy=0.99))
+    (home / mc.STATE).write_text(json.dumps(data))
+    mc.publish("small", _mcap_cfg(top=4), 0, now=now, home=home)
+    stored = json.loads((home / mc.STATE).read_text())
+    assert stored["projects"]["small"]["limit"] == mc.limit(4, stored["signals"]) < 4
+    mc.publish("small", _mcap_cfg(on="off", top=2), 0, now=now, home=home)
+    entry = json.loads((home / mc.STATE).read_text())["projects"]["small"]
+    assert "base" not in entry and "limit" not in entry and entry["running"] == 0

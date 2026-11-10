@@ -387,10 +387,24 @@ def _count(key: str, v, top: int) -> int:
     return int(n)
 
 
+def _max_workers(v):
+    """machine.max_workers: a whole number of at least 1, or null, none or auto for unset (half the
+    cores, machinecap.BASE_MIN..BASE_MAX)."""
+    if v is None or str(v).strip().lower() in ("null", "none", "auto"):
+        return None
+    try:
+        n = int(v) if not isinstance(v, bool) and float(v) == int(float(v)) else 0
+    except (TypeError, ValueError, OverflowError):
+        n = 0
+    if n < 1:
+        raise ValueError("machine.max_workers: give a whole number of at least 1, or null for the default")
+    return n
+
+
 USER_SETTABLE = {
     "budget.daily_usd": float, "budget.weekly_usd": float, "budget.reserve_pct": float,
     "budget.global_daily_usd": float, "budget.daily_target_usd": float, "budget.day_start": str, "budget.timezone": str,
-    "budget.max_parallel_workers": int, "machine.worker_limit": str, "machine.max_workers": int, "budget.urgent_extra_slots": int, "budget.urgent_preempt": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
+    "budget.max_parallel_workers": int, "machine.worker_limit": str, "machine.max_workers": _max_workers, "budget.urgent_extra_slots": int, "budget.urgent_preempt": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
     "coordinator.urgent_start_wait_min": int,
     "budget.urgent_topup": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
     "budget.reset_credits_auto": lambda v: str(v).lower() in ("1", "true", "yes", "on"),

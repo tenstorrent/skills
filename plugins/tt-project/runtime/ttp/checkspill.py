@@ -593,8 +593,10 @@ def host_path(c: Any) -> bool:
         return True
     for seg in segs:
         words = [w for _, _, w in seg]
+        target = False
         for j, w in enumerate(words):
-            if re.match(r"\d*>", w):   # an output redirection writes there: any host can
+            if target or re.match(r"&?\d*>", w):   # an output redirection writes there (`>f`, `> f`): any host can
+                target = not target and bool(re.fullmatch(r"&?\d*>[>|&]?", w))
                 continue
             if _host_word(w[1:] if w.startswith("<") else w):
                 return True
