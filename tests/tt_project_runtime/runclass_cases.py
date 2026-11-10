@@ -216,6 +216,7 @@ def test_a_question_with_no_tt_model_dispatches_to_sonnet_low_and_to_the_tt_mode
     from ttp import route, runclass
     from ttp.daemon import Daemon
     p = make(env)
+    p.set_config("core_provider", "claude")   # the cheap fallback is Claude's; make() bootstraps on "fake"
     d = Daemon(p.base)
     prov, tier, note = _route_dispatch(p, d, monkeypatch, title="why is it slow", kind="question", tier="standard")
     assert prov == "claude" and note[runclass.KEY] == "status_report"
