@@ -783,6 +783,8 @@ UNREVIEWED_PASS_S = 20         # the pass stops looking after this long, so the 
 UNREVIEWED_BACKLOG_EVERY_S = 100   # after a cut pass that queued a review (a backlog): the next pass this soon
 KV_UNREVIEWED_COUNTED = "unreviewed_counted"   # kv: the runtime version whose first sweep logged its count
 KV_REVIEW_UNREAD = "review_unread"   # kv: task ids whose review a timed-out git read left unqueued (retry_unread_reviews)
+KV_REVIEW_RETRY = "review_read_retry"   # kv: {task id: first failure} of code tasks whose review's diff read failed
+REVIEW_RETRY_KEEP_S = 7 * 86400   # a read retry the sweep has not settled by then is dropped (logged)
 PUSH_REFS_EVERY_S = 600   # how often the push queue's pins (refs/ttp/push/<id>) of settled rows are pruned
 
 
@@ -18041,6 +18043,7 @@ class Daemon:
                         (now - age, now - UNREVIEWED_GRACE_S))
             todo = self._late_continued(todo, now - age, now - UNREVIEWED_GRACE_S)
             self._count_unreviewed(todo)
+            todo, retry = self._read_retries(todo, now)
             if not todo:
                 return []
             code = pushq.BranchIndex(db.q("SELECT id, branch, labels FROM tasks WHERE kind='code' "
@@ -18060,12 +18063,15 @@ class Daemon:
         except Exception:
             log(self.p, "unreviewed sweep failed\n" + traceback.format_exc())
             return []
-        hot = 0   # urgent tasks' reviews: counted against no cap, and they wait for no sweep_after_s
+        hot = 0   # urgent tasks' reviews and read retries: counted against no cap (urgent ones wait for no sweep_after_s)
         # A pass cut off (UNREVIEWED_PASS_S, the step's budget, or stopped mid-task) resumes after the task
         # it stopped at, wrapping round, so a slow early task never keeps the later ones from their turn.
         at, last = self._unreviewed_at, None
-        for t in urgent.first([r for r in todo if r["id"] > at] + [r for r in todo if r["id"] <= at]):
-            if len(done) - hot >= cap and not urgent.is_urgent(t) or last is not None and (
+        # A task whose review's diff read failed (_auto_review, KV_REVIEW_RETRY) goes first: a backlog behind
+        # the per-pass cap once kept one unreviewed for 14 h.
+        order = urgent.first([r for r in todo if r["id"] > at] + [r for r in todo if r["id"] <= at])
+        for t in [r for r in order if r["id"] in retry] + [r for r in order if r["id"] not in retry]:
+            if len(done) - hot >= cap and not urgent.is_urgent(t) and t["id"] not in retry or last is not None and (
                     time.time() - now > UNREVIEWED_PASS_S or stepclock.over()):   # each pass gets one task further
                 self._unreviewed_at = at if last is None else last
                 if done:   # cut with more to look at after queuing one: a backlog, so look again sooner
@@ -18079,6 +18085,8 @@ class Daemon:
                         urgent.is_urgent(t) or obligations.owned_open(db, t["id"])):
                     self._unreviewed_why[t["id"]] = why
                     log(self.p, f"task {t['id']}: {t['status']}, no review queued by the unreviewed sweep: {why}")
+                if t["id"] in retry:   # settled by this attempt; a read that fails again records it again
+                    self._settle_read_retry(t["id"], why)
                 if why:
                     continue
                 review = self._auto_review(t, str(load_result(t["result"]).get("summary") or ""), add=True)
@@ -18087,7 +18095,7 @@ class Daemon:
                 continue
             if review and review[1]:
                 done.append(t["id"])
-                hot += urgent.is_urgent(t)
+                hot += urgent.is_urgent(t) or t["id"] in retry
                 log(self.p, f"task {t['id']}: {t['status']} with an unlanded head and no review; queued review "
                             f"#{review[0]}")
                 db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
@@ -18097,6 +18105,44 @@ class Daemon:
         else:
             self._unreviewed_at = 0   # an uncut pass leaves no place to resume at
         return done
+
+    def _read_retries(self, todo: list[dict], now: float) -> tuple[list[dict], set[int]]:
+        """sweep_unreviewed's `todo` plus the done or queued code tasks with a branch that KV_REVIEW_RETRY
+        names (their review's diff read failed in _auto_review), whatever their age, and those ids. An
+        entry for a task that is no longer such a task, or older than REVIEW_RETRY_KEEP_S, is dropped with
+        a log line."""
+        db = self.p.db
+        marks, _ = db.kv_dict(KV_REVIEW_RETRY)
+        if not marks:
+            return todo, set()
+        have, keep, add = {t["id"] for t in todo}, {}, []
+        for k, when in marks.items():
+            t = db.task(int(k)) if str(k).isdigit() else None
+            try:
+                when = float(when)
+            except (TypeError, ValueError):   # a hand-edited mark restarts its clock, never stops the sweep
+                when = now
+            why = "no such task" if not t else "no longer a finished code task with a branch" if (
+                t["kind"] != "code" or t["status"] not in ("done", "queued") or not t.get("branch")) else \
+                f"not settled in {REVIEW_RETRY_KEEP_S // 86400} days" if now - when > REVIEW_RETRY_KEEP_S else ""
+            if why:
+                log(self.p, f"task {k}: review read retry dropped: {why}")
+                continue
+            keep[k] = when
+            if t["id"] not in have:
+                add.append(t)
+        if keep != marks:
+            db.set_kv(KV_REVIEW_RETRY, keep)
+        return (sorted(todo + add, key=lambda t: t["id"]) if add else todo), {int(k) for k in keep}
+
+    def _settle_read_retry(self, tid: int, why: str) -> None:
+        """Drop task `tid`'s KV_REVIEW_RETRY entry before the sweep's attempt (logged with the skip reason,
+        if any): a read that fails again (_auto_review) records it again."""
+        db = self.p.db
+        marks, _ = db.kv_dict(KV_REVIEW_RETRY)
+        if marks.pop(str(tid), None) is not None:
+            db.set_kv(KV_REVIEW_RETRY, marks)
+            log(self.p, f"task {tid}: review read retried by the unreviewed sweep" + (f"; left alone: {why}" if why else ""))
 
     def _late_continued(self, todo: list[dict], since: float, until: float) -> list[dict]:
         """sweep_unreviewed's `todo` plus the done or queued code tasks with a branch whose own update is older
@@ -18390,6 +18436,10 @@ class Daemon:
             if add and isinstance(e, subprocess.TimeoutExpired):
                 ids = db.kv(KV_REVIEW_UNREAD, [])
                 db.set_kv(KV_REVIEW_UNREAD, sorted({*(ids if isinstance(ids, list) else []), task["id"]}))
+            if add and task.get("id"):   # the unreviewed sweep retries it first, outside its cap and age window
+                retry, _ = db.kv_dict(KV_REVIEW_RETRY)
+                retry.setdefault(str(task["id"]), time.time())
+                db.set_kv(KV_REVIEW_RETRY, retry)
             return None
         if (not changes and not ext) or coord.next_task_slot(db, coord.task_cap(cfg, True), review=True) is not None:
             return None

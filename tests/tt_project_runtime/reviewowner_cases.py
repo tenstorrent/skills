@@ -190,6 +190,46 @@ def test_o424_a_done_code_task_whose_review_enqueue_timed_out_gets_its_review_fr
     assert d.sweep_unreviewed(force=True) == []
 
 
+def test_7144_a_failed_review_read_is_retried_first_by_the_sweep_outside_its_cap_and_age_window(env, monkeypatch):
+    """Replay of #7144: the hand-off's diff read timed out ('timed out after 0 seconds'), so no review was
+    queued, and a backlog behind review.unreviewed_per_pass left it unreviewed for 14 h. The failed read
+    is recorded (KV_REVIEW_RETRY); the sweep retries it first, counted against no cap, even past
+    review.unreviewed_max_age_h; the mark clears once settled, a read that fails again records it again,
+    and an unreadable mark never stops the sweep."""
+    import subprocess
+    from ttp import worktree
+    from ttp import daemon as dm
+    p = _owner_project(env)
+    p.set_config("review.unreviewed_per_pass", 1)
+    older, _ = _owner_unreviewed(env, p, "older backlog")
+    real = worktree.diff_lines
+    def expired(*a, **k):
+        raise subprocess.TimeoutExpired(["git", "rev-list", "-n1", "x", "--not", "y"], 0)
+    monkeypatch.setattr(worktree, "diff_lines", expired)
+    tid, branch, _, reviews = _finish_code(env, p, "read failed", {"read_failed.py": 20})
+    assert not reviews and list(p.db.kv(dm.KV_REVIEW_RETRY)) == [str(tid)]
+    # The sweep's own read fails too: the mark stays for the next pass, nothing is queued for it.
+    _owner_aged(p, older, time.time() - 600)
+    _owner_aged(p, tid, time.time() - 100 * 3600)   # past the 72 h window
+    d = dm.Daemon(p.base)
+    assert tid not in d.sweep_unreviewed(force=True) and list(p.db.kv(dm.KV_REVIEW_RETRY)) == [str(tid)]
+    monkeypatch.setattr(worktree, "diff_lines", real)
+    newer, _ = _owner_unreviewed(env, p, "newer backlog")
+    _owner_aged(p, newer, time.time() - 600)
+    got = d.sweep_unreviewed(force=True)
+    assert got[0] == tid and len(got) == 2, got   # the retry first, plus one routine review under the cap
+    assert len(_owner_reviews_of(p, tid)) == 1 and branch in _owner_reviews_of(p, tid)[0]["spec"]
+    assert p.db.kv(dm.KV_REVIEW_RETRY) == {}
+    assert d.sweep_unreviewed(force=True) == [newer if older in got else older]
+    # A mark for a missing task or with an unreadable time is dropped or restarted, never a failed sweep.
+    lines = []
+    monkeypatch.setattr(dm, "log", lambda proj, msg: lines.append(msg))
+    p.db.set_kv(dm.KV_REVIEW_RETRY, {"999999": "garbage", "x": 1, str(older): "garbage"})
+    assert d.sweep_unreviewed(force=True) == [] and p.db.kv(dm.KV_REVIEW_RETRY) == {}
+    assert [ln for ln in lines if "review read retry dropped: no such task" in ln], lines
+    assert not [ln for ln in lines if "unreviewed sweep failed" in ln], lines
+
+
 def _owner_aged(p, tid, when):
     p.db.x("UPDATE tasks SET updated=? WHERE id=?", (when, tid))
     p.db.x("UPDATE runs SET ended=? WHERE task=?", (when, tid))
