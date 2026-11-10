@@ -20,7 +20,8 @@ argv alone, with no per-call-site knowledge:
   round of the attempt that read it (gitmemo.strict), then dropped.
 Outside an attempt, within gitmemo.kept_reads() (the daemon's tick loop), only immutable and
 ref-dependent answers are served and kept, so a ref or HEAD read the daemon repeats every tick runs
-git once per ref value; worktree, index and the other volatile reads always run git."""
+git once per ref value; worktree, index and the other volatile reads always run git. Those tick-kept
+answers are capped by themselves (MAX_TICK_BYTES): trimming them never evicts an attempt's answers."""
 
 from __future__ import annotations
 
@@ -41,7 +42,7 @@ MAX_BYTES = 256 * 1024 * 1024        # output kept in all
 MAX_ENTRY_BYTES = 4 * 1024 * 1024    # one answer larger is kept only for the next round ("once")
 VOLATILE_MAX_AGE_S = 30.0
 MAX_TICK_ENTRY_BYTES = 256 * 1024    # a larger answer a tick read (outside an attempt) is not kept
-MAX_TICK_BYTES = 32 * 1024 * 1024    # a tick read's answer is kept only with all output under this
+MAX_TICK_BYTES = 32 * 1024 * 1024    # output tick reads keep in all (their oldest go first)
 IMM, REF, VOL, ONCE = "immutable", "ref", "volatile", "once"
 # subprocess.run arguments a kept answer can stand in for
 _KW = frozenset({"capture_output", "stdout", "stderr", "stdin", "input", "text", "universal_newlines", "encoding",
@@ -63,6 +64,7 @@ _PSEUDO = re.compile(r"[A-Z_]+")
 _lock = threading.Lock()
 _memo: collections.OrderedDict = collections.OrderedDict()   # key -> Entry, oldest first
 _bytes = [0]
+_tick_bytes = [0]                                            # of the entries a tick read kept (att None)
 _loose: dict[str, tuple[tuple, str | None]] = {}             # ref file -> (stat, contents)
 _packed: dict[str, tuple[tuple, dict[str, str]]] = {}        # packed-refs -> (stat, name -> value)
 stats = collections.Counter()                                # hits, kept, dropped (for tests and the log)
@@ -93,6 +95,7 @@ def clear() -> None:
     with _lock:
         _memo.clear()
         _bytes[0] = 0
+        _tick_bytes[0] = 0
         _loose.clear()
         _packed.clear()
         stats.clear()
@@ -323,12 +326,14 @@ def _drop(kk) -> None:
     e = _memo.pop(kk, None)
     if e is not None:
         _bytes[0] -= e.size
+        if e.att is None:
+            _tick_bytes[0] -= e.size
 
 
 def put(k: Key, r: subprocess.CompletedProcess | None, att_id: int | None, round_no: int) -> None:
     """Keep git's answer `r` to `k` (None: it timed out), classified by k.pre (read before it ran).
     Outside an attempt (`att_id` None: gitmemo.kept_reads) only an immutable or ref-dependent answer
-    up to MAX_TICK_ENTRY_BYTES is kept."""
+    up to MAX_TICK_ENTRY_BYTES is kept, and only tick-kept answers are trimmed to MAX_TICK_BYTES."""
     kind, deps, cstamp = k.pre or (VOL, (), None)
     rc = None if r is None else r.returncode
     out, err = (None, None) if r is None else (r.stdout, r.stderr)
@@ -347,8 +352,15 @@ def put(k: Key, r: subprocess.CompletedProcess | None, att_id: int | None, round
         _drop(k.k)
         _memo[k.k] = e
         _bytes[0] += e.size
+        if att_id is None:
+            _tick_bytes[0] += e.size
         stats["kept"] += 1
-        while _bytes[0] > (MAX_BYTES if att_id is not None else MAX_TICK_BYTES) and len(_memo) > 1:
+        if _tick_bytes[0] > MAX_TICK_BYTES:
+            for kk in [kk for kk, o in _memo.items() if o.att is None and kk != k.k]:
+                if _tick_bytes[0] <= MAX_TICK_BYTES:
+                    break
+                _drop(kk)
+        while _bytes[0] > MAX_BYTES and len(_memo) > 1:
             _drop(next(iter(_memo)))
 
 

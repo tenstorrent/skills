@@ -1455,6 +1455,49 @@ def test_kept_reads_keep_no_large_or_volatile_answer(tmp_path, monkeypatch):
     assert len(gitreplay._memo) == 1 and gitreplay._bytes[0] <= 400, "all tick answers stay under MAX_TICK_BYTES"
 
 
+def test_a_tick_read_trims_only_tick_kept_answers_never_a_finish_attempt_s(tmp_path, monkeypatch):
+    """The tick loop's answers are capped by themselves (MAX_TICK_BYTES): a tick read past that cap
+    evicts the oldest tick-kept answers only. A finish attempt's answers, kept for its strict rounds,
+    stay however large, so its next round replays them instead of missing (GitMiss)."""
+    import contextvars
+    from ttp import gitmemo, gitreplay
+    repo = tmp_path / "r"
+    env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t",
+           "GIT_COMMITTER_EMAIL": "t@t"}
+    repo.mkdir()
+    subprocess.run(["git", "-C", str(repo), "init", "-q", "-b", "main"], check=True)
+    for name in ("f", "g"):
+        (repo / name).write_text(name * 64)
+    subprocess.run(["git", "-C", str(repo), "add", "f", "g"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "one"], check=True, env=env)
+    gitreplay.clear()
+    spawns = _record_spawns(monkeypatch)
+    monkeypatch.setattr(gitreplay, "MAX_TICK_ENTRY_BYTES", 1024)
+    monkeypatch.setattr(gitreplay, "MAX_TICK_BYTES", 400)
+    git = lambda *a: gitmemo.run(["git", "-C", str(repo), *a], capture_output=True, text=True)   # noqa: E731
+    att_reads = [("status", "--porcelain"), ("ls-files",), ("show", "HEAD:f"), ("show", "HEAD:g")]
+
+    def tick():
+        with gitmemo.kept_reads():
+            git("cat-file", "-p", "HEAD:f")
+            git("cat-file", "-p", "HEAD:g")
+
+    with gitmemo.attempt() as a:
+        for r in att_reads:
+            git(*r)
+        att_keys = {kk for kk, e in gitreplay._memo.items() if e.att == a.id}
+        assert len(att_keys) == len(att_reads) and gitreplay._bytes[0] > 400, "the attempt holds over the tick cap"
+        contextvars.Context().run(tick)     # the tick loop, outside the attempt
+        tick_keys = [kk for kk, e in gitreplay._memo.items() if e.att is None]
+        assert att_keys <= set(gitreplay._memo), "a tick read evicts none of the attempt's answers"
+        assert len(tick_keys) == 1 and gitreplay._tick_bytes[0] <= 400, "tick answers are trimmed to their cap"
+        assert gitreplay._tick_bytes[0] == sum(gitreplay._memo[kk].size for kk in tick_keys)
+        n = len(spawns)
+        for r in att_reads:
+            git(*r)
+        assert len(spawns) == n, "the attempt's next round replays every answer it kept"
+
+
 def _record_spawns(monkeypatch) -> list:
     """Every git gitmemo spawns from here on. The system config lookup (gitcache._system_config, a
     `git var` asked once per process, before the first kept read) is pinned, so the count does not
