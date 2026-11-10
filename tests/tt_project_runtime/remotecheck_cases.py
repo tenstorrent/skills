@@ -187,7 +187,8 @@ def test_a_remote_check_tries_again_on_its_own_connection_when_the_shared_one_re
     from ttp import remotecheck
     repo = _rc_repo(tmp_path)
     mux = tmp_path / "mux"
-    for on in ("ttp-remote-rc", "ttp-send", "mktemp"):
+    for i, on in enumerate(("ttp-remote-rc", "ttp-send", "mktemp")):
+        _rc_commit(repo, f"n{i}.txt")   # a commit the mirror lacks: each check sends a bundle
         mux.write_text("1")
         Path(f"{mux}.log").unlink(missing_ok=True)
         rc, said = _rc_run(tmp_path, repo, "echo ran-here; exit 3", FAKE_SSH_MUX=str(mux), FAKE_SSH_MUX_ON=on)
@@ -4023,8 +4024,8 @@ def test_a_host_without_usable_git_gets_the_tree_over_a_compressed_ssh(tmp_path)
 
 
 def test_a_new_mirror_is_seeded_from_the_clone_on_the_host_that_checks_seed_names(tmp_path):
-    """`delivery.checks_seed` names a clone already on the host: a new mirror fetches its HEAD there first
-    (the clone is only read), and only the commits it lacks are sent from here."""
+    """`delivery.checks_seed` names a clone already on the host: a new mirror fetches its branches there first
+    (the clone is only read), and only the commits after the newest one both sides have are sent from here."""
     repo = _rc_repo(tmp_path)
     for i in range(6):
         _rc_commit(repo, f"s{i}.txt", os.urandom(20000))
@@ -4035,7 +4036,7 @@ def test_a_new_mirror_is_seeded_from_the_clone_on_the_host_that_checks_seed_name
     proj = tmp_path / "proj" / "tt-project" / "harness"
     proj.mkdir(parents=True)
     (proj / "project.json").write_text(json.dumps({"delivery": {"checks_seed": {"box1": str(clone)}}}))
-    rc, said = _rc_run(tmp_path, repo, "cat new.txt", TTP_PROJECT=str(tmp_path / "proj"))
+    rc, said = _rc_run(tmp_path, repo, "cat new.txt", TTP_PROJECT=str(tmp_path / "proj"), TTP_REMOTE_SEED_SAMPLE="1")
     assert rc == 0 and "seeded box1's mirror from" in said, said
     assert len(_rc_sent(said)) == 1 and _rc_sent(said)[0] < 0.05, said
     assert subprocess.run(["git", "-C", str(clone), "for-each-ref"], capture_output=True, text=True).stdout == before

@@ -420,7 +420,10 @@ def _watch(proc, progress, label: str, deadline: float, stall_s: float | None) -
         return ""
     finally:
         if proc.poll() is None:
-            proc.kill()
+            try:   # its own process group (start_new_session): what ssh started here goes with it
+                os.killpg(proc.pid, signal.SIGKILL)
+            except OSError:
+                proc.kill()
             proc.wait()
 
 
@@ -433,7 +436,8 @@ def _host_step(host: str, script: str, direct: bool, deadline: float, label: str
     """Runs `script` on the host: "", or why it failed (LINK: ssh's, MUX: its shared connection refused).
     `said` gets what it printed."""
     with tempfile.TemporaryFile() as out:
-        proc = subprocess.Popen(_ssh(host, script, direct), stdin=subprocess.DEVNULL, stdout=out, stderr=out)
+        proc = subprocess.Popen(_ssh(host, script, direct), stdin=subprocess.DEVNULL, stdout=out, stderr=out,
+                                start_new_session=True)
         why = _watch(proc, lambda: "", label, deadline, None)
         text = _tail(out)
     if said is not None:
@@ -458,13 +462,20 @@ def seed_path(host: str) -> str:
     return path if isinstance(path, str) and SEED_RE.fullmatch(path) and ".." not in path else ""
 
 
-def _seed_script(mirror: str, seed: str) -> str:
-    """The host's side: fetches the seed clone's HEAD into the mirror as a base ref and prints it. A plain
-    fetch from that path reads it and never writes there."""
-    m, t = shlex.quote(mirror), "refs/heads/seed-in"
+SEED_SAMPLE = 25    # every this many first-parent commits of the head, one is asked for in a freshly seeded mirror
+
+
+def _seed_script(mirror: str, seed: str, ours: list[str]) -> str:
+    """The host's side: fetches the seed clone's branches into the mirror (refs/seed/; a plain fetch from
+    that path reads it and never writes there), then makes the newest of `ours` (commits of the head here,
+    newest first) the mirror has a base ref and prints it. Its own commits may differ from ours (a rebase
+    rewrites them): only one both sides have saves a copy."""
+    m = shlex.quote(mirror)
     return (f"set -e; s={shlex.quote(seed)}; git -C \"$s\" rev-parse -q --verify HEAD >/dev/null; "
-            f"git -C {m} fetch -q --no-tags --no-write-fetch-head \"$s\" +HEAD:{t}; b=$(git -C {m} rev-parse {t}); "
-            f"git -C {m} update-ref refs/heads/base/$b $b; git -C {m} update-ref -d {t}; echo \"{BASE_MARK}$b\"")
+            f"git -C {m} fetch -q --no-tags --no-write-fetch-head \"$s\" '+refs/heads/*:refs/seed/heads/*' "
+            f"'+refs/remotes/*:refs/seed/remotes/*'; for c in {' '.join(ours)}; do "
+            f"if git -C {m} cat-file -e \"$c^{{commit}}\" 2>/dev/null; then "
+            f"git -C {m} update-ref refs/heads/base/$c $c; echo \"{BASE_MARK}$c\"; break; fi; done")
 
 
 def _objects(top: str) -> str:
@@ -485,7 +496,7 @@ def _copy(host, source: list[str], script: str, direct: bool, deadline: float, l
     with tempfile.TemporaryFile() as out:
         src = subprocess.Popen(source, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         proc = subprocess.Popen(_copy_argv(host, script, direct, compress), stdin=subprocess.PIPE, stdout=out,
-                                stderr=out)
+                                stderr=out, start_new_session=True)
         pumper = threading.Thread(target=_pump, args=(src.stdout, proc.stdin, sent), daemon=True)
         t0 = time.monotonic()
         pumper.start()
@@ -629,7 +640,9 @@ def _attempt(host, top, head, env, extra, cmd, mark, wrap, wait) -> tuple[int, s
         copied = False
         if mirror and not bases and (seed := seed_path(host)):   # a new mirror: from the clone there first
             said: list = []
-            why = _host_step(host, _seed_script(mirror, seed), direct, deadline,
+            ours = _git("-C", top, "rev-list", "--first-parent", head).split()[::int(_knob("TTP_REMOTE_SEED_SAMPLE",
+                                                                                         SEED_SAMPLE)) or 1]
+            why = _host_step(host, _seed_script(mirror, seed, ours[:2000]), direct, deadline,
                              f"seeding {host}'s mirror from {seed} there", said)
             if why.startswith(MUX):
                 return FAULT_RC, why[len(MUX):]
@@ -637,7 +650,8 @@ def _attempt(host, top, head, env, extra, cmd, mark, wrap, wait) -> tuple[int, s
                 return _fault(host, why[len(LINK):]), ""
             bases = [ln.strip()[len(BASE_MARK):] for ln in "".join(said).splitlines()
                      if ln.strip().startswith(BASE_MARK)]
-            _say(f"{why}; sending the whole history instead" if why else f"seeded {host}'s mirror from {seed}")
+            _say(f"{why}; sending the whole history instead" if why else
+                 f"seeded {host}'s mirror from {seed}" + ("" if bases else ": it has none of this history"))
         if mirror:
             ref = f"refs/heads/check/{int(time.time())}-{secrets.token_hex(6)}"
             why = _push(host, top, head, mirror, ref, bases, direct, deadline)

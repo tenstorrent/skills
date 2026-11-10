@@ -2150,7 +2150,10 @@ session and stateless coordinators on every provider.
   tt-project folder (`check-mirrors/`, beside `checks-env/`): each check streams a git bundle of only the
   commits the mirror lacks over ssh (KBs once the mirror is seeded; a new mirror is seeded in steps, and a
   check cut short resumes the seeding), checks it out into a fresh folder and removes the folder and its
-  ref afterwards. A host without usable git gets the tree over a compressed ssh instead. A copy prints its
+  ref afterwards. A new mirror is first filled from a clone already on that host when
+  `delivery.checks_seed` names one (`{"<host>": "<absolute path>"}`; that clone is only read), so only the
+  commits after the newest one both share cross the link. No tree is sent from here: a host without usable
+  git is the host's fault, unless `TTP_REMOTE_TREE_COPY=1` sends it the tree over a compressed ssh. A copy prints its
   progress every 30 s (`TTP_REMOTE_PROGRESS_S`); one past its limit (`TTP_REMOTE_COPY_LIMIT_S`, default
   540 s) or with nothing moving for 300 s (`TTP_REMOTE_COPY_STALL_S`) is the host's fault: the check waits
   or runs elsewhere, never failing the change.
