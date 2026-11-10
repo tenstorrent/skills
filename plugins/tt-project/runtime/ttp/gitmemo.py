@@ -290,8 +290,101 @@ def on_audit(event: str, args: tuple) -> None:
     rd.raw_t0 = time.monotonic()
 
 
+# pass(): the reads one dispatch pass answers once per repository, by their arguments from the verb
+# on. Nothing a pass does between two of them changes their answer: a worktree add, a fork-point ref
+# or a lock leaves the repository's own checkout as it was. A call that may move a checkout (MOVES)
+# drops that repository's memo; `fetch` drops it too and then counts as done for the pass.
+_PASS_READS = frozenset({
+    ("rev-parse", "--verify", "--quiet", "HEAD"),
+    ("symbolic-ref", "--quiet", "--short", "HEAD"),
+    ("symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"),
+    ("status", "--porcelain=v1", "-z", "--untracked-files=no", "--ignore-submodules=dirty"),
+})
+_PASS_FETCH = ("fetch", "--quiet", "origin")
+MOVES = frozenset({"checkout", "switch", "reset", "rebase", "merge", "commit", "cherry-pick", "revert", "am",
+                   "pull", "stash", "branch", "restore", "rm", "mv", "add", "apply", "symbolic-ref", "update-ref",
+                   "fetch", "worktree", "submodule", "read-tree", "update-index"})
+_pass: contextvars.ContextVar[dict | None] = contextvars.ContextVar("ttp_gitpass", default=None)
+
+
+@contextlib.contextmanager
+def dispatch_pass() -> Iterator[dict]:
+    """Within it, each _PASS_READS read and one `fetch --quiet origin` per repository run once; the same
+    call again gets the kept answer. A daemon dispatch pass starts several runs, and each start read
+    the project root's head, branch and status and fetched origin again: on a loaded machine where one
+    git spawn takes seconds that cost the pass its step budget after a start or two. A worker that moves
+    the root's checkout meanwhile is seen by the next pass. A nested scope shares the outer one's."""
+    m = _pass.get()
+    token = _pass.set({} if m is None else m)
+    try:
+        yield _pass.get()
+    finally:
+        _pass.reset(token)
+
+
+def _repo_dir(argv, kw: dict) -> str:
+    a = [str(x) for x in argv[1:]]
+    for i, x in enumerate(a[:-1]):
+        if x == "-C":
+            return a[i + 1]
+        if not x.startswith("-"):
+            break
+    return str(kw.get("cwd") or ".")
+
+
+def _moves(args: tuple) -> bool:
+    """Whether git `args` may move a checkout or its refs, so a pass memo of its repository is stale."""
+    if not args or args[0] not in MOVES:
+        return False
+    if args[0] == "worktree":   # add, lock and list leave the repository's own checkout alone
+        return len(args) > 1 and args[1] in ("move", "repair")
+    if args[0] == "update-ref":   # the harness's own refs (fork points) are no branch or HEAD
+        refs = [x for x in args[1:] if not x.startswith("-")]
+        return not (refs and refs[0].startswith("refs/ttp/"))
+    if args[0] == "symbolic-ref":   # its read form names one ref; a second argument sets it
+        return len([x for x in args[1:] if not x.startswith("-")]) > 1
+    return True
+
+
+def _pass_run(memo: dict, argv, kw: dict, timeout: float | None, read: bool | None) -> subprocess.CompletedProcess:
+    args = git_args(argv)
+    repo = _repo_dir(argv, kw)
+    if args == _PASS_FETCH and ("fetched", repo) in memo:
+        return subprocess.CompletedProcess(list(argv), 0, "" if kw.get("text") else b"", "" if kw.get("text") else b"")
+    key = (repo, args, bool(kw.get("text") or kw.get("universal_newlines")), "input" in kw)
+    if args in _PASS_READS and key in memo:
+        r = memo[key]
+        if kw.get("check") and r.returncode:
+            raise subprocess.CalledProcessError(r.returncode, r.args, r.stdout, r.stderr)
+        return r
+    keep = args in _PASS_READS and "input" not in kw
+    check = bool(kw.pop("check", False)) if keep else False   # a failing read is kept too, then raised
+    try:
+        r = _run(argv, timeout=timeout, read=read, **kw)
+    finally:
+        if _moves(args):
+            for k in [k for k in memo if k[0] == repo]:
+                del memo[k]
+        if args == _PASS_FETCH:   # failed or timed out too: one more try in this pass would do the same
+            memo[("fetched", repo)] = True
+    if keep:
+        memo[key] = r
+        if check and r.returncode:
+            raise subprocess.CalledProcessError(r.returncode, r.args, r.stdout, r.stderr)
+    return r
+
+
 def run(argv: list | tuple, *, timeout: float | None = None, read: bool | None = None,
         **kw: Any) -> subprocess.CompletedProcess:
+    """_run() within a dispatch_pass() memo, else as it is."""
+    memo = _pass.get()
+    if memo is not None and _att.get() is None:
+        return _pass_run(memo, argv, kw, timeout, read)
+    return _run(argv, timeout=timeout, read=read, **kw)
+
+
+def _run(argv: list | tuple, *, timeout: float | None = None, read: bool | None = None,
+         **kw: Any) -> subprocess.CompletedProcess:
     """The one way a runtime git helper runs git (subprocess.run's arguments): its own `timeout` is
     capped by timeout() for the verb argv names (`read` as there). Within an attempt a read's answer
     is kept and replayed; within a strict round a read's miss runs live only within the slice (a write

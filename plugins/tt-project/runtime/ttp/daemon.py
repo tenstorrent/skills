@@ -11065,7 +11065,8 @@ class Daemon:
             log(self.p, "slot reservations failed\n" + traceback.format_exc())
             self._slot_resv_pass = {}
         try:
-            self._dispatch(busy)
+            with gitmemo.dispatch_pass():   # each start's reads of the root's checkout and its fetch: once
+                self._dispatch(busy)
             self._dispatch_pass_at = began   # check_unstarted: a pass that began after a gate cleared
         finally:
             self._slot_resv_pass = None

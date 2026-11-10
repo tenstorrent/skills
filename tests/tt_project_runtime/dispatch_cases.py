@@ -2310,3 +2310,64 @@ def test_a_workers_start_reads_no_git_per_unlanded_branch(env, monkeypatch):
     calls.clear()
     overlap.prompt_block(p, p.db.task(q))
     assert len(calls) <= 8, calls
+
+
+def test_slow_git_dispatch_starts_every_ready_task_in_one_step(env, monkeypatch, tmp_path, reap_tmp_processes):
+    """On a loaded machine each git call is slow; each start re-read the root checkout's head, branch and
+    status and fetched origin, so a dispatch step's budget ran out after a start or two and the rest
+    waited a tick each. Within one dispatch pass those reads and the fetch run once: 4 ready tasks and
+    4 free places all start within one step budget (75 git calls took ~45 s here before, 50 take ~28 s)."""
+    from ttp import stepclock
+    p, d, drain, settle = _slot_setup(env, monkeypatch, tmp_path, slots=4)
+    try:
+        for i in range(4):
+            p.db.add_task(f"urgent code {i}", "s", kind="code", tier="light", origin="user", priority=1)
+        calls = _slow_git(tmp_path, monkeypatch, 0.4)
+        monkeypatch.setattr(d, "_step_budget", lambda: 36.0)
+        stepclock.install()
+        try:
+            d._run_step(d.dispatch)
+        finally:
+            stepclock.uninstall()
+        assert sorted(_slot_tasks(p)) == [1, 2, 3, 4], "every ready task starts within one step"
+        said = [" ".join(line.split()[1:]) for line in calls.read_text().splitlines()]
+        root = f"-C {p.root} "
+        for read in ("fetch --quiet origin", "status --porcelain=v1", "symbolic-ref --quiet --short refs/remotes/origin/HEAD"):
+            assert sum(c.startswith(root + read) for c in said) == 1, (read, said)
+    finally:
+        drain(d)
+
+
+def test_dispatch_pass_memo_keeps_root_reads_until_a_move(tmp_path, monkeypatch):
+    """gitmemo.dispatch_pass(): a root read and the fetch run once; a checkout move drops the kept reads;
+    a kept failing read still raises under check=True; outside a pass nothing is kept."""
+    from ttp import gitmemo
+    repo = tmp_path / "r"
+    subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q",
+                    "--allow-empty", "-m", "a"], check=True)
+    calls = _slow_git(tmp_path, monkeypatch, 0)
+    head = ["git", "-C", str(repo), "symbolic-ref", "--quiet", "--short", "HEAD"]
+    n = lambda s: sum(s in line for line in calls.read_text().splitlines()) if calls.exists() else 0
+    with gitmemo.dispatch_pass():
+        for _ in range(2):
+            gitmemo.run(["git", "-C", str(repo), "fetch", "--quiet", "origin"], capture_output=True)
+        assert n("fetch --quiet origin") == 1, "a failed fetch is not retried within the pass either"
+        assert gitmemo.run(head, capture_output=True, text=True).stdout.strip() == "main"
+        assert gitmemo.run(head, capture_output=True, text=True).stdout.strip() == "main"
+        assert n("symbolic-ref --quiet --short HEAD") == 1
+        gitmemo.run(["git", "-C", str(repo), "worktree", "list", "--porcelain"], capture_output=True)
+        gitmemo.run(["git", "-C", str(repo), "update-ref", "refs/ttp/fork-point/t1", "HEAD"], check=True)
+        gitmemo.run(head, capture_output=True, text=True)
+        assert n("symbolic-ref --quiet --short HEAD") == 1, "a list or a harness ref leaves the root's head"
+        gitmemo.run(["git", "-C", str(repo), "checkout", "-q", "-b", "other"], check=True)
+        assert gitmemo.run(head, capture_output=True, text=True).stdout.strip() == "other"
+        assert n("symbolic-ref --quiet --short HEAD") == 2
+        gitmemo.run(["git", "-C", str(repo), "checkout", "-q", "--detach"], check=True)
+        for _ in range(2):
+            with pytest.raises(subprocess.CalledProcessError):
+                gitmemo.run(head, capture_output=True, text=True, check=True)
+        assert n("symbolic-ref --quiet --short HEAD") == 3
+    gitmemo.run(head, capture_output=True, text=True)
+    gitmemo.run(head, capture_output=True, text=True)
+    assert n("symbolic-ref --quiet --short HEAD") == 5, "outside a pass every read runs"
