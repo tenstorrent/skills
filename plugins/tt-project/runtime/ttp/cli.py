@@ -271,6 +271,10 @@ def forward(entry: dict, argv: list[str], quiet: bool = False, shown: set[int] |
             _unreachable(entry, r.stderr)
     elif r.stderr:
         sys.stderr.write(sshfail.scrub(r.stderr, entry.get("ssh") or entry["host"]))
+        if r.returncode == 2 and argv and f"invalid choice: '{argv[0]}'" in r.stderr:
+            # Its parser is fine here: the far side runs an older ttp that lacks the command.
+            sys.stderr.write(f"ttp: `ttp {argv[0]}` ran on {entry['host']}, whose ttp is older and lacks it; "
+                             f"it works there once a newer tt-project release is deployed on that machine\n")
     return r.returncode
 
 

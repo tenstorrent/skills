@@ -233,3 +233,37 @@ def test_a_project_whose_cli_is_logged_out_or_idle_is_not_live(env, capsys):
     p.db.set_kv(alerts.BREAKER + "claude", {"open": True})
     code, out = alive()
     assert code == 1 and "logged out: claude" in out
+
+
+def test_ttp_alive_is_in_the_parser_and_a_far_project_on_an_older_ttp_says_why(env, capsys, monkeypatch):
+    """A project reported `ttp alive <name>` refused with "invalid choice: 'alive'" and blamed the parser.
+    The parser has it (every grouped command is a real choice, none added after parsing); the refusal came
+    from a project on another machine, whose older ttp lacked the command: the forward now says so."""
+    import subprocess
+    from ttp import cli
+    seen = {}
+
+    class Built(Exception):
+        pass
+
+    def grab(sub, argv):
+        seen["sub"] = sub
+        raise Built
+    monkeypatch.setattr(cli, "_project_name_argv", grab)
+    with pytest.raises(Built):
+        cli.main(["alive", "demo"])
+    monkeypatch.undo()
+    choices = seen["sub"].choices
+    assert "alive" in choices and choices["alive"].get_default("fn") is cli.cmd_alive
+    grouped = {n for _, names in cli.COMMAND_GROUPS for n in names}
+    assert not grouped - set(choices), grouped - set(choices)
+    old = "usage: ttp [-h] [--version] COMMAND ...\nttp: error: argument COMMAND: invalid choice: 'alive'\n"
+    monkeypatch.setattr(cli, "_ssh", lambda entry, argv, capture=False: subprocess.CompletedProcess(argv, 2, "", old))
+    capsys.readouterr()
+    assert cli.forward({"host": "far-box", "dir": "/x"}, ["alive", "far"]) == 2
+    err = capsys.readouterr().err
+    assert "invalid choice: 'alive'" in err and "far-box, whose ttp is older and lacks it" in err
+    monkeypatch.setattr(cli, "_ssh", lambda entry, argv, capture=False:
+                        subprocess.CompletedProcess(argv, 2, "", "ttp: error: invalid choice: 'x'\n"))
+    cli.forward({"host": "far-box", "dir": "/x"}, ["alive", "far"])
+    assert "older" not in capsys.readouterr().err
