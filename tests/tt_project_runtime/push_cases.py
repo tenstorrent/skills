@@ -9461,7 +9461,7 @@ def test_macos_boot_checks_read_sysctl_in_process_and_spawn_nothing(env, tmp_pat
     monkeypatch.setattr(runner.subprocess, "run", lambda *a, **k: spawned.append(a) or 1 / 0)
     for _ in range(50):
         assert runner.same_boot(uuid) and runner.same_boot("1700000000") and not runner.same_boot("1699999999")
-    assert runner.boot_ids() == (uuid, "1700000000") and runner.boot_time() == 1700000000.0
+    assert runner.boot_ids() == (uuid, "1700000000") and float(runner._boottime_secs()) == 1700000000.0
     assert runner._sysctl("kern.boottime") == "{ sec = 1700000000, usec = 4242 }"
     assert not spawned and lib.calls
     # An older macOS without kern.bootsessionuuid: the seconds, still with no process.
