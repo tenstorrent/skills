@@ -13,7 +13,10 @@ check with a check host does (remotecheck: a copy of exactly the commit, its out
 test workers that host's idle cores give it (workers: cores less the 1-minute load, never a fixed count). With
 none, it queues here and, while it waits (its project's lane, a host-wide checks slot, the load guard,
 test-worker slots), tries them again after each `delivery.checks_spill_after_s` (default SPILL_AFTER_S). With
-checks_spill_first false it tries them only after that first wait. The run says where it went, checks.json records it (`hosts`, `spilled_to`), and `ttp status`
+checks_spill_first false it tries them only after that first wait. On a workstation (a laptop or desktop: netwait.workstation;
+`delivery.checks_remote_only`, default auto, true or false overrides it) a heavy run whose spill hosts are all busy
+waits for one, holding nothing here, rather than run here (remote_only): it falls back here only when none is busy,
+every one out of reach or unusable, and then runs niced in this machine's few test slots. Light checks run here. The run says where it went, checks.json records it (`hosts`, `spilled_to`), and `ttp status`
 and `ttp checks status` show it while it runs (status_lines).
 
 Allowed: listed in one of those structured settings (the project's own list or the account's pool),
@@ -108,6 +111,8 @@ PRE_TIMEOUT_S = 30
 PRE_SKIP_RC = 75   # the pre-run hook's "not now": the host is skipped this time, no error
 AFTER_KEY = "checks_spill_after_s"
 FIRST_KEY = "checks_spill_first"   # delivery.checks_spill_first: a spillable run tries the spill hosts before a place here (first)
+REMOTE_ONLY_KEY = "checks_remote_only"   # delivery.checks_remote_only: on a workstation a busy pool is waited for (remote_only)
+REMOTE_ONLY_ENV = "TTP_TEST_REMOTE_ONLY"   # tests: "1"/"0" instead of this machine's kind when the setting is unset
 SPILL_AFTER_S = 60.0
 OFF_ENV = "TTP_CHECKS_NO_SPILL"   # "1": these checks never spill; else the hosts a rerun keeps off (spill_off_add)
 HOST_FAULT_TRIES = 2   # a spill host whose own fault (exit 75) ended a run this often is kept off its rerun
@@ -227,6 +232,10 @@ def problems(delivery: dict) -> list[str]:
             first_of(f)
         except ValueError as e:
             out.append(str(e).replace("; nothing was changed", ""))
+    try:
+        remote_only_of((delivery or {}).get(REMOTE_ONLY_KEY))
+    except ValueError as e:
+        out.append(str(e).replace("; nothing was changed", ""))
     return out
 
 
@@ -429,6 +438,39 @@ def first(cfg: dict | None) -> bool:
         return True if v is None else first_of(v)
     except ValueError:
         return True
+
+
+def remote_only_of(v: Any) -> bool | None:
+    """A `delivery.checks_remote_only` value set by `ttp config`: true, false, or auto (None: this machine's kind)."""
+    if v is None or isinstance(v, bool):
+        return v
+    t = str(v).strip().lower()
+    if t == "auto":
+        return None
+    try:
+        return first_of(v)
+    except ValueError:
+        raise ValueError(f"delivery.{REMOTE_ONLY_KEY}: {v!r} is not true, false or auto; nothing was changed") from None
+
+
+def remote_only(cfg: dict | None) -> bool:
+    """Whether a heavy run that may spill waits for a busy spill host instead of taking a place here
+    (delivery.checks_remote_only; default auto: on a workstation, a laptop or desktop where the user works,
+    netwait.workstation, and off on a server). Only with spill hosts set and spill first on (first): the run
+    falls back here only once no host is busy, every one out of reach or unusable (LAST_BUSY empty). Light
+    checks (checklane) never wait for it: they run here at once."""
+    if not hosts(cfg) or not first(cfg):
+        return False
+    try:
+        v = remote_only_of(((cfg or {}).get("delivery") or {}).get(REMOTE_ONLY_KEY))
+    except ValueError:
+        v = None
+    if v is not None:
+        return v
+    if (t := os.environ.get(REMOTE_ONLY_ENV)) in ("0", "1"):
+        return t == "1"
+    from . import netwait
+    return netwait.workstation(cfg)
 
 
 def workers(cores: int, load: float | None, others: int = 0, cap: int = 0) -> int:
@@ -697,6 +739,8 @@ def probe(alias: str, beside_device: bool = False) -> tuple[int, str, str]:
                     f"{running} check(s) running)"), note
 
 
+_OUT_OF_REACH = ("ssh ", "cannot run ssh", "it lacks", "its probe failed", "its pre-run hook error")   # probe and hook
+LAST_BUSY: list[str] = []   # the hosts the last pick skipped only as busy (remote_only waits for them)
 _READ: dict[str, tuple[int, float | None]] = {}   # the last probe's (cores, load) per host: pick sizes a run's workers from it
 
 
@@ -1011,7 +1055,10 @@ def pick(p, cfg: dict, tell, what: str = "", off: str = "", why_here: str = "") 
     (pre_check) lets the run go to, claimed; None when none is. One host of a machine with several (target) is
     probed, claimed and held by its own name, its machine's lock held too. Each host skipped is told with why.
     `off`: OFF_ENV's value, whose hosts (kept_off) are skipped. `why_here`: why the run tries them now (default:
-    the slots here stayed busy). The claim's `workers` are sized to the host's idle cores at its probe (workers)."""
+    the slots here stayed busy). The claim's `workers` are sized to the host's idle cores at its probe (workers).
+    LAST_BUSY lists after it the hosts skipped only as busy (a lock, a device job, the hook's "not now", full
+    slots), never one not allowed, paused, kept off or out of reach (_OUT_OF_REACH)."""
+    LAST_BUSY.clear()
     rec = {"project": p.name, "task": os.environ.get("TTP_TASK") or "", "run": os.environ.get("TTP_RUN_ID") or "",
            "pid": os.getpid(), "since": time.time(), "what": what[:300]}
     skipped, keep = [], kept_off(off)
@@ -1028,7 +1075,9 @@ def pick(p, cfg: dict, tell, what: str = "", off: str = "", why_here: str = "") 
             skipped.append(f"{alias} (these checks did not pass there in this run)")
             continue
         beside = beside_device(cfg, alias)   # the project lets its checks run there beside a device job
-        why, dev = allowed(p, cfg, alias) or lock_busy(p, cfg, alias), ""
+        why = allowed(p, cfg, alias)
+        usable = not why   # past `allowed`, a skip is the host being busy unless it is out of reach
+        why, dev = why or lock_busy(p, cfg, alias), ""
         if not why and beside:
             dev = device_busy(p, cfg, host)
             _note_skip(host, "", p.name, own_only=True)   # this project's earlier skip no longer holds
@@ -1051,6 +1100,7 @@ def pick(p, cfg: dict, tell, what: str = "", off: str = "", why_here: str = "") 
             if got.lock is None:
                 got.close()
                 skipped.append(f"{alias} (busy: its lock was taken just now)")
+                LAST_BUSY.append(alias)
                 continue
             cores, load = _READ.pop(host, (0, None))
             from . import testslots
@@ -1067,6 +1117,8 @@ def pick(p, cfg: dict, tell, what: str = "", off: str = "", why_here: str = "") 
                  + (f"; skipped: {'; '.join(skipped)}" if skipped else ""))
             _note_pick(p.name, alias, skipped)
             return got
+        if usable and not why.startswith(_OUT_OF_REACH):
+            LAST_BUSY.append(alias)
         skipped.append(f"{alias} ({why or 'this machine holds its free slots'}"
                        + (f"; {note}" if note else "") + ")")
     if skipped:

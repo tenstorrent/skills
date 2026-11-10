@@ -2179,7 +2179,10 @@ session and stateless coordinators on every provider.
   workers that host's idle cores give it (cores less its 1-minute load), on the first listed host the
   charter names, the machines list holds, no pause covers and whose `ttp lock <alias>` nobody else holds (the run
   holds it shared while it runs), where no device job runs, that ssh reaches and that has a free slot; others
-  are skipped with the reason and the run keeps its place here. A check that runs an agent CLI (`claude`, `codex`,
+  are skipped with the reason and the run keeps its place here. On a workstation or laptop,
+  `delivery.checks_remote_only` (default `auto`: on there; `true`/`false` overrides) makes a heavy run wait
+  for a busy spill host instead of taking a place here; it runs here, niced, only when every host is out of
+  reach. Light checks (plugin validate, quick lints) stay here. A check that runs an agent CLI (`claude`, `codex`,
   `cursor-agent`, also inside `sh -c`), such as `claude plugin validate --strict`, or says `"host": "local"`, stays
   on this machine while the run's other checks (pytest) spill, and the run gives one verdict for both parts. A
   failure of the part kept here counts at once. Only a check that is not a test suite or build splits off this

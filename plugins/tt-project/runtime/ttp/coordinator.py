@@ -431,6 +431,9 @@ USER_SETTABLE = {
     "delivery.checks_spill_after_s": lambda v: checkspill.after_of(v),
     # Whether a run that may spill tries the spill hosts before a place here (checkspill.first; default true).
     "delivery.checks_spill_first": lambda v: checkspill.first_of(v),
+    # Whether a heavy run waits for a busy spill host instead of running here (checkspill.remote_only; auto: on a
+    # workstation), stored as true, false or "auto".
+    "delivery.checks_remote_only": lambda v: "auto" if (r := checkspill.remote_only_of(v)) is None else r,
     # Spill hosts (or "*") the project lets its checks run on beside a device job (checkspill.beside_device).
     "checks.spill_beside_device": lambda v: checkspill.beside_of(v),
     # The files holding the version that `ttp push` bumps once above the tip, plus a changeset.

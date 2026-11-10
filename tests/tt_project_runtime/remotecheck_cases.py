@@ -3498,3 +3498,88 @@ def test_the_route_diagnosis_needs_tailscale_to_say_it_is_logged_in(tmp_path, mo
     assert "logged out" in tailnet.diagnose()
     monkeypatch.setenv("FAKE_TS_STATUS", "not json")
     assert tailnet.diagnose() == ""
+
+
+def test_remote_only_defaults_to_this_machines_kind_and_is_validated(env, monkeypatch):
+    """delivery.checks_remote_only: auto (unset) follows the machine's kind (a workstation: on), true or false
+    overrides it; it is off without spill hosts or with spill first off; a bad value is a config problem."""
+    from ttp import checkspill, coordinator, netwait, project
+    monkeypatch.delenv(checkspill.REMOTE_ONLY_ENV, raising=False)
+    pool = {"delivery": {"checks_spill_hosts": ["check-host-a"]}}
+    for kind in (True, False):
+        monkeypatch.setattr(netwait, "workstation", lambda cfg=None, kind=kind: kind)
+        assert checkspill.remote_only(pool) is kind
+        assert checkspill.remote_only({"delivery": {**pool["delivery"], "checks_remote_only": "auto"}}) is kind
+        assert checkspill.remote_only({"delivery": {**pool["delivery"], "checks_remote_only": not kind}}) is (not kind)
+    monkeypatch.setattr(netwait, "workstation", lambda cfg=None: True)
+    assert not checkspill.remote_only({}), "no spill hosts: nowhere to wait for"
+    assert not checkspill.remote_only({"delivery": {**pool["delivery"], "checks_spill_first": False}})
+    assert any("delivery.checks_remote_only" in x
+               for x in project.config_problems({"delivery": {"checks_remote_only": "maybe"}}))
+    assert not project.config_problems({"delivery": {"checks_remote_only": "auto"}})
+    settable = coordinator.USER_SETTABLE["delivery.checks_remote_only"]
+    assert settable("auto") == "auto" and settable("on") is True and settable("false") is False
+    with pytest.raises(ValueError, match="nothing was changed"):
+        settable("sometimes")
+
+
+def test_pick_lists_busy_hosts_apart_from_hosts_out_of_reach(env, tmp_path, monkeypatch):
+    """checkspill.LAST_BUSY after a pick names the hosts skipped only as busy (full slots, a device job, the
+    hook's not-now), never one ssh does not reach, nor one not allowed."""
+    from ttp import checkspill
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["down", "check-host-a", "check-host-b", "nowhere"])
+    why = {"check-host-a": "its 3 running check(s) fill it", "check-host-b": checkspill.DEVICE_WHY + "a job",
+           "down": "ssh cannot reach it: Connection refused"}
+    monkeypatch.setattr(checkspill, "probe", lambda host, beside=False: (0, why.get(host, "its probe failed (exit 1)"), ""))
+    assert checkspill.pick(p, p.config(), lambda line: None) is None
+    assert sorted(checkspill.LAST_BUSY) == ["check-host-a", "check-host-b"], checkspill.LAST_BUSY
+    why = {h: "ssh timed out after 30 s" for h in why}
+    assert checkspill.pick(p, p.config(), lambda line: None) is None
+    assert checkspill.LAST_BUSY == [], "every host out of reach (or not allowed): nothing to wait for"
+
+
+def test_on_a_workstation_a_heavy_run_waits_for_a_busy_spill_host_and_never_runs_here(env, tmp_path, monkeypatch):
+    """Owner's order (keep heavy test work on the remote boxes): on a workstation a heavy run whose spill hosts
+    are busy holds nothing here and tries them again after checks_spill_after_s; it goes to the first that has
+    room, never to a place here."""
+    from ttp import checkspill, cli
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a"])
+    p.set_config("delivery.checks_remote_only", True)
+    log = tmp_path / "where.log"
+    p.set_config("delivery.push_checks", [f"pwd >> {log}"])
+    real_pick, picks = checkspill.pick, []
+
+    def pick(*a, **k):
+        picks.append(1)
+        if len(picks) == 1:   # the pool is busy at first
+            checkspill.LAST_BUSY[:] = ["check-host-a"]
+            return None
+        return real_pick(*a, **k)
+    monkeypatch.setattr(checkspill, "pick", pick)
+    monkeypatch.setattr(cli, "_checks_slot_take", lambda *a, **k: pytest.fail("a heavy run took a place here"))
+    cli.main(["checks", "--fresh"])
+    rec = json.loads((run / "checks.json").read_text())
+    assert rec["passed"] is True and rec["spilled_to"] == "check-host-a", rec
+    assert len(picks) == 2 and "/ttp-check." in log.read_text()
+    assert "waiting for a busy spill host (check-host-a), not running here" in (run / "checks.log").read_text()
+
+
+def test_on_a_workstation_a_heavy_run_falls_back_here_only_when_every_spill_host_is_out_of_reach(
+        env, tmp_path, monkeypatch):
+    """No spill host reachable: the heavy run runs here (niced, in this machine's test slots); a light run never
+    tries the spill hosts at all."""
+    from ttp import checkspill, cli
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["down"])
+    p.set_config("delivery.checks_remote_only", True)
+    log = tmp_path / "where.log"
+    p.set_config("delivery.push_checks", [f"pwd >> {log}"])
+    cli.main(["checks", "--fresh"])
+    rec = json.loads((run / "checks.json").read_text())
+    assert rec["passed"] is True and "spilled_to" not in rec, rec
+    assert checkspill.LAST_BUSY == [] and "/ttp-check." not in log.read_text(), "it ran here"
+    assert "waiting for a busy spill host" not in (run / "checks.log").read_text()
+    monkeypatch.setattr(checkspill, "pick", lambda *a, **k: pytest.fail("a light run tried the spill hosts"))
+    p.set_config("delivery.push_checks", ["sh -n /dev/null"])
+    cli.main(["checks", "--fresh"])
+    rec = json.loads((run / "checks.json").read_text())
+    assert rec["passed"] is True and "spilled_to" not in rec, rec

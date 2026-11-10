@@ -482,6 +482,7 @@ def env(tmp_path, monkeypatch, _git_session, _short_tmp):
     monkeypatch.setenv("TTP_TEST_BUDGET_SETTLE_S", "0")   # a budget red alerts on its first read (budget_cases tests the settle)
     monkeypatch.setenv("TTP_TEST_POLL_S", "0.05")   # wait loops (runner, ttp lock, listen) check often
     monkeypatch.setenv("TTP_CHECKS_LOAD_GUARD", "0")   # suites never wait on the load of the host running the tests (loadguard tests set it)
+    monkeypatch.setenv("TTP_TEST_REMOTE_ONLY", "0")   # a busy spill pool never holds checks on a laptop running the tests (checkspill.remote_only)
     monkeypatch.setenv("TTP_CHECKS_POOL_DIRS", str(tmp_path / "pool"))   # never this host's real pool runs (the suite's own run folder among them)
     monkeypatch.setenv("TTP_TEST_DISK_MOUNT", str(tmp_path))   # the disk guard's du stays in the test folder
     monkeypatch.setenv("TTP_TEST_SSH_CONFIG", str(tmp_path / "ssh_config"))   # never the user's own ssh config

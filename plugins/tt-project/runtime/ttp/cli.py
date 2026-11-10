@@ -5259,6 +5259,19 @@ def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: boo
                 slot.spill = claim
                 return slot
             pool_first = False   # the pool was just tried: an urgent run takes its urgent slot here next
+            # On a workstation (checkspill.remote_only) a heavy run waits for a busy spill host, holding nothing
+            # here, and tries them again; it takes a place here only once none is busy (all out of reach).
+            if checkspill.LAST_BUSY and checkspill.remote_only(spill_cfg):
+                busy = ", ".join(checkspill.LAST_BUSY)
+                line = (f"this machine is a workstation (delivery.{checkspill.REMOTE_ONLY_KEY}): waiting for a "
+                        f"busy spill host ({busy}), not running here; it runs here only if every host is out of reach")
+                if line not in told:
+                    told.add(line)
+                    tell(line)
+                if not _spill_wait(run_dir, out, checkspill.after_s(spill_cfg), waiting, moved, yielder,
+                                   start if foreground and p else None):
+                    return None
+                continue
         first = False
         if spill_to:   # a bounded wait here, then the spill hosts, then wait again in the same place
             bound = 0.0 if pool_first else checkspill.after_s(spill_cfg)
@@ -5311,6 +5324,34 @@ def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: boo
             return slot
         if foreground and time.time() - start >= checkcap.FOREGROUND_WAIT_S:
             return None
+
+
+def _spill_wait(run_dir: Path, out, bound: float, waiting, moved, yielder, since: float | None) -> bool:
+    """Wait up to `bound` seconds for a busy spill host (checkspill.remote_only), holding nothing here: True once
+    the bound passed (try the hosts again), False once the foreground wait that began at `since` ran out
+    (checkcap.FOREGROUND_WAIT_S). A cancel request or a replaced head (`moved`) ends the run as in
+    _checks_slot_take; `yielder()` may raise checkjoin.Yield."""
+    from . import checkcap, testslots
+    waiting(True)
+    try:
+        end = time.time() + bound
+        while True:
+            if why := _checks_cancelled(run_dir) or (moved() if moved else ""):
+                said = f"not run: stopped waiting for a spill host: {why}"
+                out.write(f"ttp checks: {said}\n")
+                out.flush()
+                if _read_checks_pid(run_dir).get("pid") == os.getpid():
+                    _checks_drop(run_dir, why, rc=False)
+                die(f"ttp checks: {said}", 1)
+            if yielder:
+                yielder()
+            if since is not None and time.time() - since >= checkcap.FOREGROUND_WAIT_S:
+                return False
+            if (left := end - time.time()) <= 0:
+                return True
+            time.sleep(min(left, max(0.01, poll_s(testslots.POLL_S))))
+    finally:
+        waiting(False)
 
 
 def _wrap_lane_after(cfg: dict) -> bool:

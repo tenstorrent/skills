@@ -11,7 +11,8 @@
   command quoted as one word (`-- 'pytest -q tests/a.py' 'ruff check .'`). It reuses
   a pass for the same tree and commands. If they outlast a tool call,
   run `ttp checks --detach -- <cmds>`: its output and exit code go to the run dir, never
-  the worktree. Hand off `waiting` with the `retry_when` it prints (`ttp checks --result <run dir>`)
+  the worktree. On a workstation or laptop with spill hosts set, run tests and builds only through
+  `ttp checks` (it sends them to those hosts), never a plain pytest or build here. Hand off `waiting` with the `retry_when` it prints (`ttp checks --result <run dir>`)
   and no `wake_tier`; failed checks wake you;
   that probe also wakes the task if the checks were killed. If only recording the result is
   left, put it in `on_pass` (`"on_pass": {"status": "done", "summary": "..."}`): a pass on the
