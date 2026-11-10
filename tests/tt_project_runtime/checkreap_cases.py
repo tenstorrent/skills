@@ -50,7 +50,8 @@ def test_a_check_s_background_child_ends_with_it_and_leaves_no_sandbox_tree(env,
     assert not list(tmp.glob("ttp-checks-*")), "the clean tree outlived the run"
     folder = p.state / checkreap.FOLDER
     assert not folder.exists() or not list(folder.iterdir())
-    assert "ttp checks: reaped 1 leftover process and 1 sandbox tree" in (run / "checks.log").read_text()
+    if checkreap.PROC.exists():  # without /proc (macOS) nothing is found to reap, so nothing is counted
+        assert "ttp checks: reaped 1 leftover process and 1 sandbox tree" in (run / "checks.log").read_text()
 
 
 def test_the_sweep_reaps_a_stale_sandbox_with_exit_json_or_a_dead_runner(env, tmp_path, monkeypatch):
