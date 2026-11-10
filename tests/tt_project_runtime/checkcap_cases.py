@@ -9997,6 +9997,60 @@ def test_an_urgent_checks_run_past_its_grace_preempts_one_routine_run_of_its_own
                 h.close()
 
 
+def test_an_urgent_run_that_was_preempted_queues_again_and_preempts_nobody(env, monkeypatch):
+    """[note 46ef17a6f474ab41]: an urgent run that was itself preempted queues again at its old arrival, so
+    its grace has long passed. It asked a third run to step back at once, while the run that preempted it
+    still waited for its test slots: two runs lost work and the asker gained nothing. A preempted run asks
+    nobody when it queues again, and the run that asked (owed: it may ask an urgent run) gets the slot it
+    freed."""
+    import subprocess
+    import threading
+    from ttp import checkcap, locks
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "2")
+    monkeypatch.setenv("TTP_CHECKS_LOAD_EXTRA", "0")
+    monkeypatch.setenv(checkcap.URGENT_SLOTS_ENV, "0")
+    monkeypatch.setenv(checkcap.PREEMPT_AFTER_ENV, "0")
+    monkeypatch.setenv(checkcap.PREEMPT_ASKED_ENV, "")
+    monkeypatch.setenv(checkcap.PREEMPTED_ENV, "")
+    monkeypatch.setattr(checkcap, "POLL_S", 0.1)
+    third = checkcap.acquire("third p3", project_name="other", priority=3, preemptible=True)
+    proc = subprocess.Popen(["sleep", "60"])   # its own process: a request to it is its own file
+    locks.relabel(third.f, {**locks._owner(proc.pid), "ns_pid": None})
+    first_since = time.time() - 900
+    mine = checkcap.acquire("mine p1", project_name="mine", priority=1, preemptible=True, since=first_since)
+    freed = threading.Event()   # the asker's test slots: free only once the run it asked let go
+    startable = lambda: freed.is_set() or (checkcap.FREEING.get() or {}).get("holder") == "mine p1"  # noqa: E731
+    told, got, again = [], [], []
+    t = threading.Thread(target=lambda: got.append(checkcap.acquire(
+        "asker p0", project_name="mine", priority=0, owns=["o1"], urgent=True, tell=told.append,
+        startable=startable, max_wait_s=30)))
+    t.start()
+    try:
+        assert _wait_for(lambda: checkcap.PREEMPT_LINE.format("mine p1") in told), told
+        monkeypatch.setenv(checkcap.PREEMPTED_ENV, checkcap.preempted(mine.since))
+        mine.close()
+        # It queues again at its first arrival, urgent, past every grace, while the asker still waits for
+        # its test slots: it asks nobody.
+        again_told: list = []
+        again.append(checkcap.acquire("mine p1", project_name="mine", priority=1, urgent=True, preemptible=True,
+                                      since=first_since, tell=again_told.append, max_wait_s=1.5))
+        assert again == [None], "the preempted run waits for a slot"
+        assert not any(m.startswith("urgent checks with every") for m in again_told), again_told
+        assert not checkcap._preempt_path(proc.pid).exists(), "the third run was never asked"
+        freed.set()
+        t.join(30)
+        assert got and got[0] is not None and got[0].f is not None, "the asker took the slot it freed"
+    finally:
+        freed.set()
+        checkcap.clear_preempt()
+        checkcap._preempt_path(proc.pid).unlink(missing_ok=True)
+        proc.kill()
+        proc.wait()
+        for h in (third, mine, *got, *again):
+            if h is not None:
+                h.close()
+
+
 def test_push_priority_urgent_and_lock_holding_checks_runs_are_never_preempted(env, monkeypatch):
     """#6246 (2): with the cap held by an urgent run and a routine run behind a lock, and a push branch's
     priority slot held, an urgent waiter past its grace asks nobody; preemptible() refuses a wrapper lock and

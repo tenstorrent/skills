@@ -76,7 +76,8 @@ With those held or the cap full, an urgent waiter that has waited preempt_after_
 (PREEMPT_ASKED_ENV, kept over a re-execution; again preempt_after_s() after one lapsed), one routine run on a cap slot to step back (preempt): one never
 preempted before first, then its own project's, then the least urgent, then the latest granted (it loses the least
 work). It ends its command, lets its slots go and queues again at its old arrival, ahead of every later arrival at
-its priority or a less urgent one whatever the project turns (a requeued ticket: locks.requeued_place), so it
+its priority or a less urgent one whatever the project turns (a requeued ticket: locks.requeued_place), asking
+nobody itself there even when urgent (its grace counts from that old arrival), so it
 keeps its place and what it recorded (in a pinned run, only passes on the pinned commit), and the waiter takes
 the freed slot: a claim (claims, CLAIM_S) keeps
 it from every other waiter while the asker lives and renews it, and a request whose claim lapsed asks nothing.
@@ -1730,8 +1731,10 @@ def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = No
                     drop_claim(claim)
                     asked, claim, lapsed = "", "", 0.0
                     os.environ.pop(PREEMPT_ASKED_ENV, None)
-            if (not f and not asked and not twin and urgent and is_urgent(priority)
+            if (not f and not asked and not twin and urgent and is_urgent(priority) and not was_preempted
                     and time.time() - since >= preempt_after_s()):
+                # A preempted run queues again at its old arrival, its grace long past: it asks nobody, else it
+                # would take a third run's slot ahead of the run that preempted it ([note 46ef17a6f474ab41]).
                 # Only a run whose stop lets this one start: parked, its test slots must fit once that run's free.
                 claim, parked_ask = secrets.token_hex(6), parked
                 if asked := preempt(holder, every, project_name, startable=startable if parked else None,
