@@ -2087,6 +2087,11 @@ session and stateless coordinators on every provider.
   checks wait there at most `checks.push_load_wait_s` seconds (default 300; `off`: no bound), then start on
   their branch's reserved lane alone, one per lane at a time. Heavy suites
   belong on another host where a project has one allowed (`delivery.checks_host`).
+  Checks that run on another host (a check's own `"host"`, `delivery.checks_host` or a spill host), with at most
+  light checks here, use none of this host's CPU: push checks and `ttp checks` take no host-wide checks slot or
+  test slots here and never wait for this host's guard. They wait instead while their host's runnable demand,
+  read over ssh from its `/proc/stat` (cached 30 s), is above `checks.load_guard` times its cores, at most
+  `checks.push_load_wait_s`, and say which host holds them; an unreadable host never holds them.
   Waiters are served first-come: one whose project is at its budget lets other projects go first but keeps its
   place in its project's line, where the most urgent task priority goes first, then arrival, so that waiter gets
   the next freed slots. A priority-1 check whose project's budget is held only by less urgent runs takes one extra

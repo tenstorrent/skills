@@ -5203,8 +5203,19 @@ def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: boo
         tell("light checks only (syntax, lint, format or validation: checklane, checks.light_cmds, --light): "
              "running now, outside the project's checks slot")
         return checkcap.Slot()
-    prio, owns = checkcap.task_rank(p or checkcap.adopted_project())
     cfg = p.config() if p else {}
+    from . import push
+    # Checks that run on other hosts (push.remote_host), with at most light ones here, use none of this
+    # machine's CPU: no checks slot or test slots here, no wait for its load guard; they wait while
+    # their host is overloaded instead (remoteload.wait), at most checks.push_load_wait_s.
+    pats = checklane.light_patterns(cfg)
+    if (hosts := list(dict.fromkeys(h for c in cmds or () if (h := push.remote_host(c))))) and all(
+            push.remote_host(c) or checklane.is_light(str(c), pats) for c in cmds):
+        from . import remoteload, testslots
+        remoteload.wait(hosts, tell, testslots.push_load_wait_s(cfg))
+        tell(f"checks run on {', '.join(hosts)}: running now, outside this machine's checks slot and test slots")
+        return checkcap.Slot()
+    prio, owns = checkcap.task_rank(p or checkcap.adopted_project())
     from . import testslots
     repo = testslots.repo_key(top) if p else ""
     cmds = cmds or []

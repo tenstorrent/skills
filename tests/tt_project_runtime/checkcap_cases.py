@@ -11322,3 +11322,99 @@ def test_the_queue_wait_report_and_slot_status_count_the_same_host_wide_slot_hol
         for f in held:
             if f is not None:
                 f.close()
+
+
+def _remote_load(monkeypatch, readings: dict):
+    """remoteload.reading answers from `readings` ({host: [(demand, cores) or None, ...]}, the last one kept)."""
+    from ttp import remoteload
+    monkeypatch.setenv("TTP_CHECKS_LOAD_GUARD", "1")
+    monkeypatch.setattr(remoteload, "reading",
+                        lambda h: readings[h].pop(0) if len(readings[h]) > 1 else readings[h][0])
+    monkeypatch.setattr(remoteload, "POLL_S", 0.01)
+
+
+def test_push_checks_on_a_remote_host_skip_this_hosts_load_guard_checks_slot_and_test_slots(env, monkeypatch):
+    """#153: a push whose checks run on another host (a check's "host") starts at once while this host reads
+    overloaded: no wait for its load guard, no host-wide checks slot, no test slots; a light local check
+    beside it (claude plugin validate) takes none either. The remote host's load is read instead."""
+    from ttp import checkcap, push, testslots
+    p = make(env)
+    monkeypatch.setattr(testslots, "load_guard", lambda: "the host's CPU is overloaded")
+    monkeypatch.setattr(push, "check_slot", lambda *a, **k: pytest.fail("no local checks slot"))
+    _remote_load(monkeypatch, {"blx06": [(3.0, 64)]})
+    before = len(checkcap.grant_records())
+    run = push.check_list([{"run": "pytest -n 16 tests", "host": "blx06"},
+                           "claude plugin validate plugins/tt-project --strict"])
+    told, t0 = [], time.time()
+    slot = push.run_slot(run, "abc", told.append, priority="branch-key", proj=p)
+    assert time.time() - t0 < 5 and told == []
+    assert slot.f is None and slot.tests is None and slot.env() == {}
+    assert len(checkcap.grant_records()) == before and checkcap.state()["running"] == []
+    # delivery.checks_host as the default host counts the same.
+    slot = push.run_slot(push.with_host(push.check_list(["pytest -n 16 tests"]), "blx06"), "abc", told.append, proj=p)
+    assert slot.f is None and slot.tests is None
+
+
+def test_push_checks_on_an_overloaded_remote_host_wait_for_it_and_say_so(env, monkeypatch):
+    """#153: checks run on a host whose runnable demand is above checks.load_guard x its cores wait for it
+    to drop and say which host and why; past checks.push_load_wait_s they go ahead anyway."""
+    from ttp import push, remoteload
+    p = make(env)
+    monkeypatch.setattr(push, "check_slot", lambda *a, **k: pytest.fail("no local checks slot"))
+    _remote_load(monkeypatch, {"blx06": [(90.0, 64), (90.0, 64), (20.0, 64)]})
+    run = push.check_list([{"run": "pytest -n 16 tests", "host": "blx06"}])
+    told = []
+    slot = push.run_slot(run, "abc", told.append, proj=p)
+    assert slot.f is None and len(told) == 1, told
+    assert "check host blx06's CPU is overloaded" in told[0] and "90.0 cores" in told[0] and "64 cores" in told[0]
+    assert "waiting for it to drop" in told[0] and "300s" in told[0]
+    # Past the bound it starts anyway; an unreadable host never holds it.
+    monkeypatch.setenv(testslots_env := "TTP_CHECKS_PUSH_LOAD_WAIT_S", "0")
+    _remote_load(monkeypatch, {"blx06": [(90.0, 64)]})
+    told = []
+    assert remoteload.wait(["blx06"], told.append, push.testslots.push_load_wait_s({})) and "starting anyway" in told[-1]
+    monkeypatch.delenv(testslots_env)
+    _remote_load(monkeypatch, {"blx06": [None]})
+    assert remoteload.wait(["blx06"], told.append, None) == ""
+
+
+def test_local_push_checks_still_take_a_checks_slot_and_never_read_a_remote_host(env, monkeypatch):
+    """#153: a push with a local check that is not light takes check_slot as before (its load guard, the
+    host-wide cap and test slots); no remote host is read."""
+    from ttp import push, remoteload
+    p = make(env)
+    monkeypatch.setattr(remoteload, "reading", lambda h: pytest.fail("no remote read"))
+    calls = []
+    monkeypatch.setattr(push, "check_slot", lambda head, say, priority="", proj=None: calls.append(priority) or "slot")
+    assert push.run_slot(push.check_list(["pytest tests", {"run": "true", "host": "local"}]), "abc", print,
+                         priority="branch-key", proj=p) == "slot"
+    assert calls == ["branch-key"]
+    assert push.run_slot([], "abc", print, proj=p).f is None and calls == ["branch-key"]
+
+
+def test_ttp_checks_run_only_on_a_remote_host_take_no_local_checks_slot(env, monkeypatch, tmp_path):
+    """#153 (review #147 waited 11 min in this host's checks queue): `ttp checks` whose checks all run on
+    another host, light local ones aside, return at once with no host-wide slot or test slots here."""
+    import io
+    from ttp import checkcap, cli, push, testslots
+    p = make(env)
+    monkeypatch.setattr(testslots, "load_guard", lambda: "the host's CPU is overloaded")
+    monkeypatch.setattr(checkcap, "acquire", lambda *a, **k: pytest.fail("no local checks slot"))
+    _remote_load(monkeypatch, {"blx06": [(3.0, 64)]})
+    out = io.StringIO()
+    cmds = push.check_list([{"run": "pytest -n 16 tests", "host": "blx06"}, "git diff --check"])
+    slot = cli._checks_slot(p, tmp_path, out, "a" * 40, cmds=cmds, top=str(p.root))
+    assert slot.f is None and slot.tests is None
+    assert "checks run on blx06: running now, outside this machine's checks slot" in out.getvalue()
+
+
+def test_remoteload_parses_two_proc_stat_samples():
+    from ttp import remoteload
+    def stat(busy, idle, running, cores=4):
+        return (f"cpu  {busy} 0 0 {idle} 0 0 0 0 0 0\n" + "".join(f"cpu{i} 1 0 0 1 0 0 0 0 0 0\n" for i in range(cores))
+                + f"procs_running {running}\n")
+    d, c = remoteload.parse(stat(100, 100, 1) + remoteload.SEP + "\n" + stat(500, 100, 1))
+    assert c == 4 and abs(d - 4.0) < 0.01
+    d, c = remoteload.parse(stat(100, 100, 9) + remoteload.SEP + "\n" + stat(100, 500, 11))
+    assert c == 4 and abs(d - 9.0) < 0.01
+    assert remoteload.parse("no sample") is None

@@ -43,7 +43,7 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import quote, unquote
 
-from . import (checkcap, checkdirs, checkwait, checklane, cleantree, envfault, gatejudge, gatetime, gitcache, gitmemo, hoststate, landed, landmark, leakfile, locks, machines, pooladmit, prguard, prhead, remotecheck, repoid, runner, runnerenv,
+from . import (checkcap, checkdirs, checkwait, checklane, cleantree, envfault, gatejudge, gatetime, gitcache, gitmemo, hoststate, landed, landmark, leakfile, locks, machines, pooladmit, prguard, prhead, remotecheck, remoteload, repoid, runner, runnerenv,
                sandbox, scriptwatch, settinghold, setupfault, shorttmp, slurmcheck, syntaxfault, testslots, timefmt, workerloss, worktree)
 from .budget import DOC_SUFFIXES
 from .db import continues_id, dependency_ids, load_result
@@ -984,6 +984,24 @@ def check_slot(head: str, say: Callable[[str], None], who: str = "", priority: s
     slot.tests = testslots.acquire(who, say, cfg=proj.config() if proj else {}, project_name=name or "",
                                    push_key=priority)
     return slot
+
+
+def run_slot(run: list, head: str, say: Callable[[str], None], priority: str = "",
+             proj: Project | None = None) -> checkcap.Slot:
+    """The slot a push's check run holds: check_slot only when one of `run` runs here and is no light
+    check (checklane.is_light). Checks run on another host (remote_host) use none of this machine's
+    CPU: they take no host-wide checks slot or test slots here and never wait for this machine's load
+    guard; they wait instead while their host is overloaded (remoteload.wait), at most
+    checks.push_load_wait_s, then go ahead."""
+    if proj is None and (base := os.environ.get("TTP_PROJECT")):
+        proj = Project(base)
+    cfg = proj.config() if proj else {}
+    if hosts := list(dict.fromkeys(h for c in run if (h := remote_host(c)))):
+        remoteload.wait(hosts, say, testslots.push_load_wait_s(cfg))
+    pats = checklane.light_patterns(cfg)
+    if any(not remote_host(c) and not checklane.is_light(str(c), pats) for c in run):
+        return check_slot(head, say, priority=priority, proj=proj)
+    return checkcap.Slot()
 
 
 def priority_key(repo: Path, remote: str, branch: str) -> str:
@@ -3784,7 +3802,7 @@ def publish(repo: Path, remote: str, branch: str, checks: list[str],
         if todo and (why := runner_wait(todo, repo, check_env("own", tip, check_run_dir, branch), say)):
             return why
         try:
-            slot = check_slot(head, say, priority=own_lane_key(repo, remote, cfg)) if todo else checkcap.Slot()
+            slot = run_slot(todo, head, say, priority=own_lane_key(repo, remote, cfg))
         except checkcap.Unavailable as e:
             say(f"{e}; not pushing")
             return CHECKS_FAILED
@@ -4094,7 +4112,7 @@ def _rounds(repo: Path, remote: str, branch: str, checks: list[str], rounds: int
         if run and (why := runner_wait(run, repo, check_env("target", tip, check_run_dir, branch), say)):
             return why
         try:
-            slot = check_slot(head, say, priority=priority_key(repo, remote, branch)) if run else checkcap.Slot()
+            slot = run_slot(run, head, say, priority=priority_key(repo, remote, branch))
         except checkcap.Unavailable as e:
             say(f"{e}; not pushing")
             return CHECKS_FAILED

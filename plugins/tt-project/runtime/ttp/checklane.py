@@ -93,7 +93,7 @@ LIGHT_CMDS = (
     "ruff check", "ruff format --check", "black --check", "isort --check-only", "isort --check",
     "flake8", "pyflakes", "pycodestyle", "git diff --check", "shellcheck", "bash -n", "sh -n",
     "yamllint", "jq", "json_pp", "xmllint --noout", "clang-format --dry-run", "gofmt -l",
-    "prettier --check", "markdownlint",
+    "prettier --check", "markdownlint", "claude plugin validate",
 )
 CORES_PER_LANE = 8
 GIB_PER_LANE = 8
