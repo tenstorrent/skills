@@ -277,8 +277,13 @@ def run(cfg: dict, root: Path, alias: str, check: str, args: list[str]) -> tuple
     except subprocess.TimeoutExpired:
         if here:
             return TIMED_OUT, f"hostcheck: {check} on {alias} timed out after {TIMEOUT_S} s"
-        return UNREACHABLE, f"hostcheck: {alias} did not answer {check} within {TIMEOUT_S} s"
+        from . import tailnet
+        return UNREACHABLE, f"hostcheck: {alias} did not answer {check} within {TIMEOUT_S} s{tailnet.suffix()}"
     except OSError as e:
         return REFUSED, f"hostcheck: {check} on {alias} could not start: {e}"
     out = (r.stdout or "") + (("\n" if r.stdout else "") + r.stderr if r.stderr else "")
+    if r.returncode == UNREACHABLE and not here:
+        from . import tailnet
+        if why := tailnet.diagnose():
+            out = f"{out.rstrip()}\nhostcheck: {why}"
     return r.returncode, trim(out.strip() or f"(no output, exit {r.returncode})")

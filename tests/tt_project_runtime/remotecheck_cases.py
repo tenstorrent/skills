@@ -3409,3 +3409,92 @@ def test_push_hard_tests_is_a_known_delivery_key_the_batch_reads():
     assert b._hard("tests/x.py::test_no_leak_in_docs") and not b._hard("tests/x.py::test_other")
     b.d = {"push_hard_tests": r"::test_other$"}
     assert b._hard("tests/x.py::test_other") and not b._hard("tests/x.py::test_no_leak_in_docs")
+
+
+# A fake `tailscale`: `debug prefs` prints $FAKE_TS_PREFS, `status --json` prints $FAKE_TS_STATUS; an
+# empty one exits 1, as the real command does when it cannot answer.
+_FAKE_TAILSCALE = r'''#!/bin/sh
+case "$1" in
+  debug) out=$FAKE_TS_PREFS;;
+  status) out=$FAKE_TS_STATUS;;
+  set) echo set >> "$FAKE_TS_SET_LOG"; exit 0;;
+  *) exit 2;;
+esac
+[ -n "$out" ] || { echo "failed to connect to local tailscaled" >&2; exit 1; }
+printf '%s\n' "$out"
+'''
+
+_TS_CASES = {
+    # (prefs, status): the case the message must name
+    "logged_out": ('{"LoggedOut": true, "WantRunning": true, "RouteAll": false}', '{"BackendState": "NeedsLogin"}'),
+    "routes_off": ('{"LoggedOut": false, "WantRunning": true, "RouteAll": false}', '{"BackendState": "Running"}'),
+    "stopped": ('{"LoggedOut": false, "WantRunning": false, "RouteAll": true}', '{"BackendState": "Stopped"}'),
+    "fine": ('{"LoggedOut": false, "WantRunning": true, "RouteAll": true}', '{"BackendState": "Running"}'),
+    "broken": ("", ""),
+}
+
+
+def _fake_tailscale(tmp_path, monkeypatch, case=None):
+    """A fake tailscale (case: a _TS_CASES key) on PATH ahead of the fake ssh; case None: no tailscale
+    on PATH at all. Returns the log a `tailscale set` would write to."""
+    bin_, _ = _rc_fake_ssh(tmp_path)
+    ts = tmp_path / "ts-bin"
+    ts.mkdir(exist_ok=True)
+    log = tmp_path / "ts-set.log"
+    if case is not None:
+        (ts / "tailscale").write_text(_FAKE_TAILSCALE)
+        (ts / "tailscale").chmod(0o755)
+        monkeypatch.setenv("FAKE_TS_PREFS", _TS_CASES[case][0])
+        monkeypatch.setenv("FAKE_TS_STATUS", _TS_CASES[case][1])
+    monkeypatch.setenv("FAKE_TS_SET_LOG", str(log))
+    monkeypatch.setenv("PATH", f"{ts}{os.pathsep}{bin_}{os.pathsep}/usr/bin{os.pathsep}/bin")
+    monkeypatch.delenv("TTP_TEST_NO_TAILSCALE", raising=False)
+    return log
+
+
+@pytest.mark.parametrize("case", ["logged_out", "routes_off", "stopped", "fine", "broken", None])
+def test_an_unreachable_host_names_what_is_wrong_with_tailscale_here_and_only_offers_the_route_fix(
+        tmp_path, monkeypatch, case):
+    """ssh cannot reach a host: with Tailscale here, the message says which part of it is wrong. Logged
+    out: sign in. Stopped: turn it on. Running and logged in with RouteAll false: no sign-in, the fix is
+    `tailscale set --accept-routes=true`, offered for the user's OK and never run. Fine, failing or not
+    installed: the plain ssh text, no Tailscale blame. Never a logout while Tailscale is logged in."""
+    from ttp import hostcheck, netwait, remotecheck, tailnet
+    log = _fake_tailscale(tmp_path, monkeypatch, case)
+    why = remotecheck.reachable("down")
+    assert why.startswith("ssh cannot reach down: ") and "Connection refused" in why, why
+    said = tailnet.diagnose()
+    if case == "logged_out":
+        assert said and "logged out" in said and "sign in" in said and tailnet.FIX not in said, said
+    elif case == "routes_off":
+        assert "running and logged in" in said and "accept-routes is off" in said, said
+        assert f"`{tailnet.FIX}`" in said and "No sign-in" in said and "user's OK" in said, said
+        assert "logged out" not in said, "never a logout while Tailscale is logged in"
+    elif case == "stopped":
+        assert "not running" in said and "logged out" not in said and tailnet.FIX not in said, said
+    else:
+        assert said == "", said
+    assert why.endswith(tailnet.suffix()) and (said in why if said else "ailscale" not in why), why
+    # The same diagnosis in the network outage alert, replacing the generic VPN advice ...
+    alert = netwait.text("UTC", 0.0, 2, ["down"], now=60.0, tailnet=said)
+    assert (said in alert and "VPN" not in alert) if said else ("VPN or network sign-in" in alert), alert
+    # ... and in `ttp hostcheck` when the host does not answer (ssh's 255).
+    monkeypatch.setattr(hostcheck, "command", lambda *a: (["sh", "-c", "echo 'ssh: timed out' >&2; exit 255"], False))
+    rc, out = hostcheck.run({}, tmp_path, "down", "uptime", [])
+    assert rc == hostcheck.UNREACHABLE and "ssh: timed out" in out and (said in out if said else "ailscale" not in out)
+    assert not log.exists(), "the accept-routes fix is offered, never run"
+
+
+def test_the_route_diagnosis_needs_tailscale_to_say_it_is_logged_in(tmp_path, monkeypatch):
+    """RouteAll false with no word on the login (status fails, prefs lack LoggedOut) blames nothing,
+    and status alone saying NeedsLogin is a logout even when prefs cannot be read."""
+    from ttp import tailnet
+    _fake_tailscale(tmp_path, monkeypatch, "fine")
+    monkeypatch.setenv("FAKE_TS_PREFS", '{"RouteAll": false}')
+    monkeypatch.setenv("FAKE_TS_STATUS", "")
+    assert tailnet.diagnose() == ""
+    monkeypatch.setenv("FAKE_TS_PREFS", "")
+    monkeypatch.setenv("FAKE_TS_STATUS", '{"BackendState": "NeedsLogin"}')
+    assert "logged out" in tailnet.diagnose()
+    monkeypatch.setenv("FAKE_TS_STATUS", "not json")
+    assert tailnet.diagnose() == ""

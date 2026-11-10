@@ -390,14 +390,16 @@ def known_down(p, aliases: list[str], now: float) -> dict[str, str]:
 
 
 def text(where, since: float, n_tasks: int, names: list[str], tunnel: bool = False, now: float | None = None,
-         kind: str = "offline", advise: bool = True, others: int = 0, known: list[str] | None = None) -> str:
+         kind: str = "offline", advise: bool = True, others: int = 0, known: list[str] | None = None,
+         tailnet: str = "") -> str:
     """The alert: what cannot be reached, since when (home zone), how many tasks wait, what to do.
     `tunnel`: every host is reached through a tunnel from the user's workstation (no VPN advice);
     `now` adds how long it has been down. `kind` (classify): "offline" gives the
     VPN or network sign-in advice only with `advise` (a workstation); "hosts" says they are down and
     this machine's network is fine; "known": every host is already known down. `others`: queued tasks
     that can still run later (0: none, and none are counted). `known`: "alias (why)" of the hosts already
-    known down."""
+    known down. `tailnet` (tailnet.diagnose): what is wrong with this machine's Tailscale; it replaces
+    the generic advice."""
     shown_ = ", ".join(names[:HOSTS_MAX]) + (f" (+{len(names) - HOSTS_MAX} more)" if len(names) > HOSTS_MAX else "")
     what = f"{shown_} cannot" if names else "The hosts this project's work needs cannot"
     them, need = ("it", "it needs") if len(names) == 1 else ("them", "they need")
@@ -413,6 +415,10 @@ def text(where, since: float, n_tasks: int, names: list[str], tunnel: bool = Fal
         return (f"Tunnel: {what} be reached since {timefmt.long(since, where)}{lasted}: the tunnel from the "
                 f"user's workstation that reaches {them} is down; the held work resumes once it reconnects. {held}")
     told = f" Already known down: {'; '.join(known)}." if known else ""
+    if tailnet:
+        return (f"Network: {what} be reached from the machine running this project since "
+                f"{timefmt.long(since, where)}{lasted}.{told} {tailnet}; the held work resumes by itself once "
+                f"{them} answer{verb_s}. {held}")
     if kind == "known":
         return (f"Known down: {what} be reached since {timefmt.long(since, where)}{lasted}; already known down: "
                 f"{'; '.join(known or [])}. The held work resumes by itself once {them} answer{verb_s}. {held}")

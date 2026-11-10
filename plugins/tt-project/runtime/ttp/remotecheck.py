@@ -38,7 +38,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import sshagent
+from . import sshagent, tailnet
 
 FAULT_RC = 75
 ENV_DIR = ".git/ttp-env"   # the pinned Python env's maker and lock in the run folder (runnerenv.remote_lines)
@@ -136,7 +136,7 @@ def reachable(host: str) -> str:
     except subprocess.TimeoutExpired:
         if sshagent.password_manager():
             return f"ssh to {host} timed out after {PROBE_TIMEOUT_S} s: {sshagent.WHY}"
-        return f"ssh to {host} timed out after {PROBE_TIMEOUT_S} s"
+        return f"ssh to {host} timed out after {PROBE_TIMEOUT_S} s" + tailnet.suffix()
     except OSError as e:
         return f"cannot run ssh: {e}"
     if r.returncode == 0:
@@ -144,7 +144,8 @@ def reachable(host: str) -> str:
     if r.returncode == 255 and sshagent.locked(r.stderr):
         return f"ssh to {host} failed: {sshagent.WHY}"
     if r.returncode == 255:
-        return f"ssh cannot reach {host}: {(r.stderr.strip().splitlines() or ['exit 255'])[-1][:200]}"
+        return (f"ssh cannot reach {host}: {(r.stderr.strip().splitlines() or ['exit 255'])[-1][:200]}"
+                + tailnet.suffix())
     return f"{host} lacks git or tar"
 
 

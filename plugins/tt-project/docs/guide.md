@@ -996,7 +996,14 @@ coordinator with that evidence.
   ssh finds no route out) from "these hosts are down" (other hosts answer, from another task's
   probe or a healthy heal check, and only these fail). VPN or network sign-in advice is given only
   when the machine is offline and is a workstation (`waiting.workstation`; null detects a laptop or
-  desktop, so a server never gets it); hosts that are down are named with no advice. When every
+  desktop, so a server never gets it); hosts that are down are named with no advice. When the
+  machine has the `tailscale` command, the alert (and an `env:check-host` fault, and `ttp hostcheck`
+  when the host does not answer) says what is wrong with it, from `tailscale debug prefs` and
+  `tailscale status --json`: logged out (sign in), not running (turn it on), or running and logged
+  in but not accepting subnet routes, where no sign-in is needed and the fix,
+  `tailscale set --accept-routes=true`, is offered for the user to run (never run by the harness: it
+  changes the machine's network settings). Tailscale that is fine, missing or not answering adds
+  nothing; it never reports a logout while Tailscale is logged in. When every
   failing host is already known down (a `ttp machines outage`, a down or held condition, a paused
   resource, an active mute, an open incident or a task naming it as down or under repair), the
   alert is a low feed line, never "needs you". When other queued tasks can still run later, it also

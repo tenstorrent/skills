@@ -39,6 +39,7 @@ from pathlib import Path
 from . import runtimeload   # first of its own: its LOADED_AT is when the daemon imported its code
 from . import untrusted
 from . import sshmux
+from . import tailnet
 from . import sshagent
 from . import ackwait
 from . import claimcheck
@@ -10416,11 +10417,12 @@ class Daemon:
             kind, known = self._net_kind(unreachable, raw, now, float(new["since"])) \
                 if not tunnel else ("offline", {})
             new.update(tasks=[tid for tid, _ in unreachable], hosts=names, tunnel=tunnel, kind=kind)
+            ts = "" if tunnel else tailnet.diagnose()   # this machine's Tailscale, if it is the cause
             if tunnel and now - float(new["since"]) < page_after:
                 severity = "low"   # a tunnel that reconnects by itself: a feed line until page_after
             elif tunnel:
                 new["raised"] = now
-            elif kind == "known":
+            elif kind == "known" and not ts:
                 severity = "low"   # every host is already known down: a feed line, never "needs you"
         if new != st:
             db.set_kv(netwait.STATE_KEY, new)
@@ -10428,7 +10430,8 @@ class Daemon:
             self.alert(netwait.KEY, netwait.text(
                 self.p, float(new["since"]), len(unreachable), names, tunnel, now, kind=kind,
                 advise=kind == "offline" and netwait.workstation(self.cfg), others=others,
-                known=[f"{h} ({why})" for h, why in known.items()]), severity=severity)
+                known=[f"{h} ({why})" for h, why in known.items()],
+                tailnet=ts), severity=severity)
             log(self.p, f"network: {len(unreachable)} task(s) wait on unreachable hosts "
                         f"({', '.join(names) or 'unnamed'}{', tunnel route' if tunnel else ''}; {kind}); "
                         f"alerted once ({severity})")
