@@ -274,7 +274,9 @@ def test_a_remote_check_runs_in_the_hosts_pinned_env_and_never_without_it(tmp_pa
     cmd = f'printf "%s|%s|%s" "$PYTHONNOUSERSITE" "${{PIP_USER-unset}}" "${{PATH%%:*}}" > {seen}'
     rc, said = _rc_run(tmp_path, repo, cmd, PIP_USER="1")
     assert rc == 0, said
-    assert seen.read_text() == f"1|unset|{os.environ['TTP_TEST_CHECKS_PYTHON_ENV']}/bin"
+    nsite, pip_user, first = seen.read_text().split("|")
+    assert (nsite, pip_user) == ("1", "unset")
+    assert os.path.realpath(first) == os.path.realpath(os.environ["TTP_TEST_CHECKS_PYTHON_ENV"] + "/bin")
     assert "TTP_ENV_" not in said and _rc_left(tmp_path) == []
     seen.unlink()
     rc, said = _rc_run(tmp_path, repo, cmd, TTP_TEST_CHECKS_PYTHON_ENV=str(tmp_path / "none"))
@@ -295,7 +297,9 @@ def test_a_slurm_check_job_runs_in_the_nodes_pinned_env_and_is_a_fault_without_i
         subprocess.run(["sh", str(q / "job.sh")], cwd=q, env={**os.environ, "TTP_TEST_CHECKS_PYTHON_ENV": stand_in},
                        capture_output=True, timeout=120)
         assert (q / "rc").read_text().strip() == rc
-    assert seen.read_text() == f"1|{os.environ['TTP_TEST_CHECKS_PYTHON_ENV']}/bin"
+    nsite, first = seen.read_text().split("|")
+    assert nsite == "1"
+    assert os.path.realpath(first) == os.path.realpath(os.environ["TTP_TEST_CHECKS_PYTHON_ENV"] + "/bin")
 
 
 def test_a_pinned_env_fault_closes_once_its_env_is_made_or_its_lock_is_gone(tmp_path, monkeypatch):
