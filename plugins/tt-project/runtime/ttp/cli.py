@@ -7157,7 +7157,9 @@ def cmd_ssh_preflight(a) -> None:
     shown = f"{host} ({target})" if host != target else host
     why = {hostmap.HOST_KEY_RC: "host key not verified (changed, or not in known_hosts)",
            hostmap.AUTH_RC: "authentication failed",
-           hostmap.NO_NEW_PRIVS_RC: "not reachable from here"}.get(rc, "not reachable")
+           hostmap.NO_NEW_PRIVS_RC: "not reachable from here",
+           hostmap.AGENT_RC: "not checked: the ssh agent here is locked or waits for approval",
+           1: "not checked: the ssh agent here is locked or waits for approval"}.get(rc, "not reachable")
     if rc == 0:
         print(f"ssh-preflight: {shown} reachable")
     else:

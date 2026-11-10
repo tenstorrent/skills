@@ -38,6 +38,8 @@ import sys
 import time
 from pathlib import Path
 
+from . import sshagent
+
 FAULT_RC = 75
 ENV_DIR = ".git/ttp-env"   # the pinned Python env's maker and lock in the run folder (runnerenv.remote_lines)
 SHIP_DIR = ".git/ttp-py"   # where shipped Python files go in the run folder: never in the tree the check sees
@@ -132,11 +134,15 @@ def reachable(host: str) -> str:
         r = subprocess.run(_ssh(host, "command -v git >/dev/null && command -v tar >/dev/null"),
                            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=PROBE_TIMEOUT_S)
     except subprocess.TimeoutExpired:
+        if sshagent.password_manager():
+            return f"ssh to {host} timed out after {PROBE_TIMEOUT_S} s: {sshagent.WHY}"
         return f"ssh to {host} timed out after {PROBE_TIMEOUT_S} s"
     except OSError as e:
         return f"cannot run ssh: {e}"
     if r.returncode == 0:
         return ""
+    if r.returncode == 255 and sshagent.locked(r.stderr):
+        return f"ssh to {host} failed: {sshagent.WHY}"
     if r.returncode == 255:
         return f"ssh cannot reach {host}: {(r.stderr.strip().splitlines() or ['exit 255'])[-1][:200]}"
     return f"{host} lacks git or tar"
@@ -154,7 +160,9 @@ def _say(msg: str) -> None:
 
 
 def _fault(host: str, why: str) -> int:
-    _say(f"environment fault {SIG}{host}: {why}. This is the host, not the change")
+    agent = sshagent.WHY in why   # the ssh agent here (sshagent.py): neither the host nor the change
+    _say(f"environment fault {SIG}{host}: {why}. "
+         + ("Not the host and not the change: the run waits and retries" if agent else "This is the host, not the change"))
     return FAULT_RC
 
 
@@ -323,7 +331,8 @@ def _attempt(host, top, head, env, extra, cmd, mark, wrap, wait) -> tuple[int, s
             made = subprocess.run(_ssh(host, mktemp_cmd(), direct),
                                   stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=PROBE_TIMEOUT_S)
         except subprocess.TimeoutExpired:
-            return _fault(host, f"ssh timed out after {PROBE_TIMEOUT_S} s"), ""
+            return _fault(host, f"ssh timed out after {PROBE_TIMEOUT_S} s"
+                          + (f": {sshagent.WHY}" if sshagent.password_manager() else "")), ""
         tmp = made.stdout.strip()
         if made.returncode != 0 or not _TMP.fullmatch(tmp):
             tmp = ""
@@ -331,6 +340,8 @@ def _attempt(host, top, head, env, extra, cmd, mark, wrap, wait) -> tuple[int, s
                    f"{(made.stderr.strip().splitlines() or [''])[-1][:200]})")
             if made.returncode == 255 and _refused(made.stderr):
                 return FAULT_RC, why
+            if made.returncode == 255 and sshagent.locked(made.stderr):
+                why = f"ssh failed: {sshagent.WHY}"
             return _fault(host, why), ""
         _say(f"checking {head[:12]} on {host} in {tmp}")
         q = shlex.quote(tmp)

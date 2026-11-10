@@ -565,3 +565,116 @@ def test_ssh_reuse_off_reaches_the_daemons_own_ssh_calls(env, monkeypatch):
     d._load_config()
     stepclock._init(None, ["ssh", "h", "true"])
     assert seen[-1][0] == sshmux.wrapper()
+
+
+# A password manager's ssh agent that is locked or waits for approval (sshagent.py). Every test stubs
+# ssh and uses a made-up socket path: no real agent, key or ssh folder is read, and no key is made.
+_AGENT_ERR = ('sign_and_send_pubkey: signing failed for ED25519 "unattended" from agent: agent refused operation\n'
+              "box-a: Permission denied (publickey).")
+_PM_SOCK = "/fake-home/Group Containers/ABC.com.1password/t/agent.sock"
+
+
+def test_an_agent_refusal_is_the_ssh_agent_here_not_the_host(env, monkeypatch):
+    from types import SimpleNamespace
+    from ttp import hostmap, sshagent
+    assert sshagent.password_manager(_PM_SOCK) and sshagent.password_manager("/fake-home/bitwarden-agent")
+    assert not sshagent.password_manager("/tmp/ssh-XYZ/agent.123") and not sshagent.password_manager("")
+    # ssh's 255 with the agent's words: "not yet" (1), or 14 when classified; never auth (11) or unreachable
+    assert hostmap.classify(255, _AGENT_ERR) == 1
+    assert hostmap.classify(255, _AGENT_ERR, classified=True) == hostmap.AGENT_RC
+    assert hostmap.classify(255, "box-a: Permission denied (publickey).") == hostmap.AUTH_RC
+    assert hostmap.classify(255, "communication with agent failed") == 1
+    monkeypatch.setattr(hostmap.subprocess, "run", lambda argv, **k: SimpleNamespace(
+        returncode=255, stdout="", stderr=_AGENT_ERR))
+    assert hostmap.preflight("box-a", classified=True)[0] == hostmap.AGENT_RC
+
+    # A BatchMode ssh that hangs: the agent waits for approval when a password manager serves it
+    def hang(argv, **k):
+        raise subprocess.TimeoutExpired(argv, 1)
+    monkeypatch.setattr(hostmap.subprocess, "run", hang)
+    monkeypatch.setenv("SSH_AUTH_SOCK", _PM_SOCK)
+    rc, out = hostmap.preflight("box-a", timeout=1)
+    assert rc == 1 and sshagent.WHY in out
+    monkeypatch.setenv("SSH_AUTH_SOCK", "/tmp/ssh-XYZ/agent.123")
+    assert hostmap.preflight("box-a", timeout=1)[0] == 255   # a plain agent: the host did not answer
+
+
+def test_a_locked_agent_raises_one_alert_and_one_coordinator_offer_per_episode(env):
+    from ttp import alerts, sshagent
+    from ttp.daemon import Daemon
+    p = make(env)
+    d = Daemon(p.base)
+    now = time.time()
+    assert sshagent.seen(d, "task #1's probe", _AGENT_ERR, now)
+    assert not sshagent.seen(d, "task #2's probe", _AGENT_ERR, now + 60)   # the same episode
+    eps = p.db.q("SELECT * FROM alerts WHERE key=?", (sshagent.KEY,))
+    assert len(eps) == 1 and eps[0]["cleared"] is None and eps[0]["severity"] == "normal"
+    assert sshagent.WHY in eps[0]["text"] and "unlock the password manager" in eps[0]["text"]
+    assert alerts.holds(p.db, sshagent.KEY, now, now + 60)
+    evs = p.db.q("SELECT * FROM events WHERE kind=?", (sshagent.EVENT,))
+    assert len(evs) == 1
+    # the fallback goes only through the coordinator's ask path, and never as an unattended key
+    assert "ask_user (blocking access)" in evs[0]["text"] and "Never create a key unattended" in evs[0]["text"]
+    assert "IdentitiesOnly" in evs[0]["text"] and "never forwarded" in evs[0]["text"]
+    assert not sshagent.settle(d, now + 60 + sshagent.QUIET_S - 1)
+    assert sshagent.settle(d, now + 60 + sshagent.QUIET_S + 1)
+    assert p.db.one("SELECT cleared FROM alerts WHERE key=?", (sshagent.KEY,))["cleared"]
+    assert sshagent.seen(d, "task #1's probe", _AGENT_ERR, now + 2 * sshagent.QUIET_S + 120)   # a new episode
+    assert len(p.db.q("SELECT id FROM events WHERE kind=?", (sshagent.EVENT,))) == 2
+
+
+def test_a_waiting_probe_refused_by_the_agent_sleeps_on_without_a_host_fault(env, monkeypatch):
+    from ttp import daemon as dmod, sshagent
+    p = make(env)
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
+    b = p.harness / "bin"
+    b.mkdir(parents=True, exist_ok=True)
+    (b / "ssh").write_text("#!/bin/sh\nprintf '%s\\n' 'sign_and_send_pubkey: signing failed for ED25519 \"k\" from "
+                           "agent: agent refused operation' 'Permission denied (publickey).' >&2\nexit 255\n")
+    (b / "ssh").chmod(0o755)
+    d = dmod.Daemon(p.base)
+    hosts = []
+    monkeypatch.setattr(d, "_check_hosts", lambda h, now: hosts.extend(h))
+    tid = _due_waiting_task(p, "ssh -o BatchMode=yes box-a test -e /tmp/marker")
+    p.db.update_task(tid, not_before=time.time() + 3600)
+    _settle_probe(d, tid)
+    assert d._probe_rc[tid][0] == 1 and not _ready(p, tid)   # not yet: it sleeps on
+    assert hosts == [] and not p.db.kv("network_outage")       # no host checked, no outage counted
+    assert not p.db.q("SELECT id FROM alerts WHERE key LIKE 'machine%' OR key LIKE 'network%'")
+    assert len(p.db.q("SELECT id FROM alerts WHERE key=? AND cleared IS NULL", (sshagent.KEY,))) == 1
+    assert len(p.db.q("SELECT id FROM events WHERE kind=?", (sshagent.EVENT,))) == 1
+
+
+def test_a_heal_check_refused_by_the_agent_is_unknown_never_a_fault(env):
+    from ttp import heal, sshagent
+    p, d, up = _heal_setup(env)
+    spec, now = _heal_spec(p), time.time()
+    chk = "echo 'sign_and_send_pubkey: signing failed: agent refused operation' >&2; exit 255"
+    status, _ = heal.run(d, "svc", dict(spec, check=chk), now)
+    assert status.startswith("ok (unknown: the ssh agent here") and heal.state(p.db, "svc").get("status") != "unhealthy"
+    assert not up.exists() and not heal.state(p.db, "svc").get("task")   # no fix ran or was queued
+    assert len(p.db.q("SELECT id FROM alerts WHERE key=?", (sshagent.KEY,))) == 1
+
+
+def test_a_remote_check_refused_by_the_agent_is_an_environment_fault_naming_the_agent(monkeypatch):
+    from types import SimpleNamespace
+    from ttp import remotecheck, sshagent
+    monkeypatch.setattr(remotecheck.subprocess, "run", lambda argv, **k: SimpleNamespace(
+        returncode=255, stdout="", stderr=_AGENT_ERR))
+    why = remotecheck.reachable("box-a")
+    assert sshagent.WHY in why and "cannot reach" not in why
+    said = []
+    monkeypatch.setattr(remotecheck, "_say", said.append)
+    assert remotecheck._fault("box-a", why) == remotecheck.FAULT_RC   # waits and retries; the change never fails
+    assert "Not the host and not the change" in said[-1]
+
+
+def test_no_runtime_code_runs_ssh_keygen_or_ssh_add():
+    # Only the guards name them (to block or watch them); nothing in the runtime makes or loads a key.
+    import re as _re
+    import ttp
+    root = Path(ttp.__file__).parent
+    guards = {"credguard.py", "pathguard.py", "credwatch.py", "sidefx.py"}
+    call = _re.compile(r"""["']ssh-(?:keygen|add)["']\s*[,\]]|\bssh-keygen\s+-[tf]""")
+    hits = [f.name for f in root.rglob("*.py") if f.name not in guards and call.search(f.read_text())]
+    assert hits == [], hits

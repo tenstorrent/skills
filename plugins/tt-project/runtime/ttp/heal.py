@@ -193,7 +193,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Callable
 
-from . import outagemsg, pageto, schedrun, screen, scriptwatch, sshfail, timefmt
+from . import outagemsg, pageto, schedrun, screen, scriptwatch, sshagent, sshfail, timefmt
 from .db import DB
 from .project import command_env, durable_write
 
@@ -1043,6 +1043,14 @@ def _run(host: Any, name: str, spec: dict, now: float) -> tuple[str, float | Non
                     kind="info", severity="low", ref=STATE_KEY + name)
             return f"fixed ({n} today)", None
         return "ok (healthy)", None
+    if rc != 1 and sshagent.locked(out):
+        # The ssh agent here is locked or waits for approval: not the machine, never a fault or a fix (sshagent.py).
+        try:
+            sshagent.seen(host, f"heal check {name}", out, now)
+        except Exception:
+            pass
+        _save(db, name, st)
+        return "ok (unknown: the ssh agent here is locked or waiting for approval, not the machine)", None
     if rc != 1:
         # route_only: every unknown run since unknown_since was only its route failing (and the box not silent).
         route = route_failed(rc, out)

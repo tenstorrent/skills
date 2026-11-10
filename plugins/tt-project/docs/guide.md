@@ -999,6 +999,22 @@ coordinator with that evidence.
   resource, an active mute, an open incident or a task naming it as down or under repair), the
   alert is a low feed line, never "needs you". When other queued tasks can still run later, it also
   counts the ones that wait on their own timers or checks.
+- ssh agent locked or waiting (model-free, sshagent.py): when ssh signs through a password
+  manager's agent (SSH_AUTH_SOCK names 1Password, Bitwarden, Secretive, KeePassXC or the like) that is
+  locked or waits for the user to approve, unattended ssh fails with `sign_and_send_pubkey: signing
+  failed`, `agent refused operation` or `communication with agent failed`, or a BatchMode ssh hangs.
+  That is told apart from a host fault: a waiting probe reads it as "not yet" (never 255, so no outage
+  alert and no machine down episode), `ttp ssh-preflight` exits 14 with `--classified` (else 1), a
+  remote check reports an environment fault naming the agent (the change never fails; the run waits
+  and retries) and a heal check reads it as unknown, never unhealthy or a fix. One normal alert per
+  episode names the cause and how to clear it (unlock the password manager or approve its request),
+  stays in the top section and clears with a low line after 30 minutes without a sighting. The
+  coordinator gets one `ssh_agent_locked` event and may offer, once and only through its ask path
+  (blocking access), a fallback: a separate key used only for unattended work, restricted to the
+  hosts the projects use (a per-host config entry with `IdentitiesOnly yes`, never forwarded), its
+  passphrase in the OS keychain (macOS `ssh-add --apple-use-keychain`, Linux the desktop keyring). On
+  the user's yes it shows the exact steps, and runs them only if the user says so. tt-project never
+  creates a key unattended.
 - The web app shows spend per day, per task and per recurring job, and plan-window peaks for the
   last two weeks.
 - A task's row in the web app shows its chain's metric trend (the task, what continues it, its fixes

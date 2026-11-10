@@ -39,6 +39,7 @@ from pathlib import Path
 from . import runtimeload   # first of its own: its LOADED_AT is when the daemon imported its code
 from . import untrusted
 from . import sshmux
+from . import sshagent
 from . import ackwait
 from . import claimcheck
 from . import dispatchguard
@@ -10300,6 +10301,7 @@ class Daemon:
         now = time.time()
         if now - getattr(self, "_net_checked", 0.0) < every_s:
             return
+        sshagent.settle(self, now)   # a locked or waiting ssh agent's episode ends after a quiet spell
         self._net_checked = now
         db = self.p.db
         grace, debounce = netwait.settings(self.cfg)
@@ -13356,6 +13358,15 @@ class Daemon:
             # What the run really did, kept beside the verdict: a kill on the timeout reads as 1 ("not yet").
             self._probe_diag[tid] = {"rc": rc, "killed": rc is None, "tail": tails[id(proc)],
                                      "at": now, "probe": probe}
+        # The ssh agent here locked or waiting for approval: "not yet", never the host's fault (sshagent.py).
+        for i, (tid, proc, probe, rc) in enumerate(done):
+            if rc != 0 and sshagent.locked(outs[id(proc)], self._probe_diag[tid]["killed"]
+                                           and re.search(r"\bssh\b", probe) is not None):
+                done[i] = (tid, proc, probe, 1)
+                try:
+                    sshagent.seen(self, f"task #{tid}'s probe", outs[id(proc)], now)
+                except Exception as e:   # never stops the wait
+                    log(self.p, f"task {tid}: ssh agent failure not noted: {type(e).__name__}: {e}")
         # Every 255's hosts at once: in an outage the tick waits out one ssh timeout, not one per probe.
         self._check_hosts([h for _, proc, probe, rc in done if rc == netwait.UNREACHABLE_RC
                            for h in netwait.hosts(probe, outs[id(proc)])[:netwait.HOSTS_MAX]], now)

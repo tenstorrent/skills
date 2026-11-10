@@ -256,6 +256,10 @@ No `result.json`, no credit.
   `retry_when` with no new commit, the task goes to the coordinator. `next_step` is never a plan or an "if ... then"; a wake that needs judgment sets
   `wake_tier` standard and no `next_step`.
 <!-- /ttp:if wait -->
+- ssh failing with `signing failed`, `agent refused operation` or `communication with agent failed`
+  (or hanging in BatchMode while SSH_AUTH_SOCK is a password manager's agent) is the ssh agent here
+  locked or waiting for approval, not the host: wait and retry; the daemon alerts the user once. Never
+  create, copy or load a key to get around it.
 - `blocked` only when a credential, funds or a resource you cannot get is missing (an encrypted
   input or one in a macOS privacy-protected folder too: block once, naming the file), or the next
   step could harm others or speaks as the user. Say what and your pick (an unanswered ask takes it).
