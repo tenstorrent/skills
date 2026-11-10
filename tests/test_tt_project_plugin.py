@@ -5080,7 +5080,7 @@ def test_guide_documents_the_product_defaults():
     """Caps, the plan line and its reserve, free Codex resets, light-tier models and Jev as an add-on."""
     text = (PLUGIN / "docs" / "guide.md").read_text(encoding="utf-8")
     flat = " ".join(text.split())
-    assert "$100 per 24 hours and $200 per 7 days per project by default" in flat
+    assert "$100 per 24 hours per project by default" in flat and "7 times the daily cap in force ($700 by default)" in flat
     assert "Global daily cap (usage-billed, $200/day by default)" in flat
     assert "The 90% line is the default (`budget.reserve_pct` 10)" in flat
     assert "only that 10% is left for you" in flat and "raise the reserve" in flat
