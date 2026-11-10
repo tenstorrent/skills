@@ -128,6 +128,31 @@ def members(pgid: int) -> list[int]:
     return out
 
 
+def strays(pgid: int) -> list[int]:
+    """The live processes of the job led by pgid outside its group: its session's other groups (a test
+    runner's helpers, such as pytest-xdist workers, that took a group of their own) and the descendants of
+    its members that left the session (setsid). [] where /proc cannot tell."""
+    procs = {}
+    try:
+        names = os.listdir("/proc")
+    except OSError:
+        return []
+    for n in names:
+        try:
+            st = Path(f"/proc/{n}/stat").read_text().rsplit(")", 1)[1].split()
+            if n.isdigit() and st[0] != "Z":
+                procs[int(n)] = (int(st[1]), int(st[2]), int(st[3]))   # ppid, pgid, sid
+        except (OSError, IndexError, ValueError):
+            continue
+    ours = {pid for pid, (_, g, sid) in procs.items() if g == pgid or sid == pgid}
+    grew = True
+    while grew:
+        more = {pid for pid, (pp, _, _) in procs.items() if pp in ours and pid not in ours}
+        ours |= more
+        grew = bool(more)
+    return sorted(pid for pid in ours if procs[pid][1] != pgid and pid != os.getpid())
+
+
 def _argv(pid: int) -> list[str]:
     if not _PROC:
         return procinfo.argv(pid)   # macOS: sysctl KERN_PROCARGS2
@@ -383,9 +408,23 @@ def end(p: Project, rc: Path, why: str, task: int | None = None, reason: str = "
         except OSError:
             pass
         pids = members(pgid)
+        for pid in strays(pgid):   # stopped too, before any can start another
+            try:
+                os.kill(pid, signal.SIGSTOP)
+            except OSError:
+                pass
+        stray = strays(pgid)
+        pids += stray
     ids, note = end_broker_jobs(pids)
     if pgid:
         detach.stop(rc, pgid, why, reason=reason, by=BY, task=task, state=p.state)
+        for pid in stray:   # its helpers in other groups of its session, or that left it
+            try:
+                os.kill(pid, signal.SIGKILL)
+                detach.signalled(rc, signal.SIGKILL, pid, reason, f"{why}; a helper of the job outside its group",
+                                 by=BY, group=False, state=p.state, task=task)
+            except OSError:
+                pass
     extra = end_requeued(p, rc, why, task, reason)
     freed, held = _free(slots, pgid, set(pids), lambda pid, s: detach.signalled(
         rc, signal.SIGKILL, pid, reason, f"{why}; it still held {s.name}", by=BY, group=False, state=p.state,
