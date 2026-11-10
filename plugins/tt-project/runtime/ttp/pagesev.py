@@ -16,7 +16,9 @@ time though most carry no decision:
 - `machine_change_overdue` (machine_ledger.route): normal, high only for a change on a live serving
   machine (`serving_machine`) that is past its end with no until-probe or one that has not passed
   (`change_severity`). Each project hears of one change once per episode: its own event and pages
-  relayed from other projects' daemons share one fingerprint (`change_fingerprint`).
+  relayed from other projects' daemons share one fingerprint (`change_fingerprint`), also when several
+  arrive batched in one item (a handled row per further fingerprint). Only a risky change
+  (`machine_ledger.change_risk`) unhandled for 24 h reaches the user.
 
 Urgent (`urgent`): priority 1, an `urgent:` line in the spec, or a required owner of an open obligation.
 """

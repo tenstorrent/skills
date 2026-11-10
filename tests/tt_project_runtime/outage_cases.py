@@ -487,3 +487,116 @@ def test_an_overdue_change_on_an_unpaused_machine_escalates_to_the_user(env):
     due = t0 + 3601
     got = [_change_pages(ml, due + k * ml.REPAGE_S) for k in range(4)]
     assert got == [[("gamma", 0)], [("owner", 1)], [("beta", 2)], [(ml.USER, 3)]]
+
+
+def _expired(ml, n, by="alpha", what="soak test drop-in", undo="rm -f /tmp/soak.conf", at=None, alias="box-a"):
+    """n change entries by `by` on `alias`, each past its end by an hour at `at`: their ids."""
+    at = time.time() if at is None else at
+    return [ml.add_change(alias, f"{what} {i}", undo, by, expires="1h", now=at - 7200)["id"] for i in range(n)]
+
+
+def _all_able(n):
+    return True, ""
+
+
+def test_expired_changes_of_one_project_reach_its_coordinator_as_one_item_and_never_the_user(env, monkeypatch):
+    """(a) N expired entries of one project: one queued coordinator event listing each with renew, close or
+    undo; the others' fingerprints are filed handled, so a resend wakes nobody; the user hears nothing."""
+    from ttp.daemon import Daemon
+    alpha, ml = _outage_box(env, "alpha", **{"box-a": ("owner", "beta")})
+    ids = _expired(ml, 3)
+    d = Daemon(alpha.base)
+    told = []
+    monkeypatch.setattr(d, "alert", lambda *a, **k: told.append(a))
+    d.route_machines()
+    rows = alpha.db.q("SELECT kind, status, text FROM events WHERE kind='machine_change_overdue' ORDER BY id")
+    queued = [r for r in rows if r["status"] == "queued"]
+    assert len(queued) == 1 and len(rows) == 3 and all(r["status"] == "handled" for r in rows[1:])
+    text = queued[0]["text"]
+    assert all(f"#{i} on box-a" in text for i in ids) and "rm -f /tmp/soak.conf" in text
+    assert "renew it" in text and "close it" in text and "undo it" in text and "no word" in text
+    assert "Outage" not in text and "Acting now" not in text and told == []
+    # The same records sent again (a crash before they were marked, or a later step's resend): nothing new.
+    assert ml.route(time.time(), able=_all_able, healthy=lambda *a: [], quiet=_no_quiet) == []
+    fps = [r["fingerprint"] for r in alpha.db.q("SELECT fingerprint FROM events WHERE kind='machine_change_overdue' "
+                                                 "ORDER BY id")]
+    again = [{"target": "alpha", "kind": "machine_change_overdue", "key": f"machine-change:{i}", "alias": "box-a",
+              "fp": fp, "line": f"#{i}", "change": i, "text": "x", "id": fp} for i, fp in zip(ids, fps)]
+    assert d._machine_pages(again, time.time())
+    assert alpha.db.one("SELECT COUNT(*) n FROM events WHERE kind='machine_change_overdue'")["n"] == 3
+
+
+def test_a_harmless_expired_change_never_pages_the_user(env):
+    """(b) An entry the risk rule calls harmless, nobody acting on it for days: it stays with the projects."""
+    p, ml = _outage_box(env, "beta", **{"box-a": ("owner", "beta")})
+    t0 = time.time()
+    _expired(ml, 1, by="beta", at=t0)
+    assert ml.change_risk(ml.load()["changes"][0], {}) == ""
+    able = {"beta": (False, "its daemon is stopped"), "owner": (False, "its daemon is stopped")}
+    seen = []
+    for h in range(0, 24 * 6):
+        seen += _route(ml, t0 + h * 3600, able)
+    assert seen and ml.USER not in [t for _, _, t, _ in seen]
+
+
+def test_a_risky_expired_change_unhandled_for_a_day_pages_the_user_once(env):
+    """(c) An entry that stopped a recovery service: after its projects let 24 h pass, the user once, as a
+    risky change (no outage wording); never before 24 h, and never again."""
+    p, ml = _outage_box(env, "beta", **{"box-a": ("owner", "beta")})
+    t0 = time.time()
+    _expired(ml, 1, by="beta", what="stopped the recovery watchdog", undo="systemctl start watchdog", at=t0)
+    assert ml.change_risk(ml.load()["changes"][0], {})
+    able = {"beta": (False, "its daemon is stopped"), "owner": (False, "its daemon is stopped")}
+    users = []
+    for h in range(0, 24 * 5):
+        at = t0 + h * 3600
+        for x in ml.route(at, able=lambda n: able.get(n, (False, "?")), healthy=lambda *a: [], quiet=_no_quiet):
+            ml.delivered(x)
+            if x["target"] == ml.USER:
+                users.append((at, x["text"]))
+    assert len(users) == 1 and users[0][0] - t0 >= ml.USER_AFTER_S
+    assert "risky" in users[0][1] and "Outage" not in users[0][1] and "Acting now" not in users[0][1]
+
+
+@pytest.mark.parametrize("how", ["renew", "close", "undo"])
+def test_renew_close_or_undo_clears_an_expired_change_and_its_page(env, how):
+    """(d) Each of the three choices ends the entry's page: no pending page, nothing on later rounds."""
+    p, ml = _outage_box(env, "beta", **{"box-a": ("owner", "beta")})
+    t0 = time.time()
+    cid = _expired(ml, 1, by="beta", what="stopped the recovery watchdog", undo="systemctl start watchdog", at=t0)[0]
+    able = {"beta": (True, ""), "owner": (True, "")}
+    assert [t for _, _, t, _ in _route(ml, t0, able)] == ["beta"]
+    if how == "renew":
+        ml.edit_change(cid, "beta", expires="2d", now=t0 + 60)
+    else:   # undo: its undo is run, then the entry closed
+        ml.close_change(cid, "undone" if how == "undo" else "kept", by="beta", now=t0 + 60)
+    c = next(c for c in ml.load()["changes"] if c["id"] == cid)
+    assert not (c.get("page") or {}).get("pending")
+    assert all(_route(ml, t0 + h * 3600, able) == [] for h in range(1, 30))
+
+
+@pytest.mark.parametrize("why", ["not a project of this user", "it is paused"])
+def test_an_expired_change_of_a_gone_or_paused_project_goes_to_the_recovery_owner(env, why):
+    """(e) Its project gone or paused: the machine's recovery owner gets it first, then its fallback."""
+    p, ml = _outage_box(env, "beta", **{"box-a": ("owner", "beta")})
+    t0 = time.time()
+    _expired(ml, 1, by="gamma", at=t0)
+    able = {"gamma": (False, why), "owner": (False, "its daemon is stopped"), "beta": (True, "")}
+    assert [t for _, _, t, _ in _route(ml, t0, able)] == ["owner"]
+    assert [t for _, _, t, _ in _route(ml, t0 + ml.UNAVAILABLE_S + 60, able)] == ["beta"]
+
+
+def test_a_relayed_batch_of_expired_changes_is_filed_once_per_change(env):
+    """A batch note from another project's daemon wakes once; a later copy of any change in it is handled."""
+    from ttp import upstream
+    p = make(env)
+    fps = ["machine-change:7@100", "machine-change:8@100"]
+    assert upstream.send("peer", None, p.name, "2 machine changes are past their end", "normal", sender="daemon",
+                         extra={"page_fp": fps[0], "page_fps": fps}) == "sent"
+    assert upstream.send("peer", None, p.name, "change 8 again", "normal", sender="daemon",
+                         extra={"page_fp": fps[1]}) == "sent"
+    upstream.ingest(p, p.config())
+    rows = p.db.q("SELECT fingerprint, status, text FROM events WHERE source='upstream' ORDER BY id")
+    assert [r["status"] for r in rows if r["status"] == "queued"] == ["queued"]
+    assert {r["fingerprint"] for r in rows} >= set(fps)
+    assert next(r for r in rows if "again" in r["text"])["status"] == "handled"

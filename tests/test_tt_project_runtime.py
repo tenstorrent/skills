@@ -40180,14 +40180,15 @@ def test_an_overdue_machine_change_pages_its_project_then_the_owner(env):
     now = time.time()
     ml.add_change("box-a", "drop-in for a soak", "remove-drop-in", "gamma", expires="1h", now=now)
     assert ml.route(now + 60, able=lambda n: (True, "")) == []
-    able = {"gamma": (False, "it is paused"), "alpha": (True, "")}
+    able = {"gamma": (False, "its daemon is stopped"), "alpha": (True, "")}
     pages = ml.route(now + 3601, able=able.get)
     assert [(x["target"], x["kind"]) for x in pages] == [("gamma", "machine_change_overdue")]
-    assert "undo it with `remove-drop-in`" in pages[0]["text"]
+    assert "Undo: `remove-drop-in`" in pages[0]["text"] and "renew it" in pages[0]["text"]
     ml.route(now + 3700, able=able.get)
     pages = ml.route(now + 3700 + ml.UNAVAILABLE_S, able=able.get)
     assert [x["target"] for x in pages] == ["alpha"]
-    assert ml.route(now + 3700 + ml.UNAVAILABLE_S + ml.REPAGE_S, able=able.get)[0]["target"] == ml.USER
+    # A harmless change (a soak's drop-in) stays with its projects: the user is never paged for it.
+    assert ml.route(now + 3700 + ml.UNAVAILABLE_S + 3 * ml.REPAGE_S, able=able.get) == []
     ml.close_change(1, "undone")
     assert ml.route(now + 4 * 86400, able=able.get) == []
 

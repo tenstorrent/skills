@@ -44,9 +44,12 @@ and edit also run a new probe once, check_probe_unmet, and refuse one that passe
 (a task of the project that made it, such as the follow-up that uses a staged build tree) is done, failed,
 cancelled or gone; a probe-only or task-only entry also expires after PROBE_END_S, and a continuation task
 re-extends it with `ttp machines change edit <id> --until-task <its own id>`. The daily review lists the
-project's open entries whose task is over (task_lines). An overdue entry pages the project that made it, then the machine's
-owner, then its fallback, each after the one before cannot act for UNAVAILABLE_S or let REPAGE_S pass,
-then the user. While its machine is in a known outage, held machine-wide or has a resource paused by the user
+project's open entries whose task is over (task_lines). An overdue entry pages the project that made it (skipped
+when that project is gone or paused, GONE_OR_PAUSED), then the machine's owner, then its fallback, each after the
+one before cannot act for UNAVAILABLE_S or let REPAGE_S pass. A project's overdue entries reach its coordinator as
+one item (batches, batch_text: each entry's what, undo and age with the renew, close or undo choices), which it
+decides without the user's word. The user is paged only for a risky entry (change_risk) nobody renewed, closed or
+undid for USER_AFTER_S since its first page; a harmless one stays with the last project in its chain. While its machine is in a known outage, held machine-wide or has a resource paused by the user
 or for every project (change_quiet, quiet_reason's cross-project reasons), the project that made it still gets
 its first page, but nothing escalates past it; the page records the reason (`quiet`), and once it ends the
 steps resume from that moment. Unlike a condition's page, an overdue entry's page is normal: high only on a live serving machine
@@ -159,6 +162,25 @@ UNWRITABLE = (errno.EROFS, errno.EACCES, errno.EPERM)   # the shared ledger is f
 CLAIM_S = 120               # a pending page one daemon took and did not mark delivered is retried after this
 UNAVAILABLE_S = 1800         # a target that cannot act this long is passed over
 REPAGE_S = 86400             # an item still open this long after its page is paged again, one step on
+USER_AFTER_S = 86400         # an expired change reaches the user only once unhandled this long, and only when risky
+
+# Risk rule for an expired change record (change_risk): only a risky one ever reaches the user, and only after its
+# projects left it USER_AFTER_S. Risky: its text or undo names a stopped or disabled service or recovery switch, a
+# pause, a reservation or drain, firewall, network, ssh or credential matters, mounts, kernel or driver settings
+# (_RISKY_RE), or its undo starts or enables a service (_UNDO_RISKY_RE); a change on a live serving machine
+# (pagesev.serving_machine); and an unclassified change (neither list matches) on a machine whose recovery owner
+# or fallback is another project. Harmless, never paged to the user: a no-op undo, and test or scratch dirs, helper
+# scripts, soak runs and restarts, logs, caches, worktrees and ledger edits (_HARMLESS_RE) on a machine that
+# serves nothing. A risky word wins over a harmless one.
+_RISKY_RE = re.compile(
+    r"\b(?:systemctl\s+(?:stop|disable|mask)|(?:stop(?:ped)?|disabl(?:e|ed)|mask(?:ed)?)\b[^.;]{0,40}?"
+    r"\b(?:service|unit|daemon|timer|watchdog|recovery)|recovery|paused?|pauses|firewall|iptables|nftables|ufw|"
+    r"network|netplan|routes?|dns|resolv\.conf|vpn|sshd?|authorized_keys|credentials?|tokens?|secrets?|"
+    r"passwords?|passwd|sudoers?|certs?|certificates?|keys?|fstab|mounts?|sysctl|modprobe|kernel|drivers?|"
+    r"firmware|reservations?|reserved|cordon(?:ed)?|drain(?:ed)?)\b", re.I)
+_UNDO_RISKY_RE = re.compile(r"\bsystemctl\s+(?:start|enable|unmask)\b|\bservice\s+\S+\s+start\b", re.I)
+_HARMLESS_RE = re.compile(r"\b(?:tests?|testing|tmp|temp|scratch|helpers?|scripts?|soak\w*|restart\w*|ledger|logs?|"
+                          r"cache|worktrees?|bundles?|mkdir|rm\s+-r\w*)\b|/tmp/|/dev/shm/", re.I)
 GRACE_S = 1800               # default: how long a condition lasts before it is routed
 CONDITION_GONE_S = 3 * 3600  # a condition nobody reported this long is over
 PROBE_END_S = 7 * 86400      # an entry with only an until-probe or until-task is overdue after this anyway
@@ -825,6 +847,26 @@ NOOP_UNDO = re.compile(r"(?:true|:|(?i:none)(?:[:;\s-].*)?)?", re.S)
 AUTO_CLOSE = "auto-close"   # closed_by of an entry route closed itself: f"{AUTO_CLOSE}: <rule>"
 
 
+def change_risk(c: dict, m: dict | None = None) -> str:
+    """Why expired change `c` is risky enough to reach the user once unhandled USER_AFTER_S ("" when harmless:
+    it never does); the rule is above _RISKY_RE. `m`: its machines.json entry (read when None)."""
+    if noop_undo(c.get("undo")):
+        return ""
+    m = (machines.load().get(c.get("alias")) or {}) if m is None else m
+    what, undo = str(c.get("what") or ""), str(c.get("undo") or "")
+    hit = _RISKY_RE.search(f"{what} {undo}")
+    if hit:
+        return f"it touches {' '.join(hit.group(0).split())}"
+    if _UNDO_RISKY_RE.search(undo):
+        return "its undo starts a stopped service"
+    if pagesev.serving_machine(m):
+        return "its machine serves live traffic"
+    if _HARMLESS_RE.search(f"{what} {undo}"):
+        return ""
+    others = sorted({m.get("recovery_owner"), m.get("recovery_fallback")} - {None, "", c.get("by")})
+    return f"it is unclassified on a machine shared with {', '.join(others)}" if others else ""
+
+
 def noop_undo(undo: Any) -> bool:
     """Whether undo command `undo` does nothing (NOOP_UNDO, after trimming whitespace)."""
     return isinstance(undo, str) and NOOP_UNDO.fullmatch(undo.strip()) is not None
@@ -1338,9 +1380,13 @@ def _ask(able: Callable[[str], tuple[bool, str]], who: str) -> tuple[bool, str]:
     return False, "not a project of this user"
 
 
-def _step(page: dict, targets: list[str], now: float, able: Callable[[str], tuple[bool, str]]) -> str | None:
-    """Advance one item's page state; returns the target to page now, or None."""
+def _step(page: dict, targets: list[str], now: float, able: Callable[[str], tuple[bool, str]],
+          to_user: Callable[[], bool] | None = None) -> str | None:
+    """Advance one item's page state; returns the target to page now, or None. `to_user` (an expired change's
+    gate): False keeps the item at its last project instead of passing it to the user, judged again each round."""
     if "stage" not in page:
+        if not targets and to_user is not None and not to_user():
+            return None
         page.update(stage=0, at=now)
         return targets[0] if targets else USER
     stage = int(page["stage"])
@@ -1354,6 +1400,8 @@ def _step(page: dict, targets: list[str], now: float, able: Callable[[str], tupl
         page.setdefault("unable_since", now)
         page["why"] = why
     if (not ok and now - page["unable_since"] >= UNAVAILABLE_S) or now - page["at"] >= REPAGE_S:
+        if stage + 1 >= len(targets) and to_user is not None and not to_user():
+            return None
         page.update(stage=stage + 1, at=now)
         page.pop("unable_since", None)
         return targets[stage + 1] if stage + 1 < len(targets) else USER
@@ -1622,7 +1670,13 @@ def route(now: float | None = None, able: Callable[[str], tuple[bool, str]] | No
                     changed = True
                 continue
             page = c.setdefault("page", {})
-            makers = chain(c["alias"], c.get("by"))
+            if "stage" not in page and "first" not in page:
+                # its project gone or paused: the machine's recovery owner (then its fallback) has it from the start
+                # (kept when nobody else is in its chain: someone always has it)
+                whom = chain(c["alias"], c.get("by"))
+                page["skip"] = [t for t in whom[:1] if len(whom) > 1 and _ask(able, t)[1] in GONE_OR_PAUSED]
+            page.setdefault("first", now)
+            makers = [t for t in chain(c["alias"], c.get("by")) if t not in (page.get("skip") or [])]
             if c["alias"] not in hushed:
                 hushed[c["alias"]] = change_quiet(c["alias"], now, doc)
             why = hushed[c["alias"]]
@@ -1637,18 +1691,25 @@ def route(now: float | None = None, able: Callable[[str], tuple[bool, str]] | No
             if page.pop("quiet", None) is not None and "stage" in page:
                 page.update(at=now)   # the steps resume from now, not from the page before the pause
                 page.pop("unable_since", None)
-            target = _step(page, makers, now, able)
+            m_entry = machines.load().get(c["alias"]) or {}
+            risk = change_risk(c, m_entry)
+            target = _step(page, makers, now, able,
+                           to_user=lambda: bool(risk) and now - float(page["first"]) >= USER_AFTER_S)
             gave_up = c.get("auto_undo_failed") or {}
             if target:
                 episode = float(c.get("page_from") or c["added"])
+                line = change_line(c, now, late, gave_up)
+                if target == USER:
+                    from . import outagemsg
+                    text = (f"A risky machine change has had no answer for "
+                            f"{outagemsg.duration(now - float(page['first']))} ({risk}): {line} "
+                            f"Its projects ({', '.join(makers) or 'none'}) did not renew, close or undo it.")
+                else:
+                    text = (f"Expired machine change ({late}): {line} {CHANGE_CHOICES} Decide it yourself: the user "
+                            f"needs to give no word for it.")
                 _pending(page, target, "machine_change_overdue", f"machine-change:{c['id']}", c["alias"], episode,
-                         f"Machine change #{c['id']} on {c['alias']} is overdue ({late}): {c['what']} "
-                         f"(by {c.get('by')}). "
-                         + (f"Its auto-undo gave up ({gave_up.get('why')})"
-                            + (f"; its output ended: {_clip(str(gave_up['tail'])[-AUTO_UNDO_PAGE_TAIL_CHARS:], AUTO_UNDO_PAGE_TAIL_CHARS)}"
-                               if gave_up.get("tail") else "") + ". " if gave_up else "")
-                         + f"Page {page['stage'] + 1}: undo it with `{c['undo']}`, "
-                         f"then `ttp machines change close {c['id']}`, which answers this page itself.")
+                         text)
+                page["pending"].update(line=line, by=c.get("by"), change=c["id"])
                 # Normal unless a live serving machine's change is past its end unconfirmed; one
                 # fingerprint per change and episode, so each project hears of it once (pagesev.py).
                 page["pending"].update(
@@ -1660,6 +1721,49 @@ def route(now: float | None = None, able: Callable[[str], tuple[bool, str]] | No
     for line in shut:   # only once written
         log(line)
     return out
+
+
+GONE_OR_PAUSED = ("not a project of this user", "it is paused")   # can_act's answers that pass a maker over at once
+CHANGE_CHOICES = ("For each: renew it (`ttp machines change edit <id> --expires <time>`) if the change is still "
+                  "needed; close it (`ttp machines change close <id>`) to keep the change, or when its undo is a "
+                  "no-op; or undo it (run its undo, then close it).")
+
+
+def change_line(c: dict, now: float, late: str = "", gave_up: dict | None = None) -> str:
+    """One expired change for its page: id, machine, author, age, what and why, its undo, and a gave-up auto-undo."""
+    from . import outagemsg
+    gave_up = gave_up or {}
+    return (f"#{c['id']} on {c['alias']} by {c.get('by') or '?'}, made "
+            f"{outagemsg.duration(now - float(c.get('since') or c.get('added') or now))} ago"
+            + (f", {late}" if late else "") + f": {c['what']}. Undo: `{c['undo']}`."
+            + (f" Its auto-undo gave up ({gave_up.get('why')})"
+               + (f"; its output ended: {_clip(str(gave_up['tail'])[-AUTO_UNDO_PAGE_TAIL_CHARS:], AUTO_UNDO_PAGE_TAIL_CHARS)}"
+                  if gave_up.get("tail") else "") + "." if gave_up else ""))
+
+
+def batches(pages: list[dict]) -> list[list[dict]]:
+    """route's pages, grouped for delivery: one project's expired-change pages go out as one item (batch_text);
+    every other page, and a change page to the user, alone. Order kept by each group's first page."""
+    out: list[list[dict]] = []
+    by: dict[str, list[dict]] = {}
+    for pg in pages:
+        if pg.get("kind") == "machine_change_overdue" and pg.get("target") != USER and pg.get("line"):
+            if pg["target"] not in by:
+                by[pg["target"]] = []
+                out.append(by[pg["target"]])
+            by[pg["target"]].append(pg)
+        else:
+            out.append([pg])
+    return out
+
+
+def batch_text(pages: list[dict]) -> str:
+    """The one item a project gets for its expired-change pages: each record on a line, then the choices."""
+    if len(pages) == 1 or not all(pg.get("line") for pg in pages):
+        return pages[0]["text"]
+    lines = "\n".join(f"- {pg['line']}" for pg in pages)
+    return (f"{len(pages)} machine changes are past their end:\n{lines}\n{CHANGE_CHOICES} Decide each yourself: "
+            f"the user needs to give no word for them.")
 
 
 def orphan_lines(now: float | None = None, where=None) -> list[str]:

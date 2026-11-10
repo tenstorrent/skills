@@ -2790,16 +2790,17 @@ class Daemon:
         except Exception:
             log(self.p, "routing shared-machine pages failed\n" + traceback.format_exc())
             return
-        for page in pages:
+        for group in machine_ledger.batches(pages):   # one project's expired changes: one item
             try:
-                ok = self._machine_page(page, now)
+                ok = self._machine_pages(group, now)
             except Exception:
                 ok = False
-                log(self.p, f"page for {page['key']} failed\n" + traceback.format_exc())
-            try:
-                (machine_ledger.delivered if ok else machine_ledger.release)(page)
-            except Exception:
-                log(self.p, f"settling the page for {page['key']} failed\n" + traceback.format_exc())
+                log(self.p, f"page for {group[0]['key']} failed\n" + traceback.format_exc())
+            for page in group:
+                try:
+                    (machine_ledger.delivered if ok else machine_ledger.release)(page)
+                except Exception:
+                    log(self.p, f"settling the page for {page['key']} failed\n" + traceback.format_exc())
 
     def host_cycle_held(self, now: float) -> dict | None:
         """The planned cycle of this host (hostcycle.hold) that holds this tick's new worker and reviewer
@@ -2877,9 +2878,54 @@ class Daemon:
         except Exception:
             log(self.p, "quarantine lift sweep failed\n" + traceback.format_exc())
 
+    def _machine_pages(self, pages: list[dict], now: float) -> bool:
+        """Deliver one group of machine_ledger.batches: a project's expired-change pages as one item, else one
+        page; whether it went out (or already had: a resend is idempotent)."""
+        if len(pages) > 1 or (pages[0].get("kind") == "machine_change_overdue"
+                              and pages[0]["target"] != machine_ledger.USER and pages[0].get("line")):
+            return self._change_batch(pages, now)
+        return self._machine_page(pages[0], now)
+
+    def _change_batch(self, pages: list[dict], now: float) -> bool:
+        """A project's expired machine changes as one item: one queued event (one coordinator wake) here, or one
+        note to the project that has them. Each record keeps its own fingerprint (pagesev.change_fingerprint):
+        one already filed, by this daemon or a copy another project's daemon relayed, is left out, and the rest
+        get handled marker rows, so a resend of the same records neither wakes nor pages again."""
+        target = pages[0]["target"]
+        severity = "high" if any(pg.get("severity") == "high" for pg in pages) else "normal"
+        fps = [str(pg.get("fp") or pg.get("id") or pg["key"]) for pg in pages]
+        if target == self.p.name:
+            with self.p.db.tx():
+                fresh = [(fp, pg) for fp, pg in zip(fps, pages)
+                         if not self.p.db.one("SELECT id FROM events WHERE fingerprint=?", (fp,))]
+                if not fresh:
+                    return True
+                text = machine_ledger.batch_text([pg for _, pg in fresh])
+                first = self.p.db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,data,status) "
+                                    "VALUES(?,?,?,?,?,?,?,?)",
+                                    (now, "daemon", "machine_change_overdue", fresh[0][0], severity, text,
+                                     json.dumps({"changes": [pg.get("change") for _, pg in fresh],
+                                                 "fps": [fp for fp, _ in fresh]}), "queued"))
+                for fp, pg in fresh[1:]:
+                    self.p.db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status) "
+                                "VALUES(?,?,?,?,?,?,?)", (now, "daemon", "machine_change_overdue", fp, "low",
+                                                          f"machine change #{pg.get('change')}: in event #{first}",
+                                                          "handled"))
+        else:
+            text = machine_ledger.batch_text(pages)
+            got = upstream.send(self.p.name, None, target, text, severity, now=now, sender="daemon",
+                                extra={"page_fp": fps[0], "page_fps": fps})
+            if got not in ("sent", "duplicate"):
+                log(self.p, f"page for {pages[0]['key']} to {target}: {got}; retried on a later tick")
+                return False
+        log(self.p, f"paged {target}: {text}")
+        return True
+
     def _machine_page(self, page: dict, now: float) -> bool:
         """Deliver one page; whether it went out (or already had: a resend is idempotent)."""
         target, text = page["target"], page["text"]
+        if page.get("kind") == "machine_change_overdue" and target != machine_ledger.USER and page.get("line"):
+            return self._change_batch([page], now)
         severity = page.get("severity") or "high"
         rec = page.get("outage") if page.get("kind") == outagetask.KIND else None
         if target == machine_ledger.USER:
@@ -2887,6 +2933,8 @@ class Daemon:
             said = text if outagemsg.ACTOR_RE.search(text) else f"{text} {outagemsg.ACTING} {outagemsg.TO_USER}."
             if page.get("kind") == "machine_condition":
                 self.alert(page["key"], f"Outage: {said}", severity="high")
+            elif page.get("kind") == "machine_change_overdue":   # a risky change unhandled a day: not an outage
+                self.alert(page.get("id") or page["key"], text, severity=severity)
             else:   # an outage task open past its due time
                 self.alert(page.get("id") or page["key"], f"Outage: {said}", severity=severity)
         elif target == self.p.name and rec is not None:   # the tracked task, in this project's own database

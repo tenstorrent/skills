@@ -349,7 +349,7 @@ def send(source: str, task: int | None, to: str, text: str, severity: str = "nor
                              **({"back": back} if back and not at else {}),
                              **({"reply_to": reply_of(text)} if reply_of(text) else {}),
                              **({"confirms": _confirms(confirms)} if _confirms(confirms) and sender != "daemon" else {}),
-                             **({k: v for k, v in extra.items() if k in ("outage", "page_fp")}
+                             **({k: v for k, v in extra.items() if k in ("outage", "page_fp", "page_fps")}
                                 if extra and sender == "daemon" else {})},
                             sort_keys=True) + "\n").encode())
         f.flush()
@@ -767,10 +767,18 @@ def _file(p: project.Project, sources, offsets: dict, known: set, seen: list, no
             # A daemon's page with a fingerprint (an overdue machine change, pagesev.change_fingerprint)
             # reaches the coordinator once: a copy of one this project already has is kept, handled.
             page_fp = str(n.get("page_fp") or "") if to and n.get("from") == "daemon" else ""
-            had = bool(page_fp) and bool(p.db.one("SELECT id FROM events WHERE fingerprint=?", (page_fp,)))
+            # A batch of a project's expired changes (page_fps): queued while any of them is new here; each new
+            # one also gets a handled row with its fingerprint, so a later copy of it is kept handled.
+            fps = [page_fp] + [str(x) for x in (n.get("page_fps") or [])[:200] if x and str(x) != page_fp] \
+                if page_fp else []
+            new = [fp for fp in fps if not p.db.one("SELECT id FROM events WHERE fingerprint=?", (fp,))]
+            had = bool(page_fp) and not new
             p.db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status) VALUES(?,?,?,?,?,?,?)",
-                   (now, "upstream", "upstream_note", None if had else (page_fp or None), "low" if had else sev,
-                    text[:cap], "handled" if had else "queued"))
+                   (now, "upstream", "upstream_note", None if had else ((new[0] if new else page_fp) or None),
+                    "low" if had else sev, text[:cap], "handled" if had else "queued"))
+            for fp in new[1:]:
+                p.db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status) VALUES(?,?,?,?,?,?,?)",
+                       (now, "upstream", "upstream_note", fp, "low", f"in the note {n.get('fp')}", "handled"))
             added += 1
             if to and n.get("from") == "daemon" and n.get("outage"):
                 from . import outagetask   # a routed outage hand-off: the tracked task, in this project's own state
