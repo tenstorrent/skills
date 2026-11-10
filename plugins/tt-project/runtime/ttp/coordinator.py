@@ -411,10 +411,18 @@ def _max_workers(v):
     return n
 
 
+def _pace_from(v):
+    """machine.pace_from: moderate or heavy."""
+    w = str(v).strip().lower()
+    if w not in ("moderate", "heavy"):
+        raise ValueError("machine.pace_from: give moderate or heavy")
+    return w
+
+
 USER_SETTABLE = {
     "budget.daily_usd": float, "budget.weekly_usd": float, "budget.reserve_pct": float,
     "budget.global_daily_usd": float, "budget.daily_target_usd": float, "budget.day_start": str, "budget.timezone": str,
-    "budget.max_parallel_workers": int, "machine.worker_limit": str, "machine.max_workers": _max_workers, "budget.urgent_extra_slots": int, "budget.urgent_preempt": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
+    "budget.max_parallel_workers": int, "machine.worker_limit": str, "machine.max_workers": _max_workers, "machine.pace_from": _pace_from, "budget.urgent_extra_slots": int, "budget.urgent_preempt": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
     "coordinator.urgent_start_wait_min": int,
     "budget.urgent_topup": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
     "budget.reset_credits_auto": lambda v: str(v).lower() in ("1", "true", "yes", "on"),

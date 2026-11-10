@@ -1715,7 +1715,12 @@ session and stateless coordinators on every provider.
   with each project's running workers and set base, in `TTP_HOME/machine-workers.json` under a file
   lock; the lowest base a live project set holds, and each start claims its place under the lock. `machine.worker_limit` is `auto` (on for
   macOS or a machine with a battery; off on lab and build servers), `on` or `off`; turn it off with
-  `ttp config <name> machine.worker_limit off`. Set values stay across upgrades.
+  `ttp config <name> machine.worker_limit off`. `machine.pace_from` is `moderate` (the default, as
+  above) or `heavy`, for a host whose projects only run agents: then only heavy CPU (idle under 5%)
+  or heavy memory (critical, under 5% free or PSI 20) cut that project's limit, a call and heat
+  count as before, and the project holds the machine's running workers to its own base rather than
+  the lowest base another project set (each other project still holds itself to its own). Set it
+  with `ttp config <name> machine.pace_from heavy`. Set values stay across upgrades.
 - Workers, reviewers, everything they start (detached checks, tests, reference models) and the
   daemon's pushes run at low CPU priority, 10 nice levels below the daemon (`runner.nice`, 0-19;
   0 = normal priority), so they never slow the machine's own work. The daemon and the coordinator
@@ -3427,6 +3432,7 @@ is open raises one `cap_wait` event naming the key.
 | `delivery.push_min_gap_s` | 1800 s, only after a batch that did not end clean | the next push | safety |
 | `budget.max_parallel_workers` | 6 | worker runs at once | safety (spend) |
 | `machine.worker_limit` / `machine.max_workers` | auto (laptops and workstations) / null: binds only under real pressure (then the cores, 2-32), paced down | worker runs at once across all projects on the machine | safety (host) |
+| `machine.pace_from` | moderate: moderate and heavy readings cut the limit and the lowest base any project set binds; heavy: only heavy CPU or memory (plus a call or heat) cut it and the project keeps its own base | which readings and bases pace this project's machine-wide limit | safety (host) |
 
 ### Queue waits over 30 minutes
 

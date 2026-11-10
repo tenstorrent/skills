@@ -499,3 +499,52 @@ def test_machine_limit_publish_follows_a_changed_max_workers_without_a_new_claim
     (home / mc.STATE).write_text(json.dumps(data))
     assert mc.check("b", _mcap_cfg(top=20), 14, now=now, home=home, read=lambda: sig) is None, "14 of 15"
     assert "a" not in json.loads((home / mc.STATE).read_text())["projects"]
+
+
+def test_machine_pace_from_heavy_ignores_moderate_readings_and_other_projects_bases(env, tmp_path):
+    """machine.pace_from heavy: moderate CPU or memory no longer cut the project's limit (heavy ones, a
+    call and heat still do), and it holds the machine to its own base, not the lowest another project
+    set; moderate (the default) keeps today's behaviour for the same readings and bases."""
+    from ttp import machinecap as mc
+    heavy = lambda top: {"machine": {"worker_limit": "on", "max_workers": top, "pace_from": "heavy"}}
+    assert mc.pace_from({}) == "moderate" and mc.pace_from(_mcap_cfg()) == "moderate"
+    assert mc.pace_from({"machine": {"pace_from": "bogus"}}) == "moderate"
+    assert mc.pace_from(heavy(4)) == "heavy" and mc.pace_from({"machine": {"pace_from": " Heavy "}}) == "heavy"
+    cpu_mod = _sustained(mc, dict(_IDLE, cpu_busy=0.90))       # idle 10%: moderate
+    cpu_heavy = _sustained(mc, dict(_IDLE, cpu_busy=0.99))     # idle 1%: heavy
+    for sig, mod, hvy in [(cpu_mod, 10, 14), ({**_IDLE, "mem_free": 0.08}, 10, 14), ({**_IDLE, "swapping": True}, 10, 14),
+                          ({**_IDLE, "psi": 6.0}, 10, 14), (cpu_heavy, 7, 7), ({**_IDLE, "mem_free": 0.04}, 7, 7),
+                          ({**_IDLE, "thermal": 2}, 7, 7), ({**cpu_mod, "call": True}, 5, 7)]:
+        assert mc.limit(14, sig) == mod and mc.limit(14, sig, "heavy") == hvy, sig
+    assert mc.words(cpu_mod, "heavy") == "nothing busy" and mc.words(cpu_mod) == "cpu moderate"
+    assert mc.in_force(None, [], cpu_mod, pace="heavy") is None, "no base set and nothing heavy: no hold"
+    assert mc.in_force(14, [10], _IDLE) == 10 and mc.in_force(14, [10], _IDLE, pace="heavy") == 14
+
+    home, now = tmp_path / "mhome", 1060.0
+    sig = dict(cpu_mod, at=now)
+    mc.publish("mod", _mcap_cfg(top=10), 3, now=now, home=home)   # another project's lower base
+    data = json.loads((home / mc.STATE).read_text())
+    data["signals"] = sig   # the stored machine reading: CPU idle 10% for a minute
+    (home / mc.STATE).write_text(json.dumps(data))
+    assert mc.check("agents", _mcap_cfg(top=14), 6, now=now, home=home, read=lambda: sig), \
+        "moderate: 3 + 6 >= the other's 10 cut to 7 by moderate CPU"
+    assert mc.check("agents", heavy(14), 10, now=now, home=home, read=lambda: sig) is None, "heavy: 3 + 10 < 14"
+    why = mc.check("agents", heavy(14), 11, now=now, home=home, read=lambda: sig)
+    assert why and "14 of 14 running" in why and "machine.pace_from heavy" in why and "nothing busy" in why
+    mc.publish("agents", heavy(14), 2, now=now, home=home)
+    assert json.loads((home / mc.STATE).read_text())["projects"]["agents"]["limit"] == 14, "heavy: moderate CPU uncut"
+    assert mc.check("mod", _mcap_cfg(top=10), 4, now=now, home=home, read=lambda: sig) is None, "2 + 4 < 7"
+    assert mc.check("mod", _mcap_cfg(top=10), 5, now=now, home=home, read=lambda: sig), \
+        "the moderate project still holds itself to its own paced limit: 2 + 5 >= 7"
+
+
+def test_machine_pace_from_is_settable_and_checked(env):
+    from ttp import coordinator as co
+    from ttp import project as pj
+    assert pj.DEFAULT_CONFIG["machine"]["pace_from"] == "moderate", "the shipped default stays moderate"
+    assert co.USER_SETTABLE["machine.pace_from"](" Heavy") == "heavy"
+    assert co.USER_SETTABLE["machine.pace_from"]("moderate") == "moderate"
+    with pytest.raises(ValueError):
+        co.USER_SETTABLE["machine.pace_from"]("light")
+    assert not [w for w in pj.config_problems({"machine": {"pace_from": "heavy"}}) if "pace_from" in w]
+    assert [w for w in pj.config_problems({"machine": {"pace_from": "light"}}) if "pace_from" in w]

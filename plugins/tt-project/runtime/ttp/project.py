@@ -565,9 +565,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # the machine is truly short: sustained low CPU idle, memory pressure or swapping, a call with low
     # CPU idle, heat. worker_limit: auto (on for laptops and workstations: macOS or a battery present;
     # off on lab and build servers), on, off. max_workers: the base before pacing; null holds nothing
-    # while nothing is short and is the cores under pressure. budget.max_parallel_workers stays each
-    # project's own ceiling.
-    "machine": {"worker_limit": "auto", "max_workers": None},
+    # while nothing is short and is the cores under pressure. pace_from: moderate, or heavy (only heavy
+    # CPU or memory cut the limit, and this project holds to its own base, not the lowest another set).
+    # budget.max_parallel_workers stays each project's own ceiling.
+    "machine": {"worker_limit": "auto", "max_workers": None, "pace_from": "moderate"},
     # reuse: every ssh the project starts (probes, checks, workers, git over ssh) shares one connection per
     # host for 10 minutes (OpenSSH ControlMaster through the harness's bin/ssh; sockets in ~/.tt-project/cm),
     # so an ssh agent signs once, not per command. Off: each ssh opens its own connection (sshmux.py).
@@ -1345,6 +1346,9 @@ def config_problems(raw: dict, root: Path | None = None) -> list[str]:
     v = m.get("max_workers")
     if v is not None and (isinstance(v, bool) or not isinstance(v, int) or v < 1):
         out.append(f"machine.max_workers: {v!r} is not a whole number of at least 1 (or null)")
+    v = m.get("pace_from")
+    if v is not None and str(v).strip().lower() not in ("moderate", "heavy"):
+        out.append(f"machine.pace_from: {v!r} is not moderate or heavy; moderate is used")
     v = (raw.get("runner") or {}).get("pin_verify") if isinstance(raw.get("runner"), dict) else None
     if v is not None and v not in ("strict", "lenient"):
         out.append(f"runner.pin_verify: {v!r} is not strict or lenient")
