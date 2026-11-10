@@ -20628,6 +20628,33 @@ def test_a_run_that_keeps_claude_ai_connectors_waits_for_them_and_one_that_leave
     assert run_env["MCP_CONNECT_TIMEOUT_MS"] == "5000" and run_env["MCP_CONNECTION_NONBLOCKING"] == "false"
 
 
+def test_connector_env_waits_only_when_connectors_are_kept_for_the_configured_time(env, monkeypatch, tmp_path):
+    from ttp import coordinator as coord
+    from ttp.providers import get_provider
+    claude = get_provider("claude")
+    assert claude.connector_env(True) == {"MCP_CONNECTION_NONBLOCKING": "false", "MCP_CONNECT_TIMEOUT_MS": "20000"}
+    assert claude.connector_env(True, 30000)["MCP_CONNECT_TIMEOUT_MS"] == "30000"
+    for bad in ("soon", True, 0, -5):   # a hand-edited value that is no wait keeps the default
+        assert claude.connector_env(True, bad)["MCP_CONNECT_TIMEOUT_MS"] == "20000", bad
+    for timeout in (None, 30000):   # left out: no wait at all
+        drop = claude.connector_env(False, timeout)
+        assert drop == {"ENABLE_CLAUDEAI_MCP_SERVERS": "false"} and "MCP_CONNECTION_NONBLOCKING" not in drop
+    assert get_provider("codex").connector_env(True, 30000) == {}
+    p = make(env)
+    for bad in ("soon", 10, 700000):
+        assert coord.apply(p, [{"type": "config_set", "key": "providers.claude.connect_timeout_ms", "value": bad}]), bad
+    _claude_mcp_config(tmp_path, monkeypatch, p)
+    p.set_config("providers.claude.worker_isolation", False)
+    p.set_config("providers.claude.mcp_servers", ["claude.ai Search"])
+    monkeypatch.delenv("MCP_CONNECT_TIMEOUT_MS", raising=False)
+    assert coord.apply(p, [{"type": "config_set", "key": "providers.claude.connect_timeout_ms", "value": "30000"}]) == []
+    assert _worker_env(p, monkeypatch)[1]["MCP_CONNECT_TIMEOUT_MS"] == "30000"
+    from ttp.project import _chat_inherits
+    cfg = {"providers": {"claude": {"connect_timeout_ms": 30000}, "chat": {}}}
+    _chat_inherits(cfg)
+    assert cfg["providers"]["chat"]["connect_timeout_ms"] == 30000, "a chat worker is Claude Code too"
+
+
 def test_connector_rule_leaves_isolation_no_internet_and_the_tool_set_alone(env, monkeypatch, tmp_path):
     p = make(env)
     _claude_mcp_config(tmp_path, monkeypatch, p)

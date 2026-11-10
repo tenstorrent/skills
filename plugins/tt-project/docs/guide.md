@@ -3466,6 +3466,12 @@ the pick order, so it takes the first starts. A resumed resource ramps only its 
   the project needs them: `mcp_servers` names one (`"claude.ai <name>"`), or one of its runs called
   a connector's tool (in the 14 days before the first such worker, or any time since). Then all
   connectors load as before.
+- A Claude run that keeps the claude.ai connectors (fresh or resumed, isolated or not) waits for
+  their list before its first turn (`MCP_CONNECTION_NONBLOCKING=false`), up to
+  `providers.claude.connect_timeout_ms` (default 20000, `MCP_CONNECT_TIMEOUT_MS`; `chat` takes
+  claude's value while its own is unset). Without the wait the CLI loads them in the background and
+  a run often starts with none. A value already in the host's environment wins. Runs that leave
+  the connectors out get neither variable.
 - `providers.codex.mcp_servers: ["name", ...]` lists the MCP servers Codex workers and reviewers get,
   with or without `worker_isolation`. Each comes from the project's `.mcp.json` (as Claude reads
   it, `${VAR}` expanded in `env` and `headers`) and goes in as one `-c mcp_servers={...}` argument;

@@ -346,6 +346,24 @@ def test_iso_run_envs_compare_equal_while_the_hosts_listeners_change(env, monkey
     assert a_env[loopproxy.PORTS_ENV] == b_env[loopproxy.PORTS_ENV] == "2222 8080"
 
 
+def test_isolated_worker_that_keeps_a_connector_waits_for_it_and_a_strict_one_does_not(env, monkeypatch, tmp_path):
+    p = make(env)
+    _claude_mcp_config(tmp_path, monkeypatch, p)
+    _host_list(p)
+    wait = ("MCP_CONNECTION_NONBLOCKING", "MCP_CONNECT_TIMEOUT_MS")
+    for k in wait:
+        monkeypatch.delenv(k, raising=False)
+    p.set_config("providers.claude.mcp_servers", ["docs"])   # no connector listed: strict, no wait
+    argv, run_env = _iso_run(p, monkeypatch)
+    assert "--strict-mcp-config" in argv and not any(k in run_env for k in wait)
+    p.set_config("providers.claude.mcp_servers", ["docs", "claude.ai Gmail"])
+    argv, run_env = _iso_run(p, monkeypatch)
+    assert "--strict-mcp-config" not in argv
+    assert run_env["MCP_CONNECTION_NONBLOCKING"] == "false" and run_env["MCP_CONNECT_TIMEOUT_MS"] == "20000"
+    p.set_config("providers.claude.connect_timeout_ms", 45000)   # the project's own wait
+    assert _iso_run(p, monkeypatch)[1]["MCP_CONNECT_TIMEOUT_MS"] == "45000"
+
+
 def test_isolated_worker_with_a_listed_connector_keeps_it_and_keeps_every_other_server_out(env, monkeypatch,
                                                                                            tmp_path):
     from ttp import mcpgap

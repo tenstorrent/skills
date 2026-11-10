@@ -499,10 +499,11 @@ class Provider:
         Called only when mcp_by_args is set."""
         return None
 
-    def connector_env(self, keep: bool) -> dict[str, str]:
+    def connector_env(self, keep: bool, timeout_ms: int | None = None) -> dict[str, str]:
         """Environment that leaves the user's account connectors (servers the agent's account adds,
         not the user's or project's own) out of a non-isolated worker unless `keep`; with `keep`, any
-        environment the agent needs to load them reliably. {} if this agent has none."""
+        environment the agent needs to load them reliably, waiting up to `timeout_ms` for them where
+        the agent has such a wait (unset: its default). {} if this agent has none."""
         return {}
 
     def is_connector(self, name: str) -> bool:

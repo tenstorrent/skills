@@ -771,6 +771,9 @@ OPEN_SECTIONS = {"resources"}           # any name below is fine
 # write_dirs: extra directories inside the project root fenced workers may write (write_dirs below).
 PROVIDER_KEYS = {"billing", "tiers", "plugin_dirs", "worker_isolation", "write_fence", "mcp_servers", "mcp_withheld",
                  "disallowed_tools", "loopback_ports", "write_dirs",
+                 # connect_timeout_ms: how long a run that keeps the account connectors waits for them at
+                 # start (Claude's MCP_CONNECT_TIMEOUT_MS; Daemon._with_connector_wait).
+                 "connect_timeout_ms",
                  # providers.chat only (chatbridge.py): the `ttp secret endpoint` alias holding the key,
                  # the base URL saved with it, a max_tokens cap and the model's context_window (also per tier).
                  # route_cooldown_s: how long a tier routed to it (tiers.<tier>.route, route.py) runs on the
@@ -3229,7 +3232,7 @@ def layered(raw: dict) -> dict:
 
 # A chat worker is Claude Code too: unset, these keys take claude's value, so a routed model never
 # gets the user's plugins, MCP servers or withheld connectors that claude workers are kept from.
-CHAT_INHERITS = ("worker_isolation", "mcp_withheld", "loopback_ports")
+CHAT_INHERITS = ("worker_isolation", "mcp_withheld", "loopback_ports", "connect_timeout_ms")
 
 
 def _chat_inherits(cfg: dict) -> None:

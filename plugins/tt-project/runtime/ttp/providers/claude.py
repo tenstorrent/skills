@@ -94,8 +94,10 @@ CONNECTORS_OFF = {"ENABLE_CLAUDEAI_MCP_SERVERS": "false"}
 # A run that keeps them waits for their list before its first turn. By default the CLI loads them
 # fully async and a resumed worker often starts without them (init mcp_servers [] in 8 of 10 of one
 # project's worker runs on 2026-11-09); blocking, every replay had them. 2.1.285 reads MCP_CONNECT_TIMEOUT_MS for
-# the connectors' wait (its changelog), MCP_TIMEOUT for the other servers.
-CONNECTORS_WAIT = {"MCP_CONNECTION_NONBLOCKING": "false", "MCP_CONNECT_TIMEOUT_MS": "20000"}
+# the connectors' wait (its changelog), MCP_TIMEOUT for the other servers. providers.<p>.connect_timeout_ms
+# sets the wait (the default below).
+CONNECT_TIMEOUT_MS = 20000
+CONNECTORS_WAIT = {"MCP_CONNECTION_NONBLOCKING": "false", "MCP_CONNECT_TIMEOUT_MS": str(CONNECT_TIMEOUT_MS)}
 CONNECTOR_PREFIXES = ("claude.ai", "claude_ai_", "mcp__claude_ai_")   # server name, its tools' prefix
 WORKER_TOOLS = ("Bash", "Read", "Edit", "Write", "Skill", "ToolSearch")
 WEB_TOOLS = ("WebFetch", "WebSearch")
@@ -360,8 +362,14 @@ class Claude(Provider):
                     break
         return found, [n for n in names if n not in found]
 
-    def connector_env(self, keep: bool) -> dict[str, str]:
-        return dict(CONNECTORS_WAIT) if keep else dict(CONNECTORS_OFF)
+    def connector_env(self, keep: bool, timeout_ms: int | None = None) -> dict[str, str]:
+        if not keep:
+            return dict(CONNECTORS_OFF)
+        try:   # a hand-edited config value that is no whole number keeps the default
+            ms = int(timeout_ms) if timeout_ms is not None and not isinstance(timeout_ms, bool) else 0
+        except (TypeError, ValueError):
+            ms = 0
+        return {**CONNECTORS_WAIT, **({"MCP_CONNECT_TIMEOUT_MS": str(ms)} if ms > 0 else {})}
 
     def is_connector(self, name: str) -> bool:
         return str(name).lower().startswith(CONNECTOR_PREFIXES)

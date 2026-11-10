@@ -403,6 +403,14 @@ def _count(key: str, v, top: int) -> int:
     return int(n)
 
 
+def _connect_timeout(key: str, v) -> int:
+    """providers.<p>.connect_timeout_ms: a whole number of milliseconds from 1000 to 600000."""
+    n = _count(key, v, 600000)
+    if n < 1000:
+        raise ValueError(f"{key}: give a whole number of milliseconds from 1000 to 600000")
+    return n
+
+
 def _max_workers(v):
     """machine.max_workers: a whole number of at least 1, or null, none or auto for unset (half the
     cores, machinecap.BASE_MIN..BASE_MAX)."""
@@ -547,6 +555,9 @@ USER_SETTABLE = {
     "providers.claude.mcp_servers": lambda v: name_list(v, strict=True),
     # Connected MCP servers kept from workers on purpose: ttp status no longer names them (mcpgap.py).
     "providers.claude.mcp_withheld": lambda v: name_list(v, strict=True),
+    # Milliseconds a run that keeps the claude.ai connectors waits for them at start (unset: 20000).
+    **{f"providers.{n}.connect_timeout_ms": (lambda k: lambda v: _connect_timeout(k, v))(f"providers.{n}.connect_timeout_ms")
+       for n in ("claude", "chat")},
     # Host loopback ports fenced workers reach besides the host's listeners and ssh tunnel ends, or
     # false to forward none (loopproxy.ports_env). Unset, chat takes the claude value.
     "providers.claude.loopback_ports": lambda v: _loopback_ports("providers.claude.loopback_ports", v),

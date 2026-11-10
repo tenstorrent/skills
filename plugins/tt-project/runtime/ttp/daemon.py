@@ -3426,11 +3426,11 @@ class Daemon:
         return any(a < end and b > start for a, b in self.p.db.kv("host_sleeps", []) or [])
 
     # runs -----------------------------------------------------------------------------------------
-    @staticmethod
-    def _with_connector_wait(prov, env: dict) -> dict:
-        """`env` plus the wait for connectors a run that keeps them needs; a value already in the
-        run's or the host's environment stays."""
-        wait = prov.connector_env(True)
+    def _with_connector_wait(self, prov, provider: str, env: dict) -> dict:
+        """`env` plus the wait for connectors a run that keeps them needs, fresh or resumed, for as long
+        as providers.<provider>.connect_timeout_ms says (unset: the provider's default); a value already
+        in the run's or the host's environment stays."""
+        wait = prov.connector_env(True, self.cfg["providers"].get(provider, {}).get("connect_timeout_ms"))
         return {**wait, **{k: v for k, v in os.environ.items() if k in wait}, **env}
 
     def _connectors_needed(self, prov, provider: str) -> bool:
@@ -3882,11 +3882,11 @@ class Daemon:
                     extra += prov.isolation_args()
                 else:
                     argv = kept
-                    env = self._with_connector_wait(prov, env)
+                    env = self._with_connector_wait(prov, provider, env)
                 mcp_servers = {} if prov.mcp_by_args else self._approved_mcp(prov, provider, cwd)
             elif prov.connector_env(False):
                 keep = self._connectors_needed(prov, provider)
-                env = self._with_connector_wait(prov, env) if keep else {**env, **prov.connector_env(False)}
+                env = self._with_connector_wait(prov, provider, env) if keep else {**env, **prov.connector_env(False)}
             if prov.mcp_by_args:
                 got, mcp_env, unknown = prov.mcp_args(self._mcp_names(provider), self._mcp_dirs(cwd), argv + extra,
                                                       {**os.environ, **env})
