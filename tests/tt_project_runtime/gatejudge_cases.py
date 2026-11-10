@@ -395,6 +395,8 @@ def test_a_detached_release_check_keeps_release_across_a_daemon_restart(env, mon
     real = subprocess.Popen
 
     def popen(argv, **kw):   # the launcher's child: recorded, then a stand-in that waits for its go
+        if list(argv[1:4]) != ["-m", "ttp", "checks"]:   # other calls (process reads on macOS): real
+            return real(argv, **kw)
         argvs.append(list(argv))
         children.append(real([sys.executable, "-c", "import sys; sys.stdin.read()"], **kw))
         return children[-1]
