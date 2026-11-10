@@ -282,6 +282,7 @@ def _host_guard():
 
 
 _HOSTSTATE = _host_guard()
+os.environ.setdefault("TTP_NO_HAIKU", "1")   # no test asks Claude Haiku for a decision (cheapdecide)
 
 _CRED_SCRIPT = ("import json, sys\nsys.path.insert(0, sys.argv[1])\nfrom ttp import credwatch\n"
                 "before = json.load(sys.stdin)\nnow = credwatch.snapshot()\n"

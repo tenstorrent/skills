@@ -283,6 +283,8 @@ def wrap(cfg: dict, jev=None, db=None, pause=None, log=None):
     """The decider the daemon uses: a Babysitter when babysitting goes to the chat provider, else `jev`.
     `pause` (any object with `until`) keeps an endpoint's cool-down across config reloads; `log(line)`
     gets each fallback's line."""
+    from . import cheapdecide
+    jev = cheapdecide.wrap(cfg, jev, db, log=log)   # Haiku behind Jev for the decision uses
     return Babysitter(cfg, jev, db, pause=pause, log=log) if settings(cfg) is not None else jev
 
 
