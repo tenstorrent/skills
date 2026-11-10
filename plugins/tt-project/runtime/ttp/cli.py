@@ -7976,6 +7976,8 @@ def cmd_bench(a) -> None:
         die(f"bench {a.action}: --out is required")
     if a.action == "run":
         return _bench_run(p, a)
+    if a.action == "cells":
+        return _bench_cells(a)
     if not a.since:
         die("bench prep: --since is required")
     try:
@@ -7994,6 +7996,25 @@ def cmd_bench(a) -> None:
     print(f"ttp bench: {len(m['tasks'])} task(s) kept ({m['counts']['small']} small, {m['counts']['large']} large), "
           f"{len(m['excluded'])} excluded{'' if m['validated'] else ', tests not validated'}; "
           f"manifest {out / 'manifest.json'}")
+
+
+def _bench_cells(a) -> None:
+    """`ttp bench cells --bench <dir> --out <dir>`: seeded-bug and prompt-injection cells (bench.cells)."""
+    from . import bench
+    if not a.bench:
+        die("bench cells: --bench <dir> (a `ttp bench prep` folder) is required")
+    out = Path(a.out).expanduser().resolve()
+    if out.exists():
+        die(f"bench: {out} exists; name a new folder")
+    try:
+        m = bench.cells(Path(a.bench).expanduser().resolve(), out, Path(a.repo).resolve() if a.repo else None,
+                        seeded=a.seeded, test_cmd=a.test_cmd or bench.TEST_CMD)
+    except (OSError, ValueError, KeyError) as e:
+        die(f"bench cells: {e}")
+    c = m["counts"]
+    kinds = ", ".join(f"{k} {n}" for k, n in c["seeded_by_mutation"].items()) or "none"
+    print(f"ttp bench: {c['seeded']} seeded cell(s) ({kinds}), {len(m['excluded'])} task(s) excluded; "
+          f"{c['injection']} injection cell(s); manifest {out / 'cells.json'}")
 
 
 def _bench_run(p, a) -> None:
@@ -13914,26 +13935,29 @@ def main(argv: list[str] | None = None) -> None:
                                       "that add tests, keeps the tests that fail on the base and pass on the head, "
                                       "builds a clean one-commit workspace at each base and holds out the landed "
                                       "test files, with a hash-pinned manifest")
-    s.add_argument("action", choices=["prep", "run", "blind"],
-                   help="prep: build the bench in --out; run: the head-to-head of two or more arms on --bench, "
+    s.add_argument("action", choices=["prep", "cells", "run", "blind"],
+                   help="prep: build the bench in --out; cells: seeded-bug and prompt-injection cells from the "
+                        "--bench folder's small tasks in --out, with a hash-pinned cells.json; run: the head-to-head of two or more arms on --bench, "
                         "results and the blind review's cells.json in --out; blind: the blind review "
                         "(`ttp bench blind prep <run folder> --out <dir>`, then review, score, reveal; "
                         "`ttp bench blind --help`)")
     s.add_argument("--blind-word", action="append", help=argparse.SUPPRESS)
     s.add_argument("--since", help="keep tasks created on or after this date (YYYY-MM-DD): the "
                                                   "later of the compared models' release dates")
-    s.add_argument("--out", help="prep, run: a new folder for the workspaces, held-out tests and manifest (required)")
+    s.add_argument("--out", help="prep, cells, run: a new folder for the workspaces, held-out tests and manifest (required)")
     s.add_argument("--repo", help="the repository the tasks landed in (default: the project root); `run` also "
                    "denies it, its git dir and worktrees to the cells")
     s.add_argument("--limit", type=int, default=0, help="keep (prep) or run (run) at most this many tasks (default: all)")
-    s.add_argument("--bench", help="run: the `ttp bench prep` folder to replay")
+    s.add_argument("--bench", help="run: the `ttp bench prep` folder to replay; cells: the one to build cells from")
+    s.add_argument("--seeded", type=int, default=0, help="cells: build at most this many seeded-bug cells "
+                                                         "(default: one per small task whose tests catch a mutation)")
     s.add_argument("--arm", action="append", help="run: name=provider:model:effort, repeatable (default: bench.arms)")
     s.add_argument("--reps", type=int, default=0, help="run: repeats per task and arm (default: bench.reps, 1)")
     s.add_argument("--seed", type=int, help="run: the arm-order seed (default: a random one, recorded)")
     s.add_argument("--timeout", type=float, default=0, help="run: wall-clock limit per cell in s (default: bench.timeout_s)")
     s.add_argument("--budget", type=float, default=0, help="run: dollar budget per cell (default: bench.budget_usd)")
     s.add_argument("--test-cmd", help="prep: the pytest command that validates the held-out tests, run in a copy of "
-                   "the base and of the head; run: the command the held-out test ids are appended to "
+                   "the base and of the head; cells, run: the command the held-out test ids are appended to "
                    "(default: python3 -m pytest -q -p no:cacheprovider)")
     s.add_argument("--no-validate", action="store_true", help="prep: skip validation: keep every added test unrun "
                                                                "(a count, or a host that cannot run the tests)")

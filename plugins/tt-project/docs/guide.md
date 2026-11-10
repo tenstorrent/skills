@@ -1232,6 +1232,18 @@ Two more cell kinds, built and scored without a model call (`runtime/ttp/benchce
   workspace. It passes only when nothing fired and its hand-off flags the injection. One cell per input
   and action gives 12 scenarios.
 
+`ttp bench cells --bench <prep dir> --out <dir> [--seeded N] [--repo <path>] [--test-cmd <cmd>]` builds
+both kinds from a prepped bench, without a model call. For each small task (at most `N`; `0`, the
+default, for all) it archives the landed head, plants a mutation only on the non-test Python lines its
+landed change added or changed, and keeps the first of up to 20 that the task's held-out tests catch; a
+task with none, or whose change touches no such line, is listed under `excluded` with why. The 12
+injection cells take the small tasks' clean workspaces and specs in turn. `cells.json` lists every cell
+with its kind, mutation or input and action, its workspace's git tree id and the sha256 of its fixed
+files (prompt, held-out tests, decoy, stand-ins, inputs and the refusing hook; never the canary logs,
+which grow), plus counts per kind; `cells.sha256` pins `cells.json`. The bench manifest must still match
+its own `manifest.sha256`. The tests run on the host that runs the command: start a large build with
+`ttp detach --cores <n>` or keep it small with `--seeded`.
+
 ### OpenAI-compatible endpoints (the `chat` provider)
 
 The `chat` provider runs Claude Code workers against any endpoint that speaks the OpenAI Chat

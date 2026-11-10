@@ -454,3 +454,101 @@ def prep(db, repo: Path, out: Path, since: float, limit: int = 0, test_cmd: str 
     durable_write(out / "manifest.json", json.dumps(manifest, indent=1) + "\n")
     durable_write(out / "manifest.sha256", f"{_sha(out / 'manifest.json')}  manifest.json\n")
     return manifest
+
+
+_HUNK = re.compile(r"^@@ [^+]*\+(\d+)(?:,(\d+))? @@")
+_UNPINNED = ("workspace", "canary", "remote.git")   # pinned by tree id, growing canary logs, a git dir
+
+
+def _targets(repo: Path, base: str, head: str) -> dict[str, set[int]]:
+    """{path: head line numbers} the change adds or changes in its non-test Python files (a pure
+    deletion: the lines beside it)."""
+    paths = [p for p in _out(repo, "diff", "--no-renames", "--name-only", "--diff-filter=AM", base, head).splitlines()
+             if p.endswith(".py") and not _held(p)]
+    out, cur = {}, None
+    for x in _out(repo, "diff", "--no-renames", "-U0", base, head, "--", *paths).splitlines() if paths else []:
+        if x.startswith("+++ "):
+            cur = x[6:] if x.startswith("+++ b/") else None
+        elif cur and (h := _HUNK.match(x)):
+            start, n = int(h[1]), 1 if h[2] is None else int(h[2])
+            out.setdefault(cur, set()).update(range(start, start + n) if n else (start, start + 1))
+    return out
+
+
+def _pins(cell: Path) -> dict[str, str]:
+    """{path: sha256} of the cell's fixed files: all but its workspace (pinned by tree id), canary logs
+    and remote repository, whose refusing hook is pinned."""
+    files = [p for p in cell.rglob("*") if p.is_file() and not p.is_symlink()
+             and p.relative_to(cell).parts[0] not in _UNPINNED]
+    hook = cell / "remote.git" / "hooks" / "pre-receive"
+    return {str(p.relative_to(cell)): _sha(p) for p in sorted(files + ([hook] if hook.is_file() else []))}
+
+
+def cells(bench_dir: Path, out: Path, repo: Path | None = None, seeded: int = 0, test_cmd: str = TEST_CMD,
+          tries: int = 20, timeout: float = TEST_TIMEOUT) -> dict:
+    """Build seeded-bug and prompt-injection cells (benchcells) in `out` (new) from the `ttp bench prep`
+    folder `bench_dir` and return their manifest. Seeded: per small task (at most `seeded`, 0 for all),
+    a mutation of its landed change's non-test lines in an archive of its landed head that its held-out
+    tests catch; a task with none is excluded with why. Injection: one cell per input and action, from
+    the small tasks' workspaces and specs in turn."""
+    from . import benchcells
+    pin = (bench_dir / "manifest.sha256").read_text().split()[0]
+    if _sha(bench_dir / "manifest.json") != pin:
+        raise ValueError(f"{bench_dir / 'manifest.json'} does not match manifest.sha256")
+    bench = json.loads((bench_dir / "manifest.json").read_text())
+    repo = repo or Path(bench["repo"])
+    small = [k for k in bench["tasks"] if k["stratum"] == "small"]
+    if not small:
+        raise ValueError(f"{bench_dir} keeps no small task to build cells from")
+    out.mkdir(parents=True)
+    rows, excluded = [], []
+
+    def one(k: dict) -> tuple[dict, dict | None, str]:
+        targets = _targets(repo, k["base"], k["head"])
+        if not targets:
+            return k, None, "its landed change touches no non-test Python line"
+        cmd = [*shlex.split(test_cmd), *k["tests"]]
+        with tempfile.TemporaryDirectory(prefix="ttp-cells-") as tmp:
+            src = Path(tmp) / "head"
+            _archive(repo, k["head"], src)
+            m, why = benchcells.find_bug(src, cmd, targets, rng_seed=k["task"], tries=tries, timeout=timeout)
+            if m:
+                benchcells.seeded_cell(src, list(k["heldout"]), m, cmd, out / "seeded" / str(k["task"]),
+                                       task=k["spec"] or k["title"])
+        return k, m, why
+
+    with concurrent.futures.ThreadPoolExecutor(BUILDERS) as pool:
+        todo = list(small)
+        while todo and not (seeded and len(rows) >= seeded):
+            n = min(BUILDERS, seeded - len(rows)) if seeded else BUILDERS
+            batch, todo = todo[:n], todo[n:]
+            for k, m, why in pool.map(one, batch):
+                if not m:
+                    excluded.append({"task": k["task"], "why": why})
+                    continue
+                path = out / "seeded" / str(k["task"])
+                rows.append({"id": f"seeded/{k['task']}", "kind": "seeded", "task": k["task"], "mutation": m,
+                             "tree": json.loads((path / "cell.json").read_text())["tree"], "files": _pins(path)})
+    for i, (source, canary) in enumerate((s, c) for s in benchcells.SOURCES for c in benchcells.CANARIES):
+        k = small[i % len(small)]
+        path = out / "injection" / f"{source}-{canary}"
+        benchcells.injection_cell(bench_dir / str(k["task"]) / "workspace", k["spec"] or k["title"], source, canary,
+                                  path)
+        rows.append({"id": f"injection/{source}-{canary}", "kind": "injection", "task": k["task"], "source": source,
+                     "canary": canary, "tree": _out(path / "workspace", "rev-parse", "HEAD^{tree}"),
+                     "files": _pins(path)})
+
+    def tally(field: str, kind: str) -> dict[str, int]:
+        vals = [(r["mutation"]["kind"] if field == "mutation" else r[field]) for r in rows if r["kind"] == kind]
+        return {v: vals.count(v) for v in sorted(set(vals))}
+
+    manifest = {"bench": str(bench_dir.resolve()), "bench_sha256": pin, "repo": str(repo.resolve()), "made": time.time(),
+                "test_cmd": test_cmd, "tries": tries, "cells": rows, "excluded": excluded,
+                "counts": {"seeded": sum(r["kind"] == "seeded" for r in rows),
+                           "injection": sum(r["kind"] == "injection" for r in rows),
+                           "seeded_by_mutation": tally("mutation", "seeded"),
+                           "injection_by_source": tally("source", "injection"),
+                           "injection_by_canary": tally("canary", "injection")}}
+    durable_write(out / "cells.json", json.dumps(manifest, indent=1) + "\n")
+    durable_write(out / "cells.sha256", f"{_sha(out / 'cells.json')}  cells.json\n")
+    return manifest
