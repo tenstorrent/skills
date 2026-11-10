@@ -1594,7 +1594,7 @@ session and stateless coordinators on every provider.
   the sockets in `~/.tt-project/cm` (mode 700). Your ssh folder and config are never read or
   changed, and `-F`, ProxyJump and BatchMode work as before. A call that sets its own sharing or
   forwards ports is left as it is, and a shared connection that fails before the command starts
-  is retried once over a plain one. Turn it off with `ttp config <name> ssh.reuse false`.
+  falls back to a direct one (OpenSSH's own). Turn it off with `ttp config <name> ssh.reuse false`.
 - A shared device or machine is taken per command, through its own queue (for example a device
   broker) or `ttp lock <resource> -- <command>`, so the rest of each task runs in parallel. A task
   marked exclusive holds the resource's lock for its whole run; while it waits for a slot, new
