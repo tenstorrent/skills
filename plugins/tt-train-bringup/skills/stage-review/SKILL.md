@@ -168,9 +168,17 @@ Optimisation loop:
 - a subset-depth MFU run, a projection or a Tracy table appears in the result table or the report
   as a result rather than as ranking evidence;
 - `doc/perf_analysis.md` or the README deviates from the optimisation-loop document format and
-  report style: a "what changed" cell that names a path or a file instead of the mechanism, a
+  report style: a "what changed" cell that names a path or a file instead of the mechanism, a cell
+  too terse to be understood without the commit, a missing `tag` or `time since start` column, a
   result without its ΔMFU, prose longer than three lines, sentences in table cells, narrative of
-  attempts without a number, review caveats appended instead of cells corrected;
+  attempts without a number, review caveats appended instead of cells corrected, or an in-house
+  word ("ledger", "rung") used as a section or column name;
+- three or more consecutive iterations carry no ΔMFU while the two largest rows of the cost table
+  are closed on a pre-check that falsified one mechanism rather than on a data-flow attempt;
+- a ceiling or "target unreachable" claim is supported by a sum of unbuilt ceilings rather than by a
+  roofline figure and a failed kernel attempt per remaining row;
+- a python-side measurement was taken after a build of a library target only, without the extension
+  the run loads being rebuilt and its new path shown to execute;
 - a result row reports MFU at the delivered clock, lacks the per-chip clock and critical chip, or
   rests on an A/B of standalone numbers from different processes;
 - `git add -u` or a commit touched a submodule pointer, or a tracked evidence file is over 500 KB,
@@ -256,7 +264,7 @@ Verdict: clean-pass | more-work-needed
 ## Hard-Check Gaps
 - ...
 
-## Anomaly Ledger
+## Anomalies And Their Controls
 - Observed anomaly:
   Evidence:
   Affected path:
