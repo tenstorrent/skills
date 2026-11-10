@@ -27,6 +27,28 @@ internally so the cost is visible to its owner. Putting a head axis on dimension
 rows and every following op streams the padding; avoid it where an existing kernel allows, and
 record it where it cannot be avoided yet.
 
+## Mesh code rules
+
+On a multi-chip layout (the plan's `mesh` block) the model follows these rules from the first
+commit; each is a numerics bug that a single-chip test never shows:
+
+- LoRA adapters are sharded with their base weight. A column-parallel base (q, k, v, gate, up)
+  shards adapter B on its output dimension and replicates A; a row-parallel base (o, down)
+  shards adapter A on its input dimension and replicates B. The adapter product then lands in the
+  same shard as the base output and needs no extra collective.
+- DP syncs trainable gradients only: `ttml.sync_gradients` (or its equivalent) runs over the
+  parameters with `requires_grad`, on the `dp` axis only, after the backward and before the
+  optimiser. Frozen weights never get a gradient to sync. TP-sharded gradients are already
+  per-shard correct and are not reduced over `tp`.
+- The seed is the same on every rank, so replicated parameters (adapter A, norms) start
+  identical; check it once by comparing a replicated parameter across ranks after init.
+- Data is sharded from the global batch in reference order: the global batch is the batch the
+  torch reference trains on, and DP rank `i` takes its `i`-th contiguous slice. The continuation
+  goldens are made at the global batch and stay valid for any DP size.
+- The loss is the mean over the global batch: the mean of per-rank token-weighted losses over the
+  total number of loss tokens, not a mean of per-rank means when ranks carry different token
+  counts. With the gradient averaged over `dp` the update equals the single-replica one.
+
 ## Before accepting the first baseline
 
 Correctness-first includes removing avoidable work using existing capabilities. During implementation
