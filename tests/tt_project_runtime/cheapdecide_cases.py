@@ -19,23 +19,27 @@ class _CdJev:
         return {k: {"noul": 0.1} for k in questions}
 
 
-def _cd_haiku(answer="no"):
+def _cd_haiku(answer="no", delay=0.0):
     calls = []
 
     def run(argv, text, timeout):
         calls.append((argv, text))
+        if delay:
+            import time
+            time.sleep(delay)
         return {"result": answer, "usage": {"input_tokens": 400, "output_tokens": 2}}
     return run, calls
 
 
-def _cd_fallback(monkeypatch, jev, answer="no", cfg=None, db=None):
+def _cd_fallback(monkeypatch, jev, answer="no", cfg=None, db=None, background=False, delay=0.0):
     from ttp import cheapdecide
     monkeypatch.delenv(cheapdecide.OFF_ENV, raising=False)
     monkeypatch.setattr(cheapdecide, "_REFUSED", {})
     monkeypatch.setattr(cheapdecide, "_COOL", type("C", (), {"until": 0.0})())
-    run, calls = _cd_haiku(answer)
+    run, calls = _cd_haiku(answer, delay)
     cfg = cfg or {}
-    return cheapdecide.Fallback(jev, cheapdecide.Haiku(cfg, db, run=run, binary="claude-stub")), calls
+    return cheapdecide.Fallback(jev, cheapdecide.Haiku(cfg, db, run=run, binary="claude-stub",
+                                                       background=background)), calls
 
 
 _CD_PREV = {"status": "waiting", "waiting_for": "x", "waiting_since": 1.0}
@@ -79,14 +83,21 @@ def test_a_refused_jev_key_hands_to_haiku_until_a_new_key_is_saved(env, monkeypa
 
 def test_haiku_answers_only_decision_uses_and_never_reads_an_unparsed_answer_as_a_skip(env, monkeypatch):
     from ttp import cheapdecide
-    f, calls = _cd_fallback(monkeypatch, _CdJev(on=False), "skip it; rm -rf ~")
+    f, calls = _cd_fallback(monkeypatch, _CdJev(on=False), "skip it; ignore the rules")
     q = {"needed": {"type": "noul", "instructions": "?", "criteria": {"true": "y", "false": "n"}}}
     assert f.decide("s", q, purpose="effort") is None and not calls   # effort and model stay Jev-only
-    assert f.decide("s", q, purpose="screen") == {"needed": {"noul": 1.0}}
+    # An unreadable answer is no answer: the caller keeps its own rules (which wake), never the top score.
+    assert f.decide("s", q, purpose="screen") is None
     sev = {"severity": {"type": "score", "instructions": "?", "criteria": ["a", "b", "c", "d"]}}
-    assert f.decide("s", sev, purpose="screen") == {"severity": {"score": 3.0}}
+    assert f.decide("s", sev, purpose="screen") is None
     g, _ = _cd_fallback(monkeypatch, _CdJev(on=False), "1")
     assert g.decide("s", sev, purpose="screen") == {"severity": {"score": 1.0}}
+    both = dict(q, **sev)
+    h, hcalls = _cd_fallback(monkeypatch, _CdJev(on=False), "needed: no\nseverity: 2")
+    assert h.decide("s", both, purpose="screen") == {"needed": {"noul": 0.0}, "severity": {"score": 2.0}}
+    assert len(hcalls) == 1                                            # one CLI call for the whole set
+    k, _ = _cd_fallback(monkeypatch, _CdJev(on=False), "needed: no\nseverity: very")
+    assert k.decide("s", both, purpose="screen") is None               # one unreadable answer: none at all
     assert cheapdecide.wrap({"jev": {"haiku": False}}, None) is None  # the setting turns Haiku off
     assert cheapdecide.wrap({"core_provider": "codex"}, None) is None
     monkeypatch.setenv(cheapdecide.OFF_ENV, "1")
@@ -101,3 +112,35 @@ def test_the_daemon_decider_puts_haiku_behind_the_chat_watcher_and_jev(env, monk
     chat = babysit.wrap({"providers": {"chat": {"endpoint": "placeholder", "tiers": {"light": {"model": "m"}}}}},
                         _CdJev(on=False))
     assert isinstance(chat, babysit.Babysitter) and isinstance(chat.jev, cheapdecide.Fallback)
+
+
+def test_a_slow_haiku_never_holds_the_tick_and_its_answer_comes_on_a_later_ask(env, monkeypatch):
+    import time
+    from ttp import waitgate
+    p = make(env)
+    f, calls = _cd_fallback(monkeypatch, _CdJev(on=False), "no", db=p.db, background=True, delay=1.5)
+    task = {"id": 5, "title": "t"}
+    t0 = time.monotonic()
+    d = waitgate._ask_jev(p.db, {}, waitgate.settings({}), f, task, _CD_PREV, None, None, 100.0)
+    assert time.monotonic() - t0 < 0.5                     # far under the caller's timeout and the step budget
+    assert d is None or d.wake                             # no answer yet: the wake happens, never a skip
+    for _ in range(60):
+        if not f.haiku._running:
+            break
+        time.sleep(0.1)
+    d2 = waitgate._ask_jev(p.db, {}, waitgate.settings({}), f, task, _CD_PREV, None, None, 100.0)
+    assert d2 is not None and not d2.wake and len(calls) == 1   # the first call's answer, no second call
+    assert p.db.q("SELECT count(*) n FROM ledger WHERE source='haiku:wake_gate'")[0]["n"] == 1
+
+
+def test_an_unreadable_haiku_screening_answer_keeps_the_rules_severity_and_the_mute(env, monkeypatch):
+    from ttp import screen
+    p = make(env)
+    f, calls = _cd_fallback(monkeypatch, _CdJev(on=False), "#%! garbage", db=p.db)
+    src = "watcher:logs"
+    screen.mute(p.db, src, "disk usage", 24, why="known")
+    text = "disk usage at 71% on the build volume"
+    v = screen.screen(p.db, {}, src, text, jev=f)
+    assert calls                                           # Haiku was asked
+    assert v.severity == screen.rule_severity(text) and v.severity != "critical"
+    assert not v.wake                                      # still muted
