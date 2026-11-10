@@ -20,11 +20,12 @@ SPEC_FOLD_KEEP = 3
 FOLD_HEAD = "## Earlier updates, folded"
 _SECTION = re.compile(r"(?m)^(?=#{2,3} (?:Update|Obligation)\b)")
 _UPDATE = re.compile(r"^## Update\b")
+_FIELD = r"^\s*[-*]?\s*(?:pr_branch|no_push|start_when|retry_when|depends_on):"
 _WHOLE = re.compile(r"\b(?:user|owner)'s\s+words?\b|verbatim|\b(?:user|owner)(?:'s)?\s+#\d+|"
                     r"\b(?:user|owner)\s+(?:said|asked|ordered)\b|"
                     r"\b(?:user|owner)(?:'s)?\s+(?:msg|message|order)s?\b|\bowner's\s+agent\b|"
-                    r"\brelayer\b|"
-                    r"^\s*[-*]?\s*(?:pr_branch|no_push|start_when|retry_when|depends_on):", re.I)
+                    r"\brelayer\b|" + _FIELD, re.I)
+_QUOTE_END = re.compile(_FIELD + r"|^\s*#{1,6}\s", re.I)   # a label's quoted lines end here (or at a blank line)
 _KEEP = re.compile(r"\burgent\b|\bmust\b|\bnever\b|\bdo not\b|\bdon't\b|\bonly\b", re.I)
 
 
@@ -35,16 +36,24 @@ def _sections(spec: str) -> list[str]:
 def _binding(text: str) -> list[str]:
     """What of one folded update a worker must still read (see the module doc): a safety line, a line
     quoting a user's or owner's words and a field line whole; of any other line, only its sentences that
-    bind (never, must, urgent...), so a long note keeps its one rule and drops the rest to the file."""
+    bind (never, must, urgent...), so a long note keeps its one rule and drops the rest to the file.
+    A user's-words line that is a label (ends in ':') keeps the lines it introduces too, up to a blank
+    line, a field line or a heading, as one entry with it, so the quote is never cut from its label."""
     from .coordinator import RETIRED_LIVE, _safety_lines
     lines = text.split("\n")
     safety = _safety_lines(text)
     out = []
+    label = False   # the previous kept entry is a user's-words label whose quoted lines follow
     for i, ln in enumerate(lines[1:], 1):
+        if label and ln.strip() and not _QUOTE_END.search(ln):
+            out[-1] += "\n" + ln.rstrip()
+            continue
+        label = False
         if not ln.strip() or ln.strip() == RETIRED_LIVE:
             continue
         if i in safety or _WHOLE.search(ln):
             out.append(ln.rstrip())
+            label = i not in safety and ln.rstrip().endswith(":") and not re.search(_FIELD, ln, re.I)
         elif _KEEP.search(ln):
             out.append(" ".join(x for x in re.split(r"(?<=[.!?])\s+", ln.strip()) if _KEEP.search(x)))
     return out
