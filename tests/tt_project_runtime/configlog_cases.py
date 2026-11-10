@@ -150,6 +150,15 @@ def test_a_coordinator_config_set_never_changes_a_value_the_user_set(env, monkey
                      "(?, 'in', 'user', 'raise it', 'system')", (time.time(),))
     probs = coord.apply(p, [{"type": "config_set", "key": key, "value": 6}], user_turn=True, messages=[sys_mid])
     assert probs and "a coordinator never changes a value the user set" in probs[0], probs
+    # Turning a permission switch off (its safe way) stays anyone's; turning it back on is the user's.
+    p.set_config("delivery.code_tasks_may_push", True, by=configwho.by("user", via="cli"))
+    p.set_config("delivery.code_tasks_may_push", False, by=configwho.by("coordinator", via="config_set"))
+    assert p.raw_config()["delivery"]["code_tasks_may_push"] is False
+    p.set_config("delivery.code_tasks_may_push", False, by=configwho.by("user", via="cli"))
+    with pytest.raises(configwho.Protected):
+        p.set_config("delivery.code_tasks_may_push", True, by=configwho.by("coordinator", via="config_set"))
+    with pytest.raises(configwho.Protected):   # removing the user's (unsafe-way) value is a change too
+        p.unset_config(key, by=configwho.by("coordinator", via="config_set"))
     # A value the coordinator set it still changes.
     for value in (["codex"], ["claude"]):
         assert coord.apply(p, [{"type": "config_set", "key": "coordinator.provider_failover_to", "value": value}]) == []

@@ -343,13 +343,15 @@ def guard(p, key: str, setter: dict | None, before, after) -> bool:
 
 def _coordinator_guard(p, key: str, setter: dict | None, before, after) -> bool:
     """guard() for a coordinator: it never changes a value under `key` whose recorded setter is the user,
-    raising or lowering it, safe way or not (only the user changes it: at a terminal, or in chat, where a
-    config_set in the turn carrying their own message is recorded as theirs). The refusal names the
+    raising or lowering it (only the user changes it: at a terminal, or in chat, where a config_set in the
+    turn carrying their own message is recorded as theirs). Turning a switch its safe way (_safe_way) stays
+    anyone's, as for an automated setter. The refusal names the
     user's value and when they set it, and is logged; the coordinator sees it as its rejected action.
     True when the value is already the user's (nothing written, their record stays)."""
     hits = []
     for k in [key] + sorted(k for k in _all(p.db) if k.startswith(key + ".")):
-        if at(before, k) != at(after, k) and role(rec := lookup(p.db, k, before)) == "user":
+        if at(before, k) != at(after, k) and not _safe_way(k, at(after, k)) \
+                and role(rec := lookup(p.db, k, before)) == "user":
             old = at(before, k)
             hits.append(f"{k} is {'unset' if old is _ABSENT else json.dumps(shown(k, old))} "
                         f"(set by {describe(rec, p)})")
