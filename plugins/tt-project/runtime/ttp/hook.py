@@ -927,6 +927,12 @@ def _git_op_in_progress(path: str) -> bool:
                               ("rebase-merge", "rebase-apply", "MERGE_HEAD", "CHERRY_PICK_HEAD"))
 
 
+def _scratch_roots() -> list[str]:
+    """Where a review may write: its run directory and the temporary folders."""
+    import tempfile
+    return [os.environ.get("TTP_RUN_DIR", ""), tempfile.gettempdir(), "/tmp"]
+
+
 def reviewer_write(payload: dict) -> str | None:
     """Why a review's file-tool write is refused: a review never edits the change it judges, so its Edit,
     Write and NotebookEdit calls write only in its run directory or a temporary folder, or in a
@@ -939,9 +945,7 @@ def reviewer_write(payload: dict) -> str | None:
     if not path:
         return None
     real = os.path.realpath(path if os.path.isabs(path) else os.path.join(str(payload.get("cwd") or os.getcwd()), path))
-    import tempfile
-    roots = [os.environ.get("TTP_RUN_DIR", ""), tempfile.gettempdir(), "/tmp"]
-    if any(r and (real + os.sep).startswith(os.path.realpath(r).rstrip(os.sep) + os.sep) for r in roots):
+    if any(r and (real + os.sep).startswith(os.path.realpath(r).rstrip(os.sep) + os.sep) for r in _scratch_roots()):
         return None
     if _git_op_in_progress(real):
         return None

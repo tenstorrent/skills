@@ -53,7 +53,13 @@ def test_grep_and_glob_never_search_from_root_or_the_home_folder(env, monkeypatc
 
 
 def test_a_review_writes_only_in_its_run_folder_or_while_resolving_a_conflict(env, monkeypatch, tmp_path):
+    from ttp import hook
     run, home = _full_harness_run(env, monkeypatch, tmp_path, role="reviewer")
+    assert {tempfile.gettempdir(), "/tmp"} <= set(hook._scratch_roots())
+    # tmp_path is itself under a temp root (TMPDIR under `ttp checks`): pin the roots so the repo is not.
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    monkeypatch.setattr(hook, "_scratch_roots", lambda: [str(run), str(scratch)])
     repo = home / "proj"
     subprocess.run(["git", "init", "-q", str(repo)], check=True)
     for tool, args in (("Edit", {"file_path": str(repo / "a.py")}), ("Write", {"file_path": "b.py"}),
@@ -61,7 +67,7 @@ def test_a_review_writes_only_in_its_run_folder_or_while_resolving_a_conflict(en
                        ("MultiEdit", {"file_path": str(repo / "c.py")})):
         reason = _hook_reason({"tool_name": tool, "tool_input": args, "cwd": str(repo)})
         assert reason and "never edits the change it judges" in reason, tool
-    for path in (run / "notes.md", tempfile.gettempdir() + "/scratch.txt"):
+    for path in (run / "notes.md", scratch / "scratch.txt"):
         assert _hook_reason({"tool_name": "Write", "tool_input": {"file_path": str(path)}, "cwd": str(repo)}) is None
     (repo / ".git" / "MERGE_HEAD").write_text("0" * 40 + "\n")   # a merge with a conflict to resolve
     assert _hook_reason({"tool_name": "Edit", "tool_input": {"file_path": str(repo / "a.py")}, "cwd": str(repo)}) is None
@@ -73,7 +79,9 @@ def test_a_review_writes_only_in_its_run_folder_or_while_resolving_a_conflict(en
 
 def test_a_subagents_tool_calls_meet_the_same_guards(env, monkeypatch, tmp_path):
     """A subagent's calls carry agent_id and agent_type (checked live with CLI 2.1.296): every guard applies."""
-    _, home = _full_harness_run(env, monkeypatch, tmp_path, role="reviewer")
+    from ttp import hook
+    run, home = _full_harness_run(env, monkeypatch, tmp_path, role="reviewer")
+    monkeypatch.setattr(hook, "_scratch_roots", lambda: [str(run)])
     sub = {"agent_id": "a2b30f4369444fbc0", "agent_type": "general-purpose", "cwd": str(home / "proj")}
     assert "as the user" in _hook_reason({**sub, "tool_name": "Bash", "tool_input": {"command": "ttp say hi"}})
     assert _hook_reason({**sub, "tool_name": "CronCreate", "tool_input": {}})
