@@ -9918,6 +9918,28 @@ def test_a_preempted_routine_checks_run_requeues_at_its_old_place_and_runs_again
     assert mark.exists()
 
 
+def test_a_preempted_checks_run_does_not_rerun_a_check_that_passed_before_the_preemption(env, tmp_path, monkeypatch,
+                                                                                         capsys):
+    """A check that passed in full before a later check of the same call was preempted keeps its pass
+    (a suite pass): the requeued run does not run it again, only the rest."""
+    from ttp import checkcap, checkwall, cli
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "1")
+    monkeypatch.setattr(checkwall, "POLL_S", 0.1)
+    monkeypatch.setenv(checkcap.PREEMPTED_ENV, "")
+    count, mark = tmp_path / "count", tmp_path / "ran-once"
+    req = checkcap.slot_dir() / f"{checkcap.PREEMPT}.{os.getpid()}.json"
+    first = f"echo x >> {count}"
+    second = (f'if [ -e {mark} ]; then exit 0; fi; touch {mark}; '
+              f'printf \'{{"by": "urgent u", "task": "77", "at": %s}}\' "$(($(date +%s) + 1))" > {req}; sleep 60')
+    cli.main(["checks", "--", first, f"sh -c {shlex.quote(second)}"])
+    out = capsys.readouterr().out
+    assert "preempted by urgent #77" in out, out
+    assert count.read_text().count("x") == 1, "the check that passed before the preemption ran again"
+    assert "not run again" in out.rsplit("preempted by", 1)[1]
+    assert json.loads((run / "checks.json").read_text())["passed"] is True
+
+
 def test_check_commands_never_see_the_checks_runs_own_preempt_rerank_and_reexec_env(env, tmp_path, monkeypatch, capsys):
     """#6289: what only a `ttp checks` run reads (checkcap.RUN_ONLY_ENV: the label a preemption sets, its
     asked request, its rerank and re-execution marks) stays in the run but never reaches its check commands,
