@@ -561,6 +561,24 @@ def test_a_risky_expired_change_unhandled_for_a_day_pages_the_user_once(env):
     assert "risky" in users[0][1] and "Outage" not in users[0][1] and "Acting now" not in users[0][1]
 
 
+@pytest.mark.parametrize("what,undo,risky", [
+    ("Stopped tt-broker.service during the soak", "sudo systemctl restart tt-broker.service", True),
+    ("disabled tt-telemetry.service for the test", "./restore.sh", True),
+    ("systemctl stop foo.service", "systemctl start foo.service", True),
+    ("stopped the soak runner for the test", "service runner reload", True),
+    ("helper scripts in /tmp/t1", "rm -r /tmp/t1", False),
+    ("soak restart", "none: it ends itself", False),
+    ("made a test dir under /dev/shm. Stopped there", "rm -rf /dev/shm/t1", False),
+])
+def test_change_risk_reads_dotted_unit_names_and_restart_undos(env, what, undo, risky):
+    """A stopped or disabled service written with its unit name (x.service) is risky, as is an undo that
+    restarts or reloads one, over any test or soak word; helper scripts, soak restarts and test dirs stay
+    harmless."""
+    from ttp import machine_ledger as ml
+    c = {"what": what, "undo": undo, "alias": "b", "by": "p"}
+    assert bool(ml.change_risk(c, {})) is risky, ml.change_risk(c, {})
+
+
 @pytest.mark.parametrize("how", ["renew", "close", "undo"])
 def test_renew_close_or_undo_clears_an_expired_change_and_its_page(env, how):
     """(d) Each of the three choices ends the entry's page: no pending page, nothing on later rounds."""

@@ -167,18 +167,20 @@ USER_AFTER_S = 86400         # an expired change reaches the user only once unha
 # Risk rule for an expired change record (change_risk): only a risky one ever reaches the user, and only after its
 # projects left it USER_AFTER_S. Risky: its text or undo names a stopped or disabled service or recovery switch, a
 # pause, a reservation or drain, firewall, network, ssh or credential matters, mounts, kernel or driver settings
-# (_RISKY_RE), or its undo starts or enables a service (_UNDO_RISKY_RE); a change on a live serving machine
+# (_RISKY_RE; a dotted unit name such as x.service counts), or its undo starts, enables, restarts or reloads a
+# service (_UNDO_RISKY_RE); a change on a live serving machine
 # (pagesev.serving_machine); and an unclassified change (neither list matches) on a machine whose recovery owner
 # or fallback is another project. Harmless, never paged to the user: a no-op undo, and test or scratch dirs, helper
 # scripts, soak runs and restarts, logs, caches, worktrees and ledger edits (_HARMLESS_RE) on a machine that
 # serves nothing. A risky word wins over a harmless one.
 _RISKY_RE = re.compile(
-    r"\b(?:systemctl\s+(?:stop|disable|mask)|(?:stop(?:ped)?|disabl(?:e|ed)|mask(?:ed)?)\b[^.;]{0,40}?"
-    r"\b(?:service|unit|daemon|timer|watchdog|recovery)|recovery|paused?|pauses|firewall|iptables|nftables|ufw|"
+    r"\b(?:systemctl\s+(?:stop|disable|mask)|(?:stop(?:ped)?|disabl(?:e|ed)|mask(?:ed)?)\b(?:[^.;]|\.(?=\S)){0,40}?"
+    r"\b(?:service|unit|daemon|timer|socket|watchdog|recovery)|recovery|paused?|pauses|firewall|iptables|nftables|ufw|"
     r"network|netplan|routes?|dns|resolv\.conf|vpn|sshd?|authorized_keys|credentials?|tokens?|secrets?|"
     r"passwords?|passwd|sudoers?|certs?|certificates?|keys?|fstab|mounts?|sysctl|modprobe|kernel|drivers?|"
     r"firmware|reservations?|reserved|cordon(?:ed)?|drain(?:ed)?)\b", re.I)
-_UNDO_RISKY_RE = re.compile(r"\bsystemctl\s+(?:start|enable|unmask)\b|\bservice\s+\S+\s+start\b", re.I)
+_UNDO_RISKY_RE = re.compile(r"\bsystemctl\s+(?:start|enable|unmask|(?:try-|reload-or-)?restart|reload)\b|"
+                            r"\bservice\s+\S+\s+(?:start|restart|reload)\b", re.I)
 _HARMLESS_RE = re.compile(r"\b(?:tests?|testing|tmp|temp|scratch|helpers?|scripts?|soak\w*|restart\w*|ledger|logs?|"
                           r"cache|worktrees?|bundles?|mkdir|rm\s+-r\w*)\b|/tmp/|/dev/shm/", re.I)
 GRACE_S = 1800               # default: how long a condition lasts before it is routed
@@ -858,7 +860,7 @@ def change_risk(c: dict, m: dict | None = None) -> str:
     if hit:
         return f"it touches {' '.join(hit.group(0).split())}"
     if _UNDO_RISKY_RE.search(undo):
-        return "its undo starts a stopped service"
+        return "its undo starts or restarts a service"
     if pagesev.serving_machine(m):
         return "its machine serves live traffic"
     if _HARMLESS_RE.search(f"{what} {undo}"):
