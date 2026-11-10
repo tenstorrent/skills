@@ -43,7 +43,7 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import quote, unquote
 
-from . import (checkcap, checkdirs, checkwait, checklane, cleantree, envfault, gatejudge, gatetime, gitcache, gitmemo, hoststate, landed, landmark, leakfile, locks, machines, outscan, pooladmit, prguard, prhead, remotecheck, remoteload, repoid, runner, runnerenv,
+from . import (checkcap, checkdirs, checkspill, checkwait, checklane, cleantree, envfault, gatejudge, gatetime, gitcache, gitmemo, hoststate, landed, landmark, leakfile, locks, machines, outscan, pooladmit, prguard, prhead, remotecheck, remoteload, repoid, runner, runnerenv,
                sandbox, scriptwatch, settinghold, setupfault, shorttmp, slurmcheck, syntaxfault, testslots, timefmt, workerloss, worktree)
 from .budget import DOC_SUFFIXES
 from .db import continues_id, dependency_ids, load_result
@@ -1012,7 +1012,6 @@ def spill_slot(cmds: list, head: str, say: Callable[[str], None], proj: Project 
     runs here beside them), else (None, `cmds`): check_slot then. A check's own "host" stays its own. The
     spill hosts are a speed-up: an error trying them keeps the checks here. Nested in a check that holds a
     slot already (checkcap.HELD_ENV) it never spills. `proj` defaults to TTP_PROJECT's project."""
-    from . import checkspill
     if proj is None and (base := os.environ.get("TTP_PROJECT")):
         proj = Project(base)
     if proj is None or not cmds or os.environ.get(checkcap.HELD_ENV):
