@@ -284,7 +284,7 @@ def migrate_script(user: str, gid: int, moves: List[dict]) -> str:
             f'  [ ! -e {d} ] || {{ echo "refused: {m["dst"]} exists" >&2; exit 3; }}',
             f'  install -d -o "$u" -g "$gid" "$(dirname {d})"',
             f'  mv -- {s} {d}; chown -R "$u:$gid" {d}; echo "moved={m["dst"]}"',
-            f'  find {d} -maxdepth 4 \\( -name pyvenv.cfg -o -name CMakeCache.txt \\) -printf "rebuild=%h\\n"',
+            f'  find {d} -maxdepth 4 \\( -name pyvenv.cfg -o -name CMakeCache.txt \\) -exec sh -c \'for f; do echo "rebuild=${{f%/*}}"; done\' _ {{}} +',
             'fi',
         ]
     return "\n".join(out) + "\n"

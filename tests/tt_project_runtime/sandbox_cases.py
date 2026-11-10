@@ -22,6 +22,7 @@ def _no_sandbox_tools(monkeypatch):
     monkeypatch.setenv(sandbox.ENV, "1")
     monkeypatch.setattr(sandbox, "_STATE", {})
     monkeypatch.setattr(sandbox, "inside", lambda: False)
+    monkeypatch.setattr(sandbox.sys, "platform", "linux")   # on macOS the probe stops at "need Linux" first
     which = shutil.which
     monkeypatch.setattr(sandbox.shutil, "which", lambda name, *a, **k: None if name in ("unshare", "bwrap") else which(name, *a, **k))
     return sandbox
