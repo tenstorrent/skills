@@ -733,10 +733,12 @@ CALLS_REBOOK_SLICE_S = 2.0      # a tick's slice of it stops after the session t
 CALLS_REBOOK_SLICE_RUNS = 200   # or this many runs, so no tick step runs long (a 7-day re-book of a busy project ~50 s)
 CALLS_NOTE = "cost_calls"   # a Claude run's note: booked at its calls' list price (how many calls)
 NO_CALL_REBOOK_KEY = "no_call_rebook"   # Daemon.rebook_no_call ran (once per project)
+NO_USAGE_REBOOK_KEY = "no_usage_rebook"   # Daemon.rebook_no_usage ran (once per project)
 NO_CALL_KEY = "no_call_streak:"   # + provider: its runs that ended failed in a row with no model call
 NO_CALL_STREAK = 3   # this many in a row open the provider's breaker until a model-free check passes
 NO_CALL_STATUSES = ("failed", "timeout", "stalled")   # ends that count toward that streak
 MODEL_REPRICE_SINCE = (2026, 11, 7)   # its window's first day, in the home zone: the days the dollar caps over-counted
+NET_HOLDS_KEY = "net_holds"   # Daemon.hold_offline's holds: provider -> {host, at} (wall time it began)
 REACH_EVERY_S = 30      # while a provider is held offline, how often its API host is resolved again
 REACH_TIMEOUT_S = 5
 NET_HOLD_MAX_S = 900    # a held provider still lets one run try this often: a lookup that keeps failing never holds forever
@@ -1413,8 +1415,9 @@ class Daemon:
         self._lease_key: tuple | None = None
         self._settle_until = 0.0   # monotonic time before which nothing new starts (the host just woke)
         # provider -> {host, since, checked, checking, up, probe}: its API host must resolve before
-        # new runs start on it (net_held). In memory only: a restart tries the network afresh.
-        self._net_holds: dict[str, dict] = {}
+        # new runs start on it (net_held). Kept in kv NET_HOLDS_KEY too, so a restart, and the overseer's
+        # wake of a coordinator turn (a Daemon of its own), hold it until the host resolves.
+        self._net_holds: dict[str, dict] = self._saved_net_holds()
         self._sched_sig: tuple[int, int] | None = None   # harness/schedules.json (mtime, size) last checked
         self._sched_read = 0.0   # monotonic time it was last read
         self._sched_problem: str | None = None   # what was wrong with it, last logged
@@ -2298,7 +2301,7 @@ class Daemon:
         self.tend_lease()
         # Compared as callables, not by name, so a step replaced on the instance is gated the same way.
         lease_off = [] if self.lease_held() else [getattr(self, n) for n in LEASE_STEPS]
-        for step in (self.lift_boot_pause, self.reap_runs, self.reap_waiting_checks, self.wake_after_reboot, self.meter_running, self.rebook_per_call_step, self.rebook_no_call_step, self.watch_runs, self.check_steer_reads, self.relay_escalations, self.post_held_notifies, self.reconcile_tasks, self.retry_workspaces, self.tend_pushes,
+        for step in (self.lift_boot_pause, self.reap_runs, self.reap_waiting_checks, self.wake_after_reboot, self.meter_running, self.rebook_per_call_step, self.rebook_no_call_step, self.rebook_no_usage_step, self.watch_runs, self.check_steer_reads, self.relay_escalations, self.post_held_notifies, self.reconcile_tasks, self.retry_workspaces, self.tend_pushes,
                      self.sweep_sandbox_trees,
                      self.verify_pushes,
                      self.tick_prune_worktrees, self.prune_leftovers, self.branch_cap, self.land_harness_worktrees, self.backup_branches, self.replicate_state, self.check_local_only, self.check_disk,
@@ -2335,7 +2338,9 @@ class Daemon:
         self._run_step(lambda: configwho.watch(self.p), "config_breakage")   # a config change that broke the checks
         settling = self._run_step(self.settling, default=False)
         core = self.cfg.get("core_provider") or "claude"
-        core_held = self._run_step(lambda: self.net_held(core) and not self._net_may_probe(core), "net_held", default=False)
+        # A coordinator turn never tries the network for a held provider (_net_may_probe is for workers):
+        # each would be a lost turn. The held events and messages fold into the one turn after it resolves.
+        core_held = self._run_step(lambda: self.net_held(core), "net_held", default=False)
         cycle = self._run_step(lambda: self.host_cycle_held(now), "host_cycle_held", default=False)
         for step in (   # one step per line: two changes adding steps merge without a conflict
                 self.run_schedules,
@@ -2407,8 +2412,11 @@ class Daemon:
             if self.cfg_status == "unavailable" and step in (self.maybe_coordinate, self.dispatch):
                 continue   # no routing to start model work with (see _load_config)
             # While the host settles after a sleep only new work waits: a person who wrote is answered now.
-            # So while the core provider's API host does not resolve; dispatch holds each provider itself.
-            if settling and step == self.dispatch or (settling or core_held) and step == self.maybe_coordinate \
+            # While the core provider's API host does not resolve no turn starts, a message waiting too: the
+            # turn could not reach the API (a lost turn every few minutes), and the message is answered by
+            # the turn that starts once it resolves. Dispatch holds each provider itself.
+            if settling and step == self.dispatch or core_held and step == self.maybe_coordinate \
+                    or settling and step == self.maybe_coordinate \
                     and not self.p.db.one("SELECT id FROM messages WHERE direction='in' AND handled=0"):
                 continue
             if cycle and step in (self.dispatch, self.start_pushes):   # the coordinator still runs
@@ -3338,6 +3346,7 @@ class Daemon:
             return
         self._net_holds[prov] = {"host": host, "since": time.monotonic(), "checked": None, "checking": False,
                                  "up": False, "probe": None}
+        self._save_net_holds()
         log(self.p, f"{prov}: {why}; no new runs start on it until {host} resolves")
 
     def net_held(self, prov: str) -> bool:
@@ -3374,7 +3383,27 @@ class Daemon:
 
     def _end_net_hold(self, prov: str, why: str) -> None:
         if self._net_holds.pop(prov, None):
+            self._save_net_holds()
             log(self.p, f"{prov}: {why}; new runs start on it again")
+
+    def _saved_net_holds(self) -> dict[str, dict]:
+        """The holds kv NET_HOLDS_KEY kept (hold_offline), each counted from the wall time it began."""
+        try:
+            saved = {} if _proxied() else self.p.db.kv(NET_HOLDS_KEY) or {}
+        except Exception:
+            return {}
+        now, mono = time.time(), time.monotonic()
+        return {prov: {"host": str(h["host"]), "since": mono - max(now - float(h.get("at") or now), 0.0),
+                       "checked": None, "checking": False, "up": False, "probe": None}
+                for prov, h in saved.items() if isinstance(h, dict) and h.get("host")} if isinstance(saved, dict) else {}
+
+    def _save_net_holds(self) -> None:
+        now, mono = time.time(), time.monotonic()
+        try:
+            self.p.db.set_kv(NET_HOLDS_KEY, {prov: {"host": h["host"], "at": now - (mono - h["since"])}
+                                             for prov, h in self._net_holds.items()} or None)
+        except Exception:   # the hold still stands in memory
+            log(self.p, "net hold not saved\n" + traceback.format_exc())
 
     def _slept_between(self, start: float, end: float) -> bool:
         return any(a < end and b > start for a, b in self.p.db.kv("host_sleeps", []) or [])
@@ -5411,7 +5440,8 @@ class Daemon:
         mis-booking, while the per-call count matched Anthropic's bill. The report stays
         in the note (reported_usd; session_cost_usd for a resumed or forked run, the coordinator's
         --max-budget-usd base, _session_total_before). A resumed or forked run with no answer at all, a
-        report and no tokens, never reached the API: $0. Other providers, and a Claude output with no
+        report and no tokens, never reached the API: $0; so does a fresh one whose stream shows no answer
+        (_model_called, strict), whatever its report says. Other providers, and a Claude output with no
         per-call usage (an old Claude Code, a run cut off before its first answer), book the old way:
         the report, netted (_net_of_session), or the token or elapsed estimate. A resumed or forked run whose
         stream shows Claude Code started (init) but no call that answered books $0 whatever its result
@@ -5431,8 +5461,9 @@ class Daemon:
             except Exception as e:   # the old way books it
                 log(self.p, f"run {r['id']}: per-call cost not read: {type(e).__name__}: {e}"[:300])
                 got = None
-            if got is None and session and reported is not None and not _has_tokens(usage):
-                got = claude.CallsCost(0.0, 0, [], [])   # a resume or fork that made no call
+            if got is None and reported is not None and not _has_tokens(usage) \
+                    and (session or not _model_called(out, strict=True)):
+                got = claude.CallsCost(0.0, 0, [], [])   # a resume or fork, or a run whose stream shows no answer: no call
             if got is not None:
                 for model in got.unknown:
                     self._unpriced_model(model)
@@ -5950,6 +5981,62 @@ class Daemon:
         if changed:
             log(self.p, f"re-booked {len(changed)} run(s) of the last {CALLS_REBOOK_DAYS} days that made no model "
                         f"call at $0: ${usd:.2f} of estimates taken back")
+        return changed
+
+    def rebook_no_usage_step(self) -> None:
+        """Tick step: the one-time re-book of estimated runs with no provider usage (rebook_no_usage), once
+        the no-call re-book before it has run."""
+        if getattr(self, "_no_usage_rebook_done", False) or not self.p.db.kv(NO_CALL_REBOOK_KEY):
+            return
+        try:
+            self.rebook_no_usage()
+        except Exception:   # tried again next tick
+            log(self.p, "no-usage re-book failed\n" + traceback.format_exc())
+            return
+        self._no_usage_rebook_done = True
+
+    def rebook_no_usage(self, dry_run: bool = False) -> list[tuple[int, float]] | None:
+        """Once per project (kv NO_USAGE_REBOOK_KEY): runs of any provider that ended in the last
+        CALLS_REBOOK_DAYS days booked at an estimate with no provider usage (no tokens counted) and no
+        evidence in their output that they reached the API (_model_called strict: an answer, a turn or
+        usage, never only an event type it does not know; output that is gone is no evidence), re-booked at
+        $0 the way _book_cost and _cut_off_cost book one now: cost_usd 0 (note no_usage_rebooked keeps the
+        old figure), the task's spend lowered by it (never below $0) and a ledger row of minus that amount
+        at the run's end. With `dry_run` nothing is written and the marker is not read. Returns (run id,
+        booked before) per run changed, or None when it already ran."""
+        db = self.p.db
+        if not dry_run and db.kv(NO_USAGE_REBOOK_KEY):
+            return None
+        since = time.time() - CALLS_REBOOK_DAYS * 86400
+        window = "COALESCE(ended, started)>=?"
+        usd_all = float(db.one(f"SELECT COALESCE(SUM(cost_usd),0) AS s FROM runs WHERE {window}", (since,))["s"])
+        changed = []
+        for r in db.q("SELECT * FROM runs WHERE status!='running' AND cost_usd>0 AND cost_estimated=1 "
+                      "AND COALESCE(input_tokens,0)=0 AND COALESCE(output_tokens,0)=0 "
+                      "AND COALESCE(cache_read_tokens,0)=0 AND COALESCE(cache_write_tokens,0)=0 "
+                      f"AND {window} ORDER BY id", (since,)):
+            out = self._run_dir(r) / "output.jsonl"
+            if out.is_file() and _model_called(out, strict=True):
+                continue
+            before = round(float(r["cost_usd"]), 6)
+            changed.append((r["id"], before))
+            if dry_run:
+                continue
+            note = json.loads(r["note"] or "{}")
+            note["no_usage_rebooked"] = before
+            with db.tx():
+                db.x("UPDATE runs SET cost_usd=0, note=? WHERE id=?", (json.dumps(note), r["id"]))
+                if r["task"]:
+                    db.x("UPDATE tasks SET spent_usd=MAX(COALESCE(spent_usd,0)-?,0) WHERE id=?", (before, r["task"]))
+                db.spend(r["provider"], -before, self._source_for(r), account=r["account"] or "", estimated=True,
+                         ts=float(r["ended"] or r["started"] or time.time()))
+        if dry_run:
+            return changed
+        usd = round(sum(c[1] for c in changed), 6)
+        db.set_kv(NO_USAGE_REBOOK_KEY, {"at": time.time(), "runs": len(changed), "usd_before": round(usd_all, 6),
+                                        "usd_after": round(usd_all - usd, 6)})
+        log(self.p, f"re-booked {len(changed)} run(s) of the last {CALLS_REBOOK_DAYS} days booked an estimate with "
+                    f"no provider usage at $0: ${usd_all:.2f} booked -> ${usd_all - usd:.2f}")
         return changed
 
     def _output_models(self, r: dict) -> dict:
@@ -11173,6 +11260,8 @@ class Daemon:
     def _maybe_coordinate(self) -> None:
         if not self.lease_held():
             return
+        if self.net_held(self.cfg.get("core_provider") or "claude"):
+            return   # its API host does not resolve: the turn that starts once it does folds in what waits
         db, c = self.p.db, self.cfg["coordinator"]
         if db.one("SELECT id FROM runs WHERE role='coordinator' AND status='running'"):
             return
@@ -20218,8 +20307,8 @@ def _cut_off_cost(run_dir: Path, exit_info: dict, usage=None, prov=None) -> floa
     count (Codex: its rollout's running totals), else the elapsed share of its dollar budget rather
     than $0, so the caps keep counting it. A run whose agent never started (it gave
     up waiting for a resource) spent nothing, and so did one that reported no tokens and whose stream
-    shows no model call (_model_called), when its CLI streams (a CLI that hung, was logged out or
-    offline, or a host that slept, before its first answer)."""
+    shows no model call (_model_called, strict), on any provider (a CLI that hung, was logged out or
+    offline, or a host that slept, before its first answer; one that printed nothing)."""
     if exit_info.get("launched") is False:
         return 0.0
     try:
@@ -20227,20 +20316,14 @@ def _cut_off_cost(run_dir: Path, exit_info: dict, usage=None, prov=None) -> floa
     except (OSError, ValueError):
         return 0.0
     tokens = usage and _has_tokens(usage)
-    try:
-        silent = not (run_dir / "output.jsonl").stat().st_size
-    except OSError:
-        silent = True
-    if silent and not tokens and (prov is None or prov.streams(spec.get("argv") or [])):
-        return 0.0
     if prov is not None and exit_info.get("started"):   # Codex: the tokens its rollout counted
         priced = _priced_from_tokens(run_dir, exit_info, usage, prov)
         if priced:
             return priced
-    # No tokens and no model call in its stream (a CLI logged out, or offline, that retried until its
-    # timeout): it spent nothing, so it books $0 and counts toward no cap.
-    if not tokens and (prov is None or prov.streams(spec.get("argv") or [])) \
-            and not _model_called(run_dir / "output.jsonl"):
+    # No tokens and no model call in its output (a CLI logged out, or offline, that retried until its
+    # timeout; one that printed nothing, streaming or not): no evidence it reached the API, so it books
+    # $0 and counts toward no cap, on every provider.
+    if not tokens and not _model_called(run_dir / "output.jsonl", strict=True):
         return 0.0
     budget = float(spec.get("budget_usd") or spec.get("default_budget_usd") or 0)
     timeout = float(spec.get("timeout_s") or 0)
@@ -20517,13 +20600,17 @@ _NO_CALL_MSGS = frozenset({"error", "stream_error", "task_started", "session_con
 # Stream event types that carry no answer (Claude Code, Cursor, Codex exec --json); another type counts as one.
 _NO_CALL_TYPES = frozenset({"system", "user", "error", "thread.started", "turn.started", "turn.failed",
                             "rate_limit_event"})
+# Stream event types an answer from the API makes (Cursor's tool calls and thinking, Claude Code's partial
+# messages): with _model_called's `strict` only these, of the types it reads no further, count as a call.
+_CALL_TYPES = frozenset({"tool_call", "thinking", "stream_event"})
 
 
-def _model_called(out: Path) -> bool:
+def _model_called(out: Path, strict: bool = False) -> bool:
     """Whether a run's output.jsonl shows a model call: an assistant message (not Claude Code's
     <synthetic> error message), a Codex item other than an error, a completed turn, a usage record
     with tokens, or a result with an answer. Lines that are not JSON prove nothing; an event of an
-    unknown type counts as a call, so an unfamiliar stream keeps its estimate."""
+    unknown type counts as a call, so an unfamiliar stream keeps its estimate, unless `strict` (what
+    books a run: no estimate without evidence that it reached the API), where only _CALL_TYPES do."""
     try:
         f = open(out, "rb")
     except OSError:
@@ -20566,7 +20653,7 @@ def _model_called(out: Path) -> bool:
                 if not ev.get("is_error") and ev.get("subtype") in (None, "success") and ev.get("result"):
                     return True
                 continue
-            if kind and kind not in _NO_CALL_TYPES:
+            if kind and kind not in _NO_CALL_TYPES and (not strict or kind in _CALL_TYPES):
                 return True
     return False
 

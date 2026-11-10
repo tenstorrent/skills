@@ -1,0 +1,5 @@
+---
+"tt-project": patch
+---
+
+`tt-project`: a run with no provider usage books $0 unless its output shows it reached the API (an answer, a turn or a usage record), on every provider. An event type the harness does not know, or an empty or missing output, no longer keeps an elapsed-time estimate. A partial result still books its own reported usage. Coordinator turns now get the same model-free network hold as worker runs: while the core provider's API host does not resolve, no turn starts, not even for a waiting user message. Once the host resolves, one turn starts and handles what waited. Holds are kept in the project database, so they survive a daemon restart and also apply to the overseer's wake. On the first daemon start after the upgrade, each project re-books once: runs of the last 7 days that were booked an estimate with no provider usage and no such evidence go to $0, through negative ledger rows at each run's end time. One daemon.log line gives the count and the 7-day total before and after.

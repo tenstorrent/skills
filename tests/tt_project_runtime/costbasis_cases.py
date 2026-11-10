@@ -370,6 +370,82 @@ def test_model_called_reads_a_call_from_any_providers_stream(tmp_path, lines, ca
     assert _model_called(tmp_path / "missing.jsonl") is False
 
 
+@pytest.mark.parametrize("lines,called", [
+    ([{"type": "something_new"}], False),   # an unknown event type is no evidence the run reached the API
+    ([{"type": "rate_limit_event"}, {"type": "system", "subtype": "init"}], False),
+    ([{"type": "tool_call", "subtype": "started"}], True),
+    ([{"type": "stream_event", "event": {"type": "message_start"}}], True),
+    ([{"type": "assistant", "message": {"id": "m1", "model": "opus"}}], True),
+])
+def test_model_called_strict_counts_only_an_answer_from_the_api(tmp_path, lines, called):
+    from ttp.daemon import _model_called
+    out = tmp_path / "output.jsonl"
+    out.write_text("".join(json.dumps(x) + "\n" for x in lines))
+    assert _model_called(out, strict=True) is called
+
+
+@pytest.mark.parametrize("provider,lines", [
+    ("codex", CODEX_NO_CALL),
+    ("claude", [{"type": "system", "subtype": "init"},
+                {"type": "result", "is_error": True, "result": "API Error: Can't reach the API server (EAI_AGAIN)"}]),
+    ("cursor", [{"type": "system", "subtype": "init"}, {"type": "something_new"}]),
+    ("cursor", []),
+])
+def test_a_lost_run_with_no_provider_result_books_0_on_every_provider(env, provider, lines):
+    """A run that never reached the API (no usage, no answer in its output) books $0, whatever its
+    provider, whether it timed out or was lost: no estimate without evidence it called a model."""
+    from ttp.daemon import Daemon
+    d = Daemon(make(env).base)
+    t0 = time.time() - 3600
+    run = _timed_out_run(d, provider, lines)
+    assert run["cost_usd"] == 0, (provider, dict(run))
+    assert d.p.db.task(run["task"])["spent_usd"] == 0 and d.p.db.spent_since(t0) == 0
+
+
+def test_the_no_usage_rebook_takes_back_estimates_with_no_evidence_once(env):
+    from ttp.daemon import CALLS_REBOOK_DAYS, NO_CALL_REBOOK_KEY, NO_USAGE_REBOOK_KEY, Daemon
+    d = Daemon(make(env).base)
+    db = d.p.db
+    now = time.time()
+
+    def booked(provider, lines, ended, usd=2.5):
+        tid = db.add_task("t", "", kind="work", tier="standard", priority=3, budget_usd=8.0, labels=[])
+        rid = db.x("INSERT INTO runs(task,role,provider,started,ended,status,cost_usd,cost_estimated) "
+                   "VALUES(?,'worker',?,?,?,'lost',?,1)", (tid, provider, ended - 900, ended, usd))
+        run_dir = d.p.runs / str(rid)
+        run_dir.mkdir(parents=True)
+        db.x("UPDATE runs SET dir=? WHERE id=?", (str(run_dir), rid))
+        if lines is not None:
+            (run_dir / "output.jsonl").write_text("".join(json.dumps(x) + "\n" for x in lines))
+        db.x("UPDATE tasks SET spent_usd=? WHERE id=?", (usd, tid))
+        db.spend(provider, usd, "t", estimated=True, ts=ended)
+        return rid, tid
+
+    unknown, unknown_task = booked("cursor", [{"type": "something_new"}], now - 3600)
+    gone, _ = booked("claude", None, now - 7200)   # output removed: no evidence either
+    called, _ = booked("codex", [{"type": "item.completed", "item": {"type": "agent_message"}}], now - 3600)
+    old, _ = booked("cursor", [], now - (CALLS_REBOOK_DAYS + 1) * 86400)
+    since = now - 2 * 86400
+    assert db.spent_since(since) == pytest.approx(7.5)
+    d.rebook_no_usage_step()
+    assert db.kv(NO_USAGE_REBOOK_KEY) is None, "it waits for the no-call re-book"
+    assert d.rebook_no_usage(dry_run=True) == [(unknown, 2.5), (gone, 2.5)]
+    assert db.spent_since(since) == pytest.approx(7.5) and db.kv(NO_USAGE_REBOOK_KEY) is None
+    db.set_kv(NO_CALL_REBOOK_KEY, {"at": now})
+    d.rebook_no_usage_step()
+    assert db.spent_since(since) == pytest.approx(2.5), "only the run that called a model still counts"
+    assert json.loads(db.one("SELECT note FROM runs WHERE id=?", (unknown,))["note"])["no_usage_rebooked"] == 2.5
+    assert db.task(unknown_task)["spent_usd"] == 0
+    assert [r["ts"] for r in db.q("SELECT ts FROM ledger WHERE usd<0 ORDER BY ts")] == \
+        [pytest.approx(now - 7200), pytest.approx(now - 3600)], "taken back at each run's end"
+    assert db.one("SELECT cost_usd FROM runs WHERE id=?", (called,))["cost_usd"] == 2.5
+    assert db.one("SELECT cost_usd FROM runs WHERE id=?", (old,))["cost_usd"] == 2.5
+    mark = db.kv(NO_USAGE_REBOOK_KEY)
+    assert mark["runs"] == 2 and mark["usd_before"] - mark["usd_after"] == pytest.approx(5.0)
+    assert d.rebook_no_usage() is None, "it runs once"
+    assert Daemon(d.p.base).rebook_no_usage() is None and db.spent_since(since) == pytest.approx(2.5)
+
+
 def test_the_no_call_rebook_takes_back_past_estimates_with_signed_rows_once(env):
     from ttp.daemon import CALLS_REBOOK_DAYS, Daemon
     d = Daemon(make(env).base)

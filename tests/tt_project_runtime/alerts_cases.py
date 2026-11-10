@@ -5683,3 +5683,36 @@ def test_the_notifier_agent_runs_at_standard_priority_and_an_old_background_one_
     plist.write_bytes(plistlib.dumps({**plistlib.loads(plist.read_bytes()), "ProcessType": "Background"}))
     assert notifier.refresh(send_test=False)[0].startswith("desktop notifier: installed and started (launchd)")
     assert plistlib.loads(plist.read_bytes())["ProcessType"] == "Standard"
+
+
+def test_a_dns_failure_holds_coordinator_turns_across_daemons_and_one_turn_starts_once_it_resolves(
+        env, monkeypatch):
+    """The field case: the API host did not resolve and a coordinator turn started every few minutes,
+    each lost after retrying EAI_AGAIN, while a user message waited. The hold stops every turn, the
+    overseer's wake (a Daemon of its own) too, and the turn after the host resolves answers the message."""
+    from ttp import daemon as dm
+    p = make(env)
+    monkeypatch.setattr(dm, "_proxied", lambda: False)
+    monkeypatch.setattr(dm, "_background", lambda fn: fn())
+    monkeypatch.setattr(dm, "REACH_EVERY_S", 0)   # each call looks the host up again
+    up = [False]
+    monkeypatch.setattr(dm, "_resolves", lambda host: up[0])
+    d = dm.Daemon(p.base)
+    core = d.cfg.get("core_provider") or "claude"
+    monkeypatch.setattr(type(dm.get_provider(core)), "reach_host", lambda self, env=None: "api.example.com")
+    started = []
+
+    def start_run(role, prompt, *a, **k):
+        started.append(role)
+        return p.db.x("INSERT INTO runs(role,started,status) VALUES('coordinator',?,'ok')", (time.time(),))
+    d.hold_offline(core, "Can't reach the API server (EAI_AGAIN)")
+    p.db.x("INSERT INTO messages(ts,direction,chat,text,handled) VALUES(?,?,?,?,0)", (time.time() - 600, "in", "web", "hi"))
+    wake = dm.Daemon(p.base)
+    for daemon in (d, wake):
+        monkeypatch.setattr(daemon, "start_run", start_run)
+        for _ in range(3):
+            daemon.maybe_coordinate()
+    assert started == [] and p.db.kv(dm.NET_HOLDS_KEY)[core]["host"] == "api.example.com"
+    up[0] = True
+    d.maybe_coordinate()
+    assert started == ["coordinator"] and p.db.kv(dm.NET_HOLDS_KEY) is None

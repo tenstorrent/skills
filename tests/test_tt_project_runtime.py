@@ -24553,8 +24553,9 @@ def test_a_run_with_no_output_and_no_tokens_costs_nothing(env):
             ("claude", ["claude", "-p", "--output-format", "stream-json"], "", 0.0),
             ("codex", ["codex", "exec", "--json"], "", 0.0),
             ("codex", ["codex", "exec", "--json"], json.dumps({"type": "item.started"}) + "\n", 1.0),
-            # An older Cursor build prints nothing until it ends: its silence is not idleness.
-            ("cursor", ["agent", "-p", "--output-format", "json"], "", 1.0)):
+            # An older Cursor build prints nothing until it ends: with no sign the run reached the API,
+            # its silence books nothing either.
+            ("cursor", ["agent", "-p", "--output-format", "json"], "", 0.0)):
         rid = p.db.x("INSERT INTO runs(role,provider,model,started,status) VALUES('worker',?,'',?,'running')",
                      (provider, t0))
         run_dir = p.runs / str(rid)
