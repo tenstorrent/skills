@@ -559,6 +559,8 @@ def env(tmp_path, monkeypatch, _git_session, _short_tmp):
     kept = lambda name, entry, row: False   # a test project has no service: its daemon faults, not stopped on purpose
     kept.real = service.stopped_at
     monkeypatch.setattr(service, "stopped_at", kept)
+    from ttp import restriction_audit   # the audit's 5 s tick-thread budget never cuts a test's scan on a loaded
+    monkeypatch.setattr(restriction_audit, "AUDIT_BUDGET_S", 600.0)   # host (restriction_audit_cases tests the budget)
     monkeypatch.setattr(importlib.machinery.SourceFileLoader, "get_code",
                         _cached_get_code(importlib.machinery.SourceFileLoader.get_code))
     monkeypatch.setattr(gettext, "find", _cached_find(gettext.find))

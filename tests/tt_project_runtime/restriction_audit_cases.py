@@ -765,6 +765,28 @@ def test_a_removal_naming_a_message_id_or_a_value_selects_only_the_tools_citing_
     assert restriction_audit.tool_hit("soak at 900 w", set(), {"900 w", "900w", "soak"}) == ["900 w", "soak"]
 
 
+def test_a_loaded_host_never_cuts_a_tests_audit_scan(env, monkeypatch):
+    """On a loaded box a scan can run past the daemon's 5 s budget (the over-note test failed that way once):
+    tests run the audit with no wall-clock cut (env sets AUDIT_BUDGET_S), so a check of its matching never
+    depends on the box's load. A clock that moves 3 s per read finds the citing tool and notes no cut."""
+    import types
+    from ttp import restriction_audit
+    assert restriction_audit.AUDIT_BUDGET_S >= 600
+    p, tasks = _scope_project(env, [("soak.sh", "#!/bin/sh\n# allowed by user msg #4321\nexit 0\n")])
+    start = time.monotonic()
+    clock = [start]
+
+    def loaded():
+        clock[0] += 3.0
+        return clock[0]
+
+    monkeypatch.setattr(restriction_audit, "time", types.SimpleNamespace(monotonic=loaded, time=time.time))
+    notes = []
+    out = restriction_audit.restriction_tools(p, [(_POWER, "", "")], [], notes)
+    assert clock[0] - start > 5, "the scan never ran past the daemon's 5 s budget"
+    assert notes == [] and len(out) == 1 and "bin/soak.sh:2 (#4321)" in out[0], (notes, out)
+
+
 def test_an_over_note_naming_a_landed_fix_dispatches_nothing(env):
     """`over` naming a done harness task, or a commit already on the project repo's HEAD, that updated the
     tools: no task and no event. A task still open, a done task that changed no code, a user-message cite of
