@@ -2855,7 +2855,7 @@ def cmd_push(a) -> None:
     if a.result:
         sys.exit(push.result(Path(a.result), pushed_only=a.pushed))
     from . import coordtools
-    if coordtools.coordinator_run() and not (a.queue or (a.free and not a.move_tag)):
+    if coordtools.coordinator_run() and not (a.queue or a.stop or (a.free and not a.move_tag)):
         die(f"ttp push: {coordtools.PUSH_REFUSAL}")   # also past the hook's text check (coordtools.py)
     if a.own_branch:   # read by push.own_target, also in the detached process (inherited, or QUEUE_ENV)
         a.own = True
@@ -2873,6 +2873,8 @@ def cmd_push(a) -> None:
         from . import pushq
         print(pushq.queue_text(p))
         return
+    if a.stop:
+        sys.exit(push.stop_own(p, Path(a.stop)))
     if a.move_tag:
         from . import channeltag
         sys.exit(channeltag.move(p, Path.cwd(), *a.move_tag, say=lambda s: print(s, file=sys.stderr)))
@@ -8442,6 +8444,8 @@ def _detach_stop(what: str, given: str | None = None) -> int:
         rc = earlier   # a job of that name an earlier run of this task detached
     if not detach._entry(rc) and rc.name == CHECKS_RC and (rc.parent / CHECKS_PID).is_file():
         return _detach_stop_checks(rc, given)
+    if not detach._entry(rc) and rc.suffix == ".json" and rc.parent.name == "pushes":
+        return _detach_stop_push(rc, given)   # a detached `ttp push` marker
     if not detach._entry(rc):
         return _launcher_stop(what, rc)
     base = rc.parent.parent.parent.parent if rc.parent.parent.name == "runs" else None
@@ -8496,6 +8500,16 @@ def _detach_stop_checks(rc: Path, given: str | None) -> int:
     code, text, _ = jobstop.stop_checks(p, run_dir, caller, run, given)
     print(text if code != 3 else f"ttp detach --stop: {text}", file=sys.stderr if code == 3 else sys.stdout)
     return code
+
+
+def _detach_stop_push(marker: Path, given: str | None) -> int:
+    """`ttp detach --stop <push marker>`: `ttp push --stop` (push.stop_own) in the marker's own project."""
+    from . import push
+    if marker.parent.name != push.DETACHED or not (p := Project(marker.parent.parent.parent)).exists() \
+            or p.state.resolve() != marker.parent.parent:
+        print(f"ttp detach: {marker} is not a detached push marker of a tt-project project", file=sys.stderr)
+        return 2
+    return push.stop_own(p, marker, given or "")
 
 
 def _launcher_stop(what: str, rc: Path) -> int:
@@ -13260,6 +13274,10 @@ def main(argv: list[str] | None = None) -> None:
                    help="push in a process of its own; print its marker and a --result probe, and return at once")
     s.add_argument("--result", metavar="MARKER",
                    help="push nothing: report a detached push; exit 0 once it finished (or died), 1 while it runs")
+    s.add_argument("--stop", metavar="MARKER",
+                   help="end this task's own detached push (its marker) while it waits for its turn or runs its "
+                        "checks, and remove its marker, so the push train can take its head; never one in its "
+                        "git push (exit 1), another task's or project's (exit 2); 0 once stopped or already ended")
     s.add_argument("--pushed", action="store_true",
                    help="with --result: exit 0 only if the push landed, 1 while it runs, 3 if it finished "
                         "without pushing (for an on_pass_cmd; no grep needed)")

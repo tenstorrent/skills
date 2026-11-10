@@ -1227,6 +1227,8 @@ def mirror_check(v: Any, push_branch: str) -> list[dict]:
 
 def _git_net(repo: Path, *args: str, timeout_s: float = MIRROR_TIMEOUT_S) -> subprocess.CompletedProcess:
     """git that talks to a remote: no prompt, no stdin, at most `timeout_s` (exit 124 when it runs past)."""
+    if args[:1] == ("push",):
+        _git_push_began()
     t = gitmemo.timeout(timeout_s, args)
     try:
         return gitmemo.run(["git", "-C", str(repo), *args], text=True, capture_output=True,
@@ -1807,6 +1809,8 @@ def unmatched_paths(repo: Path, remote: str, branch: str, checks: list[str]) -> 
 
 def _git(repo: Path, *args: str, quiet: bool = True) -> subprocess.CompletedProcess:
     """Run git; when not quiet its output goes to stderr, keeping stdout for the verdict."""
+    if args[:1] == ("push",):
+        _git_push_began()
     t = gitmemo.timeout(None, args)   # none of its own; capped within a daemon tick step or finish transaction
     if quiet:
         run = lambda: gitcache.run(repo, args, lambda: gitmemo.run(   # noqa: E731
@@ -4914,7 +4918,8 @@ def _prune(folder: Path, now: float) -> int:
             continue
         if old and _read(marker).get("status") not in ("running", "queued"):
             n += 1
-            for f in (marker, marker.with_suffix(".log"), marker.with_suffix(POOL_STATUS_SUFFIX), _run_lock(marker)):
+            for f in (marker, marker.with_suffix(".log"), marker.with_suffix(POOL_STATUS_SUFFIX),
+                      marker.with_suffix(GIT_PUSH_SUFFIX), _run_lock(marker)):
                 try:
                     f.unlink()
                 except OSError:
@@ -5130,7 +5135,28 @@ class _Stopped(Exception):
     pass
 
 
+GIT_PUSH_SUFFIX = ".gitpush"   # beside a detached push's marker once its process began a `git push` (stop_own)
+_marker_here: Path | None = None   # the marker of this process when it is a detached push (run_detached)
+_git_pushed = False   # this process began a `git push`: from here on a stop signal never interrupts it
+
+
+def _git_push_began() -> None:
+    """Mark that this process begins a `git push`, first in itself (so _stop no longer raises) and then
+    beside its marker (so `ttp push --stop` refuses it): a push to a remote is never interrupted, and once
+    one began the rest of the run (its outcome, a retry after a rejection) is short."""
+    global _git_pushed
+    _git_pushed = True
+    if _marker_here is not None:
+        try:
+            _marker_here.with_suffix(GIT_PUSH_SUFFIX).touch()
+        except OSError:
+            pass
+
+
 def _stop(sig, _frame) -> None:
+    if _git_pushed:   # os.write: a print here could re-enter a write the signal interrupted
+        os.write(2, f"ttp push: {signal.Signals(sig).name} after a git push began; not interrupting it\n".encode())
+        return
     raise _Stopped(f"stopped by {signal.Signals(sig).name}")
 
 
@@ -5159,8 +5185,9 @@ def run_detached(p: Project, repo: Path, marker: Path, own: bool = False) -> int
     except (OSError, ValueError):
         pass
     print(f"--- {time.strftime('%Y-%m-%dT%H:%M:%S')} detached push, marker {marker}", flush=True)
-    global pool_status
+    global pool_status, _marker_here
     pool_status = marker.with_suffix(POOL_STATUS_SUFFIX)
+    _marker_here = marker
     m = _read(marker)
     if m.get("status") == "running":
         m["alive"] = time.time()   # it began: a death from here on is not one at startup
@@ -5542,6 +5569,95 @@ def running(p: Project) -> list[dict]:
         if m.get("status") == "queued" or m.get("status") == "running" and not free:
             out.append({**m, "marker": str(marker), **({"lock_unknown": True} if free is None else {})})
     return out
+
+
+STOP_TERM_S = 15.0   # stop_own: how long a push has to end after SIGTERM before its group gets SIGKILL
+NOT_STOPPED = 1      # stop_own: the push began its `git push` (or did not end) and was left running
+
+
+def stop_own(p: Project, marker: Path, why: str = "") -> int:
+    """`ttp push --stop <marker>` (and `ttp detach --stop` on a push marker): end this task's own detached
+    push while it waits for its turn or runs its checks, so the push train can take its head, and remove
+    its marker, log and lock file. Refused (REFUSED) for a marker outside this project's pushes folder,
+    a push queue batch, and a push of another task or with no task. A queued push is recorded as not
+    started (jobstop.end_push). A running one gets SIGTERM to its process alone: it ends its lock wait or
+    its checks (their group leader ends them with it) and writes its outcome; SIGKILL to its group follows
+    after STOP_TERM_S only while it has not begun a `git push`. A push that began one is never signalled
+    and keeps its marker: NOT_STOPPED. Only what the push itself held is freed (its process ends, so its
+    run lock and any branch lock go with it); a push that already ended is left as it is (0)."""
+    from . import detach as job, jobstop   # `detach` here is this module's own function
+    say = lambda m: print(f"ttp push: {m}", file=sys.stderr)   # noqa: E731
+    marker = Path(marker).expanduser().resolve()
+    folder = (p.state / DETACHED).resolve()
+    mine = os.environ.get("TTP_PROJECT")
+    if mine and Path(mine).expanduser().resolve() != p.base.resolve():
+        say(f"refused: {marker} is a push of the project at {p.base}, not of this run's project ({mine})")
+        return REFUSED
+    if marker.parent != folder or marker.suffix != ".json":
+        say(f"refused: {marker} is not a detached push marker of this project ({folder}/<id>.json)")
+        return REFUSED
+    m = _read(marker)
+    if not m:
+        say(f"no detached push marker at {marker}")
+        return REFUSED
+    if m.get("kind") == "batch":
+        say("refused: that is the push queue's batch, not a task's push")
+        return REFUSED
+    me = os.environ.get("TTP_TASK") or ""
+    if not me or str(m.get("task") or "") != me:
+        say(f"refused: the push {marker.stem} is task #{m.get('task') or '?'}'s, "
+            + (f"not task #{me}'s" if me else "and only its own task's run may stop it"))
+        return REFUSED
+    why = why or f"task #{me} withdrew its own push"
+    side = marker.with_suffix(GIT_PUSH_SUFFIX)
+    m = _settle(marker)
+    if m.get("status") not in ("queued", "running"):
+        say(f"the push {marker.stem} already ended ({m.get('status') or 'no status'}); nothing to stop")
+        return 0
+    if m.get("status") == "running" and side.exists():
+        say(f"not stopped: the push {marker.stem} is in its git push, which is never interrupted; "
+            f"its outcome comes from {result_probe(marker, p)}")
+        return NOT_STOPPED
+    if m.get("status") == "queued":
+        if jobstop.end_push(p, marker, why, int(me)) is None and _read(marker).get("status") in ("queued", "running"):
+            say(f"not stopped: the daemon is starting the push {marker.stem} right now; run this again")
+            return NOT_STOPPED
+    else:
+        run_lock, pid = _run_lock(marker), m.get("pid")
+        if not (isinstance(pid, int) and pid > 1) or str(marker) not in jobstop._argv(pid):
+            say(f"not stopped: pid {pid} of the push {marker.stem} is not its push process")
+            return NOT_STOPPED
+        sent = []
+        for sig, group in ((signal.SIGTERM, False), (signal.SIGKILL, True)):
+            if group and side.exists():
+                break   # it began its git push meanwhile: never interrupted
+            try:
+                os.killpg(pid, sig) if group else os.kill(pid, sig)
+                sent.append(sig)
+            except OSError:
+                pass
+            deadline = time.monotonic() + STOP_TERM_S
+            while not locks.any_free([run_lock]) and time.monotonic() < deadline:
+                time.sleep(0.1)
+            if locks.any_free([run_lock]):
+                break
+        for sig in sent:
+            job.signalled(marker, sig, pid, "push.stop_own", why, by="push", group=sig == signal.SIGKILL,
+                             state=p.state, task=int(me))
+        if not locks.any_free([run_lock]):
+            say(f"not stopped: the push {marker.stem} " + ("began its git push, which is never interrupted"
+                if side.exists() else f"did not end within {STOP_TERM_S:.0f} s of SIGTERM"))
+            return NOT_STOPPED
+        if _read(marker).get("status") == "pushed":
+            say(f"not removed: the push {marker.stem} pushed before it ended; its marker stays for its result")
+            return NOT_STOPPED
+    for f in (marker, marker.with_suffix(".log"), marker.with_suffix(POOL_STATUS_SUFFIX), side, _run_lock(marker)):
+        try:
+            f.unlink()
+        except OSError:
+            pass
+    print(f"ttp push: stopped the push {marker.stem} (task #{me}) and removed its marker: {why}")
+    return 0
 
 
 def status_lines(p: Project) -> list[str]:
