@@ -157,7 +157,8 @@ def own_checks(p, cfg: dict, result: dict) -> str | None:
 
 def log(db: DB, task: int, d: Decision, avoided_usd: float = 0.0, now: float | None = None) -> int:
     return db.x("INSERT INTO wake_gate(ts,task,decision,by,reason,jev_call,avoided_usd) VALUES(?,?,?,?,?,?,?)",
-                (time.time() if now is None else now, task, "wake" if d.wake else "skip", d.by, d.reason[:300],
+                (time.time() if now is None else now, task,   # a wait for Haiku's answer is no skip in the stats
+                 "wake" if d.wake else "wait" if d.extra.get("pending") else "skip", d.by, d.reason[:300],
                  d.jev_call, float(avoided_usd or 0)))
 
 
@@ -253,6 +254,8 @@ def _ask_jev(db: DB, cfg: dict, s: dict, jev, task: dict, prev: dict, probe: tup
         }, purpose=USE, timeout=JEV_TIMEOUT_S)
     except Exception as e:   # the gate never loses a wake: an error wakes the model
         return Decision(True, "fallback", f"jev unavailable: {type(e).__name__}")
+    if not ans and getattr(jev, "pending", False):   # Haiku answers in the background: look again in a minute
+        return Decision(False, "haiku", "Haiku's answer is on its way", extra={"delay_s": 60.0, "pending": True})
     if not ans:
         return Decision(True, "fallback", "jev gave no answer")
     try:
@@ -323,13 +326,15 @@ def decide(p, cfg: dict, task: dict, prev: dict, now: float, probe: tuple | None
             d = Decision(False, "rule", why)
         else:
             d = _ask_jev(db, cfg, s, jev, task, prev, probe, last_run, now) or Decision(True, "fallback", "no rule or Jev decided")
+            if d.extra.get("pending") and gate.get("pending"):   # one wait for an answer per wait, never a loop
+                d = Decision(True, "fallback", "Haiku gave no answer within a minute")
     d.seen = seen
     if not d.wake:
         base = min(max(bud_retry_s(prev), float(s["backoff_s"])), float(s["max_backoff_s"]) or 3600)
         delay = min(base * 2 ** len(skips), float(s["max_backoff_s"]) or base)
         cap_at = ended + float(s["max_skip_h"]) * 3600
         d.delay_s = max(60.0, min(float(d.extra.get("delay_s") or delay), cap_at - now))
-    d.log_id = log(db, task["id"], d, wake_cost(db, cfg, now) if not d.wake else 0.0, now)
+    d.log_id = log(db, task["id"], d, wake_cost(db, cfg, now) if not d.wake and not d.extra.get("pending") else 0.0, now)
     d.extra = {**d.extra, "skips": skips}
     return d
 
@@ -362,8 +367,11 @@ def skipped(prev: dict, d: Decision, now: float) -> dict:
     as asleep again), and the gate's memory: its skips' log ids and the evidence it saw."""
     gate = prev.get("wake_gate") if isinstance(prev.get("wake_gate"), dict) else {}
     out = {k: v for k, v in prev.items() if k not in ("woke", "wake_reason")}
-    out["wake_gate"] = {"log": list(gate.get("log") or []) + [d.log_id], "seen": d.seen,
+    pending = bool(d.extra.get("pending"))   # waiting for Haiku's answer is no skip: never counted as one
+    out["wake_gate"] = {"log": list(gate.get("log") or []) + ([] if pending else [d.log_id]), "seen": d.seen,
                         "since": gate.get("since") or now, "by": d.by, "reason": d.reason[:200]}
+    if pending:
+        out["wake_gate"]["pending"] = True
     return out
 
 

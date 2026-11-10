@@ -95,19 +95,32 @@ def _parse(q: dict, text: str) -> dict | None:
     return {"noul": 1.0 if s == "yes" else 0.0} if s in ("yes", "no") else None
 
 
+class _Pool:
+    """Background Haiku calls and their answers. One per process (the daemon rebuilds its decider on
+    every config reload, so an answer waits here, not on the Haiku that asked)."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.running: set[str] = set()
+        self.done: dict[str, list] = {}   # key: [finished, data, purpose, booked usd or None, db path]
+
+
+_POOL = _Pool()
+
+
 class Haiku:
     """Jev's interface (enabled, decide, last_cost) on Claude Haiku. `run(argv, text, timeout)` replaces
     the CLI call (tests); `background=False` asks in the caller's thread (tests)."""
 
-    def __init__(self, cfg: dict, db=None, run=None, binary=None, pause=None, background: bool = True):
+    def __init__(self, cfg: dict, db=None, run=None, binary=None, pause=None, background: bool = True,
+                 pool: _Pool | None = None):
         self.cfg, self.db, self.run = cfg, db, run or _run
         self.pause = pause if pause is not None else _COOL
         self._binary = binary
         self.last_cost = 0.0
+        self.pending = False   # the last decide's answer is on its way (a later ask gets it)
         self.background = background
-        self._lock = threading.Lock()
-        self._running: set[str] = set()
-        self._done: dict[str, tuple[float, dict]] = {}
+        self.pool = pool if pool is not None else _POOL
 
     def binary(self) -> str | None:
         if self._binary is None:
@@ -129,29 +142,40 @@ class Haiku:
         if s is None or not self.enabled() or not questions or any(
                 not isinstance(q, dict) or q.get("type") not in ("noul", "score") for q in questions.values()):
             return None
-        self.last_cost = 0.0
-        key = hashlib.sha256(json.dumps([purpose, state, questions], sort_keys=True, default=str).encode()).hexdigest()
+        self.last_cost, self.pending = 0.0, False
+        key = hashlib.sha256(json.dumps([getattr(self.db, "path", ""), purpose, state, questions], sort_keys=True, default=str).encode()).hexdigest()
         if not self.background:
-            return self._book(s, purpose, questions, self._ask(s, state, questions))
+            data = self._ask(s, state, questions)
+            self.last_cost = self._spend(s, purpose, data)
+            return _read(questions, data)
         now = time.time()
-        with self._lock:
-            for k in [k for k, (t, _) in self._done.items() if now - t > KEEP_S]:
-                del self._done[k]
-            if key in self._done:
-                return self._book(s, purpose, questions, self._done.pop(key)[1])
-            if key in self._running or len(self._running) >= MAX_RUNNING:
+        with self.pool.lock:
+            for e in self.pool.done.values():   # every finished call is booked here, in the caller's thread
+                if e[3] is None and e[4] == getattr(self.db, "path", ""):   # (its project's ledger), used or not
+                    e[3] = self._spend(s, e[2], e[1])
+            for k in [k for k, e in self.pool.done.items() if now - e[0] > KEEP_S]:
+                del self.pool.done[k]
+            if key in self.pool.done:
+                e = self.pool.done.pop(key)
+                self.last_cost = e[3] or 0.0
+                return _read(questions, e[1])
+            if key in self.pool.running:
+                self.pending = True
                 return None
-            self._running.add(key)
+            if len(self.pool.running) >= MAX_RUNNING:
+                return None
+            self.pool.running.add(key)
+            self.pending = True
 
         def work():
             try:
                 data = self._ask(s, state, questions)
             except Exception:
                 data = None
-            with self._lock:
-                self._running.discard(key)
+            with self.pool.lock:
+                self.pool.running.discard(key)
                 if data is not None:
-                    self._done[key] = (time.time(), data)
+                    self.pool.done[key] = [time.time(), data, purpose, None, getattr(self.db, "path", "")]
         threading.Thread(target=work, name=f"haiku-{purpose}", daemon=True).start()
         return None
 
@@ -172,8 +196,8 @@ class Haiku:
             self.pause.until = time.time() + COOL_S
             raise
 
-    def _book(self, s: dict, purpose: str, questions: dict[str, Any], data: dict) -> dict[str, Any] | None:
-        """Book the call's cost and read its answer: None unless every question has a readable one."""
+    def _spend(self, s: dict, purpose: str, data: dict) -> float:
+        """Book one call's cost in the ledger; its USD."""
         from . import localspend
         usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
         usd = localspend.price(s["model"], usage)[0]
@@ -181,21 +205,26 @@ class Haiku:
             self.db.spend("claude", usd, f"{KEY}:{purpose}", account=s["model"],
                           tokens_in=int(usage.get("input_tokens") or 0),
                           tokens_out=int(usage.get("output_tokens") or 0))
-        self.last_cost = usd
-        lines = {}
-        for line in str(data.get("result") or "").splitlines():
-            name, sep, ans = line.strip().strip("`*- ").partition(":")
-            if sep:
-                lines[name.strip().strip("`").lower()] = ans
-        if len(questions) == 1 and not lines:
-            lines = {next(iter(questions)).lower(): str(data.get("result") or "")}
-        out = {}
-        for name, q in questions.items():
-            got = _parse(q, lines.get(name.lower(), ""))
-            if got is None:
-                return None
-            out[name] = got
-        return out
+        return usd
+
+
+def _read(questions: dict[str, Any], data: dict) -> dict[str, Any] | None:
+    """A call's answers: None unless every question has a readable one."""
+    lines = {}
+    for line in str(data.get("result") or "").splitlines():
+        name, sep, ans = line.strip().strip("`*- ").partition(":")
+        if sep:
+            lines[name.strip().strip("`").lower()] = ans
+    only = next(iter(questions)).lower()
+    if len(questions) == 1 and only not in lines:
+        lines = {only: str(data.get("result") or "")}
+    out = {}
+    for name, q in questions.items():
+        got = _parse(q, lines.get(name.lower(), ""))
+        if got is None:
+            return None
+        out[name] = got
+    return out
 
 
 def _key_hash(jev) -> str:
@@ -208,7 +237,7 @@ class Fallback:
 
     def __init__(self, jev, haiku: Haiku, log=None):
         self.jev, self.haiku, self.log = jev, haiku, log
-        self.last_cost, self.last_by = 0.0, ""
+        self.last_cost, self.last_by, self.pending = 0.0, "", False
 
     def _jev_on(self) -> bool:
         return self.jev is not None and self.jev.enabled() and _REFUSED.get(_key_hash(self.jev), 0) <= time.time()
@@ -218,7 +247,7 @@ class Fallback:
 
     def decide(self, state: str, questions: dict[str, Any], purpose: str = "decide",
                timeout: float = 20.0) -> dict[str, Any] | None:
-        err = None
+        err, self.pending = None, False
         if self._jev_on():
             from .providers.jev import JevOutOfFunds, JevUnavailable
             try:
@@ -241,6 +270,7 @@ class Fallback:
                 pass
         ans = self.haiku.decide(state, questions, purpose=purpose)
         self.last_cost, self.last_by = self.haiku.last_cost, settings(self.haiku.cfg)["model"]
+        self.pending = self.haiku.pending
         return ans
 
 

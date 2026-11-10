@@ -36,6 +36,7 @@ def _cd_fallback(monkeypatch, jev, answer="no", cfg=None, db=None, background=Fa
     monkeypatch.delenv(cheapdecide.OFF_ENV, raising=False)
     monkeypatch.setattr(cheapdecide, "_REFUSED", {})
     monkeypatch.setattr(cheapdecide, "_COOL", type("C", (), {"until": 0.0})())
+    monkeypatch.setattr(cheapdecide, "_POOL", cheapdecide._Pool())
     run, calls = _cd_haiku(answer, delay)
     cfg = cfg or {}
     return cheapdecide.Fallback(jev, cheapdecide.Haiku(cfg, db, run=run, binary="claude-stub",
@@ -114,23 +115,72 @@ def test_the_daemon_decider_puts_haiku_behind_the_chat_watcher_and_jev(env, monk
     assert isinstance(chat, babysit.Babysitter) and isinstance(chat.jev, cheapdecide.Fallback)
 
 
-def test_a_slow_haiku_never_holds_the_tick_and_its_answer_comes_on_a_later_ask(env, monkeypatch):
+def _cd_settle(h):
+    import time
+    for _ in range(100):
+        if not h.pool.running:
+            return
+        time.sleep(0.05)
+
+
+def test_a_slow_haiku_never_holds_the_tick_and_the_gate_waits_for_it_once(env, monkeypatch):
     import time
     from ttp import waitgate
     p = make(env)
-    f, calls = _cd_fallback(monkeypatch, _CdJev(on=False), "no", db=p.db, background=True, delay=1.5)
-    task = {"id": 5, "title": "t"}
+    f, calls = _cd_fallback(monkeypatch, _CdJev(on=False), "no", db=p.db, background=True, delay=1.0)
+    tid = p.db.add_task("run the long job", "s", kind="work", tier="standard", origin="user")
+    task, now = p.db.task(tid), time.time()
+    prev = {"status": "waiting", "waiting_for": "the job", "waiting_since": now - 60, "retry_after_s": 60}
     t0 = time.monotonic()
-    d = waitgate._ask_jev(p.db, {}, waitgate.settings({}), f, task, _CD_PREV, None, None, 100.0)
-    assert time.monotonic() - t0 < 0.5                     # far under the caller's timeout and the step budget
-    assert d is None or d.wake                             # no answer yet: the wake happens, never a skip
-    for _ in range(60):
-        if not f.haiku._running:
-            break
-        time.sleep(0.1)
-    d2 = waitgate._ask_jev(p.db, {}, waitgate.settings({}), f, task, _CD_PREV, None, None, 100.0)
-    assert d2 is not None and not d2.wake and len(calls) == 1   # the first call's answer, no second call
+    d = waitgate.decide(p, {}, task, prev, now, jev=f)
+    assert time.monotonic() - t0 < 0.5                     # far under the CLI's timeout and the tick's step budget
+    assert not d.wake and d.by == "haiku" and d.delay_s == 60.0   # its answer is on its way: look again in a minute
+    held = waitgate.skipped(prev, d, now)
+    assert held["wake_gate"]["log"] == [] and held["wake_gate"]["pending"]   # no skip counted
+    assert dict(p.db.q("SELECT decision, avoided_usd FROM wake_gate WHERE id=?", (d.log_id,))[0]) == {"decision": "wait", "avoided_usd": 0.0}
+    d2 = waitgate.decide(p, {}, task, held, now, jev=f)    # still no answer on the second look: the wake happens
+    assert d2.wake and d2.by == "fallback"
+    _cd_settle(f.haiku)
+    d3 = waitgate.decide(p, {}, task, held, now, jev=f)    # the first call's answer, no second call
+    assert not d3.wake and d3.by == "jev" and len(calls) == 1
+    assert waitgate.skipped(held, d3, now)["wake_gate"]["log"] == [d3.log_id]
+    assert "pending" not in waitgate.skipped(held, d3, now)["wake_gate"]
     assert p.db.q("SELECT count(*) n FROM ledger WHERE source='haiku:wake_gate'")[0]["n"] == 1
+
+
+def test_every_background_haiku_call_is_booked_even_when_its_answer_is_never_used(env, monkeypatch):
+    from ttp import cheapdecide
+    p = make(env)
+    f, calls = _cd_fallback(monkeypatch, _CdJev(on=False), "no", db=p.db, background=True)
+    q = {"needed": {"type": "noul", "instructions": "?"}}
+    h = f.haiku
+    assert h.decide("state A", q, purpose="screen") is None and h.pending
+    _cd_settle(h)
+    n = lambda: p.db.q("SELECT count(*) n FROM ledger WHERE source='haiku:screen'")[0]["n"]
+    assert h.decide("state B", q, purpose="screen") is None and h.pending and n() == 1   # A booked, unused
+    _cd_settle(h)
+    assert h.decide("state A", q, purpose="screen") == {"needed": {"noul": 0.0}} and h.last_cost > 0
+    assert n() == 2 and len(calls) == 2                    # B booked too, A never twice
+    for i in range(cheapdecide.MAX_RUNNING):               # the cap: no answer and no wait, never a pile of calls
+        h.pool.running.add(f"busy{i}")
+    assert h.decide("state C", q, purpose="screen") is None and not h.pending and len(calls) == 2
+
+
+def test_a_background_haiku_answer_survives_the_daemon_rebuilding_its_decider(env, monkeypatch):
+    from ttp import cheapdecide
+    p, spent = make(env), []
+    other = type("OtherDB", (), {"path": "/elsewhere/project.db", "spend": lambda self, *a, **k: spent.append(a)})()
+    f, calls = _cd_fallback(monkeypatch, _CdJev(on=False), "no", db=p.db, background=True)
+    q = {"needed": {"type": "noul", "instructions": "?"}}
+    assert f.decide("s", q, purpose="screen") is None
+    _cd_settle(f.haiku)
+    n = lambda db: db.q("SELECT count(*) n FROM ledger WHERE source='haiku:screen'")[0]["n"]
+    run = f.haiku.run
+    elsewhere = cheapdecide.Haiku({}, other, run=run, binary="claude-stub")   # another project's ledger
+    assert elsewhere.decide("s", q, purpose="screen") is None and spent == []   # neither its answer nor its cost
+    _cd_settle(elsewhere)
+    again = cheapdecide.Haiku({}, p.db, run=run, binary="claude-stub")   # a config reload's new decider
+    assert again.decide("s", q, purpose="screen") == {"needed": {"noul": 0.0}} and n(p.db) == 1
 
 
 def test_an_unreadable_haiku_screening_answer_keeps_the_rules_severity_and_the_mute(env, monkeypatch):
