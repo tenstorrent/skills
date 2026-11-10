@@ -1,0 +1,19 @@
+/goal Use $train-plan for training HF_MODEL (recipe: RECIPE) in the current tt-metal checkout, on the authorised chips.
+
+As the user, I explicitly authorize you to use subagents when a selected skill requests or recommends them.
+
+This goal creates the plan for the tt-train training bring-up. Write only MODEL_DIR/doc/plan.md and its work log; do not write model or kernel code in this goal.
+
+Goal completion requirements:
+- MODEL_DIR/doc/plan.md exists with the hard-constraints block (precision, batch, forbidden modes, copied verbatim from RECIPE and the user's instructions) and five sections: kernel inventory, freeze map, roofline target, memory budget, hardware ceiling.
+- Kernel inventory covers every reference forward/backward op, existing ttnn/ttml implementations, layouts/dtypes and gaps, including reusable inference forwards. The top three ops name compiled sources/forks, DEST sync, core grid, expected % of peak and per-rank shapes per the skill.
+- The inventory also selects compatible paths from existing training implementations and shared modules in the repository, with sources and reasons for fallbacks; forward/backward layouts, padding, one-time constant preparation, matmul orientations and program configs are specified at actual per-rank shapes.
+- Freeze map states for every parameter and module input whether a gradient is needed under RECIPE, where kernels/allocations/reductions will be skipped, and where input gradients must survive frozen modules.
+- Roofline target is a single wall ms/step and MFU figure at the nominal peak of the authorised chips (the box's sum for a TP layout) with its derivation: per-op max(FLOPs/peak, bytes/bandwidth) per layer kind, forward + dX + dW (+ recompute if the budget forces it), scaled by layer counts plus fixed costs and collective bytes; the useful FLOPs per step used for MFU are recorded; no host/dispatch gap is budgeted by assumption; the delivered clock from the hardware ceiling is stated next to the target as the margin, never as a new denominator.
+- Useful FLOPs follow the freeze map: LoRA includes frozen-base forward and required dX plus adapter work, excludes frozen dW and repeated recompute, and is not estimated from trainable parameters alone. Distributed work counts the global batch once without duplicating TP work; the nominal denominator uses the actual compute grid and participating chips.
+- Memory budget covers weights, gradients, optimiser state, saved and graph-retained activations at the target sequence length and batch, padding, persistent transformed weights and peak temporary/collective buffers per rank against the chip's DRAM, and states the resulting recompute policy and whether the model fits on one chip.
+- Hardware ceiling follows the skill's day-1 clock ladder with telemetry at recipe fidelity. Record per-chip settled clocks, limits, firmware, throttler masks and critical chip; show the table/figure and any user-run limit command. Decide single-chip fit or the authorised TP/DP layout with its collective floor.
+- The exact HF revision, reference commit, recipe, hardware identity and firmware bundle are recorded.
+- $stage-review returns `clean-pass`; findings fixed/rereviewed. Local commit touched-repo changes; never push; log SHAs.
+
+Unmet requirements, review findings, failed gates: work. Stop only after `$autofix` fails.

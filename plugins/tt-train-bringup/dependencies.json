@@ -1,0 +1,16 @@
+{
+  "plugins": [
+    {
+      "name": "tt-autodebug",
+      "marketplace": "tenstorrent-skills",
+      "required": true,
+      "skills": [
+        "autodebug",
+        "autotriage",
+        "autofix"
+      ],
+      "installation": "explicit-user-action",
+      "resolution": "TT_AUTODEBUG_ROOT points to the enabled installed package"
+    }
+  ]
+}

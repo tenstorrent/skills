@@ -1,0 +1,10 @@
+# QB2 (two p300c, four Blackhole) as a 1x4 line, 2 relaxed channels per link (M1.0 smoke; not in tt-metal).
+mesh_descriptors {
+  name: "M0"
+  arch: BLACKHOLE
+  device_topology { dims: [ 1, 4 ], dim_types: [ LINE, LINE ] }
+  host_topology   { dims: [ 1, 1 ] }
+  channels { count: 2 policy: RELAXED }
+}
+
+top_level_instance { mesh { mesh_descriptor: "M0" mesh_id: 0 } }
