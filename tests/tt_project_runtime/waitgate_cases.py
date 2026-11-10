@@ -792,3 +792,30 @@ def test_a_passed_probe_records_its_wait_for_the_daily_review(env, tmp_path):
     assert wt.median_s(p.db, "push") == (300.0, 1)
     lines = wt.plan_lines(p.db, p.config())
     assert lines[0].startswith("check plans on: interim 0.15") and "push waits: median 5 min over 1" in "\n".join(lines)
+
+
+@pytest.mark.parametrize("losing", ["net", "idle"])
+def test_the_watchers_free_skips_never_keep_a_losing_jev_wake_gate_use_switched_on(env, losing):
+    """The chat watcher records its decisions under Jev's use (by 'babysit'), free and with the wake
+    it avoided: they are counted apart, so Jev's review judges Jev's own calls only."""
+    p = make(env)
+    from ttp import jevuse, waitgate
+    cfg = p.config()
+    now = time.time()
+    for i in range(40):   # the watcher's skips: free, each avoiding a wake, each changing the rules' decision
+        jevuse.record(p.db, waitgate.USE, {"task": i, "by": "babysit", "model": "m", "verb": "skip", "tier": "",
+                                           "skip": True}, 0.0, avoided_usd=0.4, ref=f"task:{i}", changed=True, now=now)
+    for i in range(jevuse.MIN_CALLS if losing == "net" else jevuse.IDLE_CALLS):
+        jevuse.record(p.db, waitgate.USE, {"task": i, "needed": 0.9, "skip": False}, 0.01, ref=f"task:{i}",
+                      changed=False if losing == "idle" else None, now=now)
+    s = jevuse.stats(p.db, cfg, now)[waitgate.USE]
+    assert s["calls"] == (jevuse.MIN_CALLS if losing == "net" else jevuse.IDLE_CALLS) and s["saved"] == 0
+    assert jevuse.watcher_stats(p.db, cfg, now)[waitgate.USE]["calls"] == 40
+    assert [u for u, _ in jevuse.review(p.db, cfg, now)] == [waitgate.USE]
+    assert not jevuse.allowed(p.db, cfg, waitgate.USE)
+    assert any(line.startswith("chat watcher, wait-wake gating [wake_gate]: 40 decisions (not Jev's)")
+               for line in jevuse.lines(p.db, cfg, now))
+    waitgate.log(p.db, 1, waitgate.Decision(False, "babysit", "babysit m: skip"), avoided_usd=0.4)
+    line = waitgate.line(p.db, cfg, now)
+    n = jevuse.MIN_CALLS if losing == "net" else jevuse.IDLE_CALLS
+    assert f"Jev {n} calls ${n * 0.01:.2f}" in line and "the watcher 40 calls (free)" in line, line

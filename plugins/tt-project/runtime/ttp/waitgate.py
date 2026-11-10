@@ -449,14 +449,17 @@ def stats(db: DB, cfg: dict, now: float | None = None) -> dict:
                "SUM(decision='skip' AND outcome='miss') skip_miss, SUM(decision='wake' AND outcome='miss') wake_miss, "
                "SUM(CASE WHEN decision='skip' AND COALESCE(outcome,'')!='miss' THEN avoided_usd ELSE 0 END) saved "
                "FROM wake_gate WHERE ts>=?", (since,))
-    j = jevuse.stats(db, cfg, now).get(USE) or {}
+    j = jevuse.stats(db, cfg, now).get(USE) or {}   # Jev's own calls: the watcher's are counted apart
+    w = jevuse.watcher_stats(db, cfg, now).get(USE) or {}
     return {k: (float(r[k] or 0) if k == "saved" else int(r[k] or 0)) for k in
             ("n", "skips", "rule_skips", "jev_skips", "babysit_skips", "wakes", "skip_miss", "wake_miss", "saved")} | {
-        "jev_calls": int(j.get("calls", 0)), "jev_cost": float(j.get("cost", 0.0))}
+        "jev_calls": int(j.get("calls", 0)), "jev_cost": float(j.get("cost", 0.0)),
+        "watcher_calls": int(w.get("calls", 0))}
 
 
 def line(db: DB, cfg: dict, now: float | None = None) -> str:
-    """The daily review's line: gate decisions, skips (rules, Jev), misses, Jev's cost and the saving."""
+    """The daily review's line: gate decisions, skips (rules, the watcher, Jev), misses, Jev's calls and
+    cost, the watcher's calls apart, and the saving."""
     s = stats(db, cfg, now)
     if not s["n"]:
         return ""
@@ -467,7 +470,7 @@ def line(db: DB, cfg: dict, now: float | None = None) -> str:
     return (f"Wait-wake gate over the last {days:g} d: {s['n']} decisions, {s['skips']} skipped "
             f"({s['rule_skips']} by rules, {s['babysit_skips']} by the watcher, {s['jev_skips']} by Jev), {s['wakes']} woke; misses: "
             f"{s['skip_miss']} skips, {s['wake_miss']} wakes; Jev {s['jev_calls']} calls {_usd(s['jev_cost'])} "
-            f"({per}){' (Jev step off)' if off else ''}; estimated saving {_usd(s['saved'])}, net {_usd(net)}"
+            f"({per}){' (Jev step off)' if off else ''}; the watcher {s['watcher_calls']} calls (free); estimated saving {_usd(s['saved'])}, net {_usd(net)}"
             + (f", {_usd(net / s['skips'])} a skip" if s["skips"] else ""))
 
 

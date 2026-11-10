@@ -21,6 +21,10 @@ it costs money and decides nothing. `jev.uses.<use>` = "on" or "off" forces a us
 
 An outcome is 'right', 'wrong' or 'no change' (the call's only effect cost more and did what the
 rules' choice would have done: it saves nothing, and a negative saving still counts).
+
+The chat watcher (babysit) records its free decisions under the same use as Jev, marked `by`
+'babysit' in the decision: they are counted apart (`watcher_stats`), never in a use's Jev stats or its
+review, so a watcher's free skips never keep a Jev use that loses money switched on.
 """
 from __future__ import annotations
 
@@ -38,6 +42,11 @@ WAKE_COST_FALLBACK_USD = 0.05      # a coordinator turn's price while none was m
 LABELS = {"screen": "watcher screening", "effort": "task effort picking", "wake_gate": "wait-wake gating",
           "wake_tier": "wake tier picking",
           "model": "task model picking"}
+
+
+# A row the chat watcher recorded (`record` writes its decision with json.dumps' default separators).
+WATCHER = "COALESCE(decision, '') LIKE '%\"by\": \"babysit\"%'"
+JEV_ONLY = "NOT (" + WATCHER + ")"
 
 
 def _jcfg(cfg: dict) -> dict:
@@ -136,7 +145,8 @@ def turn_cost(db: DB, cfg: dict, now: float | None = None) -> float:
 
 def stats(db: DB, cfg: dict, now: float | None = None) -> dict[str, dict]:
     """Per use over the window: calls, cost, avoided (saved), net, right, wrong and no-change outcomes,
-    and of the calls whose effect is known, how many changed the rules' decision and how many did not."""
+    and of the calls whose effect is known, how many changed the rules' decision and how many did not.
+    Jev's own calls only: the chat watcher's are in watcher_stats."""
     now = time.time() if now is None else now
     rows = db.q("SELECT use, COUNT(*) n, SUM(cost_usd) cost, "
                 "SUM(CASE WHEN outcome IN ('wrong',?) THEN MIN(avoided_usd, 0) ELSE avoided_usd END) saved, "
@@ -144,7 +154,7 @@ def stats(db: DB, cfg: dict, now: float | None = None) -> dict[str, dict]:
                 "SUM(outcome='right' OR (outcome IS NULL AND settle_at IS NOT NULL AND settle_at<=?)) n_right, "
                 "SUM(changed=1 AND COALESCE(outcome,'')!=?) n_changed, "
                 "SUM(changed=0 OR (changed=1 AND outcome=?)) n_unchanged "
-                "FROM jev_calls WHERE ts>=? GROUP BY use ORDER BY use",
+                f"FROM jev_calls WHERE ts>=? AND {JEV_ONLY} GROUP BY use ORDER BY use",
                 (NO_CHANGE, NO_CHANGE, now, NO_CHANGE, NO_CHANGE, now - window_s(cfg)))
     return {r["use"]: {"calls": int(r["n"]), "cost": float(r["cost"] or 0), "saved": float(r["saved"] or 0),
                        "net": float(r["saved"] or 0) - float(r["cost"] or 0),
@@ -172,7 +182,7 @@ def review(db: DB, cfg: dict, now: float | None = None) -> list[tuple[str, dict]
             if s["net"] > 0:
                 continue
             if s["calls"] < min_calls(cfg):
-                first = db.one("SELECT MIN(ts) t FROM jev_calls WHERE use=?", (use,))
+                first = db.one(f"SELECT MIN(ts) t FROM jev_calls WHERE use=? AND {JEV_ONLY}", (use,))
                 if not first or first["t"] is None or now - float(first["t"]) < window_s(cfg):
                     continue
             off[use] = {"at": now, "why": f"net {_usd(s['net'])} over {s['calls']} calls"}
@@ -180,6 +190,18 @@ def review(db: DB, cfg: dict, now: float | None = None) -> list[tuple[str, dict]
         if out or cleared:
             db.set_kv(OFF_KEY, {u: v for u, v in off.items() if u not in cleared})
     return out
+
+
+def watcher_stats(db: DB, cfg: dict, now: float | None = None) -> dict[str, dict]:
+    """Per use over the window, the chat watcher's own decisions: calls, how many changed the rules'
+    decision (a skip, a lower tier), their estimated saving (a wrong call's avoided cost aside) and cost."""
+    now = time.time() if now is None else now
+    rows = db.q("SELECT use, COUNT(*) n, SUM(cost_usd) cost, SUM(changed=1) n_changed, SUM(outcome='wrong') n_wrong, "
+                "SUM(CASE WHEN outcome IN ('wrong',?) THEN MIN(avoided_usd, 0) ELSE avoided_usd END) saved "
+                f"FROM jev_calls WHERE ts>=? AND {WATCHER} GROUP BY use ORDER BY use",
+                (NO_CHANGE, now - window_s(cfg)))
+    return {r["use"]: {"calls": int(r["n"]), "cost": float(r["cost"] or 0), "saved": float(r["saved"] or 0),
+                       "changed": int(r["n_changed"] or 0), "wrong": int(r["n_wrong"] or 0)} for r in rows}
 
 
 def off_text(use: str, s: dict, cfg: dict) -> str:
@@ -210,6 +232,10 @@ def lines(db: DB, cfg: dict, now: float | None = None) -> list[str]:
                  else f"switched off ({off[use]['why']})" if use in off else "on")
         out.append(f"{LABELS.get(use, use)} [{use}]: {s['calls']} calls, cost {_usd(s['cost'])}, "
                    f"est. saved {_usd(s['saved'])}, net {_usd(s['net'])}, {err}; {state}")
+    for use, s in watcher_stats(db, cfg, now).items():
+        out.append(f"chat watcher, {LABELS.get(use, use)} [{use}]: {s['calls']} decisions (not Jev's), "
+                   f"{s['changed']} changed the rules' decision, {s['wrong']} wrong, est. saved {_usd(s['saved'])}, "
+                   f"cost {_usd(s['cost'])}")
     return out
 
 
