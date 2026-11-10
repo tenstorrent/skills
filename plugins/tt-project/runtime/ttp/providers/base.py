@@ -399,6 +399,12 @@ class Provider:
         each launch's system prompt, as Claude Code's --append-system-prompt-file), else why not."""
         return ""
 
+    def session_instructions(self, session_id: str, cwd: str, env: dict | None) -> list[str]:
+        """The developer or system texts saved session `session_id` gives a run that resumes it (the
+        launch-role check, ctxfork.own_role). Default: none, as the agent takes each launch's system
+        prompt and its sessions keep no instructions of their own."""
+        return []
+
     def add_subagent_usage(self, usage: "RunUsage", output_path: Path, since: float | None = None,
                            env: dict | None = None) -> None:
         """Add to `usage` (parse's) what the run's sub-agents spent where the agent books them apart from

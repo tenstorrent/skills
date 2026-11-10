@@ -3789,12 +3789,17 @@ class Daemon:
             if task and role in ctxfork.ROLES and not resume:   # the coordinator's context (ctxfork.py)
                 got = ctxfork.prepare(self.p, self.cfg, prov, provider, str(cwd), env, task=task["id"],
                                       model=ctxfork._arg(argv, "--model"))
+                if got.get("session") and (miss := ctxfork.own_role(prov, got, str(cwd), env, append_system)):
+                    # The copy would run under the coordinator's role (no tools, its answer format): the
+                    # run starts from the context on disk instead, checked model-free before it starts.
+                    log(self.p, f"task {task['id']}: no {got['how']}: {miss}; it starts from the disk block")
+                    got = {**ctxfork.on_disk(self.p, self.cfg, f"no {got['how']}: {miss}"), "role_gap": miss}
                 if got.get("session"):
                     resume, resume_extra = got["session"], prov.resume_args(got["session"])
                 prefix_by = ""
                 if got.get("how") == "fork" and prov.tool_hooks and append_system is not None and \
                         prov.append_system_args(Path("system.md"))[:1] == ["--append-system-prompt-file"] and \
-                        (shape := ctxfork.coord_shape(self.p)):
+                        (shape := ctxfork.coord_shape(self.p)) and not ctxfork.coord_only([shape["system"]], answer=False):
                     # The coordinator's tools and system prompt, so the copied history is read from the
                     # cache, not written again; the run's own system prompt leads its prompt (ctxfork.py).
                     shaped, prefix_by = ctxfork.shape_argv(argv, shape)
@@ -3803,7 +3808,7 @@ class Daemon:
                         append_system, prefix_by = shape["system"], "coordinator"
                 if got.get("lead"):
                     prompt = got["lead"] + "\n\n" + prompt
-                note = {**(note or {}), ctxfork.KEY: {**{k: got[k] for k in ("how", "why", "session", "tokens", "run", "from")
+                note = {**(note or {}), ctxfork.KEY: {**{k: got[k] for k in ("how", "why", "session", "tokens", "run", "from", "role_gap")
                                                          if k in got}, **({"prefix": prefix_by} if prefix_by else {})}}
             elif task and role in ctxfork.ROLES:   # a lost run continued in its own session (_resumable)
                 note = {**(note or {}), ctxfork.KEY: {"how": "resume", "why": "continues its own session",
@@ -6110,6 +6115,9 @@ class Daemon:
             note["not_waste"] = "resume"   # nothing ran: the task starts fresh (_finish_worker)
             if ctxfork.forked(note):   # its next start skips the fork (ctxfork.prepare)
                 note["resume_error"] = str(usage.error or f"exit {exit_info.get('rc')}")[:200]
+        if r["task"] and r["role"] in ctxfork.ROLES and \
+                (miss := ctxfork.role_miss(usage.final_text, _read_result(run_dir / RESULT_FILE))):
+            note["role_miss"] = miss   # its task's next start copies no session (ctxfork.prepare)
         if status == "lost" and not note.get("session_id") and (note.get("resumes") or {}).get("session"):
             # A resume the sleep or network cut keeps its session for the next resume, not a fresh start.
             note["session_id"] = note["resumes"]["session"]
@@ -7386,6 +7394,15 @@ class Daemon:
             new = "queued"   # a busy resource is not a failed attempt: the task comes back later
         elif refusal:
             new, status = "failed", "refused_wait"   # an attempt, but no deep retry (effort.RETRY_FAILED)
+        elif r.get("role") in ctxfork.ROLES and (miss := ctxfork.role_miss(usage.final_text, result if own else None)):
+            # It ran under the coordinator's role and did nothing: no top-up or session resume repeats
+            # it. A copied session's next start takes the disk block (ctxfork.prepare); a run that had no
+            # copy would start the same way again, so it is not retried.
+            new, status = "failed", "role_miss"
+            if not ctxfork.forked(json.loads(r.get("note") or "{}")):
+                guard = f"not retried: {miss}, without a copied session"
+            summary = f"{guard or miss}. {summary}"[:1500]
+            log(self.p, f"task {task['id']}: run {r.get('id')} {guard or miss}")
         elif own and status == "ok" and rstatus not in HANDOFF_STATES and not refusal and \
                 not load_result(task["result"]).get(HANDOFF_RESUME_KEY) and \
                 (back := redo or self._handoff_resume(r, task, usage, run_dir)):
@@ -7420,7 +7437,7 @@ class Daemon:
         attempts = int(task["attempts"] or 0) + (0 if status in FREE_ENDS or waiting or reboot_lost
                                                   or rejects or topped or resumed else 1)
         if new == "failed" and not guard and attempts < int(task["max_attempts"] or 3) \
-                and status in ("failed", "lost", "timeout", "stalled", "no_handoff", "refused_wait"):
+                and status in ("failed", "lost", "timeout", "stalled", "no_handoff", "refused_wait", "role_miss"):
             new = "queued"
         # A done hand-off on a spec's `cells:` line that left requested cells unfinished or unreported
         # is never passed on as complete: its summary says so, and missing cells get a `continue:`

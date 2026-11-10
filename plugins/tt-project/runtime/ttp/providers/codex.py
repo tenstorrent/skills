@@ -193,6 +193,27 @@ class Codex(Provider):
                       "".join(json.dumps(r) + "\n" for r in rows), mode=0o600)
         return ""
 
+    def session_instructions(self, session_id: str, cwd: str, env: dict | None) -> list[str]:
+        # Every text part of every developer message in the rollout, nested compacted histories too:
+        # what `codex exec resume` sends the model again (own_instructions).
+        src = self.session_paths(session_id, cwd, env)
+        if not src:
+            return []
+        out: list[str] = []
+
+        def walk(node):
+            if isinstance(node, dict) and node.get("role") == "developer" and isinstance(node.get("content"), list):
+                out.extend(x["text"] for x in node["content"] if isinstance(x, dict) and isinstance(x.get("text"), str))
+            elif isinstance(node, (list, dict)):
+                for x in (node if isinstance(node, list) else node.values()):
+                    walk(x)
+        for line in max(src, key=lambda x: x.stat().st_mtime).read_text(errors="replace").split("\n"):
+            try:
+                walk(json.loads(line))
+            except ValueError:
+                pass
+        return out
+
     def own_instructions(self, session_id: str, cwd: str, env: dict | None, text: str) -> str:
         # `codex exec resume` keeps the developer messages saved in the rollout and takes no new
         # `-c developer_instructions` (0.160), and re-sends them after a compaction (each compacted
