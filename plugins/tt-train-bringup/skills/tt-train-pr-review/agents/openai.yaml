@@ -1,0 +1,7 @@
+interface:
+  display_name: "tt-train PR Review"
+  short_description: "Strict pre-merge review of tt-metal PRs that touch tt-train/"
+  default_prompt: "Use $tt-train-pr-review on this tt-metal PR: pin the head SHA, fan out kernel, host-side, evidence and numerics reviewers, unify, refute every finding adversarially against the head, and report ranked findings anchored to patch lines."
+
+policy:
+  allow_implicit_invocation: true
