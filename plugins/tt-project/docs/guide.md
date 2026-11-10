@@ -2012,7 +2012,8 @@ session and stateless coordinators on every provider.
   uncommitted changes, else alerted; worktrees never start from such a HEAD.
 - Smoke before landing: `delivery.push_checks` gate every landing, so keep them under 10 min on
   their host (aim 5). Slower tests belong in `delivery.post_land_checks`, which run after landing:
-  the daemon runs them detached on each new pushed sha, without a model. A failing test that passes on
+  the daemon runs them detached on each new pushed sha, without a model, the first full run on a spill
+  host the project's settings allow (`delivery.checks_spill_hosts`) when one is free, its reruns here. A failing test that passes on
   a rerun is flaky (quarantined, not reverted); one failing before the landing too is not its. A new
   failure is bisected over the landed changes to the guilty one, which is reverted forward on the
   push branch through the push queue (never forced), and one code task is queued to fix it on its

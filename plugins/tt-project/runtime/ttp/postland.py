@@ -9,8 +9,9 @@ holding the queue. Each daemon pass (tend()):
   (`python -m ttp.postland <job>`, niced like the workers) on the newest pushed sha. Every batch landed
   since the last check is in its range: their entries' landed shas, in order, after the tip before them.
 - The driver (drive()) runs each check in a clean checkout of that sha, by push._run_one (its check host
-  and lock rules). Failing pytest ids rerun once there: those that pass are flaky (quarantined, never
-  reverted). Those failing again rerun at the range's start: failing there too, they were not this
+  and lock rules); its first full run goes to a spill host the project's settings allow (checkspill.spill_run,
+  as the push batch's first runs do), else here. Failing pytest ids rerun once there, always here: those that
+  pass are flaky (quarantined, never reverted). Those failing again rerun at the range's start: failing there too, they were not this
   landing's. The rest bisect over the entries' landed shas to the first that fails them: the guilty change.
 - Guilty: a revert of that entry's commits on the current tip (never a force push), checked to pass the
   failing ids, goes in as ttp/postland-revert-<sha>. The daemon approves it into the push queue (it lands
@@ -205,7 +206,7 @@ def apply(p: Project, job: dict, got: dict) -> str:
 
 def drive(p: Project, job: dict, say=print) -> dict:
     """Run the checks on job['sha'] and, on a new failure, find and revert its change (see the module)."""
-    from . import cleantree, gatejudge, push, sharedchecks, worktree
+    from . import checkcap, cleantree, gatejudge, push, sharedchecks, worktree
     repo = Path(job["repo"])
     base = str(Path(job["path"]).parent)
     checks = push.check_list(job["checks"] if "checks" in job else
@@ -230,7 +231,13 @@ def drive(p: Project, job: dict, say=print) -> dict:
             worktree.prepare(p, tree.path)
             got: dict = {}
             sel_env = gatejudge.select_env(sel, env) if sel else {}
-            rc = push._run_one(cmd, tree.path, {**env, "PWD": str(tree.path), **sel_env}, say, got)
+            claim, sent = (None, cmd) if sel else _spill(p, cmd, at, say)
+            try:
+                _, rc = push._run_or_here(sent, tree.path, {**env, "PWD": str(tree.path), **sel_env}, say, got,
+                                          checkcap.Slot)
+            finally:
+                if claim is not None:
+                    claim.close()
             return (gatejudge.BUSY if rc == gatejudge.BUSY else got.get("rc")), got.get("text") or ""
         finally:
             tree.close()
@@ -239,6 +246,20 @@ def drive(p: Project, job: dict, say=print) -> dict:
         return _drive(p, job, checks, run)
     except Busy as ex:
         return {"outcome": "busy", "why": f"the test lock stayed busy: {ex}"}
+
+
+def _spill(p: Project, cmd, sha: str, say) -> tuple:
+    """(claim, check) for a check's first full run on the landed sha: sent to a spill host checkspill.spill_run
+    picks (the project's own spill hosts, as the push batch's first full runs go), else (None, `cmd`) here. Every
+    rerun of its failing tests runs here on `cmd` itself, never spilled (as the push batch's reruns). The spill
+    hosts are a speed-up: an error trying them, or a host that cannot run it (push._run_or_here), keeps it here."""
+    from . import checkspill
+    try:
+        claim, out = checkspill.spill_run(p, p.config(), [cmd], say, f"post-landing checks on {sha[:10]}")
+    except Exception as e:   # noqa: BLE001
+        say(f"spill hosts not tried ({e}): the checks run here")
+        return None, cmd
+    return claim, (out[0] if claim is not None and out else cmd)
 
 
 class Busy(Exception):
