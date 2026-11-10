@@ -1,12 +1,14 @@
 ---
 name: train-bringup
-description: Bring up and optimise training of a Hugging Face model in tt-train (ttml) on a single chip through three phases, plan, composite bring-up, optimisation loop. Use for a new training bring-up, full fine-tuning or LoRA, or to resume one of its phases; requires separately installed tt-autodebug.
+description: Bring up and optimise training of a Hugging Face model in tt-train (ttml) on a single chip, or on the box the plan's multi-chip fit section authorises when the model does not fit one chip, through three phases, plan, composite bring-up, optimisation loop. Use for a new training bring-up, full fine-tuning or LoRA, or to resume one of its phases; requires separately installed tt-autodebug.
 ---
 
 # Training bring-up
 
 Own the implementation, gates and evidence for training one target HF model in a tt-metal checkout
-with tt-train built. Single chip. Read the phase skill and its exact goal before doing that phase.
+with tt-train built. Single chip by default; the plan's hardware ceiling decides whether the model
+needs the box, and the user authorises it. Read the phase skill and its exact goal before doing
+that phase.
 Do not skip unmet gates or replace acceptance criteria with a review plugin's criteria.
 
 ## Startup
@@ -29,11 +31,16 @@ Do not skip unmet gates or replace acceptance criteria with a review plugin's cr
 
 4. Confirm the HF model/revision, the training recipe (full fine-tuning or LoRA, sequence length,
    batch, optimiser), the target checkout (tt-metal root with `tt-train/build` present, `TT_METAL_HOME`
-   set to the checkout) and the authorised hardware (one chip). Model code lives under
+   set to the checkout) and the authorised hardware (one chip, or the box and its TP/DP layout),
+   together with the hard-constraints block (precision, batch, forbidden modes) that every phase
+   reads before any benchmark. Model code lives under
    `tt-train/sources/ttml/ttml/models/<model>/`, the training example under
    `tt-train/sources/examples/<model>_train/`, evidence under `tt-train/bringup/<model>/`.
 5. Keep the checkout, runner logs and artefacts on persistent storage. Record exact commands,
    commits, hardware identity and evidence. Keep weights and credentials out of commits.
+6. Commands that change firmware state (TDP, TDC or clock limits; ARC messages such as a TDP-limit
+   set) run under the user's shell, not the agent's: write the exact invocation into the plan or
+   work log, ask once, and continue with the measured ceiling. Plan this split on day 1.
 
 ## Phases
 
@@ -48,17 +55,19 @@ The three [goal templates](../../prompts/train_bringup_multigoal) run in order:
 `clean-pass`; findings require repairs and re-review. Commit phase-owned changes locally; never push.
 
 Step time is the sum of five op classes, and only the first is the model: useful math, layout
-overhead, glue overhead, wasted overhead, host/dispatch gap. The plan sets the roofline target, the
-composite bring-up makes the model correct, and the loop removes the four overhead classes and
-brings the math kernels toward their roofline, with kernel work from the first iteration on. The
-loop ends when the roofline target is met or every remaining item is a math kernel proven near its
-own roofline (roofline figure, measured fraction, failed kernel attempt). Fusing and removing small
-ops is the opening of the loop, not its body: the body is rewriting the largest kernels' data flow
-toward their rooflines (optimization-loop, "Kernel boost checklist"), with each kernel measured
-standalone before the full-model run. A stage-review clean-pass
-closes a phase only when that phase's gate is met; in the loop it is a checkpoint, and the agent
-continues to the next iteration in the same turn instead of reporting and stopping. The agent ends
-its turn only when the gate is met or it is blocked on something only the user can decide.
+overhead, glue overhead, wasted overhead, host/dispatch gap. The plan sets the hard constraints,
+the hardware ceiling and the roofline target (wall ms/step and MFU at the nominal peak of the
+authorised chips), the composite bring-up makes the model correct and measures the baseline, and
+the loop takes the biggest math kernel first: iteration 1 is an own-kernel attempt on the top ttnn
+op, and glue or layout work comes in only where it deletes a whole op chain. The loop ends when the
+roofline target or the stated hardware ceiling is met, or every remaining item is a math kernel
+proven near its own roofline (roofline figure, measured fraction, failed kernel attempt). A
+stage-review clean-pass closes a phase only when that phase's gate is met; in the loop it is a
+checkpoint every eight iterations or at a milestone, and the agent continues to the next iteration
+in the same turn instead of reporting and stopping. The agent never stops to ask for scope: the
+target and the hard constraints are the scope, and "try both" means both are built and measured.
+The agent ends its turn only when the gate is met or it is blocked on a decision only the user can
+make (a hardware limit, a constraint change).
 
 ## Execution
 

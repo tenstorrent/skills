@@ -50,6 +50,19 @@ commands and small analysis scripts over artefacts. It must not open TT devices,
 reset devices, launch training runs or profiles, or mutate implementation files.
 If confirming a problem needs hardware, report that as a finding.
 
+## Cadence And Severity
+
+In the optimisation loop a review runs every eight iterations or at a milestone (a kernel landed,
+a target crossed, a close claimed), not after every iteration or two: the reference bring-up spent
+19 of 90 commits answering 15 rounds that found two real problems. A clean-pass never ends the
+agent's turn while the target is unmet.
+
+- P1: a correctness break (harness, loss, a silent script), a bisect break, a result row that
+  cannot be reproduced, or a forbidden mode run. P1 is fixed and re-reviewed.
+- P2: everything else, including document hygiene (a misquoted figure, a stale table, wording).
+  All P2 items of one round are fixed in one commit and are not re-reviewed; the next scheduled
+  review checks them.
+
 ## Review Stance
 
 - Treat agent-written READMEs and work logs as claims; re-derive them from test
@@ -70,7 +83,8 @@ Any phase:
 - a hidden size, head count, sequence length, batch or weight shape was reduced
   for evidence without being labelled as debugging only;
 - a material anomaly is dismissed with prose instead of investigation;
-- multi-device work appears in a single-chip bring-up.
+- multi-device work appears without a multi-chip fit decision in the plan and a recorded user
+  authorisation; or the model does not fit one chip and the work is still single-chip.
 
 Plan:
 
@@ -81,7 +95,14 @@ Plan:
 - the roofline target has no derivation, mixes forward-only FLOPs with a training
   step, omits dX or dW, or ignores recompute the memory budget forces;
 - the memory budget omits optimiser state, saved activations at the target
-  sequence length, or workspace, or draws no recompute conclusion.
+  sequence length, or workspace, or draws no recompute conclusion;
+- the plan has no hardware-ceiling section: no clock ladder with telemetry, no limits and firmware
+  bundle, no critical chip, no multi-chip fit decision, or a host/dispatch gap is budgeted by
+  assumption;
+- the target is cycle time, a single-chip number for a model that needs the box, or MFU re-based to
+  the delivered clock instead of the nominal peak with the delivered clock as a stated margin;
+- the top three ops of the step lack their compiled kernel source, sync mode and % of peak, or the
+  hard-constraints block is missing.
 
 Composite bring-up:
 
@@ -101,7 +122,12 @@ Composite bring-up:
   layer kinds, so a heterogeneous model such as Qwen3-Next's 3+1 pattern is
   never cut mid-block), or a depth's residual from the fitted line exceeds the
   stated tolerance without an explanation, or the projection was not validated
-  against the full-model MFU wall-clock.
+  against the full-model MFU wall-clock;
+- the plan's layout is multi-chip and the harness never ran the per-rank shard shapes, or the loss
+  match ran on one chip instead of the layout, or the loss script can end without a log and still
+  count as a pass;
+- the baseline row has no telemetry (settled clock, critical chip) or the host/dispatch gap was
+  computed from profiler cycles at the nominal clock.
 
 Optimisation loop:
 
@@ -112,11 +138,14 @@ Optimisation loop:
   time against the best correct measured path;
 - an item in the ranked table has no class, or its cost omits multiplicity
   (recompute, backward mirror) or counts ops instead of chains;
-- a lower-cost math kernel was chosen over a higher-ranked overhead item that
-  can go to zero, without a stated reason;
+- an overhead item was chosen over the largest math kernel without the chain-deletion reason
+  (its measured cost above the kernel's expected gain), or iteration 1 was not a kernel attempt on
+  the biggest math item, or the top ttnn kernel has no kernel attribution (source, sync mode, % of
+  peak);
 - a rejection is unearned: a first API or shape error, a single failed attempt
   at one rung of the ladder, or "not supported" without a minimal repro, an
   adapted retry, or `$autofix` evidence;
+- a rejected item has no retry-when condition, or its condition came true and it was not retried;
 - a layout, glue or wasted item above the stated threshold remains with no
   cost, attempted fix and reason recorded;
 - a useful-math kernel is called "near roofline" without the roofline figure
@@ -136,12 +165,16 @@ Optimisation loop:
   reason and the next structural fix;
 - a precision mode, run type or configuration the hard-constraints block forbids was evaluated,
   swept or recorded as a rejected candidate;
-- a subset-depth MFU run, a projection or a Tracy table appears in the MFU history or the report
+- a subset-depth MFU run, a projection or a Tracy table appears in the result table or the report
   as a result rather than as ranking evidence;
 - `doc/perf_analysis.md` deviates from the optimisation-loop document format (prose longer than
   three lines, sentences in table cells, review caveats appended instead of cells corrected);
-- a commit bundles more than one change, or review fixes of several iterations, so the history
-  does not bisect.
+- a result row reports MFU at the delivered clock, lacks the per-chip clock and critical chip, or
+  rests on an A/B of standalone numbers from different processes;
+- `git add -u` or a commit touched a submodule pointer, or a tracked evidence file is over 500 KB,
+  or a Tracy dump sits inside the repository tree;
+- a commit bundles more than one code change so the history does not bisect (one commit for a
+  review round's P2 document fixes is fine).
 
 Do not return `more-work-needed` only because a stronger evidence format would
 be nice. If the skill accepts tests, logs and CSVs as evidence, do not invent a

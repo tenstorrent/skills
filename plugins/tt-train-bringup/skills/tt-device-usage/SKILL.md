@@ -35,6 +35,43 @@ Use this skill for the hardware-facing parts of training bring-up. It covers onl
   duration, so a hang ends the chain instead of the session.
 - The chain writes its result markers (`rc=`, `passed`, `ms/step`) to the evidence log; the agent
   reads the log once after the notification instead of tailing it.
+- Before the chain launches: the build is fresh (binary timestamp after the last edit) and any
+  patch has been applied and checked outside the chain. A patch script inside the background
+  command once measured the unpatched op; a stale build hung the chip.
+
+## Telemetry And Clock
+
+- Every MFU run carries the ARC telemetry sampler from this plugin,
+  `scripts/tt_telemetry_sampler.py` (pyluwen, 20 Hz, one CSV row per chip per sample: AICLK, TDP,
+  TDC, VCORE, temperature, throttler mask). It runs from the interpreter that has `pyluwen`
+  (usually the tt-smi venv, not the model's), in a child process started before the run and
+  stopped after it. `tt-smi` polls once per second or slower, too coarse for a step.
+- `scripts/tt_telemetry_summary.py <csv> [mfu log]` reports per chip the settled clock, mean and
+  peak TDP, TDC, temperature and throttler masks over the loaded phase, names the critical chip
+  (lowest clock or highest current) and gives the MFU at the delivered clock as a diagnostic. The
+  result row cites the settled clock and the critical chip.
+- On day 1 of a bring-up, `scripts/tt_clock_ladder.py` runs the characterisation (idle, a few-core
+  matmul, a third of the grid, the full grid, on every chip at once, at the recipe's fidelity) with
+  the sampler attached; its table or figure goes into the plan's hardware-ceiling section. A clock
+  that drops when the load reaches the TDP limit means a power cap; its delivered clock is the
+  plan's margin and the loop's variants are chosen by cooled wall ms, not cycles.
+- Cool-down protocol: one stated idle time before every MFU run, the same for every row. Same-clock
+  A/B comparisons run ABAB in one process; numbers from different processes are not comparable.
+- Firmware-state commands (TDP, TDC or clock limits; ARC messages such as a TDP-limit set) are
+  user-run. Write the exact invocation into the plan or work log with the value to set and the
+  restore command, ask once, and do not attempt it under the agent's permissions. Record the limits
+  before and after (`tt-smi` shows TDP, TDC, thermal and board limits) and the firmware bundle
+  version with every characterisation.
+
+## Repository Hygiene
+
+- Never `git add -u` or `git add -A` in a checkout with submodules: it stages a submodule pointer
+  bump (the UMD submodule in the reference bring-up). Stage by path.
+- Every tracked evidence file stays under 500 KB (the pre-commit hook refuses larger): gzip CSVs,
+  PNG at 70 dpi, compact JSON, per-op summaries instead of raw dumps. Tracy and profiler output
+  directories live outside the repository tree; the evidence directory keeps the summary and the
+  command that produced it.
+- One code change per commit; a review round's P2 document fixes may share one commit.
 
 ## Reset And Health Checks
 

@@ -1,16 +1,17 @@
-/goal Use $train-plan for training HF_MODEL (recipe: RECIPE) in the current tt-metal checkout, single chip.
+/goal Use $train-plan for training HF_MODEL (recipe: RECIPE) in the current tt-metal checkout, on the authorised chips.
 
 As the user, I explicitly authorize you to use subagents when a selected skill requests or recommends them.
 
 This goal creates the plan for the tt-train training bring-up. Write only MODEL_DIR/doc/plan.md and its work log; do not write model or kernel code in this goal.
 
 Goal completion requirements:
-- MODEL_DIR/doc/plan.md exists with four sections: kernel inventory, freeze map, roofline target, memory budget.
-- Kernel inventory lists every op of the reference forward and backward with the existing ttnn/ttml forward kernel, existing backward, accepted layout/dtype, and what is missing; inference implementations of the same model under models/ were searched for reusable forwards.
+- MODEL_DIR/doc/plan.md exists with the hard-constraints block (precision, batch, forbidden modes, copied verbatim from RECIPE and the user's instructions) and five sections: kernel inventory, freeze map, roofline target, memory budget, hardware ceiling.
+- Kernel inventory lists every op of the reference forward and backward with the existing ttnn/ttml forward kernel, existing backward, accepted layout/dtype, and what is missing; inference implementations of the same model under models/ were searched for reusable forwards; the top three ops of the step name their compiled kernel source (program factory and kernel files, any fork), DEST sync mode, core grid and expected % of peak, and the per-rank shard shapes when the layout is multi-chip.
 - Freeze map states for every parameter and module input whether a gradient is needed under RECIPE.
-- Roofline target is a single achievable ms/step and MFU figure for the target chip with its derivation: per-op max(FLOPs/peak, bytes/bandwidth) per layer kind, forward + dX + dW (+ recompute if the budget forces it), scaled by layer counts plus fixed costs; the useful FLOPs per step used for MFU are recorded.
+- Roofline target is a single wall ms/step and MFU figure at the nominal peak of the authorised chips (the box's sum for a TP layout) with its derivation: per-op max(FLOPs/peak, bytes/bandwidth) per layer kind, forward + dX + dW (+ recompute if the budget forces it), scaled by layer counts plus fixed costs and collective bytes; the useful FLOPs per step used for MFU are recorded; no host/dispatch gap is budgeted by assumption; the delivered clock from the hardware ceiling is stated next to the target as the margin, never as a new denominator.
 - Memory budget covers weights, gradients, optimiser state, saved activations at the target sequence length and batch, and workspace against the chip's DRAM, and states the resulting recompute policy and whether the model fits on one chip.
-- The exact HF revision, reference commit, recipe and hardware identity are recorded.
+- Hardware ceiling: the clock ladder with the telemetry sampler was run on day 1 at the recipe's fidelity (per-chip settled clock under idle, a few cores, a third of the grid, the full grid, on every chip at once); the TDP/TDC/thermal limits, firmware bundle, throttler masks and the critical chip are recorded with the table or figure; whether the limit can be raised and the exact user-run command are stated; the multi-chip fit is decided (fits one chip, or the TP/DP layout, its authorisation and its collective floor).
+- The exact HF revision, reference commit, recipe, hardware identity and firmware bundle are recorded.
 - $stage-review returns `clean-pass`; findings fixed/rereviewed. Local commit touched-repo changes; never push; log SHAs.
 
 Unmet requirements, review findings, failed gates: work. Stop only after `$autofix` fails.
