@@ -357,3 +357,100 @@ def test_the_daemon_reloading_its_own_rewritten_plist_does_it_from_a_new_session
     assert service.restart_service(p) == "restarted" and spawned == [p] and not popen
     assert [c[1] for c in calls] == ["bootout", "bootstrap"] and calls[0][2].endswith(f"/{label}"), calls
     assert plistlib.loads(service._agent(p).read_bytes())["ProcessType"] == "Standard"
+
+
+@pytest.mark.parametrize("bg, plist_type, want, cleared", [
+    (1, None, "normal (left the background priority it inherited from its starter)", True),
+    (1, "Standard", "normal (left the background priority it inherited from its starter)", True),
+    (0, "Standard", "normal", False),
+    (1, "Background", "background (its launchd plist sets ProcessType Background)", False),
+    (None, None, "", False)])
+def test_a_daemon_started_from_a_background_parent_leaves_background_unless_its_plist_says_so(
+        env, monkeypatch, bg, plist_type, want, cleared):
+    """Darwin background priority is inherited: a daemon the watchdog (a Background agent) or a hand or
+    cron restart starts runs on efficiency cores with throttled I/O unless it leaves it. A ProcessType
+    Background the user or a coordinator set in its plist is kept; off macOS (None) nothing happens."""
+    import plistlib
+    from ttp import service
+    sets = []
+    state = {"bg": bg}
+
+    def fake(set_to=None):
+        if set_to is not None:
+            sets.append(set_to)
+            state["bg"] = set_to
+        return state["bg"]
+    monkeypatch.setattr(service, "_darwin_bg", fake)
+    plist = env["tmp"] / "agent.plist"
+    if plist_type:
+        plist.write_bytes(plistlib.dumps({"Label": "x", "ProcessType": plist_type}))
+    out = service.leave_background(plist if plist_type else None)
+    assert out == (f"cpu priority: {want}" if want else ""), out
+    assert sets == ([0] if cleared else []), sets
+
+
+def test_a_failed_leave_says_the_daemon_still_runs_background(env, monkeypatch):
+    from ttp import service
+    monkeypatch.setattr(service, "_darwin_bg", lambda set_to=None: 1)
+    assert service.leave_background(None) == "cpu priority: background (inherited from its starter; leaving it failed)"
+
+
+@pytest.mark.skipif(sys.platform != "darwin" or not shutil.which("taskpolicy"), reason="macOS taskpolicy only")
+def test_on_macos_a_process_started_background_runs_and_starts_children_at_normal_priority(env):
+    """The real call: a process started at darwin background priority (taskpolicy -b, as from the
+    watchdog's job) leaves it, and a child it starts afterwards (a worker, git) runs normal too."""
+    code = ("import subprocess; from ttp import service; print(service._darwin_bg()); "
+            "print(service.leave_background(None)); print(service._darwin_bg()); "
+            "print(subprocess.run(['sh', '-c', 'ps -o pri= -p $$'], capture_output=True, text=True).stdout.strip())")
+    r = subprocess.run(["taskpolicy", "-b", sys.executable, "-c", code], capture_output=True, text=True,
+                       env={**os.environ, "PYTHONPATH": str(RUNTIME)}, timeout=60)
+    before, said, after, child_pri = r.stdout.split("\n")[:4]
+    assert (before, after) == ("1", "0"), r.stdout + r.stderr
+    assert said == "cpu priority: normal (left the background priority it inherited from its starter)"
+    assert int(child_pri) > 4, f"the child still runs at darwin background priority {child_pri}"
+
+
+class _PriorityChecked(BaseException):
+    pass
+
+
+def test_the_daemon_leaves_background_at_start_before_any_worker_with_its_own_plist(env, monkeypatch):
+    """Every restart route (launchd kickstart or reload, the hand fallback the watchdog calls, cron)
+    starts `python -m ttp.daemon`, whose run() sets its priority from its own plist before it starts any
+    run, and logs the priority it runs at."""
+    from ttp import service
+    from ttp.daemon import Daemon
+    p = make(env)
+    seen = []
+
+    def check(plist):
+        seen.append(plist)
+        raise _PriorityChecked
+    monkeypatch.setattr(service, "leave_background", check)
+    try:
+        Daemon(p.base).run()
+    except _PriorityChecked:
+        pass
+    assert seen == [service._agent(p)], seen
+    assert not p.db.q("SELECT id FROM runs"), "a run started before the daemon set its priority"
+
+
+def test_every_restart_route_outside_launchd_starts_the_daemon_module(env, monkeypatch):
+    """The hand fallback (watchdog or upgrade when the agent is not loaded) and cron's lines start the
+    daemon module, so its start sets the priority whichever process (Background or not) ran them."""
+    from ttp import service
+    p = make(env)
+    monkeypatch.setenv("HOME", str(env["tmp"] / "userhome"))
+    monkeypatch.setattr(service.sys, "platform", "darwin")
+    f = service._agent(p)
+    f.parent.mkdir(parents=True, exist_ok=True)
+    import plistlib
+    f.write_bytes(plistlib.dumps({"Label": service.launchd_label(p), **service.DAEMON_KEYS}))
+    monkeypatch.setattr(service, "_run", lambda *a: subprocess.CompletedProcess(a, 3, "", "not loaded"))
+    popen = []
+    monkeypatch.setattr(service.subprocess, "Popen", lambda argv, **kw: popen.append(argv))
+    assert service.restart_service(p) == "restarted"
+    (argv,), daemon = popen, " ".join(shlex.quote(a) for a in service.daemon_argv(p))
+    assert argv[:2] == ["sh", "-c"] and daemon in argv[2], argv
+    assert service.daemon_argv(p)[1:3] == ["-m", "ttp.daemon"]
+    assert all(daemon in line for line in service._cron_lines(p))

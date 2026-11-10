@@ -1562,6 +1562,12 @@ class Daemon:
         log(self.p, f"daemon start pid={os.getpid()} host={hostname()} boot={self.boot} version={r['version']} "
                     f"commit={r['commit'] or 'none'} instance={r['instance']} provenance={r['provenance']} "
                     f"harness_head={r['harness_head'] or 'none'} runtime_tree={r['runtime_tree'] or 'none'}")
+        try:   # before any worker starts: they inherit it
+            from .service import _agent, leave_background
+            if prio := leave_background(_agent(self.p)):
+                log(self.p, prio)
+        except Exception:
+            log(self.p, "cpu priority error: " + traceback.format_exc().replace("\n", " | ")[:2000])
         self.p.db.set_kv("daemon", {"pid": os.getpid(), "host": hostname(), "started": time.time(),
                                     "instance": r["instance"]})
         try:   # inherited from whatever started it: host-run then cannot gain privileges (hostrun.py)

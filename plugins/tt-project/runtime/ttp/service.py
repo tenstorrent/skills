@@ -42,6 +42,46 @@ WATCHDOG_EVERY_S = 300   # how often launchd and cron look for a stuck daemon
 # workers, reviewers and checks stay polite at runner.nice. The watchdog and tunnels stay Background.
 # An installed daemon plist lacking any of these keys is rewritten on upgrade (refresh).
 DAEMON_KEYS = {"ProcessType": "Standard", "AbandonProcessGroup": True}
+# Darwin background state is inherited: a daemon started by hand from the watchdog (a Background agent)
+# or any other background process runs at background priority too. leave_background() drops it at start.
+PRIO_DARWIN_PROCESS = 4   # <sys/resource.h>: the which of setpriority for darwin background state
+
+
+def _darwin_bg(set_to: int | None = None) -> int | None:
+    """This process's darwin background state (1 on, 0 off), after setting it to `set_to` when given;
+    None where it cannot be read (not macOS, no libc)."""
+    if sys.platform != "darwin":
+        return None
+    try:
+        import ctypes
+        libc = ctypes.CDLL(None, use_errno=True)
+        libc.getpriority.argtypes = [ctypes.c_int, ctypes.c_uint]
+        libc.setpriority.argtypes = [ctypes.c_int, ctypes.c_uint, ctypes.c_int]
+        if set_to is not None:
+            libc.setpriority(PRIO_DARWIN_PROCESS, 0, set_to)
+        return 1 if libc.getpriority(PRIO_DARWIN_PROCESS, 0) > 0 else 0
+    except (OSError, AttributeError):
+        return None
+
+
+def leave_background(plist: Path | None) -> str:
+    """Run at normal CPU priority whoever started this process (launchd, cron, the watchdog's or a hand
+    restart), unless its launchd plist sets ProcessType Background: a value the user or a coordinator
+    set there is kept. Returns the priority it runs at, for the start log."""
+    bg = _darwin_bg()
+    if bg is None:
+        return ""
+    try:
+        kept = bool(plist) and plistlib.loads(plist.read_bytes()).get("ProcessType") == "Background"
+    except (OSError, ValueError, AttributeError, plistlib.InvalidFileException):
+        kept = False
+    if kept:
+        return "cpu priority: background (its launchd plist sets ProcessType Background)"
+    if not bg:
+        return "cpu priority: normal"
+    bg = _darwin_bg(0)
+    return ("cpu priority: normal (left the background priority it inherited from its starter)" if bg == 0
+            else "cpu priority: background (inherited from its starter; leaving it failed)")
 
 
 def daemon_argv(p: Project) -> list[str]:

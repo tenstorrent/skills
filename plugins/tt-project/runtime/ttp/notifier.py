@@ -980,6 +980,12 @@ def main() -> int:
     write_json(RUNNING, {"pid": os.getpid(), "code": mine, "version": __version__, "python": py,
                          "runtime": str(own_runtime()), "started": time.time()})
     log(f"started: ttp {mine} under Python {py} from {own_runtime()}")
+    try:   # a restart from a background process keeps normal priority
+        from .service import leave_background
+        if prio := leave_background(Path.home() / "Library" / "LaunchAgents" / f"{LABEL}.plist"):
+            log(prio)
+    except Exception as e:
+        log(f"cpu priority: {type(e).__name__}: {e}")
     while True:
         try:
             state = run_once(state, conf["min_severity"], float(conf["host_down_after_s"]),
