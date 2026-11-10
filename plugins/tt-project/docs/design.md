@@ -215,7 +215,9 @@ disk untouched, with no migration; nothing else is reclaimed by check recovery.
 ## Known gaps (accepted)
 
 - A git timeout defers a coordinator action only for task_add and task_update that wrote nothing
-  yet (`actdefer.py`; the daemon applies it again next tick, up to `actdefer.MAX_TRIES`). Other
+  yet (`actdefer.py`; the daemon applies it again next tick, up to `actdefer.MAX_TRIES`, with its
+  turn's user messages, so a cited user order is still recorded; a `waits_on ask:new` is stored
+  re-pointed to the ask its turn sent, and rejected at once when none went through). Other
   action types, and one that wrote before it timed out, are still rejected, with the timeout as the
   reason. A spent deadline still refuses every new git call, local reads included (no floor: a
   finish transaction's cap bounds how long it holds the write lock); branch names are checked

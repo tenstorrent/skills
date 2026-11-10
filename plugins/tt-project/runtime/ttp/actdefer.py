@@ -7,7 +7,12 @@ Under a spent time budget (gitmemo: a finish transaction's deadline, a round's s
 time out. A timeout says nothing about the action, so apply never rejects it for one: when the action
 wrote nothing yet, it is kept here (kv, committed with the turn, so a restart keeps it) and the
 daemon's tick applies it again (retry), outside any finish transaction. After MAX_TRIES timeouts it is
-rejected as before, saying it timed out."""
+rejected as before, saying it timed out.
+
+The replay is the same apply as the first one: the action keeps its turn's context (the user messages
+the turn was started for, whether it was a user turn), so a task_add citing one of those messages is
+still recorded as the user's order, and a task_update's `waits_on ask:new` is stored re-pointed to the
+ask its turn sent (apply does that once the turn's asks are known: repoint, drop)."""
 
 from __future__ import annotations
 
@@ -24,14 +29,28 @@ def deferrable(action_type: str | None, tries: int, wrote: bool) -> bool:
     return action_type in TYPES and not wrote and tries < MAX_TRIES
 
 
-def defer(db, action: dict, chat: str | None, why: str, tries: int) -> str:
-    """Keep `action` for the next tick; the note for the coordinator's next digest."""
+def defer(db, action: dict, chat: str | None, why: str, tries: int, messages: list[int] | None = None,
+          user_turn: bool = False) -> tuple[int, str]:
+    """Keep `action` for the next tick with its turn's context (`messages`, `user_turn`: as apply got
+    them); its id and the note for the coordinator's next digest."""
     items = list(db.kv(KEY, []) or [])
     n = max([int(x.get("id") or 0) for x in items] + [0]) + 1
-    items.append({"id": n, "action": action, "chat": chat, "tries": tries, "why": why[:300], "at": time.time()})
+    items.append({"id": n, "action": dict(action), "chat": chat, "tries": tries, "why": why[:300], "at": time.time(),
+                  "messages": [int(m) for m in messages or []], "user_turn": bool(user_turn)})
     db.set_kv(KEY, items)
-    return (f"{action.get('type')}: deferred, not rejected: a git check timed out ({why[:200]}); the daemon "
-            f"applies it again on its next tick")
+    return n, (f"{action.get('type')}: deferred, not rejected: a git check timed out ({why[:200]}); the daemon "
+               f"applies it again on its next tick")
+
+
+def repoint(db, item_id: int, waits_on: str) -> None:
+    """Store deferred action `item_id`'s `waits_on` as `waits_on` (its turn's `ask:new` resolved)."""
+    db.set_kv(KEY, [{**x, "action": {**x["action"], "waits_on": waits_on}}
+                    if isinstance(x, dict) and x.get("id") == item_id and isinstance(x.get("action"), dict) else x
+                    for x in db.kv(KEY, []) or []])
+
+
+def drop(db, item_id: int) -> None:
+    db.set_kv(KEY, [x for x in db.kv(KEY, []) or [] if not (isinstance(x, dict) and x.get("id") == item_id)])
 
 
 def pending(db) -> list[dict]:
@@ -52,6 +71,8 @@ def retry(p) -> list[str]:
             db.set_kv(KEY, left)
             notes, reply = db.kv(coord.NOTES_KEY, []) or [], db.kv(coord.REJECTED_REPLY_KEY, False)
             problems = list(coord.apply(p, [item["action"]], default_chat=item.get("chat"),
+                                        user_turn=bool(item.get("user_turn")),
+                                        messages=[int(m) for m in item.get("messages") or []] or None,
                                         deferred_tries=int(item.get("tries") or 0) + 1))
             db.set_kv(coord.NOTES_KEY, list(notes) + list(db.kv(coord.NOTES_KEY, []) or []))
             db.set_kv(coord.REJECTED_REPLY_KEY, reply)

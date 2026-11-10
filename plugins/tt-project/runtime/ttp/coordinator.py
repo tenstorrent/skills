@@ -2783,6 +2783,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
     announced = charterpromise.announcing(actions)   # named in a refused charter_update's charter_retry
     turn_asks: list[tuple[int, int]] = []   # (position in order, ask id) of this turn's asks, for `waits_on ask:new`
     new_ask_holds: list[tuple[int, dict, dict]] = []   # (position, task before, update) waiting for a later ask
+    deferred_new_asks: list[tuple[int, int, object]] = []   # (position, deferred item, task id) on `ask:new`
     cfg_refused: dict[str, str] = {}   # config_set key -> why it was rejected (sorted first, so memory_add sees it)
     # (key, task) pairs this batch's obligation actions attach: a task_update spec may name those (spec_check).
     attaching = set()
@@ -4286,7 +4287,15 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
         except Exception as e:   # one bad action is reported back; it never aborts the turn
             if isinstance(e, subprocess.TimeoutExpired) and wrote_before is not None and actdefer.deferrable(
                     t, deferred_tries, db.conn.total_changes != wrote_before):
-                notes.append(actdefer.defer(db, order[k][1], default_chat, str(e), deferred_tries))
+                act = dict(order[k][1])
+                new_ask = t == "task_update" and str(act.get("waits_on") or "").strip().lower() == \
+                    f"ask:{anchors.NEW_ASK}"
+                if new_ask and turn_asks:   # this turn's newest ask so far, as _hold_anchor reads it
+                    act["waits_on"], new_ask = f"ask:{turn_asks[-1][1]}", False
+                item, note = actdefer.defer(db, act, default_chat, str(e), deferred_tries, messages, user_turn)
+                if new_ask:   # re-pointed to the turn's later ask once it is sent (below)
+                    deferred_new_asks.append((k, item, act.get("id")))
+                notes.append(note)
                 continue   # a spent time budget says nothing about the action: the next tick applies it
             failed.add(i)
             sent_as = f"; {GATE_MARK}: {json.dumps(order[k][1], ensure_ascii=False, default=str)}" \
@@ -4315,6 +4324,14 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
             db.update_task(before["id"], **{f: before[f] for f in upd if f != "updated"})
             problems.append(f"task_update: #{before['id']} rejected: it waits_on ask:new, but no ask_user of this "
                             f"turn went through")
+    for k, item, tid in deferred_new_asks:   # its replay has no later ask_user: it waits on the one sent here
+        ask = next((mid for at, mid in turn_asks if at > k), None)
+        if ask is not None:
+            actdefer.repoint(db, item, f"ask:{ask}")
+        else:
+            actdefer.drop(db, item)
+            problems.append(f"task_update: #{tid} rejected: it waits_on ask:new, but no ask_user of this turn "
+                            f"went through")
     if lean and ((user_turn and rules_added and not restr_edited and restr_before) or loosened):
         notes.append("restriction checks skipped: the daemon was cut off applying this turn once and applied "
                      "it again without them")

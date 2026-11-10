@@ -24197,3 +24197,73 @@ def test_a_task_add_whose_git_check_times_out_is_deferred_never_rejected(env, mo
         actdefer.retry(p)
     assert not actdefer.pending(p.db)
     assert any("timed out" in x for x in p.db.kv(coord.REJECTED_KEY, [])), p.db.kv(coord.REJECTED_KEY)
+
+
+def test_a_deferred_task_add_is_replayed_with_its_turns_user_messages(env, monkeypatch):
+    """A task_add citing a user message of its turn whose git check times out is applied on the next tick
+    with that turn's messages: the cite resolves as at first apply, so it is recorded as the latest user
+    order on its resource and the older task there is held."""
+    import subprocess
+    p = make(env)
+    from ttp import actdefer, coordinator as coord, userorder
+    assert coord.apply(p, [{"type": "task_add", "title": "old soak", "spec": "soak rig", "tier": "light",
+                            "resources": ["rig"]}]) == []
+    old = p.db.one("SELECT id FROM tasks WHERE title='old soak'")["id"]
+    p.db.x("UPDATE tasks SET created=?", (time.time() - 600,))
+    prior = p.db.add_task("prior", "s", kind="code")
+    p.db.update_task(prior, status="failed")
+    msg = p.db.x("INSERT INTO messages(ts,direction,kind,text) VALUES(?,'in','user','power-cycle rig now')",
+                 (time.time() - 60,))
+    real, fails = coord._continued, [1]
+
+    def slow(*a, **k):   # its git check times out once, before it writes anything
+        if fails[0]:
+            fails[0] -= 1
+            raise subprocess.TimeoutExpired(["git", "rev-parse"], 0)
+        return real(*a, **k)
+    monkeypatch.setattr(coord, "_continued", slow)
+    act = {"type": "task_add", "title": "power-cycle rig", "spec": f"user msg #{msg}: power-cycle rig",
+           "tier": "light", "resources": ["rig"], "continues": prior}
+    assert coord.apply(p, [act], user_turn=True, messages=[msg]) == []
+    assert len(actdefer.pending(p.db)) == 1 and not p.db.one("SELECT id FROM tasks WHERE title='power-cycle rig'")
+    p.db.set_kv(coord.NOTES_KEY, [])
+    out = actdefer.retry(p)
+    assert len(out) == 1 and out[0].endswith(": applied"), out
+    new = p.db.one("SELECT id FROM tasks WHERE title='power-cycle rig'")["id"]
+    assert int(userorder._orders(p.db)["rig"]["task"]) == new
+    assert int(userorder._orders(p.db)["rig"]["msg"]) == msg
+    assert any(f"#{new} is the latest user order (msg #{msg}) on rig" in n
+               for n in p.db.kv(coord.NOTES_KEY, [])), p.db.kv(coord.NOTES_KEY, [])
+    assert old != new
+
+
+def test_a_deferred_task_update_on_ask_new_waits_on_the_ask_its_turn_sent(env, monkeypatch):
+    """A task_update holding a task on `ask:new` whose git check times out is kept re-pointed to the
+    ask_user its turn sent after it, so its replay (which has no ask_user) holds the task on that ask;
+    with no ask of its turn going through, it is rejected at once, never deferred onto nothing."""
+    import subprocess
+    p = make(env)
+    from ttp import actdefer, anchors, coordinator as coord
+    tid = p.db.add_task("t", "s", kind="code")
+    real, fails = coord._landed_as_deps, [1]
+
+    def slow(*a, **k):   # its git check times out before it writes anything
+        if fails[0]:
+            fails[0] -= 1
+            raise subprocess.TimeoutExpired(["git", "merge-base"], 0)
+        return real(*a, **k)
+    monkeypatch.setattr(coord, "_landed_as_deps", slow)
+    upd = {"type": "task_update", "id": tid, "status": "blocked", "waits_on": "ask:new", "text": "needs the user"}
+    ask = {"type": "ask_user", "text": "Which credential should the box use?", "severity": "normal",
+           "blocking": "access", "recommendation": "token"}
+    assert coord.apply(p, [upd, ask]) == []
+    ask_id = p.db.one("SELECT id FROM messages WHERE kind='ask' ORDER BY id DESC")["id"]
+    assert [x["action"]["waits_on"] for x in actdefer.pending(p.db)] == [f"ask:{ask_id}"]
+    out = actdefer.retry(p)
+    assert len(out) == 1 and out[0].endswith(": applied") and not actdefer.pending(p.db), out
+    task = p.db.task(tid)
+    assert task["status"] == "blocked" and anchors.label("ask", str(ask_id)) in task["labels"], task["labels"]
+    fails[0] = 1
+    assert coord.apply(p, [upd]) == [f"task_update: #{tid} rejected: it waits_on ask:new, but no ask_user of "
+                                     f"this turn went through"]
+    assert not actdefer.pending(p.db)
