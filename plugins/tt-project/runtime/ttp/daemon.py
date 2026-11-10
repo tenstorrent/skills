@@ -342,6 +342,9 @@ TICK_STALL_S = HEARTBEAT_STALE_S
 # longer raises one model-free tick_step_slow event naming the item that held it longest (and the
 # command it killed), at most once per STEP_SLOW_EVERY_S per step.
 STEP_BUDGET_S = 30
+# A review's diff is measured for its tier only while this share of the step's budget is left; later in
+# the step the review starts at the tier it was given, so slow diff reads never hold back ready work.
+REVIEW_DIFF_LEFT = 0.5
 STEP_HARD_SLACK_S = 5
 # Git a step runs is capped by time, not per call site (gitmemo.bounded): each read under
 # gitmemo.TICK_GIT_S, and all git inside a finish transaction within gitmemo.TX_GIT_S. The library reads
@@ -1914,6 +1917,12 @@ class Daemon:
         self._step_holder, self._step_task, self._step_mark = holder, task, t
         return self._stopping or (self._step_began is not None
                                   and t - self._step_began >= (self._step_allow or self._step_budget()))
+
+    def _step_left(self) -> float | None:
+        """Seconds the running tick step has left of its budget, or None outside a step."""
+        if self._step_began is None:
+            return None
+        return (self._step_allow or self._step_budget()) - (time.monotonic() - self._step_began)
 
     def _step_allowance(self, name: str) -> float:
         """The budget for step `name` now: _step_budget(), or once at least STEP_LONG_PASS_S when it was
@@ -16681,6 +16690,12 @@ class Daemon:
         if prior is not None:
             tier, why, changes = self._rereview_pick(task, prior)
         else:
+            left = self._step_left()
+            if left is not None and left < self._step_budget() * REVIEW_DIFF_LEFT:
+                # a slow diff read now could stop the step before the ready work after this one starts
+                log(self.p, f"task {task['id']}: review diff not measured ({left:.0f} s left in the step): "
+                            f"keeps tier {task['tier']}")
+                return task, None
             try:
                 changes = worktree.diff_lines(self.p, worktree.reviewed_refs(self.p, task))
             except Exception as e:

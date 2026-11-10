@@ -2469,6 +2469,12 @@ def fix_branches(p: Project, task: dict, refs: list[str]) -> dict[str, str]:
     return {b: ref for ref, (_, b) in sorted(newest.items(), key=lambda kv: kv[1][0])}
 
 
+# diff_lines' numstat per (repo, base commit, ref commit): the same two commits always diff the same, and
+# on a loaded machine one numstat took seconds, read again for each review on every dispatch pass.
+_NUMSTAT: dict[tuple[str, str, str], str] = {}
+NUMSTAT_KEEP = 512
+
+
 def diff_lines(p: Project, refs: list[str], base: str = "", root: Path | None = None) -> dict[str, int | None] | None:
     """Lines changed per file by `refs` since they left the base branch (or `base`; in repo `root`,
     default the project root) (None for a binary file), or None when they change nothing measurable,
@@ -2476,10 +2482,21 @@ def diff_lines(p: Project, refs: list[str], base: str = "", root: Path | None = 
     root = root or p.root
     base = base or resolve_base(p)
     out: dict[str, int | None] = {}
+    base_sha = ""
     for ref in refs:
-        if not _git(root, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}", check=False):
+        sha = _git(root, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}", check=False)
+        if not sha:
             continue
-        for line in _git(root, "diff", "--numstat", "--no-renames", f"{base}...{ref}").splitlines():
+        base_sha = base_sha or _git(root, "rev-parse", "--verify", "--quiet", f"{base}^{{commit}}", check=False)
+        key = (str(root), base_sha, sha)
+        stat = _NUMSTAT.get(key) if base_sha else None
+        if stat is None:
+            stat = _git(root, "diff", "--numstat", "--no-renames", f"{base}...{ref}")
+            if base_sha:
+                _NUMSTAT[key] = stat
+                while len(_NUMSTAT) > NUMSTAT_KEEP:
+                    del _NUMSTAT[next(iter(_NUMSTAT))]
+        for line in stat.splitlines():
             added, deleted, path = line.split("\t", 2)
             prev = out.get(path, 0)
             n = None if added == "-" else int(added) + int(deleted)

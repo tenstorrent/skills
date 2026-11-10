@@ -2316,7 +2316,7 @@ def test_slow_git_dispatch_starts_every_ready_task_in_one_step(env, monkeypatch,
     """On a loaded machine each git call is slow; each start re-read the root checkout's head, branch and
     status and fetched origin, so a dispatch step's budget ran out after a start or two and the rest
     waited a tick each. Within one dispatch pass those reads and the fetch run once: 4 ready tasks and
-    4 free places all start within one step budget (75 git calls took ~45 s here before, 50 take ~28 s)."""
+    4 free places all start within one step budget, the fetch and root reads run once."""
     from ttp import stepclock
     p, d, drain, settle = _slot_setup(env, monkeypatch, tmp_path, slots=4)
     try:
@@ -2336,6 +2336,92 @@ def test_slow_git_dispatch_starts_every_ready_task_in_one_step(env, monkeypatch,
             assert sum(c.startswith(root + read) for c in said) == 1, (read, said)
     finally:
         drain(d)
+
+
+def test_slow_diff_reads_never_hold_ready_reviews_past_one_step(env, monkeypatch, tmp_path, reap_tmp_processes):
+    """The 2026-11-10 stall: each ready review's tier pick read its branch's `diff --numstat`, and on a
+    loaded machine one took most of the step budget, so the step stopped with urgent reviews and free
+    places left. A diff is now measured only while half the budget is left; later reviews start at their
+    given tier. Counted, not timed: one numstat runs and all four start (before: the step stopped first)."""
+    from ttp import stepclock, worktree
+    p, d, drain, settle = _slot_setup(env, monkeypatch, tmp_path, slots=4)
+    try:
+        g = lambda *a: subprocess.run(["git", "-C", str(p.root), *a], check=True, capture_output=True,  # noqa: E731
+                                      text=True).stdout.strip()
+        start = g("rev-parse", "HEAD")
+        for i in range(4):
+            g("checkout", "-q", "-b", f"ttp/t{90 + i}-work", start)
+            (p.root / f"w{i}.py").write_text("x = 1\n" * (i + 1))
+            g("add", f"w{i}.py")
+            g("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", f"work {i}")
+            sha = g("rev-parse", "HEAD")
+            g("checkout", "-q", "-")
+            p.db.add_task(f"Review #{90 + i}", f"Review branch ttp/t{90 + i}-work, head {sha}.", kind="review",
+                          tier="standard", origin="user", priority=1)
+        getattr(worktree, "_NUMSTAT", {}).clear()
+        calls = _slow_git(tmp_path, monkeypatch, 0.05, slow="*diff\\ --numstat*", slow_s=24)
+        monkeypatch.setattr(d, "_step_budget", lambda: 40.0)
+        stepclock.install()
+        try:
+            d._run_step(d.dispatch)
+        finally:
+            stepclock.uninstall()
+        said = calls.read_text()
+        assert said.count("diff --numstat") == 1, said
+        assert len(_slot_tasks(p)) == 4, "every ready review starts within one step"
+    finally:
+        drain(d)
+
+
+def test_diff_lines_reads_a_head_pair_once(env, monkeypatch, tmp_path):
+    """worktree.diff_lines keeps each (base commit, ref commit) numstat across calls: a review retried or
+    picked again on a later pass pays a slow diff once per head; a new head is read afresh."""
+    from ttp import worktree
+    p = make(env)
+    g = lambda *a: subprocess.run(["git", "-C", str(p.root), *a], check=True, capture_output=True,  # noqa: E731
+                                  text=True).stdout.strip()
+    base = g("rev-parse", "HEAD")
+    g("checkout", "-q", "-b", "feat")
+    (p.root / "f.py").write_text("a\n")
+    g("add", "f.py")
+    g("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "f")
+    g("checkout", "-q", "-")
+    worktree._NUMSTAT.clear()
+    calls = _slow_git(tmp_path, monkeypatch, 0)
+    n = lambda: calls.read_text().count("diff --numstat")  # noqa: E731
+    assert worktree.diff_lines(p, ["feat"], base=base) == {"f.py": 1}
+    assert worktree.diff_lines(p, ["feat"], base=base) == {"f.py": 1} and n() == 1
+    g("checkout", "-q", "feat")
+    (p.root / "f.py").write_text("a\nb\n")
+    g("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qam", "g")
+    g("checkout", "-q", "-")
+    assert worktree.diff_lines(p, ["feat"], base=base) == {"f.py": 2} and n() == 2
+
+
+def test_dispatch_pass_replays_a_failed_fetch(tmp_path, monkeypatch):
+    """A second fetch in a pass gets the first one's outcome: a failure's returncode (check=True raises)
+    and a timeout's TimeoutExpired, never a made-up success."""
+    from ttp import gitmemo
+    repo = tmp_path / "r"
+    subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+    calls = _slow_git(tmp_path, monkeypatch, 0)
+    fetch = ["git", "-C", str(repo), "fetch", "--quiet", "origin"]
+    with gitmemo.dispatch_pass():
+        first = gitmemo.run(fetch, capture_output=True, text=True)
+        assert first.returncode != 0
+        assert gitmemo.run(fetch, capture_output=True, text=True).returncode == first.returncode
+        with pytest.raises(subprocess.CalledProcessError):
+            gitmemo.run(fetch, capture_output=True, text=True, check=True)
+    assert calls.read_text().count("fetch --quiet origin") == 1
+    real = gitmemo._run
+    monkeypatch.setattr(gitmemo, "_run", lambda argv, **kw: (_ for _ in ()).throw(subprocess.TimeoutExpired(argv, 1)))
+    with gitmemo.dispatch_pass():
+        for _ in range(2):
+            with pytest.raises(subprocess.TimeoutExpired):
+                gitmemo.run(fetch, capture_output=True)
+        monkeypatch.setattr(gitmemo, "_run", real)
+        with pytest.raises(subprocess.TimeoutExpired):
+            gitmemo.run(fetch, capture_output=True)
 
 
 def test_dispatch_pass_memo_keeps_root_reads_until_a_move(tmp_path, monkeypatch):

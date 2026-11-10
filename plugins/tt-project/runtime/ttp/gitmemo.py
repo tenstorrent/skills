@@ -349,8 +349,13 @@ def _moves(args: tuple) -> bool:
 def _pass_run(memo: dict, argv, kw: dict, timeout: float | None, read: bool | None) -> subprocess.CompletedProcess:
     args = git_args(argv)
     repo = _repo_dir(argv, kw)
-    if args == _PASS_FETCH and ("fetched", repo) in memo:
-        return subprocess.CompletedProcess(list(argv), 0, "" if kw.get("text") else b"", "" if kw.get("text") else b"")
+    if args == _PASS_FETCH and ("fetched", repo) in memo:   # the first fetch's outcome, failure or timeout too
+        r = memo[("fetched", repo)]
+        if isinstance(r, BaseException):
+            raise r
+        if kw.get("check") and r.returncode:
+            raise subprocess.CalledProcessError(r.returncode, r.args, r.stdout, r.stderr)
+        return r
     key = (repo, args, bool(kw.get("text") or kw.get("universal_newlines")), "input" in kw)
     if args in _PASS_READS and key in memo:
         r = memo[key]
@@ -358,15 +363,23 @@ def _pass_run(memo: dict, argv, kw: dict, timeout: float | None, read: bool | No
             raise subprocess.CalledProcessError(r.returncode, r.args, r.stdout, r.stderr)
         return r
     keep = args in _PASS_READS and "input" not in kw
-    check = bool(kw.pop("check", False)) if keep else False   # a failing read is kept too, then raised
+    fetch = args == _PASS_FETCH
+    check = bool(kw.pop("check", False)) if keep or fetch else False   # a failing read is kept too, then raised
+    outcome: Any = None
     try:
         r = _run(argv, timeout=timeout, read=read, **kw)
+        outcome = r
+    except subprocess.TimeoutExpired as e:
+        outcome = e
+        raise
     finally:
         if _moves(args):
             for k in [k for k in memo if k[0] == repo]:
                 del memo[k]
-        if args == _PASS_FETCH:   # failed or timed out too: one more try in this pass would do the same
-            memo[("fetched", repo)] = True
+        if fetch and outcome is not None:   # failed or timed out too: one more try in this pass would do the same
+            memo[("fetched", repo)] = outcome
+    if fetch and check and r.returncode:
+        raise subprocess.CalledProcessError(r.returncode, r.args, r.stdout, r.stderr)
     if keep:
         memo[key] = r
         if check and r.returncode:
