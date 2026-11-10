@@ -24316,7 +24316,7 @@ def test_a_run_goes_on_when_os_nice_refuses_with_eperm(env, tmp_path, monkeypatc
     child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
     try:
         project.renice(child.pid, 5)
-        assert os.getpriority(os.PRIO_PROCESS, child.pid) == min(base + 5, 19)
+        assert os.getpriority(os.PRIO_PROCESS, child.pid) == max(base, min(base + 5, 19))   # at 20 macOS refuses to raise it back to 19
     finally:
         child.kill()
         child.wait()
