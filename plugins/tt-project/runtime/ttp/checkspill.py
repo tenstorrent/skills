@@ -695,13 +695,15 @@ def needs_history(c: Any) -> bool:
 
 
 def check_spills(c: Any, cfg: dict | None = None) -> bool:
-    """Whether check `c` may run on a spill host: it would run on this machine (its host "local", or an agent
+    """Whether check `c` may run on a spill host: it names no host of its own and has no spill host yet (a
+    project's delivery.checks_host, its default_host, does not keep it there; host "local", or an agent
     CLI it runs (needs_cli), only with `"spill": true`), in a clean checkout, does not say `"spill": false`, and is unwrapped unless it
     has a remote wrapper (push.spill_wrap_of; one that does not parse keeps it here) or `cfg` says its
     wrappers need no device (wrapped_ok)."""
     from . import cleantree, push
     opt = getattr(c, "spill", None)
-    if opt is False or getattr(c, "keep_here", False) or push.remote_host(c) or cleantree.authoring(c):
+    own = getattr(c, "spill_host", "") or getattr(c, "host", "")
+    if opt is False or getattr(c, "keep_here", False) or own not in ("", remotecheck.LOCAL) or cleantree.authoring(c):
         return False
     if (getattr(c, "host", "") == remotecheck.LOCAL or needs_cli(c) or needs_history(c)) and opt is not True:
         return False

@@ -1559,7 +1559,8 @@ def test_no_spill_hosts_keeps_todays_wait_and_unspillable_checks_never_spill(env
     assert checkspill.hosts(p.config()) == [] and checkspill.after_s(p.config()) == checkspill.SPILL_AFTER_S
     c = push.check_list(["make test", {"run": "make a", "host": "local"}, {"run": "make b", "cwd": "authoring"}])
     assert checkspill.spillable(c[:1]) and not checkspill.spillable(c[1:2]) and not checkspill.spillable(c[2:])
-    assert not checkspill.spillable(push.with_host(c[:1], "check-host-a"))
+    assert checkspill.spillable(push.with_host(c[:1], "check-host-a")), "delivery.checks_host does not keep it there"
+    assert not checkspill.spillable(push.check_list([{"run": "make test", "host": "check-host-a"}]))
     assert not checkspill.spillable(push.with_wrap(c[:1], ("flock", "/tmp/x")))
     assert not checkspill.spillable([])
 
@@ -1795,7 +1796,7 @@ def test_a_wrapped_run_spills_only_when_its_project_says_the_wrapper_needs_no_de
     for v in (None, True, "false", 0):
         assert not checkspill.spillable(c, {"checks": {"wrap_needs_device": v}}), v
     assert checkspill.spillable(c, {"checks": {"wrap_needs_device": False}})
-    assert not checkspill.spillable(push.with_host(c, "check-host-a"), {"checks": {"wrap_needs_device": False}})
+    assert checkspill.spillable(push.with_host(c, "check-host-a"), {"checks": {"wrap_needs_device": False}})
     assert not project.config_problems({"checks": {"wrap_needs_device": False}})
     assert any("checks.wrap_needs_device" in x for x in project.config_problems({"checks": {"wrap_needs_device": "no"}}))
 
@@ -2283,6 +2284,20 @@ def test_a_split_off_check_timing_out_here_is_the_verdict_without_a_rerun(env, t
     assert "did not pass on spill host" not in text and len(ran) == len(here) == 1, (text, ran, here)
 
 
+def test_a_suite_of_a_project_with_a_checks_host_spills_and_runs_on_the_spill_host():
+    """delivery.checks_host (push.with_host's default_host) never keeps a check off the spill hosts: only the
+    check's own host, or a spill host it already has, does. Spilled, it runs on the spill host, not the
+    checks host; a check that names its own host, or one already spilled, stays where it is."""
+    from ttp import checkspill, push
+    suite = push.with_host(push.check_list(["python3 -m pytest -q tests", {"run": "make lint", "host": "check-host-b"}]),
+                           "check-host-a")
+    assert suite[0].default_host == "check-host-a" and push.remote_host(suite[0]) == "check-host-a"
+    assert checkspill.check_spills(suite[0]) and not checkspill.check_spills(suite[1])
+    assert checkspill.spillable(suite[:1]) and not checkspill.spillable(suite)
+    spilled = push.spill_to(suite[:1], "spill-host-a", None)
+    assert push.remote_host(spilled[0]) == "spill-host-a" and not checkspill.check_spills(spilled[0])
+
+
 def test_a_check_opts_in_to_spilling_and_runs_behind_its_remote_wrapper_there(env):
     """`spill: true` lets a check with host "local" spill, `false` keeps any check here; a check behind
     checks.wrap_cmd (a device wrapper) spills only with a remote wrapper (its own spill_wrap_cmd, else
@@ -2294,7 +2309,7 @@ def test_a_check_opts_in_to_spilling_and_runs_behind_its_remote_wrapper_there(en
     assert [checkspill.spillable(c[i:i + 1]) for i in range(6)] == [True, False, True, False, True, False]
     assert not checkspill.spillable(c) and checkspill.spillable([c[0], c[2], c[4]])
     assert not checkspill.spillable(push.check_list([{"run": "make x", "host": "check-host-a", "spill": True}]))
-    assert not checkspill.spillable(push.with_host(c[:1], "check-host-a")), "delivery.checks_host stays there"
+    assert checkspill.spillable(push.with_host(c[:1], "check-host-a")), "delivery.checks_host does not keep it there"
     assert checkspill.spillable(push.with_host(c[2:3], "check-host-a")), "host local beats checks_host"
     assert push.checks_of([{"run": "make b", "host": "local", "spill": True, "spill_wrap_cmd": "./w.sh -x"}]) == [
         {"run": "make b", "host": "local", "spill": True, "spill_wrap_cmd": "./w.sh -x"}]
