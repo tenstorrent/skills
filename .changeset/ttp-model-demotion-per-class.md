@@ -1,0 +1,5 @@
+---
+"tt-project": patch
+---
+
+`tt-project`: a chat model that does worse than the next ranked model in a task class stops being picked for that class. The daemon's hourly model check (model-free) compares, per class (`review`, or the run's tier) over the last 7 days, each chat model's tasks with the next eligible model's: with 8 samples on each side, a bad rate more than 15 points worse, or in a fast class (`babysit`, and any class set to prefer `fast`) a median wall time over twice the peer's, demotes it for that class; routed starts there run the next ranked model. A model whose malformed or no-hand-off share passes 20%, or whose bench score is under half the best, is parked (weekly bench recheck only). Each action is one low alert and one coordinator digest line, and only a newer passing bench score ends a demotion. `ttp model demote|promote|park|unpark <model> [--class c]` sets these by hand with the setter recorded; the user's record stands over a coordinator's, and `ttp model` lists them. Settings: `providers.chat.demote`; class rankings from `providers.chat.class_ranking.<class>` where set, else `model_ranking`.

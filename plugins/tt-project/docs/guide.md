@@ -1510,6 +1510,25 @@ back on (`ttp model-trip --h2h <kind/tier/label> --ok --ref <result>`); samples 
 `ttp model-trip` lists the strata. Settings: `providers.chat.dispatch.tripwire` (`min_samples` 10,
 `margin_pts` 10, `days` 14).
 
+Live model demotion (`modeldemote.py`, model-free, hourly, only with a `providers.chat.model_ranking`):
+per class (`review` for a review, else the run's tier) and chat model, each task whose first worker run
+ran on the chat provider and ended in the last `days` is a sample; it is bad by the tripwire's rules or
+when a run of it fell back on the model's own fault. The classes rank by
+`providers.chat.class_ranking.<class>` where set (a project's own value, else the account's), else by
+`model_ranking`. A model's peer is the next eligible model below it (else above) with `min_samples`
+samples. Once both have them and the model's bad rate is more than `margin_pts` points above the
+peer's, or in a fast class (`fast_classes`, plus each class whose `class_prefs.<class>.prefer` is
+`fast`) its median wall time is over `slow_x` times the peer's, the model is demoted for that class:
+routed starts there run the next ranked model and `better()` never picks it. A model whose malformed
+or no-hand-off share passes `fault_share`, or whose last bench score is under `floor` of the best
+benched, is parked for every class (weekly bench recheck only, out of the daily bench). Each action
+is one low alert and one coordinator digest line. Only a newer passing bench score ends the
+detector's demotion; samples then count from it. `ttp model demote|promote <model> [--class c]` and
+`ttp model park|unpark <model>` set them by hand, recorded with the setter; a lower setter
+(detector < coordinator < user) never overrides a higher one's record, and a user's promote holds the
+detector off. `ttp model` lists the records. Settings: `providers.chat.demote` (`min_samples` 8,
+`margin_pts` 15, `days` 7, `slow_x` 2, `floor` 0.5, `fault_share` 0.2, `fast_classes` [`babysit`]).
+
 ## Asks
 
 The project asks the user only when a step could affect people badly (destroy someone's work or
