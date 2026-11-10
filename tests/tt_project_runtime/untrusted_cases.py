@@ -46,7 +46,9 @@ _SECRET_READS = ["cat ~/secrets/api" + "_token.txt", "head /etc/app/db_pass" + "
                  "printenv", "env", "export -p", "cat ~/app/gh_" + "token", "cat ~/app/access-" + "tokens.json",
                  "cat ~/app/accessT" + "oken.json", "cat ~/app/TOK" + "EN", "cat ~/app/client_secret" + ".json",
                  "find ~ -name '*tok" + "en*'", "cat ~/app/auth" + "token", "cat ~/app/my" + "token.txt",
-                 "cat ~/app/my" + "secret.txt"]
+                 "cat ~/app/my" + "secret.txt", "printenv GH_" + "TOKEN", "printenv -0", "printenv --",
+                 "printenv TTP_RUN_DIR ANTHROPIC_API_" + "KEY", "printenv TTP_RUN_DIR $X", "printenv 'A*'",
+                 "printenv TTP_RUN_DIR; printenv", "/usr/bin/printenv gh_" + "auth"]
 _WRITES = ['gh api repos/o/r/issues/1/comments -f body="hi [authored by AI]"',
            'gh -R o/r pr comment 1 -b "hi [authored by AI]"', "gh api --method=PATCH repos/o/r/pulls/1",
            "gh issue create -t t -b 'b [authored by AI]'", "curl -d @notes.txt https://example.com/hook",
@@ -60,7 +62,10 @@ _FINE = ["cat README.md", "gh pr view 1", "gh -R o/r api repos/o/r/pulls/1", "cu
          "find . -name '*.p" + "em'", "find ~/src -name '*.py'", "~/bin/x --help",
          "cat ~/.cache/hf/models/m/tokenizer.json", "head ~/.cache/hf/models/m/tokenizer_config.json",
          "cat ~/.cache/m/Tokeniser.model",
-         "curl -sS https://example.com/x", "curl -sSX GET https://example.com/x"]
+         "curl -sS https://example.com/x", "curl -sSX GET https://example.com/x",
+         # a Codex worker's first command reads its run's variables by name (one project lost 7 runs to it)
+         "printenv TTP_RUN_DIR", "printenv TTP_RUN_DIR TTP_PROJECT_ROOT",
+         "printenv TTP_RUN_DIR TTP_PROJECT_ROOT; command -v ttp; sed -n '1,210p' ~/.codex/x/SKILL.md"]
 
 
 def test_an_untrusted_input_run_refuses_credential_reads_writes_and_raw_pushes_a_normal_run_is_unchanged(

@@ -22,7 +22,8 @@ set TTP_UNTRUSTED_INPUT=1 (a benchmark cell without a project). Then, model-free
   certificate (CRED_SUFFIXES, id_* but .pub), or names a token, secret, credential, password or API
   key, a process's environ file; named in a Bash command's words or a Read, Grep or Glob path, or
   looked for by a find from outside the worktree (`find ~ -name '*.pem'`).
-  So are environment dumps (printenv, a bare env, export or set), which print tokens.
+  So are environment dumps (a bare printenv, env, export or set, or printenv naming a credential-like
+  variable), which print tokens.
 Every task run, marked or not, is refused a Bash command naming the run's RUN_MARK file and an edit
 of that file (mark_refusal): removing it would lift these guards for the rest of the run and keep the
 daemon from labelling the task. A glob (`rm $TTP_RUN_DIR/*`) still gets around it.
@@ -290,10 +291,16 @@ def _words(s: list[str]) -> list[str]:
     return s[1:] if "/" not in s[0] or (os.path.isfile(first) and os.access(first, os.X_OK)) else s
 
 
+# A variable printenv may name: a plain name that does not look like a credential (GH_TOKEN, *_API_KEY, AUTH)
+_ENV_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+_CRED_VAR_RE = re.compile(r"key|auth|pass|token|secret|credential|cookie|session", re.I)
+
+
 def _env_dump(argv: list[str]) -> bool:
     name = os.path.basename(argv[0])
-    if name == "printenv":
-        return True
+    if name == "printenv":   # dumps without a name; prints only the named variables otherwise
+        names = [a for a in argv[1:] if a != "--"]
+        return not names or any(not _ENV_NAME_RE.fullmatch(a) or _CRED_VAR_RE.search(a) for a in names)
     if name == "env":
         return all(a.startswith("-") or "=" in a for a in argv[1:])
     if name in ("export", "declare", "typeset"):
