@@ -40,6 +40,7 @@ from . import (   # one name per line: two changes adding names merge without a 
     scopehold,
     setupfault,
     sharedchecks,
+    stepclock,
     syntaxfault,
     timefmt,
     upstream,
@@ -1768,10 +1769,13 @@ def start(p: Project, rows: list[dict], name: str, now: float | None = None, ext
                 raise _Changed()
             db.x("INSERT INTO push_batches(id,marker,target,started) VALUES(?,?,?,?)", (bid, str(marker), name, now))
         # From here on finalize owns the batch: a process that never starts is a batch that died.
-        child = _spawn(p, bid, marker, lock)
-        m["pid"] = child.pid
-        write_json(marker, m)
-        child.stdin.close()      # the go
+        # A step-budget stop waits until its pid is on the marker: one landing in between would leave
+        # the batch running with no pid finalize can see, and its dropped stdin pipe would give the go.
+        with stepclock.critical():
+            child = _spawn(p, bid, marker, lock)
+            m["pid"] = child.pid
+            write_json(marker, m)
+            child.stdin.close()      # the go
         prev = db.one("SELECT * FROM push_batches WHERE outcome='rebooted' AND id!=? ORDER BY started DESC LIMIT 1",
                       (bid,))
         if prev and _read(Path(prev["marker"])).get("rerun_by") is None:

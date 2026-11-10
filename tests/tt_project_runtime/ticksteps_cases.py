@@ -2356,3 +2356,97 @@ def test_probe_verdicts_cost_the_same_at_1000_and_10000_tasks(env, monkeypatch):
     big = verdict_tick()
     assert big[:3] == small[:3], f"db calls, rows and git spawns per verdict tick grow with history: {small} -> {big}"
     assert big[3] < 1.0, f"one verdict tick took {big[3]:.2f} s at 10,000 tasks"
+
+
+def _stop_now_at(monkeypatch, target, name, match=None):
+    """Make a step-budget stop arrive at `target.name` (after the real call returns), with no real
+    timer: the stop raises there unless a critical() section defers it to just after (stepclock.release)."""
+    from ttp import stepclock
+    real = getattr(target, name)
+
+    def stop_here(*a, **k):
+        out = real(*a, **k)
+        if match is None or match(a):
+            stepclock._on_alarm(signal.SIGALRM, None)
+        return out
+    monkeypatch.setattr(target, name, stop_here)
+
+
+@pytest.mark.parametrize("at", ["spawn", "record"])
+def test_a_step_stop_during_the_runner_spawn_waits_until_the_run_is_recorded(env, monkeypatch, tmp_path, at):
+    """A step-budget stop landing in Popen or between it and the pid record leaves the run running and
+    tracked (pid and runner.pid recorded, not never_started); the stop is re-armed for just after the record."""
+    from ttp import daemon as dmod
+    from ttp import stepclock
+    p = make(env)
+    monkeypatch.setenv("TTP_FAKE_SHELL", "true")
+    d = dmod.Daemon(p.base)
+    tid = p.db.add_task("one", "do it", kind="work", tier="light", origin="user")
+    armed = []
+    monkeypatch.setattr(stepclock, "_arm", armed.append)   # no real SIGALRM: the test places the stop
+    stepclock.install()
+    try:
+        if at == "spawn":
+            real_init = stepclock._orig["init"]
+
+            def init(self, args, *a, **k):
+                real_init(self, args, *a, **k)
+                if "ttp.runner" in args:
+                    stepclock._on_alarm(signal.SIGALRM, None)
+            stepclock._orig["init"] = init
+        else:
+            _stop_now_at(monkeypatch, dmod.runner, "proc_start")
+        stepclock.begin("dispatch", 600, 5)
+        try:
+            rid = d.start_run("worker", "TASK PROMPT", "claude", "light", str(p.root), task=p.db.task(tid))
+            assert not stepclock._s.fired and armed and armed[-1] < 0.01, ("the stop is deferred to just after", armed)
+        finally:
+            stepclock.end()
+    finally:
+        stepclock.uninstall()
+    row = p.db.one("SELECT * FROM runs WHERE id=?", (rid,))
+    assert row["status"] == "running" and row["pid"], dict(row)
+    assert not json.loads(row["note"] or "{}").get("never_started"), row["note"]
+    assert (p.runs / str(rid) / "runner.pid").read_text().split()[0] == str(row["pid"])
+    deadline = time.monotonic() + 30
+    while p.db.one("SELECT status FROM runs WHERE id=?", (rid,))["status"] == "running" \
+            and time.monotonic() < deadline:
+        d.reap_runs()
+        time.sleep(0.05)
+
+
+@pytest.mark.parametrize("at", ["spawn", "record"])
+def test_a_step_stop_during_the_push_batch_spawn_waits_until_its_pid_is_on_the_marker(env, monkeypatch, at):
+    """A step-budget stop landing in the batch's Popen or before its pid is recorded leaves the batch
+    tracked (pid on the marker, in pushq._children) and its go given; the stop is re-armed for just after."""
+    from ttp import push, pushq, stepclock
+    s = _pq(env, monkeypatch, push_batch_s=10 ** 6, push_batch_max=5)
+    _pq_earlier(s)
+    row = _pq_review(s)[1]
+    monkeypatch.setattr(pushq, "batch_argv", lambda marker: [sys.executable, "-c", "import sys; sys.stdin.read()"])
+    armed = []
+    monkeypatch.setattr(stepclock, "_arm", armed.append)   # no real SIGALRM: the test places the stop
+    stepclock.install()
+    try:
+        if at == "spawn":
+            real_init = stepclock._orig["init"]
+
+            def init(self, args, *a, **k):
+                real_init(self, args, *a, **k)
+                if "sys.stdin.read()" in " ".join(map(str, args)):
+                    stepclock._on_alarm(signal.SIGALRM, None)
+            stepclock._orig["init"] = init
+        else:
+            _stop_now_at(monkeypatch, pushq, "renice")
+        stepclock.begin("push_queue", 600, 5)
+        try:
+            bid = pushq.start(s.p, s.p.db.q("SELECT * FROM push_queue WHERE id=?", (row,)), "origin/proj")
+            assert not stepclock._s.fired and armed and armed[-1] < 0.01, ("the stop is deferred to just after", armed)
+        finally:
+            stepclock.end()
+    finally:
+        stepclock.uninstall()
+    m = push._read(s.p.state / push.DETACHED / f"{bid}.json")
+    child = pushq._children.pop(bid)
+    assert m["pid"] == child.pid
+    assert child.wait(timeout=30) == 0, "its go was given"

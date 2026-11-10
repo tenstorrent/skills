@@ -3964,6 +3964,7 @@ class Daemon:
                 log(self.p, f"run {run_id}: its prompt record was not saved: {e}")
         # Raising from here on means nothing was launched: the run row must not stay "running".
         tmp_env: dict = {}
+        spawning = contextlib.ExitStack()   # holds the stop from the runner's spawn to its record
         try:
             redact.private_dir(run_dir)   # owner-only: it holds the run's output and transcript
             if role != "coordinator" and (why := prov.prepare_run(cwd, run_dir)):
@@ -4158,26 +4159,31 @@ class Daemon:
             durable_write(run_dir / "run.json", json.dumps(spec, indent=1))   # read again after a reboot
             if role == "coordinator":
                 self._coord_snapshot(run_dir, wake_guard=not prov.tool_hooks)
+            # A step-budget stop waits from the spawn until the supervisor is recorded: one landing in
+            # between would mark a started run never_started and leave its runner untracked.
+            spawning.enter_context(stepclock.critical())
             with open(run_dir / "runner.log", "wb") as out:
                 proc = subprocess.Popen([sys.executable, "-m", "ttp.runner", str(run_dir)], cwd=runtime_dir,
                                         env={**os.environ, "PYTHONPATH": runtime_dir}, stdout=out, stderr=out,
                                         stdin=subprocess.DEVNULL, start_new_session=True)
         except BaseException:   # marked never_started: the coordinator's repeated-failures count tells it apart
-            db.x("UPDATE runs SET status='failed', ended=?, note=? WHERE id=?",
-                 (time.time(), json.dumps({**(note or {}), "never_started": True}), run_id))
-            runner.remove_files(private)
-            shorttmp.remove(tmp_env.get("TMPDIR"))
-            cursorhook.undo(run_dir)
+            with spawning:
+                db.x("UPDATE runs SET status='failed', ended=?, note=? WHERE id=?",
+                     (time.time(), json.dumps({**(note or {}), "never_started": True}), run_id))
+                runner.remove_files(private)
+                shorttmp.remove(tmp_env.get("TMPDIR"))
+                cursorhook.undo(run_dir)
             raise
-        try:
-            # Its start beside its pid, as child.pid has it: a pid reused later is not this supervisor.
-            durable_write(run_dir / "runner.pid", f"{proc.pid}\n{runner.proc_start(proc.pid) or ''}\n")
-        except OSError as e:
-            log(self.p, f"run {run_id}: could not record its supervisor's start: {e}")
-        try:
-            db.x("UPDATE runs SET pid=?, dir=? WHERE id=?", (proc.pid, str(run_dir), run_id))
-        except Exception as e:   # launched all the same: the reaper finds it by its run id's directory
-            log(self.p, f"run {run_id} started but its pid was not recorded: {e}")
+        with spawning:
+            try:
+                # Its start beside its pid, as child.pid has it: a pid reused later is not this supervisor.
+                durable_write(run_dir / "runner.pid", f"{proc.pid}\n{runner.proc_start(proc.pid) or ''}\n")
+            except OSError as e:
+                log(self.p, f"run {run_id}: could not record its supervisor's start: {e}")
+            try:
+                db.x("UPDATE runs SET pid=?, dir=? WHERE id=?", (proc.pid, str(run_dir), run_id))
+            except Exception as e:   # launched all the same: the reaper finds it by its run id's directory
+                log(self.p, f"run {run_id} started but its pid was not recorded: {e}")
         if cache_fp is not None and cache_ttl == "1h":
             try:   # the 1h entries this turn writes are what a later turn within cache_warm_min reads
                 db.set_kv(cachettl.KEY, cachettl.record(db.kv(cachettl.KEY), cache_fp))
@@ -17077,12 +17083,14 @@ class Daemon:
         # disposable on_pass output folder.
         env = self._on_pass_env(tid)
         env.update(TTP_NOTE_RUN_DIR=str(r["dir"]), TTP_RESULT=str(out / RESULT_FILE))
-        with open(out / ON_PASS_LOG, "wb") as f:
-            proc = subprocess.Popen(cmd, shell=True, cwd=str(self.p.root), stdin=subprocess.DEVNULL, stdout=f,
-                                    stderr=subprocess.STDOUT, start_new_session=True,
-                                    env=env)
-        where = f"HOME={env.get('HOME', '(unset)')}, cwd={self.p.root}"
-        self._on_pass[tid] = (proc, now, timeout, out, r["id"], cmd, where, said, fallback)
+        # A step-budget stop waits until the command is tracked: else the next tick would start it twice.
+        with stepclock.critical():
+            with open(out / ON_PASS_LOG, "wb") as f:
+                proc = subprocess.Popen(cmd, shell=True, cwd=str(self.p.root), stdin=subprocess.DEVNULL, stdout=f,
+                                        stderr=subprocess.STDOUT, start_new_session=True,
+                                        env=env)
+            where = f"HOME={env.get('HOME', '(unset)')}, cwd={self.p.root}"
+            self._on_pass[tid] = (proc, now, timeout, out, r["id"], cmd, where, said, fallback)
         # Asleep while it runs: its timer must not start a model run meanwhile.
         self.p.db.update_task(tid, not_before=max(task["not_before"] or 0, now + timeout + PROBE_TIMEOUT_S),
                               blocked_reason=f"its {said}; running its on_pass_cmd model-free "
