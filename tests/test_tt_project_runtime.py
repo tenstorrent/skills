@@ -493,6 +493,7 @@ def env(tmp_path, monkeypatch, _git_session, _short_tmp):
     monkeypatch.setenv("TTP_TEST_WORKER_CONTEXT", "off")   # worker prompts carry no coordinator context (ctxfork_cases tests it)
     monkeypatch.setenv("TTP_TEST_NO_MCP_PROBE", "1")   # daemons never run the real `claude mcp list` (mcpgap.py)
     monkeypatch.setenv("TTP_TEST_NO_MODELS_PROBE", "1")   # nor the routed endpoint's /models check (route.py)
+    monkeypatch.setenv("TTP_TEST_NO_REFRESH", "1")    # upgrade never runs a real `ttp setup` of the checkout first
     monkeypatch.setenv("TTP_TEST_NO_NOTIFIER", "1")   # setup, upgrade and status never restart or test the account's own notifier
     monkeypatch.setenv("TTP_TEST_NO_SSH_CHECK", "1")   # `ttp machines add` never asks this host's own ssh config
     monkeypatch.setenv("TTP_TEST_NO_JOURNAL", "1")   # a reboot record never reads this host's own journal (initiator.py)

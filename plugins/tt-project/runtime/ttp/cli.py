@@ -11615,6 +11615,10 @@ def cmd_setup(a) -> None:
         from .release import point_current
         point_current(lib)       # in one step: a `ttp` starting meanwhile finds the old release or this one
         jr.unlink(missing_ok=True)
+        if RUNTIME.resolve() != (lib / "runtime").resolve():
+            # `ttp upgrade` compares the stable copy against this folder, so a newer pull there is not missed
+            from .release import SETUP_SOURCE
+            durable_write(HOME_DIR / "lib" / SETUP_SOURCE, str(PLUGIN_ROOT.resolve()) + "\n", sync=False)
     finally:
         os.close(lock)
     bindir = Path(a.bin_dir).expanduser()
@@ -11824,6 +11828,48 @@ def _recover_setup_from(rec: dict) -> str:
     return what
 
 
+UPGRADE_REFRESHED = "TTP_UPGRADE_REFRESHED"    # set on the upgrade a refresh re-ran: it never refreshes twice
+REFRESH_SETUP_TIMEOUT_S = 900
+
+
+def _refresh_stable_copy(name: str) -> None:
+    """`ttp upgrade` merges the stable copy's template (~/.tt-project/lib/current), so first bring that copy up
+    to the newest release on this host: the checkout the last `ttp setup` used or Claude Code's plugin cache.
+    It runs that release's `ttp setup` and re-runs this upgrade on the result; when it cannot, it says the
+    stable copy is older and names the command that refreshes it."""
+    from . import release
+    if os.environ.get("TTP_TEST_NO_REFRESH"):   # tests that never run a real setup of the checkout
+        return
+    cur = release.installed()
+    have = release.runtime_version(cur / "runtime")
+    if have == "unknown":      # nothing installed to refresh: the upgrade says so itself
+        return
+    also = (PLUGIN_ROOT,) if (PLUGIN_ROOT / "template").is_dir() else ()
+    best = release.newest_source(also=also)
+    if not best or not release.is_newer(best[0], have) or release.forced_version() == have:
+        return      # up to date, or a deliberate `ttp setup --force` downgrade stays as it is
+    v, root = best
+    cmd = f"{shlex.quote(str(root / 'bin' / 'ttp'))} setup"
+    why = ""
+    if os.environ.get(UPGRADE_REFRESHED):
+        why = "the refresh did not take"
+    else:
+        print(f"the stable ttp at {cur} is {have}, older than {v} at {root}: installing {v} first ({cmd})",
+              flush=True)
+        try:
+            r = subprocess.run([sys.executable, str(root / "bin" / "ttp"), "setup"],
+                               timeout=REFRESH_SETUP_TIMEOUT_S)
+            why = f"`{cmd}` exited {r.returncode}" if r.returncode else ""
+        except (OSError, subprocess.TimeoutExpired) as e:
+            why = f"`{cmd}` failed ({e})"
+        if not why and release.runtime_version(cur / "runtime") == v:
+            os.execve(sys.executable, [sys.executable, str(cur / "bin" / "ttp"), *sys.argv[1:]],
+                      {**os.environ, UPGRADE_REFRESHED: "1"})
+        why = why or f"`{cmd}` left the stable copy at {release.runtime_version(cur / 'runtime')}"
+    print(f"warning: the stable ttp at {cur} is {have}, older than {v} at {root} ({why}); this upgrade "
+          f"merges {have}. Refresh it with `{cmd}`, then rerun `ttp upgrade {name}`", file=sys.stderr)
+
+
 def cmd_upgrade(a) -> None:
     """Merge the installed template into a project's harness. The harness repo keeps pristine
     template snapshots on its `upstream` branch, so this is an ordinary three-way merge. `--auto` is
@@ -11848,6 +11894,8 @@ def cmd_upgrade(a) -> None:
             print(mm.push(entry.get("ssh") or entry["host"]))
             sys.exit(forward(entry, sys.argv[1:]))
         p = need(a.name, sys.argv[1:])
+    if not a.auto and a.apply is None:
+        _refresh_stable_copy(p.name)
     _cycle_hold(cyclenotice_paths(p), a, p, auto_rec=p if a.auto else None)
     from . import notifier
     for ln in notifier.refresh(send_test=not a.auto):   # this machine's notifier on the installed code too
