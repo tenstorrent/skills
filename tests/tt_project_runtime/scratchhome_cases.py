@@ -128,6 +128,54 @@ def test_checks_home_files_refuses_credentials_ssh_gh_and_paths_outside_home(tmp
     assert _home_marks(Path(got["HOME"])) == sorted([".config", ".gitconfig", ".local", ".local/share", ".local/state"])
 
 
+def test_a_check_in_the_scratch_home_reuses_the_real_tool_cache(env, tmp_path, monkeypatch):
+    # $HOME/.cache in a check's scratch HOME is the cache in force (the real HOME's .cache, or
+    # XDG_CACHE_HOME where set), so pip, uv or plugin caches are not rebuilt each run; a cache holding a
+    # credential store is never linked; removing the run's folder leaves the cache; scratch_home false: real HOME.
+    from ttp import checkdirs, cli, scratchhome
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    home = _real_home(tmp_path, monkeypatch)
+    secret = next(home.glob(".git-cred*"))
+    (home / ".cache" / "pip").mkdir(parents=True)
+    (home / ".cache" / "pip" / "wheel").write_text("warm\n")
+    out = tmp_path / "out"
+    probe = (f'printf "%s\\n%s\\n" "$HOME" "$XDG_CACHE_HOME" > {out} && cat "$HOME"/.cache/pip/wheel >> {out} && '
+             f'echo new > "$HOME"/.cache/pip/more && readlink -f "$HOME"/.cache >> {out}')
+    cli.main(["checks", "--", "sh", "-c", probe])
+    scratch, cache, warm, real = out.read_text().splitlines()
+    assert scratch == f"{scratchhome.own_folder()}/home" and cache == str(home / ".cache") and warm == "warm"
+    assert real == os.path.realpath(home / ".cache") and (home / ".cache" / "pip" / "more").read_text() == "new\n"
+    # XDG_CACHE_HOME set: that cache is linked in, the real HOME's is left alone
+    xdg = tmp_path / "xdgcache"
+    xdg.mkdir()
+    got = scratchhome.apply({"HOME": str(home), "XDG_CACHE_HOME": str(xdg)}, tmp_path / "run1", [])
+    assert os.path.realpath(Path(got["HOME"]) / ".cache") == os.path.realpath(xdg) and got["XDG_CACHE_HOME"] == str(xdg)
+    # a cache that holds or is a credential store is refused: nothing linked, the shared checks cache instead
+    for i, bad in enumerate((home, secret, "relative/cache")):   # holds one (also by a link), is one, not absolute
+        got = scratchhome.apply({"HOME": str(home), "XDG_CACHE_HOME": str(bad)}, tmp_path / f"run{i}", [".gitconfig"])
+        assert not (Path(got["HOME"]) / ".cache").is_symlink() and got["XDG_CACHE_HOME"] == str(bad)
+    (tmp_path / "homelink").symlink_to(home)
+    (home / ".cache").rename(tmp_path / "cache-aside")
+    (home / ".cache").symlink_to(tmp_path / "homelink")
+    got = scratchhome.apply({"HOME": str(home)}, tmp_path / "run9", [])
+    assert not (Path(got["HOME"]) / ".cache").is_symlink() and got["XDG_CACHE_HOME"] == str(scratchhome.cache_dir())
+    (home / ".cache").unlink()
+    (tmp_path / "cache-aside").rename(home / ".cache")
+    # removing a run's folder unlinks the link and never empties the cache it points to
+    run4 = tmp_path / "run4"
+    got = scratchhome.apply({"HOME": str(home)}, run4, [])
+    assert (Path(got["HOME"]) / ".cache").is_symlink()
+    parent = os.open(tmp_path, os.O_RDONLY)
+    try:
+        checkdirs._remove(parent, "run4")
+    finally:
+        os.close(parent)
+    assert not run4.exists() and (home / ".cache" / "pip" / "wheel").read_text() == "warm\n"
+    p.set_config("checks.scratch_home", False)
+    cli.main(["checks", "--", "sh", "-c", f'printf "%s" "$HOME" > {out}'])
+    assert out.read_text() == str(home)
+
+
 def test_a_spilled_check_runs_in_a_scratch_home_in_its_run_folder_there(tmp_path):
     # (d) on the other host: HOME in the run's folder there (removed with it), that host's own
     # .gitconfig copied in, nothing shipped from here, its real HOME unchanged; without the setting, as before.
@@ -147,5 +195,14 @@ def test_a_spilled_check_runs_in_a_scratch_home_in_its_run_folder_there(tmp_path
     assert "x" in seen and "y" in seen and "\tname = There" in seen and ".netrc" not in seen
     assert seen[2].startswith(str(rhome))   # the shared cache stays on the host's real HOME
     assert _home_marks(rhome) == before and _rc_left(tmp_path) == []
+    # that host's own .cache is linked in as the scratch HOME's (scratchhome.cache_link), and outlives the run
+    (rhome / ".cache").mkdir()
+    (rhome / ".cache" / "w").write_text("warm\n")
+    rc, said = _rc_run(tmp_path, repo, f'printf "%s\\n" "$XDG_CACHE_HOME" > {out} && cat "$HOME"/.cache/w >> {out} && '
+                       f'readlink "$HOME"/.cache >> {out}', HOME=str(rhome), XDG_CACHE_HOME="", TTP_HOME="",
+                       **{scratchhome.FILES_ENV: files})
+    assert rc == 0, said
+    assert out.read_text().splitlines() == [str(rhome / ".cache"), "warm", str(rhome / ".cache")]
+    assert (rhome / ".cache" / "w").exists() and _rc_left(tmp_path) == []
     rc, said = _rc_run(tmp_path, repo, f'printf "%s" "$HOME" > {out}', HOME=str(rhome))
     assert rc == 0 and out.read_text() == str(rhome), said

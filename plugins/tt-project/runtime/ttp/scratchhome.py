@@ -6,8 +6,12 @@ or spill host, so a project's tests never read or write the account's own home f
 With checks.scratch_home on (the default), a check runs with HOME in a fresh folder of its run, which
 goes with it: here inside the run's managed scratch (checkdirs), on another host inside the run's
 folder there (remote_lines), else (no managed scratch) in one of the process's own (own_folder). XDG_CONFIG_HOME, XDG_DATA_HOME and XDG_STATE_HOME are inside it.
-XDG_CACHE_HOME (and so pip's cache) stays where it was set, else a cache folder shared by every
-check run (TTP_HOME/checks-cache), so runs stay fast. Toolchains that find themselves under HOME
+The cache in force (XDG_CACHE_HOME where set, else the real HOME's .cache) is linked in as the
+scratch HOME's .cache, and XDG_CACHE_HOME names it, so tools that write under $HOME/.cache (pip,
+uv, pre-commit, plugin caches) reuse it and runs stay as fast as with the real HOME (cache_link). With
+no such cache, or one holding a credential store, nothing is linked and XDG_CACHE_HOME stays where it
+was set, else a cache folder shared by every check run (TTP_HOME/checks-cache). Removing the run's
+folder only unlinks the link (checkdirs, rm -rf), never what it points to. Toolchains that find themselves under HOME
 (KEEP: rustup, cargo, pyenv, go, nvm, the Hugging Face cache) keep their real folder where it exists
 and their variable is unset, and TTP_HOME stays the harness's own.
 
@@ -82,6 +86,16 @@ def cache_dir() -> Path:
     return project.HOME_DIR / "checks-cache"
 
 
+def cache_link(env: dict, real: Path) -> Path | None:
+    """The cache a scratch HOME's .cache links to: `env`'s XDG_CACHE_HOME where set, else `real`'s
+    .cache; None where that is no folder, or it is or holds a credential store (credguard)."""
+    from . import credguard
+    cache = Path(env.get("XDG_CACHE_HOME") or real / ".cache")
+    if not cache.is_absolute() or not cache.is_dir() or credguard.read_refusal(str(cache), search=True, home=real):
+        return None
+    return cache
+
+
 def apply(env: dict, folder: str | Path, files: list[str]) -> dict:
     """`env` with a HOME made in `folder` (FOLDER inside it), `files` copied in from the real
     HOME (missing ones skipped; a refused one never), and the variables the module docstring names."""
@@ -97,6 +111,13 @@ def apply(env: dict, folder: str | Path, files: list[str]) -> dict:
         if refusal(f, real) is None and src.is_file():
             (home / f).parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(src, home / f)
+    link = home / ".cache"
+    if link.is_symlink():
+        link.unlink()   # a later call on the same folder links the cache in force now, or none
+    if cache := cache_link(env, real):
+        if not link.exists():
+            link.symlink_to(cache, target_is_directory=True)
+            out["XDG_CACHE_HOME"] = str(cache)
     out.setdefault("XDG_CACHE_HOME", str(cache_dir()))
     for var, rel in KEEP.items():
         if not env.get(var) and (real / rel).exists():
@@ -120,7 +141,11 @@ def remote_lines(where: str, fail: str = "exit 1") -> str:
     out = (f'ttp_real_home="$HOME"\nttp_home=$(mktemp -d "$PWD"/{w}/{FOLDER}.XXXXXXXX) || '
            f"{{ echo 'ttp: no scratch HOME could be made on this host; the check did not run' >&2; {fail}; }}\n"
            'export TTP_HOME="${TTP_HOME:-$ttp_real_home/.tt-project}"\n'
-           'export XDG_CACHE_HOME="${XDG_CACHE_HOME:-$TTP_HOME/checks-cache}"\n')
+           # the cache in force linked in as .cache (cache_link), else the shared checks cache
+           'if [ -n "${XDG_CACHE_HOME:-}" ] && [ -d "$XDG_CACHE_HOME" ]; then ln -s "$XDG_CACHE_HOME" "$ttp_home"/.cache\n'
+           'elif [ -z "${XDG_CACHE_HOME:-}" ] && [ -d "$ttp_real_home"/.cache ]; then '
+           'export XDG_CACHE_HOME="$ttp_real_home"/.cache && ln -s "$XDG_CACHE_HOME" "$ttp_home"/.cache\n'
+           'else export XDG_CACHE_HOME="${XDG_CACHE_HOME:-$TTP_HOME/checks-cache}"; fi\n')
     for var, rel in KEEP.items():
         out += f'[ -z "${{{var}:-}}" ] && [ -e "$ttp_real_home"/{shlex.quote(rel)} ] && export {var}="$ttp_real_home"/{shlex.quote(rel)}\n'
     for f in files:
