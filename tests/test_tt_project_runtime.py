@@ -497,9 +497,7 @@ def env(tmp_path, monkeypatch, _git_session, _short_tmp):
     monkeypatch.setenv("TTP_TEST_NO_JOURNAL", "1")   # a reboot record never reads this host's own journal (initiator.py)
     monkeypatch.setenv("TTP_TEST_WTMP", str(tmp_path / "no-wtmp"))   # nor its own wtmp (shutrec.py)
     monkeypatch.setenv("TTP_TEST_CYCLE_NOTICES", str(tmp_path / "no-cycle-notice.json"))   # never the real /run notice (cyclenotice.py)
-    from ttp import hostcpu, probespawn
-    monkeypatch.setattr(hostcpu, "MEMINFO", tmp_path / "no-meminfo")   # memory reads as unknown: never this host's own
-    monkeypatch.setattr(hostcpu, "mach_mem_free", lambda: None)   # (hostcpu_cases set it)
+    from ttp import probespawn
     monkeypatch.setattr(probespawn, "_timeouts", {})   # a probe's timeouts in a row never carry over from another test
     from ttp import gitcache, statcache
     gitcache.clear()   # git and file answers kept by one test never answer another's (fakes, reused paths)
@@ -530,6 +528,9 @@ def env(tmp_path, monkeypatch, _git_session, _short_tmp):
     sys.path.insert(0, str(RUNTIME))
     for mod in [m for m in list(sys.modules) if m == "ttp" or m.startswith("ttp.")]:
         del sys.modules[mod]
+    from ttp import hostcpu   # the fresh module tests import
+    monkeypatch.setattr(hostcpu, "MEMINFO", tmp_path / "no-meminfo")   # memory reads as unknown: never this host's own
+    monkeypatch.setattr(hostcpu, "mach_mem_free", lambda: None)   # (memory tests set it)
     monkeypatch.setattr(importlib.machinery.SourceFileLoader, "get_code",
                         _cached_get_code(importlib.machinery.SourceFileLoader.get_code))
     monkeypatch.setattr(gettext, "find", _cached_find(gettext.find))
