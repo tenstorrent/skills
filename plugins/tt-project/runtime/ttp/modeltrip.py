@@ -96,12 +96,20 @@ def samples(p, cfg: dict, since: float, until: float) -> dict[int, dict]:
             rec = None
         s["bad"] |= isinstance(rec, dict) and rec.get("passed") is False
     out = {i: s for i, s in out.items() if s}
+    mark_bad(db, out, since)
+    return out
+
+
+def mark_bad(db, out: dict[int, dict], since: float) -> None:
+    """Mark each sample of `out` (task id: sample) bad that a review since `since` failed (review_failed) or
+    that got rework (a review fix or a continuation of it: rework)."""
+    from .effortab import FAILED_REVIEWS
     if not out:
-        return out
+        return
     for rv in db.q("SELECT t.labels, t.title, s.outcome FROM review_stats s JOIN tasks t ON t.id=s.task WHERE s.ts>=?",
                    (since,)):
         if rv["outcome"] in FAILED_REVIEWS and (i := review_subject(dict(rv))) in out:
-            out[i]["bad"] = True
+            out[i]["bad"] = out[i]["review_failed"] = True
     for t in db.q("SELECT id, kind, title, labels, parent FROM tasks WHERE created>=? AND kind!='review'", (since,)):
         t = dict(t)
         i = chaincap.prev_of(t)
@@ -110,8 +118,7 @@ def samples(p, cfg: dict, since: float, until: float) -> dict[int, dict]:
             rv = db.task(int(fix[11:])) if fix[11:].isdigit() else None
             i = review_subject(rv) if rv else None
         if i in out and i != t["id"]:
-            out[i]["bad"] = True
-    return out
+            out[i]["bad"] = out[i]["rework"] = True
 
 
 def check(p, cfg: dict, now: float | None = None) -> list[dict]:

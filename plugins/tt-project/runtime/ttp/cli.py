@@ -8101,6 +8101,14 @@ def cmd_model_bench(a) -> None:
     """`ttp model-bench run|show`: the host's shared daily chat model bench (modelbench.py)."""
     import time as _t
     from . import modelbench, modelrank
+    if a.action == "scores":   # this project's live rows now, with every other project's kept ones
+        from . import modelscore
+        p = here()
+        if p:
+            modelscore.record(p.name, modelscore.live_rows(p, _t.time()), _t.time())
+        got = modelscore.build(modelrank.served(p.state, _t.time()) if p else None)
+        print(json.dumps(got, indent=1) if a.json else modelscore.text(got))
+        return
     if a.action == "show":
         print(json.dumps({"owner": json.loads((modelbench.home() / modelbench.OWNER).read_text())
                           if (modelbench.home() / modelbench.OWNER).exists() else {},
@@ -14315,9 +14323,11 @@ def main(argv: list[str] | None = None) -> None:
                                             "models once per host and day (a second run does nothing; the "
                                             "daemon runs it daily), `show` prints the owner, latest result and "
                                             "per-model scores")
-    s.add_argument("action", choices=["run", "show"], help="run: bench the served models (once per host and day); "
-                                                            "show: print the owner, latest result and per-model scores")
+    s.add_argument("action", choices=["run", "show", "scores"],
+                   help="run: bench the served models (once per host and day); show: print the owner, latest "
+                        "result and per-model scores; scores: the model scoreboard's per-class rankings")
     s.add_argument("--force", action="store_true", help="run: bench again though today's result exists")
+    s.add_argument("--json", action="store_true", help="scores: print the board as JSON")
     s.set_defaults(fn=cmd_model_bench)
 
     s = sub.add_parser("ack-wait", help="wait model-free for another project's reply to a `ttp note --to`: probe "

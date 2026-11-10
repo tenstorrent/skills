@@ -2934,6 +2934,130 @@ def test_the_ranking_refresh_logs_each_change_and_a_failed_fetch_keeps_the_last(
     assert project.account_value(rankfresh.KEY) == ["rank-b", "rank-a", "odd-one"]
 
 
+# The model scoreboard (modelscore.py): fake models, live rows from a fake project db, never the network.
+def _score_row(n, good, wall=None, out_tokens=0, tok_wall_s=0.0):
+    from ttp import modelscore
+    return {**dict.fromkeys(modelscore.COUNTS, 0), "n": n, "good": good, "first_done": good, "runs": n,
+            "out_tokens": out_tokens, "tok_wall_s": tok_wall_s, "wall_med_s": wall}
+
+
+def test_the_scoreboard_weighs_live_results_against_the_bench_by_sample_count(env, monkeypatch):
+    from ttp import modelscore
+    _rank_home(env, monkeypatch)
+    benched = {"m-a": {"scores": {"*": {"cells": (1.0, 90.0)}}}}
+    few = modelscore.board({"m-a": {"standard": _score_row(2, 0)}}, benched, {}, ["m-a"])["m-a"]["standard"]
+    many = modelscore.board({"m-a": {"standard": _score_row(200, 0)}}, benched, {}, ["m-a"])["m-a"]["standard"]
+    assert few["quality"] == round(90 * 10 / 12, 2) and many["quality"] == round(90 * 10 / 210, 2)
+    assert few["bench"] == 90.0 and few["n"] == 2
+    # The index prior counts only for a model with no bench; with neither, live alone; with nothing, unscored.
+    bd = modelscore.board({"m-c": {"light": _score_row(5, 5)}}, benched, {"m-a": 10.0, "m-b": 40.0},
+                          ["m-a", "m-b", "m-c", "m-d"])
+    assert bd["m-a"]["light"]["quality"] == 90.0 and bd["m-b"]["light"]["quality"] == 40.0
+    assert bd["m-c"]["light"]["quality"] == 100.0 and bd["m-d"]["light"]["quality"] is None
+
+
+def test_fast_takes_the_fastest_model_within_the_margin_and_above_the_floor(env, monkeypatch):
+    from ttp import modelscore
+    _rank_home(env, monkeypatch)
+    q = {"best": 80.0, "near": 76.0, "far": 70.0}
+    wall = {"best": 300.0, "near": 100.0, "far": 10.0}
+    bd = {m: {c: {"quality": q[m], "wall_s": wall[m], "tok_s": None} for c in modelscore.CLASSES} for m in q}
+    bd["new"] = {c: {"quality": None, "wall_s": None, "tok_s": None} for c in modelscore.CLASSES}
+    assert modelscore.order(bd, "light", "smart", known=["new"]) == ["best", "near", "far", "new"]
+    assert modelscore.order(bd, "light", "fast", known=["new"]) == ["near", "best", "far", "new"]
+    assert modelscore.order(bd, "light", "fast", margin=2.0) == ["best", "near", "far", "new"]
+    assert modelscore.order(bd, "light", "fast", margin=50.0, floor=75.0) == ["near", "best", "far", "new"]
+    # auto: fast for babysit, smart elsewhere; a class's own prefer wins.
+    assert modelscore.prefs("light", {})["prefer"] == "auto"
+    assert modelscore.prefs("light", {"light": {"prefer": "fast", "margin_pts": 3, "floor": -1}}) == {
+        "prefer": "fast", "margin_pts": 3.0, "floor": modelscore.FLOOR}
+
+
+def test_a_new_higher_scoring_model_tops_the_rankings_and_model_ranking_stays_the_standard_class(env, monkeypatch):
+    from ttp import modelrank, modelscore, project, rankfresh
+    home = _rank_home(env, monkeypatch)
+    project.set_account_setting(rankfresh.KEY, ["m-old", "m-two"])
+    d = home / "model-bench"
+    d.mkdir(parents=True)
+    (d / "2026-01-01.json").write_text(json.dumps({"at": 1.0, "results": {
+        "m-old": {"score": 0.5, "cells": {"inject": True}}, "m-two": {"score": 0.6, "cells": {"inject": True}},
+        "m-off": {"score": 1.0, "inconclusive": True}}}))
+    res = modelscore.publish(["m-old", "m-two"], 1000.0)
+    assert res["changed"] and res["new"] == ["m-two", "m-old"] and modelrank.ranking({}) == ["m-two", "m-old"]
+    cls = project.account_value(modelscore.KEY)
+    assert set(cls) == set(modelscore.CLASSES) and cls["standard"] == ["m-two", "m-old"]
+    # A newly served model with a better bench (a jsonl suite) becomes every class's first.
+    (d / "extra.jsonl").write_text(json.dumps({"model": "m-new", "score": 95, "suite": "extra", "at": 2.0}) + "\n")
+    res = modelscore.publish(["m-old", "m-two", "m-new"], 2000.0)
+    assert res["new"][0] == "m-new" and modelrank.ranking({})[0] == "m-new"
+    assert all(v[0] == "m-new" for v in project.account_value(modelscore.KEY).values())
+    log = [json.loads(x) for x in (home / rankfresh.LOG).read_text().splitlines()]
+    assert [r["new"][0] for r in log] == ["m-two", "m-new"]
+    # The same inputs again change nothing; the index refresh no longer writes model_ranking but keeps its scores.
+    assert not modelscore.publish(["m-old", "m-two", "m-new"], 3000.0)["changed"]
+    rankfresh.refresh(["m-old"], "weekly", 1e8, "k", lambda u, k: _fake_index(("m-old", 99)))
+    assert modelrank.ranking({})[0] == "m-new" and rankfresh.read_state()["scores"] == {"m-old": 99}
+    assert modelscore.fast_order("light")[0] == "m-new"
+
+
+def test_a_failed_injection_bench_bars_a_model_from_babysit(env, monkeypatch):
+    from ttp import modelscore
+    home = _rank_home(env, monkeypatch)
+    d = home / "model-bench"
+    d.mkdir(parents=True)
+    (d / "2026-01-01.json").write_text(json.dumps({"at": 1.0, "results": {
+        "m-leaky": {"score": 1.0, "cells": {"inject": False}}, "m-safe": {"score": 0.5, "cells": {"inject": True}}}}))
+    got = modelscore.build(["m-leaky", "m-safe"], {})
+    assert got["barred"] == ["m-leaky"] and got["ranking"]["babysit"] == ["m-safe"]
+    assert got["ranking"]["standard"] == ["m-leaky", "m-safe"]
+    # A later passing row frees it.
+    (d / "re.jsonl").write_text(json.dumps({"model": "m-leaky", "inject_ok": True, "at": 2.0}) + "\n")
+    assert modelscore.build(["m-leaky", "m-safe"], {})["barred"] == []
+
+
+def test_the_scoreboard_merges_each_projects_rows_and_drops_stale_projects(env, monkeypatch):
+    from ttp import modelscore
+    _rank_home(env, monkeypatch)
+    now = 100 * 86400.0
+    modelscore.record("one", {"m": {"light": _score_row(4, 3, wall=100.0)}}, now - modelscore.DAYS * 86400 - 1)
+    modelscore.record("two", {"m": {"light": _score_row(2, 1, wall=10.0)}}, now)
+    modelscore.record("three", {"m": {"light": _score_row(6, 6, wall=50.0)}}, now)
+    data = json.loads((modelscore._home() / modelscore.FILE).read_text())
+    assert set(data["projects"]) == {"two", "three"}
+    row = modelscore.merged(data)["m"]["light"]
+    assert (row["n"], row["good"], row["wall_med_s"]) == (8, 7, round((10 * 2 + 50 * 6) / 8, 1))
+
+
+def test_live_rows_count_a_tasks_first_chat_run_and_skip_endpoint_faults(env, monkeypatch):
+    from ttp import modelscore, route
+    _rank_home(env, monkeypatch)
+    p = make(env)
+    now = 10_000_000.0
+
+    def run(tid, model, status, fell="none", started=None, tier="light", tokens=0):
+        t0 = started or now - 3600
+        p.db.x("INSERT INTO runs(task,role,provider,model,status,started,ended,output_tokens,note) "
+               "VALUES(?,'worker','chat',?,?,?,?,?,?)",
+               (tid, model, status, t0, t0 + 100, tokens, json.dumps({route.KEY: {"tier": tier, "fallback": fell}})))
+    a = p.db.add_task("a", kind="code", tier="light", status="done")
+    run(a, "m-good", "ok", tokens=5000)
+    b = p.db.add_task("b", kind="code", tier="light", status="done")
+    run(b, "m-bad", "fallback", fell="auth")        # the endpoint's fault: no sample
+    run(b, "m-bad", "fallback", fell="no_handoff")  # the model's own: its sample, not first-try done
+    run(b, "m-good", "ok")
+    c = p.db.add_task("c", kind="review", status="failed")
+    run(c, "m-good", "ok", tier="standard")
+    run(p.db.add_task("old", status="done"), "m-good", "ok", started=now - 30 * 86400)
+    rows = modelscore.live_rows(p, now)
+    g, bad = rows["m-good"]["light"], rows["m-bad"]["light"]
+    assert (g["n"], g["first_done"], g["good"], g["runs"]) == (1, 1, 1, 2)
+    assert g["out_tokens"] == 5000 and g["tok_wall_s"] == 100.0 and g["wall_med_s"] == 100.0
+    assert (bad["n"], bad["first_done"], bad["runs"], bad["fallback"], bad["no_handoff"]) == (1, 0, 2, 2, 1)
+    r = rows["m-good"]["review"]
+    assert (r["n"], r["failed"], r["bad"], r["good"]) == (1, 1, 1, 0)
+    assert modelscore.class_of("review", "light") == "review" and modelscore.class_of("code", None) == "standard"
+
+
 def test_a_newly_served_model_refreshes_the_ranking_through_the_daemon(env, monkeypatch):
     """The served-models check lists a new model: the daemon refreshes at once; no key, one user-only item."""
     from ttp import alerts, modelrank, rankfresh, route

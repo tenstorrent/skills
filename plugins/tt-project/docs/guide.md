@@ -238,9 +238,10 @@ coordinator with that evidence.
 - These keys (and `budget.push_spend_to`) are account-level: `ttp config --account KEY VALUE` writes them to
   `~/.tt-project/settings.json` (mode 0600), which every project on the machine reads under its own
   `project.json` (a project may still override a key, except `budget.push_spend_to`, which is read
-  from the account settings only). Four `providers.chat` keys are account-level too, read by their
-  own code rather than merged into each project's settings: `model_ranking`, `ranking_source`,
-  `ranking_every_s` and `ranking_key_file` (see the chat provider's model ranking below).
+  from the account settings only). Six `providers.chat` keys are account-level too, read by their
+  own code rather than merged into each project's settings: `model_ranking`, `class_ranking`,
+  `class_prefs`, `ranking_source`, `ranking_every_s` and `ranking_key_file` (see the chat provider's
+  model ranking and model scoreboard below).
   `ttp config --account KEY` reads one; an
   empty value removes it. The same holds for a project's own keys: `ttp config <name> KEY ''` removes KEY
   from `project.json`, so its default applies again (it prints the value it removed and records the removal
@@ -1361,6 +1362,30 @@ Messages calls into `<base url>/chat/completions` calls and back, and ends with 
    under two thirds or that a project parked. A weak score keeps a model parked; a parked model that
    passes is free again at once. With no working key for the endpoint no model is called: the day is
    recorded as skipped and one low alert is posted per outage.
+   A model-free scoreboard (`ttp model-bench scores [--json]`, `runtime/ttp/modelscore.py`) ranks the
+   chat models per task class: `babysit`, `light`, `standard` and `review` (review tasks; else the
+   light tier is `light` and the rest `standard`). Every project whose `chat` provider has an endpoint
+   writes its own live rows hourly into the account file `~/.tt-project/model-scores.json` (merged
+   under a lock; a project not seen for 14 days drops out), from its chat worker runs of the last 14
+   days. Per model and class a row counts the ended tasks whose first chat run the model had (a run an
+   endpoint fault ended counts for nobody), the first-try done ones (handed off with no fallback), the
+   bad ones by the same rules as the model tripwire (failed, checks failed, review failed, reworked),
+   the runs' fallback, no-hand-off and salvaged ends, the median wall time per task and the output
+   tokens per second. A model's quality is its bench score (the daily bench's conclusive results and
+   any `~/.tt-project/model-bench/*.jsonl` rows `{"model", "score" (0-1 or 0-100), "suite", "class",
+   "inject_ok", "at"}`, the latest per suite, averaged), else the Artificial Analysis index score as a
+   prior, blended with its live good share, which weighs n / (n + 10) for n samples
+   (`providers.chat.class_prefs.live_k`); with neither, live alone. Each class's order follows
+   `providers.chat.class_prefs.<class>.prefer`: `smart` (highest quality first), `fast` (the fastest
+   model, by median wall time then tokens per second, within `margin_pts`, default 5, of the best and
+   at or above the class `floor`, default 0) or `auto` (the default: fast for `babysit`, smart
+   elsewhere). Unscored models go last in the account ranking's order. The result is the account value
+   `providers.chat.class_ranking.<class>`, and `providers.chat.model_ranking` is kept equal to the
+   `standard` class, so everything above reads it unchanged; each change is one line in
+   `model-ranking.jsonl`. Once the scoreboard ranks, the Artificial Analysis refresh stops writing
+   `model_ranking` and only keeps its scores as the prior. A model whose latest bench failed the
+   planted-instruction prompt is left out of the `babysit` class. The scoreboard never turns a route
+   off.
    Endpoint faults (down, rate limit, auth) park nothing. With no ranked model served, or the whole endpoint
    cooling down, runs start on the core provider as before. Only `chat` has a served list: Claude
    Code, Codex and Cursor models are not ranked (provider failover covers a provider that cannot start

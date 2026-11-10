@@ -13,7 +13,9 @@ the key goes in the x-api-key header, from KEY_ENV or the file ranking_key_file 
 logged or stored) and ranks every served id seen so far by it (rank): ids and index entries are
 normalised (keys) and an id takes the best score of the entries it matches; ids none match go last,
 sorted, named in the log. The result is written as the account's providers.chat.model_ranking, which
-every project on the host reads under its own value (modelrank.ranking).
+every project on the host reads under its own value (modelrank.ranking). Each id's index score is kept in
+STATE (scores): the model scoreboard's prior (modelscore.py), which writes the ranking instead once it has
+published class rankings.
 
 Each change appends one line to LOG (when, the source and its index version, old and new lists, the
 trigger, the unmatched ids) and the daemon posts one low feed line; no change, no line. A failed fetch
@@ -35,6 +37,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 KEY = "providers.chat.model_ranking"
+CLASS_KEY = "providers.chat.class_ranking"   # set by the model scoreboard (modelscore.py): it then writes KEY
 SOURCE_KEY, EVERY_KEY, KEY_FILE_KEY = ("providers.chat.ranking_source", "providers.chat.ranking_every_s",
                                        "providers.chat.ranking_key_file")
 SOURCE = "https://artificialanalysis.ai/api/v2/language/models"
@@ -194,6 +197,11 @@ def _write_state(st: dict) -> None:
     durable_write(_home() / STATE, json.dumps(st, indent=1))
 
 
+def scores(ids: list[str], entries: list[tuple[set[str], float]]) -> dict[str, float]:
+    """{id: its best index score} of the ids an entry matches (modelscore.py's prior)."""
+    return {sid: best for sid in ids if (best := max((s for ek, s in entries if ek & keys(sid)), default=None)) is not None}
+
+
 def log_change(old: list, new: list, trigger: str, now: float, version: str = "", unmapped: list | None = None,
                by: str = "refresher") -> None:
     """One LOG line for a ranking change."""
@@ -233,10 +241,13 @@ def refresh(served: list[str], trigger: str, now: float, key: str,
             old = ranking_of(account_value(KEY))
         except ValueError:
             old = []
-        if new != old:
+        if new != old and not account_value(CLASS_KEY):   # once the scoreboard ranks, its index scores are a prior
             set_account_setting(KEY, new)
             log_change(old, new, trigger, now, version, unmapped)
-        _write_state({"refreshed": now, "tried": now, "seen": seen, "version": version, "outage": None})
+        else:
+            new = old
+        _write_state({"refreshed": now, "tried": now, "seen": seen, "version": version, "outage": None,
+                      "scores": scores(seen, entries)})
         return {"changed": new != old, "old": old, "new": new, "trigger": trigger, "version": version,
                 "unmapped": unmapped, "ended": bool(st.get("outage"))}
 

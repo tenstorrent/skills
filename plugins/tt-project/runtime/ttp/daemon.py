@@ -1282,6 +1282,8 @@ class Daemon:
         self._models_tried = 0.0
         self._rank_job: threading.Thread | None = None   # the chat model ranking refresh (refresh_model_ranking)
         self._rank_tried, self._rank_out = 0.0, None
+        self._scores_job: threading.Thread | None = None   # the model scoreboard (refresh_model_scores)
+        self._scores_tried = 0.0
         self._bench_job: threading.Thread | None = None   # the host's daily model bench (run_model_bench)
         self._bench_tried, self._bench_out = 0.0, None
         self._cli_watch: threading.Thread | None = None   # CLI versions being read (watch_cli_versions)
@@ -2330,6 +2332,7 @@ class Daemon:
                 self.route_machines,
                 self.check_route_models,
                 self.refresh_model_ranking,
+                self.refresh_model_scores,
                 self.run_model_bench,
                 self.refresh_coverage,
                 self.lift_quarantine,
@@ -4564,6 +4567,31 @@ class Daemon:
 
         self._rank_job = threading.Thread(target=work, name="model-ranking", daemon=True)
         self._rank_job.start()
+
+    def refresh_model_scores(self) -> None:
+        """Replace this project's live rows in the account's model scoreboard and publish the per-class chat
+        model rankings (modelscore.py), model-free, at most every modelscore.EVERY_S in a thread, wherever
+        the chat provider has an endpoint. A changed standard order is one log line."""
+        from . import modelrank, modelscore, rankfresh
+        if os.environ.get("PYTEST_CURRENT_TEST") and not os.environ.get("TTP_TEST_MODEL_RANKING"):
+            return   # daemons under test never publish, unless a test asks
+        now = time.time()
+        if (not rankfresh.configured(self.cfg) or now - self._scores_tried < modelscore.EVERY_S
+                or self._scores_job is not None and self._scores_job.is_alive()):
+            return
+        self._scores_tried, where, served = now, self.p, modelrank.served(self.p.state, now)
+
+        def work() -> None:
+            try:
+                modelscore.record(where.name, modelscore.live_rows(where, time.time()), time.time())
+                out = modelscore.publish(served, time.time())
+                if out["changed"]:
+                    log(where, f"model scores: standard class {out['old']} -> {out['new']}")
+            except Exception as e:   # a local fault: the type only; the last rankings stay
+                log(where, f"model scores: not published: {type(e).__name__}: {e}")
+
+        self._scores_job = threading.Thread(target=work, name="model-scores", daemon=True)
+        self._scores_job.start()
 
     def run_model_bench(self) -> None:
         """The host's shared daily model bench (modelbench.py), model-free until due: at most every 15
