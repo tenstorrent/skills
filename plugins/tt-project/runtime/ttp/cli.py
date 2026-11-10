@@ -5635,12 +5635,15 @@ def _checks_reexec(new: str, arrived: float | None, prio, spill: bool, tell, out
     let go (freed as a dead holder's are). With `rerank` (checkcap.Reranked) its task's priority changed (`new`
     is the new one): the same runtime re-executes (RERANK_ENV: once per priority) and reads it at its start.
     An upgrade drops the spill hosts a rerun kept off (`spill_off`): the checks may pass there with the new
-    runtime, so a run parked here spills again at its next bound."""
+    runtime, so a run parked here spills again at its next bound. Checks the old runtime would not spill
+    (`spill` false) are not kept off the spill hosts: the new runtime reads them again."""
     from . import checkcap, checkspill, testslots
     if arrived is not None:
         os.environ[checkcap.ARRIVED_ENV] = repr(arrived)
-    if not spill:   # what cmd_checks took out of the environment: no spill host for these checks
+    if checkspill.all_off(spill_off):   # what cmd_checks took out of the environment: no spill host for these checks
         os.environ[checkspill.OFF_ENV] = "1"
+    elif not spill and not spill_off:   # checks that could not spill under the old runtime: the new one judges
+        pass                            # them again (checkspill.spillable), never parking them here for good
     elif spill_off and rerank:   # or the spill hosts a rerun keeps off; a new runtime tries them all again
         os.environ[checkspill.OFF_ENV] = spill_off
     if rerank:

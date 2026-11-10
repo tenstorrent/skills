@@ -2104,8 +2104,10 @@ session and stateless coordinators on every provider.
   host-wide cap admits can start, plus the cores the runnable CPU demand (as for the load guard, below), less one per test slot the project itself holds, leaves under
   0.75 x the cores, at most half the cores, so its own suites never shrink it; `checks.load_extra` 0 keeps the base; a shrink bounds new grants only), the most test workers one project's suites run at once, which also bounds one run's
   grant. No new suite starts while the host's runnable CPU demand is above its cores (the CPU limit,
-  `checks.load_guard`, a factor of the cores, default 1; 0 turns it off): it waits and its lane's wait note says
-  why; running suites go on. The demand is the busy cores, or the tasks running or waiting to run where more
+  `checks.load_guard`, a factor of the cores, default 1; 0 turns it off) at every reading over the last
+  `checks.load_sustain_s` (default 60 s; readings of all runs on the host, check-slots/cpu-demand.jsonl; 0 reads
+  the demand now alone), so a burst of short-lived git, ssh or python processes holds nothing, or while macOS
+  reports memory pressure at warn or critical: it waits and its lane's wait note says why; running suites go on. The demand is the busy cores, or the tasks running or waiting to run where more
   (/proc/stat over a few seconds; the 1-minute load average where that cannot be read). Unlike the load average
   it leaves out tasks waiting on I/O (D state), so a contended disk with idle cores holds nothing here: disk
   contention has its own I/O pressure limit (`checks.io_full_max`, above). `ttp checks status` shows both

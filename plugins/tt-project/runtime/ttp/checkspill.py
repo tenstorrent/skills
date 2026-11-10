@@ -625,9 +625,12 @@ def stays_here(c: Any, cfg: dict | None = None) -> bool:
 
 def spillable(cmds: list, cfg: dict | None = None) -> bool:
     """Whether a run of `cmds` may spill: one check at least may (check_spills) and each other one runs
-    here beside it (stays_here)."""
+    on its own host ("host": push.remote_host, which keeps it there) or here beside it (stays_here). A
+    worker's extra local pytest beside the project's host-pinned suite so spills too, never waiting for a
+    checks slot here."""
+    from . import push
     spills = [check_spills(c, cfg) for c in cmds]
-    return any(spills) and all(ok or stays_here(c, cfg) for ok, c in zip(spills, cmds))
+    return any(spills) and all(ok or push.remote_host(c) or stays_here(c, cfg) for ok, c in zip(spills, cmds))
 
 
 def target(spec: str, known: dict | None = None) -> tuple[str, str]:

@@ -347,10 +347,13 @@ def held_since(paths: list[Path]) -> list[float]:
 def cores_short(every: list[Path], now: float | None = None) -> str:
     """Why no check may start now for want of cores, else "": one starts only while the host's live
     free cores (free_cores()), less check_load() for each check granted within RAMP_S (its workers may
-    not show yet), cover one check's price (check_load()). With no check running on the host one
+    not show yet), cover one check's price (check_load()); busy cores count only while the demand lasts
+    (sustained_load: a short spike leaves the cores free). With no check running on the host one
     always starts, so checks never starve; checks.live_cores 0 or no reading lets every one start."""
     if not live_cores_on() or not (held := held_since(every)) or (free := free_cores()) is None:
         return ""
+    if sustain_s() and (ld := sustained_load(now)) == ld and ld != float("inf"):
+        free = max(free, cores() - ld)   # busy cores that did not last (sustained_load) leave room
     now = time.time() if now is None else now
     price = check_load()
     left = free - price * sum(1 for s in held if now - s < RAMP_S)
@@ -670,6 +673,73 @@ def _load() -> float:
 def cpu_demand() -> float:
     """This host's runnable CPU demand in cores for the load guard (testslots.load_guard): _load()."""
     return _load()
+
+
+SUSTAIN_S = 60.0   # the load guard and the live-cores gate count a CPU demand only once it lasted this long
+SUSTAIN_ENV = "TTP_CHECKS_LOAD_SUSTAIN_S"
+DEMAND_LOG = "cpu-demand.jsonl"   # check-slots/cpu-demand.jsonl: the demand readings of every run here (sustained_load)
+DEMAND_EVERY_S = 5.0   # one reading logged per this many seconds at most
+DEMAND_KEEP = 200   # lines kept once the log grows past twice this
+
+
+def sustain_s() -> float:
+    """TTP_CHECKS_LOAD_SUSTAIN_S, else the account's checks.load_sustain_s, else SUSTAIN_S; 0 reads the
+    demand now alone."""
+    for v in (os.environ.get(SUSTAIN_ENV), (project.load_account_settings().get("checks") or {}).get("load_sustain_s")):
+        if v in (None, "") or isinstance(v, bool):
+            continue
+        try:
+            return max(0.0, float(v))
+        except (TypeError, ValueError):
+            continue
+    return SUSTAIN_S
+
+
+def _demand_log(now: float, d: float) -> list[tuple[float, float]]:
+    """The readings logged over the last sustain_s() with `d` (read at `now`) among them: `d` is
+    appended unless one was logged within DEMAND_EVERY_S. An unreadable log is empty."""
+    path, keep = slot_dir() / DEMAND_LOG, sustain_s()
+    got: list[tuple[float, float]] = []
+    try:
+        lines = path.read_text().splitlines()
+    except OSError:
+        lines = []
+    for line in lines:
+        try:
+            r = json.loads(line)
+            ts, v = float(r["ts"]), float(r["d"])
+        except (ValueError, KeyError, TypeError, AttributeError):
+            continue
+        if 0 <= now - ts <= keep and v == v:
+            got.append((ts, v))
+    if not got or now - max(ts for ts, _ in got) >= DEMAND_EVERY_S:
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if len(lines) > 2 * DEMAND_KEEP:   # a lost line in a race only shortens the window
+                tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+                tmp.write_text("".join(json.dumps({"ts": ts, "d": v}) + "\n" for ts, v in got[-DEMAND_KEEP:]))
+                os.replace(tmp, path)
+            with path.open("a") as f:
+                f.write(json.dumps({"ts": now, "d": d}) + "\n")
+        except OSError:
+            pass
+    return got + [(now, d)]
+
+
+def sustained_load(now: float | None = None) -> float:
+    """The CPU demand (cpu_demand()) that lasted: the lowest reading any run on this host logged over the
+    last sustain_s() (DEMAND_LOG), once those readings span half of it at least; 0 before they do. So a
+    burst of short-lived git, ssh or python processes, or a reading taken once, holds no check: only a
+    demand high at every reading of the window does. inf (nothing readable) stays inf; sustain_s() 0 is
+    cpu_demand() alone."""
+    d = cpu_demand()
+    if not (span := sustain_s()) or d != d or d == float("inf"):
+        return d
+    now = time.time() if now is None else now
+    got = _demand_log(now, d)
+    if now - min(ts for ts, _ in got) < span / 2:
+        return 0.0
+    return min(v for _, v in got)
 
 
 POOL_DIRS_ENV = "TTP_CHECKS_POOL_DIRS"   # where pool runs' folders are looked for (os.pathsep-separated)

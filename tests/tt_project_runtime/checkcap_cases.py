@@ -11499,3 +11499,67 @@ def test_remoteload_parses_two_proc_stat_samples():
     d, c = remoteload.parse(stat(100, 100, 9) + remoteload.SEP + "\n" + stat(100, 500, 11))
     assert c == 4 and abs(d - 9.0) < 0.01
     assert remoteload.parse("no sample") is None
+
+
+def test_a_light_local_check_alone_still_takes_this_hosts_checks_slot(env, monkeypatch, tmp_path):
+    """Only a light check beside checks run elsewhere goes without a slot: a run of light local checks
+    alone is still bounded by this host's checks cap (checkcap.acquire)."""
+    import io
+    from ttp import checkcap, cli, push
+    p = make(env)
+    took = []
+    monkeypatch.setattr(checkcap, "acquire", lambda *a, **k: took.append(a) or checkcap.Slot())
+    out = io.StringIO()
+    cli._checks_slot(p, tmp_path, out, "a" * 40, cmds=push.check_list(["claude plugin validate plugins/x --strict"]),
+                     top=str(p.root))
+    assert took, out.getvalue()
+
+
+def test_the_load_guard_holds_on_sustained_demand_or_memory_pressure_but_not_on_a_short_spike(env, monkeypatch):
+    """checks.load_sustain_s: the guard holds a local suite only while the CPU demand was over the guard at
+    every reading of the window (checkcap.sustained_load, readings shared through check-slots), or while
+    memory pressure is at warn or critical (hostcpu.mem_pressure); a spike of short-lived processes or one
+    high reading holds nothing, and the live-cores gate leaves cores a spike took free."""
+    from ttp import checkcap, hostcpu, testslots
+    monkeypatch.setenv("TTP_CHECKS_LOAD_SUSTAIN_S", "60")
+    monkeypatch.setenv("TTP_CHECKS_LOAD_GUARD", "1")
+    monkeypatch.setattr(checkcap, "cores", lambda: 14)
+    demand = [30.0]
+    monkeypatch.setattr(checkcap, "cpu_demand", lambda: demand[0])
+    log = checkcap.slot_dir() / checkcap.DEMAND_LOG
+    log.parent.mkdir(parents=True, exist_ok=True)
+    now = time.time()
+
+    def seen(*readings):
+        log.write_text("".join(json.dumps({"ts": now - age, "d": d}) + "\n" for age, d in readings))
+    seen()
+    assert testslots.load_guard() == "", "one high reading is no sustained load"
+    seen((50, 2.0), (20, 30.0))
+    assert testslots.load_guard() == "", "a spike: a low reading 50 s ago"
+    seen((55, 30.0), (40, 25.0), (10, 28.0))
+    assert "overloaded" in testslots.load_guard(), "high at every reading over the window"
+    assert checkcap.sustained_load(now) == 25.0
+    seen((90, 30.0), (10, 28.0))
+    assert testslots.load_guard() == "", "readings older than the window do not count"
+    demand[0] = 2.0
+    seen((55, 30.0), (40, 25.0))
+    assert testslots.load_guard() == "", "the demand dropped"
+    # Memory: pressure at warn or critical holds; normal does not.
+    for level, held in ((4, True), (2, True), (1, False), (None, False)):
+        monkeypatch.setattr(hostcpu, "mem_pressure", lambda level=level: level)
+        assert bool(testslots.load_guard()) is held, level
+    monkeypatch.setattr(hostcpu, "mem_pressure", lambda: 4)
+    assert "pressure critical" in testslots.load_guard()
+    monkeypatch.setattr(hostcpu, "mem_pressure", lambda: None)
+    # The live-cores gate: busy cores of a spike leave room; sustained ones do not.
+    monkeypatch.setenv("TTP_CHECKS_LIVE_CORES", "1")
+    monkeypatch.setattr(checkcap, "free_cores", lambda: 0.0)
+    monkeypatch.setattr(checkcap, "held_since", lambda every: [0.0])
+    demand[0] = 14.0
+    seen((50, 1.0))
+    assert checkcap.cores_short([]) == "", "a spike"
+    seen((55, 14.0), (30, 14.0))
+    assert checkcap.cores_short([]), "sustained"
+    monkeypatch.setenv("TTP_CHECKS_LOAD_SUSTAIN_S", "0")
+    demand[0] = 30.0
+    assert checkcap.cores_short([]) and "overloaded" in testslots.load_guard(), "0 reads the demand now"

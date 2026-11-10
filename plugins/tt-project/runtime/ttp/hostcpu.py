@@ -193,9 +193,29 @@ def mach_mem_free() -> float | None:
     return level.value / 100 if 0 < level.value <= 100 else None
 
 
+PRESSURE_WARN = 2   # kern.memorystatus_vm_pressure_level: 1 normal, 2 warn, 4 critical (mem_pressure)
+PRESSURE_NAMES = {2: "warn", 4: "critical"}
+
+
+def mem_pressure() -> int | None:
+    """macOS's memory pressure level (kern.memorystatus_vm_pressure_level: 1 normal, 2 warn, 4 critical;
+    the kernel raises it while it compresses and swaps), or None where it cannot be read."""
+    lib, _ = _libsystem() if MACH else (None, 0)
+    if lib is None:
+        return None
+    import ctypes
+    level, size = ctypes.c_int(0), ctypes.c_size_t(4)
+    if lib.sysctlbyname(b"kern.memorystatus_vm_pressure_level", ctypes.byref(level), ctypes.byref(size), None, 0) != 0:
+        return None
+    return level.value if level.value > 0 else None
+
+
 def mem_short(free: float | None = None) -> str:
-    """Why new work should wait for memory now, or "": its free share (mem_free) under MEM_FREE_MIN. An
-    unreadable reading holds nothing."""
+    """Why new work should wait for memory now, or "": the memory pressure level at warn or critical
+    (mem_pressure, read live only) or its free share (mem_free) under MEM_FREE_MIN. An unreadable reading
+    holds nothing."""
+    if free is None and (level := mem_pressure()) is not None and level >= PRESSURE_WARN:
+        return f"memory short: pressure {PRESSURE_NAMES.get(level, 'critical' if level > 2 else 'warn')}"
     free = mem_free() if free is None else free
     if free is None or free >= MEM_FREE_MIN:
         return ""

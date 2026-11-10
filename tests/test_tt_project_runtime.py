@@ -515,6 +515,7 @@ def env(tmp_path, monkeypatch, _git_session, _short_tmp):
     monkeypatch.setenv("TTP_CHECKS_LOAD_EXTRA", "0")   # the checks cap never grows with this host's load
     monkeypatch.setenv("TTP_TEST_NO_INHERIT", "1")   # `ttp checks` never takes the task of the run running the tests (checkcap.adopt_identity)
     monkeypatch.setenv("TTP_CHECKS_LIVE_CORES", "0")   # nor waits on this host's busy cores
+    monkeypatch.setenv("TTP_CHECKS_LOAD_SUSTAIN_S", "0")   # load tests read the demand now (sustain tests set it)
     monkeypatch.setenv("TTP_CHECKS_DIRTY_MAX_MB", "0")   # nor on its disk (diskgate)
     monkeypatch.setenv("TTP_CHECKS_IO_FULL_MAX", "0")
     monkeypatch.setenv("TTP_CHECKS_SLOTS", "1")   # one checks lane per repository, whatever this host's size
@@ -532,6 +533,7 @@ def env(tmp_path, monkeypatch, _git_session, _short_tmp):
     from ttp import hostcpu   # the fresh module tests import
     monkeypatch.setattr(hostcpu, "MEMINFO", tmp_path / "no-meminfo")   # memory reads as unknown: never this host's own
     monkeypatch.setattr(hostcpu, "mach_mem_free", lambda: None)   # (memory tests set it)
+    monkeypatch.setattr(hostcpu, "mem_pressure", lambda: None)   # nor its memory pressure level
     from ttp import machinecap   # the machine-wide worker limit: auto reads as a server (tests turn it on)
     monkeypatch.setattr(machinecap, "DARWIN", False)
     monkeypatch.setattr(machinecap, "has_battery", lambda root=None: False)

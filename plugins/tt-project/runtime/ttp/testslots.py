@@ -287,7 +287,8 @@ def load_guard_factor() -> float:
 def load_guard() -> str:
     """Why no new suite may start now, or "": the host's runnable CPU demand (checkcap.cpu_demand: busy
     cores and tasks waiting to run, not tasks waiting on I/O) is above checks.load_guard
-    (load_guard_factor()) times its cores, or its memory is short (hostcpu.mem_short). 0 turns the guard
+    (load_guard_factor()) times its cores at every reading over checks.load_sustain_s (checkcap.sustained_load:
+    a spike of short-lived processes holds nothing), or its memory is short (hostcpu.mem_short). 0 turns the guard
     off; an unreadable reading never holds a suite. Disk contention is diskgate's limit
     (checks.io_full_max), not this one."""
     factor = load_guard_factor()
@@ -295,7 +296,7 @@ def load_guard() -> str:
         return ""
     if mem := hostcpu.mem_short():
         return f"the host is {mem}; no new suite starts until memory frees, running ones go on"
-    ld, c = checkcap.cpu_demand(), checkcap.cores()
+    ld, c = checkcap.sustained_load(), checkcap.cores()
     if ld != ld or ld == float("inf") or ld <= factor * c:
         return ""
     return (f"the host's CPU is overloaded: its runnable demand of {ld:.1f} cores is above "

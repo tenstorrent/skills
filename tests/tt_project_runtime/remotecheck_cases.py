@@ -3617,3 +3617,76 @@ def test_workers_on_a_remote_only_workstation_are_told_to_run_tests_through_ttp_
     assert prompts.remote_only_line({**on, "delivery": {**on["delivery"], "checks_remote_only": False}}) == ""
     assert prompts.remote_only_line({}) == ""
 
+
+
+def _mac_full(monkeypatch):
+    """This host reads overloaded (its load guard) and its host-wide checks cap is full: a local heavy
+    check could not start here now."""
+    from ttp import checkcap, testslots
+    monkeypatch.setattr(testslots, "load_guard", lambda: "the host's CPU is overloaded")
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "1")
+    monkeypatch.setattr(checkcap, "extra_max", lambda: 0)
+    return checkcap.acquire("other project", priority=3)
+
+
+def test_a_worker_run_beside_a_host_pinned_suite_spills_at_once_while_this_host_is_full(env, tmp_path, monkeypatch):
+    """A worker's `ttp checks -- <its own pytest>` beside the project's suite pinned to a check host
+    ("host"): the run spills its own check to a spill host at once, while this host reads overloaded and
+    its checks cap is full; the pinned suite runs on its own host. Neither waits for a checks slot here."""
+    from ttp import cli
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-b"])
+    p.set_config("delivery.checks_spill_after_s", 600)
+    log = tmp_path / "where.log"
+    pinned, own = f"echo pinned $(pwd) >> {log}", f"echo own $(pwd) >> {log}"
+    p.set_config("delivery.push_checks", [{"run": pinned, "host": "check-host-a"}])
+    held = _mac_full(monkeypatch)
+    t0 = time.time()
+    try:
+        cli.main(["checks", "--fresh", "--", own])
+    finally:
+        held.close()
+    assert time.time() - t0 < 60, "no wait for the cap or the spill bound"
+    rec = json.loads((run / "checks.json").read_text())
+    assert rec["passed"] is True and rec["spilled_to"] == "check-host-b", rec
+    where = log.read_text().splitlines()
+    assert len(where) == 2 and all("/ttp-check." in ln for ln in where), where
+    text = (run / "checks.log").read_text()
+    assert "(on check-host-a)" in text and "(on check-host-b)" in text, text
+
+
+def test_a_push_batch_beside_a_host_pinned_suite_spills_and_its_light_check_takes_no_slot_here(
+        env, tmp_path, monkeypatch):
+    """The push train does the same: its local suite spills beside the suite pinned to a check host, and a
+    light local check (claude plugin validate) runs here without the host-wide checks slot, so the batch
+    lands while this host reads overloaded and its checks cap is full."""
+    from ttp import batch, checkspill, push, pushq
+    log = tmp_path / "where.log"
+    s = _spill_batch(env, tmp_path, monkeypatch, f"echo own $(pwd) >> {log}")
+    s.p.set_config("delivery.push_checks", [{"run": f"echo pinned $(pwd) >> {log}", "host": "check-host-a"},
+                                            f"echo own $(pwd) >> {log}", "claude plugin validate plugins/x --strict"])
+    s.p.charter_path.write_text("# Charter\n## Resources\n- check-host-a: a check host\n- check-host-b: a check host\n")
+    from ttp import machines
+    machines.add("check-host-b")
+    s.p.set_config("delivery.checks_spill_hosts", ["check-host-b"])
+    fake = tmp_path / "fakeclaude"
+    fake.mkdir()
+    (fake / "claude").write_text(f"#!/bin/sh\necho light $(pwd) >> {log}\n")
+    (fake / "claude").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{fake}{os.pathsep}{os.environ['PATH']}")
+    held = _mac_full(monkeypatch)
+    monkeypatch.setattr(push, "check_slot", lambda *a, **k: pytest.fail("no host-wide checks slot here"))
+    monkeypatch.setattr(pushq, "batch_argv", lambda marker: [sys.executable, "-c", "pass"])
+    try:
+        _pq_hand_off(env, s)
+        marker = pathlib.Path(s.p.db.one("SELECT marker FROM push_batches WHERE id=?", (_pq_batch(s),))["marker"])
+        monkeypatch.setattr(sys, "stdin", io.StringIO(""))
+        monkeypatch.setenv("TTP_RUN_DIR", push._read(marker)["check_report_dir"])
+        assert batch.run_batch(s.p, marker) == 0
+    finally:
+        held.close()
+    assert push._read(marker)["outcome"] == "pushed", push._read(marker)
+    where = log.read_text().splitlines()
+    assert sorted(ln.split()[0] for ln in where) == ["light", "own", "pinned"], where
+    assert all("/ttp-check." in ln for ln in where if not ln.startswith("light")), where
+    assert not any("/ttp-check." in ln for ln in where if ln.startswith("light")), "the light check ran here"
+    assert checkspill.holders(s.p.name) == []

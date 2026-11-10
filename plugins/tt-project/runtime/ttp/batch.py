@@ -53,7 +53,7 @@ import tokenize
 from collections import Counter, deque
 from pathlib import Path
 
-from . import (checkcap, checkdirs, checkspill, cleantree, conflictfix, cyclenotice, envfault, gatejudge, landmark, locks, push, pushpass, runner, scopehold,
+from . import (checkcap, checkdirs, checklane, checkspill, cleantree, conflictfix, cyclenotice, envfault, gatejudge, landmark, locks, push, pushpass, runner, scopehold,
                scriptwatch, setupfault, syntaxfault, testslots, workerloss, urgent,
                sharedchecks, slowtests, suitecost, verdictcarry, worktree)
 from .project import Project, command_env, durable_write, write_json
@@ -2315,6 +2315,12 @@ class Batch:
             slot.close()
             held[0] = True
             return self._slot(head)
+        light = checklane.light_patterns(self.p.config())
+
+        def own(cmd, slot):   # a check on its own host or a light one here (`claude plugin validate`) takes no
+            if push.remote_host(cmd) or checklane.is_light(str(cmd), light):   # host-wide slot (push.run_slot)
+                return slot
+            return here(slot)
         started = time.time()
         slow = Path(self.check_run_dir) / slowtests.FILE if self.check_run_dir else None
         if slow:
@@ -2336,11 +2342,11 @@ class Batch:
                     rc, tail = reuse   # a search run again (_research) judges this tree's failed run again
                     say(f"{head[:10]} failed {cmd} earlier in this batch (tree {tree[:10]}): judging that run again")
                 else:
-                    slot = slot if push.remote_host(cmd) else here(slot)
+                    slot = own(cmd, slot)
                     rc, tail = self._run_check(cmd, {**env, **extra, **slot.env()}, env)
                     while getattr(cmd, "spilled", False) and (fault := push.remote_fault(cmd, rc, self.wt)):
                         cmd = self._respill(cmd, head, fault, claims)   # the next spill host, else here
-                        slot = slot if push.remote_host(cmd) else here(slot)
+                        slot = own(cmd, slot)
                         rc, tail = self._run_check(cmd, {**env, **slot.env()}, env)
                     if fault := push.remote_fault(cmd, rc, self.wt):
                         raise envfault.Fault(fault)   # the check host, not this head: push_phase holds the batch
