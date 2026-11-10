@@ -2404,7 +2404,8 @@ session and stateless coordinators on every provider.
   quarantine sooner). A failure that hits two or more spill hosts the same way within an hour (the same last error
   line, paths and numbers aside, and the same failing pytest ids) with no spilled pass between is the project's
   spill setup, not the hosts (a wrapper that lost its environment): one high event says so and no host takes a
-  strike. A failure with neither an error line nor a failing test id matches no other: it is only a strike.
+  strike; a failure that is a missing package at import is already the spill env fault above (told once, never
+  a strike, and no second event under the same checks config). A failure with neither an error line nor a failing test id matches no other: it is only a strike.
   `checks.json` (`spilled_to`), `ttp status` and `ttp checks status` name the host.
   `checks.slurm_overflow` (account-level, unset by default: nothing changes) sends a run that no pool host can take
   (each paused, busy with a device job, full or unreachable, or no pool at all) to a Slurm cluster instead of

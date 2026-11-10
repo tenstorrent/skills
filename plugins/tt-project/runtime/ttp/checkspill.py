@@ -1799,9 +1799,12 @@ def strike_settle(p, cfg: dict | None, head: str, passed_on: str = "", now: floa
                 if remotecheck.shared_sig(sig) and len(same) >= CONFIG_FAULT_HOSTS:
                     for h in same:
                         hosts.setdefault(h, {})["n"] = 0
-                    if sig not in seen:
+                    # One incident, one event: env_event's fingerprint (a spill env fault already told for this
+                    # checks config is not told again).
+                    fp = f"checkspill:env:{_env_key(cfg)}"
+                    if sig not in seen and not p.db.q("SELECT 1 FROM events WHERE fingerprint=? LIMIT 1", (fp,)):
                         seen[sig] = now
-                        _event(p.db, now, f"spill-config:{sig[:80]}:{now:.0f}", "high",
+                        _event(p.db, now, fp, "high",
                                f"Spill config fault: spilled checks failed the same way on {len(same)} spill hosts "
                                f"({', '.join(sorted(same))}: {sig or 'no error line'}) and passed on this machine, "
                                "so the fault is the project's spill setup (checks.spill_wrap_cmd, its env), not the "

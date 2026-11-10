@@ -4541,6 +4541,40 @@ def test_a_failure_every_spill_host_shares_is_one_config_incident_and_quarantine
     assert sorted(checkspill.strike_settle(p, cfg, "g2")) == ["check-host-a", "check-host-b"], "different faults"
 
 
+@_LINUX_TMP
+def test_an_import_failure_on_two_spill_hosts_that_passes_here_raises_one_high_event_and_no_strikes(
+        env, tmp_path, monkeypatch):
+    """One spill-env incident, one event: the landed env_event tells it when the import fails on a second host,
+    the run then passes here, and strike_settle neither strikes the hosts nor raises its own config event."""
+    import threading
+    from ttp import checkspill, cli
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a", "check-host-b"])
+    script = tmp_path / "check.sh"
+    script.write_text('case "$(pwd)" in */ttp-check.*)\n'
+                      "  printf 'ERROR collecting tests/test_x.py\\nE   ModuleNotFoundError: No module named '"
+                      "\\''nosuchpkg'\\''\\n'; exit 2;;\nesac\n")
+    p.set_config("delivery.push_checks", [f"sh {script}"])
+    lane = _spill_lane(p, repo)
+    threading.Timer(6, lane.close).start()
+    cli.main(["checks", "--fresh"])
+    assert json.loads((run / "checks.json").read_text())["passed"] is True
+    events = p.db.q("SELECT severity, fingerprint FROM events WHERE fingerprint LIKE 'checkspill:%' "
+                    "OR fingerprint LIKE 'spill-%'")
+    assert len(events) == 1 and events[0]["severity"] == "high" and events[0]["fingerprint"].startswith(
+        "checkspill:env:"), [dict(e) for e in events]
+    strikes = checkspill._strikes(p.db)
+    assert not strikes.get("fails") and all(not h.get("n") for h in strikes["hosts"].values()), strikes
+    # A strike_settle that still sees the same failure on two hosts (recorded before env_event told it)
+    # adds no second event under another fingerprint, and still strikes nobody.
+    cfg, sig = p.config(), "ModuleNotFoundError: No module named 'nosuchpkg'"
+    for host in ("check-host-a", "check-host-b"):
+        checkspill.strike_fail(p, host, "h1", sig)
+    assert checkspill.strike_settle(p, cfg, "h1") == []
+    assert len(p.db.q("SELECT 1 FROM events WHERE severity='high' AND (fingerprint LIKE 'checkspill:%' "
+                      "OR fingerprint LIKE 'spill-%')")) == 1
+    assert all(not h.get("n") for h in checkspill._strikes(p.db)["hosts"].values())
+
+
 def test_fail_sig_reads_the_last_error_line_without_paths_or_numbers():
     from ttp import remotecheck
     a = "E   ModuleNotFoundError: No module named 'yaml'\nImportError while loading conftest '/tmp/ttp-check.ab12/x.py'.\n" \
