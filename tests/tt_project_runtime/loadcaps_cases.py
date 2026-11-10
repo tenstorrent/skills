@@ -231,39 +231,147 @@ def test_machine_limit_project_cap_above_it_is_clipped(env, tmp_path):
         "small's limit of 2 caps the machine: 1 + 1 running"
 
 
+def _sustained(mc, sig, n=3, step=30.0, start=1000.0):
+    """n readings `step` s apart through advance(): the last one, with its carried window."""
+    prev = None
+    for i in range(n):
+        prev = mc.advance(prev, {**sig, "at": start + i * step})
+    return prev
+
+
 def test_machine_limit_each_signal_lowers_it():
     from ttp import machinecap as mc
     assert mc.limit(8, _IDLE) == 8 and mc.words(_IDLE) == "nothing busy"
-    for change, want in [({"cpu_busy": 0.8}, 6), ({"cpu_busy": 0.95}, 4),
-                         ({"mem_free": 0.15}, 6), ({"mem_free": 0.05}, 4), ({"pressure": 2}, 6),
-                         ({"pressure": 4}, 4), ({"compressor": 0.35}, 6), ({"compressor": 0.6}, 4),
-                         ({"psi": 6.0}, 6), ({"psi": 25.0}, 4),
-                         ({"call": True}, 4), ({"thermal": 1}, 6), ({"thermal": 2}, 4)]:
+    for change, want in [({"mem_free": 0.08}, 6), ({"mem_free": 0.04}, 4), ({"pressure": 2}, 6),
+                         ({"pressure": 4}, 4), ({"psi": 6.0}, 6), ({"psi": 25.0}, 4), ({"swapping": True}, 6),
+                         ({"thermal": 2}, 4), ({"thermal": 3}, 4)]:
         assert mc.limit(8, {**_IDLE, **change}) == want, change
-    worst = {**_IDLE, "cpu_busy": 1.0, "mem_free": 0.01, "call": True, "thermal": 3}
+    for change in [{"mem_free": 0.15}, {"compressor": 0.6}, {"psi": 3.0}, {"thermal": 1}, {"call": True},
+                   {"cpu_busy": 0.99}]:
+        assert mc.limit(8, {**_IDLE, **change}) == 8, f"{change} alone is not shortness"
+    worst = _sustained(mc, {**_IDLE, "cpu_busy": 1.0, "mem_free": 0.01, "call": True, "thermal": 3})
     assert mc.limit(8, worst) == 1 and mc.limit(2, worst) == 1, "never below one"
     assert mc.words(worst) == "cpu heavy, memory heavy, call heavy, thermal heavy"
 
 
-def test_machine_limit_unreadable_signals_fall_back_to_a_lower_finite_limit(env, tmp_path):
+def test_machine_limit_load_and_moderate_memory_with_idle_cpu_do_not_lower_it(env, tmp_path):
+    """(a) A load average of 40 with 70% CPU idle and macOS memory 'moderate' (compressing, 38% free,
+    pressure normal) is not short: no machine hold for null-base projects, a set base stays whole."""
+    from ttp import machinecap as mc
+    sig = _sustained(mc, {**_IDLE, "load": 40.0, "cpu_busy": 0.3, "mem_free": 0.38, "pressure": 1,
+                          "compressor": 0.45})
+    assert mc.levels(sig) == {} and mc.limit(8, sig) == 8
+    assert mc.in_force(None, [], sig) is None, "healthy, nothing set: only the projects' own caps"
+    home, now = tmp_path / "mhome", time.time()
+    null_cfg = {"machine": {"worker_limit": "on", "max_workers": None}}
+    assert all(mc.check("a", null_cfg, n, claim=True, now=now, home=home, read=lambda: {**sig, "at": now}) is None
+               for n in range(20))
+
+
+def test_machine_limit_needs_cpu_idle_low_for_a_minute(env, tmp_path):
+    """(b) One low-idle sample does not lower the limit; idle under 15% in every reading for 60 s does;
+    a reading with idle back up, or a gap in readings, starts the window again."""
+    from ttp import machinecap as mc
+    hot = {**_IDLE, "cpu_busy": 0.9}
+    one = mc.advance(None, {**hot, "at": 1000.0})
+    assert mc.levels(one) == {} and mc.limit(8, one) == 8, "a single low sample"
+    assert mc.levels(_sustained(mc, hot, n=2)) == {}, "30 s is not a minute"
+    assert mc.limit(8, _sustained(mc, hot)) == 6 and mc.words(_sustained(mc, hot)) == "cpu moderate"
+    assert mc.limit(8, _sustained(mc, {**hot, "cpu_busy": 0.97})) == 4, "idle under 5% too: heavy"
+    broken = mc.advance(mc.advance(_sustained(mc, hot, n=2), {**_IDLE, "at": 1060.0}), {**hot, "at": 1090.0})
+    assert mc.levels(broken) == {}, "idle came back in between"
+    gap = mc.advance(mc.advance(None, {**hot, "at": 1000.0}), {**hot, "at": 1000.0 + mc.SUSTAIN_GAP_S + 1})
+    assert mc.levels(gap) == {}, "readings too far apart prove nothing"
+    # through check(): the shared reading is advanced once per SIGNAL_S across calls
+    home, cfg, t0 = tmp_path / "mhome", _mcap_cfg(top=8), time.time()
+    for i in range(3):
+        now = t0 + i * mc.SIGNAL_S
+        why = mc.check("a", cfg, 6, now=now, home=home, read=lambda: {**hot, "at": now})
+        assert (why is None) == (i < 2), (i, why)
+    assert "6 of 6" in why and "cpu moderate" in why
+
+
+def test_machine_limit_memory_pressure_and_swapping_lower_it():
+    """(c) Memory warn or critical lowers it, and so does swap growing between readings; a large but
+    steady swap file does not."""
+    from ttp import machinecap as mc
+    assert mc.limit(8, {**_IDLE, "pressure": mc.PRESSURE_WARN}) == 6
+    assert mc.limit(8, {**_IDLE, "pressure": mc.PRESSURE_CRITICAL}) == 4
+    gb = 1 << 30
+    steady = mc.advance(mc.advance(None, {**_IDLE, "swap": 4 * gb, "at": 1000.0}), {**_IDLE, "swap": 4 * gb, "at": 1030.0})
+    assert not steady["swapping"] and mc.limit(8, steady) == 8
+    grow = mc.advance(mc.advance(None, {**_IDLE, "swap": 4 * gb, "at": 1000.0}),
+                      {**_IDLE, "swap": 4 * gb + mc.SWAP_GROW_B, "at": 1030.0})
+    assert grow["swapping"] and mc.limit(8, grow) == 6 and mc.words(grow) == "memory moderate"
+    old = mc.advance(mc.advance(None, {**_IDLE, "swap": 0, "at": 1000.0}),
+                     {**_IDLE, "swap": 8 * gb, "at": 1000.0 + mc.SWAP_GAP_S + 1})
+    assert not old["swapping"], "growth over a long gap tells nothing"
+    assert mc.linux_swap(pathlib.Path("/nonexistent/vmstat")) is None
+
+
+def test_machine_limit_thermal_serious_lowers_it():
+    """(d) Thermal pressure serious (2) or worse lowers it; moderate (1) does not."""
+    from ttp import machinecap as mc
+    assert mc.limit(8, {**_IDLE, "thermal": 1}) == 8
+    assert mc.limit(8, {**_IDLE, "thermal": 2}) == 4 and mc.words({**_IDLE, "thermal": 2}) == "thermal heavy"
+    assert mc.in_force(None, [], {**_IDLE, "thermal": 2}, cpus=12) == 6, "under pressure a null base is the cores"
+
+
+def test_machine_limit_call_counts_only_with_low_cpu_idle():
+    """(e) A call app alone does not lower it; a call while CPU idle is under 30% does (no minute
+    needed: a call stutters at once)."""
+    from ttp import machinecap as mc
+    assert mc.limit(8, {**_IDLE, "call": True}) == 8 and mc.limit(8, {**_IDLE, "call": True, "cpu_busy": 0.6}) == 8
+    busy_call = {**_IDLE, "call": True, "cpu_busy": 0.75}
+    assert mc.limit(8, busy_call) == 4 and mc.words(busy_call) == "call heavy"
+    assert mc.limit(8, {**busy_call, "cpu_busy": None}) == 8, "a call with unreadable CPU is not short"
+
+
+def test_machine_limit_unreadable_signals_hold_it_at_base(env, tmp_path):
+    """(f) Unreadable signals count as not short: the limit stays at its base, never 1."""
     from ttp import machinecap as mc
     blind = {"cpu_busy": None, "mem_free": None, "pressure": None, "compressor": None, "call": None,
-             "thermal": None}
-    assert mc.levels(blind) == {"cpu": "moderate", "memory": "moderate"}
-    assert 1 <= mc.limit(8, blind) == 4 < 8 and mc.limit(8, {}) == 4, "unknown is never unlimited"
-    assert mc.base({}, cpus=64) == mc.BASE_MAX and mc.base({}, cpus=2) == mc.BASE_MIN
-    assert mc.base({"machine": {"max_workers": 0}}) == 1 and mc.base({"machine": {"max_workers": "x"}}, cpus=8) == 4
+             "thermal": None, "swap": None}
+    assert mc.levels(blind) == {} and mc.levels(mc.advance(None, blind)) == {}
+    assert mc.limit(8, blind) == 8 and mc.limit(8, {}) == 8
+    assert mc.in_force(5, [], blind) == 5 and mc.in_force(None, [], blind) is None
+    assert mc.base({}, cpus=64) == mc.BASE_MAX and mc.base({}, cpus=1) == mc.BASE_MIN
+    assert mc.base({"machine": {"max_workers": 0}}) == 1 and mc.base({"machine": {"max_workers": "x"}}, cpus=8) == 8
+    assert mc.set_base({"machine": {"max_workers": None}}) is None and mc.set_base(_mcap_cfg(top=3)) == 3
     assert mc.psi(tmp_path / "none") is None and mc.linux_thermal(tmp_path / "none") is None
     zone = tmp_path / "thermal" / "thermal_zone0"
     zone.mkdir(parents=True)
     (zone / "temp").write_text("85000\n")
     assert mc.linux_thermal(tmp_path / "thermal") == 1
-    # a corrupt state file is replaced, never trusted
+    (tmp_path / "vmstat").write_text("pgpgin 10\npswpout 3\n")
+    assert mc.linux_swap(tmp_path / "vmstat") == 3 * 4096
+    # a corrupt state file is replaced, never trusted; blind readings hold a set base of 2 at 2
     home = tmp_path / "mhome"
     home.mkdir()
     (home / mc.STATE).write_text("{not json")
     assert mc.check("a", _mcap_cfg(top=2), 0, claim=True, home=home, read=lambda: dict(blind, at=time.time())) is None
-    assert json.loads((home / mc.STATE).read_text())["projects"]["a"]["running"] == 1
+    assert mc.check("a", _mcap_cfg(top=2), 1, claim=True, home=home, read=lambda: dict(blind, at=time.time())) is None
+    assert mc.check("a", _mcap_cfg(top=2), 2, home=home, read=lambda: dict(blind, at=time.time()))
+    assert json.loads((home / mc.STATE).read_text())["projects"]["a"]["running"] == 2
+
+
+def test_machine_limit_null_project_does_not_drag_the_others_down(env, tmp_path):
+    """A project left at null publishes no base, so it never pulls the machine limit under another's;
+    an older daemon's entry without a base still counts by its published limit."""
+    from ttp import machinecap as mc
+    home, now = tmp_path / "mhome", time.time()
+    sig = dict(_IDLE, at=now)
+    null_cfg = {"machine": {"worker_limit": "on", "max_workers": None}}
+    mc.publish("nul", null_cfg, 1, now=now, home=home)
+    assert json.loads((home / mc.STATE).read_text())["projects"]["nul"]["base"] is None
+    assert mc.check("set", _mcap_cfg(top=6), 4, now=now, home=home, read=lambda: sig) is None, "1 + 4 < 6"
+    assert mc.check("set", _mcap_cfg(top=6), 5, now=now, home=home, read=lambda: sig), "1 + 5 = 6"
+    assert mc.check("nul", null_cfg, 30, now=now, home=home, read=lambda: sig) is None, "healthy: no machine hold"
+    data = json.loads((home / mc.STATE).read_text())
+    data["projects"]["old"] = {"pid": os.getpid(), "at": now, "running": 0, "limit": 3}
+    (home / mc.STATE).write_text(json.dumps(data))
+    assert mc.check("nul", null_cfg, 2, now=now, home=home, read=lambda: sig) is None
+    assert mc.check("nul", null_cfg, 3, now=now, home=home, read=lambda: sig), "the old entry's 3 binds"
 
 
 def test_machine_limit_is_on_for_laptops_and_off_for_servers(tmp_path):

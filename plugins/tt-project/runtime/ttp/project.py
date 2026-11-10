@@ -552,10 +552,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # the machine awake themselves as needed.
     # pin_verify: strict refuses an explicit task model/effort pin that cannot be verified before a turn.
     "runner": {"nice": 10, "prevent_idle_sleep": "off", "pin_verify": "lenient"},
-    # One limit on concurrent workers across all projects on this machine (machinecap.py), paced by CPU,
-    # memory, a call in progress and heat. worker_limit: auto (on for laptops and workstations: macOS or
-    # a battery present; off on lab and build servers), on, off. max_workers: the base before pacing,
-    # null = half the cores, from 2 to 8. budget.max_parallel_workers stays each project's own ceiling.
+    # One limit on concurrent workers across all projects on this machine (machinecap.py), cut only when
+    # the machine is truly short: sustained low CPU idle, memory pressure or swapping, a call with low
+    # CPU idle, heat. worker_limit: auto (on for laptops and workstations: macOS or a battery present;
+    # off on lab and build servers), on, off. max_workers: the base before pacing; null holds nothing
+    # while nothing is short and is the cores under pressure. budget.max_parallel_workers stays each
+    # project's own ceiling.
     "machine": {"worker_limit": "auto", "max_workers": None},
     # reuse: every ssh the project starts (probes, checks, workers, git over ssh) shares one connection per
     # host for 10 minutes (OpenSSH ControlMaster through the harness's bin/ssh; sockets in ~/.tt-project/cm),
