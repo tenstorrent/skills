@@ -100,7 +100,10 @@ def test_resume_of_a_users_own_pause_names_it_without_a_warning(env, capsys):
     assert "not the user's" not in out
 
 
-def _as_run(monkeypatch, p, run="7"):
+def _as_run(monkeypatch, p, run="7", role=None):
+    if role:   # caller() reads the run's role from its row: without one a run is a worker
+        run = str(p.db.x("INSERT INTO runs(role,provider,started,status) VALUES(?,'claude',?,'running')",
+                         (role, time.time())))
     monkeypatch.setenv("TTP_RUN_ID", run)
     monkeypatch.setenv("TTP_PROJECT", str(p.base))
 
@@ -131,17 +134,61 @@ def test_a_worker_never_re_pauses_a_project_the_user_resumed(env, monkeypatch, c
     assert p.db.kv("paused") is True and projpause.current(p.db)["by"] == "worker run 7"
 
 
-def test_the_coordinator_never_re_pauses_a_resource_the_user_resumed(env, monkeypatch, capsys):
-    from ttp import cli
+@pytest.mark.parametrize("role", [None, "coordinator"])
+def test_a_run_never_re_pauses_a_resource_the_user_resumed(env, monkeypatch, capsys, role):
+    from ttp import cli, projpause
     from ttp.coordinator import pause_resource
     p = make(env)
     pause_resource(p, "box-a", True, reason="handed back to its owner", by="worker")
     cli.main(["resume", "demo", "--resource", "box-a"])  # the user
     assert "box-a" not in p.db.paused_resources()
-    _as_run(monkeypatch, p)
+    _as_run(monkeypatch, p, role=role)
+    assert cli._pause_by(p) == (role or "worker")
     with pytest.raises(SystemExit):
         cli.main(["pause", "demo", "--resource", "box-a", "--reason", "looks live", "--until", "2d"])
+    assert "box-a" not in p.db.paused_resources() and "the user resumed resource box-a" in capsys.readouterr().err
+
+
+def test_the_coordinators_resource_pause_action_never_re_pauses_what_the_user_resumed(env):
+    """The coordinator's own resource_pause action is gated like `ttp pause --resource`; the same action
+    in a turn carrying the user's words asking for it is the user's pause and goes through."""
+    from ttp import cli
+    from ttp import coordinator as coord
+    from ttp.coordinator import pause_resource
+    p = make(env)
+    pause_resource(p, "box-a", True, reason="handed back to its owner", by="coordinator")
+    cli.main(["resume", "demo", "--resource", "box-a"])  # the user
+    act = {"type": "resource_pause", "resource": "box-a", "paused": True, "reason": "looks live", "until": "1d"}
+    rejected = coord.apply(p, [act])
+    assert rejected and "the user resumed resource box-a" in str(rejected)
     assert "box-a" not in p.db.paused_resources()
+    msg = p.db.post("in", "Pause box-a again until I say so.")
+    assert coord.apply(p, [act], user_turn=True, messages=[msg]) == []
+    assert p.db.paused_resources()["box-a"]["by"] == "user"
+
+
+@pytest.mark.parametrize("args", [["drain", "demo"], ["pause", "demo", "--until-reboot", "--reason", "kernel update"]])
+def test_a_runs_host_cycle_pause_after_a_user_resume_goes_through(env, monkeypatch, args):
+    """The own-host reboot procedure (`ttp drain`, a pause until reboot) is lifted by the run or the
+    daemon itself, so a user's earlier resume never blocks it."""
+    from ttp import cli
+    p = make(env)
+    p.db.set_paused(True, by="worker run 5", via="CLI", reason="handed back to its owner")
+    cli.main(["resume", "demo"])                         # the user
+    _as_run(monkeypatch, p)
+    cli.main(args)
+    assert p.db.kv("paused") is True
+
+
+def test_a_users_resume_binds_runs_only_for_a_few_days(env, monkeypatch):
+    from ttp import cli, projpause
+    p = make(env)
+    p.db.set_paused(True, by="worker run 5", via="CLI", reason="handed back to its owner")
+    cli.main(["resume", "demo"])                         # the user
+    p.db.x("UPDATE events SET ts=ts-? WHERE kind='project_pause'", (projpause.REPAUSE_GUARD_S + 60,))
+    _as_run(monkeypatch, p)
+    cli.main(["pause", "demo", "--reason", "host maintenance"])
+    assert p.db.kv("paused") is True
 
 
 def test_a_pause_by_a_run_after_a_runs_own_resume_is_allowed(env, monkeypatch):

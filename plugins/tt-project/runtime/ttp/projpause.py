@@ -76,16 +76,23 @@ def user_resume(db, resource: str | None = None) -> dict | None:
     return {"ts": float(row["ts"]), "via": d.get("via") or ""} if ok and d.get("by") == "user" else None
 
 
-def repause_refusal(db, by: str, user_msg: int | None = None, resource: str | None = None) -> str:
+REPAUSE_GUARD_S = 3 * 86400
+HOST_CYCLE_VIA = "ttp drain"
+HOST_CYCLE_END = "until reboot"
+
+
+def repause_refusal(db, by: str, user_msg: int | None = None, resource: str | None = None,
+                    now: float | None = None, guard_s: float = REPAUSE_GUARD_S) -> str:
     """Why a worker, coordinator or other project may not pause again what the user lifted ("" = it may).
-    The user's resume is their word that it runs; only a newer user message (`user_msg`, an inbound
-    message after that resume) asking for the pause outranks it. A pause in force is not re-checked."""
+    The user's resume (within the last `guard_s`) is their word that it runs; only a newer user message
+    (`user_msg`, an inbound message after that resume) asking for the pause outranks it. A pause in force
+    is not re-checked; an older resume no longer binds."""
     if by in ("user", UNKNOWN, "daemon"):
         return ""
     if (db.kv("paused", False) if resource is None else resource in db.paused_resources(shared=False)):
         return ""
     lifted = user_resume(db, resource)
-    if not lifted:
+    if not lifted or (time.time() if now is None else now) - lifted["ts"] > guard_s:
         return ""
     if user_msg is not None:
         row = db.one("SELECT ts FROM messages WHERE id=? AND direction='in' AND kind='user'", (int(user_msg),))
@@ -103,9 +110,11 @@ def pause(db, by: str, reason: str = "", via: str = "", end: str = "", now: floa
           user_msg: int | None = None) -> dict:
     """Record a pause of the whole project by `by`. A non-user caller must say why; a user's (or an
     unknown caller's) pause without a reason records NO_REASON. A re-pause keeps when the pause began.
-    A worker, coordinator or other project never re-applies a pause the user lifted (repause_refusal)."""
+    A worker, coordinator or other project never re-applies a pause the user lifted (repause_refusal),
+    except a host-cycle pause (`ttp drain`, until reboot) that the run or the daemon lifts itself."""
     now = time.time() if now is None else now
-    refusal = repause_refusal(db, by, user_msg)
+    cycle = via == HOST_CYCLE_VIA or end == HOST_CYCLE_END
+    refusal = "" if cycle else repause_refusal(db, by, user_msg, now=now)
     if refusal:
         raise PermissionError(refusal)
     reason = " ".join(str(reason or "").split())

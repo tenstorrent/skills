@@ -4013,6 +4013,10 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 # The user's own request makes it their pause before any default end is chosen:
                 # a health end then only reports, it never lifts it.
                 by = "user" if a["paused"] and _users_pause(db, a, user_turn, messages) else "coordinator"
+                if a["paused"] and by == "coordinator":
+                    refusal = projpause.repause_refusal(db, "coordinator", resource=name)
+                    if refusal:
+                        raise ValueError(refusal)
                 # A re-pause keeps the user's pause theirs (pause_resource), so its end is chosen as theirs.
                 owner = "user" if "user" in (by, (held or {}).get("by")) else by
                 line = pause_resource(p, name, a["paused"], reason=a.get("reason") or a.get("text") or "", by=by, key=key,
