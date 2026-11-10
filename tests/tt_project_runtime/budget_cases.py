@@ -5222,6 +5222,9 @@ def test_plan_billed_provider_reports_window_points_not_dollars(env):
     from ttp.web import budget_line
     now = time.time()
     _codex_plan_day(p, now)
+    # a Claude reading makes Claude the shown provider, so Codex's plan windows go on the status line apart
+    p.db.x("INSERT INTO snapshots(ts,provider,account,window,utilization,resets_at) VALUES(?,?,?,?,?,?)",
+           (now - 3000, "claude", "e", "5h", 20.0, now + 9000))
     assert planuse.window_points(p.db, "codex", now - 86400, now) == {"5h": 25.0, "7d": 12.0}
     rows = trainstats.per_landed(p.db, None, "", now, cfg=p.config())
     day = rows[0]
@@ -5239,6 +5242,17 @@ def test_plan_billed_provider_reports_window_points_not_dollars(env):
     p.set_config("providers.codex.billing", "usage")
     day = trainstats.per_landed(p.db, None, "", now, cfg=p.config())[0]
     assert day["usd"] == 154.0 and day["virtual_usd"] == 0 and day["plan"] == [], day
+
+
+def test_plan_billed_provider_reports_codex_alone_shown_with_its_windows(env):
+    """With readings only for Codex, the status line shows Codex itself with its windows, not a second
+    'codex plan' part."""
+    p = make(env)
+    from ttp.web import budget_line
+    now = time.time()
+    _codex_plan_day(p, now)
+    line = budget_line(p.db, now, "claude")
+    assert "5h 5%" in line and "7d 52%" in line and "codex plan" not in line, line
 
 
 def test_plan_billed_codex_dollars_never_trip_a_dollar_cap(env):
