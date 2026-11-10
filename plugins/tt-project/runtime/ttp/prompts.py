@@ -922,6 +922,8 @@ def worker_task(p: Project, task: dict, cwd: str, branch: str | None, wake: dict
                     + f": `git worktree add <dir>/t{task['id']} -b ttp/t{task['id']}-<topic> <start>`, <start> "
                     "the branch you build on. Never edit another task's worktree.\n")
     history += verified_line(p, task, cwd)
+    if kind in ("code", "review", "work", "harness"):
+        history += remote_only_line(cfg)
     if kind == "review":
         history += no_commit_line(p, task)
     own_off = own_push(cfg) == "off"
@@ -1168,6 +1170,19 @@ def verified_line(p: Project, task: dict, cwd: str) -> str:
     return (f"\nInherited marker: {m['line']}. Verify only the commits after it (`git log {m['sha'][:12]}..HEAD`) "
             f"and your own: do not re-review or re-test the inherited commits. `ttp checks` scopes its "
             f"if_changed checks the same way; the push checks still run in full on the final head.\n")
+
+
+def remote_only_line(cfg: dict) -> str:
+    """On a workstation whose heavy checks go to spill hosts (checkspill.remote_only), the worker is told to run
+    tests and builds only through `ttp checks`. "" elsewhere, or on error."""
+    from . import checkspill
+    try:
+        if not checkspill.remote_only(cfg):
+            return ""
+    except Exception:
+        return ""
+    return ("\nThis machine is a workstation whose heavy checks go to spill hosts (delivery.checks_remote_only): run "
+            "tests and builds only through `ttp checks`, never a plain pytest or build here.\n")
 
 
 def no_commit_line(p: Project, task: dict) -> str:

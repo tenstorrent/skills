@@ -3583,3 +3583,12 @@ def test_on_a_workstation_a_heavy_run_falls_back_here_only_when_every_spill_host
     cli.main(["checks", "--fresh"])
     rec = json.loads((run / "checks.json").read_text())
     assert rec["passed"] is True and "spilled_to" not in rec, rec
+
+
+def test_workers_on_a_remote_only_workstation_are_told_to_run_tests_through_ttp_checks(env, monkeypatch):
+    """The code worker prompt names `ttp checks` as the only test route only where checkspill.remote_only holds."""
+    from ttp import checkspill, prompts
+    on = {"delivery": {"checks_spill_hosts": ["check-host-a"], "checks_remote_only": True}}
+    assert "never a plain pytest or build here" in prompts.remote_only_line(on)
+    assert prompts.remote_only_line({**on, "delivery": {**on["delivery"], "checks_remote_only": False}}) == ""
+    assert prompts.remote_only_line({}) == ""
