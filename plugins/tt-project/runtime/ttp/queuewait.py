@@ -33,7 +33,7 @@ from pathlib import Path
 from . import msgparts, obligations
 
 KIND = "queue_wait"
-KV = "queue_wait"   # {"open": {episode: {task, queue, since, seen, acted, raise}}, "hist": [ended], "told": [episode]}
+KV = "queue_wait"   # {"open": {episode: {task, queue, since, opened, seen, acted, raise}}, "hist": [ended], "told": [episode]}
 DEFAULT_MIN = 30.0
 GRACE_S = 1800.0   # a wait not seen this long ends its episode; a shorter gap is the same wait
 HIST_KEEP_S = 7 * 86400.0
@@ -402,7 +402,7 @@ def scan(p, cfg: dict, now: float | None = None, host: dict | None = None, devic
         ep = episode(w)
         live.add(ep)
         rec = opened.setdefault(ep, {"task": w["task"], "queue": w["queue"], "res": w["res"], "since": w["since"],
-                                     "seen": now, "acted": None})
+                                     "opened": int(now), "seen": now, "acted": None})
         if rec.get("acted"):
             continue
         k = key(w)
@@ -433,7 +433,8 @@ def scan(p, cfg: dict, now: float | None = None, host: dict | None = None, devic
                 FOLD: fold(w, opts, now, spill_note(sp, cfg))}
         if held:
             data[pagesev.RIDE_ALONG] = True   # no coordinator action lifts it: joins the next turn
-        fp = f"{KIND}:{ep}:{n}"
+        # the episode's open time keeps a later episode of the same task and queue off this one's fingerprints
+        fp = f"{KIND}:{ep}:{int(rec.get('opened') or rec['since'])}:{n}"
         if len(raised) < MAX_RAISE and obligations._raise(db, now, fp, KIND, msg, w["task"], data,
                                                           severity="normal" if held else "high"):
             raised.append(fp)   # the longest waits first; the rest at a later scan

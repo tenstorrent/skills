@@ -514,6 +514,30 @@ def test_queue_wait_start_flip_keeps_one_episode_and_a_short_gap_does_not_end_it
     assert st["open"] == {} and len(st["hist"]) == 1 and _qw_events(p, "queued") == []
 
 
+def test_queue_wait_a_later_episode_of_the_same_task_and_queue_is_raised(env):
+    """An episode that ended past GRACE_S leaves its fingerprints in events: a later wait of the same task
+    on the same queue opens a new episode and raises under its own fingerprint, not the ended one's."""
+    from ttp import queuewait
+    p = make(env)
+    now = time.time()
+    tid = p.db.add_task("dev run", "s", kind="work", origin="user")
+    wait = lambda t: p.db.update_task(tid, not_before=t + 600, result=json.dumps(   # noqa: E731
+        {"status": "waiting", "retry_when": "ttp lock --probe dev0", "waiting_since": t - 40 * 60}))
+    wait(now)
+    first = queuewait.scan(p, QW_CFG, now, {}, {"dev0"})
+    assert len(first) == 1
+    p.db.update_task(tid, result=json.dumps({"status": "waiting"}))
+    queuewait.scan(p, QW_CFG, now + 60, {}, {"dev0"})
+    later = now + 60 + queuewait.GRACE_S + 1
+    queuewait.scan(p, QW_CFG, later, {}, {"dev0"})   # past the grace: the first episode ended
+    assert p.db.kv(queuewait.KV)["open"] == {}
+    wait(later + 3600)
+    second = queuewait.scan(p, QW_CFG, later + 3600, {}, {"dev0"})
+    assert len(second) == 1 and second != first
+    (rec,) = p.db.kv(queuewait.KV)["open"].values()
+    assert rec["raise"]["n"] == 1 and len(_qw_events(p)) == 2
+
+
 def test_queue_wait_raises_again_only_on_a_changed_cause_or_a_doubled_wait(env):
     """Same cause: no raise at the next marks; the options running out (a user pause) is a new cause; a wait
     that doubles since its last raise is raised again."""
