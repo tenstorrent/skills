@@ -312,7 +312,7 @@ CODEX_NO_CALL = [{"type": "thread.started", "thread_id": "t1"}, {"type": "turn.s
 
 
 def _timed_out_run(d, provider, lines, *, took=2464.0):
-    """A worker run of `provider` cut off at its 2464 s timeout with a $3.59 budget (the ltx-rt case)."""
+    """A worker run of `provider` cut off at its 2464 s timeout with a $3.59 budget (a logged-out case)."""
     db = d.p.db
     tid = db.add_task("build", "", kind="work", tier="standard", priority=3, budget_usd=8.0, labels=[])
     db.update_task(tid, status="running")
@@ -331,7 +331,7 @@ def _timed_out_run(d, provider, lines, *, took=2464.0):
 
 
 def test_a_timed_out_run_that_made_no_model_call_books_0_and_counts_toward_no_cap(env):
-    """The ltx-rt case: Codex logged out with no internet timed out after 2464 s with 0 tokens and was
+    """The logged-out case: Codex logged out with no internet timed out after 2464 s with 0 tokens and was
     booked the elapsed share of its budget ($3.59) as spend. It made no call: $0, no cap moves."""
     from ttp.daemon import Daemon
     d = Daemon(make(env).base)

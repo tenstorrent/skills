@@ -11422,9 +11422,9 @@ def test_push_checks_on_a_remote_host_skip_this_hosts_load_guard_checks_slot_and
     p = make(env)
     monkeypatch.setattr(testslots, "load_guard", lambda: "the host's CPU is overloaded")
     monkeypatch.setattr(push, "check_slot", lambda *a, **k: pytest.fail("no local checks slot"))
-    _remote_load(monkeypatch, {"blx06": [(3.0, 64)]})
+    _remote_load(monkeypatch, {"checkhost": [(3.0, 64)]})
     before = len(checkcap.grant_records())
-    run = push.check_list([{"run": "pytest -n 16 tests", "host": "blx06"},
+    run = push.check_list([{"run": "pytest -n 16 tests", "host": "checkhost"},
                            "claude plugin validate plugins/tt-project --strict"])
     told, t0 = [], time.time()
     slot = push.run_slot(run, "abc", told.append, priority="branch-key", proj=p)
@@ -11432,7 +11432,7 @@ def test_push_checks_on_a_remote_host_skip_this_hosts_load_guard_checks_slot_and
     assert slot.f is None and slot.tests is None and slot.env() == {}
     assert len(checkcap.grant_records()) == before and checkcap.state()["running"] == []
     # delivery.checks_host as the default host counts the same.
-    slot = push.run_slot(push.with_host(push.check_list(["pytest -n 16 tests"]), "blx06"), "abc", told.append, proj=p)
+    slot = push.run_slot(push.with_host(push.check_list(["pytest -n 16 tests"]), "checkhost"), "abc", told.append, proj=p)
     assert slot.f is None and slot.tests is None
 
 
@@ -11442,21 +11442,21 @@ def test_push_checks_on_an_overloaded_remote_host_wait_for_it_and_say_so(env, mo
     from ttp import push, remoteload
     p = make(env)
     monkeypatch.setattr(push, "check_slot", lambda *a, **k: pytest.fail("no local checks slot"))
-    _remote_load(monkeypatch, {"blx06": [(90.0, 64), (90.0, 64), (20.0, 64)]})
-    run = push.check_list([{"run": "pytest -n 16 tests", "host": "blx06"}])
+    _remote_load(monkeypatch, {"checkhost": [(90.0, 64), (90.0, 64), (20.0, 64)]})
+    run = push.check_list([{"run": "pytest -n 16 tests", "host": "checkhost"}])
     told = []
     slot = push.run_slot(run, "abc", told.append, proj=p)
     assert slot.f is None and len(told) == 1, told
-    assert "check host blx06's CPU is overloaded" in told[0] and "90.0 cores" in told[0] and "64 cores" in told[0]
+    assert "check host checkhost's CPU is overloaded" in told[0] and "90.0 cores" in told[0] and "64 cores" in told[0]
     assert "waiting for it to drop" in told[0] and "300s" in told[0]
     # Past the bound it starts anyway; an unreadable host never holds it.
     monkeypatch.setenv(testslots_env := "TTP_CHECKS_PUSH_LOAD_WAIT_S", "0")
-    _remote_load(monkeypatch, {"blx06": [(90.0, 64)]})
+    _remote_load(monkeypatch, {"checkhost": [(90.0, 64)]})
     told = []
-    assert remoteload.wait(["blx06"], told.append, push.testslots.push_load_wait_s({})) and "starting anyway" in told[-1]
+    assert remoteload.wait(["checkhost"], told.append, push.testslots.push_load_wait_s({})) and "starting anyway" in told[-1]
     monkeypatch.delenv(testslots_env)
-    _remote_load(monkeypatch, {"blx06": [None]})
-    assert remoteload.wait(["blx06"], told.append, None) == ""
+    _remote_load(monkeypatch, {"checkhost": [None]})
+    assert remoteload.wait(["checkhost"], told.append, None) == ""
 
 
 def test_local_push_checks_still_take_a_checks_slot_and_never_read_a_remote_host(env, monkeypatch):
@@ -11481,12 +11481,12 @@ def test_ttp_checks_run_only_on_a_remote_host_take_no_local_checks_slot(env, mon
     p = make(env)
     monkeypatch.setattr(testslots, "load_guard", lambda: "the host's CPU is overloaded")
     monkeypatch.setattr(checkcap, "acquire", lambda *a, **k: pytest.fail("no local checks slot"))
-    _remote_load(monkeypatch, {"blx06": [(3.0, 64)]})
+    _remote_load(monkeypatch, {"checkhost": [(3.0, 64)]})
     out = io.StringIO()
-    cmds = push.check_list([{"run": "pytest -n 16 tests", "host": "blx06"}, "git diff --check"])
+    cmds = push.check_list([{"run": "pytest -n 16 tests", "host": "checkhost"}, "git diff --check"])
     slot = cli._checks_slot(p, tmp_path, out, "a" * 40, cmds=cmds, top=str(p.root))
     assert slot.f is None and slot.tests is None
-    assert "checks run on blx06: running now, outside this machine's checks slot" in out.getvalue()
+    assert "checks run on checkhost: running now, outside this machine's checks slot" in out.getvalue()
 
 
 def test_remoteload_parses_two_proc_stat_samples():

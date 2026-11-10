@@ -5537,7 +5537,7 @@ def test_a_user_stage_machine_condition_page_reaches_only_its_owners_chat(env):
 
 def test_a_provider_whose_runs_make_no_model_call_stops_the_coordinator_until_a_model_free_check_passes(
         env, monkeypatch):
-    """The ltx-rt case: a CLI logged out on a box with no internet fails with 0 tokens and no login
+    """The case: a CLI logged out on a box with no internet fails with 0 tokens and no login
     refusal the daemon can read, so the coordinator retried every ~41 min. NO_CALL_STREAK such runs open
     the breaker and raise one alert; nothing starts on it while the login or HTTPS check fails; it
     resumes by itself once both pass."""
