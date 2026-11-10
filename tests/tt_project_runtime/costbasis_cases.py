@@ -303,3 +303,103 @@ def test_alias_priced_fork_rows_are_re_booked_once_at_their_runs_time(env):
     db.set_kv(dmod.MODEL_REPRICE_KEY, None)
     assert d.reprice_alias_runs() == [], "a re-priced row was re-booked again"
     assert len(db.q("SELECT 1 FROM ledger WHERE usd<0")) == 4
+
+
+# A CLI logged out or offline: it starts a turn, fails to reach its API and retries until the timeout.
+CODEX_NO_CALL = [{"type": "thread.started", "thread_id": "t1"}, {"type": "turn.started"},
+                 {"type": "error", "message": "Reconnecting... 1/5 (stream disconnected before completion)"},
+                 {"type": "error", "message": "stream disconnected before completion: error sending request"}]
+
+
+def _timed_out_run(d, provider, lines, *, took=2464.0):
+    """A worker run of `provider` cut off at its 2464 s timeout with a $3.59 budget (the ltx-rt case)."""
+    db = d.p.db
+    tid = db.add_task("build", "", kind="work", tier="standard", priority=3, budget_usd=8.0, labels=[])
+    db.update_task(tid, status="running")
+    rid = db.x("INSERT INTO runs(task,role,provider,model,started,status,boot_id) "
+               "VALUES(?,'worker',?,'gpt-5',?,'running',?)", (tid, provider, time.time() - took, d.boot))
+    run_dir = d.p.runs / str(rid)
+    run_dir.mkdir(parents=True)
+    db.x("UPDATE runs SET dir=? WHERE id=?", (str(run_dir), rid))
+    (run_dir / "output.jsonl").write_text("".join(json.dumps(x) + "\n" for x in lines))
+    (run_dir / "stderr.log").write_text("")
+    (run_dir / "run.json").write_text(json.dumps({"budget_usd": 3.59, "timeout_s": took, "argv": []}))
+    d.finish_run(db.one("SELECT * FROM runs WHERE id=?", (rid,)),
+                 {"rc": None, "started": time.time() - took, "ended": time.time(), "stopped": "timeout",
+                  "slept_s": 0})
+    return db.one("SELECT * FROM runs WHERE id=?", (rid,))
+
+
+def test_a_timed_out_run_that_made_no_model_call_books_0_and_counts_toward_no_cap(env):
+    """The ltx-rt case: Codex logged out with no internet timed out after 2464 s with 0 tokens and was
+    booked the elapsed share of its budget ($3.59) as spend. It made no call: $0, no cap moves."""
+    from ttp.daemon import Daemon
+    d = Daemon(make(env).base)
+    t0 = time.time() - 3600
+    run = _timed_out_run(d, "codex", CODEX_NO_CALL)
+    assert run["status"] == "timeout" and run["cost_usd"] == 0, dict(run)
+    assert d.p.db.task(run["task"])["spent_usd"] == 0
+    assert d.p.db.spent_since(t0) == 0 and d.p.db.spent_since(t0, billed=True) == 0
+    # The same cut-off run that got an answer keeps the elapsed estimate: it did spend.
+    answered = CODEX_NO_CALL[:2] + [{"type": "item.completed", "item": {"type": "agent_message", "text": "hi"}}]
+    run = _timed_out_run(d, "codex", answered)
+    assert run["cost_usd"] == pytest.approx(3.59, rel=0.05) and run["cost_estimated"] == 1, dict(run)
+
+
+@pytest.mark.parametrize("lines,called", [
+    ([], False),
+    (CODEX_NO_CALL, False),
+    ([{"type": "turn.failed", "error": {"message": "401 Unauthorized"}}], False),
+    ([{"id": "0", "msg": {"type": "task_started"}}, {"id": "0", "msg": {"type": "stream_error"}},
+      {"id": "0", "msg": {"type": "token_count", "info": None}}], False),
+    ([{"type": "system", "subtype": "init"},
+      {"type": "assistant", "message": {"model": "<synthetic>", "content": [{"type": "text", "text": "Not logged in"}]}},
+      {"type": "result", "is_error": True, "result": "Not logged in · Please run /login"}], False),
+    ([{"type": "assistant", "message": {"id": "m1", "model": "opus"}}], True),
+    ([{"type": "item.completed", "item": {"type": "reasoning"}}], True),
+    ([{"type": "turn.completed", "usage": {"input_tokens": 0}}], True),
+    ([{"id": "0", "msg": {"type": "agent_message", "message": "hi"}}], True),
+    ([{"type": "result", "subtype": "success", "is_error": False, "result": "done"}], True),
+    ([{"type": "something_new"}], True),   # an unknown stream keeps its estimate
+])
+def test_model_called_reads_a_call_from_any_providers_stream(tmp_path, lines, called):
+    from ttp.daemon import _model_called
+    out = tmp_path / "output.jsonl"
+    out.write_text("not json\n" + "".join(json.dumps(x) + "\n" for x in lines))
+    assert _model_called(out) is called
+    assert _model_called(tmp_path / "missing.jsonl") is False
+
+
+def test_the_no_call_rebook_takes_back_past_estimates_with_signed_rows_once(env):
+    from ttp.daemon import CALLS_REBOOK_DAYS, Daemon
+    d = Daemon(make(env).base)
+    db = d.p.db
+    now = time.time()
+
+    def booked(lines, ended):
+        tid = db.add_task("t", "", kind="work", tier="standard", priority=3, budget_usd=8.0, labels=[])
+        rid = db.x("INSERT INTO runs(task,role,provider,started,ended,status,cost_usd,cost_estimated) "
+                   "VALUES(?,'coordinator','codex',?,?,'timeout',3.59,1)", (tid, ended - 2464, ended))
+        run_dir = d.p.runs / str(rid)
+        run_dir.mkdir(parents=True)
+        db.x("UPDATE runs SET dir=? WHERE id=?", (str(run_dir), rid))
+        (run_dir / "output.jsonl").write_text("".join(json.dumps(x) + "\n" for x in lines))
+        db.x("UPDATE tasks SET spent_usd=3.59 WHERE id=?", (tid,))
+        db.spend("codex", 3.59, "t", estimated=True, ts=ended)
+        return rid, tid
+
+    wrong, wrong_task = booked(CODEX_NO_CALL, now - 86400)
+    called, _ = booked([{"type": "item.completed", "item": {"type": "agent_message"}}], now - 86400)
+    old, _ = booked(CODEX_NO_CALL, now - (CALLS_REBOOK_DAYS + 1) * 86400)
+    since = now - 2 * 86400
+    assert db.spent_since(since) == pytest.approx(7.18)
+    assert d.rebook_no_call(dry_run=True) == [(wrong, 3.59)] and db.spent_since(since) == pytest.approx(7.18)
+    assert d.rebook_no_call() == [(wrong, 3.59)]
+    assert db.one("SELECT cost_usd FROM runs WHERE id=?", (wrong,))["cost_usd"] == 0
+    assert json.loads(db.one("SELECT note FROM runs WHERE id=?", (wrong,))["note"])["no_call_rebooked"] == 3.59
+    assert db.task(wrong_task)["spent_usd"] == 0
+    assert db.one("SELECT usd FROM ledger WHERE usd<0")["usd"] == pytest.approx(-3.59)
+    assert db.spent_since(since) == pytest.approx(3.59), "only the run that called a model still counts"
+    assert db.one("SELECT cost_usd FROM runs WHERE id=?", (called,))["cost_usd"] == 3.59
+    assert db.one("SELECT cost_usd FROM runs WHERE id=?", (old,))["cost_usd"] == 3.59
+    assert d.rebook_no_call() is None, "it runs once"

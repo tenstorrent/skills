@@ -678,6 +678,10 @@ CALLS_REBOOK_PROGRESS_KEY = "per_call_rebook_progress"   # its place while it ru
 CALLS_REBOOK_SLICE_S = 2.0      # a tick's slice of it stops after the session that passes this many seconds
 CALLS_REBOOK_SLICE_RUNS = 200   # or this many runs, so no tick step runs long (a 7-day re-book of a busy project ~50 s)
 CALLS_NOTE = "cost_calls"   # a Claude run's note: booked at its calls' list price (how many calls)
+NO_CALL_REBOOK_KEY = "no_call_rebook"   # Daemon.rebook_no_call ran (once per project)
+NO_CALL_KEY = "no_call_streak:"   # + provider: its runs that ended failed in a row with no model call
+NO_CALL_STREAK = 3   # this many in a row open the provider's breaker until a model-free check passes
+NO_CALL_STATUSES = ("failed", "timeout", "stalled")   # ends that count toward that streak
 MODEL_REPRICE_SINCE = (2026, 11, 7)   # its window's first day, in the home zone: the days the dollar caps over-counted
 REACH_EVERY_S = 30      # while a provider is held offline, how often its API host is resolved again
 REACH_TIMEOUT_S = 5
@@ -2111,7 +2115,7 @@ class Daemon:
         self.tend_lease()
         # Compared as callables, not by name, so a step replaced on the instance is gated the same way.
         lease_off = [] if self.lease_held() else [getattr(self, n) for n in LEASE_STEPS]
-        for step in (self.lift_boot_pause, self.reap_runs, self.reap_waiting_checks, self.wake_after_reboot, self.meter_running, self.rebook_per_call_step, self.watch_runs, self.check_steer_reads, self.relay_escalations, self.post_held_notifies, self.reconcile_tasks, self.retry_workspaces, self.tend_pushes,
+        for step in (self.lift_boot_pause, self.reap_runs, self.reap_waiting_checks, self.wake_after_reboot, self.meter_running, self.rebook_per_call_step, self.rebook_no_call_step, self.watch_runs, self.check_steer_reads, self.relay_escalations, self.post_held_notifies, self.reconcile_tasks, self.retry_workspaces, self.tend_pushes,
                      self.sweep_sandbox_trees,
                      self.verify_pushes,
                      self.tick_prune_worktrees, self.prune_leftovers, self.land_harness_worktrees, self.backup_branches, self.replicate_state, self.check_local_only, self.check_disk,
@@ -5517,6 +5521,59 @@ class Daemon:
                     f"cost in {prog['slices']} slice(s): ${prog['usd_before']:.2f} booked -> ${prog['usd_after']:.2f}")
         return changed
 
+    def rebook_no_call_step(self) -> None:
+        """Tick step: the one-time re-book of estimated runs that made no model call (rebook_no_call)."""
+        if getattr(self, "_no_call_rebook_done", False):
+            return
+        try:
+            self.rebook_no_call()
+        except Exception:   # tried again next tick
+            log(self.p, "no-call re-book failed\n" + traceback.format_exc())
+            return
+        self._no_call_rebook_done = True
+
+    def rebook_no_call(self, dry_run: bool = False) -> list[tuple[int, float]] | None:
+        """Once per project (kv NO_CALL_REBOOK_KEY): runs of any provider that ended in the last
+        CALLS_REBOOK_DAYS days booked at an estimate (cost_estimated, no tokens counted) although their
+        output shows no model call (_model_called), such as a logged-out or offline CLI timing out, re-booked
+        at $0 the way _cut_off_cost books one now: cost_usd 0 (note no_call_rebooked keeps the old figure),
+        the task's spend lowered by it (never below $0) and a ledger row of minus that amount at the run's end,
+        so no cap, gate or spend figure counts it. A run whose output is gone keeps its booking. With
+        `dry_run` nothing is written and the marker is not read. Returns (run id, booked before) per run
+        changed, or None when it already ran."""
+        db = self.p.db
+        if not dry_run and db.kv(NO_CALL_REBOOK_KEY):
+            return None
+        since = time.time() - CALLS_REBOOK_DAYS * 86400
+        changed = []
+        for r in db.q("SELECT * FROM runs WHERE status!='running' AND cost_usd>0 AND cost_estimated=1 "
+                      "AND COALESCE(input_tokens,0)=0 AND COALESCE(output_tokens,0)=0 "
+                      "AND COALESCE(cache_read_tokens,0)=0 AND COALESCE(cache_write_tokens,0)=0 "
+                      "AND COALESCE(ended, started)>=? ORDER BY id", (since,)):
+            out = self._run_dir(r) / "output.jsonl"
+            if not out.is_file() or _model_called(out):
+                continue
+            before = round(float(r["cost_usd"]), 6)
+            changed.append((r["id"], before))
+            if dry_run:
+                continue
+            note = json.loads(r["note"] or "{}")
+            note["no_call_rebooked"] = before
+            with db.tx():
+                db.x("UPDATE runs SET cost_usd=0, note=? WHERE id=?", (json.dumps(note), r["id"]))
+                if r["task"]:
+                    db.x("UPDATE tasks SET spent_usd=MAX(COALESCE(spent_usd,0)-?,0) WHERE id=?", (before, r["task"]))
+                db.spend(r["provider"], -before, self._source_for(r), account=r["account"] or "", estimated=True,
+                         ts=float(r["ended"] or r["started"] or time.time()))
+        if dry_run:
+            return changed
+        usd = round(sum(c[1] for c in changed), 6)
+        db.set_kv(NO_CALL_REBOOK_KEY, {"at": time.time(), "runs": len(changed), "usd_before": usd})
+        if changed:
+            log(self.p, f"re-booked {len(changed)} run(s) of the last {CALLS_REBOOK_DAYS} days that made no model "
+                        f"call at $0: ${usd:.2f} of estimates taken back")
+        return changed
+
     def _output_models(self, r: dict) -> dict:
         """A booked Claude run's model ids from its output, else its note's model_used (RunUsage.extra keys
         model_usage and model)."""
@@ -5873,6 +5930,9 @@ class Daemon:
             self._prefetch_remote(r["task"], _read_result(run_dir / RESULT_FILE), run_dir)
             if status == "ok":
                 self._dry_run_on_pass(r, run_dir, usage.session_id or note.get("session_id") or "")
+        # A failed end that made no model call at all counts toward its provider's no-call streak.
+        called = _has_tokens(usage) or _model_called(run_dir / "output.jsonl")
+        no_call = status in NO_CALL_STATUSES and not slept and not called
         # Read before the transaction: it may read the provider's login files.
         read_as = (self._reading_account(r, usage.extra["windows"], bool(usage.extra.get("reinit")))
                    if usage.extra.get("windows") else r["account"] or "")
@@ -5932,6 +5992,10 @@ class Daemon:
                                         orderly=note.get("shutdown") == "orderly",
                                         slept=bool(note.get("lost_to_sleep") or note.get("lost_to_network")),
                                         held=held, root_wake=root_wake)
+        try:
+            self._note_no_call(r, no_call, called, usage, prov)
+        except Exception:   # a guard only: the run's end stands
+            log(p, f"run {r['id']}: no-call streak not recorded\n" + traceback.format_exc())
         self._check_price_table(r, usage)
         asleep = float(exit_info.get("slept_s") or 0)
         if asleep >= SLEPT_LONG_S:
@@ -6361,6 +6425,38 @@ class Daemon:
         if text:
             self.alert(turnsize.ALERT_KEY, text, "normal", every_s=0)
             self.p.db.x("UPDATE alerts SET text=? WHERE key=? AND cleared IS NULL", (text[:2000], turnsize.ALERT_KEY))
+
+    def _note_no_call(self, r: dict, no_call: bool, called: bool, usage, prov) -> None:
+        """Count `r`'s provider's runs that ended failed in a row with no model call (no tokens, no answer
+        in the stream): a CLI logged out or offline in a way it does not report as a login refusal.
+        NO_CALL_STREAK of them open its breaker (open_breaker `reach`): no run starts on it, the
+        coordinator's included, until check_logins' model-free login and HTTPS checks pass; one alert
+        names the fix and leaves it to the user. A run that made a call ends the streak."""
+        db, prov_name = self.p.db, r["provider"] or ""
+        key = NO_CALL_KEY + prov_name
+        if not no_call or self._logged_out(prov_name):   # runs ending while it is held start no streak
+            if (called or no_call) and db.kv(key):
+                db.set_kv(key, None)
+            return
+        runs = [*((db.kv(key) or {}).get("runs") or []), r["id"]][-NO_CALL_STREAK:]
+        if len(runs) < NO_CALL_STREAK:
+            db.set_kv(key, {"runs": runs})
+            return
+        db.set_kv(key, None)
+        last = (usage.error or usage.final_text or "").strip()[:120]
+        try:
+            host = get_provider(prov_name).reach_host()
+        except Exception:
+            host = ""
+        self.open_breaker(prov_name, f"{len(runs)} runs in a row made no model call (runs {_ids(runs)})", reach=True)
+        self.alert(f"auth:{prov_name}",
+                   f"{prov_name} on {hostname()} made no model call in {len(runs)} runs in a row "
+                   f"(runs {_ids(runs)}{f'; last: {last}' if last else ''}): it is logged out or cannot reach "
+                   f"{host or 'its API'}. The project is not live on {prov_name}: nothing starts on it, the "
+                   f"coordinator included, until a model-free check (its login status and an HTTPS check of "
+                   f"{host or 'its API'}) passes; then work resumes by itself and queued work is kept. "
+                   f"Fixing it is the user's decision: log in on that machine ({prov.login_hint}) or restore "
+                   f"its network. No worker logs in.", "high")
 
     def _coordinator_failed(self, why: str) -> None:
         db = self.p.db
@@ -7908,9 +8004,11 @@ class Daemon:
             return False
         return now >= float(self.p.db.kv(f"auth_probe:{prov}", 0) or 0) + AUTH_PROBE_S
 
-    def open_breaker(self, prov: str, why: str = "", at: float | None = None) -> None:
+    def open_breaker(self, prov: str, why: str = "", at: float | None = None, reach: bool = False) -> None:
         """Open `prov`'s auth breaker: no run starts on it (queued tasks keep their attempts) until
-        check_logins sees it logged in again. Kept in the project's state, so a restart keeps it."""
+        check_logins sees it logged in again. Kept in the project's state, so a restart keeps it.
+        `reach`: opened because its runs made no model call (_note_no_call), not on a login refusal:
+        check_logins also needs its API host to answer over HTTPS before it closes."""
         db = self.p.db
         prev = db.kv(alerts.BREAKER + prov) or {}
         if prev.get("open"):
@@ -7930,7 +8028,8 @@ class Daemon:
         db.set_kv(alerts.BREAKER + prov, {"open": True, "opened": now, "checks": 0, "creds": stamp,
                                           **({"account": acct, "account_kind": self._account(prov)[1]} if acct else {}),
                                           "next_check": time.time() + AUTH_CHECK_S[0], "why": why[:200],
-                                          **({"distrust": True} if distrust else {})})
+                                          **({"distrust": True} if distrust else {}),
+                                          **({"reach": True} if reach else {})})
         log(self.p, f"{prov}: logged out; no runs start on it until a login check passes")
 
     def _account(self, prov: str) -> tuple[str, str]:
@@ -7973,7 +8072,8 @@ class Daemon:
         change), or a run started since it opened got past the login. A CLI without a status check
         says nothing; one run then checks the login every AUTH_PROBE_S (_may_probe). A login back as
         another account than before the logout waits one more check; still another then, it closes
-        and says so (_close_breaker)."""
+        and says so (_close_breaker). A breaker its runs' missing model calls opened (`reach`) also needs
+        its API host to answer over HTTPS (_https_reaches), both model-free."""
         db, now = self.p.db, time.time()
         # A logged-out alert from before the breaker existed (an upgrade) opens it.
         for ep in db.q("SELECT key, MIN(raised) raised FROM alerts WHERE key LIKE 'auth:%' AND cleared IS NULL "
@@ -8004,6 +8104,14 @@ class Daemon:
             except Exception:
                 log(self.p, f"{prov}: login check failed\n" + traceback.format_exc())
                 ok = None
+            if rec.get("reach") and agent and ok is not False:
+                # Its runs made no model call: a login alone does not prove the API answers.
+                try:
+                    up = _https_reaches(agent.reach_host())
+                except Exception:
+                    up = False
+                if up is not None:   # no host to check: the login check alone decides
+                    ok = up
             if ok or (ok is None and changed):
                 switched = self._account_switched(prov, rec)
                 if switched and not rec.get("account_hold"):
@@ -19260,8 +19368,9 @@ def _cut_off_cost(run_dir: Path, exit_info: dict, usage=None, prov=None) -> floa
     a turn completes, and Cursor's result has none at all. Book the tokens the provider can still
     count (Codex: its rollout's running totals), else the elapsed share of its dollar budget rather
     than $0, so the caps keep counting it. A run whose agent never started (it gave
-    up waiting for a resource) spent nothing, and so did one that wrote no output and reported no
-    tokens, when its CLI streams (a CLI that hung, or a host that slept, before its first event)."""
+    up waiting for a resource) spent nothing, and so did one that reported no tokens and whose stream
+    shows no model call (_model_called), when its CLI streams (a CLI that hung, was logged out or
+    offline, or a host that slept, before its first answer)."""
     if exit_info.get("launched") is False:
         return 0.0
     try:
@@ -19279,6 +19388,11 @@ def _cut_off_cost(run_dir: Path, exit_info: dict, usage=None, prov=None) -> floa
         priced = _priced_from_tokens(run_dir, exit_info, usage, prov)
         if priced:
             return priced
+    # No tokens and no model call in its stream (a CLI logged out, or offline, that retried until its
+    # timeout): it spent nothing, so it books $0 and counts toward no cap.
+    if not tokens and (prov is None or prov.streams(spec.get("argv") or [])) \
+            and not _model_called(run_dir / "output.jsonl"):
+        return 0.0
     budget = float(spec.get("budget_usd") or spec.get("default_budget_usd") or 0)
     timeout = float(spec.get("timeout_s") or 0)
     elapsed = float(exit_info.get("ended") or time.time()) - float(exit_info.get("started") or 0)
@@ -19546,6 +19660,82 @@ def _list_cost(r: dict, usage, on_unknown=None) -> float:
 
 def _has_tokens(usage) -> bool:
     return bool(usage.input_tokens or usage.output_tokens or usage.cache_read_tokens or usage.cache_write_tokens)
+
+
+# Codex event types (its `msg` form) that come with no model answer.
+_NO_CALL_MSGS = frozenset({"error", "stream_error", "task_started", "session_configured", "background_event",
+                           "turn_aborted", "shutdown_complete"})
+# Stream event types that carry no answer (Claude Code, Cursor, Codex exec --json); another type counts as one.
+_NO_CALL_TYPES = frozenset({"system", "user", "error", "thread.started", "turn.started", "turn.failed",
+                            "rate_limit_event"})
+
+
+def _model_called(out: Path) -> bool:
+    """Whether a run's output.jsonl shows a model call: an assistant message (not Claude Code's
+    <synthetic> error message), a Codex item other than an error, a completed turn, a usage record
+    with tokens, or a result with an answer. Lines that are not JSON prove nothing; an event of an
+    unknown type counts as a call, so an unfamiliar stream keeps its estimate."""
+    try:
+        f = open(out, "rb")
+    except OSError:
+        return False
+    with f:
+        for raw in f:
+            try:
+                ev = json.loads(raw)
+            except ValueError:
+                continue
+            if not isinstance(ev, dict):
+                continue
+            kind = str(ev.get("type") or "")
+            msg = ev.get("message") if isinstance(ev.get("message"), dict) else {}
+            if kind == "assistant" or msg.get("id"):
+                if msg.get("model") != "<synthetic>":
+                    return True
+                continue
+            if kind.startswith("item."):
+                item = ev.get("item") if isinstance(ev.get("item"), dict) else {}
+                if (item.get("type") or item.get("item_type")) != "error":
+                    return True
+                continue
+            if kind in ("turn.completed", "response.completed"):
+                return True
+            use = ev.get("usage")
+            if isinstance(use, dict) and any(isinstance(v, (int, float)) and v > 0 for k, v in use.items()
+                                             if "token" in k):
+                return True
+            inner = ev.get("msg")
+            if isinstance(inner, dict) and inner.get("type"):
+                t = str(inner["type"])
+                if t == "token_count":
+                    if inner.get("info"):
+                        return True
+                elif t not in _NO_CALL_MSGS:
+                    return True
+                continue
+            if kind == "result":   # Cursor's answer carries no usage; an error result is no answer
+                if not ev.get("is_error") and ev.get("subtype") in (None, "success") and ev.get("result"):
+                    return True
+                continue
+            if kind and kind not in _NO_CALL_TYPES:
+                return True
+    return False
+
+
+def _https_reaches(host: str, timeout: float = 5.0) -> bool | None:
+    """A model-free reachability check of a provider's API host: any HTTPS answer (a 401 or 404 too)
+    within `timeout` is reachable. None when there is no host to check."""
+    if not host:
+        return None
+    import urllib.error
+    import urllib.request
+    try:
+        urllib.request.urlopen(urllib.request.Request(f"https://{host}/", method="HEAD"), timeout=timeout).close()
+        return True
+    except urllib.error.HTTPError:
+        return True
+    except Exception:
+        return False
 
 
 def _salvageable_answer(status: str, usage, note: dict) -> bool:

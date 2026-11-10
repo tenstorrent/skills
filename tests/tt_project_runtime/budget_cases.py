@@ -2087,9 +2087,9 @@ def test_a_failed_resume_that_printed_events_but_no_tokens_is_free(env, monkeypa
     assert run["status"] == "failed" and run["cost_usd"] == 0, "a resume that never started was charged"
     assert not bud.wasted(run) and json.loads(run["note"])["not_waste"] == "resume"
     assert task["status"] == "queued" and task["attempts"] == 0, dict(task)
-    # The same output from a run that resumed nothing is still priced as cut off.
+    # The same output from a run that resumed nothing made no model call either: $0, yet an attempt.
     _, run, task, _, _ = _cli_run(env, monkeypatch, "codex", out, rc=1)
-    assert run["status"] == "failed" and run["cost_usd"] > 0
+    assert run["status"] == "failed" and run["cost_usd"] == 0 and task["attempts"] == 1, (dict(run), dict(task))
 
 
 

@@ -15838,7 +15838,7 @@ def test_codex_failed_turn_is_an_attempt_and_says_why(env, monkeypatch):
     assert run["status"] == "failed" and run["exit_code"] == 1
     assert task["status"] == "queued" and task["attempts"] == 1
     assert "overloaded" in json.loads(task["result"])["summary"], "the failure's reason was lost"
-    assert run["cost_usd"] > 0 and run["cost_estimated"] == 1, "a run that reported no usage booked $0"
+    assert run["cost_usd"] == 0, "a turn that failed before any model call is not spend"
 
 
 def test_codex_usage_limit_pauses_the_provider_without_an_attempt(env, monkeypatch):
@@ -17928,7 +17928,8 @@ def test_a_lock_wait_extends_the_wall_clock_at_most_by_the_limit(env, tmp_path):
     from ttp import locks
     from ttp.daemon import _cut_off_cost
     (run_dir / "run.json").write_text(json.dumps({"budget_usd": 6.0, "timeout_s": limit}))
-    (run_dir / "output.jsonl").write_text("{}\n")   # it did something; a silent run costs nothing
+    (run_dir / "output.jsonl").write_text(   # it called a model; a run that made no call costs nothing
+        json.dumps({"type": "assistant", "message": {"id": "m1", "model": "opus"}}) + "\n")
     # Booked on the time beyond at most one limit's worth of waiting, never below it.
     waited = locks.waited(run_dir, info["ended"])
     assert _cut_off_cost(run_dir, info) == pytest.approx(
@@ -34169,7 +34170,7 @@ def test_a_cut_off_run_is_not_charged_for_the_time_the_host_slept(env, tmp_path)
     p = make(env)
     from ttp import daemon as dm
     (tmp_path / "run.json").write_text(json.dumps({"budget_usd": 10, "timeout_s": 3600, "argv": []}))
-    (tmp_path / "output.jsonl").write_text("not json\n")
+    (tmp_path / "output.jsonl").write_text(json.dumps({"type": "assistant", "message": {"id": "m1"}}) + "\n")
     info = {"rc": 1, "started": 1000.0, "ended": 1000.0 + 3600}
     assert dm._cut_off_cost(tmp_path, info) == pytest.approx(10)
     assert dm._cut_off_cost(tmp_path, {**info, "slept_s": 2700}) == pytest.approx(2.5)

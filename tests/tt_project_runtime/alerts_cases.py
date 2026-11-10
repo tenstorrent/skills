@@ -5533,3 +5533,57 @@ def test_a_user_stage_machine_condition_page_reaches_only_its_owners_chat(env):
     ml.report("proj-b", "box-1", "held", now=later)
     assert tick(later, "proj-b") == [], "the reporter does not get the owner's user page"
     assert [x["target"] for x in tick(later + ml.CLAIM_S, "proj-a")] == [ml.USER]
+
+
+def test_a_provider_whose_runs_make_no_model_call_stops_the_coordinator_until_a_model_free_check_passes(
+        env, monkeypatch):
+    """The ltx-rt case: a CLI logged out on a box with no internet fails with 0 tokens and no login
+    refusal the daemon can read, so the coordinator retried every ~41 min. NO_CALL_STREAK such runs open
+    the breaker and raise one alert; nothing starts on it while the login or HTTPS check fails; it
+    resumes by itself once both pass."""
+    p = make(env)
+    from ttp import alerts
+    from ttp import budget as bud
+    from ttp import daemon as dm
+    from ttp.daemon import NO_CALL_STREAK, Daemon
+    from ttp.providers import get_provider
+    d = Daemon(p.base)
+    started = []
+    monkeypatch.setattr(d, "start_run", lambda role, *a, **k: started.append(role) or 0)
+    d.gates["fake"] = bud.Gate("fake", regime="windows", max_parallel=6)
+    login = env["tmp"] / "logged-in"
+    login.write_text("")
+    monkeypatch.setenv("TTP_FAKE_LOGIN", str(login))   # its CLI says logged in: the network is what fails
+    monkeypatch.setattr(type(get_provider("fake")), "reach_host", lambda self, env=None: "api.example.com")
+    up, probes = {"v": False}, []
+    monkeypatch.setattr(dm, "_https_reaches", lambda host, timeout=5.0: probes.append(host) or up["v"])
+    no_call = [{"type": "turn.started"}, {"type": "error", "message": "stream disconnected before completion"}]
+    for i in range(NO_CALL_STREAK):
+        assert not d._logged_out("fake"), f"the breaker opened after {i} runs"
+        run, _ = _finished_run(d, no_call, provider="fake")
+        assert run["status"] == "failed" and run["cost_usd"] == 0, dict(run)
+    assert d._logged_out("fake") and alerts.breaker(p.db, "fake").get("reach")
+    for _ in range(NO_CALL_STREAK):   # more of them while it is open raise nothing new
+        _finished_run(d, no_call, provider="fake")
+    texts = [a["text"] for a in p.db.q("SELECT text FROM alerts WHERE key='auth:fake'")]
+    assert len(texts) == 1, texts
+    assert "log in" in texts[0] and "restore its network" in texts[0] and "user's decision" in texts[0]
+    assert "No worker logs in" in texts[0] and "coordinator" in texts[0]
+    p.db.post("in", "status?", chat="cli")
+    p.db.x("UPDATE messages SET ts=ts-60")
+    for _ in range(3):   # the HTTPS check fails: the coordinator stays stopped, no run checks it
+        p.db.set_kv("auth_breaker:fake", {**alerts.breaker(p.db, "fake"), "next_check": time.time() - 1})
+        d.sweep_alerts(); d.maybe_coordinate()
+    assert started == [] and probes == ["api.example.com"] * 3, (started, probes)
+    up["v"] = True
+    p.db.set_kv("auth_breaker:fake", {**alerts.breaker(p.db, "fake"), "next_check": time.time() - 1})
+    d.sweep_alerts()
+    assert alerts.breaker(p.db, "fake") is None and not d._logged_out("fake")
+    d.maybe_coordinate()
+    assert started == ["coordinator"], started
+    # A run that answers ends a streak.
+    for _ in range(NO_CALL_STREAK - 1):
+        _finished_run(d, no_call, provider="fake")
+    _finished_run(d, [{"type": "assistant", "message": {"id": "m1", "model": "x"}}], provider="fake")
+    _finished_run(d, no_call, provider="fake")
+    assert not d._logged_out("fake")
