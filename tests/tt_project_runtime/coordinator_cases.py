@@ -23656,7 +23656,7 @@ def test_every_run_kind_carries_the_no_drive_search_rule_and_the_known_paths(env
     p.set_config("delivery.push_branch", "team/feature")
     lock = push.lock_paths(p, *push.target(p, p.root))[0]
     block = knownpaths.block(p)
-    wants = (knownpaths.HEADER, knownpaths.RULE, str(p.state.absolute()), "state/runs/", f"state/{PRECHECKS_DIR}/",
+    wants = (knownpaths.HEADER, knownpaths.RULE, f"tt-project folder: {p.base.absolute()}; in it", "state/runs/", f"state/{PRECHECKS_DIR}/",
              f"state/{push.DETACHED}/", str(lock.relative_to(p.base)), "check-slots/ (checks queue)")
     for w in wants:
         assert w in block, w
@@ -23689,7 +23689,7 @@ def test_runtime_walks_never_start_at_the_drive_root_or_the_home_folder(tmp_path
     assert walk_root_ok(home / "proj")
     for bad in ("~/**/x.log", "/**/a", "~/*/x", "/*/x"):
         assert not glob_root_ok(bad), bad
-    for ok in ("~/proj/**/x.log", "~/*.log", str(tmp_path / "*" / "a"), "results/**/x.json"):
+    for ok in ("~/proj/**/x.log", "~/*.log", str(home / "proj" / "*" / "a"), "results/**/x.json"):
         assert glob_root_ok(ok), ok
     [o] = goalchecks.artifact_fresh("~/**/x.log")
     assert o.get("error") is True and "refused" in o["text"], o
