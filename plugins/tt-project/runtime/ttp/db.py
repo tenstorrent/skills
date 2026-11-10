@@ -961,14 +961,14 @@ END""")
             self.pause_event(PAUSE_REPLACED_KIND if name in now else PAUSE_REMOVED_KIND, name, was[name], cause)
 
     def set_paused(self, on: bool, boot: str | None = None, by: str = "unknown", reason: str = "",
-                   via: str = "", end: str = "") -> None:
+                   via: str = "", end: str = "", user_msg: int | None = None) -> None:
         """Pause or resume the whole project, recording who (`by`: user, coordinator, daemon, a run or
         another project), through what (`via`) and why (projpause: required unless by the user). With
         boot (this host's boot id) the pause lasts until the daemon first ticks on another boot
         (Daemon.lift_boot_pause); any other pause or resume ends that."""
         from . import projpause
         if on:
-            projpause.pause(self, by, reason, via=via, end=end or ("until reboot" if boot else ""))
+            projpause.pause(self, by, reason, via=via, end=end or ("until reboot" if boot else ""), user_msg=user_msg)
         else:
             projpause.resume(self, by, via=via, reason=reason)
         self.set_kv("paused", bool(on))

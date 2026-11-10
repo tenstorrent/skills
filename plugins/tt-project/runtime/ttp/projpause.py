@@ -59,10 +59,55 @@ def who(info: dict) -> str:
     return name + (f" ({via})" if via and by == "user" else "")
 
 
-def pause(db, by: str, reason: str = "", via: str = "", end: str = "", now: float | None = None) -> dict:
+def user_resume(db, resource: str | None = None) -> dict | None:
+    """The latest lift of the project's pause (or of resource `resource`'s), {"ts", "via"}, when the user
+    lifted it; None when nobody did or someone else did."""
+    if resource is None:
+        row = db.one("SELECT ts, data FROM events WHERE source='harness' AND kind='project_pause' "
+                     "ORDER BY ts DESC, id DESC LIMIT 1")
+        d = json.loads(row["data"] or "{}") if row else {}
+        ok = d.get("action") == "resume"
+    else:
+        from .db import PAUSE_REMOVED_KIND
+        row = db.one("SELECT ts, data FROM events WHERE kind=? AND json_extract(data, '$.resource')=? "
+                     "ORDER BY ts DESC, id DESC LIMIT 1", (PAUSE_REMOVED_KIND, resource))
+        d = json.loads(row["data"] or "{}") if row else {}
+        ok = bool(row)
+    return {"ts": float(row["ts"]), "via": d.get("via") or ""} if ok and d.get("by") == "user" else None
+
+
+def repause_refusal(db, by: str, user_msg: int | None = None, resource: str | None = None) -> str:
+    """Why a worker, coordinator or other project may not pause again what the user lifted ("" = it may).
+    The user's resume is their word that it runs; only a newer user message (`user_msg`, an inbound
+    message after that resume) asking for the pause outranks it. A pause in force is not re-checked."""
+    if by in ("user", UNKNOWN, "daemon"):
+        return ""
+    if (db.kv("paused", False) if resource is None else resource in db.paused_resources(shared=False)):
+        return ""
+    lifted = user_resume(db, resource)
+    if not lifted:
+        return ""
+    if user_msg is not None:
+        row = db.one("SELECT ts FROM messages WHERE id=? AND direction='in' AND kind='user'", (int(user_msg),))
+        if row and float(row["ts"]) > lifted["ts"]:
+            return ""
+        return (f"user message #{user_msg} is not a user message newer than the user's resume: "
+                f"it cannot outrank that resume")
+    what = "the project" if resource is None else f"resource {resource}"
+    return (f"the user resumed {what} last ({lifted['via'] or 'CLI'}); {by} may not pause it again. Run the "
+            "work it guards on its own terms, or tell the user; pass --user-msg <id> only when a newer user "
+            "message asks for this pause")
+
+
+def pause(db, by: str, reason: str = "", via: str = "", end: str = "", now: float | None = None,
+          user_msg: int | None = None) -> dict:
     """Record a pause of the whole project by `by`. A non-user caller must say why; a user's (or an
-    unknown caller's) pause without a reason records NO_REASON. A re-pause keeps when the pause began."""
+    unknown caller's) pause without a reason records NO_REASON. A re-pause keeps when the pause began.
+    A worker, coordinator or other project never re-applies a pause the user lifted (repause_refusal)."""
     now = time.time() if now is None else now
+    refusal = repause_refusal(db, by, user_msg)
+    if refusal:
+        raise PermissionError(refusal)
     reason = " ".join(str(reason or "").split())
     if not reason:
         if by not in ("user", UNKNOWN):
@@ -167,3 +212,27 @@ def alert_due(db, cfg: dict, now: float | None = None) -> tuple[str, dict] | Non
     if not info or limit <= 0 or now - info["since"] < limit:
         return None
     return alert_key(info), info
+
+
+LIVE_WITHIN_S = 6 * 3600
+
+
+def live(db, within_s: float = LIVE_WITHIN_S, now: float | None = None) -> tuple[bool, str]:
+    """Whether the project really works now, for a hand-back or takeover test ("is the other one still
+    coordinating?"): a running daemon is not enough. Not live while a provider's login is broken (its
+    auth breaker open) or when no model run succeeded, or spent tokens while running, in `within_s`."""
+    from .alerts import BREAKER
+    now = time.time() if now is None else now
+    out = [r["key"][len(BREAKER):] for r in db.q("SELECT key FROM kv WHERE key LIKE ?", (BREAKER + "%",))
+           if (db.kv(r["key"]) or {}).get("open")]
+    if out:
+        return False, f"logged out: {', '.join(sorted(out))} (its login breaker is open)"
+    if db.kv("paused", False):
+        return False, "paused"
+    row = db.one("SELECT MAX(COALESCE(ended, started)) AS ts FROM runs WHERE status='ok' OR status='running' "
+                 "AND (cost_usd>0 OR input_tokens>0 OR output_tokens>0)")
+    last = float(row["ts"]) if row and row["ts"] else 0.0
+    if now - last > within_s:
+        return False, ("no successful model run yet" if not last else
+                       f"no successful model run in {(now - last) / 3600:.1f} h (limit {within_s / 3600:g} h)")
+    return True, f"last successful model run {(now - last) / 60:.0f} min ago"

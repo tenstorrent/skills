@@ -23286,15 +23286,17 @@ def test_every_project_pause_path_records_who_and_why(env, monkeypatch, capsys):
     assert projpause.current(p.db) is None and p.db.kv(projpause.INFO_KEY) is None
     ev = _pause_events(p)[-1]
     assert ev["action"] == "resume" and ev["by"] == "user" and ev["paused"]["by"] == "user", ev
+    # After the user's resume a run pauses only for a newer user message (pausekeep_cases.py).
+    ask = p.db.x("INSERT INTO messages(ts,direction,text) VALUES(?,'in','pause it')", (time.time() + 1,))
     # The coordinator (a run of this project): a reason is required.
     rid = p.db.x("INSERT INTO runs(role,provider,started,status) VALUES('coordinator','claude',?,'running')",
                  (time.time(),))
     monkeypatch.setenv("TTP_RUN_ID", str(rid))
     monkeypatch.setenv("TTP_PROJECT", str(p.base))
     with pytest.raises(SystemExit):
-        cli.main(["pause", "demo"])
+        cli.main(["pause", "demo", "--user-msg", str(ask)])
     assert "needs a reason" in capsys.readouterr().err and not p.db.kv("paused", False)
-    cli.main(["pause", "demo", "--reason", "the user asked in chat"])
+    cli.main(["pause", "demo", "--reason", "the user asked in chat", "--user-msg", str(ask)])
     info = projpause.current(p.db)
     assert info["by"] == "coordinator" and info["reason"] == "the user asked in chat", info
     cli.main(["resume", "demo"])

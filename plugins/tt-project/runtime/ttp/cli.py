@@ -10175,6 +10175,15 @@ def _pause_by(p: Project) -> str:
     return "coordinator" if _coord_turn(p) is not None else "worker"
 
 
+def cmd_alive(a) -> None:
+    """`ttp alive <name>`: a running daemon is no proof the project works (its CLI may be logged out)."""
+    from . import projpause
+    p = need(a.name, sys.argv[1:])
+    ok, why = projpause.live(p.db, _since_s(a.within))
+    print(f"{p.name} {'live' if ok else 'not live'}: {why}")
+    sys.exit(0 if ok else 1)
+
+
 def cmd_pause(a) -> None:
     p = need(a.name, sys.argv[1:])
     if (a.resource or getattr(a, "machine", None)) and getattr(a, "until_reboot", False):
@@ -10200,6 +10209,11 @@ def cmd_pause(a) -> None:
         return
     if a.resource:
         from .coordinator import pause_resource
+        from . import projpause
+        refusal = projpause.repause_refusal(p.db, _pause_by(p), getattr(a, "user_msg", None), resource=a.resource) \
+            if a.cmd == "pause" else ""
+        if refusal:
+            die(refusal)
         try:
             from . import pauseends
             end = pauseends.from_action({"until": a.until, "end_when": a.end_when, "report_from": a.report_from},
@@ -10222,8 +10236,12 @@ def cmd_pause(a) -> None:
                 "or kern.bootsessionuuid or kern.boottime); use a plain pause and resume it after the reboot")
     from . import projpause
     by = projpause.caller(p)
+    ended = projpause.current(p.db) if a.cmd != "pause" else None
     try:
-        p.db.set_paused(a.cmd == "pause", boot, by=by, via="CLI", reason=getattr(a, "reason", None) or ("host power cycle (until reboot)" if boot else ""))
+        p.db.set_paused(a.cmd == "pause", boot, by=by, via="CLI", reason=getattr(a, "reason", None) or ("host power cycle (until reboot)" if boot else ""),
+                        user_msg=getattr(a, "user_msg", None))
+    except PermissionError as e:
+        die(str(e))
     except ValueError as e:
         die(f"{e}: pass --reason")
     if a.cmd != "pause":
@@ -10232,6 +10250,12 @@ def cmd_pause(a) -> None:
             print(f"planned host cycle withdrawn (machine change #{cid}): its drain recorded none")
     print(f"{p.name} " + ("resumed" if a.cmd != "pause" else "paused: no new model runs start"
                           + (" until the host reboots; the daemon lifts it on its first tick after boot" if boot else "")))
+    if ended:
+        # A pause another actor set (a worker's hand-back, the coordinator) is lifted only by this command,
+        # never by an upgrade: say whose pause it ended, so the caller sees it and the event log agrees.
+        print(f"ended the pause: {projpause.describe(ended, p)}"
+              + ("" if ended["by"] == "user" else f"; it was not the user's, re-pause with `ttp pause {p.name} "
+                 "--reason ...` if that was not meant"))
 
 
 def _draining_runs(p: Project) -> list[dict]:
@@ -10274,9 +10298,12 @@ def cmd_drain(a) -> None:
     p = need(a.name, sys.argv[1:])
     if not p.db.kv("paused", False):
         from . import projpause
-        p.db.set_paused(True, by=projpause.caller(p), via="ttp drain",
-                        reason=f"drain before a planned host cycle: {a.reboot}" if a.reboot
-                        else "drain: waiting for the runs in flight to end")
+        try:
+            p.db.set_paused(True, by=projpause.caller(p), via="ttp drain",
+                            reason=f"drain before a planned host cycle: {a.reboot}" if a.reboot
+                            else "drain: waiting for the runs in flight to end")
+        except PermissionError as e:
+            die(str(e))
         print(f"{p.name} paused: no new model runs start")
     intent, wrote, since = None, False, time.time()
     if a.reboot:
@@ -12872,7 +12899,7 @@ COMMAND_GROUPS = (
     ("inside a run", ("note", "steer", "notify", "progress", "checks", "checks-shard", "checks-yield", "lock",
                       "host-run", "detach", "devq", "push", "land", "clip", "sandbox", "pool-wait", "pool-admit",
                       "pool-shard", "skill", "killscan", "svcscan", "leftover-procs", "said", "hostcheck")),
-    ("probes (retry_when, start_when)", ("landed", "eta", "ci", "ack-wait", "ssh-preflight", "broker-released",
+    ("probes (retry_when, start_when)", ("landed", "alive", "eta", "ci", "ack-wait", "ssh-preflight", "broker-released",
                                          "deployed", "goal", "hours")),
     ("admin", ("setup", "upgrade", "start", "stop", "restart", "adopt", "prune", "secret", "consent",
                "notifier", "schedules", "heal", "upstream", "lease", "replicate", "check-plan", "stats", "audit",
@@ -14167,6 +14194,9 @@ def main(argv: list[str] | None = None) -> None:
             s.add_argument("--until-reboot", dest="until_reboot", action="store_true",
                            help="the whole project until this host reboots: the daemon lifts it on its first tick "
                                 "on a new boot")
+            s.add_argument("--user-msg", dest="user_msg", type=int, metavar="ID",
+                           help="from a run: the user message, newer than the user's own resume, that asks for "
+                                "this pause (a pause the user lifted is never re-applied without one)")
         s.set_defaults(fn=cmd_pause)
     s = sub.add_parser("lease", help="the lock that keeps a project running on one machine at a time (failover): "
                                      "check where it is kept, or show this machine's view of it")
@@ -14174,6 +14204,11 @@ def main(argv: list[str] | None = None) -> None:
                    help="check: whether the lease store answers; show: this machine's last view")
     s.add_argument("name", nargs="?", help="the project (default: the one here)")
     s.set_defaults(fn=cmd_lease)
+    s = sub.add_parser("alive", help="whether the project really works now (for hand-back and takeover checks): exit 0 "
+                                      "live; 1 not: a provider logged out, paused, or no successful model run lately")
+    s.add_argument("name", help="the project")
+    s.add_argument("--within", default="6h", help="how recent its last successful model run must be (default 6h)")
+    s.set_defaults(fn=cmd_alive)
     s = sub.add_parser("drain", help="pause the project and wait until its runs in flight end (they are not killed)")
     s.add_argument("name", help="the project")
     s.add_argument("--wait", type=float, default=0, metavar="S",
