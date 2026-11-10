@@ -605,6 +605,7 @@ DISK_DU_TOP = 6          # the biggest top-level directories it names
 KV_WORKTREES_LOGGED = "worktrees_logged"   # task -> the keep reason the daemon log last gave (compared by worktree.keep_key)
 KV_WORKTREES_DIRTY = "worktrees_dirty"     # task -> modified tracked files a kept finished worktree holds
 KEEP_RECHECK_S = 6 * 3600   # a finished task's kept worktree is looked at again this often
+PRUNE_TICK_MIN_S = 180      # the tick's worktree sweep runs at most this often, even when tasks keep finishing
 CONFIG_UNREADABLE_KEY = "config_unreadable"   # kv: project.json and its last good copy both unreadable
 ALERT_KEEP_S = 30 * 86400   # alerts_sent keeps an entry this long: the longest every_s any alert uses
 ROOT_CHECKOUT_KEY = "root_checkout"   # kv: task -> its open alert on what a run left in the project root's checkout
@@ -2109,7 +2110,7 @@ class Daemon:
         for step in (self.lift_boot_pause, self.reap_runs, self.reap_waiting_checks, self.wake_after_reboot, self.meter_running, self.rebook_per_call_step, self.watch_runs, self.check_steer_reads, self.relay_escalations, self.post_held_notifies, self.reconcile_tasks, self.retry_workspaces, self.tend_pushes,
                      self.sweep_sandbox_trees,
                      self.verify_pushes,
-                     self.prune_worktrees, self.prune_leftovers, self.land_harness_worktrees, self.backup_branches, self.replicate_state, self.check_local_only, self.check_disk,
+                     self.tick_prune_worktrees, self.prune_leftovers, self.land_harness_worktrees, self.backup_branches, self.replicate_state, self.check_local_only, self.check_disk,
                      self.sweep_alerts, self.check_release, self.sync_shared_pauses, self.check_pause_ends,
                      self.check_integrity, self.heal_harness_git,
                      self.sync_schedules, self.lint_charter, self.tend_holds, self.record_ttr, self.alert_long_pause,
@@ -12785,6 +12786,13 @@ class Daemon:
             log(self.p, f"deleted {len(gone)} worktree leftovers folder(s) past disk.worktree_leftovers_keep_days: "
                         f"{', '.join(gone[:10])}")
         return gone
+
+    def tick_prune_worktrees(self) -> list[dict]:
+        """The tick's prune_worktrees: at most every PRUNE_TICK_MIN_S even while tasks keep finishing
+        (each finish used to sweep at the next tick), except a forced or deferred archive pass still due."""
+        if not self._prune_more and time.time() - self._last_prune < PRUNE_TICK_MIN_S:
+            return []
+        return self.prune_worktrees()
 
     def prune_worktrees(self, every_s: float = 300, force: bool = False) -> list[dict]:
         """Tidy finished tasks' worktrees (worktree.sweep) soon after they end: every `every_s`, and

@@ -2263,3 +2263,50 @@ def test_a_run_that_queued_its_task_again_itself_is_not_refused_past_its_attempt
     assert "attempts 5 of 3" in dispatchguard.refusal(p.db, p.db.task(tid))
     dispatchguard.record_requeue(p.db, tid, "done", "requeue")
     assert dispatchguard.refusal(p.db, p.db.task(tid)) == ""
+
+
+def _branch_calls(env, n):
+    """A project with `n` finished code-task branches, each committing pkg/lib.py, and a queued code task
+    whose spec names that file: (project, queued task id)."""
+    p = make(env)
+    (p.root / "pkg").mkdir(exist_ok=True)
+    (p.root / "pkg/lib.py").write_text("x = 0\n")
+    _git_out(p.root, "add", "pkg/lib.py")
+    _git_out(p.root, "commit", "-qm", "lib")
+    for i in range(n):
+        _tid, path, _branch = _code_task(p, f"done {i}")
+        (path / "pkg/lib.py").write_text(f"x = {i + 1}\n")
+        _git_out(path, "add", "pkg/lib.py")
+        _git_out(path, "commit", "-qm", f"lib {i}")
+    return p, p.db.add_task("Change lib", "Edit pkg/lib.py so it reads y.", kind="code", tier="light",
+                            origin="user")
+
+
+def test_a_workers_start_reads_no_git_per_unlanded_branch(env, monkeypatch):
+    """The start-time branch check (overlap.prompt_block) once ran two or more git calls per finished
+    branch at every worker start (~230 branches on one project): heads found not on the push branch are
+    kept for its tip, so a later start runs a fixed few git calls however many branches there are."""
+    from ttp import gitmemo, landed, overlap
+    p, q = _branch_calls(env, 12)
+    p.set_config("delivery.push_branch", "t79-push")
+    push_ref = landed._push_ref(p, p.root)
+    _git_out(p.root, "update-ref", push_ref, "HEAD")   # the push branch at the base, as on a project that pushed
+    calls = []
+    real = gitmemo.run
+    monkeypatch.setattr(gitmemo, "run", lambda argv, *a, **k: calls.append(argv) or real(argv, *a, **k))
+    first = overlap.prompt_block(p, p.db.task(q))
+    cold = len(calls)
+    calls.clear()
+    again = overlap.prompt_block(p, p.db.task(q))
+    assert again == first and again.count("\n- #") == overlap.MAX_BRANCHES, again
+    assert cold >= 24 and len(calls) <= 8, (cold, [" ".join(c[3:]) for c in calls])
+    # A new commit on the push branch's tip: the heads are read again, once.
+    (p.root / "other.txt").write_text("o\n")
+    _git_out(p.root, "add", "other.txt")
+    _git_out(p.root, "commit", "-qm", "other")
+    _git_out(p.root, "update-ref", push_ref, "HEAD")
+    calls.clear()
+    assert overlap.prompt_block(p, p.db.task(q)) == first and len(calls) >= 24
+    calls.clear()
+    overlap.prompt_block(p, p.db.task(q))
+    assert len(calls) <= 8, calls

@@ -201,3 +201,31 @@ def test_a_harness_worktree_hidden_during_a_prune_keeps_its_admin_dir_and_a_fore
     p.db.update_task(c, status="done")
     assert harnesstree.land(p, c) == "kept" and other.exists()
     assert (_wk_admin(p, other) / "locked").read_text().strip() == "a user's hold"
+
+
+def test_the_worktree_sweep_runs_no_git_call_per_registered_worktree(env, monkeypatch):
+    """The tick's sweep tells a kept worktree is one from git's single `git worktree list` record and its
+    .git entry, not from an is_git subprocess per worktree (18 kept worktrees held a tick 9+ minutes)."""
+    from ttp import daemon as daemon_mod, worktree
+    from ttp.daemon import Daemon
+    _no_grace(monkeypatch)
+    p = make(env)
+    paths = []
+    for i in range(3):
+        _tid, path, _branch = _code_task(p, f"kept {i}")
+        paths.append(path)
+    calls = []
+    real = worktree.is_git
+    monkeypatch.setattr(worktree, "is_git", lambda path: calls.append(path) or real(path))
+    d = Daemon(p.base)
+    res = d.prune_worktrees(every_s=0, force=True)
+    assert {r["path"] for r in res} == {str(path) for path in paths}, res
+    assert not [c for c in calls if c in paths], calls
+    # The tick sweeps at most every PRUNE_TICK_MIN_S, even when a task finished since.
+    swept = []
+    monkeypatch.setattr(worktree, "sweep", lambda *a, **k: swept.append(1) or [])
+    _code_task(p, "finished just now")
+    assert d.tick_prune_worktrees() == [] and not swept
+    d._last_prune -= daemon_mod.PRUNE_TICK_MIN_S
+    d.tick_prune_worktrees()
+    assert swept == [1]
