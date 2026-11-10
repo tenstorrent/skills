@@ -129,12 +129,11 @@ Composite bring-up:
   MFU FLOP count differs from the plan's;
 - `doc/perf_analysis.md` lacks the ranked cost table or the table lacks op
   attribution to model code;
-- Tracy was run on the full layer stack, or on fewer than four doubling depths,
-  or a depth is not a whole number of blocks (the smallest repeating group of
-  layer kinds, so a heterogeneous model such as Qwen3-Next's 3+1 pattern is
-  never cut mid-block), or a depth's residual from the fitted line exceeds the
-  stated tolerance without an explanation, or the projection was not validated
-  against the full-model MFU wall-clock;
+- Tracy was run on the full model, or not at 1x, 2x and 4x the plan's
+  representative slice, or the slice misses a layer kind of the config (a
+  heterogeneous model such as Qwen3-Next's 3+1 pattern is never cut
+  mid-pattern), or an op's per-copy cost fails the scaling check without an
+  explanation, or a full-step time was projected from a profile and reported;
 - PCC was run without the shard shapes on a multi-chip layout (only full shapes on one chip);
 - DP syncs a frozen gradient: a gradient all-reduce over `dp` on a parameter the freeze map marks
   frozen, or a sync over the whole parameter list instead of the trainable ones;
@@ -184,8 +183,8 @@ Optimisation loop:
   reason and the next structural fix;
 - a precision mode, run type or configuration the hard-constraints block forbids was evaluated,
   swept or recorded as a rejected candidate;
-- a subset-depth MFU run, a projection or a Tracy table appears in the result table or the report
-  as a result rather than as ranking evidence;
+- a slice MFU run, a projected step time or a Tracy table appears in the result table or the
+  report as a result rather than as ranking evidence;
 - `doc/perf_analysis.md` or the README deviates from the optimisation-loop document format and
   report style: a "what changed" cell that names a path or a file instead of the mechanism, a cell
   too terse to be understood without the commit, a missing `tag` or `time since start` column, a

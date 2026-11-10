@@ -48,9 +48,17 @@ FPU peak. These three ops are the loop's first candidates; "ttnn matmul, exists"
 When the layout of section 5 is multi-chip, list the per-rank shard shapes next to the full shapes;
 the composite harness and the loop's kernels work on the shard shapes.
 
-### Multichip reuse map
+### Representative slice
 
-On a multi-chip layout the inventory also has a reuse map of tt-train's own multichip pieces, so
+Write a `slice` yaml block in `doc/plan.md`: the layer indices of the smallest group of
+consecutive layers that covers every layer kind of the config in its real proportion, at least two
+layers, plus the embedding, final norm, LM head and loss; and the number of slice copies in the
+full model. Tracy runs at 1x, 2x and 4x this slice (the loop's measurement protocol); it is never
+run on the full model.
+
+### Multi-chip reuse map
+
+On a multi-chip layout the inventory also has a reuse map of tt-train's own multi-chip pieces, so
 the first implementation starts from what exists instead of re-deriving it. For each piece, one
 row: the source path at the pinned revision, `used`, `extended` (and how) or `not used`, and why.
 At least:

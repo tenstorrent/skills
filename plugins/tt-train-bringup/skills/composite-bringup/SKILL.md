@@ -96,18 +96,18 @@ collect; small shapes are for debugging only.
 Before leaving this phase, take the first measurement so the loop has a baseline: a cooled MFU run
 without the profiler on the full model on the plan's chips, telemetry sampler attached (wall
 ms/step, MFU against the nominal peak with the plan's FLOP count, per-chip settled clock and the
-critical chip next to it) and Tracy runs at four doubling depths of whole blocks (the smallest
-repeating group of layer kinds) with real shapes, fitted and projected to the full depth as
-described in the
+critical chip next to it) and Tracy runs at 1x, 2x and 4x the plan's representative slice with
+real shapes (per-op cost per slice copy and the scaling check; on a mesh, at the plan's layout,
+per chip), as described in the
 [optimisation loop's measurement protocol](../optimization-loop/SKILL.md#measurement-protocol).
-Never profile the full layer stack. Measure the host/dispatch gap here (wall-clock minus summed
-device time, with Tracy's cycles converted to the delivered clock first); the plan does not guess
-it. Attribute the top three ttnn ops to their compiled kernel source, DEST sync mode and % of peak
+Never run Tracy on the full model and never project a full-step time from it. Measure the host/dispatch gap here, on the slice:
+the slice run's wall-clock minus its summed device time, with Tracy's cycles converted to the
+delivered clock first; the plan does not guess it. Attribute the top three ttnn ops to their compiled kernel source, DEST sync mode and % of peak
 (the plan's section 1 entries, now confirmed from the profile) so the loop's first iteration has
 its candidate. Create `doc/optimization/README.md` and `doc/perf_analysis.md` in the
 [loop's document format](../optimization-loop/SKILL.md#document-format): the result table with one
-row (composite baseline), the first ranked cost table at projected full depth, and the four raw
-Tracy measurements with their fit, residuals and projection in the evidence directory.
+row (composite baseline), the first ranked cost table (per-copy cost times slice copies, a ranking, not a step time), and
+the three per-copy tables with the scaling check in the evidence directory.
 Record actual compute cores, participating chips, useful FLOPs and nominal peak with the baseline.
 Exclude compilation and warmup from timing, and inspect per-step time and loaded clock trends;
 if they are still settling, extend the run to report a settled window or label the result transient.

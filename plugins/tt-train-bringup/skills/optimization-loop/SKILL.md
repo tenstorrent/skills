@@ -20,7 +20,7 @@ them.
   a rejection; a clock or power experiment uses the recipe's fidelity too.
 - Result metric: cooled wall ms/step of the full model on the plan's chips (TP over the box when the
   model needs it) and MFU against the nominal peak (the plan's figure, e.g. 1350 MHz). "MFU at the
-  delivered clock" is a diagnostic only, never a result row. Subset-depth profiles and
+  delivered clock" is a diagnostic only, never a result row. Slice profiles and
   single-chip subset MFU runs rank the next item and are never reported as results.
 - Batch and sequence length as the recipe states them.
 - One change per commit, reviewed and verified on its own, so the history bisects.
@@ -50,17 +50,17 @@ chain whose measured cost beats the kernel's expected gain.
 1. Measure. A cooled MFU run without the profiler, telemetry sampler running, gives wall ms/step,
    MFU at the nominal peak, the per-chip settled clock and the critical chip. On a mesh, every chip
    is profiled, not one: the step is as slow as its slowest chip, and the chip whose device time
-   plus collective wait is largest is named as the critical chip in the ranked table. Tracy runs at four
-   doubling depths of whole blocks (real shapes, warm-up steps excluded, op-support count sized for
-   the op count) give per-op device cycles, input shapes with padding, and core count; fit per-block
-   and fixed cost and project to the full depth as in the
-   [measurement protocol](#measurement-protocol).
+   plus collective wait is largest is named as the critical chip in the ranked table. Tracy runs at 1x,
+   2x and 4x the plan's representative slice (real shapes, warm-up steps excluded, op-support count
+   sized for the op count) give per-op device cycles per slice copy, input shapes with padding and
+   core count, and the scaling check, as in the [measurement protocol](#measurement-protocol).
+   Tracy never runs on the full model.
 2. Attribute. Walk the op sequence of one step (forward, recompute, backward, optimiser) and map
    every op to the line of model code that emitted it. For the top three ops also map to the kernel:
    which program factory and kernel files compile, the sync mode, the core grid, the % of peak.
 3. Classify every op into one of the six classes below (five on one chip; collectives are the
    sixth on a mesh).
-4. Cost every item in wall ms/step at full depth: microseconds per op × ops per layer × layers ×
+4. Cost every item for ranking: microseconds per op per slice copy × slice copies in the full model ×
    multiplicity, where multiplicity counts forward, recompute and the backward mirror, with Tracy's
    cycles converted at the delivered clock. Group ops into chains between two real ops and cost the
    chain, not the op. A chain of individually modest plumbing ops is often the largest item.
@@ -252,46 +252,40 @@ Measurement rules, all in one place:
   stated.
 - No forbidden fidelity, batch or run type, in any run, including clock experiments.
 
-Tracy runs never profile the full depth: an LLM's full layer stack under the profiler is too
-expensive to collect and to analyse. Instead profile the model at four depths and extrapolate:
+Tracy never runs on the full model, and no full-step time is ever projected from a profile. The
+full-model number is the MFU run without the profiler; Tracy ranks items and diffs a change. It
+runs on the plan's representative slice at three sizes:
 
-1. Define the block. A block is the smallest group of consecutive layers that repeats through the
-   model with every layer kind in its real proportion. For a homogeneous decoder the block is one
-   layer. For Qwen3-Next the block is four layers (three linear-attention layers then one
-   full-attention layer), and two bare layers would not be representative. Record the block in
-   `doc/plan.md`.
-2. Build the model at four doubling depths of whole blocks: 2, 4, 8 and 16 blocks when the block
-   is one layer; 1, 2, 4 and 8 blocks when it is larger. Stop at the largest depth below the real
-   block count, so that no run profiles the full model. Keep hidden size, heads, sequence length,
-   batch, dtype and recipe at their real values; only the block count changes. Analyse one device
-   and divide by the number of profiled steps.
-3. Fit. Fit a least-squares line `t(B) = fixed + B × per-block` through the four points. Per-block
-   cost is the slope; fixed cost is the intercept (embedding, final norm, lm head, loss, optimiser
-   on non-block parameters, per-step dispatch). Do the same fit per op class and per ranked item,
-   with ops per block from the attribution.
-4. Check the residuals. Every measured depth must sit on the fitted line within a stated tolerance
-   (five percent of its own step time is a reasonable default), and the deepest point matters
-   most because it is nearest the extrapolation. A point off the line means something in the
-   step does not scale with depth (memory pressure, program-cache churn, a host sync that
-   appears past some depth); find it and explain it before using the projection. If the
-   deviation is real and grows with depth, say so and give the projection as a range, not a
-   number.
-5. Project. Full-model step time is `fixed + B × per-block` for the real block count `B`; the
-   ranked cost table is reported at full depth and labelled as a projection.
-6. Validate. Compare the projection with the full-model MFU wall-clock taken without the profiler.
-   The difference is the host/dispatch gap plus profiler overhead; a difference beyond the
-   expected dispatch gap is a finding, not noise.
+1. The slice. `doc/plan.md` has a `slice` block: the smallest group of consecutive layers that
+   covers every layer kind in its real proportion, at least two layers so a swapped-layer mistake
+   shows, plus the embedding, final norm, LM head and loss. One layer kind: two layers. Qwen3-Next:
+   four layers (three linear-attention then one full-attention); two bare layers would not be
+   representative.
+2. Three sizes. Build the model at 1x, 2x and 4x the slice (the slice's layers repeated once,
+   twice, four times), stopping below the real layer count. Keep hidden size, heads, sequence
+   length, batch, dtype and recipe at their real values; only the layer count changes. Warm-up
+   steps are excluded and the result is divided by the number of profiled steps. On a mesh the
+   slice runs at the plan's layout (the same shape, axes and shard shapes), and every chip is
+   profiled.
+3. Per-op cost per slice copy. For each size, the op table (per op or chain: device time, shape
+   with padding, core count, class) is divided by the number of slice copies, giving one per-copy
+   table per size. Ops outside the repeated layers (embedding, head, loss, optimiser on
+   non-layer parameters) are listed once, as fixed rows.
+4. Scaling check. An op's per-copy cost should match across 1x, 2x and 4x within a stated
+   tolerance (five percent of its own cost is a reasonable default). An op whose per-copy cost
+   grows or shrinks with the size does not scale (memory pressure, program-cache churn, a host
+   sync that appears past some size, a collective whose cost depends on depth); investigate it on
+   the slice and explain it before ranking by it.
+5. Ranking. Items are ranked by per-copy cost times the number of slice copies in the full model,
+   with training multiplicity. That number orders the table; it is not a step time, it is never
+   summed into one, and it is never compared with the MFU run.
 
-Before/after Tracy diffs for a change use the same four depths; a change whose benefit does not
-show at every depth is reported with the depth where it stops showing. Record the four raw
-measurements, the fit with residuals, the projection and the validation in the evidence directory,
-linked from the measurement-traps section.
+Before/after Tracy diffs for a change use the same three sizes; a change whose benefit does not
+show at every size is reported with the size where it stops showing. Record the three per-copy
+tables and the scaling check in the evidence directory, linked from the measurement-traps section.
 
-The depth fit exists to rank the next item. It does not go into the result: once the full model
-runs (single chip or the authorised box), each iteration's profile is one subset depth on the
-result configuration (e.g. 4 layers at TP over the box, per chip), used for the before/after diff
-and the ranking only. No subset-depth MFU run, no projection row and no Tracy table belongs in the
-result table or the report; they stay in the evidence directory.
+The slice profile ranks the next item and nothing else. No slice MFU run, no per-copy table and
+no Tracy figure belongs in the result table or the report; they stay in the evidence directory.
 
 ## Kernel boost checklist
 

@@ -1,7 +1,8 @@
 # tt-train-bringup
 
 Bring up and optimise **training** of a Hugging Face model in `tt-train` (ttml) on a single chip, or
-on the box when the plan's hardware ceiling shows the model does not fit one chip.
+on the box the user authorises: the plan costs DP, TP and DP x TP on every allowed mesh shape and
+picks the fastest layout that fits. Mesh setup is checked with `scripts/tt_mesh_smoke.py`.
 
 Three phases, run in order by `scripts/multigoal` or one at a time by hand:
 
@@ -18,10 +19,11 @@ Three phases, run in order by `scripts/multigoal` or one at a time by hand:
    multiplicity, take the biggest math kernel first, verify, repeat until the roofline target or
    the hardware ceiling is met.
 
-Tracy never profiles the full layer stack: profiles are taken at four doubling depths of whole blocks (the
-smallest repeating group of layer kinds, so 2, 4, 8 and 16 layers for a homogeneous model and 1, 2,
-4 and 8 blocks for a 3+1 pattern such as Qwen3-Next) with real shapes, fitted to a per-block plus
-fixed cost, and projected to the full depth (see the
+Tracy never runs on the full model: profiles are taken at 1x, 2x and 4x the plan's representative
+slice (every layer kind in its real proportion, at least two layers) with real shapes, as a per-op
+cost table per slice copy with a scaling check across the three sizes. They rank items and diff
+changes only; no full-step time is projected from them, and the result is the full-model MFU run
+without the profiler (see the
 [measurement protocol](skills/optimization-loop/SKILL.md#measurement-protocol)).
 
 Hardware telemetry: `scripts/tt_telemetry_sampler.py` (pyluwen, 20 Hz per-chip clock/power CSV),
