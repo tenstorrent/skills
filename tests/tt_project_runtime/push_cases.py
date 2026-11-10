@@ -9404,6 +9404,7 @@ def test_macos_boot_id_prefers_bootsessionuuid_and_still_knows_the_boottime_seco
     _fake_sysctl(fake, booted, uuid)
     monkeypatch.setenv("PATH", f"{fake}{os.pathsep}{os.environ['PATH']}")
     monkeypatch.setattr(runner, "BOOT_ID_FILE", tmp_path / "noproc" / "boot_id")
+    monkeypatch.setattr(runner, "_sysctl_lib", lambda: None)   # the `sysctl` process path, faked above
     # No uuid (an older macOS): kern.boottime's seconds, as before.
     assert runner.boot_id() == "1700000000" and runner.boot_ids() == ("1700000000", "1700000000")
     uuid.write_text("6A1C0E4B-0000-4000-8000-000000000001\n")
@@ -9425,6 +9426,61 @@ def test_macos_boot_id_prefers_bootsessionuuid_and_still_knows_the_boottime_seco
     p.db.set_kv("pause_until_boot", {"boot": "1700000042", "since": time.time()})
     Daemon(p.base).tick()
     assert p.db.kv("paused"), "a pause until reboot recorded with the seconds is not lifted by an upgrade"
+
+
+class _FakeSysctlLib:
+    """sysctlbyname over a dict of raw values: a size query (no buffer), then the read; -1 if unknown."""
+    def __init__(self, values):
+        self.values, self.calls = values, 0
+
+    def sysctlbyname(self, name, buf, sizep, newp, newlen):
+        import ctypes
+        self.calls += 1
+        v = self.values.get(name.decode())
+        if v is None:
+            return -1
+        size = sizep._obj
+        if buf is not None:
+            ctypes.memmove(buf, v, min(len(v), size.value))
+        size.value = len(v)
+        return 0
+
+
+def test_macos_boot_checks_read_sysctl_in_process_and_spawn_nothing(env, tmp_path, monkeypatch):
+    """Boot checks (same_boot) run many times a tick. On macOS they read kern.bootsessionuuid and
+    kern.boottime through sysctlbyname: repeated checks start no `sysctl` process, and the values read
+    as `sysctl -n` prints them, so ids recorded before stay this boot's."""
+    import struct
+    from ttp import runner
+    uuid = "6A1C0E4B-0000-4000-8000-000000000001"
+    lib = _FakeSysctlLib({"kern.bootsessionuuid": uuid.encode() + b"\0",
+                          "kern.boottime": struct.pack("=qi4x", 1700000000, 4242)})
+    monkeypatch.setattr(runner, "BOOT_ID_FILE", tmp_path / "noproc" / "boot_id")
+    monkeypatch.setattr(runner, "_sysctl_lib", lambda: lib)
+    spawned = []
+    monkeypatch.setattr(runner.subprocess, "run", lambda *a, **k: spawned.append(a) or 1 / 0)
+    for _ in range(50):
+        assert runner.same_boot(uuid) and runner.same_boot("1700000000") and not runner.same_boot("1699999999")
+    assert runner.boot_ids() == (uuid, "1700000000") and runner.boot_time() == 1700000000.0
+    assert runner._sysctl("kern.boottime") == "{ sec = 1700000000, usec = 4242 }"
+    assert not spawned and lib.calls
+    # An older macOS without kern.bootsessionuuid: the seconds, still with no process.
+    del lib.values["kern.bootsessionuuid"]
+    assert runner.boot_id() == "1700000000" and not spawned
+    # Neither readable: unknown, never a process either.
+    lib.values.clear()
+    assert runner.boot_id() == "unknown" and runner.boot_time() is None and not spawned
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS sysctlbyname")
+def test_macos_in_process_sysctl_matches_the_sysctl_command():
+    from ttp import runner
+    assert runner._sysctl_lib() is not None
+    for key in ("kern.bootsessionuuid", "kern.boottime"):
+        want = subprocess.run(["sysctl", "-n", key], capture_output=True, text=True).stdout.strip()
+        got = runner._sysctl(key)
+        assert got and (want == got or want.startswith(got + " ")), (key, want, got)
+    assert runner._sysctl("kern.no_such_key_ttp") == ""
 
 
 def test_daily_review_target_line_reads_the_last_pushed_batch_reach(env, tmp_path):

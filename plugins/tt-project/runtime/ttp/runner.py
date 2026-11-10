@@ -111,8 +111,36 @@ for sig in (signal.SIGTERM, signal.SIGKILL):
 BOOT_ID_FILE = Path("/proc/sys/kernel/random/boot_id")
 
 
+def _sysctl_lib():
+    """macOS's libSystem for in-process sysctl reads; None elsewhere (then `sysctl` runs as a process)."""
+    from . import hostcpu
+    return hostcpu._libsystem()[0] if sys.platform == "darwin" else None
+
+
+def _sysctl_native(lib, key: str) -> str:
+    """`sysctl -n <key>`'s text read through sysctlbyname, no process: a string as is, kern.boottime
+    as `{ sec = S, usec = U }`; "" where the key is unknown or unreadable."""
+    import ctypes
+    name, n = key.encode(), ctypes.c_size_t(0)
+    if lib.sysctlbyname(name, None, ctypes.byref(n), None, 0) != 0 or not n.value:
+        return ""
+    buf = ctypes.create_string_buffer(n.value)
+    if lib.sysctlbyname(name, buf, ctypes.byref(n), None, 0) != 0:
+        return ""
+    raw = buf.raw[:n.value]
+    if key == "kern.boottime":   # struct timeval: a 64-bit tv_sec, then a 32-bit tv_usec
+        return "" if len(raw) < 12 else (f"{{ sec = {int.from_bytes(raw[:8], sys.byteorder, signed=True)}, "
+                                         f"usec = {int.from_bytes(raw[8:12], sys.byteorder, signed=True)} }}")
+    return raw.split(b"\0", 1)[0].decode(errors="replace").strip()
+
+
 def _sysctl(key: str) -> str:
+    """A sysctl value as `sysctl -n` prints it. macOS reads it in-process: boot checks run many times a
+    tick, and each `sysctl` process was a daemon spawn."""
+    lib = _sysctl_lib()
     try:
+        if lib is not None:
+            return _sysctl_native(lib, key)
         return subprocess.run(["sysctl", "-n", key], capture_output=True, text=True, timeout=5).stdout.strip()
     except Exception:
         return ""
