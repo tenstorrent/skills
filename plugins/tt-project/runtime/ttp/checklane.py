@@ -17,7 +17,7 @@ heavy checks of a project run at once, in task-priority order (#4065's order; on
 one-at-a-time slot). Lanes are per repository under check (testslots.repo_key), so checks of unrelated
 repos never share them. `checks.slots` sets it (project, then account, then TTP_CHECKS_SLOTS); unset, it
 follows the host now (capacity(), read again at every admission): the runs already holding a lane plus
-as many more as the spare cores (cores less the 1-minute load average) and the available memory fit,
+as many more as the spare cores (cores less the CPU demand, checkcap._load) and the available memory fit,
 at one run's cores (its test grant, at least CORES_PER_LANE) and GIB_PER_LANE each, at most the runs
 the cores hold; never below default_slots(), its floor: the runs its test pool fits side by side, at
 least 2 (each run is isolated: its own clean checkout, scratch, output folder and port block,
@@ -210,7 +210,7 @@ def run_cores(cfg: dict | None = None, n_cores: int | None = None) -> int:
 def capacity(cfg: dict | None = None, held: int = 0, n_cores: int | None = None, load: float | None = None,
              mem_gib: float | None = None, used: int | None = None) -> dict:
     """The lanes of one repository the host runs now with checks.slots unset (above): `held` running plus
-    the runs its spare cores (cores less the 1-minute load average, which counts the running ones) and
+    the runs its spare cores (cores less the CPU demand, checkcap._load, which counts the running ones) and
     available memory fit, at one run's cores (`run_cores`: its test grant, testslots.sizes, at least
     CORES_PER_LANE) and GIB_PER_LANE each; at most `top` (the runs the cores hold, and the runs the test pool
     fills at a full grant: testslots.pool_now with `used` of its slots held, over run_max), never below
@@ -1076,9 +1076,9 @@ def wake_text(why: list[str], events: list[dict], inc: dict, cfg: dict | None, n
 
 
 def _load_text() -> str:
-    """The host's 1-minute load on its cores for a person ("1-minute load 63.2 on 64 cores")."""
+    """The host's CPU demand on its cores for a person ("CPU demand 63.2 cores on 64 cores")."""
     ld, c = checkcap._load(), checkcap.cores()
-    return (f"1-minute load {ld:.1f} on {c} cores" if ld == ld and ld != float("inf")
+    return (f"CPU demand {ld:.1f} cores on {c} cores" if ld == ld and ld != float("inf")
             else f"load unknown, {c} cores")
 
 

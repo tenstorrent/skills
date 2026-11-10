@@ -21,7 +21,7 @@ runnable CPU demand is above its cores (load_guard()); running ones are never st
 Defaults (sizes()): the pool is half the host's usable cores, at least 2, so tests leave the other
 half to live work and builds; one run takes at most min(RUN_MAX, half the pool), at least 1, so two
 runs always fit side by side and no suite takes the pool. Unset, the test pool a run takes from also
-grows into spare cores (pool_now: the slots in use plus the cores the 1-minute load average leaves, at most
+grows into spare cores (pool_now: the slots in use plus the cores the CPU demand (checkcap._load) leaves, at most
 the host's cores), so the extra lanes an idle host gives (checklane.capacity) get their workers; a busy
 host keeps the half, as does checks.load_extra 0. A test grant is also at most the host's live free cores, less one for
 each worker granted in the last few seconds, at least WORKERS_FLOOR (live_room; checks.live_cores 0
@@ -93,7 +93,7 @@ import time
 from pathlib import Path
 from typing import Callable
 
-from . import checkcap, checkwait, locks, poll_s, project, repoid
+from . import checkcap, checkwait, hostcpu, locks, poll_s, project, repoid
 
 RESOURCE = "test-slots"    # check-slots/test-slots.<i>.lock
 RUN_MAX = 8                # one run's most workers by default: past about 8 a suite's wall time gains little
@@ -188,7 +188,7 @@ def sizes(cfg: dict | None = None, cores: int | None = None, kind: Kind = TESTS)
 def pool_now(cfg: dict | None, pool: int, held: int, cores: int | None = None, load: float | None = None,
              kind: Kind = TESTS) -> int:
     """The test pool a run may take from now: with checks.test_pool unset (account and project), the
-    `held` slots in use plus the host's spare cores (its cores less the 1-minute load average, which
+    `held` slots in use plus the host's spare cores (its cores less the CPU demand, checkcap._load, which
     counts the running ones), at most its cores, never below the default `pool`; so the half of the
     cores the pool leaves serves more checks only while nothing else keeps it busy. An unreadable load
     average, a set pool, checks.load_extra 0 (checkcap.extra_max) and the build pool keep `pool`."""
@@ -287,11 +287,14 @@ def load_guard_factor() -> float:
 def load_guard() -> str:
     """Why no new suite may start now, or "": the host's runnable CPU demand (checkcap.cpu_demand: busy
     cores and tasks waiting to run, not tasks waiting on I/O) is above checks.load_guard
-    (load_guard_factor()) times its cores. 0 turns the guard off; an unreadable reading never holds a
-    suite. Disk contention is diskgate's limit (checks.io_full_max), not this one."""
+    (load_guard_factor()) times its cores, or its memory is short (hostcpu.mem_short). 0 turns the guard
+    off; an unreadable reading never holds a suite. Disk contention is diskgate's limit
+    (checks.io_full_max), not this one."""
     factor = load_guard_factor()
     if not factor:
         return ""
+    if mem := hostcpu.mem_short():
+        return f"the host is {mem}; no new suite starts until memory frees, running ones go on"
     ld, c = checkcap.cpu_demand(), checkcap.cores()
     if ld != ld or ld == float("inf") or ld <= factor * c:
         return ""

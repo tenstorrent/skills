@@ -328,7 +328,7 @@ def test_checks_extra_slots_follow_the_load_and_never_pass_the_cap_plus_extra(en
     monkeypatch.setenv("TTP_CHECKS_LOAD_EXTRA", "2")
     monkeypatch.setattr(checkcap, "cores", lambda: 16)
     load = [3.0]
-    monkeypatch.setattr(checkcap.os, "getloadavg", lambda: (load[0], 0.0, 0.0))
+    monkeypatch.setattr(checkcap, "_load", lambda: load[0])
     assert checkcap.extra() == 2
     load[0] = 6.0
     assert checkcap.extra() == 1
@@ -384,7 +384,7 @@ def test_checks_default_cap_scales_with_load_headroom_between_floor_and_ceiling(
     monkeypatch.delenv("TTP_CHECKS_HOST_MAX", raising=False)
     monkeypatch.setattr(checkcap, "cores", lambda: 64)
     load = [0.0]
-    monkeypatch.setattr(checkcap.os, "getloadavg", lambda: (load[0], 0.0, 0.0))
+    monkeypatch.setattr(checkcap, "_load", lambda: load[0])
     assert checkcap.default_range() == (4, 8)
     assert checkcap.check_load() == 8.0, "one run's cores: its test grant on 64 cores"
     assert checkcap.limit() == 8, "an idle host gets the ceiling"
@@ -403,9 +403,9 @@ def test_checks_default_cap_scales_with_load_headroom_between_floor_and_ceiling(
         assert checkcap.limit() == 5, "(64 - 43) / 4 rounds down"
     load[0] = 200.0
     assert checkcap.limit() == 4
-    monkeypatch.setattr(checkcap.os, "getloadavg", lambda: (_ for _ in ()).throw(OSError()))
-    assert checkcap.limit() == 4, "an unreadable load average gives the floor"
-    monkeypatch.setattr(checkcap.os, "getloadavg", lambda: (load[0], 0.0, 0.0))
+    monkeypatch.setattr(checkcap, "_load", lambda: float("inf"))
+    assert checkcap.limit() == 4, "an unreadable CPU demand gives the floor"
+    monkeypatch.setattr(checkcap, "_load", lambda: load[0])
     monkeypatch.setattr(checkcap, "cores", lambda: 8)
     load[0] = 0.0
     assert checkcap.default_range() == (1, 1) and checkcap.limit() == 1, "a small host runs one at a time"
@@ -425,7 +425,7 @@ def test_checks_default_cap_shrinking_with_the_load_counts_checks_above_it(env, 
     monkeypatch.setenv("TTP_CHECKS_LOAD_EXTRA", "0")
     monkeypatch.setattr(checkcap, "cores", lambda: 32)   # floor 2, ceiling 4
     load = [0.0]
-    monkeypatch.setattr(checkcap.os, "getloadavg", lambda: (load[0], 0.0, 0.0))
+    monkeypatch.setattr(checkcap, "_load", lambda: load[0])
     held = [checkcap.acquire(f"t{i}", max_wait_s=1) for i in range(4)]
     assert all(s is not None and s.f for s in held)
     assert checkcap.acquire("over", max_wait_s=1) is None, "the ceiling holds"
@@ -4305,7 +4305,7 @@ def test_a_long_holder_is_a_likely_hang_only_when_its_log_and_cpu_stalled_else_s
     why, inc = checklane.wait_wake(evs, None, cfg, now, 600.0, marks=moving, stat=stat)
     assert why == ["new"] and inc["slow"] and not inc["hang"], (why, inc)
     text = checklane.wake_text(why, evs, inc, cfg, now, 600.0)
-    assert "slow under load (1-minute load 63.0 on 64 cores), not hung" in text and "likely hang" not in text, text
+    assert "slow under load (CPU demand 63.0 cores on 64 cores), not hung" in text and "likely hang" not in text, text
     assert checklane.wait_wake(evs, inc, cfg, now + 60, 600.0, marks=moving, stat=stat)[0] == [], "slow: no wake"
     # bypasses: its log stalled but its tree busy (left to the wall-time cap); stall watch off; no log named
     grew["at"] = t0 + 100
@@ -8507,11 +8507,92 @@ def test_the_load_guard_judges_cpu_by_runnable_demand_and_io_pressure_by_its_own
     assert testslots.load_guard() == ""
     assert diskgate.saturated() == "io pressure full avg60 35.0% over 10% (checks.io_full_max)"
     assert "disk saturated: new local check runs held" in diskgate.line()
-    # No /proc/stat (macOS): the 1-minute load average stands in.
+    # Neither /proc/stat nor macOS's CPU ticks: the 1-minute load average stands in.
     monkeypatch.setattr(hostcpu, "STAT", tmp_path / "missing")
+    monkeypatch.setattr(hostcpu, "MACH", False)
     monkeypatch.setattr(hostcpu, "_LAST", {})
     monkeypatch.setenv("TTP_CHECKS_LOAD_GUARD", "1")
     assert hostcpu.demand() is None and checkcap.cpu_demand() == 67.0 and testslots.load_guard()
+
+
+def _fake_mac(monkeypatch, tmp_path, idle, mem, load, cores=14):
+    """A Mac for hostcpu: no /proc/stat, the kernel's CPU ticks `idle` (share) idle over a window of SAMPLE_S+
+    (no sleep), its memory level `mem` (share free) and a fixed load average."""
+    from ttp import checkcap, hostcpu
+    monkeypatch.setattr(hostcpu, "STAT", tmp_path / "missing")
+    monkeypatch.setattr(hostcpu, "MACH", True)
+    monkeypatch.setattr(hostcpu, "mach_ticks", lambda: (round((1 - idle) * 1000), 1000))
+    monkeypatch.setattr(hostcpu, "_LAST", {"at": (time.monotonic() - 2 * hostcpu.SAMPLE_S, 0, 0, None)})
+    monkeypatch.setattr(hostcpu, "mach_mem_free", lambda: mem)
+    monkeypatch.setattr(hostcpu, "cores", lambda: cores)
+    monkeypatch.setattr(checkcap, "cores", lambda: cores)
+    monkeypatch.setattr(os, "cpu_count", lambda: cores)
+    monkeypatch.setattr(os, "getloadavg", lambda: (load, load, load))
+    monkeypatch.setenv("TTP_CHECKS_LOAD_GUARD", "1")
+    monkeypatch.setenv("TTP_CHECKS_LOAD_EXTRA", "2")
+
+
+def test_a_mac_load_of_40_with_two_thirds_of_its_cpu_idle_and_free_memory_holds_nothing(env, tmp_path, monkeypatch):
+    """Owner's agent msg #164: a Mac whose load average reads 40 on 14 cores (threads blocked on I/O) while
+    67% of its CPU sits idle and 45% of its memory is free paces on the measured CPU and memory: the load
+    guard, the checks host watch, extra check slots and the daily review's worker slots hold nothing."""
+    from ttp import checkcap, hostcpu, hostload, testslots, throughput
+    _fake_mac(monkeypatch, tmp_path, idle=0.67, mem=0.45, load=40.0)
+    assert round(hostcpu.demand(), 2) == 4.62 and round(checkcap.cpu_demand(), 2) == 4.62, "33% of 14 cores"
+    assert hostcpu.mem_free() == 0.45 and hostcpu.mem_short() == ""
+    assert testslots.load_guard() == ""
+    s = hostload.snapshot()
+    assert s["load"][0] == 40.0 and s["mem_free"] == 0.45
+    assert not hostload.overloaded({**s, "running": 4, "cap": 4, "spilled": {}})
+    assert throughput.cpu_free() == (True, "")
+    assert checkcap.extra(1) == 1, "4.6 cores busy is under half of 14"
+    assert checkcap.free_cores() == 14 - hostcpu.busy_cores()
+
+
+def test_a_mac_with_little_cpu_idle_or_short_memory_is_held(env, tmp_path, monkeypatch):
+    """The same pacing holds on measured trouble: CPU idle under 5% (the load average then counts tasks
+    waiting for a core, as the ticks cannot) or memory under MEM_FREE_MIN free."""
+    from ttp import checkcap, hostcpu, hostload, testslots, throughput
+    _fake_mac(monkeypatch, tmp_path, idle=0.02, mem=0.45, load=40.0)
+    assert checkcap.cpu_demand() == 40.0, "a saturated CPU: the load average stands in for its run queue"
+    assert testslots.load_guard().startswith("the host's CPU is overloaded: its runnable demand of 40.0 cores")
+    assert hostload.overloaded({**hostload.snapshot(), "running": 4, "cap": 4, "spilled": {}})
+    ok, why = throughput.cpu_free()
+    assert not ok and why == "host CPU demand 40.0 cores on 14 cores leaves no CPU free", why
+    assert checkcap.extra(1) == 0
+    _fake_mac(monkeypatch, tmp_path, idle=0.20, mem=0.45, load=40.0)
+    assert round(checkcap.cpu_demand(), 1) == 11.2 and testslots.load_guard() == "", "80% busy: under its cores"
+    ok, why = throughput.cpu_free()
+    assert not ok and why == "host CPU demand 11.2 cores on 14 cores leaves no CPU free", "over 0.75 x 14"
+    # Memory short, CPU idle: held by memory, named so.
+    _fake_mac(monkeypatch, tmp_path, idle=0.67, mem=0.05, load=40.0)
+    assert hostcpu.mem_short() == "memory short: 5% free, under 15%"
+    assert testslots.load_guard() == ("the host is memory short: 5% free, under 15%; no new suite starts "
+                                      "until memory frees, running ones go on")
+    s = {**hostload.snapshot(), "running": 4, "cap": 4, "spilled": {}}
+    assert hostload.overloaded(s) and "has run memory short: 5% free" in hostload.text(s, 900.0)
+    assert hostload.lines(s=s)[0].endswith(", overloaded: memory short: 5% free, under 15%")
+    assert throughput.cpu_free() == (False, "the host is memory short: 5% free, under 15%")
+    assert checkcap.extra(1) == 0
+    monkeypatch.setenv("TTP_CHECKS_LOAD_GUARD", "0")
+    assert testslots.load_guard() == "", "0 turns the guard off, memory too"
+
+
+def test_hostcpu_reads_memory_free_from_meminfo_and_unknown_memory_holds_nothing(env, tmp_path, monkeypatch):
+    from ttp import hostcpu
+    meminfo = "MemTotal:       64000000 kB\nMemFree:  1000 kB\nMemAvailable:   8000000 kB\n"
+    assert hostcpu.mem_free(lambda: meminfo) == 0.125
+    assert hostcpu.mem_short(0.125) == "memory short: 12% free, under 15%" and hostcpu.mem_short(0.5) == ""
+    assert hostcpu.mem_free(lambda: "MemTotal: 64000000 kB\n") is None, "no MemAvailable"
+    monkeypatch.setattr(hostcpu, "MACH", False)
+    assert hostcpu.mem_free() is None and hostcpu.mem_short() == "", "unreadable: nothing held"
+    monkeypatch.setattr(hostcpu, "MACH", True)
+    monkeypatch.setattr(hostcpu, "mach_mem_free", lambda: 0.3)
+    assert hostcpu.mem_free() == 0.3, "no /proc/meminfo on macOS: the kernel's memory level"
+    meminfo_file = tmp_path / "meminfo"
+    meminfo_file.write_text(meminfo)
+    monkeypatch.setattr(hostcpu, "MEMINFO", meminfo_file)
+    assert hostcpu.mem_free() == 0.125, "/proc/meminfo first"
 
 
 def test_disk_gate_reads_dirty_and_io_pressure_against_their_limits(env, tmp_path, monkeypatch):

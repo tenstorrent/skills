@@ -96,7 +96,7 @@ KEEP_S = 14 * 86400
 DAY = 86400
 P1_WAIT_S = 600       # a priority 1 task waiting minutes is slow
 WAIT_S = 1800         # any other task: tens of minutes, or one median run if runs are longer
-CPU_FREE = 0.75       # headroom: 1-minute load under this share of the host's cores
+CPU_FREE = 0.75       # headroom: measured CPU demand under this share of the host's cores
 ROWS = 5000
 SERIAL_S = 10.0   # a checks grant this close to a run's end, one run at a time: a serialized queue
 SUSTAIN_S = 600.0   # how long in all a count of checks runs at once must hold to count as the cap then
@@ -817,13 +817,18 @@ def measure(db: DB, cfg: dict, since_s: float = DAY, now: float | None = None, g
 
 
 def cpu_free() -> tuple[bool, str]:
-    """(CPU free, why not): the host's 1-minute load under CPU_FREE of its cores."""
-    try:
-        load, cores = os.getloadavg()[0], os.cpu_count() or 1
-    except OSError:
+    """(CPU free, why not): the host's measured CPU demand (checkcap.cpu_demand: busy cores from /proc/stat
+    or macOS's CPU ticks, the 1-minute load only where those cannot be read) under CPU_FREE of its cores,
+    and its memory not short (hostcpu.mem_short). The load average alone counts tasks waiting on I/O, so a
+    mostly idle host read high by it."""
+    from . import checkcap, hostcpu
+    if mem := hostcpu.mem_short():
+        return False, f"the host is {mem}"
+    d, cores = checkcap.cpu_demand(), checkcap.cores()
+    if d != d or d == float("inf"):
         return True, ""
-    if load >= CPU_FREE * cores:
-        return False, f"host load {load:.1f} on {cores} cores leaves no CPU free"
+    if d >= CPU_FREE * cores:
+        return False, f"host CPU demand {d:.1f} cores on {cores} cores leaves no CPU free"
     return True, ""
 
 

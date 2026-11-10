@@ -1,0 +1,5 @@
+---
+"tt-project": patch
+---
+
+tt-project 0.2.1005: work is paced on measured CPU idle and free memory instead of the load average. On macOS the load average also counts threads blocked on I/O, so a mostly idle Mac read 30 to 57 and held ready work back. The busy cores now come from the kernel's CPU ticks on macOS (host_statistics, read in-process), as they already did from /proc/stat on Linux, and free memory from kern.memorystatus_level on macOS or MemAvailable on Linux. These readings now drive the load guard for new suites, the default checks cap and its extra slots, the test-worker pool, the repository lanes' slow-under-load text, the "checks host overloaded" watch, and the daily review's worker-slot check (`ttp throughput`). Under 15% memory free holds new suites, extra check slots and worker-slot growth, and counts as overloaded for the watch. On a Mac, a CPU at least 95% busy takes the 1-minute load where it is higher, because the ticks cannot show tasks waiting for a core. The load average is used only where neither reading can be taken.

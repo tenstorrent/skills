@@ -17,7 +17,8 @@ fix. Workers get the directory as a writable root (daemon.start_run).
 
 The cap is the account setting `checks.host_max` (`ttp config --account checks.host_max N`), or the
 environment's TTP_CHECKS_HOST_MAX; 0 turns it off. Unset, it follows the load (default_limit()):
-as many checks as the cores left over the 1-minute load average hold at check_load() each, at least one
+as many checks as the cores left over the measured CPU demand (_load(): /proc/stat or macOS's CPU ticks,
+not the load average, which counts tasks waiting on I/O) hold at check_load() each, at least one
 slot per CORES_PER_SLOT cores (and at least one), at most one per CORES_PER_SLOT_MAX cores. Our own
 running checks count in that load, so the cap shrinks as they load the host; a check keeps its slot
 until it ends, and a waiter reads the cap again on every try. Check commands run with HELD_ENV
@@ -88,7 +89,7 @@ while it waits (raised to urgent, or lowered) sees it within RERANK_S (reranked)
 again at the new priority, keeping its arrival (cli._checks_reexec), so a queued or parked ticket never
 keeps a priority its task no longer has.
 
-While the host is lightly loaded (1-minute load average under half its cores) up to `checks.load_extra`
+While the host is lightly loaded (its CPU demand, _load(), under half its cores) up to `checks.load_extra`
 slots (TTP_CHECKS_LOAD_EXTRA, default EXTRA_SLOTS; 0 turns it off) open beyond the cap: two below a quarter of the cores, one
 below half. A check on one keeps it until it ends, but no new one takes one once the load rises.
 They open beyond a default cap's ceiling too. checks.load_extra 0 also keeps a project's checks lanes
@@ -144,7 +145,7 @@ OBLIGATION_MARK = " [owed to the user: goes first]"   # on its queue ticket (an 
 PRIORITY = "checks-push"   # check-slots/checks-push.<key>.lock: one priority slot per push branch
 CORES_PER_SLOT = 16       # the default cap's floor: one slot per this many cores, at least one
 CORES_PER_SLOT_MAX = 8    # its ceiling: one slot per this many cores
-CHECK_LOAD = 4.0          # the 1-minute load one running check adds with the test pool off (check_load())
+CHECK_LOAD = 4.0          # the cores one running check keeps busy with the test pool off (check_load())
 HELD_ENV = "TTP_CHECKS_SLOT"
 COST_LOG = "check-costs.jsonl"   # in slot_dir(): recent runs' measured cores (record_cost, measured_cores)
 COST_RECENT = 20
@@ -300,8 +301,8 @@ def measured_cores(now: float | None = None) -> float | None:
 
 
 def default_limit() -> int:
-    """The cap with no checks.host_max: the checks the cores left over the 1-minute load average hold
-    at check_load() each, within default_range(). An unreadable load average gives the floor."""
+    """The cap with no checks.host_max: the checks the cores left over the CPU demand (_load()) hold
+    at check_load() each, within default_range(). An unreadable reading gives the floor."""
     floor, top = default_range()
     fit = int(max(0.0, cores() - _load()) // check_load())
     return min(top, max(floor, fit))
@@ -322,10 +323,10 @@ def live_cores_on() -> bool:
 
 def free_cores() -> float | None:
     """This host's cores no process keeps busy now: its cores less hostcpu.busy_cores() (/proc/stat over
-    the last few seconds), or less the 1-minute load average where /proc/stat cannot be read; None
-    with neither readable."""
+    the last few seconds, or macOS's CPU ticks), or less the 1-minute load average where neither can be
+    read; None with nothing readable."""
     busy = hostcpu.busy_cores()
-    if busy is None and ((busy := _load()) != busy or busy == float("inf")):
+    if busy is None and ((busy := _loadavg()) != busy or busy == float("inf")):
         return None
     return max(0.0, cores() - busy)
 
@@ -649,19 +650,26 @@ def _aged_turn(project_name: str | None, aged: list[Path], now: float) -> list[P
     return out
 
 
-def _load() -> float:
+def _loadavg() -> float:
+    """The 1-minute load average (inf when unreadable): only a fallback, as it counts tasks waiting on I/O."""
     try:
         return os.getloadavg()[0]
     except OSError:
         return float("inf")
 
 
-def cpu_demand() -> float:
-    """This host's runnable CPU demand in cores for the load guard (testslots.load_guard): busy cores and
-    tasks waiting to run, read from /proc/stat over a short window (hostcpu.demand), which leaves out
-    tasks waiting on I/O in D state; the 1-minute load average where /proc/stat cannot be read."""
+def _load() -> float:
+    """The cores in use now as every pacing read counts them (the cap's default, extra slots, the test
+    pool, repository lanes, the load guard): the runnable CPU demand measured over a short window
+    (hostcpu.demand: /proc/stat on Linux, the kernel's CPU ticks on macOS), which leaves out tasks waiting
+    on I/O; the 1-minute load average only where neither can be read (inf when nothing can)."""
     d = hostcpu.demand()
-    return _load() if d is None else d
+    return _loadavg() if d is None else d
+
+
+def cpu_demand() -> float:
+    """This host's runnable CPU demand in cores for the load guard (testslots.load_guard): _load()."""
+    return _load()
 
 
 POOL_DIRS_ENV = "TTP_CHECKS_POOL_DIRS"   # where pool runs' folders are looked for (os.pathsep-separated)
@@ -768,12 +776,15 @@ def shard(holder: str, what: str = "", tell: Callable[[str], None] | None = None
 
 
 def extra(n: int | None = None) -> int:
-    """Slots open beyond the cap now: two while the 1-minute load average is under a quarter of the
-    cores, one under half, none above that, with the cap off or with checks.load_extra 0."""
+    """Slots open beyond the cap now: two while the CPU demand (_load()) is under a quarter of the
+    cores, one under half, none above that or while memory is short (hostcpu.mem_short), with the cap off
+    or with checks.load_extra 0."""
     top = extra_max()
     if not (limit() if n is None else n) or not top:
         return 0
     load, c = _load(), cores()
+    if hostcpu.mem_short():
+        return 0
     return min(top, 2 if load < c / 4 else 1 if load < c / 2 else 0)
 
 

@@ -497,7 +497,9 @@ def env(tmp_path, monkeypatch, _git_session, _short_tmp):
     monkeypatch.setenv("TTP_TEST_NO_JOURNAL", "1")   # a reboot record never reads this host's own journal (initiator.py)
     monkeypatch.setenv("TTP_TEST_WTMP", str(tmp_path / "no-wtmp"))   # nor its own wtmp (shutrec.py)
     monkeypatch.setenv("TTP_TEST_CYCLE_NOTICES", str(tmp_path / "no-cycle-notice.json"))   # never the real /run notice (cyclenotice.py)
-    from ttp import probespawn
+    from ttp import hostcpu, probespawn
+    monkeypatch.setattr(hostcpu, "MEMINFO", tmp_path / "no-meminfo")   # memory reads as unknown: never this host's own
+    monkeypatch.setattr(hostcpu, "mach_mem_free", lambda: None)   # (hostcpu_cases set it)
     monkeypatch.setattr(probespawn, "_timeouts", {})   # a probe's timeouts in a row never carry over from another test
     from ttp import gitcache, statcache
     gitcache.clear()   # git and file answers kept by one test never answer another's (fakes, reused paths)
@@ -28373,7 +28375,7 @@ def _cap_holder(label):
 def test_checks_host_cap_default_follows_cores_and_the_account_setting_overrides_it(env, monkeypatch):
     from ttp import checkcap, project
     monkeypatch.setattr(checkcap, "cores", lambda: 64)
-    monkeypatch.setattr(checkcap.os, "getloadavg", lambda: (60.0, 0.0, 0.0))
+    monkeypatch.setattr(checkcap, "_load", lambda: 60.0)
     assert checkcap.limit() == 4, "a busy host gets the floor"
     monkeypatch.setattr(checkcap, "cores", lambda: 8)
     assert checkcap.limit() == 1, "a small host still runs one at a time"
