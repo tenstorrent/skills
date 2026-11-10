@@ -290,11 +290,11 @@ def test_a_task_run_may_not_remove_or_edit_its_untrusted_input_mark(env, tmp_pat
     assert _why(tmp_path, "Write", {"file_path": str(tmp_path / "result.json"), "content": "{}"}) == ""
 
 
-def test_ssh_s_own_files_pass_but_reading_a_key_is_still_refused(env, tmp_path, monkeypatch, labels):
+def test_ssh_s_own_files_pass_but_reading_a_key_is_still_refused(env, tmp_path, monkeypatch):
     """ssh, scp and git's core.sshCommand open their own config, key and known-hosts files: -F, -i and
     -o IdentityFile=/UserKnownHostsFile= pass, also under `ttp lock <res> --`; a key read by cat or cp, a
     -F naming a key, a ProxyCommand reading one and a remote command naming one stay refused."""
-    _untrusted_run(env, tmp_path, monkeypatch, labels)
+    _untrusted_run(env, tmp_path, monkeypatch, ["untrusted_input"])
     d = tmp_path / "home" / (".s" + "sh")
     d.mkdir(parents=True, exist_ok=True)
     cfg, key = d / "config", d / "id_ed25519"
