@@ -283,7 +283,8 @@ No `result.json`, no credit.
 
 - No progress possible within your budget or wall clock: stop early with an honest hand-off.
 - NEVER poll, sleep-wait, or loop waiting for something: hand off `waiting`, `blocked` or `needs_review`.
-  Never block one tool call longer than about 5 minutes: submit long work detached, hand off `waiting`.
+  Never block one tool call longer than about 5 minutes: run long work, a remote test (`ttp lock <box> --`,
+  ssh) or a slow poll detached (`ttp detach`), hand off `waiting` with its `retry_when`: that frees your slot.
 <!-- ttp:if wait -->
   Push with `ttp push --detach` (delivery: reviews and landings) or `ttp push --own --detach`
   (your task branch). A command your task's rules say to run in the foreground gets your

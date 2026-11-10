@@ -7830,9 +7830,13 @@ def cmd_lock(a) -> None:
                 _forward(pending.pop(0), None)
 
             def _wait() -> int:
+                from . import fgwait   # a long foreground command holds the worker's slot: say so (steer)
+                fg = fgwait.watch(wait_dir, [L["name"] for L in todo], list(cmd))
                 try:
                     return proc.wait()
                 finally:
+                    if fg:
+                        fg.cancel()
                     if keeper:
                         keeper.kill()
                         keeper.wait()

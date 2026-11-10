@@ -1301,8 +1301,10 @@ def pre_tool_use(payload: dict) -> tuple[dict | None, None]:
     if not why:
         why = local_guard(payload)
     if not why:
+        from . import fgwait
         cwd = str(payload.get("cwd") or os.getcwd())
-        hint = "\n\n".join(h for h in (fenced_script(segments, commands, cwd), wide_read(commands, cwd)) if h)
+        hint = "\n\n".join(h for h in (fenced_script(segments, commands, cwd), wide_read(commands, cwd),
+                                        fgwait.reminder(cmd)) if h)
         out = {"hookEventName": "PreToolUse", **({"additionalContext": hint} if hint else {})}
         return ({"hookSpecificOutput": out} if len(out) > 1 else None), None
     return _deny(why), None

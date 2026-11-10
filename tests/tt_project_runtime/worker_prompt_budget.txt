@@ -40,3 +40,7 @@ every +169: the Threads line: independent parts run in parallel subagents, their
 code +46: the no-search rule names the KNOWN PATHS block and `ttp paths` (user msg #212: no search of / or the home folder)
 question +46: the no-search rule names the KNOWN PATHS block and `ttp paths` (user msg #212: no search of / or the home folder)
 every +46: the no-search rule names the KNOWN PATHS block and `ttp paths` (user msg #212: no search of / or the home folder)
+code +115: a remote test (`ttp lock <box> --`, ssh) or a slow poll runs detached and the worker hands off waiting, freeing its slot (msg #223)
+question +115: a remote test (`ttp lock <box> --`, ssh) or a slow poll runs detached and the worker hands off waiting, freeing its slot (msg #223)
+every +115: a remote test (`ttp lock <box> --`, ssh) or a slow poll runs detached and the worker hands off waiting, freeing its slot (msg #223)
+system +115: a remote test (`ttp lock <box> --`, ssh) or a slow poll runs detached and the worker hands off waiting, freeing its slot (msg #223)
