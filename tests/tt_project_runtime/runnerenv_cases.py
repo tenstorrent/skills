@@ -395,7 +395,7 @@ def test_runnerenv_makes_the_env_from_a_python_the_locks_requires_python_allows(
     bin_.mkdir()
     fake_base = runnerenv._base_python()
     for name, body in (("python3", "exit 1"),
-                       ("python3.41", f'echo \'["{tmp_path}/py41", "41.0.0 (old)", [41, 0, 0]]\''),
+                       ("python3.19", f'touch "{tmp_path}/old-probed"; echo \'["{tmp_path}/py41", "41.0.0 (old)", [41, 0, 0]]\''),
                        ("python3.17", f'echo \'["{fake_base}", "42.1.0 (new)", [42, 1, 0]]\'')):
         (bin_ / name).write_text(f'#!/bin/sh\n[ "$3" = --interpreter ] || exit 2\n{body}\n')
         (bin_ / name).chmod(0o755)
@@ -403,6 +403,7 @@ def test_runnerenv_makes_the_env_from_a_python_the_locks_requires_python_allows(
     lock = tmp_path / "a.lock"
     lock.write_text("# requires-python: >=42\npytest==1\n")
     assert runnerenv.interpreter(lock.read_bytes()) == (fake_base, "42.1.0 (new)")
+    assert (tmp_path / "old-probed").exists(), "the too-old Python was probed (the scan reaches it), then skipped"
     info = runnerenv.ensure(lock)
     assert builds() == 1 and info["key"] == runnerenv.key_of(lock.read_bytes(), fake_base, "42.1.0 (new)")
     assert info["key"] != runnerenv.key_of(lock.read_bytes(), fake_base), "the key names the Python it was made from"
