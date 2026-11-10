@@ -12117,8 +12117,10 @@ def test_a_macos_restart_uses_the_launchd_agent_and_falls_back_when_it_is_not_lo
     # A daemon agent installed before the watchdog existed gets its watchdog agent on restart.
     boot = [c for c in calls if c[:2] == ("launchctl", "bootstrap")]
     assert boot and boot[0][-1].endswith(".watchdog.plist"), calls
-    assert calls[-1] == ("launchctl", "kickstart", "-k", f"gui/{os.getuid()}/{label}")
-    assert bool(spawned) == bool(kickstart_rc), "a loaded agent restarts itself; an unloaded one is started by hand"
+    kick = calls.index(("launchctl", "kickstart", "-k", f"gui/{os.getuid()}/{label}"))
+    # A loaded agent restarts itself; an unloaded one is loaded from its plist, by hand only when launchd refuses.
+    assert calls[kick + 1:] == ([] if kickstart_rc == 0 else [("launchctl", "bootstrap", f"gui/{os.getuid()}", str(plist))])
+    assert bool(spawned) == bool(kickstart_rc)
 
 
 def _short_sock_path(name):

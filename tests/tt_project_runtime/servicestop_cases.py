@@ -355,7 +355,9 @@ def test_the_daemon_reloading_its_own_rewritten_plist_does_it_from_a_new_session
     monkeypatch.setattr(service, "_run", lambda *a: (a[0] == "launchctl" and calls.append(a)) or subprocess.CompletedProcess(
         a, 5 if a[1:2] == ("bootstrap",) else 0, "", "refused"))
     assert service.restart_service(p) == "restarted" and spawned == [p] and not popen
-    assert [c[1] for c in calls] == ["bootout", "bootstrap"] and calls[0][2].endswith(f"/{label}"), calls
+    # The refused reload is followed by the not-loaded fallback's own bootstrap; refused again, a hand start.
+    assert [c[1] for c in calls] == ["bootout", "bootstrap", "bootstrap"] and calls[0][2].endswith(f"/{label}"), calls
+    assert "launchctl bootstrap and kickstart failed" in (p.logs / "daemon.out").read_text()
     assert plistlib.loads(service._agent(p).read_bytes())["ProcessType"] == "Standard"
 
 
