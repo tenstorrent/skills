@@ -1286,7 +1286,7 @@ def test_the_forked_test_runner_reports_every_test_once_as_one_process_would(tmp
         "@pytest.mark.parametrize('i', range(60))\n"
         "def test_ok(i, tmp_path):\n"
         "    pathlib.Path(os.environ['OUT'], f'ok-{i}').write_text(str(os.getpid()))\n"
-        "    pathlib.Path(os.environ['OUT'], f'nice-{i}').write_text(str(os.nice(0)))\n"
+        "    pathlib.Path(os.environ['OUT'], f'nice-{i}').write_text(str(os.getpriority(os.PRIO_PROCESS, 0)))\n"
         "    pathlib.Path(os.environ['OUT'], f'tmp-{i}').write_text(str(tmp_path.parent))\n"
         "def test_fail(): assert 1 == 2, 'boom'\n"
         "def test_skip(): pytest.skip('not here')\n"
@@ -1319,8 +1319,9 @@ def test_the_forked_test_runner_reports_every_test_once_as_one_process_would(tmp
     pids = {(out / f"ok-{i}").read_text() for i in range(60)}
     assert len(pids) > 1 and str(os.getpid()) not in pids, "the tests did not run in forked workers"
     # Off CI the workers run at a lower priority, and the run ends with its wall and CPU time.
-    nice = os.nice(0)
-    assert {int((out / f"nice-{i}").read_text()) for i in range(60)} == {min(19, nice + 10)}
+    # Read, not os.nice(0): macOS refuses that at its ceiling of 20 (Linux: 19), where a niced shell's run sits.
+    nice, top = os.getpriority(os.PRIO_PROCESS, 0), 20 if sys.platform == "darwin" else 19
+    assert {int((out / f"nice-{i}").read_text()) for i in range(60)} == {min(top, nice + 10)}
     # Each worker has its own temp root in the session's: workers sharing one raced for tmp_path's
     # numbered folders, and pytest gave up after 10 lost races ('could not create numbered dir').
     roots = {}
@@ -1436,7 +1437,7 @@ def test_every_test_gets_its_own_temp_home_and_a_session_that_writes_outside_fai
     (repo / "plugins" / "tt-project").mkdir(parents=True)   # the plugin's credential list (credwatch)
     (repo / "plugins" / "tt-project" / "runtime").symlink_to(RUNTIME.parent)
     (repo / "test_tt_project_home.py").write_text(
-        "import os, pathlib, subprocess, time, pytest\n"
+        "import os, pathlib, shlex, subprocess, sys, time, pytest\n"
         "REAL = os.environ['REAL']\n"
         "assert not os.environ['HOME'].startswith(REAL) and not os.environ['GH_CONFIG_DIR'].startswith(REAL)\n"
         "@pytest.mark.parametrize('i', range(60))\n"
@@ -1447,7 +1448,7 @@ def test_every_test_gets_its_own_temp_home_and_a_session_that_writes_outside_fai
         "    assert os.environ['GH_CONFIG_DIR'] == str(home / '.config' / 'gh')\n"
         "    sh = 'echo \"$HOME\"; cd ~ && printf x > .bashrc && git config --global t.k v'\n"
         "    if i == 0:\n"
-        "        sh += ' && python3 -c \"import pytest\"'   # the account's user packages still import\n"
+        "        sh += f' && {shlex.quote(sys.executable)} -c \"import pytest\"'   # the account's user packages still import\n"
         "        # The account's git config, copied: git's answer cache keeps nothing while one has an include.\n"
         "        assert '[include' not in (home / '.gitconfig').read_text()\n"
         "        assert subprocess.run(['git', 'config', '--global', 't.mine'], capture_output=True, text=True).stdout == '1\\n'\n"
