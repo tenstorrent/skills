@@ -41,7 +41,7 @@ def make(path: Path, seed=SEED, timeout_s: float = 300) -> Path:
     base = {k: v for k, v in os.environ.items() if k not in DROP}
     try:
         # Not --system-site-packages: pip refuses an explicit --user only in a venv that hides the
-        # global site (pip 22 lets it through in one that shows it, #18 on blx06).
+        # global site (pip 22 lets it through in one that shows it, as a test host's system pip did).
         r = subprocess.run([_base_python(), "-m", "venv", "--without-pip", str(path)],
                            capture_output=True, text=True, timeout=timeout_s, stdin=subprocess.DEVNULL, env=base)
         if r.returncode:

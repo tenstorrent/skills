@@ -1265,7 +1265,7 @@ def _nested_pytest_env(**extra):
 
 
 def test_a_nested_pytest_run_never_inherits_the_outer_runs_xdist_or_ci_variables(monkeypatch):
-    """The forked-runner tests failed under `pytest -n` (blx06's -n 48 full suite) and passed on CI."""
+    """The forked-runner tests failed under `pytest -n` (a test host's -n 48 full suite) and passed on CI."""
     for var, value in (("PYTEST_XDIST_WORKER", "gw3"), ("PYTEST_XDIST_WORKER_COUNT", "48"),
                        ("PYTEST_XDIST_TESTRUNUID", "x"), ("CI", "true")):
         monkeypatch.setenv(var, value)
