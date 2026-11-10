@@ -18518,7 +18518,7 @@ def test_concurrent_pushes_to_one_branch_take_turns_and_both_land(env, monkeypat
     assert log.read_text().split() == ["start", "end", "start", "end"], \
         "the checks must run once per push, one push after the other"
     assert not any("round 2" in o for o in outs), outs
-    assert any("waiting up to" in o for o in outs), outs
+    assert any("in arrival order" in o for o in outs), outs
 
 
 def test_a_killed_push_frees_the_branch(env, monkeypatch):
