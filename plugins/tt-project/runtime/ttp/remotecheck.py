@@ -64,7 +64,9 @@ DIRECT = ["-o", "ControlMaster=no", "-o", "ControlPath=none"]
 # tried again from the start on a connection of its own after each wait here, then it is a fault.
 MUX_REFUSED = "Session open refused by peer"
 MUX_BACKOFF_S = (2, 5)
-SETUP_TIMEOUT_S = 900
+# Under the checks' silence limit (checkwall.SILENT_S, 600 s): a copy that stalls is the host's fault
+# (another host or here takes the check), never a silent "hang" blamed on the change.
+SETUP_TIMEOUT_S = 540
 CLEANUP_TIMEOUT_S = 120
 PROBE_TIMEOUT_S = 45
 STOP_GRACE_S = 5   # a stopped command's TERM before KILL on the host
@@ -101,9 +103,11 @@ def argv(cmd: str, host: str, env: dict | None = None, commit: str = "", wrap: t
             *(["--literal", json.dumps(literal, sort_keys=True)] if literal else []), "--", cmd]
 
 
-def _ssh(host: str, script: str, direct: bool = False) -> list[str]:
+def _ssh(host: str, script: str, direct: bool = False, compress: bool = False) -> list[str]:
     # The login shell parses the command line: hand it one quoted word for sh, whatever that shell is.
-    return [*SSH, *(DIRECT if direct else []), host, f"sh -c {shlex.quote(script)}"]
+    # compress: the tree copy (a plain tar, about 3x smaller compressed) on a slow link.
+    return [*SSH, *(DIRECT if direct else []), *(["-o", "Compression=yes"] if compress else []), host,
+            f"sh -c {shlex.quote(script)}"]
 
 
 def paused(host: str, where: str | Path | None = None) -> str:
@@ -351,7 +355,7 @@ def _attempt(host, top, head, env, extra, cmd, mark, wrap, wait) -> tuple[int, s
                  f"--no-verify --allow-empty -m {shlex.quote('ttp check of ' + head)}")
         archive = subprocess.Popen(["git", "-C", top, "archive", "--format=tar", head], stdout=subprocess.PIPE)
         try:
-            copied = subprocess.run(_ssh(host, setup, direct), stdin=archive.stdout, capture_output=True, text=True,
+            copied = subprocess.run(_ssh(host, setup, direct, compress=True), stdin=archive.stdout, capture_output=True, text=True,
                                     timeout=SETUP_TIMEOUT_S)
         except subprocess.TimeoutExpired:
             archive.kill()

@@ -8,7 +8,7 @@ _RC_FAKE_SSH = r'''#!/bin/sh
 # A fake ssh: drops -o options and the host, runs the last argument with sh -c. Host "down" is
 # unreachable; FAKE_SSH_FAIL=<text> exits 255 at once on a script holding it (reading nothing);
 # FAKE_SSH_DROP=<text> runs such a script, then drops the connection before its exit-code marker.
-# FAKE_SSH_LOG=<file> gets one line per call naming the host. FAKE_SSH_MUX=<file> holding a count (or
+# FAKE_SSH_LOG=<file> gets one line per call naming the host; FAKE_SSH_ARGS=<file> one with all its arguments. FAKE_SSH_MUX=<file> holding a count (or
 # "always"): on a script holding FAKE_SSH_MUX_ON (default: the run step) the shared connection refuses
 # the session while the count lasts, and the link drops (exit 255); <file>.log gets "shared" or "direct".
 all="$*"
@@ -16,6 +16,7 @@ while [ "$1" = "-o" ]; do shift 2; done
 host=$1
 shift
 [ -n "$FAKE_SSH_LOG" ] && echo "$host" >> "$FAKE_SSH_LOG"
+[ -n "$FAKE_SSH_ARGS" ] && echo "$all" >> "$FAKE_SSH_ARGS"
 if [ "$host" = down ]; then echo "ssh: connect to host down port 22: Connection refused" >&2; exit 255; fi
 [ -n "$FAKE_REMOTE_TMP" ] && export TMPDIR="$FAKE_REMOTE_TMP"
 if [ -n "$FAKE_SSH_MUX" ]; then
@@ -3690,3 +3691,19 @@ def test_a_push_batch_beside_a_host_pinned_suite_spills_and_its_light_check_take
     assert all("/ttp-check." in ln for ln in where if not ln.startswith("light")), where
     assert not any("/ttp-check." in ln for ln in where if ln.startswith("light")), "the light check ran here"
     assert checkspill.holders(s.p.name) == []
+
+
+def test_the_tree_copy_to_a_check_host_is_compressed_and_a_stall_is_the_hosts_fault_before_the_silence_limit(tmp_path):
+    """The tree goes to the check host over a compressed ssh (a plain tar, about 3x smaller on a slow link),
+    and only that copy is: the run's own session is not. A copy that stalls ends as the host's fault
+    (SETUP_TIMEOUT_S) before the checks' silence limit could call it a hang of the change."""
+    from ttp import checkwall, remotecheck
+    repo = _rc_repo(tmp_path)
+    args = tmp_path / "ssh.args"
+    rc, out = _rc_run(tmp_path, repo, "true", FAKE_SSH_ARGS=str(args))
+    assert rc == 0, out
+    calls = args.read_text().splitlines()
+    copy = [c for c in calls if "tar -xf -" in c]
+    assert len(copy) == 1 and "Compression=yes" in copy[0], calls
+    assert not [c for c in calls if "Compression=yes" in c and "tar -xf -" not in c], calls
+    assert remotecheck.SETUP_TIMEOUT_S < checkwall.SILENT_S
