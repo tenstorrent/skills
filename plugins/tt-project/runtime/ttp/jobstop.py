@@ -128,15 +128,13 @@ def members(pgid: int) -> list[int]:
     return out
 
 
-def strays(pgid: int) -> list[int]:
-    """The live processes of the job led by pgid outside its group: its session's other groups (a test
-    runner's helpers, such as pytest-xdist workers, that took a group of their own) and the descendants of
-    its members that left the session (setsid). [] where /proc cannot tell."""
-    procs = {}
+def _proc_table() -> dict[int, tuple[int, int, int | None]] | None:
+    """{pid: (ppid, pgid, sid)} of every live (not zombie) process from /proc; None without /proc."""
     try:
         names = os.listdir("/proc")
     except OSError:
-        return []
+        return None
+    procs = {}
     for n in names:
         try:
             st = Path(f"/proc/{n}/stat").read_text().rsplit(")", 1)[1].split()
@@ -144,7 +142,34 @@ def strays(pgid: int) -> list[int]:
                 procs[int(n)] = (int(st[1]), int(st[2]), int(st[3]))   # ppid, pgid, sid
         except (OSError, IndexError, ValueError):
             continue
-    ours = {pid for pid, (_, g, sid) in procs.items() if g == pgid or sid == pgid}
+    return procs
+
+
+def _ps_table() -> dict[int, tuple[int, int, int | None]]:
+    """{pid: (ppid, pgid, None)} of every live (not zombie) process from one `ps` read, where /proc is
+    missing (macOS); {} when ps fails. ps gives no session id here, so only descendants are followed."""
+    try:
+        out = subprocess.run(["ps", "-axo", "pid=,ppid=,pgid=,stat="], capture_output=True, text=True,
+                             timeout=10, stdin=subprocess.DEVNULL).stdout
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    procs = {}
+    for line in out.splitlines():
+        f = line.split()
+        if len(f) >= 4 and f[0].isdigit() and f[1].isdigit() and f[2].isdigit() and not f[3].startswith("Z"):
+            procs[int(f[0])] = (int(f[1]), int(f[2]), None)
+    return procs
+
+
+def strays(pgid: int, table=None) -> list[int]:
+    """The live processes of the job led by pgid outside its group: its session's other groups (a test
+    runner's helpers, such as pytest-xdist workers, that took a group of their own) and the descendants of
+    its members that left the group or session (setsid). From /proc, else one `ps` read (macOS), where the
+    descendants of the group's members are followed by ppid. `table`: a process table to read instead."""
+    procs = table() if table else _proc_table()
+    if procs is None:
+        procs = _ps_table()
+    ours = {pid for pid, (_, g, sid) in procs.items() if g == pgid or (sid is not None and sid == pgid)}
     grew = True
     while grew:
         more = {pid for pid, (pp, _, _) in procs.items() if pp in ours and pid not in ours}

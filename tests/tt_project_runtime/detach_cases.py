@@ -3202,12 +3202,16 @@ def test_last_progress_reads_a_live_jobs_newest_log_and_skips_ended_lost_and_rem
     assert abs(detach.last_progress(f"ttp detach --check {live.name}", live.parent) - (now - 120)) < 2
 
 
-@pytest.mark.skipif(not os.path.exists("/proc/self/stat"), reason="reads the session from /proc")
-def test_detach_stop_ends_the_jobs_helpers_in_other_groups_of_its_session_and_those_that_left_it(env, tmp_path):
+@pytest.mark.parametrize("table", ["native", "ps"])
+def test_detach_stop_ends_the_jobs_helpers_in_other_groups_of_its_session_and_those_that_left_it(env, tmp_path,
+                                                                                                 monkeypatch, table):
     """`ttp detach --stop` killed the job's process group only: pytest-xdist workers, which run in groups of
     their own, lived on. The stop now also ends the job's other groups in its session and the descendants
-    of its members that left the session (setsid)."""
+    of its members that left the session (setsid), from /proc on Linux and from one `ps` read where /proc
+    is missing (macOS; forced here by `ps`, so both paths run on every platform)."""
     from ttp import jobstop
+    if table == "ps":
+        monkeypatch.setattr(jobstop, "_proc_table", lambda: None)
     p = make(env)
     run_dir = p.runs / "7"
     run_dir.mkdir(parents=True)
@@ -3226,11 +3230,8 @@ def test_detach_stop_ends_the_jobs_helpers_in_other_groups_of_its_session_and_th
         assert r and f"group {pgid}" in r["text"]
 
         def gone(pid):
-            try:
-                s = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
-                return s[0] == "Z"
-            except OSError:
-                return True
+            st = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True).stdout
+            return not st.strip() or st.strip().startswith("Z")
         assert _until_true(lambda: all(gone(x) for x in pids)), pids
         assert any(x["signal"] == "SIGKILL" and x["pid"] in pids and "outside its group" in x["why"]
                    for x in _signal_rows(p))

@@ -150,3 +150,31 @@ def test_a_skipped_deadwait_check_never_clears_or_raises_from_probe_verdicts(env
     d2._dead_landed_waits(rows(), t0 + deadwait.GRACE_S + 12)
     assert p.db.one("SELECT status FROM events WHERE id=?", (ev["id"],))["status"] == "handled"
     assert p.db.kv(deadwait.KEY) == {}
+
+
+def test_landed_follows_link_counts_only_a_follower_on_its_predecessors_branch(env):
+    """A follows:<n> link carries <n>'s change only when the follower works on <n>'s branch: a
+    third-round fix on the fix's branch that landed makes the original land; a follow-up branched
+    from the base carries nothing. A "re-land #N" title links as before."""
+    from ttp import landed
+    p = make(env)
+    orig = p.db.add_task("Speed up the loader", "s", kind="code")
+    p.db.update_task(orig, status="done", branch=f"ttp/t{orig}-loader")
+    fix = p.db.add_task("Fix review: loader", "s", kind="code", labels=[f"continues:{orig}"])
+    p.db.update_task(fix, status="done", branch=f"ttp/t{fix}-fix")
+    third = p.db.add_task("Fix review again: loader", "s", kind="code", labels=[f"follows:{fix}"])
+    p.db.update_task(third, status="done", branch=f"ttp/t{fix}-fix")
+    base = p.db.add_task("Follow-up: loader docs", "s", kind="code", labels=[f"follows:{orig}"])
+    p.db.update_task(base, status="done", branch=f"ttp/t{base}-docs")
+    carry = landed.carriers(p.db, orig)
+    assert third in carry and fix in carry and base not in carry, carry
+    assert landed.recorded(p.db, orig)[0] == []
+    _dw_push_row(p, third, f"ttp/t{fix}-fix", "landed", sha="b" * 40)
+    assert landed.recorded(p.db, orig)[0] != []
+    _dw_push_row(p, base, f"ttp/t{base}-docs", "landed", sha="f" * 40)
+    other = p.db.add_task("Other change", "s", kind="code")
+    p.db.update_task(other, status="done", branch=f"ttp/t{other}-other")
+    assert landed.recorded(p.db, other)[0] == []
+    redo = p.db.add_task(f"Re-land #{other}", "s", kind="code")
+    p.db.update_task(redo, status="done", branch=f"ttp/t{redo}-reland")
+    assert redo in landed.carriers(p.db, other)
