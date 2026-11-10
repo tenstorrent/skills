@@ -3085,9 +3085,10 @@ ACCOUNT_OFF_VALUE = {"checks.spill_hosts": [], "checks.slurm_overflow": {}}
 # Account keys three deep, below a provider: never merged into a project's settings (a project that does not
 # use the provider gets no providers.<name> entry); their reader asks for them (account_value).
 # providers.chat.model_ranking: read under the project's own (modelrank.ranking), kept current by rankfresh.py
-# with its source, interval and key file.
+# with its source, interval and key file. providers.chat.served_every_s and served_idle_s: the host's shared
+# /models poll interval while any project routes to chat, and else (served.every_s).
 ACCOUNT_NESTED_KEYS = {"providers.chat.model_ranking", "providers.chat.ranking_source", "providers.chat.ranking_every_s",
-                       "providers.chat.ranking_key_file"}
+                       "providers.chat.ranking_key_file", "providers.chat.served_every_s", "providers.chat.served_idle_s"}
 HOST_WIDE_KEYS = {"checks.host_max", "route.host_max", "checks.spill_hosts", "checks.no_spill_hosts", "checks.slurm_overflow", "checks.dirty_max_mb", "checks.io_full_max",
                   "checks.push_priority_wait_s"}
 

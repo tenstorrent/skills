@@ -4484,22 +4484,37 @@ class Daemon:
             db.x("DELETE FROM kv WHERE key=?", (downtime.LINGER_KV,))
 
     def check_route_models(self) -> None:
-        """The routed endpoint's model-free /models check (route.py): every route.models_every seconds while
-        a tier or run class routes to it, in a thread, its served ids written to the state dir's route.MODELS_FILE for workers,
-        `ttp status` and doctor; then each tier hold its answer or a config change ends is released."""
+        """The chat endpoint's model-free /models check: the host's one shared poll (served.py), every 30 s
+        while any project on the host routes to chat, else every 5 min, in a thread; its served ids are read
+        by workers, `ttp status` and doctor (route.read_served). Where the shared files cannot be written, the
+        project's own check runs instead while it routes to chat. Then each tier hold its answer or a config
+        change ends is released."""
+        from . import served
         now = time.time()
         for tier, model, why in route.release(self.p.db, self.cfg, route.read_served(self.p.state), now):
             log(self.p, f"route: tier {tier} routes again ({model}: {why})")
         if os.environ.get("TTP_TEST_NO_MODELS_PROBE") or (self._models_probe and self._models_probe.is_alive()):
             return
-        if now - self._models_tried < route.models_every(self.cfg) or not (alias := route.models_due(self.cfg, self.p.state, now, self.p.db)):
+        if now - self._models_tried < served.CHECK_S or not (alias := route.chat_alias(self.cfg)):
             return
+        routes = bool(route.routes_chat(self.cfg, self.p.db))
+        try:
+            if not served.due(self.p.state, route.TO, routes, now):
+                return
+        except OSError:
+            pass   # the shared files are unreadable: the thread falls back
         self._models_tried = now
-        state, where = self.p.state, self.p
+        state, where, cfg = self.p.state, self.p, self.cfg
+        fallback = alias if routes else ""
 
         def work() -> None:
             try:
-                route.refresh_served(state, alias)
+                try:
+                    served.tick(state, alias, routes)
+                except OSError as e:   # the shared files cannot be written: the project's own check
+                    if fallback:
+                        log(where, f"route: shared /models poll failed ({type(e).__name__}); checking for this project")
+                        route.refresh_served(state, fallback, every=route.models_every(cfg))
             except Exception as e:   # a local fault (an unwritable state dir): the type only, never text
                 log(where, f"route: /models check failed: {type(e).__name__}")
 
@@ -6071,7 +6086,7 @@ class Daemon:
                                    f"The {routed['to']} provider no longer serves model {model} "
                                    f"(providers.{routed['to']}.tiers.{routed['tier']}.model). {routed['tier'].capitalize()} "
                                    f"runs now start on the core provider; routing resumes on its own once the model is "
-                                   f"served again (checked every minute) or the tier's model is changed. Served models: "
+                                   f"served again (checked every 30 seconds) or the tier's model is changed. Served models: "
                                    f"`ttp status`.", severity="normal", every_s=0)
             elif fell and not own:   # an endpoint fault cools the endpoint; a run's own end only its task
                 route.cool(db, self.cfg, routed["to"], fell, r["id"], time.time())

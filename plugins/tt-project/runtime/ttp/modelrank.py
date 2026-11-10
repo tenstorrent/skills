@@ -6,8 +6,8 @@
 project's own, else the account's, which rankfresh.py keeps current from the Artificial Analysis
 Intelligence Index wherever a chat endpoint is set. Unset or empty in both, nothing changes. Set, a model is down (down()) while a run was
 refused it (route.py's model_missing hold for a tier, or a ranked model's own refusal here, kept for
-route.RETRY_QUIET_S) or while the last good model-free /models check (route.MODELS_FILE) leaves it out; a check over STALE_S
-old counts as none (route.models_due keeps it fresh while a ranking is set and chat may run).
+route.RETRY_QUIET_S) or while the last good model-free /models check (the host's shared poll, served.py, else route.MODELS_FILE) leaves
+it out; a check over 3 poll intervals old counts as none (served.py polls every 30 s while chat may run).
 
 A routed start (a tier route or a model pick to chat, route.py) whose model is down runs the
 highest-ranked model that check lists and that is not down itself (pick); with none, it falls back
@@ -36,6 +36,7 @@ from pathlib import Path
 from typing import Any
 
 from . import route
+from . import served as watch
 
 TO = route.TO                         # the one provider with a served list
 KEY = "model_rank"                    # the route entry's or run note's {"from", "why"} of a swapped run
@@ -73,14 +74,14 @@ def ranking(cfg: dict) -> list[str]:
         return []
 
 
-STALE_S = 7200   # an older served list (a failed or asleep check) is unknown: no swap or hold rests on it
+STALE_S = watch.STALE_POLLS * watch.EVERY_S   # a list with no poll interval recorded this old is unknown: no swap or hold rests on it
 
 
 def served(state: Path, now: float) -> list[str] | None:
-    """The ids the last /models check listed, or None when it failed, never ran or is over STALE_S old
-    (nothing is known)."""
+    """The ids the last /models check listed (the host's shared poll first: served.py), or None when it
+    failed, never ran or is over served.stale_s old (3 poll intervals: nothing is known)."""
     rec = route.read_served(state).get(route.TO) or {}
-    if not rec.get("ok") or now - float(rec.get("checked") or 0) > STALE_S:
+    if not rec.get("ok") or now - float(rec.get("checked") or 0) > watch.stale_s(rec):
         return None
     return list(rec.get("ids") or [])
 

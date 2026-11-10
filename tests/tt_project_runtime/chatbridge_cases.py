@@ -1474,6 +1474,7 @@ def test_a_refused_model_the_endpoint_still_lists_retries_hourly_with_one_notice
         rec = route.read_served(p.state).get("chat")
         if rec:   # the last check was an hour ago
             (p.state / route.MODELS_FILE).write_text(json.dumps({"chat": {**rec, "checked": time.time() - route.MODELS_EVERY_S}}))
+            _age_shared(p, route.MODELS_EVERY_S)
         d._models_tried = 0.0
         d.check_route_models()
         if d._models_probe:
@@ -1529,6 +1530,7 @@ def test_a_model_missing_hold_ends_when_the_endpoint_lists_it_or_the_config_chan
     # Listed again at the next hourly check: the hold ends and the tier routes again.
     up.models = ["example-org/model-b", _RT_MODEL]
     (p.state / route.MODELS_FILE).write_text(json.dumps({"chat": {**rec, "checked": time.time() - route.MODELS_EVERY_S}}))
+    _age_shared(p, route.MODELS_EVERY_S)
     assert route.held(p.db, d.cfg, "light")
     check()
     assert route.held(p.db, d.cfg, "light") == "" and route.holds(p.db) == {}
@@ -1548,6 +1550,14 @@ def test_a_model_missing_hold_ends_when_the_endpoint_lists_it_or_the_config_chan
     route.refresh_served(p.state, "placeholder")
     rec = route.read_served(p.state)["chat"]
     assert not rec["ok"] and rec["ids"] == ["example-org/model-b", _RT_MODEL] and up.url not in json.dumps(rec)
+
+
+def _age_shared(p, seconds):
+    """Move the host's shared served list of the project's endpoint (served.py) `seconds` into the past."""
+    from ttp import served
+    eid = served.link(p.state, "chat")
+    if rec := served.read(eid):
+        (served.home() / f"{eid}.json").write_text(json.dumps({**rec, "checked": float(rec["checked"]) - seconds}))
 
 
 def _ranked(p, d, monkeypatch, ids, ranking=("rank-a", "rank-b")):
@@ -3007,19 +3017,179 @@ def test_the_served_model_list_is_polled_every_minute_while_a_tier_or_run_class_
     _route_config(p, models_every_s=300)
     d._load_config()
     assert route.models_every(d.cfg) == 300 and route.models_due(d.cfg, p.state, t0 + 60) == ""
-    # The daemon's own retry gate follows the same interval (a failed check retries a minute later).
+    # The daemon asks the host's shared poll (served.py) at most every served.CHECK_S; where its files
+    # cannot be written, the project's own check runs instead, at the project's interval.
+    from ttp import served
     _route_config(p)
     d._load_config()
     calls = []
     monkeypatch.delenv("TTP_TEST_NO_MODELS_PROBE", raising=False)
-    monkeypatch.setattr(route, "refresh_served", lambda state, alias: calls.append(alias))
+
+    def tick(state, alias, routes):
+        calls.append(("shared", alias, routes))
+        raise OSError("read-only")
+
+    monkeypatch.setattr(served, "tick", tick)
+    monkeypatch.setattr(route, "refresh_served", lambda state, alias, every=None: calls.append(("own", alias, every)))
     route.write_served(p.state, "chat", False, "HTTP 503", [], time.time() - 60)
-    for tried_ago in (30, 61):
+    for tried_ago in (served.CHECK_S - 2, served.CHECK_S + 1):
         d._models_tried = time.time() - tried_ago
         d.check_route_models()
         if d._models_probe:
             d._models_probe.join(10)
-    assert calls == ["placeholder"]
+    assert calls == [("shared", "placeholder", True), ("own", "placeholder", 60)]
+
+
+def _shared_watch(monkeypatch, url="https://chat.invalid/v1", ids=(_RT_MODEL, "rank-a")):
+    """The host's shared /models poll (served.py) against a fake endpoint: (the ids it lists, the poll times)."""
+    from ttp import endpoint
+    listed, polls = list(ids), []
+    monkeypatch.setattr(endpoint, "credentials", lambda alias: endpoint.Credentials(_CB_KEY, url))
+
+    def list_models(u, key, timeout=0):
+        polls.append(u)
+        return True, "HTTP 200", list(listed)
+
+    monkeypatch.setattr(endpoint, "list_models", list_models)
+    return listed, polls
+
+
+def _daemon_ticks(state, t0, t1, routes=True):
+    """Each daemon's check (every served.CHECK_S) from t0 to t1: (time, what served.tick did) of each try."""
+    from ttp import served
+    out = []
+    for t in range(int(t0), int(t1) + 1, served.CHECK_S):
+        if served.due(state, "chat", routes, t):
+            out.append((t, served.tick(state, "placeholder", routes, now=t)))
+    return out
+
+
+def test_one_shared_models_poll_per_interval_serves_every_project_on_the_host(env, monkeypatch):
+    """User's rule: one /models poll per host and endpoint, every 30 s while any project routes to chat,
+    else every 5 min; every project reads its result."""
+    from ttp import route, served
+    a, b = make(env), _second_project(env, "beta")
+    for p in (a, b):
+        _route_config(p)
+    listed, polls = _shared_watch(monkeypatch)
+    t0 = time.time()
+    for t in range(int(t0), int(t0) + 301, served.CHECK_S):
+        for p in ((a, b) if t % 2 else (b, a)):   # either daemon may ask first
+            if served.due(p.state, "chat", True, t):
+                served.tick(p.state, "placeholder", True, now=t)
+    assert len(polls) == 300 // served.EVERY_S + 1 == 11   # one per 30 s for both projects, not one each
+    for p in (a, b):
+        assert route.read_served(p.state)["chat"]["ids"] == sorted(listed)
+    # Nobody routes to chat: the busy marker lapses and the poll slows to every 5 min.
+    polls.clear()
+    t1 = int(t0) + 301 + served.LEASE_S
+    for t in range(t1, t1 + 901, served.CHECK_S):
+        for p in (a, b):
+            if served.due(p.state, "chat", False, t):
+                served.tick(p.state, "placeholder", False, now=t)
+    assert len(polls) == 3   # 5, 10 and 15 min after the last busy poll
+    assert served.read(served.link(a.state, "chat"))["every"] == served.IDLE_S
+    # Both intervals are account keys.
+    from ttp import project
+    assert {"providers.chat.served_every_s", "providers.chat.served_idle_s"} <= project.ACCOUNT_NESTED_KEYS
+    monkeypatch.setattr(project, "account_value", lambda k: {"providers.chat.served_every_s": 12}.get(k))
+    assert served.every_s(True) == 12 and served.every_s(False) == served.IDLE_S
+
+
+def test_a_model_the_endpoint_drops_is_replaced_by_the_ranked_stand_in_within_a_minute(env, monkeypatch):
+    """User's rule: if a model goes down, the next best one is ready within a minute."""
+    from ttp import modelrank, served
+    from ttp.daemon import Daemon
+    p = make(env)
+    d = Daemon(p.base)
+    _ranked(p, d, monkeypatch, [_RT_MODEL, "rank-a"])
+    listed, _ = _shared_watch(monkeypatch)
+    t0 = int(time.time())
+    _daemon_ticks(p.state, t0, t0)
+    assert modelrank.pick(p.db, d.cfg, p.state, _RT_MODEL, t0) is None   # up
+    removed = t0 + 7
+    listed.remove(_RT_MODEL)
+    swapped = None
+    for t in range(removed, removed + 120, served.CHECK_S):
+        _daemon_ticks(p.state, t, t)
+        if modelrank.pick(p.db, d.cfg, p.state, _RT_MODEL, t):
+            swapped = t
+            break
+    assert modelrank.pick(p.db, d.cfg, p.state, _RT_MODEL, swapped) == ("rank-a", "not listed")
+    assert swapped - removed <= 60   # measured: 25 s (the next 30 s poll, asked at the 5 s check)
+    gone = [json.loads(x) for x in (served.home() / served.EVENTS).read_text().splitlines()]
+    assert [(e["id"], e["event"]) for e in gone] == [(_RT_MODEL, "appeared"), ("rank-a", "appeared"), (_RT_MODEL, "gone")]
+    rec = served.read(served.link(p.state, "chat"))
+    assert rec["seen"][_RT_MODEL]["gone"] == swapped and rec["seen"]["rank-a"] == {"first_seen": t0, "last_seen": swapped}
+    # Listed again: a new stretch starts at its return.
+    listed.append(_RT_MODEL)
+    back = _daemon_ticks(p.state, swapped + 1, swapped + 60)[0][0]
+    assert served.read(served.link(p.state, "chat"))["seen"][_RT_MODEL] == {"first_seen": back, "last_seen": back}
+
+
+def test_another_daemon_takes_the_models_poll_once_the_lease_holder_dies(env, monkeypatch):
+    """User's rule: the shared poll survives a dead daemon: another one polls after the lease TTL."""
+    from ttp import served
+    a, b = make(env), _second_project(env, "beta")
+    _, polls = _shared_watch(monkeypatch)
+    t0 = int(time.time())
+    assert _daemon_ticks(a.state, t0, t0) == [(t0, "polled")]
+    # a's daemon dies; b's finds the poll due but the lease held until it lapses.
+    tries = _daemon_ticks(b.state, t0 + 1, t0 + served.LEASE_S + 30)
+    took = [t for t, what in tries if what == "polled"]
+    before = [what for t, what in tries if t < took[0]]
+    assert before[0] == "not due" and set(before[1:]) == {"held"}
+    assert served.LEASE_S <= took[0] - t0 < served.LEASE_S + served.CHECK_S
+    assert len(polls) == 1 + len(took) and all(y - x == served.EVERY_S for x, y in zip(took, took[1:]))
+    lease = json.loads((served.home() / f"{served.link(b.state, 'chat')}.lease").read_text())
+    assert lease["holder"] == str(b.state.resolve()) and lease["until"] == took[-1] + served.LEASE_S
+
+
+def test_the_shared_models_poll_writes_no_key_or_url(env, monkeypatch, mock_chat):
+    """User's rule: the key and the endpoint's URL are never written."""
+    from ttp import endpoint, route, served
+    p = make(env)
+    up = mock_chat()
+    up.models = [_RT_MODEL]
+    monkeypatch.setattr(endpoint, "credentials", lambda alias: endpoint.Credentials(_CB_KEY, up.url))
+    t0 = int(time.time())
+    assert served.tick(p.state, "placeholder", True, now=t0) == "polled"
+    up.models = None   # the next poll fails (404)
+    assert served.tick(p.state, "placeholder", True, now=t0 + served.EVERY_S) == "polled"
+    eid = served.endpoint_id(up.url)
+    rec = served.read(eid)
+    assert rec["ids"] == [_RT_MODEL] and rec["ok"] is False and rec["listed"] == t0
+    assert route.read_served(p.state)["chat"]["ok"] is False
+    host = up.url.split("//", 1)[1].split("/", 1)[0]
+    files = [f for f in [*served.home().rglob("*"), *p.state.rglob("*")] if f.is_file()]
+    assert {f.name for f in files} >= {f"{eid}.json", f"{eid}.lease", served.EVENTS, served.LINK, route.MODELS_FILE}
+    for f in files:
+        text = f.read_text(errors="replace")
+        assert _CB_KEY not in text and host not in text, f
+
+
+def test_a_stale_shared_models_list_reads_as_unknown_and_swaps_nothing(env, monkeypatch):
+    """User's rule: no swap rests on an old list: past 3 poll intervals nothing is known."""
+    from ttp import modelrank, route, served
+    from ttp.daemon import Daemon
+    p = make(env)
+    d = Daemon(p.base)
+    _ranked(p, d, monkeypatch, [_RT_MODEL, "rank-a"])
+    _shared_watch(monkeypatch, ids=["rank-a"])
+    t0 = int(time.time()) + 1   # newer than the project's own list: the shared one is read
+    _daemon_ticks(p.state, t0, t0)
+    assert route.read_served(p.state)["chat"]["ids"] == ["rank-a"]
+    stale = t0 + served.STALE_POLLS * served.EVERY_S
+    assert modelrank.STALE_S == stale - t0 == 90
+    assert modelrank.served(p.state, stale) == ["rank-a"]
+    assert modelrank.pick(p.db, d.cfg, p.state, _RT_MODEL, stale) == ("rank-a", "not listed")
+    assert modelrank.served(p.state, stale + 1) is None
+    assert modelrank.pick(p.db, d.cfg, p.state, _RT_MODEL, stale + 1) is None   # unknown: no swap
+    # A list polled at the idle interval stays known for 3 of its own intervals.
+    served.record(served.link(p.state, "chat"), True, "HTTP 200", ["rank-a"], served.IDLE_S, t0)
+    route.write_served(p.state, "chat", True, "HTTP 200", ["rank-a"], t0, every=served.IDLE_S)
+    assert modelrank.served(p.state, t0 + 3 * served.IDLE_S) == ["rank-a"]
+    assert modelrank.served(p.state, t0 + 3 * served.IDLE_S + 1) is None
 
 
 def test_a_gone_model_is_swapped_within_a_minute_and_a_smarter_new_one_is_tried_then_parked_and_rechecked_weekly(

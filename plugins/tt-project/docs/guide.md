@@ -1292,10 +1292,20 @@ Messages calls into `<base url>/chat/completions` calls and back, and ends with 
    tier's runs start on the core provider. A 404 for a model the endpoint does not serve (its wording
    names the model, or the endpoint's /models list leaves it out) is `model_missing` instead: no
    cool-down, but that tier's route holds, with one normal notice naming the provider, tier and model,
-   until `providers.chat.tiers.<tier>.model` changes or the daemon's model-free /models check (every
-   minute while a tier or run class routes to `chat`; `providers.chat.models_every_s`) lists the model
-   again. That check stores only the served ids and
-   its time in the project state folder; `ttp status` and `ttp doctor` show them and any hold.
+   until `providers.chat.tiers.<tier>.model` changes or the model-free /models check lists the model
+   again. That check runs once per machine and endpoint for every project on it
+   (`runtime/ttp/served.py`): every 30 seconds while any project there routes work to `chat` (a tier,
+   a route, a run class, babysitting or a ranked pin), else every 5 minutes (account-level
+   `providers.chat.served_every_s` and `providers.chat.served_idle_s`). The daemon that holds the poll
+   lease (renewed by each poll, free after 90 seconds) polls with its own saved key; if it stops,
+   another daemon takes over once the lease lapses. The result goes to
+   `~/.tt-project/served/<endpoint id>.json` (the id is a hash of the URL), with when each model id
+   was first and last listed, and each id that appears or goes away is a line in
+   `~/.tt-project/served/served-events.jsonl`. A list older than 3 poll intervals counts as unknown,
+   so nothing is swapped on it. Where those files cannot be written, each project checks on its own
+   (every minute while a tier or run class routes to `chat`; `providers.chat.models_every_s`). Only
+   the served ids, times and HTTP status are stored, never the key or URL; `ttp status` and
+   `ttp doctor` show them and any hold.
    To keep work on the endpoint instead, the daemon keeps a ranking of its model ids, smartest first,
    in `providers.chat.model_ranking`: account-wide (`ttp config --account providers.chat.model_ranking
    '["id-a", "id-b"]'`, in `~/.tt-project/settings.json`), so every project on the machine that uses
