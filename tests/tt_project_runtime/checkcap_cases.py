@@ -12196,7 +12196,7 @@ def test_local_push_checks_still_take_a_checks_slot_and_never_read_a_remote_host
     p = make(env)
     monkeypatch.setattr(remoteload, "reading", lambda h: pytest.fail("no remote read"))
     calls = []
-    monkeypatch.setattr(push, "check_slot", lambda head, say, priority="", proj=None: calls.append(priority) or "slot")
+    monkeypatch.setattr(push, "check_slot", lambda head, say, priority="", proj=None, repo=None: calls.append(priority) or "slot")
     assert push.run_slot(push.check_list(["pytest tests", {"run": "true", "host": "local"}]), "abc", print,
                          priority="branch-key", proj=p) == "slot"
     assert calls == ["branch-key"]
@@ -12219,6 +12219,86 @@ def test_ttp_checks_run_only_on_a_remote_host_take_no_local_checks_slot(env, mon
     slot = cli._checks_slot(p, tmp_path, out, "a" * 40, cmds=cmds, top=str(p.root))
     assert slot.f is None and slot.tests is None
     assert "checks run on checkhost: running now, outside this machine's checks slot" in out.getvalue()
+
+
+def test_a_project_whose_checks_run_on_a_remote_host_is_never_held_by_local_load(env, monkeypatch, tmp_path):
+    """A project whose checks all run on its checks host (delivery.checks_host) is never held by this machine's
+    load: neither its load guard (testslots.load_guard) nor its free cores (checkcap.free_cores) are read, with
+    or without a fixed checks.test_project_max, for `ttp checks` and push checks alike."""
+    import io
+    from ttp import checkcap, cli, push, testslots
+    p = make(env)
+    monkeypatch.setattr(testslots, "load_guard", lambda: pytest.fail("this host's load guard read"))
+    monkeypatch.setattr(checkcap, "free_cores", lambda: pytest.fail("this host's free cores read"))
+    monkeypatch.setattr(checkcap, "acquire", lambda *a, **k: pytest.fail("no local checks slot"))
+    _remote_load(monkeypatch, {"checkhost": [(3.0, 64)]})
+    for cap in ("", "2"):
+        monkeypatch.setenv("TTP_TEST_PROJECT_MAX", cap) if cap else monkeypatch.delenv("TTP_TEST_PROJECT_MAX", raising=False)
+        cmds = push.with_host(push.check_list(["pytest -n 16 tests"]), "checkhost")
+        slot = cli._checks_slot(p, tmp_path, io.StringIO(), "a" * 40, cmds=cmds, top=str(p.root))
+        assert slot is not None and slot.f is None
+        slot.close()
+        slot = push.run_slot(cmds, "abc", print, priority="branch-key", proj=p, repo=p.root)
+        assert slot.f is None
+        slot.close()
+
+
+def test_remote_checks_keep_the_project_lane_under_a_fixed_test_project_max(env, monkeypatch, tmp_path):
+    """Under a fixed checks.test_project_max, checks that run on a checks host still take one of the project's
+    checks lanes (no checks slot or test slots here): two full suites never share the checks host past the cap.
+    `ttp checks` waits for the lane; push checks wait at most checks.push_load_wait_s, then go ahead and say so."""
+    import io
+    from ttp import checkcap, cli, push, testslots
+    p = make(env)
+    monkeypatch.setattr(checkcap, "acquire", lambda *a, **k: pytest.fail("no local checks slot"))
+    _remote_load(monkeypatch, {"checkhost": [(3.0, 64)]})
+    monkeypatch.setenv("TTP_TEST_PROJECT_MAX", "1")
+    cmds = push.with_host(push.check_list(["pytest -n 16 tests"]), "checkhost")
+    out = io.StringIO()
+    first = cli._checks_slot(p, tmp_path, out, "a" * 40, cmds=cmds, top=str(p.root))
+    try:
+        assert first is not None and first.f is None and first.tests is not None
+        assert "in one of the project's checks lanes (checks.test_project_max)" in out.getvalue()
+        assert len(testslots.project_held(p.name)) == 1
+        # A second remote run waits for that lane: its foreground wait ends with no slot.
+        monkeypatch.setattr(checkcap, "FOREGROUND_WAIT_S", 0.3)
+        assert cli._checks_slot(p, tmp_path / "b", io.StringIO(), "b" * 40, cmds=cmds, top=str(p.root)) is None
+        # A push's remote checks wait at most checks.push_load_wait_s for it, then go ahead without one.
+        monkeypatch.setenv("TTP_CHECKS_PUSH_LOAD_WAIT_S", "0")
+        told = []
+        slot = push.run_slot(cmds, "abc", told.append, priority="branch-key", proj=p, repo=p.root)
+        assert slot.tests is None and any("stayed full" in t and "going ahead" in t for t in told), told
+    finally:
+        first.close()
+    assert testslots.project_held(p.name) == []
+    told = []
+    slot = push.run_slot(cmds, "abc", told.append, priority="branch-key", proj=p, repo=p.root)
+    assert slot.tests is not None and len(testslots.project_held(p.name)) == 1 and told == []
+    slot.close()
+    assert testslots.project_held(p.name) == []
+    # With no fixed cap they take no lane, as before.
+    monkeypatch.delenv("TTP_TEST_PROJECT_MAX")
+    slot = push.run_slot(cmds, "abc", told.append, proj=p, repo=p.root)
+    assert slot.tests is None
+
+
+def test_the_push_priority_slot_counts_against_a_fixed_test_project_max(env, monkeypatch):
+    """The push priority slot goes past the host-wide cap, never past the project's fixed
+    checks.test_project_max: its run holds one of the project's lanes, and waits for one while they are full."""
+    from ttp import push, testslots
+    p = make(env)
+    monkeypatch.setenv("TTP_TEST_PROJECT_MAX", "1")
+    slot = push.check_slot("abc", lambda s: None, priority="branch-key", proj=p, repo=p.root)
+    try:
+        assert len(testslots.project_held(p.name)) == 1
+        monkeypatch.setenv("TTP_CHECKS_PUSH_LOAD_WAIT_S", "0")
+        told = []
+        other = push.check_slot("abd", told.append, priority="other-key", proj=p, repo=p.root)
+        other.close()
+        assert any("stayed full" in t for t in told), told
+    finally:
+        slot.close()
+    assert testslots.project_held(p.name) == []
 
 
 def test_remoteload_parses_two_proc_stat_samples():

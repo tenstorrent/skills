@@ -5719,13 +5719,36 @@ def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: boo
         remoteload.wait(hosts, tell, testslots.push_load_wait_s(cfg), note=note, move=move)   # never starts on an overloaded host
         if moved:
             return moved[0]
+        slot = checkcap.Slot()
+        if p and checklane.fixed_cap(cfg):
+            # A fixed checks.test_project_max still bounds them: they keep the project's checks lane (counted
+            # against its cap of running checks), so its suites never pile up on one checks host.
+            tell(f"checks run on {', '.join(hosts)}: outside this machine's checks slot and test slots, "
+                 "in one of the project's checks lanes (checks.test_project_max)")
+            try:
+                lane = testslots.remote_lane(
+                    p.name, checklane.project_cap(cfg), tell,
+                    checkcap.FOREGROUND_WAIT_S if foreground else None,
+                    lambda: _checks_cancelled(run_dir) or "", f"run {run_dir.name}", checkcap.task_rank(p)[0],
+                    arrived, testslots.repo_key(top) if top else "", checklane.scope_text(cmds)[:300] or "full checks",
+                    checklane.cap_note(cfg))
+            except checkcap.Cancelled as e:
+                said = f"not run: stopped waiting for this project's other full checks: {e}"
+                out.write(f"ttp checks: {said}\n")
+                out.flush()
+                if _read_checks_pid(run_dir).get("pid") == os.getpid():
+                    _checks_drop(run_dir, str(e) or "cancelled", rc=False)
+                die(f"ttp checks: {said}", 1)
+            if lane is None:
+                return None
+            slot.tests = lane   # freed with the slot
         # Each host's check slots are claimed as a spill pick claims them, so runs here never overshoot it.
         if (claims := checkspill.admit_pinned(p, hosts, tell, what=checklane.scope_text(cmds)[:300],
                                               bound=bound)) is None:
+            slot.close()   # the lane, if one was taken
             return None
         tell(f"checks run on {', '.join(hosts)}: running now, outside this machine's checks slot and test slots"
              + (f", holding {len(claims)} check slot(s) there" if claims else ""))
-        slot = checkcap.Slot()
         slot.pinned = claims
         return slot
     prio, owns = checkcap.task_rank(p or checkcap.adopted_project())

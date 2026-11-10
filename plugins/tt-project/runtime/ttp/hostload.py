@@ -22,16 +22,24 @@ fills keeps every run here: the text says to lower checks.host_max too. It close
 once the condition no longer holds. A cap of 0 (checks.host_max 0: no cap) takes no slots, so the runs
 cannot be counted and it never fires. Read-only: it never stops, moves or slows a run.
 
+A project whose checks run on another host (delivery.checks_host, or a push check's own "host") is
+judged there too: snapshot reads each such checks host's runnable demand and cores (remoteload.reading:
+one BatchMode ssh read, cached about remoteload.CACHE_S; an unreadable host is left out and never
+alerts), and a checks host whose demand stays above checks.load_guard times its cores for HOLD_S raises
+the same observation, naming that host. Runs that go there use none of this host's CPU: they hold no
+checks slot here, so "this host"'s run count leaves them out, and this host's load never holds them.
+
 lines() is the same reading for `ttp checks --slot-status` and the daily review: the check runs per
-host (this one and each spill host), this host's load and CPU demand, and which limit holds: the CPU
-limit (checks.load_guard) here, the I/O pressure limit (checks.io_full_max) in diskgate's line."""
+host (this one and each spill host), this host's load and CPU demand, each checks host's CPU demand,
+and which limit holds: the CPU limit (checks.load_guard) here, the I/O pressure limit
+(checks.io_full_max) in diskgate's line."""
 from __future__ import annotations
 
 import math
 import os
 import time
 
-from . import checkcap, checkspill, hostcpu, testslots
+from . import checkcap, checkspill, hostcpu, remoteload, remotecheck, testslots
 
 KEY = "checks_host_overloaded"
 SOURCE = "daemon:checks-host-overloaded"
@@ -54,11 +62,35 @@ def near(running: int, cap: int) -> bool:
     return cap > 0 and running >= math.ceil(NEAR * cap)
 
 
+def check_hosts(cfg: dict | None) -> list[str]:
+    """The other hosts the project's checks run on: delivery.checks_host and the "host" of each
+    delivery.push_checks entry that names one ("local" and invalid names left out)."""
+    d = (cfg or {}).get("delivery") if isinstance((cfg or {}).get("delivery"), dict) else {}
+    checks = d.get("push_checks") if isinstance(d.get("push_checks"), list) else []
+    hosts: list[str] = []
+    for h in [d.get("checks_host"), *(c.get("host") for c in checks if isinstance(c, dict))]:
+        h = "" if h is None else str(h).strip()
+        if h and h != remotecheck.LOCAL and not remotecheck.host_problem(h) and h not in hosts:
+            hosts.append(h)
+    return hosts
+
+
+def remote(cfg: dict | None, factor: float | None = None) -> dict:
+    """{checks host: {"demand", "cores", "threshold"}} of each readable checks host (check_hosts,
+    remoteload.reading); `factor`: checks.load_guard (1 when off)."""
+    factor = factor if factor is not None else (testslots.load_guard_factor() or 1.0)
+    out = {}
+    for h in check_hosts(cfg):
+        if (got := remoteload.reading(h)) is not None:
+            out[h] = {"demand": got[0], "cores": got[1], "threshold": factor * got[1]}
+    return out
+
+
 def snapshot(cfg: dict | None = None) -> dict:
     """This host's reading: {"load": (1, 5, 15) or None, "demand" (checkcap.cpu_demand, None when
     unreadable), "cores", "factor" (checks.load_guard, 1 when off), "threshold", "cap", "running" (local
     check runs), "spilled" ({spill host: runs from here}), "spill_hosts" (the project's
-    delivery.checks_spill_hosts)}."""
+    delivery.checks_spill_hosts), "remote" (remote(): each readable checks host's reading)}."""
     cap, c = checkcap.limit(), checkcap.cores()
     factor = testslots.load_guard_factor() or 1.0
     try:
@@ -69,7 +101,8 @@ def snapshot(cfg: dict | None = None) -> dict:
     for r in checkspill.holders():
         spilled[r["host"]] = spilled.get(r["host"], 0) + 1
     return {"load": loads(), "demand": demand(), "cores": c, "factor": factor, "threshold": factor * c, "cap": cap,
-            "running": running, "spilled": spilled, "spill_hosts": checkspill.hosts(cfg), "mem_free": hostcpu.mem_free()}
+            "running": running, "spilled": spilled, "spill_hosts": checkspill.hosts(cfg), "mem_free": hostcpu.mem_free(),
+            "remote": remote(cfg, factor)}
 
 
 def demand() -> float | None:
@@ -79,11 +112,21 @@ def demand() -> float | None:
 
 
 def overloaded(s: dict) -> bool:
-    """The CPU is over the threshold by its runnable demand, or memory is short, while local runs sit near
-    the cap and none spill. A reading without "demand" (an older caller) judges by the 5-minute load."""
+    """This host's CPU is over the threshold by its runnable demand, or memory is short, while local runs
+    sit near the cap and none spill; or a checks host is over its threshold (remote_over). A reading
+    without "demand" (an older caller) judges by the 5-minute load."""
+    return local_over(s) or bool(remote_over(s))
+
+
+def local_over(s: dict) -> bool:
     d = s["demand"] if "demand" in s else (s["load"][1] if s["load"] else None)
     busy = (d is not None and d > s["threshold"]) or bool(_mem(s))
     return busy and near(s["running"], s["cap"]) and not s["spilled"]
+
+
+def remote_over(s: dict) -> list[str]:
+    """The checks hosts in reading `s` whose runnable demand is above their threshold."""
+    return [h for h, r in (s.get("remote") or {}).items() if r["demand"] > r["threshold"]]
 
 
 def _mem(s: dict) -> str:
@@ -101,6 +144,8 @@ def _load_text(s: dict) -> str:
 
 def text(s: dict, held_s: float) -> str:
     """The observation for an overloaded reading `s` that has held `held_s` seconds."""
+    if not local_over(s):
+        return remote_text(s, held_s)
     over = (f"its {s['cores']} cores" if s["factor"] == 1.0
             else f"{s['factor']:g} x its {s['cores']} cores (checks.load_guard)")
     if s["spill_hosts"]:
@@ -120,6 +165,21 @@ def text(s: dict, held_s: float) -> str:
             f"the cores hold. Nothing was stopped.")
 
 
+def remote_text(s: dict, held_s: float) -> str:
+    """The observation for checks hosts over their threshold (remote_over) for `held_s` seconds."""
+    parts = []
+    for h in remote_over(s):
+        r = s["remote"][h]
+        over = (f"its {r['cores']} cores" if s["factor"] == 1.0
+                else f"{s['factor']:g} x its {r['cores']} cores (checks.load_guard)")
+        parts.append(f"the checks host {h}'s runnable CPU demand {r['demand']:.1f} cores (busy and waiting to run) "
+                     f"has stayed above {over}")
+    return (f"checks host overloaded: {'; '.join(parts)} for {held_s / 60:.0f} min. New check runs there wait "
+            f"for it to drop (at most checks.push_load_wait_s for push checks), and running suites slow. To ease "
+            f"it: lower checks.test_project_max (a fixed cap also bounds the project's suites running there), or "
+            f"point delivery.checks_host at a host with free cores. Nothing was stopped.")
+
+
 def lines(cfg: dict | None = None, s: dict | None = None) -> list[str]:
     """The check runs per host and this host's load, for `ttp checks --slot-status` and the daily review."""
     s = s or snapshot(cfg)
@@ -132,6 +192,12 @@ def lines(cfg: dict | None = None, s: dict | None = None) -> list[str]:
            f"{_load_text(s)} (counts tasks waiting on I/O too: their limit is checks.io_full_max){flag}"]
     for h in list(dict.fromkeys([*s["spill_hosts"], *s["spilled"]])):
         out.append(f"{h}: {s['spilled'].get(h, 0)} spilled check runs from this host")
+    for h, r in (s.get("remote") or {}).items():
+        busy = r["demand"] > r["threshold"] and testslots.load_guard_factor()
+        out.append(f"{h} (checks host): CPU demand {r['demand']:.1f} cores (busy and waiting to run) on {r['cores']} "
+                   f"cores, CPU limit {r['threshold']:g} (checks.load_guard)"
+                   + (": new check runs there wait" if busy else "")
+                   + "; its runs hold no checks slot here, so this host's count leaves them out")
     return out
 
 

@@ -132,3 +132,42 @@ def test_slot_status_and_the_daily_review_show_check_runs_per_host_and_the_load(
         assert "Check runs per host now" in spec and "- this host: 1 check runs (cap 4)" in spec, spec[-800:]
     finally:
         held.close()
+
+
+def test_a_remote_checks_host_is_read_shown_and_alerted_on_never_this_hosts_load(env, monkeypatch):
+    """A project whose checks run on another host (delivery.checks_host, or a push check's own "host") is
+    judged there: the reading (remoteload.reading, faked here: no ssh) goes in the slot status and the daily
+    review, and that host staying over checks.load_guard x its cores for HOLD_S raises the overload
+    observation naming it, while this host is idle. An unreadable checks host never alerts."""
+    from ttp import hostload, remoteload
+    _overloaded_host(monkeypatch, load=(1.0, 1.0, 1.0), demand=1.0)
+    monkeypatch.setenv("TTP_CHECKS_LOAD_GUARD", "1")
+    reads = {"checkhost": (90.0, 64), "pushhost": (2.0, 16)}
+    monkeypatch.setattr(remoteload, "reading", lambda h: reads.get(h))
+    cfg = {"delivery": {"checks_host": "checkhost",
+                        "push_checks": [{"run": "pytest tests", "host": "pushhost"}, {"run": "true", "host": "local"},
+                                        "git diff --check"]}}
+    assert hostload.check_hosts(cfg) == ["checkhost", "pushhost"]
+    s = hostload.snapshot(cfg)
+    assert s["remote"]["checkhost"] == {"demand": 90.0, "cores": 64, "threshold": 64.0}, s["remote"]
+    assert hostload.remote_over(s) == ["checkhost"] and not hostload.local_over(s)
+    out = hostload.lines(cfg, s)
+    assert out[0].startswith("this host: 0 check runs"), out
+    assert any(line.startswith("checkhost (checks host): CPU demand 90.0 cores (busy and waiting to run) on 64 cores, "
+                               "CPU limit 64 (checks.load_guard): new check runs there wait") for line in out), out
+    assert any(line.startswith("pushhost (checks host): CPU demand 2.0 cores") and "new check runs there wait" not in line
+               for line in out), out
+    w = hostload.Watch()
+    w.step(s, 0.0)
+    assert w.step(s, 100.0) is None
+    kind, obs = w.step(s, hostload.HOLD_S + 1)
+    assert kind == "raise" and obs["key"] == hostload.KEY
+    assert "the checks host checkhost's runnable CPU demand 90.0 cores" in obs["text"], obs["text"]
+    assert "pushhost" not in obs["text"] and "this host's runnable" not in obs["text"]
+    reads["checkhost"] = None   # unreadable: left out, and the episode ends
+    s = hostload.snapshot(cfg)
+    assert "checkhost" not in s["remote"] and not hostload.overloaded(s)
+    assert w.step(s, hostload.HOLD_S + 60) == ("clear", None)
+    # With no checks host set, nothing remote is read.
+    monkeypatch.setattr(remoteload, "reading", lambda h: pytest.fail("no remote read"))
+    assert hostload.snapshot({})["remote"] == {}

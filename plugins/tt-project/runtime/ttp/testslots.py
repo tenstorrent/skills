@@ -1442,6 +1442,31 @@ def _numbered_held(base: str, running: bool = False) -> int:
                and not (running and _pending(x)))
 
 
+def remote_lane(project_name: str | None, cap: int, tell: Callable[[str], None] | None = None,
+                wait_s: float | None = None, stop: Callable[[], str] | None = None, who: str = "",
+                priority: int | None = None, since: float | None = None, repo: str = "",
+                what: str = "full checks", cap_note: str = "") -> Grant | None:
+    """The project's checks lane for checks that all run on other hosts (push.remote_host), under a fixed
+    checks.test_project_max (checklane.fixed_cap; `cap`: its checklane.project_cap). Such checks take no
+    checks slot or test slots of this machine, whose CPU they never use, but still count against the
+    project's cap of running checks, so the cap also bounds how many of its suites one checks host runs at
+    once. The Grant (Grant() with no project), or None once `wait_s` passed; a reason from `stop()` ends
+    the wait with checkcap.Cancelled, as suite_hold's does."""
+    t0 = time.time()
+    if (g := suite_hold(project_name, tell, wait_s, stop=stop, who=who, priority=priority, since=since,
+                        repo=repo, what=what, cap=cap, cap_note=cap_note, pending=True)) is None:
+        return None
+    while not claim_running(g, project_name, lambda n: n + 1, cap):
+        if stop and (why := stop()):
+            g.close()
+            raise checkcap.Cancelled(why)
+        if wait_s is not None and time.time() - t0 >= wait_s:
+            g.close()
+            return None
+        time.sleep(poll_s(POLL_S))
+    return g
+
+
 def claim_running(grant, project_name: str | None, slots: Callable[[int], int], cap: int = 0,
                   mark: bool = True) -> bool:
     """Mark the lanes `grant` (suite_hold's, taken `pending`) holds as running (slots_granted) once its run

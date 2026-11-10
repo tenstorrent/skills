@@ -969,7 +969,8 @@ def env_wait(p: Project | None, repo: Path, base: str, head: str, err: Exception
     return BUSY
 
 
-def check_slot(head: str, say: Callable[[str], None], who: str = "", priority: str = "", proj: Project | None = None):
+def check_slot(head: str, say: Callable[[str], None], who: str = "", priority: str = "", proj: Project | None = None,
+               repo=None):
     """A host-wide checks slot (checkcap) held while the push checks run, so `ttp push --own` counts
     toward the same cap as `ttp checks`. Checks gating a push to the push branch (`ttp push` and the
     push queue) pass `priority` (priority_key): they hold the push lock, so they take that branch's
@@ -993,26 +994,65 @@ def check_slot(head: str, say: Callable[[str], None], who: str = "", priority: s
                                 priority=prio, state=state, owns=owns,
                                 startable=None if os.environ.get(testslots.HELD_ENV)
                                 else lambda: not testslots.load_held(prio) and testslots.pool_room(cfg, name))
-    # A priority slot another push holds past checkcap.priority_wait_s(): an ordinary turn instead, on the
-    # pool's test slots (its reserved lane may be that holder's).
-    slot = checkcap.acquire_priority(priority, who, f"push checks on {head[:12]}", say, name, state,
-                                     fallback=turn) if priority else turn()
+    # Under a fixed checks.test_project_max its run counts against the project's cap first (project_lane),
+    # its priority slot included: the priority slot goes past the host-wide cap, never past the project's.
+    lane = project_lane(proj, say, repo, who)
+    try:
+        # A priority slot another push holds past checkcap.priority_wait_s(): an ordinary turn instead, on the
+        # pool's test slots (its reserved lane may be that holder's).
+        slot = checkcap.acquire_priority(priority, who, f"push checks on {head[:12]}", say, name, state,
+                                         fallback=turn) if priority else turn()
+    except BaseException:
+        lane is not None and lane.close()
+        raise
     if getattr(slot, "fell_back", False):
         priority = ""
     # The run's share of the host's test-worker slots, held and freed with the checks slot (testslots);
     # push-priority checks take the branch's reserved test slot when the pool has none free.
     slot.tests = testslots.acquire(who, say, cfg=proj.config() if proj else {}, project_name=name or "",
                                    push_key=priority)
+    _with_lane(slot, lane)
+    return slot
+
+
+def project_lane(proj: Project | None, say: Callable[[str], None], repo=None, who: str = ""):
+    """One of project `proj`'s checks lanes in repository `repo` (testslots.remote_lane), only under a fixed
+    checks.test_project_max (checklane.fixed_cap): push checks then count against the project's cap of
+    running checks, on this machine or a checks host, so its suites never pile up past it. They wait for
+    one at most checks.push_load_wait_s (they hold the push lock), then go ahead without; None with no cap
+    set, no project, or nested in a check that holds one already (checkcap.HELD_ENV)."""
+    cfg = proj.config() if proj else {}
+    if not proj or os.environ.get(checkcap.HELD_ENV) or not (fixed := checklane.fixed_cap(cfg)):
+        return None
+    lane = testslots.remote_lane(proj.name, checklane.project_cap(cfg), say, testslots.push_load_wait_s(cfg),
+                                 who=who or checkcap.label(proj.name, "ttp push"), priority=checkcap.task_rank(proj)[0],
+                                 repo=testslots.repo_key(repo) if repo else "", what="push checks",
+                                 cap_note=checklane.cap_note(cfg))
+    if lane is None:
+        say(f"the project's {fixed[0]} checks lanes (checks.test_project_max) stayed full past "
+            "checks.push_load_wait_s: going ahead without one")
+    return lane
+
+
+def _with_lane(slot: checkcap.Slot, lane) -> checkcap.Slot:
+    """`slot` holding `lane` (project_lane) too, freed with its test slots."""
+    if lane is not None:
+        if slot.tests is None:
+            slot.tests = lane
+        else:
+            slot.tests.files += lane.files
     return slot
 
 
 def run_slot(run: list, head: str, say: Callable[[str], None], priority: str = "",
-             proj: Project | None = None) -> checkcap.Slot:
+             proj: Project | None = None, repo=None) -> checkcap.Slot:
     """The slot a push's check run holds: check_slot only when one of `run` runs here and is no light
     check (checklane.is_light). Checks run on another host (remote_host) use none of this machine's
     CPU: they take no host-wide checks slot or test slots here and never wait for this machine's load
     guard; they wait instead while their host's demand is near its cores (remoteload.wait), never
-    starting there while it is."""
+    starting there while it is. Under a fixed checks.test_project_max they still take one of the
+    project's checks lanes in repository `repo` (project_lane), so a checks host never runs more of the
+    project's suites at once than the cap allows."""
     if proj is None and (base := os.environ.get("TTP_PROJECT")):
         proj = Project(base)
     cfg = proj.config() if proj else {}
@@ -1038,8 +1078,11 @@ def run_slot(run: list, head: str, say: Callable[[str], None], priority: str = "
                 "starting anyway")
             claims = []
     pats = checklane.light_patterns(cfg)
-    slot = (check_slot(head, say, priority=priority, proj=proj)
-            if any(not remote_host(c) and not checklane.is_light(str(c), pats) for c in run) else checkcap.Slot())
+    if any(not remote_host(c) and not checklane.is_light(str(c), pats) for c in run):
+        slot = check_slot(head, say, priority=priority, proj=proj, repo=repo)
+    else:
+        # Remote-only checks still take one of the project's lanes under a fixed checks.test_project_max.
+        slot = _with_lane(checkcap.Slot(), project_lane(proj, say, repo) if hosts else None)
     if moved:
         slot.spill, moved[0].spill = moved[0].spill, None
     if hasattr(slot, "pinned"):
@@ -4148,7 +4191,7 @@ def publish(repo: Path, remote: str, branch: str, checks: list[str],
         try:
             # Spill first (delivery.checks_spill_first): a spill host before the own-branch lane here.
             slot, todo = spill_slot(todo, head, say, p)
-            slot = slot or run_slot(todo, head, say, priority=own_lane_key(repo, remote, cfg))
+            slot = slot or run_slot(todo, head, say, priority=own_lane_key(repo, remote, cfg), proj=p, repo=repo)
         except checkcap.Unavailable as e:
             say(f"{e}; not pushing")
             return CHECKS_FAILED
@@ -4160,11 +4203,11 @@ def publish(repo: Path, remote: str, branch: str, checks: list[str],
             excused = False
             for cmd in todo:
                 cmd, rc = _run_or_here(cmd, repo, env, say, seen := {},
-                                       lambda: check_slot(head, say, priority=own_lane_key(repo, remote, cfg)))
+                                       lambda: check_slot(head, say, priority=own_lane_key(repo, remote, cfg), repo=repo))
                 if rc != 0:
                     if rc == CHECKS_FAILED:
                         rc = _gate_here(cmd, repo, env, say, head, base or "", seen, p,
-                                        lambda: check_slot(head, say, priority=own_lane_key(repo, remote, cfg)))
+                                        lambda: check_slot(head, say, priority=own_lane_key(repo, remote, cfg), repo=repo))
                     if rc == 0:
                         excused = True   # its reruns are no check time
                         continue
@@ -4484,7 +4527,7 @@ def _rounds(repo: Path, remote: str, branch: str, checks: list[str], rounds: int
         try:
             # Spill first (delivery.checks_spill_first): a spill host before the push priority slot here.
             slot, run = spill_slot(run, head, say)
-            slot = slot or run_slot(run, head, say, priority=priority_key(repo, remote, branch))
+            slot = slot or run_slot(run, head, say, priority=priority_key(repo, remote, branch), repo=repo)
         except checkcap.Unavailable as e:
             say(f"{e}; not pushing")
             return CHECKS_FAILED
@@ -4497,11 +4540,11 @@ def _rounds(repo: Path, remote: str, branch: str, checks: list[str], rounds: int
             excused = set()
             for cmd in run:
                 cmd, rc = _run_or_here(cmd, repo, env, say, seen := {},
-                                       lambda: check_slot(head, say, priority=priority_key(repo, remote, branch)))
+                                       lambda: check_slot(head, say, priority=priority_key(repo, remote, branch), repo=repo))
                 if rc != 0:
                     if rc == CHECKS_FAILED:
                         rc = _gate_here(cmd, repo, env, say, head, tip, seen, None,
-                                        lambda: check_slot(head, say, priority=priority_key(repo, remote, branch)))
+                                        lambda: check_slot(head, say, priority=priority_key(repo, remote, branch), repo=repo))
                     if rc == 0:
                         excused.add(str(cmd))
                         continue

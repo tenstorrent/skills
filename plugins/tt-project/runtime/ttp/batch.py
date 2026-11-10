@@ -2357,7 +2357,8 @@ class Batch:
         self.steps.between()
         slot = push.check_slot(at, say, checkcap.label(self.p.name, f"push batch {self.id}"),
                                priority=push.priority_key(self.repo, self.remote, self.branch)
-                               + (" express" if self.express else ""), proj=self.p)   # its own slot beside a batch's
+                               + (" express" if self.express else ""), proj=self.p,   # its own slot beside a batch's
+                               repo=self.repo)
         self.steps.go("checks")
         return slot
 
