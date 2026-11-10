@@ -70,6 +70,27 @@ WORKER_NICE = 10
 FD_LOST_EXIT = 97      # a worker's own exit when a test closed or replaced one of its pipe fds
 _SHARDED = "test_tt_project_"
 STACK_DUMP_S = 480.0   # a tt-project test running this long dumps its stacks (faulthandler; kills nothing)
+# A suite run inside a tt-project worker (`ttp checks`, a worker's own pytest) inherits the run's
+# variables: its task, run folder, project, device and hand-off guards, and the agent CLI's session.
+# Tests set what they need, so the session starts without them; the test-slot, port, check-output
+# and leak-pattern variables the checks harness passes the suite stay.
+_WORKER_ENV_KEEP = ("TTP_TEST_", "TTP_CHECKS_", "TTP_CHECK_OUTPUT_DIR", "TTP_PORT_", "TTP_BUILD_SLOTS_HELD",
+                    "TTP_LEAK_PATTERNS_FILE", "TTP_TX_GUARD", "TTP_ALLOW_VOLATILE_BASE", "TTP_DEVICE_NODES")
+_WORKER_ENV_CLEAR = ("TTP_", "CLAUDECODE", "CLAUDE_CODE_", "CLAUDE_ENV_FILE", "CLAUDE_PID", "CLAUDE_EFFORT",
+                     "CODEX_THREAD_ID", "CODEX_SANDBOX", "CODEX_CI", "CODEX_MANAGED_BY")
+
+
+def worker_env_cleared(env) -> dict:
+    """`env` without the worker run's variables (above)."""
+    return {k: v for k, v in env.items() if not k.startswith(_WORKER_ENV_CLEAR) or k.startswith(_WORKER_ENV_KEEP)}
+
+
+def _clear_worker_env() -> None:
+    for var in set(os.environ) - set(worker_env_cleared(os.environ)):
+        os.environ.pop(var, None)
+
+
+_clear_worker_env()
 # tt-project's db.tx() refuses a git network command (ls-remote, fetch, push) started inside a write
 # transaction while this is set: every test, and every process it starts, runs under that guard.
 os.environ.setdefault("TTP_TX_GUARD", "1")
