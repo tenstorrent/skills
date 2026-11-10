@@ -2052,7 +2052,11 @@ the pick order, so it takes the first starts. A resumed resource ramps only its 
   release (logged, with a `harness` setter record; `ttp config <key> ''` reverts one, and the charter
   never fills it again): the Resources machines into `machines.allowed` when the config names none,
   the first existing charter `branch <name>` into `delivery.base_ref` when neither it nor an existing
-  `delivery.push_branch` is set, and the charter's other branches into `worktree.shared_branches`.
+  `delivery.push_branch` is set, and the charter's other branches into `worktree.shared_branches`
+  (only names with a `/` or that exist here or on origin: a prose word after "branch", as in "the
+  branch is ready", is none; a list the harness wrote before this check loses such words once, and a
+  list a user or coordinator set is never touched). The charter's `Forbidden data` patterns move
+  into `memory.forbidden_patterns` the same way, before their first read, so none lapses.
   Nothing moves that the old reader did not use; `delivery.push_branch` is never written.
   Other kinds run in the project root unless `worktree.kinds` lists them (say `["work"]`); they
   must not move its HEAD. A run that leaves the root on another branch or with new uncommitted

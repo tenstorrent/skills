@@ -3370,6 +3370,48 @@ def test_charter_settings_move_into_config_once_and_never_widen_access(env):
     assert ml.resource_machines(q) == ["box-c"]
 
 
+def test_charter_forbidden_data_moves_into_config_once_and_charter_edits_change_nothing(env):
+    """forbidden.declared reads memory.forbidden_patterns only: charterset moves the charter's
+    "Forbidden data" patterns there once, with the labels the old reader gave them, before the first
+    read (no pattern lapses), and rewording or deleting that section afterwards changes none of them."""
+    from ttp import charterset, configwho, forbidden
+    p = make(env)
+    section = "\n## Forbidden data\n- board serial: `BRD-\\d{6}`\n- `(?i)secret-[a-z]+`\n"
+    p.charter_path.write_text(p.charter_path.read_text() + section)
+    p.set_config("memory.forbidden_patterns", ["kept-\\d+"])
+    old = [("memory.forbidden_patterns[0]", "kept-\\d+"), ("board serial", "BRD-\\d{6}"),
+           ("charter Forbidden data item 2", "(?i)secret-[a-z]+")]
+    assert forbidden.declared(p) == old, "the old parser's patterns and labels, after the config's own"
+    assert configwho.role(configwho.get(p.db, "memory.forbidden_patterns")) == "harness"
+    cfg = p.raw_config()
+    for edit in (lambda t: t.replace("BRD-", "XYZ-"), lambda t: t.replace(section, ""),
+                 lambda t: t + "\n## Forbidden data\n- more: `new-\\d`\n"):
+        p.charter_path.write_text(edit(p.charter_path.read_text()))
+        assert charterset.migrate(p) == {} and forbidden.declared(p) == old and p.raw_config() == cfg
+    assert forbidden.matches(p, "id BRD-123456") == ["board serial"]
+    p.unset_config("memory.forbidden_patterns")   # reverting it holds: the charter never fills it again
+    assert forbidden.declared(p) == [] and charterset.migrate(p) == {}
+
+
+def test_charter_branch_prose_words_are_no_shared_branches(env):
+    """"branch <word>" in charter prose ("the branch is ready", "branch tip") moves no shared branch:
+    only a name with a '/' or one that exists here or on origin. A list the harness wrote before that
+    check loses its prose words once; a list a user or coordinator set is never touched."""
+    from ttp import charterset, configwho
+    p = make(env)
+    p.charter_path.write_text(p.charter_path.read_text().replace(
+        "## Resources\n", "## Resources\nThe branch is ready; keep the branch tip green, with branch that.\n", 1))
+    assert charterset.migrate(p) == {}
+    assert not (p.raw_config().get("worktree") or {}).get("shared_branches")
+    harness = {"by": "harness", "via": "charter settings moved to config"}
+    for who, want in ((harness, ["team/work"]), (configwho.by("user", via="cli"), ["team/work", "is", "tip"])):
+        p.set_config("worktree.shared_branches", ["team/work", "is", "tip"], by=who)
+        p.db.set_kv(charterset.DONE_KEY, {i: 1 for i in charterset.ITEMS if i != "branch_words"})
+        charterset.migrate(p)
+        assert p.raw_config()["worktree"]["shared_branches"] == want, who
+        assert charterset.migrate(p) == {}, "once only"
+
+
 def test_project_machines_and_idle_capacity_skip_retired_machines(env):
     """A machine whose list entry is decommissioned or says "Do not use", or that the charter's Resources
     calls retired, is not the project's: no idle-capacity candidate, even if an older paragraph names it."""

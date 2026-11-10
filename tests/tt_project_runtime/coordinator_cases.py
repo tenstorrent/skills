@@ -17914,7 +17914,11 @@ def test_forbidden_data_patterns_refuse_memory_and_charter_writes_and_never_reac
                        turn=1) == []
     with p.charter_path.open("a") as f:
         f.write("\n## Forbidden data\n- amounts: `\\$\\s?\\d[\\d,]*`\n- account numbers: `\\b\\d{8,}\\b`\n")
-    p.set_config("memory.forbidden_patterns", [{"name": "client names", "regex": "(?i)\\bacme\\b"}])
+    from ttp import forbidden
+    assert forbidden.declared(p) == [], "a hand edit of the charter's prose sets no pattern: the config does"
+    p.set_config("memory.forbidden_patterns", [{"name": "amounts", "regex": "\\$\\s?\\d[\\d,]*"},
+                                               {"name": "account numbers", "regex": "\\b\\d{8,}\\b"},
+                                               {"name": "client names", "regex": "(?i)\\bacme\\b"}])
     (p.base / "state").mkdir(exist_ok=True)
     (p.base / "state" / "forbidden.txt").write_text("# kept out of git\n(?i)widgetco\n")
     p.set_config("memory.forbidden_patterns_file", "state/forbidden.txt")
@@ -17950,6 +17954,8 @@ def test_forbidden_data_patterns_refuse_memory_and_charter_writes_and_never_reac
     assert "memory (fact): totals" in git_log() and "card numbers" in p.charter_path.read_text()
     probs = coord.apply(p, [{"type": "memory_add", "text": "Card 1111 2222 3333 4444 on file."}], turn=5)
     assert probs and "'card numbers'" in probs[0] and "4444" not in probs[0]
+    from ttp import configwho
+    assert configwho.role(configwho.get(p.db, "memory.forbidden_patterns")) == "coordinator"
 
     # Fail closed: an invalid regex or an unreadable pattern file refuses the write, never lets it through.
     p.set_config("memory.forbidden_patterns", ["(unclosed"])

@@ -153,7 +153,7 @@ The table lists fields; the section named has their rules.
 - A restriction your records show repeatedly blocking or slowing work toward a goal, preventing no harm (blocked runs, refusals or asks citing it; no incident it stopped): one ask (blocking `restriction`, classify `restriction_change`) with that evidence, recommending to drop or loosen it, never silent re-applying; again only on new evidence.
 - Confirm changes to goals, restrictions, caps or notifications in one short `reply`.
 <!-- ttp:if forbidden_data -->
-- Memory and charter are committed to git. When the charter keeps the project's data out of git, `memory_add` and `charter_update` carry pointers (the work file's path, what it holds), never the figures, names, amounts or ID numbers themselves. Text matching the charter's `Forbidden data` patterns is refused; rewrite it as a pointer.
+- Memory and charter are committed to git. When the charter keeps the project's data out of git, `memory_add` and `charter_update` carry pointers (the work file's path, what it holds), never the figures, names, amounts or ID numbers themselves. Text matching the project's forbidden-data patterns (`memory.forbidden_patterns`; a `charter_update` to `Forbidden data` adds its backticked patterns there, a hand edit of the charter does not) is refused; rewrite it as a pointer.
 <!-- /ttp:if forbidden_data -->
 
 # Keep moving

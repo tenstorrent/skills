@@ -1,9 +1,9 @@
 """Forbidden-data patterns: text a project must never write into its harness git (memory entries,
 charter items and their commit messages), for projects whose charter keeps their data out of git.
 
-A project declares them, all optional, none by default:
-- a charter section whose heading starts with "Forbidden data": each backticked span on its lines is
-  a regex, the words before it on a "- label: `regex`" line its label;
+A project declares them in its config, all optional, none by default (never read from charter prose:
+rewording the charter changes none of them; a charter_update to a "Forbidden data" section adds its
+backticked patterns here, and charterset moved an older charter's section here once):
 - project.json `memory.forbidden_patterns`: regex strings, or {"name": ..., "regex": ...} tables;
 - project.json `memory.forbidden_patterns_file`: a file (relative to the project folder; keep it
   outside the harness, e.g. under state/) with one regex per line, `#` comments allowed. Use it for
@@ -25,20 +25,11 @@ def is_section(heading: str) -> bool:
 
 
 def declared(p) -> list[tuple[str, str]]:
-    """(label, regex) for every pattern the project declares, in charter, config, file order."""
-    from .prompts import charter_sections
+    """(label, regex) for every pattern the project declares, in config, file order."""
     out: list[tuple[str, str]] = []
-    try:
-        charter = p.charter_path.read_text()
-    except OSError:
-        charter = ""
-    for heading, body in charter_sections(charter):
-        if not is_section(heading):
-            continue
-        for line in body:
-            for rx in _TICKS.findall(line):
-                label = line.split("`", 1)[0].strip().lstrip("-*").strip().rstrip(":").strip()
-                out.append((label or f"charter Forbidden data item {len(out) + 1}", rx))
+    if getattr(p, "established", lambda: False)():
+        from . import charterset
+        charterset.migrate(p, only=("forbidden",))   # once: an older charter's patterns never lapse
     mem = p.config().get("memory") or {}
     for i, item in enumerate(mem.get("forbidden_patterns") or []):
         if isinstance(item, dict):
@@ -70,7 +61,7 @@ def matches(p, *texts: str) -> list[str]:
             pat = re.compile(rx)
         except re.error as e:
             raise ValueError(f"forbidden-data pattern {label!r} is not a valid regex ({e}): nothing written; "
-                             "fix it in the charter or config") from None
+                             "fix it in memory.forbidden_patterns") from None
         if any(t and pat.search(t) for t in texts) and label not in hits:
             hits.append(label)
     return hits

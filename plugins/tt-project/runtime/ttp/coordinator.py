@@ -3857,6 +3857,11 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                             raise ValueError(_queue_cited_restriction(p, queue, cited_agent, section, quote,
                                                                       replaces, text, end, str(e))) from None
                         raise
+                    if forbidden.is_section(section) and text:   # forbidden.declared reads the config only
+                        from .charterset import forbidden_merged
+                        if (pats := forbidden_merged(p, f"## Forbidden data\n{text}\n")) is not None:
+                            p.set_config("memory.forbidden_patterns", pats,
+                                         by=configwho.by("coordinator", via="charter_update Forbidden data"))
                     if quote or replaced:   # the retired text, searched for in what still binds (echoes)
                         drop = loose_drop or bool(retired) and not (uturn or ok is not None) and len(over) < OVER_MIN
                         echoes.record(db, f"charter '{target}' " + ("quote replaced" if quote else "section replaced"),
