@@ -4037,6 +4037,25 @@ def _land_squashed(repo: Path, tip: str, upstream: str, say: Callable[[str], Non
     return True
 
 
+def leak_step(repo: Path, tip: str, say: Callable[[str], None]) -> str | None:
+    """The secret-shape scan of what this push sends (tip..HEAD), run as its own first step, before the
+    rebase and the checks: a literal in the outgoing history fails in seconds, not after the smoke run
+    when the pre-push hook refuses it. A scan that cannot run is said and left to that hook."""
+    from . import outscan
+    started = time.time()
+    try:
+        why = outscan.history_problem(repo, tip, "HEAD", outscan._project())
+    except Exception as e:
+        say(f"leak scan of the outgoing commits could not run ({type(e).__name__}: {str(e)[:200]}); "
+            "the pre-push hook still scans them")
+        return None
+    if why:
+        outscan.record("ttp push", why)
+        return why
+    say(f"leak scan: the outgoing commits hold no secret shape ({time.time() - started:.1f}s)")
+    return None
+
+
 def _rounds(repo: Path, remote: str, branch: str, checks: list[str], rounds: int,
             say: Callable[[str], None], version_bump: dict | None = None,
             timed: Callable[[float], None] | None = None, keep: str = "",
@@ -4063,6 +4082,9 @@ def _rounds(repo: Path, remote: str, branch: str, checks: list[str], rounds: int
         if bad := excluded(repo, tip, "HEAD", exclude or []):
             say(excluded_refusal(bad, upstream))
             return REFUSED
+        if rnd == 1 and (leak := leak_step(repo, tip, say)):
+            say(f"{leak}; not pushing")
+            return CHECKS_FAILED
         # A head built on a landed dependency's approved head leaves out its stale copies (--onto);
         # a conflict in its own commits then goes the usual way.
         ok = bool(dep := _dependency(repo, tip, landed or {}, say)) and _rebase(repo, tip, dep)
