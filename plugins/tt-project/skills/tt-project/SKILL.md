@@ -50,7 +50,10 @@ description: "Start, connect to, and talk with a long-running tt-project: a loca
   projects that did not get it yet. Never relay it one project at a time.
 - A project question you can answer from `ttp status <name>`: answer directly.
 - Anything else goes to the coordinator. Answers arrive through the listener.
-- Keep this chat free: after `ttp say`, end your turn. Do not wait in the foreground.
+- Keep this chat free: after `ttp say`, end your turn. Do not wait in the foreground. A host with no
+  background wake-up waits with one long blocking `ttp listen --once --timeout`, never with polls (`hosts.md`).
+- Keep this chat's context small: relay, never do the work here. When it grows large, write a short
+  hand-over and continue in a fresh thread (`hosts.md`).
 - `ttp say` replies "queued on this machine": the project is unreachable right now and the message
   is safe. It goes out by itself, in order and once, when the project is reachable. Tell the user;
   do not resend it.
@@ -108,6 +111,8 @@ More: `operate.md`.
 |---|---|
 | "I'll just do this quick task myself" | The project owns the work. Relay it. |
 | "I'll poll until the answer comes" | The listener wakes you. End your turn. |
+| "I'll check the background command again" | Each check re-reads the whole chat. One blocking `ttp listen --once --timeout 600`, or end your turn. |
+| "This chat is long, but I'll keep going here" | Write a short hand-over and continue in a fresh thread. |
 | "I'll paste the key here" | Secrets go through `ttp secret`, typed by the user. |
 | "Shall I open a tunnel to the web app?" | A local forward to view it is asked once per user (`ttp consent tunnel`); after a yes or a kept tunnel, open and keep them, then say so. A no is never re-asked. A tunnel that exposes the user's machine is asked each time. |
 | "Would you like me to…?" / "You can run…" | If tt-project can do it, do it and report. Ask only real decisions. |

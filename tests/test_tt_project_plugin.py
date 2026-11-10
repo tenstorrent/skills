@@ -7461,3 +7461,21 @@ def test_coordinator_prompt_and_harness_skill_run_approved_work_while_the_charte
                  "Approved work never waits on this: the coordinator queues it at once citing the approval, and a "
                  "refused change is never re-asked."):
         assert want in guard, want
+
+
+def test_chat_skill_waits_with_one_blocking_listen_and_hands_over_a_long_chat():
+    """A host with no background wake-up waits with one long blocking `ttp listen --once --timeout`,
+    never with polls; a chat whose context grows large hands over and continues fresh. Both generic."""
+    hosts = " ".join((SKILLS / "tt-project" / "hosts.md").read_text(encoding="utf-8").split())
+    skill = " ".join((SKILLS / "tt-project" / "SKILL.md").read_text(encoding="utf-8").split())
+    assert "## Codex and other hosts with no background wake-up" in (SKILLS / "tt-project" / "hosts.md").read_text()
+    assert "Wait with one long blocking call, never with polls." in hosts
+    assert "`ttp listen <name> --chat <id> --once --timeout 600 --ack <last id shown>`" in hosts
+    assert "NEVER start the listener (or any command) in the background and check its output every few seconds" in hosts
+    assert "--timeout 90" not in hosts
+    assert "write a short hand-over" in hosts and "Continue in a fresh chat or thread" in hosts
+    assert "one long blocking `ttp listen --once --timeout`, never with polls" in skill
+    assert "write a short hand-over and continue in a fresh thread" in skill
+    # Generic: no host model names or sizes in the advice.
+    for text in (hosts, skill):
+        assert not re.search(r"gpt-|claude-|\b\d+ ?[kM] tokens", text)

@@ -735,3 +735,33 @@ def test_status_puts_holds_then_the_relay_backlog_above_waiting_and_a_cut_hold_l
     line = fleethold.line(fleethold.active()["box-a"], p)
     assert line.index("to lift") < line.index("why:"), line
     assert "to lift it, say so in chat" in clip(line, 160), clip(line, 160)
+
+
+def test_a_long_once_listen_blocks_in_one_call_and_returns_at_the_first_reply_or_empty_at_its_timeout(
+        env, monkeypatch, capsys):
+    """A host with no background wake-up waits with one `ttp listen --once --timeout 600`: it returns
+    as soon as a reply arrives, long before the timeout, and with no output once the timeout runs out."""
+    from ttp import cli
+    p = make(env)
+    _relay_chat(p)
+    monkeypatch.setattr(cli, "here", lambda: None)
+    real_time, clock = time.time, [0.0]
+    monkeypatch.setattr(cli.time, "time", lambda: real_time() + clock[0])
+    naps = []
+
+    def nap(s, post=True):
+        naps.append(s)
+        clock[0] += 2
+        if post and len(naps) == 3:
+            p.db.post("out", "the answer", chat="c1")
+    monkeypatch.setattr(cli.time, "sleep", nap)
+    capsys.readouterr()
+    cli.main(["listen", "demo", "--chat", "c1", "--once", "--timeout", "600", "--ack", "0"])
+    out = capsys.readouterr().out
+    assert "the answer" in out and len(naps) == 3 and clock[0] < 600, (out, naps)
+    # Nothing arrives: one call, empty output, back at the timeout.
+    naps.clear()
+    monkeypatch.setattr(cli.time, "sleep", lambda s: nap(s, post=False))
+    last = p.db.one("SELECT MAX(id) m FROM messages")["m"]
+    cli.main(["listen", "demo", "--chat", "c1", "--once", "--timeout", "10", "--ack", str(last)])
+    assert capsys.readouterr().out == "" and 4 <= len(naps) <= 7, naps
