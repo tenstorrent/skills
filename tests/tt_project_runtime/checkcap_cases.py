@@ -9838,6 +9838,7 @@ def test_a_freed_reserved_urgent_slot_goes_to_the_parked_owed_waiter_before_an_o
     monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "1")
     monkeypatch.setenv("TTP_CHECKS_LOAD_EXTRA", "0")
     monkeypatch.setenv(checkcap.URGENT_SLOTS_ENV, "1")
+    monkeypatch.setenv("TTP_CHECKS_PRIORITY_BEYOND_CAP", "1")   # #7068: the old overflow, off by default
     monkeypatch.setenv(checkcap.PREEMPT_AFTER_ENV, "3600")
     monkeypatch.setenv(checkcap.PREEMPT_ASKED_ENV, "")
     monkeypatch.setattr(checkcap, "POLL_S", 0.1)
