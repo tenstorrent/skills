@@ -20865,7 +20865,8 @@ def test_a_detached_push_waiting_for_the_push_lock_reexecs_on_an_upgrade_keeping
     p = make(env)
     from ttp import checkcap, locks, push
     _fresh_env(monkeypatch, checkcap.REEXEC_ENV, push.WAIT_SINCE_ENV, push.RUN_LOCK_FD_ENV, "TTP_RUN_DIR")
-    for name, value in (("_marker_here", None), ("_git_pushed", False), ("_run_lock_fd", None), ("_wait_since", None)):
+    for name, value in (("_marker_here", None), ("_git_pushed", False), ("_run_lock_fd", None), ("_wait_since", None),
+                        ("_wait_first", None)):
         monkeypatch.setattr(push, name, value)
     marker = _stoppable_push(p, monkeypatch, status="running", pid=os.getpid())
     before = marker.read_text()
@@ -20895,7 +20896,7 @@ def test_a_detached_push_waiting_for_the_push_lock_reexecs_on_an_upgrade_keeping
         push._reexec(up.value)
         assert seen["argv"] == [sys.executable, "-m", "ttp", "push", "--marker", str(marker)]
         assert seen["inheritable"], "the run lock passes on to the new process"
-        assert seen["env"] == {checkcap.REEXEC_ENV: "9.9.9", push.WAIT_SINCE_ENV: repr(up.value.since),
+        assert seen["env"] == {checkcap.REEXEC_ENV: "9.9.9", push.WAIT_SINCE_ENV: f"{up.value.since!r},{up.value.first_at!r}",
                                push.RUN_LOCK_FD_ENV: str(run_lock.fileno())}
         assert "re-executing with it (same pid, marker and run lock)" in capsys.readouterr().out
         # The exec failed: the run lock is this process's alone again, and this version is never tried again.
@@ -20905,15 +20906,15 @@ def test_a_detached_push_waiting_for_the_push_lock_reexecs_on_an_upgrade_keeping
         # The new process: it holds the run lock it was passed and waits only for what is left of its wait.
         monkeypatch.setattr(push, "_run_lock_fd", None)
         os.environ[push.RUN_LOCK_FD_ENV] = str(run_lock.fileno())
-        os.environ[push.WAIT_SINCE_ENV] = repr(time.time() - 29.5)
+        os.environ[push.WAIT_SINCE_ENV] = f"{time.time() - 29.5!r},{time.time() - 29.5!r}"   # arrival, first in line
         os.set_inheritable(run_lock.fileno(), True)
         push.keep_run_lock_here()
         assert push._run_lock_fd == run_lock.fileno() and not os.get_inheritable(run_lock.fileno())
-        assert push.WAIT_SINCE_ENV not in os.environ and push._wait_since is not None
+        assert push.WAIT_SINCE_ENV not in os.environ and push._wait_since and push._wait_first
         monkeypatch.setattr(checkcap, "upgraded", lambda: "")
         t0 = time.time()
         assert push.take(p, "origin", "main", 30, poll_s=0.05) is None
-        assert time.time() - t0 < 10 and push._wait_since is None
+        assert time.time() - t0 < 10 and push._wait_since is None and push._wait_first is None
         assert "stayed busy for 30 s" in capsys.readouterr().err
     finally:
         other.close()
