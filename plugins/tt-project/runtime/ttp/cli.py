@@ -2100,6 +2100,14 @@ def cmd_stats(a) -> None:
         s["per_landed"] = trainstats.per_landed(p.db, p.root, s["ref"], cfg=cfg)
         print(json.dumps(s, indent=1) if a.json else trainstats.text(s, p.name))
         return
+    if getattr(a, "chat", False):
+        from . import chatdigest
+        s = chatdigest.counts(p.db)
+        print(json.dumps(s, indent=1) if a.json else "\n".join(
+            [f"{p.name}: coordinator chat posts (digest every {chatdigest.every_s(p.config()) / 3600:g} h; 0: off)"]
+            + ([f"  {c}: {v['sent']} sent, {v['held']} held, {v['digests']} digests, {v['waiting']} waiting"
+               for c, v in s.items()] or ["  none counted yet"])))
+        return
     if a.coord_session:
         from . import coordstats
         s = coordstats.report(p.db, p.runs, timefmt.home(p), a.days)
@@ -14181,6 +14189,9 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--effort-ab", action="store_true",
                    help="the effort A/B instead (effort_ab.enabled): per arm, $ per landed change, output tokens and "
                         "calls per run, review and checks fail rates, fix-review hops, tier-up retries, end rule")
+    s.add_argument("--chat", action="store_true",
+                   help="coordinator chat posts instead, per chat: sent at once, held for the digest, digests "
+                        "posted and held now (coordinator.chat_digest_h)")
     s.add_argument("--coord-session", action="store_true",
                    help="the persistent coordinator session instead, per day: wakes, $/wake, context growth and tool "
                         "calls per wake, rollovers, cache-read share, against the stateless baseline and break-even")

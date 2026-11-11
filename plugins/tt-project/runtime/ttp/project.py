@@ -257,6 +257,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
                     # or lock, an outside pool, CPU): one must-act item per task and queue with unblock options,
                     # raised again each such span until the coordinator acts (queuewait.py; 0: off).
                     "queue_wait_escalate_min": 30,
+                    # A coordinator reply or notify that is only an acknowledgement, progress, a queue wait or
+                    # a forecast correction (and onhost's 'Status now' footer) waits for one digest per chat,
+                    # posted at most this often; results, decisions, outages and asks go at once
+                    # (chatdigest.py; 0: every post goes at once).
+                    "chat_digest_h": 3,
                     # A user-ordered urgent task (fresh `urgent:` line) with a machine or device resource
                     # still queued this long, or waiting this long in `ttp lock`: one high observation
                     # names what holds it (Daemon.check_urgent_start; 0: off).

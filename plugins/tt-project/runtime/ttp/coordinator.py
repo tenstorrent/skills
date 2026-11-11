@@ -38,6 +38,7 @@ from . import (   # one name per line: two changes adding names merge without a 
     cells,
     chaincap,
     channeltag,
+    chatdigest,
     charterpromise,
     ghroute,
     chartertemplate,
@@ -2754,6 +2755,10 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 a["text"] = _wakemode_checked(p, a["text"], notes)
                 a["text"] = _pending_checked(p, a["text"], notes, "reply")
                 a["text"], false = _claims_checked(p, a, notes)
+                if (text := chatdigest.checked(db, cfg, a["text"], a, chat, notes)) is None:
+                    workernotify.handled(db, said)
+                    continue
+                a["text"] = text
                 replies.append(msgparts.post(db, a["text"], chat=None if chat in (None, "all") else chat, kind="reply",
                                              severity=_norm_severity(a.get("severity") or "normal"))[0])
                 claimcheck.raise_false(db, false, f"your reply #{replies[-1]} (chat {chat or 'all'})")
@@ -3595,6 +3600,10 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 a["text"] = _wakemode_checked(p, a["text"], notes)
                 a["text"] = _pending_checked(p, a["text"], notes, "notify")
                 a["text"], false = _claims_checked(p, a, notes)
+                if (text := chatdigest.checked(db, cfg, a["text"], a, None, notes)) is None:
+                    workernotify.handled(db, said)
+                    continue
+                a["text"] = text
                 sent.append((msgparts.post(db, a["text"], chat=None, kind="alert",
                                            severity=_norm_severity(a.get("severity")))[0], None, authored))
                 claimcheck.raise_false(db, false, f"your notify #{sent[-1][0]}")

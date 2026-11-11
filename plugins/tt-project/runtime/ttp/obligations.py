@@ -1541,7 +1541,7 @@ def promise_lines(db, now: float | None = None, where=None) -> list[str]:
         return []
     late = sum(1 for o in rows if now >= o["promise"]["due"])
     out = [f"## Promises made in chat: {len(rows)} open" + (f", {late} OVERDUE" if late else "")
-           + " (send each deliverable or an honest update in its chat; close with `obligation` key + evidence)"]
+           + " (send each deliverable in its chat; an honest update waits for its digest; close with `obligation` key + evidence)"]
     out += [f"- {o['id']} {o['text'][:200]} [{_promise_state(o, now, where)}]" for o in rows]
     return out
 

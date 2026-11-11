@@ -2368,6 +2368,7 @@ class Daemon:
                 self.check_checks_wait,
                 self.check_urgent_check_wait,
                 self.check_queue_waits,
+                self.check_chat_digest,
                 self.check_checks_owner,
                 self.reap_leftover_checks,
                 self.reap_orphan_checks,
@@ -6673,7 +6674,7 @@ class Daemon:
         if evs:
             db.x(f"UPDATE events SET status='handled' WHERE id IN ({','.join('?' * len(evs))})", evs)
         try:
-            # A must-act item no applied action touched wakes once more, then is told model-free.
+            # A must-act item no applied action touched wakes once more, then goes in its chat's digest.
             for key, text in mustact.settle(self.p, evs, actions, applied):
                 self.observe("daemon:must-act", text, "normal", whole=True, key=key)
         except Exception:   # bookkeeping: the turn is settled either way
@@ -10541,6 +10542,17 @@ class Daemon:
                   task, json.dumps({"fold": checkcap.urgent_wait_fold(w)})))
             status = "coalesced"
             log(self.p, f"urgent checks wait: {text[:300]}")
+
+    def check_chat_digest(self, every_s: float = 60) -> None:
+        """Post each chat's held routine coordinator posts as one digest, at most every
+        coordinator.chat_digest_h hours (chatdigest.py)."""
+        now = time.time()
+        if now - getattr(self, "_chat_digest_checked", 0.0) < every_s:
+            return
+        self._chat_digest_checked = now
+        from . import chatdigest
+        if ids := chatdigest.flush(self.p, self.cfg, now):
+            log(self.p, f"chat digest posted: messages {', '.join(map(str, ids))}")
 
     def check_queue_waits(self, every_s: float = 60) -> None:
         """Model-free queue-wait escalation (queuewait.py): a task waiting past coordinator.queue_wait_escalate_min

@@ -17144,7 +17144,7 @@ def test_promise_replay_671_recorded_listed_overdue_and_raised_once(env, monkeyp
     assert "dogfood-2 candidate" in o["text"] and "Checks are running" not in o["text"]
     check(_pdt(14, 59))
     assert _promise_events(p) == [] and ob.promise_lines(p.db, _pdt(14, 59), p)[0].endswith(
-        "(send each deliverable or an honest update in its chat; close with `obligation` key + evidence)")
+        "(send each deliverable in its chat; an honest update waits for its digest; close with `obligation` key + evidence)")
     head, line = ob.promise_lines(p.db, _pdt(17, 20), p)
     assert "1 open, 1 OVERDUE" in head
     assert "chat c1, message #671" in line and "15:00 PDT" in line and "OVERDUE 2.3 h" in line

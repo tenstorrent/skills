@@ -66,3 +66,4 @@
 +120: task_update check_plan: a task's own planned checks of its waits (waketier.py, user msgs #2231, #2245)
 +214: old orders line: record each order's reason, retire one whose reason is gone (oldorders.py, user msg #2484)
 +255: Short path rule (ttp express) and the session prompt's `ttp push --land` of a reviewed fix (user msgs #2482, #2484)
++434: chat digest: post only results, decisions, outages and asks; routine updates wait for the chat's digest (chatdigest.py, user msg #2441)

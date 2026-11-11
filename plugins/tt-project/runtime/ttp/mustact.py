@@ -19,7 +19,7 @@ import json
 import re
 import time
 
-from . import msgparts, obligations
+from . import obligations
 
 REWAKE_KIND = "must_act_rewake"
 QUEUE_KIND = "queue_wait"   # queuewait.KIND: a wait on a queue or cap past its threshold, re-raised per mark
@@ -68,7 +68,8 @@ def block(db, ids) -> str:
         again += " (re-plan: missed twice)" if it.get("replan") else ""
         if ev["kind"] == QUEUE_KIND:
             again = (" (queue wait: queue its fix now (config_set, task_add or task_update naming the key or "
-                     "updating the task), or reply naming the key and the safety rule that holds it; else it "
+                     "updating the task), or a noop whose `why` names the key and the safety rule that holds it; "
+                     "else it "
                      "comes back at the next mark)")
         owners = f"; owners #{', #'.join(map(str, it.get('tasks') or []))}" if it.get("tasks") else "; no owner task"
         out.append(f"- {it['key']} in chat {it['chat']}{owners}{again}: {first}")
@@ -76,8 +77,9 @@ def block(db, ids) -> str:
         return ""
     return (f"## {SECTION}\nEach item below is late or did not hold. Act on every one in this turn: re-order or start its "
             "work (task_add or task_update naming its key, or updating its owner), record or close it "
-            "(`obligation` with its key), or tell the user in its chat (reply) what is true and by when. An "
-            "item with no such action wakes you once more, then the daemon tells the user itself.\n"
+            "(`obligation` with its key), or a noop whose `why` names its key and what is true. A chat reply "
+            "only for a result, an outage or a blocker only the user can clear: routine updates wait for the "
+            "chat's digest. An item with no such action wakes you once more, then goes in its chat's digest.\n"
             + "\n".join(out))
 
 
@@ -110,6 +112,8 @@ def acted(it: dict, actions: list, applied) -> str | None:
                 return f"task_add continues owner #{a['continues']}"
         elif t == "obligation" and str(a.get("key") or "").strip() == key:
             return f"obligation action on {key}"
+        elif t == "noop" and any(_names(v, key) for v in a.values() if isinstance(v, str)):
+            return f"noop names {key}"
         elif queue:   # any config change, or words naming the item (the rule that holds it)
             if t == "config_set":
                 return "config_set"
@@ -186,8 +190,9 @@ def settle(p, ids, actions, applied, now: float | None = None) -> list[tuple[str
             text = (f"Automatic update from the project's records (the coordinator did not act on this in two "
                     f"turns): {_status(p, it)}")
             chat = obligations._chat(it.get("chat"))
-            msgparts.post(db, text, chat=None if chat == "all" else chat, kind="info", severity="normal")
+        from . import chatdigest   # routine: the chat's next digest carries it
+        heard = ("its chat's next digest carries the update from the records"
+                if chatdigest.routine(p, chat, text, "must-act not acted on", now) else "its chat was told model-free")
         issues.append((f"must-act:{first}", f"must-act item {it['key']} ({LATE.get(it.get('kind'), 'late')}) "
-                                             f"got no action in two coordinator turns; its chat was told "
-                                             f"model-free. Event {first}."))
+                                             f"got no action in two coordinator turns; {heard}. Event {first}."))
     return issues

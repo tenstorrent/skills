@@ -3606,6 +3606,16 @@ install it, to a desktop notifier on your workstation that covers all your proje
 (`ttp notifier install`; asked once per user, recorded with `ttp consent notifier yes|no`). Only decisions, reviews, merges, funds and outages notify by default.
 `ttp notifier test` checks that desktop notifications show (with sound) and prints the fix if not.
 
+Chat posts stay few. A coordinator reply or notify reaches its chat at once only for a finished
+result, a decision you may want to override, a real outage or an ask, an answer to your question,
+or a high severity. A post that is only an acknowledgement ('Got it'), progress, a queue wait or a
+corrected forecast waits, whole, for one digest per chat, posted at most every
+`coordinator.chat_digest_h` hours (default 3; `0` sends every post at once) and only when it has
+content. The 'Status now' line the harness adds to a post naming unstarted work goes in the
+digest too, and so does the harness's own update on a late item the coordinator did not act on.
+A reminder of a step waiting on you keeps its full command and options in the digest.
+`ttp stats --chat` counts per chat the posts sent at once, held, digests posted and held now.
+
 - Web app: the Notifications card on the Overview tab shows the browser's state (on, not allowed yet,
   blocked, unavailable on this address, unsupported), an Allow button and Send test. While the page
   is open in any tab, each new ask, problem and task ready for review pops up once and stays until

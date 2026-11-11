@@ -490,6 +490,7 @@ def env(tmp_path, monkeypatch, _git_session, _short_tmp):
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))   # `ttp setup` never writes the user's own skills
     monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codexhome"))   # nor repoints or refreshes the user's own Codex plugins
     monkeypatch.setenv("TTP_TEST_NO_SYNC", "1")   # setup and upgrades skip the host-wide flush (minutes on a busy host)
+    monkeypatch.setenv("TTP_TEST_CHAT_DIGEST", "off")   # coordinator posts go at once (chatdigest_cases tests the digest)
     monkeypatch.setenv("TTP_TEST_WORKER_CONTEXT", "off")   # worker prompts carry no coordinator context (ctxfork_cases tests it)
     monkeypatch.setenv("TTP_TEST_NO_MCP_PROBE", "1")   # daemons never run the real `claude mcp list` (mcpgap.py)
     monkeypatch.setenv("TTP_TEST_NO_MODELS_PROBE", "1")   # nor the routed endpoint's /models check (route.py)
