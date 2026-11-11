@@ -657,6 +657,7 @@ def _reload_agent(label: str, plist: Path, inside: bool, log: Path) -> subproces
     and logs a failure to `log`."""
     target, domain = _target(label)
     if inside:
+        # own session: the reload outlives the bootout of the agent it runs inside
         subprocess.Popen(["sh", "-c", _reload_script(target, domain, plist, log)],
                          start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return subprocess.CompletedProcess([], 0, "", "")

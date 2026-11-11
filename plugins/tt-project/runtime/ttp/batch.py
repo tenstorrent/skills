@@ -3779,6 +3779,7 @@ def _run_detached(p: Project, receipt: Path, log: Path, lock) -> dict | None:
     try:
         with open(log, "ab") as out:
             fds = (lock.fileno(),) if lock is not None else ()
+            # own session: the after_push run outlives `ttp push` and a closed terminal
             proc = subprocess.Popen(rerun_argv(p, receipt, first=True), cwd=str(p.root), stdin=subprocess.DEVNULL,
                                     stdout=out, stderr=subprocess.STDOUT, start_new_session=True, pass_fds=fds,
                                     env={**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1]),
