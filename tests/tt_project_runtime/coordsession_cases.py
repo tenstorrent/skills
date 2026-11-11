@@ -661,10 +661,10 @@ def test_coord_session_stats_count_the_changed_prefix_parts_and_a_restart_apart(
     assert d["reasons"] == {"new: prompt, charter or schema changed": 5, "new: transcript gone": 1,
                             "new: prompt changed, provider cannot resume with it": 1,
                             "new: transcript gone after daemon restart": 1}, d["reasons"]
-    assert d["prefix_parts"] == {"charter": 3, "not recorded": 2, "none (same digests)": 1, "standing": 1,
+    assert d["prefix_parts"] == {"charter": 2, "not recorded": 2, "none (same digests)": 1, "standing": 1,
                                  "template": 1}, d["prefix_parts"]
     out = coordstats.text(coordstats.report(p.db, p.runs, "UTC", 7, now=t0 + 9000))
-    assert ("    prefix parts changed (new sessions for a changed prefix): charter 3, not recorded 2, "
+    assert ("    prefix parts changed (new sessions for a changed prefix): charter 2, not recorded 2, "
             "none (same digests) 1, standing 1, template 1") in out, out
 
 
