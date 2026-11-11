@@ -9445,12 +9445,14 @@ def cmd_task(a) -> None:
         if not t:
             die(f"no task #{int(a.title)} in {p.name}", 1)
         from .landed import abandoned, superseded_rows
-        from . import reviewsup, sweep
+        from . import probewake, reviewsup, sweep
         gone = abandoned(p.db, t["id"])
         sup = superseded_rows(p, t["id"])
         swept = sweep.task_view(p.db, t["id"])
+        woke = probewake.latest(p.db, t["id"])   # the probe run its latest probe-woken run started on
         if a.json:
             print(json.dumps({**t, **({"abandoned": {"why": gone[0], "ts": gone[1]}} if gone else {}),
+                              **({probewake.KEY: {"run": woke[0], **woke[1]}} if woke else {}),
                               **({"superseded": sup} if sup else {}), "blocker_sweep": swept}, indent=2, default=str))
         else:
             lines = ([sup_line] if (sup_line := reviewsup.show_line(t, lambda ts: timefmt.long(ts, p))) else [])
@@ -9459,6 +9461,8 @@ def cmd_task(a) -> None:
             if gone:
                 lines.append(f"abandoned {timefmt.long(gone[1], p)}: {gone[0]}")
             lines += sweep.task_lines(swept, p)
+            if woke:
+                lines.append(f"run {woke[0]} " + probewake.show_line(woke[1], lambda ts: timefmt.long(ts, p)))
             print(show_task(t) + ("\n\n" + "\n".join(lines) if lines else ""))
     elif a.action == "cancel":
         from .runner import stop_runs

@@ -41,6 +41,7 @@ from . import untrusted
 from . import sshmux
 from . import tailnet
 from . import sshagent
+from . import probewake
 from . import ackwait
 from . import charterset
 from . import claimcheck
@@ -11645,6 +11646,10 @@ class Daemon:
                                     **({"pick": pv[waketier.PICK]} if pv.get(waketier.PICK) else {})}
                 if gated:
                     note[waitgate.USE] = gated
+                woke_probe = probewake.valid(db.kv(probewake.KV_PREFIX + str(task["id"]))) \
+                    or (probewake.valid(prev.get(probewake.KEY)) if wake else None)
+                if woke_probe:   # the probe run that woke it: kept in the run's note as it was
+                    note[probewake.KEY] = woke_probe
                 if picked:
                     note["pick"] = picked
                 kept = self._floor_keeps_core(task, tier, picked)
@@ -11683,6 +11688,7 @@ class Daemon:
                     prompt, lost = worker_task(self.p, task, cwd, branch, wake=note.get("wake"),
                                                conflict=note.get(conflictfix.KEY)), None
                 prompt += startcheck.prompt_lines(found)   # a resumed session is told too
+                prompt += probewake.prompt_lines(woke_probe, lambda ts: timefmt.long(ts, self.p))
                 db.update_task(task["id"], status="running", branch=branch, blocked_reason=None)
                 run_id = self.start_run("worker" if task["kind"] != "review" else "reviewer", prompt, run_prov, tier, cwd,
                                         task=task, budget_usd=max(remaining, 0.5) if task["budget_usd"] else None,
@@ -11691,6 +11697,8 @@ class Daemon:
                                         resume=lost["session"] if lost else None,
                                         min_effort=None if tierfloor.wake_keeps_effort(task, run_cls)
                                         else (need or {}).get("effort") or None)
+                if woke_probe:   # its start_when pass is now in the run's note
+                    db.x("DELETE FROM kv WHERE key=?", (probewake.KV_PREFIX + str(task["id"]),))
                 if lease:   # the lease now names the run's supervisor in place of the daemon
                     self._route_lease(task, routed, tier, now, run_id=run_id)
             except Exception as e:
@@ -14120,6 +14128,9 @@ class Daemon:
             self.p.db.update_task(task["id"], labels=without_deferral(json.loads(task["labels"] or "[]")),
                                   not_before=None)
             log(self.p, f"task {task['id']} start_when passed; ready to start")
+            got = self._probe_out.get(task["id"])
+            self.p.db.set_kv(probewake.KV_PREFIX + str(task["id"]), probewake.record(
+                d.get("when") or "", rc, got[0] if got and got[2] == d.get("when") else "", now))
             if d.get("when"):
                 userstep.probe_passed(self.p.db, task, {d["when"]}, now)   # its user step is done
         else:
@@ -15563,6 +15574,11 @@ class Daemon:
             self._woke_on[tid] = got
         self._spec_deferred.discard(tid)
         prev = load_result(task["result"])
+        prev.pop(probewake.KEY, None)   # an earlier wake's record never passes for this one's
+        if got and kind in probewake.KINDS:   # the probe run that woke it, for its worker (probewake)
+            out = self._probe_out.get(tid)
+            extra = {probewake.KEY: probewake.record(got[2], got[0], out[0] if out and out[2] == got[2] else "",
+                                                     got[1]), **(extra or {})}
         extra, why = _with_pending_spec(task, prev, {waketier.KEY: kind, **(extra or {})}, why)
         prev.pop(SPEC_WAKE_NOW_KEY, None)
         self.p.db.update_task(tid, not_before=min(task["not_before"] or now, now),

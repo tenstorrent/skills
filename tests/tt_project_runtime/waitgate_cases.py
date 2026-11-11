@@ -819,3 +819,81 @@ def test_the_watchers_free_skips_never_keep_a_losing_jev_wake_gate_use_switched_
     line = waitgate.line(p.db, cfg, now)
     n = jevuse.MIN_CALLS if losing == "net" else jevuse.IDLE_CALLS
     assert f"Jev {n} calls ${n * 0.01:.2f}" in line and "the watcher 40 calls (free)" in line, line
+
+
+def _probe_dispatch(p, d, monkeypatch):
+    """Dispatch once with start_run stood in: each start inserts a run row with the note it was given.
+    Returns the (prompt, note) of each start."""
+    from ttp import budget as bud
+    started = []
+
+    def start(role, prompt, provider, tier, cwd, **k):
+        started.append((prompt, k.get("note") or {}))
+        p.db.x("INSERT INTO runs(task,role,provider,started,ended,status,note) VALUES(?,?,?,?,?,?,?)",
+               (k["task"]["id"], role, provider, time.time(), time.time(), "ok", json.dumps(k.get("note") or {})))
+        p.db.update_task(k["task"]["id"], status="queued", not_before=time.time() + 3600)
+        return 0
+    monkeypatch.setattr(d, "start_run", start)
+    monkeypatch.setattr(d, "_workdir_for", lambda t: (str(p.root), None))
+    monkeypatch.setattr(d, "_wake_gate", lambda t: (False, None))
+    for prov in {d.cfg.get("core_provider", "claude"), "claude", "fake"}:
+        d.gates[prov] = bud.Gate(prov, regime="windows", max_parallel=6)
+    d.dispatch()
+    return started
+
+
+def test_a_probe_woken_worker_gets_the_probes_bounded_output_and_its_run_keeps_it(env, monkeypatch, tmp_path,
+                                                                                   capsys):
+    """Upstream note 07c8ca8a4f2ccce0: a probe wake names what it saw. The woken worker's prompt and its
+    run's note carry the probe's command, exit code, first 2 KB of output and time; a later probe run
+    leaves the earlier run's record as it was; `ttp task show` prints it."""
+    p = make(env)
+    from ttp import cli, daemon as dmod, probewake
+    d = dmod.Daemon(p.base)
+    probe = "ttp detach --check job"
+    tid = _gate_task(p, tmp_path, probe)
+    now = time.time() - 600
+    big = "line one: job finished rc=0\n" + "é" * 1500   # 3000+ bytes: kept to its first 2048
+    d._probe_rc[tid] = (0, now, probe)
+    d._probe_out[tid] = (big, now, probe)
+    d._wake_waiting(p.db.task(tid), "probe passed", now, kind="probe_passed")
+    started = _probe_dispatch(p, d, monkeypatch)
+    assert len(started) == 1, started
+    prompt, note = started[0]
+    rec = note[probewake.KEY]
+    assert rec["cmd"] == probe and rec["rc"] == 0 and rec["at"] == now and rec["cut"] is True
+    assert len(rec["out"].encode()) <= probewake.OUT_BYTES and rec["out"].startswith("line one: job finished")
+    assert f"`{probe}`" in prompt and "line one: job finished rc=0" in prompt and "first 2048 bytes, cut" in prompt
+    first = p.db.one("SELECT id, note FROM runs WHERE task=? ORDER BY id DESC LIMIT 1", (tid,))
+    # A later probe run with another answer: a new wake gets its own record; the earlier run's stays.
+    later = now + 120
+    d._probe_rc[tid] = (0, later, probe)
+    d._probe_out[tid] = ("second answer", later, probe)
+    d._wake_waiting(p.db.task(tid), "probe passed", later, kind="probe_passed")
+    started = _probe_dispatch(p, d, monkeypatch)
+    assert started[0][1][probewake.KEY]["out"] == "second answer" and "second answer" in started[0][0]
+    assert p.db.one("SELECT note FROM runs WHERE id=?", (first["id"],))["note"] == first["note"]
+    assert probewake.of_run(first["note"]) == rec
+    # A timer wake carries none, and drops the earlier wake's record from the hand-off.
+    d._wake_waiting(p.db.task(tid), "timer", later + 60, kind="timer")
+    assert probewake.KEY not in json.loads(p.db.task(tid)["result"])
+    cli.main(["task", p.name, "show", str(tid), "--json"])
+    assert json.loads(capsys.readouterr().out)[probewake.KEY]["out"] == "second answer"
+    cli.main(["task", p.name, "show", str(tid)])
+    shown = capsys.readouterr().out
+    assert "woken by its probe at" in shown and "output: second answer" in shown, shown
+
+
+def test_a_passed_start_when_hands_its_probe_output_to_the_first_run(env, monkeypatch, tmp_path):
+    p = make(env)
+    from ttp import daemon as dmod, probewake
+    d = dmod.Daemon(p.base)
+    tid = p.db.add_task("after the job", "s", kind="work", tier="standard", origin="user")
+    now = time.time()
+    p.db.update_task(tid, labels=["start_when:test -e /tmp/x", f"deferred_since:{now:.0f}"])
+    d._probe_out[tid] = ("ready: build 42", now, "test -e /tmp/x")
+    d._start_verdict(p.db.task(tid), 0, now)
+    started = _probe_dispatch(p, d, monkeypatch)
+    assert len(started) == 1 and started[0][1][probewake.KEY]["out"] == "ready: build 42"
+    assert "ready: build 42" in started[0][0] and started[0][1][probewake.KEY]["cmd"] == "test -e /tmp/x"
+    assert p.db.kv(probewake.KV_PREFIX + str(tid)) is None, "the start record outlived its dispatch"
