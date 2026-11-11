@@ -729,6 +729,7 @@ def test_a_run_that_does_not_pass_on_a_spill_host_runs_again_here(env, tmp_path,
     for fake in ({}, {"FAKE_SSH_FAIL": "mktemp"}):
         for k, v in fake.items():
             monkeypatch.setenv(k, v)
+        (p.state / checkspill.FAILS_FILE).unlink(missing_ok=True)   # each scenario is its own run of the head
         log.write_text("")
         lane = _spill_lane(p, repo)
         safety = threading.Timer(120, lane.close)   # never hang the suite
@@ -808,7 +809,7 @@ def test_a_run_that_fails_tests_on_a_spill_host_reruns_only_those_tests_here_and
     again here: the rerun selects only the failed ids (TTP_PYTEST_SELECT_IDS), their pass here passes the
     run, and their failing here too fails it. One that stopped early (-x) runs whole again."""
     import threading
-    from ttp import cli
+    from ttp import checkspill, cli
     p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a"])
     log, mark = tmp_path / "where.log", tmp_path / "fail-here"
     fail = ("printf 'FAILED tests/test_x.py::test_a - boom\\nFAILED tests/test_y.py::test_b - boom\\n"
@@ -822,6 +823,7 @@ def test_a_run_that_fails_tests_on_a_spill_host_reruns_only_those_tests_here_and
             ("!!!!!!!!!! stopping after 2 failures !!!!!!!!!!", False, True, "")):
         monkeypatch.setenv("TAIL", tail)
         mark.touch() if fails_here else mark.unlink(missing_ok=True)
+        (p.state / checkspill.FAILS_FILE).unlink(missing_ok=True)   # each scenario is its own run of the head
         log.write_text("")
         seen = len((run / "checks.log").read_text()) if (run / "checks.log").exists() else 0
         lane = _spill_lane(p, repo)
