@@ -71,3 +71,4 @@
 +120: task_update untrusted_input false clears the label with a vouching text
 +350: cut queue times with the charter's resources, weighed by urgency; a silent throttle gets fixed or named (user msg #2010)
 +135: when the user asked for speed, apply a worker's slot proposal at once; no spend cap rises without the user's word (note 90a59829)
++10: the queue-time bullet's speed clause, measured after rebasing onto the tip (45632 against 45625; user msg #2010)

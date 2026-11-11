@@ -44,3 +44,4 @@ code +115: a remote test (`ttp lock <box> --`, ssh) or a slow poll runs detached
 question +115: a remote test (`ttp lock <box> --`, ssh) or a slow poll runs detached and the worker hands off waiting, freeing its slot (msg #223)
 every +115: a remote test (`ttp lock <box> --`, ssh) or a slow poll runs detached and the worker hands off waiting, freeing its slot (msg #223)
 system +115: a remote test (`ttp lock <box> --`, ssh) or a slow poll runs detached and the worker hands off waiting, freeing its slot (msg #223)
+every +130: a long queue for CPU-only work runs on another allowed host with room, rather than wait (user msg #2010)
