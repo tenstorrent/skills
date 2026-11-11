@@ -402,7 +402,7 @@ def test_bench_run_cli_dry_run_takes_arms_from_the_command_line_and_refuses_one_
     monkeypatch.setenv("TTP_PROJECT", str(p.base))   # the test's project, never the one around the checkout
     monkeypatch.setenv("TTP_FAKE_SHELL", _BENCH_FIX)
     base = ["bench", "run", "--bench", str(tmp_path / "bench"), "--dry-run", "--seed", "3",
-            "--test-cmd", f"{sys.executable} -m pytest -q -p no:cacheprovider"]
+            "--test-cmd", "python3 -m pytest -q -p no:cacheprovider"]
     cli.main([*base, "--out", str(tmp_path / "o"), "--arm", "a=claude:m:medium", "--arm", "b=chat:m2:max"])
     text = capsys.readouterr().out
     assert f"task {tid} rep 1 a: pass, $0.00" in text and f"task {tid} rep 1 b: pass" in text
@@ -507,6 +507,7 @@ def test_bench_audit_and_deny_rules_leave_a_claude_cell_its_own_session_folder(e
 def test_bench_cells_get_venvs_of_their_own_with_the_user_site_off_and_pip_user_refused(tmp_path, monkeypatch):
     # #7076: a cell ran `pip install --user` and changed the shared user site under every project.
     import importlib.util
+    import json
     from ttp import cellenv
     monkeypatch.setenv("PIP_USER", "1")
     monkeypatch.delenv("PIP_REQUIRE_VIRTUALENV", raising=False)   # cellenv must set it, not the caller's env
@@ -514,6 +515,8 @@ def test_bench_cells_get_venvs_of_their_own_with_the_user_site_off_and_pip_user_
     monkeypatch.setenv("PYTEST_PLUGINS", "ttp_no_such_plugin")
     one, two = cellenv.make(tmp_path / "c1" / "venv"), cellenv.make(tmp_path / "c2" / "venv", seed=())
     assert one != two and (one / "pyvenv.cfg").is_file() and (two / "pyvenv.cfg").is_file()
+    os_sites = subprocess.run([cellenv._base_python(), "-s", "-c", "import json, site; print(json.dumps(site.getsitepackages()))"],
+                              capture_output=True, text=True, timeout=60).stdout
     with pytest.raises(cellenv.Unavailable, match="never reused"):
         cellenv.make(one)
     for venv in (one, two):
@@ -525,6 +528,12 @@ def test_bench_cells_get_venvs_of_their_own_with_the_user_site_off_and_pip_user_
         r = subprocess.run(["python3", "-c", "import site, sys; print(sys.prefix, site.ENABLE_USER_SITE)"],
                            env=env, capture_output=True, text=True, timeout=60)
         assert r.stdout.split() == [str(venv), "False"], r
+        # The OS's site directories stay importable, below the venv's own.
+        r = subprocess.run(["python3", "-c", "import json, sys; print(json.dumps(sys.path))"], env=env,
+                           capture_output=True, text=True, timeout=60)
+        cell_path = json.loads(r.stdout)
+        for d in (d for d in json.loads(os_sites) if os.path.isdir(d)):
+            assert cell_path.index(d) > cell_path.index(str(next(venv.glob("lib/python*/site-packages")))), (d, cell_path)
         # No network: pip refuses `--user` before it looks for a package.
         r = subprocess.run(["python3", "-m", "pip", "install", "--user", "--no-index", "nopkg"], env=env,
                            capture_output=True, text=True, timeout=120)
