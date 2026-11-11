@@ -563,3 +563,40 @@ def test_the_hop_limit_ends_a_deliberate_stand_in_loop_fast(tmp_path):
     assert len((tmp_path / "hops").read_text().split()) == hostshim.MAX_HOPS
     assert len((store / "calls.jsonl").read_text().splitlines()) == hostshim.MAX_HOPS + 1
     assert r.returncode == 0 or "passed it on" in r.stderr, r.stderr
+
+
+def test_a_check_run_on_another_machine_leaves_this_hosts_crontab_unjudged(tmp_path, monkeypatch):
+    """A check spilled to another host or a Slurm job runs its tests there: a crontab line another
+    project adds or removes here meanwhile is neither put back nor recorded, and end() says why."""
+    from ttp import hoststate, push, remotecheck, slurmcheck
+    _, tabf, _ = _fake_host(tmp_path, monkeypatch, "0 1 * * * keep\n@reboot other/resume.sh\n")
+    got = _ledger(monkeypatch)
+    spill = ["nice", "-n", "10", *remotecheck.argv("pytest -q", "spill-host")]
+    assert hoststate.elsewhere(spill) == "spill-host"
+    assert hoststate.elsewhere(slurmcheck.argv("pytest -q", {}, minutes=5)) == "a Slurm batch job"
+    assert hoststate.elsewhere(["bash", "-c", "pytest -q"]) == "" == hoststate.elsewhere(None)
+    env = push.check_env("checks", run_dir=str(tmp_path / "run"))
+    guard = hoststate.Guard(env, argv=spill)
+    assert guard.before is None
+    tabf.write_text("0 1 * * * keep\n0 2 * * * added\n")
+    changed, said = guard.end()
+    assert not changed and not got and tabf.read_text() == "0 1 * * * keep\n0 2 * * * added\n"
+    assert said and "spill-host" in said[0] and "not compared" in said[0], said
+    assert hoststate.Guard(env, argv=["bash", "-c", "true"]).before is not None   # a local check is judged
+
+
+def test_push_and_ttp_checks_hand_the_check_command_to_the_host_guard(tmp_path, monkeypatch):
+    """Both check runners pass the command they run, so a spilled one is not judged against this host."""
+    from ttp import hoststate, push
+    cron, tabf, _ = _fake_host(tmp_path, monkeypatch, "0 1 * * * keep\n")
+    got = _ledger(monkeypatch)
+    seen = []
+    monkeypatch.setattr(hoststate, "elsewhere", lambda argv: seen.append(argv) or "spill-host")
+    env = push.check_env("checks", run_dir=str(tmp_path / "run"))
+    said = []
+    push._run_one(_append(cron, "0 3 * * * meanwhile", "$TTP_RUN_DIR"), tmp_path, env, said.append)
+    assert "meanwhile" in tabf.read_text() and not got, said
+    assert seen and "meanwhile" in " ".join(map(str, seen[-1])), seen
+    tabf.write_text("0 1 * * * keep\n")
+    _run_check_ended(["bash", "-c", _append(cron, "0 4 * * * meanwhile", "$TTP_RUN_DIR")], env=env)
+    assert "0 4 * * * meanwhile" in tabf.read_text() and not got

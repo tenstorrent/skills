@@ -4441,11 +4441,11 @@ def _run_one(cmd: Any, repo: Path, env: dict, say: Callable[[str], None], seen: 
         # A landing's check (to the push branch, or `ttp land`) runs under a landing mark: a `ttp lock`
         # in it goes ahead of non-landing waiters (landmark.py). No other check inherits one.
         mark = landmark.hold() if env.get("TTP_PUSH_MODE") == "target" else None
-        guard = hoststate.Guard(env)   # the real crontab and units, compared after the check
         try:
+            argv = testslots.low_priority(check_argv(cmd, repo, env))
+            guard = hoststate.Guard(env, argv=argv)   # the real crontab and units, compared after a local check
             # own session: its group is ended once it ends (_end_group), or by checkgroup if this push dies first
-            proc = subprocess.Popen([*CHECK_GROUP, str(os.getpid()), "--",
-                                     *testslots.low_priority(check_argv(cmd, repo, env))], cwd=repo,
+            proc = subprocess.Popen([*CHECK_GROUP, str(os.getpid()), "--", *argv], cwd=repo,
                                     env={**{k: v for k, v in env.items() if k != landmark.ENV}, checkwait.ENV: str(waits),
                                          **({landmark.ENV: str(mark.path)} if mark else {}),
                                          # its run-time limit, for a sharded pool run's admission (pooladmit)

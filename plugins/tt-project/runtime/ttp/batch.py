@@ -256,7 +256,7 @@ def _stream(cmd: str | list[str], cwd: Path, env: dict | None = None, timeout: f
 
 def _streamed(cmd, cwd: Path, env: dict | None, timeout: float | None, group: bool, pass_fds: tuple,
               collect: workerloss.Collector | None) -> tuple[int | None, str, bool]:
-    guard = hoststate.Guard(env) if env and env.get(hoststate.MARKER) else None   # a check: compare the host after
+    guard = hoststate.Guard(env, argv=cmd) if env and env.get(hoststate.MARKER) else None   # a check: compare the host after
     proc = subprocess.Popen(cmd, shell=isinstance(cmd, str), cwd=str(cwd), env=env, stdin=subprocess.DEVNULL,
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=group, pass_fds=pass_fds)
     tail: deque[str] = deque(maxlen=push.LOG_TAIL)

@@ -32,7 +32,9 @@ plugin's own test sessions (tests/conftest.py) get three things, with no namespa
 The snapshot leaves out the harness's own entries (crontab lines tagged `# tt-project:`, units named
 tt-project-*), which its daemons rewrite while tests run; under the marker its installers never touch
 the real ones. Only files are compared, not which units run: a unit started (not enabled) by
-absolute path is not seen."""
+absolute path is not seen. A check that runs on another machine (a spill host, a Slurm job) is not
+judged here at all: its tests touch that machine, guarded by their own session there, and a change to
+this host's crontab meanwhile is another project's."""
 from __future__ import annotations
 
 import hashlib
@@ -396,21 +398,45 @@ def faked_writes(store, since: float) -> list[str]:
     return [k + (f" ({n} times)" if n > 1 else "") for k, n in seen.items()]
 
 
-class Guard:
-    """Snapshot on creation; end() compares, restores and says what happened."""
+def elsewhere(argv) -> str:
+    """The machine check command `argv` runs its tests on when that is not this one: a spill or checks
+    host (remotecheck.argv: its `--host`) or a Slurm batch job (slurmcheck.argv), behind any local
+    wrapper (low priority); "" for a local command. This host's crontab and units say nothing about a
+    run there, and another project may change them meanwhile: the guard leaves them unjudged."""
+    if not isinstance(argv, (list, tuple)):
+        return ""
+    from . import remotecheck, slurmcheck
+    args = [str(a) for a in argv]
+    for i, a in enumerate(args[:-1]):
+        if a == "-c" and args[i + 1] == remotecheck._BOOT:
+            rest = args[i + 2:]
+            return rest[rest.index("--host") + 1] if "--host" in rest[:-1] else "another host"
+        if a == "-c" and args[i + 1] == slurmcheck._BOOT:
+            return "a Slurm batch job"
+    return ""
 
-    def __init__(self, env: dict | None = None, tokens=()):
+
+class Guard:
+    """Snapshot on creation; end() compares, restores and says what happened. With `argv`, the command
+    the check runs: one that runs on another machine (elsewhere) takes no snapshot here, and end() only
+    says so."""
+
+    def __init__(self, env: dict | None = None, tokens=(), argv=None):
         env = env if env is not None else os.environ
         self.store, self.tokens = env.get(MARKER), _tokens(env, tokens)
         self.run = env.get("TTP_TASK") and f"task {env['TTP_TASK']}" or env.get("TTP_RUN_DIR") or f"pid {os.getpid()}"
         self.since = time.time()
-        self.before = snapshot()
+        self.remote = elsewhere(argv)
+        self.before = None if self.remote else snapshot()
         self.done = False
 
     def end(self, recorded=None) -> tuple[bool, list[str]]:
         """(the run changed the real state, the lines to report). `recorded`: the real paths the run's
         own processes wrote (the test session's write log)."""
         self.done = True
+        if getattr(self, "remote", ""):
+            return False, [f"host guard: the check ran on {self.remote}; this host's crontab and user units "
+                           "were not compared or touched"]
         said = []
         if writes := faked_writes(self.store, self.since):
             said.append("host guard: these calls went to the run's fake store, never the host: " + "; ".join(writes[:10]))

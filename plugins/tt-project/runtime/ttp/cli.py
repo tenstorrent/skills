@@ -6274,7 +6274,7 @@ def _run_check(argv: list, group: bool, record=None, timeout: float | None = Non
     try:
         if _CHECK_STOP["stopped"]:   # stopped checks start no further command
             raise SystemExit(_CHECK_STOP["stopped"])
-        guard = hoststate.Guard(kw.get("env"))   # the real crontab and units, compared after the check
+        guard = hoststate.Guard(kw.get("env"), argv=argv)   # the real crontab and units, compared after a local check
         proc = _check_popen(argv, start_new_session=group, **kw)
         if group and record is not None:
             record.group(proc.pid)
