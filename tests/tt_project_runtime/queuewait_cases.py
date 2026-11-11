@@ -794,14 +794,17 @@ def test_queue_wait_answer_never_covers_an_urgent_or_owed_wait(env):
 
 
 def test_queue_wait_answered_key_stays_settled_across_a_new_episode(env):
-    """#7961 (a key answered with a task_update and raised again 7 min later): the same task's wait restarting
-    under another start time is a new episode, still covered by the answer while the cause holds; turned
-    urgent, it raises."""
+    """#7961 (a key answered with a task_update and raised again 7 min later): the same task's wait coming back
+    after its episode ended (GRACE_S with no sign of it) is a new episode, still covered by the answer while the
+    cause holds; turned urgent, it raises."""
     from ttp import queuewait
     p = make(env)
     now = time.time()
     a, b, host_of = _qw_answered(p, now)
-    assert queuewait.scan(p, QW_CFG, now + 420, host_of([a], at=now - 40 * 60 + 47)) == []
+    gap = now + queuewait.GRACE_S + 60   # b keeps the queue held while a's wait is gone: a's episode ends
+    assert queuewait.scan(p, QW_CFG, gap, host_of([b], at=now - 40 * 60)) == []
+    assert not any(r["task"] == a for r in p.db.kv(queuewait.KV)["open"].values())
+    both = host_of([a, b], at=now - 40 * 60 + 47)
+    assert queuewait.scan(p, QW_CFG, gap + 60, both) == []
     p.db.update_task(a, priority=1)
-    assert [fp.split(":")[1] for fp in queuewait.scan(p, QW_CFG, now + 480, host_of([a], at=now - 40 * 60 + 47))] \
-        == [str(a)]
+    assert [fp.split(":")[1] for fp in queuewait.scan(p, QW_CFG, gap + 120, both)] == [str(a)]
