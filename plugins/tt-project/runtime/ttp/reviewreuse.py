@@ -8,17 +8,27 @@ or an earlier review that failed or asked for changes still get a review. A revi
 a review-only verdict never pushed it, so reusing it would drop the delivery. A review that also
 covers a head the accepted one does not contain (a rebase review naming the old head beside the
 rebased branch) reuses it only when that head's commits past the base carry the same patches
-(rebased_away)."""
+(rebased_away).
+
+The key binds a verdict to its target, never to a head alone (review_key): a review whose spec also
+names commits this repository does not hold (another repository's head) or a detached review packet
+(a path beside its sha256) records a key scoped by them, so a review of another repository's head or
+of another packet neither blocks nor reuses one of this head, and only an exact repeat reuses it."""
 from __future__ import annotations
 
 import hashlib
 import json
 import re
 
-HEAD_LABEL = "review_head:"     # review_head:<40-hex sha>@<check set key>
+HEAD_LABEL = "review_head:"     # review_head:<40-hex sha>@<check set key>[+<target scope>]
 FORCED_LABEL = "review_forced"  # a review task_add forced past an accepted one: it runs
 SUMMARY_CHARS = 600
-_LABEL = re.compile(r"review_head:([0-9a-f]{40})@([0-9a-f]+)")
+_LABEL = re.compile(r"review_head:([0-9a-f]{40})@([0-9a-f]+(?:\+[0-9a-f]+)?)")
+# A commit id a spec quotes: a full one, or a short one named as a head, commit or sha.
+_FOREIGN = re.compile(r"(?<![0-9a-f])([0-9a-f]{40})(?![0-9a-f])|\b(?:head|commit|sha|at)\s+([0-9a-f]{7,39})(?![0-9a-f])",
+                      re.I)
+_PACKET = re.compile(r"(?<![0-9a-f])[0-9a-f]{64}(?![0-9a-f])")       # a packet's sha256
+_PATH = re.compile(r"[\w.~-]*(?:/[\w.~-]+)+|[\w~-]+\.[A-Za-z0-9]{1,8}\b")
 
 
 def check_key(cfg: dict) -> str:
@@ -27,6 +37,46 @@ def check_key(cfg: dict) -> str:
     from .push import checks_config
     checks = checks_config(cfg.get("delivery") or {})
     return hashlib.sha1(json.dumps(checks, sort_keys=True, default=str).encode()).hexdigest()[:12]
+
+
+def target(p, review: dict) -> tuple[list[str], list[list[str]]]:
+    """What a review's spec names beside this repository's head: the commit ids it quotes (in full, or
+    short after head, commit, sha or at) that name no commit here, i.e. another repository's heads, and
+    the detached packets it names, each [the path last named before its sha256 on that line, or "",
+    sha256]."""
+    from . import worktree
+    spec = str(review.get("spec") or "")
+    quoted = sorted({h.lower() for m in _FOREIGN.finditer(spec)
+                     if re.search(r"[a-fA-F]", h := m.group(1) or m.group(2))})
+    here = worktree._commit_ids(p, quoted) if p is not None and quoted else {}
+    packets = set()
+    for line in spec.splitlines():
+        for m in _PACKET.finditer(line):
+            paths = _PATH.findall(line[:m.start()])
+            packets.add((paths[-1] if paths else "", m.group(0)))
+    return [h for h in quoted if h not in here], [list(x) for x in sorted(packets)]
+
+
+def uncovered(p, review: dict, sha: str) -> list[str]:
+    """The commits of this repository that `review`'s spec names (in full, or short after head, commit,
+    sha or at) and head `sha` does not contain: a spec that targets a newer or another commit than the
+    head its labels lead to. Its verdict on `sha` is neither reused nor shown as verifying `sha`."""
+    from . import worktree
+    spec = str(review.get("spec") or "")
+    quoted = sorted({h.lower() for m in _FOREIGN.finditer(spec)
+                     if re.search(r"[a-fA-F]", h := m.group(1) or m.group(2))})
+    here = worktree._commit_ids(p, quoted) if p is not None and quoted and sha else {}
+    return [full for full in dict.fromkeys(here.values()) if not worktree.is_ancestor(p, full, sha)]
+
+
+def review_key(p, cfg: dict, review: dict) -> str:
+    """The key a review's verdict is bound to: the check set key (check_key), scoped by its target's
+    other repository heads and packets (target) when it names any."""
+    foreign, packets = target(p, review)
+    key = check_key(cfg)
+    if not (foreign or packets):
+        return key
+    return key + "+" + hashlib.sha1(json.dumps([foreign, packets]).encode()).hexdigest()[:12]
 
 
 def head_label(sha: str, key: str) -> str:

@@ -693,3 +693,150 @@ def test_landed_from_reads_the_whole_reflog_in_a_fixed_number_of_git_calls(env, 
     assert len(calls) <= 4 and not [c for c in calls if "--is-ancestor" in c], calls
     assert worktree.landed_from(p.root, branch, "0" * 40) == _git_out(path, "rev-parse", "HEAD"), \
         "a head that names no commit is on no entry: the newest"
+
+
+_OTHER_HEAD = "0123456789abcdef0123456789abcdef01234567"   # a commit no test repository holds
+_SUM_A, _SUM_B = "a" * 63 + "1", "b" * 63 + "2"
+
+
+def test_a_review_key_is_scoped_by_other_repo_heads_and_packets_only(env):
+    from ttp import reviewreuse
+    p = make(env)
+    tid, path, branch = _code_task(p, "make it")
+    head = _commit_files(path, {"a.py": "a\n"}, "change")
+    key = reviewreuse.check_key(p.config())
+
+    def k(spec):
+        return reviewreuse.review_key(p, p.config(), {"spec": spec})
+    assert k(f"Review {branch} at {head}. Note: [note 5f9d96bf17a446ea], run 12345678901.") == key, \
+        "this repository's head, a note's fingerprint and a number leave the plain key"
+    other = k(f"Review repo other/b, branch x, head {_OTHER_HEAD}.")
+    short = k(f"Review the fix, commit {_OTHER_HEAD[8:17]} in another clone.")
+    a, b = (k(f"Review the packet reviews/p.md sha256 {s}.") for s in (_SUM_A, _SUM_B))
+    moved = k(f"Review the packet reviews/q.md sha256 {_SUM_A}.")
+    assert len({key, other, short, a, b, moved}) == 6 and all(x.startswith(key + "+") for x in (other, a, b))
+    assert k(f"Review the packet reviews/p.md sha256 {_SUM_A}.") == a, "an exact repeat keeps its key"
+    assert reviewreuse.target(p, {"spec": f"reviews/p.md sha256 {_SUM_A}"}) == ([], [["reviews/p.md", _SUM_A]])
+    lb = reviewreuse.head_label(head, a)
+    assert reviewreuse.recorded({"labels": json.dumps([lb])}) == (head, a)
+
+
+def test_another_repos_head_or_packet_neither_blocks_nor_reuses_a_verdict_but_an_exact_repeat_does(env, monkeypatch):
+    from ttp import reviewreuse, verified
+    p = make(env)
+    tid, path, branch = _code_task(p, "make it")
+    _commit_file(path, "a")
+    head = _git_out(path, "rev-parse", "HEAD")
+    d, started = _reuse_daemon(p, monkeypatch)
+    ok = json.dumps({"status": "done", "summary": "ok"})
+    other_spec = f"Review repo other/b, branch x, head {_OTHER_HEAD}; this branch {branch} holds its evidence."
+    packet_spec = f"Review the detached packet reviews/p.md sha256 {_SUM_A}."
+    # Repository B's head is reviewed first: the head here it names as evidence is not accepted by it.
+    other = _quoting_review(p, other_spec, (tid,))
+    d.dispatch()
+    assert started == [other] and reviewreuse.recorded(p.db.task(other))[1] != reviewreuse.check_key(d.cfg)
+    p.db.update_task(other, status="done", result=ok)
+    d._mark_verified(p.db.task(other), None, {})
+    assert verified.own(p.db, tid, "review") is None, "another repository's verdict marks no head here"
+    assert d._auto_review(p.db.task(tid), "made it", add=False) is None, "nor satisfies this head's review"
+    plain = _reuse_review(p, tid)
+    d.dispatch()
+    assert started == [other, plain], "repo B's verdict does not satisfy a review of this head"
+    p.db.update_task(plain, status="done", result=ok)
+    # A packet with another sha256 is neither blocked nor satisfied; the same packet is.
+    first = _quoting_review(p, packet_spec, (tid,))
+    d.dispatch()
+    assert started[-1] == first, "this head's plain verdict does not cover a packet"
+    p.db.update_task(first, status="done", result=ok)
+    changed = _quoting_review(p, packet_spec.replace(_SUM_A, _SUM_B), (tid,))
+    d.dispatch()
+    assert started[-1] == changed and p.db.task(changed)["status"] != "done"
+    for spec, prior in ((packet_spec, first), (other_spec, other), ("Review the change.", plain)):
+        again = _quoting_review(p, spec, (tid,))
+        d.dispatch()
+        res = json.loads(p.db.task(again)["result"] or "{}")
+        assert again not in started and res.get("reused_review") == prior, "an exact repeat reuses its verdict"
+        assert res["reviewed_head"] == head
+
+
+def test_task_add_refuses_only_a_review_of_the_exact_accepted_target(env, monkeypatch):
+    from ttp import coordinator as coord
+    p = make(env)
+    tid, path, branch = _code_task(p, "make it")
+    _commit_file(path, "a")
+    d, started = _reuse_daemon(p, monkeypatch)
+    first = _quoting_review(p, f"Review the detached packet reviews/p.md sha256 {_SUM_A}.", (tid,))
+    d.dispatch()
+    p.db.update_task(first, status="done", result=json.dumps({"status": "done", "summary": "ok"}))
+    add = {"type": "task_add", "kind": "review", "depends_on": [tid]}
+    for n, spec in enumerate((f"Review the detached packet reviews/p.md sha256 {_SUM_B}.",
+                              f"Review repo other/b, branch x, head {_OTHER_HEAD}.", "Review the change.")):
+        assert coord.apply(p, [dict(add, title=f"Review target {n}", spec=spec)]) == [], spec
+    problems = coord.apply(p, [dict(add, title="Review the packet once more",
+                                    spec=f"Review the detached packet reviews/p.md sha256 {_SUM_A}.")])
+    assert len(problems) == 1 and f"review #{first}" in problems[0], problems
+
+
+def test_task_add_is_not_refused_by_a_failed_review_of_another_target(env, monkeypatch):
+    from ttp import coordinator as coord
+    p = make(env)
+    tid, path, branch = _code_task(p, "make it")
+    _commit_file(path, "a")
+    d, started = _reuse_daemon(p, monkeypatch)
+    plain = _reuse_review(p, tid)
+    d.dispatch()
+    assert started == [plain]
+    p.db.update_task(plain, status="failed", result=json.dumps(
+        {"status": "changes_needed", "summary": "fix x", "followups": [{"title": "fix x", "spec": "fix x"}]}))
+    add = {"type": "task_add", "kind": "review", "depends_on": [tid]}
+    for n, spec in enumerate((f"Review the detached packet reviews/p.md sha256 {_SUM_B}.",
+                              f"Review repo other/b, branch x, head {_OTHER_HEAD}.")):
+        assert coord.apply(p, [dict(add, title=f"Review target {n}", spec=spec)]) == [], spec
+    problems = coord.apply(p, [dict(add, title="Review the change once more", spec="Review the change.")])
+    assert len(problems) == 1 and f"review #{plain}" in problems[0], problems
+
+
+def test_a_spec_naming_a_commit_its_head_lacks_neither_reuses_nor_marks_that_head_verified(env, monkeypatch):
+    from ttp import reviewreuse, verified
+    p = make(env)
+    tid, path, branch = _code_task(p, "make it")
+    _commit_file(path, "a")
+    head = _git_out(path, "rev-parse", "HEAD")
+    _, other, _ = _code_task(p, "the repair")
+    _commit_file(other, "fix")
+    repair = _git_out(other, "rev-parse", "HEAD")
+    d, started = _reuse_daemon(p, monkeypatch)
+    ok = json.dumps({"status": "done", "summary": "ok"})
+    first = _reuse_review(p, tid)
+    d.dispatch()
+    p.db.update_task(first, status="done", result=ok)
+    # The labels still lead to the accepted head, but the spec targets the repair commit it lacks.
+    lb = reviewreuse.head_label(head, reviewreuse.check_key(d.cfg))
+    target = _quoting_review(p, f"Review the repair at commit {repair} (fix_base {head[:12]}).", (tid,))
+    p.db.update_task(target, labels=json.dumps([lb]))
+    assert reviewreuse.uncovered(p, p.db.task(target), head) == [repair]
+    d.dispatch()
+    assert started[-1] == target and p.db.task(target)["status"] != "done", "no verdict reused for another commit"
+    p.db.update_task(target, status="done", result=ok)
+    d._mark_verified(p.db.task(target), None, {})
+    assert verified.own(p.db, tid, "review") is None, "nor is the head it never covered shown as verified"
+    # A spec naming the accepted head itself, or an ancestor of it, still reuses the verdict.
+    again = _quoting_review(p, f"Review {branch} at {head}.", (tid,))
+    d.dispatch()
+    assert again not in started and json.loads(p.db.task(again)["result"])["reused_review"] == first
+
+
+def test_a_detached_repair_published_elsewhere_is_admitted_for_re_review(env, monkeypatch):
+    from ttp.daemon import FIX_BASE_LABEL
+    p = make(env)
+    tid, path, branch = _code_task(p, "fix review #1: make it")
+    _commit_file(path, "a")
+    base = _git_out(path, "rev-parse", "HEAD")
+    p.db.update_task(tid, labels=json.dumps(["review_fix:1"]))
+    rr = _quoting_review(p, "Re-review the fix.", (tid,))
+    p.db.update_task(rr, status="queued", labels=json.dumps([f"{FIX_BASE_LABEL}{base}"]))
+    d, _ = _reuse_daemon(p, monkeypatch)
+    assert [r["id"] for r in d._fix_without_commits(p.db.task(tid))] == [rr], "no new commit here: blocked"
+    published = {"status": "done", "published": {"repo": "other/b", "branch": "x", "head": _OTHER_HEAD}}
+    assert d._fix_without_commits(dict(p.db.task(tid), result=json.dumps(published))) == [], \
+        "a repair published in another repository is new to review"

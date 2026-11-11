@@ -2642,6 +2642,27 @@ def test_dispatch_never_holds_owners_of_different_obligations_as_duplicates(env)
     assert "duplicates #" in supersede.dispatch_hold(p.db, p.db.task(d))
 
 
+def test_dispatch_holds_an_open_review_only_of_the_same_subject_and_target(env):
+    """Two open reviews of one code task are duplicates only while their specs name the same other-repository
+    heads and packets (path + sha256); a done one's exact repeat is left to verdict reuse at start."""
+    from ttp import supersede
+    p = make(env)
+    code = p.db.add_task("land the gate", "s", kind="code", status="done")
+    sums = ("ab" * 32, "cd" * 32)
+
+    def review(spec):
+        supersede._clear.clear()
+        return p.db.add_task(f"Review #{code}: land the gate", spec, kind="review", labels=[f"auto_review:{code}"])
+    first = review(f"Review the packet reviews/p.md sha256 {sums[0]}.")
+    assert supersede.dispatch_hold(p.db, p.db.task(review(f"Review the packet reviews/p.md sha256 {sums[1]}."))) == ""
+    assert supersede.dispatch_hold(p.db, p.db.task(review("Review repo other/b, head " + "e" * 40 + "."))) == ""
+    same = review(f"Review the packet reviews/p.md sha256 {sums[0]} again.")
+    assert f"duplicates #{first}" in supersede.dispatch_hold(p.db, p.db.task(same))
+    p.db.update_task(first, status="done")
+    p.db.update_task(same, status="cancelled")
+    assert supersede.dispatch_hold(p.db, p.db.task(review(f"Review reviews/p.md sha256 {sums[0]}."))) == ""
+
+
 def test_dispatch_holds_a_task_whose_step_a_newer_user_order_superseded(env):
     """An obligation's `supersedes` steps are kept with the order: a queued task created before it whose spec
     still carries such a step is held at dispatch; one re-specified after the order, or created after it, runs."""

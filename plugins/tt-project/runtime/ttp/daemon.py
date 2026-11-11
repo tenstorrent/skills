@@ -19106,9 +19106,10 @@ class Daemon:
             # checks) passed it: a second review of the same head is a wasted run.
             tip = published["sha"] if published else ext["head"] if ext else (worktree._git(
                 self.p.root, "rev-parse", "--verify", "--quiet", f"{branch}^{{commit}}", check=False) if branch else "")
+            # An external head is another repository's: no verdict here names it (_reviewed_external does).
             passed = db.one("SELECT q.task FROM push_queue q JOIN tasks t ON t.id=q.task WHERE q.head=? AND "
                             "t.kind='review' AND q.status!='cancelled' ORDER BY q.id DESC LIMIT 1",
-                            (tip,)) if tip else None
+                            (tip,)) if tip and not ext else None
             if passed:
                 return passed["task"], False
             if add and (gone := self._cancelled_review(task, tip)):
@@ -19117,7 +19118,7 @@ class Daemon:
             # Or one accepted it without the push queue (review only, an own push): its verdict stands.
             # A review that would push takes only a delivered head's verdict (reviewreuse.pushes).
             prior = reviewreuse.accepted(db, tip, reviewreuse.check_key(cfg),
-                                         p=self.p if reviewreuse.pushes(cfg) else None) if tip else None
+                                         p=self.p if reviewreuse.pushes(cfg) else None) if tip and not ext else None
             if prior:
                 return prior["id"], False
             if not add:
@@ -19416,8 +19417,11 @@ class Daemon:
         try:
             if task["kind"] == "review":
                 heads = [e["head"] for e in (approval or {}).get("entries") or [] if e.get("head")]
-                head = heads[0] if heads else worktree.reviewed_head(self.p, task)
-                if not head:
+                # A review of another repository's head or a detached packet (reviewreuse.target) accepted
+                # no head here, nor did one whose spec names a commit its head lacks (reviewreuse.uncovered).
+                head = heads[0] if heads else None if any(reviewreuse.target(self.p, task)) \
+                    else worktree.reviewed_head(self.p, task)
+                if not head or not heads and reviewreuse.uncovered(self.p, task, head):
                     return
                 for t in push._reviewed(self.p, str(task["id"])):
                     verified.record(self.p.db, t["id"], "review", head, review=task["id"])
@@ -19480,10 +19484,14 @@ class Daemon:
             return False
         if not sha:
             return False
-        key = reviewreuse.check_key(self.cfg)
+        key = reviewreuse.review_key(self.p, self.cfg, task)   # bound to its target: other repos' heads, packets
         labels = json.loads(task["labels"] or "[]")
         prior = None if reviewreuse.FORCED_LABEL in labels else reviewreuse.accepted(
             db, sha, key, skip=task["id"], p=self.p if reviewreuse.pushes(self.cfg, labels) else None)
+        if prior and (miss := reviewreuse.uncovered(self.p, task, sha)):
+            log(self.p, f"review {task['id']}: not reusing review #{prior['id']}'s verdict on {sha[:12]}: its spec "
+                        f"names {', '.join(h[:12] for h in miss)}, which {sha[:12]} does not contain")
+            prior = None
         if prior and (why := reviewreuse.rebased_away(self.p, task, sha)):
             log(self.p, f"review {task['id']}: not reusing review #{prior['id']}'s verdict on {sha[:12]}: {why}")
             prior = None
@@ -20412,6 +20420,8 @@ class Daemon:
         that head as `base`. Empty when it added commits or that cannot be read."""
         if '"review_fix:' not in (task.get("labels") or "") or not task.get("branch"):
             return []
+        if self._external_change(task):
+            return []   # a detached repair: it published a new head in another repository, which is new to review
         out = []
         for r in self.p.db.q("SELECT * FROM tasks WHERE kind='review' AND status='queued' AND labels LIKE ?",
                              (f'%"{FIX_BASE_LABEL}%',)):

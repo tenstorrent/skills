@@ -56,6 +56,14 @@ def _lineage(db, task: dict) -> set[int]:
     return out
 
 
+def _target(review: dict) -> tuple:
+    """What a review checks beside its subject's head: the commit ids and detached packets its spec quotes
+    (reviewreuse.target). Reviews of different targets (another repository's head, a packet with another
+    sha256) are never duplicates."""
+    from . import reviewreuse
+    return reviewreuse.target(None, review)
+
+
 def duplicate_of(db, task: dict) -> dict | None:
     """An earlier open task, or one done in the last DUP_DONE_DAYS, that `task` repeats."""
     from .coordinator import looks_same
@@ -75,10 +83,9 @@ def duplicate_of(db, task: dict) -> dict | None:
             continue
         if (owes := set(_OWES.findall(spec))) and owes != set(_OWES.findall(o["spec"] or "")):
             continue   # it owes another deliverable
-        if task["kind"] == "review":   # same subject, and a done one only while its subject is unchanged since
-            subj = review_subject(task)
-            if subj != review_subject(o) or o["status"] == "done" and float(
-                    (db.task(subj) or {}).get("updated") or 0) > float(o["updated"] or 0):
+        if task["kind"] == "review":   # an open review of the same subject and target; a done one's exact
+            # repeat is closed with its verdict at start (daemon._reuse_review), any other target runs
+            if o["status"] == "done" or review_subject(task) != review_subject(o) or _target(task) != _target(o):
                 continue
         return o
     return None

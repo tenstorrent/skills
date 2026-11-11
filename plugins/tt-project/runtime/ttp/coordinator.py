@@ -2896,6 +2896,9 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     notes.append(f"task_add {title[:80]!r}: forced past {tried.describe(hit, p)}")
                 if not a.get("force"):
                     same = similar_task(db, title, a.get("spec") or "", skip=skip)
+                    if same and a.get("kind") == "review" and same["kind"] == "review" \
+                            and _review_target(p, a) != _review_target(p, same):
+                        same = None   # another head, repository or packet: not the same review
                     if same:
                         raise (ValueError if same["status"] in TERMINAL_TASK_STATES else InfoRejection)(
                             f"near duplicate of task #{same['id']} ({same['status']}) "
@@ -2971,18 +2974,22 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     a = dict(a, spec=f"{(a.get('spec') or '').rstrip()}\n{quoted}")
                 autos = _auto_reviews(db, covered)
                 under_way = {n: r for n, r in autos.items() if r["status"] != "queued" or r["attempts"]}
-                if covered and set(under_way) == covered:
+                if covered and set(under_way) == covered and all(
+                        _review_target(p, a, deps) == _review_target(p, r) for r in under_way.values()):
                     ids = ", ".join(f"#{r['id']}" for r in under_way.values())
                     raise ValueError(f"duplicate of review {ids} the daemon queued, already under way; send it a "
                                      f"`spec` with task_update to add checks")
                 # A head a review already accepted, or failed with a finding, under the same checks keeps
                 # that verdict (reviewreuse): another review of it runs only when forced with a reason.
                 head = _reviewed_head(p, deps, a.get("spec") or "") if review else None
-                prior = reviewreuse.accepted(db, head, reviewreuse.check_key(cfg),
-                                             p=p if reviewreuse.pushes(cfg, labels) else None) if head else None
+                key = reviewreuse.review_key(p, cfg, _draft_review(deps, a.get("spec") or "")) if head else ""
+                prior = reviewreuse.accepted(db, head, key, p=p if reviewreuse.pushes(cfg, labels) else None) \
+                    if head else None
+                if prior and reviewreuse.uncovered(p, _draft_review(deps, a.get("spec") or ""), head):
+                    prior = None   # its spec names a commit that head lacks: not the head it targets
                 if prior and _rebased_away(p, deps, a.get("spec") or "", head):
                     prior = None   # it also covers a head whose patches differ: it gets its own review
-                prior = prior or (reviewreuse.judged(db, head, reviewreuse.check_key(cfg)) if head else None)
+                prior = prior or (reviewreuse.judged(db, head, key) if head else None)
                 if prior and not (a.get("force") and str(a.get("reason") or "").strip()):
                     raise ValueError(f"task_add rejected: {reviewreuse.rejection(prior, head)}")
                 if prior:
@@ -4839,6 +4846,21 @@ def _quote_heads(p, db, covered: set[int], spec: str) -> str:
 
 def _draft_review(deps: list, spec: str) -> dict:
     return {"id": None, "spec": spec, "depends_on": json.dumps([d for d in deps if isinstance(d, int)])}
+
+
+def _review_target(p, review: dict, deps: list | None = None) -> tuple:
+    """What a review checks: (its head here, the other repositories' heads and packets its spec names
+    (reviewreuse.target)). Two reviews with different targets are never duplicates of each other."""
+    if deps is None:
+        deps = review.get("depends_on") or []
+        deps = json.loads(deps) if isinstance(deps, str) else list(deps)
+    rec = reviewreuse.recorded(review) if review.get("labels") else None
+    head = rec[0] if rec else _reviewed_head(p, deps, review.get("spec") or "")
+    try:
+        foreign, packets = reviewreuse.target(p, review)
+    except Exception:
+        foreign, packets = [], []
+    return head, foreign, packets
 
 
 def _reviewed_head(p, deps: list, spec: str) -> str | None:
