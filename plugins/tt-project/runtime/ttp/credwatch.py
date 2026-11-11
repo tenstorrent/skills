@@ -232,13 +232,25 @@ def _commands(cmd: str, depth: int = 0) -> list[tuple[list[str], list[str]]]:
     """(words, output redirect targets) of each simple command the shell command `cmd` runs, without its
     leading assignments and wrappers (sudo, env, nohup ...), and of the strings it hands to sh -c or eval.
     Quoted arguments, comments and heredoc bodies no shell reads are words of their command or nothing
-    (hook._split), never commands: a writer named in a grep pattern, a commit message or pytest -k is none."""
+    (hook._split), never commands: a writer named in a grep pattern, a commit message or pytest -k is none.
+    A quote spanning lines stays one word; a comment ends at its line, and a '#' inside a word is no comment."""
     from . import hook
-    run = hook._split(cmd)[0]
+    run = hook._split(cmd, strip=False)[0]
+    flags = hook._quoting(run)
+    kept, comment = [], False
+    for i, c in enumerate(run):   # drop '#' comments (a '#' starting an unquoted word) up to their newline
+        if c == "\n" and not flags[i][0]:
+            comment = False
+        elif c == "#" and flags[i][0] and (i == 0 or (not flags[i - 1][0] and run[i - 1] in " \t\n;&|(")):
+            comment = True
+        if not comment:
+            kept.append(c)
+    run = "".join(kept)
     run = "".join(";" if c == "\n" and not inert else c for c, (inert, _) in zip(run, hook._quoting(run)))
     try:
         lex = shlex.shlex(run, posix=True, punctuation_chars=";&|()<>")
         lex.whitespace_split = True
+        lex.commenters = ""
         words = list(lex)
     except ValueError:
         words = run.split()

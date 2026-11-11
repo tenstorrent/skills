@@ -529,10 +529,11 @@ def _heredocs(text: str) -> tuple[list[str], list[tuple[int, list[str], int]]]:
     return lines, bodies
 
 
-def _split(text: str) -> tuple[str, str]:
+def _split(text: str, strip: bool = True) -> tuple[str, str]:
     """(what runs as shell commands, what to scan) for a command line or a script. Heredoc bodies
     are commands only when a shell reads them; bodies an echo/cat only writes to a file are
-    dropped from both, and so are the quoted arguments of echo, printf and cat: data, not run."""
+    dropped from both, and so are the quoted arguments of echo, printf and cat: data, not run.
+    With `strip` False those arguments stay in what runs, so a quote spanning lines stays whole."""
     lines, bodies = _heredocs(text)
     commands = "\n".join(lines)
     scan = list(lines)
@@ -546,7 +547,7 @@ def _split(text: str) -> tuple[str, str]:
                                for j, c in enumerate(piece))
                 stripped = stripped[:s] + kept + stripped[e:]
         scan[i] = stripped
-    run = list(scan)
+    run = list(scan if strip else lines)
     for i, body, pos in bodies:
         piece, sep = _piece_at(lines[i], pos)
         if _first_word(piece) in SHELLS:

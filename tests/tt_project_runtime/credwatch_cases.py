@@ -488,7 +488,8 @@ def test_credwatch_tool_output_text_and_reads_of_a_store_fail_no_run_and_issued_
 def test_credwatch_writer_counts_only_at_command_position_never_inside_an_argument(env, monkeypatch):
     """A writer phrase (gh auth refresh, ssh-keygen -t rsa, git credential approve) inside a grep pattern, a commit
     message, a heredoc only cat reads or a pytest -k argument is no command: `outside`. The same phrase run as a
-    command, bare, behind sudo, env, cd ... &&, bash -c or a heredoc fed to a shell, fails the run."""
+    command, bare, behind sudo, env, cd ... &&, bash -c, a heredoc fed to a shell, or after a comment or a quote
+    spanning lines, fails the run."""
     from ttp import credwatch
     home = env["tmp"] / "acct"
     monkeypatch.setenv("HOME", str(home))
@@ -507,15 +508,19 @@ def test_credwatch_writer_counts_only_at_command_position_never_inside_an_argume
              "cat > /tmp/x/notes.md <<'EOF'\n" + phrase.replace("; ", "\n") + "\nEOF",
              "python3 -m pytest -q tests/ -k 'ssh-keygen or gh auth refresh or credential approve'",
              "python3 - <<'EOF'\nimport subprocess\nsubprocess.run('gh auth refresh', shell=True)\nEOF",
-             f'git commit -m "a; rm {key}; echo > {gh}"', f"grep -n '> {gh}' notes.md"]
+             f'git commit -m "a; rm {key}; echo > {gh}"', f"grep -n '> {gh}' notes.md",
+             'printf "a\ngh auth refresh\n"\nls', "echo 'a # b'; echo \"x\n# y\ngh auth refresh\""]
     kept = ["git config --get credential.helper", "ssh-keygen -t ed25519 -N '' -f \"$(mktemp -d)/k\""]   # stay quiet
     hit = [(cmd, path) for cmd in quiet + kept for path in (gh, key, netrc)
            if not verdict(cmd, path).startswith("outside") or credwatch.transcript_hit(run_dir, path, str(home))]
     assert not hit, hit
     writes = {gh: ["gh auth refresh", "sudo gh auth refresh -s read:org", "env A=1 gh auth login --with-token < t",
                    "bash -c 'gh auth refresh'", "bash <<EOF\ngh auth login\nEOF", f"echo x > {gh}",
-                   "cd /tmp && gh auth switch"],
-              key: ["ssh-keygen -t rsa", "cd /tmp/x && ssh-keygen -t rsa -N ''", "sudo -u me ssh-keygen -t ed25519"],
+                   "cd /tmp && gh auth switch", "cd repo # go there\ngh auth refresh",
+                   "curl http://x/a#b; gh auth refresh"],
+              key: ["ssh-keygen -t rsa", "cd /tmp/x && ssh-keygen -t rsa -N ''", "sudo -u me ssh-keygen -t ed25519",
+                    "# install\nssh-keygen -t rsa", "set -e # strict\ncd /x\nssh-keygen -t rsa",
+                    'printf "a\nb\n"\nssh-keygen -t rsa'],
               netrc: ["git -C repo credential approve < c", "git config --global credential.helper store",
                       "printf 'url=x\\n' | git credential-store store"]}
     for path, cmds in writes.items():
