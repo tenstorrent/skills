@@ -195,11 +195,11 @@ def test_coordsession_a_last_call_over_the_limit_compacts_in_place(tmp_path):
     # did not fire) records none: no restore, the compaction point stays.
     small = Claude().parse(_cs_stream(tmp_path / "n.jsonl", [(131000, 300)]))
     for noted in (False, None, 0):
-        quiet = cs.record(st, small, "s1", {**turn, "mode": "resume", "why": "compact"}, True, 33.0, None, noted)
+        quiet = cs.record(st, small, "s1", {**turn, "mode": "resume", "why": "compact"}, True, 33.0, noted=noted)
         assert not quiet.get("compactions") and "restore" not in quiet and "compact_floor" not in quiet
         assert cs.limit(_cs_cfg(), quiet, "m") == cs.limit(_cs_cfg(), st, "m")
     # Only a summary on a compact wake counts: a note on another wake is no compaction.
-    quiet = cs.record(st, small, "s1", {**turn, "mode": "resume", "why": "continued"}, True, 33.0, None, True)
+    quiet = cs.record(st, small, "s1", {**turn, "mode": "resume", "why": "continued"}, True, 33.0, noted=True)
     assert not quiet.get("compactions") and "restore" not in quiet
     st = cs.record(st, Claude().parse(_cs_stream(tmp_path / "h.jsonl", [(40000, 300)])), "s1",
                    {**turn, "mode": "resume", "why": "compact"}, True, 35.0, noted=True)
