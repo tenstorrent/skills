@@ -8603,6 +8603,7 @@ def cmd_model_bench(a) -> None:
         rt = str(Path(__file__).resolve().parent.parent)
         env = {**os.environ, "PYTHONPATH": os.pathsep.join(filter(None, [rt, os.environ.get("PYTHONPATH")]))}
         with open(log, "ab") as out:
+            # own session: the bench outlives the schedule's time limit; modelbench.LOCK keeps it to one per host and day
             child = subprocess.Popen([sys.executable, "-m", "ttp", "model-bench", "run", *(["--force"] if a.force else [])],
                                      cwd=p.root, env=env, stdin=subprocess.DEVNULL, stdout=out,
                                      stderr=subprocess.STDOUT, start_new_session=True)

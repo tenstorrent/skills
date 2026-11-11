@@ -488,7 +488,8 @@ def test_route_guard_keeps_protected_classes_on_core_whatever_asks(env, monkeypa
     for mod, fn, val, why in (("effort", "device_task", True, "device"), ("urgent", "is_urgent", True, "urgent")):
         with monkeypatch.context() as m:
             m.setattr(f"ttp.{mod}.{fn}", lambda t, v=val: v)
-            assert route.protected(p.db, d.cfg, plain, "light") == why and d._route(plain, "light", None, now) is None
+            got = d._route(plain, "light", None, now)   # None, or an urgent run's escalation to core
+            assert route.protected(p.db, d.cfg, plain, "light") == why and (got is None or got["fallback"] == route.ESCALATED)
     with monkeypatch.context() as m:
         m.setattr("ttp.tierfloor.target", lambda db, c, t: {"tier": "standard"})
         assert d._route(plain, "light", None, now) is None
@@ -496,4 +497,5 @@ def test_route_guard_keeps_protected_classes_on_core_whatever_asks(env, monkeypa
     with monkeypatch.context() as m:
         m.setattr("ttp.urgent.is_urgent", lambda t: True)
         d.jev = _ModelJev()
-        assert d._route(plain, "standard", None, now) is None
+        got = d._route(plain, "standard", None, now)
+        assert got is None or (got["fallback"] == route.ESCALATED and "model_pick" not in got)

@@ -12855,6 +12855,8 @@ class Daemon:
         name, model = to["to"], to["model"]
         why = route.protected(self.p.db, self.cfg, task, tier)
         if why:   # the guard: a protected class stays on core, whoever asked for the route
+            if (got_e := self._route_entry(task, tier, name, model, now, to["rule"], cls, core_only=True)):
+                return got_e   # it starts on core anyway (escalated, or a rerun after a fallback): the note says why
             if not peek:
                 log(self.p, f"task {task.get('id')}: route to {name}:{model} refused ({why} run stays on core); "
                             f"asked by {'model pick' if dp is not None else 'rule ' + str(to['rule'])}")
@@ -12880,7 +12882,9 @@ class Daemon:
             return None
 
     def _route_entry(self, task: dict, tier: str, name: str, model: str, now: float, rule_i: int | str | None = None,
-                     cls: str | None = None, pick: bool = False) -> dict:
+                     cls: str | None = None, pick: bool = False, core_only: bool = False) -> dict | None:
+        """The route entry; `core_only` returns it only when the run starts on core anyway (a rerun after
+        a fallback, or escalated), else None."""
         rule = {} if rule_i is None else {"rule": rule_i}   # the providers.chat.routes rule it matched
         after = route.fell_back_before(self.p.db, task["id"]) if task.get("id") else None
         if after:   # the task fell back on its own once: the rest of its runs stay on the core provider
@@ -12892,6 +12896,8 @@ class Daemon:
             esc = {}
         if esc:   # urgent, user-ordered, a fix of a routed change or a lineage's misses: the core provider
             return {"tier": tier, "to": name, "model": model, **rule, "fallback": route.ESCALATED, **esc}
+        if core_only:
+            return None
         why = "model_missing" if route.held(self.p.db, self.cfg, tier) == model else route.cooling(self.p.db, name, now)
         where, key = (f"tier {tier}", tier) if rule_i is None else (f"tier {tier} rule {rule_i}", f"{tier}:rule{rule_i}")
         if pick:   # a model pick routes one tier to several models (modelpick.py): one switch per model

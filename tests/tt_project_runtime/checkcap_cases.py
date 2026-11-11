@@ -10578,7 +10578,7 @@ def test_a_waiting_routine_checks_run_whose_task_turns_urgent_re_executes_once_a
     monkeypatch.setattr(os, "execv", execv)
     monkeypatch.setenv(checkcap.ARRIVED_ENV, "")
     told = []
-    cli._checks_reexec("1", 1234.5, 3, told.append, io.StringIO(), rerank=True)
+    cli._checks_reexec("1", 1234.5, 3, True, told.append, io.StringIO(), rerank=True)
     assert seen == {"rerank": "1", "reexec": "", "arrived": "1234.5"}, seen
     assert told[0].startswith("its task turned urgent (priority 1) while these checks waited at priority 3"), told
     assert checkcap.reranked(p, 3, now=9000.0) is None, "once per priority"
@@ -10608,7 +10608,7 @@ def test_a_waiting_checks_run_re_ranks_whenever_its_task_priority_changes_so_a_s
     monkeypatch.setattr(os, "execv", lambda *a: (_ for _ in ()).throw(OSError("no exec in a test")))
     monkeypatch.setenv(checkcap.ARRIVED_ENV, "")
     told = []
-    cli._checks_reexec("2", 1234.5, 1, told.append, io.StringIO(), rerank=True)
+    cli._checks_reexec("2", 1234.5, 1, True, told.append, io.StringIO(), rerank=True)
     assert told[0].startswith("its task changed priority (priority 2) while these checks waited at priority 1"), told
     assert "queueing again at their arrival" in told[0] and os.environ[checkcap.RERANK_ENV] == "2", told
     monkeypatch.setenv(checkcap.STARVE_ENV, "3600")

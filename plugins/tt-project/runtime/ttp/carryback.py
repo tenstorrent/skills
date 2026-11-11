@@ -11,13 +11,16 @@ on `landed:#<id>` with the reason. Carried commits pass with no send-back when:
 - the task declared that wait: `landed:#<id>` (or `ttp landed --task <id>`) in its start_when, spec
   or its last waiting hand-off (chaincap.waits_landing);
 - they are on the push branch already (pushq.carried leaves out landed and rebased copies);
-- that task's change is approved for the push queue (reviewhold.approved_row).
+- that task's change is approved for the push queue (reviewhold.approved_row);
+- the task re-works that task's own change (reworks): it continues it, or the failed review of it, or
+  delivers onto its branch (`pr_branch:`). Its commits are the change under re-work, not a stack.
 After the one send-back the review hold (reviewhold) handles what is still carried, as before."""
 from __future__ import annotations
 
 from . import reviewhold
 from .chaincap import waits_landing
-from .db import deferral
+from .db import continues_id, deferral, dependency_ids, review_subject
+from .worktree import carried_branch
 
 KEY = "carried_sendback"   # in the task's result: {"run", "tasks"} of its one send-back
 
@@ -30,11 +33,27 @@ def declared(task: dict, prev: dict, tid: int) -> bool:
                                                 prev.get("retry_when"), prev.get("waiting_for")))
 
 
+def reworks(db, task: dict, tid: int) -> bool:
+    """Whether `task` re-works task `tid`'s own change: down its `continues:` chain it reaches `tid` or
+    a review of it, or it delivers onto `tid`'s branch (`pr_branch:`)."""
+    other = db.task(tid)
+    if other and other.get("branch") and carried_branch(task) == other["branch"]:
+        return True
+    seen, t = set(), task
+    while t and t["id"] not in seen and len(seen) < 20:
+        seen.add(t["id"])
+        if t["id"] == tid or (t.get("kind") == "review"
+                              and tid in {review_subject(t), *(d for d in dependency_ids(t) if isinstance(d, int))}):
+            return True
+        t = db.task(c) if (c := continues_id(t)) else None
+    return False
+
+
 def pending(db, task: dict, carried: dict, prev: dict) -> dict[int, list[str]]:
     """The part of `carried` ({task id: [commit lines]}, pushq.carried) that sends `task` back."""
     return {tid: lines for tid, lines in sorted((carried or {}).items())
             if tid != task["id"] and lines and not declared(task, prev, tid)
-            and reviewhold.approved_row(db, tid) is None}
+            and reviewhold.approved_row(db, tid) is None and not reworks(db, task, tid)}
 
 
 def order(found: dict[int, list[str]], branch: str) -> str:

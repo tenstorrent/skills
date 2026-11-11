@@ -132,7 +132,23 @@ def test_an_open_upgrade_task_absorbs_a_newer_release(env, monkeypatch, capsys):
     assert f"Target release: tt-project {newest} (" in p.db.task(tids[0])["spec"]
 
 
-_PUSH_LAST = "from . import batch, cli, pushpass, verdictcarry  # noqa: E402\n"
+def _push_last() -> str:
+    """Upstream's import list at push.py's end: its last block before the marker line, read from the
+    shipped file so a release that changes the list does not break the tests below."""
+    from ttp import cli
+    text = (RUNTIME / "ttp" / "push.py").read_text()
+    body = text[:-len("\n" + cli.LOCAL_IMPORTS + "\n")]
+    return body[body.rindex("\n\n") + 2:]
+
+
+_PUSH_LAST = _push_last()
+
+
+def _push_last_changed() -> str:
+    """_PUSH_LAST as the next release ships it: its last import line imports one more module."""
+    *head, last = _PUSH_LAST.splitlines(True)
+    assert "  # noqa" in last, last
+    return "".join(head) + last.replace("  # noqa", ", timefmt  # noqa", 1)
 _PUSH_LOCAL = "\n# this project's own imports\nfrom . import release as _local_release  # noqa: E402\n"
 
 
@@ -157,7 +173,7 @@ def _push_py_upgrade(env, monkeypatch, marked):
     f.write_text(f.read_text() + _PUSH_LOCAL)
     _git_out(p.harness, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qam", "local import")
     _install_template(env)
-    lib.write_text(shipped.replace(_PUSH_LAST, _PUSH_LAST.replace("verdictcarry", "verdictcarry, timefmt")))
+    lib.write_text(shipped.replace(_PUSH_LAST, _push_last_changed()))
     _next_release(env)
     restarts.clear()
     return p, cli, restarts
@@ -175,7 +191,7 @@ def test_a_project_import_block_at_the_end_survives_upstream_changing_its_last_i
     cli.main(["upgrade", "demo", "--auto"])
     out = capsys.readouterr().out
     text = (p.harness / "runtime" / "ttp" / "push.py").read_text()
-    new = _PUSH_LAST.replace("verdictcarry", "verdictcarry, timefmt")
+    new = _push_last_changed()
     assert text.endswith(new + "\n" + cli.LOCAL_IMPORTS + "\n" + (_PUSH_LOCAL if marked else _PUSH_LOCAL.lstrip("\n"))), text[-400:]
     assert "<<<<<<<" not in text and text.count("from . import release as _local_release") == 1
     assert ("kept this project's own imports" in out) is not marked, out
