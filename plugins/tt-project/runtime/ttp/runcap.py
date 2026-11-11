@@ -2,9 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Per-task run cap at dispatch, beside chaincap's per-lineage caps: no task loops on its own.
 
-A task whose runs since its last explicit requeue (dispatchguard.REQUEUED: the coordinator, the user or a
-chain continue) reach `chains.max_task_runs` (4), or whose last `chains.max_idle_runs` (2) runs each
-spent money with no progress, is not started again. Daemon retries (a tier up after a failure, a lost or
+A task whose runs since its last explicit requeue (dispatchguard.EXPLICIT_SOURCES: the coordinator, the
+user or a chain continue; never the daemon's or push queue's own requeues) reach `chains.max_task_runs`
+(4), or whose last `chains.max_idle_runs` (2) runs each spent money with no progress, is not started again. Daemon retries (a tier up after a failure, a lost or
 stalled run, a waiting wake, a restart) all count; runs that never reached the model (FREE) do not.
 Progress is a hand-off of done or waiting, or a commit made inside the run (chaincap.code_commits).
 The task is blocked, and the coordinator gets one RUN_CAP_EVENT per requeue with a model-free summary:
@@ -18,7 +18,7 @@ from pathlib import Path
 
 from . import chaincap
 from .db import load_result
-from .dispatchguard import REQUEUED
+from .dispatchguard import EXPLICIT_SOURCES, REQUEUED
 
 RUN_CAP_EVENT = "run_cap"
 TRIGGER = "task at its run cap"
@@ -40,7 +40,9 @@ def limits(cfg: dict) -> tuple[int, int]:
 
 def runs(db, task_id: int) -> tuple[list[dict], int]:
     """The task's ended runs since its last explicit requeue, oldest first, and that requeue's event id (0)."""
-    last = db.one("SELECT id, ts FROM events WHERE task=? AND kind=? ORDER BY id DESC LIMIT 1", (task_id, REQUEUED))
+    last = db.one("SELECT id, ts FROM events WHERE task=? AND kind=? "
+                  f"AND source IN ({','.join('?' * len(EXPLICIT_SOURCES))}) ORDER BY id DESC LIMIT 1",
+                  (task_id, REQUEUED, *EXPLICIT_SOURCES))
     rows = db.q("SELECT * FROM runs WHERE task=? AND role!='coordinator' AND ended IS NOT NULL AND started>=? "
                 f"AND status NOT IN ({','.join('?' * len(FREE))}) ORDER BY id",
                 (task_id, float((last or {}).get("ts") or 0), *FREE))

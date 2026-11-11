@@ -2744,6 +2744,26 @@ def test_a_task_at_its_run_cap_is_blocked_and_the_coordinator_told_once(env, mon
     assert runcap.check(p, p.config(), p.db.task(tid)) == "", "0 turns the cap off"
 
 
+def test_the_daemons_and_push_queues_own_requeues_never_restart_the_run_count(env):
+    """Review #8098: only an explicit requeue (the coordinator, the user, a chain continue) restarts the
+    run count. The daemon's requeue of a lost run and the push queue's rework requeue write the same
+    event kind; a crash or rework loop that reset the count on them would never reach the cap."""
+    from ttp import dispatchguard, pushq, runcap
+    p = make(env)
+    tid = p.db.add_task("crash loop", "s", kind="work", tier="light", origin="user")
+    _ended_runs(p, tid, 4, cost=0.1, handoff={"status": "waiting"})
+    time.sleep(0.01)
+    p.db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+           (time.time(), "daemon", "task_requeued", "low", f"#{tid} was marked running with no live run",
+            "handled", tid))
+    pushq._event(p.db, p.db.task(tid), "task_requeued", f"#{tid}: its review runs again", queued=False)
+    assert "max_task_runs 4" in runcap.check(p, p.config(), p.db.task(tid)), "automatic requeues count on"
+    time.sleep(0.01)
+    dispatchguard.record_requeue(p.db, tid, "blocked", "coordinator")
+    p.db.update_task(tid, status="queued")
+    assert runcap.check(p, p.config(), p.db.task(tid)) == "", "the coordinator's requeue starts it again"
+
+
 def test_a_task_whose_last_runs_spent_money_with_no_progress_is_blocked(env):
     """Upstream user msg #2495 (2a): two runs in a row that each spent money and handed off neither done
     nor waiting (and, for code, committed nothing) stop the task under the run cap; a waiting hand-off is

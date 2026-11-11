@@ -23,6 +23,10 @@ import time
 from .db import load_result
 
 REQUEUED = "task_requeued"   # event kind of an explicit requeue: the done count starts again after it
+# Sources record_requeue writes for an explicit decision (the coordinator, `ttp task requeue` and the web
+# app, a chain continue). The daemon and the push queue write the same kind on their own automatic
+# requeues (sources "daemon", "task:<id>"): those are not a decision to start a count again.
+EXPLICIT_SOURCES = ("coordinator", "requeue", "continue")
 REFUSED = "dispatch_refused"
 CANCELLED = "task_cancelled"   # event kind of an explicit cancel: only an explicit requeue undoes it
 DONE_EVENT_SLACK_S = 60   # a run's end and its task_done event are written apart, within this
