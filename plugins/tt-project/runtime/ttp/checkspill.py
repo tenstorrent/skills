@@ -2305,9 +2305,9 @@ def quarantined(p, alias: str, now: float | None = None) -> str:
             f"`ttp checks --spill-back {alias}`, at the latest {timefmt.clock(now=float(off['until']))}")
 
 
-def lift(p, alias: str, now: float | None = None) -> bool:
-    """`ttp checks --spill-back <alias>`: end `alias`'s quarantine (one event, its ledger entry closed) and its
-    strikes. True when it was quarantined. Safe to run twice."""
+def lift(p, alias: str, now: float | None = None, severity: str = "normal") -> bool:
+    """`ttp checks --spill-back <alias>`: end `alias`'s quarantine (one event at `severity`, its ledger entry
+    closed) and its strikes. True when it was quarantined. Safe to run twice."""
     now = time.time() if now is None else now
     with p.db.tx():
         doc = _strikes(p.db)
@@ -2319,7 +2319,7 @@ def lift(p, alias: str, now: float | None = None) -> bool:
         h["n"] = 0
         p.db.set_kv(STRIKES_KV, doc)
         if off:
-            _event(p.db, now, f"spill-back:{alias}:{now:.0f}", "normal",
+            _event(p.db, now, f"spill-back:{alias}:{now:.0f}", severity,
                    f"Spill host {alias} is back in {p.name}'s spill pool (its quarantine ended).")
     if off and off.get("change"):
         from . import machine_ledger
