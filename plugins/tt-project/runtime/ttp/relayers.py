@@ -42,11 +42,9 @@ def read_lease(p, chat: str) -> dict:
 
 
 def write_lease(p, chat: str, lease: dict) -> None:
-    path = _lease_path(p, chat)
-    tmp = path.with_name(f"{path.name}.{os.getpid()}")
+    from .project import durable_write
     try:
-        tmp.write_text(json.dumps(lease))
-        os.replace(tmp, path)
+        durable_write(_lease_path(p, chat), json.dumps(lease), sync=False)   # a lost heartbeat only shortens it
     except OSError:
         pass
 
