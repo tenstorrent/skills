@@ -1189,13 +1189,25 @@ def _has_time(sentence: str) -> bool:
     return bool(IN_RE.search(sentence) or any(m.group("m") or m.group("ap") for m in CLOCK_RE.finditer(sentence)))
 
 
+def authored(text: str) -> str:
+    """`text` without the lines the harness appends to a coordinator message before it is posted (onhost's
+    'Status now:' queue forecasts, wakemode's mode line): what the coordinator itself wrote."""
+    from . import onhost, wakemode
+    text = text or ""
+    for head in (onhost.STATUS_HEAD, wakemode.HEAD):
+        cut = text.find("\n" + head)
+        text = text[:cut] if cut >= 0 else text
+    return text
+
+
 def commitments(text: str) -> list[str]:
     """The sentences of `text` that commit the sender to a deliverable or a time: first-person future with
     a delivery verb ("I'll report back") or a send verb and its object ("I'll post each result here"),
     "it goes up as the draft PR", first-person future with a time ("we'll have it by 15:00"), or
-    an ETA with a time. Never a question or an offer ("if you want, I'll ...")."""
+    an ETA with a time. Never a question or an offer ("if you want, I'll ..."), and never a line the
+    harness appended (authored): a runtime footer's ETA is no promise anyone made."""
     out = []
-    for s in _sentences(text):
+    for s in _sentences(authored(text)):
         if s.endswith("?") or OFFER_RE.search(s):
             continue
         timed = _has_time(s)

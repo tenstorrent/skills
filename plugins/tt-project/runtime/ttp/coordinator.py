@@ -424,6 +424,7 @@ USER_SETTABLE = {
     "budget.global_daily_usd": float, "budget.daily_target_usd": float, "budget.day_start": str, "budget.timezone": str,
     "budget.max_parallel_workers": int, "machine.worker_limit": str, "machine.max_workers": _max_workers, "machine.pace_from": _pace_from, "budget.urgent_extra_slots": int, "budget.urgent_preempt": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
     "coordinator.urgent_start_wait_min": int,
+    "coordinator.status_footer": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
     "budget.urgent_topup": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
     "budget.reset_credits_auto": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
     "budget.reset_credit_min_hours": float, "budget.reset_credit_expiry_hours": float,
@@ -2736,6 +2737,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     obligations.check_claims(a["claims"], p)
                 cites = turnrules.check_cites(db, a, chat)
                 said = workernotify.named(a["text"])   # the ids the coordinator named, before onhost's status line
+                authored = a["text"]   # promises come only from what the coordinator wrote, never the checks' footers
                 a["text"] = _onhost_checked(p, a["text"], None if chat in (None, "all") else chat, a, order[k + 1:],
                                             batch_tasks, notes)
                 a["text"] = _wakemode_checked(p, a["text"], notes)
@@ -2745,7 +2747,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                                              severity=_norm_severity(a.get("severity") or "normal"))[0])
                 claimcheck.raise_false(db, false, f"your reply #{replies[-1]} (chat {chat or 'all'})")
                 turnrules.record_cites(db, chat, cites, replies[-1])
-                sent.append((replies[-1], chat, a["text"]))
+                sent.append((replies[-1], chat, authored))
                 if a.get("claims"):
                     claimed.append((replies[-1], chat, a["claims"]))
                 workernotify.handled(db, said)
@@ -3576,12 +3578,13 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 if a.get("claims"):
                     obligations.check_claims(a["claims"], p)
                 said = workernotify.named(a["text"])   # the ids the coordinator named, before onhost's status line
+                authored = a["text"]   # promises come only from what the coordinator wrote, never the checks' footers
                 a["text"] = _onhost_checked(p, a["text"], None, a, order[k + 1:], batch_tasks, notes)
                 a["text"] = _wakemode_checked(p, a["text"], notes)
                 a["text"] = _pending_checked(p, a["text"], notes, "notify")
                 a["text"], false = _claims_checked(p, a, notes)
                 sent.append((msgparts.post(db, a["text"], chat=None, kind="alert",
-                                           severity=_norm_severity(a.get("severity")))[0], None, a["text"]))
+                                           severity=_norm_severity(a.get("severity")))[0], None, authored))
                 claimcheck.raise_false(db, false, f"your notify #{sent[-1][0]}")
                 if a.get("claims"):
                     claimed.append((sent[-1][0], None, a["claims"]))

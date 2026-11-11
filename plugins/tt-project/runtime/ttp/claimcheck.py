@@ -41,7 +41,7 @@ from . import onhost
 KIND = "claim_false"
 UNVERIFIED = "(unverified)"
 FALSE_MARK = "Not so when checked"
-STATUS_TAIL = "\nStatus now: "   # onhost.guard's appended status, never judged
+STATUS_TAIL = "\nStatus now: "   # "\n" + onhost.STATUS_HEAD: onhost.guard's appended status, never judged
 PROBE_TIMEOUT_S = 10   # one claim probe before the batch is applied
 PROBE_BUDGET_S = 30    # all of a batch's claim probes together
 # Phrases that name a setting without its key.
