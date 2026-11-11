@@ -34,8 +34,8 @@ and it is posted at once: a rewrite in place keeps every word (goal 1) and the u
 
 A sentence that reports a past event (past tense only, or a stated time at or before the send time) and
 one backed by a reply claim whose `expect` probe passes now are left as written: they report what was
-observed, not a plan. A start verb ('started', 'began', 'launched', 'kicked off') is never a past report:
-it says work runs now. Only a stop not yet confirmed (live jobs) still marks a past 'stopped'. The
+observed, not a plan. A start or completion verb ('started', 'began', 'launched', 'kicked off', 'finished',
+'completed', 'is done') is never a past report: it says the task's own work ran. Only a stop not yet confirmed (live jobs) still marks a past 'stopped'. The
 appended status line is the harness's, never the coordinator's words: no promise is read from it."""
 from __future__ import annotations
 
@@ -55,8 +55,10 @@ _PROG = re.compile(r"(?i)\b([a-z]{3,}ing)\b")
 _NOW = re.compile(r"(?i)\b(?:now|right away|as we speak|at the moment|currently)\b")
 _RUNS = re.compile(r"(?i)\b(?:runs|running|under ?way|in progress|happening|going on)\b")
 _ONLY = re.compile(r"(?i)\bonly\b[^.!?\n]{0,80}?\b(?:runs|run|is running|are running|remains?|is left)\b")
-# A start verb says work began and runs now: never a past report, whatever its tense or stated time.
-_START = re.compile(r"(?i)\b(?:started|began|begun|launched|kicked off)\b")
+# A start or completion verb says the task's own work ran (or runs now): never a past report of some
+# other event, whatever its tense or stated time. Only a started task or a passing probe clears it.
+_START = re.compile(r"(?i)\b(?:started|began|begun|launched|kicked off|finished|completed|"
+                    r"(?:is|are|was|were) (?:done|finished|complete)|\w+['’]s (?:done|finished|complete))\b")
 _DONE = re.compile(r"(?i)\b(?:stopped|killed|cancell?ed|halted|terminated|ended|aborted|power[- ]?cycled|"
                    r"rebooted|restarted|reset (?:it|them|the)|(?:is|are|was|were) (?:done|finished|complete)|"
                    r"\w+['’]s (?:done|finished|complete)|finished|completed)\b")
@@ -340,7 +342,7 @@ def _progressive(s: str, pat) -> bool:
 
 
 def _claim(sentence: str) -> str | None:
-    """'start' when a sentence says work began (so runs now), 'now' when it says an action is under way,
+    """'start' when a sentence says work began or finished (so it ran), 'now' when it says an action is under way,
     'past' when it only reports one done (a past tense verb), None when it claims neither."""
     s = sentence.strip()
     if not s or s.startswith(MARK):

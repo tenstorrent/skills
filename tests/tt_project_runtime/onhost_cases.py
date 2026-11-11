@@ -595,7 +595,8 @@ def test_a_false_started_claim_is_marked_whatever_its_tense_or_stated_time(env):
     noon = _oh_noon(p)
     # 'started' says work runs now: past tense and a stated time before the send time never clear it.
     for text in (f"Started #{tid} on box1.", "Started the soak on box1.", f"#{tid} started on box1 at 11:50.",
-                 "The soak began on box1 at 11:30.", "Kicked off the soak on box1."):
+                 "The soak began on box1 at 11:30.", "Kicked off the soak on box1.",
+                 "The box1 job finished at 11:40.", f"#{tid} is done on box1."):
         got, notes = onhost.guard(p, text, tasks, now=noon)
         assert got.startswith(onhost.MARK) and notes, text
     # A hedged start is a plan, and a completed event ('restarted') is still a past report.
