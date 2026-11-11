@@ -22070,3 +22070,38 @@ def test_the_lone_tip_fix_batch_also_runs_the_failing_ids(env, monkeypatch):
     assert [str(c) for c in checks] == [cmd, "claude plugin validate x --strict",
                                         "python3 -m pytest -q tests/test_other.py::test_a"], checks
     assert batch.tip_fix_check({}, checks[:2]) == checks[:2]
+    _pq_plan(s, release=str(env["tmp"] / "never"))
+    bid = pushq.schedule(s.p)
+    if relay_tip == "diverged":
+        assert bid is None and s.p.db.task(s.review)["status"] == "queued", "a diverged target: the review runs again"
+        return
+    assert bid, _pq_events(s.p, mark)
+    assert s.p.db.one("SELECT status, target, batch FROM push_queue WHERE id=?", (row["id"],)) == {
+        "status": "batched", "target": "relay/proj", "batch": bid}
+    assert s.p.db.task(s.review)["status"] == "pushing", "the review does not run again"
+    assert [e["kind"] for e in _pq_events(s.p, mark) if e["kind"] in ("task_requeued", "push_retargeted")] == [
+        "push_retargeted"]
+    assert push._read(s.p.state / push.DETACHED / f"{bid}.json")["target"] == "relay/proj"
+    (env["tmp"] / "never").write_text("")
+    pushq._children[bid].wait(timeout=30)
+
+
+@pytest.mark.parametrize("form", ["dict", "branch at sha", "branch only", "sha in prose"])
+def test_an_approval_in_any_form_while_the_queue_is_off_is_never_dropped(env, monkeypatch, form):
+    """Queue off: a review that names the commit it approved (one entry, "branch at sha", the branch
+    alone, a sha in a sentence) runs again to push it itself instead of being logged as ignored."""
+    s = _pq(env, monkeypatch, push_queue=False)
+    push = {"dict": {"branch": s.branch, "head": s.head}, "branch at sha": f"{s.branch} at {s.head}",
+            "branch only": s.branch, "sha in prose": f"approved for the push queue: {s.head}."}[form]
+    t = _pq_hand_off(env, s, push=push)
+    assert t["status"] == "queued" and not s.p.db.q("SELECT id FROM push_queue")
+    assert json.loads(t["result"])["woke"].startswith("push approval invalid: the push queue is off")
+    assert "push list was ignored" not in (s.p.logs / "daemon.log").read_text()
+
+
+def test_an_approval_already_on_the_push_branch_while_the_queue_is_off_is_ignored(env, monkeypatch):
+    """A review that pushed its head itself and names it: nothing is left to land, so it is done."""
+    s = _pq(env, monkeypatch, push_queue=False)
+    _git_out(s.repo, "update-ref", "refs/remotes/origin/proj", s.head)
+    t = _pq_hand_off(env, s, push=f"{s.branch} at {s.head}")
+    assert t["status"] == "done" and "already on the push branch" in (s.p.logs / "daemon.log").read_text()

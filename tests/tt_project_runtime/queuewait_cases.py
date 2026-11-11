@@ -808,3 +808,44 @@ def test_queue_wait_answered_key_stays_settled_across_a_new_episode(env):
     assert queuewait.scan(p, QW_CFG, gap + 60, both) == []
     p.db.update_task(a, priority=1)
     assert [fp.split(":")[1] for fp in queuewait.scan(p, QW_CFG, gap + 120, both)] == [str(a)]
+
+
+def test_queue_wait_on_the_push_queue_names_the_push_lock_holder_and_the_detached_pushes_behind_it(env):
+    """A push run outside the push queue (a detached `ttp push`) holds the push-branch lock and others wait
+    on it: the push wait names the holder with its task and since when, and each waiting detached push with
+    its task and the minutes it waited, instead of 'Holding: none seen. Waiting: none seen'."""
+    import fcntl
+    from ttp import queuewait
+    p = make(env)
+    now = time.time()
+    tid = _qw_task7(p)
+    p.db.update_task(tid, not_before=now + 300, blocked_reason="waiting for the push" + NT, result=json.dumps(
+        {"status": "waiting", "retry_when": "ttp push --result /r/m", "waiting_since": now - 40 * 60}))
+    d = p.state / "locks"
+    d.mkdir(parents=True, exist_ok=True)
+    held = []
+
+    def hold(name, label):
+        f = open(d / name, "a+")
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        f.write(json.dumps(label))
+        f.flush()
+        held.append(f)
+
+    hold("push:origin%2Fproj.0.lock", {"holder": "task #6787 (run 900)", "task_id": "6787", "pid": 4242,
+                                        "since": now - 50 * 60})
+    hold("push:run-a.0.lock", {"holder": "detached push a", "task_id": "6787", "pid": 4241, "since": now - 52 * 60})
+    hold("push:run-b.0.lock", {"holder": "detached push b", "task_id": "7001", "pid": 5001, "since": now - 20 * 60})
+    hold("push:run-c.0.lock", {"holder": "detached push c", "task_id": "7002", "pid": 5002, "since": now - 35 * 60})
+    (d / "push:run-gone.0.lock").write_text(json.dumps({"holder": "detached push gone", "task_id": "7003"}))
+    try:
+        assert queuewait.scan(p, QW_CFG, now, {})
+        t = _qw_events(p)[0]["text"]
+    finally:
+        for f in held:
+            f.close()
+    assert f"qwait-{tid}-push" in t and "1 running (cap 1), 2 queued" in t, t
+    assert f"{p.name} task #6787 (pid 4242) holds the push lock origin/proj since" in t, t
+    assert (f"Waiting: detached push of {p.name} task #7002 (pid 5002) waiting 35 min; "
+            f"detached push of {p.name} task #7001 (pid 5001) waiting 20 min.") in t, t
+    assert "7003" not in t and "none seen" not in t, t
