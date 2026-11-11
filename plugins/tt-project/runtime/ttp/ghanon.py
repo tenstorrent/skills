@@ -70,14 +70,16 @@ def _cached(d: Path, key: str, ttl: float) -> dict | None:
 
 
 def _put(d: Path, key: str, status: int, body) -> None:
-    p = _path(d, key)
-    tmp = p.with_suffix(f".{os.getpid()}.tmp")
-    tmp.write_text(json.dumps({"key": key, "t": time.time(), "status": status, "body": body}))
-    os.replace(tmp, p)
+    from .project import durable_write
+    # a cache: a power cut costs one more call at most, so no sync
+    durable_write(_path(d, key), json.dumps({"key": key, "t": time.time(), "status": status, "body": body}),
+                  sync=False)
 
 
 def _budget(d: Path, fn):
-    with open(d / "budget.lock", "w") as lk:
+    from .project import durable_write
+    lk = os.open(d / "budget.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    try:
         fcntl.flock(lk, fcntl.LOCK_EX)
         try:
             b = json.loads((d / "budget.json").read_text())
@@ -85,10 +87,10 @@ def _budget(d: Path, fn):
             b = {}
         b = b if isinstance(b, dict) else {}
         got = fn(b)
-        tmp = d / f"budget.{os.getpid()}.tmp"
-        tmp.write_text(json.dumps(b))
-        os.replace(tmp, d / "budget.json")
+        durable_write(d / "budget.json", json.dumps(b))
         return got
+    finally:
+        os.close(lk)
 
 
 def _take(d: Path, cap: int) -> bool:
