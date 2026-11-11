@@ -4987,10 +4987,11 @@ def test_a_failure_every_spill_host_shares_is_one_config_incident_and_quarantine
 
 
 @_LINUX_TMP
-def test_an_import_failure_on_two_spill_hosts_that_passes_here_raises_one_high_event_and_no_strikes(
+def test_an_import_failure_on_two_spill_hosts_raises_one_high_event_and_no_strikes(
         env, tmp_path, monkeypatch):
-    """One spill-env incident, one event: the landed env_event tells it when the import fails on a second host,
-    the run then passes here, and strike_settle neither strikes the hosts nor raises its own config event."""
+    """One spill-env incident, one event: the landed env_event tells it when the import fails on a second host
+    (an import failure runs again once per head, so that result counts: the run fails), and neither the hosts
+    are struck nor does strike_settle raise its own config event."""
     import threading
     from ttp import checkspill, cli
     p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a", "check-host-b"])
@@ -5001,8 +5002,9 @@ def test_an_import_failure_on_two_spill_hosts_that_passes_here_raises_one_high_e
     p.set_config("delivery.push_checks", [f"sh {script}"])
     lane = _spill_lane(p, repo)
     threading.Timer(6, lane.close).start()
-    cli.main(["checks", "--fresh"])
-    assert json.loads((run / "checks.json").read_text())["passed"] is True
+    with pytest.raises(SystemExit):
+        cli.main(["checks", "--fresh"])
+    assert json.loads((run / "checks.json").read_text())["passed"] is False
     events = p.db.q("SELECT severity, fingerprint FROM events WHERE fingerprint LIKE 'checkspill:%' "
                     "OR fingerprint LIKE 'spill-%'")
     assert len(events) == 1 and events[0]["severity"] == "high" and events[0]["fingerprint"].startswith(
