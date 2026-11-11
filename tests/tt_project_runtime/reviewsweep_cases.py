@@ -277,3 +277,27 @@ def test_a_finish_whose_diff_read_timed_out_gets_its_review_on_the_next_tick(env
     assert p.db.task(rid)["title"] == f"Review #{tid}: cut read" and p.db.kv(KV_REVIEW_UNREAD) == []
     assert d.retry_unread_reviews() == []
     assert len(p.db.q("SELECT id FROM tasks WHERE kind='review'")) == 1
+
+
+def test_a_finish_with_its_round_slice_or_git_budget_spent_defers_its_review_to_the_next_tick(env):
+    # #7690: a finish's last round (one that never aborts) past its strict slice gave _auto_review's
+    # rev-parse a 0 s timeout. It still runs no git under the lock past the slice: the read is not started
+    # (gitmemo.Spent, never 0 s), the task is kept unread and the next tick queues its review; so does a
+    # transaction whose whole git budget is spent.
+    from ttp import daemon as dm, gitmemo, gitreplay
+    p = make(env)
+    sliced = _unreviewed(env, p, "slice spent", age=5)[0]
+    later = _unreviewed(env, p, "budget spent", age=5)[0]
+    d = dm.Daemon(p.base)
+    gitreplay.clear()
+    with gitmemo.bounded(gitmemo.TX_GIT_S, gitmemo.TX_GIT_S), gitmemo.attempt(), \
+            gitmemo.strict(0.0, abortable=False):
+        assert d._auto_review(p.db.task(sliced), "slice spent works", add=True) is None
+    gitreplay.clear()
+    with gitmemo.bounded(gitmemo.TX_GIT_S, 0.0):
+        time.sleep(0.01)
+        assert d._auto_review(p.db.task(later), "budget spent works", add=True) is None
+    assert p.db.kv(dm.KV_REVIEW_UNREAD) == sorted([sliced, later]) and not _daemon_reviews(p, sliced)
+    assert "after 0 seconds" not in (p.logs / "daemon.log").read_text()
+    assert len(d.retry_unread_reviews()) == 2, "the next tick queues both"
+    assert len(_daemon_reviews(p, sliced)) == 1 and len(_daemon_reviews(p, later)) == 1

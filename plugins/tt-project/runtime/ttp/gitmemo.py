@@ -11,8 +11,11 @@ did not foresee) runs its git as before; a call that raised is not kept. Outside
 only runs the call.
 
 bounded() caps, by time, the git a scope runs: each git read (is_read) gets at most `per_call_s`,
-and a scope with `total_s` also ends every git call it makes, reads and writes, by its deadline: past
-it, timeout() starts no new call (it raises subprocess.TimeoutExpired at once). The daemon's tick steps run in bounded(TICK_GIT_S) and a finish transaction in
+and a scope with `total_s` also ends every git call it makes, reads and writes, by its deadline. A call
+started before it gets at least FLOOR_S, or the scope's whole budget if smaller (a scope ends at most
+FLOOR_S past its deadline); past it, timeout() starts no new call: it raises Spent, a
+subprocess.TimeoutExpired naming the budget, never 0 s, and its caller defers the work to the next tick
+as it does for a timeout. The daemon's tick steps run in bounded(TICK_GIT_S) and a finish transaction in
 bounded(TX_GIT_S, TX_GIT_S), so one slow or hung git call holds neither past that, whatever its call
 site (call sites pass their own timeout through timeout()). A git write outside a transaction keeps
 its own timeout: killing it midway can leave a lock or a half-removed worktree. A capped call that
@@ -29,8 +32,10 @@ transaction, Daemon._finish_rounds) a read the memo lacks runs live only while t
 stays within its slice; past it the read raises GitMiss before spawning, the transaction rolls back,
 the read runs outside the lock and the round runs again. The db audit hook calls on_audit(): a raw
 git spawn inside a round counts against the slice; a non-git spawn or a socket connect is the round's
-point of no return, after which it never aborts: later misses run live within the slice, else raise
-subprocess.TimeoutExpired without spawning. A stop (Attempt.stop: the daemon got SIGTERM) ends an
+point of no return, after which it never aborts: a later miss past the slice runs no git under the
+lock: it raises Spent (naming the slice, never a 0 s timeout) and its caller defers the work to the
+next tick (the finish's review read: Daemon.retry_unread_reviews). Pure local git (check-ref-format:
+a task_add's branch check, via _CHECKS) is never refused. A stop (Attempt.stop: the daemon got SIGTERM) ends an
 abortable round before its next live git, spawn or connect, so a stop never waits out the rounds."""
 
 from __future__ import annotations
@@ -46,8 +51,8 @@ from typing import Any, Callable, Iterator
 from . import stepclock
 
 _memo: contextvars.ContextVar[dict | None] = contextvars.ContextVar("ttp_gitmemo", default=None)
-# (per-call seconds for a read, monotonic deadline for every call or None) of the bounded() scope
-_cap: contextvars.ContextVar[tuple[float, float | None] | None] = contextvars.ContextVar("ttp_gitcap", default=None)
+# (per-call seconds for a read, monotonic deadline for every call or None, total seconds) of the bounded() scope
+_cap: contextvars.ContextVar[tuple[float, float | None, float] | None] = contextvars.ContextVar("ttp_gitcap", default=None)
 
 TICK_GIT_S = 25.0   # one git read a daemon tick step makes, at most (Daemon._run_step)
 TX_GIT_S = 20.0     # all git a finish write transaction makes, together (Daemon._finish_tx)
@@ -56,6 +61,7 @@ MAX_ROUNDS = 50     # rounds of one finish before its last, which never aborts (
 FINISH_WALL_S = 90.0    # nor past this long: the reads it learns between rounds share this wall too
 PREFETCH_GIT_S = 60.0   # all git one finish's warm-up (Daemon._prefetch_git) runs, together
 PURE_FLOOR_S = 10.0   # a git check (check-ref-format, var, version: no repository read, no lock) gets at least this
+FLOOR_S = 2.0   # the least a git call started with its bounded() deadline about to pass gets (or the whole budget)
 # git's own options that take the next argument (git -C <dir> <verb> ...)
 _OPTS_WITH_VALUE = frozenset({"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path", "--config-env"})
 # Verbs that only read the repository (a scratch GIT_INDEX_FILE aside): bounded() caps them anywhere.
@@ -64,6 +70,22 @@ READS = frozenset({"rev-parse", "rev-list", "merge-base", "diff", "log", "show",
                    "grep", "name-rev", "describe", "ls-tree", "diff-tree", "merge-tree"})
 # `git reflog` reads (show, its default, and the rest) but for these subcommands
 _REFLOG_WRITES = frozenset({"expire", "delete"})
+
+
+def _slice_name(rd) -> str:
+    return f"finish round's {rd.slice_s:g} s live-git slice"
+
+
+class Spent(subprocess.TimeoutExpired):
+    """A git call not started: its bounded() scope's whole budget was spent. The caller defers the work
+    to the next tick (as it does for a timeout); `timeout` is that budget, never 0."""
+
+    def __init__(self, cmd, timeout: float, budget: str = "") -> None:
+        super().__init__(cmd, timeout)
+        self.budget = budget or f"{timeout:g} s git budget"
+
+    def __str__(self) -> str:
+        return f"Command {self.cmd!r} not started: its {self.budget} was spent"
 
 
 def is_read(args: tuple | list) -> bool:
@@ -109,9 +131,10 @@ def bounded(per_call_s: float, total_s: float | None = None) -> Iterator[None]:
     outer = _cap.get()
     per = per_call_s if outer is None else min(per_call_s, outer[0])
     end = None if total_s is None else time.monotonic() + total_s
-    if outer is not None and outer[1] is not None:
-        end = outer[1] if end is None else min(end, outer[1])
-    token = _cap.set((per, end))
+    total = total_s or 0.0
+    if outer is not None and outer[1] is not None and (end is None or outer[1] < end):
+        end, total = outer[1], outer[2]
+    token = _cap.set((per, end, total))
     try:
         yield
     finally:
@@ -134,8 +157,10 @@ def timeout(own: float | None, args: tuple | list = (), read: bool | None = None
         left = cap[1] - time.monotonic()
         if args and args[0] in _CHECKS:   # reads no repository: an action's own check never starves on what is left
             left = max(left, PURE_FLOOR_S)
-        if left <= 0:   # past the deadline: no new spawn
-            raise subprocess.TimeoutExpired(["git", *map(str, args)], 0)
+        if left <= 0:   # past the deadline: no new spawn; the caller defers it to the next tick
+            raise Spent(["git", *map(str, args)], cap[2] or FLOOR_S)
+        # never a near-0 timeout: at most FLOOR_S past the deadline, never past the scope's own budget
+        left = max(left, min(FLOOR_S, cap[2] or FLOOR_S))
         t = left if t is None else min(t, left)
     return t
 
@@ -296,7 +321,7 @@ def on_audit(event: str, args: tuple) -> None:
     if rd.left() <= 0:
         if rd.abort():
             raise GitMiss(argv, {}, None, None, "raw git past the round's slice", learn=False)
-        raise subprocess.TimeoutExpired(argv, 0)
+        raise Spent(argv, rd.slice_s or FLOOR_S, _slice_name(rd))   # the caller defers it
     rd.raw_t0 = time.monotonic()
 
 
@@ -479,7 +504,8 @@ keeps its own cap and makes the round's point of no return)."""
             if rd.abort():
                 raise GitMiss(argv, {**kw, "check": check}, timeout, read, "past the round's slice",
                               learn=k is not None)
-            raise subprocess.TimeoutExpired(list(argv), 0)
+            # no git under the lock past the slice: the caller defers it to the next tick
+            raise Spent(list(argv), rd.slice_s or FLOOR_S, _slice_name(rd))
         slice_binds = t is None or t > left
         t = left if slice_binds else t
     if k is not None:

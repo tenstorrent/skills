@@ -618,11 +618,75 @@ def test_gitmemo_bounded_caps_reads_and_a_deadline_caps_every_call(monkeypatch):
     clock = [1000.0]
     monkeypatch.setattr(gitmemo.time, "monotonic", lambda: clock[0])
     with gitmemo.bounded(45, 20):
-        clock[0] += 19.5
-        assert gitmemo.timeout(120, ("rev-parse",)) == pytest.approx(0.5), "what is left before the deadline"
+        clock[0] += 10
+        assert gitmemo.timeout(120, ("rev-parse",)) == pytest.approx(10), "what is left before the deadline"
+        clock[0] += 9.5
+        assert gitmemo.timeout(120, ("rev-parse",)) == gitmemo.FLOOR_S, "a moment left: the floor, never ~0 s"
+        assert gitmemo.timeout(1, ("rev-parse",)) == 1, "a shorter own timeout stays"
         clock[0] += 100
-        with pytest.raises(subprocess.TimeoutExpired):   # past the deadline: no new spawn, not a 1 s floor
+        with pytest.raises(gitmemo.Spent) as spent:   # past the deadline: no new spawn; the caller defers
             gitmemo.timeout(120, ("merge-base",))
+        assert isinstance(spent.value, subprocess.TimeoutExpired) and spent.value.timeout == 20
+        assert "after 0" not in str(spent.value) and "20 s git budget was spent" in str(spent.value)
+    with gitmemo.bounded(45, 0.5):   # a budget under the floor: the floor never runs a call past it
+        clock[0] += 0.4
+        assert gitmemo.timeout(120, ("rev-parse",)) == pytest.approx(0.5)
+
+
+def test_no_git_call_gets_a_timeout_of_0_s_or_less_from_a_spent_slice_or_deadline(env, monkeypatch, tmp_path):
+    """#7690: a spent deadline or strict-round slice once gave git `timed out after 0 seconds` (155 log
+    lines a day: finishes queued no review, a coordinator task_add was refused). Every git call that
+    spawns gets more than 0 s: a deadline about to pass gives FLOOR_S, past it timeout() raises Spent
+    (named budget) without spawning; a round that never aborts runs no git under the lock past its slice:
+    it raises Spent (the caller defers it to the next tick), never a 0 s timeout; raw pure git
+    (check-ref-format: task_add's branch check) still runs past it."""
+    from ttp import gitmemo, gitreplay, project, worktree
+    project.Project(make(env).base)   # the db audit hook gitmemo.on_audit hangs off
+    repo = tmp_path / "r"
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    seen: list = []
+    real = subprocess.run
+
+    def run(argv, *a, **k):
+        r = real(argv, *a, **k)   # recorded once spawned: a call refused before its spawn is not
+        if isinstance(argv, (list, tuple)) and argv and argv[0] == "git":
+            seen.append(k.get("timeout"))
+        return r
+    monkeypatch.setattr(subprocess, "run", run)
+    monkeypatch.setattr(worktree, "_VALID_BRANCHES", {})
+    read = ["git", "-C", str(repo), "rev-parse", "--git-dir"]
+    clock = [time.monotonic()]
+    real_mono = gitmemo.time.monotonic
+    for left in (5.0, 0.3, 0.0, -50.0):   # a deadline far, near, at and long past
+        seen.clear()
+        with gitmemo.bounded(gitmemo.TICK_GIT_S, 1000):
+            monkeypatch.setattr(gitmemo.time, "monotonic", lambda: clock[0])
+            clock[0] = real_mono() + 1000 - left
+            try:
+                gitmemo.run(read, timeout=30, capture_output=True)
+            except gitmemo.Spent:
+                assert left <= 0, left
+            monkeypatch.setattr(gitmemo.time, "monotonic", real_mono)
+        assert all(t is None or t >= gitmemo.FLOOR_S for t in seen), (left, seen)
+    for raw in (False, True):   # a final round with its slice spent: through gitmemo.run, and raw
+        gitreplay.clear()
+        seen.clear()
+        with gitmemo.bounded(gitmemo.TICK_GIT_S, gitmemo.TX_GIT_S), gitmemo.attempt(), \
+                gitmemo.strict(0.0, abortable=False) as rd:
+            assert rd.left() <= 0
+            if raw:
+                assert worktree.valid_branch("ttp/t1-a-valid-branch"), "task_add's branch check with no slice left"
+                with pytest.raises(gitmemo.Spent) as spent:
+                    subprocess.run(["git", "-C", str(repo), "status"], capture_output=True)
+            else:
+                with pytest.raises(gitmemo.Spent) as spent:
+                    gitmemo.run(read, timeout=30, capture_output=True)
+            assert spent.value.timeout > 0 and "slice was spent" in str(spent.value)
+        assert seen == ([None] if raw else []), "only the pure check ran; nothing else spawned"
+    gitreplay.clear()
+    with gitmemo.attempt(), gitmemo.strict(0.0) as rd:   # an abortable round still rolls back: as before
+        with pytest.raises(gitmemo.GitMiss):
+            gitmemo.run(read, capture_output=True)
 
 
 def test_valid_branch_checks_in_process_as_git_does(monkeypatch):
