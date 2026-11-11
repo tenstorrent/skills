@@ -594,9 +594,14 @@ def test_ssh_s_own_files_pass_but_reading_a_key_is_still_refused(env, tmp_path, 
     "echo x | tee -a $TTP_RUN_DIR/untrusted-input", "ls untrusted-input | xargs rm", "x=$(rm untrusted-input)",
     "true && `truncate -s0 untrusted-input`", "bash <<EOF\nrm $TTP_RUN_DIR/untrusted-input\nEOF",
     "python3 - <<EOF\nimport os; os.remove('untrusted-input')\nEOF",
-    "python3 -c \"open('untrusted-input', 'w')\""])
+    "python3 -c \"open('untrusted-input', 'w')\"", "echo x >| $TTP_RUN_DIR/untrusted-input",
+    "rsync --remove-source-files $TTP_RUN_DIR/untrusted-input /tmp/x",
+    "tar --remove-files -cf /tmp/a.tar $TTP_RUN_DIR/untrusted-input", "zip -m /tmp/a.zip untrusted-input",
+    "zip -rm /tmp/a.zip untrusted-input", "gawk -i inplace 1 untrusted-input", "awk -iinplace 1 untrusted-input",
+    "awk '{print > \"untrusted-input\"}' /tmp/x", "chattr +i untrusted-input"])
 def test_a_write_move_or_delete_of_the_untrusted_input_mark_is_refused(env, tmp_path, monkeypatch, cmd):
-    """Redirects, changers (rm, mv, tee, sed -i, dd of=, find -delete, a cp target, xargs) and any interpreter
+    """Redirects (>| too), changers (rm, mv, tee, sed -i, awk -i inplace, dd of=, find -delete, a cp target,
+    rsync, tar or zip removing their sources, xargs) and any interpreter
     or shell heredoc naming the mark stay refused."""
     _untrusted_run(env, tmp_path, monkeypatch, [])
     assert "leave it as it is" in _why(tmp_path, "Bash", {"command": cmd}), cmd
@@ -606,7 +611,9 @@ def test_a_write_move_or_delete_of_the_untrusted_input_mark_is_refused(env, tmp_
     "ttp note 'the untrusted-input guard refused a mention'",
     "cat > $TTP_RUN_DIR/result.json <<'EOF'\n{\"summary\": \"the untrusted-input guard is fixed\"}\nEOF",
     "cat $TTP_RUN_DIR/untrusted-input", "grep -rn untrusted-input tests", "cp $TTP_RUN_DIR/untrusted-input /tmp/c",
-    "git commit -m 'untrusted-input guard: mentions pass'", "echo 'untrusted-input' > /tmp/notes.txt"])
+    "git commit -m 'untrusted-input guard: mentions pass'", "echo 'untrusted-input' > /tmp/notes.txt",
+    "rsync -a $TTP_RUN_DIR/untrusted-input /tmp/c", "tar -cf /tmp/a.tar $TTP_RUN_DIR/untrusted-input",
+    "zip /tmp/a.zip untrusted-input", "awk '{print}' untrusted-input", "echo a || cat untrusted-input"])
 def test_a_command_only_mentioning_the_untrusted_input_mark_passes(env, tmp_path, monkeypatch, cmd):
     """A note's text, a heredoc written to another file, or a read of the mark is not a write of it
     (workers' runs were refused for one)."""

@@ -514,6 +514,42 @@ def _mark_copy_read(args: list[str]) -> bool:
                    for w in args)
 
 
+def _mark_archive_read(run: list[str]) -> bool:
+    """An rsync, tar or zip that only reads RUN_MARK as a source: options from a small read-only set (no
+    removal of sources, no remote shell, no log or backup file), and the mark is not its target (rsync's
+    last plain word, tar's -f archive, zip's archive)."""
+    name, args = os.path.basename(run[0]), run[1:]
+    opts = [w for w in args if w.startswith("-")]
+    plain = [w for w in args if not w.startswith("-")]
+    if name == "rsync":
+        ok = all(re.fullmatch(r"-[avrptgoDzhlHS]+", w) or w in ("--archive", "--verbose", "--recursive", "--compress",
+                                                                  "--human-readable", "--progress") for w in opts)
+        return ok and len(plain) >= 2 and RUN_MARK not in plain[-1]
+    if name == "tar":
+        if not args or not re.fullmatch(r"-?[cvzjJ]*c[cvzjJ]*f", args[0]) or len(args) < 2:
+            return False   # create only, its archive the next word
+        return RUN_MARK not in args[1] and not any(w.startswith("-") for w in args[2:])
+    if name == "zip":
+        return all(re.fullmatch(r"-[rq0-9]+", w) for w in opts) and len(plain) >= 2 and RUN_MARK not in plain[0]
+    return False
+
+
+def _mark_awk_read(run: list[str]) -> bool:
+    """An awk whose program only reads: no option but -F or -v (no -i inplace, -f, -e or --include), and a
+    program with no output redirect or pipe (>, |), no system() and no @load."""
+    if not run or not re.fullmatch(r"[gmn]?awk", os.path.basename(run[0])):
+        return False
+    args, i = run[1:], 0
+    while i < len(args) and args[i].startswith("-"):
+        if args[i] in ("-F", "-v"):
+            i += 2
+        elif re.fullmatch(r"-[Fv].+", args[i]):
+            i += 1
+        else:
+            return False
+    return i < len(args) and not re.search(r"[>|@]|system", args[i])
+
+
 def _unsingle(cmd: str) -> str:
     """`cmd` without its single-quoted spans, the only quoting in which a shell runs no substitution."""
     out, q, esc = [], "", False
@@ -537,8 +573,8 @@ def _unsingle(cmd: str) -> str:
 def _mark_bash(cmd: str) -> bool:
     """Whether a Bash command may create, change, move or delete RUN_MARK. A mention only in a quoted
     prose argument (a note's text), as an argument of a command that only reads (a grep pattern, a
-    cat, a cp's source) or in a heredoc written to another file has no effect; a redirect into it, a
-    path to it given to any other command, or any mention in a command that runs code (or with a
+    cat, a cp, rsync, tar or zip source, an awk program that only prints) or in a heredoc written to
+    another file has no effect; a redirect into it, a path to it given to any other command, or any mention in a command that runs code (or with a
     substitution whose effect the words do not show) counts. A heredoc's body lines are read as
     commands, so one naming the mark as a bare word or path counts."""
     if RUN_MARK not in cmd:
@@ -557,8 +593,8 @@ def _mark_bash(cmd: str) -> bool:
     if any(">" in w and set(w) <= set("&<>|") and RUN_MARK in n for w, n in zip(words, words[1:])):
         return True   # a redirect into it
     segs = _segments(cmd, strip=False)
-    if any(MARK_RUNNER_RE.fullmatch(os.path.basename(w)) for seg in segs for w in seg) \
-            or any(seg[0] == "." for seg in segs):
+    if any(MARK_RUNNER_RE.fullmatch(os.path.basename(w)) for seg in segs
+           for w in (seg[1:] if _mark_awk_read(seg) else seg)) or any(seg[0] == "." for seg in segs):
         return True   # code, or a command run from piped input, anywhere in the line
     for seg in segs:
         if not any(RUN_MARK in w for w in seg):
@@ -567,6 +603,8 @@ def _mark_bash(cmd: str) -> bool:
         if run and os.path.basename(run[0]) in MARK_READERS:
             continue
         if run and os.path.basename(run[0]) in MARK_COPIERS and _mark_copy_read(run[1:]):
+            continue
+        if run and (_mark_archive_read(run) or _mark_awk_read(run)):
             continue
         if any(RUN_MARK in w and (_mark_path(w) or not re.search(r"\s", w)) for w in seg):
             return True   # a path to it, or a bare word naming it, given to a command that may write
