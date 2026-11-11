@@ -12,6 +12,7 @@ reading files, running commands or thinking hard becomes a task for a worker ins
 from __future__ import annotations
 
 import difflib
+import functools
 import hashlib
 import json
 import os
@@ -4358,8 +4359,12 @@ SIMILAR_DONE_DAYS = 3   # a task done this recently is still compared against a 
 _STOP = set("a an the of to for and or in on at by with from into vs via is be as it its this that".split())
 
 
-def _words(text: str) -> set[str]:
-    return {w for w in re.findall(r"[a-z0-9_]+(?:[.-][a-z0-9_]+)*", (text or "").lower()) if w not in _STOP}
+@functools.lru_cache(maxsize=4096)
+def _words(text: str) -> frozenset[str]:
+    """The words of `text`, kept per text: similar_task compares each task_add with every open and recent
+    task, and rebuilding each task's sets on every task_add held the daemon tick for minutes."""
+    return frozenset(w for w in re.findall(r"[a-z0-9_]+(?:[.-][a-z0-9_]+)*", (text or "").lower())
+                     if w not in _STOP)
 
 
 def _jaccard(a: set, b: set) -> float:
@@ -4375,6 +4380,8 @@ def looks_same(title1: str, spec1: str, title2: str, spec2: str) -> bool:
     if n1 and n2 and n1 != n2:
         return False
     tj = _jaccard(_words(title1), _words(title2))
+    if tj < 0.4:   # both verdicts below need this much: the specs' words are not built
+        return False
     s1, s2 = _words(spec1), _words(spec2)
     # A spec of a word or two says nothing about the work; judge by the title alone then.
     sj = _jaccard(s1, s2) if s1 and s2 and len(s1 | s2) >= 4 else tj

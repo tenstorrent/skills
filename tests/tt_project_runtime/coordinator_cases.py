@@ -5168,6 +5168,32 @@ def test_task_add_rejects_a_near_duplicate_naming_the_task(env):
 
 
 
+def test_the_duplicate_scan_builds_each_tasks_words_once_not_on_every_task_add(env):
+    """similar_task compared each task_add with every open task, rebuilding both word sets each time:
+    over many tasks one apply held the daemon tick for minutes. Each text's words are built once, a
+    title too unlike to match never builds the specs' words, and the verdicts stay the same."""
+    p = make(env)
+    from ttp import coordinator as coord
+    for i in range(60):
+        p.db.add_task(f"area {chr(65 + i % 26)}{i} sweep", f"Spec {i}: look into area {i} and its owner.",
+                      origin="user")
+    coord._words.cache_clear()
+    adds = [{"type": "task_add", "title": f"new kind {k} of work", "spec": f"Do new thing {k} now."}
+            for k in "pqrst"]
+    assert coord.apply(p, adds) == []
+    built = coord._words.cache_info().misses
+    assert built <= 60 + 2 * len(adds) + 10, built   # each title once, the new specs: no spec of the 60
+    coord._words.cache_clear()
+    assert coord.apply(p, [{"type": "task_add", "title": "new kind u of work", "spec": "Do new thing u now."}]) == []
+    once = coord._words.cache_info().misses
+    assert coord.apply(p, [{"type": "task_add", "title": "new kind v of work", "spec": "Do new thing v now."}]) == []
+    assert coord._words.cache_info().misses - once <= 4, coord._words.cache_info()   # only the new texts
+    # The same verdicts: a near repeat is still caught, an unlike title never is.
+    assert coord.looks_same("fix flaky upload test in CI", "The upload test fails one run in ten on CI.",
+                            "fix the flaky upload test in CI", "Upload test fails one run in ten on CI.")
+    assert not coord.looks_same("area A0 sweep", "same spec words here", "new kind of work", "same spec words here")
+
+
 def test_task_add_rejects_a_reworded_repeat_of_work_shelved_or_landed_the_same_day(env):
     # Replays a coordinator re-queuing, hours later, two levers it had finished that day (one shelved,
     # one landed as a kept iteration) under reworded titles with the same bounds.

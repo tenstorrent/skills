@@ -1710,6 +1710,29 @@ def test_e_a_git_write_in_a_strict_round_keeps_its_own_cap(env, monkeypatch, tmp
     assert _git_out(repo, "rev-parse", "refs/ttp/push/2") == _git_out(repo, "rev-parse", "HEAD")
 
 
+def test_a_pure_git_check_after_slow_python_in_a_strict_round_still_runs(env, tmp_path):
+    """A coordinator apply's own check (worktree.valid_branch: git check-ref-format) after a slow duplicate
+    scan failed with "timed out after 0 seconds": the scan's Python time had used up the finish scope's
+    deadline and the round's slice. A pure git call reads no repository and holds no lock: it runs. A
+    repository read past the deadline is still refused."""
+    from ttp import gitmemo, gitreplay, project, worktree
+    project.Project(make(env).base)   # the db audit hook gitmemo.on_audit hangs off
+    repo = tmp_path / "r"
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    gitreplay.clear()
+    with gitmemo.bounded(gitmemo.TX_GIT_S, 0.01), gitmemo.attempt(), gitmemo.strict(0.1) as rd:
+        rd.pnr, rd.live_s = True, 5.0   # past its point of no return, its slice spent
+        time.sleep(0.05)                # and past the scope's deadline
+        worktree._VALID_BRANCHES.pop("ttp/t1-a-pr-branch", None)
+        assert worktree.valid_branch("ttp/t1-a-pr-branch")
+        r = gitmemo.run(["git", "check-ref-format", "--branch", "ttp/t2-another"], capture_output=True, text=True)
+        assert (r.returncode, r.stdout.strip()) == (0, "ttp/t2-another"), r
+        assert rd.live_s == 5.0, "a pure call is not counted in the slice"
+        with pytest.raises(subprocess.TimeoutExpired):
+            gitmemo.run(["git", "-C", str(repo), "status", "--porcelain"], capture_output=True, text=True)
+    assert gitmemo.timeout(None, ("check-ref-format", "x")) is None   # off a scope: as before
+
+
 def test_a_git_write_in_an_attempt_drops_its_volatile_and_once_answers(tmp_path, monkeypatch):
     """A git write inside an attempt drops that attempt's volatile and once answers: the same read after
     it runs git again, never replaying what it read before the write (an absent ref, a ref list, a
