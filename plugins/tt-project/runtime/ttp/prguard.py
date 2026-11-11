@@ -1245,6 +1245,15 @@ def main(argv: list[str], own_dir: str) -> int:
             log_call(state, seen, args, refused=True)
         print(f"gh (tt-project): {why}", file=sys.stderr)
         return 1
+    from . import ghroute
+    if ghroute.wanted(args):   # no gh login here: on delivery.gh_route, else held or read publicly
+        data = stdin_text.encode() if stdin_raw is None and stdin_text is not None else stdin_raw
+        rc = ghroute.run(real, args, input=data)
+        if allowed and db is not None:
+            log_call(state, seen, args, refused=False, rc=rc)
+            if rc == 0:
+                spend(db, allowed)
+        return rc
     if allowed and db is not None:
         # The approval is spent once the PR has left draft with it.
         rc = subprocess.run([real, *args], input=stdin_text if stdin_raw is None else stdin_raw,

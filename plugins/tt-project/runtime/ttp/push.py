@@ -3244,7 +3244,8 @@ def backup(repo: Path, remote: str, branch: str, timeout_s: float = BACKUP_TIMEO
         return "gone", f"branch {branch} no longer exists"
     ref = f"refs/heads/{branch}"
     try:   # no leading + and no --force: git itself refuses anything but a fast-forward
-        out = subprocess.run(["git", "-C", str(repo), "push", "--porcelain", remote, f"{ref}:{ref}"],
+        from . import ghroute
+        out = subprocess.run(ghroute.push_argv(["git", "-C", str(repo), "push", "--porcelain", remote, f"{ref}:{ref}"]),
                              text=True, capture_output=True, timeout=timeout_s, stdin=subprocess.DEVNULL,
                              env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
     except subprocess.TimeoutExpired:
@@ -3253,7 +3254,8 @@ def backup(repo: Path, remote: str, branch: str, timeout_s: float = BACKUP_TIMEO
         return "pushed", head
     if any(ln.startswith("!") and "[rejected]" in ln for ln in out.stdout.splitlines()):
         return "not_ff", f"{remote}/{branch} has commits {branch} lacks"
-    return "failed", (out.stderr.strip() or out.stdout.strip())[-300:]
+    err = (out.stderr.strip() or out.stdout.strip())[-300:]
+    return "failed", " ".join(x for x in (err, ghroute.push_hint(err)) if x)
 
 
 def is_doc(path: str) -> bool:

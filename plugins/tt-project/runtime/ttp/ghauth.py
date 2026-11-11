@@ -7,9 +7,10 @@ printed an error and exited 0, and a start_when probe exited gh's 4 per task. No
 per host runs `gh auth status` at most every EVERY_S, only while a project here uses gh (uses_gh), in
 the daemon of whichever project takes the host-wide lock first; the others skip it and read its answer
 from the state file (STATE under the tt-project home). While it says logged out, each project using gh
-keeps kv KV set and asserts the alert KEY: a machine-wide condition (Daemon._machine_wide), so one
-project broadcasts it and the others show it quietly. It names the host and the step only the user can
-take (`gh auth login`), and clears once the check passes. A gh call elsewhere that failed for its
+keeps kv KV set and asserts the alert KEY, unless a delivery.gh_route answers (ghroute): a machine-wide
+harness condition (Daemon._machine_wide), so one project broadcasts it and the others show it quietly.
+No GitHub login is kept on lab hosts, so it never asks anyone to log gh in: it names the route setting
+and what is skipped, and clears once gh works (logged in here, or routed). A gh call elsewhere that failed for its
 login (auth_failed) asks for a recheck at once (nudge) rather than waiting out EVERY_S.
 
 `gh auth status` that fails for another reason (no network, a timeout) is no answer: the last one stands.
@@ -25,7 +26,7 @@ import subprocess
 import time
 from pathlib import Path
 
-KEY = "gh-auth"        # the alert's condition key (alerts.USER_BLOCKERS)
+KEY = "gh-auth"        # the alert's condition key (a harness condition)
 KV = "gh_auth_down"    # kv while this project uses gh and the host's gh is logged out
 STATE = "gh-auth.json"
 LOCK = "gh-auth.lock"
@@ -158,7 +159,7 @@ def uses_gh(db) -> bool:
                for t in db.q(f"SELECT labels, result FROM tasks WHERE {OPEN_TASKS} AND status IN ('queued','waiting')"))
 
 
-def text(st: dict, host: str, when: str) -> str:
-    return (f"gh is logged out on {host} since {when} ({st.get('error') or 'gh auth status failed'}): PR watching, "
-            f"CI waits and other gh calls of every project on {host} fail until the user runs `gh auth login` "
-            f"there (ssh {host}). Nothing else is needed: the alert clears once `gh auth status` passes.")
+def text(st: dict, host: str, when: str, cfg: dict | None = None) -> str:
+    """The harness condition: what is skipped and the route setting (ghroute); never a login step."""
+    from . import ghroute
+    return ghroute.down_text(host, when, st.get("error") or "gh auth status failed", cfg)

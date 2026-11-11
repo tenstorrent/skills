@@ -96,7 +96,7 @@ CLEARED_TEXT = {
     "coord-budget": "No coordinator item is parked over its per-turn budget any more.",
     "linger-off": "Linger is on again: the daemon starts at boot without a login.",
     "notifier": "Desktop notifications deliver again.",
-    "gh-auth": "gh is logged in again on this host: PR watching and CI waits read GitHub again.",
+    "gh-auth": "gh works again on this host (logged in, or its delivery.gh_route answers): PR watching and CI waits read GitHub again.",
     "ssh-agent": "ssh signs again here: the ssh agent is unlocked or no longer waits for approval.",
     "tick-step": "Daemon tick step {arg} runs again.",
     "pause-gone": "Machine change #{arg} is closed, or the resource pause its undo resumes is back.",
@@ -106,10 +106,9 @@ CLEARED_TEXT = {
 # high alert; their clearing is a low feed line, not a new notification (netwait.py).
 # linger-off: the systemd service would not start at boot without a login (downtime.py).
 # notifier: this machine's desktop notifications fail (notifier.py; a system setting or a missing tool).
-# gh-auth: this host's gh is logged out while a project here uses gh (ghauth.py; `gh auth login`).
 # fleethold: a hold the user set is past its expected end while tasks here wait on it (fleethold.passed_alerts).
 USER_BLOCKERS = ("network", "paused", "coord-budget", "linger-off", "notifier", "fleethold", "user-step",
-                 "slurm-paused", "gh-auth", "model-ranking-key", "ssh-agent")   # ssh-agent: a locked or waiting password-manager agent here (sshagent.py); model-ranking-key: no Artificial Analysis key (rankfresh); slurm-paused: the checks overflow's start-failure breaker (slurmcheck); paused: a long project pause (projpause); user-step: userstep.py
+                 "slurm-paused", "model-ranking-key", "ssh-agent")   # ssh-agent: a locked or waiting password-manager agent here (sshagent.py); model-ranking-key: no Artificial Analysis key (rankfresh); slurm-paused: the checks overflow's start-failure breaker (slurmcheck); paused: a long project pause (projpause); user-step: userstep.py
 CLEARED_SEVERITY = {"network": "low", "paused": "low", "fleethold": "low", "coord-budget": "low", "account-mismatch": "low",
                     "linger-off": "low", "notifier": "low", "user-step": "low", "slurm-paused": "low", "gh-auth": "low",
                     "model-ranking-key": "low", "ssh-agent": "low"}

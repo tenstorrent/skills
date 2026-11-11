@@ -104,7 +104,8 @@ def test_a_gh_logout_raises_one_alert_per_host_that_names_the_users_step_and_cle
     tick(dp, dq)
     assert _gh_calls(calls) == ["auth status"], "one check for the host"
     sent = [m for m in p.db.unread_for_chat("c1", 0)]
-    assert len(sent) == 1 and "`gh auth login`" in sent[0]["text"] and hostname() in sent[0]["text"], sent
+    assert len(sent) == 1 and "delivery.gh_route" in sent[0]["text"] and hostname() in sent[0]["text"], sent
+    assert "auth login" not in sent[0]["text"] and "log in" not in sent[0]["text"], "a login step on a lab host"
     assert p.db.one("SELECT severity FROM messages WHERE ref=?", (ghauth.KEY,))["severity"] == "normal"
     assert q.db.unread_for_chat("c1", 0) == [], "the second project told the chat again"
     assert alerts.holds(p.db, ghauth.KEY, 0, time.time())
@@ -117,7 +118,7 @@ def test_a_gh_logout_raises_one_alert_per_host_that_names_the_users_step_and_cle
     assert ghauth.read()["ok"] is True and not p.db.kv(ghauth.KV) and not q.db.kv(ghauth.KV)
     (ep,) = alerts.sweep(p.db)
     assert ep["key"] == ghauth.KEY
-    assert p.db.one("SELECT severity FROM messages WHERE text LIKE 'Cleared: gh is logged in again%'")["severity"] == "low"
+    assert p.db.one("SELECT severity FROM messages WHERE text LIKE 'Cleared: gh works again%'")["severity"] == "low"
 
 
 def test_pr_watch_says_error_not_ok_when_gh_is_logged_out(env, monkeypatch):
@@ -129,7 +130,7 @@ def test_pr_watch_says_error_not_ok_when_gh_is_logged_out(env, monkeypatch):
     p.db.x("INSERT INTO tasks(title,kind,status,pr_url,created) VALUES('t','code','waiting',?,?)",
            ("https://github.com/acme/widgets/pull/3", time.time()))
     status = watchers.watch_prs(Daemon(p.base))
-    assert status.startswith("error:") and "gh auth login" in status, status
+    assert status.startswith("error: degraded:") and "delivery.gh_route" in status and "auth login" not in status, status
     st = ghauth.read()
     assert float(st["nudged"]) > float(st.get("checked_at") or 0), "the host check was not asked to recheck"
 
@@ -138,7 +139,8 @@ def test_ttp_ci_exits_broken_not_not_yet_when_gh_is_logged_out(env, monkeypatch)
     from ttp import ciwait
     _stub_gh(env, monkeypatch, rc=4, err="To get started with GitHub CLI, please run:  gh auth login")
     rc, lines = ciwait.probe(repo="acme/widgets", sha="0" * 40)
-    assert rc == 4 and lines[0].startswith("broken:") and "gh auth login" in lines[0], (rc, lines)
+    assert rc == 4 and lines[0].startswith("broken:") and "delivery.gh_route" in lines[0], (rc, lines)
+    assert "auth login" not in lines[0], lines
     _stub_gh(env, monkeypatch, rc=1, err="error connecting to api.github.com")
     assert ciwait.probe(repo="acme/widgets", sha="0" * 40)[0] == 75, "a network failure is still not yet"
 
@@ -236,3 +238,103 @@ def test_the_tick_path_gh_nudge_never_waits_on_a_running_host_check(env, monkeyp
         assert time.monotonic() - t0 < 5 and "nudged" not in ghauth.read()
     finally:
         os.close(fd)
+
+
+def _no_login_here(env, monkeypatch):
+    """This host's gh logged out (a stub gh, scratch HOME), a stub ssh recording its argv, and a
+    checkout whose origin is an https GitHub URL; returns (ssh calls file, gh calls file, checkout)."""
+    from ttp import ghauth, ghroute
+    _answer, gh_calls = _stub_gh(env, monkeypatch, rc=4, err="To get started with GitHub CLI, please run:  gh auth login")
+    ghroute._memo.clear()
+    assert ghauth.check(time.time())["ok"] is False
+    d = env["tmp"] / "ghstub"
+    ssh_calls = d / "ssh_calls"
+    (d / "ssh").write_text(f'#!/bin/sh\nfor a in "$@"; do printf "%s\\n" "$a"; done >> "{ssh_calls}"\necho "[]"\n')
+    (d / "ssh").chmod(0o755)
+    repo = env["tmp"] / "ghrepo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "remote", "add", "origin", "https://github.com/acme/widgets.git"], check=True)
+    return ssh_calls, gh_calls, repo
+
+
+def test_gh_route_runs_gh_on_the_route_when_this_host_has_no_login(env, monkeypatch, capfd):
+    """No gh login here (lab hosts keep none): gh calls run on delivery.gh_route over ssh, with -R for
+    the checkout's repo and {owner}/{repo} filled, never on this host's logged-out gh."""
+    from ttp import ghroute
+    ssh_calls, gh_calls, repo = _no_login_here(env, monkeypatch)
+    cfg = {"delivery": {"gh_route": "gh-box"}}
+    assert ghroute.wanted(["pr", "view", "3"], cfg, str(repo))
+    assert ghroute.run("gh", ["pr", "view", "3", "--json", "state"], cfg=cfg, cwd=str(repo)) == 0
+    assert capfd.readouterr().out.strip() == "[]"
+    argv = ssh_calls.read_text().splitlines()
+    assert "BatchMode=yes" in argv and argv[argv.index("--") - 1] == "gh-box", argv
+    assert "gh pr view 3 --json state -R acme/widgets" in argv[-1], argv
+    assert not any(c.startswith("pr ") for c in _gh_calls(gh_calls)), "ran on the logged-out gh here"
+    assert ghroute.works(), "a routed call that answered is the route working"
+    via = ghroute.routed(["api", "repos/{owner}/{repo}/pulls"], cfg, str(repo))
+    assert "repos/acme/widgets/pulls" in via[-1], via
+    assert ghroute.routed(["pr", "view", "3"], {"delivery": {}}, str(repo)) is None, "no route, nothing routed"
+    assert ghroute.problem("gh-box") == "" and ghroute.problem("local") and ghroute.problem("a b")
+
+
+def test_no_route_falls_back_read_only_and_holds_writes_with_no_login_step(env, monkeypatch, capfd):
+    """No route: a gh write is held (exit 75) and retried later, reads run read-only, and neither the
+    held note, the host's condition nor pr-watch's status tells anyone to log gh in."""
+    from ttp import ghauth, ghroute, watchers
+    from ttp.daemon import Daemon
+    ssh_calls, gh_calls, repo = _no_login_here(env, monkeypatch)
+    cfg = {"delivery": {}}
+    assert ghroute.wanted(["pr", "comment", "3", "-b", "x"], cfg, str(repo))
+    assert ghroute.run("gh", ["pr", "comment", "3", "-b", "x"], cfg=cfg, cwd=str(repo)) == ghroute.HELD_RC
+    held = capfd.readouterr()
+    held = held.out + held.err
+    assert "delivery.gh_route" in held and "not sent" in held, held
+    assert not ssh_calls.exists() and not any("comment" in c for c in _gh_calls(gh_calls))
+    assert ghroute.is_write(["api", "-X", "POST", "repos/a/b/issues"]) and not ghroute.is_write(["api", "repos/a/b"])
+    alert = ghauth.text(ghauth.read(), "lab-1", "21:00", cfg)
+    assert "delivery.gh_route is unset" in alert and "degraded" in alert and "held" in alert, alert
+    p = make(env)
+    p.db.x("INSERT INTO tasks(title,kind,status,pr_url,created) VALUES('t','code','waiting',?,?)",
+           ("https://github.com/acme/widgets/pull/3", time.time()))
+    status = watchers.watch_prs(Daemon(p.base))
+    for said in (held, alert, status):
+        assert "auth login" not in said and "log in" not in said.lower(), said
+
+
+def test_ask_gate_refuses_a_gh_login_ask_on_a_remote_host(env):
+    """No GitHub login is kept on lab hosts: an ask or notify telling the user to log gh in there is
+    refused, naming the route setting; one about the user's own machine, or another tool, is not."""
+    from ttp import coordinator as coord, ghroute
+    text = "gh is logged out on the build host, so PR watching stopped. Please run gh auth login there."
+    assert "delivery.gh_route" in ghroute.login_ask(text)
+    assert ghroute.login_ask("Please log gh in on the lab box so CI waits work.")
+    assert ghroute.login_ask("Run gh auth login on your laptop to finish the setup.") == ""
+    assert ghroute.login_ask("The Slurm token expired; please kinit again.") == ""
+    p = make(env)
+    problems, ask = _ask(p, text, blocking="access", recommendation="log in")
+    assert ask is None and problems and "delivery.gh_route" in problems[0], problems
+    problems = coord.apply(p, [{"type": "notify", "text": text, "severity": "normal"}])
+    assert problems and "notify rejected" in problems[0], problems
+
+
+def test_https_push_without_login_goes_over_the_ssh_form_and_its_failure_names_the_setting(env, monkeypatch):
+    """An https GitHub remote with no https login here: `git push` gets the remote's ssh form on its own
+    command line (the stored remote unchanged, no credential written); a push that still fails for the
+    login waits and names the route setting, never a login step."""
+    from ttp import ghroute, gitmemo
+    _ssh, _gh, repo = _no_login_here(env, monkeypatch)
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(env["tmp"] / "gitconfig"))   # no credential helper
+    argv = ghroute.push_argv(["git", "-C", str(repo), "push", "origin", "main"])
+    assert argv[1:3] == ["-c", "url.git@github.com:.pushInsteadOf=https://github.com/"], argv
+    assert ghroute.push_argv(["git", "-C", str(repo), "fetch", "origin"])[1] == "-C", "only a push"
+    seen = []
+    monkeypatch.setattr(gitmemo, "_spawn", lambda a, t, kw: seen.append(list(a)))
+    gitmemo._run(["git", "-C", str(repo), "push", "origin", "main"])
+    assert "url.git@github.com:.pushInsteadOf=https://github.com/" in seen[0], seen
+    url = subprocess.run(["git", "-C", str(repo), "remote", "get-url", "origin"], capture_output=True, text=True)
+    assert url.stdout.strip() == "https://github.com/acme/widgets.git", "the stored remote was edited"
+    assert not (env["tmp"] / "gitconfig").exists() or "credential" not in (env["tmp"] / "gitconfig").read_text()
+    hint = ghroute.push_hint("git@github.com: Permission denied (publickey).\nfatal: Could not read from remote")
+    assert "delivery.gh_route" in hint and "waits" in hint and "log in" not in hint.lower().replace("nobody logs in", "")
+    assert ghroute.push_hint("! [rejected] main -> main (non-fast-forward)") == ""

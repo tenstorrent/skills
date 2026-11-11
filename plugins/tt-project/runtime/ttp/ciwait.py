@@ -19,7 +19,7 @@ import subprocess
 import time
 from datetime import datetime
 
-from . import ghauth
+from . import ghauth, ghroute
 
 FACTOR = 3.0
 FLOOR_MIN = 10.0     # a job is never called hung before this, however short it usually is
@@ -34,9 +34,19 @@ class LoggedOut(Exception):
 
 def _gh(args: list[str]) -> list | dict | None:
     try:
-        out = subprocess.run(["gh", *args], capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL)
+        via = ghroute.routed(args)   # no gh login here: on delivery.gh_route
+        out = subprocess.run(via or ["gh", *args], capture_output=True, text=True, timeout=30,
+                             stdin=subprocess.DEVNULL)
     except (OSError, subprocess.SubprocessError):
         return None
+    if via:
+        ghroute.mark(out.returncode != ghroute.SSH_RC)
+        if out.returncode == ghroute.SSH_RC:   # the route is down: a public read, else no answer
+            got = ghroute.public(["api", *args[1:]]) if args[:1] == ["api"] else None
+            try:
+                return json.loads(got[1]) if got else None
+            except ValueError:
+                return None
     if ghauth.auth_failed(out.returncode, out.stderr):
         raise LoggedOut((out.stderr.strip().splitlines() or [f"exit {out.returncode}"])[0][:200])
     if out.returncode != 0:
@@ -168,7 +178,9 @@ def probe(repo: str | None = None, branch: str | None = None, sha: str | None = 
         return _probe(repo, branch, sha, workflow, run, hang, **kw)
     except LoggedOut as e:
         ghauth.nudge()
-        return ghauth.AUTH_RC, [f"broken: gh is not logged in on this host ({e}); the user runs `gh auth login`"]
+        return ghauth.AUTH_RC, [f"broken: gh has no login on this host ({ghroute.quiet(str(e))}) and {ghroute.SETTING} is unset or down: "
+                                f"this CI wait is skipped; {ghroute.SETTING} (an ssh alias where gh is logged in) "
+                                f"routes it"]
 
 
 def _probe(repo, branch, sha, workflow, run, hang, **kw) -> tuple[int, list[str]]:

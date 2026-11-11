@@ -341,7 +341,6 @@ def test_a_login_ask_or_notify_needs_a_real_auth_failure(env, text):
 
 
 @pytest.mark.parametrize("text", [
-    "gh on the device box is logged out, so Claude cannot push. Please run gh auth login again there.",
     "The Slurm account token expired; please re-authenticate with kinit so the claude workers can submit jobs.",
     "The build server's SSO session expired, so codex runs cannot fetch artifacts; please log in again there.",
     "Claude cannot reach the device box: the host is logged out after the reboot. Please log in again on the console.",
@@ -359,7 +358,7 @@ def test_a_login_ask_or_notify_needs_a_real_auth_failure(env, text):
 def test_a_login_ask_about_another_credential_is_never_refused(env, text):
     """Reviews #2338 and #2354: the gate refuses only a login of the agent CLI itself (the provider is
     grammatically what is logged in) or one citing a plan-metering cue. An ask
-    about another credential or tool (gh, Slurm, kinit, SSO, a host) that only names a provider in
+    about another credential or tool (Slurm, kinit, SSO, a host) that only names a provider in
     passing is a real ask, sent with no auth breaker open. The test-only fake provider is no name to
     match unless the project's config uses it."""
     from ttp import alerts, coordinator as coord
@@ -2099,7 +2098,7 @@ def test_a_failed_batched_read_fails_its_prs_or_lets_each_ask_gh(env, monkeypatc
     if fail == "hang":
         assert status.startswith("cut short (0 of 5") and "acme/widgets#1 (5 s gh call timeout)" in status, status
     elif "401" in fail[1]:   # a logged-out gh is an error, never ok
-        assert status.startswith("error: gh is not logged in") and "gh auth login" in status, status
+        assert status.startswith("error: degraded: gh has no login") and "delivery.gh_route" in status, status
     else:
         assert status == "ok (5 PRs, 0 changed)", status
 

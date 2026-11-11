@@ -436,7 +436,8 @@ def _run(argv: list | tuple, *, timeout: float | None = None, read: bool | None 
     capped by timeout() for the verb argv names (`read` as there). Within an attempt a read's answer
     is kept and replayed; within a strict round a read's miss runs live only within the slice (a write
 keeps its own cap and makes the round's point of no return)."""
-    from . import gitreplay
+    from . import ghroute, gitreplay
+    argv = ghroute.push_argv(argv, kw.get("cwd"))   # an https GitHub push with no login here goes over ssh
     args = git_args(argv)
     a = _att.get()
     if a is None:

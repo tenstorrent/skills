@@ -57,7 +57,7 @@ from . import (checkcap, checkdirs, checklane, checkspill, cleantree, conflictfi
                scriptwatch, setupfault, syntaxfault, testslots, workerloss, urgent,
                sharedchecks, slowtests, suitecost, verdictcarry, worktree)
 from .project import Project, command_env, durable_write, write_json
-from . import gatetime, gitmemo, hoststate
+from . import ghroute, gatetime, gitmemo, hoststate
 
 WORKTREE = "push"             # the batch's own checkout under the project's worktrees (never t<id>)
 AFTER_PUSH = "after_push-"    # + batch id: the temporary checkout after_push runs in
@@ -1723,6 +1723,9 @@ class Batch:
                 return "moved"
             if self._hold_scoped(tip, carried, r.stderr):
                 return "held"
+            if hint := ghroute.push_hint(r.stderr):   # no GitHub login here: the host, not the batch
+                return self._all("requeued", "env_fault", f"push to {self.target} waits: {hint}",
+                                 keep=("landed", "refused"))
             self.message = f"push to {self.target} was rejected: {_last(r.stderr, 5)}"
             say(self.message)
             return self._close(0, "rejected", carried)

@@ -4645,9 +4645,9 @@ class Daemon:
 
     def check_gh_auth(self) -> None:
         """While this project uses gh: the host-wide gh login check (ghauth.py) in a thread when it is due,
-        and one machine-wide alert while it says logged out, naming the host and `gh auth login`; it clears
-        once the check passes."""
-        from . import ghauth
+        and, while it says logged out and no delivery.gh_route answers (ghroute), one machine-wide harness
+        condition naming the route setting and what is skipped, never a login step; it clears once gh works."""
+        from . import ghauth, ghroute
         db = self.p.db
         if not ghauth.uses_gh(db):
             if db.kv(ghauth.KV):
@@ -4658,12 +4658,12 @@ class Daemon:
                 and (not os.environ.get("PYTEST_CURRENT_TEST") or os.environ.get("TTP_TEST_GH_AUTH")):
             self._gh_auth = threading.Thread(target=ghauth.check, daemon=True, name="gh-auth")
             self._gh_auth.start()
-        if st.get("ok") is False:
+        if st.get("ok") is False and not ghroute.works():
             if not db.kv(ghauth.KV):
                 db.set_kv(ghauth.KV, {"since": st.get("since")})
             when = timefmt.short(float(st.get("since") or time.time()), self.p)
-            self.alert(ghauth.KEY, ghauth.text(st, hostname(), when), severity="normal")
-        elif st.get("ok") and db.kv(ghauth.KV):
+            self.alert(ghauth.KEY, ghauth.text(st, hostname(), when, self.cfg), severity="normal")
+        elif db.kv(ghauth.KV) and (st.get("ok") or ghroute.works()):
             db.x("DELETE FROM kv WHERE key=?", (ghauth.KV,))
 
     def check_chats(self) -> None:
@@ -14950,7 +14950,7 @@ class Daemon:
             nb = now + retry if held else min(now + retry, start + max_hold)
             what = self._wait_what(tid, prev)
             says = "host unreachable" if rc == 255 else \
-                "gh is logged out on this host (the host's gh-auth alert asks for `gh auth login`)" if gh_down \
+                "gh has no login on this host and no delivery.gh_route answers (the host's gh-auth condition)" if gh_down \
                 else "not yet"
             db = self.p.db
             db.update_task(tid, not_before=nb, blocked_reason=(

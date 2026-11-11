@@ -38,6 +38,7 @@ from . import (   # one name per line: two changes adding names merge without a 
     chaincap,
     channeltag,
     charterpromise,
+    ghroute,
     chartertemplate,
     configwho,
     coordfix,
@@ -444,6 +445,8 @@ USER_SETTABLE = {
     "delivery.push_checks_by_repo": lambda v: push.checks_by_repo_of(v),
     # The ssh alias the checks run on (remotecheck) when the project may not run them here; "" for here.
     "delivery.checks_host": lambda v: push.checks_host_of(v),
+    # The ssh alias gh calls run on (with -R) when this host has no gh login (ghroute); "" for none.
+    "delivery.gh_route": lambda v: ghroute.value_of(v),
     # Ordered ssh aliases a run whose slots here stay busy may spill to (checkspill); a list, never a scalar.
     "delivery.checks_spill_hosts": lambda v: checkspill.hosts_of(v),
     "delivery.checks_spill_after_s": lambda v: checkspill.after_of(v),
@@ -3421,7 +3424,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 if why:
                     _count_refusal(db, key, "untried host", text)
                     raise ValueError(f"ask_user rejected: {why}")
-                why = _false_login_ask(db, f"{text} {a.get('recommendation') or ''}", cfg)
+                why = _false_login_ask(db, f"{text} {a.get('recommendation') or ''}", cfg) \
+                    or ghroute.login_ask(f"{text} {a.get('recommendation') or ''}")
                 if why:
                     _count_refusal(db, key, "false login", text)
                     raise ValueError(f"ask_user rejected: {why}")
@@ -3512,6 +3516,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                                 str(a.get("quote") or ""), slack=from_config(cfg), project=p.name)
             elif t == "notify":
                 why = _owned_fix_question(a["text"]) or _false_login_ask(db, a["text"], cfg) \
+                    or ghroute.login_ask(a["text"]) \
                     or (outagemsg.bare(a["text"]) if a.get("outage") is True else "")
                 if why:
                     raise ValueError(f"notify rejected: {why}")
