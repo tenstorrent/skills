@@ -5152,8 +5152,8 @@ class Daemon:
         from . import checkgaps
         checkgaps.rerun(self)
         db, now = self.p.db, time.time()
-        for mid, st in batchrun.tend(self.p):   # a batch whose lead ended: each member settles alone
-            log(self.p, f"task {mid}: batch member settled {st}")
+        for mid, st, why in batchrun.tend(self.p):   # a batch whose lead ended: each member settles alone
+            log(self.p, f"task {mid}: batch member settled {st}: {why}")
         in_batch = batchrun.held(db)   # members of a live batch run: the lead's run is theirs
         for t in db.q("SELECT * FROM tasks WHERE status='running' AND NOT EXISTS "
                       "(SELECT 1 FROM runs WHERE runs.task=tasks.id AND runs.status='running')"):
@@ -12299,6 +12299,10 @@ class Daemon:
             if why := dispatchguard.refusal(db, task):   # ended since the read, or done again and again
                 log(self.p, f"task {task['id']} not dispatched: {why}")
                 dispatchguard.refuse(db, task["id"], why)   # still queued: back to done, on record
+                fate[task["id"]] = "other"
+                continue
+            if why := batchrun.close_landed(self.p, task):   # a requeued batch member that landed since
+                log(self.p, f"task {task['id']} not dispatched: {why}")
                 fate[task["id"]] = "other"
                 continue
             if why := supersede.dispatch_hold(db, task):   # a duplicate, or a step a newer order superseded

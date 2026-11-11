@@ -409,6 +409,28 @@ def task_shas(p, tid: int) -> tuple[list[str], str]:
     return [head], f"its branch {branch}"
 
 
+def trailer_sha(p, tid: int, since: float | None = None) -> str:
+    """The newest commit on the push branch (local ref, no fetch) whose message carries task `tid`'s
+    own `Task: #<id>` trailer and that no later commit there reverts ("This reverts commit <sha>"),
+    committed after `since`; "" when none, or no push branch. A batch run commits each member with
+    that trailer, so this finds a member's landing that no hand-off or push record names."""
+    if not _has_push_branch(p):
+        return ""
+    try:
+        tip = _commit(p.root, _push_ref(p, p.root))
+    except ValueError:
+        return ""
+    if not tip:
+        return ""
+    after = [f"--since=@{int(since)}"] if since else []
+    shas = _git(p.root, "log", "--format=%H", "-E", f"--grep=^Task: #{int(tid)}([^0-9]|$)", *after, tip).stdout.split()
+    if not shas:
+        return ""
+    reverts = _git(p.root, "log", "--format=%B", "--grep=This reverts commit", *after, tip).stdout
+    gone = set(re.findall(r"This reverts commit ([0-9a-f]{40,64})", reverts))
+    return next((s for s in shas if s not in gone), "")
+
+
 def _task_repos(p, tid: int) -> list[Path]:
     """The repositories other than the project root's that task `tid` worked in, newest run first:
     each run's recorded working directory (run.json cwd), or the nearest folder above it once that

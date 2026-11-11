@@ -18,10 +18,14 @@ cost is booked to each member pro rata to their budgets (book). Members wait as 
 blocked_reason naming the lead, which reconcile_tasks leaves alone (held). Once the lead leaves
 running, waiting and review (settle): with the lead done, a member whose outcome is done is done on
 the lead's branch, which the lead's one review and landing cover; a blocked one is blocked with its
-reason; a failed or missing one goes back to the queue alone, on a branch of its own. The record is the
-kv `batchrun:<lead>` (id, lead, members, branch, run; once settled also `settled` and each member's
-`outcomes`, kept 14 days), which status, the web app, the digest and the
-review and checks paths read (members_of, batch_of). No model, no git command.
+reason; a member whose own `Task: #<id>` commit is on the push branch (landed.trailer_sha) is done as
+landed whatever the hand-off says, unless it marks it failed or blocked; a failed or missing one goes
+back to the queue alone, on a branch of its own, and dispatch closes it instead of running it once its
+commit has landed since (close_landed). A lead asleep on its own wait (a waiting hand-off, stored as
+queued) still holds its members (holds). The record is the kv `batchrun:<lead>` (id, lead, members,
+branch, run; once settled also `settled`, each member's `outcomes` and `why`, kept 14 days), which
+status, the web app, the digest and the review and checks paths read (members_of, batch_of). No model;
+git only to read the push branch's log.
 """
 from __future__ import annotations
 
@@ -36,6 +40,54 @@ HOLDING = ("running", "waiting", "review")   # lead statuses that keep its membe
 SMALL = ("light", "standard")
 NO_START = ("wait", "resume")
 KEEP_S = 14 * 86400   # a settled record stays readable (review and checks grouping) this long
+
+
+def holds(lead: dict | None) -> bool:
+    """The lead still holds its members: it runs, waits or is in review, or it is queued asleep on its
+    own wait (a waiting hand-off is stored as queued with a `waiting` result), as a detached push is."""
+    if not lead:
+        return False
+    if lead["status"] in HOLDING:
+        return True
+    return lead["status"] == "queued" and str((load_result(lead.get("result")) or {}).get("status")) == "waiting"
+
+
+def landed_sha(p, tid: int, since: float | None = None) -> str:
+    """Task `tid`'s own `Task: #<id>` commit on the push branch (landed.trailer_sha), "" when none or
+    it cannot be read: never raises, so a git fault only leaves the member to the queue."""
+    from . import landed
+    try:
+        return landed.trailer_sha(p, tid, since)
+    except Exception:
+        return ""
+
+
+def close_landed(p, task: dict) -> str:
+    """Dispatch's check of a batch member settle requeued: once its own commit is on the push branch it is
+    closed done as landed (not run again) and the reason returned; "" when it was not requeued from a
+    batch or has not landed."""
+    res = load_result(task.get("result"))
+    if not isinstance(res, dict) or res.get("status") != "requeued" or not isinstance(res.get("batch"), dict):
+        return ""
+    if not (sha := landed_sha(p, task["id"], task.get("created"))):
+        return ""
+    why = f"its commit {sha[:10]} from batch run {res['batch'].get('id')} is on the push branch: closed as landed, not run again"
+    p.db.update_task(task["id"], status="done", blocked_reason=None,
+                     result=dump_result({"status": "done", "summary": why, "landed": sha, "batch": res["batch"]}))
+    return why
+
+
+def _members_arg(got):
+    """A hand-off's `members`: a list, or a list written as a JSON or Python literal string."""
+    if isinstance(got, str):
+        import ast
+        for parse in (json.loads, ast.literal_eval):
+            try:
+                got = parse(got)
+                break
+            except (ValueError, SyntaxError, TypeError):
+                continue
+    return got if isinstance(got, list) else None
 
 
 def enabled(cfg: dict) -> bool:
@@ -219,8 +271,7 @@ def held(db) -> set[int]:
     """Members of batches whose lead still runs, waits or is in review: never requeued as orphans."""
     out: set[int] = set()
     for rec in live(db):
-        lead = db.task(rec["lead"])
-        if lead and lead["status"] in HOLDING:
+        if holds(db.task(rec["lead"])):
             out |= set(rec.get("members", []))
     return out
 
@@ -245,10 +296,10 @@ def book(db, lead_id: int, cost: float) -> dict[int, float]:
 def outcomes(p, lead: dict) -> dict[int, dict]:
     """The lead's per-member outcomes: its stored result's `members`, else the newest run's result.json."""
     def rows_of(res):   # a waiting hand-off's outcomes ride in its on_pass
-        got = res.get("members") if isinstance(res, dict) else None
-        if not isinstance(got, list) and isinstance(res, dict) and isinstance(res.get("on_pass"), dict):
-            got = res["on_pass"].get("members")
-        return got if isinstance(got, list) else None
+        got = _members_arg(res.get("members")) if isinstance(res, dict) else None
+        if got is None and isinstance(res, dict) and isinstance(res.get("on_pass"), dict):
+            got = _members_arg(res["on_pass"].get("members"))
+        return got
     rows = rows_of(load_result(lead.get("result")))
     if rows is None:
         for r in p.db.q("SELECT id, dir FROM runs WHERE task=? ORDER BY id DESC LIMIT 5", (lead["id"],)):
@@ -268,15 +319,17 @@ def outcomes(p, lead: dict) -> dict[int, dict]:
     return out
 
 
-def settle(p, lead_id: int) -> list[tuple[int, str]]:
-    """Settle the members of a batch whose lead left running, waiting and review; drop its record.
-    Returns (member, new status)."""
+def settle(p, lead_id: int) -> list[tuple[int, str, str]]:
+    """Settle the members of a batch whose lead no longer holds them (holds); drop its record.
+    Returns (member, new status, why)."""
     db, rec = p.db, batch_of(p.db, lead_id)
     lead = db.task(lead_id)
-    if rec is None or rec.get("settled") or (lead and lead["status"] in HOLDING):
+    if rec is None or rec.get("settled") or holds(lead):
         return []
     got = outcomes(p, lead) if lead and lead["status"] == "done" else {}
     done_ok = bool(lead) and lead["status"] == "done"
+    # Commit dates: a member commits after its run started, and a rebase only moves them later.
+    since = float(rec["started"]) - 3600 if rec.get("started") else None
     out = []
     for mid in rec.get("members", []):
         m = db.task(mid)
@@ -285,29 +338,35 @@ def settle(p, lead_id: int) -> list[tuple[int, str]]:
         o = got.get(mid) or {}
         st = str(o.get("status") or "")
         info = {"id": rec["id"], "lead": lead_id, "members": rec.get("members", [])}
-        if done_ok and st == "done":
+        sha = "" if (done_ok and st == "done") or st in ("failed", "blocked") else landed_sha(p, mid, since)
+        if (done_ok and st == "done") or sha:
+            why = (f"its commit {sha[:10]} is on the push branch: closed as landed" if sha and st != "done" else
+                   str(o.get("summary") or f"done in batch run of #{lead_id}"))
             db.update_task(mid, status="done", branch=rec.get("branch"), blocked_reason=None,
-                           result=dump_result({"status": "done", "summary": str(o.get("summary") or
-                                               f"done in batch run of #{lead_id}"), "batch": info,
+                           result=dump_result({"status": "done", "summary": why, "batch": info,
+                                               **({"landed": sha} if sha else {}),
                                                **({"followups": o["followups"]} if o.get("followups") else {})}))
+            st = "done"
         elif done_ok and st == "blocked":
-            db.update_task(mid, status="blocked", branch=None,
-                           blocked_reason=str(o.get("reason") or f"blocked in batch run of #{lead_id}")[:500],
+            why = str(o.get("reason") or f"blocked in batch run of #{lead_id}")[:500]
+            db.update_task(mid, status="blocked", branch=None, blocked_reason=why,
                            result=dump_result({"status": "blocked", "summary": str(o.get("summary") or ""),
                                                "batch": info}))
         else:
-            st = "queued"
             why = str(o.get("reason") or o.get("summary") or
                       (f"no outcome in batch run of #{lead_id}" if done_ok else
                        f"batch lead #{lead_id} ended {lead['status'] if lead else 'missing'}"))[:300]
+            why += f" ({'marked failed' if st == 'failed' else 'its commit is not on the push branch'}): requeued alone"
+            st = "queued"
             db.update_task(mid, status="queued", branch=None, blocked_reason=None,
                            result=dump_result({"status": "requeued", "summary": why, "batch": info}))
-        out.append((mid, "done" if done_ok and st == "done" else st))
-    db.set_kv(KV + str(lead_id), {**rec, "settled": time.time(), "outcomes": {str(m): s for m, s in out}})
+        out.append((mid, st, why))
+    db.set_kv(KV + str(lead_id), {**rec, "settled": time.time(), "outcomes": {str(m): s for m, s, _ in out},
+                                  "why": {str(m): w for m, _, w in out}})
     return out
 
 
-def tend(p) -> list[tuple[int, str]]:
+def tend(p) -> list[tuple[int, str, str]]:
     """settle() every batch whose lead no longer holds it (reconcile_tasks, each tick)."""
     out, now = [], time.time()
     for rec in live(p.db, settled=True):
@@ -315,8 +374,7 @@ def tend(p) -> list[tuple[int, str]]:
             if now - float(rec["settled"]) > KEEP_S:
                 p.db.x("DELETE FROM kv WHERE key=?", (KV + str(rec["lead"]),))
             continue
-        lead = p.db.task(rec["lead"])
-        if not lead or lead["status"] not in HOLDING:
+        if not holds(p.db.task(rec["lead"])):
             out += settle(p, rec["lead"])
     return out
 

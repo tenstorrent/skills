@@ -154,7 +154,8 @@ def test_batch_settle_isolates_failed_and_blocked_members(env, monkeypatch):
     batchrun.record(p.db, lead2, [m2], "ttp/t-two", p.config())
     p.db.update_task(m2["id"], status="running", branch="ttp/t-two")
     p.db.update_task(lead2["id"], status="failed")
-    assert batchrun.tend(p) == [(m2["id"], "queued")]
+    (got,) = batchrun.tend(p)
+    assert got[:2] == (m2["id"], "queued") and "requeued alone" in got[2]
     assert p.db.task(m2["id"])["branch"] is None
     # Outcomes handed off in a waiting hand-off's on_pass count, read from the run's result.json.
     lead3, m3 = _batch_tasks(p, 2)
@@ -167,7 +168,91 @@ def test_batch_settle_isolates_failed_and_blocked_members(env, monkeypatch):
     p.db.x("INSERT INTO runs(task,role,provider,status,started,dir) VALUES(?,'worker','claude','ok',?,?)",
            (lead3["id"], time.time(), str(run_dir)))
     p.db.update_task(lead3["id"], status="done")
-    assert batchrun.tend(p) == [(m3["id"], "done")]
+    assert [r[:2] for r in batchrun.tend(p)] == [(m3["id"], "done")]
+
+
+def _land_member_commits(p, ids, branch="land"):
+    """A push branch `branch` (no remote: the local ref) with one commit per task id carrying its
+    `Task: #<id>` trailer, as a batch run commits each member."""
+    p.set_config("delivery.push_branch", branch)
+    root = str(p.root)
+    git = lambda *a: subprocess.run(["git", "-C", root, *a], capture_output=True, text=True, check=True).stdout
+    if subprocess.run(["git", "-C", root, "rev-parse", "--verify", "-q", f"refs/heads/{branch}"],
+                      capture_output=True).returncode:
+        git("branch", branch, "HEAD")
+    tip = git("rev-parse", f"refs/heads/{branch}").strip()
+    for tid in ids:
+        tree = git("rev-parse", f"{tip}^{{tree}}").strip()
+        tip = git("commit-tree", tree, "-p", tip, "-m", f"fix {tid}\n\nTask: #{tid}").strip()
+    git("update-ref", f"refs/heads/{branch}", tip)
+    return tip
+
+
+def test_batch_members_whose_commits_landed_close_with_the_lead(env, monkeypatch):
+    # A lead asleep on its own wait (a detached push: a waiting hand-off, stored as queued) still holds
+    # its members; once it lands with a hand-off that names no `members`, each member whose own
+    # `Task: #<id>` commit is on the push branch is done as landed, and none is requeued.
+    from ttp import batchrun
+    from ttp.db import dump_result, load_result
+    p = make(env)
+    lead, a, b = _batch_tasks(p, 3)
+    batchrun.record(p.db, lead, [a, b], "ttp/t-lead", p.config())
+    for m in (a, b):
+        p.db.update_task(m["id"], status="running", branch="ttp/t-lead")
+    p.db.update_task(lead["id"], status="queued", result=dump_result({"status": "waiting", "retry_when": "x"}))
+    assert batchrun.tend(p) == [] and {a["id"], b["id"]} <= batchrun.held(p.db)
+    _land_member_commits(p, [lead["id"], a["id"], b["id"]])
+    p.db.update_task(lead["id"], status="done", result=dump_result({"status": "done", "summary": "pushed"}))
+    got = batchrun.tend(p)
+    assert [r[:2] for r in got] == [(a["id"], "done"), (b["id"], "done")]
+    assert all("on the push branch: closed as landed" in r[2] for r in got)
+    for m in (a, b):
+        t = p.db.task(m["id"])
+        assert t["status"] == "done" and load_result(t["result"])["landed"]
+    assert batchrun.batch_of(p.db, lead["id"])["outcomes"] == {str(a["id"]): "done", str(b["id"]): "done"}
+
+
+def test_batch_member_marked_failed_is_requeued_alone(env):
+    # A member the hand-off marks failed goes back to the queue alone, even beside landed ones, and a
+    # `members` list written as a string still counts.
+    from ttp import batchrun
+    from ttp.db import dump_result, load_result
+    p = make(env)
+    lead, ok, bad = _batch_tasks(p, 3)
+    batchrun.record(p.db, lead, [ok, bad], "ttp/t-lead", p.config())
+    for m in (ok, bad):
+        p.db.update_task(m["id"], status="running", branch="ttp/t-lead")
+    _land_member_commits(p, [lead["id"], ok["id"]])
+    members = repr([{"id": ok["id"], "status": "done"}, {"id": bad["id"], "status": "failed", "reason": "flaky"}])
+    p.db.update_task(lead["id"], status="done", result=dump_result({"status": "done", "members": members}))
+    got = {r[0]: r for r in batchrun.tend(p)}
+    assert got[ok["id"]][1] == "done" and got[bad["id"]][1] == "queued"
+    assert "flaky (marked failed): requeued alone" == got[bad["id"]][2]
+    t = p.db.task(bad["id"])
+    assert t["status"] == "queued" and t["branch"] is None
+    assert load_result(t["result"])["status"] == "requeued"
+
+
+def test_requeued_batch_member_that_landed_since_is_closed_at_dispatch(env, monkeypatch):
+    # A member requeued while its commit was not on the push branch yet is closed as landed when
+    # dispatch next picks it, with no run started; one still not landed starts as usual.
+    from ttp import batchrun
+    from ttp.db import load_result
+    p = make(env)
+    d, started = _batch_daemon(p, monkeypatch)
+    lead, m, other = _batch_tasks(p, 3)
+    p.set_config("dispatch.batch", False)
+    batchrun.record(p.db, lead, [m, other], "ttp/t-lead", p.config())
+    for t in (m, other):
+        p.db.update_task(t["id"], status="running", branch="ttp/t-lead")
+    p.db.update_task(lead["id"], status="failed")
+    _land_member_commits(p, [])   # a push branch with neither member on it yet
+    assert sorted(r[:2] for r in batchrun.tend(p)) == [(m["id"], "queued"), (other["id"], "queued")]
+    _land_member_commits(p, [m["id"]])   # the lead's work landed later (a push queue batch)
+    d.dispatch()
+    t = p.db.task(m["id"])
+    assert t["status"] == "done" and "closed as landed, not run again" in load_result(t["result"])["summary"]
+    assert [k["task"]["id"] for _, k in started] == [other["id"]]
 
 
 def test_batch_cost_split_pro_rata(env):
