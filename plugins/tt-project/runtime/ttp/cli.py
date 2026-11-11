@@ -8865,7 +8865,7 @@ def _bench_run(p, a) -> None:
         opts = {"timeout_s": a.timeout or conf.get("timeout_s", 3600), "stall_s": conf.get("stall_s", 900),
                 "budget_usd": a.budget or conf.get("budget_usd", 8.0), "test_cmd": a.test_cmd or benchrun.TEST_CMD,
                 "test_timeout_s": conf.get("test_timeout_s", 900), "dry_run": a.dry_run,
-                "repo": Path(a.repo or p.root).expanduser().resolve(), "state": p.state}
+                "scratch_home": conf.get("scratch_home", True), "repo": Path(a.repo or p.root).expanduser().resolve(), "state": p.state}
         rows = benchrun.run(Path(a.bench).expanduser().resolve(), Path(a.out).expanduser().resolve(), arms,
                             a.reps or conf.get("reps", 1), seed, opts, cfg, limit=a.limit)
     except (benchrun.BenchError, OSError, ValueError) as e:

@@ -560,6 +560,98 @@ def test_bench_cells_get_venvs_of_their_own_with_the_user_site_off_and_pip_user_
             assert re.search(r"--user|virtualenv", r.stderr), r
 
 
+def test_bench_audit_flags_saved_sessions_named_by_a_relative_path_or_reached_with_dotdot(env, tmp_path, monkeypatch):
+    # Read deny rules do not cover Bash: `cd ~ && cat .claude/projects/...` or a cd into the cell's own
+    # session folder and `cat ../<other>` names no hidden path as written, so the audit reads each tool call.
+    from ttp import benchrun
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    hidden = benchrun.hidden_paths(tmp_path / "bench", tmp_path / "out", [], None)
+    own = benchrun.session_dirs(tmp_path / "cell-x" / "work")
+    task = {"head": "f" * 40}
+
+    def ran(cmd):
+        return json.dumps({"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Bash",
+                                                                          "input": {"command": cmd}}]}})
+    codex = json.dumps({"type": "item.started", "item": {"type": "command_execution",
+                                                         "command": "bash -lc 'cat .codex/sessions/2026/a.jsonl'"}})
+    for line in (ran("cd ~ && cat .claude/projects/-x/s.jsonl"), ran("cd $HOME; ls .codex/sessions"), codex,
+                 ran("cd ~/.claude && cat projects/-x/s.jsonl"), ran("cd ~/.cursor; ls chats"), "cat .claude/projects/x"):
+        assert any(f.startswith("names a saved-sessions folder by a relative path")
+                   for f in benchrun.audit(line, task, hidden, session=own)), line
+    for cmd in (f"cd {own[-1]} && cat ../-x/s.jsonl", f"cd {own[-1]}/s; cat ../../-x/s.jsonl", f"pushd {own[-1]}; ls .."):
+        assert benchrun.audit(ran(cmd), task, hidden, session=own) == ["climbs out of its own session folder with .."], cmd
+    # Honest calls: its own saved output, `..` in the workspace, a repo's own .claude folder, and outputs
+    # (a tool result quoting source code that names .claude/projects) are not the agent's reach.
+    said = json.dumps({"type": "user", "message": {"content": [{"type": "tool_result", "content": "x = '.claude/projects'"}]}})
+    for line in (ran(f"cat {own[-1]}/s/tool-results/x.txt"), ran("cd .. && ls"), ran("cat .claude/settings.json"),
+                 ran("git diff .claude-plugin/plugin.json"), ran("ls .codex && pytest tests/test_projects.py"), said):
+        assert benchrun.audit(line, task, hidden, session=own) == [], line
+
+
+def test_bench_cell_gets_a_config_folder_of_its_own_with_no_earlier_transcripts(env, tmp_path, monkeypatch):
+    from ttp import benchrun
+    from ttp.providers import get_provider
+    p, tid, task = _bench_built(env, tmp_path)
+    claude, codex = tmp_path / "claude", tmp_path / "codex"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude))
+    monkeypatch.setenv("CODEX_HOME", str(codex))
+    for d in (claude / "projects" / "-old", codex / "sessions" / "2026"):
+        d.mkdir(parents=True)
+        (d / "s.jsonl").write_text("earlier transcript\n")
+    (codex / "config.toml").write_text('model = "m"\n')
+    (codex / "hooks.json").write_text("{}\n")
+    monkeypatch.setenv("TTP_FAKE_SHELL", _BENCH_FIX + ' && printf "C=%s X=%s\\n" "$CLAUDE_CONFIG_DIR" "$CODEX_HOME" > conf.txt'
+                       ' && ls -AR "$CLAUDE_CONFIG_DIR" "$CODEX_HOME" >> conf.txt && git add conf.txt'
+                       ' && git -c user.email=c@example.com -c user.name=c commit -qm conf')
+    arms = {"a": {"provider": "claude", "model": "", "effort": ""}, "b": {"provider": "codex", "model": "", "effort": ""}}
+    out = tmp_path / "h2h"
+    rows = benchrun.run(tmp_path / "bench", out, arms, 1, 1, _bench_opts(tmp_path), p.config())
+    assert [r["outcome"] for r in rows] == ["pass", "pass"], rows
+    for arm, var, real, tag in (("a", "CLAUDE_CONFIG_DIR", claude, "C"), ("b", "CODEX_HOME", codex, "X")):
+        cell = out / "cells" / f"{tid}-r1-{arm}"
+        mine = json.loads((cell / "run.json").read_text())["env"][var]
+        assert Path(mine).parent.name.startswith("cell-") and Path(mine) != real
+        seen = (cell / "diff.patch").read_text().split("+++ b/conf.txt\n")[1].split("\ndiff --git")[0]
+        seen = [x[1:] for x in seen.splitlines() if x.startswith("+")]
+        assert any(f"{tag}={mine}" in x for x in seen), seen
+        listed, head = [], ""
+        for x in seen:
+            head = x[:-1] if x.endswith(":") and x.startswith("/") else head
+            listed += [x] if head.startswith(mine) and x != head + ":" else []
+        assert mine + ":" in seen and not any(n in x for x in listed for n in ("s.jsonl", "-old", "2026")), listed
+        if arm == "b":   # Codex's own hooks and config come along: its build decided the harness hook from them
+            assert "config.toml" in listed and "hooks.json" in listed
+    # Off on request: the CLIs' own folders, as before.
+    rows = benchrun.run(tmp_path / "bench", tmp_path / "h2h-off", arms, 1, 1, _bench_opts(tmp_path, scratch_home=False),
+                        p.config())
+    assert "CLAUDE_CONFIG_DIR" not in json.loads((tmp_path / "h2h-off" / "cells" / f"{tid}-r1-a" / "run.json").read_text())["env"]
+    # A real cell links each login in, so the CLI reads the live one; a token refresh (a new file in the
+    # cell's folder, not written through the link) goes back to the real file only while that is unchanged.
+    for name, real in (("claude", claude), ("codex", codex)):
+        login = Path(get_provider(name).credential_files()[0])
+        assert login.parent == real
+        login.write_text("old\n")
+        cell = Path(tempfile.mkdtemp(prefix="cell-", dir=tmp_path))
+        conf, links = benchrun.scratch_home(name, cell)
+        mine = Path(next(iter(conf.values()))) / login.name
+        assert mine.is_symlink() and mine.resolve() == login.resolve() and not (mine.parent / "projects").exists()
+        benchrun.restore_logins(links)
+        assert login.read_text() == "old\n" and mine.is_symlink(), "an untouched link changes nothing"
+        (mine.parent / "new").write_text("refreshed\n")
+        os.replace(mine.parent / "new", mine)
+        benchrun.restore_logins(links)
+        assert login.read_text() == "refreshed\n" and login.stat().st_mode & 0o777 == 0o600
+        conf, links = benchrun.scratch_home(name, Path(tempfile.mkdtemp(prefix="cell-", dir=tmp_path)))
+        mine = Path(next(iter(conf.values()))) / login.name
+        mine.unlink()
+        mine.write_text("mine\n")
+        login.write_text("elsewhere\n")   # refreshed by another run meanwhile: that one wins
+        benchrun.restore_logins(links)
+        assert login.read_text() == "elsewhere\n"
+    assert benchrun.scratch_home("chat", Path(tempfile.mkdtemp(prefix="cell-", dir=tmp_path))) == ({}, [])
+
+
 def test_bench_run_agent_and_grade_of_each_cell_run_in_venvs_of_their_own(env, tmp_path, monkeypatch):
     from ttp import benchrun
     p, tid, task = _bench_built(env, tmp_path)

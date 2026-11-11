@@ -1227,7 +1227,15 @@ with `~/` or `$HOME/`, and skips the provider's own system records. The cell's o
 session folder (`~/.claude/projects/<its cwd with each non-alphanumeric character as ->`, where a
 large tool output is saved for the agent to read) is neither denied nor flagged: of that folder's
 siblings, the reads denied are those of sessions started in another hidden path and of earlier
-cells, and naming any other one is flagged. A cell whose runner hangs keeps its spend so far. The agent's environment carries no `PYTHONPATH` to the
+cells, and naming any other one is flagged. Read deny rules do not cover shell commands, so the audit
+also reads each tool call the agent made (not the outputs it got back): one naming `.claude/projects`,
+`.codex/sessions` or `.cursor/chats` by a relative path (`cd ~ && cat .claude/projects/...`), or naming
+the cell's own session folder with a `..` in the same call (`cd <own folder> && cat ../<other>`), is
+flagged. Each cell also runs its arm's CLI with a config folder of its own in the cell's temporary
+folder (`CLAUDE_CONFIG_DIR`, `CODEX_HOME` with Codex's `config.toml` and `hooks.json` copied, or
+`CURSOR_CONFIG_DIR`), so no earlier transcript is within reach; the provider's login files are linked
+in, and one the CLI refreshes there is written back to the real file only while that is unchanged
+since the cell began (`bench.scratch_home` false keeps the CLIs' own folders). A cell whose runner hangs keeps its spend so far. The agent's environment carries no `PYTHONPATH` to the
 harness runtime. A transcript that names a denied path or the landed commit, or runs history or
 forge commands (`git fetch`, `git log --all`, `gh api`), flags the cell as failed. Otherwise the
 held-out files are copied in and the held-out tests run (`--test-cmd`, default `python3 -m pytest`;

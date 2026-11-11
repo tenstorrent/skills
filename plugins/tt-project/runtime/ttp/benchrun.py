@@ -192,12 +192,64 @@ def _encode(p) -> str:
     return re.sub(r"[^A-Za-z0-9]", "-", str(p))
 
 
-def session_dirs(ws: Path) -> list[Path]:
-    """Claude Code's folder for a session started in `ws`, resolved and as named: it saves a large
-    tool output there and tells the agent to read it."""
-    claude = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude").expanduser()
+def session_dirs(ws: Path, config: str | None = None) -> list[Path]:
+    """Claude Code's folder for a session started in `ws` (under `config`, the cell's own config
+    folder, if any), resolved and as named: it saves a large tool output there and tells the agent to read it."""
+    claude = Path(config or os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude").expanduser()
     return list(dict.fromkeys(c / "projects" / _encode(ws.resolve()) for c in (Path(os.path.abspath(claude)),
                                                                                  claude.resolve())))
+
+
+# Each provider's config folder variable, and the files a cell's own folder copies from the real one
+# (Codex's hooks and config, which its build reads to decide the harness hook).
+SCRATCH = {"claude": ("CLAUDE_CONFIG_DIR", ()), "codex": ("CODEX_HOME", ("config.toml", "hooks.json")),
+           "cursor": ("CURSOR_CONFIG_DIR", ())}
+
+
+def _stamp(p: Path):
+    # The file as it is (an in-place rewrite within the clock's tick keeps its mtime): None when gone.
+    try:
+        return p.stat().st_ino, hashlib.sha256(p.read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
+def scratch_home(provider: str, tmp: Path, logins: bool = True) -> tuple[dict, list]:
+    """A config folder of the cell's own for `provider`, with no earlier sessions in it: (env naming
+    it, its logins). Each login file the provider names is linked in, so the CLI reads the live one;
+    restore_logins writes back one the CLI refreshed in the cell's folder."""
+    from .providers import get_provider
+    if provider not in SCRATCH:
+        return {}, []
+    var, copies = SCRATCH[provider]
+    home = tmp / f"{provider}-config"
+    home.mkdir()
+    if copies:
+        from .providers.codex import codex_home
+        for name in (n for n in copies if (codex_home() / n).is_file()):
+            shutil.copyfile(codex_home() / name, home / name)
+    links = []
+    for f in (Path(x) for x in (get_provider(provider).credential_files() if logins else [])):
+        if f.is_file() and not (home / f.name).exists():
+            (home / f.name).symlink_to(f.resolve())
+            links.append((home / f.name, f.resolve(), _stamp(f.resolve())))
+    return {var: str(home)}, links
+
+
+def restore_logins(links: list) -> None:
+    """A login the CLI replaced in the cell's folder (a token refresh writes a new file, not through
+    the link) goes back to the real file, only while that is unchanged since the cell began: a refresh
+    elsewhere meanwhile wins. Written beside it and renamed in, owner-only."""
+    for mine, real, stamp in links:
+        if mine.is_symlink() or not mine.is_file() or _stamp(real) != stamp:
+            continue
+        part = real.with_name(f".{real.name}.{os.getpid()}.part")
+        fd = os.open(part, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as out:
+            out.write(mine.read_bytes())
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(part, real)
 
 
 def denied_reads(hidden: list[Path], own: list[Path]) -> list[str]:
@@ -225,6 +277,38 @@ def _own_session(text: str, own: list[Path]) -> str:
     return text
 
 
+def _commands(transcript: str) -> list[str]:
+    # What the agent asked its tools to do, one entry per tool call (strings under a tool call's input,
+    # args or command keys, not the outputs they returned); a line that is not JSON counts as one.
+    found = []
+
+    def walk(v, take=False):
+        if isinstance(v, str) and take:
+            found[-1] += "\n" + v
+        elif isinstance(v, dict):
+            for k, x in v.items():
+                if not take and k in ("input", "args", "arguments", "command", "cmd"):
+                    found.append("")
+                walk(x, take or k in ("input", "args", "arguments", "command", "cmd"))
+        elif isinstance(v, list):
+            for x in v:
+                walk(x, take)
+    for line in transcript.splitlines():
+        try:
+            walk(json.loads(line))
+        except ValueError:
+            found.append(line)
+    return [c for c in found if c.strip()]
+
+
+# A saved-sessions folder named relative to wherever the command runs (`cd ~ && cat .claude/projects/..`),
+# or a provider's config folder cd'ed into with its sessions named after it.
+RELATIVE = re.compile(r"(?<![\w-])\.(?:claude/projects|codex/sessions|cursor/chats)(?![\w-])")
+CONFIG_ROOT = re.compile(r"(?<![\w-])\.(?:claude|codex|cursor)/?(?=$|[\s;&|)'\"`])")
+SESSIONS = re.compile(r"(?<![\w.-])(?:projects|sessions|chats)\b")
+UP = re.compile(r"(?:^|[\s/=\"'`])\.\.(?=$|[/\s;&|)\"'`])")
+
+
 def audit(transcript: str, task: dict, hidden: list[Path], secret: dict | None = None, diff: str = "",
           session: list[Path] = ()) -> list[str]:
     """Why a cell counts as a cheat attempt: its transcript names a hidden path (the cell's own
@@ -238,6 +322,14 @@ def audit(transcript: str, task: dict, hidden: list[Path], secret: dict | None =
     if task["head"][:12] in transcript:
         out.append("names the landed commit")
     out += sorted({f"runs {m.group(0)!r}" for m in CHEAT.finditer(transcript)})
+    calls = _commands("\n".join(x for x in transcript.splitlines() if not _system(x)))
+    for c in calls:
+        rest = _own_session(c, list(session)) if session else c
+        if (m := RELATIVE.search(rest)) or CONFIG_ROOT.search(rest) and (m := SESSIONS.search(rest)):
+            out.append(f"names a saved-sessions folder by a relative path: {m.group(0)}")
+            break
+    if session and any(UP.search(c) and _own_session(c, list(session)) != c for c in calls):
+        out.append("climbs out of its own session folder with ..")
     if (long := sum(len(x) >= bench.QUOTE_LEN for xs in (secret or {}).values() for x in set(xs))) and \
             (n := bench.quotes(_strings(transcript) + "\n" + diff, [x for xs in secret.values() for x in xs])) \
             >= min(bench.QUOTE_LINES, long):
@@ -284,6 +376,7 @@ def run_cell(bench_dir: Path, out: Path, task: dict, cell: dict, arm: dict, opts
     keep = out / "cells" / f"{task['task']}-r{cell['rep']}-{cell['arm']}"
     hidden = hidden_paths(bench_dir.resolve(), out.resolve(), [task.get("repo"), opts.get("repo")], opts.get("state"))
     tmp = Path(tempfile.mkdtemp(prefix="cell-"))
+    logins = []
     try:
         ws, run = tmp / "work", tmp / "run"
         shutil.copytree(bench_dir / str(task["task"]) / "workspace", ws, symlinks=True)
@@ -294,7 +387,12 @@ def run_cell(bench_dir: Path, out: Path, task: dict, cell: dict, arm: dict, opts
             cell_env = cellenv.env(cellenv.make(tmp / "venv", opts.get("cell_packages", cellenv.SEED)), _clean_env())
         except cellenv.Unavailable as e:
             return {**row, "outcome": "isolation_failed", "passed": False, "why": [str(e)[:500]]}
-        prov, wall, hung = launch(run, ws, PROMPT.format(spec=task["spec"]), arm, opts, cfg, hidden, cell_env)
+        # No earlier transcripts within reach: the arm's CLI gets a config folder of the cell's own.
+        conf, logins = scratch_home(arm["provider"], tmp, not opts.get("dry_run")) \
+            if opts.get("scratch_home", True) else ({}, [])
+        own = session_dirs(ws, conf.get("CLAUDE_CONFIG_DIR"))
+        prov, wall, hung = launch(run, ws, PROMPT.format(spec=task["spec"]), arm, opts, cfg, hidden, cell_env, conf,
+                                  own)
         row["wall_s"] = wall
         if hung:   # the supervisor itself hung: its watchdog ends the agent; what it spent so far still counts
             row.update(outcome="runner_timeout", passed=False)
@@ -304,17 +402,19 @@ def run_cell(bench_dir: Path, out: Path, task: dict, cell: dict, arm: dict, opts
                 pass
             return row
         try:
-            return _finish(row, bench_dir, task, ws, run, keep, start, prov, opts, hidden)
+            return _finish(row, bench_dir, task, ws, run, keep, start, prov, opts, hidden, own)
         except Exception as e:   # the agent ran and spent: record the cell, so a rerun skips it
             return {**row, "outcome": "error", "passed": False, "why": [f"{type(e).__name__}: {e}"[:500]]}
     finally:
+        restore_logins(logins)
         shutil.rmtree(tmp, ignore_errors=True)
 
 
 def launch(run: Path, ws: Path, prompt: str, arm: dict, opts: dict, cfg: dict, hidden: list[Path], cell_env: dict,
-           env: dict | None = None) -> tuple:
+           env: dict | None = None, own: list[Path] | None = None) -> tuple:
     """Run the arm's agent on `prompt` in `ws` under the runner supervisor (run dir `run`, new), reads of
-    `hidden` denied; `env` adds to the agent's environment (PATH_PREPEND goes before its PATH). Returns
+    `hidden` denied except the cell's own session folders `own` (default: session_dirs(ws)); `env` adds to
+    the agent's environment (PATH_PREPEND goes before its PATH). Returns
     (provider, wall_s, hung): hung when the supervisor itself outlived its timeout."""
     from . import billing, chatbridge
     from .providers import get_provider
@@ -325,7 +425,7 @@ def launch(run: Path, ws: Path, prompt: str, arm: dict, opts: dict, cfg: dict, h
     prov = get_provider(provider).use(arm["model"], prices, billing.declared(cfg, provider))
     argv, penv = prov.build(role="worker", model=arm["model"], effort=arm["effort"], cwd=str(ws),
                             budget_usd=opts["budget_usd"], read_only=False, schema=None, restrictions={},
-                            denied_reads=denied_reads(hidden, session_dirs(ws)), web=False)
+                            denied_reads=denied_reads(hidden, own or session_dirs(ws)), web=False)
     if argv[:3] == [sys.executable, "-m", "ttp.providers.fake"]:   # the dry run's agent: no PYTHONPATH
         argv = [*_boot("ttp.providers.fake"), *argv[3:]]
     extra = dict(env or {})
@@ -361,7 +461,7 @@ def _read_json(path: Path):
 
 
 def _finish(row: dict, bench_dir: Path, task: dict, ws: Path, run: Path, keep: Path, start: str, prov, opts: dict,
-            hidden: list[Path]) -> dict:
+            hidden: list[Path], own: list[Path] | None = None) -> dict:
     """Audit and grade a cell whose agent has run, filling `row` as it goes (its cost first)."""
     u = prov.parse(run / "output.jsonl", run / "stderr.log")
     row.update(cost_usd=u.cost_usd, cost_estimated=u.estimated, input_tokens=u.input_tokens,
@@ -376,7 +476,7 @@ def _finish(row: dict, bench_dir: Path, task: dict, ws: Path, run: Path, keep: P
     diff = gitmemo.run(["git", "-C", str(ws), "diff", "--cached", start], capture_output=True, timeout=None).stdout
     row["diff_sha256"] = _sha(diff)
     flags = audit(transcript.decode(errors="replace"), task, hidden,
-                  secret_lines(bench_dir, task), diff.decode(errors="replace"), session_dirs(ws))
+                  secret_lines(bench_dir, task), diff.decode(errors="replace"), own or session_dirs(ws))
     if flags:
         passed, log_tail = False, "not graded: flagged by the cheat audit"
     else:   # a fresh venv: nothing the agent installed into its own runs the held-out tests
