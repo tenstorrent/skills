@@ -26,6 +26,7 @@ ALERT_SITES = {
     ("daemon.py", "Daemon.remind_logouts"): [("outages", "a logout whose work runs on another provider: one low status line"),
                                               ("user-blocker", "a provider stays logged out and no other provider can run its work")],
     ("daemon.py", "Daemon.relay_when_blocked"): [("outages", "the coordinator cannot run; conditions wait unhandled")],
+    ("daemon.py", "Daemon.reap_locks"): [("outages", "a lock waiter behind a dead holder whose lock was not released")],
     ("daemon.py", "relay_worker_notifies"): [(WORKER_NOTIFY, "a worker's `ttp notify`; its prompt limits it to these")],
     ("db.py", "DB._quarantine_kv"): [("outages", "stored state was unreadable and reset: state was lost")],
     ("deploy.py", "_alert"): [("outages", "a project is still behind the newest release after its takeover time")],
