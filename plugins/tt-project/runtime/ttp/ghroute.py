@@ -194,11 +194,10 @@ def mark(ok: bool, home=None) -> None:
     """Record the route's last answer, host-wide (STATE), for the gh-auth alert."""
     from . import ghauth
     try:
+        from .project import write_json
         f = ghauth._home(home) / STATE
         f.parent.mkdir(parents=True, exist_ok=True)
-        tmp = f.with_name(f".{f.name}.{os.getpid()}")
-        tmp.write_text(json.dumps({"ok": ok, "at": time.time()}))
-        os.replace(tmp, f)
+        write_json(f, {"ok": ok, "at": time.time()}, 0o600)
     except OSError:
         pass
 
