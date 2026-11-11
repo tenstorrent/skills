@@ -1179,3 +1179,30 @@ def test_a_command_watcher_that_crashes_at_a_normal_exit_code_is_a_failed_run_th
     monkeypatch.setattr(schedrun, "run_group", lambda *a, **k: setattr(
         c := subprocess.CompletedProcess("x", 1, "", note), "rerun_note", note) or c)
     assert tick()[0] == "ok (0 observations)"
+
+
+def test_a_daily_review_starting_late_re_reads_its_coordinator_stats_at_start(env):
+    """The daily review's stats were the state when it was queued: one that waited a day reported a
+    day-old 'coordinator turns' line (none of the session wakes since) as today's. A run starting
+    sched.FEED_STALE_S or more after it was queued re-reads them; a coordinator's later note stays."""
+    from ttp import daemon, schedule as sched
+    p = make(env)
+    dm = daemon.Daemon(p.base)
+    s = {"name": "daily-review", "budget_usd_day": None, "last_run": None, "description": "review"}
+    p.db.x("DELETE FROM tasks WHERE origin='schedule'")
+    assert dm._schedule_llm(s, {}) == "queued"
+    task = p.db.one("SELECT * FROM tasks WHERE origin='schedule'")
+    audit = "Self-efficiency audit (last 24 h):\n- nothing to grade"
+    assert audit in task["spec"] and "[stats read at " in task["spec"], task["spec"][-600:]
+    p.db.update_task(task["id"], spec=task["spec"] + "\n\nCoordinator note: also check the push queue.")
+    assert audit in dm._fresh_feed(p.db.one("SELECT * FROM tasks WHERE id=?", (task["id"],)))["spec"]   # not stale yet
+    p.db.x("INSERT INTO runs(role,status,started,cost_usd,session_id) VALUES('coordinator','ok',?,2.5,'sess-1')",
+           (time.time(),))                                   # a persistent-session wake after the enqueue
+    p.db.x("UPDATE tasks SET created=created-? WHERE id=?", (sched.FEED_STALE_S + 60, task["id"]))
+    got = dm._fresh_feed(p.db.one("SELECT * FROM tasks WHERE id=?", (task["id"],)))
+    stored = p.db.one("SELECT spec FROM tasks WHERE id=?", (task["id"],))["spec"]
+    assert got["spec"] == stored
+    assert "coordinator turns: 1, $2.50" in stored and audit not in stored, stored[-900:]
+    assert "[stats re-read at " in stored and "[stats read at " not in stored
+    assert stored.endswith("Coordinator note: also check the push queue."), stored[-200:]
+    assert sched.refresh_feed("no stats here", "x", time.time(), time.time(), None) is None

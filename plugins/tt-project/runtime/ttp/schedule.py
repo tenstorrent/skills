@@ -178,6 +178,26 @@ def due(db: DB, now: float | None = None) -> list[dict]:
                 (now,))
 
 
+FEED_STALE_S = 2 * 3600   # a scheduled run starting this long after it was queued re-reads its stats
+FEED_RE = re.compile(r"\n\n\[stats (?:re-)?read at [^\]\n]*\].*?\n\[end of stats\]", re.S)
+
+
+def wrap_feed(feed: str, now: float, where: str | None) -> str:
+    """The stats a scheduled run's spec carries, marked with when they were read, so a late start can
+    replace them (refresh_feed) and a reader sees how old they are."""
+    return f"\n\n[stats read at {timefmt.long(now, where)}]{feed}\n[end of stats]"
+
+
+def refresh_feed(spec: str, feed: str, now: float, created: float, where: str | None) -> str | None:
+    """`spec` with its marked stats replaced by `feed` read at `now`; text after the end mark (a
+    coordinator's update) stays. None when it carries no marked stats."""
+    if not FEED_RE.search(spec):
+        return None
+    head = (f"[stats re-read at {timefmt.long(now, where)}, when this run started; the task was queued at "
+            f"{timefmt.long(created, where)}]")
+    return FEED_RE.sub(lambda m: f"\n\n{head}{feed}\n[end of stats]", spec, count=1)
+
+
 GAP_MIN_S = 3600   # a schedule starting this late, and at least one whole period late, missed runs
 
 

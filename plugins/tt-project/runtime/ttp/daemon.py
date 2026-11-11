@@ -9556,6 +9556,23 @@ class Daemon:
         prompt_file = payload.get("prompt")
         if prompt_file and (self.p.harness / "prompts" / prompt_file).exists():
             spec = (self.p.harness / "prompts" / prompt_file).read_text() + "\n\n" + spec
+        if feed := self._review_feed(s, payload):   # marked with when it was read: a late start re-reads it
+            spec += sched.wrap_feed(feed, time.time(), timefmt.home(self.p))
+        with db.tx():   # the evidence is the state at enqueue: what changes during the run stays new
+            tid = db.add_task(f"[{s['name']}] {s['description'][:120] or 'recurring task'}", spec,
+                              kind=payload.get("kind", "work"), tier=payload.get("tier", "standard"),
+                              priority=2 if force else int(payload.get("priority", 4)),
+                              budget_usd=sched.run_budget(self.cfg, s, payload, spent),
+                              origin="schedule", labels=[s["name"]])
+            if evidence is not None:
+                sched.record_evidence(db, s["name"], tid, evidence)
+        return "queued"
+
+    def _review_feed(self, s: dict, payload: dict) -> str:
+        """The stats schedule `s` appends to its run's spec (the daily review's audit, unblocking and Jev
+        lines, among others), read now; "" when it asks for none."""
+        db = self.p.db
+        spec = ""
         jev_lines = jevuse.lines(db, self.cfg) if payload.get("jev_report", s["name"] == "daily-review") else []
         if payload.get("jev_report", s["name"] == "daily-review"):
             try:
@@ -9685,15 +9702,28 @@ class Daemon:
                          "whether the coordinator retired the stale side):\n"
                          + "\n".join(f"- \"{x['forbid']}\" ({x['forbid_section']}) vs \"{x['allow']}\" "
                                       f"({x['allow_section']})" for x in found))
-        with db.tx():   # the evidence is the state at enqueue: what changes during the run stays new
-            tid = db.add_task(f"[{s['name']}] {s['description'][:120] or 'recurring task'}", spec,
-                              kind=payload.get("kind", "work"), tier=payload.get("tier", "standard"),
-                              priority=2 if force else int(payload.get("priority", 4)),
-                              budget_usd=sched.run_budget(self.cfg, s, payload, spent),
-                              origin="schedule", labels=[s["name"]])
-            if evidence is not None:
-                sched.record_evidence(db, s["name"], tid, evidence)
-        return "queued"
+        return spec
+
+    def _fresh_feed(self, task: dict) -> dict:
+        """`task` with its stats re-read now when it is a scheduled run starting sched.FEED_STALE_S or more
+        after it was queued (a provider down, a full queue): its spec holds the state at enqueue, which
+        a review that starts a day late would report as today's. Model-free; the record keeps the new copy."""
+        now = time.time()
+        if task.get("origin") != "schedule" or now - float(task.get("created") or now) < sched.FEED_STALE_S:
+            return task
+        try:
+            name = (json.loads(task.get("labels") or "[]") or [""])[0]
+            s = self.p.db.one("SELECT * FROM schedules WHERE name=?", (name,))
+            spec = s and sched.refresh_feed(task["spec"] or "", self._review_feed(s, json.loads(s["payload"] or "{}")),
+                                            now, float(task["created"]), timefmt.home(self.p))
+        except Exception as e:   # stale stats must not keep the run from starting
+            log(self.p, f"task {task['id']}: stats not re-read: {type(e).__name__}: {e}")
+            return task
+        if not spec or spec == task["spec"]:
+            return task
+        self.p.db.update_task(task["id"], spec=spec)
+        log(self.p, f"task {task['id']}: stats re-read at start, {(now - float(task['created'])) / 3600:.1f} h after enqueue")
+        return dict(task, spec=spec)
 
     def _waste_ledger(self, db) -> str:
         """The daily review's waste ledger (waste.py): its lines for the spec, one low line to the user's
@@ -12383,6 +12413,7 @@ class Daemon:
                     prompt = worker_resume(self.p, task, lost)
                     note["resumes"] = {"run": lost["run"], "session": lost["session"]}
                 else:
+                    task = self._fresh_feed(task)
                     prompt, lost = worker_task(self.p, task, cwd, branch, wake=note.get("wake"),
                                                conflict=note.get(conflictfix.KEY)), None
                 prompt += startcheck.prompt_lines(found)   # a resumed session is told too
