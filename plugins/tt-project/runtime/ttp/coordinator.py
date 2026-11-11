@@ -553,15 +553,19 @@ places to read. `checks.suite_concurrency` (the setting's spec name) is `checks.
 
 def settable(key: str):
     """The validator config_set applies to `key` (USER_SETTABLE, else a provider key chatset.py accepts:
-    per-tier routing, the saved endpoint's alias); ValueError saying why when chat may not set it."""
+    per-tier routing, the saved endpoint's alias); ValueError saying why when chat may not set it, and
+    for a known key that is not the user's alone (NEEDS_USER), how the coordinator sets it (cli_route)."""
     if (canonical := ALIASES.get(key, key)) in USER_SETTABLE:
         return USER_SETTABLE[canonical]
     if key in accountset.KEYS:   # the account's host checks caps: applied in the daemon (accountset.apply)
         return accountset.conv(key)
     if conv := chatset.setter(key):
         return conv
+    from .configwho import cli_route
     from .project import unknown_key_hint
-    raise ValueError(chatset.refusal(key) or unknown_key_hint(key) or f"{key} is not user-settable from chat")
+    user = any(k == key or k.startswith(key + ".") or key.startswith(k + ".") for k in NEEDS_USER)
+    raise ValueError(chatset.refusal(key) or unknown_key_hint(key) or f"{key} is not user-settable from chat"
+                     + ("" if user else f"; {cli_route(key)}"))
 
 CHARTER_HISTORY = ends.CHARTER_HISTORY   # harness file: charter sections replaced or retired
 # kv: [{"id", "messages", "ask", "section", "quote", "replaces", "candidates", "text", "sha", "ts",
