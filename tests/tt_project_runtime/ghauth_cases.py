@@ -229,7 +229,7 @@ def test_a_gh_route_mode_makes_no_login_here_one_quiet_status_line_not_an_alert(
         assert lines[0]["channel"] == alerts.QUIET and lines[0]["severity"] == "low" and mode in lines[0]["text"]
     assert ghroute.problem("workstation") == ghroute.problem("none") == "" and ghroute.value_of(" none ") == "none"
     assert ghroute.problem("local") and ghroute.route(dp.cfg) == "workstation" and ghroute.route(dq.cfg) == "" and ghroute.known(dp.cfg) == "workstation"
-    assert ghroute.routed(["pr", "view", "3"], dp.cfg) is None, "a mode is no ssh alias"
+    assert ghroute.routed(["pr", "view", "3"], dq.cfg) is None, "none is no route"
     assert "is workstation" in ghroute.held(["pr", "comment", "3"], dp.cfg)
 
 
