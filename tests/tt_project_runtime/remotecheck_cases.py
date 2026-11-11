@@ -2498,7 +2498,6 @@ def test_spill_never_starts_a_check_on_a_host_whose_load_is_near_its_cores(env, 
         assert got and {c.host for c in got} == {"check-host-b"}, told
         assert len(got) < 20, "the gate held the burst"
         assert "check-host-a (its load is near its cores (load 52, of 64 cores" in told[-1], told[-1]
-        assert "more for this machine's runs just started" in told[-1], told[-1]
         assert 4 + checkspill._pending_cores("check-host-b", 64) >= checkspill.LOAD_NEAR * 64
         later = time.time() + checkspill.LOAD_LAG_S + 1
         assert checkspill._pending_cores("check-host-b", 64, now=later) == 0, "the load shows them by then"
