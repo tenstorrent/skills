@@ -84,3 +84,29 @@ def test_chain_priority_ignores_unrelated_chains_and_bad_labels(env):
                       labels=[f"auto_review:{x}"])
     p.db.update_task(x, labels=[f"continues:{y}"])
     assert chainprio.of(p.db, p.db.task(x)) in (2, 3)
+
+
+def test_a_failed_review_outside_the_fix_chain_counts_toward_the_round_cap(env):
+    """Upstream user msg #2495 (2b): rounds count per change, not only along the continues chain. A
+    coordinator's review of the same change that failed earlier makes the daemon review's failure the
+    second round: no fix or re-review is queued (review.auto_fix_rounds 1) and the coordinator decides.
+    A failed review of another change, or one carried over with no run, does not count."""
+    from ttp.daemon import Daemon
+    p = make(env)
+    p.set_config("budget.max_tasks_per_24h", 1000)
+    _with_origin(env, clone=False)
+    cid, _, _, (rev,) = _finish_code(env, p, "a change", {"app.py": 20})
+    other = p.db.add_task("another change", "s", kind="code", origin="coordinator")
+    finding = json.dumps({"status": "changes_needed", "summary": "bug", "followups": [{"title": "f", "spec": "x"}]})
+    for deps, res in (([other], finding), ([cid], json.dumps({"status": "failed", "reused_review": 1}))):
+        r = p.db.add_task("Review by hand", "s", kind="review", origin="coordinator", depends_on=deps)
+        p.db.update_task(r, status="failed", result=res)
+    p.db.update_task(rev["id"], status="failed")
+    from ttp import reviewcap
+    assert reviewcap.change_fails(p.db, p.db.task(rev["id"])) == 1
+    hand = p.db.add_task("Review by hand", "s", kind="review", origin="coordinator", depends_on=[cid])
+    p.db.update_task(hand, status="failed", result=finding)
+    d = Daemon(p.base)
+    assert d._fix_failed_review(p.db.task(rev["id"]), [{"title": "bug", "spec": "fix it"}], "bug") is None
+    assert "2 reviews of this stack failed" in d._nofix
+    assert not p.db.one("SELECT 1 FROM tasks WHERE title LIKE 'Fix review%'")

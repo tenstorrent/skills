@@ -48318,7 +48318,8 @@ def test_an_earlier_failed_or_changes_needed_review_is_not_reused(env, monkeypat
     p.db.update_task(asked, status="failed", result=json.dumps({"status": CHANGES_NEEDED, "summary": "fix x"}))
     third = _reuse_review(p, tid, "Review it once more")
     d.dispatch()
-    assert started == [failed, asked, third]
+    assert started == [failed, asked], "a head failed with a finding keeps that verdict (reviewreuse.judged)"
+    assert json.loads(p.db.task(third)["result"])["reused_review"] == asked
     assert reviewreuse.accepted(p.db, head, reviewreuse.check_key(d.cfg)) is None
 
 

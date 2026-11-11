@@ -23981,3 +23981,39 @@ def test_runtime_walks_never_start_at_the_drive_root_or_the_home_folder(tmp_path
         assert glob_root_ok(ok), ok
     [o] = goalchecks.artifact_fresh("~/**/x.log")
     assert o.get("error") is True and "refused" in o["text"], o
+
+
+def test_a_review_of_a_head_already_failed_keeps_that_verdict_with_no_run_and_no_fix_round(env, monkeypatch):
+    """Upstream user msg #2495 (2b): a second review of an unchanged head an earlier review failed with a
+    finding does not run: it closes failed with the earlier verdict and no follow-ups (no fix round
+    starts from it), and the coordinator gets one review_nofix event. A forced review still runs."""
+    from ttp import coordinator as coord, deadwait, reviewreuse
+    p = make(env)
+    tid, path, branch = _code_task(p, "make it")
+    _commit_file(path, "a")
+    head = _git_out(path, "rev-parse", "HEAD")
+    d, started = _reuse_daemon(p, monkeypatch)
+    first = _reuse_review(p, tid)
+    d.dispatch()
+    p.db.update_task(first, status="failed", result=json.dumps(
+        {"status": "changes_needed", "summary": "the loop never ends", "followups": [{"title": "fix", "spec": "x"}]}))
+    again = _reuse_review(p, tid, "Review it again")
+    d.dispatch()
+    assert started == [first], "no second run for the head it failed"
+    t = p.db.task(again)
+    res = json.loads(t["result"])
+    assert t["status"] == "failed" and res["reused_review"] == first and res["reviewed_head"] == head
+    assert "the loop never ends" in res["summary"] and not res.get("followups")
+    ev = p.db.q("SELECT * FROM events WHERE kind=?", (deadwait.NOFIX_EVENT,))
+    assert [e["task"] for e in ev] == [again]
+    add = {"type": "task_add", "title": f"Review #{tid} once more", "kind": "review", "spec": "check it",
+           "depends_on": [tid]}
+    problems = coord.apply(p, [add])
+    assert len(problems) == 1 and "already failed by review #" in problems[0] and "force" in problems[0]
+    add.update(force=True, reason="the first review misread the spec")
+    assert coord.apply(p, [add]) == []
+    forced = p.db.one("SELECT * FROM tasks WHERE title=?", (add["title"],))
+    assert reviewreuse.FORCED_LABEL in json.loads(forced["labels"])
+    p.db.update_task(forced["id"], provider="claude")
+    d.dispatch()
+    assert started == [first, forced["id"]], "a forced review runs"

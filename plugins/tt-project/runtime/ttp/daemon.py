@@ -49,6 +49,7 @@ from . import charterset
 from . import claimcheck
 from . import dispatchguard
 from . import supersede
+from . import runcap
 from . import runclass
 from . import configwho
 from . import integrate
@@ -11858,6 +11859,10 @@ class Daemon:
                 supersede.hold(db, task, why)
                 fate[task["id"]] = "other"
                 continue
+            if why := runcap.check(self.p, self.cfg, task):   # looping: blocked, the coordinator decides
+                log(self.p, f"task {task['id']} not dispatched: {why}")
+                fate[task["id"]] = "other"
+                continue
             # Before _start_hold, which may reserve the task's resource.
             if holds and self._setting_hold(task, holds, now):
                 fate[task["id"]] = "hold"
@@ -18855,8 +18860,9 @@ class Daemon:
         the same checks takes that verdict and closes with no run (reviewreuse.reuse), unless it also
         covers a head that differs from it (reviewreuse.rebased_away): True. Else it
         records the head and check set it starts on, so a later review of that head can reuse it; a
-        review forced past an accepted one runs, as does a review of an external change (extchange). False
-        whenever it runs."""
+        review forced past an accepted one runs, as does a review of an external change (extchange). A head
+        a review already failed with a finding keeps that verdict: closed failed with no run and no fix
+        round, and one review_nofix event (reviewreuse.judged, carry). False whenever it runs."""
         db = self.p.db
         if extchange.heads(push._labels(task)):
             return False   # its change lives in another repository: the project's git holds no head of it
@@ -18874,6 +18880,13 @@ class Daemon:
         if prior and (why := reviewreuse.rebased_away(self.p, task, sha)):
             log(self.p, f"review {task['id']}: not reusing review #{prior['id']}'s verdict on {sha[:12]}: {why}")
             prior = None
+        failed = None if prior or reviewreuse.FORCED_LABEL in labels else reviewreuse.judged(db, sha, key, task["id"])
+        if failed:   # the unchanged head keeps its failed verdict: no run, and the coordinator decides
+            with db.tx():
+                why = reviewreuse.carry(db, task, failed, sha, key)
+                deadwait.raise_nofix(db, db.task(task["id"]), why, "")
+            log(self.p, f"review {task['id']}: kept review #{failed['id']}'s failed verdict on {sha[:12]}; no run")
+            return True
         if not prior:
             db.update_task(task["id"], labels=reviewreuse.with_head(labels, sha, key))
             return False
@@ -19393,6 +19406,7 @@ class Daemon:
             cap = int((cfg.get("review") or {}).get("auto_fix_rounds", AUTO_FIX_ROUNDS))
         except (TypeError, ValueError):
             cap = AUTO_FIX_ROUNDS
+        rounds = max(rounds, reviewcap.change_fails(db, review))   # rounds linked outside its continues chain too
         if rounds > cap:
             self._nofix = f"{rounds} reviews of this stack failed (the daemon fixes at most {cap} round(s))"
             return None

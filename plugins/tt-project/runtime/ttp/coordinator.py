@@ -94,6 +94,7 @@ from . import (   # one name per line: two changes adding names merge without a 
     restriction_source,
     reviewcap,
     rulecite,
+    runcap,
     sandboxstate,
     selfreview,
     reviewreuse,
@@ -2880,19 +2881,20 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     ids = ", ".join(f"#{r['id']}" for r in under_way.values())
                     raise ValueError(f"duplicate of review {ids} the daemon queued, already under way; send it a "
                                      f"`spec` with task_update to add checks")
-                # A head a review already accepted under the same checks keeps that verdict
-                # (reviewreuse): another review of it runs only when forced with a reason.
+                # A head a review already accepted, or failed with a finding, under the same checks keeps
+                # that verdict (reviewreuse): another review of it runs only when forced with a reason.
                 head = _reviewed_head(p, deps, a.get("spec") or "") if review else None
                 prior = reviewreuse.accepted(db, head, reviewreuse.check_key(cfg),
                                              p=p if reviewreuse.pushes(cfg, labels) else None) if head else None
                 if prior and _rebased_away(p, deps, a.get("spec") or "", head):
                     prior = None   # it also covers a head whose patches differ: it gets its own review
+                prior = prior or (reviewreuse.judged(db, head, reviewreuse.check_key(cfg)) if head else None)
                 if prior and not (a.get("force") and str(a.get("reason") or "").strip()):
                     raise ValueError(f"task_add rejected: {reviewreuse.rejection(prior, head)}")
                 if prior:
                     labels.append(reviewreuse.FORCED_LABEL)
-                    notes.append(f"task_add {title[:80]!r}: forced past review #{prior['id']}, which accepted "
-                                 f"{head[:12]}: {clip(a.get('reason'), 200)}")
+                    notes.append(f"task_add {title[:80]!r}: forced past review #{prior['id']}, which "
+                                 f"{'failed' if prior['status'] == 'failed' else 'accepted'} {head[:12]}: {clip(a.get('reason'), 200)}")
                 old = _continued(db, a["continues"], deps) if a.get("continues") is not None else None
                 # A split code task's hop takes its branch over (chaincap.split_head): one hop at a time.
                 split = bool(old and old["status"] == "done" and chaincap.split_head(old))
@@ -4787,6 +4789,9 @@ def effort_triggers(db, cfg: dict, event_ids: list[int], wake_due: str | None,
     # A continue chain at its cap: another hop needs a reason that names what changed (chaincap).
     if any(r["kind"] == chaincap.CAP_EVENT for r in rows):
         add(chaincap.TRIGGER)
+    # A task at its run cap (runcap): the daemon starts no same-approach retry, the coordinator decides.
+    if any(r["kind"] == runcap.RUN_CAP_EVENT for r in rows):
+        add(runcap.TRIGGER)
     # A code hop with no new commit asked for its continue: the coordinator decides on it (chaincap).
     if any(r["kind"] == chaincap.NO_COMMIT_EVENT for r in rows):
         add(chaincap.NO_COMMIT_TRIGGER)

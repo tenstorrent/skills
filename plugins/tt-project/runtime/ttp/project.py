@@ -423,8 +423,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # itself (chaincap.requeue: same id, worktree and branch) instead of a new task.
     # split_lines (0 off): kind-code.md asks a worker whose change would pass about this many non-test
     # lines to hand it off in parts, each reviewed and landed on its own (prompts.split_lines).
+    # A task that ran max_task_runs times since its last explicit requeue, or whose last max_idle_runs
+    # runs spent money with no hand-off and no commit, is not started again (0 turns one off): it is
+    # blocked and the coordinator gets one run_cap event summing up its runs (runcap).
     "chains": {"max_hops": 8, "max_stalls": 2, "max_usd": 40.0, "auto": True, "urgent_followups": True,
-               "requeue": True, "split_lines": 200},
+               "requeue": True, "split_lines": 200, "max_task_runs": 4, "max_idle_runs": 2},
     # Each Jev use (e.g. "screen") is switched off once its net saving over window_days is not
     # positive, judged after min_calls calls or once its first call is a window old, or once idle_calls
     # calls in the window changed none of the rules' decisions; uses.<use> = "on" or "off" forces it

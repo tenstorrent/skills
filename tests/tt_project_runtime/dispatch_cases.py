@@ -2692,3 +2692,74 @@ def test_a_landing_record_from_before_a_run_began_never_stops_it(env, tmp_path):
     d.stop_superseded()
     assert p.db.task(tid)["status"] == "running" and not (tmp_path / "STOP").exists()
     assert not p.db.q("SELECT 1 FROM events WHERE task=? AND kind=?", (tid, supersede.STOPPED))
+
+
+def _ended_runs(p, tid, n, cost=0.5, status="error", handoff=None):
+    """`n` ended worker runs of task `tid`, each spending `cost`, with `handoff` (a result.json) or none."""
+    for i in range(n):
+        run_dir = p.base / f"run-{tid}-{time.time_ns()}"
+        run_dir.mkdir()
+        if handoff:
+            (run_dir / "result.json").write_text(json.dumps(handoff))
+        p.db.x("INSERT INTO runs(task,role,provider,effort,status,started,ended,cost_usd,dir,note) "
+               "VALUES(?,?,?,?,?,?,?,?,?,?)", (tid, "worker", "claude", "high", status, time.time(),
+                                               time.time() + 1, cost, str(run_dir), json.dumps({"error": f"boom {i}"})))
+
+
+def test_a_task_at_its_run_cap_is_blocked_and_the_coordinator_told_once(env, monkeypatch):
+    """Upstream user msg #2495 (2a): a task the daemon re-ran 4 times (tier-up retries, restarts) is not
+    dispatched a fifth time. It is blocked, with one run_cap event carrying a model-free summary of each
+    run and the last error; an explicit requeue starts the count again, and chains.max_task_runs 0 turns
+    the cap off. Runs that never reached the model do not count."""
+    from ttp import dispatchguard, runcap
+    p = make(env)
+    _no_events(p)
+    p.db.x("UPDATE tasks SET status='done'")
+    tid = p.db.add_task("loops forever", "s", kind="work", tier="light", origin="user", provider="claude")
+    _ended_runs(p, tid, 3, handoff={"status": "waiting", "summary": "tried a flag"})
+    _ended_runs(p, tid, 2, cost=0, status="limit")   # free ends: not runs here
+    d, started = _reuse_daemon(p, monkeypatch)
+    d.dispatch()
+    assert started == [tid], "3 runs: under the cap"
+    p.db.update_task(tid, status="queued")
+    _ended_runs(p, tid, 1, handoff={"status": "waiting", "summary": "tried a flag again"})
+    d.dispatch()
+    d.dispatch()
+    t = p.db.task(tid)
+    assert started == [tid] and t["status"] == "blocked" and "max_task_runs 4" in t["blocked_reason"]
+    ev = p.db.q("SELECT * FROM events WHERE kind=?", (runcap.RUN_CAP_EVENT,))
+    assert len(ev) == 1 and ev[0]["task"] == tid
+    assert "4 runs, $2.00" in ev[0]["text"] and "tried a flag again" in ev[0]["text"]
+    assert "no same-approach retry" in ev[0]["text"]
+    dispatchguard.record_requeue(p.db, tid, "blocked", "coordinator")
+    p.db.update_task(tid, status="queued")
+    d.dispatch()
+    assert started == [tid, tid], "an explicit requeue starts the count again"
+    p.db.update_task(tid, status="queued")
+    time.sleep(0.01)
+    _ended_runs(p, tid, 4, cost=0.1, handoff={"status": "waiting"})
+    assert runcap.check(p, p.config(), p.db.task(tid))
+    p.db.update_task(tid, status="queued")
+    p.set_config("chains.max_task_runs", 0)
+    assert runcap.check(p, p.config(), p.db.task(tid)) == "", "0 turns the cap off"
+
+
+def test_a_task_whose_last_runs_spent_money_with_no_progress_is_blocked(env):
+    """Upstream user msg #2495 (2a): two runs in a row that each spent money and handed off neither done
+    nor waiting (and, for code, committed nothing) stop the task under the run cap; a waiting hand-off is
+    progress, and chains.max_idle_runs 0 turns the check off."""
+    from ttp import runcap
+    p = make(env)
+    p.set_config("chains.max_task_runs", 0)   # the idle check alone
+    tid = p.db.add_task("spins", "s", kind="work", tier="light", origin="user")
+    _ended_runs(p, tid, 1)
+    _ended_runs(p, tid, 1, handoff={"status": "waiting", "summary": "checks detached"})
+    assert runcap.check(p, p.config(), p.db.task(tid)) == "", "the last run made progress"
+    _ended_runs(p, tid, 1)
+    assert runcap.check(p, p.config(), p.db.task(tid)) == "", "one idle run is not a loop"
+    _ended_runs(p, tid, 1, handoff={"status": "failed", "summary": "same error"})
+    p.set_config("chains.max_idle_runs", 0)
+    assert runcap.check(p, p.config(), p.db.task(tid)) == ""
+    p.set_config("chains.max_idle_runs", 2)
+    why = runcap.check(p, p.config(), p.db.task(tid))
+    assert "last 2 runs spent $1.00 with no hand-off" in why and p.db.task(tid)["status"] == "blocked"
