@@ -1,7 +1,8 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 # SPDX-License-Identifier: Apache-2.0
 """An ssh access bridge (`ttp bridge`): lab boxes reach hosts through this computer's ssh agents,
-with no key or credential ever stored on a box.
+with no workstation key or credential ever stored on a box (offline certificate mode, when on, adds
+the box's own key, made on the box by `--make-key`, and a short-lived certificate for it).
 
 This computer (the user's workstation) keeps one ssh session per box and agent as a user service
 (launchd agent on macOS, systemd user unit on Linux; restarted on every drop, after sleep and at
@@ -23,7 +24,8 @@ box. Every process of the box account can use a forwarded agent while its sessio
 only agents whose keys that account may use, and prefer agents with confirmation or destination
 limits where the agent offers them. The link folder must be a private folder of the box account
 (its own, 0700, not a symlink) or the session exits. Reverse forwards bind the box's loopback only:
-other accounts on the box can open those ports, which reach the hosts' sshd and still need a key.
+other accounts on the box can open those ports, which reach the hosts' sshd and still need a key
+(a box sshd with `GatewayPorts yes` would bind them on every interface: keep it off).
 On this computer the interface relay listens only on unix sockets (folder 0700, sockets 0600).
 
 The config is JSON (`~/.config/tt-project/bridge.json`, or --config); see

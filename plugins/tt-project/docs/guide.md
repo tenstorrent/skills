@@ -3420,7 +3420,8 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   - What is exposed: every process of the box account can use a forwarded agent while its session
     is up, so forward only agents whose keys that account may use. Other accounts on the box can
     open the loopback ports, which reach only the hosts' sshd and still need a key. Nothing listens
-    on a non-loopback interface. The link folder must be the box account's own, mode 0700 and no
+    on a non-loopback interface, as long as the box's sshd keeps `GatewayPorts` off (its default):
+    `GatewayPorts yes` would open the forwards on every interface. The link folder must be the box account's own, mode 0700 and no
     symlink, or the session exits; the workstation relay listens only on unix sockets (folder 0700,
     sockets 0600) and stops on the same check.
   - The link and the box's ssh config are rewritten only when they change, so a reconnect touches
