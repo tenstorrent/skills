@@ -302,7 +302,8 @@ def test_credwatch_a_change_no_transcript_shows_is_told_once_for_the_host_and_fa
     rm.write_text(f"sleep 0.05\nrm {shlex.quote(str(tok))}\n")
     for shell in (f"sh {shlex.quote(str(swap))}", f"sh {shlex.quote(str(rm))}"):
         monkeypatch.setenv("TTP_FAKE_SHELL", shell)
-        t = p.db.add_task("swap or remove", "s", kind="work", tier="light", origin="user")
+        t = p.db.add_task(f"{'swap' if 'swap' in shell else 'remove'} the shared login file", "s", kind="work",
+                          tier="light", origin="user")
         d.dispatch()
         _finish_runs(p, d)
         assert p.db.task(t)["status"] == "done", p.db.task(t)["result"]
@@ -365,13 +366,14 @@ def test_credwatch_open_run_rows_stale_or_live_never_change_a_verdict(env, monke
         other.db.x("INSERT INTO runs(task, role, started, ended, status, pid, boot_id) VALUES(?, 'worker', ?, NULL, "
                    "'running', ?, ?)", (otask, time.time() - 3600, pid, boot))
         monkeypatch.setenv("TTP_FAKE_SHELL", f"{shlex.quote(str(stub))}/gh auth refresh -s read:org")
-        own = p.db.add_task("refresh the gh login", "s", kind="work", tier="light", origin="user")
+        own = p.db.add_task(f"refresh the gh login, round {pid}-{boot}", "s", kind="work", tier="light", origin="user")
         d.dispatch()
         _finish_runs(p, d)
         res = json.loads(p.db.task(own)["result"] or "{}")
         assert res.get("status") == "failed" and res.get("cred_changed") == [[str(gh), "changed"]], (boot, pid, res)
         monkeypatch.setenv("TTP_FAKE_SHELL", _outside_write(env, f"github.com:\n    oauth_token: {pid}\n", gh))
-        outside = p.db.add_task("work while the user logs in again", "s", kind="work", tier="light", origin="user")
+        outside = p.db.add_task(f"work while the user logs in again, round {pid}-{boot}", "s", kind="work", tier="light",
+                                origin="user")
         d.dispatch()
         _finish_runs(p, d)
         assert p.db.task(outside)["status"] == "done", (boot, pid, p.db.task(outside)["result"])
@@ -520,3 +522,46 @@ def test_credwatch_writer_counts_only_at_command_position_never_inside_an_argume
         for cmd in cmds:
             assert verdict(cmd, path) == credwatch.FAILS, (path, cmd)
             assert credwatch.transcript_hit(run_dir, path, str(home))[0] == 2
+
+
+def test_credwatch_blames_only_the_runs_own_unrefused_post_fork_write_calls(env, monkeypatch):
+    """A fork's inherited calls (before its task prompt), a call a guard refused before it ran, tool output,
+    text and a write into a scratch place are `outside`; the run's own writes after its task prompt fail it, as
+    a shell command, a file tool or a Codex item. ssh-keygen counts for a key only with a -f naming that file or
+    no -f for a default id_* key."""
+    from ttp import credwatch, ctxfork
+    home = env["tmp"] / "acct"
+    monkeypatch.setenv("HOME", str(home))
+    gh, key = str(home / ".config" / "gh" / "hosts.yml"), str(home / ".ssh" / "id_ed25519")
+    run_dir = env["tmp"] / "run10"
+    run_dir.mkdir()
+    now = time.time()
+
+    def verdict(events, path):
+        (run_dir / "output.jsonl").write_text("".join(json.dumps(e) + "\n" for e in events))
+        return credwatch.classify([[path, "changed"]], {}, now - 600, now, run_dir, str(home))[path][0]
+
+    def use(i, cmd):
+        return {"type": "assistant", "message": {"content": [{"type": "tool_use", "id": i, "name": "Bash",
+                                                              "input": {"command": cmd}}]}}
+
+    def result(i, text):
+        return {"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": i, "content": text}]}}
+
+    fork = {"type": "user", "message": {"role": "user", "content": f"{ctxfork.FORK_HEAD}\nyour task"}}
+    inherited = [use("a", "gh auth refresh -s read:org"), result("a", "ok"), fork]
+    assert verdict(inherited, gh).startswith("outside")
+    assert verdict(inherited + [use("b", "gh auth refresh")], gh) == credwatch.FAILS
+    refused = [use("c", "gh auth refresh"), result("c", "PreToolUse:Bash hook error: [tt guard]: refused")]
+    assert verdict(refused, gh).startswith("outside")
+    assert verdict([use("d", "gh auth refresh"), result("d", "gh: not logged in")], gh) == credwatch.FAILS
+    declined = {"type": "item.completed", "item": {"id": "i1", "type": "command_execution",
+                                                    "command": "gh auth switch", "status": "declined"}}
+    assert verdict([declined], gh).startswith("outside")
+    done = {"type": "item.completed", "item": {"id": "i2", "type": "file_change", "status": "completed",
+                                                "changes": [{"path": gh, "kind": "update"}]}}
+    assert verdict([fork, done], gh) == credwatch.FAILS
+    assert verdict([_cred_said(f"gh auth refresh wrote {gh}", "text"), _cred_said("run gh auth login")], gh).startswith("outside")
+    for cmd, hit in ((f"ssh-keygen -t ed25519 -f {key}", True), ("ssh-keygen -t ed25519 -f ~/.ssh/other", False),
+                     ("ssh-keygen -t ed25519 -f /tmp/k", False), ("ssh-keygen -t ed25519 -N ''", True)):
+        assert (verdict([use("k", cmd)], key) == credwatch.FAILS) is hit, cmd
