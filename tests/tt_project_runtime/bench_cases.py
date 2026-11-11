@@ -530,6 +530,12 @@ def test_bench_cells_get_venvs_of_their_own_with_the_user_site_off_and_pip_user_
         r = subprocess.run(["python3", "-c", "import site, sys; print(sys.prefix, site.ENABLE_USER_SITE)"],
                            env=env, capture_output=True, text=True, timeout=60)
         assert r.stdout.split() == [str(venv), "False"], r
+        # The OS's site directories stay importable, below the venv's own.
+        r = subprocess.run(["python3", "-c", "import json, sys; print(json.dumps(sys.path))"], env=env,
+                           capture_output=True, text=True, timeout=60)
+        cell_path = json.loads(r.stdout)
+        for d in (d for d in json.loads(os_sites) if os.path.isdir(d)):
+            assert cell_path.index(d) > cell_path.index(str(next(venv.glob("lib/python*/site-packages")))), (d, cell_path)
         # No network: a current pip refuses `--user` before it looks for a package. An older one (the
         # OS's pip, seen through --system-site-packages) does not, but its user scheme still points
         # into the cell's own folder, never the shared user site.
