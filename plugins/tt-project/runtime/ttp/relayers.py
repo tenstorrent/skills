@@ -116,8 +116,9 @@ def conflicts(db, now: float | None = None) -> list[str]:
 
 
 def wakes(m, chat: str) -> str:
-    """'now' (print at once), 'batch' (print within the batch window) or '' (routine: skipped)."""
-    if m["chat"] == chat or m["kind"] == "ask" or m["severity"] in URGENT:
+    """'now' (print at once), 'batch' (print within the batch window) or '' (routine: skipped).
+    A reply or ask is for the user whatever chat it names: one posted to every chat (chat NULL) too."""
+    if m["chat"] == chat or m["kind"] in ("reply", "ask") or m["severity"] in URGENT:
         return "now"
     return "batch" if m["kind"] == "alert" else ""
 

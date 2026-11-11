@@ -865,3 +865,70 @@ def test_one_relayer_per_chat_id_refuses_another_and_redelivers_what_a_takeover_
     assert "the answer" in capsys.readouterr().out
     with pytest.raises(SystemExit):     # and the chat is the owner's again
         cli.main(["listen", "demo", "--chat", "c1", "--once", "--timeout", "1", "--holder", "mac/b"])
+
+
+def test_listen_prints_a_reply_posted_to_every_chat_and_never_reads_past_it_unprinted(env, monkeypatch, capsys):
+    """A reply to all chats (chat NULL: a coordinator reply to 'all', a hand-off with reply_chat 'all')
+    is for the user: every relayer prints it at once, never skips it as routine and marks it read."""
+    from ttp import cli, relayers
+    p = make(env)
+    _relay_chat(p)
+    monkeypatch.setattr(cli, "here", lambda: None)
+    p.db.post("out", "task 4 done", kind="info")
+    reply = p.db.post("out", "the release is out", kind="reply")
+    assert p.db.one("SELECT chat FROM messages WHERE id=?", (reply,))["chat"] is None
+    _, naps = _fake_clock(cli, monkeypatch)
+    capsys.readouterr()
+    cli.main(["listen", "demo", "--chat", "c1", "--once", "--batch", "600", "--holder", "h/a"])
+    out = capsys.readouterr().out
+    assert "the release is out" in out and "task 4 done" not in out and not naps, (out, naps)
+    assert p.db.one("SELECT last_read FROM chats WHERE id='c1'")["last_read"] >= reply
+    # Each user-facing kind wakes a relayer on any chat; routine kinds on another chat do not.
+    for kind, want in (("reply", "now"), ("ask", "now"), ("alert", "batch"), ("info", ""), ("resolved", "")):
+        assert relayers.wakes({"chat": None, "kind": kind, "severity": "normal"}, "c1") == want, kind
+    assert relayers.wakes({"chat": None, "kind": "info", "severity": "high"}, "c1") == "now"
+
+
+def test_remote_listen_and_connect_retry_without_holder_on_an_older_runtime_but_stop_on_a_lease_refusal(
+        env, monkeypatch, capsys):
+    """An older runtime there rejects --holder (exit 2, 'unrecognized arguments'): listen and connect
+    go on without it. A real lease refusal also exits 2 and is not retried."""
+    from ttp import cli
+    sent = []
+    old = "ttp: error: unrecognized arguments: --holder mac/a"
+
+    def ssh(entry, argv, capture=False, shown=None):
+        sent.append(list(argv))
+        if "--holder" in argv:
+            return subprocess.CompletedProcess(argv, 2, "", old)
+        return subprocess.CompletedProcess(argv, 0, "chat: c1\n", "")
+    monkeypatch.setattr(cli, "_ssh", ssh)
+    monkeypatch.setattr(cli, "_ssh_relay", lambda entry, argv, shown: ssh(entry, argv))
+    entry = {"host": "far", "dir": "/x"}
+    assert cli.forward(entry, ["listen", "demo", "--chat", "c1", "--holder", "mac/a"], shown=set()) == 0
+    assert "--holder" in sent[0] and "--holder" not in sent[-1] and len(sent) == 2
+    # connect: an older runtime lacking both --home-tz and --holder names both in one parse error.
+    sent.clear()
+    both = "ttp: error: unrecognized arguments: --holder mac/a --home-tz UTC --home-from far"
+
+    def ssh2(entry, argv, capture=False):
+        sent.append(list(argv))
+        if "--holder" in argv or "--home-tz" in argv:
+            return subprocess.CompletedProcess(argv, 2, "", both)
+        return subprocess.CompletedProcess(argv, 0, "chat: c1\n", "")
+    monkeypatch.setattr(cli, "_ssh", ssh2)
+    monkeypatch.setattr(cli, "flush_outbox", lambda name, entry: None)
+    monkeypatch.setattr(cli.timefmt, "in_ssh_login", lambda: False)
+    monkeypatch.setattr(cli, "remote_web", lambda name, entry, out: ("web app: ok", 0))
+    assert cli.connect_remote("demo", entry, ["connect", "demo", "--chat", "c1", "--holder", "mac/a"]) == 0
+    assert len(sent) == 2 and "--holder" not in sent[-1] and "--home-tz" not in sent[-1], sent
+    # A lease refusal (exit 2, no unknown option) is shown and not retried.
+    sent.clear()
+    refusal = "ttp: chat c1 is another relayer's (mac/b, last listening 1 min ago)."
+    monkeypatch.setattr(cli, "_ssh", lambda entry, argv, capture=False: sent.append(argv) or
+                        subprocess.CompletedProcess(argv, 2, "", refusal))
+    monkeypatch.setattr(cli, "_ssh_relay", lambda entry, argv, shown: sent.append(argv) or
+                        subprocess.CompletedProcess(argv, 2, "", refusal))
+    assert cli.connect_remote("demo", entry, ["connect", "demo", "--chat", "c1", "--holder", "mac/a"]) == 2
+    assert cli.forward(entry, ["listen", "demo", "--chat", "c1", "--holder", "mac/a"], shown=set()) == 2
+    assert len(sent) == 2 and "another relayer" in capsys.readouterr().err

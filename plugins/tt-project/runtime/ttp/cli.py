@@ -264,6 +264,8 @@ def forward(entry: dict, argv: list[str], quiet: bool = False, shown: set[int] |
         # The far side said so before it went: whatever ssh reports (255, 143), this is no drop.
         sys.stderr.write(r.stderr)
         return LISTEN_REPLACED
+    if _old_holder(r, argv):   # an older runtime there has no listener lease: relay without it
+        return forward(entry, _drop_holder(argv), quiet, shown, failure)
     if failure is not None and _dropped(r.returncode):   # the caller explains the drop, if it lasts
         failure.append(r.stderr or "")
     elif r.returncode == 255:   # ssh itself failed: the project's state is kept there
@@ -276,6 +278,18 @@ def forward(entry: dict, argv: list[str], quiet: bool = False, shown: set[int] |
             sys.stderr.write(f"ttp: `ttp {argv[0]}` ran on {entry['host']}, whose ttp is older and lacks it; "
                              f"it works there once a newer tt-project release is deployed on that machine\n")
     return r.returncode
+
+
+def _old_holder(r: subprocess.CompletedProcess, argv: list[str]) -> bool:
+    """Whether the far side's parser rejected --holder (a runtime older than the listener lease),
+    not a lease refusal, which also exits 2 but names no unknown option."""
+    err = r.stderr or ""
+    return r.returncode == 2 and "--holder" in argv and "unrecognized arguments" in err and "--holder" in err
+
+
+def _drop_holder(argv: list[str]) -> list[str]:
+    i = argv.index("--holder")
+    return argv[:i] + argv[i + 2:]
 
 
 def _send_say(entry: dict, argv: list[str], client_id: str, capture: bool = False) -> subprocess.CompletedProcess:
@@ -1053,8 +1067,13 @@ def connect_remote(name: str, entry: dict, argv: list[str]) -> int:
     # The user's zone only from their workstation: in an ssh login here it is a server's, so none.
     home = [] if timefmt.in_ssh_login() else ["--home-tz", timefmt.detect_local(), "--home-from", hostname()]
     r = _ssh(entry, [*argv, *home], capture=True)
-    if home and r.returncode == 2 and "--home-tz" in (r.stderr or ""):   # an older runtime there: connect without it
-        r = _ssh(entry, argv, capture=True)
+    while r.returncode == 2:   # an older runtime there: connect without what it lacks (one parse error names all)
+        old_tz, old_holder = bool(home) and "--home-tz" in (r.stderr or ""), _old_holder(r, argv)
+        if not (old_tz or old_holder):
+            break
+        home = [] if old_tz else home
+        argv = _drop_holder(argv) if old_holder else argv
+        r = _ssh(entry, [*argv, *home], capture=True)
     if r.returncode == 255:
         _unreachable(entry, r.stderr)
         return 255
