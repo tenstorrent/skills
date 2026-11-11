@@ -498,7 +498,7 @@ def test_bridge_writes_to_a_box_only_when_the_content_changed(tmp_path, monkeypa
     assert conf.stat().st_mtime == 1 and sshd.stat().st_mtime == 1 and not list(scratch.iterdir())
     conf.write_text("Host mine\n  User me\n\n" + first)
     assert bridge.write_block(cfg, "box-1").startswith("block written (backup")
-    assert conf.read_text().startswith("Host mine") and any(".bak-ttp-bridge-" in n for n in os.listdir(sshd))
+    assert conf.read_text().startswith(bridge.BEGIN) and "Host mine" in conf.read_text() and any(".bak-ttp-bridge-" in n for n in os.listdir(sshd))
     assert not [n for n in os.listdir(sshd) if n.endswith(".tmp")] and not list(scratch.iterdir())
     assert bridge.remove_block("box-1") == "block removed" and bridge.BEGIN not in conf.read_text()
     assert bridge.remove_block("box-1") == "no block"
