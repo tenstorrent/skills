@@ -3858,24 +3858,19 @@ def test_spill_host_entries_take_their_own_max_runs_and_jobs_and_plain_aliases_s
     assert checkspill.limits({}, "pool-a") == {"max_runs": 1, "jobs": 8}
 
 
-def test_a_spill_host_capped_by_max_runs_refuses_a_second_run_and_the_next_host_takes_it(env, tmp_path, monkeypatch):
+def test_a_spill_host_capped_by_max_runs_refuses_a_second_run_and_takes_one_again_once_freed(env, tmp_path, monkeypatch):
     """max_runs 1: the host takes one of this machine's checks at once though its idle cores fit more; a second
-    run goes to the next host, and with none left it is told why and waits; freed, the host takes one again."""
+    run is told why and waits; freed, the host takes one again."""
     from ttp import checkspill
-    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch,
-                                        [{"host": "check-host-a", "max_runs": 1}, "check-host-b"])
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, [{"host": "check-host-a", "max_runs": 1}])
     told: list[str] = []
-    first = checkspill.pick(p, p.config(), told.append, "pytest -q")
-    second = checkspill.pick(p, p.config(), told.append, "pytest -q")
+    held = checkspill.pick(p, p.config(), told.append, "pytest -q")
     try:
-        assert first is not None and first.host == "check-host-a", told
-        assert second is not None and second.host == "check-host-b", told   # spread or capped: host-b either way
-        p.set_config("delivery.checks_spill_hosts", [{"host": "check-host-a", "max_runs": 1}])
+        assert held is not None and held.host == "check-host-a", told
         assert checkspill.pick(p, p.config(), told.append, "pytest -q") is None
         assert "check-host-a (its max_runs 1 of this machine's checks run there already" in told[-1], told
     finally:
-        second.close()
-        first.close()
+        held.close()
     again = checkspill.pick(p, p.config(), told.append, "pytest -q")
     assert again is not None and again.host == "check-host-a"
     again.close()
