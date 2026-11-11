@@ -27,6 +27,7 @@ SSH_TIMEOUT_S = 40
 LIST_MARK = "ttp-orphan-dir"
 GONE_AGE = 999999      # the age list_script gives a checkout already removed whose processes run on
 REAP_MARK = "ttp-orphan-reaped"
+SKIP_MARK = "ttp-orphan-skipped"   # list_script's last line: how many checkouts are not this machine's or have no owner file
 
 
 def owner_line(pid: int | None = None) -> str:
@@ -62,10 +63,11 @@ def list_script(tag: str) -> str:
     """The host's side of the scan: one LIST_MARK line per checkout of this user carrying `tag` in its owner
     file: "<mark> <dir> <pid> <start> <age s>"; and "<mark> <dir> - - GONE_AGE" per removed checkout this
     user's processes still work in (removed while its run went on: no owner can stop it any more)."""
-    return (f"now=$(date +%s); for d in \"${{TMPDIR:-/tmp}}\"/ttp-check.*; do\n"
-            f"[ -d \"$d\" ] && [ -O \"$d\" ] && [ -f \"$d/{OWNER_FILE}\" ] || continue\n"
-            f"read t pid st < \"$d/{OWNER_FILE}\" || continue\n"
-            f"[ \"$t\" = {shlex.quote(tag)} ] || continue\n"
+    return (f"now=$(date +%s); k=0; for d in \"${{TMPDIR:-/tmp}}\"/ttp-check.*; do\n"
+            f"[ -d \"$d\" ] || continue\n"
+            f"[ -O \"$d\" ] && [ -f \"$d/{OWNER_FILE}\" ] || {{ k=$((k+1)); continue; }}\n"
+            f"read t pid st < \"$d/{OWNER_FILE}\" || {{ k=$((k+1)); continue; }}\n"
+            f"[ \"$t\" = {shlex.quote(tag)} ] || {{ k=$((k+1)); continue; }}\n"
             f"m=$(stat -c %Y \"$d\" 2>/dev/null) || continue\n"
             f"echo {LIST_MARK} \"$d\" \"$pid\" \"$st\" $((now - m))\ndone\n"
             # Processes of this user still working in a checkout that is gone: nothing owns them any more.
@@ -76,7 +78,7 @@ def list_script(tag: str) -> str:
             "r=${c#*/ttp-check.}; d=\"${c%%/ttp-check.*}/ttp-check.${r%%[/ ]*}\"\n"
             "[ ! -e \"$d\" ] || continue\n"
             "case \" $seen \" in *\" $d \"*) continue;; esac\n"
-            f"seen=\"$seen $d\"; echo {LIST_MARK} \"$d\" - - {GONE_AGE}\ndone; exit 0")
+            f"seen=\"$seen $d\"; echo {LIST_MARK} \"$d\" - - {GONE_AGE}\ndone; echo {SKIP_MARK} $k; exit 0")
 
 
 def reap_script(dirs: list[str], grace_s: int) -> str:
@@ -157,18 +159,27 @@ def hosts(cfg: dict | None) -> list[str]:
 def scan(host: str, dry_run: bool = False, run=_run, alive=owner_alive) -> list[dict]:
     """Find and (unless `dry_run`) stop `host`'s orphaned checkouts of this machine: one record each,
     {"host", "dir", "groups", "text"}; [] when the host is paused, unreachable or has none."""
+    return _scan(host, dry_run, run, alive)[1]
+
+
+def _scan(host: str, dry_run: bool, run, alive) -> tuple[dict | str, list[dict]]:
+    """scan() with its tally: ({"found", "live", "skipped"}, records), or (why the host was skipped, [])."""
     from . import checkcap, remotecheck
-    if remotecheck.paused(host):
-        return []
+    if why := remotecheck.paused(host):
+        return why, []
     rc, out = run(host, list_script(checkcap.host_tag()))
     if rc != 0:
-        return []
+        return "unreachable", []
     dirs = orphans(out, alive=alive)
+    own = [ln.split() for ln in out.splitlines() if ln.startswith(LIST_MARK + " ")]
+    skipped = next((int(w[1]) for w in map(str.split, out.splitlines())
+                    if len(w) == 2 and w[0] == SKIP_MARK and w[1].isdigit()), 0)
+    tally = {"found": len(own), "live": len(own) - len(dirs), "skipped": skipped}
     if not dirs:
-        return []
+        return tally, []
     if dry_run:
-        return [{"host": host, "dir": d, "groups": "", "text": f"would stop orphaned check {d} on {host}: "
-                 "its local owner is gone"} for d in dirs]
+        return tally, [{"host": host, "dir": d, "groups": "", "text": f"would stop orphaned check {d} on {host}: "
+                        "its local owner is gone"} for d in dirs]
     rc, out = run(host, reap_script(dirs, remotecheck.STOP_GRACE_S))
     recs = []
     for line in out.splitlines():
@@ -178,7 +189,28 @@ def scan(host: str, dry_run: bool = False, run=_run, alive=owner_alive) -> list[
             recs.append({"host": host, "dir": w[1], "groups": groups,
                          "text": f"stopped orphaned check {w[1]} on {host} (its local owner is gone): "
                                  + (f"process groups {groups}" if groups else "no process left") + ", folder removed"})
-    return recs
+    return tally, recs
+
+
+def reap_report(cfg: dict | None, dry_run: bool = False, run=_run, alive=owner_alive) -> list[str]:
+    """What `ttp checks --reap` prints for the project's check hosts (hosts()), now and whatever the sweep's
+    window says: each host's reaped checkouts (scan), then one line per host: "<host>: found N, live N,
+    reaped N, skipped N (not this machine's, or no owner file)", or "<host>: skipped (why)" for one paused or
+    out of reach. Never raises for a host."""
+    lines = []
+    for h in hosts(cfg):
+        try:
+            tally, recs = _scan(h, dry_run, run, alive)
+        except Exception as e:   # one host's fault never ends the pass
+            tally, recs = f"error: {type(e).__name__}", []
+        lines += [r["text"] for r in recs]
+        if isinstance(tally, str):
+            lines.append(f"{h}: skipped ({tally})")
+        else:
+            lines.append(f"{h}: found {tally['found']}, live {tally['live']}, "
+                         f"{'would reap' if dry_run else 'reaped'} {len(recs)}, skipped {tally['skipped']} "
+                         "(not this machine's, or no owner file)")
+    return lines
 
 
 def sweep(cfg: dict | None, every_s: float = EVERY_S, now: float | None = None, dry_run: bool = False,

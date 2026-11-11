@@ -137,3 +137,61 @@ def test_orphan_check_sweep_scans_each_check_host_once_per_window_for_all_projec
     assert orphanchecks.sweep(cfg, now=1000.0 + orphanchecks.EVERY_S, run=run, alive=lambda pid, st: False)
     assert orphanchecks.hosts({"delivery": {"checks_spill_hosts": [], "checks_host": "local"}}) == []
     assert orphanchecks.orphans(f"{orphanchecks.LIST_MARK} /tmp/ttp-check.y 1 2 5\n") == [], "within the grace"
+
+
+def test_reap_report_removes_only_this_machines_dead_checkouts_and_tallies_each_host(tmp_path, monkeypatch):
+    """The `ttp checks --reap` report on a fake host: an own dead checkout is removed; an own live one, a
+    foreign one and one with no owner file stay; the line counts found, live, reaped and skipped."""
+    from ttp import checkcap, orphanchecks
+    remote = _oc_env(tmp_path, monkeypatch)
+    tag = checkcap.host_tag()
+    dead = _oc_checkout(remote, "dead", f"{tag} {_oc_dead_pid()} 12345")
+    live = _oc_checkout(remote, "live", orphanchecks.owner_line())
+    foreign = _oc_checkout(remote, "foreign", f"otherhst {_oc_dead_pid()} 12345")
+    unmarked = remote / "ttp-check.unmarked"
+    unmarked.mkdir()
+    os.utime(unmarked, (time.time() - 600, time.time() - 600))
+    cfg = {"delivery": {"checks_spill_hosts": ["box1"]}}
+    dry = orphanchecks.reap_report(cfg, dry_run=True)
+    assert dry[-1] == "box1: found 2, live 1, would reap 1, skipped 2 (not this machine's, or no owner file)"
+    assert dead.exists(), "a dry run removes nothing"
+    lines = orphanchecks.reap_report(cfg)
+    assert lines[-1] == "box1: found 2, live 1, reaped 1, skipped 2 (not this machine's, or no owner file)"
+    assert any(str(dead) in ln and "folder removed" in ln for ln in lines[:-1])
+    assert not dead.exists()
+    assert live.exists() and foreign.exists() and unmarked.exists()
+
+
+def test_reap_report_skips_an_unreachable_or_paused_host_and_still_reports_the_rest(tmp_path, monkeypatch):
+    """A host ssh cannot reach, one that is paused, and one that raises are each one skipped line; the next
+    host is still reaped, and nothing raises."""
+    from ttp import orphanchecks, remotecheck
+    monkeypatch.setattr(remotecheck, "paused", lambda host, where=None: "paused by a hold" if host == "held" else "")
+
+    def run(host, script):
+        if host == "down":
+            return 255, "ssh: no route"
+        if host == "odd":
+            raise ValueError("boom")
+        return 0, f"{orphanchecks.SKIP_MARK} 0\n"
+
+    cfg = {"delivery": {"checks_spill_hosts": ["down", "held", "odd", "up"]}}
+    assert orphanchecks.reap_report(cfg, run=run) == [
+        "down: skipped (unreachable)", "held: skipped (paused by a hold)", "odd: skipped (error: ValueError)",
+        "up: found 0, live 0, reaped 0, skipped 0 (not this machine's, or no owner file)"]
+
+
+def test_checks_reap_prints_the_report_of_each_check_host_and_exits_zero(tmp_path, monkeypatch, capsys):
+    """`ttp checks --reap` runs the local reap, then the per-host report, and exits 0 even for a host out of reach."""
+    import argparse
+    from ttp import cli, leftoverchecks, orphanchecks
+    p = types.SimpleNamespace(config=lambda: {"delivery": {"checks_spill_hosts": ["down"]}})
+    monkeypatch.setattr(cli, "here", lambda *a, **k: p)
+    monkeypatch.setattr(leftoverchecks, "reap", lambda *a, **k: [])
+    monkeypatch.setattr(leftoverchecks, "test_orphans", lambda *a, **k: [])
+    monkeypatch.setattr(orphanchecks, "reap_report", lambda cfg, dry_run=False: ["down: skipped (unreachable)"])
+    monkeypatch.setattr("ttp.daemon.log", lambda *a, **k: None)
+    a = argparse.Namespace(reap=True, dry_run=False, result=None, gap=None)
+    with pytest.raises(SystemExit) as e:
+        cli.cmd_checks(a)
+    assert e.value.code == 0 and "down: skipped (unreachable)" in capsys.readouterr().out
