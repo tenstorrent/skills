@@ -2642,3 +2642,37 @@ def test_a_running_task_is_stopped_once_superseded_and_its_work_kept(env, tmp_pa
                                                        (ids["landed"][0], supersede.STOPPED))["text"]
     tid, run_dir = ids["kept"]
     assert p.db.task(tid)["status"] == "running" and not (run_dir / "STOP").exists()
+
+
+def test_dispatch_never_holds_a_recurring_schedule_run_as_a_duplicate_of_its_last(env):
+    """Each run of a schedule repeats its last one's title by design: the next run, after a done or beside an
+    open one, is never held, and a coordinator task is not held for matching a schedule run. A second daemon
+    fix of one review is still held."""
+    from ttp import supersede
+    p = make(env)
+    for first in ("done", "running"):
+        a = p.db.add_task("[daily-review] daily review", "evidence 1", kind="work", status=first, origin="schedule")
+        b = p.db.add_task("[daily-review] daily review", "evidence 2", kind="work", origin="schedule")
+        assert supersede.dispatch_hold(p.db, p.db.task(b)) == "", first
+        c = p.db.add_task("[daily-review] daily review", "evidence 3", kind="work")
+        assert supersede.dispatch_hold(p.db, p.db.task(c)) == "", first
+        for t in (a, b, c):
+            p.db.x("UPDATE tasks SET status='cancelled' WHERE id=?", (t,))
+    f1 = p.db.add_task("Fix review #5: code: tidy the relay", "fix the findings", kind="code", origin="daemon")
+    f2 = p.db.add_task("Fix review #5: code: tidy the relay", "fix the findings", kind="code", origin="daemon")
+    assert f"duplicates #{f1}" in supersede.dispatch_hold(p.db, p.db.task(f2))
+
+
+def test_a_landing_record_from_before_a_run_began_never_stops_it(env, tmp_path):
+    """A done task with a `ttp task superseded` record, requeued afterwards, keeps its new run."""
+    from ttp import daemon as dm, supersede
+    p = make(env)
+    d = dm.Daemon(p.base)
+    now = time.time()
+    tid = p.db.add_task("work requeued", "s", kind="code", status="running")
+    p.db.x("INSERT INTO task_superseded(task,head,sha,ts) VALUES(?,?,?,?)", (tid, "abc123", "def4567890", now - 500))
+    p.db.x("INSERT INTO runs(task,role,started,status,dir) VALUES(?,?,?,?,?)",
+           (tid, "worker", now - 100, "running", str(tmp_path)))
+    d.stop_superseded()
+    assert p.db.task(tid)["status"] == "running" and not (tmp_path / "STOP").exists()
+    assert not p.db.q("SELECT 1 FROM events WHERE task=? AND kind=?", (tid, supersede.STOPPED))

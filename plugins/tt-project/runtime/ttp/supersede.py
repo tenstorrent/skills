@@ -5,14 +5,15 @@ At dispatch (`dispatch_hold`, just before a run starts), a queued task is held (
 - repeats an earlier open task, or one done in the last DUP_DONE_DAYS: the same title, or the same
   title and spec by task_add's own test (coordinator.looks_same). Daemon-made tasks (reviews, fixes,
   re-reviews, continues) count too. Not a duplicate: a task of its own lineage (one it continues, at any
-  hop), one either depends on, a review of another subject, and a spec saying `differs from #<id>`;
+  hop), one either depends on, a review of another subject, a spec saying `differs from #<id>`, and a
+  schedule's runs (origin 'schedule': each run of a recurring schedule repeats the last by design);
 - predates a user order whose `supersedes` steps (STEPS_KEY, recorded with the order) its spec still
   carries, and was not re-specified since.
 A task is held once: queued again after its hold (the coordinator looked), it runs.
 
 While running (`stop_superseded`, every STOP_EVERY_S), a task is cancelled, which stops its run (the
 daemon's cancel path writes STOP; the worktree and branch stay, so its work is kept), once it is
-superseded: its change landed through another task (`ttp task superseded`), a newer task continues it
+superseded: its change landed through another task (`ttp task superseded`, recorded since that run began), a newer task continues it
 (`continues:`), or every obligation it owns was dropped. One `superseded_stopped` event says why.
 """
 from __future__ import annotations
@@ -57,12 +58,14 @@ def duplicate_of(db, task: dict) -> dict | None:
     """An earlier open task, or one done in the last DUP_DONE_DAYS, that `task` repeats."""
     from .coordinator import looks_same
     from .db import dependency_ids, review_subject
+    if task.get("origin") == "schedule":   # a recurring schedule's next run is never a duplicate of its last
+        return None
     skip = _lineage(db, task) | {int(d) for d in dependency_ids(task) if str(d).isdigit()} \
         | {int(i) for i in _DIFFERS.findall(task.get("spec") or "")}
     title, spec = task.get("title") or "", task.get("spec") or ""
     since = time.time() - DUP_DONE_DAYS * 86400
     for o in db.q("SELECT * FROM tasks WHERE id<? AND kind=? AND (status NOT IN ('done','failed','cancelled') "
-                  "OR (status='done' AND COALESCE(updated, created, 0) >= ?)) ORDER BY id DESC",
+                  "OR (status='done' AND COALESCE(updated, created, 0) >= ?)) AND origin!='schedule' ORDER BY id DESC",
                   (task["id"], task["kind"], since)):
         if not (_norm(title) == _norm(o["title"]) or looks_same(title, spec, o["title"] or "", o["spec"] or "")):
             continue
@@ -123,9 +126,10 @@ def hold(db, task: dict, why: str) -> None:
 
 def stop_reason(db, task: dict, started: float) -> str:
     """Why running `task` (its run started at `started`) is superseded ('' while it is not)."""
-    from . import landed, obligations
-    if rows := landed.superseded(db, [task["id"]]).get(task["id"]):
-        return f"its change landed through another commit ({rows[-1][1][:12]})"
+    from . import obligations
+    if row := db.one("SELECT sha FROM task_superseded WHERE task=? AND ts>=? ORDER BY ts DESC LIMIT 1",
+                     (task["id"], started)):   # an older record predates this run (a requeue after it)
+        return f"its change landed through another commit ({row['sha'][:12]})"
     for t in db.q("SELECT * FROM tasks WHERE id>? AND kind!='review' AND COALESCE(created,0)>? "
                   "AND labels LIKE ?", (task["id"], started, f'%"continues:{int(task["id"])}"%')):
         return f"#{t['id']} {t['title'][:120]} continues it"
