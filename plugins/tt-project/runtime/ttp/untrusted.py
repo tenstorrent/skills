@@ -336,15 +336,87 @@ def bash_refusal(segments: list[list[str]], raw: list[list[str]], cwd: str) -> s
 MARK_WHY = "this run's untrusted-input file records the untrusted text it read; leave it as it is"
 
 
+# Commands that only read or print their arguments: naming RUN_MARK to one has no effect on the file.
+MARK_READERS = frozenset(("cat", "head", "tail", "less", "more", "grep", "egrep", "fgrep", "rg", "wc", "ls", "stat",
+                          "file", "diff", "cmp", "test", "[", "echo", "printf", "jq", "md5sum", "sha1sum", "sha256sum"))
+# Words that run code or other commands from their arguments or input: a mention anywhere in such a
+# command may reach the file, so it is refused as before.
+MARK_RUNNER_RE = re.compile(r"(?:ba|z|da|k|c|tc|fi)?sh|python[\d.]*|perl|ruby|node|deno|bun|php|lua|tclsh"
+                            r"|[gmn]?awk|sed|xargs|find|parallel|ssh|eval|exec|source|watch|busybox|n?vim?|ed|ex")
+PATCH_FILE_RE = re.compile(r"^\*\*\* (?:(?:Add|Update|Delete) File|Move to): *(.+?) *$", re.M)
+
+
+def _mark_path(word: str) -> bool:
+    return os.path.basename(word.rstrip("/")) == RUN_MARK
+
+
+def _unsingle(cmd: str) -> str:
+    """`cmd` without its single-quoted spans, the only quoting in which a shell runs no substitution."""
+    out, q, esc = [], "", False
+    for c in cmd:
+        if q == "'":
+            q = "" if c == "'" else q
+        elif esc:
+            esc = False
+            out.append(c)
+        elif c == "\\":
+            esc = True
+            out.append(c)
+        elif c == "'" and not q:
+            q = "'"
+        else:
+            q = ("" if q else '"') if c == '"' else q
+            out.append(c)
+    return "".join(out)
+
+
+def _mark_bash(cmd: str) -> bool:
+    """Whether a Bash command may create, change, move or delete RUN_MARK. A mention only in a quoted
+    prose argument (a note's text) or as an argument of a command that only reads (a grep pattern, a
+    cat) has no effect; a redirect into it, a path to it given to any other command, or any mention in
+    a command that runs code (or with a substitution or heredoc whose effect the words do not show)
+    counts."""
+    if RUN_MARK not in cmd:
+        return False
+    from .hook import _quoting, _segments, _strip_prefix
+    live = "".join(c for c, (inert, _) in zip(cmd, _quoting(cmd)) if not inert)
+    if "`" in _unsingle(cmd) or "$(" in _unsingle(cmd) or "<<" in live or "<(" in live or ">(" in live:
+        return True   # a substitution (it runs inside double quotes too), heredoc or process substitution
+    try:
+        import shlex
+        lex = shlex.shlex(cmd, posix=True, punctuation_chars=";&|()<>")
+        lex.whitespace_split = True
+        words = list(lex)
+    except ValueError:
+        return True
+    if any(">" in w and set(w) <= set("&<>|") and RUN_MARK in n for w, n in zip(words, words[1:])):
+        return True   # a redirect into it
+    segs = _segments(cmd, strip=False)
+    if any(MARK_RUNNER_RE.fullmatch(os.path.basename(w)) for seg in segs for w in seg) \
+            or any(seg[0] == "." for seg in segs):
+        return True   # code, or a command run from piped input, anywhere in the line
+    for seg in segs:
+        if not any(RUN_MARK in w for w in seg):
+            continue
+        run = _strip_prefix(seg)
+        if run and os.path.basename(run[0]) in MARK_READERS:
+            continue
+        if any(RUN_MARK in w and (_mark_path(w) or not re.search(r"\s", w)) for w in seg):
+            return True   # a path to it, or a bare word naming it, given to a command that may write
+    return False
+
+
 def mark_refusal(tool: str, args: dict) -> str | None:
-    """Refuse a task run's Bash command naming RUN_MARK, or an edit or patch of that file."""
+    """Refuse a task run's Bash command that may create, change, move or delete RUN_MARK (_mark_bash),
+    or an edit or patch of that file. Its name inside quoted text or a read is no effect."""
     if tool == "Bash":
-        return MARK_WHY if RUN_MARK in str(args.get("command") or "") else None
+        return MARK_WHY if _mark_bash(str(args.get("command") or "")) else None
     if tool in ("Write", "Edit", "MultiEdit", "NotebookEdit"):
         path = str(args.get("file_path") or args.get("notebook_path") or "")
-        return MARK_WHY if os.path.basename(path.rstrip("/")) == RUN_MARK else None
+        return MARK_WHY if _mark_path(path) else None
     if tool == "apply_patch":
-        return MARK_WHY if RUN_MARK in json.dumps(args) else None
+        patch = "\n".join(str(v) for v in args.values()) if isinstance(args, dict) else str(args)
+        return MARK_WHY if any(_mark_path(p) for p in PATCH_FILE_RE.findall(patch)) else None
     return None
 
 

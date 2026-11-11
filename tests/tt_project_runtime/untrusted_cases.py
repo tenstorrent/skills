@@ -283,3 +283,44 @@ def test_a_task_run_may_not_remove_or_edit_its_untrusted_input_mark(env, tmp_pat
         assert "leave it as it is" in _why(tmp_path, tool, args), (tool, args)
     assert _why(tmp_path, "Bash", {"command": "ls $TTP_RUN_DIR/result.json"}) == ""
     assert _why(tmp_path, "Write", {"file_path": str(tmp_path / "result.json"), "content": "{}"}) == ""
+
+
+_M = "untrusted" + "-input"   # untrusted.RUN_MARK, built by parts so no command text here names it
+MARK_NO_EFFECT = [   # commands that write only other files, naming the record only in quoted text or a read
+    f"mkdir -p evidence && echo '{{}}' > evidence/git-receipt.json && ttp note \"receipt written; the {_M} record stays as it is\"",
+    f"jq -n --arg why 'left {_M} untouched' '{{why: $why}}' > evidence/artifact-manifest.json",
+    f"grep -rn \"{_M}\" plugins/ | head",
+    f"cat $TTP_RUN_DIR/{_M}",
+    f"ttp clip -- cat $TTP_RUN_DIR/{_M}",
+    f"ttp note 'kept `{_M}` as it is'",
+]
+MARK_EFFECT = [   # a create, change, move or delete of the record, or code that may reach it
+    f"mv $TTP_RUN_DIR/{_M} /tmp/x", f"cp /dev/null \"$TTP_RUN_DIR/{_M}\"", f"truncate -s0 {_M}",
+    f"echo x | tee -a {_M}", f": > {_M}", f"echo x 2>> {_M}", f"rm \"/a b/{_M}\"", f"ttp clip -- rm {_M}",
+    f"f={_M}; rm $f", f"sed -i d {_M}", f"echo {_M} | xargs rm", f"python3 -c \"import os; os.remove('{_M}')\"",
+    f"ttp note \"$(rm {_M})\"", f"ttp note \"`rm {_M}`\"", f"bash <<EOF\nrm {_M}\nEOF", f"ttp note {_M}",
+]
+
+
+@pytest.mark.parametrize("cmd", MARK_NO_EFFECT)
+def test_naming_the_untrusted_input_mark_in_quoted_text_or_a_read_passes(env, tmp_path, monkeypatch, cmd):
+    """Only a real effect on the record is refused: its name inside a note's text, a grep pattern or a
+    read is data, and a command that writes only evidence files passes."""
+    from ttp import untrusted
+    assert untrusted.RUN_MARK == _M
+    _untrusted_run(env, tmp_path, monkeypatch, ["untrusted_input"])
+    assert "leave it as it is" not in _why(tmp_path, "Bash", {"command": cmd}), cmd
+
+
+@pytest.mark.parametrize("cmd", MARK_EFFECT)
+def test_writing_moving_or_deleting_the_untrusted_input_mark_is_refused(env, tmp_path, monkeypatch, cmd):
+    _untrusted_run(env, tmp_path, monkeypatch, [])
+    assert "leave it as it is" in _why(tmp_path, "Bash", {"command": cmd}), cmd
+
+
+def test_a_patch_naming_the_untrusted_input_mark_only_in_its_text_passes(env, tmp_path, monkeypatch):
+    _untrusted_run(env, tmp_path, monkeypatch, [])
+    mark = str(tmp_path / _M)
+    for hdr in ("Update File", "Add File", "Move to"):
+        assert "leave it as it is" in _why(tmp_path, "apply_patch", {"input": f"*** {hdr}: {mark}\n+x"}), hdr
+    assert _why(tmp_path, "apply_patch", {"input": f"*** Update File: notes.md\n+the {_M} record stays"}) == ""
