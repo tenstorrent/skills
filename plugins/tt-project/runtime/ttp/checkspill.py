@@ -1966,6 +1966,8 @@ def quarantined(p, alias: str, now: float | None = None) -> str:
             return ""
     except Exception:
         return ""
+    if off.get("kind") == "health":   # spillhealth: back once its health check passes
+        return f"quarantined: its health check failed ({off.get('why')}); back once it passes, or with `ttp checks --spill-back {alias}`"
     return (f"quarantined: {off.get('n')} spilled runs in a row failed there and passed elsewhere; back once a "
             f"known-good run of the base passes there (`ttp checks --spill-probe {alias}`) or with "
             f"`ttp checks --spill-back {alias}`, at the latest {timefmt.clock(now=float(off['until']))}")

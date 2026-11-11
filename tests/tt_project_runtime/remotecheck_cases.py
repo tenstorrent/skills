@@ -5160,3 +5160,118 @@ def test_a_tree_copy_timeout_clears_only_once_a_test_copy_to_the_host_finishes_i
     envfault.record(p, plain, "7")
     assert cli._checks_env_ok(p, [sig]) == 0, "a fault that was no copy timeout clears once ssh answers"
     assert not [c for c in calls.read_text().splitlines() if "/sample" in c]
+
+
+def _health_setup(env, tmp_path, monkeypatch, hosts):
+    """_spill_setup with the health probe's pinned-env lines left out (the fake host is this machine, whose
+    pytest the probe imports) and its folder under the test's temp folder."""
+    from ttp import runnerenv
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, hosts)
+    monkeypatch.setattr(runnerenv, "remote_lines", lambda *a, **k: "")
+    monkeypatch.chdir(tmp_path)
+    return p
+
+
+def test_a_spill_host_health_probe_imports_pytest_through_the_wrapper_and_a_refusal_is_busy(
+        env, tmp_path, monkeypatch):
+    """spillhealth.check over ssh: `<wrap> python3 -c 'import pytest'` exiting 0 is ok; the wrapper failing,
+    missing or exiting 75 without its refusal file fails; exit 75 with the file (TTP_WRAP_REFUSED) is busy;
+    an unreachable host fails naming ssh."""
+    from ttp import spillhealth
+    _health_setup(env, tmp_path, monkeypatch, ["check-host-a"])
+    wrap = tmp_path / "wrap.sh"
+    wrap.write_text('#!/bin/sh\ncase "$(cat "$WRAP_MODE")" in\n  fail) echo boom; exit 1;;\n'
+                    '  refuse) : > "$TTP_WRAP_REFUSED"; exit 75;;\n  bare75) exit 75;;\nesac\nexec "$@"\n')
+    wrap.chmod(0o755)
+    mode = tmp_path / "mode"
+    monkeypatch.setenv("WRAP_MODE", str(mode))
+    for m, state in (("ok", "ok"), ("fail", "fail"), ("refuse", "busy"), ("bare75", "fail")):
+        mode.write_text(m)
+        got = spillhealth.check("check-host-a", [str(wrap)])
+        assert got["state"] == state, (m, got)
+    mode.write_text("fail")
+    assert "boom" in spillhealth.check("check-host-a", [str(wrap)])["why"]
+    assert spillhealth.check("check-host-a", [str(tmp_path / "nowrap.sh")])["state"] == "fail"
+    down = spillhealth.check("down", [])
+    assert down["state"] == "fail" and "ssh" in down["why"], down
+    assert spillhealth.check("check-host-a", [])["state"] == "ok"
+    assert spillhealth.wrap_words({"checks": {"spill_wrap_cmd": "tools/wrap.sh --low"}}) == [], "a tree path"
+
+
+def test_a_spill_host_failing_its_health_check_leaves_pick_until_it_passes_with_one_event(
+        env, tmp_path, monkeypatch):
+    """A host failing the shared health probe is quarantined (pick skips it) with one event however often it
+    fails; a busy result changes nothing; a pass lifts it; a host probed by one daemon is not probed again by
+    another within EVERY_S; a strikes quarantine is never lifted by a health pass."""
+    from ttp import checkspill, spillhealth
+    p = _health_setup(env, tmp_path, monkeypatch, ["check-host-a", "check-host-b", "down"])
+    log = tmp_path / "ssh.log"
+    monkeypatch.setenv("FAKE_SSH_LOG", str(log))
+    cfg, now = p.config(), time.time()
+    spillhealth.probe(spillhealth.targets(cfg), now)
+    spillhealth.probe(spillhealth.targets(cfg), now + 1)   # another project's daemon, same hosts: shared result
+    assert sorted(log.read_text().split()) == ["check-host-a", "check-host-b", "down"]
+    assert spillhealth.apply(p, cfg, now) == ["down"]
+    assert "health check failed (ssh failed" in checkspill.quarantined(p, "down")
+    told = []
+    got = checkspill.pick(p, cfg, told.append, "pytest -q")
+    try:
+        assert got is None or got.host != "down"
+    finally:
+        got and got.close()
+    assert "down (quarantined: its health check failed" in " ".join(told), told
+    spillhealth.probe(spillhealth.targets(cfg), now + spillhealth.EVERY_S + 1)
+    assert spillhealth.apply(p, cfg, now + spillhealth.EVERY_S + 1) == []
+    assert len(_spill_events(p, "Spill host down failed its health check")) == 1
+    # down comes back: a busy result first changes nothing, then a pass lifts it
+    res = {"down": {"state": "busy", "why": "refused"}}
+    monkeypatch.setattr(spillhealth, "check", lambda h, w: res.get(h, {"state": "ok", "why": ""}))
+    t = now + 2 * spillhealth.EVERY_S + 2
+    spillhealth.probe(spillhealth.targets(cfg), t)
+    spillhealth.apply(p, cfg, t)
+    assert checkspill.quarantined(p, "down")
+    res.clear()
+    t += spillhealth.EVERY_S + 1
+    spillhealth.probe(spillhealth.targets(cfg), t)
+    assert spillhealth.apply(p, cfg, t) == ["down"] and not checkspill.quarantined(p, "down")
+    assert len(_spill_events(p, "Spill host down is back")) == 1
+    # a strikes quarantine stays through a passing health check
+    p.set_config("checks.spill_quarantine_after", 1)
+    checkspill.strike_fail(p, "check-host-a", "h1", "OSError: disk full")
+    assert checkspill.strike_settle(p, p.config(), "h1", passed_on="check-host-b") == ["check-host-a"]
+    assert spillhealth.apply(p, cfg, t) == [] and "spilled runs in a row" in checkspill.quarantined(p, "check-host-a")
+
+
+def test_every_spill_host_failing_its_health_check_is_one_config_event_and_takes_none_out(
+        env, tmp_path, monkeypatch):
+    """The spill setup broken for every host at once (the same import error everywhere): one high event, no
+    host quarantined, however often the probe runs."""
+    from ttp import checkspill, spillhealth
+    p = _health_setup(env, tmp_path, monkeypatch, ["check-host-a", "check-host-b"])
+    monkeypatch.setattr(spillhealth, "check",
+                        lambda h, w: {"state": "fail", "why": "ModuleNotFoundError: No module named 'pytest'"})
+    cfg, now = p.config(), time.time()
+    for i in range(3):
+        t = now + i * (spillhealth.EVERY_S + 1)
+        spillhealth.probe(spillhealth.targets(cfg), t)
+        assert spillhealth.apply(p, cfg, t) == []
+    assert not checkspill.quarantined(p, "check-host-a") and not checkspill.quarantined(p, "check-host-b")
+    ev = _spill_events(p, "Every spill host failed its health check")
+    assert len(ev) == 1 and "No module named 'pytest'" in ev[0], ev
+
+
+def test_the_daemon_probes_spill_host_health_in_a_thread_and_acts_on_it(env, tmp_path, monkeypatch):
+    """Daemon.check_spill_health: the due probes run in a thread; the step takes a failing host out."""
+    from ttp import checkspill, spillhealth
+    from ttp import daemon as dm
+    p = _health_setup(env, tmp_path, monkeypatch, ["check-host-a", "check-host-b"])
+    monkeypatch.setattr(spillhealth, "check",
+                        lambda h, w: {"state": "fail" if h == "check-host-a" else "ok", "why": "no python3"})
+    monkeypatch.setenv("TTP_TEST_SPILL_HEALTH", "1")
+    d = dm.Daemon(p.base)
+    d.check_spill_health()
+    d._spill_health.join(10)
+    d._spill_health_at = 0.0
+    d.check_spill_health()
+    assert "health check failed (no python3)" in checkspill.quarantined(p, "check-host-a")
+    assert not checkspill.quarantined(p, "check-host-b")

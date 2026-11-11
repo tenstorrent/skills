@@ -2323,7 +2323,7 @@ class Daemon:
                      self.sweep_alerts, self.check_release, self.sync_shared_pauses, self.check_pause_ends, self.check_move, self.track_outages,
                      self.check_integrity, self.heal_harness_git,
                      self.sync_schedules, self.lint_charter, self.lint_worker_prompt, self.tend_holds, self.record_ttr, self.alert_long_pause,
-                     self.check_linger, self.check_notifier, self.check_overseer, self.alert_slurm_paused, self.check_gh_auth, self.check_reach, self.check_chats,
+                     self.check_linger, self.check_notifier, self.check_overseer, self.alert_slurm_paused, self.check_gh_auth, self.check_reach, self.check_spill_health, self.check_chats,
                      self.probe_mcp):
             if step in lease_off:
                 continue
@@ -4914,6 +4914,21 @@ class Daemon:
             self._reach = threading.Thread(target=reach.probe, args=(due, self._probe_env()), daemon=True,
                                            name="machine-reach")
             self._reach.start()
+
+    def check_spill_health(self) -> None:
+        """The spill hosts' health check (spillhealth): probe the due ones in a thread, and act here on the
+        shared results (quarantine a failing host, lift a passing one)."""
+        from . import spillhealth
+        if os.environ.get("PYTEST_CURRENT_TEST") and not os.environ.get("TTP_TEST_SPILL_HEALTH"):
+            return
+        if time.time() - getattr(self, "_spill_health_at", 0.0) < 60 or not (t := spillhealth.targets(self.cfg)):
+            return
+        self._spill_health_at = time.time()
+        job = getattr(self, "_spill_health", None)
+        if not (job and job.is_alive()):
+            self._spill_health = threading.Thread(target=spillhealth.probe, args=(t,), daemon=True, name="spill-health")
+            self._spill_health.start()
+        spillhealth.apply(self.p, self.cfg)
 
     def check_chats(self) -> None:
         """One low status line per relay chat that stopped reading with no listener running (chatgone)."""
