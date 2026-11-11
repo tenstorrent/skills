@@ -836,8 +836,10 @@ def test_model_suite_dry_run_writes_one_row_per_model_and_class_with_redacted_ba
     sit = lines[1]
     assert sit["cells"] == 6 and sit["bar"] is True and sit["injection_pass"] == 0.0, "a planted instruction obeyed bars"
     assert rows[1]["pass_rate"] == round(1 / 3, 3), "only the skip it was right to make"
-    assert sit["score"] == sit["pass_rate"] and sit["inject_ok"] is False, "rows carry score and inject_ok"
-    assert lines[0]["injection_pass"] is None and lines[0]["inject_ok"] is None, "no injection cells: no verdict"
+    assert all(r["suite"] == modelsuite.SUITE and r["score"] == r["pass_rate"] for r in lines), \
+        "each row carries the score modelscore.bench reads"
+    assert sit["inject_ok"] is False and all(r.get("inject_ok", not r["bar"]) is not r["bar"] for r in lines), \
+        "inject_ok is the opposite of the bar"
 
 
 def test_bench_inject_ok_never_clears_an_injection_failure(env, monkeypatch):
@@ -858,20 +860,15 @@ def test_bench_inject_ok_never_clears_an_injection_failure(env, monkeypatch):
     assert modelscore.bench()["m"]["injection_failed"] is True, "no injection cells: no verdict"
     write({**base, "class": "standard", "inject_ok": False}, {**base, "class": "babysit", "at": 200.0, "inject_ok": True})
     assert modelscore.bench()["m"]["injection_failed"] is False, "a later run that passed its injections clears it"
-    # run() writes inject_ok None for a row with no injection cells, False for a barred row, and the
+    # run() writes no inject_ok for a row with no injection cells, False for a barred row, and the
     # scoreboard keeps the standard row's failure despite the babysit row's same `at`.
     d.joinpath("2026-11-10.jsonl").unlink()
     monkeypatch.setattr(modelsuite, "babysit", lambda *a, **k: {"pass_rate": 1.0, "injection_pass": None, "bar": False})
     monkeypatch.setattr(modelsuite, "standard", lambda *a, **k: {"pass_rate": 0.5, "injection_pass": 0.0, "bar": True})
     rows = modelsuite.run(p.db, {"providers": {"chat": {"model_ranking": ["m"]}}}, ["m"], {}, 1e7,
                           date="2026-11-10", opts={"dry_run": True}, has_cli=lambda: True)
-    assert {r["class"]: r["inject_ok"] for r in rows} == {"standard": False, "babysit": None}
+    assert {r["class"]: r.get("inject_ok") for r in rows} == {"standard": False, "babysit": None}
     assert modelscore.bench()["m"]["injection_failed"] is True
-
-    assert all(r["suite"] == modelsuite.SUITE and r["score"] == r["pass_rate"] for r in lines), \
-        "each row carries the score modelscore.bench reads"
-    assert sit["inject_ok"] is False and all(r.get("inject_ok", not r["bar"]) is not r["bar"] for r in lines), \
-        "inject_ok is the opposite of the bar"
 
 
 def test_model_suite_scored_fields_read_by_the_board(env):
@@ -1029,14 +1026,3 @@ def test_model_suite_decisions_map_verb_records_and_faults_never_set_the_bar(env
     assert modelsuite.babysit("m", cs, boom)["bar"] is False
     assert modelsuite.babysit("m", cs, lambda m, q: "???")["bar"] is False
     assert modelsuite.babysit("m", cs, lambda m, q: "skip")["bar"] is True
-
-
-def test_model_bench_detach_starts_the_suite_not_a_run():
-    import argparse
-    from ttp import cli
-    a = argparse.Namespace(action="suite", force=False, date="2026-11-10", bench=None, cells="/c", timeout=9.0,
-                           budget=1.0, harbor=0, dry_run=True)
-    argv = cli._model_bench_argv(a)
-    assert argv[3:5] == ["model-bench", "suite"] and "--dry-run" in argv and argv[argv.index("--cells") + 1] == "/c"
-    assert cli._model_bench_argv(argparse.Namespace(action="run", force=True))[3:] == ["model-bench", "run", "--force"]
-

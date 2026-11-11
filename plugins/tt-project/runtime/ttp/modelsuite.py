@@ -292,8 +292,6 @@ def run(db, cfg: dict, served: list[str], parked: dict[str, float], now: float, 
                    **scored(r, SUITE)}
             for k in ("transcript_sha256", "diff_sha256", "tokens_per_s"):
                 row.setdefault(k, None)
-            row["score"] = row.get("pass_rate")   # the head-to-head report's fields; no injection cells: no verdict
-            row["inject_ok"] = None if row.get("injection_pass") is None else not row.get("bar")
             _append(d / f"{date}.jsonl", row)
             rows.append({**row, "cell_rows": r.get("cell_rows", [])})
         if (n := int(opts.get("harbor_tasks") or 0)) > 0 and not opts.get("dry_run"):   # off by default
