@@ -54,6 +54,11 @@ FORBIDDEN = re.compile(r"(?im)^\s*(IdentityFile|CertificateFile|ForwardAgent|Dyn
                        r"ProxyCommand|ProxyJump|LocalForward|RemoteForward|PKCS11Provider)\b|PRIVATE KEY")
 
 
+# a forwarded host is a loopback port here: an older entry for one of its names further down (a proxy,
+# or IdentitiesOnly with a key file) must not take over, and the first value ssh reads wins
+PROXY_NONE = "  ProxyCommand none"
+
+
 class BadConfig(ValueError):
     pass
 
@@ -255,7 +260,8 @@ def render_block(cfg: dict, box: str) -> str:
         for h in a["forward"]:
             lines += ["", f"Host {' '.join([h['name'], *h['aliases']])}", "  HostName 127.0.0.1", f"  Port {h['port']}",
                       f"  HostKeyAlias {h['host_key_alias']}", "  StrictHostKeyChecking accept-new",
-                      f"  IdentityAgent {ident}", "  ServerAliveInterval 15", "  ServerAliveCountMax 3"]
+                      f"  IdentityAgent {ident}", PROXY_NONE, "  IdentitiesOnly no",
+                      "  ServerAliveInterval 15", "  ServerAliveCountMax 3"]
             if h["user"]:
                 lines.append(f"  User {h['user']}")
         for h in a["direct"]:
@@ -273,12 +279,15 @@ def render_block(cfg: dict, box: str) -> str:
 
 def check_block(block: str, allowed: set[str] | frozenset = frozenset()) -> None:
     """Fail closed: refuse a block that would name a key file, hold key text or proxy traffic. The only
-    key-file lines let through are the exact ones of the offline certificate entries (allowed)."""
+    key-file lines let through are the exact ones of the offline certificate entries (allowed), and the
+    only proxy line is `ProxyCommand none`, which turns off a proxy an older entry further down sets."""
     for m in FORBIDDEN.finditer(block):
-        if m.group(1) in ("IdentityFile", "CertificateFile"):
-            start, end = block.rfind("\n", 0, m.start(1)) + 1, block.find("\n", m.end(1))
-            if block[start:end if end >= 0 else None] in allowed:
-                continue
+        start, end = block.rfind("\n", 0, m.start(1)) + 1, block.find("\n", m.end(1))
+        line = block[start:end if end >= 0 else None]
+        if m.group(1) in ("IdentityFile", "CertificateFile") and line in allowed:
+            continue
+        if line == PROXY_NONE:
+            continue
         raise BadConfig(f"refusing the box block: it has {m.group(0).strip()!r} (no key files, keys or proxies on a box)")
 
 

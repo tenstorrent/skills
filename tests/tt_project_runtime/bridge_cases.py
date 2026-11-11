@@ -41,6 +41,20 @@ def test_bridge_direct_host_may_name_its_address_and_known_host_key():
         bridge.parse({"boxes": {"b": {"agents": {"a": {"agent": "env", "direct": [{"name": "h", "target": "-oX"}]}}}}})
 
 
+def test_bridge_forwarded_host_turns_off_an_older_proxy_and_only_that():
+    # cells: proxy-none
+    # an older entry further down (a dead route's proxy, IdentitiesOnly with its own key file) must not take
+    # over a name the bridge forwards; `ProxyCommand none` is the one proxy line the block may hold
+    import pytest
+    from ttp import bridge
+    block = bridge.render_block(_bridge_cfg(), "box-1")
+    fwd = block[block.index("Host build-a"):block.index("Host build-b")]
+    assert "  ProxyCommand none\n  IdentitiesOnly no\n" in fwd
+    for bad in ("  ProxyCommand nc %h %p", "  ProxyCommand none extra", "  ProxyJump none"):
+        with pytest.raises(bridge.BadConfig):
+            bridge.check_block(block.replace("Match all", bad + "\nMatch all"))
+
+
 def test_bridge_config_refuses_unsafe_or_ambiguous_entries():
     import pytest
     from ttp import bridge
@@ -91,7 +105,8 @@ def test_bridge_box_block_names_agent_links_and_no_key_file():
     assert block.count("IdentityAgent ~/.ssh/tt-agent/auto.sock") == 2
     assert "Host git.example.com\n  IdentityAgent ~/.ssh/tt-agent/git.sock\n  User git" in block
     assert "\nMatch all\n" in block   # what follows the block is not scoped to its last Host
-    assert "IdentityFile" not in block and "ForwardAgent" not in block and "Proxy" not in block
+    assert "IdentityFile" not in block and "ForwardAgent" not in block and "ProxyJump" not in block
+    assert [ln for ln in block.splitlines() if "Proxy" in ln] == ["  ProxyCommand none"] * 2   # off, never a proxy
 
 
 def test_bridge_block_check_refuses_key_files_key_text_and_proxies():
