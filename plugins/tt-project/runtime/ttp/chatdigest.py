@@ -18,8 +18,8 @@ Status pace: a status post (progress, counts, ETAs; never an answer to the user'
 or a result: is_status) goes to a chat at most once per `coordinator.chat_status_gap_h` hours (default 1;
 `coordinator.chat_status_gap_chats` {chat: hours} per chat); a sooner one is held for the digest. The daemon's
 hourly table keeps the same gap. A post that nearly repeats what any other chat of the same user got in the
-last hour (twin: most words alike, or the same task and obligation ids) is not sent again; the coordinator
-records the earlier message as delivering that chat's promise on the topic (obligations.deliver_twins).
+last hour (twin: most words alike, or the same task and obligation ids) is not sent again; the earlier
+message delivers only what the reply's own `delivers` named (obligations.deliver_twins), never by topic.
 `coordinator.chat_users` {chat: user} tells apart chats of different users; unset, a project's chats are one
 user's. `coordinator.chat_dedupe` false turns the twin check off."""
 from __future__ import annotations

@@ -1747,7 +1747,8 @@ def _close(db, o: dict, now: float, evidence: str) -> None:
     _retire(db, now, "obligation delivered", prefix=f"obligation:{o['id']}:")
 
 
-def deliver(p, sent: list[tuple[int, str | None, list]], now: float | None = None) -> list[str]:
+def deliver(p, sent: list[tuple[int, str | None, list]], now: float | None = None,
+            via: str = "") -> list[str]:
     """Mark the obligations this batch's replies deliver (message id, chat, the reply's `delivers`: obligation
     ids, or owner task ids standing for every open obligation they own). One closes as soon as every owner
     task finished too; check() closes one whose owners finish later. A promise is delivered only by a reply
@@ -1776,7 +1777,7 @@ def deliver(p, sent: list[tuple[int, str | None, list]], now: float | None = Non
                 if not hits:
                     notes.append(f"delivers {str(ref)[:40]}: no open obligation")
                 for o in hits:
-                    o["delivered"] = {"message": mid, "chat": chat, "at": now}
+                    o["delivered"] = {"message": mid, "chat": chat, "at": now, **({"via": via} if via else {})}
                     ev = _delivered(p.db, o)
                     if ev:
                         _close(p.db, o, now, ev)
@@ -1793,38 +1794,10 @@ def deliver(p, sent: list[tuple[int, str | None, list]], now: float | None = Non
 
 def deliver_twins(p, twins: list[tuple], now: float | None = None) -> list[str]:
     """Replies not sent because they nearly repeat a post the same user read in another chat
-    (chatdigest.twin): (first message, chat, delivers, text). That first post delivers the reply's
-    `delivers` and every open promise of the chat on the same topic (tasks or obligations it names or its
-    promise tracks, or near-alike text), as if the reply had gone. Orders stay open. A note per promise."""
-    from . import chatdigest
-    now = time.time() if now is None else now
-    notes: list[str] = []
-    for mid, chat, refs, text in twins:
-        chat = _chat(chat)
-        first = p.db.one("SELECT text FROM messages WHERE id=?", (mid,))
-        said = " ".join([str(text or ""), str(first["text"] if first else "")])
-        topic = chatdigest._topic(said)
-        with p.db.tx():
-            st = _load(p.db)
-            topic |= {f"#{t}" for o in st["items"].values() if (o.get("promise") or {}).get("message") == mid
-                      for t in o["promise"].get("tasks") or []}
-            for o in st["items"].values():
-                pr = o.get("promise") or {}
-                if (not _open(o) or not pr or pr.get("order") or pr.get("claim") or pr.get("chat") != chat
-                        or o.get("delivered")):
-                    continue
-                mine = {f"#{t}" for t in [*(pr.get("tasks") or []), *_owner_ids(o)]} | set(pr.get("obligations") or []) | {o["id"]} \
-                    | chatdigest._topic(o.get("text") or "")
-                if (o["id"] in refs or mine & (topic | {str(r) for r in refs})
-                        or chatdigest.near(str(o.get("text") or ""), said)):
-                    o["delivered"] = {"message": mid, "chat": chat, "at": now, "via": "repeat"}
-                    if ev := _delivered(p.db, o):
-                        _close(p.db, o, now, ev + f" (the same post the user read in another chat; chat {chat}'s "
-                                                   f"near-repeat was not sent)")
-                    notes.append(f"{o['id']} (promise in chat {chat}) delivered by message #{mid}, the same post "
-                                 f"the user read in another chat")
-            p.db.set_kv(KV, st)
-    return notes
+    (chatdigest.twin): (first message, chat, delivers, text). That first post delivers exactly what the
+    reply's own `delivers` would have, resolved by deliver() for the reply's chat and tagged via=repeat;
+    nothing is matched by topic or text, so a dropped progress post never closes owed work."""
+    return deliver(p, [(mid, chat, refs) for mid, chat, refs, _text in twins if refs], now, via="repeat")
 
 
 # orders and claims --------------------------------------------------------------------------------

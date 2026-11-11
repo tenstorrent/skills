@@ -3828,8 +3828,9 @@ Status pace. A status post (progress, counts, ETAs) goes to a chat at most once 
 `{chat: hours}` sets one chat, shown beside it in the coordinator's digest); a sooner one waits for that
 chat's digest. Answers to your question, asks, outages and results you asked for are not status and go
 at once. The hourly status table keeps the same gap. A post that nearly repeats what another chat of
-yours got in the last hour (most words alike, or the same task and obligation ids) is not sent again,
-and that chat's promise on the same topic counts as delivered by the post you already read. A
+yours got in the last hour (most words alike, or the same task and obligation ids) is not sent again;
+what that reply named in its own `delivers` counts as delivered by the post you already read, and
+nothing else does, so a dropped progress post never closes a promise. A
 project's chats count as one user's unless `coordinator.chat_users` `{chat: user}` says otherwise;
 `coordinator.chat_dedupe` `false` turns the repeat check off.
 

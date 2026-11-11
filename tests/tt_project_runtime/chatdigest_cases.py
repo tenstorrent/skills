@@ -246,7 +246,8 @@ def test_a_near_repeat_to_another_chat_of_the_user_is_not_sent_within_the_hour(e
 
 
 def test_the_first_post_delivers_the_other_chats_promise_on_the_same_topic(env, monkeypatch):
-    """cells: promise_merge. A promise made in c2 is delivered by the post the user read in c1."""
+    """cells: promise_merge. A promise made in c2 is delivered by the post the user read in c1, when the
+    dropped c2 repeat itself carried `delivers`; a dropped progress repeat without it delivers nothing."""
     from ttp import coordinator as coord, obligations
     monkeypatch.setenv("TTP_TEST_CHAT_DIGEST", "on")
     p = make(env)
@@ -257,12 +258,34 @@ def test_the_first_post_delivers_the_other_chats_promise_on_the_same_topic(env, 
     table = f"#{tid} backlog table is ready: 3 of 4 cells pass, 1 queued."
     coord.apply(p, [{"type": "reply", "chat": "c1", "text": table}], turn=2)
     first = p.db.one("SELECT id FROM messages WHERE chat='c1' ORDER BY id DESC LIMIT 1")["id"]
-    coord.apply(p, [{"type": "reply", "chat": "c2", "text": f"#{tid} backlog table is ready now: 3 of 4 cells pass, 1 queued."}],
-                turn=3)
+    coord.apply(p, [{"type": "reply", "chat": "c2", "text": f"#{tid} backlog table is ready now: 3 of 4 cells pass, 1 queued.",
+                     "delivers": [o["id"]]}], turn=3)
     assert _cd_out(p, "c2") == [f"I'll send the #{tid} backlog table by 23:00."]
     got = next(x for x in obligations.items(p.db) if x["id"] == o["id"])
     assert got["delivered"]["message"] == first and got["delivered"]["via"] == "repeat"
-    assert any(f"delivered by message #{first}" in n for n in p.db.kv(coord.NOTES_KEY, []))
+    assert any(f"delivered by reply #{first}" in n for n in p.db.kv(coord.NOTES_KEY, []))
+
+
+def test_a_dropped_progress_repeat_never_delivers_the_other_chats_promise(env, monkeypatch):
+    """cells: promise_merge. Review #8333: a progress post naming #N, dropped as a repeat in c2, must not
+    mark c2's results promise delivered, so it stays owed after #N finishes."""
+    from ttp import chatdigest, coordinator as coord, obligations
+    monkeypatch.setenv("TTP_TEST_CHAT_DIGEST", "on")
+    p = make(env)
+    tid = p.db.add_task("bench", "s", kind="work", status="queued")
+    coord.apply(p, [{"type": "reply", "chat": "c2", "text": f"I'll post the before/after numbers once #{tid} "
+                                                             f"lands, by 07:30."}], turn=1)
+    o = next(o for o in obligations.open_promises(p.db) if o["promise"]["chat"] == "c2")
+    p.db.x("UPDATE messages SET ts = ts - 7200")
+    coord.apply(p, [{"type": "reply", "chat": "c1", "text": f"#{tid} still queued, 3 tasks queued, ETA 06:30."}], turn=2)
+    coord.apply(p, [{"type": "reply", "chat": "c2", "text": f"#{tid} is still queued, 3 tasks queued, ETA 06:30."}],
+                turn=3)
+    assert chatdigest.counts(p.db)["c2"]["deduped"] == 1   # the repeat was dropped
+    got = next(x for x in obligations.items(p.db) if x["id"] == o["id"])
+    assert not got.get("delivered")
+    p.db.x("UPDATE tasks SET status='done' WHERE id=?", (tid,))
+    obligations.check(p)
+    assert o["id"] in {x["id"] for x in obligations.open_promises(p.db)}
 
 
 def test_the_digest_shows_a_chats_own_status_interval(env, monkeypatch):
