@@ -112,6 +112,7 @@ def test_two_milestones_minutes_apart_post_once_and_the_next_names_both(env, mon
     from ttp import hourly, obligations
     monkeypatch.setenv("TTP_TEST_CHAT_DIGEST", "on")
     p = make(env)
+    p.set_config("notify.chat_status", True)   # the chat's status gap applies only when the chat gets the table
     p.db.post("in", "hello", chat="main")
     now = time.time() - 3 * 3600
     a, b = obligations.add(p, "first order", now=now), obligations.add(p, "second order", now=now)
@@ -137,7 +138,7 @@ def test_the_table_stays_in_the_web_app_by_default_and_its_test_line_has_no_doll
     p = make(env)
     now = time.time() - 3600
     assert hourly.post(p, now - 3700) is None, "baseline"
-    p.db.add_task("first", "spec")
+    _block(p, "first")   # an important change (#8341) makes the table due
     m = p.db.one("SELECT * FROM messages WHERE id=?", (hourly.post(p, now),))
     assert m["chat"] is None and m["channel"] == alerts.QUIET and m["ref"] == hourly.REF
     (tests,) = [r for r in m["text"].split("\n") if r.startswith("Tests in 24 h")]
