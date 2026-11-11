@@ -462,10 +462,12 @@ def test_a_run_sets_a_dollar_cap_only_on_the_users_own_message_carrying_the_sett
     with pytest.raises(SystemExit):
         cli.main(["config", "demo", "budget.weekly_usd", "400", "--user-msg", str(ok)])
     assert "later value stands" in capsys.readouterr().err
-    p.set_config("budget.weekly_usd", 350.0, by=configwho.by("coordinator"))   # a later coordinator set wins too
+    daily = msg("budget.daily_usd 250")   # a later coordinator set wins too (on a key the user has not set)
+    p.set_config("budget.daily_usd", 220.0, by=configwho.by("coordinator"))
     with pytest.raises(SystemExit):
-        cli.main(["config", "demo", "budget.weekly_usd", "400", "--user-msg", str(ok)])
+        cli.main(["config", "demo", "budget.daily_usd", "250", "--user-msg", str(daily)])
     assert "later value stands" in capsys.readouterr().err
+    assert p.raw_config()["budget"]["daily_usd"] == 220.0
 
 
 def test_capword_wording_alone_never_grants_a_cap_only_the_setting_itself(env):
