@@ -104,6 +104,38 @@ WEB_TOOLS = ("WebFetch", "WebSearch")
 SPAWN_TOOLS = ("Agent", "Task")   # Claude Code's subagent tool (older CLIs name it Task)
 
 
+def _prompt_row(row: dict) -> bool:
+    """A transcript row that opens a turn: a user message that is no tool's result."""
+    c = (row.get("message") or {}).get("content") if isinstance(row.get("message"), dict) else None
+    return row.get("type") == "user" and c is not None and not (
+        isinstance(c, list) and any(isinstance(x, dict) and x.get("type") == "tool_result" for x in c))
+
+
+def _tail(rows: list[dict], cap: int) -> list[dict]:
+    """The session's last turns, at most about `cap` tokens (4 characters each), opening on a user turn:
+    the copy a run on another model starts from (ctxfork, task #8308). Its start moves only in steps
+    of half the cap as the session grows, so every fork between two steps sends the same history and
+    reads the one cache entry the first wrote. The last turn alone when it is longer than the cap."""
+    sizes = [len(json.dumps(r["message"])) // 4 if "message" in r else 0 for r in rows]
+    total = sum(sizes)
+    if total <= cap:
+        return rows
+    step = max(cap // 2, 1)
+    floor = -(-(total - cap) // step) * step
+    seen, cut = 0, None
+    for i, r in enumerate(rows):
+        if seen >= floor and _prompt_row(r):
+            cut = i
+            break
+        seen += sizes[i]
+    if cut is None:
+        cut = max((i for i, r in enumerate(rows) if _prompt_row(r)), default=len(rows))
+    out = rows[cut:]
+    if out:
+        out[0] = {**out[0], "parentUuid": None}   # the copy's first turn; nothing before it was kept
+    return out
+
+
 @register
 class Claude(Provider):
     name = "claude"
@@ -411,7 +443,9 @@ class Claude(Provider):
             out += [*projects.glob(f"*/{session_id}.jsonl"), *projects.glob(f"*/{session_id}/**/*.jsonl")]
         return out
 
-    def fork_session(self, session_id: str, cwd: str, env: dict | None, new_id: str) -> str:
+    fork_tail = True
+
+    def fork_session(self, session_id: str, cwd: str, env: dict | None, new_id: str, tail_tokens: int = 0) -> str:
         # A copy, not `--fork-session`: Claude Code looks a session up under the run's working directory
         # (and its config directory), and the coordinator runs elsewhere. The copy starts at the session's
         # last compaction and ends at its last whole answer with no tool call open (a wake still running
@@ -440,6 +474,8 @@ class Claude(Provider):
         # From the last compaction on: the agent resumes from there anyway, and the copy stays small.
         cut = [i for i, r in enumerate(rows) if r.get("type") == "system" and r.get("subtype") == "compact_boundary"]
         rows = rows[cut[-1]:] if cut else rows
+        if tail_tokens > 0:
+            rows = _tail(rows, tail_tokens)
         if not rows:
             return "the session has no finished answer to start from"
         for row in rows:

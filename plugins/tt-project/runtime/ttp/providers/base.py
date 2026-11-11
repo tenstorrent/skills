@@ -364,6 +364,9 @@ class Provider:
     # session; ctxfork.py). "" for none.
     session_format = ""
     no_fork_why = ""   # why this provider has no fork_session, for fork_gap's report
+    # fork_session takes tail_tokens: a copy of only the session's last turns, cut where forks share it
+    # (ctxfork: a run on another model than the session's starts from such a copy).
+    fork_tail = False
 
     def fork_session(self, session_id: str, cwd: str, env: dict | None, new_id: str) -> str:
         """Copy the saved session `session_id` to a new session `new_id` that a run in `cwd` with the
@@ -391,12 +394,17 @@ class Provider:
         return ""
 
     def start_from_session(self, src_provider: str, session_id: str, cwd: str, env: dict | None,
-                           new_id: str) -> str:
+                           new_id: str, tail_tokens: int = 0) -> str:
         """The one way any caller (a worker forking the coordinator, a follow-up resuming its worker's
         session) starts a run on this provider from a saved session: copy `session_id`, saved by a
         `src_provider` run, to `new_id`, which resume_args(new_id) continues; the source is never
-        written. "" once done, else why not (the caller then takes the disk block)."""
-        return self.fork_gap(src_provider) or self.fork_session(session_id, cwd, env, new_id)
+        written. `tail_tokens` (fork_tail providers only): copy only about that many tokens of its last
+        turns. "" once done, else why not (the caller then takes the disk block)."""
+        if tail_tokens and not self.fork_tail:
+            return f"{self.name} cannot copy only a session's last turns"
+        return self.fork_gap(src_provider) or (
+            self.fork_session(session_id, cwd, env, new_id, tail_tokens=tail_tokens) if tail_tokens
+            else self.fork_session(session_id, cwd, env, new_id))
 
     def own_instructions(self, session_id: str, cwd: str, env: dict | None, text: str) -> str:
         """Give a worker or reviewer run that resumes a saved session (a fork of the coordinator's, a

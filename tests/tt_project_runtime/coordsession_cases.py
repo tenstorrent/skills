@@ -312,7 +312,8 @@ def test_coordsession_the_retired_mode_key_is_refused_and_absent_from_the_defaul
                                                    "context_window_tokens": 0, "compact_margin_tokens": 40000,
                                                    "compact_min_free": 0.3, "row_delta": True,
                                                    "worker_context": "fork", "worker_fork_max_tokens": 0,
-                                                   "worker_fork_max_age_h": 12, "worker_chat_chars": 30000}
+                                                   "worker_fork_max_age_h": 12,
+                                                   "worker_fork_other_model_tokens": 8000, "worker_chat_chars": 30000}
     assert not {"thread_warm_min", "thread_max_turns"} & set(p.config()["coordinator"])
     assert settable("coordinator.session.row_delta")(" Off ") is False and settable("coordinator.session.row_delta")(True)
     with pytest.raises(ValueError):

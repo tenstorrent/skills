@@ -7,7 +7,8 @@ order closed), and only when a row changed since the last post. No model call bu
 Rows, in order:
 1. Fork rate: of the worker and review runs started in the last hour and today (home zone), the share that
    started from a copy of a saved session (ctxfork.forked: a fork, or a resume of an earlier run), per
-   provider, against review.fork_target (default 0.9).
+   provider, against review.fork_target (default 0.9); forks, resumes and disk-block starts counted apart
+   (a disk-block start is never a fork).
 2. The project host's load (1-minute load per core: now, last-hour mean and max, from SAMPLES) and each spill
    host's use in 24 h (check runs placed there, passed there, run again on the project host after failing
    there; from each run's checks record). Hosts are named only by their alias from the machines list.
@@ -89,26 +90,36 @@ def _samples(f: Path) -> list[dict]:
 
 
 def fork_share(db, since: float) -> dict[str, list[int]]:
-    """{provider: [started from a saved session, runs]} of worker and review runs started since `since`,
-    from each run's own note (ctxfork.KEY)."""
+    """{provider: [forks of the coordinator's session, resumes of an earlier run, disk-block starts, runs]}
+    of worker and review runs started since `since`, from each run's own note (ctxfork.KEY); the first two
+    are the runs ctxfork.forked counts."""
     out: dict[str, list[int]] = {}
     for r in db.q("SELECT provider, note FROM runs WHERE role IN ('worker','reviewer') AND started>=?", (since,)):
         try:
             note = json.loads(r["note"] or "{}")
         except ValueError:
             note = {}
-        n = out.setdefault(r["provider"] or "?", [0, 0])
-        n[0] += ctxfork.forked(note if isinstance(note, dict) else {})
-        n[1] += 1
+        note = note if isinstance(note, dict) else {}
+        how = (note.get(ctxfork.KEY) or {}).get("how") if isinstance(note.get(ctxfork.KEY), dict) else None
+        n = out.setdefault(r["provider"] or "?", [0, 0, 0, 0])
+        if ctxfork.forked(note):
+            n[0 if how == "fork" else 1] += 1
+        n[2] += how == "disk"
+        n[3] += 1
     return out
 
 
+def _forked(c: dict[str, list[int]]) -> tuple[int, int]:
+    return sum(v[0] + v[1] for v in c.values()), sum(v[3] for v in c.values())
+
+
 def _share(c: dict[str, list[int]]) -> str:
-    f, n = sum(v[0] for v in c.values()), sum(v[1] for v in c.values())
+    f, n = _forked(c)
     if not n:
         return "no runs"
-    each = ", ".join(f"{k} {v[0]}/{v[1]}" for k, v in sorted(c.items())) if len(c) > 1 else next(iter(c))
-    return f"{f}/{n} ({100 * f / n:.0f}%; {each})"
+    split = "fork {}, resume {}, disk {}".format(*(sum(v[i] for v in c.values()) for i in range(3)))
+    each = ", ".join(f"{k} {v[0] + v[1]}/{v[3]}" for k, v in sorted(c.items())) if len(c) > 1 else next(iter(c))
+    return f"{f}/{n} ({100 * f / n:.0f}%: {split}; {each})"
 
 
 def spill_use(db, runs: Path, since: float) -> dict[str, list[int]]:
@@ -143,7 +154,7 @@ def rows(p, now: float | None = None) -> list[str]:
     target = float((cfg.get("review") or {}).get("fork_target", 0.9))
     hour, today = fork_share(db, now - 3600), fork_share(db, _day_start(now, tz))
     low = [w for w, c in (("last hour", hour), ("today", today))
-           if (n := sum(v[1] for v in c.values())) and sum(v[0] for v in c.values()) / n < target]
+           if (fn := _forked(c))[1] and fn[0] / fn[1] < target]
     out = [f"Fork rate: last hour {_share(hour)}; today {_share(today)}; target {target:.0%}"
            + (f" (below target {' and '.join(low)})" if low else "")]
     try:

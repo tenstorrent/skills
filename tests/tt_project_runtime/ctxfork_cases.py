@@ -893,10 +893,11 @@ def test_sonnet_workers_and_reviewers_share_one_system_prompt_while_memory_chang
     assert "MEM-ONE" in a[1] and "MEM-TWO" not in a[1] and "MEM-TWO" in b[1]
 
 
-def test_a_run_on_another_model_than_the_coordinators_takes_the_disk_block_not_a_fork(env, monkeypatch, tmp_path):
-    """Task #74: the prompt cache is per model, so a Sonnet fork of an Opus coordinator wrote the whole
-    copied history again (task #51: 10-69k tokens per run). It starts from the disk block instead; a run
-    on the coordinator's model (or its bare family alias) still forks."""
+def test_a_run_on_another_claude_model_forks_the_coordinators_last_turns_else_takes_the_disk_block(env, monkeypatch, tmp_path):
+    """Task #8308 (before: task #74): the prompt cache is per model, so a Sonnet fork of an Opus
+    coordinator cannot read its cache. It forks only the session's last turns (worker_fork_other_model_tokens,
+    "tail"), the same copy for every such run, so they share one cache entry; a model outside the Claude
+    families, or the setting at 0, takes the disk block. A run on the coordinator's model forks it whole."""
     from ttp import coordsession, ctxfork
     p, d, cfg_dir, _run = _fork_daemon(env, monkeypatch, tmp_path)
     sid = str(uuid.uuid4())
@@ -908,14 +909,81 @@ def test_a_run_on_another_model_than_the_coordinators_takes_the_disk_block_not_a
     p.db.x("INSERT INTO runs(role,status,started,dir) VALUES('coordinator','ok',?,?)", (time.time(), str(coord_dir)))
     from ttp.providers import get_provider
     prov = get_provider("claude")
-    for model, how in (("sonnet", "disk"), ("claude-sonnet-5-5", "disk"), ("claude-opus-5-5", "fork"),
-                       ("opus", "fork"), (None, "fork")):
+    copies = []
+    for model, how in (("sonnet", "fork"), ("claude-sonnet-5-5", "fork"), ("claude-opus-5-5", "fork"),
+                       ("opus", "fork"), (None, "fork"), ("glm-5.3", "disk")):
         got = ctxfork.prepare(p, p.config(), prov, "claude", str(p.root), {}, model=model)
         assert got["how"] == how, (model, got)
+        assert ("tail" in got) == (model in ("sonnet", "claude-sonnet-5-5")), (model, got)
+        if "tail" in got:
+            assert got["tail"] == 8000 and got["tokens"] == 8000, got
+            path = [x for x in prov.session_paths(got["session"], str(p.root), {}) if x.name.endswith(".jsonl")][0]
+            copies.append([{k: v for k, v in json.loads(line).items() if k != "sessionId"}
+                           for line in path.read_text().splitlines()])
         if how == "disk":
             assert "not the coordinator's claude-opus-5-5" in got["why"] and got["lead"].startswith(ctxfork.DISK_HEAD)
+    assert len(copies) == 2 and copies[0] == copies[1]   # one shared copy: the same history, byte for byte
+    p.set_config("coordinator.session.worker_fork_other_model_tokens", 0)
+    got = ctxfork.prepare(p, p.config(), prov, "claude", str(p.root), {}, model="sonnet")
+    assert got["how"] == "disk" and "not the coordinator's" in got["why"], got
     assert ctxfork.same_model("opus", "claude-opus-5-5") and not ctxfork.same_model("sonnet", "claude-opus-5-5")
     assert not ctxfork.same_model("claude-opus-4-1", "claude-opus-5-5")
+
+
+def test_a_last_turns_copy_opens_on_a_user_turn_and_its_start_moves_only_in_steps(monkeypatch, tmp_path):
+    """Task #8308: the copy a run on another model starts from holds about tail_tokens of the session's
+    last turns, opens on a user turn (never a tool's result) with no parent, and keeps its start while the
+    session grows by less than half the cap, so the forks in between share one cache entry. A provider
+    that cannot copy only the last turns says so, and the caller takes the disk block."""
+    from ttp.providers import get_provider as get
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "cfg"))
+    claude, sid = get("claude"), str(uuid.uuid4())
+    folder = tmp_path / "cfg" / "projects" / "-src"
+    folder.mkdir(parents=True)
+    so = [{"type": "tool_use", "id": "s1", "name": "StructuredOutput", "input": {"actions": []}}]
+    lines = []
+    for i in range(10):
+        lines += [_fork_line("user", sid, f"wake {i} " + "x" * 4000),
+                  _fork_line("assistant", sid, [{"type": "tool_use", "id": f"b{i}", "name": "Bash", "input": {}}]),
+                  _fork_line("user", sid, [{"type": "tool_result", "tool_use_id": f"b{i}", "content": "y" * 2000}]),
+                  _fork_line("assistant", sid, so)]
+
+    def copy(cap):
+        (folder / f"{sid}.jsonl").write_text("\n".join(lines) + "\n")
+        new = str(uuid.uuid4())
+        assert claude.fork_session(sid, "/w", None, new, tail_tokens=cap) == ""
+        return [json.loads(x) for x in (tmp_path / "cfg" / "projects" / "-w" / f"{new}.jsonl").read_text().splitlines()]
+
+    rows = copy(3000)
+    assert rows[0]["message"]["content"].startswith("wake ") and rows[0]["parentUuid"] is None
+    assert sum(len(json.dumps(r["message"])) // 4 for r in rows) <= 3000 and len(rows) < len(lines)
+    assert len(copy(10 ** 6)) == len(lines)   # under the cap: the whole session
+    starts = set()
+    for i in range(12):   # about 1000 tokens in all: under the step of 1500
+        lines += [_fork_line("user", sid, f"small {i}"), _fork_line("assistant", sid, so)]
+        starts.add(copy(3000)[0]["uuid"])
+    assert len(starts) <= 2, starts
+    for name in ("codex", "fake"):
+        assert "cannot copy only" in get(name).start_from_session(name, sid, "/w", None, str(uuid.uuid4()),
+                                                                  tail_tokens=3000)
+
+
+def test_a_fork_of_the_last_turns_sends_the_coordinators_prefix_on_its_own_model():
+    """Task #8308: every Sonnet fork of an Opus coordinator sends the coordinator's tools, answer schema
+    and system prompt on its own model, so all of them share one prefix; a whole-session fork on another
+    model is still refused the shape."""
+    from ttp import ctxfork
+    coord = ["claude", "-p", "--model", "claude-opus-5-5",
+             "--settings", json.dumps({"env": {"BASH_MAX_TIMEOUT_MS": "300000"}}), "--json-schema", '{"type": "object"}']
+    shape = {"argv": coord, "system": "# Role"}
+    runs = [["claude", "-p", "--model", "sonnet", "--settings", json.dumps({"hooks": {"h": n}}), "-"] for n in (1, 2)]
+    got, why = ctxfork.shape_argv(runs[0], shape)
+    assert got is None and "model differs" in why
+    out = [ctxfork.shape_argv(a, shape, other_model=True)[0] for a in runs]
+    for a in out:
+        assert a[a.index("--model") + 1] == "sonnet" and a[a.index("--json-schema") + 1] == '{"type": "object"}'
+        assert json.loads(a[a.index("--settings") + 1])["env"] == {"BASH_MAX_TIMEOUT_MS": "300000"} and a[-1] == "-"
+    assert [x for x in out[0] if "hooks" not in x] == [x for x in out[1] if "hooks" not in x]
 
 
 def test_a_follow_up_on_another_model_starts_fresh_never_resuming_the_other_models_session(env, monkeypatch, tmp_path):

@@ -41,9 +41,14 @@ or system prompt differ from the coordinator's writes the whole copied history t
 (task #49, measured: Claude Code reported tools_changed; a forked Opus worker wrote about 50k tokens on
 its first call and read none). So a fork on the coordinator's model sends the coordinator's last launch's
 prefix (coord_shape, shape_argv): its system prompt, its answer schema and the settings that change the
-tools' text; the run's own system prompt leads its prompt instead (shared_lead). A run on another model
-(a Sonnet worker of an Opus coordinator) cannot read that cache at all, so it takes the disk block
-instead of a fork (_model_gap). For the same reason a follow-up never resumes a session another model
+tools' text; the run's own system prompt leads its prompt instead (shared_lead). A run on another Claude
+model (a Sonnet worker of an Opus coordinator) cannot read that cache, so it forks only the session's last
+turns (about coordinator.session.worker_fork_other_model_tokens, default 8000; "tail" in its note) with the
+same shaped prefix: every such run sends the same tools, system prompt and copied turns, so the first
+after a coordinator wake writes that one cache entry and the rest read it (task #8308: before, all of
+them took the disk block, which wrote about 32k tokens per run and counted as no fork). A model outside
+the Claude families, a provider that cannot copy only the last turns, or the setting at 0 takes the disk
+block instead (_model_gap, _other_model_tail). For the same reason a follow-up never resumes a session another model
 made (Sonnet resuming an Opus run or the reverse, owner's order): it starts as a fresh run of its model
 does, from the coordinator fork (shaped) or the disk block, and its prompt carries the task it continues
 and that task's last hand-off (_cross_model)."""
@@ -270,16 +275,19 @@ def prepare(p, cfg: dict, prov, provider: str, cwd: str, env: dict | None, now: 
         except Exception as e:   # the coordinator fork, then the disk block, is always tried
             gap = f"resume failed: {type(e).__name__}: {e}"[:200]
         try:
-            why = _model_gap(p, model) or _fork_gap(p, cfg, prov, provider, cwd, env, now) \
+            tail = _other_model_tail(p, cfg, prov, model)
+            why = ("" if tail else _model_gap(p, model)) or _fork_gap(p, cfg, prov, provider, cwd, env, now) \
                 or _fork_rejected(p, task, "fork")
             if not why:
                 st = p.db.kv(coordsession.KEY)
                 new = str(uuid.uuid4())
-                why = prov.start_from_session(str(st.get("provider") or provider), str(st["id"]), cwd, env, new)
+                why = prov.start_from_session(str(st.get("provider") or provider), str(st["id"]), cwd, env, new,
+                                              tail_tokens=tail)
                 if not why:
+                    tokens = int(coordsession._num(st.get("context_tokens"), 0))
                     return {"how": "fork", "why": f"session {str(st['id'])[:8]}" + (f"; no resume: {gap}" if gap else ""),
-                            "session": new, "from": str(st.get("provider") or provider),
-                            "lead": fork_lead(), "tokens": int(coordsession._num(st.get("context_tokens"), 0))}
+                            "session": new, "from": str(st.get("provider") or provider), "lead": fork_lead(),
+                            "tokens": min(tokens, tail) if tail else tokens, **({"tail": tail} if tail else {})}
         except Exception as e:   # the disk block is always safe
             why = f"fork failed: {type(e).__name__}: {e}"[:200]
     return on_disk(p, cfg, f"no resume: {gap}; {why}" if gap else why, now)
@@ -418,13 +426,25 @@ def same_model(a: str, b: str) -> bool:
     return bool(fam[0]) and fam[0] == fam[1] and (a in _FAMILIES or b in _FAMILIES)
 
 
+def _other_model_tail(p, cfg: dict, prov, model: str | None) -> int:
+    """The tokens of last turns a run on another Claude model than the coordinator's forks (module doc);
+    0 when it runs on the coordinator's model, or forks nothing (another family, a provider without
+    fork_tail, worker_fork_other_model_tokens 0)."""
+    cm = coord_model(p) if model else ""
+    if not (model and cm) or same_model(model, cm) or not getattr(prov, "fork_tail", False):
+        return 0
+    if not all(any(f in x.lower() for f in _FAMILIES) for x in (model, cm)):
+        return 0
+    return max(int(coordsession._num(coordsession.settings(cfg).get("worker_fork_other_model_tokens"), 8000)), 0)
+
+
 def _model_gap(p, model: str | None) -> str:
     """Why a run on another model than the coordinator's takes the disk block, not a fork; "" otherwise.
     The prompt cache is per model: the copied history was cached under the coordinator's model, so a
     Sonnet fork wrote it again on its first call and read it on every later one (task #51 measured
     10-69k tokens written per fork; task #74: about $0.025 per run at the median, $0.08 on average,
     up to $0.40, against the ~7k token disk block). A run with no --model, or a coordinator whose
-    model is unknown, forks as before."""
+    model is unknown, forks as before; one _other_model_tail gives a size forks only the last turns."""
     cm = coord_model(p) if model else ""
     if model and cm and not same_model(model, cm):
         return f"its model {model} is not the coordinator's {cm}, whose cache holds the copied history"
@@ -500,14 +520,16 @@ def coord_shape(p) -> dict | None:
         return None
 
 
-def shape_argv(argv: list[str], shape: dict) -> tuple[list[str] | None, str]:
+def shape_argv(argv: list[str], shape: dict, other_model: bool = False) -> tuple[list[str] | None, str]:
     """A Claude Code fork's `argv` sending the coordinator's tools (`shape`, coord_shape): its answer
     schema (the CLI's StructuredOutput tool) and its Bash timeouts; the caller swaps the system prompt.
-    (None, why) where the tools would still differ: another model, setting sources, sandbox, MCP or
-    plugin directories, or withheld tools."""
+    (None, why) where the tools would still differ: another model (unless `other_model`: a fork of the
+    last turns, whose runs on that model share one prefix), setting sources, sandbox, MCP or plugin
+    directories, or withheld tools."""
     coord = shape["argv"]
     mine, theirs = _settings(argv), _settings(coord)
-    for what, a, b in (("model", _arg(argv, "--model"), _arg(coord, "--model")),
+    model = ("model", "", "") if other_model else ("model", _arg(argv, "--model"), _arg(coord, "--model"))
+    for what, a, b in (model,
                        ("setting sources", _arg(argv, "--setting-sources"), _arg(coord, "--setting-sources")),
                        ("sandbox", mine.get("sandbox"), theirs.get("sandbox")),
                        ("withheld tools", _bare_denied(argv), _bare_denied(coord)),

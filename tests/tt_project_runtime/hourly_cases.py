@@ -25,9 +25,10 @@ def test_the_fork_rate_counts_forks_and_resumes_of_a_run_per_provider(env):
     _hourly_run(p, "codex", "fork", now - 2 * 86400)      # another day
     p.db.x("INSERT INTO runs(role, provider, status, started, note) VALUES('coordinator', 'claude', 'done', ?, ?)",
            (now - 60, json.dumps({"coord_context": {"how": "fork"}})))
-    assert hourly.fork_share(p.db, now - 3600) == {"claude": [2, 4], "codex": [1, 3]}
+    # Task #8308: forks, resumes and disk-block starts apart; a disk-block start is never a fork.
+    assert hourly.fork_share(p.db, now - 3600) == {"claude": [1, 1, 1, 4], "codex": [1, 0, 0, 3]}
     row = hourly.rows(p, now)[0]
-    assert row.startswith("Fork rate: last hour 3/7 (43%; claude 2/4, codex 1/3)"), row
+    assert row.startswith("Fork rate: last hour 3/7 (43%: fork 2, resume 1, disk 1; claude 2/4, codex 1/3)"), row
     assert "target 90%" in row and "below target last hour" in row, row
 
 

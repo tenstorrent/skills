@@ -3940,13 +3940,13 @@ class Daemon:
                         (shape := ctxfork.coord_shape(self.p)) and not ctxfork.coord_only([shape["system"]], answer=False):
                     # The coordinator's tools and system prompt, so the copied history is read from the
                     # cache, not written again; the run's own system prompt leads its prompt (ctxfork.py).
-                    shaped, prefix_by = ctxfork.shape_argv(argv, shape)
+                    shaped, prefix_by = ctxfork.shape_argv(argv, shape, other_model=bool(got.get("tail")))
                     if shaped:
                         argv, got["lead"] = shaped, got["lead"] + "\n\n" + ctxfork.shared_lead(append_system)
                         append_system, prefix_by = shape["system"], "coordinator"
                 if got.get("lead"):
                     prompt = got["lead"] + "\n\n" + prompt
-                note = {**(note or {}), ctxfork.KEY: {**{k: got[k] for k in ("how", "why", "session", "tokens", "run", "from", "role_gap")
+                note = {**(note or {}), ctxfork.KEY: {**{k: got[k] for k in ("how", "why", "session", "tokens", "tail", "run", "from", "role_gap")
                                                          if k in got}, **({"prefix": prefix_by} if prefix_by else {})}}
             elif task and role in ctxfork.ROLES:   # a lost run continued in its own session (_resumable)
                 note = {**(note or {}), ctxfork.KEY: {"how": "resume", "why": "continues its own session",
