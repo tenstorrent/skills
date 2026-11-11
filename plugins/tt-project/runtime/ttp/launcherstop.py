@@ -181,7 +181,12 @@ def stop(pidfile: Path, pid: int, token: str, why: str) -> dict:
 # project's job-signal stream and events (detached_job_stopped, as jobstop.end does) and reports which of
 # the job's processes (this user's, with the job folder as their cwd, in their command line or in their
 # environment) are still left. A folder outside the project root, inside another tt-project project's
-# folder, or with a process of another project is refused; nothing runs then.
+# folder, or with a process of another project is refused; nothing runs then. One exception: a launcher
+# that keeps its jobs in the user's own state folder (say ~/.local/state/<tool>) registers an absolute
+# glob (`~` allowed) for them; a folder outside the project root is accepted only when such a glob
+# matches it, it lies strictly inside this user's home (symlinks followed), below the glob's literal
+# prefix, which itself lies strictly inside the home, and it and every folder up to the home are this
+# user's (_outside_root). Another user's files, system paths and the home folder itself stay refused.
 CONFIG_KEY = "detach.launcher_stops"
 CMD_TIMEOUT_S = 300.0
 GONE_WAIT_S = 15.0
@@ -212,7 +217,7 @@ def registered(stops, folder: Path, root: Path) -> tuple[str, list[str]] | None:
             continue
         g = Path(glob).expanduser()
         if g.is_absolute():
-            hit = _glob_parts(list(g.parts[1:]), list(folder.parts[1:]))
+            hit = any(_glob_parts(list(x[1:]), list(folder.parts[1:])) for x in (g.parts, _resolved_glob(g)))
         else:
             hit = rel is not None and _glob_parts([x for x in g.parts if x != "."], list(rel))
         if not hit:
@@ -226,10 +231,58 @@ def registered(stops, folder: Path, root: Path) -> tuple[str, list[str]] | None:
     return None
 
 
-def foreign(folder: Path, root: Path, project: Path) -> str | None:
-    """Why this job folder is not this project's to stop, else None."""
+_WILD = ("*", "?", "[")
+
+
+def _resolved_glob(g: Path) -> tuple[str, ...]:
+    """The parts of an absolute glob with its literal prefix (the levels before the first wildcard)
+    resolved, symlinks followed, as the job folder it is matched against is."""
+    n = next((i for i, x in enumerate(g.parts) if any(c in x for c in _WILD)), len(g.parts))
+    return (*Path(*g.parts[:n]).resolve().parts, *g.parts[n:])
+
+
+def _outside_root(folder: Path, glob: str | None, project: Path) -> str | None:
+    """Why a job folder outside the project root may not be stopped, else None. Only a folder an absolute
+    registered glob matched (folder already resolved), strictly inside this user's home and below the
+    glob's literal prefix, itself strictly inside the home, with it and every folder up to the home this
+    user's, and inside no other tt-project project's folder."""
+    if not glob or not Path(glob).expanduser().is_absolute():
+        return "no absolute glob in " + CONFIG_KEY + " names it"
+    home = Path(os.path.expanduser("~")).resolve()
+    if home == Path(home.anchor):
+        return f"the home folder is {home}"
+    if home not in folder.parents:
+        return f"it is not inside your home folder {home}"
+    g = _resolved_glob(Path(glob).expanduser())
+    prefix = Path(*g[:next((i for i, x in enumerate(g) if any(c in x for c in _WILD)), len(g))])
+    if home not in prefix.parents:
+        return f"its glob {glob!r} reaches {prefix}, not a folder strictly inside your home {home}"
+    if prefix != folder and prefix not in folder.parents:
+        return f"it is not below its glob's folder {prefix}"
+    uid = os.getuid()
+    for a in (folder, *folder.parents):
+        try:
+            owner = a.stat().st_uid
+        except OSError as e:
+            return f"{a} cannot be read ({e.strerror})"
+        if owner != uid:
+            return f"{a} is not yours (owner uid {owner})"
+        if a == home:
+            break
+        if a != project and (a / "state" / "project.db").is_file():
+            return f"it is inside another tt-project project ({a})"
+        if (a / FOLDER / "state" / "project.db").is_file():
+            return f"it is inside another tt-project project ({a / FOLDER})"
+    return None
+
+
+def foreign(folder: Path, root: Path, project: Path, glob: str | None = None) -> str | None:
+    """Why this job folder is not this project's to stop, else None. glob: the registered glob that
+    matched it (registered()), which lets a folder outside the project root in (_outside_root)."""
     if folder != root and root not in folder.parents:
-        return f"{folder} is outside the project root {root}"
+        if why := _outside_root(folder, glob, project):
+            return f"{folder} is outside the project root {root}, and {why}"
+        return None
     own = (project / "state", project / "state.noindex")      # state.noindex: macOS (noindex.py)
     if folder in (root, project, *own, *(d / "runs" for d in own)):
         return f"{folder} is the project's own folder, not a job's"

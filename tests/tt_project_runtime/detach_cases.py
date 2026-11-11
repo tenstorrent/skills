@@ -2036,6 +2036,65 @@ def test_detach_stop_never_runs_a_registered_stop_on_another_projects_job(env, t
     assert not (script.parent / "called").exists()
 
 
+def test_detach_stop_runs_a_registered_stop_on_an_owned_folder_in_the_home(env, tmp_path):
+    """A launcher keeping its jobs in the user's own state folder registers an absolute (`~`) glob: a job
+    folder there, outside the project root, is stopped by its registered command."""
+    p = make(env)
+    home = Path(os.environ["HOME"])
+    folder = home / ".local" / "state" / "gatetool" / "run1"
+    proc = _layout_job(folder)
+    try:
+        script = _stop_script(tmp_path, 'for d; do :; done; echo "$d" >>"$(dirname "$0")/called"; '
+                                          'kill "$(cat "$d/job.txt")"')
+        p.set_config("detach.launcher_stops", {"~/.local/state/gatetool/*": str(script)})
+        r = _ttp_run(p, "detach", "--stop", str(folder))
+        assert r.returncode == 0 and "run1: stopped by its registered stop" in r.stdout, r.stderr
+        assert proc.wait(timeout=10) is not None
+        assert (script.parent / "called").read_text().strip() == str(folder.resolve())
+    finally:
+        _end_launcher(proc)
+
+
+def test_detach_stop_refuses_absolute_folders_not_the_users_own_in_the_home(env, tmp_path, monkeypatch):
+    """Outside the project root only a folder an absolute glob names, strictly inside the user's home,
+    below a glob prefix strictly inside the home, and the user's own is accepted: an unregistered folder,
+    a symlink escaping the home, a system path, a glob reaching the home itself, another user's folder and
+    a folder inside another project are refused, and the stop command never runs."""
+    from ttp import launcherstop
+    p = make(env)
+    home = Path(os.environ["HOME"]).resolve()
+    script = _stop_script(tmp_path, 'touch "$(dirname "$0")/called"')
+    state = home / ".local" / "state"
+    mine, other = state / "gatetool" / "run1", state / "othertool" / "run1"
+    outside = tmp_path / "elsewhere" / "run1"
+    for d in (mine, other, outside):
+        d.mkdir(parents=True)
+    (state / "gatetool" / "link").symlink_to(outside)
+    p.set_config("detach.launcher_stops", {"~/.local/state/gatetool/*": str(script),
+                                           str(tmp_path / "elsewhere" / "*"): str(script)})
+    for folder, why in ((other, "outside the project root"),
+                        (state / "gatetool" / "link", "not inside your home folder"),
+                        (home, "outside the project root")):
+        r = _ttp_run(p, "detach", "--stop", str(folder))
+        assert r.returncode == 3 and why in r.stderr, (folder, r.stderr)
+    assert not (script.parent / "called").exists()
+    root, base = p.root.resolve(), p.base.resolve()
+    assert launcherstop.foreign(mine, root, base, "~/.local/state/gatetool/*") is None
+    assert "outside the project root" in launcherstop.foreign(mine, root, base, None)
+    assert "outside the project root" in launcherstop.foreign(mine, root, base, "gatetool/*")
+    assert "not inside your home" in launcherstop.foreign(Path("/usr").resolve(), root, base, "/*")
+    for glob in ("~/*/gatetool/*", "~/**", str(home.parent / "*" / ".local" / "state" / "gatetool" / "*")):
+        assert "strictly inside your home" in launcherstop.foreign(mine, root, base, glob), glob
+    assert "not below its glob's folder" in launcherstop.foreign(mine, root, base, "~/.local/state/othertool/*")
+    (state / "gatetool" / "state").mkdir()
+    (state / "gatetool" / "state" / "project.db").write_text("")
+    assert "another tt-project project" in launcherstop.foreign(mine, root, base, "~/.local/state/gatetool/*")
+    (state / "gatetool" / "state" / "project.db").unlink()
+    uid = os.getuid()
+    monkeypatch.setattr(launcherstop.os, "getuid", lambda: uid + 1)
+    assert "is not yours" in launcherstop.foreign(mine, root, base, "~/.local/state/gatetool/*")
+
+
 def test_launcher_stop_globs_match_folder_levels():
     from ttp import launcherstop
     root = Path("/r")

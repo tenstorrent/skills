@@ -9389,7 +9389,8 @@ def _launcher_stop(what: str, rc: Path) -> int:
     gone, 1 when it still runs, 2 when no pid file is found (the message says where it looked), 3 when
     refused (its pid file names no pid, or a process that cannot be told to be the launcher's).
     With no pid file, a job folder whose path matches a glob in detach.launcher_stops is stopped by that
-    registered command (_launcher_registered_stop); a folder outside the project root or inside another
+    registered command (_launcher_registered_stop); a folder outside the project root (unless an absolute
+    glob names it, inside the user's own home and theirs: launcherstop._outside_root) or inside another
     tt-project project's folder is refused then (3)."""
     from . import launcherstop
     from .push import _boxed
@@ -9402,10 +9403,12 @@ def _launcher_stop(what: str, rc: Path) -> int:
                    else [d / name for d in dirs] if launcherstop.NAME_RE.fullmatch(name) else [])
         stops = (p.config().get("detach") or {}).get("launcher_stops")
         for folder in (x.resolve() for x in folders if x.is_dir()):
-            if stops and (why := launcherstop.foreign(folder, p.root.resolve(), p.base.resolve())):
+            hit = launcherstop.registered(stops, folder, p.root.resolve())
+            if stops and (why := launcherstop.foreign(folder, p.root.resolve(), p.base.resolve(),
+                                                      hit[0] if hit else None)):
                 print(f"ttp detach --stop: {why}; nothing was run", file=sys.stderr)
                 return 3
-            if hit := launcherstop.registered(stops, folder, p.root.resolve()):
+            if hit:
                 return _launcher_registered_stop(p, folder, *hit)
     if f is None:
         where = ", ".join(str(d) for d in dirs) or "nowhere (no $TTP_RUN_DIR; give the pid file's path)"

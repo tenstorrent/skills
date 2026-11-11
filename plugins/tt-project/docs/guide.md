@@ -1990,8 +1990,14 @@ the pick order, so it takes the first starts. A resumed resource ramps only its 
   A launcher that lays its jobs out its own way (a job folder, no pid file) registers its stop in
   project.json: `"detach": {"launcher_stops": {"<glob of job folders>": "<stop command>"}}`. The glob
   matches the folder's path relative to the project root (`*` one level, `**` any number; an absolute
-  glob the whole path); the command, a string split as a shell would or a list, never run by a shell,
-  gets the job folder as its last argument and runs from the project root. `ttp detach --stop <job
+  glob, `~` allowed, the whole path); the command, a string split as a shell would or a list, never run by a shell,
+  gets the job folder as its last argument and runs from the project root. A launcher that keeps its
+  jobs outside the project (its own state folder such as `~/.local/state/<tool>/<job>`) registers an
+  absolute glob for them: a folder outside the project root is accepted only when a registered absolute
+  glob names it, it resolves (symlinks followed) strictly inside your home folder, below the glob's
+  fixed folder (itself strictly inside your home), and it and each parent up to your home are yours and
+  belong to no other tt-project project; another user's files, system paths and the home folder itself
+  stay refused. `ttp detach --stop <job
   folder>` then runs it, logs the stop in the job-signal stream and as a `detached_job_stopped` event,
   waits for the job's processes (this user's, naming the folder as cwd, argument or environment value)
   to end and names any left: 0 stopped, 1 the command failed or processes are left, 3 refused (a folder
