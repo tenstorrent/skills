@@ -3939,10 +3939,12 @@ class Steps:
     def go(self, step: str) -> None:
         if not self.lock:
             return
-        waited = 0.0
+        waited, started = 0.0, time.monotonic()
         while True:
             locks.relabel(self.lock, {"step": step, "step_since": time.time()})
             if not self._upgrading() or waited >= UPGRADE_WAIT_S:
+                if waited:   # the batch log shows how long a push waited on upgrades (gatetime only times checks)
+                    self.say(f"the {step} step waited {time.monotonic() - started:.0f} s for the upgrade")
                 return
             self.between()
             if not waited:

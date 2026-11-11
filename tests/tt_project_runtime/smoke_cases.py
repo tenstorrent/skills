@@ -34,3 +34,15 @@ def test_smoke_list_names_existing_tests_and_covers_each_area():
                       "of each to tests/tt_project_smoke.txt")
     assert {"test_no_local_leak_patterns_in_plugin"} <= by_file["tests/test_tt_project_plugin.py"]
     assert by_file["tests/test_plugin_catalogue.py"]
+
+
+def test_smoke_list_lines_are_unique_ids_in_the_three_required_files():
+    """The fast smoke stand-in for this file: the coverage scan above (seconds of ast parsing) runs after
+    landing, and every entry's push_entry_checks keep the list's names current before it lands."""
+    import conftest
+    text = conftest.SMOKE_LIST.read_text()
+    ids = [s for line in text.splitlines() if (s := line.split("#", 1)[0].strip())]
+    assert ids and len(ids) == len(set(ids)), sorted({i for i in ids if ids.count(i) > 1})
+    bad = [i for i in ids if not re.fullmatch(
+        r"tests/(test_tt_project_plugin|test_tt_project_runtime|test_plugin_catalogue)\.py::test_\w+", i)]
+    assert not bad, bad

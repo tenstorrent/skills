@@ -1902,6 +1902,18 @@ def test_a_push_batch_fast_forwards_the_extra_branches_it_is_given(env, monkeypa
 
 
 
+def test_a_push_batch_logs_how_long_its_merge_phase_took_and_its_slowest_entries(env, monkeypatch, capsys):
+    """The replay of all entries (merges, conflict settling, entry checks, upgrade waits) is most of a
+    batch's time before its checks: the batch log names its seconds and slowest entries."""
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    heads = [_entry(repo, f"e{n}", {f"f{n}.txt": f"{n}\n"}) for n in (1, 2)]
+    rc, m = _run_batch(p, _batch_marker(p, heads), monkeypatch)
+    assert rc == 0 and m["outcome"] == "pushed", m
+    out = capsys.readouterr().out
+    assert re.search(r"ttp push: replayed 2 entries in \d+ s \(2 carried; slowest: entry \S+ \d+ s, entry \S+ \d+ s\)",
+                     out), out
+
+
 def test_a_push_batch_mirrors_its_pushed_commit_and_still_runs_after_push(env, monkeypatch, capsys):
     from ttp import batch
     p, repo, origin, mirror = _mirror_setup(env, monkeypatch)

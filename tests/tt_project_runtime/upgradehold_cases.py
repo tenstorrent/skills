@@ -278,6 +278,7 @@ def test_a_push_step_waits_for_a_running_upgrade_and_marks_itself_first(env):
             t.join(10)
     try:
         assert not t.is_alive() and locks.read_label(pathlib.Path(f.name))["step"] == "push"
+        assert re.fullmatch(r"the push step waited \d+ s for the upgrade", said[-1]), said
     finally:
         f.close()
 

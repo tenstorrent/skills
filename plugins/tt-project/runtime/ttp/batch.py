@@ -1895,7 +1895,10 @@ class Batch:
         self.info, self.settled, self.conflicted, self.dropped = {}, {}, set(), {}
         csdir = self.cfg["changeset_dir"] if self.cfg else ""
         self._faults: list[str] = []    # where each entry before this one raised, "" for one that did not
+        took: list[tuple[float, int]] = []
+        started = time.monotonic()
         for i, e in enumerate(self.entries):
+            t0 = time.monotonic()
             try:
                 h = self._replay_one(i, e, h, carried, tip, checks, csdir)
                 self._faults.append("")
@@ -1903,6 +1906,11 @@ class Batch:
                 raise
             except Exception as ex:     # one entry's fault takes only it out, never the whole batch
                 self._replay_fault(i, e, h, carried, ex)
+            took.append((time.monotonic() - t0, i))
+        if took:   # the merge phase's time in the batch log, next to the checks' ttp-suite wall
+            slow = ", ".join(f"entry {self.entries[i].get('id')} {s:.0f} s" for s, i in sorted(took, reverse=True)[:3])
+            say(f"replayed {len(took)} entries in {time.monotonic() - started:.0f} s ({len(carried)} carried; "
+                f"slowest: {slow})")
         return carried
 
     def _replay_one(self, i: int, e: dict, h: str, carried: list[tuple[int, str]], tip: str, checks: list[str],
