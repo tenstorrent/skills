@@ -267,14 +267,38 @@ def mark_untrusted(payload: dict, run_dir: str) -> None:
 SSH_ARG_OPTS = set("bBcDEeFIiJLlmOopQRSWw")   # ssh options that take a value
 
 
+LONG_RUN = 256       # characters in a run _words hands shlex as a short mark
+RUN_MARK = "\ue000"  # brackets a mark's number; a command holding it is read as is
+
+
+def _words(cmd: str, punctuation: str, commenters: str = "#") -> list[str]:
+    """shlex's posix words of `cmd`, split at whitespace and at runs of `punctuation`, in time linear in
+    its length: shlex grows a word one character at a time (quadratic in the word's length, minutes for a
+    2 MB argument), so each run of LONG_RUN or more characters shlex reads alike in every state (none a
+    space, quote, backslash, punctuation or comment character) is read as a short mark and put back in
+    the words after. Raises ValueError as shlex does (an unclosed quote)."""
+    import shlex
+    runs: dict[str, str] = {}
+    if RUN_MARK not in cmd:
+        plain = "[^" + re.escape(" \t\r\n'\"\\" + punctuation + commenters) + "]"
+        cmd = re.sub(f"(?<!{plain}){plain}{{{LONG_RUN},}}",
+                     lambda m: runs.setdefault(m[0], f"{RUN_MARK}{len(runs)}{RUN_MARK}"), cmd)
+    lex = shlex.shlex(cmd, posix=True, punctuation_chars=punctuation)
+    lex.whitespace_split = True
+    lex.commenters = commenters
+    words = list(lex)
+    if runs:
+        back = {mark: run for run, mark in runs.items()}
+        words = [re.sub(f"{RUN_MARK}\\d+{RUN_MARK}", lambda m: back[m[0]], w) if RUN_MARK in w else w
+                 for w in words]
+    return words
+
+
 def ssh_targets(cmd: str) -> list[str]:
     """The hosts an ssh, scp or rsync command in this shell line runs on or copies to or from
     (user@ and ssh:// stripped; local paths and option values skipped)."""
-    import shlex
     try:
-        lex = shlex.shlex(cmd, posix=True, punctuation_chars=";&|()")
-        lex.whitespace_split = True
-        words = list(lex)
+        words = _words(cmd, ";&|()")
     except ValueError:
         return []
     found, i = [], 0
@@ -468,11 +492,22 @@ def api_ref_write(text: str) -> bool:
     return bool(api and change and HTTP_CLIENT_RE.search(text))
 
 
+# Per _quoting state (unquoted, in '', in "", in a comment): a run of characters that changes nothing
+QUOTING_RUNS = {"": re.compile(r"[^'\"\\#()]+"), "'": re.compile(r"[^']+"), '"': re.compile(r'[^"\\]+'),
+                "#": re.compile(r"[^\n]+")}
+
+
 def _quoting(line: str) -> list[tuple[bool, int]]:
     """Per character of `line`: whether it is quoted (or escaped, or in a comment), and the depth
-    of parentheses around it."""
-    out, q, depth, esc = [], "", 0, False
-    for i, c in enumerate(line):
+    of parentheses around it. A run of characters that changes neither is copied in one step, so a long
+    word costs no per-character loop."""
+    out, q, depth, esc, i = [], "", 0, False, 0
+    while i < len(line):
+        if not esc and (m := QUOTING_RUNS[q].match(line, i)):
+            out.extend([(q != "", depth)] * (m.end() - i))
+            i = m.end()
+            continue
+        c = line[i]
         inert = True
         if q == "#" and c == "\n":
             q = ""
@@ -495,13 +530,18 @@ def _quoting(line: str) -> list[tuple[bool, int]]:
             depth += c == "("
             depth = max(0, depth - (c == ")"))
         out.append((inert, depth))
+        i += 1
     return out
+
+
+SEPARATOR_RE = re.compile(r"[;&|]")
 
 
 def _pieces(line: str) -> list[tuple[int, int, str]]:
     """The top-level simple commands of one line: (start, end, the separator after it)."""
     flags, out, start, i = _quoting(line), [], 0, 0
-    while i < len(line):
+    while m := SEPARATOR_RE.search(line, i):   # only a separator character can end a command
+        i = m.start()
         c = line[i]
         if not flags[i][0] and flags[i][1] == 0 and c in ";&|" and line[i - 1:i] not in ("<", ">") \
                 and line[i + 1:i + 2] != ">":
@@ -753,12 +793,10 @@ def _segments(cmd: str, strip: bool = True) -> list[list[str]]:
     (env, nohup, timeout 60, `ttp lock res --` ...): what actually runs first in each. `strip`
     False keeps them."""
     # A line break ends a command; it stays a line break too, so a `#` comment (a script's #! line) ends there
-    cmd = "".join(";\n;" if c == "\n" and not inert else c for c, (inert, _) in zip(cmd, _quoting(cmd)))
+    flags = _quoting(cmd)
+    cmd = re.sub("\n", lambda m: "\n" if flags[m.start()][0] else ";\n;", cmd)
     try:
-        import shlex
-        lex = shlex.shlex(cmd, posix=True, punctuation_chars=";&|()<>")
-        lex.whitespace_split = True
-        words = list(lex)
+        words = _words(cmd, ";&|()<>")
     except ValueError:
         words = cmd.split()
     out, seg, target = [], [], False

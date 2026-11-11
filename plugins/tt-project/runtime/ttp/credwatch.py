@@ -43,7 +43,6 @@ import hashlib
 import json
 import os
 import re
-import shlex
 import stat
 from pathlib import Path
 
@@ -237,21 +236,23 @@ def _commands(cmd: str, depth: int = 0) -> list[tuple[list[str], list[str]]]:
     from . import hook
     run = hook._split(cmd, strip=False)[0]
     flags = hook._quoting(run)
-    kept, comment = [], False
-    for i, c in enumerate(run):   # drop '#' comments (a '#' starting an unquoted word) up to their newline
+    kept, comment, last = [], False, 0
+    for m in re.finditer("[#\n]", run):   # drop '#' comments (a '#' starting an unquoted word) up to their newline
+        i, c = m.start(), m[0]
+        if not comment:
+            kept.append(run[last:i])
         if c == "\n" and not flags[i][0]:
             comment = False
         elif c == "#" and flags[i][0] and (i == 0 or (not flags[i - 1][0] and run[i - 1] in " \t\n;&|(")):
             comment = True
         if not comment:
             kept.append(c)
-    run = "".join(kept)
-    run = "".join(";" if c == "\n" and not inert else c for c, (inert, _) in zip(run, hook._quoting(run)))
+        last = i + 1
+    run = "".join(kept + ([] if comment else [run[last:]]))
+    flags = hook._quoting(run)
+    run = re.sub("\n", lambda m: "\n" if flags[m.start()][0] else ";", run)
     try:
-        lex = shlex.shlex(run, posix=True, punctuation_chars=";&|()<>")
-        lex.whitespace_split = True
-        lex.commenters = ""
-        words = list(lex)
+        words = hook._words(run, ";&|()<>", commenters="")
     except ValueError:
         words = run.split()
     out, argv, targets, redirect = [], [], [], ""
@@ -419,10 +420,15 @@ def transcript_hit(run_dir: str | Path | None, path: str, home: str = "") -> tup
 
 
 def _scan(run_dir: Path, path: str, home: str) -> tuple[int, str] | None:
+    """transcript_hit's answer, read from the run's calls; a shell call holding none of the needles is passed
+    over unparsed, as a whole transcript holding none is."""
+    needles = [x.decode() for x in _needles(path)]
     for n, kind, text in issued(run_dir):
         if kind == "file":
             if _is(text, path, home):
                 return n, text[:QUOTE]
+            continue
+        if not any(x in text for x in needles):
             continue
         for argv, targets in _commands(text):
             if _writes(argv, targets, path, home) or _writer(argv, path):

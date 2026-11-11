@@ -599,3 +599,55 @@ def test_credwatch_transcript_hit_skips_a_transcript_without_the_name_unparsed_a
     gh = str(home / ".config" / "gh" / "hosts.yml")
     (d / "output.jsonl").write_text(json.dumps(_bash("gh auth login --with-token")) + "\n")
     assert credwatch.transcript_hit(d, gh, str(home))[0] == 1
+
+
+def test_credwatch_commands_and_transcript_hit_take_linear_time_on_a_huge_word(tmp_path):
+    """A call holding the store's file name next to a 2 MB word is parsed in time linear in its length
+    (shlex grows a word one character at a time, so a word that long once took minutes): the writer it runs
+    is still found, well under 2 s."""
+    import time
+    from ttp import credwatch
+    home = tmp_path / "acct"
+    key = str(home / ".ssh" / "id_example")
+    cmd = "echo " + "x" * 2_000_000 + " ; cp /tmp/k ~/.ssh/id_example # " + "y" * 1000
+    t = time.monotonic()
+    assert credwatch._commands(cmd)[-1] == (["cp", "/tmp/k", "~/.ssh/id_example"], [])
+    d = tmp_path / "run"
+    d.mkdir()
+    (d / "output.jsonl").write_text(json.dumps(_bash(cmd)) + "\n")
+    assert credwatch.transcript_hit(d, key, str(home))[0] == 1
+    assert time.monotonic() - t < 2, time.monotonic() - t
+
+
+def test_credwatch_hook_words_split_as_shlex_does_with_long_runs_shortened():
+    """hook._words, which hands shlex each long run of plain characters as a short mark, gives shlex's own
+    words (and its ValueError on an unclosed quote) for quotes, escapes, comments, separators and long runs
+    inside and around them, and reads a command already holding the mark character as is."""
+    import random
+    import shlex
+    from ttp import hook
+
+    def plain(cmd, punctuation, commenters):
+        lex = shlex.shlex(cmd, posix=True, punctuation_chars=punctuation)
+        lex.whitespace_split = True
+        lex.commenters = commenters
+        try:
+            return list(lex)
+        except ValueError:
+            return ValueError
+
+    def words(cmd, punctuation, commenters):
+        try:
+            return hook._words(cmd, punctuation, commenters)
+        except ValueError:
+            return ValueError
+
+    rng = random.Random(7)
+    alphabet = ["a", "b", " ", "\t", "\n", "#", "'", '"', "\\", "(", ")", ";", "&", "|", "<", ">", "-", "/",
+                hook.RUN_MARK, "x" * hook.LONG_RUN, "y" * (hook.LONG_RUN + 37)]
+    cases = ["echo " + "x" * 3000 + " | cat", "'" + "q" * 900 + "' \"" + "w" * 900 + "\"", "a\\" + "z" * 600,
+             "#" + "c" * 700 + "\nls", "x" * 600 + "#" + "x" * 600, "'" + "u" * 500, hook.RUN_MARK + "0" + hook.RUN_MARK]
+    cases += ["".join(rng.choice(alphabet) for _ in range(rng.randint(0, 20))) for _ in range(3000)]
+    for cmd in cases:
+        for punctuation, commenters in ((";&|()", "#"), (";&|()<>", "#"), (";&|()<>", "")):
+            assert words(cmd, punctuation, commenters) == plain(cmd, punctuation, commenters), (cmd[:80], punctuation)
