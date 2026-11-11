@@ -1023,14 +1023,23 @@ def test_a_follow_up_on_another_model_starts_fresh_never_resuming_the_other_mode
         assert got["how"] == "fork" and "run" not in got, got
         assert f"no resume: run {r_code} ran on {run_model}, this run on {model}" in got["why"], got
         assert not got["lead"].startswith(ctxfork.RESUME_HEAD)
-    # A coordinator on Opus: a Sonnet follow-up of an Opus run takes the disk block a fresh Sonnet run takes.
+    # A coordinator on Opus: a Sonnet follow-up of an Opus run forks the coordinator's last turns, as a fresh
+    # Sonnet run does (task #8308); a non-Claude model, or the setting at 0, takes the disk block.
     coord_dir = tmp_path / "coord-run"
     coord_dir.mkdir()
     (coord_dir / "run.json").write_text(json.dumps({"argv": ["claude", "-p", "--model", "claude-opus-5-5"]}))
     p.db.x("INSERT INTO runs(role,status,started,dir) VALUES('coordinator','ok',?,?)", (time.time(), str(coord_dir)))
     got = prep("claude-opus-5-5", "claude-sonnet-5-5")
+    assert got["how"] == "fork" and got.get("tail") and "run" not in got, got
+    assert "no resume: run" in got["why"] and "ran on claude-opus-5-5" in got["why"], got
+    assert not got["lead"].startswith(ctxfork.RESUME_HEAD)
+    got = prep("claude-opus-5-5", "glm-5.3")
     assert got["how"] == "disk" and got["lead"].startswith(ctxfork.DISK_HEAD), got
     assert "ran on claude-opus-5-5" in got["why"] and "not the coordinator's" in got["why"], got
+    p.set_config("coordinator.session.worker_fork_other_model_tokens", 0)
+    got = prep("claude-opus-5-5", "claude-sonnet-5-5")
+    assert got["how"] == "disk" and "not the coordinator's" in got["why"], got
+    p.set_config("coordinator.session.worker_fork_other_model_tokens", 8000)
     assert prep("claude-sonnet-5-5", "claude-opus-5-5")["how"] == "fork"   # an Opus follow-up: the coordinator fork
     # Through the daemon: the run's own model against the source run's, and its prompt carries the record.
     p.db.x("DELETE FROM runs WHERE role='coordinator'")
