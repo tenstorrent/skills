@@ -808,3 +808,68 @@ def test_an_over_note_naming_a_landed_fix_dispatches_nothing(env):
 
     assert run("the soak ended; commit {} updated the tools", commit) == []
     assert len(run("the soak ended; commit 0badc0ffee1 updated the tools", commit)) == 1
+
+
+_LOAD_BAN = ("No synthetic CPU load on box-a (user msg #81): box-a is a live serving box. Never run CPU burners or "
+             "load generators there, and keep load generators off box-b too.")
+
+
+def _load_project(env, tools):
+    """A project with `tools` (name, text) under bin/, and its restriction_tools update tasks."""
+    p = make(env)
+    p.charter_path.write_text("# demo\n\n## Restrictions\n- Never merge. (user msg #1)\n")
+    (p.root / "bin").mkdir(exist_ok=True)
+    for name, text in tools:
+        (p.root / "bin" / name).write_text(text)
+    return p, lambda: [dict(r) for r in p.db.q("SELECT * FROM tasks WHERE labels LIKE '%restriction_tools:%'")]
+
+
+def test_a_tool_line_naming_only_the_removed_items_machine_aliases_is_no_hit(env):
+    """A removed item naming box-a and box-b: a tool line listing only those boxes ('box-a, box-b') names
+    the boxes, not the rule, and is no hit; a line with the rule's own words beside them still is."""
+    from ttp import restriction_audit
+    p, tasks = _load_project(env, [("submit", "#!/bin/sh\n# held boxes: box-a, box-b\nexit 0\n")])
+    assert restriction_audit.restriction_tools(p, [(_LOAD_BAN, "", "")], []) == []
+    assert tasks() == []
+    ids, words, exact = restriction_audit.tool_terms(_LOAD_BAN, "", p.charter_path.read_text())
+    assert {"box-a", "box-b"} <= words, words
+    assert restriction_audit.tool_hit("refuse jobs on box-a, box-b", ids, words, exact) == []
+    assert restriction_audit.tool_hit("no burners on box-a", ids, words, exact) == ["box-a", "burners"]
+    (p.root / "bin" / "guard").write_text("#!/bin/sh\necho 'refused: no CPU burners on box-a'; exit 1\n")
+    out = restriction_audit.restriction_tools(p, [(_LOAD_BAN, "", "")], [])
+    assert len(out) == 1 and "bin/guard:2" in out[0] and "bin/submit" not in out[0], out
+
+
+def test_a_tool_gone_since_it_was_read_is_never_named(env, monkeypatch):
+    """A file under bin/ that a worker removes while the scan runs (its scratch copy) is not named in the
+    update task: only paths that still exist are."""
+    from ttp import restriction_audit
+    guard = "#!/bin/sh\necho 'refused: no CPU burners on box-a'; exit 1\n"
+    p, tasks = _load_project(env, [("guard", guard), ("scratch-guard", guard)])
+    real = restriction_audit.tool_terms
+
+    def vanish(*a, **k):   # after the files were read, before their lines are matched
+        (p.root / "bin" / "scratch-guard").unlink(missing_ok=True)
+        return real(*a, **k)
+    monkeypatch.setattr(restriction_audit, "tool_terms", vanish)
+    out = restriction_audit.restriction_tools(p, [(_LOAD_BAN, "", "")], [])
+    assert len(out) == 1 and "bin/guard:2" in out[0] and "scratch-guard" not in out[0], out
+    (t,) = tasks()
+    assert "scratch-guard" not in t["spec"], t["spec"]
+
+
+def test_an_item_whose_tools_a_done_task_checked_is_never_queued_again(env):
+    """Once an update task for an item is done (here with no change), the same item changed again, under
+    another `over` or new text, queues no second task; another item still does."""
+    from ttp import restriction_audit
+    p, tasks = _load_project(env, [("guard", "#!/bin/sh\necho 'refused: no CPU burners on box-a'; exit 1\n")])
+    assert len(restriction_audit.restriction_tools(p, [(_LOAD_BAN, "", "")], [])) == 1
+    (t,) = tasks()
+    p.db.update_task(t["id"], status="done")   # its worker changed nothing
+    for again in ((_LOAD_BAN, "", "the serving box was retired"), (_LOAD_BAN, "CPU burners may run on box-a.", "")):
+        assert restriction_audit.restriction_tools(p, [again], []) == [], again
+    assert len(tasks()) == 1
+    other = "Never run CPU burners on box-c (user msg #82)."
+    (p.root / "bin" / "guard-c").write_text("#!/bin/sh\necho 'refused: no CPU burners on box-c'; exit 1\n")
+    assert len(restriction_audit.restriction_tools(p, [(other, "", "")], [])) == 1
+    assert len(tasks()) == 2
