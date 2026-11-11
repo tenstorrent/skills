@@ -8633,8 +8633,35 @@ def cmd_model_bench(a) -> None:
         print(f"model bench started (pid {child.pid}; log {log})", file=sys.stderr)
         return
     now = _t.time()
+    if a.action == "suite":
+        return _model_suite(p, a, now)
     out = modelbench.run(p.name, p.config(), modelrank.parked_models(p.db), now, force=a.force)
     print(json.dumps(out, indent=1))
+
+
+def _model_suite(p, a, now: float) -> None:
+    """`ttp model-bench suite`: the daily cheat-resistant benchmark (modelsuite.py)."""
+    from . import benchrun, endpoint, modelbench, modelrank, modelsuite
+    cfg, ask = p.config(), None
+    if a.dry_run:   # a fake agent and answerer, no spend; the ranking stands in for the served list
+        served = modelrank.ranking(cfg) or die("model-bench suite --dry-run: set providers.chat.model_ranking")
+    else:
+        alias = str(((cfg.get("providers") or {}).get("chat") or {}).get("endpoint") or "")
+        got = endpoint.credentials(alias) if alias else None
+        ok, msg, ids = endpoint.list_models(got.url, got.key) if got else (False, "no key saved", None)
+        if not ok or not ids:
+            die(f"model-bench suite: no working key for chat endpoint {alias or '(none)'}: {msg}")
+        served, ask = list(ids), (lambda m, q: modelbench._post(got.url, got.key, m, q))
+    opts = {"timeout_s": a.timeout, "stall_s": min(900.0, a.timeout), "budget_usd": a.budget,
+            "test_cmd": benchrun.TEST_CMD, "test_timeout_s": 900, "dry_run": a.dry_run}
+    try:
+        rows = modelsuite.run(p.db, cfg, served, modelrank.parked_models(p.db), now, date=a.date or "",
+                              bench_dir=Path(a.bench).expanduser().resolve() if a.bench else None,
+                              cells_dir=Path(a.cells).expanduser().resolve() if a.cells else None,
+                              opts=opts, ask=ask)
+    except (modelsuite.SuiteError, benchrun.BenchError) as e:
+        die(f"model-bench suite: {e}")
+    print(json.dumps([{k: v for k, v in r.items() if k != "cell_rows"} for r in rows], indent=1))
 
 
 def cmd_bench(a) -> None:
@@ -15092,13 +15119,21 @@ def main(argv: list[str] | None = None) -> None:
                                             "models once per host and day (a second run does nothing; the "
                                             "owner project's schedule runs it daily), `show` prints the owner, latest result and "
                                             "per-model scores")
-    s.add_argument("action", choices=["run", "show", "scores"],
+    s.add_argument("action", choices=["run", "show", "scores", "suite"],
                    help="run: bench the served models (once per host and day); show: print the owner, latest "
-                        "result and per-model scores; scores: the model scoreboard's per-class rankings")
+                        "result and per-model scores; scores: the model scoreboard's per-class rankings; suite: "
+                        "the cheat-resistant daily benchmark (replay, injection and babysit cells, one row per "
+                        "model and class in model-bench/<date>.jsonl)")
     s.add_argument("--force", action="store_true", help="run: bench again though today's result exists")
     s.add_argument("--json", action="store_true", help="scores: print the board as JSON")
     s.add_argument("--detach", action="store_true", help="run: start the bench in the background and return "
                                                          "(the owner's daily schedule; output in the bench log)")
+    s.add_argument("--date", help="suite: the day whose seeded draw to run (YYYY-MM-DD; default today)")
+    s.add_argument("--dry-run", action="store_true", help="suite: a fake agent and answerer, no spend")
+    s.add_argument("--bench", help="suite: a `ttp bench prep` folder for the replay cells")
+    s.add_argument("--cells", help="suite: a `ttp bench cells` folder for the injection cells")
+    s.add_argument("--timeout", type=float, default=1800.0, help="suite: seconds per agent cell (default 1800)")
+    s.add_argument("--budget", type=float, default=2.0, help="suite: dollars per agent cell (default 2)")
     s.set_defaults(fn=cmd_model_bench)
 
     s = sub.add_parser("ack-wait", help="wait model-free for another project's reply to a `ttp note --to`: probe "

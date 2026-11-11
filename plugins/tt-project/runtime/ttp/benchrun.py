@@ -280,8 +280,6 @@ def _boot(module: str) -> list[str]:
 
 def run_cell(bench_dir: Path, out: Path, task: dict, cell: dict, arm: dict, opts: dict, cfg: dict) -> dict:
     """Run one cell, grade it and return its results row (also written under <out>/cells)."""
-    from . import billing, chatbridge
-    from .providers import get_provider
     row = {**cell, **arm, "dry_run": bool(opts.get("dry_run"))}
     keep = out / "cells" / f"{task['task']}-r{cell['rep']}-{cell['arm']}"
     hidden = hidden_paths(bench_dir.resolve(), out.resolve(), [task.get("repo"), opts.get("repo")], opts.get("state"))
@@ -296,43 +294,59 @@ def run_cell(bench_dir: Path, out: Path, task: dict, cell: dict, arm: dict, opts
             cell_env = cellenv.env(cellenv.make(tmp / "venv", opts.get("cell_packages", cellenv.SEED)), _clean_env())
         except cellenv.Unavailable as e:
             return {**row, "outcome": "isolation_failed", "passed": False, "why": [str(e)[:500]]}
-        run.mkdir()
-        durable_write(run / "prompt.md", PROMPT.format(spec=task["spec"]))
-        provider = "fake" if opts.get("dry_run") else arm["provider"]
-        prices = (cfg.get("pricing") or {}).get(provider) or {}
-        prov = get_provider(provider).use(arm["model"], prices, billing.declared(cfg, provider))
-        argv, env = prov.build(role="worker", model=arm["model"], effort=arm["effort"], cwd=str(ws),
-                               budget_usd=opts["budget_usd"], read_only=False, schema=None, restrictions={},
-                               denied_reads=denied_reads(hidden, session_dirs(ws)), web=False)
-        if argv[:3] == [sys.executable, "-m", "ttp.providers.fake"]:   # the dry run's agent: no PYTHONPATH
-            argv = [*_boot("ttp.providers.fake"), *argv[3:]]
-        spec = {"argv": argv, "env": {**env, "TTP_RUN_DIR": str(run)}, "cwd": str(ws), "provider": provider,
-                "model": arm["model"], "effort": arm["effort"], "timeout_s": opts["timeout_s"],
-                "stall_s": opts["stall_s"], "prices": prices, "default_budget_usd": opts["budget_usd"],
-                "budget_usd": None if prov.caps_budget else opts["budget_usd"], "nice": 0,
-                **({"bridge": chatbridge.settings(cfg, "standard", arm["model"], arm["effort"])}
-                   if provider == "chat" else {})}
-        durable_write(run / "run.json", json.dumps(spec, indent=1))
-        began = time.time()
-        try:
-            with open(run / "runner.log", "wb") as log:
-                subprocess.run([*_boot("ttp.runner"), str(run)], cwd=str(run), env=cell_env,
-                               stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-                               timeout=opts["timeout_s"] + 300)
-        except subprocess.TimeoutExpired:   # the supervisor itself hung: its watchdog ends the agent
-            row.update(outcome="runner_timeout", passed=False, wall_s=round(time.time() - began, 1))
-            try:   # what the agent spent so far still counts
+        prov, wall, hung = launch(run, ws, PROMPT.format(spec=task["spec"]), arm, opts, cfg, hidden, cell_env)
+        row["wall_s"] = wall
+        if hung:   # the supervisor itself hung: its watchdog ends the agent; what it spent so far still counts
+            row.update(outcome="runner_timeout", passed=False)
+            try:
                 row["cost_usd"] = prov.parse(run / "output.jsonl", run / "stderr.log").cost_usd
             except Exception:
                 pass
             return row
-        row["wall_s"] = round(time.time() - began, 1)
         try:
             return _finish(row, bench_dir, task, ws, run, keep, start, prov, opts, hidden)
         except Exception as e:   # the agent ran and spent: record the cell, so a rerun skips it
             return {**row, "outcome": "error", "passed": False, "why": [f"{type(e).__name__}: {e}"[:500]]}
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+def launch(run: Path, ws: Path, prompt: str, arm: dict, opts: dict, cfg: dict, hidden: list[Path], cell_env: dict,
+           env: dict | None = None) -> tuple:
+    """Run the arm's agent on `prompt` in `ws` under the runner supervisor (run dir `run`, new), reads of
+    `hidden` denied; `env` adds to the agent's environment (PATH_PREPEND goes before its PATH). Returns
+    (provider, wall_s, hung): hung when the supervisor itself outlived its timeout."""
+    from . import billing, chatbridge
+    from .providers import get_provider
+    run.mkdir()
+    durable_write(run / "prompt.md", prompt)
+    provider = "fake" if opts.get("dry_run") else arm["provider"]
+    prices = (cfg.get("pricing") or {}).get(provider) or {}
+    prov = get_provider(provider).use(arm["model"], prices, billing.declared(cfg, provider))
+    argv, penv = prov.build(role="worker", model=arm["model"], effort=arm["effort"], cwd=str(ws),
+                            budget_usd=opts["budget_usd"], read_only=False, schema=None, restrictions={},
+                            denied_reads=denied_reads(hidden, session_dirs(ws)), web=False)
+    if argv[:3] == [sys.executable, "-m", "ttp.providers.fake"]:   # the dry run's agent: no PYTHONPATH
+        argv = [*_boot("ttp.providers.fake"), *argv[3:]]
+    extra = dict(env or {})
+    if pre := extra.pop("PATH_PREPEND", ""):
+        extra["PATH"] = os.pathsep.join(p for p in (pre, penv.get("PATH") or cell_env.get("PATH", "")) if p)
+    spec = {"argv": argv, "env": {**penv, **extra, "TTP_RUN_DIR": str(run)}, "cwd": str(ws), "provider": provider,
+            "model": arm["model"], "effort": arm["effort"], "timeout_s": opts["timeout_s"],
+            "stall_s": opts["stall_s"], "prices": prices, "default_budget_usd": opts["budget_usd"],
+            "budget_usd": None if prov.caps_budget else opts["budget_usd"], "nice": 0,
+            **({"bridge": chatbridge.settings(cfg, "standard", arm["model"], arm["effort"])}
+               if provider == "chat" else {})}
+    durable_write(run / "run.json", json.dumps(spec, indent=1))
+    began = time.time()
+    try:
+        with open(run / "runner.log", "wb") as log:
+            subprocess.run([*_boot("ttp.runner"), str(run)], cwd=str(run), env=cell_env,
+                           stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                           timeout=opts["timeout_s"] + 300)
+    except subprocess.TimeoutExpired:
+        return prov, round(time.time() - began, 1), True
+    return prov, round(time.time() - began, 1), False
 
 
 def _read_json(path: Path):
