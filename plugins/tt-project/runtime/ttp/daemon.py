@@ -89,6 +89,7 @@ from . import probematch
 from . import chainprio
 from . import churnwatch
 from . import alerts
+from . import rampup
 from . import applyff, landff
 from . import userstep
 from . import waitpoll
@@ -2310,7 +2311,7 @@ class Daemon:
                      self.sweep_sandbox_trees,
                      self.verify_pushes,
                      self.tick_prune_worktrees, self.prune_leftovers, self.branch_cap, self.land_harness_worktrees, self.backup_branches, self.replicate_state, self.check_local_only, self.check_disk,
-                     self.sweep_alerts, self.check_release, self.sync_shared_pauses, self.check_pause_ends,
+                     self.sweep_alerts, self.check_release, self.sync_shared_pauses, self.check_pause_ends, self.track_outages,
                      self.check_integrity, self.heal_harness_git,
                      self.sync_schedules, self.lint_charter, self.tend_holds, self.record_ttr, self.alert_long_pause,
                      self.check_linger, self.check_notifier, self.check_overseer, self.alert_slurm_paused, self.check_gh_auth, self.check_reach, self.check_chats,
@@ -11820,6 +11821,32 @@ class Daemon:
         finally:
             self._slot_resv_pass = None
 
+    def track_outages(self) -> None:
+        """Note which outages hold now (rampup.py): when one ends, new starts ramp up, not all at once."""
+        db, signs = self.p.db, set()
+        if db.kv("paused", False):
+            signs.add("pause")
+        if not self.lease_held():
+            signs.add("lease")
+        for r in db.q("SELECT key FROM kv WHERE key LIKE ?", (alerts.BREAKER + "%",)):
+            if (db.kv(r["key"]) or {}).get("open"):
+                signs.add("login:" + r["key"][len(alerts.BREAKER):])
+        signs |= {f"budget:{prov}" for prov, g in self.gates.items() if not g.allow_new_work}
+        signs |= {f"network:{prov}" for prov in self._net_holds}
+        if time.monotonic() < self._settle_until:
+            signs.add("host wake")
+        signs |= {f"resource:{r}" for r in db.paused_resources()}
+        if cause := rampup.observe(db, self.cfg, signs, self.boot, self._ramp_running):
+            log(self.p, f"outage over ({cause}): new workers ramp up from "
+                        f"{rampup.settings(self.cfg)[0]} instead of all starting at once")
+
+    def _ramp_running(self, scope) -> int:
+        rows = self.p.db.q("SELECT t.labels FROM runs r JOIN tasks t ON t.id=r.task "
+                           "WHERE r.role!='coordinator' AND r.status='running'")
+        if scope is None:
+            return len(rows)
+        return sum(1 for t in rows if coord.task_resources(dict(t)) & set(scope))
+
     def _dispatch(self, busy: dict) -> None:
         db = self.p.db
         self._tend_premises()   # a code task queued this tick with a `premise:` line waits on its check
@@ -11852,6 +11879,7 @@ class Daemon:
         fresh = [t for t in ready if t["id"] not in walked]
         if walked:
             ready = _rotate_walked(ready, set(walked), _owner_due(db), now)
+        ramp = rampup.active(db, self.cfg, now) if ready else None
         for i, task in enumerate(ready):
             if not self.lease_held():   # lapsed during this tick (a slow start or store): start nothing more
                 break
@@ -11952,6 +11980,16 @@ class Daemon:
             if why == "resource":
                 self._log_resource_wait(task, ctx.get("holds", {}).get(task["id"]))
             if why:
+                continue
+            # After an outage new workers ramp up (rampup.py); urgent work is first in the pick order.
+            if ramp and rampup.covers(ramp, coord.task_resources(task)) \
+                    and self._ramp_running(ramp["scope"]) >= rampup.allowed(ramp, self.cfg, now):
+                if not ramp.get("said"):
+                    log(self.p, rampup.note(ramp, self.cfg, now))
+                    ramp["said"] = True
+                    db.set_kv(rampup.KEY, ramp)
+                fate[task["id"]] = "hold"
+                reached.discard(task["id"])
                 continue
             if note.startswith(provallow.HELD_NOTE):
                 db.update_task(task["id"], blocked_reason=None)
