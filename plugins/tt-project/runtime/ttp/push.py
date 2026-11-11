@@ -2346,7 +2346,37 @@ def local_remote_problem(p: Project, repo: Path, remote: str) -> str:
 LOCAL = "local"   # own_target's remote in a code repo with no git remote: publishing moves the local branch
 OWN_BRANCH_ENV = "TTP_PUSH_OWN_BRANCH"   # `ttp push --own-branch`: the own branch under its own name
 LAND_ENV = "TTP_PUSH_LAND"   # `ttp push --land`: a task lands its own branch though its spec has no landing step
-APPROVED_ENV = "TTP_PUSH_APPROVED"   # the approved head `ttp push` lands (approved_landing); read by gitguard.py
+APPROVED_DIR = "push-approved"   # state/<this>/<pid>.json: the head a `ttp push` lands (approved_landing)
+APPROVED_TTL = 1800   # seconds an approval marker stays good (gitguard.approved_push)
+
+
+def approval_marker(p: Project, pid: int) -> dict | None:
+    """The fresh approval marker process `pid` (a `ttp push`) wrote, else None."""
+    try:
+        m = json.loads((p.state / APPROVED_DIR / f"{int(pid)}.json").read_text())
+    except (OSError, ValueError, TypeError):
+        return None
+    if not isinstance(m, dict) or m.get("pid") != int(pid) or not isinstance(m.get("at"), (int, float)) \
+            or not 0 <= time.time() - m["at"] <= APPROVED_TTL or not isinstance(m.get("sha"), str):
+        return None
+    return m
+
+
+def _mark_approved(p: Project, head: str) -> None:
+    """Record under the project's state that this `ttp push` process lands `head` on the push branch.
+    Only this record lets the run's git wrapper (gitguard.approved_push) pass such a push: the push must
+    come from this process or a child of it and send exactly `head` to the push branch. An environment
+    variable never suffices, so a raw `git push` cannot claim an approval. The record goes when this
+    process ends."""
+    import atexit
+    import secrets
+    pid = os.getpid()
+    f = p.state / APPROVED_DIR / f"{pid}.json"
+    f.parent.mkdir(parents=True, exist_ok=True)
+    branch = str((p.config().get("delivery") or {}).get("push_branch") or "").strip()
+    durable_write(f, json.dumps({"pid": pid, "sha": head, "branch": branch, "at": time.time(),
+                                 "nonce": secrets.token_hex(8)}))
+    atexit.register(lambda: f.unlink(missing_ok=True) if os.getpid() == pid else None)
 
 
 def approved_head(p: Project, head: str) -> dict | None:
@@ -2364,9 +2394,9 @@ def approved_head(p: Project, head: str) -> dict | None:
 
 def approved_landing(p: Project, repo: Path) -> tuple[str, str]:
     """(HEAD, "") when this checkout's HEAD may land as a head an independent review approved
-    (delivery.code_tasks_may_push true or "approved", the default), else (HEAD, why not). It also sets
-    APPROVED_ENV so the run's git wrapper (gitguard.py) lets this push through; a raw `git push`
-    carries no approved head and stays refused."""
+    (delivery.code_tasks_may_push true or "approved", the default), else (HEAD, why not). It also
+    writes this process's approval marker (_mark_approved), so the run's git wrapper (gitguard.py) lets
+    this push of exactly HEAD through; a raw `git push` has no such marker and stays refused."""
     head = _git(repo, "rev-parse", "HEAD").stdout.strip()
     if not approved_heads_may_push(p.config()):
         return head, ("delivery.code_tasks_may_push is off (or no delivery.push_branch): only a review or the "
@@ -2374,7 +2404,7 @@ def approved_landing(p: Project, repo: Path) -> tuple[str, str]:
     if not approved_head(p, head):
         return head, (f"no independent review approved HEAD {head[:10]}: queue a review of it; once it passes "
                       f"(an approved push queue row at exactly this commit) `ttp push --land` may land it")
-    os.environ[APPROVED_ENV] = head
+    _mark_approved(p, head)
     return head, ""
 
 
@@ -2814,7 +2844,7 @@ def _resolve(p: Project, repo: Path, own: bool = False) -> tuple[str, str, bool]
     if task and (why := code_run_landing(p, task, f"{remote}/{push_to}", d, repo)):
         raise ValueError(why)
     if m and task and m.group(1) == task:
-        if (approved := os.environ.get(APPROVED_ENV)) and not code_tasks_may_push(p.config()) \
+        if (approved := (approval_marker(p, os.getpid()) or {}).get("sha")) and not code_tasks_may_push(p.config()) \
                 and approved == _git(repo, "rev-parse", "HEAD").stdout.strip() and approved_head(p, approved):
             say = (f"ttp push: task #{task} lands its own branch {branch} on {remote}/{push_to}: an independent "
                    f"review approved its head {approved[:10]}")

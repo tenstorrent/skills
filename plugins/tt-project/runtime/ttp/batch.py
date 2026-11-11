@@ -1759,6 +1759,8 @@ class Batch:
         if head is None:
             return self._close(0, "yielded" if self.yielded_to else "tip_failed" if failed is None else "nothing",
                                carried, failed)
+        # An express landing never waits for the push lock: it takes it if free, else pushes without it.
+        # The push has no --force, so a tip the lock's holder moved is never overwritten ("moved").
         if self.express and self.target_lock is None:   # the batch it ran beside may be done: hold the lock to push
             self.target_lock = push.take(self.p, self.remote, self.branch, 0, say=lambda _m: None,
                                          who=f"push batch {self.id}")

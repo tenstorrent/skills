@@ -137,8 +137,10 @@ def auto(p: Project, name: str, log=lambda m: None, now: float | None = None) ->
     seen = db.kv(AUTO_KV) or {}
     for qid in hot:
         row = db.one("SELECT * FROM push_queue WHERE id=?", (qid,))
+        if not row:
+            continue
         key = f"{qid}:{row['head']}"
-        if not row or seen.get(key, 0) >= AUTO_TRIES:
+        if seen.get(key, 0) >= AUTO_TRIES:
             continue
         _, why = eligible(p, str(qid), row)
         seen[key] = AUTO_TRIES if why else seen.get(key, 0) + 1

@@ -204,3 +204,24 @@ def test_the_push_queue_lands_a_priority_1_approval_express_while_a_regular_batc
     assert m.get("outcome") == "pushed", m
     assert [e["id"] for e in m["entries"]] == [row]
     assert push._read(running)["phase"] == "checking", "the running batch was left alone"
+
+
+def test_an_express_landing_whose_push_lock_stays_busy_pushes_only_a_fast_forward(env, monkeypatch):
+    """The push lock stays held through the express landing's push: it does not wait for the lock. It
+    pushes without --force, so a tip the lock's holder moved meanwhile is never overwritten."""
+    from ttp import push
+    where, flag = env["tmp"] / "other-path", env["tmp"] / "moved"
+    move = (f'test -f {flag} || {{ touch {flag} && o="$(cat {where})" && git -C "$o" commit -q --allow-empty '
+            f'-m outside && git -C "$o" push -q origin HEAD:proj; }}')
+    p, repo, origin, other = _bump_setup(env, monkeypatch, [move])
+    where.write_text(str(other))
+    head = _entry(repo, "e1", {"plugins/p/f1.txt": "1\n"})
+    held = push.take(p, "origin", "proj", 0, who="push batch batch-1")
+    try:
+        rc, m = _run_batch(p, _express_marker(p, [head]), monkeypatch)
+    finally:
+        held.close()
+    outside = _git_out(other, "rev-parse", "HEAD")
+    assert flag.exists() and _git_out(origin, "merge-base", "--is-ancestor", outside, "proj") == "", m
+    # moved under it, it lands on the new tip (rebased) or yields; either way the outside commit stays
+    assert m["outcome"] != "pushed" or _git_out(origin, "show", "proj:plugins/p/f1.txt") == "1", m

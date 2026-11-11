@@ -33,7 +33,8 @@ at run time is refused again at run time: `ttp push` (cli.cmd_push) and the harn
 wrapper (gitguard.main) refuse a landing or any `git push` in a coordinator run (coordinator_run: FULL_ENV,
 or ROLE_ENV, which the daemon sets for every run), except `ttp push` (or `--land`) of a HEAD an independent
 review approved (push.approved_landing, delivery.code_tasks_may_push "approved", the default): its own
-`git push` carries that head (push.APPROVED_ENV), which gitguard checks against the push queue. A coordinator run also holds no device
+`git push` passes only as a child of that `ttp push`, sending exactly the head its approval marker
+records (push._mark_approved, gitguard.approved_push). A coordinator run also holds no device
 (TTP_NO_DEVICE=1), so the worker device-command refusals (hook.device_command) bind it (heavy device work
 goes to a worker). Event text stays untrusted data (later hardening: #6095, #6098). A stateless turn
 (a provider with no session) never gets them.
