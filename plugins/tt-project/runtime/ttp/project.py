@@ -312,6 +312,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
                     # waits) start no sooner than this long after the last turn ended, unless a slot is
                     # free with nothing ready to fill it (eventhold.py; 0: off).
                     "event_hold_s": 900,
+                    # A session coordinator's answer is dry-run against the checks coord.apply makes
+                    # before its turn ends, and refused actions come back once in the same turn to fix
+                    # (coordprecheck.py); false sends every answer straight to apply.
+                    "answer_precheck": True,
                     # Event-only batches with no immediate event (task ends, hand-offs, timers, waits)
                     # wake at most once per this long after the last turn ended, a free slot included;
                     # user messages, immediate events and the ends of hot tasks (a fresh urgent: line or

@@ -1901,11 +1901,33 @@ def _must(o: dict, replan: bool = False) -> dict:
                          **({"replan": True} if replan else {})}}
 
 
-def _when(value, what: str) -> float:
+def _when(value, what: str, p=None) -> float:
     try:
-        return _due(value)
+        return _due(_home_time(value, p))
     except ValueError as e:
         raise ValueError(f"{what}: {str(e).replace('milestone due', 'a time')}") from e
+
+
+def _home_time(value, p):
+    """A due given without a zone (an ISO date and time, or a bare clock time such as '18:05') read in
+    project `p`'s home zone, as the coordinator prompt says a time it sets without one is: a mechanical
+    fill from the project's settings (task #8429). A clock time is its next one there. Any other value,
+    a date alone among them, comes back unchanged for _due to judge."""
+    if p is None or not isinstance(value, str):
+        return value
+    s = value.strip()
+    try:
+        from zoneinfo import ZoneInfo
+        from . import timefmt
+        zone = timefmt.home(p)
+        if re.fullmatch(r"([01]?[0-9]|2[0-3]):[0-5][0-9]", s):
+            from .coordinator import parse_start_after
+            return parse_start_after(s, tz=zone) or value
+        if len(s) > 10 and (dt := datetime.fromisoformat(s)).tzinfo is None:
+            return dt.replace(tzinfo=ZoneInfo(zone)).timestamp()
+    except (ValueError, KeyError, OSError):
+        pass
+    return value
 
 
 def _hours(p) -> float:
@@ -1979,8 +2001,8 @@ def add_order(p, text: str, message: int, owners=(), due=None, start_by=None, ac
     row = p.db.one("SELECT ts, chat FROM messages WHERE id=? AND direction='in'", (int(message),))
     if not row:
         raise ValueError(f"order: #{message} is not a user message")
-    due_at = _when(due, "order due") if due not in (None, "") else None
-    start_at = _when(start_by, "order start_by") if start_by not in (None, "") else float(row["ts"]) + ORDER_START_S
+    due_at = _when(due, "order due", p) if due not in (None, "") else None
+    start_at = _when(start_by, "order start_by", p) if start_by not in (None, "") else float(row["ts"]) + ORDER_START_S
     with p.db.tx():
         ids = _owners_known(p.db, owners)
         st = _load(p.db)
@@ -2163,7 +2185,7 @@ def check_claims(claims, p, new_tasks=None) -> None:
         if c.get("expect") not in (None, ""):
             check_start_when(str(c["expect"]), p)
         if c.get("due") not in (None, ""):
-            _when(c["due"], "claim due")
+            _when(c["due"], "claim due", p)
 
 
 def record_claims(p, sent: list[tuple[int, str | None, list]], new_tasks: dict[int, int],
@@ -2186,7 +2208,7 @@ def record_claims(p, sent: list[tuple[int, str | None, list]], new_tasks: dict[i
                     notes.append(f"claim not tracked: action {c['action']} added no task ({str(c['text'])[:80]})")
                     continue
             expect = str(c["expect"]) if c.get("expect") not in (None, "") else None
-            due = _when(c["due"], "claim due") if c.get("due") not in (None, "") else \
+            due = _when(c["due"], "claim due", p) if c.get("due") not in (None, "") else \
                 now if expect else now + _hours(p) * 3600
             todo.append((mid, _chat(chat), " ".join(str(c["text"]).split())[:TEXT_MAX], task, expect, due,
                          c.get("due") not in (None, "")))
@@ -2334,7 +2356,7 @@ def set_due(p, oid: str, due, now: float | None = None, plan: str | None = None,
     for it); else it is refused (replan.py)."""
     from . import replan, timefmt
     now = time.time() if now is None else now
-    at = _when(due, f"{oid} due")
+    at = _when(due, f"{oid} due", p)
     with p.db.tx():
         st = _load(p.db)
         o = _need(st, oid)

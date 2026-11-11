@@ -2160,6 +2160,13 @@ def cmd_stats(a) -> None:
         s = babysit.stats(p.db, since, until)
         print(json.dumps(s, indent=1) if a.json else babysit.stats_text(s, p.name, tz))
         return
+    if getattr(a, "rejections", False):
+        from . import rejtally
+        if a.json:
+            print(json.dumps(p.db.kv(rejtally.KEY, {}) or {}, indent=1))
+        else:
+            print("\n".join(rejtally.lines(p.db, max(1, int(a.days or 1))) or [f"{p.name}: no action refusals tallied"]))
+        return
     if a.wakes:
         from . import waketier
         s = waketier.stats(p.db, timefmt.home(p), a.days)
@@ -14902,6 +14909,9 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--by-class", action="store_true",
                    help="runs per run class per model per hour with real cost instead (runclass.py); "
                         "--since 1h or 24h (the default) or a time")
+    s.add_argument("--rejections", action="store_true",
+                   help="coordinator action refusals per reason class instead (rejtally.py): caught by the "
+                        "in-turn dry run and refused after the turn, over --days")
     s.add_argument("--wakes", action="store_true",
                    help="task wakes per day by reason instead: runs, $, re-waits and who chose the tier")
     s.add_argument("--effort-ab", action="store_true",

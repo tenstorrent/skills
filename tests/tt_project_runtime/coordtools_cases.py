@@ -1295,3 +1295,89 @@ def test_a_full_task_cap_denial_names_the_next_slot_and_asks_the_wake_instead_of
     p.set_config("coordinator.max_new_tasks_per_day", 0)
     (why,) = [w for _, w in coordprecheck.problems(p, [add])]
     assert "is 0" in why and "unchanged" not in why
+
+
+def test_the_in_turn_dry_run_catches_sweeps_claims_and_naive_dues_and_fills_the_home_zone(env, tmp_path, monkeypatch):
+    from ttp import coordinator as coord, coordprecheck, obligations, timefmt
+    p = make(env)
+    tid = p.db.add_task("stuck", "s", origin="user")
+    p.db.update_task(tid, status="blocked")
+    bad = [{"type": "sweep", "outcome": "still_blocked"},
+           {"type": "sweep", "id": tid, "outcome": "still_blocked", "until": "the box is back"},
+           {"type": "sweep", "id": tid, "outcome": "nope"},
+           {"type": "reply", "chat": "c", "text": "t", "claims": [{"text": "x", "task": tid, "state": "bogus"}]}]
+    got = dict(coordprecheck.problems(p, bad))
+    assert set(got) == {0, 1, 2, 3}, got
+    assert "start_after" in got[1] and "outcome" in got[2]
+    for a in bad:   # each is refused by apply too
+        assert coord.apply(p, [a]), a
+    ok = {"type": "sweep", "id": tid, "outcome": "still_blocked", "until": "the box is back", "start_after": "2h"}
+    assert coordprecheck.problems(p, [ok]) == []
+    # A due without a zone is read in the project's home zone, not refused.
+    home = timefmt.home(p)
+    from zoneinfo import ZoneInfo
+    import datetime as dt
+    want = dt.datetime(2031, 5, 6, 18, 0, tzinfo=ZoneInfo(home)).timestamp()
+    assert obligations._when("2031-05-06 18:00", "claim due", p) == want
+
+
+def test_a_denied_answer_is_resent_fixed_once_and_the_retry_wakes_no_turn(env, tmp_path, monkeypatch):
+    from ttp import coordinator as coord, coordprecheck, rejtally
+    from ttp.daemon import Daemon
+    p = make(env)
+    bad = [{"type": "task_update", "id": 424242, "status": "queued"}]
+    decision, why = _answer(p, tmp_path, monkeypatch, bad, run="r1")
+    assert decision == "deny" and "actions[0] (task_update)" in why and "once" in why
+    caught = coordprecheck.retried(tmp_path / "r1")
+    assert len(caught) == 1 and caught[0].startswith("task_update:")
+    # The fixed resend goes through and applies.
+    fixed = [{"type": "task_add", "title": "fresh work", "spec": "do it"}]
+    assert _answer(p, tmp_path, monkeypatch, fixed, run="r1") == (None, "")
+    assert coord.apply(p, fixed) == []
+    # A second bad answer in the same run is not denied again: apply refuses it after the turn.
+    assert _answer(p, tmp_path, monkeypatch, [{"type": "task_update", "id": 434343}], run="r1") == (None, "")
+    # The daemon records the turn's refusals as retried: no repair turn, no raised trigger; both tallied.
+    problems = coord.apply(p, [{"type": "task_update", "id": 434343}])
+    assert problems
+    Daemon(p.base)._record_rejections(problems, backed=True, retried=caught)
+    assert p.db.kv(coord.REJECTED_RETRIED_KEY) is True and p.db.kv(coord.REJECTED_BACKED_KEY) is False
+    assert not coord.rejection_due(p.db, time.time() + 10 * coord.REJECTION_WAIT_S)
+    assert p.db.kv(coord.REJECTED_KEY) == problems   # still shown in the next digest
+    day = next(iter(p.db.kv(rejtally.KEY)))
+    assert sum(c for c, _ in p.db.kv(rejtally.KEY)[day].values()) == 1
+    assert sum(r for _, r in p.db.kv(rejtally.KEY)[day].values()) == len(problems)
+    assert rejtally.lines(p.db)[0].startswith("action refusals (1d): 1 caught in turn")
+    # A turn that was not retried keeps today's wake after REJECTION_WAIT_S.
+    Daemon(p.base)._record_rejections(problems)
+    assert p.db.kv(coord.REJECTED_RETRIED_KEY) is False
+    assert coord.rejection_due(p.db, time.time() + 2 * coord.REJECTION_WAIT_S)
+
+
+def test_the_answer_precheck_off_switch_sends_every_answer_to_apply(env, tmp_path, monkeypatch):
+    from ttp import coordinator as coord, coordprecheck
+    p = make(env)
+    bad = [{"type": "task_update", "id": 515151}]
+    assert coordprecheck.enabled(p.config())
+    assert coord.USER_SETTABLE["coordinator.answer_precheck"](False) is False
+    p.set_config("coordinator.answer_precheck", False)
+    assert not coordprecheck.enabled(p.config())
+    assert _answer(p, tmp_path, monkeypatch, bad, run="off") == (None, "")
+    assert coordprecheck.retried(tmp_path / "off") == []
+    assert coordprecheck.after_turn(p, {"provider": "codex", "started": time.time()}, ["task_update: x"]) == []
+    p.set_config("coordinator.answer_precheck", True)
+    assert _answer(p, tmp_path, monkeypatch, bad, run="on")[0] == "deny"
+
+
+def test_a_provider_without_the_answer_hook_gets_one_second_pass_in_its_session(env, tmp_path, monkeypatch):
+    from ttp import coordinator as coord, coordprecheck
+    p = make(env)
+    t0 = time.time()
+    refused = ["task_update: no task #616161"]
+    assert coordprecheck.after_turn(p, {"provider": "claude", "started": t0}, refused) == []   # the hook did it
+    assert coordprecheck.after_turn(p, {"provider": "codex", "started": t0}, refused, now=t0) == []
+    ev = p.db.q("SELECT text,status FROM events WHERE kind='answer_precheck_pass'")
+    assert len(ev) == 1 and ev[0]["status"] == "queued" and "616161" in ev[0]["text"]
+    # The next turn is that pass: its refusals count as retried, and it queues no further pass.
+    assert coordprecheck.after_turn(p, {"provider": "codex", "started": t0 + 5}, refused) == refused
+    assert p.db.kv(coordprecheck.PASS_KEY) is None
+    assert len(p.db.q("SELECT 1 FROM events WHERE kind='answer_precheck_pass'")) == 1

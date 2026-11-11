@@ -38,6 +38,8 @@ from pathlib import Path
 
 from . import runtimeload   # first of its own: its LOADED_AT is when the daemon imported its code
 from . import batchrun
+from . import coordprecheck
+from . import rejtally
 from . import untrusted
 from . import branchcap
 from . import localfault
@@ -6810,9 +6812,14 @@ class Daemon:
             except Exception:   # bookkeeping: the turn is settled either way
                 log(self.p, "coordinator turn gate record failed: "
                     + traceback.format_exc().replace("\n", " | ")[:1000])
+        try:   # what the in-turn dry run caught and had the session resend (coordprecheck)
+            caught = coordprecheck.retried(self._run_dir(r)) \
+                or coordprecheck.after_turn(self.p, r, [str(x) for x in problems])
+        except Exception:   # bookkeeping: without it the rejections wake as before
+            caught = []
         self._record_rejections([coord.clip_rejection(x) for x in problems],
                                 backed=any(isinstance(a, dict) and a.get("type") in coord.BACKING_ACTIONS
-                                           for a in actions or []))
+                                           for a in actions or []), retried=caught)
         try:
             rejcool.start(db, self.cfg, evs, problems)   # its triggers' same cause does not wake again at once
         except Exception:   # bookkeeping: without it the next repeat wakes as before
@@ -7025,7 +7032,7 @@ class Daemon:
         """What the turn decided, for the daily review's audit of turns that decided nothing."""
         self.p.db.x("UPDATE runs SET note=? WHERE id=?", (json.dumps({**note, "decided": decided}), r.get("id")))
 
-    def _record_rejections(self, problems: list[str], backed: bool = False) -> None:
+    def _record_rejections(self, problems: list[str], backed: bool = False, retried=()) -> None:
         """Rejected actions reach the next turn's digest (kv, so a restart keeps them): they ride along
         with the next turn something else starts, and start one only once coord.REJECTION_WAIT_S passed
         with none (coord.rejection_due), in session mode too (the events section is sent every wake).
@@ -7033,13 +7040,22 @@ class Daemon:
         rest on the refused action: then the next turn something else starts raises them as a trigger
         (coord.REJECTED_BACKED_KEY) rather than carrying them; they still start no turn of their own sooner.
         A rejection repeated on consecutive turns is a harness problem and is recorded once; the next
-        digest marks it as a repeat so it is not sent again as is."""
+        digest marks it as a repeat so it is not sent again as is.
+        `retried`: what the in-turn dry run caught (coordprecheck.retried): the session already had one
+        resend, so what apply still refused rides along with the next turn and wakes none itself
+        (coord.REJECTED_RETRIED_KEY). Both are tallied per reason class for `ttp stats` (rejtally)."""
         db = self.p.db
         before = set(db.kv(coord.REJECTED_KEY, []) or [])
+        again = bool(problems and retried)
         with db.tx():   # the set and its time together: a restart between them never drops or rushes it
             db.set_kv(coord.REJECTED_KEY, problems)
             db.set_kv(coord.REJECTED_AT_KEY, time.time())
-            db.set_kv(coord.REJECTED_BACKED_KEY, bool(problems and backed))
+            db.set_kv(coord.REJECTED_BACKED_KEY, bool(problems and backed and not again))
+            db.set_kv(coord.REJECTED_RETRIED_KEY, again)
+        try:
+            rejtally.record(db, list(retried or []), problems)
+        except Exception:   # bookkeeping: the tally is a statistic
+            log(self.p, "rejection tally not recorded: " + traceback.format_exc().replace("\n", " | ")[:1000])
         db.set_kv(coord.AGAIN_KEY, [coord.rejection_key(x) for x in problems if x in before])
         if not problems:
             return

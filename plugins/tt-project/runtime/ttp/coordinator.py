@@ -605,6 +605,8 @@ USER_SETTABLE = {
     "coordinator.wake_cost_alarm_usd": lambda v: wakecost.threshold_of(v),
     # The project's own model-free settle hook for routine event batches (settlehook.py): "" is off.
     "coordinator.settle_cmd": settlehook.cmd_of,
+    # The in-turn dry run of a session coordinator's answer (coordprecheck.py): true (default) or false.
+    "coordinator.answer_precheck": lambda v: v is True or str(v).strip().lower() in ("1", "true", "yes", "on"),
 }
 
 
@@ -654,6 +656,9 @@ REJECTION_WAIT_S = 3600.0
 # kv: that turn also sent a reply, notify or obligation (BACKING_ACTIONS) that may rest on the refusal.
 # It raises the next turn something else starts (effort_triggers), never starts one (rejection_due).
 REJECTED_BACKED_KEY = "rejected_actions_backed"
+# kv: that turn already resent its answer once in the session after the in-turn dry run (coordprecheck):
+# its rejections ride along with the next turn and never start or raise one themselves.
+REJECTED_RETRIED_KEY = "rejected_actions_retried"
 REJECTED_REPLY_KEY = "rejected_after_reply"   # kv: that turn also sent the user a reply
 REPEATS_KEY = "rejected_repeats"   # kv: hashes of rejections already recorded as repeated (an event each, once)
 AGAIN_KEY = "rejected_again"   # kv: hashes of the last turn's rejections that repeat the turn before's
@@ -2112,7 +2117,10 @@ REJECTION_DUE = "rejection"   # the wake_due of a turn started for a rejection n
 def rejection_due(db, now: float | None = None) -> bool:
     """Whether the last turn's rejections (not information-only ones) have waited REJECTION_WAIT_S for a
     turn to carry them: then they start one. A set with no recorded time (written before it was
-    kept) counts from the last turn's start, the turn that recorded it."""
+    kept) counts from the last turn's start, the turn that recorded it. A turn that already retried
+    its answer in the session (REJECTED_RETRIED_KEY) starts none: the next turn carries them."""
+    if db.kv(REJECTED_RETRIED_KEY, False):
+        return False
     if not [x for x in db.kv(REJECTED_KEY, []) or [] if not informational_rejection(str(x))]:
         return False
     at = db.kv(REJECTED_AT_KEY)
@@ -4235,7 +4243,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 if a.get("order") is not None and not oid:   # the order a user message carries
                     had = obligations.open_order(db, int(a["order"]))
                     move = had is not None and a.get("due") not in (None, "") \
-                        and obligations._when(a["due"], "order due") != had["promise"]["due"]
+                        and obligations._when(a["due"], "order due", p) != had["promise"]["due"]
                     new = sorted(set(owners) - set(obligations._owner_ids(had))) if move else []
                     notes.append(obligations.add_order(p, str(a.get("text") or ""), int(a["order"]), owners,
                                                        due=None if move else a.get("due"), start_by=a.get("start_by"),
