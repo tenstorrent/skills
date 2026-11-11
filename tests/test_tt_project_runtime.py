@@ -27400,6 +27400,7 @@ DURABLE_EXEMPT = {
     ("churnwatch.py", 'os.replace(f, f.with_name(f.name + ".1"))'): "rotates that churn log to .1 past its cap: a rename lost to a crash leaves the old file, rotated on the next event",
     ("project.py", 'os.replace(log, log.with_name(log.name + ".1"))'): "rotates the protected-writes log to .1 past its cap: a rename lost to a crash leaves the old file, rotated on the next write",
     ("project.py", "os.replace(src, dst)"): "memory archive move: a rename, both directories synced after",
+    ("modelsuite.py", "os.replace(d / REQUESTS, d / TAKEN)"): "takes the model-bench requests file by renaming it (contents unchanged), its directory synced after; a rename lost to a crash leaves the requests file, read on the next run",
     ("project.py", "os.replace(a, b)"): "rolled-back memory retirement moves the file back: a rename, both directories synced after",
     ("gitlocks.py", "os.replace(path, to)"): "moves a stale git lock aside, never its content; a rename lost to a crash leaves the lock for the next sweep",
     ("cleantree.py", 'open(self.dir / LOCK, "w")'): "an empty flock file in a temp checkout folder; only the lock is used, never its content",

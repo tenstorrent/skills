@@ -65,6 +65,8 @@ def requested(d: Path) -> list[str]:
     dropped by done(), so a request a crash interrupted is read again next run."""
     if (d / REQUESTS).exists() and not (d / TAKEN).exists():
         os.replace(d / REQUESTS, d / TAKEN)
+        from .project import fsync_dir
+        fsync_dir(d)
     out = []
     for line in (d / TAKEN).read_text().splitlines() if (d / TAKEN).exists() else []:
         try:
