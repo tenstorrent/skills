@@ -3270,15 +3270,6 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                                                                and lb[5:] in names)] + [f"{kind_label}:{r}" for r in names]
                     if "needs_device" not in keep and set(names) & locks.device_locks(cfg):
                         upd["labels"].append("needs_device")
-                if a.get("resources_read") is not None:
-                    if task["status"] == "running":
-                        raise InfoRejection(f"task #{task['id']} is running: its resources change only while it is "
-                                         f"not; cancel it and re-add it with `continues` to move it now")
-                    have = upd.get("labels", json.loads(task["labels"] or "[]"))
-                    full = [lb.split(":", 1)[1] for lb in have if isinstance(lb, str)
-                            and lb.split(":", 1)[0] in ("resource", "exclusive")]
-                    upd["labels"] = [lb for lb in have if not (isinstance(lb, str) and lb.startswith("read:"))] \
-                        + read_labels(a["resources_read"], full, t, problems)
                     prev = load_result(upd.get("result") or task["result"])
                     if upd.get("status", task["status"]) == "queued" and task["not_before"] \
                             and prev.get("status") == "waiting" and not deferral(task):
@@ -3303,6 +3294,15 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                             prev.setdefault("retry_when_orig", probe)
                             prev["retry_when"] = rest
                             upd["result"] = dump_result(prev)
+                if a.get("resources_read") is not None:
+                    if task["status"] == "running":
+                        raise InfoRejection(f"task #{task['id']} is running: its resources change only while it is "
+                                         f"not; cancel it and re-add it with `continues` to move it now")
+                    have = upd.get("labels", json.loads(task["labels"] or "[]"))
+                    full = [lb.split(":", 1)[1] for lb in have if isinstance(lb, str)
+                            and lb.split(":", 1)[0] in ("resource", "exclusive")]
+                    upd["labels"] = [lb for lb in have if not (isinstance(lb, str) and lb.startswith("read:"))] \
+                        + read_labels(a["resources_read"], full, t, problems)
                 branch_line = ""
                 if a.get("pr_branch") is not None:
                     # "" carries no branch (its own label or one inherited through `continues`): it delivers
