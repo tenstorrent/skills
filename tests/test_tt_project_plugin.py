@@ -1340,6 +1340,46 @@ def test_the_forked_test_runner_reports_every_test_once_as_one_process_would(tmp
     assert single.returncode != 0 and "2 failed" not in single.stdout, single.stdout
 
 
+def test_the_forked_test_runner_ends_a_test_past_the_per_test_limit_and_runs_the_rest_on_a_new_worker(tmp_path):
+    """A hung test held its worker until `ttp checks`' silence limit ended the whole run. Past
+    TTP_TEST_LIMIT_S its worker dumps its stacks and exits; the test is FAILED naming the limit, with the
+    dump, and a new worker runs what the ended one took, so every other test still passes. 0 turns it off."""
+    import shutil
+    import subprocess
+    import time
+    shutil.copy(pathlib.Path(__file__).with_name("conftest.py"), tmp_path / "conftest.py")
+    (tmp_path / "test_tt_project_sample.py").write_text(
+        "import os, pathlib, time, pytest\n"
+        "def test_hang(): time.sleep(float(os.environ['SLEEP']))\n"
+        "@pytest.mark.parametrize('i', range(60))\n"
+        "def test_ok(i):\n"
+        "    pathlib.Path(os.environ['OUT'], f'ok-{i}').write_text(str(os.getpid()))\n")
+
+    def run(limit, sleep):
+        out = tmp_path / f"out-{limit}"
+        out.mkdir()
+        env = _nested_pytest_env(TTP_TEST_JOBS="2", TTP_TEST_LIMIT_S=limit, SLEEP=sleep, OUT=str(out),
+                                 TTP_TEST_DURATIONS="off")
+        start = time.monotonic()
+        r = subprocess.run([sys.executable, "-m", "pytest", "-q", "-rf", "-p", "no:cacheprovider", str(tmp_path)],
+                           cwd=str(tmp_path), env=env, capture_output=True, text=True, timeout=120)
+        return r, out, time.monotonic() - start
+
+    ended, out, wall = run("2", "100")
+    assert ended.returncode == 1, ended.stdout
+    assert "1 failed, 60 passed" in ended.stdout, ended.stdout
+    assert wall < 60, f"the hung test was not ended within its limit ({wall:.0f} s)"
+    report = ended.stdout.split(" test_hang ", 1)[1]
+    assert re.match(r"_+\ntest_tt_project_sample.py::test_hang ran past the per-test limit of 2 s \(TTP_TEST_LIMIT_S "
+                    r"sets it, 0 turns it off\): its test worker process \d+ was ended and a new one runs the rest",
+                    report), ended.stdout
+    assert re.search(r'File ".*test_tt_project_sample.py", line 2 in test_hang', report), ended.stdout
+    assert "ran past the per-test limit of 2 s" in ended.stderr, "the dump also goes to stderr at once"
+    assert len({(out / f"ok-{i}").read_text() for i in range(60)}) >= 2
+    # Off: the same test runs to its end and passes.
+    off, _, _ = run("0", "3")
+    assert off.returncode == 0 and "61 passed" in off.stdout, off.stdout
+
 
 def test_the_forked_test_runner_names_a_test_that_closes_or_replaces_its_workers_pipe_fds(tmp_path):
     """A test that closed a worker's report pipe, or closed its queue fd and opened another file on that
@@ -2002,6 +2042,14 @@ def test_a_hung_tt_project_test_dumps_its_stacks_after_a_generous_timeout_and_ot
     assert c.stack_dump_s(cfg, "tests/test_tt_project_runtime.py", {"TTP_TEST_STACK_DUMP_S": "30"}) == 30
     assert c.stack_dump_s(cfg, "tests/test_tt_project_runtime.py", {"TTP_TEST_STACK_DUMP_S": "x"}) == c.STACK_DUMP_S
     assert c.stack_dump_s(_IniConfig(timeout="60"), "tests/test_tt_project_runtime.py", {}) == 0
+    # In a forked worker the test is ended at TEST_LIMIT_S instead, under the same limit and scope.
+    assert 0 < c.TEST_LIMIT_S <= silent / 2 and c.LIMIT_GRACE_S < silent - c.TEST_LIMIT_S
+    assert c.test_limit_s(cfg, "tests/test_tt_project_runtime.py", {}) == c.TEST_LIMIT_S
+    assert c.test_limit_s(cfg, "tests/test_tt_buddy_plugin.py", {}) == 0
+    assert c.test_limit_s(cfg, "tests/test_tt_project_runtime.py", {"TTP_TEST_LIMIT_S": "0"}) == 0
+    assert c.test_limit_s(cfg, "tests/test_tt_project_runtime.py", {"TTP_TEST_LIMIT_S": "20"}) == 20
+    assert c.test_limit_s(cfg, "tests/test_tt_project_runtime.py", {"TTP_TEST_LIMIT_S": "x"}) == c.TEST_LIMIT_S
+    assert c.test_limit_s(_IniConfig(timeout="60"), "tests/test_tt_project_runtime.py", {}) == 0
 
 
 def test_the_stack_dump_is_armed_around_a_tt_project_test_and_cancelled_after_it_never_killing(monkeypatch):
@@ -2012,8 +2060,13 @@ def test_the_stack_dump_is_armed_around_a_tt_project_test_and_cancelled_after_it
     monkeypatch.setattr(faulthandler, "cancel_dump_traceback_later", lambda: calls.append(("cancel",)))
     monkeypatch.delenv("TTP_TEST_STACK_DUMP_S", raising=False)
 
-    def run(path, fd=7):
-        item = types.SimpleNamespace(config=_IniConfig(fd=fd), path=pathlib.Path(path))
+    monkeypatch.delenv("TTP_TEST_LIMIT_S", raising=False)
+
+    def run(path, fd=7, limit_fd=None):
+        config = _IniConfig(fd=fd)
+        if limit_fd is not None:
+            config._ttp_limit_fd = limit_fd
+        item = types.SimpleNamespace(config=config, path=pathlib.Path(path))
         gen = c.pytest_runtest_protocol(item, None)
         next(gen)
         armed = list(calls)
@@ -2026,6 +2079,12 @@ def test_the_stack_dump_is_armed_around_a_tt_project_test_and_cancelled_after_it
     calls.clear()
     assert run("tests/test_tt_buddy_plugin.py") == [] and calls == [], "another plugin's test is untouched"
     assert run("tests/test_tt_project_runtime.py", fd=None) == [] and calls == [], "no stderr copy: nothing armed"
+    # In a forked worker (its stacks file set) the timer ends the worker at the per-test limit.
+    assert run("tests/test_tt_project_runtime.py", limit_fd=9) == [("arm", c.TEST_LIMIT_S, {"exit": True, "file": 9})]
+    assert calls[-1] == ("cancel",)
+    calls.clear()
+    monkeypatch.setenv("TTP_TEST_LIMIT_S", "0")
+    assert run("tests/test_tt_project_runtime.py", limit_fd=9) == [("arm", c.STACK_DUMP_S, {"exit": False, "file": 7})]
 
 
 def _version(text):

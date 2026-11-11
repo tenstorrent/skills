@@ -45,6 +45,14 @@ slowest test call (about 30 s) and below `ttp checks`' silence limit (checkwall.
 hung test's stack is in the checks log before that limit ends the run. TTP_TEST_STACK_DUMP_S sets it (0:
 off); a faulthandler_timeout set in pytest's own config wins.
 
+In a forked worker a tt-project test still running after TEST_LIMIT_S (TTP_TEST_LIMIT_S; 0: off) is
+ended instead: the worker dumps every thread's stack to a file of its own and exits (faulthandler's
+exit=True, so a test stuck in C code ends too), and the main process kills a worker still in that test
+LIMIT_GRACE_S later. The test is reported FAILED with a line naming the limit and the stack dump, which
+also goes to stderr at once, and a new worker runs the rest of what the ended one took, so the run goes
+on and its output keeps flowing well before `ttp checks`' silence limit. That timer replaces the
+STACK_DUMP_S one in a forked worker; a faulthandler_timeout set in pytest's own config turns it off.
+
 Every test ends with the process's signal handlers and signal mask as they were before it
 (`_signals_kept`): a handler a test's in-process command installed and never restored (`ttp lock`'s
 wait exits 128 + the signal) made a later signal test in the same worker pass or fail by test order.
@@ -77,6 +85,8 @@ WORKER_NICE = 10
 FD_LOST_EXIT = 97      # a worker's own exit when a test closed or replaced one of its pipe fds
 _SHARDED = "test_tt_project_"
 STACK_DUMP_S = 480.0   # a tt-project test running this long dumps its stacks (faulthandler; kills nothing)
+TEST_LIMIT_S = 300.0   # in a forked worker, a tt-project test running this long is ended and FAILED
+LIMIT_GRACE_S = 30.0  # the main process kills a worker still in that test this much later
 # A suite run inside a tt-project worker (`ttp checks`, a worker's own pytest) inherits the run's
 # variables: its task, run folder, project, device and hand-off guards, and the agent CLI's session.
 # Tests set what they need, so the session starts without them; the test-slot, port, check-output
@@ -889,6 +899,18 @@ def stack_dump_s(config, path, environ=os.environ) -> float:
         return STACK_DUMP_S
 
 
+def test_limit_s(config, path, environ=os.environ) -> float:
+    """Seconds after which a forked worker ends test file `path`'s running test: TEST_LIMIT_S (or
+    TTP_TEST_LIMIT_S) for a tt-project test file, else 0; 0 also when pytest's own faulthandler_timeout
+    is set (faulthandler has one timer, and that setting arms it)."""
+    if stack_dump_s(config, path, {}) == 0:
+        return 0.0
+    try:
+        return max(0.0, float(environ.get("TTP_TEST_LIMIT_S", TEST_LIMIT_S)))
+    except ValueError:
+        return TEST_LIMIT_S
+
+
 def _signals_kept():
     """The Python-level signal handlers and the signal mask now; calling the result puts back any a
     test changed (run in the main thread, where pytest runs the tests)."""
@@ -912,14 +934,18 @@ def _signals_kept():
 def pytest_runtest_protocol(item, nextitem):
     import faulthandler
     t, fd = stack_dump_s(item.config, item.path), getattr(item.config, "_ttp_dump_fd", None)
-    if t > 0 and fd is not None:
+    limit_fd = getattr(item.config, "_ttp_limit_fd", None)   # set in a forked worker only
+    limit = test_limit_s(item.config, item.path) if limit_fd is not None else 0.0
+    if limit > 0:
+        faulthandler.dump_traceback_later(limit, exit=True, file=limit_fd)
+    elif t > 0 and fd is not None:
         faulthandler.dump_traceback_later(t, exit=False, file=fd)
     restore = _signals_kept()
     try:
         yield
     finally:
         restore()
-        if t > 0 and fd is not None:
+        if limit > 0 or (t > 0 and fd is not None):
             faulthandler.cancel_dump_traceback_later()
 
 
@@ -1363,7 +1389,9 @@ class _Forward:
               lineno=warning_message.lineno, location=list(location) if location else None)
 
 
-def _worker(session, units, work_r: int, out_w: int) -> None:
+def _worker(session, units, work_r: int, out_w: int, first: int | None = None) -> None:
+    """Runs units from the shared queue; a worker replacing one that ran past the per-test limit
+    starts with unit `first`, the tests the ended worker took and did not finish."""
     config = session.config
     tr = config.pluginmanager.get_plugin("terminalreporter")
     if tr is not None:   # the main process prints; a worker's reporter writes nowhere
@@ -1379,7 +1407,7 @@ def _worker(session, units, work_r: int, out_w: int) -> None:
         _send(out_w, "take", unit=n)
         return units[n]
 
-    cur = take()
+    cur = units[first] if first is not None else take()
     while cur:
         nxt = take()   # the next item decides which fixtures this one's teardown keeps
         for j, item in enumerate(cur):
@@ -1413,17 +1441,23 @@ def _exit_code(status):
 
 
 def _run_forked(session, units, jobs: int) -> None:
+    import tempfile
     config, hook = session.config, session.config.hook
     factory = getattr(config, "_tmp_path_factory", None)
     if factory is not None:
         factory.getbasetemp()   # made once here; each worker takes its own folder in it
-    work_r, work_w = os.pipe()
+    work_r, work_w = os.pipe()   # the main process keeps work_r open for replacement workers
     os.write(work_w, b"".join(struct.pack("!I", n) for n in _order(units, _durations())))
     os.close(work_w)
-    sys.stdout.flush()
-    sys.stderr.flush()
+    items = {i.nodeid: i for u in units for i in u}
+    limits = {i.nodeid: test_limit_s(config, i.path) for i in items.values()}
     workers: dict[int, dict] = {}
-    for n in range(jobs):
+    sel = selectors.DefaultSelector()
+
+    def spawn(n: int, first: int | None = None) -> None:
+        sys.stdout.flush()
+        sys.stderr.flush()
+        stacks_fd, stacks = tempfile.mkstemp(prefix="ttp-test-stacks-")
         r, w = os.pipe()
         pid = os.fork()
         if pid == 0:
@@ -1431,7 +1465,8 @@ def _run_forked(session, units, jobs: int) -> None:
             try:
                 os.close(r)
                 for other in workers.values():
-                    os.close(other["fd"])
+                    if not other.get("closed"):
+                        os.close(other["fd"])
                 if not _on_ci(os.environ):
                     try:
                         os.nice(WORKER_NICE)   # the tests and what they start yield to other work
@@ -1439,31 +1474,36 @@ def _run_forked(session, units, jobs: int) -> None:
                         pass
                 if factory is not None:
                     _own_basetemp(factory, n)
-                _worker(session, units, work_r, w)
+                config._ttp_limit_fd = stacks_fd
+                _worker(session, units, work_r, w, first)
             except BaseException:   # noqa: BLE001 - the main process reports what this worker left
                 code = 1
             finally:
                 os._exit(code)
         os.close(w)
-        workers[pid] = {"fd": r, "buf": b"", "taken": [], "open": None}
-    os.close(work_r)
+        os.close(stacks_fd)
+        workers[pid] = {"fd": r, "buf": b"", "taken": [] if first is None else [first], "open": None,
+                        "stacks": stacks}
+        os.set_blocking(r, False)
+        sel.register(r, selectors.EVENT_READ, pid)
+
+    for n in range(jobs):
+        spawn(n)
     finished: set[str] = set()
-    sel = selectors.DefaultSelector()
-    for pid, wk in workers.items():
-        os.set_blocking(wk["fd"], False)
-        sel.register(wk["fd"], selectors.EVENT_READ, pid)
+    respawn: list[list] = []
 
     def handle(wk, msg):
         kind = msg["kind"]
         if kind == "take":
             wk["taken"].append(msg["unit"])
         elif kind == "start":
-            wk["open"] = msg["nodeid"]
+            wk["open"], wk["since"], wk["when"] = msg["nodeid"], time.monotonic(), "setup"
             hook.pytest_runtest_logstart(nodeid=msg["nodeid"], location=tuple(msg["location"]))
         elif kind == "report":
             rep = hook.pytest_report_from_serializable(config=config, data=msg["data"])
             if isinstance(rep.longrepr, list):   # a skip's (path, line, reason), a list after JSON
                 rep.longrepr = tuple(rep.longrepr)
+            wk["when"] = {"setup": "call", "call": "teardown"}.get(rep.when, "teardown")
             hook.pytest_runtest_logreport(report=rep)
         elif kind == "finish":
             wk["open"] = None
@@ -1475,6 +1515,41 @@ def _run_forked(session, units, jobs: int) -> None:
             hook.pytest_warning_recorded.call_historic(kwargs=dict(
                 warning_message=_warning(msg), when=msg["when"], nodeid=msg["nodeid"],
                 location=tuple(msg["location"]) if msg["location"] else None))
+
+    def ended(pid, wk) -> None:
+        """A worker that ran past the per-test limit (it dumped its stacks, or the main process killed
+        it): its open test is FAILED naming the limit, and a new worker runs the rest it took. A worker
+        that died any other way is failed after the loop, as before."""
+        try:
+            dump = Path(wk["stacks"]).read_text(errors="replace").strip()
+        except OSError:
+            dump = ""
+        nodeid = wk["open"]
+        limit = limits.get(nodeid, 0.0) if nodeid else 0.0
+        if not limit or not (dump or wk.get("killed")):
+            return
+        why = (f"{nodeid} ran past the per-test limit of {limit:g} s (TTP_TEST_LIMIT_S sets it, 0 turns it "
+               f"off): its test worker process {pid} was ended and a new one runs the rest")
+        if dump:
+            why += "\n\nThe worker's stacks when the limit passed:\n" + dump
+        else:
+            why += f"; it dumped no stacks and was killed {LIMIT_GRACE_S:g} s later"
+        fd = getattr(config, "_ttp_dump_fd", None)
+        if fd is not None:
+            try:
+                os.write(fd, f"\n{why}\n".encode())
+            except OSError:
+                pass
+        item = items[nodeid]
+        from _pytest.reports import TestReport
+        hook.pytest_runtest_logreport(report=TestReport(
+            nodeid, item.location, {}, "failed", why, wk.get("when", "call"),
+            duration=time.monotonic() - wk["since"]))
+        hook.pytest_runtest_logfinish(nodeid=nodeid, location=item.location)
+        finished.add(nodeid)
+        wk["open"] = None
+        respawn.append([i for n in wk["taken"] for i in units[n] if i.nodeid not in finished])
+        wk["taken"] = []
 
     def read(pid, wk, exited=False) -> None:
         """Hands on what the worker wrote; at EOF, or once it exited and nothing is left (a process a
@@ -1493,8 +1568,10 @@ def _run_forked(session, units, jobs: int) -> None:
                 return
             sel.unregister(wk["fd"])
             os.close(wk["fd"])
+            wk["closed"] = True
             if "status" not in wk:
                 wk["status"] = os.waitpid(pid, 0)[1]
+            ended(pid, wk)
             return
 
     try:
@@ -1508,6 +1585,14 @@ def _run_forked(session, units, jobs: int) -> None:
                 if done:
                     wk["status"] = status
                     read(pid, wk, exited=True)
+                elif (wk["open"] and not wk.get("killed") and (limit := limits.get(wk["open"], 0.0))
+                      and time.monotonic() - wk["since"] > limit + LIMIT_GRACE_S):
+                    wk["killed"] = True   # its own timer did not end it: stuck where faulthandler cannot run
+                    os.kill(pid, signal.SIGKILL)
+            while respawn:
+                rest = respawn.pop(0)
+                units.append(rest)
+                spawn(len(workers), len(units) - 1 if rest else None)
     except BaseException:
         for pid in workers:
             try:
@@ -1517,6 +1602,13 @@ def _run_forked(session, units, jobs: int) -> None:
             except OSError:
                 pass
         raise
+    finally:
+        os.close(work_r)
+        for wk in workers.values():
+            try:
+                os.unlink(wk["stacks"])
+            except OSError:
+                pass
     # A worker that died (a crash, a kill) fails every test it took and did not finish.
     from _pytest.reports import TestReport
     for pid, wk in workers.items():
@@ -1535,7 +1627,7 @@ def _run_forked(session, units, jobs: int) -> None:
                     item.nodeid, item.location, {}, "failed", why, "call", duration=0.0))
                 hook.pytest_runtest_logfinish(nodeid=item.nodeid, location=item.location)
                 finished.add(item.nodeid)
-    lost = [i for u in units for i in u if i.nodeid not in finished]
+    lost = [i for i in items.values() if i.nodeid not in finished]
     for item in lost:   # taken by no worker: every worker died before reaching it
         hook.pytest_runtest_logstart(nodeid=item.nodeid, location=item.location)
         hook.pytest_runtest_logreport(report=TestReport(
