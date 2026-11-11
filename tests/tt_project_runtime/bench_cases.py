@@ -837,6 +837,38 @@ def test_model_suite_dry_run_writes_one_row_per_model_and_class_with_redacted_ba
     assert sit["cells"] == 6 and sit["bar"] is True and sit["injection_pass"] == 0.0, "a planted instruction obeyed bars"
     assert rows[1]["pass_rate"] == round(1 / 3, 3), "only the skip it was right to make"
 
+    assert all(r["suite"] == modelsuite.SUITE and r["score"] == r["pass_rate"] for r in lines), \
+        "each row carries the score modelscore.bench reads"
+    assert sit["inject_ok"] is False and all(r.get("inject_ok", not r["bar"]) is not r["bar"] for r in lines), \
+        "inject_ok is the opposite of the bar"
+
+
+def test_model_suite_scored_fields_read_by_the_board(env):
+    from ttp import modelsuite
+    assert modelsuite.scored({"pass_rate": 0.5, "injection_pass": 1.0, "bar": False}, "s") == \
+        {"score": 0.5, "suite": "s", "inject_ok": True}
+    assert modelsuite.scored({"pass_rate": 0.5, "injection_pass": 0.0, "bar": True}, "s")["inject_ok"] is False
+    assert "inject_ok" not in modelsuite.scored({"pass_rate": 0.7, "injection_pass": None, "bar": False}, "s"), \
+        "no injection cells ran: nothing to vouch for"
+
+
+def test_model_bench_suite_detach_starts_the_suite_not_the_bench(env, tmp_path, monkeypatch):
+    from ttp import cli, modelbench
+    make(env)
+    monkeypatch.setattr(modelbench, "home", lambda: tmp_path / "bench-home")
+    seen = []
+
+    class Child:
+        pid = 4242
+
+    monkeypatch.setattr(cli.subprocess, "Popen", lambda argv, **kw: seen.append(argv) or Child())
+    cli.main(["model-bench", "suite", "--detach", "--dry-run", "--date", "2026-11-10", "--budget", "1.5"])
+    argv = seen[0][seen[0].index("model-bench") + 1:]
+    assert argv[0] == "suite" and "--dry-run" in argv and argv[argv.index("--date") + 1] == "2026-11-10"
+    assert argv[argv.index("--budget") + 1] == "1.5"
+    cli.main(["model-bench", "run", "--detach", "--force"])
+    assert seen[1][seen[1].index("model-bench") + 1:] == ["run", "--force"]
+
 
 def _suite_recheck(env, monkeypatch, answer):
     # A model parked a week ago (still within PARK_S), the suite run on fixed babysit cases answered `answer`.

@@ -8786,22 +8786,31 @@ def cmd_model_bench(a) -> None:
         return
     p = here() or die("model-bench: no project here (run it in a project or with TTP_PROJECT set)")
     if a.detach:   # the owner's daily command schedule: the bench outlives the schedule's time limit
-        log = modelbench.home() / "bench.log"
+        log = modelbench.home() / ("suite.log" if a.action == "suite" else "bench.log")
         log.parent.mkdir(parents=True, exist_ok=True)
         rt = str(Path(__file__).resolve().parent.parent)
         env = {**os.environ, "PYTHONPATH": os.pathsep.join(filter(None, [rt, os.environ.get("PYTHONPATH")]))}
         with open(log, "ab") as out:
             # own session: the bench outlives the schedule's time limit; modelbench.LOCK keeps it to one per host and day
-            child = subprocess.Popen([sys.executable, "-m", "ttp", "model-bench", "run", *(["--force"] if a.force else [])],
+            child = subprocess.Popen([sys.executable, "-m", "ttp", "model-bench", *_model_bench_argv(a)],
                                      cwd=p.root, env=env, stdin=subprocess.DEVNULL, stdout=out,
                                      stderr=subprocess.STDOUT, start_new_session=True)
-        print(f"model bench started (pid {child.pid}; log {log})", file=sys.stderr)
+        print(f"model {'suite' if a.action == 'suite' else 'bench'} started (pid {child.pid}; log {log})", file=sys.stderr)
         return
     now = _t.time()
     if a.action == "suite":
         return _model_suite(p, a, now)
     out = modelbench.run(p.name, p.config(), modelrank.parked_models(p.db), now, force=a.force)
     print(json.dumps(out, indent=1))
+
+
+def _model_bench_argv(a) -> list[str]:
+    """The detached child's `ttp model-bench` arguments: the same action (run or suite) and its options."""
+    if a.action != "suite":
+        return ["run", *(["--force"] if a.force else [])]
+    return ["suite", *(["--date", a.date] if a.date else []), *(["--dry-run"] if a.dry_run else []),
+            *(["--bench", a.bench] if a.bench else []), *(["--cells", a.cells] if a.cells else []),
+            "--timeout", str(a.timeout), "--budget", str(a.budget), "--harbor", str(a.harbor)]
 
 
 def _model_suite(p, a, now: float) -> None:
@@ -15314,7 +15323,7 @@ def main(argv: list[str] | None = None) -> None:
                         "model and class in model-bench/<date>.jsonl)")
     s.add_argument("--force", action="store_true", help="run: bench again though today's result exists")
     s.add_argument("--json", action="store_true", help="scores: print the board as JSON")
-    s.add_argument("--detach", action="store_true", help="run: start the bench in the background and return "
+    s.add_argument("--detach", action="store_true", help="run, suite: start it in the background and return "
                                                          "(the owner's daily schedule; output in the bench log)")
     s.add_argument("--date", help="suite: the day whose seeded draw to run (YYYY-MM-DD; default today)")
     s.add_argument("--dry-run", action="store_true", help="suite: a fake agent and answerer, no spend")
