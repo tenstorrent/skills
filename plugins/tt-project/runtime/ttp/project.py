@@ -600,6 +600,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "overlap": {"enabled": True, "hub_bytes": 150000, "branch_days": 14, "settled_days": 14,
                 "ignore": ["CHANGELOG*", ".changeset/*", "changesets/*", "plugin.json", "marketplace.json",
                            "package.json", "package-lock.json", "__init__.py"]},
+    # The daily waste ledger (waste.py, `ttp waste`): a project whose avoidable share passes target_share
+    # gets one fix task for its largest bucket (fix_task); wake_usd, max_runs and review_rounds are the
+    # limits past which a coordinator wake, a task's runs and a change's review rounds count as avoidable.
+    # moved_at (epoch, no default): runs started after it count as a stand-in's after a project move.
+    "waste": {"target_share": 0.10, "wake_usd": 1.0, "max_runs": 4, "review_rounds": 2, "fix_task": True},
 }
 
 
@@ -608,6 +613,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
 META_KEYS = {"name", "id", "host", "root", "created", "tt_project_version", "pricing", "restrictions",
              "home_timezone", "home_timezone_from"}
 EXTRA_KEYS = {
+    "waste": {"moved_at"},
     "budget": {"max_waits", "hourly_floor_usd", "estimate_weights", "hourly_waste_usd", "hourly_waste_runs",
                "hourly_coordinator_turns", "hourly_coordinator_repeats", "max_pace_hold_s",
                "cap_yellow_pct"},   # max_pace_hold_s: deprecated and ignored; accepted so old configs stay quiet

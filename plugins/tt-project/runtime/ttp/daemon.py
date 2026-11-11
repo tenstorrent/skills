@@ -9500,6 +9500,10 @@ class Daemon:
                          + "\n".join(f"- {line}" for line in audit.lines(db, blocked_h=hours, p=self.p)))
             except Exception as e:   # nor must the audit
                 log(self.p, f"self-efficiency audit failed: {type(e).__name__}: {e}")
+            try:
+                spec += self._waste_ledger(db)
+            except Exception as e:   # nor must the waste ledger
+                log(self.p, f"waste ledger failed: {type(e).__name__}: {e}")
         if payload.get("audit_report", s["name"] == "daily-review"):
             try:
                 from . import machine_ledger
@@ -9601,6 +9605,41 @@ class Daemon:
             if evidence is not None:
                 sched.record_evidence(db, s["name"], tid, evidence)
         return "queued"
+
+    def _waste_ledger(self, db) -> str:
+        """The daily review's waste ledger (waste.py): its lines for the spec, one low line to the user's
+        chat, and over target one fix task for the largest bucket unless one is still open."""
+        from . import waste
+        now = time.time()
+        cfg = waste.settings(self.cfg)
+        rep = waste.report(db, now - 86400, now, self.cfg)
+        if rep["total"] <= 0:
+            return ""
+        head = waste.line(self.p.name, rep)
+        self.alert("waste-ledger", f"Waste ledger (24 h): {head}", severity="low", every_s=20 * 3600)
+        out = (f"\n\nWaste ledger (last 24 h; `ttp waste` for more): {head}\n"
+               + "\n".join(f"- {x}" for x in waste.lines(rep)))
+        bucket = waste.fix_bucket(rep)
+        if not bucket or not cfg.get("fix_task", True):
+            return out
+        label = f"waste_fix:{bucket}"
+        if db.one("SELECT id FROM tasks WHERE labels LIKE ? AND status NOT IN ('done','failed','cancelled')",
+                  (f'%"{label}"%',)):
+            return out + f"\nA fix task for {waste.LABELS[bucket]} is still open."
+        b = rep["buckets"][bucket]
+        ids = ", ".join(f"#{t}" for t in b["tasks"][:10]) or "none named"
+        tid = db.add_task(
+            f"waste: cut {waste.LABELS[bucket]} (${b['usd']:.2f} in 24 h)",
+            f"The daily waste ledger put this project's avoidable spend at ${rep['avoidable']:.2f} of "
+            f"${rep['total']:.2f} ({rep['share']:.0%}) in the last 24 h, over the {rep['target']:.0%} target. "
+            f"The largest bucket is {waste.LABELS[bucket]}: ${b['usd']:.2f} over {b['runs']} run(s), most in "
+            f"tasks {ids}.\n\nFind why this project spent it (their runs, hand-offs and reviews; `ttp waste "
+            f"--json`), fix the cause in this project's own harness, prompts, config or schedules, and say "
+            f"what changed with the before and after figures. A fault in tt-project itself goes in an "
+            f"`upstream:` follow-up, not here. Never retry the same approach.\n"
+            f"conclusion: the cause and the fix, with figures.",
+            kind="harness", tier="standard", priority=2, origin="daemon", labels=[label])
+        return out + f"\nQueued fix task #{tid} for {waste.LABELS[bucket]}."
 
     def check_self_review(self, every_s: float = 60) -> None:
         """Model-free check that the daily self-review still happens (selfreview.tick): restores a

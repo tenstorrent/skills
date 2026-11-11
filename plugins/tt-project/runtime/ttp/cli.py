@@ -2243,6 +2243,25 @@ def cmd_audit(a) -> None:
         print("\n".join(f"- {line}" for line in audit.lines(p.db, window_s=a.hours * 3600, blocked_h=hours, p=p)))
 
 
+def cmd_waste(a) -> None:
+    """Read-only: this project's avoidable spend by bucket since `--since` (waste.py), model-free."""
+    from . import waste
+    from .activity import parse_since
+    p = need(a.name, sys.argv[1:]) if a.name else here()
+    if not p:
+        die("no tt-project project here; name one: `ttp waste <name>`")
+    now = time.time()
+    try:
+        since = parse_since(a.since, now, 86400, p)
+    except ValueError as e:
+        die(str(e))
+    rep = waste.report(p.db, since, now, p.config())
+    if a.json:
+        print(json.dumps(rep, indent=1))
+        return
+    print("\n".join([waste.line(p.name, rep)] + [f"- {x}" for x in waste.lines(rep)]))
+
+
 def cmd_course(a) -> None:
     """Read-only: the Course check's lines with every costly task listed (the digest shows COSTLY_SHOWN)."""
     from . import course
@@ -13690,7 +13709,7 @@ COMMAND_GROUPS = (
     ("admin", ("setup", "upgrade", "start", "stop", "restart", "adopt", "prune", "secret", "consent",
                "notifier", "schedules", "heal", "upstream", "lease", "replicate", "check-plan", "stats", "audit",
                "push-audit", "ttr", "selfchange", "spend-today", "throughput", "model-trip", "echoes", "course",
-               "uninstall", "bench", "model-bench", "model")),
+               "uninstall", "bench", "model-bench", "model", "waste")),
 )
 
 
@@ -14154,6 +14173,14 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--done", action="store_true", help="with why: later changes in this run carry no why")
     s.add_argument("--json", action="store_true", help="print JSON")
     s.set_defaults(fn=cmd_audit)
+
+    s = sub.add_parser("waste", help="read-only: avoidable spend by bucket (cancelled or failed work, crashed "
+                                     "runs, extra review rounds, re-reviews, duplicates, runs past the limit, "
+                                     "costly wakes, a stand-in after a move), $ and share of the total")
+    s.add_argument("name", nargs="?", help="the project (default: the one here)")
+    s.add_argument("--since", help="a delay back (24h, 2d) or an ISO time (default: 24h)")
+    s.add_argument("--json", action="store_true", help="print JSON")
+    s.set_defaults(fn=cmd_waste)
 
     s = sub.add_parser("course", help="read-only: the Course check's own signs (failing, held, costly, idle "
                                       "turns) with every costly task listed; the digest shows at most 10 of those")
