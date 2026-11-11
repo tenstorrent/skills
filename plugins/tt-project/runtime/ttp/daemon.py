@@ -1227,6 +1227,7 @@ class Daemon:
         self.identity.update(self._loaded)
         self._tree_asked: str | None = None   # the runtime tree a restart was last asked for (once per tree)
         self._tree_wait = ""                  # why that restart waits, logged once per reason
+        self._tree_wait_since: float | None = None   # when it began waiting (runtimeload.DEFER_MAX_S bounds it)
         self._healthy = False
         self._progressed = 0.0   # when the daemon last told the watchdogs a tick step finished
         self._tick_began = 0.0   # when the running tick started, monotonic (0: between ticks)
@@ -1681,9 +1682,11 @@ class Daemon:
     def _restart_on_moved_runtime(self) -> None:
         """After a tick: the harness checkout's runtime/ tree moved on from the one this daemon loaded
         (ttp upgrade, a commit by hand, a merge, a reset): ask for the restart, with its rollback, a
-        harness run's runtime change asks for (runtimeload.tree_moved), once per tree."""
+        harness run's runtime change asks for (runtimeload.tree_moved), once per tree. Its wait on push
+        batches and harness upgrades is bounded from the tick it first waited."""
         try:
-            tree, why = runtimeload.tree_moved(self.p, self._loaded.get("runtime_tree"), self._tree_asked)
+            tree, why = runtimeload.tree_moved(self.p, self._loaded.get("runtime_tree"), self._tree_asked,
+                                               self._tree_wait_since)
         except Exception:   # never in the way of the tick or of a restart already asked for
             log(self.p, "runtime tree check error: " + traceback.format_exc().replace("\n", " | ")[:2000])
             return
@@ -1694,6 +1697,7 @@ class Daemon:
         elif why and why != self._tree_wait:
             log(self.p, f"runtime tree moved on: restart waits ({why})")
         self._tree_wait = why if not tree else ""
+        self._tree_wait_since = (self._tree_wait_since or time.time()) if why else None
 
     def _mark_start(self) -> None:
         """Record that this process started, and how often its first tick has failed, so `ttp restart`

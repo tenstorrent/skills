@@ -22,7 +22,10 @@ recorded. A runtime/ that moves on any other way (ttp upgrade, a commit by hand,
 caught on a tick (tree_moved): the daemon asks itself to restart through the same RESTART_REQUEST,
 once per tree, and only while no restart is asked or taken, no run waits for one (PENDING_KEY), no
 push batch is mid-flight, no run works in the harness checkout (its end restarts, check) and no
-`ttp upgrade` holds the harness-upgrade lock (it restarts the daemon itself). Known gap: a commit landing between the daemon's import (LOADED_AT) and its
+`ttp upgrade` holds the harness-upgrade lock (it restarts the daemon itself). Those last two waits
+are bounded: back-to-back batches and upgrades could otherwise defer it for good, so once the tree
+has waited DEFER_MAX_S the restart is asked despite them (a batch runs in a session of its own and
+outlives the restart; finalize reads its marker after). Known gap: a commit landing between the daemon's import (LOADED_AT) and its
 record, seconds at start, is recorded as loaded."""
 from __future__ import annotations
 
@@ -41,6 +44,8 @@ from . import gitmemo
 LOADED_AT = time.time()
 PENDING_KEY = "runtime_reload_pending"   # kv: run id -> {"start", "end", "files", "at"} (the restart request)
 ROLLBACK_RE = re.compile(r"roll back runtime to ([0-9a-f]{7,40})")   # service.restart's rollback commit
+# How long a restart on a moved runtime tree waits on push batches and harness upgrades (tree_moved).
+DEFER_MAX_S = 600
 
 
 def _git(h: Path, *args: str) -> subprocess.CompletedProcess:
@@ -190,14 +195,15 @@ def clear(p: Project, rid) -> None:
         p.db.set_kv(PENDING_KEY, pending or None)
 
 
-def _busy(p: Project) -> str:
-    """Why a restart on a moved runtime tree waits now, or "" (see tree_moved)."""
+def _busy(p: Project, overdue: bool = False) -> str:
+    """Why a restart on a moved runtime tree waits now, or "" (see tree_moved). `overdue`: it waited
+    DEFER_MAX_S already, so a push batch or a harness upgrade no longer holds it."""
     from . import service
     if (p.state / service.RESTART_REQUEST).exists() or (p.state / (service.RESTART_REQUEST + ".taken")).exists():
         return "a restart is already asked for"
     if p.db.kv(PENDING_KEY):
         return "a run's hand-off waits for its own restart"
-    if p.db.one("SELECT id FROM push_batches WHERE finalized IS NULL LIMIT 1"):
+    if not overdue and p.db.one("SELECT id FROM push_batches WHERE finalized IS NULL LIMIT 1"):
         return "a push batch is mid-flight"
     for r in p.db.q("SELECT id, note FROM runs WHERE status='running' AND note LIKE '%harness_head%'"):
         try:
@@ -208,24 +214,31 @@ def _busy(p: Project) -> str:
             # check() restarts for it at its end; until then its runtime is half-done
             return f"run {r['id']} still works in the harness checkout"
     from . import release
-    if release._taken(release.upgrade_lock(p)):   # `ttp upgrade` restarts the daemon itself
+    if not overdue and release._taken(release.upgrade_lock(p)):   # `ttp upgrade` restarts the daemon itself
         return "a harness upgrade is in flight"
     return ""
 
 
-def tree_moved(p: Project, loaded_tree: str | None, asked: str | None) -> tuple[str | None, str]:
+def tree_moved(p: Project, loaded_tree: str | None, asked: str | None,
+               waiting_since: float | None = None, now: float | None = None) -> tuple[str | None, str]:
     """Once per tick: (tree, why). `tree` is the harness checkout's current runtime tree when it differs
     from the one the daemon loaded and a restart on it was asked for now (once per tree: `asked` is the
-    tree last asked for); `why` says why it waits instead ("" when nothing moved)."""
+    tree last asked for); `why` says why it waits instead ("" when nothing moved). `waiting_since`: when
+    the caller first saw it wait (since then no restart was asked); DEFER_MAX_S after it, push batches
+    and harness upgrades no longer hold the restart."""
     if not loaded_tree:
         return None, ""
     cur = tree(p.harness / "runtime")
     if not cur or cur == loaded_tree or cur == asked:
         return None, ""
-    if why := _busy(p):
+    now = time.time() if now is None else now
+    overdue = waiting_since is not None and now - waiting_since >= DEFER_MAX_S
+    if why := _busy(p, overdue):
         return None, why
+    late = (f", after waiting {int((now - waiting_since) // 60)} min on push batches and harness upgrades"
+            if overdue and _busy(p) else "")
     from . import service
     durable_write(p.state / service.RESTART_REQUEST, json.dumps(
         {"at": time.time(), "pid": os.getpid(),
-         "why": f"the harness checkout's runtime moved on (tree {loaded_tree[:10]} loaded, {cur[:10]} now)"}))
+         "why": f"the harness checkout's runtime moved on (tree {loaded_tree[:10]} loaded, {cur[:10]} now){late}"}))
     return cur, ""

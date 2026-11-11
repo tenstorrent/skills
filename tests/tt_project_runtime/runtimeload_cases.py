@@ -285,6 +285,54 @@ def test_a_moved_runtime_tree_waits_while_a_harness_run_works_there_or_an_upgrad
     assert req.exists()                                # released: the next tick asks
 
 
+def test_back_to_back_push_batches_and_upgrades_defer_a_moved_tree_restart_only_up_to_the_bound(env, monkeypatch):
+    from ttp import locks, release, runtimeload, service
+    p = make(env)
+    d = _rl_harness_daemon(p, monkeypatch)
+    req = p.state / service.RESTART_REQUEST
+    _commit_in_harness_tree(p.harness, "runtime/ttp/ext_alt.py", "X = 1\n", "a landed batch")
+    p.db.x("INSERT INTO push_batches(id,marker,target,started) VALUES('b1','m','t',?)", (time.time(),))
+    d._restart_on_moved_runtime()
+    since = d._tree_wait_since
+    assert not req.exists() and d._tree_wait == "a push batch is mid-flight" and since
+    # The batch ends and its after_push upgrade takes the lock in the same breath: no gap at a tick.
+    held = locks.try_take([release.upgrade_lock(p)], "ttp upgrade", "exclusive")
+    try:
+        p.db.x("UPDATE push_batches SET finalized=? WHERE id='b1'", (time.time(),))
+        d._restart_on_moved_runtime()
+        assert not req.exists() and d._tree_wait == "a harness upgrade is in flight"
+    finally:
+        held.close()
+    # ... and the next batch starts before the upgrade's end is seen, on a newer tree.
+    p.db.x("INSERT INTO push_batches(id,marker,target,started) VALUES('b2','m','t',?)", (time.time(),))
+    _commit_in_harness_tree(p.harness, "runtime/ttp/ext_alt.py", "X = 2\n", "the next batch")
+    d._restart_on_moved_runtime()
+    assert not req.exists() and d._tree_wait_since == since   # the clock runs from the first wait
+    # Past the bound the restart is asked though a batch is still mid-flight (it outlives the restart).
+    d._tree_wait_since = since - runtimeload.DEFER_MAX_S
+    held = locks.try_take([release.upgrade_lock(p)], "ttp upgrade", "exclusive")
+    try:
+        d._restart_on_moved_runtime()
+    finally:
+        held.close()
+    now = _hgit(p.harness, "rev-parse", "HEAD:runtime").strip()
+    info = json.loads(req.read_text())
+    assert d._tree_asked == now and "after waiting 10 min on push batches and harness upgrades" in info["why"]
+    assert d._tree_wait == "" and d._tree_wait_since is None
+    req.unlink()
+    # The bound never overrides a run still working in the harness checkout (its own end restarts).
+    rid = _rl_run(p, _harness_task(p, "fix a runtime module"), _hgit(p.harness, "rev-parse", "HEAD").strip())
+    _commit_in_harness_tree(p.harness, "runtime/ttp/ext_alt.py", "X = 3\n", "a mid-run commit")
+    d._restart_on_moved_runtime()
+    d._tree_wait_since -= 2 * runtimeload.DEFER_MAX_S
+    d._restart_on_moved_runtime()
+    assert not req.exists() and f"run {rid} still works in the harness checkout" == d._tree_wait
+    p.db.x("UPDATE push_batches SET finalized=? WHERE id='b2'", (time.time(),))
+    p.db.x("UPDATE runs SET status='done' WHERE id=?", (rid,))
+    d._restart_on_moved_runtime()
+    assert req.exists() and "after waiting" not in json.loads(req.read_text())["why"]   # a plain gap
+
+
 def test_whether_a_runs_runtime_change_loaded_is_decided_by_the_recorded_tree_not_file_times(env):
     from ttp import runtimeload, service
     from ttp.daemon import Daemon
