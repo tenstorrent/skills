@@ -2985,7 +2985,11 @@ session and stateless coordinators on every provider.
   instead of failing; a batch of several changes first runs only these tests of each check that is
   one plain pytest run, and when they fail it finds the change that breaks the cap on them alone,
   then runs the full checks once on the changes before it; these probes are kept per merged tree,
-  so a batch rerun after a reboot does not run them again), `push_landing_alert_h` (default 4:
+  so a batch rerun after a reboot does not run them again), `push_entry_checks` (default `[]`, off:
+  quick commands, seconds each, a batch runs on each change merged onto its head before the change
+  joins it, whatever that change's own check scope, such as a test that every test file is on the
+  smoke list; one failing sends that change back alone with the command's output and the rest go on;
+  a command the push branch tip fails alone blames no change), `push_landing_alert_h` (default 4:
   when approvals have waited this many hours with nothing landed on the push branch and at least
   two batches tried them, one high alert says so, with the attempt count and how many a host
   reboot cut short; it clears when a batch lands; 0 = off), `push_script_torn_escalate_after`

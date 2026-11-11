@@ -2807,6 +2807,35 @@ def test_an_entry_whose_replay_raises_goes_back_alone_and_the_batch_goes_on(env,
     assert m["outcome"] == "env_fault" and "conflict" not in _statuses(m), m
 
 
+def test_a_push_batch_sends_back_an_entry_its_quick_entry_check_fails_and_lands_the_rest(env, monkeypatch, capsys):
+    """delivery.push_entry_checks (a smoke-list consistency test) runs on each entry merged onto the
+    batch head, whatever the entry's own scope: one adding a test file the list misses goes back
+    alone, naming it, and the rest land; a command the tip itself fails blames no entry."""
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    _commit(other, "smoke.txt", "t_a.txt\n")
+    _commit(other, "t_a.txt", "a\n")
+    _git_out(other, "push", "-q", "origin", "HEAD:proj")
+    listed = ('for f in t_*.txt; do grep -qxF "$f" smoke.txt || { echo "unlisted: $f"; exit 1; }; done')
+    p.set_config("delivery.push_entry_checks", [listed])
+    heads = [_entry(repo, "e1", {"f1.txt": "1\n"}), _entry(repo, "e2", {"t_new.txt": "n\n"}),
+             _entry(repo, "e3", {"t_ok.txt": "k\n", "smoke.txt": "t_a.txt\nt_ok.txt\n"})]
+    rc, m = _run_batch(p, _batch_marker(p, heads), monkeypatch)
+    assert m["outcome"] == "pushed" and _statuses(m) == ["pushed", "check_failed", "pushed"], m
+    d = m["results"][1]["detail"]
+    assert d["cmd"] == listed and "unlisted: t_new.txt" in d["tail"], d
+    assert "e2): its entry check" in capsys.readouterr().out
+    tree = set(_git_out(origin, "ls-tree", "--name-only", "proj").split())
+    assert {"f1.txt", "t_ok.txt"} <= tree and "t_new.txt" not in tree
+    # the tip itself failing the command: it decides nothing, every entry goes on to the batch's checks
+    _commit(other, "t_bad.txt", "b\n")
+    _git_out(other, "pull", "-q", "--rebase", "origin", "proj")
+    _git_out(other, "push", "-q", "origin", "HEAD:proj")
+    heads = [_entry(repo, "e4", {"t_new2.txt": "n\n"})]
+    rc, m = _run_batch(p, _batch_marker(p, heads, bid="b2"), monkeypatch)
+    assert m["outcome"] == "pushed" and _statuses(m) == ["pushed"], m
+    assert "fails on" in capsys.readouterr().out
+
+
 def _landed_fixture(env, monkeypatch):
     """The target has notes.txt; a first change A edits its line b and lands on the target in a
     different form (as a batch settles it, or squashed): a branch that still carries A conflicts

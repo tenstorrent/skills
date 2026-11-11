@@ -93,6 +93,7 @@ RERUN_IDS = 10                     # a check failing more tests than this is not
 TIP_IDS = 100                      # ...but up to this many still rerun on the tip alone: those it fails are its own (_tip_ids)
 TIP_RERUNS = 3                     # reruns on the tip alone of a blamed failure's failing tests: one failing clears the entry
 TIP_RESEARCH = 3                   # searches run again in one round once the tip alone fails more tests (_research)
+ENTRY_CHECK_S = 300.0              # the time limit of one delivery.push_entry_checks command on one entry (_entry_check)
 HARD_TESTS = r"leak"               # delivery.push_hard_tests: failing test ids never excused as the tip's own (the leak scan)
 HOST_FAULTS = (envfault.Fault, workerloss.Infra, syntaxfault.Infra, setupfault.Infra)   # the host's, never an entry's
 CARRY_TRIES = 5                    # recorded passes of one check on other tips tried for a carry (verdictcarry)
@@ -1474,6 +1475,7 @@ class Batch:
         self.status: dict[int, str] = {}       # entry index -> status
         self.detail: dict[int, dict] = {}
         self.landed_at: dict[int, str] = {}    # entry index -> its own commit on the branch (pushed or landed)
+        self.entry_tip_bad: dict[str, dict[str, bool]] = {}   # tip -> entry check -> fails on it alone (_entry_check)
         self._heads: dict[str, str] | None = None   # push.landed_heads, read once per batch
         self.check_run_dir = m.get("check_run_dir")
         self.isolate = {str(c) for c in m.get("setup_isolate") or []}   # alerted setup_fault checks (pushq)
@@ -1948,11 +1950,47 @@ class Batch:
                 self.landed_at[i] = tip
             else:
                 self._set(i, "rider", _after=len(carried))
+        elif failed := self._entry_check(new, tip):
+            # A quick check (delivery.push_entry_checks) failing on this entry merged onto the batch head
+            # sends it back alone, whatever its own push checks' scope; the others go on (the smoke list).
+            say(f"entry {e.get('id')} ({e.get('branch')}): its entry check `{failed[0]}` failed; sent back")
+            self._set(i, "check_failed", cmd=failed[0], tail=failed[1])
+            self._checkout(h)
         else:
             carried.append((i, new))
             self._set(i, "carried")
             return new
         return h
+
+    def _entry_check(self, head: str, tip: str) -> tuple[str, str] | None:
+        """Run each delivery.push_entry_checks command (a few seconds each, never scoped by the
+        change's paths) on `head`, an entry just replayed onto the batch head: (command, output tail)
+        of the first that fails, else None. A command that fails on `tip` alone, runs out of time or
+        cannot get its env decides nothing here: the batch's own checks judge it then."""
+        cmds = push.check_list(self.d.get("push_entry_checks"))
+        if not cmds:
+            return None
+        bad = self.entry_tip_bad.setdefault(tip, {})
+        try:
+            env = self._check_env(head)
+        except push.runnerenv.Unavailable:
+            return None
+        for cmd in cmds:
+            key = str(cmd)
+            if key not in bad:   # once per tip: a command the tip itself fails blames no entry
+                self._checkout(tip)
+                rc, _, over = _stream(_check_argv(cmd, self.wt), self.wt, env=env, timeout=ENTRY_CHECK_S, group=True)
+                bad[key] = rc != 0 or over
+                if bad[key]:
+                    say(f"entry check `{key}` fails on {tip[:10]} alone; the batch's checks decide instead")
+            if bad[key]:
+                continue
+            self._checkout(head)
+            rc, tail, over = _stream(_check_argv(cmd, self.wt), self.wt, env=env, timeout=ENTRY_CHECK_S, group=True)
+            if rc != 0 and not over:
+                return key, tail
+        self._checkout(head)
+        return None
 
     def _replay_fault(self, i: int, e: dict, h: str, carried: list[tuple[int, str]], ex: Exception) -> None:
         """Entry `i` raised while it was replayed: abort what it left in the worktree and send it
