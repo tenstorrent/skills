@@ -8404,6 +8404,9 @@ class Daemon:
         elif nofix:
             text += f"\nNo automatic fix: {nofix} ({deadwait.NOFIX_EVENT} raised)."
         folded = {id(f) for f in fixes} if fix else set()
+        if failed_fix and getattr(self, "_revert_note", ""):
+            text += self._revert_note
+            self._revert_note = ""
         if fix:
             moved = ", ".join(f"#{i}" for i in fix[2])
             text += (f"\nFix #{fix[0]} and re-review #{fix[1]} queued by the daemon"
@@ -18776,7 +18779,8 @@ class Daemon:
                     if ext:
                         self._name_external_head(task, t, ext)
                     else:
-                        self._join_shared_review(task, t)
+                        if not self._join_shared_review(task, t):
+                            continue   # kept on its own branch: it gets a review of its own
                         self._name_new_head(task, t)
                         self._precheck_open(task, t)
                     return t["id"], False
@@ -19251,37 +19255,126 @@ class Daemon:
                 out.append(e)
         return out
 
-    def _join_shared_review(self, task: dict, review: dict) -> None:
+    def _revert_failed_members(self, review: dict, first: dict, vs: dict[int, str], fups: list[dict],
+                               approved: bool) -> tuple[int, int, list[int]] | None:
+        """Shared-branch review `review` failed members `vs` marks fail past their fix hop: revert each
+        one's commits forward on the branch that carries every member (integrate.revert_member, a
+        Ttp-Reverted-Task trailer, never a rewrite), requeue each alone as a code task of its own
+        (continues:<member>: it starts from the base branch, labelled own_branch:reverted), and, unless
+        every passing member was approved on its own head, re-review the passing members at the new
+        head, which takes over the review's dependents: (first requeued id, re-review id, moved). None
+        when nothing was reverted (why in self._nofix), or no re-review was needed (self._revert_note)."""
+        db, root, cfg = self.p.db, self.p.root, self.cfg
+        if coord.next_task_slot(db, coord.task_cap(cfg)) is not None \
+                or coord.next_task_slot(db, coord.task_cap(cfg, True), review=True) is not None:
+            self._nofix += "; a 24 h task cap is reached, so its failed members were not reverted"
+            return None
+        ms = {m["id"]: m for m in integrate.members(db, review)}
+        heads = [h for i in sorted(ms) if (h := integrate.member_head(root, i))]
+        # The shared branch: the member branch whose tip carries every member's head.
+        branch = next((b for b in dict.fromkeys(m.get("branch") for m in ms.values()) if b
+                       and all(integrate._is_ancestor(root, h, f"refs/heads/{b}") for h in heads)), "")
+        if not branch:
+            self._nofix += "; no member branch carries every member, so nothing was reverted"
+            return None
+        grouped, _ = integrate.by_member(fups, sorted(ms))
+        tag = spans.new_tag()
+        reverted, requeued, new = [], [], ""
+        for i in sorted(i for i, v in vs.items() if v == "fail" and i in ms):
+            ok, out = integrate.revert_member(root, branch, i, integrate.member_commits(root, i))
+            if not ok:
+                self._nofix += f"; reverting #{i} on {branch} failed: {out}"
+                log(self.p, f"review {review['id']}: #{i} not reverted on {branch}: {out}")
+                continue
+            new, m = out, ms[i]
+            reverted.append(i)
+            requeued.append(db.add_task(
+                f"Redo #{i} alone: " + re.sub(r"^(?:(?:Fix review|Redo) #\d+(?: alone)?: )+", "", m["title"]),
+                "\n".join([
+                    f"Task #{i}'s part of shared branch {branch} failed review #{review['id']} past its fix hop, "
+                    f"so the daemon reverted it forward there (commit {new[:12]}, trailer "
+                    f"{integrate.REVERT_TRAILER}: {i}) and the other members land without it. Redo it alone, "
+                    f"on a branch of its own from the base branch, fixing these findings:",
+                    _findings(grouped.get(i, []), review, tag),
+                    f"Task #{i}'s spec:\n{m.get('spec') or ''}"]),
+                kind="code", tier=m.get("tier") or "standard", priority=chainprio.of(db, m, review),
+                origin="daemon", budget_usd=float(cfg["budget"]["task_default_usd"].get(m.get("tier") or "standard", 8.0)),
+                labels=[f"continues:{i}", integrate.own_branch_label({"why": "reverted"})], **(pin_of(m) or {})))
+        if not reverted:
+            return None
+        self._nofix = ""
+        names = ", ".join(f"#{i}" for i in reverted)
+        self._revert_note = (f"\nReverted {names} forward on {branch} ({new[:12]}) and requeued alone as "
+                             + ", ".join(f"#{q}" for q in requeued) + ".")
+        ok = sorted(i for i, v in vs.items() if v == "pass" and i in ms)
+        if approved and set(integrate.landable(root, sorted(vs), vs)) >= set(ok):
+            return None   # every passing member is pushing on its own head
+        only = push.REVIEW_ONLY_LABEL in push._labels(review) + push._labels(first)
+        rtier = "deep" if review["tier"] == "deep" else "standard"
+        rid = db.add_task(
+            f"Re-review #{review['id']}: " + re.sub(r"^(?:Re-review #\d+: )+", "", review["title"]),
+            "\n".join([
+                f"Re-review after review #{review['id']} failed: the daemon reverted {names} forward on {branch} "
+                f"(head {new[:12]}). Review only the passing members' work at that head; the reverted members "
+                f"come back alone as {', '.join(f'#{q}' for q in requeued)}.",
+                integrate.with_members(first.get("spec") or "", [ms[i] for i in ok], tip=(branch, new))]),
+            kind="review", tier=rtier, priority=chainprio.of(db, ms[ok[0]], review), origin="daemon",
+            budget_usd=float(cfg["budget"]["task_default_usd"].get(rtier, 8.0)), depends_on=ok,
+            labels=[f"continues:{review['id']}"] + ([push.REVIEW_ONLY_LABEL] if only else []),
+            **(pin_of(review) or {}))
+        moved = [] if approved else [t["id"] for t in coord._open_dependents(db, review["id"])]
+        if not approved:
+            coord._take_over_dependents(db, review["id"], rid)
+        return requeued[0], rid, moved
+
+    def _join_shared_review(self, task: dict, review: dict) -> bool:
         """Code task `task` finished on a branch a still queued review already covers for another
         member (a batch, `pr_branch:` lines, overlap routing): it joins that review rather than getting
         one of its own (user msgs #2407, #2414). The review then depends on it too, records the head it
         handed off (integrate.record_member_head: its commits are fork point..that head) and lists every
         member with its acceptance criteria (integrate.members_block), so each finding names its task.
-        A fix of a failed review is no new member: its re-review already covers it."""
+        A fix of a failed review is no new member: its re-review already covers it. A change on a
+        branch of its own (built on a member's) that really conflicts with the integration branch or
+        carries a `no_push:` line (integrate.route) does not join: it is labelled own_branch:<why> and
+        gets a review of its own (False)."""
         db, branch = self.p.db, task.get("branch")
         deps = dependency_ids(review)
         if review["status"] != "queued" or review["kind"] != "review" or not branch or task["id"] in deps \
                 or str(task.get("title") or "").startswith("Fix review #") or task.get("kind") != "code":
-            return
+            return True
         # It shares the branch when it works on a member's branch, or on its own branch built on one
         # (`pr_branch:`: the member's worktree still holds that branch, worktree.fix_branches).
         on = {branch, worktree.carried_branch(task)} - {""}
         others = [m for m in integrate.members(db, review) if m.get("branch") in on]
         if not others:
-            return
+            return True
         try:
             full = worktree._git(self.p.root, "rev-parse", branch)
             integrate.record_member_head(self.p.root, task["id"], full)
+            # Only a branch of its own can stay apart: one it shares with a member is that member's.
+            decision = integrate.route(self.p.root, self.cfg, task, full) \
+                if all(m.get("branch") != branch for m in others) else {"shared": True}
         except Exception as e:
             log(self.p, f"task {task['id']}: its head on {branch} not recorded for review #{review['id']}: {e}")
-            return
+            return True
+        if not decision["shared"]:
+            label = integrate.own_branch_label(decision)
+            with db.tx():
+                fresh = db.task(task["id"]) or task
+                labels = [x for x in json.loads(fresh.get("labels") or "[]")
+                          if not str(x).startswith(integrate.OWN_BRANCH_LABEL)]
+                db.update_task(task["id"], labels=[*labels, label])
+            task["labels"] = json.dumps([*labels, label])
+            log(self.p, f"task {task['id']}: kept on its own branch {branch}, not joining review #{review['id']} "
+                        f"({label})")
+            return False
         with db.tx():
             fresh = db.task(review["id"])
             if not fresh or fresh["status"] != "queued":
-                return
+                return True
             deps = dependency_ids(fresh)
             if task["id"] in deps:
-                return
+                return True
             deps = [*deps, task["id"]]
             spec = integrate.with_members(fresh.get("spec") or "", [*integrate.members(db, fresh), task],
                                           tip=(branch, full))
@@ -19289,6 +19382,7 @@ class Daemon:
         review.update(depends_on=json.dumps(deps), spec=spec)
         log(self.p, f"task {task['id']}: joined review #{review['id']} of shared branch {branch} "
                     f"(members {', '.join(f'#{i}' for i in deps if isinstance(i, int))})")
+        return True
 
     def _name_new_head(self, task: dict, review: dict) -> None:
         """A queued re-review of a failed review gets the new head its fix ended on, and the size of
@@ -19711,7 +19805,7 @@ class Daemon:
         (_open_fix) takes these findings too, as an open hop does, instead of a second fix."""
         cfg, db = self.cfg, self.p.db
         d = cfg.get("delivery") or {}
-        self._nofix = ""
+        self._nofix = self._revert_note = ""
         if not (cfg.get("review") or {}).get("auto", True) or not (d.get("review_before_pr", True) or d.get("push_branch")):
             return None
         # A re-review repeats the stack's first review's spec, not the nested specs of the rounds since.
@@ -19732,6 +19826,12 @@ class Daemon:
         rounds = max(rounds, reviewcap.change_fails(db, review))   # rounds linked outside its continues chain too
         if rounds > cap:
             self._nofix = f"{rounds} reviews of this stack failed (the daemon fixes at most {cap} round(s))"
+            # A shared branch whose failed members are past their fix hop: revert them forward so the
+            # others land, and requeue each alone (user msgs #2269, #2407).
+            vs = integrate.verdicts([m["id"] for m in integrate.members(db, review)],
+                                    load_result(review.get("result")), fups)
+            if vs and "pass" in vs.values():
+                return self._revert_failed_members(review, first, vs, fups, approved)
             return None
         if coord.next_task_slot(db, coord.task_cap(cfg)) is not None \
                 or coord.next_task_slot(db, coord.task_cap(cfg, True), review=True) is not None:

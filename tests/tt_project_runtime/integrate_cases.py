@@ -238,3 +238,61 @@ def test_a_split_verdict_with_a_refused_approval_keeps_the_failed_review(env):
     assert p.db.task(rid)["status"] == "failed"
     assert not p.db.q("SELECT * FROM push_queue WHERE task=?", (rid,))
     assert len(p.db.q("SELECT * FROM tasks WHERE title LIKE ?", (f"Fix review #{rid}%",))) == 1
+
+
+def test_a_failed_member_past_its_fix_hop_is_reverted_forward_and_requeued_alone(env):
+    """A shared-branch review fails member a past its fix hop (review.auto_fix_rounds 0): the daemon
+    reverts a's commits forward on the branch carrying both members (a Ttp-Reverted-Task commit, no
+    rewrite), requeues a alone on a branch of its own, and re-reviews b at the new head, which takes over
+    what waited on the review. No fix of the whole branch is queued."""
+    from ttp import integrate
+    p = _int_project(env)
+    p.set_config("review.auto_fix_rounds", 0)
+    a, b, rid, branch, bbranch, ahead, bhead = _shared_review(env, p)
+    waiter = p.db.add_task("deploy it", "s", origin="coordinator", depends_on=[rid])
+    ev = _fail_review(env, p, rid, followups=[{"title": f"task #{a}: first.py is wrong", "spec": "x"}],
+                      members={str(a): "fail", str(b): "pass"})
+    tip = _git_out(p.root, "rev-parse", bbranch).strip()
+    assert _git_out(p.root, "merge-base", "--is-ancestor", bhead, tip) == "", "the branch only moved forward"
+    msg = _git_out(p.root, "log", "-1", "--format=%B", tip)
+    assert f"{integrate.REVERT_TRAILER}: {a}" in msg, msg
+    files = _git_out(p.root, "ls-tree", "--name-only", tip).split()
+    assert "first.py" not in files and "second.py" in files
+    assert not p.db.q("SELECT * FROM tasks WHERE title LIKE ?", (f"Fix review #{rid}%",))
+    redo = p.db.one("SELECT * FROM tasks WHERE title LIKE ?", (f"Redo #{a} alone:%",))
+    assert redo and redo["kind"] == "code" and redo["status"] == "queued"
+    assert f"continues:{a}" in json.loads(redo["labels"]) and "own_branch:reverted" in json.loads(redo["labels"])
+    assert "first.py is wrong" in redo["spec"] and tip[:12] in redo["spec"]
+    rr = p.db.one("SELECT * FROM tasks WHERE kind='review' AND id!=?", (rid,))
+    assert rr and json.loads(rr["depends_on"]) == [b] and f"continues:{rid}" in json.loads(rr["labels"])
+    assert f"Review head {tip[:12]} of {bbranch}" in rr["spec"] and f"- task #{a} (" not in rr["spec"]
+    assert f"- task #{b} (second part)" in rr["spec"]
+    assert json.loads(p.db.task(waiter)["depends_on"]) == [rr["id"]], "the re-review took over its dependents"
+    assert f"Reverted #{a} forward on {bbranch}" in ev["text"], ev["text"]
+
+
+def test_a_member_that_conflicts_with_the_integration_branch_or_has_no_push_gets_its_own_review(env):
+    """At hand-off, a change on its own branch built on a member's that really conflicts with the
+    integration branch (git merge-tree) does not join the shared review: it is labelled
+    own_branch:conflict with the file and gets a review of its own. One with a `no_push:` line too."""
+    from ttp import integrate, worktree
+    from ttp.daemon import Daemon
+    p = _int_project(env)
+    p.set_config("delivery.push_branch", "work")
+    a, branch, _, (rev,) = _finish_code(env, p, "first part", {"first.py": 20})
+    # The integration branch changed second.py meanwhile.
+    scratch = env["tmp"] / "work-wt"
+    _git_out(p.root, "worktree", "add", "-q", "-b", "work", str(scratch), worktree.fork_point(p.root, a))
+    _int_commit(scratch, "second.py", "theirs\n", "landed meanwhile")
+    for spec, why in (("Add second.py.", "own_branch:conflict in second.py"),
+                      ("Add second.py.\nno_push: local notes only", "own_branch:no_push")):
+        b = p.db.add_task(f"second part {why}", f"pr_branch: {branch}\n{spec}", kind="code", tier="standard",
+                          origin="coordinator", labels=[f"pr_branch:{branch}"])
+        path, bbranch = worktree.ensure(p, p.db.task(b))
+        _int_commit(path, "second.py", "x\n" * 20, "second part")
+        p.db.update_task(b, status="done", branch=bbranch)
+        got, added = Daemon(p.base)._auto_review(p.db.task(b), "second works")
+        assert got != rev["id"] and added, (got, added)
+        assert b not in json.loads(p.db.task(rev["id"])["depends_on"]), "it joined the shared review"
+        assert why in json.loads(p.db.task(b)["labels"])
+        p.db.update_task(got, status="cancelled")   # the next case is a sibling, not built on this one
