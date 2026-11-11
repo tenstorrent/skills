@@ -12,7 +12,8 @@ _RC_FAKE_SSH = r'''#!/bin/sh
 # "always"): on a script holding FAKE_SSH_MUX_ON (default: the run step) the shared connection refuses
 # the session while the count lasts, and the link drops (exit 255); <file>.log gets "shared" or "direct".
 # The host's tt-project folder (its mirrors) is FAKE_REMOTE_TMP/../host-home. FAKE_SSH_NOGIT=1: git there
-# is unusable. FAKE_SSH_SLOW=<text>:<s> sleeps <s> before a script holding <text> (a slow link).
+# is unusable. FAKE_SSH_SLOW=<text>:<s> sleeps <s> before a script holding <text> (a slow link), only on host
+# FAKE_SSH_SLOW_HOST when that is set.
 all="$*"
 while [ "$1" = "-o" ]; do shift 2; done
 host=$1
@@ -26,7 +27,7 @@ if [ -n "$FAKE_SSH_NOGIT" ]; then
   chmod +x "$FAKE_REMOTE_TMP/../nogit/git" && export PATH="$FAKE_REMOTE_TMP/../nogit:$PATH"
 fi
 if [ -n "$FAKE_SSH_SLOW" ]; then
-  case "$1" in *"${FAKE_SSH_SLOW%:*}"*) sleep "${FAKE_SSH_SLOW##*:}";; esac
+  [ -z "$FAKE_SSH_SLOW_HOST" ] || [ "$host" = "$FAKE_SSH_SLOW_HOST" ] && case "$1" in *"${FAKE_SSH_SLOW%:*}"*) sleep "${FAKE_SSH_SLOW##*:}";; esac
 fi
 if [ -n "$FAKE_SSH_MUX" ]; then
   case "$1" in *"${FAKE_SSH_MUX_ON:-ttp-remote-rc}"*)
@@ -5342,7 +5343,8 @@ def test_a_spill_host_whose_tree_copy_timed_out_is_kept_off_at_once_and_the_reru
     p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["slow-host", "check-host-b"],
                                         charter=("slow-host", "check-host-b"))
     calls = tmp_path / "ssh.log"
-    monkeypatch.setenv("FAKE_SSH_SLOW", "slow-host")
+    monkeypatch.setenv("FAKE_SSH_SLOW", "ttp-send:20")
+    monkeypatch.setenv("FAKE_SSH_SLOW_HOST", "slow-host")
     monkeypatch.setenv("FAKE_SSH_ARGS", str(calls))
     monkeypatch.setenv(remotecheck.COPY_TIMEOUT_ENV, "1")
     p.set_config("delivery.push_checks", ["true"])
@@ -5356,7 +5358,7 @@ def test_a_spill_host_whose_tree_copy_timed_out_is_kept_off_at_once_and_the_reru
     text = (run / "checks.log").read_text()
     assert "copying the tree timed out: " in text and "overran its limit after" in text and "MB sent" in text, text
     assert "copying the tree timed out, so that host is kept off this run" in text, text
-    copies = [c for c in calls.read_text().splitlines() if "slow-host" in c and ("tar -xf -" in c or "cat > " in c)]
+    copies = [c for c in calls.read_text().splitlines() if "slow-host" in c and "ttp-send" in c and "cat > " in c]
     assert len(copies) == 1, "one copy there, never a second full timeout"
 
 
