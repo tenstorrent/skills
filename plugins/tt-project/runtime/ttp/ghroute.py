@@ -84,9 +84,9 @@ def _value(cfg: dict | None = None, cwd: str | None = None) -> str:
 
 
 def route(cfg: dict | None = None, cwd: str | None = None) -> str:
-    """The ssh alias delivery.gh_route names ("" when unset or a MODES value)."""
+    """The ssh alias delivery.gh_route names ("" when unset or "none")."""
     v = _value(cfg, cwd)
-    return "" if v in MODES else v
+    return "" if v in MODES and v != WORKSTATION else v
 
 
 def known(cfg: dict | None = None, cwd: str | None = None) -> str:
