@@ -243,13 +243,7 @@ def restore_logins(links: list) -> None:
     for mine, real, stamp in links:
         if mine.is_symlink() or not mine.is_file() or _stamp(real) != stamp:
             continue
-        part = real.with_name(f".{real.name}.{os.getpid()}.part")
-        fd = os.open(part, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(fd, "wb") as out:
-            out.write(mine.read_bytes())
-            out.flush()
-            os.fsync(out.fileno())
-        os.replace(part, real)
+        durable_write(real, mine.read_bytes(), 0o600)
 
 
 def denied_reads(hidden: list[Path], own: list[Path]) -> list[str]:
