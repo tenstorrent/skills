@@ -13479,7 +13479,7 @@ def main(argv: list[str] | None = None) -> None:
                        "(delivery.gh_route \"workstation\"; the workstation's `ttp bridge gh-pull` takes and answers them)")
     s.add_argument("action", choices=["run", "take", "put"], help="run -- <gh args>: the answer if in, else queue it "
                    "(exit 75); take: claim queued calls (JSON); put: store answers (JSON on stdin)")
-    s.add_argument("args", nargs=argparse.REMAINDER)
+    s.add_argument("args", nargs=argparse.REMAINDER, help="for run: -- then the gh arguments")
     s.set_defaults(fn=cmd_gh_queue)
 
     s = sub.add_parser("web", help="web app link (for a remote project: tunnel command and link)")
