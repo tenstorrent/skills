@@ -4651,11 +4651,12 @@ def test_failures_without_an_error_line_or_of_different_tests_never_read_as_a_co
 def test_a_spilled_failure_strikes_its_host_once_the_run_passes_here_and_a_host_fault_does_not(
         env, tmp_path, monkeypatch):
     """`ttp checks`: a run failing on the spill host and passing here strikes that host (with the error line
-    as its signature); one the host's own fault ended (exit 75) strikes nothing."""
+    as its signature); one the host's own fault ended (exit 75) strikes nothing (a missing-package import
+    failure is the spill env fault: no strike, see the one-event test)."""
     import threading
     from ttp import checkspill, cli
     p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a"])
-    cmd = 'case "$PWD" in */ttp-check.*) echo "E   ModuleNotFoundError: No module named yaml"; exit 1;; esac'
+    cmd = 'case "$PWD" in */ttp-check.*) echo "E   AssertionError: host-only difference"; exit 1;; esac'
     p.set_config("delivery.push_checks", [cmd])
     for fake, want in (({"FAKE_SSH_FAIL": "mktemp"}, None), ({}, 1)):
         for k, v in fake.items():
@@ -4668,7 +4669,7 @@ def test_a_spilled_failure_strikes_its_host_once_the_run_passes_here_and_a_host_
         assert json.loads((run / "checks.json").read_text())["passed"] is True
         doc = checkspill._strikes(p.db)
         assert doc.get("hosts", {}).get("check-host-a", {}).get("n") == want, (fake, doc)
-    assert doc["fails"][-1]["sig"] == "ModuleNotFoundError: No module named yaml" and doc["fails"][-1]["settled"]
+    assert doc["fails"][-1]["sig"] == "AssertionError: host-only difference" and doc["fails"][-1]["settled"]
 
 
 def test_spill_strikes_read_malformed_state_as_none(env, tmp_path, monkeypatch):
