@@ -25,8 +25,6 @@ ALERT_SITES = {
     ("daemon.py", "Daemon.alert"): [("outages", "the keyed condition helper: a live condition, cleared when it ends")],
     ("daemon.py", "Daemon.remind_logouts"): [("outages", "a logout whose work runs on another provider: one low status line"),
                                               ("user-blocker", "a provider stays logged out and no other provider can run its work")],
-    ("daemon.py", "Daemon.needs_ranking_key"): [("user-blocker", "a missing ranking key while nothing ranks the chat models; "
-                                                                "a ranking in use: one low feed line")],
     ("daemon.py", "Daemon.relay_when_blocked"): [("outages", "the coordinator cannot run; conditions wait unhandled")],
     ("daemon.py", "relay_worker_notifies"): [(WORKER_NOTIFY, "a worker's `ttp notify`; its prompt limits it to these")],
     ("db.py", "DB._quarantine_kv"): [("outages", "stored state was unreadable and reset: state was lost")],
