@@ -738,7 +738,7 @@ sys.exit(0)
 """
 
 
-def _fake_ssh(d, plan):
+def _fake_relay_ssh(d, plan):
     import json
     import sys
     d.mkdir(parents=True, exist_ok=True)
@@ -760,7 +760,7 @@ def _calls(d):
 def test_bridge_forward_failure_cleans_once_and_retries(tmp_path, capfd):
     # cells: forward-fail-retry
     from ttp import bridge_relay
-    argv = _fake_ssh(tmp_path / "s", ["fwd", "ok"])
+    argv = _fake_relay_ssh(tmp_path / "s", ["fwd", "ok"])
     rc = bridge_relay.main(["--tag", "box-a/auto", str(tmp_path / "relay" / "box-a.auto"), "--", *argv])
     calls = _calls(tmp_path / "s")
     assert rc == 0 and len(calls) == 3
@@ -780,7 +780,7 @@ def test_bridge_forward_failure_cleans_once_and_retries(tmp_path, capfd):
 def test_bridge_second_forward_failure_exits_after_one_cleanup(tmp_path, capfd):
     # cells: forward-fail-twice
     from ttp import bridge_relay
-    argv = _fake_ssh(tmp_path / "s", ["fwd", "fwd", "ok"])
+    argv = _fake_relay_ssh(tmp_path / "s", ["fwd", "fwd", "ok"])
     rc = bridge_relay.main(["--tag", "box-a/auto", str(tmp_path / "relay" / "box-a.auto"), "--", *argv])
     calls = _calls(tmp_path / "s")
     assert rc == 255 and len(calls) == 3 and sum("ttp-bridge-clean" in c[-1] for c in calls) == 1
@@ -790,10 +790,10 @@ def test_bridge_second_forward_failure_exits_after_one_cleanup(tmp_path, capfd):
 def test_bridge_auth_or_connect_failure_does_no_cleanup(tmp_path):
     # cells: auth-no-cleanup
     from ttp import bridge_relay
-    argv = _fake_ssh(tmp_path / "s", ["auth", "ok"])
+    argv = _fake_relay_ssh(tmp_path / "s", ["auth", "ok"])
     rc = bridge_relay.main(["--tag", "box-a/auto", str(tmp_path / "relay" / "box-a.auto"), "--", *argv])
     assert rc == 255 and len(_calls(tmp_path / "s")) == 1
-    argv = _fake_ssh(tmp_path / "u", ["fwd"])   # untagged (an older service's command): no recovery either
+    argv = _fake_relay_ssh(tmp_path / "u", ["fwd"])   # untagged (an older service's command): no recovery either
     assert bridge_relay.main([str(tmp_path / "relay" / "x"), "--", *argv]) == 255
     assert len(_calls(tmp_path / "u")) == 1
 
