@@ -8499,7 +8499,7 @@ class Daemon:
             if now < float(rec.get("next_check") or 0) and (not changed or rec.get("account_hold")):
                 continue
             try:
-                ok = agent.login_check() if agent and not rec.get("distrust") else None
+                ok = agent.login_state(self.cfg) if agent and not rec.get("distrust") else None
             except Exception:
                 log(self.p, f"{prov}: login check failed\n" + traceback.format_exc())
                 ok = None

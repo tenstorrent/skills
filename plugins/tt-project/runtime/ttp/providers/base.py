@@ -306,6 +306,11 @@ class Provider:
         True or False, or None when this CLI has no such check (a run then checks the login)."""
         return None
 
+    def login_state(self, cfg: dict | None = None) -> bool | None:
+        """login_check for a project with config `cfg`: a provider whose key a project setting names
+        (an endpoint alias) also checks, model-free, that the key is saved."""
+        return self.login_check()
+
     def build(self, *, role: str, model: str, effort: str, cwd: str, budget_usd: float | None,
               read_only: bool, schema: dict | None, restrictions: dict,
               disallowed_tools: list[str] | tuple = (), denied_reads: list[str] | tuple = (),

@@ -65,6 +65,24 @@ class Chat(Claude):
     def login_check(self) -> bool | None:
         return None   # the endpoint is asked by a run, through the bridge
 
+    def login_state(self, cfg: dict | None = None) -> bool | None:
+        # No key saved for the configured alias, or one saved for another URL: the bridge refuses every
+        # run (chatbridge.Bridge.from_settings), so a probe run every AUTH_PROBE_S would only fail
+        # again. False until a key is saved (its stamp then ends the pause); else one run asks the endpoint.
+        from .. import endpoint
+        s = ((cfg or {}).get("providers") or {}).get(self.name)
+        alias = s.get("endpoint") if isinstance(s, dict) else ""
+        if not alias:
+            return None
+        try:
+            got = endpoint.credentials(alias)
+            if not got:
+                return False
+            url = s.get("base_url") or ""
+            return None if not url or endpoint.base_url(url) == endpoint.base_url(got[1]) else False
+        except Exception:   # an unreadable store or a bad URL: a run reports it
+            return None
+
     def resolved_session(self, argv, cwd, env=None):
         # The bridge sends every request to the model the run was built with (start_run passes the
         # same name to --model and to the bridge), an upstream id taken as it is: nothing resolves

@@ -466,6 +466,34 @@ def test_a_chat_run_without_a_usable_key_goes_to_the_auth_gate(env, monkeypatch)
     assert plain["status"] == "failed" and "daemon:launch" in seen
 
 
+def test_a_chat_pause_without_a_saved_key_starts_no_probe_runs(env, monkeypatch):
+    """No key saved for the configured endpoint: every chat run fails at launch, so the logged-out pause
+    is checked model-free (Chat.login_state) and no probe run starts every AUTH_PROBE_S. Saving the key
+    ends the pause; a key saved for another URL keeps it."""
+    from ttp import alerts, endpoint, project
+    from ttp.daemon import AUTH_PROBE_S, Daemon
+    from ttp.providers import get_provider
+    monkeypatch.setattr(project, "HOME_DIR", env["tmp"] / "secrets-home")
+    p = make(env)
+    _chat_config(p)
+    d = Daemon(p.base)
+    chat = get_provider("chat")
+    assert chat.login_state(d.cfg) is False and chat.login_state({}) is None
+    assert get_provider("fake").login_state(d.cfg) == get_provider("fake").login_check()
+    d.open_breaker("chat", "failed to authenticate: no key saved for endpoint 'cloud'")
+    for step in range(3):   # each backoff step: still no key, still no probe run
+        p.db.set_kv(alerts.BREAKER + "chat", {**alerts.breaker(p.db, "chat"), "next_check": 0})
+        d.check_logins()
+        assert d._logged_out("chat") and not alerts.breaker(p.db, "chat").get("probe")
+        assert not d._may_probe("chat", time.time() + (step + 1) * AUTH_PROBE_S)
+    endpoint.save("cloud", "https://other.example.com/v1", _CB_KEY, True, "HTTP 200")
+    assert chat.login_state(d.cfg) is False, "the bridge sends the key only to its own URL"
+    endpoint.save("cloud", "https://api.example.com/v1", _CB_KEY, True, "HTTP 200")
+    assert chat.login_state(d.cfg) is None
+    d.check_logins()   # the saved key changed the store's stamp: the pause ends at once
+    assert not d._logged_out("chat")
+
+
 # Upstream model ids as chat endpoints name them: '/', '.', ':', '-', '_', '@' and uppercase.
 CHAT_MODELS = ("org-name/Model-V2.5-32B-Instruct:free", "accounts/acme/models/model_v3p1@2026-01", "Big.Model:Q4_K_M")
 
