@@ -3153,7 +3153,12 @@ the pick order, so it takes the first starts. A resumed resource ramps only its 
   a command the push branch tip fails alone blames no change), `push_landing_alert_h` (default 4:
   when approvals have waited this many hours with nothing landed on the push branch and at least
   two batches tried them, one high alert says so, with the attempt count and how many a host
-  reboot cut short; it clears when a batch lands; 0 = off), `push_script_torn_escalate_after`
+  reboot cut short; it clears when a batch lands; 0 = off; separately, when approvals have waited
+  15 minutes with no batch running and the push resource is not paused, one `push_no_batch` status
+  alert and one coordinator event name what holds the batch: the push lock's holder (a detached
+  single push), a tt-project upgrade in flight, a checks host env fault, the batch window, or a due
+  batch the start step has not taken; `ttp status` shows it until a batch starts or no approval
+  waits), `push_script_torn_escalate_after`
   (default 3: when batches are held this many times in a row because one check failed twice on a
   transient syntax error in a script outside the change, one high `push_script_torn` alert names the
   check, the scripts and the batches; each check counts on its own, and the alert clears once that

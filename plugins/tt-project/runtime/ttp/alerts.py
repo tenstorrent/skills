@@ -75,6 +75,7 @@ CLEARED_TEXT = {
     "after_push_failed": "after_push no longer fails: the last one succeeded, or after_push is off.",
     "push_queue_dying": "Push batches finish again.",
     "push_not_landing": "A push batch landed on the push branch again.",
+    "push_no_batch": "A push batch started, or no approved change waits any more.",
     "push_scope": "The changes held for the token scope `{arg}` pushed or left the push queue.",
     "push_tip_failing": "The push branch tip passes its checks again, or it moved: push batches go on as usual.",
     "push_target_unreachable": "The push target's remote answers again, or delivery.push_branch changed: push batches go on.",
@@ -121,7 +122,7 @@ CLEARED_SEVERITY = {"network": "low", "paused": "low", "fleethold": "low", "coor
 # pause-gone: an open machine-ledger entry resumes a project pause that is gone (pausegone.py); the entry
 # closing or the pause coming back clears it.
 STATUS_CONDITIONS = ("budget", "limit", "deploy", "deploy-behind", "deploy-pending", "daemon-hang", "account-mismatch",
-                     "tick-step", "chat-silent", "lock-wait", "pause-gone")
+                     "tick-step", "chat-silent", "lock-wait", "pause-gone", "push_no_batch")
 
 
 def _urgent(severity: str | None) -> bool:
@@ -332,6 +333,10 @@ def holds(db: DB, key: str, since: float, now: float) -> bool:
     if key == "push_queue_dying":   # a batch a reboot cut short did not finish either
         return not db.one("SELECT id FROM push_batches WHERE outcome IS NOT NULL AND outcome NOT IN "
                           "('died','error','rebooted') AND finalized>=? LIMIT 1", (since,))
+    if key == "push_no_batch":   # pushq.check_no_batch: until a batch starts or no approval waits
+        return (bool(((db.kv("push_queue") or {}).get("no_batch") or {}).get("alerted"))
+                and bool(db.one("SELECT id FROM push_queue WHERE status='approved' LIMIT 1"))
+                and not db.one("SELECT id FROM push_batches WHERE after_finalized IS NULL LIMIT 1"))
     if key == "push_not_landing":   # pushq.check_landing: until a batch lands
         if not db.one("SELECT id FROM push_queue WHERE status IN ('approved','batched') LIMIT 1"):
             return False   # every waiting approval was withdrawn or cancelled
@@ -356,7 +361,7 @@ def active(db: DB, key: str, ts: float, now: float) -> bool:
 def _checkable(key: str) -> bool:
     return key.partition(":")[0] in ("auth", "limit", "budget", "relayed", "disk", "coordinator", "run-start",
                                          "schedule", "release-older", "integrity", "integrity-host", "pr-ready", "config",
-                                         "push_rejected", "after_push_failed", "push_queue_dying", "push_not_landing", "push_tip_failing", "push_target_unreachable", "push_script_torn", "push_setup_fault",
+                                         "push_rejected", "after_push_failed", "push_queue_dying", "push_not_landing", "push_no_batch", "push_tip_failing", "push_target_unreachable", "push_script_torn", "push_setup_fault",
                                          "push_scope", "heal",
                                          "heal-hold", "machine", "machine-change", "network", "deploy", "deploy-behind", "deploy-pending", "redeploy", "daemon-hang", "paused", "fleethold",
                                          "coord-budget", "account-mismatch", "linger-off", "tick-step", "pause-gone", "notifier", "chat-silent", "user-step", "slurm-paused", "gh-auth", "ssh-agent")

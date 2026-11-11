@@ -5060,6 +5060,87 @@ def test_the_landing_alert_is_off_at_zero(env, monkeypatch):
     assert not pushq.check_landing(s.p, now=time.time() + 10 ** 6)
 
 
+def test_a_backlog_of_approvals_or_one_priority_one_starts_a_batch_at_once(env, monkeypatch):
+    """delivery.push_batch_max approvals (default 8), or one priority-1 approval, start a batch at once:
+    no batch window, no gap after an unclean batch, no wait for a running review."""
+    from ttp import pushq
+    s = _pq(env, monkeypatch, push_batch_s=10 ** 6, push_min_gap_s=10 ** 6)
+    s.p.db.update_task(s.review, status="running")
+    _pq_earlier(s)
+    now = time.time() + 1
+    s.p.db.x("INSERT INTO push_batches(id,marker,target,started,ended,finalized,after_finalized,outcome) "
+             "VALUES('b1','m','origin/proj',?,?,?,?,'died')", (now - 4000, now - 600, now - 600, now - 600))
+    rows = [_pq_review(s)[1] for _ in range(pushq.DEFAULT_BATCH_MAX - 1)]
+    got, why = pushq.due(s.p, now)
+    assert got == [] and "gap" in why
+    rows.append(_pq_review(s)[1])
+    got, why = pushq.due(s.p, now)
+    assert [r["id"] for r in got] == rows and f"{len(rows)} approvals" in why
+    s.p.db.x(f"DELETE FROM push_queue WHERE id IN ({','.join('?' * (len(rows) - 1))})", rows[1:])
+    one = _pq_review(s, priority=1)[1]
+    got, why = pushq.due(s.p, now)
+    assert [r["id"] for r in got] == [one, rows[0]] and "priority 1-2" in why
+
+
+def test_approvals_waiting_with_no_batch_alarm_once_naming_what_holds_it_and_clear_once_one_starts(env, monkeypatch):
+    from ttp import alerts, locks, push, pushq, release
+    from ttp.daemon import Daemon
+    s = _pq(env, monkeypatch, push_batch_s=10 ** 6)
+    s.p.db.update_task(s.review, status="running")
+    _pq_earlier(s)
+    [_pq_review(s) for _ in range(2)]
+    d = Daemon(s.p.base)
+    t0 = time.time()
+    assert not pushq.check_no_batch(s.p, d.cfg, d.alert, now=t0 + pushq.NO_BATCH_S - 60), "under 15 min"
+    held = locks.try_take(push.lock_paths(s.p, "origin", "proj"), "task #7 (run 9)", "ttp push --detach")
+    up = locks.try_take([release.upgrade_lock(s.p)], "ttp upgrade", "ttp upgrade")
+    monkeypatch.setattr(pushq.envfault, "held", lambda p, now: "the checks host lacks python3")
+    later = t0 + pushq.NO_BATCH_S + 60
+    try:
+        assert pushq.check_no_batch(s.p, d.cfg, d.alert, now=later)
+        assert not pushq.check_no_batch(s.p, d.cfg, d.alert, now=later + 600), "once per stall"
+    finally:
+        held.close()
+        up.close()
+    [msg] = s.p.db.q("SELECT text, severity FROM messages WHERE kind='alert' AND ref=?", (pushq.NO_BATCH_ALERT,))
+    assert "2 approved changes have waited 16 min and no push batch runs" in msg["text"], msg["text"]
+    for hold in ("the push lock is held by task #7 (run 9)", "a tt-project upgrade is in flight",
+                 "a checks host env fault: the checks host lacks python3"):
+        assert hold in msg["text"], msg["text"]
+    [ev] = s.p.db.q("SELECT text, status FROM events WHERE kind=?", (pushq.NO_BATCH_ALERT,))
+    assert ev["status"] == "queued" and ev["text"] == msg["text"], "one event wakes the coordinator"
+    line = pushq.status_line(s.p)
+    assert "no batch for" in line and "the push lock is held by task #7" in line, line
+    assert alerts.holds(s.p.db, pushq.NO_BATCH_ALERT, t0, time.time())
+    s.p.db.x("INSERT INTO push_batches(id,marker,target,started) VALUES('b','m','origin/proj',?)", (time.time(),))
+    assert pushq.NO_BATCH_ALERT in [ep["key"] for ep in alerts.sweep(s.p.db)], "a batch starting clears it"
+    assert not pushq.check_no_batch(s.p, d.cfg, d.alert, now=later + 1200)
+    assert "no_batch" not in pushq._state(s.p.db) and "no batch for" not in pushq.status_line(s.p)
+
+
+@pytest.mark.parametrize("case", ["window", "due", "paused"])
+def test_the_no_batch_alarm_names_the_batch_window_or_a_due_batch_and_skips_a_paused_push(env, monkeypatch, case):
+    from ttp import pushq
+    from ttp.db import PAUSED_RESOURCES_KEY
+    s = _pq(env, monkeypatch, push_batch_s=0 if case == "due" else 10 ** 6)
+    s.p.db.update_task(s.review, status="running")
+    _pq_earlier(s)
+    _pq_review(s)
+    if case == "paused":
+        s.p.db.set_kv(PAUSED_RESOURCES_KEY, {"push": {"reason": "user", "since": time.time(), "by": "user"}})
+    later = time.time() + pushq.NO_BATCH_S + 60
+    told = []
+    assert pushq.check_no_batch(s.p, alert=lambda *a, **k: told.append(a)) is False, "a fresh approval"
+    assert pushq.check_no_batch(s.p, alert=lambda *a, **k: told.append(a), now=later) is (case != "paused")
+    if case == "paused":
+        assert not told, "a paused push is no stall"
+    else:
+        [(key, text)] = told
+        assert key == pushq.NO_BATCH_ALERT and "1 approved change has waited" in text
+        assert ("the batch window (delivery.push_batch_s, 1000000 s) waits for more approvals" if case == "window"
+                else "a batch is due") in text, text
+
+
 def test_a_daemon_restart_mid_batch_finalizes_from_the_marker(env, monkeypatch):
     from ttp import pushq
     s = _pq(env, monkeypatch)

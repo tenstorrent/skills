@@ -111,6 +111,8 @@ TIP_FIX_RE = re.compile(r"\bfix(?:es|ing)?\b[^.\n]{0,80}?\b(?:tip|pre-?existing 
                         re.I)   # a spec or hand-off saying its change fixes the failing tip
 DEFAULT_LANDING_ALERT_H = 4     # delivery.push_landing_alert_h: approvals waiting this long with no landing alert (high)
 LANDING_ALERT = "push_not_landing"   # the keyed alert while nothing lands despite batches (alerts.holds)
+NO_BATCH_ALERT = "push_no_batch"   # the keyed alert while approvals wait and no batch runs (alerts.holds)
+NO_BATCH_S = 900                # ... raised once approvals waited this long with no batch running
 UNREACH_ALERT = "push_target_unreachable"   # the keyed alert while the target's remote cannot be reached (alerts.holds)
 UNREACH_AFTER = 3               # batches in a row that could not reach the target's remote before the queue stops and alerts
 UNREACH_PROBE_S = 1800          # ... then the remote is asked this often, model-free, instead of starting batches
@@ -3117,6 +3119,7 @@ def tend(p: Project, cfg: dict | None = None, alert: Callable = lambda *a, **k: 
         queue_off(p, cfg)
     changed = finalize(p, cfg, alert)
     check_landing(p, cfg, alert)
+    check_no_batch(p, cfg, alert)
     tend_scope_holds(p, cfg)
     return changed
 
@@ -3153,6 +3156,72 @@ def check_landing(p: Project, cfg: dict | None = None, alert: Callable = lambda 
                          f"{(now - since) / 3600:.1f} h although approvals wait: {len(tries)} push batch"
                          f"{'es' if len(tries) != 1 else ''} tried, {cut} of them cut short by a host reboot. "
                          f"The queue keeps retrying; this clears once a batch lands.", severity="high")
+    return True
+
+
+def no_batch_holds(p: Project, cfg: dict | None = None, now: float | None = None) -> list[str]:
+    """What keeps a batch from starting while approvals wait (check_no_batch): the push lock's holders
+    (a detached single push), a tt-project upgrade in flight, a checks host env fault, the batch window
+    or due's other reason; or that a batch is due and the start step has not taken it."""
+    from . import release
+    now = time.time() if now is None else now
+    rows, why = due(p, now=now, cfg=cfg)
+    out = []
+    if tgt := target(p):
+        paths = list(push.lock_paths(p, *tgt)) + sorted((p.state / "locks").glob("push:run-*.lock"))
+        if who := locks.holders_now(paths, p):
+            out.append("the push lock is held by " + "; ".join(who[:3]))
+    if release._taken(release.upgrade_lock(p)):
+        out.append("a tt-project upgrade is in flight")
+    env = envfault.held(p, now)
+    if env:
+        out.append(f"a checks host env fault: {env}")
+    if rows:
+        out.append(f"a batch is due ({why}) but the start step has not taken it: the push remote may be "
+                   f"unreachable or the daemon's tick may not reach its start step")
+    elif why == "waiting for more approvals":
+        window = _num(_delivery(p, cfg).get("push_batch_s"), DEFAULT_BATCH_S, float, 0)
+        out.append(f"the batch window (delivery.push_batch_s, {window:.0f} s) waits for more approvals")
+    elif why and why != env and not (out and why == "another push holds its turn"):
+        out.append(why)
+    return out or ["no hold found"]
+
+
+def check_no_batch(p: Project, cfg: dict | None = None, alert: Callable = lambda *a, **k: None,
+                   now: float | None = None) -> bool:
+    """Raise NO_BATCH_ALERT once per stall: approvals have waited NO_BATCH_S, since the oldest was
+    approved or the last batch freed the queue, and no batch runs. It names what holds the batch
+    (no_batch_holds) and queues one event for the coordinator; alerts.holds clears it once a batch
+    starts or no approval waits. A paused push resource is not a stall. Returns whether it alerted now."""
+    now = time.time() if now is None else now
+    db = p.db
+    st = _state(db)
+    oldest = db.one("SELECT MIN(created) AS t FROM push_queue WHERE status='approved'")
+    stalled = (enabled(p, cfg) and oldest and oldest["t"] is not None
+               and not db.one("SELECT id FROM push_batches WHERE after_finalized IS NULL LIMIT 1"))
+    if not stalled:
+        if st.pop("no_batch", None) is not None:
+            db.set_kv(KV, st)
+        return False
+    if (st.get("no_batch") or {}).get("alerted"):
+        return False
+    paused = db.paused_resources()
+    tgt = target(p)
+    if "push" in paused or (tgt and push.lock_name(*tgt) in paused):
+        return False
+    last = db.one("SELECT MAX(COALESCE(after_finalized, finalized, ended, started)) AS t FROM push_batches")
+    since = max(float(oldest["t"]), float(last["t"] or 0) if last else 0.0)
+    if now - since < NO_BATCH_S:
+        return False
+    holds = no_batch_holds(p, cfg, now)
+    n = db.one("SELECT COUNT(*) AS n FROM push_queue WHERE status='approved'")["n"]
+    text = (f"{n} approved change{'s' if n != 1 else ''} {'have' if n != 1 else 'has'} waited "
+            f"{(now - since) / 60:.0f} min and no push batch runs. What holds it: {'; '.join(holds)}. "
+            f"This clears once a batch starts.")
+    st["no_batch"] = {"alerted": True, "since": since, "at": now, "holds": holds}
+    db.set_kv(KV, st)
+    alert(NO_BATCH_ALERT, text, severity="normal")
+    _event(db, None, NO_BATCH_ALERT, text, queued=True)
     return True
 
 
@@ -3354,6 +3423,10 @@ def status_line(p: Project, now: float | None = None, sm: dict | None = None, db
                      + (f" {_age(now - lp['ended'])} ago" if lp["ended"] else "") + push.reach_words(lp.get("reach")))
         if lp["after_push"] in AFTER_WORDS and lp["after_push"] != "skipped":
             parts.append(AFTER_WORDS[lp["after_push"]])   # while it deploys, the live part says so
+    stall = (_state(db or p.db).get("no_batch") or {}) if n and not live else {}
+    if stall.get("alerted"):   # check_no_batch: approvals wait and no batch runs
+        parts.append(f"no batch for {_age(now - float(stall.get('since') or now))}: "
+                     + "; ".join(stall.get("holds") or []))
     if got := sm.get("landed_24h"):
         parts.append(f"{got} batch{'es' if got != 1 else ''} landed in 24 h ({sm['landings_per_h']:g}/h)")
     return "push queue" + ("" if sm["on"] else " (off)") + ": " + " · ".join(parts)
