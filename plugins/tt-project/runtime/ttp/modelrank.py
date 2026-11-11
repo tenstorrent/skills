@@ -39,6 +39,7 @@ Only the chat provider has a served list; Claude Code, Codex and Cursor models a
 """
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
@@ -131,6 +132,35 @@ def mid_text(run_id, frm: str, to: str, why: str) -> str:
     """A mid-run swap's low alert."""
     return (f"Model {frm} went away on the {route.TO} provider during run {run_id} ({why}); the run went on "
             f"with {to}, the highest-ranked model it serves (providers.{route.TO}.model_ranking), in the same session.")
+
+
+def ran(model: str, note) -> tuple[str, str]:
+    """(the model a run finished on, the model it was asked to run, '' when the same) from its runs row's
+    `model` and note: a mid-run swap (model_rank.mid_run, chatbridge.py) ran its stand-in, never `model`."""
+    try:
+        e = (json.loads(note or "{}") if isinstance(note, str) else note or {}).get(KEY)
+    except (ValueError, AttributeError):
+        e = None
+    mid = e.get("mid_run") if isinstance(e, dict) else None
+    if not mid or not isinstance(mid, list) or not all(isinstance(m, dict) for m in mid):
+        return model, ""
+    final = str(e.get("ran") or mid[-1].get("to") or model)
+    asked = str(e.get("asked") or mid[0].get("from") or "")
+    return final, asked if asked != final else ""
+
+
+def label(model: str, note, run_dir=None) -> str:
+    """A run's model as shown: 'B (stand-in for A)' when a mid-run swap ran B in place of the asked-for A;
+    a running run's swap is read from its run dir (chatbridge.SWAP_FILE)."""
+    final, asked = ran(model, note)
+    if not asked and run_dir:
+        from .chatbridge import SWAP_FILE
+        try:
+            e = json.loads((Path(run_dir) / SWAP_FILE).read_text())
+            final, asked = str(e["ran"]), str(e["asked"])
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+    return f"{final} (stand-in for {asked})" if asked and asked != final else final
 
 
 def parked(db, model: str, now: float) -> bool:

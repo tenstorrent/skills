@@ -5,7 +5,8 @@ being picked for that class. Model-free; it generalizes modeltrip.py's routed-vs
 model.
 
 A sample is a task that ended done or failed in the last `days` whose first worker run ran on the chat
-provider: its model and class ("review" for a review, else the run's tier) are that run's. It is bad by
+provider: its model and class ("review" for a review, else the run's tier) are that run's; a run a mid-run
+swap (chatbridge.py) finished on a stand-in is the stand-in's sample (modelrank.ran), never the asked-for model's. It is bad by
 modeltrip's rules (failed, a run's checks failed, a review of it failed, rework) or when a run of it fell
 back on the model's own fault (modelrank.FAULTS_PARK). Per class, the models are ordered by the class's
 ranking (providers.chat.class_ranking.<class> where set, else modelrank.ranking). A model's peer is the
@@ -133,7 +134,7 @@ def samples(p, cfg: dict, since: float, until: float) -> dict[int, dict]:
             ent = {}
         on = r["provider"] == route.TO and bool(r["model"])
         if r["task"] not in out:   # the first run decides the task's model and class
-            out[r["task"]] = {"model": r["model"], "cls": "review" if r["kind"] == "review"
+            out[r["task"]] = {"model": modelrank.ran(r["model"], r["note"])[0], "cls": "review" if r["kind"] == "review"
                               else str(ent.get("tier") or "standard"), "at": float(r["started"]),
                               "wall": ent.get("wall_s"), "bad": r["status"] == "failed", "fault": False} if on else None
         if (s := out[r["task"]]) is None or not on:

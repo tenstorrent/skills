@@ -1781,6 +1781,7 @@ def status_text(p: Project, verbose: bool = False) -> str:
         lines.append(f"  running {since(w['started'], now)}: {what}" + (f" ({w['wake']} wake)" if w.get("wake") else "")
                      + (f" [{w['floor']}]" if w.get("floor") else "")
                      + (f" [sandbox {w['sandbox']}]" if w.get("sandbox") else "")
+                     + (f" [on {w['model']}]" if "(stand-in for " in str(w.get("model") or "") else "")
                      + (f" [{topup.words(topped[w['task']])}]" if w["task"] in topped else "")
                      + (f" — {w['note']}" if w["note"] else ""))
     if stuck or h.get("drivers_stalled"):

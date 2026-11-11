@@ -75,6 +75,7 @@ CONVERSATION = frozenset({"model", "messages", "tools", "tool_choice", "parallel
                           "function_call", "stream", "stream_options", "n", "max_tokens"})
 REJECT_STATUSES = (400, 422)
 REFUSAL_CODES = ("model_not_found", "unrecognized_model")   # error codes that refuse the run's model
+SWAP_FILE = "stand-in.json"   # in the run dir: {asked, ran} once a mid-run swap ran a stand-in (live views)
 SWAP_ERRORS = 3   # 5xx or no-answer calls in a row that swap a model the served lists no longer name
 
 
@@ -556,6 +557,7 @@ class Bridge:
         self.standins = [s for s in standins or () if isinstance(s, dict) and s.get("model")]   # ranked, best first
         self.served = [str(d) for d in served or ()]   # state dirs whose served list (route.MODELS_FILE) is read
         self.mid_run: list[dict] = []   # each swap: {from, to, at, why}
+        self.on_swap = None   # called with {asked, ran} after each swap (the runner's live SWAP_FILE)
         self._errs, self._left, self._swap_lock = 0, set(), threading.Lock()   # 5xx/no-answer run; models left
         self.server: http.server.ThreadingHTTPServer | None = None
         self.thread: threading.Thread | None = None
@@ -628,7 +630,8 @@ class Bridge:
             kind = "model_missing"   # a bare 404, and the endpoint's /models leaves the model out
         self.last_fault = kind
         self.upstream = upstream_of(status, detail, self._key)
-        self._errs = self._errs + 1 if status == 0 or status >= 500 else 0
+        with self._swap_lock:   # calls in parallel count their errors in a row, none lost
+            self._errs = self._errs + 1 if status == 0 or status >= 500 else 0
         if kind:
             self.faults[kind] = self.faults.get(kind, 0) + 1
 
@@ -656,7 +659,8 @@ class Bridge:
         return error_for(502, detail)
 
     def _ok(self) -> None:
-        self.last_fault, self.upstream, self._errs = "", {}, 0
+        with self._swap_lock:
+            self.last_fault, self.upstream, self._errs = "", {}, 0
 
     def _served_ids(self) -> list[str] | None:
         """The ids the served lists name now (modelrank.served, each fresh), or None when none is known."""
@@ -699,7 +703,13 @@ class Bridge:
             self.context_window = int(alt.get("context_window") or 0)
             self._listed, self._errs, self.last_fault, self.upstream = "", 0, "", {}
             self.mid_run.append({"from": used, "to": alt["model"], "at": round(time.time(), 3), "why": why})
-            return True
+            now = {"asked": self.mid_run[0]["from"], "ran": self.model}
+        if self.on_swap:
+            try:
+                self.on_swap(now)
+            except Exception:   # a live display hint, never the run's fault
+                pass
+        return True
 
     def stats(self) -> dict:
         """For the run's exit record: fault kinds, and the last failed answer's HTTP status and error
@@ -719,24 +729,27 @@ class Bridge:
 
     def forward(self, h: _Handler, body: dict) -> None:
         while True:
-            used = self.model
+            with self._swap_lock:   # one model and its own fields: a swap in another call changes all three
+                used, fields, rejected = self.model, dict(self.fields), self.rejected
             if self._errs >= SWAP_ERRORS and self._swapped(used):   # e.g. a stream that broke 3 times
                 continue
             req = to_chat(body, used, self.max_tokens)
             try:
                 try:
-                    resp = self._open(with_fields(req, {} if self.rejected else self.fields))
+                    resp = self._open(with_fields(req, {} if rejected else fields))
                 except urllib.error.HTTPError as e:
-                    if self.rejected or not self.fields:
+                    if rejected or not fields:
                         raise
                     try:
                         detail = e.read(2000).decode("utf-8", "replace")
                     except Exception:
                         detail = ""
-                    if not rejects(e.code, detail, self.fields):
+                    if not rejects(e.code, detail, fields):
                         e.ttp_detail = detail   # read once: the handler below reports it
                         raise
-                    self.rejected = True   # once, then the rest of the run goes without them
+                    with self._swap_lock:   # once, then the rest of the run goes without them (`used`'s only)
+                        if self.model == used:
+                            self.rejected = True
                     resp = self._open(req)
             except urllib.error.HTTPError as e:
                 detail = getattr(e, "ttp_detail", None)

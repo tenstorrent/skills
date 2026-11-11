@@ -9,7 +9,8 @@ rows: every project's daemon whose chat provider has an endpoint replaces its ow
 its tasks (n: the ended tasks whose first chat run it was, not counting a run an endpoint fault ended), their
 first-try done runs (first_done: that run handed off without a fallback), the bad ones by modeltrip.py's sample rules (failed, checks_failed,
 review_failed, rework), the runs' fallback, no_handoff and salvaged ends, the median wall time per task and
-the output tokens per second. Rows of a project not seen for DAYS are dropped.
+the output tokens per second. Rows of a project not seen for DAYS are dropped. A run a mid-run swap
+(chatbridge.py) finished on a stand-in counts for the stand-in (modelrank.ran), never for the model it asked for.
 
 Bench (bench): each conclusive result of the host's daily bench (modelbench.py's day files) and every row of
 model-bench/*.jsonl ({"model", "score" 0-1 or 0-100, "suite", "class", "inject_ok": false on a failed
@@ -62,6 +63,7 @@ def class_of(kind: str | None, tier: str | None) -> str:
 
 def live_rows(p, now: float, days: int = DAYS) -> dict[str, dict[str, dict]]:
     """{model: {class: row}} of this project's chat runs started in the last `days`."""
+    from . import modelrank
     from .modeltrip import mark_reworked
     from .prguard import CHECKS_FILE
     since, rows, samples, walls, seen = now - days * 86400, {}, {}, {}, set()
@@ -71,7 +73,8 @@ def live_rows(p, now: float, days: int = DAYS) -> dict[str, dict[str, dict]]:
                     (route.TO, since, now)):
         e = route.of(r["note"]) or {}
         cls, fell = class_of(r["kind"], e.get("tier") or r["tier"]), e.get("fallback") or "none"
-        s = rows.setdefault(r["model"], {}).setdefault(cls, dict.fromkeys(COUNTS, 0) | {"tok_wall_s": 0.0})
+        model = modelrank.ran(r["model"], r["note"])[0]   # a swapped run is its stand-in's, not the asked-for one's
+        s = rows.setdefault(model, {}).setdefault(cls, dict.fromkeys(COUNTS, 0) | {"tok_wall_s": 0.0})
         wall = float(r["ended"]) - float(r["started"]) if r["ended"] and r["started"] else 0.0
         s["runs"] += 1
         s["fallback"] += fell != "none"
@@ -80,7 +83,7 @@ def live_rows(p, now: float, days: int = DAYS) -> dict[str, dict[str, dict]]:
         if int(r["output_tokens"] or 0) and wall > 0:
             s["out_tokens"] += int(r["output_tokens"])
             s["tok_wall_s"] += wall
-        k = (r["model"], cls, r["task"])
+        k = (model, cls, r["task"])
         walls[k] = walls.get(k, 0.0) + wall
         if r["task"] is not None and r["task"] not in seen and r["tstatus"] in ("done", "failed") and fell in OWN:
             seen.add(r["task"])   # the task's first chat run decides its model

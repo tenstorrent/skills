@@ -6104,8 +6104,9 @@ class Daemon:
         elif r["provider"] in self._net_holds and (status == "ok" or _has_tokens(usage)):
             self._end_net_hold(r["provider"], f"run {r['id']} reached its API")
         note = json.loads(r["note"] or "{}")
+        swapped = ""   # the stand-in a mid-run swap finished on: runs.model, never the asked-for model's run
         if mid := (exit_info.get("bridge") or {}).get("mid_run"):
-            self._rank_mid_run(r, note, mid)
+            swapped = self._rank_mid_run(r, note, mid, str((exit_info.get("bridge") or {}).get("model") or ""))
         if routed:
             note[route.KEY] = {**routed, **({"fallback": fell} if fell else {}), **({"salvaged": True} if salvaged else {}),
                                **({"cause": _route_cause(stopped or status, exit_info, usage, run_dir)} if own else {}),
@@ -6122,7 +6123,7 @@ class Daemon:
                                 f"{sent['effort'] or '-'} ({', '.join(sent['fields'])}); run {r['id']} went on without them")
             # Only a run that ran on it counts: a hand-off is a good run, its own fault (FAULTS_PARK) a bad one;
             # a start that fell back before it (no room, auth) or a run killed, capped or slept books nothing.
-            if (routed.get(modelrank.KEY) or {}).get("why") == modelrank.BETTER and on_route and (
+            if (routed.get(modelrank.KEY) or {}).get("why") == modelrank.BETTER and on_route and not swapped and (
                     handed_off or fell in modelrank.FAULTS_PARK) and (verdict := modelrank.tried(
                     db, ran := r["model"] or routed["model"], fell, r["id"], time.time())):   # a smarter model's try
                 log(self.p, f"model ranking: {ran} {verdict} (run {r['id']}{': ' + fell if fell else ''})")
@@ -6281,10 +6282,10 @@ class Daemon:
             with rnd:
                 db.x("UPDATE runs SET ended=?, status=?, exit_code=?, cost_usd=?, cost_estimated=?, cost_basis=?, "
                      "input_tokens=?, output_tokens=?, cache_read_tokens=?, cache_write_tokens=?, note=?, "
-                     "session_id=COALESCE(NULLIF(?,''), session_id) WHERE id=?",
+                     "session_id=COALESCE(NULLIF(?,''), session_id), model=COALESCE(NULLIF(?,''), model) WHERE id=?",
                      (ended, status, exit_info.get("rc"), usage.cost_usd,
                       int(usage.estimated), basis, usage.input_tokens, usage.output_tokens, usage.cache_read_tokens,
-                      usage.cache_write_tokens, json.dumps(note), usage.session_id or "", r["id"]))
+                      usage.cache_write_tokens, json.dumps(note), usage.session_id or "", swapped, r["id"]))
                 db.spend(r["provider"], usage.cost_usd, source, account=r["account"] or "", estimated=usage.estimated,
                          tokens_in=usage.input_tokens + usage.cache_read_tokens + usage.cache_write_tokens,
                          tokens_out=usage.output_tokens, ts=ended)
@@ -12232,14 +12233,16 @@ class Daemon:
         got = modelrank.standins(self.p.db, self.cfg, model, time.time())
         return {"standins": got, "served": [str(self.p.state)]} if got else {}
 
-    def _rank_mid_run(self, r: dict, note: dict, mid: list) -> None:
-        """Keep a run's mid-run swaps (chatbridge.py) in its note (model_rank.mid_run), one low alert and
-        log line each; a refused model is down for new starts (modelrank.refused)."""
+    def _rank_mid_run(self, r: dict, note: dict, mid: list, final: str = "") -> str:
+        """Keep a run's mid-run swaps (chatbridge.py) in its note (model_rank.mid_run, with the asked-for
+        model and the one it finished on), one low alert and log line each; a refused model is down for new
+        starts (modelrank.refused). Returns the model it finished on (runs.model), or '' with no swap."""
         rows = [m for m in mid if isinstance(m, dict) and m.get("from") and m.get("to")]
         if not rows:
-            return
+            return ""
+        final = final or str(rows[-1]["to"])
         kept = note.get(modelrank.KEY) if isinstance(note.get(modelrank.KEY), dict) else {}
-        note[modelrank.KEY] = {**kept, "mid_run": rows}
+        note[modelrank.KEY] = {**kept, "mid_run": rows, "asked": str(rows[0]["from"]), "ran": final}
         for i, m in enumerate(rows):
             if m.get("why") == "refused":
                 modelrank.refused(self.p.db, str(m["from"]), r["id"], float(m.get("at") or time.time()))
@@ -12247,6 +12250,7 @@ class Daemon:
             self.alert(f"model-rank-mid:{r['id']}:{i}", modelrank.mid_text(r["id"], str(m["from"]), str(m["to"]),
                                                                             str(m.get("why") or "")),
                        severity="low", every_s=0)
+        return final
 
     def _rank_pick(self, where: str, key: str, model: str, now: float, cls: str = "") -> tuple[str, dict] | None:
         """(the model to run, {"from", "why"}) when `model` is down and the ranking (modelrank.py) names one

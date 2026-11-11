@@ -3663,6 +3663,70 @@ def test_the_launch_arms_stand_ins_except_for_a_required_pin_and_the_end_keeps_t
     assert modelrank.down(p.db, d.cfg, p.state, _RT_MODEL, time.time()) == "refused"
 
 
+
+def test_a_run_a_stand_in_finished_is_the_stand_ins_everywhere_never_the_asked_for_models(env, monkeypatch):
+    """Task #7923 (user msg #1924): a stand-in's work never shows as the asked-for model's: the run's model,
+    ttp stats --runs and the web app's runs, the scoreboard and the demotion samples all name the stand-in."""
+    from ttp import modeldemote, modelrank, modelscore, route, web
+    from ttp.daemon import Daemon
+    p = make(env)
+    d = Daemon(p.base)
+    _ranked(p, d, monkeypatch, ["rank-b", "rank-a", _RT_MODEL])
+    tid = p.db.add_task("build", "", kind="work", tier="light", priority=3, budget_usd=8.0, labels=[])
+    mid = [{"from": _RT_MODEL, "to": "rank-a", "at": time.time(), "why": "refused"}]
+    run, task = _route_finish(p, d, tid, {"rc": 0, "bridge": {"last_fault": "", "faults": {"model_missing": 1},
+                                                              "mid_run": mid, "model": "rank-a"}},
+                              result={"status": "done", "summary": "built"})
+    run = p.db.one("SELECT * FROM runs WHERE id=?", (run["id"],))
+    assert run["model"] == "rank-a", run["model"]
+    e = json.loads(run["note"])[modelrank.KEY]
+    assert (e["asked"], e["ran"]) == (_RT_MODEL, "rank-a")
+    shown = f"rank-a (stand-in for {_RT_MODEL})"
+    assert [r["model"] for r in route.runs(p.db, None, 0) if r["id"] == run["id"]] == [shown]
+    assert [r["model"] for r in web.state_payload(p, p.db)["runs"] if r["id"] == run["id"]] == [shown]
+    p.db.x("UPDATE tasks SET status='done' WHERE id=?", (tid,))
+    now = time.time() + 1
+    by = modelscore.live_rows(p, now)
+    assert "rank-a" in by and _RT_MODEL not in by, by
+    assert modeldemote.samples(p, d.cfg, 0, now)[tid]["model"] == "rank-a"
+    # A row kept before the fix (runs.model still the asked-for model) reads the same way.
+    p.db.x("UPDATE runs SET model=?, note=? WHERE id=?",
+           (_RT_MODEL, json.dumps({modelrank.KEY: {"mid_run": mid}}), run["id"]))
+    assert _RT_MODEL not in modelscore.live_rows(p, now)
+    assert modeldemote.samples(p, d.cfg, 0, now)[tid]["model"] == "rank-a"
+    assert modelrank.label(_RT_MODEL, "{}") == _RT_MODEL
+
+
+def test_a_swap_in_another_call_never_sends_the_stand_ins_fields_with_the_old_model(mock_chat, tmp_path, monkeypatch):
+    """Task #7923: forward() reads model, fields and rejected as one snapshot under the swap lock. A swap by a
+    parallel call lands between reading the model and sending (here: inside to_chat, deterministically)."""
+    from ttp import chatbridge
+    up = mock_chat(_MID_OK)
+    real = chatbridge.to_chat
+    with _mid_bridge(up, tmp_path, ["run-model", "alt-model"], fields={"reasoning_effort": "low"}) as b:
+        def racing(body, model, max_tokens):
+            with b._swap_lock:   # what a parallel call's _swapped does
+                b.model, b.fields, b.rejected = "alt-model", {"reasoning_effort": "high"}, False
+            return real(body, model, max_tokens)
+        monkeypatch.setattr(chatbridge, "to_chat", racing)
+        assert _post(b, _MID_ASK)[0] == 200
+    sent = [s["body"] for s in up.seen if "body" in s]
+    assert [(s["model"], s.get("reasoning_effort")) for s in sent] == [("run-model", "low")], sent
+
+
+def test_a_mid_run_swap_is_written_for_live_views_and_shown_as_a_stand_in(mock_chat, tmp_path):
+    """Task #7923: the runner's on_swap writes chatbridge.SWAP_FILE; a running run shows 'B (stand-in for A)'."""
+    from ttp import chatbridge, modelrank
+    up = mock_chat((404, {"error": {"message": "The model does not exist", "code": "model_not_found"}}), _MID_OK)
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    with _mid_bridge(up, tmp_path, ["alt-model"]) as b:
+        b.on_swap = lambda e: (run_dir / chatbridge.SWAP_FILE).write_text(json.dumps(e))
+        assert _post(b, _MID_ASK)[0] == 200
+    assert json.loads((run_dir / chatbridge.SWAP_FILE).read_text()) == {"asked": "run-model", "ran": "alt-model"}
+    assert modelrank.label("run-model", None, run_dir) == "alt-model (stand-in for run-model)"
+    assert modelrank.label("run-model", None, tmp_path / "none") == "run-model"
+
 def _bench_owners(env, names=("proj-a", "proj-b", "proj-c")):
     """Fake projects on the machine, each with a live daemon heartbeat and a chat endpoint."""
     ps = {}

@@ -510,11 +510,12 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
     working = db.q("SELECT r.id run, r.task, r.role, r.provider, r.model, r.effort, r.started, r.cost_usd, r.dir, "
                    "r.note run_note, t.title FROM runs r "
                    "LEFT JOIN tasks t ON t.id=r.task WHERE r.status='running' ORDER BY r.id")
-    from . import runwatch   # the daemon's live record of each run; the progress.md tail is the fallback
+    from . import modelrank, runwatch   # the daemon's live record of each run; the progress.md tail is the fallback
     live = runwatch.load(p)["runs"] if working else {}
     for w in working:
         rw = live.get(str(w["run"])) or {}
         w["sandbox"] = run_sandbox(w["dir"])
+        w["model"] = modelrank.label(w["model"], w["run_note"], w["dir"])   # a stand-in shows as one
         w["note"] = rw.get("note") or last_note(w.pop("dir"))
         w.pop("dir", None)
         w["doing"], w["checks"], w["files_n"] = runwatch.doing(rw), rw.get("checks") or "", rw.get("files_n") or 0
@@ -800,8 +801,11 @@ def state_payload(p: Project, db: DB) -> dict:
     for t in tasks:
         if t["id"] in trends:
             t["trend"] = trends[t["id"]]
-    runs = db.q("SELECT id,task,role,provider,model,effort,status,started,ended,cost_usd FROM runs "
+    runs = db.q("SELECT id,task,role,provider,model,effort,status,started,ended,cost_usd,note FROM runs "
                 "ORDER BY id DESC LIMIT 40")
+    from . import modelrank
+    for r in runs:   # 'B (stand-in for A)' after a mid-run swap: a stand-in's run never shows as A's
+        r["model"] = modelrank.label(r["model"], r.pop("note"))
     health_now = health(p, db, now=now)
     gates = db.kv("gates", {})
     return {

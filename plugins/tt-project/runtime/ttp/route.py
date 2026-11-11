@@ -735,6 +735,7 @@ def phrase(db, now: float | None = None) -> str:
 def runs(db, tier: str | None, since: float, until: float | None = None) -> list[dict]:
     """Worker runs with their provider, model, tier, outcome and wall time (`ttp stats --runs`): every
     worker run of the window, routed or not, so a tier's runs compare before and after routing."""
+    from . import modelrank
     routed = {r["id"]: r for r in _rows(db, since, until)}
     out = []
     for r in db.q("SELECT r.id, r.task, r.provider, r.model, r.status, r.started, r.ended, r.cost_usd, r.note, "
@@ -751,7 +752,8 @@ def runs(db, tier: str | None, since: float, until: float | None = None) -> list
             or r["task_tier"] or ""
         if tier and t != tier:
             continue
-        out.append({"id": r["id"], "task": r["task"], "tier": t, "provider": r["provider"], "model": r["model"],
+        out.append({"id": r["id"], "task": r["task"], "tier": t, "provider": r["provider"],
+                    "model": modelrank.label(r["model"], n),   # 'B (stand-in for A)' after a mid-run swap
                     "outcome": r["status"], "fallback": (e or {}).get("fallback", ""),
                     **({"escalated": e.get("escalated") or "", "cause": e.get("cause") or ""}
                        if (e or {}).get("fallback") == ESCALATED else {}),
@@ -771,7 +773,7 @@ def runs_text(rows: list[dict]) -> str:
             + (" (salvaged)" if r.get("salvaged") else "")
         wall = f"{r['wall_s'] / 60:.1f}m" if r["wall_s"] is not None else "-"
         lines.append(f"{r['id']:<6} {str(r['task'] or ''):<6} {str(r['tier'] or '-'):<9} {str(r['provider']):<9} "
-                     f"{str(r['model'] or '-')[:30]:<30} {out[:22]:<22} {wall:>6} {cost:>9}")
+                     f"{str(r['model'] or '-')[:48]:<30} {out[:22]:<22} {wall:>6} {cost:>9}")
     why: dict[str, int] = {}
     for r in rows:
         if r["fallback"] == ESCALATED:
