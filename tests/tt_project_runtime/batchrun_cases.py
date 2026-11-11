@@ -193,3 +193,18 @@ def test_batch_cost_split_pro_rata(env):
     a = p.db.task(a["id"])
     assert batchrun.budget(p.config(), lead, 8.0, [a]) == pytest.approx(10.0)   # a spent 2 of 4
     assert batchrun.budget(p.config(), lead, 8.0, [a, b, b, b]) == pytest.approx(25.0)
+
+
+def test_batch_never_leads_or_takes_a_task_with_a_branch_of_its_own():
+    # A PR's or another task's branch never collects other tasks' commits: a task with a pr_branch
+    # line or label, a PR fix, a continuation or an open PR neither leads nor joins; a lead's own
+    # recorded branch is its batch's.
+    from ttp import batchrun
+    plain = {"id": 1, "labels": "[]", "spec": "s"}
+    assert not batchrun.own_branch(plain)
+    assert not batchrun.own_branch(dict(plain, branch="ttp/t1-x"), recorded=False)
+    assert batchrun.own_branch(dict(plain, branch="ttp/t1-x"))
+    assert batchrun.own_branch(dict(plain, pr_url="https://example.invalid/pull/1"), recorded=False)
+    assert batchrun.own_branch(dict(plain, spec="pr_branch: feat/x"), recorded=False)
+    for lb in ("pr_branch:feat/x", "pr_fix:acme/widgets#7", "continues:5"):
+        assert batchrun.own_branch(dict(plain, labels=f'["{lb}"]'), recorded=False), lb

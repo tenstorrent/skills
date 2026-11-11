@@ -73,6 +73,15 @@ def _resourced(t: dict) -> bool:
                for lb in _labels(t))
 
 
+def own_branch(t: dict, recorded: bool = True) -> bool:
+    """`t` carries a branch of its own (a `pr_branch:` line or label, a PR fix, a continuation or, with
+    `recorded`, a branch on its record): it neither joins a batch nor leads one, so no other task's work
+    lands on a PR's or another task's branch. A lead's own recorded ttp/t<id> branch is its batch's."""
+    labels = _labels(t)
+    return bool((recorded and t.get("branch")) or t.get("pr_url") or "pr_branch:" in (t.get("spec") or "")
+                or any(str(x).startswith(("pr_branch:", "pr_fix:", "continues:")) for x in labels))
+
+
 def eligible(lead: dict, t: dict) -> bool:
     """`t` may join `lead`'s batch: a queued small code task of its repo with the same pins or none."""
     from .effort import USER_DEEP
@@ -80,7 +89,7 @@ def eligible(lead: dict, t: dict) -> bool:
         return False
     if t.get("tier") not in SMALL or _resourced(t) or USER_DEEP in _labels(t) or _repo(t) != _repo(lead):
         return False
-    if t.get("branch") or "pr_branch:" in (t.get("spec") or ""):   # carries a branch of its own
+    if own_branch(t):
         return False
     if (t.get("priority") or 3) <= 1:   # urgent work starts in a worker of its own, in parallel
         return False
@@ -101,7 +110,7 @@ def pick(p, cfg: dict, lead: dict, ready: list[dict], inflight: list[dict] | Non
     """The members to add to `lead`'s run, in the order the worker takes them: related tasks (sharing
     a path the lead's spec names) first, then by priority and id; a member after any member it depends
     on. `inflight`: running tasks on other branches, whose spec paths keep a candidate out."""
-    if not enabled(cfg) or lead.get("kind") != "code" or _resourced(lead):
+    if not enabled(cfg) or lead.get("kind") != "code" or _resourced(lead) or own_branch(lead, recorded=False):
         return []
     n = batch_max(cfg)
     if n <= 0:
