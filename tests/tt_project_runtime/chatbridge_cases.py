@@ -1730,6 +1730,21 @@ def test_a_model_pick_routing_one_tier_to_an_up_and_a_down_model_keeps_one_switc
     assert p.db.kv(modelrank.SWITCH + "light") is None and "back on" not in (p.logs / "daemon.log").read_text()
 
 
+def test_daemon_route_with_a_model_pick_keys_the_switch_by_tier_and_model(env, monkeypatch):
+    """#7710: Daemon._route passes pick=True for a model pick; the switch key is per tier and model."""
+    from ttp import modelpick, modelrank
+    from ttp.daemon import Daemon
+    p = make(env)
+    d = Daemon(p.base)
+    _ranked(p, d, monkeypatch, ["rank-a"])
+    monkeypatch.setattr(d, "_model_pick", lambda task, tier, peek=False: {"pick": 1})
+    monkeypatch.setattr(modelpick, "target", lambda cfg, dp: {"provider": "chat", "model": _RT_MODEL, "effort": ""})
+    entry = d._route({"id": None, "kind": "work"}, "light", None, time.time())
+    assert entry["model"] == "rank-a" and entry["model_pick"] is True
+    assert p.db.kv(modelrank.SWITCH + "light:pick:" + _RT_MODEL)["to"] == "rank-a"
+    assert p.db.kv(modelrank.SWITCH + "light") is None
+
+
 def test_a_model_left_out_of_the_served_list_is_ranked_and_an_empty_ranking_changes_nothing(env, monkeypatch):
     from ttp import modelrank, route
     from ttp.daemon import Daemon
