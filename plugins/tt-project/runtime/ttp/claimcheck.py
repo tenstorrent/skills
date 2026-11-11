@@ -269,6 +269,7 @@ def prerun(p, actions: list, env: dict | None = None) -> None:
     if p.db.conn.in_transaction:
         return
     from .landed import probe_command
+    from .probespawn import hidden
     end = time.monotonic() + PROBE_BUDGET_S
     for a in actions or []:
         if not isinstance(a, dict) or a.get("type") not in ("reply", "notify") or not isinstance(a.get("claims"), list):
@@ -280,7 +281,8 @@ def prerun(p, actions: list, env: dict | None = None) -> None:
             if left <= 1:
                 return
             try:
-                c["_rc"] = subprocess.run(probe_command(str(c["expect"]), p), shell=True, cwd=str(p.root), env=env,
+                cmd, run_env = hidden(probe_command(str(c["expect"]), p), env)
+                c["_rc"] = subprocess.run(cmd, shell=True, cwd=str(p.root), env=run_env,
                                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                           timeout=min(PROBE_TIMEOUT_S, left)).returncode
             except subprocess.TimeoutExpired:

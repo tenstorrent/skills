@@ -208,3 +208,45 @@ def test_an_id_after_the_verb_with_a_noun_subject_is_never_false_but_a_start_on_
     coord.apply(p, [{"type": "reply", "text": f"Long runs started on #{never}.", "chat": "c1"}], turn=9)
     assert _cc_sent(p)[-1].startswith(f"{claimcheck.FALSE_MARK} (#{never} is queued)"), _cc_sent(p)[-1]
     assert len(_cc_false_events(p)) == 1
+
+
+def test_a_pgrep_f_probe_never_matches_the_shell_running_it(env):
+    """`! pgrep -f <pattern>` run as `sh -c '<probe>'` matched its own shell, whose command line carries
+    the pattern: a claim that a process was gone failed while none ran. Every probe runner passes the
+    text through the environment instead (probespawn.hidden), and a live process still matches."""
+    import os
+    import shutil
+    import subprocess
+    import time
+    import uuid
+    import pytest
+    from ttp import claimcheck, ends, looks, probespawn, schedrun
+    if not shutil.which("pgrep"):
+        pytest.skip("no pgrep here")
+    p = make(env)
+    tok = "ttp-probe-" + uuid.uuid4().hex   # built at run time: no command line above this test carries it
+    gone = f"! pgrep -f {tok} >/dev/null"
+
+    def answers():
+        # One probe at a time: two concurrent `pgrep -f <token>` processes would match each other.
+        acts = [{"type": "reply", "text": "x is gone.", "claims": [{"text": "x gone", "expect": gone}]}]
+        claimcheck.prerun(p, acts)
+        pend = probespawn.Pending(gone, cwd=str(p.root), env=None, stdout=False)
+        pend.started.wait(10)
+        pended = pend.wait(10)
+        looked = looks.screen(p.db, p.root, [{"id": "l1", "at": time.time() - 1, "text": "t", "check": gone}],
+                              time.time())
+        return [acts[0]["claims"][0]["_rc"], pended, ends.probe_once(p, gone, 10)[0],
+                schedrun.run_group(gone, cwd=str(p.root), timeout=10, env=None).returncode, 0 if not looked else 1]
+
+    assert answers() == [0, 0, 0, 0, 0]
+    live = subprocess.Popen(["sh", "-c", "sleep 30", tok], start_new_session=True)
+    try:
+        assert answers() == [1, 1, 1, 1, 1]
+    finally:
+        live.kill()
+        live.wait()
+    # Nothing a probe starts inherits its text, and a probe's own exit code still comes through.
+    got = schedrun.run_group(f"env | grep -c {probespawn.PROBE_ENV}= ; exit 7", cwd=str(p.root), timeout=10, env=None)
+    assert (got.returncode, got.stdout.strip()) == (7, "0")
+    assert os.environ.get(probespawn.PROBE_ENV) is None

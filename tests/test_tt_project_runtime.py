@@ -22169,8 +22169,10 @@ def test_waiting_tasks_with_the_same_probe_share_its_runs(env, monkeypatch):
     real = dmod.subprocess.Popen
 
     def popen(cmd, *a, **k):
-        calls.append(cmd)
+        # A probe's text rides in its environment (probespawn.hidden), not on its shell's command line.
+        calls.append((k.get("env") or {}).get(PROBE_ENV, cmd) if isinstance(cmd, str) else cmd)
         return real(cmd, *a, **k)
+    from ttp.probespawn import PROBE_ENV
     monkeypatch.setattr(dmod.subprocess, "Popen", popen)
     d = dmod.Daemon(p.base)
     same = [_due_waiting_task(p, f"test -f {flag}") for _ in range(3)]

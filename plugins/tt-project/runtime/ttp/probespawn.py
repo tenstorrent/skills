@@ -21,10 +21,21 @@ from typing import Any, Callable
 
 SLOTS = 4   # probe starts at once, per daemon; more wait in the queue (the tick never does)
 KILL_WAIT_S = 5   # how long a stop waits for a killed probe to be reaped
+# A probe's shell gets its text through PROBE_ENV (dropped before it runs, so nothing it starts inherits
+# it), never on its own command line: there `! pgrep -f <pattern>` would match the probe's own shell and
+# answer that a process that does not exist is running.
+PROBE_ENV = "TTP_PROBE_SRC"
+RUNNER = '__ttp_probe=$TTP_PROBE_SRC; unset TTP_PROBE_SRC; eval "$__ttp_probe"'
 
 _jobs: queue.Queue = queue.Queue()
 _started: list[threading.Thread] = []
 _lock = threading.Lock()
+
+
+def hidden(cmd: str, env: dict | None) -> tuple[str, dict]:
+    """The (command, environment) that run shell command `cmd` as subprocess's shell=True does, without
+    `cmd` on the shell's command line (RUNNER); `env` None is the caller's own environment."""
+    return RUNNER, {**(os.environ if env is None else env), PROBE_ENV: cmd}
 
 
 def _work() -> None:
@@ -100,7 +111,8 @@ class Pending:
                     return
             f = tempfile.TemporaryFile()
             try:
-                proc = subprocess.Popen(self._cmd, shell=True, cwd=self._cwd, env=self._env,
+                cmd, env = hidden(self._cmd, self._env)
+                proc = subprocess.Popen(cmd, shell=True, cwd=self._cwd, env=env,
                                         stdin=subprocess.DEVNULL, stdout=f if self._stdout else subprocess.DEVNULL,
                                         stderr=f, start_new_session=True)
             except BaseException:
