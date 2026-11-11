@@ -1001,6 +1001,63 @@ def clear_stale(paths: list[Path]) -> list[dict]:
     return out
 
 
+PROC_LOCKS = "/proc/locks"   # the kernel's table of held locks (Linux): flock_pids
+HOLDER_READS = 20   # reads of PROC_LOCKS before a taken lock counts as unfound (flock_pids)
+
+
+def _proc_locks() -> list[str]:
+    with open(PROC_LOCKS) as f:
+        return f.readlines()
+
+
+def flock_pids(paths: list[Path], read: Callable[[], list[str]] | None = None) -> dict[Path, list[int]] | None:
+    """The pids holding each of `paths`' flock locks right now, from the kernel's lock table (PROC_LOCKS),
+    never from the lock file's record, which keeps a released holder's JSON. A lock names the superblock's
+    device, which on btrfs differs from the st_dev stat gives: an exact device match wins, else the one pid
+    on that inode number. The kernel hands the table out a page per read, so a line can slip between two
+    pages while other locks come and go: a read that misses one of `paths` is retried, up to HOLDER_READS
+    reads (callers pass taken locks only). A path still unfound maps to []. None when the table cannot be
+    read (no /proc: macOS). The pid is the one that took the lock: it may have exited while a child keeps
+    the inherited descriptor (callers check _alive)."""
+    want = {}
+    for p in paths:
+        try:
+            st = os.stat(p)
+        except OSError:
+            continue
+        want[Path(p)] = ((os.major(st.st_dev), os.minor(st.st_dev)), str(st.st_ino))
+    out: dict[Path, list[int]] = {}
+    read = read or _proc_locks
+    for _ in range(HOLDER_READS):
+        try:
+            lines = read()
+        except OSError:
+            return None
+        exact: dict[Path, set] = {}
+        loose: dict[Path, set] = {}
+        for line in lines:
+            parts = line.split()   # N: FLOCK ADVISORY WRITE <pid> MAJ:MIN:INODE 0 EOF ("->" marks a blocked waiter)
+            if len(parts) < 6 or parts[1] != "FLOCK" or not parts[4].isdigit() or int(parts[4]) <= 0:
+                continue
+            where = parts[5].split(":")
+            if len(where) != 3:
+                continue
+            try:
+                dev = (int(where[0], 16), int(where[1], 16))
+            except ValueError:
+                continue
+            for p, (d, ino) in want.items():
+                if where[2] == ino:
+                    (exact if dev == d else loose).setdefault(p, set()).add(int(parts[4]))
+        for p in want:
+            if not out.get(p):
+                got = exact.get(p) or (loose[p] if len(loose.get(p) or ()) == 1 else set())
+                out[p] = sorted(got)
+        if all(out.values()):
+            break
+    return out
+
+
 def held(locks_dir: Path, where=None) -> list[str]:
     """Who holds each resource right now, and who has one reserved: "device: task #3 (run 9) since
     10:02 UTC" (in the zone of `where`, the project). A slot file keeps its label after release, so only slots whose lock is taken count;

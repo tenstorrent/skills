@@ -1269,6 +1269,132 @@ def activity_text(a: dict) -> str:
                   "with `ttp checks-yield`" if a["idle"] else "")
 
 
+PARKED_SHOWN = 5   # parked runs slot status lists (parked_order), in admission order
+_LABEL_WHO = re.compile(r"^(?P<project>.*?) task #(?P<task>\d+) \(run (?P<run>[^)]*)\)")
+
+
+def _pid_identity(pid: int) -> dict | None:
+    """The project, task and run live process `pid` checks for, from its own environment: the task it was
+    handed with a detached run (ADOPTED_ENV), else inherited's. None when its environment cannot be read
+    (gone, another user's, no /proc)."""
+    from . import procowner
+    env = procowner.environ(pid)
+    if env is None:
+        return None
+    if not env.get("TTP_TASK") and env.get(ADOPTED_ENV):
+        try:
+            got = json.loads(env[ADOPTED_ENV])
+        except ValueError:
+            got = {}
+        if isinstance(got, dict) and got.get("task"):
+            return {k: str(got.get(k) or "") for k in ("project", "task", "run")}
+    got = inherited(pid)
+    if got:
+        return {k: got[k] for k in ("project", "task", "run")}
+    there = procowner.base_of(env["TTP_PROJECT"]) if env.get("TTP_PROJECT") else None
+    return {"project": there.parent.name if there else "", "task": "", "run": ""}
+
+
+def _label_identity(holder: str) -> dict:
+    """The project, task and run a slot label (label()) names."""
+    m = _LABEL_WHO.match(holder or "")
+    if m:
+        return {"project": m["project"], "task": m["task"], "run": m["run"]}
+    return {"project": _project(holder or ""), "task": "", "run": ""}
+
+
+def slot_holders(read: Callable[[], list[str]] | None = None) -> list[dict]:
+    """Each held host-wide checks slot file (the cap's checks.N.lock and the ones load opened beyond it, the
+    push priority and the urgent slots) with who holds it now: {"slot", "kind" (cap/extra/push/urgent),
+    "project", "task", "run", "pid", "alive", "source"}. A slot is held while its flock is taken; a released
+    slot whose file still keeps its last holder's JSON is not listed. The pid is the live flock holder's
+    (locks.flock_pids, `read` for its table) and the project, task and run that process's own environment
+    names (source "process"). Where that does not read, the file's label serves only when it names that same
+    pid (source "label"); with no kernel lock table (macOS) the label is all there is (source "label,
+    unchecked"). Status only: it takes, stops or asks nothing."""
+    n = limit()
+    if not n:
+        return []
+    cap = set(paths(n))
+    every = ([(p, "cap" if p in cap else "extra") for p in all_paths(n)]
+             + [(p, "push") for p in priority_paths()] + [(p, "urgent") for p in urgent_paths()])
+    taken = [(p, k) for p, k in every if locks._slot_labels([p])]
+    if not taken:
+        return []
+    live = locks.flock_pids([p for p, _ in taken], read)
+    out = []
+    for path, kind in taken:
+        try:
+            rec = locks.read_label(path)
+        except (OSError, ValueError):
+            rec = {}
+        mine = rec.get("pid") if isinstance(rec.get("pid"), int) else None
+        if live is None:
+            pids, unchecked = [mine], True
+        else:
+            pids, unchecked = live.get(path) or [], False
+            if not pids and not locks._slot_labels([path]):
+                continue   # released while it was read
+        for pid in pids or [None]:
+            who, source = (_pid_identity(pid) if pid and not unchecked else None), "process"
+            if not who:
+                if unchecked or (pid and pid == mine):
+                    who, source = _label_identity(str(rec.get("holder") or "")), "label" + (", unchecked" if unchecked else "")
+                else:
+                    who, source = {"project": "", "task": "", "run": ""}, "unread"
+            out.append({"slot": path.name, "kind": kind, **who, "pid": pid,
+                        "alive": locks._alive(pid) if pid else None, "source": source})
+    return out
+
+
+def parked_order(first: int = PARKED_SHOWN) -> dict:
+    """The host's parked runs (PARKED: waiting outside the checks queue for their test slots) in the order the
+    queue admits them (fair_order with order()): {"parked": the first `first` as {"holder", "priority",
+    "owed", "tags", "since"}, "total": how many are parked}. Tags: owed (OBLIGATION_PRIORITY), p<priority>,
+    landing, small, requeued. Status only."""
+    try:
+        q = locks.fair_order(slot_dir(), PARKED, **order())
+    except OSError:
+        q = []
+    out = []
+    for t in q[:first]:
+        try:
+            text = t.read_text().strip()
+        except OSError:
+            continue
+        prio = locks.ticket_priority(t)
+        owed = prio <= OBLIGATION_PRIORITY
+        tags = ((["owed"] if owed else []) + ([f"p{int(prio)}"] if not math.isinf(prio) else [])
+                + [name for name, on in (("landing", locks.is_landing(t)), ("small", locks.is_small(t)),
+                                         ("requeued", locks.is_requeued(t))) if on])
+        out.append({"holder": text.replace(OBLIGATION_MARK, ""), "priority": None if math.isinf(prio) else int(prio),
+                    "owed": owed, "tags": tags, "since": locks._arrival(t)})
+    return {"parked": out, "total": len(q)}
+
+
+def slot_lines(held: list[dict], parked: dict, now: float | None = None) -> list[str]:
+    """The "host slots" section of the slot status: slot_holders' and parked_order's entries."""
+    now = time.time() if now is None else now
+    out = ["host slots (held now, by the live lock holder):"]
+    for h in held:
+        who = (f"{h['project'] or 'no project'}" + (f" task #{h['task']} (run {h['run'] or '?'})" if h["task"] else "")
+               if h["source"] != "unread" else "holder's process cannot be read")
+        alive = {True: "alive", False: "exited (a child may keep its descriptor)", None: "pid unknown"}[h["alive"]]
+        pid = f"pid {h['pid']} {alive}" if h["pid"] else alive
+        out.append(f"  {h['slot']} ({h['kind']}): {who}, {pid}"
+                   + (f" [from {h['source']}]" if h["source"] not in ("process", "unread") else ""))
+    if not held:
+        out.append("  none held")
+    n, shown = parked["total"], len(parked["parked"])
+    out.append(f"host parked queue (admission order{f', first {shown} of {n}' if n > shown else ''}):")
+    for i, t in enumerate(parked["parked"], 1):
+        tags = f" [{', '.join(t['tags'])}]" if t["tags"] else ""
+        out.append(f"  {i}. {t['holder']}{tags}, parked {_dur(max(0.0, now - t['since']))}")
+    if not parked["parked"]:
+        out.append("  none parked")
+    return out
+
+
 def line(activity: bool = False) -> str:
     """One status line, or "" when nothing runs or waits. With `activity` it also names each slot holder that
     has held its slot idle_hold_s() or longer with no test running (holder_activity)."""

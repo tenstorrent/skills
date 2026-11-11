@@ -5325,6 +5325,7 @@ def _checks_lane_status(as_json: bool) -> int:
     from . import checkcap, checkjoin, checkspill, diskgate, hostload, slurmcheck
     followers = checkjoin.status_lines(p.state)
     holders = checkcap.holder_activity()   # whether each host-wide slot holder runs tests now
+    slots, parked = checkcap.slot_holders(), checkcap.parked_order()   # who holds each host slot (live), who is parked
     disk = diskgate.reading()   # new local runs held while the disk is saturated: why, with the values   # joined or superseded waiters: they run no suite of their own
     load = hostload.snapshot(p.config())
     names = {"": p.root.name, **({here_repo: testslots.repo_name(top) or here_repo} if here_repo else {})}
@@ -5340,6 +5341,7 @@ def _checks_lane_status(as_json: bool) -> int:
                           "hosts": {**load, "overloaded": hostload.overloaded(load)},
                           "disk": disk,
                           "host_holders": holders,
+                          "host_slots": {"held": slots, "parked": parked["parked"], "parked_total": parked["total"]},
                           "followers": [x.strip() for x in followers]},
                          indent=2))
     else:
@@ -5353,6 +5355,7 @@ def _checks_lane_status(as_json: bool) -> int:
         if holders:
             print("host-wide checks slot holders:")
             print("\n".join(f"  {checkcap.activity_text(a)}" for a in holders))
+        print("\n".join(checkcap.slot_lines(slots, parked)))
         if followers:
             print("following another run of their task (checkjoin), no suite of their own:")
             print("\n".join(followers))

@@ -12123,3 +12123,124 @@ def test_a_queue_incident_times_a_holder_against_runs_of_its_own_command_list_an
                     "no passing run of its command list yet: nothing to time it against"
         finally:
             g.close()
+
+
+_FLOCK_HOLDER = """
+import fcntl, sys, time
+from pathlib import Path
+f = open(sys.argv[1], "a")
+fcntl.flock(f, fcntl.LOCK_EX)
+Path(sys.argv[2]).write_text("held")
+while not Path(sys.argv[3]).exists():
+    time.sleep(0.05)
+"""
+
+
+def _stale_label(path, pid, holder):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"holder": holder, "pid": pid, "since": time.time() - 600}))
+
+
+def test_slot_status_names_a_held_slots_live_holder_from_its_process_never_the_files_stale_json(
+        env, tmp_path, monkeypatch, capsys):
+    """#7173: `ttp checks --slot-status` lists a held host-wide checks slot by its live flock holder
+    (/proc/locks), its project, task and run read from that process's environment, though the lock file
+    still keeps the JSON of an earlier holder that released it."""
+    import json as _json
+    from ttp import checkcap, cli, locks
+    if locks.flock_pids([]) is None:
+        pytest.skip("no kernel lock table here")
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "2")
+    monkeypatch.setattr(checkcap, "slot_dir", lambda: tmp_path / "slots")
+    slot = checkcap.paths(2)[1]
+    _stale_label(slot, 999999, "other task #1 (run 1)")
+    got, stop = tmp_path / "held", tmp_path / "stop"
+    proc = subprocess.Popen([sys.executable, "-c", _FLOCK_HOLDER, str(slot), str(got), str(stop)],
+                            env={**os.environ, "TTP_PROJECT": str(p.base), "TTP_TASK": "12", "TTP_RUN_ID": "34"})
+    try:
+        assert _wait_for(got.exists)
+        held = checkcap.slot_holders()
+        assert held == [{"slot": slot.name, "kind": "cap", "project": p.name, "task": "12", "run": "34",
+                         "pid": proc.pid, "alive": True, "source": "process"}], held
+        with pytest.raises(SystemExit):
+            cli.main(["checks", "--slot-status"])
+        out = capsys.readouterr().out
+        assert f"  {slot.name} (cap): {p.name} task #12 (run 34), pid {proc.pid} alive" in out, out
+        section = out[out.index("host slots (held now"):]
+        assert "other task #1" not in section, section
+        with pytest.raises(SystemExit):
+            cli.main(["checks", "--slot-status", "--json"])
+        assert _json.loads(capsys.readouterr().out)["host_slots"]["held"] == held
+    finally:
+        stop.touch()
+        proc.wait(10)
+    assert checkcap.slot_holders() == [], "a released slot is no longer listed"
+
+
+def test_slot_status_lists_no_released_slot_whose_file_keeps_its_last_holders_json(env, tmp_path, monkeypatch):
+    """#7173: a slot file with a released holder's JSON (here our own live pid, so the record looks
+    current) is not held: slot status lists it nowhere; with no kernel lock table the label serves,
+    marked unchecked."""
+    from ttp import checkcap, locks
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "2")
+    monkeypatch.setattr(checkcap, "slot_dir", lambda: tmp_path / "slots")
+    for i, path in enumerate(checkcap.paths(2)):
+        _stale_label(path, os.getpid(), f"demo task #{i + 5} (run 9)")
+    assert checkcap.slot_holders(lambda: []) == []
+    import fcntl
+    slot = checkcap.paths(2)[0]
+    held = open(slot, "r+")
+    try:
+        fcntl.flock(held, fcntl.LOCK_EX)
+        locks.write_label(held, {"holder": "demo task #7 (run 8)", "pid": os.getpid(), "since": time.time()})
+
+        def no_table():
+            raise OSError("no /proc")
+        got = checkcap.slot_holders(no_table)
+        assert [(h["slot"], h["task"], h["run"], h["pid"], h["source"]) for h in got] == [
+            (slot.name, "7", "8", os.getpid(), "label, unchecked")], got
+    finally:
+        held.close()
+    assert checkcap.slot_holders() == []
+
+
+def test_flock_pids_matches_by_inode_skips_waiters_and_retries_a_missed_line(tmp_path):
+    """#7173: locks.flock_pids reads the holder pid from the kernel's lock table by the file's device and
+    inode, skips blocked waiters ("->"), and rereads a table that missed the line."""
+    from ttp import locks
+    f = tmp_path / "checks.0.lock"
+    f.write_text("{}")
+    st = os.stat(f)
+    where = f"{os.major(st.st_dev):02x}:{os.minor(st.st_dev):02x}:{st.st_ino}"
+    reads = [[], ["1: FLOCK  ADVISORY  WRITE 4242 00:99:1 0 EOF\n",
+                  f"2: -> FLOCK  ADVISORY  WRITE 777 {where} 0 EOF\n",
+                  f"2: FLOCK  ADVISORY  WRITE 4343 {where} 0 EOF\n"]]
+    assert locks.flock_pids([f], lambda: reads.pop(0) if len(reads) > 1 else reads[0]) == {f: [4343]}
+
+
+def test_slot_status_lists_the_host_parked_queue_in_admission_order_with_owed_and_priority_tags(
+        env, tmp_path, monkeypatch):
+    """#7173: slot status shows the first parked runs (checks-parked.queue) in the order they are admitted:
+    an owed run (OBLIGATION_PRIORITY) ahead of an earlier routine one, each with its tags."""
+    from ttp import checkcap, locks
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "2")
+    monkeypatch.setattr(checkcap, "slot_dir", lambda: tmp_path / "slots")
+    now = time.time()
+    routine = locks.enqueue(checkcap.slot_dir(), checkcap.PARKED, "demo task #3 (run 1)", since=now - 30,
+                            group="demo", priority=3)
+    owed = locks.enqueue(checkcap.slot_dir(), checkcap.PARKED, "demo task #4 (run 2)" + checkcap.OBLIGATION_MARK,
+                         since=now - 10, group="demo", priority=checkcap.OBLIGATION_PRIORITY)
+    try:
+        got = checkcap.parked_order()
+        assert got["total"] == 2
+        assert [(t["holder"], t["tags"], t["owed"]) for t in got["parked"]] == [
+            ("demo task #4 (run 2)", ["owed", "p0"], True), ("demo task #3 (run 1)", ["p3"], False)], got
+        lines = checkcap.slot_lines([], got, now=now)
+        assert lines[-3:] == ["host parked queue (admission order):", "  1. demo task #4 (run 2) [owed, p0], parked 10s",
+                              "  2. demo task #3 (run 1) [p3], parked 30s"], lines
+        assert "  none held" in lines
+        assert checkcap.parked_order(first=1)["parked"][0]["holder"] == "demo task #4 (run 2)"
+    finally:
+        locks.dequeue(owed)
+        locks.dequeue(routine)
