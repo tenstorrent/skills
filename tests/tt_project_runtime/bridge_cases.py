@@ -182,3 +182,287 @@ def test_bridge_relay_carries_one_connection_and_exits_with_its_session(tmp_path
     assert data == b"SSH-2.0-test\r\nping" and seen == [("10.0.0.2", "vpn0")]
     rc = bridge_relay.main([str(tmp_path / "d"), "x=10.0.0.3%vpn0", "--", sys.executable, "-c", "raise SystemExit(7)"])
     assert rc == 7 and not (tmp_path / "d" / "x.sock").exists()
+
+
+# --- offline mode: short-lived certificates (`ttp bridge cert`, bridge_cert.py) ------------------
+# A stub ssh-keygen and ssh on PATH: no key is made, nothing is signed for real, no host is reached.
+# The stub "box" is a folder used as HOME by `sh -c <script>`; a stub certificate carries its
+# fields as base64 JSON, which the stub's -L prints the way ssh-keygen does.
+
+_CERT_STUB_KEYGEN = r'''
+import base64, hashlib, json, os, sys, time
+a = sys.argv[1:]
+log = os.environ.get("STUB_LOG")
+if log:
+    with open(log, "a") as f:
+        f.write(json.dumps({"argv": a, "auth_sock": os.environ.get("SSH_AUTH_SOCK", "")}) + "\n")
+def fp(line):
+    f = line.split()
+    if f[0].endswith("-cert-v01@openssh.com"):
+        return json.loads(base64.b64decode(f[1]))["key"]
+    return "SHA256:" + hashlib.sha256(f[1].encode()).hexdigest()[:24]
+def arg(flag):
+    return a[a.index(flag) + 1]
+if "-t" in a:   # make a key: two placeholder lines, no key material
+    path = arg("-f")
+    open(path, "w").write("placeholder box key\n")
+    open(path + ".pub", "w").write("ssh-ed25519 Qm94S2V5" + base64.b16encode(os.urandom(4)).decode() + " box\n")
+elif "-l" in a:
+    print("256 " + fp(open(arg("-f")).read()) + " c (ED25519)")
+elif "-L" in a:
+    c = json.loads(base64.b64decode(open(arg("-f")).read().split()[1]))
+    ts = lambda t: time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(t))
+    print(arg("-f") + ":")
+    print("        Type: ssh-ed25519-cert-v01@openssh.com " + ("user" if c.get("user", True) else "host") + " certificate")
+    print("        Public key: ED25519-CERT " + c["key"])
+    print("        Signing CA: ED25519 " + c["ca"] + " (using ssh-ed25519)")
+    print('        Key ID: "' + c["id"] + '"')
+    print("        Serial: 0")
+    print("        Valid: from " + ts(c["from"]) + " to " + ts(c["to"]))
+    print("        Principals: " + ("" if c["principals"] else "(none)"))
+    for p in c["principals"]:
+        print("                " + p)
+    print("        Critical Options: " + ("" if c["options"] else "(none)"))
+    for k, v in c["options"].items():
+        print("                " + k + " " + v)
+    print("        Extensions: " + ("" if c["ext"] else "(none)"))
+    for e in c["ext"]:
+        print("                " + e)
+elif "-s" in a:   # sign: the -V window and -O options as asked (STUB_TO_MIN overrides the end)
+    now = int(time.time())
+    lo, hi = arg("-V").split(":")
+    to = now + int(os.environ.get("STUB_TO_MIN") or hi.strip("+m")) * 60
+    opts = [a[i + 1] for i, w in enumerate(a) if w == "-O"]
+    c = {"key": fp(open(a[-1]).read()), "ca": fp(open(arg("-s")).read()), "id": arg("-I"),
+         "from": now + int(lo.strip("m")) * 60, "to": to, "principals": arg("-n").split(","),
+         "options": dict(o.split("=", 1) for o in opts if "=" in o),
+         "ext": [o for o in opts if o.startswith("permit-")], "user": "-U" in a}
+    out = a[-1][:-4] + "-cert.pub"
+    open(out, "w").write("ssh-ed25519-cert-v01@openssh.com " + base64.b64encode(json.dumps(c).encode()).decode() + " c\n")
+else:
+    sys.exit(9)
+'''
+
+_CERT_STUB_SSH = r'''
+import os, sys
+os.environ["HOME"] = os.environ["STUB_BOX_HOME"]
+os.execvp("sh", ["sh", "-c", sys.argv[-1]])
+'''
+
+
+def _cert_env(tmp_path, monkeypatch, **cert):
+    """A bridge config with a cert section, stub ssh/ssh-keygen on PATH and an empty stub box."""
+    import json
+    import sys
+    from ttp import bridge
+    bin_ = tmp_path / "bin"
+    bin_.mkdir()
+    for name, body in (("ssh-keygen", _CERT_STUB_KEYGEN), ("ssh", _CERT_STUB_SSH)):
+        (bin_ / name).write_text(f"#!{sys.executable}\n{body}")
+        (bin_ / name).chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_}:{os.environ['PATH']}")
+    box_home = tmp_path / "box"
+    box_home.mkdir()
+    monkeypatch.setenv("STUB_BOX_HOME", str(box_home))
+    monkeypatch.setenv("STUB_LOG", str(tmp_path / "keygen.log"))
+    monkeypatch.delenv("STUB_TO_MIN", raising=False)
+    (tmp_path / "ca.pub").write_text("ssh-ed25519 Q0FrZXlwbGFjZWhvbGRlcg ca\n")
+    c = {"signer": {"kind": "agent-ca", "ca_public_key": str(tmp_path / "ca.pub"), "agent": str(tmp_path / "ca.sock")},
+         "principals": ["builder", "git"], "boxes": {"box-1": {"source_address": "10.0.0.9", "hosts": [
+             {"name": "build-a", "aliases": ["ba"], "target": "build-a.example.com", "user": "builder"}]}}}
+    c.update(cert)
+    raw = {"boxes": {"box-1": {"agents": {"auto": {"agent": "env", "forward": [
+        {"name": "build-a", "aliases": ["ba"], "target": "build-a.example.com", "port": 2301, "user": "builder"}]}}}},
+           "cert": c}
+    from ttp import bridge
+    return bridge.parse(raw), box_home
+
+
+def _cert_log(tmp_path):
+    import json
+    return [json.loads(x) for x in (tmp_path / "keygen.log").read_text().splitlines()]
+
+
+def _cert_dir(box):
+    return box / ".config" / "tt-project" / "bridge-cert"
+
+
+def test_bridge_cert_signs_the_box_key_through_the_agent_ca_and_puts_it_back(tmp_path, monkeypatch):
+    # cells: cert-sign-stub
+    from ttp import bridge_cert
+    cfg, box = _cert_env(tmp_path, monkeypatch)
+    lines, rc = bridge_cert.renew(cfg, ["box-1"])
+    assert rc == 1 and "--make-key" in lines[0]                      # no box key: says how, makes none
+    lines, rc = bridge_cert.renew(cfg, ["box-1"], make=True)
+    assert rc == 0 and "renewed, valid until" in lines[0], lines
+    d = _cert_dir(box)
+    assert {p.name for p in d.iterdir()} == {"id_ed25519", "id_ed25519.pub", "id_ed25519-cert.pub", "valid"}
+    assert oct(d.stat().st_mode & 0o777) == "0o700"
+    sign = [x for x in _cert_log(tmp_path) if "-s" in x["argv"]]
+    assert len(sign) == 1
+    argv = sign[0]["argv"]
+    assert argv[argv.index("-s") + 1] == str(tmp_path / "ca.pub") and "-U" in argv   # the CA's public half only
+    assert sign[0]["auth_sock"] == str(tmp_path / "ca.sock")
+    opts = [argv[i + 1] for i, w in enumerate(argv) if w == "-O"]
+    assert opts == ["clear", "source-address=10.0.0.9", "permit-pty"]
+    assert argv[argv.index("-n") + 1] == "builder,git" and argv[argv.index("-V") + 1] == "-5m:+4315m"
+    i = bridge_cert.inspect((d / "id_ed25519-cert.pub").read_text())
+    assert i["user"] and i["options"] == {"source-address": "10.0.0.9"} and i["extensions"] == ["permit-pty"]
+    (tmp_path / "x").mkdir()
+    cfg2, _ = _cert_env(tmp_path / "x", monkeypatch, pty=False)
+    assert bridge_cert.renew(cfg2, ["box-1"], make=True)[1] == 0
+    assert "permit-pty" not in [x for x in _cert_log(tmp_path / "x") if "-s" in x["argv"]][0]["argv"]
+
+
+def test_bridge_cert_renews_only_below_half_its_life(tmp_path, monkeypatch):
+    # cells: cert-renew-half-life
+    from ttp import bridge_cert
+    cfg, box = _cert_env(tmp_path, monkeypatch)
+    monkeypatch.setenv("STUB_TO_MIN", str(40 * 60))                 # 40 h of 72 left: more than half
+    assert bridge_cert.renew(cfg, ["box-1"], make=True)[1] == 0
+    lines, rc = bridge_cert.renew(cfg, ["box-1"])
+    assert rc == 0 and "current" in lines[0]
+    monkeypatch.setenv("STUB_TO_MIN", str(30 * 60))
+    assert "renewed" in bridge_cert.renew(cfg, ["box-1"], force=True)[0][0]
+    monkeypatch.delenv("STUB_TO_MIN")                                # 30 h left: below half, signs again
+    lines, rc = bridge_cert.renew(cfg, ["box-1"])
+    assert rc == 0 and "renewed" in lines[0]
+    assert "current" in bridge_cert.renew(cfg, ["box-1"])[0][0]
+    assert len([x for x in _cert_log(tmp_path) if "-s" in x["argv"]]) == 3
+
+
+def test_bridge_cert_expired_fails_closed(tmp_path, monkeypatch):
+    # cells: cert-expired-fails-closed
+    import subprocess
+    import time
+    import pytest
+    from ttp import bridge, bridge_cert
+    cfg, box = _cert_env(tmp_path, monkeypatch)
+    v = tmp_path / "valid"
+    v.write_text(bridge_cert.valid_script(int(time.time()) - 5, "box-1"))
+    r = subprocess.run(["sh", str(v)], capture_output=True, text=True)
+    assert r.returncode == 1 and "certificate of box-1 ended" in r.stderr and "renews it" in r.stderr
+    r = subprocess.run(["sh", str(v), "quiet"], capture_output=True, text=True)
+    assert r.returncode == 1 and r.stderr == ""
+    v.write_text(bridge_cert.valid_script(int(time.time()) + 600, "box-1"))
+    assert subprocess.run(["sh", str(v)]).returncode == 0
+    # the block: direct with the box's key only while the link is down and the certificate valid;
+    # after that every login method is off for the host, so no other key is tried
+    block = bridge.render_block(cfg, "box-1")
+    k = "~/.config/tt-project/bridge-cert"
+    assert ('Match originalhost build-a,ba !exec "SSH_AUTH_SOCK=$HOME/.ssh/tt-agent/auto.sock ssh-add -l >/dev/null 2>&1; '
+            f'[ $? -lt 2 ]" exec "sh {k}/valid"') in block
+    assert f'!exec "sh {k}/valid quiet"' in block and "  PubkeyAuthentication no" in block
+    assert f"  IdentityFile {k}/id_ed25519\n  CertificateFile {k}/id_ed25519-cert.pub" in block
+    assert block.index("Match originalhost") < block.index("Host build-a")   # first match wins
+    assert "%" not in block.split("Host build-a")[0]                         # ssh would expand it
+    for bad in ("  IdentityFile ~/keys/other", "  CertificateFile ~/keys/other-cert.pub"):
+        with pytest.raises(bridge.BadConfig):
+            bridge.check_block(block.replace("Match all", bad + "\nMatch all"), bridge_cert.block_lines(cfg, "box-1")[1])
+    # a signer returning an already ended certificate: refused, nothing installed
+    monkeypatch.setenv("STUB_TO_MIN", "-10")
+    lines, rc = bridge_cert.renew(cfg, ["box-1"], make=True)
+    assert rc == 1 and "refusing" in lines[0]
+    assert not (_cert_dir(box) / "id_ed25519-cert.pub").exists()
+
+
+def test_bridge_cert_status_reports_until_source_and_expiry(tmp_path, monkeypatch):
+    # cells: cert-status
+    import base64
+    import json
+    import time
+    from ttp import bridge_cert
+    cfg, box = _cert_env(tmp_path, monkeypatch)
+    lines, rc = bridge_cert.status(cfg, ["box-1"])
+    assert rc == 1 and "no key" in lines[0]
+    bridge_cert.renew(cfg, ["box-1"], make=True)
+    lines, rc = bridge_cert.status(cfg, ["box-1"])
+    assert rc == 0 and lines[0].startswith("box-1: OK valid until ") and "source 10.0.0.9" in lines[0]
+    assert "principals builder,git" in lines[0] and "signer agent-ca" in lines[0]
+    cert = _cert_dir(box) / "id_ed25519-cert.pub"
+    f, b64, rest = cert.read_text().split()
+    c = json.loads(base64.b64decode(b64))
+    c["to"] = int(time.time()) - 60
+    cert.write_text(f"{f} {base64.b64encode(json.dumps(c).encode()).decode()} {rest}\n")
+    lines, rc = bridge_cert.status(cfg, ["box-1"])
+    assert rc == 1 and lines[0].startswith("box-1: EXPIRED")
+    assert bridge_cert.remove(cfg, ["box-1"]) == ["box-1: key and certificate removed"]
+    assert not _cert_dir(box).exists()
+
+
+def test_bridge_cert_trust_prints_one_restricted_line_and_edits_nothing(tmp_path, monkeypatch, capsys):
+    # cells: trust-print
+    import json
+    import pytest
+    from ttp import bridge_cert, cli
+    cfg, box = _cert_env(tmp_path, monkeypatch)
+    line = bridge_cert.trust_line(cfg)
+    assert line == ('cert-authority,principals="builder,git",no-agent-forwarding,no-port-forwarding,'
+                    'no-X11-forwarding,no-user-rc ssh-ed25519 Q0FrZXlwbGFjZWhvbGRlcg ttp-bridge-ca')
+    for text in ("ssh-ed25519 AAAA a\nssh-ed25519 BBBB b\n", "not a public key\n"):
+        (tmp_path / "ca.pub").write_text(text)
+        with pytest.raises(RuntimeError):
+            bridge_cert.trust_line(cfg)
+    conf = tmp_path / "bridge.json"
+    conf.write_text(json.dumps({"boxes": {"box-1": {"agents": {"a": {"agent": "env", "direct": [{"name": "h"}]}}}}}))
+    with pytest.raises(SystemExit):
+        cli.main(["bridge", "cert", "trust", "--print", "--config", str(conf)])
+    assert "certificate mode is off" in capsys.readouterr().err
+
+
+def test_bridge_cert_command_signer_gets_the_request_and_overbroad_certs_are_refused(tmp_path, monkeypatch):
+    # cells: signer-command
+    import json
+    import sys
+    from ttp import bridge_cert
+    signer = tmp_path / "signer.py"
+    signer.write_text(
+        "import json, os, subprocess, sys, tempfile\n"
+        "pub = sys.stdin.read()\n"
+        f"open({str(tmp_path / 'req.json')!r}, 'w').write(json.dumps(dict({{k: v for k, v in os.environ.items() "
+        "if k.startswith('TTP_CERT_')}, pub=pub)))\n"
+        "d = tempfile.mkdtemp(); open(d + '/k.pub', 'w').write(pub)\n"
+        "n = os.environ.get('STUB_PRINCIPALS') or os.environ['TTP_CERT_PRINCIPALS']\n"
+        "o = ['-O', 'source-address=' + os.environ['TTP_CERT_SOURCE_ADDRESS']]\n"
+        "o += ['-O', os.environ['STUB_EXTRA']] if os.environ.get('STUB_EXTRA') else []\n"
+        f"subprocess.run(['ssh-keygen', '-s', {str(tmp_path / 'ca.pub')!r}, '-U', '-I', os.environ['TTP_CERT_KEY_ID'], "
+        "'-n', n, '-V', '-5m:+' + os.environ['TTP_CERT_VALIDITY_MINUTES'] + 'm'] + o + [d + '/k.pub'], check=True)\n"
+        "sys.stdout.write(open(d + '/k-cert.pub').read())\n")
+    cfg, box = _cert_env(tmp_path, monkeypatch, signer={"kind": "command", "ca_public_key": str(tmp_path / "ca.pub"),
+                                                        "command": [sys.executable, str(signer)]}, validity_hours=24)
+    lines, rc = bridge_cert.renew(cfg, ["box-1"], make=True)
+    assert rc == 0 and "renewed" in lines[0], lines
+    req = json.loads((tmp_path / "req.json").read_text())
+    assert req["pub"].startswith("ssh-ed25519 ") and req["TTP_CERT_PRINCIPALS"] == "builder,git"
+    assert req["TTP_CERT_VALIDITY_MINUTES"] == "1440" and req["TTP_CERT_SOURCE_ADDRESS"] == "10.0.0.9"
+    assert req["TTP_CERT_KEY_ID"].startswith("ttp-bridge:box-1:") and req["TTP_CERT_PERMIT_PTY"] == "1"
+    cert = _cert_dir(box) / "id_ed25519-cert.pub"
+    good = cert.read_text()
+    for env, value in (("STUB_PRINCIPALS", "root"), ("STUB_EXTRA", "permit-port-forwarding")):
+        monkeypatch.setenv(env, value)
+        lines, rc = bridge_cert.renew(cfg, ["box-1"], force=True)
+        assert rc == 1 and "refusing" in lines[0], lines
+        assert cert.read_text() == good                               # nothing broader is installed
+        monkeypatch.delenv(env)
+
+
+def test_bridge_cert_config_is_checked_and_off_by_default(tmp_path, monkeypatch):
+    import pytest
+    from ttp import bridge, bridge_cert
+    cfg = _bridge_cfg()
+    assert "cert" not in cfg and bridge_cert.block_lines(cfg, "box-1") == ([], set())
+    assert "IdentityFile" not in bridge.render_block(cfg, "box-1")
+    good, _ = _cert_env(tmp_path, monkeypatch)
+    assert good["cert"]["validity_hours"] == 72 and good["cert"]["pty"] is True
+    base = {"signer": {"kind": "agent-ca", "ca_public_key": "~/ca.pub"}, "principals": ["u"],
+            "boxes": {"box-1": {"source_address": "10.0.0.9", "hosts": [{"name": "h"}]}}}
+    raw = {"boxes": {"box-1": {"agents": {"a": {"agent": "env", "direct": [{"name": "h"}]}}}}}
+    bad = [{"signer": {"kind": "agent-ca", "ca_public_key": "~/ca"}},          # not a public key file
+           {"signer": {"kind": "command", "ca_public_key": "~/ca.pub"}},       # no command
+           {"validity_hours": 24 * 30}, {"principals": []}, {"key_dir": "/tmp/k"},
+           {"boxes": {"other": {"source_address": "10.0.0.9", "hosts": [{"name": "h"}]}}},
+           {"boxes": {"box-1": {"source_address": "any", "hosts": [{"name": "h"}]}}},
+           {"boxes": {"box-1": {"source_address": "10.0.0.9", "hosts": []}}}]
+    for b in bad:
+        with pytest.raises(bridge.BadConfig):
+            bridge.parse({**raw, "cert": {**base, **b}})

@@ -3422,6 +3422,32 @@ Workers can read Slack links you paste, using your Slack connector if you have o
     one interface (a VPN used through ssh's `BindInterface`). Its box port goes to a small relay on the
     workstation that connects to the host's port 22 over that interface. The relay ends with the session.
   - Agent `"env"` is the service's own `SSH_AUTH_SOCK`, even when `login` names another agent.
+  - **Offline mode (short-lived certificates).** Off unless the config has a `"cert"` section (see the
+    example). Each box listed there gets its own key, made on the box by
+    `ttp bridge cert renew --make-key` in a tool folder (`key_dir`, mode 0700); its private half never
+    leaves the box. While the workstation is online, `renew` signs the key's public half and puts the
+    certificate back on the box. The certificate is valid `validity_hours` (default 72) for the listed
+    `principals`, only from the box's `source_address`, with no agent, port or X11 forwarding (a pty
+    unless `"pty": false`). `ttp bridge cert schedule` runs `renew` every 30 minutes as a user service;
+    it signs again once less than half the validity is left.
+    - Signers: `"agent-ca"` signs with a CA key held in the workstation's ssh agent or keychain
+      (`ssh-keygen -s <ca.pub> -U`; the tool never reads or writes a private key file). `"command"`
+      runs an outside signer (a central CA): the box's public key on stdin, the request in
+      `TTP_CERT_PRINCIPALS`, `TTP_CERT_VALIDITY_MINUTES`, `TTP_CERT_SOURCE_ADDRESS`, `TTP_CERT_KEY_ID`
+      and `TTP_CERT_PERMIT_PTY`, the certificate on stdout. A certificate for another key, from another
+      CA, for other principals or addresses, with more rights or a longer life is refused, not installed.
+    - Each target user trusts the CA with one line in their own `authorized_keys`, printed by
+      `ttp bridge cert trust --print` (`cert-authority,principals="..."` plus no forwarding). Nothing
+      edits `authorized_keys`; to undo, delete that line, or `ttp bridge cert remove` on the box side.
+    - The box's block sends each `hosts` entry direct with the box's key and certificate only while
+      that host's bridge link does not answer and the certificate is valid. Once it has ended, ssh
+      prints that it ended and the login fails: every login method is off for that host, so no other
+      key is tried. `ttp bridge cert status` shows each box's validity, address and principals (exit 1
+      when one is missing or ended).
+    - What works offline: ssh logins from the box to hosts it reaches by itself and that trust the CA.
+      What does not: hosts the workstation reaches only through its VPN (an `interface` host, such as
+      a remote lab behind a site VPN) stay down while it is offline; GitHub over ssh needs the GitHub organisation to add
+      the SSH CA; the GitHub API (`gh`) is not bridged at all.
 - Workers run with your permissions, in their own worktree; restrictions in the charter are
   passed to every worker and enforced by the provider where it can (for example, no web tools).
 - When the user loosens or removes a Restrictions item (a quoted edit, or a `replaces` of a whole

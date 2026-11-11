@@ -2303,6 +2303,9 @@ def cmd_bridge(a) -> None:
         cfg = bridge.load(a.config)
     except bridge.BadConfig as e:
         die(str(e))
+    if a.action == "cert":
+        _bridge_cert(a, cfg)
+        return
     boxes = a.boxes or list(cfg["boxes"])
     unknown = [b for b in boxes if b not in cfg["boxes"]]
     if unknown:
@@ -2330,6 +2333,40 @@ def cmd_bridge(a) -> None:
                 print(f"{box}: {bridge.remove_block(box)}")
         return
     lines, rc = bridge.status(cfg, boxes, deep=a.action == "doctor")
+    print("\n".join(lines))
+    sys.exit(rc)
+
+
+def _bridge_cert(a, cfg: dict) -> None:
+    """`ttp bridge cert status|renew|remove|trust|schedule [boxes]`: the offline certificates."""
+    from . import bridge_cert
+    sub, boxes = (a.boxes[0], a.boxes[1:]) if a.boxes else ("status", [])
+    if not cfg.get("cert"):
+        die("certificate mode is off: the bridge config has no \"cert\" section (see the guide's 'Offline mode')")
+    if sub not in ("status", "renew", "remove", "trust", "schedule"):
+        die(f"ttp bridge cert {sub}: use status, renew, remove, trust --print or schedule")
+    boxes = boxes or list(cfg["cert"]["boxes"])
+    unknown = [b for b in boxes if b not in cfg["cert"]["boxes"]]
+    if unknown:
+        die(f"not in the bridge config's cert boxes: {', '.join(unknown)}")
+    if sub == "trust":
+        if not a.print:
+            die("ttp bridge cert trust --print prints the authorized_keys line; nothing edits authorized_keys")
+        try:
+            print(bridge_cert.trust_line(cfg))
+        except (OSError, RuntimeError) as e:
+            die(str(e))
+        return
+    if sub == "schedule":
+        print(bridge_cert.schedule(Path(a.config).expanduser() if a.config else None))
+        return
+    if sub == "remove":
+        print("\n".join(bridge_cert.remove(cfg, boxes)))
+        return
+    if sub == "renew":
+        lines, rc = bridge_cert.renew(cfg, boxes, force=a.force, make=a.make_key)
+    else:
+        lines, rc = bridge_cert.status(cfg, boxes)
     print("\n".join(lines))
     sys.exit(rc)
 
@@ -13266,11 +13303,17 @@ def main(argv: list[str] | None = None) -> None:
 
     s = sub.add_parser("bridge", help="ssh access bridge: lab boxes reach hosts through this computer's ssh agents, "
                        "no key stored on a box, failing closed while this computer sleeps (config ~/.config/tt-project/bridge.json)")
-    s.add_argument("action", choices=["setup", "status", "doctor", "stop", "show"],
+    s.add_argument("action", choices=["setup", "status", "doctor", "stop", "show", "cert"],
                    help="setup: write each box's ssh config block and start the kept sessions; status: one line per box "
                    "and agent (exit 1 when one is down); doctor: status and what to do; stop: stop the sessions "
-                   "(the box's logins through them then fail); show: print the block and session commands, change nothing")
-    s.add_argument("boxes", nargs="*", help="the boxes (their ssh aliases; default: all in the config)")
+                   "(the box's logins through them then fail); show: print the block and session commands, change nothing; "
+                   "cert status|renew|remove|trust --print|schedule [boxes]: the offline mode's short-lived certificates "
+                   "(off unless the config has a \"cert\" section)")
+    s.add_argument("boxes", nargs="*", help="the boxes (their ssh aliases; default: all in the config); "
+                   "with cert, the cert action first")
+    s.add_argument("--print", action="store_true", help="with cert trust: print the authorized_keys line")
+    s.add_argument("--make-key", action="store_true", help="with cert renew: make the box's own key on the box if it has none")
+    s.add_argument("--force", action="store_true", help="with cert renew: sign again even with more than half the validity left")
     s.add_argument("--config", help="the bridge config (default ~/.config/tt-project/bridge.json)")
     s.add_argument("--remove", action="store_true", help="with stop: also remove the service files and the box's block")
     s.set_defaults(fn=cmd_bridge)

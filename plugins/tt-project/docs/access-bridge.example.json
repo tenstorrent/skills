@@ -19,5 +19,17 @@
         }
       }
     }
+  },
+  "cert": {
+    "signer": {"kind": "agent-ca", "ca_public_key": "~/path/to/bridge-ca.pub", "agent": "env"},
+    "principals": ["builder"],
+    "validity_hours": 72,
+    "pty": true,
+    "boxes": {
+      "lab-box-1": {
+        "source_address": "10.0.0.5",
+        "hosts": [{"name": "test-host-1", "aliases": ["th1"], "target": "10.0.0.11"}]
+      }
+    }
   }
 }

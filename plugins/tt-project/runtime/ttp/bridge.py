@@ -137,6 +137,9 @@ def parse(data: dict) -> dict:
             parsed[an] = {"agent": a["agent"], "forward": fwd, "direct": direct}
         out["boxes"][box] = {"login": {"agent": login.get("agent", ""), "identity": login.get("identity", "")},
                              "agents": parsed}
+    if data.get("cert") is not None:
+        from . import bridge_cert
+        out["cert"] = bridge_cert.parse(data["cert"], out)
     return out
 
 
@@ -235,8 +238,12 @@ def install_relay() -> None:
 def render_block(cfg: dict, box: str) -> str:
     """The box's marked ~/.ssh/config block. No IdentityFile, no proxy: an agent socket and loopback ports only.
     It ends with `Match all` so what follows in the file is not scoped to its last Host."""
+    from . import bridge_cert
+    offline, allowed = bridge_cert.block_lines(cfg, box)
     lines = [BEGIN, "# Logins here use this box's link to an agent on the user's workstation; they fail while",
-             "# that workstation is asleep or its session is down. No key is stored on this box."]
+             "# that workstation is asleep or its session is down" + (
+                 " and the certificate below has ended." if offline else ". No key is stored on this box.")]
+    lines += offline
     for an, a in cfg["boxes"][box]["agents"].items():
         ident = link(cfg, an)
         for h in a["forward"]:
@@ -250,14 +257,18 @@ def render_block(cfg: dict, box: str) -> str:
             if h["user"]:
                 lines.append(f"  User {h['user']}")
     block = "\n".join(lines + ["", "Match all", END]) + "\n"
-    check_block(block)
+    check_block(block, allowed)
     return block
 
 
-def check_block(block: str) -> None:
-    """Fail closed: refuse a block that would name a key file, hold key text or proxy traffic."""
-    m = FORBIDDEN.search(block)
-    if m:
+def check_block(block: str, allowed: set[str] | frozenset = frozenset()) -> None:
+    """Fail closed: refuse a block that would name a key file, hold key text or proxy traffic. The only
+    key-file lines let through are the exact ones of the offline certificate entries (allowed)."""
+    for m in FORBIDDEN.finditer(block):
+        if m.group(1) in ("IdentityFile", "CertificateFile"):
+            start, end = block.rfind("\n", 0, m.start(1)) + 1, block.find("\n", m.end(1))
+            if block[start:end if end >= 0 else None] in allowed:
+                continue
         raise BadConfig(f"refusing the box block: it has {m.group(0).strip()!r} (no key files, keys or proxies on a box)")
 
 
