@@ -2270,8 +2270,9 @@ def test_a_check_kept_here_for_a_path_of_this_machine_says_why_in_the_run_log_an
     for `ttp checks status` (checkspill.here_why)."""
     from ttp import checkspill, cli, push
     p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a"])
+    here = (f"{tmp_path}/", f"{os.path.realpath(tmp_path)}/")   # _spill_setup counts the temp folder a system one
     monkeypatch.setattr(checkspill, "_SYSTEM_DIRS", tuple(d for d in checkspill._SYSTEM_DIRS
-                                                        if not str(tmp_path).startswith(d)))   # tmp under /dev/shm
+                                                        if d not in here and not here[0].startswith(d)))   # or tmp under /dev/shm
     scan = tmp_path / "harness-bin" / "scan"
     scan.parent.mkdir()
     scan.write_text("#!/bin/sh\necho scanned\n")
