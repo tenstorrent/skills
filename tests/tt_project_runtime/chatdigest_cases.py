@@ -329,6 +329,7 @@ def test_a_routine_hand_off_within_the_hour_is_folded_into_the_next_status(env, 
     from ttp import chatdigest, hourly, obligations, pushq
     monkeypatch.setenv("TTP_TEST_CHAT_DIGEST", "on")
     p = make(env)
+    p.set_config("notify.chat_status", True)   # the opt-in: status posts go to the chat
     p.db.post("in", "hello", chat="main")
     now = time.time()
     chatdigest.mark_status(p.db, "main", now - 600)   # a status went out 10 minutes ago
@@ -352,6 +353,24 @@ def test_a_routine_hand_off_within_the_hour_is_folded_into_the_next_status(env, 
     assert chatdigest.status_flush(p, p.config(), now + 3700) == []
     got = chatdigest.status_flush(p, p.config(), now + 7300)
     assert got and f"#{c['id']} one more: done" in p.db.one("SELECT text FROM messages WHERE id=?", (got[0],))["text"]
+
+
+def test_held_hand_off_lines_stay_in_the_web_app_without_chat_status(env, monkeypatch):
+    """#8356 with #8341: by default the status post carrying the held hand-off lines is recorded for the web
+    app only (no chat, the quiet channel); nothing is lost and no chat gets it."""
+    from ttp import alerts, chatdigest, pushq
+    monkeypatch.setenv("TTP_TEST_CHAT_DIGEST", "on")
+    p = make(env)
+    now = time.time()
+    chatdigest.mark_status(p.db, "main", now - 60)
+    a = _cd_task(p, "tidy the docs")
+    pushq._reply(p.db, a, "done", "Docs tidied.")
+    assert chatdigest.status_flush(p, p.config(), now) == []   # inside the status gap
+    got = chatdigest.status_flush(p, p.config(), now + 3700)
+    assert got
+    row = p.db.one("SELECT chat, channel, text FROM messages WHERE id=?", (got[0],))
+    assert row["chat"] is None and row["channel"] == alerts.QUIET and f"#{a['id']} tidy the docs: done" in row["text"]
+    assert not [i for i in (p.db.kv(chatdigest.KV)["held"].get("main") or []) if i["why"] == chatdigest.HANDOFF]
 
 
 def test_an_owed_or_user_blocking_hand_off_posts_at_once(env, monkeypatch):
