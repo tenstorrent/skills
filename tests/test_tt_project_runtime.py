@@ -6326,7 +6326,9 @@ def test_workers_read_one_prompt_when_the_cli_cannot_append_a_system_prompt(env,
     assert prompt.startswith("# BINDING RESTRICTIONS") and prompt.rstrip().endswith(restrictions_pointer(p))
     assert prompt.count("Never merge to main (user msg #1).") == 1, "one prompt, one copy of the restrictions"
     assert "Go fast." in prompt and "TASK-SPEC-MARKER" in prompt
-    # A CLI with only the inline flag gets the stable part as its argument.
+    # A CLI with only the inline flag gets the stable part as its argument. The first task ends first: the
+    # same task queued while it still runs is held at dispatch as its duplicate (supersede.dispatch_hold).
+    p.db.x("UPDATE tasks SET status='cancelled' WHERE status='running'")
     argv, _, prompt = _dispatch_claude_worker(p, monkeypatch, {claude.APPEND_SYSTEM_FILE: False})
     assert argv[argv.index("--append-system-prompt") + 1].startswith("# BINDING RESTRICTIONS")
     assert "Go fast." not in prompt and prompt.rstrip().endswith(restrictions_pointer(p))
