@@ -7,7 +7,11 @@ measure() reads the task, run and push-queue records of a window (default 24 h) 
 into a lane, from the time the task could start (created, its start_after, its dependencies ended)
 to its first run, or to now for one still queued:
 - worker_slots: no resource, deferral, dependency or provider hold. Limit budget.max_parallel_workers,
-  or the provider gate's lower max_parallel (a spend gate: reported, never changed).
+  or the provider gate's lower max_parallel (a spend gate: reported, never changed). A wait over its
+  threshold counts at the limit (all slots ran), idle (a slot was free), or raised (all slots then in
+  force ran, before a recorded raise); an idle one at least half inside a dispatch stall (no worker run
+  started for STALL_GAP_S) also counts as stalled. A task's wait ends at its first run ever, not its first
+  run in the window: a re-run of an old task (a requeued review) is no creation-to-start wait.
 - dependency: a dependency was not done during the wait (DB.unmet_dependencies' rule). Reported, no
   limit; a task's wait counts from the time its last dependency was done.
 - resource:<name> / device:<name>: a `resource:`/`exclusive:` label, counted only when dispatch
@@ -109,6 +113,7 @@ P1_WAIT_S = 600       # a priority 1 task waiting minutes is slow
 WAIT_S = 1800         # any other task: tens of minutes, or one median run if runs are longer
 CPU_FREE = 0.75       # headroom: measured CPU demand under this share of the host's cores
 ROWS = 5000
+STALL_GAP_S = 1800   # no worker run started anywhere for this long: dispatch stalled, not a slot limit
 SERIAL_S = 10.0   # a checks grant this close to a run's end, one run at a time: a serialized queue
 SUSTAIN_S = 600.0   # how long in all a count of checks runs at once must hold to count as the cap then
 # The settings apply() may change: each sizes how soon queued work starts and is accepted by config_set.
@@ -191,6 +196,15 @@ def _peak(spans: list[tuple[float, float]], t0: float, t1: float) -> int:
     """The most spans running at once at any point of [t0, t1]."""
     pts = [t0] + [s for s, _ in spans if t0 < s <= t1]
     return max((sum(1 for s, e in spans if s <= x < e) for x in pts), default=0)
+
+
+def _stalled(starts: list[float], t0: float, t1: float) -> float:
+    """The seconds of [t0, t1] inside a dispatch stall: a gap of at least STALL_GAP_S between two worker
+    run starts (sorted `starts`; the window's ends are not starts), clipped to [t0, t1]."""
+    import bisect
+    i, j = bisect.bisect_right(starts, t0), bisect.bisect_left(starts, t1)
+    pts = starts[max(0, i - 1):min(len(starts), j + 1)]
+    return sum(max(0.0, min(b, t1) - max(a, t0)) for a, b in zip(pts, pts[1:]) if b - a >= STALL_GAP_S)
 
 
 def _limit_then(db: DB, key: str, cur: int, t0: float, t1: float) -> tuple[int, dict | None]:
@@ -355,6 +369,7 @@ def measure(db: DB, cfg: dict, since_s: float = DAY, now: float | None = None, g
     runs = db.q("SELECT task, started, ended, status, note FROM runs WHERE role!='coordinator' AND started IS NOT NULL "
                 "AND (ended IS NULL OR ended>?) ORDER BY started DESC LIMIT ?", (t0 - DAY, ROWS))
     spans = [(float(r["started"]), float(r["ended"] or now)) for r in runs]
+    starts = sorted(s for s, _ in spans)
     first: dict[int, float] = {}
     last_end: dict[int, list[float]] = {}
     for r in runs:
@@ -390,9 +405,20 @@ def measure(db: DB, cfg: dict, since_s: float = DAY, now: float | None = None, g
                 ln["raised_by"] = {"id": by.get("id"), "old": by.get("old"), "new": by.get("new"), "ts": by.get("ts")}
             else:
                 ln["at_limit" if peak >= limit else "idle"] += 1
+                if peak < limit and _stalled(starts, start, end) * 2 >= end - start:
+                    # Free slots and no run started at all for most of it: dispatch stopped (a stopped
+                    # daemon, a stalled tick, a spend gate), whatever the slot count.
+                    ln["stalled"] = ln.get("stalled", 0) + 1
 
     tasks = db.q("SELECT * FROM tasks WHERE created>? OR status IN ('queued','blocked','waiting') OR id IN "
                  "(SELECT task FROM runs WHERE ended IS NULL OR ended>?) ORDER BY id DESC LIMIT ?", (t0, t0, ROWS))
+    # A task's first run ever, not its first in the runs read above: an old task re-run in the window (a
+    # requeued review, a re-review) started long ago, so its wait is not creation to that late run.
+    ids = [t["id"] for t in tasks]
+    for r in db.q("SELECT task, MIN(started) AS s FROM runs WHERE role!='coordinator' AND started IS NOT NULL "
+                  "AND task IN (SELECT value FROM json_each(?)) GROUP BY task", (json.dumps(ids),)) if ids else []:
+        if r["s"] is not None:
+            first[r["task"]] = min(first.get(r["task"], float(r["s"])), float(r["s"]))
     by_task: dict[int, list] = {}
     for r in sorted(runs, key=lambda r: r["started"]):
         if r["task"] is not None:
@@ -984,16 +1010,20 @@ def plan(db: DB, cfg: dict, report: dict) -> tuple[list[dict], list[dict]]:
             if ln.get("gate_max"):
                 kept.append({"lane": name, "key": key, "why": f"the provider gate holds parallel work at "
                              f"{ln['gate_max']} (spend or plan window), below {cur}: never raised here"})
-            elif not ln["at_limit"] and ln.get("raised"):
-                rb = ln["raised_by"]
-                kept.append({"lane": name, "key": key, "why": f"{ln['raised']} wait(s) met all {rb['old']} slots "
-                             f"before throughput #{rb['id']} raised {key} to {rb['new']}; none met the {cur} now: "
-                             "the raise is in force, measure again once the window runs under it"})
+            elif not ln["at_limit"] and (ln.get("raised") or ln["idle"]):
+                # Idle waits outnumbering the ones a raise was for lead: they name the real cause.
+                rb, idle = ln.get("raised_by") or {}, ln["idle"]
+                raised = (f"{ln['raised']} wait(s) met all {rb.get('old')} slots before throughput #{rb.get('id')} "
+                          f"raised {key} to {rb.get('new')}; none met the {cur} now" if ln.get("raised") else "")
+                stalled = (f"; {ln['stalled']} of them while no run started for {STALL_GAP_S // 60}+ min (a "
+                           "stopped daemon, a stalled dispatch tick or a spend gate)" if ln.get("stalled") else "")
+                why = (f"slots sat idle while work waited ({idle} waits{stalled}): the cause is not the slot count"
+                       + (f"; {raised}" if raised else "") if idle > ln.get("raised", 0)
+                       else f"{raised}: the raise is in force, measure again once the window runs under it"
+                       + (f"; {idle} wait(s) found slots idle" if idle else ""))
+                kept.append({"lane": name, "key": key, "why": why})
             elif not (cpu := cpu_free())[0]:
                 kept.append({"lane": name, "key": key, "why": cpu[1]})
-            elif not ln["at_limit"]:
-                kept.append({"lane": name, "key": key, "why": f"slots sat idle while work waited ({ln['idle']} waits): "
-                             "the cause is not the slot count"})
             else:
                 new = load_size(cur, max(ln["at_limit"], ln["waiting_now"]), max(cur, (os.cpu_count() or 2) // 2))
                 if new > cur:
@@ -1190,7 +1220,7 @@ def text(rep: dict) -> str:
             continue
         if not ln["count"]:
             continue
-        extra = "".join(f", {k} {ln[k]}" for k in ("peak", "gate_max", "backlog") if ln.get(k) is not None) \
+        extra = "".join(f", {k} {ln[k]}" for k in ("peak", "gate_max", "backlog", "stalled") if ln.get(k) is not None) \
             + (f", {ln['raised']} at the limit before raise #{ln['raised_by']['id']}" if ln.get("raised") else "")
         out.append(f"- {ln['lane']}{' SLOW' if ln['slow'] else ''}: {ln['count']} wait(s), median {_dur(ln['median_s'])}, "
                    f"p90 {_dur(ln['p90_s'])}" + (f" (priority 1: {ln['p1_count']}, p90 {_dur(ln['p1_p90_s'])})"

@@ -617,6 +617,47 @@ def test_throughput_never_proposes_a_review_stall_change(env, monkeypatch):
         c for c in rep["changes"] if c["key"] == "coordinator.review_stall_s"]
 
 
+def test_throughput_a_re_run_of_an_old_task_is_no_creation_to_start_wait(env):
+    """A task's wait ends at its first run ever: an old task whose first run ended before the window's runs
+    are read, run again inside it (a requeued review), is not counted as waiting from creation to that run."""
+    from ttp import throughput
+    p = make(env)
+    now = time.time()
+    p.set_config("budget.max_parallel_workers", 4)
+    old = _tp_task(p, "old review", now - 60 * 3600)
+    _tp_run(p, old, now - 60 * 3600 + 30, now - 59 * 3600)
+    _tp_run(p, old, now - 3 * 3600, now - 2 * 3600)
+    fresh = _tp_task(p, "fresh", now - 5 * 3600)
+    _tp_run(p, fresh, now - 5 * 3600 + 20, now - 4 * 3600)
+    w = _tp_lane(throughput.measure(p.db, p.config(), now=now, gates={}), "worker_slots")
+    assert (w["count"], w["p90_s"], w["idle"]) == (1, 20, 0), w
+
+
+def test_throughput_idle_and_stalled_slot_waits_lead_the_verdict_over_an_older_raise(env, monkeypatch):
+    """Free slots outnumbering the waits a raise was for: the kept line says the slot count is not the
+    cause, counts the waits inside a dispatch stall (no run started for STALL_GAP_S), and still names the
+    raise, so a speed complaint is not answered by another slot raise."""
+    from ttp import throughput
+    p = make(env)
+    now = time.time()
+    _tp_busy_fixture(p, now)   # 3 waits over threshold, all 2 slots busy, before the raise below
+    for i in range(4):          # queued 8 h ago, started one at a time from 4 h ago: nothing started for 3 h before
+        t0 = now - 4 * 3600 + i * 700
+        _tp_run(p, _tp_task(p, f"stalled {i}", now - 8 * 3600), t0, t0 + 600)
+    monkeypatch.setattr(throughput, "cpu_free", lambda: (True, ""))
+    p.set_config("budget.max_parallel_workers", 4)
+    p.db.set_kv(throughput.KV, [{"id": 1, "ts": now - 60, "key": "budget.max_parallel_workers", "old": 2, "new": 4}])
+    rep = throughput.measure(p.db, p.config(), now=now, gates={})
+    w = _tp_lane(rep, "worker_slots")
+    assert (w["at_limit"], w["idle"], w.get("raised"), w.get("stalled")) == (0, 4, 3, 4), w
+    assert "stalled 4" in throughput.text({**rep, "changes": [], "kept": []})
+    changes, kept = throughput.plan(p.db, p.config(), rep)
+    assert not [c for c in changes if c["key"] == "budget.max_parallel_workers"], changes
+    why = next(k["why"] for k in kept if k["lane"] == "worker_slots")
+    assert why.startswith("slots sat idle while work waited (4 waits; 4 of them while no run started for 30+ min"), why
+    assert "the cause is not the slot count" in why and "met all 2 slots before throughput #1 raised" in why, why
+
+
 def test_throughput_idle_slots_are_not_raised_and_resource_lanes_are_only_reported(env, monkeypatch):
     from ttp import throughput
     p = make(env)
