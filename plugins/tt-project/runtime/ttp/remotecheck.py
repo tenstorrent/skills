@@ -116,15 +116,18 @@ def env_problem(v) -> str:
 
 
 def argv(cmd: str, host: str, env: dict | None = None, commit: str = "", wrap: tuple[str, ...] = (),
-         py: tuple[str, ...] = (), literal: dict | None = None) -> list[str]:
+         py: tuple[str, ...] = (), literal: dict | None = None, spill: str = "") -> list[str]:
     """The local command that runs check `cmd` on `host` (main): on `commit` when given (the commit a
     `ttp checks` run records), else on the checkout's HEAD; behind `wrap` there when given. `py`: local
-    Python files copied there onto PYTHONPATH (shipped); `literal`: variables exported as given, unexpanded."""
+    Python files copied there onto PYTHONPATH (shipped); `literal`: variables exported as given, unexpanded.
+    `spill`: the project folder whose spill list `host` was picked from (checkspill): main checks it is still
+    on it before it starts the check there."""
     return [sys.executable, "-c", _BOOT, str(Path(__file__).resolve().parents[1]), "--host", host,
             "--env", json.dumps(env or {}, sort_keys=True), *(["--commit", commit] if commit else []),
             *(["--wrap", json.dumps(list(wrap))] if wrap else []),
             *(["--py", json.dumps(list(py))] if py else []),
-            *(["--literal", json.dumps(literal, sort_keys=True)] if literal else []), "--", cmd]
+            *(["--literal", json.dumps(literal, sort_keys=True)] if literal else []),
+            *(["--spill", spill] if spill else []), "--", cmd]
 
 
 def _ssh(host: str, script: str, direct: bool = False, compress: bool = False) -> list[str]:
@@ -419,7 +422,7 @@ def _stop(_sig, _frame) -> None:
 
 
 def main(args: list[str]) -> int:
-    host, env, commit, wrap, py, literal = "", {}, "", (), [], {}
+    host, env, commit, wrap, py, literal, spill = "", {}, "", (), [], {}, ""
     while args and args[0] != "--":
         flag, value, args = args[0], args[1] if len(args) > 1 else "", args[2:]
         if flag == "--host":
@@ -434,6 +437,8 @@ def main(args: list[str]) -> int:
             py = [str(f) for f in json.loads(value or "[]")]
         elif flag == "--literal":
             literal = json.loads(value or "{}")
+        elif flag == "--spill":
+            spill = value
     cmd = " ".join(args[1:])
     if host_problem(host) or host == LOCAL or env_problem(env) or env_problem(literal) or not cmd:
         _say(f"usage: --host <ssh alias> [--env <json>] -- <command> "
@@ -451,6 +456,11 @@ def main(args: list[str]) -> int:
         return 2
     # A paused host may be lent to others: no ssh to it until the pause lifts.
     if why := paused(host):
+        return _fault(host, why)
+    # A spill host taken off the project's list since the run picked it gets no new check: a later check of a
+    # long run starts only where the list still allows it (the fault reruns it elsewhere).
+    from . import checkspill
+    if spill and (why := checkspill.off_list(spill, host)):
         return _fault(host, why)
     # The commit given, never the checkout's HEAD in its place: that may have moved since the run began.
     top = _git("rev-parse", "--show-toplevel")

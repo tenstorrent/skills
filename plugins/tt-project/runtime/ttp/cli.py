@@ -4444,6 +4444,9 @@ def cmd_checks(a) -> None:
                 minutes = slurmcheck.time_min(checklane.median_s(p.state, _commands_hash(todo)), slurm)
             run_wrap = _spill_wrap_digest(todo, cfg)
             todo = _spill_to(todo, spilled.host, cfg, getattr(spilled, "workers", 0))
+            for c in todo if p and not slurm else []:   # each start checks the host is still listed (checkspill.off_list)
+                if getattr(c, "spill_host", "") == spilled.host:
+                    c.spill_project = str(p.base)
             for c in todo if slurm else []:
                 if getattr(c, "spill_host", ""):   # a check split off to run here stays off Slurm
                     c.slurm, c.time_min = slurm, minutes
@@ -5277,6 +5280,18 @@ def _harness_purpose(a) -> dict:
     """What a detached or relaunched `ttp checks` keeps of `--purpose`: only harness, so a restart
     after a reboot qualifies the head for the same purpose."""
     return {"purpose": "harness"} if getattr(a, "purpose", None) == "harness" else {}
+
+
+def _checks_set(a, base: str) -> dict:
+    """The check set a detached `ttp checks` run of the configured checks starts under (push.checks_set_id),
+    so the daemon stops it once delivery.push_checks changes; none for named commands or harness checks."""
+    if a.cmd or getattr(a, "purpose", None) == "harness":
+        return {}
+    from . import push
+    try:
+        return {"checks_set": push.checks_set_id(Project(base).config().get("delivery") or {})}
+    except Exception:   # an unreadable config: the run is never counted superseded
+        return {}
 
 
 CHECKS_HANDOVER = ("every host-wide checks slot stayed busy, so they did not run in this call; started them "
@@ -7143,7 +7158,8 @@ def _checks_start(a, run_dir: Path, top: str, head: str, env: dict, req: str = "
                                               "light": bool(getattr(a, "light", False)),
                                               "no_device": bool(getattr(a, "no_device", False)),
                                               "release": bool(getattr(a, "release", False)),
-                                              **_harness_purpose(a), "req": req, "pidns": pid_ns(), "arrived": arrived,
+                                              **_harness_purpose(a), **_checks_set(a, base),
+                                              "req": req, "pidns": pid_ns(), "arrived": arrived,
                                               "check_run_dir": str(output), "check_report_dir": str(checkdirs.reports(output))})
         except BaseException:
             try:

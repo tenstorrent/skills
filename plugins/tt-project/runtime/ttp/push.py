@@ -639,8 +639,11 @@ def check_argv(cmd: str, top: str | Path | None = None, env: dict | None = None,
                                dict(getattr(cmd, "literal_env", ()) or ()))
     if host := remote_host(cmd):
         there, py = _ship_plugins(exports, tuple(getattr(cmd, "ship_py", ()) or ()))
+        # A spill host is checked against the project's spill list again as the check starts (remotecheck.main)
+        spill = (getattr(cmd, "spill_project", "") or os.environ.get("TTP_PROJECT") or "") \
+            if getattr(cmd, "spill_host", "") == host else ""
         return remotecheck.argv(str(cmd), host, there, commit, tuple(getattr(cmd, "remote_wrap", ()) or ()), py,
-                                dict(getattr(cmd, "literal_env", ()) or ()))
+                                dict(getattr(cmd, "literal_env", ()) or ()), spill)
     cmd = venv_cmd(cmd, top, env) if top else cmd
     cmd = remotecheck.exports(exports) + testslots.clamp_for(cmd, env)
     bash = shutil.which("bash")
@@ -2379,6 +2382,12 @@ def checks_config(d: dict) -> Any:
     push_checks_by_repo is set, then both."""
     by = d.get(BY_REPO)
     return [d.get("push_checks"), by] if by else d.get("push_checks")
+
+
+def checks_set_id(d: dict) -> str:
+    """A short fingerprint of the check set (checks_config) a detached `ttp checks` run starts under: a
+    run whose recorded id differs from the current one ran a superseded set (jobstop.sweep_superseded_checks)."""
+    return hashlib.sha256(json.dumps(checks_config(d), sort_keys=True, default=str).encode()).hexdigest()[:16]
 
 
 def by_repo_problems(v: Any) -> list[str]:

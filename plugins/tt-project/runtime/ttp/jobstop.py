@@ -770,6 +770,9 @@ def stop_checks(p: Project, run_dir: Path, caller: str | None, caller_run: str |
         return 0, f"the checks of run {run_dir.name} no longer run; nothing to stop", None
     if _checks_alive(_read_checks_pid(run_dir)):
         return 1, r["text"] + "; they still run", r
+    if why.startswith(COORD_STOP):   # the waiting task wakes on checks.rc, reads why and reruns its checks
+        from .cli import _checks_drop
+        _checks_drop(run_dir, text)
     return 0, r["text"], r
 
 
@@ -889,6 +892,44 @@ def lane_tasks(p: Project) -> set[int]:
         out |= {str(r.get("task") or "") for r in locks.holder_records(testslots._lanes_of(base))}
         out |= {checklane._ticket_task(t) for t in locks.queued(checkcap.slot_dir(), base)}
     return {int(x) for x in out if x.isdigit()}
+
+
+def sweep_superseded_checks(p: Project, now: float | None = None) -> list[dict]:
+    """Stop the detached checks an open task's run started under a superseded check set: checks.pid
+    records the configured set's id (push.checks_set_id) and delivery.push_checks has changed since, so
+    their result would no longer qualify the head. Each is ended (end_checks) and dropped (cli._checks_drop
+    writes checks.rc 1 and why), so the task wakes and reruns its checks under the current set. Runs of
+    named commands or harness checks record no set and are left alone; a group checks_refused names is never
+    signalled."""
+    from .cli import CHECKS_RC, _checks_alive, _checks_drop, _read_checks_pid
+    from .push import checks_set_id
+    now = time.time() if now is None else now
+    try:
+        current = checks_set_id(p.config().get("delivery") or {})
+    except Exception:
+        return []
+    marks = ",".join("?" * len(ENDED + HANDED_OFF))
+    rows = p.db.q(f"SELECT r.dir, t.id FROM runs r JOIN tasks t ON t.id=r.task WHERE t.status NOT IN ({marks}) "
+                  "AND r.dir IS NOT NULL AND COALESCE(r.started, 0)>?", (*ENDED, *HANDED_OFF, now - SWEEP_DAYS * 86400))
+    out, seen = [], set()
+    for row in rows:
+        d = Path(row["dir"])
+        if row["dir"] in seen:
+            continue
+        seen.add(row["dir"])
+        info = _read_checks_pid(d)
+        old = info.get("checks_set")
+        if not old or old == current or (d / CHECKS_RC).exists() or not _checks_alive(info):
+            continue
+        if checks_refused(p, d, row["id"]):
+            continue
+        why = (f"they started under a superseded check set ({old}); delivery.push_checks is now {current}, "
+               "so rerun them under the current set")
+        r = end_checks(p, d, why, row["id"])
+        if r:
+            _checks_drop(d, why)
+            out.append(r)
+    return out
 
 
 def sweep_cancelled_checks(p: Project, after: float | None = None) -> list[dict]:
@@ -1106,6 +1147,7 @@ def sweep(p: Project, now: float | None = None) -> list[dict]:
     rows = p.db.q(f"SELECT r.dir, t.id, t.status FROM runs r JOIN tasks t ON t.id=r.task WHERE t.status IN ({marks}) "
                   "AND r.dir IS NOT NULL AND COALESCE(r.started, 0)>?", (*ENDED, now - SWEEP_DAYS * 86400))
     out += sweep_cancelled_checks(p)
+    out += sweep_superseded_checks(p, now)
     seen = set()
     for row in rows:
         reg = Path(row["dir"]) / detach.REGISTRY
@@ -1192,6 +1234,8 @@ def may_stop(p: Project, rc: Path, caller: str | None, caller_run: str | None = 
         return True, f"task #{t['id']} is {t['status']}"
     if (own := _own_stop(p, rc, t, caller, caller_run)) is not None:
         return True, own
+    if (coord := coord_checks_stop(p, rc, t, caller_run)) is not None:
+        return True, coord
     me = p.db.task(int(caller)) if caller and str(caller).isdigit() else None
     if me is None or me["status"] in OPEN_WAITER_SKIP or int(me["priority"]) != 1:
         return False, (f"refused: its task #{t['id']} is {t['status']}; only a job of an ended task, or one holding "
@@ -1285,6 +1329,25 @@ def _own_stop(p: Project, rc: Path, t: dict, caller: str | None, caller_run: str
     started = run_of(p, rc)
     when = "its current run" if started == int(caller_run) else "an earlier run"
     return f"stopped by owning task #{t['id']} (run {caller_run}) from {when}, run {started if started else '?'}"
+
+
+COORD_STOP = "stopped by the coordinator"   # coord_checks_stop's reason: stop_checks then drops the checks
+
+
+def coord_checks_stop(p: Project, rc: Path, t: dict, caller_run: str | None) -> str | None:
+    """Why the coordinator may stop these checks, or None: rc is a run's detached `ttp checks` (checks.rc),
+    its task waits on them (status waiting), and TTP_RUN_ID names a coordinator run the project records
+    whose run folder holds a `ttp audit why` (coordfix.intent). The task is told and reruns its checks
+    (stop_checks drops them). Every other rule of may_stop and checks_refused still applies."""
+    from .cli import CHECKS_RC
+    from . import coordfix
+    if Path(rc).name != CHECKS_RC or t.get("status") != "waiting" or not (caller_run and str(caller_run).isdigit()):
+        return None
+    run = p.db.one("SELECT id, dir FROM runs WHERE id=? AND role='coordinator'", (int(caller_run),))
+    if not run or not run["dir"] or not (why := coordfix.intent(run["dir"])).get("why"):
+        return None
+    return (f"{COORD_STOP} (run {run['id']}) for waiting task #{t['id']}: {why['why'][:200]}; "
+            f"serves {why.get('serves') or '?'}")
 
 
 def stop_why(why: str, given: str | None) -> str:

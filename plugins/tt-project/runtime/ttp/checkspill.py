@@ -477,6 +477,31 @@ def _listed(cfg: dict | None) -> list[str]:
     return [h for h in listed if not banned(h, known, ban)]
 
 
+def off_list(project_dir: str, alias: str) -> str:
+    """Why spill host `alias` may no longer take a check of the project at `project_dir`, or "": hosts() of
+    its settings as they are now no longer lists it (taken off its list or the account's pool, or banned).
+    A folder that is no project, or settings that cannot be read, say nothing (the pick checked them)."""
+    from .project import Project
+    try:
+        p = Project(project_dir)
+        if not p.exists():
+            return ""
+        cfg = p.config()
+    except Exception:
+        return ""
+    listed = hosts(cfg)
+    if alias in listed:
+        return ""
+    try:   # a host of a listed machine (machine:host) is listed with it, as allowed() reads it
+        from . import machines
+        if target(alias, machines.load())[0] in listed:
+            return ""
+    except Exception:
+        return ""
+    return (f"{alias} is no longer one of the project's spill hosts (delivery.{KEY}, the account's pool, less "
+            f"{NO_SPILL_KEY}); no check starts there")
+
+
 def _own(cfg: dict | None) -> list[str]:
     try:
         return hosts_of(((cfg or {}).get("delivery") or {}).get(KEY) or [])
@@ -1804,7 +1829,11 @@ def spill_run(p, cfg: dict, cmds: list, tell, what: str = "", off: str = "", why
     if claim is None:
         return None, cmds
     from .cli import _spill_to
-    return claim, [_unspilled(c, was) for c, was in zip(_spill_to(cmds, claim.host, cfg, claim.workers), cmds)]
+    got = [_unspilled(c, was) for c, was in zip(_spill_to(cmds, claim.host, cfg, claim.workers), cmds)]
+    for c in got:   # each check's start checks the host is still on the project's list (off_list)
+        if getattr(c, "spill_host", "") == claim.host:
+            c.spill_project = str(p.base)
+    return claim, got
 
 
 def _unspilled(c: Any, was: Any) -> Any:
