@@ -30,7 +30,8 @@ set TTP_UNTRUSTED_INPUT=1 (a benchmark cell without a project). Then, model-free
   So are environment dumps (a bare printenv, env, export or set, or printenv naming a credential-like
   variable), which print tokens.
 Every task run, marked or not, is refused a Bash command that may change, move or delete the run's
-RUN_MARK file (its name only in quoted text or a read passes) and an edit of that file (mark_refusal):
+RUN_MARK file (its name only in quoted text, a read, a cp's source or a heredoc written to another
+file passes) and an edit of that file (mark_refusal):
 removing it would lift these guards for the rest of the run and keep the
 daemon from labelling the task. A glob (`rm $TTP_RUN_DIR/*`) still gets around it.
 Not covered: a path or command built at run time inside a script or inline code (except git and gh,
@@ -493,11 +494,24 @@ MARK_READERS = frozenset(("cat", "head", "tail", "less", "more", "grep", "egrep"
 # command may reach the file, so it is refused as before.
 MARK_RUNNER_RE = re.compile(r"(?:ba|z|da|k|c|tc|fi)?sh|python[\d.]*|perl|ruby|node|deno|bun|php|lua|tclsh"
                             r"|[gmn]?awk|sed|xargs|find|parallel|ssh|eval|exec|source|watch|busybox|n?vim?|ed|ex")
+# Copiers that only read a source: the mark as one (not the last word) is a read, unless an option links
+# to it or names a target folder (_mark_copy_read).
+MARK_COPIERS = frozenset(("cp", "gcp", "install"))
 PATCH_FILE_RE = re.compile(r"^\*\*\* (?:(?:Add|Update|Delete) File|Move to): *(.+?) *$", re.M)
 
 
 def _mark_path(word: str) -> bool:
     return os.path.basename(word.rstrip("/")) == RUN_MARK
+
+
+def _mark_copy_read(args: list[str]) -> bool:
+    """A cp or install whose words name RUN_MARK only as a source: its last plain word (the target) is
+    something else and no option links to the source or names a target folder (-l, -s, -t)."""
+    plain = [w for w in args if not w.startswith("-")]
+    if not plain or RUN_MARK in plain[-1]:
+        return False
+    return not any(re.fullmatch(r"-[a-zA-Z]*[lst][a-zA-Z]*", w) or w.startswith(("--link", "--symbolic", "--target"))
+                   for w in args)
 
 
 def _unsingle(cmd: str) -> str:
@@ -522,16 +536,17 @@ def _unsingle(cmd: str) -> str:
 
 def _mark_bash(cmd: str) -> bool:
     """Whether a Bash command may create, change, move or delete RUN_MARK. A mention only in a quoted
-    prose argument (a note's text) or as an argument of a command that only reads (a grep pattern, a
-    cat) has no effect; a redirect into it, a path to it given to any other command, or any mention in
-    a command that runs code (or with a substitution or heredoc whose effect the words do not show)
-    counts."""
+    prose argument (a note's text), as an argument of a command that only reads (a grep pattern, a
+    cat, a cp's source) or in a heredoc written to another file has no effect; a redirect into it, a
+    path to it given to any other command, or any mention in a command that runs code (or with a
+    substitution whose effect the words do not show) counts. A heredoc's body lines are read as
+    commands, so one naming the mark as a bare word or path counts."""
     if RUN_MARK not in cmd:
         return False
     from .hook import _quoting, _segments, _strip_prefix
     live = "".join(c for c, (inert, _) in zip(cmd, _quoting(cmd)) if not inert)
-    if "`" in _unsingle(cmd) or "$(" in _unsingle(cmd) or "<<" in live or "<(" in live or ">(" in live:
-        return True   # a substitution (it runs inside double quotes too), heredoc or process substitution
+    if "`" in _unsingle(cmd) or "$(" in _unsingle(cmd) or "<(" in live or ">(" in live:
+        return True   # a substitution (it runs inside double quotes too, and in a heredoc's body) or process substitution
     try:
         import shlex
         lex = shlex.shlex(cmd, posix=True, punctuation_chars=";&|()<>")
@@ -550,6 +565,8 @@ def _mark_bash(cmd: str) -> bool:
             continue
         run = _strip_prefix(seg)
         if run and os.path.basename(run[0]) in MARK_READERS:
+            continue
+        if run and os.path.basename(run[0]) in MARK_COPIERS and _mark_copy_read(run[1:]):
             continue
         if any(RUN_MARK in w and (_mark_path(w) or not re.search(r"\s", w)) for w in seg):
             return True   # a path to it, or a bare word naming it, given to a command that may write
