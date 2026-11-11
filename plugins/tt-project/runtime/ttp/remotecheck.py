@@ -84,6 +84,13 @@ MUX_BACKOFF_S = (2, 5)
 SETUP_TIMEOUT_S = 540
 CLEANUP_TIMEOUT_S = 120
 PROBE_TIMEOUT_S = 45
+# After a tree copy timed out (STAGE_TIMED_OUT), the host's fault clears only once a sample copy of
+# STAGE_SAMPLE_BYTES (incompressible, so ssh's compression does not flatter it) lands there within
+# STAGE_PROBE_S: about 35 KB/s, twice what a 10 MB compressed tree needs within SETUP_TIMEOUT_S.
+# A host that only answers ssh would wake its waiting tasks into the same timed-out copy.
+STAGE_TIMED_OUT = "copying the tree timed out"
+STAGE_SAMPLE_BYTES = 1 << 20
+STAGE_PROBE_S = 30
 STOP_GRACE_S = 5   # a stopped command's TERM before KILL on the host
 SIG = "env:check-host:"
 _TMP = re.compile(r"/[A-Za-z0-9._/-]*/ttp-check\.[A-Za-z0-9]+")
@@ -168,6 +175,25 @@ def reachable(host: str) -> str:
     return f"{host} lacks git or tar"
 
 
+def staging_ok(host: str) -> str:
+    """"" when a sample copy (STAGE_SAMPLE_BYTES) to a temporary folder on `host` finishes within
+    STAGE_PROBE_S, else why not: a tree copy that timed out there can work again."""
+    script = (f't=$({mktemp_cmd({})}) && cat > "$t/sample" && test "$(wc -c < "$t/sample")" -eq {STAGE_SAMPLE_BYTES}; '
+              'r=$?; rm -rf "$t"; exit $r')
+    try:
+        r = subprocess.run(_ssh(host, script, direct=True, compress=True), input=os.urandom(STAGE_SAMPLE_BYTES),
+                           capture_output=True, timeout=STAGE_PROBE_S)
+    except subprocess.TimeoutExpired:
+        return (f"a {STAGE_SAMPLE_BYTES >> 20} MiB test copy to {host} did not finish within {STAGE_PROBE_S} s, "
+                "so the tree copy would time out again")
+    except OSError as e:
+        return f"cannot run ssh: {e}"
+    if r.returncode != 0:
+        err = r.stderr.decode("utf-8", errors="replace").strip().splitlines() or [f"exit {r.returncode}"]
+        return f"a test copy to {host} failed: {err[-1][:200]}"
+    return ""
+
+
 def fault(host: str, cmd: str, cwd: str, why: str = "") -> dict:
     """The envfault record of a check host that cannot run checks."""
     return {"kind": "host", "host": host, "runner": host, "sig": SIG + host, "cmd": cmd, "cwd": cwd,
@@ -245,6 +271,11 @@ def judged(host: str, rc: int, timing: bool) -> int:
     if rc in (0, 143) or not timing or not (why := overloaded(host)):
         return rc
     return _fault(host, f"timing-sensitive tests failed while {why}: load alone fails them")
+
+
+def _staged(why: str) -> str:
+    """A copy step's link fault; one that overran its limit or stalled reads STAGE_TIMED_OUT (a `staging` fault)."""
+    return f"{STAGE_TIMED_OUT} ({why})" if " overran its limit after " in why or " stalled: " in why else why
 
 
 def _fault(host: str, why: str) -> int:
@@ -765,7 +796,7 @@ def _attempt(host, top, head, env, extra, cmd, mark, wrap, wait) -> tuple[int, s
             if why.startswith(MUX):
                 return FAULT_RC, why[len(MUX):]
             if why.startswith(LINK):
-                return _fault(host, why[len(LINK):]), ""
+                return _fault(host, _staged(why[len(LINK):])), ""
             bases = [ln.strip()[len(BASE_MARK):] for ln in "".join(said).splitlines()
                      if ln.strip().startswith(BASE_MARK)]
             _say(f"{why}; sending the whole history instead" if why else
@@ -781,7 +812,7 @@ def _attempt(host, top, head, env, extra, cmd, mark, wrap, wait) -> tuple[int, s
             if why.startswith(MUX):
                 return FAULT_RC, why[len(MUX):]
             if why.startswith(LINK):
-                return _fault(host, why[len(LINK):]), ""
+                return _fault(host, _staged(why[len(LINK):])), ""
             if why and not tree_copy:
                 return _fault(host, f"the copy into its mirror failed ({why})"), ""
             if why:
@@ -794,7 +825,7 @@ def _attempt(host, top, head, env, extra, cmd, mark, wrap, wait) -> tuple[int, s
             if why.startswith(MUX):
                 return FAULT_RC, why[len(MUX):]
             if why:
-                return _fault(host, why[len(LINK):] if why.startswith(LINK) else why), ""
+                return _fault(host, _staged(why[len(LINK):]) if why.startswith(LINK) else why), ""
             if rc:
                 return rc, ""
         from . import testslots

@@ -450,11 +450,16 @@ def hosts_of(cmds: list) -> dict[str, str]:
     return {str(c): h for c in cmds if (h := remote_host(c))}
 
 
-def remote_fault(c: Any, rc: int | None, cwd: str | Path) -> dict | None:
-    """The envfault record when remote check `c` exited remotecheck.FAULT_RC (ssh or the host failed)."""
+def remote_fault(c: Any, rc: int | None, cwd: str | Path, said: str = "") -> dict | None:
+    """The envfault record when remote check `c` exited remotecheck.FAULT_RC (ssh or the host failed).
+    `said`: the check's output; a tree copy that timed out there marks the fault `staging`, which
+    clears only once a test copy works (remotecheck.staging_ok), not once ssh answers."""
     if rc != remotecheck.FAULT_RC or not (h := remote_host(c)):
         return None
-    return remotecheck.fault(h, str(c), str(cwd))
+    f = remotecheck.fault(h, str(c), str(cwd))
+    if f"{remotecheck.SIG}{h}: {remotecheck.STAGE_TIMED_OUT}" in said:
+        f.update(why=f"{remotecheck.STAGE_TIMED_OUT} after {remotecheck.SETUP_TIMEOUT_S} s", staging=True)
+    return f
 
 
 def harness_plan_problem(cmd: str) -> str | None:
@@ -4872,7 +4877,7 @@ def _run_one(cmd: Any, repo: Path, env: dict, say: Callable[[str], None], seen: 
         say(f"{workerloss.line(loss, str(cmd))}; not pushing. Hand off `waiting`; retry_when: "
             f"test \"$(date +%s)\" -ge {int(time.time()) + WORKER_LOSS_S}")
         return BUSY
-    if fault := remote_fault(cmd, rc, repo):
+    if fault := remote_fault(cmd, rc, repo, collect.text()):
         p = None
         if base := os.environ.get("TTP_PROJECT"):
             p = Project(base)

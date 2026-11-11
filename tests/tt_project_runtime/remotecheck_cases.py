@@ -4623,7 +4623,7 @@ def test_a_slow_copy_prints_progress_and_an_overrun_is_a_host_fault_not_a_timeou
     """A copy prints how far it got while it runs (the checks' silence limit never calls it a hang); one
     past its limit is killed and is the host's fault (75, the unreachable-host wait), never the change's
     failure or a timeout's 124."""
-    from ttp import remotecheck
+    from ttp import push, remotecheck
     repo = _rc_repo(tmp_path)
     rc, said = _rc_run(tmp_path, repo, "echo did-run", FAKE_SSH_SLOW="ttp-send:2", TTP_REMOTE_PROGRESS_S="0.5")
     assert rc == 0 and "did-run" in said, said
@@ -4635,6 +4635,10 @@ def test_a_slow_copy_prints_progress_and_an_overrun_is_a_host_fault_not_a_timeou
         rc, said = _rc_run(tmp_path, repo, "echo did-run", **fake, **slow)
         assert rc == remotecheck.FAULT_RC and "did-run" not in said, (fake, said)
         assert "overran its limit" in said and f"{remotecheck.SIG}box1" in said and time.monotonic() - t0 < 15, said
+        # the overrun is a staging fault (push.remote_fault reads it), so the host clears only once a test copy works
+        assert f"{remotecheck.SIG}box1: {remotecheck.STAGE_TIMED_OUT}" in said, said
+        box = type("Box", (str,), {"host": "box1"})("x")
+        assert push.remote_fault(box, rc, tmp_path, said).get("staging") is True, said
     assert _rc_left(tmp_path) == []
 
 
@@ -5103,3 +5107,56 @@ def test_remote_check_script_stops_its_command_and_removes_its_folder_when_a_sig
         proc.wait()
         with contextlib.suppress(OSError, ValueError):
             os.kill(int(pidf.read_text()), signal.SIGKILL)
+
+
+def test_a_tree_copy_timeout_clears_only_once_a_test_copy_to_the_host_finishes_in_time(env, tmp_path, monkeypatch):
+    """A check host whose tree copy timed out is a `staging` fault: `ttp checks --env-ok` on it stays 1 while ssh
+    answers but a test copy there stalls or fails (else the waiting task wakes into the same timed-out upload),
+    and 0 once the test copy lands in time. Other host faults still clear once ssh answers, with no test copy;
+    the push queue's and push's callers read the same output."""
+    from ttp import cli, envfault, push, remotecheck
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    bin_, remote = _rc_fake_ssh(tmp_path)
+    slow = tmp_path / "slowssh"
+    slow.mkdir()
+    (slow / "ssh").write_text(f'#!/bin/sh\ncase "$*" in *"/sample"*) [ -n "$STAGE_SLOW" ] && exec sleep 5;; esac\n'
+                              f'exec {bin_ / "ssh"} "$@"\n')
+    (slow / "ssh").chmod(0o755)
+    calls = tmp_path / "ssh.args"
+    monkeypatch.setenv("PATH", f"{slow}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("FAKE_REMOTE_TMP", str(remote))
+    monkeypatch.setenv("FAKE_SSH_ARGS", str(calls))
+    monkeypatch.setattr(remotecheck, "STAGE_PROBE_S", 2)
+    sig = remotecheck.SIG + "box1"
+
+    class Cmd(str):
+        host = "box1"
+    said = (f"ttp remote check: environment fault {sig}: {remotecheck.STAGE_TIMED_OUT} after "
+            f"{remotecheck.SETUP_TIMEOUT_S} s. This is the host, not the change\n")
+    f = push.remote_fault(Cmd("pytest -q"), remotecheck.FAULT_RC, repo, said)
+    assert f["staging"] is True and remotecheck.STAGE_TIMED_OUT in f["why"], f
+    plain = push.remote_fault(Cmd("pytest -q"), remotecheck.FAULT_RC, repo, "ssh: connection lost")
+    assert "staging" not in plain, plain
+    assert push.remote_fault(Cmd("pytest -q"), 1, repo, said) is None
+    envfault.record(p, f, "7")
+    assert envfault.open_faults(p)[sig]["staging"] is True, "the record keeps it"
+
+    monkeypatch.setenv("STAGE_SLOW", "1")   # ssh answers, the copy stalls past its limit
+    assert remotecheck.reachable("box1") == ""
+    assert "did not finish within 2 s" in (envfault.probe(envfault.open_faults(p)[sig]) or {}).get("why", "")
+    assert cli._checks_env_ok(p, [sig]) == 1
+    monkeypatch.delenv("STAGE_SLOW")
+    monkeypatch.setenv("FAKE_SSH_FAIL", "/sample")   # the copy fails at once
+    assert cli._checks_env_ok(p, [sig]) == 1
+    monkeypatch.delenv("FAKE_SSH_FAIL")
+    calls.unlink(missing_ok=True)
+    assert cli._checks_env_ok(p, [sig]) == 0, "the test copy lands in time: the fault closes"
+    copy = [c for c in calls.read_text().splitlines() if "/sample" in c]
+    assert len(copy) == 1 and "Compression=yes" in copy[0] and "ControlPath=none" in copy[0], copy
+    assert sig not in envfault.open_faults(p) and _rc_left(tmp_path) == [], "the sample is removed"
+
+    monkeypatch.setenv("STAGE_SLOW", "1")
+    calls.unlink()
+    envfault.record(p, plain, "7")
+    assert cli._checks_env_ok(p, [sig]) == 0, "a fault that was no copy timeout clears once ssh answers"
+    assert not [c for c in calls.read_text().splitlines() if "/sample" in c]

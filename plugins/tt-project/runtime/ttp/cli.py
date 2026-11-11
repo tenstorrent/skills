@@ -4186,6 +4186,7 @@ def cmd_checks(a) -> None:
         die(f"ttp checks: {e}")
     log = Path(run_dir) / "checks.log"
     passed, failed, failure, rc, scope_error = True, None, None, None, None
+    check_start = 0   # where the failing check's own output starts in checks.log
     clean_note = ""   # why a check found no clean checkout, or what only this worktree has
     fast_skipped, fast_cmds, scope_lines = [], [], []
     executed, selected, rerun = [], [], None
@@ -4949,7 +4950,7 @@ def cmd_checks(a) -> None:
             sys.exit(75)
         # A check host ssh could not reach (or that could not take the tree) is the environment, as a
         # missing runner is: wait for it, counting nothing against the change (envfault).
-        if not passed and (fault := push.remote_fault(failed, rc, top)):
+        if not passed and (fault := push.remote_fault(failed, rc, top, _log_since(out, log, check_start))):
             envfault.record(p, fault, os.environ.get("TTP_TASK"))
             envfault.write_marker(run_dir, fault)
             said = f"{envfault.line(fault)}. Hand off `waiting`; retry_when: {envfault.retry_when(p, fault)}"

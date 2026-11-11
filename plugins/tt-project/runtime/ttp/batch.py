@@ -2485,7 +2485,7 @@ class Batch:
                         cmd = self._respill(cmd, head, fault, claims)   # the next spill host, else here
                         slot = own(cmd, slot)
                         rc, tail = self._run_check(cmd, {**env, **slot.env()}, env)
-                    if fault := push.remote_fault(cmd, rc, self.wt):
+                    if fault := push.remote_fault(cmd, rc, self.wt, str(tail or "")):
                         raise envfault.Fault(fault)   # the check host, not this head: push_phase holds the batch
                     if rc != 0 and tree:
                         self.failed_runs[(tree, str(cmd))] = (rc, tail)
@@ -2969,7 +2969,7 @@ class Batch:
                     rc, tail, _ = _stream(_check_argv(cmd, self.wt), self.wt,
                                           env={**env, **pushpass.select_env(rx, env), **slot.env()},
                                           pass_fds=checkdirs.inherited(), urgent_mark=self._urgent_mark())
-                    if fault := push.remote_fault(cmd, rc, self.wt):
+                    if fault := push.remote_fault(cmd, rc, self.wt, str(tail or "")):
                         raise envfault.Fault(fault)
                     ok = rc in (0, NO_TESTS)
                     self.checks["cap_probes"] = self.checks.get("cap_probes", 0) + 1

@@ -18,7 +18,8 @@ command, run again where it was found, no longer hits it, or once that checkout 
 A check with a host (push.remote_host, remotecheck) needs no local runner: its fault is the host,
 env:check-host:<host>, when it is paused (remotecheck.paused: probed with no ssh), ssh cannot reach
 it or it lacks git or tar (probed before the checks, or the check exits remotecheck.FAULT_RC mid-run).
-It clears once the pause lifts and ssh reaches the host again.
+It clears once the pause lifts and ssh reaches the host again; one a tree copy timed out at (staging)
+only once a test copy there finishes in time too (remotecheck.staging_ok).
 
 A missing or old runner's observation also names its likely cause (cause), read-only and model-free:
 the pip runs of the CAUSE_WINDOW_S before it (pip's selfcheck cache: one file per interpreter prefix,
@@ -241,7 +242,8 @@ def probe(r: dict, env: dict | None = None) -> dict | None:
     if r.get("kind") == "host":
         from . import remotecheck
         host = str(r.get("host") or "")
-        why = remotecheck.paused(host, r.get("cwd") or None) or remotecheck.reachable(host)
+        why = (remotecheck.paused(host, r.get("cwd") or None) or remotecheck.reachable(host)
+               or (remotecheck.staging_ok(host) if r.get("staging") else ""))
         return {**r, "why": why} if why else None
     path = str(r.get("path") or os.defpath)
     if r.get("kind") == "program":
@@ -456,7 +458,7 @@ def record(p, f: dict, task: str | None = None, queue: bool = False) -> bool:
             if task and task not in tasks:
                 tasks = (tasks + [task])[-20:]
             keep = {k: f.get(k) for k in ("kind", "name", "python", "module", "path", "cwd", "cmd", "runner",
-                                          "min", "version", "host", "why", "lock") if f.get(k) is not None}
+                                          "min", "version", "host", "why", "lock", "staging") if f.get(k) is not None}
             if old and old.get("queue") and not queue:
                 keep = {k: old[k] for k in keep.keys() | old.keys() if k in old}
             faults[sig] = {**keep, "since": (old or {}).get("since") or now, "last": now, "tasks": tasks,
