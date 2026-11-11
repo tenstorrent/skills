@@ -363,6 +363,10 @@ class Provider:
     # run of another with the same format (the chat provider runs Claude Code, so it forks a Claude
     # session; ctxfork.py). "" for none.
     session_format = ""
+    # The agent keeps a resumed session's saved system prompt (Codex: the developer messages in its rollout),
+    # so a fork of the coordinator's session starts under the coordinator's rules unless the prompt
+    # overrides them (ctxfork.kept_system_lead).
+    resume_keeps_system = False
     no_fork_why = ""   # why this provider has no fork_session, for fork_gap's report
     # fork_session takes tail_tokens: a copy of only the session's last turns, cut where forks share it
     # (ctxfork: a run on another model than the session's starts from such a copy).

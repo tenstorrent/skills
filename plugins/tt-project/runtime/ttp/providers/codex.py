@@ -109,6 +109,7 @@ class Codex(Provider):
     # turn read 0 cached tokens on most turns with a byte-identical prefix (measured on 0.160).
     cache_key_per_session = True
     coord_session = "agent"   # `codex exec ... resume <id> -`; size and compaction from the rollout (session_context)
+    resume_keeps_system = True
     session_format = "codex-rollout"   # sessions/YYYY/MM/DD/rollout-<time>-<id>.jsonl (fork_session)
     # --output-schema is per run, but `exec resume` keeps the first run's developer instructions: on
     # 0.160 the resumed request carried the old text and none of a changed `-c developer_instructions`

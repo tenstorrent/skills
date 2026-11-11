@@ -1178,7 +1178,7 @@ def test_codex_worker_runs_start_with_their_own_instructions_and_the_coordinator
     """Task #198: a Codex worker forked from a Codex coordinator, a follow-up resuming that worker's
     session and the worker's own continued session all run under the worker's system prompt with none
     of the coordinator-only text; a Codex coordinator run keeps its own."""
-    from ttp import coordsession
+    from ttp import coordsession, ctxfork
     home = tmp_path / "codex-home"
     monkeypatch.setenv("CODEX_HOME", str(home))
     _fork_fake_codex(tmp_path, monkeypatch)
@@ -1194,6 +1194,7 @@ def test_codex_worker_runs_start_with_their_own_instructions_and_the_coordinator
         argv = json.loads((p.runs / str(rid) / "run.json").read_text())["argv"]
         got = json.loads(p.db.one("SELECT note FROM runs WHERE id=?", (rid,))["note"] or "{}").get("coord_context")
         [path] = [f for f in tmp_path.rglob(f"rollout-*-{got['session']}.jsonl")]
+        start.prompt = (p.runs / str(rid) / "prompt.md").read_text()
         return argv, got, path.read_text()
 
     tid = p.db.add_task("the change", "do it", kind="code", origin="user")
@@ -1201,8 +1202,14 @@ def test_codex_worker_runs_start_with_their_own_instructions_and_the_coordinator
     assert got["how"] == "fork" and argv[argv.index("resume") + 1] == got["session"], (got, argv)
     assert "no tools" not in text and "WORKER RULES" in text and "<multi_agent_role>" in text
     assert "This session has no tools" in coord_src.read_text()   # the coordinator's session is untouched
+    # Task #299 (user msg #329): the prompt overrides the coordinator's rules the copy may still hold and
+    # carries the worker's own, once, as a shaped Claude fork's does (forks without it wrote no result).
+    lead, rest = start.prompt.split("TASK PROMPT", 1)[0], start.prompt.split("TASK PROMPT", 1)[1]
+    assert lead.startswith(ctxfork.FORK_HEAD) and "are the coordinator's and do not apply" in lead
+    assert start.prompt.count("WORKER RULES") == 1 and "WORKER RULES" in lead, start.prompt
     _argv, again, text = start(tid, resume=got["session"])   # its own session, continued
     assert again["how"] == "resume" and "no tools" not in text and "WORKER RULES" in text
+    assert "do not apply" not in start.prompt   # its own session held the worker's rules already
     # A follow-up resumes a copy of an earlier run's session (whatever it held): it gets its own text too.
     _ok_run(p, tid, csid, provider="codex", ended=time.time() - 60)
     hop = p.db.add_task("continue: the change", "the rest", kind="code", origin="coordinator",

@@ -3949,6 +3949,9 @@ class Daemon:
                     if shaped:
                         argv, got["lead"] = shaped, got["lead"] + "\n\n" + ctxfork.shared_lead(append_system)
                         append_system, prefix_by = shape["system"], "coordinator"
+                elif got.get("how") == "fork" and prov.resume_keeps_system and append_system is not None:
+                    # The copied session keeps the coordinator's own rules: the prompt overrides them.
+                    got["lead"] = got["lead"] + "\n\n" + ctxfork.kept_system_lead(append_system)
                 if got.get("lead"):
                     prompt = got["lead"] + "\n\n" + prompt
                 note = {**(note or {}), ctxfork.KEY: {**{k: got[k] for k in ("how", "why", "session", "tokens", "tail", "run", "from", "role_gap")
@@ -4096,7 +4099,8 @@ class Daemon:
                     why = prov.own_instructions(resume, str(cwd), env, append_system)
                     if why:
                         log(self.p, f"run {run_id}: system prompt not set in the resumed session ({why}); it leads the prompt")
-                        if sys_args:
+                        if sys_args and not ((note or {}).get(ctxfork.KEY, {}).get("how") == "fork"
+                                             and prov.resume_keeps_system):   # the fork's lead has them
                             prompt = append_system + "\n\n" + prompt
             argv = _before_stdin(argv, resume_extra)
             (run_dir / "prompt.md").write_text(prompt)

@@ -51,7 +51,12 @@ the Claude families, a provider that cannot copy only the last turns, or the set
 block instead (_model_gap, _other_model_tail). For the same reason a follow-up never resumes a session another model
 made (Sonnet resuming an Opus run or the reverse, owner's order): it starts as a fresh run of its model
 does, from the coordinator fork (shaped) or the disk block, and its prompt carries the task it continues
-and that task's last hand-off (_cross_model)."""
+and that task's last hand-off (_cross_model).
+
+An agent that keeps a resumed session's saved system prompt (Codex: Provider.resume_keeps_system) has the
+run's own swapped into the copy (Provider.own_instructions); a coordinator fork's prompt also overrides
+the coordinator's rules (no tools, a JSON answer only) and carries the run's own after fork_lead
+(kept_system_lead), so a swap that could not be made never leaves a worker that does no work."""
 from __future__ import annotations
 
 import json
@@ -549,6 +554,17 @@ def shape_argv(argv: list[str], shape: dict, other_model: bool = False) -> tuple
     out = [*argv[:i], json.dumps(mine), *argv[i + 1:]]
     extra = ["--json-schema", _arg(coord, "--json-schema")]
     return (out[:-1] + extra + ["-"] if out[-1:] == ["-"] else out + extra), ""
+
+
+def kept_system_lead(own_system: str) -> str:
+    """What follows fork_lead in a fork on an agent that keeps the session's saved system prompt (Codex,
+    Provider.resume_keeps_system): the coordinator's rules there (no tools, a JSON answer only) are
+    overridden, then the run's own rules, so the run works and hands off even where they could not be
+    swapped in the copy (Provider.own_instructions; forks that kept them wrote no result)."""
+    return ("Any instructions earlier in this session that say you have no tools, no files, shell or web, "
+            "or that you answer only with a JSON object of actions, are the coordinator's and do not apply "
+            "to you. You have your tools: use them to do the task, write your result as your rules say "
+            "and end as they say. Your own rules follow and take their place.\n\n" + own_system)
 
 
 def shared_lead(own_system: str) -> str:
