@@ -3390,7 +3390,8 @@ class Daemon:
             log(self.p, f"{prov}: {why}; new runs start on it again")
 
     def _saved_net_holds(self) -> dict[str, dict]:
-        """The holds kv NET_HOLDS_KEY kept (hold_offline), each counted from the wall time it began."""
+        """The holds kv NET_HOLDS_KEY kept (hold_offline), each counted from the wall time it began. One
+        NET_HOLD_MAX_S old or more is dropped, so a restart checks the network afresh."""
         try:
             saved = {} if _proxied() else self.p.db.kv(NET_HOLDS_KEY) or {}
         except Exception:
@@ -3398,7 +3399,8 @@ class Daemon:
         now, mono = time.time(), time.monotonic()
         return {prov: {"host": str(h["host"]), "since": mono - max(now - float(h.get("at") or now), 0.0),
                        "checked": None, "checking": False, "up": False, "probe": None}
-                for prov, h in saved.items() if isinstance(h, dict) and h.get("host")} if isinstance(saved, dict) else {}
+                for prov, h in saved.items() if isinstance(h, dict) and h.get("host")
+                and now - float(h.get("at") or now) < NET_HOLD_MAX_S} if isinstance(saved, dict) else {}
 
     def _save_net_holds(self) -> None:
         now, mono = time.time(), time.monotonic()

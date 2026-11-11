@@ -5759,12 +5759,14 @@ def test_a_net_hold_whose_lookup_never_passes_still_lets_one_coordinator_turn_tr
     clock[0] += dm.NET_HOLD_MAX_S - 1
     d.maybe_coordinate()
     assert started == ["coordinator"]
-    # A restart (or the overseer's wake) restores the hold from kv and, the hold being old, tries once.
+    # A restart (or the overseer's wake) keeps a young saved hold but drops one NET_HOLD_MAX_S old,
+    # so it checks the network afresh: one turn starts.
     saved = p.db.kv(dm.NET_HOLDS_KEY)   # the fake monotonic clock moved; wall time did not: age it as it would
+    p.db.set_kv(dm.NET_HOLDS_KEY, {core: {**saved[core], "at": time.time() - 60}})
+    assert core in dm.Daemon(p.base)._net_holds
     p.db.set_kv(dm.NET_HOLDS_KEY, {core: {**saved[core], "at": time.time() - 2 * dm.NET_HOLD_MAX_S}})
     wake = dm.Daemon(p.base)
     monkeypatch.setattr(wake, "start_run", start_run)
-    assert wake.net_held(core) and wake._net_may_probe(core)
-    wake.maybe_coordinate()
+    assert not wake.net_held(core)
     wake.maybe_coordinate()
     assert started == ["coordinator"] * 2
