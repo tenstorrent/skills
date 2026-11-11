@@ -4,9 +4,15 @@
 
 A worker follow-up that names the same branch (its `pr_branch:` line), the same files (slash paths
 in its spec, as settled.files_in reads them, overlap.same) or the same task lineage (chaincap.chain
-root) as an open task of its kind is folded into that task instead of being proposed as a new one:
-appended to its spec when queued, also sent to its running run's steer.md as a mid-run update. The
-first match wins in that order (branch, files, lineage), the newest task among equals.
+root) as a queued task of its kind is folded into that task instead of being proposed as a new one:
+appended to its spec. The first match wins in that order (branch, files, lineage), the newest task
+among equals.
+
+Targets: only queued tasks that can start now (no start_after or start_when, no unmet dependency): a
+running task may already have written its hand-off and never read the fold, and a deferred one would
+make the follow-up wait. Urgency must match (urgentfup.why): an urgent or obligation-owning source's
+follow-up folds only into a target that is urgent or owns one of the same obligations, else urgentfup
+queues it at once; a routine follow-up never folds into urgent or owed work.
 
 Never folded: upstream notes, deferred follow-ups (start_after, start_when), post-landing steps,
 `continue:` and `mechanical:` follow-ups (the chain hops and their caps own them), follow-ups of a
@@ -17,9 +23,8 @@ that does not fold stays proposed, and each fold is logged, named in the task's 
 from __future__ import annotations
 
 import json
-from pathlib import Path
-
-from . import chaincap, overlap, settled, upstream, worktree
+from . import chaincap, overlap, settled, upstream, urgent, urgentfup, worktree
+from .db import deferral
 
 SETTING = "fold_followups"   # chains.fold_followups
 MAX_OPEN = 200               # open tasks read per hand-off
@@ -58,10 +63,32 @@ def _root(db, tid: int) -> int:
         return tid
 
 
+def _owned(db, tid: int) -> set[str]:
+    from . import obligations
+    try:
+        return set(obligations.owned_open(db, int(tid)))
+    except Exception:
+        return set()
+
+
+def _targets(db, task: dict, rows: list[dict]) -> list[dict]:
+    """The rows `task`'s follow-ups may fold into: queued, not deferred, dependencies met, same urgency."""
+    rows = [t for t in rows if t["status"] == "queued" and not deferral(t)]
+    try:
+        unmet = db.unmet_dependencies(rows) if rows else {}
+    except Exception:
+        return []
+    rows = [t for t in rows if not unmet.get(t["id"])]
+    if not urgentfup.why(db, task):
+        return [t for t in rows if not urgentfup.why(db, t)]
+    mine = _owned(db, task["id"])
+    return [t for t in rows if urgent.is_urgent(t) or (mine & _owned(db, t["id"]))]
+
+
 def match(db, task: dict, fup: dict, open_rows: list[dict]) -> tuple[dict, str] | None:
     """(the open task `fup` folds into, why), or None."""
     kind = str(fup.get("kind") or task["kind"]).strip().lower()
-    rows = [t for t in open_rows if t["kind"] == kind and t["id"] != task["id"]]
+    rows = _targets(db, task, [t for t in open_rows if t["kind"] == kind and t["id"] != task["id"]])
     if not rows:
         return None
     rows.sort(key=lambda t: -int(t["id"]))
@@ -98,7 +125,7 @@ def fold(p, cfg: dict, task: dict, fups: list[dict], skip: set[int], log=None) -
     if not want:
         return {}
     db = p.db
-    open_rows = [dict(r) for r in db.q("SELECT * FROM tasks WHERE status IN ('queued','running') AND kind!='review' "
+    open_rows = [dict(r) for r in db.q("SELECT * FROM tasks WHERE status='queued' AND kind!='review' "
                                        f"ORDER BY id DESC LIMIT {MAX_OPEN}")]
     out: dict = {}
     for f in want:
@@ -109,14 +136,9 @@ def fold(p, cfg: dict, task: dict, fups: list[dict], skip: set[int], log=None) -
         text = _text(task, f, why)
         try:
             cur = db.task(t["id"]) or t
-            if cur["status"] not in ("queued", "running"):
+            if cur["status"] != "queued":   # started since: its run may never read the fold
                 continue
             db.update_task(t["id"], spec=f"{str(cur.get('spec') or '').rstrip()}\n\n{text}")
-            if cur["status"] == "running":
-                from .coordinator import _append_update
-                for r in db.q("SELECT id, dir FROM runs WHERE task=? AND status='running' AND dir IS NOT NULL",
-                              (t["id"],)):
-                    _append_update(Path(r["dir"]) / "steer.md", text, f"fold-{task['id']}-{len(out)}-{r['id']}")
         except Exception as e:   # never dropped: it stays proposed
             if log:
                 log(f"task {task['id']}: follow-up {str(f.get('title'))[:80]!r} not folded into #{t['id']}: {e}")

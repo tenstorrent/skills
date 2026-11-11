@@ -771,8 +771,8 @@ def test_an_urgent_follow_up_of_another_kind_stays_with_the_coordinator(env):
 def test_a_follow_up_on_an_open_tasks_file_branch_or_lineage_folds_into_it(env):
     """fupfold: a routine task's follow-up naming a file a queued task of its kind names is appended to that
     task's spec, not proposed as a new task; the hand-off and followup_proposed events say 'folded into #N'
-    and are handled. A running task gets it as a mid-run update in its run's steer.md too. A branch match
-    (pr_branch:) beats a file match; a lineage match (it continues the done task) folds with nothing else."""
+    and are handled. A branch match (pr_branch:) beats a file match; a lineage match (it continues the done
+    task) folds with nothing else."""
     import json
     p = make(env)
     other = p.db.add_task("other docs", "Touch plugins/x/runtime/ttp/b.py.", kind="harness", origin="coordinator")
@@ -787,18 +787,14 @@ def test_a_follow_up_on_an_open_tasks_file_branch_or_lineage_folds_into_it(env):
     assert ev["status"] == "handled" and f"(folded into #{target}: same file docs/guide.md)" in ev["text"], ev["text"]
     (done,) = p.db.q("SELECT text, status FROM events WHERE kind='task_done' AND task=?", (tid,))
     assert f"Follow-up folded into #{target} (same file docs/guide.md)" in done["text"] and done["status"] == "handled"
-    # Running, on the follow-up's branch: the stored spec and the run's steer.md both get it.
-    run_dir = env["tmp"] / "run-live"
-    run_dir.mkdir()
+    # On the follow-up's branch: the branch match wins over the newer task's file match.
     live = p.db.add_task("live work", "Work.", kind="harness", origin="coordinator",
                          labels=["pr_branch:ttp/t1-live"])
-    p.db.update_task(live, status="running")
-    p.db.x("INSERT INTO runs(task, role, started, status, dir) VALUES(?,?,?,?,?)",
-           (live, "worker", time.time(), "running", str(run_dir)))
+    newer = p.db.add_task("guide again", "Edit plugins/x/docs/guide.md.", kind="harness", origin="coordinator")
     tid2 = _urgent_done(env, p, "Branch work", [
         {"title": "next step: one more test", "spec": "pr_branch: ttp/t1-live\nAdd it beside docs/guide.md."}])
     assert "Folded follow-up from #%d (same branch ttp/t1-live)" % tid2 in p.db.task(live)["spec"]
-    assert "same branch ttp/t1-live" in (run_dir / "steer.md").read_text()
+    assert "Folded" not in p.db.task(newer)["spec"]
     # Lineage: a queued task continuing the done one takes its follow-up.
     root = p.db.add_task("root", "Root.", kind="harness", origin="coordinator")
     hop = p.db.add_task("root, part 2", "More.", kind="harness", origin="coordinator", labels=[f"continues:{root}"])
@@ -806,6 +802,56 @@ def test_a_follow_up_on_an_open_tasks_file_branch_or_lineage_folds_into_it(env):
     _urgent_hand_off(env, p, root, "root", [{"title": "next step: tidy up", "spec": "Tidy."}])
     assert f"Folded follow-up from #{root} (same lineage (#{root}))" in p.db.task(hop)["spec"], p.db.task(hop)["spec"]
     assert json.loads(p.db.task(hop)["labels"]) == [f"continues:{root}"]
+
+
+def test_a_follow_up_folds_only_into_a_ready_queued_task_of_its_urgency(env):
+    """fupfold targets: an urgent task's next step naming a file of a deferred priority-5 task, of one with an
+    unmet dependency, or of a running one (whose run may already have handed off) is not folded: the
+    daemon queues it at once as urgentfup does. An urgent or same-obligation target takes it; a routine
+    follow-up never folds into urgent or owed work, and a running target hands off without it."""
+    import json
+    from ttp import obligations
+    p = make(env)
+    later = p.db.add_task("guide later", "Edit plugins/x/docs/guide.md.", kind="harness", origin="coordinator",
+                          priority=5, labels=[f"start_after:{time.time() + 3 * 86400:.0f}"])
+    first = p.db.add_task("first", "s", kind="harness", origin="coordinator")
+    gated = p.db.add_task("guide gated", "Edit plugins/x/docs/guide.md.", kind="harness", origin="coordinator",
+                          depends_on=[first])
+    live = p.db.add_task("guide live", "Edit plugins/x/docs/guide.md.", kind="harness", origin="coordinator")
+    p.db.update_task(live, status="running")
+    fup = [{"title": "next step: fix the guide's table", "spec": "The table in docs/guide.md is stale."}]
+    hot = "urgent: the user waits on the guide"
+    tid = _urgent_done(env, p, "Urgent guide", fup, spec=hot, priority=1)
+    (kid,) = p.db.q("SELECT * FROM tasks WHERE parent=?", (tid,))
+    assert kid["status"] == "queued" and kid["priority"] == 1, dict(kid)
+    assert all("Folded" not in p.db.task(t)["spec"] for t in (later, gated, live))
+    # The running target hands off right after: the follow-up was queued, not left in its spec.
+    _urgent_hand_off(env, p, live, "guide live", [])
+    assert p.db.task(live)["status"] == "done" and "Folded" not in p.db.task(live)["spec"]
+    # A routine follow-up never loads urgent work; an urgent one folds into urgent work.
+    rush = p.db.add_task("guide rush", f"Edit plugins/x/docs/guide.md.\n{hot}", kind="harness",
+                         origin="coordinator", priority=2)
+    tid2 = _urgent_done(env, p, "Routine guide", fup)
+    assert "Folded" not in p.db.task(rush)["spec"] and [e["status"] for e in _proposed(p, tid2)] == ["queued"]
+    tid3 = _urgent_done(env, p, "Urgent again", fup, spec=hot, priority=1)
+    assert f"Folded follow-up from #{tid3}" in p.db.task(rush)["spec"]
+    assert not p.db.q("SELECT id FROM tasks WHERE parent=?", (tid3,))
+    # An obligation owner's follow-up folds only into a task owning the same obligation.
+    for t in (rush, kid["id"]):   # no urgent target left
+        p.db.update_task(t, status="cancelled")
+    mate = p.db.add_task("guide mate", "Edit plugins/x/docs/guide.md.", kind="harness", origin="coordinator")
+    held = {}
+    tid4 = _urgent_done(env, p, "Owed guide", fup, setup=lambda t: held.setdefault(
+        "o", obligations.add(p, "the guide", owners=[t])))
+    assert "Folded" not in p.db.task(mate)["spec"] and p.db.q("SELECT id FROM tasks WHERE parent=?", (tid4,)), \
+        [dict(e) for e in p.db.q("SELECT kind, status, text FROM events WHERE task=?", (tid4,))]
+    obligations.add(p, "the guide too", owners=[mate])
+    p.db.update_task(mate, status="cancelled")
+    mate2 = p.db.add_task("guide mate 2", "Edit plugins/x/docs/guide.md.", kind="harness", origin="coordinator")
+    tid5 = _urgent_done(env, p, "Owed guide 2", fup, setup=lambda t: obligations.add(p, "the guide 2",
+                                                                                   owners=[t, mate2]))
+    assert f"Folded follow-up from #{tid5}" in p.db.task(mate2)["spec"], p.db.task(mate2)["spec"]
+    assert json.loads(p.db.task(later)["labels"])
 
 
 def test_a_follow_up_that_matches_no_open_task_or_may_not_fold_stays_proposed(env):

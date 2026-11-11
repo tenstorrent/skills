@@ -949,9 +949,11 @@ coordinator with that evidence.
   waiting) raises nothing. It clears once an owner starts or the promise closes; one per promise or
   task, and only for those under a day old. It holds no dispatch.
 - Folded follow-ups (model-free): a done task's follow-up that names the same branch, files or task
-  lineage as an open task of its kind is appended to that task's spec (and sent to its running run as a
-  mid-run update) instead of becoming a new task; upstream notes, deferred, `continue:`, `mechanical:`
-  and post-landing follow-ups never fold. `chains.fold_followups` false turns it off. With
+  lineage as a queued task of its kind is appended to that task's spec instead of becoming a new task.
+  Only queued tasks that can start now and match its urgency take one (an urgent or owed task's next
+  steps fold only into urgent or same-obligation work, else they are queued at once; routine ones never
+  into urgent work); upstream notes, deferred, `continue:`, `mechanical:` and post-landing follow-ups
+  never fold. `chains.fold_followups` false turns it off. With
   `tasks.daily_target` set (default 0, off), `ttp throughput` and the coordinator's state show tasks
   created in the last 24 h against that target.
 - Ready, not started (model-free): a queued task with no unmet dependency, deferral, pause or
