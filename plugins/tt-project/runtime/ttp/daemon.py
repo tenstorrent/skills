@@ -8388,21 +8388,23 @@ class Daemon:
         if split:
             text += (f"\nSplit at head {split[:12]}: no review of it; its continue hop builds on this branch, and "
                      f"the chain's last hop gets the one review.")
-        # A change over chains.split_lines goes back to its worker once with a split order, before any review.
+        # An urgent or owed one's (an open obligation's owner) review is queued at once on a needs_review hand-off
+        # too (no sweep_after_s wait); any other needs_review hand-off goes to the coordinator, unreviewed.
+        reviewable = new == "done" or new == "review" and (urgent.is_urgent(task)
+                                                          or bool(obligations.owned_open(db, task["id"])))
+        # A change over chains.split_lines goes back to its worker once with a split order, before the review
+        # it would get: only a hand-off that review would follow, so a needs_review request is never swallowed.
         resplit = self._split_back(task, result, int(task["attempts"] or 0)) \
-            if new in ("done", "review") and not split and not requeued and self._code_change(task) else ""
+            if reviewable and not split and not requeued and self._code_change(task) else ""
         if resplit:
             text += f"\n{resplit}"
-        # An urgent or owed one's (an open obligation's owner) review is queued at once on a needs_review hand-off
-        # too (no sweep_after_s wait).
         # Accepted gap: _auto_review (and _fix_without_commits below) still run a few local ref-metadata git
         # reads inside this transaction (rev-parse, the diff base, rev-list --count), each milliseconds; they
         # are not warmed by gitmemo. All git in this transaction ends within gitmemo.TX_GIT_S (_finish_tx).
         # One predicate, _code_change, gates the split above, this review, the fix check below and the
         # `changes` line: a code task, or a work task whose branch changes anything.
         review = self._auto_review(dict(task, **upd), summary) \
-            if (new == "done" or new == "review" and (urgent.is_urgent(task) or obligations.owned_open(db, task["id"]))) \
-            and not split and not requeued and not resplit and self._code_change(task) else None
+            if reviewable and not split and not requeued and not resplit and self._code_change(task) else None
         # A fix of a failed review that adds no commit to the head that review saw leaves its re-review
         # nothing new to check: the re-review is blocked, never run on the same head, and the coordinator
         # decides.

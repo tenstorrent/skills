@@ -29,7 +29,8 @@ ORDER = ("## Update\nSplit order, from the daemon after your last hand-off: your
          "`landed:#{tid}` and whose spec names branch {branch}-full at {short} as the source of what is left "
          "(further parts the same way, each stacked on the last). If it truly cannot be split, leave the branch "
          "as it is and hand off with `\"" + FIELD + "\": \"<why>\"` in result.json: its review is then queued. "
-         "This order comes once: your next hand-off is reviewed whatever its size.")
+         "This order comes once: your next hand-off is reviewed whatever its size. The follow-ups and upstream "
+         "notes of your last hand-off are already filed: do not list them again.")
 
 
 def returned(task: dict | None) -> bool:

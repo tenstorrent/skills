@@ -96,3 +96,23 @@ def test_split_gate_decisions_and_bypasses(env):
     assert splitgate.check(cfg, dict(code, labels="not json"), big)[0] == "return"
     assert splitgate.check(cfg, dict(code, spec="urgent: prod down"), big)[0].startswith("urgent")
     assert splitgate.check({"chains": {"split_lines": "junk"}}, code, big) is None
+
+
+def test_a_needs_review_hand_off_is_returned_for_a_split_only_when_a_review_would_follow(env):
+    """A needs_review hand-off of a big change that gets no auto review (not urgent, owes nothing) reaches the
+    coordinator as it is: status review, no split order, its request kept. An owed one (an open obligation's
+    owner) gets a review at once, so it goes back for a split first."""
+    from ttp import obligations, splitgate
+    p = make(env)
+    ask = {"status": "needs_review", "summary": "pick the schema", "question": "which schema?"}
+    tid, _, done, reviews = _finish_code(env, p, "asks", {"big.py": 300}, result=ask)
+    t = p.db.task(tid)
+    assert t["status"] == "review" and not reviews and not splitgate.returned(t)
+    assert splitgate.LABEL not in (t["labels"] or "") and "Split order" not in t["spec"]
+    assert done is None or "Returned once" not in done["text"]
+    assert not p.db.one("SELECT 1 FROM events WHERE kind=? AND task=?", (splitgate.EVENT, tid))
+    tid, _, _, reviews = _finish_code(env, p, "owed", {"big.py": 300}, result=ask,
+                                      before=lambda tid, head: obligations.add(p, "a promised fix", owners=[tid]))
+    t = p.db.task(tid)
+    assert t["status"] == "queued" and splitgate.returned(t) and not reviews
+    assert "do not list them again" in t["spec"]
