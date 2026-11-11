@@ -121,6 +121,45 @@ def test_a_gh_logout_raises_one_alert_per_host_that_names_the_users_step_and_cle
     assert p.db.one("SELECT severity FROM messages WHERE text LIKE 'Cleared: gh works again%'")["severity"] == "low"
 
 
+def test_only_commands_that_run_count_as_gh_use_never_prose_in_a_spec_or_hand_off(env):
+    """uses_gh counts gh only in what runs (schedule commands and heal steps, start_when, a waiting hand-off's
+    probes), never in words: a hand-off saying 'when gh fails', an llm schedule's spec or a summary
+    mentioning `gh api` raise no host gh check, so no host alert where gh is logged out on purpose."""
+    from ttp import ghauth
+    p = make(env)
+    now = time.time()
+    prose = "Retried; when gh fails the pr-watch skips. Next: gh api reads go through the route."
+    tid = p.db.add_task("prose", "Check when gh fails and run gh api only on the route.", kind="code",
+                        origin="coordinator")
+    p.db.x("UPDATE tasks SET result=? WHERE id=?",
+           (json.dumps({"status": "waiting", "summary": prose, "waiting_for": "gh fails here",
+                        "retry_when": "ttp landed --task 1", "on_pass": {"summary": prose}}), tid))
+    done = p.db.add_task("old", "s", kind="code", origin="coordinator")
+    p.db.x("UPDATE tasks SET result=? WHERE id=?", (json.dumps({"status": "done", "retry_when": "gh pr view 3"}), done))
+    p.db.x("INSERT INTO schedules(name,kind,every_s,enabled,payload) VALUES('rev','llm',3600,1,?)",
+           (json.dumps({"spec": "Read the PRs with gh pr list and report when gh fails."}),))
+    assert not ghauth.uses_gh(p.db), "prose counted as gh use"
+    for cmd in ({"command": "gh api repos/acme/widgets/pulls --jq length"},
+                {"precheck": "test -e x || gh auth status"},
+                {"heal": {"check": "gh api rate_limit >/dev/null", "fix": "true"}}):
+        p.db.x("DELETE FROM schedules WHERE name='cmd'")
+        p.db.x("INSERT INTO schedules(name,kind,every_s,enabled,payload) VALUES('cmd','command',600,1,?)",
+               (json.dumps(cmd),))
+        assert ghauth.uses_gh(p.db), cmd
+    p.db.x("UPDATE schedules SET enabled=0 WHERE name='cmd'")
+    assert not ghauth.uses_gh(p.db), "a disabled schedule counted"
+    for res in ({"status": "waiting", "retry_when": "ttp ci --branch main"},
+                {"status": "waiting", "retry_when": "true", "then": [{"retry_when": "gh pr checks 3"}]}):
+        p.db.x("UPDATE tasks SET result=? WHERE id=?", (json.dumps(res), tid))
+        assert ghauth.uses_gh(p.db), res
+    p.db.x("UPDATE tasks SET result=NULL, labels=? WHERE id=?",
+           (json.dumps(["start_why:once gh fails less", f"deferred_since:{now}"]), tid))
+    assert not ghauth.uses_gh(p.db), "a start_why counted"
+    p.db.x("UPDATE tasks SET labels=? WHERE id=?",
+           (json.dumps(["start_when:gh pr view 3 --json state | grep -q MERGED", f"deferred_since:{now}"]), tid))
+    assert ghauth.uses_gh(p.db), "a start_when calling gh"
+
+
 def test_pr_watch_says_error_not_ok_when_gh_is_logged_out(env, monkeypatch):
     """The incident: pr-watch counted gh calls that failed for the login as read and said ok."""
     from ttp import ghauth, watchers
