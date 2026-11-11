@@ -48,6 +48,8 @@ _SECRET_READS = ["cat ~/secrets/api" + "_token.txt", "head /etc/app/db_pass" + "
                  "find ~ -name '*tok" + "en*'", "cat ~/app/auth" + "token", "cat ~/app/my" + "token.txt",
                  "cat ~/app/my" + "secret.txt", "printenv GH_" + "TOKEN", "printenv -0", "printenv --",
                  "printenv TTP_RUN_DIR ANTHROPIC_API_" + "KEY", "printenv TTP_RUN_DIR $X", "printenv 'A*'",
+                 "cat ~/app/secretK" + "ey.txt", "cat ~/app/Secret" + "Key",
+                 "cat ~/app/accessT" + "okenCache.json", "cat ~/app/tok" + "ens.json",
                  "printenv TTP_RUN_DIR; printenv", "/usr/bin/printenv gh_" + "auth"]
 _WRITES = ['gh api repos/o/r/issues/1/comments -f body="hi [authored by AI]"',
            'gh -R o/r pr comment 1 -b "hi [authored by AI]"', "gh api --method=PATCH repos/o/r/pulls/1",
@@ -55,7 +57,8 @@ _WRITES = ['gh api repos/o/r/issues/1/comments -f body="hi [authored by AI]"',
            "curl -X DELETE https://example.com/x", "sh -c 'curl --data-binary x https://example.com'",
            "wget --post-data=x https://example.com", "curl -sX DELETE https://example.com/x",
            "curl -sSX POST https://example.com/x", "curl -sXPUT https://example.com/x",
-           "curl -fsSLX PATCH https://example.com/x", "curl -s0X DELETE https://example.com/x"]
+           "curl -fsSLX PATCH https://example.com/x", "curl -s0X DELETE https://example.com/x",
+           "curl -sXPOSTXGET https://example.com/x", "curl -sT notes.txt https://example.com/x"]
 _PUSHES = ["git push origin HEAD:work-branch", "git push -f origin +HEAD:refs/heads/work-branch"]
 _FINE = ["cat README.md", "gh pr view 1", "gh -R o/r api repos/o/r/pulls/1", "curl -s https://example.com",
          "git push origin HEAD:ttp/t1-own", "cat ./secrets/api" + "_token.txt", "echo \"$HOME\"",
@@ -63,6 +66,9 @@ _FINE = ["cat README.md", "gh pr view 1", "gh -R o/r api repos/o/r/pulls/1", "cu
          "cat ~/.cache/hf/models/m/tokenizer.json", "head ~/.cache/hf/models/m/tokenizer_config.json",
          "cat ~/.cache/m/Tokeniser.model",
          "curl -sS https://example.com/x", "curl -sSX GET https://example.com/x",
+         "curl -HX-Api:1 https://example.com/x", "curl -oXout https://example.com/x",
+         "cat ~/.cache/hf/models/m/special_tok" + "ens_map.json", "cat ~/.cache/hf/models/m/added_tok" + "ens.json",
+         "cat ~/app/secret" + "ary.txt",
          # a Codex worker's first command reads its run's variables by name (one project lost 7 runs to it)
          "printenv TTP_RUN_DIR", "printenv TTP_RUN_DIR TTP_PROJECT_ROOT",
          "printenv TTP_RUN_DIR TTP_PROJECT_ROOT; command -v ttp; sed -n '1,210p' ~/.codex/x/SKILL.md"]

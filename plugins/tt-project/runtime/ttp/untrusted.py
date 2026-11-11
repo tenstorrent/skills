@@ -59,10 +59,11 @@ CRED_DIRS = (".ssh", ".aws", ".azure", ".gnupg", ".docker", ".kube", ".password-
 CRED_FILES = {".netrc", "_netrc", ".git-credentials", ".npmrc", ".pypirc", ".pgpass", ".my.cnf", ".env",
               "auth.json", "hosts.yml", "hosts.yaml", "shadow", "environ"}
 CRED_SUFFIXES = (".pem", ".key", ".p12", ".pfx", ".jks", ".keystore", ".ppk", ".gpg", ".asc")
-# token and secret only as a whole word (api_token.txt, access-tokens.json, accessToken), so a model's
-# tokenizer.json is no credential
-CRED_NAME_RE = re.compile(r"token(?!i[sz])|secret|credential"   # anywhere in the name, but not a tokenizer
+# token and secret anywhere in a name (authtoken, mytoken.txt, accessTokenCache.json, SecretKey), but not
+# a tokenizer or a secretary; nor are the token lists beside a model's tokenizer.json (CRED_NAME_OK)
+CRED_NAME_RE = re.compile(r"token(?!i[sz])|secret(?!ar)|credential"
                           r"|passw(or)?d|api[_-]?key|^id_(?!.*\.pub$)|^\.env\.", re.I)
+CRED_NAME_OK = {"special_tokens_map.json", "added_tokens.json"}
 # ssh-family programs whose own option files are theirs to read (ssh_words); ssh options that take a value
 SSH_PROGS = {"ssh", "scp", "sftp", "autossh"}
 SSH_VALUE_FLAGS = set("BbcDEeFIiJLlmOoPpQRSWw")
@@ -219,7 +220,7 @@ def gh_write(args: list[str]) -> bool:
 
 def http_write(argv: list[str]) -> bool:
     """curl or wget `argv` sends a write: a non-GET method, a body, a form or an upload."""
-    from .aitag import CURL_DATA, WGET_DATA, _data_options
+    from .aitag import CURL_DATA, CURL_VALUE_SHORTS, WGET_DATA, _data_options
     prog = os.path.basename(argv[0]) if argv else ""
     if prog not in ("curl", "wget"):
         return False
@@ -230,10 +231,16 @@ def http_write(argv: list[str]) -> bool:
             method = nxt
         elif m := re.fullmatch(r"(?:-X|--request=|--method=)(\S+)", a):
             method = m.group(1)
-        elif prog == "curl" and (m := re.fullmatch(r"-[A-Za-z0-9#:]+X(\S*)", a)):   # a short-flag cluster: -sX DELETE
-            method = m.group(1) or nxt
-        elif prog == "curl" and (a in ("-T", "--upload-file") or a.startswith(("--upload-file=", "-T"))):
+        elif prog == "curl" and (a == "--upload-file" or a.startswith("--upload-file=")):
             return True
+        elif prog == "curl" and len(a) > 1 and a[0] == "-" and a[1] != "-":
+            for j, c in enumerate(a[1:], 1):   # a short-flag cluster (-sX DELETE): the first value option takes the rest
+                if c == "X":
+                    method = a[j + 1:] or nxt
+                elif c == "T":
+                    return True
+                if c in CURL_VALUE_SHORTS or f"-{c}" in CURL_DATA:
+                    break
     if method and method.upper() not in ("GET", "HEAD", "OPTIONS"):
         return True
     return bool(_data_options(argv, CURL_DATA if prog == "curl" else WGET_DATA))
@@ -273,7 +280,8 @@ def cred_path(word: str, cwd: str) -> bool:
 def cred_name(name: str) -> bool:
     """A file name (or a find -name pattern, its wildcards dropped) a credential file has."""
     name = name.strip("*?")
-    return name in CRED_FILES or name.endswith(CRED_SUFFIXES) or bool(CRED_NAME_RE.search(name))
+    return name not in CRED_NAME_OK and (name in CRED_FILES or name.endswith(CRED_SUFFIXES)
+                                         or bool(CRED_NAME_RE.search(name)))
 
 
 def _outside(path: str, cwd: str) -> bool:
