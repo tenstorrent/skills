@@ -17,7 +17,9 @@ commit message, an added line or a tag message, is refused (outscan.py). A fault
 refuses the push; a fault reading the push branch guard's project skips only that guard.
 In a run whose task reads untrusted input (untrusted.active) the same hook refuses every ref but the
 task's own branch and the push branch (untrusted.push_refs, passed as TTP_PUSH_ONLY_REFS); a fault
-reading them there refuses the push.
+reading them there refuses the push. One more push passes that hook there: one to a local repository
+under the run's own temp folders (temp_remote), such as a bare repo a test made for itself; never a
+network remote, a path elsewhere or the project's own repository.
 
 The wrapper also hands over a call whose subcommand is no common builtin (bin/git lists them): an
 alias is expanded the way git does (resolve), so `git -c alias.p=push p` is guarded as `git push`.
@@ -58,7 +60,10 @@ if [ -n "$TTP_PUSH_GUARD_REF" ] &&
     exit 1
 fi
 if [ -n "$TTP_PUSH_ONLY_REFS" ] &&
-    printf '%s' "$input${input:+$nl}" | awk -v r=" $TTP_PUSH_ONLY_REFS " 'NF >= 3 && index(r, " " $3 " ") == 0 { f = 1 } END { exit !f }'; then
+    printf '%s' "$input${input:+$nl}" | awk -v r=" $TTP_PUSH_ONLY_REFS " 'NF >= 3 && index(r, " " $3 " ") == 0 { f = 1 } END { exit !f }' &&
+    ! { [ -n "$TTP_PUSH_ONLY_RT" ] && "$TTP_PUSH_SCAN_PY" -I -c \\
+        'import sys; sys.path.insert(0, sys.argv[1]); from ttp.gitguard import temp_remote; sys.exit(not temp_remote(sys.argv[2]))' \\
+        "$TTP_PUSH_ONLY_RT" "$2" 2>/dev/null; }; then
     echo "tt-project: $TTP_PUSH_ONLY_WHY" >&2
     exit 1
 fi
@@ -224,6 +229,79 @@ def _branch_name(real: str, globals_: list[str], ref: str) -> str:
     return name.removeprefix("refs/heads/")
 
 
+def _under(path: str, root: str) -> bool:
+    return path == root or path.startswith(root.rstrip("/") + "/")
+
+
+def _common_dir(git: str, git_dir: str = "", cwd: str = "") -> str:
+    """The realpath of a repository's common git dir: of `git_dir` (as git opens a push's local path:
+    no search upward), else of the repository at `cwd` (the hook's GIT_DIR left out), else of the
+    pushing repository; "" if none."""
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")} if git_dir or cwd else None
+    args = [git, *(["--git-dir", git_dir] if git_dir else []), "rev-parse", "--path-format=absolute",
+            "--git-common-dir"]
+    try:
+        out = subprocess.run(args, capture_output=True, text=True, timeout=30, env=env, cwd=cwd or None)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    path = out.stdout.strip()
+    return os.path.realpath(path) if out.returncode == 0 and os.path.isabs(path) else ""
+
+
+def _temp_roots(env: dict) -> list[str]:
+    """The run's own temp folders: the run folder, and the temp folder mktemp uses ($TMPDIR, else /tmp)
+    unless it holds the home folder or the project, or lies in the home folder outside the run folder."""
+    import pwd
+    run = os.path.realpath(env["TTP_RUN_DIR"]) if env.get("TTP_RUN_DIR") else ""
+    run = run if run and os.path.isdir(run) and Path(run).parent.name == "runs" else ""
+    tmp = os.path.realpath(env.get("TMPDIR") or "/tmp")
+    home = os.path.realpath(pwd.getpwuid(os.getuid()).pw_dir)
+    keep = [os.path.realpath(d) for d in (home, env.get("TTP_PROJECT") or "") if d]
+    bad = tmp == "/" or any(_under(d, tmp) for d in keep) or (_under(tmp, home) and not (run and _under(tmp, run)))
+    return [r for r in (run, "" if bad else tmp) if r]
+
+
+def temp_remote(url: str, env: dict | None = None, git: str = "") -> bool:
+    """A push to `url` (the pre-push hook's location, after insteadOf rewrites, from the pushing repo's
+    top) goes to a local repository under the run's own temp folders (_temp_roots), after symlinks
+    and `..`: a plain path or a file:// URL, never a network remote (ssh, https, git://, scp-style
+    host:path, a `<transport>::` helper), a path elsewhere, or the project's or the pushing repo's own
+    repository (also a worktree's git dir, which opens the same common dir). Read by the hook only in a
+    run whose push passes TTP_PUSH_ONLY_RT (command: no receive-pack override)."""
+    env = os.environ if env is None else env
+    git = git or env.get("TTP_PUSH_GUARD_GIT") or "git"
+    if not url or "::" in url:
+        return False
+    if "://" in url:
+        if not url.startswith("file://") or not url[7:].startswith("/"):
+            return False
+        url = url[7:]
+    elif ":" in url.split("/", 1)[0]:   # scp-style host:path (git reads a colon before any slash so)
+        return False
+    roots = _temp_roots(env)
+    if not roots:
+        return False
+    path = os.path.abspath(url)
+    target = next((c for c in (_common_dir(git, d) for d in (path, path + ".git", os.path.join(path, ".git"))
+                               if os.path.exists(d)) if c), "")
+    if not target or not any(_under(target, r) for r in roots):
+        return False
+    deny = [_common_dir(git)]
+    if env.get("TTP_PROJECT") and os.path.isdir(env["TTP_PROJECT"]):
+        deny += [_common_dir(git, cwd=env["TTP_PROJECT"])]
+    return not any(d and (_under(target, d) or _under(d, target)) for d in deny)
+
+
+def _receive_pack_override(real: str, globals_: list[str], rest: list[str]) -> bool:
+    """The push names its own receive-pack command (an option or a remote's config): a local-looking
+    remote then runs any command, so the temp-folder allowance (temp_remote) does not apply."""
+    if any(a in ("--receive-pack", "--exec") or a.startswith(("--receive-pack=", "--exec=")) for a in rest):
+        return True
+    out = subprocess.run([real, *globals_, "config", "--get-regexp", r"^remote\..*\.receivepack$"],
+                         capture_output=True, text=True, timeout=30)
+    return out.returncode != 1
+
+
 def _hooks_dir(real: str, globals_: list[str]) -> str:
     """The repository's own hooks directory (core.hooksPath or .git/hooks), absolute; "" if unknown."""
     out = subprocess.run([real, *globals_, "rev-parse", "--path-format=absolute", "--git-path", "hooks"],
@@ -274,9 +352,14 @@ def command(real: str, args: list[str], env: dict) -> tuple[list[str], dict]:
                              "nothing was sent") from None
         return [real, *args], env
     rest = [a for a in rest if a not in ("--no-verify", "--verify")]
+    try:
+        tmp_off = bool(only) and _receive_pack_override(real, globals_, rest)
+    except Exception:   # the temp-folder allowance fails closed
+        tmp_off = True
     env = {**env, "TTP_PUSH_GUARD_REF": f"refs/heads/{branch}" if branch else "", "TTP_PUSH_GUARD_WHY": why,
            "TTP_PUSH_GUARD_HOOKS": hooks, "TTP_PUSH_SCAN_RT": str(Path(__file__).resolve().parents[1]) if scan else "",
-           "TTP_PUSH_SCAN_PY": sys.executable, "TTP_PUSH_ONLY_REFS": " ".join(only),
+           "TTP_PUSH_SCAN_PY": sys.executable, "TTP_PUSH_ONLY_REFS": " ".join(only), "TTP_PUSH_GUARD_GIT": real,
+           "TTP_PUSH_ONLY_RT": str(Path(__file__).resolve().parents[1]) if only and not tmp_off else "",
            "TTP_PUSH_ONLY_WHY": untrusted.WHY(label=untrusted.LABEL, what=f"pushes only {' or '.join(only)}")
            + "Commit and hand off; the review lands the change" if only else ""}
     # after the caller's own options: the last core.hooksPath wins, so theirs never replaces the guard

@@ -133,7 +133,8 @@ def test_an_untrusted_input_runs_git_and_gh_wrappers_push_only_its_branches_and_
     wrapper = RUNTIME.parent / "template" / "bin" / "git"
 
     def push(*args):
-        run_env = {**os.environ, "TTP_PYTHON": sys.executable, "TTP_RUN_DIR": str(tmp_path / "run")}
+        run_env = {**os.environ, "TTP_PYTHON": sys.executable, "TTP_RUN_DIR": str(tmp_path / "run"),
+                   "TMPDIR": str(tmp_path / "run")}   # the origin lies outside the run's temp folders
         return subprocess.run([str(wrapper), "push", *args], cwd=repo, env=run_env, capture_output=True,
                               text=True, timeout=60)
     for args in (("origin", "HEAD:refs/heads/other"), ("origin", "v1"), ("origin", "HEAD:ttp/t1-own", "HEAD:x")):
@@ -160,6 +161,92 @@ def test_an_untrusted_input_runs_git_and_gh_wrappers_push_only_its_branches_and_
     assert out.returncode == 0, out.stderr
     assert gh("-R", "o/r", "pr", "comment", "1", "-b", "hi [authored by AI]").returncode == 0
     assert "comment" in (tmp_path / "gh.log").read_text()
+
+
+
+def test_an_untrusted_input_run_pushes_to_a_temp_bare_repo_of_its_own_and_nowhere_else(env, tmp_path, monkeypatch):
+    """A repo test in an untrusted_input run may push any ref to a local repo under the run's temp folders
+    ($TMPDIR, the run folder): a plain path or a file:// URL (cells tmp_bare_ok). Every network remote,
+    a path elsewhere (also through a symlink or `..`), the pushing repo itself, the project's repository
+    or a worktree of it, an insteadOf rewrite to a network URL and a receive-pack override stay refused
+    (network_refused, outside_path_refused, own_repo_refused, symlink_refused, insteadof_refused)."""
+    from ttp import gitguard
+    p, tid = _untrusted_run(env, tmp_path, monkeypatch, ["untrusted_input"])
+    tmp, run = tmp_path / "tmp", tmp_path / "state" / "runs" / "9"
+    tmp.mkdir()
+    run.mkdir(parents=True)
+    real = shutil.which("git")
+
+    def repo_at(path, bare=False):
+        subprocess.run(["git", "init", "-q", *(["--bare"] if bare else []), "-b", "main", str(path)], check=True)
+        return path
+    origin, outside, repo = repo_at(tmp / "origin.git", True), repo_at(tmp_path / "outside.git", True), tmp / "repo"
+    in_run = repo_at(run / "o.git", True)
+    repo_at(repo)
+    for k, v in (("user.name", "Test"), ("user.email", "test@example.com"), ("commit.gpgsign", "false")):
+        _git_out(repo, "config", k, v)
+    _commit(repo, "README.md", "hello\n")
+    wrapper = RUNTIME.parent / "template" / "bin" / "git"
+    base = {**os.environ, "TTP_PYTHON": sys.executable, "TTP_RUN_DIR": str(run), "TMPDIR": str(tmp)}
+
+    def push(url, *pre, ref="HEAD:refs/heads/dashboard", cwd=repo, **extra):
+        return subprocess.run([str(wrapper), *pre, "push", "-q", url, ref], cwd=cwd, env={**base, **extra},
+                              capture_output=True, text=True, timeout=60)
+
+    def refs(path):
+        return _git_out(path, "for-each-ref")
+    # tmp_bare_ok: a plain path, a file:// URL, a remote name, a repo in the run folder
+    assert push(str(origin)).returncode == 0
+    assert push(f"file://{origin}", ref="HEAD:refs/heads/b2").returncode == 0
+    _git_out(repo, "remote", "add", "origin", str(origin))
+    assert push("origin", ref="HEAD:refs/heads/b3").returncode == 0
+    assert push(str(in_run)).returncode == 0 and "dashboard" in refs(in_run)
+    assert all(f"refs/heads/{b}" in refs(origin) for b in ("dashboard", "b2", "b3"))
+    # outside_path_refused and symlink_refused: elsewhere, through a symlink, through `..`
+    (tmp / "link.git").symlink_to(outside)
+    for url in (str(outside), str(tmp / "link.git"), f"{tmp}/x/../../outside.git", f"file://{tmp}/link.git"):
+        out = push(url)
+        assert out.returncode != 0 and "untrusted_input" in out.stderr, (url, out.stderr)
+    assert refs(outside) == ""
+    assert Path(p.base).resolve().is_relative_to(tmp_path.resolve())
+    for bad_tmp in ("/", str(tmp_path)):   # a temp folder holding the whole disk or the project
+        assert push(str(outside), TMPDIR=bad_tmp).returncode != 0
+        assert not gitguard.temp_remote(str(origin), {**base, "TMPDIR": bad_tmp,
+                                                      "TTP_RUN_DIR": str(tmp_path / "run")}, real)
+    # own_repo_refused: the pushing repo itself, the project's repository and a worktree of it
+    out = push(str(repo), ref="HEAD:refs/heads/self")
+    assert out.returncode != 0 and "self" not in refs(repo)
+    proj, top = tmp / "project.git", Path(p.base).parent   # the project repo's git dir moved into the temp folder
+    subprocess.run(["git", "-C", str(top), "init", "-q", "--separate-git-dir", str(proj)], check=True)
+    _git_out(top, "worktree", "add", "-q", str(tmp / "wt1"), "-b", "w1")
+    for url in (str(proj), f"file://{proj}", str(tmp / "wt1"), str(proj / "worktrees" / "wt1")):
+        out = push(url, ref="HEAD:refs/heads/into-project")
+        assert out.returncode != 0 and "untrusted_input" in out.stderr, (url, out.stderr)
+    assert "into-project" not in refs(proj)
+    # network_refused: every network form (no connection made: the check reads the URL only)
+    for url in ("ssh://example.invalid/r.git", "https://example.invalid/r.git", "git://example.invalid/r.git",
+                "example.invalid:r.git", f"example.invalid:{origin}", f"ext::sh -c cat {origin}",
+                "file://example.invalid/r.git"):
+        assert not gitguard.temp_remote(url, base, real), url
+    # insteadof_refused: a remote rewritten to a network URL, run through a fake ssh that pushes locally
+    fake = tmp_path / "fakessh"
+    fake.write_text(f'#!/bin/sh\nfor a; do last=$a; done\nexec sh -c "{real} ${{last#git-}}"\n')
+    fake.chmod(0o755)
+    rewrite = ("-c", f"url.ssh://fake.invalid{tmp}/.pushInsteadOf={tmp}/")
+    out = push(str(origin), *rewrite, ref="HEAD:refs/heads/rewritten", GIT_SSH_COMMAND=str(fake))
+    assert out.returncode != 0 and "untrusted_input" in out.stderr, out.stderr
+    assert "rewritten" not in refs(origin)
+    # a receive-pack override makes a local path run any command: no allowance
+    out = push(str(origin), ref="HEAD:refs/heads/rp", **{"GIT_CONFIG_COUNT": "1",
+               "GIT_CONFIG_KEY_0": "remote.origin.receivepack", "GIT_CONFIG_VALUE_0": "git-receive-pack"})
+    assert out.returncode != 0 and "rp" not in refs(origin), out.stderr
+    out = subprocess.run([str(wrapper), "push", "-q", f"--receive-pack={real} receive-pack", str(origin),
+                          "HEAD:refs/heads/rp2"], cwd=repo, env=base, capture_output=True, text=True, timeout=60)
+    assert out.returncode != 0 and "rp2" not in refs(origin), out.stderr
+    # a run without the label is unchanged
+    _switch(p, monkeypatch, [])
+    out = push(str(outside), TTP_TASK=os.environ["TTP_TASK"])
+    assert out.returncode == 0 and "dashboard" in refs(outside), out.stderr
 
 
 # The label per source (set model-free, inherited, never routed), ported from #6702/#7231.
