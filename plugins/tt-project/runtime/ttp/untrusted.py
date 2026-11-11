@@ -23,8 +23,8 @@ set TTP_UNTRUSTED_INPUT=1 (a benchmark cell without a project). Then, model-free
   key, a process's environ file; named in a Bash command's words or a Read, Grep or Glob path, or
   looked for by a find from outside the worktree (`find ~ -name '*.pem'`).
   So are environment dumps (printenv, a bare env, export or set), which print tokens.
-Every task run, marked or not, is refused a Bash command naming the run's RUN_MARK file and an edit
-of that file (mark_refusal): removing it would lift these guards for the rest of the run and keep the
+Every task run, marked or not, is refused a Bash command that may change, move or delete the run's
+RUN_MARK file (its name only in quoted text or a read passes) and an edit of that file (mark_refusal): removing it would lift these guards for the rest of the run and keep the
 daemon from labelling the task. A glob (`rm $TTP_RUN_DIR/*`) still gets around it.
 Not covered: a path or command built at run time inside a script or inline code (except git and gh,
 whose wrappers run anyway), other HTTP clients (httpie, python requests), GET requests that carry
