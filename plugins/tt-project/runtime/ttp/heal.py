@@ -131,6 +131,14 @@ fix, no task; it ends the current unknown stretch, and the status reads "known (
 says so for itself: the next run without the line starts or keeps the ordinary unknown stretch, or is
 handled as healthy or unhealthy as above.
 
+Only the user can act: a check that exits non-zero and prints a line `ttp-heal: user-only <why>`
+(USER_ONLY_RE) proves no fix or worker can clear the failure (a credential only the user holds, a step
+on site). That run counts as unhealthy (exit 1) whatever its non-zero exit code: no grace, no fix, no
+self-fix task; one keyed high alert `heal:<name>` goes to the user at once, whatever `escalate` says,
+and stays open until a run is healthy again (or a run without the line hands the failure back to the
+ordinary path above). A known machine outage, a live `known_fault` or a pause on the check's own
+resource still keeps it quiet, and a `ttp-heal: recovery-off` or `ttp-heal: known` line wins over it.
+
 Backing off while healthy: `healthy_every` (an interval like the schedule's `every`, e.g. "1h", at least
 `every`) runs the check that often once it was healthy `healthy_runs` (HEALTHY_RUNS, 3) runs in a row. The
 first run that is anything else (unhealthy, unknown, a known state, an error or a fix that ran, and a run
@@ -215,6 +223,7 @@ UNTENANTED_HOLD_S = 14400       # heal.untenanted_hold_s default: an untenanted 
 HOLD_KEY = "heal-hold:"         # alert key of an untenanted hold's page
 HOLD_CLEAR_S = 3600             # an untenanted hold's stretch ends only once runs answer without it this long
 RECOVERY_OFF = "ttp-heal: recovery-off"   # a check output line: automatic recovery is switched off (module doc)
+USER_ONLY_RE = re.compile(r"ttp-heal: user-only +(\S.*)")   # a check output line: only the user can act (module doc)
 # An unknown check result that is only its route failing (module doc): ssh's own exit code, or its words.
 ROUTE_RC = 255
 ROUTE_RE = re.compile(r"connection (refused|timed out|reset)|operation timed out|no route to host|"
@@ -612,6 +621,18 @@ def known_run(rc: int, out: str) -> tuple[str, str] | None:
     return None
 
 
+def user_only(rc: int, out: str) -> str | None:
+    """The why of a run that exits non-zero with a USER_ONLY_RE line of its own (module doc), else None;
+    never for a run reporting automatic recovery off (RECOVERY_OFF) or a known, owned state (KNOWN_RE)."""
+    if rc == 0 or recovery_off(out) or known_run(rc, out):
+        return None
+    for line in (out or "").splitlines():
+        m = USER_ONLY_RE.fullmatch(line.strip())
+        if m:
+            return m.group(1).strip()
+    return None
+
+
 def classify(rc: int, out: str) -> str:
     """The word for a check result, as the daemon reads it: known (owner: why), healthy, unhealthy (not an
     outage when a finding), else unknown. `ttp heal test` prints it."""
@@ -620,6 +641,9 @@ def classify(rc: int, out: str) -> str:
         return f"known ({owned[0]}: {owned[1]})"
     if recovery_off(out):
         return "unhealthy, automatic recovery off"
+    only = user_only(rc, out)
+    if only:
+        return f"unhealthy, only the user can act ({only})"
     if finding(rc, out):
         return "unhealthy, not an outage"
     return {0: "healthy", 1: "unhealthy"}.get(rc, "unknown")
@@ -965,7 +989,7 @@ def _report_machine(host: Any, name: str, spec: dict, now: float) -> None:
 def _run(host: Any, name: str, spec: dict, now: float) -> tuple[str, float | None]:
     p, db = host.p, host.p.db
     st = state(db, name)
-    if escalate_to(host, spec) == "coordinator":
+    if escalate_to(host, spec) == "coordinator" and not st.get("user_only"):
         from . import alerts
         alerts.close_key(db, STATE_KEY + name, "escalation moved to coordinator", now)
         st.pop("alerted", None)
@@ -986,6 +1010,12 @@ def _run(host: Any, name: str, spec: dict, now: float) -> tuple[str, float | Non
         st["recovery_off"] = True
     else:
         st.pop("recovery_off", None)
+    only = user_only(rc, out)
+    if only:   # only the user can act: unhealthy whatever its non-zero exit code (module doc)
+        rc = 1
+        st["user_only"] = only[:300]
+    else:
+        st.pop("user_only", None)
     pauseends.health_result(p, name, rc, now, pauses)
     ping = getattr(host, "_progress", None)
     if callable(ping):
@@ -1139,6 +1169,8 @@ def _run(host: Any, name: str, spec: dict, now: float) -> tuple[str, float | Non
         # The pause is the owner's explicit word and nothing is fixed under it; it is the one exemption
         # (unlike owner lines, outages and known_fault), and the paused-quiet ask still reaches the coordinator.
         return _paused_outage(host, name, st, paused, now)
+    if only:
+        return _user_only(host, name, st, st["user_only"], now)
     if st.get("task") or st.get("escalated"):
         return _escalated(host, name, spec, st, now, cwd, env)
     if pending:
@@ -1546,6 +1578,21 @@ def _paused_quiet_s(host: Any) -> float:
         return PAUSED_QUIET_S
 
 
+def _user_only(host: Any, name: str, st: dict, why: str, now: float) -> tuple[str, float | None]:
+    """Unhealthy and only the user can act (module doc): no fix, no task; the keyed high alert at once.
+    host.alert keeps one episode per key (a repeat only updates it, with its one reminder)."""
+    new = not st.get("alerted")
+    st["alerted"] = True
+    _save(host.p.db, name, st)
+    last = (st.get("last_out") or "").strip()[-300:]
+    host.alert(STATE_KEY + name, f"Heal check {name} needs you: {why}. No fix or worker can clear it, so none "
+               f"ran. Last check: {last} "
+               + outagemsg.facts(float(st.get("since") or now), now, "you (only the user can act)", host.p,
+                                 next_step="act on it; the alert clears once the check passes"),
+               "high", **({"every_s": 0} if new else {}))
+    return "unhealthy (only the user can act: alerted)", None
+
+
 def _paused_outage(host: Any, name: str, st: dict, res: str, now: float) -> tuple[str, float | None]:
     """An outage check whose own resource is paused: no fix, no user alert (an earlier one clears) and
     nothing reported to the machine ledger. Under a pause it is not known by (_pause_names), the
@@ -1644,6 +1691,8 @@ def cleared_why(db: DB, name: str, now: float | None = None, hold: bool = False)
                 break
             except (OSError, ValueError):
                 continue
+    if not hold and st.get("user_only") and not _known_fault(spec, st, now):
+        return None   # only the user can act: their alert whatever `escalate` says (module doc)
     if escalation == "coordinator":
         return "escalation moved to coordinator"
     if hold:
@@ -1659,7 +1708,8 @@ def is_outage(db: DB, name: str) -> bool:
     row = db.one("SELECT payload FROM schedules WHERE name=? AND enabled=1", (name,))
     spec = of(json.loads(row["payload"] or "{}")) if row else None
     st = state(db, name)
-    return bool(spec and spec.get("outage") and not st.get("finding") and not st.get("route_only"))
+    return bool(spec and spec.get("outage") and not st.get("finding") and not st.get("route_only")
+                and not st.get("user_only"))
 
 
 def holds(db: DB, name: str, now: float | None = None) -> bool:

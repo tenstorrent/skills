@@ -773,6 +773,60 @@ def test_heal_check_marks_a_known_owned_state_with_one_output_line():
     assert heal.known_run(75, "it says ttp-heal: known recovery: x inline") is None, "only a line of its own counts"
 
 
+def test_heal_check_marks_a_user_only_failure_with_one_output_line():
+    from ttp import heal
+    assert heal.user_only(1, "probing\nttp-heal: user-only the login token expired\n") == "the login token expired"
+    assert heal.user_only(75, "  ttp-heal: user-only on-site power switch  ") == "on-site power switch"
+    assert heal.user_only(255, "ttp-heal: user-only x") == "x", "any non-zero exit"
+    assert heal.user_only(0, "ttp-heal: user-only x") is None, "a healthy run stays healthy"
+    assert heal.user_only(1, "ttp-heal: user-only") is None, "it needs a reason"
+    assert heal.user_only(1, "ttp-heal: user-onlyx") is None
+    assert heal.user_only(1, "it says ttp-heal: user-only x inline") is None, "only a line of its own counts"
+    assert heal.user_only(1, "ttp-heal: user-only x\nttp-heal: recovery-off") is None, "recovery off wins"
+    assert heal.user_only(1, "ttp-heal: user-only x\nttp-heal: known recovery: y") is None, "an owner line wins"
+    assert heal.classify(75, "ttp-heal: user-only token expired") == "unhealthy, only the user can act (token expired)"
+
+
+@pytest.mark.parametrize("escalate", ["user", "coordinator"])
+def test_heal_user_only_runs_no_fix_or_task_and_alerts_the_user_at_once_until_healthy(env, escalate):
+    from ttp import alerts, heal
+    p, d, up = _heal_setup(env, grace_s=3600, escalate=escalate, outage=True)
+    spec, now = _heal_spec(p), time.time()
+    only = dict(spec, check="echo probing; echo 'ttp-heal: user-only the login token expired'; exit 75")
+
+    def alert_rows():
+        return p.db.q("SELECT * FROM alerts WHERE key='heal:svc' ORDER BY id")
+
+    for t in (0, 60, 7200):   # within its grace and past it: the same, one alert
+        assert heal.run(d, "svc", only, now + t) == ("unhealthy (only the user can act: alerted)", None)
+    msgs, events = _heal_told(p)
+    assert [(m["kind"], m["severity"], m["ref"]) for m in msgs] == [("alert", "high", "heal:svc")] and events == []
+    assert "needs you: the login token expired" in msgs[0]["text"] and "probing" in msgs[0]["text"]
+    assert not up.exists() and not p.db.q("SELECT id FROM tasks WHERE origin='daemon'")   # no fix, no task
+    assert len(alert_rows()) == 1 and alert_rows()[0]["cleared"] is None
+    assert not heal.is_outage(p.db, "svc") and heal.state(p.db, "svc")["status"] == "unhealthy"
+    assert alerts.sweep(p.db, now + 7201) == [] and alert_rows()[0]["cleared"] is None   # kept while it fails
+    up.touch()
+    assert heal.run(d, "svc", spec, now + 7300) == ("ok (healthy)", None)
+    assert "user_only" not in heal.state(p.db, "svc")
+    assert [e["key"] for e in alerts.sweep(p.db, now + 7301)] == ["heal:svc"]
+    assert alert_rows()[-1]["cleared_why"] == "condition cleared"
+
+
+def test_heal_user_only_stays_quiet_under_a_known_fault_and_hands_back_without_the_line(env):
+    from ttp import heal
+    p, d, up = _heal_setup(env, grace_s=0)
+    spec, now = _heal_spec(p), time.time()
+    only = dict(spec, check="echo 'ttp-heal: user-only token expired'; exit 1")
+    quiet = dict(only, known_fault={"why": "the user is renewing it"})
+    for t in (0, 60):
+        assert heal.run(d, "svc", quiet, now + t)[0] == "unhealthy (known fault: kept quiet)"
+    assert _heal_told(p) == ([], []) and not up.exists()
+    # Without the line the ordinary path is back: its fix runs.
+    heal.run(d, "svc", dict(spec), now + 120)
+    assert up.exists() and "user_only" not in heal.state(p.db, "svc")
+
+
 def test_heal_known_owned_runs_never_tell_fix_or_queue_and_a_run_without_the_line_is_unknown_again(env):
     from ttp import heal
     p, d, up = _heal_setup(env, grace_s=300, unknown_cap_s=3600, escalate="coordinator")
