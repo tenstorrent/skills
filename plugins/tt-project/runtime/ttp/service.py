@@ -134,7 +134,38 @@ def _run(*argv: str) -> subprocess.CompletedProcess:
     return subprocess.run(hoststate.argv(argv), capture_output=True, text=True, timeout=60)
 
 
+# A run's shell (a worker, review or coordinator turn) acts for its own project only. Upgrading another
+# project from it still merges files; starting that project's daemon is left to its own service or host.
+NO_FOREIGN_START = ("a run of one project never starts, restarts or reinstalls another project's daemon or services; "
+                    "its own service, or `ttp start` or `ttp restart` run on the host outside a run, does that")
+
+
+class ForeignRun(RuntimeError):
+    """A start, restart or service install of a project asked from a run of another project."""
+
+
+def foreign_run(p: Project) -> str:
+    """The project folder of the run this process is in (TTP_RUN_ID and TTP_PROJECT set) when it is not
+    p's, else ''. Push batches, the daemon and cron carry no TTP_RUN_ID: they are never foreign."""
+    base = os.environ.get("TTP_PROJECT") or ""
+    if not os.environ.get("TTP_RUN_ID") or not base:
+        return ""
+    try:
+        return "" if Path(base).resolve() == Path(p.base).resolve() else base
+    except OSError:
+        return base
+
+
+def foreign_refusal(p: Project, what: str) -> str:
+    """Why `what` (start, restart, reinstall) of p's daemon is refused here, or '' when it is allowed."""
+    other = foreign_run(p)
+    return (f"refused to {what} {p.name}'s daemon from a run of another project ({other}): {NO_FOREIGN_START}"
+            if other else "")
+
+
 def install(p: Project) -> str:
+    if why := foreign_refusal(p, "install the services of"):
+        raise ForeignRun(why)
     if sys.platform == "darwin":
         return _installed_as(p, _install_launchd(p))
     if shutil.which("systemctl") and _run("systemctl", "--user", "is-system-running").returncode in (0, 1):
@@ -419,6 +450,8 @@ def _cron_lines(p: Project) -> list[str]:
 
 
 def _spawn(p: Project) -> None:
+    if why := foreign_refusal(p, "start"):
+        raise ForeignRun(why)
     subprocess.Popen(["sh", "-c", _cron_cmd(p)], start_new_session=True, stdout=subprocess.DEVNULL,
                      stderr=subprocess.DEVNULL, env=_spawn_env())
 
@@ -580,6 +613,8 @@ def refresh(p: Project) -> bool:
 def restart_service(p: Project) -> str:
     """Restart the daemon process. Running workers are not touched: the new daemon adopts them (they
     run in sessions of their own, and the agent's AbandonProcessGroup keeps them through a bootout)."""
+    if why := foreign_refusal(p, "restart"):
+        return why
     rewrote = refresh(p)
     label = launchd_label(p)
     if sys.platform == "darwin" and _agent(p).exists():
@@ -677,7 +712,8 @@ _UNREACHABLE_RE = re.compile(r"failed to connect to bus|failed to get d-bus conn
 
 class Restarted(str):
     """restart()'s report. `outcome`: running, busy (alive, still in its first tick), deferred (the
-    restart has not happened yet; the old daemon runs on), rolled_back, or failed."""
+    restart has not happened yet; the old daemon runs on), rolled_back, failed, refused (from another
+    project's run) or stopped (restart_running left a stopped daemon stopped)."""
     outcome = "running"
 
 
@@ -1011,6 +1047,26 @@ def _judge_start(p: Project, t0: float, old: set[int], stop_s: float, wait_s: fl
     return wait_for_start(p, t0, wait_s, tick_wait_s, waits_from=time.time(), until=until), stopped, left
 
 
+def daemon_stopped(p: Project) -> bool:
+    """No daemon of p runs: no live daemon process and no heartbeat that still ticks."""
+    _, main = _manager_view(p)
+    return not _running_daemons(p, main) and not old_daemon_beats(p, time.time())
+
+
+def restart_running(p: Project) -> Restarted:
+    """An upgrade's restart (`ttp upgrade`, and so a push's deploy): new files reach a running daemon only.
+    A stopped daemon stays stopped (outcome `stopped`): it runs the files on disk at its next start, which
+    is its owner's call. From a run of another project (NO_FOREIGN_START) a running daemon is asked to
+    restart itself (request_restart), never restarted from the run."""
+    if daemon_stopped(p):
+        return _said(f"{p.name}'s daemon is stopped, so it was not started: it runs the new files at its next start",
+                     "stopped")
+    if other := foreign_run(p):
+        return request_restart(p, f"new files for {p.name} from a run of another project ({other}); its daemon "
+                                  f"restarts itself on request ({NO_FOREIGN_START})")
+    return restart(p)
+
+
 def restart(p: Project, wait_s: float = 60, restart_fn=None, tick_wait_s: float | None = None,
             requested: bool = False) -> Restarted:
     """Restart the daemon and confirm it ticks. If it is broken (never started, exited, or its first
@@ -1023,12 +1079,15 @@ def restart(p: Project, wait_s: float = 60, restart_fn=None, tick_wait_s: float 
     (TIMED_OUT) is pending: it counts once a new daemon runs the runtime on disk within the window.
     The new daemon is judged only after the old one has exited (_judge_start), so an old daemon slow to
     stop (up to its service's stop timeout) never makes a new runtime look broken.
+    Refused (outcome `refused`, nothing touched) from a run of another project (NO_FOREIGN_START).
     The result's `outcome` says how it went."""
     from .daemon import start_marker
+    if why := foreign_refusal(p, "restart"):
+        return _said(why, "refused")
     restart_fn = restart_fn or restart_service
-    (p.state / RESTART_DEFERRED).unlink(missing_ok=True)   # this restart judges the daemon itself
     stop_s, main = _manager_view(p)
     old = _running_daemons(p, main)
+    (p.state / RESTART_DEFERRED).unlink(missing_ok=True)   # this restart judges the daemon itself
     t0 = time.time()
     msg = restart_fn(p)
     timed_out = msg.startswith(TIMED_OUT)

@@ -10639,6 +10639,8 @@ def cmd_drain(a) -> None:
 def cmd_service(a) -> None:
     p = need(a.name, sys.argv[1:])
     from . import service
+    if a.cmd in ("start", "restart") and (why := service.foreign_refusal(p, a.cmd)):
+        die(why, 2)
     if a.cmd == "start":
         print(service.install(p))
     elif a.cmd == "stop":
@@ -11924,7 +11926,7 @@ def _upgrade(p: Project, auto: bool = False, explicit: bool = False, took_over: 
     print("harness up to date with the installed template; restarting the daemon")
     from . import service
     upjournal.step(p, "restarting")
-    res = service.restart(p)
+    res = service.restart_running(p)    # a stopped daemon stays stopped: it starts on the new files
     if not auto:
         _exit_for_restart(res)
         return
@@ -11935,7 +11937,9 @@ def _upgrade(p: Project, auto: bool = False, explicit: bool = False, took_over: 
     release.finish(p, "applied", **({"kept_lost": _cut_list(kept)} if kept else {}))
     # A feed line, not an alert: a clean merge needs nobody (merged with no model task, checks passed).
     p.db.post("out", f"tt-project harness upgraded from {old_v} ({old_c}) to {new_v} ({new_c}) with no model task: "
-              f"the merge was clean, the runtime compiles and imports, and the daemon restarted keeping running work."
+              f"the merge was clean, the runtime compiles and imports, and "
+              + ("the daemon, stopped, runs it at its next start." if getattr(res, "outcome", "") == "stopped"
+                 else "the daemon restarted keeping running work.")
               + (f" Kept this project's runtime edits that drop names upstream ships: {_cut_list(kept)}." if kept
                  else ""), chat=None, kind="info", severity="low")
 
@@ -12515,7 +12519,7 @@ def _apply_upgrade(p: Project, commit: str) -> None:
     print(f"harness main is now {merged[:12]}; restarting the daemon")
     from . import service
     upjournal.step(p, "restarting")
-    _exit_for_restart(service.restart(p))
+    _exit_for_restart(service.restart_running(p))
 
 
 UPGRADE_BUSY = 75       # `ttp upgrade` deferred or refused: nothing was changed (EX_TEMPFAIL, as for `ttp lock`)
@@ -12528,7 +12532,7 @@ def _exit_for_restart(res) -> None:
     that is `ttp upgrade`'s "nothing was changed", and a worker that read it as "applied" would wait on a
     restart.request that never comes."""
     print(res)
-    code = {"deferred": RESTART_DEFERRED, "failed": 1, "rolled_back": 1}.get(getattr(res, "outcome", "running"), 0)
+    code = {"deferred": RESTART_DEFERRED, "failed": 1, "rolled_back": 1, "refused": 1}.get(getattr(res, "outcome", "running"), 0)
     if code:
         print(f"restart {res.outcome.replace('_', ' ')} (exit {code})", file=sys.stderr)
         sys.exit(code)

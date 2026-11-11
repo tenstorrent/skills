@@ -538,6 +538,10 @@ def env(tmp_path, monkeypatch, _git_session, _short_tmp):
     from ttp import machinecap   # the machine-wide worker limit: auto reads as a server (tests turn it on)
     monkeypatch.setattr(machinecap, "DARWIN", False)
     monkeypatch.setattr(machinecap, "has_battery", lambda root=None: False)
+    from ttp import service
+    running = lambda p: False   # an upgrade's restart (restart_running) finds a test project's daemon up; .real checks
+    running.real = service.daemon_stopped
+    monkeypatch.setattr(service, "daemon_stopped", running)
     monkeypatch.setattr(importlib.machinery.SourceFileLoader, "get_code",
                         _cached_get_code(importlib.machinery.SourceFileLoader.get_code))
     monkeypatch.setattr(gettext, "find", _cached_find(gettext.find))
