@@ -2450,3 +2450,23 @@ def test_a_step_stop_during_the_push_batch_spawn_waits_until_its_pid_is_on_the_m
     child = pushq._children.pop(bid)
     assert m["pid"] == child.pid
     assert child.wait(timeout=30) == 0, "its go was given"
+
+
+def test_a_first_probe_verdict_past_the_step_budget_is_named_by_the_slow_step_event(env, monkeypatch):
+    p = make(env)
+    from ttp import daemon as dmod
+    d = dmod.Daemon(p.base)
+    tid = _due_waiting_task(p, "exit 1")
+    d._run_step(d.probe_waiting)
+    for proc, _, _ in list(d._probes.values()):
+        proc.wait(_load_scaled(30))
+    monkeypatch.setattr(dmod, "STEP_BUDGET_S", 0.05)
+    real = d._note_probe_out
+
+    def slow(*a, **k):
+        time.sleep(0.2)   # the first verdict alone spends the step's budget
+        return real(*a, **k)
+    monkeypatch.setattr(d, "_note_probe_out", slow)
+    d._run_step(d.probe_waiting, "probe_waiting")
+    [ev] = p.db.q("SELECT * FROM events WHERE kind='tick_step_slow'")
+    assert ev["task"] == tid and f"task #{tid}'s probe result" in ev["text"], ev["text"]

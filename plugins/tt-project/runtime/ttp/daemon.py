@@ -14456,7 +14456,8 @@ class Daemon:
         first = True
         while self._probe_left:
             tid, proc, probe, rc, outs[id(proc)], lines[id(proc)], raws[id(proc)] = self._probe_left[0]
-            if not first and self._step_over(f"task #{tid}'s probe result", tid):
+            over = self._step_over(f"task #{tid}'s probe result", tid)   # names the item even when first
+            if over and not first:
                 break
             first = False
             del self._probe_left[0]   # before its verdict: a step stopped mid-verdict never repeats it
