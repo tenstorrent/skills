@@ -838,6 +838,7 @@ def sustained_load(now: float | None = None) -> float:
 
 POOL_DIRS_ENV = "TTP_CHECKS_POOL_DIRS"   # where pool runs' folders are looked for (os.pathsep-separated)
 POOL_MAX_AGE_S = 720 * 60.0   # an older ttp-check.* folder is a leftover, not a running check (checkspill's bound)
+POOL_FRESH_S = 300.0   # a folder this new counts with no process in it: its run's copy is under way (checkspill's)
 
 
 def host_tag() -> str:
@@ -864,9 +865,13 @@ def pool_runs(now: float | None = None) -> list[Path]:
     host or a check host sends them (remotecheck: a ttp-check.* folder of this account, fresh within
     POOL_MAX_AGE_S). Each takes one of this host's slots (_room), so another project's pool queues fairly
     with the checks started here under the same cap and load guard. A run whose `ttp checks` holds a slot
-    of this host already (its folder carries host_tag()) is counted once, by that slot."""
+    of this host already (its folder carries host_tag()) is counted once, by that slot. Where /proc reads,
+    a folder counts only while a process of this account works in it, or for POOL_FRESH_S after it was
+    last changed: a run that died with its link or its origin host (no EXIT trap ran) leaves a folder
+    nothing uses, which is no running check."""
     now = time.time() if now is None else now
     mine, uid, out = f"ttp-check.{host_tag()}", os.getuid(), []
+    cwds: list[str] | None = None
     for d in pool_dirs():
         try:
             found = list(d.glob("ttp-check.*"))
@@ -879,8 +884,47 @@ def pool_runs(now: float | None = None) -> list[Path]:
                 continue
             if (f.is_dir() and st.st_uid == uid and now - st.st_mtime < POOL_MAX_AGE_S
                     and not f.name.startswith(mine)):
+                if now - st.st_mtime >= POOL_FRESH_S:
+                    cwds = _proc_cwds() if cwds is None else cwds
+                    if cwds and not _used(f, cwds):
+                        continue
                 out.append(f)
     return out + shard_runs()
+
+
+def _proc_cwds() -> list[str]:
+    """The working folders of this account's processes (/proc/<pid>/cwd), or [] where /proc does not read
+    (then pool_runs keeps its age bound alone). This process's own is always among them."""
+    try:
+        pids = [x for x in os.listdir("/proc") if x.isdigit()]
+    except OSError:
+        return []
+    out = []
+    for x in pids:
+        try:
+            out.append(os.readlink(f"/proc/{x}/cwd"))
+        except OSError:
+            continue
+    return out
+
+
+def _used(folder: Path, cwds: list[str]) -> bool:
+    """A process works in `folder`, or its run script, whose pid it keeps (remotecheck.RUN_PID), lives."""
+    try:
+        r = str(folder.resolve())
+    except OSError:
+        return True
+    if any(c == r or c.startswith(r + "/") for c in cwds):
+        return True
+    from .remotecheck import RUN_PID
+    try:
+        pid = int((folder / RUN_PID).read_text()[:20].strip())
+        os.kill(pid, 0)
+    except PermissionError:
+        return True
+    except (OSError, ValueError):
+        return False
+    return pid > 0
 
 
 SHARD_ENV = "TTP_CHECKS_SHARD"   # set for a shard's command: a shard started in it runs on its slot

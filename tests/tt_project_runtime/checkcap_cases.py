@@ -9884,6 +9884,27 @@ def test_a_pool_run_on_the_host_takes_one_of_its_checks_slots_and_one_holding_a_
     s.close()
 
 
+def test_a_pool_run_whose_script_lives_counts_though_no_process_works_in_its_folder(env, monkeypatch, tmp_path):
+    """Past POOL_FRESH_S, a pool folder counts while a process works in it or while the run script whose
+    pid it keeps (remotecheck.RUN_PID) lives, also when that run's processes all work elsewhere."""
+    from ttp import checkcap, remotecheck
+    pool = Path(os.environ["TTP_CHECKS_POOL_DIRS"])
+    pool.mkdir(parents=True, exist_ok=True)
+    f = _pool_folder(pool, held=False)
+    (f / ".git").mkdir(exist_ok=True)
+    run = subprocess.Popen(["sleep", "60"], cwd=tmp_path)
+    try:
+        (f / remotecheck.RUN_PID).write_text(f"{run.pid}\n")
+        old = time.time() - checkcap.POOL_FRESH_S - 60
+        os.utime(f, (old, old))
+        assert checkcap.pool_runs() == [f]
+    finally:
+        run.kill()
+        run.wait()
+    if os.path.isdir("/proc/self"):
+        assert checkcap.pool_runs() == [], "its script gone and nothing working in it: no running check"
+
+
 def test_remote_check_folder_names_the_origin_only_when_its_run_holds_a_slot_there(env):
     """remotecheck's folder carries the origin's host tag only for a run that holds a slot there: pool_runs
     counts the untagged folder and not the tagged one."""

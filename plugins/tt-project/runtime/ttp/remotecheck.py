@@ -57,6 +57,7 @@ TIMING = re.compile(r"Timeout(Error|Expired)?\b|timed out|took too long|too slow
                     re.I)
 ENV_DIR = ".git/ttp-env"   # the pinned Python env's maker and lock in the run folder (runnerenv.remote_lines)
 SHIP_DIR = ".git/ttp-py"   # where shipped Python files go in the run folder: never in the tree the check sees
+RUN_PID = ".git/ttp-run.pid"   # the run script's pid in the run folder: checkspill never removes a live run's folder
 NO_ENV = "no-env"     # ... and when the pinned Python env cannot be made there (runnerenv.remote_lines): a host fault
 NO_WRAP = "no-wrap"   # the exit marker's form when the remote wrapper is missing there: a host fault
 WRAP_REFUSED = "wrap-refused"   # ... and when the wrapper refused the run (WRAP_REFUSED_ENV): a host fault
@@ -318,7 +319,8 @@ def _run_script(q: str, exports_: str, cmd: str, mark: str, wrap: tuple[str, ...
     (setsid, else perl's setpgrp), with stdin from /dev/null and Ctrl-C and quit at their default, and a watcher that stops that group (TERM,
     then KILL after STOP_GRACE_S) once ssh's stdin ends: without a tty, ssh signals nothing when the
     local side stops or dies, and the command would run on. Then the exit-code marker, and the
-    directory is removed, with what the command left in it (_END). With `wrap`, the command runs behind it, and a wrapper that is missing or not
+    directory is removed, with what the command left in it (_END), also when a hangup, interrupt or TERM ends the script.
+    The script's pid goes in RUN_PID first, so the spill probe never removes the folder of a run still going. With `wrap`, the command runs behind it, and a wrapper that is missing or not
     executable there prints the marker's NO_WRAP form instead of starting anything, and one that exits
     FAULT_RC after writing the file WRAP_REFUSED_ENV names prints its WRAP_REFUSED form. With `prio`, it all
     runs behind the host's `nice` and `ionice` (_priority). Behind a wrapper the pinned checks env
@@ -338,7 +340,14 @@ def _run_script(q: str, exports_: str, cmd: str, mark: str, wrap: tuple[str, ...
     from . import orphanchecks
     # Who owns the run: once that process is gone, orphanchecks stops what still runs here.
     owner = f"printf '%s\\n' {shlex.quote(orphanchecks.owner_line())} > {orphanchecks.OWNER_FILE}\n"
-    return (f"cd {q} || exit 97\n{owner}{_END.replace('@Q@', q)}{exports_}{has}"
+    # dash runs no EXIT trap when a signal ends the shell (its ssh session hung up, its host stopping it): each
+    # of these stops the command and exits, which runs the EXIT trap, so the folder is never left behind.
+    stop = ("[ -n \"$pid\" ] && { kill -TERM -$pid 2>/dev/null || kill -TERM $pid 2>/dev/null; }; "
+            "[ -n \"$watch\" ] && kill $watch 2>/dev/null; exit")
+    traps = "".join(f"trap '{stop} {128 + n}' {sig}\n" for sig, n in (("HUP", 1), ("INT", 2), ("TERM", 15)))
+    return (f"cd {q} || exit 97\npid=; watch=\n{owner}{_END.replace('@Q@', q)}{traps}"
+            f"{{ echo $$ > {RUN_PID}; }} 2>/dev/null\n"
+            f"{exports_}{has}"
             f"if command -v bash >/dev/null 2>&1; then set -- {run}; else set -- {w} sh -e -c {shlex.quote(cmd)}; fi\n"
             f"{_priority(prio)}"
             # A background job's stdin is /dev/null unless redirected: the watcher reads ssh's from fd 3.

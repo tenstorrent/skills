@@ -517,6 +517,7 @@ def env(tmp_path, monkeypatch, _git_session, _short_tmp):
                 "TTP_BUILD_SLOTS_HELD", "TTP_BUILD_POOL", "TTP_BUILD_RUN_MAX", "TTP_BUILD_PROJECT_MAX", "MAKEFLAGS",
                 "TTP_NO_USER_POST",   # a light-tier or chat-routed run's mark (workernotify.ENV)
                 "TTP_ROLE", "TTP_COORD_FULL_TOOLS",   # the run's role: a coordinator's makes the git wrapper refuse every push
+                "TTP_CHECKS_NO_SPILL", "TTP_SPILL_HOST", "TTP_SPILL_MACHINE",   # the outer checks run's spill state (checkspill.OFF_ENV)
                 "CMAKE_BUILD_PARALLEL_LEVEL"):
         monkeypatch.delenv(var, raising=False)
     # What a re-executing `ttp checks` hands its next process (cli._checks_reexec, a rerun) is set straight in

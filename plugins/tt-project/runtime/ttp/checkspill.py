@@ -59,11 +59,13 @@ Runs already on the host go on. The skip shows in one line in `ttp status` and t
 while it is fresh (SKIP_SHOW_S). Its slots follow what it has idle now (checklane.host_slots): the runs
 its idle cores (cores less the 1-minute load average) and available memory fit, at most the runs its
 cores hold less the remote checks running there from any machine (their ttp-check.* folders a live process
-works in, or just made: _RUNNING_COUNT; a cut run's leftover folder counts for none and is removed), not a
+works in, whose run script lives, or just made: _PROBE; a cut run's leftover counts for none and is removed), not a
 small fixed count; a host whose load does not read gets checklane.default_slots less those. This machine also holds one claim file
 per slot it uses there (spill/<alias>.<n>.json in the checks slot folder), so its own runs never
 take more. A claim whose remote ttp-check.* folder is not made yet (the few seconds of its copy) is
 counted by neither, so the host can take one run more than its slots in that gap: a bound, not a guard.
+A run's folder that no process uses and whose run script is gone (its host or link died before it could
+clean up) does not count, and is removed once stale (_PROBE).
 
 Only a run whose every check may spill spills (check_spills): none with a host of its own (`host`,
 delivery.checks_host; `"host": "local"` too unless the check says `"spill": true`), none that says
@@ -148,33 +150,40 @@ _SHELLS = ("sh", "bash", "dash", "zsh")   # needs_cli reads their -c script too
 # Absolute paths every host has: a check naming only these may still spill (host_path).
 _SYSTEM_DIRS = ("/usr/", "/bin/", "/sbin/", "/lib/", "/lib64/", "/lib32/", "/etc/", "/dev/", "/proc/", "/sys/")
 RUNNING_MAX_AGE_MIN = 720   # a remote ttp-check.* folder older than this is a leftover, not a running check
-RUNNING_GRACE_MIN = 10   # where /proc reads: a folder no process works in counts as running this long (its copy)
-LEFTOVER_REAP_MIN = 60   # and is removed, a leftover of a cut run (a reboot here), once this old
-# The running checks on a host: its ttp-check.* folders a live process works in (cwd under it, read from /proc),
-# or made in the last RUNNING_GRACE_MIN; one with neither is a leftover, removed once LEFTOVER_REAP_MIN old. Without
-# /proc (macOS) every folder younger than RUNNING_MAX_AGE_MIN counts.
-_RUNNING_COUNT = (
-    "t=${TMPDIR:-/tmp}; t=${t%/}\n"
-    "if [ -r /proc/self/cwd ]; then\n"
-    "  r=$(cd \"$t\" 2>/dev/null && pwd -P); w=$(for q in /proc/[0-9]*; do readlink \"$q/cwd\" 2>/dev/null; done)\n"
-    "  n=0\n"
-    "  for d in \"$t\"/ttp-check.?*; do\n"
-    "    [ -d \"$d\" ] || continue\n"
-    "    x=\"$r/${d##*/}\"\n"
-    "    if printf '%s\\n' \"$w\" | grep -q -F -x -e \"$x\" -e \"$d\" || printf '%s\\n' \"$w\" | grep -q -F -e \"$x/\" -e \"$d/\"; then\n"
-    "      n=$((n+1))\n"
-    f"    elif [ -n \"$(find \"$d\" -maxdepth 0 -mmin -{RUNNING_GRACE_MIN} 2>/dev/null)\" ]; then n=$((n+1))\n"
-    f"    elif [ -n \"$(find \"$d\" -maxdepth 0 -mmin +{LEFTOVER_REAP_MIN} 2>/dev/null)\" ]; then rm -rf -- \"$d\"\n"
-    "    fi\n"
-    "  done\n"
-    "else\n"
-    "  n=$(find \"$t\" -maxdepth 1 -name 'ttp-check.*' -type d "
-    f"-mmin -{RUNNING_MAX_AGE_MIN} 2>/dev/null | wc -l)\n"
-    "fi\n")
+FRESH_MIN = 5   # a folder of the ssh user this new is counted even with no process in it: a run's copy is under way
+REAP_AFTER_MIN = 120   # a folder of the ssh user with no process in it, untouched this long, is removed
+# The host's slots line: cores, available memory (KiB), running checks and the 1-minute load. A running check
+# is a ttp-check.* folder of the temp folder some process of the ssh user works in (its /proc/<pid>/cwd,
+# read with GNU find: a run's shell sits in its folder until the run ends), or one of the ssh user's made
+# under FRESH_MIN ago, or one whose run script is still alive (its pid in remotecheck.RUN_PID; a run whose
+# processes all work outside its folder): those are never removed. One of the ssh user's with none of these
+# and older than REAP_AFTER_MIN is a run that died with its host or its link (no EXIT trap ran) and is
+# removed. Another user's folder, whose processes cannot be read, and every folder on a host without /proc
+# or GNU find, count while under RUNNING_MAX_AGE_MIN old.
 _PROBE = ("command -v git >/dev/null 2>&1 && command -v tar >/dev/null 2>&1 || exit 3\n"
           "c=$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)\n"
           "m=$(awk '/^MemAvailable:/{print $2}' /proc/meminfo 2>/dev/null)\n"
-          + _RUNNING_COUNT +
+          "t=${TMPDIR:-/tmp}; t=${t%/}; r=$(cd \"$t\" 2>/dev/null && pwd -P)\n"
+          "if [ -n \"$r\" ] && find /proc/self/cwd -maxdepth 0 -lname '/*' -printf '' >/dev/null 2>&1; then\n"
+          "  u=$(id -u); n=0\n"
+          "  live=\" $(find /proc/[0-9]*/cwd -maxdepth 0 -lname \"$r/ttp-check.*\" -printf '%l\\n' 2>/dev/null"
+          " | awk -v p=\"$r/ttp-check.\" 'index($0, p) == 1 {s = substr($0, length(p) + 1); sub(/\\/.*/, \"\", s);"
+          " print s}' | sort -u | tr '\\n' ' ')\"\n"
+          "  for d in \"$t\"/ttp-check.*; do\n"
+          "    [ -d \"$d\" ] || continue\n"
+          "    if [ -z \"$(find \"$d\" -maxdepth 0 -user \"$u\" 2>/dev/null)\" ]; then\n"
+          f"      [ -n \"$(find \"$d\" -maxdepth 0 -mmin -{RUNNING_MAX_AGE_MIN} 2>/dev/null)\" ] && n=$((n+1)); continue\n"
+          "    fi\n"
+          "    case \"$live\" in *\" ${d##*/ttp-check.} \"*) n=$((n+1)); continue;; esac\n"
+          f"    p=$(head -c 20 \"$d/{remotecheck.RUN_PID}\" 2>/dev/null | tr -cd 0-9)\n"
+          "    if [ -n \"$p\" ] && kill -0 \"$p\" 2>/dev/null; then n=$((n+1)); continue; fi\n"
+          f"    if [ -n \"$(find \"$d\" -maxdepth 0 -mmin -{FRESH_MIN} 2>/dev/null)\" ]; then n=$((n+1))\n"
+          f"    elif [ -n \"$(find \"$d\" -maxdepth 0 -mmin +{REAP_AFTER_MIN} 2>/dev/null)\" ]; then rm -rf \"$d\" 2>/dev/null; fi\n"
+          "  done\n"
+          "else\n"
+          "  n=$(find \"$t\" -maxdepth 1 -name 'ttp-check.*' -type d "
+          f"-mmin -{RUNNING_MAX_AGE_MIN} 2>/dev/null | wc -l | tr -d ' ')\n"
+          "fi\n"
           "l=$(cut -d' ' -f1 /proc/loadavg 2>/dev/null)\n"
           "echo \"ttp-spill $c ${m:-0} $n ${l:--}\"\n")
 DEVICE_NODES = "/dev/tenstorrent*"   # a host's Tenstorrent device nodes (a glob); a process holding one open is a tenant

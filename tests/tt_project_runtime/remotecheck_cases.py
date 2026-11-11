@@ -837,36 +837,6 @@ def test_a_run_that_fails_tests_on_a_spill_host_reruns_only_those_tests_here_and
         assert where[-1].endswith(f"ids={ids}"), where
 
 
-@pytest.mark.skipif(not os.path.isdir("/proc/self"), reason="the probe reads running checks from /proc")
-def test_the_spill_probe_counts_only_checks_a_live_process_runs_and_removes_a_cut_runs_leftover(tmp_path):
-    """A cut run (this machine rebooted) leaves its ttp-check.* folder on the spill host with no process in
-    it: the probe counts it for no running check, so the host still takes runs, and removes it once
-    LEFTOVER_REAP_MIN old. A folder a live process works in counts however old; one just made (its copy,
-    no process yet) counts for RUNNING_GRACE_MIN."""
-    import re
-    import subprocess
-    import time
-    from ttp import checkspill
-    t = tmp_path / "t"
-    ago = lambda d, m: os.utime(d, (time.time() - m * 60,) * 2)
-    live, fresh, old, mid = (t / f"ttp-check.{n}" for n in ("live", "fresh", "old", "mid"))
-    for d in (live / "work", fresh, old, mid):
-        d.mkdir(parents=True)
-    ago(live, 3 * checkspill.LEFTOVER_REAP_MIN)
-    ago(old, 2 * checkspill.LEFTOVER_REAP_MIN)
-    ago(mid, (checkspill.RUNNING_GRACE_MIN + checkspill.LEFTOVER_REAP_MIN) / 2)
-    runner = subprocess.Popen(["sleep", "60"], cwd=live / "work")
-    try:
-        r = subprocess.run(["sh", "-c", checkspill._PROBE], capture_output=True, text=True, timeout=30,
-                           env={**os.environ, "TMPDIR": f"{t}/"})
-    finally:
-        runner.kill()
-        runner.wait()
-    m = re.search(r"^ttp-spill \d+ \d+ (\d+)", r.stdout, re.M)
-    assert m and int(m.group(1)) == 2, r
-    assert live.is_dir() and fresh.is_dir() and mid.is_dir() and not old.exists()
-
-
 @_LINUX_TMP
 def test_a_rerun_after_a_spill_host_keeps_off_only_the_host_it_failed_on(env, tmp_path, monkeypatch):
     """#6379: checks that fail on one spill host run again on the next free one (a pass there counts),
@@ -2617,7 +2587,8 @@ def _spill_hosts_read(monkeypatch, loads: dict, cores=64, mem_gib=200):
         if loads[host] is None:
             return subprocess.CompletedProcess(cmd, 255, "", f"ssh: connect to host {host}: No route to host\n")
         return subprocess.CompletedProcess(
-            cmd, 0, f"ttp-spill {cores} {mem_gib * 1024 * 1024} 0 {loads[host]}\nttp-spill-dev-end none\n", "")
+            cmd, 0, f"ttp-spill {cores} {mem_gib * 1024 * 1024} {checkspill._ours(host)} {loads[host]}\n"
+            "ttp-spill-dev-end none\n", "")   # a claim's run has its folder there: it counts as running
     monkeypatch.setattr(checkspill.subprocess, "run", run)
     return seen
 
@@ -4956,3 +4927,111 @@ def test_spill_strikes_read_malformed_state_as_none(env, tmp_path, monkeypatch):
     for bad in ([1], {"hosts": [1]}, {"hosts": {"check-host-a": "x"}}, {"hosts": {"check-host-a": {"off": "x"}}}):
         p.db.set_kv(checkspill.STRIKES_KV, bad)
         assert checkspill.quarantined(p, "check-host-a") == "" and checkspill.lift(p, "check-host-a") is False
+
+
+
+@_GNU_FIND
+def test_spill_probe_counts_only_check_folders_a_process_uses_and_removes_stale_dead_ones(tmp_path):
+    """A host whose origin rebooted mid-run keeps that run's ttp-check.* folder (no EXIT trap ran): the slots
+    probe counts a folder some process of the ssh user works in, and one made just now (its copy is under
+    way), but not a dead one, and removes a dead one older than REAP_AFTER_MIN, so dead folders never fill
+    an idle host."""
+    from ttp import checkspill
+    t = tmp_path / "remote"
+    t.mkdir()
+    live, fresh, dead, stale = (t / f"ttp-check.{x}0001" for x in ("live", "fresh", "dead", "stale"))
+    for d in (live, fresh, dead, stale):
+        d.mkdir()
+    (live / "sub").mkdir()
+    for d, age_min in ((live, 600), (dead, checkspill.FRESH_MIN + 10), (stale, checkspill.REAP_AFTER_MIN + 10)):
+        old = time.time() - age_min * 60
+        os.utime(d, (old, old))
+    user = subprocess.Popen(["sleep", "60"], cwd=live / "sub")   # a run's process, deeper in its folder
+    try:
+        out = subprocess.run(["sh", "-c", checkspill._PROBE], env={**os.environ, "TMPDIR": str(t)},
+                             capture_output=True, text=True, timeout=30).stdout
+        assert out.split()[:1] == ["ttp-spill"] and out.split()[3] == "2", out   # live and fresh
+        assert sorted(p.name for p in t.iterdir()) == sorted(d.name for d in (live, fresh, dead)), "stale removed"
+    finally:
+        user.kill()
+        user.wait()
+    out = subprocess.run(["sh", "-c", checkspill._PROBE], env={**os.environ, "TMPDIR": str(t)},
+                         capture_output=True, text=True, timeout=30).stdout
+    assert out.split()[3] == "1", out   # its process gone, only the fresh folder counts
+
+
+@_GNU_FIND
+def test_spill_probe_keeps_a_run_whose_script_lives_though_its_processes_all_work_outside_its_folder(tmp_path):
+    """A run's processes can all work outside its ttp-check.* folder (its check cd's elsewhere): the run
+    script writes its pid in the folder first (remotecheck.RUN_PID), and while that pid lives the probe
+    counts the folder and never removes it, however old; once it is gone, an old folder is removed."""
+    from ttp import checkspill, remotecheck
+    t = tmp_path / "remote"
+    q = t / "ttp-check.away0001"
+    (q / ".git").mkdir(parents=True)
+    seen = tmp_path / "seen.pid"
+    script = remotecheck._run_script(shlex.quote(str(q)), "", f"cp {remotecheck.RUN_PID} {seen}; exit 0",
+                                     "ttp-remote-rc:")
+    proc = subprocess.Popen(["sh", "-c", script], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL)
+    try:
+        assert proc.wait(timeout=30) == 0   # ssh's stdin left open: closing it stops the command
+    finally:
+        proc.stdin.close()
+    assert seen.read_text().split() == [str(proc.pid)], "the run script writes its own pid first"
+    assert not q.exists(), "and removes its folder at the end"
+    (q / ".git").mkdir(parents=True)
+    run = subprocess.Popen(["sleep", "60"], cwd=tmp_path)   # the run's script, working outside its folder
+    (q / remotecheck.RUN_PID).write_text(f"{run.pid}\n")
+    old = time.time() - (checkspill.REAP_AFTER_MIN + 10) * 60
+    os.utime(q, (old, old))
+    probe = lambda: subprocess.run(["sh", "-c", checkspill._PROBE], env={**os.environ, "TMPDIR": str(t)},
+                                   capture_output=True, text=True, timeout=30).stdout
+    try:
+        out = probe()
+        assert out.split()[:1] == ["ttp-spill"] and out.split()[3] == "1", out
+        assert q.is_dir(), "a live run's folder is kept"
+    finally:
+        run.kill()
+        run.wait()
+    out = probe()
+    assert out.split()[3] == "0" and not q.exists(), out
+
+
+@pytest.mark.skipif(not shutil.which("dash") and sys.platform != "linux", reason="needs a POSIX sh")
+@pytest.mark.parametrize("sig", [signal.SIGHUP, signal.SIGINT, signal.SIGTERM])
+def test_remote_check_script_stops_its_command_and_removes_its_folder_when_a_signal_ends_it(tmp_path, sig):
+    """dash runs no EXIT trap when a signal ends the shell (its ssh session hung up, the host stopping it):
+    the run script traps hangup, interrupt and TERM, stops its command and removes its folder anyway."""
+    from ttp import remotecheck
+    q = tmp_path / "ttp-check.sig00001"
+    q.mkdir()
+    pidf = tmp_path / "cmd.pid"
+    script = remotecheck._run_script(shlex.quote(str(q)), "", f"echo $$ > {pidf}.new; mv {pidf}.new {pidf}; exec sleep 60",
+                                     "ttp-remote-rc:")
+    shell = shutil.which("dash") or "sh"
+    proc = subprocess.Popen([shell, "-c", script], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL)
+    try:
+        end = time.time() + 20
+        while not pidf.exists() and time.time() < end:
+            time.sleep(0.05)
+        assert pidf.exists(), "the command started"
+        cmd = int(pidf.read_text())
+        proc.send_signal(sig)
+        assert proc.wait(timeout=20) == 128 + sig
+        assert not q.exists(), "the folder is removed"
+        end = time.time() + 10
+        while time.time() < end:
+            try:
+                os.kill(cmd, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.05)
+        else:
+            raise AssertionError("the command was stopped")
+    finally:
+        proc.kill()
+        proc.wait()
+        with contextlib.suppress(OSError, ValueError):
+            os.kill(int(pidf.read_text()), signal.SIGKILL)
