@@ -116,3 +116,39 @@ def test_ssh_to_the_resource_counts_its_failures_and_only_role_or_provenance_ref
     assert json.loads(_lf_handoff(p, tid, "blocked", marker=prov)["data"]) == {"local_fault": ["guard"], "used": []}
     s = mm.stats(p.db)["box-a"]
     assert s["failures"] == 2 and s["local"] == 1, s
+
+
+def test_worker_role_and_provenance_denials_of_the_real_hook_are_logged_and_tag_the_run_local(env, monkeypatch):
+    """Every refusal the tool hook gives is in the run's refusals.jsonl: a worker-role guard (a harness-only
+    tool) as `worker_role`, a guard on untrusted input (the run's mark file) as `provenance`, so localfault
+    tags a run that never used its resource local. A guard that logs its own kind keeps it, once."""
+    p = make(env)
+    from ttp import hook, localfault, untrusted
+    from ttp.hook import REFUSALS_FILE
+
+    def refusals(run_dir):
+        return [json.loads(x) for x in (run_dir / REFUSALS_FILE).read_text().splitlines()]
+
+    for i, (payload, kind) in enumerate((
+            ({"tool_name": "CronCreate", "tool_input": {"cron": "* * * * *"}}, "worker_role"),
+            ({"tool_name": "Bash", "tool_input": {"command": f"rm $TTP_RUN_DIR/{untrusted.RUN_MARK}"}}, "provenance"),
+            ({"tool_name": "Write", "tool_input": {"file_path": f"/x/{untrusted.RUN_MARK}", "content": ""}},
+             "provenance"))):
+        run_dir = p.base / f"lf-hook-{i}"
+        run_dir.mkdir()
+        monkeypatch.setenv("TTP_RUN_DIR", str(run_dir))
+        out, _ = hook.pre_tool_use({**payload, "cwd": str(p.base)})
+        assert out["hookSpecificOutput"]["permissionDecision"] == "deny", payload
+        rows = refusals(run_dir)
+        assert [r["kind"] for r in rows] == [kind] and rows[0]["reason"].startswith("tt-project: "), rows
+        assert localfault.kinds(run_dir) == ["guard"], payload
+    # An allowed call logs nothing; a guard that logs its own kind (no_device here) is not logged again.
+    run_dir = p.base / "lf-hook-ok"
+    run_dir.mkdir()
+    monkeypatch.setenv("TTP_RUN_DIR", str(run_dir))
+    hook.pre_tool_use({"tool_name": "Bash", "tool_input": {"command": "git status"}, "cwd": str(p.base)})
+    assert not (run_dir / REFUSALS_FILE).exists()
+    monkeypatch.setattr(hook, "device_command", lambda commands, cmd: hook._log_refusal(cmd, kind="no_device") or "no")
+    out, _ = hook.pre_tool_use({"tool_name": "Bash", "tool_input": {"command": "tt-smi -r 0"}, "cwd": str(p.base)})
+    assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert [r["kind"] for r in refusals(run_dir)] == ["no_device"] and localfault.kinds(run_dir) == []

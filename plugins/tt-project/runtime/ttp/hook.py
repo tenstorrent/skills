@@ -1270,12 +1270,43 @@ def _deny(why: str) -> dict:
 CALL = {"id": "", "stage": "before"}
 
 
+# The refusal the current pre_tool_use call logs: whether a guard logged it itself (full_suite, no_device,
+# user_site, a local guard), and else its kind, `provenance` for a guard on untrusted input, `worker_role`
+# for the others. localfault.GUARD_KINDS counts these two as the run's own fault, not its resource's.
+_refusal = {"logged": False, "kind": "worker_role"}
+
+
+def _provenance(why: str | None) -> str | None:
+    """`why` of a guard on where the run's input came from (untrusted): its refusal is logged as provenance."""
+    if why:
+        _refusal["kind"] = "provenance"
+    return why
+
+
+def _refusal_command(payload: dict) -> str:
+    args = payload.get("tool_input") if isinstance(payload.get("tool_input"), dict) else {}
+    tool = str(payload.get("tool_name") or "")
+    return str(args.get("command") or "") if tool == "Bash" else f"{tool} {json.dumps(args, default=str)[:400]}"
+
+
 def pre_tool_use(payload: dict, stage: str = "before") -> tuple[dict | None, None]:
+    """The tool hook's verdict on one call; a refusal no guard logged itself is logged to the run's
+    refusals.jsonl as worker_role or provenance, so localfault counts it apart from the resource."""
     if not os.environ.get("TTP_RUN_DIR"):
         return None, None
     CALL.update(id=str(payload.get("tool_use_id") or payload.get("call_id") or payload.get("id") or ""), stage=stage)
+    _refusal.update(logged=False, kind="worker_role")
+    out, _ = _pre_tool_use(payload)
+    spec = (out or {}).get("hookSpecificOutput") or {}
+    if spec.get("permissionDecision") == "deny" and not _refusal["logged"]:
+        _log_refusal(_refusal_command(payload), kind=_refusal["kind"],
+                     reason=str(spec.get("permissionDecisionReason") or ""))
+    return out, None
+
+
+def _pre_tool_use(payload: dict) -> tuple[dict | None, None]:
     from . import pathguard, untrusted
-    if why := untrusted.mark_refusal(str(payload.get("tool_name") or ""), payload.get("tool_input") or {}):
+    if why := _provenance(untrusted.mark_refusal(str(payload.get("tool_name") or ""), payload.get("tool_input") or {})):
         return _deny(why), None   # the run's untrusted-input mark, marked or not
     if why := pathguard.refusal(payload):   # a write into a credential folder, on any tool
         return _deny(why), None
@@ -1291,7 +1322,7 @@ def pre_tool_use(payload: dict, stage: str = "before") -> tuple[dict | None, Non
         why = credguard.tool_refusal(str(payload["tool_name"]), args, cwd)
         if not why:   # a run reading untrusted input: a credential file outside its worktree
             from . import untrusted
-            why = untrusted.tool_refusal(str(payload["tool_name"]), args, cwd)
+            why = _provenance(untrusted.tool_refusal(str(payload["tool_name"]), args, cwd))
         why = why or search_scope(str(payload["tool_name"]), args if isinstance(args, dict) else {}, cwd)
         why = why or local_guard(payload)
         return (_deny(why) if why else None), None
@@ -1331,8 +1362,8 @@ def pre_tool_use(payload: dict, stage: str = "before") -> tuple[dict | None, Non
                                      cwd=str(payload.get("cwd") or os.getcwd()))
     if not why:   # a run reading untrusted input: no foreign push, write or credential read
         from . import untrusted
-        why = untrusted.bash_refusal(_all_segments(commands), _segments(commands, strip=False),
-                                     str(payload.get("cwd") or os.getcwd()))
+        why = _provenance(untrusted.bash_refusal(_all_segments(commands), _segments(commands, strip=False),
+                                                 str(payload.get("cwd") or os.getcwd())))
     if not why:
         why = git_push_bypass(segments)
     if not why:
@@ -1855,6 +1886,7 @@ def full_suite(cmd: str, segments: list[list[str]], cwd: str) -> str | None:
 
 def _log_refusal(cmd: str, kind: str, **extra: str) -> None:
     import time
+    _refusal["logged"] = True
     try:
         with open(Path(os.environ["TTP_RUN_DIR"]) / REFUSALS_FILE, "a") as f:
             f.write(json.dumps({"ts": time.time(), "kind": kind, "id": CALL["id"], "stage": CALL["stage"],
