@@ -26,7 +26,7 @@ import subprocess
 import time
 from pathlib import Path
 
-from . import checkspill, remotecheck, runnerenv
+from . import checkspill, project, remotecheck, runnerenv
 
 EVERY_S = 600
 PROBE_TIMEOUT_S = 120   # the first probe on a host may build the pinned env there
@@ -103,10 +103,7 @@ def probe(targets: list[tuple[str, list[str]]], now: float | None = None) -> Non
                 continue
             if now_ - float(read(host, wrap).get("at") or 0) < EVERY_S:
                 continue
-            res = {**check(host, wrap), "at": now_}
-            tmp = f.with_suffix(".tmp")
-            tmp.write_text(json.dumps(res))
-            tmp.replace(f)
+            project.durable_write(f, json.dumps({**check(host, wrap), "at": now_}))
 
 
 def targets(cfg: dict | None) -> list[tuple[str, list[str]]]:
