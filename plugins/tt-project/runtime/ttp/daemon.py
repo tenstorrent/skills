@@ -19391,10 +19391,10 @@ class Daemon:
                    ": its batch runs the project's checks on the commit it pushes") + "\n")
         out.mkdir(parents=True, exist_ok=True)
         (out / "check_failure.json").unlink(missing_ok=True)   # an earlier run's failure answers nothing here
-        (out / CHECKS_OUT).write_text(said)
-        (out / "checks.log").write_text(said)
-        (out / PUSHQ_VERDICT).write_text(json.dumps({**row, "head": full}))
-        (out / CHECKS_RC).write_text("0\n" if done else "75\n")
+        durable_write(out / CHECKS_OUT, said)
+        durable_write(out / "checks.log", said)
+        durable_write(out / PUSHQ_VERDICT, json.dumps({**row, "head": full}))
+        durable_write(out / CHECKS_RC, "0\n" if done else "75\n")   # last: a reader sees the rc once all is written
         log(self.p, f"task {task['id']}: no checks started on {full[:12]} for its review: {said.strip()}")
         return out
 
