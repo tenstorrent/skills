@@ -3993,26 +3993,40 @@ class Steps:
     lock: past upgrade.push_hold_min an automatic upgrade waits only for a push inside a step
     (release.push_hold), so it starts between steps, never in one. A step marks itself first and then
     reads the upgrade lock; the upgrade takes that lock first and then reads the marks, so the two never
-    both go: a step that finds an upgrade running unmarks itself and waits for it (UPGRADE_WAIT_S at most)."""
+    both go: a step that finds an upgrade running unmarks itself and waits for it (UPGRADE_WAIT_S at most).
+    Once a step has gone, the push stays marked until between(): a later go() (a batch's rebase of each
+    entry) only relabels and never reads or waits for the upgrade lock again, since no automatic upgrade
+    starts while the push is marked. So a batch round waits for an upgrade once, before its merge loop;
+    go(step, check=True) (each round's start and the push itself) reads the lock even when marked: a
+    deploy's upgrade takes it whatever the marks say (cmd_upgrade checks push_hold only when automatic)."""
 
     def __init__(self, lock, say: Callable[[str], None] = lambda m: None, poll_s: float = 1.0):
         name = getattr(lock, "name", None)
         self.lock = lock if isinstance(name, str) else None
         self.up = Path(name).parent / f"{UPGRADE_RESOURCE}.0.lock" if self.lock else None
         self.say, self.poll_s = say, poll_s
+        self.marked = ""       # the step the push is in since its last checked go(); "" = between steps
+        self.waited_s = 0.0    # the seconds every go() waited for upgrades (the batch's phase times)
 
     def _upgrading(self) -> bool:
         return _lock_taken(self.up)
 
-    def go(self, step: str) -> None:
+    def go(self, step: str, check: bool = False) -> None:
         if not self.lock:
+            return
+        if self.marked and not check:   # marked since a checked go(): no automatic upgrade started meanwhile
+            if step != self.marked:
+                locks.relabel(self.lock, {"step": step, "step_since": time.time()})
+                self.marked = step
             return
         waited, started = 0.0, time.monotonic()
         while True:
             locks.relabel(self.lock, {"step": step, "step_since": time.time()})
             if not self._upgrading() or waited >= UPGRADE_WAIT_S:
                 if waited:   # the batch log shows how long a push waited on upgrades (gatetime only times checks)
+                    self.waited_s += time.monotonic() - started
                     self.say(f"the {step} step waited {time.monotonic() - started:.0f} s for the upgrade")
+                self.marked = step
                 return
             self.between()
             if not waited:
@@ -4022,6 +4036,7 @@ class Steps:
                 waited += self.poll_s
 
     def between(self) -> None:
+        self.marked = ""
         if self.lock:
             locks.relabel(self.lock, {"step": ""})
 
@@ -4482,7 +4497,7 @@ def _rounds(repo: Path, remote: str, branch: str, checks: list[str], rounds: int
     passes: dict[str, tuple[str, str]] = {}   # check -> (tip, head) it last passed on in this push
     steps = steps or Steps(None)
     for rnd in range(1, rounds + 1):
-        steps.go("rebase")
+        steps.go("rebase", check=True)
         tip = _fetch(repo, remote, branch)
         if not tip:
             say(f"cannot fetch {upstream}")
@@ -4580,7 +4595,7 @@ def _rounds(repo: Path, remote: str, branch: str, checks: list[str], rounds: int
             timed(time.time() - started)
         # A check the tests gate excused did not pass: no later round carries it.
         passes = {str(cmd): (tip, head) for cmd in todo if str(cmd) not in excused}
-        steps.go("push")
+        steps.go("push", check=True)
         if _fetch(repo, remote, branch) != tip:
             say(f"{upstream} moved during the checks; round {rnd + 1}")
             continue

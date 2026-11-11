@@ -3977,17 +3977,19 @@ def test_approvals_that_waited_out_a_failed_train_start_the_next_as_it_ends(env,
     assert got == [] and "gap" in why, why
 
 
-def test_the_next_batch_waits_for_the_last_ones_after_push_deploy(env, monkeypatch):
+def test_the_next_batch_waits_for_the_last_ones_push_phase_but_not_its_after_push_deploy(env, monkeypatch):
+    """A deploy (after_push) takes minutes: the next batch merges and checks meanwhile; deploys stay one
+    at a time (batch._deploy). The last batch's push phase, not yet finalized, still holds it."""
     from ttp import pushq
     s = _pq(env, monkeypatch, push_batch_s=0)
     s.p.db.update_task(s.review, status="done")
     now = time.time()
     _pq_last_batch(s, "pushed", now - 60, after_done=False)   # pushed; its after_push still runs
     rid = _pq_review(s)[1]
+    assert [r["id"] for r in pushq.due(s.p, now)[0]] == [rid], "a deploy holds the next batch"
+    s.p.db.x("UPDATE push_batches SET finalized=NULL WHERE id='b1'")   # still in its push phase
     got, why = pushq.due(s.p, now)
     assert got == [] and "b1 is still going" in why, why
-    s.p.db.x("UPDATE push_batches SET after_push='ok', after_finalized=? WHERE id='b1'", (now,))
-    assert [r["id"] for r in pushq.due(s.p, now)[0]] == [rid], "once it ends no gap follows a clean batch"
 
 
 @pytest.mark.parametrize("blocker", ["paused branch", "paused push", "live batch", "busy branch", "detached push",
@@ -21688,3 +21690,63 @@ def test_an_approval_already_on_the_push_branch_while_the_queue_is_off_is_ignore
     _git_out(s.repo, "update-ref", "refs/remotes/origin/proj", s.head)
     t = _pq_hand_off(env, s, push=f"{s.branch} at {s.head}")
     assert t["status"] == "done" and "already on the push branch" in (s.p.logs / "daemon.log").read_text()
+
+
+def test_a_push_batch_waits_for_an_upgrade_once_per_round_never_per_entry_and_logs_its_phases(env, monkeypatch, capsys):
+    """An upgrade running through a whole batch: the round's start waits for it once (and the checks and
+    the push each check again), never each entry's rebase. The marker and log carry each phase's seconds."""
+    from ttp import locks, push
+    monkeypatch.setattr(push, "UPGRADE_WAIT_S", 0.02)
+    monkeypatch.setattr(push.Steps.__init__, "__defaults__", (lambda m: None, 0.01))
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    p.set_config("delivery.after_push", ["true"])
+    heads = [_entry(repo, f"e{n}", {f"f{n}.txt": f"{n}\n"}) for n in (1, 2, 3, 4)]
+    marker = _batch_marker(p, heads)
+    up = p.state / "locks" / f"{push.UPGRADE_RESOURCE}.0.lock"
+    up.parent.mkdir(parents=True, exist_ok=True)
+    held = locks.try_take([up], "test upgrade", "ttp upgrade")
+    try:
+        rc, m = _run_batch(p, marker, monkeypatch)
+    finally:
+        held.close()
+    out = capsys.readouterr().out
+    assert rc == 0 and m["outcome"] == "pushed" and m["rounds"] == 1, m
+    assert out.count("the rebase step waits for it") == 1, out
+    ph = m["phases"]
+    assert set(ph) >= {"merge_s", "entry_checks_s", "checks_s", "push_s", "upgrade_wait_s", "deploy_s"}, ph
+    assert ph["upgrade_wait_s"] > 0 and all(v >= 0 for v in ph.values()), ph
+    assert re.search(r"ttp push: phases: merge \d+ s \(entry checks \d+ s, upgrade waits \d+ s\), checks \d+ s, "
+                     r"push \d+ s", out), out
+    assert re.search(r"ttp push: phases: deploy \d+ s", out), out
+
+
+def test_a_batch_deploy_waits_for_the_earlier_one_and_a_newer_waiting_deploy_supersedes_it(env, monkeypatch):
+    """Deploys run one at a time: a batch whose after_push finds another deploying names itself as next
+    and runs once that one ends; an older waiter that finds a newer batch named next skips its deploy."""
+    import threading
+    from ttp import batch, locks
+    from ttp.project import write_json
+    p = make(env)
+    ran = []
+    monkeypatch.setattr(batch, "after_push", lambda p_, marker, m: ran.append(m["id"]) or {"status": "ok"})
+    path = batch._deploy_lock(p)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    nxt = path.with_suffix(".next")
+    held = locks.try_take([path], "deploy of b0", "ttp push --batch")
+    old = {"id": "b1", "outcome": "pushed", "pushed_sha": "a" * 40, "started": 100.0}
+    write_json(nxt, {"id": "b2", "started": 200.0, "sha": "b" * 40})
+    got = batch._deploy(p, p.state / "b1.json", old, poll_s=0.01)
+    assert got["status"] == "skipped" and "superseded by batch b2" in got["reason"] and ran == [], got
+    nxt.unlink()
+    new = {"id": "b3", "outcome": "pushed", "pushed_sha": "c" * 40, "started": 300.0}
+    res = {}
+    t = threading.Thread(target=lambda: res.update(batch._deploy(p, p.state / "b3.json", new, poll_s=0.01)))
+    t.start()
+    for _ in range(500):
+        if nxt.exists():
+            break
+        time.sleep(0.01)
+    assert json.loads(nxt.read_text())["id"] == "b3" and ran == []
+    held.close()
+    t.join(10)
+    assert res == {"status": "ok"} and ran == ["b3"] and not nxt.exists(), (res, ran)

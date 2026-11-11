@@ -198,6 +198,57 @@ def _after_lock(p: Project, bid: str) -> Path:
     return p.state / "locks" / f"after_push:run-{_safe(bid)}.0.lock"
 
 
+DEPLOY_POLL_S = 2.0   # how often a batch's after_push waiting for an earlier deploy looks again
+
+
+def _deploy_lock(p: Project) -> Path:
+    """The lock every batch's after_push takes while it deploys: deploys run one at a time, while the
+    next batch already merges and checks (pushq.due waits only for the last batch's push phase)."""
+    return p.state / "locks" / "after_push:deploy.0.lock"
+
+
+def _deploy(p: Project, marker: Path, m: dict, poll_s: float | None = None) -> dict:
+    """after_push (step 12) once no other batch deploys. A batch waiting for that names itself in the
+    deploy lock's `.next` file; an older waiter that finds a newer batch named there skips its own
+    deploy, as the newer one's pushed commit (a fast-forward of it) deploys its push too."""
+    if m.get("outcome") != "pushed" or not m.get("pushed_sha"):
+        return after_push(p, marker, m)
+    bid = str(m.get("id") or marker.stem)
+    path = _deploy_lock(p)
+    nxt = path.with_suffix(".next")
+    me = {"id": bid, "started": float(m.get("started") or 0), "sha": str(m["pushed_sha"])}
+    waited, t0 = False, time.monotonic()
+
+    def newer() -> dict | None:
+        cur = push._read(nxt)
+        if cur.get("id") and cur["id"] != bid and float(cur.get("started") or 0) > me["started"]:
+            return cur
+        if cur.get("id") != bid and waited:   # absent or older: name this batch (a race converges here)
+            write_json(nxt, me)
+        return None
+
+    while (lock := locks.try_take([path], f"after_push of push batch {bid}", "ttp push --batch")) is None:
+        if cur := newer():
+            say(f"after_push skipped: batch {cur['id']}'s deploy of {str(cur.get('sha'))[:10]} includes this push")
+            return {"status": "skipped", "reason": f"superseded by batch {cur['id']}'s deploy", "ended": time.time()}
+        if not waited:
+            waited = True
+            newer()
+            say("after_push waits for an earlier batch's deploy (one deploy at a time)")
+        time.sleep(DEPLOY_POLL_S if poll_s is None else poll_s)
+    try:
+        if waited:
+            say(f"after_push waited {time.monotonic() - t0:.0f} s for an earlier deploy")
+            if cur := newer():
+                say(f"after_push skipped: batch {cur['id']}'s deploy of {str(cur.get('sha'))[:10]} includes this push")
+                return {"status": "skipped", "reason": f"superseded by batch {cur['id']}'s deploy", "ended": time.time()}
+            if push._read(nxt).get("id") == bid:
+                _forget(nxt)
+        return after_push(p, marker, m)
+    finally:
+        lock.close()
+
+
 # Commands and worktrees ------------------------------------------------------------------------------
 
 def _kill(proc: subprocess.Popen) -> None:
@@ -1484,6 +1535,7 @@ class Batch:
         self.spill_off = ""   # the spill hosts this batch's checks keep off (checkspill.spill_off_add, _respill)
         self.at = ""                            # the head _check runs on
         self.checks = {"runs": 0, "seconds": 0.0, "cpu_s": 0.0, "flaky": False}
+        self.phase_s = {"merge_s": 0.0, "entry_checks_s": 0.0, "push_s": 0.0}   # phases(): the batch's seconds
         self.tip = self.pushed_sha = self.version = None
         self.reach: dict | None = None          # push.reach of what it pushed or found landed
         self.message = ""
@@ -1639,7 +1691,7 @@ class Batch:
             self.rounds += 1
             if rnd > 1 and (aim := self._target_now()) and aim != self.target:
                 return self._retargeted(aim)    # changed while the last round ran: before its next checks
-            self.steps.go("rebase")
+            self.steps.go("rebase", check=True)   # the round's one upgrade wait: each entry's _rebase only relabels
             tip = push._fetch(self.repo, self.remote, self.branch)
             if not tip:
                 return self._all("requeued", "error", f"cannot fetch {self.target}", keep=("refused",))
@@ -1775,12 +1827,14 @@ class Batch:
             self.target_lock = push.take(self.p, self.remote, self.branch, 0, say=lambda _m: None,
                                          who=f"push batch {self.id}")
             self.steps = push.Steps(self.target_lock, say)
-        self.steps.go("push")
-        if push._fetch(self.repo, self.remote, self.branch) != tip:
+        self.steps.go("push", check=True)
+        t0 = time.monotonic()
+        try:
+            r = None if push._fetch(self.repo, self.remote, self.branch) != tip else self._push_head(tip, head, k, carried, failed)
+        finally:
+            self.phase_s["push_s"] += time.monotonic() - t0
+        if r is None:
             return "moved"
-        self._mark_pushing(tip, head, k, carried, failed)
-        # Without --force the remote takes only a fast-forward of the tip the checks ran on.
-        r = _git(self.repo, "push", self.remote, f"{head}:refs/heads/{self.branch}")
         if r.returncode != 0:
             if push._fetch(self.repo, self.remote, self.branch) != tip:
                 return "moved"
@@ -1843,6 +1897,17 @@ class Batch:
         m["pushing"] = {"sha": head, "tip": tip, "version": version, "results": results, "at": time.time(),
                         "checks": self.checks, "rounds": self.rounds}
         write_json(self.marker, m)
+
+    def _push_head(self, tip: str, head: str, k: int, carried: list, failed: tuple | None):
+        self._mark_pushing(tip, head, k, carried, failed)
+        # Without --force the remote takes only a fast-forward of the tip the checks ran on.
+        return _git(self.repo, "push", self.remote, f"{head}:refs/heads/{self.branch}")
+
+    def phases(self) -> dict:
+        """The seconds of each phase of the push: merge (the replay of every entry, its entry checks and
+        upgrade waits included), the push checks and the push itself; after_push adds deploy_s."""
+        return {**{k: round(v, 1) for k, v in self.phase_s.items()}, "checks_s": round(self.checks["seconds"], 1),
+                "upgrade_wait_s": round(self.steps.waited_s, 1)}
 
     def _close(self, k: int, outcome: str, carried: list | None = None, failed: tuple | None = None) -> str:
         """Settle every entry once the first `k` carried entries are pushed: the one after them is
@@ -1907,6 +1972,7 @@ class Batch:
             except Exception as ex:     # one entry's fault takes only it out, never the whole batch
                 self._replay_fault(i, e, h, carried, ex)
             took.append((time.monotonic() - t0, i))
+        self.phase_s["merge_s"] += time.monotonic() - started
         if took:   # the merge phase's time in the batch log, next to the checks' ttp-suite wall
             slow = ", ".join(f"entry {self.entries[i].get('id')} {s:.0f} s" for s, i in sorted(took, reverse=True)[:3])
             say(f"replayed {len(took)} entries in {time.monotonic() - started:.0f} s ({len(carried)} carried; "
@@ -2037,6 +2103,13 @@ class Batch:
         cmds = push.check_list(self.d.get("push_entry_checks"))
         if not cmds:
             return None
+        t0 = time.monotonic()
+        try:
+            return self._entry_checks(cmds, head, tip)
+        finally:
+            self.phase_s["entry_checks_s"] += time.monotonic() - t0
+
+    def _entry_checks(self, cmds: list, head: str, tip: str) -> tuple[str, str] | None:
         bad = self.entry_tip_bad.setdefault(tip, {})
         try:
             env = self._check_env(head)
@@ -3543,6 +3616,9 @@ def rerun_receipt(p: Project, receipt) -> int:
 
 
 def _finish(p: Project, marker: Path, m: dict, after: dict, lock) -> None:
+    if isinstance(after, dict) and after.get("started") and after.get("ended"):
+        m["phases"] = {**(m.get("phases") or {}), "deploy_s": round(float(after["ended"]) - float(after["started"]), 1)}
+        say(f"phases: deploy {m['phases']['deploy_s']:.0f} s")
     m.update(after_push=after, phase="finished", status="finished", ended=time.time())
     write_json(marker, m)
     _forget(_after_lock(p, str(m.get("id") or marker.stem)))
@@ -3604,7 +3680,10 @@ def run_batch(p: Project, marker: Path) -> int:
     m.update(outcome=outcome, tip=b.tip, pushed_sha=b.pushed_sha, version=b.version, results=b.results(),
              checks=b.checks, rounds=b.rounds, message=b.message or None, conflicts=conflicts,
              reach=b.reach or None, scope_held=b.scopes or None, flaky_tests=b.flaky or None,
-             pre_existing=b.pre_existing or None, yielded_to=b.yielded_to or None)
+             pre_existing=b.pre_existing or None, yielded_to=b.yielded_to or None, phases=b.phases())
+    ph = m["phases"]
+    say(f"phases: merge {ph['merge_s']:.0f} s (entry checks {ph['entry_checks_s']:.0f} s, upgrade waits "
+        f"{ph['upgrade_wait_s']:.0f} s), checks {ph['checks_s']:.0f} s, push {ph['push_s']:.0f} s")
     if ff:
         m["fast_forward"] = ff
     if conflicts["conflicted"]:
@@ -3633,7 +3712,7 @@ def run_batch(p: Project, marker: Path) -> int:
         after = {"status": "skipped", "reason": "another process holds this batch's after_push lock"}
     else:
         try:
-            after = after_push(p, marker, m)
+            after = _deploy(p, marker, m)
         except Exception as e:
             after = {"status": "failed", "exit": None, "tail": f"{type(e).__name__}: {e}", "ended": time.time()}
     _finish(p, marker, m, after, ap_lock)
@@ -3660,7 +3739,7 @@ def _resume(p: Project, marker: Path, m: dict, bid: str) -> int:
         return 0
     say(f"resuming the after_push of batch {bid} ({m.get('outcome')})")
     try:
-        after = done or after_push(p, marker, m)
+        after = done or _deploy(p, marker, m)
     except Exception as e:
         after = {"status": "failed", "exit": None, "tail": f"{type(e).__name__}: {e}", "ended": time.time()}
     _finish(p, marker, m, after, lock)

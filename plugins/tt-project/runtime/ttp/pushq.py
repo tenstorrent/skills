@@ -1449,7 +1449,8 @@ def due(p: Project, now: float | None = None, cfg: dict | None = None, lock: boo
     every approval due at its start, best priority first: delivery.push_batch_max only starts one at
     once (kept for compatibility), it caps nothing, so the full push checks run once for all of them. Only local state is read: no fetch, no checks (an open runner
     fault, envfault, is probed again at most once a minute and holds every batch). No batch starts
-    while the last one or its after_push (the deploy) still runs. After a clean batch an approval
+    while the last one's push phase still runs; its after_push (the deploy) does not hold the next one,
+    which merges and checks meanwhile (deploys still run one at a time: batch._deploy). After a clean batch an approval
     starts one at once unless a review is running or ready, which it waits for at most
     delivery.push_batch_s. After a batch that did not end clean (a failing tip, a dead batch), unless
     the batch is full or holds one the last batch requeued untested, it waits for
@@ -1470,7 +1471,7 @@ def due(p: Project, now: float | None = None, cfg: dict | None = None, lock: boo
         return [], "no push target (delivery.push_branch)"
     remote, branch = tgt
     db = p.db
-    live = db.one("SELECT id FROM push_batches WHERE after_finalized IS NULL ORDER BY started LIMIT 1")
+    live = db.one("SELECT id FROM push_batches WHERE finalized IS NULL ORDER BY started LIMIT 1")
     if live:
         _urgent_waits(p, live["id"], now)
         return [], f"batch {live['id']} is still going"
