@@ -152,3 +152,89 @@ def test_a_conflicting_or_no_push_change_keeps_its_own_branch_and_status_says_wh
     lines = integrate.status_lines(p.db, p.config(), "skills")
     assert lines[0] == "skills: integration branch work (push branch): nothing waiting"
     assert lines[1] == f"skills: kept on their own branch: #{t} on clash (conflict in shared.txt)"
+
+
+def _shared_review(env, p):
+    """A review of two members, a and b, on one shared branch (b built on a's), and a's and b's heads."""
+    from ttp import integrate, worktree
+    from ttp.daemon import Daemon
+    a, branch, _, (rev,) = _finish_code(env, p, "first part", {"first.py": 20})
+    b = p.db.add_task("second part", f"pr_branch: {branch}\nAdd second.py.\nAcceptance: second.py has 20 lines.",
+                      kind="code", tier="standard", origin="coordinator", labels=[f"pr_branch:{branch}"])
+    path, bbranch = worktree.ensure(p, p.db.task(b))
+    bhead = _int_commit(path, "second.py", "x\n" * 20, "second part")
+    p.db.update_task(b, status="done", branch=bbranch)
+    assert Daemon(p.base)._auto_review(p.db.task(b), "second works") == (rev["id"], False)
+    ahead = integrate.member_head(p.root, a)
+    assert ahead and bhead != ahead
+    return a, b, rev["id"], branch, bbranch, ahead, bhead
+
+
+def test_a_split_verdict_approves_the_passing_member_and_scopes_the_fix_to_the_failed_one(env):
+    """One review of a shared branch hands off a verdict per change: the member that passed is approved
+    for the push queue (the review waits as 'pushing'), the fix is for the failed member's part only and
+    what waits on the review keeps waiting on it. A passing member above a failing one is not approved
+    (its head carries the failing commits), a loose finding is no split and an approval the queue
+    refuses leaves the normal failed review with its fix."""
+    from ttp import integrate
+    p = _int_project(env)
+    p.set_config("delivery.push_branch", "work")
+    p.set_config("delivery.push_queue", True)
+    a, b, rid, branch, bbranch, ahead, bhead = _shared_review(env, p)
+    ids = [a, b]
+    # Unit level: verdicts and landable.
+    fb = [{"title": f"task #{b}: off by one", "spec": "x"}]
+    assert integrate.verdicts(ids, {}, fb) == {a: "pass", b: "fail"}
+    assert integrate.verdicts(ids, {"members": {str(a): "fail", str(b): "pass"}}, []) == {a: "fail", b: "pass"}
+    assert integrate.verdicts(ids, {"members": {str(a): "pass", str(b): "pass"}}, []) is None, "nothing fails"
+    assert integrate.verdicts(ids, {}, fb + [{"title": "branch-wide lint", "spec": ""}]) is None, "a loose finding"
+    assert integrate.verdicts([a], {}, [{"title": f"task #{a}: x", "spec": ""}]) is None, "one member is no split"
+    assert integrate.verdicts(ids, {"members": {str(b): "FAIL "}}, []) == {a: "pass", b: "fail"}
+    assert integrate.landable(p.root, ids, {a: "pass", b: "fail"}) == [a]
+    assert integrate.landable(p.root, ids, {a: "fail", b: "pass"}) == [], "b's head carries a's failing commits"
+    assert "task #%d's part failed review" % b in integrate.scope_text({a: "pass", b: "fail"})
+    waiter = p.db.add_task("deploy it", "s", origin="coordinator", depends_on=[rid])
+    # The daemon: a passes, b fails.
+    _fail_review(env, p, rid, followups=fb, members={str(a): "pass", str(b): "fail"},
+                 push=[{"branch": branch, "head": ahead}])
+    rev = p.db.task(rid)
+    assert rev["status"] == "pushing", rev["status"]
+    rows = p.db.q("SELECT * FROM push_queue WHERE task=?", (rid,))
+    assert [(r["status"], r["head"]) for r in rows] == [("approved", ahead)], "only the passing member's head"
+    fixes = p.db.q("SELECT * FROM tasks WHERE title LIKE ?", (f"Fix review #{rid}%",))
+    assert len(fixes) == 1 and integrate.scope_text({a: "pass", b: "fail"}) in fixes[0]["spec"]
+    assert f"task #{b}: off by one" in fixes[0]["spec"]
+    rereviews = p.db.q("SELECT * FROM tasks WHERE kind='review' AND id!=?", (rid,))
+    assert len(rereviews) == 1 and fixes[0]["id"] in json.loads(rereviews[0]["depends_on"])
+    assert json.loads(p.db.task(waiter)["depends_on"]) == [rid], "the dependents were not taken over"
+    text = "\n".join(e["text"] for e in p.db.q("SELECT text FROM events WHERE task=?", (rid,)))
+    assert f"Member verdicts: #{a} pass, #{b} fail" in text, text
+
+
+def test_a_split_verdict_whose_passing_member_sits_above_the_failed_one_is_not_approved(env):
+    """Member b built on a's commits: when a fails and b passes, b's head carries a's failing commits, so
+    nothing is approved and the failed review takes its normal fix and re-review and the dependents."""
+    p = _int_project(env)
+    p.set_config("delivery.push_branch", "work")
+    p.set_config("delivery.push_queue", True)
+    a, b, rid, branch, bbranch, ahead, bhead = _shared_review(env, p)
+    waiter = p.db.add_task("deploy it", "s", origin="coordinator", depends_on=[rid])
+    _fail_review(env, p, rid, followups=[{"title": f"task #{a}: bad", "spec": "x"}],
+                 members={str(a): "fail", str(b): "pass"}, push=[{"branch": bbranch, "head": bhead}])
+    assert p.db.task(rid)["status"] == "failed"
+    assert not p.db.q("SELECT * FROM push_queue WHERE task=?", (rid,)), "an unreviewed head was approved"
+    fixes = p.db.q("SELECT * FROM tasks WHERE title LIKE ?", (f"Fix review #{rid}%",))
+    assert len(fixes) == 1
+    assert json.loads(p.db.task(waiter)["depends_on"]) != [rid], "the re-review took over its dependents"
+
+
+def test_a_split_verdict_with_a_refused_approval_keeps_the_failed_review(env):
+    """The queue refuses the passing member's head (the project does not push): the review stays failed
+    and its fix and re-review cover every member, as for any failed review."""
+    p = _int_project(env)   # no delivery.push_queue: an approval list is refused
+    a, b, rid, branch, bbranch, ahead, bhead = _shared_review(env, p)
+    _fail_review(env, p, rid, followups=[{"title": f"task #{b}: bad", "spec": "x"}],
+                 members={str(a): "pass", str(b): "fail"}, push=[{"branch": branch, "head": ahead}])
+    assert p.db.task(rid)["status"] == "failed"
+    assert not p.db.q("SELECT * FROM push_queue WHERE task=?", (rid,))
+    assert len(p.db.q("SELECT * FROM tasks WHERE title LIKE ?", (f"Fix review #{rid}%",))) == 1

@@ -7751,13 +7751,30 @@ class Daemon:
         entries = result.get("push") if isinstance(result, dict) else None
         if task["kind"] == "review" and (judged := load_result(task["result"]).get(pushq.JUDGED_KEY)):
             extra[pushq.JUDGED_KEY] = judged   # what its earlier approvals accepted, kept for the next one
-        if new == "done" and entries not in (None, "", []):
+        member_vs = None   # a shared-branch review that passes some members and fails others (integrate.verdicts)
+        if task["kind"] == "review" and new == "failed" and isinstance(entries, list) and entries:
+            try:
+                member_vs = self._split_verdicts(task, result)
+                entries = self._landable_entries(member_vs, entries) if member_vs else None
+            except Exception as e:
+                member_vs, entries = None, None
+                log(self.p, f"task {task['id']}: its member verdicts were not read: {e}")
+            if not entries:
+                member_vs = None
+        if (new == "done" or member_vs) and entries not in (None, "", []):
             try:
                 check = (pushq.check_approval(self.p, task, entries, cfg=self.cfg) if task["kind"] == "review"
                          else {"ignored": "only a review task approves pushes"})
             except subprocess.TimeoutExpired as e:   # gitmemo.TX_GIT_S ran out: invalid, so the review runs again
                 check = {"invalid": f"local git timed out checking it (after {e.timeout:.0f} s)"}
-            if check.get("ignored"):
+            if member_vs and (check.get("ignored") or check.get("invalid")):
+                # The passing members' approval is refused: the review stays failed and its fix and
+                # re-review carry every member, as for any failed review.
+                log(self.p, f"task {task['id']}: approval of its passing members refused: "
+                            f"{check.get('ignored') or check.get('invalid')}")
+                push_note = f" Its passing members' approval was refused: {check.get('ignored') or check.get('invalid')}."
+                member_vs = None
+            elif check.get("ignored"):
                 log(self.p, f"task {task['id']}: its push list was ignored: {check['ignored']}")
                 push_note = f" Its push list was ignored: {check['ignored']}."
             elif check.get("invalid"):
@@ -7941,7 +7958,10 @@ class Daemon:
                 db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
                      (time.time(), f"task:{task['id']}", "push_queued", "normal",
                       f"{pushq.queued_text(task, approval)} (run {ended or status}, "
-                      f"{'~' if usage.estimated else ''}${usage.cost_usd:.2f})", "handled", task["id"]))
+                      f"{'~' if usage.estimated else ''}${usage.cost_usd:.2f})"
+                      + (f"\nMember verdicts: " + ", ".join(f"#{i} {v}" for i, v in sorted(member_vs.items()))
+                         + "; the passing members' heads are approved together, the failed members' fix is queued"
+                         if member_vs else ""), "handled", task["id"]))
         else:
             db.update_task(task["id"], **upd)
         if plan_line and (gate := plangate.stored(db.task(task["id"]))):   # tasks queued from it already
@@ -8128,8 +8148,12 @@ class Daemon:
         form_only = new == "failed" and task["kind"] == "review" and review_failure(result) == "approval"
         area = self._review_area(dict(task, **upd)) if new == "failed" and task["kind"] == "review" \
             and not check_only and not form_only and not marker_fix else None
-        fix = self._fix_failed_review(dict(task, **upd), fixes, summary, reuse_fix=bool(marker_fix)) \
-            if new == "failed" and task["kind"] == "review" and fixes and (len(fups) <= MAX_FOLLOWUPS or marker_fix) \
+        # A split review's approved members go to the push queue while the failed members' fix is queued
+        # for their part only (the review waits as 'pushing'; what waits on it keeps waiting on it).
+        failed_fix = new == "failed" or bool(member_vs and approval)
+        fix = self._fix_failed_review(dict(task, **upd), fixes, summary, reuse_fix=bool(marker_fix),
+                                      approved=bool(member_vs and approval)) \
+            if failed_fix and task["kind"] == "review" and fixes and (len(fups) <= MAX_FOLLOWUPS or marker_fix) \
             and not area and not check_only and not form_only else None
         # A failed review left with no fix (a capped round, no fix follow-ups, findings on branches
         # that are not one stack) wakes the coordinator, never silently.
@@ -18468,6 +18492,32 @@ class Daemon:
                 f"The push queue runs the full checks again on the commit it pushes: run only focused tests "
                 f"of what changed.")
 
+    def _split_verdicts(self, review: dict, result: dict) -> dict[int, str] | None:
+        """{member id: pass | fail} of shared-branch review `review` from its hand-off, when it passes
+        some members and fails others (integrate.verdicts)."""
+        ids = [m["id"] for m in integrate.members(self.p.db, review)]
+        fups = [f for f in (result.get("followups") or []) if isinstance(f, dict) and f.get("title")
+                and not upstream.is_note(f)] if isinstance(result.get("followups"), list) else []
+        vs = integrate.verdicts(ids, result, fups)
+        return vs if vs and "pass" in vs.values() else None
+
+    def _landable_entries(self, vs: dict[int, str], entries: list) -> list:
+        """The approval entries of a split review that are safe: a head that is, or lies under, the head
+        of a passing member that carries no failing member's commit (integrate.landable)."""
+        root = self.p.root
+        heads = [integrate.member_head(root, i) for i in integrate.landable(root, sorted(vs), vs)]
+        out = []
+        for e in entries:
+            head = str(e.get("head") or "") if isinstance(e, dict) else ""
+            try:
+                full = worktree._git(root, "rev-parse", "--verify", "--quiet", f"{head}^{{commit}}", check=False) \
+                    if head else ""
+            except Exception:
+                full = ""
+            if full and any(integrate._is_ancestor(root, full, h) for h in heads):
+                out.append(e)
+        return out
+
     def _join_shared_review(self, task: dict, review: dict) -> None:
         """Code task `task` finished on a branch a still queued review already covers for another
         member (a batch, `pr_branch:` lines, overlap routing): it joins that review rather than getting
@@ -18887,7 +18937,7 @@ class Daemon:
             return None
 
     def _fix_failed_review(self, review: dict, fups: list[dict], summary: str,
-                           reuse_fix: bool = False) -> tuple[int, int, list[int]] | None:
+                           reuse_fix: bool = False, approved: bool = False) -> tuple[int, int, list[int]] | None:
         """A review that failed with fix specs, handled the way the coordinator would: one code task
         fixes them all on top of the reviewed branch, and a re-review that waits on it takes over the
         failed review's dependents: (fix id, re-review id, the dependents moved). None when auto
@@ -18969,6 +19019,11 @@ class Daemon:
         rtier = "deep" if review["tier"] == "deep" else "standard"   # a re-review never runs light
         tag = spans.new_tag()   # this spec's delimiter: the reviewer's findings and hand-off are data
         found = _findings(fups, review, tag)
+        # A shared-branch review that failed only some members: the fix is for their part alone.
+        vs = integrate.verdicts([m["id"] for m in integrate.members(db, review)], load_result(review.get("result")),
+                                fups)
+        if vs:
+            found = f"{integrate.scope_text(vs)}\n{found}"
         # An open fix of the PR's findings (pr_findings_owner) on this stack takes these findings too:
         # a PR has one fixer.
         root, key = self._stack_root(code), prguard.pr_key(code.get("pr_url") or "")
@@ -19110,8 +19165,9 @@ class Daemon:
                                f"Leave the push to re-review #{rid}, which checks each finding once this task is done."),
                     f"Findings to fix:\n{found}",
                     f"The review's hand-off: {spans.wrap(coord.clip(summary, AUTO_REVIEW_SUMMARY_CHARS), _handoff_of(review), tag)}"]))
-            moved = [t["id"] for t in coord._open_dependents(db, review["id"])]
-            coord._take_over_dependents(db, review["id"], rid)
+            moved = [] if approved else [t["id"] for t in coord._open_dependents(db, review["id"])]
+            if not approved:   # its approved members are pushing: what waits on it waits for that push
+                coord._take_over_dependents(db, review["id"], rid)
         log(self.p, f"review {review['id']} failed: "
                     + (f"PR fix #{fid} takes its findings" if prfix else f"continue hop #{fid} takes its findings"
                        if hop else f"queued fix #{fid}") + f" and re-review #{rid}"

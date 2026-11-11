@@ -83,8 +83,10 @@ def members_block(tasks: list[dict], tip: tuple[str, str] | None = None) -> str:
         lines.append(f"- task #{t['id']} ({t.get('title') or ''}) on {t.get('branch') or '?'}: "
                      f"acceptance: {acceptance(t.get('spec'))}")
     lines.append("Check each member against its own acceptance criteria. Start each finding's title with the "
-                 "member it is about, as `task #<id>:`; a finding names one member only. A failed member's "
-                 "commits are reverted forward on the branch so the members that pass land together.")
+                 "member it is about, as `task #<id>:`; a finding names one member only. When some members pass "
+                 "and others fail, hand off `failed` with `members` mapping each member id to pass or fail, put "
+                 "only the passing members' own heads in `push`, and give the failed members' findings as "
+                 "follow-ups. Members that pass are approved together; the fix covers the failed part only.")
     return "\n".join(lines)
 
 
@@ -94,7 +96,7 @@ def with_members(spec: str, tasks: list[dict], tip: tuple[str, str] | None = Non
     i = spec.find(MEMBERS_PREFIX)
     if i >= 0:
         # The block ends at its last line, the attribution rule.
-        end = spec.find("\n", spec.find("A failed member's commits", i))
+        end = spec.find("\n", spec.find("Members that pass are approved together", i))
         spec = spec[:i].rstrip("\n") + (spec[end:] if end >= 0 else "")
     return f"{spec.rstrip()}\n{members_block(tasks, tip)}"
 
@@ -123,6 +125,64 @@ def by_member(fups: list[dict], ids: list[int]) -> tuple[dict[int, list[dict]], 
         m = finding_member(f, ids)
         (out.setdefault(m, []) if m is not None else loose).append(f)
     return out, loose
+
+
+def _is_ancestor(repo: Path, commit: str, head: str) -> bool:
+    try:
+        return subprocess.run(["git", "-C", str(repo), "merge-base", "--is-ancestor", commit, head],
+                              capture_output=True, timeout=60).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+PASS_WORDS = {"pass", "passed", "ok", "approve", "approved", "accept", "accepted", "done"}
+
+
+def verdicts(ids: list[int], result: dict | None, fups: list[dict]) -> dict[int, str] | None:
+    """One verdict per member of a shared-branch review: {id: "pass" | "fail"}. The reviewer's own
+    `members` map in its hand-off ({"<id>": "pass"|"fail"}) decides for the members it names; any other
+    member fails when a finding names it and passes when none does. None when this is no split: fewer
+    than two members, a finding naming no member (the branch as a whole), or no member failing."""
+    if len(ids) < 2:
+        return None
+    grouped, loose = by_member([f for f in fups if isinstance(f, dict)], ids)
+    if loose:
+        return None
+    given = (result or {}).get("members")
+    out: dict[int, str] = {}
+    for i in ids:
+        v = ""
+        if isinstance(given, dict):
+            v = str(given.get(str(i), given.get(i, ""))).strip().lower()
+        out[i] = ("pass" if v in PASS_WORDS else "fail") if v else ("fail" if i in grouped else "pass")
+    return out if "fail" in out.values() else None
+
+
+def landable(repo: Path, ids: list[int], vs: dict[int, str]) -> list[int]:
+    """The passing members that can be approved on their own head: the head each handed off is recorded
+    and carries no commit of a failing member (an earlier member's bad commits sit under a later head,
+    which waits for the fix's re-review)."""
+    bad: set[str] = set()
+    for i in ids:
+        if vs.get(i) == "fail":
+            bad.update(member_commits(repo, i))
+    out = []
+    for i in ids:
+        head = member_head(repo, i)
+        if vs.get(i) != "pass" or not head:
+            continue
+        if any(_is_ancestor(repo, c, head) for c in bad):
+            continue
+        out.append(i)
+    return out
+
+
+def scope_text(vs: dict[int, str]) -> str:
+    """The line a fix or re-review spec carries for a split verdict: only the failed members' parts."""
+    fail = [i for i, v in sorted(vs.items()) if v == "fail"]
+    ok = [i for i, v in sorted(vs.items()) if v == "pass"]
+    return (f"Only {', '.join(f'task #{i}' for i in fail)}'s part failed review: fix only its findings below. "
+            f"{', '.join(f'task #{i}' for i in ok)} passed and must not change.")
 
 
 def record_member_head(repo: Path, task_id: int, head: str) -> None:

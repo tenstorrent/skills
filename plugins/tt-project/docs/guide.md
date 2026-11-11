@@ -3091,7 +3091,12 @@ session and stateless coordinators on every provider.
   through one draft PR); with a push branch, the push branch is the integration branch. A code task
   that finishes on a branch a queued review already covers (a `pr_branch:` task stacked on it, a
   batch) joins that review rather than getting its own: the review lists each member with its
-  acceptance criteria and each finding names its member (`task #<id>:`). A change that conflicts on
+  acceptance criteria and each finding names its member (`task #<id>:`). The reviewer gives a
+  verdict per member (hand-off `members`: `{"<id>": "pass"|"fail"}`, else a member fails when a finding
+  names it): with the push queue on, the passing members' own heads are approved together while the
+  review waits as `pushing`, and the fix and its re-review are scoped to the failed members' part
+  only. A passing member built on a failing member's commits is not approved; it waits for the
+  re-review. A change that conflicts on
   the integration branch (`git merge-tree`) or has a `no_push:` line keeps its own branch, and
   `ttp status` shows the integration branch, what waits on it and each change kept apart with why.
 - `delivery.own_push` (`existing_only` when unset) says which remote branches besides the push branch
