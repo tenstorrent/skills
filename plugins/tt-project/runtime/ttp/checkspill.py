@@ -562,9 +562,10 @@ def off_list(project_dir: str, alias: str) -> str:
     listed = hosts(cfg)
     if alias in listed:
         return ""
-    try:   # a host of a listed machine (machine:host) is listed with it, as allowed() reads it
-        from . import machines
-        if target(alias, machines.load())[0] in listed:
+    try:   # a host of a listed machine (machine:host) is listed with it, as allowed() reads it; the run
+        from . import machines   # names a listed `machine:host` entry by its ssh host (remotecheck --host)
+        known = machines.load()
+        if target(alias, known)[0] in listed or any(target(h, known)[1] == alias for h in listed):
             return ""
     except Exception:
         return ""
