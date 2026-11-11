@@ -1600,18 +1600,26 @@ def status_text(p: Project, verbose: bool = False) -> str:
     head += " · tasks: " + (", ".join(f"{k} {v}" for k, v in sorted(counts.items())) if counts else "none yet")
     head += " · " + timefmt.long(now, p)
     lines = [head]
-    for m in attention(db, now, p)[:6]:
-        text = " ".join(m["text"].split())
+    whole = set()   # lines quoting an open ask: never cut to STATUS_WIDTH (user msg #2424)
+    seen = attention(db, now, p)
+    for m in [m for m in seen if m["kind"] == "ask"] + [m for m in seen if m["kind"] != "ask"][:6]:
+        text = " ".join(m["text"].split())   # an open ask in full, every one: the user acts on it (#2424)
         what = (f"ask {m['id']}" + (f"; {m['auto']}" if m.get("auto") else "")) if m["kind"] == "ask" else f"alert {m['id']}"
-        lines.append(f"  needs you ({what}, {since(m['ts'], now)} ago): {clip(text, 300)}")
+        lines.append(f"  needs you ({what}, {since(m['ts'], now)} ago): {text if m['kind'] == 'ask' else clip(text, 300)}")
+        if m["kind"] == "ask":
+            whole.add(lines[-1])
     # Blocked tasks: those that wait on the user join the top; the rest are the project's to move.
-    from . import waits
+    from . import pendingask, waits
     wy = waits.on_user(db, now, tz)
     you, stuck = wy["tasks"], wy["held"]
     for t in wy["gated"][:6]:
-        lines.append(f"  needs you (#{t['id']}, gated on an open ask): {t['title']}")
+        on = "; ".join(pendingask.full(a) for a in waits.asks_for(t["id"], wy["asks"]))
+        lines.append(f"  needs you (#{t['id']}, gated on an open ask): {t['title']}" + (f" — {on}" if on else ""))
+        whole.add(lines[-1])
     for t in you[:6]:
         lines.append(f"  needs you (#{t['id']}, {t['wait']['age_text']}): {t['title']} — {t['wait']['text']}")
+        if t["wait"].get("asks"):
+            whole.add(lines[-1])
     # Then what stops work (holds, pauses, breakers, a full disk), then alerts no chat or web view read.
     from . import hostcycle
     if cyc := hostcycle.hold(p, now):
@@ -1858,7 +1866,7 @@ def status_text(p: Project, verbose: bool = False) -> str:
         text = " ".join(m["text"].split())
         tag = f"cleared {at(m['cleared_at'], now, tz)}" if m.get("cleared_at") else m["state"]
         lines.append(f"  {at(m['ts'], now, tz)} ({tag}) {clip(text, 160)}")
-    return "\n".join(clip(ln) for ln in lines)
+    return "\n".join(ln if ln in whole else clip(ln) for ln in lines)
 
 
 def daemon_state(p: Project) -> str:

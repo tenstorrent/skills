@@ -66,6 +66,8 @@ description: "Start, connect to, and talk with a long-running tt-project: a loca
 - A project's questions never block it: each shows "acts on X at HH:MM unless answered" and goes
   with that recommendation if unanswered (`coordinator.ask_timeout_h`, 0.5 h), except asks only the
   user can answer (review, merge, credentials, money, acting as the user).
+- Saying the user still owes something: quote it in full right there (the question, its options and
+  recommendation, the exact command), never only "ask 297" or "see above".
 - Never give an unverified web app link. Give only a `web app: http…` line that `ttp new`,
   `ttp connect` or `ttp web` just printed: they check it first (HTTP 200 naming this project,
   through that exact port and token). Never build a link by hand or reuse an old one.

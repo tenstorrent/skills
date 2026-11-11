@@ -2606,6 +2606,18 @@ def _wakemode_checked(p: Project, text: str, notes: list) -> str:
     return text
 
 
+def _pending_checked(p: Project, text: str, notes: list, what: str) -> str:
+    """A reply or notify as pendingask.expand sends it: an open ask it names only by id goes with its full
+    text appended (user msg #2424). Any fault posts the text unchanged: a message is never lost to this check."""
+    try:
+        from . import pendingask, waits
+        text, why = pendingask.expand(text, waits.open_asks(p.db), what)
+        notes += why
+    except Exception as e:
+        notes.append(f"pendingask: the open-ask check failed ({type(e).__name__}: {e}); the message went unchecked")
+    return text
+
+
 def _claims_checked(p: Project, a: dict, notes: list) -> tuple[str, list]:
     """A reply or notify as claimcheck.check sends it: a status claim that did not hold goes prefixed with what is
     true, one nothing could check with '(unverified)' after it. Returns (text, the false claims)."""
@@ -2702,6 +2714,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 a["text"] = _onhost_checked(p, a["text"], None if chat in (None, "all") else chat, a, order[k + 1:],
                                             batch_tasks, notes)
                 a["text"] = _wakemode_checked(p, a["text"], notes)
+                a["text"] = _pending_checked(p, a["text"], notes, "reply")
                 a["text"], false = _claims_checked(p, a, notes)
                 replies.append(msgparts.post(db, a["text"], chat=None if chat in (None, "all") else chat, kind="reply",
                                              severity=_norm_severity(a.get("severity") or "normal"))[0])
@@ -3540,6 +3553,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 said = workernotify.named(a["text"])   # the ids the coordinator named, before onhost's status line
                 a["text"] = _onhost_checked(p, a["text"], None, a, order[k + 1:], batch_tasks, notes)
                 a["text"] = _wakemode_checked(p, a["text"], notes)
+                a["text"] = _pending_checked(p, a["text"], notes, "notify")
                 a["text"], false = _claims_checked(p, a, notes)
                 sent.append((msgparts.post(db, a["text"], chat=None, kind="alert",
                                            severity=_norm_severity(a.get("severity")))[0], None, a["text"]))
@@ -5099,7 +5113,7 @@ def expire_asks(p: Project, *, hold: bool = False, now: float | None = None) -> 
             to = resolves(v)[1]
             db.x("UPDATE messages SET handled=1 WHERE id=?", (ask["id"],))
             unblock.record_resolve(db, int(k), [], auto=to)
-            question = _ask_question(ask["text"])[:300]
+            question = _ask_question(ask["text"]).strip()   # whole: the user may reply to change it (#2424)
             if not isinstance(v, dict):
                 # at least high, and never under the chat floor: the user must see what was decided for them
                 severity = max((ask["severity"], "high", floor), key=lambda n: SEVERITY_RANK.get(n, -1))

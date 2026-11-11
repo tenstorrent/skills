@@ -141,6 +141,8 @@ def project_status(name: str, entry: dict, now: float, here: str, lib_v: str, wi
         w = waits.on_user(_ReadOnly(conn), now, ages=False)
         row["waiting_on_user"] = w["count"]
         row["wait_asks"] = len(w["asks"])
+        from .pendingask import full
+        row["open_asks"] = [full(a) for a in w["asks"]]   # each in full, never only its id (user msg #2424)
         row["wait_tasks"] = len(w["tasks"]) + len(w["gated"])
         row["running"] = conn.execute("SELECT COUNT(*) FROM runs WHERE status='running'").fetchone()[0]
         from . import billing
@@ -215,7 +217,8 @@ def line(r: dict) -> str:
     return (f"{r['name']}\tdaemon {r['daemon']} · v{v}"
             f" · waiting on you: {r['waiting_on_user']} ({r['wait_asks']} ask{'s' if r['wait_asks'] != 1 else ''},"
             f" {r['wait_tasks']} task{'s' if r['wait_tasks'] != 1 else ''}) · {r['running']} running · {spend(r)}"
-            + "".join(f" · {x}" for x in r.get("slots") or []))
+            + "".join(f" · {x}" for x in r.get("slots") or [])
+            + "".join(f"\n  needs you: {a}" for a in r.get("open_asks") or []))
 
 
 def target_line(g: dict) -> str:

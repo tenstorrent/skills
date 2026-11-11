@@ -108,6 +108,7 @@ def asks(db: DB, since: float, now: float, p: Project | None = None) -> list[dic
         m = msgs.get(r["id"]) or {"ts": now, "text": ""}
         rec = m["text"].split(_REC_NOTE, 1)[1].split("\n\n")[0] if _REC_NOTE in m["text"] else ""
         out.append({**r, "question": _short(_ask_question(m["text"])), "recommendation": _short(rec, 100),
+                    "full": " ".join(m["text"].split()),   # an ask still open is quoted whole (user msg #2424)
                     "wait_s": (r["answered_at"] - m["ts"]) if r.get("answered_at") else None,
                     "open_s": None if r.get("answered_at") else _closed_at(r, now) - m["ts"]})
     return out
@@ -500,6 +501,7 @@ def lines(db: DB, now: float | None = None, window_s: float = WINDOW_S, blocked_
             how = f"resolved: #{a['step']['task']}'s user step was done, after {_dur(a['open_s'])}"
         else:
             how = f"no answer yet, open {_dur(a['open_s'])}"
+            a, rec = {**a, "question": a.get("full") or a["question"]}, ""   # whole: its recommendation included
         out.append(f"ask {a['id']} ({a['blocking']}): \"{a['question']}\"{rec}; {how}")
     refused = rejected_asks(db, since)
     if refused:

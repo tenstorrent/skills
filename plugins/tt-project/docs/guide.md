@@ -1551,6 +1551,14 @@ for the user's word. Nothing else does: a project's own gates (test-gate scope, 
 landing order, which settings the coordinator changes) are the coordinator's to decide and record,
 never held for "the user's word".
 
+- An open ask is shown in full wherever it waits on the user (user msg #2424): `ttp status`,
+  `ttp overview`, the web board's waiting-on-you column, a task's "waits on you" text, the daily
+  review and the ask-timeout notice all carry its whole text (question, options, recommendation,
+  command), never only its id. A model-free check on each outgoing coordinator reply and notify
+  (`pendingask.py`) appends the full text of an open ask it names only as "ask N"; a "still waiting
+  on you" that matches no open ask goes as written and is flagged in the next turn's notes. It never
+  rejects or drops a message.
+
 - Self-blocking check, model-free, once a minute (`selfblock.py`): a blocked or waiting task whose
   reason cites the user's word or waits for the user, a coordinator reply from the last hour that
   does so, or an open `irreversible` or `restriction` ask, none of whose text names one of the gates

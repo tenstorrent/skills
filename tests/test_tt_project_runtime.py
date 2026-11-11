@@ -39022,10 +39022,12 @@ def test_a_task_an_open_ask_names_waits_on_the_user(env):
     ask = p.db.post("out", f"#{tid}: vendor A or B? (not #{tid}0)", chat=None, kind="ask", severity="high")
     st = state_payload(p, p.db)
     w = next(t for t in st["tasks"] if t["id"] == tid)["wait"]
-    assert w["kind"] == "user" and w["text"] == f"waits on you: ask {ask}" and w["asks"] == [ask], w
+    # The ask in full, never only its id (user msg #2424).
+    full = f"waits on you: ask {ask}: #{tid}: vendor A or B? (not #{tid}0)"
+    assert w["kind"] == "user" and w["text"] == full and w["asks"] == [ask], w
     assert next(t for t in st["tasks"] if t["id"] == other)["wait"]["kind"] == "coordinator"
     out = status_text(p)
-    assert f"  needs you (#{tid}, waiting 0.0h): pick a vendor — waits on you: ask {ask}" in out, out
+    assert f"  needs you (#{tid}, waiting 0.0h): pick a vendor — {full}" in out, out
     assert f"  #{other} waiting 0.0h: other — waits on the coordinator" in out, out
     # Answered, it is the coordinator's again.
     p.db.x("UPDATE messages SET handled=1 WHERE id=?", (ask,))
@@ -39052,7 +39054,7 @@ def test_status_and_web_read_a_hold_anchor_by_its_kind(env, anchor, kind, text):
     tid = p.db.add_task("cache layout", "s", origin="user")
     if anchor == "ask":
         ask = p.db.post("out", "vendor A or B?", chat=None, kind="ask", severity="high")
-        anchor, text = f"ask:{ask}", f"waits on you: ask {ask}"
+        anchor, text = f"ask:{ask}", f"waits on you: ask {ask}: vendor A or B?"
     p.db.update_task(tid, status="blocked", blocked_reason="held by the coordinator: some free text",
                      labels=["kept", f"waits:{anchor}"])
     w = next(t for t in state_payload(p, p.db)["tasks"] if t["id"] == tid)["wait"]
