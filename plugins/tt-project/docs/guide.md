@@ -2885,6 +2885,8 @@ session and stateless coordinators on every provider.
   the push log and the run's notes say who cancelled it, and `--result` reports it not pushed. Only
   the task that queued the push may cancel it (the project's coordinator may cancel any push of its
   project); another task's push is refused (exit 2). Exit 1 when it had already pushed.
+  `ttp push --stop <marker>` is the narrower form: it ends only the caller's own push and refuses one
+  already in its `git push` (exit 1).
 - Inside a run, `ttp push --land` lands the task's own branch though its spec has no landing step,
   and skips the guard that wants `ttp checks` passed on HEAD. It never skips a review: when delivery
   has a review step (`delivery.review_before_pr`, on by default, or a `delivery.push_branch`; with

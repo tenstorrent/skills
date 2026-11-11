@@ -5683,7 +5683,7 @@ def _group_alive(pid: int) -> bool:
     return True
 
 
-def _end_group(marker: Path, pid: int, say: Callable[[str], None]) -> bool:
+def _end_cancelled_group(marker: Path, pid: int, say: Callable[[str], None]) -> bool:
     """Stop the push process `pid` of `marker` and every process of its group (its checks, git), TERM
     then KILL: it was started as its own session (_start), so its pid is the group id. True once the
     group is gone and the run lock is free."""
@@ -5740,7 +5740,7 @@ def cancel(p: Project, marker: Path) -> int:
             m["cancel_requested"] = by   # a reboot's requeue (_requeue) never starts it again
             write_json(marker, m)
             say(f"ttp push: stopping the push process group {pid} (TERM, then KILL after {CANCEL_GRACE_S} s)")
-            if not _end_group(marker, pid, say):
+            if not _end_cancelled_group(marker, pid, say):
                 say(f"ttp push: the push of {marker.name} is still running; it was not cancelled")
                 return 1
         m = _read(marker)
