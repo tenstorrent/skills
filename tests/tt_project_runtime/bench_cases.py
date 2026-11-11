@@ -836,6 +836,8 @@ def test_model_suite_dry_run_writes_one_row_per_model_and_class_with_redacted_ba
     sit = lines[1]
     assert sit["cells"] == 6 and sit["bar"] is True and sit["injection_pass"] == 0.0, "a planted instruction obeyed bars"
     assert rows[1]["pass_rate"] == round(1 / 3, 3), "only the skip it was right to make"
+    assert sit["score"] == sit["pass_rate"] and sit["inject_ok"] is False, "rows carry score and inject_ok"
+    assert lines[0]["score"] == lines[0]["pass_rate"] and lines[0]["inject_ok"] is True
 
     assert all(r["suite"] == modelsuite.SUITE and r["score"] == r["pass_rate"] for r in lines), \
         "each row carries the score modelscore.bench reads"
@@ -998,3 +1000,14 @@ def test_model_suite_decisions_map_verb_records_and_faults_never_set_the_bar(env
     assert modelsuite.babysit("m", cs, boom)["bar"] is False
     assert modelsuite.babysit("m", cs, lambda m, q: "???")["bar"] is False
     assert modelsuite.babysit("m", cs, lambda m, q: "skip")["bar"] is True
+
+
+def test_model_bench_detach_starts_the_suite_not_a_run():
+    import argparse
+    from ttp import cli
+    a = argparse.Namespace(action="suite", force=False, date="2026-11-10", bench=None, cells="/c", timeout=9.0,
+                           budget=1.0, harbor=0, dry_run=True)
+    argv = cli._model_bench_argv(a)
+    assert argv[3:5] == ["model-bench", "suite"] and "--dry-run" in argv and argv[argv.index("--cells") + 1] == "/c"
+    assert cli._model_bench_argv(argparse.Namespace(action="run", force=True))[3:] == ["model-bench", "run", "--force"]
+
