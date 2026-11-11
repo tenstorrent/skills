@@ -296,3 +296,67 @@ def test_a_member_that_conflicts_with_the_integration_branch_or_has_no_push_gets
         assert b not in json.loads(p.db.task(rev["id"])["depends_on"]), "it joined the shared review"
         assert why in json.loads(p.db.task(b)["labels"])
         p.db.update_task(got, status="cancelled")   # the next case is a sibling, not built on this one
+
+
+def test_a_failed_member_revert_that_conflicts_leaves_the_shared_branch_unreviewed_and_unapproved(env):
+    """Two members fail past their fix hop and the second's revert conflicts (a later passing member c
+    changed its file): all or nothing, so the branch is put back, nothing is requeued, re-reviewed or
+    approved on a head that still carries a failed member's commits, and the no-fix wake names it."""
+    from ttp import integrate, worktree
+    from ttp.daemon import Daemon
+    p = _int_project(env)
+    p.set_config("review.auto_fix_rounds", 0)
+    p.set_config("delivery.push_branch", "work")
+    p.set_config("delivery.push_queue", True)
+    a, b, rid, branch, bbranch, ahead, bhead = _shared_review(env, p)
+    c = p.db.add_task("third part", f"pr_branch: {bbranch}\nChange second.py.\nAcceptance: it says c.",
+                      kind="code", tier="standard", origin="coordinator", labels=[f"pr_branch:{bbranch}"])
+    path, cbranch = worktree.ensure(p, p.db.task(c))
+    chead = _int_commit(path, "second.py", "c\n" * 20, "third part")
+    p.db.update_task(c, status="done", branch=cbranch)
+    assert Daemon(p.base)._auto_review(p.db.task(c), "third works") == (rid, False)
+    ev = _fail_review(env, p, rid, followups=[{"title": f"task #{a}: bad", "spec": "x"},
+                                              {"title": f"task #{b}: bad", "spec": "x"}],
+                      members={str(a): "fail", str(b): "fail", str(c): "pass"})
+    for br in {bbranch, cbranch}:
+        tip = _git_out(p.root, "rev-parse", br).strip()
+        assert integrate.REVERT_TRAILER not in _git_out(p.root, "log", "-1", "--format=%B", tip), br
+    assert _git_out(p.root, "rev-parse", cbranch).strip() == chead, "the branch was put back"
+    assert not p.db.q("SELECT * FROM tasks WHERE title LIKE 'Redo #%'")
+    assert not p.db.q("SELECT * FROM tasks WHERE kind='review' AND id!=?", (rid,)), "a head with b's commits"
+    assert not p.db.q("SELECT * FROM push_queue WHERE task=?", (rid,))
+    assert f"reverting #{b} on" in ev["text"] and "No automatic fix" in ev["text"], ev["text"]
+
+
+def test_a_redo_of_a_member_that_joined_by_pr_branch_gets_a_branch_of_its_own(env):
+    """Member b joined the shared branch by a pr_branch: line; reverted past its fix hop, its Redo
+    delivers onto no branch of b's (neither through continues: nor the quoted spec's pr_branch: line)."""
+    from ttp import push
+    p = _int_project(env)
+    p.set_config("review.auto_fix_rounds", 0)
+    a, b, rid, branch, bbranch, ahead, bhead = _shared_review(env, p)
+    p.db.update_task(b, spec=p.db.task(b)["spec"] + f"\n## Update\npr_branch: {bbranch}\n")
+    ev = _fail_review(env, p, rid, followups=[{"title": f"task #{b}: second.py is wrong", "spec": "x"}],
+                      members={str(a): "pass", str(b): "fail"})
+    redo = p.db.one("SELECT * FROM tasks WHERE title LIKE ?", (f"Redo #{b} alone:%",))
+    assert redo and push.pr_branch_of(p, redo) == "", push.pr_branch_of(p, redo)
+    assert f"> pr_branch: {branch}" in redo["spec"]
+    assert f"Redo #{redo['id']} and re-review" in ev["text"], ev["text"]
+
+
+def test_route_resolves_a_remote_qualified_push_branch(env):
+    """delivery.push_branch '<remote>/<branch>' with only the remote-tracking ref: a change conflicting
+    with it is routed to its own branch, not silently shared."""
+    from ttp import integrate
+    p = _int_project(env)
+    root = p.root
+    base = _git_out(root, "rev-parse", "HEAD").strip()
+    _git_out(root, "remote", "add", "up", str(root))
+    scratch = env["tmp"] / "up-wt"
+    _git_out(root, "worktree", "add", "-q", "-b", "tmp-up", str(scratch), base)
+    theirs = _int_commit(scratch, "x.py", "theirs\n", "theirs")
+    _git_out(root, "update-ref", "refs/remotes/up/rel/one", theirs)
+    _git_out(root, "worktree", "add", "-q", "-b", "tmp-mine", str(env["tmp"] / "mine-wt"), base)
+    mine = _int_commit(env["tmp"] / "mine-wt", "x.py", "mine\n", "mine")
+    got = integrate.route(root, {"delivery": {"push_branch": "up/rel/one"}}, {"spec": ""}, mine)
+    assert not got["shared"] and got["why"] == "conflict" and got["files"] == ["x.py"], got

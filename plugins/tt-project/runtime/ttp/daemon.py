@@ -8404,12 +8404,13 @@ class Daemon:
         elif nofix:
             text += f"\nNo automatic fix: {nofix} ({deadwait.NOFIX_EVENT} raised)."
         folded = {id(f) for f in fixes} if fix else set()
-        if failed_fix and getattr(self, "_revert_note", ""):
-            text += self._revert_note
+        revert_note = getattr(self, "_revert_note", "") if failed_fix else ""
+        if revert_note:
+            text += revert_note
             self._revert_note = ""
         if fix:
             moved = ", ".join(f"#{i}" for i in fix[2])
-            text += (f"\nFix #{fix[0]} and re-review #{fix[1]} queued by the daemon"
+            text += (f"\n{'Redo' if revert_note else 'Fix'} #{fix[0]} and re-review #{fix[1]} queued by the daemon"
                      + (f"; {moved} now wait on #{fix[1]}." if moved else "."))
         if check_only:
             text += ("\nCheck-only failure (review_failure: check_only): no automatic fix or re-review. Route the "
@@ -19279,27 +19280,41 @@ class Daemon:
             return None
         grouped, _ = integrate.by_member(fups, sorted(ms))
         tag = spans.new_tag()
+        # All or nothing: a head that still carries a failed member's commits is never re-reviewed or
+        # approved (integrate.landable's rule), so one failed revert puts the branch back as it was.
+        orig = worktree._git(root, "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}", check=False)
         reverted, requeued, new = [], [], ""
         for i in sorted(i for i, v in vs.items() if v == "fail" and i in ms):
             ok, out = integrate.revert_member(root, branch, i, integrate.member_commits(root, i))
             if not ok:
                 self._nofix += f"; reverting #{i} on {branch} failed: {out}"
                 log(self.p, f"review {review['id']}: #{i} not reverted on {branch}: {out}")
-                continue
-            new, m = out, ms[i]
+                if reverted:
+                    r = subprocess.run(["git", "update-ref", f"refs/heads/{branch}", orig, new], cwd=root,
+                                       capture_output=True, text=True, timeout=60)
+                    self._nofix += (f"; so {', '.join(f'#{j}' for j in reverted)} were not reverted either"
+                                    if r.returncode == 0 else
+                                    f"; {branch} could not be put back to {orig[:12]}: {r.stderr.strip()[:200]}")
+                return None
+            new = out
             reverted.append(i)
+        for i in reverted:
+            m = ms[i]
+            # The member's spec is quoted (`> `) so its pr_branch: and update lines are not the Redo's.
+            quoted = "\n".join("> " + ln for ln in (m.get("spec") or "").splitlines())
             requeued.append(db.add_task(
                 f"Redo #{i} alone: " + re.sub(r"^(?:(?:Fix review|Redo) #\d+(?: alone)?: )+", "", m["title"]),
                 "\n".join([
                     f"Task #{i}'s part of shared branch {branch} failed review #{review['id']} past its fix hop, "
-                    f"so the daemon reverted it forward there (commit {new[:12]}, trailer "
+                    f"so the daemon reverted it forward there (head {new[:12]}, trailer "
                     f"{integrate.REVERT_TRAILER}: {i}) and the other members land without it. Redo it alone, "
                     f"on a branch of its own from the base branch, fixing these findings:",
                     _findings(grouped.get(i, []), review, tag),
-                    f"Task #{i}'s spec:\n{m.get('spec') or ''}"]),
+                    f"Task #{i}'s spec:\n{quoted}"]),
                 kind="code", tier=m.get("tier") or "standard", priority=chainprio.of(db, m, review),
                 origin="daemon", budget_usd=float(cfg["budget"]["task_default_usd"].get(m.get("tier") or "standard", 8.0)),
-                labels=[f"continues:{i}", integrate.own_branch_label({"why": "reverted"})], **(pin_of(m) or {})))
+                labels=[f"continues:{i}", integrate.own_branch_label({"why": "reverted"}), worktree.NO_PR_BRANCH],
+                **(pin_of(m) or {})))
         if not reverted:
             return None
         self._nofix = ""

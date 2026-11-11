@@ -303,7 +303,14 @@ def route(repo: Path, cfg: dict, task: dict, head: str, onto: str = "") -> dict:
     branch = integration_branch(cfg)
     if _NO_PUSH.search(task.get("spec") or ""):
         return {"shared": False, "branch": branch, "why": "no_push", "files": []}
-    ref = onto or next((r for r in (f"refs/heads/{branch}", f"refs/remotes/origin/{branch}") if worktree._git(
+    # As push reads delivery.push_branch: a local branch, else <remote>/<rest> naming a known remote's
+    # tracking ref, else origin's.
+    remote, _, rest = branch.partition("/")
+    cands = [f"refs/heads/{branch}"]
+    if rest and remote in (worktree._git(repo, "remote", check=False) or "").split():
+        cands.append(f"refs/remotes/{remote}/{rest}")
+    cands.append(f"refs/remotes/origin/{branch}")
+    ref = onto or next((r for r in cands if worktree._git(
         repo, "rev-parse", "--verify", "--quiet", f"{r}^{{commit}}", check=False)), "")
     if not ref:   # no integration branch yet: the first change starts it
         return {"shared": True, "branch": branch, "files": []}
