@@ -312,6 +312,24 @@ def test_outside_writes_names_each_paths_class_and_its_reason(tmp_path, scratch_
     assert classes(f"python3 -c \"open('{o}/m', 'w').write('z')\" > /dev/null")[f"{o}/m"][0] == "write"
 
 
+def test_outside_writes_reads_an_empty_argument_as_a_word_and_splits_each_command(tmp_path, scratch_home):
+    """An empty argument ('') is a word, not a command break: a write after it is still seen. commands()
+    gives each simple command's words, quoted text as `_`, a `bash -c` script's own commands in its place
+    and no redirect targets, so a tool's name inside a commit message is no run of it."""
+    from ttp import sidefx
+    rd = tmp_path / "run"
+    rd.mkdir()
+    conf = str(scratch_home / ("." + "ssh") / "example-hop.conf")
+    (rd / "output.jsonl").write_text("".join(json.dumps(x) + "\n" for x in _claude_calls(
+        ("Bash", {"command": f"sed -i '' s/a/b/ {conf}"}))))
+    got = {f["path"]: (f["class"], f["why"]) for f in sidefx.scan(rd, str(tmp_path / "wt"))}
+    assert got[conf] == ("write", "sed -i target"), got
+    assert sidefx.commands("git commit -qm 'fix: gh auth login > x' && git credential approve") == [
+        "git commit -qm _", "git credential approve"]
+    assert sidefx.commands("cd d; bash -lc 'echo hi > o | tee p' 2>/dev/null") == ["cd d", "echo hi", "tee p"]
+    assert sidefx.commands("printf '' | gh auth login --with-token") == ["printf ''", "gh auth login --with-token"]
+    assert sidefx.commands("echo 'unclosed") == ["echo 'unclosed"]
+
 def test_outside_writes_keeps_each_calls_status_and_only_a_guards_own_words_refuse_it(tmp_path, scratch_home):
     from ttp import sidefx
     wt, rd, o = tmp_path / "wt", tmp_path / "run", tmp_path / "elsewhere"

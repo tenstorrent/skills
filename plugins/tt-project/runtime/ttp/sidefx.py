@@ -123,7 +123,7 @@ def _local_text(cmd: str, depth: int = 0) -> str:
         spans.append((i, i + len(t)) if i >= 0 else None)
         at = i + len(t) if i >= 0 else at
     new: dict[int, str] = {}
-    punct = [all(c in "();<>|&\n" for c in t) for t in toks]
+    punct = [bool(t) and all(c in "();<>|&\n" for c in t) for t in toks]   # an empty argument ('') is a word
     commands = _commands(toks, punct)
     for i, t in enumerate(toks):
         name = t.rsplit("/", 1)[-1]
@@ -403,6 +403,43 @@ CODE_WRITE_RE = re.compile(r"""open\([^)]*['"][wax]|\.write(?:_text|_bytes)?\(|u
                            r"""replace\(|mkdir|chmod|writeFile|appendFile|copyfile|shutil\.(?:copy|move)""")
 
 
+def commands(cmd: str, depth: int = 0) -> list[str]:
+    """Each simple command `cmd` runs, as its words without redirects, an argument holding a space (quoted
+    text: a commit message, an echo's) as `_` and an empty one as '' (a `bash -c` script's own commands in
+    its place): what a check for a command's words reads, so a tool's name inside a quoted argument is no
+    run of it. [cmd] when the shell cannot split it."""
+    try:
+        lex = shlex.shlex(cmd, posix=True, punctuation_chars="();<>|&\n")
+        lex.whitespace, lex.whitespace_split, lex.commenters = " \t\r", True, ""
+        toks = list(lex)
+    except ValueError:
+        return [cmd]
+    out: list[str] = []
+
+    def flush(words: list[str]) -> None:
+        k = next((k for k, w in enumerate(words[:-2]) if w.rsplit("/", 1)[-1] in SHELLS
+                  and re.fullmatch(r"-\w*c", words[k + 1])), None) if depth < 3 else None
+        if k is not None:
+            out.extend(commands(words[k + 2], depth + 1))
+        elif words:
+            out.append(" ".join("_" if re.search(r"\s", w) else w or "''" for w in words))
+
+    words, skip = [], False
+    for t in toks:
+        if t and all(c in "();<>|&\n" for c in t):
+            if any(c in "<>" for c in t) and not t.endswith("("):
+                skip = True   # a redirect: its target is no word of the command
+            else:
+                flush(words)
+                words = []
+        elif skip:
+            skip = False
+        else:
+            words.append(t)
+    flush(words)
+    return out
+
+
 def classify_paths(cmd: str, home: str, cwd: str, run_dir: str, depth: int = 0) -> dict[str, tuple[str, str]]:
     """{path: (class, why)} for the paths a shell command names: `write` (a redirect, tee or output-flag
     target, a writing verb's target, a copy's destination, inline code that writes), `executed` (the
@@ -415,7 +452,7 @@ def classify_paths(cmd: str, home: str, cwd: str, run_dir: str, depth: int = 0) 
         toks = list(lex)
     except ValueError:
         return {}
-    punct = [all(c in "();<>|&\n" for c in t) for t in toks]
+    punct = [bool(t) and all(c in "();<>|&\n" for c in t) for t in toks]   # an empty argument ('') is a word
     out: dict[str, tuple[str, str]] = {}
     base: str | None = None
 
