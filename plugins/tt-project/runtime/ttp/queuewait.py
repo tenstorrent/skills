@@ -189,59 +189,11 @@ def _config_hold(db, cfg: dict) -> dict | None:
     return {"queue": "workers", "cap": cap} if cap and n >= cap else None
 
 
-def _lock_label(path) -> dict:
-    try:
-        h = json.loads(path.read_text() or "{}")
-    except (OSError, ValueError):
-        return {}
-    return h if isinstance(h, dict) else {}
-
-
-def _who(p, h: dict) -> str:
-    m = re.search(r"\btask #(\d+)", str(h.get("holder") or ""))
-    tid = h.get("task_id") or (m and m[1])
-    pid = h.get("pid")
-    return (f"{p.name} task #{tid}" if tid else str(h.get("holder") or "a push")) + (f" (pid {pid})" if pid else "")
-
-
-def push_locks(p, now: float | None = None) -> tuple[list[str], list[str]]:
-    """(holding, waiting) of the project's push locks right now, read from the lock files: each push-branch
-    lock held (its holder, task and since when) and each detached push (`ttp push --detach`, whose run lock
-    it holds for its whole life) of another task, waiting its turn, with the minutes it has waited. The push
-    queue's rows miss both: a push run by hand or by a review holds the lock outside the queue."""
-    from urllib.parse import unquote
-    from . import locks, timefmt
-    now = time.time() if now is None else now
-    d = p.state / "locks"
-    try:
-        files = sorted(d.glob("push:*.lock"))
-    except OSError:
-        return [], []
-    held = [(x, _lock_label(x)) for x in files if not locks.any_free([x])]
-    branch = [(x, h) for x, h in held if not x.name.startswith("push:run-")]
-    hold, mine = [], set()
-    for x, h in branch:
-        name = unquote(x.name[len("push:"):].rsplit(".", 2)[0])
-        since = float(h.get("since") or 0)
-        hold.append(f"{_who(p, h)} holds the push lock {name}"
-                    + (f" since {timefmt.short(since, p, now)}" if since else ""))
-        mine.add(str(h.get("task_id") or h.get("holder") or ""))
-    wait = []
-    for x, h in sorted(((x, h) for x, h in held if x.name.startswith("push:run-")),
-                       key=lambda xh: float(xh[1].get("since") or now)):
-        if not branch or str(h.get("task_id") or "") in mine:
-            continue   # the holder's own run lock, or no branch lock taken: nobody waits on it
-        since = float(h.get("since") or now)
-        wait.append(f"detached push of {_who(p, h)} waiting {(now - since) / 60:.0f} min")
-    return hold, wait
-
-
 def _holders(db, p, queue: str, res: str, cfg: dict, now: float | None = None) -> dict:
     if queue == "push":
         rows = db.q("SELECT task, status FROM push_queue WHERE status IN ('approved','pushing') ORDER BY id")
-        hold, wait = push_locks(p, now)
-        out = {"cap": 1, "running": [f"{p.name} task #{r['task']}" for r in rows if r["status"] == "pushing"] + hold,
-               "queued": [f"{p.name} task #{r['task']}" for r in rows if r["status"] == "approved"] + wait}
+        out = {"cap": 1, "running": [f"{p.name} task #{r['task']}" for r in rows if r["status"] == "pushing"],
+               "queued": [f"{p.name} task #{r['task']}" for r in rows if r["status"] == "approved"]}
         _push_turns(p, out, time.time() if now is None else now)
         return out
     if queue in ("device", "lock") and res:
