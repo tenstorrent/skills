@@ -1010,7 +1010,8 @@ def standing_lines(p: Project) -> list[str]:
     heads = charter_headings(p)
     if heads:
         lines.append(f"## Charter sections (exact headings and numbers, for charter_update `replaces`): {heads}")
-    if loose := restriction_source.unsourced_items(p.charter_path.read_text() if p.charter_path.exists() else ""):
+    if loose := restriction_source.unsourced_items(p.charter_path.read_text() if p.charter_path.exists() else "",
+                                                   restriction_source.history_items(p)):
         lines += [f"## {restriction_source.ADVISORY_HEAD} (they cite no user message, the Brief or a harness gate, so "
                   f"they bind nothing and are never asked about: remove each with charter_update section Restrictions, "
                   f"`quote` it, empty `text`; no user word or `over` needed. Keep one only by resending it with "
@@ -1919,11 +1920,16 @@ def next_task_slot(db, cap: int, now: float | None = None, review: bool = False)
 def parse_start_after(raw: Any, now: float | None = None, tz: str | None = None) -> float | None:
     """`start_after` as epoch seconds, or None for `now` and times already past. A delay counts
     from now; an ISO time without a zone is in zone `tz` (the project's home zone; this machine's
-    without one). Tasks keep the result as epoch seconds, so a later zone change never moves it."""
+    without one). A bare clock time ('15:17') is today's there, tomorrow's once over an hour past. Tasks keep the result as epoch seconds, so a later zone change never moves it."""
     now = time.time() if now is None else now
     s = str(raw).strip()
     if isinstance(raw, str) and s.lower() in ("", "now"):
         return None
+    clock = re.fullmatch(r"([01]?[0-9]|2[0-3]):([0-5][0-9])( [A-Za-z]{2,5})?", s) if isinstance(raw, str) else None
+    if clock:   # a bare clock time ('15:17', '15:17 PST'): its next time in the home zone, see below
+        zone = ZoneInfo(timefmt.valid(tz)) if timefmt.valid(tz) else None
+        day = datetime.fromtimestamp(now, zone).date().isoformat()
+        s = f"{day}T{int(clock[1]):02d}:{clock[2]}{clock[3] or ''}"
     if not isinstance(raw, str) or not re.fullmatch(START_AFTER_RE, s):
         raise ValueError(f"start_after {raw!r}: use a delay such as 90m, 6h or 3d, an ISO date or time "
                          f"such as 2026-10-05T09:00, or now")
@@ -1950,6 +1956,8 @@ def parse_start_after(raw: Any, now: float | None = None, tz: str | None = None)
             at = at_dt.timestamp()
         except ValueError as e:
             raise ValueError(f"start_after {raw!r}: {e}") from None
+        if clock and at <= now - 3600:   # passed over an hour ago: tomorrow's; within the hour: now
+            at += 86400
     if at > now + MAX_DEFER_S:
         raise ValueError(f"start_after {raw!r} is more than {MAX_DEFER_S // 86400} days away")
     return at if at > now else None
@@ -3738,8 +3746,10 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                         replaced = "\n".join(secs[si][1]) if si is not None else ""
                         if si is not None and " ".join(secs[si][0][3:].split()).lower().startswith("restriction"):
                             gone = "\n".join(secs[si][1])
-                    loose_drop = (restriction_source.drops_unsourced("", body=gone) if gone else
-                                  restriction_source.drops_unsourced(p.charter_path.read_text(), quote=quote)
+                    rec = restriction_source.history_items(p)
+                    loose_drop = (restriction_source.drops_unsourced("", body=gone, recorded=rec) if gone else
+                                  restriction_source.drops_unsourced(p.charter_path.read_text(), quote=quote,
+                                                                     recorded=rec)
                                   if quote and _DATED.sub("", section).lower().startswith("restriction") else False)
                     # resting only on the owner's agent's words: shown as relayer-ordered, relay.HELD refused;
                     # a relayer-ordered cite counts in any turn, a later one with no messages too
@@ -8231,7 +8241,8 @@ def _charter_update(p: Project, section: str, text: str, quote: str, replaces: s
         name = " ".join(old_head[3:].split())
         if name.lower().startswith("brief"):
             raise ValueError("charter_update: the Brief is the user's own words and is never replaced")
-        loose = not any(restriction_source.sourced(" ".join(x)) for x in restriction_source.split_items(
+        rec = restriction_source.history_items(p)
+        loose = not any(restriction_source.sourced(" ".join(x), rec) for x in restriction_source.split_items(
             "\n".join(old_body)))   # every item unsourced: advisory, the coordinator's to drop
         if name.lower().startswith("restriction") and not (by_word or loose):
             raise ValueError(f"charter_update: replacing the restriction section {name!r} {why}")
@@ -8253,11 +8264,12 @@ def _charter_update(p: Project, section: str, text: str, quote: str, replaces: s
                              f"sections: " + "; ".join(n for n in names if n))
         t, hits = _charter_quote_spot(sections, t, section, quote)
         body = "\n".join(sections[t][1])
-        loose = len(hits) == 1 and restriction_source.unsourced_span(body, *hits[0], _items(body))
+        rec = restriction_source.history_items(p)
+        loose = len(hits) == 1 and restriction_source.unsourced_span(body, *hits[0], _items(body), rec)
         if names[t].lower().startswith("restriction") and not (by_word or loose):
             raise ValueError(f"charter_update: removing or replacing a restriction {why}")
         cited = cited or names[t].lower().startswith("restriction") and any(
-            restriction_source.cited_span(body, *h, _items(body)) for h in hits)
+            restriction_source.cited_span(body, *h, _items(body), rec) for h in hits)
         if len(hits) != 1:
             near = _closest_items(sections, quote) if not hits else []
             raise ValueError(f"charter_update: `quote` matches {len(hits)} times in {names[t]!r}; quote the exact "

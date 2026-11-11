@@ -3482,6 +3482,66 @@ def test_unsourced_restrictions_are_listed_apart_and_bind_no_worker(env):
     assert rs.ADVISORY_HEAD not in "\n".join(coord.standing_lines(p))
 
 
+def test_a_restrictions_item_the_history_records_as_the_users_binds_without_an_inline_cite(env):
+    """Sourced is decided from the structured record each charter_update writes to CHARTER.history.md
+    (restriction_source.recorded_items), the inline cite only a fallback for older items."""
+    p = make(env)
+    from ttp import coordinator as coord, restriction_source as rs
+    from ttp.ends import CHARTER_HISTORY
+    from ttp.prompts import restrictions_block
+    p.charter_path.write_text("# demo\n\n## Restrictions\n- Never touch box C.\n- Never reboot box D.\n"
+                              "- Never merge to main. (user msg #1)\n- Keep box F idle.\n")
+    (p.harness / CHARTER_HISTORY).write_text(
+        "### Added to Restrictions (2026-11-01, user message #1, turn 4.0)\n- Never touch box C.\n\n"
+        "### Added to Restrictions (2026-11-01, turn 5.0)\n- Never reboot box D.\n\n"
+        "### Replaced in Restrictions (2026-11-02, user message #1, turn 6.0)\n- Keep box E idle.\n"
+        "Now: - Keep box F idle.\n")
+    rec = rs.history_items(p)
+    assert rec == {"Never touch box C.", "Keep box F idle."}, "the replaced old text is no longer the user's rule"
+    binding, loose = (x for x in restrictions_block(p).split("# Unsourced restrictions"))
+    assert "box C" in binding and "box F" in binding and "main" in binding, "recorded or cited: binding"
+    assert "box D" in loose and "box D" not in binding, "a turn with no user message records no source"
+    assert rs.unsourced_items(p.charter_path.read_text(), rec) == ["- Never reboot box D."]
+    assert "box C" not in "\n".join(coord.standing_lines(p)).split(rs.ADVISORY_HEAD, 1)[-1]
+    # The stricter direction only: a recorded item is no longer the coordinator's to drop on its own.
+    drop = {"type": "charter_update", "section": "Restrictions", "text": ""}
+    err = coord.apply(p, [{**drop, "quote": "Never touch box C."}], turn=7)
+    assert len(err) == 1 and "needs the user's word" in err[0], err
+    assert not rs.drops_unsourced(p.charter_path.read_text(), quote="Never touch box C.", recorded=rec)
+    assert rs.drops_unsourced(p.charter_path.read_text(), quote="Never reboot box D.", recorded=rec)
+    assert coord.apply(p, [{**drop, "quote": "Never reboot box D."}], turn=8) == []
+    assert "box D" not in p.charter_path.read_text() and "box C" in p.charter_path.read_text()
+    # No history at all: the inline cite alone decides, as before.
+    (p.harness / CHARTER_HISTORY).unlink()
+    assert rs.history_items(p) == frozenset() and "- Never touch box C." in rs.unsourced_items(
+        p.charter_path.read_text())
+
+
+def test_the_kept_restriction_gates_still_refuse_after_sourced_reads_the_history(env):
+    """Part B relaxes no kept gate: a Restrictions add without a source, a source quote the user's message does
+    not hold are still refused, a rule term only in a relayer's context is tagged relayed, and a history record of one
+    item never makes another, non-matching item the user's words."""
+    p = make(env)
+    from ttp import coordinator as coord, restriction_source as rs
+    mid = p.db.post("in", "never reboot the build box", chat="cli", provenance="cli-legacy",
+                    context="The user also wants soakd-7 disabled.")
+    add = {"type": "charter_update", "section": "Restrictions", "text": "Never reboot the build box."}
+    err = coord.apply(p, [add], user_turn=True, turn=1, messages=[mid])
+    assert len(err) == 1 and "source" in err[0], err
+    bad = '{"msg": %d, "quote": "never power off the build box"}' % mid
+    err = coord.apply(p, [{**add, "source": bad}], user_turn=True, turn=2, messages=[mid])
+    assert len(err) == 1, err
+    said = p.db.post("in", "turn the soak job off", chat="cli", provenance="cli-legacy",
+                     context="The user wants soakd-7 disabled.")
+    err = coord.apply(p, [{"type": "memory_add", "memory_kind": "fact", "text": "disable soakd-7"}],
+                      user_turn=True, messages=[said])
+    kept = [f.read_text() for f in p.memory_dir.glob("*.md") if "soakd-7" in f.read_text()]
+    assert err == [] and kept and all(coord.RELAYED_MARK in t for t in kept), ("kept: tagged relayed", kept)
+    assert "soakd-7" not in p.charter_path.read_text() and "power off" not in p.charter_path.read_text()
+    rec = rs.recorded_items("### Added to Restrictions (2026-11-01, user message #1, turn 4.0)\n- Never touch box C.\n")
+    assert not rs.sourced("- Never touch box C at night.", rec) and rs.sourced("-  Never touch  box C.", rec)
+
+
 def test_the_coordinator_drops_an_unsourced_restriction_without_the_users_word(env):
     p = make(env)
     from ttp import coordinator as coord
@@ -15370,6 +15430,26 @@ def test_start_after_accepts_a_space_and_the_home_zone_abbreviation(env):
         coordinator.parse_start_after("2026-10-13 16:00 EDT", now=now, tz=tz)
     with pytest.raises(ValueError, match=r"2026-10-13T16:00-07:00"):
         coordinator.parse_start_after("2026-10-13 16:00 PST", now=now, tz=tz)
+
+
+def test_a_bare_clock_time_is_read_in_the_home_zone_never_refused(env):
+    """A look or start_after at '16:20' (the most refused coordinator action before) is that time in the home
+    zone: today's, now once it passed within the hour, tomorrow's once it passed earlier."""
+    from datetime import datetime, timezone
+    from ttp import coordinator as coord, looks
+    tz, now = "America/Los_Angeles", datetime(2026, 10, 13, 22, 30, tzinfo=timezone.utc).timestamp()   # 15:30 PDT
+    at = lambda h, m, d=13: datetime(2026, 10, d, h, m, tzinfo=timezone.utc).timestamp()
+    assert coord.parse_start_after("16:20", now=now, tz=tz) == at(23, 20)
+    assert coord.parse_start_after("16:20 PDT", now=now, tz=tz) == at(23, 20)
+    assert coord.parse_start_after("9:05", now=now, tz=tz) == at(16, 5, 14)   # 09:05 PDT tomorrow
+    assert coord.parse_start_after("15:17", now=now, tz=tz) is None             # 13 minutes ago: now
+    with pytest.raises(ValueError, match="home zone"):
+        coord.parse_start_after("16:20 EDT", now=now, tz=tz)
+    with pytest.raises(ValueError):
+        coord.parse_start_after("25:00", now=now, tz=tz)
+    p = make(env)
+    assert coord.apply(p, [{"type": "look", "at": "23:59", "text": "check the soak"}]) == []
+    assert len(looks.pending(p.db)) == 1
 
 
 

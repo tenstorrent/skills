@@ -108,10 +108,11 @@ def test_a_retired_claim_planted_in_every_binding_place_is_found_and_memory_name
     from ttp import echoes, schedule as sched
     p = make(env)
     claim = "Retry the stuck card with `legacy-hard-reset` first."
-    # A charter replacement: a memory retirement's phrase a live entry holds is current (advisory), below.
+    # A charter replacement: a memory retirement's phrase a live entry holds is current (advisory), below. The
+    # memory copy predates the replacement (one written after it is a rewording: current, see below).
+    mem = p.add_memory("Recovery: retry the stuck card with LEGACY-HARD-RESET first.", kind="decision")
     echoes.record(p.db, "charter 'Recovery' quote replaced", claim, "Use the documented reset command.")
     root = p.root
-    mem = p.add_memory("Recovery: retry the stuck card with LEGACY-HARD-RESET first.", kind="decision")
     p.charter_path.write_text(p.charter_path.read_text().rstrip() + "\n\n## Recovery\n- Run legacy-hard-reset.\n")
     sched.upsert(p.db, "cmd", "command", "1h", payload={"command": "legacy-hard-reset --all"})
     sched.upsert(p.db, "pre", "llm", "1d", payload={"spec": "sum up", "precheck": "test -x legacy-hard-reset"})
@@ -1171,3 +1172,57 @@ def test_an_ack_survives_an_appended_line_that_re_quotes_the_acked_phrase(env):
     lines = [" ".join(ln.split()) for ln in spec.splitlines() if any(ph in echoes._flat(ln) for ph in own)]
     p.db.set_kv(echoes.ACK_KEY, {f"{rec['id']}:task:{task}:spec": hashlib.sha256("\n".join(lines).encode()).hexdigest()})
     assert cls(rec) == "acknowledged" and cls(other) == "directive"
+
+
+def test_a_charter_retirements_phrase_a_current_item_or_a_later_memory_entry_states_is_advisory(env):
+    """A charter retirement never retires a phrase a current sourced Restrictions item states, or one a memory
+    entry written after it holds whole (a rewording, that entry included). A memory copy older than the
+    retirement and a phrase nothing current states keep their fix orders."""
+    from ttp import echoes
+    p = make(env)
+    stale = p.add_memory("Ops: drain with `queue-flush-slow` nightly.", kind="decision")
+    echoes.record(p.db, "charter 'Ops' quote replaced", "Drain with `queue-flush-slow` and `queue-park-all`.",
+                  "Drain with the documented command.", found=["queue-flush-slow", "queue-park-all"])
+    p.charter_path.write_text(p.charter_path.read_text().rstrip() + "\n\n## Restrictions\n"
+                              "- Never run queue-park-all on a shared box (user msg #7).\n")
+    later = p.add_memory("Ops: keep `queue-flush-slow` for the archive drain only.", kind="decision")
+    stated = p.db.add_task("stated", "Do not run queue-park-all here.")
+    reworded = p.db.add_task("reworded", "Use queue-flush-slow on the archive.")
+    hits = {h["key"].split(":", 1)[1]: h for h in echoes.scan(p)}
+    assert hits[f"task:{stated}:spec"]["class"] == "advisory", hits
+    assert hits[f"task:{stated}:spec"]["why"] == "a current Restrictions item with its source states it: no action"
+    assert hits[f"task:{reworded}:spec"]["class"] == "advisory", hits
+    assert f"memory:{later.stem}" not in {k for k, h in hits.items() if h["class"] == "directive"}
+    # Without the later entry, the older memory copy and the task are fix orders again.
+    p.forget_memory(later.stem)
+    hits = {h["key"].split(":", 1)[1]: h for h in echoes.scan(p)}
+    assert hits[f"task:{reworded}:spec"]["class"] == "directive", hits
+    assert hits[f"memory:{stale.stem}"]["class"] == "directive", hits
+
+
+def test_a_retired_phrase_that_only_cites_user_messages_still_cited_is_advisory(env):
+    """A retired entry's citation header ("owner's order, user msg #41") quoted in a task is advisory while live
+    memory or the charter still cites every message it names, for memory and charter retirements alike; a
+    header citing a message nothing live cites, and a real retired rule phrase, keep their fix orders."""
+    from ttp import echoes
+    p = make(env)
+    assert echoes._cite_only("owner's order, user msg #41") and echoes._msgs("user msgs #41, #42") == {"41", "42"}
+    assert not echoes._cite_only("user msg #41: run sweep-legacy")
+    old = p.add_memory("Owner's order, user msg #41: run `sweep-legacy` hourly.", kind="decision")
+    p.add_memory("Run `sweep-fast` hourly (user msg #41).", kind="decision")   # cites #41, other words
+    echoes.record(p.db, f"memory [{old.stem}] superseded by [x]", "Owner's order, user msg #41: run sweep-legacy.",
+                  "", found=["owner's order, user msg #41", "sweep-legacy"])
+    p.forget_memory(old.stem)
+    echoes.record(p.db, "charter 'Ops' quote replaced", "Per user msg #41 verbatim, sweep-legacy hourly.", "",
+                  found=["per user msg #41 verbatim"])
+    hdr = p.db.add_task("hdr", "Context: owner's order, user msg #41; per user msg #41 verbatim.")
+    rule = p.db.add_task("rule", "Then run sweep-legacy on each box.")
+    hits = [h for h in echoes.scan(p) if h["key"].split(":", 1)[1] == f"task:{hdr}:spec"]
+    assert hits and all(h["class"] == "advisory" for h in hits), hits
+    assert {h["why"] for h in hits} == {"it only cites user messages live memory or the charter still cites: no action"}
+    assert [h["class"] for h in echoes.scan(p) if h["key"].split(":", 1)[1] == f"task:{rule}:spec"] == ["directive"]
+    # Nothing live cites #41 any more: the header is a fix order again.
+    for e in p._memory_entries():
+        p.forget_memory(e["name"])
+    hits = [h for h in echoes.scan(p) if h["key"].split(":", 1)[1] == f"task:{hdr}:spec"]
+    assert hits and any(h["class"] == "directive" for h in hits), hits

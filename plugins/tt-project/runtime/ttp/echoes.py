@@ -41,8 +41,12 @@ stands. So is a phrase a live memory entry holds whole (_live_holds): its supers
 or another entry anywhere but in that entry itself (an older copy of current words). One only part of it holds,
 or only the retired entry, keeps its class, and so does a live entry's own copy of words the user withdrew,
 unless it is the superseder (that copy is the one to fix). Accepted gap: while such a stale live copy stands,
-other places quoting the same words get no fix order from that retirement. A user Correction or a charter
-replacement keeps its fix orders. A supersede whose only user cite names
+other places quoting the same words get no fix order from that retirement. A charter retirement likewise
+never retires a phrase a current sourced Restrictions item states (_states; sourced also by its structured
+record, restriction_source.recorded_items) or a memory entry written after it holds whole, that entry included:
+a rewording is no withdrawal. For both, a phrase that only cites user messages (_cite_only: an entry's
+citation header) is advisory while live memory or the charter still cites each of them (_msgs). A user
+Correction keeps its fix orders, and so does a charter replacement on every other phrase. A supersede whose only user cite names
 messages older than the entry it retires (where a rule came from, such as a current item's source) is one
 coordinator entry replacing another: SUPERSEDED (coordinator._withdrawn `since`). One the coordinator dropped on its own is SUPERSEDED, never
 WITHDRAWN, and one a record stored before the flag holds is UNVERIFIED (_unsourced). `export` is the read-only full list
@@ -611,10 +615,10 @@ def _live_holds(live: dict[str, str], ph: str, rec: dict) -> set[str]:
     return {"*"} if m and f"memory:{m.group(1)}" in keys else keys
 
 
-def _current(charter: str) -> list[str]:
+def _current(charter: str, recorded: set[str] | frozenset = frozenset()) -> list[str]:
     """The flattened text of each current Restrictions item that binds (restriction_source.sourced: a user
     cite, the Brief or a harness gate, its own or its sub-heading's), with the heading (section or
-    sub-heading) it stands under, alone and followed by the item."""
+    sub-heading) it stands under, alone and followed by the item. `recorded`: restriction_source.recorded_items."""
     from .prompts import charter_sections
     from .restriction_source import sourced, split_items
     out: list[str] = []
@@ -627,10 +631,10 @@ def _current(charter: str) -> list[str]:
             text = " ".join(" ".join(it).split())
             if text.startswith("#"):
                 name = text.lstrip("#").strip()
-                cited = sourced(name)   # a cite on the sub-heading itself covers its items
+                cited = sourced(name, recorded)   # a cite on the sub-heading itself covers its items
                 if cited:
                     out.append(_flat(name))
-            elif cited or sourced(text):
+            elif cited or sourced(text, recorded):
                 out += [_flat(text), _flat(name), _flat(f"{name} {text}")]
     return list(dict.fromkeys(out))
 
@@ -665,6 +669,25 @@ def _states(units: list[str], ph: str) -> bool:
     return False
 
 
+# A cite of user messages: "user msg #4", "user messages #4, #5", "msg #4/#6" (the numbers, _msgs).
+_MSG_CITE = re.compile(r"\b(?:user(?:'s|s)?\s+(?:msgs?|messages?)?|msgs?|messages?)\s*(#\d+(?:\s*(?:,|/|&|and)\s*#\d+)*)")
+# What a phrase that only cites holds besides message numbers: cite words, dates and punctuation (_cite_only).
+_CITE_WORDS = re.compile(r"\b(?:user|users|owner|owners|agent|agents|relayer|relayer-ordered|msgs?|messages?|orders?|"
+                         r"words?|verbatim|via|per|by|from|in|the|and|cited?|cites|see|origin|s)\b|#\d+|"
+                         r"\d{4}-\d{2}-\d{2}|[^\w#]+")
+
+
+def _msgs(text: str) -> set[str]:
+    """The user message numbers `text` cites (_MSG_CITE)."""
+    return {n for m in _MSG_CITE.finditer(text.lower()) for n in re.findall(r"\d+", m.group(1))}
+
+
+def _cite_only(ph: str) -> bool:
+    """Whether phrase `ph` only cites user messages, such as an entry's citation header ("owner's order, user
+    msg #12"): message numbers, cite words and dates, nothing that states a rule."""
+    return bool(_msgs(ph)) and not _CITE_WORDS.sub("", ph).strip()
+
+
 def records(p, now: float | None = None) -> list[dict]:
     """The live retirements (kept RETIRED_DAYS), each with its kind (see _kind; _unsourced)."""
     now = time.time() if now is None else now
@@ -696,8 +719,12 @@ def scan(p, now: float | None = None, historical: list[dict] | None = None,
         charter = p.charter_path.read_text()
     except OSError:
         charter = ""
-    units = _current(charter)
+    from .project import _stamp_ts
+    from .restriction_source import history_items
+    units = _current(charter, history_items(p))
     live = {key[7:]: flat for key, _, _, flat in where if key.startswith("memory:")}
+    born = {e["name"]: _stamp_ts(e.get("created") or "") for e in p._memory_entries()}
+    cited = _msgs(" ".join(live.values()) + " " + charter)   # messages live memory or the charter still cites
     out, seen = [], set()
     for rec in sorted(recs, key=lambda r: -r.get("at", 0)):
         kept = _superseders(rec, recs, live)
@@ -710,11 +737,19 @@ def scan(p, now: float | None = None, historical: list[dict] | None = None,
             from .restriction_audit import still_stated
             stated = still_stated(charter, rec.get("old") or "")
         weak = {ph for ph in own if _weak(ph) or _fragment(ph, rec.get("old") or "")}
-        # A memory entry's retirement never retires what a current cited Restrictions item or a live entry states.
+        # A memory entry's retirement never retires what a current cited Restrictions item or a live entry states;
+        # a charter one, what a current cited Restrictions item or a memory entry written after it states.
         mem = bool(_MEMORY_RETIRED.match(rec.get("source") or ""))
-        stated_now = {ph for ph in own if _states(units, ph)} if mem else set()
-        held = {ph: _live_holds(live, ph, rec) for ph in own if ph not in stated_now} if mem else {}
-        cur = stated_now | {ph for ph, keys in held.items() if keys}
+        chart = not mem and (rec.get("source") or "").lower().startswith("charter ")
+        stated_now = {ph for ph in own if _states(units, ph)} if mem or chart else set()
+        later = {n: flat for n, flat in live.items() if born.get(n, 0) > rec.get("at", 0)}
+        held = ({ph: _live_holds(live, ph, rec) for ph in own if ph not in stated_now} if mem else
+                {ph: {"*"} if any(_hit({}, flat, [ph]) for flat in later.values()) else set()
+                 for ph in own if ph not in stated_now} if chart else {})
+        # A phrase that only cites user messages (a citation header) is current while live memory or the
+        # charter still cites every one of them: the rule that came from them lives on in another wording.
+        cites = {ph for ph in own if (mem or chart) and _cite_only(ph) and _msgs(ph) <= cited}
+        cur = stated_now | cites | {ph for ph, keys in held.items() if keys}
         own.sort(key=lambda ph: ph in weak or ph in cur)   # a governing phrase first: a hit rests on it when it can
         skip = set(rec.get("skip") or ())
         mine = _own_decision(rec)
@@ -730,6 +765,8 @@ def scan(p, now: float | None = None, historical: list[dict] | None = None,
                 why = (f"still stated in {stated}: no action" if stated else
                        "a current Restrictions item with its source states it: no action" if ph in stated_now else
                        "a live memory entry states it: no action" if held.get(ph, set()) - {key} else
+                       "it only cites user messages live memory or the charter still cites: no action"
+                       if ph in cites else
                        "a coordinator's own decision retired, no user rule withdrawn: no action" if mine else
                        "" if rec["kind"] == WITHDRAWN and ph not in weak else
                        "origin not recorded: nothing shows the user withdrew this rule" if rec["kind"] == UNVERIFIED
