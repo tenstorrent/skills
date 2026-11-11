@@ -45,7 +45,10 @@ again on a timer while the same owners stay stalled; an owner not yet covered th
 attached after an earlier owner ended) opens the next episode, and once no owner is late the episode ends.
 Milestones have stable keys, absolute due times and evidence_required. The coordinator adds them on
 its obligation action; an owner records a checked milestone with `ttp obligation receipt <id>
-"<evidence>" --milestone <key>`, leaving the obligation open. A missing milestone receipt at its due
+"<evidence>" --milestone <key>`, leaving the obligation open. An owner's plain receipt delivers only its own
+task's part: the obligation (with its open milestones) closes once every other open owner filed its part,
+or on the coordinator's receipt. `ttp obligation reopen <id> "<why>"` undoes a receipt filed by
+mistake. A missing milestone receipt at its due
 time raises one durable high episode, even with fresh owner progress or a healthy heartbeat. A milestone
 episode that ends (its receipt, the obligation's receipt, a drop) retires its still-queued event, so the
 coordinator is not woken for it. Status and the web app show the next deadline in the project's home time zone.
@@ -500,6 +503,12 @@ def record(p, oid: str, kind: str, evidence: str, task: int | None, now: float |
             if _accepts(o) and (why := _receipt_unmet(p.db, o, evidence, task)):
                 raise ValueError(f"{oid}: receipt refused: {why}, so the acceptance is not met. Record it once an "
                                  f"owner meets it, or give evidence that does (a commit, a file, a met hand-off)")
+            if own is not None and (rest := _parts_open(p.db, o, str(task))):
+                own["receipt"] = {"at": now, "evidence": evidence}
+                _record_progress(own, evidence, now)
+                p.db.set_kv(KV, st)
+                return (f"#{task}'s part of {oid} has its receipt; {oid} stays owed until "
+                        f"{', '.join(rest)} have receipts or the coordinator files the receipt")
             o["receipt"] = {"at": now, "task": task, "evidence": evidence}
             _retire(p.db, now, "obligation receipt", prefix=f"obligation:{oid}:milestone:")
             _retire(p.db, now, "promise kept", prefix=f"obligation:{oid}:promise")
@@ -518,6 +527,41 @@ def _receipt_unmet(db, o: dict, evidence: str, task: int | None) -> str | None:
     cited = list(dict.fromkeys(int(t) for t in TASK_REF.findall(evidence or "") if int(t) in ids))
     whys = [unmet_handoff(db, ids, only=[t]) for t in cited]
     return "; ".join(whys) if cited and all(whys) else None
+
+
+def _parts_open(db, o: dict, tid: str) -> list[str]:
+    """The other owners `o` still waits on besides task `tid`: still open (not done, failed or cancelled:
+    an ended owner's work was carried on by a later owner) and without a part receipt. A worker's receipt
+    delivers only its own task's part, so the obligation closes on the last part's receipt (or the
+    coordinator's); its open milestones close with it, as for a sole owner's receipt."""
+    others = [t for t, own in o["owners"].items() if t != tid and not own.get("receipt")]
+    if not others:
+        return []
+    marks = ",".join("?" * len(others))
+    live = {str(r["id"]) for r in db.q(f"SELECT id FROM tasks WHERE id IN ({marks}) AND status NOT IN "
+                                       "('done', 'failed', 'cancelled')", [int(t) for t in others])}
+    return ["#" + t for t in sorted(others, key=int) if t in live]
+
+
+def reopen(p, oid: str, why: str, now: float | None = None) -> str:
+    """Undo a receipt filed by mistake (the user or the coordinator): the obligation is owed again, its owners'
+    clocks restart now and the cleared receipt is kept under `reopened`."""
+    why = " ".join(str(why or "").split())[:EVIDENCE_MAX]
+    if not why:
+        raise ValueError("reopen needs a reason: why the receipt was filed by mistake")
+    now = time.time() if now is None else now
+    with p.db.tx():
+        st = _load(p.db)
+        o = _need(st, oid)
+        parts = {t: own.pop("receipt") for t, own in o["owners"].items() if own.get("receipt")}
+        if not o["receipt"] and not parts:
+            return f"{oid} has no receipt; nothing to reopen"
+        o.setdefault("reopened", []).append({"at": now, "why": why, "receipt": o["receipt"], "parts": parts})
+        o["receipt"] = None
+        for own in o["owners"].values():
+            own["progress"] = max(float(own.get("progress") or 0), now)
+        p.db.set_kv(KV, st)
+    return f"{oid} reopened: it is owed again" + (f" ({len(parts)} part receipt(s) cleared)" if parts else "")
 
 
 def append_run(run_dir: Path, oid: str, kind: str, evidence: str, task: str, milestone: str | None = None) -> None:
@@ -718,7 +762,7 @@ def overdue(o: dict, now: float, cover: dict[str, tuple] | None = None) -> list[
         return [("", age)] if age >= CLOCK_S else []
     out = []
     for tid, own in sorted(o["owners"].items(), key=lambda kv: int(kv[0])):
-        if tid in cover or own.get("ask") is not None or own.get("sleep") is not None:
+        if tid in cover or own.get("ask") is not None or own.get("sleep") is not None or own.get("receipt"):
             continue
         age = now - _last(own)
         if age >= CLOCK_S:
@@ -1178,6 +1222,8 @@ def _held_open(db, o: dict) -> str | None:
 def _owner_state(tid: str, own: dict, cover: tuple[str, str] | None, late: set, now: float) -> str:
     """One owner in lines(): 'done, no receipt' once it ended, 'waiting on ask <id>' while an open ask
     covers it, 'asleep on <what>' while it sleeps on a model-free wake, else its clock (and OVERDUE when late)."""
+    if own.get("receipt"):
+        return f"#{tid} part delivered"
     if cover and cover[0] == "finished":
         return f"#{tid} {cover[1]}, no receipt"
     if cover and cover[0] == "asleep":

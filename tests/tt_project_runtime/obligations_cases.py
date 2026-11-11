@@ -1085,3 +1085,39 @@ def test_obligation_actions_that_change_nothing_owed_are_notes_and_kept_gates_st
     assert any("no milestone nope" in x and "its milestones: none" in x for x in probs), probs
     assert any(x.startswith("charter_update") for x in probs) and p.charter_path.read_text() == before
     assert any("touches a safety line" in x for x in probs), probs
+
+
+def test_a_worker_receipt_closes_only_its_own_part_and_reopen_undoes_a_mistaken_receipt(env, monkeypatch):
+    """Worker #297 filed a receipt for the before numbers alone and closed the user's whole order (msg #329):
+    a worker's receipt delivers its own task's part; the order stays owed while another open owner has
+    none. An ended owner's part was carried on by a later owner. `reopen` undoes a receipt."""
+    from ttp import obligations as ob
+    p, d, now, tid, check = _ob_setup(env, monkeypatch)
+    other = p.db.add_task("the fixes", "make them", kind="code", tier="standard", origin="coordinator")
+    oid = ob.add(p, "before numbers and the fixes", [tid, other], now=now)
+    msg = ob.record(p, oid, "receipt", "before numbers posted", tid, now=now + 60)
+    o = ob.get(p.db, oid)
+    assert not o["receipt"] and o["owners"][str(tid)]["receipt"] and f"#{other}" in msg
+    assert all(t != str(tid) for t, _ in ob.overdue(o, now + 3 * ob.CLOCK_S))   # a delivered part has no clock
+    assert any(f"#{tid} part delivered" in line for line in ob.lines(p.db, now=now + 120))
+    assert "no longer owed" in ob.record(p, oid, "receipt", "fixes landed", other, now=now + 240)
+    assert ob.get(p.db, oid)["receipt"]["task"] == other
+    assert "reopened" in ob.reopen(p, oid, "filed for a part only", now=now + 300)
+    o = ob.get(p.db, oid)
+    assert not o["receipt"] and not any(own.get("receipt") for own in o["owners"].values())
+    assert o["reopened"][0]["receipt"]["task"] == other and str(tid) in o["reopened"][0]["parts"]
+    assert "nothing to reopen" in ob.reopen(p, oid, "again", now=now + 360)
+    with pytest.raises(ValueError):
+        ob.reopen(p, oid, " ")
+
+
+def test_a_worker_receipt_closes_the_obligation_once_the_other_owners_ended(env, monkeypatch):
+    """A done or cancelled other owner (a carrier chain: fix, review, continue) never holds the receipt."""
+    from ttp import obligations as ob
+    p, d, now, tid, check = _ob_setup(env, monkeypatch)
+    old = p.db.add_task("first try", "x", kind="work", tier="light", origin="coordinator")
+    oid = ob.add(p, "the deliverable", [old, tid], now=now)
+    p.db.update_task(old, status="done")
+    assert "no longer owed" in ob.record(p, oid, "receipt", "built it", tid, now=now + 60)
+    oid2 = ob.add(p, "another", [tid], now=now)
+    assert "no longer owed" in ob.record(p, oid2, "receipt", "single owner", tid, now=now + 60)

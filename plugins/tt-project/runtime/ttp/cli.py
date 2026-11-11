@@ -10868,7 +10868,7 @@ def cmd_heal(a) -> None:
 
 
 def cmd_obligation(a) -> None:
-    """`ttp obligation add|attach|progress|receipt|drop|list`: urgent deliverables owed to the user (obligations.py).
+    """`ttp obligation add|attach|progress|receipt|drop|reopen|list`: urgent deliverables owed to the user (obligations.py).
     Inside a run, progress and receipts go to the run's file and the daemon files them for its task; so
     do a task's on_pass_cmd's (note-only context: the waiting run's directory)."""
     from . import obligations as ob
@@ -10911,6 +10911,10 @@ def cmd_obligation(a) -> None:
             if len(a.args) != 2:
                 die('usage: ttp obligation drop <id> "<why it is no longer owed>"')
             print(ob.drop(p, a.args[0], a.args[1]))
+        elif a.action == "reopen":
+            if len(a.args) != 2:
+                die('usage: ttp obligation reopen <id> "<why the receipt was a mistake>"')
+            print(ob.reopen(p, a.args[0], a.args[1]))
         elif a.json:
             print(json.dumps(ob.items(p.db), indent=1))
         else:
@@ -15563,9 +15567,10 @@ def main(argv: list[str] | None = None) -> None:
 
     s = sub.add_parser("obligation", help="urgent deliverables owed to the user: add, attach owner tasks, "
                                           "record progress and receipts, drop one recorded by mistake, list")
-    s.add_argument("action", choices=["add", "attach", "progress", "receipt", "drop", "list"], help="what to do")
+    s.add_argument("action", choices=["add", "attach", "progress", "receipt", "drop", "reopen", "list"],
+                   help="what to do")
     s.add_argument("args", nargs="*", help="add: the text; attach: <id> <task>...; progress/receipt: <id> <evidence>; "
-                                           "drop: <id> <why>")
+                                           "drop: <id> <why>; reopen: <id> <why> (a receipt filed by mistake)")
     s.add_argument("--owner", type=int, action="append", help="add: a required owner task (repeatable)")
     s.add_argument("--milestone", help="receipt: the milestone key; leaves the obligation open")
     s.add_argument("--task", type=int, help="progress/receipt outside a run: the owner task it is for")
