@@ -166,7 +166,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
                 # re-ask the watcher (no answer wakes), and cap_hard_h hours force the wake. enabled
                 # false: every wake starts a turn, as before
                 "wake_gate": {"enabled": True, "max_skips": 4, "max_skip_h": 4.0, "cap_hard_h": 24.0,
-                              "backoff_s": 600, "max_backoff_s": 3600, "jev_skip_below": 0.25},
+                              "backoff_s": 600, "max_backoff_s": 3600, "jev_skip_below": 0.25,
+                              # a wait's own checks whose log has not advanced this long are not held
+                              "checks_stall_s": 1800},
                 # every task that could start waits on hosts this machine cannot reach (probe exit 255),
                 # nothing runs: one normal alert this long into the outage (0: never); the outage ends
                 # once no probe has said unreachable for the debounce (netwait.py). Hosts whose ssh route

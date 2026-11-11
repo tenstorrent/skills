@@ -176,3 +176,34 @@ def test_the_hourly_module_names_no_host():
     found = [n.value for n in ast.walk(ast.parse(src)) if isinstance(n, ast.Constant) and isinstance(n.value, str)
              and hostish.search(n.value)]
     assert not found, found
+
+
+def test_the_tests_row_shows_no_total_spend_and_labels_the_model_spend_of_check_waits_by_reason(env):
+    """#8307: tests are CPU work. The row shows check runs and CPU-hours, never the day's total spend, and
+    apart, labelled, the runs woken while their task waited on its own checks: wakes, $ and wake reasons."""
+    from ttp import hourly, trainstats
+    p = make(env)
+    now = time.time()
+    tid = p.db.add_task("land a change", "s", kind="code", tier="standard", origin="user")
+    other = p.db.add_task("unrelated", "s", kind="work", tier="standard", origin="user")
+    wait = p.runs / "wait"
+    wait.mkdir(parents=True)
+    (wait / "result.json").write_text(json.dumps({"status": "waiting", "retry_when": f"ttp checks --result {wait}"}))
+
+    def run(task, started, usd, reason=None, d=None):
+        note = {"wake": {"reason": reason}} if reason else {}
+        p.db.x("INSERT INTO runs(task, role, status, started, cost_usd, note, dir) VALUES(?, 'worker', 'done', ?, ?, "
+               "?, ?)", (task, started, usd, json.dumps(note), str(d or p.runs / f"none-{started}")))
+    run(tid, now - 3000, 40.0, d=wait)               # the run that handed off on its checks
+    run(tid, now - 2000, 0.5, "timer", d=wait)      # woken while waiting: counted, and waits again
+    run(tid, now - 1000, 1.25, "checks_failed")     # woken by the checks' failure: counted
+    run(other, now - 900, 100.0, "timer")           # spend unrelated to checks: in no test figure
+    rows = trainstats.checkwait(p.db, now - 86400, now)
+    assert [(w["reason"], w["usd"]) for w in rows] == [("timer", 0.5), ("checks_failed", 1.25)]
+    day = trainstats.report(p.db, p.runs, "UTC", days=1, now=now)["days"][-1]
+    assert (day["checkwait_wakes"], day["checkwait_usd"]) == (2, 1.75)
+    row = next(r for r in hourly.rows(p, now) if r.startswith("Tests in 24 h"))
+    assert row.startswith("Tests in 24 h (CPU work, no model spend): 0 check runs, 0.0 CPU-h; 0 landed"), row
+    assert ("Model spend of runs woken while waiting on their checks: 2 wakes, $1.75: "
+            "checks_failed 1 $1.25, timer 1 $0.50") in row, row
+    assert "141" not in row and "$40" not in row and "$100" not in row

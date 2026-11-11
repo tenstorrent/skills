@@ -9,6 +9,11 @@ recorded (cpu_s, from #2220 on; older runs recorded none), the train check hours
 run that started that day cost, and approval to landed (median, p90 by nearest rank) of the day's landings.
 Dollars are billed dollars only: a plan-billed run's list price is `virtual_usd`, shown apart, and its
 plan's window points are shown per landed change instead (planuse.py; user msg #140).
+
+Tests are CPU work: no model spend is counted as test cost. What the checks do cost in model calls is apart
+(checkwait): the worker and review runs that started while their task waited on its own `ttp checks` (the task's
+previous run handed off with `retry_when` `ttp checks --result <dir>`), counted per day with their dollars and
+split by why the run woke (its note's wake reason: timer, checks_failed, probe_passed, spec_change, ...).
 """
 from __future__ import annotations
 
@@ -16,6 +21,7 @@ import json
 import re
 import subprocess
 import time
+from pathlib import Path
 
 from . import planuse, timefmt
 
@@ -46,7 +52,8 @@ def report(db, runs_dir, tz: str, days: float = 7, now: float | None = None, cfg
         return out.setdefault(timefmt.today(ts, tz), {
             "landed": 0, "direct": 0, "checks_runs": 0, "full_runs": 0, "trains": 0, "train_check_runs": 0,
             "cpu_s": 0.0, "cpu_unrecorded": 0, "train_check_s": 0.0, "train_cpu_s": 0.0, "train_cpu_unrecorded": 0,
-            "usd": 0.0, "virtual_usd": 0.0, "_wait": []})
+            "usd": 0.0, "virtual_usd": 0.0, "checkwait_wakes": 0, "checkwait_usd": 0.0,
+            "checkwait_virtual_usd": 0.0, "checkwait_by_reason": {}, "_wait": []})
 
     for r in db.q("SELECT q.created, COALESCE(b.ended, q.updated) at_ FROM push_queue q LEFT JOIN push_batches b "
                   "ON b.id=q.batch WHERE q.status IN ('pushed','landed') AND COALESCE(b.ended, q.updated)>=?",
@@ -90,6 +97,12 @@ def report(db, runs_dir, tz: str, days: float = 7, now: float | None = None, cfg
             d["cpu_s"] += float(rec["cpu_s"])
         else:
             d["cpu_unrecorded"] += 1
+    for w in checkwait(db, since, now):
+        d = day(w["started"])
+        d["checkwait_wakes"] += 1
+        d["checkwait_virtual_usd" if cls.is_plan(w["provider"], w["account"], w["started"]) else "checkwait_usd"] += w["usd"]
+        n, usd = d["checkwait_by_reason"].get(w["reason"], (0, 0.0))
+        d["checkwait_by_reason"][w["reason"]] = (n + 1, round(usd + w["usd"], 2))
     rows = []
     for k in sorted(out):
         d = out[k]
@@ -102,9 +115,41 @@ def report(db, runs_dir, tz: str, days: float = 7, now: float | None = None, cfg
                      "full_per_landed": per(d["full_runs"] + d["trains"]),
                      "cpu_h_per_landed": per((d["cpu_s"] + d["train_cpu_s"]) / 3600),
                      "usd_per_landed": per(d["usd"]),
+                     "checkwait_usd_per_landed": per(d["checkwait_usd"]),
                      "landing_median_h": round(m / 3600, 1) if (m := _pct(wait, 0.5)) is not None else None,
                      "landing_p90_h": round(m / 3600, 1) if (m := _pct(wait, 0.9)) is not None else None})
     return {"days": rows, "since": since, "until": now}
+
+
+CHECKS_WAIT_RE = re.compile(r"\bchecks\s+--result\s+(\S+)")
+
+
+def checkwait(db, since: float, until: float) -> list[dict]:
+    """The worker and review runs started in [since, until) that woke while their task waited on its own checks:
+    the task's run before them handed off with a `retry_when` naming `ttp checks --result <dir>`. Each row:
+    run, task, started, provider, account, usd (its cost) and reason (its note's wake reason, 'unknown' if
+    none). A task's first run in the window looks at its run just before the window."""
+    rows = db.q("SELECT id, task, role, provider, account, started, cost_usd, note, dir FROM runs WHERE task IS NOT "
+                "NULL AND role!='coordinator' AND task IN (SELECT DISTINCT task FROM runs WHERE started>=? AND "
+                "started<?) AND started<? ORDER BY task, id", (since, until, until))
+    out, prev = [], {}
+    for r in rows:
+        before, prev[r["task"]] = prev.get(r["task"]), r["dir"]
+        if (r["started"] or 0) < since or not before:
+            continue
+        try:
+            res = json.loads((Path(before) / "result.json").read_text())
+        except (OSError, ValueError):
+            continue
+        if not isinstance(res, dict) or not CHECKS_WAIT_RE.search(str(res.get("retry_when") or "")):
+            continue
+        try:
+            reason = (json.loads(r["note"] or "{}").get("wake") or {}).get("reason") or "unknown"
+        except (ValueError, AttributeError):
+            reason = "unknown"
+        out.append({"run": r["id"], "task": r["task"], "started": float(r["started"]), "provider": r["provider"],
+                    "account": r["account"], "usd": float(r["cost_usd"] or 0), "reason": str(reason)})
+    return out
 
 
 BUMP_RE = re.compile(r"^tt-project: \d+\.\d+\.\d+ \(")   # the push queue's version-bump commit
@@ -172,6 +217,11 @@ def per_landed_lines(rows: list[dict], ref: str = "") -> list[str]:
             for w in rows]
 
 
+def checkwait_reasons(by: dict) -> str:
+    """'timer 12 $3.10, checks_failed 4 $1.20': wake reasons by count, most first."""
+    return ", ".join(f"{k} {n} ${u:.2f}" for k, (n, u) in sorted(by.items(), key=lambda x: (-x[1][0], x[0])))
+
+
 def text(r: dict, name: str) -> str:
     def f(v, unit=""):
         return "-" if v is None else f"{v}{unit}"
@@ -185,9 +235,12 @@ def text(r: dict, name: str) -> str:
             + f", train checks {d['train_check_s'] / 3600:.1f} h wall, {d['train_cpu_s'] / 3600:.1f} CPU-h"
             + (f" ({d['train_cpu_unrecorded']} trains recorded no CPU)" if d["train_cpu_unrecorded"] else "")
             + "; "
-            f"${f(d['usd_per_landed'])}/landed "
+            f"all model spend ${f(d['usd_per_landed'])}/landed "
             f"(${d['usd']:.2f}{f' billed, ${v:.2f} virtual on a plan' if (v := d.get('virtual_usd')) else ''}); approved to landed median {f(d['landing_median_h'], ' h')}, "
-            f"p90 {f(d['landing_p90_h'], ' h')}")
+            f"p90 {f(d['landing_p90_h'], ' h')}"
+            + (f"; model spend while waiting on checks: {d['checkwait_wakes']} wakes, ${d['checkwait_usd']:.2f}"
+               + (f" (+${v:.2f} virtual)" if (v := d.get('checkwait_virtual_usd')) else "")
+               + f" ({checkwait_reasons(d['checkwait_by_reason'])})" if d.get("checkwait_wakes") else ""))
     if not r["days"]:
         lines.append("  nothing in the window")
     if r.get("per_landed"):

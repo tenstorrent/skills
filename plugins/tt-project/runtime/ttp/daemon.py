@@ -14790,8 +14790,9 @@ class Daemon:
                     continue
                 if not self._hold_waiting(t, prev, now):
                     continue
-            elif t["id"] in self._probes or now - self._probed.get(t["id"], 0) < self._probe_gap(t["id"]):
-                continue
+            elif t["id"] in self._probes or now - self._probed.get(t["id"], 0) < self._probe_gap(t["id"]) \
+                    and not checksgone.ended_since(probe, self._probed.get(t["id"], 0)):
+                continue   # checks that just ended are asked at once: their end wakes model-free, not the timer
             self._start_probe(t["id"], probe, now)
             got = self._probe_rc.get(t["id"])
             if t["id"] not in self._probes and got and got[2] == probe and (t["not_before"] or 0) > now \

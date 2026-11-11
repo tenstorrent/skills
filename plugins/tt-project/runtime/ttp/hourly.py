@@ -11,7 +11,10 @@ Rows, in order:
 2. The project host's load (1-minute load per core: now, last-hour mean and max, from SAMPLES) and each spill
    host's use in 24 h (check runs placed there, passed there, run again on the project host after failing
    there; from each run's checks record). Hosts are named only by their alias from the machines list.
-3. Test runs, CPU-hours and $ per landed change in 24 h (trainstats).
+3. Test runs and CPU-hours per landed change in 24 h (trainstats). Tests are CPU work, so the row shows no
+   test dollars; it shows apart, labelled, the model spend of runs woken while their task waited on its own
+   checks (trainstats.checkwait: wakes, $ and wake reasons). Total spend stays in the spend reports
+   (`ttp status`, `ttp spend-today`), never in this row.
 4. Queue: open tasks, push queue entries and the oldest approval's age.
 5. Approved-to-landed median today (trainstats) and tasks created in 24 h.
 
@@ -158,10 +161,17 @@ def rows(p, now: float | None = None) -> list[str]:
     days = trainstats.report(db, p.runs, tz, days=1, now=now, cfg=cfg)["days"]
     landed = sum(d["landed"] for d in days)
     runs_n = sum(d["checks_runs"] + d["train_check_runs"] for d in days)
-    cpu_h, usd = sum(d["cpu_s"] for d in days) / 3600, sum(d["usd"] for d in days)
-    out.append(f"Tests in 24 h: {runs_n} check runs, {cpu_h:.1f} CPU-h, ${usd:.2f}; {landed} landed"
-               + (f", so {runs_n / landed:.1f} runs, {cpu_h / landed:.2f} CPU-h and ${usd / landed:.2f} per landed change"
-                  if landed else ""))
+    cpu_h = sum(d["cpu_s"] + d["train_cpu_s"] for d in days) / 3600
+    wakes, wusd = sum(d["checkwait_wakes"] for d in days), sum(d["checkwait_usd"] for d in days)
+    by: dict = {}
+    for d in days:
+        for k, (n, u) in d["checkwait_by_reason"].items():
+            by[k] = (by.get(k, (0, 0.0))[0] + n, by.get(k, (0, 0.0))[1] + u)
+    out.append(f"Tests in 24 h (CPU work, no model spend): {runs_n} check runs, {cpu_h:.1f} CPU-h; {landed} landed"
+               + (f", so {runs_n / landed:.1f} runs and {cpu_h / landed:.2f} CPU-h per landed change" if landed else "")
+               + f". Model spend of runs woken while waiting on their checks: {wakes} wakes, ${wusd:.2f}"
+               + (f" (${wusd / landed:.2f} per landed change)" if landed and wakes else "")
+               + (f": {trainstats.checkwait_reasons(by)}" if by else ""))
     open_n = db.one(f"SELECT COUNT(*) n FROM tasks WHERE status IN ({','.join('?' * len(OPEN))})", OPEN)["n"]
     q = db.q(f"SELECT status, created FROM push_queue WHERE status IN ({','.join('?' * len(QUEUED))})", QUEUED)
     oldest = min((float(r["created"]) for r in q if r["status"] == "approved"), default=None)

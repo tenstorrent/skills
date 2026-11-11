@@ -15,6 +15,14 @@ passed, or another wake path made it due). In this order:
    --check`) still running with no exit code, a lock (`ttp lock --probe`) still held by a live
    holder, `ttp checks --result` / `ttp push --result` still pending, and a probe that passed with the
    same answer the last turn already saw and handed the same wait back on (no new evidence).
+   A wait on its own `ttp checks --result` run is held before the events of step 1 (checks_hold): while
+   those checks are queued, or run and their log still advances (within `waiting.wake_gate.checks_stall_s`), a
+   timer, a planned check, a spec change or a changed progress line starts no turn (a spec change
+   applies when they end: daemon._probe_passed); only an escalated wake, a real wake reason and the
+   `cap_hard_h` ceiling do. Checks that ended while the probe's last answer was still "not yet" re-defer
+   a minute, so the probe's own model-free path (a pass records on_pass, a failure wakes as
+   checks_failed) settles them, at most `max_skips` times. Neither counts toward the `max_skips` cap.
+   Checks that died or stalled are not held: the fallback wake stays.
 3. Jev, where its `wake_gate` use is allowed (jevuse) and it is reachable, judges the rest from the
    wait, the probe's last answer, the task's last note and its next step. It skips only when it is
    confident no turn is needed.
@@ -49,7 +57,8 @@ DEFAULTS = {"enabled": True,
             "cap_hard_h": 24.0,      # hours since the last real turn before it wakes with no question
             "backoff_s": 600,        # the first re-defer when the hand-off asked for less; doubles per skip
             "max_backoff_s": 3600,   # the longest one re-defer lasts
-            "jev_skip_below": 0.25}  # Jev skips only when its "a turn would find work" score is below this
+            "jev_skip_below": 0.25,  # Jev skips only when its "a turn would find work" score is below this
+            "checks_stall_s": 1800}  # running checks whose log has not advanced this long are no longer held
 SOFT_WOKE = ("", "probe passed")     # wake reasons that are no event on their own
 JEV_TIMEOUT_S = 10.0
 # A wake the daemon could not start yet (slots full, a hold): (db path, task) -> (fingerprint, at,
@@ -106,6 +115,31 @@ class Decision:
         out = {"log": self.log_id, "by": self.by, "skips": skips, "seen": self.seen, "key": wait_key(prev)}
         out.update({k: self.extra[k] for k in ("tier", "flag", "model") if self.extra.get(k)})
         return out
+
+
+def checks_hold(cfg: dict, probe: Any, now: float, answer: tuple | None = None) -> tuple[str, str] | None:
+    """("running", why) while the `ttp checks --result` run a wait probe names is queued, or runs and its
+    log advanced within `checks_stall_s` (checksgone.last_progress); ("ended", why) once its checks.rc is
+    written while the probe's last `answer` is still a stale "not yet"; else None (no checks wait,
+    checks that died or stalled, or a probe that already answered)."""
+    got = bud.result_wait(probe)
+    if not got or got[0] != "checks":
+        return None
+    from . import checksgone
+    st = checksgone.state(Path(got[1]))
+    if st == "finished":
+        if answer is not None and (answer[0] in _not_yet() or answer[0] == "timeout"):
+            return "ended", "its checks just ended; the probe's model-free path settles them"
+        return None
+    if st == "queued":
+        return "running", "its checks are queued"
+    if st != "running":
+        return None
+    stall = float(settings(cfg)["checks_stall_s"])
+    last = checksgone.last_progress(str(probe))
+    if last is None or stall and now - last >= stall:
+        return None
+    return "running", "its checks still run and their log advances"
 
 
 def pending(p, cfg: dict, probe: Any) -> str | None:
@@ -308,14 +342,27 @@ def decide(p, cfg: dict, task: dict, prev: dict, now: float, probe: tuple | None
         woke = ""
     ended = float(last_run["ended"] or last_run["started"] or now) if last_run else float(prev["waiting_since"])
     # Its probe_match reads the probe's "not yet" output as a wait: a changed progress line is no event.
-    over = len(skips) - int(gate.get("plan_skips") or 0) >= int(s["max_skips"]) or now - ended >= float(s["max_skip_h"]) * 3600
+    over = len(skips) - int(gate.get("plan_skips") or 0) - int(gate.get("hold_skips") or 0) >= int(s["max_skips"]) or now - ended >= float(s["max_skip_h"]) * 3600
     capped = f"{len(skips)} skip(s), {(now - ended) / 3600:.1f} h since its last turn"
     matchwait = bool(probe and probe[0] in _not_yet() and probematch.verdict(prev, probe[1] if match_out is None else match_out) == "wait")
+    hard = now - ended >= max(float(s["cap_hard_h"]), float(s["max_skip_h"])) * 3600
+    try:
+        held = None if prev.get("escalated_wake") or woke else checks_hold(cfg, prev.get("retry_when"), now, probe)
+    except Exception:   # a rule that cannot tell holds nothing
+        held = None
     d = None
     if prev.get("escalated_wake"):
         d = Decision(True, "event", "an escalated wake")
     elif woke not in SOFT_WOKE:
         d = Decision(True, "event", f"woken because: {woke[:200]}")
+    elif held and held[0] == "running" and not hard:
+        # A timer, a planned check, a spec change or a new progress line cannot make running checks
+        # end sooner; their end (or their death or stall) wakes the task.
+        d = Decision(False, "rule", held[1] + ("; its spec change applies when they end"
+                                               if spec_sha and last.get("spec_sha") and last["spec_sha"] != spec_sha else ""),
+                     extra={"hold": "checks"})
+    elif held and held[0] == "ended" and int(gate.get("end_skips") or 0) < int(s["max_skips"]):
+        d = Decision(False, "rule", held[1], extra={"delay_s": 60.0, "hold": "checks", "ended": True})
     elif spec_sha and last.get("spec_sha") and last["spec_sha"] != spec_sha:
         d = Decision(True, "event", "its spec changed since the last turn")
     elif gate.get("seen") and seen and gate["seen"] != seen and not matchwait:
@@ -368,10 +415,10 @@ def decide(p, cfg: dict, task: dict, prev: dict, now: float, probe: tuple | None
         base = min(max(bud_retry_s(prev), float(s["backoff_s"])), float(s["max_backoff_s"]) or 3600)
         delay = min(base * 2 ** len(skips), float(s["max_backoff_s"]) or base)
         want = float(d.extra.get("delay_s") or delay)
-        if over and not d.extra.get("pending"):   # a skip at the cap is no re-ask each minute
+        if over and not d.extra.get("pending") and d.extra.get("hold") != "checks":   # a skip at the cap is no re-ask each minute
             want = max(want, float(s["backoff_s"]))
-        until = ended + max(float(s["cap_hard_h"]), float(s["max_skip_h"])) * 3600 if over \
-            else ended + float(s["max_skip_h"]) * 3600
+        until = ended + max(float(s["cap_hard_h"]), float(s["max_skip_h"])) * 3600 \
+            if over or d.extra.get("hold") == "checks" else ended + float(s["max_skip_h"]) * 3600
         d.delay_s = max(60.0, min(want, until - now))
     d.log_id = log(db, task["id"], d, wake_cost(db, cfg, now) if not d.wake and not d.extra.get("pending") else 0.0, now)
     d.extra = {**d.extra, "skips": skips}
@@ -416,6 +463,9 @@ def skipped(prev: dict, d: Decision, now: float) -> dict:
                         "since": gate.get("since") or now, "by": d.by, "reason": d.reason[:200]}
     if pending:
         out["wake_gate"]["pending"] = True
+    if d.extra.get("hold") == "checks" or gate.get("hold_skips"):   # nor does a skip while its own checks run
+        out["wake_gate"]["hold_skips"] = int(gate.get("hold_skips") or 0) + (d.extra.get("hold") == "checks")
+        out["wake_gate"]["end_skips"] = int(gate.get("end_skips") or 0) + bool(d.extra.get("ended"))
     if prev.get("plan_by") or gate.get("plan_skips"):   # a planned check's skip brings no cap wake closer
         out["wake_gate"]["plan_skips"] = int(gate.get("plan_skips") or 0) + bool(prev.get("plan_by"))
     return out

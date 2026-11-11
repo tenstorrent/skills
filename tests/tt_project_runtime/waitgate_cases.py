@@ -89,7 +89,7 @@ def test_the_wake_gate_rules_skip_only_what_is_mechanically_still_pending(env, m
     monkeypatch.setattr(cli, "_checks_alive", lambda info: alive[0])
     tid = _gate_task(p, tmp_path, f"ttp checks --result {checks}")
     d = _gate_decide(p, tid)
-    assert not d.wake and d.reason == "its checks still run", d
+    assert not d.wake and d.reason.startswith("its checks still run"), d
     alive[0] = False
     assert _gate_decide(p, tid).wake
     alive[0] = True
@@ -991,3 +991,65 @@ def test_a_passed_start_when_hands_its_probe_output_to_the_first_run(env, monkey
     assert len(started) == 1 and started[0][1][probewake.KEY]["out"] == "ready: build 42"
     assert "ready: build 42" in started[0][0] and started[0][1][probewake.KEY]["cmd"] == "test -e /tmp/x"
     assert p.db.kv(probewake.KV_PREFIX + str(tid)) is None, "the start record outlived its dispatch"
+
+
+def _own_checks(monkeypatch, tmp_path, name="own-checks"):
+    """A run dir whose detached checks run (pid file, alive) with a fresh checks.log; the alive flag list."""
+    from ttp import cli
+    d = tmp_path / name
+    d.mkdir()
+    (d / cli.CHECKS_PID).write_text(json.dumps({"pid": 1, "started": "x"}))
+    (d / "checks.log").write_text("smoke 3/9\n")
+    alive = [True]
+    monkeypatch.setattr(cli, "_checks_alive", lambda info: alive[0])
+    return d, alive
+
+
+def test_running_own_checks_hold_a_timer_spec_change_or_new_progress_line_until_they_end_or_stall(
+        env, monkeypatch, tmp_path):
+    """#8307: a run waiting on its own `ttp checks --result` is not woken while those checks run and their
+    log advances: not by its timer, a spec change or a changed progress line. An escalated wake, a real
+    wake reason and the hard cap still wake it; checks that stalled or died fall back to the old path."""
+    p = make(env)
+    from ttp import waitgate
+    d, alive = _own_checks(monkeypatch, tmp_path)
+    tid = _gate_task(p, tmp_path, f"ttp checks --result {d}", note={"spec_sha": "old"})
+    _gate_set(p, tid, wake_gate={"seen": waitgate.evidence(1, "checks running 3/9"), "log": [1]})
+    for kw in ({}, {"spec_sha": "new"}, {"probe": (1, "checks running 7/9")}):
+        r = _gate_decide(p, tid, **{"spec_sha": "old", **kw})
+        assert not r.wake and r.by == "rule" and r.extra["hold"] == "checks", (kw, r)
+    assert "spec change applies when they end" in _gate_decide(p, tid, spec_sha="new").reason
+    # a hold skip brings no cap wake closer
+    held = waitgate.skipped(json.loads(p.db.task(tid)["result"]), r, time.time())
+    assert held["wake_gate"]["hold_skips"] == 1 and held["wake_gate"]["end_skips"] == 0
+    _gate_set(p, tid, woke="its checks failed (exit 1)")
+    assert _gate_decide(p, tid).wake
+    _gate_set(p, tid, woke="")
+    hard = _gate_task(p, tmp_path, f"ttp checks --result {d}", ended_ago=25 * 3600)
+    assert _gate_decide(p, hard).by == "cap"
+    old = time.time() - 3600
+    os.utime(d / "checks.log", (old, old))
+    os.utime(d / "checks.pid", (old, old))
+    r = _gate_decide(p, tid, spec_sha="new")   # stalled: the spec change wakes it as before
+    assert r.wake and r.reason == "its spec changed since the last turn", r
+    alive[0] = False   # died: not held either
+    assert waitgate.checks_hold(p.config(), f"ttp checks --result {d}", time.time()) is None
+
+
+def test_own_checks_that_ended_under_a_stale_not_yet_answer_re_defer_a_minute_for_the_model_free_path(
+        env, monkeypatch, tmp_path):
+    p = make(env)
+    from ttp import checksgone, cli, waitgate
+    d, _ = _own_checks(monkeypatch, tmp_path)
+    probe = f"ttp checks --result {d}"
+    tid = _gate_task(p, tmp_path, probe)
+    before = time.time() - 1
+    assert not checksgone.ended_since(probe, before)
+    (d / cli.CHECKS_RC).write_text("0\n")
+    assert checksgone.ended_since(probe, before) and not checksgone.ended_since("exit 1", 0)
+    r = _gate_decide(p, tid, probe=(1, "checks running 7/9"))
+    assert not r.wake and r.extra.get("ended") and r.delay_s == 60.0, r
+    assert waitgate.skipped(json.loads(p.db.task(tid)["result"]), r, time.time())["wake_gate"]["end_skips"] == 1
+    assert _gate_decide(p, tid, probe=(0, "checks passed")).wake   # the probe answered: no hold
+    _gate_set(p, tid, wake_gate={"end_skips": 4, "hold_skips": 4, "log": [1, 2, 3, 4]})
+    assert _gate_decide(p, tid, probe=(1, "checks running 7/9")).wake   # at most max_skips such re-defers

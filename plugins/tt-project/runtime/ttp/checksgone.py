@@ -82,6 +82,22 @@ def last_progress(probe: str) -> float | None:
     return best
 
 
+def ended_since(probe: str, at: float) -> bool:
+    """Whether checks `probe` waits on wrote their checks.rc at or after `at` (the probe's last run), so the
+    probe runs again now and its pass or failure takes its model-free path at once, not after the poll
+    gap. A plain stat per run dir; a probe naming no checks is False."""
+    from .cli import CHECKS_RC
+    if "checks" not in str(probe or ""):
+        return False
+    for d in run_dirs(probe):
+        try:
+            if (d / CHECKS_RC).stat().st_mtime >= at:
+                return True
+        except OSError:
+            continue
+    return False
+
+
 def gone(probe: str) -> list[Path]:
     """The run dirs `probe` waits on whose checks are neither queued, running nor finished."""
     return [d for d in run_dirs(probe) if state(d) == "gone"]
