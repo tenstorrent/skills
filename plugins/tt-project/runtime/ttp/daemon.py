@@ -17634,6 +17634,10 @@ class Daemon:
 
         At most twice its slots run at once among the tasks that use a resource either way: more
         would only queue in `ttp lock` on a worker slot and a wall clock that other work could use.
+        Config `resources_tasks.<name>` sets that cap apart from the lock slots (shared.task_cap): a
+        multi-box alias runs many tasks while `ttp lock <name>` still serializes. A `read:<name>` task
+        (task_add `resources_read`) only reads records there under `ttp lock --shared`: it counts
+        toward no cap and is held only by pauses, user orders and the project's pre-grant check.
 
         None when all are free, else the first hold found, as data (dispatch's recorded hold reason,
         which the stall check reads instead of working it out again): {"kind": "pause", "resource"}
@@ -17676,7 +17680,7 @@ class Daemon:
         for res in _shared(task):
             lock = locks.canonical(self.cfg, res)
             users = [t["id"] for t in running if lock in _locks_of(_shared(t) + _exclusive(t))]
-            if len(users) >= 2 * shared.slots(self.p, lock, self.cfg):
+            if len(users) >= shared.task_cap(self.p, lock, self.cfg):
                 return {"kind": "busy", "resource": res, "tasks": users}
         for res in _exclusive(task):
             lock = locks.canonical(self.cfg, res)

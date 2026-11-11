@@ -184,6 +184,18 @@ def own_slots(cfg: dict, res: str) -> int:
         return 1
 
 
+def task_cap(p, res: str, cfg: dict | None = None) -> int:
+    """How many of this project's tasks naming the resource may run at once: config
+    `resources_tasks.<name>` (at least 1), else twice its `ttp lock` slots (slots()). Only dispatch reads
+    it, so a multi-box alias can run many tasks while `ttp lock <name>` still admits its slots."""
+    cfg = cfg if cfg is not None else p.config()
+    try:
+        own = int((cfg.get("resources_tasks") or {}).get(res) or 0)
+    except (TypeError, ValueError, AttributeError):
+        own = 0
+    return max(1, own) if own else 2 * slots(p, res, cfg)
+
+
 def _counts(res: str) -> dict[str, dict]:
     """{project dir: {"project", "slots"}} as recorded, without projects whose directory is gone."""
     try:

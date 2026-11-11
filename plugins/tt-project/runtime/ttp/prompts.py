@@ -395,6 +395,11 @@ def _resource_line(task: dict) -> str:
                 f"`ttp lock <name> -- <command>` (or through its own queue)\n")
     if held:
         out += f"held for this whole run (and on while a job you `ttp detach` runs): {', '.join(held)}\n"
+    read = [lb.split(":", 1)[1] for lb in labels if lb.startswith("read:")]
+    if read:
+        out += (f"read-only resources: {', '.join(read)}; only read records there (ssh reads, ledgers, logs), "
+                f"each command as `ttp lock --shared <name> -- <command>`; never run a device job or change "
+                f"a service there\n")
     return out
 
 

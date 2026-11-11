@@ -7569,6 +7569,79 @@ def test_only_exclusive_resources_serialize_whole_tasks(env):
 
 
 
+def test_a_resources_dispatch_cap_is_set_apart_from_its_lock_slots(env):
+    """resources_tasks.<name> caps how many tasks naming a resource run (a multi-box alias runs many),
+    while `ttp lock <name>` keeps the slots `resources.<name>` gives; unset, the cap stays twice them."""
+    p = make(env)
+    from ttp.daemon import Daemon
+    from ttp import coordinator as coord, shared
+    assert coord.apply(p, [{"type": "task_add", "title": f"use {i}", "spec": "s", "tier": "light",
+                            "resources": ["fleet"]} for i in range(6)]
+                       + [{"type": "task_add", "title": f"hold {i}", "spec": "s", "tier": "light",
+                           "resources": ["fleet"], "exclusive": True} for i in range(2)]) == []
+    tasks = {t["title"]: t for t in p.db.q("SELECT * FROM tasks")}
+    run = lambda *names: [p.db.update_task(tasks[n]["id"], status="running") for n in names]
+    hold = lambda n, d: d._resource_hold(p.db.task(tasks[n]["id"]))
+    run("use 0", "use 1")
+    d = Daemon(p.base)
+    assert (hold("use 2", d) or {}).get("kind") == "busy", "unset: twice the one default slot, as before"
+    p.set_config("resources_tasks", {"fleet": 5})
+    d = Daemon(p.base)
+    assert shared.slots(p, "fleet", d.cfg) == 1 and shared.task_cap(p, "fleet", d.cfg) == 5
+    assert hold("use 2", d) is None, "the dispatch cap, not the lock slots, sizes how many run"
+    run("use 2", "use 3")
+    assert hold("use 4", d) is None
+    run("use 4")
+    assert (hold("use 5", d) or {}).get("kind") == "busy", "five running fill a cap of five"
+    p.db.update_task(tasks["use 4"]["id"], status="queued")
+    run("hold 0")
+    assert (hold("hold 1", d) or {}).get("kind") == "busy", "whole-run holders still share the one lock slot"
+    p.set_config("resources", {"fleet": 3})
+    p.set_config("resources_tasks", {})
+    d = Daemon(p.base)
+    assert shared.task_cap(p, "fleet", d.cfg) == 6 and shared.slots(p, "fleet", d.cfg) == 3
+
+
+def test_a_read_only_resource_counts_for_pauses_and_activity_never_for_dispatch_caps(env):
+    """task_add resources_read labels `read:<name>`: its worker reads records there under `ttp lock
+    --shared`, so it neither fills nor waits on the resource's dispatch cap, yet a pause holds it, user
+    orders, failure attribution and `ttp machines activity` see it."""
+    p = make(env)
+    from ttp.daemon import Daemon
+    from ttp import coordinator as coord, activity, prompts
+    assert coord.apply(p, [
+        *({"type": "task_add", "title": f"device {i}", "spec": "s", "tier": "light", "resources": ["box"]}
+          for i in range(3)),
+        *({"type": "task_add", "title": f"read {i}", "spec": "s", "tier": "light", "resources_read": ["box"]}
+          for i in range(3)),
+        {"type": "task_add", "title": "both", "spec": "s", "tier": "light", "resources": ["box"],
+         "resources_read": ["box", "other"]}]) == []
+    tasks = {t["title"]: t for t in p.db.q("SELECT * FROM tasks")}
+    assert json.loads(tasks["read 0"]["labels"]) == ["read:box"]
+    assert sorted(json.loads(tasks["both"]["labels"])) == ["read:other", "resource:box"], \
+        "a name the task uses in full keeps only its full label"
+    assert coord.task_resources(tasks["read 0"]) == {"box"}, "pauses, orders and failure attribution see it"
+    for n in ("read 0", "read 1", "device 0"):
+        p.db.update_task(tasks[n]["id"], status="running")
+    d = Daemon(p.base)
+    assert d._resource_hold(p.db.task(tasks["device 1"]["id"])) is None, "running readers fill no slot"
+    p.db.update_task(tasks["device 1"]["id"], status="running")
+    assert (d._resource_hold(p.db.task(tasks["device 2"]["id"])) or {}).get("kind") == "busy"
+    assert d._resource_hold(p.db.task(tasks["read 2"]["id"])) is None, "a reader never waits on the cap"
+    coord.pause_resource(p, "box", True, "test")
+    assert (Daemon(p.base)._resource_hold(p.db.task(tasks["read 2"]["id"])) or {}).get("kind") == "pause"
+    line = prompts._resource_line(p.db.task(tasks["read 2"]["id"]))
+    assert "ttp lock --shared" in line and "never run a device job" in line
+    view = {"alias": "box", "known": True, "since": 0, "now": 1, "holders": [], "waiters": [],
+            "reservations": [], "exclusive": [], "jobs": [], "activity": [], "unread": [],
+            "readers": [{"project": "x", "task": 7, "title": "t", "resource": "box"}]}
+    out = activity.lines(view)
+    assert "  reads box: x task #7 t" in out and not any("nothing holds" in ln for ln in out)
+    assert coord.apply(p, [{"type": "task_update", "id": tasks["read 2"]["id"], "resources_read": ["other"]}]) == []
+    assert json.loads(p.db.task(tasks["read 2"]["id"])["labels"]) == ["read:other"]
+
+
+
 def test_a_new_restriction_reaches_workers_already_running(env, tmp_path):
     p = make(env)
     from ttp import coordinator as coord

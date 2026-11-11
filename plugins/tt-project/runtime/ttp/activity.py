@@ -304,7 +304,8 @@ def _current(alias: str, owner: str, d: Path, view: dict, projects: dict | None 
 
 
 def _exclusive(alias: str, name: str, base: Path, view: dict) -> None:
-    """Running tasks of a project whose `exclusive:<resource>` label is on `alias`, read-only."""
+    """Running tasks of a project whose `exclusive:<resource>` (or read-only `read:<resource>`) label is
+    on `alias`; the project's db is read only."""
     from . import globalcap
     from .responsibilities import _names
     db = base / "state" / "project.db"
@@ -328,9 +329,9 @@ def _exclusive(alias: str, name: str, base: Path, view: dict) -> None:
         except ValueError:
             continue
         for lb in got if isinstance(got, list) else []:
-            if isinstance(lb, str) and lb.startswith("exclusive:") and _names(alias, lb.split(":", 1)[1]):
-                view["exclusive"].append({"project": name, "task": tid, "title": str(title)[:80],
-                                          "resource": lb.split(":", 1)[1]})
+            if isinstance(lb, str) and lb.startswith(("exclusive:", "read:")) and _names(alias, lb.split(":", 1)[1]):
+                view["exclusive" if lb.startswith("exclusive:") else "readers"].append(
+                    {"project": name, "task": tid, "title": str(title)[:80], "resource": lb.split(":", 1)[1]})
 
 
 def machine_view(alias: str, since: float, now: float | None = None) -> dict:
@@ -343,7 +344,7 @@ def machine_view(alias: str, since: float, now: float | None = None) -> dict:
     projects = _projects(project.hostname())
     hosts = _alias_hostnames(alias, known)
     view = {"alias": alias, "known": alias in known, "since": since, "now": now, "holders": [], "waiters": [],
-            "reservations": [], "exclusive": [], "jobs": [], "activity": [], "unread": []}
+            "reservations": [], "exclusive": [], "readers": [], "jobs": [], "activity": [], "unread": []}
     for owner, d in _lock_dirs(alias, projects):
         _current(alias, owner, d, view, {name: base for name, base in projects})
     for name, base in projects:
@@ -390,9 +391,11 @@ def lines(view: dict, where=None) -> list[str]:
         out.append(f"  reserved {r['resource']}: {r['holder']}")
     for x in view["exclusive"]:
         out.append(f"  exclusive {x['resource']}: {x['project']} task #{x['task']} {x['title']}")
+    for x in view.get("readers") or []:
+        out.append(f"  reads {x['resource']}: {x['project']} task #{x['task']} {x['title']}")
     for j in view["jobs"]:
         out.append(f"  live job: {span_line(j, where)}")
-    if not any(view[k] for k in ("holders", "waiters", "reservations", "exclusive", "jobs")):
+    if not any(view[k] for k in ("holders", "waiters", "reservations", "exclusive", "readers", "jobs")):
         out.append("  nothing holds, waits for or runs on it now")
     out += [f"  {span_line(s, where)}" for s in view["activity"]] or ["  no logged activity in the window"]
     if view["unread"]:

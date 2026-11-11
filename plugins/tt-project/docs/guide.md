@@ -3583,6 +3583,7 @@ is open raises one `cap_wait` event naming the key.
 | Cap | Default | What it holds | Class |
 |---|---|---|---|
 | `device.max_tasks` | one per device resource, at most the worker slots, at least 2 (old: 2) | device tasks preparing at once | convenience |
+| `resources_tasks.<name>` | twice `resources.<name>` (its `ttp lock` slots, default 1) | tasks naming the resource in `resources` that run at once; `ttp lock` slots and `exclusive` tasks still follow `resources.<name>`. A task's `resources_read` (read-only use: ssh reads, ledgers, logs; commands under `ttp lock --shared`, no device job or service change) counts for pauses, user orders, per-machine failures and `ttp machines activity`, never for this cap | convenience |
 | `review.unreviewed_per_pass` | `budget.max_parallel_workers` (old: 2) | reviews the backstop sweep queues per pass | convenience |
 | `review.auto_fix_rounds` | 1 (old: 2) | daemon-queued fix and re-review rounds per stack before the coordinator decides | convenience |
 | `review.sweep_after_s` | 300 s (old: 1800) | a code task left in review before its review is queued | convenience |

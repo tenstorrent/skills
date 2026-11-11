@@ -190,6 +190,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
                 # with no result, the last within window_s, are a stalled driver (one observation)
                 "progress": {"stall_after": 5, "window_s": 86400}},
     "resources": {},                    # shared-slot limits, e.g. {"device": 1}
+    # How many tasks naming a resource may run at once (shared.task_cap), apart from its `ttp lock`
+    # slots above: e.g. {"fleet": 8} runs 8 tasks on a multi-box alias while `ttp lock fleet` stays one
+    # holder. Unset: twice the resource's slots.
+    "resources_tasks": {},
     # Lock names that all mean the one device (they share one `ttp lock` slot), and how many tasks
     # tagged needs_device may run at once (max_tasks null: derived from the project's device resources
     # and budget.max_parallel_workers, loadcaps.py); `ttp lock` admits one of them at a time to the device.
@@ -772,7 +776,7 @@ EXTRA_KEYS = {
     # plugin's own repository and not the delivery remote unless allow_delivery_remote; lease_ttl_s (300).
     "failover": {"standby", "fleet", "lease_remote", "lease_ttl_s", "allow_delivery_remote"},
 }
-OPEN_SECTIONS = {"resources"}           # any name below is fine
+OPEN_SECTIONS = {"resources", "resources_tasks"}           # any name below is fine
 # write_fence: true runs the provider's workers in its optional write fence (Claude's Bash sandbox, Codex's
 # workspace-write, Provider.fence_args) where the host can run it; off by default (providers.fence_on).
 # loopback_ports: extra host loopback ports fenced workers reach (loopproxy.ports_env), or false for none.

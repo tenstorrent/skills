@@ -245,6 +245,7 @@ ACTIONS_SCHEMA: dict[str, Any] = {
             "requester": {"type": "string"}, "not_own_call": {"type": "string"},
             "classify": {"type": "string", "enum": list(ASK_CLASSES)},
             "resources": {"type": "array", "items": {"type": "string"}}, "exclusive": {"type": "boolean"},
+            "resources_read": {"type": "array", "items": {"type": "string"}},
             "needs_device": {"type": "boolean"}, "user_deep": {"type": "boolean"}, "standing": {"type": "boolean"},
             "continues": {"type": "integer"}, "resource": {"type": "string"}, "machine": {"type": "string"}, "paused": {"type": "boolean"},
             "user_asked": {"type": "boolean"}, "user_end": {"type": "boolean"}, "outage": {"type": "boolean"},
@@ -2925,7 +2926,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 budget = a.get("budget_usd") or cfg["budget"]["task_default_usd"].get(tier, 8.0)
                 kind_label = "exclusive" if a.get("exclusive") else "resource"
                 names = _resource_names(a.get("resources") or [], t, problems)
-                labels = [f"{kind_label}:{r}" for r in names]
+                labels = [f"{kind_label}:{r}" for r in names] + read_labels(a.get("resources_read"), names, t, problems)
                 if a.get("needs_device") or set(names) & locks.device_locks(cfg):
                     labels.append("needs_device")
                 if tier == "deep" and a.get("user_deep"):
@@ -3265,9 +3266,19 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     keep = [lb for lb in json.loads(task["labels"] or "[]")
                             if not (isinstance(lb, str) and lb.split(":", 1)[0] in ("resource", "exclusive"))]
                     names = _resource_names(a["resources"], t, problems)
-                    upd["labels"] = keep + [f"{kind_label}:{r}" for r in names]
+                    upd["labels"] = [lb for lb in keep if not (isinstance(lb, str) and lb.startswith("read:")
+                                                               and lb[5:] in names)] + [f"{kind_label}:{r}" for r in names]
                     if "needs_device" not in keep and set(names) & locks.device_locks(cfg):
                         upd["labels"].append("needs_device")
+                if a.get("resources_read") is not None:
+                    if task["status"] == "running":
+                        raise InfoRejection(f"task #{task['id']} is running: its resources change only while it is "
+                                         f"not; cancel it and re-add it with `continues` to move it now")
+                    have = upd.get("labels", json.loads(task["labels"] or "[]"))
+                    full = [lb.split(":", 1)[1] for lb in have if isinstance(lb, str)
+                            and lb.split(":", 1)[0] in ("resource", "exclusive")]
+                    upd["labels"] = [lb for lb in have if not (isinstance(lb, str) and lb.startswith("read:"))] \
+                        + read_labels(a["resources_read"], full, t, problems)
                     prev = load_result(upd.get("result") or task["result"])
                     if upd.get("status", task["status"]) == "queued" and task["not_before"] \
                             and prev.get("status") == "waiting" and not deferral(task):
@@ -5559,14 +5570,23 @@ def _user_order(p: Project, a: dict, task_id: int, text: str, messages: list[int
             + (f"; told running " + ", ".join(f"#{t}" for t in told) + " to stop conflicting steps" if told else ""))
 
 
+def read_labels(names, full: list[str], action: str, problems: list) -> list[str]:
+    """`read:<name>` labels of task_add/task_update `resources_read`: resources the task only reads
+    records on (no device job, no service change). They count for pauses, user orders, failure
+    attribution and `ttp machines activity`, never toward dispatch's caps (Daemon._resource_hold); a
+    name also in `resources` keeps its full label only."""
+    return [f"read:{r}" for r in dict.fromkeys(_resource_names(names or [], action, problems)) if r not in full]
+
+
 def task_resources(task: dict) -> set[str]:
-    """Resources a task names in its labels, shared (`resource:`) or held for the run (`exclusive:`)."""
+    """Resources a task names in its labels, shared (`resource:`), held for the run (`exclusive:`) or
+    only read (`read:`)."""
     try:
         labels = json.loads(task.get("labels") or "[]")
     except ValueError:
         return set()
     return {lb.split(":", 1)[1] for lb in labels if isinstance(lb, str)
-            and lb.split(":", 1)[0] in ("resource", "exclusive") and ":" in lb}
+            and lb.split(":", 1)[0] in ("resource", "exclusive", "read") and ":" in lb}
 
 
 MEMORY_ALERT_KEY = "memory_pinned_over"   # kv: set once pinned memory alone has outgrown the budget
