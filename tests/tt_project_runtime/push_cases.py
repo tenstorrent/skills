@@ -16981,7 +16981,9 @@ def test_a_push_batch_reruns_each_failing_test_not_yet_judged_at_that_head(env, 
     assert ("head", both, ["e1", "e2"]) in calls, "both failing tests rerun together at the full head"
     assert ("head", gatejudge.select_rx([_NEW_ID]), ["e1"]) in calls, \
         "prefix 1's probe reruns only the new failing test: _FLAKY_ID was already judged (passed its rerun) at the full head"
-    assert [f["ids"] for f in m["flaky_tests"]] == [[_FLAKY_ID]], m["flaky_tests"]   # judged once, at the full head
+    assert ("head", _SEL, ["e1"]) in calls, "prefix 1's second check fails _FLAKY_ID in full: it reruns there too"
+    assert [f["ids"] for f in m["flaky_tests"]] == [[_FLAKY_ID], [_FLAKY_ID]], m["flaky_tests"]
+    assert len({f["head"] for f in m["flaky_tests"]}) == 2, "judged once per head: the full head, then prefix 1"
     assert _FLAKY_ID in gatejudge.active(p.state, time.time())
     calls.clear()
     rc, m2 = _run_batch(p, _batch_marker(p, [_entry(repo, "e3", {"e3.txt": "3\n"})], bid="b2"), monkeypatch)
@@ -21596,7 +21598,8 @@ def test_an_urgent_approval_waiting_behind_a_running_batch_for_15_min_tells_the_
     from ttp import pushq
     s = _pq(env, monkeypatch)
     now = time.time()
-    _pq_last_batch(s, None, now - 60, after_done=False)   # still running
+    # still in its push phase (43196a414: a batch only deploying no longer holds the next one)
+    s.p.db.x("INSERT INTO push_batches(id,marker,target,started) VALUES('b1','m','origin/proj',?)", (now - 660,))
     _, slow = _pq_review(s, priority=3)
     _, hot = _pq_review(s, priority=1)
     s.p.db.x("UPDATE push_queue SET created=?", (now - pushq.URGENT_WAIT_S - 60,))

@@ -31306,6 +31306,8 @@ def test_with_the_push_queue_on_the_daemon_starts_the_checks_as_it_queues_the_re
     (out / cli.CHECKS_RC).unlink()
     alive = {"pid": os.getpid(), "started": proc_start(os.getpid()), "ts": now}
     (out / cli.CHECKS_PID).write_text(json.dumps(alive))
+    # 9534cee30: only once they run on a host (cli.CHECKS_RUNNING), never while they queue
+    (out / cli.CHECKS_RUNNING).write_text(json.dumps({"since": now}))
     assert d._precheck_holds(task, now)
     assert not d._precheck_holds(task, now + PRECHECK_HOLD_S + 1)
     assert not d._precheck_holds(dict(task, kind="code"), now)
