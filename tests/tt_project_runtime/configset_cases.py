@@ -408,13 +408,11 @@ def test_upgrade_drops_retired_keys_once_and_keeps_the_rest(env):
     assert rec and rec.get("h") == "-" and "retired" in rec.get("via", ""), rec
     text = p.config_path.read_text()
     assert cli._drop_retired_keys(p) == [] and p.config_path.read_text() == text, "a rerun is a no-op"
-
-
-def test_a_run_sets_a_dollar_cap_only_on_the_users_own_logged_words_naming_it_and_its_value(env, monkeypatch, capsys):
-    """A cap change the user ordered in chat is applied by a run with --user-msg, recorded as the user's
-    with the message id, only when that message is the user's own and its verbatim words name the cap
-    and the exact value; a harness post, a relayer's context, another value or cap, an old message, a
-    later user set and every other user-only key are refused (capword)."""
+def test_a_run_sets_a_dollar_cap_only_on_the_users_own_message_carrying_the_setting(env, monkeypatch, capsys):
+    """A cap change the user wrote in chat as the setting itself is applied by a run with --user-msg,
+    recorded as the user's with the message id, only when that message is the user's own and carries the
+    cap's key with that one value; a harness post, a relayer's context, another value or cap, an old
+    message, a later user or coordinator set and every other user-only key are refused (capword)."""
     from ttp import capword, cli, configwho
     p = make(env)
     p.set_config("budget.weekly_usd", 200.0)
@@ -425,14 +423,14 @@ def test_a_run_sets_a_dollar_cap_only_on_the_users_own_logged_words_naming_it_an
                (ts, "in", "c", kind, text, provenance))
         return p.db.one("SELECT MAX(id) i FROM messages")["i"]
 
-    ok = msg("raise the weekly cap to $400 please")
-    harness = msg("raise the weekly cap to $400", provenance="system")
-    relayed = msg("go faster\n" + __import__("ttp.relay", fromlist=["MARK"]).MARK + "\nraise the weekly cap to 400")
-    other_value = msg("raise the weekly cap to $500")
-    other_cap = msg("raise the global daily cap to $400")
-    old = msg("weekly cap $400", ts=now - capword.MAX_AGE_S - 60)
+    ok = msg("go faster: budget.weekly_usd 400 please")
+    harness = msg("budget.weekly_usd 400", provenance="system")
+    relayed = msg("go faster\n" + __import__("ttp.relay", fromlist=["MARK"]).MARK + "\nbudget.weekly_usd 400")
+    other_value = msg("budget.weekly_usd 500")
+    other_cap = msg("budget.daily_usd 400")
+    old = msg("budget.weekly_usd 400", ts=now - capword.MAX_AGE_S - 60)
     p.db.x("INSERT INTO messages(ts,direction,chat,kind,text) VALUES(?,?,?,?,?)",
-           (now - 30, "out", "c", "user", "weekly cap $400"))   # an outbound row is nobody's order
+           (now - 30, "out", "c", "user", "budget.weekly_usd 400"))   # an outbound row is nobody's order
     out = p.db.one("SELECT MAX(id) i FROM messages")["i"]
     monkeypatch.setattr(cli, "in_run", lambda: True)
     monkeypatch.setenv("TTP_TASK_ID", "7")
@@ -441,8 +439,8 @@ def test_a_run_sets_a_dollar_cap_only_on_the_users_own_logged_words_naming_it_an
     with pytest.raises(SystemExit):
         cli.main(["config", "demo", "budget.weekly_usd", "400"])
     assert "--user-msg" in capsys.readouterr().err   # the refusal names the path
-    for mid, why in ((harness, "not the user's own"), (relayed, "do not name"), (other_value, "the value"),
-                     (other_cap, "do not name"), (old, "older than"), (out, "not the user's own"),
+    for mid, why in ((harness, "not the user's own"), (relayed, "do not carry"), (other_value, "do not carry"),
+                     (other_cap, "do not carry"), (old, "older than"), (out, "not the user's own"),
                      (99999, "not the user's own")):
         with pytest.raises(SystemExit):
             cli.main(["config", "demo", "budget.weekly_usd", "400", "--user-msg", str(mid)])
@@ -470,10 +468,11 @@ def test_a_run_sets_a_dollar_cap_only_on_the_users_own_logged_words_naming_it_an
     assert "later value stands" in capsys.readouterr().err
 
 
-def test_capword_grants_only_a_dollar_value_bound_to_the_cap_in_one_clause(env):
-    """Loose words never grant a cap (review #7384): a day or week word and any number elsewhere, a
-    '#' id, a limit the user named (negated or above/below), a past value, and a key name inside
-    another key ('global_daily_usd') are refused; a $ value bound to the cap phrase is granted."""
+def test_capword_wording_alone_never_grants_a_cap_only_the_setting_itself(env):
+    """No gate reads the meaning of the user's words (user msg #2116): prose that plainly orders a cap
+    ('raise the weekly cap to $400') grants nothing in a run; only the setting itself, the cap's full key
+    with one plain value, grants it. A key inside another key, a short key name, two values, a '#' id,
+    a number that runs on (400,000, 400k, 400.5.1) and an outbound copy are refused."""
     from ttp import capword
     p = make(env)
     now = time.time()
@@ -483,20 +482,21 @@ def test_capword_grants_only_a_dollar_value_bound_to_the_cap_in_one_clause(env):
                (now - 60, "in", "c", "user", text, ""))
         return capword.problem(p.db, key, value, p.db.one("SELECT MAX(id) i FROM messages")["i"], now=now)
 
-    for text, key, value in (("the H3 run did 5000 steps this week", "budget.weekly_usd", 5000),
-                             ("run it with 8192 tokens, finish by end of day", "budget.daily_usd", 8192),
-                             ("per user msg #2010 the weekly report is fine", "budget.weekly_usd", 2010),
-                             ("the global_daily_usd stays at 3000", "budget.daily_usd", 3000),
-                             ("don't raise the weekly cap above 300", "budget.weekly_usd", 300),
-                             ("never raise the weekly cap above $300", "budget.weekly_usd", 300),
-                             ("keep the daily budget below $300", "budget.daily_usd", 300),
-                             ("the weekly cap was $300", "budget.weekly_usd", 300),
-                             ("run it with $8192 budget, finish by end of day", "budget.daily_usd", 8192),
-                             ("raise the weekly cap per #400", "budget.weekly_usd", 400),
-                             ("raise the weekly cap to $400 and spend $5000 on it", "budget.weekly_usd", 5000)):
-        assert problem(text, key, value), text
     for text, key, value in (("raise the weekly cap to $400 please", "budget.weekly_usd", 400),
                              ("daily cap $1.5k", "budget.daily_usd", 1500),
                              ("set the weekly limit to 1,200 usd.", "budget.weekly_usd", 1200),
-                             ("set budget.daily_usd to 250", "budget.daily_usd", 250)):
+                             ("set daily_usd to 250", "budget.daily_usd", 250),
+                             ("budget.global_daily_usd 3000", "budget.daily_usd", 3000),
+                             ("xbudget.daily_usd 3000", "budget.daily_usd", 3000),
+                             ("budget.daily_usd #400", "budget.daily_usd", 400),
+                             ("budget.weekly_usd 400,000", "budget.weekly_usd", 400),
+                             ("budget.weekly_usd 400k", "budget.weekly_usd", 400),
+                             ("budget.weekly_usd 400.5.1", "budget.weekly_usd", 400.5),
+                             ("budget.weekly_usd 400 or budget.weekly_usd 500", "budget.weekly_usd", 400),
+                             ("budget.weekly_usd 400", "budget.daily_usd", 400)):
+        assert problem(text, key, value), text
+    for text, key, value in (("budget.weekly_usd 400", "budget.weekly_usd", 400),
+                             ("please set budget.daily_usd=$250.5 today.", "budget.daily_usd", 250.5),
+                             ("budget.daily_usd: 1500", "budget.daily_usd", 1500),
+                             ("budget.weekly_usd 400, and budget.weekly_usd=400", "budget.weekly_usd", 400)):
         assert problem(text, key, value) is None, text

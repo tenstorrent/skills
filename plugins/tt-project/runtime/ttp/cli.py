@@ -11416,7 +11416,8 @@ def _refuse_user_only_in_run(key: str) -> None:
     die(f"{key} is a setting only the user may change, and `ttp config` refuses to set it inside a run; "
         f"reading it still works. Name the value you need in the hand-off (a followup or the question) "
         f"so the coordinator can ask the user"
-        + ("; a cap the user already set in chat: add --user-msg <their message id>" if key in capword.KEYS else ""))
+        + (f"; a cap the user wrote as the setting itself in chat (`{key} <value>`): add --user-msg <their "
+           f"message id>" if key in capword.KEYS else ""))
 
 
 def cmd_chat_settable(key: str, value: str | None) -> None:
@@ -11559,7 +11560,7 @@ def cmd_config(a) -> None:
     if run and (k := _user_only_change(p.raw_config(), a.key, val, p)):
         # A run can be steered by text it reads; these change only in a coordinator turn that carries
         # the user's yes (coordinator.NEEDS_USER), as `ttp say` is refused inside a run, or for a dollar
-        # cap, on the user's own logged words naming it and the value (capword).
+        # cap, on the user's own logged message carrying the setting itself (capword).
         from . import capword
         why = (capword.problem(p.db, k, val, a.user_msg) if k == a.key
                else f"set {k} itself, not {a.key}") if a.user_msg else None

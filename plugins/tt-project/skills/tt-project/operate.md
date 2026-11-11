@@ -152,8 +152,10 @@ Every project cuts its queue times with the resources its charter allows (the te
   self-started coordinator turns (user messages and must-act items still wake it); worker tasks keep
   starting under the normal caps.
 - Raising a cap: tell the coordinator, or `ttp config <name> budget.daily_usd <n>`. A run applies a
-  daily or 7-day cap the user ordered in chat with `ttp config budget.weekly_usd <n> --user-msg <id>`,
-  only when that message is the user's own and its words name the cap and the exact value.
+  daily or 7-day cap the user wrote in chat as the setting itself (`budget.weekly_usd 400`) with
+  `ttp config budget.weekly_usd 400 --user-msg <id>`, only when that message is the user's own. A cap
+  ordered in plain words ('raise the weekly cap to $400') is set by the coordinator in a turn that
+  carries the user's yes.
   Warn the user to raise caps carefully.
 
 ## Health
