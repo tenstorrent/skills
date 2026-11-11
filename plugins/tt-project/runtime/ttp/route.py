@@ -236,6 +236,30 @@ def models(cfg: dict, tier: str) -> set[str]:
     return {*([own[1]] if own else []), *(r["model"] for _, r in rules(cfg) if not r["tiers"] or tier in r["tiers"])}
 
 
+def protected(db, cfg: dict, task: dict, tier: str) -> str:
+    """Why a worker run stays on the core provider whatever a rule, escalation or Jev pick says, or ''.
+    Model-free and always on: a deep tier, device, urgent, optimization, conclusion or untrusted-input
+    run is never sent to a routed provider or model. (Coordinator and review runs are never routed:
+    see eligible.)"""
+    from . import effort, modelpick, tierfloor, urgent
+    if tier == "deep":
+        return "deep"
+    if effort.device_task(task):
+        return "device"
+    if urgent.is_urgent(task):
+        return "urgent"
+    if modelpick.UNTRUSTED in modelpick._labels(task):
+        return "untrusted"
+    if modelpick.HARD.search(f"{task.get('title') or ''}\n{task.get('spec') or ''}"):
+        return "optimization"
+    try:
+        if tierfloor.target(db, cfg, task):
+            return "conclusion"
+    except Exception:   # an unreadable floor keeps the task on core
+        return "conclusion"
+    return ""
+
+
 def timeout_s(cfg: dict, tier: str, rule: int | None = None) -> float | None:
     """The routed run time limit: rule `rule`'s route_timeout_s (match), else the tier's
     (providers.chat.tiers.<tier>.route_timeout_s), or None: the tier's budget.run_timeout_s applies."""

@@ -200,7 +200,9 @@ def test_model_pick_applies_only_at_its_own_tier_and_never_to_a_floor_run(env, m
     # A core pick (the rules' 'hard' pick) leaves a later light wake to the light tier's route.
     core = p.db.add_task("Speed up", "Optimize the cache in notes.py.", kind="code", tier="standard")
     assert modelpick.pick(p.db, d.cfg, p.db.task(core), "standard", jev=d.jev)["why"] == "hard"
-    light = d._route(p.db.task(core), "light", None, now)
+    assert d._route(p.db.task(core), "light", None, now) is None   # the route guard: optimization stays on core
+    plain = p.db.add_task("Tidy", "Rename helpers in notes.py.", kind="code", tier="light")
+    light = d._route(p.db.task(plain), "light", None, now)
     assert light and light["to"] == "chat" and light["model"] == "example-org/light-model" and "model_pick" not in light
     assert d._model_pick(p.db.task(core), "light", peek=True) is None
     # A routed pick runs only at the standard tier: a deep start and a floor run start on core.
@@ -466,3 +468,32 @@ def test_model_trip_a_worse_head_to_head_keeps_the_sample_window(env):
     _mp_config(p)
     modeltrip.head_to_head(p.db, "code/standard/*", False, "bench/worse", now=now - 600)
     assert [t["stratum"] for t in modeltrip.check(p, p.config(), now=now)] == ["code/standard/*"]
+
+
+def test_route_guard_keeps_protected_classes_on_core_whatever_asks(env, monkeypatch):
+    from ttp import route
+    from ttp.daemon import Daemon
+    p = make(env)
+    _mp_config(p)
+    d = Daemon(p.base)
+    now = time.time()
+    add = lambda title, spec="Rename helpers in notes.py.", **k: p.db.task(p.db.add_task(
+        title, spec, **{"kind": "code", "tier": "light", **k}))
+    plain = add("Tidy the notes module")
+    assert d._route(plain, "light", None, now)["to"] == "chat"   # an unprotected class routes as its rule says
+    for why, task in {"optimization": add("Optimize the cache", "Optimize notes.py."),
+                      "untrusted": add("Triage", labels=["untrusted_input"])}.items():
+        assert route.protected(p.db, d.cfg, task, "light") == why and d._route(task, "light", None, now) is None
+    assert route.protected(p.db, d.cfg, plain, "deep") == "deep"
+    for mod, fn, val, why in (("effort", "device_task", True, "device"), ("urgent", "is_urgent", True, "urgent")):
+        with monkeypatch.context() as m:
+            m.setattr(f"ttp.{mod}.{fn}", lambda t, v=val: v)
+            assert route.protected(p.db, d.cfg, plain, "light") == why and d._route(plain, "light", None, now) is None
+    with monkeypatch.context() as m:
+        m.setattr("ttp.tierfloor.target", lambda db, c, t: {"tier": "standard"})
+        assert d._route(plain, "light", None, now) is None
+    # A model pick is refused the same way.
+    with monkeypatch.context() as m:
+        m.setattr("ttp.urgent.is_urgent", lambda t: True)
+        d.jev = _ModelJev()
+        assert d._route(plain, "standard", None, now) is None

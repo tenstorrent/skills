@@ -12084,6 +12084,12 @@ class Daemon:
         if not to or not route.eligible(task, picked) or (dp is None and self._floor_keeps_core(task, tier, picked)):
             return None
         name, model = to["to"], to["model"]
+        why = route.protected(self.p.db, self.cfg, task, tier)
+        if why:   # the guard: a protected class stays on core, whoever asked for the route
+            if not peek:
+                log(self.p, f"task {task.get('id')}: route to {name}:{model} refused ({why} run stays on core); "
+                            f"asked by {'model pick' if dp is not None else 'rule ' + str(to['rule'])}")
+            return None
         if dp is not None:
             return {**self._route_entry(task, tier, name, model, now, pick=True), "model_pick": True,
                     **({"pick_effort": got["effort"]} if got["effort"] else {})}
