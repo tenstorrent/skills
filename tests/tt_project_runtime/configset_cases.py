@@ -408,6 +408,8 @@ def test_upgrade_drops_retired_keys_once_and_keeps_the_rest(env):
     assert rec and rec.get("h") == "-" and "retired" in rec.get("via", ""), rec
     text = p.config_path.read_text()
     assert cli._drop_retired_keys(p) == [] and p.config_path.read_text() == text, "a rerun is a no-op"
+
+
 def test_a_run_sets_a_dollar_cap_only_on_the_users_own_message_carrying_the_setting(env, monkeypatch, capsys):
     """A cap change the user wrote in chat as the setting itself is applied by a run with --user-msg,
     recorded as the user's with the message id, only when that message is the user's own and carries the
