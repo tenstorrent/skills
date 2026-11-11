@@ -844,10 +844,21 @@ def _named_commits(p: Project, entries: Any) -> list[str]:
 
 
 def _all_landed(p: Project, shas: list[str]) -> bool:
-    """Whether every commit in `shas` is on the push branch as its tracking ref has it (no fetch)."""
+    """Whether every commit in `shas` is on the push branch as its tracking ref has it (no fetch): an
+    ancestor of its tip, or a commit whose changes the tip already has under another sha (`ttp push`
+    rebases, so a review that pushed its head itself names a commit the tip never contains)."""
     tgt = target(p)
     tip = _commit(p, f"refs/remotes/{tgt[0]}/{tgt[1]}") if tgt else ""
-    return bool(tip) and all(_contains(p, [tip], s) for s in shas)
+    return bool(tip) and all(_contains(p, [tip], s) or _patch_on(p, tip, s) for s in shas)
+
+
+def _patch_on(p: Project, tip: str, sha: str) -> bool:
+    """Every commit `sha` adds over its merge base with `tip` has a patch-equivalent commit on `tip`."""
+    try:
+        r = _git(p, "rev-list", "--cherry-pick", "--right-only", "--no-merges", f"{tip}...{sha}", timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return r.returncode == 0 and not r.stdout.strip()
 
 
 def check_approval(p: Project, task: dict, entries: Any, cfg: dict | None = None) -> dict:
