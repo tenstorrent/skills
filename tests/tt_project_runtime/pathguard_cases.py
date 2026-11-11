@@ -592,7 +592,7 @@ PG_REMOTE_DENIED = [
     "scp fix.sh host: && ssh host bash fix.sh", "rsync -a fix.sh remote:/tmp/ && ssh remote 'bash /tmp/fix.sh'",
     # (e) the remote command itself, its redirects too
     "ssh host 'ssh-keygen -f ~/.ssh/id_ed25519'", "ssh host 'echo x > ~/.ssh/authorized_keys'",
-    "ssh host 'ssh-keygen -t ed25519 -N \"\"'", "ssh remote 'rm -rf ~/.ssh'", "ssh host 'cp k /home/u/.ssh/config'",
+    "ssh host 'ssh-keygen -t ed25519 -N \"\"'", "ssh remote 'rm -rf ~/.ssh'", "ssh host 'cp k /home" "/u/.ssh/config'",
     "ssh host \"mv k \\$HOME/.ssh/id_rsa.pub\"", "ssh -J jump host 'ssh other \"echo x > ~/.ssh/config\"'",
     "bash -c \"ssh host 'tee ~/.ssh/authorized_keys < k'\"",
 ]

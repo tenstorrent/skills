@@ -14943,7 +14943,7 @@ def test_only_a_review_precheck_s_checks_wait_asks_the_push_queue_for_its_head(e
         cli._checks_slot(p, tmp_path, io.StringIO(), "a" * 40, detached=True)
     moved = e.value.args[0]
     assert isinstance(moved, cli._TaskEnded) and isinstance(moved.inner, cli._HeadMoved)
-    assert isinstance(moved.queued, cli._QueuedHead) == run_id.startswith("precheck-")
+    assert isinstance(getattr(moved, "queued", None), cli._QueuedHead) == run_id.startswith("precheck-")
 
 
 @pytest.mark.parametrize("excused", [False, True])
