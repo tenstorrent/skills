@@ -3529,7 +3529,7 @@ def test_billed_to_plan_and_back_swaps_caps_and_windows_cleanly(env, monkeypatch
     _bk_tick(d, monkeypatch)
     g = d.gates["fake"]
     assert g.regime == "caps" and "plan" not in g.numbers, g.reasons
-    assert g.numbers["daily_cap"] == 100 and g.numbers["weekly_cap"] == 200, g.numbers
+    assert g.numbers["daily_cap"] == 100 and g.numbers["weekly_cap"] == 700, g.numbers   # an unset weekly cap is 7 x daily
     assert g.numbers["spent_24h"] == 3.0 and g.numbers["spent_7d"] == 3.0, "the plan's $7 is not billed spend"
     line, detail = _bk_billed_only(p, d, time.time())
     for stale in ("5h", "7d", "avg", "virtual"):

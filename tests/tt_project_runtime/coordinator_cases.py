@@ -15082,7 +15082,7 @@ def test_resource_pause_end_when_is_only_a_probe(env, end):
     # Nobody writes or tunes a health end: an object (or other non-string) end is refused, never applied.
     from ttp import coordinator as coord, pauseends
     p, d, _ = _health_pause(env)
-    coord.pause_resource(p, "board", False)
+    coord.pause_resource(p, "board", False, by="coordinator")
     problems = coord.apply(p, [{"type": "resource_pause", "resource": "board", "paused": True, "until": "1d",
                                 "end_when": end}])
     assert problems and "one shell command" in problems[0], problems
@@ -15128,7 +15128,7 @@ def test_resource_pause_end_fields_ride_the_strict_wire_schema(env, given):
 def test_resource_pause_origin_follows_the_users_own_words(env, words, context, flag, users):
     from ttp import coordinator as coord
     p, d, _ = _health_pause(env)
-    coord.pause_resource(p, "board", False)
+    coord.pause_resource(p, "board", False, by="coordinator")
     msg = p.db.post("in", words)
     if context:
         p.db.x("UPDATE messages SET context=? WHERE id=?", (context, msg))
@@ -15136,7 +15136,7 @@ def test_resource_pause_origin_follows_the_users_own_words(env, words, context, 
     assert coord.apply(p, [action], user_turn=True, messages=[msg]) == []
     assert p.db.paused_resources()["board"]["by"] == ("user" if users else "coordinator")
     # Without a user message in the turn, neither the words nor the flag make it theirs.
-    coord.pause_resource(p, "board", False)
+    coord.pause_resource(p, "board", False, by="coordinator")
     assert coord.apply(p, [{**action, "user_asked": True}]) == []
     assert p.db.paused_resources()["board"]["by"] == "coordinator"
 
@@ -15146,7 +15146,7 @@ def test_resource_pause_origin_follows_the_users_own_words(env, words, context, 
 def test_resource_pause_in_a_turn_asking_to_pause_fails_safe_to_the_user(env, flag, users):
     from ttp import coordinator as coord
     p, d, _ = _health_pause(env)
-    coord.pause_resource(p, "board", False)
+    coord.pause_resource(p, "board", False, by="coordinator")
     msg = p.db.post("in", "Pause the other box please.")
     action = {"type": "resource_pause", "resource": "board", "paused": True, "until": "1d",
               **({} if flag is None else {"user_asked": flag})}

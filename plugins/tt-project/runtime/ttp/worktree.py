@@ -32,6 +32,14 @@ def _git(cwd: Path, *args: str, check: bool = True, timeout: float = 120, env: d
     return out.stdout.strip()
 
 
+def _has_git_entry(path: Path, file: bool = False) -> bool:
+    """Whether `path` has a .git entry (a file, with `file`); False when its parent folder cannot be read."""
+    try:
+        return (path / ".git").is_file() if file else (path / ".git").exists()
+    except OSError:
+        return False
+
+
 def is_git(path: Path) -> bool:
     try:
         return _git(path, "rev-parse", "--is-inside-work-tree", check=False) == "true"
@@ -2141,10 +2149,10 @@ def sweep(p: Project, *, older_than_s: float = 0, names: list[str] | None = None
                         records = {}
                 rec = _record_of(records, path)
             lock = rec["locked"] if rec else None
-            half = lock is not None and lock.startswith(HARNESS_LOCKS) and not (path / ".git").is_file()
+            half = lock is not None and lock.startswith(HARNESS_LOCKS) and not _has_git_entry(path, file=True)
             # git's own record (one `git worktree list` for all) and a .git entry say it is a worktree without
             # a git call per worktree; only one git does not list (another repository's, a prunable one) runs is_git
-            if not half and not (rec and not rec["prunable"] and (path / ".git").exists()) and not is_git(path):
+            if not half and not (rec and not rec["prunable"] and _has_git_entry(path)) and not is_git(path):
                 continue
             if lock is None and not dry_run:
                 keep(path)   # one made before keep() existed: from now on no partial-view prune orphans it

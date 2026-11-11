@@ -24206,7 +24206,7 @@ def test_budget_line_shows_both_windows_their_resets_and_the_mean_of_window_peak
     # Readings of another provider on the account do not mix into the core provider's line.
     p.db.x("INSERT INTO snapshots(ts,provider,account,window,utilization,resets_at) VALUES(?,?,?,?,?,?)",
            (now - 60, "other", "", "five_hour", 80.0, now + h))
-    assert budget_line(p.db, now) == line
+    assert budget_line(p.db, now) == line + ", other plan 5h 80%", "named as another plan, not mixed into the windows or averages"
     assert budget_line(p.db, now, "other").startswith("5h 80% - resets in 1.0 h, 24h $0.17 virtual")
 
 
@@ -43427,6 +43427,7 @@ def test_failover_settings_are_known_keys_and_settable_from_cli_and_chat(env, ca
     d.update_gates()
     d.failover_pinned()
     assert p.db.task(tid)["provider"] == "codex", "0 set through the CLI turns failover off"
+    p.db.set_kv("config_provenance", {})   # the CLI part is done; the chat part below starts from a value no user owns
     for bad in ("soon", "-1"):
         with pytest.raises(SystemExit):
             cli.main(["config", p.name, "coordinator.provider_failover_after_h", bad])
@@ -44490,7 +44491,10 @@ def test_budget_line_shows_free_resets_and_paid_credits_on_one_line(env):
     snap("claude", "five_hour", 4.4, now + 3.94 * 3600)
     snap("codex", "5h", 10.0, now + 3600)
     snap("codex", "7d", 93.0, now + 2 * 86400)
-    base = budget_line(p.db, now)
+    full = budget_line(p.db, now)
+    other = ", codex plan 5h 10%, 7d 93%"   # codex's windows as another plan until its credits name it
+    assert full.endswith(other), full
+    base = full[:-len(other)]
     assert "free reset" not in base and "credits" not in base
     credits.record(p.db, "codex", credits.parse(_credit_answer()), "", now)
     line = budget_line(p.db, now)
@@ -44500,7 +44504,7 @@ def test_budget_line_shows_free_resets_and_paid_credits_on_one_line(env):
     assert line == base + ", paid credits, codex 7d 93%, 2 free resets", line
     assert "\n" not in line
     credits.record(p.db, "codex", credits.parse(_credit_answer()), "", now - credits.FRESH_S - 1)
-    assert budget_line(p.db, now) == base + ", paid credits", "a stale reading is left out"
+    assert budget_line(p.db, now) == base + ", paid credits" + other, "a stale reading is left out"
 
 
 def test_sweep_digest_and_budget_digest_list_credits_as_a_provider_holds_unblock_path(env):

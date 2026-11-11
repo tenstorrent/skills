@@ -615,6 +615,10 @@ def prefetch_git(p: Project, task: dict, result: dict, cfg: dict | None = None) 
     if not tip or len(out) != len(entries) or not all(_HEX40.fullmatch(e["head"]) for e in out):
         return   # check_approval refuses it before reading _inherited
     try:
+        # the refs the review names, as check_approval reads them: a quoted hash is judged by one batched
+        # cat-file and rev-lists of the branches it names (worktree._on_heads), history walks that must
+        # not run inside the transaction
+        fix_branches(p, task, named_refs(p, task))
         for e in out:
             _markers(p, e["head"], tip)
         _inherited(p, task, out, tip, time.time())
