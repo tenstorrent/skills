@@ -4378,10 +4378,13 @@ def test_a_workstations_wait_for_a_busy_spill_host_says_so_and_holds_no_checks_s
     real_cancelled = cli._checks_cancelled
 
     def cancelled(run_dir):
-        if not said:
-            capsys.readouterr()
-            cli._checks_result(run_dir)
-            said.append(capsys.readouterr().out)
+        if not said:   # the probe as a detached run's owner reads it, mid-wait
+            with monkeypatch.context() as m:
+                m.setattr(cli, "_read_checks_pid", lambda rd: {"pid": os.getpid()})
+                m.setattr(cli, "_checks_alive", lambda info: True)
+                capsys.readouterr()
+                cli._checks_result(run_dir)
+                said.append(capsys.readouterr().out)
         return real_cancelled(run_dir)
     monkeypatch.setattr(checkspill, "pick", pick)
     monkeypatch.setattr(cli, "_checks_cancelled", cancelled)
