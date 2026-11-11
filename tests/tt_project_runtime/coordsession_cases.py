@@ -1854,6 +1854,22 @@ def test_a_subagent_call_books_with_its_run(env):
     assert _cs_finish(p, d, _pc_run(p, "N", 2.0, {}, lines, task=8, role="worker")) == 3.0
 
 
+def test_a_subagents_usage_in_the_result_is_booked_once(env):
+    """The result's modelUsage already aggregates a subagent's model: booking it beside the subagent's own
+    streamed calls would count it twice. The run books its calls (parent's and subagent's) once each."""
+    p = make(env)
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    lines = [_pc_call("main", output_tokens=100_000),
+             _pc_call("sub", "claude-sonnet-5-5", parent="toolu_9", output_tokens=100_000)]
+    r = _pc_run(p, "N", 3.0, {}, lines, task=8, role="worker")
+    out = p.runs / str(r["id"]) / "output.jsonl"
+    ev = [json.loads(x) for x in out.read_text().splitlines()]
+    ev[-1]["modelUsage"] = {"claude-opus-5-5": {"outputTokens": 100_000}, "claude-sonnet-5-5": {"outputTokens": 100_000}}
+    out.write_text("\n".join(json.dumps(e) for e in ev) + "\n")
+    assert _cs_finish(p, d, r) == 3.0
+
+
 def test_a_glm_message_in_a_claude_run_is_not_booked(env):
     p = make(env)
     from ttp.daemon import Daemon
