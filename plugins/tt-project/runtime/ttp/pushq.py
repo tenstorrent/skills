@@ -1444,7 +1444,6 @@ def _urgent_waits(p: Project, live: str, now: float) -> None:
                queued=True, severity="high")
 
 
-def due(p: Project, now: float | None = None, cfg: dict | None = None) -> tuple[list[dict], str]:
 def due(p: Project, now: float | None = None, cfg: dict | None = None, lock: bool = True) -> tuple[list[dict], str]:
     """The approved rows a batch (a push train) should take now and why; or ([], why not). A train takes
     every approval due at its start, best priority first: delivery.push_batch_max only starts one at
