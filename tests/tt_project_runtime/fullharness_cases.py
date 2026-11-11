@@ -169,3 +169,37 @@ def test_ttp_stats_landing_shows_dollars_per_landed_change_and_spawns_over_24h_a
     # No such branch: the commit count is unknown, never zero.
     (day, _) = trainstats.per_landed(p.db, repo, "refs/heads/nope", now=now)
     assert day["landed_commits"] is None and day["usd_per_landed"] is None
+
+
+def test_daily_audit_shows_dollars_per_landed_change_over_24h_and_7d(env, monkeypatch):
+    """#7971: the daily self-efficiency audit carries the same $ per landed change view as
+    `ttp stats --landing` (trainstats.per_landed), in its lines and in `ttp audit --json`."""
+    from ttp import audit, landed, trainstats
+    p = make(env)
+    now = time.time()
+    for age, cost, spawned in ((3600, 6.0, 2), (3 * 86400, 4.0, 1)):
+        p.db.x("INSERT INTO runs(role, started, ended, cost_usd, note) VALUES('worker',?,?,?,?)",
+               (now - age, now - age + 60, cost, json.dumps({"subagents_spawned": spawned})))
+    monkeypatch.setattr(landed, "_push_ref", lambda p, repo: "refs/heads/land")
+    counts = {86400: 3, 7 * 86400: 5}
+    monkeypatch.setattr(trainstats, "landed_commits", lambda repo, ref, since, until: counts[round(until - since)])
+    line = next(x for x in audit.lines(p.db, now=now, p=p) if x.startswith("$ per landed change"))
+    assert "24 h: $6.00 over 3 commits landed on refs/heads/land = $2.00 per landed change; 2 subagents" in line, line
+    assert "7 d: $10.00 over 5 commits landed on refs/heads/land = $2.00 per landed change; 3 subagents" in line, line
+    rep = audit.report(p.db, now=now, p=p)["per_landed"]
+    assert rep["ref"] == "refs/heads/land" and [w["usd_per_landed"] for w in rep["windows"]] == [2.0, 2.0], rep
+    # The push branch unreadable: the count is unknown, never zero, and the spend still shows.
+    monkeypatch.setattr(trainstats, "landed_commits", lambda *a: None)
+    line = next(x for x in audit.lines(p.db, now=now, p=p) if x.startswith("$ per landed change"))
+    assert "$6.00 over ? commits" in line and "= - per landed change" in line, line
+    # No project, or a view that raises (an unreadable database): no line, and the audit still runs.
+    assert not any(x.startswith("$ per landed change") for x in audit.lines(p.db, now=now))
+    assert audit.report(p.db, now=now)["per_landed"] == {}
+    real = trainstats.per_landed
+    monkeypatch.setattr(trainstats, "per_landed", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("busy")))
+    assert not any(x.startswith("$ per landed change") for x in audit.lines(p.db, now=now, p=p))
+    monkeypatch.setattr(trainstats, "per_landed", real)
+    # Nothing spent and nothing landed: no line.
+    p.db.x("DELETE FROM runs")
+    monkeypatch.setattr(trainstats, "landed_commits", lambda *a: 0)
+    assert not any(x.startswith("$ per landed change") for x in audit.lines(p.db, now=now, p=p))

@@ -25,6 +25,8 @@ the project could have saved. Model-free; the review grades it.
   their plan's windows rose in the window (user msg #140);
 - tasks blocked or waiting longer than `blocked_h` hours now, longest first;
 - push queue: approval to landed per entry that landed in the window, median and p90 (pushq.landing_times);
+- $ per landed change over the last 24 h and 7 d (trainstats.per_landed): booked spend over the commits
+  landed on the push branch, merges and version bumps left out, and the subagents those runs started;
 - review loops: per change whose review moved in the window, its review rounds and their spend
   plus the fixes they asked for (a review's `auto_review:<task>` and `continues:<review>` labels);
 - reviews finished (reviewstats): count, spend and failures by diff size (all and non-test lines), tier and first review
@@ -475,6 +477,29 @@ def target_line(db: DB, cfg: dict) -> str:
     return t.removeprefix(" · ") if t else ""
 
 
+def per_landed(p: Project | None, db: DB, now: float) -> dict:
+    """trainstats.per_landed's 24 h and 7 d rows and the push ref they count on; {} without a project or
+    when the push branch cannot be read (the review goes on without the line)."""
+    if p is None:
+        return {}
+    from . import landed, trainstats
+    try:
+        ref = landed._push_ref(p, p.root)
+        return {"ref": ref, "windows": trainstats.per_landed(db, p.root, ref, now, cfg=p.config())}
+    except Exception:
+        return {}
+
+
+def per_landed_line(pl: dict) -> str:
+    """One audit line for per_landed(); '' when no window spent or landed anything."""
+    from . import trainstats
+    rows = pl.get("windows") or []
+    if not any(w["usd"] or w["virtual_usd"] or w["landed_commits"] for w in rows):
+        return ""
+    return "$ per landed change (merges and version bumps left out): " + " | ".join(
+        trainstats.per_landed_lines(rows, pl.get("ref", "")))
+
+
 def lines(db: DB, now: float | None = None, window_s: float = WINDOW_S, blocked_h: float = BLOCKED_H,
           p: Project | None = None) -> list[str]:
     """The daily review's 'Self-efficiency audit' lines for the last `window_s`; [NOTHING] on an empty
@@ -569,6 +594,8 @@ def lines(db: DB, now: float | None = None, window_s: float = WINDOW_S, blocked_
         out.append(suite)
     if landed := landing_line(db, since):
         out.append(landed)
+    if dollars := per_landed_line(per_landed(p, db, now)):
+        out.append(dollars)
     if p is not None and (gate := gatetime.status_line(p.state, p.config(), now)):
         out.append(gate)
     if p is not None and (waits := gatetime.waits_line(db, p.state, now, landed=False)):
@@ -739,6 +766,6 @@ def report(db: DB, now: float | None = None, window_s: float = WINDOW_S, blocked
             "overrides": overrides(p, db, now, blocked_h), "promises": obligations.promise_outcomes(db, since, now),
             "repeated_instructions": correction.repeat_summary(db, since), "mount_races": mount_races(db, since),
             "context_gaps": context_gaps(db, since), "coordinator_fixes": coordfix.entries(db, since, now),
-            "approval_to_landed": pushq.landing_times(db, since),
+            "approval_to_landed": pushq.landing_times(db, since), "per_landed": per_landed(p, db, now),
             "outscan_refusals": outscan.refusal_counts(db, since),
             **({"rule_cites": rulecite.metric(p, now, window_s)} if p is not None else {})}

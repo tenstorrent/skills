@@ -3006,7 +3006,8 @@ the pick order, so it takes the first starts. A resumed resource ramps only its 
   the last 24 h and 7 d the booked spend over the commits landed on the push branch (merges and
   version bumps left out) and the subagents those runs started (each run's note keeps
   `subagents_spawned` and `subagent_types`, counted from its Agent calls; their cost is already in the
-  run's own). Checks already waiting for a slot re-execute on the new runtime
+  run's own). The daily review's self-efficiency audit (`ttp audit`) shows the same 24 h and 7 d
+  view on its `$ per landed change` line, and `ttp audit --json` as `per_landed`. Checks already waiting for a slot re-execute on the new runtime
   and pick their scope again.
 - `ttp checks -- <cmd>` adds a check. Several words run as that argv (`ttp checks -- pytest -q`);
   one quoted string runs through the shell (`ttp checks -- 'FOO=1 pytest -q && ruff check .'`);
