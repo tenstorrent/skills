@@ -3070,6 +3070,7 @@ ACCOUNT_KEYS = {"budget": {"global_daily_usd", "daily_target_usd", "day_start", 
                            "priority_beyond_cap",   # push and urgent runs beyond checks.host_max (checkcap.priority_beyond_cap)
                            "dirty_max_mb", "io_full_max",   # the disk gate on new local runs (diskgate)
                            "spill_hosts",   # the spill pool every project's checks may use (checkspill.account_hosts)
+                           "no_spill_hosts",   # hosts no project's checks spill to (checkspill.no_spill; a run only adds)
                            "slurm_overflow",   # a Slurm cluster the pool's overflow runs on (slurmcheck)
                            "smoke_max_s"}}   # the landing check time limit (gatetime.max_s), project first
 # Account keys a run may only clear (ttp config --account refuses setting them inside a run): remove them
@@ -3086,7 +3087,7 @@ ACCOUNT_OFF_VALUE = {"checks.spill_hosts": [], "checks.slurm_overflow": {}}
 # with its source, interval and key file.
 ACCOUNT_NESTED_KEYS = {"providers.chat.model_ranking", "providers.chat.ranking_source", "providers.chat.ranking_every_s",
                        "providers.chat.ranking_key_file"}
-HOST_WIDE_KEYS = {"checks.host_max", "route.host_max", "checks.spill_hosts", "checks.slurm_overflow", "checks.dirty_max_mb", "checks.io_full_max",
+HOST_WIDE_KEYS = {"checks.host_max", "route.host_max", "checks.spill_hosts", "checks.no_spill_hosts", "checks.slurm_overflow", "checks.dirty_max_mb", "checks.io_full_max",
                   "checks.push_priority_wait_s"}
 
 

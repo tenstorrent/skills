@@ -5302,6 +5302,7 @@ def _checks_lane_status(as_json: bool) -> int:
                           "project_max": checklane.project_cap(p.config()), "this_repo": here_repo,
                           "repos": checklane.lane_status(p.name, cfg=p.config(), names=names, db=p.db),
                           "spilled": checkspill.holders(p.name),
+                          "no_spill_hosts": checkspill.no_spill(),
                           "here": checkspill.here_records(p.name),
                           "slurm_overflow": slurmcheck.holders(p.name),
                           "slurm_paused": slurmcheck.tripped(),
@@ -5312,7 +5313,7 @@ def _checks_lane_status(as_json: bool) -> int:
                          indent=2))
     else:
         print(checklane.status_text(p.name, p.config(), here_repo, names=names, db=p.db))
-        for line in [*checkspill.status_lines(p.name), *checkspill.pick_lines(p.name), *checkspill.here_lines(p.name), *slurmcheck.probe_lines(), *slurmcheck.status_lines(p.name),
+        for line in [*checkspill.no_spill_lines(), *checkspill.status_lines(p.name), *checkspill.pick_lines(p.name), *checkspill.here_lines(p.name), *slurmcheck.probe_lines(), *slurmcheck.status_lines(p.name),
                      *filter(None, [slurmcheck.paused_line()])]:
             print(f"  {line}")
         print("check runs per host:")
@@ -10774,6 +10775,13 @@ def cmd_account_config(key: str, value: str | None) -> None:
             val = checkspill.hosts_of(val) or ""   # an empty pool is no pool: removed
         except ValueError as e:
             bad = [str(e).replace(f"delivery.{checkspill.KEY}", key)]
+        if not bad and (why := checkspill.ban_refusal(key, val)):
+            bad = [why]
+    if key == checkspill.NO_SPILL_KEY and val not in ("", None):
+        try:
+            val = checkspill.no_spill_of(val) or ""   # an empty ban list is none: removed
+        except ValueError as e:
+            bad = [str(e)]
     if key == slurmcheck.KEY and val not in ("", None, {}):
         try:
             slurmcheck.settings_of(val)
@@ -10799,8 +10807,18 @@ def cmd_account_config(key: str, value: str | None) -> None:
         weekly_default(b, acct)
         if warn := weekly_below_daily(b):
             print(f"warning: {warn} (account-level)", file=sys.stderr)
-    if key in ACCOUNT_USER_ONLY:   # who changed the account's pool or overflow, when (and slurmcheck's re-arm)
+    if key in ACCOUNT_USER_ONLY or key == checkspill.NO_SPILL_KEY:   # who changed the pool, overflow or ban, when
         _log_account_change(key, old, None if val == "" else val)
+    if key == checkspill.NO_SPILL_KEY and val:
+        from .globalcap import local_projects
+        for name, db in local_projects():   # a project list naming a now-banned host: its checks no longer go there
+            try:
+                if bad := checkspill.banned_in((Project(db.parent.parent).config().get("delivery") or {})
+                                               .get(checkspill.KEY)):
+                    print(f"warning: {name}'s delivery.{checkspill.KEY} names {', '.join(bad)}; "
+                          "its checks no longer spill there", file=sys.stderr)
+            except Exception:
+                continue
     if key == rankfresh.KEY:   # the ranking's change log, beside the refresher's own changes
         from .modelrank import ranking_of
         try:
@@ -10869,6 +10887,25 @@ def _user_only_change(raw: dict, key: str, val, p=None) -> str | None:
     return None
 
 
+def _no_spill_run_refusal(key: str, value: str) -> str:
+    """Why a run may not set the account's spill ban list to `value`: it drops a host the list bans now
+    (only the user lifts a ban; a run may add hosts); else ""."""
+    from . import checkspill
+    if key != checkspill.NO_SPILL_KEY:
+        return ""
+    try:
+        new = checkspill.no_spill_of(json.loads(value) if value else [])
+    except ValueError:
+        try:
+            new = checkspill.no_spill_of(value)
+        except ValueError:
+            return ""   # malformed: cmd_account_config refuses it with the reason
+    if gone := [b for b in checkspill.no_spill() if b not in new]:
+        return (f"{key}: a run may add hosts to the ban list but not remove one ({', '.join(gone)}); "
+                "only the user lifts a ban. Nothing was changed")
+    return ""
+
+
 def _refuse_user_only_in_run(key: str) -> None:
     from .coordinator import SANDBOX_KEYS, sandbox_refusal
     if key in SANDBOX_KEYS:
@@ -10919,6 +10956,8 @@ def cmd_config(a) -> None:
             # The account's spill pool and Slurm overflow send every project's code to those machines: only
             # clearing them (removing, or their off value) is a run's.
             _refuse_user_only_in_run(a.name)
+        if run and a.key is not None and (why := _no_spill_run_refusal(a.name, a.key)):
+            die(why)
         from . import accountset
         if a.name in accountset.KEYS and a.key is not None:
             return cmd_account_cap(a.name, a.key, run)
@@ -10984,6 +11023,11 @@ def cmd_config(a) -> None:
             minutes(a.key.split(".", 1)[1], val)
         except ValueError as e:
             die(str(e).replace("; the default is used", ""))
+    if a.key == "delivery.checks_spill_hosts" or a.key == "delivery" and isinstance(val, dict):
+        from . import checkspill
+        if why := checkspill.ban_refusal(f"delivery.{checkspill.KEY}", val.get(checkspill.KEY) if a.key == "delivery"
+                                         else val):
+            die(why)
     if a.key in ("delivery.push_checks", "delivery.push_checks_by_repo"):
         from .push import checks_by_repo_of, checks_of
         try:

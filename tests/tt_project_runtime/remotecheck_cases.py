@@ -1638,6 +1638,87 @@ def test_ttp_config_account_sets_the_spill_pool_validated_and_a_run_may_only_cle
     assert checkspill.account_hosts() == [] and "spill_hosts" not in (project.load_account_settings().get("checks") or {})
 
 
+
+def test_the_account_ban_list_keeps_a_spill_host_out_by_alias_or_host_name_and_an_unlisted_host_still_spills(
+        env, tmp_path, monkeypatch):
+    """checks.no_spill_hosts in the account settings: a host it names, by alias or by the machines list's host
+    name (full or short), is never tried or allowed, from the project's own list or the account's pool; a host
+    it does not name still spills, and the run's log says why the banned one was skipped."""
+    from ttp import checkspill, cli, machines, project
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a", "check-host-b"])
+    machines.add("check-host-b", hostname="serve-b.example")
+    project.set_account_setting(checkspill.ACCOUNT_KEY, ["down"])
+    project.set_account_setting(checkspill.NO_SPILL_KEY, ["CHECK-HOST-A", "serve-b", "down"])
+    assert checkspill.hosts(p.config()) == []
+    assert checkspill.banned("check-host-a") == "CHECK-HOST-A", "by alias, any case"
+    assert checkspill.banned("check-host-b") == "serve-b", "by the machines list's host name, short form"
+    assert "checks.no_spill_hosts" in checkspill.allowed(p, p.config(), "check-host-b")
+    assert checkspill.allowed(p, p.config(), "down").startswith("banned for every project"), "the pool too"
+    project.set_account_setting(checkspill.NO_SPILL_KEY, ["check-host-a", "serve-b.example"])
+    assert checkspill.banned("check-host-b") == "serve-b.example", "by the full host name"
+    assert checkspill.hosts(p.config()) == ["down"]
+    project.set_account_setting(checkspill.NO_SPILL_KEY, ["check-host-a"])
+    assert checkspill.hosts(p.config()) == ["check-host-b", "down"]
+    assert checkspill.allowed(p, p.config(), "check-host-b") == "", "an unlisted host still spills"
+    log = tmp_path / "where.log"
+    p.set_config("delivery.push_checks", [f"pwd >> {log}"])
+    lane = _spill_lane(p, repo)
+    try:
+        cli.main(["checks", "--fresh"])
+    finally:
+        lane.close()
+    rec = json.loads((run / "checks.json").read_text())
+    assert rec["passed"] is True and rec["spilled_to"] == "check-host-b", rec
+    text = (run / "checks.log").read_text()
+    assert "check-host-a (banned by the account's checks.no_spill_hosts)" in text, text
+    project.set_account_setting(checkspill.NO_SPILL_KEY, "check-host-a")   # malformed: no ban, never a crash
+    assert checkspill.no_spill() == [] and "check-host-a" in checkspill.hosts(p.config())
+
+
+def test_a_spill_list_naming_a_banned_host_is_refused_and_a_run_may_only_add_to_the_ban_list(
+        env, tmp_path, capsys, monkeypatch):
+    """`ttp config` and config_set refuse a project spill list or account pool naming a host the account bans;
+    a list set before the ban is flagged by the config check; `ttp checks status` shows the ban; a run may
+    add hosts to the ban list but never remove one, and each change is logged with its undo."""
+    from ttp import accountset, checkspill, cli, coordinator, machines, project
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    for k in ("TTP_RUN_ID", "TTP_RUN_DIR"):   # the user at a terminal until the run below
+        monkeypatch.delenv(k, raising=False)
+    machines.add("check-host-b", hostname="serve-b.example")
+    p.set_config("delivery.checks_spill_hosts", ["check-host-b"])
+    cli.main(["config", "--account", "checks.no_spill_hosts", '["serve-b.example"]'])
+    err = capsys.readouterr().err
+    assert checkspill.no_spill() == ["serve-b.example"]
+    assert f"{p.name}'s delivery.checks_spill_hosts names check-host-b" in err, err
+    assert any("check-host-b is banned" in x for x in project.config_problems(p.raw_config()))
+    for argv in (["config", p.name, "delivery.checks_spill_hosts", '["check-host-c", "check-host-b"]'],
+                 ["config", "--account", "checks.spill_hosts", '["check-host-b"]']):
+        with pytest.raises(SystemExit):
+            cli.main(argv)
+        assert "banned from every project's checks" in capsys.readouterr().err, argv
+    with pytest.raises(ValueError, match="banned"):
+        coordinator.USER_SETTABLE["delivery.checks_spill_hosts"](["check-host-b"])
+    assert coordinator.USER_SETTABLE["delivery.checks_spill_hosts"](["check-host-c"]) == ["check-host-c"]
+    cli.main(["config", p.name, "delivery.checks_spill_hosts", '["check-host-c"]'])
+    assert p.config()["delivery"]["checks_spill_hosts"] == ["check-host-c"]
+    assert checkspill.no_spill_lines() == [
+        "spill hosts banned for every project (checks.no_spill_hosts): serve-b.example"]
+    capsys.readouterr()
+    with pytest.raises(SystemExit):
+        cli.main(["checks", "status"])
+    assert "spill hosts banned for every project (checks.no_spill_hosts): serve-b.example" in capsys.readouterr().out
+    monkeypatch.setenv("TTP_RUN_ID", "7")
+    for value in ("[]", "", '["check-host-x"]'):
+        with pytest.raises(SystemExit):
+            cli.main(["config", "--account", "checks.no_spill_hosts", value])
+        assert "only the user lifts a ban" in capsys.readouterr().err, value
+    cli.main(["config", "--account", "checks.no_spill_hosts", '["serve-b.example", "check-host-x"]'])
+    assert checkspill.no_spill() == ["serve-b.example", "check-host-x"]
+    log = [json.loads(x) for x in accountset.log_path().read_text().splitlines()]
+    assert [r["new"] for r in log if r["key"] == "checks.no_spill_hosts"] == [
+        ["serve-b.example"], ["serve-b.example", "check-host-x"]]
+
+
 def test_a_wrapped_run_spills_only_when_its_project_says_the_wrapper_needs_no_device(env, tmp_path, monkeypatch):
     """checks.wrap_needs_device false: a run behind checks.wrap_cmd may spill and runs there without the
     wrapper (it is this machine's); unset, true or not a bool, the need is unknown and the run stays here."""

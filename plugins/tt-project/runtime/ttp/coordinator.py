@@ -448,7 +448,7 @@ USER_SETTABLE = {
     # The ssh alias gh calls run on (with -R) when this host has no gh login (ghroute); "" for none.
     "delivery.gh_route": lambda v: ghroute.value_of(v),
     # Ordered ssh aliases a run whose slots here stay busy may spill to (checkspill); a list, never a scalar.
-    "delivery.checks_spill_hosts": lambda v: checkspill.hosts_of(v),
+    "delivery.checks_spill_hosts": lambda v: checkspill.settable_hosts(v),
     "delivery.checks_spill_after_s": lambda v: checkspill.after_of(v),
     # Whether a run that may spill tries the spill hosts before a place here (checkspill.first; default true).
     "delivery.checks_spill_first": lambda v: checkspill.first_of(v),

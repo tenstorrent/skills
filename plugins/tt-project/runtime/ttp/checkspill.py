@@ -5,7 +5,11 @@
 A project may list, in order, the ssh aliases of other machines its checks may run on. The account's
 pool, `checks.spill_hosts` in the account settings (`ttp config --account checks.spill_hosts '["pool-a"]'`,
 which a run may only clear), follows that list in every project on this machine, so each spills
-without a list of its own. No machines-list tag adds a host. A project's own empty list (`[]`)
+without a list of its own. No machines-list tag adds a host. The account's ban list, `checks.no_spill_hosts`
+(`ttp config --account checks.no_spill_hosts '["host-x"]'`, ssh aliases or host names, which a run may only add
+to), keeps a host out of every project's spill on this machine: an alias, its machine or ssh host, or the
+machines list's `hostname` for it (full or short name) matches (banned), a project or pool list naming one is
+refused at config time, and `ttp checks status` shows the list. A project's own empty list (`[]`)
 keeps its checks here, the pool too; with neither, checks never leave this machine. A `ttp checks` run that may spill tries the listed hosts in
 order before it takes a place here (`delivery.checks_spill_first`, default true: first), so this machine keeps
 only the checks that cannot spill, and runs on the first that is allowed, reachable and has a free slot, as a
@@ -107,6 +111,7 @@ from . import remotecheck
 
 KEY = "checks_spill_hosts"
 ACCOUNT_KEY = "checks.spill_hosts"   # the account's pool (project.ACCOUNT_KEYS), after a project's own list
+NO_SPILL_KEY = "checks.no_spill_hosts"   # the account's ban list: hosts no project's checks spill to (banned)
 BESIDE_KEY = "spill_beside_device"   # checks.spill_beside_device: hosts a device job keeps no spill off (beside_device)
 NO_DEVICE_KEY = "wrap_needs_device"   # checks.wrap_needs_device false: a wrapped run needs no device and may spill
 PRE_KEY = "spill_pre_cmd"   # checks.spill_pre_cmd: the project's own go/skip command before a spill to a host (pre_check)
@@ -253,6 +258,9 @@ def problems(delivery: dict) -> list[str]:
             hosts_of(v)
         except ValueError as e:
             out.append(str(e).replace("; nothing was changed", ""))
+        if bad := banned_in(v):
+            out.append(f"delivery.{KEY}: {', '.join(bad)} is banned by the account's {NO_SPILL_KEY}; "
+                       "its checks never spill there")
     a = (delivery or {}).get(AFTER_KEY)
     if a is not None and (isinstance(a, bool) or not isinstance(a, (int, float)) or a < 0):
         out.append(f"delivery.{AFTER_KEY}: {a!r} is not a number of seconds")
@@ -268,6 +276,93 @@ def problems(delivery: dict) -> list[str]:
     return out
 
 
+def no_spill_of(v: Any) -> list[str]:
+    """A `checks.no_spill_hosts` value set by `ttp config --account`: a list (or a JSON-encoded list) of ssh
+    aliases or host names. ValueError for anything else."""
+    try:
+        return hosts_of(v)
+    except ValueError as e:
+        raise ValueError(str(e).replace(f"delivery.{KEY}", NO_SPILL_KEY)) from None
+
+
+def _names(x: str) -> set[str]:
+    """A host name and its short form (first label), lower-cased; an address keeps no short form."""
+    x = str(x).strip().lower()
+    short = x.split(".")[0]
+    return set() if not x else {x} if short.isdigit() else {x, short}
+
+
+def no_spill() -> list[str]:
+    """The account's ban list (checks.no_spill_hosts) in order; [] when unset or malformed."""
+    from . import project
+    try:
+        return no_spill_of((project.load_account_settings().get("checks") or {}).get("no_spill_hosts") or [])
+    except ValueError:
+        return []
+
+
+def banned(alias: str, known: dict | None = None, ban: list[str] | None = None) -> str:
+    """The checks.no_spill_hosts entry that keeps spill host `alias` out, else "": it names the alias, its
+    machine or ssh host (target), or the machines list's `hostname` for either, by full or short name."""
+    ban = no_spill() if ban is None else ban
+    if not ban:
+        return ""
+    from . import machines
+    known = machines.load() if known is None else known
+    machine, host = target(alias, known)
+    names = set().union(*(_names(n) for n in (alias, machine, host)))
+    for n in (machine, host):
+        names |= _names((known.get(n) or {}).get("hostname") or "")
+    return next((b for b in ban if _names(b) & names), "")
+
+
+def banned_in(v: Any, known: dict | None = None) -> list[str]:
+    """The hosts of spill list `v` (a project's delivery.checks_spill_hosts or the account's pool) that
+    checks.no_spill_hosts bans; [] when none is or `v` is malformed."""
+    try:
+        got = hosts_of(v)
+    except ValueError:
+        return []
+    ban = no_spill()
+    return [h for h in got if banned(h, known, ban)] if ban else []
+
+
+def ban_refusal(key: str, v: Any) -> str:
+    """Why setting spill list `key` to `v` is refused: it names a host checks.no_spill_hosts bans; else ""."""
+    if bad := banned_in(v):
+        return (f"{key}: {', '.join(bad)} is banned from every project's checks by the account's "
+                f"{NO_SPILL_KEY} ({json.dumps(no_spill())}); nothing was changed")
+    return ""
+
+
+def banned_listed(cfg: dict | None) -> list[str]:
+    """The hosts in the project's spill list or the account's pool that checks.no_spill_hosts keeps out."""
+    if not no_spill():
+        return []
+    own = ((cfg or {}).get("delivery") or {}).get(KEY)
+    try:
+        mine = hosts_of(own) if own is not None else []
+    except ValueError:
+        return []
+    if own is not None and not mine:
+        return []
+    return banned_in(list(dict.fromkeys([*mine, *account_hosts()])))
+
+
+def settable_hosts(v: Any) -> list[str]:
+    """hosts_of(v) for a config_set of delivery.checks_spill_hosts; ValueError also when it names a host the
+    account's checks.no_spill_hosts bans."""
+    got = hosts_of(v)
+    if why := ban_refusal(f"delivery.{KEY}", got):
+        raise ValueError(why)
+    return got
+
+
+def no_spill_lines() -> list[str]:
+    """`ttp checks status` line: the account's ban list."""
+    return [f"spill hosts banned for every project ({NO_SPILL_KEY}): {', '.join(b)}"] if (b := no_spill()) else []
+
+
 def account_hosts() -> list[str]:
     """The account's pool (checks.spill_hosts in the account settings) in order; [] when unset or malformed."""
     from . import project
@@ -278,7 +373,7 @@ def account_hosts() -> list[str]:
 
 
 def hosts(cfg: dict | None) -> list[str]:
-    """The project's spill hosts in order, then the account's pool;
+    """The project's spill hosts in order, then the account's pool, less those checks.no_spill_hosts bans;
     [] when the project's own list is empty (it keeps its checks here) or malformed (config_problems names it)."""
     own = ((cfg or {}).get("delivery") or {}).get(KEY)
     try:
@@ -287,7 +382,12 @@ def hosts(cfg: dict | None) -> list[str]:
         return []
     if own is not None and not mine:
         return []
-    return list(dict.fromkeys([*mine, *account_hosts()]))
+    listed = list(dict.fromkeys([*mine, *account_hosts()]))
+    if not (ban := no_spill()):
+        return listed
+    from . import machines
+    known = machines.load()
+    return [h for h in listed if not banned(h, known, ban)]
 
 
 def _own(cfg: dict | None) -> list[str]:
@@ -685,6 +785,8 @@ def allowed(p, cfg: dict, alias: str) -> str:
         return "not in the machines list (ttp machines add)"
     if machines.retired(known.get(machine)):
         return "retired in the machines list"
+    if ban := banned(alias, known):
+        return f"banned for every project by the account's {NO_SPILL_KEY} ({ban})"
     if alias not in _own(cfg) and alias not in account_hosts() and machine not in account_hosts():
         name = getattr(p, "name", "") or "<project>"
         return (f"not a spill host of this project (add it with `ttp config {name} delivery.{KEY} "
@@ -1214,7 +1316,7 @@ def pick(p, cfg: dict, tell, what: str = "", off: str = "", why_here: str = "") 
     LAST_BUSY.clear()
     rec = {"project": p.name, "task": os.environ.get("TTP_TASK") or "", "run": os.environ.get("TTP_RUN_ID") or "",
            "pid": os.getpid(), "since": time.time(), "what": what[:300]}
-    skipped, keep = [], kept_off(off, cfg)
+    skipped, keep = [f"{h} (banned by the account's {NO_SPILL_KEY})" for h in banned_listed(cfg)], kept_off(off, cfg)
     if env := env_off(off, cfg):
         tell(f"no spill host could take the checks, waiting here: {env}")
         _note_pick(p.name, "", [f"{alias} ({env})" for alias in hosts(cfg)])

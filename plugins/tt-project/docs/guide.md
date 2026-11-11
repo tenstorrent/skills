@@ -2278,7 +2278,12 @@ session and stateless coordinators on every provider.
   (`ttp config --account checks.spill_hosts '["pool-a", "pool-b"]'`; only the user sets it, a run may only
   clear it with `[]`), follows each project's own list, so every project on the machine spills to it without a
   list of its own; its hosts need no charter line but must be in the machines list. A project's own `[]` keeps
-  its runs here, pool included. Runs with a check host or the authoring tree never spill; runs behind
+  its runs here, pool included. The account's ban list, `checks.no_spill_hosts`
+  (`ttp config --account checks.no_spill_hosts '["host-x"]'`; ssh aliases or host names; a run may add to it but
+  never remove a host), keeps those machines out of every project's spill on this machine: a host matches by its
+  alias, its machine, or the machines list's `hostname` (full or short name). Setting a project list or the pool
+  that names one is refused, a project list set before the ban is flagged by the config check and skipped, and
+  `ttp checks status` shows the list. Runs with a check host or the authoring tree never spill; runs behind
   `checks.wrap_cmd` spill only when the project sets `checks.wrap_needs_device: false` (they run there without
   the wrapper; unset or true, the run stays here, and its `checks.log` and queue-wait item say `no spill host can
   take these checks` because neither `checks.spill_wrap_cmd` nor `checks.wrap_needs_device: false` is set). Two settings drop the wrapper, for different cases.
