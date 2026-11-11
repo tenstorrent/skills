@@ -598,7 +598,12 @@ def _archive(host, top, head, q, direct, deadline) -> tuple[int, str]:
     if src_rc != 0:
         _say(f"git archive of {head[:12]} failed (exit {src_rc})")
         return 2, ""
-    return 0, _host_step(host, init, direct, deadline, f"making {head[:12]}'s tree a git checkout on {host} (setup)")
+    label = f"making {head[:12]}'s tree a git checkout on {host} (setup)"
+    t0 = time.time()
+    why = _host_step(host, init, direct, deadline, label)
+    if not why:
+        _say(f"{label}: done in {time.time() - t0:.0f} s")
+    return 0, why
 
 
 def _attempt(host, top, head, env, extra, cmd, mark, wrap, wait) -> tuple[int, str]:
