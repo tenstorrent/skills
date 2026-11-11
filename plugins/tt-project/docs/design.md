@@ -224,8 +224,8 @@ disk untouched, with no migration; nothing else is reclaimed by check recovery.
 
 - The project lease (lease.py) only refuses dispatch on a host that does not hold it. Shared
   effects of workers already running there (pushes, device jobs, `ttp lock`, ledger writes) are not
-  yet fenced by `TTP_LEASE_EPOCH`, there is no ssh-file store, and a stand-in, hand-back or planned
-  move needs later steps. "Failover" in lease docs means moving a project between hosts; provider
+  yet fenced by `TTP_LEASE_EPOCH`, there is no ssh-file store, and a stand-in or hand-back needs
+  later steps. A planned move without the lease is `ttp move` (projmove.py, guide "Moving a project"). "Failover" in lease docs means moving a project between hosts; provider
   failover (failover.py) moves a task between model providers.
 
 - A pause's health end cannot be tuned. A coordinator pause of a resource with an enabled heal

@@ -116,6 +116,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # A project paused this long raises one normal alert naming who paused it, why and since when,
         # reminded at most once a day and cleared on resume (projpause; 0 = never).
         "paused_alert_s": 14400,
+        # After an outage ends, new workers start this many above those still running and double every
+        # ramp_step_s seconds until they pass max_parallel_workers (rampup.py; 0 = all at once).
+        "ramp_start": 2,
+        "ramp_step_s": 180,
         # A run that ends without reporting its cost is estimated from its tokens at the project's
         # own observed rate; until there is one, this $ per million weighted tokens (set high).
         "estimate_usd_per_mtok": 15.0,

@@ -90,6 +90,7 @@ from . import chainprio
 from . import churnwatch
 from . import alerts
 from . import rampup
+from . import projmove
 from . import applyff, landff
 from . import userstep
 from . import waitpoll
@@ -2311,7 +2312,7 @@ class Daemon:
                      self.sweep_sandbox_trees,
                      self.verify_pushes,
                      self.tick_prune_worktrees, self.prune_leftovers, self.branch_cap, self.land_harness_worktrees, self.backup_branches, self.replicate_state, self.check_local_only, self.check_disk,
-                     self.sweep_alerts, self.check_release, self.sync_shared_pauses, self.check_pause_ends, self.track_outages,
+                     self.sweep_alerts, self.check_release, self.sync_shared_pauses, self.check_pause_ends, self.check_move, self.track_outages,
                      self.check_integrity, self.heal_harness_git,
                      self.sync_schedules, self.lint_charter, self.tend_holds, self.record_ttr, self.alert_long_pause,
                      self.check_linger, self.check_notifier, self.check_overseer, self.alert_slurm_paused, self.check_gh_auth, self.check_reach, self.check_chats,
@@ -11821,6 +11822,17 @@ class Daemon:
         finally:
             self._slot_resv_pass = None
 
+    def check_move(self) -> None:
+        """A planned move (projmove.py): the old copy stops once the new one runs; the new one starts
+        workers once the old one has stopped."""
+        def turned(since: float) -> bool:
+            return bool(self.p.db.one("SELECT 1 FROM runs WHERE role='coordinator' AND status='ok' AND ended>?",
+                                      (since,)))
+        if said := projmove.step(self.p.db, turned):
+            log(self.p, f"project move: {said}")
+            self.p.db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
+                        (time.time(), "daemon", "project_move", "low", said, "done"))
+
     def track_outages(self) -> None:
         """Note which outages hold now (rampup.py): when one ends, new starts ramp up, not all at once."""
         db, signs = self.p.db, set()
@@ -11849,6 +11861,11 @@ class Daemon:
 
     def _dispatch(self, busy: dict) -> None:
         db = self.p.db
+        if held := projmove.dispatch_hold(db):   # the old copy may still start workers: none here yet
+            if held != getattr(self, "_move_said", ""):
+                log(self.p, held)
+                self._move_said = held
+            return
         self._tend_premises()   # a code task queued this tick with a `premise:` line waits on its check
         self._release_topup_holds()   # an urgent or user-ordered task held on its spent budget goes back
         ready = db.ready_tasks()   # read after _slot_reservations, which may have woken a reserving task

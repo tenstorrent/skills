@@ -10764,6 +10764,45 @@ def cmd_alive(a) -> None:
     sys.exit(0 if ok else 1)
 
 
+def cmd_move(a) -> None:
+    """`ttp move <name>`: a planned move to another host, without both copies starting work (projmove.py)."""
+    from . import projmove
+    p = need(a.name, sys.argv[1:])
+    db = p.db
+    if a.cancel:
+        db.set_kv(projmove.KEY, None)
+        print(f"{p.name}: move forgotten")
+        return
+    if a.confirmed:   # the new copy runs: this one stops now
+        projmove.stop(db, projmove.current(db) or {"role": "source", "host": "", "name": p.name,
+                                                 "since": time.time()})
+        print(f"{p.name} stopped here: no new worker or coordinator run starts; running workers finish")
+        return
+    if a.to or a.from_:
+        try:
+            host, name = projmove.parse(a.to or a.from_, p.name)
+        except ValueError as e:
+            die(str(e))
+        rec = projmove.record(db, "source" if a.to else "target", host, name)
+        if a.to:
+            print(f"{p.name} moving to {host} ({name}): this copy stops within a few minutes of the copy "
+                  "there running (`ttp move` --from on that host holds its workers until then)")
+        else:
+            db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
+                 (rec["since"], "cli", "project_move", "normal",
+                  f"this project moved here from {host}: take a turn; workers start once the copy there stopped",
+                  "queued"))
+            print(f"{p.name} moving here from {host} ({name}): workers start once the copy there has stopped")
+        return
+    rec = projmove.current(db)
+    if not rec:
+        print(f"{p.name}: no move recorded")
+        return
+    state = "done" if rec.get("done") else "under way"
+    way = "to" if rec["role"] == "source" else "from"
+    print(f"{p.name} move {way} {rec['host']} ({rec['name']}): {state}" + (f"; last: {rec['note']}" if rec.get("note") else ""))
+
+
 def cmd_pause(a) -> None:
     p = need(a.name, sys.argv[1:])
     if (a.resource or getattr(a, "machine", None)) and getattr(a, "until_reboot", False):
@@ -15157,6 +15196,16 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("name", help="the project")
     s.add_argument("--within", default="6h", help="how recent its last successful model run must be (default 6h)")
     s.set_defaults(fn=cmd_alive)
+    s = sub.add_parser("move", help="move a project to another host without both copies starting work: --to on "
+                                     "the old host, --from on the new one; the old copy stops once the new one runs")
+    s.add_argument("name", help="the project")
+    g = s.add_mutually_exclusive_group()
+    g.add_argument("--to", metavar="HOST[:NAME]", help="this is the old copy: stop it once the copy there runs")
+    g.add_argument("--from", dest="from_", metavar="HOST[:NAME]",
+                   help="this is the new copy: start workers only once the copy there has stopped")
+    g.add_argument("--confirmed", action="store_true", help="the new copy runs: stop this one now (exit 0)")
+    g.add_argument("--cancel", action="store_true", help="forget the move recorded here")
+    s.set_defaults(fn=cmd_move)
     s = sub.add_parser("drain", help="pause the project and wait until its runs in flight end (they are not killed)")
     s.add_argument("name", help="the project")
     s.add_argument("--wait", type=float, default=0, metavar="S",

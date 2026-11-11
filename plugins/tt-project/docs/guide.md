@@ -1700,6 +1700,32 @@ the promises missed, those missed twice or more, due moves without a plan change
 median lateness. All of it runs at action apply and in the obligation check, so it is the same for
 session and stateless coordinators on every provider.
 
+## Moving a project
+
+`ttp move` moves a project to another host without both copies starting work:
+
+- On the new host, `ttp move <name> --from <old host>[:<name>]`: its coordinator runs, but it
+  starts no worker until the old copy has stopped. After its first coordinator turn it calls
+  `ttp move <name> --confirmed` on the old host over ssh, which stops that copy at once. An old host
+  that does not answer for 10 minutes counts as stopped.
+- On the old host, `ttp move <name> --to <new host>[:<name>]`: every minute its daemon asks the new
+  host (`ttp alive <name>`) whether a model run there succeeded since the move began; the first yes
+  pauses this copy. Either side alone is enough, so the old copy stops within a few minutes of the
+  new one running.
+
+The stopped copy is paused: no worker starts and its coordinator wakes no more, while its running
+workers finish with their work kept, as with `ttp drain`. It raises no long-pause alert. `ttp move
+<name>` shows the move, `--cancel` forgets it, and `ttp resume` on the old host undoes the stop.
+
+## Ramp-up after an outage
+
+When an outage ends (a host reboot, the project or one of its resources resumed, a provider's login,
+budget gate or network back, the lease taken again), new workers do not all start at once. Starts
+begin at `budget.ramp_start` (2) workers above those still running and double every
+`budget.ramp_step_s` (180 s) until they pass `budget.max_parallel_workers`. Urgent work is first in
+the pick order, so it takes the first starts. A resumed resource ramps only its own tasks.
+`budget.ramp_start: 0` turns ramp-up off.
+
 ## Parallel work
 
 - Up to 6 workers per project run side by side (`budget.max_parallel_workers`); on a plan, all of

@@ -218,8 +218,8 @@ def alert_due(db, cfg: dict, now: float | None = None) -> tuple[str, dict] | Non
     now = time.time() if now is None else now
     limit = alert_s(cfg)
     info = current(db, now)
-    if not info or limit <= 0 or now - info["since"] < limit:
-        return None
+    if not info or limit <= 0 or now - info["since"] < limit or info.get("via") == "ttp move":
+        return None   # a copy stopped for a move (projmove.py) is meant to stay paused
     return alert_key(info), info
 
 
