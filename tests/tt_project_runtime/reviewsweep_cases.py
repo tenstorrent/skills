@@ -299,7 +299,9 @@ def test_a_finish_whose_diff_read_timed_out_gets_its_review_on_the_next_tick(env
     from ttp.daemon import Daemon, KV_REVIEW_UNREAD
     p = make(env)
     _with_origin(env, clone=False)
-    real, cut = worktree.diff_lines, {"n": 1}
+    # A slow disk cuts every read of the finish: the split check's (splitgate, e5906194d: a miss is skipped)
+    # and the review's own.
+    real, cut = worktree.diff_lines, {"n": 2}
 
     def slow(*a, **k):
         if cut["n"]:
