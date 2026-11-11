@@ -37,6 +37,7 @@ def _sh_setup(env, monkeypatch, tmp_path, mode="all", hook=True):
     p, d, clock, starts = _batch_setup(env, monkeypatch, busy=0)
     p.set_config("coordinator.batch_s", 0)
     p.set_config("coordinator.event_hold_s", 0)
+    p.set_config("coordinator.plain_done_hold_max_s", 0)   # a held plain hand-off never reaches the hook
     script = tmp_path / "hook.py"
     script.write_text(_HOOK)
     if hook:
@@ -288,3 +289,15 @@ def test_settlehook_parse_shapes():
                 b'[{"event_id": 1, "settle": true, "reason": " "}]'):
         with pytest.raises(ValueError):
             settlehook.parse(bad, {1})
+
+
+def test_settlehook_is_not_asked_about_a_plain_done_the_hold_keeps_waiting(env, monkeypatch, tmp_path):
+    p, d, clock, starts, turns = _sh_setup(env, monkeypatch, tmp_path)
+    p.set_config("coordinator.plain_done_hold_max_s", 3000)
+    d.cfg = p.config()
+    clock[0] += 60
+    i = _ev_x(p, clock, "task_done", "#3 tidy docs → done: ok", "normal", "task:3", 3, None)
+    assert not _drive(d, clock, starts) and not _hook_ran(tmp_path) and _status(p, i) == "queued"
+    clock[0] += 3000   # past the hold: the batch goes through the hook as any other
+    assert _drive(d, clock, starts) or _status(p, i) == "handled"
+    assert _hook_ran(tmp_path)
