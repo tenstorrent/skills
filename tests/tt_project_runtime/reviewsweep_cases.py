@@ -407,3 +407,22 @@ def test_the_unreviewed_sweep_reads_every_head_in_one_git_call(env, monkeypatch)
     assert sorted(queued) == tids
     assert len(batches) == 1 and sorted(batches[0]) == sorted(p.db.task(t)["branch"] for t in tids)
     assert not calls, "the sweep read a head on its own"
+
+
+def test_a_worker_renaming_its_branch_in_its_worktree_still_gets_a_pushable_review_at_the_new_head(env):
+    """The branch a worker renamed inside its worktree is recorded on the task before the review is
+    queued: no external-repo wording, no no_push line."""
+    from ttp.daemon import Daemon
+    from ttp import extchange, worktree
+    p = make(env)
+    tid = p.db.add_task("renamed", "spec", kind="code", origin="coordinator")
+    path, own = worktree.ensure(p, p.db.task(tid))
+    _git_out(path, "branch", "-m", own, f"ttp/t{tid}-renamed-by-worker")
+    head = _commit_file_in(path, "fix.txt")
+    p.db.update_task(tid, branch=own, status="review", result=json.dumps({"status": "done", "summary": "ok"}))
+    _ran(p, tid, time.time() - 1900)
+    _sweep(Daemon(p.base))
+    assert p.db.task(tid)["branch"] == f"ttp/t{tid}-renamed-by-worker"
+    (rev,) = _daemon_reviews(p, tid)
+    assert extchange.NO_PUSH_LINE not in rev["spec"] and extchange.REVIEW_ONLY not in rev["spec"]
+    assert head[:7] in rev["spec"] or f"ttp/t{tid}-renamed-by-worker" in rev["spec"]

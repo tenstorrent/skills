@@ -19453,6 +19453,13 @@ class Daemon:
         branch on record, no PR and no `published` entry takes its hand-off's top-level `branch` + `head`
         (+ optional `repo`, extchange.top_level) as that entry, never a branch or sha named in prose."""
         res = load_result(task.get("result"))
+        if task.get("id") and not prguard.task_pr(task) and (own := worktree.worktree_branch(self.p, task)) \
+                and own != task.get("branch"):
+            # The worker renamed its branch inside its worktree: the worktree's branch is the change.
+            self.p.db.update_task(task["id"], branch=own)
+            log(self.p, f"task {task['id']}: its worktree is on {own}, not {task.get('branch')}; "
+                        f"recorded the worktree's branch")
+            task["branch"] = own
         ch, why = extchange.parse(res.get(extchange.FIELD))
         field = extchange.FIELD
         if ch is None and not why and not task.get("branch") and not prguard.task_pr(task):

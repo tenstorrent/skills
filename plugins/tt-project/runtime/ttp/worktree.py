@@ -62,6 +62,19 @@ def unbare_root(p: Project) -> bool:
     return is_git(root)
 
 
+def worktree_branch(p: Project, task: dict) -> str:
+    """The branch task `task`'s own worktree is on now, when that is a ttp/t<id>-* branch of this task
+    (a worker may rename its branch inside the worktree), else "" (no worktree, detached, or not its own)."""
+    path = p.worktrees / f"t{task['id']}"
+    try:
+        if not path.is_dir():
+            return ""
+        there = _git(path, "symbolic-ref", "--short", "-q", "HEAD", check=False).strip()
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return there if there.startswith(f"ttp/t{task['id']}-") else ""
+
+
 def local_change(p: Project, ch: dict) -> str:
     """The local branch of the project's own git holding change `ch` ({"branch", "head"}, as a hand-off's
     top-level fields name it): its branch when that is a local branch and its head is a commit here, else
