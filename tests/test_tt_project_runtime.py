@@ -6248,7 +6248,9 @@ def _dispatch_claude_worker(p, monkeypatch, flags, kind="work", spec="TASK-SPEC-
     monkeypatch.setattr(dmod.subprocess, "Popen",
                         lambda argv, *a, **k: Proc() if "ttp.runner" in argv else real(argv, *a, **k))
     p.set_config("core_provider", "claude")
-    tid = p.db.add_task("tidy docs", spec, kind=kind, tier="light", origin="user")
+    # Several dispatches in one project take numbered titles: a repeated title is held at dispatch (supersede.py).
+    n = p.db.one("SELECT COUNT(*) AS n FROM tasks")["n"] + 1
+    tid = p.db.add_task(f"tidy docs {n}", spec, kind=kind, tier="light", origin="user")
     dmod.Daemon(p.base).dispatch()
     run = p.db.one("SELECT dir FROM runs WHERE task=?", (tid,))
     assert run, p.db.task(tid)["blocked_reason"]

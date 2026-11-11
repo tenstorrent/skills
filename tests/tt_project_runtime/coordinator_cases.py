@@ -14014,6 +14014,7 @@ def test_a_setting_hold_keeps_landing_tasks_off_workers_until_the_setting_is_on(
     from ttp import settinghold
     p = make(env)
     _remote_origin(p)
+    p.set_config("dispatch.batch", False)   # each task its own run: batch runs (1ed160fc4) would fold them into one
     p.set_config("delivery.push_branch", "origin/main")
     land = [p.db.add_task("Land the fix", "Fix it, then land on main with `ttp push --detach`.", kind="code",
                           tier="light", origin="user"),

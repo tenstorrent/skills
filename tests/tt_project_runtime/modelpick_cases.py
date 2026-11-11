@@ -87,6 +87,7 @@ def test_model_pick_jev_routes_open_work_logs_and_settles_it(env, monkeypatch):
     from ttp.providers.base import RunUsage as Usage
     p = make(env)
     _mp_config(p)
+    p.set_config("dispatch.batch", False)   # each task its own run: batch runs (1ed160fc4) would fold them into one
     now = time.time()
     for cost in (2.0, 4.0):   # the stratum's core runs: code tasks at the standard tier's model
         old = p.db.add_task("old", "s", kind="code", tier="standard")
@@ -193,6 +194,7 @@ def test_model_pick_applies_only_at_its_own_tier_and_never_to_a_floor_run(env, m
     from ttp.daemon import Daemon
     p = make(env)
     _mp_config(p)
+    p.set_config("dispatch.batch", False)   # each task its own run: batch runs (1ed160fc4) would fold them into one
     p.set_config("providers.chat.tiers.deep", {"model": "example-org/deep-model"})   # deep is not routed
     d = Daemon(p.base)
     d.jev = _ModelJev()
