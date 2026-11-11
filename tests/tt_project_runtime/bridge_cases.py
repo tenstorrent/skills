@@ -22,7 +22,23 @@ def test_bridge_config_parses_hosts_ports_and_agents():
     assert [h["port"] for h in a["auto"]["forward"]] == [2301, 2302]
     assert a["auto"]["forward"][0]["host_key_alias"] == "build-a.example.com"   # defaults to the target
     assert a["auto"]["forward"][1]["adopt"] is True
-    assert a["git"]["direct"] == [{"name": "git.example.com", "aliases": [], "user": "git"}]
+    assert a["git"]["direct"] == [{"name": "git.example.com", "aliases": [], "user": "git",
+                                     "target": "", "host_key_alias": ""}]
+
+
+def test_bridge_direct_host_may_name_its_address_and_known_host_key():
+    # cells: direct-hostname
+    # a lab host whose older config entry elsewhere names a stale known-hosts alias: the block's own
+    # HostName and HostKeyAlias come first, so they win
+    import pytest
+    from ttp import bridge
+    cfg = _bridge_cfg(agents={"auto": {"agent": "env", "direct": [
+        {"name": "peer", "aliases": ["peer-long"], "target": "10.0.0.9", "host_key_alias": "10.0.0.9", "user": "u"}]}})
+    block = bridge.render_block(cfg, "box-1")
+    host = block[block.index("Host peer peer-long"):]
+    assert "  HostName 10.0.0.9\n  HostKeyAlias 10.0.0.9\n  User u" in host
+    with pytest.raises(bridge.BadConfig):
+        bridge.parse({"boxes": {"b": {"agents": {"a": {"agent": "env", "direct": [{"name": "h", "target": "-oX"}]}}}}})
 
 
 def test_bridge_config_refuses_unsafe_or_ambiguous_entries():

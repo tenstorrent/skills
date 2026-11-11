@@ -111,7 +111,7 @@ def block_lines(cfg: dict, box: str) -> tuple[list[str], set[str]]:
     bridged = {n: an for an, a in cfg["boxes"][box]["agents"].items()
                for h in a["forward"] + a["direct"] for n in [h["name"], *h["aliases"]]}
     keyalias = {n: h["host_key_alias"] for a in cfg["boxes"][box]["agents"].values()
-                for h in a["forward"] for n in [h["name"], *h["aliases"]]}
+                for h in a["forward"] + a["direct"] if h["host_key_alias"] for n in [h["name"], *h["aliases"]]}
     allowed = {f"  IdentityFile {p['key']}", f"  CertificateFile {p['cert']}"}
     lines = ["", "# Offline: while the link to the workstation is down, these go direct with this box's own key and a",
              "# short-lived certificate the workstation renews; once it ends, they fail."]

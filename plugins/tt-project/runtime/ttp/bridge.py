@@ -75,7 +75,9 @@ def parse(data: dict) -> dict:
     Each agent: {"agent": "env" or a socket path on this computer, "forward": [host...], "direct": [host...]}.
     A forwarded host: {"name", "aliases", "target", "port", "adopt", "user", "host_key_alias", "interface"}
     ("interface": this computer reaches the target only bound to that interface; see bridge_relay); a direct
-    one: {"name", "aliases", "user"}. Raises BadConfig naming the first problem."""
+    one: {"name", "aliases", "user", "target", "host_key_alias"} (the last two optional: the HostName to dial
+    and the known-hosts name to check it by, for a host whose older config entries elsewhere name others).
+    Raises BadConfig naming the first problem."""
     if not isinstance(data, dict):
         raise BadConfig("the config is a JSON object")
     sock = data.get("socket_dir", SOCKET_DIR)
@@ -126,7 +128,9 @@ def parse(data: dict) -> dict:
                     raise BadConfig(f"box {box} agent {an}: each direct entry is an object")
                 direct.append({"name": _name(h.get("name"), f"box {box} agent {an}: host"),
                                "aliases": [_name(x, "alias") for x in h.get("aliases") or []],
-                               "user": _name(h["user"], "user") if h.get("user") else ""})
+                               "user": _name(h["user"], "user") if h.get("user") else "",
+                               "target": _name(h["target"], "target") if h.get("target") else "",
+                               "host_key_alias": _name(h["host_key_alias"], "host_key_alias") if h.get("host_key_alias") else ""})
             if not fwd and not direct:
                 raise BadConfig(f"box {box} agent {an}: list the hosts it serves (forward or direct)")
             for h in fwd + direct:
@@ -256,6 +260,10 @@ def render_block(cfg: dict, box: str) -> str:
                 lines.append(f"  User {h['user']}")
         for h in a["direct"]:
             lines += ["", f"Host {' '.join([h['name'], *h['aliases']])}", f"  IdentityAgent {ident}"]
+            if h["target"]:
+                lines.append(f"  HostName {h['target']}")
+            if h["host_key_alias"]:
+                lines.append(f"  HostKeyAlias {h['host_key_alias']}")
             if h["user"]:
                 lines.append(f"  User {h['user']}")
     block = "\n".join(lines + ["", "Match all", END]) + "\n"
