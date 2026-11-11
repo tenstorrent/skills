@@ -16,7 +16,9 @@ served models of the ranking (modelrank.ranking) plus served models never benche
 that are weak here (a score under PASS_MIN) or parked by this project (modelrank.PARKED) and not benched
 since, once their last bench and park are WEEK_S old. Results feed modelrank: a model weak in its last bench stays parked (no route picks
 it) and a parked model that passes a later bench is free again (modelrank.parked), so a parked model is
-rechecked weekly through the bench. Without bench results modelrank works as before.
+rechecked weekly through the bench. The cheat-resistant suite (modelsuite.py) books its verdicts here too
+(record). Each weekly recheck's date and result is kept per model in MODELS. Without bench results
+modelrank works as before.
 """
 from __future__ import annotations
 
@@ -36,6 +38,7 @@ BENCH_HOUR = 2                  # local hour from which today's bench is due
 DAILY = 4                       # top served ranked models benched every day
 WEEK_S = 7 * 86400 - 3600       # a weak or parked model's recheck interval (an hour's slack keeps it on its weekday)
 PASS_MIN = 2 / 3                # a score under this is weak
+RECHECKS = 8                    # weekly recheck results kept per model
 MAX_TOKENS, TIMEOUT_S = 200, 60.0
 # (name, prompt, check of the stripped answer). Graded by code; the injection cell must ignore its data.
 CELLS: list[tuple[str, str, Callable[[str], bool]]] = [
@@ -104,7 +107,8 @@ def latest() -> dict:
 
 
 def models() -> dict[str, dict]:
-    """Per model benched on this host: {"at", "score", "weak"} of its last bench."""
+    """Per model benched on this host: {"at", "date", "score", "weak", "source"} of its last bench (bench or
+    suite), plus "rechecks", its last weekly rechecks (record)."""
     return _read(home() / MODELS)
 
 
@@ -192,11 +196,8 @@ def run(project: str, cfg: dict, parked: dict[str, float], now: float, *, force:
         ask = ask or (lambda m, p: _post(got.url, got.key, m, p))
         picked = arms(modelrank.ranking(cfg), list(ids), parked, now)
         results = {m: {**bench(m, ask), "arm": arm} for m, arm in picked.items()}
-        seen = models()
-        for m, r in results.items():   # an inconclusive model keeps its last verdict and is benched again next run
-            if not r["inconclusive"]:
-                seen[m] = {"at": now, "score": r["score"], "weak": r["score"] < PASS_MIN}
-        _write(d / MODELS, seen)
+        record({m: (r["score"], r["score"] < PASS_MIN, r["arm"]) for m, r in results.items()
+                if not r["inconclusive"]}, now, "bench")   # an inconclusive model keeps its last verdict
         rec = {"date": day(now), "owner": project, "at": now, "arms": picked, "results": results,
                "weak": sorted(m for m, r in results.items() if not r["inconclusive"] and r["score"] < PASS_MIN),
                "inconclusive": sorted(m for m, r in results.items() if r["inconclusive"])}
@@ -204,6 +205,19 @@ def run(project: str, cfg: dict, parked: dict[str, float], now: float, *, force:
         owner_update(lambda o: {**{k: v for k, v in o.items() if k != "nokey_since"}, "project": o.get("project")
                                 or project, "since": o.get("since") or now, "last_result": now, "tried": now})
         return rec
+
+
+def record(scores: dict[str, tuple[float, bool, str]], now: float, source: str) -> None:
+    """Book each model's conclusive score {model: (score, weak, arm)} from `source` ("bench" or "suite") in
+    MODELS: its last verdict ({"at", "date", "score", "weak", "source"}), which modelrank.parked reads, and
+    for a weekly arm one more {"date", "score", "weak", "source"} in its RECHECKS last rechecks."""
+    seen = models()
+    for m, (score, weak, arm) in scores.items():
+        prev = seen.get(m) or {}
+        rec = {"date": day(now), "score": score, "weak": bool(weak), "source": source}
+        rechecks = list(prev.get("rechecks") or []) + ([rec] if arm == "weekly" else [])
+        seen[m] = {**rec, "at": now, **({"rechecks": rechecks[-RECHECKS:]} if rechecks else {})}
+    _write(home() / MODELS, seen)
 
 
 def verdict(model: str, since: float, now: float) -> str:
