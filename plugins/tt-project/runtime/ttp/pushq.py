@@ -1177,30 +1177,60 @@ def _follows(p: Project, old: str, name: str) -> bool:
         return False
 
 
+def _same_patch(p: Project, head: str, old: str, name: str) -> bool:
+    """Whether `head` carries the same commits, by patch-id, past target `name`'s tip as past target
+    `old`'s (both read from their tracking refs, `name` fetched by _follows): the change's own patch
+    is unchanged on the new target, so its approval stands there though the targets diverged."""
+    from . import reviewreuse
+    was, now = _tip(p, old, False), _tip(p, name, False)
+    if not (was and now and _HEX40.fullmatch(head or "")):
+        return False
+    try:
+        a = _git(p, "merge-base", was, head, timeout=RECOVER_FETCH_S).stdout.strip()
+        b = _git(p, "merge-base", now, head, timeout=RECOVER_FETCH_S).stdout.strip()
+        mine = reviewreuse._patches(p, a, head) if a and b else []
+        return bool(mine) and mine == reviewreuse._patches(p, b, head)
+    except Exception:
+        return False
+
+
 def retarget(p: Project, name: str) -> int:
     """Approvals for another target (delivery.push_branch changed). A target change is a delivery
     route, not a code change: where the new target's tip has the old one's in it (or they are one
     commit), the reviewed head is still the reviewed change there, so its approval moves to `name` and
     its review does not run again; the batch runs the push checks on the new tip, where a pass carries
-    across by the usual rule. A diverged target sends the review back."""
+    across by the usual rule. A diverged target where each approved head carries the same commits by
+    patch-id past both tips (_same_patch) carries too, recorded as approval_carried on its rows; else
+    the review is sent back."""
     db = p.db
-    rows = db.q("SELECT q.id, q.task, q.target FROM push_queue q JOIN tasks t ON t.id=q.task "
+    rows = db.q("SELECT q.id, q.task, q.target, q.head FROM push_queue q JOIN tasks t ON t.id=q.task "
                 "WHERE q.status IN ('approved','held') AND t.status='pushing' AND q.target!=?", (name,))
     if not rows:
         return 0
     olds = {r["target"]: _follows(p, r["target"], name) for r in rows}    # git before the transaction
+    same = {r["id"]: not olds[r["target"]] and _same_patch(p, str(r["head"] or ""), r["target"], name) for r in rows}
     now = time.time()
     with db.tx():
         for tid in dict.fromkeys(r["task"] for r in rows):
             task = db.task(tid)
             old = next(r["target"] for r in rows if r["task"] == tid)
-            if olds[old]:
-                ids = [r["id"] for r in rows if r["task"] == tid]
+            mine = [r for r in rows if r["task"] == tid]
+            if olds[old] or all(same[r["id"]] for r in mine):
+                ids = [r["id"] for r in mine]
                 db.x(f"UPDATE push_queue SET target=?, updated=? WHERE id IN ({','.join('?' * len(ids))})",
                      (name, now, *ids))
-                _event(db, task, "push_retargeted", f"#{tid}: push target changed from {old} to {name}, which has "
-                                                    f"{old}'s tip; the reviewed head is unchanged, so its approval "
-                                                    f"moves with it (no review rerun)", queued=False)
+                if olds[old]:
+                    why = f"which has {old}'s tip; the reviewed head is unchanged"
+                else:
+                    why = f"which diverged from {old}, but the change carries the same commits (patch-ids) past both"
+                    for r in mine:
+                        db.x("UPDATE push_queue SET detail=json_set(CASE WHEN json_valid(detail) THEN detail "
+                             "ELSE '{}' END, '$.approval_carried', json(?)) WHERE id=?",
+                             (json.dumps({"old_head": r["head"], "new_head": r["head"], "old_target": old,
+                                          "target": name, "reason": "same patch-id per commit past both targets"}),
+                              r["id"]))
+                _event(db, task, "push_retargeted", f"#{tid}: push target changed from {old} to {name}, {why}, "
+                                                    f"so its approval moves with it (no review rerun)", queued=False)
                 continue
             _cancel(db, [r["id"] for r in db.q("SELECT id FROM push_queue WHERE task=? AND status IN ('approved','held')",
                                                 (tid,))])
@@ -2504,10 +2534,12 @@ def auto_rebase(p: Project, review: dict, row: dict, target: str, woke: str) -> 
     branch = row["branch"] or ""
     tier = "deep" if review["tier"] == "deep" else "standard"
     new = rebase_branch(branch, head)
+    files = [str(f) for f in (_detail(row).get("files") or []) if str(f) and not str(f).startswith("(the rebase")]
     spec = "\n".join([
         f"Review #{review['id']} ({review['title'][:150]}) passed, but its approved head conflicted in more than "
         f"one push batch: {woke}.",
         f"Branch: {branch or '(none)'} at {head}. Push branch: {target}.",
+        *([f"Conflicted files (resolve only these): {', '.join(files[:20])}."] if files else []),
         f"Woken because `push conflict`: fetch, create the new branch {new} at that head in a worktree of your own "
         f"(`git worktree add -b {new} <dir> {head}`), rebase it onto the push branch's current tip and resolve every "
         f"conflict keeping both sides' intents (the one edit you may make). Leave {branch or 'the old branch'} as it "

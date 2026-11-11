@@ -12428,7 +12428,8 @@ class Daemon:
                 task, prev = dict(task, result=dump_result(lowered)), lowered
                 need = self._floor_need(task, bud.wake_tier(task["tier"], prev, self.cfg, self.p.harness), prev)
             review_pick = None
-            if task["kind"] == "review" and (self._landed_conflict_fix(task) or self._reuse_review(task)):
+            if task["kind"] == "review" and (self._landed_conflict_fix(task) or self._carry_clean_rebase(task)
+                                             or self._reuse_review(task)):
                 continue
             if task["kind"] == "review":
                 task, review_pick = self._size_review(task)
@@ -19551,6 +19552,56 @@ class Daemon:
             except (ValueError, OSError, subprocess.SubprocessError) as e:
                 words += f"; task #{sid} not recorded: {e}"
         log(self.p, f"review {task['id']}: {line}; closed as superseded{words}")
+        return True
+
+    def _carry_clean_rebase(self, task: dict) -> bool:
+        """A queued push-conflict fix (conflictfix.of) whose head now rebases onto the target's tip
+        with no conflict (conflictfix.clean_rebase) and the same patch-id per commit needs no model:
+        True once the reviewed head is approved into the push queue again (the batch replays it onto
+        its tip) and the task is `pushing`, recorded as approval_carried (old head, the rebased head,
+        why) on the task, its conflict rows and the feed. False whenever the fix runs: a conflict, an
+        escalated or trim fix, or a patch the rebase changed."""
+        cf = conflictfix.of(task)
+        target = str((cf or {}).get("target") or "")
+        if not cf or "/" not in target or not (cr := conflictfix.clean_rebase(str(self.p.root), cf)):
+            return False
+        head = str(cf["head"])
+        try:
+            base = worktree._git(self.p.root, "merge-base", head, cr["onto"])
+            mine = reviewreuse._patches(self.p, base, head)
+            same = bool(mine) and mine == reviewreuse._patches(self.p, cr["onto"], cr["sha"])
+        except Exception as e:
+            log(self.p, f"review {task['id']}: clean rebase of {head[:12]} not compared: {e}; the fix runs")
+            return False
+        if not same:
+            return False
+        db, now = self.p.db, time.time()
+        carried = {"old_head": head, "new_head": cr["sha"], "onto": cr["onto"],
+                   "reason": "rebases cleanly onto the target's tip with the same patch-id per commit"}
+        line = (f"its head {head[:12]} rebases onto {target} ({cr['onto'][:10]}) with no conflict and an unchanged "
+                f"patch ({cr['sha'][:10]}), so its approval carries and no conflict fix ran")
+        try:
+            with db.tx():
+                prev = load_result(task.get("result"))
+                result = {**{k: v for k, v in prev.items() if k != conflictfix.KEY}, "status": "done",
+                          "approval_carried": carried}
+                if not db.conn.execute("UPDATE tasks SET status='pushing', blocked_reason=NULL, result=?, updated=? "
+                                       "WHERE id=? AND status='queued'",
+                                       (dump_result(result), now, task["id"])).rowcount:
+                    return False
+                pushq.approve(self.p, task["id"], None,
+                              {"entries": [{"branch": str(cf.get("branch") or ""), "head": head}], "target": target})
+                db.x("UPDATE push_queue SET detail=json_set(CASE WHEN json_valid(detail) THEN detail ELSE '{}' END, "
+                     "'$.approval_carried', json(?)) WHERE task=? AND status='conflict' AND head=?",
+                     (json.dumps(carried), task["id"], head))
+                db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+                     (now, f"task:{task['id']}", "approval_carried", "normal",
+                      f"#{task['id']} {task['title']}: {line}; it goes out with the next batch"[:coord.EVENT_CHARS],
+                      "handled", task["id"]))
+        except RuntimeError as e:   # the pin failed: the transaction rolled back, the fix runs
+            log(self.p, f"review {task['id']}: approval not carried: {e}")
+            return False
+        log(self.p, f"review {task['id']}: {line}")
         return True
 
     def _reuse_review(self, task: dict) -> bool:

@@ -22173,3 +22173,99 @@ def test_an_approval_whose_patch_is_on_the_push_branch_while_the_queue_is_off_is
     _git_out(s.repo, "update-ref", "refs/remotes/origin/proj", landed)
     t = _pq_hand_off(env, s, push=f"{s.branch} at {s.head}")
     assert t["status"] == "done" and "already on the push branch" in (s.p.logs / "daemon.log").read_text()
+
+
+def _pq_conflict_fix(s, before):
+    """The review queued again as a push-conflict fix of its head, as _settle leaves it."""
+    cf = {"head": s.head, "branch": s.branch, "target": "origin/proj", "onto": before, "files": ["feature.txt"],
+          "n": 1}
+    s.p.db.update_task(s.review, status="queued", result=json.dumps({"status": "done", "conflict_fix": cf}))
+    s.p.db.x("INSERT INTO push_queue(task,branch,head,target,status,detail,created,updated) "
+             "VALUES(?,?,?,?,'conflict',?,?,?)",
+             (s.review, s.branch, s.head, "origin/proj", json.dumps({"files": ["feature.txt"]}), time.time(), time.time()))
+    return cf
+
+
+def test_a_conflict_fix_whose_head_now_rebases_cleanly_with_the_same_patch_is_approved_again_with_no_run(
+        env, monkeypatch):
+    """A push-conflict fix ran a model (or a rebase review) though the target's tip had moved on and
+    the head now rebased onto it with no conflict. Dispatch now rebases it model-free; with the same
+    patch-id per commit the reviewed head is approved into the push queue again, the review waits
+    `pushing`, no task is queued, and the carry is recorded on the task, its conflict row and the feed."""
+    from ttp.daemon import Daemon
+    s = _pq(env, monkeypatch)
+    before = _git_out(s.repo, "rev-parse", "origin/proj")
+    tip = _pq_moved_tip(s)
+    _pq_conflict_fix(s, before)
+    tasks = s.p.db.one("SELECT COUNT(*) n FROM tasks")["n"]
+    assert Daemon(s.p.base)._carry_clean_rebase(s.p.db.task(s.review)) is True
+    review = s.p.db.task(s.review)
+    res = json.loads(review["result"])
+    carried = res["approval_carried"]
+    assert review["status"] == "pushing" and "conflict_fix" not in res, res
+    assert carried["old_head"] == s.head and carried["onto"] == tip and carried["new_head"] != s.head, carried
+    assert _git_out(s.repo, "rev-parse", f"{carried['new_head']}^") == tip
+    rows = s.p.db.q("SELECT head, target, status, detail FROM push_queue WHERE task=? ORDER BY id", (s.review,))
+    assert [(r["head"], r["target"], r["status"]) for r in rows] == [
+        (s.head, "origin/proj", "conflict"), (s.head, "origin/proj", "approved")], rows
+    assert json.loads(rows[0]["detail"])["approval_carried"]["new_head"] == carried["new_head"]
+    assert s.p.db.one("SELECT COUNT(*) n FROM tasks")["n"] == tasks, "no fix or rebase task queued"
+    assert [e["kind"] for e in _pq_events(s.p, task=s.review)] == ["approval_carried"]
+
+
+def test_a_conflict_fix_still_runs_when_the_clean_rebase_changed_the_patch_or_the_head_still_conflicts(
+        env, monkeypatch):
+    from ttp import reviewreuse
+    from ttp.daemon import Daemon
+    s = _pq(env, monkeypatch)
+    before = _git_out(s.repo, "rev-parse", "origin/proj")
+    _pq_moved_tip(s)
+    _pq_conflict_fix(s, before)
+    real = reviewreuse._patches
+    monkeypatch.setattr(reviewreuse, "_patches",
+                        lambda p, base, head: real(p, base, head) + ([] if head == s.head else ["changed"]))
+    assert Daemon(s.p.base)._carry_clean_rebase(s.p.db.task(s.review)) is False
+    assert s.p.db.task(s.review)["status"] == "queued"
+    monkeypatch.setattr(reviewreuse, "_patches", real)
+    _pq_moved_tip(s, "feature.txt")   # the tip now has its own feature.txt: a real conflict
+    assert Daemon(s.p.base)._carry_clean_rebase(s.p.db.task(s.review)) is False
+    assert s.p.db.task(s.review)["status"] == "queued"
+    assert not s.p.db.q("SELECT 1 FROM push_queue WHERE status='approved'")
+
+
+def test_a_push_conflict_rebase_task_names_only_the_conflicted_files(env, monkeypatch):
+    from ttp import pushq
+    s = _pq(env, monkeypatch)
+    row = {"head": s.head, "branch": s.branch,
+           "detail": json.dumps({"files": ["feature.txt", "docs/a.md"], "onto": "x"})}
+    with s.p.db.tx():
+        rid = pushq.auto_rebase(s.p, s.p.db.task(s.review), row, "origin/proj", "push conflict: x")
+    spec = s.p.db.task(rid)["spec"]
+    assert "Conflicted files (resolve only these): feature.txt, docs/a.md." in spec, spec
+
+
+def test_an_approval_moves_to_a_diverged_push_target_where_the_change_carries_the_same_patch(env, monkeypatch):
+    """A push-target rename to a branch that diverged from the old target sent every approval back
+    for a review of the same change. Where each approved head carries the same commits by patch-id
+    past both tips, the approval now moves, recorded as approval_carried; else it is sent back."""
+    from ttp import pushq
+    s = _pq(env, monkeypatch)
+    review = _pq_hand_off(env, s)
+    assert review["status"] == "pushing"
+    _pq_moved_tip(s, "x.txt")   # the old target moved on past the head's base
+    _git_out(s.other, "checkout", "-q", "-b", "proj2")
+    _commit(s.other, "y.txt", "y\n")
+    _git_out(s.other, "push", "-q", "origin", "HEAD:refs/heads/proj2")
+    assert pushq.retarget(s.p, "origin/proj2") == 1
+    row = s.p.db.one("SELECT target, status, detail FROM push_queue WHERE task=?", (s.review,))
+    assert (row["target"], row["status"]) == ("origin/proj2", "approved"), dict(row)
+    carried = json.loads(row["detail"])["approval_carried"]
+    assert carried["old_target"] == "origin/proj" and carried["new_head"] == s.head, carried
+    assert s.p.db.task(s.review)["status"] == "pushing"
+    assert [e["kind"] for e in _pq_events(s.p, task=s.review)][-1] == "push_retargeted"
+    # an unrelated history has none of the change's base: the review runs again
+    _git_out(s.other, "checkout", "-q", "--orphan", "proj3")
+    _commit(s.other, "z.txt", "z\n")
+    _git_out(s.other, "push", "-q", "origin", "HEAD:refs/heads/proj3")
+    assert pushq.retarget(s.p, "origin/proj3") == 1
+    assert s.p.db.task(s.review)["status"] == "queued"

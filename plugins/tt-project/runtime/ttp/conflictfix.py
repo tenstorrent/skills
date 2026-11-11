@@ -319,12 +319,13 @@ def _py_ok(text: str, ours: str, theirs: str) -> bool:
     return not _duplicates(text) - _duplicates(ours) - _duplicates(theirs)
 
 
-def model_free(root: str, head: str, onto: str, steps: int = 200) -> dict | None:
+def model_free(root: str, head: str, onto: str, steps: int = 200, clean: bool = False) -> dict | None:
     """Rebase `head` onto `onto` in a scratch worktree of `root`, settling every conflict by
     merge_additive: {"sha", "onto", "files", "hunks", "delta"} (the new head, the files it settled,
     their hunk count and a bounded text of the settled hunks), or None when any conflict needs
     judgment, a stop is no content conflict, the head carries merges, or git fails. Ours (stage 2)
-    is the tip, theirs (stage 3) the change. Nothing outside the scratch worktree changes."""
+    is the tip, theirs (stage 3) the change. Nothing outside the scratch worktree changes. `clean`:
+    a rebase with no conflict at all is an answer too (0 hunks), else it is None."""
     if _git(root, "rev-list", "--merges", "-1", head, f"^{onto}").stdout.strip():
         return None
     wt = tempfile.mkdtemp(prefix="ttp-resolve-")
@@ -337,7 +338,7 @@ def model_free(root: str, head: str, onto: str, steps: int = 200) -> dict | None
         for _ in range(steps):
             if r.returncode == 0:
                 sha = _git(wt, "rev-parse", "HEAD").stdout.strip()
-                if not sha or not settled:
+                if not sha or not (settled or clean):
                     return None   # nothing conflicted here: the batch's own conflict is not this one
                 return {"sha": sha, "onto": onto, "files": sorted(set(files)), "hunks": len(settled),
                         "delta": _delta(settled)}
@@ -392,11 +393,7 @@ def try_model_free(root: str, cf: dict, task_id: int) -> dict | None:
     if cf.get("escalate") or cf.get("trim") or not head or not files or files[0].startswith("(the rebase"):
         return None
     try:
-        onto = ""
-        for ref in (str(cf.get("target") or ""), str(cf.get("onto") or "")):
-            if ref and (r := _git(root, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}")).returncode == 0:
-                onto = r.stdout.strip()
-                break
+        onto = _onto(root, cf)
         if not onto or _git(root, "cat-file", "-e", f"{head}^{{commit}}").returncode != 0:
             return None
         key = (root, head, onto)
@@ -408,6 +405,37 @@ def try_model_free(root: str, cf: dict, task_id: int) -> dict | None:
         if mf and _git(root, "update-ref", f"{RESOLVED_REF}{int(task_id)}", mf["sha"]).returncode != 0:
             return None
         return mf
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def _onto(root: str, cf: dict) -> str:
+    """The target's current tip where git knows it, else the tip the batch saw, else ""."""
+    for ref in (str(cf.get("target") or ""), str(cf.get("onto") or "")):
+        if ref and (r := _git(root, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}")).returncode == 0:
+            return r.stdout.strip()
+    return ""
+
+
+def clean_rebase(root: str, cf: dict) -> dict | None:
+    """{"sha", "onto"}: a queued conflict fix's head rebased onto the target's current tip (_onto)
+    with no conflict at all, in a scratch worktree, or None (it conflicts, escalated or trim, git
+    fails). The tip moved past what the head conflicted with: the batch can replay the head itself."""
+    head = str(cf.get("head") or "")
+    if cf.get("escalate") or cf.get("trim") or not head:
+        return None
+    try:
+        onto = _onto(root, cf)
+        if not onto or _git(root, "cat-file", "-e", f"{head}^{{commit}}").returncode != 0:
+            return None
+        key = (root, head, onto, "clean")
+        if key not in _TRIED:
+            while len(_TRIED) >= 64:
+                _TRIED.pop(next(iter(_TRIED)))
+            got = model_free(root, head, onto, clean=True)
+            _TRIED[key] = got if got and not got["hunks"] else None
+        got = _TRIED[key]
+        return {"sha": got["sha"], "onto": onto} if got else None
     except (OSError, subprocess.SubprocessError):
         return None
 
