@@ -73,10 +73,12 @@ def _inside(path: str, root: str) -> bool:
     return bool(root) and (path == root or path.startswith(root.rstrip("/") + "/"))
 
 
-def tied(pid: int, tok: str, pgids=(), root: str = "") -> bool:
+def tied(pid: int, tok: str, pgids=(), root: str = "", tmp: str = "") -> bool:
     """Whether live process `pid` of this user belongs to the check run `tok`: its environment
     carries the token, or it is in one of the run's check groups with its working directory in
-    `root`. A zombie, another user's process or an unreadable one never is."""
+    `root`, or, in any group, its working directory or an argument is in `tmp`, the run's own managed
+    scratch (a test that started it with an environment of its own and a session of its own).
+    A zombie, another user's process or an unreadable one never is."""
     st = _stat(pid)
     if not tok or st is None or st[0] in ("Z", "X"):
         return False
@@ -90,9 +92,18 @@ def tied(pid: int, tok: str, pgids=(), root: str = "") -> bool:
             return True
     except OSError:
         pass
-    if st[1] in set(pgids) and root:
+    try:
+        cwd = os.path.realpath(os.readlink(PROC / str(pid) / "cwd"))
+    except OSError:
+        return False
+    if st[1] in set(pgids) and root and _inside(cwd, os.path.realpath(root)):
+        return True
+    if tmp and len(Path(tmp).parts) >= 4:   # never a shared folder such as /tmp itself
+        tmp = os.path.realpath(tmp)
+        if _inside(cwd, tmp):
+            return True
         try:
-            return _inside(os.path.realpath(os.readlink(PROC / str(pid) / "cwd")), os.path.realpath(root))
+            return f"{tmp}/" in (PROC / str(pid) / "cmdline").read_bytes().replace(b"\0", b"/").decode(errors="replace")
         except OSError:
             return False
     return False
@@ -107,7 +118,7 @@ def _inside_run(tok: str) -> bool:
         return False
 
 
-def members(tok: str, pgids=(), root: str = "") -> list[int]:
+def members(tok: str, pgids=(), root: str = "", tmp: str = "") -> list[int]:
     """The live processes tied to run `tok` (never this process or its ancestors). None when this
     process is itself inside run `tok`: the runner never carries its own token, so a check (or a test
     worker under it) that reaps its own run would only end its siblings, e.g. the other test workers."""
@@ -120,7 +131,7 @@ def members(tok: str, pgids=(), root: str = "") -> list[int]:
     except OSError:
         return []
     for name in names:
-        if name.isdigit() and int(name) not in mine and tied(int(name), tok, pgids, root):
+        if name.isdigit() and int(name) not in mine and tied(int(name), tok, pgids, root, tmp):
             out.append(int(name))
     return out
 
@@ -145,13 +156,14 @@ def _logged(state, tok: str, pid: int, sig: int, why: str, cmd: str) -> None:
         pass
 
 
-def reap(tok: str, pgids=(), root: str = "", grace_s: float = GRACE_S, state=None, why: str = "") -> tuple[int, int]:
+def reap(tok: str, pgids=(), root: str = "", grace_s: float = GRACE_S, state=None, why: str = "",
+         tmp: str = "") -> tuple[int, int]:
     """End every process tied to run `tok`: SIGTERM, up to `grace_s` for them to go, then SIGKILL
     those still there. Returns (processes found, processes still there, e.g. stuck in D state).
     A found process counts as there until it is gone or a zombie, by its pid and start time: one
     that is exiting no longer shows its environment, yet still runs. With a project `state`, each
     signal sent writes a job-signals.jsonl row naming the process (`why`: the caller's reason)."""
-    found = {pid: _start(pid) for pid in members(tok, pgids, root)}
+    found = {pid: _start(pid) for pid in members(tok, pgids, root, tmp)}
     cmds = {pid: _cmdline(pid) for pid in found} if state is not None else {}
 
     def there(pid: int) -> bool:

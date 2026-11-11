@@ -19,7 +19,15 @@
 # connection that fails before the command starts is OpenSSH's own to handle: with ControlMaster=auto
 # it removes a stale socket and connects directly. A file in the folder that is no socket (ssh would
 # then run unshared on every call) is removed before ssh starts.
+# Re-entry (an "ssh" further down PATH that execs plain ssh, finding this script again in the same
+# process) ends with 125 and a message instead of looping: the pid is marked before every exec.
 set -f
+if [ "${TTP_SSH_WRAPPER_PID:-}" = "$$" ]; then
+    echo "tt-project ssh wrapper: re-entered from the ssh it ran (an ssh on PATH execs ssh again); not looping" >&2
+    exit 125
+fi
+TTP_SSH_WRAPPER_PID=$$
+export TTP_SSH_WRAPPER_PID
 real=
 ifs=$IFS
 IFS=:

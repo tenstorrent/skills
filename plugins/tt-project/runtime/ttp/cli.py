@@ -3810,7 +3810,7 @@ def cmd_checks(a) -> None:
         if not p:
             die("ttp checks --reap: no project found")
         from .daemon import log as daemon_log
-        for r in leftoverchecks.reap(p, dry_run=a.dry_run):
+        for r in leftoverchecks.reap(p, dry_run=a.dry_run) + leftoverchecks.test_orphans(p, dry_run=a.dry_run):
             print(r["text"])
             if not a.dry_run:
                 daemon_log(p, r["text"])   # as the daemon's pass logs it
@@ -6484,6 +6484,12 @@ def _foreground_stop() -> dict:
     return old
 
 
+def _run_scratch() -> str:
+    """This checks run's own scratch (its TMPDIR under the supervisor), or "" outside one."""
+    from . import checkdirs
+    return checkdirs.scratch(dict(os.environ)) or ""
+
+
 def _checks_reaped(out, tok: str, record, clean, rc) -> None:
     """The end of a run's checks, however it ends: record their exit code (exit.json), end what is
     still tied to the run, remove the clean tree, say what was reaped, then drop the record unless
@@ -6497,7 +6503,8 @@ def _checks_reaped(out, tok: str, record, clean, rc) -> None:
         found, left = checkreap.reap(tok, record.data["pgids"] if record is not None else (),
                                      str(clean.dir) if clean is not None else "",
                                      state=record.dir.parent.parent if record is not None else None,
-                                     why="the end of its own check run")
+                                     why="the end of its own check run",
+                                     tmp=_run_scratch())
     except OSError:
         pass
     finally:
@@ -14101,7 +14108,8 @@ def main(argv: list[str] | None = None) -> None:
                         "or still run (for an on_pass_cmd; a wait keeps plain --result)")
     s.add_argument("--reap", action="store_true",
                    help="run nothing: stop this user's leftover ttp checks runs (their run ended or their folder "
-                        "is gone) that hold or wait for a host checks slot, as the daemon does (leftoverchecks)")
+                        "is gone) that hold or wait for a host checks slot, as the daemon does, and process trees "
+                        "a test left orphaned in its pytest temp folder (leftoverchecks)")
     s.add_argument("--dry-run", action="store_true", help="with --reap: only list what it would stop")
     s.add_argument("--settle", metavar="RUN_DIR",
                    help="an on_pass_cmd: on a pass of the run's detached checks on --head, write the final "

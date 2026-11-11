@@ -239,6 +239,28 @@ def _rc_gone(pid, within=10.0):
     return False
 
 
+def test_a_remote_check_s_orphan_in_its_run_dir_ends_with_the_run(tmp_path):
+    """A process a remote check left in a session of its own, with an environment of its own, ends with
+    the run when its working directory is the run's temp dir on the host (remotecheck._END)."""
+    import shutil
+    if not os.path.exists("/proc/self/status") or not shutil.which("setsid"):
+        pytest.skip("needs /proc and setsid")
+    repo = _rc_repo(tmp_path)
+    pidf = tmp_path / "orphan.pid"
+    rc, out = _rc_run(tmp_path, repo, f"setsid sh -c 'echo $$ > {pidf}.tmp; mv {pidf}.tmp {pidf}; exec env -i sleep 60' & "
+                                      f"while [ ! -e {pidf} ]; do sleep 0.05; done")
+    assert rc == 0, out
+    orphan = int(pidf.read_text())
+    try:
+        assert _rc_gone(orphan), "the orphan in the run's dir outlived the run"
+        assert _rc_left(tmp_path) == []
+    finally:
+        try:
+            os.kill(orphan, signal.SIGKILL)
+        except OSError:
+            pass
+
+
 def test_a_stopped_remote_check_stops_its_command_on_the_host(tmp_path, tmp_processes_in):
     """SIGTERM to the local side (a timeout, a `ttp checks` stop, a queue stop) stops the command where
     it runs (ssh without a tty signals nothing) and removes its temp dir; the host's stop watcher (its

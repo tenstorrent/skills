@@ -59,18 +59,21 @@ NOTES=()
 say() { printf '%s\n' "$*"; }
 note() { NOTES+=("$*"); say "$*"; }
 fail() { RESULT="FAIL at $STEP: $*"; exit 1; }
-box() { python3 "$BOX_PY" --site "$SITE" "$@"; }
+# A hung ssh or box.py call ends at its limit (GNU timeout, kept in the run's process group so ^C and
+# the trap still reach it); without timeout (stock macOS) a call runs unbounded.
+if timeout --foreground 5 true 2>/dev/null; then lim() { timeout --foreground -k 10 "$@"; }; else lim() { shift; "$@"; }; fi
+box() { lim 900 python3 "$BOX_PY" --site "$SITE" "$@"; }
 q() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
 SSH_CFG="$RUN_DIR/ssh_config"
 export TTP_SSH_CONFIG="$SSH_CFG"  # box.py runs its ssh with -F "$TTP_SSH_CONFIG"
-on_machine() { ssh -F "$SSH_CFG" -n -o BatchMode=yes -o ConnectTimeout=20 "$MACHINE" "$1"; }
-ird_rows() { ssh -F "$SSH_CFG" -n -o BatchMode=yes -o ConnectTimeout=20 "$MGMT" 'ird list --noheader'; }
+on_machine() { lim 900 ssh -F "$SSH_CFG" -n -o BatchMode=yes -o ConnectTimeout=20 "$MACHINE" "$1"; }
+ird_rows() { lim 120 ssh -F "$SSH_CFG" -n -o BatchMode=yes -o ConnectTimeout=20 "$MGMT" 'ird list --noheader'; }
 row_of() { ird_rows | awk -v id="$1" '$1 == id' ; }
 
 report() {
   {
     say "--- ird-e2e report (paste this back) ---"
-    say "when: $(date '+%Y-%m-%d %H:%M %Z')  host: $(uname -s) $(uname -r)  $(ssh -V 2>&1)"
+    say "when: $(date '+%Y-%m-%d %H:%M %Z')  host: $(uname -s) $(uname -r)  $(lim 30 ssh -V 2>&1)"
     say "plugin: $(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["version"])' \
       "$HERE/../../../.claude-plugin/plugin.json" 2>/dev/null || echo '?')  mode: $([ "$DRY" = 1 ] && echo dry-run || echo live)"
     say "pool: ${POOL:-?}  arch: ${ARCH:-?}  timeout: $TIMEOUT  repo: $REPO"
@@ -213,7 +216,7 @@ if ! grep -qsF -e "tt-project/ird/ssh-hosts" -e "$INCLUDE" "$HOME/.ssh/config"; 
   note "note: ~/.ssh/config lacks 'Include $INCLUDE' at its top; a live run stops here"
 fi
 # The management host under the run's own config only: no silent fallback to personal ssh config.
-if ! ERR=$(ssh -F "$SSH_CFG" -n -o BatchMode=yes -o ConnectTimeout=20 "$MGMT" true 2>&1 </dev/null); then
+if ! ERR=$(lim 120 ssh -F "$SSH_CFG" -n -o BatchMode=yes -o ConnectTimeout=20 "$MGMT" true 2>&1 </dev/null); then
   if [ -z "$JUMP_FROM" ]; then
     fail "cannot reach $MGMT with managed ssh config only ($(printf '%s' "$ERR" | tail -n 1)): the site file has no ird.mgmt_ssh, so nothing managed defines $MGMT. If your personal ~/.ssh/config defines it, copy its HostName, User (and IdentityFile, ProxyJump if needed) into ird.mgmt_ssh (site.md); this run never uses personal ssh config"
   fi
@@ -266,7 +269,7 @@ note "  ird list row: ${ROW1:-<none>}"
 STEP="3 ssh"; T0=$(date +%s)
 grep -qs "^# >>> tt-project ird $RID\$" "$INCLUDE" || fail "no ssh block for $RID in $INCLUDE"
 # The options that apply to the machine under the run's own config, for the report.
-EFF=$(ssh -F "$SSH_CFG" -G "$MACHINE" 2>/dev/null)
+EFF=$(lim 30 ssh -F "$SSH_CFG" -G "$MACHINE" 2>/dev/null)
 opt() { printf '%s\n' "$EFF" | awk -v k="$1" '$1 == k {sub(/^[^ ]+ /, ""); gsub(/"/, ""); print; exit}'; }
 note "  ssh -G $MACHINE: hostname=$(opt hostname) port=$(opt port) proxyjump=$(opt proxyjump) stricthostkeychecking=$(opt stricthostkeychecking) userknownhostsfile=$(opt userknownhostsfile)"
 [ "$(opt proxyjump)" = "$MGMT" ] || fail "ssh -G $MACHINE gives proxyjump '$(opt proxyjump)', not $MGMT: the managed block in $INCLUDE does not apply"

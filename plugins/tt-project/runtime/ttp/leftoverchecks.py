@@ -367,3 +367,54 @@ def reap(p, dry_run: bool = False) -> list[dict]:
     from . import checkcap, leftoverstop
     slots, guarded = Path(checkcap.slot_dir()), leftoverstop._guarded(p)
     return [r for pid in pids() for r in reap_one(p, pid, slots, guarded, dry_run)]
+
+
+ORPHAN_S = 600.0   # a test's process orphaned this long under its pytest temp folder is a leftover
+
+
+def _test_root(pid: int) -> str:
+    """The pytest temp folder (`.../pytest-of-<user>/pytest-<n>`) the process's cwd or argv sits in, or ""."""
+    import getpass
+    import re
+    pat = re.compile(r"(/[^\0\s]*/pytest-of-" + re.escape(getpass.getuser()) + r"/pytest-\d+)(?:/|$)")
+    try:
+        cwd = os.readlink(f"/proc/{pid}/cwd")
+    except OSError:
+        cwd = ""
+    m = pat.search(cwd) or next(filter(None, (pat.search(a) for a in _argv(pid))), None)
+    return m.group(1) if m else ""
+
+
+def test_orphans(p, guarded: set[int] | None = None, dry_run: bool = False, min_age: float = ORPHAN_S) -> list[dict]:
+    """End this user's process trees a test left behind: a process orphaned (its parent pid 1 or a
+    `systemd` subreaper) at least `min_age` s ago whose cwd or argv sits in a pytest temp folder (only that
+    root is matched, never a command name), with every descendant. A caller, worker, daemon (guarded),
+    `ttp detach` job or device user is never touched. A pytest temp folder is a test's own scratch, never a
+    project's live work, so no project test applies. Returns one record with "text" per tree."""
+    from . import leftoverstop
+    guarded = leftoverstop._guarded(p) if guarded is None else guarded
+    procs = [n for n in pids() if leftoverstop._uid(n) == os.getuid()]
+    kids: dict[int, list[int]] = {}
+    for n in procs:
+        kids.setdefault(_ppid(n), []).append(n)
+    reapers = {1} | {n for n in procs if (_argv(n) or [""])[0].rsplit("/", 1)[-1] == "systemd"}
+    out = []
+    for top in procs:
+        start = started_at(top)
+        if _ppid(top) not in reapers or top in guarded or start is None or time.time() - start < min_age:
+            continue
+        if not (root := _test_root(top)):
+            continue
+        tree, todo = [], [top]
+        while todo:
+            n = todo.pop()
+            tree.append(n)
+            todo += kids.get(n, [])
+        if guarded & set(tree) or any(leftoverstop._untouchable(p, n, leftoverstop._read_env(n) or {}) for n in tree):
+            continue
+        if not dry_run:
+            leftoverstop.end([{"pid": n, "start": leftoverstop._start(n)} for n in tree])
+        out.append({"pid": top, "pids": tree, "root": root,
+                    "text": f"checks reap{' (dry run): would stop' if dry_run else ': stopped'} a test's leftover "
+                            f"process tree {tree} (orphaned under {root})"})
+    return out

@@ -5989,7 +5989,7 @@ def test_setup_box_site_without_the_wrapper_says_so(tmp_path, fake_ird):
     rc, out = fake_ird.run("status", "<ird-box>")
     assert rc == 1 and "missing version/boxes wrapper" in out and "no box" not in out, out
     argv, env, _ = _e2e(fake_ird, tmp_path)
-    r = subprocess.run(argv + ["--dry-run"], capture_output=True, text=True, timeout=60, env=env)
+    r = _e2e_run(argv + ["--dry-run"], 60, env=env)
     assert r.returncode == 1 and "missing version/boxes wrapper" in r.stdout, r.stdout + r.stderr
 
 
@@ -6237,7 +6237,10 @@ for a; do last=$a; done
 if [ -n "$FAKE_MGMT_DOWN" ] && [ "$last" = true ]; then echo "ssh: Could not resolve hostname" >&2; exit 255; fi
 # The machine's effective options come from the real ssh -G under the run's own config.
 if [ "$1" = "-F" ] && [ "$3" = "-G" ]; then case "$4" in m-*)
-  echo "$*" >> "$FAKE_DIR/ssh.log"; exec "$REAL_SSH" "$@";; esac; fi
+  echo "$*" >> "$FAKE_DIR/ssh.log"
+  case "$REAL_SSH" in /*) ;; *) echo "fake ssh: REAL_SSH must be an absolute path" >&2; exit 125;; esac
+  [ "$REAL_SSH" -ef "$0" ] && { echo "fake ssh: REAL_SSH is this fake" >&2; exit 125; }
+  exec "$REAL_SSH" "$@";; esac; fi
 [ -n "$FAKE_SSH_BANNER" ] && [ "$last" != true ] && echo "$FAKE_SSH_BANNER" >&2
 exec "$FAKE_DIR/bin/ssh" "$@"
 """
@@ -6255,10 +6258,44 @@ echo '{"device_info": [{"board_info": {"board_type": "n300 L"}}, {"board_info": 
 """
 
 
-def _e2e(fake_ird, tmp_path, include=True):
+def _real_ssh(path):
+    """OpenSSH's own ssh binary: the first ssh on `path` that is no script (a harness ssh wrapper or another
+    shim would exec ssh from PATH again and loop with the fake), else a standard install path."""
+    import os
+    for d in [*path.split(os.pathsep), "/usr/bin", "/usr/local/bin", "/opt/homebrew/bin"]:
+        c = os.path.join(d, "ssh") if d else ""
+        if c and os.path.isfile(c) and os.access(c, os.X_OK):
+            with open(c, "rb") as f:
+                if f.read(2) != b"#!":
+                    return os.path.realpath(c)
+    return None
+
+
+def _e2e_run(argv, timeout, env, **kw):
+    """subprocess.run for ird_e2e.sh in a process group of its own, ended whole when the run ends or
+    times out, so no fake ssh or box.py call it started outlives the test."""
+    import signal
+    import subprocess
+    proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
+                            start_new_session=True, **kw)
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    finally:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        if proc.poll() is None:
+            proc.wait()
+    return subprocess.CompletedProcess(argv, proc.returncode, out, err)
+
+
+def _e2e(fake_ird, tmp_path, include=True, wrapper=None):
+    import os
     import shutil
     import subprocess
-    real_ssh = shutil.which("ssh")
+    path = f"{wrapper}:{os.environ.get('PATH', '')}" if wrapper else os.environ.get("PATH", "")
+    real_ssh = _real_ssh(path)
     if not real_ssh:
         pytest.skip("needs OpenSSH's ssh for `ssh -G`")
     shims = tmp_path / "e2e-bin"
@@ -6273,17 +6310,54 @@ def _e2e(fake_ird, tmp_path, include=True):
         (fake_ird.home / ".ssh" / "config").write_text(f"Include {fake_ird.ird_dir}/ssh-hosts\n")
     work = tmp_path / "work"
     work.mkdir()
-    env = {**fake_ird.env, "PATH": f"{shims}:{fake_ird.env['PATH']}", "TMPDIR": str(tmp_path),
-           "REAL_SSH": real_ssh}
+    env = {**fake_ird.env, "PATH": f"{shims}:{wrapper + ':' if wrapper else ''}{fake_ird.env['PATH']}",
+           "TMPDIR": str(tmp_path), "REAL_SSH": real_ssh}
     argv = ["bash", str(IRD_E2E), "--site", str(fake_ird.site), "--arch", "<arch>",
             "--workdir", str(work), "--repo", f"file://{repo}"]
     return argv, env, work
 
 
+def test_setup_box_ird_e2e_ends_quickly_with_the_harness_ssh_wrapper_on_path(fake_ird, tmp_path):
+    """A project's harness ssh wrapper on PATH (as in a worker) never loops with the fake ssh: the fake's
+    `ssh -G` goes to OpenSSH's own binary, and the case ends within seconds."""
+    import shutil
+    import subprocess
+    import time
+    wbin = tmp_path / "harness-bin"
+    wbin.mkdir()
+    shutil.copy(PLUGIN / "template" / "bin" / "ssh", wbin / "ssh")
+    (wbin / "ssh").chmod(0o755)
+    argv, env, _ = _e2e(fake_ird, tmp_path, include=False, wrapper=str(wbin))
+    with open(env["REAL_SSH"], "rb") as f:
+        assert f.read(2) != b"#!"
+    t0 = time.monotonic()
+    r = _e2e_run(argv + ["--dry-run"], 30, env=env)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert time.monotonic() - t0 < 20
+
+
+def test_the_ssh_wrapper_stops_when_the_ssh_it_runs_execs_it_again(tmp_path):
+    """An ssh further down PATH that execs plain `ssh` finds the wrapper again in the same process: the
+    wrapper ends with 125 and says why instead of looping."""
+    import shutil
+    import subprocess
+    wbin, sbin = tmp_path / "wbin", tmp_path / "sbin"
+    wbin.mkdir()
+    sbin.mkdir()
+    shutil.copy(PLUGIN / "template" / "bin" / "ssh", wbin / "ssh")
+    (wbin / "ssh").chmod(0o755)
+    (sbin / "ssh").write_text('#!/bin/sh\nexec ssh "$@"\n')
+    (sbin / "ssh").chmod(0o755)
+    env = {"PATH": f"{wbin}:{sbin}:/usr/bin:/bin", "HOME": str(tmp_path), "TMPDIR": str(tmp_path)}
+    for args in (["-G", "host-a"], ["host-a", "true"]):
+        r = subprocess.run([str(wbin / "ssh"), *args], capture_output=True, text=True, timeout=10, env=env)
+        assert r.returncode == 125 and "re-entered" in r.stderr, (args, r.returncode, r.stderr)
+
+
 def test_setup_box_ird_e2e_dry_run_lists_and_only_prints_the_rest(fake_ird, tmp_path):
     import subprocess
     argv, env, _ = _e2e(fake_ird, tmp_path, include=False)
-    r = subprocess.run(argv + ["--dry-run"], capture_output=True, text=True, timeout=60, env=env)
+    r = _e2e_run(argv + ["--dry-run"], 60, env=env)
     out = r.stdout + r.stderr
     assert r.returncode == 0, out
     assert "step 1 list: PASS 2 free, picked m-idle" in out, out
@@ -6296,7 +6370,7 @@ def test_setup_box_ird_e2e_dry_run_lists_and_only_prints_the_rest(fake_ird, tmp_
     r = subprocess.run([a for a in argv if a != "<arch>" and a != "--arch"] + ["--dry-run"],
                        capture_output=True, text=True, timeout=60, env=env)
     assert r.returncode == 1 and "missing --arch" in r.stdout + r.stderr, r.stdout + r.stderr
-    r = subprocess.run(argv, capture_output=True, text=True, timeout=60, env=env)  # live, no Include
+    r = _e2e_run(argv, 60, env=env)  # live, no Include
     assert r.returncode == 1 and "lacks 'Include" in r.stdout, r.stdout
     assert all(l.startswith("list-machines") for l in fake_ird.ird_log()), fake_ird.ird_log()
 
@@ -6305,7 +6379,7 @@ def test_setup_box_ird_e2e_step_summary_ignores_stderr_banner(fake_ird, tmp_path
     import subprocess
     argv, env, _ = _e2e(fake_ird, tmp_path)
     env["FAKE_SSH_BANNER"] = "** WARNING: connection is not using a post-quantum key exchange algorithm"
-    r = subprocess.run(argv, capture_output=True, text=True, timeout=120, env=env)
+    r = _e2e_run(argv, 120, env=env)
     out = r.stdout + r.stderr
     assert r.returncode == 0, out
     assert ("step 4 work: PASS edited 1 file(s);ird-e2e build ok; tt-smi -s ok, boards: "
@@ -6319,7 +6393,7 @@ def test_setup_box_ird_e2e_failing_step_still_shows_its_error(fake_ird, tmp_path
     argv, env, _ = _e2e(fake_ird, tmp_path)
     env["FAKE_SMI_FAIL"] = "1"
     env["FAKE_SSH_BANNER"] = "** WARNING: banner"
-    r = subprocess.run(argv, capture_output=True, text=True, timeout=120, env=env)
+    r = _e2e_run(argv, 120, env=env)
     out = r.stdout + r.stderr
     assert r.returncode == 1, out
     assert "tt-smi -s (rc 1)" in out and "no devices" in out, out
@@ -6328,7 +6402,7 @@ def test_setup_box_ird_e2e_failing_step_still_shows_its_error(fake_ird, tmp_path
 def test_setup_box_ird_e2e_live_run_reserves_works_extends_and_releases(fake_ird, tmp_path):
     import subprocess
     argv, env, work = _e2e(fake_ird, tmp_path)
-    r = subprocess.run(argv, capture_output=True, text=True, timeout=120, env=env)
+    r = _e2e_run(argv, 120, env=env)
     out = r.stdout + r.stderr
     assert r.returncode == 0, out
     for line in ("step 2 reserve: PASS id 100 on m-idle", "step 3 ssh: PASS via ProxyJump",
@@ -6357,7 +6431,7 @@ def test_setup_box_ird_e2e_step4_smi_failure_shows_only_smi_output(fake_ird, tmp
     import subprocess
     argv, env, _ = _e2e(fake_ird, tmp_path)
     env = {**env, "FAKE_CC_NOISE": "1", "FAKE_SMI_FAIL": "1"}
-    r = subprocess.run(argv, capture_output=True, text=True, timeout=120, env=env)
+    r = _e2e_run(argv, 120, env=env)
     out = r.stdout + r.stderr
     assert r.returncode == 1, out
     assert "tt-smi -s (rc 1): no devices" in out, out
@@ -6393,7 +6467,7 @@ def test_setup_box_ird_e2e_claims_the_real_machine_despite_rc_1_and_noise(fake_i
     import subprocess
     argv, env, _ = _e2e(fake_ird, tmp_path)
     env.update(FAKE_IRD_RC="1", FAKE_IRD_NOISE="1", FAKE_IRD_LAND="m-mixed")
-    r = subprocess.run(argv, capture_output=True, text=True, timeout=120, env=env)
+    r = _e2e_run(argv, 120, env=env)
     out = r.stdout + r.stderr
     assert r.returncode == 0, out
     for line in ("  warning: ird: chown: changing ownership", "  warning: ird reserve exited 1",
@@ -6408,7 +6482,7 @@ def test_setup_box_ird_e2e_ssh_drop_mid_reserve_still_claims_and_releases(fake_i
     fake_ird.add("99")
     argv, env, _ = _e2e(fake_ird, tmp_path)
     env.update(FAKE_IRD_RC="255", FAKE_IRD_LIST_FAIL="1", FAKE_SLEEP_SCALE="0.01")   # the list retry in 20 ms
-    r = subprocess.run(argv, capture_output=True, text=True, timeout=120, env=env)
+    r = _e2e_run(argv, 120, env=env)
     out = r.stdout + r.stderr
     assert r.returncode == 0, out
     for line in ("  warning: ird reserve exited 255", "step 2 reserve: PASS id 100 on m-idle,",
@@ -6421,12 +6495,12 @@ def test_setup_box_ird_e2e_notes_a_different_machine_only_when_it_differs(fake_i
     import subprocess
     argv, env, _ = _e2e(fake_ird, tmp_path)
     env["FAKE_IRD_PREFIX"] = "site1-"  # list-machines names carry a site prefix, ird list's do not
-    r = subprocess.run(argv, capture_output=True, text=True, timeout=120, env=env)
+    r = _e2e_run(argv, 120, env=env)
     out = r.stdout + r.stderr
     assert r.returncode == 0 and "picked site1-m-idle" in out, out
     assert "step 2 reserve: PASS id 100 on m-idle," in out and "asked for" not in out, out
     env["FAKE_IRD_LAND"] = "m-mixed"
-    r = subprocess.run(argv, capture_output=True, text=True, timeout=120, env=env)
+    r = _e2e_run(argv, 120, env=env)
     out = r.stdout + r.stderr
     assert r.returncode == 0, out
     assert "PASS id 101 on m-mixed (asked for site1-m-idle; using the machine ird reserved)" in out, out
@@ -6438,7 +6512,7 @@ def test_setup_box_ird_e2e_says_asked_for_only_when_machine_reached_ird(fake_ird
     fake_ird.load().update(busy=[], reservations=[])  # nothing to learn ird list's name form from
     fake_ird.save()
     env.update(FAKE_IRD_PREFIX="site1-", FAKE_IRD_LAND="m-mixed")
-    r = subprocess.run(argv, capture_output=True, text=True, timeout=120, env=env)
+    r = _e2e_run(argv, 120, env=env)
     out = r.stdout + r.stderr
     assert r.returncode == 0, out
     assert "reserve --cluster <pool> --timeout 00:30:00 --no-shell <arch>" in fake_ird.ird_log()
@@ -6449,7 +6523,7 @@ def test_setup_box_ird_e2e_says_asked_for_only_when_machine_reached_ird(fake_ird
 def test_setup_box_ird_e2e_reaches_the_management_host_only_through_managed_config(fake_ird, tmp_path):
     import subprocess
     argv, env, _ = _e2e(fake_ird, tmp_path)
-    r = subprocess.run(argv + ["--dry-run"], capture_output=True, text=True, timeout=60,
+    r = _e2e_run(argv + ["--dry-run"], 60,
                        env={**env, "FAKE_MGMT_DOWN": "1"})
     out = r.stdout + r.stderr
     assert r.returncode == 1 and "the site file has no ird.mgmt_ssh" in out, out
@@ -6458,7 +6532,7 @@ def test_setup_box_ird_e2e_reaches_the_management_host_only_through_managed_conf
     site = json.loads(fake_ird.site.read_text())
     site["boxes"]["<ird-box>"]["ird"]["mgmt_ssh"] = {"HostName": "<mgmt-host>", "User": "<user>", "Port": 22}
     fake_ird.site.write_text(json.dumps(site))
-    r = subprocess.run(argv + ["--dry-run"], capture_output=True, text=True, timeout=60, env=env)
+    r = _e2e_run(argv + ["--dry-run"], 60, env=env)
     out = r.stdout + r.stderr
     assert r.returncode == 0 and "<ird-mgmt-alias> from ird.mgmt_ssh" in out, out
     cfg = sorted(tmp_path.glob("ird-e2e.*"), key=lambda p: p.stat().st_mtime)[-1] / "ssh_config"
@@ -6467,7 +6541,7 @@ def test_setup_box_ird_e2e_reaches_the_management_host_only_through_managed_conf
                                    '\nHost *\n    LogLevel ERROR\n')
     site["boxes"]["<ird-box>"]["ird"]["mgmt_ssh"] = {"StrictHostKeyChecking": "no"}
     fake_ird.site.write_text(json.dumps(site))
-    r = subprocess.run(argv + ["--dry-run"], capture_output=True, text=True, timeout=60, env=env)
+    r = _e2e_run(argv + ["--dry-run"], 60, env=env)
     assert r.returncode == 1 and "ird.mgmt_ssh must map ssh options" in r.stdout, r.stdout
 
 
@@ -6475,7 +6549,7 @@ def test_setup_box_ird_e2e_extend_that_adds_no_time_fails(fake_ird, tmp_path):
     import subprocess
     argv, env, _ = _e2e(fake_ird, tmp_path)
     env["FAKE_IRD_EXTEND"] = "noop"  # rc 0, but the time left (and so the expiry) does not move
-    r = subprocess.run(argv, capture_output=True, text=True, timeout=120, env=env)
+    r = _e2e_run(argv, 120, env=env)
     out = r.stdout + r.stderr
     assert r.returncode == 1, out
     # the target is the minutes left (rounded up) plus 15; the fixture's frozen clock keeps it 45
@@ -6483,7 +6557,7 @@ def test_setup_box_ird_e2e_extend_that_adds_no_time_fails(fake_ird, tmp_path):
                      r"100 45 exited 0, but ird list shows it expiring", out), out
     assert "released: yes" in out and fake_ird.load()["reservations"] == [], out
     env["FAKE_IRD_EXTEND"] = "fail"
-    r = subprocess.run(argv, capture_output=True, text=True, timeout=120, env=env)
+    r = _e2e_run(argv, 120, env=env)
     out = r.stdout + r.stderr
     assert r.returncode == 1 and re.search(r"\(rc 1\): error: ird change-timeout 101 45 failed \(rc 3\)", out), out
 
@@ -6515,7 +6589,7 @@ def test_setup_box_ird_e2e_trap_leaves_unclaimed_new_reservations_and_says_so(fa
     import subprocess
     argv, env, _ = _e2e(fake_ird, tmp_path)
     env["FAKE_IRD_ALSO"] = "m-idle"  # two new rows on one machine: box.py claims neither
-    r = subprocess.run(argv, capture_output=True, text=True, timeout=120, env=env)
+    r = _e2e_run(argv, 120, env=env)
     out = r.stdout + r.stderr
     assert r.returncode == 1 and "result: FAIL at 2 reserve" in out, out
     assert "reservation: 100 on m-idle, 101 on m-idle" in out, out
