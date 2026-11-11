@@ -270,14 +270,82 @@ def _make_root(p: Project) -> None:
 RECOVERED_EVENT = "worktree_recovered"   # the task's event when ensure fixed a worktree on another branch or moved a folder aside
 
 
+def lineage(p: Project, task: dict, depth: int = 6) -> dict[int, dict]:
+    """The tasks whose work is this task's own, by id: the task, the chain it continues and, where a
+    link of that chain is a review, the code task that review reviewed and the chain it continues."""
+    from .db import review_subject
+    out: dict[int, dict] = {}
+    todo = [(task, 0)]
+    while todo:
+        t, d = todo.pop()
+        if not t or t["id"] in out:
+            continue
+        out[t["id"]] = t
+        if d < depth:
+            todo += [(p.db.task(i), d + 1) for i in (continues_id(t), review_subject(t) if t["kind"] == "review" else None)
+                     if i and i not in out]
+    return out
+
+
 def _owns(p: Project, task: dict, name: str) -> bool:
-    """Whether branch `name` is this task's work: its own (ttp/t<id>-...), or the branch of the task
-    it continues (that task's own or the one recorded on its row)."""
-    old_id = continues_id(task)
-    if any(name.startswith(f"ttp/t{i}-") for i in (task["id"], old_id) if i):
-        return True
-    old = p.db.task(old_id) if old_id else None
-    return bool(old and old["branch"] == name)
+    """Whether branch `name` is this task's work: the own branch (ttp/t<id>-...) of a task in its
+    lineage (the chain it continues, through a review parent to the code task it reviewed), or the
+    branch recorded on one of their rows."""
+    return any(name.startswith(f"ttp/t{i}-") or t["branch"] == name for i, t in lineage(p, task).items())
+
+
+def adopt_branch(p: Project, tid: int, name: str, why: str = "") -> str:
+    """Bind task `tid` to branch `name`, a reviewed branch its saved work is on, with a
+    `branch_adopted` event. Only the task's branch changes: no checkout, delete or rename; the
+    delivery target, continues link, holds and checks stay. Raises ValueError, touching nothing, when
+    the task is running or used by a running task or a pending push, the branch is missing, checked
+    out with uncommitted changes, held by an open task outside the lineage, or its head is neither
+    the saved result's head nor built on a lineage branch."""
+    from .db import TERMINAL_TASK_STATES, load_result
+    task = p.db.task(tid)
+    if not task:
+        raise ValueError(f"no task {tid}")
+    if task["status"] == "cancelled":
+        raise ValueError(f"task {tid} is cancelled")
+    if task["status"] == "running" or p.db.one("SELECT 1 FROM runs WHERE task=? AND status='running'", (tid,)):
+        raise ValueError(f"task {tid} is running; adopt the branch once its run ends")
+    live = p.db.q("SELECT * FROM tasks WHERE status='running'")
+    user = next(needers(task, live), None)
+    if user:
+        raise ValueError(f"task {user['id']} is running and uses task {tid}; adopt the branch once it ends")
+    if p.db.one("SELECT 1 FROM push_queue WHERE task=? AND status IN ('approved','held','batched')", (tid,)):
+        raise ValueError(f"task {tid} has a push pending; adopt the branch once it lands or is dropped")
+    t = git_timeout(p)
+    head = _git(p.root, "rev-parse", "--verify", "-q", f"refs/heads/{name}^{{commit}}", check=False, timeout=t)
+    if not head:
+        raise ValueError(f"no branch {name}")
+    for r in _records(p).values():
+        if r["branch"] == name and dirty_tracked(Path(r["path"])):
+            raise ValueError(f"branch {name} is checked out in {r['path']} with uncommitted changes")
+    mine = lineage(p, task)
+    other = next((o for o in p.db.q("SELECT * FROM tasks WHERE branch=? AND id!=?", (name, tid))
+                  if o["status"] not in TERMINAL_TASK_STATES and o["id"] not in mine), None)
+    if other:
+        raise ValueError(f"branch {name} belongs to open task {other['id']}, outside task {tid}'s lineage")
+    saved = str(load_result(task["result"]).get("head") or "")
+    tips = [t2["branch"] for t2 in mine.values() if t2["branch"]] + \
+        [r["branch"] for r in _records(p).values() if any(r["branch"].startswith(f"ttp/t{i}-") for i in mine)]
+    try:
+        base = resolve_base(p)
+    except RuntimeError:
+        base = ""
+    # A lineage branch still at the base carries no work of the lineage, so it proves nothing.
+    built = any(_has(p, b) and is_ancestor(p, b, head) and not (base and is_ancestor(p, b, base))
+                for b in dict.fromkeys(tips))
+    if not ((saved and head.startswith(saved)) or built):
+        raise ValueError(f"branch {name} at {head[:12]} is neither task {tid}'s saved head nor built on its lineage")
+    was = task["branch"]
+    p.db.update_task(tid, branch=name)
+    p.db.x("INSERT INTO events(ts,source,kind,severity,text,data,status,task) VALUES(?,?,?,?,?,?,?,?)",
+           (time.time(), "cli", "branch_adopted", "low", f"task {tid} adopted branch {name} (was {was or 'none'})",
+            json.dumps({"was": was, "branch": name, "head": head, "why": why,
+                        "by": os.environ.get("TTP_TASK_ID") or "cli"}), "handled", tid))
+    return f"task {tid} now works on {name} at {head[:12]} (was {was or 'none'})"
 
 
 def _resolved(p: Project, *refs: str) -> list[str]:
