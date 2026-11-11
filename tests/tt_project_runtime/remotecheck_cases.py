@@ -454,7 +454,7 @@ def test_check_host_settings_are_validated_and_local_keeps_a_check_here():
 
 # The fake ssh runs a spill host's probe and checks on this machine. On macOS its device holder scan cannot
 # run (no GNU find), and a check script under its temp folder (/private/var/...) is a path of this machine,
-# which never spills; the Linux test hosts keep their temp folder under /dev/shm, a system folder.
+# which never spills unless the test counts its temp folder as a system folder (_spill_setup does).
 _GNU_FIND = pytest.mark.skipif(sys.platform != "linux", reason="the fake spill host's device scan needs GNU find")
 _LINUX_TMP = pytest.mark.skipif(sys.platform != "linux", reason="a check script under the macOS temp folder never spills")
 
@@ -477,6 +477,11 @@ def _spill_setup(env, tmp_path, monkeypatch, hosts, charter=("check-host-a", "ch
     p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
     # The fake ssh runs the probe here: read an idle load, not this machine's (a busy test host has none).
     monkeypatch.setattr(checkspill, "_PROBE", _idle_probe())
+    # The fake spill hosts are this machine, so the test's temp folder is there too: a check naming it may spill
+    # (checkspill.host_path) wherever the session keeps its temp files. Before, it spilled only under /dev/shm (a
+    # system folder), and on a loaded host or under `ttp checks` (temp under /tmp) waited for the lane instead.
+    monkeypatch.setattr(checkspill, "_SYSTEM_DIRS", (*checkspill._SYSTEM_DIRS,
+                                                     *{f"{d}/" for d in (str(tmp_path), os.path.realpath(tmp_path))}))
     p.charter_path.write_text("# Charter\n## Resources\n" + "".join(f"- {h}: a check host\n" for h in charter))
     for h in charter:
         machines.add(h)
@@ -846,9 +851,23 @@ def test_a_rerun_after_a_spill_host_keeps_off_only_the_host_it_failed_on(env, tm
     mark.unlink()
     log.write_text("")
     p.set_config("delivery.push_checks", [f'pwd >> {log}; case "$PWD" in */ttp-check.*) exit 1;; esac'])
+    real_off, kept = checkspill.spill_off_add, []
+
+    def spill_off_add(*a, **k):   # the lane frees once both spill hosts failed, never on a timer (a loaded host)
+        off = real_off(*a, **k)
+        kept.append(off)
+        if len(kept) == 2:
+            lane.close()
+        return off
+    monkeypatch.setattr(checkspill, "spill_off_add", spill_off_add)
     lane = _spill_lane(p, repo)
-    threading.Timer(4.0, lane.close).start()
-    cli.main(["checks", "--fresh"])
+    safety = threading.Timer(120, lane.close)   # never hang the suite
+    safety.start()
+    try:
+        cli.main(["checks", "--fresh"])
+    finally:
+        safety.cancel()
+        lane.close()
     rec = json.loads((run / "checks.json").read_text())
     assert rec["passed"] is True and "spilled_to" not in rec, rec
     where = log.read_text().splitlines()

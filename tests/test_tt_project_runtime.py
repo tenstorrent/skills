@@ -513,6 +513,13 @@ def env(tmp_path, monkeypatch, _git_session, _short_tmp):
                 "TTP_ROLE", "TTP_COORD_FULL_TOOLS",   # the run's role: a coordinator's makes the git wrapper refuse every push
                 "CMAKE_BUILD_PARALLEL_LEVEL"):
         monkeypatch.delenv(var, raising=False)
+    # What a re-executing `ttp checks` hands its next process (cli._checks_reexec, a rerun) is set straight in
+    # os.environ: recorded here (set, then removed) so it is undone after each test and never reaches the next
+    # one in the same worker (a monkeypatch.delenv of an unset name records nothing to undo).
+    for var in ("TTP_CHECKS_NO_SPILL", "TTP_CHECKS_ARRIVED", "TTP_CHECKS_REEXEC", "TTP_CHECKS_RERANKED",
+                "TTP_CHECKS_KEPT_SLOT", "TTP_CHECKS_LANES", "TTP_CHECKS_WAIT_KEPT", "TTP_CHECKS_RETRY_IDS"):
+        monkeypatch.setenv(var, "")
+        monkeypatch.delenv(var)
     monkeypatch.setenv("TTP_CHECKS_LOAD_EXTRA", "0")   # the checks cap never grows with this host's load
     monkeypatch.setenv("TTP_TEST_NO_INHERIT", "1")   # `ttp checks` never takes the task of the run running the tests (checkcap.adopt_identity)
     monkeypatch.setenv("TTP_CHECKS_LIVE_CORES", "0")   # nor waits on this host's busy cores
