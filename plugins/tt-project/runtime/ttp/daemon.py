@@ -205,6 +205,7 @@ from . import release
 from . import responsibilities
 from . import reviewcap
 from . import reviewhold
+from . import carryback
 from . import reviewreuse
 from . import reviewstats
 from . import reviewsup
@@ -7912,6 +7913,29 @@ class Daemon:
             except Exception:
                 log(self.p, f"run {r.get('id')}: checking the project root's checkout failed\n"
                             + traceback.format_exc())
+        if isinstance(cmark := load_result(task["result"]).get(carryback.KEY), dict):
+            extra[carryback.KEY] = cmark   # kept for the task's life: one send-back per task
+        elif new == "done" and not approval and status == "ok" and not root_sent and task["kind"] == "code" \
+                and task["branch"]:
+            try:   # memoized by _prefetch_git: the same read the review's queueing makes below
+                head = pushq._commit(self.p, task["branch"])
+                found = carryback.pending(db, task, pushq.carried(self.p, task, head, self.cfg) if head else {},
+                                          load_result(task["result"]))
+            except Exception:   # never lose a hand-off to the check itself
+                found = {}
+                log(self.p, f"task {task['id']}: checking carried commits failed: "
+                            + traceback.format_exc().replace("\n", " | ")[:1500])
+            if found:
+                tgt = pushq.target(self.p)
+                new, not_before, push_quiet = "queued", time.time(), True
+                attempts = int(task["attempts"] or 0)
+                extra[carryback.KEY] = {"run": r.get("id"), "head": head, "tasks": sorted(found)}
+                extra["woke"] = carryback.order(found, f"{tgt[0]}/{tgt[1]}" if tgt else "")
+                if (back := self._handoff_resume(r, task, usage, run_dir, extra["woke"])):
+                    extra[HANDOFF_RESUME_KEY] = back   # continues its session, as a hand-off check's send-back
+                reason = (f"its head carries commits of {', '.join(f'#{t}' for t in found)}, whose review failed; "
+                          f"sent back once")
+                log(self.p, f"task {task['id']}: run {r.get('id')} {reason}")
         if new == "done" and not approval and not push_verified and status == "ok" \
                 and self._defer_for_push(r, task, run_dir, usage, ended, result, summary):
             return
@@ -7940,7 +7964,7 @@ class Daemon:
                  if k not in ("summary", "waits", "waiting_since", "woke", "reboot_wakes", "escalated_wake",
                               "stale_wakes", "wait_key", SPEC_SEEN_KEY, SPEC_WAKES_KEY, SPEC_WAKE_NOW_KEY,
                               SPEC_WOKE_KEY, SPEC_HOLD_KEY, SPEC_URGENT_KEY, SPEC_URGENT_WOKE_KEY,
-                              handoffcheck.KEY, ROOT_WAKE_KEY)}
+                              handoffcheck.KEY, ROOT_WAKE_KEY, carryback.KEY)}
                 if isinstance(result, dict) else {})})}
         if reason:
             upd["blocked_reason"] = reason[:500]

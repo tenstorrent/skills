@@ -7412,6 +7412,7 @@ def test_a_passed_probe_reads_the_push_queues_rejected_commit_git_before_its_fin
         d._probe_passed(s.p.db.task(tid), time.time())
     # A code task's checks passed: its review is queued, naming the rejected commits its head carries.
     s.p.db.update_task(crev, status="cancelled")
+    s.p.db.x("UPDATE tasks SET labels=? WHERE id=?", (json.dumps([f"start_when:landed:#{x}"]), c))   # no send-back
     passed(c, {"status": "done", "summary": "made the change"})
     rid = s.p.db.one("SELECT id FROM tasks WHERE kind='review' AND status='queued' AND depends_on LIKE ?",
                      (f"%{c}%",))["id"]
@@ -20611,3 +20612,79 @@ def test_a_dead_push_waiter_is_skipped_and_a_late_turn_gets_its_full_wait(env, m
     t.join(timeout=30)
     assert got and got[0] is not None and time.time() - t0 < push.STALL_S / 2, (got, time.time() - t0)
     got[0].close()
+
+
+def _carry_hand_off(env, s, tid, **more):
+    """Code task `tid`'s run hands off done (its branch at its current head)."""
+    return _pq_hand_off(env, s, push=False, task=tid, **more)
+
+
+def test_a_code_hand_off_carrying_a_rejected_task_s_commits_is_sent_back_once_to_rebase_or_wait(env, monkeypatch):
+    """#7223: a head stacked on a task whose review failed cannot pass the push queue, so its hand-off
+    is sent back once with the order to rebase or wait on that landing; the next hand-off is taken."""
+    from ttp import carryback
+    from ttp.daemon import Daemon
+    s = _pq(env, monkeypatch)
+    monkeypatch.setattr(Daemon, "_precheck", lambda self, task, head: None)
+    x, xbranch, _, _ = _pq_stacked(s, "rejected", review="failed")
+    c, _, chead, _ = _pq_stacked(s, "stacked", on=xbranch)
+    # The worker cannot skip the check by writing the key itself.
+    t = _carry_hand_off(env, s, c, **{carryback.KEY: {"run": 1}})
+    res = json.loads(t["result"])
+    assert t["status"] == "queued" and int(t["attempts"] or 0) == 0, dict(t)
+    assert f"#{x}" in res["woke"] and "rebase onto the tip of origin/proj" in res["woke"], res["woke"]
+    assert f"ttp landed --task {x}" in res["woke"] and "asked once" in res["woke"]
+    assert res[carryback.KEY]["tasks"] == [x] and res[carryback.KEY]["head"] == chead
+    assert not s.p.db.q("SELECT id FROM tasks WHERE kind='review' AND labels LIKE ?", (f'%auto_review:{c}"%',))
+    # Handed off again unchanged: taken, and the daemon's review is queued (held as before).
+    t = _carry_hand_off(env, s, c)
+    assert t["status"] == "done", dict(t)
+    assert carryback.KEY in json.loads(t["result"]), "once per task"
+    assert s.p.db.q("SELECT id FROM tasks WHERE kind='review' AND labels LIKE ?", (f'%auto_review:{c}"%',))
+
+
+def test_a_code_hand_off_passes_when_it_declares_the_landing_or_the_carried_commits_landed_or_are_approved(
+        env, monkeypatch):
+    from ttp import carryback, pushq
+    from ttp.daemon import Daemon
+    s = _pq(env, monkeypatch)
+    monkeypatch.setattr(Daemon, "_precheck", lambda self, task, head: None)
+    x, xbranch, xhead, _ = _pq_stacked(s, "rejected", review="failed")
+    # a) It declares start_when `landed:#x` (or names it in its spec): no send-back.
+    a, _, _, _ = _pq_stacked(s, "declared", on=xbranch)
+    s.p.db.x("UPDATE tasks SET labels=? WHERE id=?",
+             (json.dumps([f"start_when:landed:#{x}", "start_why:needs its code"]), a))
+    b, _, _, _ = _pq_stacked(s, "in-spec", on=xbranch)
+    s.p.db.x("UPDATE tasks SET spec=? WHERE id=?", (f"needs #{x}'s code: start_when landed:#{x}", b))
+    for tid in (a, b):
+        t = _carry_hand_off(env, s, tid)
+        assert t["status"] == "done" and carryback.KEY not in json.loads(t["result"]), dict(t)
+    # A declared wait on another task is no wait on this one.
+    assert not carryback.declared({"spec": f"start_when landed:#{x}1", "labels": "[]"}, {}, x)
+    assert carryback.declared({"spec": "", "labels": "[]"}, {"retry_when": f"ttp landed --task {x}"}, x)
+    # b) Its change is approved for the push queue (a passed re-review of its fix): no send-back.
+    fix = s.p.db.add_task(f"fix #{x}", "f", kind="code", origin="daemon", labels=[f"continues:{x}"])
+    s.p.db.update_task(fix, status="done")
+    rr = s.p.db.add_task(f"Review #{fix}: fix", "r", kind="review", origin="daemon", depends_on=[x, fix],
+                         labels=[f"auto_review:{fix}"])
+    s.p.db.update_task(rr, status="pushing")
+    with s.p.db.tx():
+        pushq.approve(s.p, rr, None, {"entries": [{"branch": xbranch, "head": xhead}], "target": "origin/proj"})
+    c, _, _, _ = _pq_stacked(s, "on-approved", on=xbranch)
+    t = _carry_hand_off(env, s, c)
+    assert t["status"] == "done" and carryback.KEY not in json.loads(t["result"]), dict(t)
+    # c) The carried commits are on the push branch already (landed there as a rebased copy): no send-back.
+    s.p.db.x("DELETE FROM push_queue")
+    y, ybranch, yhead, _ = _pq_stacked(s, "landed-rejected", review="failed")
+    tip = _git_out(s.repo, "rev-parse", "origin/proj")
+    _git_out(s.other, "fetch", "-q", "origin")
+    _git_out(s.other, "checkout", "-q", "-B", "proj", "origin/proj")
+    _git_out(s.other, "fetch", "-q", str(s.repo), ybranch)
+    _git_out(s.other, "cherry-pick", "FETCH_HEAD")
+    _git_out(s.other, "push", "-q", "origin", "proj")
+    _git_out(s.repo, "fetch", "-q", "origin")
+    assert _git_out(s.repo, "rev-parse", "origin/proj") != tip
+    d, _, _, _ = _pq_stacked(s, "on-landed", on=ybranch)
+    assert not pushq.carried(s.p, s.p.db.task(d), _git_out(s.repo, "rev-parse", s.p.db.task(d)["branch"])).get(y)
+    t = _carry_hand_off(env, s, d)
+    assert t["status"] == "done" and carryback.KEY not in json.loads(t["result"]), dict(t)
