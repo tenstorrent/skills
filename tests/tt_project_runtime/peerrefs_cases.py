@@ -77,3 +77,22 @@ def test_stale_facts_and_strip_facts():
     assert stale_facts([a], "", [("task", 5)]) == [] and stale_facts(None, f"; {b}", []) == [b]
     assert strip_facts(f"waiting for x ({a}; {b}); {a}; then", [a]) == f"waiting for x ({b}); then"
     assert strip_facts(f"waiting for x ({a}); {b}; then", [a]) == f"waiting for x; {b}; then"
+
+
+def test_a_foreign_fact_the_note_cannot_lose_is_neither_rewritten_nor_logged_each_tick(env):
+    p = make(env, "alpha")
+    from ttp import daemon as dmod, project, refwaits
+    project.register("otherproj", {"host": "testhost", "dir": str(p.root) + "-other"})
+    d = dmod.Daemon(p.base)
+    n = p.db.add_task("same number as the peer's", "s", kind="work", origin="user", status="done")
+    tid, _ = _ref_wait(p, f"otherproj task #{n}", probe="false")
+    note = f"waiting: task #{n} is done (not proof its work landed)"   # no separator strip_facts knows
+    p.db.update_task(tid, blocked_reason=note)
+    before = p.db.task(tid)["result"]
+    for _ in range(2):
+        d.refresh_ref_waits()
+    t = p.db.task(tid)
+    assert t["result"] == before and t["blocked_reason"] == note
+    assert refwaits.FACTS_KEY not in json.loads(t["result"])
+    log = p.logs / "daemon.log"
+    assert f"task {tid} wait note: dropped" not in (log.read_text() if log.exists() else "")

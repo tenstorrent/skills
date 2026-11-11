@@ -14516,8 +14516,10 @@ class Daemon:
             upd["result"] = dump_result({**prev, refwaits.FACTS_KEY: [
                 f for f in prev.get(refwaits.FACTS_KEY) or [] if f not in stale]})
         note = str(t["blocked_reason"] or "")
-        if not note.startswith(refwaits.HELD_NOTES):
+        if not note.startswith(refwaits.HELD_NOTES) and refwaits.strip_facts(note, stale) != note:
             upd["blocked_reason"] = refwaits.strip_facts(note, stale)
+        if not upd:     # nothing to drop: no write, no log on every refresh
+            return t
         with db.tx():
             cur = db.task(tid) or {}
             if cur.get("status") != "queued" or cur.get("result") != t["result"]:
