@@ -9,7 +9,8 @@
           "forward": [
             {"name": "build-host", "target": "build-host.example.com", "port": 2301, "user": "builder"},
             {"name": "test-host-1", "aliases": ["th1"], "target": "10.0.0.11", "port": 2302,
-             "host_key_alias": "test-host-1"}
+             "host_key_alias": "test-host-1"},
+            {"name": "vpn-host", "target": "10.0.0.12", "port": 2303, "interface": "ppp0"}
           ]
         },
         "git": {

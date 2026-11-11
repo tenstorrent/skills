@@ -3418,6 +3418,10 @@ Workers can read Slack links you paste, using your Slack connector if you have o
     `restrict` and no `agent-forwarding` gives none (`doctor` says so). Name a key that may forward
     under `login`.
   - A forward entry with `"adopt": true` uses a loopback port another kept forward already serves.
+  - A forward entry with `"interface": "<name>"` is for a host the workstation reaches only bound to
+    one interface (a VPN used through ssh's `BindInterface`). Its box port goes to a small relay on the
+    workstation that connects to the host's port 22 over that interface. The relay ends with the session.
+  - Agent `"env"` is the service's own `SSH_AUTH_SOCK`, even when `login` names another agent.
 - Workers run with your permissions, in their own worktree; restrictions in the charter are
   passed to every worker and enforced by the provider where it can (for example, no web tools).
 - When the user loosens or removes a Restrictions item (a quoted edit, or a `replaces` of a whole
