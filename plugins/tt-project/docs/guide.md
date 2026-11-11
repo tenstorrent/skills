@@ -2407,12 +2407,17 @@ session and stateless coordinators on every provider.
   A host whose own environment keeps failing runs is quarantined, per project and model-free: a spilled failure
   (never a host fault, exit 75, nor a timeout) is a strike against its host once the same commit then passes
   elsewhere (here or on another spill host); a pass there resets its strikes. After `checks.spill_quarantine_after`
-  strikes in a row (default 3) the host takes none of the project's runs for 6 hours, with one event and one
-  machine ledger entry whose auto-undo, `ttp checks --spill-back <alias>`, puts it back (run it by hand to end the
-  quarantine sooner). A failure that hits two or more spill hosts the same way within an hour (the same last error
+  strikes in a row (default 3) the host takes none of the project's runs, with one event and one machine ledger
+  entry. Its until-probe, `ttp checks --spill-probe <alias>`, puts it back once a known-good run passes there: on
+  the daemon's probe timer it starts the push branch tip's spillable checks on that host, detached and behind its
+  spill wrapper, and reads that run's result on later rounds. A refusal there (exit 75, a busy host) starts it
+  again at once and is no strike; a failure starts it again an hour later. The entry's auto-undo,
+  `ttp checks --spill-back <alias>`, ends it after 7 days at the latest (run it by hand to end the quarantine
+  sooner). However a quarantine ends, it raises one "back" event and resets the host's strikes, ledger entry or
+  not. A failure that hits two or more spill hosts the same way within an hour (the same last error
   line, paths and numbers aside, and the same failing pytest ids) with no spilled pass between is the project's
-  spill setup, not the hosts (a wrapper that lost its environment): one high event says so and no host takes a
-  strike; a failure that is a missing package at import is already the spill env fault above (told once, never
+  spill setup, not the hosts (a wrapper that lost its environment): one high event says so, no host takes a
+  strike, and a host quarantined earlier for that same failure comes back; a failure that is a missing package at import is already the spill env fault above (told once, never
   a strike, and no second event under the same checks config). A failure with neither an error line nor a failing test id matches no other: it is only a strike.
   `checks.json` (`spilled_to`), `ttp status` and `ttp checks status` name the host.
   `checks.slurm_overflow` (account-level, unset by default: nothing changes) sends a run that no pool host can take

@@ -3832,6 +3832,13 @@ def cmd_checks(a) -> None:
         was = checkspill.lift(p, a.spill_back)
         print(f"ttp checks: spill host {a.spill_back} " + ("is back in the spill pool" if was else "was not quarantined"))
         sys.exit(0)
+    if getattr(a, "spill_probe", None):
+        from . import checkspill
+        if (p := here()) is None:
+            die("ttp checks --spill-probe: not in a project")
+        code, said = checkspill.known_good(p, p.config(), a.spill_probe)
+        print(f"ttp checks: spill host {a.spill_probe}: {said}")
+        sys.exit(code)
     if getattr(a, "preempt", None):
         from . import checkcap, checklane
         p = here()
@@ -14122,6 +14129,10 @@ def main(argv: list[str] | None = None) -> None:
                         "open one) no longer hit a missing check runner, 1 while one does")
     s.add_argument("--spill-back", metavar="ALIAS",
                    help="run nothing: end spill host ALIAS's quarantine (checkspill.strike_settle) and its strikes")
+    s.add_argument("--spill-probe", metavar="ALIAS",
+                   help="exit 0 once quarantined spill host ALIAS passed a known-good run of the push branch tip "
+                        "(then back in the spill pool), 1 while it runs or failed; starts one detached when none "
+                        "runs (checkspill.known_good, its machine ledger entry's until-probe)")
     s.add_argument("--slot-status", action="store_true",
                    help="run nothing (also `ttp checks status`): print each repository's checks lanes, their "
                         "holders (pid, task, run, age, alive) and the waiters in queue order; never queues")

@@ -4536,6 +4536,93 @@ def test_a_spill_host_whose_runs_fail_where_the_head_passes_elsewhere_is_quarant
         checkspill.quarantine_after_of("x")
 
 
+
+def _quarantine(p, host="check-host-a", sig="OSError: no space left on device"):
+    from ttp import checkspill
+    p.set_config("checks.spill_quarantine_after", 1)
+    checkspill.strike_fail(p, host, "q1", sig)
+    assert checkspill.strike_settle(p, p.config(), "q1") == [host]
+
+
+def test_a_spill_quarantine_past_its_end_comes_back_with_its_event_and_no_strikes_left(env, tmp_path, monkeypatch):
+    """A quarantine that ends by time (no known-good run passed, its ledger entry gone or unrun) ends as a lift
+    does: one back event, its strikes reset, its ledger entry closed; never silently with the old strike count.
+    The entry's until-probe is the known-good probe."""
+    from ttp import checkspill, machine_ledger
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a", "check-host-b"])
+    _quarantine(p)
+    entry = [c for c in machine_ledger.changes(["check-host-a"]) if c.get("kind") == "spill_quarantine"]
+    assert entry and entry[0]["probe"] == "ttp checks --spill-probe check-host-a || exit 1", entry
+    off = checkspill._strikes(p.db)["hosts"]["check-host-a"]["off"]
+    assert "known-good run" in checkspill.quarantined(p, "check-host-a", float(off["until"]) - 1)
+    assert checkspill.quarantined(p, "check-host-a", float(off["until"]) + 1) == ""
+    h = checkspill._strikes(p.db)["hosts"]["check-host-a"]
+    assert h["n"] == 0 and "off" not in h, h
+    assert len(_spill_events(p, "Spill host check-host-a is back")) == 1
+    assert not [c for c in machine_ledger.changes(["check-host-a"]) if c.get("kind") == "spill_quarantine"]
+
+
+def test_the_known_good_probe_lifts_a_quarantine_only_once_its_detached_run_passes(env, tmp_path, monkeypatch):
+    """`ttp checks --spill-probe`: starts the known-good run detached and exits 1 while it runs; a refusal there
+    (exit 75) starts it again at once with no strike; a failure waits KNOWN_GOOD_RETRY_S; a pass lifts the host
+    (exit 0, one back event)."""
+    from ttp import checkspill, detach
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a", "check-host-b"])
+    cfg = p.config()
+    assert checkspill.known_good(p, cfg, "check-host-a")[0] == 0, "not quarantined"
+    _quarantine(p)
+    starts, state = [], [("running", "")]
+    rc = checkspill._known_good_rc(p, "check-host-a")
+    from ttp import gatejudge
+    monkeypatch.setattr(gatejudge, "_push_tip", lambda p_: (repo, "c0ffee1"))
+    p.set_config("delivery.push_checks", ["python3 -m pytest -q", "claude plugin validate . --strict"])
+    cfg = p.config()
+    argv = []
+    monkeypatch.setattr(detach, "start", lambda rc_, log, cmd, *a, **k: argv.extend(cmd) or 4242)
+    assert checkspill._known_good_start(p, cfg, "check-host-a", rc) == ("c0ffee1", "")
+    assert argv[:2] == ["sh", "-c"] and "--host check-host-a" in argv[2] and "--commit c0ffee1" in argv[2], argv
+    assert "pytest" in argv[2] and "validate" not in argv[2], "only the checks that may spill"
+
+    def start(p_, cfg_, alias, rc_):
+        starts.append(alias)
+        rc_.parent.mkdir(parents=True, exist_ok=True)
+        rc_.write_text("")
+        return "base1", ""
+    monkeypatch.setattr(checkspill, "_known_good_start", start)
+    monkeypatch.setattr(detach, "state", lambda rc_: state[0])
+    now = time.time()
+    assert checkspill.known_good(p, cfg, "check-host-a", now)[0] == 1 and starts == ["check-host-a"]
+    assert checkspill._strikes(p.db)["hosts"]["check-host-a"]["off"]["probe"] == "base1"
+    assert checkspill.known_good(p, cfg, "check-host-a", now)[0] == 1 and len(starts) == 1, "running"
+    state[0] = ("ended", "75")
+    assert checkspill.known_good(p, cfg, "check-host-a", now)[0] == 1 and len(starts) == 2, "refused: again now"
+    assert checkspill._strikes(p.db)["hosts"]["check-host-a"]["n"] == 1, "a refusal is no strike"
+    state[0] = ("ended", "1")
+    assert checkspill.known_good(p, cfg, "check-host-a", rc.stat().st_mtime + 60)[0] == 1 and len(starts) == 2
+    assert checkspill.quarantined(p, "check-host-a", now), "a failed known-good run keeps it out"
+    later = rc.stat().st_mtime + checkspill.KNOWN_GOOD_RETRY_S + 1
+    assert checkspill.known_good(p, cfg, "check-host-a", later)[0] == 1 and len(starts) == 3, "failed: again later"
+    state[0] = ("ended", "0")
+    code, said = checkspill.known_good(p, cfg, "check-host-a", now)
+    assert code == 0 and "passed" in said and not checkspill.quarantined(p, "check-host-a", now)
+    assert checkspill._strikes(p.db)["hosts"]["check-host-a"]["n"] == 0
+    assert len(_spill_events(p, "Spill host check-host-a is back")) == 1
+    assert checkspill.known_good(p, cfg, "check-host-a", now)[0] == 0 and len(starts) == 3
+
+
+def test_a_late_config_fault_lifts_the_quarantine_its_failure_caused(env, tmp_path, monkeypatch):
+    """One host failed alone and was quarantined; the same failure then shows on a second host: it was the
+    project's spill setup all along, so the first host comes back (one back event)."""
+    from ttp import checkspill
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a", "check-host-b"])
+    sig = "ModuleNotFoundError: No module named 'yaml'"
+    _quarantine(p, sig=sig)
+    assert checkspill.quarantined(p, "check-host-a")
+    checkspill.strike_fail(p, "check-host-b", "q2", sig)
+    assert checkspill.strike_settle(p, p.config(), "q2") == []
+    assert not checkspill.quarantined(p, "check-host-a") and not checkspill.quarantined(p, "check-host-b")
+    assert len(_spill_events(p, "Spill host check-host-a is back")) == 1
+
 def test_a_failure_every_spill_host_shares_is_one_config_incident_and_quarantines_no_host(env, tmp_path, monkeypatch):
     """The spill setup broke for all hosts (the pinned env lost: the same import error everywhere, passing here):
     one high incident, no strike, no quarantine, however many runs; a second host failing differently, or a
