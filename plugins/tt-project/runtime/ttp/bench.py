@@ -379,9 +379,9 @@ def _reach(rows, pushed: list[dict]) -> set[int]:
     for tid, t in rows.tasks.items():
         branch.setdefault(t.get("branch") or "", set()).add(tid)
     links = {}
-    for i, b, _, ids, names in rows.links:
+    for i, b, _, ids, names, follows in rows.links:
         branch.setdefault(b, set()).add(i)
-        links[i] = (ids, names)
+        links[i] = (ids | follows, names)
     branch.pop("", None)
     seen = {r["task"] for r in pushed} | {i for r in pushed for i in branch.get(r["branch"] or "", ())}
     todo = list(seen)

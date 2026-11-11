@@ -578,3 +578,15 @@ def test_bench_run_agent_and_grade_of_each_cell_run_in_venvs_of_their_own(env, t
         assert shown, (cell / "tests.log").read_text()
         grades.add(shown[1])
     assert len(agents | grades) == 4, "each cell's agent and grade get a venv of their own"
+
+
+def test_bench_reach_follows_carrier_links_named_by_follows_labels():
+    # landed.carriers joins a link that follows a carried task on its branch; the bench's reach
+    # (a superset found before carriers) must walk those links too, or such tasks lose their landing.
+    from types import SimpleNamespace
+    from ttp import bench
+    rows = SimpleNamespace(tasks={1: {"branch": "b1"}, 2: {"branch": "b2"}},
+                           links=[(2, "b2", "code", set(), set(), {1})])
+    assert bench._reach(rows, [{"task": 2, "branch": "b2"}]) == {1, 2}
+    rows.links = [(2, "b2", "code", set(), set(), set())]
+    assert bench._reach(rows, [{"task": 2, "branch": "b2"}]) == {2}
