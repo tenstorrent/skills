@@ -487,8 +487,11 @@ def test_the_host_guard_ledger_record_says_when_this_host_is_not_listed(monkeypa
 
 
 def test_this_test_session_runs_with_the_host_stand_ins_first_on_path():
+    from ttp import hoststate
     store = os.environ.get("TTP_HOSTSTATE_FAKE")
-    assert store and os.environ["PATH"].split(os.pathsep)[0] == os.path.join(store, "bin")
+    # Under `ttp checks` the suite's sudo wrapper stays ahead of the stand-ins (hoststate.fake_env).
+    path = [d for d in os.environ["PATH"].split(os.pathsep) if os.path.basename(d) != hoststate.SUDO_WRAPPER_DIR]
+    assert store and path[0] == os.path.join(store, "bin")
     assert shutil.which("crontab") == os.path.join(store, "bin", "crontab")
 
 

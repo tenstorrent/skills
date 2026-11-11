@@ -469,6 +469,15 @@ def _git_session(tmp_path_factory):
     return {"objects": objects / "objects", "repo": repo, "config": config, "base": base, "bare": bare}
 
 
+def _run_wrapper_dir(d: str) -> bool:
+    """`d` holds a tt-project git wrapper (a harness's bin/, which a run puts on PATH)."""
+    try:
+        with open(os.path.join(d or ".", "git"), "rb") as f:
+            return f.read(2) == b"#!" and b"# tt-project git wrapper" in f.read(65536)
+    except OSError:
+        return False
+
+
 @pytest.fixture()
 def env(tmp_path, monkeypatch, _git_session, _short_tmp):
     home = tmp_path / "home"
@@ -537,6 +546,10 @@ def env(tmp_path, monkeypatch, _git_session, _short_tmp):
     # Tests may run from an ssh login: timefmt.in_ssh_login() is false unless a test sets it.
     for var in ("SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY"):
         monkeypatch.delenv(var, raising=False)
+    # A live run puts its harness's bin/ (git, gh, ssh and ttp wrappers) first on PATH: its git wrapper
+    # would guard a test's pushes with the installed runtime and that run's project, not the code under test.
+    monkeypatch.setenv("PATH", os.pathsep.join(d for d in os.environ.get("PATH", "").split(os.pathsep)
+                                               if not _run_wrapper_dir(d)))
     # A run's environment makes every git fsync its objects (project.git_fsync_env); test repositories
     # need no power-loss durability, and on some filesystems each `git add` then takes 20x longer.
     # Tests of those settings set and inspect them explicitly.

@@ -40,6 +40,7 @@ from . import (   # one name per line: two changes adding names merge without a 
     release,
     replymsg,
     reviewcap,
+    reviewreuse,
     runner,
     scopehold,
     setupfault,
@@ -1181,7 +1182,6 @@ def _same_patch(p: Project, head: str, old: str, name: str) -> bool:
     """Whether `head` carries the same commits, by patch-id, past target `name`'s tip as past target
     `old`'s (both read from their tracking refs, `name` fetched by _follows): the change's own patch
     is unchanged on the new target, so its approval stands there though the targets diverged."""
-    from . import reviewreuse
     was, now = _tip(p, old, False), _tip(p, name, False)
     if not (was and now and _HEX40.fullmatch(head or "")):
         return False

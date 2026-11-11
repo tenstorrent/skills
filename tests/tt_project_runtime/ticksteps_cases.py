@@ -1986,6 +1986,9 @@ def test_g_a_read_that_never_settles_degrades_as_a_git_failure_in_the_final_roun
     assert not reviews, "the code task's review was queued in the degraded round"
     s.p.db.x("UPDATE tasks SET updated=? WHERE id=?", (time.time() - 3600, s.code))
     s.p.db.update_task(s.review, status="cancelled")   # the fixture's review of an earlier head covers it
+    # The tick's push-queue pass withdraws the cancelled review's approved push of that head first.
+    from ttp import pushq
+    pushq.cancel_orphans(s.p)
     assert dmod.Daemon(s.p.base).sweep_unreviewed(force=True) == [s.code]
 
 

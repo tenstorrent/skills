@@ -158,6 +158,9 @@ def test_a_check_gets_the_sudo_wrapper_and_its_report_never_fails_it(tmp_path, m
     orphaned root process with who can end it, the exit code stays the command's, and the runner's own
     environment keeps no wrapper. Under the refusal the stub never runs."""
     from ttp import cli, sudowatch
+    # A suite run under `ttp checks` has that run's own wrapper on PATH: not this check's.
+    monkeypatch.setenv("PATH", os.pathsep.join(d for d in os.environ.get("PATH", "").split(os.pathsep)
+                                               if os.path.basename(d) != sudowatch.DIR_NAME))
     path, calls = _sudo_path(tmp_path)
     monkeypatch.setattr(sudowatch, "processes", lambda: [
         {"pid": 4321, "ppid": 1, "sid": 1, "start": time.time() + 30, "uids": [0, 0], "name": "ipmitool",

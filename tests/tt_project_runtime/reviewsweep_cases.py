@@ -61,6 +61,8 @@ def test_a_task_with_an_unreadable_head_raises_one_coordinator_event_and_gets_no
     p = make(env)
     tid, _, _ = _unreviewed(env, p, "gone branch", status="review", age=1900)
     p.db.update_task(tid, branch="ttp/no-such-branch")
+    # Its worktree goes too: one still on its own ttp/t<id>-* branch is a rename the daemon records.
+    _git_out(p.root, "worktree", "remove", "--force", str(p.worktrees / f"t{tid}"))
     p.db.x("UPDATE tasks SET updated=? WHERE id=?", (time.time() - 1900, tid))
     for _ in range(3):
         _sweep(Daemon(p.base))
