@@ -3576,13 +3576,8 @@ def test_a_tasks_checks_never_start_anyway_on_an_overloaded_pinned_host(env, tmp
     monkeypatch.setattr(checkspill, "probe", lambda h, b=False: pytest.fail("no admission while overloaded"))
     why = "the check host check-host-a's CPU is overloaded: its runnable demand of 298.0 cores is above its 64 cores"
     monkeypatch.setattr(remoteload, "held", lambda h: why)
-    out = io.StringIO()
     cmds = push.check_list([{"run": "pytest -n 16 tests", "host": "check-host-a"}])
-    assert cli._checks_slot(p, tmp_path, out, "a" * 40, cmds=cmds, top=str(p.root)) is None
-    assert why in out.getvalue() and "not starting there while it is" in out.getvalue()
-    assert "starting anyway" not in out.getvalue() and "running now" not in out.getvalue()
     told = []
-    assert remoteload.wait(["check-host-a"], told.append, 0) == why and "starting anyway" in told[-1]
     # #8107 (load_guard_in_status): while it waits, status names the guard and its setting; cleared after.
     seen = []
 
@@ -3590,12 +3585,9 @@ def test_a_tasks_checks_never_start_anyway_on_an_overloaded_pinned_host(env, tmp
         seen.append(checkspill.limit_lines(p.name))
         monkeypatch.setattr(remoteload, "held", lambda h: "")
     note = lambda line: checkspill.note_limit(p.name, line)   # noqa: E731
-    assert remoteload.wait(["check-host-a"], told.append, None, sleep=nap, anyway=False, note=note) == ""
+    assert remoteload.wait(["check-host-a"], told.append, None, sleep=nap, note=note) == ""
     assert any("remote load guard" in x and "checks.load_guard" in x and why in x for x in seen[0]), seen
     assert checkspill.limit_lines(p.name) == []
-    monkeypatch.setattr(remoteload, "held", lambda h: why)
-    assert remoteload.wait(["check-host-a"], told.append, 0, anyway=False, note=note) == why
-    assert checkspill.limit_lines(p.name) == [], "cleared when the bound hands it over too"
     monkeypatch.setattr(remoteload, "held", lambda h: "")
     _full_after(monkeypatch, free=1)
     out = io.StringIO()

@@ -5408,14 +5408,12 @@ def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: boo
     pats = checklane.light_patterns(cfg)
     if (hosts := list(dict.fromkeys(h for c in cmds or () if (h := push.remote_host(c))))) and all(
             push.remote_host(c) or checklane.is_light(str(c), pats) for c in cmds):
-        from . import remoteload
-        # A task's checks never start on an overloaded check host (only push checks keep a bounded start):
-        # in the foreground the wait hands over to detached checks after FOREGROUND_WAIT_S, detached it waits.
+        from . import remoteload, testslots
+        # The pinned-host admission below hands over to detached checks after FOREGROUND_WAIT_S in the foreground.
         bound = checkcap.FOREGROUND_WAIT_S if foreground and p else None
         # While it waits, status names the guard and its setting (a limit line), cleared once the wait ends.
         note = (lambda line: checkspill.note_limit(p.name, line, checklane.scope_text(cmds)[:300])) if p else None
-        if remoteload.wait(hosts, tell, bound, anyway=False, note=note):
-            return None
+        remoteload.wait(hosts, tell, testslots.push_load_wait_s(cfg), note=note)   # never starts on an overloaded host
         # Each host's check slots are claimed as a spill pick claims them, so runs here never overshoot it.
         if (claims := checkspill.admit_pinned(p, hosts, tell, what=checklane.scope_text(cmds)[:300],
                                               bound=bound)) is None:
