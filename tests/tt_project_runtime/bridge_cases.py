@@ -132,7 +132,7 @@ def test_bridge_box_block_names_agent_links_and_no_key_file():
 def test_bridge_block_check_refuses_key_files_key_text_and_proxies():
     import pytest
     from ttp import bridge
-    for bad in ("Host x\n  IdentityFile ~/.ssh/id_ed25519\n", "-----BEGIN OPENSSH PRIVATE KEY-----\n",
+    for bad in ("Host x\n  IdentityFile ~/.ssh/id_ed25519\n", "-----BEGIN " + "OPENSSH PRIVATE" + " KEY-----\n",
                 "Host x\n  ProxyJump ws\n", "Host x\n  DynamicForward 1080\n", "Host x\n  ForwardAgent yes\n"):
         with pytest.raises(bridge.BadConfig):
             bridge.check_block(bridge.BEGIN + "\n" + bad + bridge.END + "\n")

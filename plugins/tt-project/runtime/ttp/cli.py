@@ -14408,7 +14408,7 @@ COMMAND_GROUPS = (
     ("admin", ("setup", "upgrade", "start", "stop", "restart", "adopt", "prune", "secret", "consent",
                "notifier", "schedules", "heal", "upstream", "lease", "replicate", "check-plan", "stats", "audit",
                "push-audit", "ttr", "selfchange", "spend-today", "throughput", "model-trip", "echoes", "course",
-               "uninstall", "bench", "model-bench", "model", "waste")),
+               "uninstall", "bench", "model-bench", "model", "waste", "bridge", "gh-queue")),
 )
 
 

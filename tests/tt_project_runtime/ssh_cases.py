@@ -722,11 +722,14 @@ def test_a_remote_check_refused_by_the_agent_is_an_environment_fault_naming_the_
 
 
 def test_no_runtime_code_runs_ssh_keygen_or_ssh_add():
-    # Only the guards name them (to block or watch them); nothing in the runtime makes or loads a key.
+    # Only the guards name them (to block or watch them); nothing in the runtime makes or loads a key,
+    # except the documented allowlist: bridge_cert.py (`ttp bridge cert`) reads fingerprints, signs a box's
+    # public key with the CA held in the user's ssh agent (never a private key file) and has the box make
+    # its own key; its module docstring says so.
     import re as _re
     import ttp
     root = Path(ttp.__file__).parent
-    guards = {"credguard.py", "pathguard.py", "credwatch.py", "sidefx.py"}
+    guards = {"credguard.py", "pathguard.py", "credwatch.py", "sidefx.py", "bridge_cert.py"}
     call = _re.compile(r"""["']ssh-(?:keygen|add)["']\s*[,\]]|\bssh-keygen\s+-[tf]""")
     hits = [f.name for f in root.rglob("*.py") if f.name not in guards and call.search(f.read_text())]
     assert hits == [], hits
