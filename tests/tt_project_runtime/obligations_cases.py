@@ -305,6 +305,24 @@ def test_claim_expect_probe_miss_raises_claim_failed_once(env, monkeypatch):
     assert ob.get(p.db, n2[0].split()[1])["receipt"]
 
 
+def test_a_claim_probe_whose_host_did_not_answer_is_unchecked_and_retried(env, monkeypatch):
+    """Upstream note b8cfa86d5ff92f74: a claim probe that exits 255 (ssh could not reach its host, as
+    while it reboots) is "could not check", never "does not hold": no claim_failed even past
+    CLAIM_WAIT_S, the ledger says it is unchecked, due_claims keeps running it, and a later 0 holds."""
+    from ttp import obligations as ob
+    p, d, now, tid, check, mid, raised = _order_setup(env, monkeypatch)
+    out = p.db.post("out", "it is up", chat="c1", kind="reply")
+    notes = ob.record_claims(p, [(out, "c1", [{"text": "the box is up", "expect": "ssh box true"}])], {}, now=now)
+    oid = notes[0].split()[1]
+    late = now + ob.CLAIM_WAIT_S + 100
+    assert ob.claim_result(p, oid, 255, now + 10) == [] and ob.claim_result(p, oid, 255, late) == []
+    assert raised((ob.CLAIM_KIND,)) == []
+    assert [c[0] for c in ob.due_claims(p.db, late)] == [oid], "retried on the next pass"
+    assert any(oid in ln and "unchecked" in ln and "255" in ln for ln in ob.lines(p.db, late))
+    ob.claim_result(p, oid, 0, late + 60)
+    assert ob.get(p.db, oid)["receipt"] and raised((ob.CLAIM_KIND,)) == []
+
+
 def test_a_claim_never_takes_another_callers_earlier_probe_answer_and_its_own_run_decides(env, monkeypatch):
     """Another caller ran the claim's probe string shortly before its due and got 1 (cached for
     STALL_PROBE_KEEP_S): check_claims runs its own probe under its own key and fails nothing on that

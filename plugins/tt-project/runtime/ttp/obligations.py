@@ -1120,6 +1120,8 @@ def lines(db, now: float | None = None, where=None, open_only: bool = False) -> 
             pr = o["promise"]
             state = ("claimed; " if pr.get("claim") else f"ordered ({pr.get('class')}); " if pr.get("order") is not None
                      else "promised; ") + _promise_state(o, now, where)
+            if (pr.get("claim") or {}).get("last") == CLAIM_UNREACHABLE:
+                state += "; unchecked: its check's host did not answer (exit 255), retrying"
             if pr.get("order") is not None and not pr.get("started"):
                 state += f"; not started (start by {timefmt.long(pr['start_by'], where)})"
         else:
@@ -1655,7 +1657,8 @@ def deliver(p, sent: list[tuple[int, str | None, list]], now: float | None = Non
 # landed can carry `claims`, each `{text, task | action | expect, due}`. A `task` (or `action`: the index
 # of a task_add of the same batch) holds once it ends done; an `expect` probe (start_when rules:
 # read-only, under a minute) holds once it exits 0. It runs model-free (the daemon's check_claims) and
-# is judged at its due: exit 1 is "not yet", 75, 255 or a timeout keep waiting up to CLAIM_WAIT_S more.
+# is judged at its due: exit 1 is "not yet", 75 or a timeout keep waiting up to CLAIM_WAIT_S more; 255
+# (ssh could not reach the probe's host, as while it reboots) is "could not check": retried, never a miss.
 # A miss raises one high `claim_failed` event. Overdue promises and orders, late orders and failed
 # claims carry `must_act` in their event data: the coordinator wake they start must act on each
 # (mustact.py).
@@ -1670,7 +1673,8 @@ LANDING_STUCK_KIND = "order_landing_stuck"
 MUST_ACT_KINDS = (PROMISE_KIND, ORDER_LATE_KIND, ORDER_KIND, CLAIM_KIND, LANDING_STUCK_KIND)
 ORDER_CLASSES = ("read", "change", "device")
 ORDER_START_S = 1800          # an order with no start_by: its owner's run starts within this after the message
-CLAIM_WAIT_S = 1800           # a claim's probe that cannot answer (75, 255, timeout) past its due: failed after this
+CLAIM_WAIT_S = 1800           # a claim's probe that cannot answer (75, timeout) past its due: failed after this
+CLAIM_UNREACHABLE = 255       # ssh's own exit: the probe's host did not answer; the claim stays unchecked and is retried
 CLAIM_HOPS_MAX = 50           # continuation hops a task claim's check walks from its named task (_continuations)
 CLAIM_WAITING = (75, 255, "timeout", None)
 # A change or device order is owned by a task that can make the change or run the job: a question,
@@ -2006,6 +2010,8 @@ def _check_claim(p, o: dict, now: float, raised: list[str]) -> bool:
             _retire(db, now, "claim held", prefix=fp)
             return True
         answered = c.get("at") is not None and c["at"] >= pr["due"]
+        if c.get("last") == CLAIM_UNREACHABLE:
+            return False   # could not check: the next due_claims pass runs it again
         if now < pr["due"] or (not answered or c.get("last") in CLAIM_WAITING) and now < pr["due"] + CLAIM_WAIT_S:
             return False
         miss = (f"its check `{c['expect'][:200]}` exited {c['last']}" if answered and c["last"] not in CLAIM_WAITING

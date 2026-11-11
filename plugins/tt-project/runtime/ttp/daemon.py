@@ -17939,6 +17939,8 @@ class Daemon:
         if db.one("SELECT 1 FROM task_superseded WHERE task=? UNION ALL SELECT 1 FROM task_landings WHERE task=? "
                   "UNION ALL SELECT 1 FROM push_queue WHERE task=?", (tid, tid, tid)):
             return "superseded, landed or queued"
+        if landed.abandoned(db, tid):
+            return "abandoned"
         # A task that waits on this one landing (a deploy or live check) carries none of its work: counted
         # as its continuation, a head no review lands would hold it forever.
         # Nor does one that stalls on the user or a long deferral (chaincap.hop_stall): the head is reviewed now.
@@ -17953,6 +17955,8 @@ class Daemon:
         tip = worktree._git(self.p.root, "rev-parse", "--verify", "--quiet", f"{t['branch']}^{{commit}}", check=False)
         if not tip:
             return "no branch"
+        if gone := self._cancelled_review(t, tip):
+            return f"review #{gone} of its head was cancelled"
         cont = db.task(continues_id(t) or 0)
         # A hop with no commits past its split head adds nothing to review, once that head has a review of its
         # own (queued, running or passed) or the hop stalls (the split task's own review then covers the head).
@@ -18100,6 +18104,9 @@ class Daemon:
             return None
         if self._landed_elsewhere(task):
             return None
+        if landed.abandoned(db, task["id"]):
+            log(self.p, f"task {task['id']}: no review queued, its work is abandoned (ttp task abandon)")
+            return None
         branch = task.get("branch")
         try:
             self._fold_split_review(task)
@@ -18139,6 +18146,9 @@ class Daemon:
                             (tip,)) if tip else None
             if passed:
                 return passed["task"], False
+            if add and (gone := self._cancelled_review(task, tip)):
+                log(self.p, f"task {task['id']}: no review queued, review #{gone} of head {tip[:12]} was cancelled")
+                return None
             # Or one accepted it without the push queue (review only, an own push): its verdict stands.
             # A review that would push takes only a delivered head's verdict (reviewreuse.pushes).
             prior = reviewreuse.accepted(db, tip, reviewreuse.check_key(cfg),
@@ -18364,6 +18374,18 @@ class Daemon:
             f", held until the fix of {', '.join(f'#{t} (#{f})' for t, f in sorted(held.items()))} lands or "
             f"its chain ends" if held else ""))
         return rid, True
+
+    def _cancelled_review(self, task: dict, tip: str) -> int | None:
+        """The daemon review of code task `task` at head `tip` that was cancelled explicitly (the
+        coordinator's task_update or `ttp task cancel`: dispatchguard.record_cancel) and not requeued since,
+        or None. That cancel stands for that head: no fresh review of it is queued; a new commit gets one."""
+        if not tip:
+            return None
+        for r in self.p.db.q("SELECT id, spec FROM tasks WHERE kind='review' AND status='cancelled' AND labels LIKE ? "
+                             "ORDER BY id DESC", (f'%"auto_review:{task["id"]}"%',)):
+            if f"head {tip[:12]}" in (r["spec"] or "") and dispatchguard.cancelled_unrequeued(self.p.db, r["id"]):
+                return r["id"]
+        return None
 
     def _external_change(self, task: dict) -> dict | None:
         """The change code task `task`'s hand-off names as published in another repository

@@ -15755,9 +15755,10 @@ def test_a_landed_wait_on_an_abandoned_task_is_raised_as_a_broken_probe_naming_w
 
 
 def test_abandon_refuses_a_task_whose_review_is_open_or_whose_work_waits_in_the_push_queue(env, monkeypatch, capsys):
-    """Review #3624 finding 1: a done code task whose daemon-queued review is still open, or whose
+    """Review #3624 finding 1: a done code task whose coordinator-queued review is still open, or whose
     branch a review approved into the push queue, can still land: abandon refuses it, naming the review
-    or the queue entry, and records nothing until that is cancelled."""
+    or the queue entry, and records nothing until that is cancelled. (The daemon's own open review is
+    cancelled with the abandon instead: test_abandon_cancels_the_daemon_review_of_the_task.)"""
     from ttp import landed
     from ttp.daemon import Daemon
     s = _pq(env, monkeypatch)
@@ -15771,9 +15772,6 @@ def test_abandon_refuses_a_task_whose_review_is_open_or_whose_work_waits_in_the_
     assert _ttp_task(s.p, "cancel", str(s.review)) == 0
     rid, added = d._auto_review(s.p.db.task(s.code), "made the change")
     assert added and s.p.db.task(rid)["title"].startswith(f"Review #{s.code}")
-    capsys.readouterr()
-    assert _ttp_task(s.p, "abandon", str(s.code), "approach dropped") not in (0, None)
-    assert f"review task #{rid} that carries it is queued: cancel that first" in capsys.readouterr().err
     _pq_hand_off(env, s, task=rid)
     [q] = s.p.db.q("SELECT id, status FROM push_queue")
     assert q["status"] == "approved"
@@ -15782,6 +15780,55 @@ def test_abandon_refuses_a_task_whose_review_is_open_or_whose_work_waits_in_the_
     assert f"is queued to push (entry #{q['id']} of task #{rid}, approved): cancel that first" \
         in capsys.readouterr().err
     assert s.p.db.q("SELECT * FROM task_abandoned") == [] and landed.abandoned(s.p.db, s.code) is None
+
+
+def test_abandon_cancels_the_daemon_review_of_the_task(env, monkeypatch, capsys):
+    """Upstream notes b8cfa86d5ff92f74 and 5338aa394465b31f: `ttp task abandon` on a done code task whose
+    daemon-queued review is open succeeds and cancels that review in the same step, and no
+    `Review #<id>` is queued for it on the next ticks (auto-review or the unreviewed sweep)."""
+    from ttp import landed
+    from ttp.daemon import Daemon
+    s = _pq(env, monkeypatch)
+    monkeypatch.setattr(Daemon, "_precheck", lambda self, task, head: None)
+    d = Daemon(s.p.base)
+    assert _ttp_task(s.p, "cancel", str(s.review)) == 0
+    rid, added = d._auto_review(s.p.db.task(s.code), "made the change")
+    assert added and s.p.db.task(rid)["origin"] == "daemon"
+    capsys.readouterr()
+    assert _ttp_task(s.p, "abandon", str(s.code), "approach dropped") == 0
+    assert f"its review #{rid} cancelled" in capsys.readouterr().out
+    assert s.p.db.task(rid)["status"] == "cancelled" and landed.abandoned(s.p.db, s.code)
+    before = {r["id"] for r in s.p.db.q("SELECT id FROM tasks")}
+    for _ in range(3):
+        assert d._auto_review(s.p.db.task(s.code), "made the change") is None
+        d.sweep_unreviewed(force=True)
+    assert not s.p.db.q(f"SELECT id FROM tasks WHERE title LIKE ? AND id NOT IN ({','.join('?' * len(before))})",
+                        (f"Review #{s.code}:%", *before))
+
+
+def test_a_cancelled_daemon_review_is_not_requeued_for_the_same_head(env, monkeypatch):
+    """Upstream note b8cfa86d5ff92f74: a daemon review the coordinator (or `ttp task cancel`) cancelled
+    is not queued again for the same head by auto-review or the unreviewed sweep; a new commit on the
+    branch gets a fresh review."""
+    from ttp import coordinator as coord
+    from ttp.daemon import Daemon
+    s = _pq(env, monkeypatch)
+    monkeypatch.setattr(Daemon, "_precheck", lambda self, task, head: None)
+    d = Daemon(s.p.base)
+    assert _ttp_task(s.p, "cancel", str(s.review)) == 0
+    rid, added = d._auto_review(s.p.db.task(s.code), "made the change")
+    assert added
+    assert coord.apply(s.p, [{"type": "task_update", "id": rid, "status": "cancelled", "text": "not needed"}]) == []
+    assert s.p.db.task(rid)["status"] == "cancelled"
+    for _ in range(3):
+        assert d._auto_review(s.p.db.task(s.code), "made the change") is None
+        assert d.sweep_unreviewed(force=True) == []
+    reviews = lambda: [r["id"] for r in s.p.db.q("SELECT id FROM tasks WHERE title LIKE ? AND status!='cancelled'",
+                                                (f"Review #{s.code}:%",))]
+    assert reviews() == []
+    _commit(s.path, "more.txt", "more\n")
+    again, added = d._auto_review(s.p.db.task(s.code), "made the change")
+    assert added and again != rid and reviews() == [again]
 
 
 def test_a_landing_recorded_after_abandon_wins_over_it(env, monkeypatch, capsys):
