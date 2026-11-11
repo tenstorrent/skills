@@ -1,8 +1,12 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 # SPDX-License-Identifier: Apache-2.0
 """One model-free status table, `ttp status --hourly`, which the daemon posts to the project's main chat
-(Daemon.post_hourly_status) at most once an hour, sooner on a milestone (a push batch landed or deployed, an
-order closed), and only when a row changed since the last post. No model call builds or posts it.
+(Daemon.post_hourly_status) only when something important changed since the last post (important, changes:
+an order or promise closed or went overdue, a blocker or outage appeared or cleared, the spend gate changed
+level), and never sooner than the chat's status gap (chatdigest.status_wait, `coordinator.chat_status_gap_h`).
+Counts, times, loads or versions moving alone never post it; nor does a batch landing or a deploy by itself.
+The changes since the last post add up across the gap, so the next post names them all. The post folds the
+main chat's held hand-off lines (chatdigest.handoff), one per finished task. No model call builds or posts it.
 
 Rows, in order:
 1. Fork rate: of the worker and review runs started in the last hour and today (home zone), the share that
@@ -34,7 +38,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import time
 from pathlib import Path
 
@@ -44,8 +47,8 @@ from .project import durable_append, durable_write
 SAMPLES = "host-load.jsonl"     # in the state folder: {"ts", "load1", "cores"} per line
 STATE_FILE = "hourly-status.json"
 SAMPLE_S = 240.0
-POST_S = 3600.0
-CHECK_S = 600.0    # a due table whose rows had not changed is rebuilt at most this often
+CHECK_S = 600.0    # an unchanged signature (important) is read again at most this often
+OUTAGE_S = 2 * 86400.0   # an uncleared high or critical alert raised this recently counts as an outage
 KEEP_S = 2 * 86400.0
 REF = "hourly_status"
 OPEN = ("queued", "running", "blocked", "waiting", "pushing")
@@ -210,22 +213,57 @@ def table(p, now: float | None = None) -> str:
     return "\n".join([f"Status at {timefmt.short(now, timefmt.home(p), now)}", *rows(p, now)])
 
 
-def milestone(p, since: float) -> str:
-    """What landed, deployed or closed since `since`, in a few words, or ''."""
-    from . import obligations
-    got = []
-    if p.db.one("SELECT COUNT(*) n FROM push_queue WHERE status IN ('pushed','landed') AND updated>?", (since,))["n"]:
-        got.append("a batch landed")
-    for f in (p.state / "pushes").glob("*.json") if (p.state / "pushes").is_dir() else ():
-        try:
-            if f.stat().st_mtime > since and (json.loads(f.read_text()).get("after_push") or {}).get("status") == "ok":
-                got.append("a deploy")
-                break
-        except (OSError, ValueError, AttributeError):
+def important(p, now: float | None = None) -> dict:
+    """What a post may be due for, as sorted lists: open obligation keys, those closed with a receipt in
+    OUTAGE_S (one opened and closed between two posts still counts), those overdue (a promise or order
+    past its due, a milestone past its due without its receipt), blockers (blocked tasks and open asks to
+    the user), outages (uncleared high or critical alerts raised in OUTAGE_S) and each provider's spend gate
+    level. Counts, times and versions are not in it, so they never make a post due."""
+    from . import obligations, waits
+    now = time.time() if now is None else now
+    db = p.db
+    opened, late, closed = [], [], []
+    for o in obligations.items(db):
+        if not obligations._open(o):
+            if float((o.get("receipt") or {}).get("at") or 0) >= now - OUTAGE_S:
+                closed.append(o["id"])
             continue
-    if any(float((o.get("receipt") or {}).get("at") or 0) > since for o in obligations.items(p.db)):
-        got.append("an order closed")
-    return ", ".join(got)
+        opened.append(o["id"])
+        due = (o.get("promise") or {}).get("due")
+        ms = [m for m in (o.get("milestones") or {}).values() if isinstance(m, dict)]
+        if (isinstance(due, (int, float)) and now >= due) or any(
+                not m.get("receipt") and isinstance(m.get("due"), (int, float)) and now >= m["due"] for m in ms):
+            late.append(o["id"])
+    blocked = [f"#{r['id']}" for r in db.q("SELECT id FROM tasks WHERE status='blocked' ORDER BY id")]
+    blocked += [f"ask {a['id']}" for a in waits.open_asks(db)]
+    outages = sorted({r["key"] for r in db.q(
+        "SELECT key FROM alerts WHERE cleared IS NULL AND LOWER(COALESCE(severity,'')) IN ('high','critical') "
+        "AND raised>=?", (now - OUTAGE_S,))})
+    gates = db.kv("gates") or {}
+    gate = sorted(f"{k}:{(v or {}).get('level')}" for k, v in gates.items() if isinstance(v, dict))
+    return {"open": opened, "closed": closed, "overdue": late, "blocked": blocked, "outages": outages, "gate": gate}
+
+
+def changes(old: dict, new: dict) -> list[str]:
+    """The important changes from `old` to `new` (important), in a few words each; [] for none."""
+    def gone(k):
+        return set(old.get(k) or ()) - set(new.get(k) or ())
+
+    def came(k):
+        return set(new.get(k) or ()) - set(old.get(k) or ())
+    got = []
+    if done := came("closed"):
+        got.append("an order closed" if len(done) == 1 else f"{len(done)} orders closed")
+    if late := came("overdue") & set(new.get("open") or ()):
+        got.append("an order went overdue" if len(late) == 1 else f"{len(late)} orders went overdue")
+    for k, what in (("blocked", "a blocker"), ("outages", "an outage")):
+        if came(k):
+            got.append(f"{what} appeared")
+        if gone(k):
+            got.append(f"{what} cleared")
+    if sorted(old.get("gate") or ()) != sorted(new.get("gate") or ()):
+        got.append("the spend gate changed level")
+    return got
 
 
 def main_chat(db) -> str | None:
@@ -235,31 +273,34 @@ def main_chat(db) -> str | None:
     return r["chat"] if r else None
 
 
-def due(p, now: float | None = None) -> tuple[str, str] | None:
-    """(table, why) when a post is due (module doc), else None; records only the first pass's baseline."""
+def due(p, now: float | None = None, chat: str | None = None) -> tuple[str, str] | None:
+    """(table, why) when a post is due (module doc), else None; records only the first pass's baseline and
+    the time of an unchanged check. With `chat`, a change waits while that chat's status gap runs."""
     now = time.time() if now is None else now
     try:
         st = json.loads((p.state / STATE_FILE).read_text())
     except (OSError, ValueError):
         st = {}
-    if not st:   # the first pass only sets the baseline: the first table follows an hour or a milestone later
-        durable_write(p.state / STATE_FILE, json.dumps({"at": now, "rows": rows(p, now), "why": "baseline",
-                                                        "corr_seen": now}))
+    if not st or "sig" not in st:   # the first pass only sets the baseline: a table follows the first change
+        durable_write(p.state / STATE_FILE, json.dumps({**st, "at": st.get("at", now), "sig": important(p, now),
+                                                        "why": st.get("why", "baseline"),
+                                                        "corr_seen": st.get("corr_seen", now)}))
         return None
     fixed = mark_corrected(p, st, now)
-    last = float(st.get("at") or 0)
-    why = "a correction" if fixed else "hourly" if now - last >= POST_S else milestone(p, last)
-    if not why or (not fixed and 0 <= now - float(st.get("checked") or -1e18) < CHECK_S):
+    if not fixed and 0 <= now - float(st.get("checked") or -1e18) < CHECK_S:
         return None
-    rs = rows(p, now)
-    if not fixed and _key(rs) == _key(st.get("rows") or []):
+    if chat is not None:   # a correction too waits for the gap: it is marked now and named in the next post
+        from . import chatdigest
+        if chatdigest.status_wait(p.db, p.config(), chat, now) > 0:
+            return None
+    why = ", ".join((["a correction"] if fixed else []) + changes(st.get("sig") or {}, important(p, now)))
+    if not why:
         durable_write(p.state / STATE_FILE, json.dumps({**st, "checked": now}))
         return None
     notes = [f"Corrected: the status posted at {timefmt.short(m['ts'], timefmt.home(p), now)} said '{m['wrong']}' in "
              f"its {m['row']} row; user msg #{m['msg']} corrected it, and the rows above are recomputed"
              for m in st.get("new_marks") or ()]
-    return "\n".join([f"Status at {timefmt.short(now, timefmt.home(p), now)}" + ("" if why == "hourly" else f" ({why})"),
-                      *rs, *notes]), why
+    return "\n".join([f"Status at {timefmt.short(now, timefmt.home(p), now)} ({why})", *rows(p, now), *notes]), why
 
 
 def mark_corrected(p, st: dict, now: float) -> bool:
@@ -298,39 +339,33 @@ def corrected(p) -> dict:
         return {}
 
 
-_MOVING = re.compile(r", oldest approval [^,]* old|; \d+ tasks created in 24 h")
-
-
-def _key(rs: list[str]) -> list[str]:
-    """What counts as a change: every row, the values that move by the minute aside (the project host's load
-    reading, the oldest approval's age, the tasks created in 24 h)."""
-    return [f"{r.partition(': load')[0]}.{r.partition('. Spill')[2]}" if r.startswith("Project host")
-            else _MOVING.sub("", r) for r in rs]
-
-
 def post(p, now: float | None = None) -> int | None:
-    """Record the table for the web app when due, and post it to the main chat too with notify.chat_status;
-    the message id, else None."""
+    """Record the table for the web app when due, and post it to the main chat too with notify.chat_status,
+    its held hand-off lines folded in; the message id, else None."""
     now = time.time() if now is None else now
-    if not (p.config().get("notify") or {}).get("hourly_status", True) or not (got := due(p, now)):
+    if not (p.config().get("notify") or {}).get("hourly_status", True):
         return None
     from . import alerts, chatdigest
-    if not chatdigest.to_chat(p.config(), "status"):   # the web app only (notify.chat_status: chats too)
-        mid = p.db.post("out", got[0], chat=None, channel=alerts.QUIET, kind="info", severity="low", ref=REF)
-    else:
-        if not (chat := main_chat(p.db)):
-            return None
-        if chatdigest.status_wait(p.db, p.config(), chat, now) > 0:   # the chat's status pace: waits, never stacks
-            return None
-        mid = p.db.post("out", got[0], chat=chat, kind="info", severity="low", ref=REF)
-        chatdigest.mark_status(p.db, chat, now)
+    to_chats = chatdigest.to_chat(p.config(), "status")   # the web app only (notify.chat_status: chats too)
+    chat = main_chat(p.db)
+    if to_chats and not chat:
+        return None
+    if not (got := due(p, now, chat if to_chats else None)):   # the chat's status pace: waits, never stacks
+        return None
+    sig = important(p, now)
+    with p.db.tx():
+        text = "\n".join([got[0], *chatdigest.handoff_lines(chatdigest.take_handoffs(p.db, chat))])
+        if to_chats:
+            mid = p.db.post("out", text, chat=chat, kind="info", severity="low", ref=REF)
+            chatdigest.mark_status(p.db, chat, now)
+        else:
+            mid = p.db.post("out", text, chat=None, channel=alerts.QUIET, kind="info", severity="low", ref=REF)
     try:
         st = json.loads((p.state / STATE_FILE).read_text())
     except (OSError, ValueError):
         st = {}
     st.pop("new_marks", None)
     st.pop("checked", None)
-    durable_write(p.state / STATE_FILE, json.dumps({**st, "at": now, "rows": [r for r in got[0].split("\n")[1:]
-                                                                              if not r.startswith("Corrected:")],
-                                                    "id": mid, "why": got[1]}))
+    st.pop("rows", None)
+    durable_write(p.state / STATE_FILE, json.dumps({**st, "at": now, "sig": sig, "id": mid, "why": got[1]}))
     return mid

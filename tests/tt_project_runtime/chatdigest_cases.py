@@ -315,3 +315,92 @@ def test_the_digest_shows_a_chats_own_status_interval(env, monkeypatch):
     chats = coord.digest(p, {}, [], []).split("## Chats attached")[1].split("\n## ")[0]
     assert "- c2 (chat), active 0 min ago, status at most every 2 h" in chats
     assert "status at most" not in next(line for line in chats.splitlines() if line.startswith("- c1"))
+
+
+def _cd_task(p, title, chat="main"):
+    t = p.db.add_task(title, "spec")
+    p.db.x("UPDATE tasks SET reply_chat=? WHERE id=?", (chat, t))
+    return dict(p.db.task(t))
+
+
+def test_a_routine_hand_off_within_the_hour_is_folded_into_the_next_status(env, monkeypatch):
+    """A finished task's routine hand-off and shipped notice wait as one line each and go out in the next
+    status post, once the chat's status gap allows; nothing is lost."""
+    from ttp import chatdigest, hourly, obligations, pushq
+    monkeypatch.setenv("TTP_TEST_CHAT_DIGEST", "on")
+    p = make(env)
+    p.db.post("in", "hello", chat="main")
+    now = time.time()
+    chatdigest.mark_status(p.db, "main", now - 600)   # a status went out 10 minutes ago
+    a, b = _cd_task(p, "tidy the docs"), _cd_task(p, "speed up a check")
+    pushq._reply(p.db, a, "done", "Docs tidied. Two pages merged.")
+    pushq._reply(p.db, b, "done", "(shipped by review #9) the check runs in 40 s now.")
+    assert not p.db.q("SELECT id FROM messages WHERE direction='out'"), "both held inside the status gap"
+    assert hourly.post(p, now) is None and chatdigest.status_flush(p, p.config(), now) == []
+    held = [i["task"] for i in p.db.kv(chatdigest.KV)["held"]["main"] if i["why"] == chatdigest.HANDOFF]
+    assert held == [a["id"], b["id"]]
+    o = obligations.add(p, "an order", now=now)
+    obligations.record(p, o, "receipt", "commit abc1234", None, now=now + 3100)
+    mid = hourly.post(p, now + 3601)
+    text = p.db.one("SELECT text FROM messages WHERE id=?", (mid,))["text"]
+    assert "Finished since the last status (2):" in text
+    assert f"- #{a['id']} tidy the docs: done: Docs tidied." in text and f"#{b['id']} speed up a check: done" in text
+    assert not [i for i in p.db.kv(chatdigest.KV)["held"]["main"] if i["why"] == chatdigest.HANDOFF]
+    # With no table due, status_flush posts the held lines alone once the gap allows.
+    c = _cd_task(p, "one more")
+    pushq._reply(p.db, c, "done", "Done.")
+    assert chatdigest.status_flush(p, p.config(), now + 3700) == []
+    got = chatdigest.status_flush(p, p.config(), now + 7300)
+    assert got and f"#{c['id']} one more: done" in p.db.one("SELECT text FROM messages WHERE id=?", (got[0],))["text"]
+
+
+def test_an_owed_or_user_blocking_hand_off_posts_at_once(env, monkeypatch):
+    """A hand-off that delivers an open obligation its task owns, or a failure only the user can clear,
+    goes at once inside the status gap; a routine failure waits."""
+    from ttp import chatdigest, obligations, pushq
+    monkeypatch.setenv("TTP_TEST_CHAT_DIGEST", "on")
+    p = make(env)
+    now = time.time()
+    chatdigest.mark_status(p.db, "main", now - 60)
+    a = _cd_task(p, "find the causes")
+    obligations.add(p, "the causes and fixes", owners=[a["id"]], now=now)
+    pushq._reply(p.db, a, "done", "Causes and fixes: the table posted on each batch.")
+    assert _cd_out(p, "main") == ["Causes and fixes: the table posted on each batch."]
+    b = _cd_task(p, "rerun a check")
+    pushq._reply(p.db, b, "failed", "The build host is down.")
+    c = _cd_task(p, "flaky test")
+    pushq._reply(p.db, c, "failed", "A test was flaky; retried by itself.")
+    assert _cd_out(p, "main")[1:] == [f"(task #{b['id']} failed) The build host is down."]
+    assert [i["task"] for i in p.db.kv(chatdigest.KV)["held"]["main"]] == [c["id"]]
+
+
+def test_every_daemon_chat_post_of_kind_info_or_reply_keeps_the_chat_pace():
+    """Built from the posting code itself: every call in the runtime that posts an out message of kind
+    'info' or 'reply' to a chat (chat not None) must sit in a function that applies the chat's pace
+    (status_wait, hold, checked or handoff). A new posting path that skips it fails here."""
+    import ast
+    pace = {"status_wait", "hold", "checked", "handoff", "mark_status"}
+    found, bad = [], []
+    for f in sorted((RUNTIME / "ttp").glob("*.py")):
+        tree = ast.parse(f.read_text())
+        for fn in [n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]:
+            names = {n.attr if isinstance(n, ast.Attribute) else n.id for n in ast.walk(fn)
+                     if isinstance(n, (ast.Attribute, ast.Name))}
+            for call in [n for n in ast.walk(fn) if isinstance(n, ast.Call)]:
+                func = call.func
+                if not (isinstance(func, ast.Attribute) and func.attr == "post"):
+                    continue
+                kw = {k.arg: k.value for k in call.keywords if k.arg}
+                is_db = (call.args and isinstance(call.args[0], ast.Constant) and call.args[0].value == "out")
+                is_parts = isinstance(func.value, ast.Name) and func.value.id == "msgparts"
+                kind = kw.get("kind")
+                chat = kw.get("chat")
+                if not (is_db or is_parts) or not (isinstance(kind, ast.Constant) and kind.value in ("info", "reply")):
+                    continue
+                if chat is None or (isinstance(chat, ast.Constant) and chat.value is None):
+                    continue   # a broadcast to every chat, not one chat's status
+                found.append(f"{f.name}:{call.lineno}")
+                if not names & pace:
+                    bad.append(f"{f.name}:{call.lineno} in {fn.name}")
+    assert found, "the scan found no posting call: the guard is broken"
+    assert not bad, f"chat posts that skip the chat's status pace: {bad}"

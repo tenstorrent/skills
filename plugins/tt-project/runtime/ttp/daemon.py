@@ -8310,9 +8310,10 @@ class Daemon:
             need = db.for_user(upd.get("blocked_reason")) if new == "blocked" else None
             if need and need not in summary:
                 text += f"\nNeeds from you: {need}"
-            chat = None if task["reply_chat"] == "all" else task["reply_chat"]
-            msgparts.post(db, msgparts.cut(text, f"task #{task['id']}'s hand-off (`ttp task {self.p.name} show {task['id']}`)"),
-                          chat=chat, kind="reply", severity="normal")
+            # The chat's status pace (chatdigest.handoff): at once only when owed or the user must act.
+            from . import chatdigest
+            chatdigest.handoff(db, self.cfg, task, new, msgparts.cut(
+                text, f"task #{task['id']}'s hand-off (`ttp task {self.p.name} show {task['id']}`)"))
         sev = "high" if new == "blocked" else "normal"
         fups = result.get("followups") if isinstance(result, dict) else None
         fups = [f for f in fups if isinstance(f, dict) and f.get("title")] if isinstance(fups, list) else []
@@ -10156,6 +10157,9 @@ class Daemon:
         self._hourly_checked = now
         hourly.sample(self.p.state, now)
         hourly.post(self.p, now)
+        from . import chatdigest   # held hand-off lines the table did not fold, once each chat's gap allows
+        if ids := chatdigest.status_flush(self.p, self.cfg, now):
+            log(self.p, f"held hand-offs posted: messages {', '.join(map(str, ids))}")
 
     def check_host_load(self) -> None:
         """Model-free host-load watch (hostload): this host's runnable CPU demand above the load guard's threshold

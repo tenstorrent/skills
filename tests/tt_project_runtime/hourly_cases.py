@@ -65,7 +65,13 @@ def test_the_spill_row_counts_runs_placed_passed_and_run_again_here(env):
             "1 run again here") in hourly.rows(p, now)[1]
 
 
-def test_the_table_posts_hourly_or_at_a_milestone_and_only_when_a_row_changed(env):
+def _block(p, title="stuck"):
+    t = p.db.add_task(title, "spec")
+    p.db.x("UPDATE tasks SET status='blocked', blocked_reason='needs a look' WHERE id=?", (t,))
+    return t
+
+
+def test_the_table_posts_only_when_something_important_changed(env):
     from ttp import hourly
     p = make(env)
     p.set_config("notify.chat_status", True)   # the opt-in: the table goes to the main chat
@@ -73,19 +79,54 @@ def test_the_table_posts_hourly_or_at_a_milestone_and_only_when_a_row_changed(en
     now = time.time() - 3600
     assert hourly.post(p, now - 3700) is None, "the first pass only sets the baseline"
     p.db.add_task("first", "spec")
-    first = hourly.post(p, now)
+    assert hourly.post(p, now) is None, "a new task alone (a count) is not important"
+    t = _block(p)
+    first = hourly.post(p, now + hourly.CHECK_S + 1)
     msg = p.db.one("SELECT * FROM messages WHERE id=?", (first,))
     assert msg["chat"] == "main" and msg["ref"] == hourly.REF and msg["text"].startswith("Status at ")
-    assert "(a batch landed)" not in msg["text"] and "Queue: 1 open tasks" in msg["text"]
-    assert hourly.post(p, now + 60) is None, "within the hour, no milestone"
-    hourly.sample(p.state, now + 3700, load1=3.0, cores=4)
-    assert hourly.post(p, now + 3700) is None, "an hour on, only the load moved: no post"
-    t = p.db.add_task("next", "spec")
-    p.db.x("INSERT INTO push_queue(task, branch, head, target, status, created, updated) "
-           "VALUES(?, 'b', 'h', 'origin/x', 'landed', ?, ?)", (t, now + 100, now + 200))
-    second = hourly.post(p, now + 300)
-    assert second and "(a batch landed)" in p.db.one("SELECT text FROM messages WHERE id=?", (second,))["text"]
-    assert hourly.post(p, now + 400) is None, "one post per milestone"
+    assert "(a blocker appeared)" in msg["text"] and "Queue: 2 open tasks" in msg["text"]
+    assert hourly.post(p, now + hourly.CHECK_S + 60) is None, "nothing new"
+    p.db.x("UPDATE tasks SET status='queued' WHERE id=?", (t,))
+    second = hourly.post(p, now + 2 * hourly.CHECK_S + 61)
+    assert second and "(a blocker cleared)" in p.db.one("SELECT text FROM messages WHERE id=?", (second,))["text"]
+    assert p.db.one("SELECT COUNT(*) n FROM messages WHERE ref=?", (hourly.REF,))["n"] == 2
+
+
+def test_counts_times_loads_or_a_landed_batch_alone_post_nothing(env, monkeypatch):
+    from ttp import hourly
+    monkeypatch.setenv("TTP_TEST_CHAT_DIGEST", "on")
+    p = make(env)
+    p.db.post("in", "hello", chat="main")
+    now = time.time() - 3 * 3600
+    assert hourly.post(p, now) is None
+    for i in range(3):   # a new task, a landed batch, a deploy record, a load reading and an hour each time
+        t = p.db.add_task(f"t{i}", "spec")
+        p.db.x("INSERT INTO push_queue(task, branch, head, target, status, created, updated) "
+               "VALUES(?, 'b', 'h', 'origin/x', 'landed', ?, ?)", (t, now + i * 3600, now + i * 3600 + 1))
+        hourly.sample(p.state, now + (i + 1) * 3600, load1=float(i + 1), cores=4)
+        assert hourly.post(p, now + (i + 1) * 3600 + 5) is None
+    assert not p.db.q("SELECT id FROM messages WHERE ref=?", (hourly.REF,))
+
+
+def test_two_milestones_minutes_apart_post_once_and_the_next_names_both(env, monkeypatch):
+    from ttp import hourly, obligations
+    monkeypatch.setenv("TTP_TEST_CHAT_DIGEST", "on")
+    p = make(env)
+    p.db.post("in", "hello", chat="main")
+    now = time.time() - 3 * 3600
+    a, b = obligations.add(p, "first order", now=now), obligations.add(p, "second order", now=now)
+    assert hourly.post(p, now) is None, "baseline"
+    obligations.record(p, a, "receipt", "commit abc1234", None, now=now + 60)
+    first = hourly.post(p, now + hourly.CHECK_S + 1)
+    assert first, "the first important change posts"
+    assert "(an order closed)" in p.db.one("SELECT text FROM messages WHERE id=?", (first,))["text"]
+    obligations.record(p, b, "receipt", "commit def5678", None, now=now + hourly.CHECK_S + 200)
+    _block(p, "another")
+    assert hourly.post(p, now + hourly.CHECK_S + 301) is None, "5 minutes later: the chat's status gap holds it"
+    assert hourly.post(p, now + 2 * hourly.CHECK_S + 2) is None, "still inside the hour"
+    second = hourly.post(p, now + hourly.CHECK_S + 3602)
+    assert second, "after the gap, the held change posts"
+    assert "(an order closed, a blocker appeared)" in p.db.one("SELECT text FROM messages WHERE id=?", (second,))["text"]
     assert p.db.one("SELECT COUNT(*) n FROM messages WHERE ref=?", (hourly.REF,))["n"] == 2
 
 
@@ -124,7 +165,7 @@ def test_a_correction_marks_the_hourly_post_that_stated_the_wrong_value_and_the_
     now = time.time() - 3600
     _hourly_run(p, "claude", "disk", now - 60)
     assert hourly.post(p, now - 3700) is None, "baseline"
-    p.db.add_task("first", "spec")
+    _block(p)
     first = hourly.post(p, now)
     assert "below target" in p.db.one("SELECT text FROM messages WHERE id=?", (first,))["text"]
     assert hourly.post(p, now + 30) is None
@@ -133,7 +174,7 @@ def test_a_correction_marks_the_hourly_post_that_stated_the_wrong_value_and_the_
     second = hourly.post(p, now + 60)
     assert second, "a new correction posts at once, rows unchanged or not"
     text = p.db.one("SELECT text FROM messages WHERE id=?", (second,))["text"]
-    assert "(a correction)" in text and "said 'below' in its Fork rate row; user msg #42 corrected it" in text
+    assert "(a correction" in text and "said 'below' in its Fork rate row; user msg #42 corrected it" in text
     mark = hourly.corrected(p)[str(first)]
     assert mark["msg"] == 42 and mark["entry"] == "corr-1" and str(second) not in hourly.corrected(p)
     assert hourly.post(p, now + 120) is None, "one post per correction"
@@ -160,28 +201,34 @@ def test_the_table_carries_no_eta_so_an_expired_one_never_shows(env):
     assert "eta" not in out and "expected finish" not in out
 
 
-def test_an_unchanged_due_table_is_rechecked_at_most_every_check_s(env, monkeypatch):
+def test_an_unchanged_signature_is_rechecked_at_most_every_check_s(env, monkeypatch):
     from ttp import hourly
     p = make(env)
     p.db.post("in", "hello", chat="main")
     now = time.time() - 3600
     assert hourly.post(p, now - 3700) is None
     calls = []
-    real = hourly.rows
-    monkeypatch.setattr(hourly, "rows", lambda *a, **k: calls.append(1) or real(*a, **k))
-    assert hourly.post(p, now) is None and len(calls) == 1, "due, rows unchanged: no post"
+    real = hourly.important
+    monkeypatch.setattr(hourly, "important", lambda *a, **k: calls.append(1) or real(*a, **k))
+    assert hourly.post(p, now) is None and len(calls) == 1, "nothing important changed: no post"
     assert hourly.post(p, now + 60) is None and len(calls) == 1, "rechecked only after CHECK_S"
     assert hourly.post(p, now + hourly.CHECK_S + 1) is None and len(calls) == 2
 
 
-def test_the_change_check_ignores_minute_by_minute_values():
+def test_the_change_check_reads_only_orders_blockers_outages_and_the_gate():
     from ttp import hourly
-    a = ["Queue: 3 open tasks, 1 in the push queue, oldest approval 5m old",
-         "Landing: approved to landed median 0.4 h; 12 tasks created in 24 h"]
-    b = ["Queue: 3 open tasks, 1 in the push queue, oldest approval 9m old",
-         "Landing: approved to landed median 0.4 h; 13 tasks created in 24 h"]
-    assert hourly._key(a) == hourly._key(b)
-    assert hourly._key(a) != hourly._key([a[0].replace("1 in", "2 in"), a[1]])
+    base = {"open": ["o1", "o2"], "closed": ["o0"], "overdue": [], "blocked": ["#5"], "outages": [],
+            "gate": ["claude:green"]}
+    assert hourly.changes(base, dict(base)) == []
+    assert hourly.changes(base, {**base, "open": ["o2"], "closed": ["o0", "o1"]}) == ["an order closed"]
+    assert hourly.changes(base, {**base, "closed": ["o0", "o3"]}) == ["an order closed"], "opened and closed between"
+    assert hourly.changes(base, {**base, "closed": []}) == [], "a receipt ageing out is no change"
+    assert hourly.changes(base, {**base, "overdue": ["o1"]}) == ["an order went overdue"]
+    assert hourly.changes(base, {**base, "blocked": ["#5", "ask 9"]}) == ["a blocker appeared"]
+    assert hourly.changes(base, {**base, "blocked": []}) == ["a blocker cleared"]
+    assert hourly.changes(base, {**base, "outages": ["box-down"]}) == ["an outage appeared"]
+    assert hourly.changes(base, {**base, "gate": ["claude:yellow"]}) == ["the spend gate changed level"]
+    assert hourly.changes(base, {**base, "open": ["o1", "o2", "o3"]}) == [], "a new order alone posts nothing"
 
 
 def test_the_hourly_module_names_no_host():

@@ -515,8 +515,8 @@ def _reply(db, task: dict, new: str, text: str, need: str | None = None) -> None
     text = text if new == "done" else f"(task #{task['id']} {new}) {text}"
     if need and need not in text:
         text += f"\nNeeds from you: {need}"
-    msgparts.post(db, msgparts.cut(text, f"task #{task['id']}'s hand-off"),
-                  chat=None if task["reply_chat"] == "all" else task["reply_chat"], kind="reply", severity="normal")
+    from . import chatdigest   # the chat's status pace: a routine hand-off waits for its next status post
+    chatdigest.handoff(db, None, task, new, msgparts.cut(text, f"task #{task['id']}'s hand-off"))
 
 
 def _done_text(prev: dict, summary: str, tail: str) -> str:

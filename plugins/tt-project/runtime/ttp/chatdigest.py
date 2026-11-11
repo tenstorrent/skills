@@ -23,7 +23,15 @@ hourly table keeps the same gap. A post that nearly repeats what any other chat 
 last hour (twin: most words alike, or the same task and obligation ids) is not sent again; the earlier
 message delivers only what the reply's own `delivers` named (obligations.deliver_twins), never by topic.
 `coordinator.chat_users` {chat: user} tells apart chats of different users; unset, a project's chats are one
-user's. `coordinator.chat_dedupe` false turns the twin check off."""
+user's. `coordinator.chat_dedupe` false turns the twin check off.
+
+Daemon hand-offs (handoff): a finished task's hand-off or shipped notice to its reply chat goes at once only
+when it delivers an open obligation the task owns in that chat (owed), or reports a failure or block the user
+must act on (needs_user). Any other is held as one short line per task (why HANDOFF) and folded into the
+chat's next status post under its status gap: the hourly table folds the main chat's lines (hourly.post) and
+status_flush posts the rest; the digest's own flush keeps the same gap. With the digest off, each goes at once.
+Every daemon path that posts kind info or reply to a chat goes through status_wait, hold or checked (a guard
+test reads the posting code paths)."""
 from __future__ import annotations
 
 import os
@@ -34,6 +42,8 @@ KV = "chat_digest"   # {"held": {chat: [{ts, text, why}]}, "last": {chat: ts}, "
 #                       "counts": {chat: {sent, held, digests, deduped}}}
 DEFAULT_H = 3
 STATUS_GAP_H = 1
+HANDOFF = "hand-off"   # why of a held daemon hand-off line (handoff, status_flush)
+HANDOFF_REF = "held_handoffs"
 TWIN_S = 3600   # a near-repeat within this long of a post to another chat of the same user is not sent
 FOOTER = "\nStatus now: "   # onhost.guard's appended status line
 
@@ -67,6 +77,14 @@ def asks_user(text: str) -> bool:
     credential wording. Such a post is an ask, never routine."""
     body = str(text or "")
     return bool(_USER_STEP.search(body) or ("`" in body and re.search(r"`[^`\n]+`", body) and _YOU.search(body)))
+
+
+_NEEDS_USER = re.compile(r"\bask \d+\b|\bneed (?:you|your)\b|\byour (?:yes|word|answer|call|go|decision)\b", re.I)
+
+
+def needs_user(text: str) -> bool:
+    """A failure or block the user must act on: an outage, a step only they can take, or their answer."""
+    return urgent(text) or bool(_NEEDS_USER.search(str(text or "").replace("Needs from you:", "")))
 
 
 def urgent(text: str) -> bool:
@@ -207,13 +225,14 @@ def _count(st: dict, chat: str, field: str) -> None:
     c[field] = int(c.get(field) or 0) + 1
 
 
-def hold(db, chat: str | None, text: str, why: str, now: float | None = None) -> None:
-    """Keep `text` for `chat`'s next digest ('all': every chat)."""
+def hold(db, chat: str | None, text: str, why: str, now: float | None = None, task: int | None = None) -> None:
+    """Keep `text` for `chat`'s next digest ('all': every chat); `task`: the task a hand-off line is of."""
     now = time.time() if now is None else now
     chat = chat or "all"
     with db.tx():
         st = db.kv(KV) or {}
-        st.setdefault("held", {}).setdefault(chat, []).append({"ts": now, "text": str(text), "why": why})
+        st.setdefault("held", {}).setdefault(chat, []).append(
+            {"ts": now, "text": str(text), "why": why, **({"task": int(task)} if task is not None else {})})
         _count(st, chat, "held")
         db.set_kv(KV, st)
 
@@ -294,6 +313,8 @@ def flush(p, cfg: dict | None, now: float | None = None) -> list[int]:
             if not items or (gap and (now - min(float(i["ts"]) for i in items) < gap
                                       or now - float(last.get(chat) or 0) < gap)):
                 continue
+            if status_wait(db, cfg, None if chat == "all" else chat, now) > 0:   # never right after a status
+                continue
             where = timefmt.home(p)
             lines = [f"- {timefmt.short(float(i['ts']), where, now)}: {' '.join(str(i['text']).split())}"
                      for i in items]
@@ -307,8 +328,96 @@ def flush(p, cfg: dict | None, now: float | None = None) -> list[int]:
                 out += msgparts.post(db, text.replace("\n", where_to + "\n", 1), chat=None, channel=alerts.QUIET,
                                      kind="info", severity="normal")
             held[chat], last[chat] = [], now
+            if gap:
+                st.setdefault("status", {})[chat] = now
             _count(st, chat, "digests")
         db.set_kv(KV, st)
+    return out
+
+
+def owed(db, tid: int, chat: str | None) -> list[str]:
+    """The open obligations task `tid` owns that are owed in `chat`: an order or promise made there (or to
+    every chat), or a plain obligation, which names no chat."""
+    from . import obligations
+    here = obligations._chat(chat)
+    out = []
+    for o in obligations.items(db):
+        if not obligations._open(o) or int(tid) not in obligations._owner_ids(o):
+            continue
+        where = (o.get("promise") or {}).get("chat")
+        if where is None or here == "all" or obligations._chat(where) in ("all", here):
+            out.append(o["id"])
+    return out
+
+
+def _line(task: dict, new: str, text: str) -> str:
+    """One short line for a held hand-off: the task, how it ended and its first sentence."""
+    body = re.sub(r"^\(task #\d+ \w+\)\s*", "", " ".join(str(text or "").split()))
+    first = re.split(r"(?<=[.;!])\s", body, 1)[0]
+    first = first if len(first) <= 160 else first[:157].rstrip() + "..."
+    return f"#{task['id']} {' '.join(str(task.get('title') or '').split())[:60]}: {new}" + (f": {first}" if first else "")
+
+
+def handoff(db, cfg: dict | None, task: dict, new: str, text: str, now: float | None = None) -> list[int]:
+    """Post the daemon's hand-off `text` of `task` (ended `new`) to its reply chat at once when the user needs
+    it now (owed, needs_user) or the chat has no status gap; else hold one short line of it for the chat's
+    next status post (module doc). The message ids posted ([] when held). Any fault posts it at once."""
+    from . import msgparts
+    chat = None if task.get("reply_chat") in (None, "", "all") else task["reply_chat"]
+    try:
+        if cfg is None:
+            from pathlib import Path
+            from .project import Project
+            cfg = Project(Path(db.path).parent.parent).config()
+        if (status_gap_s(cfg, chat) > 0 and not owed(db, int(task["id"]), chat)
+                and not (new in ("failed", "blocked") and needs_user(text))):
+            hold(db, chat, _line(task, new, text), HANDOFF, now, task=int(task["id"]))
+            return []
+    except Exception:   # a hand-off is never lost to this filter
+        pass
+    return msgparts.post(db, text, chat=chat, kind="reply", severity="normal")
+
+
+def take_handoffs(db, chat: str | None) -> list[str]:
+    """Remove and return `chat`'s held hand-off lines, oldest first, for the status post that folds them."""
+    with db.tx():
+        st = db.kv(KV) or {}
+        items = (st.get("held") or {}).get(chat or "all") or []
+        got = [i for i in items if i.get("why") == HANDOFF]
+        if got:
+            st["held"][chat or "all"] = [i for i in items if i.get("why") != HANDOFF]
+            db.set_kv(KV, st)
+    return [str(i["text"]) for i in got]
+
+
+def handoff_lines(lines: list[str]) -> list[str]:
+    return [f"Finished since the last status ({len(lines)}):", *(f"- {x}" for x in lines)] if lines else []
+
+
+def status_flush(p, cfg: dict | None, now: float | None = None) -> list[int]:
+    """Post each chat's held hand-off lines as one short status post once its status gap allows (the hourly
+    table folds the main chat's first, hourly.post). The message ids posted."""
+    from . import msgparts, timefmt
+    now = time.time() if now is None else now
+    out: list[int] = []
+    for chat, items in list(((p.db.kv(KV) or {}).get("held") or {}).items()):
+        target = None if chat == "all" else chat
+        if not any(i.get("why") == HANDOFF for i in items) or status_wait(p.db, cfg, target, now) > 0:
+            continue
+        with p.db.tx():
+            if not (lines := take_handoffs(p.db, target)):
+                continue
+            text = "\n".join([f"Status at {timefmt.short(now, timefmt.home(p), now)}", *handoff_lines(lines)])
+            if to_chat(cfg, "status"):
+                out += msgparts.post(p.db, text, chat=target, kind="info", severity="low", ref=HANDOFF_REF)
+            else:   # the web app only: no chat, the quiet channel
+                from . import alerts
+                out += msgparts.post(p.db, text, chat=None, channel=alerts.QUIET, kind="info", severity="low",
+                                     ref=HANDOFF_REF)
+            mark_status(p.db, target, now)
+            st = p.db.kv(KV) or {}
+            _count(st, chat, "sent")
+            p.db.set_kv(KV, st)
     return out
 
 
