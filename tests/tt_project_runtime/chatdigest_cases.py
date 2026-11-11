@@ -38,7 +38,7 @@ def test_results_decisions_outages_and_asks_go_at_once(env, monkeypatch):
                  {"type": "reply", "chat": "c1", "text": "On it.", "delivers": [f"#{tid}"]}]
     coord.apply(p, important, turn=1)
     assert _cd_out(p) == [a["text"] for a in important]
-    assert chatdigest.counts(p.db)["c1"]["sent"] == 5 and not (p.db.kv(chatdigest.KV)["held"] or {}).get("c1")
+    assert chatdigest.counts(p.db)["c1"]["sent"] == 5 and not ((p.db.kv(chatdigest.KV) or {}).get("held") or {}).get("c1")
     # A high notify always goes; a routine one waits like a reply.
     coord.apply(p, [{"type": "notify", "text": "Still waiting on the queue.", "severity": "high"},
                     {"type": "notify", "text": "Still waiting on the queue.", "severity": "low"}], turn=2)
