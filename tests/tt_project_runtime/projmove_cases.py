@@ -60,3 +60,92 @@ def test_ttp_move_confirmed_stops_the_old_copy_and_the_held_new_copy_starts_noth
     finally:
         drain(d)
         assert reap_tmp_processes(tmp_path) == [], "a stand-in run outlived the test"
+
+
+def test_the_move_check_never_blocks_the_tick_on_a_hung_remote_and_applies_its_answer_later(env, monkeypatch):
+    import subprocess
+    import threading
+    from ttp import daemon, projmove
+    p = make(env)
+    projmove.record(p.db, "source", "newhost", "demo", now=time.time() - 120)
+    release, calls = threading.Event(), []
+
+    def hung(host, cmd, timeout):   # a down host: ssh hangs until its timeout
+        calls.append((host, cmd))
+        release.wait(30)
+        return subprocess.CompletedProcess([], 0, "demo live\n", "")
+    monkeypatch.setattr(projmove, "_ssh", hung)
+    d = daemon.Daemon(p.base)
+    t0 = time.monotonic()
+    d.check_move()
+    d.check_move()
+    assert time.monotonic() - t0 < 2, "the ssh call ran inside the tick"
+    deadline = time.monotonic() + 5
+    while not calls and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert len(calls) == 1 and not p.db.kv("paused", False), "one call in flight, nothing applied yet"
+    release.set()
+    deadline = time.monotonic() + 5
+    while d._move_call.job.is_alive() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    d.check_move()
+    assert p.db.kv("paused", False) and projmove.current(p.db)["done"], "the answer applies on a later tick"
+    assert p.db.one("SELECT 1 FROM events WHERE kind='project_move' AND severity='low'")
+    assert len(calls) == 1
+
+
+def test_the_new_copy_asks_the_old_one_only_after_its_own_coordinator_run_since_the_move(env):
+    from ttp import daemon, projmove
+    p = make(env)
+    since = time.time() - 300
+    projmove.record(p.db, "target", "oldhost", "demo", now=since)
+    calls = []
+    d = daemon.Daemon(p.base)
+    d._move_call = lambda h, c: (calls.append(c) or (0, "demo stopped here"))
+    for role, status, ended in (("coordinator", "ok", since - 10), ("coordinator", "error", since + 10),
+                                ("worker", "ok", since + 10)):
+        p.db.x("INSERT INTO runs(role,status,started,ended) VALUES(?,?,?,?)", (role, status, ended - 5, ended))
+    d.check_move()
+    assert calls == [] and projmove.dispatch_hold(p.db), "an old, failed or worker run is no coordinator turn here"
+    p.db.x("INSERT INTO runs(role,status,started,ended) VALUES('coordinator','ok',?,?)", (since + 5, since + 20))
+    p.db.set_kv(projmove.KEY, dict(projmove.current(p.db), checked=0))
+    d.check_move()
+    assert calls == ["move demo --confirmed"] and projmove.dispatch_hold(p.db) == ""
+    ev = p.db.one("SELECT severity, text FROM events WHERE kind='project_move'")
+    assert ev["severity"] == "low" and "workers start here" in ev["text"]
+
+
+def test_background_drops_an_answer_for_another_host_and_reports_a_crashed_call(env):
+    from ttp import projmove
+    gate = __import__("threading").Event()
+
+    def call(host, cmd):
+        gate.wait(5)
+        if host == "bad":
+            raise RuntimeError("boom")
+        return 0, f"{host} ok"
+    bg = projmove.Background(call)
+    assert bg("a", "alive demo --within 5s") is None
+    gate.set()
+    bg.job.join(5)
+    assert bg("b", "alive demo --within 9s") is None, "a's answer is not b's: a new call starts"
+    bg.job.join(5)
+    assert bg("b", "alive demo --within 70s") == (0, "b ok")
+    assert bg("bad", "move demo --confirmed") is None
+    bg.job.join(5)
+    assert bg("bad", "move demo --confirmed")[0] == 255
+
+
+def test_ttp_alive_on_the_new_copy_counts_no_run_copied_over_from_the_old_host(env, capsys):
+    from ttp import cli, projmove
+    p = make(env)
+    now = time.time()
+    p.db.x("INSERT INTO runs(role,status,started,ended,cost_usd) VALUES('coordinator','ok',?,?,0.1)", (now - 100, now - 90))
+    projmove.record(p.db, "target", "oldhost", p.name, now=now - 60)
+    with pytest.raises(SystemExit) as e:
+        cli.main(["alive", p.name, "--within", "1h"])
+    assert e.value.code == 1 and "not live" in capsys.readouterr().out, "the old host's run, copied over, counted"
+    p.db.x("INSERT INTO runs(role,status,started,ended,cost_usd) VALUES('coordinator','ok',?,?,0.1)", (now - 30, now - 20))
+    with pytest.raises(SystemExit) as e:
+        cli.main(["alive", p.name, "--within", "1h"])
+    assert e.value.code == 0

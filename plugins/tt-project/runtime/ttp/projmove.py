@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import shlex
 import subprocess
+import threading
 import time
 
 KEY = "project_move"     # kv: {"role", "host", "name", "since", "checked", "first_try", "done", "note"}
@@ -82,27 +83,62 @@ def remote(host: str, cmd: str, timeout: float = 45) -> tuple[int, str]:
     return r.returncode, (out[-1] if out else "")[:200]
 
 
+class Background:
+    """`remote` off the daemon tick (an ssh to a down host can take 45 s): the first call starts it
+    in a thread and returns None, later calls return None while it runs, then its (code, line) once.
+    At most one call is in flight; the thread touches no database."""
+
+    def __init__(self, call=remote):
+        self.call, self.job, self.out, self.asked = call, None, None, ""
+
+    def __call__(self, host: str, cmd: str):
+        if self.job is not None:
+            if self.job.is_alive():
+                return None
+            self.job, out, self.out = None, self.out, None
+            if self.asked == f"{host} {cmd.split()[0]}":   # else an answer for a move since cancelled
+                return out if out is not None else (255, "the remote call ended without an answer")
+        self.asked = f"{host} {cmd.split()[0]}"
+        self.job = threading.Thread(target=self._run, args=(host, cmd), name="ttp-move-remote", daemon=True)
+        self.job.start()
+        return None
+
+    def _run(self, host: str, cmd: str) -> None:
+        try:
+            self.out = self.call(host, cmd)
+        except Exception as e:   # noqa: BLE001 - reported as a failed call, never raised into the tick
+            self.out = (255, str(e)[:200])
+
+
 def step(db, ran_since, now: float | None = None, call=remote) -> str:
     """One look at the move; what changed, for the log, or ''. `ran_since(t)`: whether a model run
-    here succeeded since t."""
+    here succeeded since t. `call` may answer None (a Background call still running): the step then
+    changes nothing and looks again on the next tick."""
     now = time.time() if now is None else now
     rec = current(db)
     if not rec or rec.get("done") or now - float(rec.get("checked") or 0) < CHECK_S:
         return ""
-    rec = dict(rec, checked=now)
     name = shlex.quote(rec["name"])
     if rec["role"] == "source":
-        code, said = call(rec["host"], f"alive {name} --within {max(int(now - rec['since']), 1)}s")
+        if (got := call(rec["host"], f"alive {name} --within {max(int(now - rec['since']), 1)}s")) is None:
+            return ""
+        code, said = got
+        rec = dict(rec, checked=now)
         db.set_kv(KEY, dict(rec, note=said))
         if code == 0:
             stop(db, rec, now)
             return f"the copy on {rec['host']} runs ({said}): this copy stopped starting work"
         return ""
     if not ran_since(rec["since"]):
-        db.set_kv(KEY, rec)
+        db.set_kv(KEY, dict(rec, checked=now))
         return ""
     first = float(rec.get("first_try") or now)
-    code, said = call(rec["host"], f"move {name} --confirmed")
+    if (got := call(rec["host"], f"move {name} --confirmed")) is None:
+        if not rec.get("first_try"):
+            db.set_kv(KEY, dict(rec, first_try=first))
+        return ""
+    code, said = got
+    rec = dict(rec, checked=now)
     if code == 0:
         db.set_kv(KEY, dict(rec, first_try=first, done=now, note=said))
         return f"the old copy on {rec['host']} stopped: workers start here now"

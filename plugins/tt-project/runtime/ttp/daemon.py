@@ -1408,6 +1408,7 @@ class Daemon:
         self._on_pass_notes_due = 0.0   # when runs are next swept for notes an unsettled on_pass_cmd queued
         self._reboot_told = False
         self._linger_at, self._linger_off = 0.0, False   # linger last looked at, and what it said
+        self._move_call = None   # projmove.Background: the move's ssh check in flight (check_move)
         self._gh_auth: threading.Thread | None = None   # the host-wide gh login check in flight (ghauth.py)
         self._reach: threading.Thread | None = None     # the machines' ssh reach probe in flight (reach.py)
         self._last_stop: dict = {}   # the clean-stop record this daemon found at start
@@ -11828,7 +11829,9 @@ class Daemon:
         def turned(since: float) -> bool:
             return bool(self.p.db.one("SELECT 1 FROM runs WHERE role='coordinator' AND status='ok' AND ended>?",
                                       (since,)))
-        if said := projmove.step(self.p.db, turned):
+        if self._move_call is None:   # ssh to the other host runs in a thread: never inside the tick
+            self._move_call = projmove.Background()
+        if said := projmove.step(self.p.db, turned, call=self._move_call):
             log(self.p, f"project move: {said}")
             self.p.db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
                         (time.time(), "daemon", "project_move", "low", said, "done"))

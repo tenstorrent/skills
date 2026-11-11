@@ -1711,7 +1711,12 @@ session and stateless coordinators on every provider.
 - On the old host, `ttp move <name> --to <new host>[:<name>]`: every minute its daemon asks the new
   host (`ttp alive <name>`) whether a model run there succeeded since the move began; the first yes
   pauses this copy. Either side alone is enough, so the old copy stops within a few minutes of the
-  new one running.
+  new one running. Runs copied over with the project's records do not count: only those since the
+  new host's own `--from`.
+
+The ssh checks run in the background, so a host that hangs never slows the daemon. If neither host
+can reach the other, the new copy starts work after its 10 minutes while the old one may still run:
+stop the old copy by hand (`ttp pause` there) when the hosts cannot see each other.
 
 The stopped copy is paused: no worker starts and its coordinator wakes no more, while its running
 workers finish with their work kept, as with `ttp drain`. It raises no long-pause alert. `ttp move

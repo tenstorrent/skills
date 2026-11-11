@@ -10757,9 +10757,12 @@ def _pause_by(p: Project) -> str:
 
 def cmd_alive(a) -> None:
     """`ttp alive <name>`: a running daemon is no proof the project works (its CLI may be logged out)."""
-    from . import projpause
+    from . import projmove, projpause
     p = need(a.name, sys.argv[1:])
-    ok, why = projpause.live(p.db, _since_s(a.within))
+    within = _since_s(a.within)
+    if (rec := projmove.current(p.db)) and rec["role"] == "target":   # runs copied over from the old host do not count
+        within = min(within, max(time.time() - float(rec["since"]), 0))
+    ok, why = projpause.live(p.db, within)
     print(f"{p.name} {'live' if ok else 'not live'}: {why}")
     sys.exit(0 if ok else 1)
 
