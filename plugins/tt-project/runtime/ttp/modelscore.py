@@ -166,7 +166,7 @@ def bench() -> dict[str, dict]:
         cur = b["scores"].setdefault(cls or "*", {}).get(suite)
         if score is not None and (cur is None or at >= cur[0]):
             b["scores"][cls or "*"][suite] = (at, score * 100 if score <= 1 else score)
-        if inject_ok is not None and at >= b["_inj_at"]:
+        if inject_ok is not None and (at > b["_inj_at"] or (at == b["_inj_at"] and not inject_ok)):   # a tie: failure wins
             b["injection_failed"], b["_inj_at"] = not inject_ok, at
     d = _home() / "model-bench"
     for f in sorted(d.glob("20*.json")) if d.is_dir() else ():
