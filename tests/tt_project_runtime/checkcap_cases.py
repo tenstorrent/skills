@@ -9734,6 +9734,7 @@ def _owed_preempt_env(monkeypatch, cap="2"):
     monkeypatch.setenv(checkcap.URGENT_SLOTS_ENV, "0")
     monkeypatch.setenv(checkcap.PREEMPT_AFTER_ENV, "0")
     monkeypatch.setenv(checkcap.PREEMPT_ASKED_ENV, "")
+    monkeypatch.setenv("TTP_CHECKS_PRIORITY_BEYOND_CAP", "1")   # #7068: the old overflow, off by default
     monkeypatch.setattr(checkcap, "POLL_S", 0.1)
     return checkcap
 
@@ -9878,6 +9879,7 @@ def test_ttp_checks_preempt_asks_a_run_by_hand_and_refuses_owed_push_and_locked_
     from ttp import checkcap, cli, locks
     monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "5")
     monkeypatch.setenv("TTP_CHECKS_LOAD_EXTRA", "0")
+    monkeypatch.setenv("TTP_CHECKS_PRIORITY_BEYOND_CAP", "1")   # #7068: the old overflow, off by default
     holds = {}
     for run, kw in (("r-owed", {"priority": 0, "owns": ["o1"], "preemptible": True}),
                     ("r-urgent", {"priority": 0, "preemptible": True}),
