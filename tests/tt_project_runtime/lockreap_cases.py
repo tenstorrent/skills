@@ -288,6 +288,84 @@ def test_lock_wait_alert_fires_once_after_the_threshold_names_the_holder_and_cle
     assert lockreap.wait_alert_s({}) == 30 * 60
 
 
+def _lock_wait_rows(p, key):
+    return p.db.q("SELECT text, channel FROM messages WHERE direction='out' AND ref=? ORDER BY id", (key,))
+
+
+def _prime_reaper(dmn, p):
+    """Give daemon `dmn` a reaper that first saw today's dead holders past the grace, so its next sweep judges them."""
+    from ttp import checkcap, lockreap
+    r = lockreap.Reaper(ended=lambda h: lockreap.ended_job(p, h), project=p.base)
+    r.sweep(lockreap.slot_files([p.state / "locks", checkcap.slot_dir()]), time.time() - lockreap.GRACE_S - 5)
+    dmn._lock_reaper = r
+
+
+def test_lock_wait_alert_stays_off_chat_while_the_holder_lives_and_posts_once_when_it_dies_unreleased(env, monkeypatch):
+    from ttp import daemon as dm, locks
+    p = make(env)
+    d = p.state / "locks"
+    f = _reap_slot(d / "gate.0.lock", pid=4100, pid_start="11", pgid=4100, run_id="70", task_id="7")
+    procs = {4100: {"start": "11", "pgid": 4100}, 5200: {"start": "1", "cmd": "sleep 999", "env": {"TTP_PROJECT": "/srv/other"}}}
+    _ReapProcs(monkeypatch, procs, [4100, 5200])
+    ticket = locks.enqueue(d, "gate", "task #8", since=time.time() - 31 * 60)
+    try:
+        dmn = dm.Daemon(p.base)
+        dmn.reap_locks()
+        dmn.reap_locks()
+        rows = _lock_wait_rows(p, "lock-wait:gate")
+        assert [r["channel"] for r in rows] == ["quiet"], rows      # holder alive: web app and status only
+        assert "holder alive" in rows[0]["text"]
+        del procs[4100]                                             # it dies; another project's process keeps the slot
+        dmn.reap_locks()
+        assert [r["channel"] for r in _lock_wait_rows(p, "lock-wait:gate")] == ["quiet"], "the sweep may still release it"
+        _prime_reaper(dmn, p)
+        for _ in range(3):
+            dmn.reap_locks()
+        dm.Daemon(p.base).reap_locks()
+        rows = _lock_wait_rows(p, "lock-wait:gate")
+        assert [r["channel"] for r in rows] == ["quiet", "chat"], rows   # posted once, not per tick
+        assert "dead" in rows[1]["text"] and "pid 4100" in rows[1]["text"]
+    finally:
+        locks.dequeue(ticket)
+    dmn.reap_locks()
+    assert not p.db.one("SELECT id FROM alerts WHERE key='lock-wait:gate' AND cleared IS NULL")
+    rows = _lock_wait_rows(p, "lock-wait:gate")
+    assert rows[-1]["text"].startswith("Cleared:") and rows[-1]["channel"] == "chat", rows
+    f.close()
+
+
+def test_lock_wait_alert_behind_a_dead_holder_the_sweep_kept_posts_to_chat_at_once(env, monkeypatch):
+    from ttp import daemon as dm, locks
+    p = make(env)
+    d = p.state / "locks"
+    f = _reap_slot(d / "gate.0.lock", pid=4100, pid_start="11", pgid=4100, run_id="70", task_id="7")
+    _ReapProcs(monkeypatch, {5200: {"start": "1", "cmd": "sleep 999", "env": {"TTP_PROJECT": "/srv/other"}}}, [5200])
+    ticket = locks.enqueue(d, "gate", "task #8", since=time.time() - 31 * 60)
+    try:
+        dmn = dm.Daemon(p.base)
+        _prime_reaper(dmn, p)
+        dmn.reap_locks()
+        dmn.reap_locks()
+        rows = _lock_wait_rows(p, "lock-wait:gate")
+        assert [r["channel"] for r in rows] == ["chat"], rows
+    finally:
+        locks.dequeue(ticket)
+        f.close()
+
+
+def test_dead_unreleased_counts_a_dead_holder_once_the_sweep_had_time_to_release_it():
+    from ttp import lockreap
+    w = {"lock": "gate", "holders": [{"state": "dead", "path": "/l/gate.0.lock", "pid": 4100}]}
+    seen = {}
+    assert not lockreap.dead_unreleased(w, {}, seen, 1000.0)          # within the sweep's grace
+    assert not lockreap.dead_unreleased(w, {}, seen, 1000.0 + lockreap.RELEASE_WITHIN_S - 1)
+    assert lockreap.dead_unreleased(w, {}, seen, 1000.0 + lockreap.RELEASE_WITHIN_S)
+    assert lockreap.dead_unreleased(w, {"/l/gate.0.lock": {}}, {}, 1000.0)   # kept: at once
+    assert lockreap.dead_unreleased({"lock": "devq:r", "holders": [{"state": "dead", "path": "", "pid": 7}]}, None, {}, 1.0)
+    assert not lockreap.dead_unreleased({"lock": "gate", "holders": [{"state": "alive", "path": "/x", "pid": 1},
+                                                                     {"state": "unknown", "path": "/y", "pid": 2}]}, {}, {}, 1e9)
+
+
 def test_lockreap_never_reaps_a_detached_jobs_lock(env, monkeypatch, tmp_path):
     """A detached job's lock (label via "job") is held by every process of the job by design: a process
     of the same run that left the job's group keeps it, dead wrapper or not, and nothing is signalled."""

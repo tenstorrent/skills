@@ -564,6 +564,23 @@ def wait_text(w: dict, now: float | None = None, kept: dict | None = None) -> st
             f"Holder: " + "; ".join(parts) + ".")[:1300] + " " + BOUND_TEXT
 
 
+def dead_unreleased(w: dict, kept: dict | None, dead_seen: dict, now: float | None = None) -> bool:
+    """Whether wait `w` has a dead holder the sweep did not release: one it kept (`kept`, Reaper.sweep),
+    a device-queue holder (no slot file: nothing here releases it), or one seen dead past RELEASE_WITHIN_S.
+    Only such a wait goes to chat; one behind live or unjudgeable holders stays in the web app and status.
+    `dead_seen` (the caller's, kept across ticks) maps each dead holder (lock, slot path, pid) to when it
+    was first seen dead; the caller drops holders no longer dead."""
+    now = time.time() if now is None else now
+    out = False
+    for h in w["holders"]:
+        if h.get("state") != "dead":
+            continue
+        first = dead_seen.setdefault((w["lock"], h.get("path") or "", h.get("pid")), now)
+        if not h.get("path") or h["path"] in (kept or {}) or now - first >= RELEASE_WITHIN_S:
+            out = True
+    return out
+
+
 # The release guarantee, in every lock-wait alert: waiters do not sweep (or cannot judge from a sandbox).
 BOUND_TEXT = (f"The daemon's tick releases a dead holder's lock that only its own run keeps within about "
               f"{int(RELEASE_WITHIN_S // 60) + 1} min; one it does not release stays named here.")
