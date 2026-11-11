@@ -982,10 +982,13 @@ coordinator with that evidence.
   until a task names the device again.
 - gh logged out (model-free): one check per machine, shared by every project on it, runs `gh auth
   status` at most every 15 min while a project there uses gh (a PR to watch, or a schedule or
-  probe that calls gh or `ttp ci`). While it fails for the login, one normal alert in the top
-  section names the machine's ssh alias and the step only the user can take (`gh auth login`
-  there). It is sent once per outage, the other projects there show it quietly, and it clears once
-  the check passes. Shipped gh callers never read a logout as ok: pr-watch's run ends with an
+  probe that calls gh or `ttp ci`). While it fails for the login and no `delivery.gh_route`
+  answers, one normal alert in the top section names the machine and the route setting (never a
+  login step: lab hosts keep no GitHub login). It is sent once per logout for the whole account,
+  however many projects see it (a marker under the tt-project home folder), the other projects
+  show it quietly, and it clears once gh works or a route answers. Where no gh login is the
+  expected state, set `delivery.gh_route` to `workstation` (gh actions are run by the user's
+  workstation) or `none`: then no alert is raised, only one quiet status line per logout. Shipped gh callers never read a logout as ok: pr-watch's run ends with an
   `error:` status, `ttp ci` exits 4 with a `broken:` line, and a gh call that failed its login asks
   for a recheck at once. A `start_when` probe that fails for gh's login (exit 4, or `not logged in`
   in its output) raises no broken-probe event of its own while the host check says logged out; the

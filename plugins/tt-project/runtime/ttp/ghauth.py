@@ -28,8 +28,10 @@ from pathlib import Path
 
 KEY = "gh-auth"        # the alert's condition key (a harness condition)
 KV = "gh_auth_down"    # kv while this project uses gh and the host's gh is logged out
+KNOWN_KV = "gh_auth_known"   # kv {since, mode}: the quiet status line of an expected logout was posted
 STATE = "gh-auth.json"
 LOCK = "gh-auth.lock"
+ANNOUNCED = "gh-auth-alert.json"   # which project told the user of the current logout (announce), account-wide
 EVERY_S = 900.0        # `gh auth status` runs at most this often, host-wide
 TIMEOUT_S = 20.0
 AUTH_RC = 4            # gh's own exit code for "authentication required"
@@ -72,10 +74,10 @@ def due(st: dict, now: float, every_s: float = EVERY_S) -> bool:
     return now - checked >= every_s or float(st.get("nudged") or 0) > checked
 
 
-def _locked(home: Path | None, fn, block: bool):
+def _locked(home: Path | None, fn, block: bool, lock: str = LOCK):
     d = _home(home)
     d.mkdir(parents=True, exist_ok=True)
-    fd = os.open(d / LOCK, os.O_RDWR | os.O_CREAT, 0o600)
+    fd = os.open(d / lock, os.O_RDWR | os.O_CREAT, 0o600)
     try:
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | (0 if block else fcntl.LOCK_NB))
@@ -182,6 +184,38 @@ def uses_gh(db) -> bool:
             return True
     return any(_runs_gh([deferral(t).get("when")] + _probes(load_result(t["result"])))
                for t in db.q(f"SELECT labels, result FROM tasks WHERE {OPEN_TASKS} AND status IN ('queued','waiting')"))
+
+
+def announce(owner: str, since, home: Path | None = None) -> bool:
+    """Whether `owner` (a project) tells the user of the logout that began at `since`: True only for the
+    first project to ask in this logout, and for it again; every other project of this account shows it
+    quietly, so a logout is one alert per account however often a project's own episode clears and
+    reopens. A marker that cannot be read or written never silences anyone."""
+    def take():
+        f = _home(home) / ANNOUNCED
+        try:
+            m = json.loads(f.read_text())
+        except (OSError, ValueError):
+            m = {}
+        if isinstance(m, dict) and m.get("since") == since and m.get("owner") not in (None, owner):
+            return False
+        if not (isinstance(m, dict) and m.get("since") == since):
+            from .project import write_json
+            write_json(f, {"since": since, "owner": owner, "at": time.time()}, 0o600)
+        return True
+    try:
+        took = _locked(home, take, block=True, lock=ANNOUNCED + ".lock")
+    except OSError:
+        return True
+    return took is not False
+
+
+def forget(home: Path | None = None) -> None:
+    """The logout is over (gh works, or a route or MODES value is set): the next one is told afresh."""
+    try:
+        (_home(home) / ANNOUNCED).unlink()
+    except OSError:
+        pass
 
 
 def text(st: dict, host: str, when: str, cfg: dict | None = None) -> str:

@@ -4831,8 +4831,10 @@ class Daemon:
 
     def check_gh_auth(self) -> None:
         """While this project uses gh: the host-wide gh login check (ghauth.py) in a thread when it is due,
-        and, while it says logged out and no delivery.gh_route answers (ghroute), one machine-wide harness
-        condition naming the route setting and what is skipped, never a login step; it clears once gh works."""
+        and, while it says logged out and no delivery.gh_route answers (ghroute), one harness condition naming
+        the route setting and what is skipped, never a login step, told by one project per account and logout
+        (ghauth.announce); it clears once gh works. With delivery.gh_route set to a ghroute.MODES value (no gh
+        login here is expected), one quiet status line per logout instead, never an alert."""
         from . import ghauth, ghroute
         db = self.p.db
         if not ghauth.uses_gh(db):
@@ -4844,13 +4846,28 @@ class Daemon:
                 and (not os.environ.get("PYTEST_CURRENT_TEST") or os.environ.get("TTP_TEST_GH_AUTH")):
             self._gh_auth = threading.Thread(target=ghauth.check, daemon=True, name="gh-auth")
             self._gh_auth.start()
-        if st.get("ok") is False and not ghroute.works():
+        mode = ghroute.known(self.cfg)
+        if st.get("ok") is False and mode:   # expected here: one quiet status line per logout, no alert
+            if db.kv(ghauth.KV):
+                db.x("DELETE FROM kv WHERE key=?", (ghauth.KV,))   # an open alert episode clears (alerts.sweep)
+            if db.kv(ghauth.KNOWN_KV) != {"since": st.get("since"), "mode": mode}:
+                db.set_kv(ghauth.KNOWN_KV, {"since": st.get("since"), "mode": mode})
+                when = timefmt.short(float(st.get("since") or time.time()), self.p)
+                db.post("out", ghroute.known_text(hostname(), when, mode), chat=None, channel=alerts.QUIET,
+                        kind="info", severity="low")
+        elif st.get("ok") is False and not ghroute.works():
             if not db.kv(ghauth.KV):
                 db.set_kv(ghauth.KV, {"since": st.get("since")})
             when = timefmt.short(float(st.get("since") or time.time()), self.p)
-            self.alert(ghauth.KEY, ghauth.text(st, hostname(), when, self.cfg), severity="normal")
-        elif db.kv(ghauth.KV) and (st.get("ok") or ghroute.works()):
-            db.x("DELETE FROM kv WHERE key=?", (ghauth.KV,))
+            self.alert(ghauth.KEY, ghauth.text(st, hostname(), when, self.cfg), severity="normal",
+                       quiet=not ghauth.announce(str(self.p.base), st.get("since")))
+        else:
+            if db.kv(ghauth.KV) and (st.get("ok") or ghroute.works()):
+                db.x("DELETE FROM kv WHERE key=?", (ghauth.KV,))
+            if st.get("ok") is True or ghroute.works():
+                ghauth.forget()
+        if db.kv(ghauth.KNOWN_KV) and not (st.get("ok") is False and mode):
+            db.x("DELETE FROM kv WHERE key=?", (ghauth.KNOWN_KV,))
 
     def check_reach(self) -> None:
         """The listed machines' ssh reach probe (reach.py) in a thread when one is due: the digest's reach
@@ -19870,7 +19887,7 @@ class Daemon:
 
     # notifications and Slack -------------------------------------------------------------------------
     def alert(self, key: str, text: str, severity: str = "high", every_s: float = 6 * 3600,
-              outage: bool | None = None) -> None:
+              outage: bool | None = None, quiet: bool = False) -> None:
         """Deduplicated broadcast, across daemon restarts too (an upgrade must not re-announce a
         condition the user already has). A high alert with a key opens an episode that clears
         itself once the condition does (alerts.sweep); while it is open a repeat only updates the
@@ -19902,7 +19919,9 @@ class Daemon:
                 return
             if not ep and not tracked and now - last < every_s:
                 return
-            if claim_key:
+            if quiet:
+                pass
+            elif claim_key:
                 prev = db.one("SELECT MAX(cleared) AS c FROM alerts WHERE key=?", (key,))
                 quiet = not alerts.claim(claim_key, key, str(self.p.base), now, float(prev["c"] or 0) if prev else 0.0)
             else:

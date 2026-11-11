@@ -108,7 +108,7 @@ CLEARED_TEXT = {
 # notifier: this machine's desktop notifications fail (notifier.py; a system setting or a missing tool).
 # fleethold: a hold the user set is past its expected end while tasks here wait on it (fleethold.passed_alerts).
 USER_BLOCKERS = ("network", "paused", "coord-budget", "linger-off", "notifier", "fleethold", "user-step",
-                 "slurm-paused", "model-ranking-key", "ssh-agent")   # ssh-agent: a locked or waiting password-manager agent here (sshagent.py); model-ranking-key: no Artificial Analysis key (rankfresh); slurm-paused: the checks overflow's start-failure breaker (slurmcheck); paused: a long project pause (projpause); user-step: userstep.py
+                 "slurm-paused", "model-ranking-key", "ssh-agent", "gh-auth")   # gh-auth: gh has no login here and no route (ghauth); ssh-agent: a locked or waiting password-manager agent here (sshagent.py); model-ranking-key: no Artificial Analysis key (rankfresh); slurm-paused: the checks overflow's start-failure breaker (slurmcheck); paused: a long project pause (projpause); user-step: userstep.py
 CLEARED_SEVERITY = {"network": "low", "paused": "low", "fleethold": "low", "coord-budget": "low", "account-mismatch": "low",
                     "linger-off": "low", "notifier": "low", "user-step": "low", "slurm-paused": "low", "gh-auth": "low",
                     "model-ranking-key": "low", "ssh-agent": "low"}

@@ -160,6 +160,79 @@ def test_only_commands_that_run_count_as_gh_use_never_prose_in_a_spec_or_hand_of
     assert ghauth.uses_gh(p.db), "a start_when calling gh"
 
 
+def _two_gh_projects(env, monkeypatch):
+    """Two projects on one host, both watching a PR, a stub gh logged out; returns (p, q, dp, dq, answer, tick)."""
+    from ttp.cli import bootstrap
+    from ttp.daemon import Daemon
+    monkeypatch.setenv("TTP_TEST_GH_AUTH", "1")
+    answer, _calls = _stub_gh(env, monkeypatch)
+    p = make(env)
+    repo2 = env["tmp"] / "repo2"
+    subprocess.run(["git", "clone", "-q", str(env["repo"]), str(repo2)], check=True)
+    q = bootstrap(repo2, "second", "Another project.", "fake")
+    for x in (p, q):
+        x.db.x("INSERT INTO chats(id,created,label,last_active,last_read) VALUES('c1',?,?,?,0)",
+               (time.time(), "t", time.time()))
+        x.db.x("INSERT INTO tasks(title,kind,status,pr_url,created) VALUES('t','code','waiting',?,?)",
+               ("https://github.com/acme/widgets/pull/3", time.time()))
+    dp, dq = Daemon(p.base), Daemon(q.base)
+
+    def tick(*ds):
+        for d in ds:
+            d.check_gh_auth()
+            if d._gh_auth:
+                d._gh_auth.join(30)
+            d.check_gh_auth()
+    return p, q, dp, dq, answer, tick
+
+
+def test_a_gh_logout_is_one_alert_per_account_even_when_a_projects_episode_reopens(env, monkeypatch):
+    """The account-wide marker (ghauth.announce), not only the machine-wide claim: a second project whose
+    claim check would let it broadcast (the first one's daemon looks gone, or its own episode cleared and
+    reopened) still shows the logout quietly; once gh works the marker goes, and the next logout is told."""
+    from ttp import alerts, ghauth
+    monkeypatch.setattr(alerts, "owner_alive", lambda owner: False)   # every claim looks stale
+    p, q, dp, dq, answer, tick = _two_gh_projects(env, monkeypatch)
+    tick(dp, dq)
+    assert len(p.db.unread_for_chat("c1", 0)) == 1
+    assert q.db.unread_for_chat("c1", 0) == [], "a second alert for the same logout"
+    assert q.db.one("SELECT channel FROM messages WHERE ref=?", (ghauth.KEY,))["channel"] == alerts.QUIET
+    q.db.x("UPDATE alerts SET cleared=? WHERE key=?", (time.time(), ghauth.KEY))   # q's episode clears
+    tick(dq, dp)
+    assert q.db.unread_for_chat("c1", 0) == [], "a reopened episode told the user again"
+    assert (ghauth._home(None) / ghauth.ANNOUNCED).exists()
+    answer(0)
+    ghauth.nudge()
+    tick(dp, dq)
+    assert not (ghauth._home(None) / ghauth.ANNOUNCED).exists(), "the marker outlived the logout"
+    assert ghauth.announce("x", 2.0) and not ghauth.announce("y", 2.0) and ghauth.announce("x", 2.0)
+
+
+def test_a_gh_route_mode_makes_no_login_here_one_quiet_status_line_not_an_alert(env, monkeypatch):
+    """delivery.gh_route `workstation` (gh actions run by the user's workstation) or `none` (no gh login
+    expected here): no alert in any chat, one quiet low status line per logout, an open alert clears;
+    the value is no ssh alias, so no gh call goes over ssh to it."""
+    from ttp import alerts, ghauth, ghroute
+    monkeypatch.setattr(alerts, "owner_alive", lambda owner: True)
+    p, q, dp, dq, _answer, tick = _two_gh_projects(env, monkeypatch)
+    tick(dp)
+    assert len(p.db.unread_for_chat("c1", 0)) == 1 and p.db.kv(ghauth.KV), "unset: the alert"
+    dp.cfg.setdefault("delivery", {})["gh_route"] = "workstation"
+    dq.cfg.setdefault("delivery", {})["gh_route"] = "none"
+    for _ in range(3):
+        tick(dp, dq)
+    assert q.db.unread_for_chat("c1", 0) == [] and not q.db.kv(ghauth.KV)
+    assert not p.db.kv(ghauth.KV) and [e["key"] for e in alerts.sweep(p.db)] == [ghauth.KEY], "the open alert stays"
+    for x, mode in ((p, "workstation"), (q, "none")):
+        lines = x.db.q("SELECT * FROM messages WHERE kind='info' AND text LIKE '%as expected%'")
+        assert len(lines) == 1, lines
+        assert lines[0]["channel"] == alerts.QUIET and lines[0]["severity"] == "low" and mode in lines[0]["text"]
+    assert ghroute.problem("workstation") == ghroute.problem("none") == "" and ghroute.value_of(" none ") == "none"
+    assert ghroute.problem("local") and ghroute.route(dp.cfg) == "" and ghroute.known(dp.cfg) == "workstation"
+    assert ghroute.routed(["pr", "view", "3"], dp.cfg) is None, "a mode is no ssh alias"
+    assert "is workstation" in ghroute.held(["pr", "comment", "3"], dp.cfg)
+
+
 def test_pr_watch_says_error_not_ok_when_gh_is_logged_out(env, monkeypatch):
     """The incident: pr-watch counted gh calls that failed for the login as read and said ok."""
     from ttp import ghauth, watchers
