@@ -432,7 +432,8 @@ def record(state, usage, session_id: str, turn: dict, ok: bool, now: float, summ
                 row["post"] = post
             st["compactions"] = [*(st.get("compactions") or []), row][-COMPACTIONS_KEPT:]
             st.update({"restore": True, "compact_floor": st["context_tokens"]})
-            st.pop("shrink", None)   # a wake-cost shrink request is met by any compaction
+        if mode == "resume" and turn.get("why") == "compact":
+            st.pop("shrink", None)   # a wake-cost shrink request is asked once: that wake was its try
     return st
 
 

@@ -3274,8 +3274,11 @@ def test_wakecost_shrink_compacts_the_same_session_in_place_once():
     usage = SimpleNamespace(input_tokens=1, cache_read_tokens=70000, cache_write_tokens=0, output_tokens=10,
                             session_id="s1", extra={})
     turn = {"mode": "resume", "why": "compact", "key": "k1", "model": "m", "effort": "high", "provider": "fake"}
-    got = cs.record(st, usage, "s1", turn, True, 1.0)
+    got = cs.record(st, usage, "s1", turn, True, 1.0, compacted={"pre_tokens": 150000})
     assert "shrink" not in got and got["id"] == "s1" and got["restore"]
+    none = cs.record(st, usage, "s1", turn, True, 1.0)   # the agent's switch did not fire: asked once, no loop
+    assert "shrink" not in none and not none.get("compactions")
+    assert cs.decide(_cs_cfg(), none, "k1", "m", "high", lambda s: True, 0)[1] == "continued"
     assert cs.decide(_cs_cfg(), got, "k1", "m", "high", lambda s: True, 0) == ("resume", "continued")
 
 
