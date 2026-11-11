@@ -3987,8 +3987,11 @@ def test_ttp_checks_wait_record_and_probe_name_where_the_lane_count_comes_from(
     if set_by == "load":
         monkeypatch.delenv(checklane.SLOTS_ENV, raising=False)
         monkeypatch.setattr(checklane, "_explicit_slots", lambda cfg: None)   # neither project nor account
-        cap = checklane.capacity
-        monkeypatch.setattr(checklane, "capacity", lambda *a, **k: {**cap(*a, **k), "n": 1})   # a loaded host
+        # A loaded host, as a constant: a real host-load read can take longer than the wait window on a
+        # busy host, and the wait record would never be written.
+        loaded = {"n": 1, "floor": 1, "top": 1, "held": 0, "fit": 1, "cores": 4, "load": 4.0, "mem_gib": 16.0,
+                  "run_cores": 4, "run_gib": checklane.GIB_PER_LANE}
+        monkeypatch.setattr(checklane, "capacity", lambda *a, **k: dict(loaded))
     records, real = [], cli.write_json
     monkeypatch.setattr(cli, "write_json", lambda path, data, *a, **k: (
         records.append(dict(data)) if Path(path).name == cli.CHECKS_SLOT_WAIT else None, real(path, data, *a, **k))[1])
