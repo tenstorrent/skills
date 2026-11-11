@@ -1559,9 +1559,8 @@ def fail_add(state: Path, head: str, key: str, host: str, sig: str, env_cfg: dic
                     if isinstance(r, dict) and now - float(r.get("ts") or 0) <= FAILS_KEEP_S]
             recs.append({"head": head, "key": key, "host": host, "sig": sig,
                          "env": _env_key(env_cfg) if env_cfg is not None else "", "ts": now})
-            tmp = path.with_name(f".{path.name}.{os.getpid()}")
-            tmp.write_text(json.dumps(recs[-500:]))
-            os.replace(tmp, path)
+            from . import project
+            project.durable_write(path, json.dumps(recs[-500:]))
     except OSError:   # a record is a bound on reruns: never a reason for the checks run to fail
         pass
 
