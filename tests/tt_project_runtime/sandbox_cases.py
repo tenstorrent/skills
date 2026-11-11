@@ -139,7 +139,8 @@ def test_ttp_checks_runs_each_check_in_the_sandbox_once_the_project_opts_in(env,
     from ttp import cli
     _live_sandbox(monkeypatch)
     p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
-    sentinel = subprocess.Popen(["sleep", "60"])
+    # lives until killed below: a run queued for a busy host's checks slot can outlast any fixed sleep
+    sentinel = subprocess.Popen([sys.executable, "-c", "import signal; signal.pause()"])
     try:
         cli.main(["checks", "--fresh", "--", f"test ! -e /proc/{sentinel.pid}"])
         assert json.loads((run / "checks.json").read_text())["passed"] is True

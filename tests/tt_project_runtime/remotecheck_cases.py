@@ -660,18 +660,31 @@ def test_a_run_that_does_not_pass_on_a_spill_host_runs_again_here(env, tmp_path,
     failure there reruns the checks here, without spilling again, and only that result counts; no
     envfault is opened for the spill host."""
     import threading
-    from ttp import cli, envfault
+    from ttp import checkspill, cli, envfault
     p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a"])
     log = tmp_path / "where.log"
     cmd = f'case "$PWD" in */ttp-check.*) pwd >> {log}; exit 1;; esac; pwd >> {log}'
     p.set_config("delivery.push_checks", [cmd])
+    real_off = checkspill.spill_off_add
+    lane = None
+
+    def spill_off_add(*a, **k):   # the spill run ended without passing: free the lane for the rerun here
+        off = real_off(*a, **k)
+        lane.close()
+        return off
+    monkeypatch.setattr(checkspill, "spill_off_add", spill_off_add)
     for fake in ({}, {"FAKE_SSH_FAIL": "mktemp"}):
         for k, v in fake.items():
             monkeypatch.setenv(k, v)
         log.write_text("")
         lane = _spill_lane(p, repo)
-        threading.Timer(2.0, lane.close).start()
-        cli.main(["checks", "--fresh"])
+        safety = threading.Timer(120, lane.close)   # never hang the suite
+        safety.start()
+        try:
+            cli.main(["checks", "--fresh"])
+        finally:
+            safety.cancel()
+            lane.close()
         rec = json.loads((run / "checks.json").read_text())
         assert rec["passed"] is True and "spilled_to" not in rec, (fake, rec)
         text = (run / "checks.log").read_text()
@@ -1987,8 +2000,16 @@ def test_a_saturated_disk_sends_a_new_run_to_a_spill_host_before_any_wait_here(e
     cmd = f"pwd >> {log}"
     p.set_config("delivery.push_checks", [cmd])
     held = [True]
-    monkeypatch.setattr(diskgate, "saturated", lambda: "Dirty 7.6 GB over the 2.0 GB limit (checks.dirty_max_mb)"
-                        if held[0] else "")
+    picks = []
+    after_pick = [0]
+
+    def saturated():
+        if picks and held[0]:   # the disk clears only once the run, the spill hosts tried, saw it held here
+            after_pick[0] += 1
+            held[0] = after_pick[0] < 2
+            return "Dirty 7.6 GB over the 2.0 GB limit (checks.dirty_max_mb)"
+        return "Dirty 7.6 GB over the 2.0 GB limit (checks.dirty_max_mb)" if held[0] else ""
+    monkeypatch.setattr(diskgate, "saturated", saturated)
     real_acquire = checkcap.acquire
     monkeypatch.setattr(checkcap, "acquire", lambda *a, **k: pytest.fail("no wait here before the spill hosts"))
     cli.main(["checks", "--fresh"])
@@ -1999,11 +2020,14 @@ def test_a_saturated_disk_sends_a_new_run_to_a_spill_host_before_any_wait_here(e
     # No spill host free: it waits here (the gate in checkcap._take) and runs here once the disk clears.
     monkeypatch.setattr(checkcap, "acquire", real_acquire)
     monkeypatch.setattr(checkcap, "POLL_S", 0.02)
-    picks = []
     monkeypatch.setattr(checkspill, "pick", lambda *a, **k: picks.append(1) or None)
     log.write_text("")
-    threading.Timer(1.0, lambda: held.__setitem__(0, False)).start()
-    cli.main(["checks", "--fresh"])
+    safety = threading.Timer(120, lambda: held.__setitem__(0, False))   # never hang the suite
+    safety.start()
+    try:
+        cli.main(["checks", "--fresh"])
+    finally:
+        safety.cancel()
     rec = json.loads((run / "checks.json").read_text())
     assert rec["passed"] is True and "spilled_to" not in rec, rec
     assert picks == [1], "the spill hosts were tried first, once"

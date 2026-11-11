@@ -37219,9 +37219,7 @@ def test_devq_restart_requeues_a_job_a_reboot_killed_and_adopts_one_still_runnin
     os.kill(int((d / "runner.pid").read_text()), signal.SIGKILL)
     os.killpg(pid, signal.SIGKILL)
     from ttp import devq
-    deadline = time.time() + 10
-    while time.time() < deadline and _devq("probe", d, "long-1").returncode != devq.RUNNER_DOWN_RC:
-        time.sleep(0.05)
+    assert _until_true(lambda: _devq("probe", d, "long-1").returncode == devq.RUNNER_DOWN_RC, _load_scaled(30))
     assert "no runner is alive" in _devq("probe", d, "long-1").stdout
     flag.touch()
     assert _devq("start", d, json.dumps(DEVQ_FAST)).returncode == 0
@@ -45859,14 +45857,17 @@ def test_check_scratch_finish_waits_for_concurrent_catalogue_operation(env, monk
             finished.set()
 
     monkeypatch.setattr(checkdirs, '_take_fd', take)
+    # finish waits for the catalogue until it is released, never for a wall-clock bound a busy host's
+    # fsync or a stalled thread could pass; the timeouts below only keep a hang from stalling the suite
+    monkeypatch.setattr(checkdirs, 'WAIT_S', 600)
     with ThreadPoolExecutor(max_workers=1) as pool:
         result = pool.submit(finish)
         try:
-            assert entered.wait(5)
+            assert entered.wait(120)
             assert not finished.wait(0.1), 'completion abandoned cleanup while the catalogue was busy'
         finally:
             catalogue.close()
-        result.result(timeout=5)
+        result.result(timeout=120)
     assert not output.exists(), 'completion must reclaim scratch without waiting for daemon recovery'
 
 
