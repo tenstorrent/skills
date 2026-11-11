@@ -5161,6 +5161,23 @@ def test_a_due_batch_reserves_the_next_push_turn_and_single_pushes_yield_it(env,
     assert push.take(s.p, "origin", "proj", 0, say=lambda m: None), "released once released"
 
 
+def test_a_reserved_turn_holds_back_only_pushes_to_the_queue_target(env, monkeypatch):
+    """The reserved turn guards only the batch's own lock: a routine `ttp push --own` or `ttp land` to
+    another branch takes its lock at once; a routine push to the target still stands back."""
+    from ttp import push, pushq
+    s = _pq(env, monkeypatch, push_batch_s=0)
+    assert pushq.target(s.p) == ("origin", "proj")
+    normal = s.p.db.add_task("a routine fix", "x", kind="code", origin="coordinator", priority=3)
+    monkeypatch.setenv("TTP_TASK", str(normal))
+    pushq.reserve_turn(s.p, time.time())
+    assert pushq.turn_reserved(s.p)
+    for remote, branch in [("origin", "ttp/t1-x"), ("other", "proj")]:
+        got = push.take(s.p, remote, branch, 0, say=lambda m: None)
+        assert got, f"{remote}/{branch} never competes with the batch"
+        got.close()
+    assert push.take(s.p, "origin", "proj", 0, say=lambda m: None) is None, "the target still yields"
+
+
 def test_a_reserved_turn_lets_a_batch_start_past_a_waiting_detached_push(env, monkeypatch):
     from ttp import locks, pushq
     s = _pq(env, monkeypatch, push_batch_s=0)

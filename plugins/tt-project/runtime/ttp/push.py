@@ -3894,11 +3894,14 @@ def _priority(p: Project) -> int | None:
         return None
 
 
-def _yields_turn(p: Project) -> bool:
-    """Whether this push stands back for the push queue's due batch (pushq.turn_reserved): not when its
-    task is urgent or a review of one, nor when anything here fails."""
+def _yields_turn(p: Project, remote: str, branch: str) -> bool:
+    """Whether this push stands back for the push queue's due batch (pushq.turn_reserved): only a push
+    to the queue's own target (the lock the batch takes), never when its task is urgent or a review of
+    one, nor when anything here fails."""
     try:
         from . import pushq, urgent
+        if pushq.target(p) != (remote, branch):
+            return False
         if (tid := os.environ.get("TTP_TASK")) and urgent.covers_urgent(p.db, p.db.task(int(tid))):
             return False
         return pushq.turn_reserved(p)
@@ -3925,7 +3928,7 @@ def take(p: Project, remote: str, branch: str, wait_s: float, poll_s: float = 1.
     who = who or (f"task #{os.environ['TTP_TASK']} (run {os.environ.get('TTP_RUN_ID') or '?'})"
                   if os.environ.get("TTP_TASK") else f"pid {os.getpid()}")
     def grab():   # a non-urgent push leaves the next turn to the push queue's due batch
-        return None if yield_turn and _yields_turn(p) else locks.try_take(paths, who, "ttp push")
+        return None if yield_turn and _yields_turn(p, remote, branch) else locks.try_take(paths, who, "ttp push")
 
     if wait_s <= 0 or not locks.queued(locks_dir, resource):
         f = grab()
