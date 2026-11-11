@@ -465,6 +465,24 @@ def test_bridge_cert_trust_prints_one_restricted_line_and_edits_nothing(tmp_path
     assert "certificate mode is off" in capsys.readouterr().err
 
 
+def test_bridge_options_may_follow_or_sit_between_the_words(tmp_path, monkeypatch):
+    # cells: options-after-words
+    from ttp import cli
+    monkeypatch.setenv("HOME", str(tmp_path))
+    seen = []
+    monkeypatch.setattr(cli, "cmd_bridge", lambda a: seen.append((a.action, a.boxes, a.make_key, a.force,
+                                                                  a.config, a.remove)))
+    for argv in (["bridge", "cert", "renew", "--make-key", "box-2"], ["bridge", "--make-key", "cert", "renew", "box-2"],
+                 ["bridge", "cert", "renew", "box-2", "--make-key"]):
+        cli.main(argv)
+    cli.main(["bridge", "cert", "--force", "renew", "--config", "c.json", "box-1", "box-2"])
+    cli.main(["bridge", "stop", "--remove", "box-1", "--config=d.json"])
+    assert seen == [("cert", ["renew", "box-2"], True, False, None, False)] * 3 + [
+        ("cert", ["renew", "box-1", "box-2"], False, True, "c.json", False),
+        ("stop", ["box-1"], False, False, "d.json", True)]
+    assert cli._bridge_argv(["web", "x", "--keep"]) == ["web", "x", "--keep"]
+
+
 def test_bridge_cert_command_signer_gets_the_request_and_overbroad_certs_are_refused(tmp_path, monkeypatch):
     # cells: signer-command
     import json

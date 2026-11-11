@@ -1278,6 +1278,22 @@ def _bench_blind_argv(argv: list[str]) -> list[str]:
     return [*argv[:2], *(f"--blind-word=:{w}" for w in argv[2:])]
 
 
+def _bridge_argv(argv: list[str]) -> list[str]:
+    """`ttp bridge cert renew --make-key BOX`: argparse takes no positional after an option once the
+    boxes list has begun, so the options go first and the words keep their order."""
+    if argv[:1] != ["bridge"]:
+        return argv
+    opts, pos, it = [], [], iter(argv[1:])
+    for w in it:
+        if w == "--config":
+            opts += [w, *(v for v in [next(it, None)] if v is not None)]
+        elif w.startswith("-") and w != "-":
+            opts.append(w)
+        else:
+            pos.append(w)
+    return [argv[0], *opts, *pos]
+
+
 def _secret_env_argv(argv: list[str]) -> list[str]:
     """`ttp secret env [alias] --secret <name>[:<key>]=<VAR> ... -- <command...>`: argparse takes no
     positional after an option and drops a '--' inside the command, so the options go first and each
@@ -14710,8 +14726,8 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("dir", help="the project's tt-project folder")
     s.set_defaults(fn=cmd_daemon)
 
-    a = ap.parse_args(_project_name_argv(sub, _say_finding_argv(_say_all_argv(_secret_value_argv(_secret_env_argv(_bench_blind_argv(
-        sys.argv[1:] if argv is None else list(argv))))))))
+    a = ap.parse_args(_project_name_argv(sub, _say_finding_argv(_say_all_argv(_secret_value_argv(_secret_env_argv(_bench_blind_argv(_bridge_argv(
+        sys.argv[1:] if argv is None else list(argv)))))))))
     dry_run_stub(a)
     try:
         _recover_setup()     # a `ttp setup` a reboot cut short: finished or rolled back before anything else
