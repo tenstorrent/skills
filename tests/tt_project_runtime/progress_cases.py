@@ -1609,23 +1609,27 @@ def test_a_stalled_probe_stall_recheck_never_holds_the_blocker_sweep(env, monkey
     p = make(env)
     d, now = dmod.Daemon(p.base), time.time()
     pidf = tmp_path / "probe.pid"
-    probe = f"echo $$ > {pidf}; sleep 60; exit 0"
+    # The pid file appears whole (mv): `echo > file` creates it empty first, which a poll could read.
+    # The probe outlasts every bound below: a sweep that waited on it would still find it ended.
+    probe = f"echo $$ > {pidf}.tmp && mv {pidf}.tmp {pidf}; sleep 600; exit 0"
     tid = _stalled(p, d, probe, deps=[_done_task(p)], now=now)
     t0 = time.monotonic()
     d.blocker_sweep()
-    assert time.monotonic() - t0 < 5, "the tick waited on the probe"
+    assert time.monotonic() - t0 < 30, "the tick waited on the probe"
     proc = d._stall_probes[probe][0]
-    assert proc.poll() is None and deferral(p.db.task(tid)).get("when") == probe
-    deadline = time.monotonic() + _load_scaled(10)
+    assert proc.poll() is None and deferral(p.db.task(tid)).get("when") == probe, "the tick waited on the probe"
+    deadline = time.monotonic() + _load_scaled(30)
     while not pidf.exists() and time.monotonic() < deadline:
         time.sleep(0.05)
+    assert pidf.exists(), "the probe never started"
     pid = int(pidf.read_text())
     monkeypatch.setattr(dmod, "PROBE_TIMEOUT_S", 0)
     d._sweep_checked = 0
     t0 = time.monotonic()
     d.blocker_sweep()   # past its timeout: killed, a not yet
-    assert time.monotonic() - t0 < 10
-    assert proc.poll() is not None and not _alive(pid), "the stalled probe outlived its timeout"
+    assert time.monotonic() - t0 < 30
+    # Killed, not ended by itself; a loaded host may reap it after probespawn.KILL_WAIT_S.
+    assert proc.wait(_load_scaled(30)) == -signal.SIGKILL and not _alive(pid), "the stalled probe outlived its timeout"
     assert p.db.kv(sweep.PROBE_STALL_KEY)[str(tid)]["disposition"] == "released-stale"
     assert not deferral(p.db.task(tid)).get("when")
 
