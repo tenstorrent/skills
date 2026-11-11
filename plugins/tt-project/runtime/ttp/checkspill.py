@@ -148,6 +148,7 @@ FAIL_VERDICT_HOSTS = 2   # on a workstation (remote_only), checks that failed on
 HANG_VERDICT_HOSTS = 2   # one check command stopped by its silence limit on this many spill hosts hangs: no rerun
 HANG = "hang."   # spill_off_add's mark of a host where a check command hung (hang_mark): kept off, as a failure
 SLOW = "slow"   # spill_off_add's mark of a host whose tree copy timed out (remotecheck.COPY_TIMEOUT): kept off at once
+BUSY = "busy"   # spill_off_add's mark of a host whose spill wrapper declined the run (a busy host): kept off at once
 WRAP_ENV = "TTP_CHECKS_WRAP_REFUSED"   # this run's spill hosts whose wrapper refused it, each with why (wrap_refused)
 WRAP_SAME_HOSTS = 3   # this many spill hosts (or every one listed) refusing a run for one reason: the wrapper's setting
 ENV_FAULT_HOSTS = 2   # the checks failed at import this often on spill hosts: one fault of the spill env config
@@ -162,6 +163,7 @@ DEVICE_SUFFIX = "-device"
 DEVICE_WHY = "a device job runs there: "   # how a device-busy reason starts (device_busy, _device_holders)
 BROKER_TIMEOUT_S = 10.0   # one read of a broker's status; past it the device locks alone decide
 SPILL_MARK = {"checks_spill": True}   # in the label of a pool check run's hold of a host's lock (_hold)
+BUSY_COOL_S = 300   # a host whose spill wrapper declined a run as busy (busy_add) is skipped this long
 DOWN_RETRY_S = 1800   # a host marked down (down_add) takes one run again after this, which marks it again or clears it
 SKIP_SHOW_S = 900   # a host skipped for a device job shows in `ttp status` and the web app this long after
 _JOB_LISTS = ("jobs", "running_jobs", "active_jobs", "running")   # broker status: job rows (a list) or a count
@@ -1372,6 +1374,34 @@ def down_why(host: str, now: float | None = None, move: bool = True) -> str:
             f"one run tries it again {max(1, int((DOWN_RETRY_S - (now - at)) // 60))} min from now")
 
 
+def busy_add(host: str, why: str, now: float | None = None) -> None:
+    """Mark `host` busy for every project on this machine: its spill wrapper declined a run (its own workload,
+    remotecheck.wrap_busy), so pick skips it (busy_why) for BUSY_COOL_S. Neither the host's fault nor the change's."""
+    from . import checkcap, project
+    f = checkcap.slot_dir() / "spill-busy" / _down_file(host).name
+    try:
+        f.parent.mkdir(parents=True, exist_ok=True)
+        project.durable_write(f, json.dumps({"host": host, "why": why[:300], "at": time.time() if now is None else now}),
+                              sync=False)
+    except OSError:
+        pass
+
+
+def busy_why(host: str, now: float | None = None) -> str:
+    """Why pick skips `host` as busy (busy_add, within BUSY_COOL_S), or ""."""
+    from . import checkcap
+    now = time.time() if now is None else now
+    try:
+        r = json.loads((checkcap.slot_dir() / "spill-busy" / _down_file(host).name).read_text() or "{}")
+        at = float(r.get("at") or 0)
+    except (OSError, ValueError, TypeError, AttributeError):
+        return ""
+    if now - at >= BUSY_COOL_S:
+        return ""
+    return (f"busy: its spill wrapper declined a run {max(0, int(now - at))} s ago ({r.get('why') or 'its own workload'}); "
+            f"tried again {max(1, int(BUSY_COOL_S - (now - at)))} s from now")
+
+
 def skip_lines(now: float | None = None) -> list[str]:
     """`ttp status` and web app lines: each spill host the pool skipped for a device job or a pre-run hook in the last
     SKIP_SHOW_S, one line each, with the reason."""
@@ -1609,7 +1639,7 @@ def all_off(off: str) -> bool:
 
 
 def spill_off_add(off: str, host: str, fault: bool, env_cfg: dict | None = None, cfg: dict | None = None,
-                  slow: bool = False, hang: str = "") -> str:
+                  slow: bool = False, hang: str = "", busy: bool = False) -> str:
     """OFF_ENV's value after the checks did not pass on spill host `host`: `fault` when the host's own fault
     ended them (exit 75), else they failed or timed out there. `env_cfg`: they failed at import for want of a
     package (push.env_problem), a fault of the spill env config `env_cfg` (env_off), never of the host.
@@ -1617,9 +1647,10 @@ def spill_off_add(off: str, host: str, fault: bool, env_cfg: dict | None = None,
     `slow`: the copy of the tree there timed out (remotecheck.COPY_TIMEOUT), a fault kept off at once (kept_off):
     another full copy timeout on the same link would only add to the wait; the rerun goes elsewhere or here.
     `hang`: check command `hang` was stopped there by its silence limit (checkwall.Silent): marked per command
-    (hang_mark), so the same command hanging on HANG_VERDICT_HOSTS hosts is the change's (hang_hosts)."""
+    (hang_mark), so the same command hanging on HANG_VERDICT_HOSTS hosts is the change's (hang_hosts).
+    `busy`: its spill wrapper declined the run as busy (remotecheck.wrap_busy): kept off at once, never a fault."""
     mark = (f"env.{_env_key(env_cfg)}.{int(time.time())}" if env_cfg is not None
-            else SLOW if slow else hang_mark(hang) if hang else f"fault.{_env_key(cfg) if cfg is not None else ''}.{int(time.time())}" if fault else "fail")
+            else BUSY if busy else SLOW if slow else hang_mark(hang) if hang else f"fault.{_env_key(cfg) if cfg is not None else ''}.{int(time.time())}" if fault else "fail")
     return ",".join([*(e for e in off.split(",") if e and e != "1"), f"{host}:{mark}"])
 
 
@@ -1663,12 +1694,13 @@ def kept_off(off: str, cfg: dict | None = None, now: float | None = None) -> set
     """The spill hosts OFF_ENV's value `off` keeps a rerun off: each its checks failed on, and each whose own
     fault ended them HOST_FAULT_TRIES times under the checks config `cfg` has now (None: any) within the last
     FAULT_RETRY_S (once that config changes, a fixed checks.spill_wrap_cmd, or the time passes, it is tried
-    again), and each its tree copy timed out on once (SLOW). An import failure keeps no host off (env_off)."""
+    again), and each its tree copy timed out on once (SLOW) or whose wrapper declined the run as busy (BUSY). An
+    import failure keeps no host off (env_off)."""
     now = time.time() if now is None else now
     key = None if cfg is None else _env_key(cfg)
     seen = [e.rpartition(":") for e in off.split(",") if e and e != "1"]
     return {h for h, _, why in seen if not why.startswith("env.") and (
-            why in ("fail", SLOW) or why.startswith(HANG) or sum(1 for h2, _, w2 in seen if h2 == h and _fault_counts(w2, key, now)) >= HOST_FAULT_TRIES)}
+            why in ("fail", SLOW, BUSY) or why.startswith(HANG) or sum(1 for h2, _, w2 in seen if h2 == h and _fault_counts(w2, key, now)) >= HOST_FAULT_TRIES)}
 
 
 def fails(state: Path, head: str, key: str) -> list[dict]:
@@ -1832,7 +1864,7 @@ def pick(p, cfg: dict, tell, what: str = "", off: str = "", why_here: str = "") 
         beside = beside_device(cfg, alias)   # the project lets its checks run there beside a device job
         why = allowed(p, cfg, alias)
         usable = not why   # past `allowed`, a skip is the host being busy unless it is out of reach
-        why, dev = why or backed_off(host, now) or lock_busy(p, cfg, alias), ""
+        why, dev = why or backed_off(host, now) or busy_why(host, now) or lock_busy(p, cfg, alias), ""
         if not why and beside:
             dev = device_busy(p, cfg, host)
             _note_skip(host, "", p.name, own_only=True)   # this project's earlier skip no longer holds

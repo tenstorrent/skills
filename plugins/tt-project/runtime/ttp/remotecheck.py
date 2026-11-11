@@ -271,6 +271,16 @@ def wrap_fault(text: str) -> tuple[str, str]:
     return found
 
 
+def wrap_busy(text: str) -> tuple[str, str]:
+    """(host, reason) when the last spill wrapper fault in a checks log's `text` (wrap_fault) is the wrapper
+    declining the run (WRAP_REFUSED_ENV: a busy host, its own workload), else ("", ""): a missing wrapper is
+    none. The reason is the one the wrapper gave, or "its own workload"."""
+    host, why = wrap_fault(text)
+    if " refused the run there " not in why:
+        return "", ""
+    return host, why.partition(WRAP_SETTING)[2].removeprefix(":").strip() or "its own workload"
+
+
 def overloaded(host: str) -> str:
     """Why `host` is overloaded now (a fresh remoteload reading: demand at or above remoteload.factor() x its
     cores), or "": not, unreadable, or the load guard off."""

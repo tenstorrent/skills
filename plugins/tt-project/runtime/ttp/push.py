@@ -29,6 +29,7 @@ listed files one patch version above the tip's and adds a changeset, in one comm
 bump happens under the lock, so parallel pushes never race for one version."""
 from __future__ import annotations
 
+import contextvars
 import json
 import hashlib
 import math
@@ -1052,6 +1053,10 @@ def project_lane(proj: Project | None, say: Callable[[str], None], repo=None, wh
     cfg = proj.config() if proj else {}
     if not proj or os.environ.get(checkcap.HELD_ENV) or not (fixed := checklane.fixed_cap(cfg)):
         return None
+    if _LANDING_FIRST.get():
+        say(f"a landing check sent back from the spill hosts runs here at once, ahead of the project's other "
+            f"full checks (checks.test_project_max {fixed[0]}): landing checks go first")
+        return None
     lane = testslots.remote_lane(proj.name, checklane.project_cap(cfg), say, testslots.push_load_wait_s(cfg),
                                  who=who or checkcap.label(proj.name, "ttp push"), priority=checkcap.task_rank(proj)[0],
                                  repo=testslots.repo_key(repo) if repo else "", what="push checks",
@@ -1186,23 +1191,66 @@ def spill_slot(cmds: list, head: str, say: Callable[[str], None], proj: Project 
     return slot, out
 
 
+# Set while a landing check a busy spill host sent back takes its slot here: project_lane lets it go first.
+_LANDING_FIRST: contextvars.ContextVar[bool] = contextvars.ContextVar("ttp_landing_first", default=False)
+
+
 def _run_or_here(cmd: Any, repo: Path, env: dict, say: Callable[[str], None], seen: dict,
                  here: Callable[[], Any]) -> tuple[Any, int]:
     """_run_one, and a check spill_slot sent to a spill host that could not run it (BUSY: ssh, the host or
     its pool, never the change) once more here, in the slot `here()` takes: (the check that ran last, its
-    exit code). A spill host's fault never holds the push."""
+    exit code). A spill host's fault never holds the push. One whose spill wrapper declined the run (a busy
+    host, _run_one's wrap_busy) goes to the next spill host with room first, and comes here only when none
+    can take it, ahead of the project's other full checks (_LANDING_FIRST)."""
     rc = _run_one(cmd, repo, env, say, seen)
     if rc != BUSY or (was := getattr(cmd, "was", None)) is None:
         return cmd, rc
-    say(f"spill host {remote_host(cmd)} could not run {was}: running it here")
+    off, busy = "", []
+    while getattr(cmd, "wrap_busy", ""):   # its spill wrapper declined the run: the next spill host with room
+        busy.append(host := remote_host(cmd))
+        off = checkspill.spill_off_add(off, host, False, busy=True)
+        claim, nxt = _respill(was, off, say, f"spill host {host} is busy")
+        if claim is None:
+            break
+        say(f"spill host {host} is busy: running {was} on spill host {claim.host}")
+        seen.clear()
+        try:
+            rc = _run_one(nxt, repo, env, say, seen)
+        finally:
+            claim.close()
+        if rc != BUSY:
+            return nxt, rc
+        cmd = nxt
+    say(f"no spill host could take {was} (busy: {', '.join(busy)}): running it here" if getattr(cmd, "wrap_busy", "")
+        else f"spill host {remote_host(cmd)} could not run {was}: running it here")
     seen.clear()
+    token = _LANDING_FIRST.set(True)   # a landing check sent back here never queues behind other full checks
     try:
         slot = here()
     except checkcap.Unavailable as e:
         say(f"{e}; not pushing")
         return was, CHECKS_FAILED
+    finally:
+        _LANDING_FIRST.reset(token)
     with slot:
         return was, _run_one(was, repo, {**env, **slot.env()}, say, seen)
+
+
+def _respill(was: Any, off: str, say: Callable[[str], None], why_here: str) -> tuple[Any, Any]:
+    """Check `was` sent to the next spill host checkspill.spill_run picks with the hosts in `off` kept off:
+    (its claim, the check sent there), else (None, None): no spill host can take it, or trying them failed."""
+    if not (base := os.environ.get("TTP_PROJECT")) or not (proj := Project(base)).exists():
+        return None, None
+    try:
+        claim, got = checkspill.spill_run(proj, proj.config(), [was], say, "push checks", off=off, why_here=why_here)
+    except Exception as e:   # noqa: BLE001
+        say(f"spill hosts not tried again ({e})")
+        return None, None
+    if claim is not None and got and getattr(got[0], "spill_host", "") == claim.host:
+        return claim, got[0]
+    if claim is not None:
+        claim.close()
+    return None, None
 
 
 def priority_key(repo: Path, remote: str, branch: str) -> str:
@@ -4948,13 +4996,23 @@ def _run_one(cmd: Any, repo: Path, env: dict, say: Callable[[str], None], seen: 
         say(f"{workerloss.line(loss, str(cmd))}; not pushing. Hand off `waiting`; retry_when: "
             f"test \"$(date +%s)\" -ge {int(time.time()) + WORKER_LOSS_S}")
         return BUSY
+    spilled = getattr(cmd, "was", None) is not None   # _run_or_here runs it on another spill host or here
+    if (spilled and rc == remotecheck.FAULT_RC and (host := remote_host(cmd))
+            and (busy := remotecheck.wrap_busy(collect.text())[1])):
+        # Its spill wrapper declined the run (a busy host): neither the host's fault nor the change's. No
+        # environment fault or observation; that host cools off (checkspill.busy_add) and the check moves on.
+        checkspill.busy_add(host, busy)
+        cmd.wrap_busy = busy
+        say(f"spill host {host} is busy (its spill wrapper declined the run: {busy}); not a fault")
+        return BUSY
     if fault := remote_fault(cmd, rc, repo, collect.text()):
         p = None
         if base := os.environ.get("TTP_PROJECT"):
             p = Project(base)
             p = p if p.exists() else None
         envfault.record(p, fault, os.environ.get("TTP_TASK"))
-        say(f"{envfault.line(fault)}; not pushing. Hand off `waiting`; retry_when: {envfault.retry_when(p, fault)}")
+        say(envfault.line(fault) if spilled else
+            f"{envfault.line(fault)}; not pushing. Hand off `waiting`; retry_when: {envfault.retry_when(p, fault)}")
         return BUSY
     if rc == BUSY:   # its own "busy" (a lock, a test pool or a gate rerun that admitted it nowhere): not the change
         say(f"busy, not failed: {cmd}{where(cmd)} exited 75 (no free slot, lock or pool); not pushing. Hand off "

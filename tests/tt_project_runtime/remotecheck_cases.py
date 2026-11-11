@@ -4360,6 +4360,97 @@ def test_a_direct_push_spills_its_checks_first_as_ttp_checks_does(env, tmp_path,
     assert checkspill.holders(p.name) == [], "the claim ends with the push"
 
 
+def _busy_push(env, tmp_path, monkeypatch, always: bool):
+    """A _spill_push project with two spill hosts whose push check runs under a repo wrapper that declines the
+    run (exit 75 and TTP_WRAP_REFUSED: a busy host) once, or `always`: (p, repo, checks, where-log)."""
+    from ttp import machines, push
+    log, mark = tmp_path / "where.log", tmp_path / "refused-once"
+    p, repo = _spill_push(env, tmp_path, monkeypatch, f"pwd >> {log}")
+    machines.add("check-host-b")
+    p.set_config("delivery.checks_spill_hosts", ["check-host-a", "check-host-b"])
+    (repo / "refuse.sh").write_text("#!/bin/sh\n" + ("" if always else f'test -e {mark} && exec "$@"\ntouch {mark}\n')
+                                    + 'echo "spill-wrap: busy: its own soak" > "$TTP_WRAP_REFUSED"\nexit 75\n')
+    (repo / "refuse.sh").chmod(0o755)
+    _commit(repo, "refuse.sh", (repo / "refuse.sh").read_text())
+    checks = push.check_list([{"run": f"pwd >> {log}", "host": "local", "spill": True, "spill_wrap_cmd": "./refuse.sh"}])
+    return p, repo, checks, log
+
+
+def test_a_busy_spill_host_moves_a_push_check_to_the_next_one_with_no_env_fault(env, tmp_path, monkeypatch):
+    """#8418: a spill wrapper declining a push check's run (a busy host) is neither the host's fault nor the
+    change's: no env:check-host fault and no hand-off to wait, that host cools off (checkspill.busy_why) and the
+    check runs on the next spill host, whose pass lands the change."""
+    from ttp import checkspill, envfault, push
+    p, repo, checks, log = _busy_push(env, tmp_path, monkeypatch, always=False)
+    said: list[str] = []
+    assert push.push(repo, "origin", "proj", checks, 1, say=said.append) == 0, said
+    assert _git_out(repo, "rev-parse", "origin/proj") == _git_out(repo, "rev-parse", "HEAD")
+    where = log.read_text().splitlines()
+    assert len(where) == 1 and "/ttp-check." in where[0], (where, said)   # ran on the second spill host
+    text = "\n".join(said)
+    first = next(h for h in ("check-host-a", "check-host-b") if f"spill host {h} is busy" in text)
+    assert "its own soak" in text and "not pushing" not in text and "running it here" not in text, text
+    assert envfault.open_faults(p) == {}, envfault.open_faults(p)
+    assert checkspill.busy_why(first) and checkspill.holders(p.name) == []
+
+
+def test_every_spill_host_busy_runs_the_push_check_here_ahead_of_the_projects_full_checks(env, tmp_path, monkeypatch):
+    """#8418: with every spill host's wrapper declining the run, the push check runs here once, and never waits
+    behind the project's other full checks (a fixed checks.test_project_max held by another run): landing
+    checks go first. One line says so; no env fault."""
+    from ttp import envfault, push
+    p, repo, checks, log = _busy_push(env, tmp_path, monkeypatch, always=True)
+    monkeypatch.setenv("TTP_TEST_PROJECT_MAX", "1")
+    monkeypatch.setenv("TTP_CHECKS_PUSH_LOAD_WAIT_S", "60")
+    other = push.check_slot("abc", lambda s: None, priority="other-key", proj=p, repo=repo)   # another full suite
+    said: list[str] = []
+    try:
+        t0 = time.time()
+        assert push.push(repo, "origin", "proj", checks, 1, say=said.append) == 0, said
+        took = time.time() - t0
+    finally:
+        other.close()
+    text = "\n".join(said)
+    where = log.read_text().splitlines()
+    assert where and "/ttp-check." not in where[-1], (where, text)   # ran here
+    assert "no spill host could take" in text and "landing checks go first" in text, text
+    assert "stayed full" not in text and "not pushing" not in text and took < 45, (took, text)
+    assert envfault.open_faults(p) == {}
+
+
+def test_a_real_spill_host_fault_on_a_push_check_still_records_the_env_fault(env, tmp_path, monkeypatch):
+    """#8418: a real spill host fault (ssh drops) keeps the env-fault path: the fault is recorded, the check
+    runs here, and the push says what happens in one line (no "not pushing" before running it anyway)."""
+    from ttp import envfault, push
+    log = tmp_path / "where.log"
+    p, repo = _spill_push(env, tmp_path, monkeypatch, f"pwd >> {log}")
+    monkeypatch.setenv("FAKE_SSH_DROP", str(log))
+    said: list[str] = []
+    assert push.push(repo, "origin", "proj", push.check_list([f"pwd >> {log}"]), 1, say=said.append) == 0, said
+    text = "\n".join(said)
+    assert any("check-host-a" in k for k in envfault.open_faults(p)), envfault.open_faults(p)
+    assert "running it here" in text and "not pushing" not in text and "is busy" not in text, text
+
+
+def test_a_busy_spill_host_cools_off_briefly_and_is_kept_off_for_the_run():
+    """#8418: busy_add marks a host whose wrapper declined a run for checkspill.BUSY_COOL_S; spill_off_add
+    with busy keeps it off the rest of the run at once. remotecheck.wrap_busy reads only a refusal, never a
+    missing wrapper."""
+    from ttp import checkspill, remotecheck
+    checkspill.busy_add("check-host-a", "its own soak", now=1000.0)
+    assert "its own soak" in checkspill.busy_why("check-host-a", now=1010.0)
+    assert checkspill.busy_why("check-host-a", now=1000.0 + checkspill.BUSY_COOL_S + 1) == ""
+    assert checkspill.busy_why("check-host-b", now=1010.0) == ""
+    off = checkspill.spill_off_add("", "check-host-a", False, busy=True)
+    assert "check-host-a" in checkspill.kept_off(off, {})
+    refused = (f"environment fault {remotecheck.SIG}h1: the spill wrapper 'sh' refused the run there "
+               f"{remotecheck.WRAP_SETTING}: spill-wrap: busy: x (exit 75 and {remotecheck.WRAP_REFUSED_ENV}), so it")
+    missing = (f"environment fault {remotecheck.SIG}h1: the spill wrapper 'sh' is missing or not executable there "
+               f"{remotecheck.WRAP_SETTING}, so the check did not run")
+    assert remotecheck.wrap_busy(refused) == ("h1", "spill-wrap: busy: x")
+    assert remotecheck.wrap_busy(missing) == ("", "")
+
+
 def test_push_own_spills_its_checks_first_too(env, tmp_path, monkeypatch):
     """`ttp push --own` (publish) takes the same spill-first route as a direct push."""
     from ttp import checkspill, push
