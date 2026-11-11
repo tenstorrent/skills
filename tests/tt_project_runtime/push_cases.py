@@ -16881,10 +16881,12 @@ def test_a_push_batch_reruns_each_failing_test_not_yet_judged_at_that_head(env, 
     """Cell flaky_rerun_all: _FLAKY_ID fails in every full check and passes when rerun; entry 2 breaks
     _NEW_ID; entry 1 edits _FLAKY_ID's file, so its quarantine does not excuse it in this batch. At each
     head every failing test not yet judged there is rerun, so prefix 1 passes once its _FLAKY_ID is rerun
-    (before, one test rerun anywhere in the batch stopped every later rerun). The flaky test is
-    quarantined; a later batch that does not touch it is excused at once, with no rerun."""
+    (before, one test rerun anywhere in the batch stopped every later rerun). Prefix 1 runs in full only
+    the second check, which never ran on the failing full head (91eea3917: no second full run of a check
+    once the search knows its failing tests). The flaky test is quarantined; a later batch that does not
+    touch it is excused at once, with no rerun."""
     from ttp import gatejudge
-    p, repo, origin, other = _push_setup(env, monkeypatch, [_FLAKY_CHECK])
+    p, repo, origin, other = _push_setup(env, monkeypatch, [_FLAKY_CHECK, _SECOND_CHECK])
     tip = _git_out(origin, "rev-parse", "proj")
     calls = _ids_stub(monkeypatch, tip, lambda tree, sel: ({_FLAKY_ID} if sel is None else set())
                       | ({_NEW_ID} if (tree / "e2.txt").exists() else set()))
@@ -16901,7 +16903,7 @@ def test_a_push_batch_reruns_each_failing_test_not_yet_judged_at_that_head(env, 
     calls.clear()
     rc, m2 = _run_batch(p, _batch_marker(p, [_entry(repo, "e3", {"e3.txt": "3\n"})], bid="b2"), monkeypatch)
     assert m2["outcome"] == "pushed" and _statuses(m2) == ["pushed"], m2
-    assert [c[1] for c in calls] == [None], "a quarantined test the batch does not touch is not rerun"
+    assert [c[1] for c in calls] == [None, None], "a quarantined test the batch does not touch is not rerun"
 
 
 def test_a_one_entry_push_batch_blames_its_new_failing_test_without_a_full_tip_check(env, monkeypatch):
