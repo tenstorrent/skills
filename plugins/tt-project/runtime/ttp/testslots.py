@@ -1655,7 +1655,8 @@ def suite_hold(project_name: str | None, tell: Callable[[str], None] | None = No
                cap_note: str = "", worktree: str = "", headroom: Callable[[], bool] | None = None,
                age: float | None = None, pending: bool = False, check: str = "",
                repo_name: str = "", name: str = "", startable: Callable[[], bool] | None = None,
-               running: bool = False, landing: bool | str = False, slots_from: str = "") -> Grant | None:
+               running: bool = False, landing: bool | str = False, slots_from: str = "",
+               cap_fixed: bool = False) -> Grant | None:
     """Hold one of project `project_name`'s `slots` checks lanes in repository `repo` (repo_key) for its
     full checks (above), waiting while its other runs there hold them all or a more urgent waiter is ahead
     (suite_order); Grant(0) holding one, Grant() with no project or nested in a check, None once `wait_s`
@@ -1681,7 +1682,9 @@ def suite_hold(project_name: str | None, tell: Callable[[str], None] | None = No
     the wait line. A priority-1 waiter (`priority` <= 1) whose lanes are held
     only by less urgent runs takes an overflow lane beside them while `headroom()` says the host has room,
     never beside a holder in the same `worktree` (one suite per worktree); with the cap full of less urgent
-    runs it takes one past the cap ("over_cap"), one such lane per project at a time (over_cap_room). `age`: the aging step
+    runs it takes one past the cap ("over_cap"), one such lane per project at a time (over_cap_room), unless
+    `cap_fixed` (checklane.fixed_cap: the user set checks.test_project_max to a number): a fixed cap holds every
+    task's run, urgent ones too, which wait for a lane under it. `age`: the aging step
     (age_s(), checks.priority_age_s; default the account's or SUITE_AGE_S). `pending`: the run takes its
     test slots after the lane, so the lane counts against `cap` only once slots_granted() marks it.
     `name`: the lane's name for status (the repository's directory name, or with `lock` the wrapper
@@ -1696,7 +1699,7 @@ def suite_hold(project_name: str | None, tell: Callable[[str], None] | None = No
     waits for its host grants leaves its place to the next waiter, which queues in those gates beside it
     (most urgent first there), and claim_running checks the bound when a run gets its grants. There an
     urgent or priority-1 waiter (checkcap.is_urgent) takes a lane at once, past its place, the lanes' count
-    and the cap: it never waits behind holders that only queue for a host-wide slot, and the host queue,
+    and a sized cap (a fixed one: claim_running holds it to it): it never waits behind holders that only queue for a host-wide slot, and the host queue,
     where it preempts routine runs, and claim_running decide when it runs."""
     from . import checklane
     age = age_s() if age is None else age
@@ -1795,13 +1798,13 @@ def suite_hold(project_name: str | None, tell: Callable[[str], None] | None = No
                         if cap_turn(project_name, cap, ticket, slots, age=age):
                             f = locks.try_take(lanes, label, what, extra=fields)
                         else:
-                            over = urgent and over_cap_room(project_name, cap)
+                            over = urgent and not cap_fixed and over_cap_room(project_name, cap)
                     elif cheaper or urgent:
                         if cap_turn(project_name, cap, ticket, slots, age=age):
                             f = locks.try_take(extra_lanes, label, what,
                                                extra={**fields, "overflow": True, **({"urgent": True} if urgent else {})})
                         else:
-                            over = urgent and over_cap_room(project_name, cap)
+                            over = urgent and not cap_fixed and over_cap_room(project_name, cap)
                     if over:   # one priority-1 run at a time past the project's full cap
                         f = locks.try_take(extra_lanes, label, what,
                                            extra={**fields, "overflow": True, "over_cap": True, "urgent": True})

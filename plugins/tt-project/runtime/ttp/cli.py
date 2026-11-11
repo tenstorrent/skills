@@ -6020,7 +6020,8 @@ def _checks_slot_take(p, run_dir: Path, out, head: str, tell, waiting, limit: fl
     ends the wait with all it held let go. `moved()` (_HeadMoved), asked with the cancel request, names why
     the run is dropped once its task replaced the head it waits for: the wait ends as a cancel does. With
     `urgent` an urgent run that would wait for the host-wide slot takes a reserved urgent one (checkcap.acquire),
-    with its reserved test lane and past its project's cap and repository's lanes of running checks."""
+    with its reserved test lane and past its project's sized cap and repository's lanes of running checks;
+    a fixed project cap (checklane.fixed_cap) still holds it."""
     from . import checkcap, checkjoin, checklane, cleantree, push, testslots
     t0 = time.time()
 
@@ -6112,12 +6113,15 @@ def _checks_slot_take(p, run_dir: Path, out, head: str, tell, waiting, limit: fl
         # The repository's lanes are read again at every try, checks.slots too (a raised one takes a waiting run
         # at its next poll): unset, they follow the host's load (checklane.capacity).
         lanes_now = lambda held: checklane.slots(p.config() if p else cfg, held)   # noqa: E731
+        # A fixed checks.test_project_max holds every run of the project, urgent ones too (checklane.fixed_cap).
+        fixed = checklane.fixed_cap(cfg) is not None
         # Its repository's lanes bound running suites only: while it waits for its grants below, the next
         # waiter takes a lane and queues in those gates too (most urgent first); claim_running keeps the bound.
         if suite is None and (suite := hold(repo, lanes_now, lock=lock,
                                             cap=checklane.project_cap(cfg), cap_note=checklane.cap_note(cfg),
                                             worktree=top, headroom=checklane.headroom, pending=True, running=True,
-                                            landing=_landing_check(p), startable=pool_ok)) is None:
+                                            landing=_landing_check(p), cap_fixed=fixed,
+                                            startable=pool_ok)) is None:
             lane_waited(False)
             if tree is not None:
                 tree.close()
@@ -6173,8 +6177,8 @@ def _checks_slot_take(p, run_dir: Path, out, head: str, tell, waiting, limit: fl
                 return None
             # Only now does its lane count against the project's cap and its repository's lanes, if both
             # have room; else its grants go back and it waits for a running suite to end, then queues again.
-            if slot.urgent and testslots.claim_running(suite, p.name if p else None, lambda n: n + 1, 0):
-                break   # its reserved slot is beyond every cap: no bound of running checks holds it
+            if slot.urgent and not fixed and testslots.claim_running(suite, p.name if p else None, lambda n: n + 1, 0):
+                break   # its reserved slot is beyond every sized cap: no bound of running checks holds it
             if testslots.claim_running(suite, p.name if p else None, lanes_now, checklane.project_cap(cfg)):
                 break
             slot.close()

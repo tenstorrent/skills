@@ -6416,6 +6416,117 @@ def test_checks_slot_take_passes_its_landing_kind_to_the_lane_hold(env, monkeypa
         assert got is None and seen and seen[-1].get("landing") == kind, (kind, seen)
 
 
+def test_a_fixed_project_cap_holds_urgent_and_priority_1_checks_runs_too(env, monkeypatch, tmp_path):
+    # Upstream note 7824b6557438f9ff (a): a fixed checks.test_project_max holds. A p1 run takes no over-cap
+    # lane past a fixed cap full of routine runs, and an urgent run granted a reserved urgent slot still waits
+    # for room under the fixed cap (claim_running), never running beside the cap's holder; a sized cap keeps
+    # both shortcuts.
+    import io
+    import types
+    from ttp import checkcap, cli, testslots
+    _lane_env(monkeypatch)
+    monkeypatch.delenv("TTP_TEST_PROJECT_MAX", raising=False)
+    kw = dict(slots=1, cap=1, priority=1, wait_s=0, worktree="/w/c", headroom=lambda: True)
+    routine = testslots.suite_hold("pa", repo=_REPO_B, slots=1, cap=1, priority=2, worktree="/w/b", wait_s=0,
+                                   pending=True, running=True)
+    try:
+        assert routine and testslots.claim_running(routine, "pa", lambda n: 12, 1)
+        assert testslots.suite_hold("pa", repo=_LANE_REPO, cap_fixed=True, **kw) is None, \
+            "a fixed cap full of routine runs: the p1 run waits"
+        p1 = testslots.suite_hold("pa", repo=_LANE_REPO, **kw)
+        assert p1 and "-x." in p1.files[0].name, "a sized cap: the p1 run still takes its over-cap lane"
+        p1.close()
+
+        closed = []
+
+        class Slot:
+            urgent, served, tests, f = True, False, None, None
+
+            def close(self):
+                closed.append(True)
+
+        monkeypatch.setattr(checkcap, "acquire", lambda *a, **k: Slot())
+        monkeypatch.setattr(checkcap, "urgent_key", lambda s: "urgent:test")
+        monkeypatch.setattr(testslots, "acquire", lambda *a, **k: testslots.Grant(0, []))
+        cfg = {"checks": {"test_project_max": 1}}
+        proj = types.SimpleNamespace(name="pa", state=tmp_path / "state", config=lambda: cfg)
+        take = lambda c: cli._checks_slot_take(   # noqa: E731
+            proj, tmp_path / "run", io.StringIO(), "a" * 40, None, lambda *a: None, 0.5, time.time(), "", None, 0,
+            [], c, _LANE_REPO, ["true"], "checks", urgent=True)
+        assert take(cfg) is None and closed, "an urgent run waits for room under a fixed cap, its slot handed back"
+        assert len(testslots.project_held("pa")) == 1, "only the cap's holder runs"
+        cfg = {}
+        got = take(cfg)
+        try:
+            assert got is not None and got.urgent, "a sized cap: the reserved urgent slot runs past it"
+        finally:
+            got and got.suite.close()
+    finally:
+        routine.close()
+
+
+def test_a_landing_check_is_never_held_by_lanes_whose_runs_wait_for_their_grants(env, monkeypatch, tmp_path):
+    # Upstream note 7824b6557438f9ff (b): push checks (a push batch's `ttp checks` under a landing mark) take
+    # their lane through _checks_slot_take, which asks suite_hold to count only running suites (pending and
+    # running): lanes held by runs still waiting for their host grants never block it, even under a fixed cap.
+    import types
+    from ttp import cli, testslots
+    _lane_env(monkeypatch)
+    seen = []
+    real = testslots.suite_hold
+    monkeypatch.setattr(testslots, "suite_hold", lambda *a, **kw: seen.append(kw) or None)
+    proj = types.SimpleNamespace(name="pa", state=tmp_path / "state")
+    monkeypatch.setattr(cli, "_landing_check", lambda p: "mark")
+    cli._checks_slot_take(proj, tmp_path / "run", None, "a" * 40, None, lambda *a: None, 0.0, time.time(), "",
+                          None, 2, None, {"checks": {"test_project_max": 1}}, _LANE_REPO, ["true"], "checks")
+    assert seen and seen[-1].get("pending") is True and seen[-1].get("running") is True
+    assert seen[-1].get("cap") == 1 and seen[-1].get("cap_fixed") is True, seen[-1]
+    monkeypatch.setattr(testslots, "suite_hold", real)
+    queued = [real("pa", repo=r, slots=1, cap=1, priority=2, wait_s=0, pending=True, running=True,
+                   worktree=f"/w/{r}") for r in (_REPO_B, "c0ffee000000")]
+    try:
+        assert all(g and g.files for g in queued) and not testslots.project_held("pa"), "none running yet"
+        mark = real("pa", repo=_LANE_REPO, slots=1, cap=1, wait_s=0, pending=True, running=True,
+                    landing="mark", cap_fixed=True)
+        assert mark and "-x." not in mark.files[0].name, "its own lane at once: queued holders do not count"
+        assert testslots.claim_running(mark, "pa", lambda n: 1, 1), "and it runs once granted"
+        mark.close()
+    finally:
+        for g in queued:
+            g and g.close()
+
+
+def test_obligation_owners_rank_by_their_earliest_due(env, monkeypatch):
+    # Upstream note 7824b6557438f9ff (c): every owner used to rank OBLIGATION_PRIORITY whatever its due. An
+    # owner due sooner (obligations.owner_due) ranks before one due later, all before every task priority, and
+    # its queue ticket carries the rank, so the checks queue serves the nearest due first.
+    from ttp import checkcap, locks
+    from ttp import obligations as ob
+    p = make(env)
+    now = time.time()
+    tasks = {k: p.db.add_task(k, "s", kind="code", tier="light", origin="coordinator", priority=1)
+             for k in ("none", "day", "soon", "late")}
+    for k, due in (("day", now + 20 * 3600), ("soon", now + 1800), ("late", now - 60)):
+        ob.add(p, f"report {k}", [tasks[k]], milestones=[{"key": "m1", "due": due, "evidence_required": "a file"}])
+    ob.add(p, "report none", [tasks["none"]])
+    rank = {}
+    for k, tid in tasks.items():
+        monkeypatch.setenv("TTP_TASK", str(tid))
+        rank[k], owns = checkcap.task_rank(p)
+        assert owns, k
+    assert rank["none"] == checkcap.OBLIGATION_PRIORITY
+    assert rank["late"] <= rank["soon"] < rank["day"] < rank["none"] < 1, rank
+    assert checkcap.owed_rank(now + 3 * 86400, now) == checkcap.OBLIGATION_PRIORITY, "a far due: the plain boost"
+    tickets = [locks.enqueue(checkcap.slot_dir(), checkcap.RESOURCE, k, now + i, priority=rank[k])
+               for i, k in enumerate(("none", "day", "soon"))]
+    try:
+        assert sorted(tickets, key=locks.ticket_priority) == tickets[::-1], "the ticket carries the due's rank"
+        assert checkcap._urgent_rank(["o1"], now, rank["soon"]) < checkcap._urgent_rank(["o2"], now - 9, rank["day"])
+    finally:
+        for t in tickets:
+            locks.dequeue(t)
+
+
 def test_cap_turn_counts_one_lane_for_the_old_unkeyed_base(env, monkeypatch):
     # The old one-slot base ('test-suite.<gid>', no repository key) has one lane: with it held, its aged
     # waiter cannot start and must not take the cap's last room from a repository waiter with a free lane.

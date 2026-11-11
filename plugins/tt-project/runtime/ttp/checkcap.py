@@ -68,7 +68,7 @@ behind routine runs. `ttp checks` first tries the account's test pool at once (c
 wait first, cli._checks_slot); with no pool host free it takes a reserved urgent slot (acquire's `urgent`):
 `checks.urgent_slots` (TTP_CHECKS_URGENT_SLOTS, default URGENT_SLOTS; 0 turns them off) slots of their own,
 as push checks have one per branch, each taking test slots ahead of the queue (testslots' push lane keyed
-urgent_key) and past its project's cap of running checks. They count toward the cap: one is taken only while the
+urgent_key) and past its project's sized cap of running checks (a fixed cap, checklane.fixed_cap, still holds it). They count toward the cap: one is taken only while the
 cap has room, the next slot that frees ahead of every waiter (with checks.priority_beyond_cap true, beyond the
 cap and the load's extras with a reserved test lane, at most that many above the cap at once). Only urgent runs
 take one; the cores and disk gates do not hold it (as for push checks).
@@ -157,6 +157,9 @@ from . import checkwait, diskgate, hostcpu, locks, obligations, poll_s, project,
 
 RESOURCE = "checks"
 OBLIGATION_PRIORITY = 0   # an open obligation's required owner: before every task priority (1 and up)
+# An owner whose earliest open due (obligations.owner_due) is within each of these hours, or past, ranks one
+# more before OBLIGATION_PRIORITY (owed_rank): the owner due soonest goes first, never every owner alike.
+OWED_DUE_H = (24.0, 4.0, 1.0)
 OBLIGATION_MARK = " [owed to the user: goes first]"   # on its queue ticket (an obligation owner or user-ordered urgent)
 PRIORITY = "checks-push"   # check-slots/checks-push.<key>.lock: one priority slot per push branch
 CORES_PER_SLOT = 16       # the default cap's floor: one slot per this many cores, at least one
@@ -1184,6 +1187,7 @@ def task_priority(p) -> int | None:
 
 def task_rank(p) -> tuple[int | None, list[str]]:
     """(task_priority(p), the ids of the open obligations behind an OBLIGATION_PRIORITY boost, else []).
+    An owner ranks by its earliest due (owed_rank): OBLIGATION_PRIORITY or before it, the nearest due first.
     An urgent task (urgent.is_urgent) ranks at least urgent.PRIORITY, a user-ordered one (a fresh `urgent:`
     line) urgent.ORDERED_PRIORITY, as an obligation owner."""
     task = _task_run()[0] or ""
@@ -1200,7 +1204,23 @@ def task_rank(p) -> tuple[int | None, list[str]]:
         owned = list(obligations.owned_open(p.db, int(task))) if t else []
     except Exception:   # unreadable obligations only lose the boost
         return prio, []
-    return (OBLIGATION_PRIORITY, owned) if owned else (prio, [])
+    if not owned:
+        return prio, []
+    try:
+        due = obligations.owner_due(p.db).get(int(task), math.inf)
+    except Exception:   # an unreadable due only loses the order among owners
+        due = math.inf
+    return owed_rank(due), owned
+
+
+def owed_rank(due: float, now: float | None = None) -> int:
+    """An obligation owner's queue rank from its earliest open due (obligations.owner_due; math.inf: none):
+    OBLIGATION_PRIORITY, less one for each OWED_DUE_H bound the due is within (a past due within all), so
+    owners queue nearest due first and all before every task priority. An int: queue tickets carry it."""
+    if not isinstance(due, (int, float)) or math.isinf(due) or math.isnan(due):
+        return OBLIGATION_PRIORITY
+    left_h = (due - (time.time() if now is None else now)) / 3600
+    return OBLIGATION_PRIORITY - sum(1 for h in OWED_DUE_H if left_h <= h)
 
 
 def paths(n: int | None = None) -> list[Path]:
@@ -1730,13 +1750,13 @@ def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = No
             locks.mark_turn(slot_dir(), RESOURCE, None)
             _granted(tell, state, project_name, priority, owns, since, cap=cap, lane_at=lane_at, waited=waited)
             return Slot(f, again=again)
-        if f := _urgent_take(urgent, priority, every, held_as, what, same, owns, rank=_urgent_rank(owns, since),
+        if f := _urgent_take(urgent, priority, every, held_as, what, same, owns, rank=_urgent_rank(owns, since, priority),
                              n=n, claim=claim):
             drop_claim(claim)
             return _urgent_granted(f, tell, state, project_name, priority, owns, since, cap, lane_at, waited)
         ticket = None if parked else locks.enqueue(slot_dir(), RESOURCE, queued_as, since, group=project_name,
                                                    priority=priority, requeued=was_preempted, small=small)
-        uwait = _urgent_wait(urgent and is_urgent(priority) and not twin, None, queued_as, since, owns)
+        uwait = _urgent_wait(urgent and is_urgent(priority) and not twin, None, queued_as, since, owns, priority)
         said = ""   # the limit last told while parked (parked_line): told again when another one holds it
         if parked and tell:   # told once a wait: its pool's room may come and go
             said = _tell_parked(tell, project_name, why)
@@ -1760,7 +1780,7 @@ def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = No
                 _drop_pass()
             try:
                 park = _park(parked, park, queued_as, since, project_name, priority, small)
-                uwait = _urgent_wait(urgent and is_urgent(priority) and not twin, uwait, queued_as, since, owns)
+                uwait = _urgent_wait(urgent and is_urgent(priority) and not twin, uwait, queued_as, since, owns, priority)
             except OSError as e:
                 raise _unavailable(e) from e
             if parks and parked != was:
@@ -1887,18 +1907,22 @@ def _urgent_take(urgent: bool, priority: int | None, every: list[Path], holder: 
 URGENT_WAIT = "checks-urgent-wait"   # check-slots queue: the urgent runs that could take a reserved urgent slot now
 
 
-def _urgent_rank(owns, since: float) -> tuple[float, float]:
-    """An urgent waiter's place for a reserved urgent slot: an open obligation's owner first, then arrival
-    (its URGENT_WAIT ticket's priority: OBLIGATION_PRIORITY, else locks.URGENT_PRIORITY)."""
-    return (float(OBLIGATION_PRIORITY if owns else locks.URGENT_PRIORITY), since)
+def _urgent_rank(owns, since: float, priority: int | None = None) -> tuple[float, float]:
+    """An urgent waiter's place for a reserved urgent slot: an open obligation's owner first (the nearest
+    due first: its owed_rank `priority`), then arrival (its URGENT_WAIT ticket's priority: OBLIGATION_PRIORITY
+    or that rank before it, else locks.URGENT_PRIORITY)."""
+    if not owns:
+        return (float(locks.URGENT_PRIORITY), since)
+    return (float(min(OBLIGATION_PRIORITY, priority if isinstance(priority, (int, float)) else OBLIGATION_PRIORITY)), since)
 
 
-def _urgent_wait(want: bool, ticket: Path | None, holder: str, since: float, owns) -> Path | None:
+def _urgent_wait(want: bool, ticket: Path | None, holder: str, since: float, owns,
+                 priority: int | None = None) -> Path | None:
     """The URGENT_WAIT ticket an urgent run holds while it could take a reserved urgent slot (acquire: not
     while the same checks run), so a freed one goes to the owed waiter first, then the oldest, not to whichever
     polls first (_urgent_take); dropped once it no longer could."""
     if want and ticket is None:
-        return locks.enqueue(slot_dir(), URGENT_WAIT, holder, since, priority=int(_urgent_rank(owns, since)[0]))
+        return locks.enqueue(slot_dir(), URGENT_WAIT, holder, since, priority=int(_urgent_rank(owns, since, priority)[0]))
     if not want and ticket is not None:
         locks.dequeue(ticket)
         return None
