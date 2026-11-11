@@ -6,7 +6,8 @@ Every run gets one class, model-free (classify): coordinator; wake_decision (wak
 babysit decisions: jev_calls rows, DECISION_USES); screening (watcher, log and alert triage: SCREEN_USES);
 worker_wake (a waiting task's resume turn); status_report (a question, or a work task whose deliverable
 is a status, measurement or report); rebase (a push-conflict fix or a rebase task); review_small (a
-review whose diff is under `route.review_small_lines`, SMALL_LINES); light (light tier); hard (the rest:
+review whose diff is under `route.review_small_lines`, SMALL_LINES); light (light tier); routine (a work,
+question or harness task, or a review up to `route.review_medium_lines`, MEDIUM_LINES); hard (the rest:
 code, plan, deep, device work, large reviews). The dispatch records it on the run note (KEY); a run
 without one is classified the same way at read time from its note.
 
@@ -30,6 +31,14 @@ routing could not move (routable), a model pick, or a class `route.classes` keep
 endpoint answers with a working key, the route's fallback is none and the run goes to the tt model again
 with no config edit. The run note records it (CHEAP_KEY).
 
+Routine (ROUTINE): standard-tier work, question and harness runs and reviews up to MEDIUM_LINES that no
+cheaper class takes run on Sonnet at high effort on the Claude core provider (CORE_CHEAP), never on the chat
+provider unless `route.classes` sends them there. Opus keeps code, plan, device, deep and user_deep runs,
+needs_deep, urgent and review_fix tasks, tier-up retries and pinned runs (provider, model or effort).
+Off: `route.classes.routine` "core" (or `route.core_cheap.routine` false). Quality alarm
+(routine_quality): when routine's failed and needs_review share over QUALITY_WINDOW_S beats hard's by more
+than QUALITY_GAP, with ALARM_MIN runs in each, the daemon raises one run_class_quality event per window.
+
 Report: by_class counts runs per class per model per hour with their real cost (`ttp stats --by-class`),
 and the share of runs whose class routes to chat. Alarm: quiet_classes names a class meant for cheap
 models (routed to chat, or with a cheap core model) that had at least ALARM_MIN runs in the window and none
@@ -45,7 +54,7 @@ import time
 
 KEY = "run_class"
 CLASSES = ("coordinator", "wake_decision", "screening", "worker_wake", "status_report", "rebase",
-           "review_small", "light", "hard")
+           "review_small", "light", "routine", "hard")
 CHAT = ("wake_decision", "screening", "worker_wake", "status_report", "rebase", "review_small", "light")
 # The cheap classes an urgent task does not lift to core (urgency sets order only, decision 2026-11-08 23:55
 # PST); a light-tier first run is not one of them: an urgent one starts on core.
@@ -53,6 +62,11 @@ ORDER_ONLY = tuple(c for c in CHAT if c != "light")
 DECISION_USES = ("wake_gate", "wake_tier", "babysit")
 SCREEN_USES = ("screen",)
 SMALL_LINES = 300
+MEDIUM_LINES = 400
+ROUTINE = "routine"
+ROUTINE_KINDS = ("work", "question", "harness")
+QUALITY_GAP = 0.10
+QUALITY_WINDOW_S = 86400.0
 ALARM_MIN = 5
 CHEAP_KEY = "core_cheap"
 # Claude models for cheap classes on the core provider while no tt model serves them: decisions and
@@ -63,7 +77,8 @@ CORE_CHEAP = {"wake_decision": {"model": "haiku", "effort": "low"},
               "worker_wake": {"model": "sonnet", "effort": "low"},
               "status_report": {"model": "sonnet", "effort": "low"},
               "rebase": {"model": "sonnet", "effort": "low"},
-              "review_small": {"model": "sonnet", "effort": "low"}}
+              "review_small": {"model": "sonnet", "effort": "low"},
+              ROUTINE: {"model": "sonnet", "effort": "high"}}
 CHEAP_PROVIDER = "claude"
 REPORT = re.compile(r"(?i)\b(status|report|measure(?:d|ment|s)?|count|stats|summar(?:y|ise|ize)|digest|brief)\b")
 
@@ -108,20 +123,29 @@ def classify(task: dict | None, run: dict | None = None, cfg: dict | None = None
     if kind == "review":
         lines = (note.get("review_tier") or {}).get("lines")
         small = small_lines(cfg)
-        return "review_small" if isinstance(lines, (int, float)) and lines < small and task.get("tier") != "deep" \
-            else "hard"
+        if isinstance(lines, (int, float)) and task.get("tier") != "deep":
+            if lines < small:
+                return "review_small"
+            if lines <= medium_lines(cfg):
+                return ROUTINE
+        return "hard"
     if note.get("wake"):
         return "worker_wake"
     if tier == "light":
         return "light"
     if kind == "question" or (kind == "work" and REPORT.search(title)):
         return "status_report"
-    return "hard"
+    return ROUTINE if kind in ROUTINE_KINDS else "hard"
 
 
 def small_lines(cfg: dict | None) -> int:
     v = ((cfg or {}).get("route") or {}).get("review_small_lines")
     return int(v) if isinstance(v, int) and not isinstance(v, bool) and v > 0 else SMALL_LINES
+
+
+def medium_lines(cfg: dict | None) -> int:
+    v = ((cfg or {}).get("route") or {}).get("review_medium_lines")
+    return int(v) if isinstance(v, int) and not isinstance(v, bool) and v > 0 else MEDIUM_LINES
 
 
 def chat_model(cfg: dict, tier: str) -> str:
@@ -174,7 +198,7 @@ def cheap_models(cfg: dict) -> dict[str, dict]:
     out = {c: dict(v) for c, v in CORE_CHEAP.items()}
     if isinstance(got, dict):
         for c, v in got.items():
-            if c not in CHAT:
+            if c not in (*CHAT, ROUTINE):
                 continue
             if v is False:
                 out.pop(c, None)
@@ -189,9 +213,12 @@ def core_cheap(cfg: dict, task: dict | None, cls: str, tier: str, provider: str,
     `tier`: {"provider", "model", "effort", "class", "why"}, or None (its tier's model): not the Claude core
     provider, not a CHAT class, not the standard tier, the run goes to the chat provider (`routed` with no
     fallback), the task is one routing could not move, or `route.classes` keeps the class on core."""
-    if provider != CHEAP_PROVIDER or (cfg.get("core_provider") or "claude") != provider or cls not in CHAT \
-            or tier != "standard":
+    if provider != CHEAP_PROVIDER or (cfg.get("core_provider") or "claude") != provider \
+            or cls not in (*CHAT, ROUTINE) or tier != "standard":
         return None
+    from .route import kept_core
+    if cls == ROUTINE and task and (str(task.get("effort") or "") or kept_core(task)):
+        return None   # urgent, needs_deep, user_deep, review_fix or an effort pin: Opus at its tier
     if routed and routed.get("to") != provider and routed.get("fallback") == "none":
         return None   # it runs on the chat provider's tt model
     if not routable(task, {"pick": picked or {}}):
@@ -201,7 +228,7 @@ def core_cheap(cfg: dict, task: dict | None, cls: str, tier: str, provider: str,
     m = cheap_models(cfg).get(cls)
     if not m:
         return None
-    why = str((routed or {}).get("fallback") or "") if routed else "no chat model"
+    why = "routine work" if cls == ROUTINE else str((routed or {}).get("fallback") or "") if routed else "no chat model"
     return {"provider": provider, "model": m["model"], "effort": m["effort"], "class": cls, "why": why or "no chat model"}
 
 
@@ -279,6 +306,49 @@ def by_class(db, cfg: dict, since: float, until: float | None = None) -> dict:
     meant = {c for c in CHAT if rt.get(c) == "chat" or c in cheap_models(cfg)}
     return {"since": since, "until": until, "hours": round(hours, 3), "routes": rt, "classes": rows,
             "eligible": eligible, "cheap": cheap, "meant": sorted(meant), "last_error": last_error, "runs": total, "share": round(chat / total, 3) if total else 0.0}
+
+
+def routine_quality(db, cfg: dict, since: float, until: float | None = None) -> dict:
+    """Routine vs hard outcomes in [since, until), per task by its last worker run there: {"routine", "hard":
+    {"tasks", "bad", "share"}, "gap", "alarm"}. Routine counts runs that took the routine cheap model; hard,
+    runs of class hard on their tier's model. Bad: the run failed, or the task ended failed or with a
+    needs_review hand-off. `alarm`: ALARM_MIN tasks in each and routine's bad share above hard's by more
+    than QUALITY_GAP."""
+    until = time.time() if until is None else until
+    last: dict = {}
+    for r in db.q("SELECT task, role, provider, status, note FROM runs WHERE role='worker' AND task IS NOT NULL "
+                  "AND started>=? AND started<? AND status!='running' ORDER BY started", (since, until)):
+        last[r["task"]] = dict(r)
+    tasks = {t["id"]: dict(t) for t in db.q(
+        f"SELECT * FROM tasks WHERE id IN ({','.join('?' * len(last))})", tuple(last))} if last else {}
+    out = {c: {"tasks": 0, "bad": 0, "share": 0.0} for c in (ROUTINE, "hard")}
+    for tid, r in last.items():
+        task, note = tasks.get(tid), _note(r)
+        cheap = cheap_run(note, str(r["provider"] or ""))
+        cls = ROUTINE if (cheap or {}).get("class") == ROUTINE else "hard" if not cheap and \
+            classify(task, r, cfg) == "hard" else None
+        if not cls or not task:
+            continue
+        try:
+            got = json.loads(task.get("result") or "{}")
+        except (TypeError, ValueError):
+            got = {}
+        bad = r["status"] == "failed" or task.get("status") == "failed" or \
+            (isinstance(got, dict) and got.get("status") in ("failed", "needs_review"))
+        out[cls]["tasks"] += 1
+        out[cls]["bad"] += int(bad)
+    for v in out.values():
+        v["share"] = round(v["bad"] / v["tasks"], 3) if v["tasks"] else 0.0
+    gap = round(out[ROUTINE]["share"] - out["hard"]["share"], 3)
+    return {**out, "gap": gap, "alarm": min(out[ROUTINE]["tasks"], out["hard"]["tasks"]) >= ALARM_MIN
+            and gap > QUALITY_GAP}
+
+
+def quality_text(q: dict, hours: float) -> str:
+    r, h = q[ROUTINE], q["hard"]
+    return (f"Routine runs (Sonnet, high effort) went wrong more often than hard ones (Opus) in the last {hours:g} h: "
+            f"{r['bad']}/{r['tasks']} tasks failed or needs_review ({r['share']:.0%}) vs {h['bad']}/{h['tasks']} "
+            f"({h['share']:.0%}). Check them; `route.classes.routine` \"core\" moves routine work back to Opus.")
 
 
 def decider(decision) -> str:

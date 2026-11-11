@@ -23,17 +23,79 @@ def test_run_classes_cover_every_kind_of_run():
     assert c({"kind": "review", "tier": "standard", "title": "r"}, {"note": {"review_tier": {"lines": 900}}}) == "hard"
     assert c({"kind": "review", "tier": "standard", "title": "r"}, {"note": {}}) == "hard"   # size unknown
     assert c({"kind": "review", "tier": "standard", "title": "r"}, {"note": {"review_tier": {"lines": 120}}},
-             {"route": {"review_small_lines": 100}}) == "hard"
+             {"route": {"review_small_lines": 100}}) == "routine"
     assert c({"kind": "code", "tier": "standard", "title": "x"}, {"note": {"wake": {"tier": "light"}}}) == "worker_wake"
     assert c({"kind": "code", "tier": "light", "title": "x"}) == "light"
     assert c({"kind": "question", "tier": "standard", "title": "why"}) == "status_report"
     assert c({"kind": "work", "tier": "standard", "title": "report runs per hour"}) == "status_report"
-    assert c({"kind": "work", "tier": "standard", "title": "bring up a model"}) == "hard"
+    assert c({"kind": "work", "tier": "standard", "title": "bring up a model"}) == "routine"
     assert c({"kind": "code", "tier": "standard", "title": "fix it"}) == "hard"
     assert c({"kind": "plan", "tier": "deep", "title": "plan"}) == "hard"
     # A recorded class wins; a bad one is ignored.
     assert c({"kind": "code", "tier": "standard", "title": "x"}, {"note": '{"run_class": "light"}'}) == "light"
     assert c({"kind": "code", "tier": "standard", "title": "x"}, {"note": '{"run_class": "bogus"}'}) == "hard"
+
+
+def test_routine_runs_take_sonnet_at_high_effort_and_opus_keeps_hard_pinned_urgent_and_retried_work():
+    from ttp import runclass
+    c = runclass.classify
+    for kind in ("work", "question", "harness"):
+        t = {"kind": kind, "tier": "standard", "title": "tidy the notes"}
+        assert c(t) == ("status_report" if kind == "question" else "routine"), kind
+    review = {"kind": "review", "tier": "standard", "title": "r"}
+    assert c(review, {"note": {"review_tier": {"lines": 350}}}) == "routine"
+    assert c(review, {"note": {"review_tier": {"lines": 401}}}) == "hard"
+    assert c(review, {"note": {"review_tier": {"lines": 450}}}, {"route": {"review_medium_lines": 500}}) == "routine"
+    for t in ({"kind": "code", "tier": "standard", "title": "x"}, {"kind": "plan", "tier": "standard", "title": "p"},
+              {"kind": "work", "tier": "deep", "title": "x"}, {"kind": "work", "tier": "standard", "title": "x",
+                                                                "spec": "run it on the device (tt-smi reset)"}):
+        assert c(t) == "hard", t
+    t = {"kind": "harness", "tier": "standard", "title": "tidy", "labels": "[]"}
+    got = runclass.core_cheap({}, t, "routine", "standard", "claude")
+    assert (got["model"], got["effort"], got["class"], got["why"]) == ("sonnet", "high", "routine", "routine work")
+    # Opus keeps: other tiers, pins (provider, model, effort), tier-up retries, urgent, deep asks and review fixes.
+    assert runclass.core_cheap({}, t, "routine", "deep", "claude") is None
+    assert runclass.core_cheap({}, t, "routine", "standard", "claude", None, {"by": "retry"}) is None
+    for extra in ({"model": "opus"}, {"provider": "claude"}, {"effort": "xhigh"}, {"priority": 0},
+                  {"labels": '["needs_deep"]'}, {"labels": '["user_deep"]'}, {"labels": '["review_fix:12"]'},
+                  {"spec": "urgent: the user is waiting"}):
+        assert runclass.core_cheap({}, {**t, **extra}, "routine", "standard", "claude") is None, extra
+    # Off-switch: route.classes.routine core (or route.core_cheap.routine false).
+    assert runclass.core_cheap({"route": {"classes": {"routine": "core"}}}, t, "routine", "standard", "claude") is None
+    assert runclass.core_cheap({"route": {"core_cheap": {"routine": False}}}, t, "routine", "standard", "claude") is None
+    # It stays on core with a chat provider too (not a CHAT class).
+    assert runclass.routes(_rc_cfg())["routine"] == "core"
+
+
+def test_routine_quality_alarm_fires_when_routine_goes_wrong_ten_points_more_often_than_hard(env):
+    from ttp import runclass
+    from ttp.daemon import Daemon
+    p = make(env)
+    now = time.time()
+    cheap = json.dumps({runclass.CHEAP_KEY: {"provider": "claude", "model": "sonnet", "effort": "high",
+                                             "class": "routine", "why": "routine work"}})
+
+    def task(kind, status, result_status, note):
+        t = p.db.add_task("t", "", kind=kind, tier="standard", priority=3, budget_usd=1.0)
+        p.db.x("UPDATE tasks SET status=?, result=? WHERE id=?", (status, json.dumps({"status": result_status}), t))
+        p.db.x("INSERT INTO runs(task,role,provider,model,started,status,cost_usd,note) VALUES(?,?,?,?,?,?,?,?)",
+               (t, "worker", "claude", "sonnet" if note else "opus", now - 600, "ok", 0.1, note))
+    for i in range(6):   # hard: 1 of 6 needs review
+        task("code", "done", "needs_review" if i == 0 else "done", None)
+    for i in range(6):   # routine: 2 of 6 (33% vs 17%: 16 points) go wrong
+        task("work", "failed" if i < 2 else "done", "failed" if i < 2 else "done", cheap)
+    q = runclass.routine_quality(p.db, {}, now - 86400, now)
+    assert (q["routine"]["bad"], q["routine"]["tasks"], q["hard"]["bad"], q["hard"]["tasks"]) == (2, 6, 1, 6)
+    assert q["alarm"] and "route.classes.routine" in runclass.quality_text(q, 24)
+    d = Daemon(p.base)
+    d.watch_run_classes()
+    d._run_class_checked = 0.0
+    d.watch_run_classes()   # once per window
+    assert p.db.one("SELECT COUNT(*) n FROM events WHERE kind='run_class_quality'")["n"] == 1
+    # Within 10 points: quiet.
+    p.db.x("UPDATE tasks SET status='done', result=? WHERE status='failed' AND id=(SELECT MAX(id) FROM tasks "
+           "WHERE status='failed')", (json.dumps({"status": "done"}),))
+    assert not runclass.routine_quality(p.db, {}, now - 86400, now)["alarm"]
 
 
 def test_class_routes_default_to_chat_only_with_a_chat_model_and_never_move_the_coordinator():

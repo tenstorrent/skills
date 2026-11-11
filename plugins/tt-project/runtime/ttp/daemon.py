@@ -2498,6 +2498,16 @@ class Daemon:
             self.p.db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
                         (now, "daemon", "run_class_quiet", "normal", runclass.alarm_text(q, window_s / 3600)[:500],
                          "queued"))
+        # Routine work on Sonnet going wrong clearly more often than hard work on Opus: one event per window.
+        if now - float(self.p.db.kv("run_class_quality", 0) or 0) >= runclass.QUALITY_WINDOW_S and \
+                now - getattr(self, "_run_quality_checked", 0.0) >= 3600:
+            self._run_quality_checked = now
+            q = runclass.routine_quality(self.p.db, self.cfg, now - runclass.QUALITY_WINDOW_S, now)
+            if q["alarm"]:
+                self.p.db.set_kv("run_class_quality", now)
+                self.p.db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
+                            (now, "daemon", "run_class_quality", "normal",
+                             runclass.quality_text(q, runclass.QUALITY_WINDOW_S / 3600)[:500], "queued"))
         # Cheap classes on Claude with none on a tt model: told once per outage, never as a repeating alarm.
         down = runclass.tt_unavailable(s)
         told = self.p.db.kv("tt_unavailable_told", "") or ""
