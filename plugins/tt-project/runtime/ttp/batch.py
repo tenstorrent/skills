@@ -85,6 +85,7 @@ DROP_TODO = ("import sys\nf, drop = sys.argv[-1], sys.argv[1:-1]\nkeep = [ln for
 # and no other branch moved along (rebase.updateRefs would move a task branch the replay passes)
 DROP_CONFIG = ("-c", "rebase.autoSquash=false", "-c", "rebase.missingCommitsCheck=ignore", "-c", "rebase.updateRefs=false")
 RESCUES = 1                        # checks per batch of the entries after a blamed one, replayed without it
+SUSPECTS = 8                       # entries a failed full head's new failing tests point at, each probed alone (_culprits)
 NO_TESTS = 5                       # pytest's exit status when nothing was selected: a cap probe of a check without cap tests
 RERUN_S = 600.0                    # delivery.push_rerun_s: the time limit of one rerun of a failed check's failing tests
 YIELD_GRACE_S = 300.0              # delivery.push_yield_grace_s: an urgent approval stops a batch only if approved this soon after its checks began
@@ -1656,6 +1657,7 @@ class Batch:
         self.conflicted: set[int] = set()      # entries whose replay hit a conflict it did not settle
         self._settling: tuple[list[str], set, list] = ([], set(), [])   # files, kinds and doc merges of the replay running
         self.rescued: dict[int, str] = {}      # entry index -> its head, replayed again without a blamed entry
+        self.culprits: dict[int, tuple] = {}   # entry index -> (cmd, tail): its own head alone fails new tests (_culprits)
         self.unbumped: dict[str, str] = {}     # a head with this batch's version bump -> the replayed head under it
         self.held: dict[int, dict] = {}        # entry index -> the token scope a refused push needs for it
         self.scopes: list[dict] = []           # those refusals: scope, files, entry ids, check (scopehold)
@@ -1919,7 +1921,7 @@ class Batch:
         self.tip_passed = False
         self.tip_tried = 0
         self.researched = 0
-        self.rescued, self.retried, self.early = {}, False, False
+        self.rescued, self.retried, self.early, self.culprits = {}, False, False, {}
         carried = self._replay(tip, checks)
         if not carried:
             return self._close(0, "nothing")
@@ -2052,6 +2054,8 @@ class Batch:
                 self._set(i, "conflict", files=self.settled[i]["settled"], cmd=failed[0], tail=failed[1])
             elif n == k + 1 and failed:
                 self._set(i, "check_failed", cmd=failed[0], tail=failed[1])
+            elif i in self.culprits:
+                self._set(i, "check_failed", cmd=self.culprits[i][0], tail=self.culprits[i][1])
             elif i in self.rescued and outcome == "pushed":
                 self._set(i, "pushed")
                 self.landed_at[i] = self.rescued[i]
@@ -3193,7 +3197,8 @@ class Batch:
         msg #2317): the later entries go untested and unblamed to the next train, and no entry joins or
         rejoins a head that passed, so a search blames only entry 1 of the entries it searches. A failing check none of whose failing pytest ids is new at its head
         (gatejudge: flaky, pre-existing on the tip or quarantined) passes there (_judged). When the full
-        head's failure names new ids, the search probes each prefix with only those ids (_ids_check) and
+        head's failure names new ids, every entry they point at that fails them alone on the tip is sent
+        back at once and the others land in this round when they pass (_culprits); else the search probes each prefix with only those ids (_ids_check) and
         runs the checks that never ran on the failing head on the highest prefix they pass on, once
         (_rest_check: the others passed there): it pushes when they pass, else the search goes below it
         in full. Before an entry is blamed, its failing ids are rerun on the tip alone up to TIP_RERUNS
@@ -3253,6 +3258,9 @@ class Batch:
             if fail is None:
                 return m, heads[m], None
             self.full_fail, fails = fail, {m: fail}
+            if not bad and m > 1 and (ids := self.new_ids.get(fail[1])) and (
+                    got := self._culprits(tip, carried, fail, ids, checks)):
+                return got
         # A failure whose new tests are known (_judged) is searched on those tests alone (_ids_check), then
         # the longest prefix that passed them runs the checks after the failing one (_rest_check) once;
         # failing there, the search goes below in full.
@@ -3345,29 +3353,31 @@ class Batch:
         self.early = True
         return k, heads[k], None
 
-    def _rescue(self, tip: str, carried: list, k: int, checks: list[str]) -> str | None:
-        """After _judge blamed carried entry 1 (k 0): replay the later carried entries in order onto the
-        tip and check that head once, in this batch. With k entries before the blamed one that passed
-        (k > 0), none: their head pushes at once and the later entries go to the next train, as no
-        entry joins a head that passed (user msg #2317). An entry built on the blamed one (it would
-        replay its commits) or whose replay conflicts or adds nothing without it is skipped and requeued; the others still go.
-        When the full head's failure names its new tests (self.new_ids), that head is checked on those
-        tests alone (_ids_check) and then on the checks that never ran on the full head (_rest_check), not
-        in full a second time; a probe that cannot tell checks it in full. Returns the head that pushes the
-        replayed entries (self.rescued), or None (nothing after the blamed entry, none replays, or a
-        failing check: those entries are requeued). A batch makes at most RESCUES such checks, whatever
-        their outcome."""
-        later = carried[1:]
-        if not later or k or self.detail_tip is not None or self.rescues >= RESCUES:
-            return None
-        h = tip
+    def _check_rest(self, head: str, checks: list[str]) -> tuple[str, str] | None:
+        """`head` replays the entries of the full head that failed new tests without some of them: check it
+        on those tests alone (_ids_check), then on the checks that never ran on the full head (_rest_check);
+        a probe that cannot tell checks it in full. None when it passes."""
+        full = self.full_fail
+        probe = self._ids_check(head, full, ids) if full and (ids := self.new_ids.get(full[1])) else False
+        if probe is None:
+            return self._rest_check(head, checks, full)
+        return self._check(head, checks) if probe is False else probe
+
+    def _own(self, carried: list, k: int) -> set[str]:
+        """Carried entry k's own commits: not those of an earlier carried entry it was built on."""
+        b = self.info[carried[k][0]]
+        return set(_git(self.repo, "rev-list", b["top"], f"^{b['base']}",
+                        *(f"^{self.info[j]['top']}" for j, _ in carried[:k])).stdout.split())
+
+    def _replay_without(self, h: str, later: list, own: set[str]) -> tuple[list[tuple[int, str]], list]:
+        """Replay the entries `later` in order onto `h`, leaving out the commits `own` (of entries taken
+        out): (replayed as (index, head), ids skipped). An entry built on those commits, or whose replay
+        conflicts or adds nothing without them, is skipped."""
         replayed: list[tuple[int, str]] = []
         skipped: list = []
-        b = self.info[carried[0][0]]
-        own = set(_git(self.repo, "rev-list", b["top"], f"^{b['base']}").stdout.split())
         for i, _ in later:
             if own & set(_git(self.repo, "rev-list", self.info[i]["top"], f"^{h}").stdout.split()):
-                skipped.append(self.entries[i].get("id"))     # built on the blamed entry: it would replay it too
+                skipped.append(self.entries[i].get("id"))     # built on an entry taken out: it would replay it too
                 continue
             self._settling = ([], set(), [])
             new, files = self._rebase(h, self.info[i]["top"])
@@ -3382,6 +3392,85 @@ class Batch:
                     self.settled[i]["approval_carried"] = carry
             replayed.append((i, new))
             h = new
+        return replayed, skipped
+
+    def _suspects(self, head: str, carried: list, ids: list[str]) -> list[int]:
+        """The carried entries the failing test ids point at: those changing a failing test's file first,
+        then those changing a Python module that file names (its imports), in batch order."""
+        tests = {t.partition("::")[0] for t in ids}
+        text = "\n".join(_git(self.repo, "show", f"{head}:{t}").stdout for t in sorted(tests))
+        direct, named = [], []
+        for i, _ in carried:
+            files = _git(self.repo, "diff", "--name-only", self.info[i]["base"], self.info[i]["top"]).stdout.split()
+            if tests & set(files):
+                direct.append(i)
+            elif any(f.endswith(".py") and re.search(rf"\b{re.escape(Path(f).stem)}\b", text) for f in files):
+                named.append(i)
+        return (direct + named)[:SUSPECTS]
+
+    def _culprits(self, tip: str, carried: list, fail: tuple[str, str], ids: list[str], checks: list[str]):
+        """The full head failed tests new on it (_judged): take out, in one round, every entry those tests
+        point at (_suspects) whose own changes, alone on the tip, fail them too (a split probe, run here:
+        reruns never spill), replay the others onto the tip without them and check that head once in
+        full. Passing, it pushes those (self.rescued) and every culprit is check_failed: (0, head, None).
+        None when no culprit is confirmed, the replay or its check fails, or a search is due anyway: the
+        prefix search then runs as before (a failure no entry maps to bisects there). Tests failing on
+        the tip too, or flaky, are never new (_judged), so they take no entry out."""
+        if self.rescues >= RESCUES:
+            return None
+        found: dict[int, tuple] = {}
+        for i in self._suspects(carried[-1][1], carried, ids):
+            if self._yield_now():
+                return None
+            self._settling = ([], set(), [])
+            alone, files = self._rebase(tip, self.info[i]["top"])
+            if files is not None or alone == tip:
+                continue
+            if isinstance(f := self._ids_check(alone, fail, ids), tuple):
+                found[i] = f
+        if not found:
+            return None
+        rest = [c for c in carried if c[0] not in found]
+        own: set[str] = set()
+        for n, (i, _) in enumerate(carried):
+            if i in found:
+                own |= self._own(carried, n)
+        replayed, skipped = self._replay_without(tip, rest, own)
+        names = ", ".join(str(self.entries[i].get("id")) for i in found)
+        say(f"entr{'y' if len(found) == 1 else 'ies'} {names} fail{'s' if len(found) == 1 else ''} the new tests "
+            f"alone on the tip; checking the {len(replayed)} other{'' if len(replayed) == 1 else 's'} without "
+            f"{'it' if len(found) == 1 else 'them'}" + (f" ({', '.join(map(str, skipped))} do not replay)" if skipped else ""))
+        if not replayed:
+            return None
+        try:
+            head = self._head(tip, replayed, len(replayed))
+        except Refused:
+            return None
+        self.rescues += 1
+        if len(replayed) > 1 and isinstance(self._caps(head, checks, replayed[-1][1]), tuple):
+            return None
+        if self._check_rest(head, checks) is not None:
+            say("they fail too: searching the batch")
+            return None
+        self.culprits, self.rescued, self.retried = found, dict(replayed), True
+        return 0, head, None
+
+    def _rescue(self, tip: str, carried: list, k: int, checks: list[str]) -> str | None:
+        """After _judge blamed carried entry 1 (k 0): replay the later carried entries in order onto the
+        tip and check that head once, in this batch. With k entries before the blamed one that passed
+        (k > 0), none: their head pushes at once and the later entries go to the next train, as no
+        entry joins a head that passed (user msg #2317). An entry built on the blamed one (it would
+        replay its commits) or whose replay conflicts or adds nothing without it is skipped and requeued; the others still go.
+        When the full head's failure names its new tests (self.new_ids), that head is checked on those
+        tests alone (_ids_check) and then on the checks that never ran on the full head (_rest_check), not
+        in full a second time; a probe that cannot tell checks it in full (_check_rest). Returns the head that pushes the
+        replayed entries (self.rescued), or None (nothing after the blamed entry, none replays, or a
+        failing check: those entries are requeued). A batch makes at most RESCUES such checks, whatever
+        their outcome."""
+        later = carried[1:]
+        if not later or k or self.detail_tip is not None or self.rescues >= RESCUES:
+            return None
+        replayed, skipped = self._replay_without(tip, later, self._own(carried, 0))
         blamed = self.entries[carried[0][0]].get("id")
         if skipped:
             say(f"entr{'y' if len(skipped) == 1 else 'ies'} {', '.join(map(str, skipped))} after {blamed} "
@@ -3401,13 +3490,7 @@ class Batch:
         if len(replayed) > 1 and isinstance(self._caps(head, checks, replayed[-1][1]), tuple):
             say("they break a prompt size cap too; requeued")
             return None
-        full = self.full_fail
-        probe = self._ids_check(head, full, ids) if full and (ids := self.new_ids.get(full[1])) else False
-        if probe is None:
-            probe = self._rest_check(head, checks, full)
-        elif probe is False:
-            probe = self._check(head, checks)
-        if probe is not None:
+        if self._check_rest(head, checks) is not None:
             say("they fail too; requeued")
             return None
         self.rescued = dict(replayed)

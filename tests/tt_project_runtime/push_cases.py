@@ -16795,6 +16795,89 @@ def test_a_rescue_runs_only_the_blamed_entrys_new_failing_tests_and_the_checks_l
     assert ("head", "^(?:test_breaks_with_its_entry)$", ["e2", "e3", "e4"]) in calls, calls
 
 
+def _tests_stub(monkeypatch, failing):
+    """batch._stream stubbed as a pytest check of every tests/test_*.py file in the tree, one test each
+    (`tests/test_x.py::test_x`, plus _FLAKY_ID): `failing(tree)` names the ids failing in worktree
+    `tree`; only TTP_PYTEST_SELECT's ids run when set. Returns the calls (selected, entry files)."""
+    from ttp import batch
+    calls = []
+
+    def fake(cmd, cwd, env=None, timeout=None, group=False, pass_fds=(), collect=None, urgent_mark=False):
+        tree = pathlib.Path(cwd)
+        sel = (env or {}).get("TTP_PYTEST_SELECT")
+        calls.append((sel, sorted(f.stem for f in tree.glob("e*.txt"))))
+        known = [_FLAKY_ID] + [f"tests/{f.name}::{f.stem}" for f in sorted(tree.glob("tests/test_*.py"))]
+        run = [i for i in known if sel is None or re.match(sel, i.rpartition("::")[2])]
+        bad = [i for i in run if i in failing(tree)]
+        if not run:
+            return 5, "no tests ran in 0.01s", False
+        if not bad:
+            return 0, f"{'.' * len(run)}\n{len(run)} passed in 0.50s", False
+        return 1, ("F" * len(bad) + "\n" + "".join(f"FAILED {i} - AssertionError: broken\n" for i in bad)
+                   + f"{len(bad)} failed, {len(run) - len(bad)} passed in 0.50s"), False
+
+    monkeypatch.setattr(batch, "_stream", fake)
+    return calls
+
+
+def _tests_full_runs(calls):
+    return [c[1] for c in calls if c[0] is None]
+
+
+def test_a_push_batch_drops_every_culprit_its_failing_tests_point_at_and_lands_the_rest_in_one_round(env, monkeypatch, capsys):
+    """Cell drop_all_culprits (#8262): 3 of 20 entries each add a test that fails (3 different tests).
+    The full head fails; each failing test's file points at the entry that changed it, each is confirmed
+    by a split probe of that entry alone on the tip, all 3 are sent back together and the other 17 land
+    in the same round: one full check run (the full head), then the head without the culprits runs only
+    the failing tests (2 check rounds)."""
+    p, repo, origin, other = _push_setup(env, monkeypatch, [_FLAKY_CHECK])
+    tip = _git_out(origin, "rev-parse", "proj")
+    bad = {4, 11, 17}
+    heads = [_entry(repo, f"e{k}", {f"e{k}.txt": f"{k}\n", **({f"tests/test_c{k}.py": "x\n"} if k in bad else {})})
+             for k in range(1, 21)]
+    calls = _tests_stub(monkeypatch, lambda tree: {f"tests/test_c{k}.py::test_c{k}" for k in bad
+                                                   if (tree / f"tests/test_c{k}.py").exists()})
+    rc, m = _run_batch(p, _batch_marker(p, heads), monkeypatch)
+    assert rc == 0 and m["outcome"] == "pushed" and m["rounds"] == 1, m
+    assert _statuses(m) == ["check_failed" if k in bad else "pushed" for k in range(1, 21)], m
+    full = _tests_full_runs(calls)
+    rest = [f"e{k}" for k in sorted(range(1, 21), key=str) if k not in bad]
+    assert len(full) == 1 and len(full[0]) == 20, full
+    assert (r"^(?:test_c11|test_c17|test_c4)$", rest) in calls, calls
+    pushed = _git_out(origin, "show", "--name-only", "--format=", f"{tip}..proj").split()
+    assert not [f for f in pushed if f.startswith("tests/")] and "e20.txt" in pushed, pushed
+    assert "entries 4, 11, 17 fail the new tests alone on the tip; checking the 17 others without them" in \
+        capsys.readouterr().out
+
+
+def test_a_push_batch_whose_failing_test_points_at_no_entry_bisects(env, monkeypatch, capsys):
+    """Cell unmapped_failure_bisects: entry 3 of 4 breaks a test none of the entries' changes names. No
+    culprit is dropped by name: the prefix search bisects, and the half that passes (entries 1 and 2)
+    lands at once."""
+    p, repo, origin, other = _push_setup(env, monkeypatch, [_FLAKY_CHECK])
+    _entry(repo, "base", {"tests/test_x.py": "x\n"})
+    _git_out(repo, "push", "-q", "origin", "base:proj")
+    calls = _tests_stub(monkeypatch, lambda tree: {"tests/test_x.py::test_x"} if (tree / "e3.txt").exists() else set())
+    rc, m = _run_batch(p, _batch_marker(p, _entries(repo, 4)), monkeypatch)
+    assert _statuses(m) == ["pushed", "pushed", "requeued", "requeued"], m
+    assert _tests_full_runs(calls) == [["e1", "e2", "e3", "e4"]], calls
+    assert ("^(?:test_x)$", ["e1", "e2"]) in calls, calls
+    assert "alone on the tip" not in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("how", ["base", "flaky"])
+def test_a_push_batch_never_drops_an_entry_for_a_test_failing_on_the_base_or_flaky(env, monkeypatch, how):
+    """Cell base_or_flaky_drops_none: entry 2 of 3 changes the file of a test that fails on the tip too
+    (base) or only once (flaky). Neither failure is new (_judged), so no entry is a culprit: all 3 land."""
+    p, repo, origin, other = _push_setup(env, monkeypatch, [_FLAKY_CHECK])
+    runs = iter([1])
+    heads = [_entry(repo, f"e{k}", {f"e{k}.txt": f"{k}\n", **({"tests/test_a.py": "x\n"} if k == 2 else {})})
+             for k in (1, 2, 3)]
+    _tests_stub(monkeypatch, lambda tree: {_FLAKY_ID} if how == "base" or next(runs, 0) else set())
+    rc, m = _run_batch(p, _batch_marker(p, heads), monkeypatch)
+    assert rc == 0 and m["outcome"] == "pushed" and _statuses(m) == ["pushed"] * 3, m
+
+
 def test_a_push_batch_lands_the_passing_entries_when_the_tip_fails_a_test_too(env, monkeypatch):
     """Cells base_fail_ignored and passing_entries_land: the tip fails _FLAKY_ID on its own, and entry 1
     of 3 breaks _NEW_ID too. _FLAKY_ID is pre-existing at every head, never the tip's failure (no
