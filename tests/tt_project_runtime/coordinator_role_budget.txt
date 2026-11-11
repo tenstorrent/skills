@@ -63,4 +63,4 @@
 +300: the `look` action row: the coordinator sets its own next check-in (looks.py, user msgs #2242, #2245)
 +46: text the batch-1 merge (#6 integration) left over the cap on 3bc14129b (cause not traced; this change adds no stateless-role text); measured 44817 against 44771
 +203: machine_change_overdue: the project's expired entries come batched; renew, close or undo them without the user's word; only a risky one left 24 h reaches the user
-+100: task_update check_plan: a task's own planned checks of its waits (waketier.py, user msgs #2231, #2245)
++120: task_update check_plan: a task's own planned checks of its waits (waketier.py, user msgs #2231, #2245)
