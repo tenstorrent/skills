@@ -8871,7 +8871,7 @@ def cmd_detach(a) -> None:
     `--idle-ok "<why>"` declares the job's low use by design (it waits on what the sampler cannot see):
     no under-use alarm, the reason shown where the job is listed (jobuse.declared); with a name or .rc
     and no command it sets or ('') removes that on a running job (_detach_idle_ok)."""
-    from . import detach, jobuse
+    from . import detach, jobuse, testslots
     from . import locks as lk
     from .push import _boxed, _own_ttp
     from .runner import boot_id
@@ -8979,6 +8979,11 @@ def cmd_detach(a) -> None:
     if any(f.exists() for f in (rc, logf, detach.queued(rc), detach.lost(rc))):
         die(f"a detached job named {a.name} already ran in this run; pick another name")
     asked = cmd
+    # A pytest -n job takes its workers from the host's test slots, as under `ttp clip` (testslots.detach_argv)
+    if (pooled := testslots.detach_argv(cmd, [sys.executable, str(Path(__file__).resolve().parents[2] / "bin" / "ttp")])) != cmd:
+        print("ttp detach: its pytest runs under `ttp sandbox`, which takes its test workers from the host's "
+              "test slots (fewer, or a short wait, while other runs hold them)", file=sys.stderr)
+        cmd = pooled
     if job_locks:
         cmd = _lock_job(job_locks, cmd)
     pid = None

@@ -1699,8 +1699,8 @@ def _check_runs() -> list[tuple[str, set[str], set[tuple[str, str]]]]:
 def too_many_workers(cmd: str) -> str | None:
     """Why `cmd` is refused when a pytest in it asks for more workers (`-n N`) than the run's test-worker
     budget (TTP_TEST_SLOTS, which the daemon gives worker runs: testslots.worker_env), or for more than
-    one outside `ttp clip` / `ttp sandbox`, which take them from the host's test pool (testslots.direct)
-    unless the run already holds slots; else None."""
+    one outside `ttp clip` / `ttp sandbox` / a local `ttp detach` (testslots.detach_argv), which take them from
+    the host's test pool (testslots.direct) unless the run already holds slots; else None."""
     from . import testslots
     try:
         k = int(os.environ.get(testslots.SLOTS_ENV) or 0)
@@ -1714,8 +1714,8 @@ def too_many_workers(cmd: str) -> str | None:
         return (f"pytest -n {max(big)} is above this run's test-worker budget of {k} on this shared host. "
                 f"Use -n {k} or fewer (or `-n auto`) through {how}")
     if not os.environ.get(testslots.HELD_ENV) and (bare := testslots.unpooled(cmd)):
-        return (f"pytest -n {bare[0]} outside `ttp clip` or `ttp sandbox` holds none of this shared host's "
-                f"test slots. Run it as {how}, or with no -n")
+        return (f"pytest -n {bare[0]} outside `ttp clip`, `ttp sandbox` or a local `ttp detach` holds none of "
+                f"this shared host's test slots. Run it as {how}, as a local `ttp detach` job, or with no -n")
     return None
 
 

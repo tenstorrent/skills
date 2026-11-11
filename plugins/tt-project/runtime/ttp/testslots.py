@@ -2058,14 +2058,41 @@ def _shell_counts(cmd: str) -> list[tuple[int, str]]:
     return out
 
 
+def _pools(seg: list) -> bool:
+    """Whether simple command `seg` runs its command under a wrapper that takes host test slots: `ttp clip`,
+    `ttp sandbox`, or a local `ttp detach` (its job runs a pytest -n under `ttp sandbox`: detach_argv);
+    a `ttp detach --remote` job runs on another host, so not."""
+    words = [w for *_, w in seg]
+    for i, (a, b) in enumerate(zip(words, words[1:])):
+        if _base(a) != "ttp" or b not in ("clip", "sandbox", "detach"):
+            continue
+        if b != "detach":
+            return True
+        opts = words[i + 2:]
+        opts = opts[:opts.index("--")] if "--" in opts else opts
+        return not any(o == "--remote" or o.startswith("--remote=") for o in opts)
+    return False
+
+
 def unpooled(cmd: str) -> list[str]:
     """The pytest `-n` values in `cmd` that may start more than one worker (an explicit N above 1, or a
-    value the shell fills in such as `-n $TTP_TEST_SLOTS`) whose command no `ttp clip` or `ttp sandbox`
-    wraps, so no host test slots are taken for them (direct)."""
-    wrapped = [(seg[0][0], seg[-1][1]) for seg in _segments(cmd)
-               if any(_base(a) == "ttp" and b in ("clip", "sandbox") for (*_, a), (*_, b) in zip(seg, seg[1:]))]
+    value the shell fills in such as `-n $TTP_TEST_SLOTS`) whose command no `ttp clip`, `ttp sandbox` or
+    local `ttp detach` wraps (_pools), so no host test slots are taken for them (direct)."""
+    wrapped = [(seg[0][0], seg[-1][1]) for seg in _segments(cmd) if _pools(seg)]
     found = [(start, str(n)) for start, *_, n in _edits(cmd, 1, False)] + _shell_counts(cmd)
     return [v for start, v in sorted(found) if not any(lo <= start <= hi for lo, hi in wrapped)]
+
+
+def detach_argv(argv: list[str], ttp: list[str]) -> list[str]:
+    """A detached job's command `argv` (`ttp detach`) as it runs: under `ttp sandbox --` (`ttp`: the words
+    that start this runtime's ttp) when, in a worker
+    run that holds no slots (SLOTS_ENV set, as direct), it runs a pytest that may start more than one
+    worker outside `ttp clip` or `ttp sandbox` (unpooled), so the job takes its test workers from the
+    host's pool for its life (direct), wherever it starts (here, the daemon, a reboot relaunch); else as
+    it is."""
+    if not _number(os.environ.get(SLOTS_ENV)) or os.environ.get(HELD_ENV) or os.environ.get(checkcap.HELD_ENV):
+        return argv
+    return [*ttp, "sandbox", "--", *argv] if unpooled(shlex.join(argv)) else argv
 
 
 def clamp(cmd: str, k: int) -> str:

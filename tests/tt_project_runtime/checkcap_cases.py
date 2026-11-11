@@ -1444,7 +1444,8 @@ def test_a_pytest_n_above_the_budget_is_lowered_with_a_line_saying_so_and_refuse
 
 
 @pytest.mark.parametrize("cmd", ["pytest -n 4 tests/a.py", "cd x && python3 -m pytest -n4 tests",
-                                 "ttp detach t -- pytest --numprocesses=3 tests", "ttp clip -- true; pytest -n 2 t",
+                                 "ttp detach --remote h t -- pytest --numprocesses=3 tests",
+                                 "ttp clip -- true; pytest -n 2 t",
                                  "pytest -n $TTP_TEST_SLOTS tests", 'pytest -n "${TTP_TEST_SLOTS}" t',
                                  "python3 -m pytest -n$(nproc) t", "pytest --numprocesses=$N t",
                                  "ttp clip -- true; pytest -n `nproc` t"])
@@ -1454,10 +1455,48 @@ def test_a_workers_pytest_n_outside_clip_or_sandbox_is_refused_as_it_holds_no_ho
     assert "holds none of this shared host's test slots" in (hook.too_many_workers(cmd) or "")
     for ok in ("pytest tests/a.py", "pytest -n 1 tests", "pytest -n 0 t", "ttp sandbox -- pytest -n 4 t",
                "ttp clip -- pytest -n 4 t", "ttp detach t -- ttp clip -- pytest -n 4 t",
+               "ttp detach t -- pytest --numprocesses=3 tests", "ttp detach --lock a t -- pytest -n 4 t",
                "ttp clip -- ttp sandbox -- pytest -n $TTP_TEST_SLOTS t", "head -n $N f", "nice -n $N pytest t"):
         assert hook.too_many_workers(ok) is None, ok
     monkeypatch.setenv(testslots.HELD_ENV, "4")
     assert hook.too_many_workers(cmd) is None, "inside a run that holds slots (a check) it runs on them"
+
+
+def test_ttp_detach_runs_a_workers_pytest_n_job_under_ttp_sandbox_so_it_takes_host_test_slots(env, tmp_path,
+                                                                                             monkeypatch):
+    from ttp import checkcap, cli, detach, push, testslots
+    job, ttp = ["python3", "-m", "pytest", "-n", "4", "t"], ["ttp"]
+    for k in (testslots.SLOTS_ENV, testslots.HELD_ENV, checkcap.HELD_ENV, "TTP_PROJECT", "TTP_PIDNS"):
+        monkeypatch.delenv(k, raising=False)
+    assert testslots.detach_argv(job, ttp) == job, "outside a worker run: no budget, as it is"
+    monkeypatch.setenv(testslots.SLOTS_ENV, "4")
+    assert testslots.detach_argv(job, ttp) == ["ttp", "sandbox", "--", *job]
+    assert testslots.detach_argv(["env", "A=1", *job], ttp)[:3] == ["ttp", "sandbox", "--"]
+    for same in (["ttp", "clip", "--", *job], ["ttp", "sandbox", "--", *job], ["pytest", "t"],
+                 ["pytest", "-n", "auto", "t"], ["make", "-j", "4"]):
+        assert testslots.detach_argv(same, ttp) == same, same
+    monkeypatch.setenv(testslots.HELD_ENV, "4")
+    assert testslots.detach_argv(job, ttp) == job, "a run that holds slots (a check) runs on them"
+    monkeypatch.delenv(testslots.HELD_ENV)
+    # `ttp detach` itself: the job it starts (and records for a relaunch) runs its pytest under `ttp sandbox`
+    run = tmp_path / "run"
+    run.mkdir()
+    monkeypatch.setenv("TTP_RUN_DIR", str(run))
+    monkeypatch.setattr(push, "_boxed", lambda: False)
+    monkeypatch.setattr(detach, "foreign_pidns", lambda: False)
+    started = {}
+    monkeypatch.setattr(detach, "start", lambda rc, log, argv, *a, **k: started.setdefault(Path(rc).stem, argv) and 0)
+    monkeypatch.chdir(tmp_path)
+    for name, argv in (("tests", job), ("plain", ["sh", "-c", "exit 0"])):
+        try:
+            cli.main(["detach", name, "--", *argv])
+        except SystemExit as e:
+            assert not e.code, e
+    assert started["tests"][-len(job) - 2:] == ["sandbox", "--", *job], started
+    assert Path(started["tests"][-len(job) - 3]).name == "ttp", started
+    assert started["plain"] == ["sh", "-c", "exit 0"], "a job with no pytest -n is left as it is"
+    rows = {j["name"]: j["argv"] for j in json.loads((run / "detached.json").read_text())}
+    assert rows["tests"] == started["tests"], rows
 
 
 def test_asked_reads_a_pytest_runs_worker_count(env):
