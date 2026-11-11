@@ -477,7 +477,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # lower severity, only counts; it stays closed and wakes nobody (null or 0: off).
     "screen": {"wake_min_severity": "normal", "rewake_after_h": 6, "same_subject_warn": 3, "reraise_window_h": 6},
     # The stale queued tail (queuetrim.py): a task that never started is cancelled, with its reason and a
-    # `ttp task <project> requeue <id>` undo, after expire_h queued (no open dependency, no start_when) or
+    # `ttp task <project> requeue <id> --force` undo, after expire_h queued (no open dependency, no start_when) or
     # dead_dep_h blocked on a failed or cancelled dependency (0: off). Urgent, user-ordered, review and
     # obligation-owner tasks never expire.
     "queue": {"expire_h": 48, "dead_dep_h": 24},

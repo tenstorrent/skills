@@ -35,7 +35,7 @@ def test_queuetrim_expires_only_the_stale_never_started_tail_with_reason_and_und
     t = db.task(stale)
     assert t["status"] == "cancelled"
     assert t["blocked_reason"] == (f"expired: queued 50 h without starting (queue.expire_h 48); "
-                                   f"undo: ttp task {p.name} requeue {stale}")
+                                   f"undo: ttp task {p.name} requeue {stale} --force")
     for kept in (fresh, urgent, urgent_line, by_user, cites, review, ran, waits, deferred):
         assert db.task(kept)["status"] == "queued", (kept, db.task(kept)["title"])
     ev = db.one("SELECT * FROM events WHERE kind='task_expired'")
@@ -44,7 +44,7 @@ def test_queuetrim_expires_only_the_stale_never_started_tail_with_reason_and_und
     assert queuetrim.expire(db, p.config(), p.name) == []
     assert [r["task"] for r in db.kv(queuetrim.KEY)] == [stale]
     # The undo puts it back in the queue and clears the reason.
-    assert db.requeue(stale) == ""
+    assert db.requeue(stale, force=True) == ""
     assert db.task(stale)["status"] == "queued" and db.task(stale)["blocked_reason"] is None
     # 0 turns it off.
     p.set_config("queue.expire_h", 0)
@@ -84,7 +84,7 @@ def test_queuetrim_daily_review_lists_each_expired_task_once(env):
     queuetrim.expire(p.db, p.config(), p.name)
     first = queuetrim.review_lines(p.db)
     assert len(first) == 1 and first[0].startswith(f"#{tid} an old idea: queued 72 h")
-    assert f"`ttp task {p.name} requeue {tid}`" in first[0]
+    assert f"`ttp task {p.name} requeue {tid} --force`" in first[0]
     assert queuetrim.review_lines(p.db) == []
 
 
@@ -208,7 +208,7 @@ def test_queuetrim_requeued_task_ages_from_its_requeue_not_its_creation(env):
     assert [x.split(":")[0] for x in queuetrim.expire(db, p.config(), p.name, t0)] == \
         [f"task {stale} expired", f"task {dead} expired"]
     # The recorded undo: requeued an hour later (the dead one is blocked again on its dependency).
-    assert db.requeue(stale) == "" and db.requeue(dead) == ""
+    assert db.requeue(stale, force=True) == "" and db.requeue(dead, force=True) == ""
     db.x("UPDATE tasks SET updated=? WHERE id=?", (t0 + 3600, stale))
     db.x("UPDATE tasks SET status='blocked', blocked_reason=?, updated=? WHERE id=?",
          (f"dependency #{live} failed", t0 + 3600, dead))
@@ -230,7 +230,7 @@ def test_queuetrim_requeued_open_task_keeps_its_record_past_the_cap(env):
     requeued = _qt_aged(p, "tidy the old notes", 50, kind="work")
     t0 = time.time()
     assert [x.split(":")[0] for x in queuetrim.expire(db, p.config(), p.name, t0)] == [f"task {requeued} expired"]
-    assert db.requeue(requeued) == ""
+    assert db.requeue(requeued, force=True) == ""
     db.x("UPDATE tasks SET updated=? WHERE id=?", (t0 + 3600, requeued))
     # More than KEEP newer records of finished or deleted tasks would push the requeued task's out.
     done = _qt_aged(p, "an old finished one", 60, kind="work")

@@ -10,7 +10,7 @@ expire() (Daemon.expire_queue, every EVERY_S): a task that never started (no run
   `queue.dead_dep_h` (default 24; 0: off), time for the coordinator to redo or re-point it.
 Never expired: an urgent task (urgent.is_urgent), a user-ordered one (user_ordered), a review, the owner of
 an open obligation. Each is cancelled with its reason in blocked_reason and one handled `task_expired`
-event, and recorded under KEY with its undo, `ttp task <project> requeue <id>` (requeue clears the
+event, and recorded under KEY with its undo, `ttp task <project> requeue <id> --force` (requeue clears the
 reason). review_lines() lists each record once in the daily review; digest_lines() shows the backlog.
 
 covering() (coordinator task_add): a new status, report, summary, check-on, digest or recap task (REPORT_RE
@@ -146,7 +146,7 @@ def expire(db: DB, cfg: dict, project: str, now: float | None = None) -> list[st
     now = time.time() if now is None else now
     lines = []
     for t, why in candidates(db, cfg, now):
-        undo = f"ttp task {project} requeue {t['id']}"
+        undo = f"ttp task {project} requeue {t['id']} --force"
         reason = f"expired: {why}; undo: {undo}"
         with db.tx():
             # One statement: a task dispatch starts or someone changes in between keeps its state.
@@ -202,7 +202,7 @@ def digest_lines(db: DB, since: float, now: float | None = None) -> list[str]:
         out.append("- Oldest non-urgent: " + ", ".join(f"#{t['id']}" for t in plain[:SHOWN]))
     if expired:
         out.append(f"- {len(expired)} never-started task(s) expired since your last turn (listed in the daily "
-                   f"review; `ttp task <project> requeue <id>` undoes one): "
+                   f"review; `ttp task <project> requeue <id> --force` undoes one): "
                    + ", ".join(f"#{r['task']}" for r in expired[:SHOWN]))
     return out
 

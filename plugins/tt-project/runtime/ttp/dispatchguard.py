@@ -14,7 +14,8 @@ was done (its last run ended in a task_done event) is refused too
 unless an explicit requeue came after that hand-off, start_when probe or not: a deferral that passes
 only makes it ready, never a reason to run it again. A cancel (`ttp task cancel`, the web app, the
 coordinator's status cancelled) records a `task_cancelled` event and sticks the same way: a cancelled task
-queued again with no explicit requeue after the cancel is refused and put back to cancelled."""
+queued again with no explicit requeue after the cancel is refused and put back to cancelled. So is a task
+whose last run failed at its attempt limit (put back to failed): the attempt cap holds at dispatch too."""
 from __future__ import annotations
 
 import time
@@ -55,6 +56,20 @@ def cancelled_unrequeued(db, task_id: int) -> bool:
     return bool((row or {}).get("c")) and (row["c"] or 0) > (row["r"] or 0)
 
 
+FAILED_RUNS = ("failed", "timeout", "stalled")   # run ends that spend an attempt and never queue at the cap
+
+
+def failed_at_cap_unrequeued(db, task: dict) -> bool:
+    """The task is at its attempt limit, its last run failed (which the daemon never queues again at the
+    cap) and no explicit requeue came after that run's end."""
+    if int(task.get("attempts") or 0) < int(task.get("max_attempts") or 3):
+        return False
+    run = db.one("SELECT status, ended FROM runs WHERE task=? ORDER BY id DESC LIMIT 1", (task["id"],))
+    if not run or run["status"] not in FAILED_RUNS or not run["ended"]:
+        return False
+    return not db.one("SELECT 1 FROM events WHERE task=? AND kind=? AND ts>=?", (task["id"], REQUEUED, run["ended"]))
+
+
 def refusal(db, task: dict) -> str:
     """Why `task` must not start now ('' when it may), from a fresh read of its row."""
     t = db.task(task["id"])
@@ -66,6 +81,9 @@ def refusal(db, task: dict) -> str:
     if cancelled_unrequeued(db, t["id"]):
         return (f"it was cancelled and queued again without an explicit requeue; "
                 f"attempts {int(t.get('attempts') or 0)} of {limit}")
+    if failed_at_cap_unrequeued(db, t):
+        return (f"its last run failed at its attempt limit (attempts {int(t.get('attempts') or 0)} of {limit}) "
+                f"and it was queued again without an explicit requeue")
     done = load_result(t.get("result")).get("status") == "done"
     if done and (n := done_closes(db, t["id"])) >= limit:
         return (f"it was already closed done {n} times (attempt limit {limit}) and was queued again "
@@ -84,11 +102,12 @@ def refuse(db, task_id: int, why: str) -> None:
     with db.tx():
         t = db.task(task_id)
         if t and t["status"] == "queued":
-            back = "cancelled" if cancelled_unrequeued(db, task_id) else "done"
+            back = "cancelled" if cancelled_unrequeued(db, task_id) else \
+                "failed" if failed_at_cap_unrequeued(db, t) else "done"
             db.x("UPDATE tasks SET status=?, updated=? WHERE id=? AND status='queued'", (back, now, task_id))
             db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
                  (now, f"task:{task_id}", REFUSED, "low",
-                  f"#{task_id} not dispatched: {why}. Put back to {back}; `ttp task requeue` runs it again.",
+                  f"#{task_id} not dispatched: {why}. Put back to {back}; `ttp task requeue --force` runs it again.",
                   "handled", task_id))
 
 

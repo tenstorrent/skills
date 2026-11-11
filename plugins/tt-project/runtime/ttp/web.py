@@ -978,7 +978,7 @@ class Handler(BaseHTTPRequestHandler):
                 if not t:
                     return self._send(404, {"error": "no task"})
                 if body.get("status") == "queued":
-                    why = db.requeue(tid)
+                    why = db.requeue(tid, force=True, by="web")   # a click is a deliberate decision
                     if why:
                         return self._send(409, {"error": why})
                 elif body.get("status") == "cancelled":

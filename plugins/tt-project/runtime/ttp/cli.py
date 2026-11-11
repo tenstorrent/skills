@@ -9494,7 +9494,7 @@ def cmd_task(a) -> None:
         if not a.title.strip().isdigit():
             die(f"requeue needs a task id, not {a.title!r}")
         tid = int(a.title)
-        why = p.db.requeue(tid)
+        why = p.db.requeue(tid, force=bool(a.force))
         if why:
             die(why)
         nb = (p.db.task(tid) or {}).get("not_before")
@@ -14504,6 +14504,9 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--by-review", type=int, help="superseded: for a failed (changes_needed) review, a passed "
                    "re-review of the same change chain that covers its findings")
     s.add_argument("--json", action="store_true", help="list: JSON rows with start_when/retry_when; show: the task record with its blocker_sweep")
+    s.add_argument("--force", action="store_true", help="requeue: run a cancelled or done task, or one that failed "
+                   "its last allowed attempt, again (a deliberate decision; scripts requeueing failed or waiting "
+                   "work leave it off)")
     s.add_argument("--status", help="list: only tasks in these statuses, comma-separated (queued,running,waiting,"
                    "blocked,review,done,failed,changes_needed,superseded,cancelled, ...); filtered before any cap, so every match "
                    "shows unless --limit is given")

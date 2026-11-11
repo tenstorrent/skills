@@ -2109,7 +2109,7 @@ def test_a_done_task_queued_again_without_a_requeue_is_not_dispatched_past_its_a
         assert f"task {again} not dispatched: it was already closed done 3 times" in \
             (p.logs / "daemon.log").read_text()
         settle(d)
-        assert p.db.requeue(again) == ""   # the user's decision: its done count starts again
+        assert p.db.requeue(again, force=True) == ""   # the user's decision: its done count starts again
         assert p.db.one("SELECT id FROM events WHERE task=? AND kind='task_requeued'", (again,))
         d.dispatch()
         assert again in _slot_tasks(p), "an explicit requeue did not run the task again"
@@ -2186,6 +2186,77 @@ def test_a_chain_continue_records_a_requeue(env):
     assert dispatchguard.refusal(p.db, p.db.task(tid)) == ""
 
 
+def test_a_plain_requeue_never_undoes_a_cancel_or_a_done_hand_off_or_passes_the_attempt_cap(env, capsys):
+    """Regression (upstream fp af9f443ce59b93ba): a project's model-free watcher script ran
+    `ttp task <project> requeue <id>` on a task its coordinator had cancelled, and the requeue counted as
+    the user's decision, so the task ran again at attempt 37 of 3. A plain requeue (CLI or db) now leaves
+    a cancelled or done task, or one that failed its last allowed attempt, as it is; `--force` (a
+    deliberate decision) and a web app click run it again, on record with who did it."""
+    from ttp import cli, dispatchguard, web
+    p = make(env)
+
+    def task(status, attempts=0):
+        tid = p.db.add_task(f"{status} at {attempts}", "s", kind="work", tier="light", origin="user")
+        p.db.x("UPDATE tasks SET status=?, attempts=? WHERE id=?", (status, attempts, tid))
+        return tid
+
+    cancelled, done, spent = task("cancelled", 37), task("done", 2), task("failed", 3)
+    for tid in (cancelled, done, spent):   # what a watcher script runs: refused, the task left as it is
+        before = p.db.task(tid)["status"]
+        with pytest.raises(SystemExit):
+            cli.main(["task", "demo", "requeue", str(tid)])
+        assert p.db.task(tid)["status"] == before and not _requeues(p, tid), tid
+        assert "--force" in capsys.readouterr().err
+        assert "--force" in p.db.requeue(tid), "the db path the CLI and web app share refuses it too"
+        assert dispatchguard.refusal(p.db, p.db.task(tid)), "never dispatched"
+    # Work a script may still requeue: failed under its cap, blocked, waiting.
+    for tid in (task("failed", 1), task("blocked", 5), task("waiting", 5)):
+        cli.main(["task", "demo", "requeue", str(tid)])
+        assert p.db.task(tid)["status"] == "queued", tid
+        assert [r["source"] for r in _requeues(p, tid)] == ["requeue"]
+    # A deliberate requeue: it runs again, and the event says it was forced.
+    cli.main(["task", "demo", "requeue", str(cancelled), "--force"])
+    assert p.db.task(cancelled)["status"] == "queued" and dispatchguard.refusal(p.db, p.db.task(cancelled)) == ""
+    assert [r["source"] for r in _requeues(p, cancelled)] == ["requeue --force"]
+    # The web app's Requeue is a click: deliberate.
+    port = _start_web(p)
+    req = urllib.request.Request(f"http://127.0.0.1:{port}/api/task/{done}", method="POST",
+                                 data=json.dumps({"status": "queued"}).encode(),
+                                 headers={"X-TTP-Token": web.token(p), "Content-Type": "application/json"})
+    for _ in range(50):
+        try:
+            with urllib.request.urlopen(req, timeout=2) as r:
+                assert r.status == 200
+            break
+        except urllib.error.HTTPError:
+            raise
+        except OSError:
+            time.sleep(0.1)
+    assert p.db.task(done)["status"] == "queued"
+    assert [r["source"] for r in _requeues(p, done)] == ["web --force"]
+
+
+def test_a_task_whose_last_run_failed_at_its_attempt_cap_is_not_dispatched_until_a_requeue(env):
+    """Regression (upstream fp af9f443ce59b93ba): the attempt cap holds at dispatch. A task whose last run
+    failed at its attempt limit and that some write queued again with no explicit requeue is refused and
+    put back to failed; under its cap, or after an explicit requeue, it may run."""
+    from ttp import dispatchguard
+    p = make(env)
+    tid = p.db.add_task("flaky", "s", kind="work", tier="light", origin="user")
+    now = time.time()
+    p.db.x("INSERT INTO runs(task, role, provider, status, started, ended) VALUES(?,?,?,?,?,?)",
+           (tid, "worker", "claude", "failed", now - 60, now - 30))
+    for attempts, refused in ((2, False), (3, True), (37, True)):
+        p.db.x("UPDATE tasks SET status='queued', attempts=? WHERE id=?", (attempts, tid))
+        why = dispatchguard.refusal(p.db, p.db.task(tid))
+        assert bool(why) == refused and (not refused or f"attempts {attempts} of 3" in why), (attempts, why)
+    dispatchguard.refuse(p.db, tid, dispatchguard.refusal(p.db, p.db.task(tid)))
+    assert p.db.task(tid)["status"] == "failed"
+    assert "requeue --force" in p.db.one("SELECT text FROM events WHERE task=? AND kind='dispatch_refused'", (tid,))["text"]
+    assert p.db.requeue(tid, force=True) == ""
+    assert dispatchguard.refusal(p.db, p.db.task(tid)) == "", "the deliberate requeue grants a run"
+
+
 def test_a_cancelled_task_queued_again_without_a_requeue_is_not_dispatched(
         env, monkeypatch, tmp_path, reap_tmp_processes):
     """Regression (upstream fp aed18d8ef1b1ecc7): a task cancelled for good (`ttp task cancel`, or the
@@ -2208,7 +2279,7 @@ def test_a_cancelled_task_queued_again_without_a_requeue_is_not_dispatched(
             ev = p.db.one("SELECT text FROM events WHERE task=? AND kind='dispatch_refused'", (tid,))
             assert ev and "cancelled and queued again" in ev["text"] and "attempts 35 of 3" in ev["text"]
         settle(d)
-        assert p.db.requeue(by_cli) == ""   # the user's decision: it runs again
+        assert p.db.requeue(by_cli, force=True) == ""   # the user's decision: it runs again
         d.dispatch()
         assert by_cli in _slot_tasks(p) and by_coord not in _slot_tasks(p)
     finally:
@@ -2240,7 +2311,7 @@ def test_a_done_task_with_a_start_when_probe_past_its_attempt_limit_is_not_redis
         ev = p.db.one("SELECT text FROM events WHERE task=? AND kind='dispatch_refused'", (held,))
         assert ev and "attempts 9 of 3" in ev["text"]
         settle(d)
-        assert p.db.requeue(held) == ""   # the user's decision: it runs again
+        assert p.db.requeue(held, force=True) == ""   # the user's decision: it runs again
         d.dispatch()
         assert held in _slot_tasks(p), "an explicit requeue did not run the task again"
     finally:
