@@ -2585,6 +2585,22 @@ def test_dispatch_holds_daemon_reviews_of_one_unchanged_subject_but_not_a_re_rev
     assert supersede.dispatch_hold(p.db, p.db.task(r2)) == ""
 
 
+def test_dispatch_never_holds_owners_of_different_obligations_as_duplicates(env):
+    """The owner note the harness appends to each owner's spec reads alike for any two obligations, so two owners
+    of different obligations looked like one task and the second was held. Owning other obligations is other
+    work; a same-title task owing the same obligation, or none, is still held."""
+    from ttp import supersede
+    p = make(env)
+    note = "\n\n## Obligation {} (urgent, owed to the user)\nship the deliverable\nRecord progress every 2 h.\n"
+    a = p.db.add_task("ship the relay deliverable", "build it" + note.format("o1"), kind="work")
+    b = p.db.add_task("ship the relay deliverable", "build it" + note.format("o2"), kind="work")
+    c = p.db.add_task("ship the relay deliverable", "build it" + note.format("o1"), kind="work")
+    d = p.db.add_task("ship the relay deliverable", "build it", kind="work")
+    assert supersede.dispatch_hold(p.db, p.db.task(b)) == ""
+    assert f"duplicates #{a}" in supersede.dispatch_hold(p.db, p.db.task(c))
+    assert "duplicates #" in supersede.dispatch_hold(p.db, p.db.task(d))
+
+
 def test_dispatch_holds_a_task_whose_step_a_newer_user_order_superseded(env):
     """An obligation's `supersedes` steps are kept with the order: a queued task created before it whose spec
     still carries such a step is held at dispatch; one re-specified after the order, or created after it, runs."""

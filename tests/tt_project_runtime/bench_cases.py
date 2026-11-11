@@ -336,7 +336,9 @@ def test_bench_run_cell_cannot_reach_the_landed_commit_later_history_or_the_held
     arms = {"a": {"provider": "claude", "model": "", "effort": ""}, "b": {"provider": "claude", "model": "", "effort": ""}}
     out = tmp_path / "h2h"
     rows = benchrun.run(tmp_path / "bench", out, arms, 1, 1, _bench_opts(tmp_path), p.config())
-    assert [r["outcome"] for r in rows] == ["fail", "fail"], "isolation passed and the candidate did not solve it"
+    # The hunt's history command is in its transcript (as a real agent's tool call is): the audit flags the
+    # cell, which fails ungraded; isolation is what the found files below show.
+    assert [(r["outcome"], r["flagged"], r["passed"]) for r in rows] == [("flagged", ["runs 'git log --all'"], False)] * 2
     for r in rows:
         found = (out / "cells" / f"{tid}-r1-{r['arm']}" / "diff.patch").read_text()
         assert "found.txt" in found and task["head"] not in found and task["base"] not in found

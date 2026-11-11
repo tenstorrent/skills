@@ -1191,7 +1191,9 @@ def _has_time(sentence: str) -> bool:
 
 def authored(text: str) -> str:
     """`text` without the lines the harness appends to a coordinator message before it is posted (onhost's
-    'Status now:' queue forecasts, wakemode's mode line): what the coordinator itself wrote."""
+    'Status now:' queue forecasts, wakemode's mode line): what the coordinator itself wrote. A queue
+    forecast is the harness's, never the sender's own promise. One definition: a second one below once
+    replaced this and let the mode line's ETA mint a promise."""
     from . import onhost, wakemode
     text = text or ""
     for head in (onhost.STATUS_HEAD, wakemode.HEAD):
@@ -1317,13 +1319,6 @@ def _named_owner(db, chat: str, text: str) -> int | None:
     rows = db.q(f"SELECT id, status, reply_chat FROM tasks WHERE id IN ({','.join('?' * len(ids))})", ids)
     hits = [r["id"] for r in rows if r["status"] in NAMED_OPEN and r["reply_chat"] and _chat(r["reply_chat"]) == chat]
     return hits[0] if len(hits) == 1 else None
-
-
-def authored(text: str) -> str:
-    """`text` without the footer the harness appends to a sent reply (onhost: "Status now: #12: queued
-    for a worker, ETA ..."): the queue forecast is the harness's, never the sender's own promise."""
-    from .claimcheck import STATUS_TAIL
-    return (text or "").partition(STATUS_TAIL)[0]
 
 
 def record_promises(p, sent: list[tuple[int, str | None, str]], tasks: dict[int, str | None],

@@ -566,15 +566,16 @@ def test_every_restart_route_outside_launchd_starts_the_daemon_module(env, monke
 
 
 def test_a_hand_started_daemon_never_inherits_its_starters_run_env(env, monkeypatch):
-    """A restart or upgrade run from another project's worker or coordinator shell starts this project's
-    daemon by hand (no service): it must not inherit that run's TTP_ variables (role, run id, project)
-    or its agent's per-command env file, as a service or cron start would not. An inherited
-    CLAUDE_ENV_FILE naming the starter's loopproxy.sh broke every Bash call of the new daemon's workers."""
+    """A restart or upgrade run from a worker or coordinator shell starts the project's daemon by hand
+    (no service): it must not inherit that run's TTP_ variables (role, run id, project) or its agent's
+    per-command env file, as a service or cron start would not. An inherited CLAUDE_ENV_FILE naming the
+    starter's loopproxy.sh broke every Bash call of the new daemon's workers. The run is the project's
+    own: a run of another project is refused before any start (test_a_run_of_another_project_*)."""
     from ttp import hoststate, service
     p = make(env)
     popen = []
     monkeypatch.setattr(service.subprocess, "Popen", lambda argv, **kw: popen.append((argv, kw)))
-    leaked = {"TTP_ROLE": "reviewer", "TTP_RUN_ID": "16596", "TTP_PROJECT": "/other/tt-project",
+    leaked = {"TTP_ROLE": "reviewer", "TTP_RUN_ID": "16596", "TTP_PROJECT": str(p.base),
               "TTP_RUN_DIR": "/other/run", "CLAUDE_ENV_FILE": "/other/ttp/loopproxy.sh",
               "TTP_PREV_CLAUDE_ENV_FILE": "/other/ttp/loopproxy.sh", "CLAUDECODE": "1",
               "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1"}
