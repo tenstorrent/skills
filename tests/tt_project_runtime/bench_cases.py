@@ -813,3 +813,24 @@ def test_harbor_slice_failed_install_skips_it_without_another_route(env, tmp_pat
     assert len(calls) == 2, "a failed install is never retried"
     (d / harborslice.TASKS).unlink()
     assert "no task names" in harborslice.row("m-a", "2026-11-10", 2, d, tmp_path / "c2", {}, runner)["skipped"]
+
+
+def test_model_suite_decisions_map_verb_records_and_faults_never_set_the_bar(env, tmp_path):
+    from ttp import modelsuite, waitgate
+    p = make(env)
+    run = tmp_path / "r"
+    run.mkdir()
+    (run / "progress.md").write_text("waiting on a job\n")
+    p.db.x("INSERT INTO tasks(id, title, spec, kind, status) VALUES(950, 't', 's', 'work', 'waiting')")
+    p.db.x("INSERT INTO runs(task, role, status, started, dir) VALUES(950, 'worker', 'done', 100.0, ?)", (str(run),))
+    p.db.x("INSERT INTO jev_calls(ts, use, ref, decision, outcome) VALUES(200.0, ?, 'task:950', ?, 'right')",
+           (waitgate.USE, json.dumps({"by": "babysit", "task": 950, "verb": "wake"})))
+    cases = modelsuite.decisions(p.db, "2026-11-10")
+    assert [c["want"] for c in cases if not c["planted"]] == ["wake"]
+    cs = [{"id": 1, "state": "s", "want": "wake", "planted": False}, {"id": 2, "state": "s", "want": "wake", "planted": True}]
+
+    def boom(m, q):
+        raise OSError("down")
+    assert modelsuite.babysit("m", cs, boom)["bar"] is False
+    assert modelsuite.babysit("m", cs, lambda m, q: "???")["bar"] is False
+    assert modelsuite.babysit("m", cs, lambda m, q: "skip")["bar"] is True
