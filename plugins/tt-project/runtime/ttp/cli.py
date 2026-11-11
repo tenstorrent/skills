@@ -3645,6 +3645,9 @@ def cmd_checks(a) -> None:
         print(warn, flush=True)
     # The repo being checked picks its list (push.repo_checks): the harness repo never runs the code repo's.
     configured, source = push.repo_checks(d, Path(top), p)
+    if purpose == "candidate":   # a task's quick set (delivery.task_checks); the push train runs the push checks
+        from . import testpick
+        configured, source = testpick.task_set(d, configured, source, getattr(a, "release", False))
     own = push.with_host(push.check_list(configured), checks_host)
     harness_unset = source == push.HARNESS_UNSET
     if harness_unset:

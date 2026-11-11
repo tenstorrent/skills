@@ -2693,7 +2693,14 @@ session and stateless coordinators on every provider.
   fixture it changes, and a selection of half the suite or more stays targeted. A task's
   `ttp checks --full` is refused with a one-line reason unless the user set
   `delivery.checks_task_full: true`; `ttp checks --release` (the release cut's required suite) always
-  runs in full: never narrowed, refused or fast-pathed. A change only the full suite covers adds the tests it can place,
+  runs in full: never narrowed, refused or fast-pathed. A selection too long for one environment
+  variable goes compressed (`TTP_PYTEST_SELECT_FILES_Z`) and stays targeted. `delivery.task_checks`
+  (a check list, same form as `push_checks`) is a task's own quick set: a task's or review's
+  `ttp checks` runs it, targeted as above, instead of the push checks; unset, it runs the push checks
+  (the smoke set that gates a landing). The push train (or `ttp push`) still runs the push checks
+  once per batch on the merged heads, drops only the change at fault and lands the rest, and
+  `delivery.post_land_checks` runs the slower tests after landing, so nothing lands without its push
+  checks passing. A change only the full suite covers adds the tests it can place,
   and the scope line ends `; the push batch runs the rest: <reasons>`. With the push queue off a
   task's checks narrow and widen as before. Each checks run records its wall and CPU seconds
   (`wall_s`, `cpu_s`) in `checks.json`; `ttp stats <name> --landing` shows per day the test runs and

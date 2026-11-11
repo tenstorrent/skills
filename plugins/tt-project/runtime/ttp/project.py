@@ -668,6 +668,7 @@ EXTRA_KEYS = {
                  "allow_protected_push_branch", "own_push", "own_push_remote", "own_push_reserved_lane", "deploy_restart_wait_s", "plugin_version_guard",
                  "checks_fast_globs", "checks_fast_exclude",   # these two: `ttp checks` fast path (push.FAST_GLOBS),
                  "checks_targeted", "checks_targeted_always",   # a task's `ttp checks` runs the tests its diff reaches (testpick)
+                 "task_checks",   # a task's own `ttp checks` list (testpick.task_set); unset: the push checks
                  "checks_task_full",   # the user's own: a task's `ttp checks --full` runs with the push queue on (testpick.full_refusal)
                  "checks_host",   # where checks run (remotecheck)
                  "checks_spill_hosts", "checks_spill_after_s", "checks_spill_first", "checks_remote_only",   # where busy checks may spill to (checkspill)
@@ -1203,6 +1204,7 @@ def config_problems(raw: dict, root: Path | None = None) -> list[str]:
     out += [f"delivery.push_checks: {p}" for p in check_problems(delivery.get("push_checks"))]
     out += [f"delivery.push_checks: {p}" for p in applicability_problems(delivery.get("push_checks"), root)]
     out += [f"delivery.post_land_checks: {p}" for p in check_problems(delivery.get("post_land_checks"))]
+    out += [f"delivery.task_checks: {p}" for p in check_problems(delivery.get("task_checks"))]
     out += [f"delivery.push_checks_by_repo: {p}" for p in by_repo_problems(delivery.get("push_checks_by_repo"))]
     for k in ("checks_targeted", "checks_task_full"):
         if delivery.get(k) not in (None, True, False):
