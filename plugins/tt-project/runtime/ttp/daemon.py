@@ -19290,11 +19290,9 @@ class Daemon:
                 self._nofix += f"; reverting #{i} on {branch} failed: {out}"
                 log(self.p, f"review {review['id']}: #{i} not reverted on {branch}: {out}")
                 if reverted:
-                    r = subprocess.run(["git", "update-ref", f"refs/heads/{branch}", orig, new], cwd=root,
-                                       capture_output=True, text=True, timeout=60)
+                    back, why = integrate.put_back(root, branch, orig, new)
                     self._nofix += (f"; so {', '.join(f'#{j}' for j in reverted)} were not reverted either"
-                                    if r.returncode == 0 else
-                                    f"; {branch} could not be put back to {orig[:12]}: {r.stderr.strip()[:200]}")
+                                    if back else f"; {branch} could not be put back to {orig[:12]}: {why}")
                 return None
             new = out
             reverted.append(i)

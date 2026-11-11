@@ -322,10 +322,45 @@ def test_a_failed_member_revert_that_conflicts_leaves_the_shared_branch_unreview
         tip = _git_out(p.root, "rev-parse", br).strip()
         assert integrate.REVERT_TRAILER not in _git_out(p.root, "log", "-1", "--format=%B", tip), br
     assert _git_out(p.root, "rev-parse", cbranch).strip() == chead, "the branch was put back"
+    # c's worktree holds the branch: its index and files went back too, so no revert is left staged.
+    assert _git_out(path, "status", "--porcelain", "--untracked-files=no") == "", "the holder is clean"
+    assert (path / "second.py").read_text() == "c\n" * 20 and (path / "first.py").exists()
     assert not p.db.q("SELECT * FROM tasks WHERE title LIKE 'Redo #%'")
     assert not p.db.q("SELECT * FROM tasks WHERE kind='review' AND id!=?", (rid,)), "a head with b's commits"
     assert not p.db.q("SELECT * FROM push_queue WHERE task=?", (rid,))
     assert f"reverting #{b} on" in ev["text"] and "No automatic fix" in ev["text"], ev["text"]
+
+
+def test_putting_a_reverted_branch_back_resets_its_holder_or_moves_the_ref(env):
+    """integrate.put_back undoes revert_member's commits: with a worktree holding the branch it resets
+    there, so the index and files match the ref (a bare update-ref left the revert staged); with none
+    it moves the ref by compare-and-swap. A branch that moved meanwhile is left alone."""
+    from ttp import integrate
+    repo = env["tmp"] / "pb"
+    repo.mkdir()
+    _git_out(repo, "init", "-q", "-b", "main")
+    _int_commit(repo, "f", "base\n", "base")
+    wt = env["tmp"] / "pb-wt"
+    _git_out(repo, "worktree", "add", "-q", "-b", "shared", str(wt))
+    a = _int_commit(wt, "f", "a\n", "member a")
+    _git_out(repo, "branch", "loose", a)
+    for branch, holder in (("shared", wt), ("loose", None)):
+        ok, new = integrate.revert_member(repo, branch, 7, [a])
+        assert ok, new
+        if holder is not None:
+            assert (holder / "f").read_text() == "base\n"
+        assert integrate.put_back(repo, branch, a, "0" * 40)[0] is False, "moved meanwhile: refused"
+        assert _git_out(repo, "rev-parse", branch).strip() == new
+        assert integrate.put_back(repo, branch, a, new) == (True, "")
+        assert _git_out(repo, "rev-parse", branch).strip() == a
+        if holder is not None:
+            assert _git_out(holder, "status", "--porcelain") == "", "nothing staged in the holder"
+            assert (holder / "f").read_text() == "a\n"
+    # A holder with uncommitted changes is never reset.
+    ok, new = integrate.revert_member(repo, "shared", 7, [a])
+    (wt / "f").write_text("edit\n")
+    assert integrate.put_back(repo, "shared", a, new)[0] is False
+    assert (wt / "f").read_text() == "edit\n" and _git_out(repo, "rev-parse", "shared").strip() == new
 
 
 def test_a_redo_of_a_member_that_joined_by_pr_branch_gets_a_branch_of_its_own(env):

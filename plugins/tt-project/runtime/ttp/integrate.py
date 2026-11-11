@@ -269,6 +269,26 @@ def revert_member(repo: Path, branch: str, task_id: int, commits: list[str]) -> 
             shutil.rmtree(tmp, ignore_errors=True)
 
 
+def put_back(repo: Path, branch: str, orig: str, expect: str) -> tuple[bool, str]:
+    """Undo revert_member's forward commits: move `branch` from `expect` back to `orig`, (True, '') or
+    (False, why). A worktree that has the branch checked out is reset there (`git reset --hard`), so its
+    index and files match the ref again and no revert is left staged for its next commit; with none,
+    the ref moves by compare-and-swap. A branch that moved meanwhile, or a holder with uncommitted
+    changes, is left as it is."""
+    held = _checked_out(repo, branch)
+    if held is None:
+        r = subprocess.run(["git", "update-ref", f"refs/heads/{branch}", orig, expect], cwd=repo,
+                           capture_output=True, text=True, timeout=60)
+        return (True, "") if r.returncode == 0 else (False, r.stderr.strip()[:200])
+    if worktree._git(held, "rev-parse", "HEAD", check=False) != expect:
+        return False, f"{branch} moved at {held}"
+    if worktree._git(held, "status", "--porcelain", "--untracked-files=no", check=False):
+        return False, f"{branch} is checked out at {held} with uncommitted changes"
+    r = subprocess.run(["git", "reset", "--hard", "-q", orig], cwd=held, capture_output=True, text=True,
+                       timeout=60)
+    return (True, "") if r.returncode == 0 else (False, r.stderr.strip()[:200])
+
+
 def conflicts(repo: Path, onto: str, head: str) -> list[str] | None:
     """The files merging `head` onto `onto` conflicts in ([] merges cleanly), or None when it could not
     be told. Uses `git merge-tree --write-tree` (git 2.38+), else a trial merge in a scratch worktree."""
