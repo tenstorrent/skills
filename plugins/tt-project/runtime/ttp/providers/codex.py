@@ -110,8 +110,9 @@ class Codex(Provider):
     cache_key_per_session = True
     coord_session = "agent"   # `codex exec ... resume <id> -`; size and compaction from the rollout (session_context)
     session_format = "codex-rollout"   # sessions/YYYY/MM/DD/rollout-<time>-<id>.jsonl (fork_session)
-    # --output-schema is per run; whether `exec resume` re-reads `-c developer_instructions` is not
-    # documented, so the harness sends the system prompt's diff too.
+    # --output-schema is per run, but `exec resume` keeps the first run's developer instructions: on
+    # 0.160 the resumed request carried the old text and none of a changed `-c developer_instructions`
+    # (measured against a local stand-in API), so the harness sends the system prompt's diff too.
     resume_new_prompt = "diff"
     mcp_by_args = True   # `-c mcp_servers=...` (codexmcp.py): Codex has no per-run MCP config file
     # Whether build() left the harness hook out only because the user's config.toml defines hooks or

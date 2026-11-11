@@ -826,6 +826,30 @@ def test_coordsession_system_prompt_is_byte_identical_between_wakes_with_an_unch
     assert len(coordinator_role(p)) <= _role_budget()
 
 
+@pytest.mark.parametrize("how", ["diff", "reread"])
+def test_a_resumed_session_gets_the_system_prompt_diff_only_where_the_resume_keeps_the_old_prompt(
+        env, monkeypatch, how):
+    """#7718: `codex exec resume` (0.160, measured against a local stand-in API) sends the first run's
+    developer instructions and drops a changed `-c developer_instructions`, so Codex keeps "diff" and the
+    wake carries the system prompt's diff; a provider that re-reads it ("reread") gets one line instead."""
+    from ttp import coordsession
+    from ttp.providers import fake, get_provider
+    monkeypatch.setattr(fake.Fake, "resume_new_prompt", how)
+    p, d, sessions, wake = _cs_session_project(env, monkeypatch)
+    first, system1, _ = wake("one")
+    p.charter_path.write_text(_CS_CHARTER.replace("Never push to main", "Never push to main or release"))
+    second, system2, prompt2 = wake("two")
+    assert (second["mode"], second["why"]) == ("resume", "prompt changed") and second["key"] != first["key"]
+    assert "Never push to main or release" in system2 and "Never push to main or release" not in system1
+    block = prompt2.split(coordsession.CHANGED_HEAD, 1)[1]
+    if how == "diff":
+        assert "System prompt (" in block and "+- Never push to main or release" in block, block
+        assert "System prompt: changed" not in block
+    else:
+        assert "System prompt (" not in block and "System prompt: changed (the new one is in effect)." in block
+    assert get_provider("codex").resume_new_prompt == "diff"
+
+
 def test_both_coordinator_modes_and_the_planner_pass_the_worker_the_context_it_cannot_see(env):
     """User msg #1785: a worker or planner sees none of the coordinator's context, so each spec, plan
     brief and mid-run correction carries a Context block; a plan gives its own tasks the same block."""
