@@ -4199,7 +4199,10 @@ def cmd_checks(a) -> None:
             checkjoin.update(join_rec, phase=checkjoin.RUNNING, run_since=time.time())
         child_env = {"PWD": top, **venv_vars, **(slot.env() if slot else {})}
         run_env = {**push.check_env("checks", run_dir=getattr(a, "check_run_dir", None), lock=lock), **child_env}
-        for line in [] if hit or handover else push.sandbox_lines(todo):
+        # The priority its checks run at here, with its settings, once per run (a remote host's: remotecheck).
+        from . import testslots
+        prio_line = [testslots.priority_line(cfg)] if any(not push.remote_host(c) for c in todo) else []
+        for line in [] if hit or handover else [*push.sandbox_lines(todo), *prio_line]:
             print(f"ttp checks: {line}", flush=True)
             out.write(f"ttp checks: {line}\n")
         # Local checks run in a clean checkout of `head` (cleantree), never in this worktree, whose
@@ -4569,6 +4572,11 @@ def cmd_checks(a) -> None:
                         env_why = push.env_problem(ran_out, top) or ""
                 except OSError:
                     pass
+            if rc == 75 and not timed_out:   # its spill wrapper refused it or is missing: status names it (a limit line)
+                from . import checklane, checkspill, remotecheck
+                if (wrapped := remotecheck.wrap_fault(ran_out))[1]:
+                    checkspill.note_limit(p.name, f"spill host {wrapped[0] or spilled.host}: {wrapped[1]}; its "
+                                          "checks run again on another host or here", checklane.scope_text(todo)[:300])
             no_spill = checkspill.spill_off_add(no_spill, spilled.host, rc == 75 and not timed_out,
                                                 p.config() if env_why else None, cfg=p.config())
             if env_why:
@@ -5404,7 +5412,9 @@ def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: boo
         # A task's checks never start on an overloaded check host (only push checks keep a bounded start):
         # in the foreground the wait hands over to detached checks after FOREGROUND_WAIT_S, detached it waits.
         bound = checkcap.FOREGROUND_WAIT_S if foreground and p else None
-        if remoteload.wait(hosts, tell, bound, anyway=False):
+        # While it waits, status names the guard and its setting (a limit line), cleared once the wait ends.
+        note = (lambda line: checkspill.note_limit(p.name, line, checklane.scope_text(cmds)[:300])) if p else None
+        if remoteload.wait(hosts, tell, bound, anyway=False, note=note):
             return None
         # Each host's check slots are claimed as a spill pick claims them, so runs here never overshoot it.
         if (claims := checkspill.admit_pinned(p, hosts, tell, what=checklane.scope_text(cmds)[:300],

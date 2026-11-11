@@ -2209,6 +2209,34 @@ def priority_args(cfg: dict | None = None) -> tuple[list, list] | None:
     return ["nice", "-n", str(nice_level(cfg))], ["ionice", *ionice_args(cfg)]
 
 
+def _ionice_name(words: list) -> str:
+    """'idle', 'best-effort N' or 'best-effort' for ionice argv words (ionice_args), else the words."""
+    w = [str(x) for x in words]
+    if w == ["-c3"]:
+        return "idle"
+    if w[:1] == ["-c2"]:
+        return "best-effort" + (f" {w[2]}" if len(w) > 2 else "")
+    return " ".join(w)
+
+
+def priority_line(cfg: dict | None = None, where: str = "", which=shutil.which) -> str:
+    """The one line a checks run logs about its priority (low_priority, remotecheck._priority): the nice
+    level and ionice class its commands run at, each with its setting, so the slowdown is never silent.
+    `where` names a remote host (which then applies them where it has them); without it, a tool this
+    machine lacks is said to be skipped."""
+    prio = priority_args(cfg)
+    if prio is None:
+        return "check commands run at normal priority (checks.nice false)"
+    nice, ionice = prio
+    parts = [f"nice {nice[-1]} (checks.nice)", f"ionice class {_ionice_name(ionice[1:])} (checks.ionice)"]
+    if not where:
+        parts = [part + ("" if which(tool) else ", skipped: not on this machine")
+                 for part, tool in zip(parts, ("nice", "ionice"))]
+    return (f"check commands run at low priority{f' on {where}' if where else ''}, behind the host's other "
+            f"processes: {'; '.join(parts)}{'; each where the host has it' if where else ''}; "
+            "checks.nice false runs them at normal priority")
+
+
 def low_priority(argv: list) -> list:
     """A check command's argv under `nice` (nice_level) and `ionice` (ionice_args) where they exist, so a
     host's live services go first; either missing is skipped. checks.nice false (priority_args)

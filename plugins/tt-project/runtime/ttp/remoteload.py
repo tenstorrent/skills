@@ -128,22 +128,38 @@ def held(host: str, start: bool = False, fresh: bool = False, now: Callable[[], 
               "CPU limit checks.load_guard)")
 
 
+def guard_line(why: str, bound: float | None) -> str:
+    """The limit line naming the remote load guard, its threshold setting and what ends the wait."""
+    return (f"held by the remote load guard (threshold checks.load_guard x the host's cores; 0 turns it off): "
+            f"{why}; waiting until it drops, never starting there while it is")
+
+
 def wait(hosts: list[str], say: Callable[[str], None], bound: float | None,
-         sleep: Callable[[float], None] = time.sleep, clock: Callable[[], float] = time.monotonic) -> str:
+         sleep: Callable[[float], None] = time.sleep, clock: Callable[[], float] = time.monotonic,
+         note: Callable[[str], None] | None = None) -> str:
     """Wait while one of `hosts` is overloaded (held): never start on one that is. `bound` (seconds; None:
-    once) is how often the wait is told again. "" once all may start, each start recorded (held's `start`)."""
-    start, said, told_at = clock(), "", clock()
-    while True:
-        host, why = next(((h, w) for h in hosts if (w := held(h))), ("", ""))
-        if not why:   # each host again, fresh and under its lock, recording this start
-            host, why = next(((h, w) for h in hosts if (w := held(h, start=True, fresh=True))), ("", ""))
-            if not why:
-                return ""
-        if host != said:   # once per host it waits for, not at each new reading
-            say(f"{why}; waiting for it to drop, never starting there while it is"
-                + (f" (told again every {bound:.0f}s, checks.push_load_wait_s)" if bound is not None else ""))
-            said, told_at = host, clock()
-        elif bound is not None and clock() - told_at >= max(bound, TELL_MIN_S):
-            say(f"{why}; still waiting after {clock() - start:.0f}s, never starting there while it is")
-            told_at = clock()
-        sleep(POLL_S)
+    once) is how often the wait is told again. "" once all may start, each start recorded (held's `start`).
+    `note` (a limit line for status, e.g. checkspill.note_limit) names the guard and its settings while it
+    waits, and gets "" once the wait ends."""
+    start, said, told_at, noted = clock(), "", clock(), ""
+    try:
+        while True:
+            host, why = next(((h, w) for h in hosts if (w := held(h))), ("", ""))
+            if not why:   # each host again, fresh and under its lock, recording this start
+                host, why = next(((h, w) for h in hosts if (w := held(h, start=True, fresh=True))), ("", ""))
+                if not why:
+                    return ""
+            if note and host != noted:
+                note(guard_line(why, bound))
+                noted = host
+            if host != said:   # once per host it waits for, not at each new reading
+                say(f"{why}; waiting for it to drop, never starting there while it is"
+                    + (f" (told again every {bound:.0f}s, checks.push_load_wait_s)" if bound is not None else ""))
+                said, told_at = host, clock()
+            elif bound is not None and clock() - told_at >= max(bound, TELL_MIN_S):
+                say(f"{why}; still waiting after {clock() - start:.0f}s, never starting there while it is")
+                told_at = clock()
+            sleep(POLL_S)
+    finally:
+        if noted:
+            note("")

@@ -2080,6 +2080,21 @@ def test_check_priority_follows_the_project_s_checks_ionice(env, monkeypatch):
     assert testslots.ionice_args(None) == ["-c2", "-n", "3"]
 
 
+def test_check_priority_line_names_the_nice_level_the_ionice_class_and_their_settings(env, monkeypatch):
+    """#8107 (nice_line_logged): the low priority checks run at is said with its values and settings, here
+    (a tool this machine lacks is said skipped) and on a remote host; checks.nice false says normal priority."""
+    from ttp import project, testslots
+    line = testslots.priority_line({}, which=lambda t: f"/usr/bin/{t}")
+    assert "nice 19 (checks.nice)" in line and "ionice class idle (checks.ionice)" in line and "skipped" not in line
+    assert "ionice class idle (checks.ionice), skipped: not on this machine" in testslots.priority_line(
+        {}, which=lambda t: "" if t == "ionice" else f"/usr/bin/{t}")
+    project.set_account_setting("checks.ionice", "best-effort:3")
+    remote = testslots.priority_line({}, "check-host-a")
+    assert "on check-host-a" in remote and "best-effort 3 (checks.ionice)" in remote and "where the host has it" in remote
+    project.set_account_setting("checks.nice", False)
+    assert testslots.priority_line({}) == "check commands run at normal priority (checks.nice false)"
+
+
 def test_check_priority_invalid_values_fall_back_to_the_defaults(env, monkeypatch):
     got = _argv_with(monkeypatch, {"checks.nice": "soon", "checks.ionice": "bogus:9"}, runner={"nice": "x"})
     assert got == ["nice", "-n", "19", "ionice", "-c3", "pytest"]

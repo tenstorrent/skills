@@ -2358,6 +2358,9 @@ def test_a_remote_wrapper_that_records_its_refusal_is_a_host_fault_and_a_plain_e
         return r.returncode, r.stdout + r.stderr
     rc, out = go(f"echo ran >> {ran}", refuse="mark75")
     assert rc == remotecheck.FAULT_RC and f"{remotecheck.SIG}box1" in out and "refused" in out, out
+    host, why = remotecheck.wrap_fault(out)   # #8107: the limit line status shows names the host and the setting
+    assert host == "box1" and "'./busy.sh' refused the run there" in why and "checks.spill_wrap_cmd" in why, why
+    assert "on box1" in out and "low priority" in out and out.count("(checks.nice)") == 1, out
     assert "host busy" in out and not ran.exists() and "ttp-remote-rc" not in out, out
     assert _rc_left(tmp_path) == []
     rc, out = go("exit 3")
@@ -2412,6 +2415,12 @@ def test_a_host_local_check_that_opts_in_spills_behind_its_remote_wrapper_and_a_
     assert rec["passed"] is True and "spilled_to" not in rec, rec
     text = (run / "checks.log").read_text()
     assert "missing-wrap.sh' is missing or not executable there" in text and "did not pass on spill host" in text, text
+    # #8107 (wrap_refusal_in_status): status names the host and the wrapper's setting while the run goes on.
+    lines = checkspill.limit_lines(p.name)
+    assert any("spill host check-host-a: the spill wrapper './missing-wrap.sh' is missing" in x
+               and "checks.spill_wrap_cmd" in x for x in lines), lines
+    assert "check commands run at low priority, behind" in text and "(checks.nice)" in text, "nice_line_logged here"
+    checkspill.note_limit(p.name, "")
     assert "/ttp-check." not in log.read_text().splitlines()[-1] and len(log.read_text().splitlines()) == 1
     assert not wlog.exists()
     # Without the opt-in a host-local check waits here.
@@ -3574,6 +3583,19 @@ def test_a_tasks_checks_never_start_anyway_on_an_overloaded_pinned_host(env, tmp
     assert "starting anyway" not in out.getvalue() and "running now" not in out.getvalue()
     told = []
     assert remoteload.wait(["check-host-a"], told.append, 0) == why and "starting anyway" in told[-1]
+    # #8107 (load_guard_in_status): while it waits, status names the guard and its setting; cleared after.
+    seen = []
+
+    def nap(s):
+        seen.append(checkspill.limit_lines(p.name))
+        monkeypatch.setattr(remoteload, "held", lambda h: "")
+    note = lambda line: checkspill.note_limit(p.name, line)   # noqa: E731
+    assert remoteload.wait(["check-host-a"], told.append, None, sleep=nap, anyway=False, note=note) == ""
+    assert any("remote load guard" in x and "checks.load_guard" in x and why in x for x in seen[0]), seen
+    assert checkspill.limit_lines(p.name) == []
+    monkeypatch.setattr(remoteload, "held", lambda h: why)
+    assert remoteload.wait(["check-host-a"], told.append, 0, anyway=False, note=note) == why
+    assert checkspill.limit_lines(p.name) == [], "cleared when the bound hands it over too"
     monkeypatch.setattr(remoteload, "held", lambda h: "")
     _full_after(monkeypatch, free=1)
     out = io.StringIO()

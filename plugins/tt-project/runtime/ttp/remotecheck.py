@@ -168,9 +168,26 @@ def fault(host: str, cmd: str, cwd: str, why: str = "") -> dict:
             **({"why": why} if why else {})}
 
 
+_TOLD: dict = {}   # what this run has said once (its priority line)
+
+
 def _say(msg: str) -> None:
     sys.stdout.write(f"ttp remote check: {msg}\n")
     sys.stdout.flush()
+
+
+WRAP_SETTING = "(checks.spill_wrap_cmd, or the check's own spill_wrap_cmd)"   # names the wrapper's setting
+
+
+def wrap_fault(text: str) -> tuple[str, str]:
+    """(host, why) of the last spill wrapper fault (missing or refused) in a checks log's `text`, else ("", "")."""
+    found = ("", "")
+    for line in text.splitlines():
+        head, sep, rest = line.partition(f"environment fault {SIG}")
+        host, _, why = rest.partition(": ")
+        if sep and why.startswith("the spill wrapper ") and WRAP_SETTING in why:
+            found = (host, why.partition(", so the check")[0].partition(" (exit ")[0])
+    return found
 
 
 def _fault(host: str, why: str) -> int:
@@ -690,7 +707,11 @@ def _attempt(host, top, head, env, extra, cmd, mark, wrap, wait) -> tuple[int, s
             if rc:
                 return rc, ""
         from . import testslots
-        script = _run_script(q, exports(env) + extra, cmd, mark, wrap, testslots.priority_args(testslots._cfg()))
+        cfg = testslots._cfg()
+        script = _run_script(q, exports(env) + extra, cmd, mark, wrap, testslots.priority_args(cfg))
+        if not _TOLD.get("prio"):   # the priority it runs at there, with its settings: once per run, not per retry
+            _say(testslots.priority_line(cfg, host))
+            _TOLD["prio"] = True
         # stdin stays open and unwritten: its end on the host (we stopped, died or lost ssh) stops the command.
         proc = subprocess.Popen(_ssh(host, script, direct), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT)
@@ -720,15 +741,15 @@ def _attempt(host, top, head, env, extra, cmd, mark, wrap, wait) -> tuple[int, s
             return _fault(host, "the checks' pinned Python env could not be made there (its error is above), "
                                 "so the check did not run (never with that host's user site)"), ""
         if no_wrap:
-            return _fault(host, f"the spill wrapper {wrap[0]!r} is missing or not executable there, so the "
-                                "check did not run (never unwrapped)"), ""
+            return _fault(host, f"the spill wrapper {wrap[0]!r} is missing or not executable there {WRAP_SETTING}, "
+                                "so the check did not run (never unwrapped)"), ""
         if rc is None:
             why = f"ssh ended before the command reported its exit code (ssh exit {proc.returncode})"
             if proc.returncode == 255 and refused:
                 return FAULT_RC, why
             return _fault(host, why), ""
         if rc == FAULT_RC and wrap_refused:
-            return _fault(host, f"the spill wrapper {wrap[0]!r} refused the run there (exit {FAULT_RC} and "
+            return _fault(host, f"the spill wrapper {wrap[0]!r} refused the run there {WRAP_SETTING} (exit {FAULT_RC} and "
                                 f"{WRAP_REFUSED_ENV}; its reason, if any, is above), so the check did not run "
                                 "there"), ""
         if rc == FAULT_RC:
