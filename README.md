@@ -244,8 +244,9 @@ Primary author is the top contributor to that path by commit count.
 | ⤷ `perf-optimization-audit` | [@fvranicTT](https://github.com/fvranicTT) | The provenance lens, semantic-equivalence gate, SIMD false-positive guards |
 | [`tt-metal`](https://github.com/tenstorrent/tt-metal) — `.github/bug_checker` | [@stevendae](https://github.com/stevendae) | Rules distilled from ~1,398 merged fix PRs: program-cache correctness, op validation, CCL ring buffers, stale LLK config. Strong evidence of which failures *recur* |
 | [`tt-metal`](https://github.com/tenstorrent/tt-metal) — `tech_reports/Handling_Special_Value` | [@ttmtrajkovic](https://github.com/ttmtrajkovic) | NaN/Inf/denormal semantics and the FPU/SFPU divergence |
-| [`tt-metal`](https://github.com/tenstorrent/tt-metal) — `docs/source/tt-metalium/tools`, `tt_metal/impl/debug`, `tt_metal/tools`, `tt_metal/hw/inc/api/debug` | *see note below* | The `tt-debug-tools` plugin: watcher, DPRINT, NoC debug dump, asserts and the LLK sanitizer, Inspector, triage, the device profiler, and TTNN's host-side debug flags |
+| [`tt-metal`](https://github.com/tenstorrent/tt-metal) — `docs/source/tt-metalium/tools`, `tt_metal/impl/debug`, `tt_metal/tools`, `tt_metal/hw/inc/api/debug`, `ttnn/ttnn` | *see note below* | The `tt-debug-tools` plugin: watcher, DPRINT, NoC debug dump, asserts and the LLK sanitizer, Inspector, triage, the device profiler, TTNN's host-side debug flags, and when the TTNN report database is written |
 | [`tenstorrent/tt-exalens`](https://github.com/tenstorrent/tt-exalens) | *see note below* | The `tt-exalens` skill: the command set, the server/remote and GDB modes, JTAG, and NoC selection |
+| [`tenstorrent/ttnn-visualizer`](https://github.com/tenstorrent/ttnn-visualizer) — `docs/src` | [@dcblundell](https://github.com/dcblundell) | The `tt-ttnn-visualizer` skill: the report capture settings, the MCP agent tools and what their answers mean |
 
 ### Structure and tooling
 
