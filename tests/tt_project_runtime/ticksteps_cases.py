@@ -652,7 +652,6 @@ def test_no_git_call_gets_a_timeout_of_0_s_or_less_from_a_spent_slice_or_deadlin
             seen.append(k.get("timeout"))
         return r
     monkeypatch.setattr(subprocess, "run", run)
-    monkeypatch.setattr(worktree, "_VALID_BRANCHES", {})
     read = ["git", "-C", str(repo), "rev-parse", "--git-dir"]
     clock = [time.monotonic()]
     real_mono = gitmemo.time.monotonic
