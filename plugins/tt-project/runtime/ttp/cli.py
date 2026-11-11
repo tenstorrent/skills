@@ -10640,6 +10640,18 @@ def cmd_schedules(a) -> None:
         return
     if a.action == "run":
         sys.exit(_schedule_run(p, a.schedule))
+    if a.action == "grace":   # read-only: ok, retrying (inside its grace) or down, per key
+        from . import watchgrace
+        if not a.schedule:
+            die("usage: ttp schedules <name> grace <schedule> [key]")
+        r = p.db.one("SELECT payload FROM schedules WHERE name=?", (a.schedule,))
+        if not r:
+            die(f"no schedule {a.schedule!r}")
+        grace = watchgrace.grace_s(json.loads(r["payload"] or "{}"))
+        lines = watchgrace.status(dict(p.db.kv(watchgrace.KV + a.schedule) or {}), grace, a.obs_key)
+        print("\n".join(lines) if lines else f"{a.schedule}: ok (no key reported"
+              + (f"; grace {grace / 60:g} min)" if grace else "; no grace_min set)"))
+        return
     if a.action == "show":
         if not a.schedule:
             die("usage: ttp schedules <name> show <schedule>")
@@ -15527,10 +15539,12 @@ def main(argv: list[str] | None = None) -> None:
     s = sub.add_parser("schedules", help="list or show schedules (read-only), or run a command schedule now; "
                                          "--export moves them into the harness")
     s.add_argument("name", help="the project")
-    s.add_argument("action", nargs="?", choices=["list", "show", "run"], default="list",
+    s.add_argument("action", nargs="?", choices=["list", "show", "run", "grace"], default="list",
                    help="list (default) or show <schedule>: read-only, writes nothing. run <schedule>: the daemon "
-                        "runs that command schedule now, as a timed run, and this prints its output and exit code")
-    s.add_argument("schedule", nargs="?", help="the schedule to show or run")
+                        "runs that command schedule now, as a timed run, and this prints its output and exit code. "
+                        "grace <schedule> [key]: read-only, each key's state under its grace_min: ok, retrying or down")
+    s.add_argument("schedule", nargs="?", help="the schedule to show, run or read the grace of")
+    s.add_argument("obs_key", nargs="?", metavar="key", help="grace: only this observation key")
     s.add_argument("--export", action="store_true",
                    help="MOVES the schedules into harness/schedules.json and COMMITS it; that file then holds "
                         "them. Asks first; needs --yes when not interactive. To only read, use show")

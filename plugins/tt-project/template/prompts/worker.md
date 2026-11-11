@@ -260,6 +260,7 @@ No `result.json`, no credit.
   `retry_when` with no new commit, the task goes to the coordinator. `next_step` is never a plan or an "if ... then"; a wake that needs judgment sets
   `wake_tier` standard and no `next_step`.
 <!-- /ttp:if wait -->
+- A failed try inside a route's grace is a retry, not a finding: report it only once past its grace.
 <!-- ttp:if remote -->
 - ssh `signing failed`, `agent refused operation`, `communication with agent failed` or a BatchMode
   hang: the ssh agent is locked or awaits approval, not the host. Retry later (user alerted);

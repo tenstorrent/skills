@@ -238,6 +238,7 @@ ACTIONS_SCHEMA: dict[str, Any] = {
             "every": {"type": "string"}, "at": {"type": "string"}, "enabled": {"type": "boolean"},
             "command": {"type": "string"}, "timeout_s": {"type": "number"},
             "rewake_after_h": {"type": ["number", "null"]}, "debounce_h": {"type": ["number", "null"]},
+            "grace_min": {"type": ["number", "null"]},
             "budget_usd_run": {"type": ["number", "null"]},
             "precheck": {"type": ["string", "null"]}, "precheck_timeout_s": {"type": "number"},
             "issue_lifecycle": {"type": ["string", "null"]},
@@ -4044,6 +4045,11 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     payload = {**kept, **{k: a[k] for k in ("command", "timeout_s") if a.get(k)}}
                     if "rewake_after_h" in a:   # null: a known issue never wakes again by time alone
                         payload["rewake_after_h"] = _hours_or_none(a, "rewake_after_h")
+                    if a.get("grace_min") is not None:   # minutes a keyed line is held (watchgrace); 0 removes it
+                        mins = _hours_or_none(a, "grace_min")
+                        payload.pop("grace_min", None)
+                        if mins:
+                            payload["grace_min"] = mins
                     if "issue_lifecycle" in a:   # explicit_clear: receipts stay pending until acknowledged
                         life = a.get("issue_lifecycle") or None
                         if life not in (None, "default", scr.EXPLICIT_CLEAR):
@@ -5871,7 +5877,7 @@ def memory_budget_check(p: Project) -> None:
 
 
 def _hours_or_none(a: dict, key: str) -> float | None:
-    """schedule_set's `key`: hours (a number, at least 0) or null."""
+    """schedule_set's `key`: hours (minutes for a `_min` key; a number, at least 0) or null."""
     v = a.get(key)
     if v is None:
         return None
@@ -5880,7 +5886,8 @@ def _hours_or_none(a: dict, key: str) -> float | None:
     except (TypeError, ValueError):
         hours = -1.0
     if hours < 0 or hours != hours:
-        raise ValueError(f"schedule_set {a.get('name')!r} rejected: `{key}` must be hours (a number, 0 or more) or null")
+        unit = "minutes" if key.endswith("_min") else "hours"
+        raise ValueError(f"schedule_set {a.get('name')!r} rejected: `{key}` must be {unit} (a number, 0 or more) or null")
     return hours
 
 
