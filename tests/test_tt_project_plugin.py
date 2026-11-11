@@ -1120,7 +1120,7 @@ def test_ttp_help_groups_commands_and_hides_internal_ones():
     assert len(grouped) == len(set(grouped)), "a command is in one group only"
     listed = [c.dest for c in sub._choices_actions]
     assert sorted(grouped) == sorted(listed) and "daemon" not in listed and "daemon" in sub.choices
-    assert not re.search(r"^\s+daemon\b", text, re.M)
+    assert not re.search(r"^ {1,6}daemon\b", text, re.M), "no command row; a wrapped help line may start with it"
     # A word with a hyphen is never split across lines.
     assert "--start-when" in text and not re.search(r"-\n", text)
 

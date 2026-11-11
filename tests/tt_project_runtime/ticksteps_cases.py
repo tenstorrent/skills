@@ -946,6 +946,9 @@ FINISH_ROUND_MEMORY = {
     "_root_checked": "a timer: kept, a retry's root check waits as the first's did; its alert rows are rolled back",
     "_cycles": "a cache of host-cycle records read from files, not from the rolled-back rows",
     "_nofix": "scratch: _fix_failed_review sets it before each use",
+    "_revert_note": "scratch: as _nofix, _fix_failed_review clears it before each use",
+    "_net_holds": "a hold a run that reached its API proved over: kept ended; its kv row, if rolled back, "
+                  "is rewritten on the next hold change and dropped after NET_HOLD_MAX_S on a restart",
     "_wait_what_errs": "a log-once set: a retried round may drop that one line, never repeat it",
 }
 _MUTATORS = frozenset({"pop", "append", "add", "update", "clear", "setdefault", "discard", "remove", "extend",

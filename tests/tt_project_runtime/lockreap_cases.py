@@ -1054,7 +1054,7 @@ def test_running_count_live_only(env, monkeypatch, tmp_path):
     try:
         s = checkcap.state()
         assert s["running"] == ["task #4 (run 40)"], s
-        assert "1 running (cap 3" in checkcap.line(), checkcap.line()
+        assert "1 running of cap 3" in checkcap.line(), checkcap.line()
         assert "task #9" not in checkcap.line(activity=True)
     finally:
         f.close()

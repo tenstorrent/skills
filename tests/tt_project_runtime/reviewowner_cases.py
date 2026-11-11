@@ -295,6 +295,7 @@ def test_a_second_failed_review_with_an_open_fix_gets_its_own_fix_and_re_review(
     findings (test (c) above)."""
     from ttp.daemon import Daemon
     p = _owner_project(env)
+    p.set_config("review.auto_fix_rounds", 2)   # rounds count per change (6617f325d): allow this second one
     d = Daemon(p.base)
     fups = [{"title": "bug", "spec": "fix it"}]
     cid, branch, _, (rev,) = _finish_code(env, p, "twice", {"twice.py": 20})

@@ -576,6 +576,8 @@ def test_ssh_s_own_files_pass_but_reading_a_key_is_still_refused(env, tmp_path, 
     d = tmp_path / "home" / (".s" + "sh")
     d.mkdir(parents=True, exist_ok=True)
     cfg, key = d / "config", d / "id_ed25519"
+    cfg.write_text("Host *\n    BatchMode yes\n")   # -F passes only a file shaped like ssh_config (501923e1b)
+    (d / "known_hosts").write_text("host ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGV4YW1wbGVrZXlleGFtcGxla2V5ZXhhbXBsZQ\n")
     for c in [f"ssh -F {cfg} -o BatchMode=yes host true", f"ttp lock h -- ssh -F {cfg} host true",
               f"ssh -qF{cfg} host true", f"ssh -i {key} host true", f"ssh -o IdentityFile={key} host true",
               f"ssh -oUserKnownHostsFile={d / 'known_hosts'} host true", f"scp -F {cfg} a host:b",
