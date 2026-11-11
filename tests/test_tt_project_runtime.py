@@ -43939,7 +43939,9 @@ def test_a_push_process_loads_every_module_of_its_push_and_after_push_path_at_st
     needs = {}   # each path module: the sibling modules it uses
     for mod in path_mods:
         aliases, froms = _sibling_imports(f"ttp.{mod}", RUNTIME / "ttp" / f"{mod}.py")
-        needs[f"ttp.{mod}"] = sorted(set(aliases.values()) | {m for _, m, _ in froms})
+        names = set(aliases.values()) | {m for _, m, _ in froms}   # modules only: `from . import __version__`
+        needs[f"ttp.{mod}"] = sorted(n for n in names if (RUNTIME / f"{n.replace('.', '/')}.py").is_file()
+                                     or (RUNTIME / n.replace(".", "/") / "__init__.py").is_file())
     assert "ttp.batch" in needs["ttp.push"]
     for entry in ("ttp.push", "ttp.batch", "ttp.pushq"):   # whichever a process imports first
         code = (f"import sys, {entry}\n"

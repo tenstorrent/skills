@@ -49,7 +49,8 @@ from typing import Any, Callable
 from urllib.parse import quote, unquote
 
 from . import (checkcap, checkdirs, checkspill, checkwait, checklane, cleantree, coordtools, envfault, gatejudge, gatetime, gitcache, ghroute, gitmemo, hoststate, landed, landmark, leakfile, locks, machines, outscan, pooladmit, prguard, prhead, remotecheck, remoteload, repoid, runner, runnerenv, scratchhome,
-               sandbox, scriptwatch, settinghold, setupfault, shorttmp, slurmcheck, syntaxfault, testslots, timefmt, verified, workerloss, worktree)
+               sandbox, scriptwatch, settinghold, setupfault, sharedchecks, shorttmp, slurmcheck, syntaxfault, testslots, timefmt, verified, workerloss, worktree)
+from . import __version__
 from .budget import DOC_SUFFIXES, task_default_usd
 from .db import continues_id, dependency_ids, load_result
 from .project import (Project, approved_heads_may_push, code_tasks_may_push, durable_append, durable_write, git_fsync_env, hostname,
@@ -57,6 +58,7 @@ from .project import (Project, approved_heads_may_push, code_tasks_may_push, dur
                       rebase_replace, renice, write_json)
 from .project import never_force as never_force_on
 from .release import UPGRADE_RESOURCE, _taken as _lock_taken
+from .testpick import TASK_KEY
 
 # Exit codes, distinct so a worker can say why it did not push. BUSY: another push to the same
 # branch kept the lock past `delivery.push_wait_s`; the task hands back `waiting`.
@@ -940,7 +942,6 @@ def assertion_failures(output: str, top: str) -> list[str]:
     failure of the change, its missing package only a note about that checks env."""
     if not test_failures(output):
         return []
-    from . import sharedchecks
     ids, _ = sharedchecks.failing_ids(output)
     if not ids:
         return ["(failed tests)"]
@@ -2419,7 +2420,6 @@ def checks_set_id(d: dict, task: bool = False) -> str:
     could take delivery.task_checks (testpick.task_set: a candidate run of a single-repo project's own
     checks, not --release), so the id covers task_checks while it is set, else the push checks it falls
     back to (checks_config). Like is compared with like: a task-checks run ignores push_checks edits."""
-    from .testpick import TASK_KEY
     cfg = ["task", d[TASK_KEY]] if task and d.get(TASK_KEY) else checks_config(d)
     return hashlib.sha256(json.dumps(cfg, sort_keys=True, default=str).encode()).hexdigest()[:16]
 
@@ -5689,7 +5689,6 @@ def _reexec(up: _Upgraded) -> None:
     lock passes on (RUN_LOCK_FD_ENV). It waits for the push lock again from when it began (WAIT_SINCE_ENV).
     Called only while it waits for the push lock, holding nothing else; returns only when the exec failed,
     and then it waits on with this runtime (REEXEC_ENV: never for this version again)."""
-    from . import __version__
     os.environ[checkcap.REEXEC_ENV] = up.new
     os.environ[WAIT_SINCE_ENV] = repr(up.since) + (f",{up.first_at!r}" if up.first_at else "")
     if _run_lock_fd is not None:
@@ -6380,7 +6379,6 @@ def stop_batch(p: Project, marker: Path, why: str) -> int:
     its outcome already is left as it is (0). Each stop is recorded in the project's audit stream
     (detach.signalled) and the batch's log, with its why. The process-group kill guard is untouched:
     this is the route that needs no signal to the batch's group."""
-    from . import batch, detach as job, jobstop   # `detach` here is this module's own function
     say = lambda m: print(f"ttp push: {m}", file=sys.stderr)   # noqa: E731
     marker = Path(marker).expanduser().resolve()
     folder = (p.state / DETACHED).resolve()
@@ -6422,7 +6420,7 @@ def stop_batch(p: Project, marker: Path, why: str) -> int:
         except OSError:
             pass
     # The audit: one row in the project's signal stream and one line in the batch's log, with the why.
-    job.signalled(marker, batch.STOP_SIGNAL if sent else 0, pid if isinstance(pid, int) else 0,
+    detachjob.signalled(marker, batch.STOP_SIGNAL if sent else 0, pid if isinstance(pid, int) else 0,
                   "push.stop_batch" if sent else "push.stop_batch (request only, honoured at a safe point)",
                   why, by=by, group=False, state=p.state, task=int(task) if task.isdigit() else None)
     deadline = time.monotonic() + STOP_BATCH_WAIT_S
