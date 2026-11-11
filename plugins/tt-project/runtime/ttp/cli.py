@@ -12468,6 +12468,9 @@ def cmd_setup(a) -> None:
     from . import notifier
     for ln in notifier.refresh(send_test=True, always=True):   # an installed notifier runs this code from now on
         print(ln)
+    from . import bridge
+    for ln in bridge.refresh():   # installed bridge sessions run the current wrapper from now on
+        print(ln)
     from .project import DEFAULT_CONFIG
     print("defaults for new projects:")
     for ln in new_project_defaults_lines():
@@ -12739,6 +12742,9 @@ def cmd_upgrade(a) -> None:
     _cycle_hold(cyclenotice_paths(p), a, p, auto_rec=p if a.auto else None)
     from . import notifier
     for ln in notifier.refresh(send_test=not a.auto):   # this machine's notifier on the installed code too
+        print(ln)
+    from . import bridge
+    for ln in bridge.refresh():   # and its bridge sessions
         print(ln)
     from . import codexmarket
     for ln in codexmarket.once():   # and Codex's copy of tt-project, once per release

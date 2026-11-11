@@ -3938,6 +3938,16 @@ Workers can read Slack links you paste, using your Slack connector if you have o
     sockets 0600) and stops on the same check.
   - The link and the box's ssh config are rewritten only when they change, so a reconnect touches
     nothing on the box.
+  - Stale sessions recover by themselves. After a network change an earlier session can live on at
+    the box's sshd and keep holding its forward ports, so the new one exits with `remote port
+    forwarding failed`. The session then makes one short cleanup login (same key, no forwards, no
+    agent) that ends only the box account's own sshd processes listening on that session's own
+    loopback ports and carrying this workstation's tag for the same box and agent (a random id made on
+    the workstation, never a hostname): TERM, then KILL. It logs one line per ended session (port, pid,
+    age) and retries at once; a second forward failure in a row exits for the supervisor to restart.
+    No sudo, no other account's process, no sshd config change. `status --deep` names a port held by a
+    stale session. `ttp setup` and the upgrade re-install bridge services whose command changed, so
+    nothing needs running by hand on the workstation.
   - The session's own login key must be allowed to forward an agent: an `authorized_keys` line with
     `restrict` and no `agent-forwarding` gives none (`doctor` says so). Name a key that may forward
     under `login`.

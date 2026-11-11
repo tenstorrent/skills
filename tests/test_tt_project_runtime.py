@@ -503,6 +503,7 @@ def env(tmp_path, monkeypatch, _git_session, _short_tmp):
     monkeypatch.setenv("TTP_TEST_WORKER_CONTEXT", "off")   # worker prompts carry no coordinator context (ctxfork_cases tests it)
     monkeypatch.setenv("TTP_TEST_NO_MCP_PROBE", "1")   # daemons never run the real `claude mcp list` (mcpgap.py)
     monkeypatch.setenv("TTP_TEST_NO_MODELS_PROBE", "1")   # nor the routed endpoint's /models check (route.py)
+    monkeypatch.setenv("TTP_TEST_NO_BRIDGE_REFRESH", "1")   # setup never restarts this account's own bridge sessions
     monkeypatch.setenv("TTP_TEST_NO_REFRESH", "1")    # upgrade never runs a real `ttp setup` of the checkout first
     monkeypatch.setenv("TTP_SELFWATCH_EVERY_S", "0")   # daemons never scan the real /proc nor signal (selfwatch_cases turns it on)
     monkeypatch.setenv("TTP_TEST_NO_SELFAUDIT_READ", "1")   # nor read the real crontab, systemd units or held hosts (selfaudit.py)

@@ -7,22 +7,38 @@ is used through ssh's BindInterface, say). A reverse forward cannot bind its con
 session forwards such a host's box port to a unix socket here instead, and this relay connects
 each connection to that host's port 22 bound to the interface. Nothing else is carried.
 
-usage: bridge_relay.py <socket dir> <name>=<host>%<interface> ... -- <ssh argv...>
+usage: bridge_relay.py [--tag <box>/<agent>] <socket dir> [<name>=<host>%<interface> ...] -- <ssh argv...>
 
 It listens on <socket dir>/<name>.sock (mode 600, the directory 700), runs the ssh session, and
 exits with it, removing its sockets: the relay lives exactly as long as the session. It exits 4
 before listening when the socket directory is not a private one of this account (its own, 700,
 not a symlink).
+
+With --tag it also recovers from a stale session. Each session's remote command carries a tag,
+`ttp-bridge-tag=<computer id>/<box>/<agent>/<session id>` (the computer id is random, made on first
+use and kept next to the socket dir; the session id is new each run). When a network change leaves
+the box's sshd holding an earlier session's reverse-forward ports, ssh exits 255 with 'remote port
+forwarding failed'. The relay then runs one cleanup login to the box (the same login options, no
+forwards, no agent, a short timeout) that ends only sshd processes of the box account itself that
+listen on 127.0.0.1 at one of this session's forward ports and whose session carries this
+computer's tag for the same box and agent (this computer's session for them has just failed, so
+such a session has no live peer here): SIGTERM, then SIGKILL after 5 s. It never uses sudo and
+leaves untagged, interactive and other accounts' sessions alone. The session then starts again at
+once; a second forward failure in a row exits nonzero, so the service's own restart pacing applies.
 """
 from __future__ import annotations
 
 import os
+import re
+import secrets
+import shlex
 import signal
 import socket
 import stat
 import subprocess
 import sys
 import threading
+import time
 
 IP_BOUND_IF = 25      # macOS <netinet/in.h>
 IPV6_BOUND_IF = 125   # macOS <netinet6/in6.h>
@@ -129,7 +145,128 @@ def listen(path: str, host: str, iface: str) -> socket.socket:
     return srv
 
 
+FORWARD_FAILED = "remote port forwarding failed"
+TAG = "ttp-bridge-tag="
+CLEAN_TIMEOUT = 45
+STEADY_S = 60   # a session that stayed up this long starts a fresh count of forward failures
+
+# On the box (POSIX sh; ss, else /proc): $1 the tag prefix, then the ports. Prints `ended <port>
+# <pid> <age s>` per session it ends and `kept <port> <pid> <why>` per listener it leaves.
+CLEANUP = r"""tag=$1; shift; me=$(id -u)
+listeners() {
+  if command -v ss >/dev/null 2>&1; then
+    ss -Hltnp 2>/dev/null | awk -v a="127.0.0.1:$1" '$4 == a' | grep -o 'pid=[0-9]*' | cut -d= -f2
+  else
+    hex=$(printf '0100007F:%04X' "$1")
+    for ino in $(awk -v a="$hex" '$2 == a && $4 == "0A" {print $10}' /proc/net/tcp); do
+      for f in /proc/[0-9]*/fd/*; do
+        [ "$(readlink "$f" 2>/dev/null)" = "socket:[$ino]" ] && { p=${f#/proc/}; echo "${p%%/*}"; }
+      done
+    done
+  fi
+}
+alive() { kill -0 "$1" 2>/dev/null && ! ps -o stat= -p "$1" 2>/dev/null | grep -q Z; }   # a zombie has ended
+for port in "$@"; do
+  for pid in $(listeners "$port" | sort -u); do
+    [ "$(stat -c %u "/proc/$pid" 2>/dev/null)" = "$me" ] || { echo "kept $port $pid another account"; continue; }
+    case "$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null)" in sshd*) ;; *) echo "kept $port $pid not an sshd session"; continue;; esac
+    ps -o ppid=,args= -e 2>/dev/null | awk -v p="$pid" '$1 == p' | grep -qF -- "$tag" \
+      || { echo "kept $port $pid not this computer's session"; continue; }
+    age=$(ps -o etimes= -p "$pid" 2>/dev/null | tr -d ' ')
+    kill -TERM "$pid" 2>/dev/null; n=0
+    while alive "$pid" && [ $n -lt 5 ]; do sleep 1; n=$((n+1)); done
+    alive "$pid" && kill -KILL "$pid" 2>/dev/null
+    echo "ended $port $pid ${age:-?}"
+  done
+done"""
+
+
+def computer_id(d: str) -> str:
+    """This computer's random bridge id, made on first use (never a host name)."""
+    path = os.path.join(os.path.dirname(os.path.abspath(d)), "computer-id")
+    try:
+        with open(path) as f:
+            cid = f.read().strip()
+        if re.fullmatch(r"[0-9a-f]{12}", cid):
+            return cid
+    except OSError:
+        pass
+    cid = secrets.token_hex(6)
+    fd = os.open(path + ".tmp", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(cid + "\n")
+    os.replace(path + ".tmp", path)
+    return cid
+
+
+def forward_ports(ssh: list[str]) -> list[int]:
+    return [int(m.group(1)) for a, b in zip(ssh, ssh[1:]) if a == "-R"
+            for m in [re.match(r"127\.0\.0\.1:(\d+):", b)] if m]
+
+
+def tagged(ssh: list[str], tag: str) -> list[str]:
+    """The session with its tag at the head of its remote command (a no-op `:` the box can read)."""
+    return ssh[:-1] + [f": {TAG}{tag}; " + ssh[-1]]
+
+
+def cleanup_argv(ssh: list[str], prefix: str, ports: list[int]) -> list[str]:
+    """One login to the same box with the session's own login options: no forwards, no agent, a short timeout."""
+    cut = ssh.index("--")
+    out, skip = [], False
+    for i, a in enumerate(ssh[:cut]):
+        if skip:
+            skip = False
+            continue
+        nxt = ssh[i + 1] if i + 1 < cut else ""
+        if a == "-R" or (a == "-o" and re.match(r"(ForwardAgent|ExitOnForwardFailure|ConnectTimeout)=", nxt)):
+            skip = True
+            continue
+        out.append(a)
+    script = "sh -c " + shlex.quote(CLEANUP) + " ttp-bridge-clean " + " ".join(
+        shlex.quote(x) for x in [TAG + prefix, *map(str, ports)])
+    return out + ["-a", "-o", "ForwardAgent=no", "-o", "ClearAllForwardings=yes", "-o", "ConnectTimeout=10",
+                  "--", ssh[cut + 1], script]
+
+
+def clean(ssh: list[str], prefix: str, ports: list[int]) -> None:
+    box = ssh[ssh.index("--") + 1]
+    try:
+        r = subprocess.run(cleanup_argv(ssh, prefix, ports), stdin=subprocess.DEVNULL, capture_output=True,
+                           text=True, timeout=CLEAN_TIMEOUT)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        print(f"ttp bridge: {box}: the stale-session cleanup did not finish ({e})", file=sys.stderr, flush=True)
+        return
+    ended = 0
+    for ln in r.stdout.splitlines():
+        w = ln.split()
+        if w[:1] == ["ended"] and len(w) == 4:
+            ended += 1
+            print(f"ttp bridge: {box}: ended a stale session holding port {w[1]} (pid {w[2]}, {w[3]} s old)",
+                  file=sys.stderr, flush=True)
+        elif w[:1] == ["kept"] and len(w) >= 3:
+            print(f"ttp bridge: {box}: port {w[1]} is held by pid {w[2]} ({' '.join(w[3:])}): left alone",
+                  file=sys.stderr, flush=True)
+    if r.returncode or not ended:
+        print(f"ttp bridge: {box}: the cleanup ended no session (exit {r.returncode}"
+              f"{': ' + r.stderr.strip()[-200:] if r.stderr.strip() else ''})", file=sys.stderr, flush=True)
+
+
+def session(ssh: list[str], state: dict) -> tuple[int, bool]:
+    """Run one session, passing its stderr through; (exit code, whether a forward failed)."""
+    child = subprocess.Popen(ssh, stderr=subprocess.PIPE)
+    state["child"] = child
+    failed = False
+    for raw in child.stderr:
+        sys.stderr.buffer.write(raw)
+        sys.stderr.flush()
+        failed = failed or FORWARD_FAILED in raw.decode(errors="replace")
+    return child.wait(), failed
+
+
 def main(argv: list[str]) -> int:
+    tag = ""
+    if argv[:1] == ["--tag"] and len(argv) > 1:
+        tag, argv = argv[1], argv[2:]
     if "--" not in argv or len(argv) < 3:
         print(__doc__, file=sys.stderr)
         return 2
@@ -146,15 +283,33 @@ def main(argv: list[str]) -> int:
         path = os.path.join(d, name + ".sock")
         listen(path, host, iface)
         paths.append(path)
-    child = subprocess.Popen(ssh)
+    state: dict = {"stop": False, "child": None}
 
     def end(signum, _frame):
-        child.terminate()
+        state["stop"] = True
+        if state["child"] is not None:
+            state["child"].terminate()
 
     signal.signal(signal.SIGTERM, end)
     signal.signal(signal.SIGINT, end)
     try:
-        return child.wait()
+        if not tag:
+            state["child"] = subprocess.Popen(ssh)
+            return state["child"].wait()
+        prefix, ports, cleaned = f"{computer_id(d)}/{tag}/", forward_ports(ssh), False
+        while True:
+            t0 = time.monotonic()
+            rc, failed = session(tagged(ssh, prefix + secrets.token_hex(4)), state)
+            if time.monotonic() - t0 >= STEADY_S:
+                cleaned = False
+            if state["stop"] or rc != 255 or not failed or not ports:
+                return rc
+            if cleaned:
+                print("ttp bridge: a reverse forward failed again right after the cleanup; exiting",
+                      file=sys.stderr, flush=True)
+                return rc
+            clean(ssh, prefix, ports)
+            cleaned = True
     finally:
         for p in paths:
             try:

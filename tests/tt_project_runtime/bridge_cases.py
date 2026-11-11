@@ -227,9 +227,12 @@ def test_bridge_interface_hosts_go_through_the_relay_socket(tmp_path, monkeypatc
     sock = tmp_path / "bridge-relay" / "box-1.auto" / "build-a.sock"
     assert argv[argv.index("-R") + 1] == f"127.0.0.1:2301:{sock}"
     svc = bridge.service_argv(cfg, "box-1", "auto", ssh="ssh")
-    assert svc[1:4] == [str(tmp_path / "bridge_relay.py"), str(sock.parent), "build-a=build-a.example.com%vpn0"]
+    assert svc[1:6] == [str(tmp_path / "bridge_relay.py"), "--tag", "box-1/auto", str(sock.parent),
+                        "build-a=build-a.example.com%vpn0"]
     assert svc[svc.index("--") + 1:] == argv
-    assert bridge.service_argv(_bridge_cfg(), "box-1", "auto", ssh="ssh")[0] == "/bin/sh"   # no relay without one
+    plain = bridge.service_argv(_bridge_cfg(), "box-1", "auto", ssh="ssh")   # no interface host: still wrapped
+    assert plain[1:5] == [str(tmp_path / "bridge_relay.py"), "--tag", "box-1/auto", str(sock.parent)]
+    assert plain[5] == "--" and plain[6] == "/bin/sh"
 
 
 def test_bridge_relay_carries_one_connection_and_exits_with_its_session(monkeypatch, request):
@@ -709,3 +712,164 @@ def test_bridge_relay_refuses_a_shared_or_linked_socket_dir_and_installs_on_chan
     argv = bridge.ssh_argv(_bridge_cfg(), "box-1", "auto", ssh="ssh")
     binds = [argv[i + 1] for i, a in enumerate(argv) if a == "-R"]
     assert binds and all(b.startswith("127.0.0.1:") for b in binds)   # never a non-loopback listener
+
+
+# --- stale-session recovery (bridge_relay --tag) ----------------------------------------------------
+# A fake ssh (a Python script) plays each session from a plan and logs its argv; no host is reached.
+
+_BRIDGE_FAKE_SSH = """
+import json, os, sys
+d = os.path.dirname(os.path.abspath(sys.argv[0]))
+log = os.path.join(d, 'calls.jsonl')
+calls = [json.loads(ln) for ln in open(log)] if os.path.exists(log) else []
+open(log, 'a').write(json.dumps(sys.argv[1:]) + '\\n')
+if 'ttp-bridge-clean' in sys.argv[-1]:
+    print('ended 2301 4242 3600')
+    print("kept 2302 4343 not this computer's session")
+    sys.exit(0)
+step = json.load(open(os.path.join(d, 'plan.json')))[sum(1 for c in calls if 'ttp-bridge-clean' not in c[-1])]
+if step == 'fwd':
+    sys.stderr.write('Error: remote port forwarding failed for listen port 2301\\n')
+    sys.exit(255)
+if step == 'auth':
+    sys.stderr.write('user@box-a: Permission denied (publickey).\\n')
+    sys.exit(255)
+sys.exit(0)
+"""
+
+
+def _fake_ssh(d, plan):
+    import json
+    import sys
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "plan.json").write_text(json.dumps(plan))
+    ssh = d / "fake-ssh"
+    ssh.write_text(f"#!{sys.executable}\n" + _BRIDGE_FAKE_SSH)
+    ssh.chmod(0o755)
+    return [str(ssh), "-T", "-n", "-o", "BatchMode=yes", "-o", "ExitOnForwardFailure=yes", "-o", "ConnectTimeout=20",
+            "-o", "IdentitiesOnly=yes", "-o", "IdentityFile=/keys/login.pub", "-o", "ForwardAgent=/agents/a.sock",
+            "-R", "127.0.0.1:2301:build-a.example.com:22", "-R", "127.0.0.1:2302:build-b.example.com:22",
+            "--", "box-a", "echo linked"]
+
+
+def _calls(d):
+    import json
+    return [json.loads(ln) for ln in (d / "calls.jsonl").read_text().splitlines()]
+
+
+def test_bridge_forward_failure_cleans_once_and_retries(tmp_path, capfd):
+    # cells: forward-fail-retry
+    from ttp import bridge_relay
+    argv = _fake_ssh(tmp_path / "s", ["fwd", "ok"])
+    rc = bridge_relay.main(["--tag", "box-a/auto", str(tmp_path / "relay" / "box-a.auto"), "--", *argv])
+    calls = _calls(tmp_path / "s")
+    assert rc == 0 and len(calls) == 3
+    cid = (tmp_path / "relay" / "computer-id").read_text().strip()
+    first, clean, retry = calls
+    tag = f"ttp-bridge-tag={cid}/box-a/auto/"
+    assert first[-1].startswith(": " + tag) and retry[-1].startswith(": " + tag) and first[-1] != retry[-1]
+    assert "-R" not in clean and "ForwardAgent=/agents/a.sock" not in clean and "ExitOnForwardFailure=yes" not in clean
+    assert {"-a", "ForwardAgent=no", "ClearAllForwardings=yes", "ConnectTimeout=10", "BatchMode=yes",
+            "IdentityFile=/keys/login.pub"} <= set(clean)
+    assert clean[clean.index("--") + 1] == "box-a" and clean[-1].endswith(f" {tag} 2301 2302")
+    err = capfd.readouterr().err
+    assert "remote port forwarding failed" in err   # passed through to the log
+    assert "box-a: ended a stale session holding port 2301 (pid 4242, 3600 s old)" in err
+
+
+def test_bridge_second_forward_failure_exits_after_one_cleanup(tmp_path, capfd):
+    # cells: forward-fail-twice
+    from ttp import bridge_relay
+    argv = _fake_ssh(tmp_path / "s", ["fwd", "fwd", "ok"])
+    rc = bridge_relay.main(["--tag", "box-a/auto", str(tmp_path / "relay" / "box-a.auto"), "--", *argv])
+    calls = _calls(tmp_path / "s")
+    assert rc == 255 and len(calls) == 3 and sum("ttp-bridge-clean" in c[-1] for c in calls) == 1
+    assert "failed again right after the cleanup" in capfd.readouterr().err
+
+
+def test_bridge_auth_or_connect_failure_does_no_cleanup(tmp_path):
+    # cells: auth-no-cleanup
+    from ttp import bridge_relay
+    argv = _fake_ssh(tmp_path / "s", ["auth", "ok"])
+    rc = bridge_relay.main(["--tag", "box-a/auto", str(tmp_path / "relay" / "box-a.auto"), "--", *argv])
+    assert rc == 255 and len(_calls(tmp_path / "s")) == 1
+    argv = _fake_ssh(tmp_path / "u", ["fwd"])   # untagged (an older service's command): no recovery either
+    assert bridge_relay.main([str(tmp_path / "relay" / "x"), "--", *argv]) == 255
+    assert len(_calls(tmp_path / "u")) == 1
+
+
+def test_bridge_box_cleanup_ends_only_this_computers_tagged_session(tmp_path):
+    # cells: box-cleanup-scope
+    # Real processes named like sshd sessions; a fake `ss` says which pid listens on which port.
+    import os
+    import shlex
+    import subprocess
+    import time
+    from ttp import bridge_relay
+    tag = "ttp-bridge-tag=aaaaaaaaaaaa/box-a/auto/"
+
+    def session(child):
+        return subprocess.Popen(["bash", "-c", f'exec -a "sshd: u@notty" bash -c {shlex.quote(child + " & wait")}'])
+
+    stale = session(f"sh -c ': {tag}0001; sleep 300; :'")
+    login = session("sh -c 'sleep 300; :'")                                                  # interactive: no tag
+    other = session("sh -c ': ttp-bridge-tag=bbbbbbbbbbbb/box-a/auto/0002; sleep 300; :'")   # another computer
+    procs = [stale, login, other]
+    try:
+        time.sleep(0.5)
+        bin_ = tmp_path / "bin"
+        bin_.mkdir()
+        rows = [(2301, stale.pid), (2302, login.pid), (2303, other.pid), (2304, 1), (2309, stale.pid)]
+        (bin_ / "ss").write_text("#!/bin/sh\ncat <<'X'\n" + "".join(
+            f'LISTEN 0 128 127.0.0.1:{p} 0.0.0.0:* users:(("sshd",pid={pid},fd=9))\n' for p, pid in rows) + "X\n")
+        (bin_ / "ss").chmod(0o755)
+        env = dict(os.environ, PATH=f"{bin_}:{os.environ['PATH']}")
+        r = subprocess.run(["sh", "-c", bridge_relay.CLEANUP, "x", tag, "2301", "2302", "2303", "2304"],
+                           capture_output=True, text=True, env=env, timeout=30)
+        out = r.stdout.splitlines()
+        assert [ln.split()[:3] for ln in out if ln.startswith("ended")] == [["ended", "2301", str(stale.pid)]]
+        assert f"kept 2302 {login.pid} not this computer's session" in out
+        assert f"kept 2303 {other.pid} not this computer's session" in out
+        assert "kept 2304 1 another account" in out or os.getuid() == 0
+        stale.wait(timeout=10)
+        assert login.poll() is None and other.poll() is None
+    finally:
+        for p in procs:
+            if p.poll() is None:
+                p.kill()
+                p.wait()
+
+
+def test_bridge_refresh_reinstalls_a_service_whose_command_changed(tmp_path, monkeypatch):
+    # cells: refresh-argv
+    import json
+    import plistlib
+    from ttp import bridge, hoststate
+    monkeypatch.delenv("TTP_TEST_NO_BRIDGE_REFRESH", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(bridge, "HOME_DIR", tmp_path)
+    monkeypatch.setattr(bridge, "RELAY", tmp_path / "bridge_relay.py")
+    conf = tmp_path / "bridge.json"
+    conf.write_text(json.dumps({"boxes": {"box-1": {"login": {}, "agents": {"auto": {"agent": "env", "forward": [
+        {"name": "build-a", "target": "build-a.example.com", "port": 2301}]}}}}}))
+    started = []
+    monkeypatch.setattr(bridge, "start", lambda box, an, argv, platform=None: started.append(argv) or "restarted")
+    cfg = bridge.load(conf)
+    new = bridge.service_argv(cfg, "box-1", "auto")
+    old = bridge.ssh_argv(cfg, "box-1", "auto")   # what an older release installed: the bare session
+    f = bridge.service_file("box-1", "auto", "darwin")
+    f.parent.mkdir(parents=True)
+    f.write_bytes(plistlib.dumps(bridge.launchd_plist("box-1", "auto", old)))
+    assert bridge.refresh("darwin", conf) == ["bridge box-1 auto: service command changed; restarted"]
+    assert started == [new] and bridge.RELAY.is_file()
+    f.write_bytes(plistlib.dumps(bridge.launchd_plist("box-1", "auto", new)))
+    assert bridge.launchd_plist("box-1", "auto", new)["ProgramArguments"][2:4] == ["--tag", "box-1/auto"]
+    assert bridge.refresh("darwin", conf) == [] and len(started) == 1   # unchanged: left running
+    monkeypatch.setattr(hoststate, "unit_dir", lambda: tmp_path / "units")
+    (tmp_path / "units").mkdir()
+    unit = bridge.systemd_unit("box-1", "auto", new)
+    assert "--tag box-1/auto" in unit
+    bridge.service_file("box-1", "auto", "linux").write_text(unit)
+    assert bridge.installed_argv("box-1", "auto", "linux") == new
+    monkeypatch.setenv("TTP_TEST_NO_BRIDGE_REFRESH", "1")
+    assert bridge.refresh("darwin", conf) == []

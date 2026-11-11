@@ -35,6 +35,11 @@
   forward would die with that master.
 - Supervisor restarts it (`KeepAlive` / `Restart=always`).
 - A tunnel that connects but binds nothing is broken. Verify from the far end.
+- A `ttp bridge` session whose reverse forward fails (`remote port forwarding failed`, usually a
+  stale session from before a network change still holding the port) recovers by itself: one
+  cleanup login ends only the box account's own sshd session on that port carrying this
+  workstation's tag for the same box and agent, then it retries once. Nothing to do by hand;
+  `ttp bridge status --deep` names a held port, and `ttp setup`/upgrade refresh changed services.
 
 ## When a task needs a path between machines
 

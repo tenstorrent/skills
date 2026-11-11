@@ -28,6 +28,17 @@ other accounts on the box can open those ports, which reach the hosts' sshd and 
 (a box sshd with `GatewayPorts yes` would bind them on every interface: keep it off).
 On this computer the interface relay listens only on unix sockets (folder 0700, sockets 0600).
 
+Stale sessions recover by themselves. Every session runs inside the relay wrapper
+(bridge_relay.py), which tags its remote command with a random id of this computer, the box, the
+agent and the session. When a network change leaves the box's sshd holding an earlier session's
+reverse-forward ports, the new session fails with 'remote port forwarding failed'; the wrapper then
+makes one cleanup login (no forwards, no agent, a short timeout) that ends only the box account's
+own sshd sessions with this computer's tag for the same box and agent listening on 127.0.0.1 at one
+of this session's ports, logs one line per ended session, and starts the session again at once. A
+second forward failure in a row exits, so the service's restart pacing applies. No sudo, no other
+account, no untagged or interactive session, no box sshd change. `ttp setup` and upgrades re-install
+services whose command changed, so an older workstation picks this up with no step of its own.
+
 The config is JSON (`~/.config/tt-project/bridge.json`, or --config); see
 docs/access-bridge.example.json.
 """
@@ -248,14 +259,13 @@ RELAY = HOME_DIR / "bridge_relay.py"
 
 
 def service_argv(cfg: dict, box: str, agent: str, ssh: str | None = None) -> list[str]:
-    """What the service runs: the session, wrapped in the interface relay (a copy of bridge_relay.py,
-    installed by setup) when a host of it is reached through one interface."""
+    """What the service runs: the session inside the relay wrapper (a copy of bridge_relay.py, installed
+    by setup), which tags it, recovers from a stale session holding its ports, and relays the hosts
+    reached through one interface."""
     argv = ssh_argv(cfg, box, agent, ssh)
     bound = [h for h in cfg["boxes"][box]["agents"][agent]["forward"] if h["interface"] and not h["adopt"]]
-    if not bound:
-        return argv
     py = "/usr/bin/python3" if os.path.exists("/usr/bin/python3") else sys.executable
-    return [py, str(RELAY), str(relay_dir(box, agent)),
+    return [py, str(RELAY), "--tag", f"{box}/{agent}", str(relay_dir(box, agent)),
             *[f"{h['name']}={h['target']}%{h['interface']}" for h in bound], "--", *argv]
 
 
@@ -481,6 +491,43 @@ def setup(cfg: dict, boxes: list[str], platform: str | None = None) -> list[str]
     return out
 
 
+def installed_argv(box: str, agent: str, platform: str | None = None) -> list[str] | None:
+    """The command an installed service runs, or None when it is not installed (or unreadable)."""
+    f = service_file(box, agent, platform)
+    try:
+        if (platform or sys.platform) == "darwin":
+            return list(plistlib.loads(f.read_bytes()).get("ProgramArguments") or [])
+        for ln in f.read_text().splitlines():
+            if ln.startswith("ExecStart="):
+                from .tunnel import _unit_unescape
+                return shlex.split(_unit_unescape(ln[len("ExecStart="):]))
+    except (OSError, ValueError, plistlib.InvalidFileException):
+        return None
+    return None
+
+
+def refresh(platform: str | None = None, path: Path | None = None) -> list[str]:
+    """After `ttp setup` or an upgrade: re-install the relay copy and restart each installed session
+    whose command changed. Nothing when no bridge is configured or installed here."""
+    if os.environ.get("TTP_TEST_NO_BRIDGE_REFRESH") or not (path or CONFIG).is_file():
+        return []
+    try:
+        cfg = load(path)
+    except (BadConfig, OSError, ValueError) as e:
+        return [f"bridge: config not read ({e}); services left as they are"]
+    out = []
+    for box, b in cfg["boxes"].items():
+        for an in b["agents"]:
+            have = installed_argv(box, an, platform)
+            if have is None:
+                continue
+            argv = service_argv(cfg, box, an)
+            install_relay()
+            if have != argv:
+                out.append(f"bridge {box} {an}: service command changed; {start(box, an, argv, platform)}")
+    return out
+
+
 def probe_script(cfg: dict, box: str) -> str:
     """Read-only, on the box: per agent whether its link answers and how many keys it offers; per
     forwarded host whether its port listens; the block's presence; what the socket dir holds."""
@@ -547,6 +594,10 @@ def status(cfg: dict, boxes: list[str], platform: str | None = None, deep: bool 
             if deep and not ok:
                 log = HOME_DIR / f"bridge-{box}-{an}.log"
                 tail = log.read_text(errors="replace").strip().splitlines()[-3:] if log.is_file() else []
+                held = [f"{h['name']}:{h['port']}" for h in a["forward"] if p["ports"].get(h["port"]) and not ag["up"]]
+                if held:
+                    lines.append(f"  port {', '.join(held)} listens on the box while this session's link is down: an "
+                                 "earlier (stale) session holds it; the session ends it and retries on its next start")
                 if svc != "running":
                     lines.append(f"  the session is not running: `ttp bridge setup {box}` starts it")
                 elif not ag["up"]:
