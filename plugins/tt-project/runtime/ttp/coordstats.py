@@ -222,7 +222,7 @@ def report(db, runs_dir, tz: str, days: float = 7, now: float | None = None) -> 
         for r, s in d["runs"]:
             why = reason(s, r["status"])
             reasons[why] = reasons.get(why, 0) + 1
-            if s.get("mode") == "new" and s.get("why") == "prefix changed":
+            if s.get("mode") == "new" and s.get("why") in coordsession.PREFIX_WHYS:
                 for k in changed_parts(s) or ["none (same digests)"]:
                     parts[k] = parts.get(k, 0) + 1
             if r["status"] not in ("ok", "running"):   # the rerun's note also names a failed resume's error

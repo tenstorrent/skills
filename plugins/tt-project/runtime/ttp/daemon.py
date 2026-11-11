@@ -3803,7 +3803,7 @@ class Daemon:
             note = {**(note or {}), "turn": {**(note or {}).get("turn", {}), "session": {
                 "mode": session_mode, "why": why, "key": key, "model": model, "effort": effort,
                 "provider": provider, **({"digest": ack} if ack else {}), **({"parts": parts} if parts else {}),
-                **({"changed": coordsession.changed_parts(state, parts)} if why == "prefix changed" else {}),
+                **({"changed": coordsession.changed_parts(state, parts)} if why in coordsession.PREFIX_WHYS else {}),
                 **({"cap_usd": session_cap} if session_cap is not None else {}),
                 **({"seed_usd": seed_usd, "seed_basis": seed_basis} if seed_usd is not None else {}),
                 **({"error": str((state or {}).get("fail_error") or "")}   # the failed resume this reruns

@@ -121,6 +121,7 @@ HANDOFF_SUFFIX = ".handoff.md"
 PREFIX_FILE = "prefix.json"   # under NOTE_DIR, and each session wake's run dir: the prompt it ran with
 CHANGED_HEAD = "## Changed since your last wake"
 PROMPT_NEW = "prompt changed, provider cannot resume with it"   # decide()'s own reason (Provider.resume_new_prompt)
+PREFIX_WHYS = ("prompt changed", PROMPT_NEW, "prefix changed")   # a changed prefix: resumed, new, and the older stored label
 # Every provider runs the session, with no opt-out. Each provider says how it keeps it
 # (providers/base.Provider.coord_session): "agent" resumes the agent CLI's own saved session
 # (claude, codex, cursor; the fake in tests); the chat provider keeps none (Provider.session_gap).
@@ -418,7 +419,7 @@ def record(state, usage, session_id: str, turn: dict, ok: bool, now: float, summ
     st.update({"id": sid or st.get("id") or "", "provider": turn.get("provider", ""),
                "model": turn.get("model", ""), "effort": turn.get("effort", ""), "key": turn.get("key", ""),
                "last_ok": bool(ok and sid), "at": now})
-    if isinstance(turn.get("parts"), dict):   # the key's per-part digests: the next "prefix changed" names the parts
+    if isinstance(turn.get("parts"), dict):   # the key's per-part digests: the next changed prefix names the parts
         st["parts"] = turn["parts"]
     else:
         st.pop("parts", None)

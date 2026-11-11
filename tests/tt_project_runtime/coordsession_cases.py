@@ -645,7 +645,8 @@ def test_coord_session_stats_count_the_changed_prefix_parts_and_a_restart_apart(
     from ttp import coordstats
     p = make(env)
     t0 = 1793750400.0   # 2026-11-04 00:00 UTC
-    sessions = [{"why": "prefix changed", "changed": ["charter"]}, {"why": "prefix changed", "changed": ["charter"]},
+    sessions = [{"why": "prefix changed", "changed": ["charter"]},
+                {"why": "prompt changed, provider cannot resume with it", "changed": ["charter"]},
                 {"why": "prefix changed", "changed": ["template", "standing", "template"]},
                 {"why": "prefix changed", "changed": []}, {"why": "prefix changed"},
                 {"why": "prefix changed", "changed": "junk"},
@@ -657,12 +658,13 @@ def test_coord_session_stats_count_the_changed_prefix_parts_and_a_restart_apart(
         note["turn"]["session"].update(extra)
         p.db.x("UPDATE runs SET note=? WHERE id=?", (json.dumps(note), rid))
     [d] = coordstats.report(p.db, p.runs, "UTC", 7, now=t0 + 9000)["by_day"]
-    assert d["reasons"] == {"new: prompt, charter or schema changed": 6, "new: transcript gone": 1,
+    assert d["reasons"] == {"new: prompt, charter or schema changed": 5, "new: transcript gone": 1,
+                            "new: prompt changed, provider cannot resume with it": 1,
                             "new: transcript gone after daemon restart": 1}, d["reasons"]
-    assert d["prefix_parts"] == {"charter": 2, "not recorded": 2, "none (same digests)": 1, "standing": 1,
+    assert d["prefix_parts"] == {"charter": 3, "not recorded": 2, "none (same digests)": 1, "standing": 1,
                                  "template": 1}, d["prefix_parts"]
     out = coordstats.text(coordstats.report(p.db, p.runs, "UTC", 7, now=t0 + 9000))
-    assert ("    prefix parts changed (new sessions for a changed prefix): charter 2, not recorded 2, "
+    assert ("    prefix parts changed (new sessions for a changed prefix): charter 3, not recorded 2, "
             "none (same digests) 1, standing 1, template 1") in out, out
 
 
@@ -939,6 +941,8 @@ def test_a_failing_prompt_record_write_still_launches_the_session_wake(env, monk
 
 def test_coordsession_a_new_session_for_a_changed_prefix_names_each_changed_part(env, monkeypatch):
     from ttp import coordsession
+    from ttp.providers import fake
+    monkeypatch.setattr(fake.Fake, "resume_new_prompt", "")   # a changed prompt starts a new session
     p, d, sessions, wake = _cs_session_project(env, monkeypatch)
     first, _, _ = wake("one")
     assert set(first["parts"]) == set(coordsession.PREFIX_PARTS) and "changed" not in first
@@ -946,16 +950,16 @@ def test_coordsession_a_new_session_for_a_changed_prefix_names_each_changed_part
     assert second["mode"] == "resume" and second["parts"] == first["parts"]
     p.charter_path.write_text(_CS_CHARTER.replace("Ship v1.", "Ship v2."))
     third, _, _ = wake("three")
-    assert (third["mode"], third["why"], third["changed"]) == ("new", "prefix changed", ["charter"]), third
+    assert (third["mode"], third["why"], third["changed"]) == ("new", coordsession.PROMPT_NEW, ["charter"]), third
     # A setting that picks the role's rule blocks: the standing settings and the rendered role both moved.
     p.set_config("delivery.draft_prs", False)
     fourth, _, _ = wake("four")
-    assert (fourth["why"], fourth["changed"]) == ("prefix changed", ["template", "standing"]), fourth
+    assert (fourth["why"], fourth["changed"]) == (coordsession.PROMPT_NEW, ["template", "standing"]), fourth
     # The role prompt file alone.
     role = p.harness / "prompts" / "coordinator-session.md"
     role.write_text(role.read_text() + "\nOne more rule.\n")
     fifth, _, _ = wake("five")
-    assert (fifth["why"], fifth["changed"]) == ("prefix changed", ["template"]), fifth
+    assert (fifth["why"], fifth["changed"]) == (coordsession.PROMPT_NEW, ["template"]), fifth
     # The schema or the agent (the rest), and a session saved before the digests were recorded.
     parts = fifth["parts"]
     assert coordsession.changed_parts({"parts": parts}, coordsession.prefix_parts(parts, {"x": 1}, "codex")) == ["rest"]
@@ -970,7 +974,9 @@ def test_coordsession_a_new_session_for_a_changed_prefix_names_each_changed_part
 def test_coordsession_an_order_opening_moves_no_prefix_part(env, monkeypatch, resume_between):
     # The session role always renders with the order ledger's rules: an order opening changes neither
     # the prompt nor its "standing" digest, so a later new session names only what really changed.
-    from ttp import obligations
+    from ttp import coordsession, obligations
+    from ttp.providers import fake
+    monkeypatch.setattr(fake.Fake, "resume_new_prompt", "")   # a changed prompt starts a new session
     p, d, sessions, wake = _cs_session_project(env, monkeypatch)
     first, _, _ = wake("one")
     obligations.add(p, "Ship the soak report.")
@@ -979,7 +985,7 @@ def test_coordsession_an_order_opening_moves_no_prefix_part(env, monkeypatch, re
         assert second["mode"] == "resume" and second["parts"] == first["parts"], second
     p.charter_path.write_text(_CS_CHARTER.replace("Ship v1.", "Ship v2."))
     third, _, _ = wake("three")
-    assert (third["mode"], third["why"], third["changed"]) == ("new", "prefix changed", ["charter"]), third
+    assert (third["mode"], third["why"], third["changed"]) == ("new", coordsession.PROMPT_NEW, ["charter"]), third
 
 
 def test_coordsession_decide_names_a_transcript_gone_since_a_daemon_restart():
