@@ -1629,10 +1629,11 @@ class Project:
         self.base = base if base.name == FOLDER else base / FOLDER
         self.root = self.base.parent
         self.harness = self.base / "harness"
-        self.state = self.base / "state"
+        from . import noindex      # on macOS these live in state.noindex/ and worktrees.noindex/
+        self.state = noindex.real(self.base, "state")
         self.runs = self.state / "runs"
         self.logs = self.state / "logs"
-        self.worktrees = self.base / "worktrees"
+        self.worktrees = noindex.real(self.base, "worktrees")
         self.memory_dir = self.harness / "memory"
         self._db: DB | None = None
         self._harness_queued: dict[str, int] = {}   # harness path -> commits queued for it (commit_harness)

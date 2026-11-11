@@ -581,6 +581,7 @@ def relaunch_started(rc: Path) -> bool:
 
 
 SIGNALS = "job-signals.jsonl"   # under the project's state: one line per signal tt-project sent a job
+STATE_NAMES = ("state", "state.noindex")   # a project's state folder (state.noindex on macOS: noindex.py)
 
 
 def signals_file(rc: Path, state: Path | None = None) -> Path:
@@ -592,7 +593,7 @@ def signals_file(rc: Path, state: Path | None = None) -> Path:
         return Path(state) / SIGNALS
     real = Path(os.path.abspath(rc.expanduser())).parent.resolve()
     for a in (real, *real.parents):
-        if a.name == "state" and a.parent.name == FOLDER:
+        if a.name in STATE_NAMES and a.parent.name == FOLDER:
             return a / SIGNALS
     if rc.parent.parent.name == "runs":
         return rc.parent.parent.parent / SIGNALS
@@ -1083,7 +1084,7 @@ def _markable(rc: Path, quiet: bool = False) -> Path | None:
     real = p.parent.resolve()
     run = os.environ.get("TTP_RUN_DIR")
     up = [real, *real.parents]
-    if (any(a.name == "state" and a.parent.name == FOLDER for a in up) or (real / "detached.json").is_file()
+    if (any(a.name in STATE_NAMES and a.parent.name == FOLDER for a in up) or (real / "detached.json").is_file()
             or (run and Path(run).resolve() in up)):
         return p
     if not quiet:

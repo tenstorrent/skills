@@ -3638,7 +3638,9 @@ class Daemon:
         from .project import secrets_path
         from .web import token_path
         from .credguard import credential_files
-        no_reads = [str(token_path(self.p).resolve()), str(secrets_path().resolve()), *credential_files()]
+        no_reads = [*dict.fromkeys((str(token_path(self.p).resolve()),   # and by macOS's state link
+                                    str(self.p.base / "state" / "web.token"))),
+                    str(secrets_path().resolve()), *credential_files()]
         argv, env = prov.build(role=role, model=model, effort=effort, cwd=cwd, budget_usd=budget_usd,
                                read_only=read_only, schema=schema, restrictions=restrictions,
                                disallowed_tools=denied, denied_reads=no_reads,

@@ -55,7 +55,17 @@ def directory(value, *, create=False):
                     os.fsync(fd)
                 except FileExistsError:
                     pass
-            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            try:
+                child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            except OSError:
+                # macOS's state -> state.noindex (noindex.py): only a link to its own sibling is taken
+                try:
+                    to = os.readlink(part, dir_fd=fd)
+                except OSError:
+                    to = None
+                if to != part + '.noindex':
+                    raise
+                child = os.open(to, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
             os.close(fd)
             fd = child
         yield fd

@@ -716,8 +716,10 @@ def bootstrap(root: Path, name: str, brief: str, provider: str, home_tz: str | N
     p.base.mkdir(parents=True, exist_ok=True)
     # The folder ignores itself, so no enclosing repository can ever commit project state.
     durable_write(p.base / ".gitignore", "*\n")
-    from . import indexignore
+    from . import indexignore, noindex
     indexignore.ensure(p)
+    noindex.ensure(p.base)     # macOS: state/ and worktrees/ under .noindex, out of Spotlight
+    p = Project(p.base)
     for d in (p.state, p.runs, p.logs, p.worktrees, p.memory_dir):
         d.mkdir(parents=True, exist_ok=True)
     template = PLUGIN_ROOT / "template"
@@ -12224,6 +12226,15 @@ def cmd_upgrade(a) -> None:
     try:
         upjournal.recover(p, restart=_restart_daemon)    # an earlier run cut short: finish or roll it back
         upjournal.begin(p, "apply" if a.apply is not None else "upgrade", a.auto)
+        from . import noindex
+        try:      # macOS: state/ and worktrees/ under .noindex, linked from the old names
+            moved = noindex.migrate(p.base)
+        except OSError as e:     # the folders stay where they are and work as before; the next upgrade retries
+            moved = [f"noindex: not moved: {e}"]
+        for ln in moved:
+            print(ln)
+        if moved:
+            p = Project(p.base)
         own = _own_run(p)
         if a.apply is not None and own and release.fenced(p, os.environ.get("TTP_TASK") or ""):
             die(f"--apply refused: a host-side upgrade took the template merge over from task "

@@ -27,7 +27,8 @@ NAME = ".ignore"
 BEGIN = "# >>> tt-project: folders kept out of agent CLIs' start-up file index (managed; edits are replaced)"
 END = "# <<< tt-project"
 # Anchored at the project root: a nested folder of the same name (src/results/) is still searched.
-FOLDERS = (f"{FOLDER}/state/", f"{FOLDER}/worktrees/", "results/", "tmp/", "runs/", "worktrees/", ".venv/", "venv/")
+FOLDERS = (f"{FOLDER}/state/", f"{FOLDER}/worktrees/", f"{FOLDER}/state.noindex/", f"{FOLDER}/worktrees.noindex/",
+           "results/", "tmp/", "runs/", "worktrees/", ".venv/", "venv/")
 GIT_S = 10
 
 

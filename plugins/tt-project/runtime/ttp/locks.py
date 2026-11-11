@@ -263,7 +263,7 @@ def project_of(h: dict, locks_dir=None) -> str | None:
         return None
     root = h.get("project_root")
     d = Path(locks_dir) if locks_dir else None
-    if not root and d is not None and d.name == "locks" and d.parent.name == "state" \
+    if not root and d is not None and d.name == "locks" and d.parent.name in ("state", "state.noindex") \
             and d.parent.parent.name == FOLDER:
         root = str(d.parent.parent)
     name = registered_name(root) if root else None

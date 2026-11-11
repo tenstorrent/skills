@@ -230,7 +230,8 @@ def foreign(folder: Path, root: Path, project: Path) -> str | None:
     """Why this job folder is not this project's to stop, else None."""
     if folder != root and root not in folder.parents:
         return f"{folder} is outside the project root {root}"
-    if folder in (root, project, project / "state", project / "state" / "runs"):
+    own = (project / "state", project / "state.noindex")      # state.noindex: macOS (noindex.py)
+    if folder in (root, project, *own, *(d / "runs" for d in own)):
         return f"{folder} is the project's own folder, not a job's"
     for a in (folder, *folder.parents):
         if a == root:

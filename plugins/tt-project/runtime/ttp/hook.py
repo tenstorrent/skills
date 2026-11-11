@@ -824,8 +824,8 @@ def _log_bypass(cmd: str) -> None:
                      refused=True)
 
 
-# The project's web app token (state/web.token), named in a command
-WEB_TOKEN_RE = re.compile(r"state/+web\.token\b")
+# The project's web app token (state/web.token, or under state.noindex on macOS), named in a command
+WEB_TOKEN_RE = re.compile(r"state(?:\.noindex)?/+web\.token\b")
 # The per-user secrets store by path, and the runtime calls that hand back its values: a tool call's
 # output stays in the run's log and its agent's transcript, so a run tests a key with
 # `ttp secret check` and gives one to a command with `ttp secret env` (also `--secret`) instead.
