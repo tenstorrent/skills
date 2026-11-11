@@ -108,7 +108,7 @@ CLEARED_TEXT = {
 # notifier: this machine's desktop notifications fail (notifier.py; a system setting or a missing tool).
 # fleethold: a hold the user set is past its expected end while tasks here wait on it (fleethold.passed_alerts).
 USER_BLOCKERS = ("network", "paused", "coord-budget", "linger-off", "notifier", "fleethold", "user-step",
-                 "slurm-paused", "model-ranking-key", "ssh-agent")   # ssh-agent: a locked or waiting password-manager agent here (sshagent.py); model-ranking-key: no Artificial Analysis key (rankfresh); slurm-paused: the checks overflow's start-failure breaker (slurmcheck); paused: a long project pause (projpause); user-step: userstep.py
+                 "slurm-paused", "model-ranking-key", "ssh-agent", "gh-auth")   # gh-auth: gh has no login here and no route (ghauth); ssh-agent: a locked or waiting password-manager agent here (sshagent.py); model-ranking-key: no Artificial Analysis key (rankfresh); slurm-paused: the checks overflow's start-failure breaker (slurmcheck); paused: a long project pause (projpause); user-step: userstep.py
 CLEARED_SEVERITY = {"network": "low", "paused": "low", "fleethold": "low", "coord-budget": "low", "account-mismatch": "low",
                     "linger-off": "low", "notifier": "low", "user-step": "low", "slurm-paused": "low", "gh-auth": "low",
                     "model-ranking-key": "low", "ssh-agent": "low"}
@@ -137,7 +137,8 @@ def _top(severity: str | None, ref: str | None) -> bool:
 
 def _status(ref: str | None, severity: str | None = None) -> bool:
     kind = str(ref or "").partition(":")[0]
-    return bool(ref) and (kind in STATUS_CONDITIONS or (kind in USER_BLOCKERS and severity == "low"))
+    # A logout posted low is a status line too: its work runs on another provider (Daemon.logout_alert).
+    return bool(ref) and (kind in STATUS_CONDITIONS or (kind in USER_BLOCKERS + ("auth",) and severity == "low"))
 
 
 def tracked(kind: str, severity: str | None, ref: str | None) -> bool:
@@ -455,7 +456,7 @@ def ack(db: DB, message: int, why: str, now: float | None = None) -> dict:
             live = heal.cleared_why(db, arg, now) is None
         else:
             live = holds(db, ep["key"], _since(ep), now)
-        if live and _outage(db, ep["key"], now):
+        if live and _outage(db, ep["key"], now) and kind != "auth":   # a logout: known, quiet until it changes
             raise ValueError(f"alert #{message} is a live outage ({ep['key']}): it clears itself once the "
                              f"condition is over, and cannot be acknowledged away")
         if not live:

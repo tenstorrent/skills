@@ -672,7 +672,7 @@ def watch_prs(daemon, payload: dict | None = None) -> str:
     if auth:   # never ok: the host-wide gh login check (ghauth) is asked to look now and alerts once
         ghauth.nudge()
         return (f"error: degraded: gh has no login on this host ({ghroute.quiet(auth[0])}) and {ghroute.SETTING} "
-                f"{'is down' if ghroute.route(cwd=str(daemon.p.base)) else 'is unset'}: {len(auth)} gh calls failed, "
+                f"{ghroute.how(cwd=str(daemon.p.base))}: {len(auth)} gh calls failed, "
                 f"{len(order)} PRs not read; {ghroute.SETTING} (an ssh alias where gh is logged in) routes them")
     if missed:
         shown = "; ".join(missed[:10]) + (f"; {len(missed) - 10} more" if len(missed) > 10 else "")

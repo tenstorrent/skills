@@ -12,6 +12,7 @@ WORKER_NOTIFY = "decisions, reviews, merges, funds, outages"
 # Every runtime call that posts kind='alert': (file, function) -> one (class, why) per call site, in
 # source order. A new site, or one more in a listed function, fails test_every_alert_post_site_is_classed.
 ALERT_SITES = {
+    ("settinghold.py", "propose"): [("decisions", "one low proposal per setting state naming the setting, the blocked tasks and the change that unblocks them")],
     ("chartertemplate.py", "alert"): [("decisions", "a charter Restrictions item the user ordered was refused; once per item and cause, cleared when it lands")],
     ("coordinator.py", "apply"): [
         (WORKER_NOTIFY, "the coordinator's notify action; its prompt and gates limit it to these"),
@@ -22,12 +23,12 @@ ALERT_SITES = {
     ("daemon.py", "Daemon.update_gates"): [("funds", "a provider's budget gate turned red")],
     ("daemon.py", "Daemon._recover_upgrade"): [("outages", "a harness upgrade was cut short and rolled back or finished")],
     ("daemon.py", "Daemon.alert"): [("outages", "the keyed condition helper: a live condition, cleared when it ends")],
-    ("daemon.py", "Daemon.remind_logouts"): [("user-blocker", "a provider stays logged out; only the user can log in")],
+    ("daemon.py", "Daemon.remind_logouts"): [("outages", "a logout whose work runs on another provider: one low status line"),
+                                              ("user-blocker", "a provider stays logged out and no other provider can run its work")],
     ("daemon.py", "Daemon.relay_when_blocked"): [("outages", "the coordinator cannot run; conditions wait unhandled")],
     ("daemon.py", "relay_worker_notifies"): [(WORKER_NOTIFY, "a worker's `ttp notify`; its prompt limits it to these")],
     ("db.py", "DB._quarantine_kv"): [("outages", "stored state was unreadable and reset: state was lost")],
     ("deploy.py", "_alert"): [("outages", "a project is still behind the newest release after its takeover time")],
-    ("grants.py", "reconcile"): [("decisions", "a setting changed on the user's word in the charter")],
     ("relay.py", "ordered"): [("decisions", "a charter change applied on the owner's agent's order, with its old text")],
     ("service.py", "reap_restart_request"): [("outages", "a requested daemon restart failed")],
     ("service.py", "_roll_back"): [("outages", "the daemon did not start on a runtime change; rolled back")],

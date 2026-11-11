@@ -116,6 +116,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # A project paused this long raises one normal alert naming who paused it, why and since when,
         # reminded at most once a day and cleared on resume (projpause; 0 = never).
         "paused_alert_s": 14400,
+        # After an outage ends, new workers start this many above those still running and double every
+        # ramp_step_s seconds until they pass max_parallel_workers (rampup.py; 0 = all at once).
+        "ramp_start": 2,
+        "ramp_step_s": 180,
         # A run that ends without reporting its cost is estimated from its tokens at the project's
         # own observed rate; until there is one, this $ per million weighted tokens (set high).
         "estimate_usd_per_mtok": 15.0,
@@ -229,6 +233,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
                     "debounce_s": 15, "max_events_per_turn": 40,
                     "max_turns_per_hour": 30, "max_new_tasks_per_day": 200, "idle_wake_s": 3000,
                     "starve_wake_s": 300,
+                    # The median cost of the last 5 session wakes over which one alarm names the cause
+                    # and the session compacts in place and sends a leaner digest (wakecost.py; 0: off).
+                    "wake_cost_alarm_usd": 1.0,
                     # An event batch that a turn which decided nothing already met, against the same
                     # state, is settled without a model run for this long after it (turngate.py; 0: off).
                     "skip_repeat_window_s": 86400,
@@ -254,6 +261,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
                     # or lock, an outside pool, CPU): one must-act item per task and queue with unblock options,
                     # raised again each such span until the coordinator acts (queuewait.py; 0: off).
                     "queue_wait_escalate_min": 30,
+                    # A coordinator reply or notify that is only an acknowledgement, progress, a queue wait or
+                    # a forecast correction (and onhost's 'Status now' footer) waits for one digest per chat,
+                    # posted at most this often; results, decisions, outages and asks go at once
+                    # (chatdigest.py; 0: every post goes at once).
+                    "chat_digest_h": 3,
                     # A user-ordered urgent task (fresh `urgent:` line) with a machine or device resource
                     # still queued this long, or waiting this long in `ttp lock`: one high observation
                     # names what holds it (Daemon.check_urgent_start; 0: off).
@@ -360,8 +372,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
                     "review_failed_unhandled_s": 3600,
                     # Provider failover (failover.py): a queued or waiting task whose provider cannot
                     # start new work for longer than provider_failover_after_h hours (0: off) moves to
-                    # the first usable of provider_failover_to (provider names), then the core provider.
+                    # the first usable of provider_failover_to (provider names), then the core provider;
+                    # a logout counts once it lasts provider_logout_failover_s seconds (0: at once).
                     "provider_failover_after_h": 4, "provider_failover_to": [],
+                    "provider_logout_failover_s": 900,
                     # Tier floor for conclusion runs (tierfloor.py): a question or plan task, a chat
                     # answer, a spec with a `conclusion:` line, a report schedule's run, a review or
                     # verdict and a device or machine run starts at least at this tier and effort, never
@@ -373,12 +387,14 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # `ttp listen` holds broadcast alerts this long to print them together; lease_s: another relayer
     # is refused a chat id whose relayer listened this recently (relayers.py).
     "relay": {"gone_after_s": 86400, "batch_s": 120, "lease_s": 600},
-    # code_tasks_may_push: a code task whose spec asks it to land on delivery.push_branch may run
-    # `ttp push` itself, so no separate landing task is needed. Off: only review tasks push.
+    # code_tasks_may_push: true: a code task whose spec asks it to land on delivery.push_branch may run
+    # `ttp push` itself, so no separate landing task is needed. "approved" (the default): a code task
+    # or the coordinator lands a head an independent review approved (approved_heads_may_push). Off:
+    # only review tasks and the push queue push.
     # drafts_during_freeze: opening and updating draft PRs needs no ask even under a code freeze.
     # Off: a draft PR under a code freeze needs the user's word (coordinator prompt and ask gate).
     "delivery": {"draft_prs": True, "review_before_pr": True, "auto_merge_repos": [],
-                 "push_allowed": True, "code_tasks_may_push": False, "drafts_during_freeze": True},
+                 "push_allowed": True, "code_tasks_may_push": "approved", "drafts_during_freeze": True},
     # Review tasks run light when the diff under review touches no risky_paths glob and no code file
     # with a risky name (risky_names, default budget.RISKY_NAMES) and is docs and tests only or at
     # most light_max_lines non-doc lines; otherwise standard. A re-review after a failed review applies
@@ -416,8 +432,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # itself (chaincap.requeue: same id, worktree and branch) instead of a new task.
     # split_lines (0 off): kind-code.md asks a worker whose change would pass about this many non-test
     # lines to hand it off in parts, each reviewed and landed on its own (prompts.split_lines).
+    # A task that ran max_task_runs times since its last explicit requeue, or whose last max_idle_runs
+    # runs spent money with no hand-off and no commit, is not started again (0 turns one off): it is
+    # blocked and the coordinator gets one run_cap event summing up its runs (runcap).
     "chains": {"max_hops": 8, "max_stalls": 2, "max_usd": 40.0, "auto": True, "urgent_followups": True,
-               "requeue": True, "split_lines": 200},
+               "requeue": True, "split_lines": 200, "max_task_runs": 4, "max_idle_runs": 2},
     # Each Jev use (e.g. "screen") is switched off once its net saving over window_days is not
     # positive, judged after min_calls calls or once its first call is a window old, or once idle_calls
     # calls in the window changed none of the rules' decisions; uses.<use> = "on" or "off" forces it
@@ -600,6 +619,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "overlap": {"enabled": True, "hub_bytes": 150000, "branch_days": 14, "settled_days": 14,
                 "ignore": ["CHANGELOG*", ".changeset/*", "changesets/*", "plugin.json", "marketplace.json",
                            "package.json", "package-lock.json", "__init__.py"]},
+    # The daily waste ledger (waste.py, `ttp waste`): a project whose avoidable share passes target_share
+    # gets one fix task for its largest bucket (fix_task); wake_usd, max_runs and review_rounds are the
+    # limits past which a coordinator wake, a task's runs and a change's review rounds count as avoidable.
+    # moved_at (epoch, no default): runs started after it count as a stand-in's after a project move.
+    "waste": {"target_share": 0.10, "wake_usd": 1.0, "max_runs": 4, "review_rounds": 2, "fix_task": True},
+    # Batch runs (batchrun.py): a code task's run also takes up to batch_max small ready code tasks.
+    "dispatch": {"batch": True, "batch_max": 5},
 }
 
 
@@ -608,6 +634,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
 META_KEYS = {"name", "id", "host", "root", "created", "tt_project_version", "pricing", "restrictions",
              "home_timezone", "home_timezone_from"}
 EXTRA_KEYS = {
+    "waste": {"moved_at"},
     "budget": {"max_waits", "hourly_floor_usd", "estimate_weights", "hourly_waste_usd", "hourly_waste_runs",
                "hourly_coordinator_turns", "hourly_coordinator_repeats", "max_pace_hold_s",
                "cap_yellow_pct"},   # max_pace_hold_s: deprecated and ignored; accepted so old configs stay quiet
@@ -669,6 +696,8 @@ EXTRA_KEYS = {
     # plugin_version_guard: refuse a change that edits plugins/<name>/ but keeps the tip's manifest version (off).
     # push_solo_paths: pathspecs a batch takes at most one routine change touching (pushq.SOLO_PATHS, off); push_cap_tests:
     # the name regex of prompt size cap tests, whose lone failure sends a trim-to-fit fix (conflictfix.CAP_TESTS).
+    # push_entry_checks: quick commands (seconds) a batch runs on each entry merged onto its head before
+    # it joins the batch, whatever the entry's own scope; one failing sends that entry back alone (batch._entry_check).
     # push_rerun_s: the time limit of one rerun of a failed push check's failing tests (batch.RERUN_S).
     # push_hard_tests: the regex of failing test ids a batch never excuses as the tip's own (batch.HARD_TESTS, the leak scan).
     # mechanical_merge_paths: globs of shared docs whose push-rebase conflicts settle by keeping both sides'
@@ -689,7 +718,7 @@ EXTRA_KEYS = {
                  "push_checks_timeout_s", "push_pool_wait_s", "push_retries",
                  "version_bump", "push_queue", "push_batch_s", "push_batch_max", "push_min_gap_s", "push_age_s", "push_landing_alert_h", "push_script_torn_escalate_after",
                  "push_setup_fault_escalate_after", "after_push",
-                 "push_solo_paths", "push_cap_tests", "push_rerun_s", "push_hard_tests", "mechanical_merge_paths",
+                 "push_solo_paths", "push_cap_tests", "push_entry_checks", "push_rerun_s", "push_hard_tests", "mechanical_merge_paths",
                  "after_push_timeout_s", "backup_remote", "fast_forward_also", "mirror_remotes",
                  "allow_protected_push_branch", "own_push", "own_push_remote", "own_push_reserved_lane", "deploy_restart_wait_s", "plugin_version_guard",
                  "checks_fast_globs", "checks_fast_exclude",   # these two: `ttp checks` fast path (push.FAST_GLOBS),
@@ -698,14 +727,15 @@ EXTRA_KEYS = {
                  "checks_task_full",   # the user's own: a task's `ttp checks --full` runs with the push queue on (testpick.full_refusal)
                  "checks_host",   # where checks run (remotecheck)
                  "gh_route",   # the ssh alias gh calls run on when this host has no gh login (ghroute)
-                 "checks_spill_hosts", "checks_spill_after_s", "checks_spill_first", "checks_remote_only",   # where busy checks may spill to (checkspill)
+                 "checks_spill_hosts", "checks_spill_exclude", "checks_spill_after_s", "checks_spill_first", "checks_remote_only",   # where busy checks may spill to (checkspill)
                  "check_prestage",   # a short foreground run before `ttp checks --detach` (checkprestage)
                  "pr_body_check",   # a project's own PR body check before gh pr create/edit (prbody)
                  "ai_tag",   # the AI-authorship tag a post to others ends with (aitag)
                  "max_open_branches", "max_work_threads", "delete_landed_branches", "dead_branch_days",   # open-branch soft cap (branchcap)
                  "rebase_replace", "never_force",   # whether a rebase replaces its branch (rebase_replace)
                  "integration_branch",   # where reviewed changes land on a project with no push branch (integrate)
-                 "channel_tags"},   # release-channel tags a forward move may update under never_force (channeltag)
+                 "channel_tags",   # release-channel tags a forward move may update under never_force (channeltag)
+                 "express", "express_max_lines", "express_max_files"},   # `ttp express`: one small urgent head lands alone (express)
     "jev": {"via", "url", "model"},
     "effort_ab": {"winner", "decided_at"},   # the end rule's result, written by effortab.conclude
     # launcher_stops: {glob of a project launcher's job folders: stop command} `ttp detach --stop <job
@@ -987,6 +1017,18 @@ def code_tasks_may_push(cfg: dict) -> bool:
     true and delivery.push_branch is set."""
     d = cfg.get("delivery") or {}
     return d.get("code_tasks_may_push") is True and bool(str(d.get("push_branch") or "").strip())
+
+
+APPROVED_PUSH = "approved"   # delivery.code_tasks_may_push: only heads an independent review approved
+
+
+def approved_heads_may_push(cfg: dict) -> bool:
+    """Whether a code task or the coordinator may land a head an independent review approved with
+    `ttp push` (push.approved_head): delivery.code_tasks_may_push is true or "approved" (the default)
+    and delivery.push_branch is set."""
+    d = cfg.get("delivery") or {}
+    v = d.get("code_tasks_may_push", APPROVED_PUSH)
+    return (v is True or str(v).strip().lower() == APPROVED_PUSH) and bool(str(d.get("push_branch") or "").strip())
 
 
 # delivery.push_queue on: reviews approve into the daemon's queue, which pushes approved heads in
@@ -1284,9 +1326,10 @@ def config_problems(raw: dict, root: Path | None = None) -> list[str]:
         if ceiling and isinstance(jt, (int, float)) and not isinstance(jt, bool) and jt > ceiling:
             out.append(f"device.runners.{name}.job_timeout_s: {jt} is above runner.device_timeout_max_s "
                        f"({ceiling}); jobs without their own --timeout get {ceiling}")
-    may_push = delivery.get("code_tasks_may_push", False)
-    if not isinstance(may_push, bool):
-        out.append(f"delivery.code_tasks_may_push: {may_push!r} is not true or false; code tasks do not push")
+    may_push = delivery.get("code_tasks_may_push", APPROVED_PUSH)
+    if not isinstance(may_push, bool) and str(may_push).strip().lower() != APPROVED_PUSH:
+        out.append(f"delivery.code_tasks_may_push: {may_push!r} is not true, false or \"{APPROVED_PUSH}\"; "
+                   "code tasks do not push")
     own = delivery.get("own_push")
     if own is not None and not isinstance(own, bool) and \
             str(own).strip().lower().replace("-", "_") not in OWN_PUSH_MODES + ("existing", "true", "false", "yes", "no"):

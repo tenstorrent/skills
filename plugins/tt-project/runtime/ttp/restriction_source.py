@@ -48,6 +48,10 @@ _CITES_RE = re.compile(r"\(\s*" + _CITE_RUN + _CITE_DATE + r"\s*\)|" + _CITE_RUN
 _BARE_RE = re.compile(r"[ \t]*(?:" + _CITES_RE.pattern + ")", re.I)
 ADVISORY_HEAD = "Unsourced restrictions (advisory): drop them yourself"
 _BULLET_RE = re.compile(r"\s*(?:[-*+]|\d+[.)])\s+")
+# A CHARTER.history.md entry (coordinator._charter_update) and the user message ids its header names.
+_HIST = re.compile(r"^### (?:Added to|Replaced in) (?P<sec>[^\n]+?) \((?P<meta>[^)\n]*)\)\n(?P<body>.*?)(?=^### |\Z)",
+                   re.M | re.S)
+_USER_MSG = re.compile(r"user message (#\d+(?:, #\d+)*)")
 SOURCE_FORMS = ("`source` is the JSON text of {\"msg\": <user message id>, \"quote\": \"<the user's own words in "
                 "it, from the 'user's words (verbatim)' part only>\"}, {\"origin\": \"brief\", \"quote\": \"<words "
                 "of the Brief>\"}, {\"origin\": \"gate\"} for a harness hard gate (a spend cap, a credential), or "
@@ -77,7 +81,6 @@ def sourced(item: str, recorded: set[str] | frozenset = frozenset()) -> bool:
 def recorded_items(history: str) -> frozenset[str]:
     """The Restrictions items (_item_key) CHARTER.history.md logs as added or replaced in a turn carrying
     the user's message: the structured source each charter_update records (coordinator._charter_update)."""
-    from .grants import _HIST, _USER_MSG
     out: set[str] = set()
     for m in _HIST.finditer(history or ""):
         if not m.group("sec").strip().lower().startswith("restriction") or not _USER_MSG.search(m.group("meta")):

@@ -3304,3 +3304,96 @@ def test_detach_stop_ends_the_jobs_helpers_in_other_groups_of_its_session_and_th
                 os.kill(x, signal.SIGKILL)
             except OSError:
                 pass
+
+
+def test_guard_or_lets_a_failed_detach_check_exit_4_past_its_fallback_and_leaves_other_probes_alone():
+    """`ttp detach --check x.rc || test "$(date +%s)" -ge <t>` would hide the check's exit 4 (jobs ended,
+    one failed) behind the fallback: guard_or makes a 4 exit 4, keeps 0 and "still running" as before."""
+    from ttp import detach
+    g = detach.guard_or
+    assert g('ttp detach --check a.rc || test "$(date +%s)" -ge 9') == \
+        'ttp detach --check a.rc || { [ $? -eq 4 ] && exit 4; test "$(date +%s)" -ge 9; }'
+    for same in ("ttp detach --check a.rc", "ttp lock --probe x || true", "ttp detach --check a.rc && true",
+                 "(ttp detach --check a.rc || true); x", "echo 'detach --check a || b'", None):
+        assert g(same) == same
+    # `||` in quotes is not an operator; a chain guards each fallback; a second pass changes nothing.
+    assert g('ttp detach --check "a || b.rc" || false && x') == \
+        'ttp detach --check "a || b.rc" || { [ $? -eq 4 ] && exit 4; false; } && x'
+    chain = g("ttp detach --check a.rc || ttp detach --check b.rc || true")
+    assert chain.count("exit 4") == 2 and g(chain) == chain
+    run = lambda probe: subprocess.run(["sh", "-c", probe], capture_output=True, text=True)
+    for a, b, rc, out in ((0, 0, 0, ""), (1, 0, 0, ""), (4, 0, 4, ""), (1, 4, 4, ""), (1, 1, 0, "fb")):
+        r = run(g(f'sh -c "exit {a}" detach --check || sh -c "exit {b}" detach --check || echo fb'))
+        assert (r.returncode, r.stdout.strip()) == (rc, out), (a, b, r)
+
+
+def test_guard_or_reads_a_redirects_ampersand_as_part_of_the_redirect_not_a_separator():
+    """`2>&1`, `>&2`, `&>f` and `|&` carry an `&` that is no command separator: guarded, each probe still
+    parses (`bash -n`), a check exiting 4 exits 4, and other exits reach the fallback."""
+    from ttp import detach
+    g = detach.guard_or
+    chk = 'sh -c "exit $0" detach --check'
+    for probe in (f"{chk} || ssh-stand-in test -e /m >/dev/null 2>&1",
+                  f"{chk} 2>&1 || echo fb >&2",
+                  f"{chk} &>/dev/null || echo fb 2>&1 <&0"):
+        guarded = g(probe)
+        assert guarded != probe and guarded.count("exit 4") == 1 and g(guarded) == guarded, guarded
+        assert subprocess.run(["bash", "-n", "-c", guarded]).returncode == 0, guarded
+        for code, want in (("4", 4), ("0", None), ("1", None)):
+            r = subprocess.run(["bash", "-c", guarded.replace("$0", code)], capture_output=True, text=True)
+            o = subprocess.run(["bash", "-c", probe.replace("$0", code)], capture_output=True, text=True)
+            assert r.returncode == (want if want is not None else o.returncode), (probe, code, r)
+    # `|&` pipes: the pipeline's exit (cat's) feeds `||`, so the guard parses and changes no outcome
+    pipe = f"{chk} |& cat || echo fb >&2"
+    assert subprocess.run(["bash", "-n", "-c", g(pipe)]).returncode == 0 and g(pipe).count("exit 4") == 1
+    assert subprocess.run(["bash", "-c", g(pipe).replace("$0", "4")]).returncode == 0
+    assert g("ttp detach --check a.rc 2>&1 & wait") == "ttp detach --check a.rc 2>&1 & wait"
+
+
+def test_a_hand_offs_detach_check_feeding_a_fallback_is_stored_guarded_with_its_own_text_kept(env, monkeypatch,
+                                                                                              tmp_path):
+    """The daemon stores a waiting hand-off's `detach --check x.rc || <time>` guarded (retry_when_orig keeps
+    the worker's text), so a failed job exits 4 and wakes the task as a failed job, not at the fallback."""
+    p = make(env)
+    from ttp import daemon as dmod
+    from ttp import detach
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
+    d = dmod.Daemon(p.base)
+    rc = tmp_path / "job.rc"
+    probe = f'ttp detach --check {rc} || test "$(date +%s)" -ge 4102444800'
+    monkeypatch.setenv("TTP_FAKE_RESULT", json.dumps({
+        "status": "waiting", "summary": "job running", "waiting_for": "the job", "retry_after_s": 900,
+        "retry_when": probe}))
+    tid = p.db.add_task("waits on a job", "s", kind="work", tier="light", origin="user")
+    assert _run_until(d, p, lambda: p.db.one("SELECT id FROM events WHERE kind='task_waiting' AND task=?", (tid,)))
+    res = json.loads(p.db.task(tid)["result"])
+    assert res["retry_when"] == detach.guard_or(probe) != probe and res["retry_when_orig"] == probe, res
+    rc.write_text("3\n")
+    stored = res["retry_when"].replace("ttp detach", f"{sys.executable} -m ttp detach", 1)
+    r = subprocess.run(["sh", "-c", stored], capture_output=True, text=True,
+                       env={**os.environ, "PYTHONPATH": str(Path(dmod.__file__).parent.parent)})
+    assert r.returncode == detach.FAILED_RC and detach.failed_check(res["retry_when"], r.returncode), r
+
+
+def test_detach_state_reads_a_bare_job_path_as_its_rc_and_an_rc_written_late_wins(env, tmp_path, monkeypatch):
+    """Upstream note f08269644b34508b: `detach --check <dir>/<name>` (no .rc) read the bare path, found no
+    exit code and marked the ended job lost. The bare path maps to <name>.rc; detached.json entries match by
+    absolute path; an .rc that shows while the loss reasons are read wins over the guess."""
+    from ttp import detach
+    run = tmp_path / "run"
+    run.mkdir()
+    (run / "job.v2.rc").write_text("0\n")
+    assert detach.state(run / "job.v2") == ("ended", "0") and detach.recorded(run / "job.v2")
+    assert not (run / "job.v2.lost").exists() and not (run / "job.lost").exists()
+    assert detach.job_rc(run) == run, "a series driver's dir stays as given"
+    monkeypatch.chdir(tmp_path)
+    (run / "detached.json").write_text(json.dumps([{"rc": "./run/other.rc", "boot": "b1"}]))
+    assert detach._entry(run / "other.rc") == {"rc": "./run/other.rc", "boot": "b1"}
+    late = run / "late.rc"
+    real = detach.started
+
+    def started_then_rc(rc):   # the job writes its exit code while state() works out why it is gone
+        late.write_text("3\n")
+        return real(rc)
+    monkeypatch.setattr(detach, "started", started_then_rc)
+    assert detach.state(late) == ("ended", "3") and not detach.lost(late).exists()

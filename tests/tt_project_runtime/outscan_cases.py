@@ -37,8 +37,8 @@ def test_outscan_names_the_class_of_each_leak_and_never_the_value(env, monkeypat
     for clean in ("the build passed in 12 minutes", "slot acme holds the key", "sk-short", "BRD-12"):
         assert outscan.problem("ttp notify", clean, p=p) is None, clean
     # A forbidden-data pattern that is not a regex fails closed, naming the pattern.
-    with open(p.charter_path, "a") as f:
-        f.write("- broken: `(unclosed`\n")
+    p.set_config("memory.forbidden_patterns", [*p.raw_config()["memory"]["forbidden_patterns"],
+                                               {"name": "broken", "regex": "(unclosed"}])
     assert "'broken' is not a valid regex" in outscan.problem("ttp notify", "anything", p=p)
     assert outscan.mask_shapes("a " + _OUT_SHAPE + " b") == "a [redacted:GitHub token] b"
 

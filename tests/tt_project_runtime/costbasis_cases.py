@@ -244,9 +244,10 @@ def test_an_opus_alias_fork_books_the_rates_of_the_model_its_result_names(env):
     u = _reported(12.0, output_tokens=20_000)
     u.extra.update(model="claude-opus-5-5")
     assert abs(d._net_of_session(r, u) - want) < 1e-6
-    usd, est = localspend.price("claude-haiku-5-5", {"input_tokens": 1_000_000, "output_tokens": 1_000_000,
-                                                    "cache_read_input_tokens": 1_000_000})
-    assert not est and abs(usd - 0.61) < 1e-9
+    # a prompt under the 100K long-prompt tier: the base Haiku 5.5 row
+    usd, est = localspend.price("claude-haiku-5-5", {"input_tokens": 60_000, "output_tokens": 1_000_000,
+                                                    "cache_read_input_tokens": 30_000})
+    assert not est and abs(usd - 0.5063) < 1e-9
     for _ in range(2):
         u = _reported(30.0, output_tokens=20_000)
         u.extra.update(model_usage=["claude-unheard-9"])
@@ -550,3 +551,36 @@ def test_a_forked_run_books_its_subagent_calls_at_each_ones_model(env):
     plain = dict(r, note=json.dumps({"coord_context": {"how": "disk"}}))
     u = get_provider("claude").parse(run_dir / "output.jsonl")
     assert d._net_of_session(plain, u) == 12.0 and "subagent_usd" not in u.extra
+
+
+def test_a_haiku_5_5_call_over_100k_prompt_tokens_is_priced_at_its_long_prompt_tier(monkeypatch):
+    """Review #7627: claude-haiku-5-5's row is for prompts up to 100K tokens (input, cache read and cache
+    write); a longer prompt bills 5x on every rate, output included. Other rows have no tier."""
+    from ttp import localspend
+    monkeypatch.setattr(localspend, "overrides", lambda: {})
+    short = {"input_tokens": 60_000, "cache_read_input_tokens": 40_000, "output_tokens": 1_000}
+    usd, est = localspend.price("claude-haiku-5-5", short, overrides={})
+    assert not est and usd == pytest.approx((60_000 * 0.1 + 40_000 * 0.01 + 1_000 * 0.5) / 1e6)
+    long = {**short, "cache_creation_input_tokens": 1}
+    assert localspend.price("claude-haiku-5-5", long, overrides={})[0] == \
+        pytest.approx(5 * (60_000 * 0.1 + 40_000 * 0.01 + 1 * 0.125 + 1_000 * 0.5) / 1e6)
+    split = {**short, "cache_creation": {"ephemeral_1h_input_tokens": 1}}
+    assert localspend.price("claude-haiku-5-5", split, overrides={})[0] == \
+        pytest.approx(5 * (60_000 * 0.1 + 40_000 * 0.01 + 1 * 0.2 + 1_000 * 0.5) / 1e6)
+    assert localspend.price("claude-sonnet-5-5", long, overrides={})[0] == \
+        pytest.approx((60_000 * 2.0 + 40_000 * 0.2 + 1 * 2.5 + 1_000 * 10.0) / 1e6), "no tier on other rows"
+
+
+def test_a_haiku_5_5_runs_list_cost_books_the_long_prompt_tier_on_its_total_prompt(monkeypatch):
+    """daemon._list_cost sees only a run's summed tokens: over 100K prompt tokens in total it books 5x
+    (over-booking a run of short prompts, never under-booking a long one); at or under, the base rates."""
+    from ttp import localspend
+    from ttp.daemon import _list_cost
+    from ttp.providers.base import RunUsage
+    monkeypatch.setattr(localspend, "overrides", lambda: {})
+    run = {"provider": "claude", "model": "claude-haiku-5-5"}
+    under = RunUsage(input_tokens=50_000, cache_read_tokens=50_000, output_tokens=2_000)
+    over = RunUsage(input_tokens=50_000, cache_read_tokens=50_000, cache_write_tokens=10, output_tokens=2_000)
+    assert _list_cost(run, under) == pytest.approx(round((50_000 * 0.1 + 50_000 * 0.01 + 2_000 * 0.5) / 1e6, 6))
+    assert _list_cost(run, over) == pytest.approx(
+        round(5 * (50_000 * 0.1 + 50_000 * 0.01 + 10 * 0.125 + 2_000 * 0.5) / 1e6, 6))

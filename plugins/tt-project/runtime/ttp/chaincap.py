@@ -84,7 +84,8 @@ MIN_REASON = 20
 HARD = ("max_hops", "max_usd")   # caps no `reason` lifts (spend safety); max_stalls and review.area_fail_cap take one
 REASON_HINT = ("add a `reason` field to the task_add that names what changed, in these words: new evidence, "
                f"a different approach or a narrower scope (at least {MIN_REASON} characters); it then passes in the same action")
-DEFAULTS = {"max_hops": 8, "max_stalls": 2, "max_usd": 40.0, "auto": True, "requeue": True}
+DEFAULTS = {"max_hops": 8, "max_stalls": 2, "max_usd": 40.0, "auto": True, "requeue": True,
+            "max_task_runs": 4, "max_idle_runs": 2}   # the last two: per task, at dispatch (runcap)
 CAP_EVENT = "continue_cap"
 OVERRIDE_EVENT = "continue_cap_override"
 AUTO_EVENT = "continue_auto"
@@ -282,13 +283,13 @@ def own_trees(p, hop: dict) -> list[Path]:
     return list(dict.fromkeys(trees))
 
 
-def code_commits(p, hop: dict, earlier=(), now: float | None = None) -> int:
-    """The commits code hop `hop` made: committer time inside its runs (run_windows), read from its own
+def code_commits(p, hop: dict, earlier=(), now: float | None = None, wins=None) -> int:
+    """The commits code hop `hop` made: committer time inside its runs (run_windows, or `wins`), read from its own
     worktree or clone (own_trees), its branch and pr_branch (each where it resolves: the worktree, the
     project root) less the base (in a standalone clone, its origin/HEAD) and the `earlier` tasks' branches
     it started from, and the shas its hand-off names. A source git cannot read adds none."""
     from . import worktree
-    wins = run_windows(p.db, hop, now)
+    wins = wins or run_windows(p.db, hop, now)
     lo = min(a for a, _ in wins)
     found: dict[str, int] = {}
 

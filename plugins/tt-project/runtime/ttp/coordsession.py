@@ -244,6 +244,8 @@ def decide(cfg: dict, state, prefix_key: str, model: str, effort: str, saved, no
         return "resume", "rerun"
     if _num(st.get("context_tokens"), 0) >= limit(cfg, st, model):
         return "resume", "compact"   # the same session compacts in place (agent switch or session_note)
+    if shrink_due(st):   # over the wake-cost alarm (wakecost.py): compacts in place now, once
+        return "resume", "compact"
     return "resume", "prompt changed" if changed else "continued"
 
 
@@ -308,17 +310,38 @@ def salvaged_line(n) -> str:
             f"answer as sent ({int(n)} actions): do not send it again.")
 
 
+SHRINK_MIN_TOKENS = 20000      # growth over the session's floor below which a shrink frees too little
+SHRINK_MIN_CONTEXT = 100000    # a smaller session is not what makes its wakes dear (and Claude Code's
+                               # compaction switch takes no window under it)
+
+
+def shrink_due(state) -> bool:
+    """The wake-cost check (wakecost.py) asked the session to compact in place, the session holds at least
+    SHRINK_MIN_CONTEXT tokens and has grown SHRINK_MIN_TOKENS since its first prompt or last compaction,
+    so a compaction frees something."""
+    st = state if isinstance(state, dict) else {}
+    floor = max(_num(st.get("base_tokens"), 0), _num(st.get("compact_floor"), 0))
+    size = _num(st.get("context_tokens"), 0)
+    return bool(st.get("shrink")) and size >= max(floor + SHRINK_MIN_TOKENS, SHRINK_MIN_CONTEXT)
+
+
 def limit(cfg: dict, state, model: str = "") -> float:
     """The context size at which the session compacts in place: compact_tokens when above 0, else the
     session's first prompt (base_tokens) or its size after its last compaction (compact_floor), the
     larger, plus compact_growth_tokens, and at least compact_floor / (1 - compact_min_free), at most the
     context window (context_window_tokens; 0: LONG_WINDOW for a "[1m]" model, else unknown) less
     compact_margin_tokens."""
+    st = state if isinstance(state, dict) else {}
+    if shrink_due(st):   # the agent's own switch fires at once (wakecost.py)
+        return min(_limit(cfg, st, model), _num(st.get("context_tokens"), 0))
+    return _limit(cfg, st, model)
+
+
+def _limit(cfg: dict, st: dict, model: str) -> float:
     s = settings(cfg)
     fixed = _num(s.get("compact_tokens"), 0)
     if fixed > 0:
         return fixed
-    st = state if isinstance(state, dict) else {}
     floor = _num(st.get("compact_floor"), 0)
     out = max(_num(st.get("base_tokens"), 0), floor) \
         + _num(s.get("compact_growth_tokens"), DEFAULTS["compact_growth_tokens"])
@@ -409,6 +432,8 @@ def record(state, usage, session_id: str, turn: dict, ok: bool, now: float, summ
                 row["post"] = post
             st["compactions"] = [*(st.get("compactions") or []), row][-COMPACTIONS_KEPT:]
             st.update({"restore": True, "compact_floor": st["context_tokens"]})
+        if mode == "resume" and turn.get("why") == "compact":
+            st.pop("shrink", None)   # a wake-cost shrink request is asked once: that wake was its try
     return st
 
 
@@ -477,8 +502,9 @@ def _body(key: str, text: str) -> str:
 
 
 def sections(parts: list[tuple[str, str]]) -> dict:
-    """{key: [hash, label]} of a digest's (section, text) parts."""
-    return {k: [_sha(_body(k, t)), _label(_body(k, t) or t)] for k, t in _keyed(parts)}
+    """{key: [hash, label, hash without ages]} of a digest's (section, text) parts."""
+    return {k: [_sha(_body(k, t)), _label(_body(k, t) or t), _sha(_unticked(_body(k, t)))]
+            for k, t in _keyed(parts)}
 
 
 def _key_rows(text: str, section: str = ROWS) -> list[tuple[str, str]] | None:
@@ -575,11 +601,13 @@ def delta(parts: list[tuple[str, str]], state, seen_fp: str, gen: str,
     if got.get("seen") != seen_fp:
         return None, "another turn's digest since"
     before, now = got["sections"], sections(parts)
-    keyed = got.get("keyed") if row_delta and isinstance(got.get("keyed"), dict) else {}
+    lean = bool(state.get("lean"))   # over the wake-cost alarm (wakecost.py): an age alone is no change
+    keyed = got.get("keyed") if (row_delta or lean) and isinstance(got.get("keyed"), dict) else {}
     sent, same, by_row = [], [], []
     for key, text in _keyed(parts):
         old = before.get(key)
-        changed = key in ALWAYS or not isinstance(old, list) or old[:1] != now[key][:1]
+        at = 2 if lean and isinstance(old, list) and len(old) > 2 else 0
+        changed = key in ALWAYS or not isinstance(old, list) or old[at:at + 1] != now[key][at:at + 1]
         rowed = (_row_delta(key, text, keyed.get(key)) if changed and key.split("#")[0] in (ROWS, COURSE)
                  and isinstance(old, list) else None)
         if rowed is not None and len(rowed) < len(text):   # else the whole section is the shorter
@@ -595,6 +623,8 @@ def delta(parts: list[tuple[str, str]], state, seen_fp: str, gen: str,
     line = ("## Since your last wake in this session only the changed sections follow, each whole"
             + (f" (by row, as their key line says: {', '.join(by_row)}). " if by_row else ". ")
             + f"Unchanged, not repeated: {', '.join(same) or 'none'}"
+            + (" (their ages grown since: a section whose only change is an age is not repeated while this"
+               " session is over its cost-per-wake alarm)" if lean and same else "")
             + (f". Gone (now empty): {', '.join(gone)}" if gone else "")
             + f'. For the whole digest on the next wake, add the action {{"type": "noop", "key": "{FULL_ASK}"}}.')
     at = 1 if sent and sent[0][0] == HEAD else 0

@@ -12,6 +12,7 @@ reading files, running commands or thinking hard becomes a task for a worker ins
 from __future__ import annotations
 
 import difflib
+import functools
 import hashlib
 import json
 import os
@@ -37,6 +38,7 @@ from . import (   # one name per line: two changes adding names merge without a 
     cells,
     chaincap,
     channeltag,
+    chatdigest,
     charterpromise,
     ghroute,
     chartertemplate,
@@ -93,6 +95,7 @@ from . import (   # one name per line: two changes adding names merge without a 
     restriction_source,
     reviewcap,
     rulecite,
+    runcap,
     sandboxstate,
     selfreview,
     reviewreuse,
@@ -130,6 +133,7 @@ from . import claimcheck
 from . import reach
 from . import coordsession
 from . import oldorders
+from . import wakecost
 from . import spans
 from . import coordtools
 from . import pointers
@@ -273,7 +277,8 @@ ACTIONS_SCHEMA: dict[str, Any] = {
             "due": {"type": ["number", "string"]}, "start_by": {"type": ["number", "string"]},
             "claims": {"type": "array", "items": {"type": "object", "properties": {
                 "text": {"type": "string"}, "task": {"type": "integer"}, "action": {"type": "integer"},
-                "expect": {"type": "string"}, "due": {"type": ["number", "string"]}}, "required": ["text"]}},
+                "expect": {"type": "string"}, "due": {"type": ["number", "string"]},
+                "state": {"type": "string", "enum": list(obligations.CLAIM_STATES)}}, "required": ["text"]}},
             "no_order": {"type": "string"}, "cites": {"type": "array", "items": {"type": "integer"}},
             "repeat": {"type": "boolean"}},
             "required": ["type"]}},
@@ -463,6 +468,8 @@ USER_SETTABLE = {
     "delivery.gh_route": lambda v: ghroute.value_of(v),
     # Ordered ssh aliases a run whose slots here stay busy may spill to (checkspill); a list, never a scalar.
     "delivery.checks_spill_hosts": lambda v: checkspill.settable_hosts(v),
+    # Spill hosts (ssh aliases or host names) the project keeps out of every spill route, the pool included.
+    "delivery.checks_spill_exclude": lambda v: checkspill.excludes_of(v),
     "delivery.checks_spill_after_s": lambda v: checkspill.after_of(v),
     # Whether a run that may spill tries the spill hosts before a place here (checkspill.first; default true).
     "delivery.checks_spill_first": lambda v: checkspill.first_of(v),
@@ -505,7 +512,9 @@ USER_SETTABLE = {
     # Lets ttp push and the push queue publish to a push branch that is main, master or the remote's default.
     "delivery.allow_protected_push_branch": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
     # Code tasks whose spec asks for it land on delivery.push_branch with `ttp push` themselves.
-    "delivery.code_tasks_may_push": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
+    # "approved": they and the coordinator land only heads an independent review approved (the default).
+    "delivery.code_tasks_may_push": lambda v: "approved" if str(v).strip().lower() == "approved"
+    else str(v).lower() in ("1", "true", "yes", "on"),
     # Repos whose PRs the project may merge itself. Set only in the turn carrying the user's own message,
     # and only added to (_only_adds_repos); a charter line or a quote never opens it.
     MERGE_KEY: _repo_list,
@@ -557,6 +566,7 @@ USER_SETTABLE = {
     # and waiting tasks move (0: off), and the providers they move to first.
     "coordinator.provider_failover_after_h": lambda v: failover.after_h_of(v),
     "coordinator.provider_failover_to": lambda v: v,   # checked against the configured providers in config_set
+    "coordinator.provider_logout_failover_s": lambda v: failover.logout_s_of(v),   # seconds logged out before work moves
     # Orders the owner's own chat agent relays (`ttp say` context and findings) count as the owner's word
     # (relay.agent_orders). Turned on only in a turn carrying the owner's own message (NEEDS_USER).
     relay.AGENT_KEY: lambda v: v is True or str(v).strip().lower() in ("1", "true", "yes", "on"),
@@ -566,12 +576,25 @@ USER_SETTABLE = {
     "coordinator.session.tools": lambda v: coordtools.tools_mode_of(v),
     # Per-row updates of the keyed digest lists on resumed session wakes: true (default) or false.
     "coordinator.session.row_delta": lambda v: coordsession.row_delta_of(v),
+    # The median cost of the last 5 session wakes at which one alarm goes out and the session shrinks
+    # itself in place (wakecost.py): dollars, 0 or off for no check.
+    "coordinator.wake_cost_alarm_usd": lambda v: wakecost.threshold_of(v),
 }
 
 
 ALIASES = {"checks.suite_concurrency": "checks.slots"}
 """Chat-settable aliases: a key here is stored under its canonical name, so one setting never has two
 places to read. `checks.suite_concurrency` (the setting's spec name) is `checks.slots`."""
+
+
+def _forbidden_body(section: str, text: str) -> str:
+    """A charter_update's text as charter sections holding its Forbidden data patterns, or "" (none):
+    the Forbidden data section itself, or a Forbidden data subsection inside another section's text
+    (each of its headings read as a section heading, so a later subsection's spans are not taken)."""
+    if forbidden.is_section(section):
+        return f"## Forbidden data\n{text}\n"
+    body = re.sub(r"(?m)^#{2,6}[ \t]+", "## ", text)
+    return body if any(forbidden.is_section(line) for line in body.splitlines() if line.startswith("## ")) else ""
 
 
 def settable(key: str):
@@ -1263,10 +1286,17 @@ def _worker_line(p: Project, e: dict, now: float, tag: str) -> tuple[str, str]:
     tail = [clip(check, 40), money] + ([steer + ago] if steer else []) + ([flags] if flags else [])
     tail_text = " | ".join([files] + tail)
     label = f"worker step of #{e.get('task')}"
-    room = WORKER_LINE_CHARS - len(f"- #{e.get('task')} |  | ") - len(tail_text)
+    who = f"#{e.get('task')}" + _batch_note(p, e.get("task"))
+    room = WORKER_LINE_CHARS - len(f"- {who} |  | ") - len(tail_text)
     # Clipped before it is enclosed, and the cut falls on the tail: a cut never drops the span's end.
-    head = f"- #{e.get('task')} | {spans.wrap(clip(step, max(room, 20)), label, tag)} | "
+    head = f"- {who} | {spans.wrap(clip(step, max(room, 20)), label, tag)} | "
     return head + tail_text[:max(WORKER_LINE_CHARS - len(spans.strip(head)), 0)], ident
+
+
+def _batch_note(p: Project, task) -> str:
+    """' (batch b<lead>: +#a, #b)' for a run that leads a batch run (batchrun.py), else ''."""
+    from . import batchrun
+    return batchrun.words(batchrun.view(p.db, task))
 
 
 def workers_lines(p: Project, db, seen: dict | None, fold: bool, now: float,
@@ -1426,6 +1456,9 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
                 if kept and low else f"; {len(kept)} finished tasks' worktrees kept (hand-off artifacts or open "
                 f"tasks): " + clip(", ".join(f"#{t}" for t in kept), 200) if kept else "")
         lines.append(f"## Disk: {disk.get('free_gb')} GB free of {disk.get('total_gb')} GB; {guard}{held}")
+    from . import selfwatch
+    if sw := selfwatch.line(db.kv(selfwatch.KV), now):
+        lines.append(f"## Self-watch: {sw[len('self-watch: '):]}")
     section("host", lines)
     from . import overseer
     section("loop_health", overseer.digest_lines(p, now))   # results, from the overseer's last pass
@@ -2654,6 +2687,34 @@ def _claims_checked(p: Project, a: dict, notes: list) -> tuple[str, list]:
     return text, false
 
 
+def untrusted_update(task: dict, a: dict, upd: dict) -> str:
+    """A task_update's `untrusted_input` (untrusted.py): true adds the label; false clears it, only with a
+    `text` naming who vouched for the task's source, and never from inside a task run (a worker's
+    process). Writes upd["labels"]; returns the why of a clear, else ""."""
+    want = a.get("untrusted_input")
+    if want is None:
+        return ""
+    if not isinstance(want, bool):
+        raise ValueError(f"#{task['id']} rejected: untrusted_input is true or false")
+    labels = upd.get("labels")
+    labels = json.loads(task["labels"] or "[]") if labels is None else labels
+    if want:
+        if untrusted.LABEL not in labels:
+            upd["labels"] = labels + [untrusted.LABEL]
+        return ""
+    if os.environ.get("TTP_TASK") and not coordtools.coordinator_run():
+        raise ValueError(f"#{task['id']} rejected: a task run cannot clear {untrusted.LABEL}; only the coordinator can")
+    why = " ".join(str(a.get("text") or "").split())
+    if not why:
+        raise ValueError(f"#{task['id']} rejected: untrusted_input false needs `text` naming who vouched for "
+                         f"the task's source and why it is safe")
+    if untrusted.LABEL not in labels:
+        return ""
+    upd["labels"] = [lb for lb in labels if lb != untrusted.LABEL] + \
+        ([untrusted.CLEARED_LABEL] if untrusted.CLEARED_LABEL not in labels else [])
+    return why
+
+
 def apply(p: Project, actions: list[dict], default_chat: str | None = None, user_turn: bool = False,
           turn: int | None = None, messages: list[int] | None = None, lean: bool = False,
           applied: list | None = None, skip_actions: frozenset | set = frozenset(),
@@ -2743,6 +2804,10 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 a["text"] = _wakemode_checked(p, a["text"], notes)
                 a["text"] = _pending_checked(p, a["text"], notes, "reply")
                 a["text"], false = _claims_checked(p, a, notes)
+                if (text := chatdigest.checked(db, cfg, a["text"], a, chat, notes)) is None:
+                    workernotify.handled(db, said)
+                    continue
+                a["text"] = text
                 replies.append(msgparts.post(db, a["text"], chat=None if chat in (None, "all") else chat, kind="reply",
                                              severity=_norm_severity(a.get("severity") or "normal"))[0])
                 claimcheck.raise_false(db, false, f"your reply #{replies[-1]} (chat {chat or 'all'})")
@@ -2870,19 +2935,20 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     ids = ", ".join(f"#{r['id']}" for r in under_way.values())
                     raise ValueError(f"duplicate of review {ids} the daemon queued, already under way; send it a "
                                      f"`spec` with task_update to add checks")
-                # A head a review already accepted under the same checks keeps that verdict
-                # (reviewreuse): another review of it runs only when forced with a reason.
+                # A head a review already accepted, or failed with a finding, under the same checks keeps
+                # that verdict (reviewreuse): another review of it runs only when forced with a reason.
                 head = _reviewed_head(p, deps, a.get("spec") or "") if review else None
                 prior = reviewreuse.accepted(db, head, reviewreuse.check_key(cfg),
                                              p=p if reviewreuse.pushes(cfg, labels) else None) if head else None
                 if prior and _rebased_away(p, deps, a.get("spec") or "", head):
                     prior = None   # it also covers a head whose patches differ: it gets its own review
+                prior = prior or (reviewreuse.judged(db, head, reviewreuse.check_key(cfg)) if head else None)
                 if prior and not (a.get("force") and str(a.get("reason") or "").strip()):
                     raise ValueError(f"task_add rejected: {reviewreuse.rejection(prior, head)}")
                 if prior:
                     labels.append(reviewreuse.FORCED_LABEL)
-                    notes.append(f"task_add {title[:80]!r}: forced past review #{prior['id']}, which accepted "
-                                 f"{head[:12]}: {clip(a.get('reason'), 200)}")
+                    notes.append(f"task_add {title[:80]!r}: forced past review #{prior['id']}, which "
+                                 f"{'failed' if prior['status'] == 'failed' else 'accepted'} {head[:12]}: {clip(a.get('reason'), 200)}")
                 old = _continued(db, a["continues"], deps) if a.get("continues") is not None else None
                 # A split code task's hop takes its branch over (chaincap.split_head): one hop at a time.
                 split = bool(old and old["status"] == "done" and chaincap.split_head(old))
@@ -3222,6 +3288,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                         raise ValueError(f"task #{task['id']} rejected: pr_branch {want!r} is not one valid branch name")
                     upd["labels"] = _branch_labels(upd.get("labels", json.loads(task["labels"] or "[]")), want)
                     branch_line = f"pr_branch: `{want}`" if want else 'pr_branch: ""'
+                cleared = untrusted_update(task, a, upd)
                 if a.get("start_after") is not None or a.get("start_when") is not None \
                         or (a.get("why") is not None and deferral(task).get("when")):
                     if task["status"] in ("running", *TERMINAL_TASK_STATES):
@@ -3358,6 +3425,11 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     if waits or anchors.without(labels) != labels:
                         upd["labels"] = anchors.without(labels) + ([waits] if waits else [])
                 db.update_task(task["id"], **upd)
+                if cleared:   # the audit trail of who vouched for the task's source
+                    db.x("INSERT INTO events(ts,source,kind,severity,text,data,status,task) VALUES(?,?,?,?,?,?,?,?)",
+                         (time.time(), "coordinator", untrusted.CLEARED_KIND, "low",
+                          f"#{task['id']}: {untrusted.LABEL} cleared: {cleared}"[:1000],
+                          json.dumps({"why": cleared}), "handled", task["id"]))
                 for h in history:   # the append-only history of what the live spec no longer says
                     db.x("INSERT INTO events(ts,source,kind,severity,text,data,status,task) VALUES(?,?,?,?,?,?,?,?)",
                          (time.time(), "coordinator", STEP_REPLACED_KIND, "low",
@@ -3583,6 +3655,10 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 a["text"] = _wakemode_checked(p, a["text"], notes)
                 a["text"] = _pending_checked(p, a["text"], notes, "notify")
                 a["text"], false = _claims_checked(p, a, notes)
+                if (text := chatdigest.checked(db, cfg, a["text"], a, None, notes)) is None:
+                    workernotify.handled(db, said)
+                    continue
+                a["text"] = text
                 sent.append((msgparts.post(db, a["text"], chat=None, kind="alert",
                                            severity=_norm_severity(a.get("severity")))[0], None, authored))
                 claimcheck.raise_false(db, false, f"your notify #{sent[-1][0]}")
@@ -3826,6 +3902,11 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                             raise ValueError(_queue_cited_restriction(p, queue, cited_agent, section, quote,
                                                                       replaces, text, end, str(e))) from None
                         raise
+                    if text and (body := _forbidden_body(section, text)):   # forbidden.declared reads the config only
+                        from .charterset import forbidden_merged
+                        if (pats := forbidden_merged(p, body)) is not None:
+                            p.set_config("memory.forbidden_patterns", pats,
+                                         by=configwho.by("coordinator", via="charter_update Forbidden data"))
                     if quote or replaced:   # the retired text, searched for in what still binds (echoes)
                         drop = loose_drop or bool(retired) and not (uturn or ok is not None) and len(over) < OVER_MIN
                         echoes.record(db, f"charter '{target}' " + ("quote replaced" if quote else "section replaced"),
@@ -4358,8 +4439,12 @@ SIMILAR_DONE_DAYS = 3   # a task done this recently is still compared against a 
 _STOP = set("a an the of to for and or in on at by with from into vs via is be as it its this that".split())
 
 
-def _words(text: str) -> set[str]:
-    return {w for w in re.findall(r"[a-z0-9_]+(?:[.-][a-z0-9_]+)*", (text or "").lower()) if w not in _STOP}
+@functools.lru_cache(maxsize=4096)
+def _words(text: str) -> frozenset[str]:
+    """The words of `text`, kept per text: similar_task compares each task_add with every open and recent
+    task, and rebuilding each task's sets on every task_add held the daemon tick for minutes."""
+    return frozenset(w for w in re.findall(r"[a-z0-9_]+(?:[.-][a-z0-9_]+)*", (text or "").lower())
+                     if w not in _STOP)
 
 
 def _jaccard(a: set, b: set) -> float:
@@ -4375,6 +4460,8 @@ def looks_same(title1: str, spec1: str, title2: str, spec2: str) -> bool:
     if n1 and n2 and n1 != n2:
         return False
     tj = _jaccard(_words(title1), _words(title2))
+    if tj < 0.4:   # both verdicts below need this much: the specs' words are not built
+        return False
     s1, s2 = _words(spec1), _words(spec2)
     # A spec of a word or two says nothing about the work; judge by the title alone then.
     sj = _jaccard(s1, s2) if s1 and s2 and len(s1 | s2) >= 4 else tj
@@ -4771,6 +4858,9 @@ def effort_triggers(db, cfg: dict, event_ids: list[int], wake_due: str | None,
     # A continue chain at its cap: another hop needs a reason that names what changed (chaincap).
     if any(r["kind"] == chaincap.CAP_EVENT for r in rows):
         add(chaincap.TRIGGER)
+    # A task at its run cap (runcap): the daemon starts no same-approach retry, the coordinator decides.
+    if any(r["kind"] == runcap.RUN_CAP_EVENT for r in rows):
+        add(runcap.TRIGGER)
     # A code hop with no new commit asked for its continue: the coordinator decides on it (chaincap).
     if any(r["kind"] == chaincap.NO_COMMIT_EVENT for r in rows):
         add(chaincap.NO_COMMIT_TRIGGER)

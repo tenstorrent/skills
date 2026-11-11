@@ -263,13 +263,39 @@ def _priority(prio: tuple[list, list] | None) -> str:
                    for words in reversed(prio) if words)
 
 
+# The host's end of a run (its EXIT trap; @Q@ is the run's directory, quoted): what the command left
+# behind ends with it. Its group, then (Linux /proc) every process of this user, bar this shell and its
+# ancestors, whose working directory or an argument is in that directory, the run's own; then the directory.
+_END = """_ttp_end() {
+  set +e
+  cd / || :
+  [ -n "${pid:-}" ] && kill -KILL -"$pid" 2>/dev/null
+  if [ -r /proc/self/status ]; then
+    root=@Q@ keep=" $$ " p=$$
+    while [ -n "$p" ] && [ "$p" != 0 ] && [ "$p" != 1 ]; do
+      p=$(sed -n 's/^PPid:[[:space:]]*//p' "/proc/$p/status" 2>/dev/null) || p=; keep="$keep$p "
+    done
+    for d in /proc/[0-9]*; do
+      n=${d#/proc/}
+      case $keep in *" $n "*) continue ;; esac
+      [ -O "$d" ] || continue
+      case $(readlink "$d/cwd" 2>/dev/null) in "$root"|"$root"/*) kill -KILL "$n" 2>/dev/null; continue ;; esac
+      tr '\\0' / < "$d/cmdline" 2>/dev/null | grep -qF -- "$root/" && kill -KILL "$n" 2>/dev/null
+    done
+  fi
+  rm -rf @Q@
+}
+trap _ttp_end EXIT
+"""
+
+
 def _run_script(q: str, exports_: str, cmd: str, mark: str, wrap: tuple[str, ...] = (),
                 prio: tuple[list, list] | None = None) -> str:
     """The host's side of a check run in directory `q`: the command in a process group of its own
     (setsid, else perl's setpgrp), with stdin from /dev/null and Ctrl-C and quit at their default, and a watcher that stops that group (TERM,
     then KILL after STOP_GRACE_S) once ssh's stdin ends: without a tty, ssh signals nothing when the
     local side stops or dies, and the command would run on. Then the exit-code marker, and the
-    directory is removed. With `wrap`, the command runs behind it, and a wrapper that is missing or not
+    directory is removed, with what the command left in it (_END). With `wrap`, the command runs behind it, and a wrapper that is missing or not
     executable there prints the marker's NO_WRAP form instead of starting anything, and one that exits
     FAULT_RC after writing the file WRAP_REFUSED_ENV names prints its WRAP_REFUSED form. With `prio`, it all
     runs behind the host's `nice` and `ionice` (_priority). Behind a wrapper the pinned checks env
@@ -289,7 +315,7 @@ def _run_script(q: str, exports_: str, cmd: str, mark: str, wrap: tuple[str, ...
     from . import orphanchecks
     # Who owns the run: once that process is gone, orphanchecks stops what still runs here.
     owner = f"printf '%s\\n' {shlex.quote(orphanchecks.owner_line())} > {orphanchecks.OWNER_FILE}\n"
-    return (f"cd {q} || exit 97\n{owner}trap 'cd / && rm -rf {q}' EXIT\n{exports_}{has}"
+    return (f"cd {q} || exit 97\n{owner}{_END.replace('@Q@', q)}{exports_}{has}"
             f"if command -v bash >/dev/null 2>&1; then set -- {run}; else set -- {w} sh -e -c {shlex.quote(cmd)}; fi\n"
             f"{_priority(prio)}"
             # A background job's stdin is /dev/null unless redirected: the watcher reads ssh's from fd 3.

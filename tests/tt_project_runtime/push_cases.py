@@ -2807,6 +2807,35 @@ def test_an_entry_whose_replay_raises_goes_back_alone_and_the_batch_goes_on(env,
     assert m["outcome"] == "env_fault" and "conflict" not in _statuses(m), m
 
 
+def test_a_push_batch_sends_back_an_entry_its_quick_entry_check_fails_and_lands_the_rest(env, monkeypatch, capsys):
+    """delivery.push_entry_checks (a smoke-list consistency test) runs on each entry merged onto the
+    batch head, whatever the entry's own scope: one adding a test file the list misses goes back
+    alone, naming it, and the rest land; a command the tip itself fails blames no entry."""
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    _commit(other, "smoke.txt", "t_a.txt\n")
+    _commit(other, "t_a.txt", "a\n")
+    _git_out(other, "push", "-q", "origin", "HEAD:proj")
+    listed = ('for f in t_*.txt; do grep -qxF "$f" smoke.txt || { echo "unlisted: $f"; exit 1; }; done')
+    p.set_config("delivery.push_entry_checks", [listed])
+    heads = [_entry(repo, "e1", {"f1.txt": "1\n"}), _entry(repo, "e2", {"t_new.txt": "n\n"}),
+             _entry(repo, "e3", {"t_ok.txt": "k\n", "smoke.txt": "t_a.txt\nt_ok.txt\n"})]
+    rc, m = _run_batch(p, _batch_marker(p, heads), monkeypatch)
+    assert m["outcome"] == "pushed" and _statuses(m) == ["pushed", "check_failed", "pushed"], m
+    d = m["results"][1]["detail"]
+    assert d["cmd"] == listed and "unlisted: t_new.txt" in d["tail"], d
+    assert "e2): its entry check" in capsys.readouterr().out
+    tree = set(_git_out(origin, "ls-tree", "--name-only", "proj").split())
+    assert {"f1.txt", "t_ok.txt"} <= tree and "t_new.txt" not in tree
+    # the tip itself failing the command: it decides nothing, every entry goes on to the batch's checks
+    _commit(other, "t_bad.txt", "b\n")
+    _git_out(other, "pull", "-q", "--rebase", "origin", "proj")
+    _git_out(other, "push", "-q", "origin", "HEAD:proj")
+    heads = [_entry(repo, "e4", {"t_new2.txt": "n\n"})]
+    rc, m = _run_batch(p, _batch_marker(p, heads, bid="b2"), monkeypatch)
+    assert m["outcome"] == "pushed" and _statuses(m) == ["pushed"], m
+    assert "fails on" in capsys.readouterr().out
+
+
 def _landed_fixture(env, monkeypatch):
     """The target has notes.txt; a first change A edits its line b and lands on the target in a
     different form (as a batch settles it, or squashed): a branch that still carries A conflicts
@@ -13727,11 +13756,15 @@ def test_a_code_tasks_run_never_pushes_to_the_push_branch_while_code_tasks_may_p
     run_dir.mkdir()
     monkeypatch.setenv("TTP_TASK", str(tid))
     monkeypatch.setenv("TTP_RUN_DIR", str(run_dir))
-    for args in (["push"], ["push", "--detach"], ["push", "--land"], ["push", "--land", "--detach"]):
-        assert _ttp(*args) == 2, args
-        assert "delivery.code_tasks_may_push is off" in capsys.readouterr().err, args
-        monkeypatch.delenv(push.LAND_ENV, raising=False)   # cmd_push sets it in os.environ
+    for mode in (False, "approved"):   # off, and the default: no review approved this head
+        p.set_config("delivery.code_tasks_may_push", mode)
+        for args in (["push"], ["push", "--detach"], ["push", "--land"], ["push", "--land", "--detach"]):
+            assert _ttp(*args) == 2, args
+            assert ("delivery.code_tasks_may_push is off" if mode is False else "no independent review approved HEAD") \
+                in capsys.readouterr().err, args
+            monkeypatch.delenv(push.LAND_ENV, raising=False)   # cmd_push sets it in os.environ
     assert not (p.state / "pushes").exists() and _git_out(origin, "rev-parse", "proj") == shared
+    p.set_config("delivery.code_tasks_may_push", False)
     # A raw `git push` in the run goes through the harness's bin/git, first on the run's PATH.
     wrapper = RUNTIME.parent / "template" / "bin" / "git"
     hooks = repo / _git_out(repo, "rev-parse", "--git-path", "hooks")
@@ -16372,6 +16405,46 @@ def test_a_push_batch_with_checks_judge_off_quarantines_nothing(env, monkeypatch
     assert m["outcome"] == "pushed" and _statuses(m) == ["pushed"], m
     assert ("head", _SEL, ["e1"]) in calls and not any(c[0] == "tip" for c in calls), calls
     assert gatejudge.active(p.state, time.time()) == {}
+
+
+def test_a_push_batch_rerun_selects_each_failing_test_by_its_full_node_id(tmp_path, monkeypatch):
+    """Batch._run_ids reruns real pytest through the select plugin by full node id: a same-named test in
+    another file does not run, one parametrized case (spaces or brackets in its id) runs alone, and a
+    failing id the collection no longer has is named in the batch log and the marker, not dropped."""
+    from ttp import batch, gatejudge
+    proj = tmp_path / "proj"
+    (proj / "tests").mkdir(parents=True)
+    (proj / "pytest.ini").write_text("[pytest]\n")
+    (proj / "tests" / "test_a.py").write_text(
+        "import pytest\n\ndef test_same():\n    assert 0\n\n"
+        "@pytest.mark.parametrize('v', ['one two', 'a[b]', 'three'])\n"
+        "def test_p(v):\n    assert v != 'one two'\n")
+    (proj / "tests" / "test_b.py").write_text("def test_same():\n    pass\n")
+    clean = {k: v for k, v in os.environ.items() if not k.startswith(("PYTEST_", "TTP_PYTEST_"))}
+    monkeypatch.setattr(batch.Batch, "_checkout", lambda self, head: None)
+    monkeypatch.setattr(batch.Batch, "_urgent_mark", lambda self: False)
+    b = batch.Batch.__new__(batch.Batch)
+    b.wt, b.d, b.checks, b.reran = proj, {}, {}, {"head": set(), "tip": set()}
+    cmd = f"{sys.executable} -m pytest -q -p no:cacheprovider"
+
+    def rerun(ids, extra=""):
+        return b._run_ids("h" * 40, cmd + extra, ids, "head", clean, {})
+    same, gone = "tests/test_a.py::test_same", "tests/test_a.py::test_gone"
+    rc, tail = rerun([same])
+    assert rc == 1 and gatejudge._ran(tail) == (0, 1), tail      # test_b.py::test_same is not run
+    rc, tail = rerun(["tests/test_a.py::test_p[one two]"])
+    assert rc == 1 and gatejudge._ran(tail) == (0, 1), tail      # the other two cases are not run
+    rc, tail = rerun(["tests/test_a.py::test_p[a[b]]"])
+    assert rc == 0 and gatejudge._ran(tail) == (1, 0), tail
+    assert "not_collected" not in b.checks
+    rc, tail = rerun([gone, same])
+    assert rc == 1 and gatejudge._ran(tail) == (0, 1), tail
+    assert gatejudge.not_collected(tail) == [gone] and b.checks["not_collected"] == [gone], tail
+    assert gatejudge.failed_of(rc, tail, [gone, same], "head") is None, "a missing id proves nothing"
+    pytest.importorskip("xdist")
+    b.checks = {}
+    rc, tail = rerun([gone, "tests/test_b.py::test_same"], " -n 2")
+    assert rc == 0 and b.checks["not_collected"] == [gone], tail   # the workers' list reaches the controller
 
 
 def test_stray_running_batch_file_is_closed_at_daemon_start_and_a_live_one_is_left(env, monkeypatch):
@@ -20881,3 +20954,131 @@ def test_push_cancel_of_a_queued_push_keeps_the_daemon_from_starting_it(env, mon
     push.tend(p)   # the daemon's tick never starts it
     assert json.loads(marker.read_text())["status"] == "cancelled"
     assert _ttp("push", "--free") == 0 and _git_out(origin, "rev-parse", "proj") == shared
+
+
+
+
+def test_a_reviewed_head_lands_from_a_code_task_or_the_coordinator_by_default_and_an_unreviewed_one_does_not(
+        env, monkeypatch, capsys):
+    # User msg #2484: the coordinator fixes problems itself, landing its own reviewed fix. By default
+    # (delivery.code_tasks_may_push "approved") a code task's or the coordinator's `ttp push` lands a HEAD
+    # an independent review approved (an approved push queue row at exactly that commit); an unreviewed
+    # head is refused, and a raw `git push` stays refused in both runs.
+    from ttp import coordtools, push
+    from ttp.project import approved_heads_may_push
+    p, repo, origin, _ = _push_setup(env, monkeypatch, ["true"])
+    assert approved_heads_may_push(p.config())   # the shipped default
+    shared = _git_out(origin, "rev-parse", "proj")
+    tid = p.db.add_task("fix", kind="code", spec="Fix it and land it on the push branch.")
+    own = f"ttp/t{tid}-fix"
+    _git_out(repo, "checkout", "-q", "-b", own)
+    _commit(repo, "FIX.md", "fix\n")
+    head = _git_out(repo, "rev-parse", "HEAD")
+    _record_checks_pass(p, tid, repo)
+    run_dir = env["tmp"] / "run"
+    run_dir.mkdir()
+    monkeypatch.setenv("TTP_TASK", str(tid))
+    monkeypatch.setenv("TTP_RUN_DIR", str(run_dir))
+    wrapper = RUNTIME.parent / "template" / "bin" / "git"
+
+    def git_push(extra=None, spec="HEAD:proj"):
+        run_env = {**os.environ, "TTP_PYTHON": sys.executable, **(extra or {})}
+        return subprocess.run([str(wrapper), "push", "origin", spec], cwd=repo, env=run_env,
+                              capture_output=True, text=True, timeout=60)
+
+    # Unreviewed: refused by `ttp push`, by the wrapper and by a forged approval.
+    assert _ttp("push", "--land") == 2
+    assert "no independent review approved HEAD" in capsys.readouterr().err
+    monkeypatch.delenv(push.LAND_ENV, raising=False)
+    assert git_push({"TTP_PUSH_APPROVED": head}).returncode != 0
+    review = p.db.add_task("review", kind="review", depends_on=[tid])
+    now = time.time()
+    p.db.x("INSERT INTO push_queue(task, branch, head, target, status, created, updated) VALUES(?,?,?,?,?,?,?)",
+           (review, own, head, "origin/proj", "approved", now, now))
+    # The code task: `ttp push --land` resolves to the push branch and marks the approved head for its
+    # own process only; once that `ttp push` is gone a raw push of the same head stays refused.
+    assert push.resolve(p, repo) == ("origin", "proj", False)
+    mark = p.state / push.APPROVED_DIR / f"{os.getpid()}.json"
+    assert push.approval_marker(p, os.getpid())["sha"] == head
+    mark.unlink()
+    out = git_push()
+    assert out.returncode != 0 and "code_tasks_may_push" in out.stderr, out.stderr   # raw push: still refused
+    assert _git_out(origin, "rev-parse", "proj") == shared
+    # The coordinator: no task, its role set. A raw `git push` is refused even for the approved head;
+    # the push a `ttp push` process makes of it (_approved_child) goes through.
+    monkeypatch.delenv("TTP_TASK")
+    monkeypatch.setenv(coordtools.ROLE_ENV, "coordinator")
+    out = git_push()
+    assert out.returncode != 0 and coordtools.PUSH_REFUSAL in out.stderr, out.stderr
+    assert _ttp("push", "--land", "--own") not in (0, None)   # an own branch, a tag or a batch: never
+    capsys.readouterr()
+    mark.unlink(missing_ok=True)
+    out = _approved_child(repo, "HEAD:proj")
+    assert out.returncode == 0, out.stderr
+    assert _git_out(origin, "rev-parse", "proj") == head
+    assert not list((p.state / push.APPROVED_DIR).glob("*.json")), "the marker goes with its process"
+    # A later unreviewed commit: the coordinator's `ttp push` refuses it before any push path runs.
+    _commit(repo, "MORE.md", "more\n")
+    monkeypatch.setattr(push, "run", lambda *a, **k: (_ for _ in ()).throw(AssertionError("pushed")))
+    assert _ttp("push", "--land") not in (0, None)
+    err = capsys.readouterr().err
+    assert coordtools.PUSH_REFUSAL in err and "no independent review approved HEAD" in err, err
+    monkeypatch.delenv(push.LAND_ENV, raising=False)
+
+
+def _approved_child(repo, spec):
+    """A stand-in `ttp push` process: it marks the approved HEAD (push.approved_landing) and then runs
+    the run's git wrapper as its child to push `spec` to origin."""
+    wrapper = RUNTIME.parent / "template" / "bin" / "git"
+    code = ("import os, subprocess, sys\nfrom pathlib import Path\nfrom ttp import push\n"
+            "from ttp.project import Project\n"
+            "p = Project(os.environ['TTP_PROJECT'])\nhead, why = push.approved_landing(p, Path.cwd())\n"
+            "assert not why, why\n"
+            f"sys.exit(subprocess.run([{str(wrapper)!r}, 'push', 'origin', {spec!r}]).returncode)\n")
+    run_env = {**os.environ, "TTP_PYTHON": sys.executable,
+               "PYTHONPATH": os.pathsep.join([str(RUNTIME), os.environ.get("PYTHONPATH", "")])}
+    return subprocess.run([sys.executable, "-c", code], cwd=repo, env=run_env, capture_output=True, text=True,
+                          timeout=120)
+
+
+def test_a_raw_push_never_claims_an_approval_from_an_environment_variable(env, monkeypatch):
+    # Review #8053: a code task or the coordinator set TTP_PUSH_APPROVED to an approved head and then
+    # pushed any commit with a raw `git push`. Only a `ttp push` process's own approval marker counts,
+    # and only for exactly the approved commit sent to the push branch.
+    from ttp import coordtools
+    p, repo, origin, _ = _push_setup(env, monkeypatch, ["true"])
+    shared = _git_out(origin, "rev-parse", "proj")
+    tid = p.db.add_task("fix", kind="code", spec="Fix it and land it on the push branch.")
+    own = f"ttp/t{tid}-fix"
+    _git_out(repo, "checkout", "-q", "-b", own)
+    _commit(repo, "FIX.md", "fix\n")
+    head = _git_out(repo, "rev-parse", "HEAD")
+    review = p.db.add_task("review", kind="review", depends_on=[tid])
+    now = time.time()
+    p.db.x("INSERT INTO push_queue(task, branch, head, target, status, created, updated) VALUES(?,?,?,?,?,?,?)",
+           (review, own, head, "origin/proj", "approved", now, now))
+    _commit(repo, "EVIL.md", "unreviewed\n")
+    other = _git_out(repo, "rev-parse", "HEAD")
+    _git_out(repo, "checkout", "-q", head)
+    run_dir = env["tmp"] / "run"
+    run_dir.mkdir()
+    monkeypatch.setenv("TTP_RUN_DIR", str(run_dir))
+    wrapper = RUNTIME.parent / "template" / "bin" / "git"
+    forged = {**os.environ, "TTP_PYTHON": sys.executable, "TTP_PUSH_APPROVED": head}
+
+    def raw(spec, role):
+        run_env = {**forged, **role}
+        if "TTP_TASK" not in role:
+            run_env.pop("TTP_TASK", None)
+        return subprocess.run([str(wrapper), "push", "origin", spec], cwd=repo, env=run_env,
+                              capture_output=True, text=True, timeout=60)
+
+    for role in ({"TTP_TASK": str(tid)}, {coordtools.ROLE_ENV: "coordinator"}):
+        for spec in (f"{other}:proj", f"{head}:proj"):
+            out = raw(spec, role)
+            assert out.returncode != 0, (role, spec, out.stderr)
+            assert _git_out(origin, "rev-parse", "proj") == shared, (role, spec)
+    # Even beside a live `ttp push` approval, a push of another commit than the approved one is refused.
+    monkeypatch.setenv("TTP_TASK", str(tid))
+    out = _approved_child(repo, f"{other}:proj")
+    assert out.returncode != 0 and _git_out(origin, "rev-parse", "proj") == shared, out.stderr

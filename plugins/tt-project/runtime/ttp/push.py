@@ -49,7 +49,7 @@ from . import (checkcap, checkdirs, checkspill, checkwait, checklane, cleantree,
                sandbox, scriptwatch, settinghold, setupfault, shorttmp, slurmcheck, syntaxfault, testslots, timefmt, verified, workerloss, worktree)
 from .budget import DOC_SUFFIXES
 from .db import continues_id, dependency_ids, load_result
-from .project import (Project, code_tasks_may_push, durable_append, durable_write, git_fsync_env, hostname,
+from .project import (Project, approved_heads_may_push, code_tasks_may_push, durable_append, durable_write, git_fsync_env, hostname,
                       load_registry, nice_level, open_append_or_null, own_creates_pr_branch, own_push, push_queue_on,
                       rebase_replace, renice, write_json)
 from .project import never_force as never_force_on
@@ -2346,6 +2346,66 @@ def local_remote_problem(p: Project, repo: Path, remote: str) -> str:
 LOCAL = "local"   # own_target's remote in a code repo with no git remote: publishing moves the local branch
 OWN_BRANCH_ENV = "TTP_PUSH_OWN_BRANCH"   # `ttp push --own-branch`: the own branch under its own name
 LAND_ENV = "TTP_PUSH_LAND"   # `ttp push --land`: a task lands its own branch though its spec has no landing step
+APPROVED_DIR = "push-approved"   # state/<this>/<pid>.json: the head a `ttp push` lands (approved_landing)
+APPROVED_TTL = 1800   # seconds an approval marker stays good (gitguard.approved_push)
+
+
+def approval_marker(p: Project, pid: int) -> dict | None:
+    """The fresh approval marker process `pid` (a `ttp push`) wrote, else None."""
+    try:
+        m = json.loads((p.state / APPROVED_DIR / f"{int(pid)}.json").read_text())
+    except (OSError, ValueError, TypeError):
+        return None
+    if not isinstance(m, dict) or m.get("pid") != int(pid) or not isinstance(m.get("at"), (int, float)) \
+            or not 0 <= time.time() - m["at"] <= APPROVED_TTL or not isinstance(m.get("sha"), str):
+        return None
+    return m
+
+
+def _mark_approved(p: Project, head: str) -> None:
+    """Record under the project's state that this `ttp push` process lands `head` on the push branch.
+    Only this record lets the run's git wrapper (gitguard.approved_push) pass such a push: the push must
+    come from this process or a child of it and send exactly `head` to the push branch. An environment
+    variable never suffices, so a raw `git push` cannot claim an approval. The record goes when this
+    process ends."""
+    import atexit
+    import secrets
+    pid = os.getpid()
+    f = p.state / APPROVED_DIR / f"{pid}.json"
+    f.parent.mkdir(parents=True, exist_ok=True)
+    branch = str((p.config().get("delivery") or {}).get("push_branch") or "").strip()
+    durable_write(f, json.dumps({"pid": pid, "sha": head, "branch": branch, "at": time.time(),
+                                 "nonce": secrets.token_hex(8)}))
+    atexit.register(lambda: f.unlink(missing_ok=True) if os.getpid() == pid else None)
+
+
+def approved_head(p: Project, head: str) -> dict | None:
+    """The push queue row whose head is `head` and that an independent review approved (approved or
+    taken into a batch), newest first; None when no review approved exactly that commit."""
+    head = str(head or "").strip().lower()
+    if len(head) < 7:
+        return None
+    try:
+        return p.db.one("SELECT id, task, head, target FROM push_queue WHERE status IN ('approved','batched') "
+                        "AND lower(head)=? ORDER BY id DESC LIMIT 1", (head,))
+    except Exception:   # no queue table yet: nothing is approved
+        return None
+
+
+def approved_landing(p: Project, repo: Path) -> tuple[str, str]:
+    """(HEAD, "") when this checkout's HEAD may land as a head an independent review approved
+    (delivery.code_tasks_may_push true or "approved", the default), else (HEAD, why not). It also
+    writes this process's approval marker (_mark_approved), so the run's git wrapper (gitguard.py) lets
+    this push of exactly HEAD through; a raw `git push` has no such marker and stays refused."""
+    head = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    if not approved_heads_may_push(p.config()):
+        return head, ("delivery.code_tasks_may_push is off (or no delivery.push_branch): only a review or the "
+                      "push queue lands a change")
+    if not approved_head(p, head):
+        return head, (f"no independent review approved HEAD {head[:10]}: queue a review of it; once it passes "
+                      f"(an approved push queue row at exactly this commit) `ttp push --land` may land it")
+    _mark_approved(p, head)
+    return head, ""
 
 
 def say_target(repo: Path, remote: str, branch: str) -> None:
@@ -2781,10 +2841,16 @@ def _resolve(p: Project, repo: Path, own: bool = False) -> tuple[str, str, bool]
                 return remote, branch, True
         raise ValueError(f"{why}. Publish it on its own branch with `ttp push --own`, or rebase only "
                          f"its own commits (`git rebase --onto {upstream} {base}`) and rerun")
-    if task and (why := code_run_landing(p, task, f"{remote}/{push_to}", d)):
+    if task and (why := code_run_landing(p, task, f"{remote}/{push_to}", d, repo)):
         raise ValueError(why)
     if m and task and m.group(1) == task:
-        if os.environ.get(LAND_ENV):
+        if (approved := (approval_marker(p, os.getpid()) or {}).get("sha")) and not code_tasks_may_push(p.config()) \
+                and approved == _git(repo, "rev-parse", "HEAD").stdout.strip() and approved_head(p, approved):
+            say = (f"ttp push: task #{task} lands its own branch {branch} on {remote}/{push_to}: an independent "
+                   f"review approved its head {approved[:10]}")
+            print(say, file=sys.stderr)
+            run_note(say)
+        elif os.environ.get(LAND_ENV):
             if why := unreviewed_landing(p, repo, task, d):
                 raise ValueError(why)
             say = (f"ttp push: --land: task #{task} lands its own branch {branch} on {remote}/{push_to} "
@@ -2801,17 +2867,23 @@ def _resolve(p: Project, repo: Path, own: bool = False) -> tuple[str, str, bool]
     return remote, push_to, False
 
 
-def code_run_landing(p: Project, task: str, upstream: str, d: dict) -> str:
+def code_run_landing(p: Project, task: str, upstream: str, d: dict, repo: Path | None = None) -> str:
     """Why task `task`'s run must not push to the push branch `upstream`, or "": a code task lands
     there itself only with delivery.code_tasks_may_push on. Off, only a review (or the push queue it
     hands the change to) pushes there, whatever the spec says, and `--land` does not override it;
-    the run's `git` wrapper (gitguard.py) refuses a raw `git push` there the same way."""
+    the run's `git` wrapper (gitguard.py) refuses a raw `git push` there the same way. With "approved"
+    (the default) it lands only a HEAD an independent review approved (approved_landing)."""
     try:
         t = p.db.task(int(task))
     except (ValueError, TypeError):
         return ""
     if not t or t.get("kind") != "code" or code_tasks_may_push(p.config()):
         return ""
+    if repo is not None and approved_heads_may_push(p.config()):
+        head, why = approved_landing(p, repo)
+        if not why:
+            return ""
+        return f"task #{task} is a code task: it lands only a head an independent review approved; {why}"
     own = (" To publish the branch under its own name, run `ttp push --own --detach`."
            if own_push({"delivery": d}) != "off" else "")
     return (f"task #{task} is a code task and delivery.code_tasks_may_push is off: code tasks never push to "
@@ -4542,7 +4614,7 @@ def _run_one(cmd: Any, repo: Path, env: dict, say: Callable[[str], None], seen: 
         mark = landmark.hold() if env.get("TTP_PUSH_MODE") == "target" else None
         try:
             argv = testslots.low_priority(check_argv(cmd, repo, env))
-            guard = hoststate.Guard(env, argv=argv)   # the real crontab and units, compared after a local check
+            guard = hoststate.Guard(env, tokens=[repo], argv=argv)   # the real crontab and units, compared after a local check
             # own session: its group is ended once it ends (_end_group), or by checkgroup if this push dies first
             proc = subprocess.Popen([*CHECK_GROUP, str(os.getpid()), "--", *argv], cwd=repo,
                                     env={**{k: v for k, v in env.items() if k != landmark.ENV}, checkwait.ENV: str(waits),
@@ -5809,15 +5881,38 @@ def _pid_alive(pid: Any) -> bool:
     return True
 
 
+_ENDED: dict[str, dict[str, tuple]] = {}   # running(): per pushes folder, marker name -> stat key of an ended one
+
+
+def _stat_key(marker: Path) -> tuple | None:
+    try:
+        st = marker.stat()
+    except OSError:
+        return None
+    return (st.st_ino, st.st_mtime_ns, st.st_size)
+
+
 def running(p: Project) -> list[dict]:
     """Markers of this project's detached pushes that are still running or queued. A running one whose
-    run lock does not open (locks.free_state None) counts, with `lock_unknown`."""
+    run lock does not open (locks.free_state None) counts, with `lock_unknown`. A marker read once with
+    an ended status is not read again while its inode, mtime and size stay the same (_ENDED): an ended
+    push's marker is never rewritten in place, so a large pushes history costs one stat per marker."""
     out = []
-    for marker in sorted((p.state / DETACHED).glob("*.json")):
+    folder = p.state / DETACHED
+    ended = _ENDED.get(str(folder), {})
+    seen: dict[str, tuple] = {}
+    for marker in sorted(folder.glob("*.json")):
+        key = _stat_key(marker)
+        if key is not None and ended.get(marker.name) == key:
+            seen[marker.name] = key
+            continue
         m = _read(marker)
+        if key is not None and isinstance(m.get("status"), str) and m["status"] not in ("running", "queued"):
+            seen[marker.name] = key
         free = locks.free_state(_run_lock(marker)) if m.get("status") == "running" else True
         if m.get("status") == "queued" or m.get("status") == "running" and not free:
             out.append({**m, "marker": str(marker), **({"lock_unknown": True} if free is None else {})})
+    _ENDED[str(folder)] = seen
     return out
 
 

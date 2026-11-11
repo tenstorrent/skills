@@ -27,6 +27,11 @@ order; each is bounded and never raises:
    LEDGER_WINDOW_S before the shutdown (the boot's last heartbeat) up to this boot, that names a power
    cycle or a reboot: the latest one, with its entry id and the project that recorded it.
 
+Beside the answer, a fourth bounded read the same way, the boot's last KERNEL_ENTRIES kernel and
+systemd-oomd lines, names the last kernel fault there (`kernel`: a panic, an out-of-memory kill, a
+machine check or a lockup, KERNEL_FAULTS), whatever source answered: a reboot that followed one is told
+with it (often a panic never reaches the disk, so none found proves nothing).
+
 Else the unit started or logging nearest before the marker, a bare logind line, or for a boot whose
 journal ends with no marker 'no clean shutdown logged (...)' and its last unit lines (a marker read that
 came back full says only that no marker was in it). Else 'unknown',
@@ -60,6 +65,17 @@ _LINE = re.compile(r"\s(?P<ident>[\w.@-]+)(?:\[\d+\])?:\s(?P<msg>.*)$")
 _DENIED = re.compile(r"insufficient permissions|not seeing messages from other users|permission denied", re.I)
 _NO_STORE = re.compile(r"no persistent journal|no journal files were found|is not available", re.I)
 _STOPS = {"reboot", "shutdown", "poweroff", "halt"}
+KERNEL_ENTRIES = 300
+KERNEL_IDENTS = ("kernel", "systemd-oomd")
+# (label, pattern) per kind of kernel fault, matched on the kernel's and systemd-oomd's own lines only.
+KERNEL_FAULTS = (
+    ("kernel panic", re.compile(r"Kernel panic|\bpanic\b.*not syncing", re.I)),
+    ("out of memory", re.compile(r"Out of memory:|invoked oom-killer|oom-kill:|due to memory pressure", re.I)),
+    # A fatal or uncorrected one: the routine 'Machine check events logged' summary of corrected errors is none.
+    ("machine check", re.compile(r"(?=.*\b(?:fatal|uncorrect\w*|panic)\b).*(?:Machine check|\bmce: |\[Hardware Error\])",
+                                 re.I)),
+    ("lockup", re.compile(r"soft lockup|hard lockup|watchdog: BUG|NMI watchdog: .*lockup", re.I)),
+)
 _SYSTEMCTL_STOPS = {"reboot", "poweroff", "halt", "kexec"}
 _LEDGER_WORDS = re.compile(r"power[ _-]?cycl|reboot|power[ _-]?off|shut[ _-]?down", re.I)
 _STOP_WORDS = re.compile(r"power[ _-]?cycl|\breboot|power[ _-]?off|\bshutdown\b|\bhalt\b|kexec|watchdog", re.I)
@@ -116,6 +132,26 @@ def window_args(at: float | None) -> list[str]:
 def unit_args(unit: str) -> list[str]:
     """The last lines unit `unit` logged itself (systemd's lines about it are init.scope's)."""
     return ["-n", str(UNIT_ENTRIES), f"_SYSTEMD_UNIT={unit}"]
+
+
+def kernel_args() -> list[str]:
+    """The boot's last kernel and systemd-oomd lines (a match, never -k, which would pick its own boot)."""
+    return ["-n", str(KERNEL_ENTRIES), "_TRANSPORT=kernel", "+", "SYSLOG_IDENTIFIER=systemd-oomd"]
+
+
+def kernel_fault(out: str | None, at: float | None = None) -> str:
+    """'<kind>: <line>' for the last kernel fault line in `out` (KERNEL_FAULTS) in the WINDOW_S up to `at`
+    (the shutdown marker; else the newest line of `out`), or '': an older one did not end the boot."""
+    rows = _entries(out or "")
+    at = at if at is not None else max((e["ts"] for e in rows if e["ts"] is not None), default=None)
+    for e in reversed(rows):
+        if e["ts"] is None or at is None or not at - WINDOW_S <= e["ts"] <= at + 1:
+            continue
+        if e["ident"] in KERNEL_IDENTS:
+            for label, rx in KERNEL_FAULTS:
+                if rx.search(e["msg"]):
+                    return f"{label}: {_clip(e['msg'], 90)}"
+    return ""
 
 
 def end_args() -> list[str]:
@@ -385,12 +421,14 @@ def find(p, boot: str | None, boot_at: float | None, last_heartbeat: float | Non
     `unreadable`: why no read showed the system's entries (ttp doctor says it once; the notice only in
     its text)."""
     from . import hostcycle, machines
-    fallback, why, how = None, "", ""
+    fallback, why, how, kern = None, "", "", {}
     try:
         got, ask, how, why = read(boot, journal, sudo)
         if got:
             window = commands = None
             if ask:
+                k = ask(kernel_args())
+                kout = k[1] if k and k[0] == 0 else None
                 c = ask(command_args())
                 commands = c[1] if c and c[0] == 0 else None
                 args = window_args(marker_at(got[1]))
@@ -398,6 +436,12 @@ def find(p, boot: str | None, boot_at: float | None, last_heartbeat: float | Non
                 window = w[1] if w and w[0] == 0 else None
                 if window is not None and "-r" in args:
                     window = "\n".join(reversed(window.splitlines()))   # read newest first
+                # The marker's time, else the boot's real end: the newest line of any read (after a
+                # crash the marker read's last line can be an old logind one, hours before the panic).
+                ends = [e["ts"] for o in (got[1], kout, commands, window) for e in _entries(o or "")
+                        if e["ts"] is not None]
+                if fault := kernel_fault(kout, marker_at(got[1]) or (max(ends) if ends else None)):
+                    kern = {"kernel": fault}
             seen = {}
 
             def own(unit):   # once per unit: its 'Starting' and 'Started' lines both ask
@@ -408,10 +452,10 @@ def find(p, boot: str | None, boot_at: float | None, last_heartbeat: float | Non
             found, fallback = parse(got[1], window, full=bool(how) and window is not None, commands=commands,
                                     own=own if ask else None)
             if found:
-                return {"source": "journal", "text": found, **({"read": how} if how == "sudo" else {})}
+                return {"source": "journal", "text": found, **({"read": how} if how == "sudo" else {}), **kern}
     except Exception:
         why = why or "the journal read failed"
-    extra = {"unreadable": why} if why else {}
+    extra = {**({"unreadable": why} if why else {}), **kern}
     try:
         rec = hostcycle.planned(p, boot, boot_at)
         if rec:

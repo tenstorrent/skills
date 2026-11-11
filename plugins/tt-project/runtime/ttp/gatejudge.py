@@ -121,6 +121,14 @@ def select_env(ids: list[str], env: dict) -> dict:
     return pushpass.select_env(select_rx(ids), env, ids=list(ids))
 
 
+_NOT_COLLECTED = re.compile(r"^ttp select: not collected: (.+?)\s*$", re.M)   # ttp_pytest_select.MISSING
+
+
+def not_collected(output: str) -> list[str]:
+    """The ids a select_env rerun asked for that its collection did not have, as the select plugin names them."""
+    return sorted(set(_NOT_COLLECTED.findall(output or "")))
+
+
 def judgeable(rc: int | None, output: str, cfg: dict) -> list[str]:
     """The failing ids of a check that exited 1 with a complete list of at most max_ids, else []."""
     s = settings(cfg)

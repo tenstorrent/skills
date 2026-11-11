@@ -61,6 +61,10 @@ description: "Start, connect to, and talk with a long-running tt-project: a loca
   is safe. It goes out by itself, in order and once, when the project is reachable. Tell the user;
   do not resend it.
 - Alerts arrive in every attached chat. Replies arrive only in the chat that asked.
+- A project posts to a chat at once only for results, decisions you may override, outages and asks.
+  Acknowledgements, progress and new ETAs come as one digest per chat, at most every
+  `coordinator.chat_digest_h` hours (default 3; 0 sends everything at once). Show each as it arrives;
+  do not ask the project for the routine updates in between.
 - A repeated message id was already shown. Skip it.
 - The user asks what is running, costs, or blockers → `ttp status <name>`.
 - A project's questions never block it: each shows "acts on X at HH:MM unless answered" and goes

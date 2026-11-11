@@ -603,6 +603,13 @@ coordinator with that evidence.
   resources and the like) is compared as raw text and sent whole on any change, so one changed
   line there resends the section. Accepted gap: a chats or promises section whose only change is an
   age is resent whole too.
+  `wake_cost_alarm_usd` (default 1.0; 0 or `off`: no check) checks cost per wake without a model
+  call after each session wake (wakecost.py): when the median of the last 5 new or resumed wakes is
+  above it, one alarm goes out for the episode naming its cause (context tokens, digest size or tool
+  calls), the same session compacts in place on its next wake (once; again only after a further 5
+  wakes still over, and only once its context is at least 100k tokens and 20k over its seed), and the
+  digest sends any section whose only change is an age as unchanged. Never a new or stateless
+  session. Both end once the median is back at or under the alarm.
   A new session, a daemon restart (the digest then goes whole into the same resumed session), a
   failed or compacted wake since, or the action `{"type": "noop", "key": "full_digest"}` sends the whole
   digest on the next wake. A session wake's answer is checked before its turn ends: an action the
@@ -982,10 +989,13 @@ coordinator with that evidence.
   until a task names the device again.
 - gh logged out (model-free): one check per machine, shared by every project on it, runs `gh auth
   status` at most every 15 min while a project there uses gh (a PR to watch, or a schedule or
-  probe that calls gh or `ttp ci`). While it fails for the login, one normal alert in the top
-  section names the machine's ssh alias and the step only the user can take (`gh auth login`
-  there). It is sent once per outage, the other projects there show it quietly, and it clears once
-  the check passes. Shipped gh callers never read a logout as ok: pr-watch's run ends with an
+  probe that calls gh or `ttp ci`). While it fails for the login and no `delivery.gh_route`
+  answers, one normal alert in the top section names the machine and the route setting (never a
+  login step: lab hosts keep no GitHub login). It is sent once per logout for the whole account,
+  however many projects see it (a marker under the tt-project home folder), the other projects
+  show it quietly, and it clears once gh works or a route answers. Where no gh login is the
+  expected state, set `delivery.gh_route` to `workstation` (gh actions are run by the user's
+  workstation) or `none`: then no alert is raised, only one quiet status line per logout. Shipped gh callers never read a logout as ok: pr-watch's run ends with an
   `error:` status, `ttp ci` exits 4 with a `broken:` line, and a gh call that failed its login asks
   for a recheck at once. A `start_when` probe that fails for gh's login (exit 4, or `not logged in`
   in its output) raises no broken-probe event of its own while the host check says logged out; the
@@ -1690,6 +1700,37 @@ the promises missed, those missed twice or more, due moves without a plan change
 median lateness. All of it runs at action apply and in the obligation check, so it is the same for
 session and stateless coordinators on every provider.
 
+## Moving a project
+
+`ttp move` moves a project to another host without both copies starting work:
+
+- On the new host, `ttp move <name> --from <old host>[:<name>]`: its coordinator runs, but it
+  starts no worker until the old copy has stopped. After its first coordinator turn it calls
+  `ttp move <name> --confirmed` on the old host over ssh, which stops that copy at once. An old host
+  that does not answer for 10 minutes counts as stopped.
+- On the old host, `ttp move <name> --to <new host>[:<name>]`: every minute its daemon asks the new
+  host (`ttp alive <name>`) whether a model run there succeeded since the move began; the first yes
+  pauses this copy. Either side alone is enough, so the old copy stops within a few minutes of the
+  new one running. Runs copied over with the project's records do not count: only those since the
+  new host's own `--from`.
+
+The ssh checks run in the background, so a host that hangs never slows the daemon. If neither host
+can reach the other, the new copy starts work after its 10 minutes while the old one may still run:
+stop the old copy by hand (`ttp pause` there) when the hosts cannot see each other.
+
+The stopped copy is paused: no worker starts and its coordinator wakes no more, while its running
+workers finish with their work kept, as with `ttp drain`. It raises no long-pause alert. `ttp move
+<name>` shows the move, `--cancel` forgets it, and `ttp resume` on the old host undoes the stop.
+
+## Ramp-up after an outage
+
+When an outage ends (a host reboot, the project or one of its resources resumed, a provider's login,
+budget gate or network back, the lease taken again), new workers do not all start at once. Starts
+begin at `budget.ramp_start` (2) workers above those still running and double every
+`budget.ramp_step_s` (180 s) until they pass `budget.max_parallel_workers`. Urgent work is first in
+the pick order, so it takes the first starts. A resumed resource ramps only its own tasks.
+`budget.ramp_start: 0` turns ramp-up off.
+
 ## Parallel work
 
 - Up to 6 workers per project run side by side (`budget.max_parallel_workers`); on a plan, all of
@@ -1744,6 +1785,24 @@ session and stateless coordinators on every provider.
   changelogs, changesets, manifests, `__init__.py`), `hub_bytes` (tracked files larger than this,
   150000, touched by most changes, never count), `branch_days` (14) and `settled_days` (14). Folders and the files the
   check commands (`delivery.push_checks`) name never count either: specs cite those as the required suite.
+- Batch runs: a worker that starts a code task also takes up to `dispatch.batch_max` (5) other small
+  ready code tasks in the same run, on the same worktree and branch, so related small changes do not
+  each need their own worker and branch. A task joins only when it is queued, of the same repo, light
+  or standard tier, not exclusive, holds no device or machine resource, has the lead's provider and
+  model pins or none, was not set to deep by the user, has no branch of its own and has budget left.
+  Tasks naming files the lead's spec names come first, then by priority; one whose files a task on
+  another branch is changing stays out; one that depends on another member comes after it. Whatever
+  dispatch picks first leads, so an urgent task never waits for a batch to fill, and an urgent task
+  never joins another's run: it starts in a worker of its own, in parallel. The worker commits
+  each task separately with a `Task: #<id>` trailer and hands off one outcome per task (`members` in
+  result.json); the batch's one review and one checks run cover the branch. Once the lead ends, a
+  member done in the run is done on the lead's branch, a blocked one is blocked with its reason, and
+  a failed one goes back to the queue alone. The run's budget is the sum of the members' remaining
+  budgets, capped at the deep tier's default, and its cost is split between them pro rata to their
+  budgets, so each task's spend stays its own. `ttp status`, the web app and the coordinator show
+  the run once, as `#<lead> (batch b<lead>: +#a, #b)`; each member's line says `in batch run
+  b<lead> led by #<lead>`. Settings: `dispatch.batch` (on; `ttp config <name> dispatch.batch false`
+  turns it off) and `dispatch.batch_max` (5).
 - tt-project never keeps a machine awake by default: `runner.prevent_idle_sleep` is `off`, and you
   keep your Mac awake yourself as needed. Set it to `on` (or `auto`, on for a Mac) with
   `ttp config <name> runner.prevent_idle_sleep on`; a value you set stays across upgrades. Then,
@@ -1993,8 +2052,21 @@ session and stateless coordinators on every provider.
   release (logged, with a `harness` setter record; `ttp config <key> ''` reverts one, and the charter
   never fills it again): the Resources machines into `machines.allowed` when the config names none,
   the first existing charter `branch <name>` into `delivery.base_ref` when neither it nor an existing
-  `delivery.push_branch` is set, and the charter's other branches into `worktree.shared_branches`.
+  `delivery.push_branch` is set, and the charter's other branches into `worktree.shared_branches`
+  (only names with a `/` or that exist here or on origin: a prose word after "branch", as in "the
+  branch is ready", is none; a list the harness wrote before this check loses such words once, and a
+  list a user or coordinator set is never touched). The charter's `Forbidden data` patterns move
+  into `memory.forbidden_patterns` the same way, before their first read, so none lapses.
   Nothing moves that the old reader did not use; `delivery.push_branch` is never written.
+  Granted settings are applied by the coordinator with `config_set` in the turn that carries the user's
+  word; push permission (`delivery.push_allowed`) and the machine allowlist (`machines.allowed`) are the
+  user's own, which `config_set` refuses, so the coordinator's reply names the exact `ttp config` command
+  instead. The daemon reads no charter wording for them. Its one check: `delivery.push_allowed`,
+  `delivery.allow_protected_push_branch` or `delivery.auto_merge_repos`, last set by the user and changed
+  since, raises one `grant_mismatch` event (never an ask, never a write). A setting hold
+  (`delivery.allow_protected_push_branch` off) sends one low-severity proposal per setting state naming
+  the setting, the held tasks and the `ttp config` change that would release them; other ready work keeps
+  dispatching.
   Other kinds run in the project root unless `worktree.kinds` lists them (say `["work"]`); they
   must not move its HEAD. A run that leaves the root on another branch or with new uncommitted
   changes raises an alert naming it. Before a worktree is made, a root left detached or off its
@@ -2002,7 +2074,8 @@ session and stateless coordinators on every provider.
   uncommitted changes, else alerted; worktrees never start from such a HEAD.
 - Smoke before landing: `delivery.push_checks` gate every landing, so keep them under 10 min on
   their host (aim 5). Slower tests belong in `delivery.post_land_checks`, which run after landing:
-  the daemon runs them detached on each new pushed sha, without a model. A failing test that passes on
+  the daemon runs them detached on each new pushed sha, without a model, the first full run on a spill
+  host the project's settings allow (`delivery.checks_spill_hosts`) when one is free, its reruns here. A failing test that passes on
   a rerun is flaky (quarantined, not reverted); one failing before the landing too is not its. A new
   failure is bisected over the landed changes to the guilty one, which is reverted forward on the
   push branch through the push queue (never forced), and one code task is queued to fix it on its
@@ -2011,6 +2084,24 @@ session and stateless coordinators on every provider.
   `checks.smoke_max_s` (default 600 s) the project's coordinator gets one observation a day naming the
   slowest tests (push-checks reference, "Smoke before landing"). `ttp status` also shows the waits:
   checks wait to start and approval to landed (median and p90, last 24 h).
+- Short path (`ttp express <task|head> --why "<why>"`): a small urgent change lands alone, now,
+  instead of waiting for the next push queue batch. It is allowed, without a model, only when an
+  independent review approved that head, the change is urgent (priority 1, an `urgent:` line or a
+  user's order) and its diff is at most `delivery.express_max_lines` (200) changed lines in at most
+  `delivery.express_max_files` (8) files; a refusal names every reason. `delivery.express: false`
+  turns it off; `--dry-run` only checks. It goes through the same push path as every batch (the push
+  branch, never forced, the leak scan, one version bump and changeset), in its own worktree beside a
+  running batch rather than behind it. Its pytest push checks run only the tests its diff reaches; a
+  failure the unchanged tip shares does not block it. After it lands the daemon runs the full push
+  checks and `delivery.post_land_checks` on it, and a failure there reverts that commit forward.
+  The narrowing is a per-push override: `delivery.push_checks` stays as set, and the batch marker and
+  a `push_check_override` event record which checks ran narrowed. The push queue starts an urgent
+  approval this way by itself, beside a running batch.
+- Reviewed fixes land without the queue: under `delivery.code_tasks_may_push: "approved"` (the
+  default) a code task, or the coordinator in its own worktree, runs `ttp push --land` on a head an
+  independent review approved; the push checks run as for any push, an unreviewed head is refused,
+  and a raw `git push` stays refused. `true` lets code tasks land unreviewed work (the user's word
+  only); `false` leaves landing to reviews and the push queue.
 - Where reviewed changes go straight to a shared branch, `ttp push` publishes them guarded: it
   refuses uncommitted changes, rebases onto the latest tip, runs `delivery.push_checks` on the
   exact commit it pushes, starts over if the branch moved meanwhile, and never forces. A
@@ -2369,7 +2460,11 @@ session and stateless coordinators on every provider.
   (`ttp config --account checks.spill_hosts '["pool-a", "pool-b"]'`; only the user sets it, a run may only
   clear it with `[]`), follows each project's own list, so every project on the machine spills to it without a
   list of its own; its hosts need no charter line but must be in the machines list. A project's own `[]` keeps
-  its runs here, pool included. The account's ban list, `checks.no_spill_hosts`
+  its runs here, pool included. `delivery.checks_spill_exclude` (a list of ssh aliases or host names, default
+  `[]`) keeps named hosts out of every route: the project's own list, the account pool and
+  `checks.spill_beside_device`; an alias or the machines list's host name for it matches, the coordinator may
+  set it, and the pick and `ttp checks status` list those hosts as `excluded by the project
+  (delivery.checks_spill_exclude)`. The account's ban list, `checks.no_spill_hosts`
   (`ttp config --account checks.no_spill_hosts '["host-x"]'`; ssh aliases or host names; a run may add to it but
   never remove a host), keeps those machines out of every project's spill on this machine: a host matches by its
   alias, its machine, or the machines list's `hostname` (full or short name). Setting a project list or the pool
@@ -2404,12 +2499,17 @@ session and stateless coordinators on every provider.
   A host whose own environment keeps failing runs is quarantined, per project and model-free: a spilled failure
   (never a host fault, exit 75, nor a timeout) is a strike against its host once the same commit then passes
   elsewhere (here or on another spill host); a pass there resets its strikes. After `checks.spill_quarantine_after`
-  strikes in a row (default 3) the host takes none of the project's runs for 6 hours, with one event and one
-  machine ledger entry whose auto-undo, `ttp checks --spill-back <alias>`, puts it back (run it by hand to end the
-  quarantine sooner). A failure that hits two or more spill hosts the same way within an hour (the same last error
+  strikes in a row (default 3) the host takes none of the project's runs, with one event and one machine ledger
+  entry. Its until-probe, `ttp checks --spill-probe <alias>`, puts it back once a known-good run passes there: on
+  the daemon's probe timer it starts the push branch tip's spillable checks on that host, detached and behind its
+  spill wrapper, and reads that run's result on later rounds. A refusal there (exit 75, a busy host) starts it
+  again at once and is no strike; a failure starts it again an hour later. The entry expires after 7 days
+  and is then due whatever its until-probe says, so its auto-undo, `ttp checks --spill-back <alias>`, ends the
+  quarantine then at the latest (run it by hand to end it sooner). However a quarantine ends, it raises one "back" event and resets the host's strikes, ledger entry or
+  not. A failure that hits two or more spill hosts the same way within an hour (the same last error
   line, paths and numbers aside, and the same failing pytest ids) with no spilled pass between is the project's
-  spill setup, not the hosts (a wrapper that lost its environment): one high event says so and no host takes a
-  strike; a failure that is a missing package at import is already the spill env fault above (told once, never
+  spill setup, not the hosts (a wrapper that lost its environment): one high event says so, no host takes a
+  strike, and a host quarantined earlier for that same failure comes back; a failure that is a missing package at import is already the spill env fault above (told once, never
   a strike, and no second event under the same checks config). A failure with neither an error line nor a failing test id matches no other: it is only a strike.
   `checks.json` (`spilled_to`), `ttp status` and `ttp checks status` name the host.
   `checks.slurm_overflow` (account-level, unset by default: nothing changes) sends a run that no pool host can take
@@ -2534,7 +2634,27 @@ session and stateless coordinators on every provider.
   watches the host's fork rate (/proc/stat): above `checks.churn_forks_s` (800/s) for `checks.churn_window_s`
   (120 s), the owning project's daemon raises one `process-churn:<unit>` observation and, muted or not, appends the
   event (rate, threshold, new processes per unit, top 5 parent command lines, secrets redacted) to
-  `state/logs/churn.jsonl`, rotated to `churn.jsonl.1` past 1 MB. It never stops a process. A
+  `state/logs/churn.jsonl`, rotated to `churn.jsonl.1` past 1 MB. It never stops a process. The self-watch
+  (selfwatch.py) does, for the project's own runs only: about every 30 s (`selfwatch.every_s`) each daemon samples
+  the host's load against its cores, processes created per second, available memory and free disk, and its own
+  process tree (every process whose TTP_PROJECT or TTP_RUN_DIR is this project's, and the daemon's children),
+  per run: processes, spawn rate (only its own processes the watch sees: pids in its tree first seen at a sample
+  or, while the host forks at or above the limit, in about 20 quick pid listings over 1 s, each counted once, as a
+  rate over the time watched; the host's fork rate is never shared out to a run), CPU cores and RSS. A run past a limit at every sample for `selfwatch.window_s`
+  (60 s): `selfwatch.spawn_s` (1000 new processes/s), `selfwatch.procs` (3000 processes), or host load at
+  `selfwatch.load_x` (2) times its cores while the run uses `selfwatch.load_share` (half) of them, is stopped: its
+  supervisor is asked to stop, its own process groups get TERM and after `selfwatch.grace_s` (5 s) KILL (a group
+  with any process not this project's gets only the owned members), their flock locks go with them, the task
+  gets one `selfwatch_runaway` event with the numbers and the user one notify. 0 turns a limit off;
+  `selfwatch.act: false` only reports. Host churn at or above the spawn limit that the runs' own counted rates do not
+  explain is reported once per episode as unattributed churn, never acted on. Known gap: a run's storm of processes
+  that each live shorter than the gap between two pid listings (about 50 ms) may be under-counted and then shows
+  only as unattributed churn. The reaper sweeps right after a stop, and the stop text says how many of the run's
+  locks were released. The same line also shows (selfaudit.py) a read-only ssh probe about every 2 min of each
+  machine a running task names (load, processes/s, memory, disk; never one paused or held; unreachable ones
+  skipped), the crontab entries and systemd user units the project installed, with any new entry that appeared
+  while one of its runs ran flagged with the run ids, and the locks, keeper holds and detached jobs it holds.
+  Its one line is in `ttp status`, the web app and the coordinator's Host section. A
   `ttp checks` or push inside a check command does not wait for its parent's slot. Checks that
   gate a push to the push branch (the push queue's batches and `ttp push`) hold the push lock, so
   they never queue behind task checks: each push branch has one priority slot of its own, shared
@@ -2985,7 +3105,11 @@ session and stateless coordinators on every provider.
   instead of failing; a batch of several changes first runs only these tests of each check that is
   one plain pytest run, and when they fail it finds the change that breaks the cap on them alone,
   then runs the full checks once on the changes before it; these probes are kept per merged tree,
-  so a batch rerun after a reboot does not run them again), `push_landing_alert_h` (default 4:
+  so a batch rerun after a reboot does not run them again), `push_entry_checks` (default `[]`, off:
+  quick commands, seconds each, a batch runs on each change merged onto its head before the change
+  joins it, whatever that change's own check scope, such as a test that every test file is on the
+  smoke list; one failing sends that change back alone with the command's output and the rest go on;
+  a command the push branch tip fails alone blames no change), `push_landing_alert_h` (default 4:
   when approvals have waited this many hours with nothing landed on the push branch and at least
   two batches tried them, one high alert says so, with the attempt count and how many a host
   reboot cut short; it clears when a batch lands; 0 = off), `push_script_torn_escalate_after`
@@ -3564,6 +3688,16 @@ install it, to a desktop notifier on your workstation that covers all your proje
 (`ttp notifier install`; asked once per user, recorded with `ttp consent notifier yes|no`). Only decisions, reviews, merges, funds and outages notify by default.
 `ttp notifier test` checks that desktop notifications show (with sound) and prints the fix if not.
 
+Chat posts stay few. A coordinator reply or notify reaches its chat at once only for a finished
+result, a decision you may want to override, a real outage or an ask, an answer to your question,
+or a high severity. A post that is only an acknowledgement ('Got it'), progress, a queue wait or a
+corrected forecast waits, whole, for one digest per chat, posted at most every
+`coordinator.chat_digest_h` hours (default 3; `0` sends every post at once; `coordinator.chat_digest_chats` `{chat: hours}` sets one chat, `all` is the broadcast chat) and only when it has
+content. The 'Status now' line the harness adds to a post naming unstarted work goes in the
+digest too, and so does the harness's own update on a late item the coordinator did not act on.
+A reminder of a step waiting on you keeps its full command and options in the digest.
+`ttp stats --chat` counts per chat the posts sent at once, held, digests posted and held now.
+
 - Web app: the Notifications card on the Overview tab shows the browser's state (on, not allowed yet,
   blocked, unavailable on this address, unsupported), an Allow button and Send test. While the page
   is open in any tab, each new ask, problem and task ready for review pops up once and stays until
@@ -3800,10 +3934,16 @@ Workers can read Slack links you paste, using your Slack connector if you have o
 - A run whose task carries the `untrusted_input` label (its input, such as a PR comment, an issue body
   or a CI log, may carry planted instructions) gets three more guards, model-free (untrusted.py). The
   label is read from the task's record; `TTP_UNTRUSTED_INPUT=1` also turns them on (a benchmark cell
-  without a project) and nothing turns them off. A run without the label is unchanged.
+  without a project). Only the coordinator turns them off, with a task_update `untrusted_input: false`
+  whose `text` names who vouched for the source: the task keeps the label `untrusted_cleared` and an
+  `untrusted_cleared` event holds the why; a task run cannot clear it. A note from another project of
+  the same owner still sets the label, since it can quote PR comments, logs or web pages. A run
+  without the label is unchanged.
   - Pushes: git's pre-push hook refuses every ref but the task's own branch (its recorded branch) and
     the push branch, so a new branch, a tag or a delete is refused, and the hook refuses a raw
-    `git push` naming the push branch: that branch is reached only through `ttp push`.
+    `git push` naming the push branch: that branch is reached only through `ttp push`. One more: the
+    pr_branch the coordinator recorded for the task (a spec `pr_branch:` line or a task_update's,
+    never one only inside quoted text), at exactly a commit an independent review of the task passed.
   - Writes: `gh api` with a write method, a field or input body or a GraphQL mutation; every other gh
     subcommand but reads (`view`, `list`, `diff`, `checks`, `status` and the like), so `gh pr comment`,
     `gh issue create` and `gh pr review`; curl with a method other than GET, HEAD or OPTIONS, a data

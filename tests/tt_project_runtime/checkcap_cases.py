@@ -2113,7 +2113,7 @@ def test_every_checks_key_the_runtime_reads_is_an_account_key_and_settable(env):
     read |= set(re.findall(r'get\("checks"\) or \{\}\)\.get\("([a-z_]+)"', src))
     for kind in (testslots.TESTS, testslots.BUILDS):
         read |= {kind.setting(s)[1] for s in ("pool", "run_max", "project_max")}
-    read -= {"dropped", "json", "log", "out", "pid", "queued", "rc", "stalled"}   # file names (checks.json), not keys
+    read -= {"dropped", "json", "log", "out", "pid", "queued", "rc", "running", "stalled"}   # file names (checks.json), not keys
     # project-only: the project's own lock or queue wrapper (and the one its checks run behind on a spill host),
     # set by the user per project, its fallback lane, the spill hosts its user lets it share with device jobs,
     # the Python lock its checks' pinned env is built from, and the strikes that quarantine a spill host for it
@@ -3633,10 +3633,12 @@ def test_checks_test_project_max_auto_sizes_from_the_host_over_a_fixed_account_n
     a = testslots.suite_hold("pa", repo=_LANE_REPO, slots=4, cap=1, wait_s=0)
     told = []
     # No wall-clock deadline (wait_s), which a slow first poll under load passes before the first line:
-    # the wait ends once it has told (stop), however long that took.
+    # the wait ends once it has told (stop), however long that took, or after a minute that never tells.
+    began = time.time()
     with pytest.raises(checkcap.Cancelled):
         testslots.suite_hold("pa", repo=_LANE_REPO, slots=4, cap=1, tell=told.append, cap_note=note,
-                             stop=lambda: "told" if told else "")
+                             stop=lambda: "told" if told else "timeout" if time.time() - began > 60 else "")
+    assert told, "the waiter at the cap told nothing within a minute"
     assert "(checks.test_project_max 3, set in the account settings; the host fits" in told[0], told
     a.close()
     # config_set takes auto for the cap, not for the test-worker budget, which is a number of slots.
@@ -9812,6 +9814,7 @@ def test_a_preempted_routine_checks_run_requeues_at_its_old_place_and_runs_again
     monkeypatch.setattr(checkcap, "acquire",
                         lambda *a, **k: arrivals.append((a[5] if len(a) > 5 else k.get("since"), k.get("preemptible")))
                         or holders.append(a[0]) or real(*a, **k))
+    monkeypatch.setenv(checkcap.CUT_ENV, "")
     monkeypatch.setenv(checkcap.PREEMPTED_ENV, "")
     mark, req = tmp_path / "ran-once", checkcap.slot_dir() / f"{checkcap.PREEMPT}.{os.getpid()}.json"
     script = (f'if [ -e {mark} ]; then exit 0; fi; touch {mark}; '
@@ -9839,6 +9842,7 @@ def test_check_commands_never_see_the_checks_runs_own_preempt_rerank_and_reexec_
     p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
     monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "1")
     monkeypatch.setattr(checkwall, "POLL_S", 0.1)
+    monkeypatch.setenv(checkcap.CUT_ENV, "")
     monkeypatch.setenv(checkcap.PREEMPTED_ENV, "")
     monkeypatch.setenv(checkcap.PREEMPT_ASKED_ENV, '{"since": 1.0, "asked": "x"}')
     monkeypatch.setenv(checkcap.RERANK_ENV, "1")
@@ -12356,3 +12360,29 @@ def test_slot_status_lists_the_host_parked_queue_in_admission_order_with_owed_an
     finally:
         locks.dequeue(owed)
         locks.dequeue(routine)
+
+
+def test_a_preempted_checks_runs_rerun_logs_its_wait_as_cut_by_the_preempting_project(env, tmp_path, monkeypatch,
+                                                                                      capsys):
+    """[note 82418fd2fe098005]: a routine run preempted by another project's urgent run queues again at its
+    first arrival; its rerun's waits-log record carries cut_at (its old grant) and cut_by (the asker's project,
+    checkcap.preempt's request), so throughput books that wait to the preempting project, and its lane wait
+    (lane_s, of which pool_s the host's test pool held)."""
+    from ttp import checkcap, checkwall, cli
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "1")
+    monkeypatch.setattr(checkwall, "POLL_S", 0.1)
+    monkeypatch.setenv(checkcap.PREEMPTED_ENV, "")
+    monkeypatch.setenv(checkcap.CUT_ENV, "")
+    monkeypatch.setenv("TTP_TASK", "7")
+    mark, req = tmp_path / "ran-once", checkcap.slot_dir() / f"{checkcap.PREEMPT}.{os.getpid()}.json"
+    script = (f'if [ -e {mark} ]; then exit 0; fi; touch {mark}; '
+              f'printf \'{{"by": "urgent u", "task": "77", "project": "other-project", "at": %s}}\' '
+              f'"$(($(date +%s) + 1))" > {req}; sleep 60')
+    cli.main(["checks", "--", "sh", "-c", script])
+    assert "preempted by urgent #77" in capsys.readouterr().out
+    rows = checkcap.wait_records(p.state)
+    assert len(rows) == 2 and "cut_at" not in rows[0], rows
+    assert rows[1]["cut_by"] == "other-project" and rows[0]["granted_at"] - 1 <= rows[1]["cut_at"], rows
+    assert all(r["lane_s"] >= 0 and 0 <= r["pool_s"] <= r["lane_s"] for r in rows), rows
+    assert checkcap.CUT_ENV in checkcap.RUN_ONLY_ENV and checkcap.LANE_WAIT_ENV in checkcap.RUN_ONLY_ENV

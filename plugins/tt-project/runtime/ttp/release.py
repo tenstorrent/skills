@@ -606,7 +606,7 @@ def copy_failed(p: Project, e: BaseException) -> bool:
 def hold_reason(p: Project, d: dict) -> str:
     """Why the daemon must not start an automatic upgrade to `d` now ("" = go)."""
     from . import cyclenotice
-    h = cyclenotice.held(cyclenotice.project_paths(p))
+    h = cyclenotice.project_held(p)
     if h:       # busy, not a try: nothing is recorded, so it starts once the notice is gone
         return cyclenotice.line(h, p) + "; " + CYCLE_HELD
     if _taken(upgrade_lock(p)):

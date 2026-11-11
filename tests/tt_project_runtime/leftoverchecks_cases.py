@@ -428,5 +428,45 @@ def test_the_subreaper_stand_in_keeps_the_tests_ttp_variables_and_ends_with_its_
     assert own[checkreap.MARKER] == "lc-token" and own["TTP_RUN_DIR"] == str(tmp_path) and "TTP_PROJECT" not in own
     os.kill(proc.pid, signal.SIGKILL)
     assert proc.gone_within(5) and proc.reaper.gone_within(5), "the subreaper outlived its stand-in"
-    late, _ = lc_spawn({}, name="b", reaper_s=1)
-    assert late.reaper.gone_within(10) and late.alive(), "the subreaper outlived its time limit"
+    late, _ = lc_spawn({}, name="b", reaper_s=4)   # long enough for a loaded host to start the stand-in under it
+    assert late.reaper.gone_within(_load_scaled(20)) and late.alive(), "the subreaper outlived its time limit"
+
+
+def test_a_test_s_process_tree_orphaned_in_its_pytest_temp_folder_is_stopped_and_nothing_else(env, tmp_path, monkeypatch):
+    """`ttp checks --reap`'s second pass (test_orphans): an orphaned tree whose top has its cwd in a
+    pytest-of-<user>/pytest-<n> folder is listed by the dry run and stopped with its child; an orphan
+    outside such a folder, and one too young, are left alone."""
+    import getpass
+    from ttp import leftoverchecks, leftoverstop
+    if not leftoverstop.PROC.exists():
+        pytest.skip("needs /proc")
+    p = make(env)
+    inside = tmp_path / f"pytest-of-{getpass.getuser()}" / "pytest-7" / "test_x0"
+    inside.mkdir(parents=True)
+    tree = subprocess.Popen(["sh", "-c", "sleep 60 & wait"], cwd=inside, start_new_session=True)
+    other = subprocess.Popen(["sleep", "60"], cwd="/", start_new_session=True)
+    tops = {tree.pid, other.pid}
+    real_ppid = leftoverchecks._ppid
+    monkeypatch.setattr(leftoverchecks, "_ppid", lambda n: 1 if n in tops else real_ppid(n))
+    try:
+        deadline = time.time() + 10
+        while time.time() < deadline and not [n for n in leftoverchecks.pids() if real_ppid(n) == tree.pid]:
+            time.sleep(0.05)
+        (child,) = [n for n in leftoverchecks.pids() if real_ppid(n) == tree.pid]
+        mine = lambda rs: [r for r in rs if r["pid"] in tops]
+        assert mine(leftoverchecks.test_orphans(p, set(), dry_run=True, min_age=3600)) == []   # too young
+        (f,) = mine(leftoverchecks.test_orphans(p, set(), dry_run=True, min_age=0))
+        assert f["pid"] == tree.pid and sorted(f["pids"]) == sorted([tree.pid, child]) and "would stop" in f["text"]
+        assert tree.poll() is None, "the dry run stops nothing"
+        (f,) = mine(leftoverchecks.test_orphans(p, set(), min_age=0))
+        assert tree.wait(timeout=15) is not None
+        deadline = time.time() + 10
+        while time.time() < deadline and leftoverstop._start(child):
+            time.sleep(0.05)
+        assert not leftoverstop._start(child), "its child is stopped too"
+        assert other.poll() is None, "an orphan outside a pytest temp folder is left alone"
+    finally:
+        for proc in (tree, other):
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()

@@ -9,13 +9,16 @@ holding the queue. Each daemon pass (tend()):
   (`python -m ttp.postland <job>`, niced like the workers) on the newest pushed sha. Every batch landed
   since the last check is in its range: their entries' landed shas, in order, after the tip before them.
 - The driver (drive()) runs each check in a clean checkout of that sha, by push._run_one (its check host
-  and lock rules). Failing pytest ids rerun once there: those that pass are flaky (quarantined, never
-  reverted). Those failing again rerun at the range's start: failing there too, they were not this
+  and lock rules); its first full run goes to a spill host the project's settings allow (checkspill.spill_run,
+  as the push batch's first runs do), else here. Failing pytest ids rerun once there, always here: those that
+  pass are flaky (quarantined, never reverted). Those failing again rerun at the range's start: failing there too, they were not this
   landing's. The rest bisect over the entries' landed shas to the first that fails them: the guilty change.
 - Guilty: a revert of that entry's commits on the current tip (never a force push), checked to pass the
   failing ids, goes in as ttp/postland-revert-<sha>. The daemon approves it into the push queue (it lands
   with the next batch, after the smoke checks) and queues one code task to fix the change on its failing
   tests alone. Anything it cannot tell or attribute goes to the coordinator as one observation.
+- An express landing (express.py, batch id express-*) checked only its smoke and touched tests: its job
+  runs the full push checks and the post-landing checks, also where post_land_checks is unset.
 """
 from __future__ import annotations
 
@@ -58,13 +61,19 @@ def _event(db, text: str, kind: str = "observation", queued: bool = True) -> Non
 def tend(p: Project, cfg: dict, now: float | None = None) -> str:
     """One daemon pass: settle a finished run, else start one for what landed since the last. Returns
     what it did ('' when nothing)."""
-    from . import push
+    from . import express, push
     now = time.time() if now is None else now
-    if not push.check_list((cfg.get("delivery") or {}).get("post_land_checks")):
-        return ""
+    d = cfg.get("delivery") or {}
+    plc = push.check_list(d.get("post_land_checks"))
     db = p.db
     st = db.kv(KEY, {}) or {}
     job = st.get("job")
+    # An express landing ran only its smoke and touched tests: its full push checks run here even in a
+    # project with no post-landing checks of its own.
+    only = "" if plc else f" AND id LIKE '{express.PREFIX}%'"
+    if not plc and not job and not db.one(f"SELECT 1 FROM push_batches WHERE outcome='pushed' AND finalized IS NOT "
+                                          f"NULL AND ended>?{only}", (st.get("since") or 0,)):
+        return ""
     if job:
         res = Path(job["path"]).with_suffix(".result.json")
         if res.exists():
@@ -85,11 +94,13 @@ def tend(p: Project, cfg: dict, now: float | None = None) -> str:
             got = {"outcome": "unattributed", "why": f"the test lock stayed busy for {busy} passes"}
         db.set_kv(KEY, {**st, "job": None, "busy": 0, "since": job["ended"], "last": {**got, "sha": job["sha"]}})
         return apply(p, job, got)
-    batches = db.q("SELECT * FROM push_batches WHERE outcome='pushed' AND finalized IS NOT NULL AND ended>? "
+    batches = db.q(f"SELECT * FROM push_batches WHERE outcome='pushed' AND finalized IS NOT NULL AND ended>?{only} "
                    "ORDER BY ended, started", (st.get("since") or 0,))
     if not batches:
         return ""
-    if "since" not in st:
+    if not plc:
+        batches = batches[:1]    # express landings only: one at a time, its own range
+    elif "since" not in st:
         batches = batches[-1:]   # first run: this landing only, not the project's history
     points = []
     for b in batches:   # by position on the branch (a batch replays in priority order, not id order)
@@ -110,6 +121,9 @@ def tend(p: Project, cfg: dict, now: float | None = None) -> str:
     path = folder / f"{batches[-1]['id']}.json"
     job = {"path": str(path), "batch": batches[-1]["id"], "sha": batches[-1]["pushed_sha"], "good": batches[0]["tip"] or "", "points": points,
            "target": batches[-1]["target"], "ended": batches[-1]["ended"], "repo": str(p.root)}
+    if any(express.is_express(b["id"]) for b in batches):
+        full = push.check_list(push.repo_checks(d, p.root, p)[0])
+        job["checks"] = [c.config() for c in full + plc]
     durable_write(path, json.dumps(job))
     job["pid"] = spawn(p, path)
     db.set_kv(KEY, {**st, "job": job, "since": st.get("since", 0)})
@@ -192,10 +206,11 @@ def apply(p: Project, job: dict, got: dict) -> str:
 
 def drive(p: Project, job: dict, say=print) -> dict:
     """Run the checks on job['sha'] and, on a new failure, find and revert its change (see the module)."""
-    from . import cleantree, gatejudge, push, sharedchecks, worktree
+    from . import checkcap, cleantree, gatejudge, push, sharedchecks, worktree
     repo = Path(job["repo"])
     base = str(Path(job["path"]).parent)
-    checks = push.check_list((p.config().get("delivery") or {}).get("post_land_checks"))
+    checks = push.check_list(job["checks"] if "checks" in job else
+                             (p.config().get("delivery") or {}).get("post_land_checks"))
     try:
         env = push.check_env("target", job.get("good") or "", base)
     except Exception:
@@ -216,7 +231,13 @@ def drive(p: Project, job: dict, say=print) -> dict:
             worktree.prepare(p, tree.path)
             got: dict = {}
             sel_env = gatejudge.select_env(sel, env) if sel else {}
-            rc = push._run_one(cmd, tree.path, {**env, "PWD": str(tree.path), **sel_env}, say, got)
+            claim, sent = (None, cmd) if sel else _spill(p, cmd, at, say)
+            try:
+                _, rc = push._run_or_here(sent, tree.path, {**env, "PWD": str(tree.path), **sel_env}, say, got,
+                                          checkcap.Slot)
+            finally:
+                if claim is not None:
+                    claim.close()
             return (gatejudge.BUSY if rc == gatejudge.BUSY else got.get("rc")), got.get("text") or ""
         finally:
             tree.close()
@@ -225,6 +246,20 @@ def drive(p: Project, job: dict, say=print) -> dict:
         return _drive(p, job, checks, run)
     except Busy as ex:
         return {"outcome": "busy", "why": f"the test lock stayed busy: {ex}"}
+
+
+def _spill(p: Project, cmd, sha: str, say) -> tuple:
+    """(claim, check) for a check's first full run on the landed sha: sent to a spill host checkspill.spill_run
+    picks (the project's own spill hosts, as the push batch's first full runs go), else (None, `cmd`) here. Every
+    rerun of its failing tests runs here on `cmd` itself, never spilled (as the push batch's reruns). The spill
+    hosts are a speed-up: an error trying them, or a host that cannot run it (push._run_or_here), keeps it here."""
+    from . import checkspill
+    try:
+        claim, out = checkspill.spill_run(p, p.config(), [cmd], say, f"post-landing checks on {sha[:10]}")
+    except Exception as e:   # noqa: BLE001
+        say(f"spill hosts not tried ({e}): the checks run here")
+        return None, cmd
+    return claim, (out[0] if claim is not None and out else cmd)
 
 
 class Busy(Exception):

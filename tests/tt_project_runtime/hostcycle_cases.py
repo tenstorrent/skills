@@ -857,7 +857,7 @@ def _initiator_reboot(p, tmp_path, monkeypatch, journal, last_heartbeat_ago=600)
     d = Daemon(p.base)
     d.tick()
     d.tick()
-    assert set(calls) <= {"boot-0"} and 1 <= len(calls) <= 3, "the journal is read once per boot (markers, " \
+    assert set(calls) <= {"boot-0"} and 1 <= len(calls) <= 4, "the journal is read once per boot (markers, kernel, " \
         "commands, then the window before the marker), for the boot that ended"
     (n,) = _reboot_notices(p)
     ev = p.db.one("SELECT text, data FROM events WHERE source='host' AND kind='boot' ORDER BY id DESC LIMIT 1")
@@ -1050,10 +1050,12 @@ def test_the_unit_systemd_started_just_before_the_marker_is_found_however_long_t
     assert got == {"source": "journal", "text": "a request to systemd-logind that names no user (journal: System is "
                    "rebooting.); example-broker-recover.service (Example recovery: power-cycle a hung shutdown) "
                    f"armed, not fired: it logged nothing of its own before the boot's journal ended {end} s later"}, got
-    assert [r[:2] for r in reads] == [["-n", str(initiator.MARK_ENTRIES)]] * 2 + [["--since", f"@{_T0 - 600}"]] + \
-        [["-n", str(initiator.UNIT_ENTRIES)], ["-n", "1"]], reads
-    assert reads[0] == initiator.marker_args() and reads[1] == initiator.command_args(), reads
-    assert reads[3] == initiator.unit_args("example-broker-recover.service") and reads[4] == initiator.end_args()
+    assert [r[:2] for r in reads] == [["-n", str(initiator.MARK_ENTRIES)], ["-n", str(initiator.KERNEL_ENTRIES)],
+                                      ["-n", str(initiator.MARK_ENTRIES)], ["--since", f"@{_T0 - 600}"],
+                                      ["-n", str(initiator.UNIT_ENTRIES)], ["-n", "1"]], reads
+    assert reads[0] == initiator.marker_args() and reads[1] == initiator.kernel_args() \
+        and reads[2] == initiator.command_args(), reads
+    assert reads[4] == initiator.unit_args("example-broker-recover.service") and reads[5] == initiator.end_args()
 
 
 # A shutdown watchdog systemd-run started just before the reboot request, to power-cycle the host if the
@@ -1087,7 +1089,7 @@ def test_a_watchdog_systemd_only_started_before_the_request_is_armed_not_the_ini
     assert got == {"source": "journal", "text": "a request to systemd-logind that names no user (journal: System is "
                    f"rebooting.); {_WATCHDOG} (power-cycle a hung shutdown) armed, not fired: it logged nothing of "
                    "its own before the boot's journal ended 88 s later"}, got
-    assert reads[3:] == [initiator.unit_args(_WATCHDOG), initiator.end_args()], reads
+    assert reads[4:] == [initiator.unit_args(_WATCHDOG), initiator.end_args()], reads
     # Its lines from before this start (an earlier run of the same name) are no sign it fired.
     early = [_j(-300, "ready", _WATCHDOG, "example-watchdog"), *_ARMED]
     assert _find_over(monkeypatch, early)["text"] == got["text"]
@@ -1095,7 +1097,7 @@ def test_a_watchdog_systemd_only_started_before_the_request_is_armed_not_the_ini
     both = [_ARMED[0], _j(-0.02, f"Starting {_WATCHDOG} - power-cycle a hung shutdown...", "init.scope", "systemd",
                           about=_WATCHDOG), *_ARMED[1:]]
     reads.clear()
-    assert _find_over(monkeypatch, both, reads)["text"] == got["text"] and len(reads) == 5, reads
+    assert _find_over(monkeypatch, both, reads)["text"] == got["text"] and len(reads) == 6, reads
     # The request names nobody, so a host-cycle record for the boot still wins over it.
     monkeypatch.setattr(hostcycle, "planned", lambda p, boot, at: {"path": "/x/rec/cycle.json", "id": "c1",
                                                                    "project": "other", "reason": "kernel update"})
@@ -1158,12 +1160,12 @@ def test_a_unit_line_that_is_no_systemd_start_is_the_initiator_without_reading_i
     reads = []
     assert _find_over(monkeypatch, plain, reads) == {
         "source": "journal", "text": f"{_BROKER} (power-cycle requested by the operator console)"}
-    assert len(reads) == 3 and initiator.unit_args(_BROKER) not in reads and initiator.end_args() not in reads, reads
+    assert len(reads) == 4 and initiator.unit_args(_BROKER) not in reads and initiator.end_args() not in reads, reads
     # A unit line that reads like a start (not systemd's) is the unit's own line: named, nothing more read.
     own = [_j(-2, f"Started {_WATCHDOG} - power-cycle a hung shutdown.", _BROKER, "example-broker"), *_ARMED[2:]]
     reads.clear()
     assert _find_over(monkeypatch, own, reads)["text"].startswith(f"{_BROKER} (Started ")
-    assert len(reads) == 3 and initiator.unit_args(_WATCHDOG) not in reads, reads
+    assert len(reads) == 4 and initiator.unit_args(_WATCHDOG) not in reads, reads
 
 
 def test_a_full_marker_read_with_no_marker_never_claims_no_clean_shutdown(monkeypatch):
@@ -1201,10 +1203,12 @@ def test_a_permission_limited_journal_is_read_through_sudo_n_never_prompting(env
     got = initiator.find(p, "0123456789abcdef0123456789abcdef", time.time(), None)
     assert got["source"] == "journal" and got["read"] == "sudo" \
         and got["text"].startswith("example-broker-recover.service (power-cycle a hung shutdown"), got
-    user, check, sudo, commands, window = (c[0] for c in calls)
+    user, check, sudo, kernel, commands, window = (c[0] for c in calls)
     assert user[:3] == ["journalctl", "-b", "0123456789abcdef0123456789abcdef"] and "json" in user \
         and "SYSLOG_IDENTIFIER=systemd-logind" in user
     assert check == ["sudo", "-n", "-l", "journalctl"] and sudo == ["sudo", "-n", *user]
+    k = initiator.kernel_args()
+    assert kernel[:2] == ["sudo", "-n"] and kernel[-len(k):] == k, kernel
     assert commands[:2] == ["sudo", "-n"] and commands[-2:] == ["SYSLOG_IDENTIFIER=sudo", "SYSLOG_IDENTIFIER=pkexec"]
     assert window[:2] == ["sudo", "-n"] and window[window.index("--since") + 1] == f"@{_T0 - 600}" \
         and window[window.index("--until") + 1] == f"@{_T0 + 1}", window   # the 10 min before the marker
@@ -1336,3 +1340,80 @@ def test_a_reboot_after_a_shutdown_record_requeues_the_cut_short_run_that_held_a
     else:
         assert t["status"] == "blocked", dict(t)
         assert t["blocked_reason"].startswith("the host rebooted abruptly while this task held board"), t
+
+
+# A kernel fault before the reboot (initiator.kernel_fault): fixture journal text only.
+@pytest.mark.parametrize("ident,msg,label", [
+    ("kernel", "Kernel panic - not syncing: Fatal exception", "kernel panic"),
+    ("kernel", "Out of memory: Killed process 4242 (python3)", "out of memory"),
+    ("systemd-oomd", "Killed /user.slice/x.scope due to memory pressure", "out of memory"),
+    ("kernel", "mce: [Hardware Error]: Machine check: Processor context corrupt, fatal", "machine check"),
+    ("kernel", "mce: [Hardware Error]: Machine check events logged", ""),     # corrected errors: routine
+    ("kernel", "watchdog: BUG: soft lockup - CPU#3 stuck for 22s!", "lockup"),
+    ("kernel", "watchdog: watchdog0: watchdog did not stop!", ""),             # a normal shutdown
+    ("systemd", "Started Shutdown watchdog.", ""),                             # not the kernel's own line
+    ("example-app", "Out of memory: Killed process 1", ""),                    # an app quoting it
+])
+def test_the_kernel_fault_read_names_only_the_kernels_own_fault_lines(ident, msg, label):
+    from ttp import initiator
+    got = initiator.kernel_fault(_j(-40, msg, ident=ident) + "\n", _T0)
+    assert got.startswith(label + ": ") if label else got == "", got
+
+
+@pytest.mark.parametrize("dt,named", [(-40, True), (-3 * 3600, False), (-2 * 86400, False)])
+def test_a_kernel_fault_counts_only_in_the_window_before_the_shutdown(dt, named):
+    from ttp import initiator
+    oom = _j(dt, "Out of memory: Killed process 4242 (python3)", ident="kernel")
+    later = _j(-10, "e1000e: link down", ident="kernel")
+    for at in (_T0, None):     # the marker's time, else the newest line read
+        got = initiator.kernel_fault(oom + "\n" + later + "\n", at)
+        assert got.startswith("out of memory: ") if named else got == "", (dt, at, got)
+    assert initiator.kernel_fault(oom + "\n", None).startswith("out of memory"), "alone, it is the newest line"
+
+
+@pytest.mark.parametrize("panic_dt,named", [(0, True), (-3 * 3600, False)])
+def test_a_crash_with_no_shutdown_marker_anchors_the_kernel_window_to_the_boots_end(monkeypatch, panic_dt, named):
+    """No marker: the window ends at the newest line of any read, not the marker read's old logind line."""
+    from ttp import initiator
+    marker = _j(-3 * 3600, "New session 7 of user someuser.", "systemd-logind.service", "systemd-logind") + "\n"
+    kern = "\n".join([_j(panic_dt - 30, "watchdog: BUG: soft lockup - CPU#3 stuck for 22s!", ident="kernel"),
+                      _j(panic_dt, "Kernel panic - not syncing: Fatal exception", ident="kernel"),
+                      *([_j(0, "e1000e: link down", ident="kernel")] if panic_dt else [])]) + "\n"
+
+    def run(boot, extra=(), sudo=False):     # one answer per read: `journal=` would answer all the same
+        extra = list(extra)
+        return (0, kern if extra == initiator.kernel_args() else marker if extra == initiator.marker_args()
+                else "", "")
+    monkeypatch.setattr(initiator, "run_journal", run)
+    got = initiator.find(None, "boot-0", None, None)
+    assert got.get("kernel", "").startswith("kernel panic: ") if named else "kernel" not in got, got
+
+
+def test_the_kernel_read_selects_kernel_and_oomd_lines_of_the_ended_boot(env, monkeypatch):
+    from ttp import initiator
+    p = make(env)
+    oom = json.dumps({"__REALTIME_TIMESTAMP": str(int((_T0 - 40) * 1e6)), "_TRANSPORT": "kernel",
+                      "SYSLOG_IDENTIFIER": "kernel", "MESSAGE": "Out of memory: Killed process 4242 (python3)"})
+    quoted = _j(-20, "Out of memory: Killed process 1", "example.service", "example-app")
+    text = "\n".join([oom, quoted, *_CYCLE.splitlines()]) + "\n"
+    monkeypatch.setattr(initiator, "run_journal", lambda boot, extra=(), sudo=False: _journalctl(text, extra))
+    got = initiator.find(p, "boot-0", _T0 + 60, _T0 - 60)
+    assert got["source"] == "journal" and got["kernel"] == "out of memory: Out of memory: Killed process 4242 (python3)"
+
+
+def test_the_reboot_record_and_host_line_say_when_in_the_home_zone_and_why(env, tmp_path, monkeypatch):
+    from ttp import db as dbm
+    from ttp import timefmt
+    p = make(env)
+    p.set_config(timefmt.KEY, "America/Los_Angeles")
+    # the kernel read is JSON: a fault counts only with its time, in the window before the shutdown
+    oom = _j(-30, "Out of memory: Killed process 4242 (python3)", ident="kernel") + "\n"
+    feed, record, got = _initiator_reboot(p, tmp_path, monkeypatch, (0, oom + _SUDO_REBOOT, ""))
+    assert got["kernel"].startswith("out of memory: ") and "someuser ran `reboot`" in got["text"], got
+    boot = p.db.boots(0)[-1]
+    back = timefmt.short(float(boot["boot_time"]), p)
+    assert back.endswith(("PST", "PDT")), back
+    assert f"; back up at {back}; " in record and "kernel fault before it: out of memory" in record, record
+    assert "Kernel fault before it: out of memory" in feed or "kernel fault before it: out of memory" in feed, feed
+    line = dbm.host_line(p.db.boots(0), p)
+    assert f"(last {back}: someuser ran `reboot` via sudo (journal); kernel: out of memory: " in line, line

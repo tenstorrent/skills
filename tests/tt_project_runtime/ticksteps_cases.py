@@ -130,6 +130,7 @@ def test_dispatch_cut_at_its_budget_reaches_the_tasks_it_did_not_walk_next_tick(
     from ttp import daemon as dmod
     p.db.x("UPDATE tasks SET status='done'")
     d = dmod.Daemon(p.base)
+    d.cfg["dispatch"] = {**(d.cfg.get("dispatch") or {}), "batch": False}   # this walks single starts
     held = p.db.add_task("held", "s", kind="code", tier="light", origin="user", priority=2)
     b = p.db.add_task("b", "s", kind="code", tier="light", origin="user", priority=2)
     c = p.db.add_task("c", "s", kind="code", tier="light", origin="user", priority=2)
@@ -165,6 +166,7 @@ def test_dispatch_cut_walk_keeps_an_urgent_task_it_walked_before_unreached_lower
     from ttp import daemon as dmod
     p.db.x("UPDATE tasks SET status='done'")
     d = dmod.Daemon(p.base)
+    d.cfg["dispatch"] = {**(d.cfg.get("dispatch") or {}), "batch": False}   # this walks single starts
     top = p.db.add_task("top", "s", kind="code", tier="light", origin="user", priority=1)
     low = p.db.add_task("low", "s", kind="code", tier="light", origin="user", priority=3)
     monkeypatch.setattr(d, "_workdir_for", lambda t: (str(p.base), None))
@@ -1710,6 +1712,29 @@ def test_e_a_git_write_in_a_strict_round_keeps_its_own_cap(env, monkeypatch, tmp
     assert _git_out(repo, "rev-parse", "refs/ttp/push/2") == _git_out(repo, "rev-parse", "HEAD")
 
 
+def test_a_pure_git_check_after_slow_python_in_a_strict_round_still_runs(env, tmp_path):
+    """A coordinator apply's own check (worktree.valid_branch: git check-ref-format) after a slow duplicate
+    scan failed with "timed out after 0 seconds": the scan's Python time had used up the finish scope's
+    deadline and the round's slice. A pure git call reads no repository and holds no lock: it runs. A
+    repository read past the deadline is still refused."""
+    from ttp import gitmemo, gitreplay, project, worktree
+    project.Project(make(env).base)   # the db audit hook gitmemo.on_audit hangs off
+    repo = tmp_path / "r"
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    gitreplay.clear()
+    with gitmemo.bounded(gitmemo.TX_GIT_S, 0.01), gitmemo.attempt(), gitmemo.strict(0.1) as rd:
+        rd.pnr, rd.live_s = True, 5.0   # past its point of no return, its slice spent
+        time.sleep(0.05)                # and past the scope's deadline
+        worktree._VALID_BRANCHES.pop("ttp/t1-a-pr-branch", None)
+        assert worktree.valid_branch("ttp/t1-a-pr-branch")
+        r = gitmemo.run(["git", "check-ref-format", "--branch", "ttp/t2-another"], capture_output=True, text=True)
+        assert (r.returncode, r.stdout.strip()) == (0, "ttp/t2-another"), r
+        assert rd.live_s == 5.0, "a pure call is not counted in the slice"
+        with pytest.raises(subprocess.TimeoutExpired):
+            gitmemo.run(["git", "-C", str(repo), "status", "--porcelain"], capture_output=True, text=True)
+    assert gitmemo.timeout(None, ("check-ref-format", "x")) is None   # off a scope: as before
+
+
 def test_a_git_write_in_an_attempt_drops_its_volatile_and_once_answers(tmp_path, monkeypatch):
     """A git write inside an attempt drops that attempt's volatile and once answers: the same read after
     it runs git again, never replaying what it read before the write (an absent ref, a ref list, a
@@ -2331,3 +2356,97 @@ def test_probe_verdicts_cost_the_same_at_1000_and_10000_tasks(env, monkeypatch):
     big = verdict_tick()
     assert big[:3] == small[:3], f"db calls, rows and git spawns per verdict tick grow with history: {small} -> {big}"
     assert big[3] < 1.0, f"one verdict tick took {big[3]:.2f} s at 10,000 tasks"
+
+
+def _stop_now_at(monkeypatch, target, name, match=None):
+    """Make a step-budget stop arrive at `target.name` (after the real call returns), with no real
+    timer: the stop raises there unless a critical() section defers it to just after (stepclock.release)."""
+    from ttp import stepclock
+    real = getattr(target, name)
+
+    def stop_here(*a, **k):
+        out = real(*a, **k)
+        if match is None or match(a):
+            stepclock._on_alarm(signal.SIGALRM, None)
+        return out
+    monkeypatch.setattr(target, name, stop_here)
+
+
+@pytest.mark.parametrize("at", ["spawn", "record"])
+def test_a_step_stop_during_the_runner_spawn_waits_until_the_run_is_recorded(env, monkeypatch, tmp_path, at):
+    """A step-budget stop landing in Popen or between it and the pid record leaves the run running and
+    tracked (pid and runner.pid recorded, not never_started); the stop is re-armed for just after the record."""
+    from ttp import daemon as dmod
+    from ttp import stepclock
+    p = make(env)
+    monkeypatch.setenv("TTP_FAKE_SHELL", "true")
+    d = dmod.Daemon(p.base)
+    tid = p.db.add_task("one", "do it", kind="work", tier="light", origin="user")
+    armed = []
+    monkeypatch.setattr(stepclock, "_arm", armed.append)   # no real SIGALRM: the test places the stop
+    stepclock.install()
+    try:
+        if at == "spawn":
+            real_init = stepclock._orig["init"]
+
+            def init(self, args, *a, **k):
+                real_init(self, args, *a, **k)
+                if "ttp.runner" in args:
+                    stepclock._on_alarm(signal.SIGALRM, None)
+            stepclock._orig["init"] = init
+        else:
+            _stop_now_at(monkeypatch, dmod.runner, "proc_start")
+        stepclock.begin("dispatch", 600, 5)
+        try:
+            rid = d.start_run("worker", "TASK PROMPT", "claude", "light", str(p.root), task=p.db.task(tid))
+            assert not stepclock._s.fired and armed and armed[-1] < 0.01, ("the stop is deferred to just after", armed)
+        finally:
+            stepclock.end()
+    finally:
+        stepclock.uninstall()
+    row = p.db.one("SELECT * FROM runs WHERE id=?", (rid,))
+    assert row["status"] == "running" and row["pid"], dict(row)
+    assert not json.loads(row["note"] or "{}").get("never_started"), row["note"]
+    assert (p.runs / str(rid) / "runner.pid").read_text().split()[0] == str(row["pid"])
+    deadline = time.monotonic() + 30
+    while p.db.one("SELECT status FROM runs WHERE id=?", (rid,))["status"] == "running" \
+            and time.monotonic() < deadline:
+        d.reap_runs()
+        time.sleep(0.05)
+
+
+@pytest.mark.parametrize("at", ["spawn", "record"])
+def test_a_step_stop_during_the_push_batch_spawn_waits_until_its_pid_is_on_the_marker(env, monkeypatch, at):
+    """A step-budget stop landing in the batch's Popen or before its pid is recorded leaves the batch
+    tracked (pid on the marker, in pushq._children) and its go given; the stop is re-armed for just after."""
+    from ttp import push, pushq, stepclock
+    s = _pq(env, monkeypatch, push_batch_s=10 ** 6, push_batch_max=5)
+    _pq_earlier(s)
+    row = _pq_review(s)[1]
+    monkeypatch.setattr(pushq, "batch_argv", lambda marker: [sys.executable, "-c", "import sys; sys.stdin.read()"])
+    armed = []
+    monkeypatch.setattr(stepclock, "_arm", armed.append)   # no real SIGALRM: the test places the stop
+    stepclock.install()
+    try:
+        if at == "spawn":
+            real_init = stepclock._orig["init"]
+
+            def init(self, args, *a, **k):
+                real_init(self, args, *a, **k)
+                if "sys.stdin.read()" in " ".join(map(str, args)):
+                    stepclock._on_alarm(signal.SIGALRM, None)
+            stepclock._orig["init"] = init
+        else:
+            _stop_now_at(monkeypatch, pushq, "renice")
+        stepclock.begin("push_queue", 600, 5)
+        try:
+            bid = pushq.start(s.p, s.p.db.q("SELECT * FROM push_queue WHERE id=?", (row,)), "origin/proj")
+            assert not stepclock._s.fired and armed and armed[-1] < 0.01, ("the stop is deferred to just after", armed)
+        finally:
+            stepclock.end()
+    finally:
+        stepclock.uninstall()
+    m = push._read(s.p.state / push.DETACHED / f"{bid}.json")
+    child = pushq._children.pop(bid)
+    assert m["pid"] == child.pid
+    assert child.wait(timeout=30) == 0, "its go was given"

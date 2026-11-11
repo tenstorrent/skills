@@ -31,6 +31,10 @@ SETTING = f"delivery.{KEY}"
 STATE = "gh-route.json"   # the route's last answer, host-wide, under the tt-project home
 WORKSTATION = "workstation"   # the value whose calls the user's workstation pulls (ghqueue)
 HELD_RC = 75             # a write held until the route is back: retry later
+# delivery.gh_route values that are no ssh alias: no gh login here is the expected state, so the
+# gh-auth condition is one quiet status line, never an alert (Daemon.check_gh_auth).
+MODES = {"workstation": "gh actions are pulled and run by the user's workstation",
+         "none": "this host is expected to have no gh login"}
 SSH_RC = 255             # ssh's own failure: the route is down
 API = "https://api.github.com"
 # The subcommands gh takes -R on: the routed call has no checkout to read the repo from.
@@ -56,14 +60,16 @@ def problem(v) -> str:
     from .remotecheck import HOST_RE
     if v in (None, ""):
         return ""
+    if isinstance(v, str) and v.strip() in MODES:
+        return ""
     if not isinstance(v, str) or not HOST_RE.fullmatch(v.strip()) or v.strip() == "local":
         return (f"{v!r}: {SETTING} is the ssh alias of a machine where gh is logged in, or "
                 f"\"{WORKSTATION}\" (the user's workstation pulls the calls: `ttp bridge gh-pull`)")
     return ""
 
 
-def route(cfg: dict | None = None, cwd: str | None = None) -> str:
-    """The project's delivery.gh_route ("" when unset), from `cfg` or the project at `cwd`."""
+def _value(cfg: dict | None = None, cwd: str | None = None) -> str:
+    """The project's valid delivery.gh_route ("" when unset), from `cfg` or the project at `cwd`."""
     if cfg is None:
         def find():
             from .project import here
@@ -75,6 +81,23 @@ def route(cfg: dict | None = None, cwd: str | None = None) -> str:
         cfg = _cached(("cfg", cwd or os.getcwd(), os.environ.get("TTP_PROJECT")), 60, find)
     v = ((cfg or {}).get("delivery") or {}).get(KEY)
     return v.strip() if isinstance(v, str) and not problem(v) else ""
+
+
+def route(cfg: dict | None = None, cwd: str | None = None) -> str:
+    """The ssh alias delivery.gh_route names ("" when unset or "none")."""
+    v = _value(cfg, cwd)
+    return "" if v in MODES and v != WORKSTATION else v
+
+
+def known(cfg: dict | None = None, cwd: str | None = None) -> str:
+    """The MODES value of delivery.gh_route ("" for none): no gh login here is expected."""
+    v = _value(cfg, cwd)
+    return v if v in MODES else ""
+
+
+def how(cfg: dict | None = None, cwd: str | None = None) -> str:
+    """'is down', 'is unset' or 'is <mode>': delivery.gh_route's state in a held or degraded line."""
+    return f"is {m}" if (m := known(cfg, cwd)) else "is down" if route(cfg, cwd) else "is unset"
 
 
 def local_ok() -> bool:
@@ -145,7 +168,7 @@ def held(args: list[str], cfg: dict | None = None, cwd: str | None = None) -> st
     """Why a write is held here (no login, and no route), or ""."""
     if not is_write(args) or local_ok():
         return ""
-    return (f"held: gh has no login on this host and {SETTING} " + ("is down" if route(cfg, cwd) else "is unset")
+    return (f"held: gh has no login on this host and {SETTING} " + how(cfg, cwd)
             + f"; `gh {' '.join(args[:2])}` was not sent. Retry once {SETTING} works (exit {HELD_RC}).")
 
 
@@ -291,6 +314,12 @@ def down_text(host: str, when: str, error: str, cfg: dict | None = None) -> str:
             f"ssh alias of a machine where gh is logged in. Pushes go over ssh with the forwarded agent.")
 
 
+def known_text(host: str, when: str, mode: str) -> str:
+    """The one status line while gh has no login here as expected (a MODES value is set)."""
+    return (f"gh has no login on {host} (since {when}), as expected: {SETTING} is {mode} "
+            f"({MODES.get(mode, mode)}). No alert is raised for it.")
+
+
 # --- pushes ---------------------------------------------------------------------------------
 
 def _https_login(repo: str | None) -> bool:
@@ -311,7 +340,7 @@ def _https_login(repo: str | None) -> bool:
 
 
 def value_of(v) -> str:
-    """A `delivery.gh_route` value: an ssh alias, "workstation", or "" for none."""
+    """A `delivery.gh_route` value: an ssh alias, a MODES value, or "" for none."""
     v = "" if v is None else str(v).strip()
     if v and (why := problem(v)):
         raise ValueError(why)

@@ -146,7 +146,11 @@
   naming the step, its overrun count and its slowest call, once per incident.
   Set it with `ttp config <project> watchdog.step_budget_s <seconds>`. Reaping a coordinator run is
   never stopped by this budget: its answer is applied whole in one go, however long that takes.
-- Daemon not running → its service restarts it. Hung (alive, but its heartbeat untouched for
+- Daemon not running → its service restarts it. On macOS launchd's KeepAlive does that only while the
+  agent is loaded, so the watchdog (a Standard agent) bootstraps an unloaded one from its plist. A
+  restart there reloads the agent through launchd, waiting for `launchctl bootout` to unload it before
+  the bootstrap, and never starts the daemon by hand outside launchd: a failure is reported with
+  launchctl's own words and logged to `logs/daemon.out`. Hung (alive, but its heartbeat untouched for
   `watchdog.hang_s`, 900 s by default, never below 600; 600 s once the daemon itself reported a stall in
   a named tick step, `state/tick-stall.json`) → `ttp.watchdog`, run every 5 min (a systemd
   user timer, a launchd agent or the crontab entry), sends it SIGUSR1, saves its thread stacks under

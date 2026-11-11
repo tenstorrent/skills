@@ -2,6 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """A code task's run never pushes to the push branch while delivery.code_tasks_may_push is off.
 
+With it "approved" (the default) a code task's or the coordinator's `ttp push` of a head an
+independent review approved goes through (approved_push: the `ttp push` process above this git
+wrote an approval marker for exactly the commit pushed, and the push queue holds it approved); any
+other push from them, a raw `git push` included, is refused as below.
+
 The harness's `bin/git` comes first on every run's PATH. Inside a run it hands any call naming
 `push` to main() here; every other call goes straight to the real git. `ttp push` refuses the same
 landing (push.code_run_landing); this covers a raw `git push` a worker runs because its spec says
@@ -16,8 +21,10 @@ own: a push that would send a stored secret, a credential shape or a forbidden-d
 commit message, an added line or a tag message, is refused (outscan.py). A fault setting the scan up
 refuses the push; a fault reading the push branch guard's project skips only that guard.
 In a run whose task reads untrusted input (untrusted.active) the same hook refuses every ref but the
-task's own branch and the push branch (untrusted.push_refs, passed as TTP_PUSH_ONLY_REFS); a fault
-reading them there refuses the push. One more push passes that hook there: one to a local repository
+task's own branch, the push branch and its recorded pr_branch at a reviewed head (`ref@sha`:
+untrusted.push_refs, passed as TTP_PUSH_ONLY_REFS; a remote ref with an `@` matches only that
+form, never an entry by name); a fault reading them there refuses the push.
+One more push passes that hook there: one to a local repository
 under the run's own temp folders (temp_remote), such as a bare repo a test made for itself; never a
 network remote, a path elsewhere or the project's own repository.
 
@@ -60,7 +67,7 @@ if [ -n "$TTP_PUSH_GUARD_REF" ] &&
     exit 1
 fi
 if [ -n "$TTP_PUSH_ONLY_REFS" ] &&
-    printf '%s' "$input${input:+$nl}" | awk -v r=" $TTP_PUSH_ONLY_REFS " 'NF >= 3 && index(r, " " $3 " ") == 0 { f = 1 } END { exit !f }' &&
+    printf '%s' "$input${input:+$nl}" | awk -v r=" $TTP_PUSH_ONLY_REFS " 'NF >= 3 && (index($3, "@") > 0 || index(r, " " $3 " ") == 0) && index(r, " " $3 "@" $2 " ") == 0 { f = 1 } END { exit !f }' &&
     ! { [ -n "$TTP_PUSH_ONLY_RT" ] && "$TTP_PUSH_SCAN_PY" -I -c \\
         'import sys; sys.path.insert(0, sys.argv[1]); from ttp.gitguard import temp_remote; sys.exit(not temp_remote(sys.argv[2]))' \\
         "$TTP_PUSH_ONLY_RT" "$2" 2>/dev/null; }; then
@@ -198,8 +205,62 @@ def never_force_refusal(args: list[str], env: dict, git: str = "git") -> str:
             f"or deliver a rewritten history on a new branch.{hint}")
 
 
-def guarded_branch(env: dict) -> tuple[str, str]:
-    """(push branch, why) when this run must not push to the push branch, else ("", "")."""
+def _ancestors(limit: int = 32) -> list[int]:
+    """This process's parent, grandparent and so on (Linux /proc, else ps)."""
+    out, pid = [], os.getpid()
+    for _ in range(limit):
+        try:
+            stat = Path(f"/proc/{pid}/stat").read_text()
+            pid = int(stat.rsplit(")", 1)[1].split()[1])
+        except (OSError, ValueError, IndexError):
+            r = subprocess.run(["ps", "-o", "ppid=", "-p", str(pid)], capture_output=True, text=True, timeout=10)
+            pid = int(r.stdout.strip() or 0)
+        if pid <= 1:
+            break
+        out.append(pid)
+    return out
+
+
+def approved_push(env: dict, real: str = "git", args: list[str] | None = None) -> bool:
+    """Whether this `git push <args>` is the push a `ttp push` makes of a head an independent review
+    approved: an ancestor process of this one wrote a fresh approval marker (push.approved_landing),
+    the push queue still has that head approved, and every refspec sends exactly that commit to the
+    push branch. No environment variable counts, so a raw `git push` is never one."""
+    from . import push
+    from .project import Project, approved_heads_may_push
+    base = env.get("TTP_PROJECT", "")
+    globals_, sub, rest = split(args or [])
+    if not base or sub != "push":
+        return False
+    p = Project(base)
+    if not (p.state / "project.db").is_file() or not approved_heads_may_push(p.config()):
+        return False
+    mark = next((m for pid in _ancestors() if (m := push.approval_marker(p, pid))), None)
+    if not mark or not mark.get("branch") or push.approved_head(p, mark["sha"]) is None:
+        return False
+    branch = _branch_name(real, globals_, mark["branch"])
+    words = [a for a in rest if a not in ("--verify", "--porcelain", "--quiet", "-q", "--progress", "--no-progress")]
+    if any(a.startswith("-") for a in words):   # --all, --mirror, --tags, --delete, --force, -o ...
+        return False
+    specs = words[1:]
+    if not specs:
+        return False
+    for spec in specs:
+        src, colon, dst = spec.partition(":")
+        if src.startswith("+") or not src or not colon:
+            return False
+        r = subprocess.run([real, *globals_, "rev-parse", "--verify", "--quiet", f"{src}^{{commit}}"],
+                           capture_output=True, text=True, timeout=30)
+        if r.returncode != 0 or r.stdout.strip().lower() != str(mark["sha"]).lower():
+            return False
+        if dst.removeprefix("refs/heads/") != branch:
+            return False
+    return True
+
+
+def guarded_branch(env: dict, approved: bool = False) -> tuple[str, str]:
+    """(push branch, why) when this run must not push to the push branch, else ("", ""). `approved`:
+    the push is one approved_push passed."""
     task, base = env.get("TTP_TASK", ""), env.get("TTP_PROJECT", "")
     if not task.isdigit() or not base:
         return "", ""
@@ -209,7 +270,7 @@ def guarded_branch(env: dict) -> tuple[str, str]:
         return "", ""
     cfg = p.config()
     branch = str((cfg.get("delivery") or {}).get("push_branch") or "").strip()
-    if not branch or code_tasks_may_push(cfg):
+    if not branch or code_tasks_may_push(cfg) or approved:
         return "", ""
     t = p.db.task(int(task))
     if not t or t.get("kind") != "code":
@@ -330,7 +391,7 @@ def command(real: str, args: list[str], env: dict) -> tuple[list[str], dict]:
         return [real, *args], env
     scan = bool(env.get("TTP_TASK"))
     try:
-        branch, why = guarded_branch(env)
+        branch, why = guarded_branch(env, approved_push(env, real, args))
         branch = branch and _branch_name(real, globals_, branch)
     except Exception:   # a fault reading the project skips this guard; push.code_run_landing still holds
         branch, why = "", ""
@@ -376,9 +437,10 @@ def main(argv: list[str]) -> int:
               file=sys.stderr)
         return 1
     if split(resolved)[1] == "push" or bypass_refusal(resolved, shell):
-        try:   # a coordinator run pushes nothing, however the command was built (coordtools.py)
+        try:   # a coordinator run pushes only an approved head through `ttp push` (coordtools.py)
             from . import coordtools
-            coord = coordtools.coordinator_run()
+            coord = coordtools.coordinator_run() and not (split(resolved)[1] == "push"
+                                                          and approved_push(dict(os.environ), real, resolved))
         except Exception:
             print("tt-project: the coordinator push check failed: no push", file=sys.stderr)
             return 1

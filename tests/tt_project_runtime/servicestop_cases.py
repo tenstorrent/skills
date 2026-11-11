@@ -305,21 +305,84 @@ def test_a_new_daemons_first_tick_ends_a_deferred_restart(env):
 
 
 
-def _launchd_calls(monkeypatch):
-    """service and tunnel on macOS with nothing run; returns the launchctl calls."""
+class _FakeLaunchd:
+    """launchctl as launchd answers it, with nothing run: `print` exits 0 for a loaded job and 113 for
+    none; `bootstrap` of a loaded job fails (5, as launchd's "Input/output error"); `bootout` unloads
+    the job only after `linger` more `print`s (launchd still ending its processes), or never (None).
+    `refuse` > 0: that many bootstraps fail with the job left unloaded. Records every call but `print`
+    in `calls`; `clock` is the fake time service sleeps on."""
+
+    def __init__(self, loaded=(), linger=0, refuse=0):
+        self.loaded, self.linger, self.refuse = set(loaded), linger, refuse
+        self.ending: dict[str, int | None] = {}
+        self.calls, self.prints, self.clock = [], 0, [1000.0]
+
+    def __call__(self, *a):
+        ok = lambda rc=0, err="": subprocess.CompletedProcess(a, rc, "", err)
+        if a[0] != "launchctl":
+            return ok()
+        if a[1] != "print":
+            self.calls.append(a)
+        if a[1] == "print":
+            self.prints += 1
+            t = a[2]
+            if t in self.ending:
+                left = self.ending[t]
+                if left is not None and left <= 0:
+                    del self.ending[t]
+                    self.loaded.discard(t)
+                elif left is not None:
+                    self.ending[t] = left - 1
+            return ok(0 if t in self.loaded else 113, "" if t in self.loaded else "Could not find service")
+        if a[1] == "bootout":
+            if a[2] not in self.loaded:
+                return ok(3, "Boot-out failed: 3: No such process")
+            if self.linger == 0:
+                self.loaded.discard(a[2])
+            else:
+                self.ending[a[2]] = self.linger
+            return ok()
+        if a[1] == "bootstrap":
+            import plistlib
+            t = f"{a[2]}/{plistlib.loads(pathlib.Path(a[3]).read_bytes())['Label']}"
+            if t in self.loaded:
+                return ok(5, "Bootstrap failed: 5: Input/output error")
+            if self.refuse:
+                self.refuse -= 1
+                return ok(5, "Bootstrap failed: 5: Input/output error")
+            self.loaded.add(t)
+            return ok()
+        if a[1] == "kickstart":
+            return ok(0 if a[-1] in self.loaded else 113, "" if a[-1] in self.loaded else "Could not find service")
+        return ok()
+
+    def sleep(self, s):
+        self.clock[0] += s
+
+
+def _launchd_calls(monkeypatch, fake=None):
+    """service and tunnel on macOS with nothing run and a fake clock; returns the launchctl calls
+    (but `print`) of `fake` (default: a launchd with nothing loaded)."""
     from ttp import service, tunnel
-    calls = []
-    run = lambda *a: (a[0] == "launchctl" and calls.append(a)) or subprocess.CompletedProcess(a, 0, "", "")
-    monkeypatch.setattr(service, "_run", run)
-    monkeypatch.setattr(tunnel, "_run", run)
+    fake = fake or _FakeLaunchd()
+    monkeypatch.setattr(service, "_run", fake)
+    monkeypatch.setattr(tunnel, "_run", fake)
+    monkeypatch.setattr(service, "time", types.SimpleNamespace(time=lambda: fake.clock[0], sleep=fake.sleep))
     monkeypatch.setattr(service.sys, "platform", "darwin")
-    return calls
+    return fake.calls
 
 
-def test_the_daemon_plist_runs_standard_and_the_watchdog_and_tunnels_stay_background(env, monkeypatch):
+def _targets(p):
+    from ttp import service
+    uid = os.getuid()
+    return tuple(f"gui/{uid}/{service.launchd_label(p, wd)}" for wd in (False, True))
+
+
+def test_the_daemon_and_watchdog_plists_run_standard_and_tunnels_stay_background(env, monkeypatch):
     """ProcessType Background puts the daemon and every child (workers, git, pytest) on efficiency cores
     with throttled I/O: the daemon is Standard (its workers and checks stay niced) and keeps
-    AbandonProcessGroup; the watchdog and kept tunnels stay Background (owner's agent msg #169)."""
+    AbandonProcessGroup. The watchdog is Standard too: on a loaded host a Background one is starved past
+    the hang it should end. Kept tunnels stay Background."""
     import plistlib
     from ttp import service, tunnel
     p = make(env)
@@ -328,7 +391,7 @@ def test_the_daemon_plist_runs_standard_and_the_watchdog_and_tunnels_stay_backgr
     assert service._install_launchd(p).endswith(" with a watchdog"), calls
     daemon, watchdog = (plistlib.loads(service._agent(p, wd).read_bytes()) for wd in (False, True))
     assert daemon["ProcessType"] == "Standard" and daemon["AbandonProcessGroup"] is True, daemon
-    assert watchdog["ProcessType"] == "Background", watchdog
+    assert watchdog["ProcessType"] == "Standard", watchdog
     assert tunnel.launchd_plist("host-a", ["ssh", "host-a"])["ProcessType"] == "Background"
 
 
@@ -337,14 +400,14 @@ def test_the_daemon_plist_runs_standard_and_the_watchdog_and_tunnels_stay_backgr
 def test_an_upgrade_over_an_old_daemon_plist_rewrites_it_standard_and_reloads_it(env, monkeypatch, old):
     """`ttp upgrade` restarts through restart_service: a daemon plist an older tt-project installed
     (Background, or without AbandonProcessGroup) gets DAEMON_KEYS, keeps its other keys, and is
-    reloaded by bootout and bootstrap (kickstart keeps the loaded job). The watchdog's stays; a second
-    restart only kickstarts."""
+    reloaded by bootout and bootstrap (kickstart keeps the loaded job). An older Background watchdog
+    gets WATCHDOG_KEYS and its own reload; a second restart only kickstarts."""
     import plistlib
     from ttp import service
     p = make(env)
     monkeypatch.setenv("HOME", str(env["tmp"] / "userhome"))
     monkeypatch.delenv("XPC_SERVICE_NAME", raising=False)
-    calls = _launchd_calls(monkeypatch)
+    calls = _launchd_calls(monkeypatch, _FakeLaunchd(loaded=_targets(p)))
     for wd in (False, True):
         f = service._agent(p, wd)
         f.parent.mkdir(parents=True, exist_ok=True)
@@ -354,9 +417,14 @@ def test_an_upgrade_over_an_old_daemon_plist_rewrites_it_standard_and_reloads_it
     assert service.restart_service(p) == "restarted"
     job = plistlib.loads(service._agent(p).read_bytes())
     assert job == {"Label": label, "Extra": "kept", "ProcessType": "Standard", "AbandonProcessGroup": True}, job
-    assert plistlib.loads(service._agent(p, True).read_bytes())["ProcessType"] == "Background"
-    assert calls == [("launchctl", "bootout", f"gui/{uid}/{label}"),
-                     ("launchctl", "bootstrap", f"gui/{uid}", str(service._agent(p)))], calls
+    assert plistlib.loads(service._agent(p, True).read_bytes())["ProcessType"] == "Standard"
+    wd_target = _targets(p)[1]
+    reload_wd = [("launchctl", "bootout", wd_target),
+                 ("launchctl", "bootstrap", f"gui/{uid}", str(service._agent(p, True)))]
+    assert calls == reload_wd + ([("launchctl", "bootout", f"gui/{uid}/{label}"),
+                                  ("launchctl", "bootstrap", f"gui/{uid}", str(service._agent(p)))]
+                                 if old != {"ProcessType": "Standard", "AbandonProcessGroup": True} else
+                                 [("launchctl", "kickstart", "-k", f"gui/{uid}/{label}")]), calls
     calls.clear()
     assert service.restart_service(p) == "restarted"
     assert calls == [("launchctl", "kickstart", "-k", f"gui/{uid}/{label}")], calls
@@ -364,13 +432,14 @@ def test_an_upgrade_over_an_old_daemon_plist_rewrites_it_standard_and_reloads_it
 
 def test_the_daemon_reloading_its_own_rewritten_plist_does_it_from_a_new_session(env, monkeypatch):
     """The daemon (or a worker under it) restarting itself: bootout would end the caller before its
-    bootstrap, so both run in a new session. From the watchdog's job they run in the foreground, and a
-    bootstrap refused falls back to a hand start."""
+    bootstrap, so both run in a new session, which waits for the unload and retries the bootstrap. From the
+    watchdog's job they run in the foreground; a bootstrap refused is reported, never a hand start, and the
+    watchdog never rewrites or boots out its own job."""
     import plistlib
     from ttp import service
     p = make(env)
     monkeypatch.setenv("HOME", str(env["tmp"] / "userhome"))
-    calls = _launchd_calls(monkeypatch)
+    calls = _launchd_calls(monkeypatch, _FakeLaunchd(loaded=_targets(p)))
     spawned, popen = [], []
     monkeypatch.setattr(service, "_spawn", lambda p: spawned.append(p))
     monkeypatch.setattr(service.subprocess, "Popen", lambda argv, **kw: popen.append((argv, kw)))
@@ -383,20 +452,31 @@ def test_the_daemon_reloading_its_own_rewritten_plist_does_it_from_a_new_session
     old()
     service._agent(p, watchdog=True).write_bytes(plistlib.dumps({"Label": "w", "ProcessType": "Background"}))
     monkeypatch.setenv("XPC_SERVICE_NAME", label)
-    assert service.restart_service(p) == "restarted" and not calls and not spawned
+    assert service.restart_service(p) == "restarted" and not spawned
     (argv, kw), = popen
     assert argv[:2] == ["sh", "-c"] and kw["start_new_session"], popen
-    assert f"launchctl bootout gui/{os.getuid()}/{label};" in argv[2] and str(service._agent(p)) in argv[2]
+    target = f"gui/{os.getuid()}/{label}"
+    assert argv[2].startswith(f"launchctl bootout {target} ") and str(service._agent(p)) in argv[2]
+    assert argv[2].index(f"while launchctl print {target} ") < argv[2].index("launchctl bootstrap"), argv[2]
+    # The watchdog plist was rewritten and reloaded from the daemon (not its own job): calls are its reload.
+    assert [c[1] for c in calls] == ["bootout", "bootstrap"] and calls[0][2] == _targets(p)[1], calls
     old()
+    service._agent(p, watchdog=True).write_bytes(plistlib.dumps({"Label": "w", "ProcessType": "Background"}))
     popen.clear()
+    calls.clear()
     monkeypatch.setenv("XPC_SERVICE_NAME", service.launchd_label(p, watchdog=True))
-    monkeypatch.setattr(service, "_run", lambda *a: (a[0] == "launchctl" and calls.append(a)) or subprocess.CompletedProcess(
-        a, 5 if a[1:2] == ("bootstrap",) else 0, "", "refused"))
-    assert service.restart_service(p) == "restarted" and spawned == [p] and not popen
-    # The refused reload is followed by the not-loaded fallback's own bootstrap; refused again, a hand start.
-    assert [c[1] for c in calls] == ["bootout", "bootstrap", "bootstrap"] and calls[0][2].endswith(f"/{label}"), calls
-    assert "launchctl bootstrap and kickstart failed" in (p.logs / "daemon.out").read_text()
+    fake = _FakeLaunchd(loaded=_targets(p), refuse=99)
+    _launchd_calls(monkeypatch, fake)
+    said = service.restart_service(p)
+    assert said != "restarted" and "Bootstrap failed: 5" in said, said
+    assert not spawned and not popen, "a refused bootstrap started the daemon by hand"
+    # Its reload's bootstrap tried BOOTSTRAP_TRIES times, then the not-loaded fallback's as often.
+    assert [c[1] for c in fake.calls] == ["bootout"] + ["bootstrap"] * (2 * service.BOOTSTRAP_TRIES), fake.calls
+    assert fake.calls[0][2] == target, "the watchdog booted out its own job"
+    assert "not started by hand" in (p.logs / "daemon.out").read_text()
     assert plistlib.loads(service._agent(p).read_bytes())["ProcessType"] == "Standard"
+    assert plistlib.loads(service._agent(p, True).read_bytes())["ProcessType"] == "Background", \
+        "the watchdog rewrote its own plist from inside its job"
 
 
 @pytest.mark.parametrize("pris, plist_type, want, cleared", [
@@ -541,24 +621,14 @@ def test_a_restart_of_a_not_loaded_agent_bootstraps_its_plist_and_never_starts_t
     assert popen == [], "the daemon was started by hand from the caller"
 
 
-def test_a_restart_without_a_plist_starts_the_daemon_by_hand_and_logs_its_inherited_priority(env, monkeypatch):
+def test_a_restart_without_a_plist_starts_the_daemon_module_by_hand_as_cron_does(env, monkeypatch):
+    """With no launchd agent installed a restart starts the daemon by hand, as cron's lines do, and logs
+    why; both start the daemon module, whose start reports the priority it runs at."""
     from ttp import service
     p, popen = _darwin_agent(env, monkeypatch, plist=False)
     monkeypatch.setattr(service, "_run", lambda *a: pytest.fail(f"launchctl without a plist: {a}"))
     assert service.restart_service(p) == "restarted"
-    assert len(popen) == 1
     assert "no launchd agent is installed" in (p.logs / "daemon.out").read_text()
-
-
-def test_every_restart_route_outside_launchd_starts_the_daemon_module(env, monkeypatch):
-    """When launchd refuses the agent (bootstrap fails) the daemon is still started by hand, as cron's
-    lines do, with the reason and its inherited priority logged; both start the daemon module, whose start
-    reports the priority it runs at."""
-    from ttp import service
-    p, popen = _darwin_agent(env, monkeypatch)
-    monkeypatch.setattr(service, "_run", lambda *a: subprocess.CompletedProcess(a, 3, "", "not loaded"))
-    assert service.restart_service(p) == "restarted"
-    assert "launchctl bootstrap and kickstart failed" in (p.logs / "daemon.out").read_text()
     (argv,), daemon = popen, " ".join(shlex.quote(a) for a in service.daemon_argv(p))
     assert argv[:2] == ["sh", "-c"] and daemon in argv[2], argv
     assert service.daemon_argv(p)[1:3] == ["-m", "ttp.daemon"]
@@ -566,15 +636,16 @@ def test_every_restart_route_outside_launchd_starts_the_daemon_module(env, monke
 
 
 def test_a_hand_started_daemon_never_inherits_its_starters_run_env(env, monkeypatch):
-    """A restart or upgrade run from another project's worker or coordinator shell starts this project's
-    daemon by hand (no service): it must not inherit that run's TTP_ variables (role, run id, project)
-    or its agent's per-command env file, as a service or cron start would not. An inherited
-    CLAUDE_ENV_FILE naming the starter's loopproxy.sh broke every Bash call of the new daemon's workers."""
+    """A restart or upgrade run from a worker or coordinator shell starts the project's daemon by hand
+    (no service): it must not inherit that run's TTP_ variables (role, run id, project) or its agent's
+    per-command env file, as a service or cron start would not. An inherited CLAUDE_ENV_FILE naming the
+    starter's loopproxy.sh broke every Bash call of the new daemon's workers. The run is the project's
+    own: a run of another project is refused before any start (test_a_run_of_another_project_*)."""
     from ttp import hoststate, service
     p = make(env)
     popen = []
     monkeypatch.setattr(service.subprocess, "Popen", lambda argv, **kw: popen.append((argv, kw)))
-    leaked = {"TTP_ROLE": "reviewer", "TTP_RUN_ID": "16596", "TTP_PROJECT": "/other/tt-project",
+    leaked = {"TTP_ROLE": "reviewer", "TTP_RUN_ID": "16596", "TTP_PROJECT": str(p.base),
               "TTP_RUN_DIR": "/other/run", "CLAUDE_ENV_FILE": "/other/ttp/loopproxy.sh",
               "TTP_PREV_CLAUDE_ENV_FILE": "/other/ttp/loopproxy.sh", "CLAUDECODE": "1",
               "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1"}
@@ -700,3 +771,143 @@ def test_a_project_stopped_on_purpose_is_left_out_of_deploys_rollout_counts_and_
     assert not any("beta" in k for k in pages) and not deploy.holds_behind(p.db, "beta", now + 10 * deploy.GRACE_S)
     named = overview.deployed(names=["beta"])
     assert [r["name"] for r in named["projects"]] == ["beta"], "named on purpose: still checked"
+
+
+def test_a_restart_launchd_refuses_is_reported_and_never_starts_the_daemon_by_hand(env, monkeypatch):
+    """A hand start runs outside launchd at its starter's priority (nice 19 under a niced caller) with no
+    KeepAlive: when launchd refuses the agent the restart fails with launchctl's own words, logged, and
+    `ttp restart` reports it."""
+    from ttp import service
+    p, popen = _darwin_agent(env, monkeypatch)
+    fake = _FakeLaunchd(refuse=99)
+    _launchd_calls(monkeypatch, fake)
+    said = service.restart_service(p)
+    assert said != "restarted" and "Bootstrap failed: 5: Input/output error" in said, said
+    assert popen == [], "the daemon was started by hand"
+    log = (p.logs / "daemon.out").read_text()
+    assert "restart failed, the daemon was not started by hand" in log and "Input/output error" in log, log
+
+
+def test_a_reload_waits_for_the_bootout_to_unload_the_job_before_its_bootstrap(env, monkeypatch):
+    """`launchctl bootout` returns while launchd still ends the job's processes: a bootstrap at once fails
+    ("Input/output error") and leaves the agent unloaded. The reload polls `launchctl print` until the
+    label is gone, then bootstraps once."""
+    from ttp import service
+    p, popen = _darwin_agent(env, monkeypatch)
+    daemon_t = _targets(p)[0]
+    fake = _FakeLaunchd(loaded={daemon_t}, linger=4)
+    calls = _launchd_calls(monkeypatch, fake)
+    r = service._reload(service.launchd_label(p), service._agent(p))
+    assert r.returncode == 0, r
+    assert [c[1] for c in calls] == ["bootout", "bootstrap"], calls
+    assert daemon_t in fake.loaded and fake.prints >= 5 and not popen
+
+
+def test_a_reload_whose_job_never_unloads_gives_up_within_its_bound_and_says_so(env, monkeypatch):
+    from ttp import service
+    p, _ = _darwin_agent(env, monkeypatch)
+    fake = _FakeLaunchd(loaded={_targets(p)[0]}, linger=None)
+    calls = _launchd_calls(monkeypatch, fake)
+    r = service._reload(service.launchd_label(p), service._agent(p))
+    assert r.returncode != 0 and f"still loaded {service.UNLOAD_WAIT_S}s" in r.stderr, r
+    assert [c[1] for c in calls] == ["bootout"], "it bootstrapped a job still loaded"
+    assert service.UNLOAD_WAIT_S <= fake.clock[0] - 1000 <= service.UNLOAD_WAIT_S + 1, fake.clock
+
+
+def test_a_bootstrap_is_retried_and_a_job_already_loaded_counts_as_loaded(env, monkeypatch):
+    from ttp import service
+    p, _ = _darwin_agent(env, monkeypatch)
+    label, plist = service.launchd_label(p), service._agent(p)
+    fake = _FakeLaunchd(refuse=service.BOOTSTRAP_TRIES - 1)
+    _launchd_calls(monkeypatch, fake)
+    assert service.bootstrap(label, plist).returncode == 0
+    assert [c[1] for c in fake.calls] == ["bootstrap"] * service.BOOTSTRAP_TRIES, fake.calls
+    fake = _FakeLaunchd(loaded={_targets(p)[0]})   # KeepAlive or another restart loaded it first
+    _launchd_calls(monkeypatch, fake)
+    assert service.bootstrap(label, plist).returncode == 0
+    assert [c[1] for c in fake.calls] == ["bootstrap"], fake.calls
+
+
+def test_an_install_over_a_job_still_ending_waits_and_loads_both_agents(env, monkeypatch):
+    from ttp import service
+    p = make(env)
+    monkeypatch.setenv("HOME", str(env["tmp"] / "userhome"))
+    monkeypatch.delenv("XPC_SERVICE_NAME", raising=False)
+    fake = _FakeLaunchd(loaded=_targets(p), linger=3)
+    _launchd_calls(monkeypatch, fake)
+    said = service._install_launchd(p)
+    assert said.endswith(" with a watchdog") and "failed" not in said, said
+    assert fake.loaded == set(_targets(p))
+
+
+def test_the_watchdog_never_reinstalls_its_own_job_from_inside_it(env, monkeypatch):
+    import plistlib
+    from ttp import service
+    p = make(env)
+    monkeypatch.setenv("HOME", str(env["tmp"] / "userhome"))
+    calls = _launchd_calls(monkeypatch, _FakeLaunchd(loaded=_targets(p)))
+    monkeypatch.setenv("XPC_SERVICE_NAME", service.launchd_label(p, watchdog=True))
+    assert "this runs inside it" in service._install_launchd_watchdog(p)
+    assert calls == [] and not service._agent(p, watchdog=True).exists()
+
+
+def test_the_watchdog_bootstraps_an_unloaded_agent_after_ending_a_hung_daemon(env, monkeypatch):
+    """KeepAlive restarts a daemon only while its agent is loaded: after a bootout whose bootstrap failed
+    the watchdog's restart (and its look when no daemon runs) bootstraps the agent from its plist."""
+    from ttp import service, watchdog
+    p, popen = _darwin_agent(env, monkeypatch)
+    fake = _FakeLaunchd()   # the agent is not loaded
+    _launchd_calls(monkeypatch, fake)
+    monkeypatch.setattr(service, "installed", lambda p: {"kind": "launchd"})
+    monkeypatch.setattr(watchdog, "_end", lambda pid, grace: True)
+    ok, how = watchdog._restart(p, 424242, 0)
+    assert ok and "bootstrapped its unloaded launchd agent" in how, how
+    assert _targets(p)[0] in fake.loaded and not popen
+    ok, how = watchdog._restart(p, 424242, 0)   # loaded: KeepAlive does it, nothing run
+    assert ok and "its launchd service starts a new daemon" in how and [c[1] for c in fake.calls] == ["bootstrap"]
+    fake.loaded.clear()
+    fake.refuse = 99
+    ok, how = watchdog._restart(p, 424242, 0)
+    assert not ok and "not loaded" in how and "Input/output error" in how, how
+    fake.refuse, fake.calls[:] = 0, []
+    monkeypatch.setattr(watchdog, "check", lambda p: "not running")
+    monkeypatch.setattr(service, "check_deferred", lambda p, budget_s: None)
+    monkeypatch.setattr(watchdog.sys, "argv", ["watchdog", str(p.base)])
+    assert watchdog.main() == 0
+    assert [c[1] for c in fake.calls] == ["bootstrap"] and _targets(p)[0] in fake.loaded, fake.calls
+
+
+def test_a_reload_from_inside_its_job_waits_for_the_unload_and_retries_its_bootstrap(env, monkeypatch, tmp_path):
+    """The reload a daemon runs on itself goes to a shell in a new session: run that script against a
+    fake launchctl on PATH whose bootout lingers, then one that always refuses."""
+    from ttp import service
+    p = make(env)
+    p.logs.mkdir(parents=True, exist_ok=True)
+    bin_, st = tmp_path / "bin", tmp_path / "state"
+    bin_.mkdir()
+    st.mkdir()
+    (bin_ / "launchctl").write_text(f"""#!/bin/sh
+s={shlex.quote(str(st))}
+echo "$1" >> "$s/log"
+case "$1" in
+print) if [ -f "$s/linger" ]; then n=$(cat "$s/linger"); if [ "$n" -gt 0 ]; then echo $((n-1)) > "$s/linger"; exit 0; fi
+         rm -f "$s/linger" "$s/loaded"; fi; [ -f "$s/loaded" ] && exit 0; exit 113;;
+bootout) echo 2 > "$s/linger"; exit 0;;
+bootstrap) if [ -f "$s/refuse" ] || [ -f "$s/loaded" ] || [ -f "$s/linger" ]; then
+             echo "Bootstrap failed: 5: Input/output error" >&2; exit 5; fi; touch "$s/loaded"; exit 0;;
+esac
+""")
+    (bin_ / "launchctl").chmod(0o755)
+    environ = {**os.environ, "PATH": f"{bin_}:{os.environ['PATH']}"}
+    (st / "loaded").touch()
+    script = service._reload_script("gui/501/x", "gui/501", service._agent(p), p.logs / "daemon.out")
+    assert subprocess.run(["sh", "-c", script], env=environ, timeout=30).returncode == 0
+    assert (st / "log").read_text().split() == ["bootout", "print", "print", "print", "bootstrap"]
+    assert (st / "loaded").exists()
+    (st / "refuse").touch()
+    (st / "log").unlink()
+    monkeypatch.setattr(service, "BOOTSTRAP_TRIES", 2)
+    script = service._reload_script("gui/501/x", "gui/501", service._agent(p), p.logs / "daemon.out")
+    assert subprocess.run(["sh", "-c", script], env=environ, timeout=30).returncode == 1
+    assert (st / "log").read_text().split().count("bootstrap") == 2
+    assert "reload of gui/501/x failed: launchctl bootstrap: Bootstrap failed: 5" in (p.logs / "daemon.out").read_text()

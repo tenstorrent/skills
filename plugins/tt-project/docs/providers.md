@@ -45,6 +45,7 @@ follow below.
 | Plan windows | reference: five-hour and seven-day windows from the CLI's events | **same**: from its rollout (`windows_so_far`) and the meter | **differs**: the CLI reports none; `providers.cursor.billing` decides | **differs**: none; `providers.chat.billing` decides |
 | Auth breaker and login check | reference: an auth failure requeues free, the breaker stops new runs, a model-free login check reopens them | **same** | **same**: `agent status` text read too | **same**: the saved endpoint key's stamp |
 | Tiers and effort | reference: `sonnet`/`opus` with low, high, max effort | **same**: the default model with low, high, xhigh effort | **missing**: every tier `auto`, no effort flag (#6552) | **same**: `providers.chat` tiers and the endpoint's effort fields |
+| Short path landing (`ttp express`, express.py: one urgent reviewed head lands alone, narrowed smoke, full checks after) | reference: model-free, in the push queue | **same** | **same** | **same** |
 | Routing (model pick, escalation, tier floor) | reference: `route.py`, `tierfloor.py`, no provider branch | **same** | **same** | **same** |
 | Run classes (`runclass.py`: one class per run; with a chat model set, wake, status and report, rebase, small-review and light runs go to `chat` by class, the coordinator and hard runs stay on core; with no tt model serving one, its standard-tier Claude run takes `route.core_cheap`'s model (Haiku or Sonnet, low effort; a tier-floor run such as a question or small review at the floor's effort, high by default, but a worker wake of a code task at low; an urgent task's run takes the same route) and goes back to the tt model once its endpoint answers; `route.classes` overrides; `ttp stats --by-class`) | reference: classes read the task and run note, no provider branch | **same** | **same** | **same** |
 | Babysitting decisions (`providers.chat.babysit`, `babysit.py`: yes/no wake questions such as the wait gate; score and choice questions stay with Jev) | reference: the daemon's decider, provider-independent: with a chat endpoint configured the cheap served model answers first, decision only (`wake <coordinator|id> <tier>`, `skip [<minutes>m]`, `flag <reason>`), no tools; the wait gate and the spec-change wake tier act on the verb itself (skip re-defers, wake runs at the named tier, flag wakes with the reason). Candidates: `babysit.model`, `babysit.fallback_models`, then the light and standard tier models; a 404 model is skipped for an hour. An unparsed answer, an error or a cool-down falls back to Jev, then the model-free path (a wake), each with a daemon.log line naming the model and a `babysit_fallback:<purpose>` ledger row; `ttp stats <project> --babysit` shows settled decisions and fallbacks per hour | **same** | **same** | **same** |
@@ -164,8 +165,10 @@ $0.21). Cursor agent: installed, not measured (no login on the test machine). On
 passed again for Claude Code with workers in the write fence (38 s, $0.12).
 
 - Any provider: a code task's raw `git push` to the push branch is refused by the harness's
-  pre-push hook (`runtime/ttp/gitguard.py`) while `delivery.code_tasks_may_push` is off, and
-  `ttp push` refuses the same landing. Before that guard, on 2026-10-21, a Claude Code worker whose
+  pre-push hook (`runtime/ttp/gitguard.py`) unless `delivery.code_tasks_may_push` is true, and
+  `ttp push` refuses the same landing. Under the default `"approved"`, a code task's or the
+  coordinator's `ttp push` lands a head an independent review approved (an approved push queue row
+  at that commit), with the push checks, and refuses any other head. Before that guard, on 2026-10-21, a Claude Code worker whose
   task said to land its change pushed it straight to the remote; `ttp doctor --loop` still fails
   such a landing.
 - A code task's plain `needs_review` hand-off gets its review from the daemon's review sweep,

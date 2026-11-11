@@ -9,7 +9,10 @@ without a list of its own. No machines-list tag adds a host. The account's ban l
 (`ttp config --account checks.no_spill_hosts '["host-x"]'`, ssh aliases or host names, which a run may only add
 to), keeps a host out of every project's spill on this machine: an alias, its machine or ssh host, or the
 machines list's `hostname` for it (full or short name) matches (banned), a project or pool list naming one is
-refused at config time, and `ttp checks status` shows the list. A project's own empty list (`[]`)
+refused at config time, and `ttp checks status` shows the list. `delivery.checks_spill_exclude` (ssh aliases or
+host names, default none) keeps named hosts out of this project's routes, the pool and checks.spill_beside_device
+included: an alias or the machines list's `hostname` for it matches (excluded), and the pick says it skipped them.
+A project's own empty list (`[]`)
 keeps its checks here, the pool too; with neither, checks never leave this machine. A `ttp checks` run that may spill tries the listed hosts in
 order before it takes a place here (`delivery.checks_spill_first`, default true: first), so this machine keeps
 only the checks that cannot spill, and runs on the first that is allowed, reachable and has a free slot, as a
@@ -110,6 +113,7 @@ from typing import Any
 from . import remotecheck
 
 KEY = "checks_spill_hosts"
+EXCLUDE_KEY = "checks_spill_exclude"   # delivery.checks_spill_exclude: hosts the project keeps out of every route (excluded)
 ACCOUNT_KEY = "checks.spill_hosts"   # the account's pool (project.ACCOUNT_KEYS), after a project's own list
 NO_SPILL_KEY = "checks.no_spill_hosts"   # the account's ban list: hosts no project's checks spill to (banned)
 BESIDE_KEY = "spill_beside_device"   # checks.spill_beside_device: hosts a device job keeps no spill off (beside_device)
@@ -243,6 +247,62 @@ def hosts_of(v: Any) -> list[str]:
     return list(dict.fromkeys(out))
 
 
+def excludes_of(v: Any) -> list[str]:
+    """A `delivery.checks_spill_exclude` value set by `ttp config`: a list (or a JSON-encoded list) of ssh aliases
+    or host names. ValueError for anything else."""
+    if isinstance(v, str) and v.strip().startswith("["):
+        try:
+            v = json.loads(v)
+        except ValueError:
+            pass
+    if not isinstance(v, (list, tuple)):
+        raise ValueError(f"delivery.{EXCLUDE_KEY}: {v!r} is not a list of ssh aliases or host names "
+                         "(e.g. [\"check-host-a\"]); nothing was changed")
+    out = [str(x).strip() if isinstance(x, str) else x for x in v]
+    if bad := [why for x in out if (why := remotecheck.host_problem(x))]:
+        raise ValueError(f"delivery.{EXCLUDE_KEY}: " + "; ".join(bad) + "; nothing was changed")
+    return list(dict.fromkeys(out))
+
+
+def _excludes(cfg: dict | None) -> set[str]:
+    """The project's delivery.checks_spill_exclude, lower-cased; empty when unset or malformed (problems names it)."""
+    try:
+        return {x.lower() for x in excludes_of(((cfg or {}).get("delivery") or {}).get(EXCLUDE_KEY) or [])}
+    except ValueError:
+        return set()
+
+
+def excluded(cfg: dict | None, alias: str, known: dict | None = None) -> bool:
+    """Whether delivery.checks_spill_exclude keeps spill host `alias` out: it names the alias, its machine or
+    ssh host (target), or the machines list's `hostname` for either (full or short name)."""
+    out = _excludes(cfg)
+    if not out:
+        return False
+    from . import machines
+    known = machines.load() if known is None else known
+    machine, host = target(alias, known)
+    names = {alias, machine, host}
+    for n in (machine, host):
+        if h := str((known.get(n) or {}).get("hostname") or "").strip():
+            names |= {h, h.split(".")[0]}
+    return bool({n.lower() for n in names} & out)
+
+
+def excluded_hosts(cfg: dict | None) -> list[str]:
+    """The listed spill hosts (the project's own, then the pool) that delivery.checks_spill_exclude keeps out."""
+    if not _excludes(cfg):
+        return []
+    from . import machines
+    known = machines.load()
+    return [h for h in _listed(cfg) if excluded(cfg, h, known)]
+
+
+def exclude_lines(cfg: dict | None) -> list[str]:
+    """`ttp checks status` line: the listed spill hosts delivery.checks_spill_exclude keeps out."""
+    got = excluded_hosts(cfg)
+    return [f"spill hosts excluded by the project (delivery.{EXCLUDE_KEY}): {', '.join(got)}"] if got else []
+
+
 def _host_problem(x: Any) -> str:
     if x == remotecheck.LOCAL:
         return f"{x!r} is this machine, not a host to spill to"
@@ -261,6 +321,11 @@ def problems(delivery: dict) -> list[str]:
         if bad := banned_in(v):
             out.append(f"delivery.{KEY}: {', '.join(bad)} is banned by the account's {NO_SPILL_KEY}; "
                        "its checks never spill there")
+    if (x := (delivery or {}).get(EXCLUDE_KEY)) is not None:
+        try:
+            excludes_of(x)
+        except ValueError as e:
+            out.append(str(e).replace("; nothing was changed", ""))
     a = (delivery or {}).get(AFTER_KEY)
     if a is not None and (isinstance(a, bool) or not isinstance(a, (int, float)) or a < 0):
         out.append(f"delivery.{AFTER_KEY}: {a!r} is not a number of seconds")
@@ -373,8 +438,19 @@ def account_hosts() -> list[str]:
 
 
 def hosts(cfg: dict | None) -> list[str]:
-    """The project's spill hosts in order, then the account's pool, less those checks.no_spill_hosts bans;
-    [] when the project's own list is empty (it keeps its checks here) or malformed (config_problems names it)."""
+    """The project's spill hosts in order, then the account's pool, less those checks.no_spill_hosts bans and
+    those delivery.checks_spill_exclude keeps out (excluded); [] when the project's own list is empty (it keeps
+    its checks here) or malformed (config_problems names it)."""
+    listed = _listed(cfg)
+    if not listed or not _excludes(cfg):
+        return listed
+    from . import machines
+    known = machines.load()
+    return [h for h in listed if not excluded(cfg, h, known)]
+
+
+def _listed(cfg: dict | None) -> list[str]:
+    """hosts() before delivery.checks_spill_exclude."""
     own = ((cfg or {}).get("delivery") or {}).get(KEY)
     try:
         mine = hosts_of(own) if own is not None else []
@@ -829,6 +905,8 @@ def allowed(p, cfg: dict, alias: str) -> str:
         return "retired in the machines list"
     if ban := banned(alias, known):
         return f"banned for every project by the account's {NO_SPILL_KEY} ({ban})"
+    if excluded(cfg, alias, known):
+        return f"excluded by the project (delivery.{EXCLUDE_KEY})"
     if alias not in _own(cfg) and alias not in account_hosts() and machine not in account_hosts():
         name = getattr(p, "name", "") or "<project>"
         return (f"not a spill host of this project (add it with `ttp config {name} delivery.{KEY} "
@@ -1419,7 +1497,8 @@ def pick(p, cfg: dict, tell, what: str = "", off: str = "", why_here: str = "") 
     LAST_BUSY.clear()
     rec = {"project": p.name, "task": os.environ.get("TTP_TASK") or "", "run": os.environ.get("TTP_RUN_ID") or "",
            "pid": os.getpid(), "since": time.time(), "what": what[:300]}
-    skipped, keep = [f"{h} (banned by the account's {NO_SPILL_KEY})" for h in banned_listed(cfg)], kept_off(off, cfg)
+    skipped, keep = [*(f"{h} (banned by the account's {NO_SPILL_KEY})" for h in banned_listed(cfg)),
+                     *(f"{h} (excluded by the project: delivery.{EXCLUDE_KEY})" for h in excluded_hosts(cfg))], kept_off(off, cfg)
     if env := env_off(off, cfg):
         tell(f"no spill host could take the checks, waiting here: {env}")
         _note_pick(p.name, "", [f"{alias} ({env})" for alias in hosts(cfg)])
@@ -1715,7 +1794,9 @@ def _unspilled(c: Any, was: Any) -> Any:
 STRIKES_KV = "checks_spill_strikes"   # project state: each spill host's strikes, recent spilled failures, quarantines
 QUARANTINE_KEY = "spill_quarantine_after"   # checks.spill_quarantine_after: strikes in a row that take a host off
 QUARANTINE_AFTER = 3
-QUARANTINE_MAX_S = 6 * 3600   # a quarantine's end: its ledger entry's auto-undo (`ttp checks --spill-back`) runs then
+QUARANTINE_MAX_S = 7 * 86400   # a quarantine's backstop end, if no known-good run (known_good) has passed by then
+KNOWN_GOOD_DIR = "spill-known-good"   # under the project's state: each quarantined host's known-good run
+KNOWN_GOOD_RETRY_S = 3600   # a known-good run that failed there starts again after this; a refused one (exit 75) at once
 CONFIG_WINDOW_S = 3600   # one failure on CONFIG_FAULT_HOSTS hosts within this, no spilled pass between: a config fault
 CONFIG_FAULT_HOSTS = 2
 FAILS_KEPT = 100
@@ -1773,11 +1854,13 @@ def strike_settle(p, cfg: dict | None, head: str, passed_on: str = "", now: floa
     """`head` passed (on spill host `passed_on`, else here). `passed_on`'s strikes reset. Each spill host whose
     run of `head` failed (strike_fail) takes a strike, unless that failure's signature hit CONFIG_FAULT_HOSTS
     hosts within CONFIG_WINDOW_S with no spilled pass between: a project-wide config fault (one incident, no
-    strike, those hosts' strikes reset); a bare `exit <rc>` signature never matches (remotecheck.shared_sig). A host at quarantine_after strikes in a row is quarantined until
-    QUARANTINE_MAX_S (pick skips it), with one event and a machine ledger entry whose auto-undo lifts it.
+    strike, those hosts' strikes reset, and a host quarantined earlier for that signature lifted); a bare
+    `exit <rc>` signature never matches (remotecheck.shared_sig). A host at quarantine_after strikes in a row is
+    quarantined (pick skips it), with one event and a machine ledger entry whose until-probe (known_good) lifts it
+    once a known-good run passes there, QUARANTINE_MAX_S at the latest (its auto-undo).
     Returns the hosts quarantined now. Never raises."""
     now = time.time() if now is None else now
-    took, after = [], quarantine_after(cfg)
+    took, after, freed = [], quarantine_after(cfg), set()
     try:
         with p.db.tx():
             doc = _strikes(p.db)
@@ -1799,6 +1882,8 @@ def strike_settle(p, cfg: dict | None, head: str, passed_on: str = "", now: floa
                 if remotecheck.shared_sig(sig) and len(same) >= CONFIG_FAULT_HOSTS:
                     for h in same:
                         hosts.setdefault(h, {})["n"] = 0
+                    # A host quarantined earlier for this failure was never at fault: it comes back.
+                    freed.update(k for k, v in hosts.items() if (v.get("off") or {}).get("sig") == sig)
                     # One incident, one event: env_event's fingerprint (a spill env fault already told for this
                     # checks config is not told again).
                     fp = f"checkspill:env:{_env_key(cfg)}"
@@ -1817,41 +1902,53 @@ def strike_settle(p, cfg: dict | None, head: str, passed_on: str = "", now: floa
                     took.append(f["host"])
                     _event(p.db, now, f"spill-quarantine:{f['host']}:{now:.0f}", "normal",
                            f"Spill host {f['host']} quarantined: {h['n']} spilled runs in a row failed there and "
-                           f"passed elsewhere (last: {sig or 'no error line'}); its checks run elsewhere until "
-                           f"`ttp checks --spill-back {f['host']}` (its machine ledger entry's auto-undo).")
+                           f"passed elsewhere (last: {sig or 'no error line'}); its checks run elsewhere until a "
+                           f"known-good run of the base passes there (`ttp checks --spill-probe {f['host']}`, "
+                           f"its machine ledger entry's until-probe) or `ttp checks --spill-back {f['host']}`.")
             doc.update(fails=fails[-FAILS_KEPT:], incidents=seen)
             p.db.set_kv(STRIKES_KV, doc)
     except Exception:
         return []
+    for host in sorted(freed - set(took)):
+        try:
+            lift(p, host, now)
+        except Exception:
+            pass
     from . import machine_ledger
     for host in took:   # the ledger's file lock, outside the db transaction
         try:
             c = machine_ledger.add_change(
                 host, f"spill host quarantined for {p.name}'s checks: its spilled runs fail where they pass "
                       "elsewhere", f"ttp checks --spill-back {host}", p.name, expires=now + QUARANTINE_MAX_S,
-                auto_undo=True, queue=p.state, extra={"kind": "spill_quarantine"})
+                until_probe=f"ttp checks --spill-probe {shlex.quote(host)} || exit 1", auto_undo=True,
+                queue=p.state, extra={"kind": "spill_quarantine"})
             with p.db.tx():
                 doc = _strikes(p.db)
                 if (off := doc["hosts"].get(host, {}).get("off")) is not None:
                     off["change"] = c.get("id")
                     p.db.set_kv(STRIKES_KV, doc)
-        except Exception:   # not in the machines list, the ledger unwritable: the quarantine's end still holds
+        except Exception:   # not in the machines list, the ledger unwritable: known_good and the end still hold
             pass
     return took
 
 
 def quarantined(p, alias: str, now: float | None = None) -> str:
-    """Why `alias` is quarantined for project `p`'s checks ("" when it is not)."""
+    """Why `alias` is quarantined for project `p`'s checks ("" when it is not). A quarantine past its end
+    ends here as lift ends one (its event, its strikes reset), ledger entry or not."""
     from . import timefmt
     now = time.time() if now is None else now
     try:
-        off = _strikes(p.db)["hosts"].get(alias, {}).get("off") or {}
+        off = _strikes(p.db)["hosts"].get(alias, {}).get("off")
+        if not off:
+            return ""
         if float(off.get("until") or 0) <= now:
+            lift(p, alias, now)
             return ""
     except Exception:
         return ""
-    return (f"quarantined: {off.get('n')} spilled runs in a row failed there and passed elsewhere; "
-            f"back with `ttp checks --spill-back {alias}`, by itself at {timefmt.clock(now=float(off['until']))}")
+    return (f"quarantined: {off.get('n')} spilled runs in a row failed there and passed elsewhere; back once a "
+            f"known-good run of the base passes there (`ttp checks --spill-probe {alias}`) or with "
+            f"`ttp checks --spill-back {alias}`, at the latest {timefmt.clock(now=float(off['until']))}")
 
 
 def lift(p, alias: str, now: float | None = None) -> bool:
@@ -1877,3 +1974,71 @@ def lift(p, alias: str, now: float | None = None) -> bool:
         except (ValueError, OSError):   # closed already (by hand, or by the auto-undo running this)
             pass
     return bool(off)
+
+
+def _known_good_rc(p, alias: str) -> Path:
+    return Path(p.state) / KNOWN_GOOD_DIR / re.sub(r"[^A-Za-z0-9_.-]", "_", alias) / "known-good.rc"
+
+
+def known_good(p, cfg: dict | None, alias: str, now: float | None = None) -> tuple[int, str]:
+    """`ttp checks --spill-probe <alias>`, the until-probe of a quarantine's ledger entry, run by the daemon
+    on its probe timer: (exit, what it found). The known-good run is the push branch tip's spillable checks,
+    run detached on `alias` behind its spill wrapper (the probe's own time limit is far shorter than a
+    suite). Passed: the host is lifted (lift), exit 0. Running: exit 1. Refused there (exit 75, a busy host
+    or a host fault): started again now, no strike. Failed: started again after KNOWN_GOOD_RETRY_S.
+    Not quarantined: exit 0."""
+    from . import detach
+    now = time.time() if now is None else now
+    off = _strikes(p.db)["hosts"].get(alias, {}).get("off")
+    if not isinstance(off, dict):
+        return 0, "not quarantined"
+    rc = _known_good_rc(p, alias)
+    if off.get("probe"):
+        st, code = detach.state(rc)
+        if st in ("running", "queued"):
+            return 1, f"its known-good run is {st} ({rc.with_suffix('.log')})"
+        if st == "ended" and code == "0":
+            lift(p, alias, now)
+            return 0, f"its known-good run of {off['probe']} passed: back in the spill pool"
+        ended = rc.stat().st_mtime if rc.exists() else 0.0
+        if code != str(remotecheck.FAULT_RC) and now - ended < KNOWN_GOOD_RETRY_S:
+            return 1, (f"its known-good run of {off['probe']} failed ({code or st}); again after "
+                       f"{KNOWN_GOOD_RETRY_S // 60} min")
+    base, why = _known_good_start(p, cfg, alias, rc)
+    if not base:
+        return 1, f"no known-good run started: {why}"
+    with p.db.tx():
+        doc = _strikes(p.db)
+        if isinstance(o := doc["hosts"].get(alias, {}).get("off"), dict):
+            o["probe"] = base
+            p.db.set_kv(STRIKES_KV, doc)
+    return 1, f"a known-good run of {base} started there ({rc.with_suffix('.log')})"
+
+
+def _known_good_start(p, cfg: dict | None, alias: str, rc: Path) -> tuple[str, str]:
+    """Start the known-good run (known_good): (the base commit, "") or ("", why not)."""
+    import json
+    from . import detach, gatejudge, locks, project, push
+    from .runner import boot_id
+    repo, base = gatejudge._push_tip(p)
+    if not base:
+        return "", "the push branch tip is unreadable"
+    configured, _ = push.repo_checks((cfg or {}).get("delivery") or {}, repo, p)
+    cmds = [c for c in push.check_list(configured) if check_spills(c, cfg)]
+    if not cmds:
+        return "", "no configured check may spill"
+    script = " && ".join(shlex.join(push.check_argv(c, commit=base)) for c in push.spill_to(cmds, alias, cfg))
+    rc.parent.mkdir(parents=True, exist_ok=True)
+    lock = locks.try_take([locks.job_lock(rc)], f"spill known-good run on {alias}", script)
+    if lock is None:
+        return "", "an earlier known-good run still runs"
+    try:
+        for f in (rc, rc.with_suffix(".log"), detach.lost(rc), detach.started(rc)):
+            f.unlink(missing_ok=True)
+        env = {k: v for k, v in project.command_env(p).items() if k not in ("TTP_LOCKS_HELD", "TTP_LOCKS_SHARED")}
+        pid = detach.start(rc, rc.with_suffix(".log"), ["sh", "-c", script], str(repo), env, lock)
+    finally:
+        lock.close()
+    project.durable_write(rc.parent / "detached.json", json.dumps([{"rc": str(rc), "pid": pid, "boot": boot_id(),
+                                                                    "start": time.time()}]))
+    return base, ""

@@ -346,6 +346,7 @@ async function refresh() {
   }
   put($("#why"), h.why_idle ? `<b>Idle:</b> ${esc(h.why_idle)}` : `${h.running} run${h.running === 1 ? "" : "s"} working.` +
     (h.held ? ` <b>Held:</b> ${esc(h.held)}` : ""));
+  text($("#selfwatch"), st.selfwatch || "");
   text($("#top"), [h.spend.in_flight ? `~${money(h.spend.in_flight)} so far in running work` : "",
     h.spend.top_7d ? `Top spender, 7 days: ${h.spend.top_7d.source} ${money(h.spend.top_7d.usd)}` : "",
     h.spend.caps_line ? `Project caps: ${h.spend.caps_line}` : "",
@@ -367,7 +368,7 @@ async function refresh() {
   R.rows($("#feed"), feed.length ? feed : muted("Nothing yet."));
   put($("#gates2"), gateHtml(st.gates));
   const running = h.working || st.runs.filter((r) => r.status === "running").map((r) => ({ ...r, run: r.id }));
-  R.rows($("#running"), running.length ? running.map((r) => ({ key: r.run, html: `<div class="row"><span class="id">run ${r.run}</span><span class="title">${r.task ? `#${r.task} ${esc(r.title || "")}` : esc(r.role)}</span><span class="meta">${esc(r.provider)} ${esc(r.model || "")} ${esc(r.effort || "")}${r.wake ? ` · ${esc(r.wake)} wake` : ""}${r.floor ? ` · ${esc(r.floor)}` : ""} · ${agoH(r.started)}${r.cost_usd ? ` · ~${money(r.cost_usd)} so far` : ""}</span>${r.note ? `<div class="meta">${esc(r.note)}</div>` : ""}${r.doing ? `<div class="meta">${esc(r.doing)}${r.files_n ? ` · ${r.files_n} file(s) changed` : ""}</div>` : ""}${r.checks ? `<div class="meta">${esc(r.checks)}</div>` : ""}</div>` })) : muted("Idle."));
+  R.rows($("#running"), running.length ? running.map((r) => ({ key: r.run, html: `<div class="row"><span class="id">run ${r.run}</span><span class="title">${r.task ? `#${r.task} ${esc(r.title || "")}` : esc(r.role)}${r.batch ? ` <span class="meta">(batch ${esc(r.batch.id)}: +${r.batch.members.map((m) => `#${m}`).join(", ")})</span>` : ""}</span><span class="meta">${esc(r.provider)} ${esc(r.model || "")} ${esc(r.effort || "")}${r.wake ? ` · ${esc(r.wake)} wake` : ""}${r.floor ? ` · ${esc(r.floor)}` : ""} · ${agoH(r.started)}${r.cost_usd ? ` · ~${money(r.cost_usd)} so far` : ""}</span>${r.note ? `<div class="meta">${esc(r.note)}</div>` : ""}${r.doing ? `<div class="meta">${esc(r.doing)}${r.files_n ? ` · ${r.files_n} file(s) changed` : ""}</div>` : ""}${r.checks ? `<div class="meta">${esc(r.checks)}</div>` : ""}</div>` })) : muted("Idle."));
   text($("#coord"), (st.coordinator && st.coordinator.summary) || "—");
   const cache = st.budget && st.budget.coordinator_cache && st.budget.coordinator_cache["24h"];
   text($("#coordcache"), (cache && cache.line) || "cache stats unavailable");   // the server's wording, as is

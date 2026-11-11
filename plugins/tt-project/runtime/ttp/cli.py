@@ -1710,6 +1710,9 @@ def status_text(p: Project, verbose: bool = False) -> str:
                      + (f" in {pr['project']} (shared: holds in every project)" if pr.get("shared") else "")
                      + (f": {pr['reason']}" if pr.get("reason") else "") + (f"; {pr['end']}" if pr.get("end") else "")
                      + f" — resume: ttp resume {p.name} --resource {pr['resource']}")
+    from . import selfwatch
+    if sw := selfwatch.line(db.kv(selfwatch.KV), now):
+        lines.append(sw)
     disk = db.kv("disk_low")
     if disk:
         lines.append(f"disk: only {disk['free_gb']} GB free under {disk['path']} (guard {disk.get('threshold_gb', '?')} GB); "
@@ -1854,11 +1857,12 @@ def status_text(p: Project, verbose: bool = False) -> str:
         lines.append(f"idle: {h['why_idle']}")
     elif h["held"]:
         lines.append(f"held: {h['held']}")
-    from . import topup
+    from . import batchrun, topup
     topped = topup.counts(db)   # urgent or user-ordered tasks whose budget the daemon raised (topup.py)
     for w in h["working"][:8]:
         what = f"#{w['task']} {w['title']}" if w["task"] else w["role"]
-        lines.append(f"  running {since(w['started'], now)}: {what}" + (f" ({w['wake']} wake)" if w.get("wake") else "")
+        lines.append(f"  running {since(w['started'], now)}: {what}" + batchrun.words(w.get("batch"))
+                     + (f" ({w['wake']} wake)" if w.get("wake") else "")
                      + (f" [{w['floor']}]" if w.get("floor") else "")
                      + (f" [sandbox {w['sandbox']}]" if w.get("sandbox") else "")
                      + (f" [on {w['model']}]" if "(stand-in for " in str(w.get("model") or "") else "")
@@ -2100,6 +2104,14 @@ def cmd_stats(a) -> None:
         s["per_landed"] = trainstats.per_landed(p.db, p.root, s["ref"], cfg=cfg)
         print(json.dumps(s, indent=1) if a.json else trainstats.text(s, p.name))
         return
+    if getattr(a, "chat", False):
+        from . import chatdigest
+        s = chatdigest.counts(p.db)
+        print(json.dumps(s, indent=1) if a.json else "\n".join(
+            [f"{p.name}: coordinator chat posts (digest every {chatdigest.every_s(p.config()) / 3600:g} h; 0: off)"]
+            + ([f"  {c}: {v['sent']} sent, {v['held']} held, {v['digests']} digests, {v['waiting']} waiting"
+               for c, v in s.items()] or ["  none counted yet"])))
+        return
     if a.coord_session:
         from . import coordstats
         s = coordstats.report(p.db, p.runs, timefmt.home(p), a.days)
@@ -2241,6 +2253,25 @@ def cmd_audit(a) -> None:
         print(json.dumps(audit.report(p.db, window_s=a.hours * 3600, blocked_h=hours, p=p), indent=1, default=str))
     else:
         print("\n".join(f"- {line}" for line in audit.lines(p.db, window_s=a.hours * 3600, blocked_h=hours, p=p)))
+
+
+def cmd_waste(a) -> None:
+    """Read-only: this project's avoidable spend by bucket since `--since` (waste.py), model-free."""
+    from . import waste
+    from .activity import parse_since
+    p = need(a.name, sys.argv[1:]) if a.name else here()
+    if not p:
+        die("no tt-project project here; name one: `ttp waste <name>`")
+    now = time.time()
+    try:
+        since = parse_since(a.since, now, 86400, p)
+    except ValueError as e:
+        die(str(e))
+    rep = waste.report(p.db, since, now, p.config())
+    if a.json:
+        print(json.dumps(rep, indent=1))
+        return
+    print("\n".join([waste.line(p.name, rep)] + [f"- {x}" for x in waste.lines(rep)]))
 
 
 def cmd_course(a) -> None:
@@ -3092,7 +3123,8 @@ def cmd_push(a) -> None:
     if a.result:
         sys.exit(push.result(Path(a.result), pushed_only=a.pushed))
     from . import coordtools
-    if coordtools.coordinator_run() and not (a.queue or a.stop or a.cancel or (a.free and not a.move_tag)):
+    coord = coordtools.coordinator_run() and not (a.queue or a.stop or a.cancel or (a.free and not a.move_tag))
+    if coord and (a.move_tag or a.own or a.own_branch or a.batch):
         die(f"ttp push: {coordtools.PUSH_REFUSAL}")   # also past the hook's text check (coordtools.py)
     if a.own_branch:   # read by push.own_target, also in the detached process (inherited, or QUEUE_ENV)
         a.own = True
@@ -3106,6 +3138,8 @@ def cmd_push(a) -> None:
                                          if (c := Project(d)).exists()), None)
     if not p or not p.exists():
         die("ttp push: no tt-project project here (run it inside a run or a project's worktree)")
+    if coord and (why := push.approved_landing(p, Path.cwd())[1]):   # only a head a review approved
+        die(f"ttp push: {coordtools.PUSH_REFUSAL}: {why}")
     if a.queue:
         from . import pushq
         print(pushq.queue_text(p))
@@ -3791,7 +3825,7 @@ def cmd_checks(a) -> None:
         if not p:
             die("ttp checks --reap: no project found")
         from .daemon import log as daemon_log
-        for r in leftoverchecks.reap(p, dry_run=a.dry_run):
+        for r in leftoverchecks.reap(p, dry_run=a.dry_run) + leftoverchecks.test_orphans(p, dry_run=a.dry_run):
             print(r["text"])
             if not a.dry_run:
                 daemon_log(p, r["text"])   # as the daemon's pass logs it
@@ -3813,6 +3847,13 @@ def cmd_checks(a) -> None:
         was = checkspill.lift(p, a.spill_back)
         print(f"ttp checks: spill host {a.spill_back} " + ("is back in the spill pool" if was else "was not quarantined"))
         sys.exit(0)
+    if getattr(a, "spill_probe", None):
+        from . import checkspill
+        if (p := here()) is None:
+            die("ttp checks --spill-probe: not in a project")
+        code, said = checkspill.known_good(p, p.config(), a.spill_probe)
+        print(f"ttp checks: spill host {a.spill_probe}: {said}")
+        sys.exit(code)
     if getattr(a, "preempt", None):
         from . import checkcap, checklane
         p = here()
@@ -3846,6 +3887,7 @@ def cmd_checks(a) -> None:
         print(f"ttp checks: not started, {hostcycle.hold_line(cyc, p)}. Commit and hand off `waiting` with a "
               "`retry_when` that exits 0 once this host is back, and run them after the cycle", file=sys.stderr)
         sys.exit(75)
+    _cycle_notice_busy("ttp checks", p)
     purpose = getattr(a, "purpose", None) or "candidate"
     if a.full and purpose == "candidate" and not getattr(a, "release", False):
         from . import testpick   # a release run (the release cut's required suite) always runs in full
@@ -4605,6 +4647,8 @@ def cmd_checks(a) -> None:
                     out.write(f"ttp checks: {checkwall.said(str(py_check), wall, wall_how, head)}\n")
         except checkcap.Preempted as e:
             preempted_by = str(e)
+            # Its rerun's wait from this slot's grant is the asker's project's, not its own (record_wait).
+            os.environ[checkcap.CUT_ENV] = json.dumps({"at": _CHECK_PREEMPT["since"], "by": checkcap.preempter()})
         finally:
             _CHECK_YIELD["slot"] = None
             if _CHECK_PREEMPT["since"] is not None:   # a request it never saw is for no later run
@@ -5447,7 +5491,7 @@ def _checks_lane_status(as_json: bool) -> int:
                          indent=2))
     else:
         print(checklane.status_text(p.name, p.config(), here_repo, names=names, db=p.db))
-        for line in [*checkspill.no_spill_lines(), *checkspill.status_lines(p.name), *checkspill.pick_lines(p.name), *checkspill.here_lines(p.name), *checkspill.limit_lines(p.name), *slurmcheck.probe_lines(), *slurmcheck.status_lines(p.name),
+        for line in [*checkspill.no_spill_lines(), *checkspill.status_lines(p.name), *checkspill.exclude_lines(p.config()), *checkspill.pick_lines(p.name), *checkspill.here_lines(p.name), *checkspill.limit_lines(p.name), *slurmcheck.probe_lines(), *slurmcheck.status_lines(p.name),
                      *filter(None, [slurmcheck.paused_line()])]:
             print(f"  {line}")
         print("check runs per host:")
@@ -5568,6 +5612,13 @@ def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: boo
     urgent = checkcap.is_urgent(prio) and p is not None   # an adopted task's run never takes an urgent slot
     pool_first = urgent and spill_to and bool(checkspill.hosts(cfg))
     moved = _HeadMoved(top, head)   # its task replacing the head while it waits drops the run
+    # Its own lane wait over every bound and re-execution (_checks_slot_take; checkcap.record_wait's lane_s).
+    try:
+        lane_wait = json.loads(os.environ.pop(checkcap.LANE_WAIT_ENV, "") or "{}")
+        lane_wait = {"s": float(lane_wait["s"]), "pool": float(lane_wait["pool"]),
+                     "at": float(lane_wait["at"]) if lane_wait.get("at") is not None else None}
+    except (ValueError, KeyError, TypeError):
+        lane_wait = {"s": 0.0, "pool": 0.0, "at": None}
     while True:
         limit = max(0.0, checkcap.FOREGROUND_WAIT_S - (time.time() - start)) if foreground and p else None
         spill_cfg = p.config() if spill_to else {}
@@ -5606,7 +5657,7 @@ def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: boo
         try:
             slot = _checks_slot_take(p, run_dir, out, head, tell, waiting, limit, arrived, same, done, prio, owns,
                                      cfg, repo, cmds, what, top, lock, restart=detached, yielder=yielder,
-                                     moved=moved, urgent=urgent and not pool_first)
+                                     moved=moved, urgent=urgent and not pool_first, lane_wait=lane_wait)
         except checksqueue.Parked:
             # Parked: it waits outside the queue holding nothing, then queues again at its first arrival.
             arrived = start if arrived is None else arrived
@@ -5627,6 +5678,7 @@ def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: boo
         except checkcap.Upgraded as e:
             if p:   # its checkjoin record goes: the re-executed run registers again at the same arrival
                 checkjoin.forget(p.state)
+            os.environ[checkcap.LANE_WAIT_ENV] = json.dumps(lane_wait)
             _checks_reexec(str(e), arrived, prio, spill, tell, out, getattr(e, "lanes", None),
                            getattr(e, "slot", None), rerank=isinstance(e, checkcap.Reranked), spill_off=spill_off)
             continue   # it could not re-execute: wait again with the code it runs
@@ -5739,7 +5791,8 @@ def _landing_check(p) -> str:
 
 def _checks_slot_take(p, run_dir: Path, out, head: str, tell, waiting, limit: float | None, arrived, same: str,
                       done, prio, owns, cfg: dict, repo: str, cmds: list, what: str, top: str = "",
-                      lock: str = "", restart: bool = False, yielder=None, moved=None, urgent: bool = False):
+                      lock: str = "", restart: bool = False, yielder=None, moved=None, urgent: bool = False,
+                      lane_wait: dict | None = None):
     """One wait of _checks_slot for the repository's lane (or `lock`'s), a host-wide checks slot and
     test-worker slots, at most `limit` seconds (None: no limit): the slot, or None once `limit` passed.
     With `restart` (detached checks), a newer runtime installed while it waits (checkcap.upgraded) ends the
@@ -5804,11 +5857,35 @@ def _checks_slot_take(p, run_dir: Path, out, head: str, tell, waiting, limit: fl
                                     check=f"{head[:12]}.{_commands_hash(cmds)[:12]}",
                                     repo_name=testslots.repo_name(top) if p and key == repo and not lane.get("lock") else "",
                                     name=names["lock" if lane.get("lock") else "repo"] if key in (repo, "") else "", **lane)
+    # Its wait for its own lanes is the project's (checks.slots) only while it could run: the time the
+    # host's test pool refused it a lane past them (pool_room) is the host's. Both add up in `lane_wait`
+    # over every bound (each gives the lane back), so the waits log tells them apart (record_wait).
+    lane_wait = {"s": 0.0, "pool": 0.0, "at": None} if lane_wait is None else lane_wait
+    refused, asked = [None], time.time()
+
+    def pool_ok() -> bool:
+        ok = testslots.pool_room(cfg, p.name if p else None, priority=prio, since=arrived, cost=run_cost)
+        now = time.time()
+        if refused[0] is not None:
+            lane_wait["pool"] += now - refused[0]
+        refused[0] = None if ok else now
+        return ok
+
+    def lane_waited(got: bool) -> None:
+        now = time.time()
+        lane_wait["s"] += now - asked
+        if refused[0] is not None:
+            lane_wait["pool"] += now - refused[0]
+        refused[0] = None
+        if got:
+            lane_wait["at"] = now
     try:
+        waits = kept is None   # a re-execution that kept its lanes waits for none
         if kept is not None:
             suite, kept = kept, None
         elif in_tree:
             if (tree := hold(testslots.tree_key(top), 1, pending=True)) is None:
+                lane_waited(False)
                 return None
         if suite is None and lock and _wrap_lane_after(cfg):
             suite = testslots.Grant()   # checks.wrap_lane "after": the step inside the wrapper takes the lane
@@ -5820,13 +5897,13 @@ def _checks_slot_take(p, run_dir: Path, out, head: str, tell, waiting, limit: fl
         if suite is None and (suite := hold(repo, lanes_now, lock=lock,
                                             cap=checklane.project_cap(cfg), cap_note=checklane.cap_note(cfg),
                                             worktree=top, headroom=checklane.headroom, pending=True, running=True,
-                                            landing=_landing_check(p),
-                                            startable=lambda: testslots.pool_room(
-                                                cfg, p.name if p else None, priority=prio, since=arrived,
-                                                cost=run_cost))) is None:
+                                            landing=_landing_check(p), startable=pool_ok)) is None:
+            lane_waited(False)
             if tree is not None:
                 tree.close()
             return None
+        if waits:
+            lane_waited(True)
         if tree is not None:
             suite.files += tree.files
             tree = None
@@ -5845,7 +5922,7 @@ def _checks_slot_take(p, run_dir: Path, out, head: str, tell, waiting, limit: fl
         while True:
             left = max(0.0, limit - (time.time() - t0)) if limit is not None else None
             testslots.lane_waits(suite, "a host-wide checks slot")   # held, not running yet: status says why
-            lane_at = time.time()   # the waits log counts only the time after it as the host's (throughput)
+            lane_at = lane_wait["at"] or time.time()   # its lane's grant (throughput: the host's time is after it)
             slot = kept_slot if kept_slot is not None else checkcap.acquire(checkcap.label(checkcap.queue_name(p)), f"ttp checks on {head[:12]}", tell,
                                     waiting, left, arrived,
                                     checkcap.queue_name(p), prio, same, done, stop,
@@ -5854,7 +5931,8 @@ def _checks_slot_take(p, run_dir: Path, out, head: str, tell, waiting, limit: fl
                                     parks=lambda on: testslots.lane_waits(
                                         suite, testslots.PARKED_WAITS if on else "a host-wide checks slot"),
                                     urgent=urgent, preemptible=checkcap.preemptible(cmds, lock),
-                                    small=checkcap.is_small(run_cost), progress=_checks_progress(out, cmds))
+                                    small=checkcap.is_small(run_cost), progress=_checks_progress(out, cmds),
+                                    waited={"lane_s": lane_wait["s"], "pool_s": lane_wait["pool"]})
             kept_slot = None
             if slot is None or slot.served:
                 suite.close()
@@ -5884,14 +5962,17 @@ def _checks_slot_take(p, run_dir: Path, out, head: str, tell, waiting, limit: fl
             testslots.lane_waits(suite, "a running suite of its repository or project to end")
             tell and tell(f"granted, but its repository's lanes or the project's cap of running checks are full: "
                  f"handed its grants back to wait for a running suite to end")
+            asked = time.time()   # a wait for its own running suites: the project's (lane_waited)
             while not testslots.claim_running(suite, p.name if p else None, lanes_now,
                                               checklane.project_cap(cfg), mark=False):
                 if stop and (why := stop()):
                     raise checkcap.Cancelled(why)
                 if limit is not None and time.time() - t0 >= limit:
+                    lane_waited(False)
                     suite.close()
                     return None
                 time.sleep(testslots.poll_s(testslots.POLL_S))
+            lane_waited(False)
         slot.tests.files += suite.files   # the suite lock ends with the run's test slots
         slot.suite = suite   # its label shows the run's wall-time cap (testslots.suite_running)
         if not os.environ.get(testslots.HELD_ENV) and (ports := testslots.port_block(checkcap.label(checkcap.queue_name(p)))):
@@ -6397,7 +6478,7 @@ def _run_check(argv: list, group: bool, record=None, timeout: float | None = Non
     try:
         if _CHECK_STOP["stopped"]:   # stopped checks start no further command
             raise SystemExit(_CHECK_STOP["stopped"])
-        guard = hoststate.Guard(kw.get("env"), argv=argv)   # the real crontab and units, compared after a local check
+        guard = hoststate.Guard(kw.get("env"), tokens=[kw.get("cwd")], argv=argv)   # the real crontab and units, compared after a local check
         proc = _check_popen(argv, start_new_session=group, **kw)
         if group and record is not None:
             record.group(proc.pid)
@@ -6465,6 +6546,12 @@ def _foreground_stop() -> dict:
     return old
 
 
+def _run_scratch() -> str:
+    """This checks run's own scratch (its TMPDIR under the supervisor), or "" outside one."""
+    from . import checkdirs
+    return checkdirs.scratch(dict(os.environ)) or ""
+
+
 def _checks_reaped(out, tok: str, record, clean, rc) -> None:
     """The end of a run's checks, however it ends: record their exit code (exit.json), end what is
     still tied to the run, remove the clean tree, say what was reaped, then drop the record unless
@@ -6478,7 +6565,8 @@ def _checks_reaped(out, tok: str, record, clean, rc) -> None:
         found, left = checkreap.reap(tok, record.data["pgids"] if record is not None else (),
                                      str(clean.dir) if clean is not None else "",
                                      state=record.dir.parent.parent if record is not None else None,
-                                     why="the end of its own check run")
+                                     why="the end of its own check run",
+                                     tmp=_run_scratch())
     except OSError:
         pass
     finally:
@@ -8248,6 +8336,16 @@ def cmd_land(a) -> None:
     sys.exit(land.run(p, a))
 
 
+def cmd_express(a) -> None:
+    """Land one small, urgent, reviewed head alone, ahead of the push queue (express.py): 0 started or
+    landed, 2 refused (each reason printed), 1 failed."""
+    from . import express
+    p = here()
+    if not p:
+        die("ttp express: no project here (run it in a project or with TTP_PROJECT set)")
+    sys.exit(express.main(p, a.ref, a.why, dry_run=a.dry_run, wait_s=a.wait))
+
+
 def cmd_model_bench(a) -> None:
     """`ttp model-bench run|show`: the host's shared daily chat model bench (modelbench.py)."""
     import time as _t
@@ -8642,6 +8740,7 @@ def cmd_detach(a) -> None:
             "(name: letters, digits, . _ -)")
     if not run_dir:
         die("ttp detach only works inside a tt-project run")
+    _cycle_notice_busy("ttp detach", Project(os.environ["TTP_PROJECT"]) if os.environ.get("TTP_PROJECT") else None)
     rd = Path(run_dir).resolve()
     rc, logf = rd / f"{a.name}.rc", rd / f"{a.name}.log"
     if any(f.exists() for f in (rc, logf, detach.queued(rc), detach.lost(rc))):
@@ -10703,11 +10802,53 @@ def _pause_by(p: Project) -> str:
 
 def cmd_alive(a) -> None:
     """`ttp alive <name>`: a running daemon is no proof the project works (its CLI may be logged out)."""
-    from . import projpause
+    from . import projmove, projpause
     p = need(a.name, sys.argv[1:])
-    ok, why = projpause.live(p.db, _since_s(a.within))
+    within = _since_s(a.within)
+    if (rec := projmove.current(p.db)) and rec["role"] == "target":   # runs copied over from the old host do not count
+        within = min(within, max(time.time() - float(rec["since"]), 0))
+    ok, why = projpause.live(p.db, within)
     print(f"{p.name} {'live' if ok else 'not live'}: {why}")
     sys.exit(0 if ok else 1)
+
+
+def cmd_move(a) -> None:
+    """`ttp move <name>`: a planned move to another host, without both copies starting work (projmove.py)."""
+    from . import projmove
+    p = need(a.name, sys.argv[1:])
+    db = p.db
+    if a.cancel:
+        db.set_kv(projmove.KEY, None)
+        print(f"{p.name}: move forgotten")
+        return
+    if a.confirmed:   # the new copy runs: this one stops now
+        projmove.stop(db, projmove.current(db) or {"role": "source", "host": "", "name": p.name,
+                                                 "since": time.time()})
+        print(f"{p.name} stopped here: no new worker or coordinator run starts; running workers finish")
+        return
+    if a.to or a.from_:
+        try:
+            host, name = projmove.parse(a.to or a.from_, p.name)
+        except ValueError as e:
+            die(str(e))
+        rec = projmove.record(db, "source" if a.to else "target", host, name)
+        if a.to:
+            print(f"{p.name} moving to {host} ({name}): this copy stops within a few minutes of the copy "
+                  "there running (`ttp move` --from on that host holds its workers until then)")
+        else:
+            db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
+                 (rec["since"], "cli", "project_move", "normal",
+                  f"this project moved here from {host}: take a turn; workers start once the copy there stopped",
+                  "queued"))
+            print(f"{p.name} moving here from {host} ({name}): workers start once the copy there has stopped")
+        return
+    rec = projmove.current(db)
+    if not rec:
+        print(f"{p.name}: no move recorded")
+        return
+    state = "done" if rec.get("done") else "under way"
+    way = "to" if rec["role"] == "source" else "from"
+    print(f"{p.name} move {way} {rec['host']} ({rec['name']}): {state}" + (f"; last: {rec['note']}" if rec.get("note") else ""))
 
 
 def cmd_pause(a) -> None:
@@ -11200,10 +11341,12 @@ def cmd_config(a) -> None:
             val = pin_verify_mode(val)
         except ValueError as e:
             die(str(e))
-    if a.key in ("coordinator.provider_failover_after_h", "coordinator.provider_failover_to"):
+    if a.key in ("coordinator.provider_failover_after_h", "coordinator.provider_failover_to",
+                 "coordinator.provider_logout_failover_s"):
         from . import failover
         try:
             val = (failover.after_h_of(val) if a.key.endswith("_after_h")
+                   else failover.logout_s_of(val) if a.key.endswith("_logout_failover_s")
                    else failover.to_of(val, p.config().get("providers")))
         except ValueError as e:
             die(str(e))
@@ -11788,6 +11931,21 @@ def cmd_uninstall(a) -> None:
         print(f"  {ln}")
 
 
+def _cycle_notice_busy(what: str, p: Project | None) -> None:
+    """Exit 75 when a power cycle of this host is announced (cyclenotice.project_held): a long job started
+    now would be cut by it. Hand off `waiting` on a time check; it starts once the announcement clears."""
+    from . import cyclenotice
+    try:
+        h = cyclenotice.project_held(p) if p is not None and p.exists() else None
+    except Exception:
+        return
+    if h:
+        print(f"{what}: not started, {cyclenotice.line(h, p)}. Commit and hand off `waiting` with retry_when "
+              f"'test \"$(date +%s)\" -ge {int(time.time()) + 600}' and start it once the cycle is over",
+              file=sys.stderr)
+        sys.exit(cyclenotice.BUSY)
+
+
 def cyclenotice_paths(p: Project) -> list[str]:
     from . import cyclenotice
     return cyclenotice.project_paths(p)
@@ -11986,7 +12144,8 @@ def cmd_upgrade(a) -> None:
     template snapshots on its `upstream` branch, so this is an ordinary three-way merge. `--auto` is
     the daemon's own call (release.py): it records the outcome and sends one low notify when applied.
     Exit 75 = deferred, nothing changed and the project finishes it itself (another upgrade, a harness
-    task or the daemon landing a harness worktree holds it, a push is in flight, or a conflicting merge waits for a harness task or for the daemon's
+    task or the daemon landing a harness worktree holds it, a push is in flight, uncommitted edits in the
+    checkout block --apply's fast-forward, or a conflicting merge waits for a harness task or for the daemon's
     retry, which comes only for a newer version under upgrade.auto). Exit 1 = failed, including a conflict
     nothing will retry (upgrade.auto off, or the same version from another commit). After main moved, the
     restart decides: exit RESTART_DEFERRED (76) = main is applied and the restart deferred (the old daemon
@@ -12849,6 +13008,11 @@ def _apply_upgrade(p: Project, commit: str) -> None:
               f"fast-forward main")
         outcome, why = applyff.request(p, merged, os.environ.get("TTP_TASK") or "")
         why = "" if outcome == "done" or _git(h, "rev-parse", "HEAD") == merged else why
+    if why and applyff.local_changes(why) and _git(h, "rev-parse", "HEAD") == base:
+        # Someone is mid-edit in the checkout: a transient busy state, not a failure (git wrote nothing).
+        die(f"--apply deferred: uncommitted edits in {h} are in the way ({why}); nothing was changed, main is "
+            f"still {base[:12]} and no restart is coming: rerun `ttp upgrade {p.name} --apply {commit}` once "
+            f"they are committed", UPGRADE_BUSY)
     if why:
         die(f"--apply: could not fast-forward main to {commit}: {why}. Main is still "
             f"{_git(h, 'rev-parse', 'HEAD')[:12]} and nothing was restarted; rerun "
@@ -13683,14 +13847,14 @@ COMMAND_GROUPS = (
                   "memory", "obligation", "config", "pause", "resume", "drain", "alerts", "issues", "mute",
                   "quarantine", "machines", "runs", "logs", "doctor")),
     ("inside a run", ("note", "steer", "notify", "progress", "checks", "checks-shard", "checks-yield", "lock",
-                      "host-run", "detach", "devq", "push", "land", "clip", "sandbox", "pool-wait", "pool-admit",
+                      "host-run", "detach", "devq", "push", "land", "express", "clip", "sandbox", "pool-wait", "pool-admit",
                       "pool-shard", "skill", "killscan", "svcscan", "leftover-procs", "said", "hostcheck", "paths")),
     ("probes (retry_when, start_when)", ("landed", "alive", "eta", "ci", "ack-wait", "ssh-preflight", "broker-released",
                                          "deployed", "goal", "hours")),
     ("admin", ("setup", "upgrade", "start", "stop", "restart", "adopt", "prune", "secret", "consent",
                "notifier", "schedules", "heal", "upstream", "lease", "replicate", "check-plan", "stats", "audit",
                "push-audit", "ttr", "selfchange", "spend-today", "throughput", "model-trip", "echoes", "course",
-               "uninstall", "bench", "model-bench", "model")),
+               "uninstall", "bench", "model-bench", "model", "waste")),
 )
 
 
@@ -14082,7 +14246,8 @@ def main(argv: list[str] | None = None) -> None:
                         "or still run (for an on_pass_cmd; a wait keeps plain --result)")
     s.add_argument("--reap", action="store_true",
                    help="run nothing: stop this user's leftover ttp checks runs (their run ended or their folder "
-                        "is gone) that hold or wait for a host checks slot, as the daemon does (leftoverchecks)")
+                        "is gone) that hold or wait for a host checks slot, as the daemon does, and process trees "
+                        "a test left orphaned in its pytest temp folder (leftoverchecks)")
     s.add_argument("--dry-run", action="store_true", help="with --reap: only list what it would stop")
     s.add_argument("--settle", metavar="RUN_DIR",
                    help="an on_pass_cmd: on a pass of the run's detached checks on --head, write the final "
@@ -14093,6 +14258,10 @@ def main(argv: list[str] | None = None) -> None:
                         "open one) no longer hit a missing check runner, 1 while one does")
     s.add_argument("--spill-back", metavar="ALIAS",
                    help="run nothing: end spill host ALIAS's quarantine (checkspill.strike_settle) and its strikes")
+    s.add_argument("--spill-probe", metavar="ALIAS",
+                   help="exit 0 once quarantined spill host ALIAS passed a known-good run of the push branch tip "
+                        "(then back in the spill pool), 1 while it runs or failed; starts one detached when none "
+                        "runs (checkspill.known_good, its machine ledger entry's until-probe)")
     s.add_argument("--slot-status", action="store_true",
                    help="run nothing (also `ttp checks status`): print each repository's checks lanes, their "
                         "holders (pid, task, run, age, alive) and the waiters in queue order; never queues")
@@ -14128,6 +14297,9 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--effort-ab", action="store_true",
                    help="the effort A/B instead (effort_ab.enabled): per arm, $ per landed change, output tokens and "
                         "calls per run, review and checks fail rates, fix-review hops, tier-up retries, end rule")
+    s.add_argument("--chat", action="store_true",
+                   help="coordinator chat posts instead, per chat: sent at once, held for the digest, digests "
+                        "posted and held now (coordinator.chat_digest_h)")
     s.add_argument("--coord-session", action="store_true",
                    help="the persistent coordinator session instead, per day: wakes, $/wake, context growth and tool "
                         "calls per wake, rollovers, cache-read share, against the stateless baseline and break-even")
@@ -14154,6 +14326,14 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--done", action="store_true", help="with why: later changes in this run carry no why")
     s.add_argument("--json", action="store_true", help="print JSON")
     s.set_defaults(fn=cmd_audit)
+
+    s = sub.add_parser("waste", help="read-only: avoidable spend by bucket (cancelled or failed work, crashed "
+                                     "runs, extra review rounds, re-reviews, duplicates, runs past the limit, "
+                                     "costly wakes, a stand-in after a move), $ and share of the total")
+    s.add_argument("name", nargs="?", help="the project (default: the one here)")
+    s.add_argument("--since", help="a delay back (24h, 2d) or an ISO time (default: 24h)")
+    s.add_argument("--json", action="store_true", help="print JSON")
+    s.set_defaults(fn=cmd_waste)
 
     s = sub.add_parser("course", help="read-only: the Course check's own signs (failing, held, costly, idle "
                                       "turns) with every costly task listed; the digest shows at most 10 of those")
@@ -14524,6 +14704,15 @@ def main(argv: list[str] | None = None) -> None:
                    "a conflict (exit 3), the push checks it would run (without running them) and the records "
                    "it would write; exits as a landing would")
     s.set_defaults(fn=cmd_land)
+
+    s = sub.add_parser("express", help="land one small urgent reviewed head alone, now: its smoke and touched tests "
+                                       "beside any running batch, one bump, the full checks after it lands "
+                                       "(delivery.express, express_max_lines, express_max_files); 0 started, 2 refused")
+    s.add_argument("ref", help="the task (code or review) or head sha whose approved head lands")
+    s.add_argument("--why", required=True, help="what makes it urgent (kept on the batch)")
+    s.add_argument("--dry-run", action="store_true", help="check eligibility only")
+    s.add_argument("--wait", type=float, default=0.0, metavar="S", help="wait up to S seconds for the landing")
+    s.set_defaults(fn=cmd_express)
 
     s = sub.add_parser("landed", help="exit 0 once a commit or a task's landing is on the push branch, even "
                                       "rebased (same patch-id or author/date/subject), 1 while not yet, 2 if it "
@@ -15076,6 +15265,16 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("name", help="the project")
     s.add_argument("--within", default="6h", help="how recent its last successful model run must be (default 6h)")
     s.set_defaults(fn=cmd_alive)
+    s = sub.add_parser("move", help="move a project to another host without both copies starting work: --to on "
+                                     "the old host, --from on the new one; the old copy stops once the new one runs")
+    s.add_argument("name", help="the project")
+    g = s.add_mutually_exclusive_group()
+    g.add_argument("--to", metavar="HOST[:NAME]", help="this is the old copy: stop it once the copy there runs")
+    g.add_argument("--from", dest="from_", metavar="HOST[:NAME]",
+                   help="this is the new copy: start workers only once the copy there has stopped")
+    g.add_argument("--confirmed", action="store_true", help="the new copy runs: stop this one now (exit 0)")
+    g.add_argument("--cancel", action="store_true", help="forget the move recorded here")
+    s.set_defaults(fn=cmd_move)
     s = sub.add_parser("drain", help="pause the project and wait until its runs in flight end (they are not killed)")
     s.add_argument("name", help="the project")
     s.add_argument("--wait", type=float, default=0, metavar="S",
@@ -15244,7 +15443,7 @@ def dry_run_stub(a) -> None:
             or (cmd == "detach" and a.check is None):
         print(f"ttp {cmd}: refused in an on_pass_cmd dry run ({ENV}=1)", file=sys.stderr)
         sys.exit(75)
-    if cmd in ("note", "notify", "push", "land"):
+    if cmd in ("note", "notify", "push", "land", "express"):
         print(f"ttp {cmd}: skipped in an on_pass_cmd dry run ({ENV}=1)", file=sys.stderr)
         sys.exit(0)
 

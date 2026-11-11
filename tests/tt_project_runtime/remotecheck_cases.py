@@ -239,6 +239,28 @@ def _rc_gone(pid, within=10.0):
     return False
 
 
+def test_a_remote_check_s_orphan_in_its_run_dir_ends_with_the_run(tmp_path):
+    """A process a remote check left in a session of its own, with an environment of its own, ends with
+    the run when its working directory is the run's temp dir on the host (remotecheck._END)."""
+    import shutil
+    if not os.path.exists("/proc/self/status") or not shutil.which("setsid"):
+        pytest.skip("needs /proc and setsid")
+    repo = _rc_repo(tmp_path)
+    pidf = tmp_path / "orphan.pid"
+    rc, out = _rc_run(tmp_path, repo, f"setsid sh -c 'echo $$ > {pidf}.tmp; mv {pidf}.tmp {pidf}; exec env -i sleep 60' & "
+                                      f"while [ ! -e {pidf} ]; do sleep 0.05; done")
+    assert rc == 0, out
+    orphan = int(pidf.read_text())
+    try:
+        assert _rc_gone(orphan), "the orphan in the run's dir outlived the run"
+        assert _rc_left(tmp_path) == []
+    finally:
+        try:
+            os.kill(orphan, signal.SIGKILL)
+        except OSError:
+            pass
+
+
 def test_a_stopped_remote_check_stops_its_command_on_the_host(tmp_path, tmp_processes_in):
     """SIGTERM to the local side (a timeout, a `ttp checks` stop, a queue stop) stops the command where
     it runs (ssh without a tty signals nothing) and removes its temp dir; the host's stop watcher (its
@@ -500,6 +522,29 @@ def _spill_lane(p, repo):
     g = testslots.suite_hold(p.name, wait_s=0, slots=1, repo=testslots.repo_key(str(repo)))
     assert g is not None and g.files
     return g
+
+
+def _close_when_back(lane, run, said="did not pass on spill host"):
+    """Free the held lane once checks.log says the spilled run came back here, not after a fixed time: a slow
+    spill under load would otherwise find the lane free first and run here without spilling. A bounded wait
+    in a daemon thread keeps a run that never says it from holding the lane past the test."""
+    import threading
+    log = run / "checks.log"
+    start = log.stat().st_size if log.exists() else 0
+
+    def watch():
+        end = time.time() + _load_scaled(120)
+        while time.time() < end:
+            try:
+                with open(log, "rb") as f:
+                    f.seek(start)
+                    if said.encode() in f.read():
+                        break
+            except OSError:
+                pass
+            time.sleep(0.05)
+        lane.close()
+    threading.Thread(target=watch, daemon=True).start()
 
 
 def test_busy_checks_spill_to_the_first_reachable_allowed_host_and_name_it(env, tmp_path, monkeypatch):
@@ -1607,6 +1652,68 @@ def test_the_account_pool_spills_every_project_after_its_own_list_and_an_empty_o
     assert checkspill.account_hosts() == [] and checkspill.hosts({}) == []
 
 
+def test_a_project_excludes_a_pool_host_by_alias_or_machines_list_hostname(env, tmp_path, monkeypatch):
+    """delivery.checks_spill_exclude keeps named hosts out of every spill route, the account's pool and
+    checks.spill_beside_device included: an alias or the machines list's hostname (full or short) matches, the
+    run spills to the next host and its log names the setting; `ttp checks status` lists the excluded hosts."""
+    from ttp import checkspill, cli, machines, project
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, [], charter=())
+    raw = json.loads(p.config_path.read_text())
+    raw["delivery"].pop("checks_spill_hosts")
+    p.config_path.write_text(json.dumps(raw))
+    project.set_account_setting(checkspill.ACCOUNT_KEY, ["pool-a", "pool-b", "pool-c"])
+    machines.add("pool-a", hostname="serve-a.example.test")
+    machines.add("pool-b")
+    machines.add("pool-c")
+    p.set_config("checks.spill_beside_device", "*")
+    p.set_config("delivery.checks_spill_exclude", ["SERVE-A", "pool-c"])   # a short host name, any case; an alias
+    assert checkspill.hosts(p.config()) == ["pool-b"]
+    assert checkspill.excluded_hosts(p.config()) == ["pool-a", "pool-c"]
+    for h in ("pool-a", "pool-c"):
+        assert checkspill.allowed(p, p.config(), h) == "excluded by the project (delivery.checks_spill_exclude)"
+    assert checkspill.exclude_lines(p.config()) == [
+        "spill hosts excluded by the project (delivery.checks_spill_exclude): pool-a, pool-c"]
+    p.set_config("delivery.checks_spill_exclude", ["serve-a.example.test"])   # the full host name matches too
+    assert checkspill.hosts(p.config()) == ["pool-b", "pool-c"]
+    p.set_config("delivery.checks_spill_exclude", ["pool-a"])
+    log = tmp_path / "where.log"
+    p.set_config("delivery.push_checks", [f"pwd >> {log}"])
+    lane = _spill_lane(p, repo)
+    try:
+        cli.main(["checks", "--fresh"])
+    finally:
+        lane.close()
+    rec = json.loads((run / "checks.json").read_text())
+    assert rec["passed"] is True and rec["spilled_to"] == "pool-b", rec
+    assert "pool-a (excluded by the project: delivery.checks_spill_exclude)" in (run / "checks.log").read_text()
+    lines = checkspill.pick_lines(p.name)
+    assert any("pool-a took no run: excluded by the project" in x for x in lines), lines
+
+
+def test_spill_exclude_default_and_settings(env, tmp_path, monkeypatch):
+    """The empty default changes no host set; a project's own list is excluded from as the pool is; a malformed
+    exclude list is named by the config check and excludes nothing; the coordinator may set it."""
+    from ttp import checkspill, coordinator, machines, project
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a", "check-host-b"], charter=())
+    machines.add("check-host-a")
+    before = checkspill.hosts(p.config())
+    assert before == ["check-host-a", "check-host-b"]
+    p.set_config("delivery.checks_spill_exclude", [])
+    assert checkspill.hosts(p.config()) == before and checkspill.excluded_hosts(p.config()) == []
+    assert checkspill.exclude_lines(p.config()) == [] and checkspill.allowed(p, p.config(), "check-host-a") == ""
+    p.set_config("delivery.checks_spill_exclude", ["check-host-b"])
+    assert checkspill.hosts(p.config()) == ["check-host-a"]
+    for bad in ("check-host-a", 3, ["a b"]):
+        assert any("delivery.checks_spill_exclude" in x
+                   for x in project.config_problems({"delivery": {"checks_spill_exclude": bad}})), bad
+        assert checkspill.hosts({"delivery": {"checks_spill_hosts": ["check-host-a"],
+                                              "checks_spill_exclude": bad}}) == ["check-host-a"], bad
+    settable = coordinator.settable("delivery.checks_spill_exclude")
+    assert settable('["host-a"]') == ["host-a"] and settable([]) == []
+    with pytest.raises(ValueError):
+        settable("host-a")
+
+
 def test_spill_gate_reads_only_structured_settings_never_charter_wording(env, tmp_path, monkeypatch):
     """allowed() decides from delivery.checks_spill_hosts and the account's pool, never the charter: a listed
     host with no charter line is allowed, a host the charter names but no setting lists is refused with the
@@ -2578,7 +2685,7 @@ def test_an_unreachable_spill_host_backs_off_and_its_share_spreads_over_the_othe
 # probe answer never shows on the submit host). Probe jobs (--job-name=ttp-probe) log to probe.log
 # with ids from 901. FAKE_SLURM_NOACCT=1: sacct answers nothing (no accounting), scontrol does.
 # FAKE_SLURM_RC_LAG=<s>: a job's rc file shows that long after the job ended (NFS); lag.pids lists the
-# background movers, which a test waits out so none outlives it.
+# background movers, which a test waits out so none outlives it; "never": it never shows.
 _SLURM_FAKES = {
     "sbatch": r'''#!/bin/sh
 d=$FAKE_SLURM
@@ -2594,7 +2701,9 @@ elif [ "$FAKE_SLURM_MODE" = hold ]; then echo RUNNING > "$d/state.$n"
 elif [ "$FAKE_SLURM_MODE" = startfail ]; then echo FAILED > "$d/state.$n"; echo "1:0" > "$d/code.$n"
 elif [ "$FAKE_SLURM_MODE" = nodefail1 ] && [ ! -e "$d/failed" ]; then touch "$d/failed"; echo NODE_FAIL > "$d/state.$n"
 else (cd "$dir" && sh "$script" > "$out" 2>&1); echo COMPLETED > "$d/state.$n"
-  if [ -n "$FAKE_SLURM_RC_LAG" ] && [ -e "$dir/rc" ]; then
+  if [ "$FAKE_SLURM_RC_LAG" = never ] && [ -e "$dir/rc" ]; then
+    mv "$dir/rc" "$dir/rc.late"
+  elif [ -n "$FAKE_SLURM_RC_LAG" ] && [ -e "$dir/rc" ]; then
     mv "$dir/rc" "$dir/rc.late"; (sleep "$FAKE_SLURM_RC_LAG"; mv "$dir/rc.late" "$dir/rc") </dev/null >/dev/null 2>&1 &
     echo $! >> "$d/lag.pids"
   fi
@@ -2991,7 +3100,8 @@ def test_a_slurm_job_on_a_cluster_without_accounting_reads_scontrol_and_waits_ou
     assert rc == 5 and "submitting it again" not in out, out
     assert "show job 101" in (d / "scontrol.log").read_text()
     assert len((d / "sbatch.log").read_text().splitlines()) == 1
-    rc, out = _slurm_run(tmp_path, repo, "echo ran", {**fake, "FAKE_SLURM_RC_LAG": "3"}, rc_grace_s=1)
+    # Past the grace: an rc file that never shows, not a lag a slow poll under load could outwait.
+    rc, out = _slurm_run(tmp_path, repo, "echo ran", {**fake, "FAKE_SLURM_RC_LAG": "never"}, rc_grace_s=1)
     assert rc == remotecheck.FAULT_RC and "submitting it again once" in out and "ended COMPLETED" in out, out
     assert len((d / "sbatch.log").read_text().splitlines()) == 3
     _wait_out_pids(d / "lag.pids")
@@ -3314,7 +3424,7 @@ def test_a_spilled_failure_whose_head_rerun_cannot_tell_still_runs_again_here_an
                                base.replace("def test_x():\n    pass", "def test_x():\n    assert False"))
     monkeypatch.setattr(gatejudge, "rerun", lambda *a, **k: got)
     lane = _spill_lane(p, repo)
-    threading.Timer(2.0, lane.close).start()
+    _close_when_back(lane, run)
     with pytest.raises(SystemExit) as e:
         cli.main(["checks", "--fresh"])
     assert e.value.code == 1
@@ -3342,7 +3452,7 @@ def _spill_gate_unproven(env, tmp_path, monkeypatch, at):
         return next(faults) if where == at else real(run_, where, ids, *a, **k)
     monkeypatch.setattr(gatejudge, "rerun", rerun)
     lane = _spill_lane(p, repo)
-    threading.Timer(2.0, lane.close).start()
+    _close_when_back(lane, run)
     with pytest.raises(SystemExit) as e:
         cli.main(["checks", "--fresh"])
     assert e.value.code == 1
@@ -4513,6 +4623,112 @@ def test_a_spill_host_whose_runs_fail_where_the_head_passes_elsewhere_is_quarant
     with pytest.raises(ValueError):
         checkspill.quarantine_after_of("x")
 
+
+
+def _quarantine(p, host="check-host-a", sig="OSError: no space left on device"):
+    from ttp import checkspill
+    p.set_config("checks.spill_quarantine_after", 1)
+    checkspill.strike_fail(p, host, "q1", sig)
+    assert checkspill.strike_settle(p, p.config(), "q1") == [host]
+
+
+def test_a_spill_quarantine_past_its_end_comes_back_with_its_event_and_no_strikes_left(env, tmp_path, monkeypatch):
+    """A quarantine that ends by time (no known-good run passed, its ledger entry gone or unrun) ends as a lift
+    does: one back event, its strikes reset, its ledger entry closed; never silently with the old strike count.
+    The entry's until-probe is the known-good probe."""
+    from ttp import checkspill, machine_ledger
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a", "check-host-b"])
+    _quarantine(p)
+    entry = [c for c in machine_ledger.changes(["check-host-a"]) if c.get("kind") == "spill_quarantine"]
+    assert entry and entry[0]["probe"] == "ttp checks --spill-probe check-host-a || exit 1", entry
+    off = checkspill._strikes(p.db)["hosts"]["check-host-a"]["off"]
+    assert "known-good run" in checkspill.quarantined(p, "check-host-a", float(off["until"]) - 1)
+    assert checkspill.quarantined(p, "check-host-a", float(off["until"]) + 1) == ""
+    h = checkspill._strikes(p.db)["hosts"]["check-host-a"]
+    assert h["n"] == 0 and "off" not in h, h
+    assert len(_spill_events(p, "Spill host check-host-a is back")) == 1
+    assert not [c for c in machine_ledger.changes(["check-host-a"]) if c.get("kind") == "spill_quarantine"]
+
+
+def test_a_spill_quarantine_ledger_entry_is_due_at_its_expiry_while_its_probe_still_says_not_yet(
+        env, tmp_path, monkeypatch):
+    """The 7-day backstop is real: past its --expires a spill quarantine's ledger entry is due (its auto-undo
+    runs, nobody is paged) though its known-good probe never passed. Any other entry with a failing
+    until-probe stays not due past its --expires."""
+    from ttp import machine_ledger
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a", "check-host-b"])
+    _quarantine(p)
+    entry = [c for c in machine_ledger.changes(["check-host-a"]) if c.get("kind") == "spill_quarantine"][0]
+    end = float(entry["expires"])
+    assert not entry.get("probe_passed")
+    assert machine_ledger._due(entry, end - 1) == "" and not machine_ledger.auto_undo_due(entry, end - 1)
+    assert machine_ledger._due(entry, end + 1) == "expired"
+    assert machine_ledger.auto_undo_due(entry, end + 1) and machine_ledger.auto_undo_waits(entry, end + 1)
+    other = {**entry, "kind": None}
+    assert machine_ledger._due(other, end + 1) == "", "only the backstop kinds: a failing probe holds others"
+    assert machine_ledger._due({**entry, "probe_passed": True}, end - 1), "a passed probe is due as before"
+
+
+def test_the_known_good_probe_lifts_a_quarantine_only_once_its_detached_run_passes(env, tmp_path, monkeypatch):
+    """`ttp checks --spill-probe`: starts the known-good run detached and exits 1 while it runs; a refusal there
+    (exit 75) starts it again at once with no strike; a failure waits KNOWN_GOOD_RETRY_S; a pass lifts the host
+    (exit 0, one back event)."""
+    from ttp import checkspill, detach
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a", "check-host-b"])
+    cfg = p.config()
+    assert checkspill.known_good(p, cfg, "check-host-a")[0] == 0, "not quarantined"
+    _quarantine(p)
+    starts, state = [], [("running", "")]
+    rc = checkspill._known_good_rc(p, "check-host-a")
+    from ttp import gatejudge
+    monkeypatch.setattr(gatejudge, "_push_tip", lambda p_: (repo, "c0ffee1"))
+    p.set_config("delivery.push_checks", ["python3 -m pytest -q", "claude plugin validate . --strict"])
+    cfg = p.config()
+    argv = []
+    monkeypatch.setattr(detach, "start", lambda rc_, log, cmd, *a, **k: argv.extend(cmd) or 4242)
+    assert checkspill._known_good_start(p, cfg, "check-host-a", rc) == ("c0ffee1", "")
+    assert argv[:2] == ["sh", "-c"] and "--host check-host-a" in argv[2] and "--commit c0ffee1" in argv[2], argv
+    assert "pytest" in argv[2] and "validate" not in argv[2], "only the checks that may spill"
+
+    def start(p_, cfg_, alias, rc_):
+        starts.append(alias)
+        rc_.parent.mkdir(parents=True, exist_ok=True)
+        rc_.write_text("")
+        return "base1", ""
+    monkeypatch.setattr(checkspill, "_known_good_start", start)
+    monkeypatch.setattr(detach, "state", lambda rc_: state[0])
+    now = time.time()
+    assert checkspill.known_good(p, cfg, "check-host-a", now)[0] == 1 and starts == ["check-host-a"]
+    assert checkspill._strikes(p.db)["hosts"]["check-host-a"]["off"]["probe"] == "base1"
+    assert checkspill.known_good(p, cfg, "check-host-a", now)[0] == 1 and len(starts) == 1, "running"
+    state[0] = ("ended", "75")
+    assert checkspill.known_good(p, cfg, "check-host-a", now)[0] == 1 and len(starts) == 2, "refused: again now"
+    assert checkspill._strikes(p.db)["hosts"]["check-host-a"]["n"] == 1, "a refusal is no strike"
+    state[0] = ("ended", "1")
+    assert checkspill.known_good(p, cfg, "check-host-a", rc.stat().st_mtime + 60)[0] == 1 and len(starts) == 2
+    assert checkspill.quarantined(p, "check-host-a", now), "a failed known-good run keeps it out"
+    later = rc.stat().st_mtime + checkspill.KNOWN_GOOD_RETRY_S + 1
+    assert checkspill.known_good(p, cfg, "check-host-a", later)[0] == 1 and len(starts) == 3, "failed: again later"
+    state[0] = ("ended", "0")
+    code, said = checkspill.known_good(p, cfg, "check-host-a", now)
+    assert code == 0 and "passed" in said and not checkspill.quarantined(p, "check-host-a", now)
+    assert checkspill._strikes(p.db)["hosts"]["check-host-a"]["n"] == 0
+    assert len(_spill_events(p, "Spill host check-host-a is back")) == 1
+    assert checkspill.known_good(p, cfg, "check-host-a", now)[0] == 0 and len(starts) == 3
+
+
+def test_a_late_config_fault_lifts_the_quarantine_its_failure_caused(env, tmp_path, monkeypatch):
+    """One host failed alone and was quarantined; the same failure then shows on a second host: it was the
+    project's spill setup all along, so the first host comes back (one back event)."""
+    from ttp import checkspill
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a", "check-host-b"])
+    sig = "ModuleNotFoundError: No module named 'yaml'"
+    _quarantine(p, sig=sig)
+    assert checkspill.quarantined(p, "check-host-a")
+    checkspill.strike_fail(p, "check-host-b", "q2", sig)
+    assert checkspill.strike_settle(p, p.config(), "q2") == []
+    assert not checkspill.quarantined(p, "check-host-a") and not checkspill.quarantined(p, "check-host-b")
+    assert len(_spill_events(p, "Spill host check-host-a is back")) == 1
 
 def test_a_failure_every_spill_host_shares_is_one_config_incident_and_quarantines_no_host(env, tmp_path, monkeypatch):
     """The spill setup broke for all hosts (the pinned env lost: the same import error everywhere, passing here):

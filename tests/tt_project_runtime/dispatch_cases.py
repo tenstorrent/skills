@@ -2585,6 +2585,22 @@ def test_dispatch_holds_daemon_reviews_of_one_unchanged_subject_but_not_a_re_rev
     assert supersede.dispatch_hold(p.db, p.db.task(r2)) == ""
 
 
+def test_dispatch_never_holds_owners_of_different_obligations_as_duplicates(env):
+    """The owner note the harness appends to each owner's spec reads alike for any two obligations, so two owners
+    of different obligations looked like one task and the second was held. Owning other obligations is other
+    work; a same-title task owing the same obligation, or none, is still held."""
+    from ttp import supersede
+    p = make(env)
+    note = "\n\n## Obligation {} (urgent, owed to the user)\nship the deliverable\nRecord progress every 2 h.\n"
+    a = p.db.add_task("ship the relay deliverable", "build it" + note.format("o1"), kind="work")
+    b = p.db.add_task("ship the relay deliverable", "build it" + note.format("o2"), kind="work")
+    c = p.db.add_task("ship the relay deliverable", "build it" + note.format("o1"), kind="work")
+    d = p.db.add_task("ship the relay deliverable", "build it", kind="work")
+    assert supersede.dispatch_hold(p.db, p.db.task(b)) == ""
+    assert f"duplicates #{a}" in supersede.dispatch_hold(p.db, p.db.task(c))
+    assert "duplicates #" in supersede.dispatch_hold(p.db, p.db.task(d))
+
+
 def test_dispatch_holds_a_task_whose_step_a_newer_user_order_superseded(env):
     """An obligation's `supersedes` steps are kept with the order: a queued task created before it whose spec
     still carries such a step is held at dispatch; one re-specified after the order, or created after it, runs."""
@@ -2676,3 +2692,130 @@ def test_a_landing_record_from_before_a_run_began_never_stops_it(env, tmp_path):
     d.stop_superseded()
     assert p.db.task(tid)["status"] == "running" and not (tmp_path / "STOP").exists()
     assert not p.db.q("SELECT 1 FROM events WHERE task=? AND kind=?", (tid, supersede.STOPPED))
+
+
+def _ended_runs(p, tid, n, cost=0.5, status="error", handoff=None):
+    """`n` ended worker runs of task `tid`, each spending `cost`, with `handoff` (a result.json) or none."""
+    for i in range(n):
+        run_dir = p.base / f"run-{tid}-{time.time_ns()}"
+        run_dir.mkdir()
+        if handoff:
+            (run_dir / "result.json").write_text(json.dumps(handoff))
+        p.db.x("INSERT INTO runs(task,role,provider,effort,status,started,ended,cost_usd,dir,note) "
+               "VALUES(?,?,?,?,?,?,?,?,?,?)", (tid, "worker", "claude", "high", status, time.time(),
+                                               time.time() + 1, cost, str(run_dir), json.dumps({"error": f"boom {i}"})))
+
+
+def test_a_task_at_its_run_cap_is_blocked_and_the_coordinator_told_once(env, monkeypatch):
+    """Upstream user msg #2495 (2a): a task the daemon re-ran 4 times (tier-up retries, restarts) is not
+    dispatched a fifth time. It is blocked, with one run_cap event carrying a model-free summary of each
+    run and the last error; an explicit requeue starts the count again, and chains.max_task_runs 0 turns
+    the cap off. Runs that never reached the model do not count."""
+    from ttp import dispatchguard, runcap
+    p = make(env)
+    _no_events(p)
+    p.db.x("UPDATE tasks SET status='done'")
+    tid = p.db.add_task("loops forever", "s", kind="work", tier="light", origin="user", provider="claude")
+    _ended_runs(p, tid, 3, handoff={"status": "waiting", "summary": "tried a flag"})
+    _ended_runs(p, tid, 2, cost=0, status="limit")   # free ends: not runs here
+    d, started = _reuse_daemon(p, monkeypatch)
+    d.dispatch()
+    assert started == [tid], "3 runs: under the cap"
+    p.db.update_task(tid, status="queued")
+    _ended_runs(p, tid, 1, handoff={"status": "waiting", "summary": "tried a flag again"})
+    d.dispatch()
+    d.dispatch()
+    t = p.db.task(tid)
+    assert started == [tid] and t["status"] == "blocked" and "max_task_runs 4" in t["blocked_reason"]
+    ev = p.db.q("SELECT * FROM events WHERE kind=?", (runcap.RUN_CAP_EVENT,))
+    assert len(ev) == 1 and ev[0]["task"] == tid
+    assert "4 runs, $2.00" in ev[0]["text"] and "tried a flag again" in ev[0]["text"]
+    assert "no same-approach retry" in ev[0]["text"]
+    dispatchguard.record_requeue(p.db, tid, "blocked", "coordinator")
+    p.db.update_task(tid, status="queued")
+    d.dispatch()
+    assert started == [tid, tid], "an explicit requeue starts the count again"
+    p.db.update_task(tid, status="queued")
+    time.sleep(0.01)
+    _ended_runs(p, tid, 4, cost=0.1, handoff={"status": "waiting"})
+    assert runcap.check(p, p.config(), p.db.task(tid))
+    p.db.update_task(tid, status="queued")
+    p.set_config("chains.max_task_runs", 0)
+    assert runcap.check(p, p.config(), p.db.task(tid)) == "", "0 turns the cap off"
+
+
+def test_the_daemons_and_push_queues_own_requeues_never_restart_the_run_count(env):
+    """Review #8098: only an explicit requeue (the coordinator, the user, a chain continue) restarts the
+    run count. The daemon's requeue of a lost run and the push queue's rework requeue write the same
+    event kind; a crash or rework loop that reset the count on them would never reach the cap."""
+    from ttp import dispatchguard, pushq, runcap
+    p = make(env)
+    tid = p.db.add_task("crash loop", "s", kind="work", tier="light", origin="user")
+    _ended_runs(p, tid, 4, cost=0.1, handoff={"status": "waiting"})
+    time.sleep(0.01)
+    p.db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+           (time.time(), "daemon", "task_requeued", "low", f"#{tid} was marked running with no live run",
+            "handled", tid))
+    pushq._event(p.db, p.db.task(tid), "task_requeued", f"#{tid}: its review runs again", queued=False)
+    assert "max_task_runs 4" in runcap.check(p, p.config(), p.db.task(tid)), "automatic requeues count on"
+    time.sleep(0.01)
+    dispatchguard.record_requeue(p.db, tid, "blocked", "coordinator")
+    p.db.update_task(tid, status="queued")
+    assert runcap.check(p, p.config(), p.db.task(tid)) == "", "the coordinator's requeue starts it again"
+
+
+def test_a_task_whose_last_runs_spent_money_with_no_progress_is_blocked(env):
+    """Upstream user msg #2495 (2a): two runs in a row that each spent money and handed off neither done
+    nor waiting (and, for code, committed nothing) stop the task under the run cap; a waiting hand-off is
+    progress, and chains.max_idle_runs 0 turns the check off."""
+    from ttp import runcap
+    p = make(env)
+    p.set_config("chains.max_task_runs", 0)   # the idle check alone
+    tid = p.db.add_task("spins", "s", kind="work", tier="light", origin="user")
+    _ended_runs(p, tid, 1)
+    _ended_runs(p, tid, 1, handoff={"status": "waiting", "summary": "checks detached"})
+    assert runcap.check(p, p.config(), p.db.task(tid)) == "", "the last run made progress"
+    _ended_runs(p, tid, 1)
+    assert runcap.check(p, p.config(), p.db.task(tid)) == "", "one idle run is not a loop"
+    _ended_runs(p, tid, 1, handoff={"status": "failed", "summary": "same error"})
+    p.set_config("chains.max_idle_runs", 0)
+    assert runcap.check(p, p.config(), p.db.task(tid)) == ""
+    p.set_config("chains.max_idle_runs", 2)
+    why = runcap.check(p, p.config(), p.db.task(tid))
+    assert "last 2 runs spent $1.00 with no hand-off" in why and p.db.task(tid)["status"] == "blocked"
+
+
+@pytest.mark.parametrize("at", ["before_spawn", "after_record"])
+def test_a_step_stop_in_a_worker_start_never_leaves_its_task_running_with_no_run(
+        env, monkeypatch, tmp_path, reap_tmp_processes, at):
+    """The step's stop (StepBudgetSpent, no Exception) landing in start_run before the runner spawned puts
+    the task back to queued; one landing after the run was recorded keeps the task running with its run."""
+    from ttp import stepclock
+    from ttp.daemon import Daemon
+    p, d, drain, settle = _slot_setup(env, monkeypatch, tmp_path, slots=1)
+    tid = p.db.add_task("one", "s", kind="work", tier="light", origin="user")
+    real = Daemon.start_run
+
+    def start_run(self, *a, **k):
+        if at == "before_spawn":
+            stepclock._on_alarm(signal.SIGALRM, None)
+        rid = real(self, *a, **k)
+        stepclock._on_alarm(signal.SIGALRM, None)
+        return rid
+    monkeypatch.setattr(Daemon, "start_run", start_run)
+    monkeypatch.setattr(stepclock, "_arm", lambda t: None)   # no real SIGALRM: the test places the stop
+    try:
+        stepclock.begin("dispatch", 600, 5)
+        try:
+            with pytest.raises(stepclock.StepBudgetSpent):
+                d.dispatch()
+        finally:
+            stepclock.end()
+        status = p.db.task(tid)["status"]
+        if at == "before_spawn":
+            assert status == "queued" and not _slot_tasks(p), status
+        else:
+            assert status == "running" and _slot_tasks(p) == [tid], status
+    finally:
+        drain(d)
+        assert reap_tmp_processes(tmp_path) == [], "a stand-in run outlived the test"

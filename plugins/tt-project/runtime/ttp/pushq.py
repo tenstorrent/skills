@@ -40,6 +40,7 @@ from . import (   # one name per line: two changes adding names merge without a 
     scopehold,
     setupfault,
     sharedchecks,
+    stepclock,
     syntaxfault,
     timefmt,
     upstream,
@@ -70,6 +71,7 @@ from .worktree import FORK_POINT_REF, fix_branches, named_refs
 
 REF_PREFIX = "refs/ttp/push/"   # + row id: pins the approved commit until its row is settled
 KV = "push_queue"               # kv: {"backoff_until", "deaths", "bad_tip": {"tip", "fails", "tried", "at", ...}, "tips_told"}
+CYCLE_SAID_KEY = "push_queue_cycle_said"   # kv: the announced power cycle a held batch start was logged for
 DEFAULT_BATCH_S = 300           # delivery.push_batch_s: the oldest approval waits at most this long for running reviews
 DEFAULT_BATCH_MAX = 8           # delivery.push_batch_max: start at once with this many (no longer a batch's most: one train takes every approval)
 DEFAULT_MIN_GAP_S = 1800        # delivery.push_min_gap_s: after a batch that did not end clean, the least time to the next start
@@ -1706,15 +1708,17 @@ def _spawn(p: Project, bid: str, marker: Path, lock) -> subprocess.Popen:
         checkdirs.cleanup(output, whole=True)
 
 
-def start(p: Project, rows: list[dict], name: str, now: float | None = None) -> str | None:
+def start(p: Project, rows: list[dict], name: str, now: float | None = None, extra: dict | None = None,
+          prefix: str = "batch-") -> str | None:
     """Start a batch for `rows` (see due): marker, run lock, rows `batched`, a push_batches row,
-    then the detached process. Returns the batch id, or None when nothing started."""
+    then the detached process. Returns the batch id, or None when nothing started. `extra` goes on the
+    marker and `prefix` starts the id (express.start: an express landing's "express" and "express-")."""
     now = time.time() if now is None else now
     db = p.db
     folder = p.state / push.DETACHED
     folder.mkdir(parents=True, exist_ok=True)
     push._prune(folder, now)
-    bid = base = "batch-" + time.strftime("%Y%m%d-%H%M%S", time.localtime(now)) + f"-{os.getpid()}"
+    bid = base = prefix + time.strftime("%Y%m%d-%H%M%S", time.localtime(now)) + f"-{os.getpid()}"
     n = 1
     while (folder / f"{bid}.json").exists() or db.one("SELECT id FROM push_batches WHERE id=?", (bid,)):
         n += 1
@@ -1728,7 +1732,7 @@ def start(p: Project, rows: list[dict], name: str, now: float | None = None) -> 
         m = {"v": 1, "kind": "batch", "id": bid, "status": "running", "phase": "push", "pid": None, "started": now,
              "repo": str(p.root), "target": name, "log": str(marker.with_suffix(".log")), "lock": str(lock_path),
              "entries": [{"id": r["id"], "task": r["task"], "branch": r["branch"], "head": r["head"],
-                          "ref": f"{REF_PREFIX}{r['id']}"} for r in rows]}
+                          "ref": f"{REF_PREFIX}{r['id']}"} for r in rows], **(extra or {})}
         if cur := target(p):
             name = f"{cur[0]}/{cur[1]}"     # delivery.push_branch as it is now, whatever the caller read
         m["target"] = name
@@ -1765,10 +1769,13 @@ def start(p: Project, rows: list[dict], name: str, now: float | None = None) -> 
                 raise _Changed()
             db.x("INSERT INTO push_batches(id,marker,target,started) VALUES(?,?,?,?)", (bid, str(marker), name, now))
         # From here on finalize owns the batch: a process that never starts is a batch that died.
-        child = _spawn(p, bid, marker, lock)
-        m["pid"] = child.pid
-        write_json(marker, m)
-        child.stdin.close()      # the go
+        # A step-budget stop waits until its pid is on the marker: one landing in between would leave
+        # the batch running with no pid finalize can see, and its dropped stdin pipe would give the go.
+        with stepclock.critical():
+            child = _spawn(p, bid, marker, lock)
+            m["pid"] = child.pid
+            write_json(marker, m)
+            child.stdin.close()      # the go
         prev = db.one("SELECT * FROM push_batches WHERE outcome='rebooted' AND id!=? ORDER BY started DESC LIMIT 1",
                       (bid,))
         if prev and _read(Path(prev["marker"])).get("rerun_by") is None:
@@ -1864,9 +1871,19 @@ def schedule(p: Project, cfg: dict | None = None, log: Callable[[str], None] = l
         return None
     if retarget(p, name):
         log(f"push queue: approvals for an old target sent back to their reviews (target now {name})")
+    from . import express
+    if bid := express.auto(p, name, log):
+        return bid
     rows, why = due(p, cfg=cfg)
     if not rows:
         return None
+    if held := _cycle_held(p, cfg):   # its checks would be cut: the batch starts once the cycle is over
+        if db.kv(CYCLE_SAID_KEY) != held:
+            db.set_kv(CYCLE_SAID_KEY, held)
+            log(f"push queue: no new batch starts: {held}")
+        return None
+    if db.kv(CYCLE_SAID_KEY):
+        db.set_kv(CYCLE_SAID_KEY, None)
     bid = start(p, rows, name)
     if bid:
         log(f"push queue: started {bid} with {len(rows)} approval{'s' if len(rows) > 1 else ''} ({why})")
@@ -2781,7 +2798,7 @@ def _after_push_set(p: Project, cfg: dict | None) -> bool:
 
 def _cycle_held(p: Project, cfg: dict | None) -> str:
     """The line of a power cycle of this host a device broker announced, or "" (cyclenotice.py)."""
-    h = cyclenotice.held(cyclenotice.paths(cfg) if cfg else cyclenotice.project_paths(p))
+    h = cyclenotice.project_held(p, cfg)
     return cyclenotice.line(h, p) if h else ""
 
 

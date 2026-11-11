@@ -18,6 +18,9 @@ site (call sites pass their own timeout through timeout()). A git write outside 
 its own timeout: killing it midway can leave a lock or a half-removed worktree. A capped call that
 times out raises subprocess.TimeoutExpired as before, and its caller degrades as it does for a git
 failure. Outside a bounded scope timeout() returns the call's own timeout.
+A git check (_CHECKS: check-ref-format, var, version; no repository read, no lock) is an action's own
+check: it gets at least PURE_FLOOR_S past a scope's deadline, and a strict round's slice neither refuses
+nor counts it, so slow Python before it never fails it with "timed out after 0 seconds".
 
 run() is the one way runtime code runs git (a guard test holds every helper to it). Within an
 attempt() (a finish: its warm-up, then its transaction's rounds) it keeps each read's answer in the
@@ -52,6 +55,7 @@ HOLD_SLICE_S = 1.5  # live git one strict round of a finish transaction may run 
 MAX_ROUNDS = 50     # rounds of one finish before its last, which never aborts (Daemon._finish_rounds)
 FINISH_WALL_S = 90.0    # nor past this long: the reads it learns between rounds share this wall too
 PREFETCH_GIT_S = 60.0   # all git one finish's warm-up (Daemon._prefetch_git) runs, together
+PURE_FLOOR_S = 10.0   # a git check (check-ref-format, var, version: no repository read, no lock) gets at least this
 # git's own options that take the next argument (git -C <dir> <verb> ...)
 _OPTS_WITH_VALUE = frozenset({"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path", "--config-env"})
 # Verbs that only read the repository (a scratch GIT_INDEX_FILE aside): bounded() caps them anywhere.
@@ -128,6 +132,8 @@ def timeout(own: float | None, args: tuple | list = (), read: bool | None = None
         t = cap[0] if t is None else min(t, cap[0])
     if cap[1] is not None:
         left = cap[1] - time.monotonic()
+        if args and args[0] in _CHECKS:   # reads no repository: an action's own check never starves on what is left
+            left = max(left, PURE_FLOOR_S)
         if left <= 0:   # past the deadline: no new spawn
             raise subprocess.TimeoutExpired(["git", *map(str, args)], 0)
         t = left if t is None else min(t, left)
@@ -192,6 +198,8 @@ _att: contextvars.ContextVar[Attempt | None] = contextvars.ContextVar("ttp_gitat
 _own: contextvars.ContextVar[bool] = contextvars.ContextVar("ttp_gitown", default=False)
 # git verbs outside READS that change nothing: they never make a round's point of no return
 _PURE = frozenset({"merge-file", "var", "check-ref-format", "version", "hash-object"})
+# Of those, the ones that read no file at all: an action's own check (see PURE_FLOOR_S)
+_CHECKS = frozenset({"check-ref-format", "var", "version"})
 
 
 @contextlib.contextmanager
@@ -283,6 +291,8 @@ def on_audit(event: str, args: tuple) -> None:
     if Path(str(exe)).name != "git":
         rd.pnr = True
         return
+    if isinstance(argv, (list, tuple)) and (args := git_args(argv)) and args[0] in _CHECKS:
+        return   # check-ref-format and the like read no repository: never refused, nor counted in the slice
     if rd.left() <= 0:
         if rd.abort():
             raise GitMiss(argv, {}, None, None, "raw git past the round's slice", learn=False)
@@ -457,12 +467,13 @@ keeps its own cap and makes the round's point of no return)."""
     t = _cap_timeout(timeout, args, read)
     check = bool(kw.pop("check", False))
     write = not is_read(args) and not _pure(args)
+    pure = bool(args) and args[0] in _CHECKS   # reads no repository: the slice neither binds nor counts it
     slice_binds = False
     if rd and rd.abort() and a.stopping():   # a stop ends the round before its next live git
         raise GitMiss(argv, {**kw, "check": check}, timeout, read, "the daemon is stopping", learn=False)
     if rd and write:
         rd.pnr = True   # a write keeps its own cap: the slice never refuses, binds or kills it
-    elif rd:
+    elif rd and not pure:
         left = rd.left()
         if left <= 0:
             if rd.abort():
@@ -477,7 +488,7 @@ keeps its own cap and makes the round's point of no return)."""
     try:
         r = _spawn(argv, t, kw)
     except subprocess.TimeoutExpired:
-        if rd:
+        if rd and not pure:
             rd.live_s += time.monotonic() - t0
             rd.live_n += 1
             if slice_binds and rd.abort():
@@ -489,7 +500,7 @@ keeps its own cap and makes the round's point of no return)."""
     finally:
         if write:
             gitreplay.end(a.id)     # its own volatile and once answers may predate the write
-    if rd:
+    if rd and not pure:
         rd.live_s += time.monotonic() - t0
         rd.live_n += 1
     if k is not None:

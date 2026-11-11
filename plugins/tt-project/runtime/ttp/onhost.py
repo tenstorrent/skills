@@ -11,6 +11,7 @@ line() is the state the digest rows and Expected finish show for a host task:
 - 'queued for a worker, ETA <start>' (queued, or open with no record yet),
 - 'worker running, waiting for <resource> since HH:MM' (running, no grant yet),
 - 'on <resource> since HH:MM' (a grant recorded),
+- 'detached job running on <host>' (no grant, but a detached job it started still runs),
 - 'stop requested; N jobs still running on <resource>' (a cancelled, failed or exhausted task whose
   detached jobs still run: until the job sweep has ended them). Its `ttp detach --remote` jobs count
   too, from their mirrors in its run dirs (detach.mirror_save): one counts until an answer from its host
@@ -24,11 +25,12 @@ names (#id), the reply's backing tasks (open tasks answering its chat, its `owne
 batch adds or updates. When one of them has not started on its host (or was stopped while its jobs
 still run) and a sentence claims an action is under way or done ('now', '...ing it', 'started',
 'stopped', 'only X runs') about it, that sentence is kept but marked planned, not started, and the honest
-status of each such task is appended. A claim is about a task when it names its #id or resource, or, when
-the reply speaks for one unstarted task, when its subject is that work: the speaker ('I'm ...'), a pronoun
-('it is ...'), none ('Resetting the board') or a noun phrase sharing a word with its title. A sentence whose
-subject is something else ('The review passed ...', 'That batch is now ...') states a fact and stays as written. Nothing else in the message changes and it is posted at once: a rewrite
-in place keeps every word (goal 1) and the user never reads the claim as a fact."""
+status of each such task is appended. A claim is about a task only when it names its #id or its resource
+or host; any other sentence states a fact about other work and stays as written. A task with a detached
+job still live on its host (a queued task's driver too) is under way. Inside a block meant to be posted
+as written (segments(): a fenced code block, text between '---' lines, a '>' quote) nothing is inserted:
+the marker goes on its own line after the block, quoting the sentence. Nothing else in the message changes
+and it is posted at once: a rewrite in place keeps every word (goal 1) and the user never reads the claim as a fact."""
 from __future__ import annotations
 
 import json
@@ -86,8 +88,8 @@ def record(run_dir, resources, kind: str = "lock", now: float | None = None) -> 
 
 
 def _labels(task: dict) -> list[str]:
-    try:
-        got = json.loads(task.get("labels") or "[]")
+    try:   # a stored task's labels are JSON; a pending task_add's (pending()) a list
+        got = task.get("labels") if isinstance(task.get("labels"), list) else json.loads(task.get("labels") or "[]")
     except (TypeError, ValueError):
         return []
     return [x for x in got if isinstance(x, str)] if isinstance(got, list) else []
@@ -185,19 +187,21 @@ REMOTE_TIMEOUT_S = 10       # one ssh call for a remote job's liveness
 REMOTE_EVERY_S = 60         # a remote job seen running is asked about again after this long
 REMOTE_UNREACHABLE_S = 300  # one whose host did not answer, after this long
 REMOTE_BUDGET_S = 20        # ssh time one sweep spends; the rest wait for the next sweep
+OPEN_IDLE = ("queued", "waiting", "blocked")   # open, no worker: refresh_remote asks after their jobs too
 
 
 def refresh_remote(p, now: float | None = None, budget: float = REMOTE_BUDGET_S) -> int:
-    """The job sweep's model-free probe of the `ttp detach --remote` jobs of tasks that ended (jobstop.ENDED,
-    within SWEEP_DAYS): one bounded ssh call per job not known to have ended (detach.mirror_probe), whose
+    """The job sweep's model-free probe of the `ttp detach --remote` jobs of tasks that ended (jobstop.ENDED)
+    or wait with no worker (OPEN_IDLE: their live driver counts as under way, state()), within SWEEP_DAYS:
+    one bounded ssh call per job not known to have ended (detach.mirror_probe), whose
     answer goes to its mirror: an end, 'running', 'none' (no driver at its path) or 'unreachable'. A host
     that did not answer is not asked again in this sweep. The number of ssh calls made."""
     from . import detach
     from .jobstop import ENDED, SWEEP_DAYS
     now = time.time() if now is None else now
-    marks = ",".join("?" * len(ENDED))
+    marks = ",".join("?" * (len(ENDED) + len(OPEN_IDLE)))
     rows = p.db.q(f"SELECT DISTINCT r.dir FROM runs r JOIN tasks t ON t.id=r.task WHERE t.status IN ({marks}) "
-                  "AND r.dir IS NOT NULL AND COALESCE(r.started, 0)>?", (*ENDED, now - SWEEP_DAYS * 86400))
+                  "AND r.dir IS NOT NULL AND COALESCE(r.started, 0)>?", (*ENDED, *OPEN_IDLE, now - SWEEP_DAYS * 86400))
     down: set[str] = set()
     calls, t0 = 0, time.monotonic()
     for row in rows:
@@ -279,6 +283,10 @@ def state(p, task: dict, now: float | None = None, est=None, cfg: dict | None = 
     got = started(p, task, cfg)
     if got and st != "queued":
         return {"kind": "on", "started": True, "line": f"on {got[1]} since {timefmt.short(got[0], p, now)}"}
+    n, res, _, _ = live_jobs(p, task)
+    if n:   # a detached job it started still runs there (a queued task's driver too): under way
+        return {"kind": "on", "started": True,
+                "line": f"detached job{'s' if n != 1 else ''} running on {', '.join(res or named)}"}
     if st == "running":
         since = _waiting_since(p, task)
         return {"kind": "waiting", "started": False,
@@ -359,39 +367,56 @@ def _names(sentence: str, task: dict) -> bool:
     return False
 
 
-# Openings before a sentence's subject: list marks, numbering, a short 'Label:' and linking words.
-_LEAD = re.compile(r"(?i)^\s*(?:[-*>\u2022]+\s*|\(?\d{1,3}[.)]\s*|[\w .'-]{1,30}:\s+|(?:also|so|and|but|then|"
-                   r"meanwhile|plus|ok|okay)\b,?\s+)*")
-_DET = {"the", "a", "an", "that", "this", "these", "those", "its", "their", "his", "her", "each", "every", "both",
-        "some", "another", "one", "all", "any", "no"}
-_AUX = {"is", "are", "was", "were", "be", "been", "has", "have", "had", "will", "would", "can", "could", "may", "might",
-        "should", "must", "do", "does", "did", "isn't", "aren't", "wasn't", "weren't", "hasn't", "haven't", "hadn't",
-        "won't", "didn't", "doesn't", "ran", "runs", "got", "gets", "now", "only"}
-# Nouns that name a reply's own work whatever its title says.
-_WORK = {"task", "job", "jobs", "run", "work", "step"}
-_STOP = {"with", "from", "into", "onto", "over", "this", "that", "these", "those", "their", "them", "then", "than",
-         "when", "what", "which", "while", "for", "and", "the", "new", "task", "work", "code"}
+_FENCE = re.compile(r"^\s*(`{3,}|~{3,})")
+_RULE = re.compile(r"^\s*-{3,}\s*$")
 
 
-def _subject_is(sentence: str, task: dict) -> bool:
-    """Whether a claim sentence that names no #id or resource speaks of `task`, the reply's one unstarted task:
-    its subject is the speaker, a pronoun or none (it opens with the verb), or a noun phrase ('the reset') that
-    names that work (a word of its title, or 'the job'). Any other noun phrase ('The review passed', 'That batch
-    is now ...', 'the provider stopped ...') is the subject of a fact about other things."""
-    words = re.findall(r"[\w'\u2019.-]+", _LEAD.sub("", sentence.strip(), count=1))[:6]
-    words = [w.lower().replace("\u2019", "'").strip(".") for w in words]
-    if not words or words[0] not in _DET or len(words) < 2:
-        return True
-    if words[0] in {"this", "that", "these", "those"} and (words[1] in _AUX or re.search(r"(?:ing|ed)$", words[1])):
-        return True   # 'This is running', 'That started': a pronoun, not a determiner
-    np = []
-    for w in words[1:]:
-        if w in _AUX or (len(w) > 4 and re.search(r"(?:ing|ed)$", w)):
-            break
-        np.append(w)
-    stem = lambda w: re.sub(r"(?:ing|ed|es|s)$", "", w)[:5]   # noqa: E731  slots/slot, cycling/cycle
-    title = {stem(w) for w in re.findall(r"[a-z][a-z0-9]{3,}", str(task.get("title") or "").lower()) if w not in _STOP}
-    return any(w in _WORK or (len(w) > 3 and w not in _STOP and stem(w) in title) for w in np)
+def segments(text: str) -> list[tuple[str, bool]]:
+    """`text` cut into (chunk, is_block) pieces that join back to it exactly. A block is text meant to be
+    posted as written: a fenced code block (to its closing fence, or the end), the lines between two '---'
+    lines (a lone '---' is a rule, not a block) or a run of '>' quote lines. A block chunk leaves out its
+    last newline, so a marker line goes right after it (marker_after)."""
+    lines = (text or "").splitlines(keepends=True)
+    out, plain, i = [], "", 0
+
+    def fence_end(k: int) -> int:
+        m = _FENCE.match(lines[k])
+        for j in range(k + 1, len(lines)):
+            if lines[j].lstrip().startswith(m.group(1)[0] * len(m.group(1))):
+                return j
+        return len(lines) - 1
+
+    while i < len(lines):
+        j = None
+        if _FENCE.match(lines[i]):
+            j = fence_end(i)
+        elif _RULE.match(lines[i]):
+            k = i + 1
+            while k < len(lines) and not _RULE.match(lines[k]):
+                k = fence_end(k) + 1 if _FENCE.match(lines[k]) else k + 1
+            j = k if k < len(lines) else None
+        elif lines[i].lstrip().startswith(">"):
+            j = i
+            while j + 1 < len(lines) and lines[j + 1].lstrip().startswith(">"):
+                j += 1
+        if j is None:
+            plain += lines[i]
+            i += 1
+            continue
+        block = "".join(lines[i:j + 1])
+        if plain:
+            out.append((plain, False))
+        tail = block[len(block.rstrip("\r\n")):]
+        out.append((block[:len(block) - len(tail)], True))
+        plain, i = tail, j + 1
+    if plain or not out:
+        out.append((plain, False))
+    return out
+
+
+def quoted(sentence: str) -> str:
+    """A block's sentence as a marker line after the block quotes it: without its quote mark."""
+    return '"' + re.sub(r"^[\s>]+", "", sentence).strip() + '"'
 
 
 def guard(p, text: str, tasks: list[dict], now: float | None = None) -> tuple[str, list[str]]:
@@ -400,9 +425,8 @@ def guard(p, text: str, tasks: list[dict], now: float | None = None) -> tuple[st
     now = time.time() if now is None else now
     if not text or not tasks:
         return text, []
-    parts = re.split(r"((?<=[.!?;])[ \t]+|\n)", text)
-    hits = [k for k in range(0, len(parts), 2) if claims(parts[k])]
-    if not hits:
+    segs = [(re.split(r"((?<=[.!?;])[ \t]+|\n)", chunk), block) for chunk, block in segments(text)]
+    if not any(claims(parts[k]) for parts, _ in segs for k in range(0, len(parts), 2)):
         return text, []
     from . import eta
     try:
@@ -424,29 +448,36 @@ def guard(p, text: str, tasks: list[dict], now: float | None = None) -> tuple[st
             waiting.append((t, f"{who}: {got['line']}"))
     if not waiting:
         return text, []
-    direct = [t for t, _ in waiting if not t.get("via_chat")]
     about: set[int] = set()   # indexes in `waiting` of the tasks a marked sentence is about
-    for k in hits:
-        named = {int(x) for x in re.findall(r"#(\d{1,9})\b", parts[k])}
-        # A sentence is about an unstarted task when it names its #id; naming no #id, when it names that
-        # task's resource, or the reply speaks for exactly one unstarted task (a chat's other open tasks do
-        # not count) and the sentence's subject is that work (_subject_is). Any other claim sentence is left
-        # as written: it states a fact about other work.
-        if named:
-            hit = {j for j, (t, _) in enumerate(waiting) if t.get("id") in named}
-        else:
-            hit = {j for j, (t, _) in enumerate(waiting) if _names(parts[k], t)}
-            if not hit and len(direct) == 1 and _subject_is(parts[k], direct[0]):
-                hit = {j for j, (t, _) in enumerate(waiting) if t is direct[0]}
-        if hit:
-            parts[k] = f"{MARK} {parts[k].strip()}"
+    marked, out = 0, []
+    for parts, block in segs:
+        after = []
+        for k in range(0, len(parts), 2):
+            if not claims(parts[k]):
+                continue
+            named = {int(x) for x in re.findall(r"#(\d{1,9})\b", parts[k])}
+            # A sentence is about an unstarted task only when it names its #id, or (naming no #id) that
+            # task's resource or host. Any other claim sentence is left as written: it states a fact about
+            # other work, whatever its subject.
+            if named:
+                hit = {j for j, (t, _) in enumerate(waiting) if t.get("id") in named}
+            else:
+                hit = {j for j, (t, _) in enumerate(waiting) if _names(parts[k], t)}
+            if not hit:
+                continue
+            marked += 1
             about |= hit
-    if not about:
+            if block:   # text meant to be posted as written: the marker goes on its own line after it
+                after.append(f"\n{MARK} {quoted(parts[k])}")
+            else:
+                parts[k] = f"{MARK} {parts[k].strip()}"
+        out.append("".join(parts) + "".join(after))
+    if not marked:
         return text, []
     # Only the tasks the message itself claimed: the other unstarted tasks it covers get no forecast line
     honest = [waiting[j][1] for j in sorted(about)]
     footer = ((cfg.get("coordinator") or {}).get("status_footer", True) is not False)
-    out = "".join(parts).rstrip() + ("\n" + STATUS_HEAD + "; ".join(honest) if footer else "")
+    out = "".join(out).rstrip() + ("\n" + STATUS_HEAD + "; ".join(honest) if footer else "")
     note = (f"onhost: a message said work was under way or done that has not started on its host "
             f"({'; '.join(honest)[:300]}); it was sent marked as planned"
             + (" with that status" if footer else " (coordinator.status_footer is off: no status line)")

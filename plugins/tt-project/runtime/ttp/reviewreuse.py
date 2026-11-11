@@ -90,6 +90,35 @@ def accepted(db, sha: str, key: str, skip: int | None = None, p=None) -> dict | 
     return None
 
 
+def judged(db, sha: str, key: str, skip: int | None = None) -> dict | None:
+    """The newest review that failed `sha` under check set `key` with a finding (a verdict, not a crash or
+    a check, precheck or approval failure: reviewcap.unjudged), or None: a later review of the unchanged
+    head would only repeat it."""
+    from .reviewcap import unjudged
+    if not sha:
+        return None
+    for r in db.q("SELECT * FROM tasks WHERE kind='review' AND status='failed' AND labels LIKE ? ORDER BY id DESC",
+                  (f'%"{head_label(sha, key)}"%',)):
+        res = _result(r)
+        if r["id"] != skip and not unjudged(r) and (res.get("followups") or res.get("status") == "changes_needed"
+                                                     or res.get("reused_review")):
+            return r
+    return None
+
+
+def carry(db, review: dict, prior: dict, sha: str, key: str) -> str:
+    """Close `review` failed with failed review `prior`'s verdict on the same head, without a run, and
+    with no follow-ups (so no fix round starts from it): the summary for the caller's event."""
+    clip = str(_result(prior).get("summary") or "")[:SUMMARY_CHARS]
+    summary = (f"Head {sha[:12]} is unchanged since review #{prior['id']} failed it under the same checks: its "
+               f"verdict stands, no new run." + (f" Its summary: {clip}" if clip else ""))
+    db.update_task(review["id"], status="failed", blocked_reason=None,
+                   labels=with_head(json.loads(review.get("labels") or "[]"), sha, key),
+                   result=json.dumps({"status": "failed", "summary": summary, "reused_review": prior["id"],
+                                      "reviewed_head": sha}))
+    return summary
+
+
 def rebased_away(p, review: dict, sha: str) -> str:
     """Why `review` must not reuse the verdict on `sha`, or "": each other head it covers
     (worktree.covered_heads) that `sha` does not contain must carry the same commits past the base
@@ -140,8 +169,9 @@ def _result(task: dict) -> dict:
 
 
 def rejection(prior: dict, sha: str) -> str:
-    """Why task_add refuses a review of a head `prior` already accepted."""
-    return (f"head {sha[:12]} was already accepted by review #{prior['id']} under the same checks: its verdict "
+    """Why task_add refuses a review of a head `prior` already accepted or failed (judged)."""
+    did = "failed" if prior.get("status") == "failed" else "accepted"
+    return (f"head {sha[:12]} was already {did} by review #{prior['id']} under the same checks: its verdict "
             f"stands (dependents can take it from #{prior['id']}); review a new head, or add force: true with "
             f"a reason saying why this head needs another review")
 

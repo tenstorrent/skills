@@ -54,6 +54,37 @@ def test_a_check_s_background_child_ends_with_it_and_leaves_no_sandbox_tree(env,
         assert "ttp checks: reaped 1 leftover process and 1 sandbox tree" in (run / "checks.log").read_text()
 
 
+def test_an_orphaned_grandchild_in_the_run_s_own_scratch_ends_with_the_run(env, tmp_path, monkeypatch):
+    """A grandchild a check left in a session of its own with an environment of its own (no run token,
+    no check group) ends with the run when its working directory or an argument is in the run's own
+    scratch; a process outside it is never touched."""
+    import shutil
+    from ttp import cli
+    from ttp import checkreap
+    if not checkreap.PROC.exists() or not shutil.which("setsid"):
+        pytest.skip("needs /proc and setsid")
+    _no_sandbox_tools(monkeypatch)
+    _reap_tmp(tmp_path, monkeypatch)
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    own = tmp_path / "scratch"   # what the checks supervisor makes the run's TMPDIR (checkdirs.scratch)
+    own.mkdir()
+    monkeypatch.setenv("TMPDIR", str(own))
+    monkeypatch.setattr(cli, "_run_scratch", lambda: str(own))
+    by_cwd, by_arg = tmp_path / "cwd.pid", tmp_path / "arg.pid"
+    outside = subprocess.Popen(["sleep", "60"], cwd=tmp_path, start_new_session=True)
+    try:
+        q = shlex.quote
+        cmd = (f"setsid sh -c 'echo $$ > {q(str(by_cwd))}; cd \"$TMPDIR\" && exec env -i sleep 60' & "
+               f"setsid sh -c 'echo $$ > {q(str(by_arg))}; cd / && exec env -i sleep 60 \"$1\"' sh \"$TMPDIR/x\" & "
+               f"sleep 0.5")
+        cli.main(["checks", "--fresh", "--", cmd])
+        pids = [int(_reap_wait_file(by_cwd)), int(_reap_wait_file(by_arg))]
+        assert not any(_reap_live(pid) for pid in pids), "a grandchild in the run's scratch outlived the run"
+        assert outside.poll() is None, "a process outside the run's scratch was ended"
+    finally:
+        _reap_kill(outside)
+
+
 def test_the_sweep_reaps_a_stale_sandbox_with_exit_json_or_a_dead_runner(env, tmp_path, monkeypatch):
     """An earlier run's record that has ended (exit.json) or whose runner died: the processes in its
     recorded group with a working directory in its tree are ended, then the tree and record go."""

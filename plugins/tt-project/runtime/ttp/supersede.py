@@ -5,7 +5,8 @@ At dispatch (`dispatch_hold`, just before a run starts), a queued task is held (
 - repeats an earlier open task, or one done in the last DUP_DONE_DAYS: the same title, or the same
   title and spec by task_add's own test (coordinator.looks_same). Daemon-made tasks (reviews, fixes,
   re-reviews, continues) count too. Not a duplicate: a task of its own lineage (one it continues, at any
-  hop), one either depends on, a review of another subject, a spec saying `differs from #<id>`, and a
+  hop), one either depends on, a review of another subject, a spec saying `differs from #<id>`, a task
+  owing other obligations (the owner note the harness appends reads alike for any two), and a
   schedule's runs (origin 'schedule': each run of a recurring schedule repeats the last by design);
 - predates a user order whose `supersedes` steps (STEPS_KEY, recorded with the order) its spec still
   carries, and was not re-specified since.
@@ -29,6 +30,7 @@ DUP_DONE_DAYS = 14
 STOP_EVERY_S = 60
 CLEAR_TTL_S = 60   # a task found clear is not compared again this soon unless its row changed
 _DIFFERS = re.compile(r"differs from #(\d+)", re.I)
+_OWES = re.compile(r"^## Obligation (o\d+) ", re.M)   # obligations._owner_note's heading
 _clear: dict[int, tuple[float, float]] = {}   # task id -> (its `updated`, when it was found clear)
 
 
@@ -71,6 +73,8 @@ def duplicate_of(db, task: dict) -> dict | None:
             continue
         if o["id"] in skip or task["id"] in dependency_ids(o) or task["id"] in _lineage(db, o):
             continue
+        if (owes := set(_OWES.findall(spec))) and owes != set(_OWES.findall(o["spec"] or "")):
+            continue   # it owes another deliverable
         if task["kind"] == "review":   # same subject, and a done one only while its subject is unchanged since
             subj = review_subject(task)
             if subj != review_subject(o) or o["status"] == "done" and float(

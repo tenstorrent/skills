@@ -173,7 +173,7 @@ def test_a_logout_is_one_alert_per_machine_reminded_at_1_4_and_12_hours_with_wha
     assert sent[0] == "fake is logged out" and len(sent) == 5, sent
     assert [h for (h, n), (_, m) in zip(seen[1:], seen) if n > m] == [1.01, 4.01, 12.01, 36.01]
     assert all("still logged out" in t and "2 project(s) wait on it (demo, second)" in t
-               and "1 queued task(s) and 1 high event(s)" in t for t in sent[1:]), sent[1]
+               and "1 task(s) no other provider can run and 1 high event(s)" in t for t in sent[1:]), sent[1]
     rows = p.db.q("SELECT channel, severity FROM messages WHERE ref='auth:fake'")
     assert {(r["channel"], r["severity"]) for r in rows} == {("chat", "high")}, "a reminder went out quietly"
     assert len(_episodes(p, "auth:fake")) == 1, "a reminder opened a second episode"
@@ -2684,6 +2684,11 @@ def test_failover_moves_off_a_logged_out_provider_only_to_a_usable_target(env):
     assert p.db.task(tid)["provider"] == "codex", "moved to a logged-out target"
     from ttp import alerts
     p.db.set_kv(alerts.BREAKER + "fake", {})
+    d._failover_checked = 0
+    d.failover_pinned()
+    assert p.db.task(tid)["provider"] == "codex", "moved before the logout lasted provider_logout_failover_s"
+    rec = p.db.kv(alerts.BREAKER + "codex")
+    p.db.set_kv(alerts.BREAKER + "codex", {**rec, "opened": time.time() - 901})
     d._failover_checked = 0
     d.failover_pinned()
     t = p.db.task(tid)
@@ -5770,3 +5775,112 @@ def test_a_net_hold_whose_lookup_never_passes_still_lets_one_coordinator_turn_tr
     assert not wake.net_held(core)
     wake.maybe_coordinate()
     assert started == ["coordinator"] * 2
+
+
+def _logged_out_for(p, prov, s):
+    from ttp import alerts
+    p.db.set_kv(alerts.BREAKER + prov, {**p.db.kv(alerts.BREAKER + prov), "opened": time.time() - s})
+
+
+def test_a_logout_counts_only_the_work_that_waits_on_it(env):
+    """Codex logged out on a fake-core project: only tasks queued or waiting on codex count, and only
+    those no other provider may run (a required pin) are stuck on the user's login."""
+    p, d, now = _failover_setup(env, util=10.0)
+    p.db.add_task("routed", "x", kind="work", tier="standard")   # unpinned: runs on the core provider
+    moved = _codex_task(p)
+    running = _codex_task(p, "running")
+    p.db.update_task(running, status="running")
+    p.db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
+           (now, "watch", "obs", "high", "a box is down", "queued"))
+    d.open_breaker("codex", "401")
+    d.update_gates()
+    w = d.logout_waits("codex")
+    assert (w["queued"], w["stuck"], w["events"], w["to"], w["need"]) == (1, 0, 0, ["fake"], False), w
+    req = _codex_task(p, "required", labels=["pin:required"])
+    w = d.logout_waits("codex")
+    assert (w["queued"], w["stuck"], w["need"]) == (2, 1, True), w
+    assert moved and req
+
+
+def test_a_logout_moves_work_after_provider_logout_failover_s_but_never_a_required_pin(env):
+    p, d, now = _failover_setup(env, util=10.0)
+    tid = _codex_task(p)
+    req = _codex_task(p, "required", labels=["pin:required"])
+    d.open_breaker("codex", "401")
+    d.update_gates()
+    d.failover_pinned()
+    assert p.db.task(tid)["provider"] == "codex", "moved before the logout lasted 15 minutes"
+    _logged_out_for(p, "codex", 901)
+    d._failover_checked = 0
+    d.failover_pinned()
+    t, r = p.db.task(tid), p.db.task(req)
+    assert (t["provider"], t["model"]) == ("fake", None) and "[provider failover" in t["spec"], t
+    assert "logged out" in t["spec"]
+    assert p.db.q("SELECT id FROM events WHERE kind='provider_failover' AND task=?", (tid,))
+    assert (r["provider"], r["status"]) == ("codex", "queued"), "a pin the user's words require waits"
+    # The threshold is a setting; a negative one is refused.
+    from ttp import cli
+    with pytest.raises(SystemExit):
+        cli.main(["config", "demo", "coordinator.provider_logout_failover_s", "-1"])
+
+
+def test_routing_to_a_logged_out_provider_falls_back_and_returns_after_login(env):
+    p, d, now = _failover_setup(env, util=10.0)
+    task = {"id": None, "title": "t", "spec": ""}
+    assert d._route_entry(task, "light", "codex", "m", now)["fallback"] == "none"
+    d.open_breaker("codex", "401")
+    assert d._route_entry(task, "light", "codex", "m", now)["fallback"] == "auth", "routed to a logged-out provider"
+    from ttp import alerts
+    d._close_breaker("codex", alerts.breaker(p.db, "codex"), "login check passed")
+    assert d._route_entry(task, "light", "codex", "m", time.time())["fallback"] == "none", "routing did not come back"
+
+
+def test_a_logout_is_a_low_status_line_while_its_work_runs_elsewhere_and_high_when_none_can(env, monkeypatch):
+    from ttp import alerts
+    p, d, now = _failover_setup(env, util=10.0)
+    monkeypatch.setattr(alerts, "owner_alive", lambda owner: True)
+    p.db.x("INSERT INTO chats(id,created,label,last_active,last_read) VALUES('c1',?,?,?,0)", (now, "t", now))
+    _codex_task(p)
+    d.open_breaker("codex", "401")
+    d.update_gates()
+    d.logout_alert("codex", "codex is logged out. Log in once on that machine.")
+    m = p.db.q("SELECT severity, text FROM messages WHERE ref='auth:codex'")
+    assert [x["severity"] for x in m] == ["low"] and "its work runs on fake" in m[0]["text"], m
+    assert "nothing waits on it" in m[0]["text"] and "Log in once" not in m[0]["text"]
+    assert alerts._status("auth:codex", "low") and not alerts._status("auth:codex", "high"), "not a status line"
+    d._logout_round = 0.0
+    d.remind_logouts()
+    assert not p.db.q("SELECT id FROM messages WHERE ref='auth:codex' AND severity='high'"), "asked for a login"
+    # No provider can run it: the core provider is logged out too.
+    d.open_breaker("fake", "401")
+    d.logout_alert("codex", "codex is logged out. Log in once on that machine.")
+    assert d.logout_waits("codex")["need"]
+    assert p.db.q("SELECT id FROM messages WHERE ref='auth:codex' AND severity='high'"), "no alert with nothing left"
+
+
+def test_alerts_ack_quiets_a_logout_until_its_state_changes(env, monkeypatch):
+    from ttp import alerts, cli
+    from ttp.daemon import Daemon
+    p = make(env)
+    monkeypatch.setattr(alerts, "owner_alive", lambda owner: True)
+    start = time.time()
+    clock = {"t": start}
+    monkeypatch.setattr(time, "time", lambda: clock["t"])
+    p.db.x("INSERT INTO chats(id,created,label,last_active,last_read) VALUES('c1',?,?,?,0)", (start, "t", start))
+    d = Daemon(p.base)
+    d.open_breaker("fake", "logged out")
+    d.alert("auth:fake", "fake is logged out", "high")
+    p.db.add_task("queued work", "")
+    mid = p.db.one("SELECT id FROM messages WHERE kind='alert' AND ref='auth:fake'")["id"]
+    try:
+        cli.main(["alerts", "demo", "--ack", str(mid), "--why", "known"])
+    except SystemExit as e:
+        assert e.code in (0, None), e.code
+    ep = alerts.episode(p.db, "auth:fake", clock["t"])
+    assert alerts.acked(p.db, ep), "the ack did not hold"
+    sent = len(p.db.unread_for_chat("c1", 0))
+    for hours in (1.01, 4.01, 12.01):
+        clock["t"] = start + hours * 3600
+        d._logout_round = 0.0
+        d.remind_logouts()
+    assert len(p.db.unread_for_chat("c1", 0)) == sent, "an acknowledged logout was reminded"

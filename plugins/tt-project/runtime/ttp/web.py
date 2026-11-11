@@ -18,7 +18,7 @@ from . import alerts, awake, chatgone, configwho
 from . import budget as bud
 from . import globalcap as gcap
 from . import coordinator as coord
-from . import credits, eta, fleethold, heal, identity, lockprobe, mcpgap, obligations, outagetask, projpause, pushq, redact, release, responsibilities, route, sweep, timefmt, urgent, waits
+from . import credits, eta, fleethold, heal, identity, lockprobe, mcpgap, obligations, outagetask, projpause, pushq, redact, release, responsibilities, route, selfwatch, sweep, timefmt, urgent, waits
 from . import schedule as sched
 from . import pauseends, selfreview, spendproj, startgate, sweepskip, timefmt, topup, trend, upstream
 from .daemon import (AUTH_PROBE_S, HEARTBEAT_STALE_S, KV_LOCAL_ONLY, KV_WORKTREES_DIRTY, LOGGED_OUT_NOTE, NET_HELD_NOTE,
@@ -510,7 +510,7 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
     working = db.q("SELECT r.id run, r.task, r.role, r.provider, r.model, r.effort, r.started, r.cost_usd, r.dir, "
                    "r.note run_note, t.title FROM runs r "
                    "LEFT JOIN tasks t ON t.id=r.task WHERE r.status='running' ORDER BY r.id")
-    from . import modelrank, runwatch   # the daemon's live record of each run; the progress.md tail is the fallback
+    from . import batchrun, modelrank, runwatch   # the daemon's live record of each run; the progress.md tail is the fallback
     live = runwatch.load(p)["runs"] if working else {}
     for w in working:
         rw = live.get(str(w["run"])) or {}
@@ -521,6 +521,7 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
         w["doing"], w["checks"], w["files_n"] = runwatch.doing(rw), rw.get("checks") or "", rw.get("files_n") or 0
         w["floor"] = run_floor(w["run_note"])
         w["wake"] = run_wake(w.pop("run_note"))
+        w["batch"] = batchrun.view(db, w["task"])   # a batch run: one run, its member tasks (batchrun.py)
     spend = {"spent_24h": round(db.spent_since(now - DAY), 2), "spent_7d": round(db.spent_since(now - WEEK), 2),
              "top_7d": top if top and top["usd"] else None, "in_flight": round(bud.in_flight(db), 2)}
     from . import audit   # runs by provider and how their cost was known: measured apart from guessed $
@@ -816,7 +817,7 @@ def state_payload(p: Project, db: DB) -> dict:
         "gates": {k: {**g, "detail": gate_detail(g, now, tz, gates)} for k, g in gates.items()},
         "heartbeat": heartbeat(p), "runtime": health_now["runtime"], "heartbeat_stale_s": HEARTBEAT_STALE_S, "watchdog_s": int(watchdog_settings(p)["hang_s"]),
         "service": installed(p), "disk_low": db.kv("disk_low"),
-        "disk": db.kv("disk"), "worktrees_kept": db.kv("worktrees_kept"),
+        "disk": db.kv("disk"), "selfwatch": selfwatch.line(db.kv(selfwatch.KV)), "worktrees_kept": db.kv("worktrees_kept"),
         "branches": db.kv("branchcap"),
         "tasks": tasks, "task_counts": db.status_counts(), "runs": runs,
         "issues": db.q("SELECT id,source,title,severity,status,count,first_seen,last_seen,task FROM issues "

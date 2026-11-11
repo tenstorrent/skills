@@ -334,3 +334,41 @@ def test_an_unreadable_project_json_with_no_last_good_copy_reports_its_unasked_l
     lines = localguard.report(q.config(), q.harness, q.config_status)
     assert lines == [f"problem: {localguard.UNREAD}"]
     assert localguard.report({}, q.harness, "ok") == []
+
+
+def test_the_guards_defaults_keep_local_and_protected_paths():
+    # DEFAULT_CONFIG once held two "guards" keys: the later {"protected_paths": []} replaced {"local": []},
+    # so guards.local had no default and `ttp config guards.local <string>` was saved unchecked.
+    from ttp import project as proj
+    assert proj.DEFAULT_CONFIG["guards"] == {"local": [], "protected_paths": [], "user_site": "auto"}
+    assert "guards.local needs a JSON list" in (proj.key_type_problem("guards.local", "x.py") or "")
+    assert "guards.protected_paths needs a JSON list" in (proj.key_type_problem("guards.protected_paths", "x") or "")
+
+
+def test_no_section_of_the_config_defaults_is_written_twice():
+    # A repeated key in the DEFAULT_CONFIG literal silently drops the first one's defaults.
+    import ast
+    from ttp import project as proj
+    tree = ast.parse(Path(proj.__file__).read_text())
+    lit = next(n.value for n in ast.walk(tree) if isinstance(n, (ast.Assign, ast.AnnAssign))
+               and any(getattr(t, "id", None) == "DEFAULT_CONFIG" for t in (n.targets if isinstance(n, ast.Assign) else [n.target])))
+    dupes = []
+    for d in [lit, *[v for v in lit.values if isinstance(v, ast.Dict)]]:
+        keys = [k.value for k in d.keys if isinstance(k, ast.Constant)]
+        dupes += sorted({k for k in keys if keys.count(k) > 1})
+    assert not dupes, dupes
+
+
+@pytest.mark.parametrize("raw", [{"guards": {"local": ["guards/a.py"]}},
+                                 {"guards": {"protected_paths": ["~/.secret-login"]}},
+                                 {"guards": {"local": ["guards/a.py"], "protected_paths": ["~/.secret-login"]}}])
+def test_a_project_guards_setting_keeps_the_other_guards_key(env, raw):
+    # guards.local alone, guards.protected_paths alone and both: each set key reads back and the other
+    # keeps its default (local: [], protected_paths: at least the project's own list).
+    p = make(env)
+    for key, val in raw["guards"].items():
+        p.set_config(f"guards.{key}", val)
+    g = p.config()["guards"]
+    assert g["local"] == raw["guards"].get("local", [])
+    assert set(raw["guards"].get("protected_paths", [])) <= set(g["protected_paths"])
+    assert isinstance(g["protected_paths"], list)

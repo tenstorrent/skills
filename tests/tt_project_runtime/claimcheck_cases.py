@@ -320,3 +320,50 @@ def test_the_digest_shows_each_machines_reach_and_the_daemon_probes_due_machines
     monkeypatch.setattr(netwait, "reach", lambda names, env=None: {n: True for n in names})
     d._check_hosts(["box-b"], time.time())
     assert reach.read()["box-b"]["ok"] is True
+
+
+
+
+@pytest.mark.parametrize("block", [
+    "---\nThe smoke test is running on the box.\n---",
+    "```\nThe smoke test is running on the box.\n```",
+    "> The smoke test is running on the box.",
+])
+def test_a_claim_in_a_block_meant_for_posting_is_marked_after_the_block_never_inside_it(env, block):
+    from ttp import claimcheck
+    p = make(env)
+    text = f"Draft for the channel:\n{block}\nThe model is running since 07:09."
+    got, false, unverified = claimcheck.check(p, text)
+    assert block in got and unverified == 2, got
+    after = got.split(block, 1)[1]
+    assert after.startswith(f'\n{claimcheck.UNVERIFIED}: "The smoke test is running on the box."'), got
+    assert got.endswith("The model is running since 07:09 (unverified)."), got
+    tid = p.db.add_task("smoke the model", "s", kind="work", status="queued")
+    quoted = f"---\nTask #{tid} is running now.\n---"
+    got, false, _ = claimcheck.check(p, f"{quoted}\nThat is all.")
+    assert got.startswith(quoted + f'\n{claimcheck.FALSE_MARK} (#{tid} is queued): "Task #{tid} is running now."')
+    assert false == [(f"Task #{tid} is running now.", f"#{tid} is queued")]
+
+
+def test_a_claim_whose_probe_passes_is_never_marked_though_the_daemon_did_not_run_it_first(env):
+    from ttp import claimcheck, coordinator as coord
+    p = make(env)
+    acts = [{"type": "reply", "text": "The smoke test is running on the box.", "chat": "c1",
+             "claims": [{"text": "smoke test running", "expect": "true"}]}]
+    coord.apply(p, acts, turn=1)   # no prerun: a replayed batch, a worker notify
+    assert _cc_sent(p)[-1] == "The smoke test is running on the box."
+    # A sentence stating the claim shorter than its text still finds it.
+    claims = [{"text": "the smoke test is running on the box since this morning", "expect": "true"}]
+    assert claimcheck.check(p, "Smoke test running on the box.", claims)[0] == "Smoke test running on the box."
+
+
+def test_a_rewritten_probe_that_cannot_tell_falls_back_to_the_probe_as_written(env, monkeypatch):
+    from ttp import claimcheck, landed
+    p = make(env)
+    monkeypatch.setattr(landed, "probe_command", lambda expect, proj: "exit 2")   # 'ttp landed': CANNOT
+    claims = [{"text": "fix landed on the branch", "expect": "true"}]
+    claimcheck.prerun(p, [{"type": "reply", "text": "x", "claims": claims}])
+    assert claims[0]["_rc"] == 0
+    claims = [{"text": "fix landed on the branch", "expect": "false"}]
+    claimcheck.prerun(p, [{"type": "reply", "text": "x", "claims": claims}])
+    assert claims[0]["_rc"] == 2   # neither passes: the rewrite's answer stands

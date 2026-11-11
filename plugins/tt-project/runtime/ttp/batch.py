@@ -38,6 +38,7 @@ from __future__ import annotations
 import ast
 import difflib
 import fcntl
+import json
 import os
 import re
 import secrets
@@ -93,6 +94,7 @@ RERUN_IDS = 10                     # a check failing more tests than this is not
 TIP_IDS = 100                      # ...but up to this many still rerun on the tip alone: those it fails are its own (_tip_ids)
 TIP_RERUNS = 3                     # reruns on the tip alone of a blamed failure's failing tests: one failing clears the entry
 TIP_RESEARCH = 3                   # searches run again in one round once the tip alone fails more tests (_research)
+ENTRY_CHECK_S = 300.0              # the time limit of one delivery.push_entry_checks command on one entry (_entry_check)
 HARD_TESTS = r"leak"               # delivery.push_hard_tests: failing test ids never excused as the tip's own (the leak scan)
 HOST_FAULTS = (envfault.Fault, workerloss.Infra, syntaxfault.Infra, setupfault.Infra)   # the host's, never an entry's
 CARRY_TRIES = 5                    # recorded passes of one check on other tips tried for a carry (verdictcarry)
@@ -257,7 +259,7 @@ def _stream(cmd: str | list[str], cwd: Path, env: dict | None = None, timeout: f
 
 def _streamed(cmd, cwd: Path, env: dict | None, timeout: float | None, group: bool, pass_fds: tuple,
               collect: workerloss.Collector | None) -> tuple[int | None, str, bool]:
-    guard = hoststate.Guard(env, argv=cmd) if env and env.get(hoststate.MARKER) else None   # a check: compare the host after
+    guard = hoststate.Guard(env, tokens=[cwd], argv=cmd) if env and env.get(hoststate.MARKER) else None   # a check: compare the host after
     proc = subprocess.Popen(cmd, shell=isinstance(cmd, str), cwd=str(cwd), env=env, stdin=subprocess.DEVNULL,
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=group, pass_fds=pass_fds)
     tail: deque[str] = deque(maxlen=push.LOG_TAIL)
@@ -1470,10 +1472,12 @@ class Batch:
         self.d = p.config().get("delivery") or {}
         self.mechanical = mechanical_paths(self.d)   # shared docs settle_union may settle
         self.entries = [e for e in m.get("entries") or [] if isinstance(e, dict)]
-        self.wt = p.worktrees / WORKTREE
+        self.express = isinstance(m.get("express"), dict)   # express.start: one urgent head, ahead of the queue
+        self.wt = p.worktrees / (f"{WORKTREE}-express" if self.express else WORKTREE)
         self.status: dict[int, str] = {}       # entry index -> status
         self.detail: dict[int, dict] = {}
         self.landed_at: dict[int, str] = {}    # entry index -> its own commit on the branch (pushed or landed)
+        self.entry_tip_bad: dict[str, dict[str, bool]] = {}   # tip -> entry check -> fails on it alone (_entry_check)
         self._heads: dict[str, str] | None = None   # push.landed_heads, read once per batch
         self.check_run_dir = m.get("check_run_dir")
         self.isolate = {str(c) for c in m.get("setup_isolate") or []}   # alerted setup_fault checks (pushq)
@@ -1604,7 +1608,11 @@ class Batch:
                                      who=f"push batch {self.id}")
         if self.target_lock is None:
             who = ", ".join(locks.holders_now(push.lock_paths(self.p, self.remote, self.branch), self.p)) or "another push"
-            return self._all("requeued", "busy", f"{push.lock_name(self.remote, self.branch)} is busy (held by {who})")
+            if not self.express:
+                return self._all("requeued", "busy", f"{push.lock_name(self.remote, self.branch)} is busy (held by {who})")
+            # An express landing never waits behind a batch: it checks beside it, and its push (no --force)
+            # takes only a fast-forward of the tip it checked; a tip the batch moved is another round.
+            say(f"{push.lock_name(self.remote, self.branch)} is held by {who}: the express landing checks beside it")
         self.steps = push.Steps(self.target_lock, say)
         why = push.refusal(self.repo, self.remote, self.branch, push.allow_protected(self.d))
         if why.startswith("refusing"):
@@ -1631,7 +1639,7 @@ class Batch:
                 self._set(i, "scope_held", **d)
             self._prepare(tip)
             try:
-                outcome = self._round(tip, checks)
+                outcome = self._round(tip, self._express_checks(tip, checks) if self.express else checks)
             except envfault.Fault as e:
                 # The host, not an entry: every entry goes back to the queue untouched, which holds
                 # until the runner is back (pushq.due); the coordinator hears of it once.
@@ -1667,6 +1675,43 @@ class Batch:
             say(f"{self.target} moved; round {rnd + 1}")
         return self._all("requeued", "moved", f"{self.target} kept moving for {rounds} rounds",
                          keep=("landed", "refused"))
+
+    def _express_checks(self, tip: str, checks: list) -> list:
+        """An express landing's checks: the smoke push checks, each pytest one narrowed to the tests the
+        entry's diff reaches (testpick.narrow). The full checks run after it lands (postland)."""
+        from . import testpick
+        head = str(self.entries[0].get("head") or "") if self.entries else ""
+        if not head:
+            return checks
+        self._checkout(head)   # the tests are read from the entry's own tree, then the round starts on the tip
+        try:
+            out, lines = testpick.narrow(self.wt, tip, head, checks, checks, self.p.config())
+        finally:
+            self._checkout(tip)
+        for line in lines:
+            say(f"express: {line}")
+        self._audit_override(checks, out, lines)
+        return out
+
+    def _audit_override(self, configured: list, used: list, lines: list) -> None:
+        """Record this push's check override (an express landing's narrowed smoke checks) in the batch
+        marker and as a handled `push_check_override` event: delivery.push_checks itself stays as set."""
+        rec = {"at": time.time(), "configured": [str(c) for c in configured],
+               "used": [{"check": str(c), "targeted": bool(getattr(c, "targeted", False))} for c in used],
+               "why": list(lines),
+               "head": str(self.entries[0].get("head") or "") if self.entries else ""}
+        try:
+            m = push._read(self.marker) or self.m
+            m["check_override"] = rec
+            write_json(self.marker, m)
+            self.p.db.x("INSERT INTO events(ts,source,kind,severity,text,status,data) VALUES(?,?,?,?,?,?,?)",
+                        (rec["at"], f"push:{self.marker.stem}", "push_check_override", "low",
+                         f"express {self.marker.stem} checks {rec['head'][:10]} with "
+                         f"{sum(u['targeted'] for u in rec['used'])} of {len(configured)} push checks narrowed to "
+                         "the tests its diff reaches; delivery.push_checks unchanged; full checks after landing",
+                         "handled", json.dumps(rec, default=str)))
+        except Exception as e:   # the audit record never stops the landing
+            say(f"express: could not record the check override: {e}")
 
     def _prepare(self, tip: str) -> None:
         """A clean checkout of `tip` in the batch's own worktree, made anew when broken or dirty."""
@@ -1714,6 +1759,12 @@ class Batch:
         if head is None:
             return self._close(0, "yielded" if self.yielded_to else "tip_failed" if failed is None else "nothing",
                                carried, failed)
+        # An express landing never waits for the push lock: it takes it if free, else pushes without it.
+        # The push has no --force, so a tip the lock's holder moved is never overwritten ("moved").
+        if self.express and self.target_lock is None:   # the batch it ran beside may be done: hold the lock to push
+            self.target_lock = push.take(self.p, self.remote, self.branch, 0, say=lambda _m: None,
+                                         who=f"push batch {self.id}")
+            self.steps = push.Steps(self.target_lock, say)
         self.steps.go("push")
         if push._fetch(self.repo, self.remote, self.branch) != tip:
             return "moved"
@@ -1948,11 +1999,47 @@ class Batch:
                 self.landed_at[i] = tip
             else:
                 self._set(i, "rider", _after=len(carried))
+        elif failed := self._entry_check(new, tip):
+            # A quick check (delivery.push_entry_checks) failing on this entry merged onto the batch head
+            # sends it back alone, whatever its own push checks' scope; the others go on (the smoke list).
+            say(f"entry {e.get('id')} ({e.get('branch')}): its entry check `{failed[0]}` failed; sent back")
+            self._set(i, "check_failed", cmd=failed[0], tail=failed[1])
+            self._checkout(h)
         else:
             carried.append((i, new))
             self._set(i, "carried")
             return new
         return h
+
+    def _entry_check(self, head: str, tip: str) -> tuple[str, str] | None:
+        """Run each delivery.push_entry_checks command (a few seconds each, never scoped by the
+        change's paths) on `head`, an entry just replayed onto the batch head: (command, output tail)
+        of the first that fails, else None. A command that fails on `tip` alone, runs out of time or
+        cannot get its env decides nothing here: the batch's own checks judge it then."""
+        cmds = push.check_list(self.d.get("push_entry_checks"))
+        if not cmds:
+            return None
+        bad = self.entry_tip_bad.setdefault(tip, {})
+        try:
+            env = self._check_env(head)
+        except push.runnerenv.Unavailable:
+            return None
+        for cmd in cmds:
+            key = str(cmd)
+            if key not in bad:   # once per tip: a command the tip itself fails blames no entry
+                self._checkout(tip)
+                rc, _, over = _stream(_check_argv(cmd, self.wt), self.wt, env=env, timeout=ENTRY_CHECK_S, group=True)
+                bad[key] = rc != 0 or over
+                if bad[key]:
+                    say(f"entry check `{key}` fails on {tip[:10]} alone; the batch's checks decide instead")
+            if bad[key]:
+                continue
+            self._checkout(head)
+            rc, tail, over = _stream(_check_argv(cmd, self.wt), self.wt, env=env, timeout=ENTRY_CHECK_S, group=True)
+            if rc != 0 and not over:
+                return key, tail
+        self._checkout(head)
+        return None
 
     def _replay_fault(self, i: int, e: dict, h: str, carried: list[tuple[int, str]], ex: Exception) -> None:
         """Entry `i` raised while it was replayed: abort what it left in the worktree and send it
@@ -2251,7 +2338,8 @@ class Batch:
         past upgrade.push_hold_min may go then; once it is held the checks step is marked."""
         self.steps.between()
         slot = push.check_slot(at, say, checkcap.label(self.p.name, f"push batch {self.id}"),
-                               priority=push.priority_key(self.repo, self.remote, self.branch), proj=self.p)
+                               priority=push.priority_key(self.repo, self.remote, self.branch)
+                               + (" express" if self.express else ""), proj=self.p)   # its own slot beside a batch's
         self.steps.go("checks")
         return slot
 
@@ -2571,16 +2659,22 @@ class Batch:
 
     def _run_ids(self, at: str, cmd, ids: list[str], where: str, env: dict, slot_env: dict) -> tuple[int | None, str]:
         """Run only `ids` of check `cmd` once at commit `at`: the check's own command, its other tests
-        deselected by name (pushpass.select_env), killed after delivery.push_rerun_s. (pytest's exit
-        code, None when it ran out of time; the output tail)."""
+        deselected by full node id (gatejudge.select_env: a same-named test in another file never runs),
+        killed after delivery.push_rerun_s. An id the collection there does not have is said in the batch
+        log and kept in the marker's checks["not_collected"]. (pytest's exit code, None when it ran out of
+        time; the output tail)."""
         cmd = _here(cmd)   # only a check's first full run spills: every rerun runs here
         self.reran.setdefault(where, set()).update(ids)
         self._checkout(at)
         self.checks["reruns"] = self.checks.get("reruns", 0) + 1
         rc, tail, late = _stream(_check_argv(cmd, self.wt), self.wt,
-                                 env={**env, **pushpass.select_env(gatejudge.select_rx(ids), env), **slot_env},
+                                 env={**env, **gatejudge.select_env(ids, env), **slot_env},
                                  timeout=_seconds(self.d.get("push_rerun_s"), RERUN_S), group=True,
                                  pass_fds=checkdirs.inherited(), urgent_mark=self._urgent_mark())
+        gone = gatejudge.not_collected(tail)
+        if gone:
+            say(f"not collected on {at[:10]}, so not rerun there: {' '.join(gone)}")
+            self.checks["not_collected"] = sorted(set(self.checks.get("not_collected", [])) | set(gone))
         return (None if late else rc), tail
 
     def _judged(self, head: str, cmd, rc: int | None, tail: str, env: dict, slot_env: dict) -> bool:
@@ -3353,7 +3447,7 @@ def _notice_hold(p: Project) -> str:
     """The line of a power cycle of this host a device broker announced, or "" (cyclenotice.py)."""
     if not push.after_set(p):
         return ""
-    h = cyclenotice.held(cyclenotice.project_paths(p))
+    h = cyclenotice.project_held(p)
     return cyclenotice.line(h, p) if h else ""
 
 

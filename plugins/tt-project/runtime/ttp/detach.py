@@ -85,6 +85,63 @@ def failed_check(probe: str, rc) -> bool:
     that the probe itself is broken: the daemon then runs the hand-off's on_pass_cmd or wakes the task
     with the job's exit code, never as a passed probe."""
     return rc == FAILED_RC and bool(CHECK_RE.search(probe or ""))
+def _top_ops(text: str) -> list[tuple[int, str]]:
+    """(index, operator) of each `||`, `&&`, `;`, `&`, newline and closing `)`/`}` of `text` outside
+    quotes, backslash escapes and nested parentheses or braces; a closer ends the list. The `&` of a
+    redirect or `|&` is not an operator."""
+    out, depth, i, q = [], 0, 0, ""
+    while i < len(text):
+        c = text[i]
+        if q:
+            if c == "\\" and q == '"':
+                i += 1
+            elif c == q:
+                q = ""
+        elif c == "\\":
+            i += 1
+        elif c in "'\"":
+            q = c
+        elif c in "({":
+            depth += 1
+        elif c in ")}":
+            if depth == 0:
+                out.append((i, c))
+                return out
+            depth -= 1
+        elif depth == 0 and text.startswith(("||", "&&"), i):
+            out.append((i, text[i:i + 2]))
+            i += 1
+        elif c == "&" and (text[i - 1:i] in (">", "<", "|") or text[i + 1:i + 2] == ">"):
+            pass   # a redirect (`2>&1`, `<&3`, `&>f`, `&>>f`) or bash's `|&` pipe, not a separator
+        elif depth == 0 and c in ";&\n":
+            out.append((i, c))
+        i += 1
+    return out
+
+
+def guard_or(probe: str) -> str:
+    """`probe` with the fallback of each top-level `<... detach --check ...> || <fallback>` rewritten so
+    the check's FAILED_RC (jobs ended, one failed) exits FAILED_RC instead of running the fallback:
+    written as `ttp detach --check x.rc || test "$(date +%s)" -ge <t>`, a failed job would sleep until
+    <t>. Other exits reach the fallback as before. Checks inside parentheses or braces stay as written;
+    a probe with no such `||` comes back unchanged."""
+    if not isinstance(probe, str) or not CHECK_RE.search(probe):
+        return probe
+    ops = _top_ops(probe)
+    stop = ops[-1][0] if ops and ops[-1][1] in ")}" else len(probe)
+    ops = [o for o in ops if o[1] not in ")}"]
+    cuts = [0] + [i + len(op) for i, op in ops]
+    ends = [i for i, _ in ops] + [stop]
+    parts, wrap = [], False
+    for n, (lo, hi) in enumerate(zip(cuts, ends)):
+        word = probe[lo:hi]
+        if wrap and word.strip() and not word.strip().startswith(f"{{ [ $? -eq {FAILED_RC} ]"):
+            word = f" {{ [ $? -eq {FAILED_RC} ] && exit {FAILED_RC}; {word.strip()}; }}" + (" " if n < len(ops) else "")
+        parts.append(word + (ops[n][1] if n < len(ops) else ""))
+        wrap = n < len(ops) and ops[n][1] == "||" and bool(CHECK_RE.search(probe[lo:hi]))
+    return "".join(parts) + probe[stop:]
+
+
 def _checked(probe: str, cwd=None) -> list[Path]:
     """The local .rc paths a probe's `detach --check` names, relative to `cwd` (none for a --host one)."""
     words = shlex.split(probe or "")
@@ -1103,7 +1160,7 @@ def record_stop(rc: Path, why: str) -> bool:
 def stopped(rc: Path) -> str | None:
     """Why the job at this .rc was stopped on purpose (its .rc holds STOP_RC and <name>.lost says
     why: record_stop), else None: an exit code the job wrote itself, or no .rc yet."""
-    rc = Path(rc)
+    rc = job_rc(rc)
     try:
         if rc.read_text().strip() != str(STOP_RC):
             return None
@@ -1214,20 +1271,29 @@ def sweep(state: Path) -> None:
             _drop(d)
 
 
+def job_rc(rc) -> Path:
+    """The .rc path of a job named by its bare path <dir>/<name> (a probe's `detach --check <dir>/<name>`),
+    as state(), recorded() and stopped() read it: with_suffix on the bare path would read <name>'s own
+    files under another name and mark an exited job lost. A .rc path or a series driver's dir is as given."""
+    rc = Path(rc)
+    return rc if rc.suffix == ".rc" or rc.is_dir() else rc.with_name(rc.name + ".rc")
+
+
 def _entry(rc: Path) -> dict:
     try:
         jobs = json.loads((rc.parent / "detached.json").read_text())
     except (OSError, ValueError):
         return {}
-    return next((j for j in jobs if isinstance(j, dict) and j.get("rc") == str(rc)), {}) \
-        if isinstance(jobs, list) else {}
+    want = os.path.abspath(rc)   # an entry written with a relative or ./ path is the same job
+    return next((j for j in jobs if isinstance(j, dict) and isinstance(j.get("rc"), str)
+                 and os.path.abspath(j["rc"]) == want), {}) if isinstance(jobs, list) else {}
 
 
 def recorded(rc: Path) -> bool:
     """Whether anything records a detached job at this .rc path: its exit code, its loss, its start,
     its entry in detached.json, a queued request or its held lock. False for a path no `ttp detach`
     wrote, which state() would call lost (and mark so)."""
-    rc = Path(rc)
+    rc = job_rc(rc)
     return (rc.exists() or lost(rc).exists() or started(rc).exists() or bool(_entry(rc)) or pending(rc)
             or not locks.any_free([locks.job_lock(rc)]))
 
@@ -1273,7 +1339,7 @@ def series(rc: Path) -> tuple[str, str] | None:
 def state(rc: Path) -> tuple[str, str]:
     """("ended", exit code), ("running" or "queued", ""), or ("lost", why). The first look at a lost
     job records why in <name>.lost."""
-    rc = Path(rc)
+    rc = job_rc(rc)
     for _ in range(2):   # a job that ends between the looks wrote its .rc before its lock went free
         if rc.exists():
             return "ended", rc.read_text().strip() or "?"
@@ -1296,6 +1362,8 @@ def state(rc: Path) -> tuple[str, str]:
     else:
         why = ("it was killed after it started, before it wrote an exit code, or the host restarted: the boot "
                "id could not be read, so which is unknown")
+    if rc.exists():   # it ended while the reasons were read: its own exit code wins over a guess
+        return "ended", rc.read_text().strip() or "?"
     return "lost", _mark_lost_first(rc, why)
 
 

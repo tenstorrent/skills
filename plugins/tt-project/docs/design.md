@@ -224,8 +224,8 @@ disk untouched, with no migration; nothing else is reclaimed by check recovery.
 
 - The project lease (lease.py) only refuses dispatch on a host that does not hold it. Shared
   effects of workers already running there (pushes, device jobs, `ttp lock`, ledger writes) are not
-  yet fenced by `TTP_LEASE_EPOCH`, there is no ssh-file store, and a stand-in, hand-back or planned
-  move needs later steps. "Failover" in lease docs means moving a project between hosts; provider
+  yet fenced by `TTP_LEASE_EPOCH`, there is no ssh-file store, and a stand-in or hand-back needs
+  later steps. A planned move without the lease is `ttp move` (projmove.py, guide "Moving a project"). "Failover" in lease docs means moving a project between hosts; provider
   failover (failover.py) moves a task between model providers.
 
 - A pause's health end cannot be tuned. A coordinator pause of a resource with an enabled heal
@@ -390,6 +390,16 @@ What each supported CLI offers, with doc links: [providers.md](providers.md).
   spent and no failure counted. `upgrade.cycle_notices` (a list of paths; `[]` turns the hold off) sets
   the files; a missing file holds nothing. A malformed file holds for 10 min after its last write, a
   well-formed one for 6 h after its last update. `--ignore-cycle-notice` proceeds with a warning.
+  A broker's health probe or status command can announce the cycle too: while a heal check that
+  watches this host printed a line matching `upgrade.cycle_patterns` (regexes; generic defaults such as
+  'next: power cycle'; `[]` turns it off) in its last run within 15 min (`upgrade.cycle_checks` picks the
+  checks), the same hold applies. While either holds, the push queue also starts no new batch and
+  `ttp checks` and `ttp detach` start nothing (exit 75); each clears once the announcement does.
+- Reboot causes (initiator.py). After a reboot the daemon reads the previous boot's journal (as this
+  user, else `sudo -n` where allowed, else 'unreadable' with why): who or what started the shutdown and
+  any kernel panic, out-of-memory kill, machine check or lockup before it. The boot record, the reboot
+  notice and the host status line name it with the time in the home zone, so a reboot is not blamed on
+  the work that ran.
 - Interrupted upgrades (upjournal.py). `ttp upgrade` journals each step in `state/upgrade.journal`
   before it changes the harness. A run cut short (a reboot, a kill) is recovered under the upgrade
   lock by the next `ttp upgrade` and by the daemon at start and on its release check: before the

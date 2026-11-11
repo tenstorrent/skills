@@ -208,6 +208,11 @@ HANDOVER_S = 3.0   # a parked asker that still cannot start this long after the 
 # The run a preempt would stop: testslots counts the test slots it holds as free (preempt's `startable`).
 FREEING: contextvars.ContextVar[dict | None] = contextvars.ContextVar("checkcap_freeing", default=None)
 RERANK_ENV = "TTP_CHECKS_RERANKED"   # the priority these waiting checks last re-executed at (reranked)
+# The lane wait a re-executing `ttp checks` carries over (cli._checks_slot): {"s", "pool", "at"} as record_wait's
+# lane_s, pool_s and lane_at. And a preempted run's cut, read by record_wait: {"at": its slot's grant, "by":
+# the asker's project} (cut_at, cut_by: the rerun's wait from its old grant is the preempting project's).
+LANE_WAIT_ENV = "TTP_CHECKS_LANE_WAIT"
+CUT_ENV = "TTP_CHECKS_CUT"
 RERANK_S = 30.0   # a waiting run reads its task's priority again at most this often (reranked)
 # A preempted run's rerun resumes each plain local pytest check from the files it passed (cli._checks_resume).
 RESUME_ENV = "TTP_CHECKS_RESUME"
@@ -215,7 +220,7 @@ SHIELD_PCT = 90   # a run that cannot resume is never asked once its log's last 
 # What only this `ttp checks` run reads (its own re-queue, re-execution and label): never passed to the check
 # commands it starts (push.check_env), so a `ttp checks` nested in them is not labelled preempted nor kept from
 # its own rerank or re-execution.
-RUN_ONLY_ENV = (REEXEC_ENV, PREEMPT_ASKED_ENV, PREEMPTED_ENV, RERANK_ENV, RESUME_ENV)
+RUN_ONLY_ENV = (REEXEC_ENV, PREEMPT_ASKED_ENV, PREEMPTED_ENV, RERANK_ENV, RESUME_ENV, LANE_WAIT_ENV, CUT_ENV)
 BARE_SLOTS = 1   # default checks.bare_slots: host-wide slots held at once by runs with no project (acquire)
 BARE_SLOTS_ENV = "TTP_CHECKS_BARE_SLOTS"
 INHERIT_DEPTH = 64   # ancestors read at most for the project run a `ttp checks` was started under (inherited)
@@ -1575,7 +1580,7 @@ def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = No
             startable: Callable[[], bool] | None = None,
             parks: Callable[[bool], None] | None = None, urgent: bool = False,
             preemptible: bool = False, small: bool = False, progress: str = "",
-            why: Callable[[], str] | None = None) -> Slot | None:
+            why: Callable[[], str] | None = None, waited: dict | None = None) -> Slot | None:
     """Take a host-wide checks slot, waiting while all are held. Waiters take turns by project
     (`project_name`; none form their own group), within one by task priority (`priority`, 1 first;
     OBLIGATION_PRIORITY before it, its ticket marked OBLIGATION_MARK; none last), then arrival (locks.fair_order),
@@ -1592,7 +1597,7 @@ def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = No
     ends it with Cancelled. Slots beyond the cap open while the host is lightly loaded (extra()).
     With `state` (a project's state directory) each slot taken is logged there (record_wait); every one is
     logged host-wide (record_grant); `cap` (the project cap the run's lane was held under) goes in
-    the project's record. `owns`: the ids behind a boost to OBLIGATION_PRIORITY (task_rank).
+    the project's record, with `waited` (record_wait's lane_s and pool_s). `owns`: the ids behind a boost to OBLIGATION_PRIORITY (task_rank).
     A slot taken more than GRANT_TELL_S after `since` is told with its priority and arrival (grant_line),
     also when a relaunch that inherited `since` takes it at once. While `startable()` is false (the
     run's test slots could not be taken now: testslots.pool_room) it waits outside the queue as for
@@ -1639,12 +1644,12 @@ def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = No
             drop_claim(claim)
             locks.mark_served(slot_dir(), RESOURCE, project_name)
             locks.mark_turn(slot_dir(), RESOURCE, None)
-            _granted(tell, state, project_name, priority, owns, since, cap=cap, lane_at=lane_at)
+            _granted(tell, state, project_name, priority, owns, since, cap=cap, lane_at=lane_at, waited=waited)
             return Slot(f, again=again)
         if f := _urgent_take(urgent, priority, every, held_as, what, same, owns, rank=_urgent_rank(owns, since),
                              n=n, claim=claim):
             drop_claim(claim)
-            return _urgent_granted(f, tell, state, project_name, priority, owns, since, cap, lane_at)
+            return _urgent_granted(f, tell, state, project_name, priority, owns, since, cap, lane_at, waited)
         ticket = None if parked else locks.enqueue(slot_dir(), RESOURCE, queued_as, since, group=project_name,
                                                    priority=priority, requeued=was_preempted, small=small)
         uwait = _urgent_wait(urgent and is_urgent(priority) and not twin, None, queued_as, since, owns)
@@ -1707,7 +1712,7 @@ def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = No
                     f = None
             if not f and not twin and (f := _urgent_take(urgent, priority, every, held_as, what, same, owns,
                                                          mine=uwait, n=n, claim=claim)):
-                return _urgent_granted(f, tell, state, project_name, priority, owns, since, cap, lane_at)
+                return _urgent_granted(f, tell, state, project_name, priority, owns, since, cap, lane_at, waited)
             if not f and asked and not twin and not parked:   # the slot a preempted run gave up is this run's
                 f = _take(n, paths(n), every, held_as, what, same, label=label, mine=claim)
             if claim and not f:
@@ -1740,7 +1745,7 @@ def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = No
             if f:
                 locks.mark_served(slot_dir(), RESOURCE, project_name)
                 locks.mark_turn(slot_dir(), RESOURCE, ticket)
-                _granted(tell, state, project_name, priority, owns, since, bool(told), cap, lane_at)
+                _granted(tell, state, project_name, priority, owns, since, bool(told), cap, lane_at, waited)
                 return Slot(f, again=again)
             if time.time() - told >= TELL_S:
                 if tell and ticket is not None:
@@ -1825,10 +1830,10 @@ def _urgent_ahead(mine: Path | None, rank: tuple | None = None) -> bool:
     return me is not None and any(t != mine and key(t) < me for t in q)
 
 
-def _urgent_granted(f, tell, state, project_name, priority, owns, since, cap, lane_at) -> Slot:
+def _urgent_granted(f, tell, state, project_name, priority, owns, since, cap, lane_at, waited=None) -> Slot:
     """An urgent slot taken: logged as a grant (_granted), told, marked (Slot.urgent). The queue's turns
     are not marked: it took no slot of the cap."""
-    _granted(tell, state, project_name, priority, owns, since, cap=cap, lane_at=lane_at)
+    _granted(tell, state, project_name, priority, owns, since, cap=cap, lane_at=lane_at, waited=waited)
     if tell:
         tell(URGENT_LINE if priority_beyond_cap() else URGENT_IN_CAP_LINE)
     slot = Slot(f)
@@ -1909,7 +1914,8 @@ def preempt(by: str, every: list[Path], project_name: str | None = None,
                 _write(_claim_path(claim), {"by": by, "made": time.time(), "at": time.time(), "slot": path.name,
                                             "victim": {k: h.get(k) for k in OWNER_KEYS}, **locks.taker()})
             _preempt_path(pid).write_text(json.dumps({"by": by, "task": os.environ.get("TTP_TASK") or "",
-                                                      "at": time.time(), **({"claim": claim} if claim else {})}))
+                                                      "project": project_name or "", "at": time.time(),
+                                                      **({"claim": claim} if claim else {})}))
         except OSError:
             drop_claim(claim)
             return ""
@@ -2060,6 +2066,15 @@ def preempted(since: float) -> str:
         return ""
     task = str(req.get("task") or "")
     return f"urgent #{task}" if task.isdigit() else f"urgent {req.get('by') or 'run'}"
+
+
+def preempter() -> str:
+    """The project whose urgent run asked this process's checks to give up their slot (preempt), or ""."""
+    try:
+        req = json.loads(_preempt_path(os.getpid()).read_text() or "{}")
+    except (OSError, ValueError):
+        return ""
+    return str(req.get("project") or "") if isinstance(req, dict) else ""
 
 
 def clear_preempt() -> None:
@@ -2234,14 +2249,16 @@ def grant_line(priority: int | None, owns, since: float, now: float | None = Non
 
 
 def _granted(tell, state, project_name, priority, owns, since: float, told: bool = False,
-             cap: int | None = None, lane_at: float | None = None) -> None:
-    """Log a slot taken (record_wait) and tell it when it waited, here or before a relaunch."""
+             cap: int | None = None, lane_at: float | None = None, waited: dict | None = None) -> None:
+    """Log a slot taken (record_wait, with `waited`'s lane_s and pool_s) and tell it when it waited, here or
+    before a relaunch."""
     now = time.time()
     try:   # only the log's note: a failed read never costs the slot
         over = over_share(project_name) if now - since > POLL_S else []
     except Exception:
         over = []
-    record_wait(state, project_name, priority, since, now, owns=owns, cap=cap, lane_at=lane_at, over=over)
+    record_wait(state, project_name, priority, since, now, owns=owns, cap=cap, lane_at=lane_at, over=over,
+                **(waited or {}))
     if tell and (told or now - since > GRANT_TELL_S):
         tell(grant_line(priority, owns, since, now))
 
@@ -2409,14 +2426,20 @@ WAITS_WINDOW_S = 24 * 3600
 
 def record_wait(state: Path | None, project_name: str | None, priority: int | None, queued_at: float,
                 granted_at: float, slot: str = "queue", owns: list[str] | tuple = (),
-                cap: int | None = None, lane_at: float | None = None, over: list[str] | tuple = ()) -> None:
+                cap: int | None = None, lane_at: float | None = None, over: list[str] | tuple = (),
+                lane_s: float | None = None, pool_s: float | None = None) -> None:
     """Append one slot wait to `state`/WAITS_LOG and sync it, and the grant to the host-wide log
     (record_grant). Never raises: a log that cannot be written must not cost the checks their slot.
     No `state`: only the host-wide line is logged. `cap`: the project cap in force (checklane.project_cap,
     0: none), stored as "cap" so throughput judges the wait by it; None (no project lane): no field.
     `lane_at`: when the run got its repository's lane (`ttp checks` queues for it before this slot, from
     the same `queued_at`), stored as "lane_at": only the time after it waited for the host. `over`: the
-    other projects over their fair share of the cap when a wait ended (over_share), stored as "over_share"."""
+    other projects over their fair share of the cap when a wait ended (over_share), stored as "over_share".
+    `lane_s`: the seconds
+    since `queued_at` it waited for its own lanes over every bound and re-execution (a bounded wait gives its lane
+    back and takes it again, so lane_at alone dates only the last one), of which `pool_s` the host's test pool held
+    (testslots.pool_room refused a lane it could take past them): throughput books only lane_s - pool_s as own.
+    A preempted run's rerun (CUT_ENV) stores "cut_at" and "cut_by": its wait from its old grant was the asker's."""
     task, run = _task_run()
     task = task or ""
     rec = {"project": project_name, "task": int(task) if task.isdigit() else None,
@@ -2428,6 +2451,15 @@ def record_wait(state: Path | None, project_name: str | None, priority: int | No
         rec["lane_at"] = round(lane_at, 3)
     if over:
         rec["over_share"] = list(over)
+    if lane_s is not None:
+        rec["lane_s"] = round(max(0.0, lane_s), 3)
+        rec["pool_s"] = round(min(max(0.0, pool_s or 0.0), rec["lane_s"]), 3)
+    try:
+        cut = json.loads(os.environ.get(CUT_ENV) or "{}")
+        if isinstance(cut, dict) and isinstance(cut.get("at"), (int, float)) and not isinstance(cut["at"], bool):
+            rec["cut_at"], rec["cut_by"] = round(float(cut["at"]), 3), str(cut.get("by") or "")
+    except ValueError:
+        pass
     if state is not None:
         _append(Path(state), WAITS_LOG, WAITS_OLD, WAITS_LOCK, WAITS_MAX_BYTES, rec)
     record_grant(rec, owns)

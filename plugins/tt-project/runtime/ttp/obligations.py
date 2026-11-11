@@ -105,7 +105,8 @@ CHECK_EVERY_S = 300
 REOWN_LABEL = "reown:"        # + obligation id: the owner task the daemon started for it
 RUN_FILES_DAYS = 7            # run records are looked for in runs started this recently (or still running)
 RUN_IDS_PER_QUERY = 500       # kept run offsets checked per query (SQLite caps the variables in one)
-CLOSED = ("done", "failed", "cancelled")
+CLOSED = ("done", "failed", "cancelled", "superseded")   # superseded: a review a later passing one covers (db.SUPERSEDED)
+_CLOSED_QS = ",".join("?" * len(CLOSED))
 DEFER_MAX_DAYS = 14.0         # coordinator.defer_max_days: a sleep this old no longer covers its owner
 TEXT_MAX = 500
 EVIDENCE_MAX = 300
@@ -386,7 +387,7 @@ def _attach_carriers(p, st: dict, now: float, tids=None) -> list[tuple[str, int]
            and not o.get("delivered")]
     if not obs:
         return []
-    sql = "SELECT id, title, labels, parent FROM tasks WHERE status NOT IN (?,?,?)"
+    sql = f"SELECT id, title, labels, parent FROM tasks WHERE status NOT IN ({_CLOSED_QS})"
     args: list = [*CLOSED]
     if tids is not None:
         ids = [int(t) for t in tids]
@@ -432,7 +433,7 @@ def _candidates(db, o: dict, limit: int = 10) -> list[dict]:
     if not ids:
         return []
     like = " OR ".join(["title LIKE ? OR spec LIKE ?"] * len(ids))
-    rows = db.q(f"SELECT id, title, spec, status FROM tasks WHERE status NOT IN (?,?,?) AND ({like}) ORDER BY id",
+    rows = db.q(f"SELECT id, title, spec, status FROM tasks WHERE status NOT IN ({_CLOSED_QS}) AND ({like}) ORDER BY id",
                 [*CLOSED, *(x for t in ids for x in (f"%#{t}%",) * 2)])
     out = []
     for r in rows:
@@ -1191,7 +1192,9 @@ def _has_time(sentence: str) -> bool:
 
 def authored(text: str) -> str:
     """`text` without the lines the harness appends to a coordinator message before it is posted (onhost's
-    'Status now:' queue forecasts, wakemode's mode line): what the coordinator itself wrote."""
+    'Status now:' queue forecasts, wakemode's mode line): what the coordinator itself wrote. A queue
+    forecast is the harness's, never the sender's own promise. One definition: a second one below once
+    replaced this and let the mode line's ETA mint a promise."""
     from . import onhost, wakemode
     text = text or ""
     for head in (onhost.STATUS_HEAD, wakemode.HEAD):
@@ -1317,13 +1320,6 @@ def _named_owner(db, chat: str, text: str) -> int | None:
     rows = db.q(f"SELECT id, status, reply_chat FROM tasks WHERE id IN ({','.join('?' * len(ids))})", ids)
     hits = [r["id"] for r in rows if r["status"] in NAMED_OPEN and r["reply_chat"] and _chat(r["reply_chat"]) == chat]
     return hits[0] if len(hits) == 1 else None
-
-
-def authored(text: str) -> str:
-    """`text` without the footer the harness appends to a sent reply (onhost: "Status now: #12: queued
-    for a worker, ETA ..."): the queue forecast is the harness's, never the sender's own promise."""
-    from .claimcheck import STATUS_TAIL
-    return (text or "").partition(STATUS_TAIL)[0]
 
 
 def record_promises(p, sent: list[tuple[int, str | None, str]], tasks: dict[int, str | None],
@@ -1546,7 +1542,7 @@ def promise_lines(db, now: float | None = None, where=None) -> list[str]:
         return []
     late = sum(1 for o in rows if now >= o["promise"]["due"])
     out = [f"## Promises made in chat: {len(rows)} open" + (f", {late} OVERDUE" if late else "")
-           + " (send each deliverable or an honest update in its chat; close with `obligation` key + evidence)"]
+           + " (send each deliverable in its chat; an honest update waits for its digest; close with `obligation` key + evidence)"]
     out += [f"- {o['id']} {o['text'][:200]} [{_promise_state(o, now, where)}]" for o in rows]
     return out
 
@@ -1674,6 +1670,9 @@ def deliver(p, sent: list[tuple[int, str | None, list]], now: float | None = Non
 # A miss raises one high `claim_failed` event. Overdue promises and orders, late orders and failed
 # claims carry `must_act` in their event data: the coordinator wake they start must act on each
 # (mustact.py).
+# A status claim ("#12 is queued", "#12 has started", `state` set or read from such a line, see
+# claim_state) observes a task's status now: check_claims holds it against the task record at send
+# time and record_claims does not track it as a promise that the task ends done.
 ORDER_LATE_KIND = "order_late"
 ORDER_KIND = "order_overdue"
 CLAIM_KIND = "claim_failed"
@@ -1694,6 +1693,13 @@ CLAIM_WAITING = (75, 255, "timeout", None)
 # Owners the daemon attaches itself (attach_carriers: a review carrying an owner's work on) are hops, not
 # this choice, and are not checked.
 UNFIT_OWNER_KINDS = ("question", "plan", "review")
+# A status claim's `state` and the task statuses that make it true at send time ("started": a run began).
+CLAIM_STATES = {"queued": ("queued",), "running": ("running",), "waiting": ("waiting",),
+                "started": ("running", "waiting", "blocked", "review", "done", "failed")}
+_OBSERVED = re.compile(r"\b(?:is|are|has|have|was|were|been|now|got)\s+(?:(?:still|now|already|just|been)\s+){0,2}"
+                       r"(queued|started|running|waiting)\b|\b(?:in|on) the queue\b", re.I)
+_OUTCOME = re.compile(r"\b(?:done|land(?:s|ed|ing)?|push(?:es|ed)?|finish(?:es|ed)?|complete[sd]?|merged?|fixed|"
+                      r"ready|live|deliver(?:s|ed)?|report(?:s|ed)?|result)\b", re.I)
 ORDER_AUDIT_DAYS = 7
 
 
@@ -1901,6 +1907,21 @@ def _check_order(p, o: dict, now: float, raised: list[str]) -> bool:
     return changed
 
 
+def claim_state(c: dict) -> str | None:
+    """The status a task-backed claim observes (a key of CLAIM_STATES), else None: its `state`, or a
+    claim with no `due` whose text only says the task is queued, started, running or waiting (no outcome,
+    no future or time). A claim that also names an outcome stays a claim that the task ends done."""
+    if c.get("task") in (None, ""):
+        return None
+    if c.get("state") not in (None, ""):
+        return str(c["state"])
+    text = " ".join(str(c.get("text") or "").split())
+    if c.get("due") not in (None, "") or _OUTCOME.search(text) or FUTURE_RE.search(text) or _has_time(text):
+        return None
+    seen = {(m.group(1) or "queued").lower() for m in _OBSERVED.finditer(text)}
+    return seen.pop() if len(seen) == 1 else None
+
+
 def check_claims(claims, p, new_tasks=None) -> None:
     """Static checks of a reply's or notify's `claims` before it is sent; raises on the first bad one.
     `new_tasks`: the action indexes of this batch's task_add actions, when known."""
@@ -1918,6 +1939,14 @@ def check_claims(claims, p, new_tasks=None) -> None:
             raise ValueError(f"claim: no task #{c['task']}")
         if c.get("action") not in (None, "") and new_tasks is not None and int(c["action"]) not in new_tasks:
             raise ValueError(f"claim: action {c['action']} is not a task_add of this batch")
+        if c.get("state") not in (None, "") and (c["state"] not in CLAIM_STATES or c.get("task") in (None, "")):
+            raise ValueError(f"claim `state` is one of {', '.join(CLAIM_STATES)}, with `task`: what its record "
+                             f"shows now")
+        if state := claim_state(c):
+            t = p.db.task(int(c["task"]))
+            if t["status"] not in CLAIM_STATES[state]:
+                raise ValueError(f"claim: #{c['task']} is {t['status']} in its record, not {state} "
+                                 f"({str(c['text'])[:80]}): state its status from the record")
         if c.get("expect") not in (None, ""):
             check_start_when(str(c["expect"]), p)
         if c.get("due") not in (None, ""):
@@ -1933,6 +1962,10 @@ def record_claims(p, sent: list[tuple[int, str | None, list]], new_tasks: dict[i
     todo = []
     for mid, chat, claims in sent:
         for c in claims or []:
+            if state := claim_state(c):   # a status checked at send time (check_claims), not a promise
+                notes.append(f"claim not tracked: #{c['task']} is {state} at send time, a status, not that it "
+                             f"ends done ({str(c['text'])[:80]})")
+                continue
             task = int(c["task"]) if c.get("task") not in (None, "") else None
             if c.get("action") not in (None, ""):
                 task = new_tasks.get(int(c["action"]))
@@ -1998,6 +2031,13 @@ def _check_claim(p, o: dict, now: float, raised: list[str]) -> bool:
         status = t["status"] if t else "gone"
         if status == "done":
             o["receipt"] = {"at": now, "task": int(c["task"]), "evidence": f"#{c['task']} ended done"}
+            _retire(db, now, "claim held", prefix=fp)
+            return True
+        if status == "superseded":   # a later passing review covers it: closed, held through that one
+            from .db import SUPERSEDED_KEY, load_result
+            by = (load_result(t["result"]).get(SUPERSEDED_KEY) or {}).get("by_review")
+            o["receipt"] = {"at": now, "task": int(c["task"]), "evidence": f"#{c['task']} was superseded"
+                            + (f" by review #{by}, which passed" if by else " by a later passing review")}
             _retire(db, now, "claim held", prefix=fp)
             return True
         if status in ("failed", "cancelled", "gone"):

@@ -31,7 +31,10 @@ project.protected_log records) and reports it in the tool result and as an event
 not compared, as the daemon writes it all the time: only the command-text refusal covers it. A push built
 at run time is refused again at run time: `ttp push` (cli.cmd_push) and the harness's git
 wrapper (gitguard.main) refuse a landing or any `git push` in a coordinator run (coordinator_run: FULL_ENV,
-or ROLE_ENV, which the daemon sets for every run). A coordinator run also holds no device
+or ROLE_ENV, which the daemon sets for every run), except `ttp push` (or `--land`) of a HEAD an independent
+review approved (push.approved_landing, delivery.code_tasks_may_push "approved", the default): its own
+`git push` passes only as a child of that `ttp push`, sending exactly the head its approval marker
+records (push._mark_approved, gitguard.approved_push). A coordinator run also holds no device
 (TTP_NO_DEVICE=1), so the worker device-command refusals (hook.device_command) bind it (heavy device work
 goes to a worker). Event text stays untrusted data (later hardening: #6095, #6098). A stateless turn
 (a provider with no session) never gets them.
@@ -89,9 +92,10 @@ ROLE_ENV = "TTP_ROLE"   # the run's role, set for every run (daemon.start_run): 
 # `ttp push` forms that land or move nothing (cli.cmd_push; `--cancel` only stops one): the only ones a coordinator may run
 PUSH_READS = (("--queue",), ("--free",), ("--result", "*"), ("--result", "*", "--pushed"), ("--cancel", "*"),
               ("--help",), ("-h",))
-PUSH_REFUSAL = ("a coordinator lands nothing and moves no tag: code changes go on a work branch through a worker "
-                "task, its review and the push queue (the review lands them), and a channel tag moves only in a "
-                "release cut task once its candidate checks pass. Queue a task (`ttp task <project> add ...`)")
+PUSH_REFUSAL = ("a coordinator lands only a head an independent review approved, with `ttp push --land` in "
+                "its worktree (the push checks run as for any push), and moves no tag: never a raw `git push`; "
+                "other changes go through a worker task, its review and the push queue, and a channel tag "
+                "moves only in a release cut task once its candidate checks pass")
 
 
 def coordinator_run(env=None) -> bool:
@@ -384,6 +388,22 @@ def _lands(cmd: str) -> bool:
     return _runs(cmd, _ttp_push, r"\bttp\s+push\b(?!\s+--(?:queue|free|result|cancel)\b)")
 
 
+def _ttp_push_other(seg: list[str]) -> bool:
+    """A `ttp push` that moves a tag, publishes a branch of its own or runs a batch: never a coordinator's."""
+    for i, w in enumerate(seg[:-1]):
+        if os.path.basename(w) == "ttp" and seg[i + 1] == "push":
+            return any(x.split("=")[0] in ("--move-tag", "--own", "--own-branch", "--batch", "--marker")
+                       for x in seg[i + 2:])
+    return False
+
+
+def _moves(cmd: str) -> bool:
+    """Whether `cmd` runs a `ttp push` other than a landing of the checkout's HEAD (_ttp_push_other), or any
+    landing inside `sh -c`, ssh and the like; the plain landing goes on to cmd_push, which runs it only
+    for a head a review approved."""
+    return _runs(cmd, _ttp_push_other, r"\bttp\s+push\b(?!\s+--(?:queue|free|result)\b)")   # nested: any
+
+
 def full_refusal(tool: str, args: dict, cwd: str) -> str | None:
     """Why a full-tools coordinator may not make this call before the worker checks run (None: go on)."""
     protected = [d for d in os.environ.get(PROTECTED_ENV, "").split(os.pathsep) if d]
@@ -401,7 +421,7 @@ def full_refusal(tool: str, args: dict, cwd: str) -> str | None:
     if asked > limit or args.get("run_in_background"):
         return (f"a coordinator's foreground command runs at most {int(limit)} s (coordinator.session.tool_timeout_s); "
                 "run longer work with `ttp detach <name> -- <cmd>` or give it to a worker task")
-    if _pushes(cmd) or _lands(cmd):
+    if _pushes(cmd) or _moves(cmd):   # a plain `ttp push` / `--land`: cmd_push checks its head was approved
         return PUSH_REFUSAL
     if bash_refusal(cmd) is None:   # a listed read-only ttp command
         return None

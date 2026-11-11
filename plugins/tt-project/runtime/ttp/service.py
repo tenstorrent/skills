@@ -40,12 +40,22 @@ def unit_name(p: Project) -> str:
 WATCHDOG_EVERY_S = 300   # how often launchd and cron look for a stuck daemon
 # launchd's ProcessType Background runs an agent and every child (workers, git, pytest, ttp push) at
 # darwin background priority: efficiency cores only and throttled I/O. The daemon runs Standard; its
-# workers, reviewers and checks stay polite at runner.nice. The watchdog and tunnels stay Background.
-# An installed daemon plist lacking any of these keys is rewritten on upgrade (refresh).
+# workers, reviewers and checks stay polite at runner.nice. The watchdog runs Standard too (on a loaded
+# host a Background watchdog is starved past the hang it should end); tunnels stay Background.
+# An installed daemon or watchdog plist lacking any of these keys is rewritten on upgrade (refresh).
 DAEMON_KEYS = {"ProcessType": "Standard", "AbandonProcessGroup": True}
-# Darwin background priority is inherited: a daemon started by hand from the watchdog (a Background agent)
-# runs at background priority too. launchd's ProcessType Background stays on its children through fork and
-# exec and no setpriority lifts it, so restart_service starts the daemon through launchd from its own plist;
+WATCHDOG_KEYS = {"ProcessType": "Standard"}
+# `launchctl bootout` can return before launchd has removed the job (it waits for the job's processes to
+# exit, up to its ExitTimeOut): a bootstrap right after fails while the label is still loaded. A reload waits
+# for the label to unload, at most UNLOAD_WAIT_S, then tries the bootstrap BOOTSTRAP_TRIES times; a job
+# launchd already loaded (KeepAlive, the watchdog, another restart) counts as loaded.
+UNLOAD_WAIT_S = 30
+BOOTSTRAP_TRIES = 3
+BOOTSTRAP_RETRY_S = 1.0
+# Darwin background priority is inherited: a daemon started by hand from a background or niced starter
+# runs at that priority too. launchd's ProcessType Background stays on its children through fork and
+# exec and no setpriority lifts it, so restart_service starts the daemon only through launchd from its own
+# plist when one is installed (a failure is reported, never a hand start);
 # leave_background() drops what it can (taskpolicy -b) and logs the priority the kernel applies.
 PRIO_DARWIN_PROCESS = 4   # <sys/resource.h>: the which of setpriority for darwin background state
 DARWIN_BG_PRI = 4         # `ps -o pri=` of a process at darwin background priority
@@ -96,7 +106,7 @@ def leave_background(plist: Path | None) -> str:
     if after is not None and after > DARWIN_BG_PRI:
         return f"cpu priority: normal (pri {after}; left the background priority it inherited from its starter)"
     return (f"warning: cpu priority: background (pri {after}) though its launchd plist does not set ProcessType "
-            "Background: it inherited it from a background starter (a hand restart from the watchdog); "
+            "Background: it inherited it from a background starter (a hand start from a background caller); "
             "a restart through launchd (launchctl kickstart -k) runs it at its plist's priority")
 
 
@@ -402,11 +412,9 @@ def _install_launchd(p: Project) -> str:
            "ThrottleInterval": 10, "StandardOutPath": str(p.logs / "launchd.log"),
            "StandardErrorPath": str(p.logs / "launchd.log")}
     durable_write(plist, plistlib.dumps(job))
-    uid = os.getuid()
-    _run("launchctl", "bootout", f"gui/{uid}/{label}")
-    r = _run("launchctl", "bootstrap", f"gui/{uid}", str(plist))
+    r = _reload(label, plist)
     if r.returncode != 0:
-        return f"launchd bootstrap failed: {r.stderr.strip()[:200]}"
+        return f"launchd bootstrap failed: {_ctl_out(r)[:200]}"
     return f"launchd agent {label}" + _install_launchd_watchdog(p)
 
 
@@ -414,16 +422,80 @@ def _install_launchd_watchdog(p: Project) -> str:
     """A second agent that runs `ttp.watchdog` every few minutes: KeepAlive restarts a daemon that
     exits, not one that is alive but stuck."""
     label, plist = launchd_label(p, watchdog=True), _agent(p, watchdog=True)
+    if os.environ.get("XPC_SERVICE_NAME") == label:
+        # Never from inside its own job: the bootout would end this process before its bootstrap.
+        return " with a watchdog (kept as loaded: this runs inside it)"
     job = {"Label": label, "ProgramArguments": watchdog_argv(p), "WorkingDirectory": str(p.base),
-           "EnvironmentVariables": _env(p), "StartInterval": WATCHDOG_EVERY_S, "ProcessType": "Background",
+           "EnvironmentVariables": _env(p), "StartInterval": WATCHDOG_EVERY_S, **WATCHDOG_KEYS,
            "StandardOutPath": str(p.logs / "launchd.log"), "StandardErrorPath": str(p.logs / "launchd.log")}
     plist.parent.mkdir(parents=True, exist_ok=True)
     p.logs.mkdir(parents=True, exist_ok=True)
     durable_write(plist, plistlib.dumps(job))
-    uid = os.getuid()
-    _run("launchctl", "bootout", f"gui/{uid}/{label}")
-    r = _run("launchctl", "bootstrap", f"gui/{uid}", str(plist))
-    return " with a watchdog" if r.returncode == 0 else f" (watchdog bootstrap failed: {r.stderr.strip()[:200]})"
+    r = _reload(label, plist)
+    return " with a watchdog" if r.returncode == 0 else f" (watchdog bootstrap failed: {_ctl_out(r)[:200]})"
+
+
+def _ctl_out(r: subprocess.CompletedProcess) -> str:
+    return " ".join(x.strip() for x in (r.stderr or "", r.stdout or "") if x and x.strip()) or f"exit {r.returncode}"
+
+
+def _target(label: str) -> tuple[str, str]:
+    domain = f"gui/{os.getuid()}"
+    return f"{domain}/{label}", domain
+
+
+def launchd_loaded(label: str) -> bool:
+    """launchd has job `label` loaded (`launchctl print` exits 0; 113 when it has no such job)."""
+    return _run("launchctl", "print", _target(label)[0]).returncode == 0
+
+
+def _wait_unloaded(label: str, wait_s: float = UNLOAD_WAIT_S) -> bool:
+    """After a bootout: wait, at most wait_s, until launchd has removed the job; whether it did."""
+    deadline = time.time() + wait_s
+    while launchd_loaded(label):
+        if time.time() >= deadline:
+            return False
+        time.sleep(0.5)
+    return True
+
+
+def bootstrap(label: str, plist: Path) -> subprocess.CompletedProcess:
+    """Load agent `label` from its plist: bootstrap, retried a few times; a job launchd already has
+    loaded counts as success. A failure keeps launchctl's own output."""
+    target, domain = _target(label)
+    r = subprocess.CompletedProcess([], 1, "", "")
+    for i in range(BOOTSTRAP_TRIES):
+        r = _run("launchctl", "bootstrap", domain, str(plist))
+        if r.returncode == 0:
+            return r
+        if launchd_loaded(label):   # "service already loaded": loaded is what this wants
+            return subprocess.CompletedProcess(r.args, 0, r.stdout, r.stderr)
+        if i + 1 < BOOTSTRAP_TRIES:
+            time.sleep(BOOTSTRAP_RETRY_S * (i + 1))
+    return r
+
+
+def _reload(label: str, plist: Path) -> subprocess.CompletedProcess:
+    """bootout, wait for the label to unload, then bootstrap: how launchd takes a changed plist."""
+    target, _ = _target(label)
+    _run("launchctl", "bootout", target)
+    if not _wait_unloaded(label):
+        return subprocess.CompletedProcess([], 1, "", f"launchctl bootout {target}: still loaded {UNLOAD_WAIT_S}s "
+                                                     f"later, so its bootstrap was not tried")
+    return bootstrap(label, plist)
+
+
+def ensure_loaded(p: Project) -> str | None:
+    """The watchdog's launchd step: KeepAlive restarts a daemon only while its agent is loaded, so an agent
+    left unloaded (a bootout whose bootstrap failed) is bootstrapped from its plist. None when it is loaded
+    or not installed; else what was done."""
+    label, plist = launchd_label(p), _agent(p)
+    if sys.platform != "darwin" or not plist.exists() or launchd_loaded(label):
+        return None
+    r = bootstrap(label, plist)
+    if r.returncode == 0:
+        return f"bootstrapped its unloaded launchd agent {label}"
+    return _manager_said(f"launchctl bootstrap {label}", r).replace("\n", " ")[:300]
 
 
 CRON_TAG = "# tt-project:"
@@ -564,18 +636,31 @@ def update_plist(path: Path, want: dict) -> bool:
     return True
 
 
-def _reload_agent(label: str, plist: Path, inside: bool) -> subprocess.CompletedProcess:
-    """bootout, then bootstrap: how launchd takes a changed plist (kickstart keeps the loaded one).
-    From inside that agent's job (`inside`) both run in a new session, which outlives the bootout."""
-    target, domain = f"gui/{os.getuid()}/{label}", f"gui/{os.getuid()}"
+def _reload_script(target: str, domain: str, plist: Path, log: Path) -> str:
+    """_reload as a shell script, for a reload from inside the job: bootout, wait for the label to unload,
+    bootstrap with retries (already loaded counts), and log a failure."""
+    t, pl, lg = shlex.quote(target), shlex.quote(str(plist)), shlex.quote(str(log))
+    polls = int(UNLOAD_WAIT_S * 2)
+    return (f"launchctl bootout {t} >/dev/null 2>&1; i=0; "
+            f"while launchctl print {t} >/dev/null 2>&1; do i=$((i+1)); "
+            f"if [ $i -gt {polls} ]; then echo \"$(date '+%Y-%m-%d %H:%M:%S') reload of {t} failed: still loaded "
+            f"{UNLOAD_WAIT_S}s after its bootout\" >> {lg}; exit 1; fi; sleep 0.5; done; "
+            f"n=0; while [ $n -lt {BOOTSTRAP_TRIES} ]; do n=$((n+1)); "
+            f"out=$(launchctl bootstrap {domain} {pl} 2>&1) && exit 0; "
+            f"launchctl print {t} >/dev/null 2>&1 && exit 0; [ $n -lt {BOOTSTRAP_TRIES} ] && sleep $n; done; "
+            f"echo \"$(date '+%Y-%m-%d %H:%M:%S') reload of {t} failed: launchctl bootstrap: $out\" >> {lg}; exit 1")
+
+
+def _reload_agent(label: str, plist: Path, inside: bool, log: Path) -> subprocess.CompletedProcess:
+    """bootout, wait for the unload, then bootstrap: how launchd takes a changed plist (kickstart keeps the
+    loaded one). From inside that agent's job (`inside`) it runs in a new session, which outlives the bootout,
+    and logs a failure to `log`."""
+    target, domain = _target(label)
     if inside:
-        # own session: the bootstrap must outlive the bootout of the agent job that runs it
-        subprocess.Popen(["sh", "-c", f"launchctl bootout {shlex.quote(target)}; "
-                                      f"launchctl bootstrap {domain} {shlex.quote(str(plist))}"],
+        subprocess.Popen(["sh", "-c", _reload_script(target, domain, plist, log)],
                          start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return subprocess.CompletedProcess([], 0, "", "")
-    _run("launchctl", "bootout", target)
-    return _run("launchctl", "bootstrap", domain, str(plist))
+    return _reload(label, plist)
 
 
 def _inside(p: Project, label: str) -> bool:
@@ -589,6 +674,12 @@ def refresh(p: Project) -> bool:
     watchdog existed gets it) without starting or stopping anything. True when it rewrote the
     daemon's launchd plist to DAEMON_KEYS (an older Background one): restart_service reloads it."""
     rewrote = sys.platform == "darwin" and update_plist(_agent(p), DAEMON_KEYS)
+    wd_label, wd_plist = launchd_label(p, watchdog=True), _agent(p, watchdog=True)
+    # An older Background watchdog gets WATCHDOG_KEYS and a reload, never from inside its own job (the
+    # bootout would end the watchdog mid-restart): the next upgrade or restart from elsewhere does it.
+    if (sys.platform == "darwin" and os.environ.get("XPC_SERVICE_NAME") != wd_label
+            and update_plist(wd_plist, WATCHDOG_KEYS)):
+        _reload(wd_label, wd_plist)
     unit = _unit(p)
     if unit.exists():
         changed = unit.read_text(errors="replace") != _unit_text(p)
@@ -619,7 +710,7 @@ def restart_service(p: Project) -> str:
     label = launchd_label(p)
     if sys.platform == "darwin" and _agent(p).exists():
         if rewrote:
-            r = _reload_agent(label, _agent(p), _inside(p, label))
+            r = _reload_agent(label, _agent(p), _inside(p, label), p.logs / "daemon.out")
         else:
             r = _run("launchctl", "kickstart", "-k", f"gui/{os.getuid()}/{label}")
         if r.returncode == 0:
@@ -647,19 +738,22 @@ def restart_service(p: Project) -> str:
             time.sleep(0.5)
     p.logs.mkdir(parents=True, exist_ok=True)
     if sys.platform == "darwin":
-        why = "no launchd agent is installed"
         if _agent(p).exists():
-            # launchd starts it at its plist's ProcessType; a hand start would run at the caller's
-            # priority, and the watchdog calling this runs Background.
-            domain = f"gui/{os.getuid()}"
-            r = _run("launchctl", "bootstrap", domain, str(_agent(p)))
+            # launchd starts it at its plist's ProcessType. Never by hand: a hand start runs outside
+            # launchd at its starter's priority (a niced or Background caller's), so a failure is reported.
+            r = bootstrap(label, _agent(p))
             if r.returncode == 0:
-                r = _run("launchctl", "kickstart", f"{domain}/{label}")
+                r = _run("launchctl", "kickstart", _target(label)[0])
             if r.returncode == 0:
                 return "restarted"
             why = _manager_said("launchctl bootstrap and kickstart", r).replace("\n", " ")[:300]
-        line = (f"{datetime.now():%Y-%m-%d %H:%M:%S} restart by hand ({why}): the daemon runs at its "
-                f"starter's CPU priority (background when the watchdog started it)\n")
+            line = (f"{datetime.now():%Y-%m-%d %H:%M:%S} restart failed, the daemon was not started by hand "
+                    f"(it would run outside launchd at its starter's CPU priority): {why}\n")
+            with open_append_or_null(p.logs / "daemon.out", text=line) as f:
+                f.write(line)
+            return why
+        line = (f"{datetime.now():%Y-%m-%d %H:%M:%S} restart by hand (no launchd agent is installed): the "
+                f"daemon runs at its starter's CPU priority\n")
         with open_append_or_null(p.logs / "daemon.out", text=line) as f:
             f.write(line)
     _spawn(p)

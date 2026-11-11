@@ -9,7 +9,9 @@ step is open, on the thread that opened it:
   and resumes there next tick (Daemon._step_over).
 - at budget + slack a step still running is stopped where it is: SIGALRM raises StepBudgetSpent in it
   (main thread only), so a pure Python loop or a blocking wait ends too. Inside critical() (a db
-  transaction's commit or rollback, a git write) the stop waits until the section ends.
+  transaction's commit or rollback, a git write, a child's spawn) the stop waits until the section ends.
+  A caller that starts a detached child holds critical() from the spawn until it has recorded the child,
+  so a stop never leaves one running untracked.
 - every child it waits on (subprocess.run, call, check_output, Popen.wait and communicate) waits at
   most until then: no timeout, or a longer one, gets the time left. On expiry the child's whole tree is
   killed and StepBudgetSpent names the command. A wait inside critical() keeps its own timeout
@@ -188,7 +190,8 @@ def _init(self, args, *a, **kw):
     _count_spawn(args)
     if not kw.get("shell"):
         args = sshmux.argv(ssh_argv(args), kw.get("env"))
-    _orig["init"](self, args, *a, **kw)
+    with critical():   # a stop mid-spawn would leave a started child its caller never got to record
+        _orig["init"](self, args, *a, **kw)
 
 
 def _bounded(proc, call, timeout):

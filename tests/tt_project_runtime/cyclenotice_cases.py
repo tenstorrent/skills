@@ -434,3 +434,129 @@ def test_setup_recovery_skips_while_another_process_holds_the_setup_lock(env, tm
         holder.stdin.close()
         holder.wait(30)
     assert "rolled back" in cli._recover_setup() and not journal.exists()
+
+
+# A cycle a heal check's output announces (cyclenotice.probe_held): fixture probe text in the test db only.
+def _cycle_probe(p, out, name="broker", ago=30, **spec):
+    """A heal check `name` whose last run `ago` s back printed `out`."""
+    from ttp import heal
+    from ttp import schedule as sched
+    sched.upsert(p.db, name, "command", "5m", payload={"heal": spec if spec.get("preset") else {"check": "true", **spec}})
+    p.db.set_kv(heal.STATE_KEY + name, {"last_check": time.time() - ago, "last_rc": 1, "last_out": out})
+
+
+_ANNOUNCED = "chips: 31/32 up\nnext: power cycle of this host in 90 s (chip 7 lost)\n"
+
+
+def test_a_probe_announcing_a_power_cycle_holds_until_its_output_clears(env, monkeypatch):
+    from ttp import cyclenotice as cn
+    p = make(env)
+    _notice(env, monkeypatch, None)           # no notice file: only the probe announces
+    assert cn.project_held(p) is None
+    _cycle_probe(p, _ANNOUNCED)
+    h = cn.project_held(p)
+    assert h and h["path"] == "heal check broker" and "chip 7 lost" in h["reason"], h
+    assert "heal check broker" in cn.line(h, p) and "notice heal" not in cn.line(h, p)
+    _cycle_probe(p, "chips: 32/32 up\nnext: nothing scheduled\n")
+    assert cn.project_held(p) is None, "the next output that no longer announces it releases the hold"
+    _cycle_probe(p, _ANNOUNCED, ago=cn.PROBE_FRESH_S + 5)
+    assert cn.project_held(p) is None, "an old output says nothing about now"
+
+
+@pytest.mark.parametrize("out", [
+    '{"auto_power_cycle": true, "held": false}',            # a setting, not an announcement
+    "power_cycle_pending: false",
+    "last power cycle: 3 days ago",
+    "Power cycle completed",
+    "no power cycle scheduled in 90 s",
+    "power cycle pending: no",
+    "power cycle requested: none",
+    "next: power cycle disabled",
+    "power cycle pending: 0",
+    "auto power cycle: scheduled on chip loss",          # a setting: no time or countdown
+    "next: power cycle",                                 # no time or countdown either
+])
+def test_probe_text_that_names_no_pending_cycle_holds_nothing(env, monkeypatch, out):
+    from ttp import cyclenotice as cn
+    p = make(env)
+    _notice(env, monkeypatch, None)
+    _cycle_probe(p, out)
+    assert cn.project_held(p) is None, out
+
+
+def test_a_probe_line_that_stays_past_the_bound_releases_its_hold_and_is_told_once(env, monkeypatch):
+    from ttp import cyclenotice as cn
+    p = make(env)
+    _notice(env, monkeypatch, None)
+    _cycle_probe(p, _ANNOUNCED)
+    t0 = time.time()
+    assert cn.probe_held(p, now=t0), "a fresh announcement holds"
+    _cycle_probe(p, _ANNOUNCED, ago=-(cn.PROBE_MAX_HOLD_S - 90))   # rerun since: the same line again
+    assert cn.probe_held(p, now=t0 + cn.PROBE_MAX_HOLD_S - 60), "still within the bound"
+    _cycle_probe(p, _ANNOUNCED, ago=-cn.PROBE_MAX_HOLD_S)      # rerun since: the same line again
+    for _ in range(3):
+        assert cn.probe_held(p, now=t0 + cn.PROBE_MAX_HOLD_S + 60) is None, "past the bound the line is stuck"
+    ev = p.db.q("SELECT severity, text FROM events WHERE fingerprint LIKE 'cycle-probe-stuck:%'")
+    assert len(ev) == 1 and ev[0]["severity"] == "low" and "heal check broker" in ev[0]["text"] \
+        and "chip 7 lost" in ev[0]["text"], ev
+    # The output changes: a new announcement holds again, from its own start.
+    _cycle_probe(p, "next: power cycle of this host in 60 s (chip 3 lost)\n", ago=-cn.PROBE_MAX_HOLD_S)
+    assert cn.probe_held(p, now=t0 + cn.PROBE_MAX_HOLD_S + 90)
+
+
+def test_a_broker_check_on_another_box_holds_nothing_here(env, monkeypatch):
+    from ttp import cyclenotice as cn
+    from ttp import machines
+    p = make(env)
+    _notice(env, monkeypatch, None)
+    monkeypatch.setattr(machines, "load", lambda: {"box-a": {"hostname": "box-a.example"},
+                                                   "box-b": {"hostname": "box-b.example"}})
+    monkeypatch.setattr(machines, "here", lambda: ("box-a", {"hostname": "box-a.example"}))
+    _cycle_probe(p, _ANNOUNCED, preset="broker", resource="box-b-device",
+                status_command="example-broker status")
+    assert cn.project_held(p) is None, "a broker check of another box says nothing about this host"
+    _cycle_probe(p, _ANNOUNCED, preset="broker", resource="box-a-device",
+                status_command="example-broker status")
+    assert cn.project_held(p), "the same check on this host's box holds"
+
+
+def test_probe_patterns_and_checks_are_configurable_and_a_remote_check_holds_nothing_here(env, monkeypatch):
+    from ttp import cyclenotice as cn
+    p = make(env)
+    _notice(env, monkeypatch, None)
+    _cycle_probe(p, _ANNOUNCED, name="other-box", machine="some-other-box")
+    assert cn.project_held(p) is None, "a check watching another machine says nothing about this host"
+    p.set_config("upgrade.cycle_checks", ["other-box"])
+    assert cn.project_held(p), "a check named in upgrade.cycle_checks is read whatever it watches"
+    p.set_config("upgrade.cycle_checks", None)
+    _cycle_probe(p, "state: RECYCLE_SOON", name="local")
+    assert cn.project_held(p) is None
+    p.set_config("upgrade.cycle_patterns", ["recycle_soon", "(unbalanced"])   # a bad regex is skipped
+    assert cn.project_held(p)["reason"] == "state: RECYCLE_SOON"
+    p.set_config("upgrade.cycle_patterns", [])
+    _cycle_probe(p, _ANNOUNCED, name="local")
+    assert cn.project_held(p) is None, "[] turns the probe hold off"
+
+
+def test_while_a_probe_announces_a_cycle_no_push_batch_checks_or_detached_job_start(env, monkeypatch, capsys, tmp_path):
+    from ttp import cli, pushq
+    s = _pq(env, monkeypatch)
+    _notice(env, monkeypatch, None)
+    _pq_plan(s, release=str(env["tmp"] / "go"), sha="ab" * 20, version="1.2.3")
+    _pq_hand_off(env, s)
+    _cycle_probe(s.p, _ANNOUNCED)
+    said = []
+    assert pushq.schedule(s.p, log=said.append) is None and not s.p.db.q("SELECT id FROM push_batches")
+    assert pushq.schedule(s.p, log=said.append) is None
+    assert len(said) == 1 and "no new batch starts" in said[0] and "chip 7 lost" in said[0], said
+    monkeypatch.setenv("TTP_PROJECT", str(s.p.base))
+    monkeypatch.setenv("TTP_RUN_DIR", str(tmp_path))
+    for argv in (["detach", "job", "--", "true"], ["checks", "--", "true"]):
+        with pytest.raises(SystemExit) as e:
+            cli.main(argv)
+        err = capsys.readouterr().err
+        assert e.value.code == 75 and "power cycle of this host is pending" in err and "retry_when" in err, err
+    assert not (tmp_path / "job.rc").exists() and not (tmp_path / "job.log").exists()
+    _cycle_probe(s.p, "next: nothing scheduled\n")
+    assert pushq.schedule(s.p, log=said.append), "the batch starts once the announcement clears"
+    assert s.p.db.kv(pushq.CYCLE_SAID_KEY) is None

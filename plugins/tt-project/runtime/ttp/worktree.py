@@ -1423,7 +1423,7 @@ def stray_worktrees(p: Project) -> list[dict]:
 
 
 def _sweep_stray(p: Project, w: dict, open_tasks: list[dict], now: float, older_than_s: float,
-                 entries: list, dry_run: bool) -> dict:
+                 entries: list, dry_run: bool, pushes: list[dict] | None = None) -> dict:
     """Sweep one stray worktree (see stray_worktrees): it goes once its task is done or cancelled, no
     run, process or other task holds it (held_by) and its HEAD is on a remote branch. Its dirty files
     (changed tracked and untracked ones, and hand-off artifacts) are first copied to
@@ -1447,7 +1447,7 @@ def _sweep_stray(p: Project, w: dict, open_tasks: list[dict], now: float, older_
     elif p.db.one("SELECT id FROM runs WHERE task=? AND status='running' LIMIT 1", (task["id"],)):
         why = held = f"a run of task #{task['id']} is still going"
     else:
-        why = held = held_by(p, task, open_tasks, now, path=path)
+        why = held = held_by(p, task, open_tasks, now, path=path, pushes=pushes)
     users = [] if why else _users(path)
     if users:
         why = held = f"process {users[0]} runs in it" + (f" (+{len(users) - 1} more)" if len(users) > 1 else "")
@@ -1493,6 +1493,8 @@ def _sweep_stray(p: Project, w: dict, open_tasks: list[dict], now: float, older_
             durable_write(dest / "manifest.json", json.dumps(
                 {"path": str(path), "repo": str(w["repo"]), "task": w["task"], "branch": res["branch"], "head": head,
                  "tracked": tracked, "files": files, "bytes": size, "at": now}, indent=1))
+    if not dry_run and _pushing_in(p, Path(path).resolve()):
+        return {**res, "why": "a detached `ttp push` runs in it", "held": True}   # began after the snapshot
     if not dry_run:
         remove_path(w["repo"], path, force=bool(tracked or files))
     return {**res, "why": None}
@@ -1902,12 +1904,19 @@ def keep_key(why: str | None) -> str | None:
     return _HOLDER_STATUS.sub(r"\1", why) if why else why
 
 
-def held_by(p: Project, task: dict, open_tasks: list[dict], now: float, path: Path | None = None) -> str | None:
-    """Why a finished task's worktree (or another worktree of the task, at `path`) must stay
-    untouched for now, or None."""
+def _pushing_in(p: Project, path: Path, pushes: list[dict] | None = None) -> bool:
+    """Whether a detached `ttp push` of this project runs or waits in `path`; `pushes` is a sweep's one
+    push.running() snapshot (None: read them now)."""
     from .push import running
+    return any(Path(m.get("repo") or "/").resolve() == path for m in (running(p) if pushes is None else pushes))
+
+
+def held_by(p: Project, task: dict, open_tasks: list[dict], now: float, path: Path | None = None,
+            pushes: list[dict] | None = None) -> str | None:
+    """Why a finished task's worktree (or another worktree of the task, at `path`) must stay
+    untouched for now, or None. `pushes`: a sweep's one push.running() snapshot (None: read them now)."""
     path = (path or p.worktrees / f"t{task['id']}").resolve()
-    if any(Path(m.get("repo") or "/").resolve() == path for m in running(p)):
+    if _pushing_in(p, path, pushes):
         return "a detached `ttp push` runs in it"
     user = probed_by(task, open_tasks)
     if user:
@@ -1924,12 +1933,11 @@ def held_by(p: Project, task: dict, open_tasks: list[dict], now: float, path: Pa
 
 
 def run_held(p: Project, w: dict, task: dict | None, open_tasks: list[dict], now: float,
-             older_than_s: float = 0) -> str | None:
+             older_than_s: float = 0, pushes: list[dict] | None = None) -> str | None:
     """Why the worktree `w` in a run directory (see run_worktrees) must stay for now, or None: no run
     of this project owns it, its run is still going, its task is still open, its run ended under
     FINISH_GRACE_S (or `older_than_s`) ago, or the task's own worktree would be held (held_by)."""
     from .db import TERMINAL_TASK_STATES
-    from .push import running
     run = w["run"]
     if run is None:
         return "no run of this project owns its folder"
@@ -1941,8 +1949,8 @@ def run_held(p: Project, w: dict, task: dict | None, open_tasks: list[dict], now
     if age < grace:
         return f"its run #{run['id']} ended under {grace / 3600:g} h ago"
     if task:
-        return held_by(p, task, open_tasks, now, path=w["path"])
-    if any(Path(m.get("repo") or "/").resolve() == w["path"] for m in running(p)):
+        return held_by(p, task, open_tasks, now, path=w["path"], pushes=pushes)
+    if _pushing_in(p, w["path"], pushes):
         return "a detached `ttp push` runs in it"
     return None
 
@@ -2109,6 +2117,14 @@ def sweep(p: Project, *, older_than_s: float = 0, names: list[str] | None = None
         def costly_ok() -> bool:
             return dry_run or ((archive_limit is None or archived < archive_limit)
                                and (deadline is None or time.time() < deadline))
+        pushes_now: list[list[dict]] = []
+
+        def sweep_pushes() -> list[dict]:
+            """The detached pushes, read once per sweep (not once per worktree); a removal rechecks live."""
+            if not pushes_now:
+                from .push import running
+                pushes_now.append(running(p))
+            return pushes_now[0]
         deferred = "archiving deferred to a later sweep (each daemon tick step archives at most one worktree)"
         open_tasks = p.db.q("SELECT id, status, spec, depends_on, labels, result FROM tasks WHERE status NOT IN (%s)"
                             % ",".join("?" * len(TERMINAL_TASK_STATES)), TERMINAL_TASK_STATES)
@@ -2148,13 +2164,13 @@ def sweep(p: Project, *, older_than_s: float = 0, names: list[str] | None = None
             if w is None:
                 res = {"task": task["id"], "path": str(path), "branch": task["branch"], "status": task["status"],
                        "updated": task["updated"], "cleared": []}
-                why = held_by(p, task, open_tasks, now)
+                why = held_by(p, task, open_tasks, now, pushes=sweep_pushes())
             else:
                 run = w["run"] or {}
                 res = {"task": task["id"] if task else None, "run": run.get("id"), "path": str(path),
                        "branch": rec["branch"] or (task or {}).get("branch"),
                        "status": (task or run).get("status") or "?", "updated": run.get("ended"), "cleared": []}
-                why = run_held(p, w, task, open_tasks, now, older_than_s)
+                why = run_held(p, w, task, open_tasks, now, older_than_s, sweep_pushes())
             users = [] if why else _users(path)
             if users:
                 why = f"process {users[0]} runs in it" + (f" (+{len(users) - 1} more)" if len(users) > 1 else "")
@@ -2245,6 +2261,8 @@ def sweep(p: Project, *, older_than_s: float = 0, names: list[str] | None = None
                         raise
                 if why is None and not dry_run and not patch and (res.get("moved") or res.get("archived")):
                     why = keep_reason(path)
+                if why is None and not dry_run and _pushing_in(p, Path(path).resolve()):
+                    why, res["held"] = "a detached `ttp push` runs in it", True   # began after the snapshot
                 res["why"] = why
                 if why is None and not dry_run:
                     if w is not None:
@@ -2270,7 +2288,8 @@ def sweep(p: Project, *, older_than_s: float = 0, names: list[str] | None = None
             progress()
             entries = handoff_paths(p) if entries is None else entries
             try:
-                out.append(_sweep_stray(p, w, open_tasks, now, older_than_s, entries, dry_run))
+                pushes = sweep_pushes()
+                out.append(_sweep_stray(p, w, open_tasks, now, older_than_s, entries, dry_run, pushes))
             except Exception as e:
                 out.append({"task": w["task"], "run": None, "stray": True, "path": str(w["path"]),
                             "branch": w["rec"]["branch"], "status": "?", "updated": None, "cleared": [],

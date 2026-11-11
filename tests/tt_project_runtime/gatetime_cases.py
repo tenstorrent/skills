@@ -321,3 +321,43 @@ def test_post_land_failure_that_passes_on_rerun_is_flaky_quarantined_and_never_r
     assert "tests/t.py::test_x" in gatejudge.active(p.state, time.time())
     assert not p.db.q("SELECT id FROM tasks WHERE title LIKE 'Revert%' OR title LIKE 'Fix%'")
     assert not p.db.q("SELECT id FROM push_queue WHERE status='approved'")
+
+
+def test_post_land_first_full_run_spills_and_its_reruns_bisect_and_revert_run_here(env, tmp_path, monkeypatch):
+    """The post-landing suite's first full run on the landed sha goes to a spill host (checkspill.spill_run, as
+    the push batch's first runs do) and its claim is closed after it; every rerun of the failing tests (at the
+    head, before the landing, the bisect and the revert's check) runs here on the check itself. The guilty entry
+    is still pulled out end to end. A spill attempt that errors keeps the run here."""
+    from ttp import checkspill, postland, push
+    spilled, closed, asked = tmp_path / "spilled", [], []
+
+    class Claim:
+        host = "check-host-a"
+
+        def close(self):
+            closed.append(1)
+
+    def fake_spill_run(p_, cfg, cmds, tell, what="", off="", why_here=""):
+        asked.append(what)
+        c = push.check_list([f"echo x >> {spilled}; {cmds[0]}"])[0]
+        c.spilled, c.was = True, cmds[0]
+        return Claim(), [c]
+
+    monkeypatch.setattr(checkspill, "spill_run", fake_spill_run)
+    p, g, pushed, entries = _pl_land(env, tmp_path, monkeypatch,
+                                     f"sh -c \"grep -qs bad pl*.txt && {{ {_PL_FAIL}; }}; {_PL_PASS}\"", n=3, bad_at=1)
+    postland.tend(p, p.config())
+    assert postland.tend(p, p.config()) == "guilty"
+    assert spilled.read_text().count("x") == 1, "only the first full run spills"
+    assert asked == [f"post-landing checks on {pushed[:10]}"] and closed == [1]
+    rows = p.db.q("SELECT branch FROM push_queue WHERE status='approved'")
+    assert [r["branch"] for r in rows] == [f"ttp/postland-revert-{entries[1][:10]}"]
+    assert len(p.db.q("SELECT id FROM tasks WHERE title LIKE 'Fix #%'")) == 1
+
+    def broken(*a, **k):
+        raise OSError("no spill pool")
+
+    monkeypatch.setattr(checkspill, "spill_run", broken)
+    said = []
+    got = postland._spill(p, push.check_list(["true"])[0], pushed, said.append)
+    assert got[0] is None and str(got[1]) == "true" and "the checks run here" in said[0]

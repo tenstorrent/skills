@@ -37,9 +37,11 @@ import uuid
 from pathlib import Path
 
 from . import runtimeload   # first of its own: its LOADED_AT is when the daemon imported its code
+from . import batchrun
 from . import untrusted
 from . import branchcap
 from . import sshmux
+from . import wakecost
 from . import tailnet
 from . import sshagent
 from . import probewake
@@ -48,6 +50,7 @@ from . import charterset
 from . import claimcheck
 from . import dispatchguard
 from . import supersede
+from . import runcap
 from . import runclass
 from . import configwho
 from . import integrate
@@ -87,6 +90,8 @@ from . import probematch
 from . import chainprio
 from . import churnwatch
 from . import alerts
+from . import rampup
+from . import projmove
 from . import applyff, landff
 from . import userstep
 from . import waitpoll
@@ -1404,6 +1409,7 @@ class Daemon:
         self._on_pass_notes_due = 0.0   # when runs are next swept for notes an unsettled on_pass_cmd queued
         self._reboot_told = False
         self._linger_at, self._linger_off = 0.0, False   # linger last looked at, and what it said
+        self._move_call = None   # projmove.Background: the move's ssh check in flight (check_move)
         self._gh_auth: threading.Thread | None = None   # the host-wide gh login check in flight (ghauth.py)
         self._reach: threading.Thread | None = None     # the machines' ssh reach probe in flight (reach.py)
         self._last_stop: dict = {}   # the clean-stop record this daemon found at start
@@ -2308,7 +2314,7 @@ class Daemon:
                      self.sweep_sandbox_trees,
                      self.verify_pushes,
                      self.tick_prune_worktrees, self.prune_leftovers, self.branch_cap, self.land_harness_worktrees, self.backup_branches, self.replicate_state, self.check_local_only, self.check_disk,
-                     self.sweep_alerts, self.check_release, self.sync_shared_pauses, self.check_pause_ends,
+                     self.sweep_alerts, self.check_release, self.sync_shared_pauses, self.check_pause_ends, self.check_move, self.track_outages,
                      self.check_integrity, self.heal_harness_git,
                      self.sync_schedules, self.lint_charter, self.tend_holds, self.record_ttr, self.alert_long_pause,
                      self.check_linger, self.check_notifier, self.check_overseer, self.alert_slurm_paused, self.check_gh_auth, self.check_reach, self.check_chats,
@@ -2366,6 +2372,7 @@ class Daemon:
                 self.check_checks_wait,
                 self.check_urgent_check_wait,
                 self.check_queue_waits,
+                self.check_chat_digest,
                 self.check_checks_owner,
                 self.reap_leftover_checks,
                 self.reap_orphan_checks,
@@ -2374,6 +2381,7 @@ class Daemon:
                 self.check_cap_wait,
                 self.check_progress,
                 self.check_churn,
+                self.check_self_watch,
                 self.check_host_load,
                 self.check_idle_capacity,
                 self.check_obligations,
@@ -3753,6 +3761,8 @@ class Daemon:
                 src = (state or {}) if session_mode == "resume" else {}
                 compact_at = int(coordsession.limit(
                     self.cfg, {**src, "base_tokens": max(int(src.get("base_tokens") or 0), fixed)}, model) or 0)
+                if coordsession.shrink_due(src):   # over the wake-cost alarm (wakecost.py): compact now
+                    compact_at = min(compact_at, int(src.get("context_tokens") or 0)) or compact_at
                 env = {**env, **prov.compact_env(compact_at)}
                 argv = _before_stdin(argv, prov.compact_args(compact_at))
             seed_usd = None
@@ -3954,6 +3964,7 @@ class Daemon:
                 log(self.p, f"run {run_id}: its prompt record was not saved: {e}")
         # Raising from here on means nothing was launched: the run row must not stay "running".
         tmp_env: dict = {}
+        spawning = contextlib.ExitStack()   # holds the stop from the runner's spawn to its record
         try:
             redact.private_dir(run_dir)   # owner-only: it holds the run's output and transcript
             if role != "coordinator" and (why := prov.prepare_run(cwd, run_dir)):
@@ -4148,26 +4159,31 @@ class Daemon:
             durable_write(run_dir / "run.json", json.dumps(spec, indent=1))   # read again after a reboot
             if role == "coordinator":
                 self._coord_snapshot(run_dir, wake_guard=not prov.tool_hooks)
+            # A step-budget stop waits from the spawn until the supervisor is recorded: one landing in
+            # between would mark a started run never_started and leave its runner untracked.
+            spawning.enter_context(stepclock.critical())
             with open(run_dir / "runner.log", "wb") as out:
                 proc = subprocess.Popen([sys.executable, "-m", "ttp.runner", str(run_dir)], cwd=runtime_dir,
                                         env={**os.environ, "PYTHONPATH": runtime_dir}, stdout=out, stderr=out,
                                         stdin=subprocess.DEVNULL, start_new_session=True)
         except BaseException:   # marked never_started: the coordinator's repeated-failures count tells it apart
-            db.x("UPDATE runs SET status='failed', ended=?, note=? WHERE id=?",
-                 (time.time(), json.dumps({**(note or {}), "never_started": True}), run_id))
-            runner.remove_files(private)
-            shorttmp.remove(tmp_env.get("TMPDIR"))
-            cursorhook.undo(run_dir)
+            with spawning:
+                db.x("UPDATE runs SET status='failed', ended=?, note=? WHERE id=?",
+                     (time.time(), json.dumps({**(note or {}), "never_started": True}), run_id))
+                runner.remove_files(private)
+                shorttmp.remove(tmp_env.get("TMPDIR"))
+                cursorhook.undo(run_dir)
             raise
-        try:
-            # Its start beside its pid, as child.pid has it: a pid reused later is not this supervisor.
-            durable_write(run_dir / "runner.pid", f"{proc.pid}\n{runner.proc_start(proc.pid) or ''}\n")
-        except OSError as e:
-            log(self.p, f"run {run_id}: could not record its supervisor's start: {e}")
-        try:
-            db.x("UPDATE runs SET pid=?, dir=? WHERE id=?", (proc.pid, str(run_dir), run_id))
-        except Exception as e:   # launched all the same: the reaper finds it by its run id's directory
-            log(self.p, f"run {run_id} started but its pid was not recorded: {e}")
+        with spawning:
+            try:
+                # Its start beside its pid, as child.pid has it: a pid reused later is not this supervisor.
+                durable_write(run_dir / "runner.pid", f"{proc.pid}\n{runner.proc_start(proc.pid) or ''}\n")
+            except OSError as e:
+                log(self.p, f"run {run_id}: could not record its supervisor's start: {e}")
+            try:
+                db.x("UPDATE runs SET pid=?, dir=? WHERE id=?", (proc.pid, str(run_dir), run_id))
+            except Exception as e:   # launched all the same: the reaper finds it by its run id's directory
+                log(self.p, f"run {run_id} started but its pid was not recorded: {e}")
         if cache_fp is not None and cache_ttl == "1h":
             try:   # the 1h entries this turn writes are what a later turn within cache_warm_min reads
                 db.set_kv(cachettl.KEY, cachettl.record(db.kv(cachettl.KEY), cache_fp))
@@ -4831,8 +4847,10 @@ class Daemon:
 
     def check_gh_auth(self) -> None:
         """While this project uses gh: the host-wide gh login check (ghauth.py) in a thread when it is due,
-        and, while it says logged out and no delivery.gh_route answers (ghroute), one machine-wide harness
-        condition naming the route setting and what is skipped, never a login step; it clears once gh works."""
+        and, while it says logged out and no delivery.gh_route answers (ghroute), one harness condition naming
+        the route setting and what is skipped, never a login step, told by one project per account and logout
+        (ghauth.announce); it clears once gh works. With delivery.gh_route set to a ghroute.MODES value (no gh
+        login here is expected), one quiet status line per logout instead, never an alert."""
         from . import ghauth, ghroute
         db = self.p.db
         if not ghauth.uses_gh(db):
@@ -4844,13 +4862,28 @@ class Daemon:
                 and (not os.environ.get("PYTEST_CURRENT_TEST") or os.environ.get("TTP_TEST_GH_AUTH")):
             self._gh_auth = threading.Thread(target=ghauth.check, daemon=True, name="gh-auth")
             self._gh_auth.start()
-        if st.get("ok") is False and not ghroute.works():
+        mode = ghroute.known(self.cfg)
+        if st.get("ok") is False and mode:   # expected here: one quiet status line per logout, no alert
+            if db.kv(ghauth.KV):
+                db.x("DELETE FROM kv WHERE key=?", (ghauth.KV,))   # an open alert episode clears (alerts.sweep)
+            if db.kv(ghauth.KNOWN_KV) != {"since": st.get("since"), "mode": mode}:
+                db.set_kv(ghauth.KNOWN_KV, {"since": st.get("since"), "mode": mode})
+                when = timefmt.short(float(st.get("since") or time.time()), self.p)
+                db.post("out", ghroute.known_text(hostname(), when, mode), chat=None, channel=alerts.QUIET,
+                        kind="info", severity="low")
+        elif st.get("ok") is False and not ghroute.works():
             if not db.kv(ghauth.KV):
                 db.set_kv(ghauth.KV, {"since": st.get("since")})
             when = timefmt.short(float(st.get("since") or time.time()), self.p)
-            self.alert(ghauth.KEY, ghauth.text(st, hostname(), when, self.cfg), severity="normal")
-        elif db.kv(ghauth.KV) and (st.get("ok") or ghroute.works()):
-            db.x("DELETE FROM kv WHERE key=?", (ghauth.KV,))
+            self.alert(ghauth.KEY, ghauth.text(st, hostname(), when, self.cfg), severity="normal",
+                       quiet=not ghauth.announce(str(self.p.base), st.get("since")))
+        else:
+            if db.kv(ghauth.KV) and (st.get("ok") or ghroute.works()):
+                db.x("DELETE FROM kv WHERE key=?", (ghauth.KV,))
+            if st.get("ok") is True or ghroute.works():
+                ghauth.forget()
+        if db.kv(ghauth.KNOWN_KV) and not (st.get("ok") is False and mode):
+            db.x("DELETE FROM kv WHERE key=?", (ghauth.KNOWN_KV,))
 
     def check_reach(self) -> None:
         """The listed machines' ssh reach probe (reach.py) in a thread when one is due: the digest's reach
@@ -4902,6 +4935,9 @@ class Daemon:
             # A planned cycle already names its planner: only the journal adds to it there.
             by = f"initiator: {started.get('text') or 'unknown'}" \
                 if started and (not cycle or started.get("source") == "journal") else ""
+            if started and started.get("kernel"):
+                by += ("; " if by else "") + f"kernel fault before it: {started['kernel']}"
+            back = timefmt.short(min(booted or now, now), self.p)
             data = {"boot": self.boot, "boot_time": booted, "prev_boot": prev.get("prev_boot"), "shutdown": shutdown,
                     "initiator": started,
                     "planned": {"reason": str(cycle.get("reason") or "")[:300], "record": cycle["path"],
@@ -4912,7 +4948,8 @@ class Daemon:
             # A record, not news: the coordinator sees it in its digest, not as a new event.
             db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,data,status) VALUES(?,?,?,?,?,?,?,?)",
                  (min(booted or now, now), "host", "boot", f"boot:{self.boot}", "normal",
-                  f"the host rebooted ({how}); {len(lost)} run(s) cut short" + (f"; {by}" if by else ""),
+                  f"the host rebooted ({how}); back up at {back}; {len(lost)} run(s) cut short"
+                  + (f"; {by}" if by else ""),
                   json.dumps(data), "record"))
             if not lost:
                 return
@@ -5011,6 +5048,7 @@ class Daemon:
                              estimated=bool(cur["cost_estimated"]), ts=now)
                     if r["task"]:
                         db.x("UPDATE tasks SET spent_usd=COALESCE(spent_usd,0)+? WHERE id=?", (cost, r["task"]))
+                        batchrun.book(db, r["task"], cost)
                 if r["role"] == "coordinator":
                     self._coordinator_failed(why)
                 elif r["task"] and (db.task(r["task"]) or {}).get("status") == "running":
@@ -5033,8 +5071,13 @@ class Daemon:
         from . import checkgaps
         checkgaps.rerun(self)
         db, now = self.p.db, time.time()
+        for mid, st in batchrun.tend(self.p):   # a batch whose lead ended: each member settles alone
+            log(self.p, f"task {mid}: batch member settled {st}")
+        in_batch = batchrun.held(db)   # members of a live batch run: the lead's run is theirs
         for t in db.q("SELECT * FROM tasks WHERE status='running' AND NOT EXISTS "
                       "(SELECT 1 FROM runs WHERE runs.task=tasks.id AND runs.status='running')"):
+            if t["id"] in in_batch:
+                continue
             last = db.one("SELECT * FROM runs WHERE task=? ORDER BY id DESC LIMIT 1", (t["id"],))
             if last and self._run_alive(last):
                 continue
@@ -6441,6 +6484,7 @@ class Daemon:
                          tokens_out=usage.output_tokens, ts=ended)
                 if r["task"]:
                     db.x("UPDATE tasks SET spent_usd=COALESCE(spent_usd,0)+? WHERE id=?", (usage.cost_usd, r["task"]))
+                    batchrun.book(db, r["task"], usage.cost_usd)   # a batch run's members get their share
                     runtimeload.clear(p, r["id"])   # finished once: a restart after this never finishes it again
                 self._record_readings(db, r["provider"], read_as, usage, ended)
                 if usage.limited:
@@ -6462,10 +6506,10 @@ class Daemon:
                     # breaker (no run starts on it), say exactly how to fix it, and let check_logins ask
                     # its CLI, without a model call, when it is logged in again.
                     self.open_breaker(r["provider"], (usage.final_text or usage.error)[:200])
-                    self.alert(f"auth:{r['provider']}",
+                    self.logout_alert(r["provider"], coordinator=r["role"] == "coordinator", text=
                                f"{r['provider']} on {hostname()} is logged out ({(usage.final_text or usage.error)[:120]}). "
                                f"Log in once on that machine ({prov.login_hint}). Nothing starts on it until then; "
-                               f"work resumes by itself once a login check passes, and queued work is kept.", "high")
+                               f"work resumes by itself once a login check passes, and queued work is kept.")
                 if r["role"] == "coordinator":
                     self._finish_coordinator(r, usage, status, note)
                 else:
@@ -6652,7 +6696,7 @@ class Daemon:
         if evs:
             db.x(f"UPDATE events SET status='handled' WHERE id IN ({','.join('?' * len(evs))})", evs)
         try:
-            # A must-act item no applied action touched wakes once more, then is told model-free.
+            # A must-act item no applied action touched wakes once more, then goes in its chat's digest.
             for key, text in mustact.settle(self.p, evs, actions, applied):
                 self.observe("daemon:must-act", text, "normal", whole=True, key=key)
         except Exception:   # bookkeeping: the turn is settled either way
@@ -6769,6 +6813,7 @@ class Daemon:
                                         noted=noted)
             if ok and session.get("mode") in ("new", "resume"):
                 coordsession.ack_prefix(self.p, r.get("dir") or self.p.runs / str(r["id"]))
+                state = self._wake_cost(r, usage, session, state)
             if ok and (state.get("compactions") or [{}])[-1].get("at") == now:
                 c = state["compactions"][-1]
                 log(self.p, f"coordinator run {r['id']}: session {c['session'][:8]} compacted in place "
@@ -6777,6 +6822,21 @@ class Daemon:
         except Exception:   # bookkeeping: the next wake decides from what is saved
             log(self.p, "coordinator session record failed: " + traceback.format_exc().replace("\n", " | ")[:1000])
         return False
+
+    def _wake_cost(self, r: dict, usage, session: dict, state: dict) -> dict:
+        """The session state after the model-free cost-per-wake check (wakecost.py): over
+        coordinator.wake_cost_alarm_usd, one alarm per episode naming its cause, and the session asked to
+        compact in place and send a leaner digest. Never a new session."""
+        try:
+            cur = wakecost.current_row(r, usage, session, self.p.runs)
+            state, text = wakecost.check(self.cfg, self.p.db, self.p.runs, state, cur)
+        except Exception:   # bookkeeping: the next wake checks again
+            log(self.p, "coordinator wake-cost check failed: " + traceback.format_exc().replace("\n", " | ")[:1000])
+            return state
+        if text:
+            log(self.p, f"coordinator run {r['id']}: {text}")
+            self.alert("coord-wake-cost", text, "normal", every_s=0)
+        return state
 
     def _session_context(self, r: dict, usage) -> dict | None:
         """The session's size after a wake from the agent's own saved session (Provider.session_context),
@@ -6944,14 +7004,14 @@ class Daemon:
         except Exception:
             host = ""
         self.open_breaker(prov_name, f"{len(runs)} runs in a row made no model call (runs {_ids(runs)})", reach=True)
-        self.alert(f"auth:{prov_name}",
+        self.logout_alert(prov_name,
                    f"{prov_name} on {hostname()} made no model call in {len(runs)} runs in a row "
                    f"(runs {_ids(runs)}{f'; last: {last}' if last else ''}): it is logged out or cannot reach "
                    f"{host or 'its API'}. The project is not live on {prov_name}: nothing starts on it, the "
                    f"coordinator included, until a model-free check (its login status and an HTTPS check of "
                    f"{host or 'its API'}) passes; then work resumes by itself and queued work is kept. "
                    f"Fixing it is the user's decision: log in on that machine ({prov.login_hint}) or restore "
-                   f"its network. No worker logs in.", "high")
+                   f"its network. No worker logs in.")
 
     def _coordinator_failed(self, why: str) -> None:
         db = self.p.db
@@ -7607,6 +7667,13 @@ class Daemon:
                       "retry_when_refused": result["retry_when"][:200]}
         if rstatus == "waiting" and isinstance(result.get("retry_when"), str):
             result = self._pin_handoff_probe(task, r, run_dir, result)
+            if isinstance(result.get("retry_when"), str) \
+                    and (guarded := detach.guard_or(result["retry_when"])) != result["retry_when"]:
+                # `detach --check x.rc || <fallback>` would hide a failed job behind the fallback.
+                log(self.p, f"task {task['id']} hand-off: a failed detach check now exits "
+                            f"{detach.FAILED_RC} past its || fallback: {guarded[:300]}")
+                result = {**result, "retry_when": guarded,
+                          "retry_when_orig": result.get("retry_when_orig", result["retry_when"])}
             result, how = checks_settle_fill(task, result, run_dir, push._own_ttp(self.p))
             if how:
                 log(self.p, f"task {task['id']} hand-off: its checks wait {how}")
@@ -9483,6 +9550,10 @@ class Daemon:
                          + "\n".join(f"- {line}" for line in audit.lines(db, blocked_h=hours, p=self.p)))
             except Exception as e:   # nor must the audit
                 log(self.p, f"self-efficiency audit failed: {type(e).__name__}: {e}")
+            try:
+                spec += self._waste_ledger(db)
+            except Exception as e:   # nor must the waste ledger
+                log(self.p, f"waste ledger failed: {type(e).__name__}: {e}")
         if payload.get("audit_report", s["name"] == "daily-review"):
             try:
                 from . import machine_ledger
@@ -9584,6 +9655,41 @@ class Daemon:
             if evidence is not None:
                 sched.record_evidence(db, s["name"], tid, evidence)
         return "queued"
+
+    def _waste_ledger(self, db) -> str:
+        """The daily review's waste ledger (waste.py): its lines for the spec, one low line to the user's
+        chat, and over target one fix task for the largest bucket unless one is still open."""
+        from . import waste
+        now = time.time()
+        cfg = waste.settings(self.cfg)
+        rep = waste.report(db, now - 86400, now, self.cfg)
+        if rep["total"] <= 0:
+            return ""
+        head = waste.line(self.p.name, rep)
+        self.alert("waste-ledger", f"Waste ledger (24 h): {head}", severity="low", every_s=20 * 3600)
+        out = (f"\n\nWaste ledger (last 24 h; `ttp waste` for more): {head}\n"
+               + "\n".join(f"- {x}" for x in waste.lines(rep)))
+        bucket = waste.fix_bucket(rep)
+        if not bucket or not cfg.get("fix_task", True):
+            return out
+        label = f"waste_fix:{bucket}"
+        if db.one("SELECT id FROM tasks WHERE labels LIKE ? AND status NOT IN ('done','failed','cancelled')",
+                  (f'%"{label}"%',)):
+            return out + f"\nA fix task for {waste.LABELS[bucket]} is still open."
+        b = rep["buckets"][bucket]
+        ids = ", ".join(f"#{t}" for t in b["tasks"][:10]) or "none named"
+        tid = db.add_task(
+            f"waste: cut {waste.LABELS[bucket]} (${b['usd']:.2f} in 24 h)",
+            f"The daily waste ledger put this project's avoidable spend at ${rep['avoidable']:.2f} of "
+            f"${rep['total']:.2f} ({rep['share']:.0%}) in the last 24 h, over the {rep['target']:.0%} target. "
+            f"The largest bucket is {waste.LABELS[bucket]}: ${b['usd']:.2f} over {b['runs']} run(s), most in "
+            f"tasks {ids}.\n\nFind why this project spent it (their runs, hand-offs and reviews; `ttp waste "
+            f"--json`), fix the cause in this project's own harness, prompts, config or schedules, and say "
+            f"what changed with the before and after figures. A fault in tt-project itself goes in an "
+            f"`upstream:` follow-up, not here. Never retry the same approach.\n"
+            f"conclusion: the cause and the fix, with figures.",
+            kind="harness", tier="standard", priority=2, origin="daemon", labels=[label])
+        return out + f"\nQueued fix task #{tid} for {waste.LABELS[bucket]}."
 
     def check_self_review(self, every_s: float = 60) -> None:
         """Model-free check that the daily self-review still happens (selfreview.tick): restores a
@@ -9788,6 +9894,87 @@ class Daemon:
             churnwatch.record(self.p.logs / churnwatch.FILE, obs, now, self.__dict__.setdefault("_churn_log", {}),
                               lambda m: log(self.p, m))
             self.observe("daemon:process-churn", obs["text"], obs["severity"], whole=True, key=obs["key"])
+
+    def check_self_watch(self) -> None:
+        """Model-free watch on this host and this project's own process tree (selfwatch): one snapshot
+        line for status, the web app and the coordinator, and a run of this project's that runs away
+        (spawn rate, processes or load share past selfwatch.* for its window) is stopped: its own
+        process groups TERM then KILL, one event on its task and one notify. Never signals a process
+        this project does not own."""
+        from . import selfaudit, selfwatch
+        now, s = time.time(), selfwatch.settings(self.cfg)
+        due = selfwatch.BREACH_EVERY_S if getattr(self, "_selfwatch_breach", False) else s["every_s"]
+        if not s["every_s"] or now - getattr(self, "_selfwatch_at", 0.0) < due:
+            return
+        self._selfwatch_at = now
+        w = self.__dict__.setdefault("_selfwatch", selfwatch.Watch(self.p.base, cores=checkcap.cores()))
+        snap = w.step(s, now)
+        self._selfwatch_breach = bool(snap["breach"])
+        db = self.p.db
+        dirs = self._slot_dirs()
+        try:
+            snap.update(self._self_audit(now, dirs))
+        except Exception:
+            log(self.p, "self-watch audit: " + traceback.format_exc().replace("\n", " | ")[:1000])
+        snap["stopped"] = (db.kv(selfwatch.KV) or {}).get("stopped")
+        if snap.pop("churn_new", False):
+            log(self.p, f"self-watch: unattributed churn, {snap['churn_s']:g} new processes/s on the host that this "
+                        "project's own counted processes do not explain; reported, not acted on")
+        for r in snap.pop("runaway"):
+            numbers = (f"{r['procs']} processes, {r['spawn_s']:g} new/s, {r['cpu']:g} cores, "
+                       f"{r['rss'] / 2**30:.1f} GB; host load {snap['host'].get('load1')} on {snap['host']['cores']} cores")
+            what = f"run {r['run']}" + (f" of task #{r['task']}" if r["task"] else "")
+            if not s["act"]:
+                log(self.p, f"self-watch: {what} past a limit for {s['window_s']:g} s ({r['why']}; {numbers}); "
+                            "selfwatch.act is off: not stopped")
+                continue
+            run = db.one("SELECT id, dir FROM runs WHERE id=? AND status='running'", (r["run"],)) \
+                if str(r["run"]).isdigit() else None
+            if run:
+                try:
+                    runner.request_stop(self._run_dir(run), f"selfwatch: {r['why']}")
+                except OSError:
+                    pass
+            held = selfaudit.run_locks(dirs, self.p.base, r["run"])
+            done = selfwatch.stop(w, r, s["grace_s"])
+            try:   # the reaper clears and logs the labels the stopped processes left
+                self.reap_locks()
+            except Exception:
+                log(self.p, "self-watch lock release: " + traceback.format_exc().replace("\n", " | ")[:1000])
+            left = selfaudit.run_locks(dirs, self.p.base, r["run"])
+            text = (f"Self-watch stopped {what}: {r['why']} for {s['window_s']:g} s ({numbers}). TERM to process "
+                    f"group(s) {done['groups'] or '-'} and pid(s) {done['pids'] or '-'}, KILL to {done['killed'] or '-'}; "
+                    f"{len(held) - len(left)} of its {len(held)} lock(s) released"
+                    + (f", still held: {', '.join(x['lock'] for x in left)}." if left else "."))
+            log(self.p, text)
+            task = int(r["task"]) if str(r["task"] or "").isdigit() else None
+            db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+                 (now, "daemon", "selfwatch_runaway", "normal", text, "new", task))
+            self.alert(f"selfwatch:runaway:{r['run']}", text, severity="normal", every_s=0)
+            snap["stopped"] = {"ts": now, "run": r["run"], "task": r["task"], "why": r["why"]}
+        db.set_kv(selfwatch.KV, snap)
+
+    def _slot_dirs(self) -> list:
+        """The slot-lock folders the project's runs take locks in: its own, its shared resources' and the
+        check slots (reap_locks sweeps the same)."""
+        from . import checkcap
+        return [self.p.state / "locks", *(shared.root() / r for r in sorted(shared.names(self.cfg))),
+                checkcap.slot_dir()]
+
+    def _self_audit(self, now: float, dirs: list) -> dict:
+        """selfaudit's part of the self-watch snapshot: held machines probed (never one paused or held),
+        the crontab entries and user units installed (new ones during a run flagged with its id) and what
+        the project holds."""
+        from . import lockprobe, machines, selfaudit
+        a = self.__dict__.setdefault("_selfaudit", selfaudit.Audit(self.p.base, service.unit_name(self.p)))
+        rows = self.p.db.q("SELECT r.id, r.dir, t.labels FROM runs r LEFT JOIN tasks t ON t.id=r.task "
+                           "WHERE r.status='running'")
+        known = machines.load()
+        aliases = sorted({x for r in rows for x in coord.task_resources({"labels": r["labels"]}) if x in known})
+        held = lambda alias: lockprobe.pause_in(self.p.db, self.cfg, alias)
+        return {"machines": a.probe(now, aliases, held), "installed": a.entries(now, {str(r["id"]) for r in rows}),
+                "holding": selfaudit.holdings(dirs, self.p.base, self.p.state / "holds",
+                                              [self._run_dir(r) for r in rows])}
 
     def retire_coord_guard(self) -> None:
         """Once per daemon start: the coordinator session spend guard is gone (every wake resumes the
@@ -10466,6 +10653,17 @@ class Daemon:
             status = "coalesced"
             log(self.p, f"urgent checks wait: {text[:300]}")
 
+    def check_chat_digest(self, every_s: float = 60) -> None:
+        """Post each chat's held routine coordinator posts as one digest, at most every
+        coordinator.chat_digest_h hours (chatdigest.py)."""
+        now = time.time()
+        if now - getattr(self, "_chat_digest_checked", 0.0) < every_s:
+            return
+        self._chat_digest_checked = now
+        from . import chatdigest
+        if ids := chatdigest.flush(self.p, self.cfg, now):
+            log(self.p, f"chat digest posted: messages {', '.join(map(str, ids))}")
+
     def check_queue_waits(self, every_s: float = 60) -> None:
         """Model-free queue-wait escalation (queuewait.py): a task waiting past coordinator.queue_wait_escalate_min
         on a checks, push, worker, device, lock, pool or CPU queue raises one must-act item with unblock options."""
@@ -11083,26 +11281,15 @@ class Daemon:
             stops, holds, windows = {}, {}, bud.plan_windows(db)
             for prov in provs:   # update_gates leaves out providers only waiting tasks use
                 gate = self.gates.get(prov) or bud.evaluate(db, self.cfg, prov, windows)
-                pause, out = self._provider_pause(prov), self._logged_out(prov)
+                # A logout moves work once it lasts provider_logout_failover_s, not after hours.
+                pause, out = self._provider_pause(prov), failover.out_long(db, self.cfg, prov, now)
                 if why := failover.hold(gate, pause, out, now):
                     holds[prov] = why
                 if why := failover.stop(gate, pause, out, now):
                     stops[prov] = why
             if not holds:
                 return
-            ok = []
-            for prov in failover.targets(self.cfg):
-                if prov in holds or self._logged_out(prov) or self.net_held(prov):
-                    continue
-                try:
-                    if not get_provider(prov).available():
-                        continue
-                except Exception:
-                    continue
-                gate = self.gates.get(prov) or bud.evaluate(db, self.cfg, prov, windows)
-                if gate.level != "red" and gate.allow_new_work and gate.max_parallel > 0 \
-                        and not failover.hold(gate, self._provider_pause(prov), False, now):
-                    ok.append(prov)
+            ok = self._failover_ok(holds, windows, now)
             kept: list[dict] = []
             moves, running = failover.plan(db, self.cfg, stops, ok, now, holds, kept)
             where = timefmt.home(self.p)
@@ -11122,6 +11309,70 @@ class Daemon:
             olds = sorted({m["old"] for m in moves} | {r["provider"] for r in running})
             self.alert(f"failover:{','.join(olds)}", "Provider failover: " + "; ".join(lines)[:1500],
                        severity="low", every_s=0)
+
+    def _failover_ok(self, holds: dict, windows: object, now: float) -> list[str]:
+        """The failover targets (failover.targets) that can start new work now, best first."""
+        db, ok = self.p.db, []
+        for prov in failover.targets(self.cfg):
+            if prov in holds or self._logged_out(prov) or self.net_held(prov):
+                continue
+            try:
+                if not get_provider(prov).available():
+                    continue
+            except Exception:
+                continue
+            gate = self.gates.get(prov) or bud.evaluate(db, self.cfg, prov, windows)
+            if gate.level != "red" and gate.allow_new_work and gate.max_parallel > 0 \
+                    and not failover.hold(gate, self._provider_pause(prov), False, now):
+                ok.append(prov)
+        return ok
+
+    def logout_waits(self, prov: str, now: float | None = None) -> dict:
+        """What really waits here on logged-out `prov`: its queued and waiting tasks (pinned to it, or
+        unpinned when it is the core provider; routed tiers fall back at start, _route_entry), those
+        of them no other provider can run (a required pin, failover off, or no target that works),
+        the high events a coordinator on it cannot handle, the providers its work runs on, and whether
+        the login is the user's to do (`need`)."""
+        db, now = self.p.db, time.time() if now is None else now
+        core = self.cfg.get("core_provider") or "claude"
+        tasks = db.q("SELECT * FROM tasks WHERE status IN ('queued','waiting') AND (provider=?"
+                     + (" OR provider IS NULL OR provider=''" if prov == core else "") + ")", (prov,))
+        try:
+            to = [t for t in self._failover_ok({prov: True}, bud.plan_windows(db), now) if t != prov] \
+                if failover.after_h(self.cfg) else []
+        except Exception as e:   # a reminder never fails on this: count it all as waiting
+            log(self.p, f"{prov}: failover targets not read: {type(e).__name__}: {e}")
+            to = []
+        stuck = sum(1 for t in tasks if not to or failover.required(db, t))
+        events = db.one("SELECT COUNT(*) n FROM events WHERE status IN ('new','queued') "
+                        "AND severity IN ('high','critical')")["n"] if prov == core else 0
+        runs_on = to or ([core] if prov != core and not self._logged_out(core) else [])
+        # The coordinator runs on the core provider only (coordinator_blocked): its logout needs the user.
+        need = bool(stuck or events or not runs_on or prov == core)
+        return {"queued": len(tasks), "stuck": stuck, "events": events, "to": runs_on, "need": need}
+
+    def logout_alert(self, prov: str, text: str, coordinator: bool = False) -> None:
+        """A logout's first alert: high only when work here can run on no other provider (a required
+        pin, every provider out, or the coordinator's own provider: `coordinator`, a coordinator run
+        hit it); else one low status line saying where its work runs meanwhile, which never asks the
+        user to log in."""
+        try:
+            w = self.logout_waits(prov)
+        except Exception as e:
+            log(self.p, f"{prov}: logout waits not read: {type(e).__name__}: {e}")
+            w = {"need": True}
+        if coordinator or w["need"]:
+            self.alert(f"auth:{prov}", text, "high")
+        else:
+            self.alert(f"auth:{prov}", self._logout_status(prov, time.time(), w["to"]), "low")
+
+    def _logout_status(self, prov: str, since: float, to: list[str]) -> str:
+        try:
+            hint = get_provider(prov).login_hint
+        except Exception:
+            hint = ""
+        return (f"{prov} logged out since {timefmt.long(since, timefmt.home(self.p))}; its work runs on "
+                f"{', '.join(to)}. Logging in again ({hint or 'its CLI login'}) is optional; nothing waits on it.")
 
     def rethink_asks(self) -> None:
         """Hand an open ask that has held work past coordinator.ask_rethink_h back to a tricky
@@ -11679,8 +11930,52 @@ class Daemon:
         finally:
             self._slot_resv_pass = None
 
+    def check_move(self) -> None:
+        """A planned move (projmove.py): the old copy stops once the new one runs; the new one starts
+        workers once the old one has stopped."""
+        def turned(since: float) -> bool:
+            return bool(self.p.db.one("SELECT 1 FROM runs WHERE role='coordinator' AND status='ok' AND ended>?",
+                                      (since,)))
+        if self._move_call is None:   # ssh to the other host runs in a thread: never inside the tick
+            self._move_call = projmove.Background()
+        if said := projmove.step(self.p.db, turned, call=self._move_call):
+            log(self.p, f"project move: {said}")
+            self.p.db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
+                        (time.time(), "daemon", "project_move", "low", said, "done"))
+
+    def track_outages(self) -> None:
+        """Note which outages hold now (rampup.py): when one ends, new starts ramp up, not all at once."""
+        db, signs = self.p.db, set()
+        if db.kv("paused", False):
+            signs.add("pause")
+        if not self.lease_held():
+            signs.add("lease")
+        for r in db.q("SELECT key FROM kv WHERE key LIKE ?", (alerts.BREAKER + "%",)):
+            if (db.kv(r["key"]) or {}).get("open"):
+                signs.add("login:" + r["key"][len(alerts.BREAKER):])
+        signs |= {f"budget:{prov}" for prov, g in self.gates.items() if not g.allow_new_work}
+        signs |= {f"network:{prov}" for prov in self._net_holds}
+        if time.monotonic() < self._settle_until:
+            signs.add("host wake")
+        signs |= {f"resource:{r}" for r in db.paused_resources()}
+        if cause := rampup.observe(db, self.cfg, signs, self.boot, self._ramp_running):
+            log(self.p, f"outage over ({cause}): new workers ramp up from "
+                        f"{rampup.settings(self.cfg)[0]} instead of all starting at once")
+
+    def _ramp_running(self, scope) -> int:
+        rows = self.p.db.q("SELECT t.labels FROM runs r JOIN tasks t ON t.id=r.task "
+                           "WHERE r.role!='coordinator' AND r.status='running'")
+        if scope is None:
+            return len(rows)
+        return sum(1 for t in rows if coord.task_resources(dict(t)) & set(scope))
+
     def _dispatch(self, busy: dict) -> None:
         db = self.p.db
+        if held := projmove.dispatch_hold(db):   # the old copy may still start workers: none here yet
+            if held != getattr(self, "_move_said", ""):
+                log(self.p, held)
+                self._move_said = held
+            return
         self._tend_premises()   # a code task queued this tick with a `premise:` line waits on its check
         self._release_topup_holds()   # an urgent or user-ordered task held on its spent budget goes back
         ready = db.ready_tasks()   # read after _slot_reservations, which may have woken a reserving task
@@ -11711,6 +12006,8 @@ class Daemon:
         fresh = [t for t in ready if t["id"] not in walked]
         if walked:
             ready = _rotate_walked(ready, set(walked), _owner_due(db), now)
+        ramp = rampup.active(db, self.cfg, now) if ready else None
+        batched: set[int] = set()   # tasks a batch run started this tick took along (batchrun.py)
         for i, task in enumerate(ready):
             if not self.lease_held():   # lapsed during this tick (a slow start or store): start nothing more
                 break
@@ -11720,6 +12017,8 @@ class Daemon:
                 break
             if task["id"] not in walked:
                 walked.append(task["id"])   # kept as it grows: a step killed mid-task resumes past it
+            if task["id"] in batched:
+                continue
             if why := dispatchguard.refusal(db, task):   # ended since the read, or done again and again
                 log(self.p, f"task {task['id']} not dispatched: {why}")
                 dispatchguard.refuse(db, task["id"], why)   # still queued: back to done, on record
@@ -11728,6 +12027,10 @@ class Daemon:
             if why := supersede.dispatch_hold(db, task):   # a duplicate, or a step a newer order superseded
                 log(self.p, f"task {task['id']} held at dispatch: {why}")
                 supersede.hold(db, task, why)
+                fate[task["id"]] = "other"
+                continue
+            if why := runcap.check(self.p, self.cfg, task):   # looping: blocked, the coordinator decides
+                log(self.p, f"task {task['id']} not dispatched: {why}")
                 fate[task["id"]] = "other"
                 continue
             # Before _start_hold, which may reserve the task's resource.
@@ -11807,6 +12110,16 @@ class Daemon:
             if why == "resource":
                 self._log_resource_wait(task, ctx.get("holds", {}).get(task["id"]))
             if why:
+                continue
+            # After an outage new workers ramp up (rampup.py); urgent work is first in the pick order.
+            if ramp and rampup.covers(ramp, coord.task_resources(task)) \
+                    and self._ramp_running(ramp["scope"]) >= rampup.allowed(ramp, self.cfg, now):
+                if not ramp.get("said"):
+                    log(self.p, rampup.note(ramp, self.cfg, now))
+                    ramp["said"] = True
+                    db.set_kv(rampup.KEY, ramp)
+                fate[task["id"]] = "hold"
+                reached.discard(task["id"])
                 continue
             if note.startswith(provallow.HELD_NOTE):
                 db.update_task(task["id"], blocked_reason=None)
@@ -11920,6 +12233,7 @@ class Daemon:
             self._workspace_tries(task["id"], clear=True)
             from .prompts import spec_digest, worker_resume, worker_system, worker_task
             probe_tried = probe_tried or probing == task["id"]   # this tick's one retry: the rest stay held
+            run_id = None
             try:
                 system = worker_system(self.p, task)
                 note = {"spec_sha": spec_digest(task), runclass.KEY: run_cls}
@@ -11976,9 +12290,16 @@ class Daemon:
                                                conflict=note.get(conflictfix.KEY)), None
                 prompt += startcheck.prompt_lines(found)   # a resumed session is told too
                 prompt += probewake.prompt_lines(woke_probe, lambda ts: timefmt.long(ts, self.p))
+                members = [] if note.get("wake") or note.get("resumes") else \
+                    self._batch_members(task, ready, batched | set(fate), live)
+                if members:
+                    note["batch"] = {"id": f"b{task['id']}", "members": [m["id"] for m in members]}
+                    prompt += batchrun.prompt_block(self.p, task, members, branch)
+                    remaining = batchrun.budget(self.cfg, task, remaining, members)
                 db.update_task(task["id"], status="running", branch=branch, blocked_reason=None)
                 run_id = self.start_run("worker" if task["kind"] != "review" else "reviewer", prompt, run_prov, tier, cwd,
-                                        task=task, budget_usd=max(remaining, 0.5) if task["budget_usd"] else None,
+                                        task=task, budget_usd=max(remaining, 0.5) if task["budget_usd"] or members
+                                        else None,
                                         timeout_s=(routed or {}).get("timeout_s"),
                                         read_only=False, append_system=system, note=note,
                                         resume=lost["session"] if lost else None,
@@ -11988,6 +12309,24 @@ class Daemon:
                     db.x("DELETE FROM kv WHERE key=?", (probewake.KV_PREFIX + str(task["id"]),))
                 if lease:   # the lease now names the run's supervisor in place of the daemon
                     self._route_lease(task, routed, tier, now, run_id=run_id)
+                if members:
+                    batchrun.record(db, task, members, branch, self.cfg, run=run_id)
+                    for m in members:
+                        db.update_task(m["id"], status="running", branch=branch,
+                                       blocked_reason=f"in batch run b{task['id']} led by #{task['id']}")
+                        live[m["id"]] = worktree.claims(self.p, dict(m, branch=branch))
+                        batched.add(m["id"])
+                    log(self.p, f"task {task['id']}: batch run b{task['id']} takes "
+                                + ", ".join(f"#{m['id']}" for m in members))
+            except StepBudgetSpent:
+                # The step's stop is no Exception: a task set running whose run never got recorded goes
+                # back to the queue, or it would stay 'running' with no run. One recorded keeps its run.
+                if run_id is None and not db.one("SELECT 1 FROM runs WHERE task=? AND status='running'",
+                                                 (task["id"],)):
+                    db.update_task(task["id"], status="queued")
+                    self._unreserve(task)
+                    self._route_unlease(lease)
+                raise
             except Exception as e:
                 self._start_failed(task, e)
                 self._unreserve(task)
@@ -12093,6 +12432,22 @@ class Daemon:
                                                                    schedlog.slot_users(db)),
                         self.__dict__.setdefault("_schedlog", {}), lambda msg: log(self.p, msg))
 
+    def _batch_members(self, lead: dict, ready: list[dict], taken: set[int], live: dict) -> list[dict]:
+        """The ready code tasks to take into `lead`'s run (batchrun.pick): none already started, taken or
+        held by another live task's branch or worktree. Never raises: a fault starts the lead alone."""
+        db = self.p.db
+        try:
+            if lead["kind"] != "code" or not batchrun.enabled(self.cfg) or batchrun.members_of(db, lead["id"]):
+                return []
+            cands = [t for t in ready if t["id"] not in taken and t["id"] != lead["id"]
+                     and (cur := db.task(t["id"])) and cur["status"] == "queued"
+                     and not self._branch_clash(t, {k: v for k, v in live.items() if k != lead["id"]})]
+            inflight = db.q("SELECT * FROM tasks WHERE status='running' AND kind='code'")
+            return batchrun.pick(self.p, self.cfg, lead, cands, inflight)
+        except Exception:
+            log(self.p, f"task {lead['id']}: batch pick failed\n" + traceback.format_exc())
+            return []
+
     def _live_claims(self) -> dict[int, tuple[set[str], set[str]]]:
         """worktree.claims of each running task, by id."""
         return {t["id"]: worktree.claims(self.p, t) for t in self.p.db.q(
@@ -12107,8 +12462,10 @@ class Daemon:
         of its own (worktree.ensure) from that branch's head. Changes nothing (_start_hold runs it)."""
         db = self.p.db
         mine, why = worktree.claims(self.p, task), None
+        rec = batchrun.members_of(db, task["id"])
+        mates = {rec["lead"], *rec.get("members", [])} if rec else set()   # one batch run shares its branch
         for tid, theirs in sorted(live.items()):
-            if tid != task["id"] and (what := worktree.clash(mine, theirs)):
+            if tid != task["id"] and tid not in mates and (what := worktree.clash(mine, theirs)):
                 why = (tid, what)
                 break
         if why is None and (hid := worktree.lineage_hold(task)) and (h := db.task(hid)) \
@@ -13849,6 +14206,7 @@ class Daemon:
         held = [(t, settinghold.held_key(t)) for t in rows]
         held = [(t, k) for t, k in held if k]
         db = self.p.db
+        settinghold.held_proposals(db, self.cfg, [t for t, _ in held])
         names = sorted({k.rpartition(".")[2] for k in settinghold.SETTINGS})
         loose = db.q("SELECT * FROM tasks WHERE status='blocked' AND labels NOT LIKE '%\"waits:%' AND ("
                      + " OR ".join("blocked_reason LIKE ? OR result LIKE ?" for _ in names) + ")",
@@ -16743,12 +17101,14 @@ class Daemon:
         # disposable on_pass output folder.
         env = self._on_pass_env(tid)
         env.update(TTP_NOTE_RUN_DIR=str(r["dir"]), TTP_RESULT=str(out / RESULT_FILE))
-        with open(out / ON_PASS_LOG, "wb") as f:
-            proc = subprocess.Popen(cmd, shell=True, cwd=str(self.p.root), stdin=subprocess.DEVNULL, stdout=f,
-                                    stderr=subprocess.STDOUT, start_new_session=True,
-                                    env=env)
-        where = f"HOME={env.get('HOME', '(unset)')}, cwd={self.p.root}"
-        self._on_pass[tid] = (proc, now, timeout, out, r["id"], cmd, where, said, fallback)
+        # A step-budget stop waits until the command is tracked: else the next tick would start it twice.
+        with stepclock.critical():
+            with open(out / ON_PASS_LOG, "wb") as f:
+                proc = subprocess.Popen(cmd, shell=True, cwd=str(self.p.root), stdin=subprocess.DEVNULL, stdout=f,
+                                        stderr=subprocess.STDOUT, start_new_session=True,
+                                        env=env)
+            where = f"HOME={env.get('HOME', '(unset)')}, cwd={self.p.root}"
+            self._on_pass[tid] = (proc, now, timeout, out, r["id"], cmd, where, said, fallback)
         # Asleep while it runs: its timer must not start a model run meanwhile.
         self.p.db.update_task(tid, not_before=max(task["not_before"] or 0, now + timeout + PROBE_TIMEOUT_S),
                               blocked_reason=f"its {said}; running its on_pass_cmd model-free "
@@ -18727,8 +19087,9 @@ class Daemon:
         the same checks takes that verdict and closes with no run (reviewreuse.reuse), unless it also
         covers a head that differs from it (reviewreuse.rebased_away): True. Else it
         records the head and check set it starts on, so a later review of that head can reuse it; a
-        review forced past an accepted one runs, as does a review of an external change (extchange). False
-        whenever it runs."""
+        review forced past an accepted one runs, as does a review of an external change (extchange). A head
+        a review already failed with a finding keeps that verdict: closed failed with no run and no fix
+        round, and one review_nofix event (reviewreuse.judged, carry). False whenever it runs."""
         db = self.p.db
         if extchange.heads(push._labels(task)):
             return False   # its change lives in another repository: the project's git holds no head of it
@@ -18746,6 +19107,13 @@ class Daemon:
         if prior and (why := reviewreuse.rebased_away(self.p, task, sha)):
             log(self.p, f"review {task['id']}: not reusing review #{prior['id']}'s verdict on {sha[:12]}: {why}")
             prior = None
+        failed = None if prior or reviewreuse.FORCED_LABEL in labels else reviewreuse.judged(db, sha, key, task["id"])
+        if failed:   # the unchanged head keeps its failed verdict: no run, and the coordinator decides
+            with db.tx():
+                why = reviewreuse.carry(db, task, failed, sha, key)
+                deadwait.raise_nofix(db, db.task(task["id"]), why, "")
+            log(self.p, f"review {task['id']}: kept review #{failed['id']}'s failed verdict on {sha[:12]}; no run")
+            return True
         if not prior:
             db.update_task(task["id"], labels=reviewreuse.with_head(labels, sha, key))
             return False
@@ -19265,6 +19633,7 @@ class Daemon:
             cap = int((cfg.get("review") or {}).get("auto_fix_rounds", AUTO_FIX_ROUNDS))
         except (TypeError, ValueError):
             cap = AUTO_FIX_ROUNDS
+        rounds = max(rounds, reviewcap.change_fails(db, review))   # rounds linked outside its continues chain too
         if rounds > cap:
             self._nofix = f"{rounds} reviews of this stack failed (the daemon fixes at most {cap} round(s))"
             return None
@@ -19870,7 +20239,7 @@ class Daemon:
 
     # notifications and Slack -------------------------------------------------------------------------
     def alert(self, key: str, text: str, severity: str = "high", every_s: float = 6 * 3600,
-              outage: bool | None = None) -> None:
+              outage: bool | None = None, quiet: bool = False) -> None:
         """Deduplicated broadcast, across daemon restarts too (an upgrade must not re-announce a
         condition the user already has). A high alert with a key opens an episode that clears
         itself once the condition does (alerts.sweep); while it is open a repeat only updates the
@@ -19902,7 +20271,9 @@ class Daemon:
                 return
             if not ep and not tracked and now - last < every_s:
                 return
-            if claim_key:
+            if quiet:
+                pass
+            elif claim_key:
                 prev = db.one("SELECT MAX(cleared) AS c FROM alerts WHERE key=?", (key,))
                 quiet = not alerts.claim(claim_key, key, str(self.p.base), now, float(prev["c"] or 0) if prev else 0.0)
             else:
@@ -19920,8 +20291,10 @@ class Daemon:
     def remind_logouts(self) -> None:
         """Each open logout: report what waits on it here into its machine-wide claim, and if this
         project holds the claim and a reminder is due (alerts.LOGOUT_REMIND_S), remind the chats with
-        how many projects, queued tasks and high events wait on it. Model-free, so it works while no
-        coordinator can run."""
+        how many projects, tasks and high events wait on it. Only work no other provider can run counts
+        (logout_waits): while every project's work runs elsewhere, no reminder asks for the login and
+        the alert stays one low status line, re-posted quietly when that changes; an acknowledged
+        alert stays quiet until it does. Model-free, so it works while no coordinator can run."""
         db, now = self.p.db, time.time()
         if now - getattr(self, "_logout_round", 0.0) < LOGOUT_REPORT_S:
             return
@@ -19931,25 +20304,31 @@ class Daemon:
             key, prov = ep["key"], ep["key"].split(":", 1)[1]
             if not alerts.breaker(db, prov):
                 continue   # check_logins closes it, and the sweep the alert
-            info = {"name": self.p.name,
-                    "queued": db.one("SELECT COUNT(*) n FROM tasks WHERE status='queued'")["n"],
-                    "events": db.one("SELECT COUNT(*) n FROM events WHERE status IN ('new','queued') "
-                                     "AND severity IN ('high','critical')")["n"]}
+            w = self.logout_waits(prov, now)
+            info = {"name": self.p.name, "queued": w["stuck"], "events": w["events"], "need": w["need"]}
+            cur = db.one("SELECT * FROM alerts WHERE key=? AND cleared IS NULL ORDER BY id DESC LIMIT 1", (key,))
+            if not w["need"] and cur and cur["severity"] != "low":   # its work runs elsewhere: a status line
+                db.post("out", self._logout_status(prov, float(ep["raised"]), w["to"]), chat=None,
+                        channel=alerts.QUIET, kind="alert", severity="low", ref=key)
             prev = db.one("SELECT MAX(cleared) AS c FROM alerts WHERE key=?", (key,))
             due = alerts.machine_round(self._machine_wide(key), key, str(self.p.base), now,
                                        float(prev["c"] or 0) if prev else 0.0, float(ep["raised"]), info)
             if not due:
                 continue
-            waiting = due["waiting"]
+            # Only projects whose work can run nowhere else wait on the login (a report without
+            # `need` comes from an older daemon: it counts).
+            waiting = [x for x in due["waiting"] if x.get("need", True)]
+            if not waiting or (cur and alerts.acked(db, cur) and cur["severity"] == "high"):
+                continue   # nothing needs the login, or the user knows and nothing changed
             try:
                 hint = get_provider(prov).login_hint
             except Exception:
                 hint = ""
-            names = ", ".join(sorted(str(w.get("name")) for w in waiting))
+            names = ", ".join(sorted(str(x.get("name")) for x in waiting))
             text = (f"{prov} on {hostname()} is still logged out ({(now - due['since']) / 3600:.1f} h). "
                     f"{len(waiting)} project(s) wait on it ({names}): "
-                    f"{sum(int(w.get('queued') or 0) for w in waiting)} queued task(s) and "
-                    f"{sum(int(w.get('events') or 0) for w in waiting)} high event(s) not handled yet. "
+                    f"{sum(int(x.get('queued') or 0) for x in waiting)} task(s) no other provider can run and "
+                    f"{sum(int(x.get('events') or 0) for x in waiting)} high event(s) not handled yet. "
                     f"Log in once on that machine{f' ({hint})' if hint else ''}; work resumes by itself.")
             db.post("out", text, chat=None, kind="alert", severity="high", ref=key)
             log(self.p, f"{key}: logout reminder {due['reminder']} sent")

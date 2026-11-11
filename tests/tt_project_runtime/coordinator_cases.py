@@ -5168,6 +5168,32 @@ def test_task_add_rejects_a_near_duplicate_naming_the_task(env):
 
 
 
+def test_the_duplicate_scan_builds_each_tasks_words_once_not_on_every_task_add(env):
+    """similar_task compared each task_add with every open task, rebuilding both word sets each time:
+    over many tasks one apply held the daemon tick for minutes. Each text's words are built once, a
+    title too unlike to match never builds the specs' words, and the verdicts stay the same."""
+    p = make(env)
+    from ttp import coordinator as coord
+    for i in range(60):
+        p.db.add_task(f"area {chr(65 + i % 26)}{i} sweep", f"Spec {i}: look into area {i} and its owner.",
+                      origin="user")
+    coord._words.cache_clear()
+    adds = [{"type": "task_add", "title": f"new kind {k} of work", "spec": f"Do new thing {k} now."}
+            for k in "pqrst"]
+    assert coord.apply(p, adds) == []
+    built = coord._words.cache_info().misses
+    assert built <= 60 + 2 * len(adds) + 10, built   # each title once, the new specs: no spec of the 60
+    coord._words.cache_clear()
+    assert coord.apply(p, [{"type": "task_add", "title": "new kind u of work", "spec": "Do new thing u now."}]) == []
+    once = coord._words.cache_info().misses
+    assert coord.apply(p, [{"type": "task_add", "title": "new kind v of work", "spec": "Do new thing v now."}]) == []
+    assert coord._words.cache_info().misses - once <= 4, coord._words.cache_info()   # only the new texts
+    # The same verdicts: a near repeat is still caught, an unlike title never is.
+    assert coord.looks_same("fix flaky upload test in CI", "The upload test fails one run in ten on CI.",
+                            "fix the flaky upload test in CI", "Upload test fails one run in ten on CI.")
+    assert not coord.looks_same("area A0 sweep", "same spec words here", "new kind of work", "same spec words here")
+
+
 def test_task_add_rejects_a_reworded_repeat_of_work_shelved_or_landed_the_same_day(env):
     # Replays a coordinator re-queuing, hours later, two levers it had finished that day (one shelved,
     # one landed as a kept iteration) under reworded titles with the same bounds.
@@ -11814,7 +11840,8 @@ def test_code_tasks_land_their_own_work_only_when_the_project_opts_in(env):
     from ttp import coordinator as coord
     from ttp.project import DEFAULT_CONFIG, code_tasks_may_push, config_problems, unknown_key_hint
     from ttp.prompts import worker_task
-    assert DEFAULT_CONFIG["delivery"]["code_tasks_may_push"] is False
+    # Default "approved" (user msg #2484): a code task lands only a head a review approved (push.py).
+    assert DEFAULT_CONFIG["delivery"]["code_tasks_may_push"] == "approved"
     assert unknown_key_hint("delivery.code_tasks_may_push") is None
     code = p.db.add_task("fix it", "s", kind="code", tier="light", origin="user")
     review = p.db.add_task("review it", "s", kind="review", tier="light", origin="user")
@@ -11825,7 +11852,7 @@ def test_code_tasks_land_their_own_work_only_when_the_project_opts_in(env):
     def state():   # the STANDING block; the prompt's rules always name `## Delivery` as an example
         return "\n".join(coord.standing_lines(p))
 
-    # Default: off, and nothing in the prompts says otherwise.
+    # Default: no unreviewed landing, and nothing in the prompts says otherwise.
     p.set_config("delivery.push_branch", "work")
     assert not code_tasks_may_push(p.config()) and config_problems(p.raw_config()) == []
     assert "land on work with ttp push=True" not in worker(code) and "## Delivery" not in state()
@@ -11833,7 +11860,7 @@ def test_code_tasks_land_their_own_work_only_when_the_project_opts_in(env):
     p.set_config("delivery.code_tasks_may_push", "yes")
     assert not code_tasks_may_push(p.config())
     assert config_problems(p.raw_config()) == [
-        "delivery.code_tasks_may_push: 'yes' is not true or false; code tasks do not push"]
+        "delivery.code_tasks_may_push: 'yes' is not true, false or \"approved\"; code tasks do not push"]
     # On without a push branch: still off.
     p.set_config("delivery.code_tasks_may_push", True)
     p.set_config("delivery.push_branch", "")
@@ -11858,7 +11885,7 @@ def test_code_tasks_may_push_is_turned_on_only_on_the_users_word(env):
     off = {**on, "value": "false"}
     notes = coord.apply(p, [on])
     assert len(notes) == 1 and "ask_user (blocking review)" in notes[0], notes
-    assert p.config()["delivery"]["code_tasks_may_push"] is False
+    assert p.config()["delivery"]["code_tasks_may_push"] == "approved"
     assert coord.apply(p, [on], user_turn=True) == []
     assert p.config()["delivery"]["code_tasks_may_push"] is True
     assert coord.apply(p, [off]) == []
@@ -14038,29 +14065,19 @@ def test_setting_setup_question_fires_once_per_setting_state(env):
 
 
 @pytest.mark.parametrize("user_text,provenance", [("auto-merge acme/widgets", None), (None, None), ("hi", "system")])
-def test_auto_merge_line_from_any_source_is_reported_never_applied(env, user_text, provenance):
-    """A Policies auto-merge line, whether logged with the user's message, written by the coordinator on
-    its own, or in a turn whose only message the harness posted, never changes delivery.auto_merge_repos
-    (only the coordinator's config_set in the user's turn does): one keyed mismatch defect across ticks
-    and restarts, no alert, no grant_applied event, nothing asked, no bookkeeping."""
-    from ttp import coordinator as coord
+def test_auto_merge_line_from_any_source_is_never_read_or_applied(env, user_text, provenance):
+    """A Policies auto-merge line, however it got there, changes nothing and raises nothing: the daemon
+    reads no charter wording (only the coordinator's config_set in the user's turn sets the setting)."""
     from ttp import grants
     from ttp.daemon import Daemon
     p = make(env)
     _policies_line(p, "- Auto-merge repositories: acme/widgets.", user_text, provenance)
     d = Daemon(p.base)
     d.sweep_holds()
-    d.sweep_holds()
     Daemon(p.base).sweep_holds()
     assert p.config()["delivery"]["auto_merge_repos"] == []
-    ev = _grant_events(p)
-    assert len(ev) == 1 and "auto_merge_repos" in ev[0]["text"] and "Not an ask" in ev[0]["text"]
-    assert "report-only" in ev[0]["text"]
-    assert coord.EFFORT_EVENT_TRIGGERS[grants.EVENT] == "conflict"
-    assert p.db.q("SELECT id FROM messages WHERE kind='ask'") == []
-    assert _grant_events(p, grants.APPLIED) == []
-    assert p.db.q("SELECT id FROM messages WHERE kind='alert' AND text LIKE '%auto_merge_repos%'") == []
-    assert grants.AUTO_MERGE not in (p.db.kv(grants.APPLIED_KV) or {})
+    assert _grant_events(p) == [] and p.db.q("SELECT id FROM messages WHERE kind IN ('ask','alert') "
+                                             "AND text LIKE '%auto_merge_repos%'") == []
 
 
 
@@ -17117,7 +17134,7 @@ def test_promise_replay_671_recorded_listed_overdue_and_raised_once(env, monkeyp
     assert "dogfood-2 candidate" in o["text"] and "Checks are running" not in o["text"]
     check(_pdt(14, 59))
     assert _promise_events(p) == [] and ob.promise_lines(p.db, _pdt(14, 59), p)[0].endswith(
-        "(send each deliverable or an honest update in its chat; close with `obligation` key + evidence)")
+        "(send each deliverable in its chat; an honest update waits for its digest; close with `obligation` key + evidence)")
     head, line = ob.promise_lines(p.db, _pdt(17, 20), p)
     assert "1 open, 1 OVERDUE" in head
     assert "chat c1, message #671" in line and "15:00 PDT" in line and "OVERDUE 2.3 h" in line
@@ -17887,7 +17904,11 @@ def test_forbidden_data_patterns_refuse_memory_and_charter_writes_and_never_reac
                        turn=1) == []
     with p.charter_path.open("a") as f:
         f.write("\n## Forbidden data\n- amounts: `\\$\\s?\\d[\\d,]*`\n- account numbers: `\\b\\d{8,}\\b`\n")
-    p.set_config("memory.forbidden_patterns", [{"name": "client names", "regex": "(?i)\\bacme\\b"}])
+    from ttp import forbidden
+    assert forbidden.declared(p) == [], "a hand edit of the charter's prose sets no pattern: the config does"
+    p.set_config("memory.forbidden_patterns", [{"name": "amounts", "regex": "\\$\\s?\\d[\\d,]*"},
+                                               {"name": "account numbers", "regex": "\\b\\d{8,}\\b"},
+                                               {"name": "client names", "regex": "(?i)\\bacme\\b"}])
     (p.base / "state").mkdir(exist_ok=True)
     (p.base / "state" / "forbidden.txt").write_text("# kept out of git\n(?i)widgetco\n")
     p.set_config("memory.forbidden_patterns_file", "state/forbidden.txt")
@@ -17923,6 +17944,8 @@ def test_forbidden_data_patterns_refuse_memory_and_charter_writes_and_never_reac
     assert "memory (fact): totals" in git_log() and "card numbers" in p.charter_path.read_text()
     probs = coord.apply(p, [{"type": "memory_add", "text": "Card 1111 2222 3333 4444 on file."}], turn=5)
     assert probs and "'card numbers'" in probs[0] and "4444" not in probs[0]
+    from ttp import configwho
+    assert configwho.role(configwho.get(p.db, "memory.forbidden_patterns")) == "coordinator"
 
     # Fail closed: an invalid regex or an unreadable pattern file refuses the write, never lets it through.
     p.set_config("memory.forbidden_patterns", ["(unclosed"])
@@ -17934,6 +17957,35 @@ def test_forbidden_data_patterns_refuse_memory_and_charter_writes_and_never_reac
     assert probs and "cannot be read" in probs[0]
     assert not list(p.memory_dir.glob("*anything*.md"))
 
+
+
+def test_the_grant_line_names_only_keys_config_set_accepts_and_the_user_only_ones_as_refused():
+    """Review #7994: every key the coordinator prompt's grant line has it config_set passes config_set's
+    validator; push permission and the machine allowlist are named only as the user's own (refused)."""
+    import re
+    from ttp import coordinator as coord
+    text = (RUNTIME.parent / "template" / "prompts" / "coordinator.md").read_text()
+    line = next(l for l in text.splitlines() if l.startswith("- A setting the user grants"))
+    for key in ("delivery.allow_protected_push_branch", "delivery.auto_merge_repos", "delivery.checks_spill_hosts"):
+        coord.settable(key)
+    own = line.split("are the user's own", 1)
+    assert len(own) == 2 and "`config_set` refuses them" in own[1]
+    for key in re.findall(r"`((?:delivery|machines)\.[\w.]+)`", own[0].rsplit(". ", 1)[-1]):
+        with pytest.raises(ValueError):
+            coord.settable(key)
+    for key in re.findall(r"`((?:delivery|machines|checks)\.[\w.]+)`", own[0].rsplit(". ", 1)[0]):
+        coord.settable(key)
+
+
+def test_a_forbidden_data_subsection_in_a_restrictions_update_is_found_and_others_are_not():
+    """Review #7994: a "### Forbidden data" subsection in another section's charter_update text merges its
+    patterns; a later subsection's spans are not patterns."""
+    from ttp import charterset
+    from ttp import coordinator as coord
+    body = coord._forbidden_body("Restrictions", "- keep it generic\n### Forbidden data\n- card numbers: `\\d{16}`\n### Other\n- run `make test`")
+    assert [i["regex"] for i in charterset.forbidden_patterns(body)] == ["\\d{16}"]
+    assert coord._forbidden_body("Restrictions", "- run `make test`") == ""
+    assert coord._forbidden_body("Forbidden data", "- x: `y`").startswith("## Forbidden data\n")
 
 def test_a_machine_change_until_task_ends_with_its_task_and_a_continuation_re_extends_it(env, monkeypatch, capsys):
     """`--until-task <id>`: the entry is overdue once that task of its project is done, failed, cancelled
@@ -23954,3 +24006,39 @@ def test_runtime_walks_never_start_at_the_drive_root_or_the_home_folder(tmp_path
         assert glob_root_ok(ok), ok
     [o] = goalchecks.artifact_fresh("~/**/x.log")
     assert o.get("error") is True and "refused" in o["text"], o
+
+
+def test_a_review_of_a_head_already_failed_keeps_that_verdict_with_no_run_and_no_fix_round(env, monkeypatch):
+    """Upstream user msg #2495 (2b): a second review of an unchanged head an earlier review failed with a
+    finding does not run: it closes failed with the earlier verdict and no follow-ups (no fix round
+    starts from it), and the coordinator gets one review_nofix event. A forced review still runs."""
+    from ttp import coordinator as coord, deadwait, reviewreuse
+    p = make(env)
+    tid, path, branch = _code_task(p, "make it")
+    _commit_file(path, "a")
+    head = _git_out(path, "rev-parse", "HEAD")
+    d, started = _reuse_daemon(p, monkeypatch)
+    first = _reuse_review(p, tid)
+    d.dispatch()
+    p.db.update_task(first, status="failed", result=json.dumps(
+        {"status": "changes_needed", "summary": "the loop never ends", "followups": [{"title": "fix", "spec": "x"}]}))
+    again = _reuse_review(p, tid, "Review it again")
+    d.dispatch()
+    assert started == [first], "no second run for the head it failed"
+    t = p.db.task(again)
+    res = json.loads(t["result"])
+    assert t["status"] == "failed" and res["reused_review"] == first and res["reviewed_head"] == head
+    assert "the loop never ends" in res["summary"] and not res.get("followups")
+    ev = p.db.q("SELECT * FROM events WHERE kind=?", (deadwait.NOFIX_EVENT,))
+    assert [e["task"] for e in ev] == [again]
+    add = {"type": "task_add", "title": f"Review #{tid} once more", "kind": "review", "spec": "check it",
+           "depends_on": [tid]}
+    problems = coord.apply(p, [add])
+    assert len(problems) == 1 and "already failed by review #" in problems[0] and "force" in problems[0]
+    add.update(force=True, reason="the first review misread the spec")
+    assert coord.apply(p, [add]) == []
+    forced = p.db.one("SELECT * FROM tasks WHERE title=?", (add["title"],))
+    assert reviewreuse.FORCED_LABEL in json.loads(forced["labels"])
+    p.db.update_task(forced["id"], provider="claude")
+    d.dispatch()
+    assert started == [first, forced["id"]], "a forced review runs"
