@@ -3962,7 +3962,10 @@ def test_spill_pick_spreads_runs_across_hosts_with_room_and_checks_status_says_w
         assert first is not None and second is not None
         assert (first.host, second.host) == ("check-host-a", "check-host-b"), told
         lines = checkspill.pick_lines(p.name)
-        assert lines == ["last spill pick (0 min ago) took check-host-b"], "the unreachable host backs off: tried last"
+        # The unreachable host backs off (not probed again) and status names it as skipped with why: no silent limit.
+        assert lines[0] == "last spill pick (0 min ago) took check-host-b", lines
+        assert len(lines) == 2 and lines[1].startswith("  spill host down took no run: ") \
+            and "backing off after 1 failed probe(s)" in lines[1], lines
         off = ",".join(f"{h}:fail" for h in ("down", "check-host-a", "check-host-b"))
         assert checkspill.pick(p, p.config(), told.append, "pytest -q", off) is None
         lines = checkspill.pick_lines(p.name)
@@ -4393,9 +4396,11 @@ def test_a_spilled_push_batch_check_reruns_only_here_with_its_selection(env, tmp
     lines = log.read_text().splitlines()
     first = next(n for n, ln in enumerate(lines) if "/ttp-check." in ln)
     spilled = [ln for ln in lines if "/ttp-check." in ln]
-    assert len(spilled) == 2 and all(ln.endswith(" none") for ln in spilled), lines   # the two full runs only
+    # The one full run only: once the search knows the failing tests, the passing entry runs no second full run.
+    assert len(spilled) == 1 and spilled[0].endswith(" none"), lines
     reruns = [ln for ln in lines[first + 1:] if not ln.endswith(" none")]
-    assert len(reruns) >= 3, lines   # the judge's at the head and on the tip, the split probe's at entry 1
+    # The judge's at the head; the tip and entry 1 do not collect test_g.py, so it is not rerun there.
+    assert len(reruns) >= 1, lines
     assert all("/ttp-check." not in ln and "test_g" in ln.split(" ", 1)[1] for ln in reruns), lines
 
 

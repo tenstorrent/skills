@@ -14,6 +14,7 @@ import subprocess
 import time
 from pathlib import Path
 
+from . import gitmemo
 from .project import Project
 
 KEY = "worker_prompt_drift"   # kv: {"stat", "hash": the copy's last checked hash, "flagged": its last flagged hash}
@@ -23,7 +24,7 @@ EVERY_S = 3600   # the daemon looks at most this often
 
 def _git_show(harness: Path, *args: str) -> str | None:
     try:
-        r = subprocess.run(["git", "-C", str(harness), *args], capture_output=True, text=True, timeout=30)
+        r = gitmemo.run(["git", "-C", str(harness), *args], capture_output=True, text=True, timeout=30)
     except (OSError, subprocess.SubprocessError):
         return None
     return r.stdout if r.returncode == 0 else None

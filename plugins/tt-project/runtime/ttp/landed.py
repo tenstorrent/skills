@@ -27,7 +27,7 @@ import subprocess
 import time
 from pathlib import Path
 
-from . import gitcache, gitmemo, push, repoid
+from . import gitcache, gitmemo, repoid
 from .db import TERMINAL_TASK_STATES, dependency_ids, review_subject
 
 LANDED_PROBE = re.compile(r"\s*landed:\s*#?(\d+)\s*")
@@ -72,6 +72,7 @@ def probe_command(probe: str, p=None) -> str:
 
 def _is_push_branch(p, remote: str, branch: str) -> bool:
     """Whether <remote>/<branch> is the project's push branch; False when none is configured."""
+    from . import push   # late: push loads pushq, whose imports reach this module
     try:
         return push.target(p, p.root) == (remote, branch)
     except Exception:
@@ -151,6 +152,7 @@ def on_branch(repo: Path, sha: str, tip: str) -> bool:
 
 def _on_branch(repo: Path, sha: str, tip: str) -> bool | None:
     """on_branch's answer; None when a git read failed (cannot tell)."""
+    from . import push   # late: push loads pushq, whose imports reach this module
     def out(*args: str, ok: tuple[int, ...] = (0,)) -> str | None:
         r = _git(repo, *args)
         return r.stdout if r.returncode in ok else None
@@ -220,6 +222,7 @@ def _tip(repo: Path, onto: str, fetch: bool) -> tuple[str, str]:
 def _push_ref(p, repo: Path) -> str:
     """The push branch to look on: <remote>/<branch>, or the local refs/heads/<branch> when the repo
     has no such remote (a remote-less repo pushes nowhere, so its branch is the local one)."""
+    from . import push   # late: push loads pushq, whose imports reach this module
     remote, branch = push.target(p, repo)
     if remote not in _git(repo, "remote").stdout.split():
         return f"refs/heads/{branch}"
@@ -248,6 +251,7 @@ def record_push(p, marker: Path, m: dict) -> None:
 
 def reconcile_pushes(p, tid: int) -> None:
     """A worker can finish before the daemon tends its detached pushes, regardless of its handoff."""
+    from . import push   # late: push loads pushq, whose imports reach this module
     for marker in sorted((p.state / push.DETACHED).glob(f"t{tid}-*.json")):
         record_push(p, marker, push._read(marker))
 
@@ -655,6 +659,7 @@ def equivalent(p, branch: str, bump=None) -> tuple[str, str] | None:
     changesets of `bump` (delivery.version_bump) aside. None when it did not, the branch already is
     on the push branch (a plain landing) or has no change of its own, or it cannot be read.
     Local refs only: no fetch."""
+    from . import push   # late: push loads pushq, whose imports reach this module
     repo = p.root
     head = _commit(repo, f"refs/heads/{branch}")
     try:

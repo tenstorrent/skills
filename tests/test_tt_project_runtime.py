@@ -31071,6 +31071,12 @@ def test_pr_findings_wait_for_the_delivering_tasks_review_chain_and_a_pr_has_one
                          labels=[f"auto_review:{src}"])
     after = p.db.add_task("after", "a", kind="work", depends_on=[late])
     p.db.update_task(late, status="failed")
+    # It is the change's second failed review: past review.auto_fix_rounds (1) the coordinator decides
+    # (reviewcap.change_fails), and no second fixer is queued either.
+    assert d._fix_failed_review(p.db.task(late), [{"title": "Loader leaks", "spec": "close the file"}], "leaks") is None
+    assert "2 reviews of this stack failed" in d._nofix and [t["id"] for t in fixers()] == [prfix]
+    p.set_config("review.auto_fix_rounds", 2)   # a project that allows a second automatic round
+    d = Daemon(p.base)
     out = d._fix_failed_review(p.db.task(late), [{"title": "Loader leaks", "spec": "close the file"}], "leaks")
     assert out is not None
     fid, rid, moved = out

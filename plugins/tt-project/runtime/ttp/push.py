@@ -1099,7 +1099,6 @@ def run_slot(run: list, head: str, say: Callable[[str], None], priority: str = "
     if hosts := list(dict.fromkeys(h for c in run if (h := remote_host(c)))):
         bound = testslots.push_load_wait_s(cfg)
         remoteload.wait(hosts, say, bound, move=move)
-        from . import checkspill   # the host's check slots, claimed as `ttp checks` claims them (bounded here)
         if not moved and (claims := checkspill.admit_pinned(proj, hosts, say, "push checks", bound=bound)) is None:
             say(f"no check slot freed on {', '.join(hosts)} in {bound:.0f}s (checks.push_load_wait_s), "
                 "starting anyway")
@@ -1127,7 +1126,6 @@ def move_off(cmds: list, host: str, head: str, say: Callable[[str], None], proj:
     checkspill.pick, `cmds` with those sent there and the rest as they were), else (None, `cmds`): they keep
     waiting, never starting on `host`. A light one of those that may not spill (checklane.is_light) runs here
     beside them; a check whose own "host" names `host`, or a heavy one that may not spill, stays."""
-    from .cli import _spill_to
     if proj is None and (base := os.environ.get("TTP_PROJECT")):
         proj = Project(base)
     if proj is None or os.environ.get(checkcap.HELD_ENV):
@@ -1154,7 +1152,7 @@ def move_off(cmds: list, host: str, head: str, say: Callable[[str], None], proj:
         return None, cmds
     if claim is None:
         return None, cmds
-    out = [(h or c) if f is None else checkspill._unspilled(_spill_to([f], claim.host, cfg, claim.workers)[0], f)
+    out = [(h or c) if f is None else checkspill._unspilled(cli._spill_to([f], claim.host, cfg, claim.workers)[0], f)
            for c, f, h in zip(cmds, free, here)]
     say(f"the check host {host} stayed overloaded: {sum(1 for f in free if f)} check(s) moved to spill host "
         f"{claim.host}, which has free cores")
@@ -3939,7 +3937,6 @@ def _yields_turn(p: Project, remote: str, branch: str) -> bool:
     to the queue's own target (the lock the batch takes), never when its task is urgent or a review of
     one, nor when anything here fails."""
     try:
-        from . import pushq, urgent
         if pushq.target(p) != (remote, branch):
             return False
         if (tid := os.environ.get("TTP_TASK")) and urgent.covers_urgent(p.db, p.db.task(int(tid))):
@@ -6366,7 +6363,7 @@ def status_lines(p: Project) -> list[str]:
 # never inside a function: a push that outlives an upgrade of runtime/ must not import a newer batch
 # that calls into this older push (after_push would fail on a missing attribute). cli and pushpass
 # (for `ttp push --own` reusing a `ttp checks` pass) likewise: pushpass imports push at import time.
-from . import batch, cli, jobstop, pushpass, verdictcarry  # noqa: E402
+from . import batch, cli, jobstop, pushpass, pushq, urgent, verdictcarry  # noqa: E402
 from . import detach as detachjob  # noqa: E402  (this module has its own `detach` function)
 
 # --- project-local imports below ---

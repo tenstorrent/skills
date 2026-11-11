@@ -56,7 +56,7 @@ from pathlib import Path
 
 from . import (checkcap, checkdirs, checklane, checkspill, cleantree, conflictfix, cyclenotice, envfault, gatejudge, landmark, locks, push, pushpass, runner, scopehold,
                scriptwatch, setupfault, syntaxfault, testslots, workerloss, urgent,
-               sharedchecks, slowtests, suitecost, verdictcarry, worktree)
+               sharedchecks, slowtests, suitecost, testpick, verdictcarry, worktree)
 from .project import Project, command_env, durable_write, write_json
 from . import ghroute, gatetime, gitmemo, hoststate
 
@@ -1741,7 +1741,6 @@ class Batch:
     def _express_checks(self, tip: str, checks: list) -> list:
         """An express landing's checks: the smoke push checks, each pytest one narrowed to the tests the
         entry's diff reaches (testpick.narrow). The full checks run after it lands (postland)."""
-        from . import testpick
         head = str(self.entries[0].get("head") or "") if self.entries else ""
         if not head:
             return checks

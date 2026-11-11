@@ -203,6 +203,9 @@ def test_an_indexed_audit_record_is_historical_only_while_its_hash_and_retiremen
     import json as _json
     from ttp import echoes
     p = make(env)
+    # Written before the retirement: a memory entry written after a charter retirement that states its words is
+    # the current wording (advisory), which would leave nothing directive here.
+    mem = p.add_memory("Recovery: legacy-card-kick first.", kind="decision")
     rec = echoes.record(p.db, "charter 'Recovery' quote replaced", "Recover a hung card with `legacy-card-kick`.",
                         "Recover a hung card with the documented reset.")
     other = echoes.record(p.db, "memory [old-gate] superseded by [new-gate]", "Hold builds for `legacy_build_gate`.",
@@ -217,7 +220,6 @@ def test_an_indexed_audit_record_is_historical_only_while_its_hash_and_retiremen
     tool.parent.mkdir(parents=True, exist_ok=True)
     tool.write_text("#!/bin/sh\nlegacy-card-kick \"$1\"\n")
     p.charter_path.write_text(p.charter_path.read_text().rstrip() + "\n\n## Recovery\n- Run legacy-card-kick.\n")
-    mem = p.add_memory("Recovery: legacy-card-kick first.", kind="decision")
     p.set_config("coordinator.echo_paths", ["audits"])
     index = p.harness / echoes.HISTORICAL_INDEX
     sha = _hashlib.sha256(audit.read_bytes()).hexdigest()

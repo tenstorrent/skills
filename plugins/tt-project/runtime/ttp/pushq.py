@@ -27,6 +27,7 @@ from . import (   # one name per line: two changes adding names merge without a 
     coordinator as coord,
     cyclenotice,
     envfault,
+    express,
     lanewait,
     locks,
     msgparts,
@@ -35,6 +36,7 @@ from . import (   # one name per line: two changes adding names merge without a 
     prhead,
     push,
     pushclaim,
+    release,
     replymsg,
     reviewcap,
     runner,
@@ -1997,7 +1999,6 @@ def schedule(p: Project, cfg: dict | None = None, log: Callable[[str], None] = l
         return None
     if retarget(p, name):
         log(f"push queue: approvals for an old target sent back to their reviews (target now {name})")
-    from . import express
     if bid := express.auto(p, name, log):
         return bid
     now = time.time()
@@ -3220,7 +3221,6 @@ def no_batch_holds(p: Project, cfg: dict | None = None, now: float | None = None
     """What keeps a batch from starting while approvals wait (check_no_batch): the push lock's holders
     (a detached single push), a tt-project upgrade in flight, a checks host env fault, the batch window
     or due's other reason; or that a batch is due and the start step has not taken it."""
-    from . import release
     now = time.time() if now is None else now
     rows, why = due(p, now=now, cfg=cfg)
     out = []
