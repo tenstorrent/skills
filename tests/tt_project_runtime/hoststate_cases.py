@@ -433,6 +433,20 @@ def test_a_check_s_own_crontab_line_in_its_working_tree_fails_it_and_only_its_ow
     assert tabf.read_text() == f"0 1 * * * keep\n{FOREIGN}\n"
 
 
+def test_a_run_tree_after_a_redirect_or_separator_is_the_run_s_and_an_outside_removal_is_not(tmp_path):
+    from ttp import hoststate
+    tree = str(tmp_path / "run")
+    gone = "0 2 * * * outside-job"
+    before = {"crontab": f"0 1 * * * keep\n{gone}\n", "units": {}}
+    for line in (f"* * * * * x >>{tree}/log", f"* * * * * x 2>{tree}/err", f"* * * * * x <{tree}/in",
+                 f"* * * * * x|{tree}/y", f"* * * * * x;{tree}/y", f"* * * * * x&&{tree}/y",
+                 f"* * * * * x a,{tree}/y"):
+        after = {"crontab": f"0 1 * * * keep\n{line}\n", "units": {}}   # the outside job dropped its line too
+        mine, theirs = hoststate.own(before, after, hoststate.diff(before, after), tokens=[tree])
+        assert mine == {"crontab": ([line], [])}, line
+        assert theirs == {"crontab": ([], [gone])}, line
+
+
 def test_a_host_restore_reads_the_crontab_again_and_keeps_a_line_written_after_the_compare(
         tmp_path, monkeypatch):
     from ttp import hoststate
