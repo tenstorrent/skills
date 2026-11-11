@@ -2321,7 +2321,7 @@ class Daemon:
                      self.tick_prune_worktrees, self.prune_leftovers, self.branch_cap, self.land_harness_worktrees, self.backup_branches, self.replicate_state, self.check_local_only, self.check_disk,
                      self.sweep_alerts, self.check_release, self.sync_shared_pauses, self.check_pause_ends, self.check_move, self.track_outages,
                      self.check_integrity, self.heal_harness_git,
-                     self.sync_schedules, self.lint_charter, self.tend_holds, self.record_ttr, self.alert_long_pause,
+                     self.sync_schedules, self.lint_charter, self.lint_worker_prompt, self.tend_holds, self.record_ttr, self.alert_long_pause,
                      self.check_linger, self.check_notifier, self.check_overseer, self.alert_slurm_paused, self.check_gh_auth, self.check_reach, self.check_chats,
                      self.probe_mcp):
             if step in lease_off:
@@ -13334,6 +13334,16 @@ class Daemon:
         log(self.p, f"disk guard sweep: {removed} finished task worktree(s) removed, {len(res) - removed} kept, "
                     f"{freed / 1e9:.1f} GB freed")
         return {"removed": removed, "kept": len(res) - removed, "freed": freed}
+
+    def lint_worker_prompt(self) -> None:
+        """Flag this project's own harness/prompts/worker.md once per changed copy when it is much larger
+        than the template's or has drifted from its sections (promptdrift.check): a stat call per tick,
+        the compare at most hourly. Its coordinator merges it; the harness never edits it."""
+        try:
+            from . import promptdrift
+            promptdrift.check(self.p)
+        except Exception:
+            log(self.p, "worker prompt drift: " + traceback.format_exc().replace("\n", " | ")[:1000])
 
     def lint_charter(self) -> None:
         """Flag dated charter sections that contradict a standing restriction (coord.charter_lint);

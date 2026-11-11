@@ -712,6 +712,9 @@ def lines(db: DB, now: float | None = None, window_s: float = WINDOW_S, blocked_
         from .coordinator import worker_pinned_line
         if pinned := worker_pinned_line(p):
             out.append(pinned)
+        from . import promptdrift
+        if drift := promptdrift.line(p):
+            out.append(drift)
     return out or [NOTHING]
 
 

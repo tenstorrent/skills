@@ -236,6 +236,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
                     # The median cost of the last 5 session wakes over which one alarm names the cause
                     # and the session compacts in place and sends a leaner digest (wakecost.py; 0: off).
                     "wake_cost_alarm_usd": 1.0,
+                    # A project's own harness/prompts/worker.md over this many times the template's size is
+                    # flagged to its coordinator, in doctor and the daily review (promptdrift.py; 0: off).
+                    "prompt_drift_ratio": 1.5,
                     # An event batch that a turn which decided nothing already met, against the same
                     # state, is settled without a model run for this long after it (turngate.py; 0: off).
                     "skip_repeat_window_s": 86400,
