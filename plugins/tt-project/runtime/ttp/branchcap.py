@@ -21,7 +21,7 @@ import json
 import subprocess
 import time
 
-from . import landed, tried
+from . import gitmemo, landed, tried
 from .project import durable_append
 from .db import TERMINAL_TASK_STATES
 
@@ -38,7 +38,7 @@ SHOWN = 10
 
 def _git(repo, *args, timeout=60) -> subprocess.CompletedProcess:
     try:
-        return subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True, timeout=timeout)
+        return gitmemo.run(["git", "-C", str(repo), *args], capture_output=True, text=True, timeout=timeout)
     except (OSError, subprocess.TimeoutExpired) as e:
         return subprocess.CompletedProcess(args, 1, "", str(e))
 
