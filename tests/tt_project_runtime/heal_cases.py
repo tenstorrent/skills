@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 
-@pytest.mark.parametrize("outage", ["auth", "network", "disk", "heal"])
+@pytest.mark.parametrize("outage", ["network", "disk", "heal"])
 def test_alerts_ack_refuses_a_live_outage_without_mutation(env, outage):
     from ttp import alerts, cli, heal, netwait
     from ttp.daemon import Daemon

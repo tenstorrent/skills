@@ -360,8 +360,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
                     "review_failed_unhandled_s": 3600,
                     # Provider failover (failover.py): a queued or waiting task whose provider cannot
                     # start new work for longer than provider_failover_after_h hours (0: off) moves to
-                    # the first usable of provider_failover_to (provider names), then the core provider.
+                    # the first usable of provider_failover_to (provider names), then the core provider;
+                    # a logout counts once it lasts provider_logout_failover_s seconds (0: at once).
                     "provider_failover_after_h": 4, "provider_failover_to": [],
+                    "provider_logout_failover_s": 900,
                     # Tier floor for conclusion runs (tierfloor.py): a question or plan task, a chat
                     # answer, a spec with a `conclusion:` line, a report schedule's run, a review or
                     # verdict and a device or machine run starts at least at this tier and effort, never

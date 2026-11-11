@@ -558,6 +558,7 @@ USER_SETTABLE = {
     # and waiting tasks move (0: off), and the providers they move to first.
     "coordinator.provider_failover_after_h": lambda v: failover.after_h_of(v),
     "coordinator.provider_failover_to": lambda v: v,   # checked against the configured providers in config_set
+    "coordinator.provider_logout_failover_s": lambda v: failover.logout_s_of(v),   # seconds logged out before work moves
     # Orders the owner's own chat agent relays (`ttp say` context and findings) count as the owner's word
     # (relay.agent_orders). Turned on only in a turn carrying the owner's own message (NEEDS_USER).
     relay.AGENT_KEY: lambda v: v is True or str(v).strip().lower() in ("1", "true", "yes", "on"),

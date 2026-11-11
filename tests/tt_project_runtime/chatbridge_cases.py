@@ -576,6 +576,11 @@ def test_failover_off_a_logged_out_chat_drops_its_model_and_keeps_a_required_pin
     d.open_breaker("chat", "chat bridge: failed to authenticate")
     d.update_gates()
     d.failover_pinned()
+    assert p.db.task(pref)["provider"] == "chat", "a logout moves work only once it lasts provider_logout_failover_s"
+    from ttp import alerts
+    p.db.set_kv(alerts.BREAKER + "chat", {**p.db.kv(alerts.BREAKER + "chat"), "opened": time.time() - 901})
+    d._failover_checked = 0
+    d.failover_pinned()
     t = p.db.task(pref)
     assert (t["provider"], t["model"]) == (core, None), "the chat model id must not carry to the core provider"
     assert "moved at once from chat" in t["spec"].lower()

@@ -6479,10 +6479,10 @@ class Daemon:
                     # breaker (no run starts on it), say exactly how to fix it, and let check_logins ask
                     # its CLI, without a model call, when it is logged in again.
                     self.open_breaker(r["provider"], (usage.final_text or usage.error)[:200])
-                    self.alert(f"auth:{r['provider']}",
+                    self.logout_alert(r["provider"], coordinator=r["role"] == "coordinator", text=
                                f"{r['provider']} on {hostname()} is logged out ({(usage.final_text or usage.error)[:120]}). "
                                f"Log in once on that machine ({prov.login_hint}). Nothing starts on it until then; "
-                               f"work resumes by itself once a login check passes, and queued work is kept.", "high")
+                               f"work resumes by itself once a login check passes, and queued work is kept.")
                 if r["role"] == "coordinator":
                     self._finish_coordinator(r, usage, status, note)
                 else:
@@ -6961,14 +6961,14 @@ class Daemon:
         except Exception:
             host = ""
         self.open_breaker(prov_name, f"{len(runs)} runs in a row made no model call (runs {_ids(runs)})", reach=True)
-        self.alert(f"auth:{prov_name}",
+        self.logout_alert(prov_name,
                    f"{prov_name} on {hostname()} made no model call in {len(runs)} runs in a row "
                    f"(runs {_ids(runs)}{f'; last: {last}' if last else ''}): it is logged out or cannot reach "
                    f"{host or 'its API'}. The project is not live on {prov_name}: nothing starts on it, the "
                    f"coordinator included, until a model-free check (its login status and an HTTPS check of "
                    f"{host or 'its API'}) passes; then work resumes by itself and queued work is kept. "
                    f"Fixing it is the user's decision: log in on that machine ({prov.login_hint}) or restore "
-                   f"its network. No worker logs in.", "high")
+                   f"its network. No worker logs in.")
 
     def _coordinator_failed(self, why: str) -> None:
         db = self.p.db
@@ -11139,26 +11139,15 @@ class Daemon:
             stops, holds, windows = {}, {}, bud.plan_windows(db)
             for prov in provs:   # update_gates leaves out providers only waiting tasks use
                 gate = self.gates.get(prov) or bud.evaluate(db, self.cfg, prov, windows)
-                pause, out = self._provider_pause(prov), self._logged_out(prov)
+                # A logout moves work once it lasts provider_logout_failover_s, not after hours.
+                pause, out = self._provider_pause(prov), failover.out_long(db, self.cfg, prov, now)
                 if why := failover.hold(gate, pause, out, now):
                     holds[prov] = why
                 if why := failover.stop(gate, pause, out, now):
                     stops[prov] = why
             if not holds:
                 return
-            ok = []
-            for prov in failover.targets(self.cfg):
-                if prov in holds or self._logged_out(prov) or self.net_held(prov):
-                    continue
-                try:
-                    if not get_provider(prov).available():
-                        continue
-                except Exception:
-                    continue
-                gate = self.gates.get(prov) or bud.evaluate(db, self.cfg, prov, windows)
-                if gate.level != "red" and gate.allow_new_work and gate.max_parallel > 0 \
-                        and not failover.hold(gate, self._provider_pause(prov), False, now):
-                    ok.append(prov)
+            ok = self._failover_ok(holds, windows, now)
             kept: list[dict] = []
             moves, running = failover.plan(db, self.cfg, stops, ok, now, holds, kept)
             where = timefmt.home(self.p)
@@ -11178,6 +11167,70 @@ class Daemon:
             olds = sorted({m["old"] for m in moves} | {r["provider"] for r in running})
             self.alert(f"failover:{','.join(olds)}", "Provider failover: " + "; ".join(lines)[:1500],
                        severity="low", every_s=0)
+
+    def _failover_ok(self, holds: dict, windows: object, now: float) -> list[str]:
+        """The failover targets (failover.targets) that can start new work now, best first."""
+        db, ok = self.p.db, []
+        for prov in failover.targets(self.cfg):
+            if prov in holds or self._logged_out(prov) or self.net_held(prov):
+                continue
+            try:
+                if not get_provider(prov).available():
+                    continue
+            except Exception:
+                continue
+            gate = self.gates.get(prov) or bud.evaluate(db, self.cfg, prov, windows)
+            if gate.level != "red" and gate.allow_new_work and gate.max_parallel > 0 \
+                    and not failover.hold(gate, self._provider_pause(prov), False, now):
+                ok.append(prov)
+        return ok
+
+    def logout_waits(self, prov: str, now: float | None = None) -> dict:
+        """What really waits here on logged-out `prov`: its queued and waiting tasks (pinned to it, or
+        unpinned when it is the core provider; routed tiers fall back at start, _route_entry), those
+        of them no other provider can run (a required pin, failover off, or no target that works),
+        the high events a coordinator on it cannot handle, the providers its work runs on, and whether
+        the login is the user's to do (`need`)."""
+        db, now = self.p.db, time.time() if now is None else now
+        core = self.cfg.get("core_provider") or "claude"
+        tasks = db.q("SELECT * FROM tasks WHERE status IN ('queued','waiting') AND (provider=?"
+                     + (" OR provider IS NULL OR provider=''" if prov == core else "") + ")", (prov,))
+        try:
+            to = [t for t in self._failover_ok({prov: True}, bud.plan_windows(db), now) if t != prov] \
+                if failover.after_h(self.cfg) else []
+        except Exception as e:   # a reminder never fails on this: count it all as waiting
+            log(self.p, f"{prov}: failover targets not read: {type(e).__name__}: {e}")
+            to = []
+        stuck = sum(1 for t in tasks if not to or failover.required(db, t))
+        events = db.one("SELECT COUNT(*) n FROM events WHERE status IN ('new','queued') "
+                        "AND severity IN ('high','critical')")["n"] if prov == core else 0
+        runs_on = to or ([core] if prov != core and not self._logged_out(core) else [])
+        # The coordinator runs on the core provider only (coordinator_blocked): its logout needs the user.
+        need = bool(stuck or events or not runs_on or prov == core)
+        return {"queued": len(tasks), "stuck": stuck, "events": events, "to": runs_on, "need": need}
+
+    def logout_alert(self, prov: str, text: str, coordinator: bool = False) -> None:
+        """A logout's first alert: high only when work here can run on no other provider (a required
+        pin, every provider out, or the coordinator's own provider: `coordinator`, a coordinator run
+        hit it); else one low status line saying where its work runs meanwhile, which never asks the
+        user to log in."""
+        try:
+            w = self.logout_waits(prov)
+        except Exception as e:
+            log(self.p, f"{prov}: logout waits not read: {type(e).__name__}: {e}")
+            w = {"need": True}
+        if coordinator or w["need"]:
+            self.alert(f"auth:{prov}", text, "high")
+        else:
+            self.alert(f"auth:{prov}", self._logout_status(prov, time.time(), w["to"]), "low")
+
+    def _logout_status(self, prov: str, since: float, to: list[str]) -> str:
+        try:
+            hint = get_provider(prov).login_hint
+        except Exception:
+            hint = ""
+        return (f"{prov} logged out since {timefmt.long(since, timefmt.home(self.p))}; its work runs on "
+                f"{', '.join(to)}. Logging in again ({hint or 'its CLI login'}) is optional; nothing waits on it.")
 
     def rethink_asks(self) -> None:
         """Hand an open ask that has held work past coordinator.ask_rethink_h back to a tricky
@@ -19978,8 +20031,10 @@ class Daemon:
     def remind_logouts(self) -> None:
         """Each open logout: report what waits on it here into its machine-wide claim, and if this
         project holds the claim and a reminder is due (alerts.LOGOUT_REMIND_S), remind the chats with
-        how many projects, queued tasks and high events wait on it. Model-free, so it works while no
-        coordinator can run."""
+        how many projects, tasks and high events wait on it. Only work no other provider can run counts
+        (logout_waits): while every project's work runs elsewhere, no reminder asks for the login and
+        the alert stays one low status line, re-posted quietly when that changes; an acknowledged
+        alert stays quiet until it does. Model-free, so it works while no coordinator can run."""
         db, now = self.p.db, time.time()
         if now - getattr(self, "_logout_round", 0.0) < LOGOUT_REPORT_S:
             return
@@ -19989,25 +20044,31 @@ class Daemon:
             key, prov = ep["key"], ep["key"].split(":", 1)[1]
             if not alerts.breaker(db, prov):
                 continue   # check_logins closes it, and the sweep the alert
-            info = {"name": self.p.name,
-                    "queued": db.one("SELECT COUNT(*) n FROM tasks WHERE status='queued'")["n"],
-                    "events": db.one("SELECT COUNT(*) n FROM events WHERE status IN ('new','queued') "
-                                     "AND severity IN ('high','critical')")["n"]}
+            w = self.logout_waits(prov, now)
+            info = {"name": self.p.name, "queued": w["stuck"], "events": w["events"], "need": w["need"]}
+            cur = db.one("SELECT * FROM alerts WHERE key=? AND cleared IS NULL ORDER BY id DESC LIMIT 1", (key,))
+            if not w["need"] and cur and cur["severity"] != "low":   # its work runs elsewhere: a status line
+                db.post("out", self._logout_status(prov, float(ep["raised"]), w["to"]), chat=None,
+                        channel=alerts.QUIET, kind="alert", severity="low", ref=key)
             prev = db.one("SELECT MAX(cleared) AS c FROM alerts WHERE key=?", (key,))
             due = alerts.machine_round(self._machine_wide(key), key, str(self.p.base), now,
                                        float(prev["c"] or 0) if prev else 0.0, float(ep["raised"]), info)
             if not due:
                 continue
-            waiting = due["waiting"]
+            # Only projects whose work can run nowhere else wait on the login (a report without
+            # `need` comes from an older daemon: it counts).
+            waiting = [x for x in due["waiting"] if x.get("need", True)]
+            if not waiting or (cur and alerts.acked(db, cur) and cur["severity"] == "high"):
+                continue   # nothing needs the login, or the user knows and nothing changed
             try:
                 hint = get_provider(prov).login_hint
             except Exception:
                 hint = ""
-            names = ", ".join(sorted(str(w.get("name")) for w in waiting))
+            names = ", ".join(sorted(str(x.get("name")) for x in waiting))
             text = (f"{prov} on {hostname()} is still logged out ({(now - due['since']) / 3600:.1f} h). "
                     f"{len(waiting)} project(s) wait on it ({names}): "
-                    f"{sum(int(w.get('queued') or 0) for w in waiting)} queued task(s) and "
-                    f"{sum(int(w.get('events') or 0) for w in waiting)} high event(s) not handled yet. "
+                    f"{sum(int(x.get('queued') or 0) for x in waiting)} task(s) no other provider can run and "
+                    f"{sum(int(x.get('events') or 0) for x in waiting)} high event(s) not handled yet. "
                     f"Log in once on that machine{f' ({hint})' if hint else ''}; work resumes by itself.")
             db.post("out", text, chat=None, kind="alert", severity="high", ref=key)
             log(self.p, f"{key}: logout reminder {due['reminder']} sent")

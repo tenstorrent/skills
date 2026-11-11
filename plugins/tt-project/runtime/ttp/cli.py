@@ -11226,10 +11226,12 @@ def cmd_config(a) -> None:
             val = pin_verify_mode(val)
         except ValueError as e:
             die(str(e))
-    if a.key in ("coordinator.provider_failover_after_h", "coordinator.provider_failover_to"):
+    if a.key in ("coordinator.provider_failover_after_h", "coordinator.provider_failover_to",
+                 "coordinator.provider_logout_failover_s"):
         from . import failover
         try:
             val = (failover.after_h_of(val) if a.key.endswith("_after_h")
+                   else failover.logout_s_of(val) if a.key.endswith("_logout_failover_s")
                    else failover.to_of(val, p.config().get("providers")))
         except ValueError as e:
             die(str(e))

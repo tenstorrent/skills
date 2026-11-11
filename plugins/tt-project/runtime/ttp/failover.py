@@ -8,7 +8,9 @@ lasts more than coordinator.provider_failover_after_h hours (default AFTER_H; 0 
 A provider cannot start new work when its auth breaker is open (logged out: no known end), its
 limit pause runs, or its budget gate is red (a plan window at the line, a dollar cap, the runaway
 guard). Its end is the pause's end, or for a red gate the reset of every window or cap holding it;
-a red gate whose end is unknown moves nothing.
+a red gate whose end is unknown moves nothing. A logout counts once its auth breaker has been open
+coordinator.provider_logout_failover_s seconds (default LOGOUT_S; out_long): a short re-login moves
+nothing, a longer one moves the work instead of leaving it to wait for hours on a login.
 
 A pin to a provider other than the core one is a preference unless it is marked required (the
 task's `pin_required`, kept as the label REQUIRED_LABEL): such a task moves at once, with no wait,
@@ -42,6 +44,7 @@ REQUIRED_LABEL = "pin:required"      # the user's own words require the task's p
 PREFERRED_LABEL = "pin:preferred"    # pin_required set false: overrides a mark on a task it continues
 NOTE_PREFIX = "[provider failover"
 AFTER_H = 4.0
+LOGOUT_S = 900.0                     # a logout this long moves work (coordinator.provider_logout_failover_s)
 REPORTED_KEY = "failover_reported"     # kv: {"<task>:<provider>": ts} running tasks already reported
 CHAIN_RE = re.compile(r"^(?:continues|auto_review|review_fix):(\d+)$")
 EFFORT_RANK = ("minimal", "low", "medium", "high", "xhigh", "max")
@@ -65,6 +68,33 @@ def after_h_of(v: Any) -> float:
     if not h >= 0:
         raise ValueError(f"provider_failover_after_h needs a number of hours >= 0 (0: off), not {v!r}")
     return h
+
+
+def logout_s(cfg: dict) -> float:
+    """coordinator.provider_logout_failover_s: how long a provider is logged out before its work moves."""
+    try:
+        v = (cfg.get("coordinator") or {}).get("provider_logout_failover_s", LOGOUT_S)
+        return max(0.0, float(LOGOUT_S if v is None else v))
+    except (TypeError, ValueError):
+        return LOGOUT_S
+
+
+def logout_s_of(v: Any) -> float:
+    """coordinator.provider_logout_failover_s as config_set takes it: seconds >= 0 (0: at once)."""
+    try:
+        s = float(v)
+    except (TypeError, ValueError):
+        s = -1.0
+    if not s >= 0:
+        raise ValueError(f"provider_logout_failover_s needs a number of seconds >= 0 (0: at once), not {v!r}")
+    return s
+
+
+def out_long(db: DB, cfg: dict, provider: str, now: float) -> bool:
+    """Whether `provider` has been logged out (its auth breaker open) for logout_s or longer."""
+    from . import alerts
+    rec = alerts.breaker(db, provider)
+    return bool(rec) and now - float(rec.get("opened") or now) >= logout_s(cfg)
 
 
 def to_of(v: Any, providers: dict | None) -> list[str]:
