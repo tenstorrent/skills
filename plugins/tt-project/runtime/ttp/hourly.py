@@ -15,6 +15,14 @@ Rows, in order:
 4. Queue: open tasks, push queue entries and the oldest approval's age.
 5. Approved-to-landed median today (trainstats) and tasks created in 24 h.
 
+No ETA row: the table repeats no ETA, so none can go stale in it; ETAs stay in the coordinator's STATE (eta.py).
+
+Corrections at the source (mark_corrected): when a user correction is recorded (a memory entry starting
+'Correction (user msg #N)', whose key claim correction.remember keeps in CLAIMS_KEY), each table posted in
+KEEP_S whose row restates the corrected value (correction.contradicts) is marked corrected in STATE_FILE
+("corrected": {message id: {msg, entry, wrong, row}}), and the next table follows at once, rows recomputed, with
+one line per new mark naming the post, the wrong value and the correction.
+
 The load sampler (sample) appends one reading to SAMPLES at most every SAMPLE_S; the overseer's pass and the
 daemon both call it, so the history keeps growing while either one runs, and it never holds two readings
 closer than SAMPLE_S."""
@@ -22,6 +30,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from pathlib import Path
 
@@ -32,6 +41,7 @@ SAMPLES = "host-load.jsonl"     # in the state folder: {"ts", "load1", "cores"} 
 STATE_FILE = "hourly-status.json"
 SAMPLE_S = 240.0
 POST_S = 3600.0
+CHECK_S = 600.0    # a due table whose rows had not changed is rebuilt at most this often
 KEEP_S = 2 * 86400.0
 REF = "hourly_status"
 OPEN = ("queued", "running", "blocked", "waiting", "pushing")
@@ -115,10 +125,10 @@ def spill_use(db, runs: Path, since: float) -> dict[str, list[int]]:
             n[0] += 1
             n[1] += bool(rec.get("passed"))
         for e in str(rec.get("spill_off") or "").split(","):
-            if (host := e.partition(":")[0]) and e != "1":
+            if (host := e.rpartition(":")[0] if ":" in e else e) and e != "1":
                 n = out.setdefault(host, [0, 0, 0])
                 n[0] += 1
-                n[2] += 1
+                n[2] += not rec.get("spilled_to")   # the rerun ran here, not on another spill host
     return out
 
 
@@ -212,23 +222,69 @@ def due(p, now: float | None = None) -> tuple[str, str] | None:
     except (OSError, ValueError):
         st = {}
     if not st:   # the first pass only sets the baseline: the first table follows an hour or a milestone later
-        durable_write(p.state / STATE_FILE, json.dumps({"at": now, "rows": rows(p, now), "why": "baseline"}))
+        durable_write(p.state / STATE_FILE, json.dumps({"at": now, "rows": rows(p, now), "why": "baseline",
+                                                        "corr_seen": now}))
         return None
+    fixed = mark_corrected(p, st, now)
     last = float(st.get("at") or 0)
-    why = "hourly" if now - last >= POST_S else milestone(p, last)
-    if not why:
+    why = "a correction" if fixed else "hourly" if now - last >= POST_S else milestone(p, last)
+    if not why or (not fixed and 0 <= now - float(st.get("checked") or -1e18) < CHECK_S):
         return None
     rs = rows(p, now)
-    if _key(rs) == _key(st.get("rows") or []):
+    if not fixed and _key(rs) == _key(st.get("rows") or []):
+        durable_write(p.state / STATE_FILE, json.dumps({**st, "checked": now}))
         return None
+    notes = [f"Corrected: the status posted at {timefmt.short(m['ts'], timefmt.home(p), now)} said '{m['wrong']}' in "
+             f"its {m['row']} row; user msg #{m['msg']} corrected it, and the rows above are recomputed"
+             for m in st.get("new_marks") or ()]
     return "\n".join([f"Status at {timefmt.short(now, timefmt.home(p), now)}" + ("" if why == "hourly" else f" ({why})"),
-                      *rs]), why
+                      *rs, *notes]), why
+
+
+def mark_corrected(p, st: dict, now: float) -> bool:
+    """Mark each table posted in KEEP_S that a correction recorded since st['corr_seen'] contradicts (module doc);
+    True when a new mark was made. Writes STATE_FILE and keeps the new marks in st['new_marks'] for the next post."""
+    from .correction import CLAIMS_KEY, contradicts
+    seen = float(st.get("corr_seen") or st.get("at") or now)
+    new = [(n, c) for n, c in ((p.db.kv(CLAIMS_KEY, {}) or {}).items()) if float(c.get("ts") or 0) > seen]
+    if not new:
+        return bool(st.get("new_marks"))
+    marks, fresh = dict(st.get("corrected") or {}), list(st.get("new_marks") or ())
+    posts = p.db.q("SELECT id, ts, text FROM messages WHERE ref=? AND direction='out' AND ts>=? ORDER BY id",
+                   (REF, now - KEEP_S))
+    for name, c in new:
+        for m in posts:
+            if str(m["id"]) in marks:
+                continue
+            for line in str(m["text"]).split("\n")[1:]:
+                if line.startswith("Corrected:") or not (hit := contradicts(c, line)):
+                    continue
+                mark = {"msg": c.get("msg"), "entry": name, "wrong": hit, "row": line.partition(":")[0],
+                        "ts": float(m["ts"])}
+                marks[str(m["id"])] = mark
+                fresh.append(mark)
+                break
+    st.update({"corr_seen": max(float(c.get("ts") or 0) for _, c in new), "corrected": marks, "new_marks": fresh})
+    durable_write(p.state / STATE_FILE, json.dumps(st))
+    return bool(fresh)
+
+
+def corrected(p) -> dict:
+    """{posted message id: its correction mark} (mark_corrected)."""
+    try:
+        return dict(json.loads((p.state / STATE_FILE).read_text()).get("corrected") or {})
+    except (OSError, ValueError, AttributeError):
+        return {}
+
+
+_MOVING = re.compile(r", oldest approval [^,]* old|; \d+ tasks created in 24 h")
 
 
 def _key(rs: list[str]) -> list[str]:
-    """What counts as a change: every row, the project host's moving load reading aside."""
-    return [f"{r.partition(': load')[0]}.{r.partition('. Spill')[2]}" if r.startswith("Project host") else r
-            for r in rs]
+    """What counts as a change: every row, the values that move by the minute aside (the project host's load
+    reading, the oldest approval's age, the tasks created in 24 h)."""
+    return [f"{r.partition(': load')[0]}.{r.partition('. Spill')[2]}" if r.startswith("Project host")
+            else _MOVING.sub("", r) for r in rs]
 
 
 def post(p, now: float | None = None) -> int | None:
@@ -239,6 +295,13 @@ def post(p, now: float | None = None) -> int | None:
     if not (chat := main_chat(p.db)):
         return None
     mid = p.db.post("out", got[0], chat=chat, kind="info", severity="low", ref=REF)
-    durable_write(p.state / STATE_FILE, json.dumps({"at": now, "rows": got[0].split("\n")[1:], "id": mid,
-                                                    "why": got[1]}))
+    try:
+        st = json.loads((p.state / STATE_FILE).read_text())
+    except (OSError, ValueError):
+        st = {}
+    st.pop("new_marks", None)
+    st.pop("checked", None)
+    durable_write(p.state / STATE_FILE, json.dumps({**st, "at": now, "rows": [r for r in got[0].split("\n")[1:]
+                                                                              if not r.startswith("Corrected:")],
+                                                    "id": mid, "why": got[1]}))
     return mid
