@@ -155,8 +155,10 @@ def parse(data: dict) -> dict:
         hold = b.get("hold_check") or ""
         if hold and (not isinstance(hold, str) or not re.fullmatch(r"/[A-Za-z0-9_./-]+", hold)):
             raise BadConfig(f"box {box}: hold_check is an absolute path on the box (letters, digits, '_', '.', '-', '/')")
+        if not isinstance(b.get("gh_pull", False), bool):
+            raise BadConfig(f"box {box}: gh_pull is true or false (this computer runs the box's queued gh calls)")
         out["boxes"][box] = {"login": {"agent": login.get("agent", ""), "identity": login.get("identity", "")},
-                             "agents": parsed, "hold_check": hold}
+                             "agents": parsed, "hold_check": hold, "gh_pull": b.get("gh_pull", False)}
     if data.get("cert") is not None:
         from . import bridge_cert
         out["cert"] = bridge_cert.parse(data["cert"], out)
@@ -341,6 +343,9 @@ def strip(text: str) -> str:
 
 # --- this computer's user services -------------------------------------------------------------
 
+GH_PULL = "gh-pull"   # the service running a box's queued gh calls here (`ttp bridge gh-pull --loop`)
+
+
 def label(box: str, agent: str) -> str:
     return f"com.tt-project.bridge.{box}.{agent}"
 
@@ -470,6 +475,9 @@ def setup(cfg: dict, boxes: list[str], platform: str | None = None) -> list[str]
             if argv[1:2] == [str(RELAY)]:
                 install_relay()
             out.append(f"{box} {an}: {start(box, an, argv, platform)}")
+        if cfg["boxes"][box].get("gh_pull"):   # its delivery.gh_route "workstation" calls (ghqueue)
+            from .ghqueue import service_argv as gh_argv
+            out.append(f"{box} {GH_PULL}: {start(box, GH_PULL, gh_argv(box), platform)}")
     return out
 
 

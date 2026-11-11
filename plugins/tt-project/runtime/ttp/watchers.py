@@ -195,7 +195,7 @@ def _spawn(args: list[str], timeout: float, cwd: str, run=None):
         via = ghroute.routed(args, cwd=cwd)   # no gh login here: on delivery.gh_route
         res = boundedchild.run(via or ["gh", *args], timeout, cwd=cwd, on_start=started)
         if via and not res.timed_out:
-            ghroute.mark(res.rc != ghroute.SSH_RC)
+            ghroute.seen(res.rc)
         failed = _AUTH.get()
         if failed is not None and not res.timed_out and ghauth.auth_failed(res.rc, res.err):
             err = res.err.decode(errors="replace") if isinstance(res.err, bytes) else str(res.err or "")

@@ -1285,7 +1285,7 @@ def _bridge_argv(argv: list[str]) -> list[str]:
         return argv
     opts, pos, it = [], [], iter(argv[1:])
     for w in it:
-        if w == "--config":
+        if w in ("--config", "--every"):
             opts += [w, *(v for v in [next(it, None)] if v is not None)]
         elif w.startswith("-") and w != "-":
             opts.append(w)
@@ -2341,9 +2341,12 @@ def cmd_bridge(a) -> None:
         except (bridge.BadConfig, RuntimeError) as e:
             die(str(e))
         return
+    if a.action == "gh-pull":
+        _bridge_gh_pull(a, cfg, boxes if a.boxes else [b for b in boxes if cfg["boxes"][b].get("gh_pull")])
+        return
     if a.action == "stop":
         for box in boxes:
-            for an in cfg["boxes"][box]["agents"]:
+            for an in [*cfg["boxes"][box]["agents"], *([bridge.GH_PULL] if cfg["boxes"][box].get("gh_pull") else [])]:
                 print(f"{box} {an}: {bridge.stop(box, an, remove=a.remove)}")
             if a.remove:
                 print(f"{box}: {bridge.remove_block(box)}")
@@ -2351,6 +2354,36 @@ def cmd_bridge(a) -> None:
     lines, rc = bridge.status(cfg, boxes, deep=a.action == "doctor")
     print("\n".join(lines))
     sys.exit(rc)
+
+
+def _bridge_gh_pull(a, cfg: dict, boxes: list[str]) -> None:
+    """`ttp bridge gh-pull [boxes] [--loop]`: run the boxes' queued gh calls with this computer's gh."""
+    from . import ghqueue
+    if not boxes:
+        die("no box to pull: name one, or set \"gh_pull\": true on it in the bridge config")
+    while True:
+        for box in boxes:
+            print(ghqueue.pull(box), flush=True)
+        if not a.loop:
+            return
+        time.sleep(max(5, a.every))
+
+
+def cmd_gh_queue(a) -> None:
+    """`ttp gh-queue run|take|put` on the box: the workstation's gh queue (ghqueue)."""
+    from . import ghqueue
+    if a.action == "run":
+        args = a.args[1:] if a.args[:1] == ["--"] else a.args
+        sys.exit(ghqueue.enqueue(args, None if sys.stdin is None or sys.stdin.isatty() else sys.stdin.buffer.read(),
+                                 os.getcwd()))
+    if a.action == "take":
+        print(json.dumps(ghqueue.take()))
+        return
+    try:
+        results = json.loads(sys.stdin.read() or "[]")
+    except ValueError:
+        die("ttp gh-queue put: the answers on stdin are not JSON")
+    print(f"stored {ghqueue.put(results)} answer(s)")
 
 
 def _bridge_cert(a, cfg: dict) -> None:
@@ -13424,12 +13457,13 @@ def main(argv: list[str] | None = None) -> None:
 
     s = sub.add_parser("bridge", help="ssh access bridge: lab boxes reach hosts through this computer's ssh agents, "
                        "no key stored on a box, failing closed while this computer sleeps (config ~/.config/tt-project/bridge.json)")
-    s.add_argument("action", choices=["setup", "status", "doctor", "stop", "show", "cert"],
+    s.add_argument("action", choices=["setup", "status", "doctor", "stop", "show", "cert", "gh-pull"],
                    help="setup: write each box's ssh config block and start the kept sessions; status: one line per box "
                    "and agent (exit 1 when one is down); doctor: status and what to do; stop: stop the sessions "
                    "(the box's logins through them then fail); show: print the block and session commands, change nothing; "
                    "cert status|renew|remove|trust --print|schedule [boxes]: the offline mode's short-lived certificates "
-                   "(off unless the config has a \"cert\" section)")
+                   "(off unless the config has a \"cert\" section); gh-pull: run the boxes' gh calls queued by "
+                   "delivery.gh_route \"workstation\" with this computer's gh (default: the boxes with \"gh_pull\": true)")
     s.add_argument("boxes", nargs="*", help="the boxes (their ssh aliases; default: all in the config); "
                    "with cert, the cert action first")
     s.add_argument("--print", action="store_true", help="with cert trust: print the authorized_keys line")
@@ -13437,7 +13471,16 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--force", action="store_true", help="with cert renew: sign again even with more than half the validity left")
     s.add_argument("--config", help="the bridge config (default ~/.config/tt-project/bridge.json)")
     s.add_argument("--remove", action="store_true", help="with stop: also remove the service files and the box's block")
+    s.add_argument("--loop", action="store_true", help="with gh-pull: keep pulling (the gh_pull service runs this)")
+    s.add_argument("--every", type=int, default=30, help="with gh-pull --loop: seconds between rounds (default 30)")
     s.set_defaults(fn=cmd_bridge)
+
+    s = sub.add_parser("gh-queue", help="the gh calls this host queues for the user's workstation "
+                       "(delivery.gh_route \"workstation\"; the workstation's `ttp bridge gh-pull` takes and answers them)")
+    s.add_argument("action", choices=["run", "take", "put"], help="run -- <gh args>: the answer if in, else queue it "
+                   "(exit 75); take: claim queued calls (JSON); put: store answers (JSON on stdin)")
+    s.add_argument("args", nargs=argparse.REMAINDER)
+    s.set_defaults(fn=cmd_gh_queue)
 
     s = sub.add_parser("web", help="web app link (for a remote project: tunnel command and link)")
     s.add_argument("name", help="the project")

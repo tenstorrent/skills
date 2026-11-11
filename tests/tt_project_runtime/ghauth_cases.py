@@ -387,3 +387,127 @@ def test_https_push_without_login_goes_over_the_ssh_form_and_its_failure_names_t
     hint = ghroute.push_hint("git@github.com: Permission denied (publickey).\nfatal: Could not read from remote")
     assert "delivery.gh_route" in hint and "waits" in hint and "log in" not in hint.lower().replace("nobody logs in", "")
     assert ghroute.push_hint("! [rejected] main -> main (non-fast-forward)") == ""
+
+
+def _workstation(env, monkeypatch):
+    """delivery.gh_route "workstation": this host logged out (stub gh, scratch HOME, TTP_HOME), a
+    workstation stub gh echoing its argv and stdin, and the bridge's ssh login replaced by in-process
+    calls to this host's queue (take, put); returns (cfg, checkout, workstation gh, its calls file)."""
+    import io
+    import json
+    from ttp import bridge, ghqueue
+    _ssh, here_calls, repo = _no_login_here(env, monkeypatch)
+    monkeypatch.setenv("TTP_HOME", str(env["tmp"] / "ttphome"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(env["tmp"] / "ghhome" / "xdg"))
+    monkeypatch.setenv("TTP_TASK", "42")
+    ws = env["tmp"] / "workstation"
+    ws.mkdir()
+    ws_calls = ws / "calls"
+    gh = ws / "gh"
+    gh.write_text("#!/bin/sh\n"
+                  f'printf "%s\\n" "$*" >> "{ws_calls}"\n'
+                  'echo "ws: $*"\n'
+                  'cat\n')
+    gh.chmod(0o755)
+
+    def box(b, script, timeout=40, inp=None):
+        assert b == "lab-box" and script.startswith(ghqueue.REMOTE)
+        if script.endswith(" take"):
+            return subprocess.CompletedProcess([], 0, json.dumps(ghqueue.take()), "")
+        assert script.endswith(" put")
+        return subprocess.CompletedProcess([], 0, str(ghqueue.put(json.loads(inp))), "")
+    monkeypatch.setattr(bridge, "_box", box)
+    monkeypatch.setattr("sys.stdin", io.StringIO(""))
+    return {"delivery": {"gh_route": "workstation"}}, repo, str(gh), ws_calls
+
+
+def test_gh_route_workstation_queues_once_the_workstation_pulls_runs_and_the_retry_resumes(env, monkeypatch, capfd):
+    """No gh login here and delivery.gh_route "workstation": a gh call is queued once (exit 75) with its
+    argv, repo and task; the workstation pulls the queue, runs it with its own gh and puts the answer
+    back; the same call again gets that answer. A read is answered once, a write's answer is kept so a
+    retry never posts twice, and nothing runs on this host's logged-out gh."""
+    from ttp import ghqueue, ghroute
+    cfg, repo, gh, ws_calls = _workstation(env, monkeypatch)
+    assert ghroute.problem("workstation") == ""
+    view = ["pr", "view", "3", "--json", "state"]
+    assert ghroute.run("gh", view, cfg=cfg, cwd=str(repo)) == ghroute.HELD_RC
+    assert ghroute.run("gh", view, cfg=cfg, cwd=str(repo)) == ghroute.HELD_RC   # dedupe: still one call queued
+    queued = list(ghqueue.outbox().glob("*.q"))
+    assert len(queued) == 1, queued
+    q = json.loads(queued[0].read_text())
+    assert q["argv"] == [*view, "-R", "acme/widgets"] and q["repo"] == "acme/widgets" and q["task"] == "42"
+    assert queued[0].stat().st_mode & 0o777 == 0o600
+    capfd.readouterr()
+    assert ghqueue.pull("lab-box", gh) == "lab-box: answered 1 gh call(s)"
+    assert ws_calls.read_text().splitlines() == ["pr view 3 --json state -R acme/widgets"]
+    assert ghroute.run("gh", view, cfg=cfg, cwd=str(repo)) == 0
+    assert capfd.readouterr().out == "ws: pr view 3 --json state -R acme/widgets\n"
+    assert ghroute.run("gh", view, cfg=cfg, cwd=str(repo)) == ghroute.HELD_RC   # a read is answered once
+
+    body = f"Looks good.\n\n{ghqueue.aitag.DEFAULT}"
+    post = ["pr", "comment", "3", "--body", body]
+    assert ghroute.run("gh", post, cfg=cfg, cwd=str(repo)) == ghroute.HELD_RC
+    assert ghqueue.pull("lab-box", gh) == "lab-box: answered 2 gh call(s)"   # the read asked again, and the post
+    for _ in range(2):   # a retried write gets the stored answer and never posts again
+        assert ghroute.run("gh", post, cfg=cfg, cwd=str(repo)) == 0
+    assert ghqueue.pull("lab-box", gh) == "lab-box: no gh calls queued"
+    assert sum(ln.startswith("pr comment") for ln in ws_calls.read_text().splitlines()) == 1
+    assert not any(c.startswith(("pr ", "api", "issue")) for c in _gh_calls(env["tmp"] / "ghstub" / "calls"))
+    # the subprocess path the watchers and CI waits take (ghroute.routed)
+    argv = ghroute.routed(["pr", "checks", "3"], cfg, str(repo))
+    assert argv[-5:] == ["run", "--", "pr", "checks", "3"] and "gh-queue" in argv
+    assert ghroute.route({"delivery": {"gh_route": "gh-box"}}) == "gh-box"   # the ssh-alias route is unchanged
+
+
+def test_gh_workstation_runs_only_its_allowlist_and_never_resends_a_lost_write(env, monkeypatch):
+    """The workstation checks the allowlist itself, on whatever the box sends: api GET reads, pr/issue
+    view, list and checks, comments and `pr create --draft`, each post ending with the AI tag; never
+    `pr ready`, a merge, an api write in any spelling, a bundled short option or a shell string. A
+    write taken but never answered is not sent again."""
+    import base64
+    import time
+    from ttp import ghqueue
+    cfg, repo, gh, ws_calls = _workstation(env, monkeypatch)
+    tag = ghqueue.aitag.DEFAULT
+    R = "repos/acme/widgets/"
+    for ok in (["api", R + "pulls", "--jq", ".[0]"], ["api", "-X", "GET", R + "issues", "-f", "state=open"],
+               ["pr", "list", "-R", "acme/widgets"], ["issue", "view", "7"], ["pr", "checks", "3"],
+               ["issue", "comment", "7", "--body", f"Thanks.\n{tag}"], ["pr", "create", "--draft", "--body", f"x\n{tag}"]):
+        assert ghqueue.allowed(ok) == "", ok
+    assert ghqueue.allowed(["pr", "comment", "3", "--body-file", "-"], f"Done.\n{tag}\n".encode()) == ""
+    for bad in (["pr", "ready", "3"], ["pr", "merge", "3", "--squash"], ["api", "-XPOST", R + "issues"],
+                ["api", "--field=title=x", R + "issues"], ["api", R + "issues", "-f", "title=x"],
+                ["api", "--method=PATCH", R + "pulls/3"], ["api", "-X", "DELETE", R + "issues/1"],
+                ["api", "graphql", "-f", "query=x"], ["api", "--input", "-", R + "issues"],
+                ["api", "-H", "X-HTTP-Method-Override: POST", R + "issues"], ["pr", "view", "3", "-cw"],
+                ["pr", "view", "3", "--web"], ["pr", "create", "--body", f"x\n{tag}"],
+                ["pr", "comment", "3", "--body", "no tag"], ["pr", "comment", "3", "--body-file", "/etc/passwd"],
+                ["repo", "delete", "acme/widgets"], ["sh", "-c", "gh pr merge 3"], "pr view 3", []):
+        assert ghqueue.allowed(bad), bad
+    # the box side refuses too: nothing queued
+    assert ghqueue.enqueue(["pr", "merge", "3"], cwd=str(repo)) == 1
+    assert not list(ghqueue.outbox().glob("*.q"))
+    # a box that queues a refused call anyway (written straight into the outbox) gets a refusal back
+    d = ghqueue.outbox()
+    for key, argv in (("a" * 32, ["pr", "ready", "3"]), ("b" * 32, ["api", "-XPOST", R + "issues"])):
+        ghqueue._write(d / f"{key}.q", {"key": key, "argv": argv, "write": True, "stdin": "", "queued_at": time.time()})
+    assert ghqueue.pull("lab-box", gh) == "lab-box: answered 2 gh call(s), 2 refused"
+    assert not ws_calls.exists(), "the workstation ran a refused call"
+    assert all(json.loads((d / f"{k * 32}.done").read_text())["stderr"].startswith("refused on the workstation")
+               for k in "ab")
+    # a write taken and never answered is answered "may have posted", never handed out again
+    key = "c" * 32
+    ghqueue._write(d / f"{key}.q", {"key": key, "argv": ["issue", "comment", "7", "--body", f"x\n{tag}"],
+                                     "write": True, "stdin": base64.b64encode(b"").decode(), "queued_at": time.time()})
+    assert [e["key"] for e in ghqueue.take()] == [key]
+    assert ghqueue.take(now=time.time() + ghqueue.CLAIM_S + 1) == []
+    assert "it was not sent again" in json.loads((d / f"{key}.done").read_text())["stderr"]
+
+
+def test_bridge_gh_pull_is_a_per_box_switch():
+    from ttp import bridge
+    agents = {"a": {"agent": "env", "direct": [{"name": "h"}]}}
+    assert bridge.parse({"boxes": {"b": {"agents": agents, "gh_pull": True}}})["boxes"]["b"]["gh_pull"] is True
+    assert bridge.parse({"boxes": {"b": {"agents": agents}}})["boxes"]["b"]["gh_pull"] is False
+    with pytest.raises(bridge.BadConfig):
+        bridge.parse({"boxes": {"b": {"agents": agents, "gh_pull": "yes"}}})

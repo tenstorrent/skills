@@ -85,6 +85,9 @@ description: "Start, connect to, and talk with a long-running tt-project: a loca
 - On the user's own workstation, the desktop notifier is asked once: `ttp consent notifier` says
   `ask`: ask, record `ttp consent notifier yes|no`, on a yes run `ttp notifier install`. Never re-ask.
 - Details and optional Slack: `notifications.md`.
+- gh logged in only on the user's workstation: the workstation pulls and runs the queue, never the
+  other way round. Set the project's `delivery.gh_route` to `workstation` and the box's `"gh_pull": true`
+  in the workstation's `ttp bridge` config (`operate.md`). Never log gh in on a lab or remote host.
 
 ## Operating
 

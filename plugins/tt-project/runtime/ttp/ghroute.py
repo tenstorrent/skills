@@ -29,6 +29,7 @@ import urllib.request
 KEY = "gh_route"         # delivery.gh_route
 SETTING = f"delivery.{KEY}"
 STATE = "gh-route.json"   # the route's last answer, host-wide, under the tt-project home
+WORKSTATION = "workstation"   # the value whose calls the user's workstation pulls (ghqueue)
 HELD_RC = 75             # a write held until the route is back: retry later
 SSH_RC = 255             # ssh's own failure: the route is down
 API = "https://api.github.com"
@@ -56,7 +57,8 @@ def problem(v) -> str:
     if v in (None, ""):
         return ""
     if not isinstance(v, str) or not HOST_RE.fullmatch(v.strip()) or v.strip() == "local":
-        return f"{v!r}: {SETTING} is the ssh alias of a machine where gh is logged in"
+        return (f"{v!r}: {SETTING} is the ssh alias of a machine where gh is logged in, or "
+                f"\"{WORKSTATION}\" (the user's workstation pulls the calls: `ttp bridge gh-pull`)")
     return ""
 
 
@@ -114,6 +116,9 @@ def routed(args: list[str], cfg: dict | None = None, cwd: str | None = None) -> 
     alias = route(cfg, cwd)
     if not alias or local_ok():
         return None
+    if alias == WORKSTATION:   # queued for the workstation to pull (ghqueue); never dialled from here
+        from .ghqueue import queue_argv
+        return queue_argv(args)
     remote = shlex.join(["gh", *_with_repo(args, repo_of(cwd))])
     # A non-login shell there may lack the usual install folders on PATH.
     return ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", alias, "--",
@@ -217,6 +222,9 @@ def run(real: str, args: list[str], input: bytes | None = None, cfg: dict | None
     """`gh args` with no login here, its output on ours: on the route; route unset or down, a write is
     held (HELD_RC), a public `gh api` read answered without a login, any other read run here as before."""
     import sys
+    if route(cfg, cwd) == WORKSTATION and not local_ok():
+        from .ghqueue import enqueue
+        return enqueue(args, input, cwd)
     via = routed(args, cfg, cwd)
     if via:
         sent, data, why = local_inputs(args, input, cwd)
@@ -246,6 +254,13 @@ def mark(ok: bool, home=None) -> None:
         write_json(f, {"ok": ok, "at": time.time()}, 0o600)
     except OSError:
         pass
+
+
+def seen(rc: int) -> None:
+    """A routed call's exit: ssh's own failure marks the route down; one still queued for the workstation
+    (HELD_RC) says nothing yet (its answer marks it, ghqueue.enqueue)."""
+    if rc != HELD_RC:
+        mark(rc != SSH_RC)
 
 
 def works(home=None, within_s: float = 3600) -> bool:
@@ -296,7 +311,7 @@ def _https_login(repo: str | None) -> bool:
 
 
 def value_of(v) -> str:
-    """A `delivery.gh_route` value: an ssh alias, or "" for none."""
+    """A `delivery.gh_route` value: an ssh alias, "workstation", or "" for none."""
     v = "" if v is None else str(v).strip()
     if v and (why := problem(v)):
         raise ValueError(why)
