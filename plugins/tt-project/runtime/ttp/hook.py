@@ -264,10 +264,64 @@ def mark_untrusted(payload: dict, run_dir: str) -> None:
         pass
 
 
+SSH_ARG_OPTS = set("bBcDEeFIiJLlmOopQRSWw")   # ssh options that take a value
+
+
+def ssh_targets(cmd: str) -> list[str]:
+    """The hosts an ssh, scp or rsync command in this shell line runs on or copies to or from
+    (user@ and ssh:// stripped; local paths and option values skipped)."""
+    import shlex
+    try:
+        lex = shlex.shlex(cmd, posix=True, punctuation_chars=";&|()")
+        lex.whitespace_split = True
+        words = list(lex)
+    except ValueError:
+        return []
+    found, i = [], 0
+    while i < len(words):
+        prog = posixpath.basename(words[i])
+        if prog not in ("ssh", "scp", "rsync") or (i and words[i - 1] in ("echo", "printf", "grep", "which", "man", "type")):
+            i += 1
+            continue
+        j = i + 1
+        while j < len(words) and words[j][:1] not in ";&|()":
+            w = words[j]
+            if w.startswith("-"):
+                if prog == "ssh" and len(w) == 2 and w[1] in SSH_ARG_OPTS:
+                    j += 1
+            elif prog == "ssh":
+                found.append(w)
+                break
+            elif ":" in w and not w.startswith("/"):
+                found.append(w.split(":", 1)[0])
+            j += 1
+        i = j
+    out = []
+    for h in found:
+        h = h.split("://", 1)[-1].rsplit("@", 1)[-1].split(":", 1)[0].split("/", 1)[0].strip("[]")
+        if h and h not in out and re.fullmatch(r"[\w.-]+", h):
+            out.append(h)
+    return out
+
+
+def record_ssh(payload: dict, run_dir: str) -> None:
+    """A Bash call that ran ssh, scp or rsync on a host: the host is a resource the run used
+    (onhost), so a failure there counts against it and is never filed as a local fault."""
+    if payload.get("tool_name") != "Bash":
+        return
+    try:
+        if hosts := ssh_targets(str((payload.get("tool_input") or {}).get("command") or "")):
+            from . import onhost
+            onhost.record(run_dir, hosts, "ssh")
+    except Exception:
+        pass
+
+
 def post_tool_use(payload: dict) -> tuple[dict | None, Callable[[], None] | None]:
     run_dir = os.environ.get("TTP_RUN_DIR")
     if run_dir:
         mark_untrusted(payload, run_dir)
+        record_ssh(payload, run_dir)
     if not run_dir or payload.get("agent_id"):
         return None, None
     parts, marks = [], []

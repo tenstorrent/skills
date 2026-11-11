@@ -3,13 +3,13 @@
 """Failures that are the run's own, not its resource's. Model-free.
 
 A run failed or blocked by one of these says nothing about the machine or device its task names:
-- `guard`: a guard refused one of its commands (hook.REFUSALS_FILE: worker-role, provenance, device and
-  other refusals);
+- `guard`: a worker-role, provenance or project local guard refused one of its commands (hook.REFUSALS_FILE
+  kinds in GUARD_KINDS; a full-suite, no-device or user-site refusal is no local fault);
 - `credential`: its hand-off was failed for a credential file change (credwatch, result `cred_changed`);
 - `check_bootstrap`: its checks stopped at a runner or env fault (envfault.MARKER) or a lost test worker
   (workerloss.MARKER).
 machines.stats counts such a failure apart, as local, for every resource the run never used (onhost.FILE:
-no `ttp lock` grant, no `exclusive:` hold, no `ttp detach --remote` there): resource trouble and its migrate
+no `ttp lock` grant, no `exclusive:` hold, no `ttp detach --remote`, no ssh, scp or rsync there): resource trouble and its migrate
 or pause advice count only failures of commands that ran on the resource. Guards stay enforced; only the
 count moves."""
 from __future__ import annotations
@@ -18,6 +18,26 @@ import json
 from pathlib import Path
 
 KINDS = {"guard": "guard refusals", "credential": "credential alerts", "check_bootstrap": "check bootstrap faults"}
+GUARD_KINDS = ("worker_role", "provenance", "local")   # refusal kinds (and `local:<guard>`) that are guard faults
+
+
+def guard_kind(kind) -> bool:
+    k = str(kind or "")
+    return k in GUARD_KINDS or k.startswith("local:")
+
+
+def _guard_refused(path: Path) -> bool:
+    try:
+        lines = path.read_text(errors="replace").splitlines()
+    except OSError:
+        return False
+    for line in lines:
+        try:
+            if guard_kind((json.loads(line) or {}).get("kind")):
+                return True
+        except (ValueError, AttributeError):
+            continue
+    return False
 
 
 def kinds(run_dir, result=None) -> list[str]:
@@ -30,11 +50,8 @@ def kinds(run_dir, result=None) -> list[str]:
     if isinstance(result, dict) and result.get("cred_changed"):
         found.add("credential")
     if d is not None:
-        try:
-            if (d / REFUSALS_FILE).stat().st_size:
-                found.add("guard")
-        except OSError:
-            pass
+        if _guard_refused(d / REFUSALS_FILE):
+            found.add("guard")
         if (d / ENV).exists() or (d / LOSS).exists():
             found.add("check_bootstrap")
     return [k for k in KINDS if k in found]
@@ -57,6 +74,7 @@ def tag(run_dir, result, names, cfg: dict | None = None) -> dict:
     if not found:
         return {}
     held = used(run_dir)
+    held |= {canonical(cfg or {}, h) for h in held}
     return {"local_fault": found, "used": sorted(n for n in names if n in held or canonical(cfg or {}, n) in held)}
 
 

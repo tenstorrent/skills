@@ -80,3 +80,39 @@ def test_failures_of_commands_that_ran_on_the_resource_still_count_and_raise_tro
     Daemon(p.base).check_resource_trouble(every_s=0)
     (row,) = p.db.q("SELECT text FROM events WHERE kind='resource_trouble'")
     assert "2 hand-offs failed or blocked" in row["text"] and "local faults" not in row["text"], row["text"]
+
+
+def test_ssh_to_the_resource_counts_its_failures_and_only_role_or_provenance_refusals_are_local(env, monkeypatch):
+    """A run that ran a command on the resource over plain ssh, scp or rsync used it (the Bash hook records
+    the destination in onhost), so its failure counts against the resource even beside a refusal. Only
+    worker-role, provenance and project local guard refusals are guard faults: a full-suite, no-device or
+    user-site refusal alone tags nothing local."""
+    p = make(env)
+    from ttp import hook, localfault, machines as mm, onhost
+    from ttp.hook import REFUSALS_FILE
+    assert hook.ssh_targets("cd x && timeout 9 ssh -o BatchMode=yes -p 22 me@box-a 'make' | tail") == ["box-a"]
+    assert hook.ssh_targets("scp f u@box-b:/tmp/ && rsync -az ./ box-c:d/") == ["box-b", "box-c"]
+    assert hook.ssh_targets("echo ssh box-a; ls host:dir") == []
+    mm.add("box-a", tags="cpu")
+    tid = p.db.add_task("soak", "s", kind="work", tier="light", origin="user", labels=["resource:box-a"])
+    run_dir = p.base / "lf-ssh"
+    run_dir.mkdir()
+    monkeypatch.setenv("TTP_RUN_DIR", str(run_dir))
+    hook.post_tool_use({"tool_name": "Bash", "tool_input": {"command": "ssh box-a 'pytest -x'"}})
+    assert localfault.used(run_dir) == {"box-a"}
+    assert json.loads((run_dir / onhost.FILE).read_text())["box-a"]["kind"] == "ssh"
+    full = (REFUSALS_FILE, json.dumps({"ts": 1, "kind": "full_suite", "command": "pytest"}) + "\n")
+    prov = (REFUSALS_FILE, json.dumps({"ts": 1, "kind": "provenance", "command": "edit"}) + "\n")
+    # ssh to the resource and a full-suite refusal: a plain failure, counted against box-a.
+    assert _lf_handoff(p, tid, marker=full, used=["box-a"])["data"] is None
+    # Only a full-suite, no-device or user-site refusal, the resource unused: no local fault either.
+    for k in ("full_suite", "no_device", "user_site"):
+        (run_dir / REFUSALS_FILE).write_text(json.dumps({"kind": k}) + "\n")
+        assert localfault.kinds(run_dir) == [], k
+    # A provenance refusal on a run that ssh'd to the resource: tagged, but the resource was used.
+    assert json.loads(_lf_handoff(p, tid, marker=prov, used=["box-a"])["data"]) == \
+        {"local_fault": ["guard"], "used": ["box-a"]}
+    # A provenance refusal only, the resource never used: counted apart.
+    assert json.loads(_lf_handoff(p, tid, "blocked", marker=prov)["data"]) == {"local_fault": ["guard"], "used": []}
+    s = mm.stats(p.db)["box-a"]
+    assert s["failures"] == 2 and s["local"] == 1, s
