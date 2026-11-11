@@ -16009,13 +16009,18 @@ def test_a_push_batch_reruns_each_failing_test_not_yet_judged_at_that_head(env, 
 def test_a_one_entry_push_batch_blames_its_new_failing_test_without_a_full_tip_check(env, monkeypatch):
     """The tip fails _FLAKY_ID on its own and the one entry breaks _NEW_ID. The judge saved _FLAKY_ID
     failing and _NEW_ID passing on the tip: only the new test decides, so entry 1 is blamed with no
-    full check of the tip alone (before, the partly passing saved results sent it to a full tip run)."""
+    full check of the tip alone (before, the partly passing saved results sent it to a full tip run).
+    The failing run's wall time is kept for the landing check time (gatetime), as a passing one's is."""
+    from ttp import gatetime
     p, repo, origin, other = _push_setup(env, monkeypatch, [_FLAKY_CHECK])
     tip = _git_out(origin, "rev-parse", "proj")
     calls = _ids_stub(monkeypatch, tip,
                       lambda tree, sel: {_FLAKY_ID} | ({_NEW_ID} if (tree / "e1.txt").exists() else set()))
+    timed = []
+    monkeypatch.setattr(gatetime, "record", lambda state, s, *a, **k: timed.append((Path(state), s)))
     rc, m = _run_batch(p, _batch_marker(p, _entries(repo, 1)), monkeypatch)
     assert _statuses(m) == ["check_failed"], m
+    assert timed and all(st == p.state and s >= 0 for st, s in timed), timed
     assert ("tip", None, []) not in calls, calls
     assert _git_out(origin, "rev-parse", "proj") == tip
 

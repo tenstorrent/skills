@@ -432,6 +432,54 @@ def test_throughput_keeps_push_window_and_sweep_unless_they_held_the_waits(env):
     assert {(c["key"], c["new"]) for c in changes if c["key"] in levers} == {("delivery.push_batch_s", 1800), ("review.sweep_after_s", 600)}
 
 
+
+def test_throughput_names_failed_push_batches_and_slow_push_checks_as_the_hold_not_the_window(env, tmp_path):
+    """Rows held by batches that failed fast (an unreachable remote) or by push checks over the smoke limit
+    are reported with their real holder as information: no push_batch_s change, no throughput task."""
+    import json
+    from ttp import slowcomplaint, throughput
+    p = make(env)
+    now = time.time()
+    p.set_config("delivery.push_batch_s", 1800)
+    code = _tp_task(p, "code change", now - 5 * 3600)
+    _tp_run(p, code, now - 5 * 3600, now - 5 * 3600 + 600)
+    msg = ("cannot reach origin: fatal: unable to access 'https://example.invalid/repo.git/': "
+           "Failed to connect to example.invalid port 443 after 133136 ms: Connection timed out")
+    for i in range(3):   # three batches that each failed in about 2 min, 30 min apart
+        m = tmp_path / f"b{i}.json"
+        m.write_text(json.dumps({"id": f"b{i}", "message": msg}))
+        s0 = now - 4 * 3600 + i * 1900
+        p.db.x("INSERT INTO push_batches(id, marker, target, started, ended, outcome) VALUES(?,?,?,?,?,?)",
+               (f"b{i}", str(m), "origin/br", s0, s0 + 135, "error"))
+    for c in (now - 4 * 3600 - 60, now - 4 * 3600 + 1000):   # approved before them, still waiting
+        p.db.x("INSERT INTO push_queue(task, branch, head, target, created, updated) VALUES(?,?,?,?,?,?)",
+               (code, "b", "h", "origin/br", c, now))
+    rep = throughput.measure(p.db, p.config(), now=now, gates={})
+    ln = _tp_lane(rep, "push_batch")
+    assert ln["slow"] and ln["failed_count"] == 2 and ln["failed_batches"] == 3, ln
+    assert ln["failed_last"]["id"] == "b2" and "Connection timed out" in ln["failed_last"]["message"]
+    changes, kept = throughput.plan(p.db, p.config(), rep)
+    assert not [c for c in changes if c["key"] == "delivery.push_batch_s"], changes
+    k = next(k for k in kept if k["lane"] == "push_batch")
+    assert k["info"] and k["holder"] == "failed_batches", k
+    assert "3 push batch(es) that did not end clean (error 3)" in k["why"] and "b2 on origin/br" in k["why"]
+    assert "remote cannot be reached" in k["why"] and "behind a running batch" not in k["why"]
+    assert slowcomplaint._followups(p.db, {"lanes": rep["lanes"], "kept": kept}, [1], now)["opened"] is None
+    # The same rows behind a clean batch whose check runs take 25 min each: the push checks hold them.
+    p.db.x("DELETE FROM push_batches")
+    p.db.x("INSERT INTO push_batches(id, marker, target, started, ended, outcome, check_runs, check_s) "
+           "VALUES('c0','m','origin/br',?,?,'pushed',2,3000)", (now - 4 * 3600, now - 3600))
+    rep = throughput.measure(p.db, p.config(), now=now, gates={})
+    assert _tp_lane(rep, "push_batch")["check_run_s"] == 1500
+    k = next(k for k in throughput.plan(p.db, p.config(), rep)[1] if k["lane"] == "push_batch")
+    assert k["info"] and k["holder"] == "push_checks", k
+    assert "each batch check run takes 25 min" in k["why"] and "delivery.post_land_checks" in k["why"]
+    # Under the smoke limit, the old reading stands and the lane may still get its task.
+    p.set_config("checks.smoke_max_s", 3600)
+    k = next(k for k in throughput.plan(p.db, p.config(), throughput.measure(p.db, p.config(), now=now,
+                                                                          gates={}))[1] if k["lane"] == "push_batch")
+    assert not k.get("info") and "2 of 2 row(s) waited behind a running batch" in k["why"], k
+
 def _tp_review(p, code_created, run_end, queued, started, labels=()):
     """A code task whose run ended at `run_end`, and its review queued at `queued`, first run at `started`."""
     code = _tp_task(p, "code change", code_created)

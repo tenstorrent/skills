@@ -32,7 +32,12 @@ to its first run, or to now for one still queued:
   own checks, or the precheck the daemon starts on its head as it queues the review) and, for the
   stall, the review's precheck hold (Daemon._precheck_holds) covering half of it.
 - push_batch: a push-queue row's approval to its batch's start. Limit delivery.push_batch_s, judged
-  only on the rows the window alone held (no other batch ran while they waited).
+  only on the rows the window alone held (no other batch ran while they waited). Rows that waited
+  through batches that did not end clean (an unreachable remote, a failing tip, a reboot: `failed_*`)
+  are held by those batches: with them half the lane or more, plan() reports the last one's message
+  as information (no throughput task), since no push setting moves them. Rows behind running batches
+  whose check runs (`check_run_s`, the last week's mean) take longer than checks.smoke_max_s are held
+  by the project's own push checks: reported the same way, with the smoke-split lever (gatetime).
 - landed_chain / deferral: `start_when` waits (a `landed:#<id>` chain or another probe); provider_gate:
   a task held because its provider is logged out or paused. Reported with their cause, no limit.
 - Re-queue waits: each waiting hand-off (its task_waiting event) to the task's next run, and the current
@@ -89,7 +94,7 @@ import re
 import time
 from pathlib import Path
 
-from . import loadcaps
+from . import gatetime, loadcaps
 from .db import DB, START_PASSED, deferral
 
 KV = "throughput_changes"   # kv: [{"id", "ts", "key", "old", "new", "why", "undo", "trigger", "undone"}], newest last
@@ -136,6 +141,15 @@ def load_size(current: int, waiting: int, units: int) -> int:
     current = max(1, int(current))
     step = max(1, min(int(waiting), current))
     return max(current, min(current + step, int(units)))
+
+
+def _batch_message(marker) -> str:
+    """A finished push batch's own message (its marker's `message`, as `ttp push` wrote it), cut short; ''."""
+    try:
+        m = json.loads(Path(str(marker)).read_text())
+    except (OSError, ValueError, TypeError):
+        return ""
+    return " ".join(str(m.get("message") or "").split())[:240] if isinstance(m, dict) else ""
 
 
 def _pct(xs: list[float], q: float) -> float:
@@ -772,8 +786,10 @@ def measure(db: DB, cfg: dict, since_s: float = DAY, now: float | None = None, g
     # Push queue: approval to its batch's start.
     push_s = float(_cfg(cfg, "delivery.push_batch_s", 300) or 0)
     pb = lane("push_batch", "delivery.push_batch_s", push_s)
-    batches = db.q("SELECT id, started, ended FROM push_batches WHERE ended IS NULL OR ended>?", (t0 - DAY,))
-    pb["window"] = []
+    from .pushq import CLEAN_OUTCOMES
+    batches = db.q("SELECT id, marker, target, started, ended, outcome FROM push_batches WHERE ended IS NULL OR ended>?",
+                   (t0 - DAY,))
+    pb["window"], pb["failed"], bad = [], [], {}
     for r in db.q("SELECT q.created c, q.batch b, b.started s FROM push_queue q LEFT JOIN push_batches b ON b.id=q.batch "
                   "WHERE q.created>? LIMIT ?", (t0, ROWS)):
         c, s1 = float(r["c"]), float(r["s"] or now)
@@ -782,6 +798,26 @@ def measure(db: DB, cfg: dict, since_s: float = DAY, now: float | None = None, g
         if s1 - c <= 1.25 * push_s + 60 and not any(b["id"] != r["b"] and float(b["started"]) < s1
                                                     and float(b["ended"] or now) > c for b in batches):
             pb["window"].append(s1 - c)
+        # Held by batches that did not end clean (an unreachable remote, a failing tip, a reboot): each
+        # sends its rows back, and the next one waits delivery.push_min_gap_s, so no window helps them.
+        hit = [b for b in batches if b["id"] != r["b"] and b["ended"] and b["outcome"]
+               and b["outcome"] not in CLEAN_OUTCOMES and float(b["started"]) < s1 and float(b["ended"]) > c]
+        if hit:
+            pb["failed"].append(s1 - c)
+            bad.update({b["id"]: b for b in hit})
+    # What one check run of a batch costs (the last week's finished batches): a push check suite over the
+    # smoke limit holds every queued row for a full run (and more when a batch re-checks a candidate).
+    cr = db.one("SELECT SUM(check_s) s, SUM(check_runs) n FROM push_batches WHERE started>? AND check_runs>0 "
+                "AND check_s>0", (now - 7 * DAY,))
+    if cr and cr["n"]:
+        pb["check_run_s"], pb["check_runs"] = round(float(cr["s"]) / int(cr["n"])), int(cr["n"])
+    if bad:
+        pb["failed_batches"] = len(bad)
+        pb["failed_outcomes"] = {o: sum(1 for b in bad.values() if b["outcome"] == o)
+                                 for o in sorted({b["outcome"] for b in bad.values()})}
+        last = max(bad.values(), key=lambda b: float(b["started"]))
+        pb["failed_last"] = {"id": last["id"], "outcome": last["outcome"], "target": last["target"],
+                             "message": _batch_message(last["marker"])}
     # The lane's limit is whichever of the two checks limits held more of its wait time (its
     # checks_slot_wait events name the holder; a logged wait with no event defaults to the
     # per-repository lane limit; a wait known only from its reason text, the project cap).
@@ -849,7 +885,7 @@ def measure(db: DB, cfg: dict, since_s: float = DAY, now: float | None = None, g
     out = []
     for ln in lanes.values():
         w, p1 = ln.pop("waits"), ln.pop("p1")
-        for k in ("swept", "backstop", "window", "free"):
+        for k in ("swept", "backstop", "window", "free", "failed"):
             if k in ln:
                 v = ln.pop(k)
                 ln.update({f"{k}_count": len(v), f"{k}_p90_s": round(_pct(v, 0.9))})
@@ -993,13 +1029,42 @@ def plan(db: DB, cfg: dict, report: dict) -> tuple[list[dict], list[dict]]:
         elif name == "push_batch":
             n, wp90 = ln.get("window_count", 0), ln.get("window_p90_s", 0)
             target = max(FLOORS[key], int(cur // 2))
+            nf, total = ln.get("failed_count", 0), ln.get("count", 0)
             if cur and int(cur) > target and n and wp90 > th["other"]:
                 changes.append({"key": key, "old": int(cur), "new": target, "why": f"{n} row(s) held by the {int(cur)}s "
                                 f"window alone, p90 {wp90}s over threshold"})
+            elif nf and 2 * nf >= total:
+                # Batches that ended unclean held them: their own events and alarms own the cause, so the
+                # lane is reported, never handed to a throughput task (no setting here would move it).
+                from .pushq import DEFAULT_MIN_GAP_S
+                gap = int(float(_cfg(cfg, "delivery.push_min_gap_s", DEFAULT_MIN_GAP_S) or 0))
+                last = ln.get("failed_last") or {}
+                outs = ", ".join(f"{o} {k}" for o, k in (ln.get("failed_outcomes") or {}).items())
+                why = (f"{nf} of {total} row(s) waited through {ln.get('failed_batches', 0)} push batch(es) that did "
+                       f"not end clean ({outs}); each sent its rows back and the next waited delivery.push_min_gap_s "
+                       f"({gap}s): the failing batches held them, not {key}")
+                if last:
+                    why += f"; the last, {last.get('id')} on {last.get('target')}: {last.get('outcome')}"
+                    why += f" ({last['message']})" if last.get("message") else ""
+                    if re.search(r"cannot reach|could not resolve|connection (timed out|refused)|unable to access",
+                                 last.get("message") or "", re.I):
+                        why += (f"; its target's remote cannot be reached: point delivery.push_branch at a "
+                                f"reachable remote or restore the route to it")
+                kept.append({"lane": name, "key": key, "info": True, "holder": "failed_batches", "why": why})
             else:
-                kept.append({"lane": name, "key": key, "why": f"{ln['count'] - n} of {ln['count']} row(s) waited "
-                             f"behind a running batch or its checks; {n} held by the {int(cur)}s window alone "
-                             f"(p90 {wp90}s): a shorter window only means more batches, each a full check run"})
+                why = (f"{ln['count'] - n} of {ln['count']} row(s) waited behind a running batch or its checks; {n} "
+                       f"held by the {int(cur)}s window alone (p90 {wp90}s): a shorter window only means more "
+                       f"batches, each a full check run")
+                run_s, lim = ln.get("check_run_s") or 0, gatetime.max_s(cfg)
+                if lim and run_s > lim:
+                    # The project's own push checks hold the queue: they are its choice (gatetime flags
+                    # them), so the lane is reported with that lever, never handed to a throughput task.
+                    kept.append({"lane": name, "key": key, "info": True, "holder": "push_checks", "why": (
+                        f"{why}; each batch check run takes {run_s // 60} min ({ln.get('check_runs')} run(s) in "
+                        f"7 d), over the {int(lim) // 60} min smoke limit (checks.smoke_max_s): the push checks "
+                        f"hold the queue, not {key}: {gatetime.split_advice(short=True)}")})
+                else:
+                    kept.append({"lane": name, "key": key, "why": why})
     return [c for c in changes if safe(c["key"])], kept
 
 

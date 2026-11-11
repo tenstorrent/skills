@@ -57,7 +57,7 @@ from . import (checkcap, checkdirs, checklane, checkspill, cleantree, conflictfi
                scriptwatch, setupfault, syntaxfault, testslots, workerloss, urgent,
                sharedchecks, slowtests, suitecost, verdictcarry, worktree)
 from .project import Project, command_env, durable_write, write_json
-from . import gitmemo, hoststate
+from . import gatetime, gitmemo, hoststate
 
 WORKTREE = "push"             # the batch's own checkout under the project's worktrees (never t<id>)
 AFTER_PUSH = "after_push-"    # + batch id: the temporary checkout after_push runs in
@@ -2357,10 +2357,10 @@ class Batch:
                 if push.remote_host(cmd):
                     say(f"running {cmd}{push.where(cmd)}")
                 if self.researched and (reuse := self.failed_runs.pop((tree, str(cmd)), None)):
-                    rc, tail = reuse   # a search run again (_research) judges this tree's failed run again
+                    rc, tail, reused = *reuse, True   # a search run again (_research) judges this tree's failed run again
                     say(f"{head[:10]} failed {cmd} earlier in this batch (tree {tree[:10]}): judging that run again")
                 else:
-                    slot = own(cmd, slot)
+                    slot, reused = own(cmd, slot), False
                     rc, tail = self._run_check(cmd, {**env, **extra, **slot.env()}, env)
                     while getattr(cmd, "spilled", False) and (fault := push.remote_fault(cmd, rc, self.wt)):
                         cmd = self._respill(cmd, head, fault, claims)   # the next spill host, else here
@@ -2381,6 +2381,8 @@ class Batch:
                             resume.unlink(missing_ok=True)
                         self._passed(cmd)
                         continue
+                    if not reused:   # a failing run held the landing as long as a passing one: gatetime flags both
+                        gatetime.record(self.p.state, time.time() - started)
                     return cmd, tail
                 self._passed(cmd)
                 if why := pushpass.record(self.p, tree, str(cmd), eid, self.id, parts, head, self.tip or ""):

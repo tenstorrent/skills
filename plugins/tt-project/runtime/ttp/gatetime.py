@@ -7,7 +7,8 @@ aim 5. Slower tests belong in delivery.post_land_checks, which the daemon runs a
 never holding the queue.
 
 - Record: each passing push check run's wall time is one row of LOG under the project's state (record(),
-  from push.record_check_s), the newest KEEP rows kept.
+  from push.record_check_s), the newest KEEP rows kept; so is each failing run of a batch (batch.py), since
+  it held the landing as long: a slow suite that keeps failing is flagged too.
 - Measure (stats()): median and p90 over the last 24 h and over the last LAST_N runs. `ttp status` and the
   daily review show it (status_line()).
 - Flag (flag(), each daemon pass, model-free): once the median of the last LAST_N runs is over
@@ -47,7 +48,7 @@ _DURATION = re.compile(r"^(?:ttp-suite:)?\s*(\d+(?:\.\d+)?)s\s+(?:(?:call|setup|
 
 
 def record(state: Path | None, seconds: float, now: float | None = None, log: str = LOG) -> None:
-    """Keep one passing push check run's wall time (or, in WAIT_LOG, one wait); a failed write only loses a sample."""
+    """Keep one push check run's wall time (or, in WAIT_LOG, one wait); a failed write only loses a sample."""
     if state is None or seconds is None or seconds < 0 or not seconds and log == LOG:
         return
     path = Path(state) / log
