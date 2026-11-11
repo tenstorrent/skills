@@ -75,7 +75,7 @@ _REACH = re.compile(r"(?i)\b(?:unreachable|not reachable|(?:can(?:no|['’])t|co
 def _verb(sentence: str) -> str | None:
     """The claim verb of `sentence`, or None: a plan, condition, negation, question or no status verb."""
     s = _CODE.sub(" ", sentence)
-    if not s.strip() or s.rstrip().endswith("?") or onhost.MARK in s or s.lstrip().startswith(FALSE_MARK):
+    if not s.strip() or s.rstrip().endswith("?") or onhost.MARK in s or s.lstrip().startswith((FALSE_MARK, UNVERIFIED)):
         return None
     for m in _verbs(s):
         return m["v"].lower()
@@ -153,10 +153,12 @@ def _cls(verb: str) -> str:
 
 
 def _entry(sentence: str, claims: list) -> dict | None:
+    """The claim `sentence` states: half its text's words are in the sentence, or (a sentence of 4+ words that
+    says it shorter or split over two) most of the sentence's words are in its text."""
     s = set(_WORD.findall(sentence.lower()))
     for c in claims or []:
         w = set(_WORD.findall(str((c or {}).get("text") or "").lower()))
-        if w and len(w & s) * 2 >= len(w):
+        if w and (len(w & s) * 2 >= len(w) or len(s) >= 4 and len(w & s) * 3 >= len(s) * 2):
             return c
     return None
 
@@ -187,6 +189,8 @@ def _judge(p, sentence: str, verb: str, claims: list, now: float, own: dict | No
             from .obligations import _when
             if _when(c["due"], "claim due") > now:
                 return "ok", "tracked until its due"
+        if "_rc" not in c and str(c.get("expect") or "").strip() and not p.db.conn.in_transaction:
+            c["_rc"] = _probe(p, str(c["expect"]))   # prerun did not run it (a replay, a worker notify): now
         rc = c.get("_rc")
         if rc == 0:
             return "ok", "its check exited 0"
@@ -246,29 +250,39 @@ def _mark(sentence: str) -> str:
 def check(p, text: str, claims: list | None = None, now: float | None = None,
           own: dict | None = None) -> tuple[str, list[tuple[str, str]], int]:
     """(text to send, [(false sentence, what is true)], count marked unverified). `own` ({'task': id, 'run': id}):
-    the writer's own task and run, whose state at the end of its run is not what its notify claimed."""
+    the writer's own task and run, whose state at the end of its run is not what its notify claimed. A
+    sentence in a block meant to be posted as written (onhost.segments) is never changed: its mark goes on
+    its own line after the block, quoting it."""
     now = time.time() if now is None else now
     try:
         head, cut, tail = (text or "").partition(STATUS_TAIL)   # onhost's honest status lines: the harness's own
-        parts = _SPLIT.split(head)
-        false, unverified = [], 0
-        for k in range(0, len(parts), 2):
-            verb, cut_off = _verb(parts[k]), _reach(parts[k])
-            if not verb and not cut_off:
-                continue
-            got = [_judge(p, parts[k], verb, claims or [], now, own)] if verb else []
-            got += [_judge_reach(p, parts[k], claims or [], now)] if cut_off else []
-            bad = [w for g, w in got if g == "false"]
-            got, why = ("false", "; ".join(bad)) if bad else ("ok", "") if all(g == "ok" for g, _ in got) \
-                else ("unverified", "")
-            lead = parts[k][:len(parts[k]) - len(parts[k].lstrip())]
-            if got == "false":
-                false.append((parts[k].strip(), why))
-                parts[k] = f"{lead}{FALSE_MARK} ({why}): {parts[k].strip()}"
-            elif got == "unverified":
-                unverified += 1
-                parts[k] = _mark(parts[k].rstrip()) + parts[k][len(parts[k].rstrip()):]
-        return "".join(parts) + cut + tail, false, unverified
+        false, unverified, out = [], 0, []
+        for chunk, block in onhost.segments(head):
+            parts, after = _SPLIT.split(chunk), []
+            for k in range(0, len(parts), 2):
+                verb, cut_off = _verb(parts[k]), _reach(parts[k])
+                if not verb and not cut_off:
+                    continue
+                got = [_judge(p, parts[k], verb, claims or [], now, own)] if verb else []
+                got += [_judge_reach(p, parts[k], claims or [], now)] if cut_off else []
+                bad = [w for g, w in got if g == "false"]
+                got, why = ("false", "; ".join(bad)) if bad else ("ok", "") if all(g == "ok" for g, _ in got) \
+                    else ("unverified", "")
+                lead = parts[k][:len(parts[k]) - len(parts[k].lstrip())]
+                if got == "false":
+                    false.append((parts[k].strip(), why))
+                    if block:
+                        after.append(f"\n{FALSE_MARK} ({why}): {onhost.quoted(parts[k])}")
+                    else:
+                        parts[k] = f"{lead}{FALSE_MARK} ({why}): {parts[k].strip()}"
+                elif got == "unverified":
+                    unverified += 1
+                    if block:
+                        after.append(f"\n{UNVERIFIED}: {onhost.quoted(parts[k])}")
+                    else:
+                        parts[k] = _mark(parts[k].rstrip()) + parts[k][len(parts[k].rstrip()):]
+            out.append("".join(parts) + "".join(after))
+        return "".join(out) + cut + tail, false, unverified
     except Exception:
         return text, [], 0
 
@@ -294,8 +308,6 @@ def prerun(p, actions: list, env: dict | None = None) -> None:
     probe never holds the write lock. Bounded: PROBE_TIMEOUT_S each, PROBE_BUDGET_S in all."""
     if p.db.conn.in_transaction:
         return
-    from .landed import probe_command
-    from .probespawn import hidden
     end = time.monotonic() + PROBE_BUDGET_S
     for a in actions or []:
         if not isinstance(a, dict) or a.get("type") not in ("reply", "notify") or not isinstance(a.get("claims"), list):
@@ -306,15 +318,34 @@ def prerun(p, actions: list, env: dict | None = None) -> None:
             left = end - time.monotonic()
             if left <= 1:
                 return
-            try:
-                cmd, run_env = hidden(probe_command(str(c["expect"]), p), env)
-                c["_rc"] = subprocess.run(cmd, shell=True, cwd=str(p.root), env=run_env,
-                                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                          timeout=min(PROBE_TIMEOUT_S, left)).returncode
-            except subprocess.TimeoutExpired:
-                c["_rc"] = "timeout"
-            except OSError:
-                c["_rc"] = "could not start"
+            c["_rc"] = _probe(p, str(c["expect"]), env, min(PROBE_TIMEOUT_S, left))
+
+
+def _probe(p, expect: str, env: dict | None = None, timeout: float = PROBE_TIMEOUT_S):
+    """A claim probe's exit code ('timeout', 'could not start'), run as the daemon runs a start_when
+    (landed.probe_command). When that rewrote it and the rewrite did not pass ('ttp landed' cannot tell of a
+    commit in another repository), the probe as written runs too: a raw ancestor check that passes holds."""
+    from .landed import probe_command
+    from .probespawn import hidden
+    end = time.monotonic() + timeout
+    rc = None
+    for cmd in dict.fromkeys((probe_command(expect, p), expect)):
+        left = end - time.monotonic()
+        if left <= 0.5:
+            break
+        try:
+            run_cmd, run_env = hidden(cmd, env)
+            got = subprocess.run(run_cmd, shell=True, cwd=str(p.root), env=run_env, stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL, timeout=left).returncode
+        except subprocess.TimeoutExpired:
+            got = "timeout"
+        except OSError:
+            got = "could not start"
+        if got == 0 or rc is None:
+            rc = got   # the raw probe only overrules the rewrite by passing
+        if rc == 0:
+            break
+    return "timeout" if rc is None else rc
 
 
 _EVIDENCE = re.compile(r"(?:^|[\s(\"'`])(?:/|~/|\./|\$\w+/)\S+|\b\S+\.(?:log|out|txt|json|jsonl|rc|csv)\b")

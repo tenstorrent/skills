@@ -2,7 +2,7 @@
 # tests/test_tt_project_runtime.py, which runs this file in its own namespace (see _include_cases there).
 from __future__ import annotations
 
-_OH_CLAIM = "Power cycling it now, nothing else touches the box."
+_OH_CLAIM = "Power cycling box1 now, nothing else touches the box."
 
 
 def _oh_task(p, status="queued", chat="c1", labels=("resource:box1-device",)):
@@ -31,7 +31,7 @@ def test_a_claim_about_a_queued_host_task_is_sent_marked_with_the_honest_status(
     tid = _oh_task(p)
     coord.apply(p, [{"type": "reply", "text": _OH_CLAIM, "chat": "c1", "owners": [tid]}], turn=1)
     (got,) = _oh_sent(p)
-    assert got != _OH_CLAIM and f"{onhost.MARK} Power cycling it now" in got
+    assert got != _OH_CLAIM and f"{onhost.MARK} Power cycling box1 now" in got
     assert f"#{tid}: queued for a worker, ETA" in got, got
     assert "nothing else touches the box" in got   # nothing of the message is dropped
     assert any("onhost:" in n for n in p.db.kv(coord.NOTES_KEY, []))   # the coordinator hears of it next turn
@@ -46,7 +46,7 @@ def test_only_sentences_about_an_unstarted_host_task_are_marked(env):
     p = make(env)
     tid = _oh_task(p)
     # The chat's queued host task does not make a true sentence about other work read as planned.
-    for text in ("The docs rewrite finished at 14:00 and landed.", _OH_CLAIM):
+    for text in ("The docs rewrite finished at 14:00 and landed.", "Power cycling it now, nothing else touches it."):
         coord.apply(p, [{"type": "reply", "text": text, "chat": "c1"}], turn=1)
         assert _oh_sent(p)[-1] == text
     # The chat's task is tied by its resource or its #id.
@@ -112,7 +112,7 @@ def test_a_cancelled_task_with_a_live_detached_job_reads_stop_requested(env, mon
     monkeypatch.setattr(jobstop, "running", lambda r: str(r) in live)
     monkeypatch.setattr(jobstop, "job_resources", lambda p, r: {"box1-device"})
     # Cancelled in the same batch as a reply saying it stopped: the jobs still run, so it is not.
-    coord.apply(p, [{"type": "reply", "text": "Stopped the runs on the box.", "chat": "c1"},
+    coord.apply(p, [{"type": "reply", "text": "Stopped the runs on box1.", "chat": "c1"},
                     {"type": "task_update", "id": tid, "status": "cancelled"}], turn=1)
     (got,) = _oh_sent(p)
     assert onhost.MARK in got and "stop requested; 1 job still running on box1-device" in got, got
@@ -272,7 +272,7 @@ _OH_FREE = {"type": "task_add", "title": "free the check slots held by stale run
 def test_facts_beside_a_newly_queued_host_task_are_not_marked_as_planned(env):
     from ttp import coordinator as coord, onhost
     p = make(env)
-    plan = "I'm changing the rerun to use the model the provider serves now and to name that model in the results."
+    plan = "I'm changing the rerun on box1 to use the model the provider serves now and to name that model in the results."
     text = " ".join(["Correction on the rerun: it has not started yet.", *_OH_FACTS[:2],
                      "The rerun starts on its own once the cut lands.", _OH_FACTS[2], plan])
     coord.apply(p, [{"type": "reply", "text": text, "chat": "c1"}, dict(_OH_FREE)], turn=1)
@@ -290,8 +290,8 @@ def test_facts_beside_a_newly_queued_host_task_are_not_marked_as_planned(env):
 def test_a_premature_claim_beside_facts_is_still_marked(env):
     from ttp import coordinator as coord, onhost
     p = make(env)
-    for turn, claim in enumerate(("The slot cleanup is running now.", "It's done.", "Freeing the check slots now.",
-                                  "The job finished.", "This is running now."), 1):
+    for turn, claim in enumerate(("The slot cleanup is running on box1 now.", "Freeing the check slots on box1 now.",
+                                  "The box1 job finished."), 1):
         text = f"{_OH_FACTS[0]} {claim}"
         coord.apply(p, [{"type": "reply", "text": text, "chat": "c1"}, dict(_OH_FREE)], turn=turn)
         got = _oh_sent(p)[-1]
@@ -436,6 +436,69 @@ def test_status_footer_off_marks_the_claim_and_appends_no_status(env):
     p.set_config("coordinator.status_footer", False)
     coord.apply(p, [{"type": "reply", "text": _OH_CLAIM, "chat": "c1", "owners": [tid]}], turn=1)
     (got,) = _oh_sent(p)
-    assert got.startswith(f"{onhost.MARK} Power cycling it now") and onhost.STATUS_HEAD not in got, got
+    assert got.startswith(f"{onhost.MARK} Power cycling box1 now") and onhost.STATUS_HEAD not in got, got
     note = next(n for n in p.db.kv(coord.NOTES_KEY, []) if n.startswith("onhost:"))
     assert f"#{tid}: queued for a worker" in note and "status_footer is off" in note
+
+
+# A block meant to be posted as written (a comment for another tool, a quote): never edited (upstream note
+# a4b54adbe049e531).
+_OH_BLOCKS = ("Post this:\n---\nPower cycling box1 now.\nIt is on the release branch.\n---\nThat is all.",
+              "Post this:\n```\nPower cycling box1 now.\nIt is on the release branch.\n```\nThat is all.",
+              "Post this:\n> Power cycling box1 now.\n> It is on the release branch.\nThat is all.")
+
+
+@pytest.mark.parametrize("text", _OH_BLOCKS)
+def test_no_marker_goes_inside_a_block_meant_for_posting(env, text):
+    from ttp import coordinator as coord, onhost
+    p = make(env)
+    tid = _oh_task(p)
+    coord.apply(p, [{"type": "reply", "text": text, "chat": "c1", "owners": [tid]}], turn=1)
+    (got,) = _oh_sent(p)
+    block, rest = text[:text.index("\nThat is all.")], "\nThat is all."
+    # The block is sent word for word; the marker follows it on its own line, quoting the sentence.
+    assert got.startswith(f"{block}\n{onhost.MARK} \"Power cycling box1 now.\"{rest}"), got
+    assert f"#{tid}: queued for a worker" in got, got
+
+
+def test_segments_join_back_and_tell_blocks_from_plain_text():
+    from ttp import onhost
+    for text in (*_OH_BLOCKS, "a\n---\nlone rule", "```\nunclosed fence\nstill code", "", "x\n\n> q\n",
+                 "---\n```\n---\n```\n---\nafter"):
+        segs = onhost.segments(text)
+        assert "".join(c for c, _ in segs) == text, segs
+    assert [b for _, b in onhost.segments("a\n---\nlone rule")] == [False]   # one '---' is a rule, not a block
+    assert onhost.segments("```\nunclosed\n")[0] == ("```\nunclosed", True)
+    # A '---' inside a fenced block does not close the '---' block around it.
+    assert onhost.segments("---\n```\n---\n```\n---\nafter")[0] == ("---\n```\n---\n```\n---", True)
+
+
+def test_a_sentence_naming_no_task_id_or_host_is_never_marked(env):
+    from ttp import coordinator as coord, onhost
+    p = make(env)
+    tid = _oh_task(p)
+    # The reply speaks for one unstarted host task, but these sentences name neither it nor its host.
+    for turn, text in enumerate(("It is on the release branch (commit 5088f11) and running there.",
+                                 "Resetting the board.", "The reset is in progress.",
+                                 f"#{tid} is queued. It landed on the release branch."), 1):
+        coord.apply(p, [{"type": "reply", "text": text, "chat": "c1", "owners": [tid]}], turn=turn)
+        assert _oh_sent(p)[-1] == text and onhost.MARK not in _oh_sent(p)[-1]
+
+
+def test_a_queued_task_whose_detached_driver_is_live_counts_as_under_way(env, monkeypatch):
+    from ttp import coordinator as coord, onhost
+    p = make(env)
+    tid = _oh_task(p)
+    d = _oh_run(p, tid, env, status="done")
+    _oh_remote(d, "driver")   # not known to have ended: live
+    st = onhost.state(p, p.db.task(tid))
+    assert st["started"] and st["kind"] == "on" and st["line"] == "detached job running on hostA", st
+    text = f"#{tid} is running its driver on box1 now."
+    coord.apply(p, [{"type": "reply", "text": text, "chat": "c1"}], turn=1)
+    assert _oh_sent(p) == [text]
+    # Its host answers that it ended: queued again, and the same claim is marked.
+    _oh_answers(monkeypatch, {"hostA": "rc 0"})
+    onhost.refresh_remote(p, time.time() + onhost.REMOTE_EVERY_S + 1)
+    assert not onhost.state(p, p.db.task(tid))["started"]
+    coord.apply(p, [{"type": "reply", "text": text, "chat": "c1"}], turn=2)
+    assert _oh_sent(p)[-1].startswith(f"{onhost.MARK} {text}")
