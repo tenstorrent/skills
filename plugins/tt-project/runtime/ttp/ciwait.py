@@ -41,12 +41,14 @@ def _gh(args: list[str]) -> list | dict | None:
         return None
     if via:
         ghroute.mark(out.returncode != ghroute.SSH_RC)
-        if out.returncode == ghroute.SSH_RC:   # the route is down: a public read, else no answer
-            got = ghroute.public(["api", *args[1:]]) if args[:1] == ["api"] else None
-            try:
-                return json.loads(got[1]) if got else None
-            except ValueError:
-                return None
+    if out.returncode == ghroute.SSH_RC if via else (out.returncode and args[:1] == ["api"]
+                                                      and ghauth.auth_failed(out.returncode, out.stderr)):
+        # the route down, or unset with no login here: a public read, else no answer
+        got = ghroute.public(args) if args[:1] == ["api"] else None
+        try:
+            return json.loads(got[1]) if got else None
+        except ValueError:
+            return None
     if ghauth.auth_failed(out.returncode, out.stderr):
         raise LoggedOut((out.stderr.strip().splitlines() or [f"exit {out.returncode}"])[0][:200])
     if out.returncode != 0:

@@ -302,6 +302,55 @@ def test_no_route_falls_back_read_only_and_holds_writes_with_no_login_step(env, 
         assert "auth login" not in said and "log in" not in said.lower(), said
 
 
+def test_routed_gh_sends_a_local_body_file_on_stdin_and_holds_uploads(env, monkeypatch, capfd):
+    """A routed gh call naming a local file (--body-file, -F, --input, api -F name=@path) sends the
+    file's content on the call's stdin with "-" in its place, since the route host lacks the path;
+    several inputs, or files gh uploads, are held (exit 75), never sent with a dangling path."""
+    from ttp import ghroute
+    ssh_calls, _gh, repo = _no_login_here(env, monkeypatch)
+    d = env["tmp"] / "ghstub"
+    got = d / "ssh_stdin"
+    (d / "ssh").write_text(f'#!/bin/sh\nfor a in "$@"; do printf "%s\\n" "$a"; done >> "{ssh_calls}"\n'
+                           f'cat > "{got}"\necho "[]"\n')
+    body = repo / "body.md"
+    body.write_text("the comment body\n\n[authored by AI]\n")
+    cfg = {"delivery": {"gh_route": "gh-box"}}
+    assert ghroute.run("gh", ["pr", "comment", "3", "--body-file", str(body)], cfg=cfg, cwd=str(repo)) == 0
+    assert got.read_text() == body.read_text()
+    remote = ssh_calls.read_text().splitlines()[-1]
+    assert "gh pr comment 3 --body-file - -R acme/widgets" in remote and str(body) not in remote, remote
+    for args, want in ((["pr", "edit", "3", "-F", "body.md"], ["pr", "edit", "3", "-F", "-"]),
+                       (["pr", "create", "--body-file=body.md"], ["pr", "create", "--body-file=-"]),
+                       (["api", "-X", "POST", "repos/a/b/issues", "--input", "body.md"],
+                        ["api", "-X", "POST", "repos/a/b/issues", "--input", "-"]),
+                       (["api", "graphql", "-F", "query=@body.md"], ["api", "graphql", "-F", "query=@-"]),
+                       (["api", "repos/a/b", "-F", "per_page=5"], ["api", "repos/a/b", "-F", "per_page=5"])):
+        sent, data, why = ghroute.local_inputs(args, None, str(repo))
+        assert sent == want and not why, (args, sent, why)
+        assert data == (None if sent == args else body.read_bytes())
+    capfd.readouterr()
+    before = ssh_calls.read_text()
+    for args in (["release", "upload", "v1", "body.md"], ["release", "create", "v1", "body.md"],
+                 ["pr", "comment", "3", "--body-file", "body.md", "--edit-last", "-F", "body.md"],
+                 ["api", "-X", "POST", "repos/a/b", "--input", "-", "-F", "x=@body.md"]):
+        assert ghroute.run("gh", args, cfg=cfg, cwd=str(repo)) == ghroute.HELD_RC, args
+        assert "held" in capfd.readouterr().err
+    assert ssh_calls.read_text() == before, "an unrewritable file form was sent"
+
+
+def test_ci_wait_with_no_route_reads_public_api_and_the_alert_claims_no_public_pr_reads(env, monkeypatch):
+    """No route and no login here: `ttp ci`'s `gh api` reads fall back to the public read, and the
+    host's condition says PRs are not read rather than claiming public PR reads."""
+    from ttp import ciwait, ghauth, ghroute
+    _no_login_here(env, monkeypatch)
+    seen = []
+    monkeypatch.setattr(ghroute, "public", lambda a, cwd=None, timeout=20: seen.append(a) or (0, '{"ok": 1}'))
+    assert ciwait._gh(["api", "repos/acme/widgets/actions/runs"]) == {"ok": 1}
+    assert seen == [["api", "repos/acme/widgets/actions/runs"]], seen
+    alert = ghauth.text(ghauth.read(), "lab-1", "21:00", {"delivery": {}})
+    assert "not read" in alert and "public reads only" not in alert, alert
+
+
 def test_ask_gate_refuses_a_gh_login_ask_on_a_remote_host(env):
     """No GitHub login is kept on lab hosts: an ask or notify telling the user to log gh in there is
     refused, naming the route setting; one about the user's own machine, or another tool, is not."""

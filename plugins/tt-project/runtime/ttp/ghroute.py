@@ -165,6 +165,48 @@ def public(args: list[str], cwd: str | None = None, timeout: float = 20) -> tupl
         return None
 
 
+# Flags naming a local file gh reads: on the route host that path does not exist, so the file is
+# read here and sent on the call's one stdin ("-"). -F is --body-file only outside `gh api`.
+_FILE_FLAGS = {"--body-file", "--notes-file", "--input"}
+
+
+def local_inputs(args: list[str], input: bytes | None = None,
+                 cwd: str | None = None) -> tuple[list[str], bytes | None, str]:
+    """(args, stdin, why) for a routed `gh args`: each local file argument read here and passed on
+    stdin ("-", or `@-` for a `gh api` field), or `why` it cannot be (several inputs, or files gh
+    uploads) and the call is held instead of sent with paths the route host lacks."""
+    api, out, files = args[:1] == ["api"], list(args), []
+    flags = _FILE_FLAGS | (set() if api else {"-F"})
+    for i, a in enumerate(args):
+        name, eq, val = a.partition("=")
+        if eq and name in flags:              # --body-file=<path>
+            files.append((i, val, f"{name}="))
+        elif a in flags and i + 1 < len(args):
+            files.append((i + 1, args[i + 1], ""))
+        elif api and i and args[i - 1] in ("-F", "--field") and "=@" in a:
+            k, _, val = a.partition("=@")      # -F name=@<path>
+            files.append((i, val, f"{k}=@"))
+    files = [f for f in files if f[1] != "-"]
+    uses_stdin = any(a == "-" or a.endswith(("=@-", "=-")) for a in args)
+    if args[:1] == ["release"] and args[1:2] in (["upload"], ["create"]):
+        base = cwd or os.getcwd()
+        if any(not a.startswith("-") and os.path.isfile(os.path.join(base, a.split("#", 1)[0])) for a in args[3:]):
+            return args, input, f"`gh release {args[1]}` uploads local files, which the route host does not have"
+    if not files:
+        return out, input, ""
+    if len(files) > 1 or uses_stdin:   # else gh reads no stdin: `input` was never its
+        return args, input, (f"`gh {' '.join(args[:2])}` reads {len(files) + uses_stdin} local inputs; "
+                             f"a routed call sends one, on its stdin")
+    i, path, prefix = files[0]
+    try:
+        with open(os.path.join(cwd or os.getcwd(), path), "rb") as f:
+            data = f.read()
+    except OSError as e:
+        return args, input, f"cannot read {path} here: {e.strerror or e}"
+    out[i] = f"{prefix}-"
+    return out, data, ""
+
+
 def wanted(args: list[str], cfg: dict | None = None, cwd: str | None = None) -> bool:
     """Whether `gh args` takes the no-login path here: routed, else held or read publicly."""
     return not local_ok() and bool(route(cfg, cwd) or _logged_out())
@@ -177,7 +219,11 @@ def run(real: str, args: list[str], input: bytes | None = None, cfg: dict | None
     import sys
     via = routed(args, cfg, cwd)
     if via:
-        rc = subprocess.run(via, input=input, cwd=cwd).returncode
+        sent, data, why = local_inputs(args, input, cwd)
+        if why:
+            print(f"gh (tt-project): held: {why}; it was not sent to {SETTING} (exit {HELD_RC}).", file=sys.stderr)
+            return HELD_RC
+        rc = subprocess.run(routed(sent, cfg, cwd), input=data, cwd=cwd).returncode
         mark(rc != SSH_RC)
         if rc != SSH_RC:
             return rc
@@ -224,8 +270,9 @@ def down_text(host: str, when: str, error: str, cfg: dict | None = None) -> str:
     setting that routes it; no login step for anyone."""
     how = (f"{SETTING} is set but its last gh call failed" if route(cfg) else f"{SETTING} is unset")
     return (f"gh has no login on {host} (since {when}; {quiet(error)}), as is normal for a lab host, and {how}. "
-            f"PR watching runs degraded on public reads only; CI waits, PR edits, comments and other gh writes "
-            f"of projects here are held and retried once a route works. To route them, set {SETTING} to the "
+            f"PR watching is degraded: PRs are not read, CI waits are skipped (a plain `gh api` GET of a public "
+            f"repo still answers), and PR edits, comments and other gh writes of projects here are held and "
+            f"retried once a route works. To route them, set {SETTING} to the "
             f"ssh alias of a machine where gh is logged in. Pushes go over ssh with the forwarded agent.")
 
 
