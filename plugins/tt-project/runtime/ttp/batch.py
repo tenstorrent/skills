@@ -1615,7 +1615,7 @@ class Batch:
         if not (self.remote and self.branch) or now != self.target:
             return self._retargeted(now)
         self.target_lock = push.take(self.p, self.remote, self.branch, 0, say=lambda _m: None,
-                                     who=f"push batch {self.id}")
+                                     who=f"push batch {self.id}", yield_turn=False)
         if self.target_lock is None:
             who = ", ".join(locks.holders_now(push.lock_paths(self.p, self.remote, self.branch), self.p)) or "another push"
             if not self.express:

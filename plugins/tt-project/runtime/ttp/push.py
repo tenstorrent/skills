@@ -3894,9 +3894,21 @@ def _priority(p: Project) -> int | None:
         return None
 
 
+def _yields_turn(p: Project) -> bool:
+    """Whether this push stands back for the push queue's due batch (pushq.turn_reserved): not when its
+    task is urgent or a review of one, nor when anything here fails."""
+    try:
+        from . import pushq, urgent
+        if (tid := os.environ.get("TTP_TASK")) and urgent.covers_urgent(p.db, p.db.task(int(tid))):
+            return False
+        return pushq.turn_reserved(p)
+    except Exception:
+        return False
+
+
 def take(p: Project, remote: str, branch: str, wait_s: float, poll_s: float = 1.0,
          say: Callable[[str], None] = lambda m: print(f"ttp push: {m}", file=sys.stderr),
-         who: str | None = None):
+         who: str | None = None, yield_turn: bool = True):
     """The held push lock of remote/branch, waiting for it; None when it stayed busy.
     Waiters queue beside the lock (locks.enqueue, with the task's priority): when it frees, the first
     live one in turn takes it, an urgent or user-ordered task's (locks.my_turn) before the rest, each
@@ -3905,13 +3917,18 @@ def take(p: Project, remote: str, branch: str, wait_s: float, poll_s: float = 1.
     first in line while the lock stays busy gives up after `wait_s`. A waiter ahead that leaves the
     lock free for STALL_S loses its turn to the next. `wait_s` 0: one try, no queue (the push queue's
     batch). Inside a run the wait is recorded, so it does not count against the run's wall clock.
-    `who` labels the holder (default: the task and run, else the pid)."""
+    `who` labels the holder (default: the task and run, else the pid). A non-urgent push to the push
+    queue's own target stands back while the queue reserves its next turn for a due batch
+    (`yield_turn` False: the batch itself)."""
     paths = lock_paths(p, remote, branch)
     locks_dir, resource = (p.state / "locks" if p else paths[0].parent), lock_resource(remote, branch)
     who = who or (f"task #{os.environ['TTP_TASK']} (run {os.environ.get('TTP_RUN_ID') or '?'})"
                   if os.environ.get("TTP_TASK") else f"pid {os.getpid()}")
+    def grab():   # a non-urgent push leaves the next turn to the push queue's due batch
+        return None if yield_turn and _yields_turn(p) else locks.try_take(paths, who, "ttp push")
+
     if wait_s <= 0 or not locks.queued(locks_dir, resource):
-        f = locks.try_take(paths, who, "ttp push")
+        f = grab()
         if f or wait_s <= 0:
             return f
     name = lock_name(remote, branch)
@@ -3944,7 +3961,7 @@ def take(p: Project, remote: str, branch: str, wait_s: float, poll_s: float = 1.
                 first_at = None   # a more urgent waiter came in ahead: its turn is not this one's wait
             free_since = (free_since or now) if not first and locks.any_free(paths) else None
             if first or (free_since and now - free_since >= STALL_S):
-                f = locks.try_take(paths, who, "ttp push")
+                f = grab()
             if f or (first_at is not None and now - first_at >= wait_s):
                 break
             time.sleep(max(0.0, poll_s if first_at is None else min(poll_s, wait_s - (now - first_at))))

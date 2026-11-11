@@ -5118,6 +5118,64 @@ def test_approvals_waiting_with_no_batch_alarm_once_naming_what_holds_it_and_cle
     assert "no_batch" not in pushq._state(s.p.db) and "no batch for" not in pushq.status_line(s.p)
 
 
+def test_a_due_batch_reserves_the_next_push_turn_and_single_pushes_yield_it(env, monkeypatch):
+    """Direct landings taking the push lock one after another starved the batch with no trace: once a
+    batch is due and only the lock holds it, the tick reserves the next turn, non-urgent single pushes
+    (and detached ones waiting on their run locks) stand back, urgent ones and the batch itself do not."""
+    from ttp import locks, push, pushq
+    s = _pq(env, monkeypatch, push_batch_s=0)
+    s.p.db.update_task(s.review, status="done")
+    _pq_review(s)
+    told = []
+    lock_paths = push.lock_paths(s.p, "origin", "proj")
+    holder = locks.try_take(lock_paths, "task #7 (run 9)", "ttp push")
+    run_lock = locks.try_take([s.p.state / "locks" / "push:run-123.0.lock"], "a detached ttp push")
+    assert not pushq.turn_reserved(s.p)
+    try:
+        assert pushq.schedule(s.p, log=told.append) is None
+        assert pushq.schedule(s.p, log=told.append) is None
+        assert pushq.turn_reserved(s.p), "the batch is due and only the lock holds it"
+        assert told == [f"push queue: no batch started: {pushq.LOCK_WHY}"], "one line per change of reason"
+    finally:
+        holder.close()
+    # The turn is free; a detached push that waits holds its run lock but must not hold the batch back.
+    rows, why = pushq.due(s.p)
+    assert rows, why
+    run_lock.close()
+    normal = s.p.db.add_task("a routine fix", "x", kind="code", origin="coordinator", priority=3)
+    hot = s.p.db.add_task("an urgent fix", "urgent: why", kind="code", origin="coordinator", priority=1)
+    monkeypatch.setenv("TTP_TASK", str(normal))
+    assert push.take(s.p, "origin", "proj", 0, say=lambda m: None) is None, "a routine push stands back"
+    monkeypatch.setenv("TTP_TASK", str(hot))
+    got = push.take(s.p, "origin", "proj", 0, say=lambda m: None)
+    assert got, "an urgent push never yields"
+    got.close()
+    monkeypatch.setenv("TTP_TASK", str(normal))
+    got = push.take(s.p, "origin", "proj", 0, say=lambda m: None, yield_turn=False)
+    assert got, "the batch itself takes the turn"
+    got.close()
+    t = pushq.time.time()
+    assert not pushq.turn_reserved(s.p, t + pushq.TURN_TTL_S + 1), "a dead daemon frees the pushes"
+    assert not pushq.turn_reserved(s.p, t + pushq.TURN_MAX_S + 1)
+    pushq.reserve_turn(s.p, t, off=True)
+    assert push.take(s.p, "origin", "proj", 0, say=lambda m: None), "released once released"
+
+
+def test_a_reserved_turn_lets_a_batch_start_past_a_waiting_detached_push(env, monkeypatch):
+    from ttp import locks, pushq
+    s = _pq(env, monkeypatch, push_batch_s=0)
+    s.p.db.update_task(s.review, status="done")
+    _pq_review(s)
+    run_lock = locks.try_take([s.p.state / "locks" / "push:run-123.0.lock"], "a detached ttp push")
+    try:
+        assert pushq.due(s.p)[1] == pushq.LOCK_WHY
+        pushq.reserve_turn(s.p, time.time())
+        assert pushq.due(s.p)[0], "its run lock alone no longer blocks"
+        assert pushq.due(s.p, lock=False)[0]
+    finally:
+        run_lock.close()
+
+
 @pytest.mark.parametrize("case", ["window", "due", "paused"])
 def test_the_no_batch_alarm_names_the_batch_window_or_a_due_batch_and_skips_a_paused_push(env, monkeypatch, case):
     from ttp import pushq

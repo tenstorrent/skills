@@ -113,6 +113,8 @@ DEFAULT_LANDING_ALERT_H = 4     # delivery.push_landing_alert_h: approvals waiti
 LANDING_ALERT = "push_not_landing"   # the keyed alert while nothing lands despite batches (alerts.holds)
 NO_BATCH_ALERT = "push_no_batch"   # the keyed alert while approvals wait and no batch runs (alerts.holds)
 NO_BATCH_S = 900                # ... raised once approvals waited this long with no batch running
+TURN_TTL_S = 120                # a reserved push turn (reserve_turn) lapses unless the tick renews it within this
+TURN_MAX_S = 900                # ... and never holds single pushes back longer than this in all
 UNREACH_ALERT = "push_target_unreachable"   # the keyed alert while the target's remote cannot be reached (alerts.holds)
 UNREACH_AFTER = 3               # batches in a row that could not reach the target's remote before the queue stops and alerts
 UNREACH_PROBE_S = 1800          # ... then the remote is asked this often, model-free, instead of starting batches
@@ -1443,6 +1445,7 @@ def _urgent_waits(p: Project, live: str, now: float) -> None:
 
 
 def due(p: Project, now: float | None = None, cfg: dict | None = None) -> tuple[list[dict], str]:
+def due(p: Project, now: float | None = None, cfg: dict | None = None, lock: bool = True) -> tuple[list[dict], str]:
     """The approved rows a batch (a push train) should take now and why; or ([], why not). A train takes
     every approval due at its start, best priority first: delivery.push_batch_max only starts one at
     once (kept for compatibility), it caps nothing, so the full push checks run once for all of them. Only local state is read: no fetch, no checks (an open runner
@@ -1456,7 +1459,10 @@ def due(p: Project, now: float | None = None, cfg: dict | None = None) -> tuple[
     (fast_ids: urgent, priority 1-2 or aged to it (delivery.push_age_s: _approved), or sharing no file
     with an earlier unlanded approval) wait for neither: they start a train at once and lead it, and
     every other approval rides in it. After a batch a
-    reboot cut short its members still approved go again at once, alone and in its order (_cut_members)."""
+    reboot cut short its members still approved go again at once, alone and in its order (_cut_members).
+    A push holding its turn blocks all of this ("another push holds its turn"), unless `lock` is False
+    (schedule asks so, to reserve the next turn for the batch: reserve_turn). While the turn is
+    reserved, detached pushes that only wait for it (their run locks) no longer block."""
     now = time.time() if now is None else now
     if not enabled(p, cfg):
         return [], "the push queue is off"
@@ -1494,9 +1500,10 @@ def due(p: Project, now: float | None = None, cfg: dict | None = None) -> tuple[
         return [], f"backing off until {_at(float(st['backoff_until']), now, p)}{why}"
     if held := envfault.held(p, now):   # a check runner the host lacks: checks would only fail on it
         return [], held
-    if not locks.any_free(push.lock_paths(p, remote, branch)) or any(
-            not locks.any_free([x]) for x in sorted((p.state / "locks").glob("push:run-*.lock"))):
-        return [], "another push holds its turn"
+    if lock and (not locks.any_free(push.lock_paths(p, remote, branch)) or (
+            not turn_reserved(p, now) and any(
+                not locks.any_free([x]) for x in sorted((p.state / "locks").glob("push:run-*.lock"))))):
+        return [], LOCK_WHY
     bad = st.get("bad_tip") or {}
     tried: set = set()
     if bad.get("tip") and _tracking_tip(p, remote, branch) == bad["tip"]:
@@ -1926,6 +1933,49 @@ def _forget_moved_tip(p: Project, remote: str, branch: str) -> None:
         db.set_kv(KV, st)
 
 
+LOCK_WHY = "another push holds its turn"
+
+
+def turn_reserved(p: Project, now: float | None = None) -> bool:
+    """Whether the push queue holds the next turn on the push lock for its due batch (reserve_turn):
+    single pushes that are not urgent wait for it (push.take). The tick renews it each pass, so a dead
+    daemon frees the pushes within TURN_TTL_S; it never holds them past TURN_MAX_S."""
+    now = time.time() if now is None else now
+    t = _state(p.db).get("turn")
+    return (isinstance(t, dict) and now - float(t.get("at") or 0) < TURN_TTL_S
+            and now - float(t.get("since") or now) < TURN_MAX_S)
+
+
+def reserve_turn(p: Project, now: float, off: bool = False) -> None:
+    """Reserve the next push turn for the due batch, or release it (`off`). Written when it changes
+    or is about to lapse, not every tick."""
+    db = p.db
+    st = _state(db)
+    t = st.get("turn") if isinstance(st.get("turn"), dict) else None
+    if off:
+        if t is not None:
+            st.pop("turn", None)
+            db.set_kv(KV, st)
+        return
+    if t is None or now - float(t.get("at") or 0) >= TURN_TTL_S / 4:
+        live = t is not None and now - float(t.get("at") or 0) < TURN_TTL_S
+        st["turn"] = {"since": float(t["since"]) if live else now, "at": now}
+        db.set_kv(KV, st)
+
+
+def _told_why(p: Project, why: str, log: Callable[[str], None]) -> None:
+    """Remember why no batch started (`why`, "" once one did): a changed reason is logged once, a
+    steady one never again."""
+    db = p.db
+    st = _state(db)
+    if (st.get("why") or "") == why:
+        return
+    st["why"] = why
+    db.set_kv(KV, st)
+    if why:
+        log(f"push queue: no batch started: {why}")
+
+
 def schedule(p: Project, cfg: dict | None = None, log: Callable[[str], None] = lambda m: None) -> str | None:
     """The tick's start step: send back approvals for another target, then start a batch if one is
     due. Cheap while nothing is approved: no locks, and no git unless a failing tip is remembered."""
@@ -1949,7 +1999,13 @@ def schedule(p: Project, cfg: dict | None = None, log: Callable[[str], None] = l
     from . import express
     if bid := express.auto(p, name, log):
         return bid
-    rows, why = due(p, cfg=cfg)
+    now = time.time()
+    rows, why = due(p, now=now, cfg=cfg)
+    if not rows and why == LOCK_WHY and due(p, now=now, cfg=cfg, lock=False)[0]:
+        reserve_turn(p, now)    # the batch is due: single pushes yield the next turn to it
+    else:
+        reserve_turn(p, now, off=True)
+    _told_why(p, "" if rows else why, log)
     if not rows:
         return None
     if held := _cycle_held(p, cfg):   # its checks would be cut: the batch starts once the cycle is over
