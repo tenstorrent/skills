@@ -1766,18 +1766,54 @@ def clear_caches(path: Path, names: list[str] | None = None, keep: list[str] = (
     return gone
 
 
-def needed_by(task: dict, open_tasks: list[dict]) -> dict | None:
-    """The first unfinished task that may still work in this task's worktree (a review that runs
-    `ttp push` there, say): it depends on or continues the task, or its spec names the task's
-    branch or id (#12, t12, task 12, worktrees/t12)."""
+def needers(task: dict, open_tasks: list[dict]):
+    """The unfinished tasks that may still need this task's worktree, in order: each depends on or
+    continues the task, or its spec names the task's branch or id (#12, t12, task 12, worktrees/t12)."""
     from .db import dependency_ids
     tid, branch = task["id"], task.get("branch")
     named = re.compile(rf"(?<![\w.-])(?:#|t|task\s+){tid}(?!\d)"
                        + (rf"|(?<![\w/.-]){re.escape(branch)}(?![\w/-])" if branch else ""), re.I)
     for t in open_tasks:
         if t["id"] != tid and (tid in dependency_ids(t) or continues_id(t) == tid or named.search(t.get("spec") or "")):
-            return t
-    return None
+            yield t
+
+
+def needed_by(task: dict, open_tasks: list[dict]) -> dict | None:
+    """The first unfinished task that may still work in this task's worktree (a review that runs
+    `ttp push` there, say): it depends on or continues the task, or its spec names the task's
+    branch or id (#12, t12, task 12, worktrees/t12)."""
+    return next(needers(task, open_tasks), None)
+
+
+def may_work_in(p: Project, task: dict, user: dict) -> bool:
+    """Whether `user`, an unfinished task that needs `task`, may work in task's worktree rather than
+    only read its commits: a code task (it may branch from it), a review (it runs `ttp push` there),
+    a kind gets_worktree gives a worktree of its own, a task continuing it, one whose spec names the
+    worktree's path, and a row whose kind is not known."""
+    kind = user.get("kind")
+    return (not kind or kind in ("code", "review") or gets_worktree(p, kind) or continues_id(user) == task["id"]
+            or task["id"] in worktree_refs(user.get("spec")))
+
+
+def reader_hold(p: Project, task: dict, users: list[dict], path: Path) -> str | None:
+    """Whether the tasks that need `task` (needers) still hold its worktree at `path`: "" when one may
+    work in it (may_work_in) or the task kept no branch; else, all of them only reading its commits
+    from its kept branch, a clause saying what removing it would lose (changes not committed, commits
+    not landed); None when nothing (it is clean and landed: its branch and the push branch keep them)."""
+    if not task.get("branch") or any(may_work_in(p, task, u) for u in users):
+        return ""
+    if inspect(path)["why"]:
+        return "; it holds work that is not committed"
+    from .tried import landed_tasks
+    if task["id"] in landed_tasks(p.db):
+        return None
+    try:
+        head = _git(path, "rev-parse", "HEAD", check=False)
+        if head and is_ancestor(p, head, resolve_base(p)):
+            return None
+    except (RuntimeError, OSError, subprocess.SubprocessError):
+        pass
+    return "; its commits have not landed"
 
 
 # What needed_by's pattern matches, read once per spec: a task id named as #12, t12 or task 12, and the
@@ -1921,9 +1957,10 @@ def held_by(p: Project, task: dict, open_tasks: list[dict], now: float, path: Pa
     user = probed_by(task, open_tasks)
     if user:
         return f"task #{user['id']} ({user['status']}) waits on a probe that reads it"
-    user = needed_by(task, open_tasks)
-    if user:
-        return f"task #{user['id']} ({user['status']}) may still use it"
+    users = list(needers(task, open_tasks))
+    if users and (why := reader_hold(p, task, users, path)) is not None:
+        user = next((u for u in users if may_work_in(p, task, u)), users[0])
+        return f"task #{user['id']} ({user['status']}) may still use it{why}"
     if p.db.one("SELECT id FROM events WHERE task=? AND status='queued' AND kind!=? LIMIT 1",
                 (task["id"], DIRTY_EVENT)):
         return "the coordinator has not yet seen how it ended"
@@ -2126,7 +2163,7 @@ def sweep(p: Project, *, older_than_s: float = 0, names: list[str] | None = None
                 pushes_now.append(running(p))
             return pushes_now[0]
         deferred = "archiving deferred to a later sweep (each daemon tick step archives at most one worktree)"
-        open_tasks = p.db.q("SELECT id, status, spec, depends_on, labels, result FROM tasks WHERE status NOT IN (%s)"
+        open_tasks = p.db.q("SELECT id, kind, status, spec, depends_on, labels, result FROM tasks WHERE status NOT IN (%s)"
                             % ",".join("?" * len(TERMINAL_TASK_STATES)), TERMINAL_TASK_STATES)
         targets: list[tuple[Path, dict | None, dict | None]] = []   # (path, task, run worktree or None)
         for path in sorted(p.worktrees.iterdir()) if p.worktrees.is_dir() else []:
