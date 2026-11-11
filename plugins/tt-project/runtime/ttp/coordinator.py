@@ -128,6 +128,7 @@ from . import onhost
 from . import claimcheck
 from . import reach
 from . import coordsession
+from . import oldorders
 from . import spans
 from . import coordtools
 from . import pointers
@@ -1477,6 +1478,7 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
     section("retired_echoes", echoes.digest_lines(p, now))
     section("guards_behind", restriction_audit.digest_lines(p))
     section("ends", ends.digest_lines(p, float(db.kv("last_coordinator_turn", 0) or 0), now))
+    section("old_orders", safe_eta(lambda: oldorders.digest_lines(p, event_ids, now), []))
     section("heal", heal.digest_lines(db, float(db.kv("last_coordinator_turn", 0) or 0), now))
     section("budget_topups", topup.digest_lines(db, float(db.kv("last_coordinator_turn", 0) or 0)))
     section("unexplained_fixes", coordfix.digest_lines(db, float(db.kv("last_coordinator_turn", 0) or 0), now))
@@ -3615,7 +3617,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                                                           a.get("standing") is True, audience, a.get("title"),
                                                           key, end)
                 added = p.add_memory(text, kind=a.get("memory_kind") or "fact", title=a.get("title"), key=key,
-                                     end=end, standing=a.get("standing") is True, audience=audience)
+                                     end=end, standing=a.get("standing") is True, audience=audience,
+                                     reason=a.get("reason"), context=oldorders.context_for(db, text))
                 if (a.get("memory_kind") or "") == "restriction":
                     notes.append(_tell_running_workers(p, f"New binding restriction: {a['text'].strip()}", key,
                                                        messages if user_turn else ()))
@@ -4029,7 +4032,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     new = sorted(set(owners) - set(obligations._owner_ids(had))) if move else []
                     notes.append(obligations.add_order(p, str(a.get("text") or ""), int(a["order"]), owners,
                                                        due=None if move else a.get("due"), start_by=a.get("start_by"),
-                                                       action_class=a.get("action_class")))
+                                                       action_class=a.get("action_class"), reason=a.get("reason")))
                     if move:   # a re-sent order's new due: after the batch, as `key`+`due` (replan)
                         due_moves.append((i, a, had["id"], f"new owner #{', #'.join(map(str, new))}" if new else None))
                     fan_orders.append((None, int(a["order"]), a.get("supersedes") or []))

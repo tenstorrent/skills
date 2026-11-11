@@ -614,7 +614,8 @@ EXTRA_KEYS = {
     # promise_default_h: when a chat promise that names no time is due (obligations.py; default 6).
     # mitigation_due_h: when a live-impact mitigation is due after it is filed (mitigate.py; default 4, 0 off).
     # course_check: thresholds of the digest's Course check ({"fails_24h", "queued_h", "spend_ratio", ...}; course.py;
-    #   self-review: "missed_deadlines", "same_wait", "self_races", "rule_clash", "recurring"; coursecheck.py;
+    #   self-review: "missed_deadlines", "same_wait", "self_races", "rule_clash", "recurring", "old_orders";
+    #   coursecheck.py;
     #   "long_promise_h": a promise on urgent work due later than this is flagged, eta.py, default 2).
     # progress_check: thresholds of the progress and stall check ({"task_h", "probe_n", "repeat_n", ...}; progress.py).
     # probe_stall_dispose_h: when the blocker sweep settles a probe stall model-free (sweep.py; default 1, 0 off).
@@ -2015,7 +2016,8 @@ class Project:
 
     def add_memory(self, text: str, kind: str = "fact", title: str | None = None, key: str | None = None,
                    end: dict | None = None, standing: bool = False, audience: str | None = None,
-                   commit: bool = True, dry_run: bool = False) -> Path:
+                   commit: bool = True, dry_run: bool = False, reason: str | None = None,
+                   context: str | None = None) -> Path:
         """One fact per file plus a one-line pointer in MEMORY.md, so the index stays cheap to load.
         A memory written again under the same `key` (a replayed coordinator turn) keeps its one
         file and line. `end` (see ends.from_action) makes it temporary: the daemon retires it then.
@@ -2023,10 +2025,14 @@ class Project:
         unless pinned already): finishing one instance never retires it (see forget_memory).
         `audience` (one of MEMORY_AUDIENCES) says whether workers get it (see worker_memory).
         `commit` False leaves the harness commit to the caller (see supersede_memory). `dry_run`
-        only returns the path it would write: no file, index line or commit."""
+        only returns the path it would write: no file, index line or commit. `reason` (why the rule
+        was given) and `context` (the user's words around it) let an old order be re-read by its
+        intent once that reason is gone (see oldorders)."""
         from .ends import front_matter
         from .forbidden import check
-        check(self, "memory", text, title or "")   # before any write: nothing refused reaches git
+        from .oldorders import one_line
+        reason, context = one_line(reason), one_line(context)
+        check(self, "memory", text, title or "", reason or "", context or "")   # before any write: nothing refused reaches git
         if standing and kind not in PINNED_MEMORY_KINDS:
             kind = "preference"
         if not dry_run:
@@ -2054,6 +2060,8 @@ class Project:
                 durable_write(path, f"---\nkind: {kind}\ncreated: {_stamp(time.time())}\n{front_matter(end or {})}"
                                     f"{'standing: true' + chr(10) if standing else ''}"
                                     f"{f'audience: {audience}' + chr(10) if audience in MEMORY_AUDIENCES else ''}"
+                                    f"{f'reason: {reason}' + chr(10) if reason else ''}"
+                                    f"{f'context: {context}' + chr(10) if context else ''}"
                                     f"{tag}---\n{text}\n")
             index = self.memory_index.read_text() if self.memory_index.exists() else ""
             line = None
@@ -2093,7 +2101,8 @@ class Project:
     def _memory_entries(self) -> list[dict]:
         """Live memory entries, oldest first: `name` (the file stem shown in prompts), `kind`, `line`,
         `end` (see ends) for a temporary one, whose line says when it ends, `standing` (see
-        add_memory), whose line says so, and `audience` (see worker_memory).
+        add_memory), whose line says so, `audience` (see worker_memory) and `reason` and `context`
+        (see add_memory; "" when not recorded).
         Ordered by the front matter's `created`, then name; the file's mtime stands in only where
         `created` is missing, so a checkout or copy that touches the files does not reorder them
         (which would change the coordinator's cached prompt)."""
@@ -2111,11 +2120,14 @@ class Project:
             end = read_front_matter(head)
             standing = bool(re.search(r"^standing:[ \t]*true[ \t]*$", head, re.M))
             aud = re.search(r"^audience:[ \t]*(\S+)", head, re.M)
+            why = re.search(r"^reason:[ \t]*(.*)$", head, re.M)
+            ctx = re.search(r"^context:[ \t]*(.*)$", head, re.M)
             ends = (" (standing)" if standing else "") + (f" ({describe(end, self)})" if end else "")
             created = c.group(1) if c else _stamp(p.stat().st_mtime)
             out.append({"name": p.stem, "kind": kind, "line": f"[{p.stem}] {body.strip()}{ends}", "end": end,
                         "body": body.strip(),
                         "standing": standing, "audience": aud.group(1) if aud else "", "created": created,
+                        "reason": why.group(1).strip() if why else "", "context": ctx.group(1).strip() if ctx else "",
                         "order": (created, p.stem)})
         out.sort(key=lambda e: e.pop("order"))
         return out

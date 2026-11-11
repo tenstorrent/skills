@@ -1734,10 +1734,11 @@ def open_order(db, message: int) -> dict | None:
 
 
 def add_order(p, text: str, message: int, owners=(), due=None, start_by=None, action_class: str | None = None,
-              chat: str | None = None, now: float | None = None) -> str:
+              chat: str | None = None, now: float | None = None, reason: str | None = None) -> str:
     """Record the order user message `message` carries, or update the open one recorded for it. Returns
-    a note."""
-    from . import replan, timefmt
+    a note. `reason` (why the user gave it) and the message's own words are kept with it, so an old
+    order is re-read by its intent once that reason is gone (oldorders.py)."""
+    from . import oldorders, replan, timefmt
     now = time.time() if now is None else now
     text = " ".join(str(text or "").split())[:TEXT_MAX]
     if not text:
@@ -1765,6 +1766,8 @@ def add_order(p, text: str, message: int, owners=(), due=None, start_by=None, ac
                 replan.note_move(pr, due_at, now, f"new owner #{', #'.join(map(str, new))}", None, "order")
             pr["tasks"] = sorted(set(pr["tasks"]) | set(ids))
             pr["class"] = action_class
+            if oldorders.one_line(reason):
+                pr["reason"] = oldorders.one_line(reason)
             if due_at is not None and due_at != pr["due"]:
                 pr.update(due=due_at, timed=True, raised=None, set_at=now)
             if start_by not in (None, "") and start_at != pr["start_by"]:
@@ -1780,7 +1783,8 @@ def add_order(p, text: str, message: int, owners=(), due=None, start_by=None, ac
                             "due": due_at if due_at is not None else now + _hours(p) * 3600,
                             "timed": due_at is not None, "tasks": ids, "obligations": [], "raised": None,
                             "set_at": now, "order": int(message), "class": action_class, "start_by": start_at,
-                            "started": None, "late": None}}
+                            "started": None, "late": None, "reason": oldorders.one_line(reason),
+                            "context": oldorders.context_for(p.db, "", int(message))}}
             note = f"order {oid} recorded from message #{message}"
         pr = o["promise"]
         p.db.set_kv(KV, st)
