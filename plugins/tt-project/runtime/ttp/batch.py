@@ -90,6 +90,7 @@ YIELD_GRACE_S = 300.0              # delivery.push_yield_grace_s: an urgent appr
 YIELD_WAIT_S = 900.0               # delivery.push_yield_wait_s: an urgent approval waits for a search whose verdict is expected this soon
 YIELD_RESTARTS = 0                 # delivery.push_yield_restarts: searches one set of approvals may stop for urgent ones (0: none, they join the next check)
 RERUN_IDS = 10                     # a check failing more tests than this is not rerun: that is no flake
+TIP_IDS = 100                      # ...but up to this many still rerun on the tip alone: those it fails are its own (_tip_ids)
 TIP_RERUNS = 3                     # reruns on the tip alone of a blamed failure's failing tests: one failing clears the entry
 TIP_RESEARCH = 3                   # searches run again in one round once the tip alone fails more tests (_research)
 HARD_TESTS = r"leak"               # delivery.push_hard_tests: failing test ids never excused as the tip's own (the leak scan)
@@ -2533,18 +2534,18 @@ class Batch:
                 return f"{verdictcarry.line(e['head'], delta)} (the task's own ttp checks run {e.get('run') or '?'})"
         return ""
 
-    def _rerun_ids(self, cmd, rc: int | None, tail: str) -> list[str]:
+    def _rerun_ids(self, cmd, rc: int | None, tail: str, cap: int = RERUN_IDS) -> list[str]:
         """The failing pytest ids of a failed check to rerun: none when the check is not one plain local
         pytest run (pushpass.resumable; a spilled check: its local original, _here), it did not exit 1 (tests failed; `rc` None: not known) or pytest
         stopped early (-x, --maxfail, an interrupt: sharedchecks.stopped_early, so later tests never ran),
-        its list of failing ids is incomplete (sharedchecks.failing_ids) or it names more than RERUN_IDS."""
+        its list of failing ids is incomplete (sharedchecks.failing_ids) or it names more than `cap`."""
         cmd = _here(cmd)
         if cmd == STALE or push.remote_host(cmd) or not pushpass.resumable(cmd):
             return []
         if rc not in (1, None) or sharedchecks.stopped_early(tail):
             return []
         ids, complete = sharedchecks.failing_ids(tail)
-        if not complete or not ids or len(ids) > RERUN_IDS:
+        if not complete or not ids or len(ids) > cap:
             return []
         return ids
 
@@ -2570,9 +2571,10 @@ class Batch:
         `head`: each flaky (passed on the rerun: quarantined, the marker's flaky_tests), pre-existing (failed
         on the tip too: the marker's pre_existing) or quarantined. The check then counts as passed in this
         batch only: no pass is recorded for the tree. Else the new ids are kept for the search
-        (self.new_ids, _ids_check) and the failure stands; a rerun that cannot tell keeps it too."""
-        ids = self._rerun_ids(cmd, rc, tail)
-        if not ids:
+        (self.new_ids, _ids_check) and the failure stands; a rerun that cannot tell keeps it too. Tests the
+        tip fails on its own (_excused) count toward no cap: more than RERUN_IDS others stand unrerun."""
+        ids = self._rerun_ids(cmd, rc, tail, TIP_IDS)
+        if not ids or len([i for i in ids if i not in self._excused()]) > RERUN_IDS:
             return False
         todo = [i for i in ids if (head, i) not in self.judged and i not in self._excused()]
         if todo:
@@ -2680,7 +2682,7 @@ class Batch:
         tree judged again once (_check), not run again. False: the batch ends tip_failed (a hard or non-pytest
         failure, or nothing new)."""
         if tf is not None:
-            self._tip_excused(tip, self._rerun_ids(tf[0], self.fail_rc.get(tf[1]), tf[1]), tf[0], why)
+            self._tip_excused(tip, self._rerun_ids(tf[0], self.fail_rc.get(tf[1]), tf[1], TIP_IDS), tf[0], why)
         if not self._excused() - before or self.researched >= TIP_RESEARCH:
             return False
         self.researched += 1
@@ -2729,12 +2731,14 @@ class Batch:
         there (the failure is the tip's own, flaky or already failing, not the entry's), True when every
         rerun passes or the tests are not on the tip (the entry's own failure), None when that cannot tell
         (no such ids, ids rerun on the tip in this batch already, a rerun out of time or one pytest ends
-        with neither). A failure whose new tests are known (_judged: self.new_ids) is judged on those alone,
+        with neither). Up to TIP_IDS failing tests rerun here, more than a head reruns (RERUN_IDS): the tip
+        fails many of them on its own often enough, and those it fails are excused (_research). A failure whose new tests are known (_judged: self.new_ids) is judged on those alone,
         as the others failed on the tip or were excused already. Base results saved for the tip on this
         host (gatejudge) count without a rerun: all passing there, True. The batch log and the marker's
         checks["tip_reruns"] keep the counts."""
         cmd = fail[0]
-        ids = self.new_ids.get(fail[1]) or self._rerun_ids(cmd, self.fail_rc.get(fail[1]), fail[1])
+        ids = self.new_ids.get(fail[1]) or [i for i in self._rerun_ids(cmd, self.fail_rc.get(fail[1]), fail[1], TIP_IDS)
+                                            if i not in self._excused()]
         if not ids:
             return None
         saved = gatejudge.saved_base(self.p.state, gatejudge.host(), tip, ids, time.time())

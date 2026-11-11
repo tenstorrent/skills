@@ -15919,6 +15919,93 @@ def test_a_push_batch_pushes_past_a_failing_test_that_fails_on_the_tip_alone_too
     assert "failed with the batch" in ev["text"] and "pre-existing" in ev["text"] and tip[:7] in ev["text"], ev["text"]
 
 
+_SCOPED_FLAKY = {"run": _FLAKY_CHECK, "if_changed": "src/**"}
+
+
+def _scoped_ids_stub(monkeypatch, tip, plan):
+    """batch._stream stubbed: `plan(where, selected)` gives the test ids failing at the tip ("tip") or a head
+    ("head"), `selected` the rerun's TTP_PYTEST_SELECT (None for the full check); the run fails when the
+    selection keeps one of them. Returns the calls (where, selected)."""
+    from ttp import batch
+    calls = []
+
+    def fake(cmd, cwd, env=None, timeout=None, group=False, pass_fds=(), collect=None, urgent_mark=False):
+        head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(cwd), capture_output=True, text=True).stdout.strip()
+        where, selected = "tip" if head == tip else "head", (env or {}).get("TTP_PYTEST_SELECT")
+        calls.append((where, selected))
+        failing = [i for i in plan(where, selected)
+                   if selected is None or re.search(selected, i.partition("::")[2])]
+        if not failing:
+            return 0, "....\n4 passed in 0.50s", False
+        lines = "".join(f"FAILED {i} - AssertionError: boom\n" for i in failing)
+        return 1, f"F...\n{lines}{len(failing)} failed, 3 passed in 0.50s", False
+
+    monkeypatch.setattr(batch, "_stream", fake)
+    return calls
+
+
+def test_an_if_changed_check_runs_on_a_commit_checked_against_itself_or_an_ancestor_of_its_base(env, monkeypatch):
+    """An empty self-diff (the tip checked alone against itself, or a head already in its base) says nothing
+    about the check's scope: the check runs, so its skip is never read as that commit's pass."""
+    from ttp import push
+    p, repo, origin, other = _push_setup(env, monkeypatch, [SCOPED])
+    _commit(repo, "notes.txt", "notes\n")
+    check = push.check_list([SCOPED])
+    head = _git_out(repo, "rev-parse", "HEAD")
+    for base in (head, "HEAD"):
+        assert push.applicable(repo, head, check, print, base) == (check, []), base
+        assert push.skip_reason(repo, head, check[0], base) is None
+    assert push.applicable(repo, "HEAD~1", check, print, head) == (check, []), "an ancestor of the base adds nothing"
+    todo, skipped = push.applicable(repo, head, check, print, "HEAD~1")
+    assert todo == [] and push.outside_scope(check, skipped), "a real out-of-scope change still skips"
+
+
+_MANY_IDS = [f"tests/test_a.py::test_broken_on_the_tip_{n:02d}" for n in range(12)]   # more than batch.RERUN_IDS
+
+
+def test_a_push_batch_never_counts_the_tip_checked_alone_as_passing_by_an_empty_self_diff(env, monkeypatch):
+    """Cell self_diff_skip: a check scoped to src/** with no test ids to rerun fails on the entry, so the
+    tip is checked alone. Diffing the tip against itself scoped the check out, and that skip read as the
+    tip's pass (tip_passed), blaming the entry. Now the check runs on the tip: it fails there too, so the
+    tip fails on its own, no entry is blamed and the marker claims no tip pass."""
+    check = {"run": "sh check.sh", "if_changed": "src/**"}
+    p, repo, origin, other = _push_setup(env, monkeypatch, [check])
+    tip = _git_out(origin, "rev-parse", "proj")
+    calls = _scoped_ids_stub(monkeypatch, tip, lambda where, sel: [_FLAKY_ID])
+    rc, m = _run_batch(p, _batch_marker(p, [_entry(repo, "e1", {"src/f1.py": "1\n"})]), monkeypatch)
+    assert calls == [("head", None), ("tip", None)], f"the tip alone must run its check, not skip it: {calls}"
+    assert not m.get("tip_passed"), "a skip on an empty self-diff is no tip pass"
+    assert m["outcome"] == "tip_failed" and "check_failed" not in _statuses(m), m
+    assert not any(f"since {tip[:10]}" in s for s in m["checks"].get("skipped", [])), m["checks"]
+    assert _git_out(origin, "rev-parse", "proj") == tip
+
+
+def test_a_push_batch_pushes_an_entry_whose_many_failing_tests_all_fail_on_the_tip_alone(env, monkeypatch):
+    """Cell tip_ids_many: the entry fails 12 tests, more than a head reruns, and the tip fails all 12 on its
+    own. They rerun on the tip alone (only those ids), are pre-existing, and the entry lands."""
+    p, repo, origin, other = _push_setup(env, monkeypatch, [_SCOPED_FLAKY])
+    tip = _git_out(origin, "rev-parse", "proj")
+    calls = _scoped_ids_stub(monkeypatch, tip, lambda where, sel: _MANY_IDS)
+    rc, m = _run_batch(p, _batch_marker(p, [_entry(repo, "e1", {"src/f1.py": "1\n"})]), monkeypatch)
+    assert rc == 0 and m["outcome"] == "pushed" and _statuses(m) == ["pushed"], m
+    assert ("tip", None) not in calls and [w for w, sel in calls if sel] == ["tip"], calls
+    assert sorted(i for pre in m["pre_existing"] for i in pre["ids"]) == _MANY_IDS, m["pre_existing"]
+    assert not m.get("tip_passed")
+    assert _git_out(origin, "rev-parse", "proj") == m["pushed_sha"] != tip
+
+
+def test_a_push_batch_refuses_an_entry_with_one_new_failure_among_many_the_tip_fails_alone(env, monkeypatch):
+    """Cell tip_ids_one_new: the entry fails 12 tests, the tip alone 11 of them. The 11 are pre-existing;
+    the 12th is new on the entry (fails on its rerun there, passes on the tip) and still blocks it."""
+    p, repo, origin, other = _push_setup(env, monkeypatch, [_SCOPED_FLAKY])
+    tip = _git_out(origin, "rev-parse", "proj")
+    _scoped_ids_stub(monkeypatch, tip, lambda where, sel: _MANY_IDS[:11] if where == "tip" else _MANY_IDS)
+    rc, m = _run_batch(p, _batch_marker(p, [_entry(repo, "e1", {"src/f1.py": "1\n"})]), monkeypatch)
+    assert _statuses(m) == ["check_failed"] and m["outcome"] != "tip_failed", m
+    assert sorted(i for pre in m["pre_existing"] for i in pre["ids"]) == _MANY_IDS[:11], m["pre_existing"]
+    assert _MANY_IDS[11] in json.dumps(m["results"]), m["results"]
+    assert _git_out(origin, "rev-parse", "proj") == tip
+
 def test_a_push_batch_pushes_past_a_failing_test_that_fails_on_a_later_tip_rerun(env, monkeypatch):
     """The failing test passes on its first rerun on the tip and fails on the second: pre-existing, as one
     failing base run makes it. The entry goes; the tip reruns stop at that failure."""

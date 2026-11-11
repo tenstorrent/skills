@@ -561,7 +561,20 @@ def _changed_reason(repo: Path, head: str, check: Check, base: str) -> str | Non
     files = [f for f in diff.stdout.splitlines() if f]
     if any(matches(files, g) for g in globs):
         return None
+    if not files and _adds_nothing(repo, base, head):
+        # An empty self-diff (the tip checked against itself, or a head already in base) proves nothing
+        # about scope: the check runs, so a skip is never read as that commit's pass.
+        return None
     return f"{head[:10]} changes nothing under {', '.join(globs)} since {base[:10]}"
+
+
+def _adds_nothing(repo: Path, base: str, head: str) -> bool:
+    """`head` has no commit beyond `base` (the same commit, or an ancestor of it). A git error reads as
+    adding nothing, so the check runs."""
+    if head == base:
+        return True
+    ahead = _git(repo, "rev-list", "--count", f"{base}..{head}")
+    return ahead.returncode != 0 or ahead.stdout.strip() == "0"
 
 
 def _tail(text: str) -> str:
