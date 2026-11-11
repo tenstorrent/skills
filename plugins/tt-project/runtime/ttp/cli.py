@@ -4832,6 +4832,16 @@ def cmd_checks(a) -> None:
             out.write(f"ttp checks: {said}\n")
             out.flush()
             print(f"ttp checks: {said}", flush=True)
+        # Nor on a workstation (checkspill.remote_only) once they failed alike on FAIL_VERDICT_HOSTS spill hosts:
+        # it never runs them here while a host is busy, so a change failing everywhere would go from host to host,
+        # then wait for the last one; failing alike there is the change's verdict.
+        elif failed_on := _spill_fail_verdict(spilled, passed, executed, timed_out, rc, failed, todo, no_spill,
+                                               log, start, top, p):
+            said = (f"the checks failed on spill hosts {', '.join(failed_on)} (exit {rc}): the change's failure, "
+                    "not a host's; not run again: fix them and commit")
+            out.write(f"ttp checks: {said}\n")
+            out.flush()
+            print(f"ttp checks: {said}", flush=True)
         # Nor when a check split off to run here failed or timed out (checkspill.stays_here): that counts as is.
         elif spilled and not passed and (executed or timed_out) and not _CHECK_STOP.get("stopped") \
                 and not (failed in todo and not getattr(failed, "spill_host", "")):
@@ -5666,10 +5676,11 @@ def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: boo
         except OSError:
             pass
 
-    def waiting(on: bool, suite: str = "", limit: int = 0, limit_from: str = "") -> None:
+    def waiting(on: bool, suite: str = "", limit: int = 0, limit_from: str = "", spill: str = "") -> None:
         # The wait is recorded before the marker shows it, so whoever sees the marker sees both. `suite`:
         # the project's suite lock it waits on (testslots.suite_hold), which the `--result` probe names
-        # with its `limit` (lanes at once) and `limit_from` (checklane.slots_from: "" for checks.slots).
+        # with its `limit` (lanes at once) and `limit_from` (checklane.slots_from: "" for checks.slots);
+        # `spill`: the busy spill hosts a workstation waits for, holding no checks slot here (_spill_wait).
         if foreground:
             lk.record_wait(run_dir, key, start, None if on else time.time())
         try:
@@ -5677,7 +5688,8 @@ def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: boo
                 write_json(run_dir / CHECKS_SLOT_WAIT, {"since": time.time(), "pid": os.getpid(), "head": head,
                                                         **({"suite": suite} if suite else {}),
                                                         **({"limit": limit} if suite and limit else {}),
-                                                        **({"limit_from": limit_from} if suite and limit_from else {})})
+                                                        **({"limit_from": limit_from} if suite and limit_from else {}),
+                                                        **({"spill": spill} if spill else {})})
             else:
                 (run_dir / CHECKS_SLOT_WAIT).unlink(missing_ok=True)
         except OSError:
@@ -5869,13 +5881,36 @@ def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: boo
             return None
 
 
+def _spill_fail_verdict(spilled, passed, executed, timed_out, rc, failed, todo, no_spill: str, log, start: int,
+                        top, p) -> list[str]:
+    """The spill hosts a workstation's checks failed on, this one included, once they are
+    checkspill.FAIL_VERDICT_HOSTS or more: its failure then counts as is (no rerun). Else []: not spilled, passed,
+    timed out, the host's own fault (exit 75), its env (push.env_problem), stopped, a check split off to run here,
+    or not a workstation."""
+    from . import checkspill, push
+    if not spilled or passed or not executed or timed_out or rc == 75 or _CHECK_STOP.get("stopped") \
+            or (failed in todo and not getattr(failed, "spill_host", "")) or not checkspill.remote_only(p.config()):
+        return []
+    hosts = checkspill.fail_hosts(checkspill.spill_off_add(no_spill, spilled.host, False))
+    if len(hosts) < checkspill.FAIL_VERDICT_HOSTS:
+        return []
+    try:
+        with open(log, "rb") as f:
+            f.seek(start)
+            if push.env_problem(f.read().decode("utf-8", errors="replace"), top):
+                return []
+    except OSError:
+        pass
+    return hosts
+
+
 def _spill_wait(run_dir: Path, out, bound: float, waiting, moved, yielder, since: float | None) -> bool:
     """Wait up to `bound` seconds for a busy spill host (checkspill.remote_only), holding nothing here: True once
     the bound passed (try the hosts again), False once the foreground wait that began at `since` ran out
     (checkcap.FOREGROUND_WAIT_S). A cancel request or a replaced head (`moved`) ends the run as in
     _checks_slot_take; `yielder()` may raise checkjoin.Yield."""
-    from . import checkcap, testslots
-    waiting(True)
+    from . import checkcap, checkspill, testslots
+    waiting(True, spill=", ".join(checkspill.LAST_BUSY) or "the spill hosts")
     try:
         end = time.time() + bound
         while True:
@@ -7328,6 +7363,9 @@ def _checks_result(run_dir: Path) -> int:
             print(f"ttp checks: waiting (pid {info['pid']}, not running) for this project's other full checks "
                   f"to end, {'one' if n == 1 else n} at a time per project and repository "
                   f"({n_from or 'checks.slots sets it'}): held by {held or 'a run that just ended'}")
+        elif isinstance(wait, dict) and wait.get("spill"):   # a workstation's wait (_spill_wait): no slot here
+            print(f"ttp checks: waiting (pid {info['pid']}, not running, holding no checks slot here) for a busy "
+                  f"spill host ({wait['spill']})")
         elif wait is not None or (run_dir / CHECKS_SLOT_WAIT).exists():
             from . import checkcap
             print(f"ttp checks: queued for a host-wide checks slot (pid {info['pid']}); "

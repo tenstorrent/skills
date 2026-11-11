@@ -131,6 +131,7 @@ SPILL_AFTER_S = 60.0
 OFF_ENV = "TTP_CHECKS_NO_SPILL"   # "1": these checks never spill; else the hosts a rerun keeps off (spill_off_add)
 HOST_FAULT_TRIES = 2   # a spill host whose own fault (exit 75) ended a run this often is kept off its rerun
 FAULT_RETRY_S = 600   # for this long, or until the checks config changes; then it is tried again
+FAIL_VERDICT_HOSTS = 2   # on a workstation (remote_only), checks that failed on this many spill hosts failed: no rerun
 ENV_FAULT_HOSTS = 2   # the checks failed at import this often on spill hosts: one fault of the spill env config
 ENV_RETRY_S = 900   # after which (or once the checks config changes) a run tries the spill hosts again
 PROBE_TIMEOUT_S = 30
@@ -1427,6 +1428,16 @@ def spill_off_add(off: str, host: str, fault: bool, env_cfg: dict | None = None,
     mark = (f"env.{_env_key(env_cfg)}.{int(time.time())}" if env_cfg is not None
             else f"fault.{_env_key(cfg) if cfg is not None else ''}.{int(time.time())}" if fault else "fail")
     return ",".join([*(e for e in off.split(",") if e and e != "1"), f"{host}:{mark}"])
+
+
+def fail_hosts(off: str) -> list[str]:
+    """The spill hosts OFF_ENV's value `off` records the checks as failing on (a ":fail" mark: neither the
+    host's own fault nor its env), in order, each once."""
+    seen: list[str] = []
+    for h, _, why in (e.rpartition(":") for e in off.split(",") if e and e != "1"):
+        if why == "fail" and h not in seen:
+            seen.append(h)
+    return seen
 
 
 def _fault_counts(why: str, key: str | None, now: float) -> bool:

@@ -4357,6 +4357,71 @@ def test_on_a_workstation_a_heavy_run_waits_for_a_busy_spill_host_and_never_runs
     assert "waiting for a busy spill host (check-host-a), not running here" in (run / "checks.log").read_text()
 
 
+def test_a_workstations_wait_for_a_busy_spill_host_says_so_and_holds_no_checks_slot(env, tmp_path, monkeypatch,
+                                                                                     capsys):
+    """Owner's msg #303 (checks waited an hour as "queued for a host-wide checks slot ... 0 running, 0 queued"):
+    a workstation's wait for a busy spill host holds no checks slot here, so its `--result` probe says it waits
+    for the spill host and the queue report files it under busy spill hosts, never offering a raise of the
+    host-wide checks cap."""
+    from ttp import checkspill, cli, queuewait
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a"])
+    p.set_config("delivery.checks_remote_only", True)
+    p.set_config("delivery.push_checks", ["true"])
+    real_pick, picks, said = checkspill.pick, [], []
+
+    def pick(*a, **k):
+        picks.append(1)
+        if len(picks) == 1:
+            checkspill.LAST_BUSY[:] = ["check-host-a"]
+            return None
+        return real_pick(*a, **k)
+    real_cancelled = cli._checks_cancelled
+
+    def cancelled(run_dir):
+        if not said:
+            capsys.readouterr()
+            cli._checks_result(run_dir)
+            said.append(capsys.readouterr().out)
+        return real_cancelled(run_dir)
+    monkeypatch.setattr(checkspill, "pick", pick)
+    monkeypatch.setattr(cli, "_checks_cancelled", cancelled)
+    cli.main(["checks", "--fresh"])
+    assert said and "for a busy spill host (check-host-a)" in said[0] and "host-wide" not in said[0], said
+    assert "holding no checks slot here" in said[0], said
+    assert queuewait.classify("ttp checks --result", said[0]) == ("spill", "")
+    assert queuewait.classify("ttp checks --result", "ttp checks: queued for a host-wide checks slot (pid 1); x") \
+        == ("checks", "")
+    w = {"task": 1, "queue": "spill", "res": "", "cap": 3, "running": [], "queued": [], "project": p.name}
+    assert not any("host_max" in o for o in queuewait.options(p.db, w, p.config(), {}, cores=64))
+
+
+@_LINUX_TMP
+def test_on_a_workstation_checks_that_fail_on_two_spill_hosts_fail_without_another_run(env, tmp_path, monkeypatch):
+    """Owner's msg #303: a workstation never runs heavy checks here while a spill host is busy, so a change that
+    fails everywhere went from host to host, then waited for the last one for hours. Failing alike on
+    checkspill.FAIL_VERDICT_HOSTS spill hosts is its verdict: it fails at once, never runs here or again."""
+    from ttp import checkspill, cli
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a", "check-host-b"],
+                                        charter=("check-host-a", "check-host-b", "check-host-c"))
+    p.set_config("delivery.checks_spill_hosts", ["check-host-a", "check-host-b", "check-host-c"])
+    p.set_config("delivery.checks_remote_only", True)
+    log = tmp_path / "where.log"
+    p.set_config("delivery.push_checks", [f"pwd >> {log}; exit 1"])
+    monkeypatch.setattr(cli, "_checks_slot_take", lambda *a, **k: pytest.fail("a heavy run took a place here"))
+    try:
+        cli.main(["checks", "--fresh"])
+    except SystemExit:
+        pass
+    rec = json.loads((run / "checks.json").read_text())
+    assert rec["passed"] is False, rec
+    where = log.read_text().splitlines()
+    assert len(where) == 2 and all("/ttp-check." in w for w in where), where
+    text = (run / "checks.log").read_text()
+    assert "failed on spill hosts check-host-a, check-host-b (exit 1): the change's failure" in text, text
+    assert checkspill.fail_hosts("a:fail,b:fault,a:fail,c:env.k.1,d:fail") == ["a", "d"]
+    assert checkspill.holders(p.name) == []
+
+
 def test_on_a_workstation_a_heavy_run_falls_back_here_only_when_every_spill_host_is_out_of_reach(
         env, tmp_path, monkeypatch):
     """No spill host reachable: the heavy run runs here (niced, in this machine's test slots); a light run never

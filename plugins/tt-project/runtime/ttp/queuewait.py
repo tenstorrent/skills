@@ -50,7 +50,8 @@ MAX_RAISE = 3   # new items per scan, so a long queue never floods the coordinat
 COVER_X = 3   # a covered wait past this many times the answered one is raised on its own
 FOLD = "fold"   # in event data: {"group", "item", "ctx", "opts"} (coordinator.fold_events)
 NAMES = {"checks": "checks queue", "push": "push queue", "workers": "worker slots", "device": "device queue",
-         "lock": "lock", "pool": "outside batch pool", "cpu": "CPU admission"}
+         "lock": "lock", "pool": "outside batch pool", "cpu": "CPU admission",
+         "spill": "busy spill hosts"}
 # Words other observations use for a queue, so a mute of one (screen.mutes) matches its waits.
 ALIASES = {"checks": ("host-wide checks slot", "checks slot", "checks queue")}
 
@@ -63,6 +64,9 @@ def threshold_s(cfg: dict) -> float:
 
 
 # A worker's own checks waiting for a slot, as its `ttp checks --result` probe's line says it (cli.checks_result).
+# Its checks on a workstation (checkspill.remote_only) waiting for a busy spill host: no checks slot here, so the
+# host-wide checks cap is no route (cli._spill_wait).
+SPILL_WAIT_RE = re.compile(r"\bttp checks: waiting \([^)]*\) for a busy spill host\b")
 CHECKS_WAIT_RE = re.compile(r"\bttp checks: (?:queued|waiting)\b|queued for a host-wide checks slot")
 
 
@@ -80,6 +84,8 @@ def classify(probe: str, reason: str, device: set | frozenset = frozenset()) -> 
         return "device", ""
     if re.search(r"\bpool-wait\b|\bsqueue\b|\bsacct\b", pr):
         return "pool", ""
+    if SPILL_WAIT_RE.search(r):   # a workstation's checks wait for a busy spill host, holding no slot here
+        return "spill", ""
     if re.search(r"\bttp checks\b[^;|&]*--result\b", pr):
         return None if "ttp checks: running" in r else ("checks", "")   # running: holds its slot, no queue wait
     if CHECKS_WAIT_RE.search(r):
@@ -287,7 +293,7 @@ def options(db, w: dict, cfg: dict, paused: dict, device: set | None = None, cor
         return []
     user_set = lambda key: configwho.role(configwho.get(db, key)) == "user"   # noqa: E731
     out, q = [], w["queue"]
-    if q in ("checks", "cpu", "pool"):
+    if q in ("checks", "cpu", "pool", "spill"):
         hosts = list((spill or ([], []))[0])
         if hosts and not user_set("delivery.checks_spill_after_s"):
             out.append(f"spill to an allowed check host ({', '.join(hosts[:3])}): config_set "
