@@ -24,6 +24,18 @@ def _head_out(ids: list) -> str:
     return "".join(f"FAILED {i} - assert 0\n" for i in ids) + f"{len(ids)} failed in 0.1s\n"
 
 
+def test_the_tests_gate_settings_are_known_config_keys_and_read_as_set():
+    """#8400: the tests gate's settings (gatejudge.settings) are known checks keys, so a project can set them
+    (checks.judge_max_ids above 10 judges a check failing more tests); before, each was an unknown key."""
+    from ttp import gatejudge, project
+    checks = {"judge": False, "quarantine_days": 7, "judge_max_ids": 200, "judge_rerun_s": 900,
+              "judge_busy_tries": 2, "judge_busy_wait_s": 5}
+    assert project.config_problems({"checks": checks}) == []
+    got = gatejudge.settings({"checks": checks})
+    assert got["on"] is False and got["max_ids"] == 200 and got["rerun_s"] == 900 and got["days"] == 7, got
+    assert gatejudge.settings({})["max_ids"] == gatejudge.MAX_IDS
+
+
 def test_gate_judge_sorts_pre_existing_flaky_and_new_failures(tmp_path):
     from ttp import gatejudge
     a, b, c = "tests/test_a.py::test_pre", "tests/test_a.py::test_flaky", "tests/test_a.py::test_new"
