@@ -510,7 +510,7 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
     working = db.q("SELECT r.id run, r.task, r.role, r.provider, r.model, r.effort, r.started, r.cost_usd, r.dir, "
                    "r.note run_note, t.title FROM runs r "
                    "LEFT JOIN tasks t ON t.id=r.task WHERE r.status='running' ORDER BY r.id")
-    from . import modelrank, runwatch   # the daemon's live record of each run; the progress.md tail is the fallback
+    from . import batchrun, modelrank, runwatch   # the daemon's live record of each run; the progress.md tail is the fallback
     live = runwatch.load(p)["runs"] if working else {}
     for w in working:
         rw = live.get(str(w["run"])) or {}
@@ -521,6 +521,7 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
         w["doing"], w["checks"], w["files_n"] = runwatch.doing(rw), rw.get("checks") or "", rw.get("files_n") or 0
         w["floor"] = run_floor(w["run_note"])
         w["wake"] = run_wake(w.pop("run_note"))
+        w["batch"] = batchrun.view(db, w["task"])   # a batch run: one run, its member tasks (batchrun.py)
     spend = {"spent_24h": round(db.spent_since(now - DAY), 2), "spent_7d": round(db.spent_since(now - WEEK), 2),
              "top_7d": top if top and top["usd"] else None, "in_flight": round(bud.in_flight(db), 2)}
     from . import audit   # runs by provider and how their cost was known: measured apart from guessed $

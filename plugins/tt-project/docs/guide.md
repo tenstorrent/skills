@@ -1785,6 +1785,24 @@ the pick order, so it takes the first starts. A resumed resource ramps only its 
   changelogs, changesets, manifests, `__init__.py`), `hub_bytes` (tracked files larger than this,
   150000, touched by most changes, never count), `branch_days` (14) and `settled_days` (14). Folders and the files the
   check commands (`delivery.push_checks`) name never count either: specs cite those as the required suite.
+- Batch runs: a worker that starts a code task also takes up to `dispatch.batch_max` (5) other small
+  ready code tasks in the same run, on the same worktree and branch, so related small changes do not
+  each need their own worker and branch. A task joins only when it is queued, of the same repo, light
+  or standard tier, not exclusive, holds no device or machine resource, has the lead's provider and
+  model pins or none, was not set to deep by the user, has no branch of its own and has budget left.
+  Tasks naming files the lead's spec names come first, then by priority; one whose files a task on
+  another branch is changing stays out; one that depends on another member comes after it. Whatever
+  dispatch picks first leads, so an urgent task never waits for a batch to fill, and an urgent task
+  never joins another's run: it starts in a worker of its own, in parallel. The worker commits
+  each task separately with a `Task: #<id>` trailer and hands off one outcome per task (`members` in
+  result.json); the batch's one review and one checks run cover the branch. Once the lead ends, a
+  member done in the run is done on the lead's branch, a blocked one is blocked with its reason, and
+  a failed one goes back to the queue alone. The run's budget is the sum of the members' remaining
+  budgets, capped at the deep tier's default, and its cost is split between them pro rata to their
+  budgets, so each task's spend stays its own. `ttp status`, the web app and the coordinator show
+  the run once, as `#<lead> (batch b<lead>: +#a, #b)`; each member's line says `in batch run
+  b<lead> led by #<lead>`. Settings: `dispatch.batch` (on; `ttp config <name> dispatch.batch false`
+  turns it off) and `dispatch.batch_max` (5).
 - tt-project never keeps a machine awake by default: `runner.prevent_idle_sleep` is `off`, and you
   keep your Mac awake yourself as needed. Set it to `on` (or `auto`, on for a Mac) with
   `ttp config <name> runner.prevent_idle_sleep on`; a value you set stays across upgrades. Then,

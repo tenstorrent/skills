@@ -1275,10 +1275,17 @@ def _worker_line(p: Project, e: dict, now: float, tag: str) -> tuple[str, str]:
     tail = [clip(check, 40), money] + ([steer + ago] if steer else []) + ([flags] if flags else [])
     tail_text = " | ".join([files] + tail)
     label = f"worker step of #{e.get('task')}"
-    room = WORKER_LINE_CHARS - len(f"- #{e.get('task')} |  | ") - len(tail_text)
+    who = f"#{e.get('task')}" + _batch_note(p, e.get("task"))
+    room = WORKER_LINE_CHARS - len(f"- {who} |  | ") - len(tail_text)
     # Clipped before it is enclosed, and the cut falls on the tail: a cut never drops the span's end.
-    head = f"- #{e.get('task')} | {spans.wrap(clip(step, max(room, 20)), label, tag)} | "
+    head = f"- {who} | {spans.wrap(clip(step, max(room, 20)), label, tag)} | "
     return head + tail_text[:max(WORKER_LINE_CHARS - len(spans.strip(head)), 0)], ident
+
+
+def _batch_note(p: Project, task) -> str:
+    """' (batch b<lead>: +#a, #b)' for a run that leads a batch run (batchrun.py), else ''."""
+    from . import batchrun
+    return batchrun.words(batchrun.view(p.db, task))
 
 
 def workers_lines(p: Project, db, seen: dict | None, fold: bool, now: float,

@@ -1857,11 +1857,12 @@ def status_text(p: Project, verbose: bool = False) -> str:
         lines.append(f"idle: {h['why_idle']}")
     elif h["held"]:
         lines.append(f"held: {h['held']}")
-    from . import topup
+    from . import batchrun, topup
     topped = topup.counts(db)   # urgent or user-ordered tasks whose budget the daemon raised (topup.py)
     for w in h["working"][:8]:
         what = f"#{w['task']} {w['title']}" if w["task"] else w["role"]
-        lines.append(f"  running {since(w['started'], now)}: {what}" + (f" ({w['wake']} wake)" if w.get("wake") else "")
+        lines.append(f"  running {since(w['started'], now)}: {what}" + batchrun.words(w.get("batch"))
+                     + (f" ({w['wake']} wake)" if w.get("wake") else "")
                      + (f" [{w['floor']}]" if w.get("floor") else "")
                      + (f" [sandbox {w['sandbox']}]" if w.get("sandbox") else "")
                      + (f" [on {w['model']}]" if "(stand-in for " in str(w.get("model") or "") else "")

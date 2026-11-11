@@ -37,6 +37,7 @@ import uuid
 from pathlib import Path
 
 from . import runtimeload   # first of its own: its LOADED_AT is when the daemon imported its code
+from . import batchrun
 from . import untrusted
 from . import branchcap
 from . import sshmux
@@ -5041,6 +5042,7 @@ class Daemon:
                              estimated=bool(cur["cost_estimated"]), ts=now)
                     if r["task"]:
                         db.x("UPDATE tasks SET spent_usd=COALESCE(spent_usd,0)+? WHERE id=?", (cost, r["task"]))
+                        batchrun.book(db, r["task"], cost)
                 if r["role"] == "coordinator":
                     self._coordinator_failed(why)
                 elif r["task"] and (db.task(r["task"]) or {}).get("status") == "running":
@@ -5063,8 +5065,13 @@ class Daemon:
         from . import checkgaps
         checkgaps.rerun(self)
         db, now = self.p.db, time.time()
+        for mid, st in batchrun.tend(self.p):   # a batch whose lead ended: each member settles alone
+            log(self.p, f"task {mid}: batch member settled {st}")
+        in_batch = batchrun.held(db)   # members of a live batch run: the lead's run is theirs
         for t in db.q("SELECT * FROM tasks WHERE status='running' AND NOT EXISTS "
                       "(SELECT 1 FROM runs WHERE runs.task=tasks.id AND runs.status='running')"):
+            if t["id"] in in_batch:
+                continue
             last = db.one("SELECT * FROM runs WHERE task=? ORDER BY id DESC LIMIT 1", (t["id"],))
             if last and self._run_alive(last):
                 continue
@@ -6471,6 +6478,7 @@ class Daemon:
                          tokens_out=usage.output_tokens, ts=ended)
                 if r["task"]:
                     db.x("UPDATE tasks SET spent_usd=COALESCE(spent_usd,0)+? WHERE id=?", (usage.cost_usd, r["task"]))
+                    batchrun.book(db, r["task"], usage.cost_usd)   # a batch run's members get their share
                     runtimeload.clear(p, r["id"])   # finished once: a restart after this never finishes it again
                 self._record_readings(db, r["provider"], read_as, usage, ended)
                 if usage.limited:
@@ -11986,6 +11994,7 @@ class Daemon:
         if walked:
             ready = _rotate_walked(ready, set(walked), _owner_due(db), now)
         ramp = rampup.active(db, self.cfg, now) if ready else None
+        batched: set[int] = set()   # tasks a batch run started this tick took along (batchrun.py)
         for i, task in enumerate(ready):
             if not self.lease_held():   # lapsed during this tick (a slow start or store): start nothing more
                 break
@@ -11995,6 +12004,8 @@ class Daemon:
                 break
             if task["id"] not in walked:
                 walked.append(task["id"])   # kept as it grows: a step killed mid-task resumes past it
+            if task["id"] in batched:
+                continue
             if why := dispatchguard.refusal(db, task):   # ended since the read, or done again and again
                 log(self.p, f"task {task['id']} not dispatched: {why}")
                 dispatchguard.refuse(db, task["id"], why)   # still queued: back to done, on record
@@ -12265,9 +12276,16 @@ class Daemon:
                                                conflict=note.get(conflictfix.KEY)), None
                 prompt += startcheck.prompt_lines(found)   # a resumed session is told too
                 prompt += probewake.prompt_lines(woke_probe, lambda ts: timefmt.long(ts, self.p))
+                members = [] if note.get("wake") or note.get("resumes") else \
+                    self._batch_members(task, ready, batched | set(fate), live)
+                if members:
+                    note["batch"] = {"id": f"b{task['id']}", "members": [m["id"] for m in members]}
+                    prompt += batchrun.prompt_block(self.p, task, members, branch)
+                    remaining = batchrun.budget(self.cfg, task, remaining, members)
                 db.update_task(task["id"], status="running", branch=branch, blocked_reason=None)
                 run_id = self.start_run("worker" if task["kind"] != "review" else "reviewer", prompt, run_prov, tier, cwd,
-                                        task=task, budget_usd=max(remaining, 0.5) if task["budget_usd"] else None,
+                                        task=task, budget_usd=max(remaining, 0.5) if task["budget_usd"] or members
+                                        else None,
                                         timeout_s=(routed or {}).get("timeout_s"),
                                         read_only=False, append_system=system, note=note,
                                         resume=lost["session"] if lost else None,
@@ -12277,6 +12295,15 @@ class Daemon:
                     db.x("DELETE FROM kv WHERE key=?", (probewake.KV_PREFIX + str(task["id"]),))
                 if lease:   # the lease now names the run's supervisor in place of the daemon
                     self._route_lease(task, routed, tier, now, run_id=run_id)
+                if members:
+                    batchrun.record(db, task, members, branch, self.cfg, run=run_id)
+                    for m in members:
+                        db.update_task(m["id"], status="running", branch=branch,
+                                       blocked_reason=f"in batch run b{task['id']} led by #{task['id']}")
+                        live[m["id"]] = worktree.claims(self.p, dict(m, branch=branch))
+                        batched.add(m["id"])
+                    log(self.p, f"task {task['id']}: batch run b{task['id']} takes "
+                                + ", ".join(f"#{m['id']}" for m in members))
             except Exception as e:
                 self._start_failed(task, e)
                 self._unreserve(task)
@@ -12382,6 +12409,22 @@ class Daemon:
                                                                    schedlog.slot_users(db)),
                         self.__dict__.setdefault("_schedlog", {}), lambda msg: log(self.p, msg))
 
+    def _batch_members(self, lead: dict, ready: list[dict], taken: set[int], live: dict) -> list[dict]:
+        """The ready code tasks to take into `lead`'s run (batchrun.pick): none already started, taken or
+        held by another live task's branch or worktree. Never raises: a fault starts the lead alone."""
+        db = self.p.db
+        try:
+            if lead["kind"] != "code" or not batchrun.enabled(self.cfg) or batchrun.members_of(db, lead["id"]):
+                return []
+            cands = [t for t in ready if t["id"] not in taken and t["id"] != lead["id"]
+                     and (cur := db.task(t["id"])) and cur["status"] == "queued"
+                     and not self._branch_clash(t, {k: v for k, v in live.items() if k != lead["id"]})]
+            inflight = db.q("SELECT * FROM tasks WHERE status='running' AND kind='code'")
+            return batchrun.pick(self.p, self.cfg, lead, cands, inflight)
+        except Exception:
+            log(self.p, f"task {lead['id']}: batch pick failed\n" + traceback.format_exc())
+            return []
+
     def _live_claims(self) -> dict[int, tuple[set[str], set[str]]]:
         """worktree.claims of each running task, by id."""
         return {t["id"]: worktree.claims(self.p, t) for t in self.p.db.q(
@@ -12396,8 +12439,10 @@ class Daemon:
         of its own (worktree.ensure) from that branch's head. Changes nothing (_start_hold runs it)."""
         db = self.p.db
         mine, why = worktree.claims(self.p, task), None
+        rec = batchrun.members_of(db, task["id"])
+        mates = {rec["lead"], *rec.get("members", [])} if rec else set()   # one batch run shares its branch
         for tid, theirs in sorted(live.items()):
-            if tid != task["id"] and (what := worktree.clash(mine, theirs)):
+            if tid != task["id"] and tid not in mates and (what := worktree.clash(mine, theirs)):
                 why = (tid, what)
                 break
         if why is None and (hid := worktree.lineage_hold(task)) and (h := db.task(hid)) \
