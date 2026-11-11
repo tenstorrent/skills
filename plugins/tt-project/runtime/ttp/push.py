@@ -4614,7 +4614,7 @@ def _run_one(cmd: Any, repo: Path, env: dict, say: Callable[[str], None], seen: 
         mark = landmark.hold() if env.get("TTP_PUSH_MODE") == "target" else None
         try:
             argv = testslots.low_priority(check_argv(cmd, repo, env))
-            guard = hoststate.Guard(env, argv=argv)   # the real crontab and units, compared after a local check
+            guard = hoststate.Guard(env, tokens=[repo], argv=argv)   # the real crontab and units, compared after a local check
             # own session: its group is ended once it ends (_end_group), or by checkgroup if this push dies first
             proc = subprocess.Popen([*CHECK_GROUP, str(os.getpid()), "--", *argv], cwd=repo,
                                     env={**{k: v for k, v in env.items() if k != landmark.ENV}, checkwait.ENV: str(waits),

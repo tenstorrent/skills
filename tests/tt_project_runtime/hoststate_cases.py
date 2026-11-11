@@ -386,6 +386,73 @@ def test_local_share_units_guarded(tmp_path, monkeypatch):
     assert not list(units.iterdir())
 
 
+FOREIGN = "@reboot bash /opt/demo-series/job-a/resume.sh 600 # ttp-series-resume:job-a"
+FOREIGN_GONE = "@reboot bash /opt/demo-series/job-b/resume.sh 600 # ttp-series-resume:job-b"
+
+
+def test_a_crontab_change_another_process_makes_during_a_check_is_left_alone_and_never_fails_it(
+        tmp_path, monkeypatch):
+    # A live job outside the run registers and drops its own @reboot lines while a check runs: the
+    # guard cannot tie them to the run, so it reports them, keeps them and passes the check.
+    from ttp import push
+    cron, tabf, units = _fake_host(tmp_path, monkeypatch, f"0 1 * * * keep\n{FOREIGN_GONE}\n")
+    (units / "demo.service").write_text("[Service]\nExecStart=/opt/demo-series/job-b/run.sh\n")
+    got = _ledger(monkeypatch)
+    env = push.check_env("checks", run_dir=str(tmp_path / "run"))
+    script = (f"printf '0 1 * * * keep\\n{FOREIGN}\\n' | {shlex.quote(str(cron))} - && "
+              f"rm {shlex.quote(str(units / 'demo.service'))}")
+    log = tmp_path / "checks.log"
+    with open(log, "w") as out:
+        rc = _run_check_ended(["sh", "-c", script], cwd=tmp_path, stdout=out, stderr=subprocess.STDOUT, env=env)
+    text = log.read_text()
+    assert rc == 0, text
+    assert "host guard: left in place" in text and "job-a" in text and "job-b" in text, text
+    assert "host guard: FAILED" not in text and got == [], text
+    assert tabf.read_text() == f"0 1 * * * keep\n{FOREIGN}\n"   # neither reverted
+    assert not (units / "demo.service").exists()
+
+
+def test_a_check_s_own_crontab_line_in_its_working_tree_fails_it_and_only_its_own_line_goes(
+        tmp_path, monkeypatch):
+    # The line names the check's working tree (its cwd), not its run folder: still the run's own.
+    from ttp import push
+    cron, tabf, _ = _fake_host(tmp_path, monkeypatch, "0 1 * * * keep\n")
+    _ledger(monkeypatch)
+    env = push.check_env("checks", run_dir=str(tmp_path / "run"))
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    own = f"@reboot {tree}/made-by-a-test.sh"
+    log = tmp_path / "checks.log"
+    with open(log, "w") as out:
+        rc = _run_check_ended(["sh", "-c", f"printf '0 1 * * * keep\\n{FOREIGN}\\n{own}\\n' | "
+                               f"{shlex.quote(str(cron))} -"], cwd=tree, stdout=out,
+                              stderr=subprocess.STDOUT, env=env)
+    text = log.read_text()
+    assert rc == 1 and "host guard: FAILED" in text and "made-by-a-test" in text, text
+    assert "left in place" in text and "job-a" in text, text
+    assert tabf.read_text() == f"0 1 * * * keep\n{FOREIGN}\n"
+
+
+def test_a_host_restore_reads_the_crontab_again_and_keeps_a_line_written_after_the_compare(
+        tmp_path, monkeypatch):
+    from ttp import hoststate
+    _, tabf, _ = _fake_host(tmp_path, monkeypatch, "0 1 * * * keep\n")
+    _ledger(monkeypatch)
+    g = hoststate.Guard({}, tokens=[str(tmp_path / "run")])
+    own = f"@reboot {tmp_path}/run/made-by-a-test.sh"
+    tabf.write_text(f"0 1 * * * keep\n{own}\n")
+    snap = hoststate.snapshot
+
+    def compare_then_concurrent_write():
+        got = snap()
+        tabf.write_text(tabf.read_text() + FOREIGN + "\n")   # another process, between compare and restore
+        return got
+    monkeypatch.setattr(hoststate, "snapshot", compare_then_concurrent_write)
+    changed, said = g.end()
+    assert changed and any("FAILED" in s for s in said), said
+    assert tabf.read_text() == f"0 1 * * * keep\n{FOREIGN}\n"
+
+
 def test_installers_write_to_the_fake_store_only_under_the_marker_with_the_real_home(tmp_path, monkeypatch):
     from ttp import hoststate
     store = tmp_path / "store"
