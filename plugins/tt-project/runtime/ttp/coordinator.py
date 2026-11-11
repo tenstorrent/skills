@@ -96,6 +96,7 @@ from . import (   # one name per line: two changes adding names merge without a 
     restriction_audit,
     restriction_source,
     reviewcap,
+    routinedefault,
     rulecite,
     runcap,
     sandboxstate,
@@ -1552,6 +1553,7 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
     section("heal", heal.digest_lines(db, float(db.kv("last_coordinator_turn", 0) or 0), now))
     section("budget_topups", topup.digest_lines(db, float(db.kv("last_coordinator_turn", 0) or 0)))
     section("unexplained_fixes", coordfix.digest_lines(db, float(db.kv("last_coordinator_turn", 0) or 0), now))
+    section("routine_defaults", routinedefault.digest_lines(db, float(db.kv("last_coordinator_turn", 0) or 0), now))
     section("noisy_watchers", watchdup.digest_lines(db, float(db.kv("last_coordinator_turn", 0) or 0), now))
     section("queue_backlog", queuetrim.digest_lines(db, float(db.kv("last_coordinator_turn", 0) or 0), now))
     section("model_demotions", modeldemote.digest_lines(db, float(db.kv("last_coordinator_turn", 0) or 0), now))

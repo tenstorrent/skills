@@ -162,6 +162,7 @@ UNWRITABLE = (errno.EROFS, errno.EACCES, errno.EPERM)   # the shared ledger is f
 CLAIM_S = 120               # a pending page one daemon took and did not mark delivered is retried after this
 UNAVAILABLE_S = 1800         # a target that cannot act this long is passed over
 REPAGE_S = 86400             # an item still open this long after its page is paged again, one step on
+RENEW_LEAD_S = 600           # an own entry this close to expiry may be renewed (Probes._renew)
 USER_AFTER_S = 86400         # an expired change reaches the user only once unhandled this long, and only when risky
 
 # Risk rule for an expired change record (change_risk): only a risky one ever reaches the user, and only after its
@@ -1962,6 +1963,7 @@ class Probes:
         if passed or any((c.get("id"), c.get("probe")) in unpassed and c.get("probe_passed") for c in changes()):
             self._mark(passed, unpassed, now)
         self._tasks(now)
+        self._renew(now)
         self._auto_undos(now)
         for c in changes():
             if c.get("kind") == POWER_CYCLE and float(c.get("expires") or 0) <= now:   # any daemon: the maker's may be gone
@@ -2030,6 +2032,61 @@ class Probes:
                     c.update(task_ended=now, task_end_why=over[(c["id"], c["until_task"])],
                              **({"task_status": status[c["until_task"]]} if c["until_task"] in status else {}))
             _write(LEDGER, doc)
+
+    def _renew(self, now: float) -> None:
+        """Routine default (routinedefault.py): renew this project's open entries about to expire, or
+        expired, whose own task is still open or whose until-probe still says not yet, by the entry's own
+        span (RENEW_MIN_S to RENEW_MAX_S), at most RENEW_MAX times each, so no page wakes the coordinator.
+        Never runs an undo: a no-op undo still auto-closes in route, and anything else pages."""
+        from . import routinedefault as rd
+        try:
+            cfg = self.p.config() if callable(getattr(self.p, "config", None)) else {}
+        except Exception:   # an unreadable config: the default stays on, as documented
+            cfg = {}
+        if not rd.on(cfg):
+            return
+        due = {}
+        for c in changes():
+            if c.get("by") != self.p.name or c.get("closed") or c.get("kind") == POWER_CYCLE \
+                    or c.get("kind") in EXPIRY_UNDO_KINDS or c.get("auto_undo") or noop_undo(c.get("undo")) \
+                    or c.get("probe_passed") or c.get("probe_job_failed") or c.get("task_ended") \
+                    or not c.get("expires") or float(c["expires"]) - now > RENEW_LEAD_S \
+                    or len(c.get("auto_renewed") or []) >= rd.RENEW_MAX:
+                continue
+            why = ""
+            for tid in (c.get("task"), c.get("until_task")):
+                row = self.p.db.task(int(tid)) if str(tid or "").isdigit() else None
+                if row is not None and row["status"] not in TERMINAL_TASK_STATES:
+                    why = f"its task #{tid} is still {row['status']}"
+                    break
+            if not why and c.get("probe") and not trivial_probe(c) and c.get("id") not in self._reported:
+                why = "its until-probe still says not yet"
+            if why:
+                due[c["id"]] = why
+        if not due:
+            return
+        done = []
+        with _locked():
+            doc = _read(LEDGER, {"next": 1, "changes": []})
+            for c in doc.get("changes", []):
+                if c.get("id") not in due or c.get("closed") or c.get("by") != self.p.name:
+                    continue
+                old = float(c["expires"])
+                span = min(max(old - float(c.get("added") or old), rd.RENEW_MIN_S), rd.RENEW_MAX_S)
+                c["expires"] = max(old, now) + span
+                c.setdefault("auto_renewed", []).append({"at": now, "from": old, "why": due[c["id"]]})
+                if c.pop("page", None) is not None:
+                    c["page_from"] = now   # a later expiry starts a new page episode
+                done.append(c)
+            _write(LEDGER, doc)
+        for c in done:
+            n = len(c["auto_renewed"])
+            msg = (f"renewed #{c['id']} on {c['alias']} to {ends.shown(c['expires'], self.p)} "
+                   f"({n} of {rd.RENEW_MAX}): {due[c['id']]}: {c['what']}")
+            self.log(f"machine change {msg}")
+            with contextlib.suppress(Exception):   # the renewal stands even if its record cannot be written
+                rd.record(self.p.db, "renew", f"machine-change:{c['id']}", msg,
+                          f"ttp machines change edit {c['id']} --expires <time>, or close it", now)
 
     def _auto_undos(self, now: float) -> None:
         """Run the undo of this project's --auto-undo entries once due (module doc: Auto-undo): reap the runs

@@ -687,6 +687,9 @@ EXTRA_KEYS = {
     #   "long_promise_h": a promise on urgent work due later than this is flagged, eta.py, default 2).
     # progress_check: thresholds of the progress and stall check ({"task_h", "probe_n", "repeat_n", ...}; progress.py).
     # probe_stall_dispose_h: when the blocker sweep settles a probe stall model-free (sweep.py; default 1, 0 off).
+    # routine_defaults: the daemon settles own expired machine changes, run caps and new probe stalls itself
+    # and wakes the coordinator only when no default applies or the item comes back (routinedefault.py;
+    # default true, false off).
     # echo_paths: more files or folders (relative to the project root) the retired-rule echo scan reads,
     # such as a repo's recovery scripts (echoes.py; default none).
     # agent_orders_as_user: the owner's own chat agent's relayed context and findings count as the owner's
@@ -708,7 +711,7 @@ EXTRA_KEYS = {
     # outside_spec 3, quiet_s 900, pace 1.5, and raise_s 600 before a still-flagged run reaches the coordinator.
     "coordinator": {"session", "status_footer", "agent_orders_as_user", "owner_identities", "max_review_tasks_per_day", "charter_approval_days", "approval_lookback_days", "reask_window_days", "blocker_sweep_h", "blocker_sweep_min_gap_h",
                     "blocker_sweep_recheck_skip_h", "review_backlog_h", "user_pause_marker", "promise_default_h", "mitigation_due_h", "course_check",
-                    "progress_check", "probe_stall_dispose_h", "echo_paths", "drift",
+                    "progress_check", "probe_stall_dispose_h", "routine_defaults", "echo_paths", "drift",
                     "reply_terms", "reply_max_terms", "reply_soft_chars"},   # plain-reply check (plainreply.py)
     # hold_s: how long a worker's normal notify from a blocked, waiting, failed or needs_review run waits
     # for the coordinator before it is posted unchanged (workernotify.py; default 900, 0 posts at run end).

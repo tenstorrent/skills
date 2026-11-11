@@ -9988,7 +9988,7 @@ class Daemon:
             log(self.p, f"progress check: machine ledger not read: {e}")
             changes = None
         for e in progress.check(self.p.db, self.cfg, self.p.state, now, where=self.p, current_probe=_current_probe,
-                                changes=changes):
+                                changes=changes, recheck=self._probe_now):
             log(self.p, f"progress check: {e['kind']} for {', '.join(e['keys'])}")
         self.close_absent_waits(now)
 

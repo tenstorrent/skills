@@ -2287,7 +2287,7 @@ def cmd_replicate(a) -> None:
 
 def cmd_audit(a) -> None:
     """The daily review's self-efficiency audit of this project's last `--hours`, model-free."""
-    from . import audit, coordfix
+    from . import audit, coordfix, routinedefault
     if a.name == "why":   # the session coordinator's why for its next hands-on changes (coordfix.py)
         run = os.environ.get("TTP_RUN_DIR")
         if not run or not Path(run).is_dir():
@@ -2316,6 +2316,8 @@ def cmd_audit(a) -> None:
             die(str(e))
         rows = coordfix.entries(p.db, since, now)
         print(json.dumps(rows, indent=1) if a.json else coordfix.fixes_text(p.db, since, timefmt.home(p), now))
+        if not a.json and (routine := routinedefault.fixes_text(p.db, since, timefmt.home(p), now)):
+            print(routine)
         return
     hours = float((p.config().get("review") or {}).get("blocked_long_h", audit.BLOCKED_H))
     if a.json:

@@ -9,14 +9,16 @@ stalled run, a waiting wake, a restart) all count; runs that never reached the m
 Progress is a hand-off of done or waiting, or a commit made inside the run (chaincap.code_commits).
 The task is blocked, and the coordinator gets one RUN_CAP_EVENT per requeue with a model-free summary:
 each run's tier, end, spend and what it handed off, and the last error. The coordinator decides (a new
-approach, a narrower spec, cancel); its requeue starts the count again. 0 turns a cap off."""
+approach, a narrower spec, cancel); its requeue starts the count again. 0 turns a cap off.
+Routine default (routinedefault.py): a task's first cap is only held and listed in the next digest, no
+wake; the same task at its cap again wakes the coordinator."""
 from __future__ import annotations
 
 import json
 import time
 from pathlib import Path
 
-from . import chaincap
+from . import chaincap, routinedefault
 from .db import load_result
 from .dispatchguard import EXPLICIT_SOURCES, REQUEUED
 
@@ -103,6 +105,8 @@ def check(p, cfg: dict, task: dict) -> str:
         return ""
     text = summary(task, rows)
     fp = f"{RUN_CAP_EVENT}:{task['id']}:{req}"
+    # Routine default: the first cap only holds it and lists it in the next digest; the same task back wakes.
+    quiet = routinedefault.on(cfg) and not routinedefault.seen(db, RUN_CAP_EVENT, f"#{task['id']}")
     with db.tx():
         db.x("UPDATE tasks SET status='blocked', blocked_reason=?, updated=? WHERE id=? AND status='queued'",
              (f"run cap: {reason}"[:500], time.time(), task["id"]))
@@ -112,5 +116,10 @@ def check(p, cfg: dict, task: dict) -> str:
                  (time.time(), f"task:{task['id']}", RUN_CAP_EVENT, fp, "normal",
                   f"{TRIGGER}: #{task['id']} {task['title']}: {reason}. The daemon starts no same-approach retry. "
                   f"{text} Decide: requeue it with a new approach or narrower spec, or cancel it.",
-                  json.dumps({"reason": reason, "runs": [r["id"] for r in rows]}), "queued", task["id"]))
+                  json.dumps({"reason": reason, "runs": [r["id"] for r in rows]}), "handled" if quiet else "queued",
+                  task["id"]))
+            if quiet:
+                routinedefault.record(db, RUN_CAP_EVENT, f"#{task['id']}",
+                                      f"held {task['title'][:80]}: {reason}. {text}"[:300],
+                                      "requeue it with a new approach or narrower spec, or cancel it")
     return reason

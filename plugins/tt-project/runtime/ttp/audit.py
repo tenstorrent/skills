@@ -59,7 +59,7 @@ import statistics
 import time
 from typing import Any
 
-from . import budget, chaincap, dailyspend, checkprestage, coordfix, coordmodel, correction, ends, gatejudge, gatetime, obligations, outscan, plainreply, planuse, quietgate, relay, replan, reviewstats, route, rulecite, schedule, settlehook, sharedchecks, stalegate, suitecost, sweepskip, timefmt, turngate, unblock, upstream
+from . import budget, chaincap, dailyspend, checkprestage, coordfix, coordmodel, correction, ends, gatejudge, gatetime, obligations, outscan, plainreply, planuse, quietgate, relay, replan, reviewstats, routinedefault, route, rulecite, schedule, settlehook, sharedchecks, stalegate, suitecost, sweepskip, timefmt, turngate, unblock, upstream
 from .db import DB, continues_id, load_result
 from .project import Project
 
@@ -584,6 +584,8 @@ def lines(db: DB, now: float | None = None, window_s: float = WINDOW_S, blocked_
         out.append(orders)
     if hands_on := coordfix.audit_line(db, since, now):
         out.append(hands_on)
+    if routine := routinedefault.audit_line(db, since, now):
+        out.append(routine)
     if p is not None and (cites := rulecite.audit_line(p, now, window_s)):
         out.append(cites)
     if chains := chaincap.audit_line(db, since, TOP):

@@ -67,7 +67,13 @@ disk untouched, with no migration; nothing else is reclaimed by check recovery.
    (eventhold.gap_until, waketriage.py). A ride-along event (data flag `ride_along`: a forgotten
    `continue:` follow-up, a repeat block of a non-urgent task) starts no turn alone: it joins the
    next turn something else starts, or starts one an hour after it was raised. It stays queued
-   in the database, so a restart keeps it (pagesev.py). A slow tick step's reports
+   in the database, so a restart keeps it (pagesev.py). Routine defaults (routinedefault.py) settle three
+   triggers with no model call: a project's own machine change about to expire whose task is open or
+   whose until-probe still says not yet is renewed by its own span (1 to 24 h), at most twice, never
+   undone; a task's first run cap holds it blocked; a new probe stall re-runs its probe and wakes only
+   if it still says not yet. Each is listed once in the next digest, in the daily review and in
+   `ttp audit fixes`; the same item back, or no default that applies, wakes as before. Off:
+   `ttp config <project> coordinator.routine_defaults false`. A slow tick step's reports
    (tick_step_slow, tick_step_degraded, tick_step_incident: pagesev.TICK_KINDS) never start a turn,
    not even after that hour. Relayed messages (`ttp say` from another agent) with no order or
    question wait up to `coordinator.relay_window_s` (90 s; 0: off) after the oldest, so a burst is

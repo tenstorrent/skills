@@ -88,7 +88,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-from . import ackwait, startgate, userpause
+from . import ackwait, routinedefault, startgate, userpause
 from .db import DB, TERMINAL_TASK_STATES, deferral, load_result, waiting_handoff
 from .project import durable_append
 
@@ -768,11 +768,11 @@ def _unraise(st: dict, key: str, now: float) -> None:
 
 def check(db: DB, cfg: dict | None, state_dir: Path | str | None, now: float | None = None, where: Any = None,
           current_probe: Callable[[dict], str | None] | None = None, wake: bool = True,
-          changes: list[dict] | None = None) -> list[dict]:
+          changes: list[dict] | None = None, recheck: Callable[[str, str], Any] | None = None) -> list[dict]:
     """One pass: read drivers' results, find every stuck condition, raise one event per kind for the
     keys due a wake (muted keys only counted) and clear the keys healthy long enough. `changes`: this
-    project's open machine-ledger changes (None: change-probe keys are not judged). Returns the
-    events raised."""
+    project's open machine-ledger changes (None: change-probe keys are not judged). `recheck(probe, key)`
+    (Daemon._probe_now) re-runs a new probe stall's probe first (_recheck). Returns the events raised."""
     now = time.time() if now is None else now
     cfg = cfg or {}
     s = check_settings(cfg)
@@ -793,6 +793,8 @@ def check(db: DB, cfg: dict | None, state_dir: Path | str | None, now: float | N
         got, ended = change_probes(db, s, st, changes, now)
         conds, gone = conds + got, gone | ended
     due = _decide(st, conds, s, now, kinds, gone)
+    if recheck is not None and routinedefault.on(cfg):
+        due = _recheck(db, st, due, current_probe, recheck, now)
     with db.tx():
         _save(db, st)
         return _emit(db, due, now, where, wake)
@@ -829,6 +831,31 @@ def change_probes(db: DB, s: dict, st: dict, changes: list[dict], now: float) ->
     gone |= {k for k, r in st["raised"].items() if r.get("kind") == "change-probe"
              and k.split(":", 1)[1] not in open_ids}
     return out, gone
+
+
+def _recheck(db: DB, st: dict, due: list[tuple[dict, str]], current_probe: Callable[[dict], str | None],
+             recheck: Callable[[str, str], Any], now: float) -> list[tuple[dict, str]]:
+    """Routine default (routinedefault.py): a new probe stall re-runs its probe before it wakes anyone.
+    Still running: not raised yet, judged on a later pass. A pass: the stall ends here (its task starts on
+    its own gate), recorded once. Not yet (or broken): it wakes as before, as does a stall seen again."""
+    keep = []
+    for c, why in due:
+        key = f"{c['kind']}:{c['key']}"
+        t = db.task(int(c["task"])) if why == "new" and _by_time(c) and c.get("task") else None
+        probe = current_probe(t) if t is not None else None
+        if not probe or routinedefault.seen(db, "stall", key):
+            keep.append((c, why))
+            continue
+        rc = recheck(probe, f"routine-stall:{c['task']}:{probe}")
+        if rc is None:
+            st["raised"].pop(key, None)   # its re-run still runs: judged on a later pass
+        elif rc == 0:
+            st["raised"].pop(key, None)
+            routinedefault.record(db, "stall", key, f"{c['what']}: re-run now passes; the task starts on its own "
+                                  "gate", "", now)
+        else:
+            keep.append((c, why))
+    return keep
 
 
 def _emit(db: DB, due: list[tuple[dict, str]], now: float, where: Any, wake: bool) -> list[dict]:
