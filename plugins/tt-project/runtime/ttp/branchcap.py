@@ -10,7 +10,8 @@ before, and the dollar caps stay the hard limits.
 
 sweep deletes the local branch of a finished task whose change is on the push branch, once its
 worktree is gone (worktree.sweep, `ttp prune`), and appends each deletion with its sha to
-state/branch-deletions.jsonl (RECOVERY) so `git branch <name> <sha>` restores it. It never deletes a
+state/branch-deletions.jsonl (RECOVERY), after saving its tip as refs/ttp-archive/<branch> (ARCHIVE) so
+git gc keeps it and `git branch <name> refs/ttp-archive/<name>` restores it. It never deletes a
 branch an unfinished task uses, one on a remote other than delivery.backup_remote (it may carry a PR),
 one whose task has a PR, or one with a commit by another author than the repo's user.email.
 """
@@ -21,12 +22,14 @@ import subprocess
 import time
 
 from . import landed, tried
+from .project import durable_append
 from .db import TERMINAL_TASK_STATES
 
 KV = "branchcap"
 KEPT_KV = "branchcap_kept"   # {branch: sha} sweep read and kept (another author, not landed): not read again at that sha
-CAPS = {"max_open_branches": 8, "max_work_threads": 6}
+CAPS = {"max_open_branches": 6, "max_work_threads": 4}
 RECOVERY = "branch-deletions.jsonl"
+ARCHIVE = "refs/ttp-archive/"   # each deleted branch's tip is kept here first, so git gc never drops it
 SWEEP_MAX = 50   # branch deletions per sweep: each costs a few git calls
 LOOK_MAX = 200   # branches read with git per sweep, deleted or kept: the next sweep goes on
 TIME_MAX_S = 8.0   # and seconds of it, so a daemon tick step stays short (the next sweep goes on)
@@ -177,12 +180,13 @@ def sweep(p, cfg, now: float | None = None, dry: bool = False, limit: int = SWEE
                 or landed.equivalent(p, branch, bump)):
             kept[branch] = sha
             continue
-        row = {"ts": now, "task": ts[-1]["id"], "branch": branch, "sha": sha, "why": "landed"}
+        row = {"ts": now, "task": ts[-1]["id"], "branch": branch, "sha": sha, "why": "landed",
+               "saved": ARCHIVE + branch}
         if not dry:
-            if _git(repo, "update-ref", "-d", f"refs/heads/{branch}", sha).returncode != 0:
+            if (_git(repo, "update-ref", ARCHIVE + branch, sha).returncode != 0
+                    or _git(repo, "update-ref", "-d", f"refs/heads/{branch}", sha).returncode != 0):
                 continue
-            with open(p.state / RECOVERY, "a", encoding="utf-8") as f:
-                f.write(json.dumps(row) + "\n")
+            durable_append(p.state / RECOVERY, json.dumps(row) + "\n")
         out.append(row)
     if not dry and kept != kept_before:
         p.db.set_kv(KEPT_KV, kept)

@@ -674,7 +674,8 @@ EXTRA_KEYS = {
     # max_open_branches, max_work_threads: soft caps on open code branches (task branches with commits not on
     # the push branch) and running workers; over one, the Course check and `ttp status` raise one alarm line
     # (branchcap.CAPS defaults, 0: no cap). delete_landed_branches (default on): the daemon deletes a landed
-    # task's local branch once its worktree is gone, recorded in state/branch-deletions.jsonl.
+    # task's local branch once its worktree is gone, its tip saved as refs/ttp-archive/<branch> and
+    # recorded in state/branch-deletions.jsonl.
     # push_retries: how often a detached push retries a cause it clears itself, a non-fast-forward
     # (--own) or a reboot that cut it short (push.retries_of; default 2, 0: never).
     "delivery": {"base_ref", "push_branch", "landed_probe", "push_checks", "post_land_checks", "push_checks_by_repo", "push_exclude_paths", "push_rounds", "push_wait_s",

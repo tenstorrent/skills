@@ -3045,14 +3045,15 @@ session and stateless coordinators on every provider.
   project's open code branches (task branches with commits not on the push branch, of tasks not
   landed, cancelled or failed) and running workers. `ttp status`, the web app (`branches` in the
   state payload) and the coordinator's Course check show them. Over `delivery.max_open_branches`
-  (default 8) or `delivery.max_work_threads` (default 6; 0 turns a cap off) one alarm line asks the
+  (default 6) or `delivery.max_work_threads` (default 4; 0 turns a cap off) one alarm line asks the
   coordinator to give new non-urgent code work that overlaps an open code task that task's branch
   (`pr_branch:`) or fold it into its spec, and to land open branches before opening more. The caps
   are soft: they hold no work, urgent and user-ordered work runs as before, and the dollar caps stay
   the hard limits.
 - Landed branch cleanup: once a finished task's change is on the push branch and its worktree is
-  gone, the daemon (and `ttp prune`) deletes its local branch and appends branch, sha and task to
-  `state/branch-deletions.jsonl` (`git branch <branch> <sha>` restores one). A branch an unfinished
+  gone, the daemon (and `ttp prune`) saves its tip as `refs/ttp-archive/<branch>`, deletes the
+  local branch and appends branch, sha, task and that ref to `state/branch-deletions.jsonl`
+  (`git branch <branch> refs/ttp-archive/<branch>` restores one). A branch an unfinished
   task uses, one on a remote other than `delivery.backup_remote`, one whose task has a PR and one
   with a commit by an author other than the repository's `user.email` are kept.
   `delivery.delete_landed_branches: false` turns this off.

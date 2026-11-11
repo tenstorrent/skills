@@ -38,7 +38,7 @@ def test_open_branches_and_threads_are_counted_and_over_cap_raise_one_alarm(env,
     assert got["open_tasks"] == [a, b] and got["thread_tasks"] == [a, q]
     assert web.state_payload(p, p.db)["branches"]["open_branches"] == 2
     line = branchcap.status_line(p.db, p.config())
-    assert "2 open code branches (cap 8)" in line and "OVER CAP" not in line
+    assert "2 open code branches (cap 6)" in line and "OVER CAP" not in line
     assert branchcap.digest_lines(p.db, p.config()) == []
     p.set_config("delivery.max_open_branches", 1)
     alarm = branchcap.digest_lines(p.db, p.config())
@@ -107,7 +107,9 @@ def test_landed_task_branches_are_deleted_once_their_worktree_is_gone_with_a_rec
     for b in (kept_wt, not_landed, foreign, on_remote, with_pr, shared):
         assert exists(b), b
     rows = [json.loads(x) for x in (p.state / branchcap.RECOVERY).read_text().splitlines()]
-    assert rows == [{"ts": rows[0]["ts"], "task": gone, "branch": gone_b, "sha": sha, "why": "landed"}]
+    assert rows == [{"ts": rows[0]["ts"], "task": gone, "branch": gone_b, "sha": sha, "why": "landed",
+                     "saved": f"refs/ttp-archive/{gone_b}"}]
+    assert _git_out(repo, "rev-parse", rows[0]["saved"]) == sha   # the tip is kept for recovery
     assert p.db.kv(branchcap.KEPT_KV) == {foreign: _git_out(repo, "rev-parse", f"refs/heads/{foreign}")}   # not read again
     assert d.branch_cap() == []   # hourly: the next tick does not sweep again
     assert p.db.kv(branchcap.KV)["open_branches"] == 1   # notlanded
