@@ -13498,7 +13498,7 @@ COMMAND_GROUPS = (
     ("admin", ("setup", "upgrade", "start", "stop", "restart", "adopt", "prune", "secret", "consent",
                "notifier", "schedules", "heal", "upstream", "lease", "replicate", "check-plan", "stats", "audit",
                "push-audit", "ttr", "selfchange", "spend-today", "throughput", "model-trip", "echoes", "course",
-               "uninstall", "bench", "model-bench")),
+               "uninstall", "bench", "model-bench", "model")),
 )
 
 
@@ -14129,7 +14129,8 @@ def main(argv: list[str] | None = None) -> None:
 
     s = sub.add_parser("model", help="chat model demotions and parks (modeldemote.py): demote, promote, park or "
                                      "unpark one by hand, recorded with its setter; no action lists them")
-    s.add_argument("action", nargs="?", choices=("demote", "promote", "park", "unpark"))
+    s.add_argument("action", nargs="?", choices=("demote", "promote", "park", "unpark"),
+                   help="what to do with the model")
     s.add_argument("model", nargs="?", help="the chat model id")
     s.add_argument("--class", dest="cls", help="the task class (babysit, light, standard, review); default every class")
     s.add_argument("--why", help="the reason kept with the record")
