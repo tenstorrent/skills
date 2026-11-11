@@ -19830,7 +19830,10 @@ def test_after_push_runs_at_the_pushed_commit_in_a_clean_checkout_with_the_push_
                  "TTP_PUSH_TASKS=101,102", f"TTP_PUSH_BATCH={marker}", f"TTP_PROJECT={p.base}", f"head {sha}",
                  "dirty 0", f"cwd {p.worktrees / 'after_push-b1'}", "in_flight False", "alive True"):
         assert want in lines, (want, lines)
-    assert "push:run-b1.0.lock" not in lines and any(x.startswith("held ['after_push:run-b1: ") for x in lines), lines
+    # It holds its own after_push run lock and the deploy lock (deploys run one at a time), nothing else.
+    held = next(x for x in lines if x.startswith("held "))
+    assert "push:run-b1.0.lock" not in lines and "'after_push:run-b1: " in held and "'after_push:deploy: " in held, lines
+    assert held.count("', '") == 1, held
     assert not (p.worktrees / "after_push-b1").exists() and "after_push-b1" not in _git_out(repo, "worktree", "list")
     assert not list((p.state / "locks").glob("*run-b1*"))
     assert not (p.state / "after_push").exists(), "a batch runs its own after_push, never a second one"
