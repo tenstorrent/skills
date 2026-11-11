@@ -9421,8 +9421,9 @@ def test_status_cuts_long_lines_at_words_and_keeps_diagnostics_for_verbose(env, 
     moved = ("coordinator cache:", "checks slot waits", "upstream fix")
     plain = cli.status_text(p)
     assert not any(m in plain for m in moved) and "sending upstream notes on to x has failed" in plain
-    ask = next(ln for ln in plain.splitlines() if "word0 " in ln)
-    assert len(ask) < 340 and re.search(r" word\d+…$", ask), ask
+    rows = plain.splitlines()   # an open ask is never cut: it wraps onto indented lines (user msg #2424)
+    at = next(i for i, ln in enumerate(rows) if "word0 " in ln)
+    assert rows[at + 1].startswith("    word") and rows[at + 1].rstrip().endswith("word79"), rows[at:at + 2]
     p.db.post("out", "note " + words, kind="alert")   # the recent feed's quoted texts end at a word too
     recent = [ln for ln in cli.status_text(p).splitlines() if "note word0 " in ln]
     assert recent and all(re.search(r" word\d+…$", ln) for ln in recent), recent

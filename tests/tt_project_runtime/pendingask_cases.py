@@ -74,7 +74,7 @@ def test_status_waiting_on_you_full_text(env):
     tid = p.db.add_task("reboot the board", "s", origin="user")
     p.db.update_task(tid, status="blocked", blocked_reason="held", labels=["kept", f"waits:ask:{asks[-1]}"])
     flat = " ".join(_PA_LONG.split())
-    out = status_text(p)
+    out = status_text(p).replace("\n    ", " ")   # a long ask wraps onto indented lines, never cut
     # Every open ask in full, none capped away, and the task waiting on one carries its text too.
     assert f"(ask {asks[-1]}, " in out and flat in out and all(f"Question {n}: pick a route?" in out for n in range(7)), out
     assert f"reboot the board — waits on you: ask {asks[-1]}: {flat}" in out, out
@@ -95,6 +95,6 @@ def test_skill_rule_present():
     skill = (plugin / "skills" / "tt-project" / "SKILL.md").read_text()
     assert 'quote it in full right there' in skill and 'never only "ask 297"' in skill
     role = (plugin / "template" / "prompts" / "coordinator.md").read_text()
-    assert "an open one is quoted in full (options, command), never just its id" in role
+    assert "To the user an ask is `ask <id>`, never `#<id>`, quoted in full while open" in role
     guide = (plugin / "docs" / "guide.md").read_text()
     assert "An open ask is shown in full wherever it waits on the user (user msg #2424)" in guide

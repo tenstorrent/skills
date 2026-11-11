@@ -1600,7 +1600,7 @@ def status_text(p: Project, verbose: bool = False) -> str:
     head += " · tasks: " + (", ".join(f"{k} {v}" for k, v in sorted(counts.items())) if counts else "none yet")
     head += " · " + timefmt.long(now, p)
     lines = [head]
-    whole = set()   # lines quoting an open ask: never cut to STATUS_WIDTH (user msg #2424)
+    whole = set()   # lines quoting an open ask: wrapped at STATUS_WIDTH, never cut (user msg #2424)
     seen = attention(db, now, p)
     for m in [m for m in seen if m["kind"] == "ask"] + [m for m in seen if m["kind"] != "ask"][:6]:
         text = " ".join(m["text"].split())   # an open ask in full, every one: the user acts on it (#2424)
@@ -1866,7 +1866,9 @@ def status_text(p: Project, verbose: bool = False) -> str:
         text = " ".join(m["text"].split())
         tag = f"cleared {at(m['cleared_at'], now, tz)}" if m.get("cleared_at") else m["state"]
         lines.append(f"  {at(m['ts'], now, tz)} ({tag}) {clip(text, 160)}")
-    return "\n".join(ln if ln in whole else clip(ln) for ln in lines)
+    import textwrap   # an open ask wraps onto indented lines, never cut (#2424)
+    return "\n".join("\n".join(textwrap.wrap(ln, STATUS_WIDTH, subsequent_indent="    ", break_long_words=False,
+                                             break_on_hyphens=False)) if ln in whole else clip(ln) for ln in lines)
 
 
 def daemon_state(p: Project) -> str:
