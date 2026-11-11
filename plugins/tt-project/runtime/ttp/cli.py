@@ -3907,7 +3907,8 @@ def cmd_checks(a) -> None:
             checkdirs.writable(run_dir)
             # The project's short pre-stage runs first, in the foreground (checkprestage): its failure
             # starts nothing, so it is fixed in this run, not after the whole detached suite. Unset, it is
-            # derived from the project's frequent detached checks failures (checkprestage.derived).
+            # derived from the project's frequent detached checks failures (checkprestage.derived); a derived
+            # one's failures that the change's base fails too start the full checks anyway.
             say = lambda m: print(f"ttp checks: {m}", flush=True)
             pre = d.get(checkprestage.KEY)
             if purpose == "candidate" and not harness_unset and not getattr(a, "no_prestage", False) \
@@ -3918,7 +3919,9 @@ def cmd_checks(a) -> None:
                     if why := _prestage_skip(a, p, top, head, tree, cmds, own, vpy, purpose):
                         print(f"ttp checks: pre-stage (delivery.{checkprestage.KEY}) skipped: {why}", flush=True)
                     elif checkprestage.run(pre, top, pre_env, say) if pre is not None else \
-                            checkprestage.run_derived(p, ids, own, top, pre_env, say, run_dir):
+                            checkprestage.run_derived(p, ids, own, top, pre_env, say, run_dir,
+                                                      base=_checks_judge_base(p, top, head,
+                                                                              _checks_base(p, Path(top), cmds))[0]):
                         sys.exit(1)
             _checks_detach(a, Path(run_dir), p, top, head, need=shorttmp.need(top, head, cmds))
         except OSError as e:

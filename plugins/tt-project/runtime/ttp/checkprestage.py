@@ -11,7 +11,11 @@ With delivery.check_prestage unset, a project whose own checks run pytest here g
 (`derive`): the DERIVE_MAX tests that failed in the most distinct detached `ttp checks` runs of the
 project over DERIVE_WINDOW_S, leaving out those a run recorded taking DERIVE_FAST_S or more. A derived
 pre-stage that times out records the tests it cut off as slow (`_learn_from_timeout`), so the next one
-leaves them out instead of timing out the same way. No such failures: no pre-stage. `''` or false turns it off; an explicit command is used as it is."""
+leaves them out instead of timing out the same way. A derived pre-stage that fails reruns its failing
+tests on the change's base in a clean checkout (`_shared_with_base`): when every one fails there too
+(a broken push-branch tip, which the derived list then mostly holds), the full checks start, since
+failures the base shares never block a change. No such failures: no pre-stage. `''` or false turns it
+off; an explicit command is used as it is."""
 from __future__ import annotations
 
 import contextlib
@@ -125,14 +129,17 @@ def derived_command(ids: list[str], top: str) -> tuple[str, str] | None:
             "^(?:" + "|".join(map(re.escape, names)) + ")$")
 
 
-def run_derived(p, ids: list[str], checks: list, top: str, env: dict, say, run_dir: str | Path | None = None) -> int:
+def run_derived(p, ids: list[str], checks: list, top: str, env: dict, say, run_dir: str | Path | None = None,
+                base: str = "") -> int:
     """Run the derived pre-stage `ids` as `run` does (0: start the full checks, 1: start nothing),
     the way the project's pytest check among `checks` runs (push.check_argv: its venv, its "env"
     exports, and its process sandbox unless it opts out). No test selected passes, and a pytest internal or usage error never
     holds the full checks back; a failure is
     recorded for the daily audit (CAUGHT_KEY). Its test times go to DURATIONS in `run_dir`, so a
     test found slow there is left out next time; on a timeout, from each test's end as it happened,
-    with the tests cut off recorded as slow (`_learn_from_timeout`)."""
+    with the tests cut off recorded as slow (`_learn_from_timeout`). Given `base` (the commit the change
+    was built on), a failure whose failing tests all fail on `base` too starts the full checks
+    (`_shared_with_base`)."""
     from . import push, pushpass, slowtests
     spec = derived_command(ids, top)
     if spec is None:
@@ -149,17 +156,79 @@ def run_derived(p, ids: list[str], checks: list, top: str, env: dict, say, run_d
             pass
         env = {**env, **slowtests.env(Path(run_dir) / DURATIONS, env, live=live)}
         learn = lambda took: _learn_from_timeout(Path(run_dir), ids, took, say)
-    check = push.Check(cmd)   # with the project check's exports and sandbox opt-out
-    check.env = tuple(getattr(pytest_check(checks), "env", ()) or ())
-    check.sandbox = getattr(pytest_check(checks), "sandbox", True) is not False
+    check = _check(cmd, checks)
+    shared = (lambda out: _shared_with_base(p, out, checks, top, env, base, say)) if base else None
     rc = run(shlex.join(push.check_argv(check, top, env)), top, env, say,
              what="derived from this project's frequent check failures", ok=(0, NO_TESTS),
-             cannot=(*SETUP, *CANNOT_RUN), shown=cmd, on_timeout=learn)
+             cannot=(*SETUP, *CANNOT_RUN), shown=cmd, on_timeout=learn, on_fail=shared)
     if rc:
         _record(p, CAUGHT_KEY, lambda rows: [*[r for r in rows or [] if isinstance(r, dict)
                                                 and r.get("ts", 0) >= time.time() - DERIVE_WINDOW_S],
                                               {"ts": time.time(), "ids": ids}])
     return rc
+
+
+def _check(cmd: str, checks: list):
+    """`cmd` as a check run the way the project's pytest check among `checks` runs: with its exports
+    and its sandbox opt-out."""
+    from . import push
+    check = push.Check(cmd)
+    check.env = tuple(getattr(pytest_check(checks), "env", ()) or ())
+    check.sandbox = getattr(pytest_check(checks), "sandbox", True) is not False
+    return check
+
+
+def _shared_with_base(p, output: str, checks: list, top: str, env: dict, base: str, say) -> bool:
+    """Whether a failed derived pre-stage's failing tests (from its `output`) all fail on `base` too:
+    each reruns there, in a clean checkout of `base` made beside the repository at `top`, the way the
+    pre-stage ran. True starts the full checks: a failure the base shares (a broken push-branch tip)
+    is not the change's, and the full checks' own base rerun judges it again. False (the failure
+    stands) when the output does not name every failing test, a test passes on the base, or the base
+    rerun cannot tell (cannot start, times out, names no failure)."""
+    from . import cleantree, push, pushpass, sharedchecks, worktree
+    ids, whole = sharedchecks.failing_ids(output)
+    if not ids or not whole:
+        return False
+    say(f"pre-stage: rerunning its {len(ids)} failing test(s) on the base {base[:12]} to see whether the base "
+        f"fails them too: {', '.join(ids)}")
+    tree = None
+    try:
+        tree = cleantree.Checkout(top, base)
+        where = str(tree.path)
+        if p is not None:
+            worktree.prepare(p, where)
+        spec = derived_command(ids, where)
+        if spec is None:
+            say("pre-stage: none of the failing tests' files exist on the base; the failure stands")
+            return False
+        cmd, pattern = spec
+        e = {**env, "PWD": where, **pushpass.select_env(pattern, env, ids)}
+        argv = shlex.join(push.check_argv(_check(cmd, checks), where, e))
+        with tempfile.NamedTemporaryFile(prefix="ttp-prestage-base-") as out:
+            script = f"exec >{shlex.quote(out.name)} 2>&1\n{testslots.clamped(argv, 1)}"
+            res = boundedchild.run(testslots.low_priority(["/bin/sh", "-c", script]), DEFAULT_TIMEOUT_S, cwd=where,
+                                   env={**e, testslots.XDIST_ENV: "1", testslots.SLOTS_ENV: "1"}, text=False,
+                                   stderr="stdout")
+            out.seek(0)
+            got = out.read().decode(errors="replace")
+    except (cleantree.Error, OSError, ValueError) as err:
+        say(f"pre-stage: the base rerun could not run ({err}); the failure stands")
+        return False
+    finally:
+        if tree is not None:
+            tree.close()
+    if res.timed_out or res.error:
+        say(f"pre-stage: the base rerun could not tell ({res.error or 'timed out'}); the failure stands")
+        return False
+    on_base = set(sharedchecks.failing_ids(got)[0]) if res.rc else set()
+    new = [i for i in ids if i not in on_base]
+    if new:
+        say(f"pre-stage: {len(new)} of its failing test(s) pass on the base {base[:12]}, so the change "
+            f"broke them: {', '.join(new)}")
+        return False
+    say(f"pre-stage: every failing test also fails on the base {base[:12]}, so none is this change's; "
+        f"starting the full checks: {', '.join(ids)}")
+    return True
 
 
 def _learn_from_timeout(run_dir: Path, ids: list[str], took: float, say) -> None:
@@ -240,11 +309,12 @@ def _tail(raw: bytes, n: int = TAIL_LINES) -> str:
 
 
 def run(v, cwd: str, env: dict, say, what: str = f"delivery.{KEY}", ok: tuple = (0,),
-        cannot: tuple = CANNOT_RUN, shown: str = "", on_timeout=None) -> int:
+        cannot: tuple = CANNOT_RUN, shown: str = "", on_timeout=None, on_fail=None) -> int:
     """Run the pre-stage `v` in `cwd`; `say` prints a line. 0: start the full checks (it passed,
     timed out, is unset, malformed or could not be started); 1: it failed, start nothing. `ok` exit
     codes pass and `cannot` ones are a setting fault (`what` names the setting); `shown` is the
-    command as printed (default `v`'s); `on_timeout(seconds)` runs once a timed-out one is stopped."""
+    command as printed (default `v`'s); `on_timeout(seconds)` runs once a timed-out one is stopped;
+    `on_fail(output)` gets a failed one's whole output, and True from it starts the full checks."""
     try:
         spec = parse(v)
     except ValueError as e:
@@ -286,9 +356,16 @@ def run(v, cwd: str, env: dict, say, what: str = f"delivery.{KEY}", ok: tuple = 
             say(f"pre-stage could not run (exit {rc}): {why}; starting the full checks without it")
             return 0
         out.seek(0)
-        tail = _tail(out.read())
-    say(f"pre-stage failed (exit {rc}) in {took:.0f} s; the full checks were NOT started. Its output's last "
-        f"{TAIL_LINES} lines:\n{tail}\nttp checks: fix this and commit, then run `ttp checks --detach` again "
+        raw = out.read()
+        tail = _tail(raw)
+    last = f" Its output's last {TAIL_LINES} lines:\n{tail}\nttp checks:"
+    if on_fail is not None:   # its output shown once, before the base rerun's lines
+        say(f"pre-stage failed (exit {rc}) in {took:.0f} s.{last.removesuffix(chr(10) + 'ttp checks:')}")
+        if on_fail(raw.decode(errors="replace")):
+            return 0
+        last = ""
+    say(f"pre-stage failed (exit {rc}) in {took:.0f} s; the full checks were NOT started.{last} Fix this and "
+        "commit, then run `ttp checks --detach` again "
         "in this run. If the pre-stage itself is broken, not the change, `--no-prestage` starts the full checks "
         "without it")
     return 1

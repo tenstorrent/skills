@@ -10539,6 +10539,66 @@ def test_a_derived_check_prestage_id_that_no_longer_exists_never_fails_it(env, t
     assert len(started) == 2 and "none of the derived tests' files exist" in capsys.readouterr().out
 
 
+def _derived_on_base(env, tmp_path, monkeypatch, head_seed: str):
+    """_derived_setup's repo as the base (its static failure on it), then a head commit writing
+    `head_seed` to tests/test_seed.py; the push branch tip as last fetched is that base."""
+    from ttp import cli
+    p, run, started = _derived_setup(env, tmp_path, monkeypatch)
+    repo = tmp_path / "work"
+    git = ["git", "-C", str(repo), "-c", "user.email=t@example.com", "-c", "user.name=t"]
+    base = subprocess.run([*git, "rev-parse", "HEAD"], capture_output=True, text=True, check=True).stdout.strip()
+    (repo / "tests" / "test_seed.py").write_text(head_seed)
+    subprocess.run([*git, "commit", "-qam", "head"], check=True)
+    monkeypatch.setattr(cli, "_checks_base", lambda p, top, cmds: base)
+    return p, started, base
+
+
+def test_a_derived_check_prestage_failure_the_base_shares_starts_the_full_checks(env, tmp_path, monkeypatch, capsys):
+    """A broken push-branch tip: its failures fill every task's derived pre-stage. Each fails on the
+    change's base too, so none is the change's and the detached checks start (user msg #1635)."""
+    from ttp import checkprestage, cli
+    seed = ("def test_static_guard():\n    assert 0, 'seeded-static-failure'\n\n\n"
+            "def test_fine():\n    pass\n\n\ndef test_added_by_head():\n    pass\n")
+    p, started, base = _derived_on_base(env, tmp_path, monkeypatch, seed)
+    for rid in (1, 2):
+        _seed_check_failure(p, rid, [SEED])
+    cli.main(["checks", "--detach"])
+    out = capsys.readouterr().out
+    assert len(started) == 1, out
+    assert "seeded-static-failure" in out and f"rerunning its 1 failing test(s) on the base {base[:12]}" in out
+    assert f"every failing test also fails on the base {base[:12]}" in out and SEED in out
+    assert "NOT started" not in out and not p.db.kv(checkprestage.CAUGHT_KEY), "not counted as caught"
+
+
+def test_a_derived_check_prestage_failure_new_on_the_head_still_blocks(env, tmp_path, monkeypatch, capsys):
+    """A head-only failure beside a shared one: the base passes it, so the change broke it and nothing
+    detaches; the shared one is not named as the change's."""
+    from ttp import cli
+    fine = "tests/test_seed.py::test_fine"
+    seed = ("def test_static_guard():\n    assert 0, 'seeded-static-failure'\n\n\n"
+            "def test_fine():\n    assert 0, 'head-only-failure'\n")
+    p, started, base = _derived_on_base(env, tmp_path, monkeypatch, seed)
+    _seed_check_failure(p, 1, [SEED, fine])
+    with pytest.raises(SystemExit) as failed:
+        cli.main(["checks", "--detach"])
+    out = capsys.readouterr().out
+    assert failed.value.code == 1 and not started, out
+    assert f"1 of its failing test(s) pass on the base {base[:12]}, so the change broke them: {fine}" in out
+    assert "head-only-failure" in out and "NOT started" in out
+
+
+def test_a_derived_check_prestage_base_rerun_needs_every_failing_id(tmp_path):
+    """Output that does not name every failing test (no summary, a count above its FAILED lines, another
+    runner) never starts the full checks, and no base checkout is made for it."""
+    from ttp import checkprestage
+    said = []
+    for out in ("FAILED tests/a.py::test_x - x\n", "FAILED tests/a.py::test_x - x\n2 failed in 1s\n",
+                "error: build broke\n", ""):
+        assert not checkprestage._shared_with_base(None, out, [], str(tmp_path / "nowhere"), {}, "0" * 40,
+                                                   said.append)
+    assert said == [], "nothing reran"
+
+
 @pytest.mark.parametrize("off", ["", False], ids=["empty", "false"])
 def test_an_explicit_empty_check_prestage_turns_the_derived_one_off(env, tmp_path, monkeypatch, capsys, off):
     from ttp import cli, project
