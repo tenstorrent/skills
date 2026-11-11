@@ -59,7 +59,8 @@ Runs already on the host go on. The skip shows in one line in `ttp status` and t
 while it is fresh (SKIP_SHOW_S). Its slots follow what it has idle now (checklane.host_slots): the runs
 its idle cores (cores less the 1-minute load average) and available memory fit, at most the runs its
 cores hold less the remote checks running there from any machine (their ttp-check.* folders a live process
-works in, whose run script lives, or just made: _PROBE; a cut run's leftover counts for none and is removed), not a
+works in once its run started, whose run script lives, or just made: _PROBE; a stalled copy's or a cut run's
+leftover counts for none and is removed), not a
 small fixed count; a host whose load does not read gets checklane.default_slots less those. This machine also holds one claim file
 per slot it uses there (spill/<alias>.<n>.json in the checks slot folder), so its own runs never
 take more. A claim whose remote ttp-check.* folder is not made yet (the few seconds of its copy) is
@@ -71,6 +72,9 @@ An entry of either list may be a table instead of an alias, `{"host": "<alias>",
 project here shares) below what its idle cores allow, and jobs gives each run there that many test workers
 (the xdist -n its grant sets) instead of sizing them from the host's idle cores; a smaller box, or one whose
 tests time out under load, gets a lower jobs.
+A host whose pinned checks env cannot be made (remotecheck's NO_ENV, as with no package index there) is
+down for every project here (down_add): pick skips it, and `ttp status` says why (skip_lines), until a
+run there passes its env step (down_clear) or, after DOWN_RETRY_S, the one run that tries it again.
 
 Only a run whose every check may spill spills (check_spills): none with a host of its own (`host`,
 delivery.checks_host; `"host": "local"` too unless the check says `"spill": true`), none that says
@@ -153,6 +157,7 @@ DEVICE_SUFFIX = "-device"
 DEVICE_WHY = "a device job runs there: "   # how a device-busy reason starts (device_busy, _device_holders)
 BROKER_TIMEOUT_S = 10.0   # one read of a broker's status; past it the device locks alone decide
 SPILL_MARK = {"checks_spill": True}   # in the label of a pool check run's hold of a host's lock (_hold)
+DOWN_RETRY_S = 1800   # a host marked down (down_add) takes one run again after this, which marks it again or clears it
 SKIP_SHOW_S = 900   # a host skipped for a device job shows in `ttp status` and the web app this long after
 _JOB_LISTS = ("jobs", "running_jobs", "active_jobs", "running")   # broker status: job rows (a list) or a count
 _JOB_ONE = ("current_job", "active_job", "running_job")   # broker status: the one job under way
@@ -166,7 +171,8 @@ FRESH_MIN = 5   # a folder of the ssh user this new is counted even with no proc
 REAP_AFTER_MIN = 120   # a folder of the ssh user with no process in it, untouched this long, is removed
 # The host's slots line: cores, available memory (KiB), running checks and the 1-minute load. A running check
 # is a ttp-check.* folder of the temp folder some process of the ssh user works in (its /proc/<pid>/cwd,
-# read with GNU find: a run's shell sits in its folder until the run ends), or one of the ssh user's made
+# read with GNU find: a run's shell sits in its folder until the run ends) and whose run started (RUN_PID is there:
+# a copy that stalled with a process in its folder is no running check), or one of the ssh user's made
 # under FRESH_MIN ago, or one whose run script is still alive (its pid in remotecheck.RUN_PID; a run whose
 # processes all work outside its folder): those are never removed. One of the ssh user's with none of these
 # and older than REAP_AFTER_MIN is a run that died with its host or its link (no EXIT trap ran) and is
@@ -186,8 +192,8 @@ _PROBE = ("command -v git >/dev/null 2>&1 && command -v tar >/dev/null 2>&1 || e
           "    if [ -z \"$(find \"$d\" -maxdepth 0 -user \"$u\" 2>/dev/null)\" ]; then\n"
           f"      [ -n \"$(find \"$d\" -maxdepth 0 -mmin -{RUNNING_MAX_AGE_MIN} 2>/dev/null)\" ] && n=$((n+1)); continue\n"
           "    fi\n"
-          "    case \"$live\" in *\" ${d##*/ttp-check.} \"*) n=$((n+1)); continue;; esac\n"
           f"    p=$(head -c 20 \"$d/{remotecheck.RUN_PID}\" 2>/dev/null | tr -cd 0-9)\n"
+          "    case \"$live\" in *\" ${d##*/ttp-check.} \"*) [ -n \"$p\" ] && { n=$((n+1)); continue; };; esac\n"
           "    if [ -n \"$p\" ] && kill -0 \"$p\" 2>/dev/null; then n=$((n+1)); continue; fi\n"
           f"    if [ -n \"$(find \"$d\" -maxdepth 0 -mmin -{FRESH_MIN} 2>/dev/null)\" ]; then n=$((n+1))\n"
           f"    elif [ -n \"$(find \"$d\" -maxdepth 0 -mmin +{REAP_AFTER_MIN} 2>/dev/null)\" ]; then rm -rf \"$d\" 2>/dev/null; fi\n"
@@ -1315,6 +1321,51 @@ def _note_skip(alias: str, why: str, project_name: str, own_only: bool = False) 
         pass
 
 
+def _down_file(host: str) -> Path:
+    from . import checkcap
+    return checkcap.slot_dir() / "spill-down" / f"{re.sub(r'[^A-Za-z0-9_.-]', '_', host)}.json"
+
+
+def down_add(host: str, why: str, now: float | None = None) -> None:
+    """Mark `host` down for every project on this machine (remotecheck: its pinned checks env cannot be made
+    there, as on a host with no package index): pick skips it (down_why) until a run there passes its env
+    step (down_clear) or DOWN_RETRY_S lets one run try again."""
+    from . import project
+    f = _down_file(host)
+    try:
+        f.parent.mkdir(parents=True, exist_ok=True)
+        project.durable_write(f, json.dumps({"host": host, "why": why[:300], "at": time.time() if now is None else now,
+                                             "project": Path(os.environ.get("TTP_PROJECT") or "").name}), sync=False)
+    except OSError:
+        pass
+
+
+def down_clear(host: str) -> None:
+    """`host` is usable again (a run there passed its env step, or a health probe of it passed)."""
+    try:
+        _down_file(host).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def down_why(host: str, now: float | None = None, move: bool = True) -> str:
+    """Why pick skips `host` for every project (down_add), or "". Once DOWN_RETRY_S has passed, the first
+    caller gets "" and (with `move`; a status read never) moves the mark's time on, so only its run tries
+    the host again."""
+    now = time.time() if now is None else now
+    try:
+        r = json.loads(_down_file(host).read_text() or "{}")
+        at = float(r.get("at") or 0)
+    except (OSError, ValueError, TypeError, AttributeError):
+        return ""
+    if now - at >= DOWN_RETRY_S:
+        if move:
+            down_add(host, str(r.get("why") or ""), now)
+        return ""
+    return (f"down for every project here since {max(0, int((now - at) // 60))} min: {r.get('why') or 'a host fault'}; "
+            f"one run tries it again {max(1, int((DOWN_RETRY_S - (now - at)) // 60))} min from now")
+
+
 def skip_lines(now: float | None = None) -> list[str]:
     """`ttp status` and web app lines: each spill host the pool skipped for a device job or a pre-run hook in the last
     SKIP_SHOW_S, one line each, with the reason."""
@@ -1329,6 +1380,14 @@ def skip_lines(now: float | None = None) -> list[str]:
         if r.get("host") and now - at <= SKIP_SHOW_S:
             out.append(f"spill host {r['host']} takes no new checks: {r.get('why') or 'a device job runs there'}"
                        f" (seen {max(0, int((now - at) // 60))} min ago)")
+    d = _down_file("x").parent
+    for f in sorted(d.glob("*.json")) if d.is_dir() else []:
+        try:
+            host = json.loads(f.read_text() or "{}").get("host") or ""
+        except (OSError, ValueError, AttributeError):
+            continue
+        if host and (why := down_why(host, now, move=False)):
+            out.append(f"spill host {host} takes no checks: {why}")
     return out
 
 
@@ -1708,6 +1767,9 @@ def pick(p, cfg: dict, tell, what: str = "", off: str = "", why_here: str = "") 
             continue
         if why := quarantined(p, alias):
             skipped.append(f"{alias} ({why})")
+            continue
+        if down := down_why(host):
+            skipped.append(f"{alias} ({down})")
             continue
         beside = beside_device(cfg, alias)   # the project lets its checks run there beside a device job
         why = allowed(p, cfg, alias)

@@ -30,10 +30,18 @@ without that file still reads as 1. `--py` files (the tests gate's select plugin
 run folder's .git, out of the tree the check sees, and put first on PYTHONPATH; `--literal` variables are
 exported as given, never expanded there.
 
+At most UPLOADS_PER_HOST tree copies to one host run from this machine at once (upload_slot, every
+project here sharing them): a copy waits for a free one, saying so, and one still waiting after
+UPLOAD_WAIT_S is a host fault. A run writes RUN_PID once its copy is in, so a host's probe
+(checkspill._PROBE) counts started runs, never copies that stalled. A host whose pinned env cannot be
+made (NO_ENV) is marked down for every project here (checkspill.down_add) until a run there passes its
+env step or DOWN_RETRY_S lets one more run try.
+
 `host` is an ssh alias (a machines-list alias is one): `ssh <host>` must reach it without a prompt."""
 from __future__ import annotations
 
 import hashlib
+import fcntl
 import json
 import os
 import re
@@ -84,6 +92,9 @@ MUX_BACKOFF_S = (2, 5)
 SETUP_TIMEOUT_S = 540
 COPY_TIMEOUT_ENV = "TTP_REMOTE_COPY_TIMEOUT_S"   # a shorter copy timeout (_copy_timeout_s), never a longer one
 COPY_TIMEOUT = "copying the tree timed out"   # the fault said when a bulk copy overran or stalled: that host is kept off the rerun (checkspill.SLOW)
+UPLOADS_PER_HOST = 2   # tree copies to one host from this machine at once (upload_slot)
+UPLOAD_WAIT_S = 300    # a copy that found no free upload slot this long is a host fault
+UPLOAD_TELL_S = 60     # while it waits, it says so this often (under the checks' silence limit)
 CLEANUP_TIMEOUT_S = 120
 PROBE_TIMEOUT_S = 45
 # After a tree copy timed out (STAGE_TIMED_OUT), the host's fault clears only once a sample copy of
@@ -414,6 +425,40 @@ def _run_script(q: str, exports_: str, cmd: str, mark: str, wrap: tuple[str, ...
 
 class _Stop(Exception):
     pass
+
+
+def upload_slot(host: str, wait_s: float | None = None):
+    """One of the UPLOADS_PER_HOST tree copies to `host` from this machine (an flock in the checks slot
+    folder, shared by every project here): its open file, held until closed, or None after `wait_s`
+    (default UPLOAD_WAIT_S). While it waits it says so every UPLOAD_TELL_S. A slot folder that cannot be
+    written caps nothing: a file that is no lock (None is only a timeout)."""
+    from . import checkcap
+    d = checkcap.slot_dir() / "uploads"
+    name = re.sub(r"[^A-Za-z0-9._-]", "_", host)
+    end = time.monotonic() + (UPLOAD_WAIT_S if wait_s is None else wait_s)
+    told = 0.0
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return open(os.devnull)
+    while True:
+        for i in range(UPLOADS_PER_HOST):
+            try:
+                fh = open(d / f"{name}.{i}.lock", "a")
+            except OSError:
+                return open(os.devnull)
+            try:
+                fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return fh
+            except OSError:
+                fh.close()
+        now = time.monotonic()
+        if now >= end:
+            return None
+        if now - told >= UPLOAD_TELL_S:
+            _say(f"waiting for a copy slot to {host}: {UPLOADS_PER_HOST} copies to it from this machine run now")
+            told = now
+        time.sleep(min(2.0, max(0.05, end - now)))
 
 
 def mktemp_cmd(env=None) -> str:
@@ -785,10 +830,13 @@ def _attempt(host, top, head, env, extra, cmd, mark, wrap, wait) -> tuple[int, s
     for s in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
         signal.signal(s, _stop)
     direct = wait is not None
-    tmp, proc, cleanup_ref = "", None, None
+    tmp, proc, cleanup_ref, slot = "", None, None, None
     try:
         if direct:
             time.sleep(wait)
+        if (slot := upload_slot(host)) is None:
+            return _fault(host, f"{UPLOADS_PER_HOST} tree copies to it from this machine were still running "
+                                f"after {UPLOAD_WAIT_S} s"), ""
         key = mirror_key(top, head)
         try:
             made = subprocess.run(_ssh(host, f"{mktemp_cmd()} && {{ {_mirror_probe(key)}; }}", direct),
@@ -857,6 +905,7 @@ def _attempt(host, top, head, env, extra, cmd, mark, wrap, wait) -> tuple[int, s
                 return _fault(host, _staged(why[len(LINK):]) if why.startswith(LINK) else why), ""
             if rc:
                 return rc, ""
+        slot.close()   # its copy is in: the next one to this host may start
         from . import testslots
         cfg = testslots._cfg()
         script = _run_script(q, exports(env) + extra, cmd, mark, wrap, testslots.priority_args(cfg))
@@ -890,8 +939,14 @@ def _attempt(host, top, head, env, extra, cmd, mark, wrap, wait) -> tuple[int, s
             out.flush()
         proc.wait()
         if no_wrap == NO_ENV:
-            return _fault(host, "the checks' pinned Python env could not be made there (its error is above), "
-                                "so the check did not run (never with that host's user site)"), ""
+            why = ("the checks' pinned Python env could not be made there (its error is above), "
+                   "so the check did not run (never with that host's user site)")
+            from . import checkspill
+            checkspill.down_add(host, why)
+            return _fault(host, why), ""
+        if rc is not None:   # its env step passed there: a mark from an earlier failure no longer holds
+            from . import checkspill
+            checkspill.down_clear(host)
         if no_wrap:
             return _fault(host, f"the spill wrapper {wrap[0]!r} is missing or not executable there {WRAP_SETTING}, "
                                 "so the check did not run (never unwrapped)"), ""
@@ -911,6 +966,8 @@ def _attempt(host, top, head, env, extra, cmd, mark, wrap, wait) -> tuple[int, s
     except _Stop:
         return 143, ""
     finally:
+        if slot is not None:
+            slot.close()
         for s in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
             signal.signal(s, signal.SIG_IGN)
         if proc is not None and proc.poll() is None:

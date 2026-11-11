@@ -39,6 +39,8 @@ LOCK = Path(__file__).with_name("checks-python.lock")
 LOCK_ENV = "TTP_CHECKS_PYTHON_LOCK"   # in a check's env (apply): the lock, for a check run on another host
 INFO = "ttp-env.json"   # in an env: its key, lock hash and versions (describe)
 BUILD_TIMEOUT_S = 900
+REMOTE_PIP_RETRIES = 1        # on another host (remote_lines): pip retries once, then fails, so an offline host fails fast
+REMOTE_PIP_TIMEOUT_S = 15     # ... and waits this long per connection
 _ready: dict[str, dict] = {}   # key -> info, for this process
 
 
@@ -390,14 +392,17 @@ def remote_lines(lock: Path | str | None, where: str, fail: str, home: str = "")
     `where` there, make or reuse the pinned env from them with that host's python3 (as ensure does
     here, under its TTP_HOME, or `home`, a shell word, when given), and put it in force as apply does.
     Where it cannot be made, they print why and run `fail`: the check never runs with that host's user
-    site. TTP_CHECKS_ENV_BIN names its bin, so a check behind a spill wrapper puts it first again
+    site. A build there that cannot reach its package index (an offline host) fails within a minute, not
+    after pip's silent retries: REMOTE_PIP_RETRIES and REMOTE_PIP_TIMEOUT_S unless the host's own PIP_RETRIES
+    and PIP_DEFAULT_TIMEOUT say otherwise. TTP_CHECKS_ENV_BIN names its bin, so a check behind a spill wrapper puts it first again
     (remotecheck.REFRONT). OSError when a file cannot be read."""
     lock = Path(lock or LOCK)
     out, w = f"mkdir -p {shlex.quote(where)}\n", shlex.quote(where)
     for name, text in (("runnerenv.py", Path(__file__).read_text()), ("checks-python.lock", lock.read_text())):
         end = f"TTP_ENV_{secrets.token_hex(8)}"
         out += f"cat > {w}/{name} <<'{end}'\n{text.rstrip(chr(10))}\n{end}\n"
-    return (out + f'ttp_env=$({f"TTP_HOME={home} " if home else ""}python3 -I {w}/runnerenv.py "$PWD"/{w}/checks-python.lock) || {{ '
+    pip = f"PIP_RETRIES=${{PIP_RETRIES:-{REMOTE_PIP_RETRIES}}} PIP_DEFAULT_TIMEOUT=${{PIP_DEFAULT_TIMEOUT:-{REMOTE_PIP_TIMEOUT_S}}} "
+    return (out + f'ttp_env=$({pip}{f"TTP_HOME={home} " if home else ""}python3 -I {w}/runnerenv.py "$PWD"/{w}/checks-python.lock) || {{ '
             f"echo 'ttp: the checks pinned Python env could not be made on this host; the check did not run' >&2; {fail}; }}\n"
             'export PATH="$ttp_env/bin${PATH:+:$PATH}" PYTHONNOUSERSITE=1 TTP_CHECKS_ENV_BIN="$ttp_env/bin"\n'
             'unset PIP_USER\n')

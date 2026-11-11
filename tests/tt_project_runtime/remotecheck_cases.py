@@ -5216,13 +5216,15 @@ def test_spill_probe_counts_only_check_folders_a_process_uses_and_removes_stale_
     probe counts a folder some process of the ssh user works in, and one made just now (its copy is under
     way), but not a dead one, and removes a dead one older than REAP_AFTER_MIN, so dead folders never fill
     an idle host."""
-    from ttp import checkspill
+    from ttp import checkspill, remotecheck
     t = tmp_path / "remote"
     t.mkdir()
     live, fresh, dead, stale = (t / f"ttp-check.{x}0001" for x in ("live", "fresh", "dead", "stale"))
     for d in (live, fresh, dead, stale):
         d.mkdir()
     (live / "sub").mkdir()
+    (live / ".git").mkdir()
+    (live / remotecheck.RUN_PID).write_text("999999999")   # started (a pid no process has)
     for d, age_min in ((live, 600), (dead, checkspill.FRESH_MIN + 10), (stale, checkspill.REAP_AFTER_MIN + 10)):
         old = time.time() - age_min * 60
         os.utime(d, (old, old))
@@ -5583,3 +5585,93 @@ def test_a_copy_timeout_keeps_its_host_off_after_one_try_a_plain_host_fault_afte
     claim = checkspill.pick(p, p.config(), told.append, "pytest -q", off="check-host-a:fault")
     assert claim is not None and claim.host == "check-host-a", told
     claim.close()
+
+
+@_GNU_FIND
+def test_the_spill_probe_counts_only_started_folders_a_live_process_works_in(tmp_path):
+    """checkspill's slots probe: a ttp-check.* folder counts as a running check only once its run started
+    (remotecheck.RUN_PID, which the real run script writes) and a live process works in it. A stalled copy
+    (no pid file, its tar still waiting, past RUNNING_GRACE_MIN) and a run that died leaving its folder count as
+    none; a copy made within FRESH_MIN still counts (its claim is not on the host yet)."""
+    import time
+    from ttp import checkspill, remotecheck
+    remote = tmp_path / "t"
+    remote.mkdir()
+    procs = []
+    try:
+        for name, mark, live in (("ttp-check.run", True, True), ("ttp-check.dead", True, False),
+                                 ("ttp-check.copy", False, True)):
+            d = remote / name
+            (d / ".git").mkdir(parents=True)
+            if mark:
+                (d / remotecheck.RUN_PID).write_text("999999999")   # a pid no process has: only the live process counts
+            if live:
+                procs.append(subprocess.Popen(["sleep", "60"], cwd=d))
+            if name != "ttp-check.run":   # the stalled copy and the dead run are past the grace
+                aged = time.time() - 2 * checkspill.FRESH_MIN * 60
+                os.utime(d, (aged, aged))
+        out = subprocess.run(["sh", "-c", checkspill._PROBE], env={**os.environ, "TMPDIR": str(remote)},
+                             capture_output=True, text=True, timeout=30).stdout.split()
+        assert out[0] == "ttp-spill" and out[3] == "1", out
+    finally:
+        for proc in procs:
+            proc.terminate()
+            proc.wait()
+    repo = _rc_repo(tmp_path)
+    rc, said = _rc_run(tmp_path, repo, f"test -f {remotecheck.RUN_PID} && echo started-here")
+    assert rc == 0 and "started-here" in said, "the run script marks its folder started once the copy is in"
+
+
+def test_tree_copies_to_one_host_are_capped_for_every_project_here(env, tmp_path, monkeypatch, capsys):
+    """remotecheck.upload_slot: at most UPLOADS_PER_HOST copies to one host run from this machine; the next
+    waits, saying so, and is a host fault once UPLOAD_WAIT_S passes; a closed copy frees its slot, and a run
+    leaves none held."""
+    from ttp import remotecheck
+    monkeypatch.setattr(remotecheck, "UPLOAD_TELL_S", 0)
+    held = [remotecheck.upload_slot("box1", wait_s=0) for _ in range(remotecheck.UPLOADS_PER_HOST)]
+    try:
+        assert all(h is not None for h in held)
+        assert remotecheck.upload_slot("box1", wait_s=0.1) is None
+        assert "waiting for a copy slot to box1" in capsys.readouterr().out
+        other = remotecheck.upload_slot("box2", wait_s=0)
+        assert other is not None, "another host has its own slots"
+        other.close()
+        held.pop().close()
+        again = remotecheck.upload_slot("box1", wait_s=0)
+        assert again is not None
+        again.close()
+    finally:
+        for h in held:
+            h.close()
+    repo = _rc_repo(tmp_path)
+    rc, said = _rc_run(tmp_path, repo, "true")
+    assert rc == 0, said
+    free = [remotecheck.upload_slot("box1", wait_s=0) for _ in range(remotecheck.UPLOADS_PER_HOST)]
+    assert all(h is not None for h in free), "the run's copy slot was freed"
+    for h in free:
+        h.close()
+
+
+def test_a_host_that_cannot_make_the_checks_env_is_down_for_every_project_until_a_run_passes(env, tmp_path, monkeypatch):
+    """A spill host whose pinned checks env cannot be made (no package index there) fails at once
+    (FAULT_RC) and is marked down for every project on this machine: pick skips it and status says so. Once
+    DOWN_RETRY_S passes one run tries it again (the mark moves on for the rest), and a run there that passes
+    its env step clears it."""
+    from ttp import checkspill, remotecheck, runnerenv
+    assert "PIP_RETRIES=" in runnerenv.remote_lines(None, "x", "y"), "pip gives up quickly where it has no index"
+    assert "PIP_DEFAULT_TIMEOUT=" in runnerenv.remote_lines(None, "x", "y")
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-b"])
+    rc, said = _rc_run(tmp_path, repo, "true", host="check-host-b", TTP_TEST_CHECKS_PYTHON_ENV=str(tmp_path / "none"))
+    assert rc == remotecheck.FAULT_RC, said
+    assert "pinned Python env could not be made there" in checkspill.down_why("check-host-b")
+    told = []
+    assert checkspill.pick(p, p.config(), told.append, "pytest -q") is None
+    assert any("check-host-b" in t and "down for every project" in t for t in told), told
+    assert "check-host-b" not in checkspill.LAST_BUSY, "a down host is no busy one to wait for"
+    assert any("spill host check-host-b takes no checks" in ln for ln in checkspill.skip_lines()), checkspill.skip_lines()
+    later = time.time() + checkspill.DOWN_RETRY_S + 1
+    assert checkspill.down_why("check-host-b", now=later) == "", "one run tries it again"
+    assert checkspill.down_why("check-host-b", now=later + 1), "the others still skip it"
+    rc, said = _rc_run(tmp_path, repo, "true", host="check-host-b")
+    assert rc == 0, said
+    assert checkspill.down_why("check-host-b") == "" and not checkspill._down_file("check-host-b").exists()

@@ -27396,6 +27396,7 @@ DURABLE_EXEMPT = {
     ("bridge_cert.py", 'f.write_text(pub.strip() + "\\n")'): "a key line for ssh-keygen -l in a TemporaryDirectory removed right after; nothing is kept",
     ("bridge_cert.py", 'f.write_text(cert.strip() + "\\n")'): "a certificate line for ssh-keygen -L in a TemporaryDirectory removed right after; nothing is kept",
     ("bridge_cert.py", 'f.write_text(box_pub.strip() + "\\n")'): "the box's public key for ssh-keygen -s in a TemporaryDirectory; the certificate is read back from stdout and the folder removed",
+    ("remotecheck.py", 'fh = open(d / f"{name}.{i}.lock", "a")'): "an empty flock file capping tree copies to a host; only the lock is used, its contents never read",
     ("shorttmp.py", "with os.fdopen(out, 'w') as f:"): "marks a check's scratch dir on the RAM disk with its allocation, which a reboot clears anyway; a lost mark only counts the dir as live for a few minutes",
     ("cellenv.py", '(site / "ttp-system-site.pth").write_text('): "a .pth in a bench cell's own throwaway venv, made fresh with the venv; a cut file only fails that cell's setup, never project state",
     ("benchrun.py", 'open(run / "runner.log", "wb")'): "the supervisor's stdout in a bench cell's temp folder, copied out after the cell; a cut log costs only the log",
