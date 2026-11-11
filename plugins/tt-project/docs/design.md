@@ -422,9 +422,14 @@ What each supported CLI offers, with doc links: [providers.md](providers.md).
   An explicit host-side `ttp upgrade <name>` (not `--auto`, not from one of the project's runs) queues
   the merge task at once on the same rule, and takes the finish
   lock over from a finish task that is blocked or has had no run or update for 6 h: that task is
-  cancelled (superseded) and the lock's generation goes up, so its later `--apply` is refused. A
-  finish task stuck that long is reported once to the maintainers' upstream inbox; a restart does not
-  repeat it. Deferral lines name the owner and say when the upgrade resumes, in the home zone.
+  cancelled (superseded) and the lock's generation goes up, so its later `--apply` is refused. The
+  daemon's hourly release check runs that takeover itself once a finish task has been stuck that long
+  from first seen (`ttp upgrade <name> --take-over-from <task>`, detached, logged to
+  `state/logs/takeover.log` and the daemon log, with a low observation for the coordinator): once per
+  task, kept in kv so a restart neither repeats nor resets it. It waits while the project is paused
+  (the clock restarts at the resume) or a push, another upgrade or a `ttp setup` copy is in flight.
+  Only a takeover that fails sends one note, with its error, to the maintainers' upstream inbox.
+  Deferral lines name the owner and say when the upgrade resumes, in the home zone.
 - How a release reaches `lib/current`: `ttp setup`, run from a plugin's root, copies that plugin
   into `~/.tt-project/lib/<version>` and points `lib/current` at it. It refuses to replace a
   newer installed version unless run with `--force`, which leaves a `lib/forced-downgrade` marker

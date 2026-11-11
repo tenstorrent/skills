@@ -11438,11 +11438,17 @@ def test_check_release_runs_on_the_first_tick_after_a_resume(env, monkeypatch):
 
 def test_check_release_escalates_a_stuck_finish_task_once_across_restarts(env, monkeypatch):
     """A finish task blocked for days only produced an hourly 'held' log line. After 6 h blocked or
-    idle, check_release files ONE upstream note (block reason, what a host upgrade does); the first-seen
-    time is kept in kv, so a restart neither repeats nor resets it, and it clears when the task ends."""
+    idle, check_release takes it over once; a takeover that fails files ONE upstream note (block reason,
+    the takeover's error, what a takeover does). The first-seen time is kept in kv, so a restart neither
+    repeats nor resets it, and it clears when the task ends."""
     from ttp import release, upstream
     from ttp.daemon import Daemon
     p, d, launches = _release_daemon(env, monkeypatch)
+    took = []
+
+    class Failed:
+        pid, poll = 2 ** 22 + 9, staticmethod(lambda: 1)
+    monkeypatch.setattr(release, "_launch_takeover", lambda proj, task: took.append(task) or Failed())
     p.set_config("upgrade.auto", False)
     d.cfg = p.config()
     tid = p.db.add_task(release.UPGRADE_TASK_TITLE, "x", kind="harness")
@@ -11462,7 +11468,11 @@ def test_check_release_escalates_a_stuck_finish_task_once_across_restarts(env, m
     p.db.set_kv(release.KV_FINISH_STUCK, {**rec, "first": time.time() - 7 * 3600})   # 7 h later
     d2._release_due = 0
     d2.check_release()
+    assert took == [tid] and not notes()                    # taken over; it fails
+    d2._release_due = 0
+    d2.check_release()
     got = notes()
+    assert "exit 1" in got[0]["spec"] and took == [tid]
     assert len(got) == 1 and "Failed to connect to bus" in got[0]["spec"] and "--apply` is refused" in got[0]["spec"]
     assert "9.9.9 (bbbb2222)" in got[0]["title"] and got[0]["project"] == p.name
     d3 = Daemon(p.base)                                       # another restart: no repeat

@@ -13775,10 +13775,12 @@ class Daemon:
             db.set_kv(release.KV_RELEASE, d)
             if d:
                 log(self.p, f"tt-project {d['installed']} installed; harness on {d['current']}")
-        try:        # a finish task stuck past release.STALE_S is told to the maintainers once
+        try:        # a finish task stuck past release.STALE_S is taken over once; a failed takeover is told upstream
             done = release.escalate_stuck(self.p)
             if done:
-                log(self.p, f"template upgrade {done}; one note went to the upstream inbox")
+                log(self.p, f"template upgrade {done}")
+                self.observe("daemon:upgrade-takeover", f"Template upgrade {done}", "low", whole=True,
+                             key=f"upgrade-takeover:{done.split(':')[0]}")
         except Exception as e:
             log(self.p, f"finish-task escalation failed: {type(e).__name__}: {e}")
         if not release.retried(d, self.cfg) or db.kv("paused", False):

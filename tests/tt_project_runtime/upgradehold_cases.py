@@ -381,3 +381,149 @@ def test_a_rollback_of_a_local_runtime_edit_is_kept_by_the_upgrade(env, monkeypa
     assert "re-applied" not in capsys.readouterr().out
     assert "# a runtime change" not in (h / "runtime" / "ttp" / "daemon.py").read_text()
     assert _git_out(h, "log", "-1", "--format=%H", "--", "runtime") == rolled
+
+
+def _stale_finish_task(env, monkeypatch, conflict=False):
+    """A finish task queued by a conflicting upgrade, then idle 7 h; the next release merges cleanly unless
+    `conflict`. Its takeover runs `ttp upgrade <name> --take-over-from <task>` in this process."""
+    from ttp import cli, release
+    p, restarts = _conflicting_upgrade(env, monkeypatch)
+    with pytest.raises(SystemExit), contextlib.redirect_stdout(io.StringIO()):
+        cli.main(["upgrade", "demo"])
+    tid = p.db.one("SELECT id FROM tasks WHERE kind='harness'")["id"]
+    if not conflict:
+        _install_template(env, {"kind-harness.md": "# Harness task, this project's way\n"})
+    p.db.x("UPDATE tasks SET status='queued', created=?, updated=? WHERE id=?",
+           (time.time() - 9 * 3600, time.time() - 7 * 3600, tid))
+    calls = []
+
+    class Ended:
+        def __init__(self, rc):
+            self.pid, self.rc = 2 ** 22 + 7, rc
+
+        def poll(self):
+            return self.rc
+
+    def launch(proj, task):
+        calls.append(task)
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                cli.main(["upgrade", proj.name, "--take-over-from", str(task)])
+            return Ended(0)
+        except SystemExit as e:
+            return Ended(e.code)
+    monkeypatch.setattr(release, "_launch_takeover", launch)
+    monkeypatch.setattr(release, "_takeovers", {})
+    return p, tid, calls, restarts
+
+
+def _stuck_notes(tid):
+    from ttp import upstream
+    return [n for n in (json.loads(x) for x in upstream.path().read_text().splitlines())
+            if n["task"] == tid] if upstream.path().exists() else []
+
+
+def test_the_daemon_takes_over_a_finish_task_idle_past_six_hours_once(env, monkeypatch):
+    """A finish task idle past STALE_S only got an upstream note and waited for someone to run a host-side
+    `ttp upgrade`. The daemon's release check now runs that takeover itself, once: the task is cancelled as
+    superseded, the release merged, and no note is sent."""
+    from ttp import release
+    p, tid, calls, restarts = _stale_finish_task(env, monkeypatch)
+    assert "this project's daemon takes it over" in release.holder_line(p, release.finish_holder(p))
+    done = release.escalate_stuck(p)
+    assert done.startswith("took over: harness task #") and calls == [tid], done
+    t = p.db.task(tid)
+    assert t["status"] == "cancelled" and release.fenced(p, tid) and release.finish_holder(p) is None
+    assert restarts == [1] and not p.db.q("SELECT id FROM tasks WHERE kind='harness' AND id<>?", (tid,))
+    assert release.escalate_stuck(p) == "" and calls == [tid] and not _stuck_notes(tid)
+    assert p.db.kv(release.KV_FINISH_STUCK) is None
+
+
+def test_the_daemons_takeover_of_a_conflicting_merge_queues_one_new_merge_task(env, monkeypatch):
+    from ttp import release
+    p, tid, calls, _ = _stale_finish_task(env, monkeypatch, conflict=True)
+    assert release.escalate_stuck(p).startswith("took over")
+    new = p.db.q("SELECT id FROM tasks WHERE kind='harness' AND id<>?", (tid,))
+    assert p.db.task(tid)["status"] == "cancelled" and len(new) == 1
+    assert release.finish_holder(p)["task"] == new[0]["id"]
+    for _ in range(2):          # the new task is fresh: no second takeover, no note
+        assert release.escalate_stuck(p) == ""
+    assert calls == [tid] and not _stuck_notes(tid) and not _stuck_notes(new[0]["id"])
+
+
+@pytest.mark.parametrize("why", ["paused", "push"])
+def test_the_daemons_takeover_waits_while_paused_or_a_push_is_in_flight(env, monkeypatch, why):
+    from ttp import locks, release
+    p, tid, calls, _ = _stale_finish_task(env, monkeypatch)
+    if why == "paused":
+        p.db.set_paused(True)
+        assert "takes it over" not in release.holder_line(p, release.finish_holder(p))
+    else:
+        held = locks.try_take([p.state / "locks" / "push:run-b1.0.lock"], "push queue")
+        assert held is not None
+    for _ in range(2):
+        assert release.escalate_stuck(p) == ""
+    assert not calls and p.db.task(tid)["status"] == "queued" and not _stuck_notes(tid)
+    if why == "paused":
+        p.db.set_paused(False)
+        assert release.escalate_stuck(p) == "" and not calls     # its clock starts again at the resume
+    else:
+        held.close()
+        assert release.escalate_stuck(p).startswith("took over") and calls == [tid]
+
+
+def test_a_failed_takeover_sends_one_note_and_a_restart_does_not_run_it_again(env, monkeypatch):
+    """A takeover that ended with the same task still holding the harness sends ONE upstream note with its
+    error. The takeover lives in kv: a restart while it runs waits for its process and never starts a
+    second one; once it ended unseen, the restarted daemon reports it once."""
+    from ttp import release
+    from ttp.daemon import Daemon
+    p, tid, calls, _ = _stale_finish_task(env, monkeypatch)
+
+    class Running:
+        pid = os.getpid()
+
+        def poll(self):
+            return None
+
+    def launch(proj, task):
+        calls.append(task)
+        return Running()
+    monkeypatch.setattr(release, "_launch_takeover", launch)
+    p.set_config("upgrade.auto", False)
+    d = Daemon(p.base)
+    d.check_release()
+    assert calls == [tid] and p.db.kv(release.KV_FINISH_STUCK)["took"]["pid"] == os.getpid()
+    assert "is taking it over now" in release.holder_line(p, release.finish_holder(p))
+    assert f"template upgrade took over: harness task #{tid}" in (p.logs / "daemon.log").read_text()
+    release._takeovers.clear()                          # a restart: the process is someone else's now
+    d2 = Daemon(p.base)
+    d2._release_due = 0
+    d2.check_release()
+    assert calls == [tid] and not _stuck_notes(tid)     # still running: it waits
+    rec = p.db.kv(release.KV_FINISH_STUCK)
+    p.db.set_kv(release.KV_FINISH_STUCK, {**rec, "took": {**rec["took"], "pid": _exited_pid()}})
+    (p.logs / "takeover.log").parent.mkdir(parents=True, exist_ok=True)
+    (p.logs / "takeover.log").write_text("upgrade refused: Failed to connect to bus\n")
+    for _ in range(3):
+        d3 = Daemon(p.base)
+        d3._release_due = 0
+        d3.check_release()
+    got = _stuck_notes(tid)
+    assert calls == [tid] and len(got) == 1 and p.db.task(tid)["status"] == "queued"
+    assert "takeover" in got[0]["spec"] and "ended while this daemon was down" in got[0]["spec"]
+    assert "the maintainers were told" in release.holder_line(p, release.finish_holder(p))
+
+
+def test_a_takeover_that_cannot_start_sends_one_note_with_its_error(env, monkeypatch):
+    from ttp import release
+    p, tid, calls, _ = _stale_finish_task(env, monkeypatch)
+
+    def launch(proj, task):
+        calls.append(task)
+        raise FileNotFoundError("no installed release at lib/current/bin/ttp")
+    monkeypatch.setattr(release, "_launch_takeover", launch)
+    assert "failed" in release.escalate_stuck(p)
+    assert release.escalate_stuck(p) == "" and calls == [tid]
+    got = _stuck_notes(tid)
+    assert len(got) == 1 and "no installed release" in got[0]["spec"] and "--apply` is refused" in got[0]["spec"]

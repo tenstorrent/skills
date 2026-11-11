@@ -334,9 +334,20 @@ def holder_line(p: Project, h: dict, db=None) -> str:
         # Its task cannot run, and a takeover only queues the merge again: no deadline that would slide.
         return (f"owner: harness task #{h['task']} ({status}); {p.name} paused; upgrades when resumed "
                 f"(the task runs then)")
-    at = time.time() if status == "blocked" else last + STALE_S
-    return (f"owner: harness task #{h['task']} ({status}); resumes when it ends, or at "
-            f"{timefmt.long(max(at, time.time()), p)} when a host-side `ttp upgrade {p.name}` may take it over")
+    return f"owner: harness task #{h['task']} ({status}); resumes when it ends" + takeover_when(p, db, h["task"], t, last)
+
+
+def takeover_when(p: Project, db, tid: int, t: dict | None, last: float) -> str:
+    """When this project's daemon takes stale finish task `tid` over (escalate_stuck), for status lines."""
+    rec = db.kv(KV_FINISH_STUCK) or {}
+    rec = rec if rec.get("task") == tid else {}
+    if rec.get("sent"):
+        return "; the daemon's takeover failed and the maintainers were told"
+    if rec.get("took"):
+        return "; the daemon is taking it over now"
+    first = float(rec.get("first") or (time.time() if t and t["status"] == "blocked" else last))
+    return (f", or at {timefmt.long(max(first + STALE_S, time.time()), p)} when this project's daemon takes it "
+            f"over")
 
 
 def finish_holder(p: Project, db=None, clean: bool = False) -> dict | None:
@@ -436,11 +447,79 @@ def note_deferred(p: Project, why: str = "", task: int | None = None) -> None:
 KV_FINISH_STUCK = "upgrade_finish_stuck"    # the finish task seen blocked or idle: first seen, escalation sent
 
 
+_takeovers: dict[str, subprocess.Popen] = {}   # this daemon's own takeovers in flight, by project name
+
+
+def _launch_takeover(p: Project, task: int):
+    """Start the installed release's host-side `ttp upgrade <name> --take-over-from <task>` for this project,
+    detached (deploy.launch_takeover): a restart of this daemon leaves it running. Tests replace it."""
+    from . import deploy
+    return deploy.launch_takeover(p, p.name, task)
+
+
+def takeover_busy(p: Project) -> str:
+    """Why the daemon's takeover of a stale finish task waits for its next check ("" = go): a push, another
+    upgrade, a `ttp setup` copy or a cycle notice is in flight."""
+    from . import cyclenotice
+    if h := cyclenotice.project_held(p):
+        return cyclenotice.line(h, p)
+    if _taken(upgrade_lock(p)):
+        return "an upgrade is in flight"
+    if live_pushes(p):
+        return "a push is in flight"
+    if (HOME_DIR / "lib" / SETUP_JOURNAL).exists():
+        return "a `ttp setup` (or its recovery) is copying a release in"
+    return ""
+
+
+def _takeover_end(p: Project, t: dict, now: float) -> str | None:
+    """How the daemon's takeover `t` ({"pid", "started"}) ended; None while it runs. One past
+    deploy.TAKEOVER_TIMEOUT_S is over (stopped, when this daemon started it). Records the end in `t`."""
+    if t.get("ended"):
+        return str(t.get("rc") or "")
+    from . import deploy
+    pid = int(t.get("pid") or 0)
+    late = now - float(t.get("started") or 0) > deploy.TAKEOVER_TIMEOUT_S
+    child = _takeovers.get(p.name)
+    if child is not None and child.pid == pid:
+        rc = child.poll()
+        if rc is None and late:
+            try:
+                os.killpg(pid, 9)
+            except OSError:
+                pass
+            rc = "timed out"
+        if rc is None:
+            return None
+        _takeovers.pop(p.name, None)
+        rc = rc if isinstance(rc, str) else f"exit {rc}"
+    else:
+        if pid and locks._alive(pid) and not late:
+            return None
+        rc = "timed out" if late else "ended while this daemon was down (exit code unknown)"
+    t.update(pid=None, ended=now, rc=rc)
+    return rc
+
+
+def _log_tail(p: Project, n: int = 8) -> str:
+    try:
+        from . import deploy
+        lines = deploy.takeover_log(p, p.name).read_text(errors="replace").splitlines()
+    except (OSError, ImportError):
+        return ""
+    return " | ".join(ln.strip() for ln in lines[-n:] if ln.strip())[-1200:]
+
+
 def escalate_stuck(p: Project) -> str:
-    """The daemon's hourly look at the finish task: once it has been blocked or idle past STALE_S, ONE
-    note goes to the maintainers' upstream inbox with why it is stuck and what a host-side upgrade will
-    do. The first-seen time and the send live in kv, so a restart neither resets nor repeats it; the
-    record goes when the task ends. Returns what it did, for the log ("" = nothing)."""
+    """The daemon's hourly look at the finish task. Once it has been blocked or idle past STALE_S from first
+    seen, the daemon takes it over itself, as a host-side `ttp upgrade <name>` does: under the upgrade lock
+    it cancels the task (superseded), bumps the lock's generation so the task's `--apply` is refused, merges
+    the release, queues one new merge task on a conflict, and keeps local harness edits committed. At most
+    once per stale task: the first-seen time and the takeover live in kv, so a restart neither repeats nor
+    resets it. It waits while the project is paused (its task runs after the resume) or a push or another
+    upgrade is in flight. Only a takeover that fails sends ONE note, with its error, to the maintainers'
+    upstream inbox. The record goes when the task stops holding the harness. Returns what it did, for the
+    log ("" = nothing)."""
     db = p.db
     rec = db.kv(KV_FINISH_STUCK) or {}
     h = finish_holder(p)
@@ -451,31 +530,64 @@ def escalate_stuck(p: Project) -> str:
         if not h:
             return ""
     why = stale_holder(db, h)
-    if not why:
-        if rec and not rec.get("sent"):     # it moved again before anyone was told
+    if not why and not rec.get("took"):
+        if rec and not rec.get("sent"):     # it moved again before anything was done
             db.x("DELETE FROM kv WHERE key=?", (KV_FINISH_STUCK,))
         return ""
     now = time.time()
+    tid = h["task"]
+    target = h.get("target") or "the installed release"
+    reason = (why if why.startswith("blocked") else      # no hours: one fingerprint
+              f"idle: {why.split(' with ')[0]} with no run or update for over {STALE_S // 3600} h") if why else "stale"
     if not rec:
-        rec = {"task": h["task"], "first": min(now, task_activity(db, h["task"])[1] or now)}
-    if rec.get("sent") or now - float(rec["first"]) < STALE_S:
+        rec = {"task": tid, "first": min(now, task_activity(db, tid)[1] or now)}
+    if rec.get("sent"):
+        return ""
+    if rec.get("took"):
+        rc = _takeover_end(p, rec["took"], now)
+        db.set_kv(KV_FINISH_STUCK, rec)
+        if rc is None:
+            return ""
+        # It ended and the same task still holds the harness: the takeover did not finish it.
+        err = f"{rc}; {_log_tail(p)}".strip("; ")
+        return _send_stuck_note(p, rec, tid, target, reason or "stale", now,
+                                f"The daemon's takeover (`ttp upgrade {p.name} --take-over-from {tid}`) "
+                                f"failed: {err}")
+    if now - float(rec["first"]) < STALE_S:
         db.set_kv(KV_FINISH_STUCK, rec)
         return ""
-    from . import upstream
-    target = h.get("target") or "the installed release"
-    reason = why if why.startswith("blocked") else \
-        f"idle: {why.split(' with ')[0]} with no run or update for over {STALE_S // 3600} h"   # no hours: one fingerprint
-    note = {"title": f"upstream: {p.name}: template upgrade finish task #{h['task']} to {target} is stuck",
-            "spec": f"Harness task #{h['task']} holds the template merge of project {p.name} toward tt-project "
-                    f"{target} and is {reason}. While it holds, the daemon's automatic upgrades wait and the "
-                    f"project runs older code. A host-side `ttp upgrade {p.name}` (not --auto, not from one of "
-                    f"its runs) takes the lock over: it cancels task #{h['task']} (superseded), bumps the lock's "
-                    f"generation so that task's `--apply` is refused, merges the release, and queues one new "
-                    f"merge task if the merge conflicts. Local harness edits are committed and kept."}
-    upstream.append(p.name, h["task"], [note])
-    rec.update(sent=now, target=target, why=reason[:300])
+    if db.kv("paused", False):      # its task cannot run: it does after the resume, so the clock starts again then
+        rec["first"] = now
+        db.set_kv(KV_FINISH_STUCK, rec)
+        return ""
+    if takeover_busy(p):            # retried at the next check; nothing is recorded
+        db.set_kv(KV_FINISH_STUCK, rec)
+        return ""
+    try:
+        proc = _launch_takeover(p, tid)
+    except Exception as e:      # noqa: BLE001 - whatever stops the start is the error the maintainers get
+        return _send_stuck_note(p, rec, tid, target, reason, now,
+                                f"The daemon could not start its takeover: {type(e).__name__}: {e}")
+    _takeovers[p.name] = proc
+    rec.update(took={"pid": proc.pid, "started": now}, target=target, why=reason[:300])
     db.set_kv(KV_FINISH_STUCK, rec)
-    return f"escalated: harness task #{h['task']} is {reason}"
+    return (f"took over: harness task #{tid} (template merge to {target}) is {reason}; the daemon runs "
+            f"`ttp upgrade {p.name} --take-over-from {tid}` (pid {proc.pid}, log state/logs/takeover.log)")
+
+
+def _send_stuck_note(p: Project, rec: dict, tid: int, target: str, reason: str, now: float, error: str) -> str:
+    from . import upstream
+    note = {"title": f"upstream: {p.name}: template upgrade finish task #{tid} to {target} is stuck",
+            "spec": f"Harness task #{tid} holds the template merge of project {p.name} toward tt-project "
+                    f"{target} and is {reason}. While it holds, the daemon's automatic upgrades wait and the "
+                    f"project runs older code. {error[:1500]}. The takeover cancels task #{tid} (superseded), "
+                    f"bumps the lock's generation so that task's `--apply` is refused, merges the release, and "
+                    f"queues one new merge task if the merge conflicts; local harness edits are committed and "
+                    f"kept. The daemon does not try it again for this task."}
+    upstream.append(p.name, tid, [note])
+    rec.update(sent=now, target=target, why=reason[:300], error=error[:600])
+    p.db.set_kv(KV_FINISH_STUCK, rec)
+    return f"takeover of harness task #{tid} failed; one note went to the upstream inbox: {error[:300]}"
 
 
 def clear_stuck(p: Project) -> None:
