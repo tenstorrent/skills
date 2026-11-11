@@ -19,6 +19,8 @@ order; each is bounded and never raises:
    '<unit> (<message>)'. A unit systemd only started is named only when its own lines (the last
    UNIT_ENTRIES with its _SYSTEMD_UNIT, read the same way) show it logged after its start: one armed just
    before the request (a shutdown watchdog) that logged nothing is 'armed, not fired' after the request.
+   A line that says it skipped (_SKIP: 'skip: ...', 'skipping power cycle') names no initiator, nor do a
+   started unit's own lines that only skipped: '<unit> logged only a skip (...)' goes after the answer.
 2. A tt-project host-cycle record (`ttp drain --reboot`) from any project on this host that ended that
    boot (hostcycle.planned).
 3. An entry in the shared machine-change ledger for this host's machine alias, recorded from
@@ -64,6 +66,9 @@ _STOP_WORDS = re.compile(r"power[ _-]?cycl|\breboot|power[ _-]?off|\bshutdown\b|
 _MARKER_LOGIND = re.compile(r"^System is (rebooting|powering down|halting)|shutdown scheduled"
                             r"|system will (reboot|power ?off|halt|shut ?down)", re.I)
 _MARKER_SYSTEMD = re.compile(r"^Reached target .*\b(reboot|power-?off|halt|kexec)\b", re.I)
+# A unit's line saying it did not act ('[<tag>:] skip: ...', 'skipped ...', 'skipping ...'): its stop words
+# name what it skipped, not what it did.
+_SKIP = re.compile(r"^(?:[\w.@-]+:\s*)?skip(?:ped|ping)?\b", re.I)
 _UNIT_START = re.compile(r"^Start(?:ed|ing) (?P<unit>[\w.@:-]+\.(?:service|scope|timer))\b")
 NO_SHUTDOWN = "no clean shutdown logged (power loss, hard reset or watchdog)"
 NO_MARKER = f"no shutdown marker in the journal's last {MARK_ENTRIES} logind and shutdown-target lines read"
@@ -259,8 +264,9 @@ def _armed(unit: str, e: dict, own) -> str | None:
         return None
     lines, end = got
     t0 = e["ts"]
-    if any(r["unit"] == unit and r["msg"] and (t0 is None or r["ts"] is None or r["ts"] >= t0)
-           for r in _entries(lines) if r["json"]):
+    after = [r for r in _entries(lines) if r["json"] and r["unit"] == unit and r["msg"]
+             and (t0 is None or r["ts"] is None or r["ts"] >= t0)]
+    if any(not _SKIP.match(r["msg"]) for r in after):
         return None
     m = re.match(r"Start(?:ed|ing) (?P<what>.*?)\.*$", e["msg"])
     what = m["what"] if m else ""
@@ -269,6 +275,8 @@ def _armed(unit: str, e: dict, own) -> str | None:
     ends = [r["ts"] for r in _entries(end or "") if r["ts"] is not None]
     later = f" {max(ends) - t0:.0f} s later" if ends and t0 is not None and max(ends) >= t0 else ""
     name = f"{unit} ({_clip(what, 60)})" if what and what != unit else unit
+    if after:
+        return f"{name} armed, not fired: it logged only a skip ({_clip(after[-1]['msg'], 60)})"
     return f"{name} armed, not fired: it logged nothing of its own before the boot's journal ended{later}"
 
 
@@ -281,7 +289,8 @@ def parse(out: str, window: str | None = None, full: bool = False,
     press, else the line nearest before the marker (within WINDOW_S) of a system unit, or of systemd
     starting one, that names a power cycle, reboot or shutdown; a unit systemd started that `own` (see
     _armed) shows logged nothing after its start is no initiator: the next such line before it, else the
-    logind request, is, with '; <unit> (...) armed, not fired: ...' after it. Fallback: the unit started or logging
+    logind request, is, with '; <unit> (...) armed, not fired: ...' after it. A unit's line that says it
+    skipped (_SKIP) is none either: '; <unit> logged only a skip (...)' goes after the fallback. Fallback: the unit started or logging
     nearest before the marker, a logind 'System is ...' line that names nobody, or with `full` (a read
     that shows the system's entries) and no marker, NO_SHUTDOWN and the last unit lines before the gap."""
     rows = _entries(out)
@@ -319,7 +328,7 @@ def parse(out: str, window: str | None = None, full: bool = False,
     first = next((k for k, e in enumerate(near) if _marker(e) and (at is None or e["ts"] is None or e["ts"] >= at)),
                  None)
     before = near[:first] if first is not None else [e for e in near if at is None or (e["ts"] or 0) < at]
-    start = unit_line = armed = None
+    start = unit_line = armed = skipped = None
     for e in reversed(before):
         if at is not None and e["ts"] is not None and e["ts"] < at - WINDOW_S:
             break
@@ -328,6 +337,9 @@ def parse(out: str, window: str | None = None, full: bool = False,
         started = (e["about"] or (m["unit"] if m else "")) if m or e["about"] and e["msg"].startswith("Start") else ""
         if started.startswith(("systemd-", "user@")):
             started = ""
+        if unit and _SKIP.match(e["msg"]):
+            skipped = skipped or f"{unit} logged only a skip ({_clip(e['msg'], 60)})"
+            continue
         if (unit or started) and _STOP_WORDS.search(e["msg"]):
             quiet = None if unit else _armed(started, e, own)
             if quiet is None:
@@ -339,9 +351,10 @@ def parse(out: str, window: str | None = None, full: bool = False,
             start = f"{started} ({_clip(e['msg'])})"
         if unit_line is None and unit and e["msg"]:
             unit_line = f"{unit} ({_clip(e['msg'])})"
-    if armed:
+    if armed or skipped:
         # The request itself names nobody: a fallback, so a host-cycle record or ledger entry still wins.
-        return None, f"{fallback or 'a shutdown request that names no one (journal)'}; {armed}"
+        base = (fallback if armed else start or unit_line or fallback) or "a shutdown request that names no one (journal)"
+        return None, "; ".join(x for x in (base, armed, skipped) if x)
     return None, start or unit_line or fallback
 
 
