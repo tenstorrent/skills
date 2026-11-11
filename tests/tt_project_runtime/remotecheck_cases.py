@@ -4018,7 +4018,8 @@ def test_a_host_without_usable_git_gets_the_tree_over_a_compressed_ssh(tmp_path)
     rc, said = _rc_run(tmp_path, repo, "cat a.txt", FAKE_SSH_NOGIT="1", FAKE_SSH_ARGS=str(args),
                        TTP_REMOTE_TREE_COPY="1")
     assert rc == 0 and "a" in said and _rc_sent(said) == [], said
-    assert "tree to box1 (ssh compresses it): done" in said
+    assert "tree to box1 (transfer; ssh compresses it): done" in said, said
+    assert "git checkout on box1 (setup)" in said, said  # transfer and setup are timed and reported apart
     assert any("Compression=yes" in ln and "tar -xf" in ln for ln in args.read_text().splitlines())
     assert _rc_mirror(tmp_path) == {} and _rc_left(tmp_path) == []
 

@@ -583,22 +583,22 @@ def _push(host, top, head, mirror, ref, bases, direct, deadline) -> str:
 def _archive(host, top, head, q, direct, deadline) -> tuple[int, str]:
     """The tree of `head` over a compressed ssh into the run's folder `q` (emptied first), made a git checkout
     when the host has git: (0, ""), (2, "") when git archive failed here, else (0, why) as _host_step."""
-    setup = (f"set -e; rm -rf {q}; mkdir -m 700 {q}; cd {q}; tar -xf -; "
-             "if git --version >/dev/null 2>&1; then git -c init.defaultBranch=main init -q; git add -A -f .; "
-             f"git -c user.name=ttp -c user.email=ttp@localhost -c commit.gpgsign=false commit -q "
-             f"--no-verify --allow-empty -m {shlex.quote('ttp check of ' + head)}; fi")
+    setup = f"set -e; rm -rf {q}; mkdir -m 700 {q}; cd {q}; tar -xf -"
+    init = (f"set -e; cd {q}; if git --version >/dev/null 2>&1; then git -c init.defaultBranch=main init -q; "
+            "git add -A -f .; git -c user.name=ttp -c user.email=ttp@localhost -c commit.gpgsign=false commit -q "
+            f"--no-verify --allow-empty -m {shlex.quote('ttp check of ' + head)}; fi")
     src_rc, rc, why, text = _copy(host, ["git", "-C", top, "archive", "--format=tar", head], setup, direct, deadline,
-                                  f"sending {head[:12]}'s tree to {host} (ssh compresses it)", compress=True)
+                                  f"sending {head[:12]}'s tree to {host} (transfer; ssh compresses it)", compress=True)
     if why:
         return 0, why
     if rc != 0:
-        why = (f"cannot unpack the tree into a checkout there (exit {rc}: "
+        why = (f"cannot unpack the tree there (transfer) (exit {rc}: "
                f"{(text.strip().splitlines() or [''])[-1][:200]})")
         return 0, (MUX + why if rc == 255 and _refused(text) else why)
     if src_rc != 0:
         _say(f"git archive of {head[:12]} failed (exit {src_rc})")
         return 2, ""
-    return 0, ""
+    return 0, _host_step(host, init, direct, deadline, f"making {head[:12]}'s tree a git checkout on {host} (setup)")
 
 
 def _attempt(host, top, head, env, extra, cmd, mark, wrap, wait) -> tuple[int, str]:
