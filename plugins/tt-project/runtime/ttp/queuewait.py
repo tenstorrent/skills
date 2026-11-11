@@ -22,7 +22,14 @@ when its cause (queue, resource, host-held, options left) changes or the wait ha
 A checks wait the host-wide checks slots hold (host_held: no coordinator action lifts it) is raised at normal
 and rides along (pagesev.RIDE_ALONG). With no option left the user is told once. Once the episode ends its
 open events are settled. daily_line() is the daily review's metric.
-Each event's data carries `fold` (FOLD): the parts the coordinator's NEW EVENTS joins into one line per queue."""
+Each event's data carries `fold` (FOLD): the parts the coordinator's NEW EVENTS joins into one line per queue.
+An act on a wait's item with no fix owner also answers its queue's cause (the KV's `answers`: the cap and whether
+someone set it, the spill hosts that can take checks, the queue depth): later routine (not urgent, not owed)
+waits on that queue and resource under the same cause are counted as covered, not raised, until the cause changes
+(cap or slot setting, spill admission, depth down by half), a covered wait passes COVER_X times the answered
+wait, or the task becomes urgent or owed. Urgent and owed waits keep their own items; the queue's line names the
+covered count. An answered key stays settled across a new episode of its wait (a restarted wait, another run)
+under the same rules."""
 from __future__ import annotations
 
 import json
@@ -33,12 +40,14 @@ from pathlib import Path
 from . import msgparts, obligations
 
 KIND = "queue_wait"
-KV = "queue_wait"   # {"open": {episode: {task, queue, since, opened, seen, acted, raise}}, "hist": [ended], "told": [episode]}
+KV = "queue_wait"   # {"open": {episode: {task, queue, since, opened, seen, acted, raise, ans}}, "hist": [ended], "told": [episode],
+#                     "answers": {"<queue>:<res>": {key, cause, depth, wait, at, keys}}}
 DEFAULT_MIN = 30.0
 GRACE_S = 1800.0   # a wait not seen this long ends its episode; a shorter gap is the same wait
 HIST_KEEP_S = 7 * 86400.0
 HIST_MAX = 300
 MAX_RAISE = 3   # new items per scan, so a long queue never floods the coordinator with wakes
+COVER_X = 3   # a covered wait past this many times the answered one is raised on its own
 FOLD = "fold"   # in event data: {"group", "item", "ctx", "opts"} (coordinator.fold_events)
 NAMES = {"checks": "checks queue", "push": "push queue", "workers": "worker slots", "device": "device queue",
          "lock": "lock", "pool": "outside batch pool", "cpu": "CPU admission"}
@@ -410,17 +419,23 @@ def scan(p, cfg: dict, now: float | None = None, host: dict | None = None, devic
             spill = spill_ready(p, cfg)   # once a scan, only when a wait could spill
         sp = spill if w["queue"] in ("checks", "cpu", "pool") else None
         opts = options(db, {**w, "project": p.name}, cfg, paused, device, cores, sp)
-        msg = text(w, opts, now, spill_note(sp, cfg))
+        routine, acause = _routine(db, w["task"]), _cause(w, sp)
+        note = " ".join(x for x in (spill_note(sp, cfg), _covered_note(st, w)) if x)
+        msg = text(w, opts, now, note)
         if ev := db.one("SELECT id, text, data FROM events WHERE kind=? AND status='queued' AND data LIKE ?",
                         (KIND, f'%"key": "{k}"%')):
             got = json.loads(ev["data"] or "{}")
-            now_fold = fold(w, opts, now, spill_note(sp, cfg))
+            now_fold = fold(w, opts, now, note)
             if ev["text"] != msg[:4000] or got.get(FOLD) != now_fold:   # still unread: the holders, occupancy
                 got[FOLD] = now_fold   # and options of this scan, not the raise's, in its text and its FOLD data
                 db.x("UPDATE events SET text=?, data=? WHERE id=?", (msg[:4000], json.dumps(got), ev["id"]))
             continue
         if _cause_owner(db, st, w, now) is not None:
             continue   # one act per queue cause: its fix is already owned; raised again once that owner ends
+        if (ans := _answer(st, w, acause, now)) and (routine or (ans.get("keys") or {}).get(k) is False):
+            rec["covered"] = ans["key"]   # counted under the answer, not raised; raised once the cause changes
+            continue
+        rec.pop("covered", None)
         held, age = host_held(w), now - w["since"]
         cause = [w["queue"], w["res"], held, bool(opts)]
         last = rec.get("raise") or {}
@@ -430,7 +445,7 @@ def scan(p, cfg: dict, now: float | None = None, host: dict | None = None, devic
             continue   # raised already: again only on a changed cause or a doubled wait
         n = int(last.get("n") or 0) + 1
         data = {"must_act": {"key": k, "chat": "all", "tasks": [w["task"]], "kind": KIND, "episode": ep},
-                FOLD: fold(w, opts, now, spill_note(sp, cfg))}
+                FOLD: fold(w, opts, now, note)}
         if held:
             data[pagesev.RIDE_ALONG] = True   # no coordinator action lifts it: joins the next turn
         # the episode's open time keeps a later episode of the same task and queue off this one's fingerprints
@@ -439,6 +454,7 @@ def scan(p, cfg: dict, now: float | None = None, host: dict | None = None, devic
                                                           severity="normal" if held else "high"):
             raised.append(fp)   # the longest waits first; the rest at a later scan
             rec["raise"] = {"cause": cause, "len": age, "n": n}
+            rec["ans"] = {"cause": acause, "depth": len(w.get("queued") or []), "routine": routine}
         if not opts and ep not in told:
             told.append(ep)
             msgparts.post(db, f"#{w['task']} has waited {(now - w['since']) / 60:.0f} min on the "
@@ -461,8 +477,58 @@ def scan(p, cfg: dict, now: float | None = None, host: dict | None = None, devic
         _settle(db, ep)
     st["hist"] = [h for h in st.get("hist", []) if now - float(h.get("end") or now) <= HIST_KEEP_S][-HIST_MAX:]
     st["told"] = [e for e in told if e in opened][-HIST_MAX:]
+    held = {f"{r.get('queue')}:{r.get('res') or ''}" for r in opened.values()}
+    st["answers"] = {k: v for k, v in (st.get("answers") or {}).items() if k in held}   # the queue drained
     db.set_kv(KV, st)
     return raised
+
+
+def _routine(db, tid) -> bool:
+    """Task `tid` is routine: not urgent (urgent.is_urgent), answering no user chat and owning no open obligation.
+    Unreadable: not routine, so its wait keeps its own item."""
+    from . import urgent
+    try:
+        row = db.one("SELECT * FROM tasks WHERE id=?", (tid,)) if isinstance(tid, int) else None
+        return bool(row) and not (urgent.is_urgent(dict(row)) or dict(row).get("reply_chat")
+                                  or obligations.owned_open(db, int(tid)))
+    except Exception:
+        return False
+
+
+def _cause(w: dict, spill: tuple[list[str], list[str]] | None) -> dict:
+    """What an answer to a wait answers: the queue's cap, whether someone set it, the spill hosts that can take
+    checks now (None: the queue never spills)."""
+    return {"cap": w.get("cap"), "cap_set": bool(w.get("cap_set")), "spill": sorted(spill[0]) if spill else None}
+
+
+def _answer(st: dict, w: dict, cause: dict, now: float) -> dict | None:
+    """The answer (the KV's `answers`) that covers routine wait `w`: one on its queue and resource under the same cause,
+    with the queue still over half as deep and `w` under COVER_X times the answered wait. A changed cause or a
+    queue down by half drops the answer, so the waits raise again. The answer's `keys` (key: routine when
+    answered) also cover a new episode of an answered key (its wait restarted or moved runs): routine, or urgent
+    or owed both then and now; a routine key turned urgent or owed raises."""
+    answers = st.get("answers") or {}
+    ak = f"{w['queue']}:{w.get('res') or ''}"
+    ans = answers.get(ak)
+    if not ans:
+        return None
+    if ans.get("cause") != cause or 2 * len(w.get("queued") or []) <= int(ans.get("depth") or 0):
+        answers.pop(ak, None)
+        return None
+    if now - w["since"] >= COVER_X * float(ans.get("wait") or 0):
+        return None
+    return ans
+
+
+def _covered_note(st: dict, w: dict) -> str:
+    """The queue line's count of other waits on `w`'s queue and resource covered by an earlier answer."""
+    ans = (st.get("answers") or {}).get(f"{w['queue']}:{w.get('res') or ''}")
+    n = sum(1 for r in (st.get("open") or {}).values() if r.get("covered") and r.get("task") != w["task"]
+            and (r.get("queue"), r.get("res") or "") == (w["queue"], w.get("res") or ""))
+    if not n or not ans:
+        return ""
+    return (f"{n} more wait(s) on this queue are covered by the answer to {ans['key']} (same cause), "
+            f"not raised.")
 
 
 def _open(db, tid) -> bool:
@@ -552,12 +618,20 @@ def record_act(db, ep: str, now: float | None = None, owner: int | None = None) 
             rec["acted"] = time.time() if now is None else now
             if owner is not None:
                 rec["owner"] = owner
+            elif a := rec.get("ans"):   # answers the queue's cause for later routine waits and this key's next episodes
+                answers, ak = st.setdefault("answers", {}), f"{rec['queue']}:{rec.get('res') or ''}"
+                k = f"qwait-{rec['task']}-{rec['queue']}"
+                prev = answers.get(ak) or {}
+                keys = dict(prev.get("keys") or {}) if prev.get("cause") == a["cause"] else {}
+                answers[ak] = {"key": k, "cause": a["cause"], "depth": int(a.get("depth") or 0),
+                               "wait": rec["acted"] - float(rec["since"]), "at": rec["acted"],
+                               "keys": {**keys, k: bool(a.get("routine"))}}
             db.set_kv(KV, st)
 
 
 def daily_line(db, cfg: dict | None = None, now: float | None = None, window_s: float = 86400.0) -> str:
     """queue_wait_over: waits past the threshold in the window (ended or open), max and p95 wait, and the
-    minutes from the threshold mark to the first unblock action."""
+    minutes from the threshold mark to the first unblock action, and the waits an earlier answer covered."""
     now = time.time() if now is None else now
     thr = threshold_s(cfg or {}) or DEFAULT_MIN * 60
     st = db.kv(KV) or {}
@@ -573,8 +647,9 @@ def daily_line(db, cfg: dict | None = None, now: float | None = None, window_s: 
     for e in eps:
         by[e["queue"]] = by.get(e["queue"], 0) + 1
     acts.sort()
+    cov = sum(1 for e in eps if e.get("covered") and not e.get("acted"))
     act = (f"minutes from the mark to the first unblock action: median {acts[len(acts) // 2]:.0f}, max {acts[-1]:.0f}"
            if acts else "no unblock action")
     return (f"queue_wait_over: {len(eps)} queue wait(s) over {thr / 60:g} min in the last {window_s / 3600:g} h "
             f"({', '.join(f'{k} {v}' for k, v in sorted(by.items()))}); max {waits[-1]:.0f} min, p95 {p95:.0f} min; "
-            f"{act}; {len(eps) - len(acts)} with none")
+            f"{act}; {len(eps) - len(acts) - cov} with none" + (f", {cov} covered by an earlier answer" if cov else ""))

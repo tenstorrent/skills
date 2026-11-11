@@ -689,3 +689,119 @@ def test_a_push_batch_holding_its_branch_and_run_locks_is_a_holder_not_a_waiter(
     finally:
         for f in held:
             f.close()
+
+
+def _qw_reset(p):
+    from ttp import queuewait
+    p.db.x("DELETE FROM events WHERE kind='queue_wait'")
+    p.db.set_kv(queuewait.KV, {})
+
+
+def _qw_answered(p, now, cap=4, depth=20):
+    """Task a's routine checks wait raised and answered with a task_update naming its key (no fix owner);
+    returns (a, b, host_of(tasks, cap, depth)): b is a second routine task."""
+    from ttp import mustact, queuewait
+    a, b = p.db.add_task("a", "s", kind="code"), p.db.add_task("b", "s", kind="code")
+
+    def host_of(tasks, cap=cap, depth=depth, at=None):
+        q = [f"other task #{900 + i} (run 1)" for i in range(depth - len(tasks))] + \
+            [f"{p.name} task #{t} (run 1)" for t in tasks]
+        return {"limit": cap, "running": [f"other task #{90 + i} (run 1)" for i in range(cap)], "priority": [],
+                "urgent": [], "parked": [], "queued": q,
+                "queued_at": [now - 600] * (depth - len(tasks)) + [at or now - 40 * 60] * len(tasks)}
+    assert len(queuewait.scan(p, QW_CFG, now, host_of([a]))) == 1
+    ev = _qw_events(p)[0]
+    p.db.x("UPDATE events SET status='handled' WHERE id=?", (ev["id"],))
+    mustact.settle(p, [ev["id"]], [{"type": "task_update", "id": a, "spec": f"qwait-{a}-checks: held by the cap"}],
+                   [0], now)
+    return a, b, host_of
+
+
+def test_queue_wait_answer_covers_routine_waits_under_the_same_cause(env):
+    """#7961: once the coordinator answered one routine wait's item, a second routine task waiting on the same
+    queue under the same cause raises nothing; it is counted, and the queue's line names the count."""
+    from ttp import queuewait
+    p = make(env)
+    now = time.time()
+    a, b, host_of = _qw_answered(p, now)
+    assert queuewait.scan(p, QW_CFG, now + 60, host_of([a, b])) == []
+    rec = next(r for r in p.db.kv(queuewait.KV)["open"].values() if r["task"] == b)
+    assert rec.get("covered") == f"qwait-{a}-checks"
+    assert queuewait._covered_note(p.db.kv(queuewait.KV), {"task": a, "queue": "checks", "res": ""}).startswith(
+        f"1 more wait(s) on this queue are covered by the answer to qwait-{a}-checks")
+    queuewait.scan(p, QW_CFG, now + 120, {})
+    assert "1 covered by an earlier answer" in queuewait.daily_line(p.db, QW_CFG, now + 120)
+
+
+def test_queue_wait_answer_ends_when_its_cause_changes(env):
+    """A cap change, a halved queue or a wait past three times the answered one raises the routine wait."""
+    from ttp import queuewait
+    p = make(env)
+    now = time.time()
+    a, b, host_of = _qw_answered(p, now)
+    assert [fp.split(":")[1] for fp in queuewait.scan(p, QW_CFG, now + 60, host_of([a, b], cap=6))] == [str(b)]
+    _qw_reset(p)
+    a, b, host_of = _qw_answered(p, now)
+    assert [fp.split(":")[1] for fp in queuewait.scan(p, QW_CFG, now + 60, host_of([a, b], depth=10))] == [str(b)]
+    _qw_reset(p)
+    a, b, host_of = _qw_answered(p, now)
+    host = host_of([a, b])
+    host["queued_at"][-1] = now - 130 * 60   # b has waited over 3x a's answered 40 min
+    assert [fp.split(":")[1] for fp in queuewait.scan(p, QW_CFG, now + 60, host)] == [str(b)]
+
+
+def test_queue_wait_answer_ends_when_a_spill_host_changes(env):
+    """A spill host whose admission changed (here paused) is a new cause: the routine wait raises."""
+    from ttp import db as dbm
+    from ttp import machines, mustact, queuewait
+    p = make(env)
+    now = time.time()
+    hosts = ["check-host-a", "check-host-b"]
+    p.charter_path.write_text("# Charter\n## Resources\n" + "".join(f"- {h}: a check host\n" for h in hosts))
+    for h in hosts:
+        machines.add(h)
+    cfg = {**QW_CFG, "delivery": {"checks_spill_hosts": hosts}}
+    a, b = p.db.add_task("a", "s", kind="code"), p.db.add_task("b", "s", kind="code")
+    host = {"limit": 4, "running": [f"other task #{90 + i} (run 1)" for i in range(4)], "priority": [], "urgent": [],
+            "parked": [], "queued": [f"{p.name} task #{a} (run 1)", f"{p.name} task #{b} (run 1)"],
+            "queued_at": [now - 40 * 60] * 2}
+    assert len(queuewait.scan(p, cfg, now, {**host, "queued": host["queued"][:1], "queued_at": [now - 40 * 60]})) == 1
+    ev = _qw_events(p)[0]
+    p.db.x("UPDATE events SET status='handled' WHERE id=?", (ev["id"],))
+    mustact.settle(p, [ev["id"]], [{"type": "reply", "chat": "all", "text": f"qwait-{a}-checks: held by the cap"}],
+                   [0], now)
+    assert queuewait.scan(p, cfg, now + 30, host) == []   # same spill hosts: covered
+    p.db.set_kv(dbm.PAUSED_RESOURCES_KEY, {"check-host-a": {"reason": "user hold", "by": "user", "since": now}})
+    assert [fp.split(":")[1] for fp in queuewait.scan(p, cfg, now + 60, host)] == [str(b)]
+
+
+def test_queue_wait_answer_never_covers_an_urgent_or_owed_wait(env):
+    """An urgent (priority 1 or an `urgent:` line) or user-ordered task keeps its own item under an answer."""
+    from ttp import queuewait
+    p = make(env)
+    now = time.time()
+    a, b, host_of = _qw_answered(p, now)
+    p.db.update_task(b, priority=1)
+    assert [fp.split(":")[1] for fp in queuewait.scan(p, QW_CFG, now + 60, host_of([a, b]))] == [str(b)]
+    _qw_reset(p)
+    a, b, host_of = _qw_answered(p, now)
+    p.db.update_task(b, spec="urgent: the user is waiting")
+    assert [fp.split(":")[1] for fp in queuewait.scan(p, QW_CFG, now + 60, host_of([a, b]))] == [str(b)]
+    _qw_reset(p)
+    a, b, host_of = _qw_answered(p, now)
+    p.db.update_task(b, reply_chat="c1")
+    assert [fp.split(":")[1] for fp in queuewait.scan(p, QW_CFG, now + 60, host_of([a, b]))] == [str(b)]
+
+
+def test_queue_wait_answered_key_stays_settled_across_a_new_episode(env):
+    """#7961 (a key answered with a task_update and raised again 7 min later): the same task's wait restarting
+    under another start time is a new episode, still covered by the answer while the cause holds; turned
+    urgent, it raises."""
+    from ttp import queuewait
+    p = make(env)
+    now = time.time()
+    a, b, host_of = _qw_answered(p, now)
+    assert queuewait.scan(p, QW_CFG, now + 420, host_of([a], at=now - 40 * 60 + 47)) == []
+    p.db.update_task(a, priority=1)
+    assert [fp.split(":")[1] for fp in queuewait.scan(p, QW_CFG, now + 480, host_of([a], at=now - 40 * 60 + 47))] \
+        == [str(a)]
