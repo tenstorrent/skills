@@ -863,7 +863,9 @@ def test_a_real_pytest_rerun_after_a_spill_failure_runs_only_the_failed_tests_an
     repo_root, site = RUNTIME.parents[2], pathlib.Path(pytest.__file__).parents[1]
     p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a"])
     # The fake spill host is this machine: the repo and pytest it names are there too (see _spill_setup).
-    monkeypatch.setattr(checkspill, "_SYSTEM_DIRS", (*checkspill._SYSTEM_DIRS, f"{repo_root}/", f"{site}/"))
+    # The interpreter too: under `ttp checks` it is the pinned checks env's, outside the system folders.
+    monkeypatch.setattr(checkspill, "_SYSTEM_DIRS", (*checkspill._SYSTEM_DIRS, f"{repo_root}/", f"{site}/",
+                                                     f"{pathlib.Path(sys.executable).parent}/"))
     cat = "tests/test_plugin_catalogue.py"
     ids = [f"{cat}::test_host_catalogues_expose_the_same_plugins", f"{cat}::test_only_finder_is_installed_by_default"]
     fail = "printf '" + "".join(f"FAILED {i} - boom\\n" for i in ids) + "2 failed, 11 passed in 0.10s\\n'; exit 1"

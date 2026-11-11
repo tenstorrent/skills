@@ -882,7 +882,8 @@ def test_model_suite_scored_fields_read_by_the_board(env):
 
 def test_model_bench_suite_detach_starts_the_suite_not_the_bench(env, tmp_path, monkeypatch):
     from ttp import cli, modelbench
-    make(env)
+    p = make(env)
+    monkeypatch.setenv("TTP_PROJECT", str(p.base))   # the test's project: never one found from the checkout's folder
     monkeypatch.setattr(modelbench, "home", lambda: tmp_path / "bench-home")
     seen = []
 

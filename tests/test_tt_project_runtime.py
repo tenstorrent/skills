@@ -45579,6 +45579,8 @@ def test_detached_check_stop_during_start_still_ends_the_command(monkeypatch, wh
         return proc
 
     monkeypatch.setattr(cli.subprocess, "Popen", popen)
+    # As `ttp checks` sets it: else the sudo setting comes from the project here, found by git outside one.
+    monkeypatch.setenv("TTP_REFUSE_SUDO", "0")
     monkeypatch.setitem(cli._CHECK_STOP, "stopped", None)   # the stop must not outlast this test
     old = signal.signal(signal.SIGTERM, cli._checks_stop)
     try:
