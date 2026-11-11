@@ -557,3 +557,26 @@ def test_queue_wait_counts_a_detached_push_lock_holder_and_raises_nothing_while_
     info = queuewait._holders(p.db, p, "push", "", QW_CFG, now)
     assert not info.get("live") and info["running"] == [] and info["queued"] == [], info
     assert [w["task"] for w in queuewait.collect(p, QW_CFG, now) if w["queue"] == "push"] == [tid]
+
+
+def test_a_push_batch_holding_its_branch_and_run_locks_is_a_holder_not_a_waiter(env):
+    from ttp import locks, push, queuewait
+    p = make(env)
+    now = time.time()
+    bid = "batch-20261111-080135-1"
+    held = []
+    try:
+        held.append(locks.try_take(push.lock_paths(p, "origin", "team/feature"), f"push batch {bid}", "the push queue"))
+        folder = p.state / push.DETACHED
+        folder.mkdir(parents=True, exist_ok=True)
+        marker = folder / f"{bid}.json"
+        log = marker.with_suffix(".log")
+        log.write_text("ttp push: running the checks\n")
+        marker.write_text(json.dumps({"id": bid, "kind": "batch", "status": "running", "log": str(log),
+                                      "target": "origin/team/feature", "pid": None}))
+        held.append(locks.try_take([push._run_lock(marker)], f"push batch {bid}", "the push queue"))
+        info = queuewait._holders(p.db, p, "push", "", QW_CFG, now)
+        assert len(info["running"]) == 1 and info["queued"] == [], info
+    finally:
+        for f in held:
+            f.close()

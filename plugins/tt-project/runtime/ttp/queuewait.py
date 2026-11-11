@@ -204,11 +204,12 @@ def _push_turns(p, out: dict, now: float) -> None:
         recs = locks.holder_records(paths, p)
     except OSError:
         recs = []
-    pids = set()
+    pids, labels = set(), []
     for h in recs:
         if h.get("alive") is False or h.get("stale"):
             continue
         pids.add(h.get("pid"))
+        labels.append(str(h.get("holder") or ""))
         try:
             held = max(0.0, now - float(h.get("since") or now))
         except (TypeError, ValueError):
@@ -222,6 +223,8 @@ def _push_turns(p, out: dict, now: float) -> None:
         marks = []
     for m in marks:
         if m.get("status") != "running" or (m.get("pid") is not None and m.get("pid") in pids):
+            continue
+        if m.get("id") and any(str(m["id"]) in x for x in labels):   # a batch's run lock: the holder's own
             continue
         last = next((x for x in reversed(push._tail(m.get("log"), 40).splitlines()) if x.startswith("ttp push:")), "")
         out["queued"].append(f"{p.name} {'task #' + str(m['task']) if m.get('task') else 'push'} "
