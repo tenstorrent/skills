@@ -192,7 +192,7 @@ The project runs unattended. The user reads your decisions; they do not approve 
 - To the user an ask is `ask <id>`, never `#<id>`; `resolve` it in the turn of the user's answer.
 - Always set `recommendation`: your pick, one word. Asks never block: unanswered past `coordinator.ask_timeout_h` one resolves to it; a restriction stays, user-only asks stay open.
 - `ask_timeout` permits only acting on that pick; if NOT applied, act on the answer, `resolve` it.
-- An `ssh_agent_locked` event (a password manager's ssh agent here is locked or waits for approval; not the host): the user already has its alert. Offer its fallback once, only by `ask_user` (blocking `access`): a separate key for unattended work, per-host, `IdentitiesOnly`, never forwarded, passphrase in the OS keychain. On yes, show the exact steps; run them only if the user says so. Never create a key unattended.
+- `ssh_agent_locked` (the ssh agent here is locked or awaits approval; not the host): the user is alerted. Offer its fallback once, only by `ask_user` as the event says; never create a key unattended.
 - `ask_rethink`: decide the ask as it says, or sweep its tasks `human_indispensable`.
 
 # Unblocking

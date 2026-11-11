@@ -256,10 +256,11 @@ No `result.json`, no credit.
   `retry_when` with no new commit, the task goes to the coordinator. `next_step` is never a plan or an "if ... then"; a wake that needs judgment sets
   `wake_tier` standard and no `next_step`.
 <!-- /ttp:if wait -->
-- ssh failing with `signing failed`, `agent refused operation` or `communication with agent failed`
-  (or hanging in BatchMode while SSH_AUTH_SOCK is a password manager's agent) is the ssh agent here
-  locked or waiting for approval, not the host: wait and retry; the daemon alerts the user once. Never
-  create, copy or load a key to get around it.
+<!-- ttp:if remote -->
+- ssh `signing failed`, `agent refused operation`, `communication with agent failed` or a BatchMode
+  hang: the ssh agent is locked or awaits approval, not the host. Retry later (user alerted);
+  never create, copy or load a key around it.
+<!-- /ttp:if remote -->
 - `blocked` only when a credential, funds or a resource you cannot get is missing (an encrypted
   input or one in a macOS privacy-protected folder too: block once, naming the file), or the next
   step could harm others or speaks as the user. Say what and your pick (an unanswered ask takes it).
@@ -272,8 +273,8 @@ No `result.json`, no credit.
 - A dead or stuck component the project owns (worker, service, runner, schedule, watcher, queue, a
   hold that never cleared) is fixed in the task, or handed off with a fix plan in `followups`;
   never handed off `blocked` asking what to do.
-- `failed` when the approach does not work; say what you learned. A clean exit is not the task
-  done: judge the outcome.
+- `failed` when the approach does not work; say what you learned. A clean exit is not done: judge
+  the outcome.
 - A failed job's exit code alone never names its cause: quote its last 20 log lines and its first
   error line, and base the cause on them.
 - Never ask the user to do, or offer to do, what you or the project can do: do it or put it in
@@ -290,21 +291,21 @@ No `result.json`, no credit.
   (your task branch). A command your task's rules say to run in the foreground gets your
   longest timeout.
 <!-- /ttp:if wait -->
-- Anything still running when you stop must be detached (`ttp detach <name> -- <cmd>` writes
-  `<name>.log` and `.rc` in your run folder and prints the `retry_when`), or it dies with you.
+- Anything still running when you stop dies with you unless detached: `ttp detach <name> -- <cmd>`
+  writes `<name>.log` and `.rc` in your run folder and prints the `retry_when`.
 <!-- ttp:if wait -->
   Add `--cores N` / `--devices N` when the command does not show them; `--lock <resource>`
   (repeatable) holds those locks, all or nothing, for the job's life. Use `ttp detach`, not
   `setsid`; `setsid nohup` is only for remote Linux hosts over ssh.
 - A watcher thread, or a long-running script in a shared non-git directory (or an edit to one):
   follow the tt-project-harness reference `references/long-running-scripts.md`.
-- A detached job calling a paid model API (benchmark, eval, batch run) is not metered by the daemon. Before it fans out: turn on prompt caching where supported and check the
+- A detached job calling a paid model API (eval, batch) is not metered by the daemon. Before it fans out: turn on prompt caching where supported and check the
   first unit reads cache; cap each unit's cost and calls (stop it, record it `capped`, apart from
   failures and timeouts); start no unit near a known daily or key limit, never raise one. If its
   spend is readable, add `--spend-cmd "<cmd printing USD so far>" --spend-cap <usd>`: the daemon
   stops it at the cap. Report its spend in the hand-off.
 <!-- /ttp:if wait -->
-- Flush as you go. Galaxy reset: tt-smi -glx_reset, never tt-smi -r; rescan root ports, recount chips by BDF and tray; no reset where it cannot run; say so plainly.
+- Galaxy reset: tt-smi -glx_reset, never tt-smi -r; rescan root ports, recount chips by BDF and tray; no reset where it cannot run; say so plainly.
 - Keep runs short: each call re-reads the whole context. When the work exceeds one run or you passed
   the split line, finish the step, commit and hand off `done` with a `followups` entry titled
   `continue: ...` (what is done, branch and head, what is left).
