@@ -184,7 +184,7 @@ HOME_WATCHED = (".bash_profile", ".bash_login", ".bashrc", ".profile", ".zprofil
                 ".mcp.json", ".ripgreprc", ".idea", ".vscode", ".claude/settings.json",
                 ".claude/settings.local.json", ".claude/CLAUDE.md", ".claude/skills", ".claude/agents",
                 ".claude/commands", ".claude/hooks", ".codex/config.toml", ".config/systemd/user",
-                "Library/LaunchAgents", ".local/bin/ttp")
+                ".local/share/systemd/user", "Library/LaunchAgents", ".local/bin/ttp")
 # The credential stores and the ssh and gh folders the session's credential guards watch: the write
 # recorder records the session's writes there too (and the providers' login files, _WriteRecorder.watch).
 GUARDED = (".ssh", ".config/gh", ".git-credentials", ".netrc")

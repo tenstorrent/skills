@@ -4,7 +4,8 @@
 
 def _fake_host(tmp_path, monkeypatch, tab: str | None = None):
     """A stand-in for the host's real crontab (a script by absolute path, backed by a file) and
-    systemd user unit folder; returns (crontab script, crontab file, unit folder)."""
+    systemd user unit folders; returns (crontab script, crontab file, unit folder); the
+    ~/.local/share/systemd/user stand-in is hoststate._share_dir()."""
     from ttp import hoststate
     tabf, units, real = tmp_path / "realtab", tmp_path / "units", tmp_path / "realbin"
     units.mkdir()
@@ -24,6 +25,8 @@ def _fake_host(tmp_path, monkeypatch, tab: str | None = None):
     from ttp import checkreap
     monkeypatch.setenv(checkreap.MARKER, f"hoststate-test-{os.getpid()}-{tmp_path.name}")
     monkeypatch.setattr(hoststate, "_real_dir", lambda: units)
+    (tmp_path / "share_units").mkdir()   # the other user unit folder (~/.local/share/systemd/user)
+    monkeypatch.setattr(hoststate, "_share_dir", lambda: tmp_path / "share_units")
     monkeypatch.setattr(hoststate, "_real", lambda name: str(cron) if name == "crontab" else None)
     return cron, tabf, units
 
@@ -279,8 +282,46 @@ def test_the_host_guard_tests_reach_no_real_unit_folder_crontab_or_systemctl(tmp
     tabf.write_text(f"@reboot {tmp_path / 't'}\n")
     assert guard.end()[0]
     assert hoststate._real_dir() == units and hoststate._real("systemctl") is None
+    assert hoststate._share_dir() == tmp_path / "share_units"
     assert calls and set(calls) == {str(cron)}
-    assert ".config/systemd/user" in conftest.HOME_WATCHED
+    assert ".config/systemd/user" in conftest.HOME_WATCHED and ".local/share/systemd/user" in conftest.HOME_WATCHED
+
+
+def test_local_share_units_guarded(tmp_path, monkeypatch):
+    """~/.local/share/systemd/user gets the same rule as ~/.config/systemd/user: another process's unit,
+    its enable link and a ledger-named unit there survive and are reported; the run's own leak there
+    (its write log, a test-only name, a file naming its folder) fails the run and is put back."""
+    from ttp import hoststate, machine_ledger, push
+    _, _, units = _fake_host(tmp_path, monkeypatch)
+    share = hoststate._share_dir()
+    got = _ledger(monkeypatch)
+    monkeypatch.setattr(machine_ledger, "changes", lambda *a, **kw: [
+        {"what": "reinstalled named.service", "undo": "systemctl --user disable --now named.service", "test": False}])
+    env = push.check_env("checks", run_dir=str(tmp_path / "run"))
+    env["TTP_TASK"] = "42"
+    (share / "kept.service").write_text("[Service]\n")
+    guard = hoststate.Guard(env)
+    # Another process: its unit and enable link, and a ledger-named unit even naming this run's folder
+    (share / "other.service").write_text("[Service]\nExecStart=/opt/x\n")
+    (share / "default.target.wants").mkdir()
+    (share / "default.target.wants" / "other.service").symlink_to("../other.service")
+    (share / "named.service").write_text(f"ExecStart={env['TTP_RUN_DIR']}/x\n")
+    # The run's own: logged, test-only named, naming its run folder, and its edit of a logged file
+    (share / "logged.service").write_text("[Service]\n")
+    (share / "pytest-y.service").write_text("[Service]\n")
+    (share / "mine.service").write_text(f"ExecStart={env['TTP_RUN_DIR']}/y\n")
+    (share / "kept.service").write_text("[Service]\nchanged\n")
+    changed, said = guard.end(recorded=[str(share / "logged.service"), str(share / "kept.service"), str(share.parent)])
+    assert changed and got, said
+    assert sorted(p.name for p in share.rglob("*")) == ["default.target.wants", "kept.service", "named.service",
+                                                        "other.service", "other.service"]
+    assert (share / "kept.service").read_text() == "[Service]\n"
+    [left] = [s for s in said if "left in place" in s]
+    assert "task 42" in left and "other.service" in left and "named.service" in left, left
+    assert "mine.service" not in left and "logged.service" not in left, left
+    [failed] = [s for s in said if "FAILED" in s]
+    assert "~/.local/share/systemd/user/mine.service" in failed and "pytest-y.service" in failed, failed
+    assert not list(units.iterdir())
 
 
 def test_installers_write_to_the_fake_store_only_under_the_marker_with_the_real_home(tmp_path, monkeypatch):

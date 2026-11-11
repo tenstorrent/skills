@@ -14,7 +14,8 @@ plugin's own test sessions (tests/conftest.py) get three things, with no namespa
 - The marker TTP_HOSTSTATE_FAKE naming that store. The harness's own installers (service.py,
   uninstall.py) honour it while HOME is the account's real home: their units go to
   <store>/systemd/user and their crontab, systemctl and loginctl calls to the stand-ins.
-- A snapshot of the real user crontab and ~/.config/systemd/user (files and symlinks) before and after
+- A snapshot of the real user crontab, ~/.config/systemd/user and ~/.local/share/systemd/user (files and
+  symlinks; SHARE_KEY holds the second folder's) before and after
   the run. A change the stand-ins missed (a call by absolute path, a unit file written directly)
   that the run provably made fails the run naming it; each such line or file is put back as it was,
   and the restore is recorded in the machine change ledger (as a test change that closes itself).
@@ -61,6 +62,19 @@ def real_home() -> Path:
 
 def _real_dir() -> Path:
     return real_home() / ".config" / "systemd" / "user"
+
+
+def _share_dir() -> Path:
+    """The other folder systemd reads user units from, where another project's setup may install one."""
+    return real_home() / ".local" / "share" / "systemd" / "user"
+
+
+SHARE_KEY = "share_units"
+
+
+def _unit_dirs() -> dict:
+    """Each snapshot key of user unit paths and the real folder they are relative to."""
+    return {"units": _real_dir(), SHARE_KEY: _share_dir()}
 
 
 def make(store: Path) -> Path:
@@ -171,7 +185,7 @@ def _units(top: Path) -> dict:
 
 
 def snapshot() -> dict:
-    return {"crontab": _crontab(), "units": _units(_real_dir())}
+    return {"crontab": _crontab(), **{k: _units(top) for k, top in _unit_dirs().items()}}
 
 
 def _lines(text) -> list[str]:
@@ -186,23 +200,24 @@ def diff(before: dict, after: dict) -> dict:
         added, removed = list((Counter(a) - Counter(b)).elements()), list((Counter(b) - Counter(a)).elements())
         if added or removed:
             out["crontab"] = (added, removed)
-    units = sorted(r for r in set(before["units"]) | set(after["units"])
-                   if before["units"].get(r, ())[:2] != after["units"].get(r, ())[:2]
-                   and not Path(r).name.startswith(OWN_UNIT))
-    if units:
-        out["units"] = units
+    for k in _unit_dirs():
+        b, a = before.get(k, {}), after.get(k, {})
+        units = sorted(r for r in set(b) | set(a)
+                       if b.get(r, ())[:2] != a.get(r, ())[:2] and not Path(r).name.startswith(OWN_UNIT))
+        if units:
+            out[k] = units
     return out
 
 
 def _tokens(env: dict, extra=()) -> list[str]:
     """The run's own folders, whose path in a new line, file or link proves the run wrote it: never a
-    shared temp folder or a folder above the real unit dir."""
-    top = str(_real_dir())
+    shared temp folder or a folder above a real unit dir."""
+    tops = [str(top) for top in _unit_dirs().values()]
     out = []
     for t in (env.get("TTP_RUN_DIR"), env.get("TTP_CHECK_OUTPUT_DIR"), env.get(MARKER),
               env.get("TMPDIR") if env.get("TTP_CHECKS_TMP_FD") else None, *extra):
         t = str(t or "").rstrip("/")
-        if len(t) > 8 and t not in SHARED_TMP and not (top + "/").startswith(t + "/"):
+        if len(t) > 8 and t not in SHARED_TMP and not any((top + "/").startswith(t + "/") for top in tops):
             out.append(t)
     return out
 
@@ -219,7 +234,7 @@ def _ledger_named() -> list[str]:
 
 def own(before: dict, after: dict, d: dict, tokens=(), recorded=None) -> tuple[dict, dict]:
     """`d` split into (what the run provably made, what it cannot prove it made)."""
-    top, recorded, named = _real_dir(), set(recorded or ()), _ledger_named()
+    recorded, named = set(recorded or ()), _ledger_named()
     mine, theirs = {}, {}
 
     def says(text) -> bool:
@@ -236,28 +251,29 @@ def own(before: dict, after: dict, d: dict, tokens=(), recorded=None) -> tuple[d
             mine["crontab"] = (ok, [])
         if rest or removed:
             theirs["crontab"] = (rest, removed)
-    proved = set()
-    for rel in reversed(d.get("units", [])):   # deepest first: a new folder is its contents'
-        p, now, was = top / rel, after["units"].get(rel), before["units"].get(rel)
-        by_log = any(r == str(p) or (str(p).startswith(r + os.sep) and r.startswith(str(top) + os.sep))
-                     for r in recorded)
-        if any(part.startswith(TEST_NAMES) for part in Path(rel).parts) or by_log:
-            ok = True
-        elif now and now[0] == "file":
-            ok = says(now[2].decode("utf-8", "replace"))
-        elif now and now[0] == "link":
-            ok = says(now[1])
-        elif now and now[0] == "dir" and not was:
-            under = [r for r in after["units"] if r.startswith(rel + "/")]
-            ok = bool(under) and all(r in proved for r in under)
-        else:   # removed, or a folder replacing a file
-            ok = False
-        if ok and not is_named(str(p), Path(rel).name):
-            proved.add(rel)
-    if units := [r for r in d.get("units", []) if r in proved]:
-        mine["units"] = units
-    if units := [r for r in d.get("units", []) if r not in proved]:
-        theirs["units"] = units
+    for k, top in _unit_dirs().items():
+        proved = set()
+        for rel in reversed(d.get(k, [])):   # deepest first: a new folder is its contents'
+            p, now, was = top / rel, after.get(k, {}).get(rel), before.get(k, {}).get(rel)
+            by_log = any(r == str(p) or (str(p).startswith(r + os.sep) and r.startswith(str(top) + os.sep))
+                         for r in recorded)
+            if any(part.startswith(TEST_NAMES) for part in Path(rel).parts) or by_log:
+                ok = True
+            elif now and now[0] == "file":
+                ok = says(now[2].decode("utf-8", "replace"))
+            elif now and now[0] == "link":
+                ok = says(now[1])
+            elif now and now[0] == "dir" and not was:
+                under = [r for r in after.get(k, {}) if r.startswith(rel + "/")]
+                ok = bool(under) and all(r in proved for r in under)
+            else:   # removed, or a folder replacing a file
+                ok = False
+            if ok and not is_named(str(p), Path(rel).name):
+                proved.add(rel)
+        if units := [r for r in d.get(k, []) if r in proved]:
+            mine[k] = units
+        if units := [r for r in d.get(k, []) if r not in proved]:
+            theirs[k] = units
     return mine, theirs
 
 
@@ -283,25 +299,25 @@ def restore(before: dict, d: dict) -> list[str]:
                 if keep or before["crontab"] is not None else _run([real, "-r"])
             if r.returncode:
                 errors.append(f"crontab: {r.stderr.strip()[:200]}")
-    top = _real_dir()
-    for rel in reversed(d.get("units", [])):   # deepest first, so a folder is empty when it is removed
-        p, was = top / rel, before["units"].get(rel)
-        try:
-            if p.is_symlink() or p.is_file():
-                p.unlink()
-            elif p.is_dir() and not was:
-                p.rmdir()
-            if was and was[0] == "dir":
-                p.mkdir(parents=True, exist_ok=True)
-            elif was and was[0] == "link":
-                p.parent.mkdir(parents=True, exist_ok=True)
-                os.symlink(was[1], p)
-            elif was:
-                p.parent.mkdir(parents=True, exist_ok=True)
-                p.write_bytes(was[2])
-        except OSError as e:
-            errors.append(f"{rel}: {e.strerror or e}")
-    if d.get("units") and (sc := _real("systemctl")):
+    for k, top in _unit_dirs().items():
+        for rel in reversed(d.get(k, [])):   # deepest first, so a folder is empty when it is removed
+            p, was = top / rel, before.get(k, {}).get(rel)
+            try:
+                if p.is_symlink() or p.is_file():
+                    p.unlink()
+                elif p.is_dir() and not was:
+                    p.rmdir()
+                if was and was[0] == "dir":
+                    p.mkdir(parents=True, exist_ok=True)
+                elif was and was[0] == "link":
+                    p.parent.mkdir(parents=True, exist_ok=True)
+                    os.symlink(was[1], p)
+                elif was:
+                    p.parent.mkdir(parents=True, exist_ok=True)
+                    p.write_bytes(was[2])
+            except OSError as e:
+                errors.append(f"{rel}: {e.strerror or e}")
+    if any(d.get(k) for k in _unit_dirs()) and (sc := _real("systemctl")):
         _run([sc, "--user", "daemon-reload"], timeout=60)
     return errors
 
@@ -313,6 +329,7 @@ def describe(d: dict) -> str:
         parts += [f"crontab line added: {ln[:120]!r}" for ln in added[:5]]
         parts += [f"crontab line removed: {ln[:120]!r}" for ln in removed[:5]]
     parts += [f"systemd user unit path changed: {r}" for r in d.get("units", [])[:10]]
+    parts += [f"systemd user unit path changed: ~/.local/share/systemd/user/{r}" for r in d.get(SHARE_KEY, [])[:10]]
     return "; ".join(parts)
 
 
