@@ -2126,6 +2126,57 @@ def test_a_run_its_providers_logout_cut_short_resumes_its_session_once_a_login_c
     assert p.db.task(tid)["status"] == "done" and p.db.task(tid)["attempts"] == 1
 
 
+def test_a_resume_a_logout_refuses_before_it_names_a_session_keeps_that_session_for_the_next_resume(
+        env, tmp_path, monkeypatch):
+    # The login check passed, the resume started, and the provider refused it at launch (logged out
+    # again) before the agent printed a session id: the run keeps the session it was resuming, so once
+    # a login check passes again that same session resumes, never a fresh start that redoes the work.
+    p = make(env)
+    from ttp import alerts
+    from ttp.daemon import Daemon
+    from ttp.providers.fake import Fake
+    _sessions(env, monkeypatch, "a1")
+    login = env["tmp"] / "logged-in"
+    login.write_text("")
+    monkeypatch.setenv("TTP_FAKE_LOGIN", str(login))
+    d = Daemon(p.base)
+    tid = p.db.add_task("build", "build the thing", kind="work", tier="light", origin="user")
+    run_dir = _lost_with_session(p, d, tmp_path, tid, name="r1", session="a1", cost=0.2, took=120, status="auth")
+    p.db.x("UPDATE runs SET note=?, cost_usd=0.2, ended=? WHERE dir=?",
+           (json.dumps({"session_id": "a1"}), time.time(), str(run_dir)))
+    p.db.update_task(tid, status="queued")
+    parse = Fake.parse
+
+    def refused(self, output_path, stderr_path=None):   # logged out at launch: no session id printed
+        u = parse(self, output_path, stderr_path)
+        u.session_id, u.auth_failed, u.error = "", True, "Invalid API key. Please run /login"
+        return u
+
+    monkeypatch.setattr(Fake, "parse", refused)
+    monkeypatch.setenv("TTP_FAKE_RESULT", "none")
+    d.dispatch()
+    _finish_runs(p, d)
+    cut = p.db.one("SELECT * FROM runs WHERE task=? ORDER BY id DESC LIMIT 1", (tid,))
+    note = json.loads(cut["note"])
+    assert cut["status"] == "auth" and note["resumes"]["session"] == "a1", (cut["status"], note)
+    assert note["session_id"] == "a1", note
+    got = d._resumable(p.db.task(tid), "fake")
+    assert got["session"] == "a1" and got["run"] == cut["id"] and got["cause"] == "auth", got
+    monkeypatch.setattr(Fake, "parse", parse)
+    monkeypatch.delenv("TTP_FAKE_RESULT")
+    d.open_breaker("fake", "401")
+    p.db.update_task(tid, status="queued")
+    p.db.set_kv("auth_breaker:fake", {**alerts.breaker(p.db, "fake"), "next_check": time.time() - 1})
+    d.sweep_alerts()
+    assert not d._logged_out("fake")
+    d.dispatch()
+    run = p.db.one("SELECT * FROM runs WHERE task=? ORDER BY id DESC LIMIT 1", (tid,))
+    assert run["id"] != cut["id"] and json.loads(run["note"])["resumes"]["session"] == "a1", run["note"]
+    assert json.loads((pathlib.Path(run["dir"]) / "run.json").read_text())["argv"][-2:] == ["--resume", "a1"]
+    _finish_runs(p, d)
+    assert p.db.task(tid)["status"] == "done"
+
+
 def test_a_failed_resume_that_printed_events_but_no_tokens_is_free(env, monkeypatch):
     from ttp import budget as bud
     out = _codex_events({"type": "error", "message": f"no rollout found for thread id {THREAD}"})

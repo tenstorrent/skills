@@ -6514,8 +6514,9 @@ class Daemon:
         if r["task"] and r["role"] in ctxfork.ROLES and \
                 (miss := ctxfork.role_miss(usage.final_text, _read_result(run_dir / RESULT_FILE))):
             note["role_miss"] = miss   # its task's next start copies no session (ctxfork.prepare)
-        if status == "lost" and not note.get("session_id") and (note.get("resumes") or {}).get("session"):
-            # A resume the sleep or network cut keeps its session for the next resume, not a fresh start.
+        if status in ("lost", "auth") and not note.get("session_id") and (note.get("resumes") or {}).get("session"):
+            # A resume the sleep, the network or a logout cut (before its agent named a session) keeps
+            # its session for the next resume, not a fresh start (_resumable).
             note["session_id"] = note["resumes"]["session"]
         source = self._source_for(r)
         # Spend is booked at the run's end, not when the daemon gets to it: a run reaped after
