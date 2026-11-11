@@ -683,7 +683,8 @@ def test_pr_watch_reads_a_public_pr_anonymously_while_gh_is_logged_out(env, monk
         "/repos/acme/widgets/issues/3/comments": (200, [{"user": {"login": "h"}, "body": "hi"}], {}),
         "/repos/acme/widgets/pulls/3/reviews": (200, [{"user": {"login": "r"}, "state": "APPROVED"}], {}),
         f"/repos/acme/widgets/commits/{sha}/check-runs": (
-            200, {"check_runs": [{"name": "ci", "status": "completed", "conclusion": "failure"}]}, {})})
+            200, {"check_runs": [{"name": "ci", "status": "completed", "conclusion": "failure"}]}, {}),
+        f"/repos/acme/widgets/commits/{sha}/status": (200, {"state": "pending", "statuses": []}, {})})
     p = make(env)
     url = "https://github.com/acme/widgets/pull/3"
     p.db.x("INSERT INTO tasks(title,kind,status,pr_url,created) VALUES('t','code','waiting',?,?)", (url, time.time()))
@@ -693,8 +694,60 @@ def test_pr_watch_reads_a_public_pr_anonymously_while_gh_is_logged_out(env, monk
     sig = p.db.kv("pr_signatures")[url]
     assert sig["draft"] is True and sig["decision"] == "APPROVED" and sig["failing"] == ["ci"], sig
     assert sig["mergeable"] == "MERGEABLE" and sig["n_human"] == 2, sig
-    assert len(asked) == 4 and not any("authorization" in {k.lower() for k in h} for _, h in asked), asked
-    assert watchers.watch_prs(Daemon(p.base)).startswith("ok (1 PRs read anonymously") and len(asked) == 4, asked
+    assert len(asked) == 5 and not any("authorization" in {k.lower() for k in h} for _, h in asked), asked
+    assert watchers.watch_prs(Daemon(p.base)).startswith("ok (1 PRs read anonymously") and len(asked) == 5, asked
+
+
+def _anon_pr(env, monkeypatch, checks: dict, statuses: list) -> tuple[str, str]:
+    """A public PR acme/widgets#3 served anonymously (gh logged out) with these check runs and commit
+    statuses on its head; returns (its URL, its head sha)."""
+    _stub_gh(env, monkeypatch, rc=4, err="To get started with GitHub CLI, please run:  gh auth login")
+    _logged_out()
+    remote = env["tmp"] / "gitbase" / "acme" / "widgets"
+    remote.mkdir(parents=True)
+    git = ["git", "-C", str(remote), "-c", "user.name=t", "-c", "user.email=t@example.com"]
+    subprocess.run(["git", "init", "-q", str(remote)], check=True)
+    subprocess.run(git + ["commit", "-q", "--allow-empty", "-m", "x"], check=True)
+    sha = subprocess.run(git + ["rev-parse", "HEAD"], capture_output=True, text=True, check=True).stdout.strip()
+    subprocess.run(git + ["update-ref", "refs/pull/3/head", sha], check=True)
+    monkeypatch.setenv("TTP_GH_ANON_GIT", str(env["tmp"] / "gitbase"))
+    url = "https://github.com/acme/widgets/pull/3"
+    pull = {"state": "open", "draft": True, "mergeable": True, "html_url": url, "title": "t",
+            "user": {"login": "a"}, "updated_at": "2026-01-01T00:00:00Z", "head": {"ref": "b", "sha": sha}}
+    _anon_github(env, monkeypatch, {
+        "/repos/acme/widgets/pulls/3": (200, pull, {}),
+        "/repos/acme/widgets/issues/3/comments": (200, [], {}),
+        "/repos/acme/widgets/pulls/3/reviews": (200, [], {}),
+        f"/repos/acme/widgets/commits/{sha}/check-runs": (200, checks, {}),
+        f"/repos/acme/widgets/commits/{sha}/status": (200, {"state": "x", "statuses": statuses}, {})})
+    return url, sha
+
+
+def test_an_anonymous_read_counts_a_failing_commit_status_as_failing_ci(env, monkeypatch):
+    """CI that reports only legacy commit statuses: the anonymous view scores a failing status as gh's
+    statusCheckRollup does, never as no checks or passing."""
+    from ttp import ghanon, watchers
+    _anon_pr(env, monkeypatch, {"check_runs": []}, [{"context": "ci/legacy", "state": "failure"}])
+    sig = watchers.pr_signature(ghanon.pr_view("acme/widgets", 3))
+    assert sig["checks"] == "failing" and sig["failing"] == ["ci/legacy"], sig
+
+
+def test_an_anonymous_read_never_reports_a_pr_clean_from_unread_bot_comments(env, monkeypatch):
+    """A PR last dirty only from failing CI whose CI turns green, read anonymously (bot comments unread):
+    no pr_clean event, and its record is not marked clean; the next real read decides."""
+    from ttp import prguard, watchers
+    from ttp.daemon import Daemon
+    url, _ = _anon_pr(env, monkeypatch, {"check_runs": [{"name": "ci", "status": "completed",
+                                                         "conclusion": "success"}]}, [])
+    p = make(env)
+    p.db.x("INSERT INTO tasks(title,kind,status,pr_url,created) VALUES('t','code','waiting',?,?)", (url, time.time()))
+    key = prguard.pr_key(url)
+    p.db.set_kv(prguard.FINDINGS_KEY, {key: {"task": 1, "url": url, "failing": ["ci"], "bot": [], "bot_keys": [],
+                                             "notified": json.dumps([["ci"], []]), "owner": None}})
+    assert watchers.watch_prs(Daemon(p.base)).startswith("ok (1 PRs read anonymously")
+    kinds = [r["kind"] for r in p.db.q("SELECT kind FROM events WHERE source='pr'")]
+    assert "pr_clean" not in kinds, kinds
+    assert p.db.kv(prguard.FINDINGS_KEY)[key]["notified"] != "clean"
 
 
 def test_anonymous_reads_hold_the_host_cap_and_githubs_last_calls(env, monkeypatch):

@@ -885,6 +885,8 @@ def _check_findings(daemon, t: dict, pr: dict, sig: dict, findings: dict, data: 
     if rec["pending"]:
         return
     dirty = bool(rec["failing"] or rec["bot_open"])
+    if not dirty and data is None:
+        return   # bot comments unread: never clean on that, the next real read decides (notified kept)
     what = "; ".join([*(["CI failing: " + ", ".join(rec["failing"])] if rec["failing"] else []),
                       *([f"{len(bots)} bot review comment(s) neither fixed nor answered: "
                          + ", ".join(bots[:5])] if bots else [])])

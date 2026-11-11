@@ -193,7 +193,8 @@ def _decision(reviews: list[dict]) -> str:
 
 def pr_view(repo: str, number: int, home: Path | None = None, cap: int = CAP) -> dict:
     """The PR as `gh pr view --json` prints watchers.PR_FIELDS, read anonymously. Comments and reviews
-    are read again only once the PR's update time moves; check runs only once its head moves."""
+    are read again only once the PR's update time moves; check runs and commit statuses only once its head
+    moves. A call over the budget raises Spent: the PR is then unread, never read as passing."""
     p = get(f"repos/{repo}/pulls/{number}", TTL_OPEN, home, cap)
     stamp = f"{repo}#{number}@{p.get('updated_at')}"
     comments = get(f"repos/{repo}/issues/{number}/comments?per_page=100", TTL_PINNED, home, cap, key="c " + stamp)
@@ -212,6 +213,16 @@ def pr_view(repo: str, number: int, home: Path | None = None, cap: int = CAP) ->
                    "conclusion": str(c.get("conclusion") or "").upper()} for c in (runs or {}).get("check_runs") or []]
         if checks and all(c["status"] == "COMPLETED" for c in checks):
             _put(_dir(home), k + " done", 200, runs)   # a finished head's runs no longer change
+        # Legacy commit statuses (the combined status) count as gh's statusCheckRollup counts them.
+        s = f"s {repo}@{sha}"
+        done = _cached(_dir(home), s + " done", TTL_PINNED)
+        combined = done["body"] if done else get(f"repos/{repo}/commits/{sha}/status?per_page=100", TTL_OPEN,
+                                                   home, cap, key=s)
+        statuses = [{"__typename": "StatusContext", "context": c.get("context") or "?",
+                     "state": str(c.get("state") or "").upper()} for c in (combined or {}).get("statuses") or []]
+        if statuses and all(c["state"] != "PENDING" for c in statuses):
+            _put(_dir(home), s + " done", 200, combined)   # every status final: pinned by sha
+        checks += statuses
     m = p.get("mergeable")
     return {"state": "MERGED" if p.get("merged_at") else "CLOSED" if p.get("state") == "closed" else "OPEN",
             "isDraft": bool(p.get("draft")), "reviewDecision": _decision(reviews),
