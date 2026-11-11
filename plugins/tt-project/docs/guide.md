@@ -3393,6 +3393,31 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   `ttp web <name> --tunnel --keep` opens and keeps an SSH local forward to it. The first one is
   asked once per user (`ttp consent tunnel yes|no`, kept in `~/.tt-project/consent.json`); a kept
   tunnel already installed counts as a yes.
+- `ttp bridge` lets lab boxes log in to hosts through ssh agents on the user's workstation, so no
+  key is ever stored on a box. Configure it on the workstation in `~/.config/tt-project/bridge.json`
+  (start from `docs/access-bridge.example.json`; JSON, so the stock Python reads it). Then run
+  `ttp bridge setup [BOX...]`, `status`, `doctor`, `stop [--remove]` or `show` (prints, changes nothing).
+  - It keeps one ssh session per box and agent as a user service (launchd or systemd, restarted after
+    drops and sleep). Each session forwards exactly one agent and links it on the box to
+    `~/.ssh/tt-agent/<agent>.sock`.
+  - Hosts the box cannot reach by itself are reverse-forwarded to a loopback port on the box (their
+    ssh port only), so their source-address limits still see the workstation. Hosts the box reaches by
+    itself (GitHub) only get the agent: their traffic never passes through the workstation.
+  - The box's `~/.ssh/config` gets one marked block at the top, written after a backup with the
+    rest of the file kept. It holds a `Host` entry per host with its `127.0.0.1` port and
+    `IdentityAgent ~/.ssh/tt-agent/<agent>.sock`, and nothing else. The tool refuses a block with an
+    `IdentityFile`, key text or a proxy.
+  - A project on the box just runs `ssh <host>` or `git` over ssh as usual.
+  - It fails closed. While the workstation sleeps or its session is down, the forwards are closed
+    and the link dangles, so those logins fail. A run that needs them waits or hands off.
+  - It carries ssh only. The GitHub API (`gh`: PRs, CI, comments) is not bridged; read that from
+    the workstation side.
+  - Every process of the box account can use a forwarded agent while its session is up, so forward
+    only agents whose keys that account may use.
+  - The session's own login key must be allowed to forward an agent: an `authorized_keys` line with
+    `restrict` and no `agent-forwarding` gives none (`doctor` says so). Name a key that may forward
+    under `login`.
+  - A forward entry with `"adopt": true` uses a loopback port another kept forward already serves.
 - Workers run with your permissions, in their own worktree; restrictions in the charter are
   passed to every worker and enforced by the provider where it can (for example, no web tools).
 - When the user loosens or removes a Restrictions item (a quoted edit, or a `replaces` of a whole

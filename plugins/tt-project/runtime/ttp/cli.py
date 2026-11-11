@@ -2297,6 +2297,43 @@ def cmd_spend_today(a) -> None:
           "".join(f"\n  could not read {e}" for e in t["errors"]))
 
 
+def cmd_bridge(a) -> None:
+    from . import bridge
+    try:
+        cfg = bridge.load(a.config)
+    except bridge.BadConfig as e:
+        die(str(e))
+    boxes = a.boxes or list(cfg["boxes"])
+    unknown = [b for b in boxes if b not in cfg["boxes"]]
+    if unknown:
+        die(f"not in the bridge config: {', '.join(unknown)} (boxes there: {', '.join(cfg['boxes'])})")
+    if a.action == "show":
+        for box in boxes:
+            print(f"# {box}: box ssh config block")
+            print(bridge.render_block(cfg, box))
+            for an in cfg["boxes"][box]["agents"]:
+                print(f"# {box} {an}: session command")
+                print(" ".join(shlex.quote(w) for w in bridge.ssh_argv(cfg, box, an)))
+        return
+    if a.action == "setup":
+        try:
+            for line in bridge.setup(cfg, boxes):
+                print(line)
+        except (bridge.BadConfig, RuntimeError) as e:
+            die(str(e))
+        return
+    if a.action == "stop":
+        for box in boxes:
+            for an in cfg["boxes"][box]["agents"]:
+                print(f"{box} {an}: {bridge.stop(box, an, remove=a.remove)}")
+            if a.remove:
+                print(f"{box}: {bridge.remove_block(box)}")
+        return
+    lines, rc = bridge.status(cfg, boxes, deep=a.action == "doctor")
+    print("\n".join(lines))
+    sys.exit(rc)
+
+
 def cmd_web(a) -> None:
     from . import consent, tunnel, weblink
     if a.unkeep:
@@ -13226,6 +13263,17 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--home-tz", help=argparse.SUPPRESS)     # with --host there: the workstation's zone
     s.add_argument("--home-from", help=argparse.SUPPRESS)   # and its name
     s.set_defaults(fn=cmd_new)
+
+    s = sub.add_parser("bridge", help="ssh access bridge: lab boxes reach hosts through this computer's ssh agents, "
+                       "no key stored on a box, failing closed while this computer sleeps (config ~/.config/tt-project/bridge.json)")
+    s.add_argument("action", choices=["setup", "status", "doctor", "stop", "show"],
+                   help="setup: write each box's ssh config block and start the kept sessions; status: one line per box "
+                   "and agent (exit 1 when one is down); doctor: status and what to do; stop: stop the sessions "
+                   "(the box's logins through them then fail); show: print the block and session commands, change nothing")
+    s.add_argument("boxes", nargs="*", help="the boxes (their ssh aliases; default: all in the config)")
+    s.add_argument("--config", help="the bridge config (default ~/.config/tt-project/bridge.json)")
+    s.add_argument("--remove", action="store_true", help="with stop: also remove the service files and the box's block")
+    s.set_defaults(fn=cmd_bridge)
 
     s = sub.add_parser("web", help="web app link (for a remote project: tunnel command and link)")
     s.add_argument("name", help="the project")
