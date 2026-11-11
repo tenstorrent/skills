@@ -27345,6 +27345,8 @@ DURABLE_EXEMPT = {
     ("loopcheck.py", '(repo / "NOTES.md").write_text('): "seed file of doctor --loop's throwaway scratch repo, committed at once; the scratch project is deleted after the check",
     ("landff.py", "os.replace(req, taken)"): "claims a landing request for the daemon; a claim lost to a crash only fails the waiting `ttp land`, which lands nothing",
     ("applyff.py", "os.replace(req, taken)"): "claims a fast-forward request for the daemon; a claim lost to a crash only fails the waiting --apply, which leaves main as it was",
+    ("checkcap.py", 'tmp.write_text("".join(json.dumps({"ts": ts'): "trims the checks demand samples to their window: a lost or cut file only shortens the window the next sample refills",
+    ("checkcap.py", 'with path.open("a") as f:'): "appends one checks demand sample; a cut last line is skipped on read, a lost one only shortens the window",
     ("service.py", "os.replace(req, taken)"): "claims a restart request for one process; a reboot restarts the daemon anyway",
     ("service.py", "os.replace(path, claim)"): "claims a deferred restart's check for one judge (a rename, no new data): one lost to a crash leaves no check, never a second rollback",
     ("service.py", "os.replace(claim, path)"): "hands back a newer restart's deferred record claimed by mistake (a rename, no new data)",
