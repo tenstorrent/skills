@@ -126,9 +126,19 @@ def test_the_table_carries_no_eta_so_an_expired_one_never_shows(env):
     from ttp import hourly
     p = make(env)
     now = time.time()
+    from ttp import eta
+    from ttp.db import deferral
     t = p.db.add_task("late", "spec")
-    p.db.x("UPDATE tasks SET status='waiting', start_after=?, result=? WHERE id=?",
-           (now - 7200, json.dumps({"eta": now - 3600, "summary": "ETA 09:00"}), t))
+    # A deferral as the harness stores it (a start_after label and not_before), and a waiting hand-off
+    # whose measured ETA eta.py reads: one still ahead an hour ago, expired now.
+    p.db.x("UPDATE tasks SET status='waiting', labels=?, not_before=?, result=? WHERE id=?",
+           (json.dumps([f"start_after:{now - 7200}"]), now - 7200,
+            json.dumps({"status": "waiting", "retry_when": "ttp detach --check run/job", "eta": now - 3600,
+                        "eta_basis": "median of earlier runs", "waiting_since": now - 7200,
+                        "summary": "ETA 09:00"}), t))
+    row = dict(p.db.task(t))
+    assert deferral(row)["after"] == now - 7200
+    assert eta.outside_wait(row, now - 5400) == {"at": now - 3600, "follows": False}, "eta.py reads this ETA"
     out = "\n".join([*hourly.rows(p, now), hourly.table(p, now)]).lower()
     assert "eta" not in out and "expected finish" not in out
 
