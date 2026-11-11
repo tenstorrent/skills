@@ -253,6 +253,19 @@ def _unreachable(entry: dict, stderr: str | None, rc: int = 255, connected: bool
         print(f"ttp: {hint}", file=sys.stderr)
 
 
+_USAGE_ERROR = re.compile(r"^[^\n:]+: error: ", re.M)   # argparse's error line ("ttp task: error: ...", exit 2)
+
+
+def _remote_ttp_version(entry: dict) -> str:
+    """The ttp version on the project's machine (`ttp --version` there), or "unknown version"."""
+    try:
+        r = _ssh(entry, ["--version"], capture=True)
+    except (OSError, subprocess.SubprocessError, SystemExit):
+        return "unknown version"
+    m = re.match(r"ttp (\S+)", (r.stdout or "").strip()) if r.returncode == 0 else None
+    return m.group(1) if m else "unknown version"
+
+
 def forward(entry: dict, argv: list[str], quiet: bool = False, shown: set[int] | None = None,
             failure: list[str] | None = None) -> int:
     """Run this same command on the project's machine, streaming its output. With `shown` (a
@@ -272,7 +285,12 @@ def forward(entry: dict, argv: list[str], quiet: bool = False, shown: set[int] |
         if not quiet:
             _unreachable(entry, r.stderr)
     elif r.stderr:
-        sys.stderr.write(sshfail.scrub(r.stderr, entry.get("ssh") or entry["host"]))
+        err = sshfail.scrub(r.stderr, entry.get("ssh") or entry["host"])
+        if r.returncode == 2 and _USAGE_ERROR.search(err):
+            # The far side's parser rejected it: say where, so it never reads as this machine's ttp.
+            where = f"on {entry['host']} (ttp {_remote_ttp_version(entry)}): "
+            err = _USAGE_ERROR.sub(lambda m: where + m.group(0), err, count=1)
+        sys.stderr.write(err)
         if r.returncode == 2 and argv and f"invalid choice: '{argv[0]}'" in r.stderr:
             # Its parser is fine here: the far side runs an older ttp that lacks the command.
             sys.stderr.write(f"ttp: `ttp {argv[0]}` ran on {entry['host']}, whose ttp is older and lacks it; "
@@ -12049,14 +12067,43 @@ def new_project_defaults_lines() -> list[str]:
     return defaults_lines(budget, bool((load_secrets().get("jev") or {}).get("key")))
 
 
-def shim_text(python: str, launcher: Path) -> str:
-    """The `ttp` on PATH: the interpreter setup ran under, else (its venv or conda env removed) python3 from
-    PATH, with a hint on stderr."""
-    py, hint = shlex.quote(python), shlex.quote(f"ttp: {python} is gone; using python3 from PATH "
-                                                "(rerun `ttp setup` to pin an interpreter)")
-    return (f"#!/bin/sh\npy={py}\n"
-            f"if [ ! -x \"$py\" ]; then echo {hint} >&2; py=python3; fi\n"
-            f"exec \"$py\" {shlex.quote(str(launcher))} \"$@\"\n")
+SHIM_MIN_PYTHON = (3, 10)   # the checks env's pins (checks-python.lock's requires-python); ttp itself runs on 3.9
+
+
+def shim_text(python: str, launcher: Path, pinned_ok: bool = True) -> str:
+    """The `ttp` on PATH. It runs the launcher under the first Python new enough for all of ttp
+    (SHIM_MIN_PYTHON): $TTP_PYTHON, else `python` (the one setup ran under: trusted without a probe when
+    `pinned_ok`, so a normal call costs nothing; its venv or conda env removed, a hint on stderr), else the
+    newest python3.x on PATH. With only a 3.9 found ttp still runs there, saying `ttp checks` cannot;
+    with none, it says what it needs and exits 127."""
+    q = shlex.quote
+    need = ".".join(map(str, SHIM_MIN_PYTHON))
+    probe = ("import sys; v = sys.version_info[:2]; "
+             f"sys.exit(0 if v >= {SHIM_MIN_PYTHON} else 3 if v >= (3, 9) else 1)")
+    names = " ".join([*(f"python3.{n}" for n in range(20, SHIM_MIN_PYTHON[1] - 1, -1)), "python3"])
+    lines = ["#!/bin/sh",
+             f"# ttp under a Python {need} or newer: $TTP_PYTHON, else the one `ttp setup` ran under, else the "
+             "newest python3.x on PATH.",
+             f"pin={q(python)}", f"ttp={q(str(launcher))}", "old=",
+             # ok <python>: 0 when new enough; remembers the first 3.9 as a last resort.
+             f"ok() {{ command -v \"$1\" >/dev/null 2>&1 || return 1; \"$1\" -c {q(probe)} >/dev/null 2>&1; r=$?; "
+             "[ \"$r\" = 3 ] && [ -z \"$old\" ] && old=$1; [ \"$r\" = 0 ]; }",
+             'if [ -n "${TTP_PYTHON:-}" ] && ok "$TTP_PYTHON"; then exec "$TTP_PYTHON" "$ttp" "$@"; fi']
+    if pinned_ok:
+        hint = q(f"ttp: {python} is gone; using the newest python3 from PATH "
+                 "(rerun `ttp setup` to pin an interpreter)")
+        lines += ['if [ -x "$pin" ]; then exec "$pin" "$ttp" "$@"; fi', f"echo {hint} >&2", f"for c in {names}; do"]
+    else:
+        lines += [f'for c in "$pin" {names}; do']
+    lines += ['  if ok "$c"; then exec "$c" "$ttp" "$@"; fi', "done",
+              'if [ -n "$old" ]; then',
+              f"  echo {q(f'ttp: no Python {need} or newer found ($TTP_PYTHON, python3.x on PATH); running under ')}"
+              f"\"$old\"{q(f', where `ttp checks` cannot build its env: install Python {need}+ or set TTP_PYTHON to it')} >&2",
+              '  exec "$old" "$ttp" "$@"', "fi",
+              f"echo {q(f'ttp: needs Python {need} or newer (3.9 at the least) and found none ($TTP_PYTHON, ')}"
+              f"\"$pin\"{q(f', python3.x on PATH): install Python {need}+ or set TTP_PYTHON to it')} >&2",
+              "exit 127"]
+    return "\n".join(lines) + "\n"
 
 
 def cmd_setup(a) -> None:
@@ -12110,7 +12157,8 @@ def cmd_setup(a) -> None:
     bindir = Path(a.bin_dir).expanduser()
     bindir.mkdir(parents=True, exist_ok=True)
     shim = bindir / "ttp"
-    durable_write(shim, shim_text(sys.executable, cur / "bin" / "ttp"), mode=0o755)
+    durable_write(shim, shim_text(sys.executable, cur / "bin" / "ttp", sys.version_info[:2] >= SHIM_MIN_PYTHON),
+                  mode=0o755)
     on_path = str(bindir) in os.environ.get("PATH", "").split(":")
     print(f"ttp {__version__} ({commit}) installed: {shim}" + ("" if on_path else f" (add {bindir} to PATH)"))
     from .service import plan

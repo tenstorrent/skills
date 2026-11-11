@@ -39,7 +39,10 @@ Rerun the line to update or switch refs; it updates the clone and the same entri
 - Cursor: restart it, or run **Developer: Reload Window**. On Teams and Enterprise plans an admin
   must allow local plugin imports.
 - `ttp`: needs `~/.local/bin` on `PATH`; if it is not, the installer adds it to your shell profile
-  and prints the command for the current shell. `ttp uninstall` removes that line.
+  and prints the command for the current shell. `ttp uninstall` removes that line. That `ttp` runs
+  under Python 3.10 or newer, which `ttp checks` needs for its pinned env: `$TTP_PYTHON`, else the
+  Python `ttp setup` ran under, else the newest `python3.x` on `PATH`. With only a 3.9 it still runs
+  and says why `ttp checks` cannot; with none, it says what it needs and exits 127.
 
 ## Skills
 

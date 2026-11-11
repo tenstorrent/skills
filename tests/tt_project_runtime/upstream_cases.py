@@ -97,6 +97,35 @@ def test_the_run_fallback_sends_a_failing_targets_notes_once_and_leaves_the_daem
     assert not _fwd_state("example-host")["fails"]
 
 
+def test_forward_status_says_recovered_once_a_send_goes_through_after_failures(env, monkeypatch):
+    """`ttp upstream --forward-status` stops saying 'failing' once a run or the CLI got a note through
+    after the daemon's failures, while the daemon keeps its own record for the run fallback."""
+    from ttp import upstream
+    fake = _fake_forward_ssh(env, monkeypatch)
+    upstream.set_forward_to(["example-host"])
+    fake["mode"].write_text("ok")
+    now = time.time() - 3 * 3600
+    assert upstream.forward(now) == 0
+    upstream.append("demo", 3, [{"title": "upstream: one", "spec": "a"}])
+    real = upstream._ssh_receive
+    monkeypatch.setattr(upstream, "_ssh_receive", lambda t, lines, timeout: (None, "exit 255: ssh: connection timed out"))
+    for later in (now + 60, now + 200, now + 500):
+        assert upstream.forward(later) == 0
+    (line,) = upstream.forward_status(now + 600)
+    assert "failing (3x" in line and "recovered" not in line
+    monkeypatch.setattr(upstream, "_ssh_receive", real)
+    t = now + 60 + upstream.FALLBACK_AFTER_S
+    assert upstream.forward(t, context="run") == 1
+    assert _fwd_state("example-host")["fails"] == 3, "the daemon's failure record is its own"
+    (line,) = upstream.forward_status(t + 100)
+    assert "failing" not in line and "recovered: a send went through" in line and "3 failed tries" in line
+    # A daemon failure after that send is failing again.
+    monkeypatch.setattr(upstream, "_ssh_receive", lambda t, lines, timeout: (None, "exit 255: ssh: connection timed out"))
+    upstream.forward(t + 7200)
+    (line,) = upstream.forward_status(t + 7300)
+    assert "failing (4x" in line and "recovered" not in line
+
+
 def test_note_to_and_status_warn_when_the_forward_target_has_failed_for_hours(env, monkeypatch, capsys):
     """`ttp note --to` a project on a machine the daemon has failed to reach for WARN_AFTER_S says so
     and starts the fallback; `ttp status` shows the same line. A fresh failure says nothing yet."""

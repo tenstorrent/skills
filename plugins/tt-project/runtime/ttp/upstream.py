@@ -2605,7 +2605,15 @@ def forward_status(now: float | None = None) -> list[str]:
             line += f", read there by {st['reader']}"
         if st.get("skipped"):
             line += f", {int(st['skipped'])} skipped (too big to send)"
-        if st.get("fails"):
+        if st.get("fails") and float(st.get("last_ok") or 0) > float(st.get("error_at") or 0):
+            # A run or the CLI got through after the daemon's last failure: the target is reachable again
+            # (the daemon keeps its own record until its next try succeeds, so the run fallback still works).
+            line += (f"; recovered: a send went through {ago(st['last_ok'])}, after the daemon's {st['fails']} "
+                     f"failed tries (last {ago(st.get('error_at'))}: {st.get('last_error')}); the daemon "
+                     f"retries in {max(0.0, (float(st.get('next') or 0) - now) / 60):.1f} min")
+            if fix := local_network_fix(st):
+                line += f"; {fix}"
+        elif st.get("fails"):
             line += (f"; failing ({st['fails']}x since {ago(st.get('fail_since') or st.get('error_at'))}, "
                      f"last {ago(st.get('error_at'))}: {st.get('last_error')}), "
                      f"next try in {max(0.0, (float(st.get('next') or 0) - now) / 60):.1f} min")

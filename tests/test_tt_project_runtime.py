@@ -9837,13 +9837,66 @@ def test_the_setup_shim_survives_a_removed_interpreter(tmp_path):
     shim = tmp_path / "ttp"
     shim.write_text(cli.shim_text(str(pinned), tmp_path / "lib current" / "bin" / "ttp"))
     shim.chmod(0o755)
-    env = {**os.environ, "PATH": f"{fake}:/usr/bin:/bin"}
+    env = {**os.environ, "PATH": str(fake)}     # only the fakes: this host's own pythons stay out of it
+    env.pop("TTP_PYTHON", None)
     r = subprocess.run([str(shim), "status", "a b"], capture_output=True, text=True, env=env, timeout=30)
     assert (r.returncode, r.stdout, r.stderr) == (0, f"pinned {tmp_path}/lib current/bin/ttp status a b\n", "")
     pinned.unlink()       # the venv is gone
     r = subprocess.run([str(shim), "status", "a b"], capture_output=True, text=True, env=env, timeout=30)
     assert r.returncode == 0 and r.stdout == f"fallback python3 {tmp_path}/lib current/bin/ttp status a b\n"
     assert r.stderr.count("\n") == 1 and str(pinned) in r.stderr and "rerun `ttp setup`" in r.stderr
+
+
+def test_the_setup_shim_picks_a_python_new_enough_for_the_checks_env(tmp_path):
+    """The shim runs ttp under $TTP_PYTHON, else the pinned interpreter, else the newest python3.x on PATH,
+    skipping any older than SHIM_MIN_PYTHON (the checks env's pins need it): a pin setup made under an old
+    python is probed, not trusted. With only a 3.9 ttp still runs and says why `ttp checks` cannot; with
+    nothing usable it says what it needs and exits 127."""
+    from ttp import cli
+    assert cli.SHIM_MIN_PYTHON == (3, 10)
+    fake = tmp_path / "fakebin"
+    fake.mkdir()
+
+    def py(path, name, probe_rc):        # answers the shim's version probe with probe_rc, else echoes
+        path.write_text(f'#!/bin/sh\nif [ "$1" = -c ]; then exit {probe_rc}; fi\necho "{name} $*"\n')
+        path.chmod(0o755)
+        return path
+    py(fake / "python3", "python3-3.9", 3)
+    py(fake / "python3.11", "python3.11", 0)
+    py(fake / "python3.13", "python3.13", 0)
+    py(fake / "python3.8", "python3.8", 1)
+    old_pin = py(tmp_path / "py39", "pinned-3.9", 3)
+    mine = py(tmp_path / "mine", "ttp-python", 0)
+    launcher = tmp_path / "lib" / "bin" / "ttp"
+    shim = tmp_path / "ttp"
+    shim.write_text(cli.shim_text(str(old_pin), launcher, pinned_ok=False))
+    shim.chmod(0o755)
+    env = {**os.environ, "PATH": str(fake)}
+    env.pop("TTP_PYTHON", None)
+
+    def run(**extra):
+        return subprocess.run([str(shim), "checks"], capture_output=True, text=True, env={**env, **extra}, timeout=30)
+    r = run()
+    assert (r.returncode, r.stdout, r.stderr) == (0, f"python3.13 {launcher} checks\n", ""), "old pin skipped"
+    r = run(TTP_PYTHON=str(mine))
+    assert (r.returncode, r.stdout, r.stderr) == (0, f"ttp-python {launcher} checks\n", ""), "TTP_PYTHON first"
+    r = run(TTP_PYTHON=str(tmp_path / "missing"))
+    assert r.stdout == f"python3.13 {launcher} checks\n", "a TTP_PYTHON that is not there is skipped"
+    for n in ("python3.11", "python3.13"):
+        (fake / n).unlink()
+    r = run()
+    assert r.returncode == 0 and r.stdout == f"pinned-3.9 {launcher} checks\n"
+    assert r.stderr.count("\n") == 1 and "no Python 3.10 or newer" in r.stderr and "TTP_PYTHON" in r.stderr
+    old_pin.unlink()
+    (fake / "python3").unlink()
+    r = run()
+    assert r.returncode == 127 and not r.stdout
+    assert "needs Python 3.10 or newer" in r.stderr and "TTP_PYTHON" in r.stderr
+    # A pin setup made under a new enough python is used without a probe (no cost on each call).
+    shim.write_text(cli.shim_text(str(mine), launcher))
+    mine.write_text('#!/bin/sh\nif [ "$1" = -c ]; then echo probed >&2; exit 1; fi\necho "pinned $*"\n')
+    r = run()
+    assert (r.returncode, r.stdout, r.stderr) == (0, f"pinned {launcher} checks\n", "")
 
 
 def test_new_with_no_service_skips_the_daemon_wait_and_says_how_to_start_it(env, monkeypatch, capsys):

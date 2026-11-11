@@ -137,7 +137,10 @@ read the one for the lever you change.
   on macOS, repeated 'Network is unreachable' is read as a Local Network privacy block on the
   daemon's python, and `ttp doctor` names the fix. Past 30 min, `ttp note` in a run and `ttp
   status` send the pending notes from their own context (`ttp upstream --forward-now`), through
-  the same cursor, so none is lost or filed twice. `ttp note --status <id>` (the id `ttp note
+  the same cursor, so none is lost or filed twice; once one goes through, `--forward-status` says
+  `recovered` instead of `failing` until the daemon's own next try clears its record. A forwarded
+  command the other machine's ttp rejects (a usage error) names that machine and its ttp version
+  (`on <host> (ttp <version>): ...`). `ttp note --status <id>` (the id `ttp note
   --to` printed) says where one note stands: queued, filed-local, forwarded (in the inbox of the
   machine that runs the project; asked over ssh with `ttp upstream --note-state`) or delivered
   (that project's daemon read it). It exits 0 once delivered, 1 while on its way, 2 unknown.

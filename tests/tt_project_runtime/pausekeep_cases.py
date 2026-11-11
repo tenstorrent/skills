@@ -267,3 +267,42 @@ def test_ttp_alive_is_in_the_parser_and_a_far_project_on_an_older_ttp_says_why(e
                         subprocess.CompletedProcess(argv, 2, "", "ttp: error: invalid choice: 'x'\n"))
     cli.forward({"host": "far-box", "dir": "/x"}, ["alive", "far"])
     assert "older" not in capsys.readouterr().err
+
+
+def test_a_forwarded_usage_error_names_the_far_host_and_its_ttp_version(env, monkeypatch, capsys):
+    """A command the far side's ttp rejects (exit 2, an argparse error) says it was rejected there,
+    naming that machine and its ttp version, so it never reads as this machine's error."""
+    from ttp import cli
+    calls = []
+
+    def fake(entry, argv, capture=False):
+        calls.append(list(argv))
+        if argv == ["--version"]:
+            return subprocess.CompletedProcess(argv, 0, "ttp 0.0.1 (abc1234)\n", "")
+        return subprocess.CompletedProcess(argv, 2, "", "usage: ttp task [-h] ...\nttp task: error: unrecognized "
+                                                        "arguments: --new-flag\n")
+    monkeypatch.setattr(cli, "_ssh", fake)
+    assert cli.forward({"host": "far-box", "dir": "/x"}, ["task", "--new-flag"]) == 2
+    err = capsys.readouterr().err
+    assert "on far-box (ttp 0.0.1): ttp task: error: unrecognized arguments: --new-flag" in err, err
+    assert calls == [["task", "--new-flag"], ["--version"]]
+    # The version probe failing (an ssh error, a crash) still names the host and never raises.
+    monkeypatch.setattr(cli, "_ssh", lambda entry, argv, capture=False: (
+        subprocess.CompletedProcess(argv, 255, "", "ssh: lost") if argv == ["--version"]
+        else subprocess.CompletedProcess(argv, 2, "", "ttp: error: bad\n")))
+    cli.forward({"host": "far-box", "dir": "/x"}, ["x"])
+    assert "on far-box (ttp unknown version): ttp: error: bad" in capsys.readouterr().err
+
+    def boom(entry, argv, capture=False):
+        if argv == ["--version"]:
+            raise OSError("no ssh")
+        return subprocess.CompletedProcess(argv, 2, "", "ttp: error: bad\n")
+    monkeypatch.setattr(cli, "_ssh", boom)
+    cli.forward({"host": "far-box", "dir": "/x"}, ["x"])
+    assert "on far-box (ttp unknown version)" in capsys.readouterr().err
+    # Other failures are passed through untouched and probe nothing.
+    calls.clear()
+    monkeypatch.setattr(cli, "_ssh", lambda entry, argv, capture=False: (
+        calls.append(argv) or subprocess.CompletedProcess(argv, 1, "", "ttp: no such task\n")))
+    cli.forward({"host": "far-box", "dir": "/x"}, ["task", "9"])
+    assert capsys.readouterr().err == "ttp: no such task\n" and calls == [["task", "9"]]
