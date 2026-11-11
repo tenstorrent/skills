@@ -7829,7 +7829,8 @@ def test_a_passed_probe_reads_the_push_queues_rejected_commit_git_before_its_fin
     # Nothing else spawns inside either probe-pass transaction but local ref-metadata git, millisecond
     # reads a settled design accepts there: a code task's _auto_review (rev-parse, remote, diff --numstat,
     # a one-commit rev-list) and a review's check_approval (rev-parse, merge-base --is-ancestor). No
-    # history walk, patch or other child holds the write lock.
+    # history walk, patch or other child holds the write lock. Since 997ce56a7 _auto_review also records
+    # the member's head (integrate.record_member_head): one local update-ref of refs/ttp/member-head/.
     def ref_read(a):
         if not isinstance(a, list) or not a or a[0] != "git":
             return False
@@ -7838,7 +7839,8 @@ def test_a_passed_probe_reads_the_push_queues_rejected_commit_git_before_its_fin
             i += 2
         sub, rest = (a[i], set(a[i + 1:])) if i < len(a) else ("", set())
         return sub in ("rev-parse", "remote", "symbolic-ref") or (sub == "merge-base" and "--is-ancestor" in rest) \
-            or (sub == "rev-list" and bool({"-n1", "--count"} & rest)) or (sub == "diff" and "--numstat" in rest)
+            or (sub == "rev-list" and bool({"-n1", "--count"} & rest)) or (sub == "diff" and "--numstat" in rest) \
+            or (sub == "update-ref" and any(x.startswith("refs/ttp/member-head/t") for x in rest))
     other = [a for a in spawned if not ref_read(a)]
     assert not other, f"a child other than a local ref read ran inside the finish transaction: {other}"
     assert not d._git_memo, "a memo outlived its transaction"
