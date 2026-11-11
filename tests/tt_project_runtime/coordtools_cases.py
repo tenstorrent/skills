@@ -78,11 +78,14 @@ def test_a_wake_stops_at_its_dollar_and_time_limits(env, monkeypatch):
     assert float(argv[argv.index("--max-budget-usd") + 1]) == 0.4
     assert timeout == 300 and note["turn"]["timeout_s"] == 300
     assert note["turn"]["wake_budget"] == {"usd": 0.4, "s": 300}
-    # Unset or bad values: the stateless turn's own budget and timeout.
+    # Unset or bad values: the turn's own budget, raised to the no-history wake cap on a fresh project
+    # (seedcap.NO_HISTORY_USD, 7b9650022), and the turn's timeout.
+    from ttp import seedcap
     off_argv, off_timeout, _, _ = _coord_argv(env, monkeypatch, None, budget=1.0)
     argv, timeout, note, _ = _coord_argv(env, monkeypatch, {"mode": "on", "wake_budget_usd": "x",
                                                             "wake_budget_s": -5}, budget=1.0)
-    assert float(argv[argv.index("--max-budget-usd") + 1]) == 1.0 == float(off_argv[off_argv.index("--max-budget-usd") + 1])
+    assert float(argv[argv.index("--max-budget-usd") + 1]) == max(1.0, seedcap.NO_HISTORY_USD) \
+        == float(off_argv[off_argv.index("--max-budget-usd") + 1])
     assert timeout == off_timeout
     from ttp import coordtools
     assert coordtools.wake_budget({}, 0.7, 600) == (0.7, 600)

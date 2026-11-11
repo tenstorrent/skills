@@ -10365,7 +10365,7 @@ def test_an_urgent_run_that_was_preempted_queues_again_and_preempts_nobody(env, 
         startable=startable, max_wait_s=30)))
     t.start()
     try:
-        assert _wait_for(lambda: checkcap.PREEMPT_LINE.format("mine p1") in told), told
+        assert _wait_for(lambda: checkcap.preempt_line("mine p1") in told), told
         monkeypatch.setenv(checkcap.PREEMPTED_ENV, checkcap.preempted(mine.since))
         mine.close()
         # It queues again at its first arrival, urgent, past every grace, while the asker still waits for
