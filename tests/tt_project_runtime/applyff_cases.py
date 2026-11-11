@@ -533,6 +533,11 @@ def test_apply_over_an_uncommitted_edit_git_refuses_exits_busy_with_nothing_chan
     with pytest.raises(SystemExit) as e:
         cli.main(["upgrade", "demo", "--apply", merged])
     err = capsys.readouterr().err
-    assert e.value.code == 75 and "nothing was changed" in err and "would be overwritten" in err, err
+    assert e.value.code == 75 and "nothing was changed" in err, err
     assert _git_out(h, "rev-parse", "HEAD") == base and not restarts
     assert (h / rel).read_text() == edit
+    # The pre-check above catches it first; the fallback for a race (git itself refusing) reads git's words.
+    from ttp import applyff
+    assert applyff.local_changes("error: Your local changes to the following files would be overwritten by merge")
+    assert applyff.local_changes("untracked working tree files would be overwritten by merge")
+    assert not applyff.local_changes("fatal: not possible to fast-forward, aborting")
