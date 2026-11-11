@@ -55,6 +55,25 @@ def test_bridge_forwarded_host_turns_off_an_older_proxy_and_only_that():
             bridge.check_block(block.replace("Match all", bad + "\nMatch all"))
 
 
+def test_bridge_hold_check_keeps_a_held_host_refused():
+    # cells: hold-check
+    # with a box's hold check set, the proxy goes off only for a forwarded name the check does not hold, so a
+    # hold's refusing proxy further down still applies to a held name
+    import pytest
+    from ttp import bridge
+    cfg = _bridge_cfg()
+    cfg["boxes"]["box-1"]["hold_check"] = "/opt/hold/ssh-hold-match"
+    block = bridge.render_block(cfg, "box-1")
+    fwd = block[block.index("Host build-a"):block.index("Host build-b")]
+    assert "ProxyCommand" not in fwd
+    tail = block[block.index("Match originalhost"):]
+    assert tail.startswith('Match originalhost build-a,') and '!exec "/opt/hold/ssh-hold-match %n %h"\n  ProxyCommand none\n' in tail
+    for bad in ("relative/hold", "/opt/x; rm", '/opt/"x"'):
+        with pytest.raises(bridge.BadConfig):
+            bridge.parse({"boxes": {"b": {"hold_check": bad, "agents": {"a": {"agent": "env",
+                          "forward": [{"name": "h", "target": "h.example.com", "port": 2301}]}}}}})
+
+
 def test_bridge_config_refuses_unsafe_or_ambiguous_entries():
     import pytest
     from ttp import bridge

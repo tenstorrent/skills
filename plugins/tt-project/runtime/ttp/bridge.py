@@ -80,7 +80,9 @@ def parse(data: dict) -> dict:
     Each agent: {"agent": "env" or a socket path on this computer, "forward": [host...], "direct": [host...]}.
     A forwarded host: {"name", "aliases", "target", "port", "adopt", "user", "host_key_alias", "interface"}
     ("interface": this computer reaches the target only bound to that interface; see bridge_relay); a direct
-    one: {"name", "aliases", "user", "target", "host_key_alias"} (the last two optional: the HostName to dial
+    one: {"name", "aliases", "user", "target", "host_key_alias"}. A box's optional "hold_check": a command on
+    the box, run as `<it> %n %h`, exiting 0 for a host someone holds (its refusal is a proxy set further down,
+    which the block then leaves in place). (the last two optional: the HostName to dial
     and the known-hosts name to check it by, for a host whose older config entries elsewhere name others).
     Raises BadConfig naming the first problem."""
     if not isinstance(data, dict):
@@ -144,8 +146,11 @@ def parse(data: dict) -> dict:
                         raise BadConfig(f"box {box}: host name {n} appears twice")
                     names[n] = an
             parsed[an] = {"agent": a["agent"], "forward": fwd, "direct": direct}
+        hold = b.get("hold_check") or ""
+        if hold and (not isinstance(hold, str) or not re.fullmatch(r"/[A-Za-z0-9_./-]+", hold)):
+            raise BadConfig(f"box {box}: hold_check is an absolute path on the box (letters, digits, '_', '.', '-', '/')")
         out["boxes"][box] = {"login": {"agent": login.get("agent", ""), "identity": login.get("identity", "")},
-                             "agents": parsed}
+                             "agents": parsed, "hold_check": hold}
     if data.get("cert") is not None:
         from . import bridge_cert
         out["cert"] = bridge_cert.parse(data["cert"], out)
@@ -251,6 +256,7 @@ def render_block(cfg: dict, box: str) -> str:
     It ends with `Match all` so what follows in the file is not scoped to its last Host."""
     from . import bridge_cert
     offline, allowed = bridge_cert.block_lines(cfg, box)
+    hold = cfg["boxes"][box].get("hold_check", "")
     lines = [BEGIN, "# Logins here use this box's link to an agent on the user's workstation; they fail while",
              "# that workstation is asleep or its session is down" + (
                  " and the certificate below has ended." if offline else ". No key is stored on this box.")]
@@ -260,7 +266,7 @@ def render_block(cfg: dict, box: str) -> str:
         for h in a["forward"]:
             lines += ["", f"Host {' '.join([h['name'], *h['aliases']])}", "  HostName 127.0.0.1", f"  Port {h['port']}",
                       f"  HostKeyAlias {h['host_key_alias']}", "  StrictHostKeyChecking accept-new",
-                      f"  IdentityAgent {ident}", PROXY_NONE, "  IdentitiesOnly no",
+                      f"  IdentityAgent {ident}", *([] if hold else [PROXY_NONE]), "  IdentitiesOnly no",
                       "  ServerAliveInterval 15", "  ServerAliveCountMax 3"]
             if h["user"]:
                 lines.append(f"  User {h['user']}")
@@ -272,6 +278,10 @@ def render_block(cfg: dict, box: str) -> str:
                 lines.append(f"  HostKeyAlias {h['host_key_alias']}")
             if h["user"]:
                 lines.append(f"  User {h['user']}")
+    if hold:   # the proxy goes off only for a host its hold check does not hold, so a hold keeps refusing
+        names = [n for a in cfg["boxes"][box]["agents"].values() for h in a["forward"] for n in [h["name"], *h["aliases"]]]
+        if names:
+            lines += ["", f"Match originalhost {','.join(names)} !exec \"{hold} %n %h\"", PROXY_NONE]
     block = "\n".join(lines + ["", "Match all", END]) + "\n"
     check_block(block, allowed)
     return block
