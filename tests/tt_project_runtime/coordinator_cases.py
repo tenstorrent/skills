@@ -3002,6 +3002,18 @@ def test_guard_keeps_a_ban_on_every_item_of_a_listed_restriction(env):
             assert text in p.charter_path.read_text()
 
 
+def test_an_unknown_action_banned_on_a_host_list_meets_each_listed_host_only():
+    """A ban whose action the guard does not know ("reflash") on a list of hosts bans that action on
+    each listed host: ordering it on any one of them is the same target; another host, another action
+    or a sentence that only names a listed host is not."""
+    from ttp import coordinator as coord
+    item = "Do not reflash host-b, host-c or host-d."
+    for sentence in ("Reflash host-d tonight.", "Reflash host-b now.", "Reflash host-c and host-b now."):
+        assert coord._same_target(item, sentence), sentence
+    for sentence in ("Reflash host-e tonight.", "host-d is lent to another team.", "Reflash the demo box."):
+        assert not coord._same_target(item, sentence), sentence
+
+
 # The 2026-10-13 refusals, names replaced: an exception added to a Policies or Resources item was
 # refused as contradicting every Restrictions item that shared a word with it ("names", "msg", a
 # branch named like the skills, a generic verb). An item contradicts another only when both are

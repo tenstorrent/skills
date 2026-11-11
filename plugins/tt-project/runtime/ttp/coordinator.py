@@ -6731,11 +6731,16 @@ def _orders_banned(charter: str, section: str, text: str, quote: str = "",
 
 def _same_target(item: str, sentence: str) -> bool:
     """Whether a sentence takes the action of a ban `item` on its object: _overlaps strict, or, when
-    neither names an action it knows ("power cycle"), every object word of the item is in the sentence."""
+    neither names an action it knows ("power cycle", "reflash"), every object word of the item but the
+    names it lists (_scope_names) is in the sentence, with one of those names if it lists any: a ban on
+    a list of hosts bans each one, so "Reflash host-d" meets "Do not reflash host-b, host-c or host-d"."""
     if _overlaps(item, sentence, strict=True):
         return True
     (ia, io), (sa, so) = (_target(restriction_source.bare(x), conditions=False) for x in (item, sentence))
-    return not ia and not sa and bool(io) and io <= so
+    if ia or sa or not io:
+        return False
+    names = _scope_names(item) & io
+    return io - names <= so and (not names or bool(names & so))
 
 
 def _conflict_reason(item: str, text: str, quote: str = "") -> str:
@@ -8342,14 +8347,14 @@ def _use_charter_approval(p: Project, rid: str, key: str | None) -> None:
 # with it: a test fails when the source of CHARTER_GUARD_FUNCS no longer has CHARTER_GUARD_PIN's
 # sha256. A user's change that failed under an older guard for another reason than the guard
 # (reraise_charter_changes) is then raised at once.
-CHARTER_GUARD_VERSION = 20
+CHARTER_GUARD_VERSION = 21
 CHARTER_GUARD_FUNCS = ("_reject_contradicting_append", "_append_conflicts", "_overlaps", "_on_object", "_quote_hits",
                        "_item_quote_hits", "_items", "_norm", "_may_lift", "_lifts_item", "_companion_clause",
                        "_ref_ids", "_companion_exception", "_changed_sentences", "_quoted_news",
                        "_charter_approval", "_ask_charter_approval", "_conflict_reason", "_scope_names",
                        "_scoped_exception", "_excepted_item", "_orders_banned",
                        "_same_target", "_delivery_names", "_undelivered")
-CHARTER_GUARD_PIN = (20, "b181c0cbb108c4d58eeda8ad3a52b88b14766a15bd679068638ea83ce1f10876")
+CHARTER_GUARD_PIN = (21, "5819648beb285c562e722ffb1e3ff8199208e292a222cc1d863131e59f79faf9")
 CHARTER_RERAISE_KEY = "charter_reraise"   # kv: {"version", "ts"} of the last re-raise pass
 
 
