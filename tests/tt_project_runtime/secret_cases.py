@@ -1937,7 +1937,7 @@ def test_the_keychain_line_never_splits_on_the_users_name(env, monkeypatch, user
     assert seen[0].count("\n") == 1 and words[words.index("-a") + 1] == account and len(words) == 8
 
 
-def _live_run(tmp_path, monkeypatch, body, **spec):
+def _pump_live_run(tmp_path, monkeypatch, body, **spec):
     """Starts runner.supervise in a thread over a stand-in agent running Python `body`; returns
     (thread, run dir)."""
     import threading
@@ -1956,7 +1956,7 @@ def _live_run(tmp_path, monkeypatch, body, **spec):
     return t, run_dir
 
 
-def _live_wait(check, s=20):
+def _pump_live_wait(check, s=20):
     end = time.time() + s
     while time.time() < end:
         if check():
@@ -1972,7 +1972,7 @@ def test_a_running_agents_output_holds_no_key_text_while_it_runs(env, tmp_path, 
     block, lines = _key_block()
     keyfile = tmp_path / "k"
     keyfile.write_text(block)
-    t, run_dir = _live_run(tmp_path, monkeypatch, (
+    t, run_dir = _pump_live_run(tmp_path, monkeypatch, (
         f"block = open({str(keyfile)!r}).read()\n"
         "print(json.dumps({'type': 'user', 'tool_result': {'content': block}}), flush=True)\n"
         "sys.stdout.write('raw:\\n' + block + 'after the block\\n'); sys.stdout.flush()\n"
@@ -1980,21 +1980,21 @@ def test_a_running_agents_output_holds_no_key_text_while_it_runs(env, tmp_path, 
         "print(json.dumps({'type': 'assistant', 'text': 'printed'}), flush=True)\n"
         "time.sleep(30)\n"))
     out = run_dir / "output.jsonl"
-    assert _live_wait(lambda: out.exists() and "printed" in out.read_text()), "the agent's lines reach the file mid-run"
+    assert _pump_live_wait(lambda: out.exists() and "printed" in out.read_text()), "the agent's lines reach the file mid-run"
     assert not (run_dir / "exit.json").exists(), "the agent still runs"
     text = out.read_text()
     assert _no_key(text, lines) and text.count(redact.KEY_MASK) == 3, text
     assert json.loads(text.splitlines()[0])["tool_result"]["content"] == redact.KEY_MASK + "\n"
     assert "raw:\n" + redact.KEY_MASK + "\n" + redact.KEY_MASK + "\nafter the block\n" in text
     err = run_dir / "stderr.log"
-    assert _live_wait(lambda: "printed" in err.read_text()) and _no_key(err.read_text(), lines), err.read_text()
+    assert _pump_live_wait(lambda: "printed" in err.read_text()) and _no_key(err.read_text(), lines), err.read_text()
     runner.request_stop(run_dir)
     t.join(60)
     assert json.loads((run_dir / "exit.json").read_text())["stopped"]
 
 
 def test_the_masked_stream_still_shows_progress_to_the_stall_guard_and_loses_no_line(env, tmp_path, monkeypatch):
-    t, run_dir = _live_run(tmp_path, monkeypatch, (
+    t, run_dir = _pump_live_run(tmp_path, monkeypatch, (
         "for i in range(25):\n"
         "    print(json.dumps({'type': 'assistant', 'n': i}), flush=True); time.sleep(0.1)\n"
         "sys.stdout.write('tail without a line end')\n"), stall_s=1)
@@ -2003,7 +2003,7 @@ def test_the_masked_stream_still_shows_progress_to_the_stall_guard_and_loses_no_
     assert info["rc"] == 0 and info["stopped"] is None, info
     lines = (run_dir / "output.jsonl").read_text().split("\n")
     assert [json.loads(x)["n"] for x in lines[:-1]] == list(range(25)) and lines[-1] == "tail without a line end"
-    t, run_dir2 = _live_run(tmp_path / "quiet", monkeypatch,
+    t, run_dir2 = _pump_live_run(tmp_path / "quiet", monkeypatch,
                             "print(json.dumps({'type': 'assistant'}), flush=True); time.sleep(30)\n", stall_s=1)
     t.join(60)
     assert json.loads((run_dir2 / "exit.json").read_text())["stopped"] == "stalled"
@@ -2020,7 +2020,7 @@ def test_a_masking_fault_or_a_tool_holding_the_pipe_never_loses_output_or_hangs_
     monkeypatch.setattr(redact.LineScrubber, "line", broken)
     # The agent leaves a process behind that keeps its stdout open: the run still ends.
     started = time.time()
-    t, run_dir = _live_run(tmp_path, monkeypatch, (
+    t, run_dir = _pump_live_run(tmp_path, monkeypatch, (
         "import subprocess\n"
         "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(20)'])\n"
         f"print(json.dumps({{'t': open({str(keyfile)!r}).read()}}), flush=True)\n"
