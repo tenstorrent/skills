@@ -4683,7 +4683,7 @@ class Daemon:
             return
         self._rank_tried = now
         if not (key := rankfresh.api_key()):
-            self.alert(rankfresh.NEEDS_KEY, rankfresh.NEEDS_KEY_TEXT, severity="normal")   # its open episode keeps a repeat quiet
+            self.needs_ranking_key(bool(modelrank.ranking(self.cfg)))
             return
         where = self.p
 
@@ -4696,6 +4696,17 @@ class Daemon:
 
         self._rank_job = threading.Thread(target=work, name="model-ranking", daemon=True)
         self._rank_job.start()
+
+    def needs_ranking_key(self, fallback: bool) -> None:
+        """No ranking key: a user-only item while nothing ranks the chat models, else (`fallback`: a
+        ranking stays in use) one low feed line, an open item lowered to it quietly."""
+        from . import rankfresh
+        db, key, text = self.p.db, rankfresh.NEEDS_KEY, rankfresh.NEEDS_KEY_TEXT
+        cur = db.one("SELECT * FROM alerts WHERE key=? AND cleared IS NULL ORDER BY id DESC LIMIT 1", (key,))
+        if fallback and cur and cur["severity"] != "low":
+            with db.tx():   # no Cleared post: the item only drops to the feed
+                alerts._close(db, cur, time.time(), "a ranking stays in use")
+        self.alert(key, text, severity="low" if fallback else "normal", quiet=fallback)
 
     def refresh_model_scores(self) -> None:
         """Replace this project's live rows in the account's model scoreboard and publish the per-class chat
@@ -11446,7 +11457,9 @@ class Daemon:
         except Exception as e:   # a reminder never fails on this: count it all as waiting
             log(self.p, f"{prov}: failover targets not read: {type(e).__name__}: {e}")
             to = []
-        stuck = sum(1 for t in tasks if not to or failover.required(db, t))
+        # A task whose sign-in step the user acknowledged (parked) waits silently: it asks for no login.
+        stuck = sum(1 for t in tasks if (not to or failover.required(db, t)) and not (
+            (k := userstep.deferral_kind(t)) and alerts.condition_acked(db, f"{userstep.KEY}:{t['id']}:{k}")))
         events = db.one("SELECT COUNT(*) n FROM events WHERE status IN ('new','queued') "
                         "AND severity IN ('high','critical')")["n"] if prov == core else 0
         runs_on = to or ([core] if prov != core and not self._logged_out(core) else [])
@@ -11467,7 +11480,8 @@ class Daemon:
         if coordinator or w["need"]:
             self.alert(f"auth:{prov}", text, "high")
         else:
-            self.alert(f"auth:{prov}", self._logout_status(prov, time.time(), w["to"]), "low")
+            # A feed line only: its work runs elsewhere, so it asks nothing of the user.
+            self.alert(f"auth:{prov}", self._logout_status(prov, time.time(), w["to"]), "low", quiet=True)
 
     def _logout_status(self, prov: str, since: float, to: list[str]) -> str:
         try:
@@ -14807,7 +14821,7 @@ class Daemon:
         deferred = db.q("SELECT * FROM tasks WHERE status='queued' AND labels LIKE '%\"start_when:%'")
         ids = {t["id"] for t in deferred}
         try:   # one standing 'needs you' item per task deferred on a user-only step
-            userstep.sync_deferrals(db, deferred, now)
+            userstep.sync_deferrals(db, deferred, now, self.cfg)
         except Exception:
             log(self.p, "user-step deferrals: " + traceback.format_exc().replace("\n", " | ")[:1000])
         for tid in [k for k in self._start_rc if k not in ids]:
@@ -20718,6 +20732,8 @@ class Daemon:
             if ep and not raised and alerts.acked(db, ep):   # the user knows: quiet until it clears
                 db.x("UPDATE alerts SET last=? WHERE id=?", (now, ep["id"]))
                 return
+            # The user acknowledged this condition before and it has not changed: back acknowledged, quietly.
+            quiet = quiet or (not ep and tracked and alerts.known(db, key, severity) is not None)
             if ep and every_s and not raised and (key.startswith("auth:") or now - ep["raised"] < alerts.REMIND_S
                                                   or last >= ep["raised"] + alerts.REMIND_S):
                 db.x("UPDATE alerts SET last=? WHERE id=?", (now, ep["id"]))
@@ -20771,7 +20787,8 @@ class Daemon:
             # Only projects whose work can run nowhere else wait on the login (a report without
             # `need` comes from an older daemon: it counts).
             waiting = [x for x in due["waiting"] if x.get("need", True)]
-            if not waiting or (cur and alerts.acked(db, cur) and cur["severity"] == "high"):
+            if not waiting or (cur and alerts.acked(db, cur) and cur["severity"] == "high") \
+                    or alerts.condition_acked(db, key):
                 continue   # nothing needs the login, or the user knows and nothing changed
             try:
                 hint = get_provider(prov).login_hint

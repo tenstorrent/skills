@@ -39,7 +39,7 @@ from pathlib import Path
 
 from . import prguard
 from . import startbreaker
-from .db import DB, SEVERITY_RANK
+from .db import DB, SEVERITY_RANK, TERMINAL_TASK_STATES
 from .schedule import failing
 
 DAY = 86400.0
@@ -158,6 +158,9 @@ def open_episode(db: DB, key: str, ts: float, message: int, severity: str, text:
     else:
         db.x("INSERT INTO alerts(key,raised,last,message,severity,text) VALUES(?,?,?,?,?,?)",
              (key, ts, ts, message, severity, text[:2000]))
+        if rec := known(db, key, severity):   # the user acknowledged this unchanged condition before
+            new = db.one("SELECT id FROM alerts WHERE key=? AND cleared IS NULL ORDER BY id DESC LIMIT 1", (key,))
+            db.set_kv(ACKS, {**(db.kv(ACKS, {}) or {}), str(new["id"]): rec})
 
 
 BREAKER = "auth_breaker:"   # kv per provider: its auth breaker (Daemon.open_breaker, check_logins)
@@ -389,6 +392,7 @@ def _close(db: DB, ep: dict, now: float, why: str, text: str | None = None,
     acked = acks.pop(str(ep["id"]), None)
     if acked:   # the acknowledgement ends with its episode; its reason stays in the history
         db.set_kv(ACKS, acks)
+        _keep_condition(db, ep["key"], acked)   # a durable condition's outlives it while unchanged
         if acked.get("why") and acked["why"] != why:
             why = f"{why} (acknowledged: {acked['why']})"
     db.x("UPDATE alerts SET cleared=?, cleared_why=? WHERE id=?", (now, why, ep["id"]))
@@ -421,6 +425,61 @@ def acked(db: DB, ep: dict | None) -> dict | None:
     return rec
 
 
+COND_ACKS = "alert_condition_acks"   # kv: condition key -> its acknowledgement, kept past its episodes
+# Conditions an acknowledgement covers until they really change (condition_acked), not only for one episode:
+# a logout (until its login comes back or lapses again), a missing key (until it is saved), a task's user-only
+# step (until the task starts or ends), so a known, unchanged condition never asks the user again.
+DURABLE = ("auth", "model-ranking-key", "user-step")
+
+
+def _mark(db: DB, key: str):
+    """What identifies the condition's current stretch: a logout's breaker opening."""
+    kind, _, arg = key.partition(":")
+    return (breaker(db, arg) or {}).get("opened") if kind == "auth" else None
+
+
+def _changed(db: DB, key: str, rec: dict) -> bool:
+    kind, _, arg = key.partition(":")
+    if kind == "auth":
+        return breaker(db, arg) is None or (breaker(db, arg) or {}).get("opened") != rec.get("mark")
+    if key == "model-ranking-key":
+        from .rankfresh import api_key
+        return api_key() is not None
+    if kind == "user-step":
+        from .userstep import deferral_kind
+        tid, _, step = arg.partition(":")
+        t = db.task(int(tid)) if tid.isdigit() else None
+        return not t or t["status"] in TERMINAL_TASK_STATES or (t["status"] == "queued" and deferral_kind(t) != step)
+    return True
+
+
+def _keep_condition(db: DB, key: str, rec: dict) -> None:
+    if key.partition(":")[0] in DURABLE and not _changed(db, key, {**rec, "mark": _mark(db, key)}):
+        db.set_kv(COND_ACKS, {**(db.kv(COND_ACKS, {}) or {}), key: {**rec, "mark": _mark(db, key)}})
+
+
+def condition_acked(db: DB, key: str) -> dict | None:
+    """The user's acknowledgement of condition `key`, while the condition is unchanged since (DURABLE).
+    A real change drops it, so the condition's next stretch may alert once again."""
+    acks = db.kv(COND_ACKS, {}) or {}
+    rec = acks.get(key)
+    if not isinstance(rec, dict):
+        return None
+    if _changed(db, key, rec):
+        acks.pop(key, None)
+        db.set_kv(COND_ACKS, acks)
+        return None
+    return rec
+
+
+def known(db: DB, key: str | None, severity: str | None) -> dict | None:
+    """condition_acked, when it covers `severity`: a new episode of it opens acknowledged and quiet."""
+    rec = condition_acked(db, key) if key else None
+    if rec and SEVERITY_RANK.get(severity, 1) <= SEVERITY_RANK.get(rec.get("severity"), 1):
+        return rec
+    return None
+
+
 def _outage(db: DB, key: str, now: float) -> bool:
     """A live outage: a logout, unreachable hosts, a full disk, a machine condition, or an outage
     heal check that still needs the user."""
@@ -449,7 +508,9 @@ def ack(db: DB, message: int, why: str, now: float | None = None) -> dict:
             return _ack_keyless(db, m, why, now)
         if not ep:
             raise ValueError(f"no alert with message id #{message}: `ttp alerts <project>` lists the open ones")
+        rec = {"why": why, "ts": now, "message": message, "severity": ep["severity"]}
         if ep["cleared"] is not None:
+            _keep_condition(db, ep["key"], rec)   # its condition may still hold: a later episode stays quiet
             return ep
         if prior := acked(db, ep):
             return {**ep, "acked": prior}
@@ -464,9 +525,9 @@ def ack(db: DB, message: int, why: str, now: float | None = None) -> dict:
         if live and _outage(db, ep["key"], now) and kind != "auth":   # a logout: known, quiet until it changes
             raise ValueError(f"alert #{message} is a live outage ({ep['key']}): it clears itself once the "
                              f"condition is over, and cannot be acknowledged away")
+        _keep_condition(db, ep["key"], rec)
         if not live:
             return _close(db, ep, now, why, f"Acknowledged alert #{message}: {why}")
-        rec = {"why": why, "ts": now, "message": message, "severity": ep["severity"]}
         db.set_kv(ACKS, {**(db.kv(ACKS, {}) or {}), str(ep["id"]): rec})
         db.post("out", f"Acknowledged alert #{message} ({ep['key']}): {why}. It stays in the feed until "
                 f"the condition clears.", chat=None, kind="info", severity="low", ref=ep["key"])

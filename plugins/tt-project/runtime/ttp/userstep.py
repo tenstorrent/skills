@@ -161,10 +161,28 @@ def deferral_text(t: dict, kind: str) -> str:
             f"Once a check sees it done, #{t['id']} {t['title'][:100]} starts by itself; nothing else is needed.")
 
 
-def sync_deferrals(db: DB, tasks: list[dict] | None = None, now: float | None = None) -> list[str]:
+def silent(db: DB, t: dict, kind: str, cfg: dict | None) -> str | None:
+    """Why a task deferred on user-only step `kind` waits without a 'needs you' item, or None: the user
+    acknowledged (parked) the step (alerts.condition_acked), or it waits on a provider login while
+    another, logged-in provider may run its work (failover: no required pin, a target not logged out)."""
+    if alerts.condition_acked(db, f"{KEY}:{t['id']}:{kind}"):
+        return "acknowledged by the user"
+    if kind != "sign-in" or not cfg:
+        return None
+    from . import failover
+    prov = t["provider"] or cfg.get("core_provider") or "claude"
+    if alerts.breaker(db, prov) and failover.after_h(cfg) and not failover.required(db, t) \
+            and any(p != prov and not alerts.breaker(db, p) for p in failover.targets(cfg)):
+        return "another provider runs its work"
+    return None
+
+
+def sync_deferrals(db: DB, tasks: list[dict] | None = None, now: float | None = None,
+                   cfg: dict | None = None) -> list[str]:
     """Open (or update in place, never a second alert) the standing item of each queued task deferred on
     a user-only step (deferral_kind), and drop the deferral records whose item no longer holds. `tasks`:
-    the queued deferred tasks (default: all). Returns the `<task>:<kind>` items it opened."""
+    the queued deferred tasks (default: all). A step that waits silently (silent; `cfg`: the project's
+    settings) opens none, and its open item closes as a feed line. Returns the `<task>:<kind>` items it opened."""
     now = time.time() if now is None else now
     if tasks is None:
         tasks = db.q("SELECT * FROM tasks WHERE status='queued' AND labels LIKE '%\"start_when:%'")
@@ -174,6 +192,12 @@ def sync_deferrals(db: DB, tasks: list[dict] | None = None, now: float | None = 
         if not kind:
             continue
         sid, text = f"{t['id']}:{kind}", deferral_text(t, kind)
+        if why := silent(db, t, kind, cfg):
+            if _open(db, f"{KEY}:{sid}"):   # closed without a word: nothing changed for the user
+                with db.tx():
+                    for ep in db.q("SELECT * FROM alerts WHERE key=? AND cleared IS NULL", (f"{KEY}:{sid}",)):
+                        alerts._close(db, ep, now, f"waits silently: {why}")
+            continue
         rec = db.kv_dict(STEPS)[0].get(sid)
         if isinstance(rec, dict) and rec.get("text") == text and rec.get("check") == deferral(t)["when"] \
                 and _open(db, f"{KEY}:{sid}"):

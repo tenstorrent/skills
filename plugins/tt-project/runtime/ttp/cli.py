@@ -10252,7 +10252,7 @@ def add_task(p, a) -> tuple[int, str]:
                         labels=defer_labels(after, when, start_why(d, {}, when)), not_before=after)
     stale = marker_only_probe(when, p.root)
     from . import userstep
-    userstep.sync_deferrals(p.db, [p.db.task(tid)])   # a user-only step's one standing item
+    userstep.sync_deferrals(p.db, [p.db.task(tid)], cfg=p.config())   # a user-only step's one standing item
     if after or when:
         _cite_hold(p, {"type": "task_add", "id": tid, "start_after": a.start_after if after else None,
                        "start_when": when, "why": a.why})
@@ -10370,7 +10370,7 @@ def _set_when(db, tid: int, probe: str | None, p=None, on_pass_cmd: str | None =
                                               else "cleared; a passed probe wakes it"))
         if "start_when" in d:
             from . import userstep
-            userstep.sync_deferrals(db, [db.task(tid)])   # a user-only step's one standing item
+            userstep.sync_deferrals(db, [db.task(tid)], cfg=p.config() if p else None)   # a user-only step's one standing item
         return f"task #{tid} " + "; ".join(said)
 
 
