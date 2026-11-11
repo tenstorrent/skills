@@ -2903,7 +2903,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 if not a.get("force"):
                     same = similar_task(db, title, a.get("spec") or "", skip=skip)
                     if same and a.get("kind") == "review" and same["kind"] == "review" \
-                            and _review_target(p, a) != _review_target(p, same):
+                            and _review_target(p, _draft_review(a.get("depends_on") or [], a.get("spec") or "")) \
+                            != _review_target(p, same):
                         same = None   # another head, repository or packet: not the same review
                     if same:
                         raise (ValueError if same["status"] in TERMINAL_TASK_STATES else InfoRejection)(
@@ -2981,7 +2982,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 autos = _auto_reviews(db, covered)
                 under_way = {n: r for n, r in autos.items() if r["status"] != "queued" or r["attempts"]}
                 if covered and set(under_way) == covered and all(
-                        _review_target(p, a, deps) == _review_target(p, r) for r in under_way.values()):
+                        _review_target(p, _draft_review(deps, a.get("spec") or ""), deps) == _review_target(p, r)
+                        for r in under_way.values()):
                     ids = ", ".join(f"#{r['id']}" for r in under_way.values())
                     raise ValueError(f"duplicate of review {ids} the daemon queued, already under way; send it a "
                                      f"`spec` with task_update to add checks")
