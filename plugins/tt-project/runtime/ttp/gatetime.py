@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Each project's landing check time: how long its push checks (delivery.push_checks) take before a change lands.
 
-A landing waits for the project's push checks, so they are a smoke suite: under 10 minutes on their host,
-aim 5. Slower tests belong in delivery.post_land_checks, which the daemon runs after each landing (postland),
+A landing waits for the project's push checks, so they are a smoke suite: under 5 minutes on their host,
+aim 4. Slower tests belong in delivery.post_land_checks, which the daemon runs after each landing (postland),
 never holding the queue.
 
 - Record: each passing push check run's wall time is one row of LOG under the project's state (record(),
@@ -14,7 +14,9 @@ never holding the queue.
 - Flag (flag(), each daemon pass, model-free): once the median of the last LAST_N runs is over
   `checks.smoke_max_s` (seconds; default DEFAULT_MAX_S, 0: off), one `gate_slow` observation goes to the
   project's own coordinator per day. It names the slowest tests the newest push log shows (pytest's
-  --durations lines) and suggests a smoke split; the project changes its own push checks.
+  --durations lines) and suggests a smoke split; the project changes its own push checks. With it, one
+  priority-1 test speed-up task (labelled SPEED_LABEL, naming those tests) is queued for the project, never
+  while another is still open.
 - Waits (waits_line()): how long full `ttp checks` runs waited to start (WAIT_LOG, record_wait(), from the run's
   arrival to its start here or on a spill host) and approval to landed (pushq.landing_times), median and p90
   over the last 24 h: the hours a slow landing spends queued, not testing.
@@ -38,9 +40,10 @@ POST_LAND_RUNS = True
 KEEP = 200
 DAY_S = 86400.0
 LAST_N = 10
-DEFAULT_MAX_S = 600.0
-AIM_S = 300.0
+DEFAULT_MAX_S = 300.0
+AIM_S = 240.0
 EVENT = "gate_slow"
+SPEED_LABEL = "test_speed"   # the daemon's test speed-up task (speed_task), one open at a time
 SLOWEST = 10
 # A pytest --durations line ("12.34s call     tests/x.py::test_y") or a test suite's own slowest-call line
 # ("ttp-suite:    61.20s tests/x.py::test_y", the plugin's test runner's)
@@ -179,9 +182,32 @@ def slowest(log_dir: Path | None, n: int = SLOWEST) -> list[tuple[float, str]]:
     return []
 
 
+def speed_task(db, last: dict, lim: float, tests: list[tuple[float, str]]) -> int:
+    """Queue one priority-1 code task to bring the landing checks under `lim` (0: one is still open)."""
+    from .db import TERMINAL_TASK_STATES
+    marks = ",".join("?" * len(TERMINAL_TASK_STATES))
+    if db.one(f"SELECT id FROM tasks WHERE labels LIKE ? AND status NOT IN ({marks})",
+              (f'%"{SPEED_LABEL}"%', *TERMINAL_TASK_STATES)):
+        return 0
+    named = ("\n".join(f"- {k}: {s:.0f}s" for s, k in tests) if tests else
+             "- (no durations in the push logs: add --durations=30 to the pytest push check first)")
+    spec = (f"urgent: landing checks take a median {_m(last['median_s'])} over the last {last['n']} runs, over "
+            f"the {_m(lim)} smoke limit (checks.smoke_max_s); every change waits that long to land.\n\n"
+            f"Bring this project's per-change checks (delivery.push_checks, delivery.task_checks) under "
+            f"{_m(lim)} on their host, aim {_m(AIM_S)}, without losing coverage:\n"
+            f"1. {split_advice()} Keep at least one fast test per area in the smoke subset.\n"
+            f"2. Speed up the slowest tests themselves (fixtures, sleeps, polling, repeated setup).\n"
+            f"3. Run tests in parallel sized to the host's free cores, slowest first.\n"
+            f"Slowest tests in the newest push log:\n{named}\n\n"
+            f"Measure the smoke wall time before and after on the same host and report both. If the checks "
+            f"are already under the limit when you start, hand off done saying so.")
+    return db.add_task("Speed up the landing checks: under " + _m(lim), spec, kind="code", tier="standard",
+                       priority=1, origin="daemon", labels=[SPEED_LABEL])
+
+
 def flag(db, state: Path | None, cfg: dict | None, log_dir: Path | None = None, now: float | None = None) -> str:
-    """Raise one `gate_slow` observation a day while the last runs' median is over checks.smoke_max_s;
-    returns its text ('' when none was raised)."""
+    """Raise one `gate_slow` observation a day while the last runs' median is over checks.smoke_max_s, and
+    queue a test speed-up task (speed_task) unless one is open; returns its text ('' when none was raised)."""
     now = time.time() if now is None else now
     lim = max_s(cfg)
     last = stats(state, now)["last"]
@@ -193,9 +219,11 @@ def flag(db, state: Path | None, cfg: dict | None, log_dir: Path | None = None, 
     tests = slowest(log_dir)
     named = ("Slowest tests in the newest push log: " + ", ".join(f"{k} {s:.0f}s" for s, k in tests) + ". ") if tests \
         else "Add --durations=30 to the pytest push check to see the slowest tests. "
+    tid = speed_task(db, last, lim, tests)
     text = (f"Landing checks are slow: median {_m(last['median_s'])} over the last {last['n']} push check runs, "
             f"over the {_m(lim)} smoke limit (checks.smoke_max_s; aim {_m(AIM_S)}). " + named
-            + split_advice())
+            + split_advice() + (f" Queued test speed-up task #{tid} (priority 1)." if tid else
+                                " A test speed-up task is already open."))
     db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status) VALUES(?,?,?,?,?,?,?)",
          (now, "daemon", "observation", fp, "normal", text[:4000], "queued"))
     return text

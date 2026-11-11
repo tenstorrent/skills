@@ -806,7 +806,7 @@ def _known_keys(path: list[str]) -> set[str] | None:
                 "wait_escalate_s", "wait_hang_factor", "priority_age_s", "test_project_max", "test_project_slots",
                 "test_project_workers", "test_run_max", "test_run_min",
                 "done_holder_flag_s", "done_holder_grace_s", "stall_s", "push_load_wait_s",
-                "smoke_max_s"}   # the landing check time limit (gatetime.max_s; default 600 s, 0: off)
+                "smoke_max_s"}   # the landing check time limit (gatetime.max_s; default 300 s, 0: off)
     if len(path) == 1 and isinstance(DEFAULT_CONFIG.get(path[0]), dict):
         return set(DEFAULT_CONFIG[path[0]]) | EXTRA_KEYS.get(path[0], set())
     return None
