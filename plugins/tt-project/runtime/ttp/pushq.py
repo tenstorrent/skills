@@ -2449,9 +2449,9 @@ def _apply(p: Project, b: dict, m: dict, alert: Callable, now: float) -> None:
     with db.tx():
         if not db.conn.execute(
                 "UPDATE push_batches SET outcome=?, ended=?, pushed_sha=?, version=?, tip=?, check_runs=?, check_s=?, "
-                "finalized=? WHERE id=? AND finalized IS NULL",
-                (outcome, m.get("ended") or now, sha, version, tip, checks.get("runs"), checks.get("seconds"), now,
-                 b["id"])).rowcount:
+                "check_cpu_s=?, finalized=? WHERE id=? AND finalized IS NULL",
+                (outcome, m.get("ended") or now, sha, version, tip, checks.get("runs"), checks.get("seconds"),
+                 checks.get("cpu_s"), now, b["id"])).rowcount:
             return
         rows = db.q("SELECT * FROM push_queue WHERE batch=? AND status='batched' ORDER BY id", (b["id"],))
         shipped: list[int] = []
@@ -3166,7 +3166,7 @@ def summary(p: Project, now: float | None = None, last: int = 5, db=None) -> dic
                 "phase": m.get("phase") or ("after_push" if b["finalized"] else "push"),
                 "rows": db.one("SELECT COUNT(*) n FROM push_queue WHERE batch=?", (b["id"],))["n"]}
     batches = [{k: r[k] for k in ("id", "target", "outcome", "pushed_sha", "version", "after_push", "started", "ended",
-                                  "check_runs", "check_s")}
+                                  "check_runs", "check_s", "check_cpu_s")}
                for r in db.q("SELECT * FROM push_batches WHERE finalized IS NOT NULL ORDER BY started DESC LIMIT ?",
                              (last,))]
     for x in batches:

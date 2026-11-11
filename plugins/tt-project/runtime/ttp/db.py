@@ -267,7 +267,7 @@ CREATE INDEX IF NOT EXISTS push_queue_status ON push_queue(status, id);
 CREATE TABLE IF NOT EXISTS push_batches(
   id TEXT PRIMARY KEY, marker TEXT NOT NULL, target TEXT NOT NULL,
   started REAL NOT NULL, ended REAL,
-  outcome TEXT, pushed_sha TEXT, version TEXT, tip TEXT, check_runs INTEGER, check_s REAL,
+  outcome TEXT, pushed_sha TEXT, version TEXT, tip TEXT, check_runs INTEGER, check_s REAL, check_cpu_s REAL,
   after_push TEXT, after_tries INTEGER NOT NULL DEFAULT 0, finalized REAL, after_finalized REAL);
 """
 # Open asks older than this no longer hold back idle-slot wakes. They are still shown until answered.
@@ -434,6 +434,7 @@ class DB:
         self._migrate_review_code_lines()
         self._migrate_tier_source()
         self._migrate_run_cost_basis()
+        self._migrate_push_check_cpu()
 
     def _migrate_tier_source(self) -> None:
         # The tier a task was queued at and why its current tier is what it is (TIER_SOURCES). Older
@@ -454,6 +455,15 @@ class DB:
         with self.tx():
             if "cost_basis" not in {r["name"] for r in self.q("PRAGMA table_info(runs)")}:
                 self.x("ALTER TABLE runs ADD COLUMN cost_basis TEXT")
+
+    def _migrate_push_check_cpu(self) -> None:
+        # The CPU seconds a push train's checks took here (Batch._spent; trainstats). Older batches keep
+        # NULL, shown as unrecorded.
+        if "check_cpu_s" in {r["name"] for r in self.q("PRAGMA table_info(push_batches)")}:
+            return
+        with self.tx():
+            if "check_cpu_s" not in {r["name"] for r in self.q("PRAGMA table_info(push_batches)")}:
+                self.x("ALTER TABLE push_batches ADD COLUMN check_cpu_s REAL")
 
     def _migrate_review_self_check(self) -> None:
         # Whether the reviewed hand-off carried a `self_check` line. Older rows have none (NULL).

@@ -16172,22 +16172,56 @@ def _entries(repo, n):
     return [_entry(repo, f"e{k}", {f"e{k}.txt": f"{k}\n"}) for k in range(1, n + 1)]
 
 
+_SECOND_CHECK = f"{_FLAKY_CHECK} -p no:cacheprovider"
+
+
+def _full_runs(monkeypatch):
+    """Record each full check run (no TTP_PYTEST_SELECT) on top of _ids_stub's batch._stream: ("first" or
+    "second" for _FLAKY_CHECK or _SECOND_CHECK, the entries' files in the tree)."""
+    from ttp import batch
+    stub, ran = batch._stream, []
+
+    def rec(cmd, cwd, env=None, **kw):
+        if not (env or {}).get("TTP_PYTEST_SELECT"):
+            line = cmd if isinstance(cmd, str) else " ".join(map(str, cmd))
+            ran.append(("second" if "no:cacheprovider" in line else "first",
+                        sorted(f.stem for f in pathlib.Path(cwd).glob("e*.txt"))))
+        return stub(cmd, cwd, env, **kw)
+    monkeypatch.setattr(batch, "_stream", rec)
+    return ran
+
+
 def test_a_push_batch_split_runs_only_the_new_failing_tests_at_the_prefix_heads(env, monkeypatch):
-    """Cell split_failing_ids_only: entry 3 of 4 breaks one test. The search probes the prefixes with
-    only that test, never their whole suite: the full suite runs at the full head and at the prefix the
-    probes showed passing (once, after they found entry 3), which then pushes at once; entries 3 and 4 go untested to the next train
+    """Cell split_failing_ids_only: entry 3 of 4 breaks one test of the first check. The search probes the
+    prefixes with only that test, never their whole suite. The prefix the probes showed passing runs only
+    the check that never ran on the full head, not a second full run (task #7758: the first check passed
+    there but for that test), and then pushes at once; entries 3 and 4 go untested to the next train
     (user msg #2317)."""
-    p, repo, origin, other = _push_setup(env, monkeypatch, [_FLAKY_CHECK])
+    p, repo, origin, other = _push_setup(env, monkeypatch, [_FLAKY_CHECK, _SECOND_CHECK])
     tip = _git_out(origin, "rev-parse", "proj")
     calls = _ids_stub(monkeypatch, tip, lambda tree, sel: {_NEW_ID} if (tree / "e3.txt").exists() else set())
+    ran = _full_runs(monkeypatch)
     rc, m = _run_batch(p, _batch_marker(p, _entries(repo, 4)), monkeypatch)
     assert _statuses(m) == ["pushed", "pushed", "requeued", "requeued"], m
     sel = "^(?:test_breaks_with_its_entry)$"
-    full = [c[2] for c in calls if c[1] is None]
-    assert full == [["e1", "e2", "e3", "e4"], ["e1", "e2"]], calls
+    assert ran == [("first", ["e1", "e2", "e3", "e4"]), ("second", ["e1", "e2"])], ran
     probes = [c[2] for c in calls if c[1] == sel and c[0] == "head"]
     assert ["e1", "e2"] in probes and ["e1", "e2", "e3"] in probes, calls
     assert m["checks"]["id_probes"] == 2 and not m.get("pre_existing") and not m.get("flaky_tests")
+
+
+def test_a_rescue_runs_only_the_blamed_entrys_new_failing_tests_and_the_checks_left_not_a_second_full_run(env, monkeypatch):
+    """Task #7758: entry 1 of 4 breaks one test of the first check and is blamed. The later entries,
+    replayed without it, are checked on that test alone and on the check that never ran on the full head;
+    they land as those pass, with no second full run of the first check."""
+    p, repo, origin, other = _push_setup(env, monkeypatch, [_FLAKY_CHECK, _SECOND_CHECK])
+    tip = _git_out(origin, "rev-parse", "proj")
+    calls = _ids_stub(monkeypatch, tip, lambda tree, sel: {_NEW_ID} if (tree / "e1.txt").exists() else set())
+    ran = _full_runs(monkeypatch)
+    rc, m = _run_batch(p, _batch_marker(p, _entries(repo, 4)), monkeypatch)
+    assert m["outcome"] == "pushed" and _statuses(m) == ["check_failed", "pushed", "pushed", "pushed"], m
+    assert ran == [("first", ["e1", "e2", "e3", "e4"]), ("second", ["e2", "e3", "e4"])], ran
+    assert ("head", "^(?:test_breaks_with_its_entry)$", ["e2", "e3", "e4"]) in calls, calls
 
 
 def test_a_push_batch_lands_the_passing_entries_when_the_tip_fails_a_test_too(env, monkeypatch):
@@ -19943,6 +19977,27 @@ def test_ttp_stats_landing_shows_runs_cpu_hours_and_dollars_per_landed_change(en
     out = trainstats.text(r, p.name)
     assert "2 landed" in out and "$2.5/landed" in out and "0.5 CPU-h/landed" in out, out
     p.db.x("DELETE FROM push_queue")
+
+
+def test_a_push_train_records_its_check_cpu_seconds_and_ttp_stats_landing_shows_them(env, monkeypatch):
+    """Task #7758: a train tallies the CPU seconds of the check runs it waited for (Batch._spent), the
+    queue writes them to push_batches.check_cpu_s, and `ttp stats --landing` counts them in CPU-h per
+    landed change and shows them beside the trains' wall hours."""
+    from ttp import batch, pushq, timefmt, trainstats
+    ticks = iter(range(0, 10 ** 6, 450))
+    monkeypatch.setattr(batch.checkcap, "child_cpu_s", lambda: float(next(ticks)))
+    p, repo, origin, other = _bump_setup(env, monkeypatch, ["test ! -e plugins/p/bad.txt"])
+    rc, m = _run_batch(p, _batch_marker(p, [_entry(repo, "e1", {"plugins/p/f1.txt": "1\n"})]), monkeypatch)
+    assert rc == 0 and m["outcome"] == "pushed" and m["checks"]["cpu_s"] >= 450 and m["checks"]["cpu_s"] % 450 == 0, m
+    now = time.time()
+    _pq_batch_row(p, "t1", now, age=600)
+    pushq._apply(p, p.db.one("SELECT * FROM push_batches WHERE id='t1'"),
+                 {"outcome": "nothing", "checks": {"runs": 2, "seconds": 600.0, "cpu_s": 1800.0}}, lambda *a, **k: None, now)
+    assert p.db.one("SELECT check_cpu_s FROM push_batches WHERE id='t1'")["check_cpu_s"] == 1800.0
+    r = trainstats.report(p.db, p.runs, timefmt.home(p), days=1, now=now)
+    (d,) = r["days"]
+    assert d["trains"] == 1 and d["train_cpu_s"] == 1800.0 and not d["train_cpu_unrecorded"], d
+    assert "train checks 0.2 h wall, 0.5 CPU-h;" in trainstats.text(r, p.name)
 
 
 def test_ttp_stats_landing_counts_a_review_that_landed_its_change_by_direct_push(env):
