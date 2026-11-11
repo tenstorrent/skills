@@ -3821,7 +3821,17 @@ corrected forecast waits, whole, for one digest per chat, posted at most every
 content. The 'Status now' line the harness adds to a post naming unstarted work goes in the
 digest too, and so does the harness's own update on a late item the coordinator did not act on.
 A reminder of a step waiting on you keeps its full command and options in the digest.
-`ttp stats --chat` counts per chat the posts sent at once, held, digests posted and held now.
+`ttp stats --chat` counts per chat the posts sent at once, held, digests posted, repeats not sent and held now.
+
+Status pace. A status post (progress, counts, ETAs) goes to a chat at most once per
+`coordinator.chat_status_gap_h` hours (default 1; `0` no gap; `coordinator.chat_status_gap_chats`
+`{chat: hours}` sets one chat, shown beside it in the coordinator's digest); a sooner one waits for that
+chat's digest. Answers to your question, asks, outages and results you asked for are not status and go
+at once. The hourly status table keeps the same gap. A post that nearly repeats what another chat of
+yours got in the last hour (most words alike, or the same task and obligation ids) is not sent again,
+and that chat's promise on the same topic counts as delivered by the post you already read. A
+project's chats count as one user's unless `coordinator.chat_users` `{chat: user}` says otherwise;
+`coordinator.chat_dedupe` `false` turns the repeat check off.
 
 Hourly status table: `ttp status --hourly` prints one table, built without a model call: the fork rate
 (worker and review runs started from a copy of a saved session, last hour and today, per provider,

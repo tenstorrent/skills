@@ -22,7 +22,8 @@ def test_ack_progress_and_forecast_correction_replies_wait_for_the_digest(env, m
     assert [h["text"] for h in held] == routine   # kept whole, never dropped
     assert [h["why"] for h in held] == ["ack", "progress", "forecast correction", "progress"]
     assert any("chat digest:" in n for n in p.db.kv(coord.NOTES_KEY, []))   # the coordinator hears of it
-    assert chatdigest.counts(p.db)["c1"] == {"sent": 0, "held": 4, "digests": 0, "waiting": 4}
+    assert chatdigest.counts(p.db)["c1"] == {"sent": 0, "held": 4, "digests": 0, "deduped": 0,
+                                               "waiting": 4}
 
 
 def test_results_decisions_outages_and_asks_go_at_once(env, monkeypatch):
@@ -88,7 +89,7 @@ def test_the_digest_goes_at_most_every_n_hours_and_only_with_content(env, monkey
     chatdigest.hold(p.db, "c1", "#13 is queued.", "progress", t0 + 2 * 3600 + 60)
     assert chatdigest.flush(p, cfg, t0 + 3 * 3600 + 120) == []   # 2 h since the last digest not yet passed
     assert len(chatdigest.flush(p, cfg, t0 + 4 * 3600 + 60)) == 1
-    assert chatdigest.counts(p.db)["c1"] == {"sent": 0, "held": 3, "digests": 2, "waiting": 0}
+    assert chatdigest.counts(p.db)["c1"] == {"sent": 0, "held": 3, "digests": 2, "waiting": 0, "deduped": 0}
 
 
 def test_a_held_reminder_keeps_its_full_command_in_the_digest(env, monkeypatch):
@@ -184,3 +185,93 @@ def test_a_chat_can_set_its_own_digest_hours_and_a_high_floor_elsewhere_hides_no
     coord.apply(p, [{"type": "reply", "chat": "c1", "text": "Got it."},
                     {"type": "reply", "chat": "c2", "text": "Got it."}], turn=1)
     assert _cd_out(p, "c1") == [] and _cd_out(p, "c2") == ["Got it."]
+
+
+def _cd_chats(p, *ids):
+    import time
+    for c in ids:
+        p.db.x("INSERT INTO chats(id,created,label,last_active,last_read) VALUES(?,?,?,?,0)",
+               (c, time.time(), None, time.time()))
+
+
+def test_a_status_goes_at_most_once_per_gap_and_answers_asks_and_outages_still_go(env, monkeypatch):
+    """cells: chat_interval. A second status within coordinator.chat_status_gap_h waits for the digest; an
+    answer to the user's question and an outage go at once; after the gap a status goes again."""
+    from ttp import chatdigest, coordinator as coord
+    monkeypatch.setenv("TTP_TEST_CHAT_DIGEST", "on")
+    p = make(env)
+    assert chatdigest.status_gap_s(p.config(), "c1") == 3600
+    first, second = ("Backlog: 12 tasks open, 3 queued; #40 done.", "Backlog: 11 tasks open, 4 queued; #41 done.")
+    coord.apply(p, [{"type": "reply", "chat": "c1", "text": first}], turn=1)
+    coord.apply(p, [{"type": "reply", "chat": "c1", "text": second}], turn=2)
+    assert _cd_out(p) == [first]
+    assert [h["why"] for h in p.db.kv(chatdigest.KV)["held"]["c1"]] == ["status gap"]
+    assert any("chat_status_gap_h" in n for n in p.db.kv(coord.NOTES_KEY, []))
+    p.db.post("in", "how many tasks are left?", chat="c1")
+    coord.apply(p, [{"type": "reply", "chat": "c1", "text": "11 tasks left, 4 queued."}], turn=3)
+    coord.apply(p, [{"type": "reply", "chat": "c1", "text": "The build host is down; 11 tasks wait for it."}], turn=4)
+    assert _cd_out(p)[1:] == ["11 tasks left, 4 queued.", "The build host is down; 11 tasks wait for it."]
+    st = p.db.kv(chatdigest.KV)
+    st["status"]["c1"] -= 3601
+    p.db.set_kv(chatdigest.KV, st)
+    coord.apply(p, [{"type": "reply", "chat": "c1", "text": "Backlog: 9 tasks open, 2 queued; #42 done."}], turn=5)
+    assert _cd_out(p)[-1] == "Backlog: 9 tasks open, 2 queued; #42 done."
+    p.set_config("coordinator.chat_status_gap_chats", {"c1": 0})
+    assert chatdigest.status_gap_s(p.config(), "c1") == 0 and chatdigest.status_gap_s(p.config(), "c2") == 3600
+
+
+def test_a_near_repeat_to_another_chat_of_the_user_is_not_sent_within_the_hour(env, monkeypatch):
+    """cells: cross_chat_dedupe."""
+    from ttp import chatdigest, coordinator as coord
+    monkeypatch.setenv("TTP_TEST_CHAT_DIGEST", "on")
+    p = make(env)
+    status = "Backlog: 12 tasks open, 3 queued; #40 done, the rest by 15:10."
+    coord.apply(p, [{"type": "reply", "chat": "c1", "text": status}], turn=1)
+    coord.apply(p, [{"type": "reply", "chat": "c2", "text": "Backlog now: 12 tasks open, 3 queued; #40 done, the "
+                                                             "rest by 15:10."}], turn=2)
+    assert _cd_out(p, "c1") == [status] and _cd_out(p, "c2") == []
+    assert chatdigest.counts(p.db)["c2"]["deduped"] == 1
+    assert any("nearly repeats message #" in n for n in p.db.kv(coord.NOTES_KEY, []))
+    other = "I picked the spare host for the soak runs."
+    coord.apply(p, [{"type": "reply", "chat": "c2", "text": other}], turn=3)
+    assert _cd_out(p, "c2") == [other]
+    p.set_config("coordinator.chat_users", {"c1": "a", "c3": "b"})   # another user's chat gets its own copy
+    coord.apply(p, [{"type": "reply", "chat": "c3", "text": status}], turn=4)
+    assert _cd_out(p, "c3") == [status]
+    p.db.x("UPDATE messages SET ts = ts - 3700")
+    p.set_config("coordinator.chat_users", {})
+    coord.apply(p, [{"type": "reply", "chat": "c2", "text": status}], turn=5)
+    assert _cd_out(p, "c2") == [other, status]   # an hour on, it goes again
+    assert chatdigest.near("The build host is down.", "The build host is up.") is False
+
+
+def test_the_first_post_delivers_the_other_chats_promise_on_the_same_topic(env, monkeypatch):
+    """cells: promise_merge. A promise made in c2 is delivered by the post the user read in c1."""
+    from ttp import coordinator as coord, obligations
+    monkeypatch.setenv("TTP_TEST_CHAT_DIGEST", "on")
+    p = make(env)
+    tid = p.db.add_task("table", "s", kind="work", status="queued")
+    coord.apply(p, [{"type": "reply", "chat": "c2", "text": f"I'll send the #{tid} backlog table by 23:00."}], turn=1)
+    o = next(o for o in obligations.open_promises(p.db) if o["promise"]["chat"] == "c2")
+    p.db.x("UPDATE messages SET ts = ts - 7200")
+    table = f"#{tid} backlog table is ready: 3 of 4 cells pass, 1 queued."
+    coord.apply(p, [{"type": "reply", "chat": "c1", "text": table}], turn=2)
+    first = p.db.one("SELECT id FROM messages WHERE chat='c1' ORDER BY id DESC LIMIT 1")["id"]
+    coord.apply(p, [{"type": "reply", "chat": "c2", "text": f"#{tid} backlog table is ready now: 3 of 4 cells pass, 1 queued."}],
+                turn=3)
+    assert _cd_out(p, "c2") == [f"I'll send the #{tid} backlog table by 23:00."]
+    got = next(x for x in obligations.items(p.db) if x["id"] == o["id"])
+    assert got["delivered"]["message"] == first and got["delivered"]["via"] == "repeat"
+    assert any(f"delivered by message #{first}" in n for n in p.db.kv(coord.NOTES_KEY, []))
+
+
+def test_the_digest_shows_a_chats_own_status_interval(env, monkeypatch):
+    """cells: digest_line."""
+    from ttp import coordinator as coord
+    monkeypatch.setenv("TTP_TEST_CHAT_DIGEST", "on")
+    p = make(env)
+    _cd_chats(p, "c1", "c2")
+    p.set_config("coordinator.chat_status_gap_chats", {"c2": 2})
+    chats = coord.digest(p, {}, [], []).split("## Chats attached")[1].split("\n## ")[0]
+    assert "- c2 (chat), active 0 min ago, status at most every 2 h" in chats
+    assert "status at most" not in next(line for line in chats.splitlines() if line.startswith("- c1"))

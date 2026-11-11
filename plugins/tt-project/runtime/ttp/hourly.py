@@ -315,7 +315,11 @@ def post(p, now: float | None = None) -> int | None:
         return None
     if not (chat := main_chat(p.db)):
         return None
+    from . import chatdigest   # the chat's status pace binds this table too: it waits, never stacks
+    if chatdigest.status_wait(p.db, p.config(), chat, now) > 0:
+        return None
     mid = p.db.post("out", got[0], chat=chat, kind="info", severity="low", ref=REF)
+    chatdigest.mark_status(p.db, chat, now)
     try:
         st = json.loads((p.state / STATE_FILE).read_text())
     except (OSError, ValueError):

@@ -1735,8 +1735,11 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
     clash = relayers.conflicts(db, now)   # a relayer on another chat's id takes that chat's replies
     if chats or clash:
         lines.append("## Chats attached")
-    for c in chats:
-        lines.append(f"- {c['id']} ({c['label'] or 'chat'}), active {(now - (c['last_active'] or now)) / 60:.0f} min ago")
+    own_gap = (p.config().get("coordinator") or {}).get("chat_status_gap_chats")
+    for c in chats:   # a chat's own status pace (chatdigest.status_gap_s) shows beside it
+        gap = chatdigest.status_gap_s(p.config(), c["id"]) if isinstance(own_gap, dict) and c["id"] in own_gap else 0
+        lines.append(f"- {c['id']} ({c['label'] or 'chat'}), active {(now - (c['last_active'] or now)) / 60:.0f} min ago"
+                     + (f", status at most every {gap / 3600:g} h" if gap else ""))
     lines += [f"- relay: {c}" for c in clash]
     section("chats", lines)
     lines = []
@@ -2783,6 +2786,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
     batch_obls: list[str] = []
     fan_orders: list[tuple[str | None, int, list]] = []   # (key, message, supersedes) of orders: userorder.fan_out
     delivered: list[tuple[int, str | None, list]] = []   # replies with `delivers` (obligations.deliver)
+    twins: list[tuple] = []   # (first message, chat, delivers, text) of replies not sent as near-repeats
     explicit: set[int] = set()   # replies naming `owners` or `delivers`: their promise is never auto-attached
     claimed: list[tuple[int, str | None, list]] = []   # (message, chat, claims) of replies and notifies
     new_tasks: dict[int, int] = {}   # action index -> the task its task_add created (a claim's `action`)
@@ -2839,7 +2843,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 a["text"] = _wakemode_checked(p, a["text"], notes)
                 a["text"] = _pending_checked(p, a["text"], notes, "reply")
                 a["text"], false = _claims_checked(p, a, notes)
-                if (text := chatdigest.checked(db, cfg, a["text"], a, chat, notes)) is None:
+                if (text := chatdigest.checked(db, cfg, a["text"], a, chat, notes, twins=(dup := []))) is None:
+                    twins += [(m, c, list(a.get("delivers") or []), authored) for m, c in dup]
                     workernotify.handled(db, said)
                     continue
                 a["text"] = text
@@ -4394,6 +4399,10 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
         notes += obligations.deliver(p, delivered)
     except Exception as e:
         notes.append(f"delivery not recorded: {type(e).__name__}: {str(e)[:200]}")
+    try:   # a near-repeat not sent: the post the user already read delivers that chat's promise
+        notes += obligations.deliver_twins(p, twins)
+    except Exception as e:
+        notes.append(f"repeat's delivery not recorded: {type(e).__name__}: {str(e)[:200]}")
     try:   # a reply already went out: recording its promise never undoes or rejects it
         notes += obligations.record_promises(p, sent, batch_tasks, batch_obls, explicit=explicit, plans=plans)
     except Exception as e:

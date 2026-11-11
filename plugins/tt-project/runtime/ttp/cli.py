@@ -2143,7 +2143,8 @@ def cmd_stats(a) -> None:
         s = chatdigest.counts(p.db)
         print(json.dumps(s, indent=1) if a.json else "\n".join(
             [f"{p.name}: coordinator chat posts (digest every {chatdigest.every_s(p.config()) / 3600:g} h; 0: off)"]
-            + ([f"  {c}: {v['sent']} sent, {v['held']} held, {v['digests']} digests, {v['waiting']} waiting"
+            + ([f"  {c}: {v['sent']} sent, {v['held']} held, {v['digests']} digests, "
+               f"{v['deduped']} not sent as repeats, {v['waiting']} waiting"
                for c, v in s.items()] or ["  none counted yet"])))
         return
     if a.coord_session:

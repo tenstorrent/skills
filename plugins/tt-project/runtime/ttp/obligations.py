@@ -1791,6 +1791,42 @@ def deliver(p, sent: list[tuple[int, str | None, list]], now: float | None = Non
     return notes
 
 
+def deliver_twins(p, twins: list[tuple], now: float | None = None) -> list[str]:
+    """Replies not sent because they nearly repeat a post the same user read in another chat
+    (chatdigest.twin): (first message, chat, delivers, text). That first post delivers the reply's
+    `delivers` and every open promise of the chat on the same topic (tasks or obligations it names or its
+    promise tracks, or near-alike text), as if the reply had gone. Orders stay open. A note per promise."""
+    from . import chatdigest
+    now = time.time() if now is None else now
+    notes: list[str] = []
+    for mid, chat, refs, text in twins:
+        chat = _chat(chat)
+        first = p.db.one("SELECT text FROM messages WHERE id=?", (mid,))
+        said = " ".join([str(text or ""), str(first["text"] if first else "")])
+        topic = chatdigest._topic(said)
+        with p.db.tx():
+            st = _load(p.db)
+            topic |= {f"#{t}" for o in st["items"].values() if (o.get("promise") or {}).get("message") == mid
+                      for t in o["promise"].get("tasks") or []}
+            for o in st["items"].values():
+                pr = o.get("promise") or {}
+                if (not _open(o) or not pr or pr.get("order") or pr.get("claim") or pr.get("chat") != chat
+                        or o.get("delivered")):
+                    continue
+                mine = {f"#{t}" for t in [*(pr.get("tasks") or []), *_owner_ids(o)]} | set(pr.get("obligations") or []) | {o["id"]} \
+                    | chatdigest._topic(o.get("text") or "")
+                if (o["id"] in refs or mine & (topic | {str(r) for r in refs})
+                        or chatdigest.near(str(o.get("text") or ""), said)):
+                    o["delivered"] = {"message": mid, "chat": chat, "at": now, "via": "repeat"}
+                    if ev := _delivered(p.db, o):
+                        _close(p.db, o, now, ev + f" (the same post the user read in another chat; chat {chat}'s "
+                                                   f"near-repeat was not sent)")
+                    notes.append(f"{o['id']} (promise in chat {chat}) delivered by message #{mid}, the same post "
+                                 f"the user read in another chat")
+            p.db.set_kv(KV, st)
+    return notes
+
+
 # orders and claims --------------------------------------------------------------------------------
 # An order (add_order): a user message that asks for something, recorded by the coordinator's
 # `obligation` action with `order` (the message id), `action_class` (read, change or device), optional

@@ -278,6 +278,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
                     # posted at most this often; results, decisions, outages and asks go at once
                     # (chatdigest.py; 0: every post goes at once).
                     "chat_digest_h": 3,
+                    # A status post (progress, counts, ETAs) goes to a chat at most this often; a sooner
+                    # one waits for that chat's digest. `chat_status_gap_chats` {chat: hours} sets a
+                    # chat's own (chatdigest.py; 0: no gap).
+                    "chat_status_gap_h": 1,
                     # A user-ordered urgent task (fresh `urgent:` line) with a machine or device resource
                     # still queued this long, or waiting this long in `ttp lock`: one high observation
                     # names what holds it (Daemon.check_urgent_start; 0: off).
