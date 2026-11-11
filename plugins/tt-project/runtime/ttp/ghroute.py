@@ -298,7 +298,7 @@ def works(home=None, within_s: float = 3600) -> bool:
 
 def quiet(error: str) -> str:
     """gh's own error with its 'run gh auth login' advice cut: nobody logs in on a lab host."""
-    out = re.sub(r"[\s.:;,-]*(?:to (?:log in|get started)[^:]*:?\s*|please run:?\s*|run:?\s*)*`?gh auth login`?\.?",
+    out = re.sub(r"[\s.:;,-]*(?:to (?:log in|get started)[^:]*:?\s*|please\s+run:?\s*|run:?\s*)*`?gh auth login`?\.?",
                  "", str(error or ""), flags=re.I).strip()
     return out or "not logged in"
 

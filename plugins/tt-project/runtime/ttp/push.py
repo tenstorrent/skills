@@ -48,7 +48,7 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import quote, unquote
 
-from . import (checkcap, checkdirs, checkspill, checkwait, checklane, cleantree, coordtools, envfault, gatejudge, gatetime, gitcache, gitmemo, hoststate, landed, landmark, leakfile, locks, machines, outscan, pooladmit, prguard, prhead, remotecheck, remoteload, repoid, runner, runnerenv,
+from . import (checkcap, checkdirs, checkspill, checkwait, checklane, cleantree, coordtools, envfault, gatejudge, gatetime, gitcache, ghroute, gitmemo, hoststate, landed, landmark, leakfile, locks, machines, outscan, pooladmit, prguard, prhead, remotecheck, remoteload, repoid, runner, runnerenv,
                sandbox, scriptwatch, settinghold, setupfault, shorttmp, slurmcheck, syntaxfault, testslots, timefmt, verified, workerloss, worktree)
 from .budget import DOC_SUFFIXES
 from .db import continues_id, dependency_ids, load_result
@@ -3414,7 +3414,6 @@ def backup(repo: Path, remote: str, branch: str, timeout_s: float = BACKUP_TIMEO
         return "gone", f"branch {branch} no longer exists"
     ref = f"refs/heads/{branch}"
     try:   # no leading + and no --force: git itself refuses anything but a fast-forward
-        from . import ghroute
         out = subprocess.run(ghroute.push_argv(["git", "-C", str(repo), "push", "--porcelain", remote, f"{ref}:{ref}"]),
                              text=True, capture_output=True, timeout=timeout_s, stdin=subprocess.DEVNULL,
                              env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
