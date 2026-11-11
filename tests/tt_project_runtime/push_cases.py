@@ -21511,3 +21511,24 @@ def test_push_check_targets_are_looked_up_at_the_remote_tracking_push_branch(tmp
     git(alone, "branch", "-D", "feature")
     assert targets_tip(alone, "origin/feature") == "HEAD"
     assert missing(alone)
+
+
+@pytest.mark.parametrize("form", ["dict", "branch at sha", "branch only", "sha in prose"])
+def test_an_approval_in_any_form_while_the_queue_is_off_is_never_dropped(env, monkeypatch, form):
+    """Queue off: a review that names the commit it approved (one entry, "branch at sha", the branch
+    alone, a sha in a sentence) runs again to push it itself instead of being logged as ignored."""
+    s = _pq(env, monkeypatch, push_queue=False)
+    push = {"dict": {"branch": s.branch, "head": s.head}, "branch at sha": f"{s.branch} at {s.head}",
+            "branch only": s.branch, "sha in prose": f"approved for the push queue: {s.head}."}[form]
+    t = _pq_hand_off(env, s, push=push)
+    assert t["status"] == "queued" and not s.p.db.q("SELECT id FROM push_queue")
+    assert json.loads(t["result"])["woke"].startswith("push approval invalid: the push queue is off")
+    assert "push list was ignored" not in (s.p.logs / "daemon.log").read_text()
+
+
+def test_an_approval_already_on_the_push_branch_while_the_queue_is_off_is_ignored(env, monkeypatch):
+    """A review that pushed its head itself and names it: nothing is left to land, so it is done."""
+    s = _pq(env, monkeypatch, push_queue=False)
+    _git_out(s.repo, "update-ref", "refs/remotes/origin/proj", s.head)
+    t = _pq_hand_off(env, s, push=f"{s.branch} at {s.head}")
+    assert t["status"] == "done" and "already on the push branch" in (s.p.logs / "daemon.log").read_text()

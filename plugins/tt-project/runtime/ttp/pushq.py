@@ -801,11 +801,55 @@ def _push_conflict(p: Project, task: dict, rows: list[dict]) -> str:
     return "" if rows and (rows[-1]["created"] or 0) > at else head
 
 
+_REF_TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,199}")
+NAMED_MAX = 16   # tokens of a push value tried as commits: a few git reads, bounded
+
+
+def _named_commits(p: Project, entries: Any) -> list[str]:
+    """The commits a review's `push` value names, in whatever form it took (a list of entries, one
+    entry, a "branch at sha" string): each 40-hex hash that is a commit here, and each token that
+    is a local branch. Free text names none."""
+    words: list[str] = []
+
+    def walk(v: Any) -> None:
+        if isinstance(v, str):
+            words.extend(re.split(r"[\s,;]+", v))
+        elif isinstance(v, dict):
+            for x in v.values():
+                walk(x)
+        elif isinstance(v, list):
+            for x in v:
+                walk(x)
+    walk(entries)
+    out: list[str] = []
+    tries = 0
+    for w in dict.fromkeys(w.strip("`'\"()[]<>.:") for w in words):
+        if _HEX40.fullmatch(w.lower()):
+            ref = w.lower()
+        elif "/" in w and _REF_TOKEN.fullmatch(w) and ".." not in w:
+            ref = f"refs/heads/{w}"
+        else:
+            continue
+        if (tries := tries + 1) > NAMED_MAX:
+            break
+        if (sha := _commit(p, ref)) and sha not in out:
+            out.append(sha)
+    return out
+
+
+def _all_landed(p: Project, shas: list[str]) -> bool:
+    """Whether every commit in `shas` is on the push branch as its tracking ref has it (no fetch)."""
+    tgt = target(p)
+    tip = _commit(p, f"refs/remotes/{tgt[0]}/{tgt[1]}") if tgt else ""
+    return bool(tip) and all(_contains(p, [tip], s) for s in shas)
+
+
 def check_approval(p: Project, task: dict, entries: Any, cfg: dict | None = None) -> dict:
     """Validate a review's `push` list with fast local git: {"ignored": why} in a project that does
-    not push or, while the queue is off, for anything but a list of approvals; {"invalid": why} (also
-    for such a list while the queue is off: turned off while the review ran, it runs again and
-    pushes itself, as queue_off sends back approvals made before), or {"entries": [{"branch", "head"}], "target": "remote/branch", "added": {head:
+    not push or, while the queue is off, for a value naming no commit (_named_commits) or only
+    commits already on the push branch; {"invalid": why} (also for a value naming another commit, in
+    any form, while the queue is off: turned off while the review ran, it runs again and pushes
+    itself, as queue_off sends back approvals made before, so no approval is dropped), or {"entries": [{"branch", "head"}], "target": "remote/branch", "added": {head:
     [commit lines]}}. Each head is a full hash of a commit in the project root that the review
     reviewed (worktree.named_refs) or an ancestor of one, or a commit of a fix branch of the lineage
     (worktree.fix_branches: a re-plan that committed on its own branch, not the reviewed one) that
@@ -823,14 +867,21 @@ def check_approval(p: Project, task: dict, entries: Any, cfg: dict | None = None
     head with a commit that adds a conflict marker is invalid with its hits under "markers"
     (conflictfix.stray_markers)."""
     d = _delivery(p, cfg)
-    if d.get("push_queue") is not True:
-        if isinstance(entries, list) and entries and all(isinstance(e, dict) and e.get("head") for e in entries):
-            return {"invalid": "the push queue is off (delivery.push_queue): push with ttp push"}
-        return {"ignored": "the push queue is off (delivery.push_queue)"}
     if not push_allowed(d):
         return {"ignored": "this project does not allow pushing (delivery.push_allowed)"}
     if push.REVIEW_ONLY_LABEL in push._labels(task):
         return {"ignored": "this review is review only: its change must not reach the push branch"}
+    if d.get("push_queue") is not True:
+        # An approval in any form (a list, one entry, "branch at sha") is never dropped: the review
+        # runs again and pushes the head it approved itself. Free text naming no commit, or commits
+        # already on the push branch (a review that pushed itself), is ignored.
+        named = _named_commits(p, entries)
+        if named and not _all_landed(p, named):
+            return {"invalid": "the push queue is off (delivery.push_queue): push with ttp push "
+                               "(land the head you approved with `ttp push --detach`, then hand off "
+                               "without a push list)"}
+        return {"ignored": "the push queue is off (delivery.push_queue)"
+                           + ("; what it names is already on the push branch" if named else "")}
     tgt = target(p) if enabled(p, cfg) else None
     notes = []
     for t in push._reviewed(p, str(task["id"])):
