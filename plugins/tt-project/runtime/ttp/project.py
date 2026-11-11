@@ -324,7 +324,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
                     "wake_triage": True,
                     "wake_triage_max_s": 1800,
                     # Without a chat provider, Claude Haiku (low effort, no tools) decides instead.
-                    "wake_triage_fallback": False,
+                    "wake_triage_fallback": True,
                     # High events within this long after the turn high events woke (from its end) start
                     # no turn of their own: one follow-up turn reads them all when it ends. User
                     # messages, critical and safety-class events never wait (bursthold.py; 0: off).

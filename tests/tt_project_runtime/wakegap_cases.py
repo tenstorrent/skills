@@ -10,7 +10,7 @@ _WG_CHAT = {"endpoint": "placeholder", "base_url": "https://chat.example.invalid
 
 def _wg_setup(env, monkeypatch, busy=0, chat=False, haiku=False):
     """A turn that just ended, batch_s off, a free worker slot by default; `chat` turns the watcher on,
-    `haiku` the opt-in Haiku fallback (coordinator.wake_triage_fallback)."""
+    `haiku` sets the Haiku fallback (coordinator.wake_triage_fallback, on by default) explicitly."""
     from ttp import configwho
     p, d, clock, starts = _batch_setup(env, monkeypatch, busy=busy)
     p.set_config("coordinator.batch_s", 0)
@@ -161,15 +161,25 @@ def test_waketriage_haiku_wake_answer_wakes_and_the_fallback_switch_turns_it_off
     assert not waketriage.on(p.config())
 
 
-def test_waketriage_haiku_fallback_is_off_by_default_and_the_wake_comes_without_asking(env, monkeypatch):
-    from ttp import project, waketriage
+def test_waketriage_haiku_fallback_is_on_by_default_and_its_off_switch_wakes_without_asking(env, monkeypatch):
+    from ttp import configwho, project, waketriage
     calls = _wg_haiku(monkeypatch)
-    assert project.DEFAULT_CONFIG["coordinator"]["wake_triage_fallback"] is False
+    assert project.DEFAULT_CONFIG["coordinator"]["wake_triage_fallback"] is True
+    # On by default: with no config set, Haiku is asked and folds a routine event-only batch.
     p, d, clock, starts, _ = _wg_setup(env, monkeypatch)
-    assert not waketriage.fallback_on(d.cfg)
+    assert waketriage.fallback_on(d.cfg)
     clock[0] += 400   # past the wake gap
     _event(p, clock, "task_done")
-    assert _turn_within(d, clock, starts, 60) and not calls, "Haiku decided a wake nobody opted in to"
+    assert not _turn_within(d, clock, starts, 60) and len(calls) == 1
+    # Off-switch: coordinator.wake_triage_fallback false wakes without asking Haiku.
+    p, d, clock, starts, _ = _wg_setup(env, monkeypatch)
+    p.set_config("coordinator.wake_triage_fallback", False, by=configwho.by("user", via="cli"))
+    d.cfg = p.config()
+    assert not waketriage.fallback_on(d.cfg)
+    n = len(calls)
+    clock[0] += 400
+    _event(p, clock, "task_done")
+    assert _turn_within(d, clock, starts, 60) and len(calls) == n, "Haiku decided a wake after its off-switch"
 
 
 def test_waketriage_haiku_pending_holds_the_batch_but_never_past_max_s(env):

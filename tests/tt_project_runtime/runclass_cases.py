@@ -36,7 +36,7 @@ def test_run_classes_cover_every_kind_of_run():
     assert c({"kind": "code", "tier": "standard", "title": "x"}, {"note": '{"run_class": "bogus"}'}) == "hard"
 
 
-def test_routine_runs_take_sonnet_at_high_effort_once_opted_in_and_opus_keeps_hard_pinned_urgent_and_retried_work():
+def test_routine_runs_take_sonnet_at_high_effort_by_default_and_opus_keeps_hard_pinned_urgent_and_retried_work():
     from ttp import runclass
     c = runclass.classify
     for kind in ("work", "question", "harness"):
@@ -51,9 +51,10 @@ def test_routine_runs_take_sonnet_at_high_effort_once_opted_in_and_opus_keeps_ha
                                                                 "spec": "run it on the device (tt-smi reset)"}):
         assert c(t) == "hard", t
     t = {"kind": "harness", "tier": "standard", "title": "tidy", "labels": "[]"}
-    # Off by default: a routine run keeps its tier's model until route.core_cheap.routine is set.
-    assert runclass.core_cheap({}, t, "routine", "standard", "claude") is None
-    assert "routine" not in runclass.cheap_models({})
+    # On by default: an empty config already routes routine runs to Sonnet at high effort.
+    assert runclass.cheap_models({})["routine"] == {"model": "sonnet", "effort": "high"}
+    dflt = runclass.core_cheap({}, t, "routine", "standard", "claude")
+    assert (dflt["model"], dflt["effort"], dflt["class"]) == ("sonnet", "high", "routine")
     on = {"route": {"core_cheap": {"routine": True}}}
     own = runclass.core_cheap({"route": {"core_cheap": {"routine": {"model": "haiku", "effort": "low"}}}},
                               t, "routine", "standard", "claude")

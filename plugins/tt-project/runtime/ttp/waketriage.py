@@ -8,8 +8,9 @@ coordinator's effort tier never changes here. Any watcher error wakes and logs t
 Off with coordinator.wake_triage false.
 
 Without a chat provider (babysit.settings is None) the core provider's cheap model decides instead
-(cheapdecide.Haiku: Claude Haiku at low effort, no tools), once a project opts in with
-coordinator.wake_triage_fallback true (off by default) and Haiku is on (cheapdecide.settings). Its call runs in the background: while the answer
+(cheapdecide.Haiku: Claude Haiku at low effort, no tools), on by default while Haiku is on
+(cheapdecide.settings); off with coordinator.wake_triage_fallback false. It only decides whether the
+coordinator wakes now; it never answers in the coordinator's place. Its call runs in the background: while the answer
 is on its way the batch waits (never past wake_triage_max_s), and a later tick reads it. Its cost is
 booked by Haiku's own path under purpose wake_decision. The same exclusions hold for both: the daemon
 asks only for an event-only batch (no user message) that may wait (eventhold.can_wait: no high or
@@ -44,7 +45,7 @@ ASK = {"wake": {"type": "noul", "instructions": QUESTION + " Answer yes to wake 
 def fallback_on(cfg: dict) -> bool:
     """Whether Haiku decides because there is no chat provider."""
     return babysit.settings(cfg) is None and \
-        (cfg.get("coordinator") or {}).get("wake_triage_fallback") is True and \
+        (cfg.get("coordinator") or {}).get("wake_triage_fallback", True) is not False and \
         cheapdecide.settings(cfg) is not None
 
 
