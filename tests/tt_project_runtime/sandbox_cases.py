@@ -516,6 +516,28 @@ def _pid_ended(pid: int) -> bool:
         return True
 
 
+def _wait_ended(pid: int, cap_s: float = 60.0) -> bool:
+    """Wait for process `pid` to end, on the kernel's word: its pidfd turns readable as it exits (a zombie
+    too), so no poll interval or load decides it; `cap_s` only bounds a hang. Without pidfds (not Linux)
+    it polls _pid_ended up to `cap_s`."""
+    import select
+    try:
+        fd = os.pidfd_open(pid)
+    except ProcessLookupError:
+        return True
+    except (AttributeError, OSError):   # no pidfds here
+        deadline = time.monotonic() + cap_s
+        while not _pid_ended(pid):
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.05)
+        return True
+    try:
+        return bool(select.select([fd], [], [], cap_s)[0])
+    finally:
+        os.close(fd)
+
+
 def _kill_left(pid: int) -> None:
     try:
         os.kill(pid, signal.SIGKILL)
@@ -535,11 +557,7 @@ def test_a_check_run_without_a_sandbox_ends_the_processes_it_left_behind(tmp_pat
             f"sleep 300 </dev/null >/dev/null 2>&1 &\necho $! > {pidfile}\nexit {rc}\n")
         assert push._run_one("bash check.sh", tmp_path, dict(env), lambda m: None) == want
         pid = int(pidfile.read_text())
-        for _ in range(100):
-            if _pid_ended(pid):
-                break
-            time.sleep(0.05)
-        else:
+        if not _wait_ended(pid):
             _kill_left(pid)
             pytest.fail(f"the check's leftover process {pid} outlived it (exit {rc})")
 
@@ -559,27 +577,29 @@ def test_checkgroup_started_outside_a_group_of_its_own_kills_only_what_it_starte
 
 def test_a_check_whose_push_is_killed_outright_ends_with_it(tmp_path):
     """A check runs in a group of its own, so a SIGKILL of its push (or of the push's group) does not
-    reach it: its group leader (checkgroup) sees the push gone and kills the check's whole group."""
+    reach it: its group leader (checkgroup) sees the push gone and kills the check's whole group. The
+    test waits on events, not on time: the check's leftover pid comes through a pipe and its end
+    through a pidfd (_wait_ended); their caps only bound a hang."""
+    import select
     from ttp import push
-    pidfile = tmp_path / "left.pid"
-    check = f"sleep 300 </dev/null >/dev/null 2>&1 & echo $! > {pidfile}; sleep 300"
+    r, w = os.pipe()
+    check = f"sleep 300 </dev/null >/dev/null 2>&1 & echo $! >&{w}; sleep 300"
     start = ("import os, subprocess, sys, time\n"   # the push: its check in a session of its own, as _run_one
+             "w = int(sys.argv[5])\n"
              "subprocess.Popen([*sys.argv[1:4], str(os.getpid()), '--', 'bash', '-c', sys.argv[4]],"
-             " start_new_session=True)\ntime.sleep(300)\n")
-    pusher = subprocess.Popen([sys.executable, "-c", start, *push.CHECK_GROUP, check], start_new_session=True)
+             " start_new_session=True, pass_fds=(w,))\nos.close(w)\ntime.sleep(300)\n")
+    pusher = subprocess.Popen([sys.executable, "-c", start, *push.CHECK_GROUP, check, str(w)],
+                              start_new_session=True, pass_fds=(w,))
+    os.close(w)
     try:
-        deadline = time.time() + 30
-        while not (pidfile.exists() and pidfile.read_text().strip()) and time.time() < deadline:
-            time.sleep(0.05)
-        left = int(pidfile.read_text())
+        with os.fdopen(r) as out:
+            assert select.select([out], [], [], 120)[0], "the check did not start"
+            line = out.readline().strip()
+        assert line.isdigit(), f"the check did not start: {line!r} (push exit {pusher.poll()})"
+        left = int(line)
         os.killpg(pusher.pid, signal.SIGKILL)   # the push's group: the check's own group is not in it
         pusher.wait()
-        deadline = time.time() + 15
-        while time.time() < deadline:
-            if _pid_ended(left):
-                break
-            time.sleep(0.1)
-        else:
+        if not _wait_ended(left):
             _kill_left(left)
             pytest.fail(f"the check's process {left} outlived its killed push")
     finally:
