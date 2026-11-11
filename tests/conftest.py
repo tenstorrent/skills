@@ -32,6 +32,12 @@ full-suite run (MIN_ITEMS or more tt-project tests) also prints its SLOWEST slow
 that line (`ttp-suite: slowest 15 test calls:`, then `ttp-suite:   61.20s <test id>` each), so slow or
 wall-clock-bound tests can be ranked from any run's log.
 
+A forked run hands its workers the slowest tests first (_order), by the durations earlier runs on this
+host measured (DURATIONS, a per-user file in the temp folder; TTP_TEST_DURATIONS names another, `off`: none,
+as for every suite a test starts), so one
+long test never starts last and holds the run's end; tests it has no time for run in their usual order
+after the known slow ones. Every run of MIN_ITEMS or more tt-project tests updates that file.
+
 A tt-project test still running after STACK_DUMP_S has every thread's stack dumped to the session's
 stderr (Python's faulthandler, as pytest's faulthandler_timeout does, scoped to tests/test_tt_project_*.py:
 other plugins' tests are untouched). It only dumps and kills nothing. The default sits far above the
@@ -65,7 +71,8 @@ import pytest
 MIN_ITEMS = 50
 SLOWEST = 15           # the slowest test calls a full-suite run lists
 MAX_AUTO_JOBS = 8      # on CI
-MAX_LOCAL_JOBS = 4     # anywhere else: half the CPUs, at most this
+MAX_LOCAL_JOBS = 4     # anywhere else: half the CPUs, at most this, and never more than the free CPUs
+UNKNOWN_S = 1.0        # the duration _order assumes for a test no earlier run timed
 WORKER_NICE = 10
 FD_LOST_EXIT = 97      # a worker's own exit when a test closed or replaced one of its pipe fds
 _SHARDED = "test_tt_project_"
@@ -184,7 +191,7 @@ HOME_WATCHED = (".bash_profile", ".bash_login", ".bashrc", ".profile", ".zprofil
                 ".mcp.json", ".ripgreprc", ".idea", ".vscode", ".claude/settings.json",
                 ".claude/settings.local.json", ".claude/CLAUDE.md", ".claude/skills", ".claude/agents",
                 ".claude/commands", ".claude/hooks", ".codex/config.toml", ".config/systemd/user",
-                "Library/LaunchAgents", ".local/bin/ttp")
+                ".local/share/systemd/user", "Library/LaunchAgents", ".local/bin/ttp")
 # The credential stores and the ssh and gh folders the session's credential guards watch: the write
 # recorder records the session's writes there too (and the providers' login files, _WriteRecorder.watch).
 GUARDED = (".ssh", ".config/gh", ".git-credentials", ".netrc")
@@ -729,25 +736,31 @@ def _jobs(config, items) -> int:
         cpus = len(os.sched_getaffinity(0))
     except AttributeError:
         cpus = os.cpu_count() or 1
-    return _auto_jobs(cpus, os.environ)
+    try:
+        load = os.getloadavg()[0]
+    except (AttributeError, OSError):
+        load = None
+    return _auto_jobs(cpus, os.environ, load)
 
 
 def _on_ci(env) -> bool:
     return env.get("CI", "").strip().lower() not in ("", "0", "false", "no")
 
 
-def _auto_jobs(cpus: int, env) -> int:
+def _auto_jobs(cpus: int, env, load: float | None = None) -> int:
     """The default worker count: one per CPU up to MAX_AUTO_JOBS on CI, else half the CPUs up to
-    MAX_LOCAL_JOBS, so a run on a laptop or a shared host leaves room for everything else; never more
-    than the host-wide test slots tt-project granted the run (TTP_TEST_SLOTS). A run that holds its grant
-    (TTP_TEST_SLOTS_HELD: `ttp checks`) uses all of it, so a granted slot never sits idle."""
+    MAX_LOCAL_JOBS and no more than the CPUs the 1-minute `load` leaves free, so a run on a laptop or a
+    shared host leaves room for everything else; never more than the host-wide test slots tt-project
+    granted the run (TTP_TEST_SLOTS). A run that holds its grant (TTP_TEST_SLOTS_HELD: `ttp checks`, whose
+    grant is already sized to the host's free cores) uses all of it, so a granted slot never sits idle."""
     slots = env.get("TTP_TEST_SLOTS", "").strip()
     cap = int(slots) if slots.isdigit() and int(slots) > 0 else cpus
     if env.get("TTP_TEST_SLOTS_HELD", "").strip().isdigit() and slots.isdigit() and int(slots) > 0:
         return max(1, min(cpus, cap))
     if _on_ci(env):
         return max(1, min(MAX_AUTO_JOBS, cpus, cap))
-    return max(1, min(MAX_LOCAL_JOBS, cpus // 2, cap))
+    free = cpus - int(load + 0.5) if load is not None else cpus
+    return max(1, min(MAX_LOCAL_JOBS, cpus // 2, cap, free))
 
 
 def _suite_line(wall: float, cpu: float, workers: int) -> str:
@@ -860,8 +873,10 @@ def pytest_terminal_summary(terminalreporter, config):
                                                      resource.getrusage(resource.RUSAGE_CHILDREN)))
     except ImportError:   # no resource module (Windows): this process's own CPU time only
         cpu = time.process_time()
-    for line in _slowest_lines([r for reps in terminalreporter.stats.values() for r in reps]):
+    reports = [r for reps in terminalreporter.stats.values() for r in reps]
+    for line in _slowest_lines(reports):
         terminalreporter.write_line(line)
+    _save_durations(reports)
     terminalreporter.write_line(_suite_line(time.monotonic() - started, cpu, getattr(config, "_ttp_workers", 1)))
 
 
@@ -1041,7 +1056,7 @@ def pytest_sessionstart(session):
         session.config._ttp_outside = _outside_snapshot(session.config)
         creds = session.config._ttp_creds = credential_marks()
         session.config._ttp_secret = folder_marks(secret_folders())
-        session.config._ttp_host = _HOSTSTATE.Guard() if _HOSTSTATE else None
+        session.config._ttp_host = _HOSTSTATE.Guard(tokens=_basetemp(session.config)) if _HOSTSTATE else None
         recorder = getattr(sys.modules.get("_ttp_suite_writes"), "recorder", None)
         if recorder:   # the providers' login files and gh's folder, wherever the account's env puts them
             recorder.watch(list((creds or {}).get("kinds") or ()) + secret_folders())
@@ -1064,7 +1079,16 @@ def host_state_lines(guard) -> tuple[bool, list[str]]:
     if guard is None:
         return False, []
     _HOSTSTATE.record = _ledger_record
-    return guard.end()
+    # The session's own writes under the real unit folder prove a unit is its leak (a whole-home record does not)
+    return guard.end(recorded_writes(_WRITE_LOG) if _WRITE_LOG and os.path.exists(_WRITE_LOG) else None)
+
+
+def _basetemp(config) -> tuple[str, ...]:
+    """The session's temp folder: a unit or crontab line naming it is the session's own leak."""
+    try:
+        return (str(config._tmp_path_factory.getbasetemp()),)
+    except Exception:
+        return ()
 
 
 def pytest_sessionfinish(session, exitstatus):
@@ -1132,6 +1156,53 @@ def _units(items) -> list[list]:
     """Each tt-project test is a unit of its own; every other test goes in one unit, kept in order."""
     rest = [i for i in items if not i.path.name.startswith(_SHARDED)]
     return ([rest] if rest else []) + [[i] for i in items if i.path.name.startswith(_SHARDED)]
+
+
+DURATIONS = Path(os.environ.get("TTP_TEST_DURATIONS") or
+                 Path(os.environ.get("TMPDIR") or "/tmp") / f"ttp-test-durations-{getattr(os, 'getuid', lambda: 0)()}.json")
+DURATIONS_KEEP = 50000
+os.environ["TTP_TEST_DURATIONS"] = "off"   # a suite a test starts keeps its own order and saves nothing
+
+
+def _durations(path: Path | None = None) -> dict[str, float]:
+    """Each test id's last measured seconds (setup, call and teardown) on this host; {} when none."""
+    if str(path or DURATIONS) == "off":
+        return {}
+    try:
+        got = json.loads(Path(path or DURATIONS).read_text())
+    except (OSError, ValueError):
+        return {}
+    return {k: float(v) for k, v in got.items() if isinstance(v, (int, float))} if isinstance(got, dict) else {}
+
+
+def _save_durations(reports, path: Path | None = None) -> None:
+    """Merge a full run's measured test times into DURATIONS (atomic; a failed write only loses them)."""
+    took: dict[str, float] = {}
+    for r in reports:
+        if isinstance(getattr(r, "duration", None), float) and getattr(r, "when", None) in ("setup", "call", "teardown"):
+            took[r.nodeid] = took.get(r.nodeid, 0.0) + r.duration
+    if str(path or DURATIONS) == "off" or \
+            sum(1 for k in took if Path(k.split("::", 1)[0]).name.startswith(_SHARDED)) < MIN_ITEMS:
+        return
+    path = Path(path or DURATIONS)
+    merged = {**_durations(path), **{k: round(v, 2) for k, v in took.items()}}
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    try:
+        tmp.write_text(json.dumps(dict(list(merged.items())[-DURATIONS_KEEP:])))
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+
+def _order(units, durations: dict[str, float]) -> list[int]:
+    """The units' indexes, slowest first by `durations`; untimed tests count UNKNOWN_S, ties keep order."""
+    if not durations:
+        return list(range(len(units)))
+    cost = [sum(durations.get(i.nodeid, UNKNOWN_S) for i in u) for u in units]
+    return sorted(range(len(units)), key=lambda n: -cost[n])
 
 
 @pytest.hookimpl(tryfirst=True)
@@ -1276,7 +1347,7 @@ def _run_forked(session, units, jobs: int) -> None:
     if factory is not None:
         factory.getbasetemp()   # made once here; each worker takes its own folder in it
     work_r, work_w = os.pipe()
-    os.write(work_w, b"".join(struct.pack("!I", n) for n in range(len(units))))
+    os.write(work_w, b"".join(struct.pack("!I", n) for n in _order(units, _durations())))
     os.close(work_w)
     sys.stdout.flush()
     sys.stderr.flush()

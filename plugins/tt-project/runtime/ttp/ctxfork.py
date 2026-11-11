@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 import uuid
 
@@ -172,6 +173,67 @@ def forked(note: dict | None) -> bool:
     return isinstance(got, dict) and (got.get("how") == "fork" or (got.get("how") == "resume" and "run" in got))
 
 
+# The coordinator-only rules no worker or reviewer runs under (template/prompts/coordinator-session.md
+# and coordinator.md; a test keeps them in step): its tool rules and its answer format. A fork that
+# would carry one in its system or developer instructions takes the disk block instead (own_role).
+COORD_TOOL_RULES = ("This session has no tools", "This session has read-only tools")
+COORD_ANSWER_RULE = 'Return ONLY the JSON object `{"actions"'
+_MISS = re.compile(r"\b(?:i|this (?:run|session|worker)) (?:have|has|had|ran with) no tools\b|"
+                   r"coordinator[- ]only (?:role|rules?|(?:developer )?instructions)", re.I)
+
+
+def coord_only(texts, answer: bool = True) -> str:
+    """The coordinator-only rule one of `texts` (a launch's system prompt, a session's developer
+    messages) carries, quoted; "" when none. `answer`: its answer format counts too."""
+    for t in texts:
+        for rule in COORD_TOOL_RULES + ((COORD_ANSWER_RULE,) if answer else ()):
+            if rule in str(t or ""):
+                return rule
+    return ""
+
+
+def own_role(prov, got: dict, cwd: str, env: dict | None, system: str | None) -> str:
+    """Why a worker or reviewer starting from a copied session (`got`, prepare) would run under the
+    coordinator's role, model-free before it starts: the run's own system prompt replaces the
+    session's where the agent keeps it (Codex, own_instructions), then neither that prompt nor the
+    session's developer messages may carry a coordinator-only rule. "" when the run's role is its own."""
+    if not got.get("session"):
+        return ""
+    if system is not None:
+        prov.own_instructions(got["session"], cwd, env, system)   # its gap leads the prompt (daemon)
+    rule = coord_only([system]) or coord_only(prov.session_instructions(got["session"], cwd, env))
+    return f'its instructions would carry the coordinator-only rule "{rule}"' if rule else ""
+
+
+def role_miss(final_text: str, handoff: dict | None) -> str:
+    """Why a worker or reviewer run's end shows it ran under the coordinator's role and did no work
+    ("" when it does not): no hand-off and a final answer in the coordinator's {"actions"} format, or
+    a hand-off short of done that says it had no tools or the coordinator-only instructions. Its task's
+    next start takes neither a fork nor a resume (prepare), and a run that had neither is not retried
+    the same way (daemon._finish_worker)."""
+    if isinstance(handoff, dict) and handoff.get("status"):
+        if handoff["status"] == "done":
+            return ""
+        text = " ".join(str(handoff.get(k) or "") for k in ("summary", "question", "waiting_for"))
+        found = coord_only([text], answer=False) or ((m := _MISS.search(text)) and m.group(0))
+        return f'its hand-off says it ran under the coordinator\'s role ("{found}")' if found else ""
+    from .providers.base import last_json_object
+    out = last_json_object(final_text or "")
+    if isinstance(out, dict) and "actions" in out:
+        return "it answered with the coordinator's {\"actions\"} object and wrote no hand-off"
+    return ""
+
+
+def _role_missed(p, task: int | None) -> str:
+    """Why the task's last worker or reviewer run says copying a session into it gives the coordinator's
+    role ("" when it does not, role_miss)."""
+    if task is None:
+        return ""
+    r = p.db.one("SELECT id, note FROM runs WHERE task=? AND role!='coordinator' ORDER BY id DESC LIMIT 1", (task,))
+    miss = json.loads((r or {}).get("note") or "{}").get("role_miss") if r else ""
+    return f"run {r['id']} ran under the coordinator's role: {miss}"[:300] if miss else ""
+
+
 def prepare(p, cfg: dict, prov, provider: str, cwd: str, env: dict | None, now: float | None = None,
             task: int | None = None, model: str | None = None) -> dict:
     """What a new worker or reviewer run starts with: {"how", "why", "session" (a fork: the run's own
@@ -185,7 +247,9 @@ def prepare(p, cfg: dict, prov, provider: str, cwd: str, env: dict | None, now: 
         return {"how": "none", "why": "coordinator.session.worker_context off", "lead": ""}
     why = "coordinator.session.worker_context disk"
     gap = ""
-    if m == "fork":
+    if m == "fork" and (missed := _role_missed(p, task)):
+        why = f"no fork or resume: {missed}"[:400]   # a copy again would repeat it
+    elif m == "fork":
         try:
             src = follow_source(p, task)
             gap = _resume_gap(src, prov, provider) or _cross_model(src, model) or _fork_rejected(p, task, "resume") \
@@ -212,7 +276,12 @@ def prepare(p, cfg: dict, prov, provider: str, cwd: str, env: dict | None, now: 
                             "lead": fork_lead(), "tokens": int(coordsession._num(st.get("context_tokens"), 0))}
         except Exception as e:   # the disk block is always safe
             why = f"fork failed: {type(e).__name__}: {e}"[:200]
-    why = f"no resume: {gap}; {why}"[:400] if gap else why
+    return on_disk(p, cfg, f"no resume: {gap}; {why}" if gap else why, now)
+
+
+def on_disk(p, cfg: dict, why: str, now: float | None = None) -> dict:
+    """prepare's answer for a run that starts from the coordinator's context on disk, saying `why`."""
+    why = why[:400]
     try:
         return {"how": "disk", "why": why, "lead": disk_block(p, cfg, now)}
     except Exception as e:

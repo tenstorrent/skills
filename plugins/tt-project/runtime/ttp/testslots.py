@@ -45,8 +45,12 @@ of the host's line, so it never holds up other projects, but keeps its ticket in
 (the "<own>.<project id>" queue): it re-enters the host's line at its first arrival, and a later
 arrival of the same project waits until every earlier one is back in the host's line, so a freed slot
 goes to the project's earliest waiter, never to whichever polls first. Checks gating
-a push to the push branch (`push_key`) never wait behind task checks or run short: with fewer than one
-run's grant free in the pool or their project's budget, they take that branch's reserved lane beyond
+a push to the push branch (`push_key`), and urgent runs on a reserved urgent slot (checkcap.urgent_key), never
+wait behind task checks: they take the pool's free slots (up to one run's grant) past the host's line and
+their project's budget, and while none is free they hold the line's first place (an owed run's priority), so
+the slots that free next are theirs. They draw on the pool: while it is busy they may run with fewer workers.
+With checks.priority_beyond_cap true (checkcap.priority_beyond_cap) they instead never run short: with fewer
+than one run's grant free in the pool or their project's budget, they take that branch's reserved lane beyond
 both (RESERVED), which makes up one run's grant, holds for one push check of the branch at a time and
 which task checks never use. While any other run waits for test slots (others_wait: a checks run parked
 for them, or a waiter in the host's or its project's line) they run on that lane alone and take none of
@@ -739,8 +743,9 @@ def acquire(holder: str, tell: Callable[[str], None] | None = None, wait_s: floa
     (load_guard), except one run per load pass at a time (load_pass_paths: a priority-0 run's, an urgent or
     push run's, the floor's; it holds the pass with its grant): it waits, telling why and passing the reason
     to `waits` (its lanes' wait note, lane_waits), and `waits` gets "host test slots" again once the load drops. A push check's wait there is bounded
-    (push_load_wait_s): past it, it starts on its branch's reserved lane alone. `most`: a run's most slots
-    below run_max (a worker's own pytest -n N, direct)."""
+    (push_load_wait_s): past it, it starts on its branch's reserved lane alone (with checks.priority_beyond_cap
+    off: on the pool's free slots, past the guard). `most`: a run's most slots below run_max (a worker's own
+    pytest -n N, direct)."""
     tell = tell or (lambda _line: None)
     what = f"{kind.name} slots"
     for env in (kind.held_env, HELD_ENV):   # HELD_ENV: a build in a check builds on the check's slots
@@ -751,6 +756,8 @@ def acquire(holder: str, tell: Callable[[str], None] | None = None, wait_s: floa
     start, told, ticket, mine, guard = time.time(), 0.0, None, None, None
     arrival = start if since is None else since
     guarded, passed = "", (_RESERVED.__dict__.pop("grant", None) if kind is TESTS else None)
+    # Push and urgent checks draw on the pool (no reserved lane beyond it) unless checks.priority_beyond_cap.
+    in_pool = bool(push_key) and kind is TESTS and not checkcap.priority_beyond_cap()
     if passed is not None and (load := load_guard()):   # taken at its gate (reserve_load_pass)
         tell(_pass_told(what, passed, load))
     try:
@@ -763,8 +770,10 @@ def acquire(holder: str, tell: Callable[[str], None] | None = None, wait_s: floa
                                              "load-guard pass",
                                              extra={"priority": priority} if priority is not None else None)):
                     tell(_pass_told(what, passed, load))
-            if kind is TESTS and passed is None and (load := load_guard()):
-                if push_key and (bound := push_load_wait_s(cfg)) is not None and time.time() - start >= bound \
+            if kind is TESTS and passed is None and (load := load_guard()) and not (
+                    in_pool and (bound := push_load_wait_s(cfg)) is not None and time.time() - start >= bound):
+                if push_key and not in_pool and (bound := push_load_wait_s(cfg)) is not None \
+                        and time.time() - start >= bound \
                         and (f := locks.try_take([reserved_path(push_key)], holder, "push test slots",
                                                  extra={"priority": priority} if priority is not None else None)):
                     # Past the bound a push check starts anyway, on its branch's reserved lane alone (one
@@ -808,7 +817,8 @@ def acquire(holder: str, tell: Callable[[str], None] | None = None, wait_s: floa
                 room, sized = live, f", sized to the host's free cores (at least {WORKERS_FLOOR})"
             else:
                 sized = ""
-            ps, own = paths(pool, kind), own_paths(name, project_max(cfg, (pool, s[1]), kind, name), kind)
+            ps, own = paths(pool, kind), ([] if in_pool else
+                                          own_paths(name, project_max(cfg, (pool, s[1]), kind, name), kind))
             own_free = _own_free(name, own, kind) if own else 0
             if own:   # a project's test-worker ceiling (project_workers) also bounds one run's grant
                 top, room = min(top, len(own)), min(room, len(own))
@@ -856,6 +866,14 @@ def acquire(holder: str, tell: Callable[[str], None] | None = None, wait_s: floa
                     # An earlier waiter of its project goes back into the host's line first.
                     locks.dequeue(ticket)
                     ticket, why = None, f"{len(ahead)} earlier waiter(s) of its project go first"
+                elif in_pool:
+                    # From the pool, ahead of the host's line: while none is free it holds the line's first
+                    # place (an owed run's priority), so the slots that free next are its.
+                    k, files = _take(ps, own, room, holder, what, extra)
+                    if not k and ticket is None:
+                        ticket = locks.enqueue(checkcap.slot_dir(), kind.resource, holder, arrival, group=name,
+                                               priority=checkcap.OBLIGATION_PRIORITY)
+                    why = f"all {pool} are held; first in the host's line as push or urgent checks"
                 elif push_key and kind is TESTS and others_wait(name) and \
                         (f := locks.try_take([reserved_path(push_key)], holder, "push test slots", extra=extra)):
                     # Others wait for the slots it would take: its branch's reserved lane alone (one run's grant).
@@ -1283,7 +1301,7 @@ def pool_gate(cfg: dict | None, project_name: str | None, full: bool = False, pr
     used = _held(paths(max(s[0], checkcap.cores())))
     pool = pool_now(cfg, s[0], used)
     if used >= pool:
-        return f"the host's test pool is full: {used} of {pool} held"
+        return f"the host's test pool is full: {used} of {pool} held (limit checks.test_pool)"
     if (q := locks.queued(checkcap.slot_dir(), TESTS.resource)):
         return f"{len(q)} waiter(s) ahead in the host's test-slot line"
     own = own_paths(project_name, project_max(cfg, (pool, s[1]), project_name=project_name))
@@ -1298,12 +1316,14 @@ def pool_gate(cfg: dict | None, project_name: str | None, full: bool = False, pr
         own_free = _free(urgent)
     if own and own_free < need:
         return (f"{BUDGET_GATE}{own_free} of {len(own)} free, a run needs {need}"
-                f" (held by {checkcap._some(list(dict.fromkeys(locks.held_labels(own))))})")
+                f" (held by {checkcap._some(list(dict.fromkeys(locks.held_labels(own))))};"
+                f" limits checks.test_project_slots, checks.test_run_min)")
     kept = need * urgent_parked(project_name, priority, since, budget=project_max(cfg, (pool, s[1])), need=need,
                                  run_max=s[1], room=pool - used)
     if min(s[1], pool - used - kept) < need:
         return (f"the host's test pool: {pool - used} of {pool} free, a run needs {need}"
-                + (f", {kept} kept for {kept // need} urgent run(s) of other projects parked ahead" if kept else ""))
+                + (f", {kept} kept for {kept // need} urgent run(s) of other projects parked ahead" if kept else "")
+                + " (limits checks.test_pool, checks.test_run_min)")
     room = min(own_free if own else pool, pool - used - kept)
     if (n := own_urgent_parked(project_name, priority, room // need)) and room - need * n < need:
         return f"{room} test slot(s) free, a run needs {need}, {need * n} {OWN_RESERVE} ({n})"
@@ -2187,6 +2207,34 @@ def priority_args(cfg: dict | None = None) -> tuple[list, list] | None:
     if _section(cfg, "checks").get("nice") is False or acct.get("nice") is False:
         return None
     return ["nice", "-n", str(nice_level(cfg))], ["ionice", *ionice_args(cfg)]
+
+
+def _ionice_name(words: list) -> str:
+    """'idle', 'best-effort N' or 'best-effort' for ionice argv words (ionice_args), else the words."""
+    w = [str(x) for x in words]
+    if w == ["-c3"]:
+        return "idle"
+    if w[:1] == ["-c2"]:
+        return "best-effort" + (f" {w[2]}" if len(w) > 2 else "")
+    return " ".join(w)
+
+
+def priority_line(cfg: dict | None = None, where: str = "", which=shutil.which) -> str:
+    """The one line a checks run logs about its priority (low_priority, remotecheck._priority): the nice
+    level and ionice class its commands run at, each with its setting, so the slowdown is never silent.
+    `where` names a remote host (which then applies them where it has them); without it, a tool this
+    machine lacks is said to be skipped."""
+    prio = priority_args(cfg)
+    if prio is None:
+        return "check commands run at normal priority (checks.nice false)"
+    nice, ionice = prio
+    parts = [f"nice {nice[-1]} (checks.nice)", f"ionice class {_ionice_name(ionice[1:])} (checks.ionice)"]
+    if not where:
+        parts = [part + ("" if which(tool) else ", skipped: not on this machine")
+                 for part, tool in zip(parts, ("nice", "ionice"))]
+    return (f"check commands run at low priority{f' on {where}' if where else ''}, behind the host's other "
+            f"processes: {'; '.join(parts)}{'; each where the host has it' if where else ''}; "
+            "checks.nice false runs them at normal priority")
 
 
 def low_priority(argv: list) -> list:

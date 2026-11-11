@@ -305,6 +305,24 @@ def test_claim_expect_probe_miss_raises_claim_failed_once(env, monkeypatch):
     assert ob.get(p.db, n2[0].split()[1])["receipt"]
 
 
+def test_a_claim_probe_whose_host_did_not_answer_is_unchecked_and_retried(env, monkeypatch):
+    """Upstream note b8cfa86d5ff92f74: a claim probe that exits 255 (ssh could not reach its host, as
+    while it reboots) is "could not check", never "does not hold": no claim_failed even past
+    CLAIM_WAIT_S, the ledger says it is unchecked, due_claims keeps running it, and a later 0 holds."""
+    from ttp import obligations as ob
+    p, d, now, tid, check, mid, raised = _order_setup(env, monkeypatch)
+    out = p.db.post("out", "it is up", chat="c1", kind="reply")
+    notes = ob.record_claims(p, [(out, "c1", [{"text": "the box is up", "expect": "ssh box true"}])], {}, now=now)
+    oid = notes[0].split()[1]
+    late = now + ob.CLAIM_WAIT_S + 100
+    assert ob.claim_result(p, oid, 255, now + 10) == [] and ob.claim_result(p, oid, 255, late) == []
+    assert raised((ob.CLAIM_KIND,)) == []
+    assert [c[0] for c in ob.due_claims(p.db, late)] == [oid], "retried on the next pass"
+    assert any(oid in ln and "unchecked" in ln and "255" in ln for ln in ob.lines(p.db, late))
+    ob.claim_result(p, oid, 0, late + 60)
+    assert ob.get(p.db, oid)["receipt"] and raised((ob.CLAIM_KIND,)) == []
+
+
 def test_a_claim_never_takes_another_callers_earlier_probe_answer_and_its_own_run_decides(env, monkeypatch):
     """Another caller ran the claim's probe string shortly before its due and got 1 (cached for
     STALL_PROBE_KEEP_S): check_claims runs its own probe under its own key and fails nothing on that
@@ -639,3 +657,55 @@ def test_order_stuck_behind_a_landing_nothing_can_make_raises_one_must_act_per_e
     assert len(ev) == 2 and f"review #{rv2} failed" in ev[1]["text"]
     check(now + 500 + deadwait.GRACE_S + 120)
     assert len(raised(kind)) == 2
+
+
+# A reported reply (upstream note 22debba2bfa9e948), the authored prose verbatim with a generic host and the
+# harness's appended status footer verbatim with generic task ids: only the footer names times.
+_AUTHORED = ("I’m returning the missing check-configuration repair and validation to the existing integration "
+             "owner, then requeuing its reviewer. This replaces my reviewer-only plan; the earlier 18:08 PST "
+             "review estimate is withdrawn. Consolidation and sustained streaming remain owed, without a "
+             "supported completion date. Planned, not started on the host yet: I’m also assigning the "
+             "encoder-only PR repair to box-a’s verified existing runtime under your fastest-route instruction.")
+_FOOTER = ("\nStatus now: #{a}: queued for a worker, ETA: no estimate yet (#{a} waits on outside work: no measured "
+           "finish yet); #{b}: queued for a worker, ETA 17:26 PST to start, finish 18:27 PST (critical path #{b}); "
+           "#{c}: queued for a worker, ETA 17:31 PST to start, finish 17:35 PST (critical path #{c}→#{b})")
+
+
+def _footer_reply(p, now, text, tasks):
+    from ttp import obligations as ob
+    mid = p.db.x("INSERT INTO messages(ts,direction,kind,text,handled) VALUES(?,?,?,?,?)", (now, "out", "reply", text, 1))
+    return ob.record_promises(p, [(mid, "c1", text)], tasks, now=now), ob.open_promises(p.db)
+
+
+def test_promise_never_comes_from_the_harness_status_footer(env):
+    """A reply whose only times are in the appended 'Status now:' footer records no promise, owned or not;
+    the same footer after the sender's own timed commitment still records that one, from its words only."""
+    import time
+    p = make(env)
+    now = time.time()
+    ids = [p.db.add_task(f"leg {i}", "s", kind="work", reply_chat="c1") for i in range(3)]
+    footer = _FOOTER.format(a=ids[0], b=ids[1], c=ids[2])
+    notes, open_ = _footer_reply(p, now, _AUTHORED + footer, {})
+    assert notes == [] and open_ == [], (notes, open_)
+    notes, open_ = _footer_reply(p, now, _AUTHORED + footer, {i: "c1" for i in ids})
+    assert notes == [] and open_ == [], (notes, open_)
+    own = f"I'll post the merged table here by 16:00 PST once #{ids[1]} finishes."
+    notes, (o,) = _footer_reply(p, now, own + footer, {})
+    assert "Status now" not in o["text"] and "16:00" in o["text"], o["text"]
+    assert o["promise"]["tasks"] == [ids[1]], o["promise"]
+
+
+def test_promise_is_owned_by_the_batch_task_its_words_name_never_a_cancelled_one(env):
+    """Of the batch's tasks replying to the promise's chat, the ones its own words name (#id) own it; with
+    none named, all of them but a cancelled one do."""
+    import time
+    p = make(env)
+    now = time.time()
+    a, b, gone = (p.db.add_task(f"leg {i}", "s", kind="work", reply_chat="c1") for i in range(3))
+    p.db.update_task(gone, status="cancelled")
+    batch = {a: "c1", b: "c1", gone: "c1"}
+    _, (o,) = _footer_reply(p, now, f"I'll post #{b}'s table here by 16:00 PST.", batch)
+    assert o["promise"]["tasks"] == [b], o["promise"]
+    _, open_ = _footer_reply(p, now, "I'll report the soak result here by 17:00 PST.", batch)
+    (o2,) = [x for x in open_ if "soak" in x["text"]]
+    assert o2["promise"]["tasks"] == [a, b], o2["promise"]

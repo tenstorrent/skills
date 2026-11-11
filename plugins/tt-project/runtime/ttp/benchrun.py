@@ -239,7 +239,7 @@ def audit(transcript: str, task: dict, hidden: list[Path], secret: dict | None =
         out.append("names the landed commit")
     out += sorted({f"runs {m.group(0)!r}" for m in CHEAT.finditer(transcript)})
     if (long := sum(len(x) >= bench.QUOTE_LEN for xs in (secret or {}).values() for x in set(xs))) and \
-            (n := bench.quotes(_strings(transcript) + "\n" + diff, {"x": [x for xs in secret.values() for x in xs]})) \
+            (n := bench.quotes(_strings(transcript) + "\n" + diff, [x for xs in secret.values() for x in xs])) \
             >= min(bench.QUOTE_LINES, long):
         out.append(f"shows {n} line(s) only the held-out tests have")
     return out

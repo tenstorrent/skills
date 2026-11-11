@@ -10,17 +10,21 @@ tests with one of those ids (as pytest's node id or relative to the current dire
 prints them; set but empty: none), so a same-named test in another file never runs.
 TTP_PYTEST_SELECT_FILES, one entry per line (testpick, a task's targeted `ttp checks`), keeps only the
 tests matching an entry: a path keeps the tests defined in that file (a case file an aggregator test
-file executes, or a test file), `path::name` the test function `name` of test file `path`. The filters
-combine (a test must pass each one set). A run that keeps none exits 5, pytest's "no tests" status.
+file executes, or a test file), `path::name` the test function `name` of test file `path` (or of the
+case file `path`, wherever it is collected). The filters
+combine (a test must pass each one set). A list too long for one variable comes zlib-compressed and base64 in
+TTP_PYTEST_SELECT_FILES_Z. A run that keeps none exits 5, pytest's "no tests" status.
 It acts only in the pytest process it was loaded into and its xdist workers: it takes its load, its
 TTP_PYTEST_SELECT* settings and its folder on PYTHONPATH out of the environment, so a pytest a test
 starts runs without it. The folder stays while PYTEST_ADDOPTS still loads another plugin from it. An xdist controller, which runs no test, keeps them: its workers, started after
 it loads, load the plugin from the environment they inherit and get the settings from the controller."""
 from __future__ import annotations
 
+import base64
 import inspect
 import os
 import re
+import zlib
 from pathlib import Path
 
 import pytest
@@ -28,6 +32,7 @@ import pytest
 ENV = "TTP_PYTEST_SELECT"
 IDS_ENV = "TTP_PYTEST_SELECT_IDS"
 FILES_ENV = "TTP_PYTEST_SELECT_FILES"
+FILES_Z_ENV = FILES_ENV + "_Z"   # the same list zlib-compressed and base64 (testpick.pack)
 NAME = "ttp_pytest_select"
 
 
@@ -87,6 +92,8 @@ def pytest_collection_modifyitems(config, items):
     env = getattr(config, "_ttp_select_env", None)
     env = {k: v for k, v in os.environ.items() if k.startswith(ENV)} if env is None else env
     pattern, ids, files = env.get(ENV), env.get(IDS_ENV), env.get(FILES_ENV)
+    if files is None and env.get(FILES_Z_ENV):
+        files = zlib.decompress(base64.b64decode(env[FILES_Z_ENV])).decode()
     if not pattern and ids is None and files is None:
         return
     paths, tests = set(), set()
@@ -123,7 +130,7 @@ def _in_files(item, paths: set, tests: set) -> bool:
         code = ""
     name = getattr(item, "originalname", None) or item.name.partition("[")[0]
     return any(_ends(code, p) or _ends(where, p) for p in paths) \
-        or any(n == name and _ends(where, p) for p, n in tests)
+        or any(n == name and (_ends(where, p) or _ends(code, p)) for p, n in tests)
 
 
 def _cwd_relative(config, nodeid: str) -> str:

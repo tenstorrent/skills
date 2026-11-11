@@ -493,6 +493,7 @@ def env(tmp_path, monkeypatch, _git_session, _short_tmp):
     monkeypatch.setenv("TTP_TEST_WORKER_CONTEXT", "off")   # worker prompts carry no coordinator context (ctxfork_cases tests it)
     monkeypatch.setenv("TTP_TEST_NO_MCP_PROBE", "1")   # daemons never run the real `claude mcp list` (mcpgap.py)
     monkeypatch.setenv("TTP_TEST_NO_MODELS_PROBE", "1")   # nor the routed endpoint's /models check (route.py)
+    monkeypatch.setenv("TTP_TEST_NO_REFRESH", "1")    # upgrade never runs a real `ttp setup` of the checkout first
     monkeypatch.setenv("TTP_TEST_NO_NOTIFIER", "1")   # setup, upgrade and status never restart or test the account's own notifier
     monkeypatch.setenv("TTP_TEST_NO_SSH_CHECK", "1")   # `ttp machines add` never asks this host's own ssh config
     monkeypatch.setenv("TTP_TEST_NO_JOURNAL", "1")   # a reboot record never reads this host's own journal (initiator.py)
@@ -510,8 +511,16 @@ def env(tmp_path, monkeypatch, _git_session, _short_tmp):
                 "TTP_CHECKS_SLOT", "TTP_CHECKS_HOST_MAX", "TTP_ROUTE_HOST_MAX", "TTP_WAITS_IDLE", "TTP_TEST_SLOTS_HELD", "TTP_TEST_SLOTS", "TTP_TEST_POOL", "TTP_TEST_RUN_MAX",
                 "TTP_BUILD_SLOTS_HELD", "TTP_BUILD_POOL", "TTP_BUILD_RUN_MAX", "TTP_BUILD_PROJECT_MAX", "MAKEFLAGS",
                 "TTP_NO_USER_POST",   # a light-tier or chat-routed run's mark (workernotify.ENV)
+                "TTP_ROLE", "TTP_COORD_FULL_TOOLS",   # the run's role: a coordinator's makes the git wrapper refuse every push
                 "CMAKE_BUILD_PARALLEL_LEVEL"):
         monkeypatch.delenv(var, raising=False)
+    # What a re-executing `ttp checks` hands its next process (cli._checks_reexec, a rerun) is set straight in
+    # os.environ: recorded here (set, then removed) so it is undone after each test and never reaches the next
+    # one in the same worker (a monkeypatch.delenv of an unset name records nothing to undo).
+    for var in ("TTP_CHECKS_NO_SPILL", "TTP_CHECKS_ARRIVED", "TTP_CHECKS_REEXEC", "TTP_CHECKS_RERANKED",
+                "TTP_CHECKS_KEPT_SLOT", "TTP_CHECKS_LANES", "TTP_CHECKS_WAIT_KEPT", "TTP_CHECKS_RETRY_IDS"):
+        monkeypatch.setenv(var, "")
+        monkeypatch.delenv(var)
     monkeypatch.setenv("TTP_CHECKS_LOAD_EXTRA", "0")   # the checks cap never grows with this host's load
     monkeypatch.setenv("TTP_TEST_NO_INHERIT", "1")   # `ttp checks` never takes the task of the run running the tests (checkcap.adopt_identity)
     monkeypatch.setenv("TTP_CHECKS_LIVE_CORES", "0")   # nor waits on this host's busy cores
@@ -537,6 +546,13 @@ def env(tmp_path, monkeypatch, _git_session, _short_tmp):
     from ttp import machinecap   # the machine-wide worker limit: auto reads as a server (tests turn it on)
     monkeypatch.setattr(machinecap, "DARWIN", False)
     monkeypatch.setattr(machinecap, "has_battery", lambda root=None: False)
+    from ttp import service
+    running = lambda p: False   # an upgrade's restart (restart_running) finds a test project's daemon up; .real checks
+    running.real = service.daemon_stopped
+    monkeypatch.setattr(service, "daemon_stopped", running)
+    kept = lambda name, entry, row: False   # a test project has no service: its daemon faults, not stopped on purpose
+    kept.real = service.stopped_at
+    monkeypatch.setattr(service, "stopped_at", kept)
     monkeypatch.setattr(importlib.machinery.SourceFileLoader, "get_code",
                         _cached_get_code(importlib.machinery.SourceFileLoader.get_code))
     monkeypatch.setattr(gettext, "find", _cached_find(gettext.find))
@@ -7931,6 +7947,12 @@ def _ask(p, text="Option A or B?", **fields):
     return problems, p.db.one("SELECT * FROM messages WHERE kind='ask' ORDER BY id DESC LIMIT 1")
 
 
+def _flagged(p) -> str:
+    """The last turn's notes on actions applied with a change: an ask sent with a flag names it there."""
+    from ttp import coordinator as coord
+    return "\n".join(p.db.kv(coord.NOTES_KEY, []) or [])
+
+
 def _legacy_ask(p, rec="use option A", text="Option A or B?", severity="high"):
     """An ask registered with a default before new asks stopped getting one."""
     from ttp import coordinator as coord
@@ -9171,7 +9193,8 @@ def test_task_branches_start_from_a_remote_only_base(env):
 
 
 def test_task_branches_start_from_the_working_branch_before_origin_head(env):
-    """base_ref unset: delivery.push_branch, then a branch the charter names, then origin/HEAD."""
+    """base_ref unset: delivery.push_branch, then origin/HEAD. A branch the charter names moves into
+    delivery.base_ref once (charterset); after that its wording changes nothing."""
     p = make(env)
     from ttp import worktree
     repo = env["repo"]
@@ -9188,12 +9211,18 @@ def test_task_branches_start_from_the_working_branch_before_origin_head(env):
     assert worktree.base_ref(p) == default
     p.charter_path.write_text(p.charter_path.read_text() + "\nNever push to main. Each change is made on "
                               "a work branch, then pushed to branch gone/away, then branch `team/work`.\n")
-    assert worktree.base_ref(p) == "origin/team/work", "the charter's existing branch, not main or a missing one"
-    assert worktree.resolve_base(p) == "origin/team/work"
+    assert worktree.base_ref(p) == default, "charter prose never picks the base"
+    from ttp import charterset
+    assert charterset.migrate(p) == {"delivery.base_ref": "origin/team/work",
+                                     "worktree.shared_branches": ["gone/away"]}, "the old reader's pick, once"
+    assert worktree.base_ref(p) == "origin/team/work" and worktree.resolve_base(p) == "origin/team/work"
+    p.charter_path.write_text(p.charter_path.read_text().replace("team/work", "push/target"))
+    assert charterset.migrate(p) == {} and worktree.base_ref(p) == "origin/team/work", "rewording moves nothing"
+    p.set_config("delivery.base_ref", "")
     p.set_config("delivery.push_branch", "origin/push/target")
     assert worktree.base_ref(p) == "origin/push/target"
     p.set_config("delivery.push_branch", "not/there")
-    assert worktree.base_ref(p) == "origin/team/work", "a push branch that does not exist yet is skipped"
+    assert worktree.base_ref(p) == default, "a push branch that does not exist yet is skipped"
     _git_out(repo, "branch", "local/only")
     p.set_config("delivery.push_branch", "local/only")
     assert worktree.base_ref(p) == "local/only", "a branch only this clone has is used by its own name"
@@ -9393,8 +9422,9 @@ def test_status_cuts_long_lines_at_words_and_keeps_diagnostics_for_verbose(env, 
     moved = ("coordinator cache:", "checks slot waits", "upstream fix")
     plain = cli.status_text(p)
     assert not any(m in plain for m in moved) and "sending upstream notes on to x has failed" in plain
-    ask = next(ln for ln in plain.splitlines() if "word0 " in ln)
-    assert len(ask) < 340 and re.search(r" word\d+…$", ask), ask
+    rows = plain.splitlines()   # an open ask is never cut: it wraps onto indented lines (user msg #2424)
+    at = next(i for i, ln in enumerate(rows) if "word0 " in ln)
+    assert rows[at + 1].startswith("    word") and rows[at + 1].rstrip().endswith("word79"), rows[at:at + 2]
     p.db.post("out", "note " + words, kind="alert")   # the recent feed's quoted texts end at a word too
     recent = [ln for ln in cli.status_text(p).splitlines() if "note word0 " in ln]
     assert recent and all(re.search(r" word\d+…$", ln) for ln in recent), recent
@@ -11754,9 +11784,13 @@ def _upgrade_probe(p) -> int:
 def test_a_restart_helper_that_cannot_start_is_reaped_with_a_failed_result(env, monkeypatch):
     from ttp import service
     p = make(env)
-    broken = env["tmp"] / "broken-runtime"
+    broken, gate = env["tmp"] / "broken-runtime", env["tmp"] / "helper-may-fail"
     (broken / "ttp").mkdir(parents=True)
-    (broken / "ttp" / "__init__.py").write_text("raise ImportError('the new runtime is broken')\n")
+    # The helper fails only once the test lets it: a helper that died before the first reap is no race.
+    (broken / "ttp" / "__init__.py").write_text(
+        f"import os, time\nend = time.time() + 120\n"
+        f"while not os.path.exists({str(gate)!r}) and time.time() < end:\n    time.sleep(0.02)\n"
+        f"raise ImportError('the new runtime is broken')\n")
     monkeypatch.setattr(service, "_env", lambda p: {"PYTHONPATH": str(broken)})
     started = time.time() - 3600
     at = time.time()
@@ -11764,6 +11798,7 @@ def test_a_restart_helper_that_cannot_start_is_reaped_with_a_failed_result(env, 
     assert service.take_restart_request(p, started)
     assert _upgrade_probe(p) != 0, "the probe must keep waiting while the restart runs"
     assert service.reap_restart_request(p, started) is None, "a running helper is left alone"
+    gate.touch()
     assert service._helpers[str(p.base)].wait(timeout=60) != 0
     assert service.reap_restart_request(p, started) == "failed"
     res = service._restart_result(p, at)
@@ -17394,7 +17429,7 @@ def test_a_charter_and_memory_heavy_project_keeps_the_worker_prompt_under_its_ca
     mem_chars = sum(len(e["line"]) + 1 for e in p._memory_entries())
     assert len(charter) > 11_000 and mem_chars > 9_000, (len(charter), mem_chars)
     spec = "SPEC-MARKER: follow up on fact-03 and fact-07"
-    for kind, cap in (("code", 31_825 + 875), ("question", 24_670 + 875)):   # +875 both: the KNOWN PATHS block (user msg #212); code: +45 for where the harness hook runs; code: +128 for `probe_match` waits; code: +120 for the hand-off's measured `eta`; code: +135 for the `context_gaps` hand-off field; code: +265 for `then` wait stages; +155 both: a wake at the `ttp eta` expected finish; code: +20 for `ttp checks --result --passed`; +55 both: a fix confirmed by its ack alone; +265 both: relayed findings citing records; +30 both: the charter's source cites; code: +50 for the Galaxy reset rescan and recount, +15 for wait_kind user, +100 for `ttp detach --lock`, +150 for atomic script writes, +175 for `published`, +35 for the $TTP_TEST_SLOTS cap, +80 for the home-zone date, +400 for paid-model-API job guards, +125 for its spend cap, +110 for evidence manifests naming only immutable artifacts, +30 for the root .ignore line, +150 for one standing item per user step (`ttp notify --step`); +162 both: the Threads line (parallel subagents); code: +25 for the pytest -n clip and sandbox wrap
+    for kind, cap in (("code", 31_825 + 875 + 115), ("question", 24_670 + 875)):   # +875 both: the KNOWN PATHS block (user msg #212); code: +45 for where the harness hook runs; code: +128 for `probe_match` waits; code: +120 for the hand-off's measured `eta`; code: +135 for the `context_gaps` hand-off field; code: +265 for `then` wait stages; +155 both: a wake at the `ttp eta` expected finish; code: +20 for `ttp checks --result --passed`; +55 both: a fix confirmed by its ack alone; +265 both: relayed findings citing records; +30 both: the charter's source cites; code: +50 for the Galaxy reset rescan and recount, +15 for wait_kind user, +100 for `ttp detach --lock`, +150 for atomic script writes, +175 for `published`, +35 for the $TTP_TEST_SLOTS cap, +80 for the home-zone date, +400 for paid-model-API job guards, +125 for its spend cap, +110 for evidence manifests naming only immutable artifacts, +30 for the root .ignore line, +150 for one standing item per user step (`ttp notify --step`); +162 both: the Threads line (parallel subagents); code: +25 for the pytest -n clip and sandbox wrap; code: +115 for remote tests and slow polls run detached, freeing the slot (msg #223)
         tid = p.db.add_task(f"{kind} task", spec, kind=kind, tier="light", origin="user")
         prompt = worker_prompt(p, p.db.task(tid), str(p.root), "ttp/t1-x" if kind == "code" else None)
         assert spec in prompt and str(tmp_path) in prompt
@@ -19074,6 +19109,7 @@ def test_a_push_batch_runs_its_checks_on_the_priority_slot_while_task_checks_que
     log = env["tmp"] / "checks.log"
     p, repo, origin, other = _bump_setup(env, monkeypatch, [f'echo "${{{checkcap.HELD_ENV}:-none}}" >> {log}'])
     monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "1")
+    monkeypatch.setenv(checkcap.BEYOND_CAP_ENV, "1")  # the opt-in overflow; the default counts it in the cap
     heads = [_entry(repo, "e1", {"plugins/p/f1.txt": "1\n"})]
     holder = _cap_holder("other project task #3 (run 9)")
     got = []
@@ -19691,7 +19727,7 @@ def test_a_push_batch_refuses_main_the_remotes_default_branch_and_a_changed_targ
     assert rc == 2 and _statuses(m) == ["refused"] and "default branch" in m["message"], m
     # The configured target changed after the batch was made: its entries wait for a batch to the new one.
     rc, m = _run_batch(p, _batch_marker(p, heads, bid="b3", target="origin/old"), monkeypatch)
-    assert rc == 2 and m["outcome"] == "refused" and _statuses(m) == ["requeued"], m
+    assert m["outcome"] == "retargeted" and _statuses(m) == ["requeued"], m
     assert _git_out(origin, "rev-parse", "proj") == before
     assert subprocess.run(["git", "-C", str(origin), "rev-parse", "-q", "--verify", "main"]).returncode != 0
 
@@ -22147,8 +22183,10 @@ def test_waiting_tasks_with_the_same_probe_share_its_runs(env, monkeypatch):
     real = dmod.subprocess.Popen
 
     def popen(cmd, *a, **k):
-        calls.append(cmd)
+        # A probe's text rides in its environment (probespawn.hidden), not on its shell's command line.
+        calls.append((k.get("env") or {}).get(PROBE_ENV, cmd) if isinstance(cmd, str) else cmd)
         return real(cmd, *a, **k)
+    from ttp.probespawn import PROBE_ENV
     monkeypatch.setattr(dmod.subprocess, "Popen", popen)
     d = dmod.Daemon(p.base)
     same = [_due_waiting_task(p, f"test -f {flag}") for _ in range(3)]
@@ -24200,7 +24238,7 @@ def test_budget_line_shows_both_windows_their_resets_and_the_mean_of_window_peak
     # Readings of another provider on the account do not mix into the core provider's line.
     p.db.x("INSERT INTO snapshots(ts,provider,account,window,utilization,resets_at) VALUES(?,?,?,?,?,?)",
            (now - 60, "other", "", "five_hour", 80.0, now + h))
-    assert budget_line(p.db, now) == line
+    assert budget_line(p.db, now) == line + ", other plan 5h 80%", "named as another plan, not mixed into the windows or averages"
     assert budget_line(p.db, now, "other").startswith("5h 80% - resets in 1.0 h, 24h $0.17 virtual")
 
 
@@ -24520,8 +24558,9 @@ def test_a_run_with_no_output_and_no_tokens_costs_nothing(env):
             ("claude", ["claude", "-p", "--output-format", "stream-json"], "", 0.0),
             ("codex", ["codex", "exec", "--json"], "", 0.0),
             ("codex", ["codex", "exec", "--json"], json.dumps({"type": "item.started"}) + "\n", 1.0),
-            # An older Cursor build prints nothing until it ends: its silence is not idleness.
-            ("cursor", ["agent", "-p", "--output-format", "json"], "", 1.0)):
+            # An older Cursor build prints nothing until it ends: with no sign the run reached the API,
+            # its silence books nothing either.
+            ("cursor", ["agent", "-p", "--output-format", "json"], "", 0.0)):
         rid = p.db.x("INSERT INTO runs(role,provider,model,started,status) VALUES('worker',?,'',?,'running')",
                      (provider, t0))
         run_dir = p.runs / str(rid)
@@ -27287,6 +27326,9 @@ def test_durable_write_syncs_renames_and_keeps_the_mode(env, monkeypatch):
 # Every place the runtime writes a file directly, and why it need not survive a power cut. Anything
 # else goes through project.durable_write / durable_append / write_json.
 DURABLE_EXEMPT = {
+    ("bridge_cert.py", 'f.write_text(pub.strip() + "\\n")'): "a key line for ssh-keygen -l in a TemporaryDirectory removed right after; nothing is kept",
+    ("bridge_cert.py", 'f.write_text(cert.strip() + "\\n")'): "a certificate line for ssh-keygen -L in a TemporaryDirectory removed right after; nothing is kept",
+    ("bridge_cert.py", 'f.write_text(box_pub.strip() + "\\n")'): "the box's public key for ssh-keygen -s in a TemporaryDirectory; the certificate is read back from stdout and the folder removed",
     ("shorttmp.py", "with os.fdopen(out, 'w') as f:"): "marks a check's scratch dir on the RAM disk with its allocation, which a reboot clears anyway; a lost mark only counts the dir as live for a few minutes",
     ("cellenv.py", '(site / "ttp-system-site.pth").write_text('): "a .pth in a bench cell's own throwaway venv, made fresh with the venv; a cut file only fails that cell's setup, never project state",
     ("benchrun.py", 'open(run / "runner.log", "wb")'): "the supervisor's stdout in a bench cell's temp folder, copied out after the cell; a cut log costs only the log",
@@ -27310,6 +27352,8 @@ DURABLE_EXEMPT = {
     ("loopcheck.py", '(repo / "NOTES.md").write_text('): "seed file of doctor --loop's throwaway scratch repo, committed at once; the scratch project is deleted after the check",
     ("landff.py", "os.replace(req, taken)"): "claims a landing request for the daemon; a claim lost to a crash only fails the waiting `ttp land`, which lands nothing",
     ("applyff.py", "os.replace(req, taken)"): "claims a fast-forward request for the daemon; a claim lost to a crash only fails the waiting --apply, which leaves main as it was",
+    ("checkcap.py", 'tmp.write_text("".join(json.dumps({"ts": ts'): "trims the checks demand samples to their window: a lost or cut file only shortens the window the next sample refills",
+    ("checkcap.py", 'with path.open("a") as f:'): "appends one checks demand sample; a cut last line is skipped on read, a lost one only shortens the window",
     ("service.py", "os.replace(req, taken)"): "claims a restart request for one process; a reboot restarts the daemon anyway",
     ("service.py", "os.replace(path, claim)"): "claims a deferred restart's check for one judge (a rename, no new data): one lost to a crash leaves no check, never a second rollback",
     ("service.py", "os.replace(claim, path)"): "hands back a newer restart's deferred record claimed by mistake (a rename, no new data)",
@@ -27337,6 +27381,7 @@ DURABLE_EXEMPT = {
     ("cli.py", "tmp.write_text(str(os.getpid()))"): "names a process, which a reboot ends",
     ("cli.py", "os.replace(tmp, lock)"): "names a process, which a reboot ends",
     ("cli.py", 'open(log, "w")'): "the output of `ttp clip`, for reading; the command's exit code is passed on",
+    ("cli.py", 'with open(log, "ab") as out:'): "a detached model bench's stdout log, for reading; its scores are written by the bench itself",
     ("cli.py", "spec.write_text"): "the upgrade commit's scratch pathspec list, deleted right after; a lost one only redoes the commit",
     ("cli.py", "os.replace(p+'.tmp',p)"): "runs on another machine, inside a command string",
     ("machines.py", "os.replace(p+'.tmp',p)"): "runs on another machine, inside a command string",
@@ -27356,6 +27401,8 @@ DURABLE_EXEMPT = {
     ("checkcap.py", "os.replace(log, d / old)"): "rotates a bounded checks slot log (waits, grants); a rename lost to a crash leaves the log one generation longer",
     ("checkcap.py", "tmp.write_text(json.dumps(rec))"): "a checks-yield request or answer, or a preempt's claim on the slot it frees, read only while the processes involved live; one lost to a crash leaves the asker re-asking, seeing the run gone, or the slot in the normal turn",
     ("checkcap.py", "os.replace(tmp, path)"): "publishes that checks-yield request or answer atomically; same lifetime as above",
+    ("checkcap.py", "got[-DEMAND_KEEP:]"): "trims the bounded CPU-demand sample log (load guard); a sample lost to a crash or a race only shortens the window it is read over",
+    ("checkcap.py", 'path.open("a") as f'): "appends one CPU-demand sample to that log; same lifetime as above",
     ("checkcap.py", "_preempt_path(pid).write_text("): "an urgent run's preempt request, read only while both live; one lost to a crash only leaves that run waiting as before",
     ("shared.py", '.guard", "a")'): "a flock guard file, never written",
     ("globalcap.py", 'global-spend.lock", "a")'): "a flock guard file, never written",
@@ -27415,7 +27462,10 @@ DURABLE_EXEMPT = {
     ("hostshim.py", 'os.replace(tab + ".tmp", tab)'): "places that fake crontab atomically; same lifetime as above",
     ("overseer.py", 'lock = open(p.state / LOCK_FILE, "a")'): "the overseer's flock guard file, never written",
     ("modelbench.py", 'with open(d / LOCK, "a") as lk:'): "the host bench's flock guard file, never written",
+    ("modelbench.py", 'with open(d / OWNER_LOCK, "a") as lk:'): "the bench owner lease's flock guard file, never written",
     ("untrusted.py", 'with open(path, "a") as f:'): "a run's untrusted-source marks in its own run dir, read when that run ends; a crash that loses one ends the run too; never project state",
+    ("remotecheck.py", 'Path(scratch, "objects", "info", "alternates").write_text('): "points a scratch repository in a TemporaryDirectory at this one's objects for one bundle; it is gone when the bundle is sent, never project state",
+    ("streamguard.py", "with open(run_dir / WARN_FILE, \"a\") as f:"): "appends one fsync'd warning line per refused call that had already finished; a cut last line is skipped on read (take_warnings), a lost one costs only that warning",
 }
 
 
@@ -28424,7 +28474,7 @@ def test_checks_host_cap_enforces_the_limit_and_serves_waiters_in_order(env, mon
     time.sleep(0.3)
     assert got == [], "nobody runs past the cap"
     assert checkcap.state()["running"] == ["a", "b"]
-    assert "2 running (cap 2), 2 queued: c; d" in checkcap.line()
+    assert "host checks: 2 running of cap 2, 2 queued: c; d" in checkcap.line()
     assert any("queued for a host-wide checks slot: 2 of 2 running" in t for t in told) and waits[0] is True
     a.close()
     first.join(10)
@@ -28540,9 +28590,10 @@ def test_checks_host_cap_serves_projects_round_robin(env, monkeypatch):
         waiters[-1].start()
         assert _wait_for(lambda: len(checkcap.state()["queued"]) == i + 1)
     assert _wait_for(lambda: told)
-    assert "queued for a host-wide checks slot: 1 of 1 running, 2 ahead, 3 projects" in told[0]
+    assert "queued for a host-wide checks slot: 1 of 1 running, cap 1" in told[0], told[0]
+    assert ", 2 ahead, 3 projects" in told[0], told[0]
     assert checkcap.state()["queued"] == ["a1", "b1", "c1", "a2", "b2", "a3"], "status lists them in serving order"
-    assert "1 running (cap 1), 6 queued: a1; b1; c1; a2; ... (running: h)" in checkcap.line()
+    assert "1 running of cap 1, 6 queued: a1; b1; c1; a2; ... (running: h)" in checkcap.line()
     assert checkcap.line().endswith("; next per project: a1 0 ahead, b1 1 ahead, c1 2 ahead"), \
         "each project's next waiter shows how many are served before it"
     held.close()
@@ -28587,6 +28638,7 @@ def test_push_checks_take_a_priority_slot_ahead_of_every_queued_task_check(env, 
     import threading
     from ttp import checkcap, locks
     monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "2")
+    monkeypatch.setenv(checkcap.BEYOND_CAP_ENV, "1")  # the opt-in overflow; the default counts it in the cap
     full = [checkcap.acquire("a"), checkcap.acquire("b")]
     got = []
 
@@ -28670,7 +28722,7 @@ def test_checks_host_cap_queues_detached_checks_and_starts_them_once_the_holder_
         assert "queued for a host-wide checks slot" in out and "other project task #3 (run 9)" in out
         assert "queued for a host-wide checks slot" in (run / "progress.md").read_text()
         assert "host checks:" not in cli.status_text(p), "routine: only --verbose shows it"
-        assert "host checks: 1 running (cap 1), 1 queued:" in cli.status_text(p, verbose=True)
+        assert "host checks: 1 running of cap 1, 1 queued:" in cli.status_text(p, verbose=True)
         assert "(running: other project task #3 (run 9))" in cli.status_text(p, verbose=True), "it still lists the holders"
         assert f"{p.name} task #7 (run 41)" in checkcap.line()
         assert not ran.exists(), "nothing runs over the cap"
@@ -36344,13 +36396,29 @@ def test_probe_env_finds_ttp(env):
 
 
 def _supervise_with_wait(tmp_path, monkeypatch, wait_start):
+    """Supervise a run with a 2 s limit whose awake time is a test clock (FileClock): the child moves it to
+    3 s, past the plain limit and short of the 4 s a lock wait extends it to, then runs until the watch
+    thread looked 3 more times, so no scheduling delay decides the outcome."""
     from ttp import locks as lk
     from ttp import runner
     monkeypatch.setattr(runner, "POLL_S", 0.2)
+    clock, looked = tmp_path / "awake-clock", tmp_path / "looked"
+    monkeypatch.setenv(runner.TEST_CLOCK_ENV, str(clock))
+    looks, real_stop = [], runner.stop_reason
+
+    def stop_reason(rd):   # once per watch look, after its limit check
+        if clock.exists():
+            looks.append(1)
+            if len(looks) >= 3:
+                looked.touch()
+        return real_stop(rd)
+    monkeypatch.setattr(runner, "stop_reason", stop_reason)
+    child = (f"import pathlib, time\npathlib.Path({str(clock)!r}).write_text('3')\nend = time.time() + 60\n"
+             f"while time.time() < end and not pathlib.Path({str(looked)!r}).exists():\n    time.sleep(0.05)\n")
     run_dir = tmp_path / "run"
     run_dir.mkdir()
     (run_dir / "prompt.md").write_text("")
-    (run_dir / "run.json").write_text(json.dumps({"argv": ["sh", "-c", "sleep 3"], "cwd": str(tmp_path),
+    (run_dir / "run.json").write_text(json.dumps({"argv": [sys.executable, "-c", child], "cwd": str(tmp_path),
                                                   "timeout_s": 2, "provider": "fake"}))
     if wait_start is not None:
         # An open wait by a live process (this one): the run is queued for a lock right now.
@@ -37187,9 +37255,7 @@ def test_devq_restart_requeues_a_job_a_reboot_killed_and_adopts_one_still_runnin
     os.kill(int((d / "runner.pid").read_text()), signal.SIGKILL)
     os.killpg(pid, signal.SIGKILL)
     from ttp import devq
-    deadline = time.time() + 10
-    while time.time() < deadline and _devq("probe", d, "long-1").returncode != devq.RUNNER_DOWN_RC:
-        time.sleep(0.05)
+    assert _until_true(lambda: _devq("probe", d, "long-1").returncode == devq.RUNNER_DOWN_RC, _load_scaled(30))
     assert "no runner is alive" in _devq("probe", d, "long-1").stdout
     flag.touch()
     assert _devq("start", d, json.dumps(DEVQ_FAST)).returncode == 0
@@ -38982,10 +39048,12 @@ def test_a_task_an_open_ask_names_waits_on_the_user(env):
     ask = p.db.post("out", f"#{tid}: vendor A or B? (not #{tid}0)", chat=None, kind="ask", severity="high")
     st = state_payload(p, p.db)
     w = next(t for t in st["tasks"] if t["id"] == tid)["wait"]
-    assert w["kind"] == "user" and w["text"] == f"waits on you: ask {ask}" and w["asks"] == [ask], w
+    # The ask in full, never only its id (user msg #2424).
+    full = f"waits on you: ask {ask}: #{tid}: vendor A or B? (not #{tid}0)"
+    assert w["kind"] == "user" and w["text"] == full and w["asks"] == [ask], w
     assert next(t for t in st["tasks"] if t["id"] == other)["wait"]["kind"] == "coordinator"
     out = status_text(p)
-    assert f"  needs you (#{tid}, waiting 0.0h): pick a vendor — waits on you: ask {ask}" in out, out
+    assert f"  needs you (#{tid}, waiting 0.0h): pick a vendor — {full}" in out, out
     assert f"  #{other} waiting 0.0h: other — waits on the coordinator" in out, out
     # Answered, it is the coordinator's again.
     p.db.x("UPDATE messages SET handled=1 WHERE id=?", (ask,))
@@ -39012,7 +39080,7 @@ def test_status_and_web_read_a_hold_anchor_by_its_kind(env, anchor, kind, text):
     tid = p.db.add_task("cache layout", "s", origin="user")
     if anchor == "ask":
         ask = p.db.post("out", "vendor A or B?", chat=None, kind="ask", severity="high")
-        anchor, text = f"ask:{ask}", f"waits on you: ask {ask}"
+        anchor, text = f"ask:{ask}", f"waits on you: ask {ask}: vendor A or B?"
     p.db.update_task(tid, status="blocked", blocked_reason="held by the coordinator: some free text",
                      labels=["kept", f"waits:{anchor}"])
     w = next(t for t in state_payload(p, p.db)["tasks"] if t["id"] == tid)["wait"]
@@ -39800,8 +39868,15 @@ def test_heal_outage_check_whose_adopted_task_fails_raises_one_high_alert(env):
 # shared machines: recovery owner and change ledger (machine_ledger.py) -----------------------------
 
 def _resources(p, text):
+    """The charter's Resources gain `text`, and `machines.allowed` the listed machines it names (as the
+    coordinator records a Resources change with config_set: the charter's prose is never read)."""
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
     c = p.charter_path.read_text()
     p.charter_path.write_text(c.replace("## Resources\n", f"## Resources\n{text}\n", 1))
+    known = mm.load()
+    if names := ml.charter_machines(p.charter_path.read_text(), ml.live_machines(known)):
+        p.set_config("machines.allowed", names)
 
 
 def test_machines_set_names_a_recovery_owner_that_an_update_keeps(env, capsys):
@@ -43419,6 +43494,7 @@ def test_failover_settings_are_known_keys_and_settable_from_cli_and_chat(env, ca
     d.update_gates()
     d.failover_pinned()
     assert p.db.task(tid)["provider"] == "codex", "0 set through the CLI turns failover off"
+    p.db.set_kv("config_provenance", {})   # the CLI part is done; the chat part below starts from a value no user owns
     for bad in ("soon", "-1"):
         with pytest.raises(SystemExit):
             cli.main(["config", p.name, "coordinator.provider_failover_after_h", bad])
@@ -44482,7 +44558,10 @@ def test_budget_line_shows_free_resets_and_paid_credits_on_one_line(env):
     snap("claude", "five_hour", 4.4, now + 3.94 * 3600)
     snap("codex", "5h", 10.0, now + 3600)
     snap("codex", "7d", 93.0, now + 2 * 86400)
-    base = budget_line(p.db, now)
+    full = budget_line(p.db, now)
+    other = ", codex plan 5h 10%, 7d 93%"   # codex's windows as another plan until its credits name it
+    assert full.endswith(other), full
+    base = full[:-len(other)]
     assert "free reset" not in base and "credits" not in base
     credits.record(p.db, "codex", credits.parse(_credit_answer()), "", now)
     line = budget_line(p.db, now)
@@ -44492,7 +44571,7 @@ def test_budget_line_shows_free_resets_and_paid_credits_on_one_line(env):
     assert line == base + ", paid credits, codex 7d 93%, 2 free resets", line
     assert "\n" not in line
     credits.record(p.db, "codex", credits.parse(_credit_answer()), "", now - credits.FRESH_S - 1)
-    assert budget_line(p.db, now) == base + ", paid credits", "a stale reading is left out"
+    assert budget_line(p.db, now) == base + ", paid credits" + other, "a stale reading is left out"
 
 
 def test_sweep_digest_and_budget_digest_list_credits_as_a_provider_holds_unblock_path(env):
@@ -45816,14 +45895,17 @@ def test_check_scratch_finish_waits_for_concurrent_catalogue_operation(env, monk
             finished.set()
 
     monkeypatch.setattr(checkdirs, '_take_fd', take)
+    # finish waits for the catalogue until it is released, never for a wall-clock bound a busy host's
+    # fsync or a stalled thread could pass; the timeouts below only keep a hang from stalling the suite
+    monkeypatch.setattr(checkdirs, 'WAIT_S', 600)
     with ThreadPoolExecutor(max_workers=1) as pool:
         result = pool.submit(finish)
         try:
-            assert entered.wait(5)
+            assert entered.wait(120)
             assert not finished.wait(0.1), 'completion abandoned cleanup while the catalogue was busy'
         finally:
             catalogue.close()
-        result.result(timeout=5)
+        result.result(timeout=120)
     assert not output.exists(), 'completion must reclaim scratch without waiting for daemon recovery'
 
 
@@ -46360,7 +46442,8 @@ def _job_of_waiting_task(p, tid, requested, next_in=3.7 * 3600):
     rc = run_dir / "build.rc"
     (run_dir / "build.started").write_text(f"{os.getpid()}\n")
     (run_dir / "detached.json").write_text(json.dumps([{"name": "build", "rc": str(rc), "log": str(run_dir / "build.log"),
-                                                        "requested": requested}]))
+                                                        "pid": os.getpid(), "pid_start": locks.start_time(os.getpid()),
+                                                        "status": "running", "requested": requested}]))
     p.db.x("INSERT INTO runs(task,role,provider,started,ended,status,dir) VALUES(?,?,?,?,?,?,?)",
            (tid, "worker", "fake", time.time() - 1200, time.time() - 1100, "ok", str(run_dir)))
     now = time.time()

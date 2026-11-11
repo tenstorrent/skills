@@ -192,6 +192,7 @@ def test_gh_needs_stdin_only_for_the_forms_that_read_it():
              ["pr", "create", "--body-file", "-"], ["pr", "edit", "7", "--body-file=-"], ["pr", "comment", "7", "-F", "-"],
              ["issue", "comment", "7", "-F-"], ["pr", "review", "7", "-F=-"], ["release", "create", "v1", "--notes-file", "-"],
              ["gist", "create"], ["secret", "set", "X"], ["variable", "set", "X"], ["auth", "login", "--with-token"],
+             ["auth", "git-credential", "get"], ["auth", "git-credential", "store"], ["auth", "git-credential", "erase"],
              ["ssh-key", "add", "-"], ["alias", "import", "-"], ["some-extension", "x"],
              ["pr", "comment", "7", "--body-file", "/dev/stdin"], ["pr", "edit", "7", "--body-file=/dev/fd/0"],
              ["release", "create", "v1", "--notes-file", "/dev/stdin"], ["pr", "comment", "7", "-F", "/dev/stdin"],
@@ -239,6 +240,22 @@ def test_gh_and_its_hooks_never_stall_on_an_open_stdin_pipe_gh_does_not_read(env
         assert r.returncode == 0 and took < 5, (hooked, took, r.stderr)
         assert (tmp_path / "gh.state").read_text() == "eof", hooked
         assert not hooked or (tmp_path / "hook.stdin").read_bytes() == b""
+
+
+def test_gh_auth_git_credential_gets_git_s_request_on_stdin(env, tmp_path):
+    """git runs `gh auth git-credential get|store|erase` as its credential helper and writes the request on
+    stdin: bin/gh passes it through to the real gh, never /dev/null."""
+    p = make(env)
+    fake = tmp_path / "credbin"
+    fake.mkdir()
+    (fake / "gh").write_text(f"#!/bin/sh\ncat > {tmp_path / 'gh.stdin'}\n")
+    (fake / "gh").chmod(0o755)
+    request = b"protocol=https\nhost=github.com\n\n"
+    for op in ("get", "store", "erase"):
+        (tmp_path / "gh.stdin").unlink(missing_ok=True)
+        r = _gh_main(p, tmp_path, ["auth", "git-credential", op], data=request, fake=fake)
+        assert r.returncode == 0, (op, r.stderr)
+        assert (tmp_path / "gh.stdin").read_bytes() == request, op
 
 
 def test_gh_api_stdin_forms_still_reach_hooks_and_gh_intact(env, tmp_path):

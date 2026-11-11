@@ -39,6 +39,7 @@ from pathlib import Path
 FILE = "onhost.json"
 CLOSED = ("done", "failed", "cancelled", "exhausted")
 MARK = "Planned, not started on the host yet:"
+STATUS_HEAD = "Status now: "   # the honest status line guard() appends (claimcheck and promises skip it)
 
 _PROG_OBJ = re.compile(r"(?i)\b([a-z]{3,}ing)\s+(?:it|them|this|that|those|these|the|its|their|all|both)\b")
 _PROG = re.compile(r"(?i)\b([a-z]{3,}ing)\b")
@@ -284,7 +285,7 @@ def state(p, task: dict, now: float | None = None, est=None, cfg: dict | None = 
                 "line": f"worker running, waiting for {', '.join(named)}"
                         + (f" since {timefmt.short(since, p, now)}" if since else "")}
     try:
-        e = (est.task(task["id"]) if est is not None else eta.estimate(p.db, task["id"], now, core=eta.core_of(cfg)))
+        e = (est.task(task["id"]) if est is not None else eta.estimate(p.db, task["id"], now, core=eta.core_of(cfg), delivery=eta.delivery_of(cfg)))
     except Exception:
         e = None
     return {"kind": "queued", "started": False, "line": queued_line(e, p, now)}
@@ -406,7 +407,7 @@ def guard(p, text: str, tasks: list[dict], now: float | None = None) -> tuple[st
     from . import eta
     try:
         cfg = p.config()
-        est = eta._Est(p.db, now, core=cfg.get("core_provider"))
+        est = eta._Est(p.db, now, core=cfg.get("core_provider"), delivery=eta.delivery_of(cfg))
     except Exception:
         return text, []
     waiting = []   # (task, honest status) of each covered task not started on its host
@@ -423,26 +424,33 @@ def guard(p, text: str, tasks: list[dict], now: float | None = None) -> tuple[st
             waiting.append((t, f"{who}: {got['line']}"))
     if not waiting:
         return text, []
-    ids = {t["id"] for t, _ in waiting if t.get("id")}
     direct = [t for t, _ in waiting if not t.get("via_chat")]
-    marked = 0
+    about: set[int] = set()   # indexes in `waiting` of the tasks a marked sentence is about
     for k in hits:
         named = {int(x) for x in re.findall(r"#(\d{1,9})\b", parts[k])}
         # A sentence is about an unstarted task when it names its #id; naming no #id, when it names that
         # task's resource, or the reply speaks for exactly one unstarted task (a chat's other open tasks do
         # not count) and the sentence's subject is that work (_subject_is). Any other claim sentence is left
         # as written: it states a fact about other work.
-        if (named & ids) if named else (any(_names(parts[k], t) for t, _ in waiting)
-                                        or len(direct) == 1 and _subject_is(parts[k], direct[0])):
+        if named:
+            hit = {j for j, (t, _) in enumerate(waiting) if t.get("id") in named}
+        else:
+            hit = {j for j, (t, _) in enumerate(waiting) if _names(parts[k], t)}
+            if not hit and len(direct) == 1 and _subject_is(parts[k], direct[0]):
+                hit = {j for j, (t, _) in enumerate(waiting) if t is direct[0]}
+        if hit:
             parts[k] = f"{MARK} {parts[k].strip()}"
-            marked += 1
-    if not marked:
+            about |= hit
+    if not about:
         return text, []
-    honest = [h for _, h in waiting]
-    out = "".join(parts).rstrip() + "\nStatus now: " + "; ".join(honest)
+    # Only the tasks the message itself claimed: the other unstarted tasks it covers get no forecast line
+    honest = [waiting[j][1] for j in sorted(about)]
+    footer = ((cfg.get("coordinator") or {}).get("status_footer", True) is not False)
+    out = "".join(parts).rstrip() + ("\n" + STATUS_HEAD + "; ".join(honest) if footer else "")
     note = (f"onhost: a message said work was under way or done that has not started on its host "
-            f"({'; '.join(honest)[:300]}); it was sent marked as planned with that status. Describe an "
-            f"action as happening only once STATE shows it on the host")
+            f"({'; '.join(honest)[:300]}); it was sent marked as planned"
+            + (" with that status" if footer else " (coordinator.status_footer is off: no status line)")
+            + ". Describe an action as happening only once STATE shows it on the host")
     return out, [note]
 
 

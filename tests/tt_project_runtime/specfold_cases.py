@@ -73,6 +73,29 @@ def test_a_folded_update_keeps_every_line_citing_a_user_or_owner_order_whole():
         assert c in older, c
 
 
+def test_a_folded_update_keeps_the_quoted_lines_after_a_users_words_label():
+    from ttp import specfold
+    spec = _grown_spec(n=20)
+    block = ("User's words (verbatim):\n"
+             "  'move every review to the tt models'\n"
+             "  'keep Opus for the coordinator only'")
+    second = "Per user msg #2329:\n- report runs per class per model per hour"
+    third = ("User's words (verbatim):\n  'hold routine work until morning'\n"   # the same label again
+             "#2310 is that order")   # a '#N' line is quoted text, not a heading
+    spec = spec.replace("step 1: tune the cache knob 1. ",
+                        "step 1: tune the cache knob 1. \n" + block + "\n\nfiller after the quote\n", 1)
+    spec = spec.replace("step 2: tune the cache knob 2. ",
+                        "step 2: tune the cache knob 2. \n" + second + "\npr_branch: ttp/t1-x\nnot quoted\n", 1)
+    spec = spec.replace("step 4: tune the cache knob 4. ", "step 4: tune the cache knob 4. \n" + third + "\n", 1)
+    shown, older = specfold.fold(spec)
+    assert "step 1: tune" not in shown and "step 4: tune" not in shown   # those updates are folded
+    assert block in shown and second in shown and third in shown   # each quote stays under its label
+    assert "pr_branch: ttp/t1-x" in shown   # a field line ends the quote and is kept on its own
+    assert "filler after the quote" not in shown and "not quoted" not in shown   # a blank or field line ends it
+    for x in (block, second, third):
+        assert x in older
+
+
 def test_a_short_or_rarely_updated_spec_is_shown_as_it_is():
     from ttp import specfold
     small = _grown_spec(n=5, pad=10)

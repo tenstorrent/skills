@@ -22,9 +22,14 @@ set TTP_UNTRUSTED_INPUT=1 (a benchmark cell without a project). Then, model-free
   certificate (CRED_SUFFIXES, id_* but .pub), or names a token, secret, credential, password or API
   key, a process's environ file; named in a Bash command's words or a Read, Grep or Glob path, or
   looked for by a find from outside the worktree (`find ~ -name '*.pem'`).
-  So are environment dumps (printenv, a bare env, export or set), which print tokens.
+  ssh, scp, sftp and git (core.sshCommand) read their own files: the value of ssh's -F and -i and of
+  -o IdentityFile=, UserKnownHostsFile= and CertificateFile= is not checked (ssh_words), but a
+  config or known-hosts file with a credential's name is (ssh would echo its lines in errors).
+  So are environment dumps (a bare printenv, env, export or set, or printenv naming a credential-like
+  variable), which print tokens.
 Every task run, marked or not, is refused a Bash command that may change, move or delete the run's
-RUN_MARK file (its name only in quoted text or a read passes) and an edit of that file (mark_refusal): removing it would lift these guards for the rest of the run and keep the
+RUN_MARK file (its name only in quoted text or a read passes) and an edit of that file (mark_refusal):
+removing it would lift these guards for the rest of the run and keep the
 daemon from labelling the task. A glob (`rm $TTP_RUN_DIR/*`) still gets around it.
 Not covered: a path or command built at run time inside a script or inline code (except git and gh,
 whose wrappers run anyway), other HTTP clients (httpie, python requests), GET requests that carry
@@ -37,6 +42,7 @@ import functools
 import json
 import os
 import re
+import shlex
 
 LABEL = "untrusted_input"   # modelpick.UNTRUSTED
 WRITE_LABEL = "untrusted_write"
@@ -54,12 +60,20 @@ CRED_DIRS = (".ssh", ".aws", ".azure", ".gnupg", ".docker", ".kube", ".password-
 CRED_FILES = {".netrc", "_netrc", ".git-credentials", ".npmrc", ".pypirc", ".pgpass", ".my.cnf", ".env",
               "auth.json", "hosts.yml", "hosts.yaml", "shadow", "environ"}
 CRED_SUFFIXES = (".pem", ".key", ".p12", ".pfx", ".jks", ".keystore", ".ppk", ".gpg", ".asc")
-# token and secret only as a whole word (api_token.txt, access-tokens.json, accessToken), so a model's
-# tokenizer.json is no credential
-CRED_NAME_RE = re.compile(r"token(?!i[sz])|secret|credential"   # anywhere in the name, but not a tokenizer
+# token and secret anywhere in a name (authtoken, mytoken.txt, accessTokenCache.json, SecretKey), but not
+# a tokenizer or a secretary; nor are the token lists beside a model's tokenizer.json (CRED_NAME_OK)
+CRED_NAME_RE = re.compile(r"token(?!i[sz])|secret(?!ar)|credential"
                           r"|passw(or)?d|api[_-]?key|^id_(?!.*\.pub$)|^\.env\.", re.I)
+CRED_NAME_OK = {"special_tokens_map.json", "added_tokens.json"}
+# ssh-family programs whose own option files are theirs to read (ssh_words); ssh options that take a value
+SSH_PROGS = {"ssh", "scp", "sftp", "autossh"}
+SSH_VALUE_FLAGS = set("BbcDEeFIiJLlmOoPpQRSWw")
+# -o options naming a file ssh opens itself: keys ssh never prints, its sockets, and known-hosts files
+SSH_OWN_O_RE = re.compile(r"\s*(IdentityFile|CertificateFile|ControlPath|IdentityAgent|UserKnownHostsFile)\s*=?\s*(.*)", re.I | re.S)
 WHY = ("this task reads untrusted input (label {label}), which may carry planted instructions, so its run "
        "{what}. ").format
+ENV_WHAT = "never dumps its environment, which holds tokens"
+CRED_WHAT = "never reads credential, token or secret files outside its worktree"
 
 
 def guards_live() -> bool:
@@ -207,7 +221,7 @@ def gh_write(args: list[str]) -> bool:
 
 def http_write(argv: list[str]) -> bool:
     """curl or wget `argv` sends a write: a non-GET method, a body, a form or an upload."""
-    from .aitag import CURL_DATA, WGET_DATA, _data_options
+    from .aitag import CURL_DATA, CURL_VALUE_SHORTS, WGET_DATA, _data_options
     prog = os.path.basename(argv[0]) if argv else ""
     if prog not in ("curl", "wget"):
         return False
@@ -218,10 +232,16 @@ def http_write(argv: list[str]) -> bool:
             method = nxt
         elif m := re.fullmatch(r"(?:-X|--request=|--method=)(\S+)", a):
             method = m.group(1)
-        elif prog == "curl" and (m := re.fullmatch(r"-[A-Za-z0-9#:]+X(\S*)", a)):   # a short-flag cluster: -sX DELETE
-            method = m.group(1) or nxt
-        elif prog == "curl" and (a in ("-T", "--upload-file") or a.startswith(("--upload-file=", "-T"))):
+        elif prog == "curl" and (a == "--upload-file" or a.startswith("--upload-file=")):
             return True
+        elif prog == "curl" and len(a) > 1 and a[0] == "-" and a[1] != "-":
+            for j, c in enumerate(a[1:], 1):   # a short-flag cluster (-sX DELETE): the first value option takes the rest
+                if c == "X":
+                    method = a[j + 1:] or nxt
+                elif c == "T":
+                    return True
+                if c in CURL_VALUE_SHORTS or f"-{c}" in CURL_DATA:
+                    break
     if method and method.upper() not in ("GET", "HEAD", "OPTIONS"):
         return True
     return bool(_data_options(argv, CURL_DATA if prog == "curl" else WGET_DATA))
@@ -261,7 +281,8 @@ def cred_path(word: str, cwd: str) -> bool:
 def cred_name(name: str) -> bool:
     """A file name (or a find -name pattern, its wildcards dropped) a credential file has."""
     name = name.strip("*?")
-    return name in CRED_FILES or name.endswith(CRED_SUFFIXES) or bool(CRED_NAME_RE.search(name))
+    return name not in CRED_NAME_OK and (name in CRED_FILES or name.endswith(CRED_SUFFIXES)
+                                         or bool(CRED_NAME_RE.search(name)))
 
 
 def _outside(path: str, cwd: str) -> bool:
@@ -290,10 +311,76 @@ def _words(s: list[str]) -> list[str]:
     return s[1:] if "/" not in s[0] or (os.path.isfile(first) and os.access(first, os.X_OK)) else s
 
 
+# A variable printenv may name: a plain name that does not look like a credential (GH_TOKEN, *_API_KEY, AUTH)
+_ENV_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+_CRED_VAR_RE = re.compile(r"key|auth|pass|token|secret|credential|cookie|session", re.I)
+
+
+def _program(s: list[str]) -> str:
+    """The program a segment runs (its first word's name) when that word is one, else ''."""
+    first = os.path.expanduser(s[0])
+    return os.path.basename(s[0]) if "/" not in s[0] or (os.path.isfile(first) and os.access(first, os.X_OK)) else ""
+
+
+def ssh_words(argv: list[str]) -> list[str]:
+    """An ssh, scp, sftp or autossh call's words to check: all but the files ssh reads itself (-F's config,
+    -i's key, -o IdentityFile=, CertificateFile=, UserKnownHostsFile=, its sockets). A config or known-hosts file with a
+    credential's name stays checked: ssh echoes a bad line of it in its errors. ssh's options end at its
+    destination; scp and sftp take them anywhere."""
+    out, i, stop = [], 1, os.path.basename(argv[0]) in ("ssh", "autossh")
+    while i < len(argv):
+        w = argv[i]
+        i += 1
+        if w == "--" or not w.startswith("-") or w == "-":
+            out.append(w)
+            if stop and w != "--":
+                out.extend(argv[i:])
+                break
+            continue
+        j = next((k for k, c in enumerate(w[1:], 1) if c in SSH_VALUE_FLAGS), None)
+        if j is None:
+            out.append(w)
+            continue
+        flag, value = w[j], w[j + 1:]
+        if not value and i < len(argv):
+            value, i = argv[i], i + 1
+        if flag == "o" and (m := SSH_OWN_O_RE.fullmatch(value)):
+            flag, value = ("i" if m.group(1).lower() != "userknownhostsfile" else "F"), m.group(2)
+        if flag == "i" or (flag == "F" and not cred_name(os.path.basename(value.strip("\"'")))):
+            continue
+        # another -o option's value is checked whole and word by word (ProxyCommand=cat <file>)
+        out += ([w[:j + 1], value, *(value.partition("=")[2].split() if flag == "o" else [])] if value else [w])
+    return out
+
+
+def _checked_words(s: list[str]) -> list[str]:
+    """A segment's words cred_path checks (_words), the files ssh reads itself left out (ssh_words), also in
+    git's `-c core.sshCommand=<ssh command>`."""
+    name = _program(s) if s else ""
+    if name in SSH_PROGS:
+        return ssh_words(s)
+    if name != "git":
+        return _words(s)
+    out = []
+    for prev, w in zip(s, s[1:]):
+        key, _, value = w.partition("=")
+        if (prev == "-c" or w.startswith("-c")) and key.removeprefix("-c").lower() == "core.sshcommand":
+            try:
+                inner = shlex.split(value)
+            except ValueError:
+                inner = []
+            if inner and os.path.basename(inner[0]) in SSH_PROGS:
+                out += ssh_words(inner)
+                continue
+        out.append(w)
+    return out
+
+
 def _env_dump(argv: list[str]) -> bool:
     name = os.path.basename(argv[0])
-    if name == "printenv":
-        return True
+    if name == "printenv":   # dumps without a name; prints only the named variables otherwise
+        names = [a for a in argv[1:] if a != "--"]
+        return not names or any(not _ENV_NAME_RE.fullmatch(a) or _CRED_VAR_RE.search(a) for a in names)
     if name == "env":
         return all(a.startswith("-") or "=" in a for a in argv[1:])
     if name in ("export", "declare", "typeset"):
@@ -310,11 +397,11 @@ def bash_refusal(segments: list[list[str]], raw: list[list[str]], cwd: str) -> s
             or any("/" in w or w.startswith(("~", ".")) for w in words)) or not active():
         return None
     if any(_env_dump(s) for s in raw if s):
-        return WHY(label=LABEL, what="never dumps its environment, which holds tokens") + \
+        return WHY(label=LABEL, what=ENV_WHAT) + \
             "Print one harmless variable by name with `echo \"$NAME\"`"
-    if any(cred_path(w, cwd) for s in segments for w in _words(s)) or any(
+    if any(cred_path(w, cwd) for s in segments for w in _checked_words(s)) or any(
             _find_refusal(s, cwd) for s in segments if s and os.path.basename(s[0]) == "find"):
-        return WHY(label=LABEL, what="never reads credential, token or secret files outside its worktree") + \
+        return WHY(label=LABEL, what=CRED_WHAT) + \
             "ssh, git and gh read their own credentials; give a stored secret to a command with `ttp secret env`"
     allowed = writes_allowed()
     for s in segments:
@@ -406,6 +493,12 @@ def _mark_bash(cmd: str) -> bool:
     return False
 
 
+def secret_refusal(why: str) -> bool:
+    """Whether a refusal guards a secret (a credential read, an environment dump, the run marker): once
+    such a call ran, the secret is in the agent's context (streamguard.must_stop)."""
+    return any(w in why for w in (ENV_WHAT, CRED_WHAT, MARK_WHY))
+
+
 def mark_refusal(tool: str, args: dict) -> str | None:
     """Refuse a task run's Bash command that may create, change, move or delete RUN_MARK (_mark_bash),
     or an edit or patch of that file. Its name inside quoted text or a read is no effect."""
@@ -426,4 +519,4 @@ def tool_refusal(tool: str, args: dict, cwd: str) -> str | None:
     path = str(args.get("file_path") or args.get("path") or "")
     if tool not in ("Read", "Grep", "Glob") or not path or not cred_path(path, cwd) or not active():
         return None
-    return WHY(label=LABEL, what="never reads credential, token or secret files outside its worktree").rstrip()
+    return WHY(label=LABEL, what=CRED_WHAT).rstrip()

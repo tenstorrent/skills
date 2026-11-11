@@ -397,3 +397,43 @@ def test_a_job_a_worker_let_run_raises_no_second_alarm_but_a_restart_or_no_decis
             assert len(ev()) == 2 and not entry["raised"].get("let_run"), (case, entry)
     finally:
         lock.close()
+
+
+@pytest.mark.parametrize("case", ["died", "ended", "lost", "pid_gone", "pid_reused", "live"])
+def test_an_ended_job_is_never_sampled_as_running_whatever_its_lock_says(env, monkeypatch, case):
+    """A job is live by its detached.json status and its wrapper's pid, never its lock file: one stopped
+    (status died, .rc or .lost written), or whose pid is gone or now names another process, raises no
+    under-use and shows no line, though its lock is still held (a leftover that inherited it). A live,
+    idle job is still flagged."""
+    p = make(env)
+    from ttp import daemon as dmod, detach, jobuse
+    tid = p.db.add_task("bench", "s", kind="work", tier="light", origin="user")
+    rc, lock = _job_of_waiting_task(p, tid, {"cores": 8})
+    try:
+        reg = rc.parent / "detached.json"
+        jobs = json.loads(reg.read_text())
+        if case == "died":
+            jobs[0].update(status="died", exit=None, ended=time.time(), why="stopped")
+        elif case == "ended":
+            rc.write_text(f"{detach.STOP_RC}\n")
+        elif case == "lost":
+            detach.lost(rc).write_text("stopped by its task\n")
+        elif case == "pid_gone":
+            gone = subprocess.Popen(["true"])
+            gone.wait()
+            jobs[0].update(pid=gone.pid, pid_start="1")
+            (rc.parent / "build.started").write_text(f"{gone.pid}\n")
+        elif case == "pid_reused":
+            jobs[0]["pid_start"] = "1"   # the recorded wrapper started at another time: this pid is another process
+        reg.write_text(json.dumps(jobs))
+        clock = [time.time()]
+        _underused(p, monkeypatch, tid, rc, clock)
+        dmod.Daemon(p.base).sample_jobs()
+        ev = p.db.q("SELECT * FROM events WHERE kind='job_underuse' AND task=?", (tid,))
+        kv = p.db.kv(jobuse.KV) or {}
+        if case == "live":
+            assert len(ev) == 1 and "used 0.1 cores" in kv[str(rc)]["line"]
+        else:
+            assert not ev and str(rc) not in kv, (ev, kv)
+    finally:
+        lock.close()

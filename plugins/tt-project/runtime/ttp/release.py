@@ -108,6 +108,46 @@ def restorable(at_least: str) -> Path | None:
     return best
 
 
+SETUP_SOURCE = "setup-source"   # in HOME_DIR/lib: the plugin folder the last `ttp setup` installed from
+
+
+def _plugin_root(d: Path) -> bool:
+    return ((d / "runtime" / "ttp" / "__init__.py").is_file() and (d / "template").is_dir()
+            and (d / "bin" / "ttp").is_file())
+
+
+def newest_source(claude_dir: Path | None = None, also: tuple[Path, ...] = ()) -> tuple[str, Path] | None:
+    """The newest tt-project plugin on this host that `ttp setup` can install from, as (version, plugin folder):
+    the folder the last setup used (a checkout), a release in Claude Code's plugin cache or a folder in `also`.
+    None when there is none; never a release under ~/.tt-project/lib itself."""
+    if claude_dir is None:
+        from .providers.claude import claude_config_dir
+        claude_dir = claude_config_dir()
+    found: list[Path] = list(also)
+    try:
+        found.append(Path((HOME_DIR / "lib" / SETUP_SOURCE).read_text().strip()))
+    except (OSError, ValueError):
+        pass
+    cache = claude_dir / "plugins" / "cache" / "tenstorrent-skills" / "tt-project"
+    try:
+        found += [d for d in cache.iterdir() if d.is_dir()]
+    except OSError:
+        pass
+    lib = (HOME_DIR / "lib").resolve()
+    best: tuple[str, Path] | None = None
+    for d in found:
+        try:
+            d = d.resolve()
+            if not d.name or d.is_relative_to(lib) or not _plugin_root(d):
+                continue
+        except OSError:
+            continue
+        v = runtime_version(d / "runtime")
+        if v != "unknown" and (best is None or is_newer(v, best[0])):
+            best = (v, d)
+    return best
+
+
 def point_current(target: Path) -> None:
     """Re-point lib/current at `target` in one step (a new symlink renamed over the old one), so a
     `ttp` starting meanwhile sees the old release or the new one, never none."""

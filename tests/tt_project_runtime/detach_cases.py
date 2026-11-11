@@ -1316,6 +1316,39 @@ def test_an_owners_stop_writes_the_rc_so_a_reader_of_the_rc_alone_sees_a_stop_no
         _end_group(pgid)
 
 
+def test_detach_stop_removes_the_jobs_lock_file_and_a_live_holder_keeps_it(env, tmp_path):
+    """`ttp detach --stop` leaves no <name>.lock naming the dead wrapper: removed once free and the job is
+    over. A stop of a job that no longer runs removes a leftover one too; one still held, or of a job not
+    over, stays."""
+    from ttp import detach, jobstop, locks as lk
+    p = make(env)
+    broker = _stub_broker(tmp_path)
+    tid = p.db.add_task("soak", "s", kind="work", tier="light", origin="user")
+    rc, pgid = _locked_job(p, tid, broker, status="running")
+    try:
+        run = p.db.one("SELECT id FROM runs WHERE dir=?", (str(rc.parent),))["id"]
+        assert lk.job_lock(rc).exists()
+        r = _ttp_run(p, "detach", "--stop", str(rc), env=_as(tid, run))
+        assert r.returncode == 0 and "stopped detached job loop" in r.stdout, r.stderr
+        assert not lk.job_lock(rc).exists() and detach.state(rc)[0] == "ended"
+        # A leftover lock file (an earlier stop that left it): a stop of the ended job removes it.
+        lk.job_lock(rc).write_text(json.dumps({"holder": "detached job loop", "pid": pgid}))
+        r = _ttp_run(p, "detach", "--stop", str(rc), env=_as(tid, run))
+        assert r.returncode == 0 and "not running" in r.stdout, r.stderr
+        assert not lk.job_lock(rc).exists()
+        # Held by a live process, or the job is not over: kept.
+        held = lk.try_take([lk.job_lock(rc)], "detached job loop", "sleep")
+        try:
+            assert not jobstop.drop_lock(rc) and lk.job_lock(rc).exists()
+        finally:
+            held.close()
+        other = rc.with_name("other.rc")
+        lk.job_lock(other).write_text("{}")
+        assert not jobstop.drop_lock(other) and lk.job_lock(other).exists()
+    finally:
+        _end_group(pgid)
+
+
 def test_a_stop_never_overwrites_an_exit_code_the_job_wrote_itself(env, tmp_path):
     """A job that wrote its own .rc before the stop's record keeps it (and gets no .lost); a natural exit
     of 137 with no .lost, or a job not stopped (no .rc yet), never reads as stopped; a path outside the
@@ -3200,6 +3233,36 @@ def test_last_progress_reads_a_live_jobs_newest_log_and_skips_ended_lost_and_rem
     assert detach.last_progress("test -e state/out-ready || exit 1") is None
     assert detach.last_progress(f"ttp detach --check '{live}") is None   # unbalanced quote: never raises
     assert abs(detach.last_progress(f"ttp detach --check {live.name}", live.parent) - (now - 120)) < 2
+
+
+def test_last_progress_of_a_remote_job_reads_its_mirrors_last_log_growth(env):
+    """#7433 follow-up: a `detach --check --host <alias> --mirror <dir>` wait had no progress, so a long
+    remote job raised wait_stale while its log still grew. Its progress is when its mirror last saw the
+    log size change (mirror_save's "moved"); an ended job, a probe with no mirror and a job never
+    mirrored have none."""
+    import json
+    from ttp import detach
+    p = make(env)
+    now = time.time()
+    m = p.root / "run-1"
+    m.mkdir()
+    job = "/tmp/ttp-detach/build"
+    detach.mirror_save(m, "build", "box-a", job, tail=b"x", size=10)
+    f = m / "build.remote.json"
+    old = json.loads(f.read_text())
+    old["moved"] = int(now) - 5000
+    f.write_text(json.dumps(old))
+    detach.mirror_save(m, "build", "box-a", job, size=10)   # same size: no progress
+    probe = f"ttp detach --check --host box-a --mirror {m} {job}"
+    assert abs(detach.last_progress(probe) - (now - 5000)) < 2
+    assert abs(detach.last_progress(f"ttp detach --check --host=box-a --mirror=run-1 {job} || exit 1",
+                                    p.root) - (now - 5000)) < 2
+    detach.mirror_save(m, "build", "box-a", job, size=20)   # its log grew
+    assert abs(detach.last_progress(probe) - now) < 5
+    assert detach.last_progress(f"ttp detach --check --host box-a {job}") is None, "no mirror folder"
+    assert detach.last_progress(f"ttp detach --check --host box-b --mirror {m} {job}") is None, "another host's job"
+    detach.mirror_save(m, "build", "box-a", job, end={"rc": 0})
+    assert detach.last_progress(probe) is None, "ended"
 
 
 @pytest.mark.parametrize("table", ["native", "ps"])

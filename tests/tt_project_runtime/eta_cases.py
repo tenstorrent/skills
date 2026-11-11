@@ -649,6 +649,54 @@ def test_eta_landing_gate_with_no_live_owner_reads_after_landed_and_no_clock_tim
     after(w, "abandoned")
 
 
+def test_expected_finish_keeps_the_gate_of_urgent_tasks_sharing_one_reason(env):
+    """#7511: urgent tasks sharing one reason shared a 'no estimate yet (why)' line, which dropped the
+    gate they wait on (after landed:#N). Tasks share a line only per gate and reason, and it names
+    the gate."""
+    from ttp import eta
+    p = make(env)
+    now = time.time()
+    n, w, _ = _eta_gated(p, now)
+    w2 = p.db.add_task("deploy it too", "s", kind="work", labels=[f"start_when:landed:#{n}"])
+    for t in (w, w2):
+        p.db.update_task(t, priority=1)
+    bad = p.db.add_task(f"Review #{n}", "s", kind="review", depends_on=[n], status="failed")
+    rows = [x for x in eta.state_lines(p.db, p, now) if x.startswith("- #")]
+    assert len(rows) == 1 and rows[0].startswith(f"- #{w}, #{w2}: ETA: after landed:#{n} ("), rows
+    assert f"its last review #{bad} failed" in rows[0] and "no estimate yet" not in rows[0], rows
+
+
+def test_eta_state_web_and_host_estimates_read_the_projects_push_batch_cap(env):
+    """#6860 follow-up: every estimate built for the STATE, the Course check, the web app and the
+    started-on-host line reads the project's delivery config (push_batch_max, push_age_s), so an
+    approval's 'approvals ahead' count follows the project's batch cap, not the default 8."""
+    from ttp import eta
+    p = make(env)
+    now = time.time()
+    p.set_config("delivery.push_batch_max", 2)
+    p.db.x("INSERT INTO push_queue(task,branch,head,target,status,created,updated) VALUES(?,?,?,?,?,?,?)",
+           (999, "b", "h", "t", "pushed", now - 9000, now - 8400))
+    for i in range(3):
+        p.db.x("INSERT INTO push_batches(id,marker,target,started,ended,finalized,after_finalized,outcome) "
+               "VALUES(?,?,?,?,?,?,?,?)", (f"b{i}", "m", "t", now - 20000 + i * 5000, None, None,
+                                            now - 20000 + i * 5000 + 1800, "pushed"))
+    ids = [p.db.add_task(f"Review {k}", "s", kind="review", priority=1, status="pushing") for k in range(5)]
+    for tid in ids:
+        p.db.x("INSERT INTO push_queue(task,branch,head,target,status,created,updated) VALUES(?,?,?,?,?,?,?)",
+               (tid, "b", "h", "t", "approved", now - 60, now - 60))
+    last = ids[-1]
+    want = now + 3 * 1800   # 4 ahead at 2 per batch: its batch is the third
+    assert eta.estimate(p.db, last, now, delivery=eta.delivery_of(p))["end"] == pytest.approx(want)
+    assert eta.delivery_of(p.config()) == eta.delivery_of(p) and eta.delivery_of({}) is None
+    capped = eta.field(eta.estimate(p.db, last, now, delivery=eta.delivery_of(p)), p, now)
+    assert capped != eta.field(eta.estimate(p.db, last, now), p, now), "the default cap of 8 reads otherwise"
+    line = next(x for x in eta.state_lines(p.db, p, now) if x.startswith(f"- #{last} "))
+    assert line.endswith(capped), (line, capped)
+    assert eta.state_lines(p.db, p, now) == eta.state_lines(p.db, p.config(), now)
+    e = eta.obligation_estimate(p.db, {"id": "o1", "owners": [last]}, now, delivery=eta.delivery_of(p))
+    assert e["end"] == pytest.approx(want), e
+
+
 def test_eta_landing_gate_with_a_live_owner_follows_its_critical_path(env):
     from ttp import eta
     p = make(env)

@@ -31,17 +31,21 @@ unless the user set `delivery.checks_task_full: true`. With the push queue off n
 from __future__ import annotations
 
 import ast
+import base64
 import os
 import re
 import shlex
 import subprocess
+import zlib
 from pathlib import Path
 
 KEY, ALWAYS_KEY = "checks_targeted", "checks_targeted_always"   # delivery.<key>
 ALWAYS = ("tests/test_plugin_catalogue.py",)
 FILES_ENV = "TTP_PYTEST_SELECT_FILES"   # one unit per line: a source file, or <test file>::<test name>
+TASK_KEY = "task_checks"   # delivery.task_checks: a task's own check list (task_set)
+FILES_Z_ENV = FILES_ENV + "_Z"          # the same list, zlib-compressed and base64 (one too long for FILES_ENV)
 MAX_SHARE = 0.5      # a selection of at least this share of the tests runs in full (not in a push-queue project)
-MAX_ENV = 64_000     # the selection's size cap (one exported variable of the check's shell line)
+MAX_ENV = 64_000     # the selection's size cap (one exported variable of the check's shell line; over it, compressed: _select)
 FULL_NAMES = {"conftest.py", "__init__.py", "plugin.json", "marketplace.json", "pytest.ini", "pyproject.toml",
               "setup.cfg", "setup.py", "tox.ini", "requirements.txt"}
 RUNNER = ("testpick.py", "push.py", "pushpass.py", "pytest_resume/")   # under runtime/ttp/
@@ -59,6 +63,17 @@ def full_refusal(cfg: dict | None) -> str:
     return ("--full is refused: with the push queue on, the push train runs the only full suite and a task's "
             "checks run the tests its change reaches (run `ttp checks` without --full; the user's "
             "delivery.checks_task_full: true allows it)")
+
+
+def task_set(d: dict, configured, source: str, release: bool = False) -> tuple:
+    """The check list a task's `ttp checks` runs and where it came from: delivery.task_checks when set (a
+    project's quick per-task set, #7854), else `configured` (the push checks: the smoke set that gates a
+    landing). Only for a single-repo project's own checks; a release run keeps the push checks. The
+    push train (or `ttp push`) still runs the push checks on every batch, so nothing lands without them."""
+    task = (d or {}).get(TASK_KEY)
+    if release or source != "delivery.push_checks" or not task:
+        return configured, source
+    return task, f"delivery.{TASK_KEY}"
 
 
 def enabled(cfg: dict | None) -> bool:
@@ -335,11 +350,20 @@ def pick(top: Path, base: str, head: str, files: list[str], always=ALWAYS,
     if soft is None and (share := n / total) >= MAX_SHARE:   # a push batch runs the whole suite anyway
         return [], f"the diff reaches {share:.0%} of the tests"
     out = sorted(chosen)
-    if len("\n".join(out)) > MAX_ENV:
+    if len(text := "\n".join(out)) > MAX_ENV and len(pack(text)) > MAX_ENV:
         return [], "the selection is too long"
     if sizes is not None:
         sizes.update(tests=n, of=total)
     return out, ""
+
+
+def pack(text: str) -> str:
+    """`text` as FILES_Z_ENV carries it (the select plugin unpacks it)."""
+    return base64.b64encode(zlib.compress(text.encode(), 9)).decode()
+
+
+def unpack(value: str) -> str:
+    return zlib.decompress(base64.b64decode(value)).decode()
 
 
 def summary(entries: list[str]) -> str:
@@ -348,6 +372,13 @@ def summary(entries: list[str]) -> str:
     rest = len(entries) - cases - len(tests)
     return (f"targeted: {cases} case files, {len(tests)} tests in {len(set(tests))} test files"
             + (f", {rest} whole files" if rest else ""))
+
+
+def _select(entries: list[str]) -> dict[str, str]:
+    """The variable carrying `entries`: plain while it fits MAX_ENV, else compressed (#7854: a long
+    selection ran the whole suite alone)."""
+    text = "\n".join(entries)
+    return {FILES_ENV: text} if len(text) <= MAX_ENV else {FILES_Z_ENV: pack(text)}
 
 
 def narrow(top: Path, base: str, head: str, todo: list, own: list, cfg: dict | None,
@@ -380,7 +411,7 @@ def narrow(top: Path, base: str, head: str, todo: list, own: list, cfg: dict | N
             c2.__dict__.update(c.__dict__)
         c2.env = tuple(sorted({"PYTHONPATH": f"{pushpass.PLUGIN_DIR}${{PYTHONPATH:+:$PYTHONPATH}}",
                                "PYTEST_ADDOPTS": f"${{PYTEST_ADDOPTS:+$PYTEST_ADDOPTS }}-p {pushpass.SELECT_PLUGIN}",
-                               FILES_ENV: "\n".join(entries)}.items()))
+                               **_select(entries)}.items()))
         c2.targeted = True   # a part of the suite: never a verified-through marker
         c2.scope = sizes     # its size, and the full check it narrows, price its lane (checklane.cost)
         c2.full = c

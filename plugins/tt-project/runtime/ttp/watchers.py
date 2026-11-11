@@ -44,7 +44,7 @@ import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 
-from . import ghauth, prguard
+from . import ghauth, ghroute, prguard
 from . import screen as scr
 
 DAY = 86400.0
@@ -192,7 +192,10 @@ def _spawn(args: list[str], timeout: float, cwd: str, run=None):
         return run is None or schedrun.track(run, pid)
 
     try:
-        res = boundedchild.run(["gh", *args], timeout, cwd=cwd, on_start=started)
+        via = ghroute.routed(args, cwd=cwd)   # no gh login here: on delivery.gh_route
+        res = boundedchild.run(via or ["gh", *args], timeout, cwd=cwd, on_start=started)
+        if via and not res.timed_out:
+            ghroute.seen(res.rc)
         failed = _AUTH.get()
         if failed is not None and not res.timed_out and ghauth.auth_failed(res.rc, res.err):
             err = res.err.decode(errors="replace") if isinstance(res.err, bytes) else str(res.err or "")
@@ -668,8 +671,9 @@ def watch_prs(daemon, payload: dict | None = None) -> str:
     unapproved = f", {len(flagged)} out of draft unapproved" if flagged else ""
     if auth:   # never ok: the host-wide gh login check (ghauth) is asked to look now and alerts once
         ghauth.nudge()
-        return (f"error: gh is not logged in on this host ({auth[0]}): {len(auth)} gh calls failed, "
-                f"{len(order)} PRs not read; the user runs `gh auth login` there")
+        return (f"error: degraded: gh has no login on this host ({ghroute.quiet(auth[0])}) and {ghroute.SETTING} "
+                f"{'is down' if ghroute.route(cwd=str(daemon.p.base)) else 'is unset'}: {len(auth)} gh calls failed, "
+                f"{len(order)} PRs not read; {ghroute.SETTING} (an ssh alias where gh is logged in) routes them")
     if missed:
         shown = "; ".join(missed[:10]) + (f"; {len(missed) - 10} more" if len(missed) > 10 else "")
         return (f"cut short ({read} of {len(order)} PRs read, {changed} changed{unapproved}; "

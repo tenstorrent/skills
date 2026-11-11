@@ -327,6 +327,30 @@ def test_the_watcher_settles_a_wake_gate_skip_with_a_ledger_row(env):
     assert "FAILURE" in babysit.stats_text(babysit.stats(p.db, time.time() - 3600, time.time() - 1800))
 
 
+def test_a_cap_wake_replay_shows_the_watchers_decisions_in_babysit_stats(env):
+    """At the wake gate's cap the watcher is asked (no cap wake before it): its skip is a settled
+    decision `ttp stats --babysit` counts, naming its model; a fallback still wakes by the cap."""
+    from ttp import babysit, waitgate
+    p, cfg, b, lines = _bs_gate(env, _bs_reply("skip 30m"), _BsJev(on=False))
+    now = time.time()
+    for _ in range(3):
+        task, _prev = _bs_wait_task(p)
+        prev = {**_prev, "waiting_since": now - 5 * 3600, "wake_gate": {"log": [1, 2, 3, 4]}}
+        d = waitgate.decide(p, cfg, task, prev, now, jev=b)
+        assert not d.wake and d.by == "babysit" and "at the cap" in d.reason and "example-org/small-model" in d.reason
+    st = babysit.stats(p.db, now - 3600)
+    assert st["decisions"] == {"wake_gate": 3} and st["wake_gate"] == {"skip": 3}
+    text = babysit.stats_text(st, "demo")
+    assert "FAILURE" not in text and "model example-org/small-model: 3" in text and "skip 3" in text
+    def down(s, m, t):
+        raise babysit.Unavailable("no key")
+    b.post = down
+    task, _prev = _bs_wait_task(p)
+    d = waitgate.decide(p, cfg, task, {**_prev, "waiting_since": now - 5 * 3600}, now, jev=b)
+    assert d.wake and d.by == "cap" and lines   # the fallback is logged and counted, the cap wakes
+    assert babysit.stats(p.db, now - 3600)["fallbacks"] == {"wake_gate": 1}
+
+
 def test_the_watchers_tier_and_flag_are_what_the_wake_runs_at(env):
     from ttp import budget as bud, waitgate
     p = None
@@ -395,3 +419,29 @@ def test_the_watcher_lowers_an_escalated_wake_through_waketier(env):
     assert got and got["by"] == "babysit" and got["tier"] == "light" and b.jev.calls == 0
     b.post = _bs_reply("wake #1 standard")
     assert waketier.pick(p.db, cfg, task, prev, jev=b, now=100.0) is None and b.jev.calls == 0
+
+
+def test_a_babysit_call_every_candidate_failed_asks_the_next_ranked_served_model_once(env):
+    from ttp import babysit, route
+    babysit._REFUSED.clear()
+    seen = []
+
+    def post(s, messages, timeout):
+        seen.append(s["model"])
+        if s["model"] != "example-org/best":
+            raise babysit.Unavailable("HTTP 503: busy")
+        return _bs_reply("skip")(s, messages, timeout)
+    p, cfg, b, lines = _bs_gate(env, post, None)
+    cfg["providers"]["chat"]["model_ranking"] = ["example-org/unlisted", "example-org/best", "example-org/third"]
+    route.write_served(p.state, "chat", True, "HTTP 200", ["example-org/best", "example-org/third"], time.time())
+    d = babysit.ask(cfg, "s", "Is there work?", post=post, db=p.db, served=b._served())
+    assert seen == ["example-org/small-model", "example-org/best"] and d["model"] == "example-org/best"
+    seen.clear()
+    cfg["providers"]["chat"]["model_ranking"] = ["example-org/third"]   # the stand-in fails too: one try, then Unavailable
+    with pytest.raises(babysit.Unavailable, match="ranked stand-in example-org/third"):
+        babysit.ask(cfg, "s", "Is there work?", post=post, db=p.db, served=b._served())
+    assert seen == ["example-org/small-model", "example-org/third"]
+    seen.clear()
+    with pytest.raises(babysit.Unavailable):   # no served list known: unchanged
+        babysit.ask(cfg, "s", "Is there work?", post=post, db=p.db, served=None)
+    assert seen == ["example-org/small-model"]

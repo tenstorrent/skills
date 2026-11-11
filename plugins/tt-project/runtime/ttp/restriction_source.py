@@ -7,6 +7,10 @@ The rule, one line per item (a bullet with its continuation lines, or a paragrap
   owner's own agent's message in agent mode ("(relayer-ordered, msg #12)", relay.agent_orders), or carries an
   origin marker, "(origin: Brief)" or "(origin: harness gate)". The Brief is the user's own words and
   is never a Restrictions section, so everything in it is sourced by definition.
+- recorded: CHARTER.history.md (ends.CHARTER_HISTORY) logs it as added to or replaced in Restrictions in a
+  turn carrying the user's message ("### Added to Restrictions (<date>, user message #N, ...)"), the structured
+  source the harness wrote when it applied that change (recorded_items). The inline cite is the fallback for
+  items older than those records, or ones whose cite an edit since dropped.
 - unsourced: anything else. It is advisory: workers are not told to obey it, and the coordinator
   drops it itself (charter_update with `quote` and empty `text`, no user word and no `over`).
 
@@ -59,9 +63,39 @@ AGENT_SOURCE = (f"With {relay.AGENT_KEY} on, the owner's own agent's words count
                 "cited \"(relayer-ordered, msg #N)\"")
 
 
-def sourced(item: str) -> bool:
-    """Whether a Restrictions item rests on the user's words, the Brief or a harness gate (module doc)."""
-    return bool(CITE_RE.search(item) or ORIGIN_RE.search(item))
+def _item_key(text: str) -> str:
+    """An item's text as recorded_items keys it: whitespace-joined, without its bullet marker."""
+    return " ".join(_BULLET_RE.sub("", " ".join(text.split()), count=1).split())
+
+
+def sourced(item: str, recorded: set[str] | frozenset = frozenset()) -> bool:
+    """Whether a Restrictions item rests on the user's words, the Brief or a harness gate (module doc):
+    its structured record (`recorded`, recorded_items) or, failing that, its inline cite."""
+    return bool(recorded and _item_key(item) in recorded or CITE_RE.search(item) or ORIGIN_RE.search(item))
+
+
+def recorded_items(history: str) -> frozenset[str]:
+    """The Restrictions items (_item_key) CHARTER.history.md logs as added or replaced in a turn carrying
+    the user's message: the structured source each charter_update records (coordinator._charter_update)."""
+    from .grants import _HIST, _USER_MSG
+    out: set[str] = set()
+    for m in _HIST.finditer(history or ""):
+        if not m.group("sec").strip().lower().startswith("restriction") or not _USER_MSG.search(m.group("meta")):
+            continue
+        body = m.group("body")
+        body = body.split("\nNow: ", 1)[1] if "\nNow: " in body else body
+        body = body.split("\nOver: ", 1)[0]
+        out.update(k for it in split_items(body) if (k := _item_key(" ".join(it))))
+    return frozenset(out)
+
+
+def history_items(p) -> frozenset[str]:
+    """recorded_items of project `p`'s CHARTER.history.md (none when it is missing or unreadable)."""
+    from .ends import CHARTER_HISTORY
+    try:
+        return recorded_items((p.harness / CHARTER_HISTORY).read_text())
+    except (OSError, UnicodeDecodeError):
+        return frozenset()
 
 
 def split_items(body: str) -> list[list[str]]:
@@ -82,23 +116,24 @@ def split_items(body: str) -> list[list[str]]:
     return out
 
 
-def partition(body: str, brief: set[str] | frozenset = frozenset()) -> tuple[str, str]:
+def partition(body: str, brief: set[str] | frozenset = frozenset(),
+              recorded: set[str] | frozenset = frozenset()) -> tuple[str, str]:
     """(the binding lines, the unsourced items) of a Restrictions body (prompts.charter_restrictions).
     A sub-heading stays with the binding lines; so does an item of `brief` (prompts.brief_restrictions:
-    a Restrictions item the user wrote inside the Brief, origin Brief)."""
+    a Restrictions item the user wrote inside the Brief, origin Brief) and one `recorded` (recorded_items)."""
     keep, drop = [], []
     for it in split_items(body):
         text = " ".join(it)
-        bound = it[0].lstrip().startswith("#") or sourced(text) or " ".join(text.split()) in brief
+        bound = it[0].lstrip().startswith("#") or sourced(text, recorded) or " ".join(text.split()) in brief
         (keep if bound else drop).append("\n".join(it))
     return "\n".join(keep), "\n".join(drop)
 
 
-def unsourced_items(charter: str) -> list[str]:
-    """The charter's unsourced Restrictions items, one line each."""
+def unsourced_items(charter: str, recorded: set[str] | frozenset = frozenset()) -> list[str]:
+    """The charter's unsourced Restrictions items, one line each (`recorded`: recorded_items)."""
     from .prompts import brief_restrictions, charter_restrictions
-    return [" ".join(" ".join(it).split())
-            for it in split_items(partition(charter_restrictions(charter), brief_restrictions(charter))[1])]
+    return [" ".join(" ".join(it).split()) for it in
+            split_items(partition(charter_restrictions(charter), brief_restrictions(charter), recorded)[1])]
 
 
 def _loose(text: str) -> str:
@@ -407,25 +442,27 @@ def whole_item(body: str, start: int, end: int, items) -> tuple[int, int]:
     return start, end
 
 
-def drops_unsourced(charter: str, quote: str = "", body: str = "") -> bool:
+def drops_unsourced(charter: str, quote: str = "", body: str = "",
+                    recorded: set[str] | frozenset = frozenset()) -> bool:
     """Whether a charter_update retires only unsourced Restrictions items: those of the replaced
     Restrictions section `body`, else the items of `charter`'s Restrictions holding `quote`. Such an item
-    never bound, whoever drops it and with or without `over` (echoes.scan checks what still states it)."""
+    never bound, whoever drops it and with or without `over` (echoes.scan checks what still states it).
+    `recorded` (recorded_items): items the history logs as the user's, sourced whatever their text."""
     from .prompts import charter_restrictions
     q = _loose(quote)
     items = [" ".join(" ".join(x).split()) for x in split_items(body or charter_restrictions(charter))]
     items = [x for x in items if x and not x.startswith("#") and (body or q and q in _loose(x))]
-    return bool(items) and not any(sourced(x) for x in items)
+    return bool(items) and not any(sourced(x, recorded) for x in items)
 
 
-def cited_span(body: str, start: int, end: int, items) -> bool:
-    """Whether the span [start, end) of a Restrictions body touches a sourced (cited) item (`items`:
-    coordinator._items of `body`)."""
-    return any(sourced(body[a:e]) for a, e, _ in items if a < end and start <= e)
+def cited_span(body: str, start: int, end: int, items, recorded: set[str] | frozenset = frozenset()) -> bool:
+    """Whether the span [start, end) of a Restrictions body touches a sourced (cited or `recorded`) item
+    (`items`: coordinator._items of `body`)."""
+    return any(sourced(body[a:e], recorded) for a, e, _ in items if a < end and start <= e)
 
 
-def unsourced_span(body: str, start: int, end: int, items) -> bool:
+def unsourced_span(body: str, start: int, end: int, items, recorded: set[str] | frozenset = frozenset()) -> bool:
     """Whether the span [start, end) of a Restrictions body lies only in unsourced items (`items`:
-    coordinator._items of `body`)."""
+    coordinator._items of `body`; `recorded`: recorded_items)."""
     hit = [body[a:e] for a, e, _ in items if a < end and start <= e]
-    return bool(hit) and not any(sourced(x) for x in hit)
+    return bool(hit) and not any(sourced(x, recorded) for x in hit)

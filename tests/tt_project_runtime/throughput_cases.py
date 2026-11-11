@@ -95,6 +95,39 @@ def test_throughput_measures_waits_per_lane_from_task_run_and_push_records(env, 
     assert "worker_slots SLOW" in txt and "limit budget.max_parallel_workers=2" in txt
 
 
+def test_throughput_judges_worker_waits_against_the_slot_limit_in_force_then_not_a_later_raise(env, monkeypatch):
+    """Waits that met every slot of a cap throughput has since raised are neither at the new cap nor idle
+    capacity: they count as `raised`, propose no second raise and the kept line names the raise."""
+    from ttp import throughput
+    p = make(env)
+    now = time.time()
+    _tp_busy_fixture(p, now)   # 3 waits over threshold, all 2 slots busy
+    monkeypatch.setattr(throughput, "cpu_free", lambda: (True, ""))
+    monkeypatch.setattr(throughput.os, "cpu_count", lambda: 64)
+    p.set_config("budget.max_parallel_workers", 4)
+    # No record of the raise: judged against 4, the waits look like idle capacity (the old reading).
+    w = _tp_lane(throughput.measure(p.db, p.config(), now=now, gates={}), "worker_slots")
+    assert (w["at_limit"], w["idle"], w.get("raised")) == (0, 3, None)
+    # A raise recorded before the waits began changes nothing; one after them is the limit then.
+    for ts, want in ((now - 9 * 3600, (0, 3, None)), (now - 60, (0, 0, 3))):
+        p.db.set_kv(throughput.KV, [{"id": 1, "ts": ts, "key": "budget.max_parallel_workers", "old": 2, "new": 4}])
+        rep = throughput.measure(p.db, p.config(), now=now, gates={})
+        w = _tp_lane(rep, "worker_slots")
+        assert (w["at_limit"], w["idle"], w.get("raised")) == want, (ts, w)
+    assert w["raised_by"]["id"] == 1 and "3 at the limit before raise #1" in throughput.text(
+        {**rep, "changes": [], "kept": []})
+    changes, kept = throughput.plan(p.db, p.config(), rep)
+    assert not [c for c in changes if c["key"] == "budget.max_parallel_workers"], changes
+    why = next(k["why"] for k in kept if k["lane"] == "worker_slots")
+    assert "met all 2 slots before throughput #1 raised" in why and "idle" not in why
+    # An undone raise: after its undo the old value is in force again, so a wait after it is at the limit.
+    p.set_config("budget.max_parallel_workers", 2)
+    p.db.set_kv(throughput.KV, [{"id": 1, "ts": now - 10 * 3600, "key": "budget.max_parallel_workers", "old": 2,
+                                 "new": 4, "undone": now - 9 * 3600}])
+    w = _tp_lane(throughput.measure(p.db, p.config(), now=now, gates={}), "worker_slots")
+    assert (w["at_limit"], w["idle"], w.get("raised")) == (3, 0, None)
+
+
 def test_throughput_apply_raises_only_at_limit_with_headroom_bounded_by_load_and_undoes(env, monkeypatch):
     from ttp import throughput
     p = make(env)
@@ -399,6 +432,54 @@ def test_throughput_keeps_push_window_and_sweep_unless_they_held_the_waits(env):
     assert {(c["key"], c["new"]) for c in changes if c["key"] in levers} == {("delivery.push_batch_s", 1800), ("review.sweep_after_s", 600)}
 
 
+
+def test_throughput_names_failed_push_batches_and_slow_push_checks_as_the_hold_not_the_window(env, tmp_path):
+    """Rows held by batches that failed fast (an unreachable remote) or by push checks over the smoke limit
+    are reported with their real holder as information: no push_batch_s change, no throughput task."""
+    import json
+    from ttp import slowcomplaint, throughput
+    p = make(env)
+    now = time.time()
+    p.set_config("delivery.push_batch_s", 1800)
+    code = _tp_task(p, "code change", now - 5 * 3600)
+    _tp_run(p, code, now - 5 * 3600, now - 5 * 3600 + 600)
+    msg = ("cannot reach origin: fatal: unable to access 'https://example.invalid/repo.git/': "
+           "Failed to connect to example.invalid port 443 after 133136 ms: Connection timed out")
+    for i in range(3):   # three batches that each failed in about 2 min, 30 min apart
+        m = tmp_path / f"b{i}.json"
+        m.write_text(json.dumps({"id": f"b{i}", "message": msg}))
+        s0 = now - 4 * 3600 + i * 1900
+        p.db.x("INSERT INTO push_batches(id, marker, target, started, ended, outcome) VALUES(?,?,?,?,?,?)",
+               (f"b{i}", str(m), "origin/br", s0, s0 + 135, "error"))
+    for c in (now - 4 * 3600 - 60, now - 4 * 3600 + 1000):   # approved before them, still waiting
+        p.db.x("INSERT INTO push_queue(task, branch, head, target, created, updated) VALUES(?,?,?,?,?,?)",
+               (code, "b", "h", "origin/br", c, now))
+    rep = throughput.measure(p.db, p.config(), now=now, gates={})
+    ln = _tp_lane(rep, "push_batch")
+    assert ln["slow"] and ln["failed_count"] == 2 and ln["failed_batches"] == 3, ln
+    assert ln["failed_last"]["id"] == "b2" and "Connection timed out" in ln["failed_last"]["message"]
+    changes, kept = throughput.plan(p.db, p.config(), rep)
+    assert not [c for c in changes if c["key"] == "delivery.push_batch_s"], changes
+    k = next(k for k in kept if k["lane"] == "push_batch")
+    assert k["info"] and k["holder"] == "failed_batches", k
+    assert "3 push batch(es) that did not end clean (error 3)" in k["why"] and "b2 on origin/br" in k["why"]
+    assert "remote cannot be reached" in k["why"] and "behind a running batch" not in k["why"]
+    assert slowcomplaint._followups(p.db, {"lanes": rep["lanes"], "kept": kept}, [1], now)["opened"] is None
+    # The same rows behind a clean batch whose check runs take 25 min each: the push checks hold them.
+    p.db.x("DELETE FROM push_batches")
+    p.db.x("INSERT INTO push_batches(id, marker, target, started, ended, outcome, check_runs, check_s) "
+           "VALUES('c0','m','origin/br',?,?,'pushed',2,3000)", (now - 4 * 3600, now - 3600))
+    rep = throughput.measure(p.db, p.config(), now=now, gates={})
+    assert _tp_lane(rep, "push_batch")["check_run_s"] == 1500
+    k = next(k for k in throughput.plan(p.db, p.config(), rep)[1] if k["lane"] == "push_batch")
+    assert k["info"] and k["holder"] == "push_checks", k
+    assert "each batch check run takes 25 min" in k["why"] and "delivery.post_land_checks" in k["why"]
+    # Under the smoke limit, the old reading stands and the lane may still get its task.
+    p.set_config("checks.smoke_max_s", 3600)
+    k = next(k for k in throughput.plan(p.db, p.config(), throughput.measure(p.db, p.config(), now=now,
+                                                                          gates={}))[1] if k["lane"] == "push_batch")
+    assert not k.get("info") and "2 of 2 row(s) waited behind a running batch" in k["why"], k
+
 def _tp_review(p, code_created, run_end, queued, started, labels=()):
     """A code task whose run ended at `run_end`, and its review queued at `queued`, first run at `started`."""
     code = _tp_task(p, "code change", code_created)
@@ -432,7 +513,7 @@ def test_throughput_review_sweep_is_not_lowered_for_waits_the_checks_held(env, m
            (t0 + 3600, "daemon", "review_swept", "normal", f"#{code} x; review #{rv} queued by the daemon.", "handled", code))
     _tp_slot_wait(p, monkeypatch, code, t0 + 60, t0 + 3000)
     _tp_slot_wait(p, monkeypatch, code, t0 + 3700, t0 + 13500)
-    # Queued at finish, held about an hour by its precheck (its checks.pid start to its checks.rc).
+    # Queued at finish, held about an hour by its precheck (from when it ran on a host to its checks.rc).
     t1 = now - 3 * 3600
     code2, rv2 = _tp_review(p, t1 - 1800, t1, t1 + 100, t1 + 5000)
     name = f"t{code2}-0123456789ab"
@@ -440,6 +521,7 @@ def test_throughput_review_sweep_is_not_lowered_for_waits_the_checks_held(env, m
     pc = state / "prechecks" / name
     pc.mkdir(parents=True)
     (pc / "checks.pid").write_text(json.dumps({"pid": 1, "ts": t1 + 100}))
+    (pc / "checks.running").write_text(json.dumps({"since": t1 + 100}))
     (pc / "checks.rc").write_text("0")
     os.utime(pc / "checks.rc", (t1 + 3600, t1 + 3600))
     levers = ("coordinator.review_stall_s", "review.sweep_after_s")
@@ -889,7 +971,8 @@ def _tp_checks_run(p, monkeypatch, start, seconds):
 def test_throughput_checks_at_limit_counts_only_the_wait_before_the_grant(env, monkeypatch, tmp_path):
     """#4399's repro: cap 3, a p1 task waits 999 s for the checks, its own checks are granted at once at
     w0+5 and run 900 s beside two runs started at w0. Its waits-log record has no time before the grant,
-    so the wait is not at the limit and nothing is raised. A task queued 700 s while three runs ran is."""
+    so the wait is not at the limit and nothing is raised (#7793: only its 5 s before the grant is a checks
+    wait; the rest is its own checks run). A task queued 700 s while three runs ran is."""
     from ttp import throughput
     from ttp.daemon import Daemon
     p = make(env)
@@ -903,7 +986,8 @@ def test_throughput_checks_at_limit_counts_only_the_wait_before_the_grant(env, m
     _tp_checks_run(p, monkeypatch, w0 + 5, 900)
     rep = throughput.measure(p.db, p.config(), now=now, gates={})
     ck = _tp_lane(rep, "checks_slots")
-    assert (ck["limit"], ck["count"], ck["at_limit"], ck["idle"]) == (3, 1, 0, 1), ck
+    assert (ck["limit"], ck["count"], ck["at_limit"], ck["idle"], ck["median_s"]) == (3, 1, 0, 0, 5), ck
+    assert _tp_lane(rep, "own_job")["median_s"] == 994
     changes, _ = throughput.plan(p.db, p.config(), rep)
     assert not [c for c in changes if c["key"].startswith("checks.")], changes
     # A wait with no grant record at all is not at the limit either.
@@ -917,7 +1001,7 @@ def test_throughput_checks_at_limit_counts_only_the_wait_before_the_grant(env, m
         _tp_checks_run(p, monkeypatch, w1 - 60, 1200)
     _tp_slot_wait(p, monkeypatch, q, w1, w1 + 700)
     ck = _tp_lane(throughput.measure(p.db, p.config(), now=now, gates={}), "checks_slots")
-    assert (ck["count"], ck["at_limit"], ck["idle"]) == (3, 1, 2), ck
+    assert (ck["count"], ck["at_limit"], ck["idle"]) == (3, 1, 1), ck   # the one granted at once: 5 s
     changes, _ = throughput.plan(p.db, p.config(), throughput.measure(p.db, p.config(), now=now, gates={}))
     assert not [c for c in changes if c["key"].startswith("checks.")], changes
 
@@ -1054,6 +1138,27 @@ def test_throughput_judges_a_checks_wait_by_the_cap_its_record_stored_else_the_e
     p.set_config("checks.test_project_max", 4)
     ck = _tp_lane(throughput.measure(p.db, p.config(), now=now, gates={}), "checks_slots")
     assert (ck["count"], ck["at_limit"], ck["idle"]) == (3, 2, 1), ck
+
+
+def test_throughput_charges_a_checks_wait_only_until_its_slot_grant(env, monkeypatch, tmp_path):
+    """#7793: a task that handed off waiting on its own checks got its slot 900 s in, at the project cap,
+    then waited 20 h more for its retry condition and a worker. Only the 900 s before the grant is a
+    checks_slots wait; the rest is its own checks run and after (own_job), never an at-the-limit checks
+    wait that asks to raise checks.slots or checks.test_project_max."""
+    from ttp import throughput
+    from ttp.daemon import Daemon
+    p = make(env)
+    p.set_config("checks.test_project_max", 3)
+    d, now = Daemon(p.base), time.time()
+    w0, wait_s = now - 21 * 3600, 20 * 3600
+    t = _tp_checks_requeue(p, d, monkeypatch, tmp_path, "granted early", w0, wait_s)
+    for s0 in (w0 - 60, w0 - 50, w0 - 40):
+        _tp_checks_run(p, monkeypatch, s0, 1200)
+    _tp_slot_wait(p, monkeypatch, t, w0, w0 + 900, cap=3)
+    rep = throughput.measure(p.db, p.config(), now=now, gates={})
+    ck, own = _tp_lane(rep, "checks_slots"), _tp_lane(rep, "own_job")
+    assert (ck["count"], ck["median_s"], ck["at_limit"]) == (1, 900, 1), ck
+    assert (own["count"], own["median_s"]) == (1, wait_s - 900), own
 
 
 def _tp_host_scene(p, monkeypatch, tmp_path, d, now, at_cap=False, other_grant=False):

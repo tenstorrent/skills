@@ -267,7 +267,7 @@ CREATE INDEX IF NOT EXISTS push_queue_status ON push_queue(status, id);
 CREATE TABLE IF NOT EXISTS push_batches(
   id TEXT PRIMARY KEY, marker TEXT NOT NULL, target TEXT NOT NULL,
   started REAL NOT NULL, ended REAL,
-  outcome TEXT, pushed_sha TEXT, version TEXT, tip TEXT, check_runs INTEGER, check_s REAL,
+  outcome TEXT, pushed_sha TEXT, version TEXT, tip TEXT, check_runs INTEGER, check_s REAL, check_cpu_s REAL,
   after_push TEXT, after_tries INTEGER NOT NULL DEFAULT 0, finalized REAL, after_finalized REAL);
 """
 # Open asks older than this no longer hold back idle-slot wakes. They are still shown until answered.
@@ -434,6 +434,7 @@ class DB:
         self._migrate_review_code_lines()
         self._migrate_tier_source()
         self._migrate_run_cost_basis()
+        self._migrate_push_check_cpu()
 
     def _migrate_tier_source(self) -> None:
         # The tier a task was queued at and why its current tier is what it is (TIER_SOURCES). Older
@@ -454,6 +455,15 @@ class DB:
         with self.tx():
             if "cost_basis" not in {r["name"] for r in self.q("PRAGMA table_info(runs)")}:
                 self.x("ALTER TABLE runs ADD COLUMN cost_basis TEXT")
+
+    def _migrate_push_check_cpu(self) -> None:
+        # The CPU seconds a push train's checks took here (Batch._spent; trainstats). Older batches keep
+        # NULL, shown as unrecorded.
+        if "check_cpu_s" in {r["name"] for r in self.q("PRAGMA table_info(push_batches)")}:
+            return
+        with self.tx():
+            if "check_cpu_s" not in {r["name"] for r in self.q("PRAGMA table_info(push_batches)")}:
+                self.x("ALTER TABLE push_batches ADD COLUMN check_cpu_s REAL")
 
     def _migrate_review_self_check(self) -> None:
         # Whether the reviewed hand-off carried a `self_check` line. Older rows have none (NULL).
@@ -1115,14 +1125,19 @@ END""")
         if old and (d := deferral(old)).get("when") and not deferral({"labels": kw["labels"]}).get("when"):
             record_start_passed(self, old, d, kw["updated"])
 
-    def requeue(self, task_id: int) -> str:
+    def requeue(self, task_id: int, force: bool = False, by: str = "requeue") -> str:
         """Put a task that is not running back in the queue (the user's decision to run it: the web app,
         `ttp task requeue`): its blocked reason, its waiting state and earlier unchanged wakes, and its
-        failed workspace tries are cleared. Returns "" when done, else why not (no such task, running)."""
+        failed workspace tries are cleared. Returns "" when done, else why not (no such task, running).
+        A cancelled or done task, or one at its attempt limit, is queued again only with `force` (a
+        deliberate requeue: `--force`, a click in the web app): a script that requeues failed or waiting
+        work model-free never undoes a cancel or a done hand-off, nor runs a task past its cap."""
         with self.tx():
             t = self.task(task_id)
             if not t:
                 return f"no task #{task_id}"
+            if not force and (why := requeue_refusal(t)):
+                return why
             # One statement, so dispatch cannot start the task between a check and the write.
             if not self.conn.execute("UPDATE tasks SET status='queued', blocked_reason=NULL, updated=? "
                                      "WHERE id=? AND status!='running'", (time.time(), task_id)).rowcount:
@@ -1136,7 +1151,7 @@ END""")
                 self.x("UPDATE tasks SET result=? WHERE id=?", (dump_result(prev), task_id))
             if t["status"] != "queued":   # logged; dispatch's done count restarts (dispatchguard)
                 from . import dispatchguard
-                dispatchguard.record_requeue(self, task_id, t["status"], "requeue")
+                dispatchguard.record_requeue(self, task_id, t["status"], by + (" --force" if force else ""))
             for key in (WORKSPACE_TRIES_KEY, WORKSPACE_LOCK_TRIES_KEY):
                 tries = self.kv(key, {}) or {}
                 if str(task_id) in tries:
@@ -1640,3 +1655,16 @@ def load_result(text: str | None) -> dict:
         return {"summary": json.loads('"' + re.sub(r"\\u[0-9a-fA-F]{0,3}$", "", m.group(1)) + '"')}
     except ValueError:
         return {}
+
+
+def requeue_refusal(task: dict) -> str:
+    """Why a plain (not forced) requeue must leave `task` as it is ('' when it may queue it): a cancel
+    and a done hand-off are decisions, and a task that failed its last allowed attempt is at its cap."""
+    status, n, limit = task.get("status") or "", int(task.get("attempts") or 0), int(task.get("max_attempts") or 3)
+    if status in ("cancelled", "done"):
+        why = f"task #{task['id']} is {status}"
+    elif status == "failed" and n >= limit:
+        why = f"task #{task['id']} failed its last allowed attempt ({n} of {limit})"
+    else:
+        return ""
+    return f"{why}: only a deliberate requeue runs it again (--force)"

@@ -697,7 +697,8 @@ def _segments(cmd: str, strip: bool = True) -> list[list[str]]:
     """The simple commands in `cmd`, each without its leading variable assignments and wrappers
     (env, nohup, timeout 60, `ttp lock res --` ...): what actually runs first in each. `strip`
     False keeps them."""
-    cmd = "".join(";" if c == "\n" and not inert else c for c, (inert, _) in zip(cmd, _quoting(cmd)))
+    # A line break ends a command; it stays a line break too, so a `#` comment (a script's #! line) ends there
+    cmd = "".join(";\n;" if c == "\n" and not inert else c for c, (inert, _) in zip(cmd, _quoting(cmd)))
     try:
         import shlex
         lex = shlex.shlex(cmd, posix=True, punctuation_chars=";&|()<>")

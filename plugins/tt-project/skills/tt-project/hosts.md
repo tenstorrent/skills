@@ -16,8 +16,14 @@ Each line starts with the message id: `[#<id> coordinator] <text>`.
 - For a project on another machine the listener runs there over ssh. A dropped connection is
   retried (5 s, doubling to 2 min) until it is back; each message prints once per listener.
 - With `--once`, a batch that arrived before a drop ends the listener normally (exit 0).
+- It prints only what the user should see: this chat's replies, asks and high alerts at once;
+  other alerts together after up to `relay.batch_s` (120 s; `--batch S` per listener). Routine
+  updates stay in `ttp status` and the web app (`--all` prints everything).
+- Listen only on your own chat id, the one `ttp connect` printed in this chat. A chat id another
+  relayer listens on is refused (exit 2, naming it). If that relayer stays gone `relay.lease_s`
+  (10 min), a resumed copy of it may take the chat over; its first owner gets back what was taken.
 - Exit codes: `0` messages shown or `--timeout` reached; `2` the project refused it (unknown chat
-  or project); `3` a newer listener for this chat took over (do not restart this one); `75` still
+  or project, or another relayer's chat); `3` a newer listener for this chat took over (do not restart this one); `75` still
   unreachable when `--timeout` ran out (nothing is lost: start it again).
 
 ## Claude Code

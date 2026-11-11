@@ -72,8 +72,10 @@ handed off failed, and routed changes a review or checks sent back); such a line
 Missing model: a model_missing fallback cools nothing; it holds that tier's route alone (MISSING kv,
 hold), so its runs start on the core provider with fallback `model_missing` and one normal notice
 names the provider, tier and model. The hold ends (release, each daemon tick) once the tier's
-configured model changes or the daemon's model-free /models check (every minute while a tier or run class
-routes: models_every, providers.chat.models_every_s) lists the model again. That check writes the served ids, its time and HTTP status to
+configured model changes or the model-free /models check lists the model again: the host's one shared poll
+(served.py: every 30 s while any project routes to chat, else every 5 min), with the project's own check
+(every minute while a tier or run class routes: models_every, providers.chat.models_every_s) the fallback when
+the shared files cannot be written. Each writes the served ids, its time and HTTP status to
 the project state dir's MODELS_FILE, never the key or URL; `ttp status` and doctor show holds and ids
 (model_lines), so a worker can pick a replacement without the key. With providers.chat.model_ranking
 set, a routed start whose model is held or unlisted runs the highest-ranked served model instead
@@ -236,6 +238,30 @@ def models(cfg: dict, tier: str) -> set[str]:
     return {*([own[1]] if own else []), *(r["model"] for _, r in rules(cfg) if not r["tiers"] or tier in r["tiers"])}
 
 
+def protected(db, cfg: dict, task: dict, tier: str) -> str:
+    """Why a worker run stays on the core provider whatever a rule, escalation or Jev pick says, or ''.
+    Model-free and always on: a deep tier, device, urgent, optimization, conclusion or untrusted-input
+    run is never sent to a routed provider or model. (Coordinator and review runs are never routed:
+    see eligible.)"""
+    from . import effort, modelpick, tierfloor, urgent
+    if tier == "deep":
+        return "deep"
+    if effort.device_task(task):
+        return "device"
+    if urgent.is_urgent(task):
+        return "urgent"
+    if modelpick.UNTRUSTED in modelpick._labels(task):
+        return "untrusted"
+    if modelpick.HARD.search(f"{task.get('title') or ''}\n{task.get('spec') or ''}"):
+        return "optimization"
+    try:
+        if tierfloor.target(db, cfg, task):
+            return "conclusion"
+    except Exception:   # an unreadable floor keeps the task on core
+        return "conclusion"
+    return ""
+
+
 def timeout_s(cfg: dict, tier: str, rule: int | None = None) -> float | None:
     """The routed run time limit: rule `rule`'s route_timeout_s (match), else the tier's
     (providers.chat.tiers.<tier>.route_timeout_s), or None: the tier's budget.run_timeout_s applies."""
@@ -329,8 +355,7 @@ def release(db, cfg: dict, served: dict, now: float) -> list[tuple[str, str, str
     return out
 
 
-def read_served(state: Path) -> dict:
-    """The last model-free /models check per provider ({"ids", "checked", "ok", "check"}), or {}."""
+def _own_served(state: Path) -> dict:
     try:
         v = json.loads((Path(state) / MODELS_FILE).read_text())
     except (OSError, ValueError):
@@ -338,18 +363,33 @@ def read_served(state: Path) -> dict:
     return v if isinstance(v, dict) else {}
 
 
-def write_served(state: Path, prov: str, ok: bool, check: str, ids: list[str] | None, now: float) -> None:
-    """Record one /models check: ids only, the check time and its HTTP status line, never the key or URL.
-    A failed check keeps the last ids it had (marked by `ok` false)."""
-    data = read_served(state)
+def read_served(state: Path) -> dict:
+    """The last model-free /models check per provider ({"ids", "checked", "ok", "check", "every"}), or {}:
+    the host's shared list of the project's endpoint (served.py) where it is newer, else the project's own."""
+    from . import served
+    data = _own_served(state)
+    shared = served.read(served.link(state, TO))
+    own = data.get(TO) if isinstance(data.get(TO), dict) else {}
+    if shared.get("checked") and float(shared["checked"]) >= float(own.get("checked") or 0):
+        data[TO] = served.entry(shared)
+    return data
+
+
+def write_served(state: Path, prov: str, ok: bool, check: str, ids: list[str] | None, now: float,
+                 every: int | None = None) -> None:
+    """Record one /models check in the project's own list: ids only, the check time, its HTTP status line
+    and the poll interval in force (`every`), never the key or URL. A failed check keeps the last ids it
+    had (marked by `ok` false)."""
+    data = _own_served(state)
     last = data.get(prov) if isinstance(data.get(prov), dict) else {}
     data[prov] = {"ids": list(ids or []) if ok else list(last.get("ids") or []), "checked": now, "ok": bool(ok),
-                  "check": check, **({"listed": last.get("checked")} if not ok and last.get("checked") else {})}
+                  "check": check, **({"every": every} if every else {}),
+                  **({"listed": last.get("checked")} if not ok and last.get("checked") else {})}
     from .project import durable_write
     durable_write(Path(state) / MODELS_FILE, json.dumps(data, indent=1))
 
 
-def refresh_served(state: Path, alias: str) -> bool:
+def refresh_served(state: Path, alias: str, every: int | None = None) -> bool:
     """Run one /models check with the key saved for `alias` and record it (write_served); False when no
     key is saved (the auth gate tells the user). Nothing it writes holds the key or the URL."""
     from . import endpoint
@@ -357,7 +397,7 @@ def refresh_served(state: Path, alias: str) -> bool:
     if got is None:
         return False
     ok, msg, ids = endpoint.list_models(got.url, got.key)
-    write_served(state, TO, ok, msg, ids, time.time())
+    write_served(state, TO, ok, msg, ids, time.time(), every=every)
     return True
 
 
@@ -367,14 +407,34 @@ def models_every(cfg: dict) -> int:
     return v if isinstance(v, int) and not isinstance(v, bool) and v > 0 else MODELS_EVERY_S
 
 
-def models_due(cfg: dict, state: Path, now: float, db=None) -> str:
-    """The endpoint alias whose /models check is due (a tier or run class routes to it, or with a model
-    ranking set a queued or running task pins a model on it, and the last check is models_every old), else ''."""
-    from . import runclass
+def chat_alias(cfg: dict) -> str:
+    """providers.chat.endpoint, or ''."""
     entry = (cfg.get("providers") or {}).get(TO) or {}
-    alias = str(entry.get("endpoint") or "") if isinstance(entry, dict) else ""
+    return str(entry.get("endpoint") or "") if isinstance(entry, dict) else ""
+
+
+def _routed(cfg: dict, db) -> str:
+    from . import runclass
+    alias, entry = chat_alias(cfg), (cfg.get("providers") or {}).get(TO) or {}
     if not alias or not (any(target(cfg, t) for t in (entry.get("tiers") or {}))
                          or "chat" in runclass.routes(cfg).values() or _ranked_pin(cfg, db)):
+        return ""
+    return alias
+
+
+def routes_chat(cfg: dict, db=None) -> str:
+    """The endpoint alias when the project sends work to chat (a tier, routes rule or run class, a ranked
+    model pin, or babysitting), else '': the host's shared /models poll then runs at its busy interval (served.py)."""
+    from . import babysit
+    return _routed(cfg, db) or (chat_alias(cfg) if babysit.settings(cfg) else "")
+
+
+def models_due(cfg: dict, state: Path, now: float, db=None) -> str:
+    """The endpoint alias whose per-project /models check is due (a tier or run class routes to it, or with a
+    model ranking set a queued or running task pins a model on it, and the last check is models_every old),
+    else ''. The fallback when the host's shared poll cannot run (served.py)."""
+    alias = _routed(cfg, db)
+    if not alias:
         return ""
     last = read_served(state).get(TO) or {}
     return alias if now - float(last.get("checked") or 0) >= models_every(cfg) else ""
@@ -399,7 +459,7 @@ def model_lines(db, cfg: dict, state: Path, now: float, at) -> list[str]:
         if held(db, cfg, tier):
             out.append(f"routing: {tier} held since {at(float(h.get('since') or now))}: {TO} does not serve "
                        f"{h.get('model')}; runs start on the core provider until providers.{TO}.tiers.{tier}.model "
-                       f"changes or the endpoint lists it (checked every minute)")
+                       f"changes or the endpoint lists it (checked every 30 seconds)")
     if rec:
         ids = rec.get("ids") or []
         state_txt = "" if rec.get("ok") else f" (failed: {rec.get('check') or '?'}; ids from the last good check)"
@@ -675,6 +735,7 @@ def phrase(db, now: float | None = None) -> str:
 def runs(db, tier: str | None, since: float, until: float | None = None) -> list[dict]:
     """Worker runs with their provider, model, tier, outcome and wall time (`ttp stats --runs`): every
     worker run of the window, routed or not, so a tier's runs compare before and after routing."""
+    from . import modelrank
     routed = {r["id"]: r for r in _rows(db, since, until)}
     out = []
     for r in db.q("SELECT r.id, r.task, r.provider, r.model, r.status, r.started, r.ended, r.cost_usd, r.note, "
@@ -691,7 +752,8 @@ def runs(db, tier: str | None, since: float, until: float | None = None) -> list
             or r["task_tier"] or ""
         if tier and t != tier:
             continue
-        out.append({"id": r["id"], "task": r["task"], "tier": t, "provider": r["provider"], "model": r["model"],
+        out.append({"id": r["id"], "task": r["task"], "tier": t, "provider": r["provider"],
+                    "model": modelrank.label(r["model"], n),   # 'B (stand-in for A)' after a mid-run swap
                     "outcome": r["status"], "fallback": (e or {}).get("fallback", ""),
                     **({"escalated": e.get("escalated") or "", "cause": e.get("cause") or ""}
                        if (e or {}).get("fallback") == ESCALATED else {}),
@@ -711,7 +773,7 @@ def runs_text(rows: list[dict]) -> str:
             + (" (salvaged)" if r.get("salvaged") else "")
         wall = f"{r['wall_s'] / 60:.1f}m" if r["wall_s"] is not None else "-"
         lines.append(f"{r['id']:<6} {str(r['task'] or ''):<6} {str(r['tier'] or '-'):<9} {str(r['provider']):<9} "
-                     f"{str(r['model'] or '-')[:30]:<30} {out[:22]:<22} {wall:>6} {cost:>9}")
+                     f"{str(r['model'] or '-')[:48]:<30} {out[:22]:<22} {wall:>6} {cost:>9}")
     why: dict[str, int] = {}
     for r in rows:
         if r["fallback"] == ESCALATED:

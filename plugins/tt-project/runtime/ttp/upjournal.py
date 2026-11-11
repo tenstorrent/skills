@@ -186,7 +186,7 @@ def recover(p, daemon_started: float | None = None, restart=None, log=print) -> 
                 _write_request(p, RESTART_REQUEST, "an interrupted upgrade merged new code")
                 what += "; this daemon restarts on it"
         elif restart is not None and not _daemon_up(p):     # a live daemon restarts itself on moved code
-            what += f"; daemon: {restart(p)}"
+            what += "; the daemon is stopped, so it was not started: it runs the new code at its next start"
     if rec.get("auto"):
         auto = p.db.kv(release.KV_AUTO) or {}
         if finished:

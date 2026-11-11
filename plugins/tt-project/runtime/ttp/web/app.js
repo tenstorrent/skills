@@ -233,7 +233,8 @@ function board(st) {
     ["queued", "Queued", st.tasks.filter((t) => t.status === "queued").map((t) => [`#${t.id} ${t.title}${deferred(t) ? ` (${t.starts})` : waiting(t) ? ` (waiting, next try ${at(t.not_before)})` : ""}`])],
   ];
   R.rows($("#board"), cols.map(([cls, name, items]) => ({ key: cls, html: `<div class="col ${cls}"><h3>${name}<span class="n">${items.length}</span></h3>` +
-    (items.slice(0, 6).map(([x, tail, head]) => `<div class="item">${head || ""}${esc(cls === "you" ? preview(x, 320, "full text below") : x.slice(0, 160))}${tail || ""}</div>`).join("") || `<div class="item muted">—</div>`) + `</div>` })));
+    // What waits on the user shows in full and every item of it: never only an id to look up (user msg #2424).
+    (items.slice(0, cls === "you" ? items.length : 6).map(([x, tail, head]) => `<div class="item">${head || ""}${esc(cls === "you" ? x : x.slice(0, 160))}${tail || ""}</div>`).join("") || `<div class="item muted">—</div>`) + `</div>` })));
 }
 
 let lastOk = 0;

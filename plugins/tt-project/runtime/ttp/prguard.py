@@ -1054,10 +1054,10 @@ def _restore_stdin(data: bytes) -> None:
 
 
 # Commands that read stdin without a `-` argument when it is not a terminal (a secret or variable
-# value, a gist's content, a key, a token, workflow inputs as JSON): they keep it.
+# value, a gist's content, a key, a token, workflow inputs as JSON, git's credential request): they keep it.
 STDIN_COMMANDS = frozenset((("secret", "set"), ("variable", "set"), ("gist", "create"), ("ssh-key", "add"),
-                            ("gpg-key", "add"), ("auth", "login"), ("workflow", "run"), ("alias", "import"),
-                            ("extension", "exec"), ("codespace", "ssh")))
+                            ("gpg-key", "add"), ("auth", "login"), ("auth", "git-credential"), ("workflow", "run"),
+                            ("alias", "import"), ("extension", "exec"), ("codespace", "ssh")))
 # What gh reads as stdin: `-` and the paths that name fd 0.
 STDIN_PATHS = frozenset(("-", "/dev/stdin", "/dev/fd/0", "/proc/self/fd/0"))
 # Posts whose body the AI-authorship check (aitag) reads, from stdin too.
@@ -1245,6 +1245,15 @@ def main(argv: list[str], own_dir: str) -> int:
             log_call(state, seen, args, refused=True)
         print(f"gh (tt-project): {why}", file=sys.stderr)
         return 1
+    from . import ghroute
+    if ghroute.wanted(args):   # no gh login here: on delivery.gh_route, else held or read publicly
+        data = stdin_text.encode() if stdin_raw is None and stdin_text is not None else stdin_raw
+        rc = ghroute.run(real, args, input=data)
+        if allowed and db is not None:
+            log_call(state, seen, args, refused=False, rc=rc)
+            if rc == 0:
+                spend(db, allowed)
+        return rc
     if allowed and db is not None:
         # The approval is spent once the PR has left draft with it.
         rc = subprocess.run([real, *args], input=stdin_text if stdin_raw is None else stdin_raw,

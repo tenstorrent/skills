@@ -141,6 +141,7 @@ class Claude(Provider):
 
     caps_budget = True   # --max-budget-usd
     coord_session = "agent"   # --resume <session id>
+    resume_new_prompt = "reread"   # --system-prompt-file and --json-schema are per run, --resume or not
     session_format = "claude-code"   # projects/<cwd slug>/<id>.jsonl (fork_session); the chat provider's too
     tool_hooks = True
     fence_optional = True   # the Bash sandbox (fence_args)
@@ -881,6 +882,37 @@ def calls_cost(path: Path, overrides: dict | None = None, transcripts=(), tail: 
     if per and transcripts:
         logged = tail.usage(transcripts, set(per)) if tail is not None else logged_usage(transcripts, set(per))
     return price_calls(per, overrides, logged)
+
+
+def subagent_calls(output_path: Path, session_id: str, env: dict | None = None) -> list[dict]:
+    """A run's subagent API calls (the Agent or Task tool, nested ones too), which its result's usage
+    leaves out: [{"model", "usage"}], each message once at its fullest reading (most output tokens).
+    Read from the stream's events with parent_tool_use_id set and from the session's subagent
+    transcripts (<config dir>/projects/*/<session>/subagents/), which also hold the messages and
+    final token counts the stream leaves out."""
+    best: dict[str, dict] = {}
+
+    def take(n: int, ev, where: str) -> None:
+        if not isinstance(ev, dict) or ev.get("type") != "assistant":
+            return
+        msg = ev.get("message") if isinstance(ev.get("message"), dict) else {}
+        usage, model = msg.get("usage"), str(msg.get("model") or "")
+        if not isinstance(usage, dict) or model == "<synthetic>":   # written by the CLI, no API call
+            return
+        key = str(msg.get("id") or ev.get("uuid") or f"{where}:{n}")
+        rank = (int(usage.get("output_tokens") or 0), sum(int(usage.get(k) or 0) for k in USAGE_KEYS))
+        if key not in best or rank > best[key]["rank"]:
+            best[key] = {"model": model, "usage": usage, "rank": rank}
+
+    prov = Claude()
+    for n, ev in enumerate(prov._events(Path(output_path))):
+        if ev.get("parent_tool_use_id"):
+            take(n, ev, "stream")
+    for path in prov.session_paths(session_id, "", env):
+        if "subagents" in path.parts:
+            for n, ev in enumerate(prov._events(path)):
+                take(n, ev, str(path))
+    return [{"model": c["model"], "usage": c["usage"]} for c in best.values()]
 
 
 def _whole_answer(row: dict) -> bool:

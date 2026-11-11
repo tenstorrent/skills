@@ -13,8 +13,9 @@ and neither seeds a new session. "stateless" is left only for a provider that ke
 (Provider.session_gap: the chat provider, whose coordinator use is out of scope here), named in the
 wake's `why`.
 
-A new session starts only when: there is none; the prefix key changed (system prompt, stable
-context, action schema or agent); the model or effort changed; the last new session's first wake did
+A new session starts only when: there is none; the provider changed; the prompt changed (system
+prompt, stable context or action schema) on a provider that cannot resume with a changed prompt
+(Provider.resume_new_prompt ""); the model or effort changed; the last new session's first wake did
 not end ok and did no work in it (one that did, then hit its dollar cap or timeout, is kept like a
 failed resume: the next wake resumes it); its transcript is no longer saved (a host move or the provider's session expiry); or the
 provider rejected the resume (resume failed, below). Never because the context grew: the session
@@ -79,10 +80,12 @@ section (memory, user corrections, promises, chats) is hashed raw and sent whole
 whose only change is an age goes whole too."""
 from __future__ import annotations
 
+import difflib
 import hashlib
 import json
 import re
 import time
+from pathlib import Path
 
 from . import cachettl, spans
 
@@ -114,6 +117,9 @@ CHAT_EXCHANGES = 20       # the chat exchanges a new or compacted session's firs
 CHAT_CHARS = 60000        # their cap: the oldest whole exchanges go first, the newest always stays
 NOTE_DIR = "coord-session"
 HANDOFF_SUFFIX = ".handoff.md"
+PREFIX_FILE = "prefix.json"   # under NOTE_DIR, and each session wake's run dir: the prompt it ran with
+CHANGED_HEAD = "## Changed since your last wake"
+PROMPT_NEW = "prompt changed, provider cannot resume with it"   # decide()'s own reason (Provider.resume_new_prompt)
 # Every provider runs the session, with no opt-out. Each provider says how it keeps it
 # (providers/base.Provider.coord_session): "agent" resumes the agent CLI's own saved session
 # (claude, codex, cursor; the fake in tests); the chat provider keeps none (Provider.session_gap).
@@ -146,6 +152,10 @@ _MSG_RE = re.compile(r"\b(?:(?:user|msgs?|messages?)\s*#|msgs?\s+|messages?\s+)(
                      re.I)
 _QUOTE_RE = re.compile(r'"([^"\n]{3,})"|“([^”\n]{3,})”|(?<!\w)[\'‘]([^\n]{3,}?)[\'’](?!\w)')
 DROPPED = "order_claim_dropped"   # the event kind of a claimed user order that failed the verbatim check
+# What replaces the user's-words label of a line that failed the verbatim check and is kept (as_data): it
+# names no user or owner, so no reader (CLAIM_RE, a handover, the memory loader) takes it for their words.
+DATA_LABEL = "[unverified quote, kept as data]"
+_PUNCT_RE = re.compile(r"[^\w\s]+")
 
 
 def _row_key(section: str, line: str) -> str | None:
@@ -203,19 +213,25 @@ def prefix_key(system: str | None, context: str | None, schema: dict | None, pro
 
 
 def decide(cfg: dict, state, prefix_key: str, model: str, effort: str, saved, now: float,
-           no_session: str = "") -> tuple[str, str]:
+           no_session: str = "", provider: str = "", prompt_resumes: bool = True) -> tuple[str, str]:
     """(mode, why) of one wake: "resume" or "new" (the next session, seeded with the hand-off). A daemon
     restart or a reboot changes nothing here: the saved session is resumed by its id. `state`
     is kv KEY (None: none yet), `saved(session_id)` says the agent can still resume that session,
     `no_session` is gap() of the wake's provider: only a provider that keeps no session at all gets
-    "stateless". No setting in `cfg` changes the mode; it only sizes the rollover (limit())."""
+    "stateless". No setting in `cfg` changes the mode; it only sizes compaction (limit()). A changed
+    `prefix_key` resumes ("prompt changed": the wake leads with changed_block()) unless the wake's
+    `provider` differs from the session's or cannot resume with a changed prompt (`prompt_resumes`
+    False: Provider.resume_new_prompt "")."""
     if no_session:
         return "stateless", no_session
     st = state if isinstance(state, dict) else {}
     if not st.get("id"):
         return "new", "no session"
-    if st.get("key") != prefix_key:
-        return "new", "prefix changed"
+    if provider and st.get("provider") and str(st["provider"]) != str(provider):
+        return "new", "provider changed"
+    changed = st.get("key") != prefix_key
+    if changed and not prompt_resumes:
+        return "new", PROMPT_NEW
     if str(st.get("model") or "") != str(model or "") or str(st.get("effort") or "") != str(effort or ""):
         return "new", "model or effort changed"
     if st.get("rerun") and st.get("rejected"):
@@ -228,7 +244,62 @@ def decide(cfg: dict, state, prefix_key: str, model: str, effort: str, saved, no
         return "resume", "rerun"
     if _num(st.get("context_tokens"), 0) >= limit(cfg, st, model):
         return "resume", "compact"   # the same session compacts in place (agent switch or session_note)
-    return "resume", "continued"
+    return "resume", "prompt changed" if changed else "continued"
+
+
+def prefix_record(key: str, system: str | None, context: str | None, schema: dict | None) -> dict:
+    """What a session wake's changed_block() compares: the prompt texts and the schema's hash."""
+    return {"key": key, "system": system or "", "context": context or "",
+            "schema": _sha(json.dumps(schema, sort_keys=True))}
+
+
+def acked_prefix(p) -> dict:
+    """prefix_record() of the last session wake that ended ok ({} when none is saved)."""
+    try:
+        got = json.loads((p.state / NOTE_DIR / PREFIX_FILE).read_text())
+    except (OSError, ValueError):
+        return {}
+    return got if isinstance(got, dict) else {}
+
+
+def ack_prefix(p, run_dir) -> None:
+    """After a session wake that ended ok: the prompt it ran with (its run dir's PREFIX_FILE) is the one
+    the next wake compares with. A failed wake leaves the saved one, so its changes are sent again."""
+    src = Path(run_dir) / PREFIX_FILE
+    if not src.is_file():
+        return
+    from .project import durable_write
+    durable_write(p.state / NOTE_DIR / PREFIX_FILE, src.read_bytes())
+
+
+def changed_block(before: dict, now: dict, version: str, with_system: bool, last_key: str = "") -> str:
+    """The resumed wake's lead when its prompt changed since the last wake that ended ok (`before`,
+    acked_prefix(); `now`, prefix_record()), model-free: a prompt version line, the charter's unified
+    diff (the changed text whole where that is shorter) and, with `with_system` (a provider whose resume
+    keeps the old system prompt, Provider.resume_new_prompt "diff"), the system prompt's too. Memory is
+    not here: resume_memory() leads every resumed wake with its changes. With no saved copy, only a key
+    that differs from the session's `last_key` counts as a change, and the changed parts go whole. ""
+    when nothing changed."""
+    if before.get("key", last_key) == now["key"]:
+        return ""
+    lines = [f"{CHANGED_HEAD} (model-free; the session continues)",
+             f"Prompt version: {str(before.get('key') or last_key or 'unknown')[:16]} -> {now['key'][:16]} "
+             f"(tt-project {version}). The new system prompt and action schema apply from this wake."]
+    if not before:
+        lines.append("The earlier prompt is not on disk, so the current text follows whole.")
+    parts = [("Charter", "context")] + ([("System prompt", "system")] if with_system else [])
+    for name, k in parts:
+        if before and before.get(k) == now[k]:
+            continue
+        diff = "\n".join(difflib.unified_diff(str(before.get(k) or "").splitlines(), now[k].splitlines(),
+                                              f"{name} (last wake)", f"{name} (now)", n=1, lineterm=""))
+        whole = not before or len(diff) >= len(now[k])
+        lines += [f"{name} ({'whole' if whole else 'unified diff'}):", "```", now[k] if whole else diff, "```"]
+    if not with_system and before and before.get("system") != now["system"]:
+        lines.append("System prompt: changed (the new one is in effect).")
+    if before and before.get("schema") != now["schema"]:
+        lines.append("Action schema: changed (the new one is in effect).")
+    return "\n".join(lines)
 
 
 def salvaged_line(n) -> str:
@@ -276,14 +347,14 @@ def context_tokens(usage) -> int:
 
 
 def record(state, usage, session_id: str, turn: dict, ok: bool, now: float, summary: str = "",
-           compacted=None) -> dict:
+           compacted=None, noted: bool = False) -> dict:
     """kv KEY after a wake that decided `turn` ({"mode", "why", "key", "model", "effort",
     "provider"}) ended, ok or not; `summary` is its answer's own summary, kept in `recent` for the next
     seed or restore. A provider gap's stateless wake leaves the session as it was. `compacted`: the
     agent compacted the session during the wake ({"pre_tokens": its size before, "post_tokens": its history
-    right after, when known}); a
-    "compact" wake without it was the harness-supplied summary (its session_note). Either is kept in
-    `compactions` and makes the next wake lead with restore()."""
+    right after, when known}); `noted`: the wake was asked for the harness-supplied summary (compact_ask)
+    and returned its session_note. Either is kept in `compactions` and makes the next wake lead with
+    restore(); a "compact" wake with neither (the agent's switch did not fire) records no compaction."""
     st = dict(state) if isinstance(state, dict) else {}
     st.setdefault("failures", [])
     mode = turn.get("mode")
@@ -328,7 +399,7 @@ def record(state, usage, session_id: str, turn: dict, ok: bool, now: float, summ
         if turn.get("restore"):   # the pinned record went out after the last compaction
             st.pop("restore", None)
         agent = isinstance(compacted, dict) or compacted is True
-        if agent or (mode == "resume" and turn.get("why") == "compact"):
+        if agent or (noted and mode == "resume" and turn.get("why") == "compact"):
             pre = _num(compacted.get("pre_tokens"), 0) if isinstance(compacted, dict) else 0
             row = {"at": now, "session": st["id"], "before": int(pre or before),
                    "after": st["context_tokens"], "how": "agent" if agent else "summary"}
@@ -593,7 +664,6 @@ def order_claim(db, line: str, agent: bool = False, strict: bool = True) -> str:
     `agent`) hold each of its quotes. A labelled line without a quote fails when `strict` (a handover
     line), else passes (a memory entry's paraphrase is data). Unlabelled lines are data, never checked."""
     from . import relay
-    from .restriction_source import _loose
     if not CLAIM_RE.search(line or ""):
         return ""
     quotes = [" ".join(next(g for g in m.groups() if g).split()) for m in _QUOTE_RE.finditer(line)]
@@ -610,10 +680,39 @@ def order_claim(db, line: str, agent: bool = False, strict: bool = True) -> str:
             said += [own, ctx if agent else ""]
     if not any(said):
         return f"msg #{', #'.join(map(str, ids))} is no logged message from the user"
-    words = _loose("\n".join(said))
-    if bad := next((q for q in quotes if _loose(q) not in words), None):
+    words = _plain("\n".join(said))
+    if bad := next((q for q in quotes if not _plain(q) or _plain(q) not in words), None):
         return f"{bad[:120]!r} is not in the user's own words of msg #{', #'.join(map(str, ids))}"
     return ""
+
+
+def _plain(text: str) -> str:
+    """`text` compared for the verbatim check: case, whitespace, quote style and punctuation aside."""
+    from .restriction_source import _loose
+    return " ".join(_PUNCT_RE.sub(" ", _loose(text)).split())
+
+
+def relabel(line: str) -> str:
+    """`line` with each user's-words label (CLAIM_RE) replaced by DATA_LABEL, the quote it opens kept."""
+    for _ in range(5):   # a replacement may expose another label ("user's user's words")
+        if not CLAIM_RE.search(line):
+            break
+        line = CLAIM_RE.sub(lambda m: DATA_LABEL + (" " + m.group(0)[-1] if m.group(0)[-1] in "\"“‘'" else ""),
+                            line)
+    return line if not CLAIM_RE.search(line) else CLAIM_RE.sub(" ", line)
+
+
+def as_data(db, text: str, agent: bool = False, strict: bool = True) -> tuple[str, list[tuple[str, str]]]:
+    """(`text` with each line whose claimed user order fails order_claim relabelled as data (relabel),
+    [(line, why)] relabelled). For a memory entry: the rest of it still stands, and a relabelled line
+    never counts as the user's words anywhere."""
+    out, bad = [], []
+    for line in str(text or "").splitlines():
+        if why := order_claim(db, line, agent, strict):
+            bad.append((line.strip(), why))
+            line = relabel(line)
+        out.append(line)
+    return "\n".join(out), bad
 
 
 def checked(db, text: str, agent: bool = False, strict: bool = True) -> tuple[str, list[tuple[str, str]]]:

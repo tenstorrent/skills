@@ -69,8 +69,8 @@ def diagnose() -> str:
     if s["route_all"] is False and s["logged_out"] is False:
         return ("Tailscale on this machine is running and logged in, but does not accept subnet routes "
                 "(accept-routes is off), so hosts reached through a subnet route are out of reach. No sign-in "
-                f"is needed: the fix is `{FIX}` on this machine, run only with the user's OK because it "
-                "changes this machine's network settings")
+                f"is needed: the fix is `{FIX}` on this machine; it changes this machine's network settings, "
+                "so it waits for the user's OK")
     return ""
 
 

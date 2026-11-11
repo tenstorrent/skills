@@ -45,7 +45,8 @@ def report(db, runs_dir, tz: str, days: float = 7, now: float | None = None, cfg
     def day(ts: float) -> dict:
         return out.setdefault(timefmt.today(ts, tz), {
             "landed": 0, "direct": 0, "checks_runs": 0, "full_runs": 0, "trains": 0, "train_check_runs": 0,
-            "cpu_s": 0.0, "cpu_unrecorded": 0, "train_check_s": 0.0, "usd": 0.0, "virtual_usd": 0.0, "_wait": []})
+            "cpu_s": 0.0, "cpu_unrecorded": 0, "train_check_s": 0.0, "train_cpu_s": 0.0, "train_cpu_unrecorded": 0,
+            "usd": 0.0, "virtual_usd": 0.0, "_wait": []})
 
     for r in db.q("SELECT q.created, COALESCE(b.ended, q.updated) at_ FROM push_queue q LEFT JOIN push_batches b "
                   "ON b.id=q.batch WHERE q.status IN ('pushed','landed') AND COALESCE(b.ended, q.updated)>=?",
@@ -60,11 +61,17 @@ def report(db, runs_dir, tz: str, days: float = 7, now: float | None = None, cfg
         d = day(float(r["ts"]))
         d["landed"] += 1
         d["direct"] += 1
-    for r in db.q("SELECT started, check_runs, check_s FROM push_batches WHERE started>=? AND check_runs>0", (since,)):
+    for r in db.q("SELECT started, check_runs, check_s, check_cpu_s FROM push_batches WHERE started>=? AND check_runs>0",
+                  (since,)):
         d = day(float(r["started"]))
         d["trains"] += 1
         d["train_check_runs"] += int(r["check_runs"] or 0)
         d["train_check_s"] += float(r["check_s"] or 0)
+        # CPU of the train's checks run here (Batch._spent); a spilled run's host CPU is not in it
+        if r["check_cpu_s"] is None:
+            d["train_cpu_unrecorded"] += 1
+        else:
+            d["train_cpu_s"] += float(r["check_cpu_s"])
     for r in db.q("SELECT id, provider, account, started, ended, cost_usd FROM runs WHERE COALESCE(ended, started)>=?",
                   (since,)):
         if (r["started"] or 0) >= since:
@@ -93,7 +100,7 @@ def report(db, runs_dir, tz: str, days: float = 7, now: float | None = None, cfg
         rows.append({"day": k, **{x: (round(v, 2) if isinstance(v, float) else v) for x, v in d.items()},
                      "runs_per_landed": per(d["checks_runs"] + d["train_check_runs"]),
                      "full_per_landed": per(d["full_runs"] + d["trains"]),
-                     "cpu_h_per_landed": per(d["cpu_s"] / 3600),
+                     "cpu_h_per_landed": per((d["cpu_s"] + d["train_cpu_s"]) / 3600),
                      "usd_per_landed": per(d["usd"]),
                      "landing_median_h": round(m / 3600, 1) if (m := _pct(wait, 0.5)) is not None else None,
                      "landing_p90_h": round(m / 3600, 1) if (m := _pct(wait, 0.9)) is not None else None})
@@ -175,7 +182,10 @@ def text(r: dict, name: str) -> str:
             f"{d['trains']} trains ({d['train_check_runs']} check runs): {f(d['runs_per_landed'])} runs and "
             f"{f(d['full_per_landed'])} full suites/landed; {f(d['cpu_h_per_landed'])} CPU-h/landed"
             + (f" ({d['cpu_unrecorded']} runs recorded no CPU)" if d["cpu_unrecorded"] else "")
-            + f", train checks {d['train_check_s'] / 3600:.1f} h wall; ${f(d['usd_per_landed'])}/landed "
+            + f", train checks {d['train_check_s'] / 3600:.1f} h wall, {d['train_cpu_s'] / 3600:.1f} CPU-h"
+            + (f" ({d['train_cpu_unrecorded']} trains recorded no CPU)" if d["train_cpu_unrecorded"] else "")
+            + "; "
+            f"${f(d['usd_per_landed'])}/landed "
             f"(${d['usd']:.2f}{f' billed, ${v:.2f} virtual on a plan' if (v := d.get('virtual_usd')) else ''}); approved to landed median {f(d['landing_median_h'], ' h')}, "
             f"p90 {f(d['landing_p90_h'], ' h')}")
     if not r["days"]:

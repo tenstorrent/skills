@@ -26,6 +26,7 @@ import hashlib
 import json
 import re
 import time
+from pathlib import Path
 
 from . import msgparts, obligations
 
@@ -90,7 +91,9 @@ def collect(p, cfg: dict, now: float, host: dict | None = None, device: set | No
     take), {"queue": "checks", "since"} (a review's daemon pre-checks wait for a host checks slot) or any
     other hold (a pause, a lock, the spend gate: their own alarms name those). Only the first ready task
     held by full slots raises a workers wait; a task parked on its own checks or a detached wait runs no
-    worker and never counts as a slot holder."""
+    worker and never counts as a slot holder. A checks wait needs an open task with a live wait record (its
+    label queued or parked on the host, its own run's checks waiting for a slot: _checks_waiting, or dispatch's
+    hold) while the host queue has someone waiting: finished checks or 0 queued raise nothing."""
     from .db import TERMINAL_TASK_STATES, load_result
     db, name, out = p.db, p.name, {}
     host = host or {}
@@ -118,15 +121,19 @@ def collect(p, cfg: dict, now: float, host: dict | None = None, device: set | No
         if prev.get("status") != "waiting" or not isinstance(prev.get("waiting_since"), (int, float)):
             continue
         got = classify(prev.get("retry_when") or "", t["blocked_reason"] or "", device)
+        if got and got[0] == "checks" and not (queued and _checks_waiting(p, prev.get("retry_when"))):
+            continue   # its checks finished, run or never queued, or the host queue is empty: no slot to wait for
         if got and not (got[0] == "checks" and t["id"] in busy):
-            add(t["id"], got[0], got[1], prev["waiting_since"],
-                checks if got[0] == "checks" else _holders(db, p, got[0], got[1], cfg))
+            info = checks if got[0] == "checks" else _holders(db, p, got[0], got[1], cfg, now)
+            if not info.pop("live", False):   # a push in its turn, alive and in its time limit: a fair wait
+                add(t["id"], got[0], got[1], prev["waiting_since"], info)
     for t in db.ready_tasks():
         got = hold(t) if hold else _config_hold(db, cfg)
         if got is None:
             break   # dispatch starts it: no ready task behind it waits on a slot
         if got.get("queue") == "checks":   # a review held by its daemon pre-checks waiting for a host slot
-            add(t["id"], "checks", "", got.get("since"), checks)
+            if queued:   # 0 queued on the host: the slot is not what holds it
+                add(t["id"], "checks", "", got.get("since"), checks)
         elif got.get("queue") == "workers":   # the head of the line: more capacity unblocks every one behind it
             prov = got.get("provider")
             run = db.q("SELECT r.task, t.priority FROM runs r JOIN tasks t ON t.id=r.task WHERE r.role!='coordinator' "
@@ -140,6 +147,23 @@ def collect(p, cfg: dict, now: float, host: dict | None = None, device: set | No
     return list(out.values())
 
 
+def _checks_waiting(p, probe) -> bool:
+    """A worker's `ttp checks --result <run dir>` wait has a live record of waiting for a host-wide checks
+    slot: no checks.rc yet, its checks process alive (or in a PID namespace this one cannot judge) and its
+    checks-slot.wait file present. Read-only (never cli._checks_result, which settles the run). A run whose
+    checks finished, run or are gone, or a probe naming no run dir, has none."""
+    from . import cli
+    m = re.search(r"\bttp checks\b[^;|&]*?--result\s+('[^']*'|\"[^\"]*\"|[^\s;|&]+)", str(probe or ""))
+    if not m or "$" in m[1]:
+        return False
+    d = Path(m[1].strip("'\"")).expanduser()
+    d = d if d.is_absolute() else p.base / d
+    if (d / cli.CHECKS_RC).exists() or not (d / cli.CHECKS_SLOT_WAIT).exists():
+        return False
+    info = cli._read_checks_pid(d)
+    return bool(info) and (cli._checks_alive(info) or cli._checks_elsewhere(info))
+
+
 def _config_hold(db, cfg: dict) -> dict | None:
     """Without the daemon's dispatch check (Daemon._queue_hold): dispatch's own rule with no budget gate, every
     live worker run against budget.max_parallel_workers. None: a slot is free."""
@@ -148,11 +172,13 @@ def _config_hold(db, cfg: dict) -> dict | None:
     return {"queue": "workers", "cap": cap} if cap and n >= cap else None
 
 
-def _holders(db, p, queue: str, res: str, cfg: dict) -> dict:
+def _holders(db, p, queue: str, res: str, cfg: dict, now: float | None = None) -> dict:
     if queue == "push":
         rows = db.q("SELECT task, status FROM push_queue WHERE status IN ('approved','pushing') ORDER BY id")
-        return {"cap": 1, "running": [f"{p.name} task #{r['task']}" for r in rows if r["status"] == "pushing"],
-                "queued": [f"{p.name} task #{r['task']}" for r in rows if r["status"] == "approved"]}
+        out = {"cap": 1, "running": [f"{p.name} task #{r['task']}" for r in rows if r["status"] == "pushing"],
+               "queued": [f"{p.name} task #{r['task']}" for r in rows if r["status"] == "approved"]}
+        _push_turns(p, out, time.time() if now is None else now)
+        return out
     if queue in ("device", "lock") and res:
         from . import locks
         try:
@@ -161,6 +187,45 @@ def _holders(db, p, queue: str, res: str, cfg: dict) -> dict:
             held = []
         return {"cap": None, "running": held, "queued": []}
     return {"cap": None, "running": [], "queued": []}
+
+
+PUSH_HOLD_LIMIT_S = 4 * 3600.0   # push.CHECK_LIMIT_FLOOR_S: a push turn held longer is overdue, not a fair wait
+
+
+def _push_turns(p, out: dict, now: float) -> None:
+    """Add to push occupancy `out` the pushes that never write push_queue (`ttp push`, detached or not):
+    each live holder of a branch push lock as running, with its step and minutes held (`live` while one is
+    within PUSH_HOLD_LIMIT_S, so no wait behind it is raised), and each other running detached push
+    (push.running) as queued, with its last `ttp push:` log line. The lock and markers are what the
+    waiting task's blocked reason reads; a holder whose pid died left the lock free, so it is not counted."""
+    from . import locks, push
+    try:
+        paths = [x for x in sorted((p.state / "locks").glob("push:*.lock")) if not x.name.startswith("push:run-")]
+        recs = locks.holder_records(paths, p)
+    except OSError:
+        recs = []
+    pids = set()
+    for h in recs:
+        if h.get("alive") is False or h.get("stale"):
+            continue
+        pids.add(h.get("pid"))
+        try:
+            held = max(0.0, now - float(h.get("since") or now))
+        except (TypeError, ValueError):
+            held = PUSH_HOLD_LIMIT_S + 1   # an unreadable start: counted, never trusted as within its limit
+        step = f"step {h['step']}, " if h.get("step") else ""
+        out["running"].append(f"{p.name} {h.get('holder') or 'a push'} ({step}held {held / 60:.0f} min)")
+        out["live"] = out.get("live") or held <= PUSH_HOLD_LIMIT_S
+    try:
+        marks = push.running(p)
+    except OSError:
+        marks = []
+    for m in marks:
+        if m.get("status") != "running" or (m.get("pid") is not None and m.get("pid") in pids):
+            continue
+        last = next((x for x in reversed(push._tail(m.get("log"), 40).splitlines()) if x.startswith("ttp push:")), "")
+        out["queued"].append(f"{p.name} {'task #' + str(m['task']) if m.get('task') else 'push'} "
+                             f"(push {m.get('id')}{': ' + last[:160] if last else ''})")
 
 
 def spill_ready(p, cfg: dict) -> tuple[list[str], list[str]]:

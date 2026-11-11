@@ -6,15 +6,15 @@
 project's own, else the account's, which rankfresh.py keeps current from the Artificial Analysis
 Intelligence Index wherever a chat endpoint is set. Unset or empty in both, nothing changes. Set, a model is down (down()) while a run was
 refused it (route.py's model_missing hold for a tier, or a ranked model's own refusal here, kept for
-route.RETRY_QUIET_S) or while the last good model-free /models check (route.MODELS_FILE) leaves it out; a check over STALE_S
-old counts as none (route.models_due keeps it fresh while a ranking is set and chat may run).
+route.RETRY_QUIET_S) or while the last good model-free /models check (the host's shared poll, served.py, else route.MODELS_FILE) leaves
+it out; a check over 3 poll intervals old counts as none (served.py polls every 30 s while chat may run).
 
 A routed start (a tier route or a model pick to chat, route.py) whose model is down runs the
 highest-ranked model that check lists and that is not down itself (pick); with none, it falls back
 as before (model_missing: the core provider). A cool-down (the whole endpoint faulted) swaps nothing.
 A task's own model pin on chat that is down is swapped the same way, unless the pin is required
 (failover.required: only the user's own words mark it): such a task waits, held, until its model is
-served again, and is never swapped. Each switch (per tier, routes rule or pinned model) is one low alert;
+served again, and is never swapped. Each switch (per tier, routes rule, picked model or pinned model) is one low alert;
 once the model is served again the next start runs it, and the switch record ends (back).
 
 A routed start (tier, routes rule or run class; never a task's own pin) whose model is up and ranked
@@ -27,19 +27,28 @@ route picks it, and once the week is over it is tried again from scratch (the we
 The host's daily bench (modelbench.py) rechecks parked models weekly: a pass frees one at once, a weak
 score keeps it parked.
 
+A run in flight swaps too (chatbridge.py): its launch names the ranking's other unparked models
+(standins, best first; none for a required pin), and its bridge moves the call and the rest of the run
+to the first of them still served once the endpoint refuses its model, or errs SWAP_ERRORS times in a
+row while the served list leaves it out. The daemon keeps each swap in the run note (KEY "mid_run":
+[{from, to, at, why}]) with one low alert, and a refused model is down (refused()) for new starts.
+Babysit decisions (babysit.py) ask the next ranked served model once before they fall back.
+
 Only the chat provider has a served list; Claude Code, Codex and Cursor models are not ranked here
 (provider failover moves work off a provider that cannot start, failover.py).
 """
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
 from . import route
+from . import served as watch
 
 TO = route.TO                         # the one provider with a served list
 KEY = "model_rank"                    # the route entry's or run note's {"from", "why"} of a swapped run
-SWITCH = "model_rank_switch:"         # kv per tier, "<tier>:rule<i>" or "pin:<model>": {"from", "to", "since"} while swapped
+SWITCH = "model_rank_switch:"         # kv per tier, "<tier>:rule<i>", "<tier>:pick:<model>" or "pin:<model>": {"from", "to", "since"} while swapped
 REFUSED = "model_rank_refused:"       # kv per ranked model a swapped run was refused: {"at", "run"}
 TRIED = "model_rank_tried:"           # kv per better() model: {"ok", "bad": its runs' ends, "since", "run"}
 PARKED = "model_rank_parked:"         # kv per parked model: {"at", "run", "why"}
@@ -73,22 +82,27 @@ def ranking(cfg: dict) -> list[str]:
         return []
 
 
-STALE_S = 7200   # an older served list (a failed or asleep check) is unknown: no swap or hold rests on it
+STALE_S = watch.STALE_POLLS * watch.EVERY_S   # a list with no poll interval recorded this old is unknown: no swap or hold rests on it
 
 
 def served(state: Path, now: float) -> list[str] | None:
-    """The ids the last /models check listed, or None when it failed, never ran or is over STALE_S old
-    (nothing is known)."""
+    """The ids the last /models check listed (the host's shared poll first: served.py), or None when it
+    failed, never ran or is over served.stale_s old (3 poll intervals: nothing is known)."""
     rec = route.read_served(state).get(route.TO) or {}
-    if not rec.get("ok") or now - float(rec.get("checked") or 0) > STALE_S:
+    if not rec.get("ok") or now - float(rec.get("checked") or 0) > watch.stale_s(rec):
         return None
     return list(rec.get("ids") or [])
 
 
-def down(db, cfg: dict, state: Path, model: str, now: float) -> str:
-    """Why `model` is down ('refused' or 'not listed'), else ''; always '' with no ranking."""
+def down(db, cfg: dict, state: Path, model: str, now: float, cls: str = "") -> str:
+    """Why `model` is down ('refused', 'not listed' or, for a class `cls`, 'demoted for <cls>'
+    (modeldemote.py)), else ''; always '' with no ranking."""
     if not ranking(cfg) or not model:
         return ""
+    if cls:
+        from . import modeldemote
+        if modeldemote.demoted(db, model, cls, now):
+            return f"demoted for {cls}"
     if any(h.get("model") == model and not h.get("retry") for h in route.holds(db).values()):
         return "refused"
     if now - float((db.kv(REFUSED + model) or {}).get("at") or 0) < route.RETRY_QUIET_S:
@@ -97,15 +111,56 @@ def down(db, cfg: dict, state: Path, model: str, now: float) -> str:
     return "not listed" if ids is not None and model not in ids else ""
 
 
-def pick(db, cfg: dict, state: Path, model: str, now: float) -> tuple[str, str] | None:
+def pick(db, cfg: dict, state: Path, model: str, now: float, cls: str = "") -> tuple[str, str] | None:
     """(the model to run in place of `model`, why `model` is down), or None: it is up, no ranking is
-    set, or no ranked model is served now."""
-    why = down(db, cfg, state, model, now)
+    set, or no ranked model is served now. A `cls` also counts demotions for that class."""
+    why = down(db, cfg, state, model, now, cls)
     ids = served(state, now) if why else None
     for m in ranking(cfg) if ids else ():
-        if m != model and m in ids and not down(db, cfg, state, m, now) and not parked(db, m, now):
+        if m != model and m in ids and not down(db, cfg, state, m, now, cls) and not parked(db, m, now):
             return m, why
     return None
+
+
+def standins(db, cfg: dict, model: str, now: float) -> list[str]:
+    """The ranked models a run on `model` may swap to mid-run (chatbridge.py), best first: the ranking
+    less `model` and parked ones. The bridge checks each against the served list when it swaps."""
+    return [m for m in ranking(cfg) if m != model and not parked(db, m, now)]
+
+
+def mid_text(run_id, frm: str, to: str, why: str) -> str:
+    """A mid-run swap's low alert."""
+    return (f"Model {frm} went away on the {route.TO} provider during run {run_id} ({why}); the run went on "
+            f"with {to}, the highest-ranked model it serves (providers.{route.TO}.model_ranking), in the same session.")
+
+
+def ran(model: str, note) -> tuple[str, str]:
+    """(the model a run finished on, the model it was asked to run, '' when the same) from its runs row's
+    `model` and note: a mid-run swap (model_rank.mid_run, chatbridge.py) ran its stand-in, never `model`."""
+    try:
+        e = (json.loads(note or "{}") if isinstance(note, str) else note or {}).get(KEY)
+    except (ValueError, AttributeError):
+        e = None
+    mid = e.get("mid_run") if isinstance(e, dict) else None
+    if not mid or not isinstance(mid, list) or not all(isinstance(m, dict) for m in mid):
+        return model, ""
+    final = str(e.get("ran") or mid[-1].get("to") or model)
+    asked = str(e.get("asked") or mid[0].get("from") or "")
+    return final, asked if asked != final else ""
+
+
+def label(model: str, note, run_dir=None) -> str:
+    """A run's model as shown: 'B (stand-in for A)' when a mid-run swap ran B in place of the asked-for A;
+    a running run's swap is read from its run dir (chatbridge.SWAP_FILE)."""
+    final, asked = ran(model, note)
+    if not asked and run_dir:
+        from .chatbridge import SWAP_FILE
+        try:
+            e = json.loads((Path(run_dir) / SWAP_FILE).read_text())
+            final, asked = str(e["ran"]), str(e["asked"])
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+    return f"{final} (stand-in for {asked})" if asked and asked != final else final
 
 
 def parked(db, model: str, now: float) -> bool:
@@ -123,14 +178,14 @@ def parked_models(db) -> dict[str, float]:
             for r in db.q("SELECT key FROM kv WHERE key LIKE ?", (PARKED + "%",))}
 
 
-def better(db, cfg: dict, state: Path, model: str, now: float, light: bool) -> str:
-    """The highest-ranked served model above `model` (up and ranked) that is neither down nor parked,
-    and on a non-`light` start has TRIES good runs; else ''."""
+def better(db, cfg: dict, state: Path, model: str, now: float, light: bool, cls: str = "") -> str:
+    """The highest-ranked served model above `model` (up and ranked) that is neither down nor parked
+    (nor demoted for `cls`), and on a non-`light` start has TRIES good runs; else ''."""
     rank = ranking(cfg)
-    if model not in rank or down(db, cfg, state, model, now) or (ids := served(state, now)) is None:
+    if model not in rank or down(db, cfg, state, model, now, cls) or (ids := served(state, now)) is None:
         return ""
     for m in rank[:rank.index(model)]:
-        if m in ids and not down(db, cfg, state, m, now) and not parked(db, m, now) and (
+        if m in ids and not down(db, cfg, state, m, now, cls) and not parked(db, m, now) and (
                 light or int((db.kv(TRIED + m) or {}).get("ok") or 0) >= TRIES):
             return m
     return ""

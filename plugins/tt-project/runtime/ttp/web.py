@@ -510,11 +510,12 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
     working = db.q("SELECT r.id run, r.task, r.role, r.provider, r.model, r.effort, r.started, r.cost_usd, r.dir, "
                    "r.note run_note, t.title FROM runs r "
                    "LEFT JOIN tasks t ON t.id=r.task WHERE r.status='running' ORDER BY r.id")
-    from . import runwatch   # the daemon's live record of each run; the progress.md tail is the fallback
+    from . import modelrank, runwatch   # the daemon's live record of each run; the progress.md tail is the fallback
     live = runwatch.load(p)["runs"] if working else {}
     for w in working:
         rw = live.get(str(w["run"])) or {}
         w["sandbox"] = run_sandbox(w["dir"])
+        w["model"] = modelrank.label(w["model"], w["run_note"], w["dir"])   # a stand-in shows as one
         w["note"] = rw.get("note") or last_note(w.pop("dir"))
         w.pop("dir", None)
         w["doing"], w["checks"], w["files_n"] = runwatch.doing(rw), rw.get("checks") or "", rw.get("files_n") or 0
@@ -650,10 +651,11 @@ def uncommitted_feed(db: DB) -> list[dict]:
 
 def slots_feed(now: float, p=None) -> list[dict]:
     """Feed rows (state 'status': not the top section) for the host's test and build slots in use and
-    project `p`'s checks lanes and the spill hosts kept off for a device job, the lines `ttp status` prints
-    (testslots.use_lines, checklane.lane_lines, checkspill.skip_lines)."""
+    project `p`'s checks lanes, the limit each of its live checks runs is under and the spill hosts kept off for
+    a device job, the lines `ttp status` prints (testslots.use_lines, checklane.lane_lines,
+    checkspill.limit_lines, checkspill.skip_lines)."""
     from . import checklane, checkspill, testslots
-    lanes = checklane.lane_lines(p.name, p.config(), now) if p else []
+    lanes = checklane.lane_lines(p.name, p.config(), now) + checkspill.limit_lines(p.name) if p else []
     return [{"id": None, "ts": now, "kind": "slots", "severity": "low", "state": "status", "text": line}
             for line in testslots.use_lines() + lanes + checkspill.skip_lines(now)]
 
@@ -763,7 +765,7 @@ def state_payload(p: Project, db: DB) -> dict:
     paused = db.paused_resources()
     entered = sweep.entered_map(db, [t for t in tasks if t["status"] == "blocked"], now)
     cfg, probed = p.config(), {}
-    est = eta._Est(db, now, core=eta.core_of(cfg))
+    est = eta._Est(db, now, core=eta.core_of(cfg), delivery=eta.delivery_of(cfg))
     topped = topup.counts(db)   # budget top-ups of urgent or user-ordered tasks (topup.py)
     for t in tasks:
         t["budget_topups"] = topped.get(t["id"])
@@ -799,8 +801,11 @@ def state_payload(p: Project, db: DB) -> dict:
     for t in tasks:
         if t["id"] in trends:
             t["trend"] = trends[t["id"]]
-    runs = db.q("SELECT id,task,role,provider,model,effort,status,started,ended,cost_usd FROM runs "
+    runs = db.q("SELECT id,task,role,provider,model,effort,status,started,ended,cost_usd,note FROM runs "
                 "ORDER BY id DESC LIMIT 40")
+    from . import modelrank
+    for r in runs:   # 'B (stand-in for A)' after a mid-run swap: a stand-in's run never shows as A's
+        r["model"] = modelrank.label(r["model"], r.pop("note"))
     health_now = health(p, db, now=now)
     gates = db.kv("gates", {})
     return {
@@ -812,6 +817,7 @@ def state_payload(p: Project, db: DB) -> dict:
         "heartbeat": heartbeat(p), "runtime": health_now["runtime"], "heartbeat_stale_s": HEARTBEAT_STALE_S, "watchdog_s": int(watchdog_settings(p)["hang_s"]),
         "service": installed(p), "disk_low": db.kv("disk_low"),
         "disk": db.kv("disk"), "worktrees_kept": db.kv("worktrees_kept"),
+        "branches": db.kv("branchcap"),
         "tasks": tasks, "task_counts": db.status_counts(), "runs": runs,
         "issues": db.q("SELECT id,source,title,severity,status,count,first_seen,last_seen,task FROM issues "
                        "WHERE status IN ('open','tracking') ORDER BY last_seen DESC LIMIT 100"),
@@ -977,7 +983,7 @@ class Handler(BaseHTTPRequestHandler):
                 if not t:
                     return self._send(404, {"error": "no task"})
                 if body.get("status") == "queued":
-                    why = db.requeue(tid)
+                    why = db.requeue(tid, force=True, by="web")   # a click is a deliberate decision
                     if why:
                         return self._send(409, {"error": why})
                 elif body.get("status") == "cancelled":

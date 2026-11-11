@@ -40,7 +40,9 @@ The user's machines are listed once per user and shared by all their projects:
   its short host name);
 - ask, in the same message as any other question, which of them this project may use (a
   restriction only the user sets). Put that in the brief as a line starting
-  "Machines this project may use:", so the charter's Resources section records it.
+  "Machines this project may use:", so the charter's Resources section records it; the daemon's
+  first start moves those aliases into config `machines.allowed` once, and later changes go there
+  with `ttp config machines.allowed '[...]'`.
 
 Shared clusters (Slurm, other people's machines): record in the "Machines this project may use:"
 line the clusters the user names and any nodes, partitions or limits they set for this project;

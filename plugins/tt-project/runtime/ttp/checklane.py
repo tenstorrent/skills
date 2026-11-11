@@ -69,9 +69,10 @@ WAIT_EVENT_S; 0 turns it off) naming holder and waiter (wait_events). Only one o
 per queue incident (wait_wake: from the first waiter past the threshold until none is); the incident wakes it
 again only when a decision is due: its longest waiter past `checks.wait_escalate_s` (default WAIT_ESCALATE_S,
 then once per as long again; 0: never), a holder running `checks.wait_hang_factor` (default WAIT_HANG_FACTOR;
-0: never) times the recent median checks run whose log has also stopped growing (checkstall; a likely hang:
-one still printing results is named slow under load, with the host's load, and wakes nobody), or a holder
-whose task has ended (no owner to fix it).
+0: never) times the median run of its own command list (scope_median_s: a full suite is never timed against
+targeted runs) whose log has also stopped growing (checkstall; a likely hang: one still printing results is
+named slow under load, with the host's load, and wakes nobody), or a holder whose task has ended (no owner
+to fix it).
 """
 from __future__ import annotations
 
@@ -905,10 +906,113 @@ def _ticket_task(t: Path) -> str:
     return locks.ticket_task(t)
 
 
+_WORKTREE = re.compile(r"/worktrees/t(\d+)(?:/|$)")   # a task's worktree: <project folder>/worktrees/t<id>
+_RUN_DIR = re.compile(r"/runs/(\d+)/?$")
+
+
+def _env_task(env: dict | None) -> tuple[str, str]:
+    """(task, run) an environment names (TTP_TASK, TTP_RUN_ID or its TTP_RUN_DIR's number), "" each without."""
+    env = env or {}
+    task = str(env.get("TTP_TASK") or env.get("TTP_TASK_ID") or "")
+    run = str(env.get("TTP_RUN_ID") or "")
+    if not run and (m := _RUN_DIR.search(str(env.get("TTP_RUN_DIR") or ""))):
+        run = m.group(1)
+    return (task if task.isdigit() else ""), (run if run.isdigit() else "")
+
+
+def _run_dir_task(run_dir: str) -> str:
+    """The task of the worker run in folder `run_dir` (the TTP_TASK its run.json gives the worker), else ""."""
+    try:
+        env = json.loads((Path(run_dir) / "run.json").read_text()).get("env")
+    except (OSError, ValueError, AttributeError, TypeError):
+        return ""
+    return _env_task(env if isinstance(env, dict) else {})[0]
+
+
+def _proc(pid: int | None) -> dict:
+    """A live process's command line, working folder, parent pid, session id and environment, each "" or
+    None when unreadable (gone, another user's, no /proc)."""
+    from . import procowner
+    out = {"command": "", "cwd": "", "ppid": None, "sid": None, "env": None}
+    if not pid:
+        return out
+    try:
+        out["command"] = " ".join(Path(f"/proc/{pid}/cmdline").read_bytes().decode(errors="replace").split("\0")).strip()
+    except OSError:
+        pass
+    try:
+        out["cwd"] = os.readlink(f"/proc/{pid}/cwd")
+    except OSError:
+        pass
+    try:
+        f = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+        out["ppid"], out["sid"] = int(f[1]), int(f[3])
+    except (OSError, ValueError, IndexError):
+        pass
+    out["env"] = procowner.environ(pid)
+    return out
+
+
+def waiter(t: Path) -> dict:
+    """Who a checks-lane waiter's ticket `t` is: task, run, pid, command, cwd (its working folder). The
+    ticket's text is read once (a waiter that leaves and rejoins the queue between two reads must not lose
+    its task); when it names no task, the task comes from the ticket's owner record (the run it waits for),
+    the waiter's environment or a parent's in its session (a worker run's TTP_TASK, TTP_RUN_DIR), else its worktree
+    (worktrees/t<id>). Only a waiter none of these link to a task is taskless: its pid, command and
+    folder then name it (waiter_text)."""
+    text = testslots._ticket_text(t)
+    m = re.search(r"task #(\d+)", text)
+    task, run, pid = (m.group(1) if m else ""), _run_of(text), testslots.ticket_pid(t)
+    if task:   # the usual case: no /proc read
+        return {"task": task, "run": run, "pid": pid, "command": "", "cwd": "", "label": text}
+    me = _proc(pid)
+    try:
+        rec = json.loads(locks._owner_file(t).read_text())
+        rec = rec if isinstance(rec, dict) else {}
+    except (OSError, ValueError, AttributeError):
+        rec = {}
+    owner = str(rec.get("run_dir") or "")
+    task = str(rec.get("task_id") or "")   # the ticket's record (locks.waiter_ids), else its run folder's
+    task = task if task.isdigit() else (_run_dir_task(owner) if owner else "")
+    if not run and str(rec.get("run_id") or "").isdigit():
+        run = str(rec["run_id"])
+    if not run and (r := _RUN_DIR.search(owner)):
+        run = r.group(1)
+    up, seen = me, 0
+    while not task and up["env"] is not None and seen < 8:   # its own environment, then its parents'
+        task, r = _env_task(up["env"])
+        run = run or r
+        task = task or _run_dir_task(str(up["env"].get("TTP_RUN_DIR") or ""))
+        seen += 1
+        if task or not up["ppid"] or up["ppid"] <= 1:
+            break
+        up = _proc(up["ppid"])
+        if up["sid"] != me["sid"]:   # a detached waiter's starter is not its task
+            break
+    if not task and (w := _WORKTREE.search(me["cwd"])):
+        task = w.group(1)
+    return {"task": task, "run": run, "pid": pid, "command": me["command"], "cwd": me["cwd"], "label": text}
+
+
+def waiter_text(w: dict, since: float, cfg: dict | None = None, now: float | None = None) -> str:
+    """How a wait line names its waiter: "#12", a run no record links to a task "run 7 (no task)"
+    (_waiter_name), else "a run with no task (pid 4242 'ttp checks ...' in /path, first queued 12:40 PST)"
+    so it can be acted on without a hunt; a gone waiter's command is its ticket label's."""
+    if w.get("task") or w.get("run"):
+        return _waiter_name(str(w.get("task") or ""), f"run {w['run']}" if w.get("run") else "")
+    from . import timefmt
+    cmd = str(w.get("command") or "") or " ".join(str(w.get("label") or "").split(": ", 1)[-1].split())
+    cmd = cmd if len(cmd) <= 80 else cmd[:77] + "..."
+    bits = [f"pid {w['pid']}" if w.get("pid") else "pid unknown", repr(cmd) if cmd else "command unknown",
+            f"in {w['cwd']}" if w.get("cwd") else "folder unknown",
+            f"first queued {timefmt.short(since, cfg or {}, now)}"]
+    return f"a run with no task ({' '.join(bits[:3])}, {bits[3]})"
+
+
 def waits(project_name: str, cfg: dict | None, now: float | None = None, over_s: float = 0.0) -> list[dict]:
     """The project's waiters for a lane that have waited over `over_s`, in queue order (the aging step
     of `cfg`, checks.priority_age_s — the order the lanes grant): task, waited_s, since (arrival),
-    position (1-based), the waiter's run (`run`, from its label) and who it is (`who`: _waiter_name), the
+    position (1-based), the waiter's run (`run`), who it is (`waiter`: waiter) and its name (`who`: waiter_text), the
     lane's label (lane_labels), what it waits on (the lane, the project cap or a host gate:
     _lane_waits_on), the limit holding it ("lanes", "project_cap", "host" or "" for none), the holders'
     records (of the lane, else of every lane) and how many lanes the repository has now (slots_note)."""
@@ -929,13 +1033,9 @@ def waits(project_name: str, cfg: dict | None, now: float | None = None, over_s:
             for i, t in enumerate(q):
                 waited = now - locks._arrival(t)
                 if waited > over_s:
-                    try:
-                        text = t.read_text()
-                    except OSError:
-                        text = ""
-                    task = _ticket_task(t)
-                    out.append({"task": task, "run": _run_of(text), "who": _waiter_name(task, text, t.name),
-                                "waited_s": waited, "since": locks._arrival(t),
+                    who, since = waiter(t), locks._arrival(t)
+                    out.append({"task": who["task"], "run": who["run"], "who": waiter_text(who, since, cfg, now),
+                                "waiter": who, "waited_s": waited, "since": since,
                                 "position": i + 1, "of": len(q), "lane": labels[key], "waits_on": on[i],
                                 "holders": lane_recs if on[i] == labels[key] else all_recs,
                                 "limit": "lanes" if on[i] == labels[key] else "project_cap" if on[i] == CAP_LABEL
@@ -1018,7 +1118,7 @@ def wait_wake(events: list[dict], incident: dict | None, cfg: dict | None, now: 
     when they do not, and the queue incident to keep). An incident opens with the first waiter past
     checks.wait_event_s (reason "new") and closes once no waiter is past it (None). Within it, a wake again
     only for: "escalate" (its longest wait past checks.wait_escalate_s, then once per as long again), "hang"
-    (a holder running checks.wait_hang_factor times `median_s`, the recent median checks run, that is also
+    (a holder running checks.wait_hang_factor times its scope_median_s (`median_s` only without a cost label), that is also
     stalled (_hung: its log still, its CPU idle where `marks` knows it; `stat` is for tests), once per
     holder; such a holder whose log still grows is only kept in the incident's "slow", for wake_text) and "ownerless" (a holder whose task has ended (`ended(holder record)`; a review precheck
     only once no review reading it is open, open_precheck) or whose hold is stale, once per holder). Every other waiter shows in the digest and ttp status only."""
@@ -1038,10 +1138,11 @@ def wait_wake(events: list[dict], incident: dict | None, cfg: dict | None, now: 
     factor = wait_hang_factor(cfg)
     # A holder still waiting for a later gate (testslots.lane_waits) is not hung: its clock starts once
     # it has its test slots (granted_at), or with its commands (run_since).
+    # Each holder is timed against runs of its own scope (scope_median_s), never a mix of full and targeted.
     def long(h: dict) -> bool:
-        return bool(factor > 0 and median_s and median_s > 0 and not h.get("waits")
+        return bool(factor > 0 and (base := scope_median_s(h, median_s)) and not h.get("waits")
                     and now - float(h.get("run_since") or h.get("granted_at") or h.get("since") or now)
-                    > factor * median_s)
+                    > factor * base)
 
     inc["slow"] = [k for k, h in holders.items() if long(h) and _hung(h, now, cfg, marks, stat) is False][-20:]
     for name, test in (("hang", lambda h: long(h) and bool(_hung(h, now, cfg, marks, stat))),
@@ -1056,12 +1157,28 @@ def wait_wake(events: list[dict], incident: dict | None, cfg: dict | None, now: 
     return why, inc
 
 
+def scope_median_s(h: dict, median_s: float | None = None) -> float | None:
+    """The usual run time a lane holder `h` is timed against: the median of the passing runs of its own
+    command list (its label's cost est_s, median_s()). A label with a cost but no est_s (its command list
+    has no passing run yet) has none, so its wall time alone flags nothing; only a label without a cost
+    (an older runtime) falls back to `median_s`, the project's recent median."""
+    c = h.get("cost")
+    if isinstance(c, dict) and c:
+        est = c.get("est_s")
+        return float(est) if isinstance(est, (int, float)) and est > 0 else None
+    return float(median_s) if median_s and median_s > 0 else None
+
+
 def wake_text(why: list[str], events: list[dict], inc: dict, cfg: dict | None, now: float,
               median_s: float | None = None, load=None) -> str:
     """The waking `checks_slot_wait` event's text: the reasons, a slow holder's count with the host's load
     (`load`, default _load_text), then the longest waiter's own event text."""
     head = max(events, key=lambda e: float(e.get("waited_s") or 0))
-    over = f"over {wait_hang_factor(cfg):g}x the recent median checks run ({mins(median_s or 0)})"
+    holders = {_holder_key(h): h for e in events for h in e.get("holders") or []}
+    flagged = [holders[k] for w in ("hang", "slow") if w in why or w == "slow"
+               for k in (inc.get(w) or [])[-1:] if k in holders]
+    base = scope_median_s(flagged[0], median_s) if flagged else median_s
+    over = f"over {wait_hang_factor(cfg):g}x the median run of its own command list ({mins(base or 0)})"
     say = {"new": f"a checks queue incident started ({len(events)} waiting past {mins(wait_event_s(cfg))})",
            "escalate": f"its longest wait passed {mins(wait_escalate_s(cfg))}",
            "hang": f"a holder has run {over} and its log stopped growing, its CPU idle: a likely hang",
@@ -1174,11 +1291,8 @@ def lane_status(project_name: str, now: float | None = None, cfg: dict | None = 
         for i, t in enumerate(q):
             m = re.match(r"\d+(?:\.\d+)?-(\d+)", t.name)
             prio = locks.ticket_priority(t)
-            try:
-                label = t.read_text()
-            except OSError:
-                label = ""
-            waiters.append({"position": i + 1, "task": _ticket_task(t), "run": _run_of(label),
+            who = waiter(t)
+            waiters.append({"position": i + 1, "task": who["task"], "run": who["run"],
                             "pid": int(m.group(1)) if m else None,
                             "priority": None if prio == float("inf") else prio,
                             "rank": testslots.suite_priority(t, now, age), "label": testslots.rank_text(t, now, age),

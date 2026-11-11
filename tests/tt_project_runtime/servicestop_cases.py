@@ -563,3 +563,140 @@ def test_every_restart_route_outside_launchd_starts_the_daemon_module(env, monke
     assert argv[:2] == ["sh", "-c"] and daemon in argv[2], argv
     assert service.daemon_argv(p)[1:3] == ["-m", "ttp.daemon"]
     assert all(daemon in line for line in service._cron_lines(p))
+
+
+def test_a_hand_started_daemon_never_inherits_its_starters_run_env(env, monkeypatch):
+    """A restart or upgrade run from another project's worker or coordinator shell starts this project's
+    daemon by hand (no service): it must not inherit that run's TTP_ variables (role, run id, project)
+    or its agent's per-command env file, as a service or cron start would not. An inherited
+    CLAUDE_ENV_FILE naming the starter's loopproxy.sh broke every Bash call of the new daemon's workers."""
+    from ttp import hoststate, service
+    p = make(env)
+    popen = []
+    monkeypatch.setattr(service.subprocess, "Popen", lambda argv, **kw: popen.append((argv, kw)))
+    leaked = {"TTP_ROLE": "reviewer", "TTP_RUN_ID": "16596", "TTP_PROJECT": "/other/tt-project",
+              "TTP_RUN_DIR": "/other/run", "CLAUDE_ENV_FILE": "/other/ttp/loopproxy.sh",
+              "TTP_PREV_CLAUDE_ENV_FILE": "/other/ttp/loopproxy.sh", "CLAUDECODE": "1",
+              "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1"}
+    for k, v in leaked.items():
+        monkeypatch.setenv(k, v)
+    monkeypatch.setenv("SSH_AUTH_SOCK", "/tmp/agent.sock")
+    monkeypatch.setenv(hoststate.MARKER, str(env["tmp"] / "hoststate"))
+    service._spawn(p)
+    [(argv, kw)] = popen
+    assert argv[:2] == ["sh", "-c"] and kw["start_new_session"] is True
+    assert not set(leaked) & set(kw["env"]), sorted(set(leaked) & set(kw["env"]))
+    assert kw["env"]["SSH_AUTH_SOCK"] == "/tmp/agent.sock"
+    assert kw["env"][hoststate.MARKER] == str(env["tmp"] / "hoststate")   # a test's fake host state stays
+    monkeypatch.setenv("TTP_HOME", str(env["tmp"] / "home"))
+    service._spawn(p)
+    assert popen[-1][1]["env"]["TTP_HOME"] == str(env["tmp"] / "home")   # a host-wide setting stays
+
+
+def _svc_run_of(env, monkeypatch, same=False):
+    """A project and this process in a run (TTP_RUN_ID) of another project, or of the same one."""
+    from ttp import service
+    p = make(env)
+    monkeypatch.setenv("TTP_RUN_ID", "16840")
+    monkeypatch.setenv("TTP_PROJECT", str(p.base if same else env["tmp"] / "other" / "tt-project"))
+    real = service.subprocess.Popen
+
+    def popen(argv, *a, **kw):
+        if list(argv[:2]) == ["sh", "-c"] and "ttp.daemon" in str(argv):
+            pytest.fail(f"a daemon was started: {argv}")
+        return real(argv, *a, **kw)
+    monkeypatch.setattr(service.subprocess, "Popen", popen)
+    return p, service
+
+
+def test_a_run_of_another_project_never_starts_restarts_or_reinstalls_this_projects_daemon(env, monkeypatch):
+    """A worker, review or coordinator shell of one project upgrading or repairing another must not start,
+    restart or reinstall that project's daemon or services: each refusal names the rule."""
+    from ttp import cli, watchdog
+    p, service = _svc_run_of(env, monkeypatch)
+    for call in (service._spawn, service.install):
+        with pytest.raises(service.ForeignRun, match="never starts, restarts or reinstalls another project"):
+            call(p)
+    assert service.NO_FOREIGN_START in service.restart_service(p)
+    res = service.restart(p, restart_fn=lambda q: pytest.fail("restarted from another project's run"))
+    assert res.outcome == "refused" and service.NO_FOREIGN_START in res
+    ok, why = watchdog._restart(p, 4242, 0)
+    assert not ok and service.NO_FOREIGN_START in why
+    for cmd in ("start", "restart"):
+        with pytest.raises(SystemExit) as e:
+            cli.main([cmd, "demo"])
+        assert e.value.code == 2
+    # Its own run, the daemon, cron and a push batch (no TTP_RUN_ID) are not foreign.
+    assert service.foreign_refusal(p, "start")
+    monkeypatch.setenv("TTP_PROJECT", str(p.base))
+    assert not service.foreign_refusal(p, "start")
+    monkeypatch.setenv("TTP_PROJECT", str(env["tmp"] / "other" / "tt-project"))
+    monkeypatch.delenv("TTP_RUN_ID")
+    assert not service.foreign_refusal(p, "start")
+
+
+def test_an_upgrade_never_starts_a_stopped_daemon_and_asks_another_projects_running_one_to_restart_itself(env, monkeypatch):
+    """`ttp upgrade` (and so a push's deploy) applies the files and leaves a stopped daemon stopped, for its
+    next start; from another project's run a running daemon is asked to restart itself, never restarted."""
+    from ttp import upjournal
+    p, service = _svc_run_of(env, monkeypatch)
+    monkeypatch.setattr(service, "restart", lambda *a, **kw: pytest.fail("restart from an upgrade"))
+    assert service.daemon_stopped.real(p), "a test project has no daemon"
+    monkeypatch.setattr(service, "daemon_stopped", lambda q: True)
+    res = service.restart_running(p)
+    assert res.outcome == "stopped" and "not started" in res
+    asked = []
+    monkeypatch.setattr(service, "daemon_stopped", lambda q: False)
+    monkeypatch.setattr(service, "request_restart", lambda q, why, *a, **kw: asked.append(why) or service._said(why, "running"))
+    assert service.restart_running(p).outcome == "running"
+    assert asked and service.NO_FOREIGN_START in asked[0]
+    # Its own run restarts it the usual way.
+    monkeypatch.setenv("TTP_PROJECT", str(p.base))
+    monkeypatch.setattr(service, "restart", lambda q: service._said("restarted", "running"))
+    assert service.restart_running(p) == "restarted" and len(asked) == 1
+    # A journalled upgrade a later run finishes leaves a stopped daemon stopped too.
+    upjournal.begin(p, "upgrade")
+    upjournal.step(p, "merged", base="x", merged="y")
+    monkeypatch.setattr(upjournal, "dead", lambda rec: True)
+    monkeypatch.setattr(upjournal, "_daemon_up", lambda q: False)
+    monkeypatch.setattr(upjournal, "_put_back", lambda *a: [])
+    monkeypatch.setattr(upjournal, "_touched", lambda *a: [])
+    line = upjournal.recover(p, restart=lambda q: pytest.fail("recover started the daemon"), log=lambda m: None)
+    assert "not started" in line, line
+
+
+def test_a_project_stopped_on_purpose_is_left_out_of_deploys_rollout_counts_and_deploy_alerts(env, tmp_path, monkeypatch):
+    """A project whose daemon was stopped on purpose (no service, no daemon) gets no verdict, no place in
+    `ttp deployed`'s count and no deploy alert: one "stopped on purpose" line instead, until it starts again."""
+    from ttp import deploy, overview, service
+    p = make(env)
+    monkeypatch.setattr(service, "installed", lambda q: None)
+    monkeypatch.setattr(service, "daemon_stopped", lambda q: True)
+    assert service.stopped_on_purpose(p)
+    monkeypatch.setattr(service, "installed", lambda q: {"kind": "systemd", "watchdog": True})
+    assert not service.stopped_on_purpose(p), "a service keeps it: not stopped on purpose"
+    monkeypatch.setattr(service, "installed", lambda q: None)
+    real = service.stopped_at.real
+    assert not real("x", {}, {}) and not real("x", {"dir": "/nowhere"}, {"daemon_alive": True})
+    assert not real("x", {"dir": "/nowhere"}, {"upgrading": True}), "its own upgrade restarts it"
+    assert real("x", {"dir": "/nowhere"}, {"daemon_alive": False})
+    _deploy_lib("0.5.0")
+    _deploy_project(tmp_path, "alpha", "0.4.9")
+    _deploy_project(tmp_path, "beta", "0.4.9")
+    stopped = set()
+    monkeypatch.setattr(service, "stopped_at", lambda n, e, row: n in stopped)
+    now = time.time()
+    deploy.record(p, overview.deployed(names=["alpha", "beta"]), now)   # beta's check opens while it runs
+    stopped.add("beta")
+    report = overview.deployed()
+    names = [r["name"] for r in report["projects"]]
+    assert "alpha" in names and "beta" not in names and report["stopped"] == ["beta"]
+    assert f"beta\t{service.STOPPED_ON_PURPOSE}" in report["text"]
+    assert f" of {len(names)} running it" in report["text"] or f"all {len(names)} project" in report["text"]
+    pages = []
+    deploy.tick(p, lambda key, text, severity, **_: pages.append(key), now + 10 * deploy.GRACE_S)
+    beta = [r for r in (p.db.kv(deploy.CHECKS) or {}).values() if r.get("name") == "beta"]
+    assert beta and all(r.get("closed") and r.get("outcome") == "stopped" for r in beta)
+    assert not any("beta" in k for k in pages) and not deploy.holds_behind(p.db, "beta", now + 10 * deploy.GRACE_S)
+    named = overview.deployed(names=["beta"])
+    assert [r["name"] for r in named["projects"]] == ["beta"], "named on purpose: still checked"

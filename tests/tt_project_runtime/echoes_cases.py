@@ -108,9 +108,11 @@ def test_a_retired_claim_planted_in_every_binding_place_is_found_and_memory_name
     from ttp import echoes, schedule as sched
     p = make(env)
     claim = "Retry the stuck card with `legacy-hard-reset` first."
-    echoes.record(p.db, "memory [old] superseded by [new]", claim, "Use the documented reset command.")
-    root = p.root
+    # A charter replacement: a memory retirement's phrase a live entry holds is current (advisory), below. The
+    # memory copy predates the replacement (one written after it is a rewording: current, see below).
     mem = p.add_memory("Recovery: retry the stuck card with LEGACY-HARD-RESET first.", kind="decision")
+    echoes.record(p.db, "charter 'Recovery' quote replaced", claim, "Use the documented reset command.")
+    root = p.root
     p.charter_path.write_text(p.charter_path.read_text().rstrip() + "\n\n## Recovery\n- Run legacy-hard-reset.\n")
     sched.upsert(p.db, "cmd", "command", "1h", payload={"command": "legacy-hard-reset --all"})
     sched.upsert(p.db, "pre", "llm", "1d", payload={"spec": "sum up", "precheck": "test -x legacy-hard-reset"})
@@ -598,6 +600,48 @@ def test_a_user_withdrawal_quoting_a_current_restriction_heading_flags_only_the_
     assert not echoes._states(units, "the hosts rule")   # one word, not the unit's whole wording
 
 
+def test_a_phrase_a_live_memory_entry_states_whole_is_advisory_never_a_fix_order(env):
+    """A user-withdrawn memory entry's phrase another live entry still holds whole is an older copy of current
+    words: advisory wherever it is quoted but in that entry itself (its own copy is the one to fix), and
+    anywhere at all when the superseder holds it. A phrase only the retired entry holds, or one a live entry
+    holds only inside a longer name, keeps its fix order; a charter replacement keeps its fix orders even
+    where a live memory entry holds the phrase."""
+    from ttp import coordinator as coord, echoes
+    p = make(env)
+    fact = p.add_memory("Release notes: run `ship-it --canary` in staging; see roll-back-faster for drills.",
+                        kind="fact")
+    old = p.add_memory("Deploy with `ship-it --canary` and `roll-back-fast` before each job.", kind="decision")
+    said = _echo_said(p, "Stop using roll-back-fast, deploy with ship-fast.")
+    assert coord.apply(p, [{"type": "memory_add", "memory_kind": "decision", "supersedes": [old.stem],
+                            "text": f"Deploy with `ship-fast` before each job (user msg #{said})."}],
+                       user_turn=True, turn=1, messages=[said]) == []
+    assert [r["kind"] for r in echoes.records(p)] == [echoes.WITHDRAWN]
+    both = p.db.add_task("both", "Run ship-it --canary on the staging box.")
+    retired = p.db.add_task("retired", "Then call roll-back-fast on failure.")
+    hits = {h["key"].split(":", 1)[1]: h for h in echoes.scan(p)}
+    assert hits[f"task:{both}:spec"]["class"] == "advisory", hits
+    assert hits[f"task:{both}:spec"]["why"] == "a live memory entry states it: no action"
+    assert hits[f"task:{retired}:spec"]["class"] == "directive", hits
+    assert hits[f"task:{retired}:spec"]["phrase"] == "roll-back-fast"
+    assert hits[f"memory:{fact.stem}"]["class"] == "directive", hits   # the live entry's own stale copy
+    assert sorted(h["key"] for h in echoes.scan(p) if h["class"] == "directive") == sorted(
+        hits[k]["key"] for k in (f"task:{retired}:spec", f"memory:{fact.stem}"))
+    # A superseder that still holds a retired phrase whole (not in the retirement's replacing text, nor skipped)
+    # makes it current everywhere, in the superseder itself too: no phrase of the retired rule (_superseders).
+    sup = p.add_memory("Deploys: keep the `pre-flight-gate` step.", kind="decision")
+    echoes.record(p.db, f"memory [{old.stem}] superseded by [{sup.stem}]", "Run the `pre-flight-gate` step.",
+                  "", found=["pre-flight-gate"])
+    p.db.add_task("kept", "Do the pre-flight-gate step.")
+    assert [h for h in echoes.scan(p) if h["phrase"] == "pre-flight-gate"] == []
+    # A second live entry holding the phrase makes each one's copy current too.
+    p.add_memory("Staging checklist: `ship-it --canary` before the demo.", kind="fact")
+    assert hits[f"memory:{fact.stem}"]["key"] not in {h["key"] for h in echoes.scan(p) if h["class"] == "directive"}
+    echoes.record(p.db, "charter 'Deploys' quote replaced", "Deploy with `ship-it --canary` before each job.")
+    charter = [h for h in echoes.scan(p) if h["source"].startswith("charter")]
+    assert charter and all(h["class"] == "directive" for h in charter), charter
+    assert {h["key"].split(":", 1)[1] for h in charter} >= {f"task:{both}:spec"}
+
+
 def test_a_supersede_citing_a_user_message_is_a_withdrawal_unless_every_cited_message_predates_the_entry(env):
     from ttp import coordinator as coord
     p = make(env)
@@ -951,10 +995,12 @@ def test_an_acknowledged_false_positive_is_hidden_counted_and_listed_again_once_
     assert classes()[(rec["id"], "file src/client.py:3")] == "directive"
     code.write_text(before)
     assert classes()[(rec["id"], "file src/client.py:3")] == "acknowledged"
-    # The line's text changes: listed again as a directive.
+    # The line's text changes but holds the same phrase: still acknowledged; a changed phrase lists it again.
     code.write_text(code.read_text().replace("return payload", "return  dict(payload)"))
-    assert classes()[(rec["id"], "file src/client.py:3")] == "directive"
+    assert classes()[(rec["id"], "file src/client.py:3")] == "acknowledged"
     p.db.x("UPDATE tasks SET spec=? WHERE id=?", ("Wait for the alpha_gate_flag before every release.", task))
+    assert classes()[(rec["id"], f"task #{task} spec")] == "acknowledged"
+    p.db.x("UPDATE tasks SET spec=? WHERE id=?", ("Hold every release for the `alpha_gate_flag` sign-off.", task))
     assert classes()[(rec["id"], f"task #{task} spec")] == "directive"
 
 
@@ -1089,3 +1135,94 @@ def test_a_phrase_the_live_superseding_entry_still_carries_is_no_echo_whatever_t
     other = echoes.record(p.db, f"memory [merge-older] superseded by [{plain.stem}]", f'Old: "{phrase}"',
                           found=[phrase], skip=[f"memory:{plain.stem}"])
     assert f"task #{copy} spec" in hits(other["id"])
+
+
+def test_an_ack_survives_an_appended_line_that_re_quotes_the_acked_phrase(env):
+    """Upstream note a1e73e1389d71a3a: a note appended to a task spec quoting an acked phrase kept every ack
+    on it lapsing; a different new phrase of the retirement is still listed, and a legacy ack still holds."""
+    import hashlib
+    from ttp import echoes
+    p = make(env)
+    src = "charter 'Policies' quote replaced"
+    rec = echoes.record(p.db, src, "Hold every release for the `alpha_gate_flag` sign-off.")
+    other = echoes.record(p.db, src, "Route each build through `beta_field_name` first.")
+    spec = "Wait for the alpha_gate_flag and beta_field_name before each release."
+    task = p.db.add_task("t", spec)
+    where = f"task #{task} spec"
+
+    def cls(r):
+        return {(m["retirement"], m["where"]): m["class"] for m in echoes.export(p)["matches"]}[(r["id"], where)]
+    echoes.acknowledge(p, rec["id"], where)
+    echoes.acknowledge(p, other["id"], where)
+    assert cls(rec) == cls(other) == "acknowledged"
+    # Appended notes that only re-quote the acked phrases keep both acks.
+    p.db.x("UPDATE tasks SET spec=? WHERE id=?",
+           (spec + "\n\nNote: the alpha_gate_flag check stays.\nAlso beta_field_name, as before.", task))
+    assert cls(rec) == cls(other) == "acknowledged"
+    # A different phrase of one retirement appended: that one is listed again, the other ack holds.
+    p.db.x("UPDATE tasks SET spec=spec || ? WHERE id=?",
+           ("\nRoute each build through `beta_field_name` first.", task))
+    assert cls(other) == "directive" and cls(rec) == "acknowledged"
+    # The phrase leaves the place: nothing to list.
+    p.db.x("UPDATE tasks SET spec=? WHERE id=?", ("Wait for the release.", task))
+    assert not [m for m in echoes.export(p)["matches"] if m["where"] == where]
+    # An ack stored before acks were keyed by phrase (the matched lines' hash) still holds.
+    p.db.x("UPDATE tasks SET spec=? WHERE id=?", (spec, task))
+    own = [ph for ph in rec["phrases"]]
+    lines = [" ".join(ln.split()) for ln in spec.splitlines() if any(ph in echoes._flat(ln) for ph in own)]
+    p.db.set_kv(echoes.ACK_KEY, {f"{rec['id']}:task:{task}:spec": hashlib.sha256("\n".join(lines).encode()).hexdigest()})
+    assert cls(rec) == "acknowledged" and cls(other) == "directive"
+
+
+def test_a_charter_retirements_phrase_a_current_item_or_a_later_memory_entry_states_is_advisory(env):
+    """A charter retirement never retires a phrase a current sourced Restrictions item states, or one a memory
+    entry written after it holds whole (a rewording, that entry included). A memory copy older than the
+    retirement and a phrase nothing current states keep their fix orders."""
+    from ttp import echoes
+    p = make(env)
+    stale = p.add_memory("Ops: drain with `queue-flush-slow` nightly.", kind="decision")
+    echoes.record(p.db, "charter 'Ops' quote replaced", "Drain with `queue-flush-slow` and `queue-park-all`.",
+                  "Drain with the documented command.", found=["queue-flush-slow", "queue-park-all"])
+    p.charter_path.write_text(p.charter_path.read_text().rstrip() + "\n\n## Restrictions\n"
+                              "- Never run queue-park-all on a shared box (user msg #7).\n")
+    later = p.add_memory("Ops: keep `queue-flush-slow` for the archive drain only.", kind="decision")
+    stated = p.db.add_task("stated", "Do not run queue-park-all here.")
+    reworded = p.db.add_task("reworded", "Use queue-flush-slow on the archive.")
+    hits = {h["key"].split(":", 1)[1]: h for h in echoes.scan(p)}
+    assert hits[f"task:{stated}:spec"]["class"] == "advisory", hits
+    assert hits[f"task:{stated}:spec"]["why"] == "a current Restrictions item with its source states it: no action"
+    assert hits[f"task:{reworded}:spec"]["class"] == "advisory", hits
+    assert f"memory:{later.stem}" not in {k for k, h in hits.items() if h["class"] == "directive"}
+    # Without the later entry, the older memory copy and the task are fix orders again.
+    p.forget_memory(later.stem)
+    hits = {h["key"].split(":", 1)[1]: h for h in echoes.scan(p)}
+    assert hits[f"task:{reworded}:spec"]["class"] == "directive", hits
+    assert hits[f"memory:{stale.stem}"]["class"] == "directive", hits
+
+
+def test_a_retired_phrase_that_only_cites_user_messages_still_cited_is_advisory(env):
+    """A retired entry's citation header ("owner's order, user msg #41") quoted in a task is advisory while live
+    memory or the charter still cites every message it names, for memory and charter retirements alike; a
+    header citing a message nothing live cites, and a real retired rule phrase, keep their fix orders."""
+    from ttp import echoes
+    p = make(env)
+    assert echoes._cite_only("owner's order, user msg #41") and echoes._msgs("user msgs #41, #42") == {"41", "42"}
+    assert not echoes._cite_only("user msg #41: run sweep-legacy")
+    old = p.add_memory("Owner's order, user msg #41: run `sweep-legacy` hourly.", kind="decision")
+    p.add_memory("Run `sweep-fast` hourly (user msg #41).", kind="decision")   # cites #41, other words
+    echoes.record(p.db, f"memory [{old.stem}] superseded by [x]", "Owner's order, user msg #41: run sweep-legacy.",
+                  "", found=["owner's order, user msg #41", "sweep-legacy"])
+    p.forget_memory(old.stem)
+    echoes.record(p.db, "charter 'Ops' quote replaced", "Per user msg #41 verbatim, sweep-legacy hourly.", "",
+                  found=["per user msg #41 verbatim"])
+    hdr = p.db.add_task("hdr", "Context: owner's order, user msg #41; per user msg #41 verbatim.")
+    rule = p.db.add_task("rule", "Then run sweep-legacy on each box.")
+    hits = [h for h in echoes.scan(p) if h["key"].split(":", 1)[1] == f"task:{hdr}:spec"]
+    assert hits and all(h["class"] == "advisory" for h in hits), hits
+    assert {h["why"] for h in hits} == {"it only cites user messages live memory or the charter still cites: no action"}
+    assert [h["class"] for h in echoes.scan(p) if h["key"].split(":", 1)[1] == f"task:{rule}:spec"] == ["directive"]
+    # Nothing live cites #41 any more: the header is a fix order again.
+    for e in p._memory_entries():
+        p.forget_memory(e["name"])
+    hits = [h for h in echoes.scan(p) if h["key"].split(":", 1)[1] == f"task:{hdr}:spec"]
+    assert hits and any(h["class"] == "directive" for h in hits), hits

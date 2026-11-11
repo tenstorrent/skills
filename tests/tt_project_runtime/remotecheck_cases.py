@@ -11,6 +11,8 @@ _RC_FAKE_SSH = r'''#!/bin/sh
 # FAKE_SSH_LOG=<file> gets one line per call naming the host; FAKE_SSH_ARGS=<file> one with all its arguments. FAKE_SSH_MUX=<file> holding a count (or
 # "always"): on a script holding FAKE_SSH_MUX_ON (default: the run step) the shared connection refuses
 # the session while the count lasts, and the link drops (exit 255); <file>.log gets "shared" or "direct".
+# The host's tt-project folder (its mirrors) is FAKE_REMOTE_TMP/../host-home. FAKE_SSH_NOGIT=1: git there
+# is unusable. FAKE_SSH_SLOW=<text>:<s> sleeps <s> before a script holding <text> (a slow link).
 all="$*"
 while [ "$1" = "-o" ]; do shift 2; done
 host=$1
@@ -18,7 +20,14 @@ shift
 [ -n "$FAKE_SSH_LOG" ] && echo "$host" >> "$FAKE_SSH_LOG"
 [ -n "$FAKE_SSH_ARGS" ] && echo "$all" >> "$FAKE_SSH_ARGS"
 if [ "$host" = down ]; then echo "ssh: connect to host down port 22: Connection refused" >&2; exit 255; fi
-[ -n "$FAKE_REMOTE_TMP" ] && export TMPDIR="$FAKE_REMOTE_TMP"
+[ -n "$FAKE_REMOTE_TMP" ] && export TMPDIR="$FAKE_REMOTE_TMP" TTP_HOME="$FAKE_REMOTE_TMP/../host-home"
+if [ -n "$FAKE_SSH_NOGIT" ]; then
+  mkdir -p "$FAKE_REMOTE_TMP/../nogit" && printf '#!/bin/sh\nexit 127\n' > "$FAKE_REMOTE_TMP/../nogit/git"
+  chmod +x "$FAKE_REMOTE_TMP/../nogit/git" && export PATH="$FAKE_REMOTE_TMP/../nogit:$PATH"
+fi
+if [ -n "$FAKE_SSH_SLOW" ]; then
+  case "$1" in *"${FAKE_SSH_SLOW%:*}"*) sleep "${FAKE_SSH_SLOW##*:}";; esac
+fi
 if [ -n "$FAKE_SSH_MUX" ]; then
   case "$1" in *"${FAKE_SSH_MUX_ON:-ttp-remote-rc}"*)
     case "$all" in *ControlPath=none*) echo direct >> "$FAKE_SSH_MUX.log";; *) echo shared >> "$FAKE_SSH_MUX.log";; esac
@@ -158,7 +167,8 @@ def test_ssh_failing_at_any_step_of_a_remote_check_is_an_environment_fault(tmp_p
     buffer, where git archive dies of SIGPIPE) or mid-run exits 75, never the change's 1 or 2."""
     from ttp import remotecheck
     repo = _rc_repo(tmp_path, big=True)
-    for fake in ({"FAKE_SSH_FAIL": "mktemp"}, {"FAKE_SSH_FAIL": "tar -xf"}, {"FAKE_SSH_DROP": "ttp-remote-rc"}):
+    for fake in ({"FAKE_SSH_FAIL": "mktemp"}, {"FAKE_SSH_FAIL": "ttp-send"}, {"FAKE_SSH_FAIL": "--shared"},
+                 {"FAKE_SSH_FAIL": "tar -xf", "FAKE_SSH_NOGIT": "1", "TTP_REMOTE_TREE_COPY": "1"}, {"FAKE_SSH_DROP": "ttp-remote-rc"}):
         rc, said = _rc_run(tmp_path, repo, "true", **fake)
         assert rc == remotecheck.FAULT_RC, (fake, said)
         assert f"{remotecheck.SIG}box1" in said and "git archive" not in said, said
@@ -177,7 +187,8 @@ def test_a_remote_check_tries_again_on_its_own_connection_when_the_shared_one_re
     from ttp import remotecheck
     repo = _rc_repo(tmp_path)
     mux = tmp_path / "mux"
-    for on in ("ttp-remote-rc", "tar -xf", "mktemp"):
+    for i, on in enumerate(("ttp-remote-rc", "ttp-send", "mktemp")):
+        _rc_commit(repo, f"n{i}.txt")   # a commit the mirror lacks: each check sends a bundle
         mux.write_text("1")
         Path(f"{mux}.log").unlink(missing_ok=True)
         rc, said = _rc_run(tmp_path, repo, "echo ran-here; exit 3", FAKE_SSH_MUX=str(mux), FAKE_SSH_MUX_ON=on)
@@ -443,7 +454,7 @@ def test_check_host_settings_are_validated_and_local_keeps_a_check_here():
 
 # The fake ssh runs a spill host's probe and checks on this machine. On macOS its device holder scan cannot
 # run (no GNU find), and a check script under its temp folder (/private/var/...) is a path of this machine,
-# which never spills; the Linux test hosts keep their temp folder under /dev/shm, a system folder.
+# which never spills unless the test counts its temp folder as a system folder (_spill_setup does).
 _GNU_FIND = pytest.mark.skipif(sys.platform != "linux", reason="the fake spill host's device scan needs GNU find")
 _LINUX_TMP = pytest.mark.skipif(sys.platform != "linux", reason="a check script under the macOS temp folder never spills")
 
@@ -466,6 +477,11 @@ def _spill_setup(env, tmp_path, monkeypatch, hosts, charter=("check-host-a", "ch
     p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
     # The fake ssh runs the probe here: read an idle load, not this machine's (a busy test host has none).
     monkeypatch.setattr(checkspill, "_PROBE", _idle_probe())
+    # The fake spill hosts are this machine, so the test's temp folder is there too: a check naming it may spill
+    # (checkspill.host_path) wherever the session keeps its temp files. Before, it spilled only under /dev/shm (a
+    # system folder), and on a loaded host or under `ttp checks` (temp under /tmp) waited for the lane instead.
+    monkeypatch.setattr(checkspill, "_SYSTEM_DIRS", (*checkspill._SYSTEM_DIRS,
+                                                     *{f"{d}/" for d in (str(tmp_path), os.path.realpath(tmp_path))}))
     p.charter_path.write_text("# Charter\n## Resources\n" + "".join(f"- {h}: a check host\n" for h in charter))
     for h in charter:
         machines.add(h)
@@ -649,18 +665,31 @@ def test_a_run_that_does_not_pass_on_a_spill_host_runs_again_here(env, tmp_path,
     failure there reruns the checks here, without spilling again, and only that result counts; no
     envfault is opened for the spill host."""
     import threading
-    from ttp import cli, envfault
+    from ttp import checkspill, cli, envfault
     p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a"])
     log = tmp_path / "where.log"
     cmd = f'case "$PWD" in */ttp-check.*) pwd >> {log}; exit 1;; esac; pwd >> {log}'
     p.set_config("delivery.push_checks", [cmd])
+    real_off = checkspill.spill_off_add
+    lane = None
+
+    def spill_off_add(*a, **k):   # the spill run ended without passing: free the lane for the rerun here
+        off = real_off(*a, **k)
+        lane.close()
+        return off
+    monkeypatch.setattr(checkspill, "spill_off_add", spill_off_add)
     for fake in ({}, {"FAKE_SSH_FAIL": "mktemp"}):
         for k, v in fake.items():
             monkeypatch.setenv(k, v)
         log.write_text("")
         lane = _spill_lane(p, repo)
-        threading.Timer(2.0, lane.close).start()
-        cli.main(["checks", "--fresh"])
+        safety = threading.Timer(120, lane.close)   # never hang the suite
+        safety.start()
+        try:
+            cli.main(["checks", "--fresh"])
+        finally:
+            safety.cancel()
+            lane.close()
         rec = json.loads((run / "checks.json").read_text())
         assert rec["passed"] is True and "spilled_to" not in rec, (fake, rec)
         text = (run / "checks.log").read_text()
@@ -725,6 +754,74 @@ def test_a_run_with_the_host_wide_cap_full_spills_to_a_free_host_past_a_paused_o
     assert "check-host-c (paused: user hold)" in text and "spilling to check-host-a" in text, text
 
 
+def test_a_run_that_fails_tests_on_a_spill_host_reruns_only_those_tests_here_and_their_failing_again_counts(
+        env, tmp_path, monkeypatch):
+    """A suite that failed some tests on a spill host (exit 1, every failure listed) does not run whole
+    again here: the rerun selects only the failed ids (TTP_PYTEST_SELECT_IDS), their pass here passes the
+    run, and their failing here too fails it. One that stopped early (-x) runs whole again."""
+    import threading
+    from ttp import cli
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a"])
+    log, mark = tmp_path / "where.log", tmp_path / "fail-here"
+    fail = ("printf 'FAILED tests/test_x.py::test_a - boom\\nFAILED tests/test_y.py::test_b - boom\\n"
+            "%s\\n' \"$TAIL\"; exit 1")
+    cmd = (f'echo "$PWD ids=$(printf %s \"$TTP_PYTEST_SELECT_IDS\" | tr \'\\n\' ,)" >> {log}; '
+           f'case "$PWD" in */ttp-check.*) {fail};; esac; test -e {mark} && {{ {fail}; }}; exit 0')
+    p.set_config("delivery.push_checks", [cmd])
+    for tail, fails_here, passed, ids in (
+            ("2 failed, 9 passed in 0.10s", False, True, "tests/test_x.py::test_a,tests/test_y.py::test_b"),
+            ("2 failed, 9 passed in 0.10s", True, False, "tests/test_x.py::test_a,tests/test_y.py::test_b"),
+            ("!!!!!!!!!! stopping after 2 failures !!!!!!!!!!", False, True, "")):
+        monkeypatch.setenv("TAIL", tail)
+        mark.touch() if fails_here else mark.unlink(missing_ok=True)
+        log.write_text("")
+        seen = len((run / "checks.log").read_text()) if (run / "checks.log").exists() else 0
+        lane = _spill_lane(p, repo)
+        threading.Timer(2.0, lane.close).start()
+        try:
+            cli.main(["checks", "--fresh"])
+        except SystemExit as e:
+            assert not passed and e.code == 1, e.code
+        rec = json.loads((run / "checks.json").read_text())
+        assert rec["passed"] is passed and "spilled_to" not in rec, (tail, fails_here, rec)
+        text = (run / "checks.log").read_text()[seen:]   # this run's part of the log
+        assert "did not pass on spill host check-host-a (exit 1)" in text, text
+        assert ("running only the 2 test(s)" in text) is bool(ids), text
+        where = log.read_text().splitlines()
+        assert "/ttp-check." in where[0] and "/ttp-check." not in where[-1], where
+        assert where[-1].endswith(f"ids={ids}"), where
+
+
+@pytest.mark.skipif(not os.path.isdir("/proc/self"), reason="the probe reads running checks from /proc")
+def test_the_spill_probe_counts_only_checks_a_live_process_runs_and_removes_a_cut_runs_leftover(tmp_path):
+    """A cut run (this machine rebooted) leaves its ttp-check.* folder on the spill host with no process in
+    it: the probe counts it for no running check, so the host still takes runs, and removes it once
+    LEFTOVER_REAP_MIN old. A folder a live process works in counts however old; one just made (its copy,
+    no process yet) counts for RUNNING_GRACE_MIN."""
+    import re
+    import subprocess
+    import time
+    from ttp import checkspill
+    t = tmp_path / "t"
+    ago = lambda d, m: os.utime(d, (time.time() - m * 60,) * 2)
+    live, fresh, old, mid = (t / f"ttp-check.{n}" for n in ("live", "fresh", "old", "mid"))
+    for d in (live / "work", fresh, old, mid):
+        d.mkdir(parents=True)
+    ago(live, 3 * checkspill.LEFTOVER_REAP_MIN)
+    ago(old, 2 * checkspill.LEFTOVER_REAP_MIN)
+    ago(mid, (checkspill.RUNNING_GRACE_MIN + checkspill.LEFTOVER_REAP_MIN) / 2)
+    runner = subprocess.Popen(["sleep", "60"], cwd=live / "work")
+    try:
+        r = subprocess.run(["sh", "-c", checkspill._PROBE], capture_output=True, text=True, timeout=30,
+                           env={**os.environ, "TMPDIR": f"{t}/"})
+    finally:
+        runner.kill()
+        runner.wait()
+    m = re.search(r"^ttp-spill \d+ \d+ (\d+)", r.stdout, re.M)
+    assert m and int(m.group(1)) == 2, r
+    assert live.is_dir() and fresh.is_dir() and mid.is_dir() and not old.exists()
+
+
 @_LINUX_TMP
 def test_a_rerun_after_a_spill_host_keeps_off_only_the_host_it_failed_on(env, tmp_path, monkeypatch):
     """#6379: checks that fail on one spill host run again on the next free one (a pass there counts),
@@ -754,9 +851,23 @@ def test_a_rerun_after_a_spill_host_keeps_off_only_the_host_it_failed_on(env, tm
     mark.unlink()
     log.write_text("")
     p.set_config("delivery.push_checks", [f'pwd >> {log}; case "$PWD" in */ttp-check.*) exit 1;; esac'])
+    real_off, kept = checkspill.spill_off_add, []
+
+    def spill_off_add(*a, **k):   # the lane frees once both spill hosts failed, never on a timer (a loaded host)
+        off = real_off(*a, **k)
+        kept.append(off)
+        if len(kept) == 2:
+            lane.close()
+        return off
+    monkeypatch.setattr(checkspill, "spill_off_add", spill_off_add)
     lane = _spill_lane(p, repo)
-    threading.Timer(4.0, lane.close).start()
-    cli.main(["checks", "--fresh"])
+    safety = threading.Timer(120, lane.close)   # never hang the suite
+    safety.start()
+    try:
+        cli.main(["checks", "--fresh"])
+    finally:
+        safety.cancel()
+        lane.close()
     rec = json.loads((run / "checks.json").read_text())
     assert rec["passed"] is True and "spilled_to" not in rec, rec
     where = log.read_text().splitlines()
@@ -776,6 +887,132 @@ def test_spill_off_keeps_a_failed_host_off_and_a_faulted_one_after_its_second_fa
     off = checkspill.spill_off_add(off, "host-a", fault=True)
     assert checkspill.kept_off(off) == {"host-a", "host-b"}
     assert checkspill.kept_off(checkspill.spill_off_add("1", "user@host-c:22", fault=False)) == {"user@host-c:22"}
+
+
+def test_a_host_kept_off_by_its_own_faults_is_tried_again_once_the_wrapper_changes_or_the_back_off_passes():
+    """#7917: a spill host whose own fault (exit 75) ended the checks HOST_FAULT_TRIES times is kept off under
+    the checks config they ran with, never for good: a new checks.spill_wrap_cmd, or FAULT_RETRY_S later, it is
+    tried again. A host the checks failed on stays off."""
+    from ttp import checkspill
+    old = {"checks": {"spill_wrap_cmd": "old-wrap"}}
+    off = checkspill.spill_off_add("", "host-a", fault=True, cfg=old)
+    off = checkspill.spill_off_add(off, "host-b", fault=False, cfg=old)
+    assert checkspill.kept_off(off, old) == {"host-b"}, "one fault leaves it one more try"
+    off = checkspill.spill_off_add(off, "host-a", fault=True, cfg=old)
+    assert checkspill.kept_off(off, old) == {"host-a", "host-b"}
+    assert checkspill.kept_off(off) == {"host-a", "host-b"}, "no config given: the time alone decides"
+    new = {"checks": {"spill_wrap_cmd": "new-wrap"}}
+    assert checkspill.kept_off(off, new) == {"host-b"}, "a changed wrapper tries the host again"
+    later = time.time() + checkspill.FAULT_RETRY_S + 1
+    assert checkspill.kept_off(off, old, now=later) == {"host-b"}, "so does the back-off passing"
+    assert checkspill.kept_off("host-a:fault,host-a:fault", new) == {"host-a"}, "an older run's plain mark holds"
+
+
+def test_a_run_waiting_here_moves_to_a_spill_host_once_its_lock_frees(env, tmp_path, monkeypatch):
+    """#7917: a run that found its only spill host busy waits here in its place and tries the host again at
+    each bound: once the host's lock frees it spills there, the lane here still held."""
+    import threading
+    from ttp import checkspill, cli
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a"])
+    log = tmp_path / "where.log"
+    cmd = f"pwd >> {log}"
+    p.set_config("delivery.push_checks", [cmd])
+    busy = []
+    monkeypatch.setattr(checkspill, "lock_busy", lambda _p, _c, _a: (
+        busy.append(1) or "busy (held by another run; 1 waiting)") if len(busy) < 3 else "")
+    lane = _spill_lane(p, repo)
+    safety = threading.Timer(30, lane.close)   # never hang the suite: the lane frees after 30 s at the latest
+    safety.start()
+    try:
+        cli.main(["checks", "--fresh"])
+    finally:
+        safety.cancel()
+        lane.close()
+    rec = json.loads((run / "checks.json").read_text())
+    assert rec["passed"] is True and rec.get("spilled_to") == "check-host-a", rec
+    assert len(busy) == 3, busy
+    text = (run / "checks.log").read_text()
+    assert "check-host-a (busy (held by another run" in text and "spilling to check-host-a" in text, text
+    assert "/ttp-check." in log.read_text()
+    assert checkspill.holders(p.name) == []
+
+
+def test_a_waiting_rerun_moves_to_a_host_its_faults_kept_off_once_the_wrapper_changes(env, tmp_path, monkeypatch):
+    """#7917: a rerun whose only spill host faulted twice under the old checks.spill_wrap_cmd waits here; once
+    the wrapper changes, the next bound tries that host again and the run moves there."""
+    import io
+    from ttp import checkspill, cli
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a"])
+    p.set_config("checks.spill_wrap_cmd", "old-wrap")
+    off = ""
+    for _ in range(checkspill.HOST_FAULT_TRIES):
+        off = checkspill.spill_off_add(off, "check-host-a", fault=True, cfg=p.config())
+    real, results = checkspill.pick, []
+
+    def pick(*a, **k):
+        results.append(real(*a, **k))
+        if len(results) == 2:   # the wrapper is fixed while the run waits here
+            p.set_config("checks.spill_wrap_cmd", "new-wrap")
+        return results[-1]
+    monkeypatch.setattr(checkspill, "pick", pick)
+    lane = _spill_lane(p, repo)
+    try:
+        slot = cli._checks_slot(p, run, io.StringIO(), "f" * 40, True, cmds=["true"], top=str(repo),
+                                spill=True, spill_off=off)
+    finally:
+        lane.close()
+    try:
+        assert slot is not None and slot.spill is not None and slot.spill.host == "check-host-a", results
+        assert results[:2] == [None, None] and results[-1] is slot.spill, results
+    finally:
+        slot and slot.close()
+
+
+def test_a_run_with_no_usable_spill_host_still_waits_here_under_the_load_guard(env, tmp_path, monkeypatch):
+    """#7917 (checks.load_guard, a safety rule): a run whose only spill host its faults keep off tries it at
+    each bound and finds it off, takes no host-wide checks slot while the guard holds, and starts here only
+    once the floor frees."""
+    import io
+    from ttp import checkcap, checkspill, cli, testslots
+    monkeypatch.delenv("TTP_CHECKS_LOAD_GUARD", raising=False)
+    monkeypatch.setattr(checkcap, "cores", lambda: 64)
+    monkeypatch.setattr(checkcap, "_load", lambda: 900.0)
+    monkeypatch.setattr(checkcap, "cpu_demand", lambda: 900.0)
+    monkeypatch.setenv("TTP_TEST_POOL", "4")
+    p = make(env)
+    p.set_config("delivery.checks_spill_hosts", ["check-host-a"])
+    p.set_config("delivery.checks_spill_after_s", 0.3)
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "4")
+    monkeypatch.setenv("TTP_RUN_DIR", str(run_dir))
+    off = ""
+    for _ in range(checkspill.HOST_FAULT_TRIES):
+        off = checkspill.spill_off_add(off, "check-host-a", fault=True, cfg=p.config())
+    floor = _hold_load_floor()   # another run holds the one routine pass
+    real, results, grants = checkspill.pick, [], []
+    before = len(checkcap.grant_records())
+
+    def pick(*a, **k):
+        results.append(real(*a, **k))
+        if len(results) == 3:
+            grants.append(len(checkcap.grant_records()) - before)
+            floor.close()
+        return results[-1]
+    monkeypatch.setattr(checkspill, "pick", pick)
+    out = io.StringIO()
+    try:
+        assert testslots.load_guard()
+        slot = cli._checks_slot(p, run_dir, out, "f" * 40, True, cmds=["true"], top=str(p.base), spill=True,
+                                spill_off=off)
+    finally:
+        floor.close()
+    try:
+        assert slot is not None and slot.spill is None and slot.f is not None, "it ran here"
+        assert len(results) >= 3 and not any(results) and grants == [0], (results, grants)
+        assert "check-host-a (these checks did not pass there in this run)" in out.getvalue(), out.getvalue()
+    finally:
+        slot.close()
 
 
 def test_an_urgent_rerun_after_a_spill_host_still_takes_a_free_pool_host_at_once(env, tmp_path, monkeypatch):
@@ -1322,7 +1559,8 @@ def test_no_spill_hosts_keeps_todays_wait_and_unspillable_checks_never_spill(env
     assert checkspill.hosts(p.config()) == [] and checkspill.after_s(p.config()) == checkspill.SPILL_AFTER_S
     c = push.check_list(["make test", {"run": "make a", "host": "local"}, {"run": "make b", "cwd": "authoring"}])
     assert checkspill.spillable(c[:1]) and not checkspill.spillable(c[1:2]) and not checkspill.spillable(c[2:])
-    assert not checkspill.spillable(push.with_host(c[:1], "check-host-a"))
+    assert checkspill.spillable(push.with_host(c[:1], "check-host-a")), "delivery.checks_host does not keep it there"
+    assert not checkspill.spillable(push.check_list([{"run": "make test", "host": "check-host-a"}]))
     assert not checkspill.spillable(push.with_wrap(c[:1], ("flock", "/tmp/x")))
     assert not checkspill.spillable([])
 
@@ -1433,6 +1671,87 @@ def test_ttp_config_account_sets_the_spill_pool_validated_and_a_run_may_only_cle
     assert checkspill.account_hosts() == [] and "spill_hosts" not in (project.load_account_settings().get("checks") or {})
 
 
+
+def test_the_account_ban_list_keeps_a_spill_host_out_by_alias_or_host_name_and_an_unlisted_host_still_spills(
+        env, tmp_path, monkeypatch):
+    """checks.no_spill_hosts in the account settings: a host it names, by alias or by the machines list's host
+    name (full or short), is never tried or allowed, from the project's own list or the account's pool; a host
+    it does not name still spills, and the run's log says why the banned one was skipped."""
+    from ttp import checkspill, cli, machines, project
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a", "check-host-b"])
+    machines.add("check-host-b", hostname="serve-b.example")
+    project.set_account_setting(checkspill.ACCOUNT_KEY, ["down"])
+    project.set_account_setting(checkspill.NO_SPILL_KEY, ["CHECK-HOST-A", "serve-b", "down"])
+    assert checkspill.hosts(p.config()) == []
+    assert checkspill.banned("check-host-a") == "CHECK-HOST-A", "by alias, any case"
+    assert checkspill.banned("check-host-b") == "serve-b", "by the machines list's host name, short form"
+    assert "checks.no_spill_hosts" in checkspill.allowed(p, p.config(), "check-host-b")
+    assert checkspill.allowed(p, p.config(), "down").startswith("banned for every project"), "the pool too"
+    project.set_account_setting(checkspill.NO_SPILL_KEY, ["check-host-a", "serve-b.example"])
+    assert checkspill.banned("check-host-b") == "serve-b.example", "by the full host name"
+    assert checkspill.hosts(p.config()) == ["down"]
+    project.set_account_setting(checkspill.NO_SPILL_KEY, ["check-host-a"])
+    assert checkspill.hosts(p.config()) == ["check-host-b", "down"]
+    assert checkspill.allowed(p, p.config(), "check-host-b") == "", "an unlisted host still spills"
+    log = tmp_path / "where.log"
+    p.set_config("delivery.push_checks", [f"pwd >> {log}"])
+    lane = _spill_lane(p, repo)
+    try:
+        cli.main(["checks", "--fresh"])
+    finally:
+        lane.close()
+    rec = json.loads((run / "checks.json").read_text())
+    assert rec["passed"] is True and rec["spilled_to"] == "check-host-b", rec
+    text = (run / "checks.log").read_text()
+    assert "check-host-a (banned by the account's checks.no_spill_hosts)" in text, text
+    project.set_account_setting(checkspill.NO_SPILL_KEY, "check-host-a")   # malformed: no ban, never a crash
+    assert checkspill.no_spill() == [] and "check-host-a" in checkspill.hosts(p.config())
+
+
+def test_a_spill_list_naming_a_banned_host_is_refused_and_a_run_may_only_add_to_the_ban_list(
+        env, tmp_path, capsys, monkeypatch):
+    """`ttp config` and config_set refuse a project spill list or account pool naming a host the account bans;
+    a list set before the ban is flagged by the config check; `ttp checks status` shows the ban; a run may
+    add hosts to the ban list but never remove one, and each change is logged with its undo."""
+    from ttp import accountset, checkspill, cli, coordinator, machines, project
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    for k in ("TTP_RUN_ID", "TTP_RUN_DIR"):   # the user at a terminal until the run below
+        monkeypatch.delenv(k, raising=False)
+    machines.add("check-host-b", hostname="serve-b.example")
+    p.set_config("delivery.checks_spill_hosts", ["check-host-b"])
+    cli.main(["config", "--account", "checks.no_spill_hosts", '["serve-b.example"]'])
+    err = capsys.readouterr().err
+    assert checkspill.no_spill() == ["serve-b.example"]
+    assert f"{p.name}'s delivery.checks_spill_hosts names check-host-b" in err, err
+    assert any("check-host-b is banned" in x for x in project.config_problems(p.raw_config()))
+    for argv in (["config", p.name, "delivery.checks_spill_hosts", '["check-host-c", "check-host-b"]'],
+                 ["config", "--account", "checks.spill_hosts", '["check-host-b"]']):
+        with pytest.raises(SystemExit):
+            cli.main(argv)
+        assert "banned from every project's checks" in capsys.readouterr().err, argv
+    with pytest.raises(ValueError, match="banned"):
+        coordinator.USER_SETTABLE["delivery.checks_spill_hosts"](["check-host-b"])
+    assert coordinator.USER_SETTABLE["delivery.checks_spill_hosts"](["check-host-c"]) == ["check-host-c"]
+    cli.main(["config", p.name, "delivery.checks_spill_hosts", '["check-host-c"]'])
+    assert p.config()["delivery"]["checks_spill_hosts"] == ["check-host-c"]
+    assert checkspill.no_spill_lines() == [
+        "spill hosts banned for every project (checks.no_spill_hosts): serve-b.example"]
+    capsys.readouterr()
+    with pytest.raises(SystemExit):
+        cli.main(["checks", "status"])
+    assert "spill hosts banned for every project (checks.no_spill_hosts): serve-b.example" in capsys.readouterr().out
+    monkeypatch.setenv("TTP_RUN_ID", "7")
+    for value in ("[]", "", '["check-host-x"]'):
+        with pytest.raises(SystemExit):
+            cli.main(["config", "--account", "checks.no_spill_hosts", value])
+        assert "only the user lifts a ban" in capsys.readouterr().err, value
+    cli.main(["config", "--account", "checks.no_spill_hosts", '["serve-b.example", "check-host-x"]'])
+    assert checkspill.no_spill() == ["serve-b.example", "check-host-x"]
+    log = [json.loads(x) for x in accountset.log_path().read_text().splitlines()]
+    assert [r["new"] for r in log if r["key"] == "checks.no_spill_hosts"] == [
+        ["serve-b.example"], ["serve-b.example", "check-host-x"]]
+
+
 def test_a_wrapped_run_spills_only_when_its_project_says_the_wrapper_needs_no_device(env, tmp_path, monkeypatch):
     """checks.wrap_needs_device false: a run behind checks.wrap_cmd may spill and runs there without the
     wrapper (it is this machine's); unset, true or not a bool, the need is unknown and the run stays here."""
@@ -1477,7 +1796,7 @@ def test_a_wrapped_run_spills_only_when_its_project_says_the_wrapper_needs_no_de
     for v in (None, True, "false", 0):
         assert not checkspill.spillable(c, {"checks": {"wrap_needs_device": v}}), v
     assert checkspill.spillable(c, {"checks": {"wrap_needs_device": False}})
-    assert not checkspill.spillable(push.with_host(c, "check-host-a"), {"checks": {"wrap_needs_device": False}})
+    assert checkspill.spillable(push.with_host(c, "check-host-a"), {"checks": {"wrap_needs_device": False}})
     assert not project.config_problems({"checks": {"wrap_needs_device": False}})
     assert any("checks.wrap_needs_device" in x for x in project.config_problems({"checks": {"wrap_needs_device": "no"}}))
 
@@ -1701,8 +2020,16 @@ def test_a_saturated_disk_sends_a_new_run_to_a_spill_host_before_any_wait_here(e
     cmd = f"pwd >> {log}"
     p.set_config("delivery.push_checks", [cmd])
     held = [True]
-    monkeypatch.setattr(diskgate, "saturated", lambda: "Dirty 7.6 GB over the 2.0 GB limit (checks.dirty_max_mb)"
-                        if held[0] else "")
+    picks = []
+    after_pick = [0]
+
+    def saturated():
+        if picks and held[0]:   # the disk clears only once the run, the spill hosts tried, saw it held here
+            after_pick[0] += 1
+            held[0] = after_pick[0] < 2
+            return "Dirty 7.6 GB over the 2.0 GB limit (checks.dirty_max_mb)"
+        return "Dirty 7.6 GB over the 2.0 GB limit (checks.dirty_max_mb)" if held[0] else ""
+    monkeypatch.setattr(diskgate, "saturated", saturated)
     real_acquire = checkcap.acquire
     monkeypatch.setattr(checkcap, "acquire", lambda *a, **k: pytest.fail("no wait here before the spill hosts"))
     cli.main(["checks", "--fresh"])
@@ -1713,11 +2040,14 @@ def test_a_saturated_disk_sends_a_new_run_to_a_spill_host_before_any_wait_here(e
     # No spill host free: it waits here (the gate in checkcap._take) and runs here once the disk clears.
     monkeypatch.setattr(checkcap, "acquire", real_acquire)
     monkeypatch.setattr(checkcap, "POLL_S", 0.02)
-    picks = []
     monkeypatch.setattr(checkspill, "pick", lambda *a, **k: picks.append(1) or None)
     log.write_text("")
-    threading.Timer(1.0, lambda: held.__setitem__(0, False)).start()
-    cli.main(["checks", "--fresh"])
+    safety = threading.Timer(120, lambda: held.__setitem__(0, False))   # never hang the suite
+    safety.start()
+    try:
+        cli.main(["checks", "--fresh"])
+    finally:
+        safety.cancel()
     rec = json.loads((run / "checks.json").read_text())
     assert rec["passed"] is True and "spilled_to" not in rec, rec
     assert picks == [1], "the spill hosts were tried first, once"
@@ -1954,6 +2284,20 @@ def test_a_split_off_check_timing_out_here_is_the_verdict_without_a_rerun(env, t
     assert "did not pass on spill host" not in text and len(ran) == len(here) == 1, (text, ran, here)
 
 
+def test_a_suite_of_a_project_with_a_checks_host_spills_and_runs_on_the_spill_host():
+    """delivery.checks_host (push.with_host's default_host) never keeps a check off the spill hosts: only the
+    check's own host, or a spill host it already has, does. Spilled, it runs on the spill host, not the
+    checks host; a check that names its own host, or one already spilled, stays where it is."""
+    from ttp import checkspill, push
+    suite = push.with_host(push.check_list(["python3 -m pytest -q tests", {"run": "make lint", "host": "check-host-b"}]),
+                           "check-host-a")
+    assert suite[0].default_host == "check-host-a" and push.remote_host(suite[0]) == "check-host-a"
+    assert checkspill.check_spills(suite[0]) and not checkspill.check_spills(suite[1])
+    assert checkspill.spillable(suite[:1]) and checkspill.spillable(suite)   # the host-pinned check runs beside it
+    spilled = push.spill_to(suite[:1], "spill-host-a", None)
+    assert push.remote_host(spilled[0]) == "spill-host-a" and not checkspill.check_spills(spilled[0])
+
+
 def test_a_check_opts_in_to_spilling_and_runs_behind_its_remote_wrapper_there(env):
     """`spill: true` lets a check with host "local" spill, `false` keeps any check here; a check behind
     checks.wrap_cmd (a device wrapper) spills only with a remote wrapper (its own spill_wrap_cmd, else
@@ -1965,7 +2309,7 @@ def test_a_check_opts_in_to_spilling_and_runs_behind_its_remote_wrapper_there(en
     assert [checkspill.spillable(c[i:i + 1]) for i in range(6)] == [True, False, True, False, True, False]
     assert not checkspill.spillable(c) and checkspill.spillable([c[0], c[2], c[4]])
     assert not checkspill.spillable(push.check_list([{"run": "make x", "host": "check-host-a", "spill": True}]))
-    assert not checkspill.spillable(push.with_host(c[:1], "check-host-a")), "delivery.checks_host stays there"
+    assert checkspill.spillable(push.with_host(c[:1], "check-host-a")), "delivery.checks_host does not keep it there"
     assert checkspill.spillable(push.with_host(c[2:3], "check-host-a")), "host local beats checks_host"
     assert push.checks_of([{"run": "make b", "host": "local", "spill": True, "spill_wrap_cmd": "./w.sh -x"}]) == [
         {"run": "make b", "host": "local", "spill": True, "spill_wrap_cmd": "./w.sh -x"}]
@@ -2048,6 +2392,9 @@ def test_a_remote_wrapper_that_records_its_refusal_is_a_host_fault_and_a_plain_e
         return r.returncode, r.stdout + r.stderr
     rc, out = go(f"echo ran >> {ran}", refuse="mark75")
     assert rc == remotecheck.FAULT_RC and f"{remotecheck.SIG}box1" in out and "refused" in out, out
+    host, why = remotecheck.wrap_fault(out)   # #8107: the limit line status shows names the host and the setting
+    assert host == "box1" and "'./busy.sh' refused the run there" in why and "checks.spill_wrap_cmd" in why, why
+    assert "on box1" in out and "low priority" in out and out.count("(checks.nice)") == 1, out
     assert "host busy" in out and not ran.exists() and "ttp-remote-rc" not in out, out
     assert _rc_left(tmp_path) == []
     rc, out = go("exit 3")
@@ -2102,6 +2449,12 @@ def test_a_host_local_check_that_opts_in_spills_behind_its_remote_wrapper_and_a_
     assert rec["passed"] is True and "spilled_to" not in rec, rec
     text = (run / "checks.log").read_text()
     assert "missing-wrap.sh' is missing or not executable there" in text and "did not pass on spill host" in text, text
+    # #8107 (wrap_refusal_in_status): status names the host and the wrapper's setting while the run goes on.
+    lines = checkspill.limit_lines(p.name)
+    assert any("spill host check-host-a: the spill wrapper './missing-wrap.sh' is missing" in x
+               and "checks.spill_wrap_cmd" in x for x in lines), lines
+    assert "check commands run at low priority, behind" in text and "(checks.nice)" in text, "nice_line_logged here"
+    checkspill.note_limit(p.name, "")
     assert "/ttp-check." not in log.read_text().splitlines()[-1] and len(log.read_text().splitlines()) == 1
     assert not wlog.exists()
     # Without the opt-in a host-local check waits here.
@@ -2135,10 +2488,86 @@ def test_spill_host_slots_follow_idle_cores_and_memory_and_the_probe_reads_its_l
     assert checkspill.probe("h") == (checklane.default_slots(64, 200), "", ""), "an unread load: '-'"
     out["line"] = f"ttp-spill 64 {200 * gib} 2 60"
     n, why, _ = checkspill.probe("h")
-    assert n == 0 and "load 60 of 64 cores" in why, why
+    assert n == 0 and "load 60, of 64 cores" in why and "0.8 x" in why, why
     out["line"] = "ttp-spill 64 x 2"
     assert checkspill.probe("h")[0] == 0 and "probe failed" in checkspill.probe("h")[1]
 
+
+
+def _spill_hosts_read(monkeypatch, loads: dict, cores=64, mem_gib=200):
+    """The spill probe over ssh answers per host from `loads` ({alias: 1-minute load, or None: ssh cannot
+    reach it}); every other command runs as before. Returns the probes run per host."""
+    from ttp import checkspill, remotecheck
+    real, real_ssh, seen = subprocess.run, remotecheck._ssh, {}
+    monkeypatch.setattr(remotecheck, "_ssh", lambda alias, script, *a, **k: (
+        ["fake-spill-probe", alias] if script == checkspill._probe_script() else real_ssh(alias, script, *a, **k)))
+
+    def run(cmd, *a, **k):
+        if not (isinstance(cmd, list) and cmd[:1] == ["fake-spill-probe"]):
+            return real(cmd, *a, **k)
+        host = cmd[1]
+        seen[host] = seen.get(host, 0) + 1
+        if loads[host] is None:
+            return subprocess.CompletedProcess(cmd, 255, "", f"ssh: connect to host {host}: No route to host\n")
+        return subprocess.CompletedProcess(
+            cmd, 0, f"ttp-spill {cores} {mem_gib * 1024 * 1024} 0 {loads[host]}\nttp-spill-dev-end none\n", "")
+    monkeypatch.setattr(checkspill.subprocess, "run", run)
+    return seen
+
+
+def test_spill_never_starts_a_check_on_a_host_whose_load_is_near_its_cores(env, tmp_path, monkeypatch):
+    """#8016 (user msg #2469: runs kept choking one box): a host whose 1-minute load is at or above
+    checkspill.LOAD_NEAR x its cores gets no new check, whatever its slots; this machine's runs started there
+    within LOAD_LAG_S count as load already (the 1-minute load shows them late), so a burst of picks fills a
+    host only to the gate and then waits, never piling on."""
+    from ttp import checkspill
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a", "check-host-b"])
+    _spill_hosts_read(monkeypatch, {"check-host-a": 52, "check-host-b": 4})
+    n, why, _ = checkspill.probe("check-host-a")
+    assert n == 0 and "load 52, of 64 cores" in why and "0.8 x" in why, why
+    told, got = [], []
+    try:
+        while len(got) < 20 and (c := checkspill.pick(p, p.config(), told.append, "pytest -q")) is not None:
+            got.append(c)
+        assert got and {c.host for c in got} == {"check-host-b"}, told
+        assert len(got) < 20, "the gate held the burst"
+        assert "check-host-a (its load is near its cores (load 52, of 64 cores" in told[-1], told[-1]
+        assert checkspill._pending_cores("check-host-b", 64) > 0
+        later = time.time() + checkspill.LOAD_LAG_S + 1
+        assert checkspill._pending_cores("check-host-b", 64, now=later) == 0, "the load shows them by then"
+    finally:
+        for c in got:
+            c.close()
+
+
+def test_an_unreachable_spill_host_backs_off_and_its_share_spreads_over_the_others(env, tmp_path, monkeypatch):
+    """#8016: a host whose probe fails backs off (60 s, doubling to 900 s; a state file every project here
+    reads) and is tried last until then, never probed at each pick; the runs it would take spread over the
+    other hosts by their free cores, never all to one."""
+    from ttp import checkspill
+    names = ["down", "check-host-a", "check-host-b", "check-host-c"]
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, names, charter=names)
+    probes = _spill_hosts_read(monkeypatch, {"down": None, "check-host-a": 0, "check-host-b": 0, "check-host-c": 0})
+    told, got = [], []
+    try:
+        for _ in range(6):
+            got.append(checkspill.pick(p, p.config(), told.append, "pytest -q"))
+        hosts = [c.host for c in got if c is not None]
+        assert len(hosts) == 6 and {h: hosts.count(h) for h in set(hosts)} == \
+            {"check-host-a": 2, "check-host-b": 2, "check-host-c": 2}, (hosts, told)
+        assert probes["down"] == 1, probes
+        why = checkspill.backed_off("down")
+        assert "ssh cannot reach it" in why and "backing off after 1 failed probe" in why, why
+        assert checkspill.probe("down")[0] == 0
+        st = checkspill.host_state("down")
+        assert st["fails"] == 2 and 100 < st["until"] - time.time() <= 2 * checkspill.BACKOFF_S, st
+        assert checkspill.backed_off("down", now=time.time() + checkspill.BACKOFF_MAX_S + 1) == ""
+        # A probe that reads again ends the back-off.
+        _spill_hosts_read(monkeypatch, {"down": 0})
+        assert checkspill.probe("down")[0] > 0 and checkspill.backed_off("down") == ""
+    finally:
+        for c in got:
+            c and c.close()
 
 # The account's Slurm overflow (slurmcheck): fake sbatch, squeue, sacct and scancel run through the fake
 # ssh. FAKE_SLURM=<dir> holds their logs and job states; FAKE_SLURM_MODE: run (the job runs at once and
@@ -3006,6 +3435,201 @@ def test_a_spilled_run_gets_test_workers_sized_to_the_hosts_idle_cores_outside_i
     assert dict(cli._spill_to([own], "check-host-a", p.config(), 5)[0].literal_env)[testslots.SLOTS_ENV] == "2"
 
 
+def test_a_queued_run_spills_to_the_most_free_host_with_workers_sized_to_its_free_cores(env, tmp_path, monkeypatch):
+    """#7996 (pick_most_free_host, spill_workers_sized): every usable spill host is probed and the run goes to the
+    one with the most free capacity, not the first listed; its workers fit that host's idle cores, and the tell
+    and the run's limit record (ttp status, the web app) say so."""
+    from ttp import checkspill
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a", "check-host-b"])
+    loads = {"check-host-a": 60.0, "check-host-b": 4.0}
+
+    def fake_probe(host, beside=False):
+        checkspill._READ[host] = (64, loads[host])
+        return 2, "", ""
+    monkeypatch.setattr(checkspill, "probe", fake_probe)
+    p.set_config("checks.test_run_max", 32)
+    told = []
+    got = checkspill.pick(p, p.config(), told.append, "task #1 checks")
+    try:
+        assert got is not None and got.host == "check-host-b", told
+        assert 1 < got.workers <= 32, got.workers
+        line = told[-1]
+        assert "spilling to check-host-b" in line and "the most free of 2 usable spill hosts" in line, line
+        assert f"with {got.workers} test worker(s), its idle cores (load 4 of 64)" in line, line
+        assert "limit checks.test_run_max" in line or got.workers < 32, line
+        assert any("limited: spill host check-host-b:" in x for x in checkspill.limit_lines(p.name))
+    finally:
+        got and got.close()
+    assert not any("check-host-b" in x for x in checkspill.limit_lines(p.name)), "freed with the claim"
+
+
+def test_the_spill_pick_spreads_counting_claims_not_yet_running_against_free_slots(env, tmp_path, monkeypatch):
+    """#7996 (spill_pick_spreads, user msg #2469): the pick goes to the host with the most free slots less this
+    machine's claims there that its probe did not see running yet, not the first host with any slot."""
+    from ttp import checkspill
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a", "check-host-b"])
+    frees = {"check-host-a": 3, "check-host-b": 2}
+
+    def fake_probe(host, beside=False):
+        checkspill._READ[host], checkspill._CHECKS_RUNNING[host] = (64, 4.0), 0
+        return frees[host], "", ""
+    monkeypatch.setattr(checkspill, "probe", fake_probe)
+    monkeypatch.setattr(checkspill, "_ours", lambda h: 2 if h == "check-host-a" else 0)
+    p.set_config("checks.test_run_max", 2)   # both hosts size a run alike: only the free slots decide
+    told = []
+    got = checkspill.pick(p, p.config(), told.append, "task #1 checks")
+    try:
+        assert got is not None and got.host == "check-host-b", told
+    finally:
+        got and got.close()
+    assert checkspill._inflight("check-host-a") == 2
+    monkeypatch.setitem(checkspill._CHECKS_RUNNING, "check-host-a", 2)
+    assert checkspill._inflight("check-host-a") == 0, "claims seen running there are in its load already"
+
+
+def test_a_host_wide_checks_wait_names_its_cap_and_where_the_cap_comes_from(monkeypatch):
+    """#7996 (user msg #2469): the host-wide cap in a wait line says its number and source: the setting, or the
+    free-core fit while checks.host_max is unset."""
+    from ttp import checkcap
+    monkeypatch.delenv("TTP_CHECKS_HOST_MAX", raising=False)
+    monkeypatch.setattr(checkcap, "_set_limit", lambda: None)
+    assert checkcap.cap_text(12) == "cap 12: the free-core fit (checks.host_max unset)"
+    monkeypatch.setattr(checkcap, "_set_limit", lambda: 6)
+    assert checkcap.cap_text(6) == "cap 6 (checks.host_max)"
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "6")
+    assert checkcap.cap_text(6) == "cap 6 (TTP_CHECKS_HOST_MAX)"
+
+
+def test_a_spilled_run_held_to_one_worker_says_why(env, tmp_path, monkeypatch):
+    """#7996 (single_worker_logged): a spill host sized to 1 test worker says which cores are idle and which
+    are kept, and a run's per-run cap names its setting; an unread load says the run sizes itself."""
+    from ttp import checkspill
+    n, why = checkspill.workers_why(4, 9.0)
+    assert n == 1 and "only 1 because 0 core(s) are idle" in why, why
+    n, why = checkspill.workers_why(10, 4.0, others=1)
+    assert n == 1 and "kept for 1 other run(s)" in why and "only 1 because" in why, why
+    n, why = checkspill.workers_why(64, 0.0, cap=8)
+    assert n == 8 and "at most 8 per run (limit checks.test_run_max)" in why, why
+    assert checkspill.workers_why(16, None)[1].startswith("test workers it sizes itself")
+
+
+def test_a_claim_record_no_live_holder_locks_counts_for_no_run(env, tmp_path, monkeypatch):
+    """#7996: a claim record left by a run a reboot killed (its pid since reused by another process) holds no
+    lock: it is no holder and keeps no cores off the next run's workers (it once sized a spill to 1 worker)."""
+    from ttp import checkspill
+    d = checkspill.claim_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    stale = d / "check-host-a.0.json"
+    stale.write_text(json.dumps({"project": "other", "pid": os.getpid(), "host": "check-host-a", "since": 1.0}))
+    assert not any(r.get("host") == "check-host-a" for r in checkspill.holders())
+    assert checkspill._ours("check-host-a") == 0
+
+
+def test_a_parked_checks_run_names_the_limit_its_value_and_setting(env, tmp_path, monkeypatch):
+    """#7996 (limit_reason_logged, status_shows_limit): a run parked on a limit writes the limit, its value and
+    its setting to its log, and the same line shows in ttp status and the web app's checks view until it ends."""
+    import contextlib
+    import io
+    from ttp import checkcap, checkspill, cli, web
+    p = make(env)
+    why = "the host's test pool: 0 of 8 free, a run needs 2 (limits checks.test_pool, checks.test_run_min)"
+    told = []
+    checkcap._tell_parked(told.append, p.name, lambda: why)
+    assert told == [checkcap.parked_line(why)] and checkcap.PARKED_LINE in told[0] and why in told[0]
+    lines = checkspill.limit_lines(p.name)
+    assert lines and "limited: waits for its test slots: " + why in lines[0], lines
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        cli.main(["status", p.name])
+    assert "limited: waits for its test slots:" in out.getvalue()
+    import time
+    assert any("checks.test_pool" in r["text"] for r in web.slots_feed(time.time(), p)), "web feed"
+    checkcap._note_limit("", p.name)
+    assert checkspill.limit_lines(p.name) == []
+
+
+def _full_after(monkeypatch, free=1, running=0):
+    """checkspill.probe for fake hosts: `free` check slots, `running` checks there (no ssh)."""
+    from ttp import checkspill
+
+    def fake(host, beside=False):
+        checkspill._READ[host], checkspill._CHECKS_RUNNING[host] = (64, 0.0), running
+        return free, "", ""
+    monkeypatch.setattr(checkspill, "probe", fake)
+
+
+def test_checks_pinned_to_a_host_take_its_check_slots_as_a_spill_pick_does(env, tmp_path, monkeypatch):
+    """#7996 (pinned_host_admission, no_overshoot_concurrent_picks): checks pinned to a host claim its check
+    slots in the shared claim folder, so runs of any project here (pinned or spilled) never start more there
+    than its probe's free slots, claims still in flight (no check running there yet) included; a run that
+    waits says why with its numbers, and status shows it."""
+    import threading
+    from ttp import checkspill
+    p = make(env)
+    monkeypatch.setitem(checkspill._CHECKS_RUNNING, "check-host-a", 0)   # the last probe: no check running there yet
+    got, lock = [], threading.Lock()
+
+    def take():
+        c = checkspill._claim("check-host-a", 2, {"project": p.name, "pid": os.getpid(), "host": "check-host-a"})
+        with lock:
+            got.append(c)
+    ts = [threading.Thread(target=take) for _ in range(6)]
+    [t.start() for t in ts]
+    [t.join(10) for t in ts]
+    held = [c for c in got if c is not None]
+    assert len(held) == 2, "6 pickers at once, 2 free slots: no overshoot"
+    for c in held:
+        c.close()
+    _full_after(monkeypatch, free=1)
+    first = checkspill.admit_pinned(p, ["check-host-a"], print, "task #1 checks")
+    assert first and len(first) == 1
+    told = []
+    assert checkspill.admit_pinned(p, ["check-host-a"], told.append, "task #2 checks", bound=0,
+                                   sleep=lambda s: None) is None
+    assert told and "checks pinned to check-host-a wait for a check slot there: its 1 free check slot(s) are " \
+        "claimed by this machine's 1 run(s) there" in told[0], told
+    assert any("limited: checks pinned to check-host-a" in x for x in checkspill.limit_lines(p.name))
+    for c in first:
+        c.close()
+    again = checkspill.admit_pinned(p, ["check-host-a"], print, "task #2 checks", bound=0)
+    assert again and len(again) == 1
+    again[0].close()
+    monkeypatch.setattr(checkspill, "probe", lambda h, b=False: (0, "ssh cannot reach it: exit 255", ""))
+    assert checkspill.admit_pinned(p, ["check-host-a"], print, bound=0) == [], "an unreadable host holds no run"
+
+
+def test_a_tasks_checks_never_start_anyway_on_an_overloaded_pinned_host(env, tmp_path, monkeypatch):
+    """#7996 (no_start_anyway_task_checks): `ttp checks` pinned to an overloaded host never start there past
+    the bound: the wait says why with its numbers and hands over (None); push checks keep their bounded start."""
+    import io
+    from ttp import checkcap, checkspill, cli, push, remoteload
+    p = make(env)
+    monkeypatch.delenv("TTP_DETACHED", raising=False)
+    monkeypatch.setattr(checkcap, "FOREGROUND_WAIT_S", 0.0)
+    monkeypatch.setattr(checkspill, "probe", lambda h, b=False: pytest.fail("no admission while overloaded"))
+    why = "the check host check-host-a's CPU is overloaded: its runnable demand of 298.0 cores is above its 64 cores"
+    monkeypatch.setattr(remoteload, "held", lambda h, **kw: why)
+    cmds = push.check_list([{"run": "pytest -n 16 tests", "host": "check-host-a"}])
+    told = []
+    # #8107 (load_guard_in_status): while it waits, status names the guard and its setting; cleared after.
+    seen = []
+
+    def nap(s):
+        seen.append(checkspill.limit_lines(p.name))
+        monkeypatch.setattr(remoteload, "held", lambda h, **kw: "")
+    note = lambda line: checkspill.note_limit(p.name, line)   # noqa: E731
+    assert remoteload.wait(["check-host-a"], told.append, None, sleep=nap, note=note) == ""
+    assert any("remote load guard" in x and "checks.load_guard" in x and why in x for x in seen[0]), seen
+    assert checkspill.limit_lines(p.name) == []
+    monkeypatch.setattr(remoteload, "held", lambda h, **kw: "")
+    _full_after(monkeypatch, free=1)
+    out = io.StringIO()
+    slot = cli._checks_slot(p, tmp_path, out, "a" * 40, cmds=cmds, top=str(p.root))
+    assert slot is not None and len(slot.pinned) == 1 and "holding 1 check slot(s) there" in out.getvalue()
+    slot.close()
+    assert slot.pinned == [] and checkspill._ours("check-host-a") == 0
+
+
 def test_a_check_reading_git_history_stays_here_and_the_rest_of_its_run_spills(env, tmp_path, monkeypatch):
     """Upstream note 92664c3b34114013: a spill host's copy has one commit, so `git diff --check <base>` exited 128
     there. A check that runs a git command reading commits (any form: options, an env prefix, a shell -c, an
@@ -3069,13 +3693,14 @@ def test_spill_pick_spreads_runs_across_hosts_with_room_and_checks_status_says_w
     p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["down", "check-host-a", "check-host-b"])
     told = []
     first = checkspill.pick(p, p.config(), told.append, "pytest -q")
+    lines = checkspill.pick_lines(p.name)
+    assert any(line.startswith("  spill host down took no run: ssh cannot reach it") for line in lines), lines
     second = checkspill.pick(p, p.config(), told.append, "pytest -q")
     try:
         assert first is not None and second is not None
         assert (first.host, second.host) == ("check-host-a", "check-host-b"), told
         lines = checkspill.pick_lines(p.name)
-        assert lines[0] == "last spill pick (0 min ago) took check-host-b", lines
-        assert any(line.startswith("  spill host down took no run: ssh cannot reach it") for line in lines), lines
+        assert lines == ["last spill pick (0 min ago) took check-host-b"], "the unreachable host backs off: tried last"
         off = ",".join(f"{h}:fail" for h in ("down", "check-host-a", "check-host-b"))
         assert checkspill.pick(p, p.config(), told.append, "pytest -q", off) is None
         lines = checkspill.pick_lines(p.name)
@@ -3700,10 +4325,356 @@ def test_the_tree_copy_to_a_check_host_is_compressed_and_a_stall_is_the_hosts_fa
     from ttp import checkwall, remotecheck
     repo = _rc_repo(tmp_path)
     args = tmp_path / "ssh.args"
-    rc, out = _rc_run(tmp_path, repo, "true", FAKE_SSH_ARGS=str(args))
+    rc, out = _rc_run(tmp_path, repo, "true", FAKE_SSH_ARGS=str(args), FAKE_SSH_NOGIT="1", TTP_REMOTE_TREE_COPY="1")
     assert rc == 0, out
     calls = args.read_text().splitlines()
     copy = [c for c in calls if "tar -xf -" in c]
     assert len(copy) == 1 and "Compression=yes" in copy[0], calls
     assert not [c for c in calls if "Compression=yes" in c and "tar -xf -" not in c], calls
     assert remotecheck.SETUP_TIMEOUT_S < checkwall.SILENT_S
+
+
+def _rc_mirror(tmp_path):
+    """The fake host's mirrors: {name: [its refs]}."""
+    found = {}
+    for m in sorted((tmp_path / "host-home" / "check-mirrors").glob("*.git")):
+        found[m.name] = subprocess.run(["git", "-C", str(m), "for-each-ref", "--format=%(refname)"],
+                                       capture_output=True, text=True, check=True).stdout.split()
+    return found
+
+
+def _rc_sent(said):
+    """MB each bundle took to the mirror, as the check printed them."""
+    return [float(x) for x in re.findall(r"to box1's mirror: done in \d+ s \(([\d.]+) MB\)", said)]
+
+
+def _rc_commit(repo, name, data=b"x\n"):
+    (repo / name).write_bytes(data)
+    git = ["git", "-C", str(repo), "-c", "user.email=t@example.com", "-c", "user.name=t"]
+    subprocess.run([*git, "add", "-A"], check=True)
+    subprocess.run([*git, "commit", "-qm", name], check=True)
+
+
+def test_a_remote_check_sends_only_new_objects_to_the_hosts_mirror_and_leaves_no_ref_or_checkout(tmp_path):
+    """The first check seeds the host's bare mirror (beside its checks env, keyed by the repository's root
+    commits) with the whole history; a later one sends a bundle of only the new commit. Each runs in a
+    fresh checkout of exactly its head; afterwards its checkout, its check ref and the bundle are gone and
+    the head stays as a base ref later bundles leave out."""
+    repo = _rc_repo(tmp_path, big=True)
+    rc, said = _rc_run(tmp_path, repo, "git rev-parse HEAD; test -f big.bin")
+    head = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+    assert rc == 0 and head in said, said
+    first = _rc_sent(said)
+    assert len(first) == 1 and first[0] > 1.5, said   # the 2 MB of history, once
+    (mirror, refs), = _rc_mirror(tmp_path).items()
+    assert re.fullmatch(r"[0-9a-f]{16}\.git", mirror) and refs == [f"refs/heads/base/{head}"], refs
+    _rc_commit(repo, "b.txt")
+    rc, said = _rc_run(tmp_path, repo, "cat b.txt; test -f big.bin")
+    assert rc == 0 and "x" in said, said
+    second = _rc_sent(said)
+    assert len(second) == 1 and second[0] < 0.01, said   # KBs: only the new commit
+    assert not [r for r in _rc_mirror(tmp_path)[mirror] if "/check/" in r]
+    assert _rc_left(tmp_path) == [] and not list((tmp_path / "host-home" / "check-mirrors").glob("*.bundle"))
+    rc, said = _rc_run(tmp_path, repo, "cat b.txt")   # nothing new: no bundle at all
+    assert rc == 0 and _rc_sent(said) == [] and "sending" not in said, said
+
+
+def test_a_new_mirror_far_behind_is_seeded_in_steps_that_a_cut_short_copy_resumes(tmp_path, monkeypatch):
+    """Seeding sends the history in SEED_STEP first-parent steps, each kept as a base ref there: a copy cut
+    off after the first step is a host fault, and the next check sends only the rest."""
+    from ttp import remotecheck
+    repo = _rc_repo(tmp_path)
+    for i in range(5):
+        _rc_commit(repo, f"c{i}.txt")
+    shas = subprocess.run(["git", "-C", str(repo), "rev-list", "--first-parent", "--reverse", "HEAD"],
+                          capture_output=True, text=True).stdout.split()
+    rc, said = _rc_run(tmp_path, repo, "true", TTP_REMOTE_SEED_STEP="2", FAKE_SSH_FAIL="ttp-send:refs/heads/check")
+    assert rc == remotecheck.FAULT_RC
+    refs = next(iter(_rc_mirror(tmp_path).values()))
+    assert {f"refs/heads/base/{shas[1]}", f"refs/heads/base/{shas[3]}"} <= set(refs), (refs, said)
+    rc, said = _rc_run(tmp_path, repo, "true", TTP_REMOTE_SEED_STEP="2")
+    assert rc == 0 and len(_rc_sent(said)) == 1, said
+
+
+def test_two_concurrent_remote_checks_share_one_mirror_and_both_pass(tmp_path):
+    repo = _rc_repo(tmp_path)
+    assert _rc_run(tmp_path, repo, "true")[0] == 0
+    _rc_commit(repo, "b.txt")
+    procs = [_rc_run(tmp_path, repo, f"cat b.txt; echo run{i}", wait=False) for i in range(2)]
+    outs = [p.communicate(timeout=60)[0] for p in procs]
+    assert [p.returncode for p in procs] == [0, 0], outs
+    assert "run0" in outs[0] and "run1" in outs[1]
+    assert not [r for r in next(iter(_rc_mirror(tmp_path).values())) if "/check/" in r]
+    assert _rc_left(tmp_path) == []
+
+
+def test_a_slow_copy_prints_progress_and_an_overrun_is_a_host_fault_not_a_timeout(tmp_path):
+    """A copy prints how far it got while it runs (the checks' silence limit never calls it a hang); one
+    past its limit is killed and is the host's fault (75, the unreachable-host wait), never the change's
+    failure or a timeout's 124."""
+    from ttp import remotecheck
+    repo = _rc_repo(tmp_path)
+    rc, said = _rc_run(tmp_path, repo, "echo did-run", FAKE_SSH_SLOW="ttp-send:2", TTP_REMOTE_PROGRESS_S="0.5")
+    assert rc == 0 and "did-run" in said, said
+    assert len(re.findall(r"sending [0-9a-f]{12} to box1's mirror: .*\(\d+ s\)", said)) >= 2, said
+    _rc_commit(repo, "b.txt")
+    for fake in ({}, {"FAKE_SSH_NOGIT": "1", "TTP_REMOTE_TREE_COPY": "1"}):
+        slow = {"FAKE_SSH_SLOW": ("tar -xf" if fake else "ttp-send") + ":20", "TTP_REMOTE_COPY_LIMIT_S": "1"}
+        t0 = time.monotonic()
+        rc, said = _rc_run(tmp_path, repo, "echo did-run", **fake, **slow)
+        assert rc == remotecheck.FAULT_RC and "did-run" not in said, (fake, said)
+        assert "overran its limit" in said and f"{remotecheck.SIG}box1" in said and time.monotonic() - t0 < 15, said
+    assert _rc_left(tmp_path) == []
+
+
+def test_a_host_without_usable_git_gets_the_tree_over_a_compressed_ssh(tmp_path):
+    """No usable git there: no mirror and, by default, no tree sent from here either (a host fault); with
+    TTP_REMOTE_TREE_COPY=1 the tree goes as before (git archive over a compressed ssh)."""
+    from ttp import remotecheck
+    repo = _rc_repo(tmp_path)
+    args = tmp_path / "args"
+    rc, said = _rc_run(tmp_path, repo, "cat a.txt", FAKE_SSH_NOGIT="1")
+    assert rc == remotecheck.FAULT_RC and "tree copies from here are off" in said and "tar" not in said, said
+    rc, said = _rc_run(tmp_path, repo, "cat a.txt", FAKE_SSH_NOGIT="1", FAKE_SSH_ARGS=str(args),
+                       TTP_REMOTE_TREE_COPY="1")
+    assert rc == 0 and "a" in said and _rc_sent(said) == [], said
+    assert "tree to box1 (transfer; ssh compresses it): done" in said, said
+    assert "git checkout on box1 (setup): done" in said, said  # transfer and setup are timed and reported apart
+    assert any("Compression=yes" in ln and "tar -xf" in ln for ln in args.read_text().splitlines())
+    assert _rc_mirror(tmp_path) == {} and _rc_left(tmp_path) == []
+
+
+def test_a_new_mirror_is_seeded_from_the_clone_on_the_host_that_checks_seed_names(tmp_path):
+    """`delivery.checks_seed` names a clone already on the host: a new mirror fetches its branches there first
+    (the clone is only read), and only the commits after the newest one both sides have are sent from here."""
+    repo = _rc_repo(tmp_path)
+    for i in range(6):
+        _rc_commit(repo, f"s{i}.txt", os.urandom(20000))
+    clone = tmp_path / "host-clone"
+    subprocess.run(["git", "clone", "-q", str(repo), str(clone)], check=True)
+    before = subprocess.run(["git", "-C", str(clone), "for-each-ref"], capture_output=True, text=True).stdout
+    _rc_commit(repo, "new.txt")
+    proj = tmp_path / "proj" / "tt-project" / "harness"
+    proj.mkdir(parents=True)
+    (proj / "project.json").write_text(json.dumps({"delivery": {"checks_seed": {"box1": str(clone)}}}))
+    rc, said = _rc_run(tmp_path, repo, "cat new.txt", TTP_PROJECT=str(tmp_path / "proj"), TTP_REMOTE_SEED_SAMPLE="1")
+    assert rc == 0 and "seeded box1's mirror from" in said, said
+    assert len(_rc_sent(said)) == 1 and _rc_sent(said)[0] < 0.05, said
+    assert subprocess.run(["git", "-C", str(clone), "for-each-ref"], capture_output=True, text=True).stdout == before
+    assert _rc_left(tmp_path) == []
+
+
+def _spill_events(p, text):
+    return [r["text"] for r in p.db.q("SELECT text FROM events") if text in r["text"]]
+
+
+def test_a_spill_host_whose_runs_fail_where_the_head_passes_elsewhere_is_quarantined_until_lifted(
+        env, tmp_path, monkeypatch):
+    """Strikes: a spilled failure counts against its host only once the same head passes elsewhere; a pass
+    there resets them; a head that never passes is no strike. At checks.spill_quarantine_after in a row the
+    host is quarantined: pick skips it, one event and one ledger entry (auto-undo `ttp checks --spill-back`);
+    lift puts it back with one event and closes the entry."""
+    from ttp import checkspill, machine_ledger
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a", "check-host-b"])
+    cfg = p.config()
+    sig = "OSError: no space left on device"
+
+    def strike(head, passed_on=""):
+        checkspill.strike_fail(p, "check-host-a", head, sig)
+        return checkspill.strike_settle(p, p.config(), head, passed_on)
+
+    def n(host="check-host-a"):
+        return checkspill._strikes(p.db)["hosts"].get(host, {}).get("n")
+
+    checkspill.strike_fail(p, "check-host-a", "h0", sig)   # the change's own failure: it never passes
+    assert checkspill.strike_settle(p, cfg, "other") == [] and n() is None
+    assert strike("h1") == [] and strike("h2") == [] and n() == 2
+    assert checkspill.strike_settle(p, cfg, "h3", passed_on="check-host-a") == [] and n() == 0, "a pass resets"
+    assert strike("h4") == [] and strike("h5") == [] and not checkspill.quarantined(p, "check-host-a")
+    assert strike("h6") == ["check-host-a"] and "quarantined: 3 spilled runs" in checkspill.quarantined(p, "check-host-a")
+    assert strike("h7") == [], "already off: no second change"
+    assert len(_spill_events(p, "Spill host check-host-a quarantined")) == 1
+    entry = [c for c in machine_ledger.changes(["check-host-a"]) if c.get("kind") == "spill_quarantine"]
+    assert len(entry) == 1 and entry[0]["auto_undo"] and entry[0]["undo"] == "ttp checks --spill-back check-host-a"
+    told = []
+    got = checkspill.pick(p, cfg, told.append, "pytest -q")
+    try:
+        assert got is not None and got.host == "check-host-b" and "check-host-a (quarantined" in told[0], told
+    finally:
+        got.close()
+    assert checkspill.lift(p, "check-host-a") is True and not checkspill.quarantined(p, "check-host-a")
+    assert checkspill.lift(p, "check-host-a") is False, "safe to run twice"
+    assert len(_spill_events(p, "Spill host check-host-a is back")) == 1
+    assert not [c for c in machine_ledger.changes(["check-host-a"]) if c.get("kind") == "spill_quarantine"]
+    assert n() == 0
+    p.set_config("checks.spill_quarantine_after", 1)
+    assert strike("h8") == ["check-host-a"], "checks.spill_quarantine_after"
+    assert checkspill.quarantine_after({"checks": {"spill_quarantine_after": 0}}) == 3
+    with pytest.raises(ValueError):
+        checkspill.quarantine_after_of("x")
+
+
+def test_a_failure_every_spill_host_shares_is_one_config_incident_and_quarantines_no_host(env, tmp_path, monkeypatch):
+    """The spill setup broke for all hosts (the pinned env lost: the same import error everywhere, passing here):
+    one high incident, no strike, no quarantine, however many runs; a second host failing differently, or a
+    pass on another spill host in between, is no config fault: strikes as before."""
+    from ttp import checkspill
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a", "check-host-b"])
+    cfg = p.config()
+    sig = "ModuleNotFoundError: No module named 'yaml'"
+    for i in range(5):
+        for host in ("check-host-a", "check-host-b"):
+            checkspill.strike_fail(p, host, f"h{i}", sig)
+        assert checkspill.strike_settle(p, cfg, f"h{i}") == []
+    hosts = checkspill._strikes(p.db)["hosts"]
+    assert all(not h.get("n") and not h.get("off") for h in hosts.values()), hosts
+    assert len(_spill_events(p, "Spill config fault")) == 1 and "No module named 'yaml'" in _spill_events(
+        p, "Spill config fault")[0]
+    p.set_config("checks.spill_quarantine_after", 1)
+    cfg = p.config()
+    checkspill.strike_settle(p, cfg, "x", passed_on="check-host-b")   # a spilled pass: the hosts work again
+    checkspill.strike_fail(p, "check-host-a", "g1", sig)
+    assert checkspill.strike_settle(p, cfg, "g1") == ["check-host-a"], "one host failing now is the host's fault"
+    checkspill.lift(p, "check-host-a")
+    checkspill.strike_fail(p, "check-host-a", "g2", "OSError: disk full")
+    checkspill.strike_fail(p, "check-host-b", "g2", "ImportError: libfoo")
+    assert sorted(checkspill.strike_settle(p, cfg, "g2")) == ["check-host-a", "check-host-b"], "different faults"
+
+
+@_LINUX_TMP
+def test_an_import_failure_on_two_spill_hosts_that_passes_here_raises_one_high_event_and_no_strikes(
+        env, tmp_path, monkeypatch):
+    """One spill-env incident, one event: the landed env_event tells it when the import fails on a second host,
+    the run then passes here, and strike_settle neither strikes the hosts nor raises its own config event."""
+    import threading
+    from ttp import checkspill, cli
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a", "check-host-b"])
+    script = tmp_path / "check.sh"
+    script.write_text('case "$(pwd)" in */ttp-check.*)\n'
+                      "  printf 'ERROR collecting tests/test_x.py\\nE   ModuleNotFoundError: No module named '"
+                      "\\''nosuchpkg'\\''\\n'; exit 2;;\nesac\n")
+    p.set_config("delivery.push_checks", [f"sh {script}"])
+    lane = _spill_lane(p, repo)
+    threading.Timer(6, lane.close).start()
+    cli.main(["checks", "--fresh"])
+    assert json.loads((run / "checks.json").read_text())["passed"] is True
+    events = p.db.q("SELECT severity, fingerprint FROM events WHERE fingerprint LIKE 'checkspill:%' "
+                    "OR fingerprint LIKE 'spill-%'")
+    assert len(events) == 1 and events[0]["severity"] == "high" and events[0]["fingerprint"].startswith(
+        "checkspill:env:"), [dict(e) for e in events]
+    strikes = checkspill._strikes(p.db)
+    assert not strikes.get("fails") and all(not h.get("n") for h in strikes["hosts"].values()), strikes
+    # A strike_settle that still sees the same failure on two hosts (recorded before env_event told it)
+    # adds no second event under another fingerprint, and still strikes nobody.
+    cfg, sig = p.config(), "ModuleNotFoundError: No module named 'nosuchpkg'"
+    for host in ("check-host-a", "check-host-b"):
+        checkspill.strike_fail(p, host, "h1", sig)
+    assert checkspill.strike_settle(p, cfg, "h1") == []
+    assert len(p.db.q("SELECT 1 FROM events WHERE severity='high' AND (fingerprint LIKE 'checkspill:%' "
+                      "OR fingerprint LIKE 'spill-%')")) == 1
+    assert all(not h.get("n") for h in checkspill._strikes(p.db)["hosts"].values())
+
+
+def test_fail_sig_reads_the_last_error_line_without_paths_or_numbers():
+    from ttp import remotecheck
+    a = "E   ModuleNotFoundError: No module named 'yaml'\nImportError while loading conftest '/tmp/ttp-check.ab12/x.py'.\n" \
+        "E   ModuleNotFoundError: No module named 'yaml'\nttp checks: SomeError: ours\n"
+    assert remotecheck.fail_sig(a, 4) == "ModuleNotFoundError: No module named 'yaml'"
+    assert remotecheck.fail_sig("FAILED t.py::x - AssertionError: 12 != 3 in /h/a/b.py", 1) == \
+        remotecheck.fail_sig("FAILED t.py::x - AssertionError: 7 != 3 in /h/c/b.py", 1)
+    assert remotecheck.fail_sig("all quiet", 2) == "exit 2"
+
+
+def test_fail_sig_names_the_failing_test_ids():
+    """Two tests failing with the same error text read differently; the same tests on two hosts read the same;
+    a whole-suite collection error keeps one signature everywhere; a long id list stays under 200 chars."""
+    from ttp import remotecheck
+    x = remotecheck.fail_sig("FAILED tests/a.py::x - AssertionError: assert False\n", 1)
+    y = remotecheck.fail_sig("FAILED tests/b.py::y - AssertionError: assert False\n", 1)
+    assert x != y and "tests/a.py::x" in x and "AssertionError: assert False" in x
+    plain = "tests/a.py F\nE       assert 1 == 2\nFAILED tests/a.py::test_x - assert 1 == 2\n1 failed in 0.12s\n"
+    assert remotecheck.fail_sig(plain, 1) == remotecheck.fail_sig(plain.replace("0.12", "3.4"), 1) != "exit 1"
+    assert "tests/a.py::test_x" in remotecheck.fail_sig(plain, 1)
+    coll = ("E   ModuleNotFoundError: No module named 'yaml'\n"
+            "ERROR tests/a.py - ModuleNotFoundError: No module named 'yaml'\n"
+            "ERROR tests/b.py - ModuleNotFoundError: No module named 'yaml'\n"
+            "!!!!!!! Interrupted: 2 errors during collection !!!!!!!\n")
+    other = coll.replace("ERROR tests/a.py", "ERROR tests/c.py").replace("tests/b.py", "tests/a.py")
+    assert remotecheck.fail_sig(coll, 2) == remotecheck.fail_sig(
+        "conftest '/tmp/ttp-check.9f/x.py'\n" + coll.replace("2 errors", "2 errors in 1.5s"), 2)
+    assert remotecheck.fail_sig(coll, 2) != remotecheck.fail_sig(other, 2)
+    assert remotecheck.fail_sig("ttp checks: FAILED tests/z.py::ours\n", 3) == "exit 3"
+    many = "".join(f"FAILED tests/test_{i}_long_module_name.py::test_case_{i} - assert 0\n" for i in range(40))
+    assert len(remotecheck.fail_sig(many, 1)) <= 200
+    assert remotecheck.fail_sig(many, 1) != remotecheck.fail_sig(many.replace("test_case_7 ", "test_case_x "), 1)
+    assert remotecheck.shared_sig(x) and not remotecheck.shared_sig("exit 1") and not remotecheck.shared_sig("")
+    assert not remotecheck.shared_sig("exit None")
+
+
+def test_failures_without_an_error_line_or_of_different_tests_never_read_as_a_config_fault(
+        env, tmp_path, monkeypatch):
+    """A bare `exit N` signature (no error line, no test id) on two hosts is two strikes, never a config fault;
+    two hosts failing different tests with the same assertion text are two strikes too; a host whose
+    failures carry no error line reaches the strike limit and is quarantined; the same collection-time
+    ImportError on two hosts within the hour is still one config incident."""
+    from ttp import checkspill, remotecheck
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a", "check-host-b"])
+    cfg = p.config()
+
+    def n(host):
+        return checkspill._strikes(p.db)["hosts"].get(host, {}).get("n")
+
+    bare = remotecheck.fail_sig("1 failed in 0.3s\n", 1)
+    assert bare == "exit 1"
+    checkspill.strike_fail(p, "check-host-a", "h1", bare)
+    checkspill.strike_fail(p, "check-host-b", "h2", bare)
+    assert checkspill.strike_settle(p, cfg, "h1") == [] and checkspill.strike_settle(p, cfg, "h2") == []
+    assert n("check-host-a") == 1 and n("check-host-b") == 1
+    checkspill.strike_fail(p, "check-host-a", "h3", remotecheck.fail_sig(
+        "FAILED tests/a.py::x - AssertionError: assert False\n", 1))
+    checkspill.strike_fail(p, "check-host-b", "h3", remotecheck.fail_sig(
+        "FAILED tests/b.py::y - AssertionError: assert False\n", 1))
+    assert checkspill.strike_settle(p, cfg, "h3") == []
+    assert n("check-host-a") == 2 and n("check-host-b") == 2
+    assert not _spill_events(p, "Spill config fault")
+    checkspill.strike_fail(p, "check-host-a", "h4", bare)
+    assert checkspill.strike_settle(p, cfg, "h4") == ["check-host-a"], "no error line: still the host's fault"
+    assert not _spill_events(p, "Spill config fault")
+    coll = ("E   ImportError: libfoo.so: cannot open shared object file\n"
+            "ERROR tests/a.py - ImportError: libfoo.so: cannot open shared object file\n")
+    checkspill.strike_fail(p, "check-host-b", "h5", remotecheck.fail_sig(coll, 2))
+    checkspill.strike_fail(p, "check-host-a", "h6", remotecheck.fail_sig(coll.replace("/x", "/y"), 2))
+    assert checkspill.strike_settle(p, cfg, "h5") == [] and checkspill.strike_settle(p, cfg, "h6") == []
+    assert len(_spill_events(p, "Spill config fault")) == 1 and n("check-host-b") == 0
+
+
+def test_a_spilled_failure_strikes_its_host_once_the_run_passes_here_and_a_host_fault_does_not(
+        env, tmp_path, monkeypatch):
+    """`ttp checks`: a run failing on the spill host and passing here strikes that host (with the error line
+    as its signature); one the host's own fault ended (exit 75) strikes nothing (a missing-package import
+    failure is the spill env fault: no strike, see the one-event test)."""
+    import threading
+    from ttp import checkspill, cli
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a"])
+    cmd = 'case "$PWD" in */ttp-check.*) echo "E   AssertionError: host-only difference"; exit 1;; esac'
+    p.set_config("delivery.push_checks", [cmd])
+    for fake, want in (({"FAKE_SSH_FAIL": "mktemp"}, None), ({}, 1)):
+        for k, v in fake.items():
+            monkeypatch.setenv(k, v)
+        lane = _spill_lane(p, repo)
+        threading.Timer(2.0, lane.close).start()
+        cli.main(["checks", "--fresh"])
+        for k in fake:
+            monkeypatch.delenv(k)
+        assert json.loads((run / "checks.json").read_text())["passed"] is True
+        doc = checkspill._strikes(p.db)
+        assert doc.get("hosts", {}).get("check-host-a", {}).get("n") == want, (fake, doc)
+    assert doc["fails"][-1]["sig"] == "AssertionError: host-only difference" and doc["fails"][-1]["settled"]
+
+
+def test_spill_strikes_read_malformed_state_as_none(env, tmp_path, monkeypatch):
+    from ttp import checkspill
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a"])
+    for bad in ([1], {"hosts": [1]}, {"hosts": {"check-host-a": "x"}}, {"hosts": {"check-host-a": {"off": "x"}}}):
+        p.db.set_kv(checkspill.STRIKES_KV, bad)
+        assert checkspill.quarantined(p, "check-host-a") == "" and checkspill.lift(p, "check-host-a") is False

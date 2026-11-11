@@ -405,6 +405,42 @@ def test_the_select_plugin_keeps_only_the_listed_case_files_and_tests(tmp_path):
     assert ran == ["test_a1", "test_a2", "test_top"], r.stdout[-2000:]
 
 
+
+def test_a_selection_too_long_for_one_variable_goes_compressed_and_stays_targeted(tmp_path, monkeypatch):
+    # #7854: runs 15844, 15845 and 15894 ran the whole required suite alone for "the selection is too long"
+    # (over testpick.MAX_ENV), holding a check slot for the full run. Such a selection goes zlib-compressed
+    # in TTP_PYTEST_SELECT_FILES_Z, which the select plugin reads like TTP_PYTEST_SELECT_FILES.
+    from ttp import push, pushpass, testpick
+    repo, base = _pick_repo(tmp_path)
+    head = _pick_change(repo, base, {"plugins/x/runtime/ttp/foo.py": "def foo_one():\n    return 2\n"})
+    big = [f"tests/test_tt_project_runtime.py::test_a_long_descriptive_test_name_{i}" for i in range(2000)]
+    assert len("\n".join(big)) > testpick.MAX_ENV
+    sent = testpick._select(big)
+    assert list(sent) == [testpick.FILES_Z_ENV] and len(sent[testpick.FILES_Z_ENV]) < testpick.MAX_ENV
+    assert testpick.unpack(sent[testpick.FILES_Z_ENV]).split("\n") == big
+    assert testpick._select(big[:2]) == {testpick.FILES_ENV: "\n".join(big[:2])}   # a short one stays plain
+    own = push.check_list([_PICK_CMD])
+    for cfg in (None, _PICK_QUEUE):   # pick sizes the list as it will be sent
+        monkeypatch.setattr(testpick, "pack", lambda text: "z")
+        monkeypatch.setattr(testpick, "MAX_ENV", 20)
+        todo, lines = testpick.narrow(repo, base, head, list(own), own, cfg)
+        env = dict(getattr(todo[0], "env", ()))
+        assert env.get(testpick.FILES_Z_ENV) == "z" and testpick.FILES_ENV not in env, lines
+        monkeypatch.undo()
+    monkeypatch.setattr(testpick, "MAX_ENV", 2)   # even compressed it does not fit: the full suite
+    assert testpick.narrow(repo, base, head, list(own), own, None)[1] == [f"{_PICK_CMD}: full: the selection is too long"]
+    t = tmp_path / "proj"
+    (t / "tests").mkdir(parents=True)
+    (t / "tests" / "test_r.py").write_text("def test_top():\n    pass\n\n\ndef test_other():\n    pass\n")
+    env = {k: v for k, v in os.environ.items() if not k.startswith("TTP_PYTEST_SELECT")}
+    env.update(PYTHONPATH=str(pushpass.PLUGIN_DIR), PYTEST_ADDOPTS="",
+               TTP_PYTEST_SELECT_FILES_Z=testpick.pack("tests/test_r.py::test_top"))
+    r = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", pushpass.SELECT_PLUGIN, "-p", "no:cacheprovider",
+                        "--rootdir", str(t), "tests/test_r.py", "-rA"],
+                       cwd=t, env=env, capture_output=True, text=True, timeout=120)
+    assert re.findall(r"^PASSED \S+::(\w+)", r.stdout, re.M) == ["test_top"], r.stdout[-2000:]
+
+
 _NESTED_OUTER = """import os, subprocess, sys, pathlib
 
 
@@ -510,6 +546,30 @@ def test_only_a_tasks_ttp_checks_narrows_so_every_push_batch_runs_the_full_suite
     from ttp import cli
     import inspect
     assert inspect.getsource(cli).count("testpick.narrow(") == 1 and "testpick.narrow(" in inspect.getsource(cli.cmd_checks)
+
+
+def test_a_tasks_ttp_checks_runs_delivery_task_checks_while_the_push_train_keeps_the_push_checks(env, tmp_path,
+                                                                                               monkeypatch):
+    """#7854 (user msg #2407): a task's own `ttp checks` runs the project's quick per-task set,
+    delivery.task_checks, else the push checks (the smoke set gating a landing); a release run and the
+    push train keep the push checks, so nothing lands without them."""
+    from ttp import cli, project, push, testpick
+    d = {"push_checks": ["full"], "task_checks": ["smoke"]}
+    assert testpick.task_set(d, ["full"], "delivery.push_checks") == (["smoke"], "delivery.task_checks")
+    assert testpick.task_set(d, ["full"], "delivery.push_checks", release=True) == (["full"], "delivery.push_checks")
+    assert testpick.task_set({"push_checks": ["full"]}, ["full"], "delivery.push_checks") == (["full"], "delivery.push_checks")
+    assert testpick.task_set(d, ["h"], push.HARNESS_UNSET) == (["h"], push.HARNESS_UNSET)
+    assert "task_checks" in project.EXTRA_KEYS["delivery"]
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    smoke, full = tmp_path / "smoke.log", tmp_path / "full.log"
+    p.set_config("delivery.push_checks", [f"echo full >> {full}"])
+    p.set_config("delivery.task_checks", [f"echo smoke >> {smoke}"])
+    try:
+        cli.main(["checks"])
+    except SystemExit as e:
+        assert not e.code, e.code
+    assert smoke.read_text() == "smoke\n" and not full.exists()
+
 
 
 def test_delivery_checks_targeted_settings_are_validated():

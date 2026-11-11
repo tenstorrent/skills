@@ -264,6 +264,8 @@ def forward(entry: dict, argv: list[str], quiet: bool = False, shown: set[int] |
         # The far side said so before it went: whatever ssh reports (255, 143), this is no drop.
         sys.stderr.write(r.stderr)
         return LISTEN_REPLACED
+    if _old_holder(r, argv):   # an older runtime there has no listener lease: relay without it
+        return forward(entry, _drop_holder(argv), quiet, shown, failure)
     if failure is not None and _dropped(r.returncode):   # the caller explains the drop, if it lasts
         failure.append(r.stderr or "")
     elif r.returncode == 255:   # ssh itself failed: the project's state is kept there
@@ -276,6 +278,18 @@ def forward(entry: dict, argv: list[str], quiet: bool = False, shown: set[int] |
             sys.stderr.write(f"ttp: `ttp {argv[0]}` ran on {entry['host']}, whose ttp is older and lacks it; "
                              f"it works there once a newer tt-project release is deployed on that machine\n")
     return r.returncode
+
+
+def _old_holder(r: subprocess.CompletedProcess, argv: list[str]) -> bool:
+    """Whether the far side's parser rejected --holder (a runtime older than the listener lease),
+    not a lease refusal, which also exits 2 but names no unknown option."""
+    err = r.stderr or ""
+    return r.returncode == 2 and "--holder" in argv and "unrecognized arguments" in err and "--holder" in err
+
+
+def _drop_holder(argv: list[str]) -> list[str]:
+    i = argv.index("--holder")
+    return argv[:i] + argv[i + 2:]
 
 
 def _send_say(entry: dict, argv: list[str], client_id: str, capture: bool = False) -> subprocess.CompletedProcess:
@@ -543,7 +557,9 @@ def need(name: str, argv: list[str]) -> Project:
     p, entry = resolve(name)
     if entry:
         if argv and argv[0] == "listen":
-            sys.exit(forward_listen(entry, argv, name))
+            from .relayers import holder_id
+            who = [] if "--holder" in argv or not holder_id() else ["--holder", holder_id()]
+            sys.exit(forward_listen(entry, [*argv, *who], name))
         failed = flush_outbox(name, entry)
         if failed is None or failed.returncode != 255:   # a message stuck for its own reason: run the command anyway
             rc = forward(entry, argv)
@@ -1004,7 +1020,10 @@ def web_line(p: Project) -> str:
 def cmd_connect(a) -> None:
     p, entry = resolve(a.name)
     if entry:
-        argv = ["connect", a.name, *(["--chat", a.chat] if a.chat else []), *(["--label", a.label] if a.label else [])]
+        from .relayers import holder_id
+        who = getattr(a, "holder", None) or holder_id()
+        argv = ["connect", a.name, *(["--chat", a.chat] if a.chat else []), *(["--label", a.label] if a.label else []),
+                *(["--holder", who] if who else [])]
         sys.exit(connect_remote(a.name, entry, argv))
     p = need(a.name, sys.argv[1:])
     # The home zone follows the user: the zone a workstation sent, or this machine's own when the
@@ -1015,6 +1034,16 @@ def cmd_connect(a) -> None:
     if tz:
         timefmt.set_home(p, tz, src, f"ttp connect from {src}" if src else "ttp connect")
     chat = a.chat or f"c{pysecrets.token_hex(3)}"
+    # One relayer per chat id: reusing another relayer's chat would take its replies (relayers.claim).
+    from . import relayers
+    lock = p.state / f"listen-{chat}.pid"
+    try:
+        live = _listener_alive(int(lock.read_text()), chat)
+    except (OSError, ValueError):
+        live = False
+    refused, _ = relayers.claim(p, p.db, chat, getattr(a, "holder", None) or relayers.holder_id(), live)
+    if refused:
+        die(refused)
     p.db.x("INSERT INTO chats(id,created,label,host,last_active,last_read) VALUES(?,?,?,?,?,"
            "(SELECT COALESCE(MAX(id),0) FROM messages)) ON CONFLICT(id) DO UPDATE SET last_active=excluded.last_active",
            (chat, time.time(), a.label or "", os.environ.get("TTP_CLIENT_HOST", ""), time.time()))
@@ -1038,8 +1067,13 @@ def connect_remote(name: str, entry: dict, argv: list[str]) -> int:
     # The user's zone only from their workstation: in an ssh login here it is a server's, so none.
     home = [] if timefmt.in_ssh_login() else ["--home-tz", timefmt.detect_local(), "--home-from", hostname()]
     r = _ssh(entry, [*argv, *home], capture=True)
-    if home and r.returncode == 2 and "--home-tz" in (r.stderr or ""):   # an older runtime there: connect without it
-        r = _ssh(entry, argv, capture=True)
+    while r.returncode == 2:   # an older runtime there: connect without what it lacks (one parse error names all)
+        old_tz, old_holder = bool(home) and "--home-tz" in (r.stderr or ""), _old_holder(r, argv)
+        if not (old_tz or old_holder):
+            break
+        home = [] if old_tz else home
+        argv = _drop_holder(argv) if old_holder else argv
+        r = _ssh(entry, [*argv, *home], capture=True)
     if r.returncode == 255:
         _unreachable(entry, r.stderr)
         return 255
@@ -1278,6 +1312,22 @@ def _bench_blind_argv(argv: list[str]) -> list[str]:
     return [*argv[:2], *(f"--blind-word=:{w}" for w in argv[2:])]
 
 
+def _bridge_argv(argv: list[str]) -> list[str]:
+    """`ttp bridge cert renew --make-key BOX`: argparse takes no positional after an option once the
+    boxes list has begun, so the options go first and the words keep their order."""
+    if argv[:1] != ["bridge"]:
+        return argv
+    opts, pos, it = [], [], iter(argv[1:])
+    for w in it:
+        if w in ("--config", "--every"):
+            opts += [w, *(v for v in [next(it, None)] if v is not None)]
+        elif w.startswith("-") and w != "-":
+            opts.append(w)
+        else:
+            pos.append(w)
+    return [argv[0], *opts, *pos]
+
+
 def _secret_env_argv(argv: list[str]) -> list[str]:
     """`ttp secret env [alias] --secret <name>[:<key>]=<VAR> ... -- <command...>`: argparse takes no
     positional after an option and drops a '--' inside the command, so the options go first and each
@@ -1409,10 +1459,25 @@ def cmd_listen(a) -> None:
         die(f"unknown chat {a.chat}; run `ttp connect {a.name}` first")
     floor = chat_floor(row["min_severity"], p.config()["notify"].get("chat_min_severity"))
     after = int(row["last_read"] or 0)
-    # One listener per chat, and the newest wins. Two would race for the same messages, and one
+    # One relayer per chat id (relayers.claim): another relayer's listener is refused, so it never
+    # takes this chat's replies; what one took over a lapsed lease is delivered again to the owner.
+    from . import relayers
+    a.holder = getattr(a, "holder", None) or relayers.holder_id()
+    lock = p.state / f"listen-{a.chat}.pid"
+    try:
+        live = _listener_alive(int(lock.read_text()), a.chat)
+    except (OSError, ValueError):
+        live = False
+    refused, rewind = relayers.claim(p, db, a.chat, a.holder, live)
+    if refused:
+        die(refused)
+    if rewind is not None and rewind < after:
+        after = rewind
+        _listen_write(db, "UPDATE chats SET last_read=MIN(COALESCE(last_read,0), ?) WHERE id=?", (rewind, a.chat),
+                      f"delivering again from #{rewind + 1}")
+    # One listener per chat, and the newest of its relayer wins. Two would race for the same messages, and one
     # printing to nowhere (a lost background task, a dropped ssh session) would silently mark them
     # read. Whoever arms a listener last is the one that wants the messages.
-    lock = p.state / f"listen-{a.chat}.pid"
     try:
         other = int(lock.read_text())
     except (OSError, ValueError):
@@ -1504,9 +1569,16 @@ def _listener_state(pid: int, chat: str) -> str:
 
 
 def _listen_loop(p: Project, db, a, after: int, floor: str) -> None:
+    """Print what is meant for the user (relayers.wakes): this chat's own messages, asks and urgent
+    ones at once, broadcast alerts batched over relay.batch_s (--batch), routine updates never
+    (--all prints everything). Each printed line wakes a relayer chat, so fewer lines cost less."""
     from .web import cleared
+    from . import relayers
     deadline = time.time() + a.timeout if a.timeout else None
     parent = _STARTED_BY[1] if _STARTED_BY[0] == os.getpid() else os.getppid()
+    window = relayers.batch_s(p.config(), getattr(a, "batch", None))
+    pending: list = []
+    read, beat = after, time.time()
     while True:
         if os.getppid() != parent:
             return      # whoever started this listener is gone; nobody would read what it prints
@@ -1514,20 +1586,33 @@ def _listen_loop(p: Project, db, a, after: int, floor: str) -> None:
         # never skipped as if it had been read.
         top = db.one("SELECT COALESCE(MAX(id),0) m FROM messages")["m"]
         msgs = [m for m in db.unread_for_chat(a.chat, after, floor, upto=top) if not cleared(db, m, time.time())]
+        after = max(after, top)
+        ready = []
         for m in msgs:
-            print(_listen_line(p, m), flush=True)
-        if top > after:
-            after = top
-            # With --ack, only an acknowledgement marks messages read, so what was printed to a
-            # reader that is gone comes back on the next listen.
+            how = "now" if getattr(a, "all", False) else relayers.wakes(m, a.chat)
+            (ready if how == "now" else pending if how == "batch" else []).append(m)
+        late = deadline and time.time() > deadline
+        if ready or (pending and (late or time.time() >= min(m["ts"] for m in pending) + window)):
+            ready, pending = sorted(ready + pending, key=lambda m: m["id"]), []
+            for m in ready:
+                print(_listen_line(p, m), flush=True)
+        # Read up to the newest message, short of one still waiting for its batch: a listener that
+        # ends before printing it leaves it for the next one. With --ack, only an acknowledgement
+        # marks messages read, so what was printed to a reader that is gone comes back.
+        upto = min(m["id"] for m in pending) - 1 if pending else after
+        if upto > read:
+            read = upto
             if a.ack is None:
-                _listen_write(db, "UPDATE chats SET last_read=? WHERE id=?", (after, a.chat), f"marking #{after} read")
-        if msgs:
+                _listen_write(db, "UPDATE chats SET last_read=? WHERE id=?", (read, a.chat), f"marking #{read} read")
+        if ready:
             _listen_write(db, "UPDATE chats SET last_active=? WHERE id=?", (time.time(), a.chat), "noting activity")
             if a.once:
                 return
-        if deadline and time.time() > deadline:
+        if late:
             return
+        if time.time() - beat > 60:
+            beat = time.time()
+            relayers.touch(p, a.chat, getattr(a, "holder", ""), beat)
         time.sleep(poll_s(2))
 
 
@@ -1584,18 +1669,29 @@ def status_text(p: Project, verbose: bool = False) -> str:
     head += " · tasks: " + (", ".join(f"{k} {v}" for k, v in sorted(counts.items())) if counts else "none yet")
     head += " · " + timefmt.long(now, p)
     lines = [head]
-    for m in attention(db, now, p)[:6]:
-        text = " ".join(m["text"].split())
+    whole = set()   # lines quoting an open ask: wrapped at STATUS_WIDTH, never cut (user msg #2424)
+    seen = attention(db, now, p)
+    for m in [m for m in seen if m["kind"] == "ask"] + [m for m in seen if m["kind"] != "ask"][:6]:
+        text = " ".join(m["text"].split())   # an open ask in full, every one: the user acts on it (#2424)
         what = (f"ask {m['id']}" + (f"; {m['auto']}" if m.get("auto") else "")) if m["kind"] == "ask" else f"alert {m['id']}"
-        lines.append(f"  needs you ({what}, {since(m['ts'], now)} ago): {clip(text, 300)}")
+        lines.append(f"  needs you ({what}, {since(m['ts'], now)} ago): {text if m['kind'] == 'ask' else clip(text, 300)}")
+        if m["kind"] == "ask":
+            whole.add(lines[-1])
     # Blocked tasks: those that wait on the user join the top; the rest are the project's to move.
-    from . import waits
+    from . import pendingask, waits
     wy = waits.on_user(db, now, tz)
     you, stuck = wy["tasks"], wy["held"]
     for t in wy["gated"][:6]:
-        lines.append(f"  needs you (#{t['id']}, gated on an open ask): {t['title']}")
+        on = "; ".join(pendingask.full(a) for a in waits.asks_for(t["id"], wy["asks"]))
+        lines.append(f"  needs you (#{t['id']}, gated on an open ask): {t['title']}" + (f" — {on}" if on else ""))
+        whole.add(lines[-1])
     for t in you[:6]:
         lines.append(f"  needs you (#{t['id']}, {t['wait']['age_text']}): {t['title']} — {t['wait']['text']}")
+        if t["wait"].get("asks"):
+            whole.add(lines[-1])
+    # A relayer on another chat's id takes that chat's replies (relayers.claim).
+    from . import relayers
+    lines += [f"  relay: {c}" for c in relayers.conflicts(p.db, now)]
     # Then what stops work (holds, pauses, breakers, a full disk), then alerts no chat or web view read.
     from . import hostcycle
     if cyc := hostcycle.hold(p, now):
@@ -1686,6 +1782,7 @@ def status_text(p: Project, verbose: bool = False) -> str:
         lines.extend(testslots.use_lines())
         lines.extend(checklane.lane_lines(p.name, p.config(), now))
     lines.extend(checklane.long_wait_lines(p.name, p.config(), now))
+    lines.extend(checkspill.limit_lines(p.name))   # the limit each live checks run is under: always shown
     lines.extend(checkspill.skip_lines(now))   # a spill host kept off for a device job: always shown
     if paused := slurmcheck.paused_line(now):   # the Slurm overflow's start-failure breaker: always shown
         lines.append(paused)
@@ -1764,6 +1861,7 @@ def status_text(p: Project, verbose: bool = False) -> str:
         lines.append(f"  running {since(w['started'], now)}: {what}" + (f" ({w['wake']} wake)" if w.get("wake") else "")
                      + (f" [{w['floor']}]" if w.get("floor") else "")
                      + (f" [sandbox {w['sandbox']}]" if w.get("sandbox") else "")
+                     + (f" [on {w['model']}]" if "(stand-in for " in str(w.get("model") or "") else "")
                      + (f" [{topup.words(topped[w['task']])}]" if w["task"] in topped else "")
                      + (f" — {w['note']}" if w["note"] else ""))
     if stuck or h.get("drivers_stalled"):
@@ -1785,7 +1883,7 @@ def status_text(p: Project, verbose: bool = False) -> str:
     hot = [t for t in db.q("SELECT * FROM tasks WHERE status IN ('queued','review') ORDER BY priority, id")
            if urgent.is_urgent(t)]
     try:
-        est = eta._Est(db, now, core=eta.core_of(p))
+        est = eta._Est(db, now, core=eta.core_of(p), delivery=eta.delivery_of(p))
     except Exception:
         est = None
     for t in hot[:8]:   # the urgent lane: each waiting urgent task, with how long it has waited and its ETA
@@ -1828,6 +1926,8 @@ def status_text(p: Project, verbose: bool = False) -> str:
         lines.append(pq)
     from . import push
     lines.extend(push.status_lines(p))
+    from . import integrate
+    lines.extend(integrate.status_lines(db, cfg, quiet=True))
     if rows:
         lines.append("waiting:")
     for tid, r in rows.items():
@@ -1840,7 +1940,9 @@ def status_text(p: Project, verbose: bool = False) -> str:
         text = " ".join(m["text"].split())
         tag = f"cleared {at(m['cleared_at'], now, tz)}" if m.get("cleared_at") else m["state"]
         lines.append(f"  {at(m['ts'], now, tz)} ({tag}) {clip(text, 160)}")
-    return "\n".join(clip(ln) for ln in lines)
+    import textwrap   # an open ask wraps onto indented lines, never cut (#2424)
+    return "\n".join("\n".join(textwrap.wrap(ln, STATUS_WIDTH, subsequent_indent="    ", break_long_words=False,
+                                             break_on_hyphens=False)) if ln in whole else clip(ln) for ln in lines)
 
 
 def daemon_state(p: Project) -> str:
@@ -1854,6 +1956,16 @@ def daemon_state(p: Project) -> str:
     if s["state"] == "stale":
         return f"NOT RUNNING (process {s['pid']} is up but stuck: no completed tick for {int(s['age'] // 60)} min)"
     return "NOT RUNNING"
+
+
+def _log_tail(log: Path, n: int = 65536) -> str:
+    """The last `n` bytes of a checks log, as text ("" when it does not read)."""
+    try:
+        with open(log, "rb") as f:
+            f.seek(max(0, f.seek(0, 2) - n))
+            return f.read().decode("utf-8", errors="replace")
+    except OSError:
+        return ""
 
 
 def here() -> Project | None:
@@ -1953,6 +2065,9 @@ def cmd_status(a) -> None:
             print(ln)
         from . import gatetime
         if ln := gatetime.status_line(p.state, p.config()):
+            print(ln)
+        from . import branchcap
+        if ln := branchcap.status_line(p.db, p.config()):
             print(ln)
         if ln := gatetime.waits_line(p.db, p.state):
             print(ln)
@@ -2149,7 +2264,7 @@ def cmd_echoes(a) -> None:
             h = echoes.acknowledge(p, *a.ack)
         except ValueError as e:
             die(str(e))
-        print(f"acknowledged: {h['label']} (retirement {h['retirement']}): hidden while that line is unchanged")
+        print(f"acknowledged: {h['label']} (retirement {h['retirement']}): hidden while that place holds the same phrases")
         return
     if a.ack_phrase:
         try:
@@ -2295,6 +2410,113 @@ def cmd_spend_today(a) -> None:
     print(f"{t['host']}: {len(t['projects'])} projects, {gcap.money(sum(r['usd'] for r in t['rows']))}{other} since "
           f"{timefmt.long(a.since, gcap.zone(b)[0])}" +
           "".join(f"\n  could not read {e}" for e in t["errors"]))
+
+
+def cmd_bridge(a) -> None:
+    from . import bridge
+    try:
+        cfg = bridge.load(a.config)
+    except bridge.BadConfig as e:
+        die(str(e))
+    if a.action == "cert":
+        _bridge_cert(a, cfg)
+        return
+    boxes = a.boxes or list(cfg["boxes"])
+    unknown = [b for b in boxes if b not in cfg["boxes"]]
+    if unknown:
+        die(f"not in the bridge config: {', '.join(unknown)} (boxes there: {', '.join(cfg['boxes'])})")
+    if a.action == "show":
+        for box in boxes:
+            print(f"# {box}: box ssh config block")
+            print(bridge.render_block(cfg, box))
+            for an in cfg["boxes"][box]["agents"]:
+                print(f"# {box} {an}: session command")
+                print(" ".join(shlex.quote(w) for w in bridge.service_argv(cfg, box, an)))
+        return
+    if a.action == "setup":
+        try:
+            for line in bridge.setup(cfg, boxes):
+                print(line)
+        except (bridge.BadConfig, RuntimeError) as e:
+            die(str(e))
+        return
+    if a.action == "gh-pull":
+        _bridge_gh_pull(a, cfg, boxes if a.boxes else [b for b in boxes if cfg["boxes"][b].get("gh_pull")])
+        return
+    if a.action == "stop":
+        for box in boxes:
+            for an in [*cfg["boxes"][box]["agents"], *([bridge.GH_PULL] if cfg["boxes"][box].get("gh_pull") else [])]:
+                print(f"{box} {an}: {bridge.stop(box, an, remove=a.remove)}")
+            if a.remove:
+                print(f"{box}: {bridge.remove_block(box)}")
+        return
+    lines, rc = bridge.status(cfg, boxes, deep=a.action == "doctor")
+    print("\n".join(lines))
+    sys.exit(rc)
+
+
+def _bridge_gh_pull(a, cfg: dict, boxes: list[str]) -> None:
+    """`ttp bridge gh-pull [boxes] [--loop]`: run the boxes' queued gh calls with this computer's gh."""
+    from . import ghqueue
+    if not boxes:
+        die("no box to pull: name one, or set \"gh_pull\": true on it in the bridge config")
+    while True:
+        for box in boxes:
+            print(ghqueue.pull(box), flush=True)
+        if not a.loop:
+            return
+        time.sleep(max(5, a.every))
+
+
+def cmd_gh_queue(a) -> None:
+    """`ttp gh-queue run|take|put` on the box: the workstation's gh queue (ghqueue)."""
+    from . import ghqueue
+    if a.action == "run":
+        args = a.args[1:] if a.args[:1] == ["--"] else a.args
+        sys.exit(ghqueue.enqueue(args, None if sys.stdin is None or sys.stdin.isatty() else sys.stdin.buffer.read(),
+                                 os.getcwd()))
+    if a.action == "take":
+        print(json.dumps(ghqueue.take()))
+        return
+    try:
+        results = json.loads(sys.stdin.read() or "[]")
+    except ValueError:
+        die("ttp gh-queue put: the answers on stdin are not JSON")
+    print(f"stored {ghqueue.put(results)} answer(s)")
+
+
+def _bridge_cert(a, cfg: dict) -> None:
+    """`ttp bridge cert status|renew|remove|trust|schedule [boxes]`: the offline certificates."""
+    from . import bridge_cert
+    sub, boxes = (a.boxes[0], a.boxes[1:]) if a.boxes else ("status", [])
+    if not cfg.get("cert"):
+        die("certificate mode is off: the bridge config has no \"cert\" section (see the guide's 'Offline mode')")
+    if sub not in ("status", "renew", "remove", "trust", "schedule"):
+        die(f"ttp bridge cert {sub}: use status, renew, remove, trust --print or schedule")
+    boxes = boxes or list(cfg["cert"]["boxes"])
+    unknown = [b for b in boxes if b not in cfg["cert"]["boxes"]]
+    if unknown:
+        die(f"not in the bridge config's cert boxes: {', '.join(unknown)}")
+    if sub == "trust":
+        if not a.print:
+            die("ttp bridge cert trust --print prints the authorized_keys line; nothing edits authorized_keys")
+        try:
+            print(bridge_cert.trust_line(cfg))
+        except (OSError, RuntimeError) as e:
+            die(str(e))
+        return
+    if sub == "schedule":
+        print(bridge_cert.schedule(Path(a.config).expanduser() if a.config else None))
+        return
+    if sub == "remove":
+        print("\n".join(bridge_cert.remove(cfg, boxes)))
+        return
+    if sub == "renew":
+        lines, rc = bridge_cert.renew(cfg, boxes, force=a.force, make=a.make_key)
+    else:
+        lines, rc = bridge_cert.status(cfg, boxes)
+    print("\n".join(lines))
+    sys.exit(rc)
 
 
 def cmd_web(a) -> None:
@@ -2860,7 +3082,9 @@ def cmd_push(a) -> None:
     rebase or bump, never the push branch or a shared one; with no push branch set, that is also the
     default once the branch is on the remote. `--own-branch` publishes the task's own branch even when
     it carries a pr_branch. Inside a run, a plain push of the task's own branch onto the push branch is
-    refused unless its spec asks it to land or `--land` says so. Inside a run, a worktree on another task's branch is
+    refused unless its spec asks it to land or `--land` says so; where delivery wants a review before
+    each push, `--land` lands only a head a passed review accepted (push.unreviewed_landing). `--cancel <marker>`
+    stops a detached push the calling task queued (the coordinator: any) before it lands. Inside a run, a worktree on another task's branch is
     refused (push.resolve), and so is publishing onto another task's branch the task only inherited. `--queue` lists the push queue
     (`delivery.push_queue`). `--move-tag <tag> <commit>` moves a delivery.channel_tags tag forward
     (channeltag.move). Exit codes are in `push.py`."""
@@ -2868,7 +3092,7 @@ def cmd_push(a) -> None:
     if a.result:
         sys.exit(push.result(Path(a.result), pushed_only=a.pushed))
     from . import coordtools
-    if coordtools.coordinator_run() and not (a.queue or a.stop or (a.free and not a.move_tag)):
+    if coordtools.coordinator_run() and not (a.queue or a.stop or a.cancel or (a.free and not a.move_tag)):
         die(f"ttp push: {coordtools.PUSH_REFUSAL}")   # also past the hook's text check (coordtools.py)
     if a.own_branch:   # read by push.own_target, also in the detached process (inherited, or QUEUE_ENV)
         a.own = True
@@ -2888,6 +3112,8 @@ def cmd_push(a) -> None:
         return
     if a.stop:
         sys.exit(push.stop_own(p, Path(a.stop)))
+    if a.cancel:
+        sys.exit(push.cancel(p, Path(a.cancel)))
     if a.move_tag:
         from . import channeltag
         sys.exit(channeltag.move(p, Path.cwd(), *a.move_tag, say=lambda s: print(s, file=sys.stderr)))
@@ -3580,6 +3806,13 @@ def cmd_checks(a) -> None:
         sys.exit(_checks_lane_status(bool(getattr(a, "json", False)) or "--json" in a.cmd))
     if getattr(a, "env_ok", None) is not None:
         sys.exit(_checks_env_ok(here(), a.env_ok))
+    if getattr(a, "spill_back", None):
+        from . import checkspill
+        if (p := here()) is None:
+            die("ttp checks --spill-back: not in a project")
+        was = checkspill.lift(p, a.spill_back)
+        print(f"ttp checks: spill host {a.spill_back} " + ("is back in the spill pool" if was else "was not quarantined"))
+        sys.exit(0)
     if getattr(a, "preempt", None):
         from . import checkcap, checklane
         p = here()
@@ -3645,6 +3878,9 @@ def cmd_checks(a) -> None:
         print(warn, flush=True)
     # The repo being checked picks its list (push.repo_checks): the harness repo never runs the code repo's.
     configured, source = push.repo_checks(d, Path(top), p)
+    if purpose == "candidate":   # a task's quick set (delivery.task_checks); the push train runs the push checks
+        from . import testpick
+        configured, source = testpick.task_set(d, configured, source, getattr(a, "release", False))
     own = push.with_host(push.check_list(configured), checks_host)
     harness_unset = source == push.HARNESS_UNSET
     if harness_unset:
@@ -3781,7 +4017,8 @@ def cmd_checks(a) -> None:
             checkdirs.writable(run_dir)
             # The project's short pre-stage runs first, in the foreground (checkprestage): its failure
             # starts nothing, so it is fixed in this run, not after the whole detached suite. Unset, it is
-            # derived from the project's frequent detached checks failures (checkprestage.derived).
+            # derived from the project's frequent detached checks failures (checkprestage.derived); a derived
+            # one's failures that the change's base fails too start the full checks anyway.
             say = lambda m: print(f"ttp checks: {m}", flush=True)
             pre = d.get(checkprestage.KEY)
             if purpose == "candidate" and not harness_unset and not getattr(a, "no_prestage", False) \
@@ -3792,7 +4029,9 @@ def cmd_checks(a) -> None:
                     if why := _prestage_skip(a, p, top, head, tree, cmds, own, vpy, purpose):
                         print(f"ttp checks: pre-stage (delivery.{checkprestage.KEY}) skipped: {why}", flush=True)
                     elif checkprestage.run(pre, top, pre_env, say) if pre is not None else \
-                            checkprestage.run_derived(p, ids, own, top, pre_env, say, run_dir):
+                            checkprestage.run_derived(p, ids, own, top, pre_env, say, run_dir,
+                                                      base=_checks_judge_base(p, top, head,
+                                                                              _checks_base(p, Path(top), cmds))[0]):
                         sys.exit(1)
             _checks_detach(a, Path(run_dir), p, top, head, need=shorttmp.need(top, head, cmds))
         except OSError as e:
@@ -3987,7 +4226,8 @@ def cmd_checks(a) -> None:
         # This run's wait was already recorded by the run it reruns (set again only for that rerun),
         # taken out of the environment so no check command or later in-process run inherits it.
         wait_kept = os.environ.pop(_WAIT_KEPT_ENV, "")
-        from . import checkjoin, checklane, checkspill
+        retry = _retry_ids_of(os.environ.pop(_RETRY_IDS_ENV, ""))
+        from . import checkjoin, checklane, checkspill, remotecheck
         # A rerun of checks that did not pass on a spill host keeps off that host (checkspill.kept_off);
         # "1" keeps them off every spill host.
         no_spill = os.environ.pop(checkspill.OFF_ENV, "")
@@ -4066,9 +4306,17 @@ def cmd_checks(a) -> None:
             wait_kept = "1"
         if join_rec and todo and not hit and not handover:
             checkjoin.update(join_rec, phase=checkjoin.RUNNING, run_since=time.time())
+        if todo and not hit and not handover:
+            try:   # the checks run on a host now, past every queue (daemon.precheck_holds)
+                write_json(Path(run_dir) / CHECKS_RUNNING, {"since": time.time(), "pid": os.getpid()})
+            except OSError:
+                pass
         child_env = {"PWD": top, **venv_vars, **(slot.env() if slot else {})}
         run_env = {**push.check_env("checks", run_dir=getattr(a, "check_run_dir", None), lock=lock), **child_env}
-        for line in [] if hit or handover else push.sandbox_lines(todo):
+        # The priority its checks run at here, with its settings, once per run (a remote host's: remotecheck).
+        from . import testslots
+        prio_line = [testslots.priority_line(cfg)] if any(not push.remote_host(c) for c in todo) else []
+        for line in [] if hit or handover else [*push.sandbox_lines(todo), *prio_line]:
             print(f"ttp checks: {line}", flush=True)
             out.write(f"ttp checks: {line}\n")
         # Local checks run in a clean checkout of `head` (cleantree), never in this worktree, whose
@@ -4155,14 +4403,24 @@ def cmd_checks(a) -> None:
                        **({pooladmit.WALL_ENV: f"{ran_since:.0f}:{wall:.0f}"} if deadline else {})}
                 judge_env = dict(env)   # a rerun of the failing tests records no suite durations
                 # A plain local pytest run records the files it passed: a preempted run's rerun skips them.
-                resume_vars, resumed_files = _checks_resume(p, top, tree, c, run_env)
+                resume_vars, resumed_files = ({}, 0) if retry else _checks_resume(p, top, tree, c, run_env)
                 env |= resume_vars
+                if retry.get("n") == n:   # only what failed on the spill host runs again, here or on another one
+                    pick = gatejudge.select_env(retry["ids"], env)
+                    if push.remote_host(c):
+                        c = _remote_select(c, pick)
+                    else:
+                        env |= pick
+                    line = (f"running only the {len(retry['ids'])} test(s) that failed on spill host "
+                            f"{retry.get('host') or '?'}: the rest passed there; their failing again fails the run")
+                    print(f"ttp checks: {line}", flush=True)
+                    out.write(f"ttp checks: {line}\n")
                 if resumed_files:
                     line = (f"resuming {c}: {resumed_files} test file(s) passed on tree {tree[:12]} before the preemption; "
                             "running the rest")
                     print(f"ttp checks: {line}", flush=True)
                     out.write(f"ttp checks: {line}\n")
-                if pushpass.resumable(c) and not push.remote_host(c):   # one plain local pytest run
+                if pushpass.resumable(c) and not push.remote_host(c) and not retry:   # one plain local pytest run
                     env |= slowtests.env(Path(run_dir) / slowtests.FILE, env)
                 def said(line: str) -> None:   # a script it runs was rewritten as it ran: once more
                     nonlocal check_start
@@ -4392,7 +4650,7 @@ def cmd_checks(a) -> None:
             elif timed_out:
                 checkwall.record_timeout(p.state, os.environ.get("TTP_TASK"), timed_out)
             elif executed:
-                if not reused:   # a run that skipped checks is no sample of their cost or wall time
+                if not reused and not retry:   # a run that skipped checks (or ran some tests) is no sample of their cost or wall time
                     if not spilled:   # its cost on this host, process churn included, prices a check (checkcap.check_load)
                         checkcap.record_cost(checkcap.child_cpu_s() - ran_cpu, time.time() - ran_since)
                     checkwall.record_run(p.state, time.time() - ran_since, passed,
@@ -4419,22 +4677,34 @@ def cmd_checks(a) -> None:
         elif spilled and not passed and (executed or timed_out) and not _CHECK_STOP.get("stopped") \
                 and not (failed in todo and not getattr(failed, "spill_host", "")):
             how = f"past the {timed_out['cap_s']:g} s wall-time cap" if timed_out else f"exit {rc}"
-            env_why = ""
+            env_why = ran_out = ""
             if not timed_out:   # a package missing there: a fault of the spill env config (checkspill.env_off)
                 try:
                     with open(log, "rb") as f:
                         f.seek(start)
-                        env_why = push.env_problem(f.read().decode("utf-8", errors="replace"), top) or ""
+                        ran_out = f.read().decode("utf-8", errors="replace")
+                        env_why = push.env_problem(ran_out, top) or ""
                 except OSError:
                     pass
+            if rc == 75 and not timed_out:   # its spill wrapper refused it or is missing: status names it (a limit line)
+                from . import checklane, checkspill, remotecheck
+                if (wrapped := remotecheck.wrap_fault(ran_out))[1]:
+                    checkspill.note_limit(p.name, f"spill host {wrapped[0] or spilled.host}: {wrapped[1]}; its "
+                                          "checks run again on another host or here", checklane.scope_text(todo)[:300])
             no_spill = checkspill.spill_off_add(no_spill, spilled.host, rc == 75 and not timed_out,
-                                                p.config() if env_why else None)
+                                                p.config() if env_why else None, cfg=p.config())
             if env_why:
                 checkspill.env_event(p.db, no_spill, p.config())
+            elif executed and not timed_out and rc != 75:   # a strike there if the head then passes elsewhere
+                out.flush()
+                checkspill.strike_fail(p, spilled.host, head, remotecheck.fail_sig(_log_tail(log), rc))
             said = (f"the checks did not pass on spill host {spilled.host} ({how}"
                     + (f": {env_why.partition(';')[0]}, a fault of the spill env, not the change" if env_why else "")
                     + "); running them again on this machine, whose result counts, or on a free spill host "
-                    + ("they did not fail on" if spilled.host in checkspill.kept_off(no_spill)
+                    + (("they did not fail on" + (f" (that one again once the checks config changes or in "
+                        f"{checkspill.FAULT_RETRY_S // 60} min: the host's own fault ended them there)"
+                        if rc == 75 and not timed_out else ""))
+                       if spilled.host in checkspill.kept_off(no_spill, p.config())
                        else "(that one again once free: the fault was the host's)" if not env_why
                        else "(any one, until the same import fails on another)"))
             out.write(f"ttp checks: {said}\n")
@@ -4444,6 +4714,8 @@ def cmd_checks(a) -> None:
             if wait_kept:
                 os.environ[_WAIT_KEPT_ENV] = wait_kept
             os.environ[checkspill.OFF_ENV] = no_spill
+            if not timed_out and not env_why and failed in todo and (ids := _spill_failed_ids(rc, ran_out)):
+                os.environ[_RETRY_IDS_ENV] = json.dumps({"n": todo.index(failed), "ids": ids, "host": spilled.host})
             if join_rec:   # the run here registers again; its followers queue again and join that one (checkjoin)
                 checkjoin.forget(p.state)
             return cmd_checks(a)
@@ -4609,6 +4881,8 @@ def cmd_checks(a) -> None:
                                                      **({"excused": excused, "landing_only": True} if excused else {}),
                                                      **({"release": True} if getattr(a, "release", False) else {}),
                                                      **_spent(spent0)})
+    if p and passed and executed and head:   # spill hosts whose runs of this head failed take a strike
+        checkspill.strike_settle(p, cfg, head, spilled.host if spilled else "")
     if join_rec:   # the outcome the runs that joined this one report (checkjoin)
         from . import checkjoin, trim
         checkjoin.finish(join_rec, passed=passed, head=head, rc=0 if passed else 1, failed=str(failed or ""),
@@ -4826,6 +5100,7 @@ CHECKS_HANDOVER = ("every host-wide checks slot stayed busy, so they did not run
                    "detached instead, in the same place in the queue (exit 75): hand off waiting with the "
                    "retry_when above")
 CHECKS_SLOT_WAIT = "checks-slot.wait"   # in the run's directory while its checks wait for a host-wide slot
+CHECKS_RUNNING = "checks.running"   # in the run's directory once its checks run on a host ({since, pid})
 # The daemon's request that the run's checks stop waiting for a slot ({pid, started}): their task ended
 # (Daemon.reap_waiting_checks). Only a waiter with that pid and start time honours it, and only while it waits.
 CHECKS_SLOT_CANCEL = "checks-slot.cancel"
@@ -4836,6 +5111,28 @@ CHECKS_DROPPED = "checks.dropped"
 
 
 _WAIT_KEPT_ENV = "TTP_CHECKS_WAIT_KEPT"   # a rerun's wait is its first run's (cmd_checks; never inherited)
+# A rerun of checks that failed tests on a spill host runs only those tests (_spill_failed_ids; never inherited).
+_RETRY_IDS_ENV = "TTP_CHECKS_RETRY_IDS"
+_RETRY_IDS_MAX = 1000   # more failed there than this: the whole check runs again
+
+
+def _spill_failed_ids(rc: int, output: str) -> list[str]:
+    """The test ids a check that exited 1 on a spill host failed, when its output lists them all (pytest ran
+    to the end), else []: its rerun runs only these, the rest having passed there."""
+    from . import sharedchecks
+    if rc != 1 or sharedchecks.stopped_early(output):
+        return []
+    ids, complete = sharedchecks.failing_ids(output)
+    return ids if complete and len(ids) <= _RETRY_IDS_MAX else []
+
+
+def _retry_ids_of(raw: str) -> dict:
+    """The rerun selection _RETRY_IDS_ENV carries ({"n": check index, "ids": [...]}), or {}."""
+    try:
+        got = json.loads(raw) if raw else {}
+        return got if isinstance(got.get("n"), int) and got.get("ids") else {}
+    except (ValueError, AttributeError):
+        return {}
 
 
 def _checks_arrived() -> float:
@@ -5129,6 +5426,7 @@ def _checks_lane_status(as_json: bool) -> int:
     from . import checkcap, checkjoin, checkspill, diskgate, hostload, slurmcheck
     followers = checkjoin.status_lines(p.state)
     holders = checkcap.holder_activity()   # whether each host-wide slot holder runs tests now
+    slots, parked = checkcap.slot_holders(), checkcap.parked_order()   # who holds each host slot (live), who is parked
     disk = diskgate.reading()   # new local runs held while the disk is saturated: why, with the values   # joined or superseded waiters: they run no suite of their own
     load = hostload.snapshot(p.config())
     names = {"": p.root.name, **({here_repo: testslots.repo_name(top) or here_repo} if here_repo else {})}
@@ -5137,17 +5435,19 @@ def _checks_lane_status(as_json: bool) -> int:
                           "project_max": checklane.project_cap(p.config()), "this_repo": here_repo,
                           "repos": checklane.lane_status(p.name, cfg=p.config(), names=names, db=p.db),
                           "spilled": checkspill.holders(p.name),
+                          "no_spill_hosts": checkspill.no_spill(),
                           "here": checkspill.here_records(p.name),
                           "slurm_overflow": slurmcheck.holders(p.name),
                           "slurm_paused": slurmcheck.tripped(),
                           "hosts": {**load, "overloaded": hostload.overloaded(load)},
                           "disk": disk,
                           "host_holders": holders,
+                          "host_slots": {"held": slots, "parked": parked["parked"], "parked_total": parked["total"]},
                           "followers": [x.strip() for x in followers]},
                          indent=2))
     else:
         print(checklane.status_text(p.name, p.config(), here_repo, names=names, db=p.db))
-        for line in [*checkspill.status_lines(p.name), *checkspill.pick_lines(p.name), *checkspill.here_lines(p.name), *slurmcheck.probe_lines(), *slurmcheck.status_lines(p.name),
+        for line in [*checkspill.no_spill_lines(), *checkspill.status_lines(p.name), *checkspill.pick_lines(p.name), *checkspill.here_lines(p.name), *checkspill.limit_lines(p.name), *slurmcheck.probe_lines(), *slurmcheck.status_lines(p.name),
                      *filter(None, [slurmcheck.paused_line()])]:
             print(f"  {line}")
         print("check runs per host:")
@@ -5156,6 +5456,7 @@ def _checks_lane_status(as_json: bool) -> int:
         if holders:
             print("host-wide checks slot holders:")
             print("\n".join(f"  {checkcap.activity_text(a)}" for a in holders))
+        print("\n".join(checkcap.slot_lines(slots, parked)))
         if followers:
             print("following another run of their task (checkjoin), no suite of their own:")
             print("\n".join(followers))
@@ -5226,14 +5527,25 @@ def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: boo
     from . import push
     # Checks that run on other hosts (push.remote_host), with at most light ones here, use none of this
     # machine's CPU: no checks slot or test slots here, no wait for its load guard; they wait while
-    # their host is overloaded instead (remoteload.wait), at most checks.push_load_wait_s.
+    # their host's demand is near its cores instead (remoteload.wait), never starting there while it is.
     pats = checklane.light_patterns(cfg)
     if (hosts := list(dict.fromkeys(h for c in cmds or () if (h := push.remote_host(c))))) and all(
             push.remote_host(c) or checklane.is_light(str(c), pats) for c in cmds):
         from . import remoteload, testslots
-        remoteload.wait(hosts, tell, testslots.push_load_wait_s(cfg))
-        tell(f"checks run on {', '.join(hosts)}: running now, outside this machine's checks slot and test slots")
-        return checkcap.Slot()
+        # The pinned-host admission below hands over to detached checks after FOREGROUND_WAIT_S in the foreground.
+        bound = checkcap.FOREGROUND_WAIT_S if foreground and p else None
+        # While it waits, status names the guard and its setting (a limit line), cleared once the wait ends.
+        note = (lambda line: checkspill.note_limit(p.name, line, checklane.scope_text(cmds)[:300])) if p else None
+        remoteload.wait(hosts, tell, testslots.push_load_wait_s(cfg), note=note)   # never starts on an overloaded host
+        # Each host's check slots are claimed as a spill pick claims them, so runs here never overshoot it.
+        if (claims := checkspill.admit_pinned(p, hosts, tell, what=checklane.scope_text(cmds)[:300],
+                                              bound=bound)) is None:
+            return None
+        tell(f"checks run on {', '.join(hosts)}: running now, outside this machine's checks slot and test slots"
+             + (f", holding {len(claims)} check slot(s) there" if claims else ""))
+        slot = checkcap.Slot()
+        slot.pinned = claims
+        return slot
     prio, owns = checkcap.task_rank(p or checkcap.adopted_project())
     from . import testslots
     repo = testslots.repo_key(top) if p else ""
@@ -5538,7 +5850,7 @@ def _checks_slot_take(p, run_dir: Path, out, head: str, tell, waiting, limit: fl
                                     waiting, left, arrived,
                                     checkcap.queue_name(p), prio, same, done, stop,
                                     p.state if p else None, owns, cap=checklane.project_cap(cfg), lane_at=lane_at,
-                                    startable=startable,
+                                    startable=startable, why=lambda: getattr(suite, "gate", "") or "",
                                     parks=lambda on: testslots.lane_waits(
                                         suite, testslots.PARKED_WAITS if on else "a host-wide checks slot"),
                                     urgent=urgent, preemptible=checkcap.preemptible(cmds, lock),
@@ -6085,7 +6397,7 @@ def _run_check(argv: list, group: bool, record=None, timeout: float | None = Non
     try:
         if _CHECK_STOP["stopped"]:   # stopped checks start no further command
             raise SystemExit(_CHECK_STOP["stopped"])
-        guard = hoststate.Guard(kw.get("env"))   # the real crontab and units, compared after the check
+        guard = hoststate.Guard(kw.get("env"), argv=argv)   # the real crontab and units, compared after a local check
         proc = _check_popen(argv, start_new_session=group, **kw)
         if group and record is not None:
             record.group(proc.pid)
@@ -6963,6 +7275,34 @@ def cmd_model_trip(a) -> None:
               + (f"; head-to-head {'passed' if h2h[k]['ok'] else 'worse'} ({h2h[k]['ref']})" if k in h2h else ""))
     if not trips and not h2h:
         print("ttp model-trip: no stratum tripped")
+
+
+def cmd_model(a) -> None:
+    """`ttp model demote|promote|park|unpark <model> [--class c]`: set a chat model's demotion or park by
+    hand (modeldemote.py), recorded with its setter (configwho.from_env); `ttp model` lists the records."""
+    from . import configwho, modeldemote, modelrank
+    p = need(a.project, sys.argv[1:]) if a.project else here()
+    if p is None:
+        die("ttp model: no project here (run it in a project or its run, or --project NAME)")
+    if a.action:
+        if not a.model:
+            die(f"ttp model {a.action}: name the model", 2)
+        if a.action in ("park", "unpark") and a.cls:
+            die(f"ttp model {a.action}: a park holds the model for every class; drop --class", 2)
+        why = modeldemote.set_state(p.db, a.model, a.cls or modeldemote.ANY, a.action, configwho.from_env(),
+                                    time.time(), a.why or "")
+        if why:
+            die(f"ttp model {a.action}: refused: {why}")
+        print(f"ttp model: {a.action} {a.model}" + (f" for {a.cls}" if a.cls else ""))
+        return
+    rows = [(r["key"], p.db.kv(r["key"]) or {}) for r in p.db.q(
+        "SELECT key FROM kv WHERE key LIKE ? OR key LIKE ? ORDER BY key",
+        (modeldemote.DEMOTED + "%", modelrank.PARKED + "%"))]
+    for k, rec in rows:
+        what = rec.get("state") or "parked"
+        print(f"{k.split(':', 1)[1]}: {what} by {configwho.role(rec.get('by'))} ({rec.get('why') or '?'})")
+    if not rows:
+        print("ttp model: no model demoted, promoted or parked")
 
 
 def cmd_throughput(a) -> None:
@@ -7912,12 +8252,31 @@ def cmd_model_bench(a) -> None:
     """`ttp model-bench run|show`: the host's shared daily chat model bench (modelbench.py)."""
     import time as _t
     from . import modelbench, modelrank
+    if a.action == "scores":   # this project's live rows now, with every other project's kept ones
+        from . import modelscore
+        p = here()
+        if p:
+            modelscore.record(p.name, modelscore.live_rows(p, _t.time()), _t.time())
+        got = modelscore.build(modelrank.served(p.state, _t.time()) if p else None)
+        print(json.dumps(got, indent=1) if a.json else modelscore.text(got))
+        return
     if a.action == "show":
         print(json.dumps({"owner": json.loads((modelbench.home() / modelbench.OWNER).read_text())
                           if (modelbench.home() / modelbench.OWNER).exists() else {},
                           "latest": modelbench.latest(), "models": modelbench.models()}, indent=1))
         return
     p = here() or die("model-bench: no project here (run it in a project or with TTP_PROJECT set)")
+    if a.detach:   # the owner's daily command schedule: the bench outlives the schedule's time limit
+        log = modelbench.home() / "bench.log"
+        log.parent.mkdir(parents=True, exist_ok=True)
+        rt = str(Path(__file__).resolve().parent.parent)
+        env = {**os.environ, "PYTHONPATH": os.pathsep.join(filter(None, [rt, os.environ.get("PYTHONPATH")]))}
+        with open(log, "ab") as out:
+            child = subprocess.Popen([sys.executable, "-m", "ttp", "model-bench", "run", *(["--force"] if a.force else [])],
+                                     cwd=p.root, env=env, stdin=subprocess.DEVNULL, stdout=out,
+                                     stderr=subprocess.STDOUT, start_new_session=True)
+        print(f"model bench started (pid {child.pid}; log {log})", file=sys.stderr)
+        return
     now = _t.time()
     out = modelbench.run(p.name, p.config(), modelrank.parked_models(p.db), now, force=a.force)
     print(json.dumps(out, indent=1))
@@ -7937,6 +8296,8 @@ def cmd_bench(a) -> None:
         die(f"bench {a.action}: --out is required")
     if a.action == "run":
         return _bench_run(p, a)
+    if a.action == "cells":
+        return _bench_cells(a)
     if not a.since:
         die("bench prep: --since is required")
     try:
@@ -7946,9 +8307,50 @@ def cmd_bench(a) -> None:
     out = Path(a.out).expanduser().resolve()
     if out.exists():
         die(f"bench: {out} exists; name a new folder")
-    m = bench.prep(p.db, Path(a.repo or p.root).resolve(), out, when.timestamp(), limit=a.limit)
+    from . import addedtests
+    cmd = a.test_cmd or bench.TEST_CMD
+    if not a.no_validate and not addedtests.eligible(cmd):
+        die(f"bench: --test-cmd {cmd!r} is not one plain pytest run")
+    m = bench.prep(p.db, Path(a.repo or p.root).resolve(), out, when.timestamp(), limit=a.limit,
+                   test_cmd=cmd, validated=not a.no_validate)
     print(f"ttp bench: {len(m['tasks'])} task(s) kept ({m['counts']['small']} small, {m['counts']['large']} large), "
-          f"{len(m['excluded'])} excluded; manifest {out / 'manifest.json'}")
+          f"{len(m['excluded'])} excluded{'' if m['validated'] else ', tests not validated'}; "
+          f"manifest {out / 'manifest.json'}")
+
+
+def _bench_cells(a) -> None:
+    """`ttp bench cells --bench <dir> --out <dir>`: seeded-bug and prompt-injection cells (bench.cells)."""
+    from . import bench
+    if not a.bench:
+        die("bench cells: --bench <dir> (a `ttp bench prep` folder) is required")
+    out = Path(a.out).expanduser().resolve()
+    if out.exists():
+        die(f"bench: {out} exists; name a new folder")
+    if os.environ.get("TTP_RUN_DIR") and not os.environ.get("TTP_DETACHED") and not a.here:
+        # In a worker run the build's test runs (up to 20 tries per task, BUILDERS at once) go in one
+        # admitted detached job holding their cores, never in the run's own shell (see _bench_cells_argv).
+        sys.exit(subprocess.call(_bench_cells_argv(a, out)))
+    try:
+        m = bench.cells(Path(a.bench).expanduser().resolve(), out, Path(a.repo).resolve() if a.repo else None,
+                        seeded=a.seeded, test_cmd=a.test_cmd or bench.TEST_CMD)
+    except (OSError, ValueError, KeyError) as e:
+        die(f"bench cells: {e}")
+    c = m["counts"]
+    kinds = ", ".join(f"{k} {n}" for k, n in c["seeded_by_mutation"].items()) or "none"
+    print(f"ttp bench: {c['seeded']} seeded cell(s) ({kinds}), {len(m['excluded'])} task(s) excluded; "
+          f"{c['injection']} injection cell(s); manifest {out / 'cells.json'}")
+
+
+def _bench_cells_argv(a, out: Path) -> list[str]:
+    """`ttp detach bench-cells-<time> --cores <BUILDERS> -- ttp bench cells ... --here`: the build as one job
+    the daemon admits on the cores it holds, outliving the worker's tool call; its log and exit code go to
+    the run folder and the printed retry_when wakes the worker once it ends."""
+    from . import bench
+    me = ["env", f"PYTHONPATH={RUNTIME}", sys.executable, "-m", "ttp"]
+    args = ["bench", "cells", "--bench", str(Path(a.bench).expanduser().resolve()), "--out", str(out),
+            "--seeded", str(a.seeded), *(["--repo", str(Path(a.repo).resolve())] if a.repo else []),
+            *(["--test-cmd", a.test_cmd] if a.test_cmd else []), "--here"]
+    return [*me, "detach", f"bench-cells-{time.strftime('%H%M%S')}", "--cores", str(bench.BUILDERS), "--", *me, *args]
 
 
 def _bench_run(p, a) -> None:
@@ -8476,6 +8878,7 @@ def _detach_stop(what: str, given: str | None = None) -> int:
     if not jobstop.running(rc):
         print(f"{rc.stem}: not running; nothing to stop")
         _free_ended_slots(rc)
+        jobstop.drop_lock(rc)
         return 0
     caller, run = os.environ.get("TTP_TASK") or "", os.environ.get("TTP_RUN_ID") or ""
     ok, why = jobstop.may_stop(p, rc, caller, run)
@@ -9213,12 +9616,14 @@ def cmd_task(a) -> None:
         if not t:
             die(f"no task #{int(a.title)} in {p.name}", 1)
         from .landed import abandoned, superseded_rows
-        from . import reviewsup, sweep
+        from . import probewake, reviewsup, sweep
         gone = abandoned(p.db, t["id"])
         sup = superseded_rows(p, t["id"])
         swept = sweep.task_view(p.db, t["id"])
+        woke = probewake.latest(p.db, t["id"])   # the probe run its latest probe-woken run started on
         if a.json:
             print(json.dumps({**t, **({"abandoned": {"why": gone[0], "ts": gone[1]}} if gone else {}),
+                              **({probewake.KEY: {"run": woke[0], **woke[1]}} if woke else {}),
                               **({"superseded": sup} if sup else {}), "blocker_sweep": swept}, indent=2, default=str))
         else:
             lines = ([sup_line] if (sup_line := reviewsup.show_line(t, lambda ts: timefmt.long(ts, p))) else [])
@@ -9227,6 +9632,8 @@ def cmd_task(a) -> None:
             if gone:
                 lines.append(f"abandoned {timefmt.long(gone[1], p)}: {gone[0]}")
             lines += sweep.task_lines(swept, p)
+            if woke:
+                lines.append(f"run {woke[0]} " + probewake.show_line(woke[1], lambda ts: timefmt.long(ts, p)))
             print(show_task(t) + ("\n\n" + "\n".join(lines) if lines else ""))
     elif a.action == "cancel":
         from .runner import stop_runs
@@ -9258,7 +9665,7 @@ def cmd_task(a) -> None:
         if not a.title.strip().isdigit():
             die(f"requeue needs a task id, not {a.title!r}")
         tid = int(a.title)
-        why = p.db.requeue(tid)
+        why = p.db.requeue(tid, force=bool(a.force))
         if why:
             die(why)
         nb = (p.db.task(tid) or {}).get("not_before")
@@ -9500,7 +9907,8 @@ def cmd_prune(a) -> None:
     directories (state/runs/<id>/...), with the daemon's checks: clear build and cache
     directories, archive hand-off artifacts and large untracked files (state/archive/tasks/<id>/),
     move small untracked leftovers to the task's last run directory, clear a stale `git worktree
-    add` lock, and remove the worktree when nothing is lost. Branches stay. Prints each worktree's
+    add` lock, and remove the worktree when nothing is lost. Then delete landed tasks' local branches
+    whose worktree is gone (branchcap.sweep, each listed in state/branch-deletions.jsonl). Prints each worktree's
     outcome (the reason for each one kept), how many went and the space freed. --dry-run changes
     nothing and lists what would happen. --archived <task> lists a task's archive; with --restore
     <dir> it extracts the archived files there."""
@@ -9559,12 +9967,21 @@ def cmd_prune(a) -> None:
                                                    if r["why"] is None else f"kept: {r['why']}") + cleared)
     if not res:
         print("no finished task's worktree to tidy")
-        return
-    gone = sum(1 for r in res if r["why"] is None)
-    line = f"{'would remove' if dry else 'removed'} {gone} worktree(s), kept {len(res) - gone}"
-    if before and not dry:
-        line += f"; freed {max(shutil.disk_usage(p.worktrees).free - before, 0) / 1e9:.1f} GB"
-    print(line)
+    else:
+        gone = sum(1 for r in res if r["why"] is None)
+        line = f"{'would remove' if dry else 'removed'} {gone} worktree(s), kept {len(res) - gone}"
+        if before and not dry:
+            line += f"; freed {max(shutil.disk_usage(p.worktrees).free - before, 0) / 1e9:.1f} GB"
+        print(line)
+    from . import branchcap   # then the landed tasks' branches whose worktree is gone, as the daemon does hourly
+    deleted = branchcap.sweep(p, p.config(), dry=dry, limit=10_000, time_max=120)
+    for r in deleted:
+        print(f"#{r['task']}: branch {r['branch']} ({r['sha'][:12]}) landed: {'would be deleted' if dry else 'deleted'}")
+    if deleted and not dry:
+        print(f"deleted {len(deleted)} landed branch(es); each is in {p.state / branchcap.RECOVERY} "
+              "(restore: git branch <branch> <sha>)")
+    if not dry:
+        branchcap.scan(p)
 
 
 def _memory_room(p, dry: str = "", added: bool = True) -> None:
@@ -10464,6 +10881,8 @@ def cmd_drain(a) -> None:
 def cmd_service(a) -> None:
     p = need(a.name, sys.argv[1:])
     from . import service
+    if a.cmd in ("start", "restart") and (why := service.foreign_refusal(p, a.cmd)):
+        die(why, 2)
     if a.cmd == "start":
         print(service.install(p))
     elif a.cmd == "stop":
@@ -10564,6 +10983,13 @@ def cmd_account_config(key: str, value: str | None) -> None:
             val = checkspill.hosts_of(val) or ""   # an empty pool is no pool: removed
         except ValueError as e:
             bad = [str(e).replace(f"delivery.{checkspill.KEY}", key)]
+        if not bad and (why := checkspill.ban_refusal(key, val)):
+            bad = [why]
+    if key == checkspill.NO_SPILL_KEY and val not in ("", None):
+        try:
+            val = checkspill.no_spill_of(val) or ""   # an empty ban list is none: removed
+        except ValueError as e:
+            bad = [str(e)]
     if key == slurmcheck.KEY and val not in ("", None, {}):
         try:
             slurmcheck.settings_of(val)
@@ -10589,8 +11015,18 @@ def cmd_account_config(key: str, value: str | None) -> None:
         weekly_default(b, acct)
         if warn := weekly_below_daily(b):
             print(f"warning: {warn} (account-level)", file=sys.stderr)
-    if key in ACCOUNT_USER_ONLY:   # who changed the account's pool or overflow, when (and slurmcheck's re-arm)
+    if key in ACCOUNT_USER_ONLY or key == checkspill.NO_SPILL_KEY:   # who changed the pool, overflow or ban, when
         _log_account_change(key, old, None if val == "" else val)
+    if key == checkspill.NO_SPILL_KEY and val:
+        from .globalcap import local_projects
+        for name, db in local_projects():   # a project list naming a now-banned host: its checks no longer go there
+            try:
+                if bad := checkspill.banned_in((Project(db.parent.parent).config().get("delivery") or {})
+                                               .get(checkspill.KEY)):
+                    print(f"warning: {name}'s delivery.{checkspill.KEY} names {', '.join(bad)}; "
+                          "its checks no longer spill there", file=sys.stderr)
+            except Exception:
+                continue
     if key == rankfresh.KEY:   # the ranking's change log, beside the refresher's own changes
         from .modelrank import ranking_of
         try:
@@ -10659,6 +11095,25 @@ def _user_only_change(raw: dict, key: str, val, p=None) -> str | None:
     return None
 
 
+def _no_spill_run_refusal(key: str, value: str) -> str:
+    """Why a run may not set the account's spill ban list to `value`: it drops a host the list bans now
+    (only the user lifts a ban; a run may add hosts); else ""."""
+    from . import checkspill
+    if key != checkspill.NO_SPILL_KEY:
+        return ""
+    try:
+        new = checkspill.no_spill_of(json.loads(value) if value else [])
+    except ValueError:
+        try:
+            new = checkspill.no_spill_of(value)
+        except ValueError:
+            return ""   # malformed: cmd_account_config refuses it with the reason
+    if gone := [b for b in checkspill.no_spill() if b not in new]:
+        return (f"{key}: a run may add hosts to the ban list but not remove one ({', '.join(gone)}); "
+                "only the user lifts a ban. Nothing was changed")
+    return ""
+
+
 def _refuse_user_only_in_run(key: str) -> None:
     from .coordinator import SANDBOX_KEYS, sandbox_refusal
     if key in SANDBOX_KEYS:
@@ -10709,6 +11164,8 @@ def cmd_config(a) -> None:
             # The account's spill pool and Slurm overflow send every project's code to those machines: only
             # clearing them (removing, or their off value) is a run's.
             _refuse_user_only_in_run(a.name)
+        if run and a.key is not None and (why := _no_spill_run_refusal(a.name, a.key)):
+            die(why)
         from . import accountset
         if a.name in accountset.KEYS and a.key is not None:
             return cmd_account_cap(a.name, a.key, run)
@@ -10733,8 +11190,8 @@ def cmd_config(a) -> None:
         val = a.value
     from .project import unknown_key_hint
     hint = unknown_key_hint(a.key)
-    if hint:
-        die(hint)
+    if hint and not (a.value == "" and _config_has(p.raw_config(), a.key)):
+        die(hint)   # an unknown key present in project.json (one a plugin retired) can still be removed
     if a.value == "":
         return _config_remove(p, a.key, run)
     if a.key == "runner.pin_verify":
@@ -10774,6 +11231,11 @@ def cmd_config(a) -> None:
             minutes(a.key.split(".", 1)[1], val)
         except ValueError as e:
             die(str(e).replace("; the default is used", ""))
+    if a.key == "delivery.checks_spill_hosts" or a.key == "delivery" and isinstance(val, dict):
+        from . import checkspill
+        if why := checkspill.ban_refusal(f"delivery.{checkspill.KEY}", val.get(checkspill.KEY) if a.key == "delivery"
+                                         else val):
+            die(why)
     if a.key in ("delivery.push_checks", "delivery.push_checks_by_repo"):
         from .push import checks_by_repo_of, checks_of
         try:
@@ -10821,6 +11283,7 @@ def _config_remove(p, key: str, run) -> None:
             "the user or the coordinator, never by a worker: name the exact command in your hand-off")
     if run and (k := _user_only_change(p.raw_config(), key, None, p)):
         _refuse_user_only_in_run(k)
+    was = configwho.at(p.raw_config(), key)
     try:
         removed = p.unset_config(key, by=configwho.from_env())
     except (RuntimeError, configwho.Protected) as e:   # project.json unreadable; a value its owner set
@@ -10828,7 +11291,7 @@ def _config_remove(p, key: str, run) -> None:
     node = p.config()
     for part in key.split("."):
         node = node.get(part) if isinstance(node, dict) else None
-    print(f"{key} {'removed' if removed else 'was not set'}; now {json.dumps(node)}")
+    print(f"{key} {f'removed (was {json.dumps(was)[:200]})' if removed else 'was not set'}; now {json.dumps(node)}")
 
 
 def cmd_config_why(words: list[str], key: str) -> None:
@@ -11263,6 +11726,10 @@ def cmd_setup(a) -> None:
         from .release import point_current
         point_current(lib)       # in one step: a `ttp` starting meanwhile finds the old release or this one
         jr.unlink(missing_ok=True)
+        if RUNTIME.resolve() != (lib / "runtime").resolve():
+            # `ttp upgrade` compares the stable copy against this folder, so a newer pull there is not missed
+            from .release import SETUP_SOURCE
+            durable_write(HOME_DIR / "lib" / SETUP_SOURCE, str(PLUGIN_ROOT.resolve()) + "\n", sync=False)
     finally:
         os.close(lock)
     bindir = Path(a.bin_dir).expanduser()
@@ -11472,6 +11939,48 @@ def _recover_setup_from(rec: dict) -> str:
     return what
 
 
+UPGRADE_REFRESHED = "TTP_UPGRADE_REFRESHED"    # set on the upgrade a refresh re-ran: it never refreshes twice
+REFRESH_SETUP_TIMEOUT_S = 900
+
+
+def _refresh_stable_copy(name: str) -> None:
+    """`ttp upgrade` merges the stable copy's template (~/.tt-project/lib/current), so first bring that copy up
+    to the newest release on this host: the checkout the last `ttp setup` used or Claude Code's plugin cache.
+    It runs that release's `ttp setup` and re-runs this upgrade on the result; when it cannot, it says the
+    stable copy is older and names the command that refreshes it."""
+    from . import release
+    if os.environ.get("TTP_TEST_NO_REFRESH"):   # tests that never run a real setup of the checkout
+        return
+    cur = release.installed()
+    have = release.runtime_version(cur / "runtime")
+    if have == "unknown":      # nothing installed to refresh: the upgrade says so itself
+        return
+    also = (PLUGIN_ROOT,) if (PLUGIN_ROOT / "template").is_dir() else ()
+    best = release.newest_source(also=also)
+    if not best or not release.is_newer(best[0], have) or release.forced_version() == have:
+        return      # up to date, or a deliberate `ttp setup --force` downgrade stays as it is
+    v, root = best
+    cmd = f"{shlex.quote(str(root / 'bin' / 'ttp'))} setup"
+    why = ""
+    if os.environ.get(UPGRADE_REFRESHED):
+        why = "the refresh did not take"
+    else:
+        print(f"the stable ttp at {cur} is {have}, older than {v} at {root}: installing {v} first ({cmd})",
+              flush=True)
+        try:
+            r = subprocess.run([sys.executable, str(root / "bin" / "ttp"), "setup"],
+                               timeout=REFRESH_SETUP_TIMEOUT_S)
+            why = f"`{cmd}` exited {r.returncode}" if r.returncode else ""
+        except (OSError, subprocess.TimeoutExpired) as e:
+            why = f"`{cmd}` failed ({e})"
+        if not why and release.runtime_version(cur / "runtime") == v:
+            os.execve(sys.executable, [sys.executable, str(cur / "bin" / "ttp"), *sys.argv[1:]],
+                      {**os.environ, UPGRADE_REFRESHED: "1"})
+        why = why or f"`{cmd}` left the stable copy at {release.runtime_version(cur / 'runtime')}"
+    print(f"warning: the stable ttp at {cur} is {have}, older than {v} at {root} ({why}); this upgrade "
+          f"merges {have}. Refresh it with `{cmd}`, then rerun `ttp upgrade {name}`", file=sys.stderr)
+
+
 def cmd_upgrade(a) -> None:
     """Merge the installed template into a project's harness. The harness repo keeps pristine
     template snapshots on its `upstream` branch, so this is an ordinary three-way merge. `--auto` is
@@ -11496,6 +12005,8 @@ def cmd_upgrade(a) -> None:
             print(mm.push(entry.get("ssh") or entry["host"]))
             sys.exit(forward(entry, sys.argv[1:]))
         p = need(a.name, sys.argv[1:])
+    if not a.auto and a.apply is None:
+        _refresh_stable_copy(p.name)
     _cycle_hold(cyclenotice_paths(p), a, p, auto_rec=p if a.auto else None)
     from . import notifier
     for ln in notifier.refresh(send_test=not a.auto):   # this machine's notifier on the installed code too
@@ -11659,6 +12170,9 @@ def _upgrade(p: Project, auto: bool = False, explicit: bool = False, took_over: 
     if problem:
         holder = release.finish_holder(p)
         tid = holder["task"] if holder else None
+        if not tid and (explicit or took_over) and (done := _finish_cancelled_merge(p, ident, base)):
+            _apply_upgrade(p, done)
+            return
         # No timer: the open task (tid) is the one merge at a time. The last one holds the next off only when it
         # ended without landing this release on these same own files; a newer release or a local edit queues
         # the next at once.
@@ -11740,10 +12254,12 @@ def _upgrade(p: Project, auto: bool = False, explicit: bool = False, took_over: 
         print(ttl_note)
     if caps_note := _migrate_load_caps(p):
         print(caps_note)
+    for line in _drop_retired_keys(p):
+        print(line)
     print("harness up to date with the installed template; restarting the daemon")
     from . import service
     upjournal.step(p, "restarting")
-    res = service.restart(p)
+    res = service.restart_running(p)    # a stopped daemon stays stopped: it starts on the new files
     if not auto:
         _exit_for_restart(res)
         return
@@ -11754,7 +12270,9 @@ def _upgrade(p: Project, auto: bool = False, explicit: bool = False, took_over: 
     release.finish(p, "applied", **({"kept_lost": _cut_list(kept)} if kept else {}))
     # A feed line, not an alert: a clean merge needs nobody (merged with no model task, checks passed).
     p.db.post("out", f"tt-project harness upgraded from {old_v} ({old_c}) to {new_v} ({new_c}) with no model task: "
-              f"the merge was clean, the runtime compiles and imports, and the daemon restarted keeping running work."
+              f"the merge was clean, the runtime compiles and imports, and "
+              + ("the daemon, stopped, runs it at its next start." if getattr(res, "outcome", "") == "stopped"
+                 else "the daemon restarted keeping running work.")
               + (f" Kept this project's runtime edits that drop names upstream ships: {_cut_list(kept)}." if kept
                  else ""), chat=None, kind="info", severity="low")
 
@@ -11839,6 +12357,32 @@ def _migrate_load_caps(p: Project) -> str:
     except Exception:
         return ""
     return "upgrade note: defaults now sized to the project's load: " + "; ".join(done)
+
+
+def _drop_retired_keys(p: Project) -> list[str]:
+    """Each project.RETIRED_KEYS key project.json still holds is removed and recorded in config provenance;
+    no other key is touched and a second run changes nothing. One note line per key removed."""
+    from .project import RETIRED_KEYS
+    out = []
+    try:
+        raw = p.raw_config()
+        if p.config_status == "unavailable":
+            return []
+        for key, why in RETIRED_KEYS.items():
+            if not _config_has(raw, key):
+                continue
+            if p.unset_config(key, by={"by": "default", "via": "upgrade: retired key"}):
+                out.append(f"upgrade note: removed {key} from project.json, a key this plugin no longer reads ({why})")
+            raw = p.raw_config()
+    except Exception:
+        return out
+    return out
+
+
+def _config_has(raw: dict, key: str) -> bool:
+    """Whether dotted `key` is in project.json `raw` (at any value, null too)."""
+    from . import configwho
+    return configwho.at(raw, key) is not configwho._ABSENT
 
 
 def _running_harness_start(p: Project) -> tuple[float, int] | None:
@@ -12283,6 +12827,13 @@ def _apply_upgrade(p: Project, commit: str) -> None:
             f"worktree: `git merge main`, check again, commit, then rerun with the new commit.", 1)
     from . import applyff
     base = _git(h, "rev-parse", "HEAD")
+    if (dirty := applyff.foreign_edits(h, base, merged)):
+        # Another harness task (or a hand edit) left these uncommitted in the live checkout: git would refuse
+        # the fast-forward. Busy, not failed: nothing was changed and a rerun once they are committed applies.
+        die(f"--apply deferred: the live harness checkout has uncommitted changes this upgrade did not make "
+            f"to {len(dirty)} file(s) it would write ({', '.join(dirty[:5])}{', ...' if len(dirty) > 5 else ''}); "
+            f"nothing was changed and main is still {base[:12]}. Rerun `ttp upgrade {p.name} --apply {commit}` "
+            f"once they are committed or put back", UPGRADE_BUSY)
     # A worker sandbox writes the harness's .git but not its working tree: the daemon moves main instead.
     # A daemon older than that is restarted onto the runtime on disk first, before the journal names the
     # merge: the new daemon then finds no merge to recover.
@@ -12308,7 +12859,7 @@ def _apply_upgrade(p: Project, commit: str) -> None:
     print(f"harness main is now {merged[:12]}; restarting the daemon")
     from . import service
     upjournal.step(p, "restarting")
-    _exit_for_restart(service.restart(p))
+    _exit_for_restart(service.restart_running(p))
 
 
 UPGRADE_BUSY = 75       # `ttp upgrade` deferred or refused: nothing was changed (EX_TEMPFAIL, as for `ttp lock`)
@@ -12321,7 +12872,7 @@ def _exit_for_restart(res) -> None:
     that is `ttp upgrade`'s "nothing was changed", and a worker that read it as "applied" would wait on a
     restart.request that never comes."""
     print(res)
-    code = {"deferred": RESTART_DEFERRED, "failed": 1, "rolled_back": 1}.get(getattr(res, "outcome", "running"), 0)
+    code = {"deferred": RESTART_DEFERRED, "failed": 1, "rolled_back": 1, "refused": 1}.get(getattr(res, "outcome", "running"), 0)
     if code:
         print(f"restart {res.outcome.replace('_', ' ')} (exit {code})", file=sys.stderr)
         sys.exit(code)
@@ -12390,11 +12941,14 @@ In this harness repo:
    (a daemon too old to take its fast-forward request is restarted onto the runtime on disk first).
    Its exit code says what happened; act on it alone:
    - Exit 0: done, remove <tmp>.
-   - Exit 75: busy, nothing was changed (the daemon is landing harness worktrees, or another upgrade
-     runs): main is as it was and no restart is coming, so never wait on restart.request. Keep <tmp> and
+   - Exit 75: busy, nothing was changed (the daemon is landing harness worktrees, another upgrade
+     runs, or another task left uncommitted edits in the live checkout): main is as it was and no restart is coming, so never wait on restart.request. Keep <tmp> and
      rerun this step once the landing ends (a minute or two), or hand off `waiting` with
      retry_after_s 300 and retry_when `ttp lock --probe harness-upgrade` (tell it from exit 76 by its
-     "nothing was changed" line).
+     "nothing was changed" line). When its line says the live checkout has uncommitted changes this
+     upgrade did not make (another harness task's edit to files it would write), keep <tmp>, never commit,
+     revert or stash those changes, and hand off `waiting` with retry_after_s 300 and retry_when
+     `test "$(date +%s)" -ge <now + 300>`, then rerun this step.
    - Exit 76: main is applied and the restart deferred; the old daemon runs on and restarts when it
      takes the request: remove <tmp> and hand off `waiting` with retry_when
      `test ! -e {state}/restart.request -a ! -e {state}/restart.request.taken`. When it wakes you, read
@@ -12508,7 +13062,7 @@ def _undo_template_rollback(h: Path, ident: list[str]) -> str:
     from .runtimeload import ROLLBACK_RE
 
     def git(*args: str) -> subprocess.CompletedProcess:
-        return subprocess.run(["git", "-C", str(h), *args], capture_output=True, text=True)
+        return gitmemo.run(["git", "-C", str(h), *args], capture_output=True, text=True)
 
     last = git("log", "-1", "--format=%H%x00%s", "HEAD", "--", "runtime").stdout.strip()
     sha, _, subject = last.partition("\0")
@@ -12756,6 +13310,75 @@ def _keep_local_blocks(ours: str, base: str, theirs: str) -> str | None:
     for i, _, lines in sorted(((where(i), k, lines) for k, (i, lines) in enumerate(groups)), reverse=True):
         out[i:i] = lines
     return "".join(out)
+
+
+def _cancelled_resolution(p: Project) -> tuple[int, str]:
+    """(task, commit): the newest merge the last template-merge task committed in a worktree of the harness
+    (or on its own branch) before it was cancelled. Such a commit was made after the task was queued, is
+    not in main and takes in template commits main lacks. (0, "") when there is none."""
+    from . import harnesstree, release
+    t = p.db.one("SELECT id, status, created FROM tasks WHERE kind='harness' AND title=? ORDER BY id DESC LIMIT 1",
+                 (release.UPGRADE_TASK_TITLE,))
+    if not t or t["status"] != "cancelled":
+        return 0, ""
+    h = p.harness
+    out = subprocess.run(["git", "-C", str(h), "worktree", "list", "--porcelain"], capture_output=True, text=True)
+    skip = {str(h.resolve()), str((p.state / "upgrade-merge").resolve()), str((p.state / "upgrade-resolution").resolve())}
+    heads, path = [], ""
+    for line in out.stdout.splitlines():
+        if line.startswith("worktree "):
+            path = str(Path(line[9:]).resolve())
+        elif line.startswith("HEAD ") and path not in skip:
+            heads.append(line[5:])
+    b = subprocess.run(["git", "-C", str(h), "rev-parse", "-q", "--verify", f"refs/heads/{harnesstree.branch(t['id'])}"],
+                       capture_output=True, text=True)
+    heads += [b.stdout.strip()] if b.returncode == 0 else []
+    best = (0.0, "")
+    for sha in dict.fromkeys(heads):
+        at = subprocess.run(["git", "-C", str(h), "show", "-s", "--format=%ct", sha], capture_output=True, text=True)
+        mb = subprocess.run(["git", "-C", str(h), "merge-base", sha, "upstream"], capture_output=True, text=True)
+        if at.returncode or mb.returncode or float(at.stdout.strip() or 0) < float(t["created"]) - 60:
+            continue
+        if any(subprocess.run(["git", "-C", str(h), "merge-base", "--is-ancestor", c, "HEAD"]).returncode == 0
+               for c in (sha, mb.stdout.strip())):
+            continue    # nothing main lacks, or no template commit main lacks: not a merge of the template
+        best = max(best, (float(at.stdout.strip()), sha))
+    return (int(t["id"]), best[1]) if best[1] else (0, "")
+
+
+def _finish_cancelled_merge(p: Project, ident: list[str], base: str) -> str:
+    """A host-side upgrade whose merge conflicts finishes, model-free, the merge a cancelled merge task left
+    committed (_cancelled_resolution): only when that commit merges the current `upstream` and main (`base`)
+    with no conflict and the result compiles and imports. Nothing is hand-resolved. Returns the checked
+    commit for `--apply`, or "" (a conflict or failed check is said; the caller queues a task as before)."""
+    tid, sha = _cancelled_resolution(p)
+    if not sha:
+        return ""
+    h, tmp = p.harness, p.state / "upgrade-resolution"
+    subprocess.run(["git", "-C", str(h), "worktree", "remove", "--force", str(tmp)], capture_output=True)
+    if tmp.exists():
+        shutil.rmtree(tmp)
+    subprocess.run(["git", "-C", str(h), "worktree", "prune"], capture_output=True)
+    _git(h, "worktree", "add", "-q", "--detach", str(tmp), sha)
+    try:
+        for ref, what in (("upstream", "the current template"), (base, "main")):
+            r = subprocess.run(["git", "-C", str(tmp), *ident, "merge", "--no-edit", ref], capture_output=True,
+                               text=True)
+            if r.returncode != 0:
+                subprocess.run(["git", "-C", str(tmp), "merge", "--abort"], capture_output=True)
+                print(f"harness task #{tid} (cancelled) left a merge {sha[:12]}, but it conflicts with {what}: "
+                      f"a merge task resolves it")
+                return ""
+        problem = _runtime_problem(tmp)
+        if problem:
+            print(f"harness task #{tid} (cancelled) left a merge {sha[:12]}, but {problem}: a merge task resolves it")
+            return ""
+        merged = _git(tmp, "rev-parse", "HEAD")
+        print(f"harness task #{tid} was cancelled with a merge committed ({sha[:12]}); it merges with the current "
+              f"template and main with no conflict, compiles and imports ({merged[:12]}): applying it, no task")
+        return merged
+    finally:
+        subprocess.run(["git", "-C", str(h), "worktree", "remove", "--force", str(tmp)], capture_output=True)
 
 
 def _merge_upstream(h: Path, tmp: Path, ident: list[str], base: str = "main",
@@ -13067,7 +13690,7 @@ COMMAND_GROUPS = (
     ("admin", ("setup", "upgrade", "start", "stop", "restart", "adopt", "prune", "secret", "consent",
                "notifier", "schedules", "heal", "upstream", "lease", "replicate", "check-plan", "stats", "audit",
                "push-audit", "ttr", "selfchange", "spend-today", "throughput", "model-trip", "echoes", "course",
-               "uninstall", "bench", "model-bench")),
+               "uninstall", "bench", "model-bench", "model")),
 )
 
 
@@ -13142,6 +13765,33 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--home-from", help=argparse.SUPPRESS)   # and its name
     s.set_defaults(fn=cmd_new)
 
+    s = sub.add_parser("bridge", help="ssh access bridge: lab boxes reach hosts through this computer's ssh agents, "
+                       "no key stored on a box, failing closed while this computer sleeps (config ~/.config/tt-project/bridge.json)")
+    s.add_argument("action", choices=["setup", "status", "doctor", "stop", "show", "cert", "gh-pull"],
+                   help="setup: write each box's ssh config block and start the kept sessions; status: one line per box "
+                   "and agent (exit 1 when one is down); doctor: status and what to do; stop: stop the sessions "
+                   "(the box's logins through them then fail); show: print the block and session commands, change nothing; "
+                   "cert status|renew|remove|trust --print|schedule [boxes]: the offline mode's short-lived certificates "
+                   "(off unless the config has a \"cert\" section); gh-pull: run the boxes' gh calls queued by "
+                   "delivery.gh_route \"workstation\" with this computer's gh (default: the boxes with \"gh_pull\": true)")
+    s.add_argument("boxes", nargs="*", help="the boxes (their ssh aliases; default: all in the config); "
+                   "with cert, the cert action first")
+    s.add_argument("--print", action="store_true", help="with cert trust: print the authorized_keys line")
+    s.add_argument("--make-key", action="store_true", help="with cert renew: make the box's own key on the box if it has none")
+    s.add_argument("--force", action="store_true", help="with cert renew: sign again even with more than half the validity left")
+    s.add_argument("--config", help="the bridge config (default ~/.config/tt-project/bridge.json)")
+    s.add_argument("--remove", action="store_true", help="with stop: also remove the service files and the box's block")
+    s.add_argument("--loop", action="store_true", help="with gh-pull: keep pulling (the gh_pull service runs this)")
+    s.add_argument("--every", type=int, default=30, help="with gh-pull --loop: seconds between rounds (default 30)")
+    s.set_defaults(fn=cmd_bridge)
+
+    s = sub.add_parser("gh-queue", help="the gh calls this host queues for the user's workstation "
+                       "(delivery.gh_route \"workstation\"; the workstation's `ttp bridge gh-pull` takes and answers them)")
+    s.add_argument("action", choices=["run", "take", "put"], help="run -- <gh args>: the answer if in, else queue it "
+                   "(exit 75); take: claim queued calls (JSON); put: store answers (JSON on stdin)")
+    s.add_argument("args", nargs=argparse.REMAINDER, help="for run: -- then the gh arguments")
+    s.set_defaults(fn=cmd_gh_queue)
+
     s = sub.add_parser("web", help="web app link (for a remote project: tunnel command and link)")
     s.add_argument("name", help="the project")
     s.add_argument("--tunnel", action="store_true", help="open the local forward now (it only lets this machine "
@@ -13168,6 +13818,7 @@ def main(argv: list[str] | None = None) -> None:
             s.add_argument("--label", help="a name for the chat, shown in the web app")
             s.add_argument("--home-tz", help=argparse.SUPPRESS)     # the connecting workstation's zone
             s.add_argument("--home-from", help=argparse.SUPPRESS)   # and its name
+            s.add_argument("--holder", help=argparse.SUPPRESS)      # the relayer connecting (relayers.holder_id)
         if name in ("status", "paths"):
             s.add_argument("--json", action="store_true", help=f"print the {name} as JSON")
         if name == "status":
@@ -13214,6 +13865,7 @@ def main(argv: list[str] | None = None) -> None:
                    "kept apart from the user's words")
     s.add_argument("--finding", default="", help="a relayer's own findings, sent with no user's words; shown to "
                    "the coordinator as data, never the user's word")
+    s.add_argument("--holder", help=argparse.SUPPRESS)   # the relayer listening (relayers.holder_id)
     s.add_argument("--all", action="store_true", help="send to every project `ttp list` shows, once each: "
                    "a resend within 24 h reaches only those that did not get it yet")
     s.add_argument("--except", dest="except_", metavar="P,Q", help="with --all: projects to leave out")
@@ -13222,11 +13874,13 @@ def main(argv: list[str] | None = None) -> None:
     s.set_defaults(fn=cmd_say)
 
     s = sub.add_parser("listen", help="print messages for a chat as they arrive", description=(
-        "Print messages for a chat as they arrive. For a project on another machine the listen runs "
+        "Print messages for a chat as they arrive: this chat's replies, asks and high or critical "
+        "alerts at once, other alerts batched over relay.batch_s, routine updates not at all "
+        "(they stay in `ttp status` and the web app; --all prints them). For a project on another machine the listen runs "
         "there over ssh; a dropped connection (ssh exit 255, or a signal ending the session) is "
         "retried after 5 s, doubling to 2 min, and each message is printed once per listener. "
         "Exit codes: 0 messages shown (--once) or --timeout reached; 2 the project refused it "
-        "(unknown chat or project); 3 a newer listener for the chat replaced this one (not retried); "
+        "(unknown chat or project, or another relayer's chat id); 3 a newer listener for the chat replaced this one (not retried); "
         "75 the project stayed unreachable until --timeout ran out; "
         "any other code is the project's own ttp failing."))
     s.add_argument("name", help="the project")
@@ -13236,6 +13890,12 @@ def main(argv: list[str] | None = None) -> None:
                    help="stop after this many seconds (0: never); also bounds reconnecting")
     s.add_argument("--ack", type=int, metavar="ID",
                    help="mark messages up to ID read; later ones stay unread until acknowledged")
+    s.add_argument("--batch", type=float, metavar="S",
+                   help="hold broadcast alerts up to S seconds to print them together (default relay.batch_s, 120)")
+    s.add_argument("--holder", help=argparse.SUPPRESS)   # the relayer listening (relayers.holder_id)
+    s.add_argument("--all", action="store_true",
+                   help="print every message at once, routine updates included (default: only replies, asks "
+                        "and alerts, which are what a relayer passes on)")
     s.set_defaults(fn=cmd_listen)
 
     s = sub.add_parser("steer", help="print the coordinator's unread update for this run (also printed by ttp note)")
@@ -13343,6 +14003,9 @@ def main(argv: list[str] | None = None) -> None:
                    help="end this task's own detached push (its marker) while it waits for its turn or runs its "
                         "checks, and remove its marker, so the push train can take its head; never one in its "
                         "git push (exit 1), another task's or project's (exit 2); 0 once stopped or already ended")
+    s.add_argument("--cancel", metavar="MARKER",
+                   help="push nothing new: stop the detached push of MARKER (queued or running, its checks too) "
+                        "before it lands; only the task that queued it, or the project's coordinator")
     s.add_argument("--pushed", action="store_true",
                    help="with --result: exit 0 only if the push landed, 1 while it runs, 3 if it finished "
                         "without pushing (for an on_pass_cmd; no grep needed)")
@@ -13428,6 +14091,8 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--env-ok", nargs="*", metavar="SIG", default=None,
                    help="run nothing: exit 0 once the named environment faults (or, with none named, every "
                         "open one) no longer hit a missing check runner, 1 while one does")
+    s.add_argument("--spill-back", metavar="ALIAS",
+                   help="run nothing: end spill host ALIAS's quarantine (checkspill.strike_settle) and its strikes")
     s.add_argument("--slot-status", action="store_true",
                    help="run nothing (also `ttp checks status`): print each repository's checks lanes, their "
                         "holders (pid, task, run, age, alive) and the waiters in queue order; never queues")
@@ -13669,6 +14334,16 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--ref", help="where the head-to-head result is (a path or task id)")
     s.set_defaults(fn=cmd_model_trip)
 
+    s = sub.add_parser("model", help="chat model demotions and parks (modeldemote.py): demote, promote, park or "
+                                     "unpark one by hand, recorded with its setter; no action lists them")
+    s.add_argument("action", nargs="?", choices=("demote", "promote", "park", "unpark"),
+                   help="what to do with the model")
+    s.add_argument("model", nargs="?", help="the chat model id")
+    s.add_argument("--class", dest="cls", help="the task class (babysit, light, standard, review); default every class")
+    s.add_argument("--why", help="the reason kept with the record")
+    s.add_argument("--project", help="project (default: the one here)")
+    s.set_defaults(fn=cmd_model)
+
     s = sub.add_parser("throughput", help="waits per lane (worker, resource, checks, review, push, chains, deferrals, "
                                           "provider) against their limits; --apply raises the limits that held work "
                                           "back while there was headroom, each with an undo")
@@ -13866,38 +14541,51 @@ def main(argv: list[str] | None = None) -> None:
     s.set_defaults(fn=cmd_quarantine)
 
     s = sub.add_parser("bench", help="replay bench, model-free part: `prep` picks landed tasks newer than --since "
-                                      "that add tests, builds a clean one-commit workspace at each base and holds "
-                                      "out the landed tests, with a hash-pinned manifest")
-    s.add_argument("action", choices=["prep", "run", "blind"],
-                   help="prep: build the bench in --out; run: the head-to-head of two or more arms on --bench, "
+                                      "that add tests, keeps the tests that fail on the base and pass on the head, "
+                                      "builds a clean one-commit workspace at each base and holds out the landed "
+                                      "test files, with a hash-pinned manifest")
+    s.add_argument("action", choices=["prep", "cells", "run", "blind"],
+                   help="prep: build the bench in --out; cells: seeded-bug and prompt-injection cells from the "
+                        "--bench folder's small tasks in --out, with a hash-pinned cells.json; run: the head-to-head of two or more arms on --bench, "
                         "results and the blind review's cells.json in --out; blind: the blind review "
                         "(`ttp bench blind prep <run folder> --out <dir>`, then review, score, reveal; "
                         "`ttp bench blind --help`)")
     s.add_argument("--blind-word", action="append", help=argparse.SUPPRESS)
     s.add_argument("--since", help="keep tasks created on or after this date (YYYY-MM-DD): the "
                                                   "later of the compared models' release dates")
-    s.add_argument("--out", help="prep, run: a new folder for the workspaces, held-out tests and manifest (required)")
+    s.add_argument("--out", help="prep, cells, run: a new folder for the workspaces, held-out tests and manifest (required)")
     s.add_argument("--repo", help="the repository the tasks landed in (default: the project root); `run` also "
                    "denies it, its git dir and worktrees to the cells")
     s.add_argument("--limit", type=int, default=0, help="keep (prep) or run (run) at most this many tasks (default: all)")
-    s.add_argument("--bench", help="run: the `ttp bench prep` folder to replay")
+    s.add_argument("--bench", help="run: the `ttp bench prep` folder to replay; cells: the one to build cells from")
+    s.add_argument("--here", action="store_true", help="cells: build in this shell, even in a worker run (by "
+                   "default a worker run's build goes in one `ttp detach --cores` job)")
+    s.add_argument("--seeded", type=int, default=0, help="cells: build at most this many seeded-bug cells "
+                                                         "(default: one per small task whose tests catch a mutation)")
     s.add_argument("--arm", action="append", help="run: name=provider:model:effort, repeatable (default: bench.arms)")
     s.add_argument("--reps", type=int, default=0, help="run: repeats per task and arm (default: bench.reps, 1)")
     s.add_argument("--seed", type=int, help="run: the arm-order seed (default: a random one, recorded)")
     s.add_argument("--timeout", type=float, default=0, help="run: wall-clock limit per cell in s (default: bench.timeout_s)")
     s.add_argument("--budget", type=float, default=0, help="run: dollar budget per cell (default: bench.budget_usd)")
-    s.add_argument("--test-cmd", help="run: the command the held-out test ids are appended to "
-                                            "(default: python3 -m pytest -q -p no:cacheprovider)")
+    s.add_argument("--test-cmd", help="prep: the pytest command that validates the held-out tests, run in a copy of "
+                   "the base and of the head; cells, run: the command the held-out test ids are appended to "
+                   "(default: python3 -m pytest -q -p no:cacheprovider)")
+    s.add_argument("--no-validate", action="store_true", help="prep: skip validation: keep every added test unrun "
+                                                               "(a count, or a host that cannot run the tests)")
     s.add_argument("--dry-run", action="store_true", help="run: every arm on the fake agent, no model call")
     s.set_defaults(fn=cmd_bench)
 
     s = sub.add_parser("model-bench", help="the host's shared daily chat model bench: `run` benches the served "
                                             "models once per host and day (a second run does nothing; the "
-                                            "daemon runs it daily), `show` prints the owner, latest result and "
+                                            "owner project's schedule runs it daily), `show` prints the owner, latest result and "
                                             "per-model scores")
-    s.add_argument("action", choices=["run", "show"], help="run: bench the served models (once per host and day); "
-                                                            "show: print the owner, latest result and per-model scores")
+    s.add_argument("action", choices=["run", "show", "scores"],
+                   help="run: bench the served models (once per host and day); show: print the owner, latest "
+                        "result and per-model scores; scores: the model scoreboard's per-class rankings")
     s.add_argument("--force", action="store_true", help="run: bench again though today's result exists")
+    s.add_argument("--json", action="store_true", help="scores: print the board as JSON")
+    s.add_argument("--detach", action="store_true", help="run: start the bench in the background and return "
+                                                         "(the owner's daily schedule; output in the bench log)")
     s.set_defaults(fn=cmd_model_bench)
 
     s = sub.add_parser("ack-wait", help="wait model-free for another project's reply to a `ttp note --to`: probe "
@@ -14084,9 +14772,13 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--by-review", type=int, help="superseded: for a failed (changes_needed) review, a passed "
                    "re-review of the same change chain that covers its findings")
     s.add_argument("--json", action="store_true", help="list: JSON rows with start_when/retry_when; show: the task record with its blocker_sweep")
+    s.add_argument("--force", action="store_true", help="requeue: run a cancelled or done task, or one that failed "
+                   "its last allowed attempt, again (a deliberate decision; scripts requeueing failed or waiting "
+                   "work leave it off)")
     s.add_argument("--status", help="list: only tasks in these statuses, comma-separated (queued,running,waiting,"
                    "blocked,review,done,failed,changes_needed,superseded,cancelled, ...); filtered before any cap, so every match "
                    "shows unless --limit is given")
+    s.add_argument("--holder", help=argparse.SUPPRESS)   # the relayer listening (relayers.holder_id)
     s.add_argument("--all", action="store_true", help="list: every task, not only the newest 50")
     s.add_argument("--limit", type=int, help="list: at most this many, newest first (default 50 with no --status; "
                    "a cut list says so on stderr)")
@@ -14525,8 +15217,8 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("dir", help="the project's tt-project folder")
     s.set_defaults(fn=cmd_daemon)
 
-    a = ap.parse_args(_project_name_argv(sub, _say_finding_argv(_say_all_argv(_secret_value_argv(_secret_env_argv(_bench_blind_argv(
-        sys.argv[1:] if argv is None else list(argv))))))))
+    a = ap.parse_args(_project_name_argv(sub, _say_finding_argv(_say_all_argv(_secret_value_argv(_secret_env_argv(_bench_blind_argv(_bridge_argv(
+        sys.argv[1:] if argv is None else list(argv)))))))))
     dry_run_stub(a)
     try:
         _recover_setup()     # a `ttp setup` a reboot cut short: finished or rolled back before anything else

@@ -33,7 +33,7 @@ def test_gate_time_over_smoke_max_raises_one_coordinator_observation_a_day_namin
     logs.mkdir(exist_ok=True)
     (logs / "t1-a.log").write_text("== slowest durations ==\n95.10s call     tests/a.py::test_slow\n"
                                    "3.00s setup    tests/a.py::test_slow\nttp-suite:    40.00s tests/b.py::test_mid\n")
-    assert "over the 10.0 min smoke limit" in gatetime.status_line(p.state, p.config(), now)
+    assert "over the 5.0 min smoke limit" in gatetime.status_line(p.state, p.config(), now)
     d = Daemon(p.base)
     d.check_gate_time(every_s=0, now=now)
     d.check_gate_time(every_s=0, now=now + 60)   # once a day
@@ -41,6 +41,16 @@ def test_gate_time_over_smoke_max_raises_one_coordinator_observation_a_day_namin
     assert len(rows) == 1 and rows[0]["status"] == "queued"
     text = rows[0]["text"]
     assert "tests/a.py::test_slow 95s, tests/b.py::test_mid 40s" in text and "delivery.post_land_checks" in text
+    # one priority-1 test speed-up task, naming the slowest tests; never a second while it is open
+    speed = p.db.q("SELECT id, priority, kind, spec, status FROM tasks WHERE labels LIKE '%\"test_speed\"%'")
+    assert len(speed) == 1 and speed[0]["priority"] == 1 and speed[0]["kind"] == "code"
+    assert f"task #{speed[0]['id']}" in text
+    assert "urgent:" in speed[0]["spec"] and "tests/a.py::test_slow: 95s" in speed[0]["spec"]
+    assert "already open" in gatetime.flag(p.db, p.state, {}, logs, now + 86400)
+    assert len(p.db.q("SELECT id FROM tasks WHERE labels LIKE '%\"test_speed\"%'")) == 1
+    p.db.x("UPDATE tasks SET status='done' WHERE id=?", (speed[0]["id"],))
+    assert "Queued test speed-up task" in gatetime.flag(p.db, p.state, {}, logs, now + 4 * 86400)
+    assert len(p.db.q("SELECT id FROM tasks WHERE labels LIKE '%\"test_speed\"%'")) == 2
     d.cfg = {**d.cfg, "checks": {**(d.cfg.get("checks") or {}), "smoke_max_s": 0}}   # 0: off
     assert gatetime.flag(p.db, p.state, d.cfg, logs, now + 2 * 86400) == ""
     # under the limit: nothing
@@ -57,7 +67,7 @@ def test_post_land_checks_and_smoke_max_s_are_known_settings_and_post_land_check
     assert not [x for x in project.config_problems(good) if "post_land" in x or "smoke_max" in x]
     bad = project.config_problems({"delivery": {"post_land_checks": [{"host": "local"}]}})
     assert any(x.startswith("delivery.post_land_checks:") for x in bad)
-    assert gatetime_default_is_ten_minutes()
+    assert gatetime_default_is_five_minutes()
 
 
 def test_smoke_max_s_is_an_account_key_the_project_value_overrides(env):
@@ -68,9 +78,9 @@ def test_smoke_max_s_is_an_account_key_the_project_value_overrides(env):
     assert gatetime.max_s({"checks": {"smoke_max_s": "x"}}) == 900, "malformed: the account's"
 
 
-def gatetime_default_is_ten_minutes() -> bool:
+def gatetime_default_is_five_minutes() -> bool:
     from ttp import gatetime
-    return gatetime.max_s({}) == 600 == gatetime.max_s({"checks": {"smoke_max_s": "x"}}) and gatetime.AIM_S == 300
+    return gatetime.max_s({}) == 300 == gatetime.max_s({"checks": {"smoke_max_s": "x"}}) and gatetime.AIM_S == 240
 
 
 def test_waits_line_gives_checks_wait_to_start_and_approved_to_landed_and_a_checks_run_records_its_wait(

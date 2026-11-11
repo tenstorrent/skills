@@ -235,6 +235,7 @@ class Provider:
     model = ""                       # the run's model and the project's price rows, for providers
     prices: dict = {}                # whose cost is estimated from tokens (see use())
     billing = "auto"                 # the project's providers.<name>.billing (billing.declared)
+    entry: dict | None = None        # the project's providers.<name> settings, for a login check that needs them
     # Read-only turns run from scratch_dir(), not the project: this agent otherwise loads the
     # project's AGENTS.md or rules from its working directory into a decision-only turn.
     isolate_read_only = False
@@ -256,6 +257,11 @@ class Provider:
     # provider only; every agent CLI the coordinator runs on keeps one).
     coord_session = ""
     session_gap = "its CLI keeps no session the harness can resume"
+    # How a resumed coordinator session takes a changed system prompt, charter or schema
+    # (coordsession.decide, changed_block): "reread", the resumed run takes this run's system prompt
+    # and schema; "diff", the harness also sends the system prompt's diff, as the resume may keep the
+    # old one; "": it cannot resume with a changed prompt, and a change starts a new session.
+    resume_new_prompt = ""
     # The CLI runs ttp's PreToolUse/PostToolUse hooks (coordtools.hook_settings): the coordinator's tool
     # policy and per-call protected-file guard. Without them the daemon guards the protected files
     # around the whole coordinator wake (coordtools.wake_snapshot, wake_guard).
@@ -300,6 +306,11 @@ class Provider:
         """Whether the agent CLI is logged in, asked without a model call (its own status command):
         True or False, or None when this CLI has no such check (a run then checks the login)."""
         return None
+
+    def login_state(self, cfg: dict | None = None) -> bool | None:
+        """login_check for a project with config `cfg`: a provider whose key a project setting names
+        (an endpoint alias) also checks, model-free, that the key is saved."""
+        return self.login_check()
 
     def build(self, *, role: str, model: str, effort: str, cwd: str, budget_usd: float | None,
               read_only: bool, schema: dict | None, restrictions: dict,
@@ -393,6 +404,12 @@ class Provider:
         keeps the session's first one on a resume. "" once done or not needed (default: the agent takes
         each launch's system prompt, as Claude Code's --append-system-prompt-file), else why not."""
         return ""
+
+    def session_instructions(self, session_id: str, cwd: str, env: dict | None) -> list[str]:
+        """The developer or system texts saved session `session_id` gives a run that resumes it (the
+        launch-role check, ctxfork.own_role). Default: none, as the agent takes each launch's system
+        prompt and its sessions keep no instructions of their own."""
+        return []
 
     def add_subagent_usage(self, usage: "RunUsage", output_path: Path, since: float | None = None,
                            env: dict | None = None) -> None:

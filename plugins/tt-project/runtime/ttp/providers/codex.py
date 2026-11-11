@@ -110,6 +110,10 @@ class Codex(Provider):
     cache_key_per_session = True
     coord_session = "agent"   # `codex exec ... resume <id> -`; size and compaction from the rollout (session_context)
     session_format = "codex-rollout"   # sessions/YYYY/MM/DD/rollout-<time>-<id>.jsonl (fork_session)
+    # --output-schema is per run, but `exec resume` keeps the first run's developer instructions: on
+    # 0.160 the resumed request carried the old text and none of a changed `-c developer_instructions`
+    # (measured against a local stand-in API), so the harness sends the system prompt's diff too.
+    resume_new_prompt = "diff"
     mcp_by_args = True   # `-c mcp_servers=...` (codexmcp.py): Codex has no per-run MCP config file
     # Whether build() left the harness hook out only because the user's config.toml defines hooks or
     # plugins; isolation_args() then adds it, as an isolated run ignores that file.
@@ -188,6 +192,27 @@ class Codex(Provider):
         durable_write(folder / f"rollout-{now.strftime('%Y-%m-%dT%H-%M-%S')}-{new_id}.jsonl",
                       "".join(json.dumps(r) + "\n" for r in rows), mode=0o600)
         return ""
+
+    def session_instructions(self, session_id: str, cwd: str, env: dict | None) -> list[str]:
+        # Every text part of every developer message in the rollout, nested compacted histories too:
+        # what `codex exec resume` sends the model again (own_instructions).
+        src = self.session_paths(session_id, cwd, env)
+        if not src:
+            return []
+        out: list[str] = []
+
+        def walk(node):
+            if isinstance(node, dict) and node.get("role") == "developer" and isinstance(node.get("content"), list):
+                out.extend(x["text"] for x in node["content"] if isinstance(x, dict) and isinstance(x.get("text"), str))
+            elif isinstance(node, (list, dict)):
+                for x in (node if isinstance(node, list) else node.values()):
+                    walk(x)
+        for line in max(src, key=lambda x: x.stat().st_mtime).read_text(errors="replace").split("\n"):
+            try:
+                walk(json.loads(line))
+            except ValueError:
+                pass
+        return out
 
     def own_instructions(self, session_id: str, cwd: str, env: dict | None, text: str) -> str:
         # `codex exec resume` keeps the developer messages saved in the rollout and takes no new

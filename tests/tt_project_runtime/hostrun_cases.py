@@ -195,7 +195,7 @@ def test_host_run_drops_a_request_its_client_gave_up_on_long_ago(env, monkeypatc
 
 def test_a_worker_cannot_change_the_host_run_allowlist(env, monkeypatch, capfd):
     from ttp import cli, configwho, hostrun
-    p = _hostrun_setup(env, monkeypatch, ["/bin/true"])
+    p = _hostrun_setup(env, monkeypatch, ["/bin/true"], by="coordinator")
     monkeypatch.setenv("TTP_RUN_ID", "5")
     monkeypatch.setenv("TTP_TASK", "12")
     for key, value in (("runner.host_commands", '["/bin/sh"]'), ("runner", '{"host_commands": ["/bin/sh"]}')):

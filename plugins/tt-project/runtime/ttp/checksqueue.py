@@ -11,8 +11,8 @@ progress.md), the project's events (EVENT, handled: it wakes nobody) and the wai
 the task's `--result` probe prints as its note.
 
 Who may: the coordinator, the user at a terminal (no run of any project above it) and a worker whose own task
-is urgent or priority 1 and whose spec gives the order (a paragraph naming park or cancel with a user msg # or
-the coordinator). Refused: a run holding a slot (only waiting runs are parked or cancelled; a review precheck
+is urgent or priority 1 and whose spec gives the order (one paragraph naming the action itself, `ttp checks
+park|cancel` or park or cancel before checks runs, with a user msg # or the coordinator). Refused: a run holding a slot (only waiting runs are parked or cancelled; a review precheck
 no review reads any more may be cancelled anyway: jobstop.may_stop), a push batch's checks, a run folder
 outside this project, a precheck an open review still reads, and any other caller."""
 from __future__ import annotations
@@ -32,7 +32,11 @@ PROBE_S = 60   # how often a parked run asks its --until probe
 PROBE_TIMEOUT_S = 50
 POLL_S = 2.0
 ACTIONS = ("park", "cancel", "resume", "queue")
-_ORDER = re.compile(r"(?i)\b(park|cancel)")
+# The checks-queue action itself: `ttp checks park|cancel`, or the word park or cancel (no variants such as
+# 'parked' or 'cancelling', which daemon notes about tasks carry) within a few words before checks or
+# queued runs ("park the routine checks runs", "cancel the queued runs").
+_ORDER = re.compile(r"(?i)\bttp\s+checks\s+(park|cancel)\b"
+                    r"|\b(park|cancel)\b(\s+[\w#'-]+){0,3}?\s+(checks?|queued)\s+runs?\b")
 _CITE = re.compile(r"(?i)(\bmsg #\d+|\bcoordinator)")
 
 
@@ -131,12 +135,14 @@ def caller(p, action: str) -> tuple[str, str]:
         return "", f"refused: task #{tid} is not urgent or priority 1"
     if action != "resume" and not ordered(t.get("spec") or ""):
         return "", (f"refused: task #{tid}'s spec gives no order to park or cancel checks runs (a paragraph "
-                    "naming park or cancel with a user msg # or the coordinator)")
+                    "naming `ttp checks park|cancel`, or park or cancel before checks runs, with a user msg # or the "
+                    "coordinator)")
     return f"task #{tid} (run {run})", ""
 
 
 def ordered(spec: str) -> bool:
-    """A paragraph of the spec names park or cancel together with a user msg # or the coordinator."""
+    """One paragraph of the spec names the checks-queue action itself (_ORDER) together with a user msg # or
+    the coordinator."""
     return any(_ORDER.search(par) and _CITE.search(par) for par in re.split(r"\n\s*\n", spec))
 
 
@@ -270,9 +276,29 @@ def queued(p) -> list[dict]:
         out.append({"run": d.name, "task": task, "priority": t.get("priority") if t else None,
                     "urgent": bool(t and checkcap.is_urgent(t.get("priority"))), "owed": owed,
                     "kind": "push batch" if push_batch(info) else ("review precheck" if kind == "precheck" else "task"),
-                    "since": info["wait"].get("since"), "parked": note(info["wait"]["parked"])
+                    "since": arrival(info), "parked": note(info["wait"]["parked"])
                     if isinstance(info["wait"].get("parked"), dict) else ""})
     return sorted(out, key=lambda e: e.get("since") or 0)
+
+
+def arrival(info: dict) -> float | None:
+    """When a waiting run first joined the queue: the earliest of its checks.pid 'arrived' (detached checks),
+    the arrival a foreground run was handed (checkcap.ARRIVED_ENV in its environment) and its latest
+    CHECKS_SLOT_WAIT 'since', which a re-wait resets."""
+    from . import checkcap, procowner
+    seen = [info.get("arrived"), info["wait"].get("since")]
+    env = procowner.environ(info["pid"]) if isinstance(info.get("pid"), int) else None
+    seen.append((env or {}).get(checkcap.ARRIVED_ENV))
+    now = time.time()
+    good = []
+    for t in seen:
+        try:
+            t = float(t)
+        except (TypeError, ValueError):
+            continue
+        if 0 < t <= now:
+            good.append(t)
+    return min(good) if good else None
 
 
 def main(p, argv: list[str]) -> int:

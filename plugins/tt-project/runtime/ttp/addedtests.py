@@ -50,11 +50,11 @@ def _params(node) -> list[str]:
     return [s for d in node.decorator_list if "parametrize" in (s := ast.unparse(d))]
 
 
-def tests_in(src: str) -> dict[str, list[str]]:
+def tests_in(src: str | ast.Module) -> dict[str, list[str]]:
     """{qualname: its parametrize decorators} of the test functions in `src` (module level, and in
-    module-level Test* classes); {} when it does not parse."""
+    module-level Test* classes; a parsed module as it is); {} when it does not parse."""
     try:
-        tree = ast.parse(src)
+        tree = src if isinstance(src, ast.Module) else ast.parse(src)
     except (SyntaxError, ValueError):
         return {}
     funcs = (ast.FunctionDef, ast.AsyncFunctionDef)
@@ -74,9 +74,11 @@ def _show(top: str | Path, rev: str, path: str) -> str:
     return r.stdout if r.returncode == 0 else ""
 
 
-def added(top: str | Path, base: str, head: str) -> list[tuple[str, str]]:
+def added(top: str | Path, base: str, head: str, tests_of=None) -> list[tuple[str, str]]:
     """[(path, qualname)] of the test functions `head` adds compared with its merge base with
-    `base`, or whose parametrize decorators it changed; [] with no base or no merge base."""
+    `base`, or whose parametrize decorators it changed; [] with no base or no merge base.
+    `tests_of(rev, path)`: tests_in of that file (default: read and parse it here)."""
+    tests_of = tests_of or (lambda rev, path: tests_in(_show(top, rev, path)))
     if not base:
         return []
     mb = _git(top, "merge-base", base, head).stdout.strip()
@@ -92,8 +94,8 @@ def added(top: str | Path, base: str, head: str) -> list[tuple[str, str]]:
         i += 3 if status.startswith("R") else 2
         if not _test_file(new):
             continue
-        before = tests_in(_show(top, mb, old)) if not status.startswith("A") else {}
-        for name, params in tests_in(_show(top, head, new)).items():
+        before = tests_of(mb, old) if not status.startswith("A") else {}
+        for name, params in tests_of(head, new).items():
             if name not in before or before[name] != params:
                 out.append((new, name))
     return out

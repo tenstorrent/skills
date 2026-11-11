@@ -16,6 +16,8 @@ import uuid
 from pathlib import Path
 from typing import Iterator
 
+from . import probespawn
+
 KEY = "coord_looks"
 DONE_KEY = "coord_looks_done"
 MAX = 10                  # pending looks kept; a new one past this drops the latest-due
@@ -76,7 +78,8 @@ def screen(db, base: Path, looks: list[dict], now: float) -> list[dict]:
     for x in looks:
         if x.get("check"):
             try:
-                rc = subprocess.run(x["check"], shell=True, cwd=str(base), capture_output=True,
+                cmd, env = probespawn.hidden(x["check"], None)
+                rc = subprocess.run(cmd, shell=True, cwd=str(base), env=env, capture_output=True,
                                     timeout=CHECK_TIMEOUT_S).returncode
             except (subprocess.TimeoutExpired, OSError):
                 rc = 1   # a check that cannot answer wakes, so a look is never lost

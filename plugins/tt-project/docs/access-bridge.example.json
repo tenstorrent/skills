@@ -1,0 +1,35 @@
+{
+  "socket_dir": "~/.ssh/tt-agent",
+  "boxes": {
+    "lab-box-1": {
+      "login": {"agent": "~/path/to/agent-that-may-forward.sock", "identity": "~/.ssh/login-key.pub"},
+      "agents": {
+        "automation": {
+          "agent": "env",
+          "forward": [
+            {"name": "build-host", "target": "build-host.example.com", "port": 2301, "user": "builder"},
+            {"name": "test-host-1", "aliases": ["th1"], "target": "10.0.0.11", "port": 2302,
+             "host_key_alias": "test-host-1"},
+            {"name": "vpn-host", "target": "10.0.0.12", "port": 2303, "interface": "ppp0"}
+          ]
+        },
+        "git": {
+          "agent": "~/path/to/password-manager/agent.sock",
+          "direct": [{"name": "github.com", "user": "git"}]
+        }
+      }
+    }
+  },
+  "cert": {
+    "signer": {"kind": "agent-ca", "ca_public_key": "~/path/to/bridge-ca.pub", "agent": "env"},
+    "principals": ["builder"],
+    "validity_hours": 72,
+    "pty": true,
+    "boxes": {
+      "lab-box-1": {
+        "source_address": "10.0.0.5",
+        "hosts": [{"name": "test-host-1", "aliases": ["th1"], "target": "10.0.0.11"}]
+      }
+    }
+  }
+}

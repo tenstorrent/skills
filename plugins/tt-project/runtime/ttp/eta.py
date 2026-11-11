@@ -46,7 +46,9 @@ estimate ('no estimate yet', with why): never a guess.
 
 An open promise or obligation is done when the last of its owner tasks lands (obligation_estimate).
 The coordinator's STATE (urgent tasks and promises), `ttp status` and the web app's task view show
-it as one short field; workers read `ttp eta <task>` before setting a retry or deadline wake.
+it as one short field; workers read `ttp eta <task>` before setting a retry or deadline wake. Each
+of them reads the project's delivery config (delivery_of: push_batch_max, push_age_s). In the STATE,
+urgent tasks with no estimate for the same gate and reason share one line that names the gate.
 
 long_promises() is the self-watch: an open promise or milestone to the user on an urgent goal (an
 owner is urgent, urgent.is_urgent) due more than coordinator.course_check.long_promise_h (LONG_H)
@@ -493,12 +495,23 @@ def core_of(where) -> str | None:
         return None
 
 
+def delivery_of(where) -> dict | None:
+    """The delivery config of a project or its config (push_batch_max, push_age_s: _Est._push_ahead)."""
+    try:
+        cfg = where.config() if hasattr(where, "config") else where
+        d = (cfg or {}).get("delivery")
+        return d if isinstance(d, dict) else None
+    except Exception:
+        return None
+
+
 def obligation_estimate(db, o: dict, now: float | None = None, est: _Est | None = None,
-                        core: str | None = None) -> dict:
+                        core: str | None = None, delivery: dict | None = None) -> dict:
     """The expected finish of an obligation or promise: the latest landing of its owner tasks
-    (`core`: the project's core provider, for owner tasks with none, when no `est` is given)."""
+    (`core`: the project's core provider, for owner tasks with none, and `delivery` its delivery
+    config, when no `est` is given)."""
     from .obligations import _owner_ids
-    est = est or _Est(db, time.time() if now is None else now, core=core)
+    est = est or _Est(db, time.time() if now is None else now, core=core, delivery=delivery)
     ids = _owner_ids(o)
     if not ids:
         return {"done": None, "end": None, "path": [], "legs": [], "why": "no owner task", "overrun": False}
@@ -599,7 +612,7 @@ def course_lines(db, cfg: dict | None, now: float | None = None) -> tuple[list[s
     rows = long_promises(db, cfg, now)
     if not rows:
         return [], []
-    est = _Est(db, now, core=core_of(cfg))
+    est = _Est(db, now, core=core_of(cfg), delivery=delivery_of(cfg))
     out, ident = [], []
     for r in rows:
         e = obligation_estimate(db, r["o"], now, est)
@@ -643,20 +656,23 @@ def state_lines(db, where, now: float | None = None, host=None, skip=()) -> list
     proms = open_promises(db)
     if not hot and not proms:
         return []
-    est = _Est(db, now, core=core_of(where))
+    est = _Est(db, now, core=core_of(where), delivery=delivery_of(where))
     out = ["## Expected finish (critical path, measured medians; quote these, never padded worst cases)"]
-    same: dict[str, list[tuple[dict, dict]]] = {}   # no estimate for one reason: one line (titles in Open tasks)
+    # no estimate for one gate and reason: one line (titles in Open tasks); the gate ('after') is kept
+    same: dict[tuple[str, str], list[tuple[dict, dict]]] = {}
     for t in hot[:10]:
         on = host(t) if host else ""
         e = est.task(t['id'])
         why = str(e["why"] or "").removeprefix(f"#{t['id']} ")
         if why and not on:
-            same.setdefault(why, []).append((t, e))
+            same.setdefault((str(e.get("after") or ""), why), []).append((t, e))
             continue
         out.append(f"- #{t['id']} {t['title'][:80]}: {field(e, where, now)}" + (f"; {on}" if on else ""))
-    for why, got in same.items():
+    for (after, why), got in same.items():
         ids = ", ".join(f"#{t['id']}" for t, _ in got)
-        out.append(f"- {ids}: ETA: no estimate yet ({why})" if len(got) > 1 else
-                   f"- #{got[0][0]['id']} {got[0][0]['title'][:80]}: {field(got[0][1], where, now)}")
+        if len(got) == 1:
+            out.append(f"- #{got[0][0]['id']} {got[0][0]['title'][:80]}: {field(got[0][1], where, now)}")
+        else:
+            out.append(f"- {ids}: ETA: after {after} ({why})" if after else f"- {ids}: ETA: no estimate yet ({why})")
     out += [f"- promise {o['id']}: {field(obligation_estimate(db, o, now, est), where, now)}" for o in proms[:10]]
     return out

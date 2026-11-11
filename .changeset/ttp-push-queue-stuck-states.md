@@ -1,0 +1,5 @@
+---
+"tt-project": patch
+---
+
+`tt-project`: the push queue notices when it is stuck and tells the coordinator, instead of retrying silently. When two push batches in a row to one target fail the same way (cannot reach the remote, a credential failure, a rejection or a batch error; shas, numbers and timings are ignored), it raises one high-severity `push_same_failure` event and stops the timed retries. A remote it could not reach or authenticate to is retried once a dry-run push works, checked every 2 minutes. Any other failure is retried when the tip or the approvals change, or after 6 hours. A retry that fails the same way holds again without a second event. While the push tip fails its checks on its own, an approval that fixes it goes alone first: its change touches the failing test files, or its review's or the reviewed task's spec or hand-off says it fixes the tip or the failing tests. The rest then rebuild on the new tip. An urgent or priority-1 approval that has waited 15 minutes behind a running batch raises one `push_urgent_waiting` event.

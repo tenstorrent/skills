@@ -59,6 +59,29 @@ def state(run_dir: Path) -> str:
     return "none"
 
 
+def last_progress(probe: str) -> float | None:
+    """When the checks `probe` waits on last showed progress while they are still queued or running: the
+    newest mtime of each such run dir's checks.log, checks.out, checks.pid and slot wait file, and of its
+    launch markers (detach.queued/started of checks.rc). None when none is queued or running, so a wait
+    on a checks run is stale only once its own log stops advancing (daemon._hold_waiting), never by the
+    time since the wait began."""
+    from . import detach
+    from .cli import CHECKS_OUT, CHECKS_PID, CHECKS_RC, CHECKS_SLOT_WAIT
+    best = None
+    for d in run_dirs(probe):
+        if state(d) not in ("queued", "running"):
+            continue
+        rc = d / CHECKS_RC
+        for path in (d / "checks.log", d / CHECKS_OUT, d / CHECKS_PID, d / CHECKS_SLOT_WAIT,
+                     detach.queued(rc), detach.started(rc)):
+            try:
+                t = path.stat().st_mtime
+            except OSError:
+                continue
+            best = t if best is None else max(best, t)
+    return best
+
+
 def gone(probe: str) -> list[Path]:
     """The run dirs `probe` waits on whose checks are neither queued, running nor finished."""
     return [d for d in run_dirs(probe) if state(d) == "gone"]

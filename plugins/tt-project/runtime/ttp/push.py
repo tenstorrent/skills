@@ -10,7 +10,9 @@ tree with the same commands and environment (_own_pass).
 Pushes of one project to one branch take turns: each holds the lock `push:<remote>/<branch>` from
 its first fetch to its push, so two reviewers never race each other through rounds. The lock is an
 OS file lock (locks.py): a killed push or a reboot frees it. A waiting push waits as long as the
-last measured check run takes, with a margin, up to 2 h (`delivery.push_wait_s` overrides it).
+last measured check run takes, with a margin, up to 2 h (`delivery.push_wait_s` overrides it), counted
+from when it is first in line: waiters queue beside the lock, an urgent or user-ordered task's first,
+then by age (take).
 Each check runs at most four times the last measured check run, at least 4 h
 (`delivery.push_checks_timeout_s` overrides it, 0 for no limit), counting its run time, wall time less its waits for a grant
 and for a test-pool slot (checkwait, `ttp pool-wait`): one that ran past it is ended and fails the push. One still waiting for a
@@ -43,8 +45,8 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import quote, unquote
 
-from . import (checkcap, checkdirs, checkspill, checkwait, checklane, cleantree, envfault, gatejudge, gatetime, gitcache, gitmemo, hoststate, landed, landmark, leakfile, locks, machines, outscan, pooladmit, prguard, prhead, remotecheck, remoteload, repoid, runner, runnerenv,
-               sandbox, scriptwatch, settinghold, setupfault, shorttmp, slurmcheck, syntaxfault, testslots, timefmt, workerloss, worktree)
+from . import (checkcap, checkdirs, checkspill, checkwait, checklane, cleantree, coordtools, envfault, gatejudge, gatetime, gitcache, gitmemo, hoststate, landed, landmark, leakfile, locks, machines, outscan, pooladmit, prguard, prhead, remotecheck, remoteload, repoid, runner, runnerenv,
+               sandbox, scriptwatch, settinghold, setupfault, shorttmp, slurmcheck, syntaxfault, testslots, timefmt, verified, workerloss, worktree)
 from .budget import DOC_SUFFIXES
 from .db import continues_id, dependency_ids, load_result
 from .project import (Project, code_tasks_may_push, durable_append, durable_write, git_fsync_env, hostname,
@@ -561,7 +563,20 @@ def _changed_reason(repo: Path, head: str, check: Check, base: str) -> str | Non
     files = [f for f in diff.stdout.splitlines() if f]
     if any(matches(files, g) for g in globs):
         return None
+    if not files and _adds_nothing(repo, base, head):
+        # An empty self-diff (the tip checked against itself, or a head already in base) proves nothing
+        # about scope: the check runs, so a skip is never read as that commit's pass.
+        return None
     return f"{head[:10]} changes nothing under {', '.join(globs)} since {base[:10]}"
+
+
+def _adds_nothing(repo: Path, base: str, head: str) -> bool:
+    """`head` has no commit beyond `base` (the same commit, or an ancestor of it). A git error reads as
+    adding nothing, so the check runs."""
+    if head == base:
+        return True
+    ahead = _git(repo, "rev-list", "--count", f"{base}..{head}")
+    return ahead.returncode != 0 or ahead.stdout.strip() == "0"
 
 
 def _tail(text: str) -> str:
@@ -991,17 +1006,31 @@ def run_slot(run: list, head: str, say: Callable[[str], None], priority: str = "
     """The slot a push's check run holds: check_slot only when one of `run` runs here and is no light
     check (checklane.is_light). Checks run on another host (remote_host) use none of this machine's
     CPU: they take no host-wide checks slot or test slots here and never wait for this machine's load
-    guard; they wait instead while their host is overloaded (remoteload.wait), at most
-    checks.push_load_wait_s, then go ahead."""
+    guard; they wait instead while their host's demand is near its cores (remoteload.wait), never
+    starting there while it is."""
     if proj is None and (base := os.environ.get("TTP_PROJECT")):
         proj = Project(base)
     cfg = proj.config() if proj else {}
+    claims: list = []
     if hosts := list(dict.fromkeys(h for c in run if (h := remote_host(c)))):
-        remoteload.wait(hosts, say, testslots.push_load_wait_s(cfg))
+        bound = testslots.push_load_wait_s(cfg)
+        remoteload.wait(hosts, say, bound)
+        from . import checkspill   # the host's check slots, claimed as `ttp checks` claims them (bounded here)
+        if (claims := checkspill.admit_pinned(proj, hosts, say, "push checks", bound=bound)) is None:
+            say(f"no check slot freed on {', '.join(hosts)} in {bound:.0f}s (checks.push_load_wait_s), "
+                "starting anyway")
+            claims = []
     pats = checklane.light_patterns(cfg)
     if any(not remote_host(c) and not checklane.is_light(str(c), pats) for c in run):
-        return check_slot(head, say, priority=priority, proj=proj)
-    return checkcap.Slot()
+        slot = check_slot(head, say, priority=priority, proj=proj)
+    else:
+        slot = checkcap.Slot()
+    if slot is not None and hasattr(slot, "pinned"):
+        slot.pinned = claims
+    else:
+        for c in claims:
+            c.close()
+    return slot
 
 
 def spill_slot(cmds: list, head: str, say: Callable[[str], None], proj: Project | None = None,
@@ -2756,6 +2785,8 @@ def _resolve(p: Project, repo: Path, own: bool = False) -> tuple[str, str, bool]
         raise ValueError(why)
     if m and task and m.group(1) == task:
         if os.environ.get(LAND_ENV):
+            if why := unreviewed_landing(p, repo, task, d):
+                raise ValueError(why)
             say = (f"ttp push: --land: task #{task} lands its own branch {branch} on {remote}/{push_to} "
                    f"(explicit override of the landing guard)")
             print(say, file=sys.stderr)
@@ -2786,6 +2817,41 @@ def code_run_landing(p: Project, task: str, upstream: str, d: dict) -> str:
     return (f"task #{task} is a code task and delivery.code_tasks_may_push is off: code tasks never push to "
             f"{upstream}, whatever the spec says, and `--land` does not change that. Commit, run `ttp checks` "
             f"and hand off; the review lands the change.{own}")
+
+
+def review_required(d: dict) -> bool:
+    """Whether delivery `d` has a review step, so each push needs an independent review first: the
+    harness's rule everywhere, delivery.review_before_pr (on unless set off) or a delivery.push_branch.
+    review.auto does not matter: with it off, reviews are queued by hand but still required."""
+    return bool(d.get("review_before_pr", True) or d.get("push_branch"))
+
+
+def unreviewed_landing(p: Project, repo: Path, task: str, d: dict) -> str:
+    """Why `ttp push --land` must not land task `task`'s HEAD, or "": where delivery wants a review
+    before each push (review_required), `--land` overrides only the landing step and the checks guard, never the review.
+    It lands only a head a passed review accepted: the `review` marker a passing review records for the
+    task or its lineage (verified.py) names exactly this commit. A review of an older head does not
+    cover a newer one. A review task's own run is the review and is not gated."""
+    if not review_required(d):
+        return ""
+    try:
+        t = p.db.task(int(task))
+    except (ValueError, TypeError):
+        return ""
+    if not t or t.get("kind") == "review":
+        return ""
+    head = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    for i in verified.lineage(p.db, t, include_self=True):
+        m = verified.own(p.db, i, "review")
+        if m and head and m.get("sha") == head:
+            return ""
+    m = verified.inherited(p.db, t, "review", include_self=True)
+    older = (f" The last passed review (#{m.get('review')}) accepted {str(m.get('sha'))[:10]}, not this "
+             f"commit; a review of an older head does not cover a newer one." if m else "")
+    return (f"task #{task}: `--land` needs a passed review of this exact commit ({head[:10]}), because this "
+            f"project's delivery has a review step (delivery.review_before_pr or delivery.push_branch), and no "
+            f"passed review covers it.{older} Commit, run `ttp checks` and "
+            f"hand off; the review lands the change")
 
 
 def untested_landing(p: Project, repo: Path, task: str, d: dict) -> str:
@@ -3244,7 +3310,8 @@ def backup(repo: Path, remote: str, branch: str, timeout_s: float = BACKUP_TIMEO
         return "gone", f"branch {branch} no longer exists"
     ref = f"refs/heads/{branch}"
     try:   # no leading + and no --force: git itself refuses anything but a fast-forward
-        out = subprocess.run(["git", "-C", str(repo), "push", "--porcelain", remote, f"{ref}:{ref}"],
+        from . import ghroute
+        out = subprocess.run(ghroute.push_argv(["git", "-C", str(repo), "push", "--porcelain", remote, f"{ref}:{ref}"]),
                              text=True, capture_output=True, timeout=timeout_s, stdin=subprocess.DEVNULL,
                              env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
     except subprocess.TimeoutExpired:
@@ -3253,7 +3320,8 @@ def backup(repo: Path, remote: str, branch: str, timeout_s: float = BACKUP_TIMEO
         return "pushed", head
     if any(ln.startswith("!") and "[rejected]" in ln for ln in out.stdout.splitlines()):
         return "not_ff", f"{remote}/{branch} has commits {branch} lacks"
-    return "failed", (out.stderr.strip() or out.stdout.strip())[-300:]
+    err = (out.stderr.strip() or out.stdout.strip())[-300:]
+    return "failed", " ".join(x for x in (err, ghroute.push_hint(err)) if x)
 
 
 def is_doc(path: str) -> bool:
@@ -3598,9 +3666,14 @@ def lock_name(remote: str, branch: str) -> str:
     return f"push:{remote}/{branch}"
 
 
+def lock_resource(remote: str, branch: str) -> str:
+    """The lock's resource name; the branch is quoted so its slashes stay in one name."""
+    return "push:" + quote(f"{remote}/{branch}", safe="")
+
+
 def lock_paths(p: Project, remote: str, branch: str) -> list[Path]:
-    """The lock file of pushes to remote/branch; the branch is quoted so its slashes stay in one name."""
-    return locks.slot_paths(p.state / "locks", "push:" + quote(f"{remote}/{branch}", safe=""), 1)
+    """The lock file of pushes to remote/branch."""
+    return locks.slot_paths(p.state / "locks", lock_resource(remote, branch), 1)
 
 
 def free_probe(p: Project) -> str:
@@ -3610,30 +3683,72 @@ def free_probe(p: Project) -> str:
     return f"{shlex.quote(str(ttp)) if ttp.is_file() else 'ttp'} push --free"
 
 
+STALL_S = 30   # the lock free this long while a waiter ahead does not take it: the next one takes it
+
+
+def _priority(p: Project) -> int | None:
+    try:
+        return checkcap.task_priority(p) if p else None
+    except Exception:   # an unreadable task only loses the ordering, never the wait
+        return None
+
+
 def take(p: Project, remote: str, branch: str, wait_s: float, poll_s: float = 1.0,
          say: Callable[[str], None] = lambda m: print(f"ttp push: {m}", file=sys.stderr),
          who: str | None = None):
-    """The held push lock of remote/branch, waiting up to `wait_s` for it; None when it stayed busy.
-    Inside a run the wait is recorded, so it does not count against the run's wall clock. `who`
-    labels the holder (default: the task and run, else the pid)."""
+    """The held push lock of remote/branch, waiting for it; None when it stayed busy.
+    Waiters queue beside the lock (locks.enqueue, with the task's priority): when it frees, the first
+    live one in turn takes it, an urgent or user-ordered task's (locks.my_turn) before the rest, each
+    in arrival order; a dead waiter's ticket drops out of the queue. `wait_s` counts from when this
+    waiter is first in line, so one behind others is never failed for their turns; one that stays
+    first in line while the lock stays busy gives up after `wait_s`. A waiter ahead that leaves the
+    lock free for STALL_S loses its turn to the next. `wait_s` 0: one try, no queue (the push queue's
+    batch). Inside a run the wait is recorded, so it does not count against the run's wall clock.
+    `who` labels the holder (default: the task and run, else the pid)."""
     paths = lock_paths(p, remote, branch)
+    locks_dir, resource = (p.state / "locks" if p else paths[0].parent), lock_resource(remote, branch)
     who = who or (f"task #{os.environ['TTP_TASK']} (run {os.environ.get('TTP_RUN_ID') or '?'})"
                   if os.environ.get("TTP_TASK") else f"pid {os.getpid()}")
-    f = locks.try_take(paths, who, "ttp push")
-    if f:
-        return f
+    if wait_s <= 0 or not locks.queued(locks_dir, resource):
+        f = locks.try_take(paths, who, "ttp push")
+        if f or wait_s <= 0:
+            return f
     name = lock_name(remote, branch)
-    say(f"waiting up to {wait_s:.0f} s for {name} (held by {', '.join(locks.holders_now(paths, p)) or 'another push'})")
-    run_dir = Path(os.environ["TTP_RUN_DIR"]) if os.environ.get("TTP_RUN_DIR") else None
     started = time.time()
+    try:
+        ticket = locks.enqueue(locks_dir, resource, who, since=started, priority=_priority(p))
+    except OSError:   # no queue: plain polling, in no fixed order
+        ticket = None
+    mine = ticket
+    waiting = len(locks.queued(locks_dir, resource)) - 1 if ticket else 0
+    say(f"waiting up to {wait_s:.0f} s, counted once first in line, for {name} (held by "
+        f"{', '.join(locks.holders_now(paths, p)) or 'another push'}"
+        + (f"; {waiting} other push(es) waiting" if waiting > 0 else "") + ")")
+    run_dir = Path(os.environ["TTP_RUN_DIR"]) if os.environ.get("TTP_RUN_DIR") else None
     key = f"push:{os.getpid()}:{started}"
     if run_dir:
         locks.record_wait(run_dir, key, started, None)
+    f, first_at, free_since = None, None, None
     try:
-        while not f and time.time() - started < wait_s:
-            time.sleep(max(0.0, min(poll_s, wait_s - (time.time() - started))))
-            f = locks.try_take(paths, who, "ttp push")
+        while True:
+            if ticket is not None and locks.dropped(ticket):
+                ticket = None
+            first = ticket is None or locks.my_turn(locks_dir, resource, ticket, 1)
+            now = time.time()
+            if first and first_at is None:
+                first_at = now
+                if ticket is not None and now - started >= poll_s:
+                    say(f"first in line for {name} after {now - started:.0f} s")
+            elif not first:
+                first_at = None   # a more urgent waiter came in ahead: its turn is not this one's wait
+            free_since = (free_since or now) if not first and locks.any_free(paths) else None
+            if first or (free_since and now - free_since >= STALL_S):
+                f = locks.try_take(paths, who, "ttp push")
+            if f or (first_at is not None and now - first_at >= wait_s):
+                break
+            time.sleep(max(0.0, poll_s if first_at is None else min(poll_s, wait_s - (now - first_at))))
     finally:
+        locks.dequeue(mine)
         if run_dir:
             locks.record_wait(run_dir, key, started, time.time())
     if f:
@@ -4425,11 +4540,11 @@ def _run_one(cmd: Any, repo: Path, env: dict, say: Callable[[str], None], seen: 
         # A landing's check (to the push branch, or `ttp land`) runs under a landing mark: a `ttp lock`
         # in it goes ahead of non-landing waiters (landmark.py). No other check inherits one.
         mark = landmark.hold() if env.get("TTP_PUSH_MODE") == "target" else None
-        guard = hoststate.Guard(env)   # the real crontab and units, compared after the check
         try:
+            argv = testslots.low_priority(check_argv(cmd, repo, env))
+            guard = hoststate.Guard(env, argv=argv)   # the real crontab and units, compared after a local check
             # own session: its group is ended once it ends (_end_group), or by checkgroup if this push dies first
-            proc = subprocess.Popen([*CHECK_GROUP, str(os.getpid()), "--",
-                                     *testslots.low_priority(check_argv(cmd, repo, env))], cwd=repo,
+            proc = subprocess.Popen([*CHECK_GROUP, str(os.getpid()), "--", *argv], cwd=repo,
                                     env={**{k: v for k, v in env.items() if k != landmark.ENV}, checkwait.ENV: str(waits),
                                          **({landmark.ENV: str(mark.path)} if mark else {}),
                                          # its run-time limit, for a sharded pool run's admission (pooladmit)
@@ -5341,7 +5456,7 @@ def _requeue(marker: Path, m: dict) -> bool:
     """Queue again, for the daemon to start (_tend_one), the push of `marker` that a host reboot cut
     short, while its retries last. True when it is queued (or another process is handling it right now:
     its run lock is taken), False to record it as failed."""
-    if not (_rebooted(m) and _restartable(m)):
+    if m.get("cancel_requested") or not (_rebooted(m) and _restartable(m)):
         return False
     if len(_retries(m)) >= retries_of(m.get("retry_max")):
         return False
@@ -5520,6 +5635,141 @@ def result(marker: Path, pushed_only: bool = False) -> int:
     return 0
 
 
+CANCEL_GRACE_S = 30   # `--cancel`: how long the push's group has after SIGTERM before SIGKILL
+CANCEL_KILL_S = 10    # and after SIGKILL, before the cancel reports it still running
+
+
+def _cancel_refusal(p: Project, marker: Path, m: dict) -> str:
+    """Why this process may not cancel the detached push of `marker`, or "": only the task that queued
+    it, this project's coordinator, or a person outside any run, and only a single push of this project
+    (never the push queue's batch process: its entries are cancelled with their tasks)."""
+    if marker.resolve().parent != (p.state / DETACHED).resolve():
+        return f"{marker} is not a detached push of this project"
+    if m.get("kind") == "batch":
+        return "that is the push queue's batch process; cancel the task whose entry it carries instead"
+    if coordtools.coordinator_run():
+        return ""
+    me, owner = os.environ.get("TTP_TASK") or "", str(m.get("task") or "")
+    if not me and not os.environ.get("TTP_RUN_ID"):
+        return ""
+    if me and me == owner:
+        return ""
+    return (f"that push was queued by {f'task #{owner}' if owner else 'no task'}, not by task #{me or '?'}: "
+            f"a task cancels only its own pushes (the project's coordinator may cancel any)")
+
+
+def _group_alive(pid: int) -> bool:
+    """Whether process group `pid` has a live member. A zombie (ended, its parent has not reaped it yet:
+    the daemon or launcher that started the push) is not one; it is read from /proc where there is one."""
+    proc = Path("/proc")
+    if proc.is_dir():
+        for d in proc.iterdir():
+            if not d.name.isdigit():
+                continue
+            try:
+                stat = (d / "stat").read_text()
+            except OSError:
+                continue
+            fields = stat[stat.rfind(")") + 2:].split()
+            if len(fields) > 2 and fields[2] == str(pid) and fields[0] not in ("Z", "X"):
+                return True
+        return False
+    try:
+        os.killpg(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _end_cancelled_group(marker: Path, pid: int, say: Callable[[str], None]) -> bool:
+    """Stop the push process `pid` of `marker` and every process of its group (its checks, git), TERM
+    then KILL: it was started as its own session (_start), so its pid is the group id. True once the
+    group is gone and the run lock is free."""
+    for sig, wait in ((signal.SIGTERM, CANCEL_GRACE_S), (signal.SIGKILL, CANCEL_KILL_S)):
+        try:
+            os.killpg(pid, sig)
+        except ProcessLookupError:
+            pass
+        except PermissionError as e:
+            say(f"ttp push: cannot signal process group {pid}: {e}")
+            return False
+        end = time.time() + wait
+        while time.time() < end:
+            if not _group_alive(pid) and locks.any_free([_run_lock(marker)]):
+                return True
+            time.sleep(0.2)
+    return not _group_alive(pid) and locks.any_free([_run_lock(marker)])
+
+
+def cancel(p: Project, marker: Path) -> int:
+    """`ttp push --cancel <marker>`: stop the detached push of `marker` before it lands. A queued one is
+    marked cancelled under its run lock, so the daemon never starts it; a running one has its process
+    group (the push, its checks and git) ended, TERM then KILL, which lets go of the run lock, the
+    check slots and the check scratch it held. The marker then reads `cancelled`, the run's notes and
+    the push's log record who cancelled it, and nothing lands. 0 when cancelled or already ended without
+    pushing, 1 when it pushed before the cancel took effect (or could not be stopped), REFUSED for a
+    missing marker or a push the caller may not cancel (_cancel_refusal)."""
+    marker = Path(marker)
+    m = _read(marker)
+    if not m:
+        print(f"ttp push: no detached push marker at {marker}", file=sys.stderr)
+        return REFUSED
+    if why := _cancel_refusal(p, marker, m):
+        print(f"ttp push: --cancel refused: {why}", file=sys.stderr)
+        return REFUSED
+    me = os.environ.get("TTP_TASK")
+    by = "the coordinator" if coordtools.coordinator_run() else f"task #{me}" if me else "hand"
+    say = lambda s: print(s, file=sys.stderr)   # noqa: E731
+    did = False
+    lock = locks.try_take([_run_lock(marker)], f"detached push {m.get('id')}", "ttp push --cancel")
+    if lock is not None:   # queued, or its process is gone: nothing runs it now, and nothing starts it
+        with lock:
+            m = _read(marker)
+            if m.get("status") in ("queued", "running"):
+                m.update(status="cancelled", exit=None, ended=time.time(), reason=f"cancelled by {by}")
+                write_json(marker, m)
+                did = True
+        _forget_lock(marker)
+    else:
+        m = _read(marker)
+        pid = m.get("pid")
+        if m.get("status") == "running" and isinstance(pid, int) and pid > 1:
+            did = True
+            m["cancel_requested"] = by   # a reboot's requeue (_requeue) never starts it again
+            write_json(marker, m)
+            say(f"ttp push: stopping the push process group {pid} (TERM, then KILL after {CANCEL_GRACE_S} s)")
+            if not _end_cancelled_group(marker, pid, say):
+                say(f"ttp push: the push of {marker.name} is still running; it was not cancelled")
+                return 1
+        m = _read(marker)
+        if did and m.get("status") in ("queued", "running", "failed") and not m.get("sha"):
+            m.update(status="cancelled", ended=m.get("ended") or time.time(), reason=f"cancelled by {by}")
+            write_json(marker, m)
+        _forget_lock(marker)
+    m = _read(marker)
+    if out := m.get("check_run_dir"):
+        try:   # a group ended by KILL never let go of its check scratch itself
+            checkdirs.finish(checkdirs.restore(p.state, out))
+        except (OSError, ValueError):
+            pass
+    if m.get("status") == "pushed":
+        say(f"ttp push: too late to cancel: it pushed {m.get('sha')} to {m.get('target')}")
+        return 1
+    text = f"ttp push: cancelled the push {marker.name} of {m.get('target') or 'no target'} ({by}); nothing landed"
+    if not did or m.get("status") != "cancelled":
+        text = f"ttp push: the push {marker.name} had already ended ({m.get('status')}); nothing to cancel"
+    else:
+        try:
+            _log_line(Path(m["log"]), text)
+        except (KeyError, OSError):
+            pass
+        run_note(text)
+    print(text)
+    return 0
+
+
 def unpushed(marker: Path) -> str:
     """Why the finished push of `marker` did not land (as `--result` reads it), or '' when it pushed,
     still runs, finished with nothing to push or its marker cannot be read: the daemon then wakes a
@@ -5585,7 +5835,6 @@ def stop_own(p: Project, marker: Path, why: str = "") -> int:
     after STOP_TERM_S only while it has not begun a `git push`. A push that began one is never signalled
     and keeps its marker: NOT_STOPPED. Only what the push itself held is freed (its process ends, so its
     run lock and any branch lock go with it); a push that already ended is left as it is (0)."""
-    from . import detach as job, jobstop   # `detach` here is this module's own function
     say = lambda m: print(f"ttp push: {m}", file=sys.stderr)   # noqa: E731
     marker = Path(marker).expanduser().resolve()
     folder = (p.state / DETACHED).resolve()
@@ -5642,7 +5891,7 @@ def stop_own(p: Project, marker: Path, why: str = "") -> int:
             if locks.any_free([run_lock]):
                 break
         for sig in sent:
-            job.signalled(marker, sig, pid, "push.stop_own", why, by="push", group=sig == signal.SIGKILL,
+            detachjob.signalled(marker, sig, pid, "push.stop_own", why, by="push", group=sig == signal.SIGKILL,
                              state=p.state, task=int(me))
         if not locks.any_free([run_lock]):
             say(f"not stopped: the push {marker.stem} " + ("began its git push, which is never interrupted"
@@ -5678,6 +5927,7 @@ def status_lines(p: Project) -> list[str]:
 # never inside a function: a push that outlives an upgrade of runtime/ must not import a newer batch
 # that calls into this older push (after_push would fail on a missing attribute). cli and pushpass
 # (for `ttp push --own` reusing a `ttp checks` pass) likewise: pushpass imports push at import time.
-from . import batch, cli, pushpass, verdictcarry  # noqa: E402
+from . import batch, cli, jobstop, pushpass, verdictcarry  # noqa: E402
+from . import detach as detachjob  # noqa: E402  (this module has its own `detach` function)
 
 # --- project-local imports below ---

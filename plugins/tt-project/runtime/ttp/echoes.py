@@ -37,7 +37,16 @@ that rule still binds, so its copies are right. Likewise a memory entry's retire
 never retires a phrase a current Restrictions item with its source (a user cite, origin: Brief or harness gate)
 or its heading states (_states: holds it whole, or as one run of its words apart from naming words and cites,
 such as 'the X restriction' or a heading quoted with its item): a hit on it is advisory (_current), wherever it
-stands; a user Correction or a charter replacement keeps its fix orders. A supersede whose only user cite names
+stands. So is a phrase a live memory entry holds whole (_live_holds): its superseder anywhere, itself included,
+or another entry anywhere but in that entry itself (an older copy of current words). One only part of it holds,
+or only the retired entry, keeps its class, and so does a live entry's own copy of words the user withdrew,
+unless it is the superseder (that copy is the one to fix). Accepted gap: while such a stale live copy stands,
+other places quoting the same words get no fix order from that retirement. A charter retirement likewise
+never retires a phrase a current sourced Restrictions item states (_states; sourced also by its structured
+record, restriction_source.recorded_items) or a memory entry written after it holds whole, that entry included:
+a rewording is no withdrawal. For both, a phrase that only cites user messages (_cite_only: an entry's
+citation header) is advisory while live memory or the charter still cites each of them (_msgs). A user
+Correction keeps its fix orders, and so does a charter replacement on every other phrase. A supersede whose only user cite names
 messages older than the entry it retires (where a rule came from, such as a current item's source) is one
 coordinator entry replacing another: SUPERSEDED (coordinator._withdrawn `since`). One the coordinator dropped on its own is SUPERSEDED, never
 WITHDRAWN, and one a record stored before the flag holds is UNVERIFIED (_unsourced). `export` is the read-only full list
@@ -46,8 +55,9 @@ suffix ('max-ratio-1.5') counts as weak; a version joined by '_', '=' or '+' cou
 
 A false positive (code using a name the retired text also holds) can be acknowledged: `ttp echoes --ack
 <retirement> <place>` (acknowledge, ACK_KEY) keeps that one match out of the digest's fix orders while the
-matched line's text is unchanged; it is still counted and listed as acknowledged, and a changed line lists
-it again. `ttp echoes --ack-phrase <retirement> <phrase>` (acknowledge_phrase) covers one phrase of one
+place holds the same phrases of that retirement (_line_sha): lines that only re-quote an acked phrase keep
+it; it is still counted and listed as acknowledged, and a new or changed phrase lists it again.
+`ttp echoes --ack-phrase <retirement> <phrase>` (acknowledge_phrase) covers one phrase of one
 retirement at every place it matches, while the retirement lives. The strong/weak rules are untouched by it.
 
 A coordinator's own decision (a memory decision entry citing no user words) retired without the user's
@@ -73,7 +83,7 @@ SEEN_KEY = "retired_echo_seen"       # kv: {"turn": last_coordinator_turn, "hits
                                      #      "historical": hits declared historical, not listed,
                                      #      "advisory": advisory hits, counted, not listed}
 WITHDRAWN, COMPACTED, SUPERSEDED = "withdrawn", "compacted", "superseded"   # retirement kinds (see the top)
-ACK_KEY = "retired_echo_acks"       # kv: {hit key: sha256 of the matched line when acknowledged}
+ACK_KEY = "retired_echo_acks"       # kv: {hit key: sha256 of the phrases the place held when acknowledged}
 ACK_KEEP = 200
 ACK_PHRASE = "phrase"                # ACK_KEY value of "<retirement>:phrase:<phrase>": that phrase, at every place
 UNVERIFIED = "unverified"
@@ -422,9 +432,16 @@ def _line(text: str, phrase: str) -> str:
 
 
 def _line_sha(text: str, phrases_: list[str]) -> str:
-    """The sha256 of every line of `text` holding one of `phrases_`, whitespace collapsed, in order (all of it
-    when none does: a phrase across lines): an acknowledgement holds while they are unchanged, so an edited
-    line or a new copy elsewhere in the place lists the match again. Moving them keeps it."""
+    """The sha256 of which of `phrases_` `text` holds (a phrase across lines too), not of the lines: an
+    acknowledgement holds while that set is unchanged, so an added line or edit that only re-quotes an acked
+    phrase keeps it, and a new or changed phrase of the retirement in the place lists the match again."""
+    flat = _flat(text)
+    return hashlib.sha256("\n".join(sorted({ph for ph in phrases_ if ph in flat})).encode()).hexdigest()
+
+
+def _legacy_line_sha(text: str, phrases_: list[str]) -> str:
+    """The sha256 an ack stored before acks were keyed by phrase (every line holding a phrase, in order),
+    so those acks hold until their place changes; new acks store _line_sha."""
     lines = [" ".join(ln.split()) for ln in text.splitlines() if any(ph in _flat(ln) for ph in phrases_)]
     return hashlib.sha256("\n".join(lines or [" ".join(text.split())]).encode()).hexdigest()
 
@@ -588,10 +605,20 @@ def _superseders(rec: dict, recs: list[dict], live: dict[str, str]) -> str:
     return " ".join(out)
 
 
-def _current(charter: str) -> list[str]:
+def _live_holds(live: dict[str, str], ph: str, rec: dict) -> set[str]:
+    """The live memory entries (place keys; `live` maps entry names to their flattened text) holding `ph`
+    whole that make it current for memory retirement `rec`: the superseder its source names counts everywhere
+    ("*"); any other entry counts everywhere but in itself, so the result is that entry's key alone when it is
+    the only one."""
+    m = re.search(r"superseded by \[([^\]]+)\]", rec.get("source") or "")
+    keys = {f"memory:{name}" for name, flat in live.items() if _hit({}, flat, [ph])}
+    return {"*"} if m and f"memory:{m.group(1)}" in keys else keys
+
+
+def _current(charter: str, recorded: set[str] | frozenset = frozenset()) -> list[str]:
     """The flattened text of each current Restrictions item that binds (restriction_source.sourced: a user
     cite, the Brief or a harness gate, its own or its sub-heading's), with the heading (section or
-    sub-heading) it stands under, alone and followed by the item."""
+    sub-heading) it stands under, alone and followed by the item. `recorded`: restriction_source.recorded_items."""
     from .prompts import charter_sections
     from .restriction_source import sourced, split_items
     out: list[str] = []
@@ -604,10 +631,10 @@ def _current(charter: str) -> list[str]:
             text = " ".join(" ".join(it).split())
             if text.startswith("#"):
                 name = text.lstrip("#").strip()
-                cited = sourced(name)   # a cite on the sub-heading itself covers its items
+                cited = sourced(name, recorded)   # a cite on the sub-heading itself covers its items
                 if cited:
                     out.append(_flat(name))
-            elif cited or sourced(text):
+            elif cited or sourced(text, recorded):
                 out += [_flat(text), _flat(name), _flat(f"{name} {text}")]
     return list(dict.fromkeys(out))
 
@@ -642,6 +669,25 @@ def _states(units: list[str], ph: str) -> bool:
     return False
 
 
+# A cite of user messages: "user msg #4", "user messages #4, #5", "msg #4/#6" (the numbers, _msgs).
+_MSG_CITE = re.compile(r"\b(?:user(?:'s|s)?\s+(?:msgs?|messages?)?|msgs?|messages?)\s*(#\d+(?:\s*(?:,|/|&|and)\s*#\d+)*)")
+# What a phrase that only cites holds besides message numbers: cite words, dates and punctuation (_cite_only).
+_CITE_WORDS = re.compile(r"\b(?:user|users|owner|owners|agent|agents|relayer|relayer-ordered|msgs?|messages?|orders?|"
+                         r"words?|verbatim|via|per|by|from|in|the|and|cited?|cites|see|origin|s)\b|#\d+|"
+                         r"\d{4}-\d{2}-\d{2}|[^\w#]+")
+
+
+def _msgs(text: str) -> set[str]:
+    """The user message numbers `text` cites (_MSG_CITE)."""
+    return {n for m in _MSG_CITE.finditer(text.lower()) for n in re.findall(r"\d+", m.group(1))}
+
+
+def _cite_only(ph: str) -> bool:
+    """Whether phrase `ph` only cites user messages, such as an entry's citation header ("owner's order, user
+    msg #12"): message numbers, cite words and dates, nothing that states a rule."""
+    return bool(_msgs(ph)) and not _CITE_WORDS.sub("", ph).strip()
+
+
 def records(p, now: float | None = None) -> list[dict]:
     """The live retirements (kept RETIRED_DAYS), each with its kind (see _kind; _unsourced)."""
     now = time.time() if now is None else now
@@ -657,8 +703,8 @@ def scan(p, now: float | None = None, historical: list[dict] | None = None,
     phrase: fix it) or "advisory" (another kind, only a _weak or _fragment phrase matched, or a dropped
     unsourced Restrictions item the Brief or a sourced item still states: `why` says which). A hit on
     a file the historical index declares historical for that retirement, with its bytes still hashing to
-    the recorded value, goes to `historical` instead (class "historical"); an acknowledged hit whose line is
-    unchanged (ACK_KEY) to `acked` (class "acknowledged")."""
+    the recorded value, goes to `historical` instead (class "historical"); an acknowledged hit whose place
+    holds the same phrases (ACK_KEY) to `acked` (class "acknowledged")."""
     recs = records(p, now)
     if not recs:
         return []
@@ -673,8 +719,12 @@ def scan(p, now: float | None = None, historical: list[dict] | None = None,
         charter = p.charter_path.read_text()
     except OSError:
         charter = ""
-    units = _current(charter)
+    from .project import _stamp_ts
+    from .restriction_source import history_items
+    units = _current(charter, history_items(p))
     live = {key[7:]: flat for key, _, _, flat in where if key.startswith("memory:")}
+    born = {e["name"]: _stamp_ts(e.get("created") or "") for e in p._memory_entries()}
+    cited = _msgs(" ".join(live.values()) + " " + charter)   # messages live memory or the charter still cites
     out, seen = [], set()
     for rec in sorted(recs, key=lambda r: -r.get("at", 0)):
         kept = _superseders(rec, recs, live)
@@ -687,8 +737,19 @@ def scan(p, now: float | None = None, historical: list[dict] | None = None,
             from .restriction_audit import still_stated
             stated = still_stated(charter, rec.get("old") or "")
         weak = {ph for ph in own if _weak(ph) or _fragment(ph, rec.get("old") or "")}
-        # A memory entry's retirement never retires what a current cited Restrictions item still states.
-        cur = {ph for ph in own if _states(units, ph)} if _MEMORY_RETIRED.match(rec.get("source") or "") else set()
+        # A memory entry's retirement never retires what a current cited Restrictions item or a live entry states;
+        # a charter one, what a current cited Restrictions item or a memory entry written after it states.
+        mem = bool(_MEMORY_RETIRED.match(rec.get("source") or ""))
+        chart = not mem and (rec.get("source") or "").lower().startswith("charter ")
+        stated_now = {ph for ph in own if _states(units, ph)} if mem or chart else set()
+        later = {n: flat for n, flat in live.items() if born.get(n, 0) > rec.get("at", 0)}
+        held = ({ph: _live_holds(live, ph, rec) for ph in own if ph not in stated_now} if mem else
+                {ph: {"*"} if any(_hit({}, flat, [ph]) for flat in later.values()) else set()
+                 for ph in own if ph not in stated_now} if chart else {})
+        # A phrase that only cites user messages (a citation header) is current while live memory or the
+        # charter still cites every one of them: the rule that came from them lives on in another wording.
+        cites = {ph for ph in own if (mem or chart) and _cite_only(ph) and _msgs(ph) <= cited}
+        cur = stated_now | cites | {ph for ph, keys in held.items() if keys}
         own.sort(key=lambda ph: ph in weak or ph in cur)   # a governing phrase first: a hit rests on it when it can
         skip = set(rec.get("skip") or ())
         mine = _own_decision(rec)
@@ -702,7 +763,10 @@ def scan(p, now: float | None = None, historical: list[dict] | None = None,
                 if key.startswith("file:"):
                     label += f":{_lineno(text, ph)}"
                 why = (f"still stated in {stated}: no action" if stated else
-                       "a current Restrictions item with its source states it: no action" if ph in cur else
+                       "a current Restrictions item with its source states it: no action" if ph in stated_now else
+                       "a live memory entry states it: no action" if held.get(ph, set()) - {key} else
+                       "it only cites user messages live memory or the charter still cites: no action"
+                       if ph in cites else
                        "a coordinator's own decision retired, no user rule withdrawn: no action" if mine else
                        "" if rec["kind"] == WITHDRAWN and ph not in weak else
                        "origin not recorded: nothing shows the user withdrew this rule" if rec["kind"] == UNVERIFIED
@@ -711,7 +775,7 @@ def scan(p, now: float | None = None, historical: list[dict] | None = None,
                 hit = {"key": f"{rec['id']}:{key}", "label": label, "line": _line(text, ph), "phrase": ph,
                        "source": rec.get("source") or "", "retirement": rec["id"], "kind": rec["kind"],
                        "class": "advisory" if why else "directive", "why": why, "sha": _line_sha(text, own)}
-                if acks.get(hit["key"]) == hit["sha"] or ph in okd:
+                if acks.get(hit["key"]) in (hit["sha"], _legacy_line_sha(text, own)) or ph in okd:
                     if acked is not None:
                         acked.append(dict(hit, **{"class": "acknowledged"}))
                     continue
@@ -771,11 +835,11 @@ def digest_lines(p, now: float | None = None) -> list[str]:
         lines.append(f"- {len(hist)} historical line{'s' if len(hist) != 1 else ''} not shown (declared in {where})")
     if acked:   # acknowledged as false positives: counted, never silently dropped
         lines.append(f"- {len(acked)} acknowledged match{'es' if len(acked) != 1 else ''} not shown (`ttp echoes --ack`;"
-                     f" listed again once its line changes)")
+                     f" listed again once a new phrase shows there)")
     if advisory:   # counted, never a fix order
         lines.append(f"- {advisory} advisory match{'es' if advisory != 1 else ''} not shown: a compacted fact, a "
                      f"coordinator's own decision, a retirement of unknown origin, a name a current cited "
-                     f"Restrictions item states or only a file name, version "
+                     f"Restrictions item or a live memory entry states or only a file name, version "
                      f"or evidence reference, never a rule the user withdrew; change nothing for them (all: "
                      f"`ttp echoes`)")
     return lines
@@ -783,8 +847,8 @@ def digest_lines(p, now: float | None = None) -> list[str]:
 
 def acknowledge(p, retirement: str, where: str, now: float | None = None) -> dict:
     """Acknowledge retirement `retirement`'s current match at `where` (a file's `<path>:<line>`, a place as
-    `ttp echoes` names it, or its key) as no echo: hidden while that line's text is unchanged, listed again
-    once it changes. Stored in the project's kv (ACK_KEY); acks of retirements no longer live are dropped.
+    `ttp echoes` names it, or its key) as no echo: hidden while that place holds the same phrases of it, listed
+    again once a new or changed one shows there. Stored in the project's kv (ACK_KEY); acks of retirements no longer live are dropped.
     Raises ValueError when no current match fits."""
     where = " ".join(where.split())
     acked: list[dict] = []

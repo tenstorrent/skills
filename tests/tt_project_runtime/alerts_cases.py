@@ -341,7 +341,6 @@ def test_a_login_ask_or_notify_needs_a_real_auth_failure(env, text):
 
 
 @pytest.mark.parametrize("text", [
-    "gh on the device box is logged out, so Claude cannot push. Please run gh auth login again there.",
     "The Slurm account token expired; please re-authenticate with kinit so the claude workers can submit jobs.",
     "The build server's SSO session expired, so codex runs cannot fetch artifacts; please log in again there.",
     "Claude cannot reach the device box: the host is logged out after the reboot. Please log in again on the console.",
@@ -359,7 +358,7 @@ def test_a_login_ask_or_notify_needs_a_real_auth_failure(env, text):
 def test_a_login_ask_about_another_credential_is_never_refused(env, text):
     """Reviews #2338 and #2354: the gate refuses only a login of the agent CLI itself (the provider is
     grammatically what is logged in) or one citing a plan-metering cue. An ask
-    about another credential or tool (gh, Slurm, kinit, SSO, a host) that only names a provider in
+    about another credential or tool (Slurm, kinit, SSO, a host) that only names a provider in
     passing is a real ask, sent with no auth breaker open. The test-only fake provider is no name to
     match unless the project's config uses it."""
     from ttp import alerts, coordinator as coord
@@ -1376,6 +1375,36 @@ def test_pr_watch_drops_flags_for_cancelled_tasks_and_prs_it_cannot_read(env, mo
 
 
 
+def test_health_counts_a_command_watcher_naming_a_pr_or_its_repo_as_pr_coverage(env):
+    """A project that may keep no gh login on its host watches its open PRs with its own command watcher:
+    one naming the PR, or its repo beside a PR word, covers it (report-only), so health never lists those
+    PRs as missing forever. A watcher naming only another repo, or the repo without any PR word, does not."""
+    from ttp import responsibilities
+    p = make(env)
+    p.db.x("DELETE FROM schedules WHERE kind='watcher'")
+    urls = ["https://github.com/example-org/widgets/pull/7", "https://github.com/example-org/gadgets/pull/3",
+            "https://github.com/example-org/other/pull/5"]
+    for url in urls:
+        p.db.x("INSERT INTO tasks(title,kind,status,pr_url,created) VALUES(?,?,?,?,?)",
+               ("t", "code", "done", url, time.time()))
+
+    def pr_items():
+        return {i["name"]: i for i in responsibilities.inventory(p) if i["kind"] == "pr"}
+    assert all(not i["covered_by"] for i in pr_items().values())
+    for name, cmd in (("one-pr", "bin/pr_state.sh example-org/widgets#7"),
+                      ("repo-prs", "curl -s https://api.github.com/repos/example-org/gadgets/pulls"),
+                      ("repo-ci", "bin/ci_state.sh example-org/other/actions"),
+                      ("near-miss", "gh pr list -R example-org/other-fork")):
+        p.db.x("INSERT INTO schedules(name,kind,every_s,enabled,payload) VALUES(?,'command',600,1,?)",
+               (name, json.dumps({"command": cmd})))
+    items = pr_items()
+    assert items[urls[0]]["covered_by"] == ["one-pr"] and items[urls[0]].get("report_only")
+    assert items[urls[1]]["covered_by"] == ["repo-prs"] and items[urls[1]].get("report_only")
+    assert items[urls[2]]["covered_by"] == [], items[urls[2]]
+    p.db.x("INSERT INTO schedules(name,kind,every_s,enabled,payload) VALUES('prs','watcher',600,1,'{}')")
+    assert all(i["covered_by"] == ["builtin: PR watcher prs"] for i in pr_items().values())
+
+
 def test_pr_watch_reads_only_real_pr_urls_and_a_hand_off_stores_no_other(env, monkeypatch):
     """Only a /pull/<n> URL or owner/repo#N is watched and counted as a PR: 'none', a branch tree URL or
     an empty value never gets a signature, so it is skipped before any gh call, not re-read every run.
@@ -2099,7 +2128,7 @@ def test_a_failed_batched_read_fails_its_prs_or_lets_each_ask_gh(env, monkeypatc
     if fail == "hang":
         assert status.startswith("cut short (0 of 5") and "acme/widgets#1 (5 s gh call timeout)" in status, status
     elif "401" in fail[1]:   # a logged-out gh is an error, never ok
-        assert status.startswith("error: gh is not logged in") and "gh auth login" in status, status
+        assert status.startswith("error: degraded: gh has no login") and "delivery.gh_route" in status, status
     else:
         assert status == "ok (5 PRs, 0 changed)", status
 
@@ -4610,15 +4639,13 @@ def test_a_failing_call_between_the_tick_step_loops_does_not_stop_dispatch_or_de
     assert f"RuntimeError: {bare} broke" in logged
 
 
-@pytest.mark.parametrize("bare", ["net_held", "_net_may_probe", "host_cycle_held"])
+@pytest.mark.parametrize("bare", ["net_held", "host_cycle_held"])
 def test_a_failing_hold_check_does_not_stop_dispatch_or_delivery(env, bare):
-    """net_held, _net_may_probe and host_cycle_held run guarded with a False default: one that raises
+    """net_held and host_cycle_held run guarded with a False default: one that raises
     is logged and dispatch and deliver_outbound still run in that tick."""
     p = make(env)
     calls: list[str] = []
     d = _failing_step_daemon(p.base, calls)
-    if bare == "_net_may_probe":
-        d.net_held = lambda prov: True   # so that the probe check is reached
 
     def broken(*a, **k):
         raise RuntimeError(f"{bare} broke")
@@ -5502,8 +5529,8 @@ def test_an_orphan_user_machine_page_reaches_no_unrelated_chat_and_shows_in_stat
     Daemon(b.base).route_machines(every_s=0)   # proj-b's charter does not list box-1
     assert not b.db.one("SELECT id FROM messages WHERE kind='alert' AND text LIKE 'A risky machine change%'")
     assert "undelivered machine page (no project here may deliver it" in status_text(b)
-    c.charter_path.write_text("# proj-c\n\n## Goals\nGo.\n\n## Resources\n- box-1: a device machine.\n")
-    Daemon(c.base).route_machines(every_s=0)   # a project whose charter lists the machine may deliver it
+    c.set_config("machines.allowed", ["box-1"])
+    Daemon(c.base).route_machines(every_s=0)   # a project whose config lists the machine may deliver it
     got = c.db.one("SELECT text FROM messages WHERE kind='alert' AND text LIKE 'A risky machine change%#1 %'")
     assert got, "the listing project's chat gets it"
     assert ml.orphan_lines() == []
@@ -5654,3 +5681,92 @@ def test_the_notifier_agent_runs_at_standard_priority_and_an_old_background_one_
     plist.write_bytes(plistlib.dumps({**plistlib.loads(plist.read_bytes()), "ProcessType": "Background"}))
     assert notifier.refresh(send_test=False)[0].startswith("desktop notifier: installed and started (launchd)")
     assert plistlib.loads(plist.read_bytes())["ProcessType"] == "Standard"
+
+
+def test_a_dns_failure_holds_coordinator_turns_across_daemons_and_one_turn_starts_once_it_resolves(
+        env, monkeypatch):
+    """The field case: the API host did not resolve and a coordinator turn started every few minutes,
+    each lost after retrying EAI_AGAIN, while a user message waited. The hold stops every turn, the
+    overseer's wake (a Daemon of its own) too, and the turn after the host resolves answers the message."""
+    from ttp import daemon as dm
+    p = make(env)
+    monkeypatch.setattr(dm, "_proxied", lambda: False)
+    monkeypatch.setattr(dm, "_background", lambda fn: fn())
+    monkeypatch.setattr(dm, "REACH_EVERY_S", 0)   # each call looks the host up again
+    up = [False]
+    monkeypatch.setattr(dm, "_resolves", lambda host: up[0])
+    d = dm.Daemon(p.base)
+    core = d.cfg.get("core_provider") or "claude"
+    monkeypatch.setattr(type(dm.get_provider(core)), "reach_host", lambda self, env=None: "api.example.com")
+    started = []
+
+    def start_run(role, prompt, *a, **k):
+        started.append(role)
+        return p.db.x("INSERT INTO runs(role,started,status) VALUES('coordinator',?,'ok')", (time.time(),))
+    d.hold_offline(core, "Can't reach the API server (EAI_AGAIN)")
+    p.db.x("INSERT INTO messages(ts,direction,chat,text,handled) VALUES(?,?,?,?,0)", (time.time() - 600, "in", "web", "hi"))
+    wake = dm.Daemon(p.base)
+    for daemon in (d, wake):
+        monkeypatch.setattr(daemon, "start_run", start_run)
+        for _ in range(3):
+            daemon.maybe_coordinate()
+    assert started == [] and p.db.kv(dm.NET_HOLDS_KEY)[core]["host"] == "api.example.com"
+    up[0] = True
+    d.maybe_coordinate()
+    assert started == ["coordinator"] and p.db.kv(dm.NET_HOLDS_KEY) is None
+
+
+def test_a_net_hold_whose_lookup_never_passes_still_lets_one_coordinator_turn_try_every_net_hold_max_s(
+        env, monkeypatch):
+    """Review #8135: the CLI reaches the API through a proxy only it knows, so the API host never resolves
+    here; a host sleep held the core provider and no worker task runs on it. A user message must still be
+    answered: one coordinator turn starts once the hold is NET_HOLD_MAX_S old, none before, and the next
+    only NET_HOLD_MAX_S after that try, through tick too and after a restart (the hold is kept in kv)."""
+    from ttp import daemon as dm
+    p = make(env)
+    monkeypatch.setattr(dm, "_proxied", lambda: False)
+    monkeypatch.setattr(dm, "_background", lambda fn: fn())
+    monkeypatch.setattr(dm, "REACH_EVERY_S", 0)
+    monkeypatch.setattr(dm, "_resolves", lambda host: False)
+    clock = [10_000.0]
+    monkeypatch.setattr(dm.time, "monotonic", lambda: clock[0])
+    d = dm.Daemon(p.base)
+    core = d.cfg.get("core_provider") or "claude"
+    monkeypatch.setattr(type(dm.get_provider(core)), "reach_host", lambda self, env=None: "api.example.com")
+    started = []
+
+    def start_run(role, prompt, *a, **k):
+        started.append(role)
+        p.db.x("UPDATE messages SET handled=1")
+        return p.db.x("INSERT INTO runs(role,started,status) VALUES('coordinator',?,'ok')", (time.time(),))
+
+    def ask(text):
+        p.db.x("INSERT INTO messages(ts,direction,chat,text,handled) VALUES(?,?,?,?,0)",
+               (time.time() - 600, "in", "web", text))
+    d.hold_offline(core, "the host slept")
+    ask("hi")
+    monkeypatch.setattr(d, "start_run", start_run)
+    for _ in range(3):
+        d.maybe_coordinate()
+    clock[0] += dm.NET_HOLD_MAX_S - 1
+    d.maybe_coordinate()
+    assert started == []
+    clock[0] += 1
+    d.maybe_coordinate()
+    d.maybe_coordinate()
+    assert started == ["coordinator"] and p.db.kv(dm.NET_HOLDS_KEY)[core]["host"] == "api.example.com"
+    ask("still there?")
+    clock[0] += dm.NET_HOLD_MAX_S - 1
+    d.maybe_coordinate()
+    assert started == ["coordinator"]
+    # A restart (or the overseer's wake) keeps a young saved hold but drops one NET_HOLD_MAX_S old,
+    # so it checks the network afresh: one turn starts.
+    saved = p.db.kv(dm.NET_HOLDS_KEY)   # the fake monotonic clock moved; wall time did not: age it as it would
+    p.db.set_kv(dm.NET_HOLDS_KEY, {core: {**saved[core], "at": time.time() - 60}})
+    assert core in dm.Daemon(p.base)._net_holds
+    p.db.set_kv(dm.NET_HOLDS_KEY, {core: {**saved[core], "at": time.time() - 2 * dm.NET_HOLD_MAX_S}})
+    wake = dm.Daemon(p.base)
+    monkeypatch.setattr(wake, "start_run", start_run)
+    assert not wake.net_held(core)
+    wake.maybe_coordinate()
+    assert started == ["coordinator"] * 2

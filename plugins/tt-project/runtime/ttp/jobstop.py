@@ -22,6 +22,7 @@ end() does it in this order:
    holding 137 (detach.record_stop) unless the job wrote its own, so a reader of the .rc alone sees it ended.
 4. The job's own lock and every lock slot whose label names the job's .rc (locks.job_fields) are
    checked; a slot still held by a process of the stopped group is freed by ending that process.
+   The job's own lock file, once free, is removed (drop_lock), so no reader finds it naming a dead pid.
 5. One event names the task, job, group, broker jobs ended and locks freed.
 
 The same pass stops such a task's detached `ttp checks` (checks.pid in any of its runs, end_checks):
@@ -63,6 +64,7 @@ the caller, a running worker, another task's or another project's process is ref
 """
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
@@ -214,6 +216,27 @@ def group_of(rc: Path) -> int:
 def running(rc: Path) -> bool:
     """Whether any process of the job still lives: its job lock is held."""
     return not locks.any_free([locks.job_lock(Path(rc))])
+
+
+def drop_lock(rc: Path) -> bool:
+    """Remove the job lock file of a job that is over (locks.job_ended: its .rc or .lost written), taken
+    first so a holder that still lives keeps it: no reader finds a stale label naming a dead pid. True
+    when removed."""
+    path = locks.job_lock(Path(rc))
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_APPEND)
+    except OSError:
+        return False
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if not locks.job_ended(Path(rc)):
+            return False
+        path.unlink()
+        return True
+    except OSError:   # still held, or already gone
+        return False
+    finally:
+        os.close(fd)
 
 
 # Broker jobs ------------------------------------------------------------------------------------
@@ -456,6 +479,8 @@ def end(p: Project, rc: Path, why: str, task: int | None = None, reason: str = "
         task=task))
     if pgid or not held:   # its wrapper is gone, so no exit code comes: the stop's own (detach.record_stop)
         detach.record_stop(rc, why)
+    if locks.job_lock(rc).name not in held:
+        drop_lock(rc)
     out = {"task": task, "job": rc.stem, "rc": str(rc), "pgid": pgid, "broker_jobs": ids, "freed": freed,
            "held": held, "requeued": extra, "note": note if pgid else "no live process group found for it",
            **(fields or {})}

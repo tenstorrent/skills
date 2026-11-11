@@ -15,7 +15,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import overview, project, timefmt
+from . import overview, project, service, timefmt
 from .db import SEVERITY_RANK
 
 CHECKS = "deploy_checks"
@@ -29,6 +29,7 @@ TAKEOVER_TRIES = 3
 TAKEOVER_SETTLE_S = 300          # after an attempt ends, its daemon has this long to report the release
 TAKEOVER_TIMEOUT_S = 900         # an attempt running this long is over (stopped, when this daemon started it)
 RESUME_GRACE_S = 6 * 3600        # a paused project's upgrade, once it is resumed, is its own again for this long
+OWNER_WAIT_S = 6 * 3600          # a takeover that deferred (exit 75) to a live merge task waits this long, at most
 PAUSED_NOTE = "{name} paused; upgrades when resumed"
 _children: dict[str, subprocess.Popen] = {}   # this daemon's own attempts, by project name
 
@@ -206,10 +207,19 @@ def _merge_event(p, rec: dict, row: dict, now: float) -> None:
             f"its next merge task at once; `ttp upgrade {name}` on unchanged files only defers it).", "queued"))
 
 
+def _live_owner(row: dict, now: float) -> str:
+    """The open harness task holding the merge while it still works on it: neither blocked nor idle past
+    release.STALE_S (overview's takeover_at for it lies ahead). "" when there is none."""
+    owner = str(row.get("merge_owner") or "")
+    live = row.get("merge_pending") and _owner_task({"owner": owner}) and float(row.get("takeover_at") or 0) > now
+    return owner if live else ""
+
+
 def _judge(p, rec: dict, row: dict, t: dict, now: float, start: bool = False) -> tuple[str, str, str]:
     """assess, then _takeover: the outcome of one probe `row` of `rec`."""
     _merge_event(p, rec, row, now)
-    return _takeover(p, rec, *assess(rec, row, now, p), t, now, start, paused=bool(row.get("paused")))
+    return _takeover(p, rec, *assess(rec, row, now, p), t, now, start, paused=bool(row.get("paused")),
+                     owner=_live_owner(row, now))
 
 
 def _owner_task(rec: dict) -> int | None:
@@ -289,7 +299,7 @@ def _reap(name: str, t: dict, now: float, p=None) -> None:
 
 
 def _takeover(p, rec: dict, outcome: str, kind: str, reason: str, t: dict, now: float,
-              start: bool = False, paused: bool = False) -> tuple[str, str, str]:
+              start: bool = False, paused: bool = False, owner: str = "") -> tuple[str, str, str]:
     """A merge past its takeover deadline is taken over, not only reported: a host-side `ttp upgrade` runs
     (`start`, by the daemon's tick; started from the first probe past the deadline, also after a restart or
     a reboot), up to TAKEOVER_TRIES times, TAKEOVER_SETTLE_S apart. Meanwhile it is pending; it fails (and
@@ -297,12 +307,15 @@ def _takeover(p, rec: dict, outcome: str, kind: str, reason: str, t: dict, now: 
     A `paused` project's upgrade merges its files and restarts it, still paused; one that defers (exit 75:
     the merge needs its harness task) is parked, not retried: pending ("paused"), one low note, and once
     the project is resumed its own task and daemon get RESUME_GRACE_S before the takeover is due again.
+    A try that deferred (exit 75) while `owner`, a live merge task (_live_owner), holds the merge waits for
+    that task to end and spends no try; past OWNER_WAIT_S of such waiting the owner is reported stuck.
     `t` is the project's attempt record, updated in place."""
     name = rec["name"]
     if t.get("noted") and not paused:       # resumed: the upgrade is the project's own again, for a while
         t.pop("noted", None)
         t.pop("parked", None)
         t["tries"] = 0
+        t.pop("owner_wait", None)
         rec["due"] = max(float(rec.get("due") or 0), now + RESUME_GRACE_S)
         if p is not None:
             _log(p, name, f"{name} was resumed: its own merge task and daemon take the upgrade on; the takeover "
@@ -324,6 +337,19 @@ def _takeover(p, rec: dict, outcome: str, kind: str, reason: str, t: dict, now: 
             p.db.post("out", PAUSED_NOTE.format(name=name) + f" (tt-project {rec['target']}: its template merge "
                       f"needs its own harness task; nothing to do).", kind="info", severity="low")
         return "pending", "paused", f"{PAUSED_NOTE.format(name=name)}; {reason}"
+    if tries and t.get("rc") == "exit 75" and owner:
+        since = float(t.setdefault("owner_wait", now))
+        if now - since < OWNER_WAIT_S:      # the merge has a live owner: wait for it, no try spent
+            return "pending", "", (f"host-side takeover deferred (exit 75) to {owner}, which still works on the "
+                                   f"merge: waiting for it to end (until {timefmt.long(since + OWNER_WAIT_S, p)} at "
+                                   f"most), no try spent; {reason}")
+        if p is not None and not t.get("gave_up"):
+            t["gave_up"] = now
+            _log(p, name, f"takeover not retried: {owner} still holds the merge after "
+                          f"{OWNER_WAIT_S / 3600:g} h of waiting (stuck owner)")
+        return "failed", kind, (f"{reason}; stuck owner: {owner} still holds the merge after "
+                                f"{OWNER_WAIT_S / 3600:g} h; the host-side takeover deferred to it (exit 75) "
+                                f"(see {name}'s logs/takeover.log)")
     if tries and now < float(t.get("ended") or 0) + TAKEOVER_SETTLE_S:
         return "pending", "", f"host-side takeover ended ({t.get('rc')}); its daemon is checked again; {reason}"
     if tries >= TAKEOVER_TRIES:
@@ -446,6 +472,7 @@ def record(p, report: dict, now: float | None = None) -> dict:
                 t["tries"] = 0     # a new release gets its own tries (a paused project: its own files-only try)
                 t.pop("parked", None)
                 t.pop("gave_up", None)
+                t.pop("owner_wait", None)
             outcome, kind, reason = _judge(p, rec, row, takeovers.setdefault(row["name"], {}), now)
             row["outcome"] = outcome
             if outcome == "done" and not old:
@@ -501,8 +528,12 @@ def tick(p, alert, now: float | None = None) -> None:
                 continue
             rec["next_probe"] = now + PROBE_S
             changed = True
-            outcome, kind, reason = _judge(p, rec, _probe(rec, now), takeovers.setdefault(rec["name"], {}), now,
-                                           start=True)
+            row = _probe(rec, now)
+            if service.stopped_at(rec["name"], rec.get("entry") or {}, row):   # stopped on purpose: closed quietly
+                _settle(rec, "stopped", now)
+                rec["closed"] = now
+                continue
+            outcome, kind, reason = _judge(p, rec, row, takeovers.setdefault(rec["name"], {}), now, start=True)
             _settle(rec, outcome, now)
             if outcome == "failed" and _mark(rec, kind, now):
                 failing.append((rec, kind, reason))

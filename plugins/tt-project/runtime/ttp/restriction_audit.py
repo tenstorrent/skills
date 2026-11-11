@@ -170,6 +170,11 @@ def _name(w: str) -> bool:
     return "-" in w or any(c.isdigit() for c in w)
 
 
+def _alias(w: str) -> bool:
+    """`w` is a machine or resource alias (_name), not a value with a unit (_VALUE: '900w', '2 hours')."""
+    return _name(w) and not _VALUE.fullmatch(w)
+
+
 def value_terms(text: str, kept: str = "") -> set[str]:
     """The values with a unit of `text` (_VALUE), lowercased, as '900 w' and '900w', where `kept` (the new
     text and charter) states neither form."""
@@ -294,7 +299,7 @@ def tool_hit(line: str, ids: set[str], words: set[str], exact: set[str] = frozen
     """What a line names of the old item, each as whole words (_whole: 'rul' is never in 'rule'): an
     identifier, a quoted phrase or user-message cite of `exact` (exact_terms), or else two or more of its
     words, one of them a specific anchor: not generic (generic_stems) and in `rare` (distinctive_words) when
-    given; [] when none. `on`: the sorted words of `words` the line has, when already known
+    given, and one not a machine or resource alias (_alias); [] when none. `on`: the sorted words of `words` the line has, when already known
     (WordIndex.words_on)."""
     from .restriction_source import CITE_RE
     got = sorted(t for t in ids if _whole(t, line))
@@ -311,7 +316,10 @@ def tool_hit(line: str, ids: set[str], words: set[str], exact: set[str] = frozen
     got = on
     from .coordinator import _stem   # stems or whole words alike: a word's stem is compared
     anchor = {w for w in got if _stem(w) not in generic_stems()}
-    return got if len(got) >= 2 and (anchor if rare is None else rare & anchor) else []
+    # Machine or resource aliases alone never hit: a line listing box names ('box-a, box-b') names the
+    # boxes, not the rule about them (a removed rule on box-a and box-b matched every tool naming them).
+    rule = any(not _alias(w) for w in got)
+    return got if len(got) >= 2 and rule and (anchor if rare is None else rare & anchor) else []
 
 
 def still_stated(charter: str, old: str) -> str:
@@ -446,11 +454,13 @@ def restriction_tools(p: Project, loosened: list[tuple], batch: list[int],
     one the Brief or a sourced item still states is left out, as is `over` "unsourced", and an `over` naming the
     done fix that already updated the tools (landed_fix: a done or landed code or harness task, a commit on
     HEAD) queues nothing. A file a task of this batch
-    names (its title or spec has the file's path or name) is left out. Open tasks' start_when probes and
+    names (its title or spec has the file's path or name) is left out, as is one gone since it was read. Open tasks' start_when probes and
     schedule prechecks are scanned too. A purely additive item (an `excepts` exception, a `both_hold` text)
     changes no older item and is never passed in. One call is one change (the turn's): at most one
     priority-1 harness task naming every flagged item and its files (one label TASK_LABEL + a key per item:
-    an item a task already covers is skipped, so the same change again queues none) and one queued
+    an item a task already covers is skipped, so the same change again queues none; one more label
+    ITEM_LABEL + a key of the old item alone: an item whose tools a done task already checked, one that
+    changed nothing included, is skipped under any new text or `over`) and one queued
     restriction_tools event for the next digest. Model-free; it edits no tool. Returns the event texts.
     Bounded by `budget_s` (AUDIT_BUDGET_S) of wall clock: past it the scan fails open, keeps what it found
     (the items' tools named so far still queue the task) and appends a cut-short note to `notes`."""
@@ -517,8 +527,11 @@ def restriction_tools(p: Project, loosened: list[tuple], batch: list[int],
             continue   # a dropped advisory copy of a rule the Brief or a sourced item still binds: tools stay right
         key = "\0".join(" ".join(bare(x).lower().split()) for x in (old, new, over))   # cites aside
         label = TASK_LABEL + hashlib.sha256(key.encode()).hexdigest()[:12]
-        if label in labels or p.db.q("SELECT 1 FROM tasks WHERE labels LIKE ? LIMIT 1", (f'%"{label}"%',)):
-            continue   # a task already covers this change: idempotent per change
+        item = ITEM_LABEL + hashlib.sha256(" ".join(bare(old).lower().split()).encode()).hexdigest()[:12]
+        if label in labels or p.db.q("SELECT 1 FROM tasks WHERE labels LIKE ? OR (status='done' AND labels LIKE ?)"
+                                     " LIMIT 1", (f'%"{label}"%', f'%"{item}"%')):
+            continue   # a task already covers this change, or one finished checking this item's tools (with no
+            # change included): the same item again, under another `over` or new text, queues none
         if over and landed_fix(p, over, end):
             continue   # its retirement names the done fix that already updated the tools
         ids, words, exact = tool_terms(old, new, charter, idx)
@@ -535,13 +548,15 @@ def restriction_tools(p: Project, loosened: list[tuple], batch: list[int],
             probe = label_.startswith(("schedule ", "task #"))   # no file: no line number
             if not line or label_ in named or (not probe and Path(label_).name in named):
                 continue
+            if not probe and not (p.root / label_).is_file():
+                continue   # gone since it was read (a worker's scratch file): never name a missing path
             hits.append(label_ + (f":{line}" if not probe else "")
                         + f" ({', '.join(clip(g, 40) for g in got[:4])})")
         if hits:
             how = (f"`over` retired the Restrictions item \"{clip(old, 200)}\" ({clip(over, 150)})" if over
                    else f"The user's word loosened the Restrictions item \"{clip(old, 200)}\"")
             flagged.append((how, new, hits))
-            labels.append(label)
+            labels += [label, item]
     if flagged:   # one task and one event for the whole change, however many items it touched
         items = []
         for how, new, hits in flagged:
@@ -570,6 +585,7 @@ def restriction_tools(p: Project, loosened: list[tuple], batch: list[int],
 
 
 TASK_LABEL = "restriction_tools:"   # + a 12-hex key per change: the queued update task's label
+ITEM_LABEL = "restriction_tools_item:"   # + a 12-hex key of the old item alone: its tools were checked
 
 
 def digest_lines(p: Project) -> list[str]:

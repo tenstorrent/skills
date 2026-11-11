@@ -4,7 +4,8 @@
 
 def _fake_host(tmp_path, monkeypatch, tab: str | None = None):
     """A stand-in for the host's real crontab (a script by absolute path, backed by a file) and
-    systemd user unit folder; returns (crontab script, crontab file, unit folder)."""
+    systemd user unit folders; returns (crontab script, crontab file, unit folder); the
+    ~/.local/share/systemd/user stand-in is hoststate._share_dir()."""
     from ttp import hoststate
     tabf, units, real = tmp_path / "realtab", tmp_path / "units", tmp_path / "realbin"
     units.mkdir()
@@ -24,8 +25,17 @@ def _fake_host(tmp_path, monkeypatch, tab: str | None = None):
     from ttp import checkreap
     monkeypatch.setenv(checkreap.MARKER, f"hoststate-test-{os.getpid()}-{tmp_path.name}")
     monkeypatch.setattr(hoststate, "_real_dir", lambda: units)
+    (tmp_path / "share_units").mkdir()   # the other user unit folder (~/.local/share/systemd/user)
+    monkeypatch.setattr(hoststate, "_share_dir", lambda: tmp_path / "share_units")
     monkeypatch.setattr(hoststate, "_real", lambda name: str(cron) if name == "crontab" else None)
     return cron, tabf, units
+
+
+def _append(cron, line, scratch):
+    """A shell command adding `line` (shell words expand) to the crontab at `cron` by absolute path,
+    through a copy in `scratch`: the stand-in's `cat >` would truncate it while `-l` still reads."""
+    c = shlex.quote(str(cron))
+    return f'{c} -l > "{scratch}/tab"; echo "{line}" >> "{scratch}/tab"; {c} - < "{scratch}/tab"'
 
 
 CHECK_TIMEOUT_S = 120   # far below ttp checks' silence limit (checkwall.SILENT_S, 10 min)
@@ -89,22 +99,26 @@ def test_a_host_change_the_stand_ins_miss_fails_ttp_checks_and_is_restored_and_r
     got = _ledger(monkeypatch)
     env = push.check_env("checks", run_dir=str(tmp_path / "run"))
     log = tmp_path / "checks.log"
-    script = (f"printf '0 1 * * * keep\\n@reboot evil\\n# tt-project: own\\n' | {shlex.quote(str(cron))} - && "
-              f"echo x > {shlex.quote(str(units / 'evil.service'))} && rm {shlex.quote(str(units / 'a.service'))} && "
+    # Each leak names the run's own folder (its run dir): proof the run made it
+    run = env["TTP_RUN_DIR"]
+    script = (f"printf '0 1 * * * keep\\n@reboot {run}/evil\\n# tt-project: own\\n' | {shlex.quote(str(cron))} - && "
+              f"echo ExecStart={shlex.quote(run)}/x > {shlex.quote(str(units / 'evil.service'))} && "
+              f"rm {shlex.quote(str(units / 'a.service'))} && "
               f"mkdir {shlex.quote(str(units / 'default.target.wants'))} && "
-              f"ln -s ../evil.service {shlex.quote(str(units / 'default.target.wants' / 'evil.service'))}")
+              f"ln -s {shlex.quote(run)}/evil.service {shlex.quote(str(units / 'default.target.wants' / 'evil.service'))}")
     with open(log, "w") as out:
         rc = _run_check_ended(["sh", "-c", script], cwd=tmp_path, stdout=out, stderr=subprocess.STDOUT, env=env)
     text = log.read_text()
     assert rc == 1, text
-    assert "host guard: FAILED" in text and "@reboot evil" in text and "evil.service" in text, text
+    assert "host guard: FAILED" in text and "/evil'" in text and "evil.service" in text, text
     assert "recorded in the machine change ledger (box1, change 7)" in text
-    # Put back: the added line gone, the harness's own line kept, the unit files as they were
+    # Put back: the added line gone, the harness's own line kept, the run's unit files gone. The removed
+    # a.service is not provably the run's (another process may have removed it): reported, never re-made
     assert tabf.read_text() == "0 1 * * * keep\n# tt-project: own\n"
-    assert sorted(p.name for p in units.iterdir()) == ["a.service"]
-    assert (units / "a.service").read_text() == "[Service]\nExecStart=/bin/true\n"
+    assert sorted(p.name for p in units.iterdir()) == []
+    assert "left in place, not proved to be this run's" in text and "a.service" in text, text
     (alias, what, undo, _by), kw = got[0]
-    assert alias == "box1" and "@reboot evil" in what and undo.startswith("none:") and kw["test"] is True
+    assert alias == "box1" and "/evil'" in what and undo.startswith("none:") and kw["test"] is True
 
 
 def test_a_failing_check_keeps_its_exit_code_when_it_also_changed_the_host(tmp_path, monkeypatch):
@@ -113,7 +127,7 @@ def test_a_failing_check_keeps_its_exit_code_when_it_also_changed_the_host(tmp_p
     _ledger(monkeypatch)
     env = push.check_env("checks", run_dir=str(tmp_path / "run"))
     with open(tmp_path / "log", "w") as out:
-        rc = _run_check_ended(["sh", "-c", f"echo '@reboot x' | {shlex.quote(str(cron))} - ; exit 3"],
+        rc = _run_check_ended(["sh", "-c", f"echo \"@reboot $TTP_RUN_DIR/x\" | {shlex.quote(str(cron))} - ; exit 3"],
                               cwd=tmp_path, stdout=out, stderr=subprocess.STDOUT, env=env)
     assert rc == 3 and not tabf.exists()   # there was no crontab before: removed again
 
@@ -129,7 +143,7 @@ def test_ttp_sandbox_fails_a_command_that_changed_the_host_and_restores_it(tmp_p
         assert sandbox.run(["sh", "-c", "crontab -r && reboot"]) == 0   # stand-ins: the real one untouched
         assert tabf.read_text() == "a\n"
         assert "went to the run's fake store" in capsys.readouterr().err
-        assert sandbox.run(["sh", "-c", f"echo b | {shlex.quote(str(cron))} -"]) == 1
+        assert sandbox.run(["sh", "-c", _append(cron, "b $TTP_HOSTSTATE_FAKE", "$TTP_HOSTSTATE_FAKE")]) == 1
     finally:
         for s, h in old.items():
             signal.signal(s, h)
@@ -193,6 +207,183 @@ def test_a_host_restore_keeps_a_concurrent_unrelated_crontab_line(tmp_path, monk
     assert hoststate.restore(before, {"crontab": (["evil"], [])}) == []
     assert tabf.read_text() == "a\nevil\nother\n"   # the last copy of the added line went
     assert hoststate.diff({"crontab": "a\n", "units": {}}, {"crontab": "a\n# tt-project: x\n", "units": {}}) == {}
+
+
+def test_a_run_wiping_the_real_crontab_by_path_fails_and_every_line_comes_back(tmp_path, monkeypatch):
+    """`crontab -r` by absolute path removes every project's lines, which no write log or folder name
+    proves: the whole crontab going from lines to none, with no open machine change naming it, is the
+    run's. It fails and each line comes back (the harness's own included), next to a line written since."""
+    from ttp import hoststate, machine_ledger, push
+    tab = "0 1 * * * keep\n@reboot bash ~/.x/resume.sh # series-resume:a\n0 3 * * * job # tt-project: d\n"
+    cron, tabf, _ = _fake_host(tmp_path, monkeypatch, tab)
+    got = _ledger(monkeypatch)
+    monkeypatch.setattr(machine_ledger, "changes", lambda *a, **kw: [
+        {"what": "a test run changed the real crontab -r", "undo": "none: restored", "test": True}])
+    guard = hoststate.Guard(push.check_env("checks", run_dir=str(tmp_path / "run")))
+    subprocess.run([str(cron), "-r"], check=True)
+    assert not tabf.exists()
+    changed, said = guard.end()
+    assert changed and any("host guard: FAILED" in s and "real crontab removed (3 lines" in s for s in said), said
+    assert tabf.read_text() == tab
+    assert got and got[0][1]["test"] is True
+    assert not any("left in place" in s for s in said), said
+    # A line another process writes between the wipe and the restore stays, after the old ones
+    guard = hoststate.Guard(push.check_env("checks", run_dir=str(tmp_path / "run")))
+    tabf.unlink()
+    monkeypatch.setattr(hoststate, "snapshot", lambda: {"crontab": None, "units": {}, hoststate.SHARE_KEY: {}})
+    real = hoststate._crontab
+    monkeypatch.setattr(hoststate, "_crontab", lambda: (tabf.write_text("0 4 * * * new\n"), real())[1])
+    assert guard.end()[0]
+    assert tabf.read_text() == tab + "0 4 * * * new\n"
+
+
+def test_a_crontab_removal_a_machine_change_names_or_one_line_going_is_left_in_place(tmp_path, monkeypatch):
+    """Not a wipe: a crontab removed with an open machine change naming it, an empty crontab, and lines
+    their owner or an overlapping run took out or added (a series' own @reboot resume line) are reported,
+    never put back or deleted, and pass the run."""
+    from ttp import hoststate, machine_ledger, push
+    _, tabf, _ = _fake_host(tmp_path, monkeypatch, "0 1 * * * keep\n")
+    got = _ledger(monkeypatch)
+    ledger = [{"what": "cleared the box: crontab -r", "undo": "none", "test": False}]
+    monkeypatch.setattr(machine_ledger, "changes", lambda *a, **kw: ledger)
+    env = push.check_env("checks", run_dir=str(tmp_path / "run"))
+    guard = hoststate.Guard(env)
+    tabf.unlink()
+    changed, said = guard.end()
+    assert not changed and not got and not tabf.exists(), said
+    assert any("left in place" in s and "keep" in s for s in said), said
+    ledger.clear()
+    tabf.write_text("")   # an empty crontab removed: nothing to wipe
+    guard = hoststate.Guard(env)
+    tabf.unlink()
+    assert guard.end() == (False, []) and not tabf.exists()
+    resume = "@reboot bash ~/.x/{0}/resume.sh # series-resume:{0}"
+    tabf.write_text("0 1 * * * keep\n" + resume.format("a") + "\n" + resume.format("b") + "\n")
+    guard = hoststate.Guard(env)
+    tabf.write_text("0 1 * * * keep\n" + resume.format("b") + "\n" + resume.format("c") + "\n")
+    changed, said = guard.end()
+    assert not changed and not got, said
+    assert tabf.read_text() == "0 1 * * * keep\n" + resume.format("b") + "\n" + resume.format("c") + "\n"
+    [line] = [s for s in said if "left in place" in s]
+    assert "series-resume:a" in line and "series-resume:c" in line, line
+    assert hoststate.wiped({"crontab": "x\n"}, {"crontab": None}, ["deleted the user crontab on purpose"]) is False
+    assert hoststate.wiped({"crontab": "x\n"}, {"crontab": None}, ["edited crontab line y"]) is True
+    assert hoststate.wiped({"crontab": "x\n"}, {"crontab": False}, []) is False   # unreadable: no claim
+
+
+def test_a_unit_another_process_installs_during_an_overlapping_run_survives_and_is_reported(tmp_path, monkeypatch):
+    """Runs overlap: another project installs its unit (with a machine change) while this run's guard is
+    open. It is not the run's: reported once, naming the paths and the run, and never deleted."""
+    from ttp import hoststate, machine_ledger, push
+    _, tabf, units = _fake_host(tmp_path, monkeypatch, "0 1 * * * keep\n")
+    got = _ledger(monkeypatch)
+    monkeypatch.setattr(machine_ledger, "changes", lambda *a, **kw: [
+        {"what": "installed other.service and enabled it", "undo": "systemctl --user disable --now other.service",
+         "test": False},
+        {"what": "a test run changed the real crontab line added: 'x'", "undo": "none: restored", "test": True}])
+    env = push.check_env("checks", run_dir=str(tmp_path / "run"))
+    env["TTP_TASK"] = "42"
+    guard = hoststate.Guard(env)
+    # The other process: a ledger-named unit (even one naming this run's folder), its enable link, an
+    # unrecorded unit, a crontab line, and a pre-existing file's edit
+    (units / "other.service").write_text(f"ExecStart={env['TTP_RUN_DIR']}/x\n")
+    (units / "default.target.wants").mkdir()
+    (units / "default.target.wants" / "other.service").symlink_to("../other.service")
+    (units / "plain.timer").write_text("[Timer]\nOnCalendar=daily\n")
+    tabf.write_text("0 1 * * * keep\n0 2 * * * other-job\n")
+    changed, said = guard.end()
+    assert not changed and not got, said
+    assert sorted(p.name for p in units.rglob("*")) == ["default.target.wants", "other.service", "other.service",
+                                                         "plain.timer"]
+    assert tabf.read_text() == "0 1 * * * keep\n0 2 * * * other-job\n"
+    [line] = [s for s in said if "left in place" in s]
+    assert "task 42" in line and "other.service" in line and "plain.timer" in line and "other-job" in line, line
+    assert not any("FAILED" in s for s in said), said
+
+
+def test_the_runs_own_unit_leak_is_still_caught_and_restored(tmp_path, monkeypatch):
+    """The run's own leak: its write log names the path, the name is a test-only one, or the file names
+    the run's folder. Each is put back and fails the run; a whole-folder record proves nothing."""
+    from ttp import hoststate, machine_ledger, push
+    _, tabf, units = _fake_host(tmp_path, monkeypatch)
+    got = _ledger(monkeypatch)
+    monkeypatch.setattr(machine_ledger, "changes", lambda *a, **kw: [])
+    env = push.check_env("checks", run_dir=str(tmp_path / "run"))
+    (units / "kept.service").write_text("[Service]\n")
+    guard = hoststate.Guard(env, tokens=[str(tmp_path / "basetemp")])
+    (units / "logged.service").write_text("[Service]\n")
+    (units / "pytest-leak.service").write_text("[Service]\n")
+    (units / "temp.service").write_text(f"ExecStart={tmp_path / 'basetemp' / 'x'}\n")
+    (units / "kept.service").write_text(f"ExecStart={env['TTP_RUN_DIR']}/y\n")   # an edit naming the run
+    (units / "other.service").write_text("[Service]\n")   # only the whole folder is recorded: not proof
+    tabf.write_text(f"@reboot {env['TTP_RUN_DIR']}/z\n")
+    changed, said = guard.end(recorded=[str(units / "logged.service"), str(tmp_path)])
+    assert changed and any("host guard: FAILED" in s and "logged.service" in s for s in said), said
+    assert sorted(p.name for p in units.iterdir()) == ["kept.service", "other.service"]
+    assert (units / "kept.service").read_text() == "[Service]\n"
+    assert not tabf.exists()   # there was no crontab before
+    assert got and got[0][1]["test"] is True
+    assert any("left in place" in s and "other.service" in s for s in said), said
+
+
+def test_the_host_guard_tests_reach_no_real_unit_folder_crontab_or_systemctl(tmp_path, monkeypatch):
+    """These tests touch only their temp stand-ins: the guard's unit folder, crontab and systemctl
+    resolve into tmp_path (systemctl to none), and the session fails any test that writes the real
+    ~/.config/systemd/user (its write recorder watches it) or calls a real crontab or systemctl by name
+    (the stand-ins are first on PATH)."""
+    import conftest
+    from ttp import hoststate, machine_ledger
+    cron, tabf, units = _fake_host(tmp_path, monkeypatch)
+    _ledger(monkeypatch)
+    monkeypatch.setattr(machine_ledger, "changes", lambda *a, **kw: [])
+    calls = []
+    run = hoststate._run
+    monkeypatch.setattr(hoststate, "_run", lambda cmd, *a, **kw: calls.append(cmd[0]) or run(cmd, *a, **kw))
+    guard = hoststate.Guard({}, tokens=[str(tmp_path / "t")])
+    (units / "pytest-x.service").write_text("x")
+    tabf.write_text(f"@reboot {tmp_path / 't'}\n")
+    assert guard.end()[0]
+    assert hoststate._real_dir() == units and hoststate._real("systemctl") is None
+    assert hoststate._share_dir() == tmp_path / "share_units"
+    assert calls and set(calls) == {str(cron)}
+    assert ".config/systemd/user" in conftest.HOME_WATCHED and ".local/share/systemd/user" in conftest.HOME_WATCHED
+
+
+def test_local_share_units_guarded(tmp_path, monkeypatch):
+    """~/.local/share/systemd/user gets the same rule as ~/.config/systemd/user: another process's unit,
+    its enable link and a ledger-named unit there survive and are reported; the run's own leak there
+    (its write log, a test-only name, a file naming its folder) fails the run and is put back."""
+    from ttp import hoststate, machine_ledger, push
+    _, _, units = _fake_host(tmp_path, monkeypatch)
+    share = hoststate._share_dir()
+    got = _ledger(monkeypatch)
+    monkeypatch.setattr(machine_ledger, "changes", lambda *a, **kw: [
+        {"what": "reinstalled named.service", "undo": "systemctl --user disable --now named.service", "test": False}])
+    env = push.check_env("checks", run_dir=str(tmp_path / "run"))
+    env["TTP_TASK"] = "42"
+    (share / "kept.service").write_text("[Service]\n")
+    guard = hoststate.Guard(env)
+    # Another process: its unit and enable link, and a ledger-named unit even naming this run's folder
+    (share / "other.service").write_text("[Service]\nExecStart=/opt/x\n")
+    (share / "default.target.wants").mkdir()
+    (share / "default.target.wants" / "other.service").symlink_to("../other.service")
+    (share / "named.service").write_text(f"ExecStart={env['TTP_RUN_DIR']}/x\n")
+    # The run's own: logged, test-only named, naming its run folder, and its edit of a logged file
+    (share / "logged.service").write_text("[Service]\n")
+    (share / "pytest-y.service").write_text("[Service]\n")
+    (share / "mine.service").write_text(f"ExecStart={env['TTP_RUN_DIR']}/y\n")
+    (share / "kept.service").write_text("[Service]\nchanged\n")
+    changed, said = guard.end(recorded=[str(share / "logged.service"), str(share / "kept.service"), str(share.parent)])
+    assert changed and got, said
+    assert sorted(p.name for p in share.rglob("*")) == ["default.target.wants", "kept.service", "named.service",
+                                                        "other.service", "other.service"]
+    assert (share / "kept.service").read_text() == "[Service]\n"
+    [left] = [s for s in said if "left in place" in s]
+    assert "task 42" in left and "other.service" in left and "named.service" in left, left
+    assert "mine.service" not in left and "logged.service" not in left, left
+    [failed] = [s for s in said if "FAILED" in s]
+    assert "~/.local/share/systemd/user/mine.service" in failed and "pytest-y.service" in failed, failed
+    assert not list(units.iterdir())
 
 
 def test_installers_write_to_the_fake_store_only_under_the_marker_with_the_real_home(tmp_path, monkeypatch):
@@ -260,7 +451,7 @@ def test_a_push_check_stopped_mid_run_still_restores_and_reports_a_host_change(t
     monkeypatch.setattr(push, "_timed_wait", _stopped_after_write(tabf))
     said = []
     with pytest.raises(SystemExit):
-        push._run_one(f"echo '@reboot evil' | {shlex.quote(str(cron))} - ; exec sleep 30", tmp_path, env, said.append)
+        push._run_one(_append(cron, "@reboot $TTP_RUN_DIR/evil", "$TTP_RUN_DIR") + " ; exec sleep 30", tmp_path, env, said.append)
     assert tabf.read_text() == "0 1 * * * keep\n"
     assert any("host guard: FAILED" in s for s in said), said
 
@@ -273,7 +464,7 @@ def test_a_ttp_checks_command_stopped_mid_run_still_restores_and_reports_a_host_
     monkeypatch.setattr(checkwall, "wait", _stopped_after_write(tabf))
     log = tmp_path / "checks.log"
     with open(log, "w") as out, pytest.raises(SystemExit):
-        cli._run_check(["sh", "-c", f"echo '@reboot evil' | {shlex.quote(str(cron))} - ; exec sleep 30"], True,
+        cli._run_check(["sh", "-c", _append(cron, "@reboot $TTP_RUN_DIR/evil", "$TTP_RUN_DIR") + " ; exec sleep 30"], True,
                        cwd=tmp_path, stdout=out, stderr=subprocess.STDOUT, env=env)
     assert tabf.read_text() == "0 1 * * * keep\n"
     assert "host guard: FAILED" in log.read_text()
@@ -307,7 +498,7 @@ def test_a_batch_check_stopped_mid_run_still_restores_and_reports_a_host_change(
             return super().wait(timeout)
     monkeypatch.setattr(batch.subprocess, "Popen", Stopped)
     with pytest.raises(SystemExit):
-        batch._streamed(f"echo '@reboot evil' | {shlex.quote(str(cron))} - ; exec sleep 30", tmp_path, env, 3600,
+        batch._streamed(_append(cron, "@reboot $TTP_RUN_DIR/evil", "$TTP_RUN_DIR") + " ; exec sleep 30", tmp_path, env, 3600,
                         True, (), None)
     assert tabf.read_text() == "0 1 * * * keep\n"
     assert "host guard: FAILED" in capsys.readouterr().out
@@ -372,3 +563,40 @@ def test_the_hop_limit_ends_a_deliberate_stand_in_loop_fast(tmp_path):
     assert len((tmp_path / "hops").read_text().split()) == hostshim.MAX_HOPS
     assert len((store / "calls.jsonl").read_text().splitlines()) == hostshim.MAX_HOPS + 1
     assert r.returncode == 0 or "passed it on" in r.stderr, r.stderr
+
+
+def test_a_check_run_on_another_machine_leaves_this_hosts_crontab_unjudged(tmp_path, monkeypatch):
+    """A check spilled to another host or a Slurm job runs its tests there: a crontab line another
+    project adds or removes here meanwhile is neither put back nor recorded, and end() says why."""
+    from ttp import hoststate, push, remotecheck, slurmcheck
+    _, tabf, _ = _fake_host(tmp_path, monkeypatch, "0 1 * * * keep\n@reboot other/resume.sh\n")
+    got = _ledger(monkeypatch)
+    spill = ["nice", "-n", "10", *remotecheck.argv("pytest -q", "spill-host")]
+    assert hoststate.elsewhere(spill) == "spill-host"
+    assert hoststate.elsewhere(slurmcheck.argv("pytest -q", {}, minutes=5)) == "a Slurm batch job"
+    assert hoststate.elsewhere(["bash", "-c", "pytest -q"]) == "" == hoststate.elsewhere(None)
+    env = push.check_env("checks", run_dir=str(tmp_path / "run"))
+    guard = hoststate.Guard(env, argv=spill)
+    assert guard.before is None
+    tabf.write_text("0 1 * * * keep\n0 2 * * * added\n")
+    changed, said = guard.end()
+    assert not changed and not got and tabf.read_text() == "0 1 * * * keep\n0 2 * * * added\n"
+    assert said and "spill-host" in said[0] and "not compared" in said[0], said
+    assert hoststate.Guard(env, argv=["bash", "-c", "true"]).before is not None   # a local check is judged
+
+
+def test_push_and_ttp_checks_hand_the_check_command_to_the_host_guard(tmp_path, monkeypatch):
+    """Both check runners pass the command they run, so a spilled one is not judged against this host."""
+    from ttp import hoststate, push
+    cron, tabf, _ = _fake_host(tmp_path, monkeypatch, "0 1 * * * keep\n")
+    got = _ledger(monkeypatch)
+    seen = []
+    monkeypatch.setattr(hoststate, "elsewhere", lambda argv: seen.append(argv) or "spill-host")
+    env = push.check_env("checks", run_dir=str(tmp_path / "run"))
+    said = []
+    push._run_one(_append(cron, "0 3 * * * meanwhile", "$TTP_RUN_DIR"), tmp_path, env, said.append)
+    assert "meanwhile" in tabf.read_text() and not got, said
+    assert seen and "meanwhile" in " ".join(map(str, seen[-1])), seen
+    tabf.write_text("0 1 * * * keep\n")
+    _run_check_ended(["bash", "-c", _append(cron, "0 4 * * * meanwhile", "$TTP_RUN_DIR")], env=env)
+    assert "0 4 * * * meanwhile" in tabf.read_text() and not got

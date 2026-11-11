@@ -300,6 +300,11 @@ def _event(p, kind: str, fp: str, text: str, every_s: float | None = None) -> bo
     return True
 
 
+def cli_route(key: str, project: str = "<project>") -> str:
+    """How a coordinator sets a key its config_set refuses (not chat-settable, not the user's alone)."""
+    return f"the coordinator runs `ttp config {project} {key} <value>` in its own shell after `ttp audit why`"
+
+
 def _safe_way(key: str, new) -> bool:
     """Whether writing `new` at `key` turns a switch its safe way, which any setter may (as the
     coordinator's and `ttp config`'s own gates read it): a sandbox key to anything but on, removing it
@@ -329,14 +334,14 @@ def guard(p, key: str, setter: dict | None, before, after) -> bool:
             hits.append(f"{k} (set by {describe(rec, p)})")
     if not hits:
         return at(before, key) == at(after, key) and role(lookup(p.db, key, before)) in OWNERS
-    why = (f"{who} may not change a value the user or a coordinator set: {', '.join(hits)}; the coordinator "
-           f"(config_set) or the user makes this change")
+    why = (f"{who} may not change a value the user or a coordinator set: {', '.join(hits)}; the user or the "
+           f"coordinator makes this change (config_set, or for a key config_set refuses, {cli_route(key, p.name)})")
     if who == "worker":
         why += "; propose it in your hand-off (summary or a followup: key, value, why) for the coordinator to make"
     fp = f"config_overwrite_refused:{key}:{who}"
     if _event(p, "config_overwrite_refused", fp,
               f"Config change refused: {line(_row(p, key, setter, before, after, time.time()), p)}. {why}. "
-              "Make it with config_set if it is right; else find and fix what tried.", REFUSAL_EVERY_S):
+              "Make it if it is right; else find and fix what tried.", REFUSAL_EVERY_S):
         log(p, _row(p, key, setter, before, after, time.time(), refused=why))
     raise Protected(why)
 

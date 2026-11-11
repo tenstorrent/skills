@@ -159,3 +159,158 @@ def test_bench_injection_cells_build_one_cell_per_source_and_canary(tmp_path):
         d = tmp_path / "inj" / f"{c['source']}-{c['canary']}"
         assert (d / "inputs" / f"{c['source']}.txt").read_text() in c["prompt"]
         assert not (d / "canary" / "push").exists() and not (d / "canary" / "calls").exists()
+
+
+def _bench_cells_home(tmp_path, monkeypatch):
+    # Git and gh in these tests see a temp HOME of their own, never the user's.
+    home = tmp_path / "home"
+    home.mkdir()
+    for k, v in (("HOME", home), ("XDG_CONFIG_HOME", home / ".config"), ("GH_CONFIG_DIR", home / ".config" / "gh")):
+        monkeypatch.setenv(k, str(v))
+
+
+def _bench_cells_bench(env, tmp_path):
+    # The one-task bench of _bench_built plus a copy of its task whose held-out test (test_old) no
+    # mutation of the landed change can fail; the bench manifest is re-pinned.
+    import hashlib
+    p, tid, task = _bench_built(env, tmp_path)
+    b = tmp_path / "bench"
+    m = json.loads((b / "manifest.json").read_text())
+    blind = dict(task, task=tid + 1000, tests=["tests/test_mod.py::test_old"])
+    m["tasks"].append(blind)
+    shutil.copytree(b / str(tid), b / str(blind["task"]), symlinks=True)
+    (b / "manifest.json").write_text(json.dumps(m))
+    (b / "manifest.sha256").write_text(f"{hashlib.sha256((b / 'manifest.json').read_bytes()).hexdigest()}  manifest.json\n")
+    return p, tid, blind["task"], b
+
+
+def test_bench_cells_seeds_a_bug_only_where_a_held_out_test_catches_it_and_pins_every_cell(env, tmp_path, monkeypatch):
+    import hashlib
+    from ttp import bench, benchcells
+    _bench_cells_home(tmp_path, monkeypatch)
+    p, tid, blind, b = _bench_cells_bench(env, tmp_path)
+    out = tmp_path / "cells"
+    m = bench.cells(b, out, test_cmd=f"{sys.executable} -m pytest -q -p no:cacheprovider", timeout=120)
+    seeded = [c for c in m["cells"] if c["kind"] == "seeded"]
+    # Built only where caught: the landed new() gets a mutation test_new fails on; the copy held out on
+    # test_old gets none and is excluded with why.
+    assert [c["task"] for c in seeded] == [tid] and seeded[0]["mutation"]["file"] == "mod.py"
+    assert [x["task"] for x in m["excluded"]] == [blind] and "mutation" in m["excluded"][0]["why"]
+    cell = out / "seeded" / str(tid)
+    assert benchcells.score_seeded(cell, cell / "workspace", timeout=120)["pass"] is False
+    assert not (cell / "workspace" / "tests" / "test_mod.py").exists()
+    # One injection cell per input and action, from the small tasks in turn.
+    inj = [c for c in m["cells"] if c["kind"] == "injection"]
+    assert len(inj) == 12 == m["counts"]["injection"] and m["counts"]["seeded"] == 1
+    assert {(c["source"], c["canary"]) for c in inj} == {(s, c) for s in benchcells.SOURCES for c in benchcells.CANARIES}
+    assert sum(m["counts"]["injection_by_source"].values()) == 12 and {c["task"] for c in inj} == {tid, blind}
+    # Every pinned file hashes as the manifest says, workspaces match their tree ids, canary logs are
+    # never pinned and the manifest itself matches cells.sha256.
+    for c in m["cells"]:
+        d = out / c["id"]
+        assert c["files"] and all(hashlib.sha256((d / f).read_bytes()).hexdigest() == h for f, h in c["files"].items())
+        assert not any(f.startswith("canary/") for f in c["files"])
+        tree = subprocess.run(["git", "-C", str(d / "workspace"), "rev-parse", "HEAD^{tree}"],
+                              capture_output=True, text=True).stdout.strip()
+        assert tree == c["tree"]
+    assert "remote.git/hooks/pre-receive" in inj[0]["files"] and "inputs/" + inj[0]["source"] + ".txt" in inj[0]["files"]
+    assert (out / "cells.sha256").read_text().split()[0] == hashlib.sha256((out / "cells.json").read_bytes()).hexdigest()
+    assert json.loads((out / "cells.json").read_text())["counts"] == m["counts"]
+
+
+def test_bench_cells_refuses_a_changed_bench_and_caps_seeded_cells(env, tmp_path, monkeypatch, capsys):
+    from ttp import bench, cli
+    _bench_cells_home(tmp_path, monkeypatch)
+    p, tid, blind, b = _bench_cells_bench(env, tmp_path)
+    monkeypatch.setenv("TTP_PROJECT", str(p.base))   # the test's project, never the one around the checkout
+    monkeypatch.delenv("TTP_RUN_DIR", raising=False)   # a shell build, not a worker run's detached job
+    cmd = ["bench", "cells", "--bench", str(b), "--test-cmd", f"{sys.executable} -m pytest -q -p no:cacheprovider"]
+    cli.main([*cmd, "--out", str(tmp_path / "c1"), "--seeded", "1"])
+    text = capsys.readouterr().out
+    assert "1 seeded cell(s)" in text and "12 injection cell(s)" in text and str(tmp_path / "c1" / "cells.json") in text
+    # --seeded 1 stops once one cell is built: the second task is never tried.
+    assert json.loads((tmp_path / "c1" / "cells.json").read_text())["excluded"] == []
+    with pytest.raises(SystemExit):
+        cli.main([*cmd, "--out", str(tmp_path / "c1")])   # never over an existing folder
+    (b / "manifest.json").write_text((b / "manifest.json").read_text().replace("test_old", "test_new"))
+    with pytest.raises(ValueError, match="manifest.sha256"):
+        bench.cells(b, tmp_path / "c2")
+    assert not (tmp_path / "c2").exists()
+
+
+def test_bench_cells_runs_a_held_out_case_file_test_where_its_aggregator_collects_it(tmp_path):
+    from ttp import bench, benchcells
+    (tmp_path / "tests" / "cases").mkdir(parents=True)
+    (tmp_path / "tests" / "cases" / "x_cases.py").write_text("def test_a():\n    pass\n\n\ndef test_b():\n    assert False\n")
+    (tmp_path / "tests" / "test_agg.py").write_text(
+        "from pathlib import Path\n_p = Path(__file__).parent / 'cases' / 'x_cases.py'\n"
+        "exec(compile(_p.read_text(), str(_p), 'exec'))\n\n\ndef test_c():\n    assert False\n")
+    cmd = "python3 -m pytest -q -p no:cacheprovider"   # a plain pytest run (addedtests.eligible)
+    def run(ids):
+        argv, select = bench._held_cmd(cmd, ids)
+        return subprocess.run(argv, cwd=tmp_path, capture_output=True, text=True,
+                              env={**os.environ, **benchcells.select_env(select)})
+    # Only the named test of the case file runs (test_c of the aggregator and test_b do not).
+    ok = run(["tests/cases/x_cases.py::test_a"])
+    assert ok.returncode == 0 and "1 passed" in ok.stdout
+    assert run(["tests/cases/x_cases.py::test_b"]).returncode == 1
+    assert run(["tests/test_agg.py::test_c"]).returncode == 1
+    # A command that is not one plain pytest run gets the ids appended.
+    assert bench._held_cmd("make check", ["t.py::x"]) == (["make", "check", "t.py::x"], [])
+
+
+def test_bench_seeded_cell_stores_no_host_path_and_scores_with_the_plugin_dir_of_the_scorer(env, tmp_path, monkeypatch):
+    # A cell built by one plugin copy (a task worktree deleted on landing, a pruned plugin-cache version)
+    # still scores from another: cell.json keeps the plain command and the held-out ids, and the select
+    # plugin's PYTHONPATH and -p come from the plugin running the score.
+    from ttp import bench, benchcells, pushpass
+    _bench_cells_home(tmp_path, monkeypatch)
+    monkeypatch.setenv("PYTEST_ADDOPTS", "-p no:randomly_builder_only")
+    p, tid, blind, b = _bench_cells_bench(env, tmp_path)
+    out = tmp_path / "cells"
+    bench.cells(b, out, seeded=1, test_cmd="python3 -m pytest -q -p no:cacheprovider", timeout=120)
+    cell = out / "seeded" / str(tid)
+    stored = json.loads((cell / "cell.json").read_text())
+    text = json.dumps([stored["test_cmd"], stored["select"]])
+    assert stored["select"] and str(pushpass.PLUGIN_DIR) not in text and "PYTHONPATH" not in text
+    assert "randomly_builder_only" not in text and not any(w.startswith("/") for w in stored["test_cmd"])
+    monkeypatch.delenv("PYTEST_ADDOPTS")
+    moved = tmp_path / "elsewhere" / "pytest_resume"
+    shutil.copytree(pushpass.PLUGIN_DIR, moved, ignore=shutil.ignore_patterns("__pycache__"))
+    monkeypatch.setattr(pushpass, "PLUGIN_DIR", moved)
+    fixed = tmp_path / "fixed"
+    shutil.copytree(cell / "workspace", fixed, symlinks=True)
+    bm = json.loads((b / "manifest.json").read_text())
+    head = next(t["head"] for t in bm["tasks"] if t["task"] == tid)
+    f = stored["mutation"]["file"]
+    (fixed / f).write_text(subprocess.run(["git", "-C", bm["repo"], "show", f"{head}:{f}"],
+                                          capture_output=True, text=True, check=True).stdout)
+    assert benchcells.score_seeded(cell, fixed, timeout=120)["pass"] is True
+    assert benchcells.score_seeded(cell, cell / "workspace", timeout=120)["pass"] is False
+    # Proof the select plugin comes from the scorer: with its plugin dir gone, -p cannot load it.
+    monkeypatch.setattr(pushpass, "PLUGIN_DIR", tmp_path / "gone")
+    assert benchcells.score_seeded(cell, fixed, timeout=120)["pass"] is False
+
+
+def test_bench_cells_in_a_worker_run_builds_as_one_admitted_detached_job(env, tmp_path, monkeypatch):
+    from ttp import bench, cli
+    # The test's own project: the checks host has none around the checkout (`ttp bench` needs one).
+    monkeypatch.setenv("TTP_PROJECT", str(make(env).base))
+    monkeypatch.setenv("TTP_RUN_DIR", str(tmp_path / "run"))
+    monkeypatch.delenv("TTP_DETACHED", raising=False)
+    calls = []
+    monkeypatch.setattr(cli.subprocess, "call", lambda argv: calls.append(argv) or 0)
+    with pytest.raises(SystemExit) as e:
+        cli.main(["bench", "cells", "--bench", str(tmp_path / "b"), "--out", str(tmp_path / "c"), "--seeded", "2"])
+    assert e.value.code == 0 and len(calls) == 1 and not (tmp_path / "c").exists()
+    argv = calls[0]
+    i = argv.index("detach")
+    assert argv[i + 2:i + 5] == ["--cores", str(bench.BUILDERS), "--"] and argv[i + 1].startswith("bench-cells-")
+    inner = argv[i + 5:]
+    assert inner[inner.index("bench"):] == ["bench", "cells", "--bench", str(tmp_path / "b"), "--out",
+                                            str(tmp_path / "c"), "--seeded", "2", "--here"]
+    # Inside the job itself (TTP_DETACHED), or with --here, it builds in place: no second job.
+    monkeypatch.setenv("TTP_DETACHED", "1")
+    with pytest.raises(SystemExit):   # the missing bench folder ends it, after no detach
+        cli.main(["bench", "cells", "--bench", str(tmp_path / "b"), "--out", str(tmp_path / "c")])
+    assert len(calls) == 1

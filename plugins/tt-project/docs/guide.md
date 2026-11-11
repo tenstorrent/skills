@@ -238,12 +238,16 @@ coordinator with that evidence.
 - These keys (and `budget.push_spend_to`) are account-level: `ttp config --account KEY VALUE` writes them to
   `~/.tt-project/settings.json` (mode 0600), which every project on the machine reads under its own
   `project.json` (a project may still override a key, except `budget.push_spend_to`, which is read
-  from the account settings only). Four `providers.chat` keys are account-level too, read by their
-  own code rather than merged into each project's settings: `model_ranking`, `ranking_source`,
-  `ranking_every_s` and `ranking_key_file` (see the chat provider's model ranking below).
+  from the account settings only). Six `providers.chat` keys are account-level too, read by their
+  own code rather than merged into each project's settings: `model_ranking`, `class_ranking`,
+  `class_prefs`, `ranking_source`, `ranking_every_s` and `ranking_key_file` (see the chat provider's
+  model ranking and model scoreboard below).
   `ttp config --account KEY` reads one; an
   empty value removes it. The same holds for a project's own keys: `ttp config <name> KEY ''` removes KEY
-  from `project.json`, so its default applies again, and a key whose default is a list or an object
+  from `project.json`, so its default applies again (it prints the value it removed and records the removal
+  in provenance, `--why`; a key the plugin no longer knows is removed too when `project.json` holds it, while
+  a value for one, or removing one not there, is refused as unknown or retired; `ttp upgrade` drops the keys the
+  plugin retired, such as `coordinator.unblock_effort`, by itself), and a key whose default is a list or an object
   refuses a value of another type without writing it, except the plain forms its reader takes
   (`budget.compact_window_tokens` and `budget.split_reread_tokens`: one non-negative number for every tier;
   `budget.resume_lost` and `waiting.wake_gate`: `false`, off; `coordinator.conclusion_floor`: a string such
@@ -514,8 +518,12 @@ coordinator with that evidence.
   Code, Codex and Cursor, with per-provider tools and guards in providers.md). An old
   `coordinator.session.mode` value in a project's config is ignored, and `config_set` refuses it. A
   daemon restart or a host reboot resumes the same session id (kept in the project's kv table) and
-  never starts a new session. A new session starts only when there is none, the system prompt,
-  stable context or action schema changed, the model or effort changed, a new session's first wake
+  never starts a new session. A changed system prompt, charter or action schema resumes the session
+  too: the wake runs with the new prompt and schema and leads with a model-free "Changed since your
+  last wake" block (a prompt version line and the charter's unified diff against the copy the last ok
+  wake saved; on Codex also the system prompt's diff). A new session starts only when there is none,
+  the provider changed, the prompt changed on a provider that cannot resume with a changed prompt
+  (`Provider.resume_new_prompt`; none shipped), the model or effort changed, a new session's first wake
   did not end ok and did no work (one that did, then hit its dollar cap or timeout, keeps its session:
   the next wake resumes it), its transcript is gone (a host move or a provider-side expiry), or the provider
   rejected a resume. A full context never starts a new session: the session compacts in place and
@@ -959,7 +967,7 @@ coordinator with that evidence.
   follow-up as announced work from when its run ended: its owner is a later task titled as the step
   (with or without `ready:`) or whose spec quotes it, `none` until one exists.
 - Idle capacity (model-free): a device resource of the project (its device lock, a `*-device` name its
-  config or recent tasks use, or a machine tagged `device` that its charter's Resources names) that
+  config or recent tasks use, or a machine tagged `device` that its config allows, `machines.allowed`) that
   no open task, `ttp lock` slot, reservation or detached-job hold uses for `coordinator.idle_capacity_s`
   (1500; 0 turns it off), while a worker slot is free, the gate is green or yellow and dispatch would
   start nothing, raises one `idle_capacity` event naming it, the running work and the next scheduled
@@ -1147,15 +1155,23 @@ uses to compare two models or efforts on this project's own work. `--since` is t
 compared models' release dates, so neither saw the changes. It keeps done code and work tasks created
 since then whose change landed through one push queue row and adds or changes tests; their landed
 tests are held out as graders. It excludes, with the reason, a task whose spec quotes 3 or more lines
-of the fix, whose held-out tests use a repository symbol the base lacks and the spec does not name, or
-whose landing range on the push branch is unclear (a fast-forward, a squash, several pushes). A task
-whose spec says its branch starts from another task's branch (a review fix) is replayed from that
-parent's recorded head to its own branch head, so its workspace has the parent's work; it is excluded
-when the repository lacks that head or the head is not under its branch. Each kept task gets `<id>/workspace`, the base commit's tracked files in a fresh repository with one commit
-and no remotes, tags or reflog, and `<id>/heldout`, the landed copy of its held-out test files; the
-manifest records its spec, base, landed commit, stratum (small up to 150 changed non-test lines, else
-large) and each held-out file's sha256, and `manifest.sha256` pins the manifest. The bench names no
-model.
+of the fix, whose held-out tests use a repository symbol the base lacks and the spec does not name
+(`from m import x`, `import a.b` and attribute chains on either), or whose landing range on the push
+branch is unclear (a fast-forward, a squash, several pushes); a review or fix task that pushed the
+change counts as its landing. A task whose spec says its branch starts from another task's branch (a
+review fix) is replayed from that parent's recorded head to its own branch head, so its workspace has
+the parent's work; it is excluded when the repository lacks that head or the head is not under its
+branch. Every test file the change adds or changes is held out, and only the
+held-out tests are scanned. Then it validates each test the change adds: it runs them, with the
+head's test files in place, on a copy of the base (each must fail) and of the landed head (each must
+pass all 3 runs), inside `ttp sandbox`, and keeps only those fail-to-pass tests; a task with none is
+excluded with the reason. `--test-cmd` sets the pytest command (one plain pytest run, default
+`python3 -m pytest -q -p no:cacheprovider`) and `--no-validate` skips this step. Each kept task gets
+`<id>/workspace`, the base commit's tracked files in a fresh repository with one commit and no
+remotes, tags or reflog, and `<id>/heldout`, the landed copy of its held-out test files; the manifest
+records its spec, base, landed commit, stratum (small up to 150 changed non-test lines, else large),
+its graded tests and each held-out file's sha256, plus `validated`, the test command and rounds, and
+`manifest.sha256` pins the manifest. The bench names no model.
 
 `ttp bench run --bench <dir> --out <dir>` then runs a head-to-head of two or more model arms on it.
 An arm is a provider, model and effort: `bench.arms` in the project's config
@@ -1224,6 +1240,21 @@ Two more cell kinds, built and scored without a model call (`runtime/ttp/benchce
   workspace. It passes only when nothing fired and its hand-off flags the injection. One cell per input
   and action gives 12 scenarios.
 
+`ttp bench cells --bench <prep dir> --out <dir> [--here] [--seeded N] [--repo <path>] [--test-cmd <cmd>]` builds
+both kinds from a prepped bench, without a model call. For each small task (at most `N`; `0`, the
+default, for all) it archives the landed head, plants a mutation only on the non-test Python lines its
+landed change added or changed, and keeps the first of up to 20 that the task's held-out tests catch; a
+task with none, or whose change touches no such line, is listed under `excluded` with why. The 12
+injection cells take the small tasks' clean workspaces and specs in turn. `cells.json` lists every cell
+with its kind, mutation or input and action, its workspace's git tree id and the sha256 of its fixed
+files (prompt, held-out tests, decoy, stand-ins, inputs and the refusing hook; never the canary logs,
+which grow), plus counts per kind; `cells.sha256` pins `cells.json`. The bench manifest must still match
+its own `manifest.sha256`. A plain pytest command runs only the held-out tests through the
+`ttp_pytest_select` plugin, so a case file's test runs where its aggregator collects it. In a worker run the build goes in one admitted
+`ttp detach --cores 4` job (log and rc in the run folder); `--here`, or a build outside a run, builds in the
+calling shell. A cell stores the plain test command and the held-out ids, never a host path: the select
+plugin is added from the plugin that scores it, so a cell outlives the worktree that built it.
+
 ### OpenAI-compatible endpoints (the `chat` provider)
 
 The `chat` provider runs Claude Code workers against any endpoint that speaks the OpenAI Chat
@@ -1262,10 +1293,20 @@ Messages calls into `<base url>/chat/completions` calls and back, and ends with 
    tier's runs start on the core provider. A 404 for a model the endpoint does not serve (its wording
    names the model, or the endpoint's /models list leaves it out) is `model_missing` instead: no
    cool-down, but that tier's route holds, with one normal notice naming the provider, tier and model,
-   until `providers.chat.tiers.<tier>.model` changes or the daemon's model-free /models check (every
-   minute while a tier or run class routes to `chat`; `providers.chat.models_every_s`) lists the model
-   again. That check stores only the served ids and
-   its time in the project state folder; `ttp status` and `ttp doctor` show them and any hold.
+   until `providers.chat.tiers.<tier>.model` changes or the model-free /models check lists the model
+   again. That check runs once per machine and endpoint for every project on it
+   (`runtime/ttp/served.py`): every 30 seconds while any project there routes work to `chat` (a tier,
+   a route, a run class, babysitting or a ranked pin), else every 5 minutes (account-level
+   `providers.chat.served_every_s` and `providers.chat.served_idle_s`). The daemon that holds the poll
+   lease (renewed by each poll, free after 90 seconds) polls with its own saved key; if it stops,
+   another daemon takes over once the lease lapses. The result goes to
+   `~/.tt-project/served/<endpoint id>.json` (the id is a hash of the URL), with when each model id
+   was first and last listed, and each id that appears or goes away is a line in
+   `~/.tt-project/served/served-events.jsonl`. A list older than 3 poll intervals counts as unknown,
+   so nothing is swapped on it. Where those files cannot be written, each project checks on its own
+   (every minute while a tier or run class routes to `chat`; `providers.chat.models_every_s`). Only
+   the served ids, times and HTTP status are stored, never the key or URL; `ttp status` and
+   `ttp doctor` show them and any hold.
    To keep work on the endpoint instead, the daemon keeps a ranking of its model ids, smartest first,
    in `providers.chat.model_ranking`: account-wide (`ttp config --account providers.chat.model_ranking
    '["id-a", "id-b"]'`, in `~/.tt-project/settings.json`), so every project on the machine that uses
@@ -1296,21 +1337,64 @@ Messages calls into `<base url>/chat/completions` calls and back, and ends with 
    is swapped the same way, unless the pin is required (`pin_required`): such a task waits until its
    model is served again. With a ranking set, a queued or running task that pins a model on `chat`
    also keeps the check running, and a check over two hours old counts as none: nothing is
-   swapped or held on it. Each switch is one low alert; once the model is served again (the hold ends
-   or the check lists it) the next start runs it. A served model ranked above a route's own model
+   swapped or held on it. Each switch (per tier, routes rule or picked model) is one low alert; once the model is served again (the hold ends
+   or the check lists it) the next start runs it. A run already in flight swaps too: its bridge
+   knows the ranking's other unparked models, and once the endpoint refuses the run's model
+   (`model_not_found`, `unrecognized_model` or HTTP 404), or 3 errors in a row (5xx or timeouts)
+   come while the fresh /models check leaves it out, that call and the rest of the run go to the
+   highest-ranked one the check lists, with its own effort fields and context window. The run note
+   keeps each swap (`model_rank.mid_run`: from, to, at, why), each is one low alert, and a refused
+   model is down for new starts. Claude Code's compaction window (`CLAUDE_CODE_AUTO_COMPACT_WINDOW`)
+   is set once at start, so a smaller stand-in window relies on the bridge's "prompt is too long"
+   answer to compact. A required pin never swaps mid-run, and with no stand-in served the error goes
+   back as before (`model_missing`). A babysit decision every candidate failed asks the next ranked
+   served model once before it falls back. A served model ranked above a route's own model
    (tier, rule or run class; never a task's pin) is tried at once: light starts run it until 3 of its
    runs end without a fallback, then every tier does. A run on it that fails on the model itself
    (malformed answer, timeout, no hand-off) during those runs, or such faults in over a fifth of 8 or
    more runs later, parks it for a week with one low alert; then it is tried again from scratch.
    One shared daily bench per machine (`ttp model-bench run`, `runtime/ttp/modelbench.py`) keeps these
-   verdicts current: from 02:00 local time the first daemon on the machine whose `chat` provider has an
-   endpoint runs it (one machine-wide lock; the others find today's result in `~/.tt-project/model-bench/`
-   and read it; `ttp model-bench show` prints it and the owner). It sends six short prompts, graded by
+   verdicts current. One project on the machine owns it (`~/.tt-project/model-bench/owner.json`,
+   `runtime/ttp/benchowner.py`): at first the first eligible project by name, where eligible means a live
+   daemon, a `chat` endpoint, not paused and no `model_bench.opt_out`. The owner keeps a model-free command
+   schedule `model-bench` that starts `ttp model-bench run --detach` daily at `model_bench.bench_at`
+   (default 02:00 home time); every other project's is off. Every daemon checks the lease hourly without a
+   model call: no result (or recorded keyless skip) for `model_bench.poke_after_h` (default 48) pokes the
+   owner once per episode, and its daemon runs the bench at once with one feed line in each project; for
+   `model_bench.take_over_after_h` (default 72), or with the owner paused, opted out or its daemon gone,
+   the next eligible project by name takes the lease under a lock (exactly one winner) and posts one low
+   alert naming the old owner. Other projects' databases are only read. One machine-wide lock keeps a
+   second run that day from doing anything; every project reads the result from
+   `~/.tt-project/model-bench/` (`ttp model-bench show` prints it and the owner). It sends six short prompts, graded by
    fixed checks and never by a model (one plants an instruction the model must ignore), to the top four
    served ranked models, every served model not benched before, and once a week to models that scored
    under two thirds or that a project parked. A weak score keeps a model parked; a parked model that
    passes is free again at once. With no working key for the endpoint no model is called: the day is
    recorded as skipped and one low alert is posted per outage.
+   A model-free scoreboard (`ttp model-bench scores [--json]`, `runtime/ttp/modelscore.py`) ranks the
+   chat models per task class: `babysit`, `light`, `standard` and `review` (review tasks; else the
+   light tier is `light` and the rest `standard`). Every project whose `chat` provider has an endpoint
+   writes its own live rows hourly into the account file `~/.tt-project/model-scores.json` (merged
+   under a lock; a project not seen for 14 days drops out), from its chat worker runs of the last 14
+   days. Per model and class a row counts the ended tasks whose first chat run the model had (a run an
+   endpoint fault ended counts for nobody), the first-try done ones (handed off with no fallback), the
+   bad ones by the same rules as the model tripwire (failed, checks failed, review failed, reworked),
+   the runs' fallback, no-hand-off and salvaged ends, the median wall time per task and the output
+   tokens per second. A model's quality is its bench score (the daily bench's conclusive results and
+   any `~/.tt-project/model-bench/*.jsonl` rows `{"model", "score" (0-1 or 0-100), "suite", "class",
+   "inject_ok", "at"}`, the latest per suite, averaged), else the Artificial Analysis index score as a
+   prior, blended with its live good share, which weighs n / (n + 10) for n samples
+   (`providers.chat.class_prefs.live_k`); with neither, live alone. Each class's order follows
+   `providers.chat.class_prefs.<class>.prefer`: `smart` (highest quality first), `fast` (the fastest
+   model, by median wall time then tokens per second, within `margin_pts`, default 5, of the best and
+   at or above the class `floor`, default 0) or `auto` (the default: fast for `babysit`, smart
+   elsewhere). Unscored models go last in the account ranking's order. The result is the account value
+   `providers.chat.class_ranking.<class>`, and `providers.chat.model_ranking` is kept equal to the
+   `standard` class, so everything above reads it unchanged; each change is one line in
+   `model-ranking.jsonl`. Once the scoreboard ranks, the Artificial Analysis refresh stops writing
+   `model_ranking` and only keeps its scores as the prior. A model whose latest bench failed the
+   planted-instruction prompt is left out of the `babysit` class. The scoreboard never turns a route
+   off.
    Endpoint faults (down, rate limit, auth) park nothing. With no ranked model served, or the whole endpoint
    cooling down, runs start on the core provider as before. Only `chat` has a served list: Claude
    Code, Codex and Cursor models are not ranked (provider failover covers a provider that cannot start
@@ -1435,6 +1519,25 @@ back on (`ttp model-trip --h2h <kind/tier/label> --ok --ref <result>`); samples 
 `ttp model-trip` lists the strata. Settings: `providers.chat.dispatch.tripwire` (`min_samples` 10,
 `margin_pts` 10, `days` 14).
 
+Live model demotion (`modeldemote.py`, model-free, hourly, only with a `providers.chat.model_ranking`):
+per class (`review` for a review, else the run's tier) and chat model, each task whose first worker run
+ran on the chat provider and ended in the last `days` is a sample; it is bad by the tripwire's rules or
+when a run of it fell back on the model's own fault. The classes rank by
+`providers.chat.class_ranking.<class>` where set (a project's own value, else the account's), else by
+`model_ranking`. A model's peer is the next eligible model below it (else above) with `min_samples`
+samples. Once both have them and the model's bad rate is more than `margin_pts` points above the
+peer's, or in a fast class (`fast_classes`, plus each class whose `class_prefs.<class>.prefer` is
+`fast`) its median wall time is over `slow_x` times the peer's, the model is demoted for that class:
+routed starts there run the next ranked model and `better()` never picks it. A model whose malformed
+or no-hand-off share passes `fault_share`, or whose last bench score is under `floor` of the best
+benched, is parked for every class (weekly bench recheck only, out of the daily bench). Each action
+is one low alert and one coordinator digest line. Only a newer passing bench score ends the
+detector's demotion; samples then count from it. `ttp model demote|promote <model> [--class c]` and
+`ttp model park|unpark <model>` set them by hand, recorded with the setter; a lower setter
+(detector < coordinator < user) never overrides a higher one's record, and a user's promote holds the
+detector off. `ttp model` lists the records. Settings: `providers.chat.demote` (`min_samples` 8,
+`margin_pts` 15, `days` 7, `slow_x` 2, `floor` 0.5, `fault_share` 0.2, `fast_classes` [`babysit`]).
+
 ## Asks
 
 The project asks the user only when a step could affect people badly (destroy someone's work or
@@ -1447,6 +1550,14 @@ A charter Restriction (changed through its own machinery) and a pause or hold th
 for the user's word. Nothing else does: a project's own gates (test-gate scope, hold scope, pacing,
 landing order, which settings the coordinator changes) are the coordinator's to decide and record,
 never held for "the user's word".
+
+- An open ask is shown in full wherever it waits on the user (user msg #2424): `ttp status`,
+  `ttp overview`, the web board's waiting-on-you column, a task's "waits on you" text, the daily
+  review and the ask-timeout notice all carry its whole text (question, options, recommendation,
+  command), never only its id. A model-free check on each outgoing coordinator reply and notify
+  (`pendingask.py`) appends the full text of an open ask it names only as "ask N"; a "still waiting
+  on you" that matches no open ask goes as written and is flagged in the next turn's notes. It never
+  rejects or drops a message.
 
 - Self-blocking check, model-free, once a minute (`selfblock.py`): a blocked or waiting task whose
   reason cites the user's word or waits for the user, a coordinator reply from the last hour that
@@ -1604,7 +1715,12 @@ session and stateless coordinators on every provider.
   with each project's running workers and set base, in `TTP_HOME/machine-workers.json` under a file
   lock; the lowest base a live project set holds, and each start claims its place under the lock. `machine.worker_limit` is `auto` (on for
   macOS or a machine with a battery; off on lab and build servers), `on` or `off`; turn it off with
-  `ttp config <name> machine.worker_limit off`. Set values stay across upgrades.
+  `ttp config <name> machine.worker_limit off`. `machine.pace_from` is `moderate` (the default, as
+  above) or `heavy`, for a host whose projects only run agents: then only heavy CPU (idle under 5%)
+  or heavy memory (critical, under 5% free or PSI 20) cut that project's limit, a call and heat
+  count as before, and the project holds the machine's running workers to its own base rather than
+  the lowest base another project set (each other project still holds itself to its own). Set it
+  with `ttp config <name> machine.pace_from heavy`. Set values stay across upgrades.
 - Workers, reviewers, everything they start (detached checks, tests, reference models) and the
   daemon's pushes run at low CPU priority, 10 nice levels below the daemon (`runner.nice`, 0-19;
   0 = normal priority), so they never slow the machine's own work. The daemon and the coordinator
@@ -1647,6 +1763,11 @@ session and stateless coordinators on every provider.
   changed, and `-F`, ProxyJump and BatchMode work as before. A call that sets its own sharing or
   forwards ports is left as it is, and a shared connection that fails before the command starts
   falls back to a direct one (OpenSSH's own). Turn it off with `ttp config <name> ssh.reuse false`.
+- Each machine in `ttp machines` gets a harmless `ssh <alias> true` at most every 20 minutes
+  (`ssh.reach_probe_s`). The answer and its time are kept for every project on the host and shown in
+  the coordinator's digest. A reply or notify saying a machine can't be reached is marked false when
+  that machine answered within the last 30 minutes (`ssh.reach_fresh_min`), and unverified when no
+  probe is that recent.
 - A shared device or machine is taken per command, through its own queue (for example a device
   broker) or `ttp lock <resource> -- <command>`, so the rest of each task runs in parallel. A task
   marked exclusive holds the resource's lock for its whole run; while it waits for a slot, new
@@ -1861,9 +1982,19 @@ session and stateless coordinators on every provider.
   --machine <alias>`, or a message to any project's coordinator). The setter's daemon checks
   its end, or the machine's recovery owner when the setter cannot act.
 - Each task edits only its own worktree. A code task branches from the first of:
-  `delivery.base_ref`; `delivery.push_branch`, then a branch the charter names as
-  `branch <name>`, each only if it exists here or on origin; the remote's default branch
-  (`origin/HEAD`); the checked-out branch.
+  `delivery.base_ref`; `delivery.push_branch`, only if it exists here or on origin; the remote's
+  default branch (`origin/HEAD`); the checked-out branch. `worktree.shared_branches` lists more
+  branches many tasks start from, which no task claims as its own.
+- Gates that place work or pick its branch read structured settings, never the charter's wording,
+  so rewording, reordering or deleting charter text changes none of them. A project's machines are
+  those its config names (`machines.allowed`, `resources`, `shared_resources`; the change ledger,
+  health coverage, time to recover and idle capacity read these). Settings older harnesses read
+  from charter prose move into the config once, model-free, at the daemon's first start with this
+  release (logged, with a `harness` setter record; `ttp config <key> ''` reverts one, and the charter
+  never fills it again): the Resources machines into `machines.allowed` when the config names none,
+  the first existing charter `branch <name>` into `delivery.base_ref` when neither it nor an existing
+  `delivery.push_branch` is set, and the charter's other branches into `worktree.shared_branches`.
+  Nothing moves that the old reader did not use; `delivery.push_branch` is never written.
   Other kinds run in the project root unless `worktree.kinds` lists them (say `["work"]`); they
   must not move its HEAD. A run that leaves the root on another branch or with new uncommitted
   changes raises an alert naming it. Before a worktree is made, a root left detached or off its
@@ -2123,11 +2254,24 @@ session and stateless coordinators on every provider.
   checks wait there at most `checks.push_load_wait_s` seconds (default 300; `off`: no bound), then start on
   their branch's reserved lane alone, one per lane at a time. Heavy suites
   belong on another host where a project has one allowed (`delivery.checks_host`).
+  A check on another host gets its commit through a bare mirror of the repository kept in that host's
+  tt-project folder (`check-mirrors/`, beside `checks-env/`): each check streams a git bundle of only the
+  commits the mirror lacks over ssh (KBs once the mirror is seeded; a new mirror is seeded in steps, and a
+  check cut short resumes the seeding), checks it out into a fresh folder and removes the folder and its
+  ref afterwards. A new mirror is first filled from a clone already on that host when
+  `delivery.checks_seed` names one (`{"<host>": "<absolute path>"}`; that clone is only read), so only the
+  commits after the newest one both share cross the link. No tree is sent from here: a host without usable
+  git is the host's fault, unless `TTP_REMOTE_TREE_COPY=1` sends it the tree over a compressed ssh. A copy prints its
+  progress every 30 s (`TTP_REMOTE_PROGRESS_S`); one past its limit (`TTP_REMOTE_COPY_LIMIT_S`, default
+  540 s) or with nothing moving for 300 s (`TTP_REMOTE_COPY_STALL_S`) is the host's fault: the check waits
+  or runs elsewhere, never failing the change.
   Checks that run on another host (a check's own `"host"`, `delivery.checks_host` or a spill host), with at most
   light checks here, use none of this host's CPU: push checks and `ttp checks` take no host-wide checks slot or
   test slots here and never wait for this host's guard. They wait instead while their host's runnable demand,
-  read over ssh from its `/proc/stat` (cached 30 s), is above `checks.load_guard` times its cores, at most
-  `checks.push_load_wait_s`, and say which host holds them; an unreadable host never holds them.
+  read over ssh from its `/proc/stat` (cached 30 s, read fresh just before a start), with one run's cores for
+  each run this machine started there in the last 90 s (the load shows them late), is at or above 0.8 x its
+  cores (`checks.load_guard` x if lower), and say which host holds them, again every `checks.push_load_wait_s`;
+  they never start there while it is, however long that takes. An unreadable host never holds them.
   Waiters are served first-come: one whose project is at its budget lets other projects go first but keeps its
   place in its project's line, where the most urgent task priority goes first, then arrival, so that waiter gets
   the next freed slots. A priority-1 check whose project's budget is held only by less urgent runs takes one extra
@@ -2182,17 +2326,21 @@ session and stateless coordinators on every provider.
   wakes the coordinator per queue incident (from the first waiter past that threshold until none is); the
   rest are recorded `coalesced` and show in the digest and `ttp status`. The incident wakes it again only when
   a decision is due: its longest wait passes `checks.wait_escalate_s` (default 7200, then once per as long
-  again; 0 never), a holder has run `checks.wait_hang_factor` (default 3, 0 never) times the recent median
-  checks run (a likely hang), or a holder's task has ended (a review precheck: once no review reading it is open). An `observation_mute` on source
+  again; 0 never), a holder has run `checks.wait_hang_factor` (default 3, 0 never) times the median
+  passing run of its own command list (a full suite is never timed against targeted runs; a label with no
+  such run yet is not timed; a likely hang only once its log stopped growing, else slow), or a holder's task has ended (a review precheck: once no review reading it is open). An `observation_mute` on source
   `daemon:checks_slot_wait` covers these events too (recorded `muted`); coalescing already keeps a long queue
   to one wake, so a mute is only for a queue the coordinator has already decided to leave alone.
   `delivery.checks_spill_hosts` (an ordered list of ssh aliases, default empty: checks never leave this machine)
   lets a run that may spill try those hosts before it takes a place here (`delivery.checks_spill_first`, default
   true; false: only after waiting `delivery.checks_spill_after_s`, default 60 s, here) and run, with the test
-  workers that host's idle cores give it (cores less its 1-minute load), on the first listed host the
+  workers that host's idle cores give it (cores less its 1-minute load), on the emptiest host (its load plus
+  this machine's runs there, over its cores; no fixed per-host cap) the
   charter names, the machines list holds, no pause covers and whose `ttp lock <alias>` nobody else holds (the run
-  holds it shared while it runs), where no device job runs, that ssh reaches and that has a free slot; others
-  are skipped with the reason and the run keeps its place here. On a workstation or laptop,
+  holds it shared while it runs), where no device job runs, that ssh reaches, whose 1-minute load (with this
+  machine's runs started there in the last 90 s) is under 0.8 x its cores and that has a free slot; others
+  are skipped with the reason and the run keeps its place here. A host whose probe fails backs off (60 s,
+  doubling to 15 min, for every project on the machine) and is tried last until then. On a workstation or laptop,
   `delivery.checks_remote_only` (default `auto`: on there; `true`/`false` overrides) makes a heavy run wait
   for a busy spill host instead of taking a place here; it runs here, niced, only when every host is out of
   reach. Light checks (plugin validate, quick lints) stay here. A check that runs an agent CLI (`claude`, `codex`,
@@ -2221,7 +2369,12 @@ session and stateless coordinators on every provider.
   (`ttp config --account checks.spill_hosts '["pool-a", "pool-b"]'`; only the user sets it, a run may only
   clear it with `[]`), follows each project's own list, so every project on the machine spills to it without a
   list of its own; its hosts need no charter line but must be in the machines list. A project's own `[]` keeps
-  its runs here, pool included. Runs with a check host or the authoring tree never spill; runs behind
+  its runs here, pool included. The account's ban list, `checks.no_spill_hosts`
+  (`ttp config --account checks.no_spill_hosts '["host-x"]'`; ssh aliases or host names; a run may add to it but
+  never remove a host), keeps those machines out of every project's spill on this machine: a host matches by its
+  alias, its machine, or the machines list's `hostname` (full or short name). Setting a project list or the pool
+  that names one is refused, a project list set before the ban is flagged by the config check and skipped, and
+  `ttp checks status` shows the list. Runs with a check host or the authoring tree never spill; runs behind
   `checks.wrap_cmd` spill only when the project sets `checks.wrap_needs_device: false` (they run there without
   the wrapper; unset or true, the run stays here, and its `checks.log` and queue-wait item say `no spill host can
   take these checks` because neither `checks.spill_wrap_cmd` nor `checks.wrap_needs_device: false` is set). Two settings drop the wrapper, for different cases.
@@ -2248,6 +2401,16 @@ session and stateless coordinators on every provider.
   taken mid-run, gets one more try once free); a pass on another spill host counts, else the result here does.
   A run whose failures the tests gate (below) proved new on that spill host, the base passing them there, fails
   at once instead: the host is ruled out, so a rerun would only fail again while holding a slot.
+  A host whose own environment keeps failing runs is quarantined, per project and model-free: a spilled failure
+  (never a host fault, exit 75, nor a timeout) is a strike against its host once the same commit then passes
+  elsewhere (here or on another spill host); a pass there resets its strikes. After `checks.spill_quarantine_after`
+  strikes in a row (default 3) the host takes none of the project's runs for 6 hours, with one event and one
+  machine ledger entry whose auto-undo, `ttp checks --spill-back <alias>`, puts it back (run it by hand to end the
+  quarantine sooner). A failure that hits two or more spill hosts the same way within an hour (the same last error
+  line, paths and numbers aside, and the same failing pytest ids) with no spilled pass between is the project's
+  spill setup, not the hosts (a wrapper that lost its environment): one high event says so and no host takes a
+  strike; a failure that is a missing package at import is already the spill env fault above (told once, never
+  a strike, and no second event under the same checks config). A failure with neither an error line nor a failing test id matches no other: it is only a strike.
   `checks.json` (`spilled_to`), `ttp status` and `ttp checks status` name the host.
   `checks.slurm_overflow` (account-level, unset by default: nothing changes) sends a run that no pool host can take
   (each paused, busy with a device job, full or unreachable, or no pool at all) to a Slurm cluster instead of
@@ -2374,9 +2537,16 @@ session and stateless coordinators on every provider.
   `state/logs/churn.jsonl`, rotated to `churn.jsonl.1` past 1 MB. It never stops a process. A
   `ttp checks` or push inside a check command does not wait for its parent's slot. Checks that
   gate a push to the push branch (the push queue's batches and `ttp push`) hold the push lock, so
-  they never queue behind task checks: each push branch has one priority slot of its own beyond the
-  cap, shared host-wide across projects. Task checks keep their cap and their order. The batch log
-  and `ttp status` say when a push holds it (`push priority slot: ...`); a killed push frees it too.
+  they never queue behind task checks: each push branch has one priority slot of its own, shared
+  host-wide across projects. It counts toward the cap: a push holds it while it waits, so the next
+  slot that frees is its, ahead of every waiter, and no new run of any kind starts while the cap's
+  runs, push runs and urgent runs together fill the cap. Its tests take the test pool's free slots
+  ahead of the queue (fewer workers while the pool is busy), never a lane beyond the pool. Set
+  `checks.priority_beyond_cap` true (account-level, env `TTP_CHECKS_PRIORITY_BEYOND_CAP`, default
+  off) to run push and urgent checks beyond the cap, each with a reserved test lane beyond the pool,
+  as before. The batch log and `ttp status` say when a push holds it (`push priority slot: ...`,
+  `push checks next for a slot: ...` while it waits for room); a killed push frees it too. The
+  status line counts every run: `host checks: N running of cap M (incl. push P, urgent U)`.
   A push waiting behind another holder of its slot waits `checks.push_priority_wait_s` at most
   (account-level, default 1800 s), then says who held it and takes an ordinary host-wide turn instead.
   Waiters take turns by project, within one by task priority. Checks of priority-1 tasks (live-impact
@@ -2397,9 +2567,10 @@ session and stateless coordinators on every provider.
   still holds it); the cap and every other rule hold it as any run. An urgent run (priority 0 or 1: a task owed to the user,
   live-impact work) that would wait with every slot busy starts within about a minute, in this order:
   on a free host of the account's test pool at once (no `checks_spill_after_s` wait first; a paused
-  host is never picked); else on a reserved urgent slot beyond the cap, with a reserved test lane past
-  its project's cap (`checks.urgent_slots`, account-level, env `TTP_CHECKS_URGENT_SLOTS`, default 1, so
-  at most that many urgent runs above the cap at once; 0 turns them off); else, once it has waited
+  host is never picked); else on a reserved urgent slot, the next one free within the cap ahead of
+  every waiter, taking test slots ahead of the queue past its project's cap (`checks.urgent_slots`,
+  account-level, env `TTP_CHECKS_URGENT_SLOTS`, default 1; 0 turns them off; with
+  `checks.priority_beyond_cap` true they run beyond the cap, at most that many at once); else, once it has waited
   `checks.preempt_after_s` from its arrival (account-level, env `TTP_CHECKS_PREEMPT_AFTER_S`, default
   120; 0 asks at once), it asks one routine run on a cap slot to step back, once per request: a run of
   its own project first, then the least urgent, then the latest started. That run ends its current
@@ -2662,7 +2833,14 @@ session and stateless coordinators on every provider.
   fixture it changes, and a selection of half the suite or more stays targeted. A task's
   `ttp checks --full` is refused with a one-line reason unless the user set
   `delivery.checks_task_full: true`; `ttp checks --release` (the release cut's required suite) always
-  runs in full: never narrowed, refused or fast-pathed. A change only the full suite covers adds the tests it can place,
+  runs in full: never narrowed, refused or fast-pathed. A selection too long for one environment
+  variable goes compressed (`TTP_PYTEST_SELECT_FILES_Z`) and stays targeted. `delivery.task_checks`
+  (a check list, same form as `push_checks`) is a task's own quick set: a task's or review's
+  `ttp checks` runs it, targeted as above, instead of the push checks; unset, it runs the push checks
+  (the smoke set that gates a landing). The push train (or `ttp push`) still runs the push checks
+  once per batch on the merged heads, drops only the change at fault and lands the rest, and
+  `delivery.post_land_checks` runs the slower tests after landing, so nothing lands without its push
+  checks passing. A change only the full suite covers adds the tests it can place,
   and the scope line ends `; the push batch runs the rest: <reasons>`. With the push queue off a
   task's checks narrow and widen as before. Each checks run records its wall and CPU seconds
   (`wall_s`, `cpu_s`) in `checks.json`; `ttp stats <name> --landing` shows per day the test runs and
@@ -2706,6 +2884,20 @@ session and stateless coordinators on every provider.
   whether it died at startup, in a reboot or later, instead of waiting. From a sandbox that runs
   each command in a PID namespace of its own (Codex on Linux), which kills a background process
   when the command ends, the push is queued and the daemon starts it; the probe exits 1 meanwhile.
+- `ttp push --cancel <marker>` stops a detached push before it lands: a queued one is never
+  started, and a running one has its process group (the push, its checks and git) ended, TERM then
+  KILL, which frees its run lock, check slots and check scratch. The marker then reads `cancelled`,
+  the push log and the run's notes say who cancelled it, and `--result` reports it not pushed. Only
+  the task that queued the push may cancel it (the project's coordinator may cancel any push of its
+  project); another task's push is refused (exit 2). Exit 1 when it had already pushed.
+  `ttp push --stop <marker>` is the narrower form: it ends only the caller's own push and refuses one
+  already in its `git push` (exit 1).
+- Inside a run, `ttp push --land` lands the task's own branch though its spec has no landing step,
+  and skips the guard that wants `ttp checks` passed on HEAD. It never skips a review: when delivery
+  has a review step (`delivery.review_before_pr`, on by default, or a `delivery.push_branch`; with
+  `review.auto` off too), it lands only a commit a passed review accepted for that task (the review
+  marker), exactly HEAD. A review of an older head does not cover a newer one; without one the push
+  is refused (exit 2), naming the missing review. With no review step, `--land` lands as before.
 - `delivery.version_bump` lets `ttp push` own the version bump, so parallel reviews never race for
   one version: `{"files": [...], "changeset_dir": ".changeset"}` (optional `package`, and `paths`,
   default the folder the files share). After each rebase, when the change touches `paths`, it
@@ -2827,7 +3019,9 @@ session and stateless coordinators on every provider.
   deploying project's daemon runs the host-side takeover itself, `ttp upgrade <name>
   --take-over-from <task>`, which fences that task even while it still shows activity. It
   tries up to three times, five minutes apart, and the check closes only when that project's
-  own daemon reports the release (output in `logs/takeover.log`). A live daemon
+  own daemon reports the release (output in `logs/takeover.log`). A try that defers (exit 75)
+  while a merge task that is still working holds the merge spends no try: the check waits for
+  that task to end, and reports it as a stuck owner after 6 h. A live daemon
   whose files are already at the release but that has not restarted onto them (or not yet
   ticked on them) is pending too, owned by that daemon, and is re-checked after
   `delivery.deploy_restart_wait_s` (default 900). A daemon that
@@ -2876,6 +3070,28 @@ session and stateless coordinators on every provider.
   ... interpreter, version differ`). The push queue keys its own passes the same way. Only the task's own branch is pushed that way: the push branch
   always gets its own checks. Records live under the project's state
   (`push_check_passes.json`, newest 200 within 14 days; `push_check_resume/`, newest 20 within 3 days).
+- Open branches and work threads: the daemon counts, hourly and without a model call, each
+  project's open code branches (task branches with commits not on the push branch, not landed, of
+  an unfinished task, a done task awaiting its push or one an unfinished task depends on) and
+  running workers. `ttp status`, the web app (`branches` in the
+  state payload) and the coordinator's Course check show them. Over `delivery.max_open_branches`
+  (default 6) or `delivery.max_work_threads` (default 4; 0 turns a cap off) one alarm line asks the
+  coordinator to give new non-urgent code work that overlaps an open code task that task's branch
+  (`pr_branch:`) or fold it into its spec, and to land open branches before opening more. The caps
+  are soft: they hold no work, urgent and user-ordered work runs as before, and the dollar caps stay
+  the hard limits.
+- Landed branch cleanup: once a finished task's change is on the push branch and its worktree is
+  gone, the daemon (and `ttp prune`) saves its tip as `refs/ttp-archive/<branch>`, deletes the
+  local branch and appends branch, sha, task and that ref to `state/branch-deletions.jsonl`
+  (`git branch <branch> refs/ttp-archive/<branch>` restores one). A branch an unfinished
+  task uses, one on a remote other than `delivery.backup_remote`, one whose task has a PR and one
+  with a commit by an author other than the repository's `user.email` are kept.
+  `delivery.delete_landed_branches: false` turns this off.
+  A dead branch, whose tasks all ended (done, cancelled or failed) more than
+  `delivery.dead_branch_days` ago (default 3; 0 turns it off) without a push queue approval and
+  with no unfinished task depending on them, is deleted the same way, with the same keeps (also
+  never one checked out in any worktree), and recorded with `why: dead`. Such branches, and those
+  of cancelled or failed tasks, are not counted as open.
 - `delivery.backup_remote` (off by default) names a git remote that each finished code task's
   branch (`ttp/t<id>-...`) is pushed to under the same name, fast-forward only: never forced, never
   to `main`, `master`, the push branch or `delivery.base_ref` (a value naming one is refused). A
@@ -2926,6 +3142,19 @@ session and stateless coordinators on every provider.
   1 the push failed; each move is logged to `state/channel_tags.jsonl`. Creating a tag is unchanged.
   The coordinator may set `new_branch` and `never_force` true itself, `lease` only on the user's
   word.
+- `delivery.integration_branch` (`ttp/integration` when unset) is the one branch per repo that
+  compatible reviewed changes land on when the project has no `delivery.push_branch` (a PR project,
+  through one draft PR); with a push branch, the push branch is the integration branch. A code task
+  that finishes on a branch a queued review already covers (a `pr_branch:` task stacked on it, a
+  batch) joins that review rather than getting its own: the review lists each member with its
+  acceptance criteria and each finding names its member (`task #<id>:`). The reviewer gives a
+  verdict per member (hand-off `members`: `{"<id>": "pass"|"fail"}`, else a member fails when a finding
+  names it): with the push queue on, the passing members' own heads are approved together while the
+  review waits as `pushing`, and the fix and its re-review are scoped to the failed members' part
+  only. A passing member built on a failing member's commits is not approved; it waits for the
+  re-review. A change that conflicts on
+  the integration branch (`git merge-tree`) or has a `no_push:` line keeps its own branch, and
+  `ttp status` shows the integration branch, what waits on it and each change kept apart with why.
 - `delivery.own_push` (`existing_only` when unset) says which remote branches besides the push branch
   `ttp push --own` may push to, and every push that publishes as with `--own` (a notes branch, a
   `pr_branch:` or `rebases:` task). The branch is the one the task was built on (its latest
@@ -2973,6 +3202,11 @@ session and stateless coordinators on every provider.
   cannot tell (offline, no auth, a timeout). `repositories/<id>/...` paths are covered like
   `repos/<owner>/<repo>/...` and, naming no repo, are always checked. Put the project's own rules (such as labels its
   PR bodies must start with) in the command, never in the plugin.
+- Text for people other than the user (posts, comments, emails and the post-ready drafts a project
+  hands the user's agent): answer what was asked, first and plainly, like a colleague; skip side
+  details the reader can live without (numbers, lists or internal ids only when they bear on the
+  question or the reader needs them to act). The worker and coordinator prompts and the relay skill
+  say so. It is guidance, not a gate: no guard checks a post's length or wording.
 - `delivery.ai_tag` (default `[authored by AI]`; `""` turns it off) is the AI-authorship tag that
   everything a run posts where people other than the user read it ends with. Prompts state the rule,
   and two model-free guards refuse a post whose last text line lacks the tag (or a similar disclosure
@@ -3198,6 +3432,7 @@ is open raises one `cap_wait` event naming the key.
 | `delivery.push_min_gap_s` | 1800 s, only after a batch that did not end clean | the next push | safety |
 | `budget.max_parallel_workers` | 6 | worker runs at once | safety (spend) |
 | `machine.worker_limit` / `machine.max_workers` | auto (laptops and workstations) / null: binds only under real pressure (then the cores, 2-32), paced down | worker runs at once across all projects on the machine | safety (host) |
+| `machine.pace_from` | moderate: moderate and heavy readings cut the limit and the lowest base any project set binds; heavy: only heavy CPU or memory (plus a call or heat) cut it and the project keeps its own base | which readings and bases pace this project's machine-wide limit | safety (host) |
 
 ### Queue waits over 30 minutes
 
@@ -3210,7 +3445,11 @@ holds and waits for each place, and the wait so far. Its unblock options come fr
 without a model call: spill to an allowed check host (only when the project or account lists one), raise
 a cap within the host's limit (never a cap the user or account set), let it go ahead of routine work,
 route to another allowed device, cut the stale queued tail, or cancel it (never a user's own task). A
-resource the user paused leaves no option: the user is told once.
+resource the user paused leaves no option: the user is told once. The push queue's occupancy also counts
+pushes that never enter push_queue (`ttp push`, detached or not): the live holder of the branch push lock
+is running (with its step and minutes held) and each other running detached push is queued (with its last
+`ttp push:` log line). While that holder lives within a push check's time limit (4 h) no wait behind it is
+raised; a holder whose pid died frees the lock, so the wait is raised as before.
 
 The coordinator must act on it that turn, in either the per-wake or the persistent session and on every
 provider: a `config_set`, a `task_add` or `task_update` naming the key or updating the task, or a reply
@@ -3291,7 +3530,11 @@ lines to a template prompt, the upgrade fences them that way itself. Only a real
 the project and upstream rewording the same line, or each adding its own version of one line (the
 same leading key, or most of the text alike), goes to a harness task, queued at once with at most one
 open; a newer release retargets it. One that ended without landing holds off the next only until a
-newer release or an edit to the project's own runtime or template files, never on a timer.
+newer release or an edit to the project's own runtime or template files, never on a timer; one the
+project cancelled holds off nothing. When a cancelled task left its merge committed (in a worktree of
+the harness or on its own branch), a host-side `ttp upgrade <name>` merges that commit with the
+current template and main and applies it with no task, if both merge without a conflict and the
+result compiles and imports; otherwise it queues a task as usual.
 The same conflict deferred past 48 h, or past two harness tasks that ended without landing it,
 reaches the coordinator once as a normal observation, not once per deploy.
 
@@ -3355,6 +3598,73 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   `ttp web <name> --tunnel --keep` opens and keeps an SSH local forward to it. The first one is
   asked once per user (`ttp consent tunnel yes|no`, kept in `~/.tt-project/consent.json`); a kept
   tunnel already installed counts as a yes.
+- `ttp bridge` lets lab boxes log in to hosts through ssh agents on the user's workstation, so no
+  key is ever stored on a box. Configure it on the workstation in `~/.config/tt-project/bridge.json`
+  (start from `docs/access-bridge.example.json`; JSON, so the stock Python reads it). Then run
+  `ttp bridge setup [BOX...]`, `status`, `doctor`, `stop [--remove]` or `show` (prints, changes nothing).
+  - It keeps one ssh session per box and agent as a user service (launchd or systemd, restarted after
+    drops and sleep). Each session forwards exactly one agent and links it on the box to
+    `~/.ssh/tt-agent/<agent>.sock`.
+  - Hosts the box cannot reach by itself are reverse-forwarded to a loopback port on the box (their
+    ssh port only), so their source-address limits still see the workstation. Hosts the box reaches by
+    itself (GitHub) only get the agent: their traffic never passes through the workstation.
+  - The box's `~/.ssh/config` gets one marked block at the top, written after a backup with the
+    rest of the file kept. It holds a `Host` entry per host with its `127.0.0.1` port and
+    `IdentityAgent ~/.ssh/tt-agent/<agent>.sock`, and nothing else. The tool refuses a block with an
+    `IdentityFile`, key text or a proxy; its one proxy line, `ProxyCommand none`, turns off an older
+    entry's proxy for the names it forwards.
+  - A box's optional `hold_check` (an absolute path on the box, run as `<it> %n %h`) keeps a host
+    someone holds refused: it exits 0 for a held host and 1 for a free one, and only that 1 lifts
+    the older entry's refusing proxy. A missing or failing check counts as held, so the check can
+    keep a hold but never lift one.
+  - A project on the box just runs `ssh <host>` or `git` over ssh as usual.
+  - It fails closed. While the workstation sleeps or its session is down, the forwards are closed
+    and the link dangles, so those logins fail. A run that needs them waits or hands off.
+  - It carries ssh only. The GitHub API (`gh`: PRs, CI, comments) is not bridged; read that from
+    the workstation side.
+  - What is exposed: every process of the box account can use a forwarded agent while its session
+    is up, so forward only agents whose keys that account may use. Other accounts on the box can
+    open the loopback ports, which reach only the hosts' sshd and still need a key. Nothing listens
+    on a non-loopback interface, as long as the box's sshd keeps `GatewayPorts` off (its default):
+    `GatewayPorts yes` would open the forwards on every interface. The link folder must be the box account's own, mode 0700 and no
+    symlink, or the session exits; the workstation relay listens only on unix sockets (folder 0700,
+    sockets 0600) and stops on the same check.
+  - The link and the box's ssh config are rewritten only when they change, so a reconnect touches
+    nothing on the box.
+  - The session's own login key must be allowed to forward an agent: an `authorized_keys` line with
+    `restrict` and no `agent-forwarding` gives none (`doctor` says so). Name a key that may forward
+    under `login`.
+  - A forward entry with `"adopt": true` uses a loopback port another kept forward already serves.
+  - A forward entry with `"interface": "<name>"` is for a host the workstation reaches only bound to
+    one interface (a VPN used through ssh's `BindInterface`). Its box port goes to a small relay on the
+    workstation that connects to the host's port 22 over that interface. The relay ends with the session.
+  - Agent `"env"` is the service's own `SSH_AUTH_SOCK`, even when `login` names another agent.
+  - **Offline mode (short-lived certificates).** Off unless the config has a `"cert"` section (see the
+    example). Each box listed there gets its own key, made on the box by
+    `ttp bridge cert renew --make-key` in a tool folder (`key_dir`, mode 0700); its private half never
+    leaves the box. While the workstation is online, `renew` signs the key's public half and puts the
+    certificate back on the box. The certificate is valid `validity_hours` (default 72) for the listed
+    `principals`, only from the box's `source_address`, with no agent, port or X11 forwarding (a pty
+    unless `"pty": false`). `ttp bridge cert schedule` runs `renew` every 30 minutes as a user service;
+    it signs again once less than half the validity is left.
+    - Signers: `"agent-ca"` signs with a CA key held in the workstation's ssh agent or keychain
+      (`ssh-keygen -s <ca.pub> -U`; the tool never reads or writes a private key file). `"command"`
+      runs an outside signer (a central CA): the box's public key on stdin, the request in
+      `TTP_CERT_PRINCIPALS`, `TTP_CERT_VALIDITY_MINUTES`, `TTP_CERT_SOURCE_ADDRESS`, `TTP_CERT_KEY_ID`
+      and `TTP_CERT_PERMIT_PTY`, the certificate on stdout. A certificate for another key, from another
+      CA, for other principals or addresses, with more rights or a longer life is refused, not installed.
+    - Each target user trusts the CA with one line in their own `authorized_keys`, printed by
+      `ttp bridge cert trust --print` (`cert-authority,principals="..."` plus no forwarding). Nothing
+      edits `authorized_keys`; to undo, delete that line, or `ttp bridge cert remove` on the box side.
+    - The box's block sends each `hosts` entry direct with the box's key and certificate only while
+      that host's bridge link does not answer and the certificate is valid. Once it has ended, ssh
+      prints that it ended and the login fails: every login method is off for that host, so no other
+      key is tried. `ttp bridge cert status` shows each box's validity, address and principals (exit 1
+      when one is missing or ended).
+    - What works offline: ssh logins from the box to hosts it reaches by itself and that trust the CA.
+      What does not: hosts the workstation reaches only through its VPN (an `interface` host, such as
+      a remote lab behind a site VPN) stay down while it is offline; GitHub over ssh needs the GitHub organisation to add
+      the SSH CA; the GitHub API (`gh`) is not bridged at all.
 - Workers run with your permissions, in their own worktree; restrictions in the charter are
   passed to every worker and enforced by the provider where it can (for example, no web tools).
 - When the user loosens or removes a Restrictions item (a quoted edit, or a `replaces` of a whole
@@ -3405,21 +3715,18 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   and each provider's login file, plus every file under the write guard's protected paths (its defaults
   and `guards.protected_paths`, in HOME and the account's own home; known_hosts, gh's state file and
   cache folders left out). Only size, mtime, ctime and inode are compared, never contents: no key or
-  token is opened or hashed, and ctime still shows a same-size rewrite. A change queues one
-  observation for the coordinator naming the run and the path (one per path and minute when several
-  overlapping runs saw it). When this machine's change ledger (`ttp machines change list --all`) has
-  an entry made while the run ran that names the path, the change was a recorded, deliberate one: the
-  observation is normal severity, names the entry, its project and task, asks for no urgent work, and
-  the run's hand-off stands. A change of ctime alone (a chmod: same size, mtime and inode) is told at
-  normal severity and fails no run. A change made while another run of any project on the host was open
-  too (the file's new ctime falls inside both runs' windows, `credwatch.classify`) is told once as
-  changed outside these runs and fails no run: at normal severity when rewritten in place at the same
-  size, high when the file is new, replaced or resized. Otherwise it is high and quotes the first line
-  of the run's transcript that names the path or runs a command that writes such a file (ssh-keygen
-  without a scratch `-f`, `gh auth`, `git credential`), or, with none, says the run's commands did not
-  show it and gives the file's time, so the search starts there; and the run's hand-off is stored
-  failed (a removal, or a change only this run was open for). Provider login
-  files count only when removed or
+  token is opened or hashed, and ctime still shows a same-size rewrite. A run's hand-off is stored
+  failed only for a change its own transcript shows: a line that names the path or runs a command that
+  writes such a file (`gh auth login`, `refresh`, `switch` or `logout`, ssh-keygen without a scratch
+  `-f`, `git credential`). That run gets one high observation quoting each line. Every other change is
+  told once for the whole host, whichever run of any project ends first (a claim per path and change
+  minute in the account's tt-project home), in one observation per run that fails no run: a change of
+  ctime alone (a chmod), one this machine's change ledger (`ttp machines change list --all`) records as
+  made while the run ran (named with its entry, project and task), and one no transcript shows (you,
+  your agent, or another process). It is high when a file is new, removed, replaced or resized, else
+  normal, and says how to record a deliberate change (`ttp machines change add <alias> "<what> <path>"
+  --undo 'none: deliberate'`) so later runs are not blamed. A write a run makes through a script whose
+  command line does not name the path is told, not failed. Provider login files count only when removed or
   rewritten to under half their size, since their CLIs rewrite them on every token refresh. Nothing is
   restored automatically: without reading contents the harness cannot tell damage from a real change (a new
   `gh auth login`, a refreshed token, a rotated key, by you or another run at the same time), a restore
@@ -3463,9 +3770,17 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   `~/.docker`, `~/.config/git`, `~/.config/gh`, the cloud folders) passes, any other mention of the
   folder (`grep -r token ~/.kube`, `tar cz ~/.docker`), a glob naming it, `..` or a second mention
   does not.
-  ssh, git and gh still read them themselves: `ssh -i <key>`, `-o IdentityFile=`, `ssh-add`,
-  `ssh-keygen`, and chmod or test of a key pass, also as the ssh command given to rsync (`-e`,
-  `--rsh`, `RSYNC_RSH`) or git (`GIT_SSH_COMMAND`, `-c core.sshCommand=`); a `stat` with a format
+  ssh, git and gh still read them themselves. A key path passes by one rule: it is the direct value
+  of `-i` or `-o IdentityFile=` of ssh, scp or sftp, also inside a plain `ssh -i <key>` that git
+  (`GIT_SSH_COMMAND` right before git, `-c core.sshCommand=`, for fetch, clone and ls-remote) or
+  rsync (`-e`, `--rsh`, `RSYNC_RSH` right before rsync) runs, and nothing in that call runs a local
+  program (no `ProxyCommand`, `LocalCommand`, `KnownHostsCommand`, `Match exec`, `Include`, `-F`
+  with another config, scp or sftp `-S`, no `;`, `|` or `$(...)` inside the ssh command, no git
+  `-c` alias or `--upload-pack`). Every other mention of a key path, an exported
+  `GIT_SSH_COMMAND` too, is refused as a credential-store read. Known gaps, accepted: programs git
+  starts on its own (hooks, config an earlier call wrote), an ssh config an earlier call wrote, and
+  a key path read back from a running ssh's process table. `ssh-add`, `ssh-keygen`, and chmod or
+  test of a key pass; a `stat` with a format
   (`-c`, `--format`, `--printf`) passes when nothing pipes or redirects its output, and a path with a
   `..` part never counts as public. A command ssh runs on another host is checked the
   same way (`ssh box 'mkdir -p ~/.ssh'` passes, `ssh box cat ~/.ssh/<key>` does not), quotes inside
@@ -3636,12 +3951,22 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   symlinks, and checks both the run's HOME and the account's own home. Reads pass, also in code
   that runs a command or compares with `>`; code with a write call (a copy too), or that runs a
   write command (`tee`, `cp`, `dd`, ...), a redirect or a login tool whose target it builds, and
-  names one of these paths anywhere is refused, since a variable may carry it. Add a path for one project with
+  names one of these paths anywhere is refused, since a variable may carry it. That holds for code
+  that only uses a key as an ssh or git identity too (a known false positive): run ssh or git as a
+  plain shell command instead, or name the key as `IdentityFile` in an ssh config. A shell line
+  that uses a key passes only by the key rule above (the remote command is the host's), with no
+  other variable before it, no command substitution, no redirect to a built target, and beside it
+  only plain commands such as `cd`, `echo` or `cat`; otherwise it is refused as a credential-store
+  read. Text ssh runs on another host is read too (its remote command, a file, pipe or heredoc on
+  its stdin, a file scp or rsync copied there and then run): with `~` as the remote home it may not
+  change that host's default keys, ssh config or authorized_keys file (appending a key passes).
+  Add a path for one project with
   `ttp config guards.protected_paths '["~/.config/example-access"]'`, or for every project in the
   account settings (`~/.tt-project/settings.json`, same key). A setting only adds: the built-in
   folders always stay. Tests and experiments use a scratch `HOME`, `XDG_CONFIG_HOME` and
   `GH_CONFIG_DIR` instead. Not caught: a path the code builds at run time from parts no word of
-  the command names. Which tools each provider covers is in providers.md.
+  the command names, and a git hook, git config or ssh config an earlier, separate command
+  planted that a later key use runs: a write those make is not blocked. Which tools each provider covers is in providers.md.
 - No `ttp` command prints a saved key. `ttp secret check [alias]` tests one (reachable, auth ok or
   auth failed), lists the model ids it serves and marks each `providers.<p>.tiers.*.model` of the
   current project it does not serve, with no key, URL or host in its output, and `ttp secret env <alias> -- <command>` gives it to a command in `OPENAI_API_KEY`
@@ -3709,6 +4034,10 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   elapsed share of its budget (flagged estimated).
   A run that wrote no output and reported no tokens is booked at $0 (except on an older Cursor
   build, which prints nothing until it ends).
+- A Claude run that forks the coordinator's session reports the parent session's total too, so it
+  books its own tokens at list price instead. Its subagents (Agent or Task tool) count as its own:
+  their calls, which the result's usage leaves out, are read from the stream and the session's
+  subagent transcripts and priced each at its own model (the note's `subagent_usd`).
 - Codex workers run in `danger-full-access` (no sandbox) by default. With `providers.codex.write_fence:
   true` or the `no_internet` restriction they run in Codex's workspace-write sandbox, with the
   project's state folder, the repository's git folder and the shared lock folder

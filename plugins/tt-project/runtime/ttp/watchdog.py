@@ -221,6 +221,8 @@ def _ctl(*args: str, timeout: float) -> str:
 def _restart(p: Project, pid: int, grace_s: float) -> tuple[bool, str]:
     """Restart the hung daemon through its service. Returns (it worked, how)."""
     from . import service
+    if why := service.foreign_refusal(p, "restart"):
+        return False, why   # from a run of another project: left as it is
     svc = service.installed(p)
     if svc and svc["kind"] == "systemd":
         unit = service._unit(p).name

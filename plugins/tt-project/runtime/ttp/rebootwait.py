@@ -31,6 +31,8 @@ _ASSIGN_RE = re.compile(r"[A-Za-z_]\w*=")
 # A probe script from a run folder larger than this is not read: it counts as a run-folder file.
 _SCRIPT_MAX = 64 * 1024
 _SHELLS = {"sh", "bash", "dash", "zsh", "ksh", ".", "source"}
+# An absolute .rc path within an inline shell command's text.
+_ABS_RC_RE = re.compile(r"(?<![\w.$}~-])/[^\s'\"]*\.rc(?![\w.])")
 
 
 def _commands(probe: str) -> list[list[str]] | None:
@@ -59,21 +61,70 @@ def _local_part(cmd: list[str]) -> list[str]:
     return cmd
 
 
+def _is_check(words: list[str]) -> bool:
+    """Whether these words run `ttp detach --check` (after any VAR=value)."""
+    while words and _ASSIGN_RE.match(words[0]):
+        words = words[1:]
+    return len(words) >= 3 and words[0].rsplit("/", 1)[-1] in ("ttp", "ttp.sh") and words[1] == "detach" \
+        and "--check" in words[2:]
+
+
+def _remote(words: list[str]) -> bool:
+    return any(w == "--host" or w.startswith("--host=") for w in words)
+
+
+def _named_rcs(words: list[str]) -> list[Path] | None:
+    """The .rc paths any other local command names (`test -s <rc>`, `[ -e <rc> ]`, `grep -q 0 <rc>`, a
+    script given `<rc>` or `--rc=<rc>`, `bash -c '<that>'`): a gate on a detached job whatever wraps it.
+    A doubtful word (a command substitution, a relative, unexpanded or glob .rc word) puts only this
+    command in doubt: None when it also names an absolute .rc (the whole probe is then in doubt), else
+    [] (it gates on no job, and the probe's other commands keep theirs). echo, printf, true and : gate
+    on nothing; a --host command is remote."""
+    while words and _ASSIGN_RE.match(words[0]):
+        words = words[1:]
+    if not words or words[0].rsplit("/", 1)[-1] in ("echo", "printf", "true", ":") or _remote(words):
+        return []
+    out: list[Path] = []
+    doubt = any("$(" in w or "`" in w for w in words)
+    for i, w in enumerate(words):
+        if i and words[i - 1] == "-c" and words[0].rsplit("/", 1)[-1] in _SHELLS:
+            got = local_jobs(w)   # an inline shell command: its own commands, judged the same way
+            if not got and _ABS_RC_RE.search(w):
+                return None   # it names an absolute .rc but in doubt
+            out += got
+            continue
+        w = w.partition("=")[2] if w.startswith("-") and "=" in w else w
+        if not w.endswith(".rc") or w.startswith("-"):
+            continue
+        if not Path(w).is_absolute() or "$" in w or any(c in w for c in "*?["):
+            doubt = True
+            continue
+        out.append(Path(w))
+    if doubt:
+        return None if out else []
+    return out
+
+
 def local_jobs(probe) -> list[Path]:
-    """The .rc paths of the local `ttp detach --check` commands in a retry_when, alone or within a
-    compound probe (&&, ;, ||, other tests; split as _commands splits it), in order, once each. A check
-    with --host, or one after an ssh, is the other host's and never counted. [] when it checks no local
-    job or when in doubt: it does not parse, or a local check names a path that is not an absolute .rc
-    path, or an option `ttp detach --check` does not take."""
+    """The .rc paths of the local detached jobs a retry_when gates on, alone or within a compound probe
+    (&&, ;, ||, other tests; split as _commands splits it), in order, once each: those of `ttp detach
+    --check`, and any absolute .rc path another local command names, whatever wraps it (`test -s <rc>`,
+    a probe script given the path: _named_rcs). The daemon relaunches only the ones in the task's own
+    run folders. A check with --host, or one after an ssh, is the other host's and never counted. []
+    when it checks no local job or when in doubt: it does not parse, or a local check names a path that
+    is not an absolute .rc path, or an option `ttp detach --check` does not take."""
     cmds = _commands(probe) if isinstance(probe, str) else None
     out: list[Path] = []
     for cmd in cmds or ():
         words = _local_part(cmd)
-        while words and _ASSIGN_RE.match(words[0]):
-            words = words[1:]   # VAR=value before the command
-        if len(words) < 3 or words[0].rsplit("/", 1)[-1] not in ("ttp", "ttp.sh") or words[1] != "detach" \
-                or "--check" not in words[2:]:
+        if not _is_check(words):
+            named = _named_rcs(words)
+            if named is None:
+                return []
+            out += [p for p in named if p not in out]
             continue
+        while _ASSIGN_RE.match(words[0]):
+            words = words[1:]   # VAR=value before the command
         rest, paths, remote = words[2:], [], False
         while rest:
             w = rest.pop(0)
@@ -196,16 +247,30 @@ def transient(probe: str, run_dirs: tuple[str, ...] = (), _depth: int = 0) -> st
     return ""
 
 
-def transient_besides_jobs(probe, run_dirs: tuple[str, ...] = ()) -> str:
+def transient_besides_jobs(probe, run_dirs: tuple[str, ...] = (), _depth: int = 0) -> str:
     """Why a retry_when depends on local state a reboot ends apart from its local detached jobs (see
     local_jobs) and the run-folder files they write, or '' when nothing else: a process, a path a reboot
-    clears, its own checks or a device runner job. A probe that does not parse says so."""
+    clears, its own checks or a device runner job. A probe that does not parse says so. A run-folder
+    script given a job's .rc is judged by its text (one level deep), where a local `ttp detach --check`
+    of an argument is that job."""
     probe = probe.strip() if isinstance(probe, str) else ""
     cmds = _commands(probe)
     if cmds is None:
         return "a probe that does not parse"
     for cmd in cmds:
+        if _depth and _is_check(_local_part(cmd)) and not _remote(_local_part(cmd)):
+            continue
         if local_jobs(shlex.join(cmd)):
+            words = _local_part(cmd)
+            inline = [w for j, w in enumerate(words) if j and words[j - 1] == "-c"
+                      and words[0].rsplit("/", 1)[-1] in _SHELLS]
+            if inline and (why := transient_besides_jobs(inline[0], run_dirs, _depth)):
+                return why
+            i = _script_word(words, run_dirs) if _depth == 0 else None
+            text = _read_script(words[i]) if i is not None else None
+            if text is not None and (why := transient_besides_jobs(
+                    text.replace("\\\n", " ").replace("\n", "\n;"), run_dirs, _depth + 1)):
+                return why
             continue
         # A file in a run folder is the jobs' own output, wherever the folder lies.
         words = [w for w in _local_part(cmd) if not (_RUN_DIR_RE.search(w) or any(d and d in w for d in run_dirs))]

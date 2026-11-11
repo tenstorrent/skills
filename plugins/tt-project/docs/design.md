@@ -98,6 +98,9 @@ disk untouched, with no migration; nothing else is reclaimed by check recovery.
    `budget.max_waits` times, then asks the user. While its `retry_when` probe exits 1 ("not yet")
    or 255 (ssh could not reach the host) it sleeps on without a run; past `waiting.max_hold_s`
    after the hand-off it still sleeps, and the coordinator is asked once to fix the probe or cancel.
+   A wait on a live detached job or a queued or running `ttp checks` run counts that time from the
+   job's own last progress instead: its log, start and queue markers, a remote job's mirrored log
+   growth (`--mirror`), or the checks run's log, pid and slot-wait files.
    A probe that can never pass (command not found, a run dir or worktree that is gone, a devq job
    unknown to its runner) is raised once per wait when it is first seen.
    A spec update sleeps with it (a `task_update` by the coordinator or the user; the hand-off keeps
@@ -147,8 +150,13 @@ disk untouched, with no migration; nothing else is reclaimed by check recovery.
    open task still waits on.
    Before a due wait starts a model turn, the wait-wake gate (`waitgate.py`) decides whether one
    is needed. Must-wake events always wake: an escalation, any wake reason but a timer or "probe
-   passed", a changed spec, a probe answer that changed since the last skip, and the cap
-   (`waiting.wake_gate.max_skips`, 4, or `max_skip_h`, 4 h, since the last turn). Model-free rules
+   passed", a changed spec, a probe answer that changed since the last skip, and the hard ceiling
+   (`waiting.wake_gate.cap_hard_h`, 24 h since the last turn). At the cap (`max_skips`, 4, or
+   `max_skip_h`, 4 h) the watcher is asked again with no model-free rule first: it may skip with a
+   next look (at least `backoff_s`, never past the ceiling); no answer, or a probe that answered,
+   wakes. A wake the daemon cannot start yet (slots full, a hold) is the same wake when re-gated
+   before its turn: no new row and no new question. Each decision names the model that answered
+   (the watcher's, Jev, or the Haiku fallback). Model-free rules
    then skip what is still pending (a detached job with no exit code, a lock still held, checks or
    a push still running or queued, a probe pass the last turn already saw); Jev, where its
    `wake_gate` use is on, judges the rest; anything else wakes as before. A skip re-defers the
@@ -167,6 +175,19 @@ disk untouched, with no migration; nothing else is reclaimed by check recovery.
    mean cost of a wake at its tier less a light one (fallback prices while unmeasured), so the use
    stays on while it pays; one whose run asked for more settles as wrong, minus the light run it added. `ttp stats --wakes` shows task wakes per day by reason, with their $, how many
    only handed the wait back and who chose the tier.
+   A waiting hand-off with a `retry_when` gets a check plan (`check_plan`): one interim check soon
+   after the wait starts (`waiting.check_plan.interim_share` of the expected end, 2-15 min) and one
+   at the expected end, the measured median wait of its kind (own checks, a detached job, a push,
+   another probe; a fallback below `min_samples`). In between only a changed probe answer wakes it.
+   A check wakes at the plan's `tier` (light), `by` `jev` (the wake gate's Jev step judges it),
+   `plain` (the whole gate: a job still running is no turn) or `model` (always a run). A planned
+   check is no event: when Jev gives no verdict (no key, paused, its use off, an error) a `jev` check
+   takes the plain rule, and a check that no rule or Jev judged sleeps rather than taking the gate's
+   always-wake fallback, since the probe's pass or failure still wakes the task on its own path.
+   Its skips do not count toward `waiting.wake_gate.max_skips`. The same wait
+   handed back keeps its plan, and a planned check never counts as a stale wake. The coordinator's
+   `task_update` `check_plan` overrides a task's plan; the daily review gets `Check plans` lines to
+   tune the defaults.
 8. The project folder ignores itself; nothing of a project is ever committed to the user's repo.
 9. Secrets live only in the machine's secret store (`~/.tt-project/secrets.json`, 0600, by default; a
    keychain, a fetch command or the environment where `ttp secret store` says so). Never in argv, logs

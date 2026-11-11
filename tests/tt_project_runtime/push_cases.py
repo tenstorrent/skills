@@ -1321,6 +1321,9 @@ def test_push_from_a_tasks_own_branch_lands_only_when_its_spec_asks_or_land_says
     from ttp import push
     p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
     p.set_config("delivery.code_tasks_may_push", True)   # code tasks land only with it on (code_run_landing)
+    # A push_branch is a review step (push.review_required), so --land wants a passed review of HEAD; that
+    # gate has its own test (test_land_needs_a_passed_review_...): this one checks the landing guards only.
+    monkeypatch.setattr(push, "unreviewed_landing", lambda *a: "")
     shared = _git_out(origin, "rev-parse", "proj")
     own_only = p.db.add_task("fix", kind="code", spec="Fix it. Push only your own ttp/* branch; never open PRs.")
     _git_out(repo, "checkout", "-q", "-b", f"ttp/t{own_only}-fix")
@@ -1394,6 +1397,9 @@ def test_a_code_workers_plain_push_lands_only_tested_work_unless_land_overrides_
     from ttp import push
     p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
     p.set_config("delivery.code_tasks_may_push", True)   # code tasks land only with it on (code_run_landing)
+    # A push_branch is a review step (push.review_required), so --land wants a passed review of HEAD; that
+    # gate has its own test (test_land_needs_a_passed_review_...): this one checks the landing guards only.
+    monkeypatch.setattr(push, "unreviewed_landing", lambda *a: "")
     shared = _git_out(origin, "rev-parse", "proj")
     tid = p.db.add_task("fix", kind="code", spec="Fix it, then land it with `ttp push`.")
     _git_out(repo, "checkout", "-q", "-b", f"ttp/t{tid}-fix")
@@ -3965,7 +3971,7 @@ def test_no_batch_starts_while_something_holds_the_push(env, monkeypatch, blocke
         held = locks.try_take([s.p.state / "locks" / "push:run-123.0.lock"], "a detached ttp push")
     elif blocker == "backoff":
         s.p.db.set_kv(pushq.KV, {"backoff_until": now + 60})
-    elif blocker == "other target":
+    elif blocker == "other target":     # a target that has nothing of the old one's tip: diverged
         s.p.set_config("delivery.push_branch", "origin/other")
     else:
         s.p.set_config("delivery.push_allowed", False)
@@ -3976,7 +3982,7 @@ def test_no_batch_starts_while_something_holds_the_push(env, monkeypatch, blocke
     finally:
         if held:
             held.close()
-    if blocker == "other target":   # approvals for the old target go back to their reviews
+    if blocker == "other target":   # approvals for a diverged target go back to their reviews
         t = s.p.db.task(rid)
         assert t["status"] == "queued" and json.loads(t["result"])["woke"].startswith(
             "push target changed: approved for origin/proj, the target is now origin/other")
@@ -4376,6 +4382,102 @@ def test_a_conflicting_head_gets_no_rebase_review_past_the_review_cap_or_after_o
     assert pushq.rebase_head(s.p.db.task(first)) == s.head
 
 
+def _pq_moved_tip(s, name="other.txt"):
+    """The target's tracking tip moves on by one commit of another change: {the new tip}."""
+    _git_out(s.path, "checkout", "-q", "-b", f"tip-{name}", "refs/remotes/origin/proj")
+    _commit(s.path, name, "someone else's change\n")
+    tip = _git_out(s.path, "rev-parse", "HEAD")
+    _git_out(s.repo, "update-ref", "refs/remotes/origin/proj", tip)
+    _git_out(s.path, "checkout", "-q", s.branch)
+    return tip
+
+
+def _pq_on(s, base, name, *changes):
+    """A head on `base` with one commit per (file, text) of `changes`."""
+    _git_out(s.path, "checkout", "-q", "-b", name, base)
+    for path, text in changes:
+        _commit(s.path, path, text)
+    head = _git_out(s.path, "rev-parse", "HEAD")
+    _git_out(s.path, "checkout", "-q", s.branch)
+    return head
+
+
+@pytest.mark.parametrize("earlier", ["cancelled", "check_failed", "approved"])
+def test_a_rebase_review_re_approves_its_head_after_its_own_earlier_row_left_the_queue(env, monkeypatch, earlier):
+    """A rebase review (push_rebase:<head>) whose own earlier row was cancelled (the push target moved) or
+    sent back re-approves its rebased head: that head is none of its named refs, but the rebase it was
+    queued for. While one of its rows is still live, the label adds nothing."""
+    from ttp import pushq
+    s = _pq(env, monkeypatch)
+    tip = _pq_moved_tip(s)
+    rebased = _pq_on(s, tip, "rebased", ("feature.txt", "feature\n"))
+    rb = s.p.db.add_task("Rebase the feature", "rebase it", kind="review", origin="daemon",
+                         labels=[f"{pushq.REBASE_LABEL}{s.head}"])
+    s.p.db.x("INSERT INTO push_queue(task, branch, head, target, status, created, updated) VALUES(?,?,?,?,?,?,?)",
+             (rb, s.branch, s.head, "origin/proj", earlier, time.time() - 60, time.time()))
+    check = pushq.check_approval(s.p, s.p.db.task(rb), [{"branch": "rebased", "head": rebased}])
+    if earlier == "approved":
+        assert "none of the reviewed refs" in check["invalid"]
+    else:
+        assert check.get("entries"), check
+
+
+@pytest.mark.parametrize("start", ["start_from", "depends_on", "continues"])
+def test_a_dependents_failed_review_never_blocks_its_prerequisites_approval(env, monkeypatch, start):
+    """A task B built on task A's head (started from it, depending on it, or continuing a task that
+    started from it) whose review failed: A's commits are A's own, so A's approval is accepted with
+    nothing inherited from B."""
+    from ttp import pushq
+    s = _pq(env, monkeypatch)
+    b, _, _, _ = _pq_stacked(s, "dependent", on=s.branch, review="failed")
+    if start == "depends_on":
+        s.p.db.update_task(b, depends_on=json.dumps([s.code]))
+    else:
+        first = s.p.db.add_task("first try", "s", kind="code", origin="coordinator") if start == "continues" else b
+        s.p.db.update_task(first, labels=json.dumps([f"start_from:{s.head}", f"early_start:{s.code}:1"]))
+        if first != b:
+            s.p.db.update_task(b, labels=json.dumps([f"continues:{first}"]))
+    check = pushq.check_approval(s.p, s.p.db.task(s.review), [{"branch": s.branch, "head": s.head}])
+    assert check.get("entries") and not check.get("inherited"), check
+
+
+def test_a_review_re_approves_its_rebased_head_after_its_own_direct_push_conflicted(env, monkeypatch):
+    """A review whose own `ttp push` (the queue off) stopped on a rebase conflict re-approves its rebased
+    head once the queue is on, the added commits listed; without a conflict recorded it stays refused."""
+    from ttp import pushq
+    s = _pq(env, monkeypatch)
+    tip = _pq_moved_tip(s)
+    rebased = _pq_on(s, tip, "rebased", ("feature.txt", "feature, resolved\n"))
+    approve = lambda: pushq.check_approval(s.p, s.p.db.task(s.review), [{"branch": "rebased", "head": rebased}])
+    assert "none of the reviewed refs" in approve()["invalid"]
+    folder = s.p.state / "pushes"
+    folder.mkdir(parents=True, exist_ok=True)
+    marker = folder / f"t{s.review}-20261111-000000-1.json"
+    marker.write_text(json.dumps({"task": str(s.review), "status": "failed", "exit": 4, "head": s.head,
+                                  "started": time.time() - 60}))
+    assert "none of the reviewed refs" in approve()["invalid"]   # its checks failed: no conflict
+    marker.write_text(json.dumps({"task": str(s.review), "status": "failed", "exit": 3, "head": s.head,
+                                  "started": time.time() - 60}))
+    check = approve()
+    assert check.get("entries") and check["added"][rebased], check
+
+
+def test_a_review_re_approves_its_own_rebase_of_the_reviewed_change_and_nothing_else(env, monkeypatch):
+    """A review that rebases its reviewed ref onto a moved tip re-approves the rebased head when its change
+    has the same patch id as the reviewed one; a head with any other diff stays refused."""
+    from ttp import pushq
+    s = _pq(env, monkeypatch)
+    tip = _pq_moved_tip(s)
+    same = _pq_on(s, tip, "same", ("feature.txt", "feature\n"))
+    assert pushq.check_approval(s.p, s.p.db.task(s.review), [{"branch": s.branch, "head": same}]).get("entries")
+    for name, changes in (("changed", [("feature.txt", "feature, edited\n")]),
+                          ("more", [("feature.txt", "feature\n"), ("extra.txt", "unreviewed\n")]),
+                          ("none", [])):
+        head = _pq_on(s, tip, name, *changes)
+        check = pushq.check_approval(s.p, s.p.db.task(s.review), [{"branch": s.branch, "head": head}])
+        assert "none of the reviewed refs" in check.get("invalid", ""), (name, check)
+
+
 def test_the_daemon_closes_code_tasks_left_in_review_whose_latest_review_pushed_them(env):
     """Clean-up of tasks left behind: only a task whose latest covering review is done and pushed its
     work after the task entered review is closed, once."""
@@ -4726,7 +4828,8 @@ def test_dead_batches_retry_with_a_growing_pause_and_three_in_a_row_raise_an_ale
         sent = s.p.db.q("SELECT severity FROM messages WHERE kind='alert' AND ref='push_queue_dying'")
         assert len(sent) == (1 if n == 3 else 0)
     assert [b["outcome"] for b in s.p.db.q("SELECT outcome FROM push_batches")] == ["died"] * 3
-    assert not [e for e in _pq_events(s.p, mark) if e["status"] == "queued"]
+    assert [e["kind"] for e in _pq_events(s.p, mark) if e["status"] == "queued"] == ["push_same_failure"], \
+        "the second death the same way tells the coordinator once; the third only holds"
     assert s.p.db.task(s.review)["status"] == "pushing" and s.p.db.one("SELECT COUNT(*) n FROM runs")["n"] == 0
     assert alerts.holds(s.p.db, "push_queue_dying", before, time.time())
     _pq_plan(s, outcome="pushed", sha="ab" * 20)
@@ -7315,6 +7418,7 @@ def test_a_passed_probe_reads_the_push_queues_rejected_commit_git_before_its_fin
         d._probe_passed(s.p.db.task(tid), time.time())
     # A code task's checks passed: its review is queued, naming the rejected commits its head carries.
     s.p.db.update_task(crev, status="cancelled")
+    s.p.db.x("UPDATE tasks SET labels=? WHERE id=?", (json.dumps([f"start_when:landed:#{x}"]), c))   # no send-back
     passed(c, {"status": "done", "summary": "made the change"})
     rid = s.p.db.one("SELECT id FROM tasks WHERE kind='review' AND status='queued' AND depends_on LIKE ?",
                      (f"%{c}%",))["id"]
@@ -7990,6 +8094,9 @@ def test_a_code_task_whose_title_ends_in_notes_still_delivers_its_own_branch_as_
     from ttp import push, worktree
     p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
     p.set_config("delivery.code_tasks_may_push", True)   # code tasks land only with it on (code_run_landing)
+    # A push_branch is a review step (push.review_required), so --land wants a passed review of HEAD; that
+    # gate has its own test (test_land_needs_a_passed_review_...): this one checks the landing guards only.
+    monkeypatch.setattr(push, "unreviewed_landing", lambda *a: "")
     _git_out(other, "push", "-q", "origin", "HEAD:refs/heads/feature/x")
     for labels in ([], ["pr_branch:feature/x"]):
         tid = p.db.add_task("Update release notes", "s", kind="code", labels=labels)
@@ -10441,6 +10548,66 @@ def test_a_derived_check_prestage_id_that_no_longer_exists_never_fails_it(env, t
         _seed_check_failure(p, rid, ["tests/test_deleted.py::test_x"])
     cli.main(["checks", "--detach"])
     assert len(started) == 2 and "none of the derived tests' files exist" in capsys.readouterr().out
+
+
+def _derived_on_base(env, tmp_path, monkeypatch, head_seed: str):
+    """_derived_setup's repo as the base (its static failure on it), then a head commit writing
+    `head_seed` to tests/test_seed.py; the push branch tip as last fetched is that base."""
+    from ttp import cli
+    p, run, started = _derived_setup(env, tmp_path, monkeypatch)
+    repo = tmp_path / "work"
+    git = ["git", "-C", str(repo), "-c", "user.email=t@example.com", "-c", "user.name=t"]
+    base = subprocess.run([*git, "rev-parse", "HEAD"], capture_output=True, text=True, check=True).stdout.strip()
+    (repo / "tests" / "test_seed.py").write_text(head_seed)
+    subprocess.run([*git, "commit", "-qam", "head"], check=True)
+    monkeypatch.setattr(cli, "_checks_base", lambda p, top, cmds: base)
+    return p, started, base
+
+
+def test_a_derived_check_prestage_failure_the_base_shares_starts_the_full_checks(env, tmp_path, monkeypatch, capsys):
+    """A broken push-branch tip: its failures fill every task's derived pre-stage. Each fails on the
+    change's base too, so none is the change's and the detached checks start (user msg #1635)."""
+    from ttp import checkprestage, cli
+    seed = ("def test_static_guard():\n    assert 0, 'seeded-static-failure'\n\n\n"
+            "def test_fine():\n    pass\n\n\ndef test_added_by_head():\n    pass\n")
+    p, started, base = _derived_on_base(env, tmp_path, monkeypatch, seed)
+    for rid in (1, 2):
+        _seed_check_failure(p, rid, [SEED])
+    cli.main(["checks", "--detach"])
+    out = capsys.readouterr().out
+    assert len(started) == 1, out
+    assert "seeded-static-failure" in out and f"rerunning its 1 failing test(s) on the base {base[:12]}" in out
+    assert f"every failing test also fails on the base {base[:12]}" in out and SEED in out
+    assert "NOT started" not in out and not p.db.kv(checkprestage.CAUGHT_KEY), "not counted as caught"
+
+
+def test_a_derived_check_prestage_failure_new_on_the_head_still_blocks(env, tmp_path, monkeypatch, capsys):
+    """A head-only failure beside a shared one: the base passes it, so the change broke it and nothing
+    detaches; the shared one is not named as the change's."""
+    from ttp import cli
+    fine = "tests/test_seed.py::test_fine"
+    seed = ("def test_static_guard():\n    assert 0, 'seeded-static-failure'\n\n\n"
+            "def test_fine():\n    assert 0, 'head-only-failure'\n")
+    p, started, base = _derived_on_base(env, tmp_path, monkeypatch, seed)
+    _seed_check_failure(p, 1, [SEED, fine])
+    with pytest.raises(SystemExit) as failed:
+        cli.main(["checks", "--detach"])
+    out = capsys.readouterr().out
+    assert failed.value.code == 1 and not started, out
+    assert f"1 of its failing test(s) pass on the base {base[:12]}, so the change broke them: {fine}" in out
+    assert "head-only-failure" in out and "NOT started" in out
+
+
+def test_a_derived_check_prestage_base_rerun_needs_every_failing_id(tmp_path):
+    """Output that does not name every failing test (no summary, a count above its FAILED lines, another
+    runner) never starts the full checks, and no base checkout is made for it."""
+    from ttp import checkprestage
+    said = []
+    for out in ("FAILED tests/a.py::test_x - x\n", "FAILED tests/a.py::test_x - x\n2 failed in 1s\n",
+                "error: build broke\n", ""):
+        assert not checkprestage._shared_with_base(None, out, [], str(tmp_path / "nowhere"), {}, "0" * 40,
+                                                   said.append)
+    assert said == [], "nothing reran"
 
 
 @pytest.mark.parametrize("off", ["", False], ids=["empty", "false"])
@@ -13866,6 +14033,7 @@ def test_ttp_land_checks_take_their_branch_priority_slot_ahead_of_an_earlier_wai
     _git_out(repo, "worktree", "add", "-q", "--detach", str(side))
     assert land._slot_key(repo, "proj") == land._slot_key(side, "proj") == key == f"{repo.resolve()}#proj"
     monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "1")
+    monkeypatch.setenv(checkcap.BEYOND_CAP_ENV, "1")  # the opt-in overflow; the default counts it in the cap
     held = checkcap.acquire("suite of another project", project_name="other")
     earlier = locks.enqueue(checkcap.slot_dir(), checkcap.RESOURCE, "earlier task check", since=1000.0, group="other")
     said, got = [], []
@@ -15597,9 +15765,10 @@ def test_a_landed_wait_on_an_abandoned_task_is_raised_as_a_broken_probe_naming_w
 
 
 def test_abandon_refuses_a_task_whose_review_is_open_or_whose_work_waits_in_the_push_queue(env, monkeypatch, capsys):
-    """Review #3624 finding 1: a done code task whose daemon-queued review is still open, or whose
+    """Review #3624 finding 1: a done code task whose coordinator-queued review is still open, or whose
     branch a review approved into the push queue, can still land: abandon refuses it, naming the review
-    or the queue entry, and records nothing until that is cancelled."""
+    or the queue entry, and records nothing until that is cancelled. (The daemon's own open review is
+    cancelled with the abandon instead: test_abandon_cancels_the_daemon_review_of_the_task.)"""
     from ttp import landed
     from ttp.daemon import Daemon
     s = _pq(env, monkeypatch)
@@ -15613,9 +15782,6 @@ def test_abandon_refuses_a_task_whose_review_is_open_or_whose_work_waits_in_the_
     assert _ttp_task(s.p, "cancel", str(s.review)) == 0
     rid, added = d._auto_review(s.p.db.task(s.code), "made the change")
     assert added and s.p.db.task(rid)["title"].startswith(f"Review #{s.code}")
-    capsys.readouterr()
-    assert _ttp_task(s.p, "abandon", str(s.code), "approach dropped") not in (0, None)
-    assert f"review task #{rid} that carries it is queued: cancel that first" in capsys.readouterr().err
     _pq_hand_off(env, s, task=rid)
     [q] = s.p.db.q("SELECT id, status FROM push_queue")
     assert q["status"] == "approved"
@@ -15624,6 +15790,55 @@ def test_abandon_refuses_a_task_whose_review_is_open_or_whose_work_waits_in_the_
     assert f"is queued to push (entry #{q['id']} of task #{rid}, approved): cancel that first" \
         in capsys.readouterr().err
     assert s.p.db.q("SELECT * FROM task_abandoned") == [] and landed.abandoned(s.p.db, s.code) is None
+
+
+def test_abandon_cancels_the_daemon_review_of_the_task(env, monkeypatch, capsys):
+    """Upstream notes b8cfa86d5ff92f74 and 5338aa394465b31f: `ttp task abandon` on a done code task whose
+    daemon-queued review is open succeeds and cancels that review in the same step, and no
+    `Review #<id>` is queued for it on the next ticks (auto-review or the unreviewed sweep)."""
+    from ttp import landed
+    from ttp.daemon import Daemon
+    s = _pq(env, monkeypatch)
+    monkeypatch.setattr(Daemon, "_precheck", lambda self, task, head: None)
+    d = Daemon(s.p.base)
+    assert _ttp_task(s.p, "cancel", str(s.review)) == 0
+    rid, added = d._auto_review(s.p.db.task(s.code), "made the change")
+    assert added and s.p.db.task(rid)["origin"] == "daemon"
+    capsys.readouterr()
+    assert _ttp_task(s.p, "abandon", str(s.code), "approach dropped") == 0
+    assert f"its review #{rid} cancelled" in capsys.readouterr().out
+    assert s.p.db.task(rid)["status"] == "cancelled" and landed.abandoned(s.p.db, s.code)
+    before = {r["id"] for r in s.p.db.q("SELECT id FROM tasks")}
+    for _ in range(3):
+        assert d._auto_review(s.p.db.task(s.code), "made the change") is None
+        d.sweep_unreviewed(force=True)
+    assert not s.p.db.q(f"SELECT id FROM tasks WHERE title LIKE ? AND id NOT IN ({','.join('?' * len(before))})",
+                        (f"Review #{s.code}:%", *before))
+
+
+def test_a_cancelled_daemon_review_is_not_requeued_for_the_same_head(env, monkeypatch):
+    """Upstream note b8cfa86d5ff92f74: a daemon review the coordinator (or `ttp task cancel`) cancelled
+    is not queued again for the same head by auto-review or the unreviewed sweep; a new commit on the
+    branch gets a fresh review."""
+    from ttp import coordinator as coord
+    from ttp.daemon import Daemon
+    s = _pq(env, monkeypatch)
+    monkeypatch.setattr(Daemon, "_precheck", lambda self, task, head: None)
+    d = Daemon(s.p.base)
+    assert _ttp_task(s.p, "cancel", str(s.review)) == 0
+    rid, added = d._auto_review(s.p.db.task(s.code), "made the change")
+    assert added
+    assert coord.apply(s.p, [{"type": "task_update", "id": rid, "status": "cancelled", "text": "not needed"}]) == []
+    assert s.p.db.task(rid)["status"] == "cancelled"
+    for _ in range(3):
+        assert d._auto_review(s.p.db.task(s.code), "made the change") is None
+        assert d.sweep_unreviewed(force=True) == []
+    reviews = lambda: [r["id"] for r in s.p.db.q("SELECT id FROM tasks WHERE title LIKE ? AND status!='cancelled'",
+                                                (f"Review #{s.code}:%",))]
+    assert reviews() == []
+    _commit(s.path, "more.txt", "more\n")
+    again, added = d._auto_review(s.p.db.task(s.code), "made the change")
+    assert added and again != rid and reviews() == [again]
 
 
 def test_a_landing_recorded_after_abandon_wins_over_it(env, monkeypatch, capsys):
@@ -15762,6 +15977,93 @@ def test_a_push_batch_pushes_past_a_failing_test_that_fails_on_the_tip_alone_too
     assert "failed with the batch" in ev["text"] and "pre-existing" in ev["text"] and tip[:7] in ev["text"], ev["text"]
 
 
+_SCOPED_FLAKY = {"run": _FLAKY_CHECK, "if_changed": "src/**"}
+
+
+def _scoped_ids_stub(monkeypatch, tip, plan):
+    """batch._stream stubbed: `plan(where, selected)` gives the test ids failing at the tip ("tip") or a head
+    ("head"), `selected` the rerun's TTP_PYTEST_SELECT (None for the full check); the run fails when the
+    selection keeps one of them. Returns the calls (where, selected)."""
+    from ttp import batch
+    calls = []
+
+    def fake(cmd, cwd, env=None, timeout=None, group=False, pass_fds=(), collect=None, urgent_mark=False):
+        head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(cwd), capture_output=True, text=True).stdout.strip()
+        where, selected = "tip" if head == tip else "head", (env or {}).get("TTP_PYTEST_SELECT")
+        calls.append((where, selected))
+        failing = [i for i in plan(where, selected)
+                   if selected is None or re.search(selected, i.partition("::")[2])]
+        if not failing:
+            return 0, "....\n4 passed in 0.50s", False
+        lines = "".join(f"FAILED {i} - AssertionError: boom\n" for i in failing)
+        return 1, f"F...\n{lines}{len(failing)} failed, 3 passed in 0.50s", False
+
+    monkeypatch.setattr(batch, "_stream", fake)
+    return calls
+
+
+def test_an_if_changed_check_runs_on_a_commit_checked_against_itself_or_an_ancestor_of_its_base(env, monkeypatch):
+    """An empty self-diff (the tip checked alone against itself, or a head already in its base) says nothing
+    about the check's scope: the check runs, so its skip is never read as that commit's pass."""
+    from ttp import push
+    p, repo, origin, other = _push_setup(env, monkeypatch, [SCOPED])
+    _commit(repo, "notes.txt", "notes\n")
+    check = push.check_list([SCOPED])
+    head = _git_out(repo, "rev-parse", "HEAD")
+    for base in (head, "HEAD"):
+        assert push.applicable(repo, head, check, print, base) == (check, []), base
+        assert push.skip_reason(repo, head, check[0], base) is None
+    assert push.applicable(repo, "HEAD~1", check, print, head) == (check, []), "an ancestor of the base adds nothing"
+    todo, skipped = push.applicable(repo, head, check, print, "HEAD~1")
+    assert todo == [] and push.outside_scope(check, skipped), "a real out-of-scope change still skips"
+
+
+_MANY_IDS = [f"tests/test_a.py::test_broken_on_the_tip_{n:02d}" for n in range(12)]   # more than batch.RERUN_IDS
+
+
+def test_a_push_batch_never_counts_the_tip_checked_alone_as_passing_by_an_empty_self_diff(env, monkeypatch):
+    """Cell self_diff_skip: a check scoped to src/** with no test ids to rerun fails on the entry, so the
+    tip is checked alone. Diffing the tip against itself scoped the check out, and that skip read as the
+    tip's pass (tip_passed), blaming the entry. Now the check runs on the tip: it fails there too, so the
+    tip fails on its own, no entry is blamed and the marker claims no tip pass."""
+    check = {"run": "sh check.sh", "if_changed": "src/**"}
+    p, repo, origin, other = _push_setup(env, monkeypatch, [check])
+    tip = _git_out(origin, "rev-parse", "proj")
+    calls = _scoped_ids_stub(monkeypatch, tip, lambda where, sel: [_FLAKY_ID])
+    rc, m = _run_batch(p, _batch_marker(p, [_entry(repo, "e1", {"src/f1.py": "1\n"})]), monkeypatch)
+    assert calls == [("head", None), ("tip", None)], f"the tip alone must run its check, not skip it: {calls}"
+    assert not m.get("tip_passed"), "a skip on an empty self-diff is no tip pass"
+    assert m["outcome"] == "tip_failed" and "check_failed" not in _statuses(m), m
+    assert not any(f"since {tip[:10]}" in s for s in m["checks"].get("skipped", [])), m["checks"]
+    assert _git_out(origin, "rev-parse", "proj") == tip
+
+
+def test_a_push_batch_pushes_an_entry_whose_many_failing_tests_all_fail_on_the_tip_alone(env, monkeypatch):
+    """Cell tip_ids_many: the entry fails 12 tests, more than a head reruns, and the tip fails all 12 on its
+    own. They rerun on the tip alone (only those ids), are pre-existing, and the entry lands."""
+    p, repo, origin, other = _push_setup(env, monkeypatch, [_SCOPED_FLAKY])
+    tip = _git_out(origin, "rev-parse", "proj")
+    calls = _scoped_ids_stub(monkeypatch, tip, lambda where, sel: _MANY_IDS)
+    rc, m = _run_batch(p, _batch_marker(p, [_entry(repo, "e1", {"src/f1.py": "1\n"})]), monkeypatch)
+    assert rc == 0 and m["outcome"] == "pushed" and _statuses(m) == ["pushed"], m
+    assert ("tip", None) not in calls and [w for w, sel in calls if sel] == ["tip"], calls
+    assert sorted(i for pre in m["pre_existing"] for i in pre["ids"]) == _MANY_IDS, m["pre_existing"]
+    assert not m.get("tip_passed")
+    assert _git_out(origin, "rev-parse", "proj") == m["pushed_sha"] != tip
+
+
+def test_a_push_batch_refuses_an_entry_with_one_new_failure_among_many_the_tip_fails_alone(env, monkeypatch):
+    """Cell tip_ids_one_new: the entry fails 12 tests, the tip alone 11 of them. The 11 are pre-existing;
+    the 12th is new on the entry (fails on its rerun there, passes on the tip) and still blocks it."""
+    p, repo, origin, other = _push_setup(env, monkeypatch, [_SCOPED_FLAKY])
+    tip = _git_out(origin, "rev-parse", "proj")
+    _scoped_ids_stub(monkeypatch, tip, lambda where, sel: _MANY_IDS[:11] if where == "tip" else _MANY_IDS)
+    rc, m = _run_batch(p, _batch_marker(p, [_entry(repo, "e1", {"src/f1.py": "1\n"})]), monkeypatch)
+    assert _statuses(m) == ["check_failed"] and m["outcome"] != "tip_failed", m
+    assert sorted(i for pre in m["pre_existing"] for i in pre["ids"]) == _MANY_IDS[:11], m["pre_existing"]
+    assert _MANY_IDS[11] in json.dumps(m["results"]), m["results"]
+    assert _git_out(origin, "rev-parse", "proj") == tip
+
 def test_a_push_batch_pushes_past_a_failing_test_that_fails_on_a_later_tip_rerun(env, monkeypatch):
     """The failing test passes on its first rerun on the tip and fails on the second: pre-existing, as one
     failing base run makes it. The entry goes; the tip reruns stop at that failure."""
@@ -15879,22 +16181,56 @@ def _entries(repo, n):
     return [_entry(repo, f"e{k}", {f"e{k}.txt": f"{k}\n"}) for k in range(1, n + 1)]
 
 
+_SECOND_CHECK = f"{_FLAKY_CHECK} -p no:cacheprovider"
+
+
+def _full_runs(monkeypatch):
+    """Record each full check run (no TTP_PYTEST_SELECT) on top of _ids_stub's batch._stream: ("first" or
+    "second" for _FLAKY_CHECK or _SECOND_CHECK, the entries' files in the tree)."""
+    from ttp import batch
+    stub, ran = batch._stream, []
+
+    def rec(cmd, cwd, env=None, **kw):
+        if not (env or {}).get("TTP_PYTEST_SELECT"):
+            line = cmd if isinstance(cmd, str) else " ".join(map(str, cmd))
+            ran.append(("second" if "no:cacheprovider" in line else "first",
+                        sorted(f.stem for f in pathlib.Path(cwd).glob("e*.txt"))))
+        return stub(cmd, cwd, env, **kw)
+    monkeypatch.setattr(batch, "_stream", rec)
+    return ran
+
+
 def test_a_push_batch_split_runs_only_the_new_failing_tests_at_the_prefix_heads(env, monkeypatch):
-    """Cell split_failing_ids_only: entry 3 of 4 breaks one test. The search probes the prefixes with
-    only that test, never their whole suite: the full suite runs at the full head and at the prefix the
-    probes showed passing (once, after they found entry 3), which then pushes at once; entries 3 and 4 go untested to the next train
+    """Cell split_failing_ids_only: entry 3 of 4 breaks one test of the first check. The search probes the
+    prefixes with only that test, never their whole suite. The prefix the probes showed passing runs only
+    the check that never ran on the full head, not a second full run (task #7758: the first check passed
+    there but for that test), and then pushes at once; entries 3 and 4 go untested to the next train
     (user msg #2317)."""
-    p, repo, origin, other = _push_setup(env, monkeypatch, [_FLAKY_CHECK])
+    p, repo, origin, other = _push_setup(env, monkeypatch, [_FLAKY_CHECK, _SECOND_CHECK])
     tip = _git_out(origin, "rev-parse", "proj")
     calls = _ids_stub(monkeypatch, tip, lambda tree, sel: {_NEW_ID} if (tree / "e3.txt").exists() else set())
+    ran = _full_runs(monkeypatch)
     rc, m = _run_batch(p, _batch_marker(p, _entries(repo, 4)), monkeypatch)
     assert _statuses(m) == ["pushed", "pushed", "requeued", "requeued"], m
     sel = "^(?:test_breaks_with_its_entry)$"
-    full = [c[2] for c in calls if c[1] is None]
-    assert full == [["e1", "e2", "e3", "e4"], ["e1", "e2"]], calls
+    assert ran == [("first", ["e1", "e2", "e3", "e4"]), ("second", ["e1", "e2"])], ran
     probes = [c[2] for c in calls if c[1] == sel and c[0] == "head"]
     assert ["e1", "e2"] in probes and ["e1", "e2", "e3"] in probes, calls
     assert m["checks"]["id_probes"] == 2 and not m.get("pre_existing") and not m.get("flaky_tests")
+
+
+def test_a_rescue_runs_only_the_blamed_entrys_new_failing_tests_and_the_checks_left_not_a_second_full_run(env, monkeypatch):
+    """Task #7758: entry 1 of 4 breaks one test of the first check and is blamed. The later entries,
+    replayed without it, are checked on that test alone and on the check that never ran on the full head;
+    they land as those pass, with no second full run of the first check."""
+    p, repo, origin, other = _push_setup(env, monkeypatch, [_FLAKY_CHECK, _SECOND_CHECK])
+    tip = _git_out(origin, "rev-parse", "proj")
+    calls = _ids_stub(monkeypatch, tip, lambda tree, sel: {_NEW_ID} if (tree / "e1.txt").exists() else set())
+    ran = _full_runs(monkeypatch)
+    rc, m = _run_batch(p, _batch_marker(p, _entries(repo, 4)), monkeypatch)
+    assert m["outcome"] == "pushed" and _statuses(m) == ["check_failed", "pushed", "pushed", "pushed"], m
+    assert ran == [("first", ["e1", "e2", "e3", "e4"]), ("second", ["e2", "e3", "e4"])], ran
+    assert ("head", "^(?:test_breaks_with_its_entry)$", ["e2", "e3", "e4"]) in calls, calls
 
 
 def test_a_push_batch_lands_the_passing_entries_when_the_tip_fails_a_test_too(env, monkeypatch):
@@ -16008,13 +16344,18 @@ def test_a_push_batch_reruns_each_failing_test_not_yet_judged_at_that_head(env, 
 def test_a_one_entry_push_batch_blames_its_new_failing_test_without_a_full_tip_check(env, monkeypatch):
     """The tip fails _FLAKY_ID on its own and the one entry breaks _NEW_ID. The judge saved _FLAKY_ID
     failing and _NEW_ID passing on the tip: only the new test decides, so entry 1 is blamed with no
-    full check of the tip alone (before, the partly passing saved results sent it to a full tip run)."""
+    full check of the tip alone (before, the partly passing saved results sent it to a full tip run).
+    The failing run's wall time is kept for the landing check time (gatetime), as a passing one's is."""
+    from ttp import gatetime
     p, repo, origin, other = _push_setup(env, monkeypatch, [_FLAKY_CHECK])
     tip = _git_out(origin, "rev-parse", "proj")
     calls = _ids_stub(monkeypatch, tip,
                       lambda tree, sel: {_FLAKY_ID} | ({_NEW_ID} if (tree / "e1.txt").exists() else set()))
+    timed = []
+    monkeypatch.setattr(gatetime, "record", lambda state, s, *a, **k: timed.append((Path(state), s)))
     rc, m = _run_batch(p, _batch_marker(p, _entries(repo, 1)), monkeypatch)
     assert _statuses(m) == ["check_failed"], m
+    assert timed and all(st == p.state and s >= 0 for st, s in timed), timed
     assert ("tip", None, []) not in calls, calls
     assert _git_out(origin, "rev-parse", "proj") == tip
 
@@ -19647,6 +19988,27 @@ def test_ttp_stats_landing_shows_runs_cpu_hours_and_dollars_per_landed_change(en
     p.db.x("DELETE FROM push_queue")
 
 
+def test_a_push_train_records_its_check_cpu_seconds_and_ttp_stats_landing_shows_them(env, monkeypatch):
+    """Task #7758: a train tallies the CPU seconds of the check runs it waited for (Batch._spent), the
+    queue writes them to push_batches.check_cpu_s, and `ttp stats --landing` counts them in CPU-h per
+    landed change and shows them beside the trains' wall hours."""
+    from ttp import batch, pushq, timefmt, trainstats
+    ticks = iter(range(0, 10 ** 6, 450))
+    monkeypatch.setattr(batch.checkcap, "child_cpu_s", lambda: float(next(ticks)))
+    p, repo, origin, other = _bump_setup(env, monkeypatch, ["test ! -e plugins/p/bad.txt"])
+    rc, m = _run_batch(p, _batch_marker(p, [_entry(repo, "e1", {"plugins/p/f1.txt": "1\n"})]), monkeypatch)
+    assert rc == 0 and m["outcome"] == "pushed" and m["checks"]["cpu_s"] >= 450 and m["checks"]["cpu_s"] % 450 == 0, m
+    now = time.time()
+    _pq_batch_row(p, "t1", now, age=600)
+    pushq._apply(p, p.db.one("SELECT * FROM push_batches WHERE id='t1'"),
+                 {"outcome": "nothing", "checks": {"runs": 2, "seconds": 600.0, "cpu_s": 1800.0}}, lambda *a, **k: None, now)
+    assert p.db.one("SELECT check_cpu_s FROM push_batches WHERE id='t1'")["check_cpu_s"] == 1800.0
+    r = trainstats.report(p.db, p.runs, timefmt.home(p), days=1, now=now)
+    (d,) = r["days"]
+    assert d["trains"] == 1 and d["train_cpu_s"] == 1800.0 and not d["train_cpu_unrecorded"], d
+    assert "train checks 0.2 h wall, 0.5 CPU-h;" in trainstats.text(r, p.name)
+
+
 def test_ttp_stats_landing_counts_a_review_that_landed_its_change_by_direct_push(env):
     """A review that lands its change with `ttp push` (no push queue) leaves only a task_landings row:
     `ttp stats --landing` counted 0 landed every day while such pushes landed. Each task counts once,
@@ -19933,3 +20295,589 @@ def test_kill_guard_names_push_stop_and_lets_it_through(tmp_path):
     from ttp import killguard
     assert "ttp push --stop <marker>" in killguard.ADVICE
     assert killguard.refusal(f"ttp push --stop {tmp_path}/state/pushes/t7-1.json", str(tmp_path), str(tmp_path)) is None
+
+
+def _relay_setup(env, monkeypatch):
+    """_push_setup plus a second bare repository, git remote `relay`, whose `proj` is at origin's tip,
+    and delivery.push_branch moved to relay/proj: a batch started for origin/proj is stale."""
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    relay = env["tmp"] / "relay.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(relay)], check=True)
+    _git_out(repo, "remote", "add", "relay", str(relay))
+    _git_out(repo, "push", "-q", "relay", "origin/proj:refs/heads/proj")
+    p.set_config("delivery.push_branch", "relay/proj")
+    return p, repo, origin, relay
+
+
+def test_target_from_setting_a_new_batch_takes_its_target_from_delivery_push_branch(env, monkeypatch):
+    """pushq.start writes delivery.push_branch as it is now into the marker and push_batches, not the
+    name its caller read earlier."""
+    from ttp import push, pushq
+    s = _pq(env, monkeypatch, push_batch_s=10 ** 6)
+    row = _pq_review(s)[1]
+    relay = env["tmp"] / "relay.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(relay)], check=True)
+    _git_out(s.repo, "remote", "add", "relay", str(relay))
+    s.p.set_config("delivery.push_branch", "relay/proj")
+    bid = pushq.start(s.p, s.p.db.q("SELECT * FROM push_queue WHERE id=?", (row,)), "origin/proj")
+    assert push._read(s.p.state / push.DETACHED / f"{bid}.json")["target"] == "relay/proj"
+    assert s.p.db.one("SELECT target FROM push_batches WHERE id=?", (bid,))["target"] == "relay/proj"
+
+
+@pytest.mark.parametrize("resumed", [False, True])
+def test_resume_rereads_target_a_stale_batch_stops_before_its_checks_and_hands_its_entries_back(env, monkeypatch,
+                                                                                                 resumed):
+    """A batch started for origin/proj, delivery.push_branch moved to relay/proj before it pushed, then
+    run again on its marker (or resuming a batch a reboot cut short): it re-reads the setting and stops
+    at once, before any check or push. Every entry goes back requeued, the outcome is `retargeted`
+    (not refused), and neither remote moves."""
+    from ttp import push
+    from ttp.project import write_json
+    p, repo, origin, relay = _relay_setup(env, monkeypatch)
+    before = _git_out(origin, "rev-parse", "proj")
+    head = _entry(repo, "e1", {"f1.txt": "1\n"})
+    marker = _batch_marker(p, [head])
+    if resumed:
+        write_json(marker, {**push._read(marker), "resumes": {"batch": "b0", "kept": [1], "left_out": [], "added": []}})
+    rc, m = _run_batch(p, marker, monkeypatch)
+    assert m["outcome"] == "retargeted" and _statuses(m) == ["requeued"], m
+    assert "relay/proj" in m["message"] and not m.get("checks", {}).get("runs"), m
+    assert _git_out(origin, "rev-parse", "proj") == before and _git_out(relay, "rev-parse", "proj") == before
+
+
+def test_landed_entry_drop_the_batch_on_the_new_target_drops_what_it_already_has(env, monkeypatch):
+    """After a stale batch hands its entries back, the next batch (its target from delivery.push_branch,
+    as pushq.start writes it) records an entry the new target already has as landed and pushes the rest."""
+    from ttp import push
+    from ttp.project import write_json
+    p, repo, origin, relay = _relay_setup(env, monkeypatch)
+    h1 = _entry(repo, "e1", {"f1.txt": "1\n"})
+    _git_out(repo, "push", "-q", "relay", f"{h1}:refs/heads/proj")
+    h2 = _entry(repo, "e2", {"f2.txt": "2\n"})
+    rc, m = _run_batch(p, _batch_marker(p, [h1, h2]), monkeypatch)
+    assert m["outcome"] == "retargeted" and _statuses(m) == ["requeued", "requeued"], m
+    marker = _batch_marker(p, [h1, h2], bid="b2")
+    write_json(marker, {**push._read(marker), "target": "/".join(push.target(p, repo))})
+    rc, m = _run_batch(p, marker, monkeypatch)
+    assert rc == 0 and _statuses(m) == ["landed", "pushed"], m
+    assert _git_out(relay, "show", "proj:f2.txt") == "2" and _git_out(relay, "merge-base", "--is-ancestor", h1, "proj") == ""
+
+
+@pytest.mark.parametrize("end", ["probe", "setting"])
+def test_unreachable_alarm_batches_that_cannot_reach_the_remote_alert_once_and_stop(env, monkeypatch, end):
+    """UNREACH_AFTER batches in a row that fail with 'cannot reach <remote>' raise one high alert naming
+    delivery.push_branch and the remote (not push_queue_dying), and schedule starts no more batches.
+    The hold ends when a bounded probe of the remote answers, or when delivery.push_branch changes."""
+    from ttp import alerts, pushq
+    s = _pq(env, monkeypatch)
+    _pq_plan(s, outcome="error", message="cannot reach origin: fatal: could not read from remote repository")
+    _pq_hand_off(env, s)
+    since = time.time()
+    for n in range(1, pushq.UNREACH_AFTER + 1):
+        _pq_batch(s)
+        _pq_tend(s)
+        assert s.p.db.kv(pushq.KV)["unreachable"]["n"] == n
+    sent = s.p.db.q("SELECT text, severity FROM messages WHERE kind='alert' AND ref=?", (pushq.UNREACH_ALERT,))
+    assert len(sent) == 1 and sent[0]["severity"] == "high", sent
+    assert "delivery.push_branch" in sent[0]["text"] and "`origin`" in sent[0]["text"], sent
+    assert not s.p.db.q("SELECT id FROM messages WHERE kind='alert' AND ref='push_queue_dying'")
+    s.p.db.x("UPDATE push_queue SET status='approved'")
+    st = s.p.db.kv(pushq.KV)
+    st.pop("backoff_until", None)
+    s.p.db.set_kv(pushq.KV, st)
+    assert pushq.schedule(s.p) is None and not s.p.db.q("SELECT id FROM push_queue WHERE status='batched'")
+    assert alerts.holds(s.p.db, pushq.UNREACH_ALERT, since, time.time())
+    if end == "probe":
+        _git_out(s.repo, "remote", "set-url", "origin", str(env["tmp"] / "missing.git"))
+        assert not pushq._reach_ok(s.p, "origin/proj", time.time() + 3600), "the remote still cannot be reached"
+        _git_out(s.repo, "remote", "set-url", "origin", str(s.origin))
+        assert pushq._reach_ok(s.p, "origin/proj", time.time() + 7200)
+    else:
+        s.p.set_config("delivery.push_branch", "origin/other")
+        pushq.schedule(s.p)
+    assert "unreachable" not in s.p.db.kv(pushq.KV)
+    assert not alerts.holds(s.p.db, pushq.UNREACH_ALERT, since, time.time())
+
+
+@pytest.mark.parametrize("relay_tip", ["same", "ahead", "diverged"])
+def test_retarget_keeps_the_review_approval_of_an_unchanged_head(env, monkeypatch, relay_tip):
+    """The live shape: a batch started for origin/proj, delivery.push_branch moved to relay/proj, the
+    batch stopped (`retargeted`) and its rows came back approved with no try counted. Where relay's tip
+    is origin's or has it, each approval moves to relay/proj with its head: the review is not run again
+    and the next batch takes it there. A diverged relay sends the review back."""
+    from ttp import push, pushq
+    s = _pq(env, monkeypatch, push_batch_s=0)
+    _pq_plan(s, outcome="retargeted", row="requeued", message="delivery.push_branch is relay/proj")
+    _pq_hand_off(env, s)
+    [row] = s.p.db.q("SELECT id FROM push_queue")
+    _pq_batch(s)
+    relay = env["tmp"] / "relay.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(relay)], check=True)
+    _git_out(s.repo, "remote", "add", "relay", str(relay))
+    if relay_tip == "diverged":
+        _git_out(s.repo, "checkout", "-q", "--orphan", "lone")
+        _commit(s.repo, "lone.txt", "lone\n")
+        _git_out(s.repo, "push", "-q", "relay", "lone:refs/heads/proj")
+    else:
+        _git_out(s.repo, "push", "-q", "relay", "origin/proj:refs/heads/proj")
+        if relay_tip == "ahead":
+            _commit(s.other, "theirs.txt", "theirs\n")
+            _git_out(s.other, "push", "-q", str(relay), "HEAD:proj")
+    s.p.set_config("delivery.push_branch", "relay/proj")
+    _pq_tend(s)
+    assert s.p.db.one("SELECT status, tries FROM push_queue WHERE id=?", (row["id"],)) == {"status": "approved", "tries": 0}
+    mark = _pq_mark(s.p)
+    _pq_plan(s, release=str(env["tmp"] / "never"))
+    bid = pushq.schedule(s.p)
+    if relay_tip == "diverged":
+        assert bid is None and s.p.db.task(s.review)["status"] == "queued", "a diverged target: the review runs again"
+        return
+    assert bid, _pq_events(s.p, mark)
+    assert s.p.db.one("SELECT status, target, batch FROM push_queue WHERE id=?", (row["id"],)) == {
+        "status": "batched", "target": "relay/proj", "batch": bid}
+    assert s.p.db.task(s.review)["status"] == "pushing", "the review does not run again"
+    assert [e["kind"] for e in _pq_events(s.p, mark) if e["kind"] in ("task_requeued", "push_retargeted")] == [
+        "push_retargeted"]
+    assert push._read(s.p.state / push.DETACHED / f"{bid}.json")["target"] == "relay/proj"
+    (env["tmp"] / "never").write_text("")
+    pushq._children[bid].wait(timeout=30)
+
+
+def test_precheck_hold_skips_an_urgent_review(tmp_path, monkeypatch):
+    """A routine review waits for its running precheck; an urgent one (priority 1 or `urgent:`) never does,
+    and its spec line says it starts at once."""
+    from ttp import cli, daemon
+    from ttp.daemon import PRECHECK_LABEL
+    out = tmp_path / daemon.PRECHECKS_DIR / "t1-abc"
+    out.mkdir(parents=True)
+    monkeypatch.setattr(cli, "_read_checks_pid", lambda o: {"ts": 1000.0})
+    monkeypatch.setattr(cli, "_checks_alive", lambda info: True)
+    (out / cli.CHECKS_RUNNING).write_text(json.dumps({"since": 1000.5}))   # the precheck runs on a host
+    task = {"id": 2, "kind": "review", "priority": 3, "spec": "check it",
+            "labels": json.dumps([PRECHECK_LABEL + "t1-abc"])}
+    assert daemon.precheck_holds(tmp_path, task, 1001.0), "a routine review waits"
+    assert not daemon.precheck_holds(tmp_path, dict(task, priority=1), 1001.0)
+    assert not daemon.precheck_holds(tmp_path, dict(task, spec="urgent: landing"), 1001.0)
+
+
+def test_a_takeover_that_defers_to_a_live_merge_task_waits_for_it_then_reports_it_stuck(env, tmp_path, monkeypatch):
+    """Every takeover try exited 75 (deferred) while a live merge task held the merge, and deploy gave up
+    after 3 quick tries. Now a try that defers to a live owner waits for it and spends no try; once the
+    owner ends the next try runs; an owner that holds it past OWNER_WAIT_S is reported stuck, once."""
+    from ttp import deploy, overview, release
+    p = make(env)
+    _deploy_lib('0.5.0')
+    _, db = _deploy_project(tmp_path, 'alpha', '0.4.9')
+    tid = db.add_task(release.UPGRADE_TASK_TITLE, 'merge', kind='harness')
+    db.update_task(tid, status='waiting')
+    now = time.time()
+    report = overview.deployed(names=['alpha'])
+    report['projects'][0]['takeover_at'] = now + 1
+    deploy.record(p, report, now)
+    due = p.db.kv(deploy.CHECKS)['deploy:alpha:0.5.0']['due']
+    launched = []
+    def launch(p, name, task):
+        launched.append((name, task))
+        return subprocess.Popen([sys.executable, "-c", "raise SystemExit(75)"])
+    monkeypatch.setattr(deploy, "launch_takeover", launch)
+    pages, page = _deploy_pager(p)
+    t = due + 1
+    for _ in range(12):     # an hour of probes: one try, then waiting on the live task
+        deploy.tick(p, page, t)
+        for child in deploy._children.values():
+            child.wait()
+        t += deploy.TAKEOVER_SETTLE_S
+    rec, tk = p.db.kv(deploy.CHECKS)['deploy:alpha:0.5.0'], p.db.kv(deploy.TAKEOVERS)['alpha']
+    assert launched == [('alpha', tid)] and not pages and tk['tries'] == 1 and tk['rc'] == 'exit 75'
+    assert rec['outcome'] == 'pending' and not rec.get('closed')
+    tk['owner_wait'] = t - deploy.OWNER_WAIT_S - 1     # the owner held it all that while
+    p.db.set_kv(deploy.TAKEOVERS, {'alpha': tk})
+    for i in range(3):
+        deploy.tick(p, page, t + i * deploy.PROBE_S)
+    assert len(pages) == 1 and 'stuck owner' in pages[0][1] and f'harness task #{tid}' in pages[0][1]
+    assert launched == [('alpha', tid)]
+    db.update_task(tid, status='cancelled')     # the owner ended without landing it: the takeover goes on
+    deploy.tick(p, page, t + 4 * deploy.PROBE_S)
+    assert len(launched) == 2, "the wait spent no try"
+
+
+def _pq_same(p, mark):
+    return [e for e in _pq_events(p, mark) if e["kind"] == "push_same_failure"]
+
+
+def test_two_batches_that_cannot_reach_the_remote_tell_the_coordinator_once_and_wait_for_the_remote(env, monkeypatch):
+    # The 47 h of silent retries: every batch ended "cannot reach origin" and was retried every 30 min.
+    # The second such batch in a row raises one high event to the coordinator; then the queue waits for a
+    # model-free dry-run push to work instead of retrying on a timer, and a third failure the same way
+    # only holds again (timings in the message differ: the same failure all the same).
+    from ttp import pushq
+    s = _pq(env, monkeypatch)
+    _pq_hand_off(env, s)
+    mark = _pq_mark(s.p)
+    for ms in (133136, 131002):
+        _pq_plan(s, outcome="error", message=f"cannot reach origin: fatal: unable to access 'https://example.com/r.git/': "
+                                             f"Failed to connect to example.com port 443 after {ms} ms")
+        _pq_batch(s)
+        _pq_tend(s)
+    ev, = _pq_same(s.p, mark)
+    assert ev["status"] == "queued" and "Failed to connect" in ev["text"] and "dry-run push" in ev["text"], ev
+    assert s.p.db.one("SELECT severity FROM events WHERE kind='push_same_failure'")["severity"] == "high"
+    probes, ok = [], {"v": False}
+    monkeypatch.setattr(pushq, "_auth_probe", lambda p, remote, branch: probes.append(1) or ok["v"])
+    now = time.time() + 3 * pushq.BACKOFF_MAX_S   # past any backoff: no timer retries it
+    rows, why = pushq.due(s.p, now)
+    assert rows == [] and why.startswith("held: the last 2 push batches failed the same way") and probes == [1], why
+    assert pushq.due(s.p, now + 10)[0] == [] and probes == [1], "probed at most every AUTH_PROBE_S"
+    ok["v"] = True
+    rows, why = pushq.due(s.p, now + pushq.AUTH_PROBE_S)
+    assert rows, why
+    _pq_batch(s)   # still failing the same way: held again, no second event
+    _pq_tend(s)
+    assert len(_pq_same(s.p, mark)) == 1
+    ok["v"] = False
+    assert pushq.due(s.p, time.time() + 3 * pushq.BACKOFF_MAX_S)[1].startswith("held: the last 3 push batches")
+
+
+def test_two_pushes_rejected_the_same_way_hold_until_the_approvals_change_and_a_landing_ends_the_streak(
+        env, monkeypatch):
+    from ttp import pushq
+    s = _pq(env, monkeypatch)
+    _pq_hand_off(env, s)
+    mark = _pq_mark(s.p)
+    for sha in ("ab" * 20, "cd" * 20):
+        _pq_plan(s, outcome="rejected", row="requeued",
+                 message=f"! [remote rejected] {sha} -> proj (protected branch hook declined)")
+        _pq_batch(s)
+        _pq_tend(s)
+    assert len(_pq_same(s.p, mark)) == 1
+    now = time.time() + 3 * pushq.BACKOFF_MAX_S
+    rows, why = pushq.due(s.p, now)
+    assert rows == [] and "retried when the tip or the approvals change" in why, why
+    _pq_review(s)   # a new approval: worth one more try
+    rows, why = pushq.due(s.p, now)
+    assert rows, why
+    _pq_plan(s, outcome="pushed", sha="ef" * 20)
+    _pq_batch(s)
+    _pq_tend(s)
+    assert "fail_streak" not in s.p.db.kv(pushq.KV)
+
+
+def test_a_failure_signature_ignores_shas_and_numbers_but_not_the_error():
+    from ttp import pushq
+    a = pushq._fail_sig("failed: ab12cd34ef after 1200 ms on try 3")
+    assert a == pushq._fail_sig("failed: 99ffee0011 after 87 ms on try 4")
+    assert a != pushq._fail_sig("failed: ab12cd34ef: protected branch")
+
+
+def test_an_urgent_approval_waiting_behind_a_running_batch_for_15_min_tells_the_coordinator_once(env, monkeypatch):
+    from ttp import pushq
+    s = _pq(env, monkeypatch)
+    now = time.time()
+    _pq_last_batch(s, None, now - 60, after_done=False)   # still running
+    _, slow = _pq_review(s, priority=3)
+    _, hot = _pq_review(s, priority=1)
+    s.p.db.x("UPDATE push_queue SET created=?", (now - pushq.URGENT_WAIT_S - 60,))
+    mark = _pq_mark(s.p)
+    assert "still going" in pushq.due(s.p, now)[1]
+    assert pushq.due(s.p, now + 60)[0] == []
+    ev = [e for e in _pq_events(s.p, mark) if e["kind"] == "push_urgent_waiting"]
+    assert len(ev) == 1 and ev[0]["status"] == "queued" and "b1" in ev[0]["text"], ev
+    assert s.p.db.kv(pushq.KV)["urgent_told"] == [hot]
+
+
+def test_an_approval_that_fixes_the_failing_tip_goes_alone_first(env, monkeypatch):
+    from ttp import pushq
+    s = _pq(env, monkeypatch)
+    _, routine = _pq_review(s)
+    fid = s.p.db.add_task("review the tip fix", "Review #9: fix the pre-existing failures on the push tip", kind="review",
+                          origin="coordinator")
+    s.p.db.update_task(fid, status="pushing")
+    with s.p.db.tx():
+        [fix] = pushq.approve(s.p, fid, None, {"entries": [{"branch": s.branch, "head": s.head}], "target": "origin/proj"})
+    tip = pushq._tracking_tip(s.p, "origin", "proj")
+    s.p.db.set_kv(pushq.KV, {"bad_tip": {"tip": tip, "fails": 2, "tried": [], "at": time.time(),
+                                         "ids": ["tests/test_other.py::test_a"]}})
+    rows, why = pushq.due(s.p, time.time() + 10 ** 6)
+    assert [r["id"] for r in rows] == [fix] and "fixes the failing tip" in why, why
+    monkeypatch.setattr(pushq, "_changed", lambda p, a, b: frozenset({"tests/test_other.py"}))
+    rows, why = pushq.due(s.p, time.time() + 10 ** 6)
+    assert [r["id"] for r in rows] == [routine], "the first approval whose change touches the failing tests"
+
+
+def _push_waiters(p, monkeypatch, prios, wait_s=30):
+    """One thread per (name, task priority) calling push.take on a held push lock, started in that
+    order once the one before is queued; returns (threads, order the lock was taken in, the holder)."""
+    from ttp import checkcap, locks, push
+    local = threading.local()
+    monkeypatch.setattr(checkcap, "task_priority", lambda _p: getattr(local, "prio", None))
+    held = locks.try_take(push.lock_paths(p, "origin", "proj"), "the holder", "ttp push")
+    order, threads = [], []
+
+    def wait(name, prio):
+        local.prio = prio
+        f = push.take(p, "origin", "proj", wait_s, poll_s=0.05, say=lambda _m: None, who=name)
+        order.append(name if f else f"{name}: gave up")
+        time.sleep(0.5)   # holds it a moment: the next waiter's turn comes after this one's
+        if f:
+            f.close()
+
+    resource = push.lock_resource("origin", "proj")
+    for name, prio in prios:
+        t = threading.Thread(target=wait, args=(name, prio), daemon=True)
+        t.start()
+        threads.append(t)
+        assert _wait_for(lambda: len(locks.queued(p.state / "locks", resource)) == len(threads))
+    return threads, order, held
+
+
+def test_push_waiters_take_the_lock_urgent_first_then_by_age(env, monkeypatch):
+    """Three pushes wait for one push lock; on release the urgent task's (priority 1) takes it, then
+    the oldest of the rest, not in random order. The last one waits longer than its 1 s in all, but
+    under 1 s once first in line: it is not failed for the others' turns."""
+    from ttp import locks, push
+    p = make(env)
+    threads, order, held = _push_waiters(p, monkeypatch, [("old", 3), ("plain", None), ("urgent", 1)], wait_s=1)
+    time.sleep(0.7)
+    held.close()
+    for t in threads:
+        t.join(timeout=30)
+    assert order == ["urgent", "old", "plain"], order
+    assert not locks.queued(p.state / "locks", push.lock_resource("origin", "proj")), "a ticket stayed queued"
+
+
+def test_a_dead_push_waiter_is_skipped_and_a_late_turn_gets_its_full_wait(env, monkeypatch, tmp_path):
+    """A user-ordered waiter ahead dies while it waits: on release the next live waiter takes the lock
+    at once, not after the stall guard. A waiter behind others gets its whole wait once first in line."""
+    from ttp import locks, push
+    p = make(env)
+    resource = push.lock_resource("origin", "proj")
+    queued_mark = tmp_path / "queued"
+    dead = subprocess.Popen([sys.executable, "-c",
+                             "import sys, time, pathlib; from ttp import locks; "
+                             "locks.enqueue(pathlib.Path(sys.argv[1]), sys.argv[2], 'dead push', priority=0); "
+                             "pathlib.Path(sys.argv[3]).touch(); time.sleep(600)",
+                             str(p.state / "locks"), resource, str(queued_mark)],
+                            env={**os.environ, "PYTHONPATH": str(RUNTIME)})
+    try:
+        assert _wait_for(lambda: queued_mark.exists())
+        held = locks.try_take(push.lock_paths(p, "origin", "proj"), "the holder", "ttp push")
+        got = []
+        t = threading.Thread(target=lambda: got.append(push.take(p, "origin", "proj", 2, poll_s=0.05,
+                                                                 say=lambda _m: None, who="live")), daemon=True)
+        t.start()
+        assert _wait_for(lambda: len(locks.queued(p.state / "locks", resource)) == 2)
+        time.sleep(2.5)   # longer than its wait, all of it behind the dead waiter: not failed for that
+        assert t.is_alive(), "a waiter behind another was failed for waiting"
+    finally:
+        dead.kill()
+        dead.wait(timeout=30)
+    t0 = time.time()
+    held.close()
+    t.join(timeout=30)
+    assert got and got[0] is not None and time.time() - t0 < push.STALL_S / 2, (got, time.time() - t0)
+    got[0].close()
+
+
+def _carry_hand_off(env, s, tid, **more):
+    """Code task `tid`'s run hands off done (its branch at its current head)."""
+    return _pq_hand_off(env, s, push=False, task=tid, **more)
+
+
+def test_a_code_hand_off_carrying_a_rejected_task_s_commits_is_sent_back_once_to_rebase_or_wait(env, monkeypatch):
+    """#7223: a head stacked on a task whose review failed cannot pass the push queue, so its hand-off
+    is sent back once with the order to rebase or wait on that landing; the next hand-off is taken."""
+    from ttp import carryback
+    from ttp.daemon import Daemon
+    s = _pq(env, monkeypatch)
+    monkeypatch.setattr(Daemon, "_precheck", lambda self, task, head: None)
+    x, xbranch, _, _ = _pq_stacked(s, "rejected", review="failed")
+    c, _, chead, _ = _pq_stacked(s, "stacked", on=xbranch)
+    # The worker cannot skip the check by writing the key itself.
+    t = _carry_hand_off(env, s, c, **{carryback.KEY: {"run": 1}})
+    res = json.loads(t["result"])
+    assert t["status"] == "queued" and int(t["attempts"] or 0) == 0, dict(t)
+    assert f"#{x}" in res["woke"] and "rebase onto the tip of origin/proj" in res["woke"], res["woke"]
+    assert f"ttp landed --task {x}" in res["woke"] and "asked once" in res["woke"]
+    assert res[carryback.KEY]["tasks"] == [x] and res[carryback.KEY]["head"] == chead
+    assert not s.p.db.q("SELECT id FROM tasks WHERE kind='review' AND labels LIKE ?", (f'%auto_review:{c}"%',))
+    # Handed off again unchanged: taken, and the daemon's review is queued (held as before).
+    t = _carry_hand_off(env, s, c)
+    assert t["status"] == "done", dict(t)
+    assert carryback.KEY in json.loads(t["result"]), "once per task"
+    assert s.p.db.q("SELECT id FROM tasks WHERE kind='review' AND labels LIKE ?", (f'%auto_review:{c}"%',))
+
+
+def test_a_code_hand_off_passes_when_it_declares_the_landing_or_the_carried_commits_landed_or_are_approved(
+        env, monkeypatch):
+    from ttp import carryback, pushq
+    from ttp.daemon import Daemon
+    s = _pq(env, monkeypatch)
+    monkeypatch.setattr(Daemon, "_precheck", lambda self, task, head: None)
+    x, xbranch, xhead, _ = _pq_stacked(s, "rejected", review="failed")
+    # a) It declares start_when `landed:#x` (or names it in its spec): no send-back.
+    a, _, _, _ = _pq_stacked(s, "declared", on=xbranch)
+    s.p.db.x("UPDATE tasks SET labels=? WHERE id=?",
+             (json.dumps([f"start_when:landed:#{x}", "start_why:needs its code"]), a))
+    b, _, _, _ = _pq_stacked(s, "in-spec", on=xbranch)
+    s.p.db.x("UPDATE tasks SET spec=? WHERE id=?", (f"needs #{x}'s code: start_when landed:#{x}", b))
+    for tid in (a, b):
+        t = _carry_hand_off(env, s, tid)
+        assert t["status"] == "done" and carryback.KEY not in json.loads(t["result"]), dict(t)
+    # A declared wait on another task is no wait on this one.
+    assert not carryback.declared({"spec": f"start_when landed:#{x}1", "labels": "[]"}, {}, x)
+    assert carryback.declared({"spec": "", "labels": "[]"}, {"retry_when": f"ttp landed --task {x}"}, x)
+    # b) Its change is approved for the push queue (a passed re-review of its fix): no send-back.
+    fix = s.p.db.add_task(f"fix #{x}", "f", kind="code", origin="daemon", labels=[f"continues:{x}"])
+    s.p.db.update_task(fix, status="done")
+    rr = s.p.db.add_task(f"Review #{fix}: fix", "r", kind="review", origin="daemon", depends_on=[x, fix],
+                         labels=[f"auto_review:{fix}"])
+    s.p.db.update_task(rr, status="pushing")
+    with s.p.db.tx():
+        pushq.approve(s.p, rr, None, {"entries": [{"branch": xbranch, "head": xhead}], "target": "origin/proj"})
+    c, _, _, _ = _pq_stacked(s, "on-approved", on=xbranch)
+    t = _carry_hand_off(env, s, c)
+    assert t["status"] == "done" and carryback.KEY not in json.loads(t["result"]), dict(t)
+    # c) The carried commits are on the push branch already (landed there as a rebased copy): no send-back.
+    s.p.db.x("DELETE FROM push_queue")
+    y, ybranch, yhead, _ = _pq_stacked(s, "landed-rejected", review="failed")
+    tip = _git_out(s.repo, "rev-parse", "origin/proj")
+    _git_out(s.other, "fetch", "-q", "origin")
+    _git_out(s.other, "checkout", "-q", "-B", "proj", "origin/proj")
+    _git_out(s.other, "fetch", "-q", str(s.repo), ybranch)
+    _git_out(s.other, "cherry-pick", "FETCH_HEAD")
+    _git_out(s.other, "push", "-q", "origin", "proj")
+    _git_out(s.repo, "fetch", "-q", "origin")
+    assert _git_out(s.repo, "rev-parse", "origin/proj") != tip
+    d, _, _, _ = _pq_stacked(s, "on-landed", on=ybranch)
+    assert not pushq.carried(s.p, s.p.db.task(d), _git_out(s.repo, "rev-parse", s.p.db.task(d)["branch"])).get(y)
+    t = _carry_hand_off(env, s, d)
+    assert t["status"] == "done" and carryback.KEY not in json.loads(t["result"]), dict(t)
+
+
+def test_land_needs_a_passed_review_of_exactly_head_where_delivery_wants_review(env, monkeypatch, capsys):
+    # Replays the upstream note: on a project whose delivery wants a review before each push, a worker's
+    # `ttp push --land --detach` ran only the checks and landed. `--land` overrides the landing step and
+    # the checks guard, never the review: it lands only the exact head a passed review accepted.
+    from ttp import push, verified
+    p, repo, origin, _ = _push_setup(env, monkeypatch, ["true"])
+    p.set_config("delivery.code_tasks_may_push", True)   # code tasks land only with it on (code_run_landing)
+    shared = _git_out(origin, "rev-parse", "proj")
+    tid = p.db.add_task("fix", kind="code", spec="Fix it.")
+    _git_out(repo, "checkout", "-q", "-b", f"ttp/t{tid}-fix")
+    _commit(repo, "mine.txt", "mine\n")
+    monkeypatch.setenv("TTP_TASK", str(tid))
+    for args in (["push", "--land"], ["push", "--land", "--detach"]):
+        assert _ttp(*args) == 2, args
+        err = capsys.readouterr().err
+        assert "needs a passed review of this exact commit" in err and "delivery.review_before_pr or delivery.push_branch" in err, err
+        monkeypatch.delenv(push.LAND_ENV, raising=False)   # cmd_push sets it in os.environ
+    assert not (p.state / "pushes").exists() and _git_out(origin, "rev-parse", "proj") == shared
+    # A passed review records the head it accepted (daemon._mark_verified): that exact head may land.
+    old = _git_out(repo, "rev-parse", "HEAD")
+    review = p.db.add_task(f"Review #{tid}", kind="review", depends_on=[tid])
+    verified.record(p.db, tid, "review", old, review=review)
+    monkeypatch.setenv(push.LAND_ENV, "1")
+    assert push.resolve(p, repo) == ("origin", "proj", False)
+    # A commit after the review is not covered by it; the refusal names the head the review accepted.
+    _commit(repo, "more.txt", "more\n")
+    head = _git_out(repo, "rev-parse", "HEAD")
+    with pytest.raises(ValueError, match=f"#{review}\\) accepted {old[:10]}, not this commit"):
+        push.resolve(p, repo)
+    # Another task's review of this very commit does not cover this task's landing.
+    other = p.db.add_task("other", kind="code")
+    verified.record(p.db, other, "review", head, review=review)
+    with pytest.raises(ValueError, match="needs a passed review"):
+        push.resolve(p, repo)
+    # A push_branch is a review step too (as the daemon's automatic reviews read it): review_before_pr off
+    # with a push_branch set still refuses the unreviewed head.
+    p.set_config("delivery.review_before_pr", False)
+    with pytest.raises(ValueError, match=r"delivery.review_before_pr or delivery.push_branch"):
+        push.resolve(p, repo)
+    # With no review step (neither set) the gate lets the head through as before.
+    assert not push.review_required({"review_before_pr": False, "push_branch": ""})
+    assert push.unreviewed_landing(p, repo, str(tid), {"review_before_pr": False}) == ""
+    p.set_config("delivery.review_before_pr", True)
+    # Reviewed at this head, `ttp push --land` lands it.
+    verified.record(p.db, tid, "review", head, review=review)
+    monkeypatch.delenv(push.LAND_ENV)
+    assert _ttp("push", "--land") == 0 and _git_out(origin, "rev-parse", "proj") == head
+    monkeypatch.delenv(push.LAND_ENV, raising=False)
+
+
+def test_push_cancel_stops_the_tasks_own_running_push_and_lands_nothing(env, monkeypatch, capsys):
+    # Replays the upstream note: a worker that started `ttp push --land --detach` could not stop it (the
+    # kill hook refuses the push's process group). `ttp push --cancel <marker>` ends the push and its
+    # checks, frees the branch and lands nothing; another task's cancel is refused.
+    started = env["tmp"] / "started"
+    p, repo, origin, _ = _push_setup(env, monkeypatch, [f"touch {started}; sleep 120"])
+    shared = _git_out(origin, "rev-parse", "proj")
+    mine, theirs = p.db.add_task("mine", kind="work"), p.db.add_task("theirs", kind="work")
+    _commit(repo, "mine.txt", "mine\n")
+    monkeypatch.setenv("TTP_TASK", str(mine))
+    monkeypatch.setenv("TTP_RUN_ID", "1")
+    rc, marker, probe = _detach(capsys)
+    assert rc == 0 and marker
+    pid = json.loads(marker.read_text())["pid"]
+    try:
+        deadline = time.time() + 30
+        while not started.exists() and time.time() < deadline:
+            time.sleep(0.05)
+        assert started.exists() and _probe(p, probe).returncode == 1
+        monkeypatch.setenv("TTP_TASK", str(theirs))
+        assert _ttp("push", "--cancel", str(marker)) == 2
+        assert f"queued by task #{mine}, not by task #{theirs}" in capsys.readouterr().err
+        assert json.loads(marker.read_text())["status"] == "running"
+        from ttp import push
+        assert push._group_alive(pid)   # still running
+        monkeypatch.setenv("TTP_TASK", str(mine))
+        assert _ttp("push", "--cancel", str(marker)) == 0
+        assert "nothing landed" in capsys.readouterr().out
+        from ttp import push
+        assert not push._group_alive(pid)   # the push and its check are gone (a zombie left unreaped is not alive)
+    finally:
+        try:
+            os.killpg(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    m = json.loads(marker.read_text())
+    assert m["status"] == "cancelled" and m["reason"] == f"cancelled by task #{mine}" and not m.get("sha")
+    assert _ttp("push", "--free") == 0 and _git_out(origin, "rev-parse", "proj") == shared
+    r = _probe(p, probe)
+    assert r.returncode == 0 and f"not pushed (cancelled by task #{mine})" in r.stdout, r
+    assert _probe(p, probe + " --pushed").returncode == 3
+    # Cancelling it again says it already ended.
+    assert _ttp("push", "--cancel", str(marker)) == 0 and "already ended" in capsys.readouterr().out
+
+
+def test_push_cancel_of_a_queued_push_keeps_the_daemon_from_starting_it(env, monkeypatch, capsys):
+    from ttp import push
+    p, repo, origin, _ = _push_setup(env, monkeypatch, ["true"])
+    shared = _git_out(origin, "rev-parse", "proj")
+    mine, theirs = p.db.add_task("mine", kind="work"), p.db.add_task("theirs", kind="work")
+    _commit(repo, "mine.txt", "mine\n")
+    monkeypatch.setenv("TTP_TASK", str(mine))
+    monkeypatch.setenv("TTP_RUN_ID", "1")
+    monkeypatch.setenv("TTP_PIDNS", "pid:[1]")   # the run's namespace, not this one: queued for the daemon
+    rc, marker, _ = _detach(capsys)
+    monkeypatch.delenv("TTP_PIDNS")
+    assert rc == 0 and json.loads(marker.read_text())["status"] == "queued"
+    # Refused: another task, a marker outside this project's pushes, the push queue's batch process.
+    monkeypatch.setenv("TTP_TASK", str(theirs))
+    assert _ttp("push", "--cancel", str(marker)) == 2 and "a task cancels only its own pushes" in capsys.readouterr().err
+    stray = env["tmp"] / "stray.json"
+    stray.write_text(json.dumps({**json.loads(marker.read_text()), "task": str(theirs)}))
+    assert _ttp("push", "--cancel", str(stray)) == 2 and "not a detached push of this project" in capsys.readouterr().err
+    batch = marker.parent / "batch-x.json"
+    batch.write_text(json.dumps({"kind": "batch", "task": str(theirs)}))
+    assert _ttp("push", "--cancel", str(batch)) == 2 and "batch process" in capsys.readouterr().err
+    assert _ttp("push", "--cancel", str(env["tmp"] / "none.json")) == 2
+    # The project's coordinator may cancel any push of its project.
+    monkeypatch.delenv("TTP_TASK")
+    monkeypatch.setenv("TTP_ROLE", "coordinator")
+    assert _ttp("push", "--cancel", str(marker)) == 0 and "nothing landed" in capsys.readouterr().out
+    monkeypatch.delenv("TTP_ROLE")
+    m = json.loads(marker.read_text())
+    assert m["status"] == "cancelled" and m["reason"] == "cancelled by the coordinator"
+    push.tend(p)   # the daemon's tick never starts it
+    assert json.loads(marker.read_text())["status"] == "cancelled"
+    assert _ttp("push", "--free") == 0 and _git_out(origin, "rev-parse", "proj") == shared

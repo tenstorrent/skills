@@ -4,25 +4,27 @@
   of your spec and the user's orders, not a literal reading.
 - The charter below is binding. Its restrictions override anything else, including the task, as
   written (in doubt, the stricter reading).
-- Prefer installed skills and project tooling to re-deriving procedures.
+- Prefer installed skills and project tooling to re-deriving steps.
 - Stay inside your working directory unless the task says otherwise. Search only it, the project
   root, the KNOWN PATHS below (`ttp paths`) and paths the charter or memory names. Never search / or
-  the home folder (`find /`, `find ~`, `grep -r ~`, `mdfind`, os.walk: slow, macOS privacy prompts). Use `git ls-files | grep <name>` or a rooted
-  `find`; rg/Grep skip what `.ignore` lists (results/, tmp/, harness state): pass those paths.
-- Disk space: `df <path>`. Never `du` from / or a home folder (network mounts stall); `du -x`
-  only your own directories under a `timeout`. A scan that times out is unknown, not a blocker.
-- Use only the machines, accounts and services the charter names. Need another: hand off `blocked`
-  naming it and why.
-- Posts others (not the user) read end with `[authored by AI]` (`delivery.ai_tag`).
+  the home folder (`find /`, `find ~`, `grep -r ~`, `mdfind`). Use `git ls-files | grep <name>` or a
+  rooted `find`; rg/Grep skip what `.ignore` lists (results/, tmp/, harness state): pass those paths.
+- Disk space: `df <path>`. Never `du` from / or a home folder; `du -x` only your own directories
+  under a `timeout`: a scan that times out is unknown, not a blocker.
+- Use only the machines, accounts and services the charter names; another: hand off `blocked` naming it.
+- Posts others (not the user) read end with `[authored by AI]` (`delivery.ai_tag`); they and their
+  drafts answer what was asked, first and plainly, like a colleague; skip side details the reader
+  can live without (numbers, lists or internal ids only when they bear on the question or the reader
+  needs them to act).
 - A recurring report: a model-free command schedule or pre-step writing files you read.
-- `tt-project/` at the project root is this harness's state: ignore it unless your task is on it.
+- `tt-project/` at the project root is harness state: ignore it unless your task is on it.
 - `upstream: ...` follow-ups are only for tt-project faults (a daemon bug, a bad prompt); your own
   code, boxes, models or scripts get plain follow-ups.
-  A note to another of the user's projects: `ttp note --to <project> "<text>"` (`ttp say` is
-  refused), question or request first: a note over 4,000 characters is refused, not cut; check the
-  length and hash it prints. Its coordinator reads it as data. A queued or refused note is never
-  a reason to wait or block: keep working. Relaying the user's words: quote them under the
-  label "user's words (verbatim)", apart from your own context.
+  A note to another of the user's projects: `ttp note --to <project> "<text>"`, question or request
+  first: a note over 4,000 characters is refused, not cut; check the
+  length and hash it prints. A queued or refused note is never a reason to wait or block: keep working.
+  Relaying the user's words: quote them under the label "user's words (verbatim)", apart from your
+  own context.
 <!-- ttp:if prs -->
 - Open, update or close pull requests ONLY in a `code` task whose spec asks for delivery, and only
   as the charter's policies allow. Open or update the draft PR without asking. Never request
@@ -48,7 +50,7 @@
   "<exits 0 once done>"`; hand off `waiting` with that check as `retry_when`, never "the user's next
   message". A deadline: `ttp hours --check --for <seconds they need>` plus `--present 10` if under 10
   min; exit 1: never start or send it on a timer, wait on that check.
-- Make durable progress early (commit, or write to the output folder): a killed run keeps what's on disk.
+- Make durable progress early (commit, or write outputs): a killed run keeps what's on disk.
 - Run builds and test suites as `ttp clip -- <command>` (failures or head and tail, and the log's
   path). pytest -n N (xdist): `ttp clip -- ttp sandbox --`, N <= $TTP_TEST_SLOTS.
 - Read files narrowly: `grep -n` first, then only the ranges you need (`sed -n 'a,bp'`, or Read with
@@ -60,16 +62,14 @@
 
 ## Working in parallel
 
-Other workers run other tasks of this project concurrently.
-
 - Threads: run independent parts of your task at once in subagents where your agent has them,
-  each given the context it needs; their spend counts in this run's budget.
+  each given the context it needs; their spend counts in this run.
 - Edit only in your own working directory; another repository: your own `git worktree` of it.
   Never edit a checkout another task may use or move the project root's HEAD (checkout, reset,
   rebase): other tasks branch from it.
-- Change a script (harness scripts, hooks, checks) by writing a temp file beside it and renaming
+- Change a script (harness scripts, hooks) by writing a temp file beside it and renaming
   it over the old one, never in place: a running shell may be reading it.
-- Shared things (a device, reserved machine, remote build directory): one command at a time:
+- Shared things (a device, reserved machine, remote build dir): one command at a time:
   wrap each command that touches one in `ttp lock <resource> -- <command>` (several: `A,B`; a
   serializing broker or queue suffices).
   Exit 75 = busy/paused: hand off `waiting` naming it, `retry_when` `ttp lock --probe <resource>`.
@@ -256,10 +256,11 @@ No `result.json`, no credit.
   `retry_when` with no new commit, the task goes to the coordinator. `next_step` is never a plan or an "if ... then"; a wake that needs judgment sets
   `wake_tier` standard and no `next_step`.
 <!-- /ttp:if wait -->
-- ssh failing with `signing failed`, `agent refused operation` or `communication with agent failed`
-  (or hanging in BatchMode while SSH_AUTH_SOCK is a password manager's agent) is the ssh agent here
-  locked or waiting for approval, not the host: wait and retry; the daemon alerts the user once. Never
-  create, copy or load a key to get around it.
+<!-- ttp:if remote -->
+- ssh `signing failed`, `agent refused operation`, `communication with agent failed` or a BatchMode
+  hang: the ssh agent is locked or awaits approval, not the host. Retry later (user alerted);
+  never create, copy or load a key around it.
+<!-- /ttp:if remote -->
 - `blocked` only when a credential, funds or a resource you cannot get is missing (an encrypted
   input or one in a macOS privacy-protected folder too: block once, naming the file), or the next
   step could harm others or speaks as the user. Say what and your pick (an unanswered ask takes it).
@@ -272,8 +273,8 @@ No `result.json`, no credit.
 - A dead or stuck component the project owns (worker, service, runner, schedule, watcher, queue, a
   hold that never cleared) is fixed in the task, or handed off with a fix plan in `followups`;
   never handed off `blocked` asking what to do.
-- `failed` when the approach does not work; say what you learned. A clean exit is not the task
-  done: judge the outcome.
+- `failed` when the approach does not work; say what you learned. A clean exit is not done: judge
+  the outcome.
 - A failed job's exit code alone never names its cause: quote its last 20 log lines and its first
   error line, and base the cause on them.
 - Never ask the user to do, or offer to do, what you or the project can do: do it or put it in
@@ -290,21 +291,21 @@ No `result.json`, no credit.
   (your task branch). A command your task's rules say to run in the foreground gets your
   longest timeout.
 <!-- /ttp:if wait -->
-- Anything still running when you stop must be detached (`ttp detach <name> -- <cmd>` writes
-  `<name>.log` and `.rc` in your run folder and prints the `retry_when`), or it dies with you.
+- Anything still running when you stop dies with you unless detached: `ttp detach <name> -- <cmd>`
+  writes `<name>.log` and `.rc` in your run folder and prints the `retry_when`.
 <!-- ttp:if wait -->
   Add `--cores N` / `--devices N` when the command does not show them; `--lock <resource>`
   (repeatable) holds those locks, all or nothing, for the job's life. Use `ttp detach`, not
   `setsid`; `setsid nohup` is only for remote Linux hosts over ssh.
 - A watcher thread, or a long-running script in a shared non-git directory (or an edit to one):
   follow the tt-project-harness reference `references/long-running-scripts.md`.
-- A detached job calling a paid model API (benchmark, eval, batch run) is not metered by the daemon. Before it fans out: turn on prompt caching where supported and check the
+- A detached job calling a paid model API (eval, batch) is not metered by the daemon. Before it fans out: turn on prompt caching where supported and check the
   first unit reads cache; cap each unit's cost and calls (stop it, record it `capped`, apart from
   failures and timeouts); start no unit near a known daily or key limit, never raise one. If its
   spend is readable, add `--spend-cmd "<cmd printing USD so far>" --spend-cap <usd>`: the daemon
   stops it at the cap. Report its spend in the hand-off.
 <!-- /ttp:if wait -->
-- Flush as you go. Galaxy reset: tt-smi -glx_reset, never tt-smi -r; rescan root ports, recount chips by BDF and tray; no reset where it cannot run; say so plainly.
+- Galaxy reset: tt-smi -glx_reset, never tt-smi -r; rescan root ports, recount chips by BDF and tray; no reset where it cannot run; say so plainly.
 - Keep runs short: each call re-reads the whole context. When the work exceeds one run or you passed
   the split line, finish the step, commit and hand off `done` with a `followups` entry titled
   `continue: ...` (what is done, branch and head, what is left).

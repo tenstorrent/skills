@@ -57,7 +57,7 @@ from . import (checkcap, checkdirs, checklane, checkspill, cleantree, conflictfi
                scriptwatch, setupfault, syntaxfault, testslots, workerloss, urgent,
                sharedchecks, slowtests, suitecost, verdictcarry, worktree)
 from .project import Project, command_env, durable_write, write_json
-from . import gitmemo, hoststate
+from . import ghroute, gatetime, gitmemo, hoststate
 
 WORKTREE = "push"             # the batch's own checkout under the project's worktrees (never t<id>)
 AFTER_PUSH = "after_push-"    # + batch id: the temporary checkout after_push runs in
@@ -90,6 +90,7 @@ YIELD_GRACE_S = 300.0              # delivery.push_yield_grace_s: an urgent appr
 YIELD_WAIT_S = 900.0               # delivery.push_yield_wait_s: an urgent approval waits for a search whose verdict is expected this soon
 YIELD_RESTARTS = 0                 # delivery.push_yield_restarts: searches one set of approvals may stop for urgent ones (0: none, they join the next check)
 RERUN_IDS = 10                     # a check failing more tests than this is not rerun: that is no flake
+TIP_IDS = 100                      # ...but up to this many still rerun on the tip alone: those it fails are its own (_tip_ids)
 TIP_RERUNS = 3                     # reruns on the tip alone of a blamed failure's failing tests: one failing clears the entry
 TIP_RESEARCH = 3                   # searches run again in one round once the tip alone fails more tests (_research)
 HARD_TESTS = r"leak"               # delivery.push_hard_tests: failing test ids never excused as the tip's own (the leak scan)
@@ -256,7 +257,7 @@ def _stream(cmd: str | list[str], cwd: Path, env: dict | None = None, timeout: f
 
 def _streamed(cmd, cwd: Path, env: dict | None, timeout: float | None, group: bool, pass_fds: tuple,
               collect: workerloss.Collector | None) -> tuple[int | None, str, bool]:
-    guard = hoststate.Guard(env) if env and env.get(hoststate.MARKER) else None   # a check: compare the host after
+    guard = hoststate.Guard(env, argv=cmd) if env and env.get(hoststate.MARKER) else None   # a check: compare the host after
     proc = subprocess.Popen(cmd, shell=isinstance(cmd, str), cwd=str(cwd), env=env, stdin=subprocess.DEVNULL,
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=group, pass_fds=pass_fds)
     tail: deque[str] = deque(maxlen=push.LOG_TAIL)
@@ -1478,7 +1479,7 @@ class Batch:
         self.isolate = {str(c) for c in m.get("setup_isolate") or []}   # alerted setup_fault checks (pushq)
         self.spill_off = ""   # the spill hosts this batch's checks keep off (checkspill.spill_off_add, _respill)
         self.at = ""                            # the head _check runs on
-        self.checks = {"runs": 0, "seconds": 0.0, "flaky": False}
+        self.checks = {"runs": 0, "seconds": 0.0, "cpu_s": 0.0, "flaky": False}
         self.tip = self.pushed_sha = self.version = None
         self.reach: dict | None = None          # push.reach of what it pushed or found landed
         self.message = ""
@@ -1515,6 +1516,7 @@ class Batch:
         self.checks_at: float | None = None    # when this batch's first check began (_check): the yield grace counts from it
         self.waited: list[int] = []            # urgent approvals that wait for this search's verdict (_yield_now)
         self.full_fail: tuple[str, str] | None = None  # the full head's failure (_judge): a stop carries it (_known_fail)
+        self.unrun: dict[str, list[str]] = {}    # a failed check's output tail -> the checks after it that never ran (_rest_check)
 
     # results
 
@@ -1567,6 +1569,22 @@ class Batch:
 
     # the push phase
 
+    def _retargeted(self, now: str) -> str:
+        """delivery.push_branch is `now`, not the target this batch (or the batch a reboot cut short,
+        rerun on its marker) began with: it stops before another check or a push, and its rows go back
+        approved with no try counted (pushq.finalize). pushq.retarget then moves their approvals to the
+        new target and the next batch, started on it, lands them; nothing alarms per row."""
+        return self._all("requeued", "retargeted", keep=("landed",), message=f"delivery.push_branch is {now or '(none)'}, not "
+                                                   f"{self.target or '(none)'}: the batch stops and hands its "
+                                                   f"entries back for a batch on {now or 'the new target'}")
+
+    def _target_now(self) -> str:
+        """delivery.push_branch as remote/branch now, '' when it cannot be read."""
+        try:
+            return "/".join(push.target(self.p, self.repo))
+        except ValueError:
+            return ""
+
     def push_phase(self) -> str:
         """Steps 1-10; the outcome. Every entry has its result when this returns."""
         allowed = self.d.get("push_allowed")
@@ -1581,7 +1599,7 @@ class Batch:
         except ValueError as e:
             return self._all("refused", "refused", str(e))
         if not (self.remote and self.branch) or now != self.target:
-            return self._all("requeued", "refused", f"the push target is {now}, not {self.target or '(none)'}")
+            return self._retargeted(now)
         self.target_lock = push.take(self.p, self.remote, self.branch, 0, say=lambda _m: None,
                                      who=f"push batch {self.id}")
         if self.target_lock is None:
@@ -1601,6 +1619,8 @@ class Batch:
         while rnd < rounds:
             rnd += 1
             self.rounds += 1
+            if rnd > 1 and (aim := self._target_now()) and aim != self.target:
+                return self._retargeted(aim)    # changed while the last round ran: before its next checks
             self.steps.go("rebase")
             tip = push._fetch(self.repo, self.remote, self.branch)
             if not tip:
@@ -1705,6 +1725,9 @@ class Batch:
                 return "moved"
             if self._hold_scoped(tip, carried, r.stderr):
                 return "held"
+            if hint := ghroute.push_hint(r.stderr):   # no GitHub login here: the host, not the batch
+                return self._all("requeued", "env_fault", f"push to {self.target} waits: {hint}",
+                                 keep=("landed", "refused"))
             self.message = f"push to {self.target} was rejected: {_last(r.stderr, 5)}"
             say(self.message)
             return self._close(0, "rejected", carried)
@@ -2321,14 +2344,14 @@ class Batch:
             if push.remote_host(cmd) or checklane.is_light(str(cmd), light):   # host-wide slot (push.run_slot)
                 return slot
             return here(slot)
-        started = time.time()
+        started, cpu0 = time.time(), checkcap.child_cpu_s()
         slow = Path(self.check_run_dir) / slowtests.FILE if self.check_run_dir else None
         if slow:
             slow.unlink(missing_ok=True)   # this head's run only
         try:
             for line in push.sandbox_lines([cmd for cmd, _, _ in run]):
                 say(line)
-            for cmd, eid, parts in run:
+            for n, (cmd, eid, parts) in enumerate(run):
                 resume = (pushpass.resume_file(self.p, tree, str(cmd), eid)
                           if tree and pushpass.resumable(cmd) and not push.remote_host(cmd) else None)
                 extra = pushpass.resume_env(resume, env) if resume else {}
@@ -2339,10 +2362,10 @@ class Batch:
                 if push.remote_host(cmd):
                     say(f"running {cmd}{push.where(cmd)}")
                 if self.researched and (reuse := self.failed_runs.pop((tree, str(cmd)), None)):
-                    rc, tail = reuse   # a search run again (_research) judges this tree's failed run again
+                    rc, tail, reused = *reuse, True   # a search run again (_research) judges this tree's failed run again
                     say(f"{head[:10]} failed {cmd} earlier in this batch (tree {tree[:10]}): judging that run again")
                 else:
-                    slot = own(cmd, slot)
+                    slot, reused = own(cmd, slot), False
                     rc, tail = self._run_check(cmd, {**env, **extra, **slot.env()}, env)
                     while getattr(cmd, "spilled", False) and (fault := push.remote_fault(cmd, rc, self.wt)):
                         cmd = self._respill(cmd, head, fault, claims)   # the next spill host, else here
@@ -2363,6 +2386,9 @@ class Batch:
                             resume.unlink(missing_ok=True)
                         self._passed(cmd)
                         continue
+                    if not reused:   # a failing run held the landing as long as a passing one: gatetime flags both
+                        gatetime.record(self.p.state, time.time() - started)
+                    self.unrun[tail] = [str(_here(c)) for c, _, _ in run[n + 1:]]
                     return cmd, tail
                 self._passed(cmd)
                 if why := pushpass.record(self.p, tree, str(cmd), eid, self.id, parts, head, self.tip or ""):
@@ -2373,7 +2399,7 @@ class Batch:
             slot.close()
             for claim in claims:
                 claim.close()
-            self.checks["seconds"] = round(self.checks["seconds"] + time.time() - started, 1)
+            self._spent(started, cpu0)
         push.record_check_s(self.p, time.time() - started)
         for line in slowtests.lines(slow) if slow else []:
             say(line)
@@ -2401,11 +2427,29 @@ class Batch:
         host free, else here: the host's fault never fails or holds the batch. A host faulting
         checkspill.HOST_FAULT_TRIES times is kept off the rest of the batch (spill_off)."""
         host, was = push.remote_host(cmd), getattr(cmd, "was", cmd)
-        self.spill_off = checkspill.spill_off_add(self.spill_off, host, True)
+        self.spill_off = checkspill.spill_off_add(self.spill_off, host, True, cfg=self.p.config())
         say(f"spill host {host} could not run {was} ({fault.get('why') or 'ssh or the host failed'}): "
             "trying the next spill host, else here")
         nxt = self._spill([was], head, claims)[0]
         return nxt if push.remote_host(nxt) else was
+
+    def _rest_check(self, head: str, checks: list[str], fail: tuple[str, str]) -> tuple[str, str] | None:
+        """`head`, a prefix of a head that failed `fail` in full, whose new failing tests in it passed on
+        `head` alone (_ids_check): run only the checks that never ran on that head (self.unrun), as each
+        one before it passed there (a test that passed on the longer head counts as passing on its prefix).
+        Not known (no full run of that head in this batch): `head` is checked in full. None when they pass."""
+        if (unrun := self.unrun.get(fail[1])) is None:
+            return self._check(head, checks)
+        rest = [c for c in checks if str(c) in unrun]
+        say(f"{head[:10]}: {'only ' + ' '.join(map(str, rest)) + ' left' if rest else 'no check left'} after {fail[0]}")
+        f = self._check(head, rest)
+        return None if f and f[0] == push.NONE_APPLY else f
+
+    def _spent(self, started: float, cpu0: float) -> None:
+        """Tally a check run's wall seconds and the CPU seconds of the processes it waited for (a spilled
+        run counts only its ssh here, not the host's CPU) into self.checks (push_batches check_s, check_cpu_s)."""
+        self.checks["seconds"] = round(self.checks["seconds"] + time.time() - started, 1)
+        self.checks["cpu_s"] = round(self.checks.get("cpu_s", 0.0) + checkcap.child_cpu_s() - cpu0, 1)
 
     def _no_slot(self) -> checkcap.Slot:
         """No slot here: every check spilled. The checks step is marked as _slot marks it."""
@@ -2510,18 +2554,18 @@ class Batch:
                 return f"{verdictcarry.line(e['head'], delta)} (the task's own ttp checks run {e.get('run') or '?'})"
         return ""
 
-    def _rerun_ids(self, cmd, rc: int | None, tail: str) -> list[str]:
+    def _rerun_ids(self, cmd, rc: int | None, tail: str, cap: int = RERUN_IDS) -> list[str]:
         """The failing pytest ids of a failed check to rerun: none when the check is not one plain local
         pytest run (pushpass.resumable; a spilled check: its local original, _here), it did not exit 1 (tests failed; `rc` None: not known) or pytest
         stopped early (-x, --maxfail, an interrupt: sharedchecks.stopped_early, so later tests never ran),
-        its list of failing ids is incomplete (sharedchecks.failing_ids) or it names more than RERUN_IDS."""
+        its list of failing ids is incomplete (sharedchecks.failing_ids) or it names more than `cap`."""
         cmd = _here(cmd)
         if cmd == STALE or push.remote_host(cmd) or not pushpass.resumable(cmd):
             return []
         if rc not in (1, None) or sharedchecks.stopped_early(tail):
             return []
         ids, complete = sharedchecks.failing_ids(tail)
-        if not complete or not ids or len(ids) > RERUN_IDS:
+        if not complete or not ids or len(ids) > cap:
             return []
         return ids
 
@@ -2547,9 +2591,10 @@ class Batch:
         `head`: each flaky (passed on the rerun: quarantined, the marker's flaky_tests), pre-existing (failed
         on the tip too: the marker's pre_existing) or quarantined. The check then counts as passed in this
         batch only: no pass is recorded for the tree. Else the new ids are kept for the search
-        (self.new_ids, _ids_check) and the failure stands; a rerun that cannot tell keeps it too."""
-        ids = self._rerun_ids(cmd, rc, tail)
-        if not ids:
+        (self.new_ids, _ids_check) and the failure stands; a rerun that cannot tell keeps it too. Tests the
+        tip fails on its own (_excused) count toward no cap: more than RERUN_IDS others stand unrerun."""
+        ids = self._rerun_ids(cmd, rc, tail, TIP_IDS)
+        if not ids or len([i for i in ids if i not in self._excused()]) > RERUN_IDS:
             return False
         todo = [i for i in ids if (head, i) not in self.judged and i not in self._excused()]
         if todo:
@@ -2657,7 +2702,7 @@ class Batch:
         tree judged again once (_check), not run again. False: the batch ends tip_failed (a hard or non-pytest
         failure, or nothing new)."""
         if tf is not None:
-            self._tip_excused(tip, self._rerun_ids(tf[0], self.fail_rc.get(tf[1]), tf[1]), tf[0], why)
+            self._tip_excused(tip, self._rerun_ids(tf[0], self.fail_rc.get(tf[1]), tf[1], TIP_IDS), tf[0], why)
         if not self._excused() - before or self.researched >= TIP_RESEARCH:
             return False
         self.researched += 1
@@ -2683,7 +2728,7 @@ class Batch:
         env = push.check_env("target", self.tip, self.check_run_dir, self.branch)
         self._runners([_here(cmd)], env)
         slot = self._slot(head)
-        started = time.time()
+        started, cpu0 = time.time(), checkcap.child_cpu_s()
         try:
             say(f"split probe of {head[:10]}: only {' '.join(ids)}")
             self.checks["id_probes"] = self.checks.get("id_probes", 0) + 1
@@ -2698,7 +2743,7 @@ class Batch:
             return None if self._judged(head, cmd, rc, tail, env, slot.env()) else (str(cmd), tail)
         finally:
             slot.close()
-            self.checks["seconds"] = round(self.checks["seconds"] + time.time() - started, 1)
+            self._spent(started, cpu0)
 
     def _tip_ids(self, tip: str, fail: tuple) -> tuple[str, str] | bool | None:
         """The search is about to blame an entry for a failed check: rerun only its failing tests
@@ -2706,12 +2751,14 @@ class Batch:
         there (the failure is the tip's own, flaky or already failing, not the entry's), True when every
         rerun passes or the tests are not on the tip (the entry's own failure), None when that cannot tell
         (no such ids, ids rerun on the tip in this batch already, a rerun out of time or one pytest ends
-        with neither). A failure whose new tests are known (_judged: self.new_ids) is judged on those alone,
+        with neither). Up to TIP_IDS failing tests rerun here, more than a head reruns (RERUN_IDS): the tip
+        fails many of them on its own often enough, and those it fails are excused (_research). A failure whose new tests are known (_judged: self.new_ids) is judged on those alone,
         as the others failed on the tip or were excused already. Base results saved for the tip on this
         host (gatejudge) count without a rerun: all passing there, True. The batch log and the marker's
         checks["tip_reruns"] keep the counts."""
         cmd = fail[0]
-        ids = self.new_ids.get(fail[1]) or self._rerun_ids(cmd, self.fail_rc.get(fail[1]), fail[1])
+        ids = self.new_ids.get(fail[1]) or [i for i in self._rerun_ids(cmd, self.fail_rc.get(fail[1]), fail[1], TIP_IDS)
+                                            if i not in self._excused()]
         if not ids:
             return None
         saved = gatejudge.saved_base(self.p.state, gatejudge.host(), tip, ids, time.time())
@@ -2786,7 +2833,7 @@ class Batch:
                 else:
                     if slot is None:
                         slot = self._slot(head)
-                        started = time.time()
+                        started, cpu0 = time.time(), checkcap.child_cpu_s()
                     say(f"cap probe of {head[:10]}: {cmd}")
                     rc, tail, _ = _stream(_check_argv(cmd, self.wt), self.wt,
                                           env={**env, **pushpass.select_env(rx, env), **slot.env()},
@@ -2803,6 +2850,7 @@ class Batch:
             if slot is not None:
                 slot.close()
                 self.checks["cap_seconds"] = round(self.checks.get("cap_seconds", 0.0) + time.time() - started, 1)
+                self.checks["cpu_s"] = round(self.checks.get("cpu_s", 0.0) + checkcap.child_cpu_s() - cpu0, 1)
         return None
 
     def _judge(self, tip: str, carried: list, heads: dict, checks: list[str]):
@@ -2814,8 +2862,9 @@ class Batch:
         rejoins a head that passed, so a search blames only entry 1 of the entries it searches. A failing check none of whose failing pytest ids is new at its head
         (gatejudge: flaky, pre-existing on the tip or quarantined) passes there (_judged). When the full
         head's failure names new ids, the search probes each prefix with only those ids (_ids_check) and
-        checks the highest prefix they pass on in full once: it pushes when it passes, else the search
-        goes below it in full. Before an entry is blamed, its failing ids are rerun on the tip alone up to TIP_RERUNS
+        runs the checks that never ran on the failing head on the highest prefix they pass on, once
+        (_rest_check: the others passed there): it pushes when they pass, else the search goes below it
+        in full. Before an entry is blamed, its failing ids are rerun on the tip alone up to TIP_RERUNS
         times unless the tip's result is saved already (_tip_ids). For entry 1: failing there once, the tip
         is broken (tip_failed); passing every time, entry 1 is blamed; only when that cannot tell is the
         tip checked alone in full.
@@ -2873,7 +2922,8 @@ class Batch:
                 return m, heads[m], None
             self.full_fail, fails = fail, {m: fail}
         # A failure whose new tests are known (_judged) is searched on those tests alone (_ids_check), then
-        # the longest prefix that passed them is checked in full once; failing there, the search goes below.
+        # the longest prefix that passed them runs the checks after the failing one (_rest_check) once;
+        # failing there, the search goes below in full.
         while not bad and hi - lo > 1 and (ids := self.new_ids.get(fails[hi][1])):
             top = hi
             while hi - lo > 1:
@@ -2893,8 +2943,8 @@ class Batch:
                 break
             if self._yield_now():
                 return 0, None, None
-            say(f"checking the {lo} entr{'y' if lo == 1 else 'ies'} that passed the split probes in full")
-            if (f := self._check(heads[lo], checks)) is None:
+            say(f"checking the {lo} entr{'y' if lo == 1 else 'ies'} that passed the split probes on the rest of the checks")
+            if (f := self._rest_check(heads[lo], checks, fails[top])) is None:
                 return self._lands(lo, heads, m)
             hi, fails[lo], lo = lo, f, 0
         if bad and fails[m][0] != STALE:
@@ -2955,7 +3005,7 @@ class Batch:
         return hi - 1, heads[hi - 1], fails[hi]
 
     def _lands(self, k: int, heads: dict, m: int):
-        """A prefix of `k` of the `m` carried entries passed every push check in full: it pushes at once
+        """A prefix of `k` of the `m` carried entries passed every push check: it pushes at once
         (user msg #2317). The later entries are requeued untested and unblamed for the next train on the
         new tip; no entry joins this head and it is not checked again."""
         say(f"{heads[k][:10]} passed every push check: pushing its {k} entr{'y' if k == 1 else 'ies'} now; "
@@ -2968,19 +3018,21 @@ class Batch:
         tip and check that head once, in this batch. With k entries before the blamed one that passed
         (k > 0), none: their head pushes at once and the later entries go to the next train, as no
         entry joins a head that passed (user msg #2317). An entry built on the blamed one (it would
-        replay its commits) or whose replay conflicts or adds nothing without it is skipped and requeued; the others still go. Returns the head that pushes the first k entries and
-        the replayed ones (self.rescued), or None (nothing after the blamed entry, none replays, or a
+        replay its commits) or whose replay conflicts or adds nothing without it is skipped and requeued; the others still go.
+        When the full head's failure names its new tests (self.new_ids), that head is checked on those
+        tests alone (_ids_check) and then on the checks that never ran on the full head (_rest_check), not
+        in full a second time; a probe that cannot tell checks it in full. Returns the head that pushes the
+        replayed entries (self.rescued), or None (nothing after the blamed entry, none replays, or a
         failing check: those entries are requeued). A batch makes at most RESCUES such checks, whatever
         their outcome."""
-        later = carried[k + 1:]
+        later = carried[1:]
         if not later or k or self.detail_tip is not None or self.rescues >= RESCUES:
             return None
-        h = carried[k - 1][1] if k else tip
+        h = tip
         replayed: list[tuple[int, str]] = []
         skipped: list = []
-        b = self.info[carried[k][0]]   # its own commits: not those of an earlier entry it was built on
-        own = set(_git(self.repo, "rev-list", b["top"], f"^{b['base']}",
-                       *(f"^{self.info[j]['top']}" for j, _ in carried[:k])).stdout.split())
+        b = self.info[carried[0][0]]
+        own = set(_git(self.repo, "rev-list", b["top"], f"^{b['base']}").stdout.split())
         for i, _ in later:
             if own & set(_git(self.repo, "rev-list", self.info[i]["top"], f"^{h}").stdout.split()):
                 skipped.append(self.entries[i].get("id"))     # built on the blamed entry: it would replay it too
@@ -2998,7 +3050,7 @@ class Batch:
                     self.settled[i]["approval_carried"] = carry
             replayed.append((i, new))
             h = new
-        blamed = self.entries[carried[k][0]].get("id")
+        blamed = self.entries[carried[0][0]].get("id")
         if skipped:
             say(f"entr{'y' if len(skipped) == 1 else 'ies'} {', '.join(map(str, skipped))} after {blamed} "
                 f"{'does' if len(skipped) == 1 else 'do'} not replay without it; requeued")
@@ -3007,17 +3059,23 @@ class Batch:
         say(f"checking the {len(replayed)} entr{'y' if len(replayed) == 1 else 'ies'} after "
             f"{blamed} without it")
         try:
-            head = self._head(tip, carried[:k] + replayed, k + len(replayed))
+            head = self._head(tip, replayed, len(replayed))
         except Refused:
             return None
         if self._yield_now():
             return None
         self.rescues += 1
         self.retried = True
-        if len(carried[:k] + replayed) > 1 and isinstance(self._caps(head, checks, replayed[-1][1]), tuple):
+        if len(replayed) > 1 and isinstance(self._caps(head, checks, replayed[-1][1]), tuple):
             say("they break a prompt size cap too; requeued")
             return None
-        if self._check(head, checks) is not None:
+        full = self.full_fail
+        probe = self._ids_check(head, full, ids) if full and (ids := self.new_ids.get(full[1])) else False
+        if probe is None:
+            probe = self._rest_check(head, checks, full)
+        elif probe is False:
+            probe = self._check(head, checks)
+        if probe is not None:
             say("they fail too; requeued")
             return None
         self.rescued = dict(replayed)

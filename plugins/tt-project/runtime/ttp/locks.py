@@ -889,23 +889,172 @@ def read_label(path: Path) -> dict:
     return {}
 
 
+PROBE_TRIES = 4      # slot_taken's probes of a slot whose label names no live holder
+PROBE_GAP_S = 0.015  # between them: another reader's own probe holds a free slot for microseconds
+
+
+def holder_live(h: dict) -> bool:
+    """Whether the process a slot label names lives and is the one that took it (on Linux its start time
+    matches pid_start, when the label recorded one). False for no pid, a gone or reused one, or one this
+    process cannot judge (another host or PID namespace). Cheap on purpose (no `ps`): a reader asks it of
+    every taken slot."""
+    if not _judgeable(h):
+        return False
+    try:
+        pid = int(h.get("pid") or 0)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass
+    except OSError:
+        return False
+    rec = h.get("pid_start")
+    if rec and sys.platform.startswith("linux"):
+        return str(start_time(pid) or "") == str(rec)
+    return True
+
+
+def _probe_taken(path: Path) -> bool | None:
+    try:
+        with open(path) as f:
+            try:
+                fcntl.flock(f, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                return False
+            except OSError:
+                return True
+    except OSError:
+        return None
+
+
+def slot_taken(path: Path) -> tuple[bool | None, dict | None]:
+    """(taken, label) for slot file `path`: taken when its lock is held right now (None when it cannot be
+    opened), with the label read once (None while not read; {} when it does not parse). A slot keeps its
+    last label after release and every daemon on the host probes the same files, so a failed probe on a
+    slot whose label names no live holder (holder_live) is retried PROBE_TRIES times: one free in any of
+    them is free, so another reader's momentary probe never makes a stale label a holder. A lock that
+    stays taken is held (a dead taker's lock kept by a process it left counts)."""
+    h = None
+    for i in range(PROBE_TRIES):
+        got = _probe_taken(path)
+        if not got:
+            return got, h
+        if h is None:
+            try:
+                h = read_label(path)
+            except ValueError:
+                h = {}
+            except OSError:
+                return None, None
+            if holder_live(h):
+                return True, h
+        if i < PROBE_TRIES - 1:
+            time.sleep(PROBE_GAP_S)
+    return True, h
+
+
 def _slot_labels(paths: list[Path]) -> list[str]:
-    """The holder labels of the slots among paths whose lock is taken right now (not shared); "" for a
-    taken slot whose label does not read: it is held all the same."""
+    """The holder labels of the slots among paths whose lock is taken right now (slot_taken; not
+    shared); "" for a taken slot whose label does not read: it is held all the same."""
+    out = []
+    for path in paths:
+        taken, h = slot_taken(path)
+        if taken:
+            out.append(str((h or {}).get("holder") or ""))
+    return out
+
+
+def clear_stale(paths: list[Path]) -> list[dict]:
+    """Clears the label of each slot among paths that is free and still names a holder that is gone
+    (pid_alive False, or its pid now another process's): the label becomes {} (what every release reads
+    as no holder). Only while holding that slot's lock (taken non-blocking, released at once), so a real
+    taker is never raced: one taking it meanwhile finds it taken and tries the next slot, and a slot
+    taken already is left alone. Returns the cleared labels."""
     out = []
     for path in paths:
         try:
-            with open(path) as f:
-                try:
-                    fcntl.flock(f, fcntl.LOCK_SH | fcntl.LOCK_NB)
-                    continue
-                except OSError:
-                    pass
-            out.append(str(read_label(path).get("holder") or ""))
-        except ValueError:
-            out.append("")
+            f = open(path, "a+")
         except OSError:
             continue
+        with f:
+            try:
+                fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                continue
+            try:
+                f.seek(0)
+                h = json.loads(f.read() or "{}")
+            except (OSError, ValueError):
+                continue
+            if not isinstance(h, dict) or not h or pid_alive(h) is None or holder_live(h):
+                continue
+            try:
+                write_label(f, {})
+            except OSError:
+                continue
+            out.append({**h, "path": str(path)})
+    return out
+
+
+PROC_LOCKS = "/proc/locks"   # the kernel's table of held locks (Linux): flock_pids
+HOLDER_READS = 20   # reads of PROC_LOCKS before a taken lock counts as unfound (flock_pids)
+
+
+def _proc_locks() -> list[str]:
+    with open(PROC_LOCKS) as f:
+        return f.readlines()
+
+
+def flock_pids(paths: list[Path], read: Callable[[], list[str]] | None = None) -> dict[Path, list[int]] | None:
+    """The pids holding each of `paths`' flock locks right now, from the kernel's lock table (PROC_LOCKS),
+    never from the lock file's record, which keeps a released holder's JSON. A lock names the superblock's
+    device, which on btrfs differs from the st_dev stat gives: an exact device match wins, else the one pid
+    on that inode number. The kernel hands the table out a page per read, so a line can slip between two
+    pages while other locks come and go: a read that misses one of `paths` is retried, up to HOLDER_READS
+    reads (callers pass taken locks only). A path still unfound maps to []. None when the table cannot be
+    read (no /proc: macOS). The pid is the one that took the lock: it may have exited while a child keeps
+    the inherited descriptor (callers check _alive)."""
+    want = {}
+    for p in paths:
+        try:
+            st = os.stat(p)
+        except OSError:
+            continue
+        want[Path(p)] = ((os.major(st.st_dev), os.minor(st.st_dev)), str(st.st_ino))
+    out: dict[Path, list[int]] = {}
+    read = read or _proc_locks
+    for _ in range(HOLDER_READS):
+        try:
+            lines = read()
+        except OSError:
+            return None
+        exact: dict[Path, set] = {}
+        loose: dict[Path, set] = {}
+        for line in lines:
+            parts = line.split()   # N: FLOCK ADVISORY WRITE <pid> MAJ:MIN:INODE 0 EOF ("->" marks a blocked waiter)
+            if len(parts) < 6 or parts[1] != "FLOCK" or not parts[4].isdigit() or int(parts[4]) <= 0:
+                continue
+            where = parts[5].split(":")
+            if len(where) != 3:
+                continue
+            try:
+                dev = (int(where[0], 16), int(where[1], 16))
+            except ValueError:
+                continue
+            for p, (d, ino) in want.items():
+                if where[2] == ino:
+                    (exact if dev == d else loose).setdefault(p, set()).add(int(parts[4]))
+        for p in want:
+            if not out.get(p):
+                got = exact.get(p) or (loose[p] if len(loose.get(p) or ()) == 1 else set())
+                out[p] = sorted(got)
+        if all(out.values()):
+            break
     return out
 
 
@@ -1433,7 +1582,7 @@ def _served(locks_dir: Path, resource: str) -> dict[str, float]:
 
 def fair_order(locks_dir: Path, resource: str, q: list[Path] | None = None, urgent_max: int = 0,
                aged_before: float | None = None, aged_turns: int | None = None,
-               bare_last: bool = False) -> list[Path]:
+               bare_last: bool = False, share: tuple[int, dict[str, int]] | None = None) -> list[Path]:
     """The waiters in the order a fair queue serves them: each next turn goes to the oldest waiter
     of the group that has waited longest since it last got the resource (since its oldest waiter
     arrived, if later), so one group's burst cannot starve the others. Within a group by task priority
@@ -1467,11 +1616,15 @@ def fair_order(locks_dir: Path, resource: str, q: list[Path] | None = None, urge
     one (requeued_place), so its project's turn spent on the run that took its slot never sends it back.
 
     `bare_last`: waiters with no group (a run with no project) go after every grouped one, by priority then
-    arrival, aged or not (accepted gap: they wait while any project's waiter does)."""
+    arrival, aged or not (accepted gap: they wait while any project's waiter does).
+
+    `share` (cap N, {group id: slots it holds now}): the routine turns go first to groups below their fair
+    share of the cap (fair_share), so one group's backlog cannot hold every slot while another waits."""
     q = queued(locks_dir, resource) if q is None else q
     if bare_last and (bare := [t for t in q if not ticket_group(t)]):
         rest = [t for t in q if ticket_group(t)]
-        return (fair_order(locks_dir, resource, rest, urgent_max, aged_before, aged_turns) if rest else []) + \
+        return (fair_order(locks_dir, resource, rest, urgent_max, aged_before, aged_turns, share=share)
+                if rest else []) + \
             sorted(bare, key=lambda t: (ticket_priority(t), _arrival(t)))
     first = urgent_max == URGENT_FIRST
     aged = sorted((t for t in q if _arrival(t) <= aged_before and not ((first or urgent_max > 0) and _urgent(t))),
@@ -1518,7 +1671,37 @@ def fair_order(locks_dir: Path, resource: str, q: list[Path] | None = None, urge
             key[g] = (1, len(out), "")
         else:
             del groups[g]
-    return requeued_place(out)
+    return requeued_place(fair_share(out, *share) if share else out)
+
+
+def share_of(cap: int, groups: int) -> int:
+    """A group's fair share of `cap` slots while `groups` groups run or wait: max(1, cap // groups)."""
+    return max(1, int(cap) // max(1, int(groups)))
+
+
+def fair_share(q: list[Path], cap: int, running: dict[str, int]) -> list[Path]:
+    """`q` (fair_order's) with its routine turns (not _urgent) given first to groups below their fair share
+    (share_of over the groups that hold a slot or wait), counting each turn before as one more slot of its
+    group; with none below it, the next routine waiter in `q`'s order (work-conserving). Urgent and
+    requeued (preempted: requeued_place) waiters keep their places, so urgent and owed runs and preemption
+    keep their order and the routine turns stay where they were. It only orders the queue: a running holder
+    is never stopped for a share."""
+    if not cap or cap <= 0:
+        return q
+    held = {g: n for g, n in running.items() if n > 0}
+    share = share_of(cap, len(set(held) | {ticket_group(t) for t in q}))
+    pinned = lambda t: _urgent(t) or is_requeued(t)
+    routine = [t for t in q if not pinned(t)]
+    out = []
+    for t in q:
+        if pinned(t):
+            pick = t
+        else:
+            pick = next((r for r in routine if held.get(ticket_group(r), 0) < share), routine[0])
+            routine.remove(pick)
+        out.append(pick)
+        held[ticket_group(pick)] = held.get(ticket_group(pick), 0) + 1
+    return out
 
 
 def requeued_place(q: list[Path]) -> list[Path]:
@@ -1580,12 +1763,13 @@ def mark_turn(locks_dir: Path, resource: str, ticket: Path | None) -> None:
 
 def my_turn(locks_dir: Path, resource: str, ticket: Path, slots: int, fair: bool = False,
             urgent_max: int = 0, past_multi: bool = False, aged_before: float | None = None,
-            aged_turns: int | None = None, bare_last: bool = False) -> bool:
+            aged_turns: int | None = None, bare_last: bool = False,
+            share: tuple[int, dict[str, int]] | None = None) -> bool:
     """Whether this ticket may take the resource now. An exclusive one: among the first `slots`
     waiters (urgent tickets, task priority URGENT_PRIORITY or better, before the rest), one per free
     slot, with no shared waiter ahead. A shared one: no exclusive waiter
     ahead, so it never jumps one. `fair`: waiters are counted in fair_order (with `urgent_max`), not
-    arrival order (and `aged_before`, `aged_turns`, `bare_last` as there). Either way landing waiters go first (landing_first). `past_multi`
+    arrival order (and `aged_before`, `aged_turns`, `bare_last`, `share` as there). Either way landing waiters go first (landing_first). `past_multi`
     (a waiter that holds locks already): waiters for several resources at
     once ahead are not counted, as one of them may wait for a lock this waiter's holder has: waiting
     behind it would never end."""
@@ -1593,7 +1777,7 @@ def my_turn(locks_dir: Path, resource: str, ticket: Path, slots: int, fair: bool
     if ticket not in q:   # none queued, unless it was this process's and was dropped (its run ended): never
         return not dropped(ticket)
     if fair:
-        q = fair_order(locks_dir, resource, q, urgent_max, aged_before, aged_turns, bare_last)
+        q = fair_order(locks_dir, resource, q, urgent_max, aged_before, aged_turns, bare_last, share)
     else:   # urgent waiters (an urgent task's) first, a user-ordered one (priority 0) before them, arrival
         q = sorted(q, key=lambda t: min(ticket_priority(t), URGENT_PRIORITY + 1))   # order within: plain arrival
     q = landing_first(q)

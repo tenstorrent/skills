@@ -972,6 +972,8 @@ def wake_tier(tier: str, prev: dict, cfg: dict | None = None, harness=None) -> s
     if not isinstance(prev, dict) or prev.get("status") != "waiting":
         return None
     tier = tier if tier in TIER_ORDER else "standard"
+    if prev.get("plan_tier") in TIER_ORDER and prev.get("woke") and not prev.get("escalated_wake"):
+        return min(prev["plan_tier"], tier, key=TIER_ORDER.index)   # a planned check (waketier.due)
     if stale_wakes(prev) and not prev.get("escalated_wake"):
         return TIER_ORDER[0]
     if ackwait.is_probe(prev.get("retry_when"), cfg, harness) and not prev.get("escalated_wake"):

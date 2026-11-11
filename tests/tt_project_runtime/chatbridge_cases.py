@@ -466,6 +466,80 @@ def test_a_chat_run_without_a_usable_key_goes_to_the_auth_gate(env, monkeypatch)
     assert plain["status"] == "failed" and "daemon:launch" in seen
 
 
+def test_a_chat_pause_without_a_saved_key_starts_no_probe_runs(env, monkeypatch):
+    """No key saved for the configured endpoint: every chat run fails at launch, so the logged-out pause
+    is checked model-free (Chat.login_state) and no probe run starts every AUTH_PROBE_S. Saving the key
+    ends the pause; a key saved for another URL keeps it."""
+    from ttp import alerts, endpoint, project
+    from ttp.daemon import AUTH_PROBE_S, Daemon
+    from ttp.providers import get_provider
+    monkeypatch.setattr(project, "HOME_DIR", env["tmp"] / "secrets-home")
+    p = make(env)
+    _chat_config(p)
+    d = Daemon(p.base)
+    chat = get_provider("chat")
+    assert chat.login_state(d.cfg) is False and chat.login_state({}) is None
+    assert get_provider("fake").login_state(d.cfg) == get_provider("fake").login_check()
+    d.open_breaker("chat", "failed to authenticate: no key saved for endpoint 'cloud'")
+    for step in range(3):   # each backoff step: still no key, still no probe run
+        p.db.set_kv(alerts.BREAKER + "chat", {**alerts.breaker(p.db, "chat"), "next_check": 0})
+        d.check_logins()
+        assert d._logged_out("chat") and not alerts.breaker(p.db, "chat").get("probe")
+        assert not d._may_probe("chat", time.time() + (step + 1) * AUTH_PROBE_S)
+    endpoint.save("cloud", "https://other.example.com/v1", _CB_KEY, True, "HTTP 200")
+    assert chat.login_state(d.cfg) is False, "the bridge sends the key only to its own URL"
+    endpoint.save("cloud", "https://api.example.com/v1", _CB_KEY, True, "HTTP 200")
+    assert chat.login_state(d.cfg) is None
+    d.check_logins()   # the saved key changed the store's stamp: the pause ends at once
+    assert not d._logged_out("chat")
+
+
+def test_a_chat_logout_with_no_saved_key_starts_no_probe_runs_and_routes_to_core(env, monkeypatch):
+    # A breaker opened by 'no key saved' used to send one real run every AUTH_PROBE_S to find out (the
+    # chat provider had no login check): each failed at launch again. The check is model-free now.
+    from ttp import alerts, endpoint, project
+    from ttp.daemon import Daemon
+    from ttp.providers import get_provider
+    monkeypatch.setattr(project, "HOME_DIR", env["tmp"] / "secrets-home")
+    assert get_provider("chat").login_check() is None, "without the project's settings it cannot tell"
+    p = make(env)
+    _chat_config(p)
+    d = Daemon(p.base)
+    monkeypatch.setattr(d, "observe", lambda *a, **k: None)
+    for _ in range(2):   # the second failure (a run that slipped through) raises no second alert
+        tid = p.db.add_task("build", "", kind="work", tier="standard", priority=3, budget_usd=8.0, labels=[])
+        p.db.update_task(tid, status="running")
+        rid = p.db.x("INSERT INTO runs(task,role,provider,model,started,status,boot_id) "
+                     "VALUES(?,'worker','chat','org/Base-Model-2',?,'running',?)", (tid, time.time() - 5, d.boot))
+        rd = p.runs / str(rid)
+        rd.mkdir(parents=True)
+        p.db.x("UPDATE runs SET dir=? WHERE id=?", (str(rd), rid))
+        d.finish_run(p.db.one("SELECT * FROM runs WHERE id=?", (rid,)),
+                     {"rc": None, "started": time.time() - 5, "ended": time.time(), "launched": False,
+                      "launch_error": "could not start the agent: chat bridge: failed to authenticate: no key "
+                                      "saved for endpoint 'cloud'", "launch_auth": True})
+    assert len(p.db.q("SELECT id FROM messages WHERE ref='auth:chat'")) == 1, "one alert per logout"
+
+    def check(verify=None):
+        if verify:
+            monkeypatch.setattr(endpoint, "verify", lambda url, key, timeout=0: verify)
+        p.db.set_kv(alerts.BREAKER + "chat", {**alerts.breaker(p.db, "chat"), "next_check": 0})
+        d.check_logins()
+        return alerts.breaker(p.db, "chat")
+
+    far = time.time() + 10 * 86400
+    rec = check()
+    assert rec and rec.get("probe") is False and not d._may_probe("chat", far), "no key: no probe run, ever"
+    assert d._no_room("chat", {"now": time.time(), "busy": {}}) == "auth", "routed work falls back to core"
+    endpoint.save("other", "https://api.example.com/v1", _CB_KEY, True, "HTTP 200")
+    assert check() and not d._may_probe("chat", far), "a key for another alias does not end it"
+    endpoint.save("cloud", "https://api.example.com/v1", _CB_KEY, True, "HTTP 200")
+    assert check((False, "HTTP 401 Unauthorized")) and not d._may_probe("chat", far), "a refused key keeps it"
+    rec = check((False, "cannot reach the endpoint: timed out"))
+    assert rec and rec.get("probe") is True, "an endpoint that does not answer: one run checks, as before"
+    assert check((True, "HTTP 200")) is None and not d._logged_out("chat"), "a key the endpoint takes ends it"
+
+
 # Upstream model ids as chat endpoints name them: '/', '.', ':', '-', '_', '@' and uppercase.
 CHAT_MODELS = ("org-name/Model-V2.5-32B-Instruct:free", "accounts/acme/models/model_v3p1@2026-01", "Big.Model:Q4_K_M")
 
@@ -1474,6 +1548,7 @@ def test_a_refused_model_the_endpoint_still_lists_retries_hourly_with_one_notice
         rec = route.read_served(p.state).get("chat")
         if rec:   # the last check was an hour ago
             (p.state / route.MODELS_FILE).write_text(json.dumps({"chat": {**rec, "checked": time.time() - route.MODELS_EVERY_S}}))
+            _age_shared(p, route.MODELS_EVERY_S)
         d._models_tried = 0.0
         d.check_route_models()
         if d._models_probe:
@@ -1529,6 +1604,7 @@ def test_a_model_missing_hold_ends_when_the_endpoint_lists_it_or_the_config_chan
     # Listed again at the next hourly check: the hold ends and the tier routes again.
     up.models = ["example-org/model-b", _RT_MODEL]
     (p.state / route.MODELS_FILE).write_text(json.dumps({"chat": {**rec, "checked": time.time() - route.MODELS_EVERY_S}}))
+    _age_shared(p, route.MODELS_EVERY_S)
     assert route.held(p.db, d.cfg, "light")
     check()
     assert route.held(p.db, d.cfg, "light") == "" and route.holds(p.db) == {}
@@ -1548,6 +1624,14 @@ def test_a_model_missing_hold_ends_when_the_endpoint_lists_it_or_the_config_chan
     route.refresh_served(p.state, "placeholder")
     rec = route.read_served(p.state)["chat"]
     assert not rec["ok"] and rec["ids"] == ["example-org/model-b", _RT_MODEL] and up.url not in json.dumps(rec)
+
+
+def _age_shared(p, seconds):
+    """Move the host's shared served list of the project's endpoint (served.py) `seconds` into the past."""
+    from ttp import served
+    eid = served.link(p.state, "chat")
+    if rec := served.read(eid):
+        (served.home() / f"{eid}.json").write_text(json.dumps({**rec, "checked": float(rec["checked"]) - seconds}))
 
 
 def _ranked(p, d, monkeypatch, ids, ranking=("rank-a", "rank-b")):
@@ -1629,6 +1713,36 @@ def test_rule_routes_of_one_tier_keep_their_own_model_ranking_switch(env, monkey
     route.write_served(p.state, "chat", True, "HTTP 200", ["rank-a", "rule-model-b"], time.time())
     assert d._route_entry(task, "light", "chat", "rule-model-b", time.time(), 0)["model"] == "rule-model-b"
     assert p.db.kv(modelrank.SWITCH + "light:rule0") is None and p.db.kv(modelrank.SWITCH + "light")
+
+
+def test_a_model_pick_routing_one_tier_to_an_up_and_a_down_model_keeps_one_switch(env, monkeypatch):
+    """#7258: a model pick keyed by tier alone ended the down model's switch with a false 'back' on a
+    start on the up model, and the next start on the down model alerted again."""
+    from ttp import modelrank
+    from ttp.daemon import Daemon
+    p = make(env)
+    d = Daemon(p.base)
+    alerts = _ranked(p, d, monkeypatch, ["rank-a", "up-model"])
+    task = {"id": None, "kind": "work"}
+    for model, runs in ((_RT_MODEL, "rank-a"), ("up-model", "up-model"), (_RT_MODEL, "rank-a")):
+        assert d._route_entry(task, "light", "chat", model, time.time(), pick=True)["model"] == runs
+    assert len(alerts) == 1 and p.db.kv(modelrank.SWITCH + "light:pick:" + _RT_MODEL)["to"] == "rank-a"
+    assert p.db.kv(modelrank.SWITCH + "light") is None and "back on" not in (p.logs / "daemon.log").read_text()
+
+
+def test_daemon_route_with_a_model_pick_keys_the_switch_by_tier_and_model(env, monkeypatch):
+    """#7710: Daemon._route passes pick=True for a model pick; the switch key is per tier and model."""
+    from ttp import modelpick, modelrank
+    from ttp.daemon import Daemon
+    p = make(env)
+    d = Daemon(p.base)
+    _ranked(p, d, monkeypatch, ["rank-a"])
+    monkeypatch.setattr(d, "_model_pick", lambda task, tier, peek=False: {"pick": 1})
+    monkeypatch.setattr(modelpick, "target", lambda cfg, dp: {"provider": "chat", "model": _RT_MODEL, "effort": ""})
+    entry = d._route({"id": None, "kind": "work"}, "light", None, time.time())
+    assert entry["model"] == "rank-a" and entry["model_pick"] is True
+    assert p.db.kv(modelrank.SWITCH + "light:pick:" + _RT_MODEL)["to"] == "rank-a"
+    assert p.db.kv(modelrank.SWITCH + "light") is None
 
 
 def test_a_model_left_out_of_the_served_list_is_ranked_and_an_empty_ranking_changes_nothing(env, monkeypatch):
@@ -1741,6 +1855,30 @@ def test_a_stale_served_list_holds_and_swaps_nothing_and_a_pinned_chat_task_keep
     _route_config(p, route=None)
     d._load_config()
     assert route.models_due(d.cfg, p.state, now, p.db) == ""           # no ranking: as before
+
+
+def test_a_preference_pins_refused_stand_in_is_skipped_on_the_next_start(env, monkeypatch):
+    """#7258: a pinned chat run has no route entry, so its refused stand-in was picked again each retry."""
+    from ttp import modelrank, route
+    from ttp.daemon import Daemon
+    p = make(env)
+    d = Daemon(p.base)
+    _ranked(p, d, monkeypatch, ["rank-a", "rank-b"])
+    assert modelrank.pick(p.db, d.cfg, p.state, _RT_MODEL, time.time())[0] == "rank-a"
+    tid = p.db.add_task("pinned", "s", kind="work", tier="light", priority=3, provider="chat", model=_RT_MODEL,
+                        labels=[])
+    p.db.update_task(tid, status="running")
+    note = {modelrank.KEY: {"from": _RT_MODEL, "why": "not listed"}}
+    rid = p.db.x("INSERT INTO runs(task,role,provider,model,started,status,boot_id,note) "
+                 "VALUES(?,'worker','chat','rank-a',?,'running',?,?)", (tid, time.time() - 30, d.boot, json.dumps(note)))
+    rd = p.runs / str(rid)
+    rd.mkdir(parents=True)
+    p.db.x("UPDATE runs SET dir=? WHERE id=?", (str(rd), rid))
+    d.finish_run(p.db.one("SELECT * FROM runs WHERE id=?", (rid,)),
+                 {"rc": 1, "started": time.time() - 30, "ended": time.time(), "bridge": {"last_fault": "model_missing"}})
+    assert route.of(p.db.one("SELECT note FROM runs WHERE id=?", (rid,))["note"]) is None   # never routed
+    assert modelrank.down(p.db, d.cfg, p.state, "rank-a", time.time()) == "refused"
+    assert modelrank.pick(p.db, d.cfg, p.state, _RT_MODEL, time.time())[0] == "rank-b"
 
 
 def test_a_model_down_with_no_ranked_model_served_keeps_its_switch(env, monkeypatch):
@@ -2885,6 +3023,130 @@ def test_the_ranking_refresh_logs_each_change_and_a_failed_fetch_keeps_the_last(
     assert project.account_value(rankfresh.KEY) == ["rank-b", "rank-a", "odd-one"]
 
 
+# The model scoreboard (modelscore.py): fake models, live rows from a fake project db, never the network.
+def _score_row(n, good, wall=None, out_tokens=0, tok_wall_s=0.0):
+    from ttp import modelscore
+    return {**dict.fromkeys(modelscore.COUNTS, 0), "n": n, "good": good, "first_done": good, "runs": n,
+            "out_tokens": out_tokens, "tok_wall_s": tok_wall_s, "wall_med_s": wall}
+
+
+def test_the_scoreboard_weighs_live_results_against_the_bench_by_sample_count(env, monkeypatch):
+    from ttp import modelscore
+    _rank_home(env, monkeypatch)
+    benched = {"m-a": {"scores": {"*": {"cells": (1.0, 90.0)}}}}
+    few = modelscore.board({"m-a": {"standard": _score_row(2, 0)}}, benched, {}, ["m-a"])["m-a"]["standard"]
+    many = modelscore.board({"m-a": {"standard": _score_row(200, 0)}}, benched, {}, ["m-a"])["m-a"]["standard"]
+    assert few["quality"] == round(90 * 10 / 12, 2) and many["quality"] == round(90 * 10 / 210, 2)
+    assert few["bench"] == 90.0 and few["n"] == 2
+    # The index prior counts only for a model with no bench; with neither, live alone; with nothing, unscored.
+    bd = modelscore.board({"m-c": {"light": _score_row(5, 5)}}, benched, {"m-a": 10.0, "m-b": 40.0},
+                          ["m-a", "m-b", "m-c", "m-d"])
+    assert bd["m-a"]["light"]["quality"] == 90.0 and bd["m-b"]["light"]["quality"] == 40.0
+    assert bd["m-c"]["light"]["quality"] == 100.0 and bd["m-d"]["light"]["quality"] is None
+
+
+def test_fast_takes_the_fastest_model_within_the_margin_and_above_the_floor(env, monkeypatch):
+    from ttp import modelscore
+    _rank_home(env, monkeypatch)
+    q = {"best": 80.0, "near": 76.0, "far": 70.0}
+    wall = {"best": 300.0, "near": 100.0, "far": 10.0}
+    bd = {m: {c: {"quality": q[m], "wall_s": wall[m], "tok_s": None} for c in modelscore.CLASSES} for m in q}
+    bd["new"] = {c: {"quality": None, "wall_s": None, "tok_s": None} for c in modelscore.CLASSES}
+    assert modelscore.order(bd, "light", "smart", known=["new"]) == ["best", "near", "far", "new"]
+    assert modelscore.order(bd, "light", "fast", known=["new"]) == ["near", "best", "far", "new"]
+    assert modelscore.order(bd, "light", "fast", margin=2.0) == ["best", "near", "far", "new"]
+    assert modelscore.order(bd, "light", "fast", margin=50.0, floor=75.0) == ["near", "best", "far", "new"]
+    # auto: fast for babysit, smart elsewhere; a class's own prefer wins.
+    assert modelscore.prefs("light", {})["prefer"] == "auto"
+    assert modelscore.prefs("light", {"light": {"prefer": "fast", "margin_pts": 3, "floor": -1}}) == {
+        "prefer": "fast", "margin_pts": 3.0, "floor": modelscore.FLOOR}
+
+
+def test_a_new_higher_scoring_model_tops_the_rankings_and_model_ranking_stays_the_standard_class(env, monkeypatch):
+    from ttp import modelrank, modelscore, project, rankfresh
+    home = _rank_home(env, monkeypatch)
+    project.set_account_setting(rankfresh.KEY, ["m-old", "m-two"])
+    d = home / "model-bench"
+    d.mkdir(parents=True)
+    (d / "2026-01-01.json").write_text(json.dumps({"at": 1.0, "results": {
+        "m-old": {"score": 0.5, "cells": {"inject": True}}, "m-two": {"score": 0.6, "cells": {"inject": True}},
+        "m-off": {"score": 1.0, "inconclusive": True}}}))
+    res = modelscore.publish(["m-old", "m-two"], 1000.0)
+    assert res["changed"] and res["new"] == ["m-two", "m-old"] and modelrank.ranking({}) == ["m-two", "m-old"]
+    cls = project.account_value(modelscore.KEY)
+    assert set(cls) == set(modelscore.CLASSES) and cls["standard"] == ["m-two", "m-old"]
+    # A newly served model with a better bench (a jsonl suite) becomes every class's first.
+    (d / "extra.jsonl").write_text(json.dumps({"model": "m-new", "score": 95, "suite": "extra", "at": 2.0}) + "\n")
+    res = modelscore.publish(["m-old", "m-two", "m-new"], 2000.0)
+    assert res["new"][0] == "m-new" and modelrank.ranking({})[0] == "m-new"
+    assert all(v[0] == "m-new" for v in project.account_value(modelscore.KEY).values())
+    log = [json.loads(x) for x in (home / rankfresh.LOG).read_text().splitlines()]
+    assert [r["new"][0] for r in log] == ["m-two", "m-new"]
+    # The same inputs again change nothing; the index refresh no longer writes model_ranking but keeps its scores.
+    assert not modelscore.publish(["m-old", "m-two", "m-new"], 3000.0)["changed"]
+    rankfresh.refresh(["m-old"], "weekly", 1e8, "k", lambda u, k: _fake_index(("m-old", 99)))
+    assert modelrank.ranking({})[0] == "m-new" and rankfresh.read_state()["scores"] == {"m-old": 99}
+    assert modelscore.fast_order("light")[0] == "m-new"
+
+
+def test_a_failed_injection_bench_bars_a_model_from_babysit(env, monkeypatch):
+    from ttp import modelscore
+    home = _rank_home(env, monkeypatch)
+    d = home / "model-bench"
+    d.mkdir(parents=True)
+    (d / "2026-01-01.json").write_text(json.dumps({"at": 1.0, "results": {
+        "m-leaky": {"score": 1.0, "cells": {"inject": False}}, "m-safe": {"score": 0.5, "cells": {"inject": True}}}}))
+    got = modelscore.build(["m-leaky", "m-safe"], {})
+    assert got["barred"] == ["m-leaky"] and got["ranking"]["babysit"] == ["m-safe"]
+    assert got["ranking"]["standard"] == ["m-leaky", "m-safe"]
+    # A later passing row frees it.
+    (d / "re.jsonl").write_text(json.dumps({"model": "m-leaky", "inject_ok": True, "at": 2.0}) + "\n")
+    assert modelscore.build(["m-leaky", "m-safe"], {})["barred"] == []
+
+
+def test_the_scoreboard_merges_each_projects_rows_and_drops_stale_projects(env, monkeypatch):
+    from ttp import modelscore
+    _rank_home(env, monkeypatch)
+    now = 100 * 86400.0
+    modelscore.record("one", {"m": {"light": _score_row(4, 3, wall=100.0)}}, now - modelscore.DAYS * 86400 - 1)
+    modelscore.record("two", {"m": {"light": _score_row(2, 1, wall=10.0)}}, now)
+    modelscore.record("three", {"m": {"light": _score_row(6, 6, wall=50.0)}}, now)
+    data = json.loads((modelscore._home() / modelscore.FILE).read_text())
+    assert set(data["projects"]) == {"two", "three"}
+    row = modelscore.merged(data)["m"]["light"]
+    assert (row["n"], row["good"], row["wall_med_s"]) == (8, 7, round((10 * 2 + 50 * 6) / 8, 1))
+
+
+def test_live_rows_count_a_tasks_first_chat_run_and_skip_endpoint_faults(env, monkeypatch):
+    from ttp import modelscore, route
+    _rank_home(env, monkeypatch)
+    p = make(env)
+    now = 10_000_000.0
+
+    def run(tid, model, status, fell="none", started=None, tier="light", tokens=0):
+        t0 = started or now - 3600
+        p.db.x("INSERT INTO runs(task,role,provider,model,status,started,ended,output_tokens,note) "
+               "VALUES(?,'worker','chat',?,?,?,?,?,?)",
+               (tid, model, status, t0, t0 + 100, tokens, json.dumps({route.KEY: {"tier": tier, "fallback": fell}})))
+    a = p.db.add_task("a", kind="code", tier="light", status="done")
+    run(a, "m-good", "ok", tokens=5000)
+    b = p.db.add_task("b", kind="code", tier="light", status="done")
+    run(b, "m-bad", "fallback", fell="auth")        # the endpoint's fault: no sample
+    run(b, "m-bad", "fallback", fell="no_handoff")  # the model's own: its sample, not first-try done
+    run(b, "m-good", "ok")
+    c = p.db.add_task("c", kind="review", status="failed")
+    run(c, "m-good", "ok", tier="standard")
+    run(p.db.add_task("old", status="done"), "m-good", "ok", started=now - 30 * 86400)
+    rows = modelscore.live_rows(p, now)
+    g, bad = rows["m-good"]["light"], rows["m-bad"]["light"]
+    assert (g["n"], g["first_done"], g["good"], g["runs"]) == (1, 1, 1, 2)
+    assert g["out_tokens"] == 5000 and g["tok_wall_s"] == 100.0 and g["wall_med_s"] == 100.0
+    assert (bad["n"], bad["first_done"], bad["runs"], bad["fallback"], bad["no_handoff"]) == (1, 0, 2, 2, 1)
+    r = rows["m-good"]["review"]
+    assert (r["n"], r["failed"], r["bad"], r["good"]) == (1, 1, 1, 0)
+    assert modelscore.class_of("review", "light") == "review" and modelscore.class_of("code", None) == "standard"
+
+
 def test_a_newly_served_model_refreshes_the_ranking_through_the_daemon(env, monkeypatch):
     """The served-models check lists a new model: the daemon refreshes at once; no key, one user-only item."""
     from ttp import alerts, modelrank, rankfresh, route
@@ -2968,19 +3230,179 @@ def test_the_served_model_list_is_polled_every_minute_while_a_tier_or_run_class_
     _route_config(p, models_every_s=300)
     d._load_config()
     assert route.models_every(d.cfg) == 300 and route.models_due(d.cfg, p.state, t0 + 60) == ""
-    # The daemon's own retry gate follows the same interval (a failed check retries a minute later).
+    # The daemon asks the host's shared poll (served.py) at most every served.CHECK_S; where its files
+    # cannot be written, the project's own check runs instead, at the project's interval.
+    from ttp import served
     _route_config(p)
     d._load_config()
     calls = []
     monkeypatch.delenv("TTP_TEST_NO_MODELS_PROBE", raising=False)
-    monkeypatch.setattr(route, "refresh_served", lambda state, alias: calls.append(alias))
+
+    def tick(state, alias, routes):
+        calls.append(("shared", alias, routes))
+        raise OSError("read-only")
+
+    monkeypatch.setattr(served, "tick", tick)
+    monkeypatch.setattr(route, "refresh_served", lambda state, alias, every=None: calls.append(("own", alias, every)))
     route.write_served(p.state, "chat", False, "HTTP 503", [], time.time() - 60)
-    for tried_ago in (30, 61):
+    for tried_ago in (served.CHECK_S - 2, served.CHECK_S + 1):
         d._models_tried = time.time() - tried_ago
         d.check_route_models()
         if d._models_probe:
             d._models_probe.join(10)
-    assert calls == ["placeholder"]
+    assert calls == [("shared", "placeholder", True), ("own", "placeholder", 60)]
+
+
+def _shared_watch(monkeypatch, url="https://chat.invalid/v1", ids=(_RT_MODEL, "rank-a")):
+    """The host's shared /models poll (served.py) against a fake endpoint: (the ids it lists, the poll times)."""
+    from ttp import endpoint
+    listed, polls = list(ids), []
+    monkeypatch.setattr(endpoint, "credentials", lambda alias: endpoint.Credentials(_CB_KEY, url))
+
+    def list_models(u, key, timeout=0):
+        polls.append(u)
+        return True, "HTTP 200", list(listed)
+
+    monkeypatch.setattr(endpoint, "list_models", list_models)
+    return listed, polls
+
+
+def _daemon_ticks(state, t0, t1, routes=True):
+    """Each daemon's check (every served.CHECK_S) from t0 to t1: (time, what served.tick did) of each try."""
+    from ttp import served
+    out = []
+    for t in range(int(t0), int(t1) + 1, served.CHECK_S):
+        if served.due(state, "chat", routes, t):
+            out.append((t, served.tick(state, "placeholder", routes, now=t)))
+    return out
+
+
+def test_one_shared_models_poll_per_interval_serves_every_project_on_the_host(env, monkeypatch):
+    """User's rule: one /models poll per host and endpoint, every 30 s while any project routes to chat,
+    else every 5 min; every project reads its result."""
+    from ttp import route, served
+    a, b = make(env), _second_project(env, "beta")
+    for p in (a, b):
+        _route_config(p)
+    listed, polls = _shared_watch(monkeypatch)
+    t0 = time.time()
+    for t in range(int(t0), int(t0) + 301, served.CHECK_S):
+        for p in ((a, b) if t % 2 else (b, a)):   # either daemon may ask first
+            if served.due(p.state, "chat", True, t):
+                served.tick(p.state, "placeholder", True, now=t)
+    assert len(polls) == 300 // served.EVERY_S + 1 == 11   # one per 30 s for both projects, not one each
+    for p in (a, b):
+        assert route.read_served(p.state)["chat"]["ids"] == sorted(listed)
+    # Nobody routes to chat: the busy marker lapses and the poll slows to every 5 min.
+    polls.clear()
+    t1 = int(t0) + 301 + served.LEASE_S
+    for t in range(t1, t1 + 901, served.CHECK_S):
+        for p in (a, b):
+            if served.due(p.state, "chat", False, t):
+                served.tick(p.state, "placeholder", False, now=t)
+    assert len(polls) == 3   # 5, 10 and 15 min after the last busy poll
+    assert served.read(served.link(a.state, "chat"))["every"] == served.IDLE_S
+    # Both intervals are account keys.
+    from ttp import project
+    assert {"providers.chat.served_every_s", "providers.chat.served_idle_s"} <= project.ACCOUNT_NESTED_KEYS
+    monkeypatch.setattr(project, "account_value", lambda k: {"providers.chat.served_every_s": 12}.get(k))
+    assert served.every_s(True) == 12 and served.every_s(False) == served.IDLE_S
+
+
+def test_a_model_the_endpoint_drops_is_replaced_by_the_ranked_stand_in_within_a_minute(env, monkeypatch):
+    """User's rule: if a model goes down, the next best one is ready within a minute."""
+    from ttp import modelrank, served
+    from ttp.daemon import Daemon
+    p = make(env)
+    d = Daemon(p.base)
+    _ranked(p, d, monkeypatch, [_RT_MODEL, "rank-a"])
+    listed, _ = _shared_watch(monkeypatch)
+    t0 = int(time.time())
+    _daemon_ticks(p.state, t0, t0)
+    assert modelrank.pick(p.db, d.cfg, p.state, _RT_MODEL, t0) is None   # up
+    removed = t0 + 7
+    listed.remove(_RT_MODEL)
+    swapped = None
+    for t in range(removed, removed + 120, served.CHECK_S):
+        _daemon_ticks(p.state, t, t)
+        if modelrank.pick(p.db, d.cfg, p.state, _RT_MODEL, t):
+            swapped = t
+            break
+    assert modelrank.pick(p.db, d.cfg, p.state, _RT_MODEL, swapped) == ("rank-a", "not listed")
+    assert swapped - removed <= 60   # measured: 25 s (the next 30 s poll, asked at the 5 s check)
+    gone = [json.loads(x) for x in (served.home() / served.EVENTS).read_text().splitlines()]
+    assert [(e["id"], e["event"]) for e in gone] == [(_RT_MODEL, "appeared"), ("rank-a", "appeared"), (_RT_MODEL, "gone")]
+    rec = served.read(served.link(p.state, "chat"))
+    assert rec["seen"][_RT_MODEL]["gone"] == swapped and rec["seen"]["rank-a"] == {"first_seen": t0, "last_seen": swapped}
+    # Listed again: a new stretch starts at its return.
+    listed.append(_RT_MODEL)
+    back = _daemon_ticks(p.state, swapped + 1, swapped + 60)[0][0]
+    assert served.read(served.link(p.state, "chat"))["seen"][_RT_MODEL] == {"first_seen": back, "last_seen": back}
+
+
+def test_another_daemon_takes_the_models_poll_once_the_lease_holder_dies(env, monkeypatch):
+    """User's rule: the shared poll survives a dead daemon: another one polls after the lease TTL."""
+    from ttp import served
+    a, b = make(env), _second_project(env, "beta")
+    _, polls = _shared_watch(monkeypatch)
+    t0 = int(time.time())
+    assert _daemon_ticks(a.state, t0, t0) == [(t0, "polled")]
+    # a's daemon dies; b's finds the poll due but the lease held until it lapses.
+    tries = _daemon_ticks(b.state, t0 + 1, t0 + served.LEASE_S + 30)
+    took = [t for t, what in tries if what == "polled"]
+    before = [what for t, what in tries if t < took[0]]
+    assert before[0] == "not due" and set(before[1:]) == {"held"}
+    assert served.LEASE_S <= took[0] - t0 < served.LEASE_S + served.CHECK_S
+    assert len(polls) == 1 + len(took) and all(y - x == served.EVERY_S for x, y in zip(took, took[1:]))
+    lease = json.loads((served.home() / f"{served.link(b.state, 'chat')}.lease").read_text())
+    assert lease["holder"] == str(b.state.resolve()) and lease["until"] == took[-1] + served.LEASE_S
+
+
+def test_the_shared_models_poll_writes_no_key_or_url(env, monkeypatch, mock_chat):
+    """User's rule: the key and the endpoint's URL are never written."""
+    from ttp import endpoint, route, served
+    p = make(env)
+    up = mock_chat()
+    up.models = [_RT_MODEL]
+    monkeypatch.setattr(endpoint, "credentials", lambda alias: endpoint.Credentials(_CB_KEY, up.url))
+    t0 = int(time.time())
+    assert served.tick(p.state, "placeholder", True, now=t0) == "polled"
+    up.models = None   # the next poll fails (404)
+    assert served.tick(p.state, "placeholder", True, now=t0 + served.EVERY_S) == "polled"
+    eid = served.endpoint_id(up.url)
+    rec = served.read(eid)
+    assert rec["ids"] == [_RT_MODEL] and rec["ok"] is False and rec["listed"] == t0
+    assert route.read_served(p.state)["chat"]["ok"] is False
+    host = up.url.split("//", 1)[1].split("/", 1)[0]
+    files = [f for f in [*served.home().rglob("*"), *p.state.rglob("*")] if f.is_file()]
+    assert {f.name for f in files} >= {f"{eid}.json", f"{eid}.lease", served.EVENTS, served.LINK, route.MODELS_FILE}
+    for f in files:
+        text = f.read_text(errors="replace")
+        assert _CB_KEY not in text and host not in text, f
+
+
+def test_a_stale_shared_models_list_reads_as_unknown_and_swaps_nothing(env, monkeypatch):
+    """User's rule: no swap rests on an old list: past 3 poll intervals nothing is known."""
+    from ttp import modelrank, route, served
+    from ttp.daemon import Daemon
+    p = make(env)
+    d = Daemon(p.base)
+    _ranked(p, d, monkeypatch, [_RT_MODEL, "rank-a"])
+    _shared_watch(monkeypatch, ids=["rank-a"])
+    t0 = int(time.time()) + 1   # newer than the project's own list: the shared one is read
+    _daemon_ticks(p.state, t0, t0)
+    assert route.read_served(p.state)["chat"]["ids"] == ["rank-a"]
+    stale = t0 + served.STALE_POLLS * served.EVERY_S
+    assert modelrank.STALE_S == stale - t0 == 90
+    assert modelrank.served(p.state, stale) == ["rank-a"]
+    assert modelrank.pick(p.db, d.cfg, p.state, _RT_MODEL, stale) == ("rank-a", "not listed")
+    assert modelrank.served(p.state, stale + 1) is None
+    assert modelrank.pick(p.db, d.cfg, p.state, _RT_MODEL, stale + 1) is None   # unknown: no swap
+    # A list polled at the idle interval stays known for 3 of its own intervals.
+    served.record(served.link(p.state, "chat"), True, "HTTP 200", ["rank-a"], served.IDLE_S, t0)
+    route.write_served(p.state, "chat", True, "HTTP 200", ["rank-a"], t0, every=served.IDLE_S)
+    assert modelrank.served(p.state, t0 + 3 * served.IDLE_S) == ["rank-a"]
+    assert modelrank.served(p.state, t0 + 3 * served.IDLE_S + 1) is None
 
 
 def test_a_gone_model_is_swapped_within_a_minute_and_a_smarter_new_one_is_tried_then_parked_and_rechecked_weekly(
@@ -3223,7 +3645,7 @@ def test_parked_and_weak_models_are_rechecked_weekly_through_the_bench_and_its_v
 
 
 def test_the_daemon_runs_the_model_bench_daily_and_reports_a_keyless_skip_once(env, monkeypatch):
-    from ttp import endpoint, modelbench
+    from ttp import benchowner, endpoint, modelbench
     from ttp.daemon import Daemon
     p = make(env)
     d = Daemon(p.base)
@@ -3232,13 +3654,253 @@ def test_the_daemon_runs_the_model_bench_daily_and_reports_a_keyless_skip_once(e
     _bench_env(env, monkeypatch, ["m-a"])
     monkeypatch.setattr(endpoint, "credentials", lambda alias: None)
     monkeypatch.setenv("TTP_TEST_MODEL_BENCH", "1")
-    monkeypatch.setattr(modelbench, "BENCH_HOUR", 0)
+    monkeypatch.setattr(benchowner, "eligible", lambda now: [p.name])
     alerts = []
     monkeypatch.setattr(d, "alert", lambda key, text, severity="high", **k: alerts.append((key, severity)))
-    for _ in range(3):
-        d.run_model_bench()
-        if d._bench_job:
-            d._bench_job.join(10)
+    for day in range(3):
+        modelbench.run(p.name, d.cfg, {}, _local(10 + day, 3))   # what the owner's daily schedule runs
         d._bench_tried = 0.0
-    assert alerts == [(modelbench.NOKEY, "low")]
+        d.run_model_bench()
+    assert [a for a in alerts if a[0] == modelbench.NOKEY] == [(modelbench.NOKEY, "low")]
     assert modelbench.latest()["skipped"].startswith("no working key") and modelbench.latest()["owner"] == p.name
+
+
+_MID_OK = (200, {"choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+                 "usage": {"prompt_tokens": 10, "completion_tokens": 2}})
+_MID_ASK = {"max_tokens": 5, "messages": [{"role": "user", "content": "hi"}]}
+
+
+def _mid_bridge(up, tmp_path, ids, **kw):
+    """A bridge on `run-model` with ranked stand-ins and a served list in tmp_path naming `ids`."""
+    from ttp import route
+    from ttp.chatbridge import Bridge
+    route.write_served(tmp_path, "chat", True, "HTTP 200", list(ids), time.time())
+    return Bridge(up.url, _CB_KEY, "run-model", context_window=200000, served=[str(tmp_path)],
+                  standins=[{"model": "gone-too"}, {"model": "alt-model", "fields": {"reasoning_effort": "high"},
+                                                    "context_window": 64000}], **kw)
+
+
+def test_a_model_refused_mid_run_moves_this_call_and_later_ones_to_the_ranked_stand_in(mock_chat, tmp_path):
+    """User's rule: tt models come and go on the console; when one goes away, the next best runs within a minute."""
+    up = mock_chat((404, {"error": {"message": "The model does not exist", "code": "model_not_found"}}), _MID_OK, _MID_OK)
+    with _mid_bridge(up, tmp_path, ["alt-model", "other"]) as b:
+        first = _post(b, _MID_ASK)
+        second = _post(b, _MID_ASK)
+        stats = b.stats()
+    assert first[0] == second[0] == 200
+    sent = [s["body"] for s in up.seen if "body" in s]
+    assert [s["model"] for s in sent] == ["run-model", "alt-model", "alt-model"]   # gone-too is not served
+    assert sent[1].get("reasoning_effort") == "high" and b.context_window == 64000   # the stand-in's own fields
+    assert stats["last_fault"] == "" and stats["model"] == "alt-model"
+    assert [(m["from"], m["to"], m["why"]) for m in stats["mid_run"]] == [("run-model", "alt-model", "refused")]
+
+
+def test_errors_while_the_model_is_still_listed_swap_nothing_and_unlisted_ones_swap(mock_chat, tmp_path):
+    up = mock_chat(*[(503, {"error": {"message": "busy"}})] * 3)
+    with _mid_bridge(up, tmp_path / "a", ["run-model", "alt-model"]) as b:
+        codes = [_post(b, _MID_ASK)[0] for _ in range(3)]
+        stats = b.stats()
+    assert codes == [529] * 3 and "mid_run" not in stats
+    assert {s["body"]["model"] for s in up.seen if "body" in s} == {"run-model"}
+    up = mock_chat(*[(503, {"error": {"message": "busy"}})] * 3, _MID_OK, _MID_OK)
+    with _mid_bridge(up, tmp_path / "b", ["alt-model"]) as b:
+        codes = [_post(b, _MID_ASK)[0] for _ in range(4)]
+        stats = b.stats()
+    assert codes == [529, 529, 200, 200]   # the third error's retry already ran on the stand-in
+    assert [s["body"]["model"] for s in up.seen if "body" in s] == ["run-model"] * 3 + ["alt-model"] * 2
+    assert stats["mid_run"][0]["why"] == "not listed"
+
+
+def test_a_refusal_with_no_stand_in_served_or_none_armed_answers_as_before(mock_chat, tmp_path):
+    from ttp.chatbridge import Bridge
+    refuse = (404, {"error": {"message": "The model does not exist", "code": "model_not_found"}})
+    up = mock_chat(refuse)
+    with _mid_bridge(up, tmp_path / "a", ["other"]) as b:
+        code, _ = _post(b, _MID_ASK)
+        stats = b.stats()
+    assert code == 404 and stats["last_fault"] == "model_missing" and "mid_run" not in stats
+    up = mock_chat(refuse)
+    with Bridge(up.url, _CB_KEY, "run-model") as b:   # a required pin: the launch names no stand-ins
+        assert _post(b, _MID_ASK)[0] == 404 and b.stats()["last_fault"] == "model_missing"
+    assert len([s for s in up.seen if "body" in s]) == 1
+
+
+def test_the_launch_arms_stand_ins_except_for_a_required_pin_and_the_end_keeps_the_swaps(env, monkeypatch):
+    from ttp import chatbridge, failover, modelrank
+    from ttp.daemon import Daemon
+    p = make(env)
+    d = Daemon(p.base)
+    alerts = _ranked(p, d, monkeypatch, ["rank-b", "rank-a", _RT_MODEL])
+    d.cfg["providers"]["chat"]["tiers"]["light"]["context_window"] = 128000
+    d.cfg["providers"]["chat"]["effort_fields"] = {"rank-a": {"*": {"reasoning_effort": "high"}}}
+    tid = p.db.add_task("build", "", kind="work", tier="light", priority=3, budget_usd=8.0, labels=[])
+    armed = d._bridge_ranked(p.db.task(tid), {}, _RT_MODEL)
+    assert armed == {"standins": ["rank-a", "rank-b"], "served": [str(p.state)]}
+    s = chatbridge.settings(d.cfg, "light", _RT_MODEL, "low", **armed)
+    assert s["context_window"] == 128000 and s["standins"][0] == {"model": "rank-a", "fields": {"reasoning_effort": "high"}}
+    pinned = p.db.add_task("pinned", "", kind="work", tier="light", priority=3, budget_usd=8.0,
+                           labels=[failover.REQUIRED_LABEL])
+    assert d._bridge_ranked(p.db.task(pinned), {"model": _RT_MODEL}, _RT_MODEL) == {}
+    assert "standins" not in chatbridge.settings(d.cfg, "light", _RT_MODEL, "low", **{})
+    mid = [{"from": _RT_MODEL, "to": "rank-a", "at": time.time(), "why": "refused"}]
+    run, task = _route_finish(p, d, tid, {"rc": 0, "bridge": {"last_fault": "", "faults": {"model_missing": 1},
+                                                              "mid_run": mid, "model": "rank-a"}},
+                              result={"status": "done", "summary": "built"})
+    assert run["status"] == "ok" and task["status"] != "queued", (run["status"], task["status"])
+    assert json.loads(run["note"])[modelrank.KEY]["mid_run"] == mid
+    assert [a[2] for a in alerts] == ["low"] and "rank-a" in alerts[0][1] and _RT_MODEL in alerts[0][1]
+    assert modelrank.down(p.db, d.cfg, p.state, _RT_MODEL, time.time()) == "refused"
+
+
+
+def test_a_run_a_stand_in_finished_is_the_stand_ins_everywhere_never_the_asked_for_models(env, monkeypatch):
+    """Task #7923 (user msg #1924): a stand-in's work never shows as the asked-for model's: the run's model,
+    ttp stats --runs and the web app's runs, the scoreboard and the demotion samples all name the stand-in."""
+    from ttp import modeldemote, modelrank, modelscore, route, web
+    from ttp.daemon import Daemon
+    p = make(env)
+    d = Daemon(p.base)
+    _ranked(p, d, monkeypatch, ["rank-b", "rank-a", _RT_MODEL])
+    tid = p.db.add_task("build", "", kind="work", tier="light", priority=3, budget_usd=8.0, labels=[])
+    mid = [{"from": _RT_MODEL, "to": "rank-a", "at": time.time(), "why": "refused"}]
+    run, task = _route_finish(p, d, tid, {"rc": 0, "bridge": {"last_fault": "", "faults": {"model_missing": 1},
+                                                              "mid_run": mid, "model": "rank-a"}},
+                              result={"status": "done", "summary": "built"})
+    run = p.db.one("SELECT * FROM runs WHERE id=?", (run["id"],))
+    assert run["model"] == "rank-a", run["model"]
+    e = json.loads(run["note"])[modelrank.KEY]
+    assert (e["asked"], e["ran"]) == (_RT_MODEL, "rank-a")
+    shown = f"rank-a (stand-in for {_RT_MODEL})"
+    assert [r["model"] for r in route.runs(p.db, None, 0) if r["id"] == run["id"]] == [shown]
+    assert [r["model"] for r in web.state_payload(p, p.db)["runs"] if r["id"] == run["id"]] == [shown]
+    p.db.x("UPDATE tasks SET status='done' WHERE id=?", (tid,))
+    now = time.time() + 1
+    by = modelscore.live_rows(p, now)
+    assert "rank-a" in by and _RT_MODEL not in by, by
+    assert modeldemote.samples(p, d.cfg, 0, now)[tid]["model"] == "rank-a"
+    # A row kept before the fix (runs.model still the asked-for model) reads the same way.
+    p.db.x("UPDATE runs SET model=?, note=? WHERE id=?",
+           (_RT_MODEL, json.dumps({modelrank.KEY: {"mid_run": mid}}), run["id"]))
+    assert _RT_MODEL not in modelscore.live_rows(p, now)
+    assert modeldemote.samples(p, d.cfg, 0, now)[tid]["model"] == "rank-a"
+    assert modelrank.label(_RT_MODEL, "{}") == _RT_MODEL
+
+
+def test_a_swap_in_another_call_never_sends_the_stand_ins_fields_with_the_old_model(mock_chat, tmp_path, monkeypatch):
+    """Task #7923: forward() reads model, fields and rejected as one snapshot under the swap lock. A swap by a
+    parallel call lands between reading the model and sending (here: inside to_chat, deterministically)."""
+    from ttp import chatbridge
+    up = mock_chat(_MID_OK)
+    real = chatbridge.to_chat
+    with _mid_bridge(up, tmp_path, ["run-model", "alt-model"], fields={"reasoning_effort": "low"}) as b:
+        def racing(body, model, max_tokens):
+            with b._swap_lock:   # what a parallel call's _swapped does
+                b.model, b.fields, b.rejected = "alt-model", {"reasoning_effort": "high"}, False
+            return real(body, model, max_tokens)
+        monkeypatch.setattr(chatbridge, "to_chat", racing)
+        assert _post(b, _MID_ASK)[0] == 200
+    sent = [s["body"] for s in up.seen if "body" in s]
+    assert [(s["model"], s.get("reasoning_effort")) for s in sent] == [("run-model", "low")], sent
+
+
+def test_a_mid_run_swap_is_written_for_live_views_and_shown_as_a_stand_in(mock_chat, tmp_path):
+    """Task #7923: the runner's on_swap writes chatbridge.SWAP_FILE; a running run shows 'B (stand-in for A)'."""
+    from ttp import chatbridge, modelrank
+    up = mock_chat((404, {"error": {"message": "The model does not exist", "code": "model_not_found"}}), _MID_OK)
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    with _mid_bridge(up, tmp_path, ["alt-model"]) as b:
+        b.on_swap = lambda e: (run_dir / chatbridge.SWAP_FILE).write_text(json.dumps(e))
+        assert _post(b, _MID_ASK)[0] == 200
+    assert json.loads((run_dir / chatbridge.SWAP_FILE).read_text()) == {"asked": "run-model", "ran": "alt-model"}
+    assert modelrank.label("run-model", None, run_dir) == "alt-model (stand-in for run-model)"
+    assert modelrank.label("run-model", None, tmp_path / "none") == "run-model"
+
+def _bench_owners(env, names=("proj-a", "proj-b", "proj-c")):
+    """Fake projects on the machine, each with a live daemon heartbeat and a chat endpoint."""
+    ps = {}
+    for i, n in enumerate(names):
+        ps[n] = make(env, n) if i == 0 else _second_project(env, n)
+        _route_config(ps[n])
+        (ps[n].state / "heartbeat").write_text("{}")
+    return ps
+
+
+def _bench_lease():
+    from ttp import modelbench
+    return json.loads((modelbench.home() / modelbench.OWNER).read_text())
+
+
+def test_one_project_per_machine_owns_the_model_bench_and_a_paused_or_opted_out_one_never_does(env):
+    """Task #7699: the first eligible project by name owns the bench; a paused owner is replaced at once
+    and an opted-out project is never chosen."""
+    from ttp import benchowner, configwho
+    ps = _bench_owners(env)
+    ps["proj-a"].set_config("model_bench", {"opt_out": True}, by=configwho.by("user", via="cli"))
+    now = time.time()
+    assert benchowner.eligible(now) == ["proj-b", "proj-c"]
+    assert benchowner.check("proj-c", {}, now) == {"owner": None}            # not first by name: waits
+    assert benchowner.check("proj-b", {}, now) == {"owner": "proj-b", "took": ""}
+    assert benchowner.check("proj-c", {}, now + 60) == {"owner": "proj-b"}   # one owner
+    assert benchowner.check("proj-a", {}, now + 60) == {"owner": "proj-b"}   # opted out: never takes it
+    ps["proj-b"].db.set_kv("paused", True)
+    assert benchowner.eligible(now + 120) == ["proj-c"]
+    assert benchowner.check("proj-c", {}, now + 120) == {"owner": "proj-c", "took": "proj-b"}
+    assert _bench_lease() == {"project": "proj-c", "since": now + 120, "prev": "proj-b"}
+    os.utime(ps["proj-c"].state / "heartbeat", (now - 3600, now - 3600))   # a dead daemon is not eligible
+    assert benchowner.eligible(now) == []
+
+
+def test_a_stale_model_bench_pokes_its_owner_once_then_the_next_project_takes_it_over(env):
+    """Task #7699: 49 h without a result pokes the owner exactly once per episode; 73 h hands the lease to
+    the next project by name, with exactly one winner among concurrent daemons."""
+    from concurrent.futures import ThreadPoolExecutor
+    from ttp import benchowner, modelbench
+    names, t0 = ["proj-a", "proj-b", "proj-c"], time.time()
+    modelbench.owner_update(lambda o: {"project": "proj-a", "since": t0 - 100 * 3600, "last_result": t0})
+    now = t0 + 49 * 3600
+    assert benchowner.check("proj-a", {}, now, names) == {"owner": "proj-a"}   # the owner never pokes itself
+    got = [benchowner.check(n, {}, now + i, names) for i, n in enumerate(["proj-c", "proj-b", "proj-c"])]
+    assert got == [{"owner": "proj-a", "poked": "proj-a"}, {"owner": "proj-a"}, {"owner": "proj-a"}]
+    assert _bench_lease()["poke"] == {"ref": t0, "at": now, "by": "proj-c"}
+    modelbench.owner_update(lambda o: {**o, "last_result": now})               # a result: the episode ends
+    assert benchowner.check("proj-b", {}, now + 3600, names) == {"owner": "proj-a"}
+    assert benchowner.check("proj-b", {}, now + 49 * 3600, names)["poked"] == "proj-a"   # a new episode
+    late = now + 73 * 3600
+    with ThreadPoolExecutor(9) as ex:
+        res = list(ex.map(lambda n: benchowner.check(n, {}, late, names), names * 3))
+    assert [r for r in res if "took" in r] == [{"owner": "proj-b", "took": "proj-a"}]
+    assert _bench_lease() == {"project": "proj-b", "since": late, "prev": "proj-a"}
+    modelbench.owner_update(lambda o: {"project": "proj-c", "since": t0})       # wraps round to the first name
+    assert benchowner.check("proj-a", {}, t0 + 73 * 3600, names) == {"owner": "proj-a", "took": "proj-c"}
+
+
+def test_the_bench_owners_daemon_keeps_a_daily_command_schedule_and_runs_it_on_a_poke(env, monkeypatch):
+    """Task #7699: the owner's daemon keeps a model-free command schedule at bench_at and turns a poke into
+    one run now and one feed line; a project that loses the lease turns its schedule off."""
+    from ttp import benchowner, modelbench, schednow
+    from ttp.daemon import Daemon
+    p = make(env)
+    _route_config(p)
+    d = Daemon(p.base)
+    d._load_config()
+    monkeypatch.setenv("TTP_TEST_MODEL_BENCH", "1")
+    monkeypatch.setattr(benchowner, "eligible", lambda now: [p.name, "zz-other"])
+    asked, alerts = [], []
+    monkeypatch.setattr(schednow, "request", lambda proj, name, caller: asked.append(name) or "r1")
+    monkeypatch.setattr(d, "alert", lambda key, text, severity="high", **k: alerts.append((key, severity)))
+    row = lambda: p.db.one("SELECT kind, at, enabled, payload FROM schedules WHERE name=?", (benchowner.SCHEDULE,))
+    d.run_model_bench()
+    assert alerts == [("model-bench-owner", "low")] and asked == []
+    assert {**row(), "payload": json.loads(row()["payload"])} == {
+        "kind": "command", "at": "02:00", "enabled": 1, "payload": {"command": benchowner.COMMAND}}
+    modelbench.owner_update(lambda o: {**o, "poke": {"ref": 1.0, "at": time.time(), "by": "zz-other"}})
+    for _ in range(2):
+        d._bench_tried = 0.0
+        d.run_model_bench()
+    assert asked == [benchowner.SCHEDULE] and len(alerts) == 1
+    assert p.db.one("SELECT count(*) n FROM messages WHERE text LIKE '%poked this project%'")["n"] == 1
+    modelbench.owner_update(lambda o: {"project": "zz-other", "since": time.time()})
+    d._bench_tried = 0.0
+    d.run_model_bench()
+    assert row()["enabled"] == 0

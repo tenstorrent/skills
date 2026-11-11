@@ -84,6 +84,7 @@ RUNNER_DEFAULTS = {
 }
 _CHOICES = {"script_lint": ("", "warn", "refuse"), "netfs_policy": ("warn", "refuse")}
 RUNNER_DOWN_RC = 3   # probe: the job is pending and no runner is alive (the daemon restarts it)
+START_WAIT_S = 120   # start: longest wait for a runner still starting up (a loaded host is slow, not broken)
 CANCEL = ".cancel"   # running/<job>.cancel: drop asked the runner to stop the job (its text: why)
 CAN_CANCEL = "runner.cancel"   # the live runner's pid: it honours CANCEL (an older runner never writes it)
 ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}")
@@ -1164,7 +1165,9 @@ def start(d: Path, cfg: dict) -> int:
     with open(d / "runner.out", "a") as out:
         proc = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "run", str(d)], cwd=str(d),
                                 stdin=subprocess.DEVNULL, stdout=out, stderr=out, start_new_session=True, env=_env())
-    for _ in range(100):
+    # wait for the runner's lock while it is still starting; its exit ends the wait at once
+    deadline = time.monotonic() + START_WAIT_S
+    while time.monotonic() < deadline:
         if runner_alive(d):
             print(f"runner started (pid {proc.pid})")
             return 0

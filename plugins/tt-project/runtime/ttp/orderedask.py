@@ -1,19 +1,21 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 # SPDX-License-Identifier: Apache-2.0
-"""Agent mode's ask gate: no permission ask for what a logged order already covers.
+"""Agent mode's ask flag: a permission ask for what a logged order may already cover.
 
 With relay.AGENT_KEY on, the owner's own chat agent's words are the owner's. An ask_user seeking permission
 for a step that the user or that agent already ordered in a logged inbound message is needless: the
 coordinator sends the change itself (a Restrictions charter_update with `source`, the agent's words as
-origin relayer) or acts. refusal() is model-free and runs only in agent mode; with it off nothing changes.
+origin relayer) or acts. refusal() is model-free and runs only in agent mode; with it off nothing changes. A shared phrase or cite
+is no proof of an order, so its finding is a flag on the sent ask (a note and the daily audit), never a
+refusal: the coordinator reads the message and decides (#2116).
 
-What it refuses: a restriction ask (blocking restriction, or classify restriction_change) that cites a logged
+What it flags: a restriction ask (blocking restriction, or classify restriction_change) that cites a logged
 inbound message's id or shares a phrase (relay.SHINGLE words, relay.CONTENT of them not common) with its
 words, verbatim or relayed, and an irreversible ask worded as a permission question (_PERMISSION_RE) that
 cites such a message's id (the coordinator saying that message ordered it). A shared phrase is no intent: it
 may come from a prohibition ("do not reset ..."), so it never refuses an irreversible ask, and a restriction
-change it steers to is still checked against its source by the Restrictions gate. Every refusal is worded
-conditionally: if the message did not order the step or forbade it, the ask goes out with `not_covered`.
+change it steers to is still checked against its source by the Restrictions gate. Every flag is worded
+conditionally: if the message did not order the step or forbade it, the ask stands.
 Ids and phrases the charter already holds (a ban's own cite and words) do not count: quoting the ban asked
 about is no order. What still goes to the owner: funds, spend, review, merge, access (credential) and human
 (another person's request) asks, an ask in a relay.HELD class (a step that could affect people badly, one
@@ -63,7 +65,7 @@ def order(p, said: str, now: float | None = None, phrases: bool = True) -> tuple
 
 
 def refusal(p, cfg: dict, a: dict, text: str, least: str, not_covered_min: int) -> tuple[str, str] | None:
-    """(refusal label, why) for a needless permission ask in agent mode (module doc), else None."""
+    """(flag label, why) for a likely needless permission ask in agent mode (module doc), else None."""
     if not relay.agent_orders(cfg) or a.get("blocking") not in ("irreversible", "restriction"):
         return None
     if len(str(a.get("not_covered") or "").strip()) >= not_covered_min:
@@ -88,8 +90,8 @@ def refusal(p, cfg: dict, a: dict, text: str, least: str, not_covered_min: int) 
     return ("already ordered",
             f"message #{mid} ({whose}" + (f', sharing the words "{words}"' if words else ", which this ask cites")
             + f") may already order this. If message #{mid} ordered this step: with {relay.AGENT_KEY} on that "
-            f"order is the owner's, so never ask the owner for permission to do what they or their agent ordered; "
-            f"instead, {act}. A refusal of that change names its own fix: apply it and resend. If message #{mid} "
-            f"did not order this step or forbade it, do not act on it: resend this ask with not_covered saying so "
-            f"(at least {not_covered_min} characters). Only a step that could affect people badly, speaks as the "
-            f"owner, or needs money or a credential goes to the owner either way")
+            f"order is the owner's, so the owner need not be asked for permission to do what they or their agent "
+            f"ordered: {act}, and `resolve` this ask. If message #{mid} did not order this step or forbade it, "
+            f"the ask stands; say so in not_covered (at least {not_covered_min} characters) next time. Only a "
+            f"step that could affect people badly, speaks as the owner, or needs money or a credential goes to "
+            f"the owner either way")

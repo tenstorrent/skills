@@ -126,6 +126,93 @@ def test_a_compound_detach_probe_gets_the_model_free_relaunch(env, tmp_path):
     assert rw.transient_besides_jobs(f"ttp detach --check {a}; test -e /tmp/x") == "a path a reboot clears"
 
 
+def test_any_local_gate_naming_a_jobs_rc_counts_as_waiting_on_that_job():
+    import ttp.rebootwait as rw
+    a, b = "/r/a.rc", "/r/b.rc"
+    for probe, want in (
+            (f"test -s {a}", [a]),
+            (f"test -e {a} && [ -s {b} ]", [a, b]),
+            (f"/x/state/runs/7/probe.sh {a}", [a]),
+            (f"/x/bin/gate --rc={a} --timeout 5", [a]),
+            (f"grep -q '^0$' {a} || ttp detach --check {b}", [a, b]),
+            (f"bash -c 'test -s {a}'", [a]),
+            (f"test -s /r/rows", []),
+            (f"test -s /r/unrelated.log && test -e /r/out", []),
+            (f"echo {a}", []),
+            (f"ssh box test -s {a}", []),
+            (f"/x/bin/gate --host box {a}", []),
+            ("test -s job.rc", []),
+            ("test -s $TTP_RUN_DIR/job.rc", []),
+            (f"bash -c 'ssh box test -s {a}'", []),
+            # doubt in one command that names no countable .rc leaves the others' jobs
+            (f"ttp detach --check {a} && test \"$(date +%s)\" -ge 5", [a]),
+            (f"ttp detach --check {a} && test -s $TTP_RUN_DIR/x.rc", [a]),
+            (f"ttp detach --check {a} || test -s x.rc", [a]),
+            (f"ttp detach --check {a} && test -s /r/*.rc", [a]),
+            (f"! test -s {a}", [a]),
+            # one naming an absolute .rc beside a substitution puts the whole probe in doubt
+            (f"ttp detach --check {b} && test -s {a} -a -n \"$(pgrep x)\"", []),
+            (f"bash -c 'test -s {a} -a -n \"$(pgrep x)\"'", [])):
+        assert rw.local_jobs(probe) == [pathlib.Path(x) for x in want], probe
+    assert rw.transient_besides_jobs(f"test -s {a} && test -s /x/state/runs/r1/rows") == ""
+    assert rw.transient_besides_jobs(f"test -s {a} && pgrep soak") == "a process"
+    assert rw.transient_besides_jobs(f"bash -c 'test -s {a} && pgrep soak'") == "a process"
+    assert rw.local_jobs(f"test -s {a} -a -n \"$(pgrep soak)\"") == []
+
+
+@pytest.mark.parametrize("form", ["test -s", "test -e", "script", "script-detach-check"])
+def test_a_reboot_relaunches_a_job_whose_gate_names_its_rc_in_any_form(env, tmp_path, form):
+    p = make(env)
+    tid = p.db.add_task("soak", "s", kind="work", tier="light", origin="user")
+    rc, counter = _resumable_job_cut_by_reboot(p, tmp_path, tid)
+    if form.startswith("script"):
+        script = rc.parent / "gate.sh"
+        script.write_text('#!/bin/sh\n' + ('ttp detach --check "$1"\n' if form == "script-detach-check"
+                                             else 'test -s "$1" && grep -q "^0" "$1"\n'))
+        script.chmod(0o755)
+        probe = f"{script} {rc}"
+    else:
+        probe = f"{form} {rc}"
+    _wait_on(p, tid, probe)
+    _boot_daemon(p)
+    assert not _woken(p, tid) and p.db.task(tid)["not_before"], dict(p.db.task(tid))
+    assert _wait_for_path(rc) and counter.read_text().split() == ["run", "run"]
+    assert len(_job_relaunches(p, tid)) == 1
+
+
+def test_a_reboot_relaunches_a_detach_check_beside_a_command_substitution(env, tmp_path):
+    p = make(env)
+    tid = p.db.add_task("soak", "s", kind="work", tier="light", origin="user")
+    rc, counter = _resumable_job_cut_by_reboot(p, tmp_path, tid)
+    _wait_on(p, tid, f'ttp detach --check {rc} || test "$(date +%s)" -ge {int(time.time()) + 86400}')
+    _boot_daemon(p)
+    assert not _woken(p, tid) and p.db.task(tid)["not_before"], dict(p.db.task(tid))
+    assert _wait_for_path(rc) and counter.read_text().split() == ["run", "run"]
+    assert len(_job_relaunches(p, tid)) == 1
+
+
+def test_a_reboot_does_not_relaunch_for_a_gate_naming_an_unrelated_path(env, tmp_path):
+    p = make(env)
+    tid = p.db.add_task("soak", "s", kind="work", tier="light", origin="user")
+    rc, counter = _resumable_job_cut_by_reboot(p, tmp_path, tid)
+    other = tmp_path / "elsewhere" / "other.rc"
+    _wait_on(p, tid, f"test -s {other}")
+    _boot_daemon(p)
+    assert counter.read_text().split() == ["run"] and not _job_relaunches(p, tid)
+
+
+def test_a_run_folder_gate_script_probing_a_process_still_wakes(env, tmp_path):
+    p = make(env)
+    tid = p.db.add_task("soak", "s", kind="work", tier="light", origin="user")
+    rc, counter = _resumable_job_cut_by_reboot(p, tmp_path, tid)
+    script = rc.parent / "gate.sh"
+    script.write_text(f'#!/bin/sh\ntest -s "$1" && kill -0 {_dead_pid()}\n')
+    _wait_on(p, tid, f"{script} {rc}")
+    _boot_daemon(p)
+    assert _woken(p, tid), dict(p.db.task(tid))
+    assert counter.read_text().split() == ["run"] and not _job_relaunches(p, tid)
+
+
 def test_a_compound_probe_with_a_reboot_volatile_part_wakes_instead_of_relaunching(env, tmp_path):
     p = make(env)
     tid = p.db.add_task("soak", "s", kind="work", tier="light", origin="user")

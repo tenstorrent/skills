@@ -731,6 +731,14 @@ def test_forked_runs_send_the_coordinator_prefix_and_keep_their_own_text_after_i
         assert prompt.startswith(ctxfork.DISK_HEAD)
     else:
         assert "differs" in ctx["prefix"]
+    # Task #7824: a coordinator system prompt holding its no-tools or read-only rule is never a worker's,
+    # cache or not: the fork keeps the run's own system prompt and answer format.
+    for rule in ctxfork.COORD_TOOL_RULES:
+        (coord_dir / "run.json").write_text(json.dumps({"argv": coord}))
+        (coord_dir / "system.md").write_text(f"# Role\nYou coordinate.\n{rule}: only your answer.")
+        argv, prompt, system, ctx = start(p.root)
+        assert ctx["how"] == "fork" and "prefix" not in ctx and "--json-schema" not in argv, ctx
+        assert system.startswith("# WORKER RULES") and not ctxfork.coord_only([system, prompt]), system
 
 
 def test_sonnet_workers_and_reviewers_share_one_system_prompt_while_memory_changes(env, monkeypatch, tmp_path):
@@ -1009,3 +1017,110 @@ def test_codex_worker_runs_start_with_their_own_instructions_and_the_coordinator
     argv = json.loads((p.runs / str(rid) / "run.json").read_text())["argv"]
     assert any(a.startswith("developer_instructions=") and "This session has no tools" in a for a in argv)
     assert coord_src.read_text().count("This session has no tools") == 3
+
+
+def test_the_launch_role_check_knows_the_coordinators_own_rules_and_no_worker_prompt_has_one():
+    """Task #7824: the model-free launch-role check matches the coordinator prompts' own tool and answer
+    rules, so a template edit cannot silently disarm it; no worker, reviewer or other prompt carries one."""
+    from ttp import ctxfork
+    prompts = pathlib.Path(ctxfork.__file__).resolve().parents[2] / "template" / "prompts"
+    session = (prompts / "coordinator-session.md").read_text()
+    assert all(rule in session for rule in ctxfork.COORD_TOOL_RULES)
+    assert ctxfork.COORD_ANSWER_RULE in (prompts / "coordinator.md").read_text()
+    for path in prompts.glob("*.md"):
+        if not path.name.startswith("coordinator"):
+            assert ctxfork.coord_only([path.read_text()]) == "", path.name
+
+
+def test_a_codex_worker_fork_that_keeps_the_coordinators_rules_starts_from_the_disk_block(env, monkeypatch, tmp_path):
+    """Task #7824: two workers forked from a Codex coordinator session without tools handed off having run
+    nothing, under its "This session has no tools". Where the copied rollout still carries a coordinator-only
+    rule after the run's own instructions went in, the launch takes the disk block, checked model-free
+    before the agent starts: no resume, the run's own developer instructions, the reason in its note."""
+    from ttp import coordsession, ctxfork
+    from ttp.providers import codex as cmod
+    home = tmp_path / "codex-home"
+    monkeypatch.setenv("CODEX_HOME", str(home))
+    _fork_fake_codex(tmp_path, monkeypatch)
+    p, d, _cfg, _run = _fork_daemon(env, monkeypatch, tmp_path, provider="codex")
+    csid = str(uuid.uuid4())
+    _codex_rollout_with_instructions(home, csid, str(p.base))
+    p.db.set_kv(coordsession.KEY, {"id": csid, "provider": "codex", "context_tokens": 7000})
+    worker = "# WORKER RULES\nuse your tools and write result.json"
+    # A Codex whose rollout the swap does not reach (another layout, another nesting).
+    monkeypatch.setattr(cmod.Codex, "own_instructions", lambda self, *a: "")
+    tid = p.db.add_task("the change", "do it", kind="code", origin="user")
+    rid = d.start_run("worker", "TASK PROMPT", "codex", "standard", str(p.root), task=p.db.task(tid),
+                      append_system=worker)
+    argv = json.loads((p.runs / str(rid) / "run.json").read_text())["argv"]
+    got = json.loads(p.db.one("SELECT note FROM runs WHERE id=?", (rid,))["note"] or "{}")["coord_context"]
+    assert got["how"] == "disk" and "This session has no tools" in got["role_gap"] and "session" not in got, got
+    assert "resume" not in argv and (p.runs / str(rid) / "prompt.md").read_text().startswith(ctxfork.DISK_HEAD)
+    assert not ctxfork.coord_only(argv) and any("WORKER RULES" in a for a in argv), argv
+
+
+def test_every_providers_worker_launch_from_the_coordinators_session_carries_the_worker_role(env, monkeypatch, tmp_path):
+    """Task #7824, on each provider path the harness ships: a worker started while the coordinator has a
+    session gets either a copy it can run its own role in or the disk block, and the launch-role check
+    refuses a copy whose instructions carry a coordinator-only rule on every provider."""
+    from ttp import coordsession, ctxfork
+    from ttp.providers import all_providers
+    p, d, cfg_dir, _run = _fork_daemon(env, monkeypatch, tmp_path)
+    sid = str(uuid.uuid4())
+    _fork_transcript(cfg_dir, p.base, sid)
+    names = sorted({prov.name for prov in all_providers()})
+    assert {"claude", "codex", "cursor", "chat"} <= set(names), names
+    for name in names:
+        prov = next(x for x in all_providers() if x.name == name)
+        p.db.set_kv(coordsession.KEY, {"id": sid, "provider": "claude", "context_tokens": 5000})
+        got = ctxfork.prepare(p, d.cfg, prov, name, str(p.root), None)
+        assert got["how"] in ("fork", "disk"), (name, got)
+        assert not ctxfork.coord_only([got.get("lead", "")]), name
+        fake = {"how": "fork", "session": str(uuid.uuid4())}
+        assert ctxfork.own_role(prov, fake, str(p.root), None, "# WORKER RULES") == "", name
+        assert "This session has no tools" in ctxfork.own_role(prov, fake, str(p.root), None,
+                                                              "# WORKER RULES\nThis session has no tools."), name
+        prov.session_instructions = lambda *a: [_CODEX_COORD_TEXT]   # a session keeping the coordinator's
+        assert "no tools" in ctxfork.own_role(prov, fake, str(p.root), None, "# WORKER RULES"), name
+
+
+def test_a_run_that_did_no_work_under_the_coordinators_role_is_not_retried_the_same_way(env, monkeypatch, tmp_path):
+    """Task #7824: a worker that handed off having run nothing because it got the coordinator's role
+    (no tools, its {"actions"} answer) is marked; a copied session's task restarts from the disk block, and
+    a run with no copy, which would start the same way again, is not retried or topped up."""
+    from ttp import coordsession, ctxfork
+    from ttp.daemon import Daemon
+    from ttp.providers.base import RunUsage
+    p, d, cfg_dir, _run = _fork_daemon(env, monkeypatch, tmp_path)
+    sid = str(uuid.uuid4())
+    _fork_transcript(cfg_dir, p.base, sid)
+    p.db.set_kv(coordsession.KEY, {"id": sid, "provider": "claude", "context_tokens": 5000})
+    said = "Nothing was run: this session has no tools under the coordinator-only instructions."
+    assert ctxfork.role_miss("", {"status": "failed", "summary": said})
+    assert ctxfork.role_miss('{"actions": []}', None) and not ctxfork.role_miss('{"actions": []}', {"status": "done"})
+    assert not ctxfork.role_miss("", {"status": "failed", "summary": "the build failed: no tools package on the box"})
+
+    def finish(note, handoff=None, final=""):
+        tid = p.db.add_task(f"t {uuid.uuid4().hex[:6]}", "do it", kind="code", origin="user")
+        p.db.update_task(tid, status="running")
+        run_dir = tmp_path / f"run-{tid}"
+        run_dir.mkdir()
+        if handoff:
+            (run_dir / "result.json").write_text(json.dumps(handoff))
+        rid = p.db.x("INSERT INTO runs(task, role, provider, started, ended, status, note) VALUES(?,?,?,?,?,?,?)",
+                     (tid, "worker", "claude", time.time() - 60, time.time(), "ok",
+                      json.dumps({**note, "role_miss": "x"})))
+        Daemon(p.base)._finish_worker({"id": rid, "task": tid, "role": "worker", "note": json.dumps(note)},
+                                      RunUsage(cost_usd=0.5, final_text=final), "ok", run_dir)
+        return tid, p.db.task(tid)
+
+    # No copied session: the same start again would repeat it, so the task fails with the reason.
+    for handoff, final in (({"status": "failed", "summary": said}, ""), (None, '{"actions": []}')):
+        tid, t = finish({ctxfork.KEY: {"how": "disk"}}, handoff, final)
+        assert t["status"] == "failed" and "not retried" in t["result"], (t["status"], t["result"])
+    # A fork: retried, and the next start takes the disk block, not the same fork.
+    tid, t = finish({ctxfork.KEY: {"how": "fork", "session": "s"}}, {"status": "failed", "summary": said})
+    assert t["status"] == "queued", t["status"]
+    from ttp.providers import get_provider
+    got = ctxfork.prepare(p, d.cfg, get_provider("claude"), "claude", str(p.root), None, task=tid)
+    assert got["how"] == "disk" and "coordinator's role" in got["why"], got

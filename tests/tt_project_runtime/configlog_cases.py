@@ -73,7 +73,9 @@ def test_upgrade_migration_and_worker_never_overwrite_a_user_or_coordinator_valu
     monkeypatch.setattr(configwho, "from_env", lambda: configwho.by("worker", task=7, via="cli"))
     with pytest.raises(SystemExit):
         cli.main(["config", "demo", "device.max_tasks", "5"])
-    assert "the coordinator (config_set) or the user makes this change" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "the user or the coordinator makes this change" in err
+    assert "`ttp config demo device.max_tasks <value>` in its own shell after `ttp audit why`" in err
     # Same value: nothing written, the coordinator's record stays.
     p.set_config("device.max_tasks", 2, by=configwho.by("harness"))
     assert configwho.role(configwho.lookup(p.db, "device.max_tasks", p.raw_config())) == "coordinator"
@@ -273,6 +275,22 @@ def test_a_worker_runs_config_of_a_coordinator_set_spill_wrap_cmd_is_refused_and
     assert [e["fingerprint"] for e in events] == ["config_overwrite_refused:checks.spill_wrap_cmd:worker"]
     assert events[0]["status"] == "queued" and "set by" in events[0]["text"]
 
+
+
+def test_config_set_refusing_a_key_a_coordinator_sets_by_cli_names_that_route_and_a_users_key_does_not(env):
+    """A known key config_set refuses (not chat-settable) but a coordinator may set by `ttp config`: the
+    rejection names that route, so a worker told to hand it to the coordinator never loops. A key that is
+    the user's alone (NEEDS_USER) and an unknown key get no such route."""
+    from ttp.coordinator import apply
+    p = make(env)
+    probs = apply(p, [{"type": "config_set", "key": "checks.spill_wrap_cmd", "value": "/opt/example/wrap.sh"}])
+    assert any("checks.spill_wrap_cmd is not user-settable from chat" in x
+               and "`ttp config <project> checks.spill_wrap_cmd <value>` in its own shell after `ttp audit "
+                   "why`" in x for x in probs), probs
+    assert "spill_wrap_cmd" not in (p.raw_config().get("checks") or {})
+    for key in ("delivery.backup_remote", "checks.no_such_key"):
+        probs = apply(p, [{"type": "config_set", "key": key, "value": "x"}])
+        assert probs and not any("ttp audit why" in x for x in probs), (key, probs)
 
 def test_config_breakage_watch_fires_when_the_passes_before_the_change_are_older_than_recent_rows(env, monkeypatch):
     """Many spill hosts: the passes of the failing hosts before a change are more than checkwall.RECENT

@@ -582,8 +582,9 @@ def spawn_probe(p: Project, probe: str, errs: dict[int, Any], stdout: bool = Fal
 def _spawn_now(p: Project, probe: str, errs: dict[int, Any], stdout: bool = False) -> subprocess.Popen:
     """spawn_probe on the caller's thread, for a caller that waits on the probe anyway (probe_once)."""
     err = tempfile.TemporaryFile()
+    cmd, env = probespawn.hidden(probe, command_env(p))
     try:
-        proc = subprocess.Popen(probe, shell=True, cwd=str(p.root), env=command_env(p), stdin=subprocess.DEVNULL,
+        proc = subprocess.Popen(cmd, shell=True, cwd=str(p.root), env=env, stdin=subprocess.DEVNULL,
                                 stdout=err if stdout else subprocess.DEVNULL, stderr=err, start_new_session=True)
     except OSError:
         err.close()

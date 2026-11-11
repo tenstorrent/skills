@@ -213,67 +213,6 @@ def test_credwatch_a_run_that_changes_a_protected_path_fails_its_hand_off_and_a_
     assert p.db.task(tid)["status"] == "done", p.db.task(tid)["result"]
 
 
-def test_credwatch_a_ledgered_change_is_normal_and_a_transcript_line_or_the_files_time_keeps_it_high(env, monkeypatch):
-    """A change the machine's change ledger records as made while the run ran (another project's new key)
-    is told at normal severity naming the entry; one the run's transcript shows stays high and quotes the
-    line; with neither it stays high, says the run's commands did not show it and gives the file's time."""
-    import json
-    import time
-    from ttp import credwatch, machines, timefmt
-    from ttp import machine_ledger as ml
-    home = env["tmp"] / "acct"
-    monkeypatch.setenv("HOME", str(home))
-    key, rsa = home / ".ssh" / "id_ed25519", home / ".ssh" / "id_rsa"
-    key.parent.mkdir(parents=True)
-    key.write_text("k\n")
-    rsa.write_text("k\n")
-    os.utime(key, (1_700_000_000, 1_700_000_000))
-    machines.add("testhost")   # this machine (TTP_HOST)
-    machines.add("box-b")
-    now = time.time()
-    run = {"id": 7, "task": 42, "role": "worker", "started": now - 600}
-    run_dir = env["tmp"] / "run7"
-    run_dir.mkdir()
-
-    def observe(path, at):
-        assert credwatch.observe(p_db, run, [[str(path), "created"]], at, run_dir, "UTC") == 1
-        return p_db.one("SELECT severity, text FROM events WHERE fingerprint=?", (f"credwatch:{path}:{int(at // 60)}",))
-
-    p_db = make(env).db
-    # Entries that do not count: another machine's, one naming only the .pub, one made before the run.
-    ml.add_change("box-b", "new key ~/.ssh/id_ed25519", "rm it", "proj-x", task=9, expires="1d", now=now - 60)
-    ml.add_change("testhost", "copied ~/.ssh/id_ed25519.pub out", "rm it", "proj-x", expires="1d", now=now - 60)
-    ml.add_change("testhost", "new key ~/.ssh/id_ed25519", "rm it", "proj-x", expires="1d", now=now - 3600)
-    row = observe(key, now)
-    assert row["severity"] == "high", row
-    assert "Not seen in this run's commands; another process on the host may have done it" in row["text"], row["text"]
-    assert timefmt.long(1_700_000_000, "UTC") in row["text"], row["text"]
-    # A ledger entry on this machine, made while the run ran, naming the path: normal, naming it.
-    c = ml.add_change("testhost", "new deploy key ~/.ssh/id_ed25519 for a hop", "mv it aside", "proj-x", task=9,
-                      expires="1d", now=now - 120)
-    row = observe(key, now + 60)
-    assert row["severity"] == "normal", row
-    assert f"#{c['id']} by project proj-x task #9" in row["text"] and "no urgent work" in row["text"], row["text"]
-    # Only the change no entry records fails the run's hand-off.
-    assert credwatch.unrecorded([[str(key), "created"], [str(rsa), "changed"]], run["started"], now + 60) == \
-        [[str(rsa), "changed"]]
-    # Another path the entry does not name, written by a command in the transcript: high, quoting its line.
-    lines = [{"type": "system"},
-             {"type": "assistant", "cmd": "ssh-keygen -t ed25519 -N '' -f /tmp/x/k"},    # a scratch key
-             {"type": "assistant", "cmd": "ssh-keygen -l -f ~/.ssh/id_rsa.pub"},         # reads the .pub
-             {"type": "assistant", "cmd": "ssh-keygen -t rsa -N '' -C me"}]
-    (run_dir / "output.jsonl").write_text("".join(json.dumps(x) + "\n" for x in lines))
-    row = observe(rsa, now + 120)
-    assert row["severity"] == "high", row
-    assert "output.jsonl line 4" in row["text"] and "ssh-keygen -t rsa" in row["text"], row["text"]
-    # A line naming the path itself counts too; gh's hosts file goes by gh auth.
-    assert credwatch.transcript_hit(run_dir, str(rsa) + ".pub", str(home))[0] == 3
-    gh = str(home / ".config" / "gh" / "hosts.yml")
-    (run_dir / "output.jsonl").write_text(json.dumps({"cmd": "gh auth status"}) + "\n" +
-                                          json.dumps({"cmd": "gh auth login --with-token"}) + "\n")
-    assert credwatch.transcript_hit(run_dir, gh, str(home))[0] == 2
-
-
 def test_credwatch_a_ctime_only_change_is_metadata_told_at_normal_and_fails_no_run(env, monkeypatch):
     """A chmod of a store (same size, mtime and inode; only ctime moves) is told once at normal severity and
     the run's hand-off stands; a store whose contents change still counts as changed."""
@@ -310,13 +249,20 @@ def _overlap(p, start: float, end: float | None = None) -> int:
                   (other, start, end))
 
 
-def test_credwatch_a_change_seen_by_overlapping_runs_is_told_once_outside_these_runs_and_fails_none(env, monkeypatch):
-    """A store rewritten in place while a run of another project (or another of this project's runs) was open
-    too: no run can be tied to it. It is told once at normal severity as changed outside these runs, and the
-    hand-off stands; the next run that saw the same change adds nothing. A store replaced (new inode) under the
-    same overlap, or rewritten to another size, keeps the high alarm but fails no run; a removal by the run's own command still fails it."""
+def _outside_write(env, text: str, path, name="w.sh"):
+    """A script that writes `text` to `path`: run by the fake agent, its command line does not name the path,
+    as a change made outside the run (the account's user, another process) shows in no transcript."""
+    script = env["tmp"] / name
+    script.write_text(f"sleep 0.05\nprintf {shlex.quote(text)} > {shlex.quote(str(path))}\n")
+    return f"sh {shlex.quote(str(script))}"
+
+
+def test_credwatch_a_change_no_transcript_shows_is_told_once_for_the_host_and_fails_no_run(env, monkeypatch):
+    """A store rewritten by something the run's transcript does not show, while runs of two projects saw it:
+    each hand-off stands, and the host gets one normal observation, with how to record a deliberate change
+    in the ledger. Replaced or removed the same way: high, still no run failed."""
     from ttp import credwatch
-    from ttp.daemon import Daemon
+    from ttp.daemon import Daemon, _cred_changed
     p = make(env)
     other = _second_project(env, "other-proj")
     home = pathlib.Path(os.environ["HOME"])
@@ -327,166 +273,250 @@ def test_credwatch_a_change_seen_by_overlapping_runs_is_told_once_outside_these_
     (env["home"] / "settings.json").write_text(json.dumps({"guards": {"protected_paths": ["~/.config/example-access"]}}))
     _overlap(other, time.time() - 3600)   # another project's run, still open
     other.db.x("UPDATE runs SET ended=NULL")
-    monkeypatch.setenv("TTP_FAKE_SHELL", f"sleep 0.05; printf 't2\\n' > {shlex.quote(str(tok))}")
-    tid = p.db.add_task("work beside the other project", "s", kind="work", tier="light", origin="user")
+    monkeypatch.setenv("TTP_FAKE_SHELL", _outside_write(env, "t2\n", tok))
+    tid = p.db.add_task("work while the user logs in again", "s", kind="work", tier="light", origin="user")
     d = Daemon(p.base)
     d.dispatch()
     _finish_runs(p, d)
-    rows = p.db.q("SELECT severity, text, fingerprint FROM events WHERE fingerprint LIKE 'credwatch:%'")
-    assert len(rows) == 1 and rows[0]["severity"] == "normal" and "outside these runs" in rows[0]["text"], rows
     assert p.db.task(tid)["status"] == "done", p.db.task(tid)["result"]
-    # A second run of this project that saw the same change (same path and new ctime): told once in all.
+    rows = p.db.q("SELECT severity, text FROM events WHERE fingerprint LIKE 'credwatch:%'")
+    assert len(rows) == 1 and rows[0]["severity"] == "normal" and "and not by it" in rows[0]["text"], rows
+    assert "ttp machines change add" in rows[0]["text"] and "--undo 'none: deliberate'" in rows[0]["text"], rows
+    # The other project's run saw the same change (same path and new ctime), its transcript quiet: it ends
+    # with its hand-off standing and tells nothing more for the host.
     run = dict(p.db.one("SELECT * FROM runs WHERE task=?", (tid,)))
     exit_info = json.loads((pathlib.Path(run["dir"]) / "exit.json").read_text())
     assert exit_info["cred_changed"] == [[str(tok), "changed"]]
-    second = dict(run, id=_overlap(p, run["started"] - 10, time.time()), task=None, role="worker")
-    got = d._cred_verdicts(second, exit_info, pathlib.Path(run["dir"]))
-    assert credwatch.observe(p.db, second, exit_info["cred_changed"], time.time() + 120, verdicts=got) == 0
-    assert len(p.db.q("SELECT id FROM events WHERE fingerprint LIKE 'credwatch:%'")) == 1
-    # Replaced (a new inode) under the same overlap: high, but no run fails for it.
-    monkeypatch.setenv("TTP_FAKE_SHELL", f"sleep 0.05; printf 'k\\n' > {shlex.quote(str(tok))}.n && "
-                                         f"mv {shlex.quote(str(tok))}.n {shlex.quote(str(tok))}")
-    swap = p.db.add_task("swap", "s", kind="work", tier="light", origin="user")
-    d.dispatch()
-    _finish_runs(p, d)
-    rows = p.db.q("SELECT severity, text FROM events WHERE fingerprint LIKE 'credwatch:%' ORDER BY id")
-    assert len(rows) == 2 and rows[1]["severity"] == "high" and "outside these runs" in rows[1]["text"], rows
-    assert p.db.task(swap)["status"] == "done"
-    # Rewritten in place to another size (a test value over a login) under the same overlap: high too.
-    monkeypatch.setenv("TTP_FAKE_SHELL", f"sleep 0.05; printf 'longer value\\n' > {shlex.quote(str(tok))}")
-    resize = p.db.add_task("resize", "s", kind="work", tier="light", origin="user")
-    d.dispatch()
-    _finish_runs(p, d)
-    rows = p.db.q("SELECT severity FROM events WHERE fingerprint LIKE 'credwatch:%' ORDER BY id")
-    assert [r["severity"] for r in rows] == ["normal", "high", "high"] and p.db.task(resize)["status"] == "done", rows
-    # Removed by the run's own command (its transcript names the path): the run fails as before.
-    rm = json.dumps({"type": "assistant", "cmd": f"rm {tok}"})
-    monkeypatch.setenv("TTP_FAKE_SHELL", f"echo {shlex.quote(rm)}; rm {shlex.quote(str(tok))}")
-    gone = p.db.add_task("remove", "s", kind="work", tier="light", origin="user")
-    d.dispatch()
-    _finish_runs(p, d)
-    res = json.loads(p.db.task(gone)["result"] or "{}")
-    assert res.get("status") == "failed" and res.get("cred_changed") == [[str(tok), "removed"]], res
+    seen = env["tmp"] / "other-run"
+    seen.mkdir()
+    (seen / "exit.json").write_text(json.dumps(exit_info))
+    (seen / "output.jsonl").write_text(json.dumps({"type": "assistant", "cmd": "pytest -q"}) + "\n")
+    orun = dict(other.db.one("SELECT * FROM runs"), role="worker")
+    got = Daemon(other.base)._cred_verdicts(orun, exit_info, seen)
+    assert credwatch.observe(other.db, orun, exit_info["cred_changed"], time.time() + 120, got, "UTC") == 0
+    assert not other.db.q("SELECT id FROM events WHERE fingerprint LIKE 'credwatch:%'")
+    assert _cred_changed(seen) == []
+    # Replaced (a new inode) or removed by something no transcript shows: high, and no run fails for it.
+    swap, rm = env["tmp"] / "swap.sh", env["tmp"] / "rm.sh"
+    swap.write_text(f"sleep 0.05\nprintf 'k\\n' > {shlex.quote(str(tok))}.n && mv {shlex.quote(str(tok))}.n {shlex.quote(str(tok))}\n")
+    rm.write_text(f"sleep 0.05\nrm {shlex.quote(str(tok))}\n")
+    for shell in (f"sh {shlex.quote(str(swap))}", f"sh {shlex.quote(str(rm))}"):
+        monkeypatch.setenv("TTP_FAKE_SHELL", shell)
+        t = p.db.add_task("swap or remove", "s", kind="work", tier="light", origin="user")
+        d.dispatch()
+        _finish_runs(p, d)
+        assert p.db.task(t)["status"] == "done", p.db.task(t)["result"]
+        rows = p.db.q("SELECT severity FROM events WHERE fingerprint LIKE 'credwatch:%' ORDER BY id")
+        assert rows[-1]["severity"] == "high", rows
+    assert len(p.db.q("SELECT id FROM events WHERE fingerprint LIKE 'credwatch:%'")) == 3
 
 
-def test_credwatch_a_change_only_this_run_was_open_for_still_fails_it_and_a_planted_verdict_excuses_nothing(env, monkeypatch):
-    """The run alone was open when the store changed and its own command names it: it fails, high, even when
-    other runs ended before the change or started after it; a verdict file the agent wrote into its own run
-    dir is overwritten."""
+def test_credwatch_a_run_whose_transcript_runs_gh_auth_refresh_still_fails_beside_open_runs(env, monkeypatch):
+    """Overlapping runs do not excuse a run whose own transcript runs the writer (gh auth refresh): its hand-off
+    is stored failed, with one high observation quoting the line; a verdict file the agent wrote is overwritten."""
     from ttp import credwatch
     from ttp.daemon import Daemon
     p = make(env)
     other = _second_project(env, "other-proj")
-    home = pathlib.Path(os.environ["HOME"])
-    ssh = home / ".ssh"
-    ssh.mkdir(parents=True, exist_ok=True)
-    key = ssh / "id_example"
-    key.write_text("k\n")
-    now = time.time()
-    _overlap(other, now - 7200, now - 3600)   # ended before
-    _overlap(other, now + 3600, now + 7200)   # starts after
-    plant = json.dumps({str(key): ["shared", 0]})
-    mine = json.dumps({"type": "assistant", "cmd": f"mv /tmp/k {key}"})   # the run's own command names it
-    monkeypatch.setenv("TTP_FAKE_SHELL", f"echo {shlex.quote(mine)}; sleep 0.05; printf 'k2\\n' > {shlex.quote(str(key))}.n && "
-                                         f"mv {shlex.quote(str(key))}.n {shlex.quote(str(key))} && "
-                                         f"printf '%s' {shlex.quote(plant)} > \"$TTP_RUN_DIR/{credwatch.VERDICTS}\"")
-    tid = p.db.add_task("rotate a key alone", "s", kind="work", tier="light", origin="user")
-    d = Daemon(p.base)
-    d.dispatch()
-    _finish_runs(p, d)
-    rows = p.db.q("SELECT severity FROM events WHERE fingerprint LIKE 'credwatch:%'")
-    assert [r["severity"] for r in rows] == ["high"], rows
-    res = json.loads(p.db.task(tid)["result"] or "{}")
-    assert res.get("status") == "failed" and res.get("cred_changed") == [[str(key), "changed"]], res
-    # classify() alone: the same change with an open run of another project would be shared.
-    assert credwatch.runs_at(now, [other.state / "project.db"]) == 0
-    _overlap(other, now - 60)
-    other.db.x("UPDATE runs SET ended=NULL WHERE started=?", (now - 60,))
-    assert credwatch.runs_at(now, [other.state / "project.db"]) == 1
-
-
-def test_credwatch_a_change_no_run_command_ties_is_told_and_the_run_goes_on(env, monkeypatch):
-    """Another process on the host (the user's own ssh setup) changes files under a temp HOME's .ssh while a
-    run is open alone, and the run's transcript never names them: the run passes. ssh's client config files
-    and their temp and backup copies (config, site_config, config.tmp.*, config.bak-*, site_config.bak-*) are
-    not watched at all (owner's agent, msg #131): removing them is not even told. A private key replaced the
-    same way stays watched: told high, still failing no run."""
-    from ttp import credwatch
-    from ttp.daemon import Daemon
-    p = make(env)
-    ssh = pathlib.Path(os.environ["HOME"]) / ".ssh"
-    ssh.mkdir(parents=True, exist_ok=True)
-    tmp, bak, key = ssh / "config.tmp.l1Seys", ssh / "config.bak-before-x", ssh / "id_example"
-    side = [ssh / "config", ssh / "site_config", ssh / "site_config.bak-1", ssh / "config~"]
-    for f in (tmp, bak, key, *side):
-        f.write_text("x\n")
-    watched = set(credwatch.guarded_paths({"HOME": str(ssh.parent)}, {}))
-    assert str(key) in watched and not watched & {str(f) for f in (tmp, bak, *side)}, sorted(watched)
-    quoted = " ".join(shlex.quote(str(f)) for f in (tmp, bak, *side))
-    monkeypatch.setenv("TTP_FAKE_SHELL", f"sleep 0.05; rm {quoted}")   # not echoed: no transcript line names them
-    tid = p.db.add_task("work while the user edits ssh config", "s", kind="work", tier="light", origin="user")
-    d = Daemon(p.base)
-    d.dispatch()
-    _finish_runs(p, d)
-    assert p.db.task(tid)["status"] == "done", p.db.task(tid)["result"]
-    rows = p.db.q("SELECT severity, text FROM events WHERE fingerprint LIKE 'credwatch:%' ORDER BY id")
-    assert rows == [], rows
-    monkeypatch.setenv("TTP_FAKE_SHELL", f"sleep 0.05; printf 'k2\\n' > {shlex.quote(str(key))}.n && "
-                                         f"mv {shlex.quote(str(key))}.n {shlex.quote(str(key))}")
-    swap = p.db.add_task("work while a key is replaced", "s", kind="work", tier="light", origin="user")
-    d.dispatch()
-    _finish_runs(p, d)
-    assert p.db.task(swap)["status"] == "done", p.db.task(swap)["result"]
-    rows = p.db.q("SELECT severity, text FROM events WHERE fingerprint LIKE 'credwatch:%' ORDER BY id")
-    assert [r["severity"] for r in rows] == ["high"] and "Not tied to this run's commands" in rows[0]["text"], rows
-    assert all(credwatch._ssh_config_side(str(f)) for f in (tmp, bak, *side))
-    assert not credwatch._ssh_config_side(str(key)) and credwatch.ssh_private("id_example")
-    assert not any(credwatch.ssh_private(f.name) for f in (tmp, bak, *side))
-
-
-def test_credwatch_a_shared_change_still_fails_the_run_whose_own_transcript_writes_that_store(env, monkeypatch):
-    """Two overlapping runs see one change of a made-up key under a temp HOME. The run whose transcript runs a
-    writer for it (ssh-keygen with no scratch -f) fails, high, quoting that line; the other keeps the shared
-    verdict and passes. A transcript naming the path counts too, and one naming another path does not."""
-    from ttp import credwatch
-    from ttp import daemon as dm
-    from ttp.daemon import Daemon
-    p = make(env)
-    other = _second_project(env, "other-proj")
-    home = pathlib.Path(os.environ["HOME"])
-    ssh = home / ".ssh"
-    ssh.mkdir(parents=True, exist_ok=True)
-    key = ssh / "id_example"
-    key.write_text("k1\n")
-    _overlap(other, time.time() - 3600)   # another project's run, still open
+    gh = pathlib.Path(os.environ["XDG_CONFIG_HOME"]) / "gh" / "hosts.yml"
+    gh.parent.mkdir(parents=True, exist_ok=True)
+    gh.write_text("github.com:\n    oauth_token: a\n")
+    monkeypatch.delenv("GH_CONFIG_DIR", raising=False)
+    stub = env["tmp"] / "bin"
+    stub.mkdir()
+    (stub / "gh").write_text(f"#!/bin/sh\nsleep 0.05\nprintf 'github.com:\\n    oauth_token: bb\\n' > {shlex.quote(str(gh))}\n")
+    (stub / "gh").chmod(0o755)
+    _overlap(other, time.time() - 3600)
     other.db.x("UPDATE runs SET ended=NULL")
-    writer = json.dumps({"type": "assistant", "cmd": "ssh-keygen -t ed25519 -N '' -C x"})
-    monkeypatch.setenv("TTP_FAKE_SHELL", f"echo {shlex.quote(writer)}; sleep 0.05; "
-                                         f"printf 'k2\\n' > {shlex.quote(str(key))}")
-    tid = p.db.add_task("write a key beside the other project", "s", kind="work", tier="light", origin="user")
+    plant = json.dumps({str(gh): ["outside", 0, ""]})
+    monkeypatch.setenv("TTP_FAKE_SHELL", f"{shlex.quote(str(stub))}/gh auth refresh -s read:org && "
+                                         f"printf '%s' {shlex.quote(plant)} > \"$TTP_RUN_DIR/{credwatch.VERDICTS}\"")
+    tid = p.db.add_task("refresh the gh login", "s", kind="work", tier="light", origin="user")
     d = Daemon(p.base)
     d.dispatch()
     _finish_runs(p, d)
-    run = dict(p.db.one("SELECT * FROM runs WHERE task=?", (tid,)))
-    assert credwatch.transcript_hit(run["dir"], str(key), str(home)), "the writer line reached output.jsonl"
-    assert credwatch.held(run["dir"]) == {}
+    assert gh.read_text().endswith("bb\n")
     res = json.loads(p.db.task(tid)["result"] or "{}")
-    assert res.get("status") == "failed" and res.get("cred_changed") == [[str(key), "changed"]], res
+    assert res.get("status") == "failed" and res.get("cred_changed") == [[str(gh), "changed"]], res
     rows = p.db.q("SELECT severity, text FROM events WHERE fingerprint LIKE 'credwatch:%'")
-    assert len(rows) == 1 and rows[0]["severity"] == "high" and "ssh-keygen -t ed25519" in rows[0]["text"], rows
-    # The other run that saw the same change, with a transcript that does not write it: shared, no failure.
-    exit_info = json.loads((pathlib.Path(run["dir"]) / "exit.json").read_text())
-    quiet = env["tmp"] / "quiet-run"
-    quiet.mkdir()
-    (quiet / "output.jsonl").write_text(json.dumps({"cmd": f"cat {ssh}/id_example.pub"}) + "\n")
-    (quiet / "exit.json").write_text(json.dumps(exit_info))
-    second = dict(run, id=_overlap(p, run["started"] - 10, time.time()), task=None, role="worker", dir=str(quiet))
-    got = d._cred_verdicts(second, exit_info, quiet)
-    assert got.get(str(key), [None])[0] == "shared" and dm._cred_changed(quiet) == [], got
-    # A third whose transcript names the path itself fails as well.
-    named = env["tmp"] / "named-run"
-    named.mkdir()
-    (named / "output.jsonl").write_text(json.dumps({"cmd": "cp /tmp/k ~/.ssh/id_example"}) + "\n")
-    (named / "exit.json").write_text(json.dumps(exit_info))
-    third = dict(second, id=_overlap(p, run["started"] - 10, time.time()), dir=str(named))
-    assert d._cred_verdicts(third, exit_info, named) == {} and dm._cred_changed(named) == [[str(key), "changed"]]
+    assert len(rows) == 1 and rows[0]["severity"] == "high" and "gh auth refresh" in rows[0]["text"], rows
+    assert "output.jsonl line 1" in rows[0]["text"], rows
+
+
+def test_credwatch_open_run_rows_stale_or_live_never_change_a_verdict(env, monkeypatch):
+    """Another project's open run row, whether from an earlier boot, with a dead pid or live on this boot, neither
+    excuses a run whose own transcript writes a store nor fails a run for a change it did not make."""
+    from ttp import runner
+    from ttp.daemon import Daemon
+    p = make(env)
+    other = _second_project(env, "other-proj")
+    gh = pathlib.Path(os.environ["XDG_CONFIG_HOME"]) / "gh" / "hosts.yml"
+    gh.parent.mkdir(parents=True, exist_ok=True)
+    gh.write_text("github.com:\n    oauth_token: a\n")
+    monkeypatch.delenv("GH_CONFIG_DIR", raising=False)
+    stub = env["tmp"] / "bin"
+    stub.mkdir()
+    (stub / "gh").write_text(f"#!/bin/sh\nsleep 0.05\nprintf 'github.com:\\n    oauth_token: bb\\n' > {shlex.quote(str(gh))}\n")
+    (stub / "gh").chmod(0o755)
+    otask = other.db.add_task("other run", "s", kind="work", tier="light", origin="user")
+    d = Daemon(p.base)
+    for boot, pid in (("boot-earlier-0001", os.getpid()), (runner.boot_id(), 4_000_000), (runner.boot_id(), os.getpid())):
+        other.db.x("DELETE FROM runs")
+        other.db.x("INSERT INTO runs(task, role, started, ended, status, pid, boot_id) VALUES(?, 'worker', ?, NULL, "
+                   "'running', ?, ?)", (otask, time.time() - 3600, pid, boot))
+        monkeypatch.setenv("TTP_FAKE_SHELL", f"{shlex.quote(str(stub))}/gh auth refresh -s read:org")
+        own = p.db.add_task("refresh the gh login", "s", kind="work", tier="light", origin="user")
+        d.dispatch()
+        _finish_runs(p, d)
+        res = json.loads(p.db.task(own)["result"] or "{}")
+        assert res.get("status") == "failed" and res.get("cred_changed") == [[str(gh), "changed"]], (boot, pid, res)
+        monkeypatch.setenv("TTP_FAKE_SHELL", _outside_write(env, f"github.com:\n    oauth_token: {pid}\n", gh))
+        outside = p.db.add_task("work while the user logs in again", "s", kind="work", tier="light", origin="user")
+        d.dispatch()
+        _finish_runs(p, d)
+        assert p.db.task(outside)["status"] == "done", (boot, pid, p.db.task(outside)["result"])
+
+
+def test_credwatch_classify_ledger_transcript_and_outside_verdicts(env, monkeypatch):
+    """classify(): a change the machine's change ledger records as made while the run ran is `ledger`
+    (normal, naming the entry); one the run's transcript shows is `run` (the only verdict that fails),
+    quoting the line; with neither it is `outside`. Entries of another machine, naming only the .pub or made
+    before the run do not count; a scratch or read-only ssh-keygen is no writer."""
+    from ttp import credwatch, machines
+    from ttp import machine_ledger as ml
+    home = env["tmp"] / "acct"
+    monkeypatch.setenv("HOME", str(home))
+    key, rsa = home / ".ssh" / "id_ed25519", home / ".ssh" / "id_rsa"
+    key.parent.mkdir(parents=True)
+    machines.add("testhost")   # this machine (TTP_HOST)
+    machines.add("box-b")
+    now = time.time()
+    run_dir = env["tmp"] / "run7"
+    run_dir.mkdir()
+    ch = [[str(key), "created"], [str(rsa), "changed"]]
+    ml.add_change("box-b", "new key ~/.ssh/id_ed25519", "rm it", "proj-x", task=9, expires="1d", now=now - 60)
+    ml.add_change("testhost", "copied ~/.ssh/id_ed25519.pub out", "rm it", "proj-x", expires="1d", now=now - 60)
+    ml.add_change("testhost", "new key ~/.ssh/id_ed25519", "rm it", "proj-x", expires="1d", now=now - 3600)
+    got = credwatch.classify(ch, {}, now - 600, now, run_dir, str(home))
+    assert [v[0] for v in got.values()] == ["outside_alarm", "outside_alarm"] and not credwatch.excused(got) ^ {str(key), str(rsa)}
+    c = ml.add_change("testhost", "new deploy key ~/.ssh/id_ed25519 for a hop", "mv it aside", "proj-x", task=9,
+                      expires="1d", now=now - 120)
+    lines = [{"type": "system"},
+             _bash("ssh-keygen -t ed25519 -N '' -f /tmp/x/k"),    # a scratch key
+             _bash("ssh-keygen -l -f ~/.ssh/id_rsa.pub"),         # reads the .pub
+             _bash("ssh-keygen -t rsa -N '' -C me")]
+    (run_dir / "output.jsonl").write_text("".join(json.dumps(x) + "\n" for x in lines))
+    got = credwatch.classify(ch, {}, now - 600, now, run_dir, str(home))
+    assert got[str(key)][0] == "ledger" and f"#{c['id']} by project proj-x task #9" in got[str(key)][2], got
+    assert got[str(rsa)][0] == credwatch.FAILS and "output.jsonl line 4" in got[str(rsa)][2], got
+    assert credwatch.excused(got) == {str(key)}
+    run = {"id": 7, "task": 42, "role": "worker", "started": now - 600}
+    db = make(env).db
+    assert credwatch.observe(db, run, ch, now, got, "UTC") == 2
+    rows = db.q("SELECT severity, text FROM events WHERE fingerprint LIKE 'credwatch:%' ORDER BY severity")
+    assert [r["severity"] for r in rows] == ["high", "normal"], rows
+    assert "ssh-keygen -t rsa" in rows[0]["text"] and "stored failed" in rows[0]["text"], rows
+    assert "no urgent work" in rows[1]["text"] and "proj-x" in rows[1]["text"], rows
+    # Reading the .pub (cat, line 1) is no write; copying over it is. gh's hosts file goes by gh auth login, not status.
+    (run_dir / "output.jsonl").write_text(json.dumps(_bash("cat ~/.ssh/id_rsa.pub")) + "\n" +
+                                          json.dumps(_bash("cp /tmp/x/k.pub ~/.ssh/id_rsa.pub")) + "\n")
+    assert credwatch.transcript_hit(run_dir, str(rsa) + ".pub", str(home))[0] == 2
+    gh = str(home / ".config" / "gh" / "hosts.yml")
+    (run_dir / "output.jsonl").write_text(json.dumps(_bash("gh auth status")) + "\n" +
+                                          json.dumps(_bash("gh auth login --with-token")) + "\n")
+    assert credwatch.transcript_hit(run_dir, gh, str(home))[0] == 2
+
+
+def _bash(cmd: str) -> dict:
+    """A Claude stream-json event issuing `cmd` through the Bash tool."""
+    return {"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Bash", "input": {"command": cmd}}]}}
+
+
+def _cred_said(text: str, kind: str = "tool_result") -> dict:
+    """A Claude stream-json event carrying `text` as tool output (or the assistant's own text)."""
+    if kind == "text":
+        return {"type": "assistant", "message": {"content": [{"type": "text", "text": text}]}}
+    return {"type": "user", "message": {"content": [{"type": "tool_result", "content": text}]}}
+
+
+def test_credwatch_tool_output_text_and_reads_of_a_store_fail_no_run_and_issued_writes_do(env, monkeypatch):
+    """Only a command or file edit the run itself issued attributes a change to it, and only where it writes the
+    path: gh's 'Failed to log in ... run gh auth login' output after an outside gh auth refresh, ssh -i <key> and a
+    grep of docs quoting gh auth refresh are `outside`, in every provider's format; writes the run issues fail."""
+    from ttp import credwatch
+    home = env["tmp"] / "acct"
+    monkeypatch.setenv("HOME", str(home))
+    gh, key = str(home / ".config" / "gh" / "hosts.yml"), str(home / ".ssh" / "id_ed25519")
+    run_dir = env["tmp"] / "run8"
+    run_dir.mkdir()
+    now = time.time()
+
+    def verdict(events, path):
+        (run_dir / "output.jsonl").write_text("".join(json.dumps(e) + "\n" for e in events))
+        return credwatch.classify([[path, "changed"]], {}, now - 600, now, run_dir, str(home))[path][0]
+
+    quiet = {
+        gh: [_bash("gh pr list"),
+             _cred_said(f"Failed to log in to github.com using token ({gh})\n- To re-authenticate, run: gh auth login"),
+             _cred_said("The gh login was changed; run `gh auth refresh -s read:org` to fix it.", "text"),
+             _bash("grep -rn 'gh auth' docs/"), _cred_said("docs/setup.md:12: gh auth refresh -s read:org"),
+             _bash(f"gh auth status; cat {gh} | wc -l"), _bash("git config --get credential.helper")],
+        key: [_bash("ssh -i ~/.ssh/id_ed25519 box hostname"), _bash(f"ssh-keygen -y -f {key} > /tmp/x/k.pub"),
+              _bash("cp ~/.ssh/id_ed25519 /tmp/x/bak"), _cred_said(f"ssh-keygen -t ed25519 -f {key}")],
+    }
+    for path, events in quiet.items():
+        assert verdict(events, path).startswith("outside"), (path, credwatch.transcript_hit(run_dir, path, str(home)))
+    writes = {
+        gh: [_bash("gh auth refresh -s read:org"), _bash(f"echo x > {gh}"), _bash("sed -i s/a/b/ ~/.config/gh/hosts.yml"),
+             _bash("printf x | tee $HOME/.config/gh/hosts.yml"),
+             {"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Edit",
+                                                            "input": {"file_path": gh, "old_string": "a"}}]}},
+             {"type": "item.completed", "item": {"type": "command_execution", "command": "gh auth switch"}},   # Codex
+             {"type": "tool_call", "tool_call": {"shellToolCall": {"args": {"command": f"rm -f {gh}"}}}},   # Cursor
+             {"ok": True, "_shell": f"mv /tmp/h.yml {gh}"}],   # the fake provider
+        key: [_bash("ssh-keygen -t rsa -N '' -C me"), _bash(f"ssh-keygen -t ed25519 -N '' -f {key}"),
+              _bash("chmod 644 ~/.ssh/id_ed25519"), _bash("cp /tmp/x/k ~/.ssh/id_ed25519")],
+    }
+    for path, events in writes.items():
+        for e in events:
+            assert verdict([_cred_said("ok"), e], path) == credwatch.FAILS, (path, e)
+            assert credwatch.transcript_hit(run_dir, path, str(home))[0] == 2
+
+
+def test_credwatch_writer_counts_only_at_command_position_never_inside_an_argument(env, monkeypatch):
+    """A writer phrase (gh auth refresh, ssh-keygen -t rsa, git credential approve) inside a grep pattern, a commit
+    message, a heredoc only cat reads or a pytest -k argument is no command: `outside`. The same phrase run as a
+    command, bare, behind sudo, env, cd ... &&, bash -c or a heredoc fed to a shell, fails the run."""
+    from ttp import credwatch
+    home = env["tmp"] / "acct"
+    monkeypatch.setenv("HOME", str(home))
+    gh, key = str(home / ".config" / "gh" / "hosts.yml"), str(home / ".ssh" / "id_ed25519")
+    netrc = str(home / ".git-credentials")
+    run_dir = env["tmp"] / "run9"
+    run_dir.mkdir()
+    now = time.time()
+
+    def verdict(cmd, path):
+        (run_dir / "output.jsonl").write_text(json.dumps(_cred_said("ok")) + "\n" + json.dumps(_bash(cmd)) + "\n")
+        return credwatch.classify([[path, "changed"]], {}, now - 600, now, run_dir, str(home))[path][0]
+
+    phrase = "gh auth refresh; ssh-keygen -t rsa; git credential approve; git config credential.helper store"
+    quiet = [f"grep -rn '{phrase}' docs/", f'git commit -q -m "docs: {phrase}"',
+             "cat > /tmp/x/notes.md <<'EOF'\n" + phrase.replace("; ", "\n") + "\nEOF",
+             "python3 -m pytest -q tests/ -k 'ssh-keygen or gh auth refresh or credential approve'",
+             "python3 - <<'EOF'\nimport subprocess\nsubprocess.run('gh auth refresh', shell=True)\nEOF",
+             f'git commit -m "a; rm {key}; echo > {gh}"', f"grep -n '> {gh}' notes.md"]
+    kept = ["git config --get credential.helper", "ssh-keygen -t ed25519 -N '' -f \"$(mktemp -d)/k\""]   # stay quiet
+    hit = [(cmd, path) for cmd in quiet + kept for path in (gh, key, netrc)
+           if not verdict(cmd, path).startswith("outside") or credwatch.transcript_hit(run_dir, path, str(home))]
+    assert not hit, hit
+    writes = {gh: ["gh auth refresh", "sudo gh auth refresh -s read:org", "env A=1 gh auth login --with-token < t",
+                   "bash -c 'gh auth refresh'", "bash <<EOF\ngh auth login\nEOF", f"echo x > {gh}",
+                   "cd /tmp && gh auth switch"],
+              key: ["ssh-keygen -t rsa", "cd /tmp/x && ssh-keygen -t rsa -N ''", "sudo -u me ssh-keygen -t ed25519"],
+              netrc: ["git -C repo credential approve < c", "git config --global credential.helper store",
+                      "printf 'url=x\\n' | git credential-store store"]}
+    for path, cmds in writes.items():
+        for cmd in cmds:
+            assert verdict(cmd, path) == credwatch.FAILS, (path, cmd)
+            assert credwatch.transcript_hit(run_dir, path, str(home))[0] == 2

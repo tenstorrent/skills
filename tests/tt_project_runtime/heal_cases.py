@@ -3309,11 +3309,12 @@ def test_project_machines_skip_an_alias_the_resources_section_only_prohibits(env
     # An alias named both ways counts; one named only in another section does not.
     assert ml.charter_machines(charter.format("Machines: box-a, box-c. Never reset box-c."),
                                known) == ["box-a", "box-c"]
-    # An explicit allowlist in the config wins over the charter text.
-    text = charter.format("Machines: box-a, box-b.")
-    assert ml.project_machines(text, {"shared_resources": ["box-d-device"]}, known) == ["box-d"]
-    assert ml.project_machines(text, {"resources": {"box-b-device": 1}}, known) == ["box-b"]
-    assert ml.project_machines(text, {"resources": {"device": 1}, "shared_resources": "box-d"}, known) == ["box-a", "box-b"]
+    # A project's machines come from its config alone (charterset moved the charter's list there once).
+    assert ml.project_machines({"shared_resources": ["box-d-device"]}, known) == ["box-d"]
+    assert ml.project_machines({"resources": {"box-b-device": 1}}, known) == ["box-b"]
+    assert ml.project_machines({"resources": {"device": 1}, "shared_resources": "box-d"}, known) == []
+    assert ml.project_machines({"machines": {"allowed": ["box-a", "box-b"]}, "shared_resources": ["box-d"]},
+                               known) == ["box-a", "box-b", "box-d"]
     # End to end: health coverage and `machines status` leave out the project that only prohibits it.
     mm.add("box-a", tags="device")
     mm.add("box-c", tags="device")
@@ -3324,9 +3325,49 @@ def test_project_machines_skip_an_alias_the_resources_section_only_prohibits(env
     main(["machines", "status", "box-c", "--json"])
     assert json.loads(capsys.readouterr().out)[0]["projects"] == ["gamma"]
     me.set_config("shared_resources", ["box-c-device"])
-    assert ml.resource_machines(me) == ["box-c"]
+    assert ml.resource_machines(me) == ["box-a", "box-c"]
     main(["machines", "status", "box-c", "--json"])
     assert sorted(json.loads(capsys.readouterr().out)[0]["projects"]) == sorted([me.name, "gamma"])
+
+
+def test_charter_settings_move_into_config_once_and_never_widen_access(env):
+    """charterset moves the charter's Resources machines and branches into the config once: the same
+    lists the old prose readers returned, nothing more (no push branch, no retired or unlisted
+    machine, nothing when the config already names machines), and rewording, reordering or deleting
+    the charter text afterwards changes none of what the gates read."""
+    from ttp import charterset
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    from ttp import worktree as wt
+    mm.add("box-a", tags="device")
+    mm.add("box-b", tags="device,decommissioned")
+    mm.add("box-c", tags="device")
+    p = make(env)
+    text = ("Machines: box-a, box-b, box-z. No authorization for box-c.\n"
+            "Repo: work on branch `team/work`, never branch main.")
+    _resources_text = p.charter_path.read_text().replace("## Resources\n", f"## Resources\n{text}\n", 1)
+    p.charter_path.write_text(_resources_text)
+    old = ml.charter_machines(_resources_text, ml.live_machines(mm.load()))
+    assert ml.resource_machines(p) == [], "the charter's prose alone names no machine"
+    wrote = charterset.migrate(p)
+    assert wrote["machines.allowed"] == old == ["box-a"], "the old parser's list: not box-b (retired), box-c or box-z"
+    assert "delivery.push_branch" not in wrote and not (p.raw_config().get("delivery") or {}).get("push_branch")
+    assert wrote.get("worktree.shared_branches") == ["team/work"], "a branch that does not exist is no base"
+    assert ml.resource_machines(p) == ["box-a"]
+    before = (ml.resource_machines(p), wt.base_ref(p), wt._shared_branches(p), p.raw_config())
+    for edit in (lambda t: t.replace(text, "Use box-c and box-a on branch `other/one`."),
+                 lambda t: t.replace("## Resources", "## Old resources"), lambda t: t.replace(text, "")):
+        p.charter_path.write_text(edit(_resources_text))
+        assert charterset.migrate(p) == {}, "once only"
+        assert (ml.resource_machines(p), wt.base_ref(p), wt._shared_branches(p), p.raw_config()) == before
+    p.unset_config("machines.allowed")   # reverting it holds: the charter never fills it again
+    assert charterset.migrate(p) == {} and ml.resource_machines(p) == []
+    # A config that already names machines keeps them alone, as the old reader did.
+    q = _second_project(env, "gamma")
+    q.charter_path.write_text(_resources_text)
+    q.set_config("shared_resources", ["box-c-device"])
+    assert "machines.allowed" not in charterset.plan(q, _resources_text, mm.load())
+    assert ml.resource_machines(q) == ["box-c"]
 
 
 def test_project_machines_and_idle_capacity_skip_retired_machines(env):
@@ -3339,9 +3380,9 @@ def test_project_machines_and_idle_capacity_skip_retired_machines(env):
     listed = charter.format("Machines: box-a, box-b, box-c.")
     known = {"box-a": {"tags": ["device"]}, "box-b": {"tags": ["device", "decommissioned"]},
              "box-c": {"tags": ["device"], "note": "Decommissioned last month. Do not use."}}
-    assert ml.project_machines(listed, {}, known) == ["box-a"]
-    # A config naming only retired machines names none, so the charter's live ones stand.
-    assert ml.project_machines(listed, {"shared_resources": ["box-b-device", "box-c"]}, known) == ["box-a"]
+    allowed = {"machines": {"allowed": ["box-a", "box-b", "box-c"]}}
+    assert ml.project_machines(allowed, known) == ["box-a"]
+    assert ml.project_machines({"shared_resources": ["box-b-device", "box-c"]}, known) == []
     for note, gone in (("Do not use", True), ("do not use.", True), ("Don't use this box!", True),
                        ("Retired", True), ("Do not use for builds; device runs only", False),
                        ("not retired", False), ("build box", False), ("Not yet decommissioned", False),
@@ -3377,7 +3418,7 @@ def test_project_machines_and_idle_capacity_skip_retired_machines(env):
         assert got == want, (line, got)
     # Idle capacity: neither a retired machine nor its `<alias>-device` resource is a candidate.
     cfg = {"shared_resources": ["box-b-device", "box-a-device"]}
-    assert idlecap.candidates(cfg, {"box-c-device"}, ml.project_machines(listed, {}, known), known) == {"box-a-device"}
+    assert idlecap.candidates(cfg, {"box-c-device"}, ml.project_machines(allowed, known), known) == {"box-a-device"}
     assert idlecap.candidates({}, set(), ["box-a", "box-b", "box-c"], known) == {"box-a"}
 
 

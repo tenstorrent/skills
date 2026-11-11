@@ -11,10 +11,10 @@ def _rp_promise(p, tid, chat, text, now):
     return next(o for o in ob.open_promises(p.db) if mid == o["promise"]["message"])
 
 
-def _rp_setup(env, monkeypatch):
+def _rp_setup(env, monkeypatch, now=None):
     from ttp import obligations as ob
     p = make(env)
-    now = time.time()
+    now = time.time() if now is None else now
     tid = p.db.add_task("merge the release", "s", kind="work", priority=2, reply_chat="c1")
     other = p.db.add_task("unrelated", "s", kind="work", priority=3)
     o = _rp_promise(p, tid, "c1", "I'll post the merged result here.", now)
@@ -135,11 +135,15 @@ def test_replan_reply_with_a_new_time_and_no_plan_change_is_flagged(env, monkeyp
 def test_replan_daily_review_metric(env, monkeypatch):
     """The audit's `missed promises` line counts the missed, the missed twice, the moves after a miss with
     no plan change (target 0) and the median lateness; nothing missed shows no line."""
+    from datetime import datetime, timezone
     from ttp import audit, coordinator as coord, replan
-    p, ob, oid, tid, other, late = _rp_setup(env, monkeypatch)
+    # Pinned so the miss lands at 23:47 UTC: a bare '23:59' reply would itself be a promise missed by the
+    # last check, so the reply names a relative time that holds at any time of day.
+    now = datetime(2026, 1, 5, 17, 37, tzinfo=timezone.utc).timestamp()
+    p, ob, oid, tid, other, late = _rp_setup(env, monkeypatch, now)
     assert replan.audit_line(p.db, late - 86400, late) == ""
     ob.check(p, late)
-    coord.apply(p, [{"type": "reply", "chat": "c1", "text": "I'll have it merged by 23:59."}])
+    coord.apply(p, [{"type": "reply", "chat": "c1", "text": "I'll have it merged in 3 hours."}])
     assert coord.apply(p, [{"type": "task_update", "id": tid, "priority": 1},
                            {"type": "obligation", "key": oid, "due": late + 3600}]) == []
     ob.check(p, late + 3700)

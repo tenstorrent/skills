@@ -214,6 +214,32 @@ def test_replies_and_notifies_to_the_user_go_out_untagged_while_posts_to_others_
     assert "Posts others (not the user) read end with `[authored by AI]`" in worker
 
 
+
+def test_text_for_other_people_answers_what_was_asked_in_one_shared_wording(env):
+    """User msgs #2465, #2466: posts and post-ready drafts for people other than the user answer what
+    was asked like a colleague and leave out side details; numbers and lists stay allowed when relevant, so
+    there is no sentence cap. One wording in the worker prompt, both coordinator modes and the relay
+    skill, next to the tag rule it leaves as it was; guidance only, no gate checks a post's length."""
+    from ttp import aitag
+    from ttp.prompts import coordinator_role, coordinator_session_role
+    rule = ("answer what was asked, first and plainly, like a colleague; skip side details the reader can "
+            "live without (numbers, lists or internal ids only when they bear on the question or the reader "
+            "needs them to act)")
+    plugin = pathlib.Path(aitag.__file__).parents[2]
+    p = make(env)
+    texts = {"stateless": coordinator_role(p), "session": coordinator_session_role(p),
+             "worker": (plugin / "template" / "prompts" / "worker.md").read_text(),
+             "relay skill": (plugin / "skills" / "tt-project" / "SKILL.md").read_text(),
+             "guide": (plugin / "docs" / "guide.md").read_text()}
+    for name, text in texts.items():
+        flat = " ".join(text.split())
+        assert flat.count(rule) == 1, name
+        assert "sentences" not in flat[flat.index(rule) - 200:][:500], name
+    for name in ("stateless", "session"):
+        assert "Posts and drafts people other than the user read" in texts[name] and texts[name].count("AI-authorship tag") == 1
+    assert "post-ready draft you post" in " ".join(texts["relay skill"].split())
+    assert "Posts others (not the user) read end with `[authored by AI]`" in texts["worker"]
+
 def test_gh_close_comments_release_notes_and_more_api_posts_need_the_ai_tag(env, tmp_path):
     from ttp import prguard
     p = make(env)

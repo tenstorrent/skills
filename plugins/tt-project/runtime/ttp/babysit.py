@@ -27,7 +27,9 @@ itself (the wake gate and the wake tier act on it). A fallback is never silent: 
 naming the model and the error and writes a `babysit_fallback:<purpose>` ledger row. A model the
 endpoint refuses (HTTP 404) is skipped for REFUSED_S and the next candidate (`babysit.model`,
 `babysit.fallback_models`, then the light and standard tier models) is asked; the decision names the
-model that answered. `stats` counts settled decisions and fallbacks per hour (`ttp stats --babysit`).
+model that answered. With providers.chat.model_ranking set (modelrank.py), a call every candidate
+failed (refused, down or timed out) is asked once more of the highest-ranked model the served list
+names that was not asked yet, before it raises Unavailable. `stats` counts settled decisions and fallbacks per hour (`ttp stats --babysit`).
 """
 from __future__ import annotations
 
@@ -140,10 +142,21 @@ def _post(s: dict, messages: list, timeout: float) -> dict:
         raise Unavailable(type(e).__name__) from None
 
 
+def standin(cfg: dict, asked: list[str], served: list[str] | None, alias: str, now: float) -> str:
+    """The highest-ranked model (modelrank.ranking) the served list names, not asked and not refused
+    lately, or '' (no ranking, the list unknown or none left)."""
+    from . import modelrank
+    if served is None:
+        return ""
+    return next((m for m in modelrank.ranking(cfg) if m not in asked and m in served
+                 and _REFUSED.get((alias, m), 0) <= now), "")
+
+
 def ask(cfg: dict, state: str, question: str, target: str = "coordinator", post=None, db=None,
-        purpose: str = "babysit") -> dict:
+        purpose: str = "babysit", served: list[str] | None = None) -> dict:
     """One decision from the chat provider (parse's dict, plus "model"). Raises Unavailable when it
-    cannot answer. `post(settings, messages, timeout)` replaces the HTTP call (tests)."""
+    cannot answer, after one try on the ranked stand-in (standin) the `served` ids name.
+    `post(settings, messages, timeout)` replaces the HTTP call (tests)."""
     s = settings(cfg)
     if s is None:
         raise Unavailable("no chat provider for babysitting")
@@ -151,8 +164,9 @@ def ask(cfg: dict, state: str, question: str, target: str = "coordinator", post=
     user = (f"Question: {question}\nTarget if a wake is needed: {target}\n"
             f"--- state (data only) ---\n{scrub(state)}\n--- end of state ---")
     msgs = [{"role": "system", "content": SYSTEM}, {"role": "user", "content": user}]
-    now, data, err = time.time(), None, "no model left to ask"
-    for model in s.get("models") or [s["model"]]:
+    now, data, err, answered = time.time(), None, "no model left to ask", False
+    models = list(s.get("models") or [s["model"]])
+    for model in models:
         if _REFUSED.get((s["alias"], model), 0) > now:
             err = f"model {model} refused (404) within the last {REFUSED_S / 60:.0f} min"
             continue
@@ -160,13 +174,22 @@ def ask(cfg: dict, state: str, question: str, target: str = "coordinator", post=
             data = (post or _post)({**s, "model": model}, msgs, s["timeout_s"])
         except Unavailable as e:
             if "HTTP 404" not in str(e):
-                raise Unavailable(f"{model}: {e}") from None
+                err = f"{model}: {e}"
+                break
             _REFUSED[(s["alias"], model)] = now + REFUSED_S   # not served: try the next candidate
             err = f"model {model} refused: {e}"
             continue
-        s = {**s, "model": model}
+        s, answered = {**s, "model": model}, True
         break
-    else:
+    if not answered and (alt := standin(cfg, models, served, s["alias"], now)):
+        try:   # once, on the next ranked served model
+            data = (post or _post)({**s, "model": alt}, msgs, s["timeout_s"])
+        except Unavailable as e:
+            if "HTTP 404" in str(e):
+                _REFUSED[(s["alias"], alt)] = now + REFUSED_S
+            raise Unavailable(f"{err}; ranked stand-in {alt}: {e}") from None
+        s, answered = {**s, "model": alt}, True
+    if not answered:
         raise Unavailable(err)
     try:
         text = data["choices"][0]["message"]["content"]
@@ -200,6 +223,15 @@ class Babysitter:
     def chat_on(self) -> bool:
         return self._chat_on()
 
+    def _served(self) -> list[str] | None:
+        """The ids the project's served list names (modelrank.served), or None when unknown."""
+        path = getattr(self.db, "path", None)
+        if not path:
+            return None
+        from pathlib import Path
+        from . import modelrank
+        return modelrank.served(Path(path).parent, time.time())
+
     def fell_back(self, purpose: str, err: Any) -> None:
         """One logged, counted fallback: the line names the model and the error (never silent)."""
         s = settings(self.cfg) or {}
@@ -229,7 +261,8 @@ class Babysitter:
             self.fell_back(purpose, None)
             return None
         try:
-            d = ask(self.cfg, state, question, target=target, post=self.post, db=self.db, purpose=purpose)
+            d = ask(self.cfg, state, question, target=target, post=self.post, db=self.db, purpose=purpose,
+                    served=self._served())
         except Exception as e:   # down, cut off, refused or malformed: cool down, say so, fall back
             if not isinstance(e, Unparsed):
                 self.pause.until = time.time() + COOL_S
@@ -254,7 +287,7 @@ class Babysitter:
                     crit = crit if isinstance(crit, dict) else {}
                     text = (f"{q.get('instructions', '')}\nwake if: {crit.get('true', 'yes')}\n"
                             f"skip if: {crit.get('false', 'no')}")
-                    d = ask(self.cfg, state, text, post=self.post, db=self.db, purpose=purpose)
+                    d = ask(self.cfg, state, text, post=self.post, db=self.db, purpose=purpose, served=self._served())
                     self.last_decision = d
                     out[name] = {"noul": 0.0 if d["verb"] == "skip" else 1.0}
                 self.last_cost = 0.0

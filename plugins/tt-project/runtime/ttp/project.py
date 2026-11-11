@@ -159,9 +159,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
                 # rules (job, lock, checks or push still pending; same probe answer) then Jev, and re-defers
                 # with a doubling backoff instead of a model turn that would only hand the wait back. Any
                 # event wakes at once; max_skips skips in a row or max_skip_h hours since the last turn
-                # force the wake. enabled false: every wake starts a turn, as before
-                "wake_gate": {"enabled": True, "max_skips": 4, "max_skip_h": 4.0, "backoff_s": 600,
-                              "max_backoff_s": 3600, "jev_skip_below": 0.25},
+                # re-ask the watcher (no answer wakes), and cap_hard_h hours force the wake. enabled
+                # false: every wake starts a turn, as before
+                "wake_gate": {"enabled": True, "max_skips": 4, "max_skip_h": 4.0, "cap_hard_h": 24.0,
+                              "backoff_s": 600, "max_backoff_s": 3600, "jev_skip_below": 0.25},
                 # every task that could start waits on hosts this machine cannot reach (probe exit 255),
                 # nothing runs: one normal alert this long into the outage (0: never); the outage ends
                 # once no probe has said unreachable for the debounce (netwait.py). Hosts whose ssh route
@@ -205,6 +206,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # in the lock order a lock-cycle alert checks, beside the words of lockcycle.WIDE_WORDS.
     "locks": {"pre_grant_check": "", "pre_grant_timeout_s": 10, "wait_alert_min": 30, "wide": []},
     "shared_resources": [],             # resources whose slots and pause all the user's projects share
+    # Machines in the user's list (ttp machines) this project uses, beside those its resources and
+    # shared_resources name: the change ledger, health coverage and idle capacity read only these.
+    "machines": {"allowed": []},
     # model / effort, when set, override the coordinator's defaults. Unset, every coordinator turn
     # runs at coordinator.DEFAULT_EFFORT (xhigh, or the provider's highest effort below it) on
     # model_tier's model: the strongest tier's ("deep", read from the provider's tier table; "" = its
@@ -365,8 +369,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
                     "conclusion_floor": {"tier": "standard", "effort": "high"}},
     "notify": {"slack": False, "slack_min_severity": "high", "chat_min_severity": "normal"},
     # gone_after_s: a relay chat with no `ttp listen` running that left a message unread this long
-    # stops counting as a reader of asks and alerts until it reads again (chatgone.py).
-    "relay": {"gone_after_s": 86400},
+    # stops counting as a reader of asks and alerts until it reads again (chatgone.py). batch_s:
+    # `ttp listen` holds broadcast alerts this long to print them together; lease_s: another relayer
+    # is refused a chat id whose relayer listened this recently (relayers.py).
+    "relay": {"gone_after_s": 86400, "batch_s": 120, "lease_s": 600},
     # code_tasks_may_push: a code task whose spec asks it to land on delivery.push_branch may run
     # `ttp push` itself, so no separate landing task is needed. Off: only review tasks push.
     # drafts_during_freeze: opening and updating draft PRs needs no ask even under a code freeze.
@@ -454,8 +460,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # reused, a half-made one remade); then the task is queued again create_retries times, after
     # retry_backoff_s (doubling), before it is blocked for the coordinator. root_branch: the branch the
     # project root's checkout belongs on (unset: the one the daemon last saw it on); a root left
-    # detached or off it is put back when clean, else alerted, and never branched from.
-    "worktree": {"venv": "auto", "link_paths": [".venv"], "kinds": [], "root_branch": "", "git_timeout_s": 120,
+    # detached or off it is put back when clean, else alerted, and never branched from. shared_branches:
+    # more branches many tasks start from (beside main, master, the push branch and delivery.base_ref),
+    # which no task claims as its own.
+    "worktree": {"venv": "auto", "link_paths": [".venv"], "kinds": [], "root_branch": "", "shared_branches": [],
+                 "git_timeout_s": 120,
                  "git_timeout_max_s": 900, "create_attempts": 2, "create_retries": 3, "retry_backoff_s": 120},
     # Commits of the harness's own files (charter, memory, schedules): each git command gets timeout_s.
     # A lock file in its .git older than stale_lock_s (unset: 600 s; 0: off) that no process holds (one a
@@ -471,7 +480,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # lower severity, only counts; it stays closed and wakes nobody (null or 0: off).
     "screen": {"wake_min_severity": "normal", "rewake_after_h": 6, "same_subject_warn": 3, "reraise_window_h": 6},
     # The stale queued tail (queuetrim.py): a task that never started is cancelled, with its reason and a
-    # `ttp task <project> requeue <id>` undo, after expire_h queued (no open dependency, no start_when) or
+    # `ttp task <project> requeue <id> --force` undo, after expire_h queued (no open dependency, no start_when) or
     # dead_dep_h blocked on a failed or cancelled dependency (0: off). Urgent, user-ordered, review and
     # obligation-owner tasks never expire.
     "queue": {"expire_h": 48, "dead_dep_h": 24},
@@ -556,16 +565,23 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # the machine is truly short: sustained low CPU idle, memory pressure or swapping, a call with low
     # CPU idle, heat. worker_limit: auto (on for laptops and workstations: macOS or a battery present;
     # off on lab and build servers), on, off. max_workers: the base before pacing; null holds nothing
-    # while nothing is short and is the cores under pressure. budget.max_parallel_workers stays each
-    # project's own ceiling.
-    "machine": {"worker_limit": "auto", "max_workers": None},
+    # while nothing is short and is the cores under pressure. pace_from: moderate, or heavy (only heavy
+    # CPU or memory cut the limit, and this project holds to its own base, not the lowest another set).
+    # budget.max_parallel_workers stays each project's own ceiling.
+    "machine": {"worker_limit": "auto", "max_workers": None, "pace_from": "moderate"},
     # reuse: every ssh the project starts (probes, checks, workers, git over ssh) shares one connection per
     # host for 10 minutes (OpenSSH ControlMaster through the harness's bin/ssh; sockets in ~/.tt-project/cm),
     # so an ssh agent signs once, not per command. Off: each ssh opens its own connection (sshmux.py).
-    "ssh": {"reuse": True},
+    # reach_probe_s: each listed machine gets a harmless `ssh <alias> true` at most this often (reach.py);
+    # reach_fresh_min: a "can't reach <machine>" claim needs a probe this recent, else it is marked.
+    "ssh": {"reuse": True, "reach_probe_s": 1200, "reach_fresh_min": 30},
     # `ttp bench run` (benchrun.py): arms {name: {provider, model, effort}} (none shipped) and the
     # limits every cell gets alike.
     "bench": {"arms": {}, "reps": 1, "timeout_s": 3600, "stall_s": 900, "budget_usd": 8.0, "test_timeout_s": 900},
+    # The machine's shared daily chat model bench (benchowner.py): one project owns it and runs it at
+    # bench_at home time; poke_after_h without a result pokes the owner once, take_over_after_h hands it
+    # to the next project by name. opt_out: this project never owns it.
+    "model_bench": {"opt_out": False, "poke_after_h": 48, "take_over_after_h": 72, "bench_at": "02:00"},
     # Once a day the daemon archives (to memory/archive/, one harness commit, one low feed line) the
     # decision and fact entries, never standing ones, that every prompt has left out for at least
     # archive_hidden_days days (0 = off). `ttp memory <name> --search <words>` still finds them.
@@ -601,7 +617,8 @@ EXTRA_KEYS = {
     # promise_default_h: when a chat promise that names no time is due (obligations.py; default 6).
     # mitigation_due_h: when a live-impact mitigation is due after it is filed (mitigate.py; default 4, 0 off).
     # course_check: thresholds of the digest's Course check ({"fails_24h", "queued_h", "spend_ratio", ...}; course.py;
-    #   self-review: "missed_deadlines", "same_wait", "self_races", "rule_clash", "recurring"; coursecheck.py;
+    #   self-review: "missed_deadlines", "same_wait", "self_races", "rule_clash", "recurring", "old_orders";
+    #   coursecheck.py;
     #   "long_promise_h": a promise on urgent work due later than this is flagged, eta.py, default 2).
     # progress_check: thresholds of the progress and stall check ({"task_h", "probe_n", "repeat_n", ...}; progress.py).
     # probe_stall_dispose_h: when the blocker sweep settles a probe stall model-free (sweep.py; default 1, 0 off).
@@ -619,9 +636,12 @@ EXTRA_KEYS = {
     # there}, default none) and "log_paths" ({name: absolute path} `ttp hostcheck log-tail` may read).
     # "tools" ("full" default | "read_only") and "tool_timeout_s" (300, at most 600) set a session
     # wake's tools and its foreground command limit.
+    # status_footer: onhost.guard appends a "Status now:" line with the claimed tasks' real status to a message
+    # that says unstarted work is under way (default true); false marks the claim in place only and leaves
+    # the status to the coordinator's note, for chats that take no status footers.
     # drift: thresholds of the running-run drift flags (drift.py; each 0: off): repeat_fail 3, loop 4,
     # outside_spec 3, quiet_s 900, pace 1.5, and raise_s 600 before a still-flagged run reaches the coordinator.
-    "coordinator": {"session", "agent_orders_as_user", "owner_identities", "max_review_tasks_per_day", "charter_approval_days", "approval_lookback_days", "reask_window_days", "blocker_sweep_h", "blocker_sweep_min_gap_h",
+    "coordinator": {"session", "status_footer", "agent_orders_as_user", "owner_identities", "max_review_tasks_per_day", "charter_approval_days", "approval_lookback_days", "reask_window_days", "blocker_sweep_h", "blocker_sweep_min_gap_h",
                     "blocker_sweep_recheck_skip_h", "review_backlog_h", "user_pause_marker", "promise_default_h", "mitigation_due_h", "course_check",
                     "progress_check", "probe_stall_dispose_h", "echo_paths", "drift",
                     "reply_terms", "reply_max_terms", "reply_soft_chars"},   # plain-reply check (plainreply.py)
@@ -657,6 +677,12 @@ EXTRA_KEYS = {
     # `landed:#<id>` (landed.landed_probe); unset there, the harness chains with depends_on instead.
     # push_checks_timeout_s: the run-time limit of each `ttp push` check, grant and test-pool waits left out (push.check_limit_of; 0: none).
     # push_pool_wait_s: how long one push check may wait for test-pool slots in all (push.pool_wait_of; 0: no bound).
+    # max_open_branches, max_work_threads: soft caps on open code branches (task branches with commits not on
+    # the push branch) and running workers; over one, the Course check and `ttp status` raise one alarm line
+    # (branchcap.CAPS defaults, 0: no cap). delete_landed_branches (default on): the daemon deletes a landed
+    # task's local branch once its worktree is gone, its tip saved as refs/ttp-archive/<branch> and
+    # recorded in state/branch-deletions.jsonl. dead_branch_days (branchcap.DEAD_DAYS, 0: off): the same for
+    # a branch whose tasks all ended that long ago, never approved and needed by no unfinished task.
     # push_retries: how often a detached push retries a cause it clears itself, a non-fast-forward
     # (--own) or a reboot that cut it short (push.retries_of; default 2, 0: never).
     "delivery": {"base_ref", "push_branch", "landed_probe", "push_checks", "post_land_checks", "push_checks_by_repo", "push_exclude_paths", "push_rounds", "push_wait_s",
@@ -668,13 +694,17 @@ EXTRA_KEYS = {
                  "allow_protected_push_branch", "own_push", "own_push_remote", "own_push_reserved_lane", "deploy_restart_wait_s", "plugin_version_guard",
                  "checks_fast_globs", "checks_fast_exclude",   # these two: `ttp checks` fast path (push.FAST_GLOBS),
                  "checks_targeted", "checks_targeted_always",   # a task's `ttp checks` runs the tests its diff reaches (testpick)
+                 "task_checks",   # a task's own `ttp checks` list (testpick.task_set); unset: the push checks
                  "checks_task_full",   # the user's own: a task's `ttp checks --full` runs with the push queue on (testpick.full_refusal)
                  "checks_host",   # where checks run (remotecheck)
+                 "gh_route",   # the ssh alias gh calls run on when this host has no gh login (ghroute)
                  "checks_spill_hosts", "checks_spill_after_s", "checks_spill_first", "checks_remote_only",   # where busy checks may spill to (checkspill)
                  "check_prestage",   # a short foreground run before `ttp checks --detach` (checkprestage)
                  "pr_body_check",   # a project's own PR body check before gh pr create/edit (prbody)
                  "ai_tag",   # the AI-authorship tag a post to others ends with (aitag)
+                 "max_open_branches", "max_work_threads", "delete_landed_branches", "dead_branch_days",   # open-branch soft cap (branchcap)
                  "rebase_replace", "never_force",   # whether a rebase replaces its branch (rebase_replace)
+                 "integration_branch",   # where reviewed changes land on a project with no push branch (integrate)
                  "channel_tags"},   # release-channel tags a forward move may update under never_force (channeltag)
     "jev": {"via", "url", "model"},
     "effort_ab": {"winner", "decided_at"},   # the end rule's result, written by effortab.conclude
@@ -715,9 +745,10 @@ PROVIDER_KEYS = {"billing", "tiers", "plugin_dirs", "worker_isolation", "write_f
                  # slot before it starts on the core provider (route.wait_s). routes: the ordered rule list
                  # routing runs by kind, tier and label (route.match). model_ranking: its model ids,
                  # smartest first, that stand in for a model that is down (modelrank.py). models_every_s:
-                 # seconds between the model-free /models checks (route.models_every).
+                 # seconds between the model-free /models checks (route.models_every). demote: the live
+                 # demotion detector's thresholds (modeldemote.DEFAULTS).
                  "endpoint", "base_url", "max_tokens", "context_window", "route_cooldown_s", "effort_fields",
-                 "route_wait_s", "routes", "model_ranking", "models_every_s",
+                 "route_wait_s", "routes", "model_ranking", "models_every_s", "demote",
                  # providers.chat only: the rules-first model pick (modelpick.py); its keys (enabled, min_p,
                  # options) are checked by modelpick.config_problems.
                  "dispatch"}
@@ -783,16 +814,17 @@ def _known_keys(path: list[str]) -> set[str] | None:
         # wrap_needs_device: false says the commands behind wrap_cmd need no device, so they may spill (checkspill).
         # spill_wrap_cmd: the wrapper a check runs behind on a spill host (push.spill_wrap_of; default "", none).
         # spill_beside_device: spill hosts a device job keeps no spill off (checkspill.beside_device; default none).
+        # spill_quarantine_after: strikes in a row that quarantine a spill host (checkspill.strike_settle; default 3).
         # python_lock: the pinned requirements file the checks' Python env is built from, relative to the
         # checkout (runnerenv.lock_of; default "", the plugin's own lock of pytest and pytest-xdist).
         # spill_pre_cmd: the project's own read-only go/skip command before a spill to a host (checkspill.pre_check;
         # default none).
         return {"nice", "python_lock", "ionice", "wall_cap_s", "wrap_cmd", "wrap_lane", "wrap_needs_device", "spill_wrap_cmd",
-                "spill_beside_device", "spill_pre_cmd", "fallback_lane", "no_device_cmds", "slots", "light_cmds", "max_wait_s", "wait_event_s",
+                "spill_beside_device", "spill_pre_cmd", "spill_quarantine_after", "fallback_lane", "no_device_cmds", "slots", "light_cmds", "max_wait_s", "wait_event_s",
                 "wait_escalate_s", "wait_hang_factor", "priority_age_s", "test_project_max", "test_project_slots",
                 "test_project_workers", "test_run_max", "test_run_min",
                 "done_holder_flag_s", "done_holder_grace_s", "stall_s", "push_load_wait_s",
-                "smoke_max_s"}   # the landing check time limit (gatetime.max_s; default 600 s, 0: off)
+                "smoke_max_s"}   # the landing check time limit (gatetime.max_s; default 300 s, 0: off)
     if len(path) == 1 and isinstance(DEFAULT_CONFIG.get(path[0]), dict):
         return set(DEFAULT_CONFIG[path[0]]) | EXTRA_KEYS.get(path[0], set())
     return None
@@ -900,13 +932,16 @@ def _without_bad_sections(raw: dict) -> dict:
     return out
 
 
-# Keys the runtime no longer reads and refuses to set, with why.
+# Keys an older plugin version read and this one no longer does, with why each went. `ttp config` refuses
+# to set them (unknown_key_hint); `ttp upgrade` drops them from project.json (cli._drop_retired_keys), and
+# `ttp config NAME KEY ''` removes any unknown key present.
 RETIRED_KEYS = {
     "coordinator.session.mode": "the coordinator session is always on, with no off switch",
     "coordinator.session.pause_h": "the session spend guard is gone: the dollar caps are the cost limits",
     "budget.hourly_coordinator_usd": "the coordinator's hourly dollar guard is gone: the dollar caps are the cost limits",
     "upgrade.merge_retry_h": "a conflicting upgrade queues its merge task at once, never on a timer",
     "upgrade.task_every_h": "a conflicting upgrade queues its merge task at once, never on a timer",
+    "coordinator.unblock_effort": "every coordinator runs at one effort level, coordinator.effort",
 }
 
 
@@ -1203,6 +1238,7 @@ def config_problems(raw: dict, root: Path | None = None) -> list[str]:
     out += [f"delivery.push_checks: {p}" for p in check_problems(delivery.get("push_checks"))]
     out += [f"delivery.push_checks: {p}" for p in applicability_problems(delivery.get("push_checks"), root)]
     out += [f"delivery.post_land_checks: {p}" for p in check_problems(delivery.get("post_land_checks"))]
+    out += [f"delivery.task_checks: {p}" for p in check_problems(delivery.get("task_checks"))]
     out += [f"delivery.push_checks_by_repo: {p}" for p in by_repo_problems(delivery.get("push_checks_by_repo"))]
     for k in ("checks_targeted", "checks_task_full"):
         if delivery.get(k) not in (None, True, False):
@@ -1221,6 +1257,8 @@ def config_problems(raw: dict, root: Path | None = None) -> list[str]:
     if delivery.get("checks_host") not in (None, ""):
         from .remotecheck import host_problem
         out += [f"delivery.checks_host: {p}" for p in [host_problem(delivery["checks_host"])] if p]
+    from .ghroute import problem as gh_route_problem
+    out += [f"delivery.gh_route: {p}" for p in [gh_route_problem(delivery.get("gh_route"))] if p]
     from .checkspill import problems as spill_problems, wrap_problems
     out += spill_problems(delivery) + wrap_problems(raw.get("checks"))
     out += bump_problems(delivery.get("version_bump"))
@@ -1311,6 +1349,9 @@ def config_problems(raw: dict, root: Path | None = None) -> list[str]:
     v = m.get("max_workers")
     if v is not None and (isinstance(v, bool) or not isinstance(v, int) or v < 1):
         out.append(f"machine.max_workers: {v!r} is not a whole number of at least 1 (or null)")
+    v = m.get("pace_from")
+    if v is not None and str(v).strip().lower() not in ("moderate", "heavy"):
+        out.append(f"machine.pace_from: {v!r} is not moderate or heavy; moderate is used")
     v = (raw.get("runner") or {}).get("pin_verify") if isinstance(raw.get("runner"), dict) else None
     if v is not None and v not in ("strict", "lenient"):
         out.append(f"runner.pin_verify: {v!r} is not strict or lenient")
@@ -1992,7 +2033,8 @@ class Project:
 
     def add_memory(self, text: str, kind: str = "fact", title: str | None = None, key: str | None = None,
                    end: dict | None = None, standing: bool = False, audience: str | None = None,
-                   commit: bool = True, dry_run: bool = False) -> Path:
+                   commit: bool = True, dry_run: bool = False, reason: str | None = None,
+                   context: str | None = None) -> Path:
         """One fact per file plus a one-line pointer in MEMORY.md, so the index stays cheap to load.
         A memory written again under the same `key` (a replayed coordinator turn) keeps its one
         file and line. `end` (see ends.from_action) makes it temporary: the daemon retires it then.
@@ -2000,10 +2042,15 @@ class Project:
         unless pinned already): finishing one instance never retires it (see forget_memory).
         `audience` (one of MEMORY_AUDIENCES) says whether workers get it (see worker_memory).
         `commit` False leaves the harness commit to the caller (see supersede_memory). `dry_run`
-        only returns the path it would write: no file, index line or commit."""
+        only returns the path it would write: no file, index line or commit. `reason` (why the rule
+        was given) and `context` (the user's words around it) let an old order be re-read by its
+        intent once that reason is gone (see oldorders)."""
         from .ends import front_matter
         from .forbidden import check
-        check(self, "memory", text, title or "")   # before any write: nothing refused reaches git
+        from .oldorders import clean_context, one_line
+        reason, context = one_line(reason), one_line(context)
+        check(self, "memory", text, title or "", reason or "")   # before any write: nothing refused reaches git
+        context = clean_context(self, context)   # harness-attached user words: dropped when forbidden, never refused
         if standing and kind not in PINNED_MEMORY_KINDS:
             kind = "preference"
         if not dry_run:
@@ -2031,6 +2078,8 @@ class Project:
                 durable_write(path, f"---\nkind: {kind}\ncreated: {_stamp(time.time())}\n{front_matter(end or {})}"
                                     f"{'standing: true' + chr(10) if standing else ''}"
                                     f"{f'audience: {audience}' + chr(10) if audience in MEMORY_AUDIENCES else ''}"
+                                    f"{f'reason: {reason}' + chr(10) if reason else ''}"
+                                    f"{f'context: {context}' + chr(10) if context else ''}"
                                     f"{tag}---\n{text}\n")
             index = self.memory_index.read_text() if self.memory_index.exists() else ""
             line = None
@@ -2070,7 +2119,8 @@ class Project:
     def _memory_entries(self) -> list[dict]:
         """Live memory entries, oldest first: `name` (the file stem shown in prompts), `kind`, `line`,
         `end` (see ends) for a temporary one, whose line says when it ends, `standing` (see
-        add_memory), whose line says so, and `audience` (see worker_memory).
+        add_memory), whose line says so, `audience` (see worker_memory) and `reason` and `context`
+        (see add_memory; "" when not recorded).
         Ordered by the front matter's `created`, then name; the file's mtime stands in only where
         `created` is missing, so a checkout or copy that touches the files does not reorder them
         (which would change the coordinator's cached prompt)."""
@@ -2088,11 +2138,14 @@ class Project:
             end = read_front_matter(head)
             standing = bool(re.search(r"^standing:[ \t]*true[ \t]*$", head, re.M))
             aud = re.search(r"^audience:[ \t]*(\S+)", head, re.M)
+            why = re.search(r"^reason:[ \t]*(.*)$", head, re.M)
+            ctx = re.search(r"^context:[ \t]*(.*)$", head, re.M)
             ends = (" (standing)" if standing else "") + (f" ({describe(end, self)})" if end else "")
             created = c.group(1) if c else _stamp(p.stat().st_mtime)
             out.append({"name": p.stem, "kind": kind, "line": f"[{p.stem}] {body.strip()}{ends}", "end": end,
                         "body": body.strip(),
                         "standing": standing, "audience": aud.group(1) if aud else "", "created": created,
+                        "reason": why.group(1).strip() if why else "", "context": ctx.group(1).strip() if ctx else "",
                         "order": (created, p.stem)})
         out.sort(key=lambda e: e.pop("order"))
         return out
@@ -3053,8 +3106,10 @@ ACCOUNT_KEYS = {"budget": {"global_daily_usd", "daily_target_usd", "day_start", 
                            "wait_escalate_s", "wait_hang_factor", "done_holder_flag_s", "done_holder_grace_s", "stall_s", "starve_s", "small_tests",
                            "push_load_wait_s",
                            "push_priority_wait_s",   # a push's longest wait behind another priority holder (checkcap.priority_wait_s)
+                           "priority_beyond_cap",   # push and urgent runs beyond checks.host_max (checkcap.priority_beyond_cap)
                            "dirty_max_mb", "io_full_max",   # the disk gate on new local runs (diskgate)
                            "spill_hosts",   # the spill pool every project's checks may use (checkspill.account_hosts)
+                           "no_spill_hosts",   # hosts no project's checks spill to (checkspill.no_spill; a run only adds)
                            "slurm_overflow",   # a Slurm cluster the pool's overflow runs on (slurmcheck)
                            "smoke_max_s"}}   # the landing check time limit (gatetime.max_s), project first
 # Account keys a run may only clear (ttp config --account refuses setting them inside a run): remove them
@@ -3068,10 +3123,12 @@ ACCOUNT_OFF_VALUE = {"checks.spill_hosts": [], "checks.slurm_overflow": {}}
 # Account keys three deep, below a provider: never merged into a project's settings (a project that does not
 # use the provider gets no providers.<name> entry); their reader asks for them (account_value).
 # providers.chat.model_ranking: read under the project's own (modelrank.ranking), kept current by rankfresh.py
-# with its source, interval and key file.
-ACCOUNT_NESTED_KEYS = {"providers.chat.model_ranking", "providers.chat.ranking_source", "providers.chat.ranking_every_s",
-                       "providers.chat.ranking_key_file"}
-HOST_WIDE_KEYS = {"checks.host_max", "route.host_max", "checks.spill_hosts", "checks.slurm_overflow", "checks.dirty_max_mb", "checks.io_full_max",
+# with its source, interval and key file; providers.chat.class_ranking and class_prefs: the model scoreboard's
+# per-class orders and their prefer settings (modelscore.py). providers.chat.served_every_s and served_idle_s: the
+# host's shared /models poll interval while any project routes to chat, and else (served.every_s).
+ACCOUNT_NESTED_KEYS = {"providers.chat.model_ranking", "providers.chat.class_ranking", "providers.chat.class_prefs", "providers.chat.ranking_source", "providers.chat.ranking_every_s",
+                       "providers.chat.ranking_key_file", "providers.chat.served_every_s", "providers.chat.served_idle_s"}
+HOST_WIDE_KEYS = {"checks.host_max", "route.host_max", "checks.spill_hosts", "checks.no_spill_hosts", "checks.slurm_overflow", "checks.dirty_max_mb", "checks.io_full_max",
                   "checks.push_priority_wait_s"}
 
 

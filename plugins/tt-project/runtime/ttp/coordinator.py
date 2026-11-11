@@ -38,6 +38,7 @@ from . import (   # one name per line: two changes adding names merge without a 
     chaincap,
     channeltag,
     charterpromise,
+    ghroute,
     chartertemplate,
     configwho,
     coordfix,
@@ -79,6 +80,7 @@ from . import (   # one name per line: two changes adding names merge without a 
     premise,
     prguard,
     progress,
+    modeldemote,
     projpause,
     publishkind,
     push,
@@ -117,13 +119,17 @@ from . import (   # one name per line: two changes adding names merge without a 
     yesask,
 )
 from . import untrusted
+from . import branchcap
 from . import urgent
+from . import waketier
 from . import replan
 from . import topup
 from . import probevars
 from . import onhost
 from . import claimcheck
+from . import reach
 from . import coordsession
+from . import oldorders
 from . import spans
 from . import coordtools
 from . import pointers
@@ -134,6 +140,7 @@ from . import schedule as sched
 from . import workernotify
 from . import provallow
 from . import hostrun
+from . import supersede
 from . import userorder
 from . import turnrules
 from .db import (
@@ -251,6 +258,9 @@ ACTIONS_SCHEMA: dict[str, Any] = {
             "wake_now": {"anyOf": [{"type": "boolean"}, {"type": "string", "enum": list(bud.TIER_ORDER)}]},
             "replace": {"type": "object", "properties": {"old": {"type": "string"}, "new": {"type": "string"}},
                         "required": ["old"]},
+            "check_plan": {"type": ["object", "null"], "properties": {
+                "checks": {"type": "integer"}, "at_s": {"type": "array", "items": {"type": "number"}},
+                "tier": {"type": "string", "enum": list(bud.TIER_ORDER)}, "by": {"type": "string", "enum": list(waketier.BYS)}}},
             "owners": {"type": "array", "items": {"type": "integer"}}, "evidence": {"type": "string"},
             "milestone": {"type": "string"}, "promise": {"type": "string"}, "justify": {"type": "string"},
             "delivers": {"type": "array", "items": {"type": "string"}},
@@ -401,11 +411,20 @@ def _max_workers(v):
     return n
 
 
+def _pace_from(v):
+    """machine.pace_from: moderate or heavy."""
+    w = str(v).strip().lower()
+    if w not in ("moderate", "heavy"):
+        raise ValueError("machine.pace_from: give moderate or heavy")
+    return w
+
+
 USER_SETTABLE = {
     "budget.daily_usd": float, "budget.weekly_usd": float, "budget.reserve_pct": float,
     "budget.global_daily_usd": float, "budget.daily_target_usd": float, "budget.day_start": str, "budget.timezone": str,
-    "budget.max_parallel_workers": int, "machine.worker_limit": str, "machine.max_workers": _max_workers, "budget.urgent_extra_slots": int, "budget.urgent_preempt": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
+    "budget.max_parallel_workers": int, "machine.worker_limit": str, "machine.max_workers": _max_workers, "machine.pace_from": _pace_from, "budget.urgent_extra_slots": int, "budget.urgent_preempt": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
     "coordinator.urgent_start_wait_min": int,
+    "coordinator.status_footer": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
     "budget.urgent_topup": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
     "budget.reset_credits_auto": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
     "budget.reset_credit_min_hours": float, "budget.reset_credit_expiry_hours": float,
@@ -440,8 +459,10 @@ USER_SETTABLE = {
     "delivery.push_checks_by_repo": lambda v: push.checks_by_repo_of(v),
     # The ssh alias the checks run on (remotecheck) when the project may not run them here; "" for here.
     "delivery.checks_host": lambda v: push.checks_host_of(v),
+    # The ssh alias gh calls run on (with -R) when this host has no gh login (ghroute); "" for none.
+    "delivery.gh_route": lambda v: ghroute.value_of(v),
     # Ordered ssh aliases a run whose slots here stay busy may spill to (checkspill); a list, never a scalar.
-    "delivery.checks_spill_hosts": lambda v: checkspill.hosts_of(v),
+    "delivery.checks_spill_hosts": lambda v: checkspill.settable_hosts(v),
     "delivery.checks_spill_after_s": lambda v: checkspill.after_of(v),
     # Whether a run that may spill tries the spill hosts before a place here (checkspill.first; default true).
     "delivery.checks_spill_first": lambda v: checkspill.first_of(v),
@@ -450,6 +471,8 @@ USER_SETTABLE = {
     "delivery.checks_remote_only": lambda v: "auto" if (r := checkspill.remote_only_of(v)) is None else r,
     # Spill hosts (or "*") the project lets its checks run on beside a device job (checkspill.beside_device).
     "checks.spill_beside_device": lambda v: checkspill.beside_of(v),
+    # Strikes in a row (spilled runs failing where the head passes elsewhere) that quarantine a spill host.
+    "checks.spill_quarantine_after": lambda v: checkspill.quarantine_after_of(v),
     # The files holding the version that `ttp push` bumps once above the tip, plus a changeset.
     "delivery.version_bump": lambda v: push.bump_of(v),
     # The daemon-owned push queue: reviews approve, the daemon pushes in batches, then runs after_push.
@@ -553,15 +576,19 @@ places to read. `checks.suite_concurrency` (the setting's spec name) is `checks.
 
 def settable(key: str):
     """The validator config_set applies to `key` (USER_SETTABLE, else a provider key chatset.py accepts:
-    per-tier routing, the saved endpoint's alias); ValueError saying why when chat may not set it."""
+    per-tier routing, the saved endpoint's alias); ValueError saying why when chat may not set it, and
+    for a known key that is not the user's alone (NEEDS_USER), how the coordinator sets it (cli_route)."""
     if (canonical := ALIASES.get(key, key)) in USER_SETTABLE:
         return USER_SETTABLE[canonical]
     if key in accountset.KEYS:   # the account's host checks caps: applied in the daemon (accountset.apply)
         return accountset.conv(key)
     if conv := chatset.setter(key):
         return conv
+    from .configwho import cli_route
     from .project import unknown_key_hint
-    raise ValueError(chatset.refusal(key) or unknown_key_hint(key) or f"{key} is not user-settable from chat")
+    user = any(k == key or k.startswith(key + ".") or key.startswith(k + ".") for k in NEEDS_USER)
+    raise ValueError(chatset.refusal(key) or unknown_key_hint(key) or f"{key} is not user-settable from chat"
+                     + ("" if user else f"; {cli_route(key)}"))
 
 CHARTER_HISTORY = ends.CHARTER_HISTORY   # harness file: charter sections replaced or retired
 # kv: [{"id", "messages", "ask", "section", "quote", "replaces", "candidates", "text", "sha", "ts",
@@ -665,7 +692,7 @@ MUTE_CHARS = 200
 # (LEDGER_SEEN_KEY).
 DIGEST_SEEN_KEY = "digest_seen"   # kv: {section: hash of what the previous turn's digest showed}
 COLLAPSIBLE = ("recurring", "muted", "memory_budget", "memory_pinned", "tried", "settled_areas", "course_check",
-               "progress", "user_words")
+               "progress", "user_words", "machine_reach")
 # The shared machine ledger collapses per line: co-tenants reword its lines often ('seen by', 'page
 # held', outage ends), so a turn with no machine_* event shows only the new or reworded ones, and the
 # whole ledger again after a machine event (ledger_section). The seen lines are keyed on the ledger
@@ -999,7 +1026,8 @@ def standing_lines(p: Project) -> list[str]:
     heads = charter_headings(p)
     if heads:
         lines.append(f"## Charter sections (exact headings and numbers, for charter_update `replaces`): {heads}")
-    if loose := restriction_source.unsourced_items(p.charter_path.read_text() if p.charter_path.exists() else ""):
+    if loose := restriction_source.unsourced_items(p.charter_path.read_text() if p.charter_path.exists() else "",
+                                                   restriction_source.history_items(p)):
         lines += [f"## {restriction_source.ADVISORY_HEAD} (they cite no user message, the Brief or a harness gate, so "
                   f"they bind nothing and are never asked about: remove each with charter_update section Restrictions, "
                   f"`quote` it, empty `text`; no user word or `over` needed. Keep one only by resending it with "
@@ -1429,6 +1457,10 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
     section("paused", lines)
     section("urgent_spend_held", urgent.spend_held_lines(p, db, now))
     section("resources", machines.digest_lines(db, paused, now))
+    if got := reach.digest_lines(p, now):
+        section("machine_reach", ["## Machine reach (last `ssh <alias> true` per machine; a \"can't reach\" claim "
+                                  "needs one this fresh, else it is marked)"] + got,
+                "\n".join(got), f"## Machine reach: {len(got)} machines (as last turn)")
     lines = []
     for res, got in shared.mismatches(p).items():
         lines.append(f"## Shared resource {res}: projects give different slot counts ("
@@ -1458,11 +1490,13 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
     section("retired_echoes", echoes.digest_lines(p, now))
     section("guards_behind", restriction_audit.digest_lines(p))
     section("ends", ends.digest_lines(p, float(db.kv("last_coordinator_turn", 0) or 0), now))
+    section("old_orders", safe_eta(lambda: oldorders.digest_lines(p, event_ids, now), []))
     section("heal", heal.digest_lines(db, float(db.kv("last_coordinator_turn", 0) or 0), now))
     section("budget_topups", topup.digest_lines(db, float(db.kv("last_coordinator_turn", 0) or 0)))
     section("unexplained_fixes", coordfix.digest_lines(db, float(db.kv("last_coordinator_turn", 0) or 0), now))
     section("noisy_watchers", watchdup.digest_lines(db, float(db.kv("last_coordinator_turn", 0) or 0), now))
     section("queue_backlog", queuetrim.digest_lines(db, float(db.kv("last_coordinator_turn", 0) or 0), now))
+    section("model_demotions", modeldemote.digest_lines(db, float(db.kv("last_coordinator_turn", 0) or 0), now))
     section("coverage", responsibilities.digest_lines(db))
     section("blocker_sweep", sweep.digest_lines(db, event_ids, now, p.config()))
     section(rulecite.SECTION, safe_eta(lambda: rulecite.index_lines(p, now), []))
@@ -1488,6 +1522,9 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
     if unplain := plainreply.digest_lines(db, now):
         course_lines = (course_lines or [course.HEADER]) + unplain
         course_id += "\nplainreply:" + unplain[0].split(" | ")[0]
+    if overcap := branchcap.digest_lines(db, p.config()):
+        course_lines = (course_lines or [course.HEADER]) + overcap
+        course_id += "\nbranchcap:" + branchcap.course_key(db, p.config())   # which caps, not the counts
     section("course_check", course_lines, course_id,
             f"## Course check: {len(course_lines) - 1} lines (as last turn; correct course or say why it is fine)")
     prog_lines, prog_id = progress.digest_lines(db, now)
@@ -1512,7 +1549,7 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
             held_on.setdefault(held, []).append(t)
     held_on = {k: ts for k, ts in held_on.items() if len(ts) > 1}
     grouped = {t["id"]: k for k, ts in held_on.items() for t in ts}
-    host_est = safe_eta(lambda: eta._Est(db, now, core=eta.core_of(p)), None) if any(onhost.resources(t) for t in rows) else None
+    host_est = safe_eta(lambda: eta._Est(db, now, core=eta.core_of(p), delivery=eta.delivery_of(p)), None) if any(onhost.resources(t) for t in rows) else None
     owns = obligations.open_keys_by_task(db)   # the open keys a task_update spec may name as its own
     for t in rows:
         if setting_held and settinghold.held_key(t):
@@ -1640,10 +1677,13 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
     lines = []
     chats = db.q("SELECT id, label, last_active FROM chats ORDER BY last_active DESC LIMIT ?",
                  (coordsession.CHATS_SHOWN,))
-    if chats:
+    from . import relayers
+    clash = relayers.conflicts(db, now)   # a relayer on another chat's id takes that chat's replies
+    if chats or clash:
         lines.append("## Chats attached")
     for c in chats:
         lines.append(f"- {c['id']} ({c['label'] or 'chat'}), active {(now - (c['last_active'] or now)) / 60:.0f} min ago")
+    lines += [f"- relay: {c}" for c in clash]
     section("chats", lines)
     lines = []
     if any(e["kind"] == "upstream_note" or e["kind"] in ("followup_proposed", "task_notes")
@@ -1908,11 +1948,16 @@ def next_task_slot(db, cap: int, now: float | None = None, review: bool = False)
 def parse_start_after(raw: Any, now: float | None = None, tz: str | None = None) -> float | None:
     """`start_after` as epoch seconds, or None for `now` and times already past. A delay counts
     from now; an ISO time without a zone is in zone `tz` (the project's home zone; this machine's
-    without one). Tasks keep the result as epoch seconds, so a later zone change never moves it."""
+    without one). A bare clock time ('15:17') is today's there, tomorrow's once over an hour past. Tasks keep the result as epoch seconds, so a later zone change never moves it."""
     now = time.time() if now is None else now
     s = str(raw).strip()
     if isinstance(raw, str) and s.lower() in ("", "now"):
         return None
+    clock = re.fullmatch(r"([01]?[0-9]|2[0-3]):([0-5][0-9])( [A-Za-z]{2,5})?", s) if isinstance(raw, str) else None
+    if clock:   # a bare clock time ('15:17', '15:17 PST'): its next time in the home zone, see below
+        zone = ZoneInfo(timefmt.valid(tz)) if timefmt.valid(tz) else None
+        day = datetime.fromtimestamp(now, zone).date().isoformat()
+        s = f"{day}T{int(clock[1]):02d}:{clock[2]}{clock[3] or ''}"
     if not isinstance(raw, str) or not re.fullmatch(START_AFTER_RE, s):
         raise ValueError(f"start_after {raw!r}: use a delay such as 90m, 6h or 3d, an ISO date or time "
                          f"such as 2026-10-05T09:00, or now")
@@ -1939,6 +1984,8 @@ def parse_start_after(raw: Any, now: float | None = None, tz: str | None = None)
             at = at_dt.timestamp()
         except ValueError as e:
             raise ValueError(f"start_after {raw!r}: {e}") from None
+        if clock and at <= now - 3600:   # passed over an hour ago: tomorrow's; within the hour: now
+            at += 86400
     if at > now + MAX_DEFER_S:
         raise ValueError(f"start_after {raw!r} is more than {MAX_DEFER_S // 86400} days away")
     return at if at > now else None
@@ -2574,14 +2621,26 @@ def _onhost_checked(p: Project, text: str, chat: str | None, a: dict, rest: list
 
 def _wakemode_checked(p: Project, text: str, notes: list) -> str:
     """A reply, notify or ask as wakemode.guard posts it: a claim that the coordinator runs in its always-on
-    session is sent marked (unverified) with the recorded wake mode when the wake is stateless or most of
-    today's wakes were. Any fault posts the text unchanged: a message is never lost to this check.
+    session is sent marked (unverified) with the recorded wake mode when the wake ran without a session.
+    Any fault posts the text unchanged: a message is never lost to this check.
     Kept apart so the live-state claim check can take it in as one of its claims."""
     try:
         text, why = wakemode.guard(p.db, timefmt.home(p), text)
         notes += why
     except Exception as e:
         notes.append(f"wakemode: the session-claim check failed ({type(e).__name__}: {e}); the message went unchecked")
+    return text
+
+
+def _pending_checked(p: Project, text: str, notes: list, what: str) -> str:
+    """A reply or notify as pendingask.expand sends it: an open ask it names only by id goes with its full
+    text appended (user msg #2424). Any fault posts the text unchanged: a message is never lost to this check."""
+    try:
+        from . import pendingask, waits
+        text, why = pendingask.expand(text, waits.open_asks(p.db), what)
+        notes += why
+    except Exception as e:
+        notes.append(f"pendingask: the open-ask check failed ({type(e).__name__}: {e}); the message went unchecked")
     return text
 
 
@@ -2678,15 +2737,17 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     obligations.check_claims(a["claims"], p)
                 cites = turnrules.check_cites(db, a, chat)
                 said = workernotify.named(a["text"])   # the ids the coordinator named, before onhost's status line
+                authored = a["text"]   # promises come only from what the coordinator wrote, never the checks' footers
                 a["text"] = _onhost_checked(p, a["text"], None if chat in (None, "all") else chat, a, order[k + 1:],
                                             batch_tasks, notes)
                 a["text"] = _wakemode_checked(p, a["text"], notes)
+                a["text"] = _pending_checked(p, a["text"], notes, "reply")
                 a["text"], false = _claims_checked(p, a, notes)
                 replies.append(msgparts.post(db, a["text"], chat=None if chat in (None, "all") else chat, kind="reply",
                                              severity=_norm_severity(a.get("severity") or "normal"))[0])
                 claimcheck.raise_false(db, false, f"your reply #{replies[-1]} (chat {chat or 'all'})")
                 turnrules.record_cites(db, chat, cites, replies[-1])
-                sent.append((replies[-1], chat, a["text"]))
+                sent.append((replies[-1], chat, authored))
                 if a.get("claims"):
                     claimed.append((replies[-1], chat, a["claims"]))
                 workernotify.handled(db, said)
@@ -3281,6 +3342,16 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     else:
                         notes.append(f"task_update: #{task['id']} wake_now ignored: it is not asleep on a retry_when "
                                      f"(a start_when deferral wakes by `start_when` \"\"; a blocked task by status queued)")
+                if "check_plan" in a:
+                    # The task's own check plan (waketier): kept for its waits; a live wait re-plans now.
+                    prev = load_result(upd.get("result") or task["result"])
+                    over = waketier.override(a["check_plan"])
+                    new = {k: v for k, v in prev.items() if k not in (waketier.PLAN_SET, waketier.PLAN)}
+                    new.update({waketier.PLAN_SET: over} if over is not None else {})
+                    if prev.get("status") == "waiting" and isinstance(prev.get("waiting_since"), (int, float)) \
+                            and (cp := waketier.plan(db, cfg, prev, prev["waiting_since"], over)):
+                        new[waketier.PLAN] = cp
+                    upd["result"] = dump_result(new)
                 if waits or upd.get("status", "blocked") != "blocked":
                     labels = upd.get("labels")
                     labels = json.loads(task["labels"] or "[]") if labels is None else labels
@@ -3348,6 +3419,11 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                                      f"coordinator.ask_timeout_h unless only the user can answer it")
                 least = str(a.get("least_disruptive") or "").strip()
                 text = a["text"].strip()
+                # Gates that judge only the form or a likely overlap send the ask with a flag (a note and
+                # the daily audit), never a refusal: the coordinator decides on what they found (#2116).
+                flags: list[tuple[str, str]] = []
+                if fixed := _classify_fixed(a):
+                    flags.append(("classify corrected", fixed))
                 if (a["blocking"] == "restriction" or a.get("classify") == "restriction_change") and (
                         item := restriction_source.cited_unsourced(
                             p.charter_path.read_text() if p.charter_path.exists() else "",
@@ -3361,10 +3437,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 if why:
                     _count_refusal(db, key, why[0], text)
                     raise ValueError(f"ask_user rejected: {why[1]}")
-                why = orderedask.refusal(p, cfg, a, text, least, NOT_COVERED_MIN)   # agent mode: ordered already
-                if why:
-                    _count_refusal(db, key, why[0], text)
-                    raise ValueError(f"ask_user rejected: {why[1]}")
+                if why := orderedask.refusal(p, cfg, a, text, least, NOT_COVERED_MIN):   # agent mode: ordered already
+                    flags.append(why)
                 if a["blocking"] == "restriction" and len(least) < LEAST_DISRUPTIVE_MIN:
                     raise ValueError("ask_user rejected: first answer what is a reasonably non-disruptive way to "
                                      "proceed. If it fits the restrictions, take it (task_add) and memory_add the "
@@ -3400,7 +3474,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 if why:
                     _count_refusal(db, key, "untried host", text)
                     raise ValueError(f"ask_user rejected: {why}")
-                why = _false_login_ask(db, f"{text} {a.get('recommendation') or ''}", cfg)
+                why = _false_login_ask(db, f"{text} {a.get('recommendation') or ''}", cfg) \
+                    or ghroute.login_ask(f"{text} {a.get('recommendation') or ''}")
                 if why:
                     _count_refusal(db, key, "false login", text)
                     raise ValueError(f"ask_user rejected: {why}")
@@ -3434,11 +3509,10 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     seen = reask.settled_by(p, cfg, text, change=a.get("classify") == "restriction_change",
                                             question=_ask_question) or correction.repeated(p, text)
                     if seen and len(nc) < NOT_COVERED_MIN:
-                        _count_refusal(db, key, "already settled", text)
-                        raise ValueError(f"ask_user rejected: already settled by {seen}. Act on that answer, and "
-                                         "`resolve` or cite it instead of asking. A new question on that subject "
-                                         "(new evidence, changed facts): resend with not_covered saying what is new "
-                                         f"(at least {NOT_COVERED_MIN} characters)")
+                        flags.append(("already settled", f"it may be already settled by {seen}. If that answers "
+                                      "it, act on it and `resolve` this ask; next time cite it instead of asking, "
+                                      "or say in not_covered what is new"))
+                        seen = None
                 if a["blocking"] in PRIOR_APPROVAL_REASONS and len(str(a.get("not_covered") or "").strip()) < NOT_COVERED_MIN:
                     prior = _prior_approval(p, text)
                     if prior:
@@ -3474,8 +3548,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 if own:   # sent on its not_own_call override: counted for the daily audit
                     _count_refusal(db, key, f"{own[0]} (not_own_call)", a["text"].strip(), kind=ASK_FLAGGED_KIND)
                 flag = None if own else _reversible_ask(a, a["text"].strip(), least)
-                if flag:   # sent anyway: a flag is feedback for the next turn and the daily review, never a refusal
-                    _count_refusal(db, key, flag[0], a["text"].strip(), kind=ASK_FLAGGED_KIND)
+                for flag in flags + [flag] * bool(flag):   # sent anyway: feedback for the next turn and the
+                    _count_refusal(db, key, flag[0], a["text"].strip(), kind=ASK_FLAGGED_KIND)   # daily review
                     notes.append(f"ask_user: ask {turn_asks[-1][1]} was sent; flagged ({flag[0]}): {flag[1]}")
             elif t == "resolve":
                 said = db.q(f"SELECT id, ts, text, context, chat, ref, direction, kind FROM messages WHERE id IN "
@@ -3492,6 +3566,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                                 str(a.get("quote") or ""), slack=from_config(cfg), project=p.name)
             elif t == "notify":
                 why = _owned_fix_question(a["text"]) or _false_login_ask(db, a["text"], cfg) \
+                    or ghroute.login_ask(a["text"]) \
                     or (outagemsg.bare(a["text"]) if a.get("outage") is True else "")
                 if why:
                     raise ValueError(f"notify rejected: {why}")
@@ -3503,11 +3578,13 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 if a.get("claims"):
                     obligations.check_claims(a["claims"], p)
                 said = workernotify.named(a["text"])   # the ids the coordinator named, before onhost's status line
+                authored = a["text"]   # promises come only from what the coordinator wrote, never the checks' footers
                 a["text"] = _onhost_checked(p, a["text"], None, a, order[k + 1:], batch_tasks, notes)
                 a["text"] = _wakemode_checked(p, a["text"], notes)
+                a["text"] = _pending_checked(p, a["text"], notes, "notify")
                 a["text"], false = _claims_checked(p, a, notes)
                 sent.append((msgparts.post(db, a["text"], chat=None, kind="alert",
-                                           severity=_norm_severity(a.get("severity")))[0], None, a["text"]))
+                                           severity=_norm_severity(a.get("severity")))[0], None, authored))
                 claimcheck.raise_false(db, false, f"your notify #{sent[-1][0]}")
                 if a.get("claims"):
                     claimed.append((sent[-1][0], None, a["claims"]))
@@ -3517,12 +3594,17 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 notes.append(f"memory_add: settled area {rec['id']} added to {settled.FILE} "
                              f"({', '.join(rec['files']) or 'no file named: it reaches no task prompt'})")
             elif t == "memory_add":
-                if forged := coordsession.checked(db, a["text"], relay.agent_orders(cfg), strict=False)[1]:
+                a["text"], forged = coordsession.as_data(db, a["text"], relay.agent_orders(cfg), strict=False)
+                if forged:   # the entry stands; only the label goes: never stored as the user's words (#2116)
                     coordsession.log_dropped(db, "memory_add", forged)
-                    raise ValueError(f"memory_add rejected: a line labelled as the user's words fails the verbatim "
-                                     f"check: {forged[0][1]}. Quoted text on such a line must be that message's own "
-                                     f"words, with its msg #N; put names and terms in backticks, or record it as "
-                                     f"your own decision or a fact, without the user's-words label")
+                    binding = (a.get("memory_kind") or "") in ("preference", "restriction") or a.get("standing") is True
+                    if binding:   # an unverified quote binds nothing: a user rule needs their own words
+                        a["memory_kind"], a["standing"] = "fact", False
+                    notes.append(f"memory_add: {len(forged)} line(s) labelled as the user's words failed the "
+                                 f"verbatim check ({forged[0][1]}) and were stored as data, marked "
+                                 f"{coordsession.DATA_LABEL}" + (", the entry as a fact, not standing" if binding
+                                                                 else "") + ". Quote that message's own words "
+                                 f"with its msg #N, or write it as your own decision or a fact")
                 text = _unapplied_config_note(a["text"], cfg_refused)
                 if text != a["text"]:
                     notes.append("memory_add: noted in the entry that a config_set it names was rejected")
@@ -3555,7 +3637,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                                                           a.get("standing") is True, audience, a.get("title"),
                                                           key, end)
                 added = p.add_memory(text, kind=a.get("memory_kind") or "fact", title=a.get("title"), key=key,
-                                     end=end, standing=a.get("standing") is True, audience=audience)
+                                     end=end, standing=a.get("standing") is True, audience=audience,
+                                     reason=a.get("reason"), context=oldorders.context_for(db, text))
                 if (a.get("memory_kind") or "") == "restriction":
                     notes.append(_tell_running_workers(p, f"New binding restriction: {a['text'].strip()}", key,
                                                        messages if user_turn else ()))
@@ -3708,8 +3791,10 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                         replaced = "\n".join(secs[si][1]) if si is not None else ""
                         if si is not None and " ".join(secs[si][0][3:].split()).lower().startswith("restriction"):
                             gone = "\n".join(secs[si][1])
-                    loose_drop = (restriction_source.drops_unsourced("", body=gone) if gone else
-                                  restriction_source.drops_unsourced(p.charter_path.read_text(), quote=quote)
+                    rec = restriction_source.history_items(p)
+                    loose_drop = (restriction_source.drops_unsourced("", body=gone, recorded=rec) if gone else
+                                  restriction_source.drops_unsourced(p.charter_path.read_text(), quote=quote,
+                                                                     recorded=rec)
                                   if quote and _DATED.sub("", section).lower().startswith("restriction") else False)
                     # resting only on the owner's agent's words: shown as relayer-ordered, relay.HELD refused;
                     # a relayer-ordered cite counts in any turn, a later one with no messages too
@@ -3967,7 +4052,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     new = sorted(set(owners) - set(obligations._owner_ids(had))) if move else []
                     notes.append(obligations.add_order(p, str(a.get("text") or ""), int(a["order"]), owners,
                                                        due=None if move else a.get("due"), start_by=a.get("start_by"),
-                                                       action_class=a.get("action_class")))
+                                                       action_class=a.get("action_class"), reason=a.get("reason")))
                     if move:   # a re-sent order's new due: after the batch, as `key`+`due` (replan)
                         due_moves.append((i, a, had["id"], f"new owner #{', #'.join(map(str, new))}" if new else None))
                     fan_orders.append((None, int(a["order"]), a.get("supersedes") or []))
@@ -5057,7 +5142,7 @@ def expire_asks(p: Project, *, hold: bool = False, now: float | None = None) -> 
             to = resolves(v)[1]
             db.x("UPDATE messages SET handled=1 WHERE id=?", (ask["id"],))
             unblock.record_resolve(db, int(k), [], auto=to)
-            question = _ask_question(ask["text"])[:300]
+            question = _ask_question(ask["text"]).strip()   # whole: the user may reply to change it (#2424)
             if not isinstance(v, dict):
                 # at least high, and never under the chat floor: the user must see what was decided for them
                 severity = max((ask["severity"], "high", floor), key=lambda n: SEVERITY_RANK.get(n, -1))
@@ -5624,6 +5709,8 @@ def _fan_order(p: Project, oid: str | None, msg: int, steps) -> str:
     o = o or {}
     pr = o.get("promise") or {}
     words = o.get("text") or ""
+    if steps:   # queued tasks still carrying a superseded step are held at dispatch (supersede.py)
+        supersede.record_steps(p.db, msg, userorder._words(p.db, [msg])[2], steps)
     return userorder.fan_out(p, f"User order{' ' + o['id'] if o.get('id') else ''} (user msg #{msg}): {clip(words, 400)}",
                              msgs=[msg], owners=obligations._owner_ids(o) if o else (),
                              chat=pr.get("chat") if pr.get("order") == int(msg) else None,
@@ -5927,8 +6014,9 @@ _PERMIT_RE = re.compile(r"\b(?:allow\w*|permit\w*|may|can|fine|ok(?:ay)?|lift\w*
                         r"no (?:problem|objection|issue)s?|objects|minds|stops)\b", re.I)
 # An item that names its own exception ("except as the dated section allows") has been reconciled.
 _OWN_EXCEPTION_RE = re.compile(r"\b(?:except|unless|other than|apart from|save for|excluding)\b", re.I)
-# A permit word negated is a ban: "an upgrade can never be blocked", "workers may not push".
-_NEGATED_PERMIT_RE = re.compile(r"\b(?:can|may)\s+(?:not|never)\b|\bcannot\b|\bcan['’]t\b", re.I)
+# A permit word negated is a ban: "an upgrade can never be blocked", "workers may not push", "pushing is not allowed".
+_NEGATED_PERMIT_RE = re.compile(r"\b(?:can|may)\s+(?:not|never)\b|\bcannot\b|\bcan['’]t\b|"
+                                r"\b(?:not|never)\s+(?:be\s+)?(?:allowed|permitted|fine|ok(?:ay)?)\b", re.I)
 # A clause that names an exception defined elsewhere: "except as the temporary exception (ask 12) allows".
 _EXCEPTION_REF_RE = re.compile(r"\b(?:exceptions?|temporary|dated|one-time|expir\w*|while it lasts)\b|"
                                r"\bask\s*#?\d+|#\d+", re.I)
@@ -5946,7 +6034,7 @@ _ACTIONS = {"push": {"push"}, "force-push": {"push"}, "modify": {"write"}, "modi
             "open": {"open"}, "creat": {"open"}, "deploy": {"deploy"}, "publish": {"deploy"},
             "install": {"install"}, "upgrad": {"install"}, "run": {"run"}, "runn": {"run"}, "start": {"run"},
             "submit": {"run"}, "restart": {"stop"}, "reboot": {"stop"}, "kill": {"stop"}, "cancel": {"stop"},
-            "stop": {"stop"}}
+            "stop": {"stop"}, "flash": {"install"}}
 _ANY = "any"
 _WRITES = {"write", "push", "merge", "delete", "install", "deploy"}
 # Words that are no target: rule, stance, actor and filler words, and verbs that let someone act.
@@ -5960,7 +6048,7 @@ _NOT_TARGET = {x for w in _RULE_STOP | {
     "ever", "pull", "request", "prs", "new", "same", "many", "few", "another", "plus", "name", "named", "msg",
     "message", "once"} for x in (w, _stem(w))}
 # Kinds of target: "the main branch" and "the release branch" share only a kind, which is no overlap.
-_KINDS = {_stem(w) for w in ("branch", "repo", "repository", "folder", "directory", "file", "path", "box",
+_KINDS = {_stem(w) for w in ("branch", "tag", "repo", "repository", "folder", "directory", "file", "path", "box",
                              "machine", "node", "host", "server", "service", "project")}
 
 
@@ -6269,10 +6357,12 @@ def _reject_contradicting_append(p: Project, section: str, text: str, user_turn:
                                  end: dict | None = None) -> str:
     """Refuse a charter_update that adds `text` (appended, or in place of `quote`) while a Restrictions
     item it is about would stay standing (_append_conflicts): workers obey that item as binding, so the
-    change may do nothing. The rejection quotes the item. With the user's word behind the change (a
-    user turn, or the approval it already carried) only a sentence that may lift what an item bans
-    (_may_lift) is refused: any other overlap is a duty, a goal or a ban added next to the item, both
-    hold, and the change goes through; the returned note names the items judged to overlap. A refused
+    change may do nothing. The rejection quotes the item. On any turn only a sentence that may lift
+    what an item bans (_may_lift) is refused: any other overlap is a duty, a goal, a ban or a resource
+    added next to the item, which shares words with it but loosens nothing, so both hold and the
+    change goes through; the returned note names the items judged to overlap. Without the user's
+    word (no user turn, no approval on record) text that orders what an item bans or says a hold or
+    ban was released (_orders_banned) is refused too. A refused
     change of the user's is recorded (_record_charter_approval), as sent and as the quoted resend of
     each item, so either fix goes through in a later turn without asking again; it is never raised
     again by itself (reraise_charter_changes). Text already in the charter (a retried turn) passes.
@@ -6291,13 +6381,23 @@ def _reject_contradicting_append(p: Project, section: str, text: str, user_turn:
         # It says it loosens nothing and no sentence takes the same action on what an item bans.
         return (f"charter_update: {clip(text, 120)!r} went in, taken as holding alongside the Restrictions item "
                 f"{named} (it says it loosens no restriction; workers obey both)")
-    if user_turn or ok is not None:
-        lifts = _append_conflicts(charter, section, text, quote, lifts_only=True)
-        if not lifts:
-            return (f"charter_update: {clip(text, 120)!r} went in on the user's word, taken as holding alongside "
-                    f"the Restrictions item {named} (it only shares words with them; workers obey both). If the "
-                    "user changed one of them, charter_update its section with `quote` set to it")
-        hits = lifts
+    # Only a sentence that may lift what an item bans is refused, on any turn: text that adds a duty,
+    # a ban, a goal or a resource (a host list) next to an item it only shares words with loosens
+    # nothing, and both hold. A lift still needs the user's word (below).
+    lifts = _append_conflicts(charter, section, text, quote, lifts_only=True)
+    if not (user_turn or ok is not None):
+        # Without the user's word, also refuse text that orders what an item bans (the same action on
+        # the same object, and no ban of its own) or says a hold or ban was released: it would lift
+        # the item in the coordinator's own words.
+        lifts += [h for h in _orders_banned(charter, section, text, quote, _delivery_names(p.config()))
+                  if h not in lifts]
+    if not lifts:
+        return (f"charter_update: {clip(text, 120)!r} went in"
+                + (" on the user's word" if user_turn or ok is not None else "")
+                + f", taken as holding alongside the Restrictions item {named} (it only shares words with them "
+                "and permits or loosens nothing; workers obey both). If the user changed one of them, "
+                "charter_update its section with `quote` set to it")
+    hits = lifts
     if user_turn:
         _record_charter_approval(p, said, section, quote, "", text, end, "the charter guard: " + GUARD_REJECTED)
     for item, sec in hits:
@@ -6323,6 +6423,75 @@ def _reject_contradicting_append(p: Project, section: str, text: str, user_turn:
           "resources, actions, a time window) while that item still holds elsewhere, resend it in Restrictions with "
           "`excepts` set to that item's clause and `source` their words (work they ordered that adds no new risk class needs no new words naming what the charter's Goals, Resources or Policies already name). Never drop a restriction the user did not "
           "change")
+
+
+# A sentence that says a hold or ban is gone: "the user released it from their hold", "the hold is over".
+_RELEASED_RE = re.compile(r"\b(?:released|unheld|un-held)\b|\b(?:hold|ban)\b[^.;:]{0,40}?\b(?:is|was|has\s+been|are)\s+"
+                          r"(?:now\s+)?(?:over|ended|gone|off|cleared|lifted)\b|\bno\s+longer\s+(?:held|on\s+hold|banned)\b",
+                          re.I)
+# A sentence that bans for itself ("Workers may never push", "Pushing is not allowed"). Narrower than
+# _BAN_RE: "must", "only" and "without" also fit an order to do the banned action.
+_OWN_BAN_RE = re.compile(r"\b(?:never|not|nobody|cannot|forbid\w*|prohibit\w*|ban(?:s|ned)?)\b|n['’]t\b", re.I)
+
+
+def _delivery_names(cfg: dict) -> tuple[str, ...]:
+    """Where this project delivers, from its settings, never from charter wording: delivery.push_branch
+    (with and without its remote) and the tags in delivery.channel_tags."""
+    ref = str((cfg.get("delivery") or {}).get("push_branch") or "").strip()
+    names = [ref, ref.partition("/")[2]] if ref else []
+    return tuple(n for n in dict.fromkeys(names + channeltag.channel_tags(cfg)) if n)
+
+
+# A push or a publish: the only actions a sentence takes when it delivers.
+_DELIVERY_ACTS = {"push", "deploy"}
+# What a delivery target reads as to the guard: an object word of its own, so "Push to branch dev"
+# still names a target beside a kind word ("branch"), one no Restrictions item names.
+_DELIVERED = " configured-delivery-target "
+
+
+def _undelivered(sentence: str, item: str, delivered: tuple[str, ...]) -> str:
+    """`sentence` with each of the project's own delivery targets (_delivery_names) put as an object no
+    item names (_DELIVERED), when it only pushes or publishes and `item` bans a push or publish: its push
+    to the configured branch or tag is what the setting allows, so only another target it names can
+    meet the ban. Else `sentence`."""
+    acts, iacts = (_target(restriction_source.bare(x), conditions=False)[0] for x in (sentence, item))
+    if not (delivered and acts and acts <= _DELIVERY_ACTS and iacts & _DELIVERY_ACTS):
+        return sentence
+    for name in sorted(delivered, key=len, reverse=True):
+        sentence = re.sub(r"(?<![\w/.-])" + re.escape(name) + r"(?![\w/-])(?!\.\w)", _DELIVERED, sentence, flags=re.I)
+    return sentence
+
+
+def _orders_banned(charter: str, section: str, text: str, quote: str = "",
+                   delivered: tuple[str, ...] = ()) -> list[tuple[str, str]]:
+    """The standing Restrictions items (as _append_conflicts) that a sentence of `text` orders done or
+    says were released, with no permit word: the same action on the same object as an item that bans
+    it (_OWN_BAN_RE: "Push only to branch x" bans no push to x) in a sentence that bans nothing itself
+    (_same_target), or a sentence that
+    overlaps the item and says a hold or ban is gone (_RELEASED_RE). Only the user's word adds one.
+    A sentence whose only push or publish target is one the project's settings deliver to
+    (`delivered`: _delivery_names) meets no push ban (_undelivered); every other target is judged."""
+    if not _DATED.sub("", section).lower().startswith(("restriction", "goal", "polic", "resource")):
+        return []
+    new, gone = _quoted_news(quote, _sentences(text.splitlines())), _loose(quote)
+    out: list[tuple[str, str]] = []
+    for item, sec, _ in _restriction_items(charter):
+        if (item, sec) in out or (gone and _loose(item) in gone) or _OWN_EXCEPTION_RE.search(item):
+            continue
+        if any(_RELEASED_RE.search(s) and _overlaps(item, s)
+               or _OWN_BAN_RE.search(item) and not _OWN_BAN_RE.search(s)
+               and _same_target(item, _undelivered(s, item, delivered)) for s in new):
+            out.append((item, sec))
+    return out
+
+
+def _same_target(item: str, sentence: str) -> bool:
+    """Whether a sentence takes the action of a ban `item` on its object: _overlaps strict, or, when
+    neither names an action it knows ("power cycle"), every object word of the item is in the sentence."""
+    if _overlaps(item, sentence, strict=True):
+        return True
+    (ia, io), (sa, so) = (_target(restriction_source.bare(x), conditions=False) for x in (item, sentence))
+    return not ia and not sa and bool(io) and io <= so
 
 
 def _conflict_reason(item: str, text: str, quote: str = "") -> str:
@@ -6876,26 +7045,30 @@ def _needless_ask(a: dict, text: str) -> str:
 _CLASS_FOR = {"irreversible": "irreversible", "restriction": "restriction_change"}
 
 
+def _classify_fixed(a: dict) -> str:
+    """Sets a missing or mismatched `classify` of an irreversible or restriction ask to the class its
+    `blocking` implies and says so; "" when it already agrees, is `neither` (_unclassified_ask) or
+    needs none. Only the form is wrong there: `blocking` already says why it blocks."""
+    want, cls = _CLASS_FOR.get(a.get("blocking")), a.get("classify")
+    if not want or cls in (want, "neither"):
+        return ""
+    a["classify"] = want
+    return (f"`classify` {cls!r} did not match blocking `{a['blocking']}`; it was set to `{want}`, the class "
+            f"that blocking implies. Set it yourself next time, or change `blocking` if it was wrong")
+
+
 def _unclassified_ask(a: dict, least: str) -> tuple[str, str] | None:
-    """(refusal label, why) for an irreversible or restriction ask whose `classify` is missing, is
-    `neither`, or does not agree with `blocking`, or an irreversible ask that does not name the
-    reversible alternative it considered; else None. Access, funds, spend, review, merge and human
-    asks carry a reason only the user or another person can clear, so they need no class."""
+    """(refusal label, why) for an irreversible or restriction ask classified `neither` (a judgment
+    call), or an irreversible ask that does not name the reversible alternative it considered; else
+    None. A missing or mismatched class is corrected first (_classify_fixed). Access, funds, spend,
+    review, merge and human asks carry a reason only the user or another person can clear, so they
+    need no class."""
     blocking = a.get("blocking")
-    want = _CLASS_FOR.get(blocking)
-    if not want:
+    if not _CLASS_FOR.get(blocking):
         return None
-    cls = a.get("classify")
-    if cls not in ASK_CLASSES:
-        return ("unclassified", f"classify it first: set `classify` to `{want}` for blocking `{blocking}`. "
-                "`irreversible`: the step cannot be undone; `restriction_change`: it breaks or changes a "
-                "restriction; `neither`: decide it yourself")
-    if cls == "neither":
+    if a.get("classify") == "neither":
         return ("neither", "decide it yourself. A step that is neither irreversible nor a restriction change is a "
                 "judgment call: act on it, memory_add a decision and notify at severity low")
-    if cls != want:
-        return ("classify mismatch", f"`classify` {cls} does not match blocking `{blocking}`: set `classify` to "
-                f"`{want}`, or change `blocking` to the reason that is true")
     if blocking == "irreversible" and len(least) < LEAST_DISRUPTIVE_MIN:
         return ("no reversible alternative", "name the reversible alternative you considered in least_disruptive, "
                 "and why it does not do. If one does, take it (task_add) and memory_add the decision instead of "
@@ -7923,13 +8096,14 @@ def _use_charter_approval(p: Project, rid: str, key: str | None) -> None:
 # with it: a test fails when the source of CHARTER_GUARD_FUNCS no longer has CHARTER_GUARD_PIN's
 # sha256. A user's change that failed under an older guard for another reason than the guard
 # (reraise_charter_changes) is then raised at once.
-CHARTER_GUARD_VERSION = 17
+CHARTER_GUARD_VERSION = 20
 CHARTER_GUARD_FUNCS = ("_reject_contradicting_append", "_append_conflicts", "_overlaps", "_on_object", "_quote_hits",
                        "_item_quote_hits", "_items", "_norm", "_may_lift", "_lifts_item", "_companion_clause",
                        "_ref_ids", "_companion_exception", "_changed_sentences", "_quoted_news",
                        "_charter_approval", "_ask_charter_approval", "_conflict_reason", "_scope_names",
-                       "_scoped_exception", "_excepted_item")
-CHARTER_GUARD_PIN = (17, "1a04da38f7231e8b05374a173b8b60a068d5c927886dcbe7f5e6f9800bbcc004")
+                       "_scoped_exception", "_excepted_item", "_orders_banned",
+                       "_same_target", "_delivery_names", "_undelivered")
+CHARTER_GUARD_PIN = (20, "b181c0cbb108c4d58eeda8ad3a52b88b14766a15bd679068638ea83ce1f10876")
 CHARTER_RERAISE_KEY = "charter_reraise"   # kv: {"version", "ts"} of the last re-raise pass
 
 
@@ -8114,7 +8288,8 @@ def _charter_update(p: Project, section: str, text: str, quote: str, replaces: s
         name = " ".join(old_head[3:].split())
         if name.lower().startswith("brief"):
             raise ValueError("charter_update: the Brief is the user's own words and is never replaced")
-        loose = not any(restriction_source.sourced(" ".join(x)) for x in restriction_source.split_items(
+        rec = restriction_source.history_items(p)
+        loose = not any(restriction_source.sourced(" ".join(x), rec) for x in restriction_source.split_items(
             "\n".join(old_body)))   # every item unsourced: advisory, the coordinator's to drop
         if name.lower().startswith("restriction") and not (by_word or loose):
             raise ValueError(f"charter_update: replacing the restriction section {name!r} {why}")
@@ -8136,11 +8311,12 @@ def _charter_update(p: Project, section: str, text: str, quote: str, replaces: s
                              f"sections: " + "; ".join(n for n in names if n))
         t, hits = _charter_quote_spot(sections, t, section, quote)
         body = "\n".join(sections[t][1])
-        loose = len(hits) == 1 and restriction_source.unsourced_span(body, *hits[0], _items(body))
+        rec = restriction_source.history_items(p)
+        loose = len(hits) == 1 and restriction_source.unsourced_span(body, *hits[0], _items(body), rec)
         if names[t].lower().startswith("restriction") and not (by_word or loose):
             raise ValueError(f"charter_update: removing or replacing a restriction {why}")
         cited = cited or names[t].lower().startswith("restriction") and any(
-            restriction_source.cited_span(body, *h, _items(body)) for h in hits)
+            restriction_source.cited_span(body, *h, _items(body), rec) for h in hits)
         if len(hits) != 1:
             near = _closest_items(sections, quote) if not hits else []
             raise ValueError(f"charter_update: `quote` matches {len(hits)} times in {names[t]!r}; quote the exact "

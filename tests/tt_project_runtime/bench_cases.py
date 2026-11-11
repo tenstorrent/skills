@@ -105,10 +105,11 @@ def test_bench_prep_replays_a_task_built_on_a_parent_branch_from_the_parent_head
     repo, git, commit, rev = _bench_repo(tmp_path)
     since = 1_000_000.0
     subprocess.run([*git, "checkout", "-q", "-b", "par", "main"], check=True)
-    par = commit({"mod.py": "def old():\n    return 1\n\n\ndef feat():\n    return 5\n"}, "parent")
+    par = commit({"mod.py": "def old():\n    return 1\n\n\ndef feat():\n    return 4\n"}, "parent")
     subprocess.run([*git, "checkout", "-q", "-b", "kid", "par"], check=True)
     kid_test = "import mod\n\n\ndef test_old():\n    assert mod.old() == 1\n\n\ndef test_feat():\n    assert mod.feat() == 5\n"
-    kid = commit({"tests/test_mod.py": kid_test}, "kid")
+    # The fix: feat() fails its test on the parent's head and passes on the kid's (fail-to-pass).
+    kid = commit({"mod.py": "def old():\n    return 1\n\n\ndef feat():\n    return 5\n", "tests/test_mod.py": kid_test}, "kid")
     subprocess.run([*git, "checkout", "-q", "main"], check=True)
     unrelated = commit({"other.txt": "x\n"}, "other")
     subprocess.run([*git, "cherry-pick", par, kid], check=True, capture_output=True)
@@ -173,9 +174,92 @@ def test_bench_unknown_symbols_counts_names_the_spec_gives_and_ignores_outside_m
     head = commit({"pkg/__init__.py": "", "pkg/tool.py": "def run():\n    pass\n\n\ndef extra():\n    pass\n",
                    "tests/test_tool.py": "import json\nimport mod as m\nfrom pkg import tool\nfrom pkg.tool import extra\n\n\n"
                                          "def test_t():\n    tool.run(); extra(); m.old(); json.dumps(1)\n"}, "tool")
-    files = ["tests/test_tool.py"]
-    assert bench.unknown_symbols(repo, base, head, files, "") == ["tool", "tool.extra", "tool.run"]
-    assert bench.unknown_symbols(repo, base, head, files, "Add pkg/tool.py with run() and extra().") == []
+    tests = [("tests/test_tool.py", "test_t")]
+    assert bench.unknown_symbols(repo, base, head, tests, "") == ["tool", "tool.extra", "tool.run"]
+    assert bench.unknown_symbols(repo, base, head, tests, "Add pkg/tool.py with run() and extra().") == []
+
+
+def test_bench_unknown_symbols_follows_dotted_imports_and_reads_only_the_held_out_tests(tmp_path):
+    from ttp import bench
+    repo, git, commit, rev = _bench_repo(tmp_path)
+    base = commit({"pkg/__init__.py": "", "pkg/tool.py": "def run():\n    pass\n"}, "pkg")
+    head = commit({"pkg/tool.py": "def run():\n    pass\n\n\ndef extra():\n    pass\n",
+                   "pkg/sub/__init__.py": "", "pkg/sub/deep.py": "def go():\n    pass\n",
+                   "tests/test_tool.py": "import pkg.tool\nimport pkg.sub.deep\nimport mod\n\n\n"
+                                         "def test_a():\n    pkg.tool.extra(); pkg.tool.run.__name__; pkg.sub.deep.go()\n\n\n"
+                                         "def test_other():\n    mod.not_held_out()\n\n\n"
+                                         "class TestB:\n    def test_b(self):\n        mod.old()\n\n"
+                                         "    def test_c(self):\n        mod.also_not_held_out()\n"}, "dotted")
+    tests = [("tests/test_tool.py", "test_a"), ("tests/test_tool.py", "TestB.test_b")]
+    assert bench.unknown_symbols(repo, base, head, tests, "") == ["deep", "deep.go", "sub", "tool.extra"]
+    assert bench.unknown_symbols(repo, base, head, tests, "Add extra() and deep.go().") == ["sub"]
+    assert bench.unknown_symbols(repo, base, head, [("tests/test_tool.py", "test_other")], "") == [
+        "deep", "mod.not_held_out", "sub"], "its module-level imports count, its other tests do not"
+
+
+def test_bench_prep_validates_fail_to_pass_tests_and_finds_landings_through_carriers(env, tmp_path):
+    from ttp import bench
+    p = make(env)
+    repo, git, commit, rev = _bench_repo(tmp_path)
+    since = 1_000_000.0
+    tests = ("import mod\n\n\ndef test_old():\n    assert mod.old() == 1\n\n\ndef test_same():\n"
+             "    assert mod.old() == 1\n\n\ndef test_new():\n    assert mod.new() == 2\n")
+    mixed = _bench_land(git, commit, rev, "mixed", {"mod.py": "def old():\n    return 1\n\n\ndef new():\n    return 2\n",
+                                                     "tests/test_mod.py": tests, "tests/data.txt": "x\n"},
+                        p, "Add new() returning 2.", since + 1)
+    passes = _bench_land(git, commit, rev, "passes", {"tests/test_more.py": "import mod\n\n\ndef test_more():\n"
+                                                      "    assert mod.old() == 1\n"}, p, "Test old().", since + 2)
+    broken = _bench_land(git, commit, rev, "broken", {"tests/test_bad.py": "def test_bad():\n    assert False\n"},
+                         p, "A test.", since + 3)
+    # A change the push queue landed under its review's row: the review carries it on.
+    via = _bench_land(git, commit, rev, "via", {"mod.py": "def old():\n    return 1\n\n\ndef new():\n    return 2\n\n\n"
+                                                "def third():\n    return 3\n", "tests/test_third.py": "import mod\n\n\n"
+                                                "def test_third():\n    assert mod.third() == 3\n"},
+                      p, "Add third() returning 3.", since + 4)
+    review = p.db.add_task(f"Review #{via}", "review", kind="review")
+    p.db.x("UPDATE push_queue SET task=?, branch='review-branch' WHERE task=?", (review, via))
+    p.db.x("UPDATE tasks SET status='done', labels=? WHERE id=?", (json.dumps([f"auto_review:{via}"]), review))
+    out = tmp_path / "bench"
+    m = bench.prep(p.db, repo, out, since)
+    assert [t["task"] for t in m["tasks"]] == [mixed, via]
+    assert m["validated"] is True and m["rounds"] == bench.ROUNDS == 3 and m["test_cmd"] == bench.TEST_CMD
+    t = m["tasks"][0]
+    assert t["tests"] == ["tests/test_mod.py::test_new"], "a test that passes on the base is dropped"
+    assert sorted(t["heldout"]) == ["tests/data.txt", "tests/test_mod.py"], "every test file the change touches"
+    assert (out / str(mixed) / "heldout" / "tests" / "data.txt").read_text() == "x\n"
+    assert not (out / str(mixed) / "workspace" / "tests" / "data.txt").exists()
+    why = {e["task"]: e["why"] for e in m["excluded"]}
+    assert why[passes] == "its held-out tests pass on the base: tests/test_more.py::test_more"
+    assert why[broken] == "none of its held-out tests fails on the base and passes 3 of 3 runs on the head"
+    unchecked = bench.prep(p.db, repo, tmp_path / "unchecked", since, validated=False)
+    assert [t["task"] for t in unchecked["tasks"]] == [mixed, passes, broken, via]
+    assert unchecked["validated"] is False and "test_cmd" not in unchecked
+    assert unchecked["tasks"][0]["tests"] == ["tests/test_mod.py::test_same", "tests/test_mod.py::test_new"]
+
+
+def test_bench_parses_a_test_file_piece_by_piece_like_a_whole_parse(tmp_path, monkeypatch):
+    # Pieces split at unindented lines; one that splits a string, a bracket, a decorated def or an
+    # if/else does not parse and joins the next. The result equals one parse of the whole file, a
+    # file that does not parse gives None, and an unchanged piece of a new version is not parsed again.
+    from ttp import bench
+    repo, git, commit, rev = _bench_repo(tmp_path)
+    src = ('"""Doc."""\nimport os\nX = """\nnot code\ndef nope(:\n"""\nY = [\n1,\n]\n@deco\n'
+           'def test_a():\n    pass\nif os:\n    Z = 1\nelse:\n    Z = 2\ntry:\n    pass\nexcept Exception:\n'
+           '    pass\nfinally:\n    pass\nclass TestB:\n    def test_b(self):\n        os.sep\n')
+    blob = lambda r, path: subprocess.run([*git, "rev-parse", f"{r}:{path}"], capture_output=True,
+                                          text=True).stdout.strip()
+    commit({"tests/test_p.py": src, "tests/test_bad.py": src + "def broken(:\n    pass\n",
+            "tests/test_big.py": "S = '''\n" + "word\n" * (bench._PIECE_MAX // 4) + "'''\ndef test_c():\n    pass\n"}, "p")
+    for path in ("tests/test_p.py", "tests/test_big.py"):
+        tree = bench._tree(repo, blob("HEAD", path))
+        assert ast.dump(tree) == ast.dump(ast.parse((repo / path).read_bytes()))
+    assert bench._tree(repo, blob("HEAD", "tests/test_bad.py")) is None
+    assert bench._tests_at(repo, blob("HEAD", "tests/test_p.py")) == {"test_a": [], "TestB.test_b": []}
+    parsed, parse = [], ast.parse
+    monkeypatch.setattr(bench.ast, "parse", lambda s, *a, **k: parsed.append(s) or parse(s, *a, **k))
+    commit({"tests/test_p.py": src + "def test_new():\n    pass\n"}, "p2")
+    assert "test_new" in bench._tests_at(repo, blob("HEAD", "tests/test_p.py"))
+    assert parsed == [b"def test_new():\n    pass\n"]
 
 
 def _bench_built(env, tmp_path):
@@ -494,3 +578,15 @@ def test_bench_run_agent_and_grade_of_each_cell_run_in_venvs_of_their_own(env, t
         assert shown, (cell / "tests.log").read_text()
         grades.add(shown[1])
     assert len(agents | grades) == 4, "each cell's agent and grade get a venv of their own"
+
+
+def test_bench_reach_follows_carrier_links_named_by_follows_labels():
+    # landed.carriers joins a link that follows a carried task on its branch; the bench's reach
+    # (a superset found before carriers) must walk those links too, or such tasks lose their landing.
+    from types import SimpleNamespace
+    from ttp import bench
+    rows = SimpleNamespace(tasks={1: {"branch": "b1"}, 2: {"branch": "b2"}},
+                           links=[(2, "b2", "code", set(), set(), {1})])
+    assert bench._reach(rows, [{"task": 2, "branch": "b2"}]) == {1, 2}
+    rows.links = [(2, "b2", "code", set(), set(), set())]
+    assert bench._reach(rows, [{"task": 2, "branch": "b2"}]) == {2}

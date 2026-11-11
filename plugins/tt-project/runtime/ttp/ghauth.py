@@ -7,9 +7,10 @@ printed an error and exited 0, and a start_when probe exited gh's 4 per task. No
 per host runs `gh auth status` at most every EVERY_S, only while a project here uses gh (uses_gh), in
 the daemon of whichever project takes the host-wide lock first; the others skip it and read its answer
 from the state file (STATE under the tt-project home). While it says logged out, each project using gh
-keeps kv KV set and asserts the alert KEY: a machine-wide condition (Daemon._machine_wide), so one
-project broadcasts it and the others show it quietly. It names the host and the step only the user can
-take (`gh auth login`), and clears once the check passes. A gh call elsewhere that failed for its
+keeps kv KV set and asserts the alert KEY, unless a delivery.gh_route answers (ghroute): a machine-wide
+harness condition (Daemon._machine_wide), so one project broadcasts it and the others show it quietly.
+No GitHub login is kept on lab hosts, so it never asks anyone to log gh in: it names the route setting
+and what is skipped, and clears once gh works (logged in here, or routed). A gh call elsewhere that failed for its
 login (auth_failed) asks for a recheck at once (nudge) rather than waiting out EVERY_S.
 
 `gh auth status` that fails for another reason (no network, a timeout) is no answer: the last one stands.
@@ -25,7 +26,7 @@ import subprocess
 import time
 from pathlib import Path
 
-KEY = "gh-auth"        # the alert's condition key (alerts.USER_BLOCKERS)
+KEY = "gh-auth"        # the alert's condition key (a harness condition)
 KV = "gh_auth_down"    # kv while this project uses gh and the host's gh is logged out
 STATE = "gh-auth.json"
 LOCK = "gh-auth.lock"
@@ -140,25 +141,50 @@ def check(now: float | None = None, home: Path | None = None, every_s: float = E
     return read(home) if got is None else got
 
 
+def _commands(payload: dict) -> list:
+    """The shell commands a schedule runs (its command, precheck and heal steps), never its spec prose."""
+    heal = payload.get("heal") if isinstance(payload.get("heal"), dict) else {}
+    return [payload.get("command"), payload.get("precheck")] + [heal.get(k) for k in ("check", "fix", "suppress",
+                                                                                     "status_command")]
+
+
+def _probes(result: dict) -> list:
+    """The commands a hand-off has the daemon run (retry_when, on_pass_cmd and each later wait in `then`),
+    never its summary, question or other prose. Only a waiting hand-off's probes still run."""
+    if result.get("status") != "waiting":
+        return []
+    out = [result.get("retry_when"), result.get("on_pass_cmd")]
+    later = result.get("then")
+    for w in later if isinstance(later, list) else []:
+        if isinstance(w, dict):
+            out += [w.get("retry_when"), w.get("on_pass_cmd")]
+    return out
+
+
+def _runs_gh(cmds) -> bool:
+    return any(isinstance(c, str) and _USES_RE.search(c) for c in cmds)
+
+
 def uses_gh(db) -> bool:
-    """Whether this project uses gh now: an enabled schedule that calls it (pr-watch while a task has a
-    PR), or an open task with a PR or a wait or start probe that calls gh or `ttp ci`."""
-    from .db import OPEN_TASKS
+    """Whether this project uses gh now: an enabled schedule whose commands call it (pr-watch while a task
+    has a PR), or an open task with a PR, or whose start_when or hand-off probes call gh or `ttp ci`.
+    Only commands that run count: a spec, summary or hand-off that mentions gh in words is no gh use."""
+    from .db import OPEN_TASKS, deferral, load_result
     prs = bool(db.one(f"SELECT id FROM tasks WHERE {OPEN_TASKS} AND pr_url IS NOT NULL AND pr_url != '' LIMIT 1"))
+    if prs:
+        return True
     for s in db.q("SELECT payload FROM schedules WHERE enabled=1"):
         try:
             payload = json.loads(s["payload"] or "{}")
         except ValueError:
             payload = {}
-        if prs and isinstance(payload, dict) and payload.get("builtin") == "prs" or _USES_RE.search(s["payload"] or ""):
+        if isinstance(payload, dict) and _runs_gh(_commands(payload)):
             return True
-    if prs:
-        return True
-    return any(_USES_RE.search((t["labels"] or "") + " " + (t["result"] or ""))
+    return any(_runs_gh([deferral(t).get("when")] + _probes(load_result(t["result"])))
                for t in db.q(f"SELECT labels, result FROM tasks WHERE {OPEN_TASKS} AND status IN ('queued','waiting')"))
 
 
-def text(st: dict, host: str, when: str) -> str:
-    return (f"gh is logged out on {host} since {when} ({st.get('error') or 'gh auth status failed'}): PR watching, "
-            f"CI waits and other gh calls of every project on {host} fail until the user runs `gh auth login` "
-            f"there (ssh {host}). Nothing else is needed: the alert clears once `gh auth status` passes.")
+def text(st: dict, host: str, when: str, cfg: dict | None = None) -> str:
+    """The harness condition: what is skipped and the route setting (ghroute); never a login step."""
+    from . import ghroute
+    return ghroute.down_text(host, when, st.get("error") or "gh auth status failed", cfg)

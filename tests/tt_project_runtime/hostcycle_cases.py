@@ -1108,6 +1108,36 @@ def test_a_watchdog_systemd_only_started_before_the_request_is_armed_not_the_ini
         "not fired: it logged nothing of its own before the boot's journal ended 88 s later")
 
 
+def test_a_unit_that_only_logged_a_skip_is_not_the_initiator(env, monkeypatch):
+    from ttp import hostcycle
+    monkeypatch.setattr(hostcycle, "planned", lambda p, boot, at: None)
+    probe = "example-health.service"
+    skip = "example-health: skip: device held (no power-cycle)"
+    # A health probe that names a power cycle only to say it skipped one, then the armed watchdog: no
+    # unit is the initiator; logind's request is, with both noted.
+    boot = [_j(-40, skip, probe, "example-health"), *_ARMED]
+    got = _find_over(monkeypatch, boot)
+    assert got == {"source": "journal", "text": "a request to systemd-logind that names no user (journal: System is "
+                   f"rebooting.); {_WATCHDOG} (power-cycle a hung shutdown) armed, not fired: it logged nothing of "
+                   "its own before the boot's journal ended 88 s later; "
+                   f"{probe} logged only a skip ({skip})"}, got
+    # Other skip wordings, with or without a tag, likewise; a real stop line before it still wins.
+    for msg in ("Skipping power cycle: device busy", "skipped reboot (hold active)"):
+        text = _find_over(monkeypatch, [_j(-40, msg, probe, "example-health"), *_ARMED])["text"]
+        assert text.startswith("a request to systemd-logind") and text.endswith(f"{probe} logged only a skip ({msg})")
+    real = [_j(-90, "power-cycle the host now", "example-recover.service", "example-recover"), *boot]
+    assert _find_over(monkeypatch, real)["text"].startswith("example-recover.service (power-cycle the host now)")
+    # A line that only mentions skipping later in it is no skip line.
+    acted = [_j(-40, "power-cycling the host: skip list empty", probe, "example-health"), *_ARMED]
+    assert _find_over(monkeypatch, acted)["text"].startswith(f"{probe} (power-cycling the host")
+    # A unit systemd started whose own lines after its start only skipped did not fire.
+    started = [*_ARMED[:3], _j(1, "skip: shutdown finished in time", _WATCHDOG, "example-watchdog"), *_ARMED[3:]]
+    assert _find_over(monkeypatch, started)["text"] == (
+        "a request to systemd-logind that names no user (journal: System is rebooting.); "
+        f"{_WATCHDOG} (power-cycle a hung shutdown) armed, not fired: it logged only a skip "
+        "(skip: shutdown finished in time)")
+
+
 def test_a_watchdog_that_logged_after_its_start_is_still_the_initiator(monkeypatch):
     from ttp import initiator
     said = f"{_WATCHDOG} (Started {_WATCHDOG} - power-cycle a hung shutdown.)"

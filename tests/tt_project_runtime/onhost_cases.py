@@ -396,3 +396,46 @@ def test_the_batch_loop_never_rebinds_its_action_list_or_position():
     for stmt in loop.body:
         walk(stmt)
     assert not bad, bad
+
+
+def _oh_promises(p):
+    from ttp import obligations as ob
+    return [o for o in ob.items(p.db) if o.get("promise")]
+
+
+def test_the_status_footer_mints_no_promise_and_names_only_the_claimed_task(env):
+    """Upstream notes 10b38a1469583bae and b3b79b0f2535fb2a: the footer's queue forecast ('ETA 21:00 to
+    start') once became a promise nobody wrote, and it listed every unstarted task the reply covered."""
+    from ttp import coordinator as coord, obligations as ob, onhost, wakemode
+    p = make(env)
+    tid = _oh_task(p)
+    other = _oh_task(p)
+    coord.apply(p, [{"type": "reply", "text": f"Power cycling #{tid} now.", "chat": "c1", "owners": [tid, other]}],
+                turn=1)
+    (got,) = _oh_sent(p)
+    assert f"\n{onhost.STATUS_HEAD}#{tid}: queued for a worker, ETA" in got, got
+    assert f"#{other}:" not in got   # a covered task the message made no claim about gets no forecast
+    assert _oh_promises(p) == []
+    # The harness's footers are never read as the coordinator's own commitments.
+    footer = f"\n{onhost.STATUS_HEAD}#{tid}: queued for a worker, ETA 21:00 to start, finish 23:00"
+    assert ob.commitments("Noted." + footer) == []
+    assert ob.commitments(f"Noted.\n{wakemode.HEAD} resumed, ETA 21:00") == []
+    # An authored commitment still mints one, footer or not.
+    assert ob.commitments("I will send the bench table by 21:00." + footer) == ["I will send the bench table by 21:00."]
+    coord.apply(p, [{"type": "reply", "text": f"I will send the bench table by 21:00. Power cycling #{tid} now.",
+                     "chat": "c1", "owners": [tid]}], turn=2)
+    assert onhost.STATUS_HEAD in _oh_sent(p)[-1]
+    (promise,) = _oh_promises(p)
+    assert "bench table" in promise["text"] and "queued for a worker" not in promise["text"], promise
+
+
+def test_status_footer_off_marks_the_claim_and_appends_no_status(env):
+    from ttp import coordinator as coord, onhost
+    p = make(env)
+    tid = _oh_task(p)
+    p.set_config("coordinator.status_footer", False)
+    coord.apply(p, [{"type": "reply", "text": _OH_CLAIM, "chat": "c1", "owners": [tid]}], turn=1)
+    (got,) = _oh_sent(p)
+    assert got.startswith(f"{onhost.MARK} Power cycling it now") and onhost.STATUS_HEAD not in got, got
+    note = next(n for n in p.db.kv(coord.NOTES_KEY, []) if n.startswith("onhost:"))
+    assert f"#{tid}: queued for a worker" in note and "status_footer is off" in note

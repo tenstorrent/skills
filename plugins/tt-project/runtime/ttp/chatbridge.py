@@ -29,6 +29,18 @@ fields for the effort the daemon launched the run at (low, medium, high, xhigh, 
 replace a field that carries the conversation (CONVERSATION). Unset, a request goes out as it is. An
 endpoint that rejects one (a 400 naming it) gets the request again without them, and the rest of the
 run goes without them; stats() records it for the run's meter.
+
+Mid-run model swap: a run whose launch named ranked stand-ins (`standins`, modelrank.standins: the
+ranking's other models, none for a required pin) keeps going when its model goes away. When the
+upstream refuses the model (model_missing: a 404 naming it or one /models leaves out; or the error
+code model_not_found or unrecognized_model), or SWAP_ERRORS calls in a row end in a 5xx or no answer
+while the served lists (`served`: state dirs holding route.MODELS_FILE, read fresh, modelrank.served)
+no longer list it, that call and every later one go to the first stand-in those lists name that this
+run has not left. Its effort_fields and context window are resolved again; the session and worktree
+stay. CLAUDE_CODE_AUTO_COMPACT_WINDOW is set once at start, so a stand-in with a smaller window
+relies on the 'prompt is too long' answer above for Claude Code to compact. stats() lists each swap
+(`mid_run`: {from, to, at, why}); the daemon keeps it in the run note (model_rank.mid_run) with one
+low alert per swap. No stand-in served (or the lists unknown): the error goes back as before.
 """
 from __future__ import annotations
 
@@ -39,6 +51,7 @@ import re
 import secrets
 import socket
 import threading
+import time
 import urllib.error
 import urllib.request
 import uuid
@@ -61,6 +74,9 @@ EFFORTS = ("low", "medium", "high", "xhigh", "max")   # the run efforts an effor
 CONVERSATION = frozenset({"model", "messages", "tools", "tool_choice", "parallel_tool_calls", "functions",
                           "function_call", "stream", "stream_options", "n", "max_tokens"})
 REJECT_STATUSES = (400, 422)
+REFUSAL_CODES = ("model_not_found", "unrecognized_model")   # error codes that refuse the run's model
+SWAP_FILE = "stand-in.json"   # in the run dir: {asked, ran} once a mid-run swap ran a stand-in (live views)
+SWAP_ERRORS = 3   # 5xx or no-answer calls in a row that swap a model the served lists no longer name
 
 
 class BridgeError(Exception):
@@ -74,17 +90,33 @@ class BridgeAuthError(BridgeError):
     auth = True
 
 
-def settings(cfg: dict, tier: str, model: str, effort: str = "") -> dict:
+def settings(cfg: dict, tier: str, model: str, effort: str = "", standins=(), served=()) -> dict:
     """The run.json `bridge` entry for a `chat` run: no key, only where to find it, and the extra
-    request fields for the run's effort (effort_fields) when its model has any."""
+    request fields for the run's effort (effort_fields) when its model has any. `standins` (ranked
+    model ids) and `served` (state dirs with a served list) arm the mid-run swap, each stand-in with
+    its own effort fields and context window."""
     entry = ((cfg or {}).get("providers") or {}).get("chat") or {}
     row = (entry.get("tiers") or {}).get(tier) or {}
     cap = row.get("max_tokens") or entry.get("max_tokens") or 0
-    window = row.get("context_window") or entry.get("context_window") or 0
+    window = window_of(entry, model, row)
     fields = effort_fields(entry, model, effort)
+    alts = [{"model": m, **({"fields": f} if (f := effort_fields(entry, m, effort)) else {}),
+             **({"context_window": w} if (w := window_of(entry, m)) else {})} for m in standins if m != model]
     return {"endpoint": str(entry.get("endpoint") or ""), "base_url": str(entry.get("base_url") or ""),
             "model": model, "max_tokens": int(cap or 0), **({"context_window": int(window)} if window else {}),
-            **({"effort": effort, "fields": fields} if fields else {})}
+            **({"effort": effort, "fields": fields} if fields else {}),
+            **({"effort": effort, "standins": alts, "served": [str(d) for d in served]} if alts and served else {})}
+
+
+def window_of(entry: dict, model: str, row: dict | None = None) -> int:
+    """The context window for `model`: the run's tier row's (`row`), else a tier row naming that model,
+    else providers.chat.context_window; 0 for Claude Code's own."""
+    rows = [row or {}] + [r for r in ((entry or {}).get("tiers") or {}).values()
+                          if isinstance(r, dict) and r.get("model") == model]
+    for r in rows:
+        if r.get("context_window"):
+            return int(r["context_window"])
+    return int((entry or {}).get("context_window") or 0)
 
 
 def effort_fields(entry: dict, model: str, effort: str) -> dict:
@@ -513,7 +545,7 @@ class Bridge:
 
     def __init__(self, base_url: str, key: str, model: str, max_tokens: int = 0,
                  timeout: float = UPSTREAM_TIMEOUT_S, context_window: int = 0, effort: str = "",
-                 fields: dict | None = None):
+                 fields: dict | None = None, standins: list | None = None, served: list | None = None):
         self.base_url, self._key, self.model = endpoint.base_url(base_url), key, model
         self.max_tokens, self.timeout = int(max_tokens or 0), timeout
         self.context_window = int(context_window or 0)
@@ -522,6 +554,11 @@ class Bridge:
         self.last_fault, self.faults = "", {}   # the last call's endpoint fault kind (fault_of), counts
         self.upstream: dict = {}   # the last failed answer's HTTP status and error code (upstream_of)
         self._listed: bool | None | str = ""    # _model_listed's answer, "" until asked
+        self.standins = [s for s in standins or () if isinstance(s, dict) and s.get("model")]   # ranked, best first
+        self.served = [str(d) for d in served or ()]   # state dirs whose served list (route.MODELS_FILE) is read
+        self.mid_run: list[dict] = []   # each swap: {from, to, at, why}
+        self.on_swap = None   # called with {asked, ran} after each swap (the runner's live SWAP_FILE)
+        self._errs, self._left, self._swap_lock = 0, set(), threading.Lock()   # 5xx/no-answer run; models left
         self.server: http.server.ThreadingHTTPServer | None = None
         self.thread: threading.Thread | None = None
 
@@ -548,7 +585,8 @@ class Bridge:
             raise BridgeError("no model for this tier: set providers.chat.tiers.<tier>.model")
         return cls(url or saved, key, s["model"], s.get("max_tokens") or 0,
                    **{"context_window": s.get("context_window") or 0, "effort": s.get("effort") or "",
-                      "fields": s.get("fields") or {}, **kw})
+                      "fields": s.get("fields") or {}, "standins": s.get("standins") or [],
+                      "served": s.get("served") or [], **kw})
 
     @property
     def url(self) -> str:
@@ -592,6 +630,8 @@ class Bridge:
             kind = "model_missing"   # a bare 404, and the endpoint's /models leaves the model out
         self.last_fault = kind
         self.upstream = upstream_of(status, detail, self._key)
+        with self._swap_lock:   # calls in parallel count their errors in a row, none lost
+            self._errs = self._errs + 1 if status == 0 or status >= 500 else 0
         if kind:
             self.faults[kind] = self.faults.get(kind, 0) + 1
 
@@ -619,7 +659,57 @@ class Bridge:
         return error_for(502, detail)
 
     def _ok(self) -> None:
-        self.last_fault, self.upstream = "", {}
+        with self._swap_lock:
+            self.last_fault, self.upstream, self._errs = "", {}, 0
+
+    def _served_ids(self) -> list[str] | None:
+        """The ids the served lists name now (modelrank.served, each fresh), or None when none is known."""
+        from pathlib import Path
+        from . import modelrank
+        got, now = None, time.time()
+        for d in self.served:
+            ids = modelrank.served(Path(d), now)
+            if ids is not None:
+                got = (got or []) + ids
+        return got
+
+    def _swap_why(self, used: str) -> str:
+        """Why the last answer for `used` swaps it: 'refused', 'not listed' (SWAP_ERRORS errors in a row
+        and the served lists leave it out), else ''."""
+        if not self.standins:
+            return ""
+        if self.last_fault == "model_missing" or self.upstream.get("code") in REFUSAL_CODES:
+            return "refused"
+        if self._errs >= SWAP_ERRORS and (ids := self._served_ids()) is not None and used not in ids:
+            return "not listed"
+        return ""
+
+    def _swapped(self, used: str) -> bool:
+        """True when the next try of this call goes to another model: this answer swapped `used` for the
+        first served stand-in the run has not left, or another call already did."""
+        why = self._swap_why(used)
+        if not why:
+            return False
+        with self._swap_lock:
+            if self.model != used:
+                return True
+            ids = self._served_ids() or []
+            alt = next((s for s in self.standins if s["model"] not in self._left and s["model"] != used
+                        and s["model"] in ids), None)
+            if alt is None:
+                return False   # no stand-in served: the error goes back as before
+            self._left.add(used)
+            self.model, self.fields, self.rejected = alt["model"], dict(alt.get("fields") or {}), False
+            self.context_window = int(alt.get("context_window") or 0)
+            self._listed, self._errs, self.last_fault, self.upstream = "", 0, "", {}
+            self.mid_run.append({"from": used, "to": alt["model"], "at": round(time.time(), 3), "why": why})
+            now = {"asked": self.mid_run[0]["from"], "ran": self.model}
+        if self.on_swap:
+            try:
+                self.on_swap(now)
+            except Exception:   # a live display hint, never the run's fault
+                pass
+        return True
 
     def stats(self) -> dict:
         """For the run's exit record: fault kinds, and the last failed answer's HTTP status and error
@@ -628,7 +718,8 @@ class Bridge:
         return {"last_fault": self.last_fault, "faults": dict(self.faults),
                 **({"upstream": dict(self.upstream)} if self.upstream else {}),
                 **({"effort": self.effort, "fields": dict(self.fields), "rejected": self.rejected}
-                   if self.fields else {})}
+                   if self.fields else {}),
+                **({"mid_run": [dict(m) for m in self.mid_run], "model": self.model} if self.mid_run else {})}
 
     def _open(self, req: dict):
         r = urllib.request.Request(f"{self.base_url}/chat/completions", data=json.dumps(req).encode(), headers={
@@ -637,34 +728,46 @@ class Bridge:
         return urllib.request.build_opener(endpoint._NoRedirect).open(r, timeout=self.timeout)
 
     def forward(self, h: _Handler, body: dict) -> None:
-        req = to_chat(body, self.model, self.max_tokens)
-        try:
+        while True:
+            with self._swap_lock:   # one model and its own fields: a swap in another call changes all three
+                used, fields, rejected = self.model, dict(self.fields), self.rejected
+            if self._errs >= SWAP_ERRORS and self._swapped(used):   # e.g. a stream that broke 3 times
+                continue
+            req = to_chat(body, used, self.max_tokens)
             try:
-                resp = self._open(with_fields(req, {} if self.rejected else self.fields))
+                try:
+                    resp = self._open(with_fields(req, {} if rejected else fields))
+                except urllib.error.HTTPError as e:
+                    if rejected or not fields:
+                        raise
+                    try:
+                        detail = e.read(2000).decode("utf-8", "replace")
+                    except Exception:
+                        detail = ""
+                    if not rejects(e.code, detail, fields):
+                        e.ttp_detail = detail   # read once: the handler below reports it
+                        raise
+                    with self._swap_lock:   # once, then the rest of the run goes without them (`used`'s only)
+                        if self.model == used:
+                            self.rejected = True
+                    resp = self._open(req)
             except urllib.error.HTTPError as e:
-                if self.rejected or not self.fields:
-                    raise
-                try:
-                    detail = e.read(2000).decode("utf-8", "replace")
-                except Exception:
-                    detail = ""
-                if not rejects(e.code, detail, self.fields):
-                    e.ttp_detail = detail   # read once: the handler below reports it
-                    raise
-                self.rejected = True   # once, then the rest of the run goes without them
-                resp = self._open(req)
-        except urllib.error.HTTPError as e:
-            detail = getattr(e, "ttp_detail", None)
-            if detail is None:
-                try:
-                    detail = e.read(2000).decode("utf-8", "replace")
-                except Exception:
-                    detail = ""
-            self._fault(e.code, detail)
-            return h._reply(*error_for(e.code, self._scrub(detail)))
-        except (urllib.error.URLError, OSError) as e:
-            self._fault(0)
-            return h._reply(*error_for(0, self._scrub(str(getattr(e, "reason", e)))))
+                detail = getattr(e, "ttp_detail", None)
+                if detail is None:
+                    try:
+                        detail = e.read(2000).decode("utf-8", "replace")
+                    except Exception:
+                        detail = ""
+                self._fault(e.code, detail)
+                if self._swapped(used):
+                    continue
+                return h._reply(*error_for(e.code, self._scrub(detail)))
+            except (urllib.error.URLError, OSError) as e:
+                self._fault(0)
+                if self._swapped(used):
+                    continue
+                return h._reply(*error_for(0, self._scrub(str(getattr(e, "reason", e)))))
+            break
         with resp:
             if not req.get("stream"):
                 try:

@@ -1120,6 +1120,8 @@ def lines(db, now: float | None = None, where=None, open_only: bool = False) -> 
             pr = o["promise"]
             state = ("claimed; " if pr.get("claim") else f"ordered ({pr.get('class')}); " if pr.get("order") is not None
                      else "promised; ") + _promise_state(o, now, where)
+            if (pr.get("claim") or {}).get("last") == CLAIM_UNREACHABLE:
+                state += "; unchecked: its check's host did not answer (exit 255), retrying"
             if pr.get("order") is not None and not pr.get("started"):
                 state += f"; not started (start by {timefmt.long(pr['start_by'], where)})"
         else:
@@ -1187,13 +1189,25 @@ def _has_time(sentence: str) -> bool:
     return bool(IN_RE.search(sentence) or any(m.group("m") or m.group("ap") for m in CLOCK_RE.finditer(sentence)))
 
 
+def authored(text: str) -> str:
+    """`text` without the lines the harness appends to a coordinator message before it is posted (onhost's
+    'Status now:' queue forecasts, wakemode's mode line): what the coordinator itself wrote."""
+    from . import onhost, wakemode
+    text = text or ""
+    for head in (onhost.STATUS_HEAD, wakemode.HEAD):
+        cut = text.find("\n" + head)
+        text = text[:cut] if cut >= 0 else text
+    return text
+
+
 def commitments(text: str) -> list[str]:
     """The sentences of `text` that commit the sender to a deliverable or a time: first-person future with
     a delivery verb ("I'll report back") or a send verb and its object ("I'll post each result here"),
     "it goes up as the draft PR", first-person future with a time ("we'll have it by 15:00"), or
-    an ETA with a time. Never a question or an offer ("if you want, I'll ...")."""
+    an ETA with a time. Never a question or an offer ("if you want, I'll ..."), and never a line the
+    harness appended (authored): a runtime footer's ETA is no promise anyone made."""
     out = []
-    for s in _sentences(text):
+    for s in _sentences(authored(text)):
         if s.endswith("?") or OFFER_RE.search(s):
             continue
         timed = _has_time(s)
@@ -1305,11 +1319,20 @@ def _named_owner(db, chat: str, text: str) -> int | None:
     return hits[0] if len(hits) == 1 else None
 
 
+def authored(text: str) -> str:
+    """`text` without the footer the harness appends to a sent reply (onhost: "Status now: #12: queued
+    for a worker, ETA ..."): the queue forecast is the harness's, never the sender's own promise."""
+    from .claimcheck import STATUS_TAIL
+    return (text or "").partition(STATUS_TAIL)[0]
+
+
 def record_promises(p, sent: list[tuple[int, str | None, str]], tasks: dict[int, str | None],
                     obligations: list[str] = (), now: float | None = None, explicit=(),
                     plans: dict[str, str] | None = None) -> list[str]:
     """Record the commitments in this batch's sent messages (message id, chat, text). `tasks`: the batch's
-    tasks by id with their reply_chat; one replying to a promise's chat owns it. `obligations`: the ids the
+    tasks by id with their reply_chat; one replying to a promise's chat owns it, unless it was cancelled or
+    the promise's words name others of them (#id): those own it. Only the sender's own words count (authored:
+    never the harness's appended status footer). `obligations`: the ids the
     batch recorded or attached owners to; one owned by a task that owns the promise is linked to it, and
     the promise closes with it. `explicit`: the message ids of replies that named `owners` or `delivers`;
     any other promise no batch task owns is attached to the one open task its text names in that chat
@@ -1317,10 +1340,13 @@ def record_promises(p, sent: list[tuple[int, str | None, str]], tasks: dict[int,
     (replan.batch_plans); a new time for a promise past its due with none is flagged (replan.flag_reply).
     Returns a note per promise."""
     now = time.time() if now is None else now
+    sent = [(mid, chat, authored(text)) for mid, chat, text in sent]
     found = [(mid, _chat(chat), said) for mid, chat, text in sent if (said := commitments(text))]
     if not found:
         return []
     full = {mid: text for mid, _, text in sent}
+    gone = {r["id"] for r in p.db.q(f"SELECT id FROM tasks WHERE status='cancelled' AND id IN "
+                                    f"({','.join('?' * len(tasks))})", list(tasks))} if tasks else set()
     from . import replan, timefmt
     tz = timefmt.tzinfo(p)
     hours = default_h(p.config())
@@ -1331,7 +1357,9 @@ def record_promises(p, sent: list[tuple[int, str | None, str]], tasks: dict[int,
         for mid, chat, said in found:
             text = " ".join(" ".join(said).split())[:PROMISE_TEXT_MAX]
             due = next((d for s in said if (d := promise_due(s, now, tz)) is not None), None)
-            owners = sorted(t for t, c in tasks.items() if c is not None and _chat(c) == chat)
+            owners = sorted(t for t, c in tasks.items() if c is not None and _chat(c) == chat and t not in gone)
+            cited = {int(m) for x in said for m in TASK_REF.findall(x)} & set(owners)
+            owners = sorted(cited) or owners   # the batch task its own words name owns it, not every one
             named = None if owners or mid in explicit else _named_owner(p.db, chat, full.get(mid, ""))
             if named is not None:
                 owners = [named]
@@ -1641,7 +1669,8 @@ def deliver(p, sent: list[tuple[int, str | None, list]], now: float | None = Non
 # landed can carry `claims`, each `{text, task | action | expect, due}`. A `task` (or `action`: the index
 # of a task_add of the same batch) holds once it ends done; an `expect` probe (start_when rules:
 # read-only, under a minute) holds once it exits 0. It runs model-free (the daemon's check_claims) and
-# is judged at its due: exit 1 is "not yet", 75, 255 or a timeout keep waiting up to CLAIM_WAIT_S more.
+# is judged at its due: exit 1 is "not yet", 75 or a timeout keep waiting up to CLAIM_WAIT_S more; 255
+# (ssh could not reach the probe's host, as while it reboots) is "could not check": retried, never a miss.
 # A miss raises one high `claim_failed` event. Overdue promises and orders, late orders and failed
 # claims carry `must_act` in their event data: the coordinator wake they start must act on each
 # (mustact.py).
@@ -1656,7 +1685,8 @@ LANDING_STUCK_KIND = "order_landing_stuck"
 MUST_ACT_KINDS = (PROMISE_KIND, ORDER_LATE_KIND, ORDER_KIND, CLAIM_KIND, LANDING_STUCK_KIND)
 ORDER_CLASSES = ("read", "change", "device")
 ORDER_START_S = 1800          # an order with no start_by: its owner's run starts within this after the message
-CLAIM_WAIT_S = 1800           # a claim's probe that cannot answer (75, 255, timeout) past its due: failed after this
+CLAIM_WAIT_S = 1800           # a claim's probe that cannot answer (75, timeout) past its due: failed after this
+CLAIM_UNREACHABLE = 255       # ssh's own exit: the probe's host did not answer; the claim stays unchecked and is retried
 CLAIM_HOPS_MAX = 50           # continuation hops a task claim's check walks from its named task (_continuations)
 CLAIM_WAITING = (75, 255, "timeout", None)
 # A change or device order is owned by a task that can make the change or run the job: a question,
@@ -1716,10 +1746,11 @@ def open_order(db, message: int) -> dict | None:
 
 
 def add_order(p, text: str, message: int, owners=(), due=None, start_by=None, action_class: str | None = None,
-              chat: str | None = None, now: float | None = None) -> str:
+              chat: str | None = None, now: float | None = None, reason: str | None = None) -> str:
     """Record the order user message `message` carries, or update the open one recorded for it. Returns
-    a note."""
-    from . import replan, timefmt
+    a note. `reason` (why the user gave it) and the message's own words are kept with it, so an old
+    order is re-read by its intent once that reason is gone (oldorders.py)."""
+    from . import oldorders, replan, timefmt
     now = time.time() if now is None else now
     text = " ".join(str(text or "").split())[:TEXT_MAX]
     if not text:
@@ -1747,6 +1778,8 @@ def add_order(p, text: str, message: int, owners=(), due=None, start_by=None, ac
                 replan.note_move(pr, due_at, now, f"new owner #{', #'.join(map(str, new))}", None, "order")
             pr["tasks"] = sorted(set(pr["tasks"]) | set(ids))
             pr["class"] = action_class
+            if oldorders.one_line(reason):
+                pr["reason"] = oldorders.one_line(reason)
             if due_at is not None and due_at != pr["due"]:
                 pr.update(due=due_at, timed=True, raised=None, set_at=now)
             if start_by not in (None, "") and start_at != pr["start_by"]:
@@ -1762,7 +1795,8 @@ def add_order(p, text: str, message: int, owners=(), due=None, start_by=None, ac
                             "due": due_at if due_at is not None else now + _hours(p) * 3600,
                             "timed": due_at is not None, "tasks": ids, "obligations": [], "raised": None,
                             "set_at": now, "order": int(message), "class": action_class, "start_by": start_at,
-                            "started": None, "late": None}}
+                            "started": None, "late": None, "reason": oldorders.one_line(reason),
+                            "context": oldorders.clean_context(p, oldorders.context_for(p.db, "", int(message)))}}
             note = f"order {oid} recorded from message #{message}"
         pr = o["promise"]
         p.db.set_kv(KV, st)
@@ -1992,6 +2026,8 @@ def _check_claim(p, o: dict, now: float, raised: list[str]) -> bool:
             _retire(db, now, "claim held", prefix=fp)
             return True
         answered = c.get("at") is not None and c["at"] >= pr["due"]
+        if c.get("last") == CLAIM_UNREACHABLE:
+            return False   # could not check: the next due_claims pass runs it again
         if now < pr["due"] or (not answered or c.get("last") in CLAIM_WAITING) and now < pr["due"] + CLAIM_WAIT_S:
             return False
         miss = (f"its check `{c['expect'][:200]}` exited {c['last']}" if answered and c["last"] not in CLAIM_WAITING

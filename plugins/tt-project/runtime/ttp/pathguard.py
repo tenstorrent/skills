@@ -21,6 +21,10 @@ refuses any create, change, move, chmod or delete it can read under a protected 
   code count only when the code reads its input; the same inside `sh -c` and shell scripts.
 Words are read after ~, $HOME, ${HOME}, $XDG_CONFIG_HOME and $GH_CONFIG_DIR are expanded with the run's
 environment and symlinks resolved, and the account's own home counts besides HOME. Reads pass as before.
+Text ssh runs on another host is read too: its quoted remote command, a file or heredoc fed to its stdin
+(`ssh host bash < f`, `cat f | ssh host bash`, `<<EOF`) and a file scp or rsync copies there and the remote
+command then runs. It is checked by the same rules with ~ and $HOME as the remote user's home, against a narrow
+list (REMOTE_PATHS: the default keys, ssh config and authorized_keys, where appending a key passes).
 Known gap: a path a program builds at run time from parts no word names (an argument read from a file).
 
 The list is DEFAULT_PATHS plus guards.protected_paths of the account settings and of the project
@@ -29,11 +33,13 @@ The list is DEFAULT_PATHS plus guards.protected_paths of the account settings an
 from __future__ import annotations
 
 import ast
+import fnmatch
 import json
 import os
 import pwd
 import re
 import shlex
+from pathlib import Path
 
 DEFAULT_PATHS = ("~/.ssh", "~/.config/gh", "~/.git-credentials", "~/.netrc", "~/.aws", "~/.docker/config.json",
                  "~/.kube")
@@ -108,9 +114,31 @@ MCP_READ_RE = re.compile(r"(?:^|_)(?:read|get|list|search|find|view|stat|info|tr
                          r"grep|glob|cat|head|tail|lookup|status)(?:_|$)", re.I)
 MCP_WRITE_RE = re.compile(r"write|edit|create|move|rename|delete|remove|copy|put|patch|append|chmod|mkdir|upload|"
                           r"save|set|update", re.I)
+# A key used as an ssh identity passes by credguard's class rule (ssh_keys, ssh_commands): the clients that take
+# one, the wrappers they may run under, and the commands that may sit beside them
+SSH_TOOLS = {"ssh", "scp", "sftp"}
+KEY_WRAPPERS = {"env", "timeout", "nohup", "nice"}
+KEY_SAFE = {"echo", "printf", "true", "false", ":", "test", "[", "cd", "pwd", "ls", "cat", "grep", "head", "tail",
+            "wc", "sleep", "date"}
+KEY_ROUTE = ("To use a key as an ssh identity, give it as the direct value of `ssh|scp|sftp -i KEY` or "
+             "`-o IdentityFile=KEY`, or in a plain `ssh -i KEY` that `GIT_SSH_COMMAND=... git "
+             "fetch|clone|ls-remote` or rsync's -e runs, as a plain shell command with no option that runs a local program (ProxyCommand, "
+             "LocalCommand, KnownHostsCommand, Match exec, -F) and nothing else in the line that runs a program or "
+             "writes, or name the key as IdentityFile in an ssh config, instead of calling them from inside "
+             "interpreter code")
+
+
+class KeyHit(str):
+    """A protected key a command line names outside credguard's class rule: refused as a credential-store read."""
+
+
 # The plugin's own shipped scripts (setup-box's write ~/.ssh on a remote box, in ssh command text):
 # reviewed code, so the script-file read skips them; a script a run wrote is read
 PLUGIN_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+# A host ssh runs text on: its user's home (a placeholder), and what there no run writes
+REMOTE_HOMES = ("/~remote", "/home/*", "/root")
+REMOTE_PATHS = (".ssh/id_*", ".ssh/config", ".ssh/authorized_keys")
+SSH_VALUE_OPTS = set("BbcDEeFIiJLlmOoPpQRSWw")
 WHY = ("a run never creates, changes, moves, chmods or deletes anything under the account's credential folders "
        "({hit} is one; guards.protected_paths lists them): a login a run overwrote is gone for every project on "
        "the host. Read it as before, test against a scratch copy under `mktemp -d` named by another variable "
@@ -165,7 +193,8 @@ def roots(env=None, cfg: dict | None = None, defaults: bool = False) -> list[str
 
 
 def _inside(path: str, rts: list[str]) -> str | None:
-    return next((r for r in rts if path == r or path.startswith(r.rstrip("/") + "/")), None)
+    return next((r for r in rts if path == r or path.startswith(r.rstrip("/") + "/")
+                 or "*" in r and fnmatch.fnmatchcase(path, r)), None)
 
 
 def _holds(path: str, rts: list[str]) -> str | None:
@@ -176,7 +205,7 @@ def _holds(path: str, rts: list[str]) -> str | None:
 def _hit(word: str, ctx, ancestor: bool = False) -> str | None:
     if not word or word.startswith("-"):
         return None
-    p = expand(word, ctx[0], ctx[1])
+    p = expand(word, ctx[0], ctx[1], real=len(ctx) < 4)   # a remote path is not resolved here
     return (_holds if ancestor else _inside)(p, ctx[2])
 
 
@@ -247,6 +276,11 @@ def _argv_refusal(argv: list[str], ctx, cmd_env=None) -> str | None:
     store = _store_write(argv)
     if store and _inside(expand(store, cmd_env or ctx[0], "/"), ctx[2]):
         return store
+    if len(ctx) > 3 and name == "ssh-keygen" and store and not any(re.fullmatch(r"-[a-zA-Z]*[RHAY]\w*", a)
+                                                                   for a in args):
+        # On a remote host (where ~/.ssh itself is writable): its default key
+        if h := _inside(expand("~/.ssh/id_", cmd_env or ctx[0], "/", real=False), ctx[2]):
+            return h
     if name == "ssh-keygen":
         return None if _keygen_reads(args) else next((h for w in _keygen_file(args) if (h := _hit(w, ctx))), None)
     if name in WRITE_ALL or name in ("sed", "perl") and any(re.match(r"-[a-zA-Z]*i|--in-place", a) for a in args):
@@ -517,18 +551,23 @@ def _py_refusal(code: str, ctx, fed: str | None = None):
     return None
 
 
-def shell_refusal(cmd: str, env, cwd: str, rts: list[str], depth: int = 0) -> str | None:
-    """The protected path a shell command line (or script) writes, as far as its words show."""
+def shell_refusal(cmd: str, env, cwd: str, rts: list[str], depth: int = 0, script: bool = False,
+                  copied: dict | None = None) -> str | None:
+    """The protected path a shell command line (or script) writes, as far as its words show. `copied`: the text
+    runs on a remote host, where these local files (by base name) were copied."""
     from . import hook
-    ctx = (env, cwd, rts)
+    ctx = (env, cwd, rts) if copied is None else (env, cwd, rts, True)
     commands, scan = hook._split(cmd)
+    if not script and (h := _key_refusal(cmd, commands, ctx)):
+        return h
     # Redirects: in the line as written and in scan (_split drops an echo's quoted words, a quoted
     # redirect target too), where the `>` is not quoted: quoted text is an argument (ssh's remote
     # command, a message); `sh -c` text is read below
     for text in (cmd, scan):
         flags = hook._quoting(text)
         for m in REDIRECT_RE.finditer(text):
-            if not flags[m.start()][0] and (h := _hit(m[2], ctx)):
+            if not flags[m.start()][0] and (h := _hit(m[2], ctx)) and not (
+                    copied is not None and ">>" in m[0] and h.endswith("/authorized_keys")):   # adding a key
                 return h
     if "*** Begin Patch" in cmd and (h := patch_refusal(cmd, ctx)):
         return h
@@ -543,7 +582,7 @@ def shell_refusal(cmd: str, env, cwd: str, rts: list[str], depth: int = 0) -> st
         inner = next((argv[i + 1] for i, a in enumerate(argv[1:-1], 1) if re.fullmatch(r"-[a-z]*c[a-z]*", a)),
                      None) if name in SHELLS else " ".join(argv[1:]) if name == "eval" else None
         if inner and depth < 2 and (
-                h := shell_refusal(inner, env, cwd, rts, depth + 1)):
+                h := shell_refusal(inner, env, cwd, rts, depth + 1, copied is not None, copied)):
             return h
         # eval parses its words again: an escaped redirect (eval echo x \> f) is one then
         if name == "eval" and "\\" in cmd and depth < 2 and (
@@ -583,22 +622,209 @@ def shell_refusal(cmd: str, env, cwd: str, rts: list[str], depth: int = 0) -> st
         if not cd and xctx[2] and (
                 h := next((h for c, py in chunks if (h := _code_refusal(c, xctx, depth, scan, py))), None)):
             return h
+    if depth < 3 and "ssh" in cmd and (h := _remote_refusal(cmd, env, cwd, depth, copied or {})):
+        return h
+    if copied is not None:   # a remote script file: the local file scp or rsync sent under its name
+        files = [Path(copied[n]) for a in segments for f in hook._run_files(a) if (n := os.path.basename(f)) in copied]
+        return next((h for f in files if depth < 2 and (h := _script_refusal(f, ctx, depth, copied))), None)
     if depth < 2:
         for f in hook._scripts(segments, cwd):
             if os.path.realpath(f).startswith(PLUGIN_ROOT + os.sep):
                 continue
-            try:
-                text = f.read_text(errors="replace")
-            except OSError:
-                continue
-            # The shebang's interpreter (`#!/usr/bin/env bash`): a first line of code (import shutil) names none
-            first = " ".join(os.path.basename(w) for w in text.split("\n", 1)[0][2:].split()) if text[:2] == "#!" else ""
-            h = (shell_refusal(text, env, cwd, rts, depth + 1) if f.suffix == ".sh" or set(first.split()) & SHELLS
-                 else _code_refusal(text, ctx if cd else dctx, depth + 1) or not cd and xctx[2] and _code_refusal(
-                     text, xctx, depth + 1, scan, f.suffix == ".py" or bool(re.search(r"python|pypy", first))))
-            if h:
+            if h := _script_refusal(f, ctx, depth, copied, (cd, dctx, xctx, scan)):
                 return h
     return None
+
+
+def _key_refusal(cmd: str, commands: str, ctx) -> str | None:
+    """A command line that uses a protected key as an ssh identity passes only by credguard's class rule: the key is
+    the direct value of `ssh|scp|sftp -i` or `-o IdentityFile=` (its remote command is the remote host's), or of a
+    plain `ssh -i KEY` in GIT_SSH_COMMAND before git fetch|clone|ls-remote or RSYNC_RSH before rsync (the only
+    assignment), and no option runs a local program. Beside it only KEY_SAFE commands, no command substitution and
+    no redirect to a built target. Anything else that names one is refused as a credential-store read (KeyHit)."""
+    from . import credguard, hook
+    hit, bad = None, False
+    for raw in hook._segments(commands, strip=False):
+        argv = hook._strip_prefix(raw)
+        pre, name = raw[:len(raw) - len(argv)], argv[0] if argv else ""
+        sets = [w.split("=", 1) for w in pre if re.match(r"[A-Za-z_]\w*=", w)]
+        keys = [h for w in raw if re.match(r"[A-Za-z_]\w*=.*\b(?:ssh|scp|sftp)\b", w) and (h := _names(w, ctx))]
+        hit = hit or (keys[0] if keys else None)
+        ok = all(re.fullmatch(r"\w+=.*|-.*|\d+[smhd]?", w) or w in KEY_WRAPPERS for w in pre) and not (
+            "env" in pre and any(w.startswith("-") for w in pre))
+        if name in SSH_TOOLS:   # ssh -i KEY, with no assignment before it
+            h, opts = _ssh_key(argv, ctx)
+            ok = ok and opts and not sets
+        elif name in credguard.SSH_COMMAND_VARS:   # GIT_SSH_COMMAND='ssh -i KEY' git fetch, RSYNC_RSH=... rsync
+            v = sets[0][1] if len(sets) == 1 and sets[0][0] + "=" == credguard.SSH_COMMAND_VARS[name] else ""
+            ssh = shlex.split(v) if v and not re.search(r"[;&|<>`$()\n\\]", VAR_RE.sub("", v)) else []
+            h, opts = _ssh_key(ssh, ctx) if ssh[:1] == ["ssh"] else (None, False)
+            ok = ok and opts and v in credguard.ssh_commands(raw) and not any(_names(a, ctx) for a in argv[1:])
+        else:
+            h, ok = None, name in KEY_SAFE and not keys
+        hit, bad = hit or h, bad or not ok
+    if not hit:
+        return None
+    q, esc = "", False   # command substitution: $( or a backtick outside single quotes, <( >( unquoted
+    for i, c in enumerate(cmd):
+        if q == "'":
+            q = "" if c == "'" else q
+        elif esc:
+            esc = False
+        elif c == "\\":
+            esc = True
+        elif c == "'" and not q:
+            q = "'"
+        elif c == '"':
+            q = "" if q else '"'
+        elif c == "`" or cmd[i:i + 2] == "$(" or not q and cmd[i:i + 2] in ("<(", ">("):
+            bad = True
+    flags = hook._quoting(cmd)   # a redirect whose target is built ($_, $f) or not a file (>& $f)
+    for m in [*REDIRECT_RE.finditer(cmd), *re.finditer(r">&\s*(?![\d-])", cmd)]:
+        if not flags[m.start()][0] and (m.re is not REDIRECT_RE or re.search(r"[$`]", m[2])):
+            bad = True
+    return KeyHit(hit) if bad else None
+
+
+def _ssh_key(argv: list[str], ctx) -> tuple[str | None, bool]:
+    """(a protected path the options of ssh, scp or sftp `argv` name, whether they follow credguard's class rule:
+    no option runs a local program, and each naming a protected path is its key, -i or -o IdentityFile). A control
+    socket or host list ssh keeps itself (-S, -o ControlPath=, credguard.ssh_public) is none."""
+    from . import credguard
+    keys, hit, ok = credguard.ssh_keys(argv), None, not credguard.ssh_runs_local(argv)
+    for o, val, word in credguard.ssh_options(argv):
+        own = o in "So" and word not in keys and credguard.ssh_public(os.path.basename(re.split(r"[\s=]", val)[-1]))
+        if not own and (h := _names(val, ctx)):
+            hit, ok = hit or h, ok and word in keys
+    return hit, ok
+
+
+def _script_refusal(f: Path, ctx, depth: int, copied: dict | None, split: tuple | None = None) -> str | None:
+    """What script file `f` writes: as shell text (a .sh or a shell #! line), else as interpreter code. A file
+    it cannot read passes. `split`: (cd, dctx, xctx, scan) of the local line: the default folders keep the
+    whole-code word check, other folders get the read pass unless the line changed directory first."""
+    try:
+        text = f.read_text(errors="replace")
+    except OSError:
+        return None
+    # The shebang's interpreter (`#!/usr/bin/env bash`): a first line of code (import shutil) names none
+    first = " ".join(os.path.basename(w) for w in text.split("\n", 1)[0][2:].split()) if text[:2] == "#!" else ""
+    if f.suffix == ".sh" or set(first.split()) & SHELLS:
+        return shell_refusal(text, ctx[0], ctx[1], ctx[2], depth + 1, True, copied)
+    if split is None:
+        return _code_refusal(text, ctx, depth + 1)
+    cd, dctx, xctx, scan = split
+    return _code_refusal(text, ctx if cd else dctx, depth + 1) or not cd and xctx[2] and _code_refusal(
+        text, xctx, depth + 1, scan, f.suffix == ".py" or bool(re.search(r"python|pypy", first)))
+
+
+def _remote_refusal(cmd: str, env, cwd: str, depth: int, copied: dict) -> str | None:
+    """What the text ssh runs on another host in `cmd` writes there: its remote command, and the text its stdin
+    feeds a remote shell or interpreter, checked with the remote home against REMOTE_PATHS."""
+    rhome = REMOTE_HOMES[0]
+    renv, rts = {"HOME": rhome}, [os.path.join(h, p) for h in REMOTE_HOMES for p in REMOTE_PATHS]
+    calls, sent = _ssh_calls(cmd, env, cwd)
+    copied = {**copied, **sent}
+    for words, stdin in calls:
+        text = " ".join(words)
+        names = {os.path.basename(a[0]) for a in _segments_of(text)} if words else {"sh"}
+        h = shell_refusal(text, renv, rhome, rts, depth + 1, True, copied) if words else None
+        if not h and stdin is not None and names & SHELLS:
+            h = shell_refusal(stdin, renv, rhome, rts, depth + 1, True, copied)
+        elif not h and stdin is not None and any(INTERPRETER_RE.match(n) for n in names):
+            h = _code_refusal(stdin, (renv, rhome, rts, True), depth + 1)
+        if h:
+            h = "~" + h[len(rhome):] if h.startswith(rhome + "/") else h
+            return h if h.endswith(" on the remote host") else h + " on the remote host"
+    return None
+
+
+def _segments_of(text: str) -> list[list[str]]:
+    from . import hook
+    return hook._all_segments(hook._split(text)[0])
+
+
+def _ssh_calls(cmd: str, env, cwd: str) -> tuple[list[tuple[list[str], str | None]], dict]:
+    """(the remote command words of each ssh in `cmd`, with the text its stdin gets from a `<` file, a heredoc,
+    a here-string, or `cat FILE`, echo or printf piped in, else None), and the local files scp or rsync copy to a
+    host there, by base name."""
+    from . import hook
+    lines, bodies, pending = [], [], []
+    for line in cmd.replace("\\\n", " ").split("\n"):
+        if pending:
+            delim, dash, body = pending[0]
+            if (line.lstrip("\t") if dash else line) == delim:
+                pending.pop(0)
+            else:
+                body.append(line)
+            continue
+        lines.append(line)
+        flags = hook._quoting(line) if "<<" in line else []
+        for m in hook.HEREDOC_RE.finditer(line):
+            if not flags[m.start()][0]:
+                pending.append((m[3], m[1] == "-", []))
+                bodies.append(pending[-1][2])
+    text = "\n".join(lines)
+    text = "".join(";\n;" if c == "\n" and not q else c for c, (q, _) in zip(text, hook._quoting(text)))
+    try:
+        lex = shlex.shlex(text, posix=True, punctuation_chars=";&|()<>")
+        lex.whitespace_split = True
+        toks = list(lex) + [";"]
+    except ValueError:
+        toks = text.split() + [";"]
+    segs, cur, i = [], {"argv": [], "in": None, "pipe": False}, 0
+    while i < len(toks):
+        t, nxt = toks[i], (toks[i + 1:i + 2] or [""])[0]
+        if t and set(t) <= set(";&|()<>") and set(t) & set("<>"):   # a redirect and its word
+            if t == "<":
+                cur["in"] = ("files", [nxt])
+            elif t in ("<<", "<<<"):
+                cur["in"] = ("text", "\n".join(bodies.pop(0)) if t == "<<" and bodies else nxt)
+            i += 2
+            continue
+        if t and set(t) <= set(";&|()"):
+            segs.append(cur)
+            cur = {"argv": [], "in": None, "pipe": t in ("|", "|&")}
+        else:
+            cur["argv"].append(t)
+        i += 1
+    calls, sent = [], {}
+    for k, seg in enumerate(segs):
+        argv = hook._strip_prefix(seg["argv"])
+        name = os.path.basename(argv[0]) if argv else ""
+        if name in ("scp", "rsync") and len(ops := _operands(argv[1:])) > 1 and ":" in ops[-1]:
+            sent.update({os.path.basename(s.rstrip("/")): expand(s, env, cwd) for s in ops[:-1] if ":" not in s})
+        if name != "ssh" or (words := _ssh_remote(argv[1:])) is None:
+            continue
+        src = seg["in"]
+        prev = hook._strip_prefix(segs[k - 1]["argv"]) if k and seg["pipe"] and not src else []
+        if prev and os.path.basename(prev[0]) == "cat":
+            src = ("files", _operands(prev[1:]))
+        elif prev and os.path.basename(prev[0]) in ("echo", "printf"):
+            src = ("text", " ".join(prev[1:]))
+        stdin = src[1] if src and src[0] == "text" else None
+        for f in src[1] if src and src[0] == "files" else []:
+            try:
+                path = Path(expand(f, env, cwd))
+                if path.stat().st_size <= hook.SCRIPT_MAX_BYTES:
+                    stdin = (stdin or "") + path.read_text(errors="replace") + "\n"
+            except (OSError, ValueError):
+                pass   # unreadable: as a local script file the guard cannot read
+        calls.append((words, stdin))
+    return calls, sent
+
+
+def _ssh_remote(args: list[str]) -> list[str] | None:
+    """The remote command words in ssh's arguments `args` (None: no host)."""
+    i = 0
+    while i < len(args) and args[i].startswith("-"):
+        if args[i] == "--":
+            i += 1
+            break
+        opt = args[i][1:]
+        j = next((k for k, c in enumerate(opt) if c in SSH_VALUE_OPTS), None)
+        i += 2 if j is not None and j == len(opt) - 1 else 1
+    return args[i + 1:] if i < len(args) else None
 
 
 def _assigned(raw: list[str], env) -> dict:
@@ -640,7 +866,15 @@ def refusal(payload: dict, env=None, cfg: dict | None = None) -> str | None:
     except Exception:
         text = json.dumps(payload.get("tool_input") or {})
         hit = next((p for p in DEFAULT_PATHS + tuple(rts) if p.lstrip("~/") in text), None)
-    return WHY.format(hit=hit) if hit else None
+    if not hit:
+        return None
+    if isinstance(hit, KeyHit):   # a key named outside the plain ssh use: a credential-store read
+        from . import credguard
+        return (f"{credguard.WHY}, and never writes under the account's credential folders ({hit} is named "
+                f"outside a plain ssh key use). {KEY_ROUTE}")
+    # A key used as an ssh or git identity: name the route that passes
+    route = re.search(r"(?<![\w./-])(?:ssh|scp|sftp)(?![\w.-])|GIT_SSH_COMMAND", json.dumps(payload.get("tool_input") or {}))
+    return WHY.format(hit=hit) + (". " + KEY_ROUTE if route else "")
 
 
 def _refusal(payload: dict, env, rts: list[str]) -> str | None:

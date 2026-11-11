@@ -755,7 +755,8 @@ def abandon(p, tid: int, why: str) -> str:
     already abandoned, one whose landing is recorded or on the push branch, and one whose work can still
     land: an open task that carries it on (its review, a fix or continuation: carriers, or an open review
     that depends on it or names its branch, as the daemon's auto-review finds one) or a push queue
-    entry of one of them or its branch still waiting to push."""
+    entry of one of them or its branch still waiting to push. The daemon's own open review of it
+    (auto_review) is cancelled in the same step instead, so it is no reason to refuse."""
     why, task = " ".join((why or "").split()), p.db.task(tid)
     if not task:
         raise ValueError(f"no task #{tid}")
@@ -780,14 +781,23 @@ def abandon(p, tid: int, why: str) -> str:
                     (*ids, *branches)):
         raise ValueError(f"not abandoned: task #{tid} is queued to push (entry #{q['id']} of task #{q['task']}, "
                          f"{q['status']}): cancel that first")
+    own = []   # the daemon's own review of it: cancelled with the abandon, not left to block it
     for t in p.db.q(f"SELECT * FROM tasks WHERE id!=? AND status NOT IN ({','.join('?' * len(TERMINAL_TASK_STATES))}) "
                     f"AND (id IN ({marks}) OR kind='review') ORDER BY id", (tid, *TERMINAL_TASK_STATES, *ids)):
         # an open review that covers it as the daemon's auto-review reads it: by dependency or a named branch
-        if t["id"] in carry or tid in dependency_ids(t) or (branch and branch in named_refs(p, t)):
-            raise ValueError(f"not abandoned: task #{tid}'s work can still land: {t['kind']} task #{t['id']} "
-                             f"that carries it is {t['status']}: cancel that first")
-    p.db.x("INSERT INTO task_abandoned(task, why, ts) VALUES(?,?,?)", (tid, why, time.time()))
-    return f"task #{tid}: abandoned ({why}); its branch {task.get('branch') or '(none)'} is kept"
+        if not (t["id"] in carry or tid in dependency_ids(t) or (branch and branch in named_refs(p, t))):
+            continue
+        if t["kind"] == "review" and t.get("origin") == "daemon" and f'"auto_review:{tid}"' in (t["labels"] or ""):
+            own.append(t["id"])
+            continue
+        raise ValueError(f"not abandoned: task #{tid}'s work can still land: {t['kind']} task #{t['id']} "
+                         f"that carries it is {t['status']}: cancel that first")
+    with p.db.tx():
+        p.db.x("INSERT INTO task_abandoned(task, why, ts) VALUES(?,?,?)", (tid, why, time.time()))
+        for rid in own:
+            p.db.cancel(rid)
+    return (f"task #{tid}: abandoned ({why}); its branch {task.get('branch') or '(none)'} is kept"
+            + (f"; its review {', '.join(f'#{i}' for i in own)} cancelled" if own else ""))
 
 
 def landed_probe(p) -> str:

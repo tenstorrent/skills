@@ -321,3 +321,90 @@ def test_an_unset_weekly_cap_is_seven_days_at_the_daily_cap_and_a_set_one_is_kep
     assert "warning" not in capsys.readouterr().err
     assert weekly_below_daily({"daily_usd": 300, "weekly_usd": 200})
     assert not weekly_below_daily({"daily_usd": 0, "weekly_usd": 200}), "no daily cap: nothing to compare"
+
+
+def _with_raw(p, **sections):
+    """project.json as an older plugin left it: `sections` merged in by hand, no setter recorded."""
+    raw = p.raw_config()
+    for sec, keys in sections.items():
+        raw.setdefault(sec, {}).update(keys)
+    p.config_path.write_text(json.dumps(raw))
+
+
+def test_config_empty_value_removes_an_unknown_key_present_and_records_who(env, capsys):
+    """A key the schema no longer knows (one an older plugin retired) that project.json still holds is removed
+    by `ttp config NAME KEY ''`, which says what it held and records the removal in config provenance; the
+    other keys of its section stay. Absent, the same request still errors (the key is retired), and a non-empty
+    value on it is still refused, nothing written."""
+    from ttp import cli, configwho
+    from ttp.project import unknown_key_hint
+    p = make(env)
+    assert unknown_key_hint("coordinator.unblock_effort")
+    _with_raw(p, coordinator={"unblock_effort": "high", "model": "some-model", "effort": "xhigh"})
+    capsys.readouterr()
+    cli.main(["config", "demo", "coordinator.unblock_effort", ""])
+    out = capsys.readouterr().out
+    assert 'coordinator.unblock_effort removed (was "high")' in out, out
+    coord = p.raw_config()["coordinator"]
+    assert "unblock_effort" not in coord and coord["model"] == "some-model" and coord["effort"] == "xhigh"
+    rec = configwho.lookup(p.db, "coordinator.unblock_effort", p.raw_config())
+    assert rec and rec.get("h") == "-", rec
+    before = p.config_path.read_text()
+    for value in ("", "low"):
+        with pytest.raises(SystemExit) as e:
+            cli.main(["config", "demo", "coordinator.unblock_effort", value])
+        assert e.value.code == 2 and "coordinator.unblock_effort is retired" in capsys.readouterr().err, value
+    _with_raw(p, coordinator={"unblock_effort": None})
+    before = p.config_path.read_text()
+    with pytest.raises(SystemExit):     # present, but setting a value is still refused
+        cli.main(["config", "demo", "coordinator.unblock_effort", "low"])
+    assert "is retired" in capsys.readouterr().err and p.config_path.read_text() == before
+    cli.main(["config", "demo", "coordinator.unblock_effort", ""])    # present at null: still removed
+    assert "unblock_effort" not in p.raw_config()["coordinator"]
+
+
+def test_config_removing_an_unknown_key_keeps_the_who_may_gates(env, monkeypatch, capsys):
+    """The removal of an unknown key runs the same gates as any removal: inside a run, a key under a user-only
+    setting is not removed, and a worker may not remove anything under runner.host_commands."""
+    from ttp import cli, configwho, coordinator
+    p = make(env)
+    _with_raw(p, coordinator={"unblock_effort": "high"})
+    monkeypatch.setitem(coordinator.NEEDS_USER, "coordinator.unblock_effort", "spend")
+    monkeypatch.setattr(cli, "in_run", lambda: True)
+    monkeypatch.setenv("TTP_TASK_ID", "7")
+    monkeypatch.setenv("TTP_RUN_DIR", str(p.state / "runs" / "1"))
+    monkeypatch.setattr(configwho, "from_env", lambda: {"by": "worker", "task": 7})
+    with pytest.raises(SystemExit):
+        cli.main(["config", "demo", "coordinator.unblock_effort", ""])
+    assert "only the user may change" in capsys.readouterr().err
+    assert p.raw_config()["coordinator"]["unblock_effort"] == "high"
+    _with_raw(p, runner={"host_commands": {"legacy": 1}})
+    with pytest.raises(SystemExit):
+        cli.main(["config", "demo", "runner.host_commands.legacy", ""])
+    assert "never by a worker" in capsys.readouterr().err
+    assert p.raw_config()["runner"]["host_commands"] == {"legacy": 1}
+
+
+def test_upgrade_drops_retired_keys_once_and_keeps_the_rest(env):
+    """The upgrade's migration removes each project.RETIRED_KEYS key project.json holds, one note line and one
+    provenance record each; coordinator.model, coordinator.effort and every other key stay, and a second run
+    changes nothing."""
+    from ttp import cli, configwho
+    from ttp.project import RETIRED_KEYS, unknown_key_hint
+    assert "coordinator.unblock_effort" in RETIRED_KEYS
+    assert all(unknown_key_hint(k) for k in RETIRED_KEYS), "a retired key is one no part of the runtime reads"
+    p = make(env)
+    assert cli._drop_retired_keys(p) == [], "nothing retired held: nothing to change"
+    _with_raw(p, coordinator={"unblock_effort": "low", "model": "some-model", "effort": "high"},
+              budget={"daily_usd": 5}, upgrade={"auto": True, "merge_retry_h": 6})
+    before = p.raw_config()
+    notes = cli._drop_retired_keys(p)
+    assert len(notes) == 2 and any("coordinator.unblock_effort" in n for n in notes), notes
+    assert any("upgrade.merge_retry_h" in n for n in notes), notes
+    after = p.raw_config()
+    del before["coordinator"]["unblock_effort"], before["upgrade"]["merge_retry_h"]
+    assert after == before
+    rec = configwho.lookup(p.db, "coordinator.unblock_effort", after)
+    assert rec and rec.get("h") == "-" and "retired" in rec.get("via", ""), rec
+    text = p.config_path.read_text()
+    assert cli._drop_retired_keys(p) == [] and p.config_path.read_text() == text, "a rerun is a no-op"

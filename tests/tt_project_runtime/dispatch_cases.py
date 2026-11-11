@@ -2109,7 +2109,7 @@ def test_a_done_task_queued_again_without_a_requeue_is_not_dispatched_past_its_a
         assert f"task {again} not dispatched: it was already closed done 3 times" in \
             (p.logs / "daemon.log").read_text()
         settle(d)
-        assert p.db.requeue(again) == ""   # the user's decision: its done count starts again
+        assert p.db.requeue(again, force=True) == ""   # the user's decision: its done count starts again
         assert p.db.one("SELECT id FROM events WHERE task=? AND kind='task_requeued'", (again,))
         d.dispatch()
         assert again in _slot_tasks(p), "an explicit requeue did not run the task again"
@@ -2186,6 +2186,77 @@ def test_a_chain_continue_records_a_requeue(env):
     assert dispatchguard.refusal(p.db, p.db.task(tid)) == ""
 
 
+def test_a_plain_requeue_never_undoes_a_cancel_or_a_done_hand_off_or_passes_the_attempt_cap(env, capsys):
+    """Regression (upstream fp af9f443ce59b93ba): a project's model-free watcher script ran
+    `ttp task <project> requeue <id>` on a task its coordinator had cancelled, and the requeue counted as
+    the user's decision, so the task ran again at attempt 37 of 3. A plain requeue (CLI or db) now leaves
+    a cancelled or done task, or one that failed its last allowed attempt, as it is; `--force` (a
+    deliberate decision) and a web app click run it again, on record with who did it."""
+    from ttp import cli, dispatchguard, web
+    p = make(env)
+
+    def task(status, attempts=0):
+        tid = p.db.add_task(f"{status} at {attempts}", "s", kind="work", tier="light", origin="user")
+        p.db.x("UPDATE tasks SET status=?, attempts=? WHERE id=?", (status, attempts, tid))
+        return tid
+
+    cancelled, done, spent = task("cancelled", 37), task("done", 2), task("failed", 3)
+    for tid in (cancelled, done, spent):   # what a watcher script runs: refused, the task left as it is
+        before = p.db.task(tid)["status"]
+        with pytest.raises(SystemExit):
+            cli.main(["task", "demo", "requeue", str(tid)])
+        assert p.db.task(tid)["status"] == before and not _requeues(p, tid), tid
+        assert "--force" in capsys.readouterr().err
+        assert "--force" in p.db.requeue(tid), "the db path the CLI and web app share refuses it too"
+        assert dispatchguard.refusal(p.db, p.db.task(tid)), "never dispatched"
+    # Work a script may still requeue: failed under its cap, blocked, waiting.
+    for tid in (task("failed", 1), task("blocked", 5), task("waiting", 5)):
+        cli.main(["task", "demo", "requeue", str(tid)])
+        assert p.db.task(tid)["status"] == "queued", tid
+        assert [r["source"] for r in _requeues(p, tid)] == ["requeue"]
+    # A deliberate requeue: it runs again, and the event says it was forced.
+    cli.main(["task", "demo", "requeue", str(cancelled), "--force"])
+    assert p.db.task(cancelled)["status"] == "queued" and dispatchguard.refusal(p.db, p.db.task(cancelled)) == ""
+    assert [r["source"] for r in _requeues(p, cancelled)] == ["requeue --force"]
+    # The web app's Requeue is a click: deliberate.
+    port = _start_web(p)
+    req = urllib.request.Request(f"http://127.0.0.1:{port}/api/task/{done}", method="POST",
+                                 data=json.dumps({"status": "queued"}).encode(),
+                                 headers={"X-TTP-Token": web.token(p), "Content-Type": "application/json"})
+    for _ in range(50):
+        try:
+            with urllib.request.urlopen(req, timeout=2) as r:
+                assert r.status == 200
+            break
+        except urllib.error.HTTPError:
+            raise
+        except OSError:
+            time.sleep(0.1)
+    assert p.db.task(done)["status"] == "queued"
+    assert [r["source"] for r in _requeues(p, done)] == ["web --force"]
+
+
+def test_a_task_whose_last_run_failed_at_its_attempt_cap_is_not_dispatched_until_a_requeue(env):
+    """Regression (upstream fp af9f443ce59b93ba): the attempt cap holds at dispatch. A task whose last run
+    failed at its attempt limit and that some write queued again with no explicit requeue is refused and
+    put back to failed; under its cap, or after an explicit requeue, it may run."""
+    from ttp import dispatchguard
+    p = make(env)
+    tid = p.db.add_task("flaky", "s", kind="work", tier="light", origin="user")
+    now = time.time()
+    p.db.x("INSERT INTO runs(task, role, provider, status, started, ended) VALUES(?,?,?,?,?,?)",
+           (tid, "worker", "claude", "failed", now - 60, now - 30))
+    for attempts, refused in ((2, False), (3, True), (37, True)):
+        p.db.x("UPDATE tasks SET status='queued', attempts=? WHERE id=?", (attempts, tid))
+        why = dispatchguard.refusal(p.db, p.db.task(tid))
+        assert bool(why) == refused and (not refused or f"attempts {attempts} of 3" in why), (attempts, why)
+    dispatchguard.refuse(p.db, tid, dispatchguard.refusal(p.db, p.db.task(tid)))
+    assert p.db.task(tid)["status"] == "failed"
+    assert "requeue --force" in p.db.one("SELECT text FROM events WHERE task=? AND kind='dispatch_refused'", (tid,))["text"]
+    assert p.db.requeue(tid, force=True) == ""
+    assert dispatchguard.refusal(p.db, p.db.task(tid)) == "", "the deliberate requeue grants a run"
+
+
 def test_a_cancelled_task_queued_again_without_a_requeue_is_not_dispatched(
         env, monkeypatch, tmp_path, reap_tmp_processes):
     """Regression (upstream fp aed18d8ef1b1ecc7): a task cancelled for good (`ttp task cancel`, or the
@@ -2208,7 +2279,7 @@ def test_a_cancelled_task_queued_again_without_a_requeue_is_not_dispatched(
             ev = p.db.one("SELECT text FROM events WHERE task=? AND kind='dispatch_refused'", (tid,))
             assert ev and "cancelled and queued again" in ev["text"] and "attempts 35 of 3" in ev["text"]
         settle(d)
-        assert p.db.requeue(by_cli) == ""   # the user's decision: it runs again
+        assert p.db.requeue(by_cli, force=True) == ""   # the user's decision: it runs again
         d.dispatch()
         assert by_cli in _slot_tasks(p) and by_coord not in _slot_tasks(p)
     finally:
@@ -2240,7 +2311,7 @@ def test_a_done_task_with_a_start_when_probe_past_its_attempt_limit_is_not_redis
         ev = p.db.one("SELECT text FROM events WHERE task=? AND kind='dispatch_refused'", (held,))
         assert ev and "attempts 9 of 3" in ev["text"]
         settle(d)
-        assert p.db.requeue(held) == ""   # the user's decision: it runs again
+        assert p.db.requeue(held, force=True) == ""   # the user's decision: it runs again
         d.dispatch()
         assert held in _slot_tasks(p), "an explicit requeue did not run the task again"
     finally:
@@ -2457,3 +2528,151 @@ def test_dispatch_pass_memo_keeps_root_reads_until_a_move(tmp_path, monkeypatch)
     gitmemo.run(head, capture_output=True, text=True)
     gitmemo.run(head, capture_output=True, text=True)
     assert n("symbolic-ref --quiet --short HEAD") == 5, "outside a pass every read runs"
+
+
+def test_dispatch_holds_a_duplicate_of_an_open_or_recently_done_task_once(
+        env, monkeypatch, tmp_path, reap_tmp_processes):
+    """User msg #2495 (waste): one project ran 27 runs on duplicate same-title tasks. Just before dispatch, a
+    task repeating an earlier open task, or one done in the last 14 days (same title, or task_add's
+    looks_same), is blocked with one dispatch_held event and nothing runs; the original starts. Its own
+    continue lineage, a `differs from #<id>` spec and an explicit requeue after the hold all run."""
+    from ttp import supersede
+    p, d, drain, settle = _slot_setup(env, monkeypatch, tmp_path, slots=4)
+    try:
+        first = p.db.add_task("deploy the relay fix", "roll it out", kind="work", tier="light")
+        dup = p.db.add_task("Deploy the relay fix", "roll it out again", kind="work", tier="light")
+        old = p.db.add_task("rebuild the wheel cache", "s", kind="work", tier="light", status="done")
+        hop = p.db.add_task("rebuild the wheel cache", "s", kind="work", tier="light", labels=[f"continues:{old}"])
+        old2 = p.db.add_task("prune the docs index", "s", kind="work", tier="light", status="done")
+        forced = p.db.add_task("prune the docs index", f"differs from #{old2}: other target", kind="work",
+                               tier="light")
+        redo = p.db.add_task("prune the docs index again", "s", kind="work", tier="light")
+        d.dispatch()
+        assert sorted(_slot_tasks(p)) == sorted([first, hop, forced])
+        for tid, orig in ((dup, first), (redo, old2)):
+            t = p.db.task(tid)
+            assert t["status"] == "blocked" and f"duplicates #{orig}" in t["blocked_reason"]
+            (ev,) = p.db.q("SELECT * FROM events WHERE task=? AND kind=?", (tid, supersede.HELD))
+            assert ev["status"] == "queued" and "Nothing ran" in ev["text"]
+        settle(d)
+        assert p.db.requeue(redo) == ""   # the coordinator looked: it runs, and no second event
+        d.dispatch()
+        assert redo in _slot_tasks(p)
+        assert len(p.db.q("SELECT 1 FROM events WHERE task=? AND kind=?", (redo, supersede.HELD))) == 1
+    finally:
+        drain(d)
+        assert reap_tmp_processes(tmp_path) == [], "a stand-in run outlived the test"
+
+
+def test_dispatch_holds_daemon_reviews_of_one_unchanged_subject_but_not_a_re_review(env):
+    """A second review of the same code task is a duplicate while its subject is unchanged since the first;
+    a re-review (other numbers in its title) and a review of another subject are not."""
+    from ttp import supersede
+    p = make(env)
+    code = p.db.add_task("land the gate", "s", kind="code", status="done")
+    other = p.db.add_task("land the other gate", "s", kind="code", status="done")
+    r1 = p.db.add_task(f"Review #{code}: land the gate", "s", kind="review", labels=[f"auto_review:{code}"])
+    r2 = p.db.add_task(f"Review #{code}: land the gate", "s", kind="review", labels=[f"auto_review:{code}"])
+    rr = p.db.add_task(f"Re-review #{r1}: Review #{code}: land the gate", "s", kind="review",
+                       labels=[f"auto_review:{code}", f"continues:{r1}"])
+    ro = p.db.add_task(f"Review #{other}: land the other gate", "s", kind="review", labels=[f"auto_review:{other}"])
+    assert f"duplicates #{r1}" in supersede.dispatch_hold(p.db, p.db.task(r2))
+    assert supersede.dispatch_hold(p.db, p.db.task(rr)) == ""
+    assert supersede.dispatch_hold(p.db, p.db.task(ro)) == ""
+    p.db.update_task(r1, status="done")
+    p.db.x("UPDATE tasks SET updated=? WHERE id=?", (time.time() + 5, code))   # the subject changed since
+    supersede._clear.clear()
+    assert supersede.dispatch_hold(p.db, p.db.task(r2)) == ""
+
+
+def test_dispatch_holds_a_task_whose_step_a_newer_user_order_superseded(env):
+    """An obligation's `supersedes` steps are kept with the order: a queued task created before it whose spec
+    still carries such a step is held at dispatch; one re-specified after the order, or created after it, runs."""
+    from ttp import coordinator as coord, supersede
+    p = make(env)
+    stale = p.db.add_task("tune the cache", "Step 1: restart the relay service nightly.\nStep 2: report.",
+                          kind="work", tier="light")
+    respecced = p.db.add_task("tune the store", "Restart the relay service nightly, then report.",
+                              kind="work", tier="light")
+    p.db.x("UPDATE tasks SET created=created-60 WHERE id IN (?,?)", (stale, respecced))
+    mid = p.db.x("INSERT INTO messages(ts,chat,direction,text) VALUES(?,?,?,?)",
+                 (time.time() - 30, "c", "in", "stop the nightly restarts"))
+    errs = coord.apply(p, [{"type": "obligation", "order": mid, "text": "no nightly restarts", "action_class": "change",
+                            "supersedes": ["restart the relay service nightly"]}])
+    assert errs == [], errs
+    coord.apply(p, [{"type": "task_update", "id": respecced, "spec": "and keep it short"}])
+    later = p.db.add_task("tune the index", "restart the relay service nightly", kind="work", tier="light")
+    why = supersede.dispatch_hold(p.db, p.db.task(stale))
+    assert f"user msg #{mid} superseded" in why
+    assert supersede.dispatch_hold(p.db, p.db.task(respecced)) == ""
+    assert supersede.dispatch_hold(p.db, p.db.task(later)) == ""
+
+
+def test_a_running_task_is_stopped_once_superseded_and_its_work_kept(env, tmp_path):
+    """A running task is cancelled and its run asked to stop (STOP) within one pass once its change landed
+    through another task, a newer task continues it, or every obligation it owns was dropped; one
+    superseded_stopped event says why, and its run dir stays. A running task with none of these keeps running."""
+    from ttp import daemon as dm, obligations, supersede
+    p = make(env)
+    d = dm.Daemon(p.base)
+    now = time.time()
+    ids = {}
+    for name in ("landed", "continued", "dropped", "kept"):
+        tid = p.db.add_task(f"work {name}", "s", kind="code", status="running")
+        run_dir = tmp_path / f"run-{name}"
+        run_dir.mkdir()
+        p.db.x("INSERT INTO runs(task,role,started,status,dir) VALUES(?,?,?,?,?)",
+               (tid, "worker", now - 100, "running", str(run_dir)))
+        ids[name] = (tid, run_dir)
+    p.db.x("INSERT INTO task_superseded(task,head,sha,ts) VALUES(?,?,?,?)",   # `ttp task superseded`
+           (ids["landed"][0], "abc123", "def4567890", now))
+    p.db.add_task("continue: work continued", "s", kind="code", labels=[f"continues:{ids['continued'][0]}"])
+    st = obligations._load(p.db)
+    st["items"]["o1"] = {"id": "o1", "text": "x", "owners": [str(ids["dropped"][0])], "receipt": None,
+                         "dropped": {"at": now, "by": "coordinator", "why": "no longer wanted"}}
+    p.db.set_kv(obligations.KV, st)
+    d.stop_superseded()
+    for name in ("landed", "continued", "dropped"):
+        tid, run_dir = ids[name]
+        assert p.db.task(tid)["status"] == "cancelled", name
+        assert (run_dir / "STOP").exists() and run_dir.is_dir(), name
+        (ev,) = p.db.q("SELECT * FROM events WHERE task=? AND kind=?", (tid, supersede.STOPPED))
+        assert ev["status"] == "queued" and "worktree and branch are kept" in ev["text"]
+    assert "landed through another commit" in p.db.one("SELECT text FROM events WHERE task=? AND kind=?",
+                                                       (ids["landed"][0], supersede.STOPPED))["text"]
+    tid, run_dir = ids["kept"]
+    assert p.db.task(tid)["status"] == "running" and not (run_dir / "STOP").exists()
+
+
+def test_dispatch_never_holds_a_recurring_schedule_run_as_a_duplicate_of_its_last(env):
+    """Each run of a schedule repeats its last one's title by design: the next run, after a done or beside an
+    open one, is never held, and a coordinator task is not held for matching a schedule run. A second daemon
+    fix of one review is still held."""
+    from ttp import supersede
+    p = make(env)
+    for first in ("done", "running"):
+        a = p.db.add_task("[daily-review] daily review", "evidence 1", kind="work", status=first, origin="schedule")
+        b = p.db.add_task("[daily-review] daily review", "evidence 2", kind="work", origin="schedule")
+        assert supersede.dispatch_hold(p.db, p.db.task(b)) == "", first
+        c = p.db.add_task("[daily-review] daily review", "evidence 3", kind="work")
+        assert supersede.dispatch_hold(p.db, p.db.task(c)) == "", first
+        for t in (a, b, c):
+            p.db.x("UPDATE tasks SET status='cancelled' WHERE id=?", (t,))
+    f1 = p.db.add_task("Fix review #5: code: tidy the relay", "fix the findings", kind="code", origin="daemon")
+    f2 = p.db.add_task("Fix review #5: code: tidy the relay", "fix the findings", kind="code", origin="daemon")
+    assert f"duplicates #{f1}" in supersede.dispatch_hold(p.db, p.db.task(f2))
+
+
+def test_a_landing_record_from_before_a_run_began_never_stops_it(env, tmp_path):
+    """A done task with a `ttp task superseded` record, requeued afterwards, keeps its new run."""
+    from ttp import daemon as dm, supersede
+    p = make(env)
+    d = dm.Daemon(p.base)
+    now = time.time()
+    tid = p.db.add_task("work requeued", "s", kind="code", status="running")
+    p.db.x("INSERT INTO task_superseded(task,head,sha,ts) VALUES(?,?,?,?)", (tid, "abc123", "def4567890", now - 500))
+    p.db.x("INSERT INTO runs(task,role,started,status,dir) VALUES(?,?,?,?,?)",
+           (tid, "worker", now - 100, "running", str(tmp_path)))
+    d.stop_superseded()
+    assert p.db.task(tid)["status"] == "running" and not (tmp_path / "STOP").exists()
+    assert not p.db.q("SELECT 1 FROM events WHERE task=? AND kind=?", (tid, supersede.STOPPED))

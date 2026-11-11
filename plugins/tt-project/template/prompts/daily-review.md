@@ -7,6 +7,9 @@ model-free command schedule or pre-step writing files you read.
 2. Spend: `ttp status <name> --json` → budget. Top spenders, runs without durable progress,
    recurring work that is not earning its cost. If this spec ends with `Jev uses` lines, give each
    use's net saving and error rate in one line; the daemon already switches off a use that saves nothing.
+   If it ends with `Check plans` lines, tune the defaults from them and `ttp stats <name> --wakes`:
+   planned checks that mostly only handed the wait back want a later interim (`waiting.check_plan.
+   interim_share`, `interim_min_s`) or `by: plain`; failures found late want an earlier one.
    `ttp stats <name> --days 1`: context re-read (cache-read) tokens per run and per $, and the runs
    that re-read most. Coordinator prompt cache (`budget.coordinator_cache`: hit %, turns that missed,
    $ per turn, 24 h against 7 d): say if the hit rate fell. Judge a fall on the within-1h rate

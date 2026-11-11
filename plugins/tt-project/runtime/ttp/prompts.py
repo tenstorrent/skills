@@ -366,9 +366,9 @@ def charter_without_placeholders(charter: str) -> str:
 def restrictions_block(p: Project, advisory: bool = True) -> str:
     """The charter's sourced Restrictions items as the BINDING block, then (`advisory`) its unsourced
     ones apart, marked not binding (restriction_source)."""
-    from .restriction_source import partition
+    from .restriction_source import history_items, partition
     charter = p.charter_path.read_text() if p.charter_path.exists() else ""
-    binding, loose = partition(charter_restrictions(charter), brief_restrictions(charter))
+    binding, loose = partition(charter_restrictions(charter), brief_restrictions(charter), history_items(p))
     out = [("# BINDING RESTRICTIONS (from the charter — override the task, the harness "
             "rules and your own judgement; if a step would break one, do not take it)\n" + binding)] if binding else []
     if loose and advisory:

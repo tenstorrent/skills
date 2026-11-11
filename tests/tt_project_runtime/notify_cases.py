@@ -765,3 +765,170 @@ def test_a_long_once_listen_blocks_in_one_call_and_returns_at_the_first_reply_or
     last = p.db.one("SELECT MAX(id) m FROM messages")["m"]
     cli.main(["listen", "demo", "--chat", "c1", "--once", "--timeout", "10", "--ack", str(last)])
     assert capsys.readouterr().out == "" and 4 <= len(naps) <= 7, naps
+
+
+def _fake_clock(cli, monkeypatch, step=2.0, on_nap=None):
+    real_time, clock, naps = time.time, [0.0], []
+
+    def nap(s):
+        naps.append(s)
+        clock[0] += step
+        if on_nap:
+            on_nap(len(naps))
+    monkeypatch.setattr(cli.time, "time", lambda: real_time() + clock[0])
+    monkeypatch.setattr(cli.time, "sleep", nap)
+    return clock, naps
+
+
+def test_listen_wakes_a_relayer_only_for_user_facing_messages_and_batches_broadcast_alerts(env, monkeypatch, capsys):
+    """Each printed line wakes a relayer chat: routine updates are not printed, a broadcast alert waits
+    up to --batch for company, and this chat's own reply prints at once with what was waiting."""
+    from ttp import cli
+    p = make(env)
+    _relay_chat(p)
+    monkeypatch.setattr(cli, "here", lambda: None)
+    p.db.post("out", "task 4 done", kind="info")
+    p.db.post("out", "ask 2 resolved", kind="resolved")
+    alert = p.db.post("out", "disk nearly full", kind="alert")
+    clock, naps = _fake_clock(cli, monkeypatch)
+    capsys.readouterr()
+    cli.main(["listen", "demo", "--chat", "c1", "--once", "--batch", "60", "--holder", "h/a"])
+    out = capsys.readouterr().out
+    assert "disk nearly full" in out and "task 4 done" not in out and "resolved" not in out, out
+    assert 29 <= len(naps) <= 31, len(naps)      # held for the 60 s window, not printed at once
+    # A reply to this chat prints at once and brings the alert waiting for its window along.
+    alert2 = p.db.post("out", "box rebooted", kind="alert")
+    p.db.post("out", "here is the answer", kind="reply", chat="c1")
+    naps.clear()
+    cli.main(["listen", "demo", "--chat", "c1", "--once", "--batch", "600", "--holder", "h/a"])
+    out = capsys.readouterr().out
+    assert out.index("box rebooted") < out.index("here is the answer") and not naps, (out, naps)
+    # An ask and a high alert never wait; --all prints routine updates too.
+    p.db.post("out", "Which board?", kind="ask")
+    cli.main(["listen", "demo", "--chat", "c1", "--once", "--batch", "600", "--holder", "h/a"])
+    assert "Which board?" in capsys.readouterr().out and not naps
+    p.db.post("out", "task 5 done", kind="info")
+    cli.main(["listen", "demo", "--chat", "c1", "--once", "--all", "--holder", "h/a"])
+    assert "task 5 done" in capsys.readouterr().out
+    assert alert < alert2
+
+
+def test_listen_never_marks_an_alert_still_waiting_for_its_batch_read(env, monkeypatch, capsys):
+    """A listener that ends before its batch window leaves the waiting alert for the next one."""
+    from ttp import cli
+    p = make(env)
+    _relay_chat(p)
+    monkeypatch.setattr(cli, "here", lambda: None)
+    info = p.db.post("out", "task 4 done", kind="info")
+    alert = p.db.post("out", "disk nearly full", kind="alert")
+    ppid = [os.getppid()]
+    monkeypatch.setattr(cli.os, "getppid", lambda: ppid[0])
+    _fake_clock(cli, monkeypatch, on_nap=lambda n: ppid.__setitem__(0, -1))
+    cli.main(["listen", "demo", "--chat", "c1", "--batch", "600", "--holder", "h/a"])
+    assert "disk nearly full" not in capsys.readouterr().out
+    assert p.db.one("SELECT last_read FROM chats WHERE id='c1'")["last_read"] == info < alert
+
+
+def test_one_relayer_per_chat_id_refuses_another_and_redelivers_what_a_takeover_took(env, monkeypatch, capsys):
+    """A relayer listening on another chat's id would take that chat's replies: it is refused while the
+    chat's relayer listens, status names it, and what it took after a lapsed lease goes to the owner again."""
+    from ttp import cli, relayers
+    from ttp.cli import status_text
+    p = make(env)
+    _relay_chat(p)
+    _relay_chat(p, "c2", label="relay-b")
+    monkeypatch.setattr(cli, "here", lambda: None)
+    clock, _ = _fake_clock(cli, monkeypatch)
+    cli.main(["listen", "demo", "--chat", "c1", "--once", "--timeout", "1", "--holder", "mac/a"])
+    capsys.readouterr()
+    with pytest.raises(SystemExit) as ex:
+        cli.main(["listen", "demo", "--chat", "c1", "--once", "--timeout", "1", "--holder", "mac/b"])
+    err = capsys.readouterr().err
+    assert ex.value.code == 2 and "mac/a" in err and "own chat id" in err, err
+    with pytest.raises(SystemExit):     # nor by reusing the id at connect
+        cli.main(["connect", "demo", "--chat", "c1", "--holder", "mac/b"])
+    assert any("mac/b" in ln and "chat c1" in ln and "close that relayer chat" in ln
+               for ln in status_text(p).splitlines()), status_text(p)
+    from ttp import coordinator as coord
+    assert "- relay: a second relayer (mac/b) listened on chat c1" in coord.digest(p, {}, [], [])
+    # A listener gets only its own chat's replies (and broadcasts).
+    p.db.post("out", "for the other chat", kind="reply", chat="c2")
+    cli.main(["listen", "demo", "--chat", "c1", "--once", "--timeout", "1", "--holder", "mac/a"])
+    assert "for the other chat" not in capsys.readouterr().out
+    # The lease lapses; another relayer takes the chat and a reply; the owner gets it again.
+    clock[0] += relayers.LEASE_S + 60
+    cli.main(["listen", "demo", "--chat", "c1", "--once", "--timeout", "1", "--holder", "mac/b"])
+    p.db.post("out", "the answer", kind="reply", chat="c1")
+    cli.main(["listen", "demo", "--chat", "c1", "--once", "--timeout", "1", "--holder", "mac/b"])
+    assert "the answer" in capsys.readouterr().out
+    cli.main(["listen", "demo", "--chat", "c1", "--once", "--timeout", "1", "--holder", "mac/a"])
+    assert "the answer" in capsys.readouterr().out
+    with pytest.raises(SystemExit):     # and the chat is the owner's again
+        cli.main(["listen", "demo", "--chat", "c1", "--once", "--timeout", "1", "--holder", "mac/b"])
+
+
+def test_listen_prints_a_reply_posted_to_every_chat_and_never_reads_past_it_unprinted(env, monkeypatch, capsys):
+    """A reply to all chats (chat NULL: a coordinator reply to 'all', a hand-off with reply_chat 'all')
+    is for the user: every relayer prints it at once, never skips it as routine and marks it read."""
+    from ttp import cli, relayers
+    p = make(env)
+    _relay_chat(p)
+    monkeypatch.setattr(cli, "here", lambda: None)
+    p.db.post("out", "task 4 done", kind="info")
+    reply = p.db.post("out", "the release is out", kind="reply")
+    assert p.db.one("SELECT chat FROM messages WHERE id=?", (reply,))["chat"] is None
+    _, naps = _fake_clock(cli, monkeypatch)
+    capsys.readouterr()
+    cli.main(["listen", "demo", "--chat", "c1", "--once", "--batch", "600", "--holder", "h/a"])
+    out = capsys.readouterr().out
+    assert "the release is out" in out and "task 4 done" not in out and not naps, (out, naps)
+    assert p.db.one("SELECT last_read FROM chats WHERE id='c1'")["last_read"] >= reply
+    # Each user-facing kind wakes a relayer on any chat; routine kinds on another chat do not.
+    for kind, want in (("reply", "now"), ("ask", "now"), ("alert", "batch"), ("info", ""), ("resolved", "")):
+        assert relayers.wakes({"chat": None, "kind": kind, "severity": "normal"}, "c1") == want, kind
+    assert relayers.wakes({"chat": None, "kind": "info", "severity": "high"}, "c1") == "now"
+
+
+def test_remote_listen_and_connect_retry_without_holder_on_an_older_runtime_but_stop_on_a_lease_refusal(
+        env, monkeypatch, capsys):
+    """An older runtime there rejects --holder (exit 2, 'unrecognized arguments'): listen and connect
+    go on without it. A real lease refusal also exits 2 and is not retried."""
+    from ttp import cli
+    sent = []
+    old = "ttp: error: unrecognized arguments: --holder mac/a"
+
+    def ssh(entry, argv, capture=False, shown=None):
+        sent.append(list(argv))
+        if "--holder" in argv:
+            return subprocess.CompletedProcess(argv, 2, "", old)
+        return subprocess.CompletedProcess(argv, 0, "chat: c1\n", "")
+    monkeypatch.setattr(cli, "_ssh", ssh)
+    monkeypatch.setattr(cli, "_ssh_relay", lambda entry, argv, shown: ssh(entry, argv))
+    entry = {"host": "far", "dir": "/x"}
+    assert cli.forward(entry, ["listen", "demo", "--chat", "c1", "--holder", "mac/a"], shown=set()) == 0
+    assert "--holder" in sent[0] and "--holder" not in sent[-1] and len(sent) == 2
+    # connect: an older runtime lacking both --home-tz and --holder names both in one parse error.
+    sent.clear()
+    both = "ttp: error: unrecognized arguments: --holder mac/a --home-tz UTC --home-from far"
+
+    def ssh2(entry, argv, capture=False):
+        sent.append(list(argv))
+        if "--holder" in argv or "--home-tz" in argv:
+            return subprocess.CompletedProcess(argv, 2, "", both)
+        return subprocess.CompletedProcess(argv, 0, "chat: c1\n", "")
+    monkeypatch.setattr(cli, "_ssh", ssh2)
+    monkeypatch.setattr(cli, "flush_outbox", lambda name, entry: None)
+    monkeypatch.setattr(cli.timefmt, "in_ssh_login", lambda: False)
+    monkeypatch.setattr(cli, "remote_web", lambda name, entry, out: ("web app: ok", 0))
+    assert cli.connect_remote("demo", entry, ["connect", "demo", "--chat", "c1", "--holder", "mac/a"]) == 0
+    assert len(sent) == 2 and "--holder" not in sent[-1] and "--home-tz" not in sent[-1], sent
+    # A lease refusal (exit 2, no unknown option) is shown and not retried.
+    sent.clear()
+    refusal = "ttp: chat c1 is another relayer's (mac/b, last listening 1 min ago)."
+    monkeypatch.setattr(cli, "_ssh", lambda entry, argv, capture=False: sent.append(argv) or
+                        subprocess.CompletedProcess(argv, 2, "", refusal))
+    monkeypatch.setattr(cli, "_ssh_relay", lambda entry, argv, shown: sent.append(argv) or
+                        subprocess.CompletedProcess(argv, 2, "", refusal))
+    assert cli.connect_remote("demo", entry, ["connect", "demo", "--chat", "c1", "--holder", "mac/a"]) == 2
+    assert cli.forward(entry, ["listen", "demo", "--chat", "c1", "--holder", "mac/a"], shown=set()) == 2
+    assert len(sent) == 2 and "another relayer" in capsys.readouterr().err

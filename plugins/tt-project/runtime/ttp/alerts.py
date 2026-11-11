@@ -77,6 +77,7 @@ CLEARED_TEXT = {
     "push_not_landing": "A push batch landed on the push branch again.",
     "push_scope": "The changes held for the token scope `{arg}` pushed or left the push queue.",
     "push_tip_failing": "The push branch tip passes its checks again, or it moved: push batches go on as usual.",
+    "push_target_unreachable": "The push target's remote answers again, or delivery.push_branch changed: push batches go on.",
     "push_script_torn": "The push check held for a script rewritten in place passes again, or a batch pushed.",
     "push_setup_fault": "The push check held for failing before any test ran passes again, or a batch pushed.",
     "heal": "Heal check {arg} passes again.",
@@ -95,7 +96,7 @@ CLEARED_TEXT = {
     "coord-budget": "No coordinator item is parked over its per-turn budget any more.",
     "linger-off": "Linger is on again: the daemon starts at boot without a login.",
     "notifier": "Desktop notifications deliver again.",
-    "gh-auth": "gh is logged in again on this host: PR watching and CI waits read GitHub again.",
+    "gh-auth": "gh works again on this host (logged in, or its delivery.gh_route answers): PR watching and CI waits read GitHub again.",
     "ssh-agent": "ssh signs again here: the ssh agent is unlocked or no longer waits for approval.",
     "tick-step": "Daemon tick step {arg} runs again.",
     "pause-gone": "Machine change #{arg} is closed, or the resource pause its undo resumes is back.",
@@ -105,10 +106,9 @@ CLEARED_TEXT = {
 # high alert; their clearing is a low feed line, not a new notification (netwait.py).
 # linger-off: the systemd service would not start at boot without a login (downtime.py).
 # notifier: this machine's desktop notifications fail (notifier.py; a system setting or a missing tool).
-# gh-auth: this host's gh is logged out while a project here uses gh (ghauth.py; `gh auth login`).
 # fleethold: a hold the user set is past its expected end while tasks here wait on it (fleethold.passed_alerts).
 USER_BLOCKERS = ("network", "paused", "coord-budget", "linger-off", "notifier", "fleethold", "user-step",
-                 "slurm-paused", "gh-auth", "model-ranking-key", "ssh-agent")   # ssh-agent: a locked or waiting password-manager agent here (sshagent.py); model-ranking-key: no Artificial Analysis key (rankfresh); slurm-paused: the checks overflow's start-failure breaker (slurmcheck); paused: a long project pause (projpause); user-step: userstep.py
+                 "slurm-paused", "model-ranking-key", "ssh-agent")   # ssh-agent: a locked or waiting password-manager agent here (sshagent.py); model-ranking-key: no Artificial Analysis key (rankfresh); slurm-paused: the checks overflow's start-failure breaker (slurmcheck); paused: a long project pause (projpause); user-step: userstep.py
 CLEARED_SEVERITY = {"network": "low", "paused": "low", "fleethold": "low", "coord-budget": "low", "account-mismatch": "low",
                     "linger-off": "low", "notifier": "low", "user-step": "low", "slurm-paused": "low", "gh-auth": "low",
                     "model-ranking-key": "low", "ssh-agent": "low"}
@@ -296,6 +296,8 @@ def holds(db: DB, key: str, since: float, now: float) -> bool:
     if kind in ("push_script_torn", "push_setup_fault"):   # pushq._held_told keeps each check's count until it
         held = (db.kv("push_queue") or {}).get("torn" if kind == "push_script_torn" else "setup") or {}   # passes or a batch pushes
         return any(isinstance(r, dict) and r.get("key") == key and r.get("alerted") for r in held.values())
+    if key == "push_target_unreachable":   # pushq keeps it until the remote answers or the setting changes
+        return bool(((db.kv("push_queue") or {}).get("unreachable") or {}).get("alerted"))
     if key == "push_tip_failing":   # pushq keeps the failing tip until it passes or the branch moves
         return bool(((db.kv("push_queue") or {}).get("bad_tip") or {}).get("alerted"))
     if kind == "paused":   # the same project pause still lasts (projpause)
@@ -353,7 +355,7 @@ def active(db: DB, key: str, ts: float, now: float) -> bool:
 def _checkable(key: str) -> bool:
     return key.partition(":")[0] in ("auth", "limit", "budget", "relayed", "disk", "coordinator", "run-start",
                                          "schedule", "release-older", "integrity", "integrity-host", "pr-ready", "config",
-                                         "push_rejected", "after_push_failed", "push_queue_dying", "push_not_landing", "push_tip_failing", "push_script_torn", "push_setup_fault",
+                                         "push_rejected", "after_push_failed", "push_queue_dying", "push_not_landing", "push_tip_failing", "push_target_unreachable", "push_script_torn", "push_setup_fault",
                                          "push_scope", "heal",
                                          "heal-hold", "machine", "machine-change", "network", "deploy", "deploy-behind", "deploy-pending", "redeploy", "daemon-hang", "paused", "fleethold",
                                          "coord-budget", "account-mismatch", "linger-off", "tick-step", "pause-gone", "notifier", "chat-silent", "user-step", "slurm-paused", "gh-auth", "ssh-agent")

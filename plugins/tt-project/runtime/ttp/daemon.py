@@ -38,14 +38,19 @@ from pathlib import Path
 
 from . import runtimeload   # first of its own: its LOADED_AT is when the daemon imported its code
 from . import untrusted
+from . import branchcap
 from . import sshmux
 from . import tailnet
 from . import sshagent
+from . import probewake
 from . import ackwait
+from . import charterset
 from . import claimcheck
 from . import dispatchguard
+from . import supersede
 from . import runclass
 from . import configwho
+from . import integrate
 from . import sidefx
 from . import looks
 from . import machinecap
@@ -145,6 +150,7 @@ from . import effort
 from . import modelpick
 from . import modelrank
 from . import modeltrip
+from . import modeldemote
 from . import effortab
 from . import extchange
 from . import failover
@@ -181,6 +187,7 @@ from . import upjournal
 from . import machine_ledger
 from . import accountset
 from . import netwait
+from . import reach
 from . import obligations
 from . import mustact
 from . import onpassdry
@@ -200,6 +207,7 @@ from . import release
 from . import responsibilities
 from . import reviewcap
 from . import reviewhold
+from . import carryback
 from . import reviewreuse
 from . import reviewstats
 from . import reviewsup
@@ -404,13 +412,14 @@ ESCALATE_READ_MAX = 1 << 16       # bytes of ESCALATE_FILE read; lines past it c
 # What a waiting hand-off keeps across a run the account refused (limit, auth).
 WAIT_KEYS = ("retry_when", "retry_after_s", "waiting_for", "wake_tier", "next_step", "survives_reboot", "waits",
              "waiting_since", "stale_wakes", "wait_key", "on_pass_cmd", refwaits.FACTS_KEY, "spec_seen", "spec_wakes",
-             "spec_hold", "spec_urgent", "spec_urgent_woke", thenwaits.KEY, thenwaits.STAGE_KEY, probematch.KEY)
+             "spec_hold", "spec_urgent", "spec_urgent_woke", thenwaits.KEY, thenwaits.STAGE_KEY, probematch.KEY,
+             waketier.PLAN, waketier.PLAN_SET)
 MAX_FOLLOWUPS, FOLLOWUP_SPEC_CHARS = 12, 4000   # per hand-off; each follow-up is its own event
 # What a review the daemon queues repeats of the code task's spec and hand-off.
 AUTO_REVIEW_SPEC_CHARS, AUTO_REVIEW_SUMMARY_CHARS = 2000, 1000
 # With the push queue on, the daemon starts the project's checks on a code task's head as it queues
-# its review (Daemon._precheck): their folder under the project's state, how long the review waits
-# for them before it starts anyway, and how long finished ones are kept.
+# its review (Daemon._precheck): their folder under the project's state, the most a review waits for
+# them once they run (precheck_hold_s measures less), and how long finished ones are kept.
 PRECHECKS_DIR, PRECHECK_LABEL = "prechecks", "precheck:"
 
 
@@ -421,20 +430,52 @@ def precheck_run_id(out: Path) -> str:
 PRECHECK_HOLD_S, PRECHECK_KEEP_S = 3600, 7 * 86400
 
 
-def precheck_holds(state: Path, task: dict, now: float) -> bool:
-    """Review `task` waits for the checks the daemon started on its head (Daemon._precheck) while they
-    run, at most PRECHECK_HOLD_S after they started. Read-only: files under `state` only, so the
-    overseer reads the same hold (Daemon._precheck_holds)."""
+def precheck_hold_s(state: Path, now: float | None = None) -> float:
+    """How long a review waits at most for its pre-checks once they run on a host: the median wall time
+    of the project's last completed checks runs (checkwall.recent), never over PRECHECK_HOLD_S, which is
+    also the limit before any run is measured."""
+    import statistics
+    from . import checkwall
+    runs = [x for x in checkwall.recent(state, now) if x > 0]
+    return min(PRECHECK_HOLD_S, statistics.median(runs)) if runs else PRECHECK_HOLD_S
+
+
+def precheck_holds(state: Path, task: dict, now: float, db=None) -> bool:
+    """Review `task` waits for the checks the daemon started on its head (Daemon._precheck) only while
+    they run on a host (cli.CHECKS_RUNNING, written once they left every queue), never while they wait
+    for a host checks slot, a lane or another run (cli.CHECKS_SLOT_WAIT), and at most precheck_hold_s
+    after they began running. An urgent review (urgent.is_urgent) or one owning an open obligation (with
+    `db`) is never held: it starts at once and reads their result only if it is there. Read-only: files
+    under `state` and `db` only, so the overseer reads the same hold (Daemon._precheck_holds)."""
     if task["kind"] != "review":
         return False
     name = next((x[len(PRECHECK_LABEL):] for x in push._labels(task) if x.startswith(PRECHECK_LABEL)), "")
     if not name or "/" in name:
         return False
-    from .cli import CHECKS_RC, _checks_alive, _read_checks_pid
+    from . import urgent
+    if urgent.is_urgent(task):
+        return False
+    from .cli import CHECKS_RC, CHECKS_RUNNING, CHECKS_SLOT_WAIT, _checks_alive, _read_checks_pid
     out = Path(state) / PRECHECKS_DIR / name
+    if (out / CHECKS_RC).exists() or (out / CHECKS_SLOT_WAIT).exists():
+        return False
     info = _read_checks_pid(out)
-    return (not (out / CHECKS_RC).exists() and _checks_alive(info)
-            and now - float(info.get("ts") or 0) < PRECHECK_HOLD_S)
+    try:
+        since = float(json.loads((out / CHECKS_RUNNING).read_text()).get("since") or 0)
+    except (OSError, ValueError, TypeError, AttributeError):
+        return False
+    if not _checks_alive(info) or since < float(info.get("ts") or 0) or now - since >= precheck_hold_s(state, now):
+        return False
+    if db is not None:
+        from . import obligations
+        try:
+            if obligations.owned_open(db, task["id"]):
+                return False
+        except Exception:
+            pass
+    return True
+
+
 # A failed review with fix specs gets its fix and re-review from the daemon this many rounds per stack
 # (review.auto_fix_rounds, unset or unreadable): one, so a failed re-review (a third round) goes to the
 # coordinator as one review_nofix event instead of being queued; the re-review repeats the failed
@@ -692,10 +733,12 @@ CALLS_REBOOK_SLICE_S = 2.0      # a tick's slice of it stops after the session t
 CALLS_REBOOK_SLICE_RUNS = 200   # or this many runs, so no tick step runs long (a 7-day re-book of a busy project ~50 s)
 CALLS_NOTE = "cost_calls"   # a Claude run's note: booked at its calls' list price (how many calls)
 NO_CALL_REBOOK_KEY = "no_call_rebook"   # Daemon.rebook_no_call ran (once per project)
+NO_USAGE_REBOOK_KEY = "no_usage_rebook"   # Daemon.rebook_no_usage ran (once per project)
 NO_CALL_KEY = "no_call_streak:"   # + provider: its runs that ended failed in a row with no model call
 NO_CALL_STREAK = 3   # this many in a row open the provider's breaker until a model-free check passes
 NO_CALL_STATUSES = ("failed", "timeout", "stalled")   # ends that count toward that streak
 MODEL_REPRICE_SINCE = (2026, 11, 7)   # its window's first day, in the home zone: the days the dollar caps over-counted
+NET_HOLDS_KEY = "net_holds"   # Daemon.hold_offline's holds: provider -> {host, at} (wall time it began)
 REACH_EVERY_S = 30      # while a provider is held offline, how often its API host is resolved again
 REACH_TIMEOUT_S = 5
 NET_HOLD_MAX_S = 900    # a held provider still lets one run try this often: a lookup that keeps failing never holds forever
@@ -740,12 +783,37 @@ UNREVIEWED_PASS_S = 20         # the pass stops looking after this long, so the 
 UNREVIEWED_BACKLOG_EVERY_S = 100   # after a cut pass that queued a review (a backlog): the next pass this soon
 KV_UNREVIEWED_COUNTED = "unreviewed_counted"   # kv: the runtime version whose first sweep logged its count
 KV_REVIEW_UNREAD = "review_unread"   # kv: task ids whose review a timed-out git read left unqueued (retry_unread_reviews)
+KV_REVIEW_RETRY = "review_read_retry"   # kv: {task id: first failure} of code tasks whose review's diff read failed
+REVIEW_RETRY_KEEP_S = 7 * 86400   # a read retry the sweep has not settled by then is dropped (logged)
 PUSH_REFS_EVERY_S = 600   # how often the push queue's pins (refs/ttp/push/<id>) of settled rows are pruned
 
 
 def _push_not_landed(probe, rc) -> bool:
     """Whether a probe's exit is `ttp push --result <marker> --pushed` saying its push finished without landing."""
     return rc == push.NOT_PUSHED and (bud.result_wait(probe) or ("",))[0] == "push"
+
+
+def _owner_due(db) -> dict:
+    """obligations.owner_due, or none when unreadable (ready_tasks treats it the same way)."""
+    try:
+        return obligations.owner_due(db)
+    except Exception:
+        return {}
+
+
+def _rotate_walked(ready: list, walked: set, owners, now: float) -> list:
+    """`ready` with each run of neighbours in one dispatch band (urgent.band) put as its tasks not in
+    `walked` first, then the walked ones, each part in its own order. The bands keep their order, so a
+    rotation never moves a task past one of a better band."""
+    out, run, key = [], [], None
+    for t in ready + [None]:
+        k = urgent.band(t, now, owners) if t else None
+        if run and k != key:
+            out += [r for r in run if r["id"] not in walked] + [r for r in run if r["id"] in walked]
+            run = []
+        run.append(t)
+        key = k
+    return out
 
 
 def _raised_at(e: BaseException) -> str:
@@ -1201,6 +1269,7 @@ class Daemon:
         self.identity.update(self._loaded)
         self._tree_asked: str | None = None   # the runtime tree a restart was last asked for (once per tree)
         self._tree_wait = ""                  # why that restart waits, logged once per reason
+        self._tree_wait_since: float | None = None   # when it began waiting (runtimeload.DEFER_MAX_S bounds it)
         self._healthy = False
         self._progressed = 0.0   # when the daemon last told the watchdogs a tick step finished
         self._tick_began = 0.0   # when the running tick started, monotonic (0: between ticks)
@@ -1230,6 +1299,8 @@ class Daemon:
         self._overrun: dict | None = None   # the running or last tick that passed TICK_OVERRUN_S or stalled
         self._last_prune = 0.0
         self._last_leftovers = 0.0   # when prune_leftovers last ran
+        self._last_branchcap = 0.0   # when branch_cap last ran
+        self._branchcap_backlog = False   # its last sweep stopped at a limit: the next comes sooner
         self._prune_more: str | None = None   # "plain" or "force": worktrees were left to archive, sweep next tick
         self._release_due = 0.0   # when the installed tt-project release is next compared with the harness
         self._root_checked = 0.0   # when clear_root_checkout last looked at the project root
@@ -1242,8 +1313,10 @@ class Daemon:
         self._unreviewed_swept = 0.0   # when sweep_unreviewed last ran
         self._unreviewed_at = 0   # the task sweep_unreviewed stopped at (time or budget): the next pass resumes after it
         self._unreviewed_every = float(REVIEW_SWEEP_EVERY_S)   # until its next pass (UNREVIEWED_BACKLOG_EVERY_S on a backlog)
+        self._unreviewed_why: dict[int, str] = {}   # urgent or owed tasks' last skip reason sweep_unreviewed logged
         self._continues_checked = 0.0   # when check_unqueued_continues last ran
         self._stale_checked = 0.0   # when check_stale_duplicates last ran
+        self._supersede_checked = 0.0   # when stop_superseded last ran
         self._queue_trimmed = 0.0   # when expire_queue last ran
         self._local_only_ok: dict[str, str] = {}   # branch -> head found on a remote: not looked at again
         self._local_only_job: dict | None = None   # the check running in its thread, applied by a later tick
@@ -1255,8 +1328,9 @@ class Daemon:
         self._models_tried = 0.0
         self._rank_job: threading.Thread | None = None   # the chat model ranking refresh (refresh_model_ranking)
         self._rank_tried, self._rank_out = 0.0, None
-        self._bench_job: threading.Thread | None = None   # the host's daily model bench (run_model_bench)
-        self._bench_tried, self._bench_out = 0.0, None
+        self._scores_job: threading.Thread | None = None   # the model scoreboard (refresh_model_scores)
+        self._scores_tried = 0.0
+        self._bench_tried = 0.0   # the last hourly model bench owner check (run_model_bench)
         self._cli_watch: threading.Thread | None = None   # CLI versions being read (watch_cli_versions)
         self._cli_watched = 0.0   # when that last started
         self._replica_checked = 0.0
@@ -1331,6 +1405,7 @@ class Daemon:
         self._reboot_told = False
         self._linger_at, self._linger_off = 0.0, False   # linger last looked at, and what it said
         self._gh_auth: threading.Thread | None = None   # the host-wide gh login check in flight (ghauth.py)
+        self._reach: threading.Thread | None = None     # the machines' ssh reach probe in flight (reach.py)
         self._last_stop: dict = {}   # the clean-stop record this daemon found at start
         self._boot_woken = False
         self._cycles: dict[str, dict | None] = {}   # earlier boot -> its planned host cycle record
@@ -1343,8 +1418,9 @@ class Daemon:
         self._lease_key: tuple | None = None
         self._settle_until = 0.0   # monotonic time before which nothing new starts (the host just woke)
         # provider -> {host, since, checked, checking, up, probe}: its API host must resolve before
-        # new runs start on it (net_held). In memory only: a restart tries the network afresh.
-        self._net_holds: dict[str, dict] = {}
+        # new runs start on it (net_held). Kept in kv NET_HOLDS_KEY too, so a restart, and the overseer's
+        # wake of a coordinator turn (a Daemon of its own), hold it until the host resolves.
+        self._net_holds: dict[str, dict] = self._saved_net_holds()
         self._sched_sig: tuple[int, int] | None = None   # harness/schedules.json (mtime, size) last checked
         self._sched_read = 0.0   # monotonic time it was last read
         self._sched_problem: str | None = None   # what was wrong with it, last logged
@@ -1504,6 +1580,11 @@ class Daemon:
                 self._load_config()
         except (OSError, RuntimeError) as e:
             log(self.p, f"home time zone not set: {e}")
+        try:   # settings older harnesses read from charter prose move into the config, once (charterset)
+            if charterset.migrate(self.p, log=lambda m: log(self.p, m)):
+                self._load_config()
+        except Exception:
+            log(self.p, "charter settings move error: " + traceback.format_exc().replace("\n", " | ")[:2000])
         try:   # coordinator turns from before runs recorded cache telemetry (bud.backfill_cache_telemetry)
             filled = bud.backfill_cache_telemetry(self.p.db, self.p.runs)
             if any(filled.values()):
@@ -1650,9 +1731,11 @@ class Daemon:
     def _restart_on_moved_runtime(self) -> None:
         """After a tick: the harness checkout's runtime/ tree moved on from the one this daemon loaded
         (ttp upgrade, a commit by hand, a merge, a reset): ask for the restart, with its rollback, a
-        harness run's runtime change asks for (runtimeload.tree_moved), once per tree."""
+        harness run's runtime change asks for (runtimeload.tree_moved), once per tree. Its wait on push
+        batches and harness upgrades is bounded from the tick it first waited."""
         try:
-            tree, why = runtimeload.tree_moved(self.p, self._loaded.get("runtime_tree"), self._tree_asked)
+            tree, why = runtimeload.tree_moved(self.p, self._loaded.get("runtime_tree"), self._tree_asked,
+                                               self._tree_wait_since)
         except Exception:   # never in the way of the tick or of a restart already asked for
             log(self.p, "runtime tree check error: " + traceback.format_exc().replace("\n", " | ")[:2000])
             return
@@ -1663,6 +1746,7 @@ class Daemon:
         elif why and why != self._tree_wait:
             log(self.p, f"runtime tree moved on: restart waits ({why})")
         self._tree_wait = why if not tree else ""
+        self._tree_wait_since = (self._tree_wait_since or time.time()) if why else None
 
     def _mark_start(self) -> None:
         """Record that this process started, and how often its first tick has failed, so `ttp restart`
@@ -2220,14 +2304,14 @@ class Daemon:
         self.tend_lease()
         # Compared as callables, not by name, so a step replaced on the instance is gated the same way.
         lease_off = [] if self.lease_held() else [getattr(self, n) for n in LEASE_STEPS]
-        for step in (self.lift_boot_pause, self.reap_runs, self.reap_waiting_checks, self.wake_after_reboot, self.meter_running, self.rebook_per_call_step, self.rebook_no_call_step, self.watch_runs, self.check_steer_reads, self.relay_escalations, self.post_held_notifies, self.reconcile_tasks, self.retry_workspaces, self.tend_pushes,
+        for step in (self.lift_boot_pause, self.reap_runs, self.reap_waiting_checks, self.wake_after_reboot, self.meter_running, self.rebook_per_call_step, self.rebook_no_call_step, self.rebook_no_usage_step, self.watch_runs, self.check_steer_reads, self.relay_escalations, self.post_held_notifies, self.reconcile_tasks, self.retry_workspaces, self.tend_pushes,
                      self.sweep_sandbox_trees,
                      self.verify_pushes,
-                     self.tick_prune_worktrees, self.prune_leftovers, self.land_harness_worktrees, self.backup_branches, self.replicate_state, self.check_local_only, self.check_disk,
+                     self.tick_prune_worktrees, self.prune_leftovers, self.branch_cap, self.land_harness_worktrees, self.backup_branches, self.replicate_state, self.check_local_only, self.check_disk,
                      self.sweep_alerts, self.check_release, self.sync_shared_pauses, self.check_pause_ends,
                      self.check_integrity, self.heal_harness_git,
                      self.sync_schedules, self.lint_charter, self.tend_holds, self.record_ttr, self.alert_long_pause,
-                     self.check_linger, self.check_notifier, self.check_overseer, self.alert_slurm_paused, self.check_gh_auth, self.check_chats,
+                     self.check_linger, self.check_notifier, self.check_overseer, self.alert_slurm_paused, self.check_gh_auth, self.check_reach, self.check_chats,
                      self.probe_mcp):
             if step in lease_off:
                 continue
@@ -2257,7 +2341,12 @@ class Daemon:
         self._run_step(lambda: configwho.watch(self.p), "config_breakage")   # a config change that broke the checks
         settling = self._run_step(self.settling, default=False)
         core = self.cfg.get("core_provider") or "claude"
-        core_held = self._run_step(lambda: self.net_held(core) and not self._net_may_probe(core), "net_held", default=False)
+        # No coordinator turn starts for a held core provider (each would be a lost turn) but the one
+        # every NET_HOLD_MAX_S that tries the network (_net_may_probe), so a lookup that keeps failing
+        # while the API is reachable (a proxy only the CLI knows) never stops turns for good. A lost
+        # turn books $0. The held events and messages fold into the turn that gets through.
+        core_held = self._run_step(lambda: self.net_held(core) and not self._net_may_probe(core), "net_held",
+                                   default=False)
         cycle = self._run_step(lambda: self.host_cycle_held(now), "host_cycle_held", default=False)
         for step in (   # one step per line: two changes adding steps merge without a conflict
                 self.run_schedules,
@@ -2279,6 +2368,7 @@ class Daemon:
                 self.check_queue_waits,
                 self.check_checks_owner,
                 self.reap_leftover_checks,
+                self.reap_orphan_checks,
                 self.check_checks_stall,
                 self.check_gate_time,
                 self.check_cap_wait,
@@ -2294,6 +2384,7 @@ class Daemon:
                 self.route_machines,
                 self.check_route_models,
                 self.refresh_model_ranking,
+                self.refresh_model_scores,
                 self.run_model_bench,
                 self.refresh_coverage,
                 self.lift_quarantine,
@@ -2303,6 +2394,7 @@ class Daemon:
                 self.sweep_unreviewed,
                 self.check_unqueued_continues,
                 self.check_stale_duplicates,
+                self.stop_superseded,
                 self.expire_queue,
                 self.tend_mitigations,
                 self.failover_pinned,
@@ -2326,8 +2418,11 @@ class Daemon:
             if self.cfg_status == "unavailable" and step in (self.maybe_coordinate, self.dispatch):
                 continue   # no routing to start model work with (see _load_config)
             # While the host settles after a sleep only new work waits: a person who wrote is answered now.
-            # So while the core provider's API host does not resolve; dispatch holds each provider itself.
-            if settling and step == self.dispatch or (settling or core_held) and step == self.maybe_coordinate \
+            # While the core provider's API host does not resolve no turn starts, a message waiting too: the
+            # turn could not reach the API (a lost turn every few minutes), and the message is answered by
+            # the turn that starts once it resolves. Dispatch holds each provider itself.
+            if settling and step == self.dispatch or core_held and step == self.maybe_coordinate \
+                    or settling and step == self.maybe_coordinate \
                     and not self.p.db.one("SELECT id FROM messages WHERE direction='in' AND handled=0"):
                 continue
             if cycle and step in (self.dispatch, self.start_pushes):   # the coordinator still runs
@@ -2399,6 +2494,13 @@ class Daemon:
             if t.get("memory_error"):
                 log(self.p, f"model trip {t['stratum']}: decision memory not written: {t['memory_error']}")
             self.alert(f"model-trip:{t['stratum']}", modeltrip.text(t), severity="low", every_s=0)
+        try:   # chat model vs the next eligible model per class (modeldemote.py)
+            for a in modeldemote.check(self.p, self.cfg, now) if modelrank.ranking(self.cfg) else ():
+                log(self.p, f"model demotion: {a['action']} {a['model']} ({a['class']}): {a['why']}")
+                self.alert(f"model-demote:{a['model']}|{a['class']}", modeldemote.text(a),
+                           severity="low", every_s=0)
+        except Exception as e:   # the detector must never stop the tick
+            log(self.p, f"model demotion not checked: {type(e).__name__}: {e}")
 
     def tend_holds(self) -> None:
         """Log each whole-run hold kept for detached jobs once it ends, and rebuild one whose keeper
@@ -3250,6 +3352,7 @@ class Daemon:
             return
         self._net_holds[prov] = {"host": host, "since": time.monotonic(), "checked": None, "checking": False,
                                  "up": False, "probe": None}
+        self._save_net_holds()
         log(self.p, f"{prov}: {why}; no new runs start on it until {host} resolves")
 
     def net_held(self, prov: str) -> bool:
@@ -3286,7 +3389,29 @@ class Daemon:
 
     def _end_net_hold(self, prov: str, why: str) -> None:
         if self._net_holds.pop(prov, None):
+            self._save_net_holds()
             log(self.p, f"{prov}: {why}; new runs start on it again")
+
+    def _saved_net_holds(self) -> dict[str, dict]:
+        """The holds kv NET_HOLDS_KEY kept (hold_offline), each counted from the wall time it began. One
+        NET_HOLD_MAX_S old or more is dropped, so a restart checks the network afresh."""
+        try:
+            saved = {} if _proxied() else self.p.db.kv(NET_HOLDS_KEY) or {}
+        except Exception:
+            return {}
+        now, mono = time.time(), time.monotonic()
+        return {prov: {"host": str(h["host"]), "since": mono - max(now - float(h.get("at") or now), 0.0),
+                       "checked": None, "checking": False, "up": False, "probe": None}
+                for prov, h in saved.items() if isinstance(h, dict) and h.get("host")
+                and now - float(h.get("at") or now) < NET_HOLD_MAX_S} if isinstance(saved, dict) else {}
+
+    def _save_net_holds(self) -> None:
+        now, mono = time.time(), time.monotonic()
+        try:
+            self.p.db.set_kv(NET_HOLDS_KEY, {prov: {"host": h["host"], "at": now - (mono - h["since"])}
+                                             for prov, h in self._net_holds.items()} or None)
+        except Exception:   # the hold still stands in memory
+            log(self.p, "net hold not saved\n" + traceback.format_exc())
 
     def _slept_between(self, start: float, end: float) -> bool:
         return any(a < end and b > start for a, b in self.p.db.kv("host_sleeps", []) or [])
@@ -3526,7 +3651,8 @@ class Daemon:
                 session_mode, why = coordsession.decide(
                     self.cfg, self.p.db.kv(coordsession.KEY), key, model, effort,
                     lambda s: bool(prov.resume_args(s)) and prov.session_saved(s, cwd, env), time.time(),
-                    no_session=coordsession.gap(prov))
+                    no_session=coordsession.gap(prov), provider=provider,
+                    prompt_resumes=bool(prov.resume_new_prompt))
             except Exception as e:   # the next session, seeded with the hand-off: never a stateless turn
                 session_mode, why = "new", f"decide failed: {type(e).__name__}: {e}"[:200]
                 log(self.p, f"coordinator session {why}")
@@ -3559,6 +3685,7 @@ class Daemon:
         # The environment and any cache mark below take the same lifetime: a mismatch is an API error.
         env = {**env, **prov.cache_env(cache_ttl)}
         thread = ""
+        prefix_now = None   # a session wake's prompt (coordsession.prefix_record), saved in its run dir
         if session_on:
             state = self.p.db.kv(coordsession.KEY)
             session_cap = None
@@ -3587,6 +3714,7 @@ class Daemon:
             if session_mode == "resume" and (n := (state or {}).get("salvaged")):
                 prompt = coordsession.salvaged_line(n) + "\n\n" + prompt
             restoring = session_mode == "resume" and bool((state or {}).get("restore"))
+            asked = False   # this wake asks for the harness-supplied summary (compact_ask)
             if session_mode in ("new", "resume") and session_prompt:
                 system, context = session_prompt["system"], session_prompt["context"]
                 try:   # a new or compacted session's pinned record (coordsession.py): no order, promise or decision is lost
@@ -3603,10 +3731,21 @@ class Daemon:
                         prompt = f"{changed}\n\n{prompt}" if changed else prompt
                     self.p.db.set_kv(coordsession.KEY, {**(state or {}), "pending": pending})   # record() keeps it once ok
                     if why == "compact" and not coordsession.agent_compacts(prov):   # the harness-supplied summary
-                        prompt = prompt + "\n\n" + coordsession.compact_ask(state)
+                        prompt, asked = prompt + "\n\n" + coordsession.compact_ask(state), True
                 except Exception:   # the digest alone still runs the wake
                     log(self.p, "coordinator session seed failed: " + traceback.format_exc().replace("\n", " | ")[:1000])
-            prompt = self._wake_mode_line(session_mode, why, True, prompt)   # before the seed cap counts it
+                try:   # a changed prompt, charter or schema: the session continues, told what changed
+                    from . import __version__
+                    prefix_now = coordsession.prefix_record(key, system, context, schema)
+                    if session_mode == "resume" and (block := coordsession.changed_block(
+                            coordsession.acked_prefix(self.p), prefix_now, __version__,
+                            prov.resume_new_prompt == "diff", str((state or {}).get("key") or ""))):
+                        prompt = block + "\n\n" + prompt
+                        note = {**(note or {}), "prompt_changed": len(block)}
+                except Exception as e:   # the wake runs; the saved copy stays, so the next ok wake sends it
+                    prefix_now = None
+                    log(self.p, f"coordinator session changed block failed: {type(e).__name__}: {e}"[:300])
+            prompt = self._wake_mode_line(session_mode, why, prompt)   # before the seed cap counts it
             compact_at = 0   # the agent's own compaction switch, at the size the session compacts at
             if session_mode in ("new", "resume"):   # never below this wake's own prompt, whatever the state knows
                 fixed = sum(len(t or "") for t in (system, context, append_system, prompt)) // CHARS_PER_TOKEN \
@@ -3637,6 +3776,7 @@ class Daemon:
                 **({"error": str((state or {}).get("fail_error") or "")}   # the failed resume this reruns
                    if (state or {}).get("rerun") else {}),
                 **({"restore": True} if restoring else {}),
+                **({"compact_ask": True} if asked else {}),
                 **({"compact_at": compact_at} if compact_at else {}),
                 **({"seed_chars": seed_chars} if session_mode == "new" else {}),
                 **({"sent": sent_why, "sent_chars": len(prompt)} if sent_why else {})}}}
@@ -3752,12 +3892,17 @@ class Daemon:
             if task and role in ctxfork.ROLES and not resume:   # the coordinator's context (ctxfork.py)
                 got = ctxfork.prepare(self.p, self.cfg, prov, provider, str(cwd), env, task=task["id"],
                                       model=ctxfork._arg(argv, "--model"))
+                if got.get("session") and (miss := ctxfork.own_role(prov, got, str(cwd), env, append_system)):
+                    # The copy would run under the coordinator's role (no tools, its answer format): the
+                    # run starts from the context on disk instead, checked model-free before it starts.
+                    log(self.p, f"task {task['id']}: no {got['how']}: {miss}; it starts from the disk block")
+                    got = {**ctxfork.on_disk(self.p, self.cfg, f"no {got['how']}: {miss}"), "role_gap": miss}
                 if got.get("session"):
                     resume, resume_extra = got["session"], prov.resume_args(got["session"])
                 prefix_by = ""
                 if got.get("how") == "fork" and prov.tool_hooks and append_system is not None and \
                         prov.append_system_args(Path("system.md"))[:1] == ["--append-system-prompt-file"] and \
-                        (shape := ctxfork.coord_shape(self.p)):
+                        (shape := ctxfork.coord_shape(self.p)) and not ctxfork.coord_only([shape["system"]], answer=False):
                     # The coordinator's tools and system prompt, so the copied history is read from the
                     # cache, not written again; the run's own system prompt leads its prompt (ctxfork.py).
                     shaped, prefix_by = ctxfork.shape_argv(argv, shape)
@@ -3766,7 +3911,7 @@ class Daemon:
                         append_system, prefix_by = shape["system"], "coordinator"
                 if got.get("lead"):
                     prompt = got["lead"] + "\n\n" + prompt
-                note = {**(note or {}), ctxfork.KEY: {**{k: got[k] for k in ("how", "why", "session", "tokens", "run", "from")
+                note = {**(note or {}), ctxfork.KEY: {**{k: got[k] for k in ("how", "why", "session", "tokens", "run", "from", "role_gap")
                                                          if k in got}, **({"prefix": prefix_by} if prefix_by else {})}}
             elif task and role in ctxfork.ROLES:   # a lost run continued in its own session (_resumable)
                 note = {**(note or {}), ctxfork.KEY: {"how": "resume", "why": "continues its own session",
@@ -3801,6 +3946,12 @@ class Daemon:
                        self.boot, "running", json.dumps(note or {}), session_id or None))
         run_dir = self.p.runs / str(run_id)
         prompt = prompt.replace(RUN_DIR_MARK, str(run_dir))
+        if prefix_now is not None:   # acknowledged once the wake ends ok (coordsession.ack_prefix)
+            try:
+                run_dir.mkdir(parents=True, exist_ok=True)
+                durable_write(run_dir / coordsession.PREFIX_FILE, json.dumps(prefix_now))
+            except OSError as e:   # the wake still runs; unacknowledged, the next wake sends the changes again
+                log(self.p, f"run {run_id}: its prompt record was not saved: {e}")
         # Raising from here on means nothing was launched: the run row must not stay "running".
         tmp_env: dict = {}
         try:
@@ -3971,7 +4122,9 @@ class Daemon:
                     "budget_usd": None if prov.caps_budget else budget_usd,
                     # The chat provider's loopback bridge (chatbridge.py): where its key is, never the key.
                     # Its effort_fields follow the effort the run launches at, whatever Claude Code asks for.
-                    **({"bridge": chatbridge.settings(self.cfg, tier, model, effort)} if provider == "chat" else {}),
+                    # Its ranked stand-ins swap a model that goes away mid-run (modelrank.standins), never a required pin.
+                    **({"bridge": chatbridge.settings(self.cfg, tier, model, effort, **self._bridge_ranked(task, pin, model))}
+                       if provider == "chat" else {}),
                     # A chat run that mostly sleep-polls is stalled too (runner.is_wait), so it falls back
                     # within stall_s instead of running to its route timeout.
                     **({"waits_idle": True} if provider == "chat" else {}),
@@ -4427,22 +4580,37 @@ class Daemon:
             db.x("DELETE FROM kv WHERE key=?", (downtime.LINGER_KV,))
 
     def check_route_models(self) -> None:
-        """The routed endpoint's model-free /models check (route.py): every route.models_every seconds while
-        a tier or run class routes to it, in a thread, its served ids written to the state dir's route.MODELS_FILE for workers,
-        `ttp status` and doctor; then each tier hold its answer or a config change ends is released."""
+        """The chat endpoint's model-free /models check: the host's one shared poll (served.py), every 30 s
+        while any project on the host routes to chat, else every 5 min, in a thread; its served ids are read
+        by workers, `ttp status` and doctor (route.read_served). Where the shared files cannot be written, the
+        project's own check runs instead while it routes to chat. Then each tier hold its answer or a config
+        change ends is released."""
+        from . import served
         now = time.time()
         for tier, model, why in route.release(self.p.db, self.cfg, route.read_served(self.p.state), now):
             log(self.p, f"route: tier {tier} routes again ({model}: {why})")
         if os.environ.get("TTP_TEST_NO_MODELS_PROBE") or (self._models_probe and self._models_probe.is_alive()):
             return
-        if now - self._models_tried < route.models_every(self.cfg) or not (alias := route.models_due(self.cfg, self.p.state, now, self.p.db)):
+        if now - self._models_tried < served.CHECK_S or not (alias := route.chat_alias(self.cfg)):
             return
+        routes = bool(route.routes_chat(self.cfg, self.p.db))
+        try:
+            if not served.due(self.p.state, route.TO, routes, now):
+                return
+        except OSError:
+            pass   # the shared files are unreadable: the thread falls back
         self._models_tried = now
-        state, where = self.p.state, self.p
+        state, where, cfg = self.p.state, self.p, self.cfg
+        fallback = alias if routes else ""
 
         def work() -> None:
             try:
-                route.refresh_served(state, alias)
+                try:
+                    served.tick(state, alias, routes)
+                except OSError as e:   # the shared files cannot be written: the project's own check
+                    if fallback:
+                        log(where, f"route: shared /models poll failed ({type(e).__name__}); checking for this project")
+                        route.refresh_served(state, fallback, every=route.models_every(cfg))
             except Exception as e:   # a local fault (an unwritable state dir): the type only, never text
                 log(where, f"route: /models check failed: {type(e).__name__}")
 
@@ -4491,34 +4659,76 @@ class Daemon:
         self._rank_job = threading.Thread(target=work, name="model-ranking", daemon=True)
         self._rank_job.start()
 
-    def run_model_bench(self) -> None:
-        """The host's shared daily model bench (modelbench.py), model-free until due: at most every 15
-        minutes, once today's is due and no project on the host has run it, it runs in a thread. A skip for
-        want of a working key is one low alert per outage; a bench is one log line."""
-        from . import modelbench, modelrank
-        out, self._bench_out = self._bench_out, None
-        if out and out.get("report"):
-            self.alert(modelbench.NOKEY, f"The daily chat model bench was skipped: {out['skipped']}. No model "
-                       "was called; it is skipped quietly each day until a key works.", severity="low")
-        elif out and out.get("results") is not None:
-            log(self.p, f"model bench {out['date']}: {len(out['results'])} model(s); weak: {', '.join(out['weak']) or 'none'}")
-        if os.environ.get("PYTEST_CURRENT_TEST") and not os.environ.get("TTP_TEST_MODEL_BENCH"):
-            return   # daemons under test never bench, unless a test asks
+    def refresh_model_scores(self) -> None:
+        """Replace this project's live rows in the account's model scoreboard and publish the per-class chat
+        model rankings (modelscore.py), model-free, at most every modelscore.EVERY_S in a thread, wherever
+        the chat provider has an endpoint. A changed standard order is one log line."""
+        from . import modelrank, modelscore, rankfresh
+        if os.environ.get("PYTEST_CURRENT_TEST") and not os.environ.get("TTP_TEST_MODEL_RANKING"):
+            return   # daemons under test never publish, unless a test asks
         now = time.time()
-        if (now - self._bench_tried < 900 or self._bench_job is not None and self._bench_job.is_alive()
-                or not modelbench.due(self.cfg, now)):
+        if (not rankfresh.configured(self.cfg) or now - self._scores_tried < modelscore.EVERY_S
+                or self._scores_job is not None and self._scores_job.is_alive()):
             return
-        self._bench_tried = now
-        cfg, name, parked, where = self.cfg, self.p.name, modelrank.parked_models(self.p.db), self.p
+        self._scores_tried, where, served = now, self.p, modelrank.served(self.p.state, now)
 
         def work() -> None:
             try:
-                self._bench_out = modelbench.run(name, cfg, parked, time.time())
-            except Exception as e:   # a local fault (an unwritable home): the type only
-                log(where, f"model bench: failed: {type(e).__name__}")
+                modelscore.record(where.name, modelscore.live_rows(where, time.time()), time.time())
+                out = modelscore.publish(served, time.time())
+                if out["changed"]:
+                    log(where, f"model scores: standard class {out['old']} -> {out['new']}")
+            except Exception as e:   # a local fault: the type only; the last rankings stay
+                log(where, f"model scores: not published: {type(e).__name__}: {e}")
 
-        self._bench_job = threading.Thread(target=work, name="model-bench", daemon=True)
-        self._bench_job.start()
+        self._scores_job = threading.Thread(target=work, name="model-scores", daemon=True)
+        self._scores_job.start()
+
+    def run_model_bench(self) -> None:
+        """The machine's shared daily model bench (benchowner.py), model-free, hourly: check the owner
+        lease (take it over or poke its owner when stale), keep this project's bench schedule on only
+        while it owns the lease, run it now on a poke, and report the owner's newest bench once: a
+        keyless skip is one low alert per outage, a bench one log line."""
+        from . import benchowner, modelbench, rankfresh, schednow
+        if os.environ.get("PYTEST_CURRENT_TEST") and not os.environ.get("TTP_TEST_MODEL_BENCH"):
+            return   # daemons under test never bench, unless a test asks
+        now, db = time.time(), self.p.db
+        if now - self._bench_tried < 3600:
+            return
+        self._bench_tried = now
+        me, cfg = self.p.name, self.cfg
+        if not rankfresh.configured(cfg):
+            return
+        got = benchowner.check(me, cfg, now)
+        lease = modelbench._read(modelbench.home() / modelbench.OWNER)
+        if got.get("took") is not None:
+            self.alert("model-bench-owner", f"This project now runs the machine's daily chat model bench "
+                       f"(was: {got['took'] or 'nobody'}).", severity="low")
+        if got.get("poked"):
+            db.post("out", f"The machine's daily chat model bench has no recent result; poked its owner "
+                    f"{got['poked']} to run it now.", chat=None, kind="info", severity="low")
+        owner = lease.get("project") == me
+        try:
+            benchowner.ensure(self.p, db, owner, benchowner.settings(cfg)["at"])
+        except ValueError as e:   # a broken schedules file: the next check tries again
+            log(self.p, f"model bench: schedule not changed: {e}")
+        seen = db.kv(benchowner.SEEN, {}) or {}
+        poke = lease.get("poke") or {}
+        if owner and float(poke.get("at") or 0) > float(seen.get("poke") or 0):
+            schednow.request(self.p, benchowner.SCHEDULE, "model-bench-poke")
+            db.post("out", f"{poke.get('by') or 'Another project'} poked this project to run the machine's "
+                    "daily chat model bench; running it now.", chat=None, kind="info", severity="low")
+            seen["poke"] = poke["at"]
+        rec = modelbench.latest()
+        if rec.get("owner") == me and float(rec.get("at") or 0) > float(seen.get("record") or 0):
+            seen["record"] = rec["at"]
+            if rec.get("skipped") and rec.get("report"):
+                self.alert(modelbench.NOKEY, f"The daily chat model bench was skipped: {rec['skipped']}. No "
+                           "model was called; it is skipped quietly each day until a key works.", severity="low")
+            elif rec.get("results") is not None:
+                log(self.p, f"model bench {rec['date']}: {len(rec['results'])} model(s); weak: "
+                    f"{', '.join(rec['weak']) or 'none'}")
+        db.set_kv(benchowner.SEEN, seen)
 
     def probe_mcp(self) -> None:
         """Refresh this host's connected MCP servers for the status feed (mcpgap.py): `claude mcp list` in
@@ -4621,9 +4831,9 @@ class Daemon:
 
     def check_gh_auth(self) -> None:
         """While this project uses gh: the host-wide gh login check (ghauth.py) in a thread when it is due,
-        and one machine-wide alert while it says logged out, naming the host and `gh auth login`; it clears
-        once the check passes."""
-        from . import ghauth
+        and, while it says logged out and no delivery.gh_route answers (ghroute), one machine-wide harness
+        condition naming the route setting and what is skipped, never a login step; it clears once gh works."""
+        from . import ghauth, ghroute
         db = self.p.db
         if not ghauth.uses_gh(db):
             if db.kv(ghauth.KV):
@@ -4634,13 +4844,23 @@ class Daemon:
                 and (not os.environ.get("PYTEST_CURRENT_TEST") or os.environ.get("TTP_TEST_GH_AUTH")):
             self._gh_auth = threading.Thread(target=ghauth.check, daemon=True, name="gh-auth")
             self._gh_auth.start()
-        if st.get("ok") is False:
+        if st.get("ok") is False and not ghroute.works():
             if not db.kv(ghauth.KV):
                 db.set_kv(ghauth.KV, {"since": st.get("since")})
             when = timefmt.short(float(st.get("since") or time.time()), self.p)
-            self.alert(ghauth.KEY, ghauth.text(st, hostname(), when), severity="normal")
-        elif st.get("ok") and db.kv(ghauth.KV):
+            self.alert(ghauth.KEY, ghauth.text(st, hostname(), when, self.cfg), severity="normal")
+        elif db.kv(ghauth.KV) and (st.get("ok") or ghroute.works()):
             db.x("DELETE FROM kv WHERE key=?", (ghauth.KV,))
+
+    def check_reach(self) -> None:
+        """The listed machines' ssh reach probe (reach.py) in a thread when one is due: the digest's reach
+        record and the claim check of "can't reach" read it."""
+        due = reach.due(time.time(), reach.probe_every(self.p))
+        if due and not (self._reach and self._reach.is_alive()) \
+                and (not os.environ.get("PYTEST_CURRENT_TEST") or os.environ.get("TTP_TEST_REACH")):
+            self._reach = threading.Thread(target=reach.probe, args=(due, self._probe_env()), daemon=True,
+                                           name="machine-reach")
+            self._reach.start()
 
     def check_chats(self) -> None:
         """One low status line per relay chat that stopped reading with no listener running (chatgone)."""
@@ -5230,7 +5450,8 @@ class Daemon:
         mis-booking, while the per-call count matched Anthropic's bill. The report stays
         in the note (reported_usd; session_cost_usd for a resumed or forked run, the coordinator's
         --max-budget-usd base, _session_total_before). A resumed or forked run with no answer at all, a
-        report and no tokens, never reached the API: $0. Other providers, and a Claude output with no
+        report and no tokens, never reached the API: $0; so does a fresh one whose stream shows no answer
+        (_model_called, strict), whatever its report says. Other providers, and a Claude output with no
         per-call usage (an old Claude Code, a run cut off before its first answer), book the old way:
         the report, netted (_net_of_session), or the token or elapsed estimate. A resumed or forked run whose
         stream shows Claude Code started (init) but no call that answered books $0 whatever its result
@@ -5250,8 +5471,9 @@ class Daemon:
             except Exception as e:   # the old way books it
                 log(self.p, f"run {r['id']}: per-call cost not read: {type(e).__name__}: {e}"[:300])
                 got = None
-            if got is None and session and reported is not None and not _has_tokens(usage):
-                got = claude.CallsCost(0.0, 0, [], [])   # a resume or fork that made no call
+            if got is None and reported is not None and not _has_tokens(usage) \
+                    and (session or not _model_called(out, strict=True)):
+                got = claude.CallsCost(0.0, 0, [], [])   # a resume or fork, or a run whose stream shows no answer: no call
             if got is not None:
                 for model in got.unknown:
                     self._unpriced_model(model)
@@ -5302,8 +5524,8 @@ class Daemon:
         they come from the result's own usage, which covers this run only (the cumulative
         modelUsage and duration_api_ms are not read).
         A run that started as a fork of the coordinator's session (note coord_context.how 'fork') reports
-        the parent session's total too: its first run books its own tokens priced (fork_base_usd keeps the
-        rest), and a later resume of that session nets against the highest total an earlier run of it
+        the parent session's total too: its first run books its own tokens priced, its subagents' calls
+        each at its own model (_subagent_cost; fork_base_usd keeps the rest), and a later resume of that session nets against the highest total an earlier run of it
         reported, so the parent's cost is never booked again.
         A resumed Claude Code run nets against the session's last reported running total
         (_session_total_before), never the sum of what its earlier runs booked: that sum drifts above the
@@ -5324,7 +5546,11 @@ class Daemon:
             # The fork's report carries the coordinator session's whole cost up to the fork: book this
             # run's own tokens at list price (the project's measured rate is itself inflated by forks
             # booked before this fix). With no priced tokens nothing is netted (over-booking is safe).
-            own = _list_cost(r, usage, on_unknown=self._unpriced_model) or own
+            # Its subagents' calls, which the result's usage leaves out, are its own too.
+            sub = self._subagent_cost(r, usage)
+            own = (_list_cost(r, usage, on_unknown=self._unpriced_model) + sub) or own
+            if sub:
+                usage.extra["subagent_usd"] = sub
             if own > 0 and reported > own:
                 usage.extra["session_cost_usd"] = reported
                 usage.extra["fork_base_usd"] = round(reported - own, 6)
@@ -5344,6 +5570,37 @@ class Daemon:
             usage.extra["session_cost_usd"] = reported
             usage.cost_usd = round(max(delta, own, 0.0), 6)
         return usage.cost_usd
+
+    def _subagent_cost(self, r: dict, usage) -> float:
+        """The list price of a Claude run's subagent calls (claude.subagent_calls: the stream and the
+        session's subagent transcripts, in the run's own config directory too), each at the model it
+        names; 0 for another provider or none found. A model no price row names books at the dearest
+        row and is told (_unpriced_model)."""
+        if (r["provider"] or "") != "claude":
+            return 0.0
+        from . import localspend
+        from .providers import claude
+        run_dir = self._run_dir(r)
+        try:
+            spec = json.loads((run_dir / "run.json").read_text(errors="replace"))
+        except (OSError, ValueError):
+            spec = {}
+        env = spec.get("env") if isinstance(spec, dict) and isinstance(spec.get("env"), dict) else None
+        usd, unknown = 0.0, set()
+        try:
+            got = claude.subagent_calls(run_dir / "output.jsonl", usage.session_id or r["session_id"] or "", env)
+            rows = localspend.table(localspend.overrides())
+            for c in got:
+                model = c["model"] or _priced_model(r, usage)
+                u, est = localspend.price(model, c["usage"], rows=rows)
+                usd += u
+                if est:
+                    unknown.add(model)
+        except Exception:   # an unreadable record: book none of them (the result's usage still books)
+            return 0.0
+        for model in unknown:
+            self._unpriced_model(model)
+        return round(usd, 6)
 
     def _session_total_before(self, session: str, before: int) -> float | None:
         """Session `session`'s running total as Claude Code last reported it before run `before`, from the
@@ -5404,11 +5661,11 @@ class Daemon:
             (before if before is not None else 1 << 62, task, session, f"%{session}%"))
             if o["session_id"] == session or json.loads(o["note"] or "{}").get("session_id") == session)
 
-    def _wake_mode_line(self, mode: str, why: str, session: bool, prompt: str) -> str:
+    def _wake_mode_line(self, mode: str, why: str, prompt: str) -> str:
         """The coordinator wake's prompt led by its real mode and today's counts, from the record `ttp stats
         --coord-session` reads, never the mode setting (wakemode.py). A fault runs the wake without it."""
         try:
-            return wakemode.prompt_line(self.p.db, timefmt.home(self.p), mode, why, session=session) + "\n\n" + prompt
+            return wakemode.prompt_line(self.p.db, timefmt.home(self.p), mode, why) + "\n\n" + prompt
         except Exception as e:
             log(self.p, f"coordinator wake mode line failed: {type(e).__name__}: {e}"[:300])
             return prompt
@@ -5736,6 +5993,62 @@ class Daemon:
                         f"call at $0: ${usd:.2f} of estimates taken back")
         return changed
 
+    def rebook_no_usage_step(self) -> None:
+        """Tick step: the one-time re-book of estimated runs with no provider usage (rebook_no_usage), once
+        the no-call re-book before it has run."""
+        if getattr(self, "_no_usage_rebook_done", False) or not self.p.db.kv(NO_CALL_REBOOK_KEY):
+            return
+        try:
+            self.rebook_no_usage()
+        except Exception:   # tried again next tick
+            log(self.p, "no-usage re-book failed\n" + traceback.format_exc())
+            return
+        self._no_usage_rebook_done = True
+
+    def rebook_no_usage(self, dry_run: bool = False) -> list[tuple[int, float]] | None:
+        """Once per project (kv NO_USAGE_REBOOK_KEY): runs of any provider that ended in the last
+        CALLS_REBOOK_DAYS days booked at an estimate with no provider usage (no tokens counted) and no
+        evidence in their output that they reached the API (_model_called strict: an answer, a turn or
+        usage, never only an event type it does not know; output that is gone is no evidence), re-booked at
+        $0 the way _book_cost and _cut_off_cost book one now: cost_usd 0 (note no_usage_rebooked keeps the
+        old figure), the task's spend lowered by it (never below $0) and a ledger row of minus that amount
+        at the run's end. With `dry_run` nothing is written and the marker is not read. Returns (run id,
+        booked before) per run changed, or None when it already ran."""
+        db = self.p.db
+        if not dry_run and db.kv(NO_USAGE_REBOOK_KEY):
+            return None
+        since = time.time() - CALLS_REBOOK_DAYS * 86400
+        window = "COALESCE(ended, started)>=?"
+        usd_all = float(db.one(f"SELECT COALESCE(SUM(cost_usd),0) AS s FROM runs WHERE {window}", (since,))["s"])
+        changed = []
+        for r in db.q("SELECT * FROM runs WHERE status!='running' AND cost_usd>0 AND cost_estimated=1 "
+                      "AND COALESCE(input_tokens,0)=0 AND COALESCE(output_tokens,0)=0 "
+                      "AND COALESCE(cache_read_tokens,0)=0 AND COALESCE(cache_write_tokens,0)=0 "
+                      f"AND {window} ORDER BY id", (since,)):
+            out = self._run_dir(r) / "output.jsonl"
+            if out.is_file() and _model_called(out, strict=True):
+                continue
+            before = round(float(r["cost_usd"]), 6)
+            changed.append((r["id"], before))
+            if dry_run:
+                continue
+            note = json.loads(r["note"] or "{}")
+            note["no_usage_rebooked"] = before
+            with db.tx():
+                db.x("UPDATE runs SET cost_usd=0, note=? WHERE id=?", (json.dumps(note), r["id"]))
+                if r["task"]:
+                    db.x("UPDATE tasks SET spent_usd=MAX(COALESCE(spent_usd,0)-?,0) WHERE id=?", (before, r["task"]))
+                db.spend(r["provider"], -before, self._source_for(r), account=r["account"] or "", estimated=True,
+                         ts=float(r["ended"] or r["started"] or time.time()))
+        if dry_run:
+            return changed
+        usd = round(sum(c[1] for c in changed), 6)
+        db.set_kv(NO_USAGE_REBOOK_KEY, {"at": time.time(), "runs": len(changed), "usd_before": round(usd_all, 6),
+                                        "usd_after": round(usd_all - usd, 6)})
+        log(self.p, f"re-booked {len(changed)} run(s) of the last {CALLS_REBOOK_DAYS} days booked an estimate with "
+                    f"no provider usage at $0: ${usd_all:.2f} booked -> ${usd_all - usd:.2f}")
+        return changed
+
     def _output_models(self, r: dict) -> dict:
         """A booked Claude run's model ids from its output, else its note's model_used (RunUsage.extra keys
         model_usage and model)."""
@@ -5771,14 +6084,12 @@ class Daemon:
             log(self.p, f"run {r['id']}: outside-writes scan failed\n" + traceback.format_exc())
 
     def _cred_verdicts(self, r: dict, exit_info: dict, run_dir: Path) -> dict:
-        """credwatch.classify() of the run's credential changes against every project's runs on this host,
-        stored in the run dir for the hand-off check (_cred_changed), before any finish transaction. Always
-        rewritten, so a file the agent left there excuses nothing."""
-        own = self.p.state / "project.db"
-        dbs = [own] + [d for _, d in gcap.local_projects(skip=str(own.resolve()))]
+        """credwatch.classify() of the run's credential changes (the machine's change ledger and the run's
+        own transcript), stored in the run dir for the hand-off check (_cred_changed), before any finish
+        transaction. Always rewritten, so a file the agent left there excuses nothing."""
         try:
             got = credwatch.classify(exit_info["cred_changed"], exit_info.get("cred_marks") or {},
-                                     r.get("started"), time.time(), dbs, (str(own), r.get("id")), run_dir)
+                                     r.get("started"), time.time(), run_dir)
             durable_write(run_dir / credwatch.VERDICTS, json.dumps(got))
             return got
         except Exception:   # every change fails the run, as before
@@ -5829,8 +6140,8 @@ class Daemon:
                      (time.time(), "daemon", "secrets_unmasked", "high", text[:500], "queued", r["task"]))
         if exit_info.get("cred_changed"):
             try:
-                credwatch.observe(db, r, exit_info["cred_changed"], time.time(), run_dir, p,
-                                  self._cred_verdicts(r, exit_info, run_dir))
+                credwatch.observe(db, r, exit_info["cred_changed"], time.time(),
+                                  self._cred_verdicts(r, exit_info, run_dir), p)
             except Exception:
                 log(p, f"run {r['id']}: credential change observation failed\n" + traceback.format_exc())
         prov = get_provider(r["provider"]).use(r["model"] or "", (self.cfg.get("pricing") or {}).get(r["provider"]))
@@ -5943,6 +6254,9 @@ class Daemon:
         elif r["provider"] in self._net_holds and (status == "ok" or _has_tokens(usage)):
             self._end_net_hold(r["provider"], f"run {r['id']} reached its API")
         note = json.loads(r["note"] or "{}")
+        swapped = ""   # the stand-in a mid-run swap finished on: runs.model, never the asked-for model's run
+        if mid := (exit_info.get("bridge") or {}).get("mid_run"):
+            swapped = self._rank_mid_run(r, note, mid, str((exit_info.get("bridge") or {}).get("model") or ""))
         if routed:
             note[route.KEY] = {**routed, **({"fallback": fell} if fell else {}), **({"salvaged": True} if salvaged else {}),
                                **({"cause": _route_cause(stopped or status, exit_info, usage, run_dir)} if own else {}),
@@ -5959,7 +6273,7 @@ class Daemon:
                                 f"{sent['effort'] or '-'} ({', '.join(sent['fields'])}); run {r['id']} went on without them")
             # Only a run that ran on it counts: a hand-off is a good run, its own fault (FAULTS_PARK) a bad one;
             # a start that fell back before it (no room, auth) or a run killed, capped or slept books nothing.
-            if (routed.get(modelrank.KEY) or {}).get("why") == modelrank.BETTER and on_route and (
+            if (routed.get(modelrank.KEY) or {}).get("why") == modelrank.BETTER and on_route and not swapped and (
                     handed_off or fell in modelrank.FAULTS_PARK) and (verdict := modelrank.tried(
                     db, ran := r["model"] or routed["model"], fell, r["id"], time.time())):   # a smarter model's try
                 log(self.p, f"model ranking: {ran} {verdict} (run {r['id']}{': ' + fell if fell else ''})")
@@ -5979,10 +6293,15 @@ class Daemon:
                                    f"The {routed['to']} provider no longer serves model {model} "
                                    f"(providers.{routed['to']}.tiers.{routed['tier']}.model). {routed['tier'].capitalize()} "
                                    f"runs now start on the core provider; routing resumes on its own once the model is "
-                                   f"served again (checked every minute) or the tier's model is changed. Served models: "
+                                   f"served again (checked every 30 seconds) or the tier's model is changed. Served models: "
                                    f"`ttp status`.", severity="normal", every_s=0)
             elif fell and not own:   # an endpoint fault cools the endpoint; a run's own end only its task
                 route.cool(db, self.cfg, routed["to"], fell, r["id"], time.time())
+        elif r["provider"] == modelrank.TO and isinstance(note.get(modelrank.KEY), dict) and r["model"] and \
+                route.fell_back(status, exit_info, usage.error) == "model_missing":
+            # A preference pin's ranked stand-in (start_run) refused, as a routed one: skip it
+            modelrank.refused(db, r["model"], r["id"], time.time())
+            log(self.p, f"model ranking: {r['provider']} refused {r['model']} (run {r['id']})")
         if "split" not in note:   # the split steer may have fired after `r` was read
             split = json.loads((db.one("SELECT note FROM runs WHERE id=?", (r["id"],)) or {}).get("note") or "{}")
             if isinstance(split.get("split"), dict):
@@ -6035,6 +6354,8 @@ class Daemon:
         for k in ("reported_usd", CALLS_NOTE):   # Claude Code's own total, kept beside the per-call booking
             if k in usage.extra:
                 note[k] = usage.extra[k]
+        if usage.extra.get("subagent_usd"):   # its subagents' share of cost_usd (_subagent_cost)
+            note["subagent_usd"] = usage.extra["subagent_usd"]
         # The runaway guard counts runs that ended without an outcome; a reboot, a host sleep or a
         # hand-off that stands is an outcome, not a loop.
         if status == "lost" and r["boot_id"] and not self._this_boot(r["boot_id"]):
@@ -6065,6 +6386,9 @@ class Daemon:
             note["not_waste"] = "resume"   # nothing ran: the task starts fresh (_finish_worker)
             if ctxfork.forked(note):   # its next start skips the fork (ctxfork.prepare)
                 note["resume_error"] = str(usage.error or f"exit {exit_info.get('rc')}")[:200]
+        if r["task"] and r["role"] in ctxfork.ROLES and \
+                (miss := ctxfork.role_miss(usage.final_text, _read_result(run_dir / RESULT_FILE))):
+            note["role_miss"] = miss   # its task's next start copies no session (ctxfork.prepare)
         if status == "lost" and not note.get("session_id") and (note.get("resumes") or {}).get("session"):
             # A resume the sleep or network cut keeps its session for the next resume, not a fresh start.
             note["session_id"] = note["resumes"]["session"]
@@ -6108,10 +6432,10 @@ class Daemon:
             with rnd:
                 db.x("UPDATE runs SET ended=?, status=?, exit_code=?, cost_usd=?, cost_estimated=?, cost_basis=?, "
                      "input_tokens=?, output_tokens=?, cache_read_tokens=?, cache_write_tokens=?, note=?, "
-                     "session_id=COALESCE(NULLIF(?,''), session_id) WHERE id=?",
+                     "session_id=COALESCE(NULLIF(?,''), session_id), model=COALESCE(NULLIF(?,''), model) WHERE id=?",
                      (ended, status, exit_info.get("rc"), usage.cost_usd,
                       int(usage.estimated), basis, usage.input_tokens, usage.output_tokens, usage.cache_read_tokens,
-                      usage.cache_write_tokens, json.dumps(note), usage.session_id or "", r["id"]))
+                      usage.cache_write_tokens, json.dumps(note), usage.session_id or "", swapped, r["id"]))
                 db.spend(r["provider"], usage.cost_usd, source, account=r["account"] or "", estimated=usage.estimated,
                          tokens_in=usage.input_tokens + usage.cache_read_tokens + usage.cache_write_tokens,
                          tokens_out=usage.output_tokens, ts=ended)
@@ -6429,17 +6753,22 @@ class Daemon:
                       f"coordinator run {r['id']}: a new session could not start "
                       f"({str(getattr(usage, 'error', '') or '')[:200] or 'no error recorded'}); the next wake "
                       f"starts it again, seeded with the hand-off", json.dumps({"run": r["id"]}), "handled"))
+            noted = False   # the wake asked for its summary returned it: a "summary" compaction
             if ok and session.get("mode") in ("new", "resume") and isinstance(out, dict) and out.get("session_note"):
                 sid = str(getattr(usage, "session_id", "") or r.get("session_id") or "")
                 from .relay import agent_orders
                 if path := coordsession.save_note(self.p, sid, out.get("session_note"), agent_orders(self.cfg)):
                     log(self.p, f"coordinator run {r['id']}: session note saved to {path}")
+                    noted = bool(session.get("compact_ask"))
             compacted = None
             if session.get("mode") in ("new", "resume"):
                 pre = self._compaction(r)
                 compacted = pre if pre is not None else {"pre_tokens": 0} if (ctx or {}).get("compacted") else None
             state = coordsession.record(state, usage, r.get("session_id") or "", session, ok, now,
-                                        summary=str((out or {}).get("summary") or ""), compacted=compacted)
+                                        summary=str((out or {}).get("summary") or ""), compacted=compacted,
+                                        noted=noted)
+            if ok and session.get("mode") in ("new", "resume"):
+                coordsession.ack_prefix(self.p, r.get("dir") or self.p.runs / str(r["id"]))
             if ok and (state.get("compactions") or [{}])[-1].get("at") == now:
                 c = state["compactions"][-1]
                 log(self.p, f"coordinator run {r['id']}: session {c['session'][:8]} compacted in place "
@@ -7034,6 +7363,13 @@ class Daemon:
         relay_worker_notifies(self.p, task, run_dir, handoff)
         _, past_cap = relay_worker_escalations(self.p, task, r.get("id"), run_dir)
         self._file_queued_notes(r.get("id"), task["id"], run_dir)
+        if warned := streamguard.take_warnings(run_dir):
+            # Calls the stream guard refuses that had already run when it read them: the run went on (streamguard).
+            text = (f"#{task['id']} {task['title']}: run {r['id']} ran {len(warned)} call(s) the harness refuses "
+                    f"before the stream guard saw them; the run was kept: {str(warned[0]['why'])[:400]}")
+            db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+                 (time.time(), f"task:{task['id']}", "guard_warning", "normal", text[:1500], "new", task["id"]))
+            log(self.p, text)
         if held:
             # Judged by the code it replaced, the hand-off could fail for the bug the run fixed: the
             # coordinator decides, no attempt spent. The hand-off stays in the run dir and the result.
@@ -7191,9 +7527,9 @@ class Daemon:
         if rejects:
             rstatus, result = "failed", dict(result, status=CHANGES_NEEDED)
         if own and rstatus in HANDOFF_STATES and rstatus != "failed" and (
-                cred := credwatch.unrecorded(_cred_changed(run_dir), r.get("started"), time.time())):
-            # The run changed a credential file (credwatch, observed above) that no change ledger entry
-            # records as made while it ran: its hand-off never stands.
+                cred := _cred_changed(run_dir)):
+            # The run's own transcript shows it changed a credential file (credwatch.classify, observed
+            # above): its hand-off never stands.
             rstatus, result = "failed", dict(result, status="failed", handoff_status=rstatus, cred_changed=cred,
                                              summary=f"Failed: credential files changed during the run "
                                                      f"({'; '.join(f'{p} {h}' for p, h in cred)[:400]}). Its "
@@ -7332,6 +7668,15 @@ class Daemon:
             new = "queued"   # a busy resource is not a failed attempt: the task comes back later
         elif refusal:
             new, status = "failed", "refused_wait"   # an attempt, but no deep retry (effort.RETRY_FAILED)
+        elif r.get("role") in ctxfork.ROLES and (miss := ctxfork.role_miss(usage.final_text, result if own else None)):
+            # It ran under the coordinator's role and did nothing: no top-up or session resume repeats
+            # it. A copied session's next start takes the disk block (ctxfork.prepare); a run that had no
+            # copy would start the same way again, so it is not retried.
+            new, status = "failed", "role_miss"
+            if not ctxfork.forked(json.loads(r.get("note") or "{}")):
+                guard = f"not retried: {miss}, without a copied session"
+            summary = f"{guard or miss}. {summary}"[:1500]
+            log(self.p, f"task {task['id']}: run {r.get('id')} {guard or miss}")
         elif own and status == "ok" and rstatus not in HANDOFF_STATES and not refusal and \
                 not load_result(task["result"]).get(HANDOFF_RESUME_KEY) and \
                 (back := redo or self._handoff_resume(r, task, usage, run_dir)):
@@ -7366,7 +7711,7 @@ class Daemon:
         attempts = int(task["attempts"] or 0) + (0 if status in FREE_ENDS or waiting or reboot_lost
                                                   or rejects or topped or resumed else 1)
         if new == "failed" and not guard and attempts < int(task["max_attempts"] or 3) \
-                and status in ("failed", "lost", "timeout", "stalled", "no_handoff", "refused_wait"):
+                and status in ("failed", "lost", "timeout", "stalled", "no_handoff", "refused_wait", "role_miss"):
             new = "queued"
         # A done hand-off on a spec's `cells:` line that left requested cells unfinished or unreported
         # is never passed on as complete: its summary says so, and missing cells get a `continue:`
@@ -7475,6 +7820,17 @@ class Daemon:
             else:
                 not_before = time.time() + waitpoll.capped(self.cfg, task, result, _retry_s(result))
                 extra["waiting_since"] = time.time()
+                # Its check plan (waketier): the checks its model makes of this wait, the first one sooner.
+                if isinstance(prev_res.get(waketier.PLAN_SET), dict):
+                    extra[waketier.PLAN_SET] = prev_res[waketier.PLAN_SET]
+                try:
+                    same = isinstance(prev_res.get(waketier.PLAN), dict) and (prev_res.get("wait_key") or {}).get("key") == key["key"]
+                    # The same wait handed back keeps its plan (and its checks done), so checks never multiply.
+                    if cp := prev_res[waketier.PLAN] if same else waketier.plan(
+                            self.p.db, self.cfg, result, extra["waiting_since"], prev_res.get(waketier.PLAN_SET)):
+                        extra[waketier.PLAN] = cp
+                except Exception as e:   # a wait without a plan still sleeps on its probe
+                    log(self.p, f"task {task['id']}: no check plan: {type(e).__name__}: {e}")
                 reason = f"waiting for {what}; next try {timefmt.short(not_before, self.p)}"
             if new == "queued" and "waiting_since" in extra and isinstance(result.get("on_pass_cmd"), str):
                 result, summary = self._dry_run_verdict(r, task, result, run_dir, extra, summary)
@@ -7517,13 +7873,30 @@ class Daemon:
         entries = result.get("push") if isinstance(result, dict) else None
         if task["kind"] == "review" and (judged := load_result(task["result"]).get(pushq.JUDGED_KEY)):
             extra[pushq.JUDGED_KEY] = judged   # what its earlier approvals accepted, kept for the next one
-        if new == "done" and entries not in (None, "", []):
+        member_vs = None   # a shared-branch review that passes some members and fails others (integrate.verdicts)
+        if task["kind"] == "review" and new == "failed" and isinstance(entries, list) and entries:
+            try:
+                member_vs = self._split_verdicts(task, result)
+                entries = self._landable_entries(member_vs, entries) if member_vs else None
+            except Exception as e:
+                member_vs, entries = None, None
+                log(self.p, f"task {task['id']}: its member verdicts were not read: {e}")
+            if not entries:
+                member_vs = None
+        if (new == "done" or member_vs) and entries not in (None, "", []):
             try:
                 check = (pushq.check_approval(self.p, task, entries, cfg=self.cfg) if task["kind"] == "review"
                          else {"ignored": "only a review task approves pushes"})
             except subprocess.TimeoutExpired as e:   # gitmemo.TX_GIT_S ran out: invalid, so the review runs again
                 check = {"invalid": f"local git timed out checking it (after {e.timeout:.0f} s)"}
-            if check.get("ignored"):
+            if member_vs and (check.get("ignored") or check.get("invalid")):
+                # The passing members' approval is refused: the review stays failed and its fix and
+                # re-review carry every member, as for any failed review.
+                log(self.p, f"task {task['id']}: approval of its passing members refused: "
+                            f"{check.get('ignored') or check.get('invalid')}")
+                push_note = f" Its passing members' approval was refused: {check.get('ignored') or check.get('invalid')}."
+                member_vs = None
+            elif check.get("ignored"):
                 log(self.p, f"task {task['id']}: its push list was ignored: {check['ignored']}")
                 push_note = f" Its push list was ignored: {check['ignored']}."
             elif check.get("invalid"):
@@ -7646,6 +8019,29 @@ class Daemon:
             except Exception:
                 log(self.p, f"run {r.get('id')}: checking the project root's checkout failed\n"
                             + traceback.format_exc())
+        if isinstance(cmark := load_result(task["result"]).get(carryback.KEY), dict):
+            extra[carryback.KEY] = cmark   # kept for the task's life: one send-back per task
+        elif new == "done" and not approval and status == "ok" and not root_sent and task["kind"] == "code" \
+                and task["branch"]:
+            try:   # memoized by _prefetch_git: the same read the review's queueing makes below
+                head = pushq._commit(self.p, task["branch"])
+                found = carryback.pending(db, task, pushq.carried(self.p, task, head, self.cfg) if head else {},
+                                          load_result(task["result"]))
+            except Exception:   # never lose a hand-off to the check itself
+                found = {}
+                log(self.p, f"task {task['id']}: checking carried commits failed: "
+                            + traceback.format_exc().replace("\n", " | ")[:1500])
+            if found:
+                tgt = pushq.target(self.p)
+                new, not_before, push_quiet = "queued", time.time(), True
+                attempts = int(task["attempts"] or 0)
+                extra[carryback.KEY] = {"run": r.get("id"), "head": head, "tasks": sorted(found)}
+                extra["woke"] = carryback.order(found, f"{tgt[0]}/{tgt[1]}" if tgt else "")
+                if (back := self._handoff_resume(r, task, usage, run_dir, extra["woke"])):
+                    extra[HANDOFF_RESUME_KEY] = back   # continues its session, as a hand-off check's send-back
+                reason = (f"its head carries commits of {', '.join(f'#{t}' for t in found)}, whose review failed; "
+                          f"sent back once")
+                log(self.p, f"task {task['id']}: run {r.get('id')} {reason}")
         if new == "done" and not approval and not push_verified and status == "ok" \
                 and self._defer_for_push(r, task, run_dir, usage, ended, result, summary):
             return
@@ -7674,7 +8070,7 @@ class Daemon:
                  if k not in ("summary", "waits", "waiting_since", "woke", "reboot_wakes", "escalated_wake",
                               "stale_wakes", "wait_key", SPEC_SEEN_KEY, SPEC_WAKES_KEY, SPEC_WAKE_NOW_KEY,
                               SPEC_WOKE_KEY, SPEC_HOLD_KEY, SPEC_URGENT_KEY, SPEC_URGENT_WOKE_KEY,
-                              handoffcheck.KEY, ROOT_WAKE_KEY)}
+                              handoffcheck.KEY, ROOT_WAKE_KEY, carryback.KEY)}
                 if isinstance(result, dict) else {})})}
         if reason:
             upd["blocked_reason"] = reason[:500]
@@ -7707,7 +8103,10 @@ class Daemon:
                 db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
                      (time.time(), f"task:{task['id']}", "push_queued", "normal",
                       f"{pushq.queued_text(task, approval)} (run {ended or status}, "
-                      f"{'~' if usage.estimated else ''}${usage.cost_usd:.2f})", "handled", task["id"]))
+                      f"{'~' if usage.estimated else ''}${usage.cost_usd:.2f})"
+                      + (f"\nMember verdicts: " + ", ".join(f"#{i} {v}" for i, v in sorted(member_vs.items()))
+                         + "; the passing members' heads are approved together, the failed members' fix is queued"
+                         if member_vs else ""), "handled", task["id"]))
         else:
             db.update_task(task["id"], **upd)
         if plan_line and (gate := plangate.stored(db.task(task["id"]))):   # tasks queued from it already
@@ -7894,8 +8293,12 @@ class Daemon:
         form_only = new == "failed" and task["kind"] == "review" and review_failure(result) == "approval"
         area = self._review_area(dict(task, **upd)) if new == "failed" and task["kind"] == "review" \
             and not check_only and not form_only and not marker_fix else None
-        fix = self._fix_failed_review(dict(task, **upd), fixes, summary, reuse_fix=bool(marker_fix)) \
-            if new == "failed" and task["kind"] == "review" and fixes and (len(fups) <= MAX_FOLLOWUPS or marker_fix) \
+        # A split review's approved members go to the push queue while the failed members' fix is queued
+        # for their part only (the review waits as 'pushing'; what waits on it keeps waiting on it).
+        failed_fix = new == "failed" or bool(member_vs and approval)
+        fix = self._fix_failed_review(dict(task, **upd), fixes, summary, reuse_fix=bool(marker_fix),
+                                      approved=bool(member_vs and approval)) \
+            if failed_fix and task["kind"] == "review" and fixes and (len(fups) <= MAX_FOLLOWUPS or marker_fix) \
             and not area and not check_only and not form_only else None
         # A failed review left with no fix (a capped round, no fix follow-ups, findings on branches
         # that are not one stack) wakes the coordinator, never silently.
@@ -8258,6 +8661,7 @@ class Daemon:
                 continue
             try:
                 agent = get_provider(prov)
+                agent.entry = dict((self.cfg.get("providers") or {}).get(prov) or {})   # a login check may need it
                 stamp = agent.credentials_stamp()
             except Exception:
                 agent, stamp = None, ""
@@ -8266,7 +8670,7 @@ class Daemon:
             if now < float(rec.get("next_check") or 0) and (not changed or rec.get("account_hold")):
                 continue
             try:
-                ok = agent.login_check() if agent and not rec.get("distrust") else None
+                ok = agent.login_state(self.cfg) if agent and not rec.get("distrust") else None
             except Exception:
                 log(self.p, f"{prov}: login check failed\n" + traceback.format_exc())
                 ok = None
@@ -9053,6 +9457,10 @@ class Daemon:
                     jev_lines.append(gate_line)
             except Exception as e:   # a metric must not keep the review from starting
                 log(self.p, f"wake gate line failed: {type(e).__name__}: {e}")
+            try:
+                spec += "\n\nCheck plans (waketier):\n" + "\n".join(f"- {x}" for x in waketier.plan_lines(db, self.cfg))
+            except Exception as e:   # a metric must not keep the review from starting
+                log(self.p, f"check plan lines failed: {type(e).__name__}: {e}")
         if jev_lines:
             spec += (f"\n\nJev uses over the last {jevuse.window_s(self.cfg) / 86400:g} d (calls, cost, estimated "
                      f"savings, net, error rate; a use with no net saving is switched off by itself):\n"
@@ -10211,6 +10619,35 @@ class Daemon:
             for rec in leftoverchecks.reap_one(self.p, r["id"], slots, guarded):
                 log(self.p, rec["text"])
 
+    def reap_orphan_checks(self, every_s: float = 60, now: float | None = None, wait: bool = False) -> None:
+        """Model-free, at most every `every_s`: stop this machine's `ttp checks` runs on the project's check
+        hosts whose local owner is gone or whose checkout was removed under them (orphanchecks: their own
+        process groups, by number; the folder removed; one line here each). Each host is scanned at most
+        once per orphanchecks.EVERY_S by all of this user's projects; the ssh calls run on a thread of
+        their own (one at a time), so an unreachable host never holds the tick. `wait`: in the tick (tests)."""
+        from . import orphanchecks
+        now = time.time() if now is None else now
+        if now - getattr(self, "_orphan_checks_at", 0.0) < every_s:
+            return
+        busy = getattr(self, "_orphan_checks_thread", None)
+        if busy is not None and busy.is_alive():
+            return
+        self._orphan_checks_at = now
+        cfg = getattr(self, "cfg", None)
+
+        def run() -> None:
+            try:
+                for rec in orphanchecks.sweep(cfg, now=now):
+                    log(self.p, rec["text"])
+            except Exception as e:   # a scan's fault is logged, never the daemon's end
+                log(self.p, f"orphaned check scan failed: {e}")
+
+        if wait:
+            run()
+            return
+        self._orphan_checks_thread = threading.Thread(target=run, name="ttp-orphan-checks", daemon=True)
+        self._orphan_checks_thread.start()
+
     def check_checks_owner(self, every_s: float = 60, now: float | None = None) -> None:
         """Model-free: a checks lane held by a check whose task has ended (checklane.finished_holders)
         raises one `checks_lane_finished` event naming the pid, the task and how long since it ended,
@@ -10836,6 +11273,9 @@ class Daemon:
     def _maybe_coordinate(self) -> None:
         if not self.lease_held():
             return
+        core = self.cfg.get("core_provider") or "claude"
+        if self.net_held(core) and not self._net_may_probe(core):
+            return   # its API host does not resolve: the turn that gets through folds in what waits
         db, c = self.p.db, self.cfg["coordinator"]
         if db.one("SELECT id FROM runs WHERE role='coordinator' AND status='running'"):
             return
@@ -11042,6 +11482,8 @@ class Daemon:
             session_prompt = {"system": s_head, "context": s_context, "cached": cached}
             context = coord.with_cached(context, cached)
             burst = bursthold.carried(db, evs)
+            if provider in self._net_holds:   # this turn is the held provider's one try (as in start_run)
+                self._net_holds[provider]["probe"] = time.monotonic()
             rid = self.start_run("coordinator", prompt, provider, c.get("tier", "light"), str(self.p.base),
                            read_only=True, schema=coordsession.schema(),
                            system=head, context=context, session_prompt=session_prompt,
@@ -11260,12 +11702,32 @@ class Daemon:
         fate: dict[int, str] = {}   # task id -> a schedlog reason, "full" or "picked" (_log_slot_fill)
         probing, probe_tried = None, False   # the task whose start retries an open run-start breaker this tick
         ready = startbreaker.probe_first(db, ready, now)   # a due retry goes to a task its cause has not failed
-        for task in ready:
+        # Tasks walked since the last whole walk (ticks cut short at the step budget, e.g. by slow git reads
+        # under load) go after the ones not reached yet in their band (urgent.band), so every ready task of
+        # a band is reached in turn, and an urgent or better-priority task walked but not started still
+        # goes before every task of a later band.
+        ids = {t["id"] for t in ready}
+        walked = self._dispatch_walked = [i for i in self.__dict__.get("_dispatch_walked") or () if i in ids]
+        fresh = [t for t in ready if t["id"] not in walked]
+        if walked:
+            ready = _rotate_walked(ready, set(walked), _owner_due(db), now)
+        for i, task in enumerate(ready):
             if not self.lease_held():   # lapsed during this tick (a slow start or store): start nothing more
                 break
+            # Stopped between tasks at the step budget: the ones not reached go first next tick (a stop
+            # instead lets dispatch finish what it began: _run_step).
+            if self._step_over(f"task #{task['id']}'s start", task["id"]) and i and not self._stopping:
+                break
+            if task["id"] not in walked:
+                walked.append(task["id"])   # kept as it grows: a step killed mid-task resumes past it
             if why := dispatchguard.refusal(db, task):   # ended since the read, or done again and again
                 log(self.p, f"task {task['id']} not dispatched: {why}")
                 dispatchguard.refuse(db, task["id"], why)   # still queued: back to done, on record
+                fate[task["id"]] = "other"
+                continue
+            if why := supersede.dispatch_hold(db, task):   # a duplicate, or a step a newer order superseded
+                log(self.p, f"task {task['id']} held at dispatch: {why}")
+                supersede.hold(db, task, why)
                 fate[task["id"]] = "other"
                 continue
             # Before _start_hold, which may reserve the task's resource.
@@ -11471,6 +11933,10 @@ class Daemon:
                                     **({"pick": pv[waketier.PICK]} if pv.get(waketier.PICK) else {})}
                 if gated:
                     note[waitgate.USE] = gated
+                woke_probe = probewake.valid(db.kv(probewake.KV_PREFIX + str(task["id"]))) \
+                    or (probewake.valid(prev.get(probewake.KEY)) if wake else None)
+                if woke_probe:   # the probe run that woke it: kept in the run's note as it was
+                    note[probewake.KEY] = woke_probe
                 if picked:
                     note["pick"] = picked
                 kept = self._floor_keeps_core(task, tier, picked)
@@ -11509,6 +11975,7 @@ class Daemon:
                     prompt, lost = worker_task(self.p, task, cwd, branch, wake=note.get("wake"),
                                                conflict=note.get(conflictfix.KEY)), None
                 prompt += startcheck.prompt_lines(found)   # a resumed session is told too
+                prompt += probewake.prompt_lines(woke_probe, lambda ts: timefmt.long(ts, self.p))
                 db.update_task(task["id"], status="running", branch=branch, blocked_reason=None)
                 run_id = self.start_run("worker" if task["kind"] != "review" else "reviewer", prompt, run_prov, tier, cwd,
                                         task=task, budget_usd=max(remaining, 0.5) if task["budget_usd"] else None,
@@ -11517,6 +11984,8 @@ class Daemon:
                                         resume=lost["session"] if lost else None,
                                         min_effort=None if tierfloor.wake_keeps_effort(task, run_cls)
                                         else (need or {}).get("effort") or None)
+                if woke_probe:   # its start_when pass is now in the run's note
+                    db.x("DELETE FROM kv WHERE key=?", (probewake.KV_PREFIX + str(task["id"]),))
                 if lease:   # the lease now names the run's supervisor in place of the daemon
                     self._route_lease(task, routed, tier, now, run_id=run_id)
             except Exception as e:
@@ -11538,6 +12007,8 @@ class Daemon:
             busy[run_prov] = busy.get(run_prov, 0) + 1
             if gate.regime == "caps":
                 ctx["committed"] += cost
+        if all(t["id"] in walked for t in fresh):
+            self._dispatch_walked = []   # every task was reached: next tick goes in plain order again
         if any(f == "full" for f in fate.values()) and preempt.enabled(self.cfg):
             try:
                 self._preempt_for_urgent(ready, fate, ctx, core)
@@ -11896,8 +12367,14 @@ class Daemon:
         if not to or not route.eligible(task, picked) or (dp is None and self._floor_keeps_core(task, tier, picked)):
             return None
         name, model = to["to"], to["model"]
+        why = route.protected(self.p.db, self.cfg, task, tier)
+        if why:   # the guard: a protected class stays on core, whoever asked for the route
+            if not peek:
+                log(self.p, f"task {task.get('id')}: route to {name}:{model} refused ({why} run stays on core); "
+                            f"asked by {'model pick' if dp is not None else 'rule ' + str(to['rule'])}")
+            return None
         if dp is not None:
-            return {**self._route_entry(task, tier, name, model, now), "model_pick": True,
+            return {**self._route_entry(task, tier, name, model, now, pick=True), "model_pick": True,
                     **({"pick_effort": got["effort"]} if got["effort"] else {})}
         return self._route_entry(task, tier, name, model, now, to["rule"], cls)
 
@@ -11917,7 +12394,7 @@ class Daemon:
             return None
 
     def _route_entry(self, task: dict, tier: str, name: str, model: str, now: float, rule_i: int | str | None = None,
-                     cls: str | None = None) -> dict:
+                     cls: str | None = None, pick: bool = False) -> dict:
         rule = {} if rule_i is None else {"rule": rule_i}   # the providers.chat.routes rule it matched
         after = route.fell_back_before(self.p.db, task["id"]) if task.get("id") else None
         if after:   # the task fell back on its own once: the rest of its runs stay on the core provider
@@ -11931,11 +12408,14 @@ class Daemon:
             return {"tier": tier, "to": name, "model": model, **rule, "fallback": route.ESCALATED, **esc}
         why = "model_missing" if route.held(self.p.db, self.cfg, tier) == model else route.cooling(self.p.db, name, now)
         where, key = (f"tier {tier}", tier) if rule_i is None else (f"tier {tier} rule {rule_i}", f"{tier}:rule{rule_i}")
-        ranked = self._rank_pick(where, key, model, now) \
+        if pick:   # a model pick routes one tier to several models (modelpick.py): one switch per model
+            key = f"{tier}:pick:{model}"
+        mcls = "review" if task.get("kind") == "review" else tier   # its class for demotions (modeldemote.py)
+        ranked = self._rank_pick(where, key, model, now, mcls) \
             if name == modelrank.TO and why in ("", "model_missing") else None   # one switch record per rule
         if ranked:   # its model is down: the smartest model still served (modelrank.py)
             model, why = ranked[0], ""
-        elif name == modelrank.TO and not why and (up := self._rank_better(where, key, model, tier, now)):
+        elif name == modelrank.TO and not why and (up := self._rank_better(where, key, model, tier, now, mcls)):
             model, ranked = up, (up, {"from": model, "why": modelrank.BETTER})   # a smarter one is served
         if not why and self._logged_out(name) and not self._may_probe(name, now):
             why = "auth"   # the auth gate holds it; its one login check may be a routed run
@@ -11956,13 +12436,40 @@ class Daemon:
             log(self.p, f"task {task.get('id')}: model ranking not checked: {type(e).__name__}: {e}")
             return ""
 
-    def _rank_pick(self, where: str, key: str, model: str, now: float) -> tuple[str, dict] | None:
+    def _bridge_ranked(self, task: dict | None, pin: dict, model: str) -> dict:
+        """A chat run's mid-run swap settings (chatbridge.settings): its ranked stand-ins and the served
+        list's state dir; {} for a required pin (failover.required) or no ranking."""
+        if pin.get("model") and task and failover.required(self.p.db, task):
+            return {}
+        got = modelrank.standins(self.p.db, self.cfg, model, time.time())
+        return {"standins": got, "served": [str(self.p.state)]} if got else {}
+
+    def _rank_mid_run(self, r: dict, note: dict, mid: list, final: str = "") -> str:
+        """Keep a run's mid-run swaps (chatbridge.py) in its note (model_rank.mid_run, with the asked-for
+        model and the one it finished on), one low alert and log line each; a refused model is down for new
+        starts (modelrank.refused). Returns the model it finished on (runs.model), or '' with no swap."""
+        rows = [m for m in mid if isinstance(m, dict) and m.get("from") and m.get("to")]
+        if not rows:
+            return ""
+        final = final or str(rows[-1]["to"])
+        kept = note.get(modelrank.KEY) if isinstance(note.get(modelrank.KEY), dict) else {}
+        note[modelrank.KEY] = {**kept, "mid_run": rows, "asked": str(rows[0]["from"]), "ran": final}
+        for i, m in enumerate(rows):
+            if m.get("why") == "refused":
+                modelrank.refused(self.p.db, str(m["from"]), r["id"], float(m.get("at") or time.time()))
+            log(self.p, f"model ranking: run {r['id']} swapped {m['from']} for {m['to']} mid-run ({m.get('why')})")
+            self.alert(f"model-rank-mid:{r['id']}:{i}", modelrank.mid_text(r["id"], str(m["from"]), str(m["to"]),
+                                                                            str(m.get("why") or "")),
+                       severity="low", every_s=0)
+        return final
+
+    def _rank_pick(self, where: str, key: str, model: str, now: float, cls: str = "") -> tuple[str, dict] | None:
         """(the model to run, {"from", "why"}) when `model` is down and the ranking (modelrank.py) names one
         served, with one low alert per switch of `key`; else None, and a switch kept for `key` ends."""
         try:
-            got = modelrank.pick(self.p.db, self.cfg, self.p.state, model, now)
+            got = modelrank.pick(self.p.db, self.cfg, self.p.state, model, now, cls)
             if not got:   # up again ends its switch; still down with none ranked served keeps it
-                if not modelrank.down(self.p.db, self.cfg, self.p.state, model, now) and (
+                if not modelrank.down(self.p.db, self.cfg, self.p.state, model, now, cls) and (
                         last := modelrank.back(self.p.db, key)):
                     log(self.p, f"model ranking: {where} back on {last.get('from')} (was {last.get('to')})")
                 return None
@@ -11974,11 +12481,11 @@ class Daemon:
             log(self.p, f"model ranking not applied ({where}): {type(e).__name__}: {e}")
             return None
 
-    def _rank_better(self, where: str, key: str, model: str, tier: str, now: float) -> str:
+    def _rank_better(self, where: str, key: str, model: str, tier: str, now: float, cls: str = "") -> str:
         """A served model ranked above the up `model` to run instead (modelrank.better: light starts only
         until it has proven itself), logged once per change of `key`; else ''."""
         try:
-            up = modelrank.better(self.p.db, self.cfg, self.p.state, model, now, light=tier == "light")
+            up = modelrank.better(self.p.db, self.cfg, self.p.state, model, now, light=tier == "light", cls=cls)
             if up and modelrank.switch(self.p.db, f"{modelrank.BETTER}:{key}", model, up, now):
                 log(self.p, f"model ranking: {where} tries {up}, ranked above {model}")
             return up
@@ -12184,7 +12691,8 @@ class Daemon:
         if d is None:
             return False, None
         if d.wake:
-            log(self.p, f"task {tid} wake gate: wake ({d.by}: {d.reason})")
+            if not d.extra.get("repeat"):   # a wake re-gated before its turn starts is logged once
+                log(self.p, f"task {tid} wake gate: wake ({d.by}: {d.reason})")
             return False, d.note(prev, d.extra.get("skips") or [])
         nb = now + d.delay_s
         db.update_task(tid, not_before=nb, result=dump_result(waitgate.skipped(prev, d, now)), blocked_reason=(
@@ -12369,6 +12877,11 @@ class Daemon:
         reaper = getattr(self, "_lock_reaper", None) or lockreap.Reaper(ended=lambda h: lockreap.ended_job(self.p, h), project=self.p.base)
         self._lock_reaper = reaper
         got = reaper.sweep(lockreap.slot_files(own + shared_dirs + [checkcap.slot_dir()]), now)
+        # A free checks slot whose record still names a gone holder: cleared under that slot's lock, so
+        # no reader on the host (other projects' too, older releases included) names it again.
+        for h in locks.clear_stale(lockreap.slot_files([checkcap.slot_dir()])):
+            log(self.p, f"cleared the stale record of free checks slot {Path(h['path']).name} "
+                        f"({h.get('holder') or 'no holder'}, pid {h.get('pid') or '?'}, gone)")
         if got["released"]:
             lockreap.record(db, got["released"], now)
             for r in got["released"]:
@@ -13095,6 +13608,22 @@ class Daemon:
                         f"{', '.join(gone[:10])}")
         return gone
 
+    def branch_cap(self, every_s: float = 3600, backlog_s: float = 600) -> list[dict]:
+        """Hourly (every `backlog_s` while a sweep stopped at its limit, so a backlog drains): delete landed tasks' local branches whose worktree is gone (branchcap.sweep, each
+        written to state/branch-deletions.jsonl), then count open code branches and running workers for
+        `ttp status`, the web app and the Course check's alarm (branchcap.scan). No model call."""
+        now, start = time.time(), time.monotonic()
+        if now - self._last_branchcap < (backlog_s if self._branchcap_backlog else every_s):
+            return []
+        self._last_branchcap = now
+        gone = branchcap.sweep(self.p, self.cfg, now)
+        self._branchcap_backlog = len(gone) >= branchcap.SWEEP_MAX or time.monotonic() - start > branchcap.TIME_MAX_S
+        if gone:
+            log(self.p, f"deleted {len(gone)} landed task branch(es), recovery list state/{branchcap.RECOVERY}: "
+                        f"{', '.join(r['branch'] for r in gone[:10])}")
+        branchcap.scan(self.p, now)
+        return gone
+
     def tick_prune_worktrees(self) -> list[dict]:
         """The tick's prune_worktrees: at most every PRUNE_TICK_MIN_S even while tasks keep finishing
         (each finish used to sweep at the next tick), except a forced or deferred archive pass still due."""
@@ -13108,7 +13637,7 @@ class Daemon:
         removal (null, the default: no delay beyond worktree.held_by; 0 or less: never tidy, as
         before). A worktree kept for a reason is checked again when its task changes or after
         KEEP_RECHECK_S, or at once with `force` (the disk guard's sweep), except one whose sweep failed
-        (`why` 'error: ...'), so a forced re-sweep does not retry it every tick. Branches are never deleted.
+        (`why` 'error: ...'), so a forced re-sweep does not retry it every tick. This sweep deletes no branch (branch_cap does, once landed).
         Removals are cheap and all done at once; archiving (worktree.sweep's costly part) is done for
         at most one worktree per call, and the sweep runs again at the next tick (forced again after a
         forced one) until none is left deferred. Returns the sweep's results."""
@@ -13513,8 +14042,9 @@ class Daemon:
         NOT_YET_RCS: 1, 75 (a busy `ttp lock`) and 255 (ssh could not reach the host a remote marker
         lives on; only when the host named really does not answer, _own_255). A broken probe
         (any other exit, a timeout, a probe that cannot start) wakes it at its timer so a worker can
-        fix the probe. Past `waiting.max_hold_s` after the hand-off (for a wait on a live detached job, after
-        its log last advanced: detach.last_progress) a "not yet" keeps it asleep too (a model run cannot
+        fix the probe. Past `waiting.max_hold_s` after the hand-off (for a wait on a live detached job, local
+        or mirrored from another host, or on a queued or running `ttp checks` run, after its log last
+        advanced: detach.last_progress, checksgone.last_progress) a "not yet" keeps it asleep too (a model run cannot
         make the probe pass) and raises one `wait_stale` event for the coordinator.
         Tasks with the same probe share its runs."""
         db, now = self.p.db, time.time()
@@ -13644,6 +14174,8 @@ class Daemon:
                     or deferral(t).get("when"):
                 continue
             if t["not_before"] > now and self._spec_wake(t, prev, probe, now):
+                continue
+            if t["not_before"] > now and self._plan_check(t, prev, now):
                 continue
             self._drop_stale_probe(t["id"], probe)
             if t["not_before"] <= now:
@@ -13910,7 +14442,9 @@ class Daemon:
         stale = [h for h in dict.fromkeys(hosts) if now - self._host_up.get(h, (False, -1e18))[1] >= 60]
         if stale:
             env = self._probe_env()
-            self._host_up.update((h, (ok, now)) for h, ok in netwait.reach(stale, env).items())
+            got = netwait.reach(stale, env)
+            self._host_up.update((h, (ok, now)) for h, ok in got.items())
+            reach.record(got, now)
 
     def _drop_stale_probe(self, tid: int, probe: str) -> None:
         """The task's probe was re-pointed (`ttp task set-when`): kill a run of the old one and forget
@@ -13939,6 +14473,9 @@ class Daemon:
             self.p.db.update_task(task["id"], labels=without_deferral(json.loads(task["labels"] or "[]")),
                                   not_before=None)
             log(self.p, f"task {task['id']} start_when passed; ready to start")
+            got = self._probe_out.get(task["id"])
+            self.p.db.set_kv(probewake.KV_PREFIX + str(task["id"]), probewake.record(
+                d.get("when") or "", rc, got[0] if got and got[2] == d.get("when") else "", now))
             if d.get("when"):
                 userstep.probe_passed(self.p.db, task, {d["when"]}, now)   # its user step is done
         else:
@@ -14280,8 +14817,9 @@ class Daemon:
         return ""
 
     def _relaunch_jobs(self, t: dict, prev: dict) -> tuple[bool, bool]:
-        """A task waiting on local detached jobs (`ttp detach --check <rc...>` in its retry_when, alone
-        or in a compound probe: rebootwait.local_jobs) that all
+        """A task waiting on local detached jobs (`ttp detach --check <rc...>` in its retry_when, or any
+        local command naming their .rc such as `test -s <rc>`, alone or in a compound probe:
+        rebootwait.local_jobs) that all
         opted in with `--resumable`: start each the reboot cut short (no .rc) again, model-free, note
         it on the task and keep the task asleep on its retry_when. Returns (asleep, cut). asleep when it
         stays asleep (relaunched now, or already on this boot: a daemon restart). Else it wakes as
@@ -14824,6 +15362,20 @@ class Daemon:
                 chat=None, kind="info", severity="low", ref=f"devq_runner:{runner}")
         log(self.p, f"device runner {runner} {why}: queued task {fid}")
 
+    def _plan_check(self, task: dict, prev: dict, now: float) -> bool:
+        """Wake a waiting task for its planned check (waketier.due) once its probe's latest answer since
+        the wait began says "not yet"; True when it woke. "jev" and "plain" checks go through the wake
+        gate, "model" always runs, each at the plan's tier."""
+        rc, at, probe = self._probe_rc.get(task["id"], (None, 0.0, ""))
+        if rc not in NOT_YET_RCS or probe != prev.get("retry_when") or at < float(prev.get("waiting_since") or 0) \
+                or prev.get("woke") or not (chk := waketier.due(prev, now)):
+            return False
+        self._wake_waiting(task, f"its planned {chk['what']} check ({chk['n']} of {chk['of']}): is the wait still "
+                           f"on track (started, running, no errors)?", now,
+                           {waketier.PLAN: chk["plan"], waketier.PLAN_BY: chk["by"], waketier.PLAN_TIER: chk["tier"]},
+                           kind="plan_check")
+        return True
+
     def _hold_waiting(self, task: dict, prev: dict, now: float) -> bool:
         """A waiting task whose timer ran out: wake it, or put it back to sleep while its probe says
         "not yet". True when a probe must run before that can be decided."""
@@ -14849,6 +15401,8 @@ class Daemon:
                                + (f" ({raw[:300]})" if raw else ""), now, {"probe_raw": raw} if raw else None, kind="probe_broken")
         elif fresh and (dirs := self._checks_gone(tid, str(prev.get("retry_when") or ""), now)):
             self._checks_gone_release(task, dirs, now)
+        elif fresh and self._plan_check(task, prev, now):
+            pass
         elif fresh:
             # 75 is EX_TEMPFAIL (e.g. a busy `ttp lock`); 255 is ssh failing to reach the host
             # (a reboot or a network blip). Both mean "not yet". A model run cannot make a "not yet"
@@ -14856,8 +15410,9 @@ class Daemon:
             start, peer = self._peer_hold(task, prev, since, max_hold, now)
             if now >= start + max_hold:   # a user-marker gate is timed from when the marker appeared
                 start = max(start, userpause.gate_opened(prev.get("retry_when"), self.cfg, self.p.root, now) or 0)
-            if now >= start + max_hold:   # a wait on a live detached job is timed from its last progress
-                start = max(start, detach.last_progress(str(prev.get("retry_when") or ""), self.p.root) or 0)
+            if now >= start + max_hold:   # a wait on a live detached job or checks run: from its last progress
+                start = max(start, detach.last_progress(str(prev.get("retry_when") or ""), self.p.root) or 0,
+                            self._checks_progress(str(prev.get("retry_when") or "")) or 0)
             held = now >= start + max_hold
             gate = time_gate(str(prev.get("retry_when") or ""))
             # A pure time gate whose epoch is still ahead is not stuck: no turn could make it pass sooner.
@@ -14875,7 +15430,7 @@ class Daemon:
             nb = now + retry if held else min(now + retry, start + max_hold)
             what = self._wait_what(tid, prev)
             says = "host unreachable" if rc == 255 else \
-                "gh is logged out on this host (the host's gh-auth alert asks for `gh auth login`)" if gh_down \
+                "gh has no login on this host and no delivery.gh_route answers (the host's gh-auth condition)" if gh_down \
                 else "not yet"
             db = self.p.db
             db.update_task(tid, not_before=nb, blocked_reason=(
@@ -14927,14 +15482,17 @@ class Daemon:
                           (t["id"], now - 7 * 86400)):
                 for j in _detached_jobs(Path(r["dir"])):
                     rc = Path(j["rc"])
-                    if rc.exists() or locks.any_free([locks.job_lock(rc)]):
-                        continue   # ended, or not started yet
+                    # Live from its record and its wrapper's pid, never its lock: a stopped job's lock may
+                    # outlive it (a leftover that inherited it), and its old pid may name another process.
+                    if j.get("status") in detach.CLOSED or rc.exists() or detach.lost(rc).exists():
+                        continue   # ended, died or stopped
+                    if not (pid := jobuse.live_pid(j)):
+                        continue   # not started yet, gone, or its pid now names another process
                     req = dict(j.get("requested") or {})
                     if not req.get("devices") and needs_device(t, self.cfg):
                         req["devices"] = 1   # the task holds the device while the job runs
-                    pid = jobuse.root_pid(j)
                     was = old.get(str(rc)) or {}
-                    got = with_containers(jobuse.sample(pid, nodes)) if pid else None
+                    got = with_containers(jobuse.sample(pid, nodes))
                     st = jobuse.assess(was.get("st"), got, req, now, s)[0]
                     entry = {"task": t["id"], "name": j["name"], "req": req, "st": st, "line": jobuse.line(req, st)}
                     if jobuse.declared(j):
@@ -15308,6 +15866,13 @@ class Daemon:
             log(self.p, f"checks wait: could not read {probe[:200]!r}: {type(e).__name__}: {e}")
             return []
 
+    def _checks_progress(self, probe: str) -> float | None:
+        try:
+            return checksgone.last_progress(probe)
+        except Exception as e:   # a bad run dir counts the wait as before, never breaks a tick
+            log(self.p, f"checks wait: could not read progress of {probe[:200]!r}: {type(e).__name__}: {e}")
+            return None
+
     def _checks_gone(self, tid: int, probe: str, now: float) -> list[Path]:
         """A "not yet" probe on `ttp checks` runs that left the queue without a result (checksgone): once
         they stayed gone SETTLE_S, record a 'dropped' result for each, so the standard probe passes; the
@@ -15357,6 +15922,11 @@ class Daemon:
             self._woke_on[tid] = got
         self._spec_deferred.discard(tid)
         prev = load_result(task["result"])
+        prev.pop(probewake.KEY, None)   # an earlier wake's record never passes for this one's
+        if got and kind in probewake.KINDS:   # the probe run that woke it, for its worker (probewake)
+            out = self._probe_out.get(tid)
+            extra = {probewake.KEY: probewake.record(got[2], got[0], out[0] if out and out[2] == got[2] else "",
+                                                     got[1]), **(extra or {})}
         extra, why = _with_pending_spec(task, prev, {waketier.KEY: kind, **(extra or {})}, why)
         prev.pop(SPEC_WAKE_NOW_KEY, None)
         self.p.db.update_task(tid, not_before=min(task["not_before"] or now, now),
@@ -15508,6 +16078,10 @@ class Daemon:
         checks (userstep.probe_passed)."""
         if why.startswith("probe passed"):
             prev = load_result(task["result"])
+            try:   # its measured length sets the expected end of the next check plan of its kind
+                waketier.record_wait(self.p.db, prev, now)
+            except Exception as e:
+                log(self.p, f"task {task['id']}: could not record its wait: {type(e).__name__}: {e}")
             try:
                 if done := userstep.probe_passed(self.p.db, task, {prev.get("retry_when"), prev.get("retry_when_orig")}, now):
                     log(self.p, f"task {task['id']}: user step(s) {', '.join(done)} done: its retry_when passed")
@@ -17094,6 +17668,20 @@ class Daemon:
                  (now, f"task:{t['id']}", STALE_DUPLICATE, "normal", text, "queued", t["id"]))
             log(self.p, f"task {t['id']}: {STALE_DUPLICATE} raised")
 
+    def stop_superseded(self) -> None:
+        """Model-free, every supersede.STOP_EVERY_S: a running task superseded since its run started (its
+        change landed through another task, a newer task continues it, every obligation it owns was dropped)
+        is cancelled and its run asked to stop at once; its worktree and branch stay (supersede.py)."""
+        now = time.time()
+        if now - self._supersede_checked < supersede.STOP_EVERY_S:
+            return
+        self._supersede_checked = now
+        for tid in supersede.stop_superseded(self.p.db):
+            for r in self.p.db.q("SELECT id, dir FROM runs WHERE task=? AND status='running'", (tid,)):
+                with contextlib.suppress(OSError):
+                    runner.request_stop(self._run_dir(r))
+            log(self.p, f"task {tid}: superseded while running; cancelled, its run asked to stop")
+
     def expire_queue(self) -> None:
         """Model-free, every queuetrim.EVERY_S: cancel never-started tasks of the stale queued tail
         (queuetrim.expire: queued past queue.expire_h, or blocked on a dead dependency past
@@ -17423,7 +18011,9 @@ class Daemon:
         recorded reason (superseded or rejected, a `no_push`, a diff all under push_exclude_paths, a
         head its PR carries, a push branch no push can reach, a landing `ttp landed` records). At most
         review.unreviewed_per_pass reviews per pass, only tasks updated within
-        review.unreviewed_max_age_h, and one head gets one review (_auto_review's own check).
+        review.unreviewed_max_age_h (or whose continuer was cancelled within it: the age runs from the later of
+        the two), and one head gets one review (_auto_review's own check). An urgent or owed task (an open
+        obligation's owner) left alone logs why, once per task per reason change.
         Every REVIEW_SWEEP_EVERY_S from the tick (UNREVIEWED_BACKLOG_EVERY_S after a pass cut short that
         queued a review: a backlog drains at more than two reviews per five minutes), and at once (`force`)
         in the blocker sweep's data pass; returns the tasks it queued a review for. The first pass after an upgrade (a runtime version
@@ -17451,7 +18041,9 @@ class Daemon:
             todo = db.q("SELECT * FROM tasks WHERE kind='code' AND status IN ('done','queued') AND branch IS NOT NULL "
                         "AND branch!='' AND updated>=? AND updated<=? ORDER BY id",
                         (now - age, now - UNREVIEWED_GRACE_S))
+            todo = self._late_continued(todo, now - age, now - UNREVIEWED_GRACE_S)
             self._count_unreviewed(todo)
+            todo, retry = self._read_retries(todo, now)
             if not todo:
                 return []
             code = pushq.BranchIndex(db.q("SELECT id, branch, labels FROM tasks WHERE kind='code' "
@@ -17463,7 +18055,7 @@ class Daemon:
                           [r["id"] for r in reviews]) if reviews else []:
                 rows.setdefault(x["task"], []).append(x)
             covers: dict[int, set[int]] = {}
-            live = db.q("SELECT id, branch, labels FROM tasks WHERE status NOT IN (?,?,?)", TERMINAL_TASK_STATES)
+            live = db.q("SELECT id, kind, branch, labels FROM tasks WHERE status NOT IN (?,?,?)", TERMINAL_TASK_STATES)
             ref = landed._push_ref(self.p, self.p.root) if d.get("push_branch") else ""
             never = push.push_branch_problem(d["push_branch"], self.p.root, push.allow_protected(d)) \
                 if d.get("push_branch") and d.get("push_allowed", True) else ""
@@ -17471,12 +18063,15 @@ class Daemon:
         except Exception:
             log(self.p, "unreviewed sweep failed\n" + traceback.format_exc())
             return []
-        hot = 0   # urgent tasks' reviews: counted against no cap, and they wait for no sweep_after_s
+        hot = 0   # urgent tasks' reviews and read retries: counted against no cap (urgent ones wait for no sweep_after_s)
         # A pass cut off (UNREVIEWED_PASS_S, the step's budget, or stopped mid-task) resumes after the task
         # it stopped at, wrapping round, so a slow early task never keeps the later ones from their turn.
         at, last = self._unreviewed_at, None
-        for t in urgent.first([r for r in todo if r["id"] > at] + [r for r in todo if r["id"] <= at]):
-            if len(done) - hot >= cap and not urgent.is_urgent(t) or last is not None and (
+        # A task whose review's diff read failed (_auto_review, KV_REVIEW_RETRY) goes first: a backlog behind
+        # the per-pass cap once kept one unreviewed for 14 h.
+        order = urgent.first([r for r in todo if r["id"] > at] + [r for r in todo if r["id"] <= at])
+        for t in [r for r in order if r["id"] in retry] + [r for r in order if r["id"] not in retry]:
+            if len(done) - hot >= cap and not urgent.is_urgent(t) and t["id"] not in retry or last is not None and (
                     time.time() - now > UNREVIEWED_PASS_S or stepclock.over()):   # each pass gets one task further
                 self._unreviewed_at = at if last is None else last
                 if done:   # cut with more to look at after queuing one: a backlog, so look again sooner
@@ -17484,8 +18079,15 @@ class Daemon:
                 break
             last = self._unreviewed_at = t["id"]   # kept if the step is stopped mid-task
             try:
-                if self._unreviewed_skip(t, reviews, rows, covers, code, live, ref, never,
-                                         0 if urgent.is_urgent(t) else waited, now):
+                why = self._unreviewed_skip(t, reviews, rows, covers, code, live, ref, never,
+                                            0 if urgent.is_urgent(t) else waited, now)
+                if why and self._unreviewed_why.get(t["id"]) != why and (
+                        urgent.is_urgent(t) or obligations.owned_open(db, t["id"])):
+                    self._unreviewed_why[t["id"]] = why
+                    log(self.p, f"task {t['id']}: {t['status']}, no review queued by the unreviewed sweep: {why}")
+                if t["id"] in retry:   # settled by this attempt; a read that fails again records it again
+                    self._settle_read_retry(t["id"], why)
+                if why:
                     continue
                 review = self._auto_review(t, str(load_result(t["result"]).get("summary") or ""), add=True)
             except Exception as e:
@@ -17493,7 +18095,7 @@ class Daemon:
                 continue
             if review and review[1]:
                 done.append(t["id"])
-                hot += urgent.is_urgent(t)
+                hot += urgent.is_urgent(t) or t["id"] in retry
                 log(self.p, f"task {t['id']}: {t['status']} with an unlanded head and no review; queued review "
                             f"#{review[0]}")
                 db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
@@ -17503,6 +18105,58 @@ class Daemon:
         else:
             self._unreviewed_at = 0   # an uncut pass leaves no place to resume at
         return done
+
+    def _read_retries(self, todo: list[dict], now: float) -> tuple[list[dict], set[int]]:
+        """sweep_unreviewed's `todo` plus the done or queued code tasks with a branch that KV_REVIEW_RETRY
+        names (their review's diff read failed in _auto_review), whatever their age, and those ids. An
+        entry for a task that is no longer such a task, or older than REVIEW_RETRY_KEEP_S, is dropped with
+        a log line."""
+        db = self.p.db
+        marks, _ = db.kv_dict(KV_REVIEW_RETRY)
+        if not marks:
+            return todo, set()
+        have, keep, add = {t["id"] for t in todo}, {}, []
+        for k, when in marks.items():
+            t = db.task(int(k)) if str(k).isdigit() else None
+            try:
+                when = float(when)
+            except (TypeError, ValueError):   # a hand-edited mark restarts its clock, never stops the sweep
+                when = now
+            why = "no such task" if not t else "no longer a finished code task with a branch" if (
+                t["kind"] != "code" or t["status"] not in ("done", "queued") or not t.get("branch")) else \
+                f"not settled in {REVIEW_RETRY_KEEP_S // 86400} days" if now - when > REVIEW_RETRY_KEEP_S else ""
+            if why:
+                log(self.p, f"task {k}: review read retry dropped: {why}")
+                continue
+            keep[k] = when
+            if t["id"] not in have:
+                add.append(t)
+        if keep != marks:
+            db.set_kv(KV_REVIEW_RETRY, keep)
+        return (sorted(todo + add, key=lambda t: t["id"]) if add else todo), {int(k) for k in keep}
+
+    def _settle_read_retry(self, tid: int, why: str) -> None:
+        """Drop task `tid`'s KV_REVIEW_RETRY entry before the sweep's attempt (logged with the skip reason,
+        if any): a read that fails again (_auto_review) records it again."""
+        db = self.p.db
+        marks, _ = db.kv_dict(KV_REVIEW_RETRY)
+        if marks.pop(str(tid), None) is not None:
+            db.set_kv(KV_REVIEW_RETRY, marks)
+            log(self.p, f"task {tid}: review read retried by the unreviewed sweep" + (f"; left alone: {why}" if why else ""))
+
+    def _late_continued(self, todo: list[dict], since: float, until: float) -> list[dict]:
+        """sweep_unreviewed's `todo` plus the done or queued code tasks with a branch whose own update is older
+        than `since` but whose continuer (its `continues:` label names them) was cancelled from `since` to
+        `until`: while that continuer was open it held their review ('an open task continues it'), so their
+        age runs from its cancel. In id order."""
+        db, have = self.p.db, {t["id"] for t in todo}
+        ids = {continues_id(x) for x in db.q("SELECT labels FROM tasks WHERE status='cancelled' AND labels LIKE ? "
+                                             "AND updated>=? AND updated<=?", ('%"continues:%', since, until))}
+        ids = sorted(i for i in ids - have if isinstance(i, int))
+        late = [r for i in range(0, len(ids), 500) for r in db.q(
+            "SELECT * FROM tasks WHERE kind='code' AND status IN ('done','queued') AND branch IS NOT NULL AND branch!='' "
+            "AND updated<? AND id IN (%s)" % ",".join("?" * len(ids[i:i + 500])), [since, *ids[i:i + 500]])]
+        return sorted(todo + late, key=lambda t: t["id"]) if late else todo
 
     def _count_unreviewed(self, todo: list[dict]) -> None:
         """Once per runtime version (KV_UNREVIEWED_COUNTED), log how many of sweep_unreviewed's tasks are done
@@ -17539,10 +18193,15 @@ class Daemon:
         if db.one("SELECT 1 FROM task_superseded WHERE task=? UNION ALL SELECT 1 FROM task_landings WHERE task=? "
                   "UNION ALL SELECT 1 FROM push_queue WHERE task=?", (tid, tid, tid)):
             return "superseded, landed or queued"
+        if landed.abandoned(db, tid):
+            return "abandoned"
         # A task that waits on this one landing (a deploy or live check) carries none of its work: counted
         # as its continuation, a head no review lands would hold it forever.
         # Nor does one that stalls on the user or a long deferral (chaincap.hop_stall): the head is reviewed now.
-        if any(x["id"] != tid and (continues_id(x) == tid or x["branch"] == t["branch"])
+        # Nor a continuer working in the project root (_continuation_owner's rule): its review never covers this branch.
+        if any(x["id"] != tid and (continues_id(x) == tid and (worktree.gets_worktree(self.p, x.get("kind") or "")
+                                                               or worktree.carried_branch(db.task(x["id"]) or x))
+                                   or x["branch"] == t["branch"])
                and not self._waits_landing(x, tid) and not chaincap.hop_stall(db.task(x["id"]), now) for x in live):
             return "an open task continues it"
         if chaincap.split_head(t) and any(
@@ -17553,6 +18212,8 @@ class Daemon:
         tip = worktree._git(self.p.root, "rev-parse", "--verify", "--quiet", f"{t['branch']}^{{commit}}", check=False)
         if not tip:
             return "no branch"
+        if gone := self._cancelled_review(t, tip):
+            return f"review #{gone} of its head was cancelled"
         cont = db.task(continues_id(t) or 0)
         # A hop with no commits past its split head adds nothing to review, once that head has a review of its
         # own (queued, running or passed) or the hop stalls (the split task's own review then covers the head).
@@ -17655,19 +18316,22 @@ class Daemon:
         result = load_result(row["result"]) if row and row["status"] not in TERMINAL_TASK_STATES else {}
         return result.get("status") == "waiting" and chaincap.waits_landing(result.get("retry_when"), tid)
 
-    def _continuation_owner(self, task: dict) -> dict | None:
+    def _continuation_owner(self, task: dict, fixes: bool = True) -> dict | None:
         """The open task, oldest first, that continues task `task` (its `continues:` label names it): the
         sole owner of its work from here, whose own finished work gets its own review. A review, a task
         that waits on `task` landing (it carries none of its work) and a stalled hop (chaincap.hop_stall)
         own nothing, nor does one that works in the project root (no worktree of its own: worktree.gets_worktree,
-        carried_branch), which never starts from its branch, so its review would not cover that work. None when
-        there is none."""
+        carried_branch), which never starts from its branch, so its review would not cover that work. With `fixes`
+        off (a failed review's path), an open fix of another review or of a PR (review_fix:, pr_fix: labels) owns
+        nothing either: that fix has its own re-review, so this failed review gets its own fix and re-review and
+        moves its dependents. None when there is none."""
         tid, now = task["id"], time.time()
         return next((x for x in self.p.db.q(
             "SELECT * FROM tasks WHERE kind!='review' AND status NOT IN (?,?,?) AND id!=? AND labels LIKE ? ORDER BY id",
             (*TERMINAL_TASK_STATES, tid, f'%"continues:{tid}"%'))
             if continues_id(x) == tid and not self._waits_landing(x, tid) and not chaincap.hop_stall(x, now)
-            and (worktree.gets_worktree(self.p, x["kind"]) or worktree.carried_branch(x))), None)
+            and (worktree.gets_worktree(self.p, x["kind"]) or worktree.carried_branch(x))
+            and (fixes or not any(lb.startswith(("review_fix:", "pr_fix:")) for lb in push._labels(x)))), None)
 
     def _stale_source(self, task: dict) -> str:
         """Why no review of task `task` may be queued now, read live from the records ('' when one may):
@@ -17700,6 +18364,9 @@ class Daemon:
             return None
         if self._landed_elsewhere(task):
             return None
+        if landed.abandoned(db, task["id"]):
+            log(self.p, f"task {task['id']}: no review queued, its work is abandoned (ttp task abandon)")
+            return None
         branch = task.get("branch")
         try:
             self._fold_split_review(task)
@@ -17717,6 +18384,7 @@ class Daemon:
                     if ext:
                         self._name_external_head(task, t, ext)
                     else:
+                        self._join_shared_review(task, t)
                         self._name_new_head(task, t)
                         self._precheck_open(task, t)
                     return t["id"], False
@@ -17738,6 +18406,9 @@ class Daemon:
                             (tip,)) if tip else None
             if passed:
                 return passed["task"], False
+            if add and (gone := self._cancelled_review(task, tip)):
+                log(self.p, f"task {task['id']}: no review queued, review #{gone} of head {tip[:12]} was cancelled")
+                return None
             # Or one accepted it without the push queue (review only, an own push): its verdict stands.
             # A review that would push takes only a delivered head's verdict (reviewreuse.pushes).
             prior = reviewreuse.accepted(db, tip, reviewreuse.check_key(cfg),
@@ -17756,6 +18427,7 @@ class Daemon:
             else:
                 changes = worktree.diff_lines(self.p, [branch]) if branch else None
                 full = worktree._git(self.p.root, "rev-parse", branch) if changes else ""
+                integrate.record_member_head(self.p.root, task["id"], full)
             head = full[:12]
         except Exception as e:
             log(self.p, f"task {task['id']}: no review queued, its diff was not read: {e}")
@@ -17764,6 +18436,10 @@ class Daemon:
             if add and isinstance(e, subprocess.TimeoutExpired):
                 ids = db.kv(KV_REVIEW_UNREAD, [])
                 db.set_kv(KV_REVIEW_UNREAD, sorted({*(ids if isinstance(ids, list) else []), task["id"]}))
+            if add and task.get("id"):   # the unreviewed sweep retries it first, outside its cap and age window
+                retry, _ = db.kv_dict(KV_REVIEW_RETRY)
+                retry.setdefault(str(task["id"]), time.time())
+                db.set_kv(KV_REVIEW_RETRY, retry)
             return None
         if (not changes and not ext) or coord.next_task_slot(db, coord.task_cap(cfg, True), review=True) is not None:
             return None
@@ -17963,6 +18639,18 @@ class Daemon:
             f"its chain ends" if held else ""))
         return rid, True
 
+    def _cancelled_review(self, task: dict, tip: str) -> int | None:
+        """The daemon review of code task `task` at head `tip` that was cancelled explicitly (the
+        coordinator's task_update or `ttp task cancel`: dispatchguard.record_cancel) and not requeued since,
+        or None. That cancel stands for that head: no fresh review of it is queued; a new commit gets one."""
+        if not tip:
+            return None
+        for r in self.p.db.q("SELECT id, spec FROM tasks WHERE kind='review' AND status='cancelled' AND labels LIKE ? "
+                             "ORDER BY id DESC", (f'%"auto_review:{task["id"]}"%',)):
+            if f"head {tip[:12]}" in (r["spec"] or "") and dispatchguard.cancelled_unrequeued(self.p.db, r["id"]):
+                return r["id"]
+        return None
+
     def _external_change(self, task: dict) -> dict | None:
         """The change code task `task`'s hand-off names as published in another repository
         (extchange.parse), or None; an invalid entry is logged with its reason and ignored. A task with no
@@ -18090,11 +18778,78 @@ class Daemon:
                     + "The push queue runs the full checks again on the commit it pushes: run only focused tests "
                       "of what changed.")
         return (f"The daemon started the project's checks (`ttp checks`) on head {head} in "
-                f"{self.p.worktrees / ('t' + str(task['id']))} as #{task['id']} finished, and starts this review "
-                f"once they end: `ttp checks --result {checks}` prints their exit code and output tail "
+                f"{self.p.worktrees / ('t' + str(task['id']))} as #{task['id']} finished. This review waits for them "
+                f"only while they run on a host, at most a typical checks run, and an urgent or owed review "
+                f"not at all: if they have not ended, judge the diff and run focused tests without them. "
+                f"Once they end, `ttp checks --result {checks}` prints their exit code and output tail "
                 f"({checks / 'checks.log'} has it all). A pass is recorded, so `ttp checks` there reuses it. "
                 f"The push queue runs the full checks again on the commit it pushes: run only focused tests "
                 f"of what changed.")
+
+    def _split_verdicts(self, review: dict, result: dict) -> dict[int, str] | None:
+        """{member id: pass | fail} of shared-branch review `review` from its hand-off, when it passes
+        some members and fails others (integrate.verdicts)."""
+        ids = [m["id"] for m in integrate.members(self.p.db, review)]
+        fups = [f for f in (result.get("followups") or []) if isinstance(f, dict) and f.get("title")
+                and not upstream.is_note(f)] if isinstance(result.get("followups"), list) else []
+        vs = integrate.verdicts(ids, result, fups)
+        return vs if vs and "pass" in vs.values() else None
+
+    def _landable_entries(self, vs: dict[int, str], entries: list) -> list:
+        """The approval entries of a split review that are safe: a head that is, or lies under, the head
+        of a passing member that carries no failing member's commit (integrate.landable)."""
+        root = self.p.root
+        heads = [integrate.member_head(root, i) for i in integrate.landable(root, sorted(vs), vs)]
+        out = []
+        for e in entries:
+            head = str(e.get("head") or "") if isinstance(e, dict) else ""
+            try:
+                full = worktree._git(root, "rev-parse", "--verify", "--quiet", f"{head}^{{commit}}", check=False) \
+                    if head else ""
+            except Exception:
+                full = ""
+            if full and any(integrate._is_ancestor(root, full, h) for h in heads):
+                out.append(e)
+        return out
+
+    def _join_shared_review(self, task: dict, review: dict) -> None:
+        """Code task `task` finished on a branch a still queued review already covers for another
+        member (a batch, `pr_branch:` lines, overlap routing): it joins that review rather than getting
+        one of its own (user msgs #2407, #2414). The review then depends on it too, records the head it
+        handed off (integrate.record_member_head: its commits are fork point..that head) and lists every
+        member with its acceptance criteria (integrate.members_block), so each finding names its task.
+        A fix of a failed review is no new member: its re-review already covers it."""
+        db, branch = self.p.db, task.get("branch")
+        deps = dependency_ids(review)
+        if review["status"] != "queued" or review["kind"] != "review" or not branch or task["id"] in deps \
+                or str(task.get("title") or "").startswith("Fix review #") or task.get("kind") != "code":
+            return
+        # It shares the branch when it works on a member's branch, or on its own branch built on one
+        # (`pr_branch:`: the member's worktree still holds that branch, worktree.fix_branches).
+        on = {branch, worktree.carried_branch(task)} - {""}
+        others = [m for m in integrate.members(db, review) if m.get("branch") in on]
+        if not others:
+            return
+        try:
+            full = worktree._git(self.p.root, "rev-parse", branch)
+            integrate.record_member_head(self.p.root, task["id"], full)
+        except Exception as e:
+            log(self.p, f"task {task['id']}: its head on {branch} not recorded for review #{review['id']}: {e}")
+            return
+        with db.tx():
+            fresh = db.task(review["id"])
+            if not fresh or fresh["status"] != "queued":
+                return
+            deps = dependency_ids(fresh)
+            if task["id"] in deps:
+                return
+            deps = [*deps, task["id"]]
+            spec = integrate.with_members(fresh.get("spec") or "", [*integrate.members(db, fresh), task],
+                                          tip=(branch, full))
+            db.update_task(review["id"], depends_on=deps, spec=spec)
+        review.update(depends_on=json.dumps(deps), spec=spec)
+        log(self.p, f"task {task['id']}: joined review #{review['id']} of shared branch {branch} "
+                    f"(members {', '.join(f'#{i}' for i in deps if isinstance(i, int))})")
 
     def _name_new_head(self, task: dict, review: dict) -> None:
         """A queued re-review of a failed review gets the new head its fix ended on, and the size of
@@ -18209,9 +18964,10 @@ class Daemon:
                 shutil.rmtree(x, ignore_errors=True)
 
     def _precheck_holds(self, task: dict, now: float) -> bool:
-        """A review waits for the checks the daemon started on its head (_precheck) while they run,
-        at most PRECHECK_HOLD_S after they started: the reviewer then reads their result at once."""
-        return precheck_holds(self.p.state, task, now)
+        """A review waits for the checks the daemon started on its head (_precheck) while they run on a
+        host, at most precheck_hold_s after they began, unless it is urgent or owed (precheck_holds): the
+        reviewer then reads their result at once."""
+        return precheck_holds(self.p.state, task, now, self.p.db)
 
     def _precheck_words(self, task: dict) -> str:
         """What the checks _precheck_holds waits for are doing, in words: waiting for a host checks slot
@@ -18475,7 +19231,7 @@ class Daemon:
             return None
 
     def _fix_failed_review(self, review: dict, fups: list[dict], summary: str,
-                           reuse_fix: bool = False) -> tuple[int, int, list[int]] | None:
+                           reuse_fix: bool = False, approved: bool = False) -> tuple[int, int, list[int]] | None:
         """A review that failed with fix specs, handled the way the coordinator would: one code task
         fixes them all on top of the reviewed branch, and a re-review that waits on it takes over the
         failed review's dependents: (fix id, re-review id, the dependents moved). None when auto
@@ -18557,6 +19313,11 @@ class Daemon:
         rtier = "deep" if review["tier"] == "deep" else "standard"   # a re-review never runs light
         tag = spans.new_tag()   # this spec's delimiter: the reviewer's findings and hand-off are data
         found = _findings(fups, review, tag)
+        # A shared-branch review that failed only some members: the fix is for their part alone.
+        vs = integrate.verdicts([m["id"] for m in integrate.members(db, review)], load_result(review.get("result")),
+                                fups)
+        if vs:
+            found = f"{integrate.scope_text(vs)}\n{found}"
         # An open fix of the PR's findings (pr_findings_owner) on this stack takes these findings too:
         # a PR has one fixer.
         root, key = self._stack_root(code), prguard.pr_key(code.get("pr_url") or "")
@@ -18575,7 +19336,7 @@ class Daemon:
             # no fix or re-review: its findings go to that owner, whose own work gets its own review.
             row = db.one("SELECT status FROM tasks WHERE id=?", (code["id"],))
             gone = bool(row and row["status"] == "cancelled")
-            owner = self._continuation_owner(code) if gone or not (prfix or hop) else None
+            owner = self._continuation_owner(code, fixes=False) if gone or not (prfix or hop) else None
             if gone or owner:
                 why = ("it was cancelled" if gone else "") + (" and " if gone and owner else "") \
                     + (f"open task #{owner['id']} continues it" if owner else "")
@@ -18698,8 +19459,9 @@ class Daemon:
                                f"Leave the push to re-review #{rid}, which checks each finding once this task is done."),
                     f"Findings to fix:\n{found}",
                     f"The review's hand-off: {spans.wrap(coord.clip(summary, AUTO_REVIEW_SUMMARY_CHARS), _handoff_of(review), tag)}"]))
-            moved = [t["id"] for t in coord._open_dependents(db, review["id"])]
-            coord._take_over_dependents(db, review["id"], rid)
+            moved = [] if approved else [t["id"] for t in coord._open_dependents(db, review["id"])]
+            if not approved:   # its approved members are pushing: what waits on it waits for that push
+                coord._take_over_dependents(db, review["id"], rid)
         log(self.p, f"review {review['id']} failed: "
                     + (f"PR fix #{fid} takes its findings" if prfix else f"continue hop #{fid} takes its findings"
                        if hop else f"queued fix #{fid}") + f" and re-review #{rid}"
@@ -19637,8 +20399,8 @@ def _cut_off_cost(run_dir: Path, exit_info: dict, usage=None, prov=None) -> floa
     count (Codex: its rollout's running totals), else the elapsed share of its dollar budget rather
     than $0, so the caps keep counting it. A run whose agent never started (it gave
     up waiting for a resource) spent nothing, and so did one that reported no tokens and whose stream
-    shows no model call (_model_called), when its CLI streams (a CLI that hung, was logged out or
-    offline, or a host that slept, before its first answer)."""
+    shows no model call (_model_called, strict), on any provider (a CLI that hung, was logged out or
+    offline, or a host that slept, before its first answer; one that printed nothing)."""
     if exit_info.get("launched") is False:
         return 0.0
     try:
@@ -19646,20 +20408,14 @@ def _cut_off_cost(run_dir: Path, exit_info: dict, usage=None, prov=None) -> floa
     except (OSError, ValueError):
         return 0.0
     tokens = usage and _has_tokens(usage)
-    try:
-        silent = not (run_dir / "output.jsonl").stat().st_size
-    except OSError:
-        silent = True
-    if silent and not tokens and (prov is None or prov.streams(spec.get("argv") or [])):
-        return 0.0
     if prov is not None and exit_info.get("started"):   # Codex: the tokens its rollout counted
         priced = _priced_from_tokens(run_dir, exit_info, usage, prov)
         if priced:
             return priced
-    # No tokens and no model call in its stream (a CLI logged out, or offline, that retried until its
-    # timeout): it spent nothing, so it books $0 and counts toward no cap.
-    if not tokens and (prov is None or prov.streams(spec.get("argv") or [])) \
-            and not _model_called(run_dir / "output.jsonl"):
+    # No tokens and no model call in its output (a CLI logged out, or offline, that retried until its
+    # timeout; one that printed nothing, streaming or not): no evidence it reached the API, so it books
+    # $0 and counts toward no cap, on every provider.
+    if not tokens and not _model_called(run_dir / "output.jsonl", strict=True):
         return 0.0
     budget = float(spec.get("budget_usd") or spec.get("default_budget_usd") or 0)
     timeout = float(spec.get("timeout_s") or 0)
@@ -19936,13 +20692,17 @@ _NO_CALL_MSGS = frozenset({"error", "stream_error", "task_started", "session_con
 # Stream event types that carry no answer (Claude Code, Cursor, Codex exec --json); another type counts as one.
 _NO_CALL_TYPES = frozenset({"system", "user", "error", "thread.started", "turn.started", "turn.failed",
                             "rate_limit_event"})
+# Stream event types an answer from the API makes (Cursor's tool calls and thinking, Claude Code's partial
+# messages): with _model_called's `strict` only these, of the types it reads no further, count as a call.
+_CALL_TYPES = frozenset({"tool_call", "thinking", "stream_event"})
 
 
-def _model_called(out: Path) -> bool:
+def _model_called(out: Path, strict: bool = False) -> bool:
     """Whether a run's output.jsonl shows a model call: an assistant message (not Claude Code's
     <synthetic> error message), a Codex item other than an error, a completed turn, a usage record
     with tokens, or a result with an answer. Lines that are not JSON prove nothing; an event of an
-    unknown type counts as a call, so an unfamiliar stream keeps its estimate."""
+    unknown type counts as a call, so an unfamiliar stream keeps its estimate, unless `strict` (what
+    books a run: no estimate without evidence that it reached the API), where only _CALL_TYPES do."""
     try:
         f = open(out, "rb")
     except OSError:
@@ -19985,7 +20745,7 @@ def _model_called(out: Path) -> bool:
                 if not ev.get("is_error") and ev.get("subtype") in (None, "success") and ev.get("result"):
                     return True
                 continue
-            if kind and kind not in _NO_CALL_TYPES:
+            if kind and kind not in _NO_CALL_TYPES and (not strict or kind in _CALL_TYPES):
                 return True
     return False
 
@@ -20270,7 +21030,7 @@ def _read_result(path: Path) -> dict | None:
 def _cred_changed(run_dir: Path) -> list:
     """The credential changes (credwatch) the runner wrote to the run's exit.json; [] when none."""
     got = (_read_result(run_dir / "exit.json") or {}).get("cred_changed")
-    held = credwatch.held(run_dir)   # metadata-only, or seen by several runs (credwatch.classify): no failure
+    held = credwatch.excused(credwatch.held(run_dir))   # not shown by the run's transcript (credwatch.classify)
     return [c for c in got if isinstance(c, list) and len(c) == 2 and c[0] not in held] if isinstance(got, list) else []
 
 
@@ -20659,7 +21419,8 @@ def _stale_wakes(prev: dict, key: dict, escalate: bool) -> int:
     if not isinstance(prev, dict) or prev.get("status") != "waiting":
         return 0
     n = bud.stale_wakes(prev)
-    if escalate or str(prev.get("woke") or "").startswith("the host rebooted") or prev.get(onpassdry.KEY):
+    if escalate or str(prev.get("woke") or "").startswith("the host rebooted") or prev.get(onpassdry.KEY) \
+            or prev.get(waketier.KEY) == "plan_check":   # a planned check is expected to hand the wait back
         return n
     before = prev.get("wait_key")
     if not isinstance(before, dict):

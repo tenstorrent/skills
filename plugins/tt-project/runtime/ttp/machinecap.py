@@ -32,6 +32,10 @@ Config (provenance as any key: a value the user or coordinator set is kept acros
     off on lab and build servers), on, off.
   machine.max_workers: the base before pacing; null (default) holds nothing while no signal is busy
     and is the cores (BASE_MIN to BASE_MAX) under pressure.
+  machine.pace_from: moderate (default) or heavy. heavy, for a host whose projects only run agents:
+    only heavy CPU or heavy memory cut this project's limit (a call and heat count as before), and the
+    project holds the machine's running workers to its own base, not to the lowest base another
+    project set (that project still holds itself to its own).
 Undo: `ttp config <project> machine.worker_limit off` (each project).
 
 State: TTP_HOME/machine-workers.json, under an fcntl lock (.lock beside it), shared by all projects:
@@ -116,9 +120,15 @@ def base(cfg: dict, cpus: int | None = None) -> int:
     return v if v is not None else max(BASE_MIN, min(BASE_MAX, cpus or hostcpu.cores()))
 
 
-def levels(sig: dict) -> dict:
+def pace_from(cfg: dict) -> str:
+    """machine.pace_from: 'heavy' when set so, else 'moderate' (the default, also for a bad value)."""
+    v = str(((cfg or {}).get("machine") or {}).get("pace_from") or "moderate").strip().lower()
+    return "heavy" if v == "heavy" else "moderate"
+
+
+def levels(sig: dict, pace: str = "moderate") -> dict:
     """{signal: 'moderate' | 'heavy'} for each busy signal in a reading (read_signals' keys, carried on
-    by advance). An unreadable signal is not busy."""
+    by advance). An unreadable signal is not busy. With `pace` heavy, moderate CPU and memory drop out."""
     out = {}
     b, at, since = sig.get("cpu_busy"), sig.get("at"), sig.get("cpu_low_since")
     if b is not None and b > 1 - CPU_IDLE_LOW and since is not None and at is not None \
@@ -135,6 +145,8 @@ def levels(sig: dict) -> dict:
     t = sig.get("thermal")
     if t is not None and t >= THERMAL_SERIOUS:
         out["thermal"] = "heavy"
+    if pace == "heavy":
+        out = {k: v for k, v in out.items() if v == "heavy"}
     return out
 
 
@@ -160,24 +172,26 @@ def advance(prev: dict | None, sig: dict) -> dict:
     return sig
 
 
-def limit(top: int, sig: dict) -> int:
+def limit(top: int, sig: dict, pace: str = "moderate") -> int:
     """The machine-wide worker limit from base `top` and a signal reading: never under 1."""
-    f = math.prod(FACTORS[v] for v in levels(sig).values())
+    f = math.prod(FACTORS[v] for v in levels(sig, pace).values())
     return max(1, math.floor(top * f + 1e-9))
 
 
-def words(sig: dict) -> str:
-    lv = levels(sig)
+def words(sig: dict, pace: str = "moderate") -> str:
+    lv = levels(sig, pace)
     return ", ".join(f"{k} {v}" for k, v in lv.items()) or "nothing busy"
 
 
-def in_force(own: int | None, lims: list[int], sig: dict, cpus: int | None = None) -> int | None:
+def in_force(own: int | None, lims: list[int], sig: dict, cpus: int | None = None,
+             pace: str = "moderate") -> int | None:
     """The machine-wide limit from this project's set base `own`, the bases other live projects set
-    (`lims`) and a reading: None (no machine hold) while nothing is busy and no base is set."""
-    bases = [x for x in (own, *lims) if x]
-    if not levels(sig):
+    (`lims`; ignored with `pace` heavy) and a reading: None (no machine hold) while nothing is busy
+    and no base is set."""
+    bases = [x for x in (own, *(lims if pace != "heavy" else ())) if x]
+    if not levels(sig, pace):
         return min(bases) if bases else None
-    return limit(min(bases) if bases else base({}, cpus), sig)
+    return limit(min(bases) if bases else base({}, cpus), sig, pace)
 
 
 # -- signal readers (each returns None where it cannot read) --------------------------------------
@@ -296,9 +310,8 @@ def _locked(home: Path | None = None):
             data = {}
         data.setdefault("projects", {})
         yield data
-        tmp = path.with_name(f".{STATE}.{os.getpid()}")
-        tmp.write_text(json.dumps(data, indent=1, sort_keys=True))
-        os.replace(tmp, path)
+        from .project import durable_write
+        durable_write(path, json.dumps(data, indent=1, sort_keys=True))
 
 
 def _alive(pid) -> bool:
@@ -339,7 +352,7 @@ def publish(project: str, cfg: dict, running: int, now: float | None = None, hom
         if on:
             sig = data.get("signals") if isinstance(data.get("signals"), dict) else {}
             mine = set_base(cfg)
-            own = {"base": mine, "limit": in_force(mine, [], sig)}
+            own = {"base": mine, "limit": in_force(mine, [], sig, pace=pace_from(cfg))}
         data["projects"][project] = {"pid": pid or os.getpid(), "at": now, "running": running, **own}
 
 
@@ -364,11 +377,12 @@ def check(project: str, cfg: dict, running: int, claim: bool = False, now: float
                 sig = prev   # another project stored a newer reading meanwhile
             else:
                 data["signals"] = sig = advance(prev, sig)
-        mine = set_base(cfg)
-        top = in_force(mine, lims, sig)
+        mine, pace = set_base(cfg), pace_from(cfg)
+        top = in_force(mine, lims, sig, pace=pace)
         if top is not None and others + running >= top:
             return (f"the machine-wide worker limit: {others + running} of {top} running across all projects "
-                    f"({words(sig)}; machine.worker_limit)")
+                    f"({words(sig, pace)}; machine.worker_limit"
+                    f"{', machine.pace_from heavy' if pace == 'heavy' else ''})")
         if claim:
             data["projects"][project] = {"pid": pid or os.getpid(), "at": now, "running": running + 1,
                                          "base": mine, "limit": top}

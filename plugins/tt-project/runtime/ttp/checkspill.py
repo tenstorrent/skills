@@ -5,7 +5,11 @@
 A project may list, in order, the ssh aliases of other machines its checks may run on. The account's
 pool, `checks.spill_hosts` in the account settings (`ttp config --account checks.spill_hosts '["pool-a"]'`,
 which a run may only clear), follows that list in every project on this machine, so each spills
-without a list of its own. No machines-list tag adds a host. A project's own empty list (`[]`)
+without a list of its own. No machines-list tag adds a host. The account's ban list, `checks.no_spill_hosts`
+(`ttp config --account checks.no_spill_hosts '["host-x"]'`, ssh aliases or host names, which a run may only add
+to), keeps a host out of every project's spill on this machine: an alias, its machine or ssh host, or the
+machines list's `hostname` for it (full or short name) matches (banned), a project or pool list naming one is
+refused at config time, and `ttp checks status` shows the list. A project's own empty list (`[]`)
 keeps its checks here, the pool too; with neither, checks never leave this machine. A `ttp checks` run that may spill tries the listed hosts in
 order before it takes a place here (`delivery.checks_spill_first`, default true: first), so this machine keeps
 only the checks that cannot spill, and runs on the first that is allowed, reachable and has a free slot, as a
@@ -51,7 +55,8 @@ is what ssh reaches, what its own pause, lock and device checks name, and where 
 Runs already on the host go on. The skip shows in one line in `ttp status` and the web app (skip_lines)
 while it is fresh (SKIP_SHOW_S). Its slots follow what it has idle now (checklane.host_slots): the runs
 its idle cores (cores less the 1-minute load average) and available memory fit, at most the runs its
-cores hold less the remote checks running there from any machine (their ttp-check.* folders), not a
+cores hold less the remote checks running there from any machine (their ttp-check.* folders a live process
+works in, or just made: _RUNNING_COUNT; a cut run's leftover folder counts for none and is removed), not a
 small fixed count; a host whose load does not read gets checklane.default_slots less those. This machine also holds one claim file
 per slot it uses there (spill/<alias>.<n>.json in the checks slot folder), so its own runs never
 take more. A claim whose remote ttp-check.* folder is not made yet (the few seconds of its copy) is
@@ -70,7 +75,9 @@ a wrapper missing there being a host fault (remotecheck), else unwrapped. A run 
 (OFF_ENV): a spill host's own environment never fails a change, only a pass there counts, unless the tests gate proved
 its failures new there (they pass on the base on that host: gatejudge.known_new), which fails it. The rerun waits for a slot here
 as any run does and may spill to another listed host, never back to one its checks failed on (spill_off_add): a host fault
-there (exit 75: the host paused, its lock or a tool gone mid-run) leaves that host one more try, once pick finds it free.
+there (exit 75: the host paused, its lock or a tool gone mid-run) leaves that host one more try, once pick finds it free,
+and a host its own fault kept off is tried again once the checks config changes (a new checks.spill_wrap_cmd) or
+after FAULT_RETRY_S. Each bound of its wait here tries them all again, so a waiting run moves to the first that can take it.
 With none left it runs here, whose result counts.
 
 A check that runs an agent CLI (AGENT_CLIS, the claude CLI among them, in command position after its
@@ -104,6 +111,7 @@ from . import remotecheck
 
 KEY = "checks_spill_hosts"
 ACCOUNT_KEY = "checks.spill_hosts"   # the account's pool (project.ACCOUNT_KEYS), after a project's own list
+NO_SPILL_KEY = "checks.no_spill_hosts"   # the account's ban list: hosts no project's checks spill to (banned)
 BESIDE_KEY = "spill_beside_device"   # checks.spill_beside_device: hosts a device job keeps no spill off (beside_device)
 NO_DEVICE_KEY = "wrap_needs_device"   # checks.wrap_needs_device false: a wrapped run needs no device and may spill
 PRE_KEY = "spill_pre_cmd"   # checks.spill_pre_cmd: the project's own go/skip command before a spill to a host (pre_check)
@@ -116,9 +124,13 @@ REMOTE_ONLY_ENV = "TTP_TEST_REMOTE_ONLY"   # tests: "1"/"0" instead of this mach
 SPILL_AFTER_S = 60.0
 OFF_ENV = "TTP_CHECKS_NO_SPILL"   # "1": these checks never spill; else the hosts a rerun keeps off (spill_off_add)
 HOST_FAULT_TRIES = 2   # a spill host whose own fault (exit 75) ended a run this often is kept off its rerun
+FAULT_RETRY_S = 600   # for this long, or until the checks config changes; then it is tried again
 ENV_FAULT_HOSTS = 2   # the checks failed at import this often on spill hosts: one fault of the spill env config
 ENV_RETRY_S = 900   # after which (or once the checks config changes) a run tries the spill hosts again
 PROBE_TIMEOUT_S = 30
+LOAD_NEAR = 0.8   # no check starts on a spill host whose 1-minute load (with this machine's runs not yet in it) is this x its cores
+LOAD_LAG_S = 90.0   # a claim this recent may not show in its host's 1-minute load yet: its cores count as load
+BACKOFF_S, BACKOFF_MAX_S = 60.0, 900.0   # an unreachable host is not probed again for this long, doubling per failure
 DEVICE_SUFFIX = "-device"
 DEVICE_WHY = "a device job runs there: "   # how a device-busy reason starts (device_busy, _device_holders)
 BROKER_TIMEOUT_S = 10.0   # one read of a broker's status; past it the device locks alone decide
@@ -132,11 +144,33 @@ _SHELLS = ("sh", "bash", "dash", "zsh")   # needs_cli reads their -c script too
 # Absolute paths every host has: a check naming only these may still spill (host_path).
 _SYSTEM_DIRS = ("/usr/", "/bin/", "/sbin/", "/lib/", "/lib64/", "/lib32/", "/etc/", "/dev/", "/proc/", "/sys/")
 RUNNING_MAX_AGE_MIN = 720   # a remote ttp-check.* folder older than this is a leftover, not a running check
+RUNNING_GRACE_MIN = 10   # where /proc reads: a folder no process works in counts as running this long (its copy)
+LEFTOVER_REAP_MIN = 60   # and is removed, a leftover of a cut run (a reboot here), once this old
+# The running checks on a host: its ttp-check.* folders a live process works in (cwd under it, read from /proc),
+# or made in the last RUNNING_GRACE_MIN; one with neither is a leftover, removed once LEFTOVER_REAP_MIN old. Without
+# /proc (macOS) every folder younger than RUNNING_MAX_AGE_MIN counts.
+_RUNNING_COUNT = (
+    "t=${TMPDIR:-/tmp}; t=${t%/}\n"
+    "if [ -r /proc/self/cwd ]; then\n"
+    "  r=$(cd \"$t\" 2>/dev/null && pwd -P); w=$(for q in /proc/[0-9]*; do readlink \"$q/cwd\" 2>/dev/null; done)\n"
+    "  n=0\n"
+    "  for d in \"$t\"/ttp-check.?*; do\n"
+    "    [ -d \"$d\" ] || continue\n"
+    "    x=\"$r/${d##*/}\"\n"
+    "    if printf '%s\\n' \"$w\" | grep -q -F -x -e \"$x\" -e \"$d\" || printf '%s\\n' \"$w\" | grep -q -F -e \"$x/\" -e \"$d/\"; then\n"
+    "      n=$((n+1))\n"
+    f"    elif [ -n \"$(find \"$d\" -maxdepth 0 -mmin -{RUNNING_GRACE_MIN} 2>/dev/null)\" ]; then n=$((n+1))\n"
+    f"    elif [ -n \"$(find \"$d\" -maxdepth 0 -mmin +{LEFTOVER_REAP_MIN} 2>/dev/null)\" ]; then rm -rf -- \"$d\"\n"
+    "    fi\n"
+    "  done\n"
+    "else\n"
+    "  n=$(find \"$t\" -maxdepth 1 -name 'ttp-check.*' -type d "
+    f"-mmin -{RUNNING_MAX_AGE_MIN} 2>/dev/null | wc -l)\n"
+    "fi\n")
 _PROBE = ("command -v git >/dev/null 2>&1 && command -v tar >/dev/null 2>&1 || exit 3\n"
           "c=$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)\n"
           "m=$(awk '/^MemAvailable:/{print $2}' /proc/meminfo 2>/dev/null)\n"
-          "n=$(find \"${TMPDIR:-/tmp}\" -maxdepth 1 -name 'ttp-check.*' -type d "
-          f"-mmin -{RUNNING_MAX_AGE_MIN} 2>/dev/null | wc -l)\n"
+          + _RUNNING_COUNT +
           "l=$(cut -d' ' -f1 /proc/loadavg 2>/dev/null)\n"
           "echo \"ttp-spill $c ${m:-0} $n ${l:--}\"\n")
 DEVICE_NODES = "/dev/tenstorrent*"   # a host's Tenstorrent device nodes (a glob); a process holding one open is a tenant
@@ -224,6 +258,9 @@ def problems(delivery: dict) -> list[str]:
             hosts_of(v)
         except ValueError as e:
             out.append(str(e).replace("; nothing was changed", ""))
+        if bad := banned_in(v):
+            out.append(f"delivery.{KEY}: {', '.join(bad)} is banned by the account's {NO_SPILL_KEY}; "
+                       "its checks never spill there")
     a = (delivery or {}).get(AFTER_KEY)
     if a is not None and (isinstance(a, bool) or not isinstance(a, (int, float)) or a < 0):
         out.append(f"delivery.{AFTER_KEY}: {a!r} is not a number of seconds")
@@ -239,6 +276,93 @@ def problems(delivery: dict) -> list[str]:
     return out
 
 
+def no_spill_of(v: Any) -> list[str]:
+    """A `checks.no_spill_hosts` value set by `ttp config --account`: a list (or a JSON-encoded list) of ssh
+    aliases or host names. ValueError for anything else."""
+    try:
+        return hosts_of(v)
+    except ValueError as e:
+        raise ValueError(str(e).replace(f"delivery.{KEY}", NO_SPILL_KEY)) from None
+
+
+def _names(x: str) -> set[str]:
+    """A host name and its short form (first label), lower-cased; an address keeps no short form."""
+    x = str(x).strip().lower()
+    short = x.split(".")[0]
+    return set() if not x else {x} if short.isdigit() else {x, short}
+
+
+def no_spill() -> list[str]:
+    """The account's ban list (checks.no_spill_hosts) in order; [] when unset or malformed."""
+    from . import project
+    try:
+        return no_spill_of((project.load_account_settings().get("checks") or {}).get("no_spill_hosts") or [])
+    except ValueError:
+        return []
+
+
+def banned(alias: str, known: dict | None = None, ban: list[str] | None = None) -> str:
+    """The checks.no_spill_hosts entry that keeps spill host `alias` out, else "": it names the alias, its
+    machine or ssh host (target), or the machines list's `hostname` for either, by full or short name."""
+    ban = no_spill() if ban is None else ban
+    if not ban:
+        return ""
+    from . import machines
+    known = machines.load() if known is None else known
+    machine, host = target(alias, known)
+    names = set().union(*(_names(n) for n in (alias, machine, host)))
+    for n in (machine, host):
+        names |= _names((known.get(n) or {}).get("hostname") or "")
+    return next((b for b in ban if _names(b) & names), "")
+
+
+def banned_in(v: Any, known: dict | None = None) -> list[str]:
+    """The hosts of spill list `v` (a project's delivery.checks_spill_hosts or the account's pool) that
+    checks.no_spill_hosts bans; [] when none is or `v` is malformed."""
+    try:
+        got = hosts_of(v)
+    except ValueError:
+        return []
+    ban = no_spill()
+    return [h for h in got if banned(h, known, ban)] if ban else []
+
+
+def ban_refusal(key: str, v: Any) -> str:
+    """Why setting spill list `key` to `v` is refused: it names a host checks.no_spill_hosts bans; else ""."""
+    if bad := banned_in(v):
+        return (f"{key}: {', '.join(bad)} is banned from every project's checks by the account's "
+                f"{NO_SPILL_KEY} ({json.dumps(no_spill())}); nothing was changed")
+    return ""
+
+
+def banned_listed(cfg: dict | None) -> list[str]:
+    """The hosts in the project's spill list or the account's pool that checks.no_spill_hosts keeps out."""
+    if not no_spill():
+        return []
+    own = ((cfg or {}).get("delivery") or {}).get(KEY)
+    try:
+        mine = hosts_of(own) if own is not None else []
+    except ValueError:
+        return []
+    if own is not None and not mine:
+        return []
+    return banned_in(list(dict.fromkeys([*mine, *account_hosts()])))
+
+
+def settable_hosts(v: Any) -> list[str]:
+    """hosts_of(v) for a config_set of delivery.checks_spill_hosts; ValueError also when it names a host the
+    account's checks.no_spill_hosts bans."""
+    got = hosts_of(v)
+    if why := ban_refusal(f"delivery.{KEY}", got):
+        raise ValueError(why)
+    return got
+
+
+def no_spill_lines() -> list[str]:
+    """`ttp checks status` line: the account's ban list."""
+    return [f"spill hosts banned for every project ({NO_SPILL_KEY}): {', '.join(b)}"] if (b := no_spill()) else []
+
+
 def account_hosts() -> list[str]:
     """The account's pool (checks.spill_hosts in the account settings) in order; [] when unset or malformed."""
     from . import project
@@ -249,7 +373,7 @@ def account_hosts() -> list[str]:
 
 
 def hosts(cfg: dict | None) -> list[str]:
-    """The project's spill hosts in order, then the account's pool;
+    """The project's spill hosts in order, then the account's pool, less those checks.no_spill_hosts bans;
     [] when the project's own list is empty (it keeps its checks here) or malformed (config_problems names it)."""
     own = ((cfg or {}).get("delivery") or {}).get(KEY)
     try:
@@ -258,7 +382,12 @@ def hosts(cfg: dict | None) -> list[str]:
         return []
     if own is not None and not mine:
         return []
-    return list(dict.fromkeys([*mine, *account_hosts()]))
+    listed = list(dict.fromkeys([*mine, *account_hosts()]))
+    if not (ban := no_spill()):
+        return listed
+    from . import machines
+    known = machines.load()
+    return [h for h in listed if not banned(h, known, ban)]
 
 
 def _own(cfg: dict | None) -> list[str]:
@@ -485,6 +614,46 @@ def workers(cores: int, load: float | None, others: int = 0, cap: int = 0) -> in
     return max(1, min(cap or cores, cores, idle))
 
 
+def workers_why(cores: int, load: float | None, others: int = 0, cap: int = 0) -> tuple[int, str]:
+    """workers(), and what sized it, for the spill line and status (no silent throttling): the host's idle
+    cores, those kept for this machine's `others` runs there, one run's limit `cap` (checks.test_run_max), and
+    why a run gets a single worker."""
+    n = workers(cores, load, others, cap)
+    if not n:
+        return 0, "test workers it sizes itself (the host's load did not read)"
+    from . import checklane
+    raw = int(cores - load)
+    kept = others * checklane.run_cores(None, cores)
+    why = f"{n} test worker(s), its idle cores (load {load:g} of {cores})"
+    if others:
+        why += f", less {kept} kept for {others} other run(s) of this machine there"
+    if cap and n == cap and cap < min(cores, raw - kept):
+        why += f", at most {cap} per run (limit checks.test_run_max)"
+    if raw - kept < 1:
+        why += (f"; only 1 because {max(0, raw)} core(s) are idle"
+                + (f" and {kept} are kept for this machine's other runs there" if others else ""))
+    return n, why
+
+
+def _size(cfg: dict, host: str) -> tuple[int, str]:
+    """workers_why for a run to `host` from its last probe (_READ), before this run's claim there."""
+    from . import testslots
+    cores, load = _READ.get(host, (0, None))
+    top = testslots.sizes(cfg, cores) if cores > 0 else None   # one run's limit, sized to that host
+    return workers_why(cores, load, _ours(host), top[1] if top else 0)
+
+
+def _probe_all(items: list[tuple[str, bool]]) -> dict:
+    """probe() of each (host, beside_device), at once: a pick compares them all, so none waits on another's ssh."""
+    items = list(dict.fromkeys(items))
+    if len(items) <= 1:
+        return {h: probe(h, b) for h, b in items}
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=min(8, len(items))) as ex:
+        got = list(ex.map(lambda hb: probe(*hb), items))
+    return {h: r for (h, _), r in zip(items, got)}
+
+
 def workers_env(n: int) -> dict:
     """The grant a spilled run's commands see for `n` workers (testslots: what xdist's `-n auto` and a held
     grant read); {} for 0."""
@@ -526,13 +695,15 @@ def needs_history(c: Any) -> bool:
 
 
 def check_spills(c: Any, cfg: dict | None = None) -> bool:
-    """Whether check `c` may run on a spill host: it would run on this machine (its host "local", or an agent
+    """Whether check `c` may run on a spill host: it names no host of its own and has no spill host yet (a
+    project's delivery.checks_host, its default_host, does not keep it there; host "local", or an agent
     CLI it runs (needs_cli), only with `"spill": true`), in a clean checkout, does not say `"spill": false`, and is unwrapped unless it
     has a remote wrapper (push.spill_wrap_of; one that does not parse keeps it here) or `cfg` says its
     wrappers need no device (wrapped_ok)."""
     from . import cleantree, push
     opt = getattr(c, "spill", None)
-    if opt is False or getattr(c, "keep_here", False) or push.remote_host(c) or cleantree.authoring(c):
+    own = getattr(c, "spill_host", "") or getattr(c, "host", "")
+    if opt is False or getattr(c, "keep_here", False) or own not in ("", remotecheck.LOCAL) or cleantree.authoring(c):
         return False
     if (getattr(c, "host", "") == remotecheck.LOCAL or needs_cli(c) or needs_history(c)) and opt is not True:
         return False
@@ -656,6 +827,8 @@ def allowed(p, cfg: dict, alias: str) -> str:
         return "not in the machines list (ttp machines add)"
     if machines.retired(known.get(machine)):
         return "retired in the machines list"
+    if ban := banned(alias, known):
+        return f"banned for every project by the account's {NO_SPILL_KEY} ({ban})"
     if alias not in _own(cfg) and alias not in account_hosts() and machine not in account_hosts():
         name = getattr(p, "name", "") or "<project>"
         return (f"not a spill host of this project (add it with `ttp config {name} delivery.{KEY} "
@@ -716,19 +889,19 @@ def probe(alias: str, beside_device: bool = False) -> tuple[int, str, str]:
         r = subprocess.run(remotecheck._ssh(alias, _probe_script()), stdin=subprocess.DEVNULL, capture_output=True,
                            text=True, timeout=PROBE_TIMEOUT_S)
     except subprocess.TimeoutExpired:
-        return 0, f"ssh timed out after {PROBE_TIMEOUT_S} s", ""
+        return _failed(alias, f"ssh timed out after {PROBE_TIMEOUT_S} s")
     except OSError as e:
-        return 0, f"cannot run ssh: {e}", ""
+        return _failed(alias, f"cannot run ssh: {e}")
     if r.returncode == 255:
         from . import sshagent
         if sshagent.locked(r.stderr or ""):
-            return 0, f"ssh cannot reach it: {sshagent.WHY}", ""
-        return 0, f"ssh cannot reach it: {(r.stderr.strip().splitlines() or ['exit 255'])[-1][:200]}", ""
+            return 0, f"ssh cannot reach it: {sshagent.WHY}", ""   # this machine's agent, not the host
+        return _failed(alias, f"ssh cannot reach it: {(r.stderr.strip().splitlines() or ['exit 255'])[-1][:200]}")
     if r.returncode == 3:
         return 0, "it lacks git or tar", ""
     m = re.search(r"^ttp-spill (\d+) (\d+) (\d+)(?: (\d+(?:\.\d+)?|-))?$", r.stdout, re.M)
     if r.returncode != 0 or not m:
-        return 0, f"its probe failed (exit {r.returncode})", ""
+        return _failed(alias, f"its probe failed (exit {r.returncode})")
     busy, note = _device_holders(r.stdout)
     if busy and not beside_device:
         return 0, busy, ""
@@ -736,7 +909,17 @@ def probe(alias: str, beside_device: bool = False) -> tuple[int, str, str]:
     cores, mem_kib, running = (int(x) for x in m.groups()[:3])
     load = float(m[4]) if m[4] and m[4] != "-" else None
     _READ[alias] = (cores, load)
-    n = checklane.host_slots(cores, mem_kib / (1024 * 1024) if mem_kib else None, load, running)
+    _note_host(alias, cores=cores, load=load)
+    _CHECKS_RUNNING[alias] = running
+    # This machine's runs started there in the last LOAD_LAG_S count as load already: many picks at once
+    # each see the same 1-minute load, which shows none of them yet.
+    seen = None if load is None else load + _pending_cores(alias, cores)
+    if seen is not None and cores > 0 and seen >= LOAD_NEAR * cores:
+        return 0, (f"its load is near its cores (load {load:g}"
+                   + (f", {seen - load:g} more for this machine's runs just started" if seen > load else "")
+                   + f", of {cores} cores; no check starts at {LOAD_NEAR:g} x or above, "
+                   f"{running} check(s) running)"), note
+    n = checklane.host_slots(cores, mem_kib / (1024 * 1024) if mem_kib else None, seen, running)
     if n > 0:
         return n, "", note
     return 0, (f"its {running} running check(s) fill it" if load is None
@@ -744,9 +927,17 @@ def probe(alias: str, beside_device: bool = False) -> tuple[int, str, str]:
                     f"{running} check(s) running)"), note
 
 
+def _failed(alias: str, why: str) -> tuple[int, str, str]:
+    """probe's answer for a host that did not answer: backed off (_note_host)."""
+    _note_host(alias, failed=why)
+    return 0, why, ""
+
+
 _OUT_OF_REACH = ("ssh ", "cannot run ssh", "it lacks", "its probe failed", "its pre-run hook error")   # probe and hook
 LAST_BUSY: list[str] = []   # the hosts the last pick skipped only as busy (remote_only waits for them)
 _READ: dict[str, tuple[int, float | None]] = {}   # the last probe's (cores, load) per host: pick sizes a run's workers from it
+_CHECKS_RUNNING: dict[str, int] = {}   # the last probe's running checks per host: _claim counts in-flight claims beyond them
+PINNED_POLL_S = 15.0   # how often a run pinned to a full host probes it again (admit_pinned)
 
 
 def claim_dir() -> Path:
@@ -954,7 +1145,19 @@ class Claim:
         self.lock = lock
         self.workers = 0   # the test workers the run takes there (workers); 0: it sizes itself
 
+    def note(self, rec: dict) -> None:
+        """Rewrite its claim file's record as `rec`."""
+        if self.f is not None:
+            try:
+                self.f.seek(0)
+                self.f.truncate(0)
+                self.f.write(json.dumps(rec))
+                self.f.flush()
+            except OSError:
+                pass
+
     def close(self) -> None:
+        note_limit("", "")   # off the host: its limit line leaves status
         if self.lock is not None:
             self.lock.close()
             self.lock = None
@@ -970,7 +1173,13 @@ class Claim:
 def _claim(alias: str, free: int, rec: dict) -> Claim | None:
     d = claim_dir()
     d.mkdir(parents=True, exist_ok=True)
-    for i in range(max(0, free) + _ours(alias)):
+    # This machine's claims are among the host's running checks only once their runs started there: one
+    # beyond the probe's count is still in flight and takes a free slot too, so concurrent pickers in any
+    # project here never claim more than the host fits.
+    ours = _ours(alias)
+    if (running := _CHECKS_RUNNING.get(alias)) is not None:
+        ours = min(ours, running)
+    for i in range(max(0, free) + ours):
         f = open(d / f"{alias}.{i}.json", "a+")
         try:
             fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -985,9 +1194,137 @@ def _claim(alias: str, free: int, rec: dict) -> Claim | None:
     return None
 
 
+def admit_pinned(p, hosts: list[str], tell, what: str = "", bound: float | None = None,
+                 sleep=time.sleep, clock=time.monotonic) -> list[Claim] | None:
+    """A claim on each host checks are pinned to (delivery.checks_host or a check's own "host"), taken as a
+    spill pick takes one (probe's free slots, _claim counting this machine's in-flight claims), so the runs of
+    every project here never start more checks there than it fits. While a host is full the run waits, told
+    once per reason with its numbers and shown in status (note_limit), at most `bound` seconds (None: until
+    all are claimed): None then, holding nothing. A host the probe cannot read holds no run (its checks then
+    fail or pass on their own), as remoteload.held never does."""
+    rec = {"project": getattr(p, "name", ""), "task": os.environ.get("TTP_TASK") or "",
+           "run": os.environ.get("TTP_RUN_ID") or "", "pid": os.getpid(), "since": time.time(),
+           "what": what[:300], "pinned": True}
+    got: dict[str, Claim] = {}
+    start, said = clock(), {}
+    while True:
+        for host in hosts:
+            if host in got:
+                continue
+            free, why, _ = probe(host, True)
+            if why.startswith(_OUT_OF_REACH):
+                got[host] = Claim(host, None)   # nothing to count it by: no hold
+                continue
+            if not why and (c := _claim(host, free, {**rec, "host": host})) is not None:
+                got[host] = c
+                continue
+            why = why or (f"its {free} free check slot(s) are claimed by this machine's "
+                          f"{_ours(host)} run(s) there")
+            if said.get(host) != why:
+                line = f"checks pinned to {host} wait for a check slot there: {why}"
+                tell(line + (f" (at most {bound:.0f}s)" if bound is not None else ""))
+                if p is not None:
+                    note_limit(p.name, line, what)
+                said[host] = why
+        if len(got) == len(hosts):
+            if said and p is not None:
+                note_limit(p.name, "")
+            return [c for c in got.values() if c.f is not None]
+        if bound is not None and clock() - start >= bound:
+            for c in got.values():
+                c.close()
+            return None
+        sleep(PINNED_POLL_S)
+
+
 def _ours(alias: str) -> int:
     """This machine's live claims on `alias`: they are among the host's running checks already."""
     return sum(1 for r in holders() if r.get("host") == alias)
+
+
+def _state_file(host: str) -> Path:
+    return claim_dir() / f"{host}.state"   # not *.json: holders reads those as claims
+
+
+def host_state(host: str) -> dict:
+    """What this machine last learned of spill host `host` (_note_host): its cores and load at `at`, and
+    while it failed to answer, `fails` in a row and `until` (no probe before)."""
+    try:
+        r = json.loads(_state_file(host).read_text() or "{}")
+    except (OSError, ValueError):
+        return {}
+    return r if isinstance(r, dict) else {}
+
+
+def _note_host(host: str, cores: int = 0, load: float | None = None, failed: str = "",
+               now: float | None = None) -> None:
+    """Record a probe of `host`: its cores and load (which ends a back-off), or `failed` (why it did not
+    answer), which backs it off BACKOFF_S, doubling per failure in a row up to BACKOFF_MAX_S. Shared by
+    every project of this machine, so one unreachable host costs one probe timeout per back-off, not one
+    per pick."""
+    now = time.time() if now is None else now
+    st = host_state(host)
+    if failed:
+        n = int(st.get("fails") or 0) + 1
+        st.update(fails=n, why=failed[:200], until=now + min(BACKOFF_MAX_S, BACKOFF_S * 2 ** (n - 1)))
+    else:
+        st = {"cores": cores, "load": load, "at": now}
+    try:
+        claim_dir().mkdir(parents=True, exist_ok=True)
+        from . import project
+        project.durable_write(_state_file(host), json.dumps(st), sync=False)
+    except OSError:
+        pass
+
+
+def backed_off(host: str, now: float | None = None) -> str:
+    """Why `host` is not probed now (its last probes failed: _note_host), else ""."""
+    now = time.time() if now is None else now
+    st = host_state(host)
+    if not st.get("fails") or float(st.get("until") or 0) <= now:
+        return ""
+    from . import timefmt
+    return (f"{st.get('why') or 'ssh cannot reach it'}; backing off after {st['fails']} failed probe(s), "
+            f"next try at {timefmt.clock(now=float(st['until']))}")
+
+
+def _run_cores(r: dict, cores: int) -> int:
+    """The cores claim `r` takes on a host of `cores`: its test workers, else one run's (checklane.run_cores)."""
+    from . import checklane
+    return int(r.get("workers") or 0) or checklane.run_cores(None, cores or None)
+
+
+def _pending_cores(host: str, cores: int, now: float | None = None) -> int:
+    """The cores of this machine's claims on `host` from the last LOAD_LAG_S: not in its 1-minute load yet."""
+    now = time.time() if now is None else now
+    return sum(_run_cores(r, cores) for r in holders()
+               if r.get("host") == host and now - float(r.get("since") or 0) < LOAD_LAG_S)
+
+
+def used_share(host: str, recs: list | None = None, now: float | None = None) -> float:
+    """How full `host` looks from here, 0 to 1 or more: its load at the last probe (if recent) plus the cores
+    of this machine's claims there since, over its cores. pick tries the emptiest host first, so a share of
+    runs follows each host's free cores and no one host takes them all. Unknown cores: its claims count."""
+    now = time.time() if now is None else now
+    recs = holders() if recs is None else recs
+    st = host_state(host)
+    cores = int(st.get("cores") or 0)
+    ours = [r for r in recs if r.get("host") == host]
+    if cores <= 0:
+        return float(len(ours))
+    at = float(st.get("at") or 0)
+    fresh = now - at < 300 and st.get("load") is not None
+    since = at - LOAD_LAG_S if fresh else 0.0   # runs just before the probe may not show in its load yet
+    load = float(st["load"]) if fresh else 0.0
+    return (load + sum(_run_cores(r, cores) for r in ours if float(r.get("since") or 0) >= since)) / cores
+
+
+def _inflight(alias: str) -> int:
+    """This machine's claims on `alias` its last probe did not see running yet (_CHECKS_RUNNING): they take
+    free slots there too."""
+    ours = _ours(alias)
+    running = _CHECKS_RUNNING.get(alias)
+    return ours if running is None else max(0, ours - running)
 
 
 def all_off(off: str) -> bool:
@@ -995,21 +1332,37 @@ def all_off(off: str) -> bool:
     return off == "1"
 
 
-def spill_off_add(off: str, host: str, fault: bool, env_cfg: dict | None = None) -> str:
+def spill_off_add(off: str, host: str, fault: bool, env_cfg: dict | None = None, cfg: dict | None = None) -> str:
     """OFF_ENV's value after the checks did not pass on spill host `host`: `fault` when the host's own fault
     ended them (exit 75), else they failed or timed out there. `env_cfg`: they failed at import for want of a
-    package (push.env_problem), a fault of the spill env config `env_cfg` (env_off), never of the host."""
+    package (push.env_problem), a fault of the spill env config `env_cfg` (env_off), never of the host.
+    A fault is marked with its time and the checks config `cfg` it ran under, so it expires (kept_off)."""
     mark = (f"env.{_env_key(env_cfg)}.{int(time.time())}" if env_cfg is not None
-            else "fault" if fault else "fail")
+            else f"fault.{_env_key(cfg) if cfg is not None else ''}.{int(time.time())}" if fault else "fail")
     return ",".join([*(e for e in off.split(",") if e and e != "1"), f"{host}:{mark}"])
 
 
-def kept_off(off: str) -> set[str]:
+def _fault_counts(why: str, key: str | None, now: float) -> bool:
+    """Whether the fault mark `why` still counts: under the checks config whose key is `key` (None: any; a
+    mark with none recorded: any) and within FAULT_RETRY_S. A plain "fault" (an older run's mark) always does."""
+    if why == "fault":
+        return True
+    if not why.startswith("fault."):
+        return False
+    _, k, at = (why.split(".") + ["", ""])[:3]
+    return (key is None or not k or k == key) and at.isdigit() and now - int(at) <= FAULT_RETRY_S
+
+
+def kept_off(off: str, cfg: dict | None = None, now: float | None = None) -> set[str]:
     """The spill hosts OFF_ENV's value `off` keeps a rerun off: each its checks failed on, and each whose own
-    fault ended them HOST_FAULT_TRIES times. An import failure keeps no host off (env_off)."""
+    fault ended them HOST_FAULT_TRIES times under the checks config `cfg` has now (None: any) within the last
+    FAULT_RETRY_S; once that config changes (a fixed checks.spill_wrap_cmd) or the time passes, it is tried
+    again. An import failure keeps no host off (env_off)."""
+    now = time.time() if now is None else now
+    key = None if cfg is None else _env_key(cfg)
     seen = [e.rpartition(":") for e in off.split(",") if e and e != "1"]
-    return {h for h, _, why in seen if not why.startswith("env.") and (why != "fault"
-            or sum(1 for h2, _, w2 in seen if h2 == h and w2 == "fault") >= HOST_FAULT_TRIES)}
+    return {h for h, _, why in seen if not why.startswith("env.") and (
+            why == "fail" or sum(1 for h2, _, w2 in seen if h2 == h and _fault_counts(w2, key, now)) >= HOST_FAULT_TRIES)}
 
 
 def _env_key(cfg: dict | None) -> str:
@@ -1066,23 +1419,29 @@ def pick(p, cfg: dict, tell, what: str = "", off: str = "", why_here: str = "") 
     LAST_BUSY.clear()
     rec = {"project": p.name, "task": os.environ.get("TTP_TASK") or "", "run": os.environ.get("TTP_RUN_ID") or "",
            "pid": os.getpid(), "since": time.time(), "what": what[:300]}
-    skipped, keep = [], kept_off(off)
+    skipped, keep = [f"{h} (banned by the account's {NO_SPILL_KEY})" for h in banned_listed(cfg)], kept_off(off, cfg)
     if env := env_off(off, cfg):
         tell(f"no spill host could take the checks, waiting here: {env}")
         _note_pick(p.name, "", [f"{alias} ({env})" for alias in hosts(cfg)])
         return None
-    mine = [r.get("host") for r in holders()]
+    mine, now = holders(), time.time()
     tried = [e.rpartition(":")[0] for e in off.split(",")]
-    # Spread: hosts these checks did not fail on yet, then those running fewer of this machine's checks, first.
-    for alias in sorted(hosts(cfg), key=lambda h: (h in tried, mine.count(h))):
+    # Spread: hosts these checks did not fail on yet, then those not backed off, then the emptiest (its load
+    # and this machine's runs there over its cores: used_share) first, so runs follow free cores.
+    gated = []   # (alias, machine, host, why before the probe, usable, dev, beside)
+    for alias in sorted(hosts(cfg), key=lambda h: (h in tried, bool(backed_off(target(h)[1], now)),
+                                                  used_share(target(h)[1], mine, now))):
         machine, host = target(alias)
         if alias in keep or host in keep:
             skipped.append(f"{alias} (these checks did not pass there in this run)")
             continue
+        if why := quarantined(p, alias):
+            skipped.append(f"{alias} ({why})")
+            continue
         beside = beside_device(cfg, alias)   # the project lets its checks run there beside a device job
         why = allowed(p, cfg, alias)
         usable = not why   # past `allowed`, a skip is the host being busy unless it is out of reach
-        why, dev = why or lock_busy(p, cfg, alias), ""
+        why, dev = why or backed_off(host, now) or lock_busy(p, cfg, alias), ""
         if not why and beside:
             dev = device_busy(p, cfg, host)
             _note_skip(host, "", p.name, own_only=True)   # this project's earlier skip no longer holds
@@ -1091,14 +1450,28 @@ def pick(p, cfg: dict, tell, what: str = "", off: str = "", why_here: str = "") 
             _note_skip(host, why, p.name)
         if not why and (why := pre_check(p, cfg, alias)):
             _note_skip(host, why, p.name)
-        free, note = 0, ""
+        gated.append((alias, machine, host, why, usable, dev, beside))
+    # Every host left is probed (at once), and the run goes to the one with the most free capacity: the
+    # most free slots less this machine's claims not yet running there (_inflight), then the most test
+    # workers it would get there (workers_why); ties keep the spread order above.
+    probed = _probe_all([(host, beside) for _, _, host, why, _, _, beside in gated if not why])
+    cands = []
+    for i, (alias, machine, host, why, usable, dev, beside) in enumerate(gated):
+        free, note, size = 0, "", (0, "")
         if not why:
-            free, why, note = probe(host, beside)
+            free, why, note = probed[host]
             if why.startswith(DEVICE_WHY):
                 _note_skip(host, why, p.name)
             if note.startswith(DEVICE_WHY):
                 dev, note = dev or note, ""
+            if not why:
+                size = _size(cfg, host)
         dev = dev[len(DEVICE_WHY):] if dev.startswith(DEVICE_WHY) else dev
+        cands.append((alias, machine, host, why, usable, dev, free, note, size, i))
+    first = [c for c in cands if not c[3]]
+    # The hosts that cannot take it go first, only to be told as skipped; then the free ones, most free first.
+    order = [c for c in cands if c[3]] + sorted(first, key=lambda c: (-(c[6] - _inflight(c[2])), -c[8][0], c[9]))
+    for alias, machine, host, why, usable, dev, free, note, size, _ in order:
         if not why and (got := _claim(host, free, {**rec, "host": host,
                                                    **({"beside": dev[:300]} if dev else {})})) is not None:
             got.lock = _hold(p, cfg, machine, what)
@@ -1107,19 +1480,20 @@ def pick(p, cfg: dict, tell, what: str = "", off: str = "", why_here: str = "") 
                 skipped.append(f"{alias} (busy: its lock was taken just now)")
                 LAST_BUSY.append(alias)
                 continue
-            cores, load = _READ.pop(host, (0, None))
-            from . import testslots
-            top = testslots.sizes(cfg, cores) if cores > 0 else None   # one run's limit, sized to that host
-            got.workers = workers(cores, load, max(0, _ours(host) - 1), top[1] if top else 0)
+            got.workers, sized = size
+            got.note({**rec, "host": host, **({"beside": dev[:300]} if dev else {}),
+                      **({"workers": got.workers} if got.workers else {})})   # its cores, for used_share
             note_here(p.name, "")   # this run is on a spill host now: no reason to show it here
+            more = [c[0] for c in first if c[0] != alias]
             tell(f"spilling to {alias}: "
                  + (why_here or f"the slots here stayed busy for {after_s(cfg):g} s")
                  + f" ({_source(cfg, alias)}); the checks run there on a copy of the commit"
-                 + (f" with {got.workers} test worker(s), its idle cores (load {load:g} of {cores})"
-                    if got.workers else "")
+                 + (f" with {sized}" if sized else "")
+                 + (f"; the most free of {len(more) + 1} usable spill hosts" if more else "")
                  + (f"; {note}, so its device locks alone decided" if note else "")
                  + (f"; beside a device job (checks.{BESIDE_KEY} lists it): {dev}" if dev else "")
                  + (f"; skipped: {'; '.join(skipped)}" if skipped else ""))
+            note_limit(p.name, f"spill host {alias}: {sized}", what)
             _note_pick(p.name, alias, skipped)
             return got
         if usable and not why.startswith(_OUT_OF_REACH):
@@ -1173,15 +1547,32 @@ def _alive(pid: Any) -> bool:
     return pid_state(pid) != DEAD
 
 
+def _held(path: Path) -> bool:
+    """Whether a run still holds claim file `path` (its flock, _claim). A record a killed run left (a crash or a
+    reboot: its flock went with it) is no claim, even when its pid was reused or cannot be judged; such
+    records counted as this machine's runs there shrank a spilled run to one test worker (workers)."""
+    try:
+        with open(path) as f:
+            try:
+                fcntl.flock(f, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            except OSError:
+                return True
+            fcntl.flock(f, fcntl.LOCK_UN)
+            return False
+    except OSError:
+        return False
+
+
 def holders(project_name: str | None = None) -> list[dict]:
-    """The live claims on spill hosts (of `project_name`'s runs when given). Read only."""
+    """The live claims on spill hosts (of `project_name`'s runs when given): a held claim file (_held) whose pid
+    is not known dead. Read only."""
     out = []
     for f in sorted(claim_dir().glob("*.json")) if claim_dir().is_dir() else []:
         try:
             r = json.loads(f.read_text() or "{}")
         except (OSError, ValueError):
             continue
-        if isinstance(r, dict) and r.get("host") and _alive(r.get("pid")) \
+        if isinstance(r, dict) and r.get("host") and _alive(r.get("pid")) and _held(f) \
                 and (project_name is None or r.get("project") == project_name):
             out.append(r)
     return out
@@ -1226,6 +1617,47 @@ def note_here(project_name: str, why: str, what: str = "") -> None:
                                              "at": time.time()}), sync=False)
     except OSError:
         pass
+
+
+def limit_dir() -> Path:
+    from . import checkcap
+    return checkcap.slot_dir() / "limits"
+
+
+def note_limit(project_name: str, line: str, what: str = "") -> None:
+    """Record the limit that slows or holds this process's checks run now (its name, value and setting, as its
+    checks log says it): limit_lines shows it in `ttp status` and the web app's checks view while the process
+    lives; "" clears it. Records of dead processes go at each write. Never raises."""
+    d = limit_dir()
+    try:
+        for g in d.glob("*.json") if d.is_dir() else []:
+            if g.stem != str(os.getpid()) and g.stem.isdigit() and not _alive(int(g.stem)):
+                g.unlink(missing_ok=True)
+        f = d / f"{os.getpid()}.json"
+        if not line:
+            f.unlink(missing_ok=True)
+            return
+        d.mkdir(parents=True, exist_ok=True)
+        from . import project
+        project.durable_write(f, json.dumps({"project": project_name, "task": os.environ.get("TTP_TASK") or "",
+                                             "pid": os.getpid(), "why": line[:400], "what": what[:200],
+                                             "at": time.time()}), sync=False)
+    except OSError:
+        pass
+
+
+def limit_lines(project_name: str) -> list[str]:
+    """`ttp status` and `ttp checks status` lines: the limit each live checks run of `project_name` is under."""
+    out = []
+    for f in sorted(limit_dir().glob("*.json")) if limit_dir().is_dir() else []:
+        try:
+            r = json.loads(f.read_text() or "{}")
+        except (OSError, ValueError):
+            continue
+        if isinstance(r, dict) and r.get("project") == project_name and r.get("why") and _alive(r.get("pid")):
+            who = f"task #{r['task']}" if r.get("task") else f"pid {r.get('pid')}"
+            out.append(f"checks of {who} limited: {r['why']}")
+    return out
 
 
 def here_records(project_name: str) -> list[dict]:
@@ -1277,3 +1709,171 @@ def _unspilled(c: Any, was: Any) -> Any:
     if getattr(c, "spilled", False):
         c.was = was
     return c
+
+
+# Quarantine of a spill host whose own environment fails runs (#2226): model-free, per project.
+STRIKES_KV = "checks_spill_strikes"   # project state: each spill host's strikes, recent spilled failures, quarantines
+QUARANTINE_KEY = "spill_quarantine_after"   # checks.spill_quarantine_after: strikes in a row that take a host off
+QUARANTINE_AFTER = 3
+QUARANTINE_MAX_S = 6 * 3600   # a quarantine's end: its ledger entry's auto-undo (`ttp checks --spill-back`) runs then
+CONFIG_WINDOW_S = 3600   # one failure on CONFIG_FAULT_HOSTS hosts within this, no spilled pass between: a config fault
+CONFIG_FAULT_HOSTS = 2
+FAILS_KEPT = 100
+
+
+def quarantine_after_of(v: Any) -> int:
+    """checks.spill_quarantine_after as set: a whole number from 1, else ValueError."""
+    try:
+        n = int(str(v).strip())
+    except ValueError:
+        raise ValueError("checks.spill_quarantine_after is a whole number of strikes, 1 or more") from None
+    if n < 1 or isinstance(v, bool) or isinstance(v, float) and v != n:
+        raise ValueError("checks.spill_quarantine_after is a whole number of strikes, 1 or more")
+    return n
+
+
+def quarantine_after(cfg: dict | None) -> int:
+    """checks.spill_quarantine_after; unset or malformed: QUARANTINE_AFTER."""
+    checks = (cfg or {}).get("checks")
+    v = checks.get(QUARANTINE_KEY) if isinstance(checks, dict) else None
+    try:
+        return quarantine_after_of(v) if v is not None else QUARANTINE_AFTER
+    except ValueError:
+        return QUARANTINE_AFTER
+
+
+def _strikes(db) -> dict:
+    doc = db.kv(STRIKES_KV, {}) or {}
+    doc = doc if isinstance(doc, dict) else {}
+    doc["hosts"] = {k: v for k, v in (doc.get("hosts") or {}).items() if isinstance(v, dict)} \
+        if isinstance(doc.get("hosts"), dict) else {}
+    return doc
+
+
+def _event(db, now: float, fp: str, severity: str, text: str) -> None:
+    db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status) VALUES(?,?,?,?,?,?,?)",
+         (now, "checks", "observation", fp, severity, text, "queued"))
+
+
+def strike_fail(p, host: str, head: str, sig: str, now: float | None = None) -> None:
+    """A spilled run of `head` failed on `host` (no host fault, no timeout) with failure signature `sig`
+    (remotecheck.fail_sig): kept until `head` passes elsewhere (strike_settle). Never raises."""
+    now = time.time() if now is None else now
+    try:
+        with p.db.tx():
+            doc = _strikes(p.db)
+            doc["fails"] = [*(f for f in doc.get("fails") or [] if isinstance(f, dict)),
+                            {"host": host, "head": head, "sig": (sig or "")[:200], "at": now}][-FAILS_KEPT:]
+            p.db.set_kv(STRIKES_KV, doc)
+    except Exception:   # a strike never stops the rerun
+        pass
+
+
+def strike_settle(p, cfg: dict | None, head: str, passed_on: str = "", now: float | None = None) -> list[str]:
+    """`head` passed (on spill host `passed_on`, else here). `passed_on`'s strikes reset. Each spill host whose
+    run of `head` failed (strike_fail) takes a strike, unless that failure's signature hit CONFIG_FAULT_HOSTS
+    hosts within CONFIG_WINDOW_S with no spilled pass between: a project-wide config fault (one incident, no
+    strike, those hosts' strikes reset); a bare `exit <rc>` signature never matches (remotecheck.shared_sig). A host at quarantine_after strikes in a row is quarantined until
+    QUARANTINE_MAX_S (pick skips it), with one event and a machine ledger entry whose auto-undo lifts it.
+    Returns the hosts quarantined now. Never raises."""
+    now = time.time() if now is None else now
+    took, after = [], quarantine_after(cfg)
+    try:
+        with p.db.tx():
+            doc = _strikes(p.db)
+            hosts = doc.setdefault("hosts", {})
+            if passed_on:
+                hosts.setdefault(passed_on, {})["n"] = 0
+                doc["pass_at"] = now
+            fails = [f for f in doc.get("fails") or [] if isinstance(f, dict) and f.get("host")]
+            since = max(now - CONFIG_WINDOW_S, float(doc.get("pass_at") or 0))
+            seen = {k: v for k, v in (doc.get("incidents") or {}).items() if now - float(v or 0) < CONFIG_WINDOW_S}
+            for f in fails:
+                if f.get("head") != head or f.get("settled"):
+                    continue
+                f["settled"] = now
+                if f["host"] == passed_on:   # failed, then passed on the same host: no strike either way
+                    continue
+                sig = str(f.get("sig") or "")
+                same = {g["host"] for g in fails if g.get("sig") == sig and float(g.get("at") or 0) >= since}
+                if remotecheck.shared_sig(sig) and len(same) >= CONFIG_FAULT_HOSTS:
+                    for h in same:
+                        hosts.setdefault(h, {})["n"] = 0
+                    # One incident, one event: env_event's fingerprint (a spill env fault already told for this
+                    # checks config is not told again).
+                    fp = f"checkspill:env:{_env_key(cfg)}"
+                    if sig not in seen and not p.db.q("SELECT 1 FROM events WHERE fingerprint=? LIMIT 1", (fp,)):
+                        seen[sig] = now
+                        _event(p.db, now, fp, "high",
+                               f"Spill config fault: spilled checks failed the same way on {len(same)} spill hosts "
+                               f"({', '.join(sorted(same))}: {sig or 'no error line'}) and passed on this machine, "
+                               "so the fault is the project's spill setup (checks.spill_wrap_cmd, its env), not the "
+                               "hosts: no host is quarantined. Fix the setting; the reruns here keep the verdicts right.")
+                    continue
+                h = hosts.setdefault(f["host"], {})
+                h["n"] = int(h.get("n") or 0) + 1
+                if h["n"] >= after and float((h.get("off") or {}).get("until") or 0) <= now:
+                    h["off"] = {"since": now, "until": now + QUARANTINE_MAX_S, "n": h["n"], "sig": sig}
+                    took.append(f["host"])
+                    _event(p.db, now, f"spill-quarantine:{f['host']}:{now:.0f}", "normal",
+                           f"Spill host {f['host']} quarantined: {h['n']} spilled runs in a row failed there and "
+                           f"passed elsewhere (last: {sig or 'no error line'}); its checks run elsewhere until "
+                           f"`ttp checks --spill-back {f['host']}` (its machine ledger entry's auto-undo).")
+            doc.update(fails=fails[-FAILS_KEPT:], incidents=seen)
+            p.db.set_kv(STRIKES_KV, doc)
+    except Exception:
+        return []
+    from . import machine_ledger
+    for host in took:   # the ledger's file lock, outside the db transaction
+        try:
+            c = machine_ledger.add_change(
+                host, f"spill host quarantined for {p.name}'s checks: its spilled runs fail where they pass "
+                      "elsewhere", f"ttp checks --spill-back {host}", p.name, expires=now + QUARANTINE_MAX_S,
+                auto_undo=True, queue=p.state, extra={"kind": "spill_quarantine"})
+            with p.db.tx():
+                doc = _strikes(p.db)
+                if (off := doc["hosts"].get(host, {}).get("off")) is not None:
+                    off["change"] = c.get("id")
+                    p.db.set_kv(STRIKES_KV, doc)
+        except Exception:   # not in the machines list, the ledger unwritable: the quarantine's end still holds
+            pass
+    return took
+
+
+def quarantined(p, alias: str, now: float | None = None) -> str:
+    """Why `alias` is quarantined for project `p`'s checks ("" when it is not)."""
+    from . import timefmt
+    now = time.time() if now is None else now
+    try:
+        off = _strikes(p.db)["hosts"].get(alias, {}).get("off") or {}
+        if float(off.get("until") or 0) <= now:
+            return ""
+    except Exception:
+        return ""
+    return (f"quarantined: {off.get('n')} spilled runs in a row failed there and passed elsewhere; "
+            f"back with `ttp checks --spill-back {alias}`, by itself at {timefmt.clock(now=float(off['until']))}")
+
+
+def lift(p, alias: str, now: float | None = None) -> bool:
+    """`ttp checks --spill-back <alias>`: end `alias`'s quarantine (one event, its ledger entry closed) and its
+    strikes. True when it was quarantined. Safe to run twice."""
+    now = time.time() if now is None else now
+    with p.db.tx():
+        doc = _strikes(p.db)
+        h = doc["hosts"].get(alias)
+        off = h.pop("off", None) if isinstance(h, dict) else None
+        if not isinstance(h, dict):
+            return False
+        off = off if isinstance(off, dict) else None
+        h["n"] = 0
+        p.db.set_kv(STRIKES_KV, doc)
+        if off:
+            _event(p.db, now, f"spill-back:{alias}:{now:.0f}", "normal",
+                   f"Spill host {alias} is back in {p.name}'s spill pool (its quarantine ended).")
+    if off and off.get("change"):
+        from . import machine_ledger
+        try:
+            machine_ledger.close_change(int(off["change"]), "spill host back", p.name, now, queue=p.state)
+        except (ValueError, OSError):   # closed already (by hand, or by the auto-undo running this)
+            pass
+    return bool(off)

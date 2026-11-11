@@ -304,6 +304,16 @@ def test_runs_git_push_refuses_a_leak_in_a_message_an_added_line_or_a_tag_messag
     assert hook.git_push_bypass([["/usr/bin/git", "push", "origin", "work"]]) is None
 
 
+def test_tests_run_outside_the_role_of_the_run_running_them(env, tmp_path, monkeypatch):
+    """Suites run inside a live run (every run sets TTP_ROLE), the coordinator's too: its role never reaches
+    a test, or the harness git wrapper first on PATH refuses every push a test makes (coordtools)."""
+    assert not {"TTP_ROLE", "TTP_COORD_FULL_TOOLS", "TTP_TASK"} & set(os.environ)
+    p, repo, push = _push_run(env, tmp_path, monkeypatch)
+    _git_out(repo, "checkout", "-q", "-b", "clean")
+    _commit(repo, "a.txt", "the build passed\n")
+    assert push("origin", "clean").returncode == 0 and "refs/heads/clean" in _remote_refs(repo)
+
+
 def test_runs_git_push_passes_clean_and_already_pushed_commits_and_keeps_refusing_a_removed_leak(
         env, tmp_path, monkeypatch, capsys):
     p, repo, push = _push_run(env, tmp_path, monkeypatch)
@@ -321,9 +331,11 @@ def test_runs_git_push_passes_clean_and_already_pushed_commits_and_keeps_refusin
     # new name, or a clean commit on top of it, passes.
     _git_out(repo, "checkout", "-q", "-b", "old", "main")
     _commit(repo, "old.txt", f"{_OUT_SHAPE}\n")
-    # Outside a run: no TTP_TASK, so a harness git wrapper first on PATH (a run host) does not scan it.
-    subprocess.run(["git", "-C", str(repo), "push", "-q", "--no-verify", "origin", "old"], check=True,
-                   capture_output=True, env={k: v for k, v in os.environ.items() if k != "TTP_TASK"})
+    # Outside a run: no TTP_TASK, TTP_ROLE or TTP_COORD_FULL_TOOLS, so a harness git wrapper first on PATH
+    # (a worker's or coordinator's run host) does not scan it.
+    outside = {k: v for k, v in os.environ.items() if k not in ("TTP_TASK", "TTP_ROLE", "TTP_COORD_FULL_TOOLS")}
+    subprocess.run(["git", "-C", str(repo), "push", "-q", "--no-verify", "origin", "old"], env=outside,
+                   capture_output=True, text=True, check=True)
     assert push("origin", "old:refs/heads/copy").returncode == 0
     _commit(repo, "new.txt", "clean\n")
     out = push("origin", "old")
@@ -389,6 +401,82 @@ def test_runs_git_push_scans_a_root_commit_and_the_objects_a_replace_ref_hides(e
     out = push("origin", "hidden")
     assert out.returncode != 0 and "(h.txt)" in out.stderr and "stored secret" in out.stderr, out.stderr
     assert "refs/heads/fresh" not in _remote_refs(repo) and "refs/heads/hidden" not in _remote_refs(repo)
+
+
+def test_push_scan_in_a_partial_clone_looks_up_without_lazy_fetches_and_prefetches_the_sent_blobs(
+        env, tmp_path, monkeypatch):
+    """In a blob:none partial clone, the scan's object lookups (the remote's advertised objects, each
+    sent object's type) set GIT_NO_LAZY_FETCH, so missing objects are not fetched one by one past the
+    time limit; the blobs git log -p diffs over the sent range are fetched in one batch before it runs,
+    and a leak in them is still refused."""
+    from ttp import outscan
+    p = _outscan_project(env, monkeypatch)
+    srv, clone = tmp_path / "pc-server", tmp_path / "pc-clone"
+    subprocess.run(["git", "init", "-q", "-b", "main", str(srv)], check=True)
+    for k, v in (("user.name", "Test"), ("user.email", "test@example.com"), ("commit.gpgsign", "false"),
+                 ("uploadpack.allowFilter", "true"), ("uploadpack.allowAnySHA1InWant", "true")):
+        _git_out(srv, "config", k, v)
+    _commit(srv, "keep.txt", "kept\n")
+    _commit(srv, "f.txt", "one\n")
+    subprocess.run(["git", "clone", "-q", "--filter=blob:none", "--no-checkout", f"file://{srv}", str(clone)],
+                   check=True, capture_output=True)
+    base = _git_out(clone, "rev-parse", "HEAD")
+    old_blob, keep_blob = (_git_out(clone, "rev-parse", f"HEAD:{f}") for f in ("f.txt", "keep.txt"))
+
+    def missing():
+        out = _git_out(clone, "rev-list", "--objects", "--missing=print", base)
+        return {line[1:] for line in out.splitlines() if line.startswith("?")}
+
+    def sent(text, replaced=None):
+        replaced = replaced or old_blob
+        new_blob = subprocess.run(["git", "-C", str(clone), "hash-object", "-w", "--stdin"], input=text,
+                                  capture_output=True, text=True, check=True).stdout.strip()
+        # The tree object written by hand: read-tree and mktree would fetch every missing blob it names
+        raw = b"".join(f"{mode} {name}\0".encode() + bytes.fromhex(new_blob if sha == replaced else sha)
+                       for mode, _, sha, name in (line.split() for line in
+                                                  _git_out(clone, "ls-tree", base).splitlines()))
+        tree = subprocess.run(["git", "-C", str(clone), "hash-object", "-t", "tree", "-w", "--stdin"], input=raw,
+                              check=True, capture_output=True).stdout.decode().strip()
+        commit = subprocess.run(["git", "-C", str(clone), "-c", "user.name=T", "-c", "user.email=t@example.com",
+                                 "commit-tree", tree, "-p", base, "-m", "edit f"], check=True,
+                                capture_output=True, text=True).stdout.strip()
+        return [f"refs/heads/w {commit} refs/heads/w {'0' * 40}"]
+
+    assert old_blob in missing()
+    real_run, real_popen, seen = subprocess.run, subprocess.Popen, {"lookups": [], "log_missing": [], "fetches": 0}
+
+    def run(cmd, *a, **kw):
+        if cmd[:1] == ["git"] and ("cat-file" in cmd or "ls-remote" in cmd):
+            seen["lookups"].append((cmd[1], (kw.get("env") or {}).get("GIT_NO_LAZY_FETCH")))
+        seen["fetches"] += cmd[:1] == ["git"] and "fetch" in cmd
+        return real_run(cmd, *a, **kw)
+
+    def popen(cmd, *a, **kw):
+        if cmd[:2] == ["git", "log"] and "-p" in cmd:
+            seen["log_missing"].append(old_blob in missing())
+        return real_popen(cmd, *a, **kw)
+    monkeypatch.setattr(outscan.subprocess, "run", run)
+    monkeypatch.setattr(outscan.subprocess, "Popen", popen)
+    monkeypatch.chdir(clone)
+    why = outscan.push_problem(sent(f"token {_OUT_SHAPE}\n"), str(srv), p=p)
+    assert why and "GitHub token shape" in why and "(f.txt)" in why and _OUT_SHAPE not in why, why
+    assert seen["log_missing"] == [False], seen   # fetched before git log ran, not by it
+    assert seen["lookups"] and all(v == "1" for _, v in seen["lookups"]), seen["lookups"]
+    assert keep_blob in missing()   # only what the diff reads, not the whole tree
+    assert seen["fetches"] == 1 and outscan.push_problem(sent("clean\n"), str(srv), p=p) is None
+    assert seen["fetches"] == 1   # nothing left to fetch
+    # A remote name shaped like an option is never passed to git fetch.
+    _git_out(clone, "config", "remote.--upload-pack=false.promisor", "true")
+    for key in ("promisor", "partialclonefilter"):
+        _git_out(clone, "config", "--unset", f"remote.origin.{key}")
+    with pytest.raises(ValueError):   # keep.txt's old blob stays missing, so git log cannot read the diff
+        outscan.push_problem(sent("clean\n", replaced=keep_blob), str(srv), p=p)
+    assert seen["fetches"] == 1
+    # Outside a partial clone nothing is fetched and the scan reads as before.
+    _git_out(clone, "config", "--unset", "remote.--upload-pack=false.promisor")
+    assert outscan.push_problem(sent("clean\n"), str(srv), p=p) is None
+    assert "stored secret" in outscan.push_problem(sent(f"key {_OUT_SECRET}\n"), str(srv), p=p)
+    assert seen["fetches"] == 1
 
 
 def test_runs_git_push_refuses_a_ref_to_a_blob_or_a_tree(env, tmp_path, monkeypatch):

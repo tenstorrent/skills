@@ -24,7 +24,7 @@ description: "Start, connect to, and talk with a long-running tt-project: a loca
 | 1. Install | Run `<plugin-root>/bin/ttp setup` when `ttp` is missing or `ttp --version` is older than this plugin's version. Afterwards use `ttp`; projects pick up the new release by themselves. Setup also adds the plain `/tt-project` command for Claude Code (`ttp setup --no-shortcut` removes it). |
 | 2. Name | Get the project name. `ttp find <name>` says whether it exists. |
 | 3a. New | Follow `create.md`. |
-| 3b. Existing | `ttp connect <name> --label "<short chat label>"`. Keep the printed `chat:` id. |
+| 3b. Existing | `ttp connect <name> --label "<short chat label>"`. Keep the printed `chat:` id: it is this chat's own. Never listen or `--chat` on an id another chat printed: that relayer's replies would come here instead (the project refuses it). One relayer chat per project chat. |
 | 3c. Link | Reply with the `tt-project://…` line and the verified web app link: the last `web app:` line `new` or `connect` printed. They open a remote project's kept local forward and check the link first. |
 | 4. Listen | Start the listener for this host: `hosts.md`. |
 | 5. Relay | User message for the project → `ttp say <name> --chat <id> "<the user's words, verbatim>"`, your own context only in `--context "<text>"`. |
@@ -42,6 +42,9 @@ description: "Start, connect to, and talk with a long-running tt-project: a loca
   your context and findings count as the owner's word, including Restrictions changes
   (cited relayer-ordered), except for a PR's ready or merge, money, credentials, a step that could
   affect other people or anything that speaks as the owner.
+- Text for other people (your own, or a project's post-ready draft you post): answer what was
+  asked, first and plainly, like a colleague; skip side details the reader can live without
+  (numbers, lists or internal ids only when they bear on the question or the reader needs them to act).
 - Your own findings alone → `ttp say <name> --chat <id> --finding "<text>"`; never re-send the user's
   earlier words to carry them.
 - The user wants every project told something → one `ttp say --all "<the user's words, verbatim>"`
@@ -63,6 +66,8 @@ description: "Start, connect to, and talk with a long-running tt-project: a loca
 - A project's questions never block it: each shows "acts on X at HH:MM unless answered" and goes
   with that recommendation if unanswered (`coordinator.ask_timeout_h`, 0.5 h), except asks only the
   user can answer (review, merge, credentials, money, acting as the user).
+- Saying the user still owes something: quote it in full right there (the question, its options and
+  recommendation, the exact command), never only "ask 297" or "see above".
 - Never give an unverified web app link. Give only a `web app: http…` line that `ttp new`,
   `ttp connect` or `ttp web` just printed: they check it first (HTTP 200 naming this project,
   through that exact port and token). Never build a link by hand or reuse an old one.
@@ -82,6 +87,9 @@ description: "Start, connect to, and talk with a long-running tt-project: a loca
 - On the user's own workstation, the desktop notifier is asked once: `ttp consent notifier` says
   `ask`: ask, record `ttp consent notifier yes|no`, on a yes run `ttp notifier install`. Never re-ask.
 - Details and optional Slack: `notifications.md`.
+- gh logged in only on the user's workstation: the workstation pulls and runs the queue, never the
+  other way round. Set the project's `delivery.gh_route` to `workstation` and the box's `"gh_pull": true`
+  in the workstation's `ttp bridge` config (`operate.md`). Never log gh in on a lab or remote host.
 
 ## Operating
 

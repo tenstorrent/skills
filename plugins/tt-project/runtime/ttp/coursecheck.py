@@ -31,6 +31,9 @@ so an idle project's digest does not grow. Each reuses a signal the harness alre
   done `harness` or `code` task citing it (not the fix task, not a schedule's own run), no recorded later
   fix. Its line stays open until one of those exists. Under the `recurring` key.
 
+- old_orders: a blocked task, a deferred task or an open ask citing an old user order whose reason is over,
+  unknown or unchecked (oldorders.py, its last scan): the order may be read literally after its cause ended.
+
 `coordinator.course_check` keys of the same names set the thresholds (0 turns one off)."""
 from __future__ import annotations
 
@@ -45,7 +48,7 @@ WINDOW_S = 3 * 86400        # wait_stale events and rule-citing asks this recent
 RACE_S = 2 * 86400          # push markers this recent
 RULE_WORDS = 3
 MAX_MARKERS = 400           # newest push markers read; each is a small JSON file
-DEFAULTS = {"missed_deadlines": 2, "same_wait": 2, "self_races": 2, "rule_clash": 1, "recurring": 1}
+DEFAULTS = {"missed_deadlines": 2, "same_wait": 2, "self_races": 2, "rule_clash": 1, "recurring": 1, "old_orders": 1}
 _RULE = re.compile(r"\b(restrictions?|charter|polic(?:y|ies)|rules?|forbid\w*|prohibit\w*|not allowed)\b", re.I)
 
 
@@ -304,6 +307,13 @@ def _relinked(db: DB, fix: str) -> bool:
     return bool(task and task.get("status") == "cancelled" and correction.fixed_by(db, int(tid)))
 
 
+def old_order_holds(db: DB, on: float) -> list[dict]:
+    if not on:
+        return []
+    from . import oldorders
+    return oldorders.held(db)
+
+
 def lines(db: DB, cfg: dict | None, pushes: Path | None = None, now: float | None = None,
           warn=None) -> tuple[list[str], str]:
     """Course check lines (no header; [] when none fires) and their identity for collapsing. A detector
@@ -364,4 +374,11 @@ def lines(db: DB, cfg: dict | None, pushes: Path | None = None, now: float | Non
                    f"followed: a command schedule, or a `harness` task citing correction #{r['msg']} that adds a "
                    "detector with a test")
         ident.append(f"report_only:{r['msg']}")
+    for r in safe(old_order_holds, db, s["old_orders"]):
+        for h in r["held"]:
+            out.append(f"- old order holds work: {h} cites {r['what']} (user msg #{', #'.join(map(str, r['msgs']))}, "
+                       f"{int(r['age_s'] // 3600)} h old; reason {r['state']}"
+                       f"{': ' + r['reason'] if r['reason'] else ''}) | re-read it by intent: if its reason is gone, "
+                       "retire it (`memory_forget` or the obligation, with a `why`) and lift the hold this turn")
+            ident.append(f"old_order:{r['key']}:{h}")
     return out[:MAX_LINES], "\n".join(ident)
