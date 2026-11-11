@@ -77,6 +77,7 @@ CLEARED_TEXT = {
     "push_not_landing": "A push batch landed on the push branch again.",
     "push_scope": "The changes held for the token scope `{arg}` pushed or left the push queue.",
     "push_tip_failing": "The push branch tip passes its checks again, or it moved: push batches go on as usual.",
+    "push_target_unreachable": "The push target's remote answers again, or delivery.push_branch changed: push batches go on.",
     "push_script_torn": "The push check held for a script rewritten in place passes again, or a batch pushed.",
     "push_setup_fault": "The push check held for failing before any test ran passes again, or a batch pushed.",
     "heal": "Heal check {arg} passes again.",
@@ -296,6 +297,8 @@ def holds(db: DB, key: str, since: float, now: float) -> bool:
     if kind in ("push_script_torn", "push_setup_fault"):   # pushq._held_told keeps each check's count until it
         held = (db.kv("push_queue") or {}).get("torn" if kind == "push_script_torn" else "setup") or {}   # passes or a batch pushes
         return any(isinstance(r, dict) and r.get("key") == key and r.get("alerted") for r in held.values())
+    if key == "push_target_unreachable":   # pushq keeps it until the remote answers or the setting changes
+        return bool(((db.kv("push_queue") or {}).get("unreachable") or {}).get("alerted"))
     if key == "push_tip_failing":   # pushq keeps the failing tip until it passes or the branch moves
         return bool(((db.kv("push_queue") or {}).get("bad_tip") or {}).get("alerted"))
     if kind == "paused":   # the same project pause still lasts (projpause)
@@ -353,7 +356,7 @@ def active(db: DB, key: str, ts: float, now: float) -> bool:
 def _checkable(key: str) -> bool:
     return key.partition(":")[0] in ("auth", "limit", "budget", "relayed", "disk", "coordinator", "run-start",
                                          "schedule", "release-older", "integrity", "integrity-host", "pr-ready", "config",
-                                         "push_rejected", "after_push_failed", "push_queue_dying", "push_not_landing", "push_tip_failing", "push_script_torn", "push_setup_fault",
+                                         "push_rejected", "after_push_failed", "push_queue_dying", "push_not_landing", "push_tip_failing", "push_target_unreachable", "push_script_torn", "push_setup_fault",
                                          "push_scope", "heal",
                                          "heal-hold", "machine", "machine-change", "network", "deploy", "deploy-behind", "deploy-pending", "redeploy", "daemon-hang", "paused", "fleethold",
                                          "coord-budget", "account-mismatch", "linger-off", "tick-step", "pause-gone", "notifier", "chat-silent", "user-step", "slurm-paused", "gh-auth", "ssh-agent")

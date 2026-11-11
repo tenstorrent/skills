@@ -3965,7 +3965,7 @@ def test_no_batch_starts_while_something_holds_the_push(env, monkeypatch, blocke
         held = locks.try_take([s.p.state / "locks" / "push:run-123.0.lock"], "a detached ttp push")
     elif blocker == "backoff":
         s.p.db.set_kv(pushq.KV, {"backoff_until": now + 60})
-    elif blocker == "other target":
+    elif blocker == "other target":     # a target that has nothing of the old one's tip: diverged
         s.p.set_config("delivery.push_branch", "origin/other")
     else:
         s.p.set_config("delivery.push_allowed", False)
@@ -3976,7 +3976,7 @@ def test_no_batch_starts_while_something_holds_the_push(env, monkeypatch, blocke
     finally:
         if held:
             held.close()
-    if blocker == "other target":   # approvals for the old target go back to their reviews
+    if blocker == "other target":   # approvals for a diverged target go back to their reviews
         t = s.p.db.task(rid)
         assert t["status"] == "queued" and json.loads(t["result"])["woke"].startswith(
             "push target changed: approved for origin/proj, the target is now origin/other")
@@ -19933,3 +19933,149 @@ def test_kill_guard_names_push_stop_and_lets_it_through(tmp_path):
     from ttp import killguard
     assert "ttp push --stop <marker>" in killguard.ADVICE
     assert killguard.refusal(f"ttp push --stop {tmp_path}/state/pushes/t7-1.json", str(tmp_path), str(tmp_path)) is None
+
+
+def _relay_setup(env, monkeypatch):
+    """_push_setup plus a second bare repository, git remote `relay`, whose `proj` is at origin's tip,
+    and delivery.push_branch moved to relay/proj: a batch started for origin/proj is stale."""
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    relay = env["tmp"] / "relay.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(relay)], check=True)
+    _git_out(repo, "remote", "add", "relay", str(relay))
+    _git_out(repo, "push", "-q", "relay", "origin/proj:refs/heads/proj")
+    p.set_config("delivery.push_branch", "relay/proj")
+    return p, repo, origin, relay
+
+
+def test_target_from_setting_a_new_batch_takes_its_target_from_delivery_push_branch(env, monkeypatch):
+    """pushq.start writes delivery.push_branch as it is now into the marker and push_batches, not the
+    name its caller read earlier."""
+    from ttp import push, pushq
+    s = _pq(env, monkeypatch, push_batch_s=10 ** 6)
+    row = _pq_review(s)[1]
+    relay = env["tmp"] / "relay.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(relay)], check=True)
+    _git_out(s.repo, "remote", "add", "relay", str(relay))
+    s.p.set_config("delivery.push_branch", "relay/proj")
+    bid = pushq.start(s.p, s.p.db.q("SELECT * FROM push_queue WHERE id=?", (row,)), "origin/proj")
+    assert push._read(s.p.state / push.DETACHED / f"{bid}.json")["target"] == "relay/proj"
+    assert s.p.db.one("SELECT target FROM push_batches WHERE id=?", (bid,))["target"] == "relay/proj"
+
+
+@pytest.mark.parametrize("resumed", [False, True])
+def test_resume_rereads_target_a_stale_batch_stops_before_its_checks_and_hands_its_entries_back(env, monkeypatch,
+                                                                                                 resumed):
+    """A batch started for origin/proj, delivery.push_branch moved to relay/proj before it pushed, then
+    run again on its marker (or resuming a batch a reboot cut short): it re-reads the setting and stops
+    at once, before any check or push. Every entry goes back requeued, the outcome is `retargeted`
+    (not refused), and neither remote moves."""
+    from ttp import push
+    from ttp.project import write_json
+    p, repo, origin, relay = _relay_setup(env, monkeypatch)
+    before = _git_out(origin, "rev-parse", "proj")
+    head = _entry(repo, "e1", {"f1.txt": "1\n"})
+    marker = _batch_marker(p, [head])
+    if resumed:
+        write_json(marker, {**push._read(marker), "resumes": {"batch": "b0", "kept": [1], "left_out": [], "added": []}})
+    rc, m = _run_batch(p, marker, monkeypatch)
+    assert m["outcome"] == "retargeted" and _statuses(m) == ["requeued"], m
+    assert "relay/proj" in m["message"] and not m.get("checks", {}).get("runs"), m
+    assert _git_out(origin, "rev-parse", "proj") == before and _git_out(relay, "rev-parse", "proj") == before
+
+
+def test_landed_entry_drop_the_batch_on_the_new_target_drops_what_it_already_has(env, monkeypatch):
+    """After a stale batch hands its entries back, the next batch (its target from delivery.push_branch,
+    as pushq.start writes it) records an entry the new target already has as landed and pushes the rest."""
+    from ttp import push
+    from ttp.project import write_json
+    p, repo, origin, relay = _relay_setup(env, monkeypatch)
+    h1 = _entry(repo, "e1", {"f1.txt": "1\n"})
+    _git_out(repo, "push", "-q", "relay", f"{h1}:refs/heads/proj")
+    h2 = _entry(repo, "e2", {"f2.txt": "2\n"})
+    rc, m = _run_batch(p, _batch_marker(p, [h1, h2]), monkeypatch)
+    assert m["outcome"] == "retargeted" and _statuses(m) == ["requeued", "requeued"], m
+    marker = _batch_marker(p, [h1, h2], bid="b2")
+    write_json(marker, {**push._read(marker), "target": "/".join(push.target(p, repo))})
+    rc, m = _run_batch(p, marker, monkeypatch)
+    assert rc == 0 and _statuses(m) == ["landed", "pushed"], m
+    assert _git_out(relay, "show", "proj:f2.txt") == "2" and _git_out(relay, "merge-base", "--is-ancestor", h1, "proj") == ""
+
+
+@pytest.mark.parametrize("end", ["probe", "setting"])
+def test_unreachable_alarm_batches_that_cannot_reach_the_remote_alert_once_and_stop(env, monkeypatch, end):
+    """UNREACH_AFTER batches in a row that fail with 'cannot reach <remote>' raise one high alert naming
+    delivery.push_branch and the remote (not push_queue_dying), and schedule starts no more batches.
+    The hold ends when a bounded probe of the remote answers, or when delivery.push_branch changes."""
+    from ttp import alerts, pushq
+    s = _pq(env, monkeypatch)
+    _pq_plan(s, outcome="error", message="cannot reach origin: fatal: could not read from remote repository")
+    _pq_hand_off(env, s)
+    since = time.time()
+    for n in range(1, pushq.UNREACH_AFTER + 1):
+        _pq_batch(s)
+        _pq_tend(s)
+        assert s.p.db.kv(pushq.KV)["unreachable"]["n"] == n
+    sent = s.p.db.q("SELECT text, severity FROM messages WHERE kind='alert' AND ref=?", (pushq.UNREACH_ALERT,))
+    assert len(sent) == 1 and sent[0]["severity"] == "high", sent
+    assert "delivery.push_branch" in sent[0]["text"] and "`origin`" in sent[0]["text"], sent
+    assert not s.p.db.q("SELECT id FROM messages WHERE kind='alert' AND ref='push_queue_dying'")
+    s.p.db.x("UPDATE push_queue SET status='approved'")
+    st = s.p.db.kv(pushq.KV)
+    st.pop("backoff_until", None)
+    s.p.db.set_kv(pushq.KV, st)
+    assert pushq.schedule(s.p) is None and not s.p.db.q("SELECT id FROM push_queue WHERE status='batched'")
+    assert alerts.holds(s.p.db, pushq.UNREACH_ALERT, since, time.time())
+    if end == "probe":
+        _git_out(s.repo, "remote", "set-url", "origin", str(env["tmp"] / "missing.git"))
+        assert not pushq._reach_ok(s.p, "origin/proj", time.time() + 3600), "the remote still cannot be reached"
+        _git_out(s.repo, "remote", "set-url", "origin", str(s.origin))
+        assert pushq._reach_ok(s.p, "origin/proj", time.time() + 7200)
+    else:
+        s.p.set_config("delivery.push_branch", "origin/other")
+        pushq.schedule(s.p)
+    assert "unreachable" not in s.p.db.kv(pushq.KV)
+    assert not alerts.holds(s.p.db, pushq.UNREACH_ALERT, since, time.time())
+
+
+@pytest.mark.parametrize("relay_tip", ["same", "ahead", "diverged"])
+def test_retarget_keeps_the_review_approval_of_an_unchanged_head(env, monkeypatch, relay_tip):
+    """The live shape: a batch started for origin/proj, delivery.push_branch moved to relay/proj, the
+    batch stopped (`retargeted`) and its rows came back approved with no try counted. Where relay's tip
+    is origin's or has it, each approval moves to relay/proj with its head: the review is not run again
+    and the next batch takes it there. A diverged relay sends the review back."""
+    from ttp import push, pushq
+    s = _pq(env, monkeypatch, push_batch_s=0)
+    _pq_plan(s, outcome="retargeted", row="requeued", message="delivery.push_branch is relay/proj")
+    _pq_hand_off(env, s)
+    [row] = s.p.db.q("SELECT id FROM push_queue")
+    _pq_batch(s)
+    relay = env["tmp"] / "relay.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(relay)], check=True)
+    _git_out(s.repo, "remote", "add", "relay", str(relay))
+    if relay_tip == "diverged":
+        _git_out(s.repo, "checkout", "-q", "--orphan", "lone")
+        _commit(s.repo, "lone.txt", "lone\n")
+        _git_out(s.repo, "push", "-q", "relay", "lone:refs/heads/proj")
+    else:
+        _git_out(s.repo, "push", "-q", "relay", "origin/proj:refs/heads/proj")
+        if relay_tip == "ahead":
+            _commit(s.other, "theirs.txt", "theirs\n")
+            _git_out(s.other, "push", "-q", str(relay), "HEAD:proj")
+    s.p.set_config("delivery.push_branch", "relay/proj")
+    _pq_tend(s)
+    assert s.p.db.one("SELECT status, tries FROM push_queue WHERE id=?", (row["id"],)) == {"status": "approved", "tries": 0}
+    mark = _pq_mark(s.p)
+    _pq_plan(s, release=str(env["tmp"] / "never"))
+    bid = pushq.schedule(s.p)
+    if relay_tip == "diverged":
+        assert bid is None and s.p.db.task(s.review)["status"] == "queued", "a diverged target: the review runs again"
+        return
+    assert bid, _pq_events(s.p, mark)
+    assert s.p.db.one("SELECT status, target, batch FROM push_queue WHERE id=?", (row["id"],)) == {
+        "status": "batched", "target": "relay/proj", "batch": bid}
+    assert s.p.db.task(s.review)["status"] == "pushing", "the review does not run again"
+    assert [e["kind"] for e in _pq_events(s.p, mark) if e["kind"] in ("task_requeued", "push_retargeted")] == [
+        "push_retargeted"]
+    assert push._read(s.p.state / push.DETACHED / f"{bid}.json")["target"] == "relay/proj"
+    (env["tmp"] / "never").write_text("")
+    pushq._children[bid].wait(timeout=30)

@@ -1567,6 +1567,22 @@ class Batch:
 
     # the push phase
 
+    def _retargeted(self, now: str) -> str:
+        """delivery.push_branch is `now`, not the target this batch (or the batch a reboot cut short,
+        rerun on its marker) began with: it stops before another check or a push, and its rows go back
+        approved with no try counted (pushq.finalize). pushq.retarget then moves their approvals to the
+        new target and the next batch, started on it, lands them; nothing alarms per row."""
+        return self._all("requeued", "retargeted", keep=("landed",), message=f"delivery.push_branch is {now or '(none)'}, not "
+                                                   f"{self.target or '(none)'}: the batch stops and hands its "
+                                                   f"entries back for a batch on {now or 'the new target'}")
+
+    def _target_now(self) -> str:
+        """delivery.push_branch as remote/branch now, '' when it cannot be read."""
+        try:
+            return "/".join(push.target(self.p, self.repo))
+        except ValueError:
+            return ""
+
     def push_phase(self) -> str:
         """Steps 1-10; the outcome. Every entry has its result when this returns."""
         allowed = self.d.get("push_allowed")
@@ -1581,7 +1597,7 @@ class Batch:
         except ValueError as e:
             return self._all("refused", "refused", str(e))
         if not (self.remote and self.branch) or now != self.target:
-            return self._all("requeued", "refused", f"the push target is {now}, not {self.target or '(none)'}")
+            return self._retargeted(now)
         self.target_lock = push.take(self.p, self.remote, self.branch, 0, say=lambda _m: None,
                                      who=f"push batch {self.id}")
         if self.target_lock is None:
@@ -1601,6 +1617,8 @@ class Batch:
         while rnd < rounds:
             rnd += 1
             self.rounds += 1
+            if rnd > 1 and (aim := self._target_now()) and aim != self.target:
+                return self._retargeted(aim)    # changed while the last round ran: before its next checks
             self.steps.go("rebase")
             tip = push._fetch(self.repo, self.remote, self.branch)
             if not tip:

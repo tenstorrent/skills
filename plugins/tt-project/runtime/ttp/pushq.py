@@ -100,6 +100,11 @@ AUTH_RE = re.compile(r"could not read (?:Username|Password)|Authentication faile
 DYING_AFTER = 3                 # batches that die in a row before push_queue_dying is raised
 DEFAULT_LANDING_ALERT_H = 4     # delivery.push_landing_alert_h: approvals waiting this long with no landing alert (high)
 LANDING_ALERT = "push_not_landing"   # the keyed alert while nothing lands despite batches (alerts.holds)
+UNREACH_ALERT = "push_target_unreachable"   # the keyed alert while the target's remote cannot be reached (alerts.holds)
+UNREACH_AFTER = 3               # batches in a row that could not reach the target's remote before the queue stops and alerts
+UNREACH_PROBE_S = 1800          # ... then the remote is asked this often, model-free, instead of starting batches
+UNREACH_PROBE_TIMEOUT_S = 20    # ... each ask bounded, as the tick waits for it
+UNREACH_RE = re.compile(r"cannot (?:reach|fetch) ")   # a batch error that is the remote's (push.refusal, batch.push_phase)
 LANDED_OUTCOMES = ("pushed", "landed")   # batch outcomes that put the approvals on the push branch
 DEPLOY_ALERTED = "deploy_alerted"   # deploy.ALERTED: the last deploy alert, by commit
 RERUN_START_S = 900              # a receipt's rerun that has not taken it up in this long never started
@@ -898,17 +903,59 @@ def queue_off(p: Project, cfg: dict | None = None) -> int:
     return len(tasks)
 
 
+def _tip(p: Project, name: str, fetch: bool) -> str | None:
+    """The tip of target `name` (remote/branch) as its tracking ref has it, after a bounded fetch when
+    asked; None when it cannot be read."""
+    remote, _, branch = name.partition("/")
+    ref = f"refs/remotes/{remote}/{branch}"
+    try:
+        if fetch:
+            _git(p, "fetch", "-q", remote, f"+refs/heads/{branch}:{ref}", timeout=RECOVER_FETCH_S)
+        r = _git(p, "rev-parse", "-q", "--verify", f"{ref}^{{commit}}", timeout=RECOVER_FETCH_S)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else None
+
+
+def _follows(p: Project, old: str, name: str) -> bool:
+    """Whether target `name`'s tip has target `old`'s tip in it (or both are one commit): an approval
+    for `old` stands on `name`, as nothing it was reviewed against is missing there. The old target's
+    tip is read from its tracking ref only: it may be the remote that cannot be reached."""
+    was, now = _tip(p, old, False), _tip(p, name, True)
+    if not (was and now):
+        return False
+    try:
+        return was == now or _git(p, "merge-base", "--is-ancestor", was, now,
+                                  timeout=RECOVER_FETCH_S).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
 def retarget(p: Project, name: str) -> int:
-    """Approvals for another target (delivery.push_branch changed) send their reviews back."""
+    """Approvals for another target (delivery.push_branch changed). A target change is a delivery
+    route, not a code change: where the new target's tip has the old one's in it (or they are one
+    commit), the reviewed head is still the reviewed change there, so its approval moves to `name` and
+    its review does not run again; the batch runs the push checks on the new tip, where a pass carries
+    across by the usual rule. A diverged target sends the review back."""
     db = p.db
     rows = db.q("SELECT q.id, q.task, q.target FROM push_queue q JOIN tasks t ON t.id=q.task "
                 "WHERE q.status IN ('approved','held') AND t.status='pushing' AND q.target!=?", (name,))
     if not rows:
         return 0
+    olds = {r["target"]: _follows(p, r["target"], name) for r in rows}    # git before the transaction
+    now = time.time()
     with db.tx():
         for tid in dict.fromkeys(r["task"] for r in rows):
             task = db.task(tid)
             old = next(r["target"] for r in rows if r["task"] == tid)
+            if olds[old]:
+                ids = [r["id"] for r in rows if r["task"] == tid]
+                db.x(f"UPDATE push_queue SET target=?, updated=? WHERE id IN ({','.join('?' * len(ids))})",
+                     (name, now, *ids))
+                _event(db, task, "push_retargeted", f"#{tid}: push target changed from {old} to {name}, which has "
+                                                    f"{old}'s tip; the reviewed head is unchanged, so its approval "
+                                                    f"moves with it (no review rerun)", queued=False)
+                continue
             _cancel(db, [r["id"] for r in db.q("SELECT id FROM push_queue WHERE task=? AND status IN ('approved','held')",
                                                 (tid,))])
             woke = f"push target changed: approved for {old}, the target is now {name}"
@@ -1468,6 +1515,9 @@ def start(p: Project, rows: list[dict], name: str, now: float | None = None) -> 
              "repo": str(p.root), "target": name, "log": str(marker.with_suffix(".log")), "lock": str(lock_path),
              "entries": [{"id": r["id"], "task": r["task"], "branch": r["branch"], "head": r["head"],
                           "ref": f"{REF_PREFIX}{r['id']}"} for r in rows]}
+        if cur := target(p):
+            name = f"{cur[0]}/{cur[1]}"     # delivery.push_branch as it is now, whatever the caller read
+        m["target"] = name
         if bad := _known_bad(db, rows):
             m["bad_tip"] = bad
         if (st_bad := _state(db).get("bad_tip") or {}).get("tip") and st_bad.get("tried"):
@@ -1522,6 +1572,54 @@ class _Changed(Exception):
     """Rows left `approved` between due() and start(): nothing starts."""
 
 
+def _reached(db) -> None:
+    """The target's remote answered (or the target changed): its unreachable count and alert end."""
+    st = _state(db)
+    if st.pop("unreachable", None) is not None:
+        db.set_kv(KV, st)
+
+
+def _note_unreachable(st: dict, b: dict, m: dict, now: float) -> dict | None:
+    """Count a batch that failed because the target's remote could not be reached; the count (in
+    `st`), or None for any other end."""
+    msg, tgt = str(m.get("message") or ""), str(m.get("target") or b["target"] or "")
+    if m.get("outcome") != "error" or not UNREACH_RE.match(msg) or "/" not in tgt:
+        return None
+    un = st.get("unreachable") if (st.get("unreachable") or {}).get("target") == tgt else None
+    un = un or {"target": tgt, "remote": tgt.partition("/")[0], "n": 0, "since": now}
+    un.update(n=int(un.get("n") or 0) + 1, why=msg[:300], at=now, probe_at=now)
+    st["unreachable"] = un
+    return un
+
+
+def _reach_ok(p: Project, name: str, now: float | None = None) -> bool:
+    """False while UNREACH_AFTER batches in a row could not reach the remote of target `name`: no
+    batch starts, so the queue does not loop on a remote that is down or wrong. The remote is asked
+    (a bounded ls-remote) at most every UNREACH_PROBE_S; once it answers, the hold and its alert end."""
+    db = p.db
+    st = _state(db)
+    un = st.get("unreachable")
+    if not isinstance(un, dict) or un.get("target") != name or int(un.get("n") or 0) < UNREACH_AFTER:
+        return True
+    now = time.time() if now is None else now
+    if now - float(un.get("probe_at") or 0) < UNREACH_PROBE_S:
+        return False
+    un["probe_at"] = now
+    db.set_kv(KV, st)
+    remote, _, branch = name.partition("/")
+    try:
+        ok = subprocess.run(["git", "-C", str(p.root), "ls-remote", "--heads", remote, f"refs/heads/{branch}"],
+                            stdin=subprocess.DEVNULL, capture_output=True, timeout=UNREACH_PROBE_TIMEOUT_S,
+                            env={**os.environ, "GIT_TERMINAL_PROMPT": "0"}).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        ok = False
+    if ok:
+        _reached(db)
+        _event(db, None, "push_target_reachable", f"the push target {name} answers again; push batches go on",
+               queued=False)
+    return ok
+
+
 def _forget_moved_tip(p: Project, remote: str, branch: str) -> None:
     """Drop the failing tip once the branch has moved past it (as last fetched): that clears its alert."""
     db = p.db
@@ -1540,12 +1638,16 @@ def schedule(p: Project, cfg: dict | None = None, log: Callable[[str], None] = l
         return None
     if (_state(db).get("bad_tip") or {}).get("tip") and (tgt := target(p)):
         _forget_moved_tip(p, *tgt)
+    if isinstance(un := _state(db).get("unreachable"), dict) and un.get("target") != "/".join(target(p) or ()):
+        _reached(db)    # delivery.push_branch changed: the old remote's count and alert are over
     if not db.one("SELECT id FROM push_queue WHERE status='approved' LIMIT 1"):
         return None
     tgt = target(p)
     if not tgt:
         return None
     name = f"{tgt[0]}/{tgt[1]}"
+    if not _reach_ok(p, name):
+        return None
     if retarget(p, name):
         log(f"push queue: approvals for an old target sent back to their reviews (target now {name})")
     rows, why = due(p, cfg=cfg)
@@ -1699,12 +1801,29 @@ def _died_db(p: Project, b: dict, m: dict, alert: Callable, why: str, now: float
         st = _state(db)
         st["deaths"] = int(st.get("deaths") or 0) + 1
         st["backoff_until"] = now + min(BACKOFF_MAX_S, BACKOFF_STEP_S * tries)
+        un = _note_unreachable(st, b, m, now)
+        stop = bool(un and un["n"] >= UNREACH_AFTER)
+        tell = stop and not un.get("alerted")
+        if tell:
+            un["alerted"] = now
         db.set_kv(KV, st)
         _event(db, None, "push_batch_died",
                f"push batch {b['id']} {why}; {len(rows)} approval{'s' if len(rows) != 1 else ''} back in the queue, "
-               f"retried after {st['backoff_until'] - now:.0f} s", queued=queued, severity="high" if queued else "normal")
+               + (f"no batch starts until its remote answers (asked every {UNREACH_PROBE_S // 60} min)" if stop
+                  else f"retried after {st['backoff_until'] - now:.0f} s"),
+               queued=queued, severity="high" if queued else "normal")
     push._forget_lock(Path(b["marker"]))     # dead: nothing holds it; the next batch has its own
-    if st["deaths"] >= DYING_AFTER:
+    if tell:
+        setting = str(_delivery(p).get("push_branch") or "").strip() or "(unset)"
+        alert(UNREACH_ALERT, f"Push batches to {un['target']} failed {un['n']} times in a row because the remote "
+                             f"`{un['remote']}` cannot be reached ({un['why'][:200]}). delivery.push_branch is "
+                             f"`{setting}`. The push queue starts no more batches for it: it asks the remote every "
+                             f"{UNREACH_PROBE_S // 60} min without a model call and goes on once it answers or "
+                             f"delivery.push_branch changes. If the remote is wrong, the coordinator points "
+                             f"delivery.push_branch at one that can be reached.", severity="high")
+    elif stop:
+        pass    # one alarm for the remote: push_queue_dying would only repeat it
+    elif st["deaths"] >= DYING_AFTER:
         alert("push_queue_dying", f"The last {st['deaths']} push batches ended without finishing ({why}). The "
                                   f"approvals stay queued and are retried with a growing pause. Log: {m.get('log') or '?'}",
               severity="high")
@@ -2211,7 +2330,7 @@ def _apply(p: Project, b: dict, m: dict, alert: Callable, now: float) -> None:
         # In the transaction that finalizes the batch: a crash before it commits records them again.
         _resolve_upstream(p, shipped, version)
         if outcome in ("moved", "busy", "env_fault", "worker_loss", "script_torn", "setup_fault", "rejected", "nothing", "landed", "pushed",
-                       "tip_failed", "yielded") and back:
+                       "tip_failed", "yielded", "retargeted") and back:
             _event(db, None, "push_requeued", f"push batch {b['id']} ended {outcome}: {len(back)} approval"
                                               f"{'s' if len(back) != 1 else ''} back in the queue", queued=False)
     for key, text, sev in later:
@@ -2587,6 +2706,8 @@ def finalize(p: Project, cfg: dict | None = None, alert: Callable = lambda *a, *
                 m = _recover(p, b, marker, m, now_)
                 if m is None:
                     continue
+            if m.get("outcome") and (m.get("tip") or m["outcome"] in CLEAN_OUTCOMES):
+                _reached(db)            # the batch read the target: its remote answers
             if m.get("outcome") and m.get("outcome") != "error":
                 _apply(p, b, m, alert, now_)
             elif live:
@@ -2856,6 +2977,7 @@ OUTCOME_WORDS = {"pushed": "pushed", "landed": "already on the branch", "nothing
                  "busy": "another push held the branch", "rejected": "rejected by the remote", "refused": "refused",
                  "died": "ended before finishing", "rebooted": "cut short by a reboot", "error": "failed",
                  "yielded": "stopped for an urgent approval",
+                 "retargeted": "stopped: delivery.push_branch changed",
                  "script_torn": "held: a script outside the change was rewritten as its check ran",
                  "setup_fault": "held: a check failed before any test ran (setup or pool)"}
 AFTER_WORDS = {"ok": "deploy ok", "failed": "deploy failed", "timeout": "deploy timed out",
