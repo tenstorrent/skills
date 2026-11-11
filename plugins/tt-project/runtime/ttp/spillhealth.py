@@ -106,19 +106,28 @@ def probe(targets: list[tuple[str, list[str]]], now: float | None = None) -> Non
             project.durable_write(f, json.dumps({**check(host, wrap), "at": now_}))
 
 
-def targets(cfg: dict | None) -> list[tuple[str, list[str]]]:
+def targets(cfg: dict | None, p=None) -> list[tuple[str, list[str]]]:
+    """(host, wrap) for each spill host; given project `p`, only those checkspill.allowed lets it use (not
+    paused, held, retired, banned or missing from the machines list), so none of those is probed."""
     wrap = wrap_words(cfg)
-    return [(h, wrap) for h in checkspill.hosts(cfg)]
+    return [(h, wrap) for h in checkspill.hosts(cfg) if p is None or not checkspill.allowed(p, cfg or {}, h)]
 
 
 def apply(p, cfg: dict | None, now: float | None = None) -> list[str]:
     """Act on the shared results for project `p`: hosts it took out (quarantined) or brought back."""
     now = time.time() if now is None else now
-    res = {h: read(h, w) for h, w in targets(cfg)}
-    res = {h: r for h, r in res.items() if r.get("state") in ("ok", "fail") and now - float(r.get("at") or 0) < 3 * EVERY_S}
+    tg = targets(cfg, p)
+    res = {h: read(h, w) for h, w in tg}
+    res = {h: r for h, r in res.items() if r.get("state") in ("ok", "fail", "busy") and now - float(r.get("at") or 0) < 3 * EVERY_S}
+    # Until every host has a fresh result, a few failures cannot be told from a config fault: take none out yet.
+    whole = bool(res) and len(res) == len(tg)
+    res = {h: r for h, r in res.items() if r["state"] != "busy"}
     failing = {h: r for h, r in res.items() if r["state"] == "fail"}
     changed: list[str] = []
-    if len(failing) >= checkspill.CONFIG_FAULT_HOSTS and len(failing) == len(res):
+    if not whole:
+        hosts = checkspill._strikes(p.db)["hosts"]
+        failing = {h: r for h, r in failing.items() if ((hosts.get(h) or {}).get("off") or {}).get("kind") == KIND}
+    elif len(failing) >= checkspill.CONFIG_FAULT_HOSTS and len(failing) == len(res):
         with p.db.tx():
             fp = "spill-health-config:" + hashlib.sha256(json.dumps(sorted(failing)).encode()).hexdigest()[:12]
             if not p.db.q("SELECT 1 FROM events WHERE fingerprint=? AND ts>?", (fp, now - 6 * 3600)):

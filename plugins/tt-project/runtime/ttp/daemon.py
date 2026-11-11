@@ -4921,7 +4921,7 @@ class Daemon:
         from . import spillhealth
         if os.environ.get("PYTEST_CURRENT_TEST") and not os.environ.get("TTP_TEST_SPILL_HEALTH"):
             return
-        if time.time() - getattr(self, "_spill_health_at", 0.0) < 60 or not (t := spillhealth.targets(self.cfg)):
+        if time.time() - getattr(self, "_spill_health_at", 0.0) < 60 or not (t := spillhealth.targets(self.cfg, self.p)):
             return
         self._spill_health_at = time.time()
         job = getattr(self, "_spill_health", None)

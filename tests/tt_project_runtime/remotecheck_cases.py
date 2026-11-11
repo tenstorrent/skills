@@ -5275,3 +5275,57 @@ def test_the_daemon_probes_spill_host_health_in_a_thread_and_acts_on_it(env, tmp
     d.check_spill_health()
     assert "health check failed (no python3)" in checkspill.quarantined(p, "check-host-a")
     assert not checkspill.quarantined(p, "check-host-b")
+
+
+def test_a_paused_or_held_spill_host_gets_no_health_probe_quarantine_or_event(env, tmp_path, monkeypatch):
+    """A spill host the user paused (the project's own pause or a shared hold) is not probed, and a stored failing
+    result for it takes it out with no event; once the pause lifts it is probed and acted on again."""
+    from ttp import checkspill, db as dbm, shared, spillhealth
+    p = _health_setup(env, tmp_path, monkeypatch, ["check-host-a", "check-host-b", "down"])
+    log = tmp_path / "ssh.log"
+    monkeypatch.setenv("FAKE_SSH_LOG", str(log))
+    cfg, now = p.config(), time.time()
+    for pause in (lambda on: p.db.set_kv(dbm.PAUSED_RESOURCES_KEY, {"down": {"reason": "lent", "by": "user"}} if on else {}),
+                  lambda on: shared.update_pause("down", lambda was: {"reason": "held", "since": time.time(),
+                                                                       "project": "third"} if on else None)):
+        pause(True)
+        assert [h for h, _ in spillhealth.targets(cfg, p)] == ["check-host-a", "check-host-b"]
+        log.unlink(missing_ok=True)
+        spillhealth.probe(spillhealth.targets(cfg, p), now)
+        assert "down" not in log.read_text().split()
+        spillhealth.probe(spillhealth.targets(cfg), now)   # another project's probe left a failing result for it
+        assert spillhealth.apply(p, cfg, now) == [] and not checkspill.quarantined(p, "down")
+        assert not _spill_events(p, "Spill host down failed its health check")
+        pause(False)
+        now += spillhealth.EVERY_S + 1
+    log.unlink(missing_ok=True)
+    spillhealth.probe(spillhealth.targets(cfg, p), now)
+    assert "down" in log.read_text().split()
+    assert spillhealth.apply(p, cfg, now) == ["down"] and checkspill.quarantined(p, "down")
+
+
+def test_health_results_for_part_of_the_spill_hosts_neither_take_out_nor_lift_nor_call_a_config_fault(
+        env, tmp_path, monkeypatch):
+    """Four hosts, fresh results for only the two failing ones: no config event, nothing taken out, an existing
+    health quarantine kept; once all four have results, the two failing ones are out with one event each and
+    stay out."""
+    from ttp import checkspill, machines, spillhealth
+    hosts = ["check-host-a", "check-host-b", "check-host-c", "check-host-d"]
+    p = _health_setup(env, tmp_path, monkeypatch, hosts)
+    for h in hosts[2:]:
+        machines.add(h)
+    res = {"check-host-a": {"state": "fail", "why": "no python3"}, "check-host-b": {"state": "fail", "why": "no python3"}}
+    monkeypatch.setattr(spillhealth, "check", lambda h, w: res.get(h, {"state": "ok", "why": ""}))
+    cfg, now = p.config(), time.time()
+    spillhealth.probe(spillhealth.targets(cfg, p)[:2], now)
+    assert spillhealth.apply(p, cfg, now) == []
+    assert not checkspill.quarantined(p, "check-host-a") and not _spill_events(p, "Every spill host failed")
+    spillhealth.probe(spillhealth.targets(cfg, p)[2:], now)
+    assert spillhealth.apply(p, cfg, now) == ["check-host-a", "check-host-b"]
+    # a new round: the first two results are fresh again, the other two are not yet
+    t = now + 3 * spillhealth.EVERY_S
+    spillhealth.probe(spillhealth.targets(cfg, p)[:2], t)
+    assert spillhealth.apply(p, cfg, t) == []
+    assert checkspill.quarantined(p, "check-host-a") and checkspill.quarantined(p, "check-host-b")
+    assert not _spill_events(p, "Every spill host failed")
+    assert len(_spill_events(p, "Spill host check-host-a failed its health check")) == 1
