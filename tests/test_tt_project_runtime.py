@@ -27429,6 +27429,8 @@ DURABLE_EXEMPT = {
     ("overseer.py", 'lock = open(p.state / LOCK_FILE, "a")'): "the overseer's flock guard file, never written",
     ("modelbench.py", 'with open(d / LOCK, "a") as lk:'): "the host bench's flock guard file, never written",
     ("untrusted.py", 'with open(path, "a") as f:'): "a run's untrusted-source marks in its own run dir, read when that run ends; a crash that loses one ends the run too; never project state",
+    ("remotecheck.py", 'Path(scratch, "objects", "info", "alternates").write_text('): "points a scratch repository in a TemporaryDirectory at this one's objects for one bundle; it is gone when the bundle is sent, never project state",
+    ("streamguard.py", "with open(run_dir / WARN_FILE, \"a\") as f:"): "appends one fsync'd warning line per refused call that had already finished; a cut last line is skipped on read (take_warnings), a lost one costs only that warning",
 }
 
 

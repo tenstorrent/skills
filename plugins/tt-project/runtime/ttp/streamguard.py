@@ -13,7 +13,7 @@ blocks it for the coordinator.
 This is weaker than a hook's deny: the call is stopped once it has started, so a quick command may have
 run. A call whose result the runner reads in the same look as its start has finished, so stopping the run
 then protects nothing and loses its work: the runner records a warning instead (WARN_FILE), the run goes
-on, and the daemon turns the warnings into one event when the run ends. Rewrites and hints the hook would add are not applied. Runs whose provider passes the harness hook
+on (a secret refusal of an untrusted run still stops it: must_stop), and the daemon turns the warnings into one event when the run ends. Rewrites and hints the hook would add are not applied. Runs whose provider passes the harness hook
 (Provider.harness_hook) or whose hook already ran when it started (hook.HOOKED_FILE) are left alone; the
 marker is read before the agent starts, since the agent could write it itself."""
 from __future__ import annotations
@@ -57,11 +57,21 @@ def record(run_dir: Path, why: str, tool: str) -> None:
     durable_write(run_dir / GUARD_FILE, json.dumps({"why": why, "tool": tool, "at": time.time()}))
 
 
+def must_stop(why: str) -> bool:
+    """Whether a refusal stops the run even when its call had already finished: a secret refusal of an
+    untrusted run (untrusted.secret_refusal). Its secret is then in the agent's context, and stopping the
+    run keeps a planted instruction from sending it out in the next call."""
+    from . import untrusted
+    return untrusted.secret_refusal(why)
+
+
 def warn(run_dir: Path, why: str, tool: str, head: str = "") -> None:
-    """Record a call the hook refuses that had already finished when the runner read it."""
+    """Record a call the hook refuses that had already finished when the runner read it (fsync'd)."""
     try:
         with open(run_dir / WARN_FILE, "a") as f:
             f.write(json.dumps({"why": why, "tool": tool, "head": head[:200], "at": time.time()}) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
     except OSError:
         pass
 

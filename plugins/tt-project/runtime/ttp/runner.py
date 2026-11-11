@@ -600,7 +600,7 @@ def supervise(run_dir: Path) -> int:
             for c in (c for c in calls if c.get("kind") == "call"):
                 for payload in c.get("payloads") or []:
                     why = streamguard.refusal(payload, env, cwd)
-                    if why and c.get("id") in done:
+                    if why and c.get("id") in done and not streamguard.must_stop(why):
                         streamguard.warn(run_dir, why, str(payload.get("tool_name") or ""), c.get("input_head") or "")
                         print(f"runner: stream guard: a {payload.get('tool_name')} call it refuses had already "
                               f"finished; the run goes on: {why}", flush=True)

@@ -7063,7 +7063,7 @@ class Daemon:
             text = (f"#{task['id']} {task['title']}: run {r['id']} ran {len(warned)} call(s) the harness refuses "
                     f"before the stream guard saw them; the run was kept: {str(warned[0]['why'])[:400]}")
             db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
-                 (time.time(), f"task:{task['id']}", "guard_warning", "low", text[:1500], "handled", task["id"]))
+                 (time.time(), f"task:{task['id']}", "guard_warning", "normal", text[:1500], "new", task["id"]))
             log(self.p, text)
         if held:
             # Judged by the code it replaced, the hand-off could fail for the bug the run fixed: the

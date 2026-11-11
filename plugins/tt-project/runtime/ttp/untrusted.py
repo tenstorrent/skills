@@ -70,6 +70,8 @@ SSH_VALUE_FLAGS = set("BbcDEeFIiJLlmOoPpQRSWw")
 SSH_OWN_O_RE = re.compile(r"\s*(IdentityFile|CertificateFile|ControlPath|IdentityAgent|UserKnownHostsFile)\s*=?\s*(.*)", re.I | re.S)
 WHY = ("this task reads untrusted input (label {label}), which may carry planted instructions, so its run "
        "{what}. ").format
+ENV_WHAT = "never dumps its environment, which holds tokens"
+CRED_WHAT = "never reads credential, token or secret files outside its worktree"
 
 
 def guards_live() -> bool:
@@ -386,11 +388,11 @@ def bash_refusal(segments: list[list[str]], raw: list[list[str]], cwd: str) -> s
             or any("/" in w or w.startswith(("~", ".")) for w in words)) or not active():
         return None
     if any(_env_dump(s) for s in raw if s):
-        return WHY(label=LABEL, what="never dumps its environment, which holds tokens") + \
+        return WHY(label=LABEL, what=ENV_WHAT) + \
             "Print one harmless variable by name with `echo \"$NAME\"`"
     if any(cred_path(w, cwd) for s in segments for w in _checked_words(s)) or any(
             _find_refusal(s, cwd) for s in segments if s and os.path.basename(s[0]) == "find"):
-        return WHY(label=LABEL, what="never reads credential, token or secret files outside its worktree") + \
+        return WHY(label=LABEL, what=CRED_WHAT) + \
             "ssh, git and gh read their own credentials; give a stored secret to a command with `ttp secret env`"
     allowed = writes_allowed()
     for s in segments:
@@ -412,6 +414,12 @@ def bash_refusal(segments: list[list[str]], raw: list[list[str]], cwd: str) -> s
 MARK_WHY = "this run's untrusted-input file records the untrusted text it read; leave it as it is"
 
 
+def secret_refusal(why: str) -> bool:
+    """Whether a refusal guards a secret (a credential read, an environment dump, the run marker): once
+    such a call ran, the secret is in the agent's context (streamguard.must_stop)."""
+    return any(w in why for w in (ENV_WHAT, CRED_WHAT, MARK_WHY))
+
+
 def mark_refusal(tool: str, args: dict) -> str | None:
     """Refuse a task run's Bash command naming RUN_MARK, or an edit or patch of that file."""
     if tool == "Bash":
@@ -430,4 +438,4 @@ def tool_refusal(tool: str, args: dict, cwd: str) -> str | None:
     path = str(args.get("file_path") or args.get("path") or "")
     if tool not in ("Read", "Grep", "Glob") or not path or not cred_path(path, cwd) or not active():
         return None
-    return WHY(label=LABEL, what="never reads credential, token or secret files outside its worktree").rstrip()
+    return WHY(label=LABEL, what=CRED_WHAT).rstrip()

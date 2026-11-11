@@ -436,6 +436,7 @@ def _host_step(host: str, script: str, direct: bool, deadline: float, label: str
     """Runs `script` on the host: "", or why it failed (LINK: ssh's, MUX: its shared connection refused).
     `said` gets what it printed."""
     with tempfile.TemporaryFile() as out:
+        # own session: _watch's finally kills the group (os.killpg), so what ssh started goes with it
         proc = subprocess.Popen(_ssh(host, script, direct), stdin=subprocess.DEVNULL, stdout=out, stderr=out,
                                 start_new_session=True)
         why = _watch(proc, lambda: "", label, deadline, None)
@@ -495,6 +496,7 @@ def _copy(host, source: list[str], script: str, direct: bool, deadline: float, l
     sent = [0]
     with tempfile.TemporaryFile() as out:
         src = subprocess.Popen(source, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        # own session: _watch's finally kills the group (os.killpg), so what ssh started goes with it
         proc = subprocess.Popen(_copy_argv(host, script, direct, compress), stdin=subprocess.PIPE, stdout=out,
                                 stderr=out, start_new_session=True)
         pumper = threading.Thread(target=_pump, args=(src.stdout, proc.stdin, sent), daemon=True)

@@ -127,7 +127,40 @@ def test_a_codex_command_that_already_finished_is_warned_about_and_the_run_kept(
     assert streamguard.take_warnings(run_dir) == [], "taken once"
 
 
-def test_guard_warnings_become_one_low_event_and_the_task_is_not_requeued(env, tmp_path, monkeypatch):
+SG_SECRET_READS = ('cat /srv/none/id_rsa.pem', "printenv")
+
+
+def _sg_finished(cmd: str) -> list[str]:
+    return [_sg_codex_line(f"bash -lc '{cmd}'"),
+            json.dumps({"type": "item.completed", "item": {"id": "item_1", "type": "command_execution",
+                                                           "command": f"bash -lc '{cmd}'", "exit_code": 0,
+                                                           "status": "completed"}})]
+
+
+def test_a_finished_secret_read_in_an_untrusted_run_still_stops_it(tmp_path, monkeypatch):
+    """The secret is in the agent's context once such a call ran: stopping the run keeps a planted
+    instruction from sending it out next. Credential reads and environment dumps both stop it."""
+    from ttp import streamguard
+    monkeypatch.setenv("TTP_UNTRUSTED_INPUT", "1")
+    for i, cmd in enumerate(SG_SECRET_READS):
+        sub = tmp_path / f"c{i}"
+        sub.mkdir()
+        ex, run_dir = _sg_run(sub, monkeypatch, "codex", _sg_finished(cmd))
+        got = streamguard.take(run_dir)
+        assert ex["stopped"] == "guard" and got and streamguard.must_stop(got["why"]), cmd
+        assert streamguard.take_warnings(run_dir) == [], cmd
+
+
+def test_a_finished_refusal_of_another_kind_in_an_untrusted_run_warns_and_goes_on(tmp_path, monkeypatch):
+    from ttp import streamguard
+    monkeypatch.setenv("TTP_UNTRUSTED_INPUT", "1")
+    ex, run_dir = _sg_run(tmp_path, monkeypatch, "codex", _sg_finished(SG_DENIED))
+    assert ex["stopped"] is None and streamguard.take(run_dir) is None
+    warned = streamguard.take_warnings(run_dir)
+    assert len(warned) == 1 and not streamguard.must_stop(warned[0]["why"])
+
+
+def test_guard_warnings_become_one_normal_event_and_the_task_is_not_requeued(env, tmp_path, monkeypatch):
     from ttp import streamguard
     from ttp.daemon import Daemon
     p = make(env)
@@ -138,7 +171,9 @@ def test_guard_warnings_become_one_low_event_and_the_task_is_not_requeued(env, t
     (run_dir / "exit.json").write_text(json.dumps({"rc": 0, "stopped": None, "ended": time.time()}))
     Daemon(p.base).reap_runs()
     ev = p.db.q("SELECT text,severity FROM events WHERE kind='guard_warning' AND task=?", (tid,))
-    assert len(ev) == 1 and ev[0]["severity"] == "low" and "2 call(s)" in ev[0]["text"]
+    assert len(ev) == 1 and ev[0]["severity"] == "normal" and "2 call(s)" in ev[0]["text"]
+    assert p.db.q("SELECT status FROM events WHERE kind='guard_warning' AND task=?", (tid,))[0]["status"] == "new", \
+        "a warning reaches the coordinator, never filed as handled"
     assert not p.db.q("SELECT 1 FROM events WHERE kind='guard_stop' AND task=?", (tid,))
 
 
