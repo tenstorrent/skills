@@ -484,20 +484,18 @@ def _pins(cell: Path) -> dict[str, str]:
     return {str(p.relative_to(cell)): _sha(p) for p in sorted(files + ([hook] if hook.is_file() else []))}
 
 
-def _held_cmd(test_cmd: str, tests: list[str]) -> list[str]:
-    """`test_cmd` running only the held-out `tests` ("path::name"). A plain pytest run selects them with
-    the ttp_pytest_select plugin, so a case file's test runs where its aggregator collects it: a file
-    pytest collects by its name is passed itself, any other its top directory. Other commands get the ids."""
-    from . import addedtests, pushpass
+def _held_cmd(test_cmd: str, tests: list[str]) -> tuple[list[str], list[str]]:
+    """(argv, select): `test_cmd` running only the held-out `tests` ("path::name"). A plain pytest run
+    selects them with the ttp_pytest_select plugin (benchcells.select_env, added at run time), so a case
+    file's test runs where its aggregator collects it: a file pytest collects by its name is passed itself,
+    any other its top directory. Other commands get the ids and no select. Neither names a host path."""
+    from . import addedtests
     if not addedtests.eligible(test_cmd):
-        return [*shlex.split(test_cmd), *tests]
+        return [*shlex.split(test_cmd), *tests], []
     files = dict.fromkeys(t.partition("::")[0] for t in tests)
     paths = dict.fromkeys(f if re.fullmatch(r"test_.*\.py|.*_test\.py", Path(f).name) else Path(f).parts[0]
                           for f in files)
-    pp = os.pathsep.join(filter(None, (str(pushpass.PLUGIN_DIR), os.environ.get("PYTHONPATH", ""))))
-    opts = " ".join(filter(None, (os.environ.get("PYTEST_ADDOPTS", ""), f"-p {pushpass.SELECT_PLUGIN}")))
-    return ["env", f"PYTHONPATH={pp}", f"PYTEST_ADDOPTS={opts}", "TTP_PYTEST_SELECT_FILES=" + "\n".join(tests),
-            *shlex.split(test_cmd), *paths]
+    return [*shlex.split(test_cmd), *paths], list(tests)
 
 
 def cells(bench_dir: Path, out: Path, repo: Path | None = None, seeded: int = 0, test_cmd: str = TEST_CMD,
@@ -523,14 +521,15 @@ def cells(bench_dir: Path, out: Path, repo: Path | None = None, seeded: int = 0,
         targets = _targets(repo, k["base"], k["head"])
         if not targets:
             return k, None, "its landed change touches no non-test Python line"
-        cmd = _held_cmd(test_cmd, k["tests"])
+        cmd, select = _held_cmd(test_cmd, k["tests"])
         with tempfile.TemporaryDirectory(prefix="ttp-cells-") as tmp:
             src = Path(tmp) / "head"
             _archive(repo, k["head"], src)
-            m, why = benchcells.find_bug(src, cmd, targets, rng_seed=k["task"], tries=tries, timeout=timeout)
+            m, why = benchcells.find_bug(src, cmd, targets, rng_seed=k["task"], tries=tries, timeout=timeout,
+                                          select=select)
             if m:
                 benchcells.seeded_cell(src, list(k["heldout"]), m, cmd, out / "seeded" / str(k["task"]),
-                                       task=k["spec"] or k["title"])
+                                       task=k["spec"] or k["title"], select=select)
         return k, m, why
 
     with concurrent.futures.ThreadPoolExecutor(BUILDERS) as pool:

@@ -65,9 +65,19 @@ def _copy(src: Path, dest: Path) -> None:
     shutil.copytree(src, dest, symlinks=True, ignore=shutil.ignore_patterns(".git"))
 
 
-def _run(cmd: list[str], cwd: Path, timeout: float) -> int | None:
-    """The exit code of `cmd` in `cwd`, or None when it timed out."""
-    env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
+def select_env(select: list[str]) -> dict[str, str]:
+    """The environment that has a plain pytest run collect only `select` ("path::name") through the
+    ttp_pytest_select plugin of the plugin running now. Added at run time, never stored in a cell: a
+    cell names no host path, so it still scores once the folder that built it is gone."""
+    from . import pushpass
+    pp = os.pathsep.join(filter(None, (str(pushpass.PLUGIN_DIR), os.environ.get("PYTHONPATH", ""))))
+    opts = " ".join(filter(None, (os.environ.get("PYTEST_ADDOPTS", ""), f"-p {pushpass.SELECT_PLUGIN}")))
+    return {"PYTHONPATH": pp, "PYTEST_ADDOPTS": opts, "TTP_PYTEST_SELECT_FILES": "\n".join(select)}
+
+
+def _run(cmd: list[str], cwd: Path, timeout: float, select: list[str] | None = None) -> int | None:
+    """The exit code of `cmd` in `cwd` (only the `select` tests, if given), or None when it timed out."""
+    env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1", **(select_env(select) if select else {})}
     try:
         return subprocess.run(cmd, cwd=cwd, capture_output=True, timeout=timeout, env=env).returncode
     except subprocess.TimeoutExpired:
@@ -110,13 +120,13 @@ def apply(text: str, m: dict) -> str:
 
 
 def find_bug(src: Path, test_cmd: list[str], targets: dict[str, set[int] | None], rng_seed: int = 0,
-             tries: int = 20, timeout: float = 600) -> tuple[dict | None, str]:
+             tries: int = 20, timeout: float = 600, select: list[str] | None = None) -> tuple[dict | None, str]:
     """(the mutation, "") of the first of up to `tries` mutations of `targets` (path -> lines, None for
     all) in `src` that makes `test_cmd` fail, in a seeded random order; (None, why) when none does or
-    the tests do not pass on `src` itself."""
+    the tests do not pass on `src` itself. `select`: as in _run."""
     with tempfile.TemporaryDirectory(prefix="ttp-seed-") as tmp:
         _copy(src, Path(tmp) / "clean")
-        if _run(test_cmd, Path(tmp) / "clean", timeout) != 0:
+        if _run(test_cmd, Path(tmp) / "clean", timeout, select) != 0:
             return None, "the hidden tests do not pass on the clean source"
     cands = [dict(m, file=f) for f, lines in sorted(targets.items()) for m in mutations((src / f).read_text(), lines)]
     random.Random(rng_seed).shuffle(cands)
@@ -129,14 +139,16 @@ def find_bug(src: Path, test_cmd: list[str], targets: dict[str, set[int] | None]
             ws = Path(tmp) / "ws"
             _copy(src, ws)
             durable_write(ws / m["file"], text, sync=False)
-            if _run(test_cmd, ws, timeout) not in (0, None):
+            if _run(test_cmd, ws, timeout, select) not in (0, None):
                 return m, ""
     return None, f"none of {min(tries, len(cands))} mutation(s) made the hidden tests fail"
 
 
-def seeded_cell(src: Path, hidden: list[str], mutation: dict, test_cmd: list[str], dest: Path, task: str = "") -> dict:
+def seeded_cell(src: Path, hidden: list[str], mutation: dict, test_cmd: list[str], dest: Path, task: str = "",
+                select: list[str] | None = None) -> dict:
     """Write a seeded cell to `dest` (new): `src` with `mutation` and without the `hidden` test files as a
-    one-commit workspace, the hidden files in heldout/ and cell.json."""
+    one-commit workspace, the hidden files in heldout/ and cell.json. `test_cmd` and `select` (as in _run)
+    are stored as given: give neither a host path, the plugin's included (select_env adds it when scored)."""
     ws = dest / "workspace"
     _copy(src, ws)
     path = ws / mutation["file"]
@@ -149,7 +161,7 @@ def seeded_cell(src: Path, hidden: list[str], mutation: dict, test_cmd: list[str
         (ws / p).unlink(missing_ok=True)
     prompt = (f"{task}\n\n" if task else "") + (f"A recent change broke behaviour in `{mutation['file']}` that used to "
                                                 "work. Find the bug and fix it; keep the existing tests passing.")
-    cell = {"kind": "seeded", "mutation": mutation, "test_cmd": test_cmd, "heldout": held, "tree": seal(ws),
+    cell = {"kind": "seeded", "mutation": mutation, "test_cmd": test_cmd, "select": list(select or []), "heldout": held, "tree": seal(ws),
             "prompt": prompt}
     durable_write(dest / "cell.json", json.dumps(cell, indent=1) + "\n")
     return cell
@@ -167,7 +179,7 @@ def score_seeded(cell_dir: Path, after: Path, timeout: float = 600) -> dict:
             if _sha(data) != sha:
                 raise ValueError(f"held-out file {p} changed since the cell was built: the cell cannot be scored")
             durable_write(ws / p, data, sync=False)
-        rc = _run(cell["test_cmd"], ws, timeout)
+        rc = _run(cell["test_cmd"], ws, timeout, cell.get("select"))
     return {"pass": rc == 0, "rc": rc, "why": "" if rc == 0 else "timed out" if rc is None else f"hidden tests exit {rc}"}
 
 

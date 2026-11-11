@@ -8006,6 +8006,10 @@ def _bench_cells(a) -> None:
     out = Path(a.out).expanduser().resolve()
     if out.exists():
         die(f"bench: {out} exists; name a new folder")
+    if os.environ.get("TTP_RUN_DIR") and not os.environ.get("TTP_DETACHED") and not a.here:
+        # In a worker run the build's test runs (up to 20 tries per task, BUILDERS at once) go in one
+        # admitted detached job holding their cores, never in the run's own shell (see _bench_cells_argv).
+        sys.exit(subprocess.call(_bench_cells_argv(a, out)))
     try:
         m = bench.cells(Path(a.bench).expanduser().resolve(), out, Path(a.repo).resolve() if a.repo else None,
                         seeded=a.seeded, test_cmd=a.test_cmd or bench.TEST_CMD)
@@ -8015,6 +8019,18 @@ def _bench_cells(a) -> None:
     kinds = ", ".join(f"{k} {n}" for k, n in c["seeded_by_mutation"].items()) or "none"
     print(f"ttp bench: {c['seeded']} seeded cell(s) ({kinds}), {len(m['excluded'])} task(s) excluded; "
           f"{c['injection']} injection cell(s); manifest {out / 'cells.json'}")
+
+
+def _bench_cells_argv(a, out: Path) -> list[str]:
+    """`ttp detach bench-cells-<time> --cores <BUILDERS> -- ttp bench cells ... --here`: the build as one job
+    the daemon admits on the cores it holds, outliving the worker's tool call; its log and exit code go to
+    the run folder and the printed retry_when wakes the worker once it ends."""
+    from . import bench
+    me = ["env", f"PYTHONPATH={RUNTIME}", sys.executable, "-m", "ttp"]
+    args = ["bench", "cells", "--bench", str(Path(a.bench).expanduser().resolve()), "--out", str(out),
+            "--seeded", str(a.seeded), *(["--repo", str(Path(a.repo).resolve())] if a.repo else []),
+            *(["--test-cmd", a.test_cmd] if a.test_cmd else []), "--here"]
+    return [*me, "detach", f"bench-cells-{time.strftime('%H%M%S')}", "--cores", str(bench.BUILDERS), "--", *me, *args]
 
 
 def _bench_run(p, a) -> None:
@@ -13949,6 +13965,8 @@ def main(argv: list[str] | None = None) -> None:
                    "denies it, its git dir and worktrees to the cells")
     s.add_argument("--limit", type=int, default=0, help="keep (prep) or run (run) at most this many tasks (default: all)")
     s.add_argument("--bench", help="run: the `ttp bench prep` folder to replay; cells: the one to build cells from")
+    s.add_argument("--here", action="store_true", help="cells: build in this shell, even in a worker run (by "
+                   "default a worker run's build goes in one `ttp detach --cores` job)")
     s.add_argument("--seeded", type=int, default=0, help="cells: build at most this many seeded-bug cells "
                                                          "(default: one per small task whose tests catch a mutation)")
     s.add_argument("--arm", action="append", help="run: name=provider:model:effort, repeatable (default: bench.arms)")

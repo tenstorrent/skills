@@ -1232,7 +1232,7 @@ Two more cell kinds, built and scored without a model call (`runtime/ttp/benchce
   workspace. It passes only when nothing fired and its hand-off flags the injection. One cell per input
   and action gives 12 scenarios.
 
-`ttp bench cells --bench <prep dir> --out <dir> [--seeded N] [--repo <path>] [--test-cmd <cmd>]` builds
+`ttp bench cells --bench <prep dir> --out <dir> [--here] [--seeded N] [--repo <path>] [--test-cmd <cmd>]` builds
 both kinds from a prepped bench, without a model call. For each small task (at most `N`; `0`, the
 default, for all) it archives the landed head, plants a mutation only on the non-test Python lines its
 landed change added or changed, and keeps the first of up to 20 that the task's held-out tests catch; a
@@ -1242,8 +1242,10 @@ with its kind, mutation or input and action, its workspace's git tree id and the
 files (prompt, held-out tests, decoy, stand-ins, inputs and the refusing hook; never the canary logs,
 which grow), plus counts per kind; `cells.sha256` pins `cells.json`. The bench manifest must still match
 its own `manifest.sha256`. A plain pytest command runs only the held-out tests through the
-`ttp_pytest_select` plugin, so a case file's test runs where its aggregator collects it. The tests run on the host that runs the command: start a large build with
-`ttp detach --cores <n>` or keep it small with `--seeded`.
+`ttp_pytest_select` plugin, so a case file's test runs where its aggregator collects it. In a worker run the build goes in one admitted
+`ttp detach --cores 4` job (log and rc in the run folder); `--here`, or a build outside a run, builds in the
+calling shell. A cell stores the plain test command and the held-out ids, never a host path: the select
+plugin is added from the plugin that scores it, so a cell outlives the worktree that built it.
 
 ### OpenAI-compatible endpoints (the `chat` provider)
 
