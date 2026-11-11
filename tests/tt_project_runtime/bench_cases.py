@@ -756,3 +756,60 @@ def test_model_suite_dry_run_books_no_verdict(env, tmp_path, monkeypatch):
     modelsuite.run(p.db, {"providers": {"chat": {"model_ranking": ["m-a"]}}}, ["m-a"], {}, 1e7, date="2026-11-10",
                    opts={"dry_run": True}, has_cli=lambda: True)
     assert modelbench.models() == {}
+
+
+def test_model_suite_harbor_slice_is_off_by_default_and_installs_only_into_its_own_venv(env, monkeypatch, capsys):
+    from ttp import cli, harborslice, modelsuite
+    p = make(env)
+    d = _suite_home(env, monkeypatch)
+    monkeypatch.setattr(modelsuite, "decisions", lambda db, date: [{"id": "c", "state": "s", "want": "skip", "planted": False}])
+    (d / harborslice.TASKS).write_text("task-a\ntask-b\ntask-c\n")
+    calls = []
+
+    def runner(cmd, env, timeout):   # a fake venv, pip and harbor: task-a passes, the rest fail
+        calls.append((cmd, env))
+        if cmd[0] == "harbor":
+            jobs = Path(cmd[cmd.index("--jobs-dir") + 1])
+            reward = 1.0 if cmd[cmd.index("--task-name") + 1] == "task-a" else 0.0
+            (jobs / "trial-1").mkdir(parents=True)
+            (jobs / "trial-1" / "result.json").write_text(json.dumps({"verifier_result": {"rewards": {"reward": reward}}}))
+        return 0, ""
+    cfg = {"providers": {"chat": {"model_ranking": ["m-a"]}}}
+    go = lambda date, opts: modelsuite.run(p.db, cfg, ["m-a"], {}, 1e7, date=date, opts=opts, ask=lambda m, q: "skip",
+                                           has_cli=lambda: True, harbor_runner=runner)
+    assert [r["class"] for r in go("2026-11-09", {})] == ["standard", "babysit"] and calls == [], \
+        "off by default: nothing installed or run"
+    with pytest.raises(SystemExit):
+        cli.main(["model-bench", "suite", "--help"])
+    assert "--harbor N" in capsys.readouterr().out
+    rows = go("2026-11-10", {"harbor_tasks": 3})
+    tb = rows[-1]
+    assert tb["class"] == "terminalbench" and tb["cells"] == 3 and tb["pass_rate"] == round(1 / 3, 3)
+    venv = d / "2026-11-10-cells" / "harbor" / "venv"
+    (mk, mk_env), (pip, pip_env) = calls[:2]
+    assert mk[1:] == ["-m", "venv", str(venv)] and pip[:4] == [str(venv / "bin" / "python"), "-m", "pip", "install"]
+    assert "--user" not in pip and pip_env["PIP_REQUIRE_VIRTUALENV"] == "1" and pip_env["PYTHONNOUSERSITE"] == "1"
+    assert "PIP_USER" not in pip_env and pip_env["VIRTUAL_ENV"] == str(venv)
+    assert all(e["PATH"].startswith(str(venv / "bin")) for c, e in calls[2:]), "harbor runs from the run's own venv"
+    assert modelsuite.verdict(rows, "m-a", "daily") == (1.0, False, "daily"), "the slice never feeds the verdict"
+    calls.clear()
+    go("2026-11-10", {"harbor_tasks": 3})
+    assert [c for c, e in calls if "pip" in c] == [], "an installed venv is reused"
+
+
+def test_harbor_slice_failed_install_skips_it_without_another_route(env, tmp_path, monkeypatch):
+    from ttp import harborslice
+    d = _suite_home(env, monkeypatch)
+    (d / harborslice.TASKS).write_text("task-a\n")
+    calls = []
+
+    def runner(cmd, env, timeout):
+        calls.append(cmd)
+        return (1, "Could not fetch URL: connection refused") if "pip" in cmd else (0, "")
+    r = harborslice.row("m-a", "2026-11-10", 2, d, tmp_path / "cells", {}, runner)
+    assert r["pass_rate"] is None and "harbor install failed" in r["skipped"] and "connection refused" in r["skipped"]
+    assert len(calls) == 2 and not any(c[0] == "harbor" for c in calls)
+    assert harborslice.row("m-a", "2026-11-10", 2, d, tmp_path / "cells", {}, runner)["skipped"] == r["skipped"]
+    assert len(calls) == 2, "a failed install is never retried"
+    (d / harborslice.TASKS).unlink()
+    assert "no task names" in harborslice.row("m-a", "2026-11-10", 2, d, tmp_path / "c2", {}, runner)["skipped"]

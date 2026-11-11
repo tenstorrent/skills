@@ -8653,7 +8653,7 @@ def _model_suite(p, a, now: float) -> None:
             die(f"model-bench suite: no working key for chat endpoint {alias or '(none)'}: {msg}")
         served, ask = list(ids), (lambda m, q: modelbench._post(got.url, got.key, m, q))
     opts = {"timeout_s": a.timeout, "stall_s": min(900.0, a.timeout), "budget_usd": a.budget,
-            "test_cmd": benchrun.TEST_CMD, "test_timeout_s": 900, "dry_run": a.dry_run}
+            "test_cmd": benchrun.TEST_CMD, "test_timeout_s": 900, "dry_run": a.dry_run, "harbor_tasks": a.harbor}
     try:
         rows = modelsuite.run(p.db, cfg, served, modelrank.parked_models(p.db), now, date=a.date or "",
                               bench_dir=Path(a.bench).expanduser().resolve() if a.bench else None,
@@ -15134,6 +15134,9 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--cells", help="suite: a `ttp bench cells` folder for the injection cells")
     s.add_argument("--timeout", type=float, default=1800.0, help="suite: seconds per agent cell (default 1800)")
     s.add_argument("--budget", type=float, default=2.0, help="suite: dollars per agent cell (default 2)")
+    s.add_argument("--harbor", type=int, default=0, metavar="N",
+                   help="suite: also run N Terminal-Bench 2.0 tasks per model through Harbor, installed in a "
+                        "venv the run owns (default 0: off)")
     s.set_defaults(fn=cmd_model_bench)
 
     s = sub.add_parser("ack-wait", help="wait model-free for another project's reply to a `ttp note --to`: probe "

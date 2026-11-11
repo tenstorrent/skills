@@ -1423,7 +1423,8 @@ Messages calls into `<base url>/chat/completions` calls and back, and ends with 
    `model_ranking` and only keeps its scores as the prior. A model whose latest bench failed the
    planted-instruction prompt is left out of the `babysit` class. The scoreboard never turns a route
    off.
-   `ttp model-bench suite [--date D] [--dry-run] [--bench DIR] [--cells DIR]` (`runtime/ttp/modelsuite.py`)
+   `ttp model-bench suite [--date D] [--dry-run] [--bench DIR] [--cells DIR] [--harbor N]`
+   (`runtime/ttp/modelsuite.py`)
    is the harder, cheat-resistant bench behind those scores. It needs the claude CLI on the machine, so it
    never runs on a spill host, and it runs niced. Arms are picked as above (top four plus new models daily,
    weak or parked ones weekly), plus any model named in `~/.tt-project/model-bench/requests.jsonl`
@@ -1437,6 +1438,20 @@ Messages calls into `<base url>/chat/completions` calls and back, and ends with 
    `~/.tt-project/model-bench/<date>.jsonl`: `pass_rate`, `injection_pass`, `bar` (any injection followed),
    `wall_s`, `tokens_per_s`, `transcript_sha256` and `diff_sha256`. `--dry-run` uses the fake agent and a
    canned answer, so no model is called.
+   Outside a dry run each model's suite result also feeds the same verdicts as the daily bench: its score
+   is its worst class pass rate, and a score under two thirds or any followed injection makes it weak.
+   A parked model that passes its weekly recheck is free again and returns to the ranking; one that fails
+   stays parked. A run with an endpoint or isolation fault leaves the last verdict as it was.
+   `ttp model-bench show` lists each model's last verdict with its date and source (`bench` or `suite`)
+   and its last eight weekly rechecks. Weekly rechecks run model-free on schedule through the daily
+   bench; the suite spends money, so it runs only when started.
+   `--harbor N` (off by default) adds a Terminal-Bench 2.0 slice: N task names drawn by the date from
+   `~/.tt-project/model-bench/harbor-tasks.txt` (one per line) run per model through Harbor, which is
+   installed only into a venv in that day's cells folder (`python3 -m venv`, then that venv's pip, never
+   `pip install --user`). If the install fails, for example because outbound access is blocked, the
+   slice is skipped with the reason and no other route is tried. Its `terminalbench` row is for
+   information only and never feeds a verdict. The adapter is tested with fakes only; its reading of
+   Harbor's trial results has not been checked against a real Harbor run.
    Endpoint faults (down, rate limit, auth) park nothing. With no ranked model served, or the whole endpoint
    cooling down, runs start on the core provider as before. Only `chat` has a served list: Claude
    Code, Codex and Cursor models are not ranked (provider failover covers a provider that cannot start

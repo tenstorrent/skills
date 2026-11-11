@@ -18,7 +18,9 @@ Each draw is seeded by the date (seed), so a day's cells are the same on every r
 anything. One row per (model, class) is appended (fsynced) to DIR/<date>.jsonl. Outside a dry run each
 conclusive model's verdict (worst class pass rate; weak under modelbench.PASS_MIN or on any bar) is booked
 in modelbench's MODELS (modelbench.record, with a weekly arm's recheck kept per model and date), so a
-parked model the suite passes is free again (modelrank.parked) and one it fails stays parked. It never
+parked model the suite passes is free again (modelrank.parked) and one it fails stays parked. An
+optional Terminal-Bench slice (harborslice.py, opts["harbor_tasks"] > 0; off by default) adds one
+information-only "terminalbench" row per model. It never
 runs where the claude CLI is missing (spill hosts hold none) and runs at nice NICE.
 """
 from __future__ import annotations
@@ -245,7 +247,7 @@ def standard(model: str, arm: dict, date: str, bench_dir: Path | None, cells_dir
 
 def run(db, cfg: dict, served: list[str], parked: dict[str, float], now: float, *, date: str = "",
         bench_dir: Path | None = None, cells_dir: Path | None = None, opts: dict, ask: Callable | None = None,
-        has_cli: Callable[[], bool] | None = None) -> list[dict]:
+        has_cli: Callable[[], bool] | None = None, harbor_runner: Callable | None = None) -> list[dict]:
     """The day's suite: one row per (model, class) appended to DIR/<date>.jsonl; returns them."""
     from . import modelbench
     if not (has_cli or (lambda: bool(shutil.which("claude"))))():
@@ -273,6 +275,13 @@ def run(db, cfg: dict, served: list[str], parked: dict[str, float], now: float, 
                 row.setdefault(k, None)
             _append(d / f"{date}.jsonl", row)
             rows.append({**row, "cell_rows": r.get("cell_rows", [])})
+        if (n := int(opts.get("harbor_tasks") or 0)) > 0 and not opts.get("dry_run"):   # off by default
+            from . import harborslice
+            r = harborslice.row(model, date, n, d, out, opts, **({"runner": harbor_runner} if harbor_runner else {}))
+            row = {"date": date, "model": model, "class": "terminalbench", "arm": why, "seed": seed(date),
+                   "dry_run": False, "at": now, **r}
+            _append(d / f"{date}.jsonl", row)
+            rows.append(row)
     if not opts.get("dry_run"):
         modelbench.record({m: v for m, why in picked.items() if (v := verdict(rows, m, why))}, now, "suite")
     (d / TAKEN).unlink(missing_ok=True)
@@ -284,7 +293,7 @@ def verdict(rows: list[dict], model: str, arm: str) -> tuple[float, bool, str] |
     harness or endpoint fault in any class, or no scored cell). The score is its worst class pass rate; a
     score under modelbench.PASS_MIN or any `bar` (an injection followed) is weak."""
     from .modelbench import PASS_MIN
-    mine = [r for r in rows if r["model"] == model]
+    mine = [r for r in rows if r["model"] == model and r.get("class", "standard") in CLASS_TIER]
     rates = [r["pass_rate"] for r in mine if r.get("pass_rate") is not None]
     if not rates or any(r.get("faults") for r in mine):
         return None
