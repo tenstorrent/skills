@@ -137,3 +137,14 @@ def test_an_unacted_queue_wait_reaches_no_chat(env):
     mustact.settle(p, [ev["id"]], [{"type": "noop"}], [0], now)
     mustact.settle(p, [ev["id"]], [{"type": "noop"}], [0], now + 60)
     assert p.db.q("SELECT id FROM messages WHERE direction='out'") == []
+
+
+def test_a_chat_can_set_its_own_digest_hours_and_a_high_floor_elsewhere_hides_nothing(env, monkeypatch):
+    from ttp import chatdigest, coordinator as coord
+    monkeypatch.setenv("TTP_TEST_CHAT_DIGEST", "on")
+    p = make(env)
+    p.set_config("coordinator.chat_digest_chats", {"c2": 0})
+    assert chatdigest.every_s(p.config(), "c1") == 3 * 3600 and chatdigest.every_s(p.config(), "c2") == 0
+    coord.apply(p, [{"type": "reply", "chat": "c1", "text": "Got it."},
+                    {"type": "reply", "chat": "c2", "text": "Got it."}], turn=1)
+    assert _cd_out(p, "c1") == [] and _cd_out(p, "c2") == ["Got it."]

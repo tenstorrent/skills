@@ -35,12 +35,17 @@ _CORRECTION = re.compile(
     r"eta (?:is )?now|now (?:due|expected))\b", re.I)
 
 
-def every_s(cfg: dict | None) -> float:
-    """Seconds between a chat's digests; 0: no digest, every post goes at once."""
+def every_s(cfg: dict | None, chat: str | None = None) -> float:
+    """Seconds between a chat's digests; 0: no digest, every post goes at once. A chat can set its own
+    hours in `coordinator.chat_digest_chats` ({chat: hours}); the broadcast chat is 'all'."""
     if os.environ.get("TTP_TEST_CHAT_DIGEST") == "off":   # the test suite's fixture: other tests see posts unchanged
         return 0.0
+    co = ((cfg or {}).get("coordinator") or {})
+    own = co.get("chat_digest_chats")
     try:
-        return max(0.0, float(((cfg or {}).get("coordinator") or {}).get("chat_digest_h", DEFAULT_H))) * 3600
+        if isinstance(own, dict) and str(chat or "all") in own:
+            return max(0.0, float(own[str(chat or "all")])) * 3600
+        return max(0.0, float(co.get("chat_digest_h", DEFAULT_H))) * 3600
     except (TypeError, ValueError):
         return DEFAULT_H * 3600.0
 
@@ -89,7 +94,7 @@ def hold(db, chat: str | None, text: str, why: str, now: float | None = None) ->
 
 def routine(p, chat: str | None, text: str, why: str, now: float | None = None) -> bool:
     """A model-free routine update: held for the chat's digest (True), or posted now with the digest off."""
-    if every_s(p.config()) > 0:
+    if every_s(p.config(), chat) > 0:
         hold(p.db, chat, text, why, now)
         return True
     from . import msgparts
@@ -102,7 +107,7 @@ def checked(db, cfg: dict | None, text: str, a: dict, chat: str | None, notes: l
     """The text to post now, or None when the whole post was held for the digest. A post that goes keeps
     its body; an onhost status footer on it goes in the digest. Any fault sends the text unchanged."""
     try:
-        if every_s(cfg) <= 0:
+        if every_s(cfg, chat) <= 0:
             return text
         kind = a.get("type") or "reply"
         why = why_hold(db, text, a, chat)
@@ -130,12 +135,13 @@ def flush(p, cfg: dict | None, now: float | None = None) -> list[int]:
     with the digest off, at once. The message ids posted."""
     from . import msgparts, timefmt
     now = time.time() if now is None else now
-    gap, db = every_s(cfg), p.db
+    db = p.db
     out: list[int] = []
     with db.tx():
         st = db.kv(KV) or {}
         held, last = st.setdefault("held", {}), st.setdefault("last", {})
         for chat, items in list(held.items()):
+            gap = every_s(cfg, chat)
             if not items or (gap and (now - min(float(i["ts"]) for i in items) < gap
                                       or now - float(last.get(chat) or 0) < gap)):
                 continue
