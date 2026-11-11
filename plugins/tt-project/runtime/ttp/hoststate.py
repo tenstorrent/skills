@@ -16,8 +16,14 @@ plugin's own test sessions (tests/conftest.py) get three things, with no namespa
   <store>/systemd/user and their crontab, systemctl and loginctl calls to the stand-ins.
 - A snapshot of the real user crontab and ~/.config/systemd/user (files and symlinks) before and after
   the run. A change the stand-ins missed (a call by absolute path, a unit file written directly)
-  fails the run naming it; each changed line or file is put back as it was, and the restore is
-  recorded in the machine change ledger (as a test change that closes itself).
+  that the run provably made fails the run naming it; each such line or file is put back as it was,
+  and the restore is recorded in the machine change ledger (as a test change that closes itself).
+  The run's proof (own()): its own process tree recorded the write (the test session's write log),
+  the path's name is one only test suites use (TEST_NAMES), or the new line, file or link names one
+  of the run's own folders (its run dir, scratch TMPDIR, fake store, the test session's temp folder).
+  Anything else (another process installing a unit while runs overlap, a path a live machine change
+  names, a removed file or line) is reported in one line naming the paths and the run, and left in
+  place: the guard never deletes what the run cannot prove it created.
 
 The snapshot leaves out the harness's own entries (crontab lines tagged `# tt-project:`, units named
 tt-project-*), which its daemons rewrite while tests run; under the marker its installers never touch
@@ -44,6 +50,8 @@ NAMES = ("crontab", "systemctl", "loginctl", "at", "atq", "atrm", "batch", "rebo
 SHIMS = ".ttp-shims"   # in each stand-in folder, so a nested run and the stand-ins skip every such folder
 OWN_CRON = "# tt-project:"
 OWN_UNIT = "tt-project-"
+TEST_NAMES = ("pytest-", "ttp-test-")   # unit names only test suites create
+SHARED_TMP = ("/tmp", "/var/tmp", "/dev/shm")
 MAX_UNIT_BYTES = 1 << 20
 
 
@@ -186,6 +194,73 @@ def diff(before: dict, after: dict) -> dict:
     return out
 
 
+def _tokens(env: dict, extra=()) -> list[str]:
+    """The run's own folders, whose path in a new line, file or link proves the run wrote it: never a
+    shared temp folder or a folder above the real unit dir."""
+    top = str(_real_dir())
+    out = []
+    for t in (env.get("TTP_RUN_DIR"), env.get("TTP_CHECK_OUTPUT_DIR"), env.get(MARKER),
+              env.get("TMPDIR") if env.get("TTP_CHECKS_TMP_FD") else None, *extra):
+        t = str(t or "").rstrip("/")
+        if len(t) > 8 and t not in SHARED_TMP and not (top + "/").startswith(t + "/"):
+            out.append(t)
+    return out
+
+
+def _ledger_named() -> list[str]:
+    """The text of each open machine change a person or project made (not the guard's own test
+    records): a path it names is never this run's to restore."""
+    try:
+        from . import machine_ledger
+        return [f"{c.get('what', '')} {c.get('undo', '')}" for c in machine_ledger.changes() if not c.get("test")]
+    except Exception:
+        return []
+
+
+def own(before: dict, after: dict, d: dict, tokens=(), recorded=None) -> tuple[dict, dict]:
+    """`d` split into (what the run provably made, what it cannot prove it made)."""
+    top, recorded, named = _real_dir(), set(recorded or ()), _ledger_named()
+    mine, theirs = {}, {}
+
+    def says(text) -> bool:
+        return any(t in text for t in tokens)
+
+    def is_named(text, name="") -> bool:
+        return any(text in n or (len(name) > 3 and name in n) for n in named)
+
+    if "crontab" in d:
+        added, removed = d["crontab"]
+        ok = [ln for ln in added if says(ln) and not is_named(ln.strip())]
+        rest = list((Counter(added) - Counter(ok)).elements())
+        if ok:
+            mine["crontab"] = (ok, [])
+        if rest or removed:
+            theirs["crontab"] = (rest, removed)
+    proved = set()
+    for rel in reversed(d.get("units", [])):   # deepest first: a new folder is its contents'
+        p, now, was = top / rel, after["units"].get(rel), before["units"].get(rel)
+        by_log = any(r == str(p) or (str(p).startswith(r + os.sep) and r.startswith(str(top) + os.sep))
+                     for r in recorded)
+        if any(part.startswith(TEST_NAMES) for part in Path(rel).parts) or by_log:
+            ok = True
+        elif now and now[0] == "file":
+            ok = says(now[2].decode("utf-8", "replace"))
+        elif now and now[0] == "link":
+            ok = says(now[1])
+        elif now and now[0] == "dir" and not was:
+            under = [r for r in after["units"] if r.startswith(rel + "/")]
+            ok = bool(under) and all(r in proved for r in under)
+        else:   # removed, or a folder replacing a file
+            ok = False
+        if ok and not is_named(str(p), Path(rel).name):
+            proved.add(rel)
+    if units := [r for r in d.get("units", []) if r in proved]:
+        mine["units"] = units
+    if units := [r for r in d.get("units", []) if r not in proved]:
+        theirs["units"] = units
+    return mine, theirs
+
+
 def restore(before: dict, d: dict) -> list[str]:
     """Put each changed crontab line and unit path back as `before` had it, on top of what is there now
     (a concurrent change elsewhere stays). Returns the problems."""
@@ -278,19 +353,26 @@ def faked_writes(store, since: float) -> list[str]:
 class Guard:
     """Snapshot on creation; end() compares, restores and says what happened."""
 
-    def __init__(self, env: dict | None = None):
-        self.store = (env if env is not None else os.environ).get(MARKER)
+    def __init__(self, env: dict | None = None, tokens=()):
+        env = env if env is not None else os.environ
+        self.store, self.tokens = env.get(MARKER), _tokens(env, tokens)
+        self.run = env.get("TTP_TASK") and f"task {env['TTP_TASK']}" or env.get("TTP_RUN_DIR") or f"pid {os.getpid()}"
         self.since = time.time()
         self.before = snapshot()
         self.done = False
 
-    def end(self) -> tuple[bool, list[str]]:
-        """(the real state changed, the lines to report)."""
+    def end(self, recorded=None) -> tuple[bool, list[str]]:
+        """(the run changed the real state, the lines to report). `recorded`: the real paths the run's
+        own processes wrote (the test session's write log)."""
         self.done = True
         said = []
         if writes := faked_writes(self.store, self.since):
             said.append("host guard: these calls went to the run's fake store, never the host: " + "; ".join(writes[:10]))
-        d = diff(self.before, snapshot())
+        after = snapshot()
+        d, theirs = own(self.before, after, diff(self.before, after), getattr(self, "tokens", ()), recorded)
+        if theirs:
+            said.append(f"host guard: left in place, not proved to be this run's ({getattr(self, 'run', '?')}; another "
+                        f"process or a recorded machine change): {describe(theirs)}")
         if d:
             what = describe(d)
             errors = restore(self.before, d)

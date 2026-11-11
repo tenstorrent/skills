@@ -1041,7 +1041,7 @@ def pytest_sessionstart(session):
         session.config._ttp_outside = _outside_snapshot(session.config)
         creds = session.config._ttp_creds = credential_marks()
         session.config._ttp_secret = folder_marks(secret_folders())
-        session.config._ttp_host = _HOSTSTATE.Guard() if _HOSTSTATE else None
+        session.config._ttp_host = _HOSTSTATE.Guard(tokens=_basetemp(session.config)) if _HOSTSTATE else None
         recorder = getattr(sys.modules.get("_ttp_suite_writes"), "recorder", None)
         if recorder:   # the providers' login files and gh's folder, wherever the account's env puts them
             recorder.watch(list((creds or {}).get("kinds") or ()) + secret_folders())
@@ -1064,7 +1064,16 @@ def host_state_lines(guard) -> tuple[bool, list[str]]:
     if guard is None:
         return False, []
     _HOSTSTATE.record = _ledger_record
-    return guard.end()
+    # The session's own writes under the real unit folder prove a unit is its leak (a whole-home record does not)
+    return guard.end(recorded_writes(_WRITE_LOG) if _WRITE_LOG and os.path.exists(_WRITE_LOG) else None)
+
+
+def _basetemp(config) -> tuple[str, ...]:
+    """The session's temp folder: a unit or crontab line naming it is the session's own leak."""
+    try:
+        return (str(config._tmp_path_factory.getbasetemp()),)
+    except Exception:
+        return ()
 
 
 def pytest_sessionfinish(session, exitstatus):
