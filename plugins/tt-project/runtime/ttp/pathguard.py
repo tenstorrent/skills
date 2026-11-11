@@ -861,9 +861,20 @@ MESSAGE_REUSE_RE = re.compile(r"\$\{?_\b|\bBASH_COMMAND\b|\bhistory\b|\bfc\b|\ba
 
 def _message_pieces(text: str) -> list[tuple[int, int]]:
     """Spans of the top-level `ttp note|notify|say ...` commands in `text`: not one piped into another
-    command or run with its own PATH."""
+    command or run with its own PATH, nor a line of a heredoc body (input to a program, which may define
+    its own `ttp`)."""
     from . import hook
     flags, out, start = hook._quoting(text), [], 0
+    bodies, pending, at = [], [], 0   # (start, end) of each heredoc body line, found as hook.py does
+    for line in text.split("\n"):
+        begin, at = at, at + len(line) + 1
+        if pending:
+            bodies.append((begin, at))
+            if (line.lstrip("\t") if pending[0][1] else line) == pending[0][0]:
+                pending.pop(0)
+            continue
+        lflags = hook._quoting(line) if "<<" in line else []
+        pending += [(m[3], m[1] == "-") for m in hook.HEREDOC_RE.finditer(line) if not lflags[m.start()][0]]
     for i, c in enumerate(text + ";"):
         if i < len(text) and (flags[i][0] or flags[i][1] or c not in ";&|\n" or text[i - 1:i] in ("<", ">")
                               or text[i + 1:i + 2] == ">"):
@@ -873,7 +884,7 @@ def _message_pieces(text: str) -> list[tuple[int, int]]:
         sub = next((a for a in argv[1:] if not a.startswith("-")), "")
         piped = c == "|" and "|" not in (text[i - 1:i], text[i + 1:i + 2])
         if argv and os.path.basename(argv[0]) == "ttp" and sub in MESSAGE_CMDS and not piped and not any(
-                w.startswith("PATH=") for w in raw):
+                w.startswith("PATH=") for w in raw) and not any(b <= start < e for b, e in bodies):
             out.append((start, i))
         start = i + 1
     return out

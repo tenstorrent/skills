@@ -281,6 +281,10 @@ PG_MESSAGE_WRITES = [
     'ttp note "~/.ssh/config" | python3 -c "import sys; open(sys.stdin.read(), \'w\')"',
     'ttp(){ python3 -c "$2"; }; ttp note "open(\'$HOME/.ssh/config\', \'w\')"',
     'PATH=/tmp/b:$PATH ttp note "open(\'$HOME/.ssh/config\', \'w\')"; python3 -c 1',
+    # a heredoc body is a program's input, not shell: its `ttp note` line may call the code's own ttp
+    "ruby <<'EOF'\ndef ttp *a; end; def note *a; end\nttp note File.write(File.expand_path(\"~/.ssh/config\"), \"x\")\nEOF",
+    "perl <<'EOF'\nsub ttp {} sub note {}\nttp note open(F, \">\", \"$ENV{HOME}/.ssh/config\");\nEOF",
+    "perl <<-EOF\n\tsub ttp {} sub note {}\n\tprint 1; ttp note open(F, \">\", \"$ENV{HOME}/.ssh/config\");\n\tEOF",
 ]
 PG_MESSAGE_LEAKS = [
     'ttp note "$(cat ~/.config/gh/hosts.yml)"', 'ttp notify "`cat ~/.ssh/id_rsa`"', 'ttp say "$(<~/.netrc)"',
