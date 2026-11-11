@@ -2411,9 +2411,9 @@ session and stateless coordinators on every provider.
   entry. Its until-probe, `ttp checks --spill-probe <alias>`, puts it back once a known-good run passes there: on
   the daemon's probe timer it starts the push branch tip's spillable checks on that host, detached and behind its
   spill wrapper, and reads that run's result on later rounds. A refusal there (exit 75, a busy host) starts it
-  again at once and is no strike; a failure starts it again an hour later. The entry's auto-undo,
-  `ttp checks --spill-back <alias>`, ends it after 7 days at the latest (run it by hand to end the quarantine
-  sooner). However a quarantine ends, it raises one "back" event and resets the host's strikes, ledger entry or
+  again at once and is no strike; a failure starts it again an hour later. The entry expires after 7 days
+  and is then due whatever its until-probe says, so its auto-undo, `ttp checks --spill-back <alias>`, ends the
+  quarantine then at the latest (run it by hand to end it sooner). However a quarantine ends, it raises one "back" event and resets the host's strikes, ledger entry or
   not. A failure that hits two or more spill hosts the same way within an hour (the same last error
   line, paths and numbers aside, and the same failing pytest ids) with no spilled pass between is the project's
   spill setup, not the hosts (a wrapper that lost its environment): one high event says so, no host takes a

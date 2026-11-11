@@ -73,7 +73,7 @@ the same one, drops its result and passes so far: it is judged afresh after PROB
 Auto-undo. `ttp machines change add ... --auto-undo` (or `edit <id> --auto-undo`; `--no-auto-undo` turns it
 off) asks the recording project's daemon to run the undo itself, model-free, once the entry is due as the
 auto-close judges it (_due: its until-probe passed PROBE_PASSES times in a row, or its --expires passed with no
-until-probe). It fits a quick, idempotent undo that is safe to run unattended (remove a scratch dir, clear a
+until-probe, or with one for an EXPIRY_UNDO_KINDS entry such as a spill host's quarantine). It fits a quick, idempotent undo that is safe to run unattended (remove a scratch dir, clear a
 hold). Add and edit refuse it (check_auto_undo) for a no-op undo (the auto-close covers it), an undo killscan
 flags (a kill by name or pattern), an until-probe that always exits 0, and an --until-task end. Before each run
 the daemon records a claim under the lock (try, time, its pid); the undo then runs from the project's root with
@@ -874,13 +874,20 @@ def noop_undo(undo: Any) -> bool:
     return isinstance(undo, str) and NOOP_UNDO.fullmatch(undo.strip()) is not None
 
 
+# Kinds whose --expires is a backstop end: past it the undo is due whatever the until-probe says (a spill
+# host's quarantine ends after checkspill.QUARANTINE_MAX_S even if no known-good run passed there).
+EXPIRY_UNDO_KINDS = ("spill_quarantine",)
+
+
 def _due(c: dict, now: float) -> str:
     """Why open entry `c`'s undo is due with nobody paged ("" when it is not): its until-probe passed
     PROBE_PASSES times in a row (never a probe that always exits 0, nor a pass whose job failed), or it has no
     until-probe or until-task and its time passed. A still failing, broken or timed out probe never makes it
-    due, even past its --expires."""
+    due, even past its --expires, except for an EXPIRY_UNDO_KINDS entry, due once its time passed."""
     if c.get("closed") or c.get("kind") == POWER_CYCLE:
         return ""
+    if c.get("kind") in EXPIRY_UNDO_KINDS and c.get("expires") and float(c["expires"]) <= now:
+        return "expired"
     if c.get("probe"):
         ok = c.get("probe_passed") and not c.get("probe_job_failed") and not trivial_probe(c)
         return f"until-probe passed {PROBE_PASSES} times" if ok else ""

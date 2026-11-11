@@ -4562,6 +4562,25 @@ def test_a_spill_quarantine_past_its_end_comes_back_with_its_event_and_no_strike
     assert not [c for c in machine_ledger.changes(["check-host-a"]) if c.get("kind") == "spill_quarantine"]
 
 
+def test_a_spill_quarantine_ledger_entry_is_due_at_its_expiry_while_its_probe_still_says_not_yet(
+        env, tmp_path, monkeypatch):
+    """The 7-day backstop is real: past its --expires a spill quarantine's ledger entry is due (its auto-undo
+    runs, nobody is paged) though its known-good probe never passed. Any other entry with a failing
+    until-probe stays not due past its --expires."""
+    from ttp import machine_ledger
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a", "check-host-b"])
+    _quarantine(p)
+    entry = [c for c in machine_ledger.changes(["check-host-a"]) if c.get("kind") == "spill_quarantine"][0]
+    end = float(entry["expires"])
+    assert not entry.get("probe_passed")
+    assert machine_ledger._due(entry, end - 1) == "" and not machine_ledger.auto_undo_due(entry, end - 1)
+    assert machine_ledger._due(entry, end + 1) == "expired"
+    assert machine_ledger.auto_undo_due(entry, end + 1) and machine_ledger.auto_undo_waits(entry, end + 1)
+    other = {**entry, "kind": None}
+    assert machine_ledger._due(other, end + 1) == "", "only the backstop kinds: a failing probe holds others"
+    assert machine_ledger._due({**entry, "probe_passed": True}, end - 1), "a passed probe is due as before"
+
+
 def test_the_known_good_probe_lifts_a_quarantine_only_once_its_detached_run_passes(env, tmp_path, monkeypatch):
     """`ttp checks --spill-probe`: starts the known-good run detached and exits 1 while it runs; a refusal there
     (exit 75) starts it again at once with no strike; a failure waits KNOWN_GOOD_RETRY_S; a pass lifts the host
