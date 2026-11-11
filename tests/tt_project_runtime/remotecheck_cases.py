@@ -853,6 +853,36 @@ def test_a_run_that_fails_tests_on_a_spill_host_reruns_only_those_tests_here_and
         assert where[-1].endswith(f"ids={ids}"), where
 
 
+def test_a_real_pytest_rerun_after_a_spill_failure_runs_only_the_failed_tests_and_says_so_first(
+        env, tmp_path, monkeypatch):
+    """#8420: a real pytest suite that failed 2 tests on a spill host runs only those 2 here (the rest
+    deselected), even with the repo's conftest clearing a worker's TTP_ variables, and checks.log says
+    so before the rerun's own output. Before, the conftest dropped the selection and all of it ran again."""
+    import threading
+    from ttp import checkspill, cli
+    repo_root, site = RUNTIME.parents[2], pathlib.Path(pytest.__file__).parents[1]
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a"])
+    # The fake spill host is this machine: the repo and pytest it names are there too (see _spill_setup).
+    monkeypatch.setattr(checkspill, "_SYSTEM_DIRS", (*checkspill._SYSTEM_DIRS, f"{repo_root}/", f"{site}/"))
+    cat = "tests/test_plugin_catalogue.py"
+    ids = [f"{cat}::test_host_catalogues_expose_the_same_plugins", f"{cat}::test_only_finder_is_installed_by_default"]
+    fail = "printf '" + "".join(f"FAILED {i} - boom\\n" for i in ids) + "2 failed, 11 passed in 0.10s\\n'; exit 1"
+    p.set_config("delivery.push_checks", [
+        f'case "$PWD" in */ttp-check.*) {fail};; esac; '
+        # The test's own HOME hides a user-site pytest: this session's one is put after the select plugin.
+        f'PYTHONPATH="$PYTHONPATH:{site}" '
+        f"{sys.executable} -m pytest -q -p no:cacheprovider --rootdir={repo_root} {repo_root / cat}"])
+    lane = _spill_lane(p, repo)
+    threading.Timer(2.0, lane.close).start()
+    cli.main(["checks", "--fresh"])
+    rec = json.loads((run / "checks.json").read_text())
+    assert rec["passed"] is True and "spilled_to" not in rec, rec
+    text = (run / "checks.log").read_text()
+    assert "did not pass on spill host check-host-a (exit 1)" in text, text
+    said, result = text.find("running only the 2 test(s)"), text.find("2 passed, 11 deselected")
+    assert 0 <= said < result, text
+
+
 @_LINUX_TMP
 def test_checks_that_fail_on_a_spill_host_run_again_only_here_and_a_host_fault_still_moves_on(
         env, tmp_path, monkeypatch):

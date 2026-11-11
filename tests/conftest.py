@@ -90,8 +90,10 @@ LIMIT_GRACE_S = 30.0  # the main process kills a worker still in that test this 
 # A suite run inside a tt-project worker (`ttp checks`, a worker's own pytest) inherits the run's
 # variables: its task, run folder, project, device and hand-off guards, and the agent CLI's session.
 # Tests set what they need, so the session starts without them; the test-slot, port, check-output
-# and leak-pattern variables the checks harness passes the suite stay.
+# and leak-pattern variables the checks harness passes the suite stay, and so do the settings of its
+# pytest plugins (TTP_PYTEST_*: a rerun's selection, a resume record), which they read after this runs.
 _WORKER_ENV_KEEP = ("TTP_TEST_", "TTP_CHECKS_", "TTP_CHECK_OUTPUT_DIR", "TTP_PORT_", "TTP_BUILD_SLOTS_HELD",
+                    "TTP_PYTEST_",
                     "TTP_LEAK_PATTERNS_FILE", "TTP_TX_GUARD", "TTP_ALLOW_VOLATILE_BASE", "TTP_DEVICE_NODES")
 _WORKER_ENV_CLEAR = ("TTP_", "CLAUDECODE", "CLAUDE_CODE_", "CLAUDE_ENV_FILE", "CLAUDE_PID", "CLAUDE_EFFORT",
                      "CODEX_THREAD_ID", "CODEX_SANDBOX", "CODEX_CI", "CODEX_MANAGED_BY")

@@ -4633,6 +4633,8 @@ def cmd_checks(a) -> None:
                             "running the rest")
                     print(f"ttp checks: {line}", flush=True)
                     out.write(f"ttp checks: {line}\n")
+                out.flush()   # ahead of the command's own output, which goes to the same file
+                check_start = out.tell()
                 if pushpass.resumable(c) and not push.remote_host(c) and not retry:   # one plain local pytest run
                     env |= slowtests.env(Path(run_dir) / slowtests.FILE, env)
                 def said(line: str) -> None:   # a script it runs was rewritten as it ran: once more
