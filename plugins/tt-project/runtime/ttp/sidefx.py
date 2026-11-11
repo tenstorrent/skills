@@ -325,16 +325,20 @@ def items(run_dir: Path, own_only: bool = False) -> list[dict]:
     `own_only`: only the run's own calls (own_events), never a fork's inherited ones."""
     out: list[dict] = []
     by_id: dict[str, list[dict]] = {}
+    line = 0
 
     def add(ev: dict, key: str, text: str = "") -> list[dict]:
-        new = [{"tool": t, "kind": k, "what": w, "status": "started", "exit": None, "guard": "", "text": text}
-               for t, k, w in event_calls(ev)]
+        new = [{"tool": t, "kind": k, "what": w, "status": "started", "exit": None, "guard": "", "text": text,
+                "line": line} for t, k, w in event_calls(ev)]
         out.extend(new)
         if key:
             by_id.setdefault(key, []).extend(new)
         return new
 
     for ev in own_events(run_dir) if own_only else _jsonl(Path(run_dir) / "output.jsonl"):
+        line = ev.get("_n") or 0
+        if isinstance(ev.get("_shell"), str):   # the fake provider's command
+            add({"message": {"content": [{"type": "tool_use", "name": "Bash", "input": {"command": ev["_shell"]}}]}}, "")
         content = (ev.get("message") or {}).get("content") if isinstance(ev.get("message"), dict) else None
         for b in content if isinstance(content, list) else []:   # Claude Code, the chat bridge
             if not isinstance(b, dict):
@@ -380,7 +384,7 @@ def items(run_dir: Path, own_only: bool = False) -> list[dict]:
     for ev in _jsonl(Path(run_dir) / "refusals.jsonl"):   # the hook's log
         if ev.get("kind") == "rewrite" and isinstance(ev.get("rewritten"), str):   # the rewritten command ran
             out.append({"tool": "hook rewrite", "kind": "shell", "what": ev["rewritten"], "status": "started",
-                        "exit": None, "guard": "", "text": ""})
+                        "exit": None, "guard": "", "text": "", "line": 0})
         elif isinstance(ev.get("command"), str):   # refused before it ran: the first unrefused call it names
             it = next((i for i in out if i["text"] == ev["command"] and i["status"] != "refused"
                        and not (i["status"] == "completed" and i["exit"] == 0)), None)
@@ -545,15 +549,17 @@ def classify_paths(cmd: str, home: str, cwd: str, run_dir: str, depth: int = 0) 
 
 
 def _jsonl(path: Path):
+    """The JSON objects of a jsonl file, each with its physical line number as `_n`."""
     try:
         with open(path, errors="replace") as f:
-            for line in f:
+            for n, line in enumerate(f, 1):
                 if line.lstrip().startswith("{"):
                     try:
                         ev = json.loads(line)
                     except ValueError:
                         continue
                     if isinstance(ev, dict):
+                        ev["_n"] = n
                         yield ev
     except OSError:
         return

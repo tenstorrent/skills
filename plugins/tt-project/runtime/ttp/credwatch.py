@@ -288,7 +288,7 @@ def _writes(argv: list[str], targets: list[str], path: str, home: str) -> bool:
 
 def _writer(argv: list[str], path: str) -> bool:
     """The simple command `argv` writes a store like `path` without naming it: ssh-keygen making a key
-    with no scratch -f for an ssh key; gh auth login, logout, refresh, switch or setup-git for gh's hosts
+    with a -f naming the file's basename, or no -f for a default id_* key; gh auth login, logout, refresh, switch or setup-git for gh's hosts
     file; git credential approve, store or erase, or git config setting credential.helper, for git's or
     netrc's. Only the command's own verb and arguments count, never a writer named inside an argument."""
     if not argv:
@@ -300,7 +300,10 @@ def _writer(argv: list[str], path: str) -> bool:
             return False
         dest = (next((b for a, b in zip(args, args[1:]) if a == "-f"), None)
                 or next((a[2:] for a in args if a.startswith("-f") and len(a) > 2), None))
-        return not (dest and SSH_SCRATCH.match(dest))
+        name = os.path.basename(path).removesuffix(".pub")
+        if dest:   # a key made elsewhere or under another name is not this file's change
+            return not SSH_SCRATCH.match(dest) and os.path.basename(dest).removesuffix(".pub") == name
+        return name.startswith("id_")   # no -f: ssh-keygen asks for the default id_* key
     if path.endswith("hosts.yml"):
         return verb == "gh" and len(ops) > 1 and ops[0] == "auth" and ops[1] in GH_AUTH_WRITE
     if path.endswith((".git-credentials", ".netrc")) and verb == "git":
@@ -317,26 +320,13 @@ def _writer(argv: list[str], path: str) -> bool:
 
 
 def issued(run_dir: str | Path) -> list[tuple[int, str, str]]:
-    """(line number, 'shell' or 'file', command or path) of each command and file edit the run issued, in
-    any shipped provider's transcript (output.jsonl): tool calls only, never tool output or text."""
+    """(line number, 'shell' or 'file', command or path) of each command and file edit the run itself
+    issued, in any shipped provider's transcript (output.jsonl): tool calls only, never tool output or
+    text, never a forked run's inherited ones (before its task prompt), never a call a guard refused
+    before it ran."""
     from . import sidefx
-    out = []
-    try:
-        fh = open(Path(run_dir) / "output.jsonl", errors="replace")
-    except OSError:
-        return out
-    with fh:
-        for n, line in enumerate(fh, 1):
-            try:
-                ev = json.loads(line) if line.lstrip().startswith("{") else None
-            except ValueError:
-                continue
-            if not isinstance(ev, dict):
-                continue
-            out += [(n, kind, text) for _, kind, text in sidefx.event_calls(ev)]
-            if isinstance(ev.get("_shell"), str):   # the fake provider's command
-                out.append((n, "shell", ev["_shell"]))
-    return out
+    return [(it["line"], it["kind"], it["what"]) for it in sidefx.items(Path(run_dir), own_only=True)
+            if it["status"] != "refused"]
 
 
 def ledger_entry(path: str, start: float | None, now: float, home: str = "") -> dict | None:
