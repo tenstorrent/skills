@@ -294,14 +294,16 @@ def ssh_own_file(value: str, kind: str = "config") -> bool:
 
 def ssh_host_list(value: str) -> bool:
     """`value` is a host list ssh may read and add to: a known_hosts-shaped file in ~/.ssh (ssh_own_file), or one
-    named as ssh names its host lists (known_hosts in the file name, ssh_public), which ssh makes if missing. ssh's
-    config, authorized_keys and any other file are no host list: ssh would add host lines to them."""
+    named as ssh names its host lists (known_hosts in the file name, ssh_public) while it is missing, which ssh
+    makes. An existing file passes only by its shape, whatever its name. ssh's config, authorized_keys and any
+    other file are no host list: ssh would add host lines to them."""
     if ssh_own_file(value, "hosts"):
         return True
     path = re.sub(r"^(?:~|\$(?:HOME|\{HOME\}))/", "", value)
     base = os.path.basename(path)
     return (path != value and path.startswith(".ssh/") and "known_hosts" in base and ssh_public(path[5:])
-            and not re.search(r"[*?\[%$`]", path))
+            and not re.search(r"[*?\[%$`]", path)
+            and not os.path.lexists(os.path.join(os.path.expanduser("~"), path)))
 
 
 def ssh_files(argv: list[str]) -> list[str]:

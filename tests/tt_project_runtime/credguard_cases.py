@@ -422,6 +422,8 @@ SSH_OWN_FILE_ALLOWED = [
     "GIT_SSH_COMMAND='ssh -F ~/.ssh/site.conf -i ~/.ssh/work-key' git fetch origin",
     # comments, blank lines, Match, key=value, hashed and marked host lines are ssh's own shapes
     "ssh -F ~/.ssh/full.conf box", "ssh -o UserKnownHostsFile=~/.ssh/full-hosts box",
+    # a missing host list named as ssh names them, which ssh makes
+    "ssh -o UserKnownHostsFile=~/.ssh/known_hosts_new -o StrictHostKeyChecking=accept-new box",
 ]
 SSH_OWN_FILE_REFUSED = [
     # reads, copies and writes of the same files
@@ -460,6 +462,8 @@ def _own_file_home(tmp_path, monkeypatch):
     (home / ".ssh" / "odd.conf").write_text("Host box\n  User me\nnot-a-keyword x\n")
     (home / ".ssh" / "vault").write_text("AGE-SECRET-" + "KEY-1QQQFAKESECRETVALUE\n")   # split: no secret shape here
     (home / ".ssh" / "token").write_text("gh" + "p_FAKETOKEN123\n")
+    (home / ".ssh" / "known_hosts_token").write_text("gh" + "p_FAKETOKEN123\n")
+    (home / ".ssh" / "known_hosts").write_text("box ssh-ed25519 AAAA\n")
     return home
 
 
@@ -475,6 +479,19 @@ def test_ssh_reads_its_own_config_and_host_lists_by_option_and_nothing_else_read
     for cmd in SSH_OWN_FILE_REFUSED:
         assert credguard.bash_refusal(cmd, hook._all_segments(hook._split(cmd)[0])), cmd
         assert "credential stores" in _bash_why(tmp_path, cmd), cmd
+
+
+def test_a_host_list_named_like_ssh_s_own_passes_by_name_only_while_missing(tmp_path, monkeypatch):
+    """ssh_host_list's by-name exemption (known_hosts in the name) covers only a missing file, which ssh makes; an
+    existing one passes only when shaped like a host list (review #8165: fail-open name-based exemption)."""
+    from ttp import credguard
+    home = _own_file_home(tmp_path, monkeypatch)
+    for value in ("~/.ssh/known_hosts_token", "$HOME/.ssh/known_hosts_token", "${HOME}/.ssh/known_hosts_token"):
+        assert not credguard.ssh_host_list(value), value
+    assert credguard.ssh_files(["ssh", "-o", "UserKnownHostsFile=~/.ssh/known_hosts_token", "box"]) == []
+    assert credguard.ssh_host_list("~/.ssh/known_hosts_new") and credguard.ssh_host_list("~/.ssh/known_hosts")
+    (home / ".ssh" / "known_hosts_token").unlink()
+    assert credguard.ssh_host_list("~/.ssh/known_hosts_token")
 
 
 def test_ssh_host_key_lists_by_any_name_are_public_and_a_key_beside_or_under_one_is_not():
