@@ -9281,6 +9281,7 @@ def test_upgraded_names_a_runtime_tree_changed_on_disk_without_a_version_bump(en
     from ttp import checkcap
     monkeypatch.setattr(checkcap, "_SEEN", {})
     monkeypatch.setattr(checkcap, "_TREE0", {})
+    monkeypatch.setattr(checkcap, "_TREE_AT", {})
     monkeypatch.setenv(checkcap.REEXEC_ENV, "")
     init, mod = tmp_path / "__init__.py", tmp_path / "gate.py"
     init.write_text(f'__version__ = "{ttp.__version__}"\n')
@@ -9296,6 +9297,81 @@ def test_upgraded_names_a_runtime_tree_changed_on_disk_without_a_version_bump(en
     assert checkcap.upgraded(init, now=300.0) == new, "byte code is not code"
     monkeypatch.setenv(checkcap.REEXEC_ENV, new)
     assert checkcap.upgraded(init, now=9999.0, settle=0) == "", "re-executed for it once already: never a loop"
+
+
+def test_upgraded_reads_the_runtime_tree_at_most_once_per_poll_interval(env, tmp_path, monkeypatch):
+    """#7116: a waiter asks upgraded() every second or less; the runtime tree on disk is read (one stat per
+    file) only once TREE_POLL_S passed since its last read, and a change is still seen at the next read."""
+    import ttp
+    from ttp import checkcap
+    monkeypatch.setattr(checkcap, "_SEEN", {})
+    monkeypatch.setattr(checkcap, "_TREE0", {})
+    monkeypatch.setattr(checkcap, "_TREE_AT", {})
+    monkeypatch.setenv(checkcap.REEXEC_ENV, "")
+    init, mod = tmp_path / "__init__.py", tmp_path / "gate.py"
+    init.write_text(f'__version__ = "{ttp.__version__}"\n')
+    mod.write_text("A = 1\n")
+    real, reads = checkcap._tree, []
+    monkeypatch.setattr(checkcap, "_tree", lambda pkg: reads.append(pkg) or real(pkg))
+    for i in range(20):   # 20 polls in under one interval: the import tree and one read of the disk
+        assert checkcap.upgraded(init, now=100.0 + i * 0.5, settle=0) == ""
+    assert len(reads) == 2, reads
+    mod.write_text("A = 22\n")
+    os.utime(mod, ns=(1, 1))
+    assert checkcap.upgraded(init, now=100.0 + checkcap.TREE_POLL_S - 1, settle=0) == "", "not read again yet"
+    assert len(reads) == 2
+    new = checkcap.upgraded(init, now=100.0 + checkcap.TREE_POLL_S, settle=0)
+    assert new == f"{ttp.__version__}+{real(tmp_path)}" and len(reads) == 3, (new, reads)
+
+
+def test_a_waiting_detached_checks_run_reexecutes_for_a_runtime_tree_change_and_keeps_its_place(
+        env, tmp_path, monkeypatch):
+    """#7116: a detached `ttp checks` parked for a host-wide slot stays put while its runtime tree is
+    unchanged, and re-executes once a runtime file changes with the version unchanged (a project-local fix),
+    keeping its lane and its arrival time, so it queues again at its old place."""
+    import threading
+    import ttp
+    from ttp import checkcap, cli, locks
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    (init := pkg / "__init__.py").write_text(f'__version__ = "{ttp.__version__}"\n')
+    (mod := pkg / "gate.py").write_text("A = 1\n")
+    for k, v in (("_SEEN", {}), ("_TREE0", {}), ("_TREE_AT", {}), ("TREE_POLL_S", 0.0)):
+        monkeypatch.setattr(checkcap, k, v)
+    real, asked = checkcap.upgraded, []
+    execs = _upgrade_child_checks(monkeypatch, lambda: asked.append(1) or real(init, settle=0))
+    arrived = time.time() - 600
+    monkeypatch.setenv(checkcap.ARRIVED_ENV, repr(arrived))
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "1")
+    held = checkcap.acquire("other")
+    ran, ended = tmp_path / "ran", []
+
+    def go():
+        try:
+            cli.main(["checks", "--", "sh", "-c", f"touch {ran}"])
+        except _ReExec:
+            ended.append("exec")
+    t = threading.Thread(target=go)
+    t.start()
+    try:
+        marker = "queued for a host-wide checks slot"
+        assert _wait_for(lambda: marker in ((run / "checks.log").read_text() if (run / "checks.log").exists() else ""))
+        n = len(asked)
+        assert _wait_for(lambda: len(asked) >= n + 3), "it keeps asking while it waits"
+        assert not execs and t.is_alive(), "an unchanged runtime tree: no re-exec"
+        mod.write_text("A = 22\n")
+        os.utime(mod, ns=(1, 1))
+        t.join(30)
+        assert not t.is_alive() and ended == ["exec"] and not ran.exists()
+        (path, argv, envs, lanes), = execs
+        assert envs[checkcap.REEXEC_ENV] == f"{ttp.__version__}+{checkcap._tree(pkg)}", envs
+        assert lanes == [(True, True, os.getpid())], "its lane is kept for the new process"
+        assert not locks.queued(checkcap.slot_dir(), checkcap.RESOURCE), "its queue ticket goes with it"
+        assert envs[checkcap.ARRIVED_ENV] == repr(arrived) and cli._checks_arrived() == arrived, "its place"
+    finally:
+        held.close()
+        t.join(30)
 
 
 def test_a_routine_run_leaves_freed_test_slots_to_a_parked_urgent_run_of_its_own_project(env, monkeypatch):

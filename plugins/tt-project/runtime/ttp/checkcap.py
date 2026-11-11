@@ -978,13 +978,26 @@ def _tree(pkg: Path) -> str:
 
 
 _TREE0: dict = {str(Path(__file__).parent): _tree(Path(__file__).parent)}   # the tree this process imported
+# upgraded() reads the tree on disk at most this often per package (a waiter asks every second or less):
+# the package's directory -> (when it last read it, what it read).
+TREE_POLL_S = 15.0
+_TREE_AT: dict = {}
+
+
+def _tree_now(pkg: Path, now: float) -> str:
+    """_tree(pkg), read again only once TREE_POLL_S passed since the last read (else that read's answer)."""
+    at, tree = _TREE_AT.get(str(pkg), (None, ""))
+    if at is None or abs(now - at) >= TREE_POLL_S:
+        tree = _tree(pkg)
+        _TREE_AT[str(pkg)] = (now, tree)
+    return tree
 
 
 def upgraded(init: Path | None = None, now: float | None = None, settle: float | None = None) -> str:
     """The runtime version now installed where this process imported its code from (`init`: that package's
     __init__.py), when it differs from the version it runs, or the same version with its code changed on
-    disk since this process imported it (_tree: "<version>+<fingerprint>"), and has stayed for `settle`
-    seconds (UPGRADE_SETTLE_S), else "". A version it re-executed for already (REEXEC_ENV) is never returned
+    disk since this process imported it (_tree, read at most every TREE_POLL_S: "<version>+<fingerprint>"),
+    and has stayed for `settle` seconds (UPGRADE_SETTLE_S), else "". A version it re-executed for already (REEXEC_ENV) is never returned
     again, so a re-execution that did not take the new code cannot loop."""
     from . import __file__ as own_init, __version__
     now = time.time() if now is None else now
@@ -996,8 +1009,9 @@ def upgraded(init: Path | None = None, now: float | None = None, settle: float |
     m = re.search(r'^__version__\s*=\s*["\']([^"\']+)["\']', text, re.M)
     new = m.group(1) if m else ""
     if new and new == __version__:
-        was = _TREE0.setdefault(str(init.parent), _tree(init.parent))
-        if was and (now_tree := _tree(init.parent)) and now_tree != was:
+        if (was := _TREE0.get(str(init.parent))) is None:   # never read on each call (setdefault would)
+            was = _TREE0[str(init.parent)] = _tree(init.parent)
+        if was and (now_tree := _tree_now(init.parent, now)) and now_tree != was:
             new = f"{new}+{now_tree}"
     if not new or new == __version__ or new == os.environ.get(REEXEC_ENV):
         _SEEN.clear()
