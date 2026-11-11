@@ -1305,11 +1305,20 @@ def _named_owner(db, chat: str, text: str) -> int | None:
     return hits[0] if len(hits) == 1 else None
 
 
+def authored(text: str) -> str:
+    """`text` without the footer the harness appends to a sent reply (onhost: "Status now: #12: queued
+    for a worker, ETA ..."): the queue forecast is the harness's, never the sender's own promise."""
+    from .claimcheck import STATUS_TAIL
+    return (text or "").partition(STATUS_TAIL)[0]
+
+
 def record_promises(p, sent: list[tuple[int, str | None, str]], tasks: dict[int, str | None],
                     obligations: list[str] = (), now: float | None = None, explicit=(),
                     plans: dict[str, str] | None = None) -> list[str]:
     """Record the commitments in this batch's sent messages (message id, chat, text). `tasks`: the batch's
-    tasks by id with their reply_chat; one replying to a promise's chat owns it. `obligations`: the ids the
+    tasks by id with their reply_chat; one replying to a promise's chat owns it, unless it was cancelled or
+    the promise's words name others of them (#id): those own it. Only the sender's own words count (authored:
+    never the harness's appended status footer). `obligations`: the ids the
     batch recorded or attached owners to; one owned by a task that owns the promise is linked to it, and
     the promise closes with it. `explicit`: the message ids of replies that named `owners` or `delivers`;
     any other promise no batch task owns is attached to the one open task its text names in that chat
@@ -1317,10 +1326,13 @@ def record_promises(p, sent: list[tuple[int, str | None, str]], tasks: dict[int,
     (replan.batch_plans); a new time for a promise past its due with none is flagged (replan.flag_reply).
     Returns a note per promise."""
     now = time.time() if now is None else now
+    sent = [(mid, chat, authored(text)) for mid, chat, text in sent]
     found = [(mid, _chat(chat), said) for mid, chat, text in sent if (said := commitments(text))]
     if not found:
         return []
     full = {mid: text for mid, _, text in sent}
+    gone = {r["id"] for r in p.db.q(f"SELECT id FROM tasks WHERE status='cancelled' AND id IN "
+                                    f"({','.join('?' * len(tasks))})", list(tasks))} if tasks else set()
     from . import replan, timefmt
     tz = timefmt.tzinfo(p)
     hours = default_h(p.config())
@@ -1331,7 +1343,9 @@ def record_promises(p, sent: list[tuple[int, str | None, str]], tasks: dict[int,
         for mid, chat, said in found:
             text = " ".join(" ".join(said).split())[:PROMISE_TEXT_MAX]
             due = next((d for s in said if (d := promise_due(s, now, tz)) is not None), None)
-            owners = sorted(t for t, c in tasks.items() if c is not None and _chat(c) == chat)
+            owners = sorted(t for t, c in tasks.items() if c is not None and _chat(c) == chat and t not in gone)
+            cited = {int(m) for x in said for m in TASK_REF.findall(x)} & set(owners)
+            owners = sorted(cited) or owners   # the batch task its own words name owns it, not every one
             named = None if owners or mid in explicit else _named_owner(p.db, chat, full.get(mid, ""))
             if named is not None:
                 owners = [named]
