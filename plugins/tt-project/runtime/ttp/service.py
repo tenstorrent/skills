@@ -604,9 +604,10 @@ def restart_service(p: Project) -> str:
             if r.returncode == 0:
                 return "restarted"
             why = _manager_said("launchctl bootstrap and kickstart", r).replace("\n", " ")[:300]
-        with open(p.logs / "daemon.out", "a") as f:
-            f.write(f"{datetime.now():%Y-%m-%d %H:%M:%S} restart by hand ({why}): the daemon runs at its "
-                    f"starter's CPU priority (background when the watchdog started it)\n")
+        line = (f"{datetime.now():%Y-%m-%d %H:%M:%S} restart by hand ({why}): the daemon runs at its "
+                f"starter's CPU priority (background when the watchdog started it)\n")
+        with open_append_or_null(p.logs / "daemon.out", text=line) as f:
+            f.write(line)
     _spawn(p)
     return "restarted"
 

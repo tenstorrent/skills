@@ -27362,6 +27362,8 @@ DURABLE_EXEMPT = {
     ("checkcap.py", "os.replace(log, d / old)"): "rotates a bounded checks slot log (waits, grants); a rename lost to a crash leaves the log one generation longer",
     ("checkcap.py", "tmp.write_text(json.dumps(rec))"): "a checks-yield request or answer, or a preempt's claim on the slot it frees, read only while the processes involved live; one lost to a crash leaves the asker re-asking, seeing the run gone, or the slot in the normal turn",
     ("checkcap.py", "os.replace(tmp, path)"): "publishes that checks-yield request or answer atomically; same lifetime as above",
+    ("checkcap.py", "got[-DEMAND_KEEP:]"): "trims the bounded CPU-demand sample log (load guard); a sample lost to a crash or a race only shortens the window it is read over",
+    ("checkcap.py", 'path.open("a") as f'): "appends one CPU-demand sample to that log; same lifetime as above",
     ("checkcap.py", "_preempt_path(pid).write_text("): "an urgent run's preempt request, read only while both live; one lost to a crash only leaves that run waiting as before",
     ("shared.py", '.guard", "a")'): "a flock guard file, never written",
     ("globalcap.py", 'global-spend.lock", "a")'): "a flock guard file, never written",

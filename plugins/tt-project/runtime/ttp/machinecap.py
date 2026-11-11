@@ -296,9 +296,8 @@ def _locked(home: Path | None = None):
             data = {}
         data.setdefault("projects", {})
         yield data
-        tmp = path.with_name(f".{STATE}.{os.getpid()}")
-        tmp.write_text(json.dumps(data, indent=1, sort_keys=True))
-        os.replace(tmp, path)
+        from .project import durable_write
+        durable_write(path, json.dumps(data, indent=1, sort_keys=True))
 
 
 def _alive(pid) -> bool:
