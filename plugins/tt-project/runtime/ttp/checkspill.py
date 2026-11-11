@@ -70,7 +70,9 @@ a wrapper missing there being a host fault (remotecheck), else unwrapped. A run 
 (OFF_ENV): a spill host's own environment never fails a change, only a pass there counts, unless the tests gate proved
 its failures new there (they pass on the base on that host: gatejudge.known_new), which fails it. The rerun waits for a slot here
 as any run does and may spill to another listed host, never back to one its checks failed on (spill_off_add): a host fault
-there (exit 75: the host paused, its lock or a tool gone mid-run) leaves that host one more try, once pick finds it free.
+there (exit 75: the host paused, its lock or a tool gone mid-run) leaves that host one more try, once pick finds it free,
+and a host its own fault kept off is tried again once the checks config changes (a new checks.spill_wrap_cmd) or
+after FAULT_RETRY_S. Each bound of its wait here tries them all again, so a waiting run moves to the first that can take it.
 With none left it runs here, whose result counts.
 
 A check that runs an agent CLI (AGENT_CLIS, the claude CLI among them, in command position after its
@@ -116,6 +118,7 @@ REMOTE_ONLY_ENV = "TTP_TEST_REMOTE_ONLY"   # tests: "1"/"0" instead of this mach
 SPILL_AFTER_S = 60.0
 OFF_ENV = "TTP_CHECKS_NO_SPILL"   # "1": these checks never spill; else the hosts a rerun keeps off (spill_off_add)
 HOST_FAULT_TRIES = 2   # a spill host whose own fault (exit 75) ended a run this often is kept off its rerun
+FAULT_RETRY_S = 600   # for this long, or until the checks config changes; then it is tried again
 ENV_FAULT_HOSTS = 2   # the checks failed at import this often on spill hosts: one fault of the spill env config
 ENV_RETRY_S = 900   # after which (or once the checks config changes) a run tries the spill hosts again
 PROBE_TIMEOUT_S = 30
@@ -995,21 +998,37 @@ def all_off(off: str) -> bool:
     return off == "1"
 
 
-def spill_off_add(off: str, host: str, fault: bool, env_cfg: dict | None = None) -> str:
+def spill_off_add(off: str, host: str, fault: bool, env_cfg: dict | None = None, cfg: dict | None = None) -> str:
     """OFF_ENV's value after the checks did not pass on spill host `host`: `fault` when the host's own fault
     ended them (exit 75), else they failed or timed out there. `env_cfg`: they failed at import for want of a
-    package (push.env_problem), a fault of the spill env config `env_cfg` (env_off), never of the host."""
+    package (push.env_problem), a fault of the spill env config `env_cfg` (env_off), never of the host.
+    A fault is marked with its time and the checks config `cfg` it ran under, so it expires (kept_off)."""
     mark = (f"env.{_env_key(env_cfg)}.{int(time.time())}" if env_cfg is not None
-            else "fault" if fault else "fail")
+            else f"fault.{_env_key(cfg) if cfg is not None else ''}.{int(time.time())}" if fault else "fail")
     return ",".join([*(e for e in off.split(",") if e and e != "1"), f"{host}:{mark}"])
 
 
-def kept_off(off: str) -> set[str]:
+def _fault_counts(why: str, key: str | None, now: float) -> bool:
+    """Whether the fault mark `why` still counts: under the checks config whose key is `key` (None: any; a
+    mark with none recorded: any) and within FAULT_RETRY_S. A plain "fault" (an older run's mark) always does."""
+    if why == "fault":
+        return True
+    if not why.startswith("fault."):
+        return False
+    _, k, at = (why.split(".") + ["", ""])[:3]
+    return (key is None or not k or k == key) and at.isdigit() and now - int(at) <= FAULT_RETRY_S
+
+
+def kept_off(off: str, cfg: dict | None = None, now: float | None = None) -> set[str]:
     """The spill hosts OFF_ENV's value `off` keeps a rerun off: each its checks failed on, and each whose own
-    fault ended them HOST_FAULT_TRIES times. An import failure keeps no host off (env_off)."""
+    fault ended them HOST_FAULT_TRIES times under the checks config `cfg` has now (None: any) within the last
+    FAULT_RETRY_S; once that config changes (a fixed checks.spill_wrap_cmd) or the time passes, it is tried
+    again. An import failure keeps no host off (env_off)."""
+    now = time.time() if now is None else now
+    key = None if cfg is None else _env_key(cfg)
     seen = [e.rpartition(":") for e in off.split(",") if e and e != "1"]
-    return {h for h, _, why in seen if not why.startswith("env.") and (why != "fault"
-            or sum(1 for h2, _, w2 in seen if h2 == h and w2 == "fault") >= HOST_FAULT_TRIES)}
+    return {h for h, _, why in seen if not why.startswith("env.") and (
+            why == "fail" or sum(1 for h2, _, w2 in seen if h2 == h and _fault_counts(w2, key, now)) >= HOST_FAULT_TRIES)}
 
 
 def _env_key(cfg: dict | None) -> str:
@@ -1066,7 +1085,7 @@ def pick(p, cfg: dict, tell, what: str = "", off: str = "", why_here: str = "") 
     LAST_BUSY.clear()
     rec = {"project": p.name, "task": os.environ.get("TTP_TASK") or "", "run": os.environ.get("TTP_RUN_ID") or "",
            "pid": os.getpid(), "since": time.time(), "what": what[:300]}
-    skipped, keep = [], kept_off(off)
+    skipped, keep = [], kept_off(off, cfg)
     if env := env_off(off, cfg):
         tell(f"no spill host could take the checks, waiting here: {env}")
         _note_pick(p.name, "", [f"{alias} ({env})" for alias in hosts(cfg)])

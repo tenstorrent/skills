@@ -778,6 +778,132 @@ def test_spill_off_keeps_a_failed_host_off_and_a_faulted_one_after_its_second_fa
     assert checkspill.kept_off(checkspill.spill_off_add("1", "user@host-c:22", fault=False)) == {"user@host-c:22"}
 
 
+def test_a_host_kept_off_by_its_own_faults_is_tried_again_once_the_wrapper_changes_or_the_back_off_passes():
+    """#7917: a spill host whose own fault (exit 75) ended the checks HOST_FAULT_TRIES times is kept off under
+    the checks config they ran with, never for good: a new checks.spill_wrap_cmd, or FAULT_RETRY_S later, it is
+    tried again. A host the checks failed on stays off."""
+    from ttp import checkspill
+    old = {"checks": {"spill_wrap_cmd": "old-wrap"}}
+    off = checkspill.spill_off_add("", "host-a", fault=True, cfg=old)
+    off = checkspill.spill_off_add(off, "host-b", fault=False, cfg=old)
+    assert checkspill.kept_off(off, old) == {"host-b"}, "one fault leaves it one more try"
+    off = checkspill.spill_off_add(off, "host-a", fault=True, cfg=old)
+    assert checkspill.kept_off(off, old) == {"host-a", "host-b"}
+    assert checkspill.kept_off(off) == {"host-a", "host-b"}, "no config given: the time alone decides"
+    new = {"checks": {"spill_wrap_cmd": "new-wrap"}}
+    assert checkspill.kept_off(off, new) == {"host-b"}, "a changed wrapper tries the host again"
+    later = time.time() + checkspill.FAULT_RETRY_S + 1
+    assert checkspill.kept_off(off, old, now=later) == {"host-b"}, "so does the back-off passing"
+    assert checkspill.kept_off("host-a:fault,host-a:fault", new) == {"host-a"}, "an older run's plain mark holds"
+
+
+def test_a_run_waiting_here_moves_to_a_spill_host_once_its_lock_frees(env, tmp_path, monkeypatch):
+    """#7917: a run that found its only spill host busy waits here in its place and tries the host again at
+    each bound: once the host's lock frees it spills there, the lane here still held."""
+    import threading
+    from ttp import checkspill, cli
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a"])
+    log = tmp_path / "where.log"
+    cmd = f"pwd >> {log}"
+    p.set_config("delivery.push_checks", [cmd])
+    busy = []
+    monkeypatch.setattr(checkspill, "lock_busy", lambda _p, _c, _a: (
+        busy.append(1) or "busy (held by another run; 1 waiting)") if len(busy) < 3 else "")
+    lane = _spill_lane(p, repo)
+    safety = threading.Timer(30, lane.close)   # never hang the suite: the lane frees after 30 s at the latest
+    safety.start()
+    try:
+        cli.main(["checks", "--fresh"])
+    finally:
+        safety.cancel()
+        lane.close()
+    rec = json.loads((run / "checks.json").read_text())
+    assert rec["passed"] is True and rec.get("spilled_to") == "check-host-a", rec
+    assert len(busy) == 3, busy
+    text = (run / "checks.log").read_text()
+    assert "check-host-a (busy (held by another run" in text and "spilling to check-host-a" in text, text
+    assert "/ttp-check." in log.read_text()
+    assert checkspill.holders(p.name) == []
+
+
+def test_a_waiting_rerun_moves_to_a_host_its_faults_kept_off_once_the_wrapper_changes(env, tmp_path, monkeypatch):
+    """#7917: a rerun whose only spill host faulted twice under the old checks.spill_wrap_cmd waits here; once
+    the wrapper changes, the next bound tries that host again and the run moves there."""
+    import io
+    from ttp import checkspill, cli
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a"])
+    p.set_config("checks.spill_wrap_cmd", "old-wrap")
+    off = ""
+    for _ in range(checkspill.HOST_FAULT_TRIES):
+        off = checkspill.spill_off_add(off, "check-host-a", fault=True, cfg=p.config())
+    real, results = checkspill.pick, []
+
+    def pick(*a, **k):
+        results.append(real(*a, **k))
+        if len(results) == 2:   # the wrapper is fixed while the run waits here
+            p.set_config("checks.spill_wrap_cmd", "new-wrap")
+        return results[-1]
+    monkeypatch.setattr(checkspill, "pick", pick)
+    lane = _spill_lane(p, repo)
+    try:
+        slot = cli._checks_slot(p, run, io.StringIO(), "f" * 40, True, cmds=["true"], top=str(repo),
+                                spill=True, spill_off=off)
+    finally:
+        lane.close()
+    try:
+        assert slot is not None and slot.spill is not None and slot.spill.host == "check-host-a", results
+        assert results[:2] == [None, None] and results[-1] is slot.spill, results
+    finally:
+        slot and slot.close()
+
+
+def test_a_run_with_no_usable_spill_host_still_waits_here_under_the_load_guard(env, tmp_path, monkeypatch):
+    """#7917 (checks.load_guard, a safety rule): a run whose only spill host its faults keep off tries it at
+    each bound and finds it off, takes no host-wide checks slot while the guard holds, and starts here only
+    once the floor frees."""
+    import io
+    from ttp import checkcap, checkspill, cli, testslots
+    monkeypatch.delenv("TTP_CHECKS_LOAD_GUARD", raising=False)
+    monkeypatch.setattr(checkcap, "cores", lambda: 64)
+    monkeypatch.setattr(checkcap, "_load", lambda: 900.0)
+    monkeypatch.setattr(checkcap, "cpu_demand", lambda: 900.0)
+    monkeypatch.setenv("TTP_TEST_POOL", "4")
+    p = make(env)
+    p.set_config("delivery.checks_spill_hosts", ["check-host-a"])
+    p.set_config("delivery.checks_spill_after_s", 0.3)
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "4")
+    monkeypatch.setenv("TTP_RUN_DIR", str(run_dir))
+    off = ""
+    for _ in range(checkspill.HOST_FAULT_TRIES):
+        off = checkspill.spill_off_add(off, "check-host-a", fault=True, cfg=p.config())
+    floor = _hold_load_floor()   # another run holds the one routine pass
+    real, results, grants = checkspill.pick, [], []
+    before = len(checkcap.grant_records())
+
+    def pick(*a, **k):
+        results.append(real(*a, **k))
+        if len(results) == 3:
+            grants.append(len(checkcap.grant_records()) - before)
+            floor.close()
+        return results[-1]
+    monkeypatch.setattr(checkspill, "pick", pick)
+    out = io.StringIO()
+    try:
+        assert testslots.load_guard()
+        slot = cli._checks_slot(p, run_dir, out, "f" * 40, True, cmds=["true"], top=str(p.base), spill=True,
+                                spill_off=off)
+    finally:
+        floor.close()
+    try:
+        assert slot is not None and slot.spill is None and slot.f is not None, "it ran here"
+        assert len(results) >= 3 and not any(results) and grants == [0], (results, grants)
+        assert "check-host-a (these checks did not pass there in this run)" in out.getvalue(), out.getvalue()
+    finally:
+        slot.close()
+
+
 def test_an_urgent_rerun_after_a_spill_host_still_takes_a_free_pool_host_at_once(env, tmp_path, monkeypatch):
     """#6379: an urgent rerun of checks that failed on a spill host still goes first: it asks the pool at
     once (no checkspill.after_s wait), keeping off the host it failed on, and takes no Slurm overflow."""

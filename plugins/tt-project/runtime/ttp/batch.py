@@ -2401,7 +2401,7 @@ class Batch:
         host free, else here: the host's fault never fails or holds the batch. A host faulting
         checkspill.HOST_FAULT_TRIES times is kept off the rest of the batch (spill_off)."""
         host, was = push.remote_host(cmd), getattr(cmd, "was", cmd)
-        self.spill_off = checkspill.spill_off_add(self.spill_off, host, True)
+        self.spill_off = checkspill.spill_off_add(self.spill_off, host, True, cfg=self.p.config())
         say(f"spill host {host} could not run {was} ({fault.get('why') or 'ssh or the host failed'}): "
             "trying the next spill host, else here")
         nxt = self._spill([was], head, claims)[0]

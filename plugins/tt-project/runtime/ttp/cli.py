@@ -4428,13 +4428,16 @@ def cmd_checks(a) -> None:
                 except OSError:
                     pass
             no_spill = checkspill.spill_off_add(no_spill, spilled.host, rc == 75 and not timed_out,
-                                                p.config() if env_why else None)
+                                                p.config() if env_why else None, cfg=p.config())
             if env_why:
                 checkspill.env_event(p.db, no_spill, p.config())
             said = (f"the checks did not pass on spill host {spilled.host} ({how}"
                     + (f": {env_why.partition(';')[0]}, a fault of the spill env, not the change" if env_why else "")
                     + "); running them again on this machine, whose result counts, or on a free spill host "
-                    + ("they did not fail on" if spilled.host in checkspill.kept_off(no_spill)
+                    + (("they did not fail on" + (f" (that one again once the checks config changes or in "
+                        f"{checkspill.FAULT_RETRY_S // 60} min: the host's own fault ended them there)"
+                        if rc == 75 and not timed_out else ""))
+                       if spilled.host in checkspill.kept_off(no_spill, p.config())
                        else "(that one again once free: the fault was the host's)" if not env_why
                        else "(any one, until the same import fails on another)"))
             out.write(f"ttp checks: {said}\n")
