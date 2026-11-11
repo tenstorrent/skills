@@ -787,17 +787,80 @@ def test_a_failed_or_timed_out_after_push_keeps_the_push_and_alerts_once(env, mo
     assert not alerts_mod.holds(p.db, "after_push_failed", since, time.time()), "a success clears it"
 
 
-def test_an_after_push_whose_process_died_is_reported_as_killed(env, monkeypatch):
+def test_an_after_push_whose_process_died_is_run_again_once_and_alerts_only_when_that_fails(env, monkeypatch):
+    """A killed deploy (process gone, lock free) gets one detached rerun at the same sha, with no alert;
+    only a rerun that dies too alerts, and there is never a second rerun."""
     from ttp import pushq
     p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
     folder = p.state / "after_push"
     folder.mkdir(parents=True)
     (folder / "p1.json").write_text(json.dumps({"id": "p1", "status": "running", "pushed_sha": "a" * 40,
                                                 "target": "origin/proj", "started": time.time()}))
-    raised = []
+    spawned, raised = [], []
+    monkeypatch.setattr(pushq, "subprocess", types.SimpleNamespace(DEVNULL=subprocess.DEVNULL,
+                                                                    Popen=lambda argv, **k: spawned.append(argv)))
+    assert pushq.tend_receipts(p, lambda key, text, **k: raised.append(text)) == []
+    m = json.loads((folder / "p1.json").read_text())
+    assert len(spawned) == 1 and not raised and m["status"] == "rerun" and m["tries"] == 1
+    assert "killed" in p.db.one("SELECT text FROM events WHERE kind='after_push_resumed'")["text"]
+    m["status"] = "running"      # its rerun started, then died as well
+    (folder / "p1.json").write_text(json.dumps(m))
     assert pushq.tend_receipts(p, lambda key, text, **k: raised.append(text)) == ["p1"]
+    assert len(spawned) == 1, "never a second rerun"
     assert len(raised) == 1 and "stopped before it finished" in raised[0]
-    assert json.loads((folder / "p1.json").read_text())["after_push"]["status"] == "killed"
+    ap = json.loads((folder / "p1.json").read_text())["after_push"]
+    assert ap["status"] == "killed" and "its one rerun" in ap["tail"]
+
+
+def test_a_killed_after_push_a_newer_deploy_replaced_is_recorded_superseded_without_an_alert(env, monkeypatch):
+    from ttp import pushq
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    folder = p.state / "after_push"
+    folder.mkdir(parents=True)
+    t = time.time()
+    (folder / "p1.json").write_text(json.dumps({"id": "p1", "status": "running", "pushed_sha": "a" * 40,
+                                                "target": "origin/proj", "started": t - 60}))
+    (folder / "p2.json").write_text(json.dumps({"id": "p2", "status": "running", "pushed_sha": "b" * 40,
+                                                "target": "origin/proj", "started": t - 10, "pid": os.getpid()}))
+    spawned, raised = [], []
+    monkeypatch.setattr(pushq, "subprocess", types.SimpleNamespace(DEVNULL=subprocess.DEVNULL,
+                                                                    Popen=lambda argv, **k: spawned.append(argv)))
+    monkeypatch.setattr(pushq.locks, "any_free", lambda paths: "p2" not in str(paths[0]))
+    assert pushq.tend_receipts(p, lambda key, text, **k: raised.append(text)) == ["p1"]
+    m = json.loads((folder / "p1.json").read_text())
+    assert m["after_push"]["status"] == "superseded" and m["after_push"]["by"] == "push bbbbbbb"
+    assert not spawned and not raised
+    assert p.db.one("SELECT id FROM events WHERE kind='after_push_superseded'")
+    assert not p.db.one("SELECT id FROM events WHERE kind='after_push_failed'")
+
+
+def test_an_after_push_completes_when_its_caller_is_killed_right_after_the_push(env, monkeypatch):
+    """`timeout` around `ttp push` SIGTERMs its process group: the deploy runs in a session of its own
+    and the receipt still reads ok."""
+    import signal
+    from ttp import push
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    began, done = env["tmp"] / "began", env["tmp"] / "done"
+    p.set_config("delivery.after_push", [f"touch {began}; sleep 2; touch {done}"])
+    _commit(repo, "mine.txt", "mine\n")
+    pid = os.fork()
+    if pid == 0:     # the caller: its own group, as under `timeout`
+        try:
+            os.setsid()
+            push.run(p, repo)
+        finally:
+            os._exit(0)
+    deadline = time.time() + 60
+    while not began.exists() and time.time() < deadline:
+        time.sleep(0.05)
+    assert began.exists(), "after_push started"
+    os.killpg(pid, signal.SIGTERM)
+    os.waitpid(pid, 0)
+    assert not done.exists(), "the caller died while the deploy ran"
+    while time.time() < deadline and not (_receipts(p) and _receipts(p)[0].get("status") == "finished"):
+        time.sleep(0.1)
+    (r,) = _receipts(p)
+    assert r["status"] == "finished" and r["after_push"]["status"] == "ok" and done.exists(), r
 
 
 def test_a_newer_ok_receipt_clears_an_after_push_failure_an_older_one_raised_in_the_same_tick(env, monkeypatch):
@@ -834,7 +897,7 @@ def test_an_ordinary_push_gives_after_push_the_version_at_the_pushed_commit(env,
 
 
 def test_a_malformed_after_push_is_recorded_as_a_failure_that_alerts(env, monkeypatch, capsys):
-    from ttp import push, pushq
+    from ttp import batch, push, pushq
     p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
     p.set_config("delivery.after_push", 5)
     _commit(repo, "mine.txt", "mine\n")
@@ -856,6 +919,7 @@ def test_a_malformed_after_push_is_recorded_as_a_failure_that_alerts(env, monkey
             raise ValueError("bad entry")
         return real(v)
     monkeypatch.setattr(push, "check_list", check_list)
+    monkeypatch.setattr(batch, "_run_detached", lambda *a: None)   # in this process, where the patch holds
     _commit(repo, "two.txt", "two\n")
     assert push.run(p, repo) == 0 and push.last_after["status"] == "failed"
     pushq.tend_receipts(p, lambda key, text, **k: raised.append(key))

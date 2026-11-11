@@ -27432,6 +27432,7 @@ DURABLE_EXEMPT = {
     ("batch.py", '(Path(d) / name).write_bytes(_blob(repo, rev, path) or b"")'): "git merge-file's inputs when checking a landed rewrite carries a commit's work, in a temporary directory removed after",
     ("batch.py", "(Path(d) / name).write_bytes(text.encode())"): "git merge-file --union's inputs for a shared doc (settle_union), in a temporary directory removed after",
     ("batch.py", "(Path(d) / name).write_bytes(text)"): "git merge-file --diff3's inputs to read a shared doc's conflict hunks (_doc_hunks), in a temporary directory removed after",
+    ("batch.py", 'with open(log, "ab") as out:'): "the after_push process's output log beside its receipt, only shown to people; the outcome is the receipt, written durably",
     ("batch.py", "open(f, 'w').writelines(keep)"): "the sequence editor of a batch's rebase rewrites git's own todo file of that rebase in the push worktree, which git reads right after; a crash aborts the rebase and the next batch makes the worktree anew",
     ("daemon.py", "runner.log"): "a log",
     ("redact.py", 'with open(log, "ab") as out:'): "a detached masking job's log (scrub.log), appended to",

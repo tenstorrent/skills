@@ -294,7 +294,7 @@ No `result.json`, no credit.
   ssh) or a slow poll detached (`ttp detach`), hand off `waiting` with its `retry_when`: that frees your slot.
 <!-- ttp:if wait -->
   Push with `ttp push --detach` (delivery: reviews and landings) or `ttp push --own --detach`
-  (your task branch). A command your task's rules say to run in the foreground gets your
+  (your task branch), never in `timeout`. Foreground commands your rules need get your
   longest timeout.
 <!-- /ttp:if wait -->
 - Anything still running when you stop dies with you unless detached: `ttp detach <name> -- <cmd>`

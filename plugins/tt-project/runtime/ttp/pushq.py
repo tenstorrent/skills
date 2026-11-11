@@ -3028,19 +3028,31 @@ def tend_receipts(p: Project, alert: Callable = lambda *a, **k: None, now: float
                 and int(m.get("tries") or 0) >= MAX_RESUMES:
             m["status"] = "running"     # its rerun never got going: reported below as stopped
             write_json(receipt, m)
-        if m.get("status") in ("held", "rerun") or (m.get("status") == "running" and locks.any_free(
-                [batch._after_lock(p, rid)]) and _read(receipt).get("status") == "running"
-                and m.get("boot") and not runner.same_boot(m.get("boot")) and int(m.get("tries") or 0) < MAX_RESUMES):
-            _rerun_receipt(p, receipt, rid, now)      # held for a power cycle, or a reboot cut it short
+        cut = m.get("status") == "running" and locks.any_free([batch._after_lock(p, rid)]) \
+            and _read(receipt).get("status") == "running"    # read after the lock: the outcome is written before it goes
+        if cut and (newer := _newer_deploy(p, folder, m)):
+            m = _read(receipt)     # a newer deploy of the same branch replaced it: recorded, never run again
+            m.update(status="finished", ended=now, after_push={
+                "status": "superseded", "exit": None, "started": m.get("started"), "by": newer,
+                "tail": f"stopped before it finished; {newer}'s after_push deploys a newer push of {m.get('target')}"})
+            _event(p.db, None, "after_push_superseded", f"after_push of {_short(m.get('pushed_sha'))} stopped before "
+                   f"it finished; {newer}'s newer after_push of {m.get('target') or '?'} replaces it", queued=False)
+            m["reported"] = now
+            write_json(receipt, m)
+            done.append(rid)
+            continue
+        if m.get("status") in ("held", "rerun") or (cut and int(m.get("tries") or 0) < MAX_RESUMES):
+            _rerun_receipt(p, receipt, rid, now)      # held for a power cycle, or killed or cut by a reboot: once
             continue
         if m.get("status") == "running":
-            if not locks.any_free([batch._after_lock(p, rid)]):
+            if not cut:
                 continue
-            m = _read(receipt)     # read after the lock: the process writes its outcome before letting go
+            m = _read(receipt)
             if m.get("status") == "running":
                 m.update(status="finished", ended=now, after_push={
                     "status": "killed", "exit": None, "started": m.get("started"),
-                    "tail": "the process ended before after_push finished (killed, crashed or rebooted)"})
+                    "tail": "the process ended before after_push finished (killed, crashed or rebooted)"
+                            + (", and so did its one rerun" if int(m.get("tries") or 0) else "")})
         ap = m.get("after_push") if isinstance(m.get("after_push"), dict) else {}
         status = str(ap.get("status") or "failed")
         what = _short(m.get("pushed_sha")) + f" to {m.get('target') or '?'}" + (
@@ -3065,6 +3077,25 @@ def tend_receipts(p: Project, alert: Callable = lambda *a, **k: None, now: float
     return done
 
 
+def _newer_deploy(p: Project, folder: Path, m: dict) -> str:
+    """What replaced the stopped after_push of receipt `m`: a newer ordinary push's after_push of the same
+    target that has started (its receipt, unless held), or a push batch that pushed to it since; else ""."""
+    target, started = m.get("target"), float(m.get("started") or 0)
+    if not target or not started:
+        return ""
+    for other in sorted(folder.glob("*.json"), reverse=True):
+        o = _read(other)
+        if o and o.get("id") != m.get("id") and o.get("target") == target and o.get("status") != "held" \
+                and float(o.get("started") or 0) > started:
+            return f"push {_short(o.get('pushed_sha'))}"
+    try:
+        row = p.db.one("SELECT id FROM push_batches WHERE target=? AND outcome='pushed' AND COALESCE(ended, started)>? "
+                       "ORDER BY started DESC LIMIT 1", (target, started))
+    except Exception:
+        row = None
+    return f"push batch {row['id']}" if row else ""
+
+
 def _rerun_receipt(p: Project, receipt: Path, rid: str, now: float) -> None:
     """An ordinary push's after_push that waited for a power-cycle notice (no resume spent) or that a reboot
     cut short (once, MAX_RESUMES): run it again, detached (batch.rerun_receipt), once no notice holds."""
@@ -3075,17 +3106,19 @@ def _rerun_receipt(p: Project, receipt: Path, rid: str, now: float) -> None:
         return          # its process is starting (or another tick started it): not twice
     if m.get("status") in ("running", "rerun"):
         m["tries"] = int(m.get("tries") or 0) + 1
-        why = "a reboot cut it short"
+        why = "a reboot cut it short" if m.get("boot") and not runner.same_boot(m.get("boot")) else \
+            "its process was killed before it finished"
     else:
         why = "the power-cycle notice it waited for is gone" if m.get("status") == "held" else "its rerun did not start"
     m.update(status="rerun", rerun_at=now)
     write_json(receipt, m)
     try:
         # own session: the rerun deploy outlives this tick, like the after_push run it replaces
-        subprocess.Popen(batch.rerun_argv(p, receipt), cwd=str(p.root), stdin=subprocess.DEVNULL,
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
-                         env={**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1]),
-                              "TTP_PROJECT": str(p.base)})
+        with open(receipt.with_suffix(".log"), "ab") as out:
+            subprocess.Popen(batch.rerun_argv(p, receipt), cwd=str(p.root), stdin=subprocess.DEVNULL,
+                             stdout=out, stderr=out, start_new_session=True,
+                             env={**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1]),
+                                  "TTP_PROJECT": str(p.base)})
     except OSError as e:
         _event(p.db, None, "after_push_failed", f"after_push of {_short(m.get('pushed_sha'))} could not run again: "
                                                 f"{e}", queued=True, severity="high")

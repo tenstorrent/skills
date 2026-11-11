@@ -3664,8 +3664,12 @@ def after_ordinary_push(p: Project, repo: Path, sha: str, target: str, tip: str 
         write_json(receipt, m)
         return {"status": "held", "reason": why, "receipt": str(receipt)}
     lock = locks.try_take([_after_lock(p, rid)], f"after_push of {sha[:10]}", "ttp push")
+    log = receipt.with_suffix(".log")
+    m["log"] = str(log)
     write_json(receipt, m)
-    try:
+    if (out := _run_detached(p, receipt, log, lock)) is not None:
+        return {**out, "receipt": str(receipt)}
+    try:   # it could not start a process of its own: here, as before
         try:
             after = after_push(p, receipt, m)
         except Exception as e:     # recorded as a failure; the push stands
@@ -3679,6 +3683,51 @@ def after_ordinary_push(p: Project, repo: Path, sha: str, target: str, tip: str 
             lock.close()
     _forget(_after_lock(p, rid))
     return {**after, "receipt": str(receipt)}
+
+
+AFTER_POLL_S = 0.2   # how often `ttp push` copies its detached after_push's log while it waits for it
+
+
+def _run_detached(p: Project, receipt: Path, log: Path, lock) -> dict | None:
+    """Run the receipt's after_push in a process of its own session (rerun_receipt), handed the receipt's
+    lock, and wait for it, copying its log: a caller killed meanwhile (a `timeout` around `ttp push`, a
+    closed terminal) no longer takes the deploy with it, and the receipt still gets its outcome. The
+    outcome the receipt records; None when the process cannot start (the caller then runs it)."""
+    try:
+        with open(log, "ab") as out:
+            fds = (lock.fileno(),) if lock is not None else ()
+            proc = subprocess.Popen(rerun_argv(p, receipt, first=True), cwd=str(p.root), stdin=subprocess.DEVNULL,
+                                    stdout=out, stderr=subprocess.STDOUT, start_new_session=True, pass_fds=fds,
+                                    env={**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1]),
+                                         "TTP_PROJECT": str(p.base),
+                                         **({LOCK_FD_ENV: str(fds[0])} if fds else {})})
+    except (OSError, ValueError) as e:
+        say(f"after_push: cannot start its own process ({type(e).__name__}: {e}); running it here")
+        return None
+    if lock is not None:
+        locks.label_pid(lock, proc.pid, via="push")   # its holder is the deploy process
+        lock.close()       # the process keeps the lock
+    say(f"after_push runs in its own process {proc.pid}, which outlives this one; log {log}, receipt {receipt}")
+    try:
+        with open(log, errors="replace") as f:
+            while True:
+                done = proc.poll() is not None
+                if text := f.read():
+                    try:
+                        sys.stdout.write(text)
+                        sys.stdout.flush()
+                    except (OSError, ValueError):
+                        pass
+                if done:
+                    break
+                time.sleep(AFTER_POLL_S)
+    except OSError:
+        proc.wait()
+    m = push._read(receipt)
+    if m.get("status") == "finished" and isinstance(m.get("after_push"), dict):
+        return m["after_push"]
+    return {"status": "killed", "exit": proc.returncode, "cmd": None, "started": m.get("started"), "ended": time.time(),
+            "tail": f"its after_push process ended (exit {proc.returncode}) before it recorded an outcome"}
 
 
 def _notice_hold(p: Project) -> str:
@@ -3703,40 +3752,44 @@ def _deploy_held(p: Project, marker: Path, m: dict, lock_path: Path, lock) -> bo
     return True
 
 
-def rerun_argv(p: Project, receipt: Path) -> list[str]:
-    """The process that runs an ordinary push's held or reboot-cut after_push (rerun_receipt); tests stub it."""
+def rerun_argv(p: Project, receipt: Path, first: bool = False) -> list[str]:
+    """The process that runs an ordinary push's after_push (rerun_receipt): its first run (`first`, handed the
+    receipt's lock by after_ordinary_push), or a held, killed or reboot-cut one again; tests stub it."""
     return [sys.executable, "-c", "import sys; from ttp import batch; from ttp.project import Project; "
-            "sys.exit(batch.rerun_receipt(Project(sys.argv[1]), sys.argv[2]))", str(p.base), str(receipt)]
+            "sys.exit(batch.rerun_receipt(Project(sys.argv[1]), sys.argv[2], first=len(sys.argv) > 3))",
+            str(p.base), str(receipt)] + (["first"] if first else [])
 
 
-def rerun_receipt(p: Project, receipt) -> int:
-    """Run the after_push a receipt names once more (pushq.tend_receipts started this): held again while
-    a power cycle is still announced."""
+def rerun_receipt(p: Project, receipt, first: bool = False) -> int:
+    """Run the after_push a receipt names: its first run (`first`: the receipt reads running and the lock
+    is the one after_ordinary_push passed down), or once more (pushq.tend_receipts started this): held
+    again while a power cycle is still announced."""
     receipt = Path(receipt)
     m = push._read(receipt)
     rid = str(m.get("id") or receipt.stem)
-    lock = locks.try_take([_after_lock(p, rid)], f"after_push of {str(m.get('pushed_sha') or '')[:10]} (again)",
-                          "the push queue")
+    lock = _hold(_after_lock(p, rid), f"after_push of {str(m.get('pushed_sha') or '')[:10]}"
+                 + ("" if first else " (again)"))
     if lock is None:
         return push.BUSY
     try:
         m = push._read(receipt) or m
-        if m.get("status") not in ("held", "rerun"):
+        if m.get("status") not in (("running",) if first else ("held", "rerun")):
             return 0      # another process ran it meanwhile
-        if why := _notice_hold(p):
+        if not first and (why := _notice_hold(p)):
             m.update(status="held", after_held={"at": time.time(), "why": why})
             write_json(receipt, m)
             return 0
-        m.update(status="running", pid=os.getpid(), boot=runner.boot_id(), resumed=time.time())
+        m.update(status="running", pid=os.getpid(), boot=runner.boot_id(), **({} if first else {"resumed": time.time()}))
         m.pop("after_held", None)
         write_json(receipt, m)
         try:
             after = after_push(p, receipt, m)
         except Exception as e:
+            say(f"after_push: {type(e).__name__}: {e}")
             after = {"status": "failed", "exit": None, "cmd": None, "tail": f"{type(e).__name__}: {e}",
-                     "started": m.get("resumed"), "ended": time.time()}
+                     "started": m.get("resumed") or m.get("started"), "ended": time.time()}
         m.update(after_push=after, status="finished", ended=time.time())
-        write_json(receipt, m)
+        write_json(receipt, m)     # before the lock goes: running with a free lock reads as killed
     finally:
         lock.close()
     _forget(_after_lock(p, rid))
