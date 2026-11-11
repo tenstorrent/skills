@@ -4966,7 +4966,16 @@ def cmd_checks(a) -> None:
                 elif executed and not timed_out and rc != 75:   # a strike there if the head then passes elsewhere
                     out.flush()
                     checkspill.strike_fail(p, spilled.host, head, remotecheck.fail_sig(_log_tail(log), rc))
-                said = (f"the checks did not pass on spill host {spilled.host} ({how}"
+                # Tests that failed there (no host fault, timeout or env fault) run once more, only here, and that
+                # result counts: never on from spill host to spill host. A workstation, which runs nothing here
+                # while a host is busy, takes the verdict of FAIL_VERDICT_HOSTS hosts instead (_spill_fail_verdict).
+                here_only = (bool(executed) and not timed_out and rc != 75 and not env_why and not slow
+                             and not checkspill.remote_only(p.config()))
+                if here_only:
+                    no_spill = "1"
+                said = (f"the checks did not pass on spill host {spilled.host} ({how}); running what failed once "
+                        "more, on this machine only, whose result counts: never on to another spill host" if here_only else
+                        f"the checks did not pass on spill host {spilled.host} ({how}"
                         + (f": {env_why.partition(';')[0]}, a fault of the spill env, not the change" if env_why else "")
                         + "); running them again on this machine, whose result counts, or on a free spill host "
                         + (("they did not fail on" + (f" (that one again once the checks config changes or in "

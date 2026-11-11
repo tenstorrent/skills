@@ -854,17 +854,23 @@ def test_a_run_that_fails_tests_on_a_spill_host_reruns_only_those_tests_here_and
 
 
 @_LINUX_TMP
-def test_a_rerun_after_a_spill_host_keeps_off_only_the_host_it_failed_on(env, tmp_path, monkeypatch):
-    """#6379: checks that fail on one spill host run again on the next free one (a pass there counts),
-    never back on the one they failed on; with every listed host kept off, paused or full they wait
-    here and run here. Before, any rerun after a spill host waited for a slot here."""
-    import threading
+def test_checks_that_fail_on_a_spill_host_run_again_only_here_and_a_host_fault_still_moves_on(
+        env, tmp_path, monkeypatch):
+    """#8400: checks that fail tests on a spill host (exit 1) run again once, on this machine only, whose result
+    counts: never on to the next spill host (before, a change failing everywhere went from host to host). A host's
+    own fault (exit 75) still moves them to another free spill host, where a pass counts, never back to that one."""
     from ttp import checkspill, cli
     p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a", "check-host-b"])
-    hosts = tmp_path / "ssh.log"
-    monkeypatch.setenv("FAKE_SSH_LOG", str(hosts))
-    mark, log = tmp_path / "failed-once", tmp_path / "where.log"
-    p.set_config("delivery.push_checks", [f"pwd >> {log}; test -e {mark} || {{ touch {mark}; exit 1; }}"])
+    p.set_config("delivery.checks_remote_only", False)   # a workstation takes the hosts' verdict instead
+    git = ["git", "-C", str(repo), "-c", "user.email=t@example.com", "-c", "user.name=t"]
+    mark, log = tmp_path / "refused-once", tmp_path / "where.log"
+    (repo / "refuse-once.sh").write_text(f'#!/bin/sh\ntest -e {mark} && exec "$@"\ntouch {mark}\n'
+                                         ': > "$TTP_WRAP_REFUSED"\nexit 75\n')   # the host busy once (a refusal)
+    (repo / "refuse-once.sh").chmod(0o755)
+    subprocess.run([*git, "add", "-A"], check=True)
+    subprocess.run([*git, "commit", "-qm", "wrap"], check=True)
+    p.set_config("delivery.push_checks", [{"run": f"pwd >> {log}", "host": "local", "spill": True,
+                                           "spill_wrap_cmd": "./refuse-once.sh"}])
     lane = _spill_lane(p, repo)
     try:
         cli.main(["checks", "--fresh"])
@@ -873,36 +879,31 @@ def test_a_rerun_after_a_spill_host_keeps_off_only_the_host_it_failed_on(env, tm
     rec = json.loads((run / "checks.json").read_text())
     assert rec["passed"] is True and rec["spilled_to"] == "check-host-b", rec
     text = (run / "checks.log").read_text()
-    assert "did not pass on spill host check-host-a (exit 1)" in text and "spilling to check-host-b" in text, text
-    # The host it failed on goes last in pick()'s order and stays off: never back to it.
-    assert "spilling to check-host-a" not in text.split("did not pass on spill host check-host-a")[1], text
-    assert "check-host-a" in checkspill.kept_off(checkspill.spill_off_add("", "check-host-a", False))
+    assert "did not pass on spill host check-host-a (exit 75)" in text and "spilling to check-host-b" in text, text
+    assert "on this machine only" not in text and mark.exists(), text
     assert all("/ttp-check." in w for w in log.read_text().splitlines()), "both runs were on spill hosts"
-    # Failing everywhere: a, then b (a kept off), then here once the lane frees, whose result counts.
-    mark.unlink()
-    log.write_text("")
-    p.set_config("delivery.push_checks", [f'pwd >> {log}; case "$PWD" in */ttp-check.*) exit 1;; esac'])
-    real_off, kept = checkspill.spill_off_add, []
-
-    def spill_off_add(*a, **k):   # the lane frees once both spill hosts failed, never on a timer (a loaded host)
-        off = real_off(*a, **k)
-        kept.append(off)
-        if len(kept) == 2:
+    # Failing on a spill host: here next, never host b, whatever is free; failing here too fails the run.
+    for fails_here in (False, True):
+        log.write_text("")
+        (p.state / checkspill.FAILS_FILE).unlink(missing_ok=True)   # each scenario is its own run of the head
+        seen = len((run / "checks.log").read_text())
+        p.set_config("delivery.push_checks", [f'pwd >> {log}; case "$PWD" in */ttp-check.*) exit 1;; esac; '
+                                              + ("exit 1" if fails_here else "exit 0")])
+        lane = _spill_lane(p, repo)
+        _close_when_back(lane, run, "on this machine only")
+        try:
+            cli.main(["checks", "--fresh"])
+        except SystemExit as e:
+            assert fails_here and e.code == 1, e.code
+        finally:
             lane.close()
-        return off
-    monkeypatch.setattr(checkspill, "spill_off_add", spill_off_add)
-    lane = _spill_lane(p, repo)
-    safety = threading.Timer(120, lane.close)   # never hang the suite
-    safety.start()
-    try:
-        cli.main(["checks", "--fresh"])
-    finally:
-        safety.cancel()
-        lane.close()
-    rec = json.loads((run / "checks.json").read_text())
-    assert rec["passed"] is True and "spilled_to" not in rec, rec
-    where = log.read_text().splitlines()
-    assert len(where) == 3 and "/ttp-check." not in where[-1], where
+        rec = json.loads((run / "checks.json").read_text())
+        assert rec["passed"] is (not fails_here) and "spilled_to" not in rec, (fails_here, rec)
+        text = (run / "checks.log").read_text()[seen:]
+        assert "did not pass on spill host check-host-a (exit 1)" in text and "on this machine only" in text, text
+        assert "spilling to check-host-b" not in text, text
+        where = log.read_text().splitlines()
+        assert len(where) == 2 and "/ttp-check." in where[0] and "/ttp-check." not in where[1], where
     assert checkspill.holders(p.name) == []
 
 

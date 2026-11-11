@@ -2606,9 +2606,13 @@ the pick order, so it takes the first starts. A resumed resource ramps only its 
   once the slots here are full: an urgent run at once, others after `delivery.checks_spill_after_s`); a run
   waiting here (its lanes, the host-wide checks cap or the load guard) asks again after each such bound; the first listed host
   that is allowed, free and reachable takes the run; only when every one is full, paused or unreachable does it
-  wait here (and try them again after the same bound). A run that does not pass on a spill host runs again in
+  wait here (and try them again after the same bound). A run whose tests fail on a spill host (no host fault,
+  timeout or env fault) runs the failing tests once more on this machine only, and that result counts: it never
+  goes on from spill host to spill host. A run a host's own fault, a timeout or the spill env ended runs again in
   the same order, keeping off the hosts its checks failed on (one whose own fault ended them, such as a pause
   taken mid-run, gets one more try once free); a pass on another spill host counts, else the result here does.
+  A workstation (`delivery.checks_remote_only`), which runs nothing here while a host is busy, fails the run
+  once its tests failed on two spill hosts instead.
   A run whose failures the tests gate (below) proved new on that spill host, the base passing them there, fails
   at once instead: the host is ruled out, so a rerun would only fail again while holding a slot.
   A host whose own environment keeps failing runs is quarantined, per project and model-free: a spilled failure
