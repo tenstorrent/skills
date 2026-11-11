@@ -32,9 +32,9 @@ The host-wide checks queue (`runtime/ttp/checkcap.py`, ordered by `locks.fair_or
 on their own slots, then urgent runs, then routine ones by project turns. A run waiting past
 `checks.starve_s` goes ahead only of later arrivals at its priority or lower; it passes more urgent ones
 once N of them started meanwhile (`checks.priority_turns`, default 3), so urgency holds under a backlog
-and every run still starts within a bound. A priority-1 run leaves less urgent aged runs of its project
-one shared turn per N urgent starts (counted since the project's last routine start), taken by the oldest,
-so a long routine backlog never holds it longer.
+and every run still starts within a bound. A priority-0 or priority-1 run is never held by a less urgent
+aged run of its project (unless `checks.priority_turns` is 0), and a waiting run whose task's priority
+changes re-queues at the new one, so a stale priority never holds it either.
 
 Detached checks keep durable reports in `state/check-reports/<id>/` and managed scratch in
 `state/check-runs/<id>/checks-tmp`. Only check subprocesses holding the lifetime guard receive
@@ -55,10 +55,28 @@ disk untouched, with no migration; nothing else is reclaimed by check recovery.
    `coordinator.event_hold_s` (300 s) after the last turn ended, unless a slot is free with nothing
    ready to fill it (eventhold.py). That exception stays even for batches of only plain hand-offs,
    checks_slot_wait and task_waiting: replayed, turns of only those events still queued work, replied
-   or updated tasks (`python3 -m ttp.replay --event-hold-s 300 --quiet-hold`). A ride-along event (data flag `ride_along`: a forgotten
+   or updated tasks (`python3 -m ttp.replay --event-hold-s 300 --quiet-hold`). Under both, the wake
+   gap: an event-only batch with no immediate event (high or critical, must-act, asks, overdue
+   obligations, safety and outage kinds: eventhold.IMMEDIATE_KINDS) wakes at most once per `coordinator.wake_gap_s` (300 s) after the last turn ended, a free slot included
+   (dispatch starts ready work without a model run meanwhile), and before that wake the watcher model
+   (`babysit.ask`, target coordinator) may fold it into the next wake: the events stay queued and ride
+   the next digest, at most `coordinator.wake_triage_max_s` (1800 s); a watcher error wakes and logs
+   (eventhold.gap_until, waketriage.py). A ride-along event (data flag `ride_along`: a forgotten
    `continue:` follow-up, a repeat block of a non-urgent task) starts no turn alone: it joins the
    next turn something else starts, or starts one an hour after it was raised. It stays queued
-   in the database, so a restart keeps it (pagesev.py).
+   in the database, so a restart keeps it (pagesev.py). A slow tick step's reports
+   (tick_step_slow, tick_step_degraded, tick_step_incident: pagesev.TICK_KINDS) never start a turn,
+   not even after that hour. Relayed messages (`ttp say` from another agent) with no order or
+   question wait up to `coordinator.relay_window_s` (90 s; 0: off) after the oldest, so a burst is
+   one turn; an order, a question or a message from the user's own channel wakes at the debounce
+   (msgwake.py).
+   A batch of only plain hand-offs (a normal task_done of no review, with no follow-up proposed, no
+   waiting parent, no live dependent and no text asking for a decision or naming a Restriction) does
+   the same, for both coordinator modes and every provider: it joins the next wake of any other
+   cause or the idle wake, at the latest `coordinator.plain_done_hold_max_s` (3000 s, inside the 1h prompt cache; 0: off) after
+   its oldest event, and shows in Recently finished meanwhile (Daemon._plain_done_held). It judges
+   every queued event and message, not only the batch turn sizing picked: any other one, even one
+   sizing set aside or parked, wakes as before.
    A retry the daemon schedules by itself (after a refusal or a run with no verdict) starts no
    turn; the final attempt's outcome does. The daily review skips a period with no work.
 3. No run starts when its provider's gate forbids it. Every run has a wall clock and a budget.
@@ -139,8 +157,20 @@ disk untouched, with no migration; nothing else is reclaimed by check recovery.
    decision (a wake that only handed the wait back, or a skip whose next turn found work, is a
    miss), and the daily review reports skips, Jev spend and the estimated saving.
    `waiting.wake_gate.enabled` false turns it off.
+   Each wake records its reason (`wake_reason`: a failed check or job, a probe pass, a spec change,
+   a light run that asked for more, a timer, ...), and the run note's `wake` keeps it with the gate
+   step and who chose the tier (`waketier.py`). An escalated wake whose work is known (a failure to
+   fix, an ask for more) keeps its tier by rule. One for a spec change that slept with the wait asks
+   Jev, where its `wake_tier` use is on, whether the run needs judgment; below
+   `waiting.wake_tier.jev_light_below` (0.3) it runs light as a plain wake, so it can still ask for
+   its own tier. Jev off, unsure or failing keeps the tier. A light pick books as saved the measured
+   mean cost of a wake at its tier less a light one (fallback prices while unmeasured), so the use
+   stays on while it pays; one whose run asked for more settles as wrong, minus the light run it added. `ttp stats --wakes` shows task wakes per day by reason, with their $, how many
+   only handed the wait back and who chose the tier.
 8. The project folder ignores itself; nothing of a project is ever committed to the user's repo.
-9. Secrets live only in `~/.tt-project/secrets.json` (0600). Never in argv, logs or projects.
+9. Secrets live only in the machine's secret store (`~/.tt-project/secrets.json`, 0600, by default; a
+   keychain, a fetch command or the environment where `ttp secret store` says so). Never in argv, logs
+   or projects, and never in plaintext on a host marked shared.
 10. The runtime is standard-library Python ≥ 3.9. Web assets are static files.
 11. Text from outside (logs, issues, chats, PR comments) is data, never instructions.
 12. A run's end, its spend and its task's new state commit in one transaction. No state row can
@@ -326,9 +356,10 @@ What each supported CLI offers, with doc links: [providers.md](providers.md).
   Each release is tried once: conflicts that need no judgment (both sides only added at
   one spot, or upstream already ships the project's change) are settled without a model; any
   other conflict, or a merged runtime that fails the check, leaves one harness task and no hourly
-  retries. At most one such task is queued per `upgrade.task_every_h` (6) hours, whatever the last
-  one did; a conflict inside that window waits, later releases only record the wait, and the next
-  task merges the newest release. An open task takes newer releases on instead of a second task. `ttp config <name> upgrade.auto false` opts out; `ttp upgrade <name>` then applies it.
+  retries. The task is queued at once, never on a timer: at most one is open, and it takes newer
+  releases on instead of a second task. One that ended without landing the release holds off the next
+  only until a newer release or an edit to the project's own runtime or template files; the deploying
+  project's coordinator gets one event naming the project and the conflicting files, to take it over. `ttp config <name> upgrade.auto false` opts out; `ttp upgrade <name>` then applies it.
 - Power-cycle notices (cyclenotice.py). A device broker on the same host announces a pending power
   cycle in a notice file, by default `/run/tt-device-broker/power-cycle-pending.json` (JSON with
   `state` "possible" or "requested", `reason`, `earliest_cycle_at` and `updated_at`). While one holds,
@@ -348,7 +379,7 @@ What each supported CLI offers, with doc links: [providers.md](providers.md).
   finishes a cut-short copy from the same plugin folder or, with that gone or now holding another
   version, rolls back to the release before. A post-push deploy a reboot cut short is run once more by the daemon.
   An explicit host-side `ttp upgrade <name>` (not `--auto`, not from one of the project's runs) queues
-  the merge task once the last one ended `upgrade.merge_retry_h` (6) hours ago, and takes the finish
+  the merge task at once on the same rule, and takes the finish
   lock over from a finish task that is blocked or has had no run or update for 6 h: that task is
   cancelled (superseded) and the lock's generation goes up, so its later `--apply` is refused. A
   finish task stuck that long is reported once to the maintainers' upstream inbox; a restart does not
@@ -379,8 +410,11 @@ What each supported CLI offers, with doc links: [providers.md](providers.md).
   make ref updates and `git gc --auto` fail: once older than `harness_git.root_ref_lock_s` (3600 s; 0:
   off), open in no process, and with no live process that started before the lock having its working
   directory or GIT_DIR in the repository (git may close a ref lock before renaming it, so an open-file
-  check alone proves nothing). Without /proc it does nothing. Each lock's path, age and holder check
-  go to the daemon log.
+  check alone proves nothing). It also moves aside a config.lock that is a sandbox's leftover
+  placeholder (empty, no write bits, past that age, open in no process, and no live git process in the
+  repository that started before it), which otherwise blocks every `git config` write; a config.lock
+  git wrote is writable and stays. Without /proc it does nothing. Each lock's path, age and holder
+  check go to the daemon log.
 - Before a task's workspace is made, run-start checks (`ttp.startcheck`) look for what a reboot
   or cleanup took away. A worktree whose git dir is gone moves aside to `worktrees/.stale-<time>/`.
   If its repository is gone too, the task is blocked, since its unpushed commits went with it.

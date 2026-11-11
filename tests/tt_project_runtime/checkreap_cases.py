@@ -50,7 +50,8 @@ def test_a_check_s_background_child_ends_with_it_and_leaves_no_sandbox_tree(env,
     assert not list(tmp.glob("ttp-checks-*")), "the clean tree outlived the run"
     folder = p.state / checkreap.FOLDER
     assert not folder.exists() or not list(folder.iterdir())
-    assert "ttp checks: reaped 1 leftover process and 1 sandbox tree" in (run / "checks.log").read_text()
+    if checkreap.PROC.exists():  # without /proc (macOS) nothing is found to reap, so nothing is counted
+        assert "ttp checks: reaped 1 leftover process and 1 sandbox tree" in (run / "checks.log").read_text()
 
 
 def test_the_sweep_reaps_a_stale_sandbox_with_exit_json_or_a_dead_runner(env, tmp_path, monkeypatch):
@@ -192,3 +193,25 @@ def test_a_sweep_kill_writes_a_job_signals_row_naming_the_process(env, tmp_path,
         assert "sleep 61" in rows[0]["target_cmd"] and rec.tok in rows[0]["why"] and "ended" in rows[0]["why"]
     finally:
         _reap_kill(proc)
+
+
+def test_a_process_inside_a_check_run_never_reaps_that_run_so_sibling_test_workers_live(tmp_path):
+    """A test worker of an outer `ttp checks` run carries the run's token from exec; a test in it that
+    reaps with that token (a check env copied from os.environ) must not end its sibling workers. The
+    runner, which never carries its own token, still ends them."""
+    from ttp import checkreap
+    tok = checkreap.token()
+    env = {**os.environ, checkreap.MARKER: tok, "PYTHONPATH": str(RUNTIME)}
+    sibling = subprocess.Popen(["sleep", "60"], env=env, start_new_session=True)
+    inner = ("import subprocess, sys; from ttp import checkreap, cli; tok = sys.argv[1]; "
+             "print(checkreap.members(tok), checkreap.reap(tok, grace_s=1)); "
+             "cli._reap_check(subprocess.Popen(['true']), False, {'env': {checkreap.MARKER: tok}})")
+    try:
+        out = subprocess.run([sys.executable, "-c", inner, tok], env=env, capture_output=True, text=True,
+                             timeout=60)
+        assert out.returncode == 0 and out.stdout.split() == ["[]", "(0,", "0)"], (out.stdout, out.stderr)
+        assert _reap_live(sibling.pid), "a check reaping its own run ended a sibling"
+        assert checkreap.members(tok) == [sibling.pid], "the runner (no token) still finds it"
+        assert checkreap.reap(tok, grace_s=5) == (1, 0) and not _reap_live(sibling.pid)
+    finally:
+        _reap_kill(sibling)

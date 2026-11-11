@@ -256,10 +256,11 @@ def test_the_audit_counts_code_runs_with_no_code_change_and_premise_closes(env):
     closed = p.db.add_task("closed by its check", "s", kind="code", labels=["premise:99:fails"])
     p.db.update_task(closed, status="done")
     got = audit.no_change_code(p.db, now - 86400)
-    assert (got["n"], got["usd"], got["premise_closed"]) == (2, 2.0, 1)
+    assert (got["n"], got["usd"], got["premise_closed"], got["premise_saved_usd"]) == (2, 2.0, 1, 2.0)
     assert [r["id"] for r in got["rows"]] == [idle, idle2]
     out = "\n".join(audit.lines(p.db, now))
-    assert (f"code runs with no code change: 2, $2.00; 1 closed by a premise check before any code run: "
+    assert (f"code runs with no code change: 2, $2.00; 1 closed by a premise check before any code run "
+            f"(about $2.00 saved at the tier's median code run): "
             f"#{idle} premise check only $1.25, #{idle2} feature already there $0.75") in out
     assert audit.report(p.db, now)["no_change_code"]["n"] == 2
     p.db.x("UPDATE tasks SET updated=? WHERE kind='code'", (now - 3 * 86400,))
@@ -378,3 +379,134 @@ def test_task_add_refuses_a_premise_a_check_already_proved_false_for_two_weeks(e
     forced = add("verify e72d3d2 with force", f"e72d3d2 lost a line; differs from #{qid}: checks the cli copy",
                  force=True)
     assert forced == [] and any(f"forced past premise check #{qid}" in n for n in p.db.kv(coord.NOTES_KEY))
+
+
+def _cmd_daemon(env, monkeypatch, tmp_path, cmd, **kw):
+    """A recording daemon (_floor_daemon) with a scratch HOME and a code task whose premise is `cmd`."""
+    for k in ("HOME", "XDG_CONFIG_HOME", "GH_CONFIG_DIR"):   # never the real ~/.config/gh or ~/.ssh
+        (scratch := tmp_path / "scratch-home" / k.lower()).mkdir(parents=True)   # a missing HOME falls back
+        monkeypatch.setenv(k, str(scratch))   # to passwd's (project.owner_home): the account's real one
+    p, d, runs = _floor_daemon(env, monkeypatch)
+    cid = _code(p, spec=f"Goal: add the retry.\npremise_cmd: {cmd}\nChange: add it.", **kw)
+    return p, d, runs, cid
+
+
+def _premise_ran(d, cid):
+    """Wait (bounded) for task `cid`'s premise command the daemon started to end."""
+    d._premise_runs[cid][0].wait(timeout=20)
+
+
+def test_a_premise_command_that_exits_0_lets_the_code_task_dispatch_with_no_question(env, monkeypatch, tmp_path):
+    p, d, runs, cid = _cmd_daemon(env, monkeypatch, tmp_path, f"test -d {tmp_path}")
+    d.dispatch()
+    assert runs == [] and cid in d._premise_runs, "held until its premise command answered"
+    _premise_ran(d, cid)
+    d.dispatch()
+    assert [k["task"]["id"] for _, k in runs] == [cid]
+    assert not p.db.q("SELECT 1 FROM tasks WHERE kind='question'"), "no model run checked the premise"
+
+
+def test_a_premise_command_that_exits_1_closes_the_task_with_its_record_and_one_event(env, monkeypatch, tmp_path):
+    from ttp import premise
+    cmd = f"test -e {tmp_path}/landed.flag && exit 1 || exit 0"
+    (tmp_path / "landed.flag").write_text("")
+    p, d, runs, cid = _cmd_daemon(env, monkeypatch, tmp_path, cmd)
+    d.dispatch()
+    _premise_ran(d, cid)
+    d.dispatch()
+    t = p.db.task(cid)
+    res = json.loads(t["result"])
+    assert runs == [] and t["status"] == "done" and premise.CMD_FAILS in json.loads(t["labels"])
+    assert res["outcome"] == "rejected" and res["premise_cmd"]["cmd"] == cmd and res["premise_cmd"]["rc"] == 1
+    assert "premise command exited 1" in res["summary"]
+    ev = p.db.q("SELECT * FROM events WHERE kind='task_done' AND task=?", (cid,))
+    assert len(ev) == 1 and ev[0]["status"] == "queued" and "not run" in ev[0]["text"]
+    assert not p.db.q("SELECT 1 FROM runs WHERE task=?", (cid,)), "no worker started"
+    d.dispatch()
+    assert len(p.db.q("SELECT 1 FROM events WHERE kind='task_done' AND task=?", (cid,))) == 1
+    # task_add's 14-day refusal covers the same command; the audit counts the close
+    hit = premise.repeat(p.db, f"Goal: again.\npremise_cmd:  {cmd}")
+    assert hit and hit["id"] == cid and "premise command" in premise.rejection(hit)
+    assert premise.repeat(p.db, "premise_cmd: test -d /") is None
+
+
+def test_a_premise_command_with_another_exit_or_a_timeout_falls_back_to_the_light_question(env, monkeypatch, tmp_path):
+    from ttp import premise
+    p, d, runs, cid = _cmd_daemon(env, monkeypatch, tmp_path, "test -d / && exit 3")
+    d.dispatch()
+    _premise_ran(d, cid)
+    d.dispatch()
+    q = p.db.one("SELECT * FROM tasks WHERE kind='question'")
+    code = p.db.task(cid)
+    assert q and q["tier"] == "light" and [k["task"]["id"] for _, k in runs] == [q["id"]]
+    assert premise.CMD_UNKNOWN in json.loads(code["labels"]) and json.loads(code["depends_on"]) == [q["id"]]
+    assert "premise command `test -d / && exit 3`" in q["spec"]
+    assert p.db.one("SELECT 1 FROM events WHERE kind='premise_check' AND text LIKE '%exit 3%'")
+    # a timeout: killed, then the same fallback; a later dispatch never reruns it
+    p2, d2, runs2, cid2 = _cmd_daemon(env, monkeypatch, tmp_path / "t", "sleep 30", priority=1)
+    d2.dispatch()
+    proc = d2._premise_runs[cid2][0]
+    d2._premise_cmds(time.time() + premise.CMD_TIMEOUT_S + 1)
+    assert proc.started.wait(10) and cid2 not in d2._premise_runs
+    assert proc.proc is None or proc.proc.wait(timeout=10) is not None, "killed, nothing left running"
+    assert premise.CMD_UNKNOWN in json.loads(p2.db.task(cid2)["labels"])
+    assert p2.db.one("SELECT 1 FROM events WHERE kind='premise_check' AND text LIKE '%timeout%'")
+    d2.dispatch()
+    assert cid2 not in d2._premise_runs and [k["task"]["id"] for _, k in runs2] == [cid2], \
+        "urgent: it checks its premise in its own run"
+    assert "check that it holds" in p2.db.task(cid2)["spec"]
+
+
+def test_a_premise_command_reruns_before_a_dispatch_after_a_long_queue_wait(env, monkeypatch, tmp_path):
+    cmd = f"test -e {tmp_path}/landed.flag && exit 1 || exit 0"
+    p, d, runs, cid = _cmd_daemon(env, monkeypatch, tmp_path, cmd)
+    d.dispatch()
+    _premise_ran(d, cid)
+    d._premise_cmds(time.time())   # it passed; the task still waits in the queue (say, for a slot)
+    assert d._premise_ok[cid][1] == cmd and cid not in d._premise_runs
+    d._premise_cmds(time.time())
+    assert cid not in d._premise_runs, "a fresh pass is not rerun"
+    (tmp_path / "landed.flag").write_text("")          # its change landed while it waited
+    d._premise_ok[cid] = (time.time() - 31 * 60, cmd)   # past premise.recheck_min (30)
+    d.dispatch()
+    assert cid in d._premise_runs
+    _premise_ran(d, cid)
+    d.dispatch()
+    assert p.db.task(cid)["status"] == "done" and runs == [] and cid not in d._premise_ok
+
+
+def test_a_premise_command_runs_only_under_the_read_only_guard(env, monkeypatch, tmp_path):
+    from ttp import premise
+    ok = ("git merge-base --is-ancestor 1a2b3c4 origin/main && exit 1 || exit 0", "grep -q x a.py 2>/dev/null",
+          "test -f a >/dev/null 2>&1", "ttp landed --task 12", "git branch --contains 1a2b3c4", "grep -q x rm.txt")
+    assert [c for c in ok if premise.guard(c)] == []
+    bad = ("echo x > f", "echo x 2>f", "awk 1 a>>b", "cat a | tee b", "rm -f x", "sed -i s/a/b/ f", "mkdir -p d",
+           "git fetch origin", "git -C . push", "git --git-dir=x commit -m a", "git -c a=b reset --hard",
+           "git log -1; git stash", "ttp task add x", "ssh host true", "srun hostname", "ttp devq run x",
+           "test -d / ||", "test -d / || true")
+    assert [c for c in bad if not premise.guard(c)] == []
+    flag = tmp_path / "written"
+    p, d, runs, cid = _cmd_daemon(env, monkeypatch, tmp_path, f"touch {flag}")
+    d.dispatch()
+    assert cid not in d._premise_runs and not flag.exists(), "a refused command never runs"
+    assert premise.CMD_UNKNOWN in json.loads(p.db.task(cid)["labels"])
+    assert p.db.one("SELECT 1 FROM tasks WHERE kind='question'"), "it falls back to the light question"
+
+
+def test_only_a_premise_cmd_line_runs_and_the_audit_estimates_what_premise_closes_saved(env):
+    from ttp import audit, premise
+    assert premise.command("- premise_cmd:  test -d /  \nmore") == "test -d /"
+    assert premise.command("premise: test -d /") == "" and premise.line("premise_cmd: test -d /") == ""
+    p = _premise_project(env)
+    now = time.time()
+    for usd in (1.0, 3.0, 5.0):
+        t = p.db.add_task("ran", "s", kind="code", tier="standard")
+        p.db.update_task(t, status="done", spent_usd=usd)
+        p.db.x("INSERT INTO runs(task,role,started,status) VALUES(?,?,?,?)", (t, "worker", now, "ok"))
+    for labels in ([premise.CMD_FAILS], ["premise:7:fails"]):
+        t = p.db.add_task("closed", "s", kind="code", tier="standard", labels=labels)
+        p.db.update_task(t, status="done")
+    got = audit.no_change_code(p.db, now - 86400)
+    assert (got["premise_closed"], got["premise_saved_usd"]) == (2, 6.0)
+    assert "2 closed by a premise check before any code run (about $6.00 saved at the tier's median code run)" \
+        in "\n".join(audit.lines(p.db, now))

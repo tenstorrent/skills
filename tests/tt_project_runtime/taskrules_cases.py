@@ -28,9 +28,10 @@ def _rules_tasks(p):
 
 def test_every_worker_and_reviewer_of_a_project_gets_a_byte_identical_system_prompt(env, monkeypatch):
     """A code task with PR delivery, one without, a review, a device task, a question and a harness task
-    get the same system.md for the same charter and memory: concurrent runs share its cache. It still
-    carries every restriction verbatim, and a memory or charter change still changes it."""
-    from ttp.prompts import charter_restrictions, worker_system
+    get the same system.md for the same charter: concurrent runs share its cache. It still carries every
+    restriction verbatim; a memory change leaves it as it was (memory leads the task prompt, task #51)
+    and a charter change changes it."""
+    from ttp.prompts import charter_restrictions, worker_memory_block, worker_system
     p = _rules_project(env, monkeypatch)
     tasks = _rules_tasks(p)
     systems = {name: worker_system(p, t) for name, t in tasks.items()}
@@ -38,10 +39,13 @@ def test_every_worker_and_reviewer_of_a_project_gets_a_byte_identical_system_pro
     assert systems["code"] == worker_system(p)
     one = systems["code"]
     assert "\n" + charter_restrictions(p.charter_path.read_text()) + "\n" in one
-    assert "MEM-RULE: never delete another task's outputs." in one
+    assert "MEM-RULE: never delete another task's outputs." not in one
+    assert "MEM-RULE: never delete another task's outputs." in worker_memory_block(p)
     for absent in ("pull requests ONLY in a `code` task", "\"wait_kind\"", "GitHub CI: `ttp ci"):
         assert absent not in one, absent   # per-task rules live in the task prompt
     p.add_memory("NEW-FACT: the store moved.", kind="fact")
+    assert worker_system(p) == one
+    p.charter_path.write_text(p.charter_path.read_text() + "\n## Resources\n- Box B: a spare.\n")
     assert worker_system(p) != one
 
 
@@ -133,7 +137,7 @@ def test_worker_system_states_every_restriction_and_user_correction_verbatim(env
              "Correction (user msg #9): box resets never touch other hosts."]
     for text in fixes:
         p.add_memory(text, kind="fact")
-    system = worker_system(p)
+    system = _worker_text(p)
     restrictions = _BIG_CHARTER.split("## Restrictions\n")[1].split("\n\n## ")[0].splitlines()
     assert len(restrictions) == 3
     for line in restrictions:

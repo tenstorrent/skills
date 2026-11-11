@@ -45,6 +45,7 @@ PARALLEL = re.compile(r"^[ \t]*parallel:[ \t]*(\S.*?)[ \t]*$", re.M)
 CACHE = "overlap_diffs.json"  # state/: {head: [[status, path], ...]}, one git diff per head ever
 CACHE_MAX = 400
 LANDED_CACHE = "overlap_landed.json"   # state/: [head], branch heads found on the push branch by patch
+OFF_CACHE = "overlap_off.json"         # state/: {"tip", "heads"}: heads found not on the push branch at that tip
 MAX_PATHS = 4                 # shared paths named in one warning
 MAX_TASKS = 3                 # other tasks named in one warning, the most recent first
 MAX_BRANCHES = 8              # branches a worker's prompt lists, the most recent first
@@ -250,14 +251,18 @@ def _heads(p, base: str, refs: list[str]) -> dict[str, str]:
     return heads
 
 
-def _on_push_branch(p, b: dict, seen: list) -> bool:
+def _on_push_branch(p, b: dict, seen: list, off: dict | None = None) -> bool:
     """A done task's branch is on the push branch under other commits (a rebase, a squash, a replay):
     landed.py's patch checks, local refs only. Read only for branches that touch the new task's
-    files; a head found there is kept in `seen` (state/LANDED_CACHE), as it stays there."""
+    files; a head found there is kept in `seen` (state/LANDED_CACHE), as it stays there, and one found
+    not there in `off` (state/OFF_CACHE, see _load_off) while the push branch's tip stays where it was,
+    so a worker's start reads no git per branch (~230 branches each read theirs at every start)."""
     if b["open"]:
         return False
     if b["head"] in seen:
         return True
+    if off and off["tip"] and b["head"] in off["heads"]:
+        return False
     from . import landed
 
     def read() -> bool:
@@ -269,7 +274,36 @@ def _on_push_branch(p, b: dict, seen: list) -> bool:
     hit = gitmemo.cached(("overlap.on_push_branch", b["branch"], b["head"]), read)
     if hit:
         seen.append(b["head"])
+    elif off and off["tip"]:
+        off["heads"].append(b["head"])
+        off["dirty"] = True
     return bool(hit)
+
+
+def _load_off(p) -> dict:
+    """{"tip": the push branch's tip now, "heads": [heads found not on it at that tip]}: the heads kept
+    in state/OFF_CACHE, none once the tip moved (a landing may carry any of them). One git read."""
+    from . import landed
+    try:
+        tip = gitmemo.cached(("overlap.push_tip",), lambda: landed._commit(p.root, landed._push_ref(p, p.root)))
+    except (OSError, ValueError, subprocess.SubprocessError):
+        tip = ""
+    try:
+        got = json.loads((p.state / OFF_CACHE).read_text())
+    except (OSError, ValueError):
+        got = None
+    heads = got["heads"] if isinstance(got, dict) and tip and got.get("tip") == tip \
+        and isinstance(got.get("heads"), list) else []
+    return {"tip": tip, "heads": heads, "dirty": not heads and bool(tip)}
+
+
+def _save_off(p, off: dict | None) -> None:
+    if off and off["tip"] and off.get("dirty"):
+        from .project import durable_write
+        try:
+            durable_write(p.state / OFF_CACHE, json.dumps({"tip": off["tip"], "heads": off["heads"][-CACHE_MAX:]}))
+        except OSError:
+            pass
 
 
 def _load_seen(p) -> list:
@@ -309,18 +343,22 @@ def find(p, spec: str, skip=()) -> list[dict]:
             hits[r["id"]] = {"id": r["id"], "open": True, "paths": {m: False for m in shared}}
     seen = _load_seen(p)
     size = len(seen)
+    off = None
     for b in branches(p, skip):
         shared = {}
         for status, f in b["files"]:
             for m in mine:
                 if same(m, f):
                     shared[m] = shared.get(m, False) or status == "A"
-        if shared and not _on_push_branch(p, b, seen):
+        if shared and off is None and not b["open"] and b["head"] not in seen:
+            off = _load_off(p)
+        if shared and not _on_push_branch(p, b, seen, off):
             h = hits.setdefault(b["id"], {"id": b["id"], "open": b["open"], "paths": {}})
             for m, new in shared.items():
                 h["paths"][m] = h["paths"].get(m, False) or new
             h.update(branch=b["branch"], head=b["head"])
     _save_seen(p, seen, size)
+    _save_off(p, off)
     for h in hits.values():
         if h["open"] and (why := exempt(p, p.db.task(h["id"]))):
             h["exempt"] = why
@@ -410,6 +448,17 @@ def label(hits: list[dict], chained: int | None = None, landing: bool = True) ->
     chained it after (`chained`), else the non-exempt tasks the warning names."""
     ids = [chained] if chained is not None else [h["id"] for h in hits[:MAX_TASKS] if not h.get("exempt")]
     return f"{LABEL}{','.join(map(str, ids))}:{warning(hits, landing)}" if hits else ""
+
+
+_ADVICE = re.compile(r": runs beside (?:it|them), conflicts settle at landing; chain only if it needs (?:its|their) "
+                     r"new file or symbol$")
+ADVICE = "overlaps: runs beside those tasks, conflicts settle at landing; chain only if it needs their new file or symbol"
+
+
+def short(note: str) -> str:
+    """A digest row's overlap note without the advice every such note repeats: the Open tasks header says
+    it once (ADVICE)."""
+    return _ADVICE.sub("", note or "")
 
 
 def digest_note(task: dict) -> str:
@@ -587,12 +636,16 @@ def prompt_block(p, task: dict) -> str:
             return ""
         lines, seen = [], _load_seen(p)
         size = len(seen)
+        off = None
         for b in reversed(branches(p, skip={int(task.get("id") or 0)})):
             shared = [(f, s == "A") for s, f in b["files"] if any(same(m, f) for m in mine)]
-            if shared and not _on_push_branch(p, b, seen):
+            if shared and off is None and not b["open"] and b["head"] not in seen:
+                off = _load_off(p)   # read only once a done branch needs the push-branch check
+            if shared and not _on_push_branch(p, b, seen, off):
                 names = ", ".join(f"{f} (new file)" if new else f for f, new in shared[:MAX_PATHS])
                 lines.append(f"- #{b['id']} {b['branch']} at {b['head'][:10]}: {names}")
         _save_seen(p, seen, size)
+        _save_off(p, off)
     except Exception:   # a hint, never a reason to fail a dispatch
         return ""
     if not lines:

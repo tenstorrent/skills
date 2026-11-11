@@ -190,3 +190,147 @@ def test_doctor_reports_local_guards(env, tmp_path):
     lines = localguard.report({"guards": {"local": ["guards/ok.py", "guards/bad.py", "runtime/x.py"]}}, p.harness)
     assert lines[0].endswith("ok.py: loads") and "problem" in lines[1] and "ModuleNotFoundError" in lines[1]
     assert "problem" in lines[2]
+
+
+NO_PATCH = ("def refusal(cmd):\n    return None\n\n\ndef tool_refusal(tool, tool_input):\n"
+            "    text = json.dumps(tool_input)\n"
+            "    return f'no {tool} on secret.txt' if 'secret.txt' in text else None\n\n\nimport json\n")
+
+
+def test_local_guards_are_asked_on_the_codex_cursor_and_runner_side_paths(env, monkeypatch, tmp_path):
+    """Codex's hook (apply_patch, mcp__ calls), Cursor's per-run hook (cursorhook.translate) and the
+    runner-side guard of runs without a hook (streamguard) each reach the listed guards."""
+    from ttp import cursorhook, streamguard
+    p, run = _guarded(env, monkeypatch, tmp_path, {"guards/no_wipe.py": NO_WIPE, "guards/edits.py": NO_PATCH},
+                      ["guards/no_wipe.py", "guards/edits.py"])
+    patch = "*** Begin Patch\n*** Update File: secret.txt\n@@\n-a\n+b\n*** End Patch\n"
+    assert "no apply_patch on secret.txt" in _worker("apply_patch", tmp_path, command=patch)
+    assert "no mcp__jira__create on secret.txt" in _worker("mcp__jira__create", tmp_path, body="see secret.txt")
+    assert _worker("apply_patch", tmp_path, command=patch.replace("secret.txt", "ok.txt")) is None
+    # Cursor: its own tool names, translated to Claude's.
+    for name, inp, text in (("Shell", {"command": "wipe-scratch"}, "wiping scratch"),
+                            ("StrReplace", {"file_path": str(tmp_path / "secret.txt")}, "no Write on secret.txt"),
+                            ("MCP:create", {"body": "secret.txt"}, "no mcp__cursor__create on secret.txt")):
+        out, _ = cursorhook.translate("preToolUse", {"tool_name": name, "tool_input": inp, "cwd": str(tmp_path)})
+        assert out and out["permission"] == "deny" and text in out["agent_message"], name
+    assert cursorhook.translate("preToolUse", {"tool_name": "Shell", "tool_input": {"command": "ls"},
+                                               "cwd": str(tmp_path)})[0] is None
+    # The runner-side guard, in a child with the run's environment.
+    child = {**os.environ, "TTP_TASK": "7"}
+    assert "wiping scratch" in streamguard.refusal({"tool_name": "Bash", "tool_input": {"command": "wipe-scratch"}},
+                                                    child, str(tmp_path))
+    assert "no Edit on secret.txt" in streamguard.refusal(
+        {"tool_name": "Edit", "tool_input": {"file_path": "secret.txt"}}, child, str(tmp_path))
+    assert streamguard.refusal({"tool_name": "Bash", "tool_input": {"command": "ls"}}, child, str(tmp_path)) is None
+    assert [r["kind"] for r in _refusals(run)].count("local:edits.py") == 5
+
+
+def test_a_session_coordinators_file_reads_ask_the_local_guards_as_a_workers_do(env, monkeypatch, tmp_path):
+    from ttp import coordtools
+    _guarded(env, monkeypatch, tmp_path, {"guards/edits.py": NO_PATCH}, ["guards/edits.py"])
+    monkeypatch.delenv(coordtools.DENIED_ENV, raising=False)
+    assert "no Read on secret.txt" in _worker("Read", tmp_path, file_path="secret.txt")
+    for full in (False, True):
+        if full:
+            monkeypatch.setenv(coordtools.FULL_ENV, "1")
+        for tool, args in (("Read", {"file_path": "secret.txt"}), ("Grep", {"pattern": "x", "path": "secret.txt"}),
+                           ("Glob", {"pattern": "secret.txt"})):
+            out, _ = coordtools.pre_tool_use({"tool_name": tool, "tool_input": args, "cwd": str(tmp_path)})
+            assert f"no {tool} on secret.txt" in out["hookSpecificOutput"]["permissionDecisionReason"], (full, tool)
+            out, _ = coordtools.pre_tool_use({"tool_name": tool, "tool_input": {"file_path": "ok.txt", "pattern": "x"},
+                                              "cwd": str(tmp_path)})
+            assert out is None, (full, tool)
+
+
+def test_a_full_tools_coordinator_edits_a_listed_guard_only_through_a_harness_task(env, monkeypatch, tmp_path):
+    from ttp import coordtools
+    p, _ = _guarded(env, monkeypatch, tmp_path, {"guards/no_wipe.py": NO_WIPE}, ["guards/no_wipe.py"])
+    monkeypatch.setenv(coordtools.FULL_ENV, "1")
+    target = p.harness / "guards" / "no_wipe.py"
+    for tool, args in (("Write", {"file_path": str(target), "content": "def refusal(c): pass\n"}),
+                       ("Edit", {"file_path": str(target), "old_string": "a", "new_string": "b"}),
+                       ("Bash", {"command": f"cp /dev/null {target}"})):
+        out, _ = coordtools.pre_tool_use({"tool_name": tool, "tool_input": args, "cwd": str(p.harness)})
+        assert "harness task" in out["hookSpecificOutput"]["permissionDecisionReason"], tool
+    out, _ = coordtools.pre_tool_use({"tool_name": "Read", "tool_input": {"file_path": str(target)}, "cwd": str(p.harness)})
+    assert out is None
+
+
+def test_a_codex_apply_patch_edits_a_listed_guard_only_through_a_harness_task(env, monkeypatch, tmp_path):
+    """Codex's apply_patch naming a listed guard (Update, Delete, Add or Move to; absolute or relative to
+    cwd; any input key) is refused outside a harness task, in a worker run and a full-tools coordinator."""
+    from ttp import coordtools
+    p, _ = _guarded(env, monkeypatch, tmp_path, {"guards/no_wipe.py": NO_WIPE}, ["guards/no_wipe.py"])
+    target = p.harness / "guards" / "no_wipe.py"
+    patches = [(f"*** Begin Patch\n*** {op}: {name}\n*** End Patch\n", cwd)
+               for op in ("Update File", "Delete File", "Add File") for name, cwd in
+               ((str(target), tmp_path), ("guards/no_wipe.py", p.harness), ("./no_wipe.py", p.harness / "guards"))]
+    patches.append((f"*** Begin Patch\n*** Update File: {tmp_path}/x.py\n*** Move to: {target}\n*** End Patch\n", tmp_path))
+    for patch, cwd in patches:
+        assert "harness task" in (_worker("apply_patch", cwd, command=patch) or ""), patch
+    assert "harness task" in (_worker("apply_patch", p.harness, input=patches[1][0]) or "")
+    from ttp import hook
+    out, _ = hook.pre_tool_use({"tool_name": "apply_patch", "tool_input": patches[0][0], "cwd": str(tmp_path)})
+    assert "harness task" in out["hookSpecificOutput"]["permissionDecisionReason"]
+    assert _worker("apply_patch", p.harness, command=patches[1][0].replace("no_wipe.py", "other.py")) is None
+    monkeypatch.setenv(coordtools.FULL_ENV, "1")
+    for patch, cwd in (patches[0], patches[4]):
+        out, _ = coordtools.pre_tool_use({"tool_name": "apply_patch", "tool_input": {"command": patch}, "cwd": str(cwd)})
+        assert "harness task" in out["hookSpecificOutput"]["permissionDecisionReason"], patch
+    monkeypatch.delenv(coordtools.FULL_ENV)
+    monkeypatch.setenv("TTP_TASK", str(p.db.add_task("tune the local guard", kind="harness")))
+    for patch, cwd in patches:
+        assert _worker("apply_patch", cwd, command=patch) is None, patch
+
+
+def test_a_shell_command_names_a_listed_guard_only_by_whole_path_components(env, monkeypatch, tmp_path):
+    p, _ = _guarded(env, monkeypatch, tmp_path, {"a.py": NO_WIPE, "guards/b.py": NO_WIPE}, ["a.py", "guards/b.py"])
+    for cmd in ("rm a.py", "rm ./a.py", "mv 'a.py' x", f"rm {p.harness / 'a.py'}", "echo >a.py", "cat x;rm a.py",
+                "rm guards/b.py", "rm ./guards/b.py", "cp x guards/b.py"):
+        assert "harness task" in (_worker("Bash", p.harness, command=cmd) or ""), cmd
+    for cmd in ("python3 data.py", "rm a.py.bak", "rm xa.py", "rm a.pyc", "rm old_guards/b.py", "rm guards/bb.py",
+                "rm guards/b.py2", "cat ~a.py"):
+        assert _worker("Bash", p.harness, command=cmd) is None, cmd
+
+
+def test_a_local_guard_that_calls_sys_exit_refuses_and_names_itself(env, monkeypatch, tmp_path):
+    from ttp import localguard
+    cases = {"guards/exit_call.py": "import sys\n\n\ndef refusal(cmd):\n    sys.exit(3)\n\n\n"
+                                    "def tool_refusal(tool, tool_input):\n    raise SystemExit('stop')\n",
+             "guards/exit_import.py": "raise SystemExit(0)\n"}
+    for rel, src in cases.items():
+        p, run = _guarded(env, monkeypatch, tmp_path, {rel: src}, [rel])
+        why = _worker("Bash", tmp_path, command="ls")
+        name = rel.split("/")[1]
+        assert why and name in why and "SystemExit" in why, (rel, why)
+        assert _refusals(run)[-1]["kind"] == f"local:{name}"
+        edit = _worker("Write", tmp_path, file_path=str(tmp_path / "x.txt"), content="x")
+        if rel.endswith("exit_call.py"):
+            assert edit and name in edit and "SystemExit" in edit
+        else:   # not loaded: its tool check is unknown, so edits still go (to fix it)
+            assert edit is None
+            assert localguard.report({"guards": {"local": [rel]}}, p.harness)[0].startswith("problem")
+    _guarded(env, monkeypatch, tmp_path, {"guards/ki.py": "def refusal(cmd):\n    raise KeyboardInterrupt\n"},
+             ["guards/ki.py"])
+    with pytest.raises(KeyboardInterrupt):   # an interrupt is never read as the guard's refusal
+        _worker("Bash", tmp_path, command="ls")
+
+
+def test_an_unreadable_project_json_with_no_last_good_copy_reports_its_unasked_local_guards(env, monkeypatch, tmp_path):
+    """Decided (review #6659): not a refusal of every call, but a daemon alert and a doctor problem."""
+    from ttp import localguard
+    from ttp.daemon import Daemon
+    from ttp.project import Project
+    p, _ = _guarded(env, monkeypatch, tmp_path, {"guards/no_wipe.py": NO_WIPE}, ["guards/no_wipe.py"])
+    assert _worker("Bash", tmp_path, command="wipe-scratch")
+    p.config_path.write_text("{ broken")
+    (p.state / "project.last-good.json").unlink(missing_ok=True)
+    assert _worker("Bash", tmp_path, command="wipe-scratch") is None   # no guard list to ask
+    d = Daemon(p.base)
+    assert d.cfg_status == "unavailable"
+    msgs = " ".join(str(dict(r)) for r in p.db.q("SELECT * FROM messages WHERE ref='config'"))
+    assert "guards.local" in msgs and "not asked" in msgs
+    q = Project(p.base)
+    lines = localguard.report(q.config(), q.harness, q.config_status)
+    assert lines == [f"problem: {localguard.UNREAD}"]
+    assert localguard.report({}, q.harness, "ok") == []

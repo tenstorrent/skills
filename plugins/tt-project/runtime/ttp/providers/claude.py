@@ -36,13 +36,16 @@ the Edit rules (a `python3 -c` write passed those), a check and not a fence; rea
 interpreter were not probed."""
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
 import shlex
 import subprocess
 import sys
+from collections import Counter
 from pathlib import Path
+from typing import NamedTuple
 
 from . import register
 from ..budget import Window
@@ -74,14 +77,13 @@ BUNDLED_SKILLS = ("dataviz", "update-config", "keybindings-help", "code-review",
                   "batch", "doctor", "run-skill-generator", "plugin-authoring",
                   *(f"anthropic-skills:{name}" for name in ("docs", "docx", "google-workspace", "import-memory",
                                                             "morning", "pdf", "pptx", "skill-creator", "xlsx")))
-# What a worker or reviewer may use, passed as --tools: the built-in tools workers called in the
-# 14 days to 2026-10-24 (~4,500 runs: Bash, Read, Edit, Write, the web tools in 8 runs; never Monitor,
-# TaskStop, NotebookEdit, subagents or scheduling), Skill for the plugin skills, and ToolSearch, which
-# loads MCP tools on demand: without it every MCP tool's full schema is sent on every call (measured:
-# 13.7k -> 28.3k tokens with three user servers). With nothing to defer it added no tokens
-# (measured), so it costs a worker without MCP servers nothing. MCP tools are not built-in, so --tools never
-# drops them; StructuredOutput comes with --json-schema. The allowlist replaces the old denylist
-# (WORKER_DENIED_TOOLS, kept for a CLI without --tools) and cuts ~0.6k tokens a call.
+# A CLI flag that limits the built-in tools. Workers and reviewers no longer get it (user msg #2302):
+# they run on Claude Code's full standard tool set, Agent included, so they can start subagents. The
+# harness's rules hold through ttp.hook's PreToolUse on every tool (subagents' calls included: their
+# payload carries `agent_id`, checked live, CLI 2.1.296) and through permission rules, never by
+# withholding a tool. The tools that would step outside the harness are refused by the hook with the
+# way the harness offers instead (hook.HARNESS_TOOLS). Only these are still withheld: the web tools
+# under the no_internet restriction, and a project's own providers.claude.disallowed_tools.
 TOOLS = "--tools"
 # The user's claude.ai connectors load in every run that is not isolated (--strict-mcp-config drops them
 # too): their deferred tool names and instructions, also for those that need a login. Measured on the
@@ -89,23 +91,22 @@ TOOLS = "--tools"
 # with ENABLE_CLAUDEAI_MCP_SERVERS=false, which keeps the user's, project's and plugins' own servers.
 # In the 14 days to 2026-10-24 no worker of three projects (~6,700 runs) called a connector's tool.
 CONNECTORS_OFF = {"ENABLE_CLAUDEAI_MCP_SERVERS": "false"}
+# A run that keeps them waits for their list before its first turn. By default the CLI loads them
+# fully async and a resumed worker often starts without them (init mcp_servers [] in 8 of 10 of one
+# project's worker runs on 2026-11-09); blocking, every replay had them. 2.1.285 reads MCP_CONNECT_TIMEOUT_MS for
+# the connectors' wait (its changelog), MCP_TIMEOUT for the other servers.
+CONNECTORS_WAIT = {"MCP_CONNECTION_NONBLOCKING": "false", "MCP_CONNECT_TIMEOUT_MS": "20000"}
 CONNECTOR_PREFIXES = ("claude.ai", "claude_ai_", "mcp__claude_ai_")   # server name, its tools' prefix
 WORKER_TOOLS = ("Bash", "Read", "Edit", "Write", "Skill", "ToolSearch")
 WEB_TOOLS = ("WebFetch", "WebSearch")
-# Scheduling, remote and orchestration tools a headless worker must not use; their definitions
-# alone are ~3.7k tokens a call. Then tools no worker used in ~1,000 runs, or that would step outside
-# the harness (its own worktrees, other sessions). Measured on the first call of a 'reply OK' worker
-# run, CLI 2.1.285: 10.6k tokens -> 9.3k without the notebook/worktree/listing/findings tools, 7.9k
-# also without subagents ("Task" in the init event, "Agent" in tool calls).
-WORKER_DENIED_TOOLS = ("Workflow", "ScheduleWakeup", "CronCreate", "CronDelete", "CronList", "RemoteTrigger",
-                       "PushNotification", "DesignSync", "NotebookEdit", "EnterWorktree", "ExitWorktree",
-                       "ListAgents", "ReportFindings", "Task", "Agent", "SendMessage")
+SPAWN_TOOLS = ("Agent", "Task")   # Claude Code's subagent tool (older CLIs name it Task)
 
 
 @register
 class Claude(Provider):
     name = "claude"
     binaries = ("claude",)
+    final_events = ("result",)   # base.stream_ended
     api_host, api_base_env = "api.anthropic.com", "ANTHROPIC_BASE_URL"
     # Measured (CLI 2.1.285, its system prompt and latest messages): three on a run's first call and
     # four on every later one (after a tool result or a schema retry). A user block's own mark on top
@@ -140,6 +141,7 @@ class Claude(Provider):
 
     caps_budget = True   # --max-budget-usd
     coord_session = "agent"   # --resume <session id>
+    session_format = "claude-code"   # projects/<cwd slug>/<id>.jsonl (fork_session); the chat provider's too
     tool_hooks = True
     fence_optional = True   # the Bash sandbox (fence_args)
 
@@ -164,15 +166,15 @@ class Claude(Provider):
         else:
             argv += ["--permission-mode", "bypassPermissions"]
         if schema:
-            argv += ["--json-schema", json.dumps(strict_schema(schema))]
+            # Only each object's own required fields: requiring all of them made every answer pad its
+            # unused fields with null (most of a coordinator answer). parse() reads it as sparse.
+            argv += ["--json-schema", json.dumps(strict_schema(schema, require_all=False))]
         if not read_only:
+            # The full standard tool set (TOOLS above): only the web tools where the run may not use the
+            # web, and the project's own denylist, are withheld.
             web = web and not restrictions.get("no_internet")
-            if self.supports(TOOLS):
-                argv += [TOOLS, ",".join([*WORKER_TOOLS, *(WEB_TOOLS if web else ())])]
-                denied = []
-            else:
-                denied = list(WORKER_DENIED_TOOLS) + ([] if web else list(WEB_TOOLS))
-            denied += [t for t in disallowed_tools if t not in denied]   # the project's own denylist
+            denied = [] if web else list(WEB_TOOLS)
+            denied += [t for t in disallowed_tools if t not in denied]
             if denied:
                 argv += ["--disallowedTools", *denied]
             argv += ["--settings", json.dumps(worker_settings(denied_reads))]
@@ -358,7 +360,7 @@ class Claude(Provider):
         return found, [n for n in names if n not in found]
 
     def connector_env(self, keep: bool) -> dict[str, str]:
-        return {} if keep else dict(CONNECTORS_OFF)
+        return dict(CONNECTORS_WAIT) if keep else dict(CONNECTORS_OFF)
 
     def is_connector(self, name: str) -> bool:
         return str(name).lower().startswith(CONNECTOR_PREFIXES)
@@ -482,6 +484,10 @@ class Claude(Provider):
         cache_keys = ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
         cache_complete = False
         tool_ids: set[str] = set()   # tool calls, each block once (a streamed message repeats its blocks)
+        # Subagents the run started (an Agent call, Task in older CLIs), each call once, by subagent_type.
+        spawns: dict[str, str] = {}
+        u.extra["subagents_spawned"] = 0
+        pending: tuple[str, dict] | None = None   # the newest main-agent StructuredOutput call not run yet
         for n, ev in enumerate(self._events(output_path)):
             t = ev.get("type")
             if t == "rate_limit_event":
@@ -506,6 +512,12 @@ class Claude(Provider):
                     if isinstance(block, dict) and block.get("type") == "tool_use":
                         tool_ids.add(str(block.get("id") or f"{ident}:{len(tool_ids)}"))
                         u.extra["tool_calls"] = len(tool_ids)
+                        if block.get("name") in SPAWN_TOOLS:
+                            args = block.get("input") if isinstance(block.get("input"), dict) else {}
+                            spawns[str(block.get("id") or f"{ident}:{len(spawns)}")] = \
+                                str(args.get("subagent_type") or "general-purpose")[:60]
+                            u.extra["subagents_spawned"] = len(spawns)
+                            u.extra["subagent_types"] = dict(Counter(spawns.values()))
                     if isinstance(block, dict) and block.get("type") == "text":
                         last_text = block.get("text") or last_text
                         # A coordinator that put its actions in an earlier message, then ended on prose
@@ -514,12 +526,21 @@ class Claude(Provider):
                                 and isinstance((last_json_object(block["text"]) or {}).get("actions"), list):
                             u.actions_text = block["text"]
                     elif isinstance(block, dict) and block.get("type") == "tool_use" \
+                            and block.get("name") == "StructuredOutput" and not ev.get("parent_tool_use_id") \
+                            and isinstance(block.get("input"), dict):
+                        pending = (str(block.get("id") or ""), block["input"])
+                    elif isinstance(block, dict) and block.get("type") == "tool_use" \
                             and self.is_connector(str(block.get("name") or "")):
                         # Its workers then keep the connectors (Daemon._connectors_needed).
                         used = u.extra.setdefault("connectors_used", [])
                         name = str(block["name"]).split("__")[1]
                         if name not in used:
                             used.append(name)
+            elif t == "user" and pending:
+                # The answer call ran (taken, refused by the schema or denied by a hook): never kept below.
+                if any(isinstance(b, dict) and b.get("type") == "tool_result" and str(b.get("tool_use_id")) == pending[0]
+                       for b in (ev.get("message") or {}).get("content") or []):
+                    pending = None
             elif t == "system" and ev.get("subtype") == "init":
                 if "model" in u.extra:   # a later init: the CLI started again, on the login it found then
                     u.extra["reinit"] = True
@@ -534,17 +555,23 @@ class Claude(Provider):
                 u.output_tokens = int(usage.get("output_tokens") or 0)
                 u.cache_read_tokens = int(usage.get("cache_read_input_tokens") or 0)
                 u.cache_write_tokens = int(usage.get("cache_creation_input_tokens") or 0)
+                if ids := model_usage_ids(ev):   # the model ids the run really used (pricing: daemon._list_cost)
+                    u.extra["model_usage"] = ids
                 thinking = (usage.get("output_tokens_details") or {}).get("thinking_tokens")
                 if isinstance(thinking, int) and not isinstance(thinking, bool):
                     u.extra["thinking_tokens"] = thinking   # part of output_tokens (effortab.report)
                 u.final_text = ev.get("result") if isinstance(ev.get("result"), str) else json.dumps(ev.get("result"))
-                u.structured = drop_nulls(ev.get("structured_output"))
+                u.structured = drop_nulls(ev.get("structured_output"), sparse=True)
                 if ev.get("is_error"):
                     u.error = f"{ev.get('subtype')}: {str(ev.get('result'))[:300]}"
                     typed += [str(e) for e in ev.get("errors") or []] + [str(ev.get("result") or "")]
                 else:
                     typed = []   # the CLI got past the errors it streamed
                 u.extra["subtype"] = ev.get("subtype")
+                if ev.get("subtype") == "error_max_budget_usd" and pending and not u.structured:
+                    # The budget ran out on the call that gave the final answer, so the CLI never ran it.
+                    # A tool block streams whole: the daemon may apply it (Daemon._finish_coordinator).
+                    u.answer = drop_nulls(pending[1], sparse=True)
                 u.session_id = ev.get("session_id", u.session_id)
         if not saw_result:
             # Ended before the result line (killed, lost): the tokens the stream showed are all there
@@ -601,6 +628,259 @@ class Claude(Provider):
         except (OSError, ValueError):
             return ""
         return str((data.get("oauthAccount") or {}).get("billingType") or data.get("billingType") or "")
+
+
+def model_usage_ids(ev: dict) -> list[str]:
+    """The model ids a result event's modelUsage names, the most used (output, then input tokens) first."""
+    mu = ev.get("modelUsage")
+    if not isinstance(mu, dict):
+        return []
+
+    def used(k):
+        v = mu[k] if isinstance(mu[k], dict) else {}
+        return (int(v.get("outputTokens") or 0), int(v.get("inputTokens") or 0) + int(v.get("cacheReadInputTokens") or 0))
+    return [str(k) for k in sorted(mu, key=used, reverse=True) if k][:8]
+
+
+def result_models(path: Path) -> tuple[list[str], str]:
+    """(modelUsage ids of the last result, the init event's model) read from a run's output.jsonl, or
+    ([], '') when it has none; for runs booked before the ids were recorded."""
+    ids, init = [], ""
+    try:
+        with open(path, errors="replace") as f:
+            for line in f:
+                if '"modelUsage"' not in line and not (not init and '"init"' in line):
+                    continue
+                try:
+                    ev = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(ev, dict):
+                    continue
+                if ev.get("type") == "result":
+                    ids = model_usage_ids(ev) or ids
+                elif ev.get("type") == "system" and ev.get("subtype") == "init" and not init:
+                    init = str(ev.get("model") or "")
+    except OSError:
+        return [], ""
+    return ids, init
+
+
+def result_total(path: Path) -> float | None:
+    """The total_cost_usd of the last result event in a run's output.jsonl (for a resumed or forked
+    session, the session's running total), or None when it has none."""
+    total = None
+    try:
+        with open(path, errors="replace") as f:
+            for line in f:
+                if '"total_cost_usd"' not in line:
+                    continue
+                try:
+                    ev = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(ev, dict) and ev.get("type") == "result" and ev.get("total_cost_usd") is not None:
+                    with contextlib.suppress(TypeError, ValueError):
+                        total = float(ev["total_cost_usd"])
+    except OSError:
+        return None
+    return total
+
+
+class CallsCost(NamedTuple):
+    usd: float           # the run's Anthropic calls at list price
+    calls: int           # how many calls (message ids) that is
+    models: list[str]    # their model ids
+    unknown: list[str]   # those no price row names: priced at the dearest row (over-counted)
+    logged: int = 0      # calls whose final usage the session transcript gave
+
+
+_MSG_ID = re.compile(rb'"id"\s*:\s*"(msg_[^"]+)"')
+
+
+def _keep_highest(seen: dict, usage: dict) -> None:
+    """Merge one reading of a message's usage into `seen`: each count at its highest reading (a nested
+    one too, cache_creation's split and server_tool_use), any other value at its last one."""
+    for k, v in usage.items():
+        if isinstance(v, dict):
+            sub = seen[k] if isinstance(seen.get(k), dict) else {}
+            _keep_highest(sub, v)
+            seen[k] = sub
+        elif isinstance(v, (int, float)) and not isinstance(v, bool):
+            old = seen.get(k)
+            seen[k] = max(old, v) if isinstance(old, (int, float)) and not isinstance(old, bool) else v
+        elif v not in (None, ""):
+            seen[k] = v
+
+
+def _logged_line(line: bytes, wanted: set[str] | None, got: dict[str, dict]) -> None:
+    """Merge one session-log line's assistant usage into `got` (logged_usage, LogTail): only a message id
+    in `wanted`, or any when `wanted` is None."""
+    if b'"assistant"' not in line or b'"usage"' not in line:
+        return
+    if wanted is not None:
+        ids = {m.decode(errors="replace") for m in _MSG_ID.findall(line)}
+        if ids and not ids & wanted:   # most lines: another run's call, never parsed
+            return
+    try:
+        ev = json.loads(line)
+    except ValueError:
+        return
+    msg = ev.get("message") if isinstance(ev, dict) and isinstance(ev.get("message"), dict) else {}
+    ident = str(msg.get("id") or "")
+    if ev.get("type") == "assistant" and ident and (wanted is None or ident in wanted) \
+            and isinstance(msg.get("usage"), dict):
+        _keep_highest(got.setdefault(ident, {}), msg["usage"])
+
+
+def logged_usage(paths, wanted: set[str]) -> dict[str, dict]:
+    """The usage Claude Code's session transcripts (`paths`: the session's log and its subagents') recorded
+    for each message id in `wanted`, every count at its highest reading: a call's final counts, which its
+    stream line does not carry. Reads each file whole: for a run that is still going use a LogTail."""
+    got: dict[str, dict] = {}
+    for p in paths:
+        try:
+            f = open(p, "rb")
+        except OSError:
+            continue
+        with f:
+            for line in f:
+                _logged_line(line, wanted, got)
+    return got
+
+
+class LogTail:
+    """logged_usage for a run that is still going (Daemon.meter_running prices it every minute): each
+    session log is read once, then only from the byte offset its last read ended at (a whole line), so a
+    forked or resumed session's log of tens of MB is not read again each minute. A file that shrank or was
+    replaced (another inode) is read again from its start. The first read of a file keeps only the ids
+    `wanted` names (the session's earlier calls are not this run's); later reads keep every call's usage,
+    since a call's log line can come before its stream line names it. Its figures are an estimate: the
+    run's end books from a whole read (logged_usage)."""
+
+    def __init__(self) -> None:
+        self.files: dict[str, list] = {}   # path -> [(dev, inode), offset, {message id: usage}]
+        self.read_bytes = 0                # bytes read over all passes (for tests and timing)
+
+    def usage(self, paths, wanted: set[str]) -> dict[str, dict]:
+        out: dict[str, dict] = {}
+        live = set()
+        for p in paths:
+            key = str(p)
+            live.add(key)
+            try:
+                st = os.stat(p)
+            except OSError:
+                continue
+            ent = self.files.get(key)
+            if ent is None or ent[0] != (st.st_dev, st.st_ino) or st.st_size < ent[1]:
+                ent = self.files[key] = [(st.st_dev, st.st_ino), 0, {}]
+            if st.st_size > ent[1]:
+                first = ent[1] == 0
+                try:
+                    with open(p, "rb") as f:
+                        f.seek(ent[1])
+                        for line in f:
+                            if not line.endswith(b"\n"):   # a line still being written: read it next pass
+                                break
+                            ent[1] += len(line)
+                            self.read_bytes += len(line)
+                            _logged_line(line, wanted if first else None, ent[2])
+                except OSError:
+                    pass
+            for ident in wanted & ent[2].keys():
+                _keep_highest(out.setdefault(ident, {}), ent[2][ident])
+        for key in set(self.files) - live:
+            del self.files[key]
+        return out
+
+
+def stream_calls(path: Path, empty_ok: bool = False) -> tuple[dict[str, tuple[str, dict]], str] | None:
+    """A run's Anthropic API calls named in its own stream output (output.jsonl), {message id: (model,
+    usage)}, and the session id its init event names. Each assistant message is one call, streamed as one
+    line per content block, each repeating its usage: every count is kept at its highest reading. A
+    forked or resumed session's earlier calls are not in a run's stream; a subagent's calls are
+    (parent_tool_use_id). '<synthetic>' messages (no API call) and another vendor's models (a chat
+    endpoint's GLM) are not Anthropic spend. None when no assistant message carries usage, or one carries
+    usage with no model id (a Claude Code that streams none, a run that never got an answer). With
+    `empty_ok`, a stream with no assistant usage at all but an init event (Claude Code ran and made no
+    call that answered) is ({}, session): a resumed or forked run books $0, never the session's total."""
+    from .. import localspend
+    per: dict[str, tuple[str, dict]] = {}
+    saw, session = False, ""
+    try:
+        with open(path, "rb") as f:
+            for n, line in enumerate(f):
+                if not session and b'"init"' in line:
+                    with contextlib.suppress(ValueError, AttributeError):
+                        ev = json.loads(line)
+                        if ev.get("type") == "system" and ev.get("subtype") == "init":
+                            session = str(ev.get("session_id") or "")
+                if b'"assistant"' not in line or b'"usage"' not in line:
+                    continue
+                try:
+                    ev = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(ev, dict) or ev.get("type") != "assistant":
+                    continue
+                msg = ev.get("message") if isinstance(ev.get("message"), dict) else {}
+                usage = msg.get("usage")
+                if not isinstance(usage, dict):
+                    continue
+                model = str(msg.get("model") or "")
+                if not model:   # a call with no model id cannot be priced: the whole output is not per call
+                    return None
+                saw = True
+                if model == localspend.SYNTHETIC or "claude" not in model.lower():
+                    continue
+                ident = str(msg.get("id") or ev.get("uuid") or f"line-{n}")
+                _, seen = per.setdefault(ident, (model, {}))
+                _keep_highest(seen, usage)
+    except OSError:
+        return None
+    return (per, session) if saw or (empty_ok and session) else None
+
+
+def price_calls(per: dict[str, tuple[str, dict]], overrides: dict | None = None,
+                logged: dict[str, dict] | None = None) -> CallsCost:
+    """The calls `per` (stream_calls) at list price, each at its own model (localspend.price: 5-minute and
+    1-hour cache writes apart, web searches, fast mode), with `overrides` (the account's pricing.claude) on
+    the table. A call's stream lines carry the usage from its start (output_tokens a handful): its counts
+    in `logged` (logged_usage, the session log's final ones) are taken where higher."""
+    from .. import localspend
+    rows = localspend.table(overrides)
+    usd, models, unknown, found = 0.0, set(), set(), 0
+    for ident, (model, usage) in per.items():
+        if logged and ident in logged:
+            usage = dict(usage)
+            _keep_highest(usage, logged[ident])
+            found += 1
+        got, est = localspend.price(model, usage, rows=rows)
+        usd += got
+        models.add(model)
+        if est:
+            unknown.add(model)
+    return CallsCost(round(usd, 6), len(per), sorted(models), sorted(unknown), found)
+
+
+def calls_cost(path: Path, overrides: dict | None = None, transcripts=(), tail: LogTail | None = None,
+               empty_ok: bool = False) -> CallsCost | None:
+    """What a run's Anthropic API calls cost at list price, each call once: the way Anthropic bills, which
+    the session's total_cost_usd is not (in a resumed or forked session it is the running total, the
+    parent's calls included). The calls are those the run's own stream names (stream_calls), each at its
+    final usage from `transcripts`, Claude Code's session log and its subagents' logs (logged_usage;
+    without them output is under-counted), priced by price_calls. None when the stream has no per-call
+    usage: the caller books the old way. `tail` (a LogTail kept for a running run) reads the logs
+    incrementally; `empty_ok` as stream_calls."""
+    got = stream_calls(path, empty_ok)
+    if got is None:
+        return None
+    per = got[0]
+    logged = None
+    if per and transcripts:
+        logged = tail.usage(transcripts, set(per)) if tail is not None else logged_usage(transcripts, set(per))
+    return price_calls(per, overrides, logged)
 
 
 def _whole_answer(row: dict) -> bool:
@@ -660,7 +940,9 @@ def hook_settings() -> dict:
                       # to the harness's gh wrapper and gh.d pre-hooks outside a harness task, and connector
                       # posts to others without the AI-authorship tag (aitag), and file tool reads of a
                       # credential store (credguard).
-                      "PreToolUse": [{"matcher": "Bash|Edit|Write|MultiEdit|NotebookEdit|Read|Grep|Glob|mcp__.*",
+                      # Every tool, so a tool the run has but no guard knows still meets the hook
+                      # (HARNESS_TOOLS, the reviewer's write rule), and subagents' calls too.
+                      "PreToolUse": [{"matcher": "*",
                                       "hooks": [{"type": "command", "command": f"{cmd} PreToolUse", "timeout": 20}]}],
                       # Refuses to end a task run whose result.json is missing or no hand-off (twice at most),
                       # or fails a hand-off check (the checks get handoffcheck.STOP_BUDGET_S in all).
@@ -730,13 +1012,18 @@ def sandbox_settings(dirs, freed=()) -> dict:
             "network": {"allowAllUnixSockets": True}}
 
 
+def lean_settings() -> dict:
+    """Bundled skills by name only, no auto-memory: a worker's, and a full-tools coordinator's, so a
+    fork of its session lists the same skills (ctxfork.shape_argv)."""
+    return {"skillOverrides": {name: "name-only" for name in BUNDLED_SKILLS}, "autoMemoryEnabled": False}
+
+
 def worker_settings(denied_reads=()) -> dict:
     """The hook, plus a leaner context: bundled skills by name only, no auto-memory (the project
     keeps its own). Skills from a project's plugin dirs stay fully listed. Each absolute path in
     `denied_reads` gets a Read deny rule (`//` starts an absolute path in a rule); deny rules hold
     under bypassPermissions."""
-    out = {**hook_settings(), "skillOverrides": {name: "name-only" for name in BUNDLED_SKILLS},
-           "autoMemoryEnabled": False,
+    out = {**hook_settings(), **lean_settings(),
            # No Bash sandbox, even one the user's own settings turn on; fence_args replaces this when the
            # project turns the write fence on (providers.claude.write_fence).
            "sandbox": {"enabled": False}}

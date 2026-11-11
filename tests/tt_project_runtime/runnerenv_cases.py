@@ -261,6 +261,7 @@ def test_ttp_checks_freeze_lock_pins_the_user_sites_packages_the_lock_does_not_n
     lines = [ln for ln in out.read_text().splitlines() if not ln.startswith("#")]
     assert "Some_Pkg==1.2.3" in lines and "pytest==8.4.2" in lines and "pytest==99.0" not in lines
     assert "--hash" not in out.read_text() and "Some_Pkg==1.2.3" in capsys.readouterr().out
+    assert "# requires-python: >=3.10" in out.read_text().splitlines(), "the frozen lock keeps the Python it needs"
     assert not (run / "checks.json").exists(), "it runs no check"
 
 
@@ -274,7 +275,9 @@ def test_a_remote_check_runs_in_the_hosts_pinned_env_and_never_without_it(tmp_pa
     cmd = f'printf "%s|%s|%s" "$PYTHONNOUSERSITE" "${{PIP_USER-unset}}" "${{PATH%%:*}}" > {seen}'
     rc, said = _rc_run(tmp_path, repo, cmd, PIP_USER="1")
     assert rc == 0, said
-    assert seen.read_text() == f"1|unset|{os.environ['TTP_TEST_CHECKS_PYTHON_ENV']}/bin"
+    nsite, pip_user, first = seen.read_text().split("|")
+    assert (nsite, pip_user) == ("1", "unset")
+    assert os.path.realpath(first) == os.path.realpath(os.environ["TTP_TEST_CHECKS_PYTHON_ENV"] + "/bin")
     assert "TTP_ENV_" not in said and _rc_left(tmp_path) == []
     seen.unlink()
     rc, said = _rc_run(tmp_path, repo, cmd, TTP_TEST_CHECKS_PYTHON_ENV=str(tmp_path / "none"))
@@ -295,7 +298,9 @@ def test_a_slurm_check_job_runs_in_the_nodes_pinned_env_and_is_a_fault_without_i
         subprocess.run(["sh", str(q / "job.sh")], cwd=q, env={**os.environ, "TTP_TEST_CHECKS_PYTHON_ENV": stand_in},
                        capture_output=True, timeout=120)
         assert (q / "rc").read_text().strip() == rc
-    assert seen.read_text() == f"1|{os.environ['TTP_TEST_CHECKS_PYTHON_ENV']}/bin"
+    nsite, first = seen.read_text().split("|")
+    assert nsite == "1"
+    assert os.path.realpath(first) == os.path.realpath(os.environ["TTP_TEST_CHECKS_PYTHON_ENV"] + "/bin")
 
 
 def test_a_pinned_env_fault_closes_once_its_env_is_made_or_its_lock_is_gone(tmp_path, monkeypatch):
@@ -303,10 +308,121 @@ def test_a_pinned_env_fault_closes_once_its_env_is_made_or_its_lock_is_gone(tmp_
     lock = tmp_path / "py.lock"
     lock.write_text("# nothing pinned\n")
     f = runnerenv.fault(lock, "pip failed")
-    assert f["sig"] == runnerenv.FAULT + hashlib.sha256(lock.read_bytes()).hexdigest()[:12]
+    assert f["sig"].startswith(runnerenv.FAULT + hashlib.sha256(lock.read_bytes()).hexdigest()[:12] + "-py")
     assert "pinned Python env cannot be made" in envfault.line(f)
     assert envfault._still(f) is None, "the suite's ready stand-in env: made"
     monkeypatch.setenv("TTP_TEST_CHECKS_PYTHON_ENV", str(tmp_path / "none"))
     assert envfault._still(f) == f, "not made: still open, the probe never waits for a build"
     lock.unlink()
     assert envfault._still(f) is None
+
+
+def test_a_pinned_env_fault_names_its_python_and_never_holds_a_run_under_another(tmp_path, monkeypatch):
+    # A run under macOS's own python3 3.9 could not make the env of a lock needing 3.10; its fault
+    # was keyed on the lock alone, so it held every check run and the push queue, those under 3.12 too.
+    from ttp import envfault, runnerenv
+    lock = tmp_path / "py.lock"
+    lock.write_text("# nothing pinned\n")
+    monkeypatch.setenv("TTP_TEST_CHECKS_PYTHON_ENV", str(tmp_path / "none"))   # no env made: a fault stays
+    mine = runnerenv.fault(lock, "pip failed")
+    assert mine["python"] == runnerenv._base_python() and mine["python_version"] == sys.version.split()[0]
+    assert runnerenv.applies(mine) and envfault._still(mine) == mine, "this Python's own fault: open"
+    old = tmp_path / "py39" / "bin" / "python3"
+    old.parent.mkdir(parents=True)
+    old.write_text("")
+    monkeypatch.setattr(runnerenv, "_base_python", lambda: str(old))
+    monkeypatch.setattr(runnerenv.sys, "version", "3.9.6 (default)")
+    other = runnerenv.fault(lock, "pip failed")
+    assert other["python"] == str(old) and other["python_version"] == "3.9.6"
+    assert other["sig"] != mine["sig"] and other["sig"].split("-py")[0] == mine["sig"].split("-py")[0]
+    monkeypatch.undo()
+    monkeypatch.setenv("TTP_TEST_CHECKS_PYTHON_ENV", str(tmp_path / "none"))
+    assert not runnerenv.applies(other) and envfault._still(other) is None, "another Python's fault: not held here"
+    assert envfault._still(mine) == mine
+    legacy = {k: v for k, v in mine.items() if k not in ("python", "python_version")}
+    assert runnerenv.applies(legacy), "a fault recorded before faults named their Python: as before"
+
+
+def test_runnerenv_key_skips_a_lock_line_for_another_platform_so_its_env_is_reused(tmp_path, monkeypatch):
+    # PyYAML is pinned for macOS only (its Pythons ship none; Linux distributions' do): adding that
+    # line must not change a Linux host's key, or a lab box with no package index could never rebuild.
+    from ttp import runnerenv
+    base = "pytest==8.4.2 --hash=sha256:aa\n# a comment; sys_platform == \"darwin\"\nexceptiongroup==1.3.1 ; python_version < \"3.11\"\n"
+    mac = ('pyyaml==6.0.3 ; sys_platform == "darwin" \\\n    --hash=sha256:bb \\\n    --hash=sha256:cc\n'
+           "colorama==0.4.6 ; sys_platform=='win32' --hash=sha256:dd\n")
+    both = "pyyaml==6.0.3 ; sys_platform == \"darwin\" and python_version >= \"3.9\"\n"
+    notmac = "pyyaml==6.0.3 ; sys_platform != 'darwin'\n"
+    for host, kept in (("linux", ""), ("darwin", mac.split("colorama")[0])):
+        monkeypatch.setattr(runnerenv.sys, "platform", host)
+        assert runnerenv._for_host((base + mac).encode()) == (base + kept).encode(), host
+        assert (runnerenv.key_of((base + mac).encode(), "/usr/bin/python3")
+                == runnerenv.key_of(base.encode(), "/usr/bin/python3")) == (host == "linux")
+        assert runnerenv._for_host((base + both).encode()) == (base + both).encode(), "a compound marker always counts"
+        assert runnerenv._for_host((base + notmac).encode()) == (base + notmac * (host == "linux")).encode()
+    # The shipped lock: on macOS it pins PyYAML (the smoke's yaml-importing tests collect there), with a
+    # hash for each macOS CPython wheel; on Linux it reads exactly as without that line.
+    text = runnerenv.LOCK.read_bytes()
+    monkeypatch.setattr(runnerenv.sys, "platform", "darwin")
+    yaml_line = [ln for ln in runnerenv._for_host(text).decode().splitlines() if ln.startswith("pyyaml==")]
+    assert len(yaml_line) == 1 and 'sys_platform == "darwin"' in yaml_line[0] and yaml_line[0].count("--hash=sha256:") >= 2
+    monkeypatch.setattr(runnerenv.sys, "platform", "linux")
+    assert b"pyyaml" not in runnerenv._for_host(text).lower()
+    req = b"# requires-python: >=3.10\n"   # picks the interpreter, which the key names itself
+    assert req in text and runnerenv._for_host(text) == text.replace((yaml_line[0] + "\n").encode(), b"").replace(req, b"")
+
+
+def test_runnerenv_makes_the_env_from_a_python_the_locks_requires_python_allows(tmp_path, monkeypatch):
+    # ttp under macOS's /usr/bin/python3 (3.9) made the default lock's env with it, and pip found no
+    # iniconfig 2.3.1 (it needs 3.10): the env is made from a Python that meets the lock's
+    # requires-python line instead, keyed by that Python, or nothing runs and the error names both.
+    runnerenv, builds = _fake_base(tmp_path, monkeypatch)
+    monkeypatch.setattr(runnerenv, "_found", {})
+    monkeypatch.setattr(runnerenv, "_PY_DIRS", ())
+    assert runnerenv.requires(runnerenv.LOCK.read_bytes()) == [(">=", (3, 10))]
+    assert runnerenv.requires(b"# Requires-Python:>=3.10, <3.14\npytest==1\n") == [(">=", (3, 10)), ("<", (3, 14))]
+    assert runnerenv.requires(b"pytest==1\n# requires-python is read by runnerenv\n") is None
+    for bad in (b"# requires-python: 3.10\n", b"# requires-python: >=3.10 (pluggy)\n", b"# requires-python:\n"):
+        with pytest.raises(runnerenv.Unavailable, match="requires-python line"):
+            runnerenv.requires(bad)
+    meets = runnerenv._meets
+    assert meets((3, 10, 0), [(">=", (3, 10))]) and not meets((3, 9, 6), [(">=", (3, 10))])
+    assert meets((3, 10, 4), [("==", (3, 10))]) and not meets((3, 11, 0), [("==", (3, 10))])
+    assert meets((3, 10, 5), [(">", (3, 10))]) and not meets((3, 13, 1), [("<", (3, 13))])
+    assert not meets((3, 12, 4), [("<=", (3, 12))]) and meets((3, 13, 0), [(">=", (3, 10)), ("!=", (3, 12))])
+    # Candidates: a PATH folder with a non-Python, a Python too old and one that meets the lock (its
+    # base is the stand-in base, so its env builds as _fake_base's do).
+    bin_ = tmp_path / "bin"
+    bin_.mkdir()
+    fake_base = runnerenv._base_python()
+    for name, body in (("python3", "exit 1"),
+                       ("python3.41", f'echo \'["{tmp_path}/py41", "41.0.0 (old)", [41, 0, 0]]\''),
+                       ("python3.17", f'echo \'["{fake_base}", "42.1.0 (new)", [42, 1, 0]]\'')):
+        (bin_ / name).write_text(f'#!/bin/sh\n[ "$3" = --interpreter ] || exit 2\n{body}\n')
+        (bin_ / name).chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_}{os.pathsep}{os.environ['PATH']}")
+    lock = tmp_path / "a.lock"
+    lock.write_text("# requires-python: >=42\npytest==1\n")
+    assert runnerenv.interpreter(lock.read_bytes()) == (fake_base, "42.1.0 (new)")
+    info = runnerenv.ensure(lock)
+    assert builds() == 1 and info["key"] == runnerenv.key_of(lock.read_bytes(), fake_base, "42.1.0 (new)")
+    assert info["key"] != runnerenv.key_of(lock.read_bytes(), fake_base), "the key names the Python it was made from"
+    runnerenv._ready.clear()
+    assert runnerenv.ensure(lock)["key"] == info["key"] and builds() == 1 and runnerenv.ready(lock)
+    # None meets it: nothing is built and the error names the Python needed and the one found.
+    lock.write_text("# requires-python: >=43\npytest==1\n")
+    with pytest.raises(runnerenv.Unavailable, match=r"needs Python >=43.*runs under Python \d+\.\d+.*install a Python >=43"):
+        runnerenv.ensure(lock)
+    assert builds() == 1 and not runnerenv.ready(lock)
+    # A lock without the line, or one this Python meets, keeps this Python and its key as before.
+    lock.write_text(f"# requires-python: >={sys.version_info[0]}.{sys.version_info[1]}\npytest==1\n")
+    assert runnerenv.interpreter(lock.read_bytes()) == (fake_base, sys.version)
+    assert runnerenv.key_of(lock.read_bytes(), fake_base) == runnerenv.key_of(b"pytest==1\n", fake_base)
+
+
+def test_runnerenv_probes_a_real_python_for_its_base_and_version(tmp_path, monkeypatch):
+    from ttp import runnerenv
+    monkeypatch.setattr(runnerenv, "_found", {})
+    base, version, info = runnerenv._probe(sys.executable)
+    assert info == tuple(sys.version_info[:3]) and version == sys.version
+    assert Path(base).resolve() == Path(runnerenv._base_python()).resolve(), "a venv's python gives its base"
+    assert runnerenv._probe(str(tmp_path / "nope")) is None

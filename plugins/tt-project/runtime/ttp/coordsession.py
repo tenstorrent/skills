@@ -21,7 +21,8 @@ provider rejected the resume (resume failed, below). Never because the context g
 compacts its own context in place and keeps its id (user order: every agent compacts its own
 context as needed). The context is the last model call's prompt and answer; limit() is the size
 it compacts at: the session's first prompt (or its size after the last compaction) plus
-compact_growth_tokens, at most the model's context window less compact_margin_tokens;
+compact_growth_tokens, and never so soon that it would free under compact_min_free of the context
+(30%), at most the model's context window less compact_margin_tokens, which always applies;
 compact_tokens above 0 sets a fixed size instead (the older rollover_* names are still read). A
 resumed wake that fails (provider down, a cap, a crash, its process lost) is rerun at once (rerun)
 on the same queued batch, resuming the same session; only a failure that says the provider rejected
@@ -68,8 +69,9 @@ Per-row updates (coordinator.session.row_delta, on by default): only a changed O
 against the row hashes the acknowledged wake saved. It sends its header, a line naming the rows added,
 changed and removed by key and counting the rest, then the added and changed rows, each whole with its
 current age. Never a partial row or a text diff. The section goes whole, as without per-row updates,
-when: a key repeats (a group line is keyed by its hash), the list is cut short by its row limit
-(cut_line()), its header changed in more than its counts, more than half its rows changed, the rows it
+when: a key repeats (a group line is keyed by its hash), the line naming the open tasks past the row
+limit (cut_line(), keyed CUT_KEY, so a task moved past the limit is not called closed) cannot name every
+one of them, its header changed in more than its counts, more than half its rows changed, the rows it
 kept changed order, there are no row hashes acknowledged, or the whole section is shorter. A task the
 section no longer shows is called no longer open (a Course check row: no longer shown) unless a group
 line still names it. Every other
@@ -86,7 +88,7 @@ from . import cachettl, spans
 
 KEY = "coord_session"
 DEFAULTS = {"compact_tokens": 0, "compact_growth_tokens": 100000, "context_window_tokens": 0,
-            "compact_margin_tokens": 40000, "row_delta": True,
+            "compact_margin_tokens": 40000, "compact_min_free": 0.3, "row_delta": True,
             # what a worker or reviewer run starts with (ctxfork.py); worker_fork_max_tokens 0: no cap
             "worker_context": "fork", "worker_fork_max_tokens": 0, "worker_fork_max_age_h": 12,
             "worker_chat_chars": 30000}
@@ -127,7 +129,8 @@ COURSE = "course_check"   # the Course check section (course.py)
 TICKS = re.compile(r"\b\d+(?:\.\d+)?\s?(?:h|min|m|s)\b")
 _READ_RE = re.compile(r"\(read [^()]*\)")
 OPEN_ROWS = 60   # the Open tasks section's row limit
-CUT_NAMED = 40   # the most open tasks past it named one by one
+CUT_NAMED = 300   # the most open tasks past it named one by one (past it the section goes whole)
+CUT_KEY = "~cut"   # the cut line's row key: a group line, so a task it names is not called closed
 _CUT = "- (open tasks past this list's limit of"
 CHATS_SHOWN = 10   # the Chats attached section's row limit (it has no line for the chats past it)
 _ROW_KEY = re.compile(r"- (#\d+) \| ")   # an Open tasks row's key, its task id
@@ -228,18 +231,31 @@ def decide(cfg: dict, state, prefix_key: str, model: str, effort: str, saved, no
     return "resume", "continued"
 
 
+def salvaged_line(n) -> str:
+    """The resumed wake's lead after its last wake's answer was cut off at its budget end and applied."""
+    return (f"Your last wake ran out of budget on its final answer before it ran. The harness applied that "
+            f"answer as sent ({int(n)} actions): do not send it again.")
+
+
 def limit(cfg: dict, state, model: str = "") -> float:
     """The context size at which the session compacts in place: compact_tokens when above 0, else the
     session's first prompt (base_tokens) or its size after its last compaction (compact_floor), the
-    larger, plus compact_growth_tokens, at most the context window (context_window_tokens; 0:
-    LONG_WINDOW for a "[1m]" model, else unknown) less compact_margin_tokens."""
+    larger, plus compact_growth_tokens, and at least compact_floor / (1 - compact_min_free), at most the
+    context window (context_window_tokens; 0: LONG_WINDOW for a "[1m]" model, else unknown) less
+    compact_margin_tokens."""
     s = settings(cfg)
     fixed = _num(s.get("compact_tokens"), 0)
     if fixed > 0:
         return fixed
     st = state if isinstance(state, dict) else {}
-    out = max(_num(st.get("base_tokens"), 0), _num(st.get("compact_floor"), 0)) \
+    floor = _num(st.get("compact_floor"), 0)
+    out = max(_num(st.get("base_tokens"), 0), floor) \
         + _num(s.get("compact_growth_tokens"), DEFAULTS["compact_growth_tokens"])
+    # A compaction is expected to come back to about the size the last one left (compact_floor): one
+    # sooner would free under compact_min_free of the context, so it waits. The window cap below still
+    # forces one.
+    free = min(max(_num(s.get("compact_min_free"), DEFAULTS["compact_min_free"]), 0.0), 0.9)
+    out = max(out, int(floor / (1 - free)))
     window = _num(s.get("context_window_tokens"), 0) or (LONG_WINDOW if str(model or "").endswith("[1m]") else 0)
     if window > 0:
         out = min(out, window - _num(s.get("compact_margin_tokens"), DEFAULTS["compact_margin_tokens"]))
@@ -264,7 +280,8 @@ def record(state, usage, session_id: str, turn: dict, ok: bool, now: float, summ
     """kv KEY after a wake that decided `turn` ({"mode", "why", "key", "model", "effort",
     "provider"}) ended, ok or not; `summary` is its answer's own summary, kept in `recent` for the next
     seed or restore. A provider gap's stateless wake leaves the session as it was. `compacted`: the
-    agent compacted the session during the wake ({"pre_tokens": its size before, when known}); a
+    agent compacted the session during the wake ({"pre_tokens": its size before, "post_tokens": its history
+    right after, when known}); a
     "compact" wake without it was the harness-supplied summary (its session_note). Either is kept in
     `compactions` and makes the next wake lead with restore()."""
     st = dict(state) if isinstance(state, dict) else {}
@@ -279,6 +296,9 @@ def record(state, usage, session_id: str, turn: dict, ok: bool, now: float, summ
     st.pop("rejected", None)
     if ok:
         st.pop("idle_fails", None)
+        st.pop("salvaged", None)   # the wake it was told in ran
+        if turn.get("salvaged"):   # its answer, cut off at its budget end, was applied: the next wake is told
+            st["salvaged"] = int(turn["salvaged"])
     if ok and str(summary or "").strip():
         st["recent"] = ([x for x in (st.get("recent") or []) if isinstance(x, dict)]
                         + [{"at": now, "summary": str(summary).strip()[:RECENT_CHARS]}])[-RECENT_WAKES:]
@@ -312,6 +332,10 @@ def record(state, usage, session_id: str, turn: dict, ok: bool, now: float, summ
             pre = _num(compacted.get("pre_tokens"), 0) if isinstance(compacted, dict) else 0
             row = {"at": now, "session": st["id"], "before": int(pre or before),
                    "after": st["context_tokens"], "how": "agent" if agent else "summary"}
+            # The agent's own count right after it compacted (its history, without the system prompt);
+            # `after` is the size at the wake's end, grown again by that wake.
+            if isinstance(compacted, dict) and (post := int(_num(compacted.get("post_tokens"), 0))) > 0:
+                row["post"] = post
             st["compactions"] = [*(st.get("compactions") or []), row][-COMPACTIONS_KEPT:]
             st.update({"restore": True, "compact_floor": st["context_tokens"]})
     return st
@@ -388,21 +412,26 @@ def sections(parts: list[tuple[str, str]]) -> dict:
 
 def _key_rows(text: str, section: str = ROWS) -> list[tuple[str, str]] | None:
     """A keyed section's (row key, line) after its header (a line with no key, such as a group line, is
-    keyed '~' and its hash), or None when a key repeats or the list is cut short by its row limit."""
+    keyed '~' and its hash; the cut line CUT_KEY), or None when a key repeats or the cut line does not
+    name every open task past the row limit."""
     out = []
     for ln in text.split("\n")[1:]:
         if not ln.strip():
             continue
         if ln.startswith(_CUT):
-            return None
+            if not ln.endswith(")") or ln.endswith(" more)"):
+                return None
+            out.append((CUT_KEY, ln))
+            continue
         out.append((_row_key(section, ln) or f"~{_sha(_unticked(ln))}", ln))
     keys = [k for k, _ in out]
     return None if len(set(keys)) < len(keys) else out
 
 
 def _head(text: str) -> str:
-    """A section's header line without its counts, hashed."""
-    return _sha(re.sub(r"\d+", "#", text.split("\n", 1)[0]))
+    """A section's header line without its counts or a note after ';' in its closing parenthesis (the Open
+    tasks overlap advice comes and goes with its rows; the delta sends the header as it is now), hashed."""
+    return _sha(re.sub(r"\d+", "#", re.sub(r";[^()]*\)$", ")", text.split("\n", 1)[0])))
 
 
 def rows(parts: list[tuple[str, str]]) -> dict:
@@ -546,9 +575,11 @@ def session_prompt_parts(p, provider: str | None = None) -> tuple[str, str]:
     Rendered live from the charter, the prompt files and the tool state only, so two wakes with an
     unchanged charter and tool state get the same bytes."""
     from .coordinator import _prompt_head
+    from .knownpaths import block
     from .prompts import coordinator_session_role, session_tools
     rules, _, charter = _prompt_head(p)
-    return f"{rules}{coordinator_session_role(p, session_tools(p, provider))}", f"# CHARTER\n{charter}\n"
+    role = coordinator_session_role(p, session_tools(p, provider)).rstrip()
+    return f"{rules}{role}\n\n{block(p)}", f"# CHARTER\n{charter}\n"
 
 
 def _note_path(p, session_id: str):

@@ -205,8 +205,9 @@ def run_group(cmd: str, *, cwd: str, timeout: float, env: dict | None,
     out = scriptwatch.rerun(lambda: _run_group(cmd, cwd=cwd, timeout=max(end - time.monotonic(), 1), env=env),
                             lambda r: r.returncode not in ok, cmd, cwd, env, said.append,
                             again=lambda: end - time.monotonic() >= 1)
+    out.rerun_note = "".join(f"ttp: {line}\n" for line in said)   # not the command's own stderr
     if said:
-        out.stderr = "".join(f"ttp: {line}\n" for line in said) + (out.stderr or "")
+        out.stderr = out.rerun_note + (out.stderr or "")
     return out
 
 

@@ -6,8 +6,8 @@
   written (in doubt, the stricter reading).
 - Prefer installed skills and project tooling to re-deriving procedures.
 - Stay inside your working directory unless the task says otherwise. Search only it, the project
-  root and paths the charter or memory names. Never search / or the home folder (`find /`,
-  `find ~`, `grep -r ~`, `mdfind`: slow, macOS privacy prompts). Use `git ls-files | grep <name>` or a rooted
+  root, the KNOWN PATHS below (`ttp paths`) and paths the charter or memory names. Never search / or
+  the home folder (`find /`, `find ~`, `grep -r ~`, `mdfind`, os.walk: slow, macOS privacy prompts). Use `git ls-files | grep <name>` or a rooted
   `find`; rg/Grep skip what `.ignore` lists (results/, tmp/, harness state): pass those paths.
 - Disk space: `df <path>`. Never `du` from / or a home folder (network mounts stall); `du -x`
   only your own directories under a `timeout`. A scan that times out is unknown, not a blocker.
@@ -50,7 +50,7 @@
   min; exit 1: never start or send it on a timer, wait on that check.
 - Make durable progress early (commit, or write to the output folder): a killed run keeps what's on disk.
 - Run builds and test suites as `ttp clip -- <command>` (failures or head and tail, and the log's
-  path). Cap pytest -n at $TTP_TEST_SLOTS, only with xdist.
+  path). pytest -n N (xdist): `ttp clip -- ttp sandbox --`, N <= $TTP_TEST_SLOTS.
 - Read files narrowly: `grep -n` first, then only the ranges you need (`sed -n 'a,bp'`, or Read with
   offset and limit). Do not re-read a range: later calls pay it again.
 <!-- ttp:if harness -->
@@ -256,6 +256,10 @@ No `result.json`, no credit.
   `retry_when` with no new commit, the task goes to the coordinator. `next_step` is never a plan or an "if ... then"; a wake that needs judgment sets
   `wake_tier` standard and no `next_step`.
 <!-- /ttp:if wait -->
+- ssh failing with `signing failed`, `agent refused operation` or `communication with agent failed`
+  (or hanging in BatchMode while SSH_AUTH_SOCK is a password manager's agent) is the ssh agent here
+  locked or waiting for approval, not the host: wait and retry; the daemon alerts the user once. Never
+  create, copy or load a key to get around it.
 - `blocked` only when a credential, funds or a resource you cannot get is missing (an encrypted
   input or one in a macOS privacy-protected folder too: block once, naming the file), or the next
   step could harm others or speaks as the user. Say what and your pick (an unanswered ask takes it).
@@ -279,7 +283,8 @@ No `result.json`, no credit.
 
 - No progress possible within your budget or wall clock: stop early with an honest hand-off.
 - NEVER poll, sleep-wait, or loop waiting for something: hand off `waiting`, `blocked` or `needs_review`.
-  Never block one tool call longer than about 5 minutes: submit long work detached, hand off `waiting`.
+  Never block one tool call longer than about 5 minutes: run long work, a remote test (`ttp lock <box> --`,
+  ssh) or a slow poll detached (`ttp detach`), hand off `waiting` with its `retry_when`: that frees your slot.
 <!-- ttp:if wait -->
   Push with `ttp push --detach` (delivery: reviews and landings) or `ttp push --own --detach`
   (your task branch). A command your task's rules say to run in the foreground gets your

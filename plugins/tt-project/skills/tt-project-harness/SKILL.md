@@ -61,6 +61,7 @@ read the one for the lever you change.
 | Own pushes | `delivery.own_push`: `on`, `existing_only` (also unset) or `off`. See [references/own-pushes.md](references/own-pushes.md) |
 | Release-channel tags | `delivery.channel_tags` lists tags a release cut moves forward; `ttp push --move-tag <tag> <commit>` moves one under a fresh lease, also under `delivery.never_force`. See [references/release-channel-tags.md](references/release-channel-tags.md) |
 | Landed waits without a push branch | `delivery.landed_probe`: a read-only command, `{id}` the task id (exit 0 landed, 1 not yet, else broken), that answers `landed:#<id>` when `delivery.push_branch` is unset. Unset too: automatic chains use `depends_on`; a coordinator `start_when landed:#<id>` becomes `depends_on <id>` (other `&&` terms kept), `ttp task add`/`set-when` refuse it, and stored or worker-written waits pass once the task is done |
+| Premise checks | A code spec line `premise: <words>` is checked once by a light question before the first run. A line `premise_cmd: <read-only shell command>` is run by the daemon itself, model-free, from the project root before each dispatch (again once a pass is older than `premise.recheck_min`, default 30; killed after `premise.cmd_timeout_s`, default 60): exit 0 dispatches, exit 1 closes the task as not needed with no worker run, anything else (or a write, remote or device access the guard refuses) falls back to the light question. Map other scripts onto 0 and 1 with a wrapper, e.g. `git merge-base --is-ancestor <sha> origin/<branch> && exit 1 \|\| exit 0` |
 | Hand-off lint | Model-free, on every code hand-off: flags a follow-up to push an own branch that is not on the remote. See [references/own-pushes.md](references/own-pushes.md) |
 | Requested cells | A spec line `cells: a, b; c` names the measurements or tests a task must cover, as short names (one per chip id or test), never a description: a descriptive line is refused at task_add/task_update and, stored from before, ignored; its done hand-off lists the ones finished with a valid result in `cells`: a list of names, or a dict name -> row; a dict value that is empty, `valid: false` or a string starting `invalid` is not finished (0 is a measurement). Model-free: a done missing some reads `partial: N of M cells` and gets a `continue:` follow-up for the rest; one without `cells` reads `cells unreported: M requested`. The status stays done. Cells no hop could produce (`cells_unrunnable`) get none: see [references/continue-hops.md](references/continue-hops.md); a wrong mark is corrected with `ttp task <project> rejudge <id>` (same file) |
 | Model-free wait endings | A waiting hand-off's `on_pass` or `on_pass_cmd` ends the task with no model run; `ttp task set-when`, `ttp ack-wait`, a measured `eta` with `eta_basis` for a wait on outside work, and where a detached `ttp checks` keeps its output. See [references/model-free-wait-endings.md](references/model-free-wait-endings.md) |
@@ -199,6 +200,10 @@ read the one for the lever you change.
   Give one to a command with `ttp secret env --secret <name>[:<key>]=<VAR> -- <command>`.
   A built-in one goes only by a field: `--secret jev:key=<VAR>`. In the sandbox, `ttp secret env`
   has the daemon run the command; you get its masked output and exit code, never the value.
+- Never copy a key to another machine yourself. A shared or build box reads keys at run time from
+  its store (`ttp secret store`, set up there by the user); never call its fetch command, keychain
+  item or the store's environment variable directly. Push from the trusted machine over HTTPS, not
+  from a box with a stored push key.
 
 ## CPU-only runs never open a device
 
@@ -377,8 +382,8 @@ The boot is told by the kernel's boot id (on macOS, kern.bootsessionuuid, else k
 - `ttp upgrade <name>` merges the installed tt-project template in a scratch worktree, checks the
   runtime compiles and imports, then fast-forwards this harness. It settles conflicts that need no
   judgment itself (both sides only added at one spot, or upstream already ships the change).
-  Otherwise the harness is left as it was and a harness task is queued to finish the merge, at
-  most one per `upgrade.task_every_h` (6) hours. Keep this project's own imports in a runtime file
+  Otherwise the harness is left as it was and a harness task is queued at once to finish the merge,
+  one open at most. Keep this project's own imports in a runtime file
   in one block at the end of the file, after its `# --- project-local imports below ---` line where it
   ends with one, outside upstream's `from . import ...` lists, so upgrades merge cleanly with no task. It then exits 75 (deferred, not failed) while that task or the daemon's retry under
   `upgrade.auto` takes it on (the daemon retries only a newer version); when nothing does, it exits 1.

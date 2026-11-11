@@ -21,6 +21,8 @@ coordinator; 3) only for pace past
 WAKE_PACE of the budget or a command failed WAKE_REPEAT_FAIL times, one normal event that wakes it.
 Active flags go in the run's runwatch entry as "flags" ({flag: evidence}); "drift" keeps the ladder.
 Unread updates are steerack's own event; nothing here repeats it.
+A run that has already exited (runwatch.ended: exit.json, its stream's final event, or its runner gone) is
+never flagged.
 """
 from __future__ import annotations
 
@@ -162,7 +164,12 @@ def check(p, cfg: dict, data: dict, now: float) -> list[int]:
     from .hook import STEER_FILE
     from .locks import wait_spans
     s = settings(cfg)
-    runs = [e for e in (data.get("runs") or {}).values() if not e.get("gone") and not e.get("error")]
+    runs = []
+    for e in (data.get("runs") or {}).values():
+        if e.get("ended"):   # exited, not reaped yet: its final spend is no pace, and nobody reads its steer.md
+            e["flags"] = {}
+        elif not e.get("gone") and not e.get("error"):
+            runs.append(e)
     specs = {}
     tasks = sorted({e["task"] for e in runs if e.get("task")})
     if tasks and s["outside_spec"] > 0:

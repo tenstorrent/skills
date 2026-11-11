@@ -92,7 +92,9 @@ def test_queue_wait_settle_records_an_act_or_raises_again_at_the_next_mark(env):
     mustact.settle(p, [ev["id"]], [{"type": "reply", "chat": "all", "text": "ok"}], [0], now)
     assert not p.db.q("SELECT id FROM events WHERE kind='must_act_rewake'")
     assert queuewait.scan(p, QW_CFG, now + 5 * 60, host) == []   # the same mark
-    assert len(queuewait.scan(p, QW_CFG, now + 31 * 60, host)) == 1   # the next mark
+    assert queuewait.scan(p, QW_CFG, now + 30 * 60, host) == []   # the next mark, nothing it says changed
+    moved = {**host, "running": host["running"][1:] + ["other task #99 (run 2)"]}
+    assert len(queuewait.scan(p, QW_CFG, now + 31 * 60, moved)) == 1   # a holder changed: raised again
     ev2 = _qw_events(p)[-1]
     p.db.x("UPDATE events SET status='handled' WHERE id=?", (ev2["id"],))
     act = {"type": "reply", "chat": "all", "text": "qwait-7-checks: held by the host checks cap, a safety cap"}
@@ -414,3 +416,29 @@ def test_queue_wait_item_shows_the_holders_when_read_not_when_raised(env):
     assert len(evs) == 1 and evs[0]["status"] == "queued", evs
     t = evs[0]["text"]
     assert "other task #500" in t and "other task #90" not in t and "1 running (cap 4)" in t and "42 min" in t, t
+    f = json.loads(evs[0]["data"])[queuewait.FOLD]   # NEW EVENTS folds by this data: it is rewritten too
+    assert "other task #500" in f["ctx"] and "other task #90" not in f["ctx"] and "42 min" in f["item"], f
+
+def test_queue_wait_unchanged_is_raised_again_only_after_repeat_marks_and_carries_fold_data(env):
+    """An unacted wait whose queue, cap, holders and options are unchanged is not raised at each mark: only
+    REPEAT_MARKS marks after its last raise. A change in the queued count or minutes is no change. Each
+    raise's data carries the parts NEW EVENTS folds by queue (coordinator.fold_events): the key, the
+    options and the queue's state."""
+    from ttp import queuewait
+    p = make(env)
+    now = time.time()
+    host = _qw_host(p, now, now - 40 * 60)   # mark 1 now; 30-minute marks
+    assert len(queuewait.scan(p, QW_CFG, now, host, cores=64)) == 1
+    p.db.x("UPDATE events SET status='handled' WHERE kind='queue_wait'")
+    fewer = _qw_host(p, now, now - 40 * 60, queued=12)
+    for k in range(1, queuewait.REPEAT_MARKS):   # marks 2..4: the same words, no wake
+        assert queuewait.scan(p, QW_CFG, now + k * 30 * 60, fewer, cores=64) == [], k
+    assert len(queuewait.scan(p, QW_CFG, now + queuewait.REPEAT_MARKS * 30 * 60, host, cores=64)) == 1
+    first, last = _qw_events(p)[0], _qw_events(p)[-1]
+    f = json.loads(first["data"])[queuewait.FOLD]
+    assert f["group"] == "the checks queue" and f["item"] == "qwait-7-checks: #7 has waited 40 min", f
+    assert f["ctx"].startswith("4 running (cap 4), 20 queued. Holding: other task #90"), f
+    assert any("raise the host-wide checks cap from 4 to 6" in o for o in f["opts"]), f
+    # The event text is unchanged by the split: item, queue, state and numbered options.
+    assert first["text"].startswith(f"{f['item']} on the checks queue: {f['ctx']} Options: (1) "), first["text"]
+    assert "has waited 160 min" in last["text"]

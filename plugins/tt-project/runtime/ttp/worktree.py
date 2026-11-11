@@ -2142,7 +2142,9 @@ def sweep(p: Project, *, older_than_s: float = 0, names: list[str] | None = None
                 rec = _record_of(records, path)
             lock = rec["locked"] if rec else None
             half = lock is not None and lock.startswith(HARNESS_LOCKS) and not (path / ".git").is_file()
-            if not half and not is_git(path):
+            # git's own record (one `git worktree list` for all) and a .git entry say it is a worktree without
+            # a git call per worktree; only one git does not list (another repository's, a prunable one) runs is_git
+            if not half and not (rec and not rec["prunable"] and (path / ".git").exists()) and not is_git(path):
                 continue
             if lock is None and not dry_run:
                 keep(path)   # one made before keep() existed: from now on no partial-view prune orphans it
@@ -2340,16 +2342,64 @@ def _named_refs(p: Project, task: dict) -> list[str]:
     from .db import dependency_ids, names_branch
     spec = task.get("spec") or ""
     ids = [i for i in dependency_ids(task) if i is not None]
+    # SQLite narrows the rows to the dependencies and the branches the spec contains (instr, in C), so
+    # the Python check runs on those only: the cost does not grow with the project's task history.
+    deps = ",".join(str(int(i)) for i in ids)
     branches = list(dict.fromkeys(
-        r["branch"] for r in p.db.q("SELECT id, branch FROM tasks WHERE branch IS NOT NULL AND branch!=''")
+        r["branch"] for r in p.db.q("SELECT id, branch FROM tasks WHERE branch IS NOT NULL AND branch!='' AND ("
+                                    + (f"id IN ({deps}) OR " if deps else "") + "instr(?, branch) > 0) ORDER BY id",
+                                    (spec,))
         if r["id"] in ids or names_branch(spec, r["branch"])))
     hashes = list(dict.fromkeys(_HEX.findall(spec)))
     heads = [h for h in (_branch_head(p, b) for b in branches) if h] if hashes else []
     if heads:
         said = {m.group(1) for b in branches for i in _find_all(spec, b)
                 if (m := _SAID_HEAD.match(spec, i + len(b)))}
-        hashes = [h for h in hashes if h in said or any(_on(p, h, tip) or _on(p, tip, h) for tip in heads)]
+        hashes = _on_heads(p, hashes, heads, said)
     return list(dict.fromkeys(branches + hashes))
+
+
+def _on_heads(p: Project, hashes: list[str], heads: list[str], said: set[str]) -> list[str]:
+    """The quoted `hashes` that are in `said`, or on one of `heads` (an ancestor) or build on one (a
+    descendant). A fixed number of git calls: one `cat-file --batch-check` drops the hashes that name no
+    commit here, then per head one `rev-list` of its ancestors and one `rev-list --ancestry-path` of
+    its descendants among the rest (a pairwise `merge-base --is-ancestor`, both ways, kept the daemon's
+    reap step on one review for 40 minutes, run 247). A git call that fails or hangs counts as no."""
+    todo = [h for h in hashes if h not in said and not any(tip.startswith(h) for tip in heads)]
+    full = _commit_ids(p, todo)
+    found: set[str] = set()
+    for tip in heads:
+        rest = [h for h in todo if h in full and h not in found]
+        if not rest:
+            break
+        anc = _rev_list(p, tip)
+        desc = _rev_list(p, "--ancestry-path", f"^{tip}", *dict.fromkeys(full[h] for h in rest))
+        found.update(h for h in rest if full[h] in anc or full[h] in desc)
+    return [h for h in hashes if h not in todo or h in found]
+
+
+def _commit_ids(p: Project, hashes: list[str]) -> dict[str, str]:
+    """{hash: full commit id} for the `hashes` that name one commit here, in one git call."""
+    if not hashes:
+        return {}
+    try:
+        out = gitmemo.run(["git", "-C", str(p.root), "cat-file", "--batch-check=%(objectname) %(objecttype)"],
+                          input="".join(f"{h}^{{commit}}\n" for h in hashes), capture_output=True, text=True,
+                          timeout=120, read=True)
+    except subprocess.TimeoutExpired:
+        return {}
+    lines = (out.stdout or "").splitlines() if out.returncode == 0 else []
+    return {h: ln.split()[0] for h, ln in zip(hashes, lines)
+            if ln.endswith(" commit") and ln.split()[0].startswith(h)}
+
+
+def _rev_list(p: Project, *args: str) -> set[str]:
+    try:
+        out = gitmemo.run(["git", "-C", str(p.root), "rev-list", *args], capture_output=True, text=True,
+                          timeout=120, read=True)
+    except subprocess.TimeoutExpired:
+        return set()
+    return set((out.stdout or "").split()) if out.returncode == 0 else set()
 
 
 def _branch_head(p: Project, branch: str) -> str:
@@ -2367,12 +2417,28 @@ def _find_all(text: str, sub: str) -> list[int]:
     return out
 
 
-def _on(p: Project, commit: str, tip: str) -> bool:
-    """Whether `commit` is `tip` or an ancestor of it; False when either does not resolve or git hangs."""
-    try:
-        return tip.startswith(commit) or is_ancestor(p, commit, tip)
-    except subprocess.TimeoutExpired:
-        return False
+# The code tasks that may carry one of the branches `names` (fix_branches), narrowed in SQLite so the
+# Python check reads only those rows, never the project's whole history: a superset of the carriers,
+# each still checked exactly. A task carries a branch its labels or spec name (carried_branch), or one its
+# continued task has (that task's branch), or one a continued review names (named_refs: a dependency's
+# branch or one its spec contains). Parameters: `names` as a JSON list, then the review's id.
+_CARRIERS_SQL = (
+    "WITH nm(name) AS (SELECT value FROM json_each(?)), "
+    "lb(task, value) AS (SELECT t.id, j.value FROM tasks t, json_each(CASE WHEN json_valid(t.labels) "
+    "  THEN t.labels ELSE '[]' END) j WHERE t.kind='code' AND (t.labels LIKE '%\"pr_branch:%' "
+    "  OR t.labels LIKE '%\"continues:%')) "
+    "SELECT * FROM tasks t WHERE kind='code' AND branch IS NOT NULL AND branch!='' AND id!=? "
+    "AND status NOT IN ('failed','cancelled') AND (labels LIKE '%\"pr_branch:%' OR labels LIKE '%\"continues:%') "
+    "AND (EXISTS (SELECT 1 FROM nm WHERE instr(t.spec, nm.name) > 0) "
+    "  OR EXISTS (SELECT 1 FROM lb, nm WHERE lb.task = t.id AND lb.value = 'pr_branch:' || nm.name) "
+    "  OR EXISTS (SELECT 1 FROM lb JOIN tasks prev ON prev.id = CAST(substr(lb.value, 11) AS INTEGER) "
+    "             WHERE lb.task = t.id AND lb.value LIKE 'continues:%' AND ("
+    "               (prev.kind != 'review' AND prev.branch IN (SELECT name FROM nm)) "
+    "               OR (prev.kind = 'review' AND (EXISTS (SELECT 1 FROM nm WHERE instr(prev.spec, nm.name) > 0) "
+    "                 OR EXISTS (SELECT 1 FROM json_each(CASE WHEN json_valid(prev.depends_on) "
+    "                            THEN prev.depends_on ELSE '[]' END) d JOIN tasks b "
+    "                            ON b.id = CAST(d.value AS INTEGER) WHERE b.branch IN (SELECT name FROM nm)))))))"
+    " ORDER BY id")
 
 
 def fix_branches(p: Project, task: dict, refs: list[str]) -> dict[str, str]:
@@ -2388,9 +2454,7 @@ def fix_branches(p: Project, task: dict, refs: list[str]) -> dict[str, str]:
     if not names:
         return {}
     newest: dict[str, tuple[int, str]] = {}
-    for t in p.db.q("SELECT * FROM tasks WHERE kind='code' AND branch IS NOT NULL AND branch!='' AND id!=? "
-                    "AND status NOT IN ('failed','cancelled') AND (labels LIKE '%\"pr_branch:%' "
-                    "OR labels LIKE '%\"continues:%')", (task["id"],)):
+    for t in p.db.q(_CARRIERS_SQL, (json.dumps(sorted(names)), task["id"])):
         if t["branch"] in names:
             continue
         on = {carried_branch(t)} & names
@@ -2405,6 +2469,12 @@ def fix_branches(p: Project, task: dict, refs: list[str]) -> dict[str, str]:
     return {b: ref for ref, (_, b) in sorted(newest.items(), key=lambda kv: kv[1][0])}
 
 
+# diff_lines' numstat per (repo, base commit, ref commit): the same two commits always diff the same, and
+# on a loaded machine one numstat took seconds, read again for each review on every dispatch pass.
+_NUMSTAT: dict[tuple[str, str, str], str] = {}
+NUMSTAT_KEEP = 512
+
+
 def diff_lines(p: Project, refs: list[str], base: str = "", root: Path | None = None) -> dict[str, int | None] | None:
     """Lines changed per file by `refs` since they left the base branch (or `base`; in repo `root`,
     default the project root) (None for a binary file), or None when they change nothing measurable,
@@ -2412,10 +2482,21 @@ def diff_lines(p: Project, refs: list[str], base: str = "", root: Path | None = 
     root = root or p.root
     base = base or resolve_base(p)
     out: dict[str, int | None] = {}
+    base_sha = ""
     for ref in refs:
-        if not _git(root, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}", check=False):
+        sha = _git(root, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}", check=False)
+        if not sha:
             continue
-        for line in _git(root, "diff", "--numstat", "--no-renames", f"{base}...{ref}").splitlines():
+        base_sha = base_sha or _git(root, "rev-parse", "--verify", "--quiet", f"{base}^{{commit}}", check=False)
+        key = (str(root), base_sha, sha)
+        stat = _NUMSTAT.get(key) if base_sha else None
+        if stat is None:
+            stat = _git(root, "diff", "--numstat", "--no-renames", f"{base}...{ref}")
+            if base_sha:
+                _NUMSTAT[key] = stat
+                while len(_NUMSTAT) > NUMSTAT_KEEP:
+                    del _NUMSTAT[next(iter(_NUMSTAT))]
+        for line in stat.splitlines():
             added, deleted, path = line.split("\t", 2)
             prev = out.get(path, 0)
             n = None if added == "-" else int(added) + int(deleted)

@@ -1008,6 +1008,29 @@ def test_config_refuses_user_only_keys_inside_a_run(env, capsys, monkeypatch, va
     assert p.raw_config()["budget"]["daily_usd"] == 12
 
 
+def test_account_config_reads_and_sets_a_key(env, capsys, tmp_path):
+    """`ttp config --account <key>` reads (the default, then the set value) and `<key> <value>` sets:
+    a local re-import of DEFAULT_CONFIG once made both raise UnboundLocalError."""
+    from ttp import cli
+    from ttp.project import load_account_settings
+    make(env)
+    capsys.readouterr()
+    cli.main(["config", "--account", "guards.protected_paths"])
+    assert json.loads(capsys.readouterr().out) == []
+    cli.main(["config", "--account", "guards"])                          # a whole section
+    assert json.loads(capsys.readouterr().out)["protected_paths"] == []
+    cli.main(["config", "--account", "checks.nice", "false"])
+    assert "checks.nice = false" in capsys.readouterr().out
+    assert load_account_settings()["checks"]["nice"] is False
+    cli.main(["config", "--account", "checks.nice"])
+    assert json.loads(capsys.readouterr().out) is False
+    path = str(tmp_path / "kept")
+    cli.main(["config", "--account", "guards.protected_paths", json.dumps([path])])
+    capsys.readouterr()
+    cli.main(["config", "--account", "guards.protected_paths"])
+    assert json.loads(capsys.readouterr().out) == [path]
+
+
 
 @pytest.mark.parametrize("text", [
     "claude's OAuth token is stale; please log in again.",
@@ -3336,6 +3359,30 @@ def test_a_restrictions_item_is_sourced_by_a_user_message_cite_or_an_origin_mark
     assert rs.bare("Keep (user #2, never merge) here.") == "Keep (, never merge) here."   # only a date goes with it
     for loose in ("- Mentions msg #7 only.", "- Says user msg 8.", "- Says user 8.", "- See #9."):
         assert not rs.sourced(loose), loose
+
+
+def test_restrictions_inside_a_brief_with_its_own_headings_bind_as_origin_brief(env):
+    """A Brief the user wrote with `## ` headings of its own (Why, Deliverables, Restrictions) is the Brief
+    up to the coordinator's own sections (Goals, Policies, Resources, a dated "(added ...)" one, the
+    template's "Restrictions (binding on every task)") or an end line: its Restrictions items bind with
+    no cite of their own; an uncited item the coordinator wrote later stays advisory."""
+    from ttp import prompts, restriction_audit as ra, restriction_source as rs
+    charter = ("# demo - charter\n\n## Brief (verbatim from the user)\n\n# demo: build the widget\n\n"
+               "## Why this project exists\nThe old box is down.\n\n## Restrictions\n"
+               "- Never push to main.\n- Run tests only on box A,\n  niced.\n\n## Deliverables\n1. The widget.\n\n"
+               "## Goals and success criteria\nShip the widget.\n\n## Restrictions (binding on every task)\n"
+               "- Keep the cache warm.\n- Never open PRs (user msg #4)\n\n## Policies\n- Never merge.\n")
+    assert "## Deliverables" in prompts.brief_text(charter) and "Ship the widget" not in prompts.brief_text(charter)
+    assert prompts.brief_restrictions(charter) == {"- Never push to main.", "- Run tests only on box A, niced."}
+    assert rs.unsourced_items(charter) == ["- Keep the cache warm."]
+    assert ra.still_stated(charter, "- Never push to main.") == "Brief"
+    # an explicit end line ends a Brief whose next heading is not one of the coordinator's own
+    marked = charter.replace("1. The widget.\n", "1. The widget.\n<!-- end of Brief -->\n\n"
+                             "## Restrictions (scratch)\n- Uncited note.\n")
+    assert "- Uncited note." in rs.unsourced_items(marked) and "- Never push to main." not in rs.unsourced_items(marked)
+    # a Brief with no headings of its own reads as before: the next `## ` heading after it is not the Brief's
+    plain = "# demo\n\n## Brief\nBuild it.\n\n## Restrictions (added 2026-01-01)\n- Loose rule.\n"
+    assert prompts.brief_text(plain).strip().endswith("Build it.") and rs.unsourced_items(plain) == ["- Loose rule."]
 
 
 def test_an_approval_matches_its_text_with_or_without_the_source_cite(env):
@@ -7097,7 +7144,7 @@ def test_a_daily_receipt_watcher_keeps_its_pending_item_quiet_until_it_changes(e
     assert not p.db.q("SELECT id FROM issues WHERE source='watcher:receipts' AND status!='open'")
     assert run(line)[1] == 0
     age(25)
-    assert run("", rc_cmd="exit 3")[0] == "error (1 lines: check could not run)", "a failed run"
+    assert run("", rc_cmd="exit 3")[0] == "error: watcher command failed rc=3: (no stderr)", "a failed run"
     age(25)
     scr.close_quiet_watcher_issues(p.db, {"watcher:receipts": 86400})
     assert p.db.one("SELECT COUNT(*) n FROM issues WHERE source='watcher:receipts' AND status='open' "
@@ -8232,7 +8279,7 @@ def test_pinned_memory_overflow_is_marked_in_the_prompt_and_alerts_the_coordinat
     big = [("decision", f"RULE-{i} " + "y" * 900, "workers") for i in range(10)]
     _memories(p, [("fact", "OLD-FACT")] + big)
     assert coord.apply(p, [{"type": "memory_add", "text": "NEW-FACT"}], turn=1) == []
-    system = worker_system(p)
+    system = _worker_text(p)
     use = worker_context(p)[2]
     n = use["pinned_dropped"]
     shown = [i for i in range(10) if f"RULE-{i} " + "y" * 900 in system]
@@ -8268,7 +8315,7 @@ def test_workers_get_a_charter_and_memory_digest_with_every_restriction_verbatim
                             "audience": "coordinator"},
                            {"type": "memory_add", "text": "TAGGED-RESTRICTION: never delete the datasets.",
                             "memory_kind": "restriction", "audience": "coordinator"}], turn=1) == []
-    system = worker_system(p)
+    system = _worker_text(p)
     full = len(_BIG_CHARTER) + sum(len(e["line"]) + 1 for e in p._memory_entries())
     block = system[system.index("# CHARTER"):]
     assert full > 20000 and len(block) <= 8000, (full, len(block))
@@ -8577,7 +8624,7 @@ def test_a_restriction_memory_reaches_running_workers_and_new_prompts(env, tmp_p
     assert coord.apply(p, [{"type": "memory_add", "text": "Never reboot box A.",
                             "memory_kind": "restriction"}], turn=1) == []
     assert "Never reboot box A." in (run_dir / "steer.md").read_text()
-    assert "Never reboot box A." in worker_system(p)
+    assert "Never reboot box A." in _worker_text(p)
 
 
 
@@ -13105,6 +13152,39 @@ def test_task_add_naming_a_finished_tasks_branch_carries_it_only_with_a_pr_branc
 
 
 
+def test_task_add_naming_a_live_tasks_branch_without_a_pr_branch_line_says_it_delivers_nothing_there(env):
+    """A reported case, replayed: a work task whose spec said to push a queued code task's branch
+    (ttp/t<id>-...) got no label and no word that it would not deliver there, so its push was refused
+    later. task_add now notes that the live task still owns the branch and that only a `pr_branch:`
+    line delivers there. A spec with that line, or a rebase title, gets no such note."""
+    p = make(env)
+    from ttp import coordinator as coord
+
+    def labels(title):
+        return json.loads(p.db.one("SELECT labels FROM tasks WHERE title=?", (title,))["labels"])
+
+    def owned_notes(new):
+        return [n for n in p.db.kv(coord.NOTES_KEY) or [] if f"#{new} names #{src}'s branch" in n]
+
+    src = p.db.add_task("Fold the peak", "s", kind="code")   # queued, never started
+    b = f"ttp/t{src}-fold-the-peak"
+    assert coord.apply(p, [{"type": "task_add", "title": "Push the fold", "kind": "work",
+                            "spec": f"Fast-forward {b} to the tested commit and push the branch."}]) == []
+    new = p.db.one("SELECT id FROM tasks WHERE title='Push the fold'")["id"]
+    assert not [x for x in labels("Push the fold") if x.startswith(("pr_branch:", "continues:", "rebases:"))]
+    got = owned_notes(new)
+    assert len(got) == 1 and f"`pr_branch: {b}`" in got[0] and f"#{src} (queued) still owns it" in got[0], got
+    p.db.update_task(src, status="running", branch=b)
+    assert coord.apply(p, [{"type": "task_add", "title": "Push it now", "kind": "work",
+                            "spec": f"Push {b}."}]) == []
+    assert owned_notes(p.db.one("SELECT id FROM tasks WHERE title='Push it now'")["id"])
+    for title, spec in (("Push the fold, carried", f"pr_branch: {b}\nFast-forward it and push."),
+                        ("Rebase the fold", f"Rebase {b} onto the tip.")):
+        assert coord.apply(p, [{"type": "task_add", "title": title, "kind": "work", "spec": spec}]) == []
+        assert not owned_notes(p.db.one("SELECT id FROM tasks WHERE title=?", (title,))["id"]), title
+    assert f"pr_branch:{b}" in labels("Push the fold, carried")
+
+
 def test_a_pr_branch_line_labels_its_first_token_with_text_after_it(env):
     """A spec's `pr_branch:` line (the marker starts the line, a list bullet aside) labels the task with
     the branch right after it, backticks or quotes aside, even with more text on the same line, and
@@ -14759,19 +14839,19 @@ def test_project_pin_verification_config_accepts_only_supported_modes(env, capsy
     from ttp.project import config_problems
     p = make(env)
     assert p.config()["runner"]["pin_verify"] == "lenient"
-    cli.main(["config", "demo", "runner.pin_verify", "strict"])
-    assert p.config()["runner"]["pin_verify"] == "strict"
-    with pytest.raises(SystemExit):
-        cli.main(["config", "demo", "runner.pin_verify", "strcit"])
-    assert "pin_verify" in capsys.readouterr().err
-    assert p.config()["runner"]["pin_verify"] == "strict"
-    for mode in ("strict", "lenient"):
+    for mode in ("strict", "lenient"):   # the coordinator first: it never changes a value the user set
         assert config_problems({"runner": {"pin_verify": mode}}) == []
         assert coord.apply(p, [{"type": "config_set", "key": "runner.pin_verify", "value": mode}]) == []
         assert p.config()["runner"]["pin_verify"] == mode
     assert "pin_verify" in " ".join(config_problems({"runner": {"pin_verify": "strcit"}}))
     assert "pin_verify" in " ".join(coord.apply(p, [{"type": "config_set", "key": "runner.pin_verify", "value": "strcit"}]))
     assert p.config()["runner"]["pin_verify"] == "lenient"
+    cli.main(["config", "demo", "runner.pin_verify", "strict"])
+    assert p.config()["runner"]["pin_verify"] == "strict"
+    with pytest.raises(SystemExit):
+        cli.main(["config", "demo", "runner.pin_verify", "strcit"])
+    assert "pin_verify" in capsys.readouterr().err
+    assert p.config()["runner"]["pin_verify"] == "strict"
 
 
 
@@ -15211,6 +15291,186 @@ def test_a_plain_task_done_waits_for_company_even_with_an_idle_slot(env):
     assert not coord.batchable("upstream_note", "high") and not coord.batchable("task_done", "info")
     note = {"ts": now - 10, "kind": "upstream_note", "severity": "normal", "task": None}
     assert not d._batch_hold([ev, note], now)
+
+
+def _plain_hold_setup(env, monkeypatch, hold=None, idle=6 * 3600):
+    """A quiet project with idle slots, its last turn now and every coordinator turn's events recorded."""
+    p, d, clock, _ = _batch_setup(env, monkeypatch, busy=0)
+    p.set_config("coordinator.idle_wake_s", idle)
+    p.set_config("coordinator.starve_wake_s", 6 * 3600)
+    if hold is not None:
+        p.set_config("coordinator.plain_done_hold_max_s", hold)
+    d.cfg = p.config()
+    p.db.set_kv("last_coordinator_turn", clock[0])
+    turns = []
+    monkeypatch.setattr(d, "start_run", lambda *a, **k: turns.append(((k.get("note") or {}).get("events"), clock[0])))
+    return p, d, clock, turns
+
+
+def _plain_done_event(p, clock, text="done: all fine", severity="normal", kind="code"):
+    tid = p.db.add_task("finished", "s", status="done", kind=kind)
+    return p.db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+                  (clock[0], f"task:{tid}", "task_done", severity, text, "queued", tid)), tid
+
+
+def test_a_plain_done_only_batch_waits_past_batch_s_for_the_next_wake_of_another_cause(env, monkeypatch):
+    p, d, clock, turns = _plain_hold_setup(env, monkeypatch)
+    batch = float(p.config()["coordinator"]["batch_s"])
+    assert p.config()["coordinator"]["plain_done_hold_max_s"] == 3000, "on by default, the idle wake interval"
+    ev, _ = _plain_done_event(p, clock)
+    assert not _turn_within(d, clock, turns, batch + 900, step=30), "a plain hand-off woke a turn after batch_s"
+    assert p.db.one("SELECT status FROM events WHERE id=?", (ev,))["status"] == "queued", "the held event was dropped"
+    assert p.db.kv("plain_done_held") == [ev]
+    # Another cause (a failure) starts the turn and the held hand-off rides it.
+    _event(p, clock, "task_failed", "high")
+    assert _turn_within(d, clock, turns, 120), "the failure did not wake its turn"
+    assert ev in turns[0][0], "the held hand-off did not ride the next wake"
+
+
+def test_a_held_plain_done_batch_rides_the_turn_a_user_message_starts(env, monkeypatch):
+    p, d, clock, turns = _plain_hold_setup(env, monkeypatch)
+    batch = float(p.config()["coordinator"]["batch_s"])
+    ev, _ = _plain_done_event(p, clock)
+    assert not _turn_within(d, clock, turns, batch + 300, step=30)
+    p.db.x("INSERT INTO messages(ts,direction,chat,text,handled) VALUES(?,?,?,?,0)", (clock[0], "in", "web", "hi"))
+    assert _turn_within(d, clock, turns, 120) and ev in turns[0][0]
+
+
+def test_a_held_plain_done_batch_wakes_at_the_hold_cap_or_the_idle_wake(env, monkeypatch):
+    p, d, clock, turns = _plain_hold_setup(env, monkeypatch, hold=1200)
+    ev, _ = _plain_done_event(p, clock)
+    assert not _turn_within(d, clock, turns, 1200 - 60, step=30)
+    assert _turn_within(d, clock, turns, 300, step=30), "the hold outlasted coordinator.plain_done_hold_max_s"
+    assert turns[0][0] == [ev]
+
+
+def test_a_held_plain_done_batch_rides_the_idle_wake(env, monkeypatch):
+    p, d, clock, turns = _plain_hold_setup(env, monkeypatch, idle=1800)   # sooner than the cap
+    start = clock[0]
+    ev, _ = _plain_done_event(p, clock)
+    assert _turn_within(d, clock, turns, 3000, step=30)
+    assert 1800 <= turns[0][1] - start < 1800 + 120 and ev in turns[0][0], "it did not ride the idle wake"
+
+
+def test_the_idle_wake_and_plain_done_hold_default_inside_the_1h_prompt_cache(env):
+    from ttp import coordinator as coord
+    c = make(env).config()["coordinator"]
+    ttl = coord.cache_ttl_s(c)
+    for key in ("idle_wake_s", "plain_done_hold_max_s", "cache_wake_s"):
+        assert 0 < c[key] <= ttl - 600, f"{key} {c[key]} leaves no room for dispatch before the {ttl}s cache ends"
+
+
+def test_a_cache_wake_keeps_the_prompt_cache_warm_while_work_is_running(env, monkeypatch):
+    from ttp.daemon import idle_wake
+    p, d, clock, turns = _plain_hold_setup(env, monkeypatch, idle=3000)
+    t0 = clock[0]
+    p.db.add_task("in 3 days", "s", kind="work", status="queued")
+    assert idle_wake(p, d.cfg, {}, t0 + 3030)["due"] is None, "a cache wake for work that only waits"
+    p.db.add_task("long run", "s", kind="work", status="running")
+    w = idle_wake(p, d.cfg, {}, t0 + 2990)
+    assert w["due"] is None and w["at"] == t0 + 3000, w
+    assert idle_wake(p, d.cfg, {}, t0 + 3030)["due"] == "cache"
+    assert idle_wake(p, d.cfg, {}, t0 + 3700)["due"] is None, "woke after the cache it keeps had expired"
+    # It counts from the last turn's end when that is later than its start.
+    p.db.x("INSERT INTO runs(role, started, ended, status) VALUES('coordinator', ?, ?, 'ok')", (t0, t0 + 300))
+    assert idle_wake(p, d.cfg, {}, t0 + 3030)["due"] is None
+    assert idle_wake(p, d.cfg, {}, t0 + 3330)["due"] == "cache"
+    # The daemon starts it; an unchanged state gets cache_wake_max of them in a row, then none.
+    for k in range(2):
+        clock[0] = float(p.db.kv("last_coordinator_turn")) + (300 if k == 0 else 0) + 2900
+        assert _turn_within(d, clock, turns, 240, step=30), f"cache wake {k + 1} did not start a turn"
+        p.db.set_kv("last_coordinator_turn", clock[0])
+    clock[0] += 2900
+    assert not _turn_within(d, clock, turns, 1200, step=30), "a third cache wake on an unchanged state"
+
+
+def test_cache_wake_s_0_or_a_5m_cache_turns_the_cache_wake_off(env, monkeypatch):
+    from ttp.daemon import idle_wake
+    p, d, clock, turns = _plain_hold_setup(env, monkeypatch)
+    p.db.add_task("long run", "s", kind="work", status="running")
+    now = clock[0] + 3030
+    for key, value in (("cache_wake_s", 0), ("cache_ttl", "5m")):
+        cfg = p.config()
+        cfg["coordinator"][key] = value
+        w = idle_wake(p, cfg, {}, now)
+        assert w["due"] is None and w["at"] is None, (key, w)
+
+
+def test_plain_done_hold_max_s_0_turns_the_hold_off(env, monkeypatch):
+    p, d, clock, turns = _plain_hold_setup(env, monkeypatch, hold=0)   # the batch wakes once batch_s passed
+    _plain_done_event(p, clock)
+    assert _turn_within(d, clock, turns, float(p.config()["coordinator"]["batch_s"]) + 120, step=30)
+
+
+def test_a_held_plain_done_batch_survives_a_daemon_restart(env, monkeypatch):
+    from ttp.daemon import Daemon
+    p, d, clock, turns = _plain_hold_setup(env, monkeypatch, hold=1800)
+    ev, _ = _plain_done_event(p, clock)
+    assert not _turn_within(d, clock, turns, 900, step=30)
+    d = Daemon(p.base)
+    d.cfg = p.config()
+    d.update_gates()
+    monkeypatch.setattr(d, "start_run", lambda *a, **k: turns.append(((k.get("note") or {}).get("events"), clock[0])))
+    assert p.db.one("SELECT status FROM events WHERE id=?", (ev,))["status"] == "queued"
+    assert not _turn_within(d, clock, turns, 800, step=30), "a restart released the held batch"
+    assert _turn_within(d, clock, turns, 300, step=30) and turns[0][0] == [ev], "the cap counts from the event"
+
+
+@pytest.mark.parametrize("case", ["high", "failed", "review", "followup", "parent", "dependent", "unqueued",
+                                  "restriction", "message", "must_act"])
+def test_never_held_events_wake_as_they_did_without_the_plain_done_hold(env, monkeypatch, case):
+    """Each kind the hold must never take starts its turn as before: at once, or after batch_s at the
+    latest, never at the hold cap or the idle wake."""
+    from ttp import daemon as dm, mustact
+    p, d, clock, turns = _plain_hold_setup(env, monkeypatch)
+    batch = float(p.config()["coordinator"]["batch_s"])
+    ev, tid = _plain_done_event(
+        p, clock, severity="high" if case == "high" else "normal", kind="review" if case == "review" else "code",
+        text={"unqueued": f"Continue follow-up {dm.UNQUEUED_TAG}: add it", "restriction":
+              "done, but the next step would break a Restriction"}.get(case, "done: all fine"))
+    if case == "failed":
+        p.db.x("UPDATE events SET kind='task_failed' WHERE id=?", (ev,))
+    if case == "followup":
+        p.db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+               (clock[0], f"task:{tid}", "followup_proposed", "normal", "f", "queued", tid))
+    if case == "parent":
+        p.db.x("UPDATE tasks SET parent=? WHERE id=?", (p.db.add_task("parent", "s", status="waiting"), tid))
+    if case == "dependent":
+        dep = p.db.add_task("next", "s", status="waiting")
+        p.db.x("UPDATE tasks SET depends_on=? WHERE id=?", (json.dumps([tid]), dep))
+    if case == "message":
+        p.db.x("INSERT INTO messages(ts,direction,chat,text,handled) VALUES(?,?,?,?,0)", (clock[0], "in", "web", "hi"))
+    if case == "must_act":
+        _event(p, clock, mustact.KINDS[0])
+    assert _turn_within(d, clock, turns, batch + 60, step=15), f"{case} waited for the plain-done hold"
+    assert ev in turns[0][0] and p.db.kv("plain_done_held") is None
+
+
+@pytest.mark.parametrize("case", ["solo", "overflow", "parked_message"])
+def test_the_plain_done_hold_judges_every_queued_event_not_only_the_sized_batch(env, monkeypatch, case):
+    """A never-held item outside the sized turn batch (a solo turnsize record, more plain hand-offs than
+    max_events_per_turn ahead of it, or a message sizing parked) still wakes as before: the hold reads
+    every queued event and message."""
+    from ttp import turnsize
+    p, d, clock, turns = _plain_hold_setup(env, monkeypatch)
+    batch = float(p.config()["coordinator"]["batch_s"])
+    if case == "solo":
+        ev, _ = _plain_done_event(p, clock)
+        p.db.set_kv(turnsize.STATE_KEY, {turnsize.item_key("e", ev): {"size": 1, "cap": 0.01}})
+    else:
+        p.set_config("coordinator.max_events_per_turn", 3)
+        d.cfg = p.config()
+        for _ in range(5):
+            _plain_done_event(p, clock)
+    if case == "parked_message":
+        _plain_done_event(p, clock)
+        m = p.db.x("INSERT INTO messages(ts,direction,chat,text,handled) VALUES(?,?,?,?,0)",
+                   (clock[0], "in", "web", "hi"))
+        p.db.set_kv(turnsize.STATE_KEY, {turnsize.item_key("m", m): {"size": 1, "cap": 1e9}})
+    else:
+        _event(p, clock, "task_failed", "high")
+    assert _turn_within(d, clock, turns, batch + 60, step=15), "a failure outside the sized batch was held"
+    assert p.db.kv("plain_done_held") is None
 
 
 
@@ -18289,7 +18549,7 @@ def test_pinned_worker_memory_past_its_room_shows_the_task_s_entries_and_a_plain
     assert 0 < n < 20 and len(shown) == 20 - n and use["memory_limit"] < use["pinned_chars"], use
     assert pinned[17].stem in shown and pinned[0].stem in shown and pinned[19].stem not in shown, shown
     assert not any("FACT-NEWEST" in e["line"] for e in mem)
-    system = worker_system(p, task)
+    system = _worker_text(p, task)
     # The task's own entry comes whole in its own prompt; the shared system prompt keeps the oldest.
     whole = system + worker_rules(p, task)
     assert "WORKER-17 uses rack-17 " + "w" * 600 in whole and "WORKER-19 uses rack-19 " + "w" * 600 not in whole
@@ -18315,7 +18575,7 @@ def test_worker_memory_keeps_charter_policies_drops_restated_restrictions_and_ma
                   ("restriction", "Never push."),   # not what the charter says: kept
                   ("fact", "FACT-NEWEST workers may reuse the build cache.")]
               + [("decision", f"RULE-{i:02} " + "r" * 900, "workers") for i in range(30)])
-    system = worker_system(p)
+    system = _worker_text(p)
     block = system[system.index("# CHARTER"):]
     text, mem, use = worker_context(p)
     for policy in ("- Delivery: workers commit on their own branch", "- Style: workers keep answers short"):
@@ -18366,7 +18626,7 @@ def test_pinned_memory_counts_each_entry_against_the_budget_of_the_prompt_that_s
     work = worker_context(p)[2]
     _, wuse = p.worker_memory_select(10 ** 6)
     assert wuse["pinned_chars"] == size({"W-PREF", "W-RES", "W-RULE", "C-RULE", "D-RES"}) == work["pinned_chars"]
-    system = worker_system(p)
+    system = _worker_text(p)
     assert "W-RULE never reboot" in system and "C-RULE never open" in system and "C-PREF" not in system
     context = coord.prompt_state(p)[0]["context"]
     assert "W-PREF" not in context and "W-RES" not in context
@@ -18399,7 +18659,7 @@ def test_pinned_worker_memory_past_its_room_shows_or_points_to_every_entry_and_n
                       + [("decision", f"TAG-{i:02} workers use queue {i}. " + "t" * 700, "workers") for i in range(12)]
                       + [("preference", "LONG-PREF " + "x" * 3000, "workers")])
     _, mem, use = worker_context(p)
-    system = worker_system(p)
+    system = _worker_text(p)
     block = system[system.index("# PROJECT MEMORY"):]
     whole = {e["name"] for e in mem}
     pointed = {x["name"] for x in use["pointers"]}
@@ -18914,7 +19174,7 @@ def test_worker_policies_keep_their_own_room_beside_long_goals_and_large_pinned_
     for item in policies + ["- Delivery: workers commit on their own branch", "- Style: workers keep answers short"]:
         assert item in text, item[:20]
     assert 0 < use["pinned_dropped"] == len(use["pointers"]) <= 30   # 30 pointers alone fill the room
-    block = worker_system(p)
+    block = _worker_text(p)
     assert "Policy 9: workers open a draft PR" in block and "Shortened for room, each in full in" in block
 
 
@@ -18975,7 +19235,7 @@ def test_a_user_correction_leads_worker_prompts_and_the_digest_and_outlives_memo
     assert "PLAIN-FACT" not in digest.split(f"## {CORRECTIONS_HEADER}")[1].split("\n## ")[0]
     # A worker: its own block before the rest of memory, outside the memory budget.
     assert fix.stem not in [e["name"] for e in worker_context(p)[1]]
-    system = worker_system(p)
+    system = _worker_text(p)
     block = f"# {CORRECTIONS_HEADER.upper()}\n[{fix.stem}] Correction (user msg #12)"
     assert block in system and system.count("Correction (user msg #12)") == 1, system
     assert system.index(block) < system.index("# PROJECT MEMORY")
@@ -18984,7 +19244,7 @@ def test_a_user_correction_leads_worker_prompts_and_the_digest_and_outlives_memo
     p.forget_memory(fix.stem)
     assert f"[{fix.stem}] retired, ignore" in coord.digest(p, {}, [], [])
     p.db.set_kv(coord.PROMPT_REFRESH_KEY, 1)
-    assert CORRECTIONS_HEADER not in coord.digest(p, {}, [], []) and CORRECTIONS_HEADER.upper() not in worker_system(p)
+    assert CORRECTIONS_HEADER not in coord.digest(p, {}, [], []) and CORRECTIONS_HEADER.upper() not in _worker_text(p)
 
 
 def test_user_corrections_drop_past_30_days_and_past_their_cap_oldest_first(env):
@@ -19659,6 +19919,40 @@ def test_result_rows_naming_a_model_or_effort_carry_what_the_run_used_and_a_mism
     assert ev and "result check: metrics claims effort 'max', run" in ev["text"], ev
 
 
+def test_a_deliverables_own_model_is_never_compared_with_the_runs_llm_and_llm_model_always_is(env):
+    from ttp import correction
+    p = make(env)
+    run = lambda model: p.db.x("INSERT INTO runs(task, role, model, effort) VALUES(?,?,?,?)",
+                               (None, "worker", model, "high"))
+    opus, gpt, other = run("opus"), run("gpt-5.1-codex"), run("newco-large-2")
+    tail = ": the row reports a run that did not use what it names; correct it or rerun"
+    # A video model under metrics.model, a CLAIM_KEYS row naming a run, or moved to video_model: no flag.
+    for result in ({"metrics": {"model": "ltx", "fps": 24}},
+                   {"metrics": {"video_model": "ltx", "fps": 24}},
+                   {"metrics": {"model": "LTX-Video-2B"}},
+                   {"cells": {"a": {"run": opus, "model": "wan-2.1"}}},
+                   {"tried": [{"run": f"#{opus}", "model": "ltx-2"}]}):
+        got, lines = correction.check_claims(p.db, result, opus)
+        assert lines == [] and "claim_mismatch" not in got, (result, lines)
+    # A provider model under `model` still flags: from the price table, a tier default, the anchor names, or
+    # a model another run of this project recorded.
+    for claim in ("claude-sonnet-4-5", "sonnet", "gpt-5", "o3", "newco-large-2"):
+        _, lines = correction.check_claims(p.db, {"metrics": {"model": claim}}, opus)
+        assert lines == [f"result check: metrics claims model {claim!r}, run #{opus} recorded 'opus'{tail}"], claim
+    assert correction.check_claims(p.db, {"metrics": {"model": "opus"}}, opus)[1] == []
+    # llm_model is always compared, even a name the harness has never seen; beside a video model too.
+    _, lines = correction.check_claims(p.db, {"metrics": {"llm_model": "zeta-9", "model": "ltx"}}, opus)
+    assert lines == [f"result check: metrics claims llm_model 'zeta-9', run #{opus} recorded 'opus'{tail}"]
+    assert correction.check_claims(p.db, {"metrics": {"llm_model": "claude-opus-5-5", "model": "ltx"}}, opus)[1] == []
+    # The same rule in a row naming its run.
+    got, lines = correction.check_claims(p.db, {"cells": {"a": {"run": gpt, "model": "ltx", "llm_model": "opus"}},
+                                                "tried": [{"run": other, "model": "claude-haiku-4-5"}]}, None)
+    assert lines == [f"result check: tried[0] claims model 'claude-haiku-4-5', run #{other} recorded "
+                     f"'newco-large-2'{tail}",
+                     f"result check: cells['a'] claims llm_model 'opus', run #{gpt} recorded 'gpt-5.1-codex'{tail}"]
+    assert got["cells"]["a"]["used"]["model"] == "gpt-5.1-codex"
+
+
 def test_the_audit_line_counts_repeated_instructions_and_names_the_top_one(env):
     from ttp import correction
     p = make(env)
@@ -20029,20 +20323,39 @@ def test_claude_ai_connectors_stay_when_the_config_lists_one_or_runs_used_one(en
     assert "ENABLE_CLAUDEAI_MCP_SERVERS" not in _worker_env(p, monkeypatch)[1]
 
 
-def test_connector_rule_leaves_isolation_no_internet_and_the_tool_allowlist_alone(env, monkeypatch, tmp_path):
+def test_a_run_that_keeps_claude_ai_connectors_waits_for_them_and_one_that_leaves_them_out_does_not(env, monkeypatch, tmp_path):
+    from ttp import coordinator as coord
+    p = make(env)
+    _claude_mcp_config(tmp_path, monkeypatch, p)
+    p.set_config("providers.claude.worker_isolation", False)
+    wait = ("MCP_CONNECTION_NONBLOCKING", "MCP_CONNECT_TIMEOUT_MS")
+    monkeypatch.delenv("MCP_CONNECT_TIMEOUT_MS", raising=False)
+    monkeypatch.delenv("MCP_CONNECTION_NONBLOCKING", raising=False)
+    run_env = _worker_env(p, monkeypatch)[1]   # every connector left out: no wait
+    assert run_env.get("ENABLE_CLAUDEAI_MCP_SERVERS") == "false" and not any(k in run_env for k in wait)
+    assert coord.apply(p, [{"type": "config_set", "key": "providers.claude.mcp_servers",
+                            "value": ["claude.ai Search"]}]) == []
+    for kind in ("work", "review"):
+        run_env = _worker_env(p, monkeypatch, kind=kind)[1]
+        assert run_env["MCP_CONNECTION_NONBLOCKING"] == "false" and run_env["MCP_CONNECT_TIMEOUT_MS"] == "20000", kind
+    monkeypatch.setenv("MCP_CONNECT_TIMEOUT_MS", "5000")   # a value already present stays
+    run_env = _worker_env(p, monkeypatch)[1]
+    assert run_env["MCP_CONNECT_TIMEOUT_MS"] == "5000" and run_env["MCP_CONNECTION_NONBLOCKING"] == "false"
+
+
+def test_connector_rule_leaves_isolation_no_internet_and_the_tool_set_alone(env, monkeypatch, tmp_path):
     p = make(env)
     _claude_mcp_config(tmp_path, monkeypatch, p)
     argv, run_env = _worker_env(p, monkeypatch)
     assert "--strict-mcp-config" in argv and "ENABLE_CLAUDEAI_MCP_SERVERS" not in run_env, "isolated: as before"
     assert p.db.kv("connectors_used:claude") is None, "an isolated project never scans its runs"
-    tools = argv[argv.index("--tools") + 1]
-    assert tools == "Bash,Read,Edit,Write,Skill,ToolSearch,WebFetch,WebSearch"
+    assert "--tools" not in argv and "--disallowedTools" not in argv, "the full tool set"
     p.set_config("providers.claude.worker_isolation", False)
     argv, run_env = _worker_env(p, monkeypatch)
-    assert argv[argv.index("--tools") + 1] == tools and "--strict-mcp-config" not in argv
+    assert "--tools" not in argv and "--disallowedTools" not in argv and "--strict-mcp-config" not in argv
     p.set_config("restrictions.no_internet", True)
     argv, run_env = _worker_env(p, monkeypatch)
-    assert argv[argv.index("--tools") + 1] == "Bash,Read,Edit,Write,Skill,ToolSearch"
+    assert argv[argv.index("--disallowedTools") + 1:argv.index("--settings")] == ["WebFetch", "WebSearch"]
     assert run_env.get("ENABLE_CLAUDEAI_MCP_SERVERS") == "false"
 
 
@@ -20084,7 +20397,7 @@ def test_every_worker_prompt_carries_every_standing_entry_for_workers(env, kind,
     from ttp.prompts import worker_context, worker_system
     task = {"id": 1, "kind": kind, "tier": tier, "title": f"{kind}: tidy the nightly report",
             "spec": "Edit notes/report.md only."}
-    system = worker_system(p, task)
+    system = _worker_text(p, task)
     block = system[system.index("# PROJECT MEMORY"):]
     for want in ("STANDING-PLAIN-1", "STANDING-PLAIN-2", "STANDING-WORKERS-3", "STANDING-TAGGED-4"):
         assert want in block, (want, block[:2000])
@@ -20096,9 +20409,11 @@ def test_every_worker_prompt_carries_every_standing_entry_for_workers(env, kind,
     assert "STANDING-" not in pointers, "a pointer stands in for none of them"
 
 
-def test_standing_worker_memory_past_its_room_is_kept_whole_and_alerts_once(env):
-    """Standing entries for workers that alone outgrow the workers' pinned room are all kept, whole,
-    ahead of every other entry, and the coordinator is told once."""
+def test_standing_worker_memory_past_its_room_is_pointed_to_and_alerts_once(env):
+    """Standing entries for workers that outgrow the workers' pinned room (user msg #2271: memory within
+    its budget, pinned ones included) are shown whole, oldest first, while they fit; each of the rest is
+    a pointer (its name, first sentence and where it is in full), never dropped; the coordinator is
+    told once."""
     p = make(env)
     from ttp import coordinator as coord
     from ttp.prompts import worker_context, worker_system
@@ -20106,17 +20421,21 @@ def test_standing_worker_memory_past_its_room_is_kept_whole_and_alerts_once(env)
                            standing=True) for i in range(8)]
     p.add_memory("FACT-1 the nightly run took 2 h.", title="fact 1")
     text, mem, use = worker_context(p)
-    assert use["kept_chars"] > use["memory_limit"] and use["pinned_dropped"] == 0, use
+    assert use["pinned_dropped"] and use["kept"] == 0 and not use["kept_over"], use
     shown = {e["name"] for e in mem}
-    assert {d.stem for d in duties} <= shown and use["kept_over"]
-    system = worker_system(p)
-    for i in range(8):
-        assert f"DUTY-{i:02} report it each time. " + "s" * 900 in system, i
+    pointed = [x["name"] for x in use["pointers"]]
+    assert shown and set(pointed) == {d.stem for d in duties} - shown
+    assert pointed == [d.stem for d in duties][len(duties) - len(pointed):], "the oldest are shown whole"
+    system = _worker_text(p)
+    for i, d in enumerate(duties):
+        assert (f"DUTY-{i:02} report it each time. " + "s" * 900 in system) == (d.stem in shown), i
+        assert f"[{d.stem}] DUTY-{i:02} report it each time." in system, i
+    assert sum(len(e["line"]) + 1 for e in mem) <= use["memory_limit"]
     alerts = lambda: p.db.q("SELECT text FROM events WHERE kind='memory_over_budget'")
     coord.memory_budget_check(p)
     coord.memory_budget_check(p)
     assert len(alerts()) == 1, alerts()
-    assert "8 restriction, resource and standing entries for workers" in alerts()[0]["text"], alerts()
+    assert f"so {len(pointed)} of them reach workers only as a pointer" in alerts()[0]["text"], alerts()
     for d in duties[1:]:   # fits again: re-armed, silent
         p.forget_memory(d.stem, why="test")
     coord.memory_budget_check(p)
@@ -20360,15 +20679,16 @@ def test_every_worker_prompt_carries_a_resource_entry_that_is_not_standing(env, 
     use = worker_context(p, task)[2]
     standing = sum(len(e["line"]) + 1 for e in p._memory_entries() if e["standing"])
     assert standing > use["memory_limit"], "the fixture must make the standing entries alone outgrow the workers' room"
-    block = _memory_block(worker_system(p, task))
+    block = _memory_block(_worker_text(p, task))
     for want in ("HOST-RESOURCE box A (alias box-a) is the project's host", "RULE-PLAIN never reboot box A"):
         assert want in block, (want, block[:1500])
 
 
 def test_the_reported_light_harness_run_carries_every_restriction_resource_and_standing_entry(env):
-    """The reported case: 14 entries, a light-tier harness run. Every restriction, resource and standing
-    entry is there, whole; the entry tagged for workers that no longer fits is pointed to, never dropped
-    silently, and the coordinator and `ttp doctor` are told the kept ones outgrow the room."""
+    """The reported case: 14 entries, a light-tier harness run. Every restriction and resource entry is
+    there, whole; the standing entries and the one tagged for workers have only the room left
+    (user msg #2271: memory within its budget, pinned ones included), so those past it are pointed to,
+    never dropped silently, and the coordinator and `ttp doctor` are told."""
     p, pins, tagged = _pinned_kinds_project(env)
     from ttp import coordinator as coord
     from ttp.prompts import worker_context, worker_system
@@ -20376,21 +20696,24 @@ def test_the_reported_light_harness_run_carries_every_restriction_resource_and_s
             "spec": "Shorten the watcher's log lines."}
     text, mem, use = worker_context(p, task)
     shown = {e["name"] for e in mem}
-    assert {f.stem for f in pins.values()} <= shown, shown
-    block = _memory_block(worker_system(p, task))
-    for f in pins.values():
+    always = {k: f for k, f in pins.items() if not k.startswith("DUTY")}
+    assert {f.stem for f in always.values()} <= shown, shown
+    block = _memory_block(_worker_text(p, task))
+    for f in always.values():
         line = next(e["line"] for e in p._memory_entries() if e["name"] == f.stem)
         assert line in block, f.stem
     assert "COORD-DECISION" not in block and "FACT-2" not in block
-    assert tagged.stem not in shown and use["pinned_dropped"] == 1
+    pointed = {x["name"] for x in use["pointers"]}
+    assert {pins["DUTY-1"].stem, pins["DUTY-2"].stem, tagged.stem} <= pointed | shown
+    assert pointed and use["pinned_dropped"] == len(pointed) and not pointed & shown
     assert f"Shortened for room, each in full in {p.memory_dir}/<name>.md" in block
-    assert f"\n[{tagged.stem}] " in block
+    for name in pointed:
+        assert f"\n[{name}] " in block, name
     line = coord.worker_pinned_line(p)
-    assert line.startswith("pinned worker memory over budget: ") and "1 of 6 pinned entries" in line, line
-    assert f"where it is in full): {tagged.stem};" in line, line
+    assert line.startswith("pinned worker memory over budget: ") and f"{len(pointed)} of 6 pinned entries" in line
     coord.memory_budget_check(p)
     alerts = p.db.q("SELECT text FROM events WHERE kind='memory_over_budget'")
-    assert len(alerts) == 1 and "so 1 of them reach workers only as a pointer" in alerts[0]["text"], alerts
+    assert len(alerts) == 1 and f"so {len(pointed)} of them reach workers only as a pointer" in alerts[0]["text"]
 
 
 def test_pinned_worker_memory_is_the_same_in_light_standard_and_deep_runs(env):
@@ -20402,7 +20725,7 @@ def test_pinned_worker_memory_is_the_same_in_light_standard_and_deep_runs(env):
     for tier in ("light", "standard", "deep"):
         task = {"id": 1, "kind": "code", "tier": tier, "title": "code: fix the report script",
                 "spec": "Change scripts/report.py."}
-        block = _memory_block(worker_system(p, task))
+        block = _memory_block(_worker_text(p, task))
         blocks[tier] = {n for n, f in pins.items() if n + " " in block}
     assert blocks["light"] == blocks["standard"] == blocks["deep"] == set(pins), blocks
 
@@ -22828,3 +23151,568 @@ def test_coordinator_running_workers_fold_unchanged_rows_on_session_wakes(env):
     # Measured on this fixture (8 runs): the full section and a delta where no row changed.
     tokens = len(full) / 4
     assert tokens <= 300, (tokens, full)
+
+
+def test_digest_labels_several_action_notes_once(env):
+    """Notes on the previous turn's applied actions: a lone note keeps its inline label; several share
+    one label line with each note under it, so the label is not paid once per note on every turn."""
+    from ttp import coordinator as coord
+    p = make(env)
+    p.db.set_kv(coord.NOTES_KEY, ["first applied note"])
+    d = coord.digest(p, {}, [], [])
+    assert "- [note on your previous turn's action: applied, nothing to fix] first applied note" in d
+    p.db.set_kv(coord.NOTES_KEY, ["first applied note", "second applied note"])
+    d = coord.digest(p, {}, [], [])
+    assert d.count("applied, nothing to fix") == 1
+    assert ("- [notes on your previous turn's actions: applied, nothing to fix]\n  - first applied note\n"
+            "  - second applied note") in d
+
+
+def _fold_event(p, kind, text, fold=None, fp=None, severity="normal", task=None, extra=None):
+    data = {**(extra or {}), **({"fold": fold} if fold else {})}
+    p.db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status,task,data) VALUES(?,?,?,?,?,?,?,?,?)",
+           (time.time(), "daemon", kind, fp or f"{kind}:{time.time()}:{text[:20]}", severity, text, "queued", task,
+            json.dumps(data) if data else None))
+    return p.db.one("SELECT MAX(id) id FROM events")["id"]
+
+
+def test_digest_folds_queue_waits_into_one_line_per_queue_keeping_keys_and_options(env):
+    """Several queue_wait events on one queue share one NEW EVENTS line: the queue's newest state once, the
+    options every item has once, then each item with its key and its own options. Must act now still names
+    every key. Another queue keeps its own line; a lone event keeps its own text."""
+    from ttp import coordinator as coord, mustact, queuewait
+    p = make(env)
+    ids = []
+    for tid, mins, ctx in ((7, 228, "4 running (cap 4), 22 queued. Holding: old."),
+                           (8, 53, "4 running (cap 4), 21 queued. Holding: run A; run B.")):
+        opts = ["cut the stale queued tail: cancel this project's older queued checks runs",
+                f"cancel it if it is no longer needed: task_update {tid} status cancelled"]
+        w = {"task": tid, "queue": "checks", "res": "", "since": time.time() - mins * 60}
+        ids.append(_fold_event(p, "queue_wait", queuewait.text(w, opts, time.time()) + f" {ctx}",
+                               {"group": "the checks queue", "item": f"qwait-{tid}-checks: #{tid} has waited {mins} min",
+                                "ctx": ctx, "opts": opts}, severity="high",
+                               extra={"must_act": {"key": f"qwait-{tid}-checks", "chat": "all", "tasks": [tid],
+                                                   "kind": "queue_wait"}}))
+    ids.append(_fold_event(p, "queue_wait", "qwait-9-push: #9 has waited 40 min on the push queue: LONE TEXT",
+                           {"group": "the push queue", "item": "qwait-9-push: #9 has waited 40 min", "ctx": "c",
+                            "opts": ["o"]}, severity="high"))
+    d = coord.digest(p, {}, ids, [])
+    ev = d.split("# NEW EVENTS", 1)[1]
+    lines = [ln for ln in ev.split("\n") if ln.startswith("- [queue_wait")]
+    assert len(lines) == 2, lines
+    one = lines[0]
+    assert one.startswith("- [queue_wait from daemon, 2 folded into one line, severity high]"), one
+    assert "on the checks queue, now: 4 running (cap 4), 21 queued. Holding: run A; run B." in one
+    assert "Holding: old." not in one   # the older state is not repeated
+    assert one.count("cut the stale queued tail") == 1 and "Options for each: cut the stale queued tail" in one
+    assert ("qwait-7-checks: #7 has waited 228 min (options: cancel it if it is no longer needed: task_update 7 "
+            "status cancelled)") in one and "task_update 8 status cancelled" in one
+    assert "LONE TEXT" in lines[1]   # alone on its queue: shown as raised
+    block = mustact.block(p.db, ids)
+    assert "qwait-7-checks" in block and "qwait-8-checks" in block
+
+
+def test_digest_folds_urgent_check_and_stale_waits_and_slot_wait_incident_wakes(env):
+    """urgent_check_wait: one line per queue, what holds it once, each waiter named. wait_stale: the shared
+    decide words once, each wait's own words kept. checks_slot_wait: of several wakes of one queue incident
+    the newest is shown whole; another incident keeps its line. Events with no fold data show as before."""
+    from ttp import checkcap, coordinator as coord
+    p = make(env)
+    ws = [{"holder": f"demo task #{t} (run {t}0)", "priority": 1, "waited_s": 660, "queue": "checks-parked",
+           "held_by": ["demo task #5 (run 50) (x4)", "other task #6 (run 60) (x8)"]} for t in (1, 2, 3)]
+    ids = [_fold_event(p, checkcap.URGENT_WAIT, checkcap.urgent_wait_text(w), checkcap.urgent_wait_fold(w))
+           for w in ws]
+    assert checkcap.urgent_wait_text(ws[0]) == (
+        "urgent checks demo task #1 (run 10) (priority 1) have waited 11 min in the host-wide checks-parked "
+        "queue; held by: demo task #5 (run 50) (x4); other task #6 (run 60) (x8)")
+    shared = ("Each keeps sleeping and no worker run is spent. Decide for each: fix its probe (`ttp task set-when "
+              "<id> \"<cmd>\"`), clear it (\"\") so it wakes at its timer, or cancel the task.")
+    for t in (4, 5):
+        ids.append(_fold_event(p, "wait_stale", f"#{t} t has waited 6 h for x. Decide: ...",
+                               {"group": "probe waits past max_hold_s", "item": f"#{t} t has waited 6 h for x{t}.",
+                                "ctx": shared}))
+    for n, start in ((1, 100), (2, 100), (3, 200)):
+        ids.append(_fold_event(p, "checks_slot_wait", f"Checks queue: wake {n} of incident {start}.",
+                               fp=f"checks_slot_wait:incident:{start}:escalate:{n}"))
+    ev = coord.digest(p, {}, ids, []).split("# NEW EVENTS", 1)[1]
+    urgent = [ln for ln in ev.split("\n") if ln.startswith("- [urgent_check_wait")]
+    assert len(urgent) == 1 and urgent[0].count("held by:") == 1, urgent
+    assert all(f"demo task #{t} (run {t}0) (priority 1) have waited 11 min" in urgent[0] for t in (1, 2, 3))
+    stale = [ln for ln in ev.split("\n") if ln.startswith("- [wait_stale")]
+    assert len(stale) == 1 and stale[0].count("Decide for each") == 1 and "x4." in stale[0] and "x5." in stale[0]
+    slot = [ln for ln in ev.split("\n") if ln.startswith("- [checks_slot_wait")]
+    assert len(slot) == 2 and "wake 2 of incident 100" in slot[0] and "the newest of 2 wakes" in slot[0], slot
+    assert "wake 1 of" not in ev and "wake 3 of incident 200" in slot[1]
+
+
+_STEPS_SPEC = ("Goal: speed up the loader.\nSteps:\n1. profile it\n2. run the device benchmark\n3. report the commit\n\n"
+               "Restrictions:\n- keep content generic\n- deliver through review\n\nnever push to main\n"
+               "guards: keep the lock on the board")
+
+
+def test_task_update_replace_withdraws_or_rewrites_one_step_and_keeps_the_old_text(env, tmp_path):
+    # Appending could never take a requirement back: `replace` changes one quoted step, records the old
+    # text as a spec_step_replaced event, and tells a running worker which step no longer applies.
+    p = make(env)
+    from ttp import coordinator as coord
+    tid = p.db.add_task("loader", _STEPS_SPEC, kind="work")
+    assert coord.apply(p, [{"type": "task_update", "id": tid, "replace": {"old": "2. run the device benchmark\n"}}]) == []
+    spec = p.db.task(tid)["spec"]
+    assert "device benchmark" not in spec.split("## Update")[0] and "1. profile it\n3. report the commit" in spec
+    assert "Step withdrawn (no longer required): '2. run the device benchmark'" in spec
+    assert "Restrictions:\n- keep content generic" in spec and "never push to main" in spec
+    [ev] = p.db.q("SELECT * FROM events WHERE kind=? AND task=?", (coord.STEP_REPLACED_KIND, tid))
+    assert json.loads(ev["data"]) == {"old": "2. run the device benchmark\n", "new": ""}
+    p.db.update_task(tid, status="running")
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    p.db.x("INSERT INTO runs(task,role,provider,started,status,dir) VALUES(?,?,?,?,?,?)",
+           (tid, "worker", "fake", time.time(), "running", str(run_dir)))
+    assert coord.apply(p, [{"type": "task_update", "id": tid,
+                            "replace": {"old": "3. report the commit", "new": "3. report the commit and its timing"}}]) == []
+    assert "3. report the commit and its timing" in p.db.task(tid)["spec"].split("## Update")[0]
+    assert "Step replaced (the earlier text no longer applies): '3. report the commit'" in (run_dir / "steer.md").read_text()
+
+
+@pytest.mark.parametrize("old, why", [
+    ("2. run the board benchmark", "0 times"),
+    ("the", "times, not once"),
+    ("- keep content generic", "touches a safety line"),             # a line of a Restrictions block
+    ("Restrictions:", "touches a safety line"),
+    ("never push to main", "touches a safety line"),
+    ("guards: keep the lock", "touches a safety line"),
+    ("3. report the commit\n\nRestrictions:", "touches a safety line"),   # a step reaching into the block
+])
+def test_task_update_replace_is_refused_off_one_exact_step_or_on_a_safety_line(env, old, why):
+    p = make(env)
+    from ttp import coordinator as coord
+    tid = p.db.add_task("loader", _STEPS_SPEC, kind="work")
+    problems = coord.apply(p, [{"type": "task_update", "id": tid, "replace": {"old": old, "new": ""}}])
+    assert problems and why in " ".join(map(str, problems)), problems
+    assert p.db.task(tid)["spec"] == _STEPS_SPEC
+    assert p.db.q("SELECT 1 FROM events WHERE kind=?", (coord.STEP_REPLACED_KIND,)) == []
+
+
+_QUOTED = 'In the user\'s words: "run the full sweep tonight"'
+
+
+def _spec_edit_running(p, tid, tmp_path):
+    p.db.update_task(tid, status="running")
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    p.db.x("INSERT INTO runs(task,role,provider,started,status,dir) VALUES(?,?,?,?,?,?)",
+           (tid, "worker", "fake", time.time(), "running", str(run_dir)))
+    return run_dir / "steer.md"
+
+
+def test_task_update_spec_retire_line_drops_every_copy_and_keeps_the_history(env, tmp_path):
+    # A re-sent update repeats a quotation: `retire:` drops each copy from the live spec, the worker is told
+    # it no longer applies, and the earlier text stays in the events.
+    p = make(env)
+    from ttp import coordinator as coord
+    tid = p.db.add_task("sweep", _STEPS_SPEC + "\n\n## Update\n" + _QUOTED + "\n\n## Update\n" + _QUOTED, kind="work")
+    steer = _spec_edit_running(p, tid, tmp_path)
+    upd = 'retire: "' + _QUOTED + '"\nRun only the quick sweep.'
+    assert coord.apply(p, [{"type": "task_update", "id": tid, "spec": upd}]) == []
+    spec = p.db.task(tid)["spec"]
+    # The live spec never repeats the retired quote (a fresh run never saw it); only the running worker is told.
+    assert "full sweep" not in spec and spec.count(coord.RETIRED_LIVE) == 1 and coord.RETIRED_TOLD not in spec
+    assert spec.endswith("Run only the quick sweep.") and "never push to main" in spec and "1. profile it" in spec
+    told = steer.read_text()
+    assert "Retired (this earlier text no longer applies; do not act on it)" in told and "full sweep tonight" in told
+    assert 'retire: "' not in told and "Run only the quick sweep." in told
+    [ev] = p.db.q("SELECT * FROM events WHERE kind=? AND task=?", (coord.STEP_REPLACED_KIND, tid))
+    assert json.loads(ev["data"]) == {"old": _QUOTED, "new": "", "how": "retire", "copies": 2}
+
+
+def test_task_update_spec_replace_line_makes_the_whole_spec_and_keeps_safety_lines(env, tmp_path):
+    p = make(env)
+    from ttp import coordinator as coord
+    tid = p.db.add_task("sweep", _STEPS_SPEC + "\n\n## Update\n" + _QUOTED, kind="work")
+    steer = _spec_edit_running(p, tid, tmp_path)
+    upd = "replace:\nGoal: run the quick sweep and report its numbers.\n- keep content generic"
+    assert coord.apply(p, [{"type": "task_update", "id": tid, "spec": upd}]) == []
+    spec = p.db.task(tid)["spec"]
+    assert spec.startswith("Goal: run the quick sweep and report its numbers.")
+    assert "full sweep" not in spec and "profile it" not in spec and "## Update" not in spec
+    kept = spec.split("Kept from the earlier spec (safety lines change only through the charter):\n")[1]
+    assert kept.split("\n") == ["Restrictions:", "- deliver through review", "never push to main",
+                                "guards: keep the lock on the board"]   # "- keep content generic" is already there
+    told = steer.read_text()
+    assert coord.WHOLE_SPEC_REPLACED in told and "quick sweep" in told and "replace:" not in told
+    [ev] = p.db.q("SELECT * FROM events WHERE kind=? AND task=?", (coord.STEP_REPLACED_KIND, tid))
+    data = json.loads(ev["data"])
+    assert data["how"] == "replace" and data["old"] == _STEPS_SPEC + "\n\n## Update\n" + _QUOTED and data["new"] == spec
+
+
+def _with_obligation(p, tid):
+    """The task's spec once an obligation with a milestone is attached, and its appended block."""
+    import time
+    from ttp import obligations
+    from ttp.coordinator import _obligation_spans
+    oid = obligations.add(p, "ship the quick sweep numbers (user msg #1)", owners=[tid],
+                          milestones=[{"key": "m1", "due": time.time() + 7200, "evidence_required": "a result"}])
+    spec = p.db.task(tid)["spec"]
+    [(a, b)] = _obligation_spans(spec)
+    block = spec[a:b]
+    assert block.startswith(f"## Obligation {oid} ") and f"### Obligation {oid} milestone m1" in block, spec
+    return oid, spec, block
+
+
+@pytest.mark.parametrize("then", ["", "\n\n## Update\nRun only the quick sweep."])
+def test_task_update_spec_replace_line_keeps_an_attached_obligation_block_byte_for_byte(env, tmp_path, then):
+    # obligations._attach never re-appends a block for an owner it has: a whole replace carries it over.
+    p = make(env)
+    from ttp import coordinator as coord, obligations
+    tid = p.db.add_task("sweep", _STEPS_SPEC, kind="work")
+    oid, _, block = _with_obligation(p, tid)
+    if then:
+        p.db.update_task(tid, spec=p.db.task(tid)["spec"] + then)
+    upd = "replace:\nGoal: run the quick sweep and report its numbers."
+    assert coord.apply(p, [{"type": "task_update", "id": tid, "spec": upd}]) == []
+    spec = p.db.task(tid)["spec"]
+    assert spec.startswith("Goal: run the quick sweep") and spec.count(block) == 1 and spec.endswith(block)
+    assert "Run only the quick sweep." not in spec and "profile it" not in spec
+    assert obligations.attach(p, oid, [tid]) == [] and p.db.task(tid)["spec"] == spec, "never appended twice"
+    # Sent again with the block already quoted in the new text: it is not added a second time.
+    assert coord.apply(p, [{"type": "task_update", "id": tid, "spec": "replace:\nGoal: y\n\n" + block}]) == []
+    assert p.db.task(tid)["spec"].count(block) == 1, p.db.task(tid)["spec"]
+
+
+@pytest.mark.parametrize("quote", ["ttp obligation progress", "This task is a required owner.", "--milestone m1",
+                                   "(urgent, owed to the user)"])
+def test_task_update_retire_or_replace_inside_an_obligation_block_is_refused(env, quote):
+    p = make(env)
+    from ttp import coordinator as coord
+    tid = p.db.add_task("sweep", _STEPS_SPEC, kind="work")
+    oid, spec, _ = _with_obligation(p, tid)
+    for act in ({"spec": f'retire: "{quote}"'}, {"replace": {"old": quote, "new": "x"}}):
+        problems = coord.apply(p, [{"type": "task_update", "id": tid, **act}])
+        assert problems and "ttp obligation" in " ".join(map(str, problems)), (act, problems)
+        assert p.db.task(tid)["spec"] == spec
+    # Text outside the block still retires, and the block stays.
+    assert coord.apply(p, [{"type": "task_update", "id": tid, "spec": 'retire: "Goal: speed up the loader."'}]) == []
+    assert "speed up" not in p.db.task(tid)["spec"] and f"## Obligation {oid} " in p.db.task(tid)["spec"]
+
+
+@pytest.mark.parametrize("upd, why", [
+    ('retire: "run the whole sweep tonight"', "matches no earlier spec text"),
+    ('retire: "sweep"', "too short"),
+    ('retire: "never push to main"', "touches a safety line"),
+    ('retire: "- keep content generic"', "touches a safety line"),
+    ("Do this first.\nreplace:\nGoal: x", "must be the update's first line"),
+    ("replace:\n\n", "needs the new spec"),
+    ('replace:\nGoal: x\nretire: "1. profile it"', "drop its `retire:` lines"),
+])
+def test_task_update_spec_retire_or_replace_line_is_refused_not_ignored(env, upd, why):
+    p = make(env)
+    from ttp import coordinator as coord
+    tid = p.db.add_task("sweep", _STEPS_SPEC, kind="work")
+    problems = coord.apply(p, [{"type": "task_update", "id": tid, "spec": upd}])
+    assert problems and why in " ".join(map(str, problems)) and f"#{tid} rejected" in " ".join(map(str, problems))
+    assert p.db.task(tid)["spec"] == _STEPS_SPEC
+    assert p.db.q("SELECT 1 FROM events WHERE kind=?", (coord.STEP_REPLACED_KIND,)) == []
+
+
+@pytest.mark.parametrize("upd", ["Replace: the loader with the streaming one.", "Retire: the old flag.",
+                                 'retire "1. profile it"', "replace: the loader"])
+def test_task_update_spec_without_an_exact_edit_line_is_appended_as_before(env, tmp_path, upd):
+    p = make(env)
+    from ttp import coordinator as coord
+    tid = p.db.add_task("loader", _STEPS_SPEC, kind="work")
+    steer = _spec_edit_running(p, tid, tmp_path)
+    assert coord.apply(p, [{"type": "task_update", "id": tid, "spec": upd}]) == []
+    assert p.db.task(tid)["spec"] == _STEPS_SPEC + "\n\n## Update\n" + upd
+    assert upd in steer.read_text() and coord.WHOLE_SPEC_REPLACED not in steer.read_text()
+    assert p.db.q("SELECT 1 FROM events WHERE kind=?", (coord.STEP_REPLACED_KIND,)) == []
+
+
+@pytest.mark.parametrize("how", ["retire", "replace"])
+def test_a_retired_quotation_leaves_the_readback_and_the_worker_prompt(env, capsys, monkeypatch, how):
+    # Witness: a task's readback kept its older broad quotation after a later explicit replacement retired it,
+    # so a worker (and an active-rule check) kept seeing it. After `retire:` or `replace:` neither shows it.
+    p = make(env)
+    from ttp import cli, prompts
+    from ttp import coordinator as coord
+    broad = 'In the user\'s words: "re-run every benchmark on every board before each push"'
+    tid = p.db.add_task("bench", _STEPS_SPEC + "\n\n## Update\n" + broad, kind="work")
+    upd = ('retire: "' + broad + '"\nBenchmark only the changed model.' if how == "retire"
+           else "replace:\nGoal: benchmark only the changed model.")
+    assert coord.apply(p, [{"type": "task_update", "id": tid, "spec": upd}]) == []
+    monkeypatch.setenv("TTP_PROJECT", str(p.base))
+    capsys.readouterr()
+    cli.main(["task", "show", str(tid)])
+    readback = capsys.readouterr().out
+    prompt = prompts.worker_task(p, p.db.task(tid), str(p.root), None)
+    for text in (readback, prompt):
+        assert "every benchmark on every board" not in text and "only the changed model" in text
+        assert "never push to main" in text
+    [ev] = p.db.q("SELECT * FROM events WHERE kind=? AND task=?", (coord.STEP_REPLACED_KIND, tid))
+    assert broad in json.loads(ev["data"])["old"]
+
+
+# A coordinator turn whose budget ended it on its whole final answer: the answer is applied, not wasted.
+SALVAGE_ANSWER = {"actions": [{"type": "reply", "chat": "c1", "text": "ok", "severity": None, "title": None}],
+                  "summary": "s"}
+
+
+def _answer_call(tid="t1", inp=None, parent=None):
+    return {"type": "assistant", "parent_tool_use_id": parent,
+            "message": {"id": f"m-{tid}", "usage": {}, "content": [
+                {"type": "tool_use", "id": tid, "name": "StructuredOutput", "input": inp or SALVAGE_ANSWER}]}}
+
+
+def _claude_result(subtype="error_max_budget_usd", structured=None):
+    return {"type": "result", "subtype": subtype, "is_error": subtype != "success", "total_cost_usd": 1.3,
+            "usage": {"input_tokens": 1, "output_tokens": 1}, "result": "", "structured_output": structured}
+
+
+def _claude_parse(tmp_path, events):
+    from ttp.providers.claude import Claude
+    path = tmp_path / "output.jsonl"
+    path.write_text("".join(json.dumps(e) + "\n" for e in events))
+    return Claude().parse(path)
+
+
+def test_claude_keeps_an_unrun_final_answer_at_budget_end_without_nulls(tmp_path):
+    init = {"type": "system", "subtype": "init", "session_id": "s"}
+    u = _claude_parse(tmp_path, [init, _answer_call(), _claude_result()])
+    assert u.answer == {"actions": [{"type": "reply", "chat": "c1", "text": "ok"}], "summary": "s"}
+    assert u.structured is None
+    # A retry after a refused first call: the newest one, still unrun, is the answer.
+    refused = {"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "t1", "is_error": True}]}}
+    newer = {"actions": [{"type": "reply", "chat": "c1", "text": "second"}]}
+    assert _claude_parse(tmp_path, [_answer_call(), refused, _answer_call("t2", newer), _claude_result()]).answer == newer
+
+
+def test_claude_keeps_no_answer_that_ran_was_denied_came_from_a_subagent_or_ended_otherwise(tmp_path):
+    ran = {"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "t1", "content": "ok"}]}}
+    denied = {"type": "user", "message": {"content": [
+        {"type": "tool_result", "tool_use_id": "t1", "is_error": True, "content": "denied by hook"}]}}
+    assert _claude_parse(tmp_path, [_answer_call(), ran, _claude_result()]).answer is None
+    assert _claude_parse(tmp_path, [_answer_call(), denied, _claude_result()]).answer is None
+    assert _claude_parse(tmp_path, [_answer_call(parent="sub1"), _claude_result()]).answer is None
+    for subtype in ("error_max_turns", "error_during_execution", "success"):
+        assert _claude_parse(tmp_path, [_answer_call(), _claude_result(subtype)]).answer is None, subtype
+    # A result that carried the answer anyway: that one stands, nothing is salvaged.
+    assert _claude_parse(tmp_path, [_answer_call(), _claude_result(structured=SALVAGE_ANSWER)]).answer is None
+    assert _claude_parse(tmp_path, [_answer_call()]).answer is None   # cut before any result line
+
+
+def test_codex_and_cursor_keep_a_whole_answer_cut_off_by_the_runners_budget_check(tmp_path):
+    from ttp.providers import get_provider
+    text = json.dumps(SALVAGE_ANSWER)
+    msg = {"type": "item.completed", "item": {"type": "agent_message", "text": text}}
+    done = {"type": "turn.completed", "usage": {"input_tokens": 1, "cached_input_tokens": 0, "output_tokens": 1}}
+    out = tmp_path / "codex.jsonl"
+    out.write_text(json.dumps(msg) + "\n")
+    assert get_provider("codex").parse(out).answer == {"actions": [{"type": "reply", "chat": "c1", "text": "ok"}],
+                                                       "summary": "s"}
+    out.write_text(json.dumps(msg) + "\n" + json.dumps(done) + "\n")
+    assert get_provider("codex").parse(out).answer is None   # its turn completed: a plain answer
+    out.write_text(json.dumps({**msg, "item": {"type": "agent_message", "text": text[:-5]}}) + "\n")
+    assert get_provider("codex").parse(out).answer is None   # a cut-off message never parses
+    cur = tmp_path / "cursor.jsonl"
+    said = {"type": "assistant", "message": {"content": [{"type": "text", "text": text}]}}
+    cur.write_text(json.dumps(said) + "\n")
+    assert get_provider("cursor").parse(cur).answer["actions"][0]["text"] == "ok"
+    cur.write_text(json.dumps(said) + "\n" + json.dumps({"type": "result", "result": text}) + "\n")
+    assert get_provider("cursor").parse(cur).answer is None
+
+
+def test_only_a_stateless_coordinator_turn_over_its_budget_is_salvageable(tmp_path):
+    from ttp.daemon import _salvageable_answer
+    u = _claude_parse(tmp_path, [_answer_call(), _claude_result()])
+    stateless = {"turn": {"session": {"mode": "stateless"}}}
+    assert _salvageable_answer("failed", u, stateless) and _salvageable_answer("failed", u, {})
+    assert _salvageable_answer("budget", u, {})
+    for mode in ("new", "resume"):   # a session wake's cut-off answer is applied too; its session resumes
+        assert _salvageable_answer("failed", u, {"turn": {"session": {"mode": mode}}}), mode
+    other = _claude_parse(tmp_path, [_answer_call(), _claude_result("error_max_turns")])
+    other.answer = u.answer
+    assert not _salvageable_answer("failed", other, stateless)   # another ending
+    u.answer = {"summary": "no actions"}
+    assert not _salvageable_answer("failed", u, stateless)
+
+
+@pytest.mark.parametrize("prior", ["none", "resumable"])
+def test_a_salvaged_coordinator_session_wake_is_applied_not_wasted_and_its_session_resumes(env, prior):
+    """A session wake (new, or a resume of a saved session) cut off at its budget end on its unrun final
+    StructuredOutput call: its answer is applied, not counted as waste, and the next wake resumes the
+    same session, told the answer was applied (never a fresh seeded session or a stateless turn)."""
+    from ttp import budget as bud
+    from ttp import coordsession as cs
+    from ttp.daemon import Daemon
+    p = make(env)
+    key, model, effort = "k1", "m", "high"
+    if prior == "resumable":
+        p.db.set_kv(cs.KEY, {"id": "s1", "key": key, "model": model, "effort": effort, "last_ok": True,
+                             "provider": "claude", "wakes": 2})
+    mode, why = cs.decide(p.config(), p.db.kv(cs.KEY), key, model, effort, lambda sid: True, time.time())
+    assert mode == ("resume" if prior == "resumable" else "new"), (mode, why)
+    session = {"mode": mode, "why": why, "key": key, "model": model, "effort": effort, "provider": "claude"}
+    answer = {"actions": [{"type": "task_add", "title": "salvaged task", "spec": "s", "kind": None, "tier": None}],
+              "summary": "s"}
+    rid = p.db.x("INSERT INTO runs(role,provider,model,started,status,note,session_id) VALUES('coordinator',"
+                 "'claude','m',?,'running',?,?)", (time.time() - 60, json.dumps({"turn": {"session": session}}),
+                                                   "s1" if mode == "resume" else None))
+    run_dir = p.runs / str(rid)
+    run_dir.mkdir(parents=True)
+    (run_dir / "run.json").write_text(json.dumps({"budget_usd": 1.0, "timeout_s": 600}))
+    (run_dir / "output.jsonl").write_text("".join(json.dumps(e) + "\n" for e in [
+        {"type": "system", "subtype": "init", "session_id": "s1"}, _answer_call(inp=answer), _claude_result()]))
+    Daemon(p.base).finish_run(p.db.one("SELECT * FROM runs WHERE id=?", (rid,)),
+                              {"rc": 1, "started": time.time() - 60, "ended": time.time()})
+    run = p.db.one("SELECT * FROM runs WHERE id=?", (rid,))
+    assert json.loads(run["note"])["not_waste"] == "answer" and not bud.wasted(run), run
+    assert len(p.db.q("SELECT id FROM tasks WHERE title='salvaged task'")) == 1
+    st = p.db.kv(cs.KEY)
+    assert st["id"] == "s1" and st["last_ok"] and st["salvaged"] == 1 and not st.get("rerun"), st
+    nxt = cs.decide(p.config(), st, key, model, effort, lambda sid: True, time.time())
+    assert nxt[0] == "resume", nxt
+    # The next wake that ends ok was told; a later one is not told again.
+    st = cs.record(st, None, "s1", {**session, "mode": "resume", "why": nxt[1]}, True, time.time())
+    assert "salvaged" not in st
+
+
+def test_claude_schema_requires_only_each_objects_own_fields_and_codex_stays_all_required(tmp_path):
+    from ttp import coordinator as coord
+    from ttp.providers import get_provider
+    from ttp.providers.base import strict_schema
+    loose = strict_schema(coord.ACTIONS_SCHEMA, require_all=False)
+    item = loose["properties"]["actions"]["items"]
+    assert loose["required"] == ["actions"] and item["required"] == ["type"]
+    assert item["additionalProperties"] is False and "null" in item["properties"]["severity"]["type"]
+    assert item["properties"]["claims"]["items"]["required"] == ["text"]
+    strict = strict_schema(coord.ACTIONS_SCHEMA)
+    assert set(strict["properties"]["actions"]["items"]["required"]) == set(item["properties"])
+    kw = dict(role="coordinator", model="", effort="low", cwd=str(tmp_path), budget_usd=1, read_only=True,
+              schema=coord.ACTIONS_SCHEMA, restrictions={})
+    for name in ("claude", "chat"):
+        argv, _ = get_provider(name).build(**kw)
+        assert json.loads(argv[argv.index("--json-schema") + 1]) == loose, name
+    argv, _ = get_provider("codex").build(**kw)
+    assert json.loads(pathlib.Path(argv[argv.index("--output-schema") + 1]).read_text()) == strict
+
+
+def test_an_answer_without_nulls_parses_to_the_same_actions_as_a_padded_one(tmp_path):
+    """Under the sparse schema a null is padding, as under the all-required one: a schedule field is
+    cleared only through clear_fields, and left-out fields keep their values."""
+    from ttp import coordinator as coord
+    props = coord.ACTIONS_SCHEMA["properties"]["actions"]["items"]["properties"]
+    bare = [{"type": "reply", "chat": "c1", "text": "ok"},
+            {"type": "schedule_set", "name": "n", "probe": "true"},
+            {"type": "schedule_set", "name": "n", "clear_fields": ["debounce_h"]},
+            {"type": "task_update", "id": 3, "status": "queued", "heal": {"preset": "x"}}]
+    padded = [{**dict.fromkeys(props), **a} for a in bare]
+    padded[3]["heal"] = {"preset": "x", "pattern": None}
+    sparse_null = [*bare[:1], {**bare[1], "debounce_h": None, "precheck": None}, *bare[2:]]
+    got = [_claude_parse(tmp_path, [_claude_result("success", {"actions": acts, "summary": "s"})]).structured
+           for acts in (bare, padded, sparse_null)]
+    assert got[0] == got[1] == got[2], got
+    assert got[0]["actions"][1] == {"type": "schedule_set", "name": "n", "probe": "true"}
+    assert got[0]["actions"][2] == {"type": "schedule_set", "name": "n", "debounce_h": None}
+    # A sparse answer outside any schema (text) keeps its legacy explicit-null clear, as before.
+    from ttp.providers.base import drop_nulls
+    assert drop_nulls({"type": "schedule_set", "debounce_h": None}) == {"type": "schedule_set", "debounce_h": None}
+
+
+def test_a_spec_naming_a_closed_delivered_or_order_owned_key_is_a_citation(env, monkeypatch):
+    """18 of 51 rejected actions in a day were 'its spec names obligation oN, which #N does not own', most on
+    done tasks naming keys no one owed any more: closed and delivered keys are citations, an order's own
+    tasks own it, and STATE's open-task rows show the open keys each task owns."""
+    from ttp import coordinator as coord
+    from ttp import obligations as ob
+    p, d, now, tid, check = _ob_setup(env, monkeypatch)
+    other = p.db.add_task("other work", "s", origin="coordinator")
+    gone, kept, sent, owed = (ob.add(p, f"report {i}", now=now) for i in range(4))
+    ob.drop(p, gone, "no longer wanted")
+    ob.record(p, kept, "receipt", "docs/report.md", None)
+    assert ob.get(p.db, kept)["receipt"]
+    st = ob._load(p.db)
+    st["items"][sent]["delivered"] = {"message": 1, "chat": "c", "at": now}
+    st["items"][owed]["promise"] = {"tasks": [other], "chat": "c", "message": 2, "due": now + 3600, "timed": True}
+    p.db.set_kv(ob.KV, st)
+    for key in (gone, kept, sent):
+        spec = f"Background: obligation {key} was settled earlier."
+        assert coord.apply(p, [{"type": "task_update", "id": tid, "spec": spec}]) == [], key
+    assert coord.apply(p, [{"type": "task_update", "id": other, "spec": f"Record obligation {owed} progress."}]) == []
+    out = coord.apply(p, [{"type": "task_update", "id": tid, "spec": f"Also obligation {owed}."}])
+    assert len(out) == 1 and "does not own" in out[0], "an open key still needs its owner"
+    assert ob.open_keys_by_task(p.db) == {other: [owed]}
+    row = next(x for x in coord.digest(p, {}, [], []).splitlines() if x.startswith(f"- #{other} |"))
+    assert f"(owns {owed})" in row
+
+
+def test_state_shows_the_24h_task_caps_near_and_at_the_limit(env):
+    """13 cap refusals in a day were learned only by refusal: STATE's budget lines show each rolling 24 h
+    cap once it is near, and the next free slot once it is full."""
+    from ttp import coordinator as coord
+    p = make(env)
+    p.set_config("coordinator.max_new_tasks_per_day", 5)
+    p.set_config("coordinator.max_review_tasks_per_day", 10)
+    now = time.time()
+    assert coord.task_cap_lines(p.db, p.config(), now, p) == [], "far below the caps: no line"
+    for i in range(4):
+        p.db.add_task(f"made {i}", "s", origin="coordinator")
+    (line,) = coord.task_cap_lines(p.db, p.config(), now, p)
+    assert "max_new_tasks_per_day): 4 of 5 used, 1 left" in line
+    p.db.add_task("made 4", "s", origin="coordinator")
+    (line,) = coord.task_cap_lines(p.db, p.config(), time.time(), p)
+    assert "5 of 5 used, FULL: the next slot frees at" in line
+    assert "24 h cap on new tasks" in coord.digest(p, {}, [], [])
+    p.set_config("coordinator.max_review_tasks_per_day", 0)
+    assert any("review tasks (max_review_tasks_per_day): 0" in x
+               for x in coord.task_cap_lines(p.db, p.config(), time.time(), p))
+
+
+def test_every_run_kind_carries_the_no_drive_search_rule_and_the_known_paths(env, monkeypatch, capsys):
+    """User msg #212: a run searched / for the push lock and popped dozens of macOS privacy dialogs.
+    Every worker, review and coordinator prompt (both coordinator modes, either provider: the worker's
+    system prompt is provider-independent) leads with the rule and the paths, from the code's own functions."""
+    import json as _json
+    from ttp import cli, coordsession, knownpaths, push
+    from ttp.coordinator import _prompt_head
+    from ttp.daemon import PRECHECKS_DIR
+    from ttp.prompts import worker_system
+    p = make(env)
+    p.set_config("delivery.push_branch", "team/feature")
+    lock = push.lock_paths(p, *push.target(p, p.root))[0]
+    block = knownpaths.block(p)
+    wants = (knownpaths.HEADER, knownpaths.RULE, f"tt-project folder: {p.base.absolute()}; in it", "state/runs/", f"state/{PRECHECKS_DIR}/",
+             f"state/{push.DETACHED}/", str(lock.relative_to(p.base)), "check-slots/ (checks queue)")
+    for w in wants:
+        assert w in block, w
+    prompts = {kind: worker_system(p, {"kind": kind, "title": "t"}) for kind in ("code", "question", "review", "work")}
+    prompts["coordinator"] = _prompt_head(p)[1]
+    for prov in ("claude", "codex"):
+        prompts[f"session/{prov}"] = coordsession.session_prompt_parts(p, prov)[0]
+    for name, text in prompts.items():
+        assert block in text, name
+    # The rule names each walk the user's popups came from.
+    for walk in ("find", "du", "grep -r", "rg", "mdfind", "os.walk", "rglob", "glob **"):
+        assert walk in knownpaths.RULE, walk
+    # `ttp paths` prints the very lock file `ttp push` takes, and the run's own folder.
+    monkeypatch.setenv("TTP_RUN_DIR", str(p.runs / "7"))
+    cli.main(["paths", p.name, "--json"])
+    got = _json.loads(capsys.readouterr().out)
+    assert got["push lock"] == str(lock.absolute()) and got["this run"] == str((p.runs / "7").absolute())
+    assert got["prechecks"] == str((p.state / PRECHECKS_DIR).absolute()) and got["state"] == str(p.state.absolute())
+    cli.main(["paths", p.name])
+    assert f"push lock: {lock.absolute()}" in capsys.readouterr().out.splitlines()
+
+
+def test_runtime_walks_never_start_at_the_drive_root_or_the_home_folder(tmp_path, monkeypatch):
+    from ttp import goalchecks
+    from ttp.knownpaths import glob_root_ok, walk_root_ok
+    home = tmp_path / "home"
+    (home / "proj").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    assert not walk_root_ok("/") and not walk_root_ok(home) and not walk_root_ok(tmp_path)
+    assert walk_root_ok(home / "proj")
+    for bad in ("~/**/x.log", "/**/a", "~/*/x", "/*/x"):
+        assert not glob_root_ok(bad), bad
+    for ok in ("~/proj/**/x.log", "~/*.log", str(home / "proj" / "*" / "a"), "results/**/x.json"):
+        assert glob_root_ok(ok), ok
+    [o] = goalchecks.artifact_fresh("~/**/x.log")
+    assert o.get("error") is True and "refused" in o["text"], o

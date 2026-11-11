@@ -102,6 +102,29 @@ project's daemon started after the alert). Other one-shot deploy and upgrade lin
 upgrade merge, a restored release, an upgrade recovered at start) are below high, so they appear
 only in the feed and never under "needs you".
 
+Each project also runs an overseer (`ttp.overseer`, its own service with `Restart=always`) beside
+the daemon. It shares no process, lock or tick step with it: once a minute it reads the database
+read-only (a short busy timeout, never waiting on the daemon's writes) and the run folders, and
+judges the tick loop by its results, not its heartbeat: the last dispatch, urgent work ready with
+a free slot, finished runs not reaped, coordinator answers not applied, events not delivered and
+slow tick steps per hour. That reading is one `loop health:` line in every coordinator digest,
+`ttp status` and `ttp deployed`. Urgent work waiting with a free slot, a run unreaped or an answer
+unapplied for over 5 min, or a stale heartbeat, is a results failure: the overseer saves the
+daemon's stacks under `state/incidents/` (py-spy when installed, else the daemon's own stack dump)
+and records one incident in that line until the results are good again. The daemon restarts an
+overseer whose heartbeat is over 5 min old. Idle cost: no model call, a few read-only queries a
+minute.
+
+The coordinator decides when it looks next: a `look` action sets a time, what to check and why,
+and optionally a shell check that skips the wake when it exits 0 (nothing changed). While a look
+is pending it replaces the fixed idle and idle-slot wakes; with none, those come back. A due look
+starts a turn in the same session. If the tick loop leaves a look pending 3 min past due, the
+overseer starts that turn itself (at most one every 10 min); the loop and the overseer share one
+start lock, so they never start two turns. A tick step over its budget in 3 of its last 10 runs
+sits out the next 10 ticks (never the steps that reap, start turns, dispatch or deliver). It is
+one incident in `state/overseer-incidents.jsonl` with the daemon's stacks, and a look wakes the
+coordinator with that evidence.
+
 ## Budget
 
 - Subscription plans: a plan's capacity is lost at each reset, so the project uses it. Below the
@@ -125,8 +148,10 @@ only in the feed and never under "needs you".
   the line holds new starts back; it clears by itself when the window resets. Budget alerts come
   only for what only you can clear (a dollar cap you set, funds), once it still holds new work two
   minutes on; they are withdrawn once it no longer does.
-- Usage-billed accounts: $100 per 24 hours and $200 per 7 days per project by default
-  (`budget.daily_usd`, `budget.weekly_usd`). With `budget.day_start` set, the daily cap counts
+- Usage-billed accounts: $100 per 24 hours per project by default (`budget.daily_usd`); the
+  7-day cap (`budget.weekly_usd`), when unset, is 7 times the daily cap in force ($700 by default),
+  so it never stops work before the daily cap would. `ttp config` and `ttp setup` warn when a weekly
+  cap you set is below the daily cap. With `budget.day_start` set, the daily cap counts
   the budget day instead of the last 24 hours. A new run
   starts only if its budget fits in what is left of both caps, each over that same window. At
   `budget.cap_yellow_pct` (60 by default) of a cap the gate turns yellow and halves the worker slots. A plan account whose successful
@@ -143,6 +168,12 @@ only in the feed and never under "needs you".
   in but names none. While the status says logged out or cannot be read, the last label seen
   stands; before any is seen (after a restart) the account is unknown, so neither is an account
   switch.
+- Daily spend target (a goal, not a cap; unset by default): with `ttp config --account
+  budget.daily_target_usd <usd>`, `ttp status` shows today's Claude spend against it, and the daily
+  review's self-efficiency audit (`ttp audit`) lists each project on this machine with the last 24 h's
+  spend by class (coordinator, reviews, worker runs that ended waiting, other workers), then the total
+  against the target. Each figure is real spend (a Claude run's own tokens priced at the model it
+  actually used) with the booked figure beside it where they differ.
 - Global daily cap (usage-billed, $200/day by default): `budget.global_daily_usd` stops new work in
   every usage-billed project on the account once the whole account's tt-project spend today reaches
   it. "Today" is the rolling 24 hours unless `budget.day_start` is set. Change it for every project
@@ -207,7 +238,10 @@ only in the feed and never under "needs you".
 - These keys (and `budget.push_spend_to`) are account-level: `ttp config --account KEY VALUE` writes them to
   `~/.tt-project/settings.json` (mode 0600), which every project on the machine reads under its own
   `project.json` (a project may still override a key, except `budget.push_spend_to`, which is read
-  from the account settings only). `ttp config --account KEY` reads one; an
+  from the account settings only). Four `providers.chat` keys are account-level too, read by their
+  own code rather than merged into each project's settings: `model_ranking`, `ranking_source`,
+  `ranking_every_s` and `ranking_key_file` (see the chat provider's model ranking below).
+  `ttp config --account KEY` reads one; an
   empty value removes it. The same holds for a project's own keys: `ttp config <name> KEY ''` removes KEY
   from `project.json`, so its default applies again, and a key whose default is a list or an object
   refuses a value of another type without writing it, except the plain forms its reader takes
@@ -260,8 +294,8 @@ only in the feed and never under "needs you".
   harness folder, kept outside `runtime/` and `prompts/` (for example `guards/no_prod_restart.py`), so an
   upgrade never touches them. Each defines `refusal(cmd)`, asked about every shell command, returning the
   reason it refuses or None, and may define `tool_refusal(tool, tool_input)` for other tool calls (file edits,
-  connector calls). The worker hook asks them after the built-in guards, as does a session coordinator's tool
-  check; a refusal blocks the call and is logged with kind `local:<file>`. A listed guard is never skipped: a
+  connector calls). Every provider path asks them after the built-in guards (the Claude, Codex and Cursor worker
+  hooks, the runner-side guard of runs without one, and a session coordinator's tool check); a refusal blocks the call and is logged with kind `local:<file>`. A listed guard is never skipped: a
   file that is missing, does not import, has no `refusal` or raises refuses the calls it checks, naming itself
   and the error. Only a harness task edits a listed guard file. `ttp doctor` shows each guard and whether it
   loads. See the harness skill's references/local-guards.md.
@@ -297,13 +331,13 @@ only in the feed and never under "needs you".
   whose branch still holds unmerged commits, or a branch that does not fast-forward),
   with `TTP_HARNESS_LANDING_WHY` saying what the worker can do. A harness-landed check should fail only
   on `refused`: a worker's sandbox cannot write the harness checkout, so it can never merge there itself.
-  Before that merge, an uncommitted copy in the harness checkout (changed or untracked) of a file the
-  branch changed, equal to the branch's head version or an earlier one since the merge base, is backed
-  up to `state/harness-land-backups/<date>-t<id>/` and put back so git does not refuse; any other
-  uncommitted file is left alone, and a merge still refused puts the copies back and names them.
-  This happens only when it clears every such copy: one that differs, a deletion, or staged content
-  unlike its working copy, or (for a merge that is not a fast-forward) any other staged change, means
-  none is set aside and git refuses as before, once per pass.
+  The merge is made in a scratch worktree; the harness checkout then only moves forward to it, the
+  ref first (a refusal, such as the template guard's, writes no file), and git updates only files that
+  still match the old HEAD. Land never runs `checkout --`, reset, stash or merge --abort there. An
+  uncommitted copy (changed, staged or untracked) of a file the merge changes lands as it is only when
+  it already holds the merged content: it is staged, never rewritten. Any other such copy (other
+  content, an earlier branch version, a deletion, a symlink) stops the land and is named once per
+  branch head; every uncommitted file is left alone.
 - A task that has ended (done, failed, cancelled, exhausted) can still leave processes behind. Its own
   ones are those of your user whose environment carries this project's `TTP_PROJECT`, the task's
   `TTP_TASK` and a `TTP_RUN_DIR` of one of its recorded runs. When such processes are the only ones with a
@@ -335,8 +369,11 @@ only in the feed and never under "needs you".
   that carries the head, a push branch no push reaches, a recorded landing), gets its review and
   a low feed line, at most `review.unreviewed_per_pass` (default: the project's
   `budget.max_parallel_workers`, 0 off) per pass, for tasks
-  updated within `review.unreviewed_max_age_h` (default 72); it runs every 5 minutes and in the
-  blocker sweep, reads local refs only, and never queues a second review of one head. A code task still in review
+  updated within `review.unreviewed_max_age_h` (default 72); it runs every 5 minutes (every 100
+  seconds after a pass cut short that queued a review, so a backlog drains) and in the
+  blocker sweep, reads local refs only, and never queues a second review of one head. Its first pass
+  after an upgrade logs how many done code tasks in that window have no landing, push-queue entry
+  or superseded record, so a backlog of finished changes shows. A code task still in review
   with no review `review.sweep_after_s` (default 300, 0 off) after its last run gets its review
   from the daemon. The sweep only queues reviews and never closes a task, so a task whose
   continuation already passed review still gets its own review (one review each, no work lost).
@@ -372,8 +409,9 @@ only in the feed and never under "needs you".
   follow-ups gets one fix task on the reviewed branch and a re-review from the daemon, and the
   tasks waiting on the failed review wait on the re-review instead of being blocked. The re-review
   depends on the fix; a fix that ends with no new commits on the reviewed head blocks it and wakes
-  the coordinator, so the same head is never re-reviewed (at most two
-  rounds per stack; a failure without fix follow-ups still blocks them, and `upstream:` notes and
+  the coordinator, so the same head is never re-reviewed (`review.auto_fix_rounds`, default 1,
+  rounds per stack: a failed re-review, which would start a third review round, goes to the
+  coordinator as one `review_nofix` event instead of being queued; a failure without fix follow-ups still blocks them, and `upstream:` notes and
   deferred follow-ups stay with the coordinator). Across stacks, once `review.area_fail_cap` (3; 0
   off) reviews of one area failed within 48 h (a lineage linked by `continues`, follow-ups,
   `depends_on` and `Review #N` / `Fix review #N` titles, or overlapping changes to the same main file), the
@@ -385,6 +423,10 @@ only in the feed and never under "needs you".
   project may word the rule that way. The rule sits in its own block of `prompts/kind-review.md`,
   between `<!-- ttp:result-rule -->` marker lines the prompt leaves out: a project that rewords it
   keeps its wording through template upgrades without merge conflicts.
+- A review judges the diff plus the gate results that already exist for the head it reviews, and
+  never starts or waits on a repeat of a test that passed on that head: a further test it wants is a
+  finding, and its verdict still goes out. Only the required checks (the suite and any smoke test)
+  and the review's verdict hold a landing (`prompts/kind-review.md`, `prompts/kind-code.md`).
 - A failed or `changes_needed` review is closed as superseded, keeping its verdict: automatically,
   model-free, once a later re-review in its chain passes; or by hand with
   `ttp task <project> superseded <id> --by-review <passed re-review id>` or
@@ -454,7 +496,13 @@ only in the feed and never under "needs you".
   is also high while the task waits on an ask. An overdue machine change
   (`machine_change_overdue`) is normal, high only on a machine tagged `serving`, `live` or `server`
   past its end with no passing until-probe, and each project hears of one change once per episode,
-  whether from its own daemon or relayed by another project's.
+  whether from its own daemon or relayed by another project's. A project's expired changes reach its
+  coordinator as one item listing each change's what, undo and age with the choices renew, close or
+  undo, which it decides without the user's word; a gone or paused project's go to the machine's
+  recovery owner, then its fallback. The user is paged only for a risky change (one that stops,
+  disables or pauses a service or recovery, or touches networking, ssh, credentials, mounts, the
+  kernel or drivers, reservations, a live serving machine, or an unclassified change on a machine
+  other projects share; `machine_ledger.change_risk`) nobody renewed, closed or undid for 24 h.
 - Untrusted text in the coordinator's digest (every event: hand-offs, notes from other projects, PR
   and CI text, watcher and tool output; a relayer's context and findings) and in a worker's context
   block (a relayer's context, earlier hand-offs, review findings, tried-ledger lines) is enclosed as
@@ -473,8 +521,10 @@ only in the feed and never under "needs you".
   rejected a resume. A full context never starts a new session: the session compacts in place and
   keeps its id. The context is the last model call's prompt and answer; the compaction point is the
   session's first prompt (or its size after its last compaction, the larger) plus
-  `compact_growth_tokens` (100000), at most the model's context window (`context_window_tokens`; 0
-  reads it from a `[1m]` model id, else no cap) less `compact_margin_tokens` (40000).
+  `compact_growth_tokens` (100000), and never so soon that a compaction would free under
+  `compact_min_free` (0.3) of the context, judged by the size the last one left; at most the model's
+  context window (`context_window_tokens`; 0 reads it from a `[1m]` model id, else no cap) less
+  `compact_margin_tokens` (40000), which always forces one.
   `compact_tokens` above 0 (default 0) sets a fixed point instead. The older `rollover_tokens`,
   `rollover_growth_tokens` and `rollover_margin_tokens` names are still read for a project that sets
   no `compact_*` value. A resumed wake that fails is recorded as an event
@@ -556,8 +606,9 @@ only in the feed and never under "needs you".
   The session prompt's Tools section names only what the wake really gets on its provider
   (`Provider.coord_tool_set`): a worker's tools, read-only tools or none, with the reason, and hands
   what it cannot do to workers.
-  With `full` it gets a worker's tools (Bash, Read, Edit, Write, Skill, ToolSearch and the web
-  tools unless `no_internet`) under a worker's PreToolUse checks, so it can edit, build, ssh to the
+  With `full` it gets a worker's tools (on Claude Code its whole standard set, subagents
+  among them, and the web tools unless `no_internet`; its text is appended to Claude Code's own
+  system prompt) under a worker's PreToolUse checks, so it can edit, build, ssh to the
   machines its charter allows and run the `ttp` CLI. Direct writes to the charter, the memory
   files, `harness/project.json` and the state database are denied, each naming the action or
   command that applies the same checks (`charter_update`, `memory_add`, `config_set`, `ttp config`).
@@ -775,6 +826,19 @@ only in the feed and never under "needs you".
   coordinator turn, which a re-hold no longer postpones). `dependency_cycle`: tasks that depend on
   each other, named; `task_add` and `task_update` refuse to create one. All are listed in the
   `stale_holds` event and flagged as loops in each blocker sweep.
+- Premise commands (model-free): a code task's spec line `premise: <words>` is checked once by a
+  light question before its first run (an urgent task checks it itself). When a read-only shell
+  command can answer it, add `premise_cmd: <command>`: the daemon runs it itself from the project
+  root, devices masked, before each dispatch, and again before a later dispatch once its pass is
+  older than `premise.recheck_min` (30, retries included). Exit 0: the premise holds and the task
+  starts. Exit 1: the premise is false; the task closes as not needed with the command, exit code
+  and output tail in its result, no worker runs, the coordinator gets one `task_done` event, and
+  `task_add` refuses the same command for 14 days. Any other exit, a run past
+  `premise.cmd_timeout_s` (60) or a command the read-only guard refuses (writes, git that changes
+  refs, ssh, schedulers, device tools) falls back to the light question, never a silent skip. Map
+  other scripts onto 0 and 1 with a wrapper, e.g. a fix already merged:
+  `premise_cmd: git merge-base --is-ancestor <sha> origin/<branch> && exit 1 || exit 0`. The daily
+  review counts premise-closed tasks and the cost they saved at the tier's median code run.
 - Dead landing waits (model-free): a queued task whose start_when is exactly `landed:#<id>`, with
   that producer done, not landed and nothing open that can land it (no review, fix, rebase, task on
   its branch or push queue row) for `waiting.landed_wait_dead_s` (900), raises one
@@ -908,6 +972,17 @@ only in the feed and never under "needs you".
   handles an event without a task naming the device, that decline is kept per device in the
   database: its next idle stretch waits both the grace and the doubling rearm from its last event,
   until a task names the device again.
+- gh logged out (model-free): one check per machine, shared by every project on it, runs `gh auth
+  status` at most every 15 min while a project there uses gh (a PR to watch, or a schedule or
+  probe that calls gh or `ttp ci`). While it fails for the login, one normal alert in the top
+  section names the machine's ssh alias and the step only the user can take (`gh auth login`
+  there). It is sent once per outage, the other projects there show it quietly, and it clears once
+  the check passes. Shipped gh callers never read a logout as ok: pr-watch's run ends with an
+  `error:` status, `ttp ci` exits 4 with a `broken:` line, and a gh call that failed its login asks
+  for a recheck at once. A `start_when` probe that fails for gh's login (exit 4, or `not logged in`
+  in its output) raises no broken-probe event of its own while the host check says logged out; the
+  one alert covers it. A command watcher or schedule of your own that calls gh should do the same:
+  print `{"error": true, ...}` on a gh auth failure, never an ok line.
 - Network outage (model-free): when every task that could start waits on a probe saying this
   machine cannot reach its host (ssh exit 255, confirmed by `ssh <alias> true` failing too; a 255
   that names no host, or whose host answers, is a broken probe for its task), no worker runs and no other task is ready to start, for
@@ -927,11 +1002,34 @@ only in the feed and never under "needs you".
   ssh finds no route out) from "these hosts are down" (other hosts answer, from another task's
   probe or a healthy heal check, and only these fail). VPN or network sign-in advice is given only
   when the machine is offline and is a workstation (`waiting.workstation`; null detects a laptop or
-  desktop, so a server never gets it); hosts that are down are named with no advice. When every
+  desktop, so a server never gets it); hosts that are down are named with no advice. When the
+  machine has the `tailscale` command, the alert (and an `env:check-host` fault, and `ttp hostcheck`
+  when the host does not answer) says what is wrong with it, from `tailscale debug prefs` and
+  `tailscale status --json`: logged out (sign in), not running (turn it on), or running and logged
+  in but not accepting subnet routes, where no sign-in is needed and the fix,
+  `tailscale set --accept-routes=true`, is offered for the user to run (never run by the harness: it
+  changes the machine's network settings). Tailscale that is fine, missing or not answering adds
+  nothing; it never reports a logout while Tailscale is logged in. When every
   failing host is already known down (a `ttp machines outage`, a down or held condition, a paused
   resource, an active mute, an open incident or a task naming it as down or under repair), the
   alert is a low feed line, never "needs you". When other queued tasks can still run later, it also
   counts the ones that wait on their own timers or checks.
+- ssh agent locked or waiting (model-free, sshagent.py): when ssh signs through a password
+  manager's agent (SSH_AUTH_SOCK names 1Password, Bitwarden, Secretive, KeePassXC or the like) that is
+  locked or waits for the user to approve, unattended ssh fails with `sign_and_send_pubkey: signing
+  failed`, `agent refused operation` or `communication with agent failed`, or a BatchMode ssh hangs.
+  That is told apart from a host fault: a waiting probe reads it as "not yet" (never 255, so no outage
+  alert and no machine down episode), `ttp ssh-preflight` exits 14 with `--classified` (else 1), a
+  remote check reports an environment fault naming the agent (the change never fails; the run waits
+  and retries) and a heal check reads it as unknown, never unhealthy or a fix. One normal alert per
+  episode names the cause and how to clear it (unlock the password manager or approve its request),
+  stays in the top section and clears with a low line after 30 minutes without a sighting. The
+  coordinator gets one `ssh_agent_locked` event and may offer, once and only through its ask path
+  (blocking access), a fallback: a separate key used only for unattended work, restricted to the
+  hosts the projects use (a per-host config entry with `IdentitiesOnly yes`, never forwarded), its
+  passphrase in the OS keychain (macOS `ssh-add --apple-use-keychain`, Linux the desktop keyring). On
+  the user's yes it shows the exact steps, and runs them only if the user says so. tt-project never
+  creates a key unattended.
 - The web app shows spend per day, per task and per recurring job, and plan-window peaks for the
   last two weeks.
 - A task's row in the web app shows its chain's metric trend (the task, what continues it, its fixes
@@ -1164,20 +1262,56 @@ Messages calls into `<base url>/chat/completions` calls and back, and ends with 
    tier's runs start on the core provider. A 404 for a model the endpoint does not serve (its wording
    names the model, or the endpoint's /models list leaves it out) is `model_missing` instead: no
    cool-down, but that tier's route holds, with one normal notice naming the provider, tier and model,
-   until `providers.chat.tiers.<tier>.model` changes or the daemon's model-free /models check (at
-   most hourly while a tier routes) lists the model again. That check stores only the served ids and
+   until `providers.chat.tiers.<tier>.model` changes or the daemon's model-free /models check (every
+   minute while a tier or run class routes to `chat`; `providers.chat.models_every_s`) lists the model
+   again. That check stores only the served ids and
    its time in the project state folder; `ttp status` and `ttp doctor` show them and any hold.
-   To keep work on the endpoint instead, set `providers.chat.model_ranking` to its model ids, smartest
-   first (for example by a public intelligence ranking you trust; empty by default, and nothing changes
-   without it). A routed start whose model is down, held as above or left out of the last good /models
+   To keep work on the endpoint instead, the daemon keeps a ranking of its model ids, smartest first,
+   in `providers.chat.model_ranking`: account-wide (`ttp config --account providers.chat.model_ranking
+   '["id-a", "id-b"]'`, in `~/.tt-project/settings.json`), so every project on the machine that uses
+   `chat` reads it; a project's own value wins (`[]` turns it off for that project). A model-free
+   refresher (`runtime/ttp/rankfresh.py`) keeps the account value current wherever `chat` has an
+   endpoint, with nothing to turn on: weekly (`providers.chat.ranking_every_s`, account-level, default
+   604800, at least 3600) and whenever the /models check lists a model no earlier refresh saw, it
+   fetches the Artificial Analysis Intelligence Index from its data API
+   (`providers.chat.ranking_source`, account-level, default
+   `https://artificialanalysis.ai/api/v2/language/models`) and ranks every served id seen so far by
+   it. Ids and index names are compared normalised (lower case, no org prefix or `:tag`, no
+   quantisation tokens such as `fp8`, with or without trailing variant words such as `reasoning`); an
+   id that matches nothing goes last, in sorted order, and is named in the log. One daemon on the
+   machine refreshes at a time. The API needs a key (a free one from Artificial Analysis; their data
+   needs attribution, which the log and feed line give): the daemon reads `ARTIFICIAL_ANALYSIS_API_KEY`
+   from its environment, else the first line of the file `providers.chat.ranking_key_file` names
+   (account-level, an absolute path; set by the user only, as is `ranking_source`, since the key is
+   sent there). The key never goes into settings, logs or prompts. Without a key nothing is fetched,
+   the last ranking stays and the account gets one user-only item asking for one, which clears once a
+   key is there. Each change (by the refresher or `ttp config --account`) appends one line to
+   `~/.tt-project/model-ranking.jsonl` (time, source and index version, old and new lists, trigger,
+   unmatched ids) and posts one low feed line; no change, no line. A failed fetch, or an answer that
+   matches no served id, keeps the last ranking (never empties it), retries an hour later and raises
+   one observation per outage (`error: true`). A routed start whose model is down, held as above or left out of the last good /models
    check, then runs the highest-ranked model that check lists and that no run was refused, at the
    tier's effort; its run's `route` record names the model it stands in for (`model_rank`). A stand-in
    that is refused too is skipped for a day and the next one runs. A task's own model pin on `chat`
    is swapped the same way, unless the pin is required (`pin_required`): such a task waits until its
    model is served again. With a ranking set, a queued or running task that pins a model on `chat`
-   also keeps the hourly check running, and a check over two hours old counts as none: nothing is
+   also keeps the check running, and a check over two hours old counts as none: nothing is
    swapped or held on it. Each switch is one low alert; once the model is served again (the hold ends
-   or the check lists it) the next start runs it. With no ranked model served, or the whole endpoint
+   or the check lists it) the next start runs it. A served model ranked above a route's own model
+   (tier, rule or run class; never a task's pin) is tried at once: light starts run it until 3 of its
+   runs end without a fallback, then every tier does. A run on it that fails on the model itself
+   (malformed answer, timeout, no hand-off) during those runs, or such faults in over a fifth of 8 or
+   more runs later, parks it for a week with one low alert; then it is tried again from scratch.
+   One shared daily bench per machine (`ttp model-bench run`, `runtime/ttp/modelbench.py`) keeps these
+   verdicts current: from 02:00 local time the first daemon on the machine whose `chat` provider has an
+   endpoint runs it (one machine-wide lock; the others find today's result in `~/.tt-project/model-bench/`
+   and read it; `ttp model-bench show` prints it and the owner). It sends six short prompts, graded by
+   fixed checks and never by a model (one plants an instruction the model must ignore), to the top four
+   served ranked models, every served model not benched before, and once a week to models that scored
+   under two thirds or that a project parked. A weak score keeps a model parked; a parked model that
+   passes is free again at once. With no working key for the endpoint no model is called: the day is
+   recorded as skipped and one low alert is posted per outage.
+   Endpoint faults (down, rate limit, auth) park nothing. With no ranked model served, or the whole endpoint
    cooling down, runs start on the core provider as before. Only `chat` has a served list: Claude
    Code, Codex and Cursor models are not ranked (provider failover covers a provider that cannot start
    work). Routed runs take worker slots under the `chat` gate (its
@@ -1193,7 +1327,8 @@ Messages calls into `<base url>/chat/completions` calls and back, and ends with 
    --runs`. Each fallback's reason (and, for a run's own end, a short `cause`) is in
    the run's `route` record. A run that hands off, even `failed`, is retried a tier up as usual.
    Some starts stay on the core provider before they run, with the reason `escalated`, its kind and
-   a short `cause`: an urgent or user-ordered task (landing in minutes outweighs the saving), a
+   a short `cause`: an urgent task of a hard class or a user-ordered task (landing in minutes outweighs the saving; an urgent
+   task's run in a cheap class, runclass.CHAT, keeps that class's cheap route: urgency only orders it), a
    review fix or failed-checks wake of a change its lineage wrote on the routed provider, and every
    later run of a lineage with two routed misses (routed runs that fell back on their own or handed
    off `failed`, and routed changes a review or failed checks sent back). The `routed 24h:` phrase
@@ -1210,7 +1345,8 @@ Messages calls into `<base url>/chat/completions` calls and back, and ends with 
    applies. Rules never route reviews, coordinator turns, pinned tasks, tier-up retries or conclusion
    and device runs, and while a rule list is set, urgent tasks, tasks whose hand-off asked for deep and
    tasks labelled `urgent`, `needs_deep`, `user_deep`, `review_fix` or `untrusted_input` stay on the
-   core provider, the tier's own route included. A missing-model hold applies to that tier's runs
+   core provider, the tier's own route included (a run class that is cheap by class takes no such
+   urgency: it routes by its class). A task labelled `untrusted_input` is never routed, by rule, tier or class. A missing-model hold applies to that tier's runs
    routed to that model only. The coordinator can set the list with `config_set` on your word.
    Routed spend uses the `pricing.chat` row for the model (or its `default` row:
    `[$/M input, cached input, output]`); with no row it is zero and labelled unpriced. Without a row
@@ -1279,13 +1415,25 @@ names, a continuation's parent diff stat, the lineage's earlier route outcomes a
 success rate over 14 days). A routed pick wins only above `dispatch.min_p` (0.6); Jev off, out of
 funds or unsure means core. The pick applies only at the tier it was picked at: a light wake, a deep or escalated start and a
 conclusion floor run start as with dispatch off, and a routed option needs the chat provider in
-`providers_allowed` and not the core provider. Each run note has a `dispatch` entry (by, pick, p); a Jev pick is logged
+`providers_allowed` and not the core provider. Each run note has a `dispatch` entry (by, pick, p, tier); a Jev pick is logged
 with the stratum's mean core cost per run over 7 days as its avoided cost and settles right when its
 task ends done on its first try with no fallback, wrong when it escalates; a core pick counts as no
 change. Jev's usual review switches the use off when it saves nothing or changes no decision.
 `ttp doctor` and the daemon name a bad dispatch setting: enabled with no option on the chat provider
 with a model (or the chat provider core or not allowed), a `min_p` outside 0 to 1 (0.6 is used), and
 an option that is not an object with a `provider` (ignored).
+
+Model-pick tripwire (`modeltrip.py`, model-free, inactive while dispatch is off): per stratum (kind,
+tier and one task label, `*` for any), each task open to routing (a Jev pick, or core because Jev was
+unavailable or the tripwire held it) that ended in the last `days` is a routed or a core sample; starts
+the rules force to core (hard, device, urgent and the like) count on neither side. A sample is bad when it failed, its last checks failed, a review of it failed or
+it got a review fix or continuation. Once both sides have `min_samples` and routed's bad rate is more than `margin_pts`
+points above core's, the stratum's tasks go to core (rule `tripwire`), a decision memory records it
+and one low notice goes out. Only a newer passing head-to-head result for that stratum turns routing
+back on (`ttp model-trip --h2h <kind/tier/label> --ok --ref <result>`); samples then count from it
+(a worse result moves no window).
+`ttp model-trip` lists the strata. Settings: `providers.chat.dispatch.tripwire` (`min_samples` 10,
+`margin_pts` 10, `days` 14).
 
 ## Asks
 
@@ -1436,6 +1584,27 @@ session and stateless coordinators on every provider.
 - Up to 6 workers per project run side by side (`budget.max_parallel_workers`); on a plan, all of
   them until the last stretch before the line. When a plan is below its line, slots sit idle and
   nothing is queued, the coordinator is asked for more work, less often each time it finds none.
+- On a laptop or workstation, one machine-wide limit caps the workers of all tt-project projects on
+  it together, so several projects cannot overheat it or make a call stutter. Each project's
+  `budget.max_parallel_workers` stays its own ceiling; a project cap above the machine limit is
+  clipped to it. Workers are agents that send suites, builds and device jobs to other boxes, so
+  the limit binds only when the machine itself is truly short; the load average and short spikes
+  never count. While nothing is short, only a `machine.max_workers` some project set caps the
+  machine (unset everywhere: each project's own caps alone apply). Under pressure the base is the
+  lowest `machine.max_workers` set (unset: the cores, 2 to 32), cut while CPU idle stays under 15%
+  in every reading for 60 s (x0.75; also under 5% now: x0.5; one low sample counts for nothing),
+  memory is short (macOS memory pressure warn, swap growing 64 MiB between readings, under 10%
+  free, or Linux memory PSI at 5: x0.75; critical, under 5% free or PSI 20: x0.5; macOS compressing
+  memory while it is still free counts for nothing), a call app holds the display awake while CPU
+  idle is under 30% (macOS `pmset -g assertions`: Zoom, Teams, Webex, FaceTime, Slack, or a WebRTC
+  call in a browser: x0.5; a call alone counts for nothing; only names are read and only a yes/no
+  is kept), or the machine is hot (thermal pressure serious or worse; Linux: a thermal zone at
+  90 C: x0.5). The limit is never below 1. An unreadable reading counts as not short, so the limit
+  holds at its base. The signals are read at most every 30 s for the whole machine and shared,
+  with each project's running workers and set base, in `TTP_HOME/machine-workers.json` under a file
+  lock; the lowest base a live project set holds, and each start claims its place under the lock. `machine.worker_limit` is `auto` (on for
+  macOS or a machine with a battery; off on lab and build servers), `on` or `off`; turn it off with
+  `ttp config <name> machine.worker_limit off`. Set values stay across upgrades.
 - Workers, reviewers, everything they start (detached checks, tests, reference models) and the
   daemon's pushes run at low CPU priority, 10 nice levels below the daemon (`runner.nice`, 0-19;
   0 = normal priority), so they never slow the machine's own work. The daemon and the coordinator
@@ -1459,14 +1628,25 @@ session and stateless coordinators on every provider.
   changelogs, changesets, manifests, `__init__.py`), `hub_bytes` (tracked files larger than this,
   150000, touched by most changes, never count), `branch_days` (14) and `settled_days` (14). Folders and the files the
   check commands (`delivery.push_checks`) name never count either: specs cite those as the required suite.
-- On macOS, while the project has work (a running run or push, or queued work that can start now)
+- tt-project never keeps a machine awake by default: `runner.prevent_idle_sleep` is `off`, and you
+  keep your Mac awake yourself as needed. Set it to `on` (or `auto`, on for a Mac) with
+  `ttp config <name> runner.prevent_idle_sleep on`; a value you set stays across upgrades. Then,
+  on macOS, while the project has work (a running run or push, or queued work that can start now)
   and the machine is on AC power, the daemon keeps it from idle and maintenance sleep with
   `caffeinate -i -s`, tied to the daemon's process so it ends with it. A closed lid without an
   external display, or a sleep you ask for, still sleeps the machine; the harness never changes
-  `pmset` settings. It lets go when the work ends, on battery, or with `runner.prevent_idle_sleep` set
-  to `off` (`auto`, the default, is on for a Mac; other platforms never hold one). `ttp status` and
+  `pmset` settings. It lets go when the work ends, on battery, or with the key set back to `off`;
+  other platforms never hold one. `ttp status` and
   the web app say when it is held, or why not while there is work, and say "the lid is closed: work
   pauses while the Mac sleeps" while a closed lid will sleep it.
+- Every ssh a project starts (probes, heal checks, checks-host runs, the daemon's own calls, and
+  workers' ssh and git over ssh) shares one connection per host for 10 minutes, so an ssh agent
+  that signs each new connection signs once per host, not once per command. The harness's `bin/ssh`
+  runs the real ssh with OpenSSH multiplexing (ControlMaster=auto, ControlPersist=600) and keeps
+  the sockets in `~/.tt-project/cm` (mode 700). Your ssh folder and config are never read or
+  changed, and `-F`, ProxyJump and BatchMode work as before. A call that sets its own sharing or
+  forwards ports is left as it is, and a shared connection that fails before the command starts
+  falls back to a direct one (OpenSSH's own). Turn it off with `ttp config <name> ssh.reuse false`.
 - A shared device or machine is taken per command, through its own queue (for example a device
   broker) or `ttp lock <resource> -- <command>`, so the rest of each task runs in parallel. A task
   marked exclusive holds the resource's lock for its whole run; while it waits for a slot, new
@@ -1689,6 +1869,17 @@ session and stateless coordinators on every provider.
   changes raises an alert naming it. Before a worktree is made, a root left detached or off its
   branch (`worktree.root_branch`, else the one it was last seen on) is put back when it has no
   uncommitted changes, else alerted; worktrees never start from such a HEAD.
+- Smoke before landing: `delivery.push_checks` gate every landing, so keep them under 10 min on
+  their host (aim 5). Slower tests belong in `delivery.post_land_checks`, which run after landing:
+  the daemon runs them detached on each new pushed sha, without a model. A failing test that passes on
+  a rerun is flaky (quarantined, not reverted); one failing before the landing too is not its. A new
+  failure is bisected over the landed changes to the guilty one, which is reverted forward on the
+  push branch through the push queue (never forced), and one code task is queued to fix it on its
+  failing tests alone. `ttp status` and the daily
+  review show the landing check time (median and p90, last 24 h and last 10 runs); over
+  `checks.smoke_max_s` (default 600 s) the project's coordinator gets one observation a day naming the
+  slowest tests (push-checks reference, "Smoke before landing"). `ttp status` also shows the waits:
+  checks wait to start and approval to landed (median and p90, last 24 h).
 - Where reviewed changes go straight to a shared branch, `ttp push` publishes them guarded: it
   refuses uncommitted changes, rebases onto the latest tip, runs `delivery.push_checks` on the
   exact commit it pushes, starts over if the branch moved meanwhile, and never forces. A
@@ -1894,7 +2085,11 @@ session and stateless coordinators on every provider.
   place and waits; running checks and the push branch's checks (its priority slot) go on. `ttp checks --slot-status` shows the values
   and the reason. A set cap wins: `ttp config
   --account checks.host_max N` (0 turns the cap off) or `TTP_CHECKS_HOST_MAX`; it is one value for every
-  project (a project's own copy is ignored and `ttp config checks.host_max` shows the account's). While
+  project (a project's own copy is ignored and `ttp config checks.host_max` shows the account's). A run with
+  no task takes the task and project of the project run it was started under; one with none queues behind
+  every project's waiter and, while one waits, such runs hold at most `checks.bare_slots` slots (default 1).
+  `ttp checks status` flags a holder that has held its slot `checks.idle_hold_s` (default 600) with no test
+  using CPU and names `ttp checks-yield`; it stops nothing. While
   the 1-minute load average is under half the cores, up to `checks.load_extra` more slots open (default 2,
   0 turns them off); check commands (`ttp checks`, push checks, pool shards, and on a remote or spill check host too, where it has the tools) run under `nice -n 19`/`ionice -c3` (idle IO), while the daemon, coordinator and workers keep their normal priority; `checks.nice` false, per project (`ttp config <project> checks.nice false`) or account, runs them at normal priority (`checks.nice` N, 0-19, sets the level; `checks.ionice` `idle` or `best-effort[:0-7]`; both per project or account). Each check
   run also takes test-worker slots from a host pool shared by all projects (testslots: default half the cores, at
@@ -1905,11 +2100,14 @@ session and stateless coordinators on every provider.
   (`checks.test_project_max`, below) times one run's grant, at most the pool, so every check under that cap gets its
   workers (3 checks at once with a grant of 8 make a budget of 24: each run gets 8, never the whole budget); `checks.test_project_slots` (chat-settable, a whole number of at least 1) sets the budget outright.
   Both stay within `checks.test_project_workers` (chat-settable, per project or account; default the smaller of 8 and
-  one per 8 cores, at least 2, plus the cores the larger of the 1- and 5-minute load, less one per test slot the project itself holds, leaves under
+  one per 8 cores, at least 2, raised to `checks.host_max` x `checks.test_run_min` within the test pool so every run the
+  host-wide cap admits can start, plus the cores the runnable CPU demand (as for the load guard, below), less one per test slot the project itself holds, leaves under
   0.75 x the cores, at most half the cores, so its own suites never shrink it; `checks.load_extra` 0 keeps the base; a shrink bounds new grants only), the most test workers one project's suites run at once, which also bounds one run's
   grant. No new suite starts while the host's runnable CPU demand is above its cores (the CPU limit,
-  `checks.load_guard`, a factor of the cores, default 1; 0 turns it off): it waits and its lane's wait note says
-  why; running suites go on. The demand is the busy cores, or the tasks running or waiting to run where more
+  `checks.load_guard`, a factor of the cores, default 1; 0 turns it off) at every reading over the last
+  `checks.load_sustain_s` (default 60 s; readings of all runs on the host, check-slots/cpu-demand.jsonl; 0 reads
+  the demand now alone), so a burst of short-lived git, ssh or python processes holds nothing, or while macOS
+  reports memory pressure at warn or critical: it waits and its lane's wait note says why; running suites go on. The demand is the busy cores, or the tasks running or waiting to run where more
   (/proc/stat over a few seconds; the 1-minute load average where that cannot be read). Unlike the load average
   it leaves out tasks waiting on I/O (D state), so a contended disk with idle cores holds nothing here: disk
   contention has its own I/O pressure limit (`checks.io_full_max`, above). `ttp checks status` shows both
@@ -1925,6 +2123,11 @@ session and stateless coordinators on every provider.
   checks wait there at most `checks.push_load_wait_s` seconds (default 300; `off`: no bound), then start on
   their branch's reserved lane alone, one per lane at a time. Heavy suites
   belong on another host where a project has one allowed (`delivery.checks_host`).
+  Checks that run on another host (a check's own `"host"`, `delivery.checks_host` or a spill host), with at most
+  light checks here, use none of this host's CPU: push checks and `ttp checks` take no host-wide checks slot or
+  test slots here and never wait for this host's guard. They wait instead while their host's runnable demand,
+  read over ssh from its `/proc/stat` (cached 30 s), is above `checks.load_guard` times its cores, at most
+  `checks.push_load_wait_s`, and say which host holds them; an unreadable host never holds them.
   Waiters are served first-come: one whose project is at its budget lets other projects go first but keeps its
   place in its project's line, where the most urgent task priority goes first, then arrival, so that waiter gets
   the next freed slots. A priority-1 check whose project's budget is held only by less urgent runs takes one extra
@@ -1984,10 +2187,15 @@ session and stateless coordinators on every provider.
   `daemon:checks_slot_wait` covers these events too (recorded `muted`); coalescing already keeps a long queue
   to one wake, so a mute is only for a queue the coordinator has already decided to leave alone.
   `delivery.checks_spill_hosts` (an ordered list of ssh aliases, default empty: checks never leave this machine)
-  lets a run that has waited `delivery.checks_spill_after_s` (default 60 s) here run on the first listed host the
+  lets a run that may spill try those hosts before it takes a place here (`delivery.checks_spill_first`, default
+  true; false: only after waiting `delivery.checks_spill_after_s`, default 60 s, here) and run, with the test
+  workers that host's idle cores give it (cores less its 1-minute load), on the first listed host the
   charter names, the machines list holds, no pause covers and whose `ttp lock <alias>` nobody else holds (the run
   holds it shared while it runs), where no device job runs, that ssh reaches and that has a free slot; others
-  are skipped with the reason and the run keeps its place here. A check that runs an agent CLI (`claude`, `codex`,
+  are skipped with the reason and the run keeps its place here. On a workstation or laptop,
+  `delivery.checks_remote_only` (default `auto`: on there; `true`/`false` overrides) makes a heavy run wait
+  for a busy spill host instead of taking a place here; it runs here, niced, only when every host is out of
+  reach. Light checks (plugin validate, quick lints) stay here. A check that runs an agent CLI (`claude`, `codex`,
   `cursor-agent`, also inside `sh -c`), such as `claude plugin validate --strict`, or says `"host": "local"`, stays
   on this machine while the run's other checks (pytest) spill, and the run gives one verdict for both parts. A
   failure of the part kept here counts at once. Only a check that is not a test suite or build splits off this
@@ -2001,13 +2209,22 @@ session and stateless coordinators on every provider.
   `checks.spill_beside_device` (ssh aliases, or `"*"` for every spill host; default none) names hosts where the
   project's own rules let its CPU-only checks run beside a device job: there the device job keeps no run off, a
   pause or a held machine lock still does, and the run and its `ttp status` line say it runs beside a device job
-  (`ttp config <project> checks.spill_beside_device '["host-a"]'`). The account's pool, `checks.spill_hosts`
+  (`ttp config <project> checks.spill_beside_device '["host-a"]'`). A spill host may be one host of a
+  machines-list entry with several hosts, written `<alias>:<host>` (`"cluster-a:host-b"`): it is allowed when its
+  machine is, a pause of the machine or the host keeps it off, the device gate and probe look at the host and the
+  run holds the machine's lock; single-host entries work as before. `checks.spill_pre_cmd` (user-set, no default)
+  is the project's own read-only pre-run hook, run here before a run spills to a host, with the host as its last
+  argument and `TTP_SPILL_HOST`, `TTP_SPILL_MACHINE`, `TTP_PROJECT` set (30 s bound): exit 0 goes, exit 75 skips
+  the host for now, any other exit is reported as a hook error and the host is skipped. It also runs on
+  `checks.spill_beside_device` hosts, so there the hook decides; tt-project ships no neighbour, serving-state or
+  site check (`ttp config <project> checks.spill_pre_cmd './tools/may-spill.sh'`). The account's pool, `checks.spill_hosts`
   (`ttp config --account checks.spill_hosts '["pool-a", "pool-b"]'`; only the user sets it, a run may only
   clear it with `[]`), follows each project's own list, so every project on the machine spills to it without a
   list of its own; its hosts need no charter line but must be in the machines list. A project's own `[]` keeps
   its runs here, pool included. Runs with a check host or the authoring tree never spill; runs behind
   `checks.wrap_cmd` spill only when the project sets `checks.wrap_needs_device: false` (they run there without
-  the wrapper; unset or true, the run stays here). Two settings drop the wrapper, for different cases.
+  the wrapper; unset or true, the run stays here, and its `checks.log` and queue-wait item say `no spill host can
+  take these checks` because neither `checks.spill_wrap_cmd` nor `checks.wrap_needs_device: false` is set). Two settings drop the wrapper, for different cases.
   `checks.no_device_cmds` (or `ttp checks --no-device` for one run) names commands that never need a device or
   the wrapper's lock (lint, unit tests): they run without the wrapper here too, and a run of only such commands
   may spill (`ttp config <project> checks.no_device_cmds '["ruff", "pytest -q tests/unit"]'`).
@@ -2021,8 +2238,10 @@ session and stateless coordinators on every provider.
   entries too), `"spill": true` lets it spill even with `"host": "local"`, `"spill": false` keeps it here (left out:
   a check with host `local` stays here, others follow the pool rules), and `"spill_wrap_cmd"` overrides the
   project's remote wrapper. A remote wrapper missing or not executable on the host is a host fault: the check never
-  runs unwrapped. The order when the slots here are full (the project's lanes or the host-wide checks cap): an
-  urgent run asks the spill hosts at once, others after `delivery.checks_spill_after_s`; the first listed host
+  runs unwrapped. A wrapper that refuses a run (say, a busy host) writes the file `$TTP_WRAP_REFUSED` names and
+  exits 75: a host fault too, so the check runs again elsewhere; exit 75 without that file reads as a failed check. The order: a run asks the spill hosts first (with `delivery.checks_spill_first` false, only
+  once the slots here are full: an urgent run at once, others after `delivery.checks_spill_after_s`); a run
+  waiting here (its lanes, the host-wide checks cap or the load guard) asks again after each such bound; the first listed host
   that is allowed, free and reachable takes the run; only when every one is full, paused or unreachable does it
   wait here (and try them again after the same bound). A run that does not pass on a spill host runs again in
   the same order, keeping off the hosts its checks failed on (one whose own fault ended them, such as a pause
@@ -2119,7 +2338,11 @@ session and stateless coordinators on every provider.
   `ttp checks --freeze-lock <file>` writes one that pins the user site's packages too (tt-project-harness
   push-checks reference, "The pinned Python env"). `checks.wrap_cmd` (project setting, default unset) runs each command given after `ttp checks --`
   behind the project's own lock or queue command, the command passed as separate arguments; a missing wrapper
-  fails the checks, and `delivery.push_checks` never go through it. A wrapper running its own test pool starts
+  fails the checks, and `delivery.push_checks` never go through it. A plain string applies to every repository;
+  `{"cmd": "<command>", "repos": ["<repo key>", ...]}` scopes it to the repositories it serves (keys as in
+  `delivery.push_checks_by_repo`), and checks elsewhere run unwrapped. A wrapped command the wall-time cap stops
+  before any test started is a wrapper or queue timeout (exit 75, `infra_fault: "wrapper-queue-timeout"`), never a
+  test failure. A wrapper running its own test pool starts
   each shard, local or over ssh, as `ttp checks-shard -- <cmd>`, so the shard counts toward that host's checks slots.
   A check command that waits on an outside CPU pool (a test gate waiting for a pool slot) gives the run's host-wide
   checks slot up while it waits: it runs `ttp checks-yield` before the wait and `ttp checks-yield --resume` before
@@ -2135,7 +2358,10 @@ session and stateless coordinators on every provider.
   wrapper command (a CPU pool's `ttp lock`, say) or `unwrapped` (no wrapper, TTP_NO_DEVICE=1 set). The pass
   line and checks.json (`fallback_lane`) name the lane and the pause; off, or with the fallback paused or
   unable to serve, the run waits on the pause (exit 75), never fails. A pytest `-n N` above
-  the grant is lowered with a line saying so; a worker's own pytest above TTP_TEST_SLOTS is refused. Builds
+  the grant is lowered with a line saying so. A worker's own pytest with more than one worker takes slots of the
+  same pool through `ttp clip` or `ttp sandbox` (at most TTP_TEST_SLOTS; fewer, or a wait of up to 4 minutes
+  then one worker, while other runs hold them), held by the test process until it ends or dies; its `-n N`
+  outside both, or above TTP_TEST_SLOTS, is refused, and a bare `-n auto` starts one worker. Builds
   (make, ninja, `cmake --build`) take slots of a second host pool of the same size, the build pool (`checks.build_pool`,
   `checks.build_run_max`, `checks.build_project_max`; 0 pool turns it off), so a long build never takes a test slot: workers
   get one run's share as MAKEFLAGS=-j<k> and CMAKE_BUILD_PARALLEL_LEVEL=<k>, and `ttp clip` of a build holds k build
@@ -2163,11 +2389,9 @@ session and stateless coordinators on every provider.
   project leave it their next free test slots. More urgent runs keep their precedence under a backlog,
   but once `checks.priority_turns` N of them (default 3 when it is unset; 0 lets the aged run go first)
   started while it waited, the aged run takes the next turn, so it still starts within a bound; priority-0
-  runs are never held by a less urgent one, and a priority-1 run leaves less urgent aged runs of its
-  project one shared turn per N urgent starts since the project's last routine start, taken by the oldest
-  (a long routine backlog holds it for at most that one run). A run at least 4 times cheaper (a targeted
-  run beside full suites) is not held by an aged run of its priority or a less urgent one; a landing's run
-  still is. A short targeted run (fewer than `checks.small_tests` tests, account-level, env
+  and priority-1 runs are never held by a less urgent aged one (unless `checks.priority_turns` is 0). A run
+  at least 4 times cheaper (a targeted run beside full suites) is not held by an aged run of its priority
+  or a less urgent one; a landing's run still is. A short targeted run (fewer than `checks.small_tests` tests, account-level, env
   `TTP_CHECKS_SMALL_TESTS`, default 500, 0 off) goes first among its project's waiters at its priority
   in the queue and is held by no longer parked run of its priority or a less urgent one (a landing's
   still holds it); the cap and every other rule hold it as any run. An urgent run (priority 0 or 1: a task owed to the user,
@@ -2182,7 +2406,9 @@ session and stateless coordinators on every provider.
   command, frees its slots and queues again at its old arrival, ahead of every later arrival of its
   project, keeping every pass and log it recorded (a pinned run keeps only passes on its pinned commit
   and reruns the rest there), and the urgent run takes the freed slot: a short-lived claim keeps it
-  from every other waiter while the urgent run lives and still waits for it, and lapses within 30 s
+  from every other waiter while the urgent run lives and still waits for it (one that asked while
+  waiting for its test slots keeps it while the preempted run stops, up to 60 s from its ask, and lets
+  it go if it still cannot start 3 s after the slot frees), and lapses within 30 s
   otherwise (a lapsed claim's request asks nothing). An urgent run waiting for its test slots asks
   only a run whose stop leaves its project's test budget and the host's test pool room for it; else
   nobody. Its log and its task's notes say `preempted by urgent #<task>`, its queue entry in
@@ -2195,9 +2421,9 @@ session and stateless coordinators on every provider.
   the urgent run that has waited longest, never whichever happens to look first. `ttp checks --preempt
   <run>` sends the same request by hand to run `<run>`'s checks, with the asker logged in the host's
   check-slots folder (`preempt-asks.jsonl`); it refuses push checks, owed runs, runs behind a lock and
-  runs on a reserved urgent slot. The freed slot goes to the next waiter in queue order. A routine run whose task
-  turns urgent while it waits notices within 30 s and re-executes once as an urgent run, at the same
-  arrival. `ttp status` shows `urgent slot beyond the cap: ...` while one runs. While any run waits for test slots, push
+  runs on a reserved urgent slot. The freed slot goes to the next waiter in queue order. A run whose task's
+  priority changes while it waits (raised to urgent or lowered) notices within 30 s and re-executes to
+  queue at the new priority, at the same arrival. `ttp status` shows `urgent slot beyond the cap: ...` while one runs. While any run waits for test slots, push
   checks use only their branch's reserved test slot. There is no
   separate outage marker: priority 1 is the signal. Accepted gap: while a host mixes runtimes from
   before this, their waiters may disagree on who is next and a slot can sit idle until another frees.
@@ -2410,8 +2636,8 @@ session and stateless coordinators on every provider.
   fast path: when every changed path matches one and none matches `delivery.checks_fast_exclude`
   (by default code, scripts, manifests, tests, templates and skill/prompt files; a list replaces
   it), `ttp checks` runs only the whitespace and CRLF checks and says so. That pass is not a full
-  pass: it never counts for a PR or `on_pass`. `ttp checks --full` runs the project's checks
-  anyway (it is kept when the checks are queued or relaunched after a reboot), and a full pass
+  pass: it never counts for a PR or `on_pass`. `ttp checks --fresh` (or `--full`, where it is not
+  refused) runs the project's checks anyway (it is kept when the checks are queued or relaunched after a reboot), and a full pass
   already recorded for the tree is reused. A scoped `push_checks` entry that applies also turns it
   off. Known gap: a project that opts in owns its globs. A glob that covers installed or
   test-asserted content (for example a plugin README that tests read) skips the checks those
@@ -2428,13 +2654,23 @@ session and stateless coordinators on every provider.
   A targeted pass counts only for that narrowed run: it never counts as the full check's pass and
   sets no verified-through marker. `ttp push` and the push queue never narrow: every batch runs the
   full required checks. `delivery.checks_targeted: false` (or `ttp checks --full`) restores full
-  runs. With the push queue on, the batch's full run on the merged tree (bisected to the changes at
-  fault when it fails) is the full-suite gate, so a task's own checks run in full only where the
-  whole suite is affected (a conftest, a shared test helper or fixture, the checks runner's own
-  files, a manifest, `__init__.py` or config file, a test file's module-level code); a selection of
-  half the suite or more stays targeted. A change only the full suite covers (a module's module-level code, the checks functions in
-  a module, something no test names) adds the tests it can place, and the scope line ends `; the push
-  batch runs the rest: <reasons>`. Checks already waiting for a slot re-execute on the new runtime
+  runs. With the push queue on, the push train's full run on the merged tree (bisected to the changes
+  at fault when it fails) is the only full suite, so a task's or review's own checks never run in
+  full: a change that would widen to the whole suite (a conftest, a shared test helper or fixture,
+  the checks runner's own files, a manifest, `__init__.py` or config file, a test file's module-level
+  code) runs only the units importing or naming the changed file, plus those naming a function or
+  fixture it changes, and a selection of half the suite or more stays targeted. A task's
+  `ttp checks --full` is refused with a one-line reason unless the user set
+  `delivery.checks_task_full: true`; `ttp checks --release` (the release cut's required suite) always
+  runs in full: never narrowed, refused or fast-pathed. A change only the full suite covers adds the tests it can place,
+  and the scope line ends `; the push batch runs the rest: <reasons>`. With the push queue off a
+  task's checks narrow and widen as before. Each checks run records its wall and CPU seconds
+  (`wall_s`, `cpu_s`) in `checks.json`; `ttp stats <name> --landing` shows per day the test runs and
+  full suites, CPU-hours and $ per landed change, and approved to landed (median and p90), then over
+  the last 24 h and 7 d the booked spend over the commits landed on the push branch (merges and
+  version bumps left out) and the subagents those runs started (each run's note keeps
+  `subagents_spawned` and `subagent_types`, counted from its Agent calls; their cost is already in the
+  run's own). Checks already waiting for a slot re-execute on the new runtime
   and pick their scope again.
 - `ttp checks -- <cmd>` adds a check. Several words run as that argv (`ttp checks -- pytest -q`);
   one quoted string runs through the shell (`ttp checks -- 'FOO=1 pytest -q && ruff check .'`);
@@ -2507,32 +2743,48 @@ session and stateless coordinators on every provider.
   since rewritten goes after that change (in the same batch when both are approved, else it waits
   for that landing, at most two hours), so it is rebased and re-reviewed once instead of losing
   its approval at each of the other's landings; a failed check fails the
-  review and wakes the coordinator. The batch finds the first change that fails by checking
-  prefixes, pushes the ones before it, and checks the ones after it once more without it, pushing
-  them too when they pass. A failed pytest check is judged as `ttp checks` judges one: its failing
+  review and wakes the coordinator. When the whole train fails, the batch checks prefixes, and the
+  first one that passes every push check pushes at once: it is never checked again and no change
+  joins it, and the changes after it go untested and unblamed into the next train on the new tip.
+  Only when even the first change fails alone is it blamed; the ones after it are then checked once
+  more without it and pushed when they pass. A failed pytest check is judged as `ttp checks` judges one: its failing
   tests (at most 10) not yet judged at that head rerun once there, within `push_rerun_s` (default
   600), and those failing again rerun on the tip alone, on the same host, up to 3 times. A test that
   passes on its rerun is flaky (quarantined), one that fails on the tip too is pre-existing, and a
   quarantined test the batch does not touch is excused at once: when none is new the check passes,
   the batch goes on and the coordinator is told once per test so a fix gets queued. A check that did
-  not exit 1, or that pytest stopped early (`-x`, `--maxfail`, an interrupt), is never rerun. The
-  search runs only the new failing tests at each prefix and the full suite once, at the prefix they
-  pass on. Keys, all under `delivery`: `push_batch_s` (default 300: with
+  not exit 1, or that pytest stopped early (`-x`, `--maxfail`, an interrupt), is never rerun. A test
+  the tip fails on its own is pre-existing for the whole batch, so it blocks none of its changes; tests
+  whose id matches `push_hard_tests` (a regex, default `leak`: the leak scan) and a failed check that
+  names no test ids still block. The batch's checks spill as `ttp checks` does: with
+  `delivery.checks_spill_hosts` set and spill first on, each check that may spill runs on the first free
+  spill host with that host's worker grant (a fixed `-n N` above it is lowered to it), the rest here; a
+  spill host's own fault (ssh, the host) reruns that check on the next free spill host, else here, and
+  never fails or holds the batch. Only a check's first full run spills: every rerun of its failing tests
+  (the judge's, the search's) runs here, with its test selection. `ttp checks status` shows each run on a spill host, and each run that
+  stayed on the project host with why. The search runs only the new failing tests at each prefix and the full suite once, at the prefix they
+  pass on, which then pushes. Keys, all under `delivery`: `push_batch_s` (default 300: with
   no review running or ready an approval starts a batch at once; otherwise the batch starts once the
   oldest approval waited this long; 0 = at once), `push_batch_max`
-  (default 8: start at once with this many; also the most one batch takes, except that after a
-  clean batch a bigger backlog grows the batch up to three times this), `push_min_gap_s`
+  (default 8: start at once with this many; it caps nothing: one train takes every approval due), `push_min_gap_s`
   (default 1800: after a batch that did not end clean, such as a failing tip or a dead batch, the
   next starts only once it ended at least this long ago, measured
   from its recorded end so a restart never stretches the wait; none after a clean batch, though a
   new batch never starts while the last one's after_push still runs; a full batch, a
   priority 1-2 review's approval, or one the last batch requeued unchecked after a failing change
-  starts at once; 0 = off). Approvals that waited while the last clean batch ran start the next one
-  at once, and priority 1-2 approvals always lead it. Within a priority, an approval an earlier batch
+  starts at once; 0 = off). Approvals that waited while the last batch ran start the next one as
+  it ends, clean or not, and priority 1-2 approvals always lead it; when such fast approvals start a
+  train before the window, every other approval due rides in it. `push_age_s` (default 14400, 4 h; 0 = off):
+  an approval of priority 3 or worse sorts one priority better per this many seconds it has waited,
+  never better than priority 2, so a steady stream of priority 1-2 approvals cannot keep it out of
+  batches; aged to priority 2 it is older than that stream and leads it, while priority 1 and urgent
+  approvals still go first. `ttp eta` of an approved change counts the approvals ahead of it and the
+  measured batch time. Within a priority, an approval an earlier batch
   sent back as a conflict leads, so a peer ahead of it cannot send it back a second time: an older
   routine approval sharing its files is not independent of it, and a solo-path batch takes it first. `push_solo_paths` (default `[]`, off:
   git pathspecs a batch takes at most one routine approved change touching; the oldest such change
-  leads the next batch and priority 1-2 ones are never held. Two prompt changes that fit a size cap
+  leads the next batch and priority 1-2 ones are never held (by their own priority: one aged by
+  `push_age_s` is still held, one per batch). Two prompt changes that fit a size cap
   alone but not together need no such rule: the batch's cap probes find the one that breaks it),
   `push_cap_tests` (a regex of prompt size cap test names, default `(?i)prompt\w*_(?:stays_small|under_its_cap|size)$`; the `$` anchor means a
   parametrized cap test id (`name[param]`) needs a custom `push_cap_tests`:
@@ -2927,6 +3179,7 @@ is open raises one `cap_wait` event naming the key.
 |---|---|---|---|
 | `device.max_tasks` | one per device resource, at most the worker slots, at least 2 (old: 2) | device tasks preparing at once | convenience |
 | `review.unreviewed_per_pass` | `budget.max_parallel_workers` (old: 2) | reviews the backstop sweep queues per pass | convenience |
+| `review.auto_fix_rounds` | 1 (old: 2) | daemon-queued fix and re-review rounds per stack before the coordinator decides | convenience |
 | `review.sweep_after_s` | 300 s (old: 1800) | a code task left in review before its review is queued | convenience |
 | `review.unreviewed_wait_s` | 1800 s | a code task waiting externally (a busy lock too) before the backstop reviews its head | convenience |
 | review sweep cadence (`REVIEW_SWEEP_EVERY_S`) | 300 s | how often both review sweeps look | convenience |
@@ -2934,7 +3187,8 @@ is open raises one `cap_wait` event naming the key.
 | `coordinator.review_stall_s` | 1800 s (old: 14400) | a dependency in review before the coordinator hears of it | convenience |
 | `checks.test_project_max` | from cores and memory, at least 2 (`auto`) | a project's suites at once | convenience |
 | `delivery.push_batch_s` | 300 s, none after a clean batch | changes gathered into one push | convenience |
-| `delivery.push_batch_max` | 8 | most changes in one push batch (a full batch starts at once; a backlog after a clean batch grows it up to 3x) | convenience |
+| `delivery.push_batch_max` | 8 | approvals that start a push train at once; one train takes every approval due, so it caps nothing | convenience |
+| `delivery.push_age_s` | 14400 s (4 h) | a priority 3+ approval in the push queue sorts one priority better per period waited (never past 2) | convenience |
 | `coordinator.burst_window_s` | 120 s (0: off) | high events after a turn high events woke, until one follow-up turn reads them all; never user messages, critical or safety-class events | convenience |
 | `retry_when` / `start_when` probe (`waiting.poll_s`) | 90 s (20-180 s); only a `start_when` probe of an arbitrary command that keeps saying not-yet backs off, to at most 600 s (`MAX_EVERY_S`) with the wait's length; landing (`landed:#`, ttp landed), job (detach --check), checks --result, push --result, lock --probe, CI, ack-wait, upstream --fixed and date (`test "$(date ...`) probes, and every `retry_when` probe, keep `waiting.poll_s`; a pass wakes the task at once whatever its timer | a waiting or deferred task before its probe runs again | convenience |
 | auth re-probe (`AUTH_PROBE_S`) | 900 s | work for a logged-out provider with no login check, before one run checks it | safety (spend) |
@@ -2943,6 +3197,7 @@ is open raises one `cap_wait` event naming the key.
 | `checks.host_max` | from the host's cores and load | suites on one host | safety |
 | `delivery.push_min_gap_s` | 1800 s, only after a batch that did not end clean | the next push | safety |
 | `budget.max_parallel_workers` | 6 | worker runs at once | safety (spend) |
+| `machine.worker_limit` / `machine.max_workers` | auto (laptops and workstations) / null: binds only under real pressure (then the cores, 2-32), paced down | worker runs at once across all projects on the machine | safety (host) |
 
 ### Queue waits over 30 minutes
 
@@ -3034,8 +3289,9 @@ after that line merges cleanly. A block that already sits right after upstream's
 is moved after that line by the upgrade itself, keeping both import lists. When a project only added
 lines to a template prompt, the upgrade fences them that way itself. Only a real overlap, such as
 the project and upstream rewording the same line, or each adding its own version of one line (the
-same leading key, or most of the text alike), goes to a harness task, at most one per
-`upgrade.task_every_h` (6) hours; releases meanwhile wait and the next task merges the newest.
+same leading key, or most of the text alike), goes to a harness task, queued at once with at most one
+open; a newer release retargets it. One that ended without landing holds off the next only until a
+newer release or an edit to the project's own runtime or template files, never on a timer.
 The same conflict deferred past 48 h, or past two harness tasks that ended without landing it,
 reaches the coordinator once as a normal observation, not once per deploy.
 
@@ -3107,7 +3363,13 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   priority-1 harness task per change naming the project's tools (bin/, hooks/, schedule commands,
   prechecks and heal checks, open tasks' `start_when` probes) that still carry the old item's terms,
   and a `restriction_tools` event says so; the digest shows a "Guards behind the charter" line while
-  that task is open. It never edits a tool. The charter guard's refusal says a user's loosening
+  that task is open. It never edits a tool. A tool is picked only by the item's distinctive terms:
+  identifiers, quoted phrases, user-message cites (#N), values with a unit (900 W), machine and
+  resource names, or two of its words with one rare in the tool tree. The harness's own words
+  (item, Restrictions, scope, limit, exception) never count, and for a removed item neither does a
+  word another charter item still states. An `over` naming the done or landed code or harness task,
+  or a commit on the project repo's HEAD, that already updated the tools queues nothing.
+  The charter guard's refusal says a user's loosening
   goes in as written, and offers the temporary-exception route only when the user's own words make
   it temporary.
 - A scoped exception for work you (or, in agent mode, your agent) ordered goes in without new
@@ -3220,6 +3482,39 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   mutations), `gh release` create, edit, delete, upload and delete-asset, `gh pr update-branch` and
   `gh repo sync` of a named repo; reads of the same endpoints pass, and the hook refuses the same
   requests sent by curl and the like. PR merges follow the charter's merge policy.
+- A run whose task carries the `untrusted_input` label (its input, such as a PR comment, an issue body
+  or a CI log, may carry planted instructions) gets three more guards, model-free (untrusted.py). The
+  label is read from the task's record; `TTP_UNTRUSTED_INPUT=1` also turns them on (a benchmark cell
+  without a project) and nothing turns them off. A run without the label is unchanged.
+  - Pushes: git's pre-push hook refuses every ref but the task's own branch (its recorded branch) and
+    the push branch, so a new branch, a tag or a delete is refused, and the hook refuses a raw
+    `git push` naming the push branch: that branch is reached only through `ttp push`.
+  - Writes: `gh api` with a write method, a field or input body or a GraphQL mutation; every other gh
+    subcommand but reads (`view`, `list`, `diff`, `checks`, `status` and the like), so `gh pr comment`,
+    `gh issue create` and `gh pr review`; curl with a method other than GET, HEAD or OPTIONS, a data
+    or form body or an upload; wget with a post body or `--method`. A task that must post carries the
+    label `untrusted_write` too, set by whoever writes the task and never read from its wording;
+    pushes and credential reads stay refused with it.
+  - Credential reads outside the run's worktree, in a Bash command's words (also inside `sh -c`) or a
+    Read, Grep or Glob path: a file in a credential folder (`~/.ssh`, `~/.aws`, `~/.azure`, `~/.gnupg`,
+    `~/.docker`, `~/.kube`, `~/.password-store`, gh's and gcloud's config, the keyrings), a known
+    credential file (`.netrc`, `.git-credentials`, `.npmrc`, `.pypirc`, `.pgpass`, `.my.cnf`, `.env`,
+    `auth.json`, `hosts.yml`, `shadow`), a private key or certificate (`.pem`, `.key`, `.p12`, `.pfx`,
+    `.jks`, `.ppk`, `.gpg`, `.asc`, `id_*` but `.pub`), a name with token, secret, credential,
+    password or API key in it, a process's `environ`, and environment dumps (`printenv`, a bare `env`,
+    `export` or `set`).
+  The label is set per source, model-free: on a PR-findings fix the daemon queues and on a shared check
+  failure's fix (they quote comments, CI and test logs); on a coordinator `task_add` that sends
+  `untrusted_input: true` or whose spec carries a peer note's `[note <fp>]` tag; and on the task of a run
+  that read web, connector or downloaded text (the hook records the source in the run dir's
+  `untrusted-input` file, the guards apply to the rest of that run at once, and the daemon labels the task
+  when the run ends). Continuations, review fixes and reopened copies of a labelled task inherit it, and
+  nothing clears it. A labelled task never routes to the chat provider; its run note records `untrusted_input`.
+  The hook (Claude Code, Codex, Cursor and the stream guard) and the run's `bin/git` and `bin/gh`, which
+  scripts reach too, apply them on every provider. Known gaps: a path or command a script or inline code
+  builds at run time (git and gh stay guarded), other HTTP clients, a GET carrying data in its URL and
+  connector (MCP) writes, which keep the AI-tag guard. `ttp.untrusted.guards_live()` tells routing code
+  that these guards ship.
 - A session coordinator's Read, Grep and Glob calls are refused on the credential files listed at
   its launch and on what the worker hook's file tool check refuses.
 - Guards in the harness are a second line. Give the account the harness uses a fine-grained token
@@ -3241,6 +3536,44 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   only the secret names, the task and the time. A request the daemon has not started within 90 s, or
   when the worker's call is stopped (SIGINT or SIGTERM), is withdrawn and never runs later; one
   already started keeps running.
+- Where keys live is chosen per machine with `ttp secret store <backend>` (no argument: show it). It
+  writes `~/.tt-project/secret-store.json`, which holds no secret:
+  - `file` (the default): `secrets.json` in the ttp home, mode 0600.
+  - `keychain`: the macOS login keychain, service `tt-project-secrets`; written through `security -i`
+    on stdin, so no value is ever on a command line.
+  - `command -- <fetch command>`: a program run whenever ttp needs the keys; it prints the whole store
+    as one JSON object on stdout and exits 0. Read-only: ttp never writes to it. Its stderr is never
+    repeated, and a failure names only the program and its exit code.
+  - `env`: `TTP_SECRETS_JSON`, read once and removed from the process environment so no child
+    inherits it. Read-only. It serves only the one process given the variable (a script, a CI job):
+    a process not given it reads the store as unreadable, never as empty. The daemon refuses to start
+    on a machine whose store is `env` (exit 2, and drops the variable either way): its runs and the
+    hooks the agent CLI starts (outbound scans, the pre-push scan) are not its children and could
+    never see it. Where a daemon runs, use `keychain` or `command`, which every process reads itself.
+  Keys read from a keychain, command or env store live only in the process's memory and are read
+  again at most every 60 s.
+- Masking fails closed. When the store cannot be read and no value was ever read in that process, a
+  run's last masking step prints `runner: could not mask stored secrets in the run: <cause>` in its
+  log and records `unmasked` (the cause, never a value) in `exit.json`; if the daemon cannot read it
+  either, it logs that and raises one `secrets_unmasked` event per cause. Outbound posts (`ttp notify`,
+  `ttp note --to`, `gh` from a run) and the pre-push scan are refused while the store cannot be read,
+  except in a run whose sandbox hides the store by design (the write fence), which is scanned as before.
+- A shared or build host keeps no plaintext keys: `ttp secret store <keychain|command|env> --shared`
+  marks it. There the file store refuses to save, `ttp new --host --copy-secrets` and `ttp secret push`
+  to it are refused on the far side (exit 3), and a `secrets.json` already there is reported by
+  `ttp secret store`, `ttp secret show` and `ttp status` (never deleted: move its keys to the store,
+  then delete it yourself). A `secrets.json` on a host marked shared whose store is still `file` (the
+  marker written by hand) is still read, never written, and reported as such.
+  `ttp new --host` copies no keys unless `--copy-secrets` asks for it.
+- A central secrets service (a company's vault or broker) plugs in as a `command` store: any program
+  that authenticates the way the service wants (a short-lived machine or user identity, not a key
+  file) and prints the JSON object. A service needing more (writes, per-key reads) is one more entry in
+  `BACKENDS` in `runtime/ttp/secretstore.py`: a load function returning the dict, a save function or
+  the read-only one. The worker hook refuses Bash calls naming the keychain item, the configured fetch
+  command or `TTP_SECRETS_JSON`.
+- Pushes go out from a trusted machine (the owner's workstation) over HTTPS with the forge's own
+  credential helper (for GitHub: `git -c credential.helper='!gh auth git-credential' push`), so no
+  build box needs a push key; a build box's project hands its commits to that machine to push.
 - Workers run without a sandbox by default (no bwrap, no network or PID namespace; sudo works).
   When the agent ends, the runner ends what it left in its process group (but a pid the hand-off lists
   in `leftover_procs` with how and when it stops) and the run's own sandbox trees nothing owns any more:
@@ -3322,7 +3655,11 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   raw or JSON-escaped, becomes `[private key redacted]`, as does a block cut short or a lone BEGIN or
   END line. Beyond the places above it is masked in `ttp note` text, the `ttp say` outbox, `ttp
   status` and `ttp logs` output and every web app answer. A running worker's own files hold what it
-  printed until the run ends; the web app and `ttp status` mask it when they show it. The Claude Code
+  printed until the run ends; the web app and `ttp status` mask it when they show it. A detached job's
+  log is masked once the job's last process exits, and detached checks mask checks.log and checks.out
+  as they end. The daemon reads at most 8 MiB of each run file and spends at most
+  10 s per run on this; a bigger file is masked by a separate background job, with no lines lost. A block cut short in plain text is masked through its last key
+  line, so prose after a quoted marker line is kept. The Claude Code
   and Codex session transcripts are masked at run end; Cursor and the `chat` provider keep none the
   harness knows of.
 - A run's outward writes are scanned before they leave, model-free (`ttp/outscan.py`), so a stored
@@ -3432,8 +3769,10 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   and the daemon log say so.
 - On Claude Code, worker, reviewer and every other run but the coordinator's write the prompt cache
   at `budget.worker_cache_ttl`: `5m` by default (a write at 1.25x input instead of 2x; calls within a
-  run are rarely 5 minutes apart), `1h`, or `off` (the agent's own default). The coordinator keeps
-  `coordinator.cache_ttl`. Codex and Cursor have no such switch.
+  run are rarely 5 minutes apart), `1h`, or `off` (the agent's own default, which on a Claude
+  subscription is 1h). A replay of a day of live runs found 1h cost 11% more for workers and 27% more
+  for reviews, and no rule picking 1h at a run's start saved more than 2%, so 5m stays set
+  explicitly. The coordinator keeps `coordinator.cache_ttl`. Codex and Cursor have no such switch.
 - Long command output stays out of a worker's context: `ttp clip -- <cmd>` and `ttp checks` keep
   it in a file and show a test run's failures (else head and tail). On Claude Code, Bash output
   past `budget.bash_output_max_chars` also goes to a file. A worker compacts its own context inside
@@ -3441,13 +3780,24 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   `budget.split_reread_tokens` is off (0) by default; a project that sets it tells a worker whose
   run re-reads more than that once to hand the rest on as a follow-up; its run note records when, and `ttp stats` shows what steered runs re-read after it and how they handed off.
 - Every worker and reviewer run starts from the coordinator's context (`coordinator.session.worker_context`,
-  default `fork`). On Claude Code it continues a copy of the coordinator's saved session (same provider,
-  written within `worker_fork_max_age_h` hours) at any size, with its own prompt as the first new turn,
-  and compacts in place inside that session if it must; `worker_fork_max_tokens` above 0 caps the size
-  (default 0: no cap). The coordinator's own session is never written. Otherwise, and on Codex, Cursor and
-  the chat provider, the prompt leads with the coordinator's context on disk: the open order ledger, its
-  latest session note and the last chat exchanges (`worker_chat_chars`). `disk` skips the fork, `off`
-  both. The run note's `coord_context` says which one a run got. Workers run independent parts in
+  default `fork`). It continues a copy of the coordinator's saved session (written within
+  `worker_fork_max_age_h` hours) at any size, with its own prompt as the first new turn, and compacts in
+  place inside that session if it must; `worker_fork_max_tokens` above 0 caps the size (default 0: no
+  cap). The copy works where the run's provider saves sessions in the coordinator's format: Claude Code
+  and the chat provider (which runs Claude Code) fork a Claude Code coordinator's session, Codex a Codex
+  coordinator's rollout. The coordinator's own session is never written. Otherwise, and always on Cursor,
+  the prompt leads with the coordinator's context on disk: the open order ledger, its latest session
+  note and the last chat exchanges (`worker_chat_chars`). `disk` skips the fork, `off` both. A follow-up
+  (a task labelled `continues:<id>`: a continue hop, a daemon review fix, a rebase, a re-review) first
+  resumes a copy of the session of its own last ok run, or before it has one, of the last ok run of the
+  task it carries on, with the coordinator's context since that run (open orders, its latest note, the
+  chat since) leading its prompt; that session is never written. A first review continues no task, so
+  it stays independent of its author's session. Where that session cannot be copied (another
+  provider's format, a missing transcript, an earlier rejected copy), the run takes the coordinator
+  fork, then the disk block. The run note's `coord_context` says how a run started (`fork` with the
+  provider it copied `from`, `resume` naming its source `run`, `disk` or `none`), so the fork rate
+  counts per provider, and `ttp stats --coord-session` shows the share of each per day and how many
+  follow-ups resumed. Workers run independent parts in
   parallel subagents; their spend counts in the run's cost.
 - `ttp killscan <script>` flags kills by name or pattern (`pkill`, `killall`, any `pgrep` or
   `pidof`, `ps | grep` feeding a kill) before a worker runs a script; `--shim <dir>` writes
@@ -3470,9 +3820,11 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   reviewer and coordinator run, and the checks the daemon starts, get `PIP_REQUIRE_VIRTUALENV=1`,
   `PIP_USER=0` and `PIP_BREAK_SYSTEM_PACKAGES=0`, so pip itself refuses an install outside a virtualenv
   on every provider, scripts included. The worker hook also refuses `pip install --user` (pip, pip3,
-  `python3 -m pip`, `uv pip --system`, `setup.py install --user`, through wrappers, `sh -c` and eval),
-  `--break-system-packages`, `--isolated`, a `--target` or `--prefix` under `.local`, a bare pip install
-  under `sudo` or `env -i`, and unsetting or overriding those variables or the same `pip config` names;
+  `python3 -m pip`, `uv pip --system`, `setup.py install --user`, through wrappers, `sh -c`, eval,
+  `find -exec`, xargs and parallel), `python3 -m ensurepip --user` (ensurepip drops the `PIP_*`
+  variables), `--break-system-packages`, `--isolated`, a `--target`, `--prefix` or `--root` (or
+  `PIP_TARGET`, `PIP_PREFIX`, `PIP_ROOT`) under `.local`, a bare pip install under `sudo` or `env -i`,
+  and unsetting or overriding those variables or the same `pip config` names;
   a pip command that installs nothing (download, list, show, freeze, wheel) may carry its own
   `PIP_REQUIRE_VIRTUALENV=0`. Each refusal is counted on one queued ride-along `user_site_install`
   event per run for the coordinator, never a user alert. Install into a venv the project owns:

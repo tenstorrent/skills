@@ -395,6 +395,8 @@ def test_a_detached_release_check_keeps_release_across_a_daemon_restart(env, mon
     real = subprocess.Popen
 
     def popen(argv, **kw):   # the launcher's child: recorded, then a stand-in that waits for its go
+        if list(argv[1:4]) != ["-m", "ttp", "checks"]:   # other calls (process reads on macOS): real
+            return real(argv, **kw)
         argvs.append(list(argv))
         children.append(real([sys.executable, "-c", "import sys; sys.stdin.read()"], **kw))
         return children[-1]
@@ -962,6 +964,74 @@ def test_gate_judge_calls_a_failure_pre_existing_only_when_base_and_head_fail_th
         assert v["new"] == [a] and v["pre_existing"] == [] and gatejudge.blocks(v)
 
 
+
+def test_gate_judge_same_failure_ignores_a_venv_path_and_reads_long_pytest_headers(tmp_path):
+    """#7330: the same assertion on head and base differed only by the checks env folder in a CompletedProcess
+    repr, and pytest's header of a long test name has one '_' a side, so its block was not read and the
+    saved base mark was empty: the failure was judged 'another way' and blocked. Now both are the same."""
+    from ttp import gatejudge, sharedchecks
+    a = "tests/test_a.py::test_" + "a_very_long_name" * 6
+    name = a.rpartition("::")[2]
+
+    def run(env, pid, secs):
+        line = (f"AssertionError: CompletedProcess(args=['/opt/ci/.tt-project/checks-env/{env}/bin/python3'], "
+                f"pid {pid}, took {secs}s)")
+        out = (f"=== FAILURES ===\n_ {name} _\n\n    def {name}():\n        helper()\n\n"
+               f"tests/test_a.py:3: \n_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _\n\n"
+               f"    def helper():\n>       assert r.returncode == 0, r\nE       {line}\n\n"
+               f"tests/test_a.py:9: AssertionError\n=== short test summary info ===\nFAILED {a}\n=== 1 failed in 0.1s ===\n")
+        return 1, out
+    head, base = run("0c594e2e7d0528a0.d8e44f94", 4101, "1.52"), run("9ab31f07c2d4e5a6.0f1e2d3c", 77, "0.98")
+    block = sharedchecks.failure_blocks(head[1], [a])[a]
+    assert "E       AssertionError" in block, "the block runs past the frame separator to the failing frame"
+    m, m2 = gatejudge.marks(head[1], [a])[a], gatejudge.marks(base[1], [a])[a]
+    assert m["line"] and m["src"] == "assert r.returncode == 0, r" and gatejudge.same_failure(m, m2), (m, m2)
+    v = gatejudge.judge([a], lambda at, ids: head if at == "head" else base, tmp_path / "s", "b1", "host-a", 1000.0)
+    assert v["pre_existing"] == [a] and not gatejudge.blocks(v), v
+    # Another assertion still differs; a word made of hex letters or a plain number is not a hash.
+    assert not gatejudge.same_failure(m, gatejudge.marks(run("0c594e2e7d0528a0", 1, "1")[1].replace(
+        "returncode == 0", "returncode == 2"), [a])[a])
+    assert gatejudge._mark_norm("decade facade 123456") == "decade facade 123456"
+    # A base failure saved with an empty mark (an output its parser could not read) proves nothing: the base reruns.
+    gatejudge.save_base(tmp_path / "e", "host-a", "b1", {a: True}, 1000.0, {a: {"line": "", "msg": "", "src": "", "at": ""}})
+    calls = []
+    v = gatejudge.judge([a], lambda at, ids: calls.append(at) or (head if at == "head" else base),
+                        tmp_path / "e", "b1", "host-a", 1001.0)
+    assert calls == ["head", "base"] and v["pre_existing"] == [a], (calls, v)
+
+
+def _narrow_fails(i: str, line: str) -> tuple[int, str]:
+    # A rerun over ssh with no tty (80 columns): a test name wider than that gets one `_` on each side, the
+    # traceback has a `_ _ _` frame separator and the summary line has no room for the message.
+    name = i.rpartition("::")[2]
+    out = (f"{'=' * 30} FAILURES {'=' * 30}\n_ {name} _\n\n    def {name}():\n>       helper()\n\nt.py:9: \n"
+           f"{'_ ' * 40}\n\n    def helper():\n>       assert r.returncode == 0\nE       {line}\n\n"
+           f"t.py:3: AssertionError\n{'=' * 20} short test summary info {'=' * 20}\nFAILED {i}\n")
+    return 1, out + "=== 1 failed in 0.1s ===\n"
+
+
+def test_gate_judge_reads_a_narrow_terminals_failure_and_never_reuses_a_saved_base_mark_it_could_not_read(tmp_path):
+    from ttp import gatejudge, sharedchecks
+    a = "tests/test_a.py::test_" + "a_name_wider_than_an_ssh_terminal_of_eighty_columns_" * 2
+    m = gatejudge.marks(_narrow_fails(a, "assert 1 == 0")[1], [a])[a]
+    assert m["line"] == "assert 1 == 0" and m["src"] == "assert r.returncode == 0" and m["at"] == "t.py:3: AssertionError"
+    assert "def helper" in sharedchecks.failure_blocks(_narrow_fails(a, "assert 1 == 0")[1], [a])[a]
+    # Base and head failing the same way on a spill host: pre-existing, not "another way".
+    calls = []
+
+    def run(at, ids):
+        calls.append(at)
+        return _narrow_fails(a, "assert 1 == 0")
+    v = gatejudge.judge([a], run, tmp_path / "s", "b1", "host-a", 1000.0)
+    assert v["pre_existing"] == [a] and not gatejudge.blocks(v)
+    # A base failure saved with a mark that shows nothing (from output marks() could not read) proves
+    # nothing: the base runs again instead of the empty mark calling every failure another way for days.
+    gatejudge.save_base(tmp_path / "e", "host-a", "b1", {a: True}, 1000.0, {a: {"line": "", "msg": "", "src": "", "at": ""}})
+    calls.clear()
+    v = gatejudge.judge([a], run, tmp_path / "e", "b1", "host-a", 1001.0)
+    assert calls == ["head", "base"] and v["pre_existing"] == [a] and v["other_failure"] == []
+
+
 _NESTED = '''import json, os, subprocess, sys
 
 
@@ -1012,3 +1082,34 @@ def test_ttp_checks_blocks_a_nested_pytest_test_new_on_the_head(env, tmp_path, m
     out = capsys.readouterr().out
     assert "new on this head" in out and "pre-existing" not in out, out
     assert not json.loads((run / "checks.json").read_text())["passed"]
+
+
+def test_gate_judge_same_failure_ignores_commit_shas_and_pytest_temp_roots(tmp_path):
+    """#7561: one failure on head and base (run 15183) differed only by the pytest temp root (a parallel
+    head run's worker folder `w1`, the base rerun's none) and the short commit sha a push refusal named,
+    so the gate called it 'failed another way' and blocked. Now both are the same; a new failure still blocks."""
+    from ttp import gatejudge
+    a = "tests/test_a.py::test_leak"
+    cmd = ("subprocess.CalledProcessError: Command '['git', '-C', '{root}/test_leak0/leak-repo', 'push']' "
+           "returned non-zero exit status 1.")
+    head = cmd.format(root="/dev/shm/ttp-1/4f2a/pytest-of-u/pytest-0/w1")
+    for root in ("/dev/shm/ttp-1/4f2a/pytest-of-u/pytest-25", "/tmp/pytest-of-u/pytest-3/popen-gw2",
+                 "/tmp/pytest-of-u/pytest-current/gw0"):
+        v = gatejudge.judge([a], lambda at, ids: _fails({a: (head if at == "head" else cmd.format(root=root), "t.py:3")}),
+                            tmp_path / root.replace("/", "_"), "b1", "host-a", 1000.0)
+        assert v["pre_existing"] == [a] and not gatejudge.blocks(v), (root, v)
+    for x, y in (("commit 3eedf5a", "commit 65cdc06"), ("commit 1234567", "commit 7654321"),
+                 ("sha deadbeefcafe", "sha 0123456789ab"), ("tip " + "a" * 40, "tip " + "1" * 40)):
+        m = gatejudge.marks(_fails({a: (f"push refused: {x} holds a token", "t.py:3")})[1], [a])[a]
+        m2 = gatejudge.marks(_fails({a: (f"push refused: {y} holds a token", "t.py:3")})[1], [a])[a]
+        assert gatejudge.same_failure(m, m2), (m, m2)
+    # A real new failure still blocks: another exit status, another file in the temp folder, another word.
+    for other in (head.replace("status 1", "status 128"), head.replace("leak-repo", "clean-repo"),
+                  head.replace("push", "fetch")):
+        v = gatejudge.judge([a], lambda at, ids: _fails({a: (head if at == "head" else other, "t.py:3")}),
+                            tmp_path / str(hash(other)), "b1", "host-a", 1000.0)
+        assert v["other_failure"] == [a] and gatejudge.blocks(v), (other, v)
+    # Plain numbers and words stay: an assert's count is not a sha.
+    assert gatejudge._mark_norm("assert 1234567 == 7654321") == "assert 1234567 == 7654321"
+    assert gatejudge._mark_norm("effaced decade") == "effaced decade"
+    assert gatejudge._mark_norm("stopped at 1000000 bytes") != gatejudge._mark_norm("stopped at 2000000 bytes")

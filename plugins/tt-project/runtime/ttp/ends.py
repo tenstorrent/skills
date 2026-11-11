@@ -673,7 +673,8 @@ def reap_probes(procs: dict, errs: dict[int, Any], now: float,
                     why = proc.fut.result()
                 except Exception:   # the check itself failed: keep the old reading
                     why = ""
-                out[key] = (why or netwait.UNREACHABLE_RC, probe, proc.err)
+                out[key] = (1 if why == netwait.AGENT_WHY else why or netwait.UNREACHABLE_RC, probe,
+                            proc.err or (why if why == netwait.AGENT_WHY else ""))
             continue
         rc = proc.poll()
         if rc is None and now - started < PROBE_TIMEOUT_S:

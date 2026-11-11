@@ -80,6 +80,7 @@ PRICES: dict[str, tuple[float, float, float, float, float]] = {
     "claude-sonnet-4-6": (3.0, 15.0, 0.3, 3.75, 6.0),
     "claude-sonnet-4-5": (3.0, 15.0, 0.3, 3.75, 6.0),
     "claude-sonnet-4": (3.0, 15.0, 0.3, 3.75, 6.0),
+    "claude-haiku-5-5": (0.1, 0.5, 0.01, 0.125, 0.2),   # prompts up to 100K tokens; longer ones bill 5x
     "claude-haiku-4-5": (1.0, 5.0, 0.1, 1.25, 2.0),
     "claude-3-5-haiku": (0.8, 4.0, 0.08, 1.0, 1.6),
 }

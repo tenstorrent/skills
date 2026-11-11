@@ -48,8 +48,8 @@ def test_eta_code_task_adds_measured_review_and_landing_and_overrun(env):
     rv = p.db.add_task("Review #1", "s", kind="review", status="done")
     p.db.x("UPDATE tasks SET created=? WHERE id=?", (now - 5000, rv))
     p.db.x("INSERT INTO runs(task, role, started, ended, status) VALUES(?, 'worker', ?, ?, 'ok')", (rv, now - 4900, now - 3200))
-    p.db.x("INSERT INTO push_queue(task,branch,head,target,status,created,updated) VALUES(?,?,?,?,?,?,?)",
-           (rv, "b", "h", "t", "pushed", now - 3000, now - 2400))
+    p.db.x("INSERT INTO push_queue(task,branch,head,target,status,created,updated,pushed_sha) VALUES(?,?,?,?,?,?,?,?)",
+           (rv, "b", "h", "t", "pushed", now - 3000, now - 2400, "abc1234"))
     t = p.db.add_task("the fix", "s", kind="code")
     e = eta.estimate(p.db, t, now)
     assert [k for k, _ in e["legs"]] == ["queue", "run", "review", "landing"]
@@ -362,8 +362,8 @@ def test_eta_a_task_waiting_on_another_tasks_landing_starts_after_that_landing(e
     rv = p.db.add_task("Review #1", "s", kind="review", status="done")
     p.db.x("UPDATE tasks SET created=? WHERE id=?", (now - 5000, rv))
     p.db.x("INSERT INTO runs(task, role, started, ended, status) VALUES(?, 'worker', ?, ?, 'ok')", (rv, now - 4900, now - 3300))
-    p.db.x("INSERT INTO push_queue(task,branch,head,target,status,created,updated) VALUES(?,?,?,?,?,?,?)",
-           (rv, "b", "h", "t", "pushed", now - 3000, now - 2400))   # medians: wait 100, review 1700, landing 600
+    p.db.x("INSERT INTO push_queue(task,branch,head,target,status,created,updated,pushed_sha) VALUES(?,?,?,?,?,?,?,?)",
+           (rv, "b", "h", "t", "pushed", now - 3000, now - 2400, "abc1234"))   # medians: wait 100, review 1700, landing 600
     n = p.db.add_task("the fix", "s", kind="code")
     w = p.db.add_task("deploy it", "s", kind="work", reply_chat="c1", labels=[f"start_when:landed:#{n}"])
     w2 = p.db.add_task("check it", "s", kind="work", labels=[f"start_when:ttp landed --task {n} && ttp landed --task #{rv} || exit 1"])
@@ -468,10 +468,13 @@ def test_eta_time_and_landing_waits_keep_their_estimates(env):
     p = make(env)
     now = time.time()
     _eta_history(p, now)                                   # run median 1200, queue wait median 300
-    # A bare clock gate, `landed:#N`, `ttp landed --task N` terms and no retry_when at all: the next try
-    # plus the usual legs.
-    for res in ({"retry_when": f'test "$(date +%s)" -ge {int(now) + 600}'}, {"retry_when": "landed:#12"},
-                {"retry_when": " landed: 12 "}, {"retry_when": "ttp landed --task 12 && ttp landed --task #13 || exit 1"},
+    # A bare clock gate, a landing wait on a landed task and no retry_when at all: the next try plus the
+    # usual legs. (A landing wait on a task not landed follows that task: eta_landing_gate tests.)
+    gone = p.db.add_task("landed fix", "s", kind="code", status="done")
+    p.db.x("INSERT INTO push_queue(task,branch,head,target,status,created,updated,landed_sha) VALUES(?,?,?,?,?,?,?,?)",
+           (gone, "b", "h", "t", "landed", now - 900, now - 600, "abc1234"))
+    for res in ({"retry_when": f'test "$(date +%s)" -ge {int(now) + 600}'}, {"retry_when": f"landed:#{gone}"},
+                {"retry_when": f" landed: {gone} "}, {"retry_when": f"ttp landed --task {gone} && ttp landed --task #{gone} || exit 1"},
                 {}):
         t = _eta_waiting(p, now, retry_after=600, **res)
         assert eta.outside_wait(p.db.task(t), now) is None
@@ -535,3 +538,158 @@ def test_eta_outside_wait_reads_a_measured_eta_from_the_task_s_progress_reports(
     cli.main(["progress", "report", "result", "--key", "box/job", "--eta", "soon"])
     assert "--eta is ignored" in capsys.readouterr().err
     assert eta.estimate(p.db, t2, now)["end"] == pytest.approx(now + 3000 + 1200, abs=1)
+
+
+def test_expected_finish_names_tasks_with_no_estimate_for_one_reason_on_one_line(env):
+    """A stateless coordinator turn paid for one 'no estimate yet' line per urgent task, each repeating
+    its title (already in Open tasks) and the same reason. Tasks sharing a reason share one line naming
+    every id; a lone one keeps its own line with its title."""
+    from ttp import eta
+    p = make(env)
+    a = p.db.add_task("first new work", "s", kind="work", priority=1)
+    lines = eta.state_lines(p.db, p)
+    assert f"#{a} first new work: ETA: no estimate yet (no measured work run yet)" in lines[1]
+    b = p.db.add_task("second new work", "s", kind="work", priority=1)
+    c = p.db.add_task("third new work", "s", kind="work", priority=1)
+    lines = eta.state_lines(p.db, p)
+    assert lines[1:] == [f"- #{a}, #{b}, #{c}: ETA: no estimate yet (no measured work run yet)"], lines
+    assert eta.state_lines(p.db, p, skip={a, b})[1:] == [f"- #{c} third new work: ETA: no estimate yet (no measured work run yet)"]
+    assert eta.state_lines(p.db, p, skip={a, b, c}) == [], "ids shown elsewhere leave no shared line naming them"
+
+
+def test_eta_of_a_queued_approval_counts_the_approvals_ahead_of_it(env):
+    """#6857: the eta of an approval still waiting for a batch is the batches it waits for (the approvals
+    ahead of it in the queue's order, aging included, per push_batch_max) times the median batch, plus
+    what is left of a running batch; with no measured batch it keeps the median landing."""
+    from ttp import eta
+    p = make(env)
+    now = time.time()
+    p.db.x("INSERT INTO push_queue(task,branch,head,target,status,created,updated) VALUES(?,?,?,?,?,?,?)",
+           (999, "b", "h", "t", "pushed", now - 9000, now - 8400))   # median landing 600
+    ids = {}
+    for name, prio in (("hot", 1), ("mine", 3), ("a", 2), ("b", 2), ("c", 2), ("later", 3)):   # approval order
+        tid = ids[name] = p.db.add_task(f"Review {name}", "s", kind="review", priority=prio, status="pushing")
+        p.db.x("INSERT INTO push_queue(task,branch,head,target,status,created,updated) VALUES(?,?,?,?,?,?,?)",
+               (tid, "b", "h", "t", "approved", now - 60, now - 60))
+    e = eta.estimate(p.db, ids["mine"], now, delivery={"push_batch_max": 2})
+    assert [k for k, _ in e["legs"]] == ["landing"] and e["end"] == pytest.approx(now + 600), "no batch measured yet"
+    for i, d in enumerate((1200, 1800, 2400)):
+        p.db.x("INSERT INTO push_batches(id,marker,target,started,ended,finalized,after_finalized,outcome) "
+               "VALUES(?,?,?,?,?,?,?,?)", (f"b{i}", "m", "t", now - 20000 + i * 5000, None, None,
+                                            now - 20000 + i * 5000 + d, "pushed"))
+    e = eta.estimate(p.db, ids["mine"], now, delivery={"push_batch_max": 2})
+    assert e["legs"] == [("landing (4 approvals ahead)", pytest.approx(3 * 1800))], e["legs"]
+    assert eta.estimate(p.db, ids["hot"], now, delivery={"push_batch_max": 2})["end"] == pytest.approx(now + 1800)
+    assert eta.estimate(p.db, ids["later"], now)["legs"][0][0] == "landing (5 approvals ahead)", "default cap 8"
+    # Waited two periods of push_age_s, it joins the priority-2 lane and leads it (approved before them).
+    p.db.x("UPDATE push_queue SET created=? WHERE task=?", (now - 7200, ids["mine"]))
+    e = eta.estimate(p.db, ids["mine"], now, delivery={"push_batch_max": 2, "push_age_s": 3600})
+    assert e["legs"] == [("landing (1 approval ahead)", pytest.approx(1800))]
+    # A running batch adds what is left of its median.
+    p.db.x("INSERT INTO push_batches(id,marker,target,started) VALUES('live','m','t',?)", (now - 600,))
+    e = eta.estimate(p.db, ids["mine"], now, delivery={"push_batch_max": 2, "push_age_s": 3600})
+    assert e["end"] == pytest.approx(now + 1200 + 1800)
+
+
+def _eta_gated(p, now):
+    """Medians (code queue 100 run 1000, work queue 100 run 500, review 1700, landing 600), a done code task
+    #n with no review yet and a work task waiting on its landing with a promise on it."""
+    _eta_history(p, now, kind="code", runs=(1000,), wait=100)
+    _eta_history(p, now, kind="work", runs=(500,), wait=100)
+    _eta_history(p, now, kind="review", runs=(1700,), wait=100)
+    rv = p.db.add_task("Review #1", "s", kind="review", status="done")
+    p.db.x("UPDATE tasks SET created=? WHERE id=?", (now - 5000, rv))
+    p.db.x("INSERT INTO runs(task, role, started, ended, status) VALUES(?, 'worker', ?, ?, 'ok')", (rv, now - 4900, now - 3300))
+    p.db.x("INSERT INTO push_queue(task,branch,head,target,status,created,updated,pushed_sha) VALUES(?,?,?,?,?,?,?,?)",
+           (rv, "b", "h", "t", "pushed", now - 3000, now - 2400, "abc1234"))
+    n = p.db.add_task("the fix", "s", kind="code", status="done")
+    p.db.update_task(n, branch=f"ttp/t{n}-fix")
+    w = p.db.add_task("deploy it", "s", kind="work", reply_chat="c1", labels=[f"start_when:landed:#{n}"])
+    p.db.update_task(w, not_before=now + 60)   # the probe's next check: never its finish
+    return n, w, _eta_promise(p, w, "c1", "I'll post here when it's deployed.", now)
+
+
+def test_eta_landing_gate_with_no_live_owner_reads_after_landed_and_no_clock_time(env):
+    import re
+    from ttp import eta
+    p = make(env)
+    now = time.time()
+    n, w, o = _eta_gated(p, now)
+    waiting = _eta_waiting(p, now, retry_after=60, retry_when=f"landed:#{n}")   # a hand-off's landing wait too
+
+    def after(tid, *words):
+        e = eta.estimate(p.db, tid, now)
+        f = eta.field(e, p, now)
+        assert e["end"] is None and e["after"] == f"landed:#{n}" and eta.wake_at(e) is None, f
+        assert f.startswith(f"ETA: after landed:#{n} (") and not re.search(r"\d:\d\d", f), f
+        assert all(x in e["why"] for x in words), e["why"]
+        return e
+    # Done, never reviewed, nothing open carries it: before the fix this showed now + 60 + the run.
+    for t in (w, waiting):
+        after(t, f"#{n} is done but not landed")
+    oe = eta.obligation_estimate(p.db, o, now)
+    assert oe["after"] == f"landed:#{n}" and eta.field(oe, p, now).startswith("ETA: after landed:#")
+    dep = p.db.add_task("then", "s", kind="work", depends_on=[w])   # a dependant inherits the gate
+    assert eta.estimate(p.db, dep, now)["after"] == f"landed:#{n}"
+    # Its review failed (and its push row failed) with no successor.
+    bad = p.db.add_task(f"Review #{n}", "s", kind="review", depends_on=[n], status="failed")
+    after(w, f"its last review #{bad} failed")
+    p.db.update_task(bad, status="cancelled")
+    after(w, f"its last review #{bad} was cancelled")
+    p.db.update_task(bad, status="done")
+    p.db.x("INSERT INTO push_queue(task,branch,head,target,status,created,updated) VALUES(?,?,?,?,?,?,?)",
+           (bad, f"ttp/t{n}-fix", "h", "t", "check_failed", now - 700, now - 600))
+    after(w, "push queue row", "check_failed")
+    # Failed, cancelled or abandoned gated tasks.
+    for st in ("failed", "cancelled"):
+        p.db.update_task(n, status=st)
+        after(w, f"#{n} {st}")
+    p.db.update_task(n, status="done")
+    p.db.x("INSERT INTO task_abandoned(task, why, ts) VALUES(?,?,?)", (n, "dropped", now))
+    after(w, "abandoned")
+
+
+def test_eta_landing_gate_with_a_live_owner_follows_its_critical_path(env):
+    from ttp import eta
+    p = make(env)
+    now = time.time()
+    n, w, o = _eta_gated(p, now)
+    p.db.add_task(f"Review #{n}", "s", kind="review", depends_on=[n], status="failed")
+    rv = p.db.add_task(f"Review #{n}", "s", kind="review", depends_on=[n])   # its re-review is queued
+    e = eta.estimate(p.db, w, now)
+    assert e["why"] is None and not e.get("after") and e["path"][:3] == [w, n, rv]
+    # The re-review's queue and run, the landing, then the work task's own queue and run.
+    assert e["end"] == pytest.approx(now + 100 + 1700 + 600 + 100 + 500)
+    assert eta.obligation_estimate(p.db, o, now)["end"] == pytest.approx(e["end"])
+    # An open fix continuing it (no review yet) is a live owner too.
+    p.db.update_task(rv, status="cancelled")
+    fix = p.db.add_task("Fix review", "s", kind="code", labels=[f"continues:{n}"])
+    e = eta.estimate(p.db, w, now)
+    assert not e.get("after") and "done but not landed" not in (e["why"] or ""), e
+    p.db.update_task(fix, status="cancelled")
+    # A live owner with no measured leg: no clock time, and the gate is named.
+    p.db.update_task(n, status="queued")
+    p.db.x("DELETE FROM runs WHERE task IN (SELECT id FROM tasks WHERE kind='code')")
+    e = eta.estimate(p.db, w, now)
+    assert e["after"] == f"landed:#{n}" and "no measured code run" in e["why"]
+
+
+def test_eta_merge_gate_reads_after_the_pr_merges_or_closes(env):
+    from ttp import eta
+    p = make(env)
+    now = time.time()
+    _eta_history(p, now)
+    for probe in ("gh pr view 12 --repo o/r --json state -q .state | grep -qv OPEN",
+                  "gh api repos/o/r/pulls/12 --jq .merged | grep -q true"):
+        t = p.db.add_task("after the PR", "s", kind="work", labels=[f"start_when:{probe}"])
+        e = eta.estimate(p.db, t, now)
+        assert e["end"] is None and e["after"] == "PR #12 merges or closes", probe
+        assert eta.field(e, p, now).startswith("ETA: after PR #12 merges or closes ("), probe
+        w = _eta_waiting(p, now, retry_when=probe)
+        assert eta.estimate(p.db, w, now)["after"] == "PR #12 merges or closes"
+        # A measured eta of the merge (with its basis) is not a probe time: it is used.
+        m = _eta_waiting(p, now, retry_when=probe, eta=now + 3600, eta_basis="the PR's approvals are in")
+        assert eta.estimate(p.db, m, now)["end"] == pytest.approx(now + 3600 + 1200)
+    # Not a merge gate: a PR's CI checks, or a probe naming no state.
+    for probe in ("gh pr checks 12 --repo o/r", "gh pr view 12 --json title"):
+        assert eta.merge_gate(probe) is None, probe

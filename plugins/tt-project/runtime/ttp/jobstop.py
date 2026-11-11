@@ -74,7 +74,7 @@ import subprocess
 import time
 from pathlib import Path
 
-from . import detach, locks, procowner
+from . import detach, locks, procinfo, procowner
 from .db import load_result
 from .project import Project, durable_write, write_json
 
@@ -94,12 +94,15 @@ CANCEL_TERM_S = 5.0    # a cancelled task's checks: SIGKILL this long after SIGT
 QUEUE = "jobstop-queue"
 EVENT = "detached_job_stopped"
 BY = "jobstop"   # the sender component detach.signalled names
+_PROC = Path("/proc/self/stat").exists()   # Linux; without it (macOS) procinfo reads sysctl and ps
 
 
 # Process groups ---------------------------------------------------------------------------------
 
 def _stat(pid: int) -> tuple[int, int] | None:
-    """(pgid, uid) of a live process (not a zombie), else None. Linux /proc only."""
+    """(pgid, uid) of a live process (not a zombie), else None: /proc, else (macOS) ps."""
+    if not _PROC:
+        return procinfo.stat(pid)
     try:
         st = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
         if st[0] == "Z":
@@ -111,8 +114,10 @@ def _stat(pid: int) -> tuple[int, int] | None:
 
 
 def members(pgid: int) -> list[int]:
-    """The live processes of group pgid ([] where /proc cannot tell)."""
+    """The live processes of group pgid: /proc, else (macOS) one ps of every process; [] where neither tells."""
     out = []
+    if not _PROC:
+        return sorted(pid for pid, (g, _) in procinfo.table().items() if g == pgid)
     try:
         names = os.listdir("/proc")
     except OSError:
@@ -123,7 +128,59 @@ def members(pgid: int) -> list[int]:
     return out
 
 
+def _proc_table() -> dict[int, tuple[int, int, int | None]] | None:
+    """{pid: (ppid, pgid, sid)} of every live (not zombie) process from /proc; None without /proc."""
+    try:
+        names = os.listdir("/proc")
+    except OSError:
+        return None
+    procs = {}
+    for n in names:
+        try:
+            st = Path(f"/proc/{n}/stat").read_text().rsplit(")", 1)[1].split()
+            if n.isdigit() and st[0] != "Z":
+                procs[int(n)] = (int(st[1]), int(st[2]), int(st[3]))   # ppid, pgid, sid
+        except (OSError, IndexError, ValueError):
+            continue
+    return procs
+
+
+def _ps_table() -> dict[int, tuple[int, int, int | None]]:
+    """{pid: (ppid, pgid, None)} of every live (not zombie) process from one `ps` read, where /proc is
+    missing (macOS); {} when ps fails. ps gives no session id here, so only descendants are followed."""
+    try:
+        out = subprocess.run(["ps", "-axo", "pid=,ppid=,pgid=,stat="], capture_output=True, text=True,
+                             timeout=10, stdin=subprocess.DEVNULL).stdout
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    procs = {}
+    for line in out.splitlines():
+        f = line.split()
+        if len(f) >= 4 and f[0].isdigit() and f[1].isdigit() and f[2].isdigit() and not f[3].startswith("Z"):
+            procs[int(f[0])] = (int(f[1]), int(f[2]), None)
+    return procs
+
+
+def strays(pgid: int, table=None) -> list[int]:
+    """The live processes of the job led by pgid outside its group: its session's other groups (a test
+    runner's helpers, such as pytest-xdist workers, that took a group of their own) and the descendants of
+    its members that left the group or session (setsid). From /proc, else one `ps` read (macOS), where the
+    descendants of the group's members are followed by ppid. `table`: a process table to read instead."""
+    procs = table() if table else _proc_table()
+    if procs is None:
+        procs = _ps_table()
+    ours = {pid for pid, (_, g, sid) in procs.items() if g == pgid or (sid is not None and sid == pgid)}
+    grew = True
+    while grew:
+        more = {pid for pid, (pp, _, _) in procs.items() if pp in ours and pid not in ours}
+        ours |= more
+        grew = bool(more)
+    return sorted(pid for pid in ours if procs[pid][1] != pgid and pid != os.getpid())
+
+
 def _argv(pid: int) -> list[str]:
+    if not _PROC:
+        return procinfo.argv(pid)   # macOS: sysctl KERN_PROCARGS2
     try:
         return [a.decode(errors="replace") for a in Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")[:-1]]
     except OSError:
@@ -141,7 +198,7 @@ def group_of(rc: Path) -> int:
             pid = int(detach.started(rc).read_text().split()[0])
         except (OSError, ValueError, IndexError):
             return 0
-    if _stat(pid) is not None and Path("/proc").is_dir():
+    if _stat(pid) is not None:
         if str(rc) not in _argv(pid):
             return 0
         return pid
@@ -376,9 +433,23 @@ def end(p: Project, rc: Path, why: str, task: int | None = None, reason: str = "
         except OSError:
             pass
         pids = members(pgid)
+        for pid in strays(pgid):   # stopped too, before any can start another
+            try:
+                os.kill(pid, signal.SIGSTOP)
+            except OSError:
+                pass
+        stray = strays(pgid)
+        pids += stray
     ids, note = end_broker_jobs(pids)
     if pgid:
         detach.stop(rc, pgid, why, reason=reason, by=BY, task=task, state=p.state)
+        for pid in stray:   # its helpers in other groups of its session, or that left it
+            try:
+                os.kill(pid, signal.SIGKILL)
+                detach.signalled(rc, signal.SIGKILL, pid, reason, f"{why}; a helper of the job outside its group",
+                                 by=BY, group=False, state=p.state, task=task)
+            except OSError:
+                pass
     extra = end_requeued(p, rc, why, task, reason)
     freed, held = _free(slots, pgid, set(pids), lambda pid, s: detach.signalled(
         rc, signal.SIGKILL, pid, reason, f"{why}; it still held {s.name}", by=BY, group=False, state=p.state,
@@ -478,8 +549,12 @@ def checks_consumer(p: Project, run_dir: Path) -> str | None:
     names them (`<run>/checks.rc`, `<run>/checks` or the run's folder, as `ttp checks --result` does), or
     another `ttp checks` run that joined them (checkjoin: a review precheck, a reviewer's or a push's
     checks of the same tree) and still follows them."""
-    from . import checkjoin
-    from .cli import CHECKS_RC, _read_checks_pid
+    return checks_waiter(p, run_dir) or checks_joiner(p.state, run_dir)
+
+
+def checks_waiter(p: Project, run_dir: Path) -> str | None:
+    """checks_consumer's database half: an open task whose hand-off names the run's detached checks."""
+    from .cli import CHECKS_RC
     run_dir = Path(run_dir)
     rc = run_dir / CHECKS_RC
     marks = ",".join("?" * len(OPEN_WAITER_SKIP))
@@ -488,8 +563,16 @@ def checks_consumer(p: Project, run_dir: Path) -> str | None:
         r = load_result(t["result"])
         if names_job(r, rc) or _names_run(r, run_dir):
             return f"open task #{t['id']} waits on them"
+    return None
+
+
+def checks_joiner(state: Path, run_dir: Path) -> str | None:
+    """checks_consumer's file and /proc half (no database): another live `ttp checks` run that joined them."""
+    from . import checkjoin
+    from .cli import _read_checks_pid
+    run_dir = Path(run_dir)
     pid = _read_checks_pid(run_dir).get("pid")
-    recs = checkjoin.records(p.state, prune=False)
+    recs = checkjoin.records(state, prune=False)
     ids = {r.get("id") for r in recs if r.get("pid") == pid and str(r.get("run")) == run_dir.name}
     for r in recs:
         if r.get("follows") in ids and not r.get("outcome") and r.get("alive") is not False:
@@ -1200,6 +1283,8 @@ def read_pidfile(f: Path) -> list[tuple[int, str | None]]:
 
 
 def _environ(pid: int) -> dict[str, str] | None:
+    if not _PROC:
+        return procinfo.environ(pid)   # macOS: sysctl KERN_PROCARGS2
     try:
         raw = Path(f"/proc/{pid}/environ").read_bytes()
     except OSError:

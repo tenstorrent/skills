@@ -189,8 +189,26 @@ def _vnum(v: str) -> tuple[int, ...]:
     return tuple(int(x) for x in re.findall(r"\d+", v or ""))
 
 
+def _merge_event(p, rec: dict, row: dict, now: float) -> None:
+    """One event to this (deploying) project's coordinator per merge task of `rec`'s project that failed or
+    ended without landing the release, naming the project and the conflicting files: it takes the merge
+    over at once instead of waiting for the next try."""
+    m = row.get("merge_unlanded")
+    if p is None or not m or rec.get("merge_event") == m["task"]:
+        return
+    rec["merge_event"] = m["task"]
+    name = rec["name"]
+    p.db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
+           (now, "deploy", "observation", "normal",
+            f"{name}'s template merge to tt-project {rec['target']} ended without landing (its harness task "
+            f"#{m['task']} {m['status']}; {m['files']}). Take it over now: resolve the merge in "
+            f"{name}'s harness (a commit to its own runtime or template files, or a newer release, queues "
+            f"its next merge task at once; `ttp upgrade {name}` on unchanged files only defers it).", "queued"))
+
+
 def _judge(p, rec: dict, row: dict, t: dict, now: float, start: bool = False) -> tuple[str, str, str]:
     """assess, then _takeover: the outcome of one probe `row` of `rec`."""
+    _merge_event(p, rec, row, now)
     return _takeover(p, rec, *assess(rec, row, now, p), t, now, start, paused=bool(row.get("paused")))
 
 

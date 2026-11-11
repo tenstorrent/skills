@@ -651,3 +651,146 @@ def test_benchmark_idle_tick_cpu_with_and_without_the_kept_spend_reads(env, monk
     before = cpu_per_tick()
     print(f"\nidle tick CPU: {before:.1f} ms with nothing kept, {after:.1f} ms with the spend reads kept ({before / after:.1f}x)")
     assert after * 3 <= before
+
+
+def test_the_spawn_counter_counts_children_by_step_and_program_and_resets_when_read(env):
+    from ttp import stepclock
+    stepclock.spawns()
+    stepclock.install()
+    try:
+        stepclock.begin("probe_step", 30, 5)
+        try:
+            subprocess.run(["true"], check=True)
+            subprocess.run(["/usr/bin/env", "true"], check=True)
+        finally:
+            stepclock.end()
+        subprocess.run("true", shell=True, check=True)
+    finally:
+        stepclock.uninstall()
+    got = stepclock.spawns()
+    assert got[("probe_step", "true")] == 1 and got[("probe_step", "env")] == 1, got
+    assert got[(threading.current_thread().name, "true")] == 1, got
+    assert stepclock.spawns() == {}
+    stepclock._count_spawn(object())   # an argv Popen itself rejects never breaks the count
+    stepclock._count_spawn(pathlib.Path("/bin/true"))
+    assert stepclock.spawns() == {(threading.current_thread().name, "true"): 1}
+
+
+def test_the_daemon_logs_its_spawns_per_window_by_step_and_program(env, monkeypatch):
+    from ttp import daemon as dmod, gitmemo, stepclock
+    p = make(env)
+    d = dmod.Daemon(p.base)
+    t0 = d._spawn_logged
+    assert d._log_spawns(t0 + 10) is None
+    monkeypatch.setattr(stepclock, "spawns", lambda: {("reap_runs", "ps"): 30, ("dispatch", "git"): 20,
+                                                      ("reap_runs", "git"): 10})
+    monkeypatch.setattr(gitmemo, "kept_hits", [7])
+    rec = d._log_spawns(t0 + 600)
+    assert rec["git_kept"] == 7 and gitmemo.kept_hits == [0], "git reads the tick memo answered, per window"
+    assert "git reads answered from memory: 7" in (p.logs / "daemon.log").read_text()
+    assert rec["per_min"] == 6.0 and rec["steps"] == {"reap_runs": 40, "dispatch": 20}
+    assert rec["programs"] == {"ps": 30, "git": 30}
+    assert p.db.kv(dmod.SPAWN_KV)["per_min"] == 6.0
+    assert "spawns: 6.0/min over 10 min; steps: reap_runs 40, dispatch 20" in (p.logs / "daemon.log").read_text()
+    assert d._log_spawns(t0 + 700) is None
+
+
+def test_one_ps_answers_a_snapshots_pid_questions_until_it_is_older_than_its_bound(env, monkeypatch):
+    from ttp import locks, project as projmod, runner
+    if projmod._PROC:
+        pytest.skip("with /proc nothing forks: no snapshot is taken")
+    calls = []
+    real = subprocess.run
+
+    def run(args, *a, **k):
+        if isinstance(args, list) and args[:1] == ["ps"]:
+            calls.append(args)
+        return real(args, *a, **k)
+    monkeypatch.setattr(subprocess, "run", run)
+    clock = [1000.0]
+    monkeypatch.setattr(projmod.time, "monotonic", lambda: clock[0])
+    me = os.getpid()
+    with projmod.ps_snapshot():
+        first = locks.start_time(me)
+        assert first and runner.proc_start(me) == first and not projmod.zombie(me)
+        assert len(calls) == 1 and "-A" in calls[0]
+        clock[0] += projmod.PS_SNAPSHOT_MAX_S / 2
+        assert locks.start_time(me) == first
+        assert len(calls) == 1
+        clock[0] += projmod.PS_SNAPSHOT_MAX_S   # older than its bound: the next question takes a fresh one
+        assert locks.start_time(me) == first
+        assert len(calls) == 2
+    # Outside a snapshot each question asks alone, as before.
+    assert locks.start_time(me) == first and len(calls) == 3 and "-p" in calls[2]
+
+
+def test_a_pid_started_after_the_snapshot_is_asked_alone_and_a_gone_one_is_none(env, monkeypatch):
+    from ttp import locks, project as projmod
+    if projmod._PROC:
+        pytest.skip("with /proc nothing forks: no snapshot is taken")
+    with projmod.ps_snapshot():
+        projmod.ps_rows()
+        child = subprocess.Popen(["sleep", "30"])
+        try:
+            assert locks.start_time(child.pid)   # not in the snapshot yet: its own `ps`
+        finally:
+            child.kill()
+            child.wait()
+        assert locks.start_time(child.pid) is None
+
+
+def _idle_daemon(env):
+    from ttp import daemon as dmod
+    p = make(env)
+    p.db.x("UPDATE messages SET handled=1")
+    return p, dmod, dmod.Daemon(p.base)
+
+
+def test_an_idle_daemon_waits_longer_between_ticks_and_a_busy_one_keeps_the_usual_pace(env, monkeypatch):
+    p, dmod, d = _idle_daemon(env)
+    monkeypatch.setattr(d, "_has_work", lambda: False)
+    waits = [d._between_ticks() for _ in range(6)]
+    assert waits == [6.0, 12.0, dmod.IDLE_TICK_MAX_S, dmod.IDLE_TICK_MAX_S, dmod.IDLE_TICK_MAX_S,
+                     dmod.IDLE_TICK_MAX_S], waits
+    monkeypatch.setattr(d, "_has_work", lambda: True)
+    assert d._between_ticks() == dmod.TICK_S
+    # The tick's own _has_work answer (IdleHold's) is used, never asked twice.
+    asked = []
+    monkeypatch.setattr(d, "_has_work", lambda: asked.append(1) or False)
+    d._work_seen()
+    assert d._between_ticks() == 6.0 and len(asked) == 1
+    monkeypatch.setattr(d, "_has_work", lambda: 1 / 0)   # unknown is busy
+    assert d._between_ticks() == dmod.TICK_S
+
+
+def test_an_idle_wait_ends_within_a_second_when_another_process_writes_the_db(env, monkeypatch):
+    import sqlite3 as sq
+    p, dmod, d = _idle_daemon(env)
+    monkeypatch.setattr(dmod, "IDLE_WATCH_S", 0.05)
+    d._wake = os.pipe()
+    try:
+        t0 = time.monotonic()
+        d._idle_nap(0.3)   # nothing written: the whole wait
+        assert 0.25 <= time.monotonic() - t0 < 2
+
+        def write():
+            time.sleep(0.2)
+            other = sq.connect(str(p.db.path))
+            other.execute("INSERT INTO kv(key, value, ts) VALUES('idle-wait-probe', '1', 0)")
+            other.commit()
+            other.close()
+        threading.Thread(target=write, daemon=True).start()
+        d._idle_s = dmod.IDLE_TICK_MAX_S
+        t0 = time.monotonic()
+        d._idle_nap(20)
+        assert time.monotonic() - t0 < 5, "a chat message or task change ends an idle wait"
+        assert d._idle_s == dmod.TICK_S
+        threading.Thread(target=lambda: (time.sleep(0.2), setattr(d, "stopping", True)), daemon=True).start()
+        t0 = time.monotonic()
+        d._idle_nap(20)
+        assert time.monotonic() - t0 < 5, "a stop ends it at once"
+    finally:
+        d.stopping = True
+        for fd in d._wake:
+            os.close(fd)
+        d._wake = None

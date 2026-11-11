@@ -321,7 +321,9 @@ def test_runs_git_push_passes_clean_and_already_pushed_commits_and_keeps_refusin
     # new name, or a clean commit on top of it, passes.
     _git_out(repo, "checkout", "-q", "-b", "old", "main")
     _commit(repo, "old.txt", f"{_OUT_SHAPE}\n")
-    _git_out(repo, "push", "-q", "--no-verify", "origin", "old")
+    # Outside a run: no TTP_TASK, so a harness git wrapper first on PATH (a run host) does not scan it.
+    subprocess.run(["git", "-C", str(repo), "push", "-q", "--no-verify", "origin", "old"], check=True,
+                   capture_output=True, env={k: v for k, v in os.environ.items() if k != "TTP_TASK"})
     assert push("origin", "old:refs/heads/copy").returncode == 0
     _commit(repo, "new.txt", "clean\n")
     out = push("origin", "old")
@@ -492,3 +494,31 @@ def test_audit_counts_the_leak_scan_refusals_by_route(env, tmp_path, monkeypatch
     line = next(x for x in audit.lines(p.db, p=p) if x.startswith("leak scan refusals"))
     assert line == "leak scan refusals: 4 (gh 1, git push 1, ttp note --to 1, ttp notify 1)", line
     assert audit.report(p.db, p=p)["outscan_refusals"] == {"gh": 1, "git push": 1, "ttp note --to": 1, "ttp notify": 1}
+
+
+def test_ttp_push_scans_the_outgoing_history_first_and_runs_no_check_on_a_leak(env, tmp_path, monkeypatch):
+    """`ttp push` runs the leak scan of tip..HEAD as its own first step: a secret shape in an earlier
+    commit of the change (later removed) fails in seconds with the check never started and nothing
+    sent; a clean change goes on to its checks and lands."""
+    from ttp import push
+    p, repo, _ = _push_run(env, tmp_path, monkeypatch)
+    ran = tmp_path / "check-ran"
+    monkeypatch.setenv("TTP_RUN_DIR", str(tmp_path / "run"))
+    checks = push.check_list([f"touch {ran}"])
+    _git_out(repo, "push", "-q", "origin", "main:proj")
+    _git_out(repo, "checkout", "-q", "-B", "work", "main")
+    _commit(repo, "conf.txt", f"key = {_OUT_SHAPE}\n")
+    _commit(repo, "conf.txt", "key = from the store\n")
+    said: list[str] = []
+    before = _remote_refs(repo)
+    assert push.push(repo, "origin", "proj", checks, 1, say=said.append) == push.CHECKS_FAILED
+    assert not ran.exists() and _remote_refs(repo) == before, said
+    assert any("ttp push refused" in m and "GitHub token shape" in m and "not pushing" in m for m in said), said
+    assert not any(_OUT_SHAPE in m for m in said)
+    from ttp import outscan
+    assert any(outscan.REWRITE_TIP in m for m in said), said   # how to rewrite without a .git-rewrite left behind
+    _git_out(repo, "checkout", "-q", "-B", "clean", "main")
+    _commit(repo, "ok.txt", "fine\n")
+    said.clear()
+    assert push.push(repo, "origin", "proj", checks, 1, say=said.append) == 0, said
+    assert ran.exists() and any("leak scan: the outgoing commits hold no secret shape" in m for m in said), said

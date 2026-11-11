@@ -15,6 +15,9 @@ Every run's push (TTP_TASK set) also runs outscan.pre_push from that hook, befor
 own: a push that would send a stored secret, a credential shape or a forbidden-data pattern, in a
 commit message, an added line or a tag message, is refused (outscan.py). A fault setting the scan up
 refuses the push; a fault reading the push branch guard's project skips only that guard.
+In a run whose task reads untrusted input (untrusted.active) the same hook refuses every ref but the
+task's own branch and the push branch (untrusted.push_refs, passed as TTP_PUSH_ONLY_REFS); a fault
+reading them there refuses the push.
 
 The wrapper also hands over a call whose subcommand is no common builtin (bin/git lists them): an
 alias is expanded the way git does (resolve), so `git -c alias.p=push p` is guarded as `git push`.
@@ -44,13 +47,19 @@ HOOKLESS_PUSH = ("send-pack", "http-push")
 ALIAS_DEPTH = 10
 HOOK = """#!/bin/sh
 # tt-project: a run's pre-push hook (ttp/gitguard.py). Refuses a push to the push branch from a code
-# task's run and a push that sends a leak (ttp/outscan.py), then runs the repository's own pre-push.
+# task's run, a push of any other ref from a run reading untrusted input (ttp/untrusted.py) and a push
+# that sends a leak (ttp/outscan.py), then runs the repository's own pre-push.
 nl='
 '
 input=$(cat)
 if [ -n "$TTP_PUSH_GUARD_REF" ] &&
     printf '%s' "$input${input:+$nl}" | awk -v r="$TTP_PUSH_GUARD_REF" '$3 == r { f = 1 } END { exit !f }'; then
     echo "tt-project: $TTP_PUSH_GUARD_WHY" >&2
+    exit 1
+fi
+if [ -n "$TTP_PUSH_ONLY_REFS" ] &&
+    printf '%s' "$input${input:+$nl}" | awk -v r=" $TTP_PUSH_ONLY_REFS " 'NF >= 3 && index(r, " " $3 " ") == 0 { f = 1 } END { exit !f }'; then
+    echo "tt-project: $TTP_PUSH_ONLY_WHY" >&2
     exit 1
 fi
 if [ -n "$TTP_PUSH_SCAN_RT" ]; then
@@ -247,20 +256,29 @@ def command(real: str, args: list[str], env: dict) -> tuple[list[str], dict]:
         branch = branch and _branch_name(real, globals_, branch)
     except Exception:   # a fault reading the project skips this guard; push.code_run_landing still holds
         branch, why = "", ""
-    if not branch and not scan:
+    from . import untrusted
+    try:   # a run reading untrusted input pushes only its own work branch
+        only = untrusted.push_refs(env, lambda ref: _branch_name(real, globals_, ref))
+    except Exception as e:   # fails closed in such a run
+        if untrusted.active(env):
+            raise ValueError(f"git push refused: its untrusted-input guard failed ({type(e).__name__})") from None
+        only = []
+    if not branch and not scan and not only:
         return [real, *args], env
     try:
         hooks = "" if "--no-verify" in rest else _hooks_dir(real, globals_)
         guard = _hook_file()
     except Exception as e:
-        if scan:   # the leak scan fails closed
+        if scan or only:   # the leak scan and the untrusted-input guard fail closed
             raise ValueError(f"git push refused: its leak scan could not be set up ({type(e).__name__}: {e}); "
                              "nothing was sent") from None
         return [real, *args], env
     rest = [a for a in rest if a not in ("--no-verify", "--verify")]
     env = {**env, "TTP_PUSH_GUARD_REF": f"refs/heads/{branch}" if branch else "", "TTP_PUSH_GUARD_WHY": why,
            "TTP_PUSH_GUARD_HOOKS": hooks, "TTP_PUSH_SCAN_RT": str(Path(__file__).resolve().parents[1]) if scan else "",
-           "TTP_PUSH_SCAN_PY": sys.executable}
+           "TTP_PUSH_SCAN_PY": sys.executable, "TTP_PUSH_ONLY_REFS": " ".join(only),
+           "TTP_PUSH_ONLY_WHY": untrusted.WHY(label=untrusted.LABEL, what=f"pushes only {' or '.join(only)}")
+           + "Commit and hand off; the review lands the change" if only else ""}
     # after the caller's own options: the last core.hooksPath wins, so theirs never replaces the guard
     return [real, *globals_, "-c", f"core.hooksPath={guard}", "push", "--verify", *rest], env
 

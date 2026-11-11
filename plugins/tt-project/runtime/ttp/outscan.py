@@ -74,9 +74,12 @@ def in_run() -> bool:
 def matcher(p=None) -> Callable[[str], str | None]:
     """A function giving the class of the first leak in a text, or None. Reads the stored secrets and the
     project's patterns once. An invalid or unreadable forbidden-data pattern raises ValueError (fails
-    closed, as forbidden.py does)."""
-    from . import redact
-    values = [(v, slot) for value, slot in redact.pairs() for v in redact._variants(value)]
+    closed, as forbidden.py does), and so does a secrets store it cannot read: it could not tell a stored
+    value. A run whose sandbox hides the store by design (secretroute.routed) is scanned as before."""
+    from . import redact, secretroute
+    if (err := redact.store_error()) and not secretroute.routed():
+        raise ValueError(f"the secrets store could not be read ({err}), so it cannot be checked for stored secrets")
+    values =[(v, slot) for value, slot in redact.pairs() for v in redact._variants(value)]
     forbidden: list[tuple[str, re.Pattern]] = []
     if p is not None:
         from .forbidden import declared
@@ -423,9 +426,28 @@ def push_problem(lines: list[str], url: str, p=None) -> str | None:
         tips.append(obj)
     if not tips:
         return None
+    revs = "".join(f"{t}\n" for t in tips) + "".join(f"^{h}\n" for h, kind in has.items() if kind == "commit")
+    return _log_problem(revs, hit)
+
+
+# How to rewrite without leaving a temp dir in the worktree: filter-branch keeps its scratch tree in
+# .git-rewrite under the working tree unless -d names one, and a worker's drift check then flags it.
+REWRITE_TIP = (" (git rebase, or git filter-branch -d with a scratch dir outside the worktree, removed "
+               "afterwards: its default .git-rewrite stays in the worktree)")
+
+
+def history_problem(repo, base: str, head: str = "HEAD", p=None) -> str | None:
+    """Why the commits `base..head` of `repo` must not be pushed: the same scan pre_push runs (a commit
+    message, an added line or a file path holds a leak), read locally, so `ttp push` can refuse in
+    seconds before its checks run. Raises ValueError when they cannot be read."""
+    return _log_problem(f"{head}\n^{base}\n", matcher(p), cwd=str(repo), what="ttp push")
+
+
+def _log_problem(revs_text: str, hit: Callable[[str], str | None], cwd: str | None = None,
+                 what: str = "git push") -> str | None:
+    """The refusal for the first leak `git log --stdin` (fed `revs_text`) shows, else None."""
     with tempfile.TemporaryFile("w+") as revs:
-        revs.write("".join(f"{t}\n" for t in tips))
-        revs.write("".join(f"^{h}\n" for h, kind in has.items() if kind == "commit"))
+        revs.write(revs_text)
         revs.flush()
         revs.seek(0)
         # %B stops at a NUL, so no message can forge the \0 lines; --cc shows what a merge adds itself
@@ -433,7 +455,7 @@ def push_problem(lines: list[str], url: str, p=None) -> str | None:
         proc = subprocess.Popen(["git", "log", "--stdin", "-p", "--root", "--cc", "--text", "--no-renames",
                                  "--no-color", "--no-ext-diff", "--no-textconv",
                                  "--format=%x00commit %h%n%B%n%x00end"],
-                                stdin=revs, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                stdin=revs, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, cwd=cwd,
                                 text=True, errors="replace", env={**os.environ, **_GIT_ENV})
         commit, path, state, cls = "", "", "", None
         try:
@@ -463,8 +485,8 @@ def push_problem(lines: list[str], url: str, p=None) -> str | None:
             rc = proc.wait()
     if cls:
         where = f"commit {commit} " + (f"({path})" if state != "message" else "(its message)")
-        return (refusal("git push", cls, where) + "; rewrite that commit, since a later commit that "
-                "removes it still sends it")
+        return (refusal(what, cls, where) + "; rewrite that commit, since a later commit that "
+                "removes it still sends it" + REWRITE_TIP)
     if rc:
         raise ValueError(f"could not read the commits it sends (git log exited {rc})")
     return None

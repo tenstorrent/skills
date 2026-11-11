@@ -29,6 +29,7 @@ TOLD_KEPT = 200
 SECTION = "Must act now"
 LATE = {obligations.PROMISE_KIND: "promise overdue", obligations.ORDER_KIND: "order overdue",
         obligations.ORDER_LATE_KIND: "order not started", obligations.CLAIM_KIND: "claim does not hold",
+        obligations.LANDING_STUCK_KIND: "stuck behind a landing nothing can make",
         QUEUE_KIND: "queue wait"}
 
 

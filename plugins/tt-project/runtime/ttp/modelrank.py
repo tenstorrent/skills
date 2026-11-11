@@ -2,8 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Model ranking: when the chat model a worker run would use is down, run the smartest one still served.
 
-`providers.chat.model_ranking` lists the chat endpoint's model ids, smartest first (a list, or "a,b").
-Unset or empty, the shipped default, nothing changes. Set, a model is down (down()) while a run was
+`providers.chat.model_ranking` lists the chat endpoint's model ids, smartest first (a list, or "a,b"): the
+project's own, else the account's, which rankfresh.py keeps current from the Artificial Analysis
+Intelligence Index wherever a chat endpoint is set. Unset or empty in both, nothing changes. Set, a model is down (down()) while a run was
 refused it (route.py's model_missing hold for a tier, or a ranked model's own refusal here, kept for
 route.RETRY_QUIET_S) or while the last good model-free /models check (route.MODELS_FILE) leaves it out; a check over STALE_S
 old counts as none (route.models_due keeps it fresh while a ranking is set and chat may run).
@@ -15,6 +16,16 @@ A task's own model pin on chat that is down is swapped the same way, unless the 
 (failover.required: only the user's own words mark it): such a task waits, held, until its model is
 served again, and is never swapped. Each switch (per tier, routes rule or pinned model) is one low alert;
 once the model is served again the next start runs it, and the switch record ends (back).
+
+A routed start (tier, routes rule or run class; never a task's own pin) whose model is up and ranked
+runs a served model ranked above it instead (better), so a newly served smarter model is tried within
+one /models check (route.models_every). Until it has TRIES runs that ended without a fallback it is
+tried on light-tier starts only (escalated runs never route); then it runs at every tier by default.
+A run on it that fails on the model itself (FAULTS_PARK: malformed, timed out or no hand-off) during
+those runs parks it for PARK_S, a week, as do such faults in over BAD_SHARE of its runs later: no
+route picks it, and once the week is over it is tried again from scratch (the weekly recheck). An endpoint fault (down, rate limit, auth) parks nothing.
+The host's daily bench (modelbench.py) rechecks parked models weekly: a pass frees one at once, a weak
+score keeps it parked.
 
 Only the chat provider has a served list; Claude Code, Codex and Cursor models are not ranked here
 (provider failover moves work off a provider that cannot start, failover.py).
@@ -30,6 +41,13 @@ TO = route.TO                         # the one provider with a served list
 KEY = "model_rank"                    # the route entry's or run note's {"from", "why"} of a swapped run
 SWITCH = "model_rank_switch:"         # kv per tier, "<tier>:rule<i>" or "pin:<model>": {"from", "to", "since"} while swapped
 REFUSED = "model_rank_refused:"       # kv per ranked model a swapped run was refused: {"at", "run"}
+TRIED = "model_rank_tried:"           # kv per better() model: {"ok", "bad": its runs' ends, "since", "run"}
+PARKED = "model_rank_parked:"         # kv per parked model: {"at", "run", "why"}
+BETTER = "better"                     # a KEY "why": the run took a model ranked above its own
+TRIES = 3                             # runs without a fallback before a better model runs past light starts
+PARK_S = 7 * 86400                    # a parked model is tried again a week on
+MIN_RUNS, BAD_SHARE = 8, 0.2         # a proven model's own faults over this share of at least these runs park it
+FAULTS_PARK = ("malformed", "timeout", "failed", "no_handoff")   # a run's fallback that is the model's own fault
 
 
 def ranking_of(v: Any) -> list[str]:
@@ -43,14 +61,19 @@ def ranking_of(v: Any) -> list[str]:
 
 
 def ranking(cfg: dict) -> list[str]:
-    """The project's ranking, or [] (unset or malformed: config_problems names it)."""
+    """The project's own ranking, else the account's (`ttp config --account`, kept current by rankfresh.py),
+    or [] (unset or malformed: config_problems names it)."""
+    v = ((cfg.get("providers") or {}).get(route.TO) or {}).get("model_ranking")
+    if v is None:
+        from .project import account_value
+        v = account_value(f"providers.{route.TO}.model_ranking")
     try:
-        return ranking_of(((cfg.get("providers") or {}).get(route.TO) or {}).get("model_ranking"))
+        return ranking_of(v)
     except ValueError:
         return []
 
 
-STALE_S = 2 * route.MODELS_EVERY_S   # an older served list is unknown: no swap or hold rests on it
+STALE_S = 7200   # an older served list (a failed or asleep check) is unknown: no swap or hold rests on it
 
 
 def served(state: Path, now: float) -> list[str] | None:
@@ -80,9 +103,53 @@ def pick(db, cfg: dict, state: Path, model: str, now: float) -> tuple[str, str] 
     why = down(db, cfg, state, model, now)
     ids = served(state, now) if why else None
     for m in ranking(cfg) if ids else ():
-        if m != model and m in ids and not down(db, cfg, state, m, now):
+        if m != model and m in ids and not down(db, cfg, state, m, now) and not parked(db, m, now):
             return m, why
     return None
+
+
+def parked(db, model: str, now: float) -> bool:
+    """`model` failed a run on its own within PARK_S (tried()) and no later host bench passed it, or its
+    last host bench (modelbench.py, within two weeks) found it weak: no route picks it."""
+    from . import modelbench
+    at = float((db.kv(PARKED + model) or {}).get("at") or 0)
+    v = modelbench.verdict(model, at, now)
+    return v == "weak" or now - at < PARK_S and v != "passed"
+
+
+def parked_models(db) -> dict[str, float]:
+    """{model: when this project last parked it} (the bench's weekly recheck arms)."""
+    return {r["key"][len(PARKED):]: float((db.kv(r["key"]) or {}).get("at") or 0)
+            for r in db.q("SELECT key FROM kv WHERE key LIKE ?", (PARKED + "%",))}
+
+
+def better(db, cfg: dict, state: Path, model: str, now: float, light: bool) -> str:
+    """The highest-ranked served model above `model` (up and ranked) that is neither down nor parked,
+    and on a non-`light` start has TRIES good runs; else ''."""
+    rank = ranking(cfg)
+    if model not in rank or down(db, cfg, state, model, now) or (ids := served(state, now)) is None:
+        return ""
+    for m in rank[:rank.index(model)]:
+        if m in ids and not down(db, cfg, state, m, now) and not parked(db, m, now) and (
+                light or int((db.kv(TRIED + m) or {}).get("ok") or 0) >= TRIES):
+            return m
+    return ""
+
+
+def tried(db, model: str, fell: str, run_id: int | None, now: float) -> str:
+    """Book a run's end on a better() model: 'parked' when it fell back on its own fault (FAULTS_PARK)
+    within its first TRIES good runs, or such faults pass BAD_SHARE of its runs from MIN_RUNS on (its
+    count then starts again from none); 'proven' at its TRIES-th good run; else ''."""
+    if fell and fell not in FAULTS_PARK:   # an endpoint fault or a refusal (refused()): no verdict
+        return ""
+    rec = db.kv(TRIED + model) or {}
+    ok, bad = int(rec.get("ok") or 0) + (not fell), int(rec.get("bad") or 0) + bool(fell)
+    if bad and (ok < TRIES or ok + bad >= MIN_RUNS and bad > BAD_SHARE * (ok + bad)):
+        db.set_kv(PARKED + model, {"at": now, "run": run_id, "why": fell, "ok": ok, "bad": bad})
+        db.x("DELETE FROM kv WHERE key=?", (TRIED + model,))
+        return "parked"
+    db.set_kv(TRIED + model, {"ok": ok, "bad": bad, "since": rec.get("since") or now, "run": run_id})
+    return "proven" if ok == TRIES and not fell else ""
 
 
 def refused(db, model: str, run_id: int | None, now: float) -> None:

@@ -62,15 +62,21 @@ Check `ttp secret show`. No Jev entry → tell the user, in plain words:
 
 - OpenRouter users: `ttp secret jev --via openrouter`.
 - The key is saved once per user and shared by all their projects on that machine.
-- Creating a project on another machine copies saved keys there over ssh.
-  Boxes set up earlier: `ttp secret push --host <ssh-alias>`.
+- Saved keys stay on the machine they were typed on. A project on a shared or build box gets them
+  at run time from that box's store (`ttp secret store command --shared -- <fetch command>`, run
+  there by the user); a machine of the user's own may take a copy (`--copy-secrets` on `ttp new
+  --host`, or `ttp secret push --host <ssh-alias>`).
 - Jev turns on by itself once a key exists. No key: say so once, carry on.
 
 ## 5. Create
 
 ```bash
-ttp new <name> [--dir <root>] [--host <ssh-alias>] [--coordinator-effort <level>] --describe-file <brief.md>
+ttp new <name> --relayer [--dir <root>] [--host <ssh-alias>] [--coordinator-effort <level>] --describe-file <brief.md>
 ```
+
+- `--relayer`: you, the user's agent, create it, so it takes your orders as the user's
+  (`coordinator.agent_orders_as_user` on, recorded as the owner's). Leave it out only if the user
+  says their agent's words should not count as theirs.
 
 - The coordinator runs at xhigh effort by default (each provider takes its nearest level). Pass
   `--coordinator-effort` only if the user asks for another; later,

@@ -1360,23 +1360,578 @@ def test_a_run_that_prints_a_private_key_keeps_it_out_of_every_copy(env, monkeyp
     assert _no_key(dump, lines) and _masked(dump)
     outbox.add("peer", ["say", "the key: " + block], outbox.new_id(), None)
     assert _no_key(outbox.path("peer").read_text(), lines) and _masked(outbox.path("peer").read_text())
-    (run_dir / "progress.md").write_text("15:00 note: " + block + "x" * 7990 + "\n")   # a live run: not masked yet
     if _sockets_refused():
         return
     from ttp import web
     port = _start_web(p)
-    for path in (f"/api/run/{run['id']}", "/api/state"):
-        req = urllib.request.Request(f"http://127.0.0.1:{port}{path}", headers={"X-TTP-Token": web.token(p)})
-        for _ in range(50):
-            try:
-                body = urllib.request.urlopen(req, timeout=5).read().decode()
-                break
-            except urllib.error.URLError:
-                time.sleep(0.1)
-        assert _no_key(body, lines), path
-        json.loads(body)
+    # A live run's progress.md (not masked yet): the block inside the 8000-character tail /api/run shows,
+    # then one the tail cut lands inside, mid-line, which only masking before the cut catches.
+    lead = "15:00 note: "
+    cut = block.index(lines[3]) + 10
+    for pad in (100, 8000 + cut - len(block) - 1):
+        (run_dir / "progress.md").write_text(lead + block + "x" * pad + "\n")
+        for path in (f"/api/run/{run['id']}", "/api/state"):
+            req = urllib.request.Request(f"http://127.0.0.1:{port}{path}", headers={"X-TTP-Token": web.token(p)})
+            for _ in range(50):
+                try:
+                    body = urllib.request.urlopen(req, timeout=5).read().decode()
+                    break
+                except urllib.error.URLError:
+                    time.sleep(0.1)
+            assert _no_key(body, lines) and not _key_piece(body, lines), (path, pad)
+            view = json.loads(body)
+            if path.startswith("/api/run"):
+                assert "x" * 50 in view["progress"], "the view shows the progress tail"
+
+
+def _key_piece(text, lines, n=20):
+    """Whether any `n` characters in a row of the key's body show in `text` (a line cut mid-way)."""
+    return any(ln[i:i + n] in text for ln in lines for i in range(0, len(ln) - n + 1))
 
 
 def _masked(text):
     from ttp import redact
     return redact.KEY_MASK in text
+
+
+def test_prose_after_a_lone_key_marker_line_survives_and_a_cut_block_is_still_masked(env):
+    """Review #6952: a raw BEGIN line with no END after it masked everything up to the next quote, so a
+    stored chat message or task spec that quoted the marker lost its prose for good (Db.x scrubs every
+    string). In raw text a cut-off block ends at its last key line; in a JSON string, at the string's end."""
+    from ttp import redact
+    block, lines = _key_block("RSA", "Proc-Type: 4,ENCRYPTED\nDEK-Info: AES-128-CBC,0A1B\n\n")
+    begin = block.splitlines()[0]
+    prose = "This line, with text: (more) and 2.5 words.\n\nAnother paragraph. Done"
+    for text in (begin + "\n" + prose, "see " + begin + " in the file.\n" + prose, begin + "\r\n" + prose,
+                 begin + "\nNote: a header-like line\n" + prose):
+        out = redact.scrub(text)
+        assert out.endswith(prose) and "PRIVATE" not in out and redact.KEY_MASK in out, out
+    cut = block.index(lines[2]) + 30   # cut mid-line, then prose or a trimming mark
+    for tail in ("", "\n" + prose, "...\n" + prose, "\n\n" + prose):
+        out = redact.scrub("x " + block[:cut] + tail)
+        assert _no_key(out, lines) and not _key_piece(out, lines) and "DEK-Info" not in out, out
+        assert out.endswith(tail.lstrip(".")) if tail else out == "x " + redact.KEY_MASK, out
+    for sep in ("\t", "\u2192"):   # numbered lines (`cat -n`, a file viewer), cut before the END line
+        numbered = "".join(f"{i + 1:6}{sep}{ln}\n" for i, ln in enumerate(block.splitlines()[:6]))
+        out = redact.scrub(numbered + prose)
+        assert out.endswith("\n" + prose) and not _key_piece(out, lines), out
+    t0 = time.monotonic()   # space-only lines match one way: no backtracking blow-up before prose
+    for filler in ("\n   ", "\n  7\t  ", "\nAAAA   \n   "):
+        assert redact.scrub(begin + filler * 3000 + "\nx y").endswith("\nx y")
+    assert time.monotonic() - t0 < 5
+    squashed = begin + " " + " ".join(lines[:4]) + "\n" + prose   # one line, cut before its END
+    out = redact.scrub(squashed)
+    assert out == redact.KEY_MASK + "\n" + prose and not _key_piece(out, lines)
+    js = json.dumps({"t": "x " + block[:cut] + " then prose, all one string"}) + "\n" + json.dumps({"n": 1})
+    out = redact.scrub(js)   # JSON-escaped: to the end of its string, and the JSONL stays valid
+    assert [json.loads(x) for x in out.splitlines()] == [{"t": "x " + redact.KEY_MASK}, {"n": 1}]
+    p = make(env)
+    tid = p.db.add_task("quote", "The file starts with " + begin + "\n" + prose, kind="work", origin="user")
+    spec = p.db.task(tid)["spec"]
+    assert spec == "The file starts with " + redact.KEY_MASK + "\n" + prose, spec
+
+
+@pytest.mark.parametrize("name,mark", [("job", "job.started"), ("job", "job.queued"), ("checks", "checks.pid")])
+def test_scrub_run_leaves_a_live_detached_jobs_log_whole_and_masks_it_once_the_job_ends(env, monkeypatch, name, mark):
+    """Review #6952: scrub_run renamed a new file over a log a `ttp detach` or `ttp checks --detach` job still
+    wrote, so the job's later lines went to the unlinked file and vanished from the log."""
+    from ttp import detach, project, redact
+    monkeypatch.setattr(project, "HOME_DIR", env["tmp"] / "empty-home")
+    block, lines = _key_block()
+    run = env["tmp"] / "runs" / "13"
+    run.mkdir(parents=True)
+    (run / mark).write_text("1\n")
+    (run / "stderr.log").write_text(block)
+    log = run / f"{name}.log"
+    with open(log, "w") as w:   # as the job wrapper's `>"$log"`: one open file, its own offset
+        w.write("line 0\n" + block)
+        w.flush()
+        masked = redact.scrub_run(run)
+        for i in range(1, 50):
+            w.write(f"line {i}\n")
+            w.flush()
+    text = log.read_text()
+    assert all(f"line {i}\n" in text for i in range(50)), text[-200:]
+    assert masked == 1   # stderr.log only
+    assert _masked((run / "stderr.log").read_text())
+    rc = run / f"{name}.rc"
+    if name == "job":   # the daemon's sweep closes the job's record once it ended: its log is masked then
+        (run / "detached.json").write_text(json.dumps([{"rc": str(rc), "status": "running"}]))
+        rc.write_text("0\n")
+        assert detach.close(rc)["status"] == "ended"
+        logs = [log]
+    else:   # review #7153: the detached checks themselves mask checks.log and checks.out as they end
+        import signal
+        import types
+        from ttp import cli
+        (run / cli.CHECKS_OUT).write_text("out 0\n" + block)
+        monkeypatch.setitem(cli._CHECK_STOP, "stopped", None)
+        handlers = {sig: signal.getsignal(sig) for sig in cli._CHECK_STOP_SIGNALS}
+        monkeypatch.setattr(cli, "_checks_released", lambda go, d: True)
+        monkeypatch.setattr(cli, "cmd_checks", lambda _a: [(run / n).open("a").write(f"{n} end\n")
+                                                           for n in ("checks.log", cli.CHECKS_OUT)])
+        monkeypatch.setattr(cli.sys, "stdin", io.TextIOWrapper(io.BytesIO(b"go\n")))
+        monkeypatch.setenv("TTP_CHECK_OUTPUT_DIR", str(run))
+        monkeypatch.delenv("TTP_CHECKS_TMP_FD", raising=False)
+        try:
+            assert cli._checks_child(types.SimpleNamespace(rc=str(rc))) == 0
+        finally:
+            for sig, h in handlers.items():
+                signal.signal(sig, h)
+        assert rc.read_text() == "0\n"
+        logs = [log, run / cli.CHECKS_OUT]
+    for f in logs:
+        text = f.read_text()
+        assert _no_key(text, lines) and _masked(text), f
+    assert "line 49\n" in log.read_text()
+    if name == "checks":
+        assert "checks.log end\n" in log.read_text() and (run / "checks.out").read_text().startswith("out 0\n")
+
+
+def test_close_masks_a_jobs_log_once_a_leftover_process_frees_its_lock(env, monkeypatch):
+    """Review #7153: a job closed while a leftover child still held its job lock kept its log unmasked for good."""
+    import fcntl
+    from ttp import detach, locks, project
+    monkeypatch.setattr(project, "HOME_DIR", env["tmp"] / "empty-home")
+    block, lines = _key_block()
+    p = make(env)
+    run = p.runs / "21"
+    run.mkdir(parents=True)
+    rc, log = run / "job.rc", run / "job.log"
+    (run / "job.started").write_text("1\n")
+    log.write_text("line 0\n" + block + "line 1\n")
+    (run / "detached.json").write_text(json.dumps([{"rc": str(rc), "status": "running"}]))
+    rc.write_text("0\n")
+    with open(locks.job_lock(rc), "w") as held:
+        fcntl.flock(held, fcntl.LOCK_EX)
+        assert detach.close_records(p) == 1
+        assert block in log.read_text()   # still written to: left whole
+        assert detach.close(rc).get("unmasked") is True
+        fcntl.flock(held, fcntl.LOCK_UN)
+    (p.state / "detach-closed.at").unlink()
+    assert detach.close_records(p) == 0   # closed before: counted once, masked now
+    text = log.read_text()
+    assert _no_key(text, lines) and _masked(text) and "line 1\n" in text
+    assert "unmasked" not in detach.close(rc)
+
+
+class _TrackedRead:
+    """An open file that records how many bytes each read asks for (a whole-file read: the file's size)."""
+
+    def __init__(self, fh, size, reads):
+        self._fh, self._size, self._reads = fh, size, reads
+
+    def read(self, n=-1):
+        self._reads.append(self._size if n is None or n < 0 else n)
+        return self._fh.read(n)
+
+    def readlines(self, *a):
+        self._reads.append(self._size)
+        return self._fh.readlines(*a)
+
+    def __iter__(self):
+        self._reads.append(self._size)
+        return iter(self._fh)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self._fh.close()
+
+    def __getattr__(self, name):
+        return getattr(self._fh, name)
+
+
+def test_ending_a_run_with_a_large_output_file_reads_it_capped_and_a_detached_job_masks_its_key(env, monkeypatch):
+    """User msg #1918: the daemon's run-end masking (reap_runs, finish_run) reads each run file within a
+    fixed cap and each run within a time limit; a file over the cap is masked by a detached job, every
+    line kept, and so is a big detached-job log the sweep closes (detach.close)."""
+    import builtins
+    from ttp import daemon as dm
+    from ttp import detach, project, redact
+    monkeypatch.setattr(project, "HOME_DIR", env["tmp"] / "empty-home")
+    p = make(env)
+    block, lines = _key_block()
+    run_dir = env["tmp"] / "big-run"
+    run_dir.mkdir()
+    (run_dir / "output.jsonl").write_text(json.dumps({"actions": [], "_cost": 0.01}))
+    (run_dir / "exit.json").write_text(json.dumps({"rc": 0, "ended": time.time()}))
+    filler = "".join(f"step {i}: " + "y" * 90 + "\n" for i in range(15000))   # about 1.5 MiB
+    big, bg = run_dir / "job.log", run_dir / "bg.log"
+    for f in (big, bg):
+        f.write_text(filler + block + filler + "last line\n")
+    before = big.read_text()
+    (run_dir / "bg.started").write_text("1\n")   # a detached job, still writing bg.log at the run's end
+    rid = p.db.x("INSERT INTO runs(role,provider,started,status,dir,boot_id,note) VALUES(?,?,?,?,?,?,?)",
+                 ("coordinator", "fake", time.time(), "running", str(run_dir), "x", "{}"))
+    cap = 1 << 20
+    monkeypatch.setattr(redact, "STEP_FILE_BYTES", cap, raising=False)
+    reads: list[int] = []
+    watched = {str(big), str(bg)}
+    real_open, real_rb, real_rt = builtins.open, pathlib.Path.read_bytes, pathlib.Path.read_text
+
+    def tracked_open(file, *a, **k):
+        fh = real_open(file, *a, **k)
+        return _TrackedRead(fh, os.path.getsize(file), reads) if str(file) in watched else fh
+
+    def whole(real):
+        def read(self, *a, **k):
+            if str(self) in watched:
+                reads.append(self.stat().st_size)
+            return real(self, *a, **k)
+        return read
+
+    def in_step(fn):
+        with monkeypatch.context() as m:
+            m.setattr(builtins, "open", tracked_open)
+            m.setattr(pathlib.Path, "read_bytes", whole(real_rb))
+            m.setattr(pathlib.Path, "read_text", whole(real_rt))
+            return fn()
+
+    d = dm.Daemon(p.base)
+    t0 = time.monotonic()
+    in_step(lambda: d._run_step(d.reap_runs))
+    assert time.monotonic() - t0 < dm.STEP_BUDGET_S
+    assert p.db.one("SELECT status FROM runs WHERE id=?", (rid,))["status"] != "running"
+    assert max(reads, default=0) <= cap + 1, f"the daemon step read {max(reads)} bytes of a big run file"
+
+    def masked(f):
+        for _ in range(300):
+            if redact.KEY_MASK in f.read_text():
+                return True
+            time.sleep(0.1)
+        return False
+    assert masked(big), (run_dir / "scrub.log").read_text() if (run_dir / "scrub.log").exists() else "no scrub.log"
+    assert big.read_text() == before.replace(block.rstrip("\n"), redact.KEY_MASK), "a line was lost"
+    assert "detached job" in (p.logs / "daemon.log").read_text()
+    assert redact.KEY_MASK not in bg.read_text()   # left whole while its job ran
+    rc = run_dir / "bg.rc"
+    (run_dir / "detached.json").write_text(json.dumps([{"rc": str(rc), "status": "running"}]))
+    rc.write_text("0\n")
+    reads.clear()
+    assert in_step(lambda: detach.close(rc))["status"] == "ended"
+    assert max(reads, default=0) <= cap + 1, f"the sweep read {max(reads)} bytes of a big job log"
+    assert masked(bg) and bg.read_text() == before.replace(block.rstrip("\n"), redact.KEY_MASK)
+    assert _no_key((run_dir / "scrub.log").read_text(), lines)
+    left: list = []   # past its time limit, the whole folder is left for the detached job
+    monkeypatch.setattr(redact, "STEP_SCRUB_S", 0.0, raising=False)
+    (run_dir / "late.log").write_text(block)
+    assert redact.scrub_run(run_dir, step=True, left=left) == 0 and left == [run_dir]
+    assert redact.main([str(run_dir)]) == 0 and _no_key((run_dir / "late.log").read_text(), lines)
+
+
+# The run-time store (secretstore): no long-lived plaintext keys on shared or build hosts.
+_STORE_KEY = "fake-store-value-0123456789abcdef"
+
+
+def _runtime_store_home(env, monkeypatch):
+    from ttp import secretstore
+    project = _endpoint_home(env, monkeypatch)
+    secretstore._mem.update(key=None, data=None)
+    secretstore._env.clear()
+    return project, secretstore
+
+
+def _fetch_script(env, body: str):
+    f = env["tmp"] / "fetch-keys"
+    f.write_text("#!/bin/sh\n" + body)
+    f.chmod(0o755)
+    return f
+
+
+def test_a_command_store_is_read_at_run_time_cached_in_memory_and_never_written(env, monkeypatch, capsys):
+    project, secretstore = _runtime_store_home(env, monkeypatch)
+    calls = env["tmp"] / "calls"
+    fetch = _fetch_script(env, f'echo x >> "{calls}"\necho \'{{"jev": {{"key": "{_STORE_KEY}"}}}}\'\n')
+    assert _custom(monkeypatch, capsys, "store", "command", "--", str(fetch))[0] == 0
+    assert _STORE_KEY not in secretstore.config_path().read_text()
+    assert project.load_secrets()["jev"]["key"] == _STORE_KEY
+    assert project.load_secrets()["jev"]["key"] == _STORE_KEY
+    assert calls.read_text().count("x") == 1, "a second read within the cache period reuses memory"
+    from ttp import redact
+    assert redact.scrub(f"value {_STORE_KEY}") == "value [secret:jev]"
+    code, out = _custom(monkeypatch, capsys, "set", "peer-key", stdin=_CUSTOM)
+    assert code and "not saved" in out and _CUSTOM not in out
+    assert not project.secrets_path().exists(), "a run-time store never leaves a plaintext file"
+
+
+def test_a_failing_fetch_command_names_no_output_and_status_still_runs(env, monkeypatch):
+    project, secretstore = _runtime_store_home(env, monkeypatch)
+    fetch = _fetch_script(env, f'echo "{_STORE_KEY}" >&2\nexit 7\n')
+    secretstore.set_config("command", [str(fetch)])
+    with pytest.raises(project.SecretsUnreadable) as e:
+        project.load_secrets()
+    assert "exited 7" in str(e.value) and _STORE_KEY not in str(e.value)
+    assert project.secrets_state()["readable"] is False
+    _fetch_script(env, "echo not-json\n")
+    secretstore._mem.update(key=None)
+    with pytest.raises(project.SecretsUnreadable):
+        project.load_secrets()
+
+
+def test_a_failed_fetch_is_not_retried_for_fail_s_and_keeps_no_value(env, monkeypatch):
+    """A burst of reads (masking each line, a hook per tool call) runs a failing fetch once per FAIL_S, not
+    per call; the remembered failure is its error text only; once due, the next read fetches again."""
+    project, secretstore = _runtime_store_home(env, monkeypatch)
+    calls = env["tmp"] / "calls"
+    fetch = _fetch_script(env, f'echo x >> "{calls}"\necho "{_STORE_KEY}" >&2\nexit 7\n')
+    secretstore.set_config("command", [str(fetch)])
+    for _ in range(5):
+        with pytest.raises(project.SecretsUnreadable) as e:
+            project.load_secrets()
+        assert "exited 7" in str(e.value) and _STORE_KEY not in str(e.value)
+    assert calls.read_text().count("x") == 1, "a failed fetch ran again within FAIL_S"
+    assert _STORE_KEY not in json.dumps(secretstore._mem) and not project.secrets_path().exists()
+    _fetch_script(env, f'echo x >> "{calls}"\necho \'{{"jev": {{"key": "{_STORE_KEY}"}}}}\'\n')
+    secretstore._mem["at"] -= secretstore.FAIL_S + 1   # the failure is due for a retry
+    assert project.load_secrets()["jev"]["key"] == _STORE_KEY
+    assert calls.read_text().count("x") == 2 and secretstore._mem["fail"] == ""
+    assert not project.secrets_path().exists(), "a fetched store is never written in plaintext"
+
+
+def test_a_run_the_daemon_cannot_mask_raises_one_secrets_unmasked_event_per_cause(env, monkeypatch, tmp_path):
+    """Deliverable 7: a run the runner flagged unmasked, with the store still unreadable in the daemon, is
+    logged and raised as one high secrets_unmasked event naming the cause (never a value); a second run
+    failing for the same cause adds none; a run the daemon can mask raises none."""
+    from ttp.daemon import Daemon
+    p = make(env)
+    project, secretstore = _runtime_store_home(env, monkeypatch)
+    d = Daemon(p.base)   # started while the store read (empty); it fails from here on
+    secretstore.set_config("command", [str(_fetch_script(env, f'echo "{_STORE_KEY}" >&2\nexit 7\n'))])
+    redact = _fresh_masking(monkeypatch)
+
+    def run(n, unmasked):
+        run_dir = tmp_path / f"run{n}"
+        run_dir.mkdir()
+        (run_dir / "output.jsonl").write_text(json.dumps({"type": "result", "result": "done", "usage": {},
+                                                          "subtype": "success", "total_cost_usd": 0}) + "\n")
+        p.db.x("INSERT INTO runs(role,provider,model,started,status,dir,boot_id) VALUES(?,?,?,?,?,?,?)",
+               ("worker", "fake", "", time.time(), "running", str(run_dir), "x"))
+        info = {"rc": 0, "ended": time.time(), **({"unmasked": unmasked} if unmasked else {})}
+        (run_dir / "exit.json").write_text(json.dumps(info))
+        d.reap_runs()
+
+    def events():
+        return p.db.q("SELECT severity, text FROM events WHERE kind='secrets_unmasked'")
+
+    run(1, "secret fetch command fetch-keys exited 7")
+    got = events()
+    assert len(got) == 1 and got[0]["severity"] == "high", got
+    assert "could not mask stored secrets" in got[0]["text"] and "exited 7" in got[0]["text"]
+    assert _STORE_KEY not in got[0]["text"]
+    secretstore._mem["at"] -= secretstore.FAIL_S + 1
+    redact._cache["sig"] = None
+    run(2, "secret fetch command fetch-keys exited 7")
+    assert len(events()) == 1, "one event per cause, not per run"
+    _fetch_script(env, f'echo \'{{"jev": {{"key": "{_STORE_KEY}"}}}}\'\n')
+    secretstore._mem.update(key=None, data=None)
+    redact._cache["sig"] = None
+    run(3, "secret fetch command fetch-keys exited 7")
+    assert len(events()) == 1, "a run the daemon could mask raises no event"
+
+
+def test_an_env_store_is_read_once_and_removed_from_the_environment(env, monkeypatch):
+    project, secretstore = _runtime_store_home(env, monkeypatch)
+    secretstore.set_config("env")
+    monkeypatch.setenv(secretstore.ENV_VAR, json.dumps({"slack": {"bot_token": _STORE_KEY}}))
+    assert project.load_secrets()["slack"]["bot_token"] == _STORE_KEY
+    assert secretstore.ENV_VAR not in os.environ, "no child process inherits the keys"
+    secretstore._mem.update(key=None)
+    assert project.load_secrets()["slack"]["bot_token"] == _STORE_KEY
+
+
+def test_a_keychain_store_round_trips_and_the_value_is_never_on_a_command_line(env, monkeypatch):
+    project, secretstore = _runtime_store_home(env, monkeypatch)
+    bindir, kc, argv_log = env["tmp"] / "fakebin", env["tmp"] / "kc.hex", env["tmp"] / "argv.log"
+    bindir.mkdir()
+    # a stand-in for macOS `security`: -i reads `add-generic-password ... -X <hex>` on stdin
+    (bindir / "security").write_text(
+        "#!/bin/sh\n"
+        f'echo "$@" >> "{argv_log}"\n'
+        'if [ "$1" = -i ]; then read -r line; echo "$line" | sed "s/.*-X //" > ' f'"{kc}"; exit 0; fi\n'
+        f'[ -f "{kc}" ] || exit 44\n'
+        f'python3 -c "import sys; print(bytes.fromhex(open(sys.argv[1]).read().strip()).decode())" "{kc}"\n')
+    (bindir / "security").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bindir}:{os.environ['PATH']}")
+    secretstore.set_config("keychain")
+    assert project.load_secrets() == {}
+    project.save_secret("peer-key", _STORE_KEY)
+    assert project.load_secrets() == {"peer-key": _STORE_KEY}
+    assert _STORE_KEY not in argv_log.read_text() and _STORE_KEY.encode().hex() not in argv_log.read_text()
+    assert not project.secrets_path().exists()
+
+
+def test_a_shared_host_never_gets_a_plaintext_key_file(env, monkeypatch, capsys):
+    project, secretstore = _runtime_store_home(env, monkeypatch)
+    code, out = _custom(monkeypatch, capsys, "store", "file", "--shared")
+    assert code and "no plaintext" in out
+    project.HOME_DIR.mkdir(parents=True, exist_ok=True)
+    secretstore.config_path().write_text(json.dumps({"backend": "file", "shared": True}))   # written by hand
+    code, out = _custom(monkeypatch, capsys, "set", "peer-key", stdin=_CUSTOM)
+    assert code and "marked shared" in out and not project.secrets_path().exists()
+    for bad in (["store", "nosuch"], ["store", "command"], ["store", "env", "--", "true"], ["show", "--shared"]):
+        assert _custom(monkeypatch, capsys, *bad)[0], bad
+
+
+def test_a_left_plaintext_key_file_is_reported_never_deleted(env, monkeypatch, capsys):
+    project, secretstore = _runtime_store_home(env, monkeypatch)
+    project.save_secret("peer-key", _CUSTOM)   # the old default: plaintext
+    assert secretstore.plaintext_report() == ""
+    code, out = _custom(monkeypatch, capsys, "store", "env", "--shared")
+    assert code == 0 and "plaintext key file left" in out and "delete it yourself" in out
+    code, out = _custom(monkeypatch, capsys, "store")
+    assert "secret store: env (shared host" in out and "plaintext key file left" in out and _CUSTOM not in out
+    assert project.secrets_path().exists()
+    monkeypatch.setenv(secretstore.ENV_VAR, "{}")
+    code, out = _custom(monkeypatch, capsys, "show")
+    assert code == 0 and "plaintext key file left" in out
+
+
+def test_keys_reach_another_machine_only_on_request_and_never_a_shared_one(env, monkeypatch, tmp_path, capsys):
+    import subprocess as sp
+    from types import SimpleNamespace
+    from ttp import cli, coordinator, machines, timefmt
+    project, secretstore = _runtime_store_home(env, monkeypatch)
+    project.save_secret("peer-key", _CUSTOM)
+    remote = tmp_path / "remote"
+    (remote / ".tt-project").mkdir(parents=True)
+    real_run = sp.run
+
+    def fake_ssh(argv, **k):   # runs the remote command here, with the remote machine's HOME
+        if argv[:1] != ["ssh"]:
+            return real_run(argv, **k)
+        return real_run(["sh", "-c", argv[-1]], env={"HOME": str(remote), "PATH": os.environ["PATH"]}, **k)
+    monkeypatch.setattr(cli.subprocess, "run", fake_ssh)
+    (remote / ".tt-project" / "secret-store.json").write_text(json.dumps({"backend": "command", "command": ["x"]}))
+    assert "could not copy" in cli.push_secrets("box") and not (remote / ".tt-project" / "secrets.json").exists()
+    (remote / ".tt-project" / "secret-store.json").write_text(json.dumps({"backend": "file", "shared": True}))
+    assert "could not copy" in cli.push_secrets("box") and not (remote / ".tt-project" / "secrets.json").exists()
+    (remote / ".tt-project" / "secret-store.json").unlink()
+    assert "copied keys" in cli.push_secrets("box")
+    assert json.loads((remote / ".tt-project" / "secrets.json").read_text()) == {"peer-key": _CUSTOM}
+    # ttp new --host copies nothing unless --copy-secrets
+    pushed = []
+    monkeypatch.setattr(cli, "push_secrets", lambda host: pushed.append(host) or "copied")
+    monkeypatch.setattr(cli, "ship_runtime", lambda host: "~/stage/bin/ttp")
+    monkeypatch.setattr(machines, "push", lambda host: "machines: pushed")
+    monkeypatch.setattr(timefmt, "in_ssh_login", lambda: True)
+    monkeypatch.setattr(cli, "register", lambda name, entry: None)
+    monkeypatch.setattr(cli, "detect_provider", lambda: "")
+    monkeypatch.setattr(cli.subprocess, "run", lambda argv, **k: SimpleNamespace(returncode=0, stdout="", stderr=""))
+    for copy in (False, True):
+        a = SimpleNamespace(dir="~/root", host="box", no_secrets=False, copy_secrets=copy, name="demo", provider="",
+                            no_service=True, coordinator_effort=coordinator.DEFAULT_EFFORT)
+        cli.new_remote(a, "brief")
+    assert pushed == ["box"] and "saved keys stay on this machine" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("backend, cmd, refused", [
+    ({"backend": "command", "command": ["/opt/it/fetch-keys", "--all"]}, "/opt/it/fetch-keys --all | head", True),
+    ({"backend": "keychain"}, "security find-generic-password -s tt-project-secrets -w", True),
+    ({"backend": "env"}, "printenv TTP_SECRETS_JSON", True),
+    ({"backend": "file"}, "python3 -c 'from ttp import secretstore; print(secretstore.load())'", True),
+    ({"backend": "command", "command": ["/opt/it/fetch-keys", "--all"]}, "ttp secret store", False),
+    ({"backend": "keychain"}, "security list-keychains", False),
+])
+def test_hook_refuses_runs_that_read_the_run_time_store_directly(env, monkeypatch, backend, cmd, refused):
+    from ttp import hook
+    project, secretstore = _runtime_store_home(env, monkeypatch)
+    project.HOME_DIR.mkdir(parents=True, exist_ok=True)
+    secretstore.config_path().write_text(json.dumps(backend))
+    monkeypatch.setenv("TTP_RUN_DIR", str(env["tmp"]))
+    out, _ = hook.pre_tool_use({"tool_name": "Bash", "tool_input": {"command": cmd}, "cwd": str(env["tmp"])})
+    denied = bool(out) and out["hookSpecificOutput"].get("permissionDecision") == "deny"
+    assert denied == refused, out
+
+
+def _fresh_masking(monkeypatch):
+    """A process that never read the store (a run, a hook), outside a sandboxed run."""
+    from ttp import redact
+    monkeypatch.setattr(redact, "_cache", {"sig": None, "pairs": [], "error": None, "ever": False})
+    for var in ("TTP_RUN_DIR", "SANDBOX_RUNTIME"):
+        monkeypatch.delenv(var, raising=False)
+    return redact
+
+
+def test_a_daemon_refuses_the_env_store_and_its_runs_never_inherit_or_miss_it_silently(env, monkeypatch, capsys):
+    from ttp import outscan
+    from ttp.daemon import Daemon
+    p = make(env)
+    project, secretstore = _runtime_store_home(env, monkeypatch)
+    code, out = _custom(monkeypatch, capsys, "store", "env")
+    assert code == 0 and "a daemon refuses to start with it" in out
+    monkeypatch.setenv(secretstore.ENV_VAR, json.dumps({"jev": {"key": _STORE_KEY}}))
+    assert Daemon(p.base).run() == 2
+    err = capsys.readouterr().err
+    assert "daemon refused" in err and "keychain or command" in err and _STORE_KEY not in err
+    assert secretstore.ENV_VAR not in os.environ, "no run started by it inherits the keys"
+    assert not (p.state / "daemon.pid").exists()
+    # A process started without the variable (a run, a hook): the store is unreadable, never empty
+    secretstore._env.clear()
+    secretstore._mem.update(key=None, data=None)
+    redact = _fresh_masking(monkeypatch)
+    assert redact.pairs() == [] and redact.blind() and secretstore.ENV_VAR in redact.store_error()
+    assert "secrets store could not be read" in outscan.problem("ttp notify", "hello", p=p)
+
+
+def test_a_store_unreadable_at_the_runs_end_flags_the_run_and_says_so(env, monkeypatch, capsys):
+    from ttp import runner
+    project, secretstore = _runtime_store_home(env, monkeypatch)
+    secretstore.set_config("command", [str(_fetch_script(env, f'echo "{_STORE_KEY}" >&2\nexit 7\n'))])
+    redact = _fresh_masking(monkeypatch)
+    run_dir = env["tmp"] / "run"
+    run_dir.mkdir()
+    (run_dir / "output.jsonl").write_text(json.dumps({"text": "hello"}) + "\n")
+    exit_info: dict = {"rc": 0}
+    runner._mask_run(run_dir, exit_info)
+    out = capsys.readouterr().out
+    assert "exited 7" in exit_info["unmasked"] and _STORE_KEY not in exit_info["unmasked"]
+    assert "runner: could not mask stored secrets in the run: secret fetch command" in out and _STORE_KEY not in out
+    assert redact.pairs() == [], "pairs() still never raises"
+    # A store read once in this process keeps masking its values: not flagged
+    _fetch_script(env, f'echo \'{{"jev": {{"key": "{_STORE_KEY}"}}}}\'\n')
+    secretstore._mem.update(key=None, data=None)
+    redact._cache["sig"] = None
+    (run_dir / "output.jsonl").write_text(json.dumps({"text": f"leaked {_STORE_KEY}"}) + "\n")
+    exit_info = {"rc": 0}
+    runner._mask_run(run_dir, exit_info)
+    assert "unmasked" not in exit_info and _STORE_KEY not in (run_dir / "output.jsonl").read_text()
+
+
+def test_outscan_refuses_while_the_store_is_unreadable_and_passes_once_it_reads(env, monkeypatch):
+    from ttp import outscan
+    project, secretstore = _runtime_store_home(env, monkeypatch)
+    secretstore.set_config("command", [str(_fetch_script(env, "exit 3\n"))])
+    redact = _fresh_masking(monkeypatch)
+    why = outscan.problem("ttp note --to", "a clean note")
+    assert why and "secrets store could not be read" in why and "nothing was sent" in why
+    _fetch_script(env, f'echo \'{{"jev": {{"key": "{_STORE_KEY}"}}}}\'\n')
+    secretstore._mem.update(key=None, data=None)
+    redact._cache["sig"] = None
+    assert outscan.problem("ttp note --to", "a clean note") is None
+    assert "a stored secret" in outscan.problem("ttp note --to", f"note {_STORE_KEY}")
+
+
+def test_a_shared_host_still_reading_its_plaintext_file_is_reported_truthfully(env, monkeypatch):
+    project, secretstore = _runtime_store_home(env, monkeypatch)
+    project.save_secret("peer-key", _CUSTOM)
+    secretstore.config_path().write_text(json.dumps({"backend": "file", "shared": True}))   # written by hand
+    assert project.load_secrets() == {"peer-key": _CUSTOM}, "the file backend still reads it"
+    line = secretstore.plaintext_report()
+    assert "still reads it" in line and "no longer reads" not in line and _CUSTOM not in line
+    secretstore.config_path().write_text(json.dumps({"backend": "keychain"}))
+    assert "no longer reads or writes it" in secretstore.plaintext_report()
+
+
+@pytest.mark.parametrize("user,account", [("alice.b", "alice.b"), ('ev il" -A', "tt-project"),
+                                          ("a\nadd-internet-password", "tt-project"), ("", "tt-project")])
+def test_the_keychain_line_never_splits_on_the_users_name(env, monkeypatch, user, account):
+    project, secretstore = _runtime_store_home(env, monkeypatch)
+    monkeypatch.setenv("USER", user)
+    seen = []
+    monkeypatch.setattr(secretstore.subprocess, "run", lambda argv, **k: (
+        seen.append(k["input"]), types.SimpleNamespace(returncode=0, stdout="", stderr=""))[1])
+    secretstore._keychain_save({}, {"peer-key": _CUSTOM})
+    words = seen[0].split()
+    assert seen[0].count("\n") == 1 and words[words.index("-a") + 1] == account and len(words) == 8

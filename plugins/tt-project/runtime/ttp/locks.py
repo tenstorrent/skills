@@ -51,7 +51,7 @@ import time
 from pathlib import Path
 
 from . import timefmt
-from .project import FOLDER, durable_write, zombie
+from .project import FOLDER, durable_write, ps_rows, zombie
 
 RESERVE_STALE_S = 120
 
@@ -150,6 +150,15 @@ def start_time(pid, proc: str = "/proc") -> str | None:
             return Path(f"{proc}/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19]
         except (OSError, IndexError):
             return None
+    if (rows := ps_rows()) is not None:   # inside a ps_snapshot: its one `ps`, never one per pid
+        if pid in rows:
+            return rows[pid][1]
+        try:   # not in the snapshot: gone, or started since it was taken (then asked alone)
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return None
+        except OSError:
+            pass
     try:
         out = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True,
                              timeout=5).stdout.strip()
@@ -1199,7 +1208,42 @@ def _ticket_owner(env=None) -> dict:
     out = _owner(os.getpid())
     if (run := _waits_for_run(env)):
         out["run_dir"] = run
+    try:   # the waiter's task and project only label it; an unreadable registry never fails a ticket
+        out |= waiter_ids(env)
+    except Exception:
+        pass
     return out
+
+
+IDENTITY: dict = {}   # the task, run and project root a process with no TTP_TASK adopted (checkcap.adopt_identity)
+
+
+def waiter_ids(env=None) -> dict:
+    """The task, run and project a waiter queues for, for its ticket's record (ticket_task): run_ids, else the
+    adopted IDENTITY's task and run (a `ttp checks` with no TTP_TASK started under a project run)."""
+    env = os.environ if env is None else env
+    out = run_ids(env)
+    if not str(env.get("TTP_TASK") or "").isdigit() and str(IDENTITY.get("task") or "").isdigit():
+        out = {**out, "task_id": IDENTITY["task"], **({"run_id": IDENTITY["run"]} if IDENTITY.get("run") else {})}
+    return out
+
+
+_TASK_RE = re.compile(r"task #(\d+)")
+
+
+def ticket_task(ticket: Path) -> str:
+    """The task a queue ticket waits for: its text's "task #N", else its record's task_id (waiter_ids); ""
+    when neither names one."""
+    try:
+        if m := _TASK_RE.search(ticket.read_text()):
+            return m.group(1)
+    except OSError:
+        return ""
+    try:
+        task = str(json.loads(_owner_file(ticket).read_text()).get("task_id") or "")
+    except (OSError, ValueError, AttributeError):
+        return ""
+    return task if task.isdigit() else ""
 
 
 def _waits_for_run(env=None) -> str:
@@ -1388,7 +1432,8 @@ def _served(locks_dir: Path, resource: str) -> dict[str, float]:
 
 
 def fair_order(locks_dir: Path, resource: str, q: list[Path] | None = None, urgent_max: int = 0,
-               aged_before: float | None = None, aged_turns: int | None = None) -> list[Path]:
+               aged_before: float | None = None, aged_turns: int | None = None,
+               bare_last: bool = False) -> list[Path]:
     """The waiters in the order a fair queue serves them: each next turn goes to the oldest waiter
     of the group that has waited longest since it last got the resource (since its oldest waiter
     arrived, if later), so one group's burst cannot starve the others. Within a group by task priority
@@ -1419,8 +1464,15 @@ def fair_order(locks_dir: Path, resource: str, q: list[Path] | None = None, urge
 
     A requeued waiter (REQUEUED_TICKET: it gave its slot up to a more urgent one) keeps its place over all of
     these turns: it goes ahead of the waiters before it that arrived after it at its priority or a less urgent
-    one (requeued_place), so its project's turn spent on the run that took its slot never sends it back."""
+    one (requeued_place), so its project's turn spent on the run that took its slot never sends it back.
+
+    `bare_last`: waiters with no group (a run with no project) go after every grouped one, by priority then
+    arrival, aged or not (accepted gap: they wait while any project's waiter does)."""
     q = queued(locks_dir, resource) if q is None else q
+    if bare_last and (bare := [t for t in q if not ticket_group(t)]):
+        rest = [t for t in q if ticket_group(t)]
+        return (fair_order(locks_dir, resource, rest, urgent_max, aged_before, aged_turns) if rest else []) + \
+            sorted(bare, key=lambda t: (ticket_priority(t), _arrival(t)))
     first = urgent_max == URGENT_FIRST
     aged = sorted((t for t in q if _arrival(t) <= aged_before and not ((first or urgent_max > 0) and _urgent(t))),
                   key=_arrival) if aged_before is not None else []
@@ -1528,12 +1580,12 @@ def mark_turn(locks_dir: Path, resource: str, ticket: Path | None) -> None:
 
 def my_turn(locks_dir: Path, resource: str, ticket: Path, slots: int, fair: bool = False,
             urgent_max: int = 0, past_multi: bool = False, aged_before: float | None = None,
-            aged_turns: int | None = None) -> bool:
+            aged_turns: int | None = None, bare_last: bool = False) -> bool:
     """Whether this ticket may take the resource now. An exclusive one: among the first `slots`
     waiters (urgent tickets, task priority URGENT_PRIORITY or better, before the rest), one per free
     slot, with no shared waiter ahead. A shared one: no exclusive waiter
     ahead, so it never jumps one. `fair`: waiters are counted in fair_order (with `urgent_max`), not
-    arrival order (and `aged_before`, `aged_turns` as there). Either way landing waiters go first (landing_first). `past_multi`
+    arrival order (and `aged_before`, `aged_turns`, `bare_last` as there). Either way landing waiters go first (landing_first). `past_multi`
     (a waiter that holds locks already): waiters for several resources at
     once ahead are not counted, as one of them may wait for a lock this waiter's holder has: waiting
     behind it would never end."""
@@ -1541,7 +1593,7 @@ def my_turn(locks_dir: Path, resource: str, ticket: Path, slots: int, fair: bool
     if ticket not in q:   # none queued, unless it was this process's and was dropped (its run ended): never
         return not dropped(ticket)
     if fair:
-        q = fair_order(locks_dir, resource, q, urgent_max, aged_before, aged_turns)
+        q = fair_order(locks_dir, resource, q, urgent_max, aged_before, aged_turns, bare_last)
     else:   # urgent waiters (an urgent task's) first, a user-ordered one (priority 0) before them, arrival
         q = sorted(q, key=lambda t: min(ticket_priority(t), URGENT_PRIORITY + 1))   # order within: plain arrival
     q = landing_first(q)

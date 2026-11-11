@@ -238,6 +238,83 @@ def test_runtime_is_standard_library_only_and_python39_compatible():
             assert "from __future__ import annotations" in src, f"{py}: PEP 604 unions need the future import on 3.9"
 
 
+def _unparenthesized_walrus_needing_310(src: str) -> list:
+    """Line numbers of `:=` that Python 3.9 rejects unparenthesized but 3.10 accepts: as a subscript
+    index (`d[k := v]`, `d[1, k := v]`) or a set element (`{k := v}`). ast.parse(feature_version=(3, 9))
+    lets these through on a newer Python; an expression's position excludes its parentheses."""
+    raw = src.encode("utf-8")
+    starts = [0]
+    for line in raw.splitlines(keepends=True):
+        starts.append(starts[-1] + len(line))
+
+    def bare(node) -> bool:   # col_offset counts UTF-8 bytes
+        i = starts[node.lineno - 1] + node.col_offset - 1
+        while i >= 0 and raw[i:i + 1].isspace():
+            i -= 1
+        return raw[i:i + 1] != b"("
+
+    found = []
+    for node in ast.walk(ast.parse(src)):
+        if isinstance(node, ast.Subscript):
+            s = node.slice
+            items = [s] if isinstance(s, ast.NamedExpr) else (
+                s.elts if isinstance(s, ast.Tuple) and raw[starts[s.lineno - 1] + s.col_offset:][:1] != b"(" else [])
+        elif isinstance(node, ast.Set):
+            items = node.elts
+        elif isinstance(node, ast.SetComp):
+            items = [node.elt]
+        else:
+            continue
+        found += [e.lineno for e in items if isinstance(e, ast.NamedExpr) and bare(e)]
+    return found
+
+
+def test_the_walrus_check_finds_what_python39_rejects_and_passes_what_it_takes():
+    rejected = ['h[k := 1] = 2', 'h[1, k := 2]', '{k := 1}', '{1, k := 2}', '{k := x for x in y}',
+                'h[\n    k := 1]']
+    accepted = ['h[(k := 1)] = 2', 'h[ ( k := 1 ) ]', 'h[(1, k := 2)]', 'h[1, (k := 2)]', '{(k := 1)}',
+                '{(k := x) for x in y}', '[k := 1]', 'f(k := 1)', 'if (k := 1): pass', 'h["é", (k := 1)]',
+                'h["é"] = [k := 1]']
+    assert [s for s in rejected if not _unparenthesized_walrus_needing_310(s)] == []
+    assert [s for s in accepted if _unparenthesized_walrus_needing_310(s)] == []
+
+
+def test_runtime_has_no_walrus_python39_rejects_and_compiles_under_a_real_39():
+    bad = [f"{py.relative_to(PLUGIN)}:{n}" for py in sorted(RUNTIME.rglob("*.py"))
+           for n in _unparenthesized_walrus_needing_310(py.read_text(encoding="utf-8"))]
+    assert bad == [], f"unparenthesized := is a SyntaxError before Python 3.10: {bad}"
+    # The real check, where a 3.9 is installed (macOS Command Line Tools ship one, and a launchd service
+    # may run it): compile every runtime file and import every ttp module under it.
+    import shutil
+    import subprocess
+    py39 = next((p for p in ("/Library/Developer/CommandLineTools/usr/bin/python3.9", shutil.which("python3.9"))
+                 if p and os.access(p, os.X_OK)), None)
+    if not py39:
+        return
+    code = ("import compileall, importlib, pkgutil, sys\n"
+            "assert sys.version_info[:2] == (3, 9), sys.version\n"
+            "root = sys.argv[1]\n"
+            "if not compileall.compile_dir(root, quiet=1, legacy=True, force=True, ddir=root, workers=1):\n"
+            "    sys.exit('compile failed')\n"
+            "sys.path.insert(0, root)\n"
+            "import ttp\n"
+            "bad = []\n"
+            "for m in pkgutil.walk_packages(ttp.__path__, 'ttp.'):\n"
+            "    if m.name.endswith('.__main__'):\n"   # importing it runs the CLI
+            "        continue\n"
+            "    try:\n"
+            "        importlib.import_module(m.name)\n"
+            "    except Exception as e:\n"
+            "        bad.append(f'{m.name}: {type(e).__name__}: {e}')\n"
+            "print('\\n'.join(bad)); sys.exit(1 if bad else 0)\n")
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:   # compileall writes .pyc files: never into the plugin
+        shutil.copytree(RUNTIME, pathlib.Path(tmp) / "ttp")
+        r = subprocess.run([py39, "-I", "-c", code, tmp], capture_output=True, text=True, timeout=300,
+                           env={"PATH": "/usr/bin:/bin", "HOME": tmp, "PYTHONDONTWRITEBYTECODE": ""})
+    assert r.returncode == 0, f"under {py39}:\n{r.stdout[-3000:]}{r.stderr[-3000:]}"
+
+
 def test_no_secrets_or_personal_paths():
     assert_no_leaks([re.compile(p) for p in FORBIDDEN], plugin_text_files())
     # The plugin's tests ship in the same open-source repository, the runtime tests' area case files
@@ -594,6 +671,19 @@ def test_review_lists_every_blocking_finding_and_fixes_test_each_bug_class():
     assert "test each class of bug found, not only the reported case" in code
 
 
+def test_reviews_and_landings_never_wait_on_a_repeat_of_a_passed_test():
+    """A review judges the diff plus the gate results for its head and never waits on a repeat of a
+    passed test; only the required checks and the verdict hold a landing."""
+    prompts = PLUGIN / "template" / "prompts"
+    review = " ".join((prompts / "kind-review.md").read_text(encoding="utf-8").split())
+    assert "Judge the diff plus the gate results that already exist for the head you review" in review
+    assert "Never start or wait on a repeat of a test that already passed on that head" in review
+    assert "a further test you want is a finding in your verdict, and the verdict still goes out" in review
+    assert "Only the required checks and your verdict hold a landing." in review
+    code = " ".join((prompts / "kind-code.md").read_text(encoding="utf-8").split())
+    assert "A landing waits only on the required checks (suite, any smoke test) and the review's verdict;" in code
+
+
 
 def test_code_workers_get_the_exact_checks_commands_and_no_unconditional_pytest_n():
     """The code prompt names each `ttp checks` form a worker needs (start, detached, result probe, the
@@ -605,7 +695,8 @@ def test_code_workers_get_the_exact_checks_commands_and_no_unconditional_pytest_
         assert part in code, part
     worker = " ".join((PLUGIN / "template" / "prompts" / "worker.md").read_text(encoding="utf-8").split())
     assert "Cap pytest -n at $TTP_TEST_SLOTS." not in worker
-    assert "Cap pytest -n at $TTP_TEST_SLOTS, only with xdist." in worker
+    assert "Cap pytest -n at $TTP_TEST_SLOTS" not in worker, "a bare -n $TTP_TEST_SLOTS holds no host test slots"
+    assert "pytest -n N (xdist): `ttp clip -- ttp sandbox --`, N <= $TTP_TEST_SLOTS." in worker
 
 
 def test_code_workers_try_to_break_their_change_before_the_hand_off():
@@ -1165,6 +1256,24 @@ def test_the_daily_review_judges_a_cache_hit_drop_on_the_within_1h_rate():
     assert "not a regression: no friction task" in review
 
 
+def _nested_pytest_env(**extra):
+    """The environment of a pytest run a test starts on a copy of tests/conftest.py, without the outer
+    run's CI and xdist variables: under `pytest -n` the inherited PYTEST_XDIST_WORKER made the copy take
+    the nested run for an xdist worker, so it ran in one process with no session checks."""
+    env = {k: v for k, v in os.environ.items() if k != "CI" and not k.startswith("PYTEST_XDIST_")}
+    return {**env, **extra}
+
+
+def test_a_nested_pytest_run_never_inherits_the_outer_runs_xdist_or_ci_variables(monkeypatch):
+    """The forked-runner tests failed under `pytest -n` (a test host's -n 48 full suite) and passed on CI."""
+    for var, value in (("PYTEST_XDIST_WORKER", "gw3"), ("PYTEST_XDIST_WORKER_COUNT", "48"),
+                       ("PYTEST_XDIST_TESTRUNUID", "x"), ("CI", "true")):
+        monkeypatch.setenv(var, value)
+    env = _nested_pytest_env(TTP_TEST_JOBS="3")
+    assert env["TTP_TEST_JOBS"] == "3" and env["PATH"] == os.environ["PATH"]
+    assert not [k for k in env if k == "CI" or k.startswith("PYTEST_XDIST_")], env
+
+
 def test_the_forked_test_runner_reports_every_test_once_as_one_process_would(tmp_path):
     """tests/conftest.py runs the tt-project tests in forked workers: every test runs exactly once,
     failures, skips and warnings come back as in one process, other files stay in one worker in
@@ -1177,7 +1286,7 @@ def test_the_forked_test_runner_reports_every_test_once_as_one_process_would(tmp
         "@pytest.mark.parametrize('i', range(60))\n"
         "def test_ok(i, tmp_path):\n"
         "    pathlib.Path(os.environ['OUT'], f'ok-{i}').write_text(str(os.getpid()))\n"
-        "    pathlib.Path(os.environ['OUT'], f'nice-{i}').write_text(str(os.nice(0)))\n"
+        "    pathlib.Path(os.environ['OUT'], f'nice-{i}').write_text(str(os.getpriority(os.PRIO_PROCESS, 0)))\n"
         "    pathlib.Path(os.environ['OUT'], f'tmp-{i}').write_text(str(tmp_path.parent))\n"
         "def test_fail(): assert 1 == 2, 'boom'\n"
         "def test_skip(): pytest.skip('not here')\n"
@@ -1191,8 +1300,7 @@ def test_the_forked_test_runner_reports_every_test_once_as_one_process_would(tmp
     def run(jobs):
         out = tmp_path / f"out-{jobs}"
         out.mkdir()
-        env = {**os.environ, "TTP_TEST_JOBS": str(jobs), "OUT": str(out)}
-        env.pop("CI", None)
+        env = _nested_pytest_env(TTP_TEST_JOBS=str(jobs), OUT=str(out))
         r = subprocess.run([sys.executable, "-m", "pytest", "-q", "-rfEs", "-p", "no:cacheprovider", "-W",
                             "default", str(tmp_path)], cwd=str(tmp_path), env=env, capture_output=True,
                            text=True, timeout=120)
@@ -1211,8 +1319,9 @@ def test_the_forked_test_runner_reports_every_test_once_as_one_process_would(tmp
     pids = {(out / f"ok-{i}").read_text() for i in range(60)}
     assert len(pids) > 1 and str(os.getpid()) not in pids, "the tests did not run in forked workers"
     # Off CI the workers run at a lower priority, and the run ends with its wall and CPU time.
-    nice = os.nice(0)
-    assert {int((out / f"nice-{i}").read_text()) for i in range(60)} == {min(19, nice + 10)}
+    # Read, not os.nice(0): macOS refuses that at its ceiling of 20 (Linux: 19), where a niced shell's run sits.
+    nice, top = os.getpriority(os.PRIO_PROCESS, 0), 20 if sys.platform == "darwin" else 19
+    assert {int((out / f"nice-{i}").read_text()) for i in range(60)} == {min(top, nice + 10)}
     # Each worker has its own temp root in the session's: workers sharing one raced for tmp_path's
     # numbered folders, and pytest gave up after 10 lost races ('could not create numbered dir').
     roots = {}
@@ -1252,8 +1361,7 @@ def test_the_forked_test_runner_names_a_test_that_closes_or_replaces_its_workers
         "def test_closes_out(request): os.close(_fd(request, 'out_w'))\n"
         "def test_replaces_out(request): _replace(request, 'out_w', os.O_WRONLY)\n"
         "def test_replaces_queue(request): _replace(request, 'work_r', os.O_RDONLY)\n")
-    env = {**os.environ, "TTP_TEST_JOBS": "3"}
-    env.pop("CI", None)
+    env = _nested_pytest_env(TTP_TEST_JOBS="3")
     status = 97
     for name, fd, how in (("test_closes_out", "out_w", "closed"), ("test_replaces_out", "out_w", "replaced"),
                           ("test_replaces_queue", "work_r", "replaced")):
@@ -1290,8 +1398,7 @@ def test_the_test_runner_restores_the_signal_handlers_and_mask_a_test_left_chang
         "    signal.signal(signal.SIGHUP, lambda s, f: None)\n"
         "    signal.signal(signal.SIGUSR1, signal.SIG_IGN)\n"
         "    signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT, signal.SIGUSR2})\n")
-    env = {**os.environ, "TTP_TEST_JOBS": str(jobs)}
-    env.pop("CI", None)
+    env = _nested_pytest_env(TTP_TEST_JOBS=str(jobs))
     r = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", str(tmp_path)],
                        cwd=str(tmp_path), env=env, capture_output=True, text=True, timeout=120)
     assert r.returncode == 0 and "60 passed" in r.stdout, r.stdout + r.stderr
@@ -1330,7 +1437,7 @@ def test_every_test_gets_its_own_temp_home_and_a_session_that_writes_outside_fai
     (repo / "plugins" / "tt-project").mkdir(parents=True)   # the plugin's credential list (credwatch)
     (repo / "plugins" / "tt-project" / "runtime").symlink_to(RUNTIME.parent)
     (repo / "test_tt_project_home.py").write_text(
-        "import os, pathlib, subprocess, time, pytest\n"
+        "import os, pathlib, shlex, subprocess, sys, time, pytest\n"
         "REAL = os.environ['REAL']\n"
         "assert not os.environ['HOME'].startswith(REAL) and not os.environ['GH_CONFIG_DIR'].startswith(REAL)\n"
         "@pytest.mark.parametrize('i', range(60))\n"
@@ -1341,7 +1448,7 @@ def test_every_test_gets_its_own_temp_home_and_a_session_that_writes_outside_fai
         "    assert os.environ['GH_CONFIG_DIR'] == str(home / '.config' / 'gh')\n"
         "    sh = 'echo \"$HOME\"; cd ~ && printf x > .bashrc && git config --global t.k v'\n"
         "    if i == 0:\n"
-        "        sh += ' && python3 -c \"import pytest\"'   # the account's user packages still import\n"
+        "        sh += f' && {shlex.quote(sys.executable)} -c \"import pytest\"'   # the account's user packages still import\n"
         "        # The account's git config, copied: git's answer cache keeps nothing while one has an include.\n"
         "        assert '[include' not in (home / '.gitconfig').read_text()\n"
         "        assert subprocess.run(['git', 'config', '--global', 't.mine'], capture_output=True, text=True).stdout == '1\\n'\n"
@@ -1386,8 +1493,8 @@ def test_every_test_gets_its_own_temp_home_and_a_session_that_writes_outside_fai
         "        tmp.write_text(text + os.environ.get('REWRITE', ''))\n"
         "        os.replace(tmp, path)\n"
         "        os.utime(path, ns=(path.stat().st_atime_ns, path.stat().st_mtime_ns + 10**9))\n")
-    env = {**os.environ, "HOME": str(real), "REAL": str(real), "OUT": str(out), "TTP_TEST_JOBS": "3"}
-    for var in ("CI", "GIT_CONFIG_GLOBAL", "GH_CONFIG_DIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME"):
+    env = _nested_pytest_env(HOME=str(real), REAL=str(real), OUT=str(out), TTP_TEST_JOBS="3")
+    for var in ("GIT_CONFIG_GLOBAL", "GH_CONFIG_DIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME"):
         env.pop(var, None)
 
     def run(*args, **extra):
@@ -4973,7 +5080,7 @@ def test_guide_documents_the_product_defaults():
     """Caps, the plan line and its reserve, free Codex resets, light-tier models and Jev as an add-on."""
     text = (PLUGIN / "docs" / "guide.md").read_text(encoding="utf-8")
     flat = " ".join(text.split())
-    assert "$100 per 24 hours and $200 per 7 days per project by default" in flat
+    assert "$100 per 24 hours per project by default" in flat and "7 times the daily cap in force ($700 by default)" in flat
     assert "Global daily cap (usage-billed, $200/day by default)" in flat
     assert "The 90% line is the default (`budget.reserve_pct` 10)" in flat
     assert "only that 10% is left for you" in flat and "raise the reserve" in flat
@@ -7354,3 +7461,21 @@ def test_coordinator_prompt_and_harness_skill_run_approved_work_while_the_charte
                  "Approved work never waits on this: the coordinator queues it at once citing the approval, and a "
                  "refused change is never re-asked."):
         assert want in guard, want
+
+
+def test_chat_skill_waits_with_one_blocking_listen_and_hands_over_a_long_chat():
+    """A host with no background wake-up waits with one long blocking `ttp listen --once --timeout`,
+    never with polls; a chat whose context grows large hands over and continues fresh. Both generic."""
+    hosts = " ".join((SKILLS / "tt-project" / "hosts.md").read_text(encoding="utf-8").split())
+    skill = " ".join((SKILLS / "tt-project" / "SKILL.md").read_text(encoding="utf-8").split())
+    assert "## Codex and other hosts with no background wake-up" in (SKILLS / "tt-project" / "hosts.md").read_text()
+    assert "Wait with one long blocking call, never with polls." in hosts
+    assert "`ttp listen <name> --chat <id> --once --timeout 600 --ack <last id shown>`" in hosts
+    assert "NEVER start the listener (or any command) in the background and check its output every few seconds" in hosts
+    assert "--timeout 90" not in hosts
+    assert "write a short hand-over" in hosts and "Continue in a fresh chat or thread" in hosts
+    assert "one long blocking `ttp listen --once --timeout`, never with polls" in skill
+    assert "write a short hand-over and continue in a fresh thread" in skill
+    # Generic: no host model names or sizes in the advice.
+    for text in (hosts, skill):
+        assert not re.search(r"gpt-|claude-|\b\d+ ?[kM] tokens", text)

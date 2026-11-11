@@ -65,23 +65,30 @@ def normalize_action(action: dict) -> dict:
     return out
 
 
-def drop_nulls(value):
+def drop_nulls(value, sparse: bool = False):
+    """`sparse`: an answer under a schema that lets unused fields be left out (strict_schema with
+    require_all=False). A null there is padding too, as under the all-required schema: only
+    clear_fields clears a schedule field, so a left-out clear_fields is not the legacy form."""
     if isinstance(value, dict):
         if value.get("type") and ("clear_fields" in value or any(k in value for k in NULL_OPERATIONS)):
+            if sparse and "clear_fields" not in value:
+                value = {**value, "clear_fields": None}
             try:
                 return normalize_action(value)
             except ValueError:
                 return value   # the application boundary rejects an invalid clear operation
-        return {k: drop_nulls(v) for k, v in value.items() if v is not None}
+        return {k: drop_nulls(v, sparse) for k, v in value.items() if v is not None}
     if isinstance(value, list):
-        return [drop_nulls(v) for v in value]
+        return [drop_nulls(v, sparse) for v in value]
     return value
 
 
-def strict_schema(schema):
+def strict_schema(schema, require_all: bool = True):
     """Close every object (including nullable objects and anyOf branches), and require all
-    properties. Optional properties are nullable. Pattern validation stays in the local parser
-    so the wire schema also works with providers/models that do not accept that keyword.
+    properties (require_all=False: only each object's own `required`, so an answer leaves unused
+    fields out instead of padding them with nulls). Optional properties are nullable either way.
+    Pattern validation stays in the local parser so the wire schema also works with
+    providers/models that do not accept that keyword.
     Unspecified free-form objects are refused instead of silently losing their keys.
     """
     if not isinstance(schema, dict):
@@ -89,11 +96,11 @@ def strict_schema(schema):
     out = {k: v for k, v in schema.items() if k != "pattern"}
     for key in ("items",):
         if key in out:
-            out[key] = strict_schema(out[key])
+            out[key] = strict_schema(out[key], require_all)
     if "anyOf" in out:
-        out["anyOf"] = [strict_schema(s) for s in out["anyOf"]]
+        out["anyOf"] = [strict_schema(s, require_all) for s in out["anyOf"]]
     if "$defs" in out:
-        out["$defs"] = {k: strict_schema(v) for k, v in out["$defs"].items()}
+        out["$defs"] = {k: strict_schema(v, require_all) for k, v in out["$defs"].items()}
     types = schema.get("type", [])
     types = [types] if isinstance(types, str) else types
     if "object" in types or "properties" in schema:
@@ -101,9 +108,9 @@ def strict_schema(schema):
         if not isinstance(props, dict):
             raise ValueError("strict output requires a full object properties schema")
         required = set(schema.get("required") or [])
-        out["properties"] = {k: strict_schema(v) if k in required else _nullable(strict_schema(v))
-                             for k, v in props.items()}
-        out["required"] = list(props)
+        out["properties"] = {k: strict_schema(v, require_all) if k in required
+                             else _nullable(strict_schema(v, require_all)) for k, v in props.items()}
+        out["required"] = list(props) if require_all else [k for k in props if k in required]
         out["additionalProperties"] = False
     return out
 
@@ -204,6 +211,7 @@ class RunUsage:
     final_text: str = ""             # the agent's last message
     structured: dict | None = None   # schema-validated output, when requested and supported
     actions_text: str = ""           # the newest main-agent text holding an {"actions": [...]} object
+    answer: dict | None = None       # a whole final answer the run's budget end kept from being applied
     auth_failed: bool = False        # the provider is logged out or its credentials are invalid
     limited: bool = False            # the provider refused for quota/limit reasons
     limit_note: str = ""
@@ -300,8 +308,8 @@ class Provider:
         """Return (argv, extra_env) for a headless run whose prompt arrives on stdin. A worker's run
         also denies `disallowed_tools` (the project's providers.<p>.disallowed_tools), and reads of the
         files in `denied_reads` (absolute paths: the user's credentials, such as the web token), where
-        the agent can. `web` False keeps the web tools from a task that does not need them
-        (daemon.web_needed), where the agent can."""
+        the agent can. `web` False keeps the web tools from the run (a benchmark arm), where the agent
+        can; the no_internet restriction does too."""
         raise NotImplementedError
 
     def parse(self, output_path: Path, stderr_path: Path | None = None) -> RunUsage:
@@ -340,11 +348,56 @@ class Provider:
         own, which may point the agent at another config directory), is still on disk to resume."""
         return False
 
+    # The saved-session format fork_session copies: a session saved by one provider can be forked into a
+    # run of another with the same format (the chat provider runs Claude Code, so it forks a Claude
+    # session; ctxfork.py). "" for none.
+    session_format = ""
+    no_fork_why = ""   # why this provider has no fork_session, for fork_gap's report
+
     def fork_session(self, session_id: str, cwd: str, env: dict | None, new_id: str) -> str:
         """Copy the saved session `session_id` to a new session `new_id` that a run in `cwd` with the
         environment `env` resumes (resume_args(new_id)), so the run starts from its history and never
         writes into it (ctxfork.py); "" once done, else why not."""
         return f"{self.name} cannot fork a saved session"
+
+    def fork_gap(self, src_provider: str) -> str:
+        """Why a run on this provider cannot start from a session a `src_provider` run saved; "" when it
+        can (the same session format, and it resumes sessions). The report of each provider's start mode
+        (fork, else the disk block) and the check every caller makes before start_from_session."""
+        if type(self).fork_session is Provider.fork_session:
+            return self.no_fork_why or f"{self.name} cannot fork a saved session"
+        if src_provider != self.name:
+            from . import get_provider
+            try:
+                other = get_provider(src_provider).session_format
+            except KeyError:
+                other = ""
+            if not other or other != self.session_format:
+                return (f"the session runs on {src_provider or 'another provider'}, this run on {self.name}, "
+                        "which cannot resume its sessions")
+        if not self.resume_args("x"):
+            return f"{self.name} cannot resume a session"
+        return ""
+
+    def start_from_session(self, src_provider: str, session_id: str, cwd: str, env: dict | None,
+                           new_id: str) -> str:
+        """The one way any caller (a worker forking the coordinator, a follow-up resuming its worker's
+        session) starts a run on this provider from a saved session: copy `session_id`, saved by a
+        `src_provider` run, to `new_id`, which resume_args(new_id) continues; the source is never
+        written. "" once done, else why not (the caller then takes the disk block)."""
+        return self.fork_gap(src_provider) or self.fork_session(session_id, cwd, env, new_id)
+
+    def own_instructions(self, session_id: str, cwd: str, env: dict | None, text: str) -> str:
+        """Give a worker or reviewer run that resumes a saved session (a fork of the coordinator's, a
+        follow-up's resume, its own continued one) `text`, this launch's system prompt, where the agent
+        keeps the session's first one on a resume. "" once done or not needed (default: the agent takes
+        each launch's system prompt, as Claude Code's --append-system-prompt-file), else why not."""
+        return ""
+
+    def add_subagent_usage(self, usage: "RunUsage", output_path: Path, since: float | None = None,
+                           env: dict | None = None) -> None:
+        """Add to `usage` (parse's) what the run's sub-agents spent where the agent books them apart from
+        the run's own stream (Codex: each in its own rollout). Default: nothing apart."""
 
     def coord_tools(self, argv: list[str], cwd: str, settings: dict, full: bool,
                     web: bool = True) -> tuple[list[str], dict]:
@@ -431,8 +484,8 @@ class Provider:
 
     def connector_env(self, keep: bool) -> dict[str, str]:
         """Environment that leaves the user's account connectors (servers the agent's account adds,
-        not the user's or project's own) out of a non-isolated worker unless `keep`; {} if this
-        agent has none to leave out."""
+        not the user's or project's own) out of a non-isolated worker unless `keep`; with `keep`, any
+        environment the agent needs to load them reliably. {} if this agent has none."""
         return {}
 
     def is_connector(self, name: str) -> bool:
@@ -523,7 +576,9 @@ class Provider:
 
     def cut_off_cost(self, output_path: Path, since: float | None = None, env: dict | None = None) -> float | None:
         """The price of the tokens a run spent before it was cut off without reporting usage, when
-        the provider can tell (None: the daemon books the elapsed share of the budget instead)."""
+        the provider can tell (None: the daemon books the elapsed share of the budget instead). It
+        includes what add_subagent_usage would add: the daemon adds that only when this did not price
+        the run."""
         return None
 
     def windows_so_far(self, output_path: Path, since: float | None = None, env: dict | None = None,
@@ -541,6 +596,32 @@ class Provider:
         whole lines count, so a line still being written is read next time. None here: runwatch falls back
         to progress.md and git."""
         return [], offset
+
+    final_events: tuple[str, ...] = ()   # stream event types that end a run (its last turn's result)
+
+    def stream_ended(self, output_path: Path) -> bool:
+        """Whether the run's stream already holds its final event (one of final_events) among its last
+        STREAM_END_BYTES: the run's work is over even before its runner writes exit.json. False when the
+        provider names none or the stream cannot be read."""
+        if not self.final_events:
+            return False
+        try:
+            with open(output_path, "rb") as fh:
+                fh.seek(max(os.fstat(fh.fileno()).st_size - STREAM_END_BYTES, 0))
+                tail = fh.read().decode(errors="replace")
+        except OSError:
+            return False
+        for line in reversed(tail.splitlines()):
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
+            try:
+                ev = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(ev, dict) and ev.get("type") in self.final_events:
+                return True
+        return False
 
     def harness_hook(self, argv: list[str]) -> bool:
         """Whether a run started with `argv` passes its tool calls through the harness hook (ttp.hook);
@@ -604,6 +685,7 @@ def jsonl_from(path: Path, offset: int, needles: tuple[bytes, ...]) -> tuple[lis
     return out, offset
 
 
+STREAM_END_BYTES = 65536   # the end of a run's stream stream_ended reads
 CMD_MAX = 400   # characters of a shell command an activity event keeps
 
 

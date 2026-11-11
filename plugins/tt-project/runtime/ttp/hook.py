@@ -250,8 +250,24 @@ def _quiet(check: Callable[[Path], str | None], path: Path) -> str | None:
         return None
 
 
+def mark_untrusted(payload: dict, run_dir: str) -> None:
+    """Record that a task run (a subagent's call too) read web, connector or downloaded text (untrusted.py)."""
+    try:
+        from . import coordtools, untrusted
+        tool = str(payload.get("tool_name") or "")
+        if not os.environ.get("TTP_TASK") or os.environ.get(coordtools.ROLE_ENV) == "coordinator":
+            return
+        cmd = str((payload.get("tool_input") or {}).get("command") or "") if tool == "Bash" else ""
+        if src := untrusted.read_source(tool, _all_segments(_split(cmd)[0]) if cmd else None):
+            untrusted.mark(run_dir, src)
+    except Exception:   # fails open, as the hook does
+        pass
+
+
 def post_tool_use(payload: dict) -> tuple[dict | None, Callable[[], None] | None]:
     run_dir = os.environ.get("TTP_RUN_DIR")
+    if run_dir:
+        mark_untrusted(payload, run_dir)
     if not run_dir or payload.get("agent_id"):
         return None, None
     parts, marks = [], []
@@ -813,7 +829,7 @@ WEB_TOKEN_RE = re.compile(r"state/+web\.token\b")
 # output stays in the run's log and its agent's transcript, so a run tests a key with
 # `ttp secret check` and gives one to a command with `ttp secret env` (also `--secret`) instead.
 SECRET_FILE_RE = re.compile(r"(?:\.tt-project|TTP_HOME\}?)/+secrets\.json\b")
-SECRET_CALL_RE = re.compile(r"(?<!def )\b(?:credentials|load_secrets|env_for)\s*\(|\bendpoint\.saved\s*\(|\bsecrets_path\s*\(")
+SECRET_CALL_RE = re.compile(r"(?<!def )\b(?:credentials|load_secrets|env_for)\s*\(|\bendpoint\.saved\s*\(|\bsecrets_path\s*\(|\bsecretstore\.(?:load|BACKENDS|_\w+_load)\b")
 
 
 def secret_read(cmd: str, segments: list[list[str]], cwd: str) -> str | None:
@@ -828,8 +844,9 @@ def secret_read(cmd: str, segments: list[list[str]], cwd: str) -> str | None:
         return why
     try:
         from .project import secrets_path
-        if str(secrets_path()) in cmd:
-            return why
+        from .secretstore import ENV_VAR, command_words
+        if any(w and w in cmd for w in (str(secrets_path()), ENV_VAR, *command_words())):
+            return why   # also the keychain item or this machine's fetch command, run directly
     except Exception:
         pass
     runs = [s for s in segments if s and _interpreter_args(s) is not None]
@@ -853,6 +870,89 @@ PATCH_FILE_RE = re.compile(r"^[ \t]*\*\*\*[ \t]*(?:(?:Add|Update|Delete)[ \t]+Fi
 HARNESS_GH_WHY = ("the harness's gh wrapper (bin/gh) and the project's gh pre-hooks (bin/gh.d) change only in a "
                   "harness task: other runs never edit, move or disable them, and a command naming their path is "
                   "refused (call gh by its name; read them with the Read tool)")
+
+
+# Tools of Claude Code's full standard set (every run has it, user msg #2302) that would step outside
+# the harness: refused by name, inside subagents too, with the harness's own way instead.
+_WAIT_WAY = ("a headless run ends when its task does, so the CLI's own schedule never wakes it: hand off "
+             "`waiting` with a `retry_when`, start long work with `ttp detach`, and ask for a recurring job "
+             "in a follow-up")
+HARNESS_TOOLS = {
+    "CronCreate": _WAIT_WAY, "CronDelete": _WAIT_WAY, "ScheduleWakeup": _WAIT_WAY,
+    "RemoteTrigger": ("a remote agent runs outside the project's spend caps and guards: put the work in a "
+                      "follow-up task, or start a subagent with the Agent tool"),
+    "EnterWorktree": ("a run works in the worktree the harness made for it; another repository: your own "
+                      "`git worktree` of it, used by path"),
+    "ExitWorktree": "a run works in the worktree the harness made for it",
+    "PushNotification": "a run tells the user with `ttp notify \"<text>\"`, which the project's settings route",
+}
+SEARCH_TOOLS = ("Grep", "Glob")
+_GLOB_CHARS = re.compile(r"[*?[{]")
+
+
+def harness_tool(tool: str) -> str | None:
+    why = HARNESS_TOOLS.get(tool)
+    return f"{tool} is refused here: {why}" if why else None
+
+
+def search_scope(tool: str, args: dict, cwd: str) -> str | None:
+    """Why a Grep or Glob call would search from /, the home folder or a folder above it (the worker
+    rule: search the working directory, the project root and paths the charter or memory names)."""
+    if tool not in SEARCH_TOOLS:
+        return None
+    starts = [str(args.get("path") or "") or cwd]
+    pattern = str(args.get("pattern") or "") if tool == "Glob" else ""
+    if pattern.startswith(("/", "~")):   # a Glob pattern names its own start: its part before the first wildcard
+        parts = pattern.split("/")
+        starts.append("/".join(parts[:next((i for i, x in enumerate(parts) if _GLOB_CHARS.search(x)), len(parts))])
+                      or "/")
+    home = os.path.realpath(os.path.expanduser("~"))
+    for start in starts:
+        path = os.path.expanduser(start)
+        real = os.path.realpath(path if os.path.isabs(path) else os.path.join(cwd, path))
+        if real == "/" or real == home or home.startswith(real.rstrip(os.sep) + os.sep):
+            return (f"{tool} would search all of {start}: search your working directory, the project root and "
+                    "paths your charter or memory names, never / or the home folder (slow, and it can raise "
+                    "privacy prompts)")
+    return None
+
+
+def _git_op_in_progress(path: str) -> bool:
+    """Whether the repository holding `path` is in a merge, rebase or cherry-pick (a conflict to resolve)."""
+    d = path if os.path.isdir(path) else os.path.dirname(path)
+    while d and not os.path.isdir(d):
+        d = os.path.dirname(d)
+    from . import gitmemo
+    try:
+        gdir = gitmemo.run(["git", "-C", d or "/", "rev-parse", "--absolute-git-dir"], capture_output=True,
+                           text=True, timeout=5).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return bool(gdir) and any(os.path.exists(os.path.join(gdir, n)) for n in
+                              ("rebase-merge", "rebase-apply", "MERGE_HEAD", "CHERRY_PICK_HEAD"))
+
+
+def reviewer_write(payload: dict) -> str | None:
+    """Why a review's file-tool write is refused: a review never edits the change it judges, so its Edit,
+    Write and NotebookEdit calls write only in its run directory or a temporary folder, or in a
+    repository with a merge or rebase in progress (resolving its conflict is the one edit a review makes)."""
+    tool = str(payload.get("tool_name") or "")
+    if os.environ.get("TTP_ROLE") != "reviewer" or tool not in EDIT_TOOLS:
+        return None
+    args = payload.get("tool_input") if isinstance(payload.get("tool_input"), dict) else {}
+    path = os.path.expanduser(str(args.get("file_path") or args.get("notebook_path") or ""))
+    if not path:
+        return None
+    real = os.path.realpath(path if os.path.isabs(path) else os.path.join(str(payload.get("cwd") or os.getcwd()), path))
+    import tempfile
+    roots = [os.environ.get("TTP_RUN_DIR", ""), tempfile.gettempdir(), "/tmp"]
+    if any(r and (real + os.sep).startswith(os.path.realpath(r).rstrip(os.sep) + os.sep) for r in roots):
+        return None
+    if _git_op_in_progress(real):
+        return None
+    return ("a review never edits the change it judges: write notes and scratch files in your run directory "
+            "($TTP_RUN_DIR); the one edit a review makes in the worktree, resolving a rebase or merge conflict, "
+            "is made while that rebase or merge is in progress")
 
 
 def _harness_task() -> bool:
@@ -1103,17 +1203,26 @@ def _deny(why: str) -> dict:
 def pre_tool_use(payload: dict) -> tuple[dict | None, None]:
     if not os.environ.get("TTP_RUN_DIR"):
         return None, None
-    from . import pathguard
+    from . import pathguard, untrusted
+    if why := untrusted.mark_refusal(str(payload.get("tool_name") or ""), payload.get("tool_input") or {}):
+        return _deny(why), None   # the run's untrusted-input mark, marked or not
     if why := pathguard.refusal(payload):   # a write into a credential folder, on any tool
+        return _deny(why), None
+    if why := harness_tool(str(payload.get("tool_name") or "")):
         return _deny(why), None
     if payload.get("tool_name") in EDIT_TOOLS | PATCH_TOOLS:
         why = harness_gh_edit(payload) if payload["tool_name"] in EDIT_TOOLS else harness_gh_patch(payload)
-        why = why or local_guard(payload)
+        why = why or reviewer_write(payload) or local_guard(payload)
         return (_deny(why) if why else None), None
     if payload.get("tool_name") in ("Read", "Grep", "Glob"):   # a credential store's contents (credguard)
         from . import credguard
-        why = credguard.tool_refusal(str(payload["tool_name"]), payload.get("tool_input") or {},
-                                     str(payload.get("cwd") or os.getcwd()))
+        args, cwd = payload.get("tool_input") or {}, str(payload.get("cwd") or os.getcwd())
+        why = credguard.tool_refusal(str(payload["tool_name"]), args, cwd)
+        if not why:   # a run reading untrusted input: a credential file outside its worktree
+            from . import untrusted
+            why = untrusted.tool_refusal(str(payload["tool_name"]), args, cwd)
+        why = why or search_scope(str(payload["tool_name"]), args if isinstance(args, dict) else {}, cwd)
+        why = why or local_guard(payload)
         return (_deny(why) if why else None), None
     if str(payload.get("tool_name") or "").startswith("mcp__"):   # a connector post to others (aitag)
         from . import aitag
@@ -1148,6 +1257,10 @@ def pre_tool_use(payload: dict) -> tuple[dict | None, None]:
     if not why:
         from . import credguard
         why = credguard.bash_refusal(cmd, _all_segments(commands))
+    if not why:   # a run reading untrusted input: no foreign push, write or credential read
+        from . import untrusted
+        why = untrusted.bash_refusal(_all_segments(commands), _segments(commands, strip=False),
+                                     str(payload.get("cwd") or os.getcwd()))
     if not why:
         why = git_push_bypass(segments)
     if not why:
@@ -1194,8 +1307,10 @@ def pre_tool_use(payload: dict) -> tuple[dict | None, None]:
     if not why:
         why = local_guard(payload)
     if not why:
+        from . import fgwait
         cwd = str(payload.get("cwd") or os.getcwd())
-        hint = "\n\n".join(h for h in (fenced_script(segments, commands, cwd), wide_read(commands, cwd)) if h)
+        hint = "\n\n".join(h for h in (fenced_script(segments, commands, cwd), wide_read(commands, cwd),
+                                        fgwait.reminder(cmd)) if h)
         out = {"hookEventName": "PreToolUse", **({"additionalContext": hint} if hint else {})}
         return ({"hookSpecificOutput": out} if len(out) > 1 else None), None
     return _deny(why), None
@@ -1578,16 +1693,25 @@ def _check_runs() -> list[tuple[str, set[str], set[tuple[str, str]]]]:
 
 def too_many_workers(cmd: str) -> str | None:
     """Why `cmd` is refused when a pytest in it asks for more workers (`-n N`) than the run's test-worker
-    budget (TTP_TEST_SLOTS, which the daemon gives worker runs: testslots.worker_env), else None."""
+    budget (TTP_TEST_SLOTS, which the daemon gives worker runs: testslots.worker_env), or for more than
+    one outside `ttp clip` / `ttp sandbox`, which take them from the host's test pool (testslots.direct)
+    unless the run already holds slots; else None."""
     from . import testslots
     try:
         k = int(os.environ.get(testslots.SLOTS_ENV) or 0)
     except ValueError:
         return None
-    if re.search(r"\bttp\s+checks\b", cmd) or not (big := testslots.over(cmd, k)):
+    if not k or re.search(r"\bttp\s+checks\b", cmd):
         return None   # `ttp checks` lowers it itself
-    return (f"pytest -n {max(big)} is above this run's test-worker budget of {k} on this shared host. "
-            f"Use -n {k} or fewer, or `-n auto` (it reads {testslots.XDIST_ENV}={k})")
+    how = (f"`ttp clip -- ttp sandbox -- <pytest ...>`, which takes up to {k} test workers from the host's "
+           f"test slots (fewer, or a short wait, while other runs hold them)")
+    if big := testslots.over(cmd, k):
+        return (f"pytest -n {max(big)} is above this run's test-worker budget of {k} on this shared host. "
+                f"Use -n {k} or fewer (or `-n auto`) through {how}")
+    if not os.environ.get(testslots.HELD_ENV) and (bare := testslots.unpooled(cmd)):
+        return (f"pytest -n {bare[0]} outside `ttp clip` or `ttp sandbox` holds none of this shared host's "
+                f"test slots. Run it as {how}, or with no -n")
+    return None
 
 
 def build_share() -> int:
@@ -1813,7 +1937,8 @@ def _coord_pre_tool_use(payload: dict):
     return coordtools.pre_tool_use(payload)
 
 
-HANDLERS[COORD_EVENT := "CoordPreToolUse"] = _coord_pre_tool_use   # a session coordinator's tools (coordtools.py)
+COORD_EVENT = "CoordPreToolUse"   # a session coordinator's tools (coordtools.py)
+HANDLERS[COORD_EVENT] = _coord_pre_tool_use
 
 
 def _coord_post(failed: bool):

@@ -248,3 +248,32 @@ def test_code_change_is_any_code_task_and_a_work_task_with_a_diff_only(env):
     for kind, want in (("code", True), ("work", False)):   # no branch: a code task is still one, as before
         tid = p.db.add_task(f"{kind} no branch", "spec", kind=kind, origin="coordinator")
         assert d._code_change(p.db.task(tid)) is want, kind
+
+
+def test_a_finish_whose_diff_read_timed_out_gets_its_review_on_the_next_tick(env, monkeypatch):
+    """A hand-off whose git read is cut off (the step budget, a slow disk: TimeoutExpired) queues no review
+    then, but the next tick's retry_unread_reviews does, not the unreviewed sweep hours later. A read that
+    times out again keeps it for the tick after; once queued, it is not retried."""
+    import subprocess
+    from ttp import worktree
+    from ttp.daemon import Daemon, KV_REVIEW_UNREAD
+    p = make(env)
+    _with_origin(env, clone=False)
+    real, cut = worktree.diff_lines, {"n": 1}
+
+    def slow(*a, **k):
+        if cut["n"]:
+            cut["n"] -= 1
+            raise subprocess.TimeoutExpired(["git", "diff"], 0)
+        return real(*a, **k)
+    monkeypatch.setattr(worktree, "diff_lines", slow)
+    tid, _, done, reviews = _finish_code(env, p, "cut read", {"app.py": 5})
+    assert not reviews and "queued by the daemon" not in done["text"]
+    assert p.db.kv(KV_REVIEW_UNREAD) == [tid]
+    d = Daemon(p.base)
+    cut["n"] = 1   # timed out again: kept for the next tick
+    assert d.retry_unread_reviews() == [] and p.db.kv(KV_REVIEW_UNREAD) == [tid]
+    (rid,) = d.retry_unread_reviews()
+    assert p.db.task(rid)["title"] == f"Review #{tid}: cut read" and p.db.kv(KV_REVIEW_UNREAD) == []
+    assert d.retry_unread_reviews() == []
+    assert len(p.db.q("SELECT id FROM tasks WHERE kind='review'")) == 1

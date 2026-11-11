@@ -8,7 +8,8 @@ def _cred_home(tmp_path, monkeypatch):
     home = tmp_path / "home"
     ssh = home / ".ssh"
     ssh.mkdir(parents=True)
-    for name in ("id_ed25519", "id_ed25519.pub", "config", "known_hosts", "work-key", "cm-0123abcd"):
+    for name in ("id_ed25519", "id_ed25519.pub", "config", "known_hosts", "work-key", "cm-0123abcd",
+                 "known_hosts_site2", "site2_known_hosts"):
         (ssh / name).write_text("x\n")
     monkeypatch.setenv("HOME", str(home))
     for var in ("GH_CONFIG_DIR", "XDG_CONFIG_HOME", "CODEX_HOME", "DOCKER_CONFIG", "KUBECONFIG",
@@ -33,7 +34,7 @@ def test_credential_files_name_every_store_and_each_private_ssh_file(env, tmp_pa
               tmp_path / "claude/.credentials.json", home / ".codex/auth.json",
               home / ".ssh/id_ed25519", home / ".ssh/work-key"):
         assert str(f) in files, f
-    for public in ("id_ed25519.pub", "config", "known_hosts", "cm-0123abcd"):
+    for public in ("id_ed25519.pub", "config", "known_hosts", "cm-0123abcd", "known_hosts_site2", "site2_known_hosts"):
         assert str(home / ".ssh" / public) not in files
     monkeypatch.setenv("GH_CONFIG_DIR", str(tmp_path / "ghc"))
     assert str(tmp_path / "ghc/hosts.yml") in credential_files()
@@ -377,3 +378,14 @@ def test_the_gh_wrapper_fails_closed_on_ref_writes_when_its_guard_errors_in_a_ru
 def _cred_ref_why():
     from ttp.credguard import REF_WHY
     return REF_WHY
+
+
+def test_ssh_host_key_lists_by_any_name_are_public_and_a_key_beside_or_under_one_is_not():
+    """known_hosts anywhere in a file name (known_hosts_<site>, <site>_known_hosts) holds public host keys;
+    a folder so named does not make the key in it public, nor does a path climbing out of one."""
+    from ttp.credguard import ssh_public
+    for name in ("known_hosts", "known_hosts.old", "known_hosts_site2", "site2_known_hosts", "x/site2_known_hosts"):
+        assert ssh_public(name), name
+    for name in ("known_hosts_x/id_ed25519", "known_hosts/../id_ed25519", "id_ed25519", "site2_key",
+                 "known_hosts*", "config_site2"):
+        assert not ssh_public(name), name

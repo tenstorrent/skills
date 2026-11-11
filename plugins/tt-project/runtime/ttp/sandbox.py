@@ -25,6 +25,7 @@ a device node nor sudo, and nothing here stops it."""
 from __future__ import annotations
 
 import os
+import shlex
 import shutil
 import signal
 import subprocess
@@ -200,6 +201,26 @@ def notice(on: bool = True) -> str:
     return f"no process sandbox: {why}. Commands run unisolated and can see and signal other processes{devices}"
 
 
+def _test_slots(argv: list[str], env: dict):
+    """A worker's pytest run `argv` with its workers taken from the host's test pool (testslots.direct):
+    its -n lowered to the grant, run at a lower priority, `env` given the grant's variables; and the grant
+    (None: none taken), kept open while the command runs: its files are passed to the command (pass_fds),
+    so they stay held for its life and free when it ends."""
+    from . import testslots
+
+    def tell(msg: str) -> None:
+        print(f"ttp sandbox: {msg}", file=sys.stderr, flush=True)
+    line = shlex.join(argv)
+    who = f"ttp sandbox (task #{os.environ.get('TTP_TASK') or '?'}, pid {os.getpid()}): {line[:80]}"
+    if (grant := testslots.direct(line, who, tell)) is None:
+        return argv, None
+    if (capped := testslots.clamp(line, grant.k)) != line:
+        tell(f"pytest workers lowered to -n {grant.k} (this run's host test slots)")
+        argv = shlex.split(capped)
+    env.update(grant.env())
+    return testslots.low_priority(argv), grant
+
+
 def run(argv: list[str]) -> int:
     """`ttp sandbox -- <cmd...>`: run `argv` and return its exit code; by default it runs as it is (a
     pass-through: existing configs that call it keep working), in a sandbox only where the project
@@ -215,13 +236,14 @@ def run(argv: list[str]) -> int:
     argv, dropped = testslots.drop_xdist(argv)
     if dropped:
         print(f"ttp sandbox: {dropped}", file=sys.stderr, flush=True)
+    argv, grant = _test_slots(list(argv), env)
     wrapped = wrap(argv)
     plain = wrapped == list(argv)
     if plain and (line := notice()):
         print(f"ttp sandbox: {line}", file=sys.stderr, flush=True)
     guard = hoststate.Guard(env)
     try:
-        proc = subprocess.Popen(wrapped, env=env)
+        proc = subprocess.Popen(wrapped, env=env, pass_fds=grant.fds() if grant else ())
     except OSError as e:
         print(f"ttp sandbox: {argv[0]}: {e.strerror}", file=sys.stderr)
         if temp and env.get(hoststate.MARKER):

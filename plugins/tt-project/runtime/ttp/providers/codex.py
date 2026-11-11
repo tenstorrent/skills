@@ -52,7 +52,7 @@ import re
 import shlex
 import subprocess
 import time
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from . import register
@@ -74,6 +74,8 @@ INSTRUCTIONS_PREFIX = 4096
 MODEL_ITEMS = ("reasoning", "function_call", "custom_tool_call", "local_shell_call", "web_search_call")
 # Tools a decision-only turn does without, switched off when this build lists them as features.
 READ_ONLY_OFF = ("shell_tool", "unified_exec", "web_search_request")
+# Codex adds its memories to the developer message after our instructions under this heading.
+CODEX_MEMORY_HEAD = "## Memory"
 HOOK_TRUST_BYPASS = "--dangerously-bypass-hook-trust"
 IGNORE_USER_CONFIG = "--ignore-user-config"
 IGNORE_RULES = "--ignore-rules"
@@ -98,6 +100,7 @@ PLUGIN_EXTRA_FILES = ("hooks", "hooks.json", ".mcp.json", ".app.json")
 class Codex(Provider):
     name = "codex"
     binaries = ("codex",)
+    final_events = ("turn.completed", "turn.failed")   # base.stream_ended
     api_host, api_base_env = "api.openai.com", "OPENAI_BASE_URL"
     login_hint = "run `codex login` there"
     efforts = ("minimal", "low", "medium", "high", "xhigh")
@@ -106,6 +109,7 @@ class Codex(Provider):
     # turn read 0 cached tokens on most turns with a byte-identical prefix (measured on 0.160).
     cache_key_per_session = True
     coord_session = "agent"   # `codex exec ... resume <id> -`; size and compaction from the rollout (session_context)
+    session_format = "codex-rollout"   # sessions/YYYY/MM/DD/rollout-<time>-<id>.jsonl (fork_session)
     mcp_by_args = True   # `-c mcp_servers=...` (codexmcp.py): Codex has no per-run MCP config file
     # Whether build() left the harness hook out only because the user's config.toml defines hooks or
     # plugins; isolation_args() then adds it, as an isolated run ignores that file.
@@ -145,6 +149,117 @@ class Codex(Provider):
         own = (env or {}).get("CODEX_HOME")
         homes = ([Path(own).expanduser()] if own else []) + [codex_home()]
         return [f for h in dict.fromkeys(homes) for f in (h / "sessions").glob(f"*/*/*/rollout-*-{session_id}.jsonl")]
+
+    def fork_session(self, session_id: str, cwd: str, env: dict | None, new_id: str) -> str:
+        # `codex fork` is interactive only and `codex exec` has none (0.160), so a copy that `exec resume
+        # <new id>` continues: the rollout's whole lines up to its last finished turn (a task_complete
+        # event: a wake still running leaves a partial turn) with the old id swapped for the new one (session
+        # meta, thread and turn records), the meta's cwd set to the run's, written owner-only as today's
+        # rollout under the run's CODEX_HOME. The rollout layout is not in the official docs: if it
+        # moves, the session is not found and the run takes the disk block (ctxfork.py).
+        if not re.fullmatch(r"[A-Za-z0-9-]+", new_id or "") or not re.fullmatch(r"[A-Za-z0-9-]+", session_id or ""):
+            return "bad session id"
+        src = self.session_paths(session_id, cwd, env)
+        if not src:
+            return "the session's rollout is not on disk"
+        raw = max(src, key=lambda x: x.stat().st_mtime).read_text(errors="replace")
+        rows: list[dict] = []
+        for line in raw.split("\n")[:-1]:   # a line not yet ended by a newline is partial
+            try:
+                row = json.loads(line.replace(session_id, new_id))
+            except ValueError:
+                continue
+            if isinstance(row, dict):
+                rows.append(row)
+        done = [i for i, r in enumerate(rows) if r.get("type") == "event_msg"
+                and isinstance(r.get("payload"), dict) and r["payload"].get("type") == "task_complete"]
+        if not done:
+            return "the session has no finished turn to start from"
+        rows = rows[:done[-1] + 1]
+        meta = next((r for r in rows if r.get("type") == "session_meta" and isinstance(r.get("payload"), dict)), None)
+        if meta is None:
+            return "the session's rollout has no session_meta line"
+        if cwd:
+            meta["payload"]["cwd"] = cwd
+        own = (env or {}).get("CODEX_HOME")
+        now = datetime.now(timezone.utc)
+        folder = (Path(own).expanduser() if own else codex_home()) / "sessions" / now.strftime("%Y/%m/%d")
+        from ..project import durable_write
+        durable_write(folder / f"rollout-{now.strftime('%Y-%m-%dT%H-%M-%S')}-{new_id}.jsonl",
+                      "".join(json.dumps(r) + "\n" for r in rows), mode=0o600)
+        return ""
+
+    def own_instructions(self, session_id: str, cwd: str, env: dict | None, text: str) -> str:
+        # `codex exec resume` keeps the developer messages saved in the rollout and takes no new
+        # `-c developer_instructions` (0.160), and re-sends them after a compaction (each compacted
+        # row's histories hold them too). A worker forked from a coordinator without tools so ran under
+        # "This session has no tools" and did no work. The run's text replaces the harness's block in
+        # every developer message, wherever it is nested: the part equal to the session's harness text
+        # (its first developer part of our own), else a message's first such part. Codex's own blocks
+        # (they start with "<", as <skills_instructions>, or are its "## Memory" block) and every other
+        # part stay as they were.
+        src = self.session_paths(session_id, cwd, env)
+        if not src:
+            return ""   # nothing here to rewrite: the resume finds no session either, or one Codex keeps elsewhere
+        path = max(src, key=lambda x: x.stat().st_mtime)
+        hits, harness = [0], [None]
+
+        def ours(part):
+            if not (isinstance(part, dict) and isinstance(part.get("text"), str)):
+                return False
+            head = part["text"].lstrip()
+            return not (head.startswith("<") or head.startswith(CODEX_MEMORY_HEAD))
+
+        def developer(node):
+            return isinstance(node, dict) and node.get("role") == "developer" \
+                and isinstance(node.get("content"), list)
+
+        def find(node):   # the session's harness text: the first developer part of our own
+            if harness[0] is not None:
+                return
+            if developer(node):
+                harness[0] = next((x["text"] for x in node["content"] if ours(x)), None)
+            elif isinstance(node, (list, dict)):
+                for x in (node if isinstance(node, list) else node.values()):
+                    find(x)
+
+        def swap(node):
+            if isinstance(node, list):
+                return [swap(x) for x in node]
+            if not isinstance(node, dict):
+                return node
+            if developer(node):
+                parts = node["content"]
+                mine = [i for i, x in enumerate(parts) if ours(x) and x["text"] == harness[0]]
+                if not mine:
+                    mine = [i for i, x in enumerate(parts) if ours(x)][:1]
+                content = []
+                for i, part in enumerate(parts):
+                    if i in mine:
+                        hits[0] += 1
+                        if i != mine[0]:   # the harness text twice in one message: the run's text once
+                            continue
+                        part = {**part, "text": text}
+                    content.append(part)
+                return {**node, "content": content}
+            return {k: swap(v) for k, v in node.items()}
+
+        rows = []
+        for line in path.read_text(errors="replace").split("\n"):
+            try:
+                row = json.loads(line)
+            except ValueError:
+                row = None
+            rows.append((line, row if isinstance(row, (dict, list)) else None))
+            if rows[-1][1] is not None:
+                find(row)
+        # a partial or blank line stays as it was
+        out = [line if row is None else json.dumps(swap(row)) for line, row in rows]
+        if not hits[0]:
+            return "the session holds no developer instructions to replace"
+        from ..project import durable_write
+        durable_write(path, "\n".join(out), mode=0o600)
+        return ""
 
     def build(self, *, role, model, effort, cwd, budget_usd, read_only, schema, restrictions,
               disallowed_tools=(), denied_reads=(), web=True):
@@ -535,11 +650,75 @@ class Codex(Provider):
         # Codex prints usage only on turn.completed, and `codex exec` is one turn; its rollout has
         # running token totals, so a run stopped mid-turn is priced at the tokens it spent.
         got = self._rollout_tokens(Path(output_path), since, env)
-        return self._price(*got) if got else None
+        return self._price(*got) + self._price(*self._subagent_tokens(output_path, since, env)) if got else None
 
     def cost_so_far(self, output_path, since=None, env=None):
         inp, cached, out, _ = self._tokens(output_path)
         return max(self._price(inp, cached, out), self.cut_off_cost(output_path, since, env) or 0.0)
+
+    def add_subagent_usage(self, usage, output_path, since=None, env=None) -> None:
+        sub = self._subagent_tokens(output_path, since, env)
+        if any(sub):
+            usage.input_tokens += sub[0] - sub[1]
+            usage.cache_read_tokens += sub[1]
+            usage.output_tokens += sub[2]
+            usage.cost_usd += self._price(*sub)
+            usage.extra["subagent_tokens"] = list(sub)
+
+    def _subagent_tokens(self, output_path, since=None, env=None) -> tuple[int, int, int]:
+        """(input, cached, output) tokens of the sub-agents the run's thread spawned (the multi_agent
+        feature), at any depth: `turn.completed` counts only the run's own thread, and each sub-agent
+        writes its own rollout whose session_meta names its parent_thread_id. Each one's newest
+        total_token_usage, less its last total before `since` (a sub-agent a resumed run continues).
+        Read from the parent rollout's day folder and the next (a sub-agent started past midnight UTC);
+        priced at the run's model. The layout is not in the official docs: if it moves, this finds none."""
+        sid = next((str(ev.get("thread_id") or "") for ev in self._events(Path(output_path))
+                    if ev.get("type") == "thread.started"), "")
+        days: set[Path] = set()
+        for f in self.session_paths(sid, "", env):
+            days.add(f.parent)
+            try:
+                nxt = datetime.strptime("/".join(f.parent.parts[-3:]), "%Y/%m/%d") + timedelta(days=1)
+                days.add(f.parent.parent.parent.parent / nxt.strftime("%Y/%m/%d"))
+            except ValueError:
+                pass
+        parent_of: dict[str, tuple[str, Path]] = {}
+        heads = self.__dict__.setdefault("_rollout_heads", {})   # a rollout's first line never changes
+        for day in days:
+            for f in day.glob("rollout-*.jsonl"):
+                if str(f) in heads:
+                    if heads[str(f)]:
+                        parent_of[heads[str(f)][0]] = (heads[str(f)][1], f)
+                    continue
+                heads[str(f)] = None
+                try:
+                    with open(f, "rb") as fh:
+                        head = fh.readline()
+                    if not head.endswith(b"\n"):
+                        del heads[str(f)]   # still being written: read it next time
+                        continue
+                    if b"parent_thread_id" not in head:
+                        continue
+                    meta = json.loads(head).get("payload") or {}
+                    up = meta.get("parent_thread_id") or (((meta.get("source") or {}).get("subagent") or {})
+                                                          .get("thread_spawn") or {}).get("parent_thread_id")
+                    if up and meta.get("id"):
+                        parent_of[str(meta["id"])] = (str(up), f)
+                        heads[str(f)] = (str(meta["id"]), str(up))
+                except (OSError, ValueError, AttributeError):
+                    continue
+        mine, grew = {sid}, bool(sid)
+        while grew:
+            grew = False
+            for child, (up, _) in parent_of.items():
+                if up in mine and child not in mine:
+                    mine.add(child)
+                    grew = True
+        total = [0, 0, 0]
+        for child in mine - {sid}:
+            got = _rollout_total(parent_of[child][1], since)
+            total = [a + b for a, b in zip(total, got)]
+        return tuple(total)
 
     def parse(self, output_path, stderr_path=None) -> RunUsage:
         inp, cached, out, last = self._tokens(output_path)
@@ -574,6 +753,10 @@ class Codex(Provider):
                 u.structured = drop_nulls(json.loads(last))
             except ValueError:
                 pass
+        if not cache_reports and isinstance(u.structured, dict) and isinstance(u.structured.get("actions"), list):
+            # Cut off before its turn completed (the runner's budget check) after a whole JSON answer:
+            # the daemon may apply it (Daemon._finish_coordinator). A cut-off message never parses.
+            u.answer = u.structured
         blob = u.error + " " + err
         if AUTH_RE.search(blob) and not u.output_tokens:
             u.auth_failed = True
@@ -653,6 +836,29 @@ class Codex(Provider):
             return {"error": "thread/start: " + json.dumps(msg.get("error") or msg.get("result"))[:300]}
         res = msg["result"]
         return {"model": str(res.get("model") or ""), "effort": str(res.get("reasoningEffort") or "")}
+
+
+def _rollout_total(path: Path, since: float | None) -> tuple[int, int, int]:
+    """A rollout's newest (input, cached, output) total_token_usage, less its last total before `since`."""
+    base, last = (0, 0, 0), (0, 0, 0)
+    try:
+        with open(path, "rb") as f:
+            for raw in f:
+                if b"token_count" not in raw or not raw.endswith(b"\n"):
+                    continue
+                try:
+                    rec = json.loads(raw)
+                    total = rec["payload"]["info"]["total_token_usage"]
+                    tok = tuple(int(total.get(k) or 0) for k in ("input_tokens", "cached_input_tokens", "output_tokens"))
+                except (ValueError, TypeError, KeyError, AttributeError):
+                    continue
+                if since is not None and _stamp(rec.get("timestamp")) < since:
+                    base = tok
+                else:
+                    last = tok
+    except OSError:
+        return (0, 0, 0)
+    return tuple(max(a - b, 0) for a, b in zip(last, base)) if last != (0, 0, 0) else (0, 0, 0)
 
 def codex_home() -> Path:
     """Where Codex keeps its login and saved sessions."""

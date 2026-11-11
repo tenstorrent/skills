@@ -1,0 +1,5 @@
+---
+"tt-project": patch
+---
+
+tt-project: the coordinator's own wakes land inside its 1-hour prompt cache, and forks onto another model stop re-writing the coordinator's history. coordinator.idle_wake_s and plain_done_hold_max_s default to 3000 s (were 3600, equal to the cache's life, so every idle wake missed it and re-wrote about 92k tokens, ~$0.75 a wake). While a run is under way there is no idle wake, so a new cache wake (coordinator.cache_wake_s, default 3000 s, 0: off) comes 50 minutes after the coordinator last used its cache, at most coordinator.cache_wake_max (default 2) times in a row on an unchanged state, and never after the cache has expired. A user's or coordinator's value and a pending look still win. A worker or reviewer on another model than the coordinator's (Sonnet under an Opus coordinator) starts from the disk block instead of a fork: the prompt cache is per model, so each such fork wrote the copied history again (10-69k tokens); runs on the coordinator's model fork as before.

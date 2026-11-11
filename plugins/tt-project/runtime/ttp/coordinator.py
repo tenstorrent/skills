@@ -50,6 +50,7 @@ from . import (   # one name per line: two changes adding names merge without a 
     coursecheck,
     credits,
     deploy,
+    dispatchguard,
     echoes,
     eta,
     effort,
@@ -115,14 +116,17 @@ from . import (   # one name per line: two changes adding names merge without a 
     worktree,
     yesask,
 )
+from . import untrusted
 from . import urgent
 from . import replan
 from . import topup
 from . import probevars
 from . import onhost
+from . import claimcheck
 from . import coordsession
 from . import spans
 from . import coordtools
+from . import pointers
 from . import ctxblock
 from . import overlap as file_overlap   # apply() has a local `overlap`
 from . import screen as scr
@@ -133,6 +137,7 @@ from . import hostrun
 from . import userorder
 from . import turnrules
 from .db import (
+    DB,
     PAUSE_REMOVED_KIND,
     PAUSED_RESOURCES_KEY,
     SEVERITY_RANK,
@@ -177,7 +182,7 @@ from .providers.base import NULL_OPERATIONS, normalize_action
 
 ACTION_TYPES = ("reply", "task_add", "task_update", "ask_user", "resolve", "notify", "memory_add", "memory_forget",
                 "charter_update", "schedule_set", "config_set", "resource_pause", "observation_mute", "pr_approve",
-                "sweep", "obligation", "self_change", "noop")
+                "sweep", "obligation", "self_change", "look", "noop")
 
 # A deferred task's `start_after`: `now`, a delay (`90m`, `3d`) or an ISO date or time (in the
 # project's home zone unless it names one). Plain character classes, so every provider's schema engine takes it.
@@ -230,7 +235,7 @@ ACTIONS_SCHEMA: dict[str, Any] = {
             "needs_device": {"type": "boolean"}, "user_deep": {"type": "boolean"}, "standing": {"type": "boolean"},
             "continues": {"type": "integer"}, "resource": {"type": "string"}, "machine": {"type": "string"}, "paused": {"type": "boolean"},
             "user_asked": {"type": "boolean"}, "user_end": {"type": "boolean"}, "outage": {"type": "boolean"},
-            "user_msg": {"type": "integer"},
+            "user_msg": {"type": "integer"}, "untrusted_input": {"type": "boolean"},
             "reason": {"type": "string"}, "supersedes": {"type": "array", "items": {"type": "string"}}, "permanent": {"type": "boolean"},
             "replaces": {"type": "string"}, "over": {"type": "string"}, "both_hold": {"type": "boolean"},
             "expires": {"type": "string"}, "until": {"type": "string"}, "until_probe": {"type": "string"},
@@ -244,6 +249,8 @@ ACTIONS_SCHEMA: dict[str, Any] = {
             "heal": HEAL_SCHEMA, "pr_branch": {"type": "string"}, "gate": {"type": ["object", "null"], "properties": {"depends_on": {"type": "array", "items": {"type": "integer"}},
                      "start_when": {"type": "string"}, "why": {"type": "string"}}},
             "wake_now": {"anyOf": [{"type": "boolean"}, {"type": "string", "enum": list(bud.TIER_ORDER)}]},
+            "replace": {"type": "object", "properties": {"old": {"type": "string"}, "new": {"type": "string"}},
+                        "required": ["old"]},
             "owners": {"type": "array", "items": {"type": "integer"}}, "evidence": {"type": "string"},
             "milestone": {"type": "string"}, "promise": {"type": "string"}, "justify": {"type": "string"},
             "delivers": {"type": "array", "items": {"type": "string"}},
@@ -380,10 +387,24 @@ def _count(key: str, v, top: int) -> int:
     return int(n)
 
 
+def _max_workers(v):
+    """machine.max_workers: a whole number of at least 1, or null, none or auto for unset (half the
+    cores, machinecap.BASE_MIN..BASE_MAX)."""
+    if v is None or str(v).strip().lower() in ("null", "none", "auto"):
+        return None
+    try:
+        n = int(v) if not isinstance(v, bool) and float(v) == int(float(v)) else 0
+    except (TypeError, ValueError, OverflowError):
+        n = 0
+    if n < 1:
+        raise ValueError("machine.max_workers: give a whole number of at least 1, or null for the default")
+    return n
+
+
 USER_SETTABLE = {
     "budget.daily_usd": float, "budget.weekly_usd": float, "budget.reserve_pct": float,
-    "budget.global_daily_usd": float, "budget.day_start": str, "budget.timezone": str,
-    "budget.max_parallel_workers": int, "budget.urgent_extra_slots": int, "budget.urgent_preempt": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
+    "budget.global_daily_usd": float, "budget.daily_target_usd": float, "budget.day_start": str, "budget.timezone": str,
+    "budget.max_parallel_workers": int, "machine.worker_limit": str, "machine.max_workers": _max_workers, "budget.urgent_extra_slots": int, "budget.urgent_preempt": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
     "coordinator.urgent_start_wait_min": int,
     "budget.urgent_topup": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
     "budget.reset_credits_auto": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
@@ -422,6 +443,11 @@ USER_SETTABLE = {
     # Ordered ssh aliases a run whose slots here stay busy may spill to (checkspill); a list, never a scalar.
     "delivery.checks_spill_hosts": lambda v: checkspill.hosts_of(v),
     "delivery.checks_spill_after_s": lambda v: checkspill.after_of(v),
+    # Whether a run that may spill tries the spill hosts before a place here (checkspill.first; default true).
+    "delivery.checks_spill_first": lambda v: checkspill.first_of(v),
+    # Whether a heavy run waits for a busy spill host instead of running here (checkspill.remote_only; auto: on a
+    # workstation), stored as true, false or "auto".
+    "delivery.checks_remote_only": lambda v: "auto" if (r := checkspill.remote_only_of(v)) is None else r,
     # Spill hosts (or "*") the project lets its checks run on beside a device job (checkspill.beside_device).
     "checks.spill_beside_device": lambda v: checkspill.beside_of(v),
     # The files holding the version that `ttp push` bumps once above the tip, plus a changeset.
@@ -440,6 +466,7 @@ USER_SETTABLE = {
     "delivery.push_batch_s": lambda v: push_queue_number("push_batch_s", v),
     "delivery.push_batch_max": lambda v: push_queue_number("push_batch_max", v),
     "delivery.push_min_gap_s": lambda v: push_queue_number("push_min_gap_s", v),
+    "delivery.push_age_s": lambda v: push_queue_number("push_age_s", v),
     "delivery.push_landing_alert_h": lambda v: push_queue_number("push_landing_alert_h", v),
     "delivery.push_script_torn_escalate_after": lambda v: push_queue_number("push_script_torn_escalate_after", v),
     "delivery.push_setup_fault_escalate_after": lambda v: push_queue_number("push_setup_fault_escalate_after", v),
@@ -569,6 +596,7 @@ EFFORT_EVENT_TRIGGERS = {
     "no_progress": "stuck", "stall": "stuck", "change_probe": "stuck",
     "missing_task_ref": "stuck", obligations.PROMISE_KIND: "stuck", mitigate.OVERDUE: "stuck",
     obligations.ORDER_KIND: "stuck", obligations.ORDER_LATE_KIND: "stuck", obligations.CLAIM_KIND: "stuck",
+    obligations.LANDING_STUCK_KIND: "stuck",
     "must_act_rewake": "stuck",
     "review_stall": "stuck", "review_failed_unhandled": "stuck", "review_nofix": "stuck", "review_unqueued": "stuck", "landed_wait_dead": "stuck", "lane_wait": "stuck", askrethink.KIND: "stuck", selfblock.KIND: "stuck",
     "wait_stale": "stuck", "hold_probe_broken": "stuck", "probe_never_passes": "stuck",
@@ -670,6 +698,58 @@ EVENT_CHARS = 1500
 # A plan's product arrives as these events; the daemon sizes them to fit, so they show whole.
 EVENT_CHARS_BY_KIND = {"followup_proposed": 4300, "task_notes": 6000, "upstream_note": 4300,
                        "charter_retry": 8000, budgetkind.KIND: 2000, reviewcap.REVIEW_AREA_EVENT: 2600}
+# NEW EVENTS joins events of these kinds that carry `fold` data ({group, item, ctx[, opts]}: queuewait.fold,
+# checkcap.urgent_wait_fold, the daemon's wait_stale) into one line per kind and group, when a wake has
+# several: the group's newest state (ctx) once, then each item with its own key and options.
+FOLD_KINDS = ("queue_wait", "urgent_check_wait", "wait_stale")
+SLOT_WAIT = "checks_slot_wait"   # several wakes of one queue incident in a batch: the newest is shown whole
+
+
+def _fold_of(e) -> dict | None:
+    try:
+        f = (json.loads(e["data"] or "{}") or {}).get("fold")
+    except (TypeError, ValueError, AttributeError):
+        return None
+    return f if isinstance(f, dict) and all(isinstance(f.get(k), str) for k in ("group", "item", "ctx")) else None
+
+
+def fold_events(events: list, tag: str) -> dict:
+    """{event id: its NEW EVENTS line, or None when an earlier line already carries it} for the events
+    folded (FOLD_KINDS with `fold` data, several of a kind and group; several checks_slot_wait wakes of one
+    queue incident). An event not in it is shown on its own line."""
+    groups: dict = {}
+    for e in events:
+        if e["kind"] in FOLD_KINDS and (f := _fold_of(e)):
+            groups.setdefault((e["kind"], f["group"]), []).append((e, f))
+        elif e["kind"] == SLOT_WAIT and str(e["fingerprint"] or "").startswith(f"{SLOT_WAIT}:incident:"):
+            groups.setdefault((SLOT_WAIT, str(e["fingerprint"]).split(":")[2]), []).append((e, None))
+    out: dict = {}
+    for (kind, group), got in groups.items():
+        if len(got) < 2:
+            continue
+        sev = "high" if any(e["severity"] == "high" for e, _ in got) else got[-1][0]["severity"]
+        if kind == SLOT_WAIT:   # the newest wake of the incident says its state now and why it woke
+            e = got[-1][0]
+            text = e["text"] if len(e["text"]) <= EVENT_CHARS else e["text"][:EVENT_CHARS] + " … [cut]"
+            out[e["id"]] = (f"- [{kind} from {e['source']}, severity {sev}; the newest of {len(got)} wakes of this "
+                            f"queue incident in this batch, the earlier ones not repeated] {spans.wrap(text, kind, tag)}")
+            out.update({x["id"]: None for x, _ in got[:-1]})
+            continue
+        opts = [list(f.get("opts") or []) for _, f in got]
+        common = [o for o in opts[0] if all(o in x for x in opts[1:])]
+        items = []
+        for (_, f), mine in zip(got, opts):
+            own = [o for o in mine if o not in common]
+            items.append(f["item"] + (f" (options: {' | '.join(own)})" if own else ""))
+        body = (f"on {group}, now: {clip(got[-1][1]['ctx'], EVENT_CHARS)}"
+                + (f" Options for each: {' | '.join(common)}." if common else "")
+                + f" Each: {'; '.join(items)}")
+        out[got[0][0]["id"]] = (f"- [{kind} from daemon, {len(got)} folded into one line, severity {sev}] "
+                                f"{spans.wrap(body, kind, tag)}")
+        out.update({e["id"]: None for e, _ in got[1:]})
+    return out
+
+
 # A refusal that carries the user's approved charter text to resend exactly (_charter_approval) keeps
 # up to this much of it in the digest and the charter_retry event: a clipped copy gets reworded.
 RESEND_CHARS = 6000
@@ -731,8 +811,9 @@ PROMPT_MAX_AGE_S = 4 * 3600
 
 def _prompt_head(p: Project) -> tuple[str, str, str]:
     """The system prompt's parts other than memory: restrictions, role, charter."""
+    from .knownpaths import block
     from .prompts import charter_restrictions, charter_without_restrictions, coordinator_role, restrictions_block
-    role = coordinator_role(p)
+    role = f"{coordinator_role(p).rstrip()}\n\n{block(p)}"
     charter = p.charter_path.read_text() if p.charter_path.exists() else "(no charter yet)"
     rules = restrictions_block(p, advisory=False)   # the unsourced ones: standing_lines
     if rules:
@@ -1297,6 +1378,7 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
     # Once, not per provider: the caps bound every usage-billed provider's spend together.
     lines.append("- project caps (usage-billed providers together): " + bud.caps_line(db, gates, b, now, home))
     lines.append(f"- per-task default budgets: {b.get('task_default_usd')}")
+    lines += task_cap_lines(db, p.config(), now, p)
     section("budget", lines)
     lines = []
     boots = db.boots(now - 86400)
@@ -1317,6 +1399,8 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
                 f"tasks): " + clip(", ".join(f"#{t}" for t in kept), 200) if kept else "")
         lines.append(f"## Disk: {disk.get('free_gb')} GB free of {disk.get('total_gb')} GB; {guard}{held}")
     section("host", lines)
+    from . import overseer
+    section("loop_health", overseer.digest_lines(p, now))   # results, from the overseer's last pass
     lines = []
     if pause := projpause.current(db, now):
         lines.append(f"## Project {projpause.describe(pause, p, now)}: no new runs start until it resumes")
@@ -1421,6 +1505,7 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
     in_review = db.review_since()
     setting_held = settinghold.digest_lines(rows)   # tasks held on a setting being asked about: one line each
     held_on = {}   # blocked tasks held on the same ask or resource: one line for them all
+    advice = False   # a row's overlap note: its advice once in the header (overlap.ADVICE), not on each row
     for t in rows:
         held = anchors.anchor(t) if t["status"] == "blocked" else None
         if held and held[0] in anchors.SHARED_KINDS and not (setting_held and settinghold.held_key(t)):
@@ -1428,6 +1513,7 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
     held_on = {k: ts for k, ts in held_on.items() if len(ts) > 1}
     grouped = {t["id"]: k for k, ts in held_on.items() for t in ts}
     host_est = safe_eta(lambda: eta._Est(db, now, core=eta.core_of(p)), None) if any(onhost.resources(t) for t in rows) else None
+    owns = obligations.open_keys_by_task(db)   # the open keys a task_update spec may name as its own
     for t in rows:
         if setting_held and settinghold.held_key(t):
             continue
@@ -1438,19 +1524,24 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
             continue
         note = clip(t["blocked_reason"] or load_result(t["result"]).get("summary"), NOTE_CHARS)
         if note:   # clipped before it is enclosed, so a cut never drops the span's end
-            note = spans.wrap(note, f"{'blocked reason' if t['blocked_reason'] else 'hand-off'} of #{t['id']}", tag)
+            note = spans.wrap(note, f"{'blocked reason' if t['blocked_reason'] else 'hand-off'} of #{t['id']}", tag) \
+                + ("" if t["blocked_reason"] else claimcheck.handoff_mark(load_result(t["result"])))
         held = anchors.anchor(t) if t["status"] == "blocked" else None
         note = f"{anchors.describe(*held, p)}: {note}" if held else note
-        clash = file_overlap.digest_note(t)
+        clash = file_overlap.short(file_overlap.digest_note(t))
+        advice = advice or bool(clash)
         note = f"{clash}; {note}" if clash and note else clash or note
         if host := onhost.line(p, t, now, host_est):   # what may be said of its work on the host
             note = f"{host}; {note}" if note else host
         cont = continues_id(t)
-        title = clip(t["title"], TITLE_CHARS) + (f" (continues #{cont})" if cont else "")
+        title = (clip(t["title"], TITLE_CHARS) + (f" (continues #{cont})" if cont else "")
+                 + (f" (owns {', '.join(owns[t['id']])})" if owns.get(t["id"]) else ""))
         starts = (starts_text(t, now, where=p, db=db) if t["status"] == "queued" else
                   f"{(now - in_review[t['id']]) / 3600:.1f}h in review" if t["id"] in in_review else "")
         lines.append(f"- #{t['id']} | {t['status']}{f' ({starts})' if starts else ''} | {t['tier']} | p{t['priority']} | "
                      f"{(now - t['created']) / 3600:.1f}h | {title} | {note}")
+    if advice:
+        lines[0] = lines[0][:-1] + f"; {file_overlap.ADVICE})"
     lines += setting_held
     if len(rows) == coordsession.OPEN_ROWS:   # the open tasks past the limit, so none reads as closed
         cut = [r["id"] for r in db.q("SELECT id FROM tasks WHERE status NOT IN ('done','failed','cancelled') "
@@ -1481,7 +1572,8 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
         summary = spans.wrap(summary, f"hand-off of #{t['id']}", tag) if summary and summary != "see new events" \
             else summary
         lines.append(f"- #{t['id']} {task_outcome(t)}: {clip(t['title'], TITLE_CHARS)}"
-                     + verified.handoff_line(load_result(t["result"])) + (f" — {summary}" if summary else ""))
+                     + verified.handoff_line(load_result(t["result"])) + (f" — {summary}" if summary else "")
+                     + (claimcheck.handoff_mark(load_result(t["result"])) if summary else ""))
     section("finished", lines)
     said = " ".join(str(e["text"] or "") for e in events)
     if msg_ids:
@@ -1595,7 +1687,12 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
                              f"{spans.wrap(m['context'], 'relayer context', tag)}")
             else:
                 lines.append(f"{head} {m['text']}")
+    folded = fold_events(events, tag)
     for e in events:
+        if e["id"] in folded:
+            if folded[e["id"]]:
+                lines.append(folded[e["id"]])
+            continue
         cap = EVENT_CHARS_BY_KIND.get(e["kind"], EVENT_CHARS)
         text = e["text"] if len(e["text"]) <= cap else e["text"][:cap] + " … [cut]"
         lines.append(f"- [{e['kind']} from {e['source']}, severity {e['severity']}] "
@@ -1615,8 +1712,12 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
         lines.append(f"- [{why}] {reason[:_rejection_cap(reason)]}{told}")
     for x in rejcool.digest_lines(db, where=p):
         lines.append(f"- [counted, not woken: the same unchanged cause as a rejected action] {x}")
-    for x in db.kv(NOTES_KEY, []) or []:
-        lines.append(f"- [note on your previous turn's action: applied, nothing to fix] {x[:500]}")
+    notes = db.kv(NOTES_KEY, []) or []
+    if len(notes) == 1:
+        lines.append(f"- [note on your previous turn's action: applied, nothing to fix] {notes[0][:500]}")
+    elif notes:   # the label once, not on each note
+        lines.append("- [notes on your previous turn's actions: applied, nothing to fix]")
+        lines += [f"  - {x[:500]}" for x in notes]
     for x in chaincap.notices(db):
         lines.append(f"- [continue hop queued by the daemon (progress or an urgent task's follow-up, under the chain "
                      f"caps): nothing to decide; task_update it to cancelled to cancel one] {x[:800]}")
@@ -1751,6 +1852,40 @@ def task_cap(cfg: dict, review: bool = False) -> int:
     if review:
         cap = int(c["max_review_tasks_per_day"]) if c.get("max_review_tasks_per_day") is not None else 2 * cap
     return max(0, cap)
+
+
+def slot_wake(db, free_at: float, review: bool, why: str) -> None:
+    """Wake the coordinator when the task cap's next slot frees (daemon.retry_rejected), the earliest
+    asked for winning, so a task_add refused on a full cap is added then without a resend."""
+    wake = db.kv(RETRY_WAKE_KEY) or {}
+    if not wake.get("at") or free_at < float(wake["at"]):
+        db.set_kv(RETRY_WAKE_KEY, {"at": free_at, "review": review, "why": why})
+
+
+# task_cap_lines shows a cap once this share of it is used in the rolling 24 h (or it is full).
+CAP_NEAR = 0.8
+
+
+def task_cap_lines(db, cfg: dict, now: float, where=None) -> list[str]:
+    """STATE's lines for the rolling 24 h task caps (max_new_tasks_per_day, max_review_tasks_per_day):
+    nothing while far below a cap; used of limit once near it; and when full, when the next slot frees,
+    so a task_add is held back instead of learned by refusal."""
+    out = []
+    for review in (False, True):
+        cap = task_cap(cfg, review)
+        what = "review tasks" if review else "new tasks"
+        key = "max_review_tasks_per_day" if review else "max_new_tasks_per_day"
+        if cap <= 0:
+            out.append(f"- 24 h cap on {what} ({key}): 0, none can be added until it is raised")
+            continue
+        used = len(tasks_made(db, now - 86400, review))
+        if used < cap * CAP_NEAR:
+            continue
+        line = f"- 24 h cap on {what} ({key}): {min(used, cap)} of {cap} used"
+        free_at = next_task_slot(db, cap, now, review)
+        out.append(line + (f", FULL: the next slot frees at {_clock(free_at, where)}; hold a task_add until then"
+                           if free_at is not None else f", {cap - used} left"))
+    return out
 
 
 # How far off next_task_slot puts the next slot when the cap is 0: no new tasks until it is raised.
@@ -2450,9 +2585,20 @@ def _wakemode_checked(p: Project, text: str, notes: list) -> str:
     return text
 
 
+def _claims_checked(p: Project, a: dict, notes: list) -> tuple[str, list]:
+    """A reply or notify as claimcheck.check sends it: a status claim that did not hold goes prefixed with what is
+    true, one nothing could check with '(unverified)' after it. Returns (text, the false claims)."""
+    text, false, unverified = claimcheck.check(p, a["text"], a.get("claims"))
+    if false or unverified:
+        notes.append(f"claimcheck: {len(false)} claim(s) did not hold and {unverified} could not be checked when "
+                     f"sent; they went marked. Check live state first and back each status claim with `claims`")
+    return text, false
+
+
 def apply(p: Project, actions: list[dict], default_chat: str | None = None, user_turn: bool = False,
           turn: int | None = None, messages: list[int] | None = None, lean: bool = False,
-          applied: list | None = None) -> list[str]:
+          applied: list | None = None, skip_actions: frozenset | set = frozenset(),
+          on_action=None) -> list[str]:
     """Apply validated actions. Returns human-readable notes about rejected ones, fed back next turn.
     Notes on actions applied with a change (NOTES_KEY) reach the next digest as information only.
     `messages`: the user messages the daemon started this turn for (a charter change they approved
@@ -2464,7 +2610,9 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
     text sent again by a later turn is still written. `lean`: the daemon applies this turn again after
     it was cut off applying it (Daemon._reap): the optional restriction checks, which may have held it,
     are skipped and a note says so. `applied`, when given, is filled with the indexes of the actions
-    that went through (mustact.settle)."""
+    that went through (mustact.settle). `on_action(i)` is called before action i is applied and the
+    indexes in `skip_actions` are refused unapplied (Daemon._coord_journal: an action the daemon was cut off
+    in twice is skipped, so the rest of the turn still applies)."""
     db, problems, notes = p.db, [], []
     cfg = p.config()
     # For the stale-restriction check (_restriction_conflicts): the restrictions before this turn's
@@ -2509,21 +2657,34 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
     for k, (i, a) in enumerate(order):
         t = a.get("type")
         key = f"{turn}.{i}" if turn is not None else None
+        if i in skip_actions:
+            failed.add(i)
+            problems.append(f"{t}: not applied: the daemon was cut off twice while applying it; the action "
+                            f"is still in turn {turn}'s output")
+            continue
+        if on_action is not None:
+            on_action(i)
         try:
             a = normalize_action(a)
             if t == "reply":
                 if why := msgparts.too_long(a["text"], "reply"):
                     raise ValueError(why)
+                chat = a.get("chat") or default_chat
+                if why := pointers.refused(a["text"], "reply", pointers.later_parts(a["text"], [
+                        str(b.get("text") or "") for _, b in order[k + 1:]
+                        if (b or {}).get("type") == "reply" and (b.get("chat") or default_chat) == chat])):
+                    raise ValueError(why)
                 if a.get("claims"):
                     obligations.check_claims(a["claims"], p)
-                chat = a.get("chat") or default_chat
                 cites = turnrules.check_cites(db, a, chat)
                 said = workernotify.named(a["text"])   # the ids the coordinator named, before onhost's status line
                 a["text"] = _onhost_checked(p, a["text"], None if chat in (None, "all") else chat, a, order[k + 1:],
                                             batch_tasks, notes)
                 a["text"] = _wakemode_checked(p, a["text"], notes)
+                a["text"], false = _claims_checked(p, a, notes)
                 replies.append(msgparts.post(db, a["text"], chat=None if chat in (None, "all") else chat, kind="reply",
                                              severity=_norm_severity(a.get("severity") or "normal"))[0])
+                claimcheck.raise_false(db, false, f"your reply #{replies[-1]} (chat {chat or 'all'})")
                 turnrules.record_cites(db, chat, cites, replies[-1])
                 sent.append((replies[-1], chat, a["text"]))
                 if a.get("claims"):
@@ -2614,10 +2775,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     else:
                         why = (f"cap of {cap} {what} in 24 h reached; the next slot frees at "
                                f"{_clock(free_at, p)}, when you are woken to add it again")
-                    wake = db.kv(RETRY_WAKE_KEY) or {}
-                    if not wake.get("at") or free_at < float(wake["at"]):
-                        db.set_kv(RETRY_WAKE_KEY, {"at": free_at, "review": review,
-                                                   "why": f"task_add {title!r}: {why}"})
+                    slot_wake(db, free_at, review, f"task_add {title!r}: {why}")
                     raise ValueError(why)
                 tier = a.get("tier") if a.get("tier") in ("light", "standard", "deep") else "standard"
                 tier_source = "task_add" if a.get("tier") == tier else "default"
@@ -2700,6 +2858,9 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     except ValueError:
                         old = None
                 taken = bool(carried and old and old["id"] == carried[0]["id"])
+                # A live task's branch the spec merely names stays that task's: nothing delivers there.
+                owned = None if review or given or followup or pub or REBASE_TITLE.search(title) \
+                    else _named_branch(db, spec_text, live=True)
                 onto = pub["branch"] if pub else given.group("branch") if given else ""
                 # A rebase of that branch cannot fast-forward it: it works on its own branch and delivers
                 # there (delivery.rebase_replace new_branch), or `ttp push --own` replaces that branch
@@ -2765,12 +2926,17 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                         raise ValueError(f"task_add rejected: its spec names order {oid}, and {why}")
                 pin = _task_pin(cfg, a, pin_of(old or followup))
                 labels += _pin_mark(db, a.get("pin_required"), pin, old or followup)
+                if a.get("untrusted_input") is True or untrusted.spec_sources(a.get("spec") or ""):
+                    labels.append(untrusted.LABEL)   # untrusted.py: its run's narrowed policy, no routing
+                labels = untrusted.inherit(labels, old, followup, carried and carried[0])
                 clash = _file_overlaps(p, kind, a.get("spec") or "", {old["id"]} if old else set())
                 if dropped := _exempt_overlap_deps(p, old or followup, deps):
                     deps = [d for d in deps if d not in dropped]
                 why_after = start_why(a, {}, when)
                 roots = {int(a["continues"])} if a.get("continues") is not None else set()
                 roots |= {t["id"] for t in (old, followup, carried and carried[0]) if t}
+                # A task that rebases or re-lands another's change carries it: it never waits on it landing.
+                roots |= {i for i in landed.redone(title, a.get("spec")) if db.task(i)}
                 tie = _overlap_chain(p, kind, a.get("spec") or "", clash, roots, {old["id"]} if old else set(), labels)
                 landing = landed.can_check(p)
                 if parallel := file_overlap.PARALLEL.search(a.get("spec") or ""):   # a no-op kept for old specs
@@ -2822,7 +2988,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 try:   # a spec missing its order's words or the earlier findings: a note, never a refusal
                     notes.extend(ctxblock.spec_notes(p, new_id))
                 except Exception as e:
-                    log(p, f"task_add #{new_id}: context check failed: {type(e).__name__}: {e}")
+                    notes.append(f"task_add #{new_id}: context check failed: {type(e).__name__}: {str(e)[:200]}")
                 if followup:
                     notes.append(f"task_add: #{followup['id']} is done; added #{new_id} as its follow-up")
                 if pub:
@@ -2847,6 +3013,10 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     notes.append(f"task_add: #{new_id} names #{carried[0]['id']}'s branch {carried[1]} but carries "
                                  f"no branch: only a `pr_branch: {carried[1]}` line in its spec makes it deliver "
                                  f"onto another task's branch")
+                if owned and not (old and old["id"] == owned[0]["id"]):
+                    notes.append(f"task_add: #{new_id} names #{owned[0]['id']}'s branch {owned[1]} but carries no "
+                                 f"branch: #{owned[0]['id']} ({owned[0]['status']}) still owns it, and only a "
+                                 f"`pr_branch: {owned[1]}` line in #{new_id}'s spec makes it deliver there")
                 if worktree.NO_PR_BRANCH in labels:
                     why = (" (never published)" if unpublished else f" (#{foreign}'s branch, and no `pr_branch: "
                            f"{inherited}` line names it)" if foreign is not None else "")
@@ -3022,8 +3192,22 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 elif a.get("text"):
                     # Kept as the reason, a note would outlive the state it described.
                     spec = "\n\n".join(x for x in (spec, a["text"]) if x)
+                base, whole, history, told = task["spec"], False, [], None
+                if spec:   # its `retire:` and `replace:` lines edit the live spec (spec_edits)
+                    try:
+                        base, spec, told, whole, history = spec_edits(base, spec)
+                    except ValueError as e:
+                        raise ValueError(f"#{task['id']} rejected: {e}") from None
+                if a.get("replace") is not None:   # one step replaced or withdrawn; the old text goes to history
+                    if whole:
+                        raise ValueError(f"#{task['id']} rejected: `replace:` replaces the whole spec; drop the `replace` field")
+                    base, said = replace_step(base, a["replace"])
+                    spec = "\n\n".join(x for x in (spec, said) if x)
+                    told = told and "\n\n".join((told, said))
+                    history.append({"old": a["replace"]["old"], "new": a["replace"].get("new") or ""})
                 # Last, so the field wins over a `pr_branch:` line of the same update (recorded_pr_branch).
                 spec = "\n\n".join(x for x in (spec, branch_line) if x)
+                told = told and "\n\n".join(x for x in (told, branch_line) if x)
                 if a.get("priority"):
                     upd["priority"] = int(a["priority"])
                     # A review hop given a priority keeps it; its chain's changes no longer move it.
@@ -3054,7 +3238,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                         raise ValueError(f"#{task['id']} rejected: {e}") from None
                     if why := cells.problem(spec):
                         raise ValueError(f"#{task['id']} rejected: {why}")
-                    upd["spec"] = task["spec"] + "\n\n## Update\n" + spec
+                    upd["spec"] = spec if whole else base + "\n\n## Update\n" + spec
                     prev = load_result(upd.get("result") or task["result"])
                     if task["status"] != "running" and prev.pop("stale_wakes", None) is not None:
                         # A re-plan: the wait it hands back next is not compared with the old plan's.
@@ -3103,6 +3287,16 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     if waits or anchors.without(labels) != labels:
                         upd["labels"] = anchors.without(labels) + ([waits] if waits else [])
                 db.update_task(task["id"], **upd)
+                for h in history:   # the append-only history of what the live spec no longer says
+                    db.x("INSERT INTO events(ts,source,kind,severity,text,data,status,task) VALUES(?,?,?,?,?,?,?,?)",
+                         (time.time(), "coordinator", STEP_REPLACED_KIND, "low",
+                          f"#{task['id']}: {'the whole spec' if whole else 'a spec step'} replaced", json.dumps(h),
+                          "handled", task["id"]))
+                if upd.get("status") == "queued" and task["status"] != "queued":
+                    # an explicit requeue, logged once the update is written: dispatch's done count restarts
+                    dispatchguard.record_requeue(db, task["id"], task["status"], "coordinator")
+                elif upd.get("status") == "cancelled" and task["status"] != "cancelled":
+                    dispatchguard.record_cancel(db, task["id"], task["status"], "coordinator")
                 if upd.get("spec"):
                     userorder.respec(db, task["id"])
                 if upd.get("status", task["status"]) not in TERMINAL_TASK_STATES \
@@ -3131,7 +3325,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 if spec and task["status"] == "running":
                     for r in db.q("SELECT dir FROM runs WHERE task=? AND status='running'", (task["id"],)):
                         if r["dir"]:
-                            _append_update(Path(r["dir"], "steer.md"), spec, key)
+                            _append_update(Path(r["dir"], "steer.md"), told or spec, key)
                     if upd.get("status") != "cancelled" and (why := preempt.restart_line(spec)):
                         # The run went the wrong way: stopped at a safe point (after its `ttp lock`s), requeued
                         # with this spec and its work kept, no attempt spent (preempt.request_restart).
@@ -3303,13 +3497,18 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     raise ValueError(f"notify rejected: {why}")
                 if why := msgparts.too_long(a["text"], "notify"):
                     raise ValueError(why)
+                if why := pointers.refused(a["text"], "notify", pointers.later_parts(a["text"], [
+                        str(b.get("text") or "") for _, b in order[k + 1:] if (b or {}).get("type") == "notify"])):
+                    raise ValueError(why)
                 if a.get("claims"):
                     obligations.check_claims(a["claims"], p)
                 said = workernotify.named(a["text"])   # the ids the coordinator named, before onhost's status line
                 a["text"] = _onhost_checked(p, a["text"], None, a, order[k + 1:], batch_tasks, notes)
                 a["text"] = _wakemode_checked(p, a["text"], notes)
+                a["text"], false = _claims_checked(p, a, notes)
                 sent.append((msgparts.post(db, a["text"], chat=None, kind="alert",
                                            severity=_norm_severity(a.get("severity")))[0], None, a["text"]))
+                claimcheck.raise_false(db, false, f"your notify #{sent[-1][0]}")
                 if a.get("claims"):
                     claimed.append((sent[-1][0], None, a["claims"]))
                 workernotify.handled(db, said)
@@ -3834,6 +4033,10 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 # The user's own request makes it their pause before any default end is chosen:
                 # a health end then only reports, it never lifts it.
                 by = "user" if a["paused"] and _users_pause(db, a, user_turn, messages) else "coordinator"
+                if a["paused"] and by == "coordinator":
+                    refusal = projpause.repause_refusal(db, "coordinator", resource=name)
+                    if refusal:
+                        raise ValueError(refusal)
                 # A re-pause keeps the user's pause theirs (pause_resource), so its end is chosen as theirs.
                 owner = "user" if "user" in (by, (held or {}).get("by")) else by
                 line = pause_resource(p, name, a["paused"], reason=a.get("reason") or a.get("text") or "", by=by, key=key,
@@ -3858,6 +4061,15 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
             elif t == "self_change":
                 notes.append(selfimprove.add(p, a, parse_start_after(a.get("start_after") or selfimprove.DEFAULT_CHECK,
                                                                      tz=timefmt.home(p)), settable=settable))
+            elif t == "look":
+                from . import looks
+                if a.get("enabled") is False:   # clears every pending look: back to the idle wake
+                    notes.append(f"look: cleared {looks.clear(db)}")
+                else:
+                    if not str(a.get("at") or "").strip():
+                        raise ValueError("look: give `at`: a delay such as 45m or a time in the home zone")
+                    at = parse_start_after(str(a["at"]), tz=timefmt.home(p)) or time.time()
+                    looks.add(db, at, str(a.get("text") or ""), a.get("precheck"))
             elif t in ("noop", None):
                 pass
             else:
@@ -3878,6 +4090,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 _charter_retry_now(p, a, str(e), key, announced, filled=(filled[0], why) if filled else None)
             if t == "config_set" and a.get("key"):
                 cfg_refused[str(a["key"])] = str(e)
+    if on_action is not None:   # past the actions: a cut-off from here on blames none of them
+        on_action(None)
     plans = _apply_due_moves(p, actions, due_moves, failed, problems, notes, started, plan_before)
     for k, before, upd in new_ask_holds:
         ask = next((mid for at, mid in turn_asks if at > k), None)
@@ -4268,7 +4482,7 @@ def _failed_latest_review(db, task: dict) -> dict | None:
 # it. A mention in running prose ("the spec's pr_branch: line") is no such line. Known gap, accepted:
 # a line such as `pr_branch: use that branch` labels a bogus branch ("use"); `ttp push --own` refuses
 # one that exists nowhere and on_carried sends the task back to its own branch.
-NAMED_BRANCH = re.compile(r"(?<![\w/.-])ttp/t(\d+)-[\w./-]*[\w-]")
+NAMED_BRANCH = push.NAMED_BRANCH
 REBASE_TITLE = re.compile(r"\brebas(?:e|es|ed|ing)\b", re.I)   # a task whose work is a rebase of its branch
 SPEC_PR_BRANCH = worktree.SPEC_PR_BRANCH
 
@@ -4289,13 +4503,14 @@ def _lands_on_push_branch(cfg: dict, spec: str, branch: str) -> bool:
         any(names_branch(spec, r) for r in {ref, ref.partition("/")[2]} if r)
 
 
-def _named_branch(db, spec: str) -> tuple[dict, str] | None:
+def _named_branch(db, spec: str, live: bool = False) -> tuple[dict, str] | None:
     """(task, branch) when `spec` names the work branch of one finished task (done, failed or
-    cancelled; a live one still owns it); None when it names none, or branches of several tasks."""
+    cancelled; a live one still owns it), or with `live` of one unfinished task; None when it names
+    none, or branches of several tasks."""
     found: dict[int, tuple[dict, str]] = {}
     for m in NAMED_BRANCH.finditer(spec):
         t = db.task(int(m.group(1)))
-        if t and t["status"] in ("done", "failed", "cancelled") \
+        if t and (t["status"] in ("done", "failed", "cancelled")) != live \
                 and m.group(0) == (t["branch"] or f"ttp/t{t['id']}-{worktree.slug(t['title'])}"):
             found[t["id"]] = (t, m.group(0))
     return next(iter(found.values())) if len(found) == 1 else None
@@ -5120,14 +5335,18 @@ def without_lock_probes(probe: Any, gone: set[str], canon: Any = None) -> str | 
 def _user_order(p: Project, a: dict, task_id: int, text: str, messages: list[int] | None) -> str:
     """Record task `task_id` as the latest user order on the resources it names (userorder.py) when the
     action carries the user's message (`user_msg`), or a task_add's text cites one of this turn's (a
-    re-spec of an older task citing it is no new order); its note, else ""."""
+    re-spec of an older task citing it is no new order); its note, else "". A cited message orders only
+    the resources its own words name: a task citing an order on another topic holds nothing."""
     try:
-        msg = int(a["user_msg"]) if a.get("user_msg") is not None else \
+        explicit = a.get("user_msg") is not None
+        msg = int(a["user_msg"]) if explicit else \
             userorder.cited(p.db, text, messages) if a.get("type") == "task_add" else None
     except (TypeError, ValueError):
         msg = None
     try:
         names = sorted(task_resources(p.db.task(task_id) or {})) if msg else []
+        if names and not explicit:
+            names = userorder.named(p.db, p.config(), msg, names)
         ordered = userorder.record(p.db, task_id, msg, names) if names else []
         if not ordered:
             return ""
@@ -5198,7 +5417,7 @@ def worker_pinned_line(p: Project, use: dict | None = None) -> str:
     from .prompts import worker_context
     use = use or worker_context(p)[2]
     if not use["pinned_dropped"]:
-        return (f"pinned worker memory over budget: the {use['kept']} restriction, resource and standing entries for "
+        return (f"pinned worker memory over budget: the {use['kept']} restriction and resource entries for "
                 f"workers ({use['kept_chars']} chars) outgrow their {use['memory_limit']} chars of room; every "
                 f"worker prompt still carries them whole; merge or shorten them") if use["kept_over"] else ""
     return (f"pinned worker memory over budget: {use['pinned_chars']} chars for {use['memory_limit']} of room "
@@ -6324,6 +6543,130 @@ def _repair_lift(p: Project, section: str, text: str, end: dict | None, said: st
         return "", str(e)
     return (stored, f"charter_update repaired: the source's words allow it within its scope, so it went in as a "
                     f"scoped exception (`excepts` \"{clip(clause, 160)}\") instead of being refused. " + note), ""
+
+
+# task_update `replace` {old, new}: one step of a task's spec, its exact text found once, becomes `new`
+# ("" withdraws it). Appending alone could never take back a requirement. The old text is kept in a
+# STEP_REPLACED_KIND event (the task's history) and named in the update a running worker reads. A step
+# touching a safety line (a Restrictions, guard, never or no_push line, or a line of a Restrictions block)
+# is refused: those change only through the charter.
+STEP_REPLACED_KIND = "spec_step_replaced"
+_SAFETY_HEAD = re.compile(r"^\s*(?:[-*#>]+\s*)*(?:\*\*)?(?:restrictions?|guards?|binding|never|no_push|safety)\b", re.I)
+
+
+def _safety_lines(spec: str) -> set[int]:
+    """Indexes of the spec's safety lines: one matching _SAFETY_HEAD, and each line after a Restrictions
+    or guards head up to the next blank line."""
+    out, block = set(), False
+    for i, ln in enumerate(spec.split("\n")):
+        if not ln.strip():
+            block = False
+        elif _SAFETY_HEAD.match(ln):
+            out.add(i)
+            block = block or bool(re.match(r"^\s*(?:[-*#>]+\s*)*(?:\*\*)?(?:restrictions?|guards?)\b", ln, re.I))
+        elif block:
+            out.add(i)
+    return out
+
+
+def _obligation_spans(spec: str) -> list[tuple[int, int]]:
+    """(start, end) of each `## Obligation` owner block and milestone note the harness appended to the spec
+    (prompts._OBLIGATION_BLOCK), without the newlines around it. obligations._attach never re-appends a
+    block for an owner it already has, so a spec edit keeps them whole."""
+    from .prompts import _OBLIGATION_BLOCK
+    out = []
+    for m in _OBLIGATION_BLOCK.finditer(spec):
+        start = m.start() + len(m.group(0)) - len(m.group(0).lstrip("\n"))
+        out.append((start, start + len(m.group(0).strip("\n"))))
+    return out
+
+
+def _in_obligation(spec: str, start: int, end: int, what: str) -> None:
+    """ValueError when spec[start:end] overlaps an appended obligation block."""
+    if any(start < b and end > a for a, b in _obligation_spans(spec)):
+        raise ValueError(f"{what} falls inside an `## Obligation` block the harness appended: an obligation changes "
+                         f"only through `ttp obligation` (or an `obligation` action), never by a task_update")
+
+
+def replace_step(spec: str, rep) -> tuple[str, str]:
+    """(the spec with `rep['old']` replaced by `rep['new']`, the update line saying so); ValueError when
+    `old` is not in the spec exactly once or touches a safety line."""
+    if not isinstance(rep, dict) or not str(rep.get("old") or "").strip():
+        raise ValueError("`replace` is {old: the exact text of one spec step, new: its new text (\"\" withdraws it)}")
+    old, new = str(rep["old"]), str(rep.get("new") or "")
+    if (n := spec.count(old)) != 1:
+        raise ValueError(f"`replace` old text is in the spec {n} times, not once: quote one step exactly")
+    start = spec.index(old)
+    _in_obligation(spec, start, start + len(old), "`replace` old text")
+    first, last = spec.count("\n", 0, start), spec.count("\n", 0, start + len(old))
+    if hit := sorted(_safety_lines(spec) & set(range(first, last + 1))):
+        line = spec.split("\n")[hit[0]].strip()
+        raise ValueError(f"`replace` touches a safety line ({line[:120]!r}): Restrictions and guards change only "
+                         f"through the charter, never by a task_update")
+    said = (f"Step replaced (the earlier text no longer applies): {' '.join(old.split())[:300]!r} now reads "
+            f"{' '.join(new.split())[:300]!r}" if new.strip() else
+            f"Step withdrawn (no longer required): {' '.join(old.split())[:300]!r}")
+    return spec[:start] + new + spec[start + len(old):], said
+
+
+# A task_update `spec` may also edit the live spec by its own lines: `retire: "<exact earlier text>"` drops
+# every copy of that text (a re-sent update repeats it), and a first line `replace:` makes the rest of the
+# update the whole live spec. Both lines are exact forms, so a plain "Replace: the loader" step stays
+# appended. A quote matching nothing is refused, never ignored. The spec's safety lines are never retired
+# and survive a replace, as do the `## Obligation` blocks the harness appended (carried over byte for byte;
+# a quote inside one is refused). Each earlier text goes to a STEP_REPLACED_KIND event; the worker reads the notice.
+_RETIRE_LINE = re.compile(r'^\s*retire:\s*"(.+)"\s*$', re.I)
+_REPLACE_LINE = re.compile(r"^\s*replace:\s*$", re.I)
+WHOLE_SPEC_REPLACED = "The whole spec was replaced: everything it said before no longer applies. It now reads:"
+RETIRED_LIVE = "Retired: an earlier text of this spec no longer applies (it is kept in the task's history)."
+RETIRED_TOLD = "Retired (this earlier text no longer applies; do not act on it):"
+
+
+def spec_edits(spec: str, update: str) -> tuple[str, str, str, bool, list[dict]]:
+    """(the live spec, the update text to add or, when whole, the new spec, the text a running worker is told,
+    whole, history entries) for a task_update `update`; ValueError on a quote matching nothing, a safety line
+    or a misplaced `replace:`. The live spec never repeats a retired quote: only the running worker, who
+    read it, is told which text it was."""
+    lines = update.split("\n")
+    first = next((i for i, ln in enumerate(lines) if ln.strip()), None)
+    whole = [i for i, ln in enumerate(lines) if _REPLACE_LINE.match(ln)]
+    retires = [i for i, ln in enumerate(lines) if _RETIRE_LINE.match(ln)]
+    if whole:
+        if whole != [first]:
+            raise ValueError("a `replace:` line must be the update's first line, alone: the rest becomes the whole spec")
+        if retires:
+            raise ValueError("an update with `replace:` replaces the whole spec: drop its `retire:` lines")
+        new = "\n".join(lines[first + 1:]).strip()
+        if not new:
+            raise ValueError("`replace:` needs the new spec on the lines after it")
+        old_lines, blocks = spec.split("\n"), _obligation_spans(spec)
+        have = {ln.strip() for ln in new.split("\n")}
+        inside = {i for a, b in blocks for i in range(spec.count("\n", 0, a), spec.count("\n", 0, b) + 1)}
+        kept = list(dict.fromkeys(old_lines[i].strip() for i in sorted(_safety_lines(spec) - inside)
+                                  if old_lines[i].strip() not in have))
+        if kept:
+            new += "\n\nKept from the earlier spec (safety lines change only through the charter):\n" + "\n".join(kept)
+        new += "".join("\n\n" + spec[a:b] for a, b in blocks if spec[a:b] not in new)   # unchanged, last
+        return new, new, f"{WHOLE_SPEC_REPLACED}\n\n{new}", True, [{"old": spec, "new": new, "how": "replace"}]
+    history, told = [], list(lines)
+    for i in retires:
+        quote = _RETIRE_LINE.match(lines[i]).group(1)
+        if len(quote.strip()) < 8:
+            raise ValueError(f"`retire:` quote {quote!r} is too short to name one text: quote at least 8 characters")
+        if not (n := spec.count(quote)):
+            raise ValueError(f"`retire:` quote {quote[:120]!r} matches no earlier spec text: quote it exactly")
+        safety, at = _safety_lines(spec), 0
+        while (at := spec.find(quote, at)) >= 0:
+            if hit := sorted(safety & set(range(spec.count("\n", 0, at), spec.count("\n", 0, at + len(quote)) + 1))):
+                raise ValueError(f"`retire:` quote touches a safety line ({spec.split(chr(10))[hit[0]].strip()[:120]!r}): "
+                                 f"Restrictions and guards change only through the charter")
+            _in_obligation(spec, at, at + len(quote), "`retire:` quote")
+            at += len(quote)
+        spec = spec.replace(quote, "")
+        lines[i] = RETIRED_LIVE
+        told[i] = f"{RETIRED_TOLD} {' '.join(quote.split())[:300]!r}"
+        history.append({"old": quote, "new": "", "how": "retire", "copies": n})
+    return spec, "\n".join(lines), "\n".join(told), False, history
 
 
 def _append_update(steer: Path, text: str, key: str | None = None) -> None:

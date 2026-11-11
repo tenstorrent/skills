@@ -20,12 +20,14 @@ suite. `delivery.checks_targeted_always` (default ALWAYS) always
 run; `delivery.checks_targeted: false` (or `ttp checks --full`) runs every task's checks in full.
 
 With the push queue on (project.push_queue_on), every batch runs the full suite on the merged tree before
-anything is pushed and bisects a failure to the changes at fault, so a task's own checks run in full only
-where the whole suite is affected (HARD: a conftest, test helper or data file, the runner files, a
-manifest, `__init__.py` or config file, a listed file's module-level code); a selection of most of the suite
-stays targeted, since the batch runs every test anyway. A change
-only the full suite would cover (SOFT: a module's module-level code, the checks runner's functions in a
-module, what no test names) adds the tests it can place, and the scope line names it as left to the batch."""
+anything is pushed and bisects a failure to the changes at fault, so a task's own checks run in full
+never: the push train is the only full run. A change that would widen to the whole check (a conftest,
+test helper or data file, the runner files, a manifest, `__init__.py` or config file, module-level
+code) runs only the units it reaches (_reach: those importing or naming the changed module, and those
+naming the functions it changes); a selection of most of the suite stays targeted, since the batch runs
+every test anyway. What only the full suite would cover adds the tests it can place, and the scope line
+names it as left to the batch. `ttp checks --full` from a task or review is refused there (full_refusal)
+unless the user set `delivery.checks_task_full: true`. With the push queue off nothing of this applies."""
 from __future__ import annotations
 
 import ast
@@ -45,6 +47,18 @@ FULL_NAMES = {"conftest.py", "__init__.py", "plugin.json", "marketplace.json", "
 RUNNER = ("testpick.py", "push.py", "pushpass.py", "pytest_resume/")   # under runtime/ttp/
 RUNNER_DEFS = re.compile(r"cmd_checks\Z|_checks")
 GIT_TIMEOUT_S = 30
+
+
+def full_refusal(cfg: dict | None) -> str:
+    """Why a task's or review's `ttp checks --full` is refused, or "": with the push queue on the push train
+    runs the only full suite, unless the user set delivery.checks_task_full."""
+    from . import project
+    d = (cfg or {}).get("delivery") or {}
+    if not project.push_queue_on(cfg or {}) or d.get("checks_task_full") is True:
+        return ""
+    return ("--full is refused: with the push queue on, the push train runs the only full suite and a task's "
+            "checks run the tests its change reaches (run `ttp checks` without --full; the user's "
+            "delivery.checks_task_full: true allows it)")
 
 
 def enabled(cfg: dict | None) -> bool:
@@ -256,6 +270,38 @@ def _place(top: Path, base: str, head: str, path: str, us: dict[str, str], liste
     return (got, "") if got else left(set(), f"no test names what {path} changes")
 
 
+def _touched(top: Path, base: str, head: str, path: str) -> set[str]:
+    """The top-level functions and classes of `path` whose lines the diff adds or changes, module-level
+    changes left out (changed_defs gives up on those)."""
+    diff, text = _git(top, "diff", "-U0", "--no-renames", f"{base}...{head}", "--", path), _git(top, "show", f"{head}:{path}")
+    try:
+        defs = _defs(text) if diff and text else []
+    except (SyntaxError, ValueError):
+        return set()
+    names: set[str] = set()
+    for m in re.finditer(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@", diff or "", re.M):
+        start, count = int(m.group(1)), int(m.group(2) if m.group(2) is not None else 1)
+        for n in range(start, start + max(count, 1)):
+            names |= {d[0] for d in defs if d[1] <= n <= d[2]}
+    return names
+
+
+def _reach(top: Path, base: str, head: str, path: str, us: dict[str, str], listed: list[str]) -> set[str]:
+    """In a push-queue project, the units a change that would widen to the whole check reaches: a case
+    file itself, a listed file's own units, the units that import or name the changed module (never for
+    a conftest or `__init__.py`, which every test loads), and those naming a function or fixture it
+    changes. The push train runs the rest."""
+    p = Path(path)
+    got = {path} if path in us else {k for k in us if k.startswith(f"{path}::")} if path in listed else set()
+    if p.suffix != ".py":
+        return got | _naming(us, p.name, False)
+    if p.name not in ("conftest.py", "__init__.py"):
+        got |= _naming(us, p.stem, True)
+    for d in _touched(top, base, head, path):
+        got |= _naming(us, d, False)
+    return got
+
+
 def pick(top: Path, base: str, head: str, files: list[str], always=ALWAYS,
          soft: list[str] | None = None, sizes: dict | None = None) -> tuple[list[str], str]:
     """(selection entries, "") for a narrowed check, else ([], why it runs in full). With `soft` (a
@@ -274,10 +320,13 @@ def pick(top: Path, base: str, head: str, files: list[str], always=ALWAYS,
     chosen: set[str] = set()
     for path in paths:
         got, why = _place(top, base, head, path, us, files, cases, soft)
+        if why and soft is not None:   # the push train runs the whole check: only what the change reaches
+            soft.append(why)
+            got, why = _reach(top, base, head, path, us, files), ""
         if why:
             return [], why
         chosen |= got
-    if not chosen and not soft:
+    if not chosen and soft is None:
         return [], "nothing in the diff maps to a test"
     chosen |= {k for k in us for a in always if k == a or k.startswith(f"{a}::")}
     if not chosen:

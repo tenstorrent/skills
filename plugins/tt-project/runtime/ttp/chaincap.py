@@ -850,6 +850,8 @@ def requeue(p, cfg: dict, task: dict, fup: dict, why: str, attempts: int, now: f
                             task["id"])).rowcount
     if not rows:
         return False
+    from . import dispatchguard
+    dispatchguard.record_requeue(db, task["id"], "done", "continue")   # a new hop: its done count restarts
     ch = chain(db, task["id"])
     db.x("INSERT INTO events(ts,source,kind,severity,text,data,status,task) VALUES(?,?,?,?,?,?,?,?)",
          (now, f"task:{task['id']}", AUTO_EVENT, "low",

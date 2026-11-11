@@ -21,7 +21,7 @@ runnable CPU demand is above its cores (load_guard()); running ones are never st
 Defaults (sizes()): the pool is half the host's usable cores, at least 2, so tests leave the other
 half to live work and builds; one run takes at most min(RUN_MAX, half the pool), at least 1, so two
 runs always fit side by side and no suite takes the pool. Unset, the test pool a run takes from also
-grows into spare cores (pool_now: the slots in use plus the cores the 1-minute load average leaves, at most
+grows into spare cores (pool_now: the slots in use plus the cores the CPU demand (checkcap._load) leaves, at most
 the host's cores), so the extra lanes an idle host gives (checklane.capacity) get their workers; a busy
 host keeps the half, as does checks.load_extra 0. A test grant is also at most the host's live free cores, less one for
 each worker granted in the last few seconds, at least WORKERS_FLOOR (live_room; checks.live_cores 0
@@ -31,7 +31,9 @@ off. A project's own checks.test_pool / checks.test_run_max may only lower them.
 (`full`) waits in line until at least run_min() slots are free in both the pool and its project's
 budget, then starts with at least that many, so a suite never runs for half an hour on one or two
 workers; with a pool or budget smaller than that it starts with what they can give. Pre-stages, push
-checks and builds keep at least one.
+checks and builds keep at least one. A worker's own pytest asking for more than one worker takes slots
+through `ttp clip` or `ttp sandbox` (direct): at most its TTP_TEST_SLOTS, fewer while others hold them,
+held by the test process itself, so they free when it ends or dies.
 
 One project holds at most project_max() slots at once over all its runs, as per-project lock files
 beside the pool's, so a burst of one project's checks leaves room for the others. Its default is the
@@ -91,7 +93,7 @@ import time
 from pathlib import Path
 from typing import Callable
 
-from . import checkcap, checkwait, locks, poll_s, project, repoid
+from . import checkcap, checkwait, hostcpu, locks, poll_s, project, repoid
 
 RESOURCE = "test-slots"    # check-slots/test-slots.<i>.lock
 RUN_MAX = 8                # one run's most workers by default: past about 8 a suite's wall time gains little
@@ -186,7 +188,7 @@ def sizes(cfg: dict | None = None, cores: int | None = None, kind: Kind = TESTS)
 def pool_now(cfg: dict | None, pool: int, held: int, cores: int | None = None, load: float | None = None,
              kind: Kind = TESTS) -> int:
     """The test pool a run may take from now: with checks.test_pool unset (account and project), the
-    `held` slots in use plus the host's spare cores (its cores less the 1-minute load average, which
+    `held` slots in use plus the host's spare cores (its cores less the CPU demand, checkcap._load, which
     counts the running ones), at most its cores, never below the default `pool`; so the half of the
     cores the pool leaves serves more checks only while nothing else keeps it busy. An unreadable load
     average, a set pool, checks.load_extra 0 (checkcap.extra_max) and the build pool keep `pool`."""
@@ -222,33 +224,41 @@ def live_room(every: list) -> int | None:
 def project_workers(cfg: dict | None = None, cores: int | None = None, project_name: str | None = None) -> int:
     """The most test workers one project runs at once over all its suites (0: no such ceiling):
     TTP_TEST_PROJECT_WORKERS, else the account's checks.test_project_workers, else the base (the smaller of
-    PROJECT_WORKERS_MAX and one per CORES_PER_PROJECT_WORKER cores, at least WORKERS_FLOOR) plus the cores
-    the load leaves under SPARE_LOAD x the cores, at most half the cores (spare_workers); a project's own
+    PROJECT_WORKERS_MAX and one per CORES_PER_PROJECT_WORKER cores, at least WORKERS_FLOOR, raised to the
+    host-wide checks cap times run_min (admitted_workers) within the test pool) plus the cores the CPU
+    demand leaves under SPARE_LOAD x the cores, at most half the cores (spare_workers); a project's own
     checks.test_project_workers only lowers it. So a project's suites take a small share of a busy host
-    however many of them run at once, and more of an idle one. The load `project_name`'s own held test
-    slots add is not counted (_own_held): its own suites never shrink its ceiling, others' load does, and
-    the host's pool and load guard still bound the total."""
+    however many of them run at once, and more of an idle one, and every run the host-wide cap admits
+    can start at run_min. The load `project_name`'s own held test slots add is not counted (_own_held):
+    its own suites never shrink its ceiling, others' load does, and the host's pool, live free cores
+    (live_room) and load guard still bound the total."""
     top = _setting(*TESTS.setting("project_workers"))
     if top is None:
         c = checkcap.cores() if cores is None else cores
-        top = max(WORKERS_FLOOR, min(PROJECT_WORKERS_MAX, c // CORES_PER_PROJECT_WORKER))
+        top = max(WORKERS_FLOOR, min(PROJECT_WORKERS_MAX, c // CORES_PER_PROJECT_WORKER), admitted_workers(cfg, c))
         top = max(top, min(c // 2, top + spare_workers(c, _own_held(project_name, c) if project_name else 0)))
     if (mine := _number(_section(cfg, "checks").get("test_project_workers"))) and mine > 0:
         top = min(top, mine) if top else mine
     return max(0, top)
 
 
+def admitted_workers(cfg: dict | None, c: int) -> int:
+    """The test workers the runs the host-wide checks cap admits need to start at run_min each:
+    checkcap.limit() x run_min(), at most the test pool (sizes); 0 with the cap off (0) or the pool off."""
+    s = sizes(cfg, cores=c)
+    n = checkcap.limit()
+    return min(s[0], n * run_min(cfg, s[1])) if s and n > 0 else 0
+
+
 def spare_workers(c: int, own: int = 0) -> int:
-    """The cores the host's load leaves under SPARE_LOAD x its `c` cores, by the larger of its 1- and
-    5-minute load averages (so the ceiling grows slowly and shrinks fast) less `own`, the load one worker
-    per slot the asking project holds puts there (never below 0); 0 with checks.load_extra 0 or an
-    unreadable load. A shrink bounds new grants only: holders above it still count (_own_free)."""
+    """The cores the host's runnable CPU demand (checkcap.cpu_demand, the load guard's reading: busy cores
+    and tasks waiting to run, not tasks waiting on I/O) leaves under SPARE_LOAD x its `c` cores, less `own`,
+    the load one worker per slot the asking project holds puts there (never below 0); 0 with
+    checks.load_extra 0 or an unreadable reading. A shrink bounds new grants only: holders above it still
+    count (_own_free)."""
     if not checkcap.extra_max():
         return 0
-    try:
-        ld = max(os.getloadavg()[:2])
-    except (OSError, ValueError):
-        return 0
+    ld = checkcap.cpu_demand()
     if ld != ld or ld == float("inf"):
         return 0
     return max(0, int(c * SPARE_LOAD - max(0.0, ld - own)))
@@ -277,12 +287,16 @@ def load_guard_factor() -> float:
 def load_guard() -> str:
     """Why no new suite may start now, or "": the host's runnable CPU demand (checkcap.cpu_demand: busy
     cores and tasks waiting to run, not tasks waiting on I/O) is above checks.load_guard
-    (load_guard_factor()) times its cores. 0 turns the guard off; an unreadable reading never holds a
-    suite. Disk contention is diskgate's limit (checks.io_full_max), not this one."""
+    (load_guard_factor()) times its cores at every reading over checks.load_sustain_s (checkcap.sustained_load:
+    a spike of short-lived processes holds nothing), or its memory is short (hostcpu.mem_short). 0 turns the guard
+    off; an unreadable reading never holds a suite. Disk contention is diskgate's limit
+    (checks.io_full_max), not this one."""
     factor = load_guard_factor()
     if not factor:
         return ""
-    ld, c = checkcap.cpu_demand(), checkcap.cores()
+    if mem := hostcpu.mem_short():
+        return f"the host is {mem}; no new suite starts until memory frees, running ones go on"
+    ld, c = checkcap.sustained_load(), checkcap.cores()
     if ld != ld or ld == float("inf") or ld <= factor * c:
         return ""
     return (f"the host's CPU is overloaded: its runnable demand of {ld:.1f} cores is above "
@@ -494,8 +508,8 @@ def own_paths(project_name: str | None, n: int, kind: Kind = TESTS) -> list:
 
 
 def urgent_paths(project_name: str | None, n: int, kind: Kind = TESTS) -> list:
-    """One project's urgent slots beyond its budget: one run's grant (`n`), for a priority-1 waiter whose
-    project's budget is held only by less urgent runs (acquire)."""
+    """One project's urgent slots beyond its budget: one run's grant (`n`), for a priority-1 or better waiter
+    (an owed priority-0 run too) whose project's budget is held only by runs less urgent than it (acquire)."""
     return (locks.slot_paths(checkcap.slot_dir(), f"{kind.own}.{locks.group_id(project_name)}-x", n)
             if project_name else [])
 
@@ -544,10 +558,59 @@ def build_env(k: int) -> dict[str, str]:
 
 
 def worker_env(cfg: dict | None) -> dict[str, str]:
-    """A worker's environment: tests and builds it runs directly in its shell start at most one run's share."""
+    """A worker's environment: tests and builds it runs directly in its shell start at most one run's share.
+    SLOTS_ENV is the most test workers one of its pytest runs may ask for; a run takes them from the host's
+    pool through `ttp clip` or `ttp sandbox` (direct), so a bare `pytest -n auto` starts one (XDIST_ENV 1)."""
     s, b = sizes(cfg), sizes(cfg, kind=BUILDS)
     k = min(s[1], project_max(cfg, s)) if s else 0
-    return {**({XDIST_ENV: str(k), SLOTS_ENV: str(k)} if s else {}), **(build_env(b[1]) if b else {})}
+    return {**({XDIST_ENV: "1", SLOTS_ENV: str(k)} if s else {}), **(build_env(b[1]) if b else {})}
+
+
+DIRECT_WAIT_S = 240.0   # a worker's own pytest waits this long for a host test slot, then runs on one worker
+
+
+def asked(cmd: str, share: int) -> int | None:
+    """The most test workers a pytest run in shell line `cmd` starts: its explicit -n N / --numprocesses N,
+    `share` for -n auto or logical, 1 with none (or -n 0); None when `cmd` runs no pytest."""
+    most = None
+    for seg in _segments(cmd):
+        words = [w for *_, w in seg]
+        if (tool := next((i for i, w in enumerate(words) if _is_tool(words, i, False)), None)) is None:
+            continue
+        n = 1
+        for i in range(tool + 1, len(words)):
+            if words[i] == "--":
+                break
+            if not (m := re.fullmatch(r"(-n|--numprocesses)(=?)(.*)", words[i])):
+                continue
+            v = m.group(3) or (words[i + 1] if not m.group(2) and i + 1 < len(words) else "")
+            n = int(v) if v.isdigit() else share if v in ("auto", "logical") else n
+        most = max(most or 0, n, 1)
+    return most
+
+
+def direct(cmd: str, holder: str, tell: Callable[[str], None]) -> Grant | None:
+    """A worker's own pytest run (`ttp clip`, `ttp sandbox`) takes its test workers from the host's pool,
+    as a `ttp checks` run does: in a worker run (SLOTS_ENV, its share) not inside a run that holds slots,
+    for a pytest asking more than one worker (asked), up to that many, at most the share. With too few
+    free it starts with fewer; with none it waits (in line, under the load guard and its project's budget,
+    as acquire) up to DIRECT_WAIT_S, then runs on one worker without a slot. The caller lowers -n to
+    grant.k (clamp) and runs the command with grant.env() and the grant's files (inheritable here), so
+    the test process holds the slots and its end or death frees them. None: nothing to take."""
+    share = _number(os.environ.get(SLOTS_ENV))
+    if not share or os.environ.get(HELD_ENV) or os.environ.get(checkcap.HELD_ENV):
+        return None
+    if (n := asked(cmd, share) or 0) <= 1:
+        return None
+    grant = acquire(holder, tell, DIRECT_WAIT_S, most=min(n, share))
+    if grant is None:
+        tell(f"no host test slot free after {DIRECT_WAIT_S:.0f} s: running on 1 test worker")
+        return Grant(1)
+    if not grant.k:   # the pool is off
+        return None
+    for f in grant.files:
+        os.set_inheritable(f.fileno(), True)
+    return grant
 
 
 def paths(pool: int, kind: Kind = TESTS):
@@ -560,6 +623,10 @@ class Grant:
     def __init__(self, k: int = 0, files=(), waited: float = 0.0, kind: Kind = TESTS):
         self.k, self.files, self.waited, self.kind = k, list(files), waited, kind
         self.extra: dict[str, str] = {}   # more variables for the commands, e.g. the run's ports (port_block)
+
+    def fds(self) -> tuple[int, ...]:
+        """The held slot files' descriptors, for a command that should hold them for its life (pass_fds)."""
+        return tuple(f.fileno() for f in self.files)
 
     def env(self) -> dict[str, str]:
         if not self.k:
@@ -650,7 +717,8 @@ def _pass_told(what: str, passed, load: str) -> str:
 def acquire(holder: str, tell: Callable[[str], None] | None = None, wait_s: float | None = None,
             cfg: dict | None = None, project_name: str | None = None, push_key: str = "",
             kind: Kind = TESTS, priority: int | None = None, stop: Callable[[], str] | None = None,
-            since: float | None = None, full: bool = False, waits: Callable[[str], None] | None = None) -> Grant | None:
+            since: float | None = None, full: bool = False, waits: Callable[[str], None] | None = None,
+            most: int | None = None) -> Grant | None:
     """Take this run's test slots (above); waits while none is free, urgent runs of any project first
     (locks.urgent_order: priority 1 or better, by priority then arrival), the rest first-come, telling why every
     TELL_S. None only once `wait_s` passed with none free (a foreground caller hands over). Nested in a
@@ -671,7 +739,8 @@ def acquire(holder: str, tell: Callable[[str], None] | None = None, wait_s: floa
     (load_guard), except one run per load pass at a time (load_pass_paths: a priority-0 run's, an urgent or
     push run's, the floor's; it holds the pass with its grant): it waits, telling why and passing the reason
     to `waits` (its lanes' wait note, lane_waits), and `waits` gets "host test slots" again once the load drops. A push check's wait there is bounded
-    (push_load_wait_s): past it, it starts on its branch's reserved lane alone."""
+    (push_load_wait_s): past it, it starts on its branch's reserved lane alone. `most`: a run's most slots
+    below run_max (a worker's own pytest -n N, direct)."""
     tell = tell or (lambda _line: None)
     what = f"{kind.name} slots"
     for env in (kind.held_env, HELD_ENV):   # HELD_ENV: a build in a check builds on the check's slots
@@ -728,6 +797,7 @@ def acquire(holder: str, tell: Callable[[str], None] | None = None, wait_s: floa
             if s is None:
                 return Grant(kind=kind)
             pool, top = s
+            top = max(1, min(top, most)) if most else top
             guard = _grant_guard(kind)   # let go once it took its slots or found none (below)
             # Slots in use over every pool file there may be (a pool that shrank leaves holders past its end).
             used = len(locks._slot_labels(paths(max(pool, checkcap.cores()), kind)))
@@ -761,7 +831,8 @@ def acquire(holder: str, tell: Callable[[str], None] | None = None, wait_s: floa
                     ahead = line[:line.index(mine)] if mine in line else line
                     if (not ahead and own_free < min(want, len(own)) and priority is not None and priority <= 1
                             and (recs := locks.holder_records(own))
-                            and all(_rank(r) > 1 for r in recs) and locks.any_free(urgent := urgent_paths(name, top, kind))):
+                            and all(_rank(r) > priority for r in recs)
+                            and locks.any_free(urgent := urgent_paths(name, top, kind))):
                         own, own_free = urgent, _free(urgent)
                         what = f"{kind.name} slots (urgent: its project's budget is held by less urgent runs)"
                 if own:   # never more than its budget has left, holders past a budget that shrank counted
@@ -1190,9 +1261,9 @@ def pool_gate(cfg: dict | None, project_name: str | None, full: bool = False, pr
     its urgent slots instead (urgent_paths), as acquire takes them. A run of the project parked past
     checkcap.starve_s() that arrived before `since` (this run's arrival; default now) goes first
     (checkcap.starved_ahead), unless this run is more urgent and that one's turn (one per
-    checkcap.aged_turns() urgent starts) has not come, or this run, of `cost`, is much cheaper than that one's; an urgent run leaves that turn only to the oldest
-    less urgent one, once per checkcap.aged_turns() urgent starts since its project's last routine start. A less urgent
-    run leaves them to its project's parked owed (priority-0) runs whatever its wait (checkcap.owed_ahead). A run leaves `need` slots of the pool to each urgent
+    checkcap.aged_turns() urgent starts) has not come, or this run, of `cost`, is much cheaper than that one's;
+    an owed or urgent run is never held by a less urgent one. A less urgent run leaves them to its project's
+    parked owed (priority-0) runs whatever its wait (checkcap.owed_ahead). A run leaves `need` slots of the pool to each urgent
     run of another project parked for its test slots ahead of it (urgent_parked: a routine run to every one,
     an urgent run to those more urgent or as urgent and older), so a freed slot goes to the urgent one, not
     to whichever polls first; one its own gate holds otherwise keeps none. A routine run also leaves `need`
@@ -1222,7 +1293,7 @@ def pool_gate(cfg: dict | None, project_name: str | None, full: bool = False, pr
     need = min(min(run_min(cfg, top), pool), len(own) or pool) if full else 1
     own_free = _own_free(project_name, own) if own else 0
     if (own and priority is not None and priority <= 1 and own_free < need
-            and (recs := locks.holder_records(own)) and all(_rank(r) > 1 for r in recs)
+            and (recs := locks.holder_records(own)) and all(_rank(r) > priority for r in recs)
             and locks.any_free(urgent := urgent_paths(project_name, top))):
         own_free = _free(urgent)
     if own and own_free < need:
@@ -1590,7 +1661,7 @@ def suite_hold(project_name: str | None, tell: Callable[[str], None] | None = No
     count = slots if callable(slots) else (lambda _held, n=max(1, int(slots or 1)): n)
     base = suite_base(project_name, repo)
     extra_lanes = lane_paths(project_name, 1, repo, overflow=True)
-    task = os.environ.get("TTP_TASK") or ""
+    task = str(checkcap._task_run()[0] or "")   # TTP_TASK, else the adopted one (checkcap.adopt_identity)
     label = f"{project_name}: full checks ({who + ', ' if who else ''}pid {os.getpid()})"
     ns = locks._pid_ns()
     text = ((f"task #{task} {label}" if task.isdigit() else label) + (f" [check {check}]" if check else "")
@@ -1944,6 +2015,32 @@ def _apply(cmd: str, edits) -> str:
 def over(cmd: str, k: int) -> list[int]:
     """The explicit pytest `-n N` / `--numprocesses N` values in `cmd` above `k` (as clamp() finds them)."""
     return [n for *_, n in _edits(cmd, k, False)]
+
+
+def _shell_counts(cmd: str) -> list[tuple[int, str]]:
+    """(start, value) for each pytest `-n` / `--numprocesses` in `cmd` whose value the shell fills in
+    ($VAR, ${VAR}, $(...), `...`): its count is unknown before it runs, so it may be above 1."""
+    out = []
+    for seg in _segments(cmd):
+        words = [w for _, _, w in seg]
+        tool = next((i for i, w in enumerate(words) if _is_tool(words, i, False)), None)
+        for i in range(tool + 1, len(seg)) if tool is not None else ():
+            if not (m := re.fullmatch(r"(-n|--numprocesses)(=?)(.*)", words[i])):
+                continue
+            value = m.group(3) or (words[i + 1] if not m.group(2) and i + 1 < len(words) else "")
+            if _shell_value(value):
+                out.append((seg[i][0], value))
+    return out
+
+
+def unpooled(cmd: str) -> list[str]:
+    """The pytest `-n` values in `cmd` that may start more than one worker (an explicit N above 1, or a
+    value the shell fills in such as `-n $TTP_TEST_SLOTS`) whose command no `ttp clip` or `ttp sandbox`
+    wraps, so no host test slots are taken for them (direct)."""
+    wrapped = [(seg[0][0], seg[-1][1]) for seg in _segments(cmd)
+               if any(_base(a) == "ttp" and b in ("clip", "sandbox") for (*_, a), (*_, b) in zip(seg, seg[1:]))]
+    found = [(start, str(n)) for start, *_, n in _edits(cmd, 1, False)] + _shell_counts(cmd)
+    return [v for start, v in sorted(found) if not any(lo <= start <= hi for lo, hi in wrapped)]
 
 
 def clamp(cmd: str, k: int) -> str:

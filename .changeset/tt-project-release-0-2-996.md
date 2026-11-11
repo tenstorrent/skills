@@ -1,0 +1,5 @@
+---
+"tt-project": patch
+---
+
+tt-project 0.2.996: `ttp stats --landing` counts changes that a review landed by direct push. It used to count only push-queue rows, so a project whose reviews push with `ttp push` showed 0 landed every day. A task's first landing record (`ttp landed`) now counts as landed, shown as "N landed (M by direct push)", and landings already recorded are counted with no backfill. The daemon's reap step no longer stalls on review specs that quote many hashes. Hashes that are not commits are dropped with one `git cat-file --batch-check`, and ancestry is sorted with one `git rev-list` per head instead of one `merge-base` call per hash, head and direction. A run's end had held the reap step for 41 minutes. A tick step stopped on the same item twice in a row gets one longer pass (5 minutes, or its configured budget if longer) before the stuck event. A finished change whose diff read timed out under load gets its review queued on the next tick, not hours later by the unreviewed sweep.

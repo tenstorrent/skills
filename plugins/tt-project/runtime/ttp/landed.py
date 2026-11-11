@@ -254,17 +254,29 @@ def reconcile_pushes(p, tid: int) -> None:
 
 # A task title that redoes another task's change on a new branch: "rebase #12 onto ...", "rebased #12".
 _REBASE_TITLE = re.compile(r"\brebas(?:e|ed|es|ing)\s+(?:task\s+)?#(\d+)(?!\d)", re.I)
+_RELAND = re.compile(r"\bre-?land(?:s|ed|ing)?\s+(?:task\s+)?#(\d+)(?!\d)", re.I)
+
+
+def redone(title: str | None, spec: str | None = "") -> set[int]:
+    """The tasks a task re-lands by its own words: its title rebases one ("Rebase #6's integration ...")
+    or its title or spec re-lands one ("re-land #6"). Their change lands only through it, so it never
+    waits on their landing (task_add's overlap chain) and no second review of them is queued while
+    it is open (Daemon._auto_review)."""
+    return {int(x) for x in _REBASE_TITLE.findall(title or "")} \
+        | {int(x) for x in _RELAND.findall(f"{title or ''}\n{spec or ''}")}
 
 
 _CARRIER_SQL = ("SELECT id, kind, branch, labels, title FROM tasks WHERE id>? AND (kind='review' "
                 "OR labels LIKE '%continues:%' OR labels LIKE '%review_fix:%' OR labels LIKE '%rebases:%' "
-                "OR labels LIKE '%pr_branch:%' OR labels LIKE '%auto_review:%' OR title LIKE '%rebas%' "
+                "OR labels LIKE '%follows:%' OR labels LIKE '%pr_branch:%' OR labels LIKE '%auto_review:%' OR title LIKE '%rebas%' "
+                "OR title LIKE '%re-land%' OR title LIKE '%reland%' "
                 "OR title LIKE '%review%') ORDER BY id")
 
 
-def _links(db, after: int) -> list[tuple[int, str, str, set[int], set[str]]]:
-    """(id, branch, kind, ids it carries on, branches it carries on) of each task after `after` that
-    may carry another's change on, in id order."""
+def _links(db, after: int) -> list[tuple[int, str, str, set[int], set[str], set[int]]]:
+    """(id, branch, kind, ids it carries on, branches it carries on, ids it follows) of each task after
+    `after` that may carry another's change on, in id order. A `follows:` link (a follow-up of a done
+    task, e.g. a third-round fix) carries only on the predecessor's own branch: carriers judges it."""
     try:
         rows = db.q(_CARRIER_SQL, (after,))
     except Exception:
@@ -280,9 +292,11 @@ def _links(db, after: int) -> list[tuple[int, str, str, set[int], set[str]]]:
                and lb.partition(":")[2].isdigit()}
         if (s := review_subject({"labels": r["labels"], "title": r["title"]})) is not None:
             ids.add(s)
-        ids |= {int(x) for x in _REBASE_TITLE.findall(r["title"] or "")}
+        ids |= redone(r["title"])
         names = {lb.partition(":")[2] for lb in labels if lb.startswith(("rebases:", "pr_branch:"))} - {""}
-        links.append((r["id"], r["branch"] or "", r["kind"] or "", ids, names))
+        follows = {int(lb[len("follows:"):]) for lb in labels if lb.startswith("follows:")
+                   and lb[len("follows:"):].isdigit()}
+        links.append((r["id"], r["branch"] or "", r["kind"] or "", ids, names, follows))
     return links
 
 
@@ -305,7 +319,9 @@ def carriers(db, tid: int, rows: Rows | None = None) -> dict[int, tuple[str, int
     """{task: (branch, the carrier it follows, kind)} of task `tid` and every task that carries its change on: a review of it
     (review_subject), a task that `continues:` or fixes (`review_fix:`) one of them, rebases or carries
     one of their branches (`rebases:`/`pr_branch:`) or whose title rebases one ("rebased #<id>"), and
-    so on down the chain (a re-review of a fix of a review of it). When the push queue lands such a
+    so on down the chain (a re-review of a fix of a review of it). A follow-up (`follows:`) counts
+    only when it works on its predecessor's own branch, so it carries that change: a plain follow-up
+    of a done task starts from the base branch and never makes an unlanded change count. When the push queue lands such a
     successor, `tid`'s work landed, under other patches if a conflict was settled on the way. `rows`:
     read once for many tasks (Rows), else read here."""
     if rows is None or tid not in rows.tasks:
@@ -317,8 +333,9 @@ def carriers(db, tid: int, rows: Rows | None = None) -> dict[int, tuple[str, int
     while grew:   # a successor always has a later id, but a link may name a branch rather than an id
         grew = False
         branches = {v[0]: k for k, v in out.items() if v[0]}
-        for i, b, kind, ids, names in links:
-            on = max(ids & out.keys(), default=None) or branches.get(min(names & branches.keys(), default=""))
+        for i, b, kind, ids, names, follows in links:
+            on = max(ids & out.keys(), default=None) or branches.get(min(names & branches.keys(), default="")) \
+                or max((f for f in follows & out.keys() if b and b == out[f][0]), default=None)
             if i not in out and on is not None:
                 out[i], grew = (b, on, kind), True
     return out

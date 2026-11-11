@@ -461,6 +461,47 @@ def test_throughput_review_sweep_is_not_lowered_for_waits_the_checks_held(env, m
     assert {(c["key"], c["old"], c["new"]) for c in changes if c["key"] in levers} == {("review.sweep_after_s", 1800, 900)}
 
 
+def test_throughput_review_sweep_names_the_backstop_whatever_the_provider_gate(env):
+    from ttp import throughput
+    p = make(env)
+    now = time.time()
+    prov = p.config().get("core_provider", "claude")
+    p.set_config("review.sweep_after_s", 1200)
+    # The finish queued no review (its git read timed out); the unreviewed backstop queued it 5 h later.
+    t0 = now - 8 * 3600
+    code, rv = _tp_review(p, t0 - 1800, t0, t0 + 5 * 3600, t0 + 5 * 3600 + 60)
+    p.db.x("INSERT INTO events(ts, source, kind, severity, text, status, task) VALUES(?,?,?,?,?,?,?)",
+           (t0 + 5 * 3600, "daemon", "review_unqueued", "low", f"#{code} x: its commits had no review and were "
+            f"not landed; review #{rv} queued by the daemon.", "handled", code))
+    # One queued at finish, at once.
+    _tp_review(p, now - 3 * 3600, now - 2 * 3600, now - 2 * 3600, now - 2 * 3600 + 60)
+    red = {prov: {"level": "red", "allow_new_work": False, "max_parallel": 2}}
+    for gates in ({}, red):
+        rep = throughput.measure(p.db, p.config(), now=now, gates=gates)
+        rs = _tp_lane(rep, "review_sweep")
+        assert rs["slow"] and (rs["backstop_count"], rs["swept_count"], rs["slot_held"]) == (1, 0, 0)
+        assert rs["per_pass"] == p.config()["budget"].get("max_parallel_workers", 6), \
+            "an unset review.unreviewed_per_pass is the worker slots, as the daemon reads it, not 0 (off)"
+        changes, kept = throughput.plan(p.db, p.config(), rep)
+        assert not [c for c in changes if c["key"] == "review.sweep_after_s"], changes
+        why = [k["why"] for k in kept if k["lane"] == "review_sweep"]
+        assert len(why) == 1, why
+        assert "1 of 2 review(s) were queued at finish" in why[0] and "1 queued late by the unreviewed backstop" \
+            in why[0], why[0]
+        assert "provider gate" not in why[0], "no change is proposed, so the gate is not the cause"
+    # A change the gate holds keeps the diagnosis too, in the same one entry.
+    p.db.x("INSERT INTO events(ts, source, kind, severity, text, status, task) VALUES(?,?,?,?,?,?,?)",
+           (t0 + 5 * 3600, "daemon", "review_swept", "normal", f"#{code} x; review #{rv} queued by the daemon.",
+            "handled", code))
+    rep = throughput.measure(p.db, p.config(), now=now, gates=red)
+    changes, kept = throughput.plan(p.db, p.config(), rep)
+    assert not [c for c in changes if c["key"] == "review.sweep_after_s"], changes
+    why = [k["why"] for k in kept if k["lane"] == "review_sweep"]
+    assert why == ["the provider gate is red (spend or plan window): never raised here"], why
+    changes, _ = throughput.plan(p.db, p.config(), throughput.measure(p.db, p.config(), now=now, gates={}))
+    assert [(c["key"], c["new"]) for c in changes if c["key"] == "review.sweep_after_s"] == [("review.sweep_after_s", 600)]
+
+
 def test_throughput_never_proposes_a_review_stall_change(env, monkeypatch):
     from ttp import throughput
     p = make(env)
@@ -544,6 +585,29 @@ def test_speed_complaint_detector_matches_complaints_not_plain_messages():
     for text in ("Approved, go ahead", "Queue a task for the docs", "What is the status of the build?",
                  "Thanks, looks good", "Use the slowtests report", ""):
         assert not sc.detect(text), text
+
+
+def test_speed_complaint_detector_skips_product_speed_wording_unless_it_names_the_projects_work():
+    """A product spec or feature request about the built product's throughput, latency or real time is no
+    complaint about the project's pace; a complaint naming the project or its tasks still is."""
+    from ttp import slowcomplaint as sc
+    for text in ("add a low-latency flag; throughput faster than realtime by generating several videos at a time",
+                 "the model should decode faster than real-time", "Can you add a low-latency flag so throughput is realtime?",
+                 "implement a feature to stream frames faster", "make inference faster",
+                 # Common verbs (runs, work, fix, build) do not name the project's work beside product wording.
+                 "add a low-latency flag so the model runs faster than real time",
+                 "fix the flag so throughput is realtime", "make the low-latency mode work with higher throughput",
+                 "the build should have a low-latency flag for faster decode",
+                 "please add the low-latency flag asap"):
+        assert not sc.detect(text), text
+    for text in ("why is this so slow", "Fix your throughput asap, especially on the most time sensitive tasks!",
+                 "the low-latency flag task is still waiting for hours", "your work on the video feature is so slow",
+                 # Pace and delay words, or a named piece of work, count beside a model, kernel, feature or image.
+                 "still waiting on the kernel fix for hours", "the model bringup is so slow",
+                 "why is the model run taking so long", "why is the feature still not done after hours",
+                 "the image build is stuck", "stuck on the decode bug for hours",
+                 "the inference perf work is too slow, speed up", "speed it up"):
+        assert sc.detect(text), text
 
 
 def test_speed_complaint_on_the_turn_start_runs_the_review_applies_and_queues_p1_followups(env, monkeypatch):
@@ -1307,3 +1371,91 @@ def test_throughput_checks_waits_under_a_small_test_worker_budget_name_that_budg
     t = p.db.one("SELECT title, spec FROM tasks WHERE id=?", (fid,))
     assert "checks.test_project_slots not raised" in t["title"], t["title"]
     assert "limit checks.test_project_slots=8" in t["spec"], t["spec"]
+
+
+def test_throughput_checks_lane_settled_in_the_ledger_opens_no_followup_until_a_new_own_wait(
+        env, monkeypatch, tmp_path):
+    """A rejected 'raise checks.slots' in the tried-work ledger, or a done follow-up that listed the checks
+    lane, from the last 24 h holds the lane's follow-up (information only) until a wait held at the
+    project's own limits starts after it; an entry older than 24 h holds nothing."""
+    from ttp import checkcap, slowcomplaint, testslots, throughput
+    from ttp.daemon import Daemon
+    monkeypatch.setattr(checkcap, "grants_dir", lambda: tmp_path / "host")
+    monkeypatch.setattr(checkcap, "cores", lambda: 64)
+    for k in ("POOL", "RUN_MAX", "RUN_MIN", "PROJECT_SLOTS", "PROJECT_WORKERS"):
+        monkeypatch.delenv(f"TTP_TEST_{k}", raising=False)
+    monkeypatch.setattr(testslots, "project_workers", lambda cfg=None, cores=None, project_name=None: 32)
+    p = make(env)
+    d, now = Daemon(p.base), time.time()
+    p.set_config("checks.test_project_max", 4)
+    p.set_config("checks.slots", 3)
+
+    def own_wait(i, w0):
+        t = _tp_checks_requeue(p, d, monkeypatch, tmp_path, f"own wait {i}", w0, 2400)
+        _tp_checks_run(p, monkeypatch, w0 - 60, 2500)
+        _tp_slot_wait(p, monkeypatch, t, w0, w0 + 2390, cap=4, lane_at=w0 + 2300)
+
+    def finished(title, at, result):
+        tid = p.db.add_task(title, "s", kind="code", priority=1, origin="daemon")
+        p.db.update_task(tid, status="done", attempts=1, result=json.dumps(result))
+        p.db.x("UPDATE tasks SET updated=? WHERE id=?", (at, tid))
+        return tid
+
+    def checks_kept():
+        rep = throughput.measure(p.db, p.config(), now=now, gates={})
+        (k,) = [k for k in throughput.plan(p.db, p.config(), rep)[1] if k["lane"] == "checks_slots"]
+        return rep, k
+
+    for i, w0 in enumerate((now - 10 * 3600, now - 8 * 3600)):
+        own_wait(i, w0)
+    rep, k = checks_kept()
+    assert k["key"] == "checks.slots" and not k.get("info"), k
+    assert _tp_lane(rep, "checks_slots")["own_wait_last"] >= now - 8 * 3600 - 60, _tp_lane(rep, "checks_slots")
+    rejected = finished("checks lane waits", now - 6 * 3600, {"status": "done", "summary": "host pool waits", "tried": [
+        {"title": "raise checks.slots", "outcome": "rejected", "result": "the waits were on the host-wide pool"}]})
+    rep, k = checks_kept()
+    assert k.get("info") and f"ledger #{rejected} (rejected: raise checks.slots)" in k["why"], k
+    assert slowcomplaint._followups(p.db, {**rep, "kept": [k]}, [1], now)["opened"] is None
+    # A wait at the project's own limits after the rejection is new evidence: the follow-up opens.
+    own_wait(2, now - 4 * 3600)
+    rep, k = checks_kept()
+    assert k["key"] == "checks.slots" and not k.get("info"), k
+    fid = slowcomplaint._followups(p.db, {**rep, "kept": [k]}, [2], now)["opened"]
+    title = p.db.one("SELECT title FROM tasks WHERE id=?", (fid,))["title"]
+    assert title == "throughput: checks_slots waits over threshold; checks.slots not raised", title
+    # That follow-up done since the last own wait holds the lane again; a done one listing other lanes does not.
+    p.db.update_task(fid, status="done", attempts=1, result=json.dumps({"status": "done", "summary": "measured"}))
+    p.db.x("UPDATE tasks SET updated=? WHERE id=?", (now - 3600, fid))
+    assert f"ledger #{fid} (done: {title})" in checks_kept()[1]["why"]
+    p.db.x("UPDATE tasks SET title=? WHERE id=?", ("throughput: review_sweep waits over threshold; not raised", fid))
+    assert not checks_kept()[1].get("info")
+    # Older than 24 h: the rejection holds nothing.
+    p.db.x("UPDATE tasks SET updated=? WHERE id IN (?,?)", (now - throughput.DAY - 60, rejected, fid))
+    p.db.x("UPDATE tasks SET title=? WHERE id=?", (title, fid))
+    assert not checks_kept()[1].get("info")
+
+
+def test_throughput_books_a_passed_start_when_wait_to_its_gate_not_worker_slots(env, monkeypatch):
+    # A landed:# chain's labels are gone once its probe passes: the wait up to the pass is the chain's,
+    # only the rest a slot wait.
+    from ttp import throughput
+    from ttp.daemon import Daemon
+    p = make(env)
+    now = time.time()
+    tid = _tp_task(p, "after #3", now - 3000, labels=["start_when:landed:#3", f"deferred_since:{now - 3000}"])
+    with monkeypatch.context() as m:
+        m.setattr(time, "time", lambda: now - 100)
+        Daemon(p.base)._start_verdict(p.db.task(tid), 0, now - 100)
+    assert "start_when" not in json.dumps(p.db.task(tid)["labels"])
+    _tp_run(p, tid, now - 40, now - 10)
+    # Any other path that drops the gate (here an edit) is recorded the same way.
+    ed = _tp_task(p, "gated", now - 2000, labels=["start_when:test -f x", f"deferred_since:{now - 2000}", "keep"])
+    with monkeypatch.context() as m:
+        m.setattr(time, "time", lambda: now - 50)
+        p.db.update_task(ed, labels=["keep"])
+    _tp_run(p, ed, now - 45, now - 10)
+    rep = throughput.measure(p.db, p.config(), now=now, gates={})
+    lc, df, w = _tp_lane(rep, "landed_chain"), _tp_lane(rep, "deferral"), _tp_lane(rep, "worker_slots")
+    assert lc["count"] == 1 and abs(lc["p90_s"] - 2900) < 2
+    assert df["count"] == 1 and abs(df["p90_s"] - 1950) < 2
+    assert w["count"] == 2 and w["p90_s"] <= 61 and not w["slow"]

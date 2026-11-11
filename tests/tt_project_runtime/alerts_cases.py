@@ -444,7 +444,7 @@ def test_a_broken_command_schedule_can_be_turned_off_without_a_command(env):
     d.gates = {}
     for _ in range(3):
         p.db.x("UPDATE schedules SET next_run=? WHERE name='probe'", (time.time() - 1,))
-        d.run_schedules()
+        _settle(d, "probe")
         d.sweep_alerts()
         if fix := p.db.one("SELECT id FROM tasks WHERE labels LIKE '%schedule_fix:probe%'"):
             p.db.update_task(fix["id"], status="failed")   # its fix task could not fix it: now the alert
@@ -474,9 +474,9 @@ def test_a_schedule_failing_twice_raises_one_alert_that_clears_on_an_ok_run(env)
     d = Daemon(p.base)
     d.gates = {}
 
-    def tick():
+    def tick():   # its run is recorded before the sweep, however long the command takes to start
         p.db.x("UPDATE schedules SET next_run=? WHERE name='probe'", (time.time() - 1,))
-        d.run_schedules()
+        _settle(d, "probe")
         d.sweep_alerts()
 
     def live():
@@ -2083,7 +2083,8 @@ def test_pr_watch_batched_reads_find_what_per_pr_reads_find(env, monkeypatch):
 def test_a_failed_batched_read_fails_its_prs_or_lets_each_ask_gh(env, monkeypatch, fail, per_pr):
     """A batched read that times out, or is refused (rate limit, auth), fails each of its PRs as per-PR
     calls would, with no gh call per PR: a timeout reports them cut by the call timeout, a refusal reads
-    them as gh errors. Any other failure lets each PR ask gh itself, as before batching."""
+    them as gh errors (an auth refusal reports an error, never ok). Any other failure lets each PR ask gh
+    itself, as before batching."""
     from ttp import watchers
     from ttp.daemon import Daemon
     p, gh = _pr_batch_setup(env, monkeypatch, {i: _gql_node(i) for i in range(1, 6)})
@@ -2097,6 +2098,8 @@ def test_a_failed_batched_read_fails_its_prs_or_lets_each_ask_gh(env, monkeypatc
     assert not p.db.kv("pr_signatures")
     if fail == "hang":
         assert status.startswith("cut short (0 of 5") and "acme/widgets#1 (5 s gh call timeout)" in status, status
+    elif "401" in fail[1]:   # a logged-out gh is an error, never ok
+        assert status.startswith("error: gh is not logged in") and "gh auth login" in status, status
     else:
         assert status == "ok (5 PRs, 0 changed)", status
 
@@ -5456,7 +5459,7 @@ def test_a_user_stage_machine_change_page_reaches_only_its_makers_chat(env):
     mm.add("box-1", tags="device")
     mm.set_recovery("box-1", owner="proj-a")
     now = time.time()
-    ml.add_change("box-1", "drop-in", "rm it", "proj-a", expires="1h", now=now - 3 * 86400)
+    ml.add_change("box-1", "stopped the recovery watchdog", "systemctl start watchdog", "proj-a", expires="1h", now=now - 3 * 86400)
     ok = lambda n: (True, "")   # noqa: E731
     t1 = now - ml.REPAGE_S - 60
     assert ml.route(t1, able=ok, claimer="proj-b") == [], "proj-a's own page"
@@ -5465,14 +5468,14 @@ def test_a_user_stage_machine_change_page_reaches_only_its_makers_chat(env):
     ml.delivered(first[0])
     assert ml.route(now - 30, able=ok, claimer="proj-b") == [], "a user page of proj-a's entry"
     Daemon(b.base).route_machines(every_s=0)   # the co-tenant's own tick: nothing reaches its chat
-    assert not b.db.one("SELECT id FROM messages WHERE kind='alert' AND text LIKE 'Outage: Machine change%'")
+    assert not b.db.one("SELECT id FROM messages WHERE kind='alert' AND text LIKE 'A risky machine change%'")
     pages = ml.route(now - 30 + ml.CLAIM_S, able=ok, claimer="proj-a")
     assert [x["target"] for x in pages] == [ml.USER]
     assert Daemon(a.base)._machine_page(pages[0], now)
     ml.delivered(pages[0])
-    got = a.db.one("SELECT text FROM messages WHERE kind='alert' AND text LIKE 'Outage: Machine change #1 %'")
+    got = a.db.one("SELECT text FROM messages WHERE kind='alert' AND text LIKE 'A risky machine change%#1 %'")
     assert got and "box-1" in got["text"], got
-    assert not b.db.one("SELECT id FROM messages WHERE kind='alert' AND text LIKE 'Outage: Machine change%'")
+    assert not b.db.one("SELECT id FROM messages WHERE kind='alert' AND text LIKE 'A risky machine change%'")
 
 
 def test_an_orphan_user_machine_page_reaches_no_unrelated_chat_and_shows_in_status(env):
@@ -5486,7 +5489,7 @@ def test_an_orphan_user_machine_page_reaches_no_unrelated_chat_and_shows_in_stat
     mm.add("box-1", tags="device")
     mm.set_recovery("box-1", owner="proj-y")
     now = time.time()
-    ml.add_change("box-1", "drop-in", "rm it", "proj-x", expires="1h", now=now - 5 * 86400)
+    ml.add_change("box-1", "stopped the recovery watchdog", "systemctl start watchdog", "proj-x", expires="1h", now=now - 5 * 86400)
     ok = lambda n: (True, "")   # noqa: E731
     for i, who in enumerate(("proj-x", "proj-y")):   # pages to projects not on this host are relayed, as before
         got = ml.route(now - (3 - i) * (ml.REPAGE_S + 60), able=ok, claimer="proj-b")
@@ -5497,11 +5500,11 @@ def test_an_orphan_user_machine_page_reaches_no_unrelated_chat_and_shows_in_stat
     assert ml.route(now - 60 + ml.CLAIM_S, able=ok, claimer="proj-b", log=said.append) == []
     assert len(said) == 1 and "proj-x, proj-y not registered on this host" in said[0], said
     Daemon(b.base).route_machines(every_s=0)   # proj-b's charter does not list box-1
-    assert not b.db.one("SELECT id FROM messages WHERE kind='alert' AND text LIKE 'Outage: Machine change%'")
+    assert not b.db.one("SELECT id FROM messages WHERE kind='alert' AND text LIKE 'A risky machine change%'")
     assert "undelivered machine page (no project here may deliver it" in status_text(b)
     c.charter_path.write_text("# proj-c\n\n## Goals\nGo.\n\n## Resources\n- box-1: a device machine.\n")
     Daemon(c.base).route_machines(every_s=0)   # a project whose charter lists the machine may deliver it
-    got = c.db.one("SELECT text FROM messages WHERE kind='alert' AND text LIKE 'Outage: Machine change #1 %'")
+    got = c.db.one("SELECT text FROM messages WHERE kind='alert' AND text LIKE 'A risky machine change%#1 %'")
     assert got, "the listing project's chat gets it"
     assert ml.orphan_lines() == []
 
@@ -5530,3 +5533,124 @@ def test_a_user_stage_machine_condition_page_reaches_only_its_owners_chat(env):
     ml.report("proj-b", "box-1", "held", now=later)
     assert tick(later, "proj-b") == [], "the reporter does not get the owner's user page"
     assert [x["target"] for x in tick(later + ml.CLAIM_S, "proj-a")] == [ml.USER]
+
+
+def test_a_provider_whose_runs_make_no_model_call_stops_the_coordinator_until_a_model_free_check_passes(
+        env, monkeypatch):
+    """The case: a CLI logged out on a box with no internet fails with 0 tokens and no login
+    refusal the daemon can read, so the coordinator retried every ~41 min. NO_CALL_STREAK such runs open
+    the breaker and raise one alert; nothing starts on it while the login or HTTPS check fails; it
+    resumes by itself once both pass."""
+    p = make(env)
+    from ttp import alerts
+    from ttp import budget as bud
+    from ttp import daemon as dm
+    from ttp.daemon import NO_CALL_STREAK, Daemon
+    from ttp.providers import get_provider
+    d = Daemon(p.base)
+    started = []
+    monkeypatch.setattr(d, "start_run", lambda role, *a, **k: started.append(role) or 0)
+    d.gates["fake"] = bud.Gate("fake", regime="windows", max_parallel=6)
+    login = env["tmp"] / "logged-in"
+    login.write_text("")
+    monkeypatch.setenv("TTP_FAKE_LOGIN", str(login))   # its CLI says logged in: the network is what fails
+    monkeypatch.setattr(type(get_provider("fake")), "reach_host", lambda self, env=None: "api.example.com")
+    up, probes = {"v": False}, []
+    monkeypatch.setattr(dm, "_https_reaches", lambda host, timeout=5.0: probes.append(host) or up["v"])
+    no_call = [{"type": "turn.started"}, {"type": "error", "message": "stream disconnected before completion"}]
+    for i in range(NO_CALL_STREAK):
+        assert not d._logged_out("fake"), f"the breaker opened after {i} runs"
+        run, _ = _finished_run(d, no_call, provider="fake")
+        assert run["status"] == "failed" and run["cost_usd"] == 0, dict(run)
+    assert d._logged_out("fake") and alerts.breaker(p.db, "fake").get("reach")
+    for _ in range(NO_CALL_STREAK):   # more of them while it is open raise nothing new
+        _finished_run(d, no_call, provider="fake")
+    texts = [a["text"] for a in p.db.q("SELECT text FROM alerts WHERE key='auth:fake'")]
+    assert len(texts) == 1, texts
+    assert "log in" in texts[0] and "restore its network" in texts[0] and "user's decision" in texts[0]
+    assert "No worker logs in" in texts[0] and "coordinator" in texts[0]
+    p.db.post("in", "status?", chat="cli")
+    p.db.x("UPDATE messages SET ts=ts-60")
+    for _ in range(3):   # the HTTPS check fails: the coordinator stays stopped, no run checks it
+        p.db.set_kv("auth_breaker:fake", {**alerts.breaker(p.db, "fake"), "next_check": time.time() - 1})
+        d.sweep_alerts(); d.maybe_coordinate()
+    assert started == [] and probes == ["api.example.com"] * 3, (started, probes)
+    up["v"] = True
+    p.db.set_kv("auth_breaker:fake", {**alerts.breaker(p.db, "fake"), "next_check": time.time() - 1})
+    d.sweep_alerts()
+    assert alerts.breaker(p.db, "fake") is None and not d._logged_out("fake")
+    d.maybe_coordinate()
+    assert started == ["coordinator"], started
+    # A run that answers ends a streak.
+    for _ in range(NO_CALL_STREAK - 1):
+        _finished_run(d, no_call, provider="fake")
+    _finished_run(d, [{"type": "assistant", "message": {"id": "m1", "model": "x"}}], provider="fake")
+    _finished_run(d, no_call, provider="fake")
+    assert not d._logged_out("fake")
+
+
+@pytest.mark.parametrize("exit_extra", [{"launched": False}, {"launch_error": "exec failed: no such file"},
+                                        {"stopped": "hung"}])
+def test_runs_that_never_tried_the_model_leave_the_no_call_streak_alone(env, monkeypatch, exit_extra):
+    """Review #110: a run refused before launch, one the runner could not exec and a supervisor stall
+    never asked the model, so NO_CALL_STREAK of them in a row open no breaker and raise no alert, and
+    they do not end a streak either."""
+    p = make(env)
+    from ttp.daemon import NO_CALL_KEY, NO_CALL_STREAK, Daemon
+    d = Daemon(p.base)
+    db = d.p.db
+
+    def finish(extra):
+        tid = db.add_task("build", "", kind="work", tier="standard", priority=3, budget_usd=8.0, labels=[])
+        db.update_task(tid, status="running")
+        rid = db.x("INSERT INTO runs(task,role,provider,model,started,status,boot_id,note) "
+                   "VALUES(?,'worker','fake','opus',?,'running',?,'{}')", (tid, time.time() - 600, d.boot))
+        run_dir = d.p.runs / str(rid)
+        run_dir.mkdir(parents=True)
+        db.x("UPDATE runs SET dir=? WHERE id=?", (str(run_dir), rid))
+        (run_dir / "output.jsonl").write_text("")
+        (run_dir / "stderr.log").write_text("")
+        d.finish_run(db.one("SELECT * FROM runs WHERE id=?", (rid,)),
+                     {"rc": 1, "started": time.time() - 600, "ended": time.time(), "stopped": None, **extra})
+
+    for _ in range(NO_CALL_STREAK + 1):
+        finish(exit_extra)
+    assert not d._logged_out("fake") and db.kv(NO_CALL_KEY + "fake") is None
+    assert not db.q("SELECT text FROM alerts WHERE key='auth:fake'")
+    finish({})   # a launched run with no call starts a streak; an untried one keeps it as it is
+    finish(exit_extra)
+    assert len((db.kv(NO_CALL_KEY + "fake") or {}).get("runs") or []) == 1
+
+
+def test_the_https_check_fails_fast_when_the_host_does_not_resolve(monkeypatch):
+    """Review #110: urlopen's timeout does not bound the DNS lookup, so a dead resolver is checked
+    first with the bounded _resolves and no HTTPS request is made."""
+    import urllib.request
+    from ttp import daemon as dm
+    opened = []
+    monkeypatch.setattr(dm, "_resolves", lambda host: False)
+    monkeypatch.setattr(urllib.request, "urlopen", lambda *a, **k: opened.append(a))
+    assert dm._https_reaches("api.example.com") is False and opened == []
+
+
+def test_the_notifier_agent_runs_at_standard_priority_and_an_old_background_one_is_reinstalled(
+        env, monkeypatch, tmp_path):
+    import plistlib
+    from ttp import notifier
+    _install_template(env)
+    _notifier_files(monkeypatch, tmp_path)
+    monkeypatch.setenv("HOME", str(tmp_path / "userhome"))
+    monkeypatch.delenv("TTP_TEST_NO_NOTIFIER", raising=False)
+    monkeypatch.setattr(notifier.sys, "platform", "darwin")
+    monkeypatch.setattr(notifier.subprocess, "run", lambda args, **kw: subprocess.CompletedProcess(args, 0, "", ""))
+    assert notifier.install() == "installed and started (launchd)"
+    plist = notifier.agent_file()
+    assert plistlib.loads(plist.read_bytes())["ProcessType"] == "Standard"
+    # An agent an older tt-project installed at Background priority is reinstalled though it runs this code.
+    monkeypatch.setattr(notifier, "enabled", lambda max_age_s=0: True)
+    monkeypatch.setattr(notifier, "running", lambda: {"code": notifier.installed_code()})
+    monkeypatch.setattr(notifier, "ensure_app", lambda: (None, ""))
+    assert notifier.refresh(send_test=False) == []
+    plist.write_bytes(plistlib.dumps({**plistlib.loads(plist.read_bytes()), "ProcessType": "Background"}))
+    assert notifier.refresh(send_test=False)[0].startswith("desktop notifier: installed and started (launchd)")
+    assert plistlib.loads(plist.read_bytes())["ProcessType"] == "Standard"

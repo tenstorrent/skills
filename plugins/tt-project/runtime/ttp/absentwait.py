@@ -187,7 +187,7 @@ def _reopen(db, tid: int, w: dict, now: float) -> int | None:
             f"{_clip(closed.get('reason'), 160)}). Its reopen watch's probe now passes: `{_clip(w['probe'], 300)}`. "
             f"Do what #{tid} could not; its spec follows.\n\n{t['spec'] or ''}")
     labels = [lb for lb in json.loads(t["labels"] or "[]") if isinstance(lb, str)
-              and lb.partition(":")[0] in ("resource", "exclusive", "needs_device")]
+              and lb.partition(":")[0] in ("resource", "exclusive", "needs_device", "untrusted_input")]
     return db.add_task(f"reopen: {t['title']}", spec, kind=t["kind"], tier=t["tier"], priority=t["priority"],
                        provider=t["provider"], origin="daemon", labels=[*labels, f"{LABEL}:{tid}"])
 

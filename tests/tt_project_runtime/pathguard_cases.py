@@ -321,7 +321,7 @@ def test_pathguard_refuses_the_lost_key_writes_on_hooked_providers(cred_home, pr
     matchers = [m["matcher"] for m in settings["hooks"]["PreToolUse"]
                 if any(h["command"].endswith("PreToolUse") for h in m["hooks"])]
     for tool, inp in PG_LOST_KEY:
-        assert any(re.fullmatch(m, tool) for m in matchers), (provider, tool)
+        assert any(m == "*" or re.fullmatch(m, tool) for m in matchers), (provider, tool)   # "*": every tool
         out, _ = hook.pre_tool_use({"tool_name": tool, "tool_input": inp, "cwd": str(cred_home.work)})
         assert out["hookSpecificOutput"]["permissionDecision"] == "deny", (provider, tool, inp)
         assert "credential folders" in out["hookSpecificOutput"]["permissionDecisionReason"]

@@ -45,7 +45,9 @@ row in state/job-signals.jsonl naming the code path and the sender. A job outliv
 task waits on it; tt-project ends one only by SIGKILL of its group with <name>.lost, so an .rc of 143
 means its command alone got SIGTERM from elsewhere (a waiting `ttp lock` logs who: `received`). An
 owner's stop (jobstop.end) then also writes <name>.rc holding 137 (STOP_RC, record_stop), so a reader of
-the .rc alone sees an ended job; `stopped` tells it from an exit code the job wrote itself.
+the .rc alone sees an ended job; `stopped` tells it from an exit code the job wrote itself. A kill from
+outside tt-project cannot be seen as it happens: when the record closes (close), a job that died by a
+signal with no stop on record gets a row too (unseen_kill, reason "unseen", by "unknown").
 """
 from __future__ import annotations
 
@@ -95,6 +97,31 @@ def _checked(probe: str, cwd=None) -> list[Path]:
                 out.append(Path(cwd or ".") / a)
             return out
     return []
+
+
+def last_progress(probe: str, cwd=None) -> float | None:
+    """When a detached job this probe's local `detach --check` names last showed progress while it still
+    runs or is queued: the newest mtime of its log, its .started and its .queued, else None (no such job,
+    or all ended). A wait on a job is stale only once this is old, never by the time since the wait
+    began (daemon._hold_waiting). A job on another host (--host) reads None: the wait counts as before."""
+    if "--host" in (probe or ""):
+        return None
+    best = None
+    try:
+        rcs = _checked(probe, cwd)
+    except ValueError:   # unbalanced quotes: no job to read, the wait counts as before
+        return None
+    for rc in rcs:
+        if rc.exists() or lost(rc).exists():
+            continue
+        e = _entry(rc)
+        for path in (Path(e["log"]) if e.get("log") else rc.with_suffix(".log"), started(rc), queued(rc)):
+            try:
+                t = path.stat().st_mtime
+            except OSError:
+                continue
+            best = t if best is None else max(best, t)
+    return best
 
 
 def failed_why(probe: str, rc, cwd=None) -> str:
@@ -507,6 +534,58 @@ def signalled(rc: Path, sig: int, pid: int, reason: str, why: str = "", *, by: s
     return row
 
 
+SIGNAL_SCAN_BYTES = 4 * 1024 * 1024   # unseen_kill reads at most this much of the signal stream's end
+
+
+def _signal_rows_for(f: Path, rc: Path) -> bool:
+    """Whether the signal stream `f` (its last SIGNAL_SCAN_BYTES) has a row for the job at `rc`."""
+    try:
+        with open(f, "rb") as fh:
+            fh.seek(max(0, fh.seek(0, os.SEEK_END) - SIGNAL_SCAN_BYTES))
+            tail = fh.read()
+    except OSError:
+        return False
+    key = json.dumps(str(rc)).encode()
+    return any(key in line for line in tail.splitlines())
+
+
+def unseen_kill(rc: Path, entry: dict, code: str | None, why: str = "") -> dict | None:
+    """At reap (close): a job that ended by a signal no tt-project path recorded, a kill from outside
+    `ttp detach --stop` or jobstop. The kill itself cannot be seen, so one row in the signal stream says
+    the job died by signal N (its exit code 128+N, as its shell wrapper reports it; None for a job gone
+    with no exit code, killed with its wrapper) with no stop on record. None, and nothing written, for an
+    ordinary exit, a stop on record (stopped, or a row for this job already in the stream) or a reboot."""
+    rc = Path(rc)
+    if code is not None:
+        if not re.fullmatch(r"[0-9]+", code or "") or not 128 < int(code) < 128 + 65 or stopped(rc):
+            return None
+        num = int(code) - 128
+    elif why.startswith("it was killed after it started"):
+        num = None
+    else:
+        return None
+    home = _markable(rc, quiet=True)
+    if home is None:
+        return None
+    f = signals_file(home)
+    if _signal_rows_for(f, rc):
+        return None
+    try:
+        name = signal.Signals(num).name if num else "unknown"
+    except ValueError:
+        name = str(num)
+    row = {"ts": time.time(), "job": rc.stem, "rc": str(rc), "pid": entry.get("pid"), "group": True,
+           "signal": name, "reason": "unseen", "exit": None if code is None else int(code),
+           "why": (f"died by signal {num} ({name})" if num else "died with its wrapper, by an unknown signal")
+           + " with no ttp detach --stop or other tt-project stop on record: killed from outside tt-project",
+           "by": "unknown", "by_pid": None, "by_cmd": "", "seen": "at reap", "task": entry.get("task")}
+    try:
+        durable_append(f, json.dumps(row) + "\n")
+    except OSError:
+        return None
+    return row
+
+
 def sender(pid: int) -> str:
     """The command line of process `pid` (best effort, cut to 200 chars), else ""."""
     try:
@@ -680,11 +759,19 @@ def close(rc: Path, now: float | None = None) -> dict | None:
     while the job runs or is queued, or when no record names it."""
     rc = Path(rc)
     e = _entry(rc)
+    if e and e.get("status") in CLOSED and e.get("unmasked") and _mask_log(rc):
+        with registry(rc.parent) as jobs:   # closed while a leftover process still held its lock: masked now
+            for j in jobs:
+                if isinstance(j, dict) and j.get("rc") == str(rc):
+                    j.pop("unmasked", None)
+                    e = j
+        return e
     if not e or e.get("status") in CLOSED:
         return e or None
     st, why = state(rc)
     if st not in ("ended", "lost"):
         return None
+    masked = _mask_log(rc)
     if st == "ended":
         try:
             end = rc.stat().st_mtime
@@ -699,14 +786,31 @@ def close(rc: Path, now: float | None = None) -> dict | None:
         except OSError:
             end = time.time() if now is None else now
         upd = {"status": "died", "exit": None, "ended": end, "why": why}
-    out = None
+    if not masked:   # close_records masks the log once the lock frees
+        upd["unmasked"] = True
+    out, closed = None, False
     with registry(rc.parent) as jobs:
         for j in jobs:
             if isinstance(j, dict) and j.get("rc") == str(rc):
                 if j.get("status") not in CLOSED:
                     j.update(upd)
+                    closed = True
                 out = j
+    if closed:   # once per job: a kill from outside tt-project leaves a row in the signal stream too
+        unseen_kill(rc, out, why if st == "ended" else None, "" if st == "ended" else why)
     return out
+
+
+def _mask_log(rc: Path) -> bool:
+    """Mask the log of the job at `rc` once no process of it holds its job lock (scrub_run left it whole
+    while the job ran: live_job_logs); a big one is masked detached (scrub.log). False while one still does."""
+    if not locks.any_free([locks.job_lock(rc)]):
+        return False
+    from . import redact
+    left: list = []
+    redact.scrub_file(rc.with_suffix(".log"), redact.STEP_FILE_BYTES, left)
+    redact.scrub_later(left, rc.with_name("scrub.log"))
+    return True
 
 
 def close_records(p: Project, now: float | None = None) -> int:
@@ -729,9 +833,9 @@ def close_records(p: Project, now: float | None = None) -> int:
         except (OSError, ValueError):
             continue
         for j in jobs if isinstance(jobs, list) else []:
-            if isinstance(j, dict) and j.get("rc") and j.get("status") not in CLOSED:
+            if isinstance(j, dict) and j.get("rc") and (j.get("status") not in CLOSED or j.get("unmasked")):
                 try:
-                    n += bool(close(Path(j["rc"]), now))
+                    n += bool(close(Path(j["rc"]), now)) and j.get("status") not in CLOSED
                 except OSError:
                     continue
     return n

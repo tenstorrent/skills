@@ -78,7 +78,8 @@ ADVICE = ("kill only what this task started: record `$!` when you start a proces
           "listed its pids in a file under the task's results dir: `ttp detach --stop-pids <file>`; a job the "
           "project's own launcher started in its own layout (no pid file): register the launcher's stop "
           "command for its job folders in project.json `detach.launcher_stops`, then "
-          "`ttp detach --stop <job folder>` runs it, audited")
+          "`ttp detach --stop <job folder>` runs it, audited; this task's own detached `ttp push` that waits for "
+          "its turn or runs its checks: `ttp push --stop <marker>`")
 PARSE = ("the kill guard could not parse this command, and a command with kill, pkill or killall that cannot be "
          "parsed is refused; split it into simpler commands")
 
@@ -227,7 +228,8 @@ class _Procs:
         try:
             env = Path(f"/proc/{pid}/environ").read_bytes()
         except OSError:
-            return False
+            from . import procinfo   # macOS: sysctl KERN_PROCARGS2 (this user's processes only)
+            return (procinfo.environ(pid) or {}).get("TTP_RUN_DIR") == self.run_dir
         return f"TTP_RUN_DIR={self.run_dir}".encode() in env.split(b"\0")
 
     def task_job(self, pgid: int) -> bool:

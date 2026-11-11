@@ -30,6 +30,8 @@ EVENT_KIND = "user_site_install"
 PIP_ENV = {"PIP_REQUIRE_VIRTUALENV": "1", "PIP_USER": "0", "PIP_BREAK_SYSTEM_PACKAGES": "0"}
 # pip settings a command may not turn back on or off (as variables or as `pip config` names)
 GUARDED_VARS = set(PIP_ENV)
+# pip settings that send an install to a directory: refused when it lies under a .local
+TARGET_VARS = {"PIP_TARGET", "PIP_PREFIX", "PIP_ROOT"}
 CONFIG_NAMES = {"user", "require-virtualenv", "require_virtualenv", "break-system-packages",
                 "break_system_packages"}
 # install options that write outside a venv or ignore the environment (pip takes an unambiguous prefix)
@@ -41,6 +43,13 @@ READ_ONLY = {"download", "list", "show", "freeze", "check", "hash", "index", "in
 LOCAL_SITE_RE = re.compile(r"(^|[/=])\.local(/|$)")
 PIP_RE = re.compile(r"pip(\d+(\.\d+)?)?")
 PYTHON_RE = re.compile(r"python(\d+(\.\d+)?)?")
+# commands that run another command for each input: find's actions and the words after xargs or parallel
+FIND_EXEC = {"-exec", "-execdir", "-ok", "-okdir"}
+PARALLEL_VALUE_OPTS = {"-j", "--jobs", "-P", "-S", "--sshlogin", "--slf", "--sshloginfile", "-a", "--arg-file", "-n",
+                       "--max-args", "-N", "-I", "-C", "--colsep", "-d", "--delimiter", "-E", "--joblog", "--results",
+                       "--res", "--tmpdir", "--workdir", "--wd", "--env", "--timeout", "--halt", "--delay", "--retries",
+                       "--tag-string", "--tagstring", "--memfree", "--load", "-s", "--max-chars", "-J", "--profile",
+                       "--basefile", "--bf", "--return"}
 ASSIGN_RE = re.compile(r"^(\w+)\+?=(.*)$", re.S)
 TRUE = {"1", "true", "yes", "on", "y", "t"}
 WHY = ("installs into the shared user site (~/.local) or outside a virtualenv are refused on a host that runs "
@@ -75,6 +84,8 @@ def env(cfg: dict | None) -> dict[str, str]:
 
 def _bad_assign(word: str) -> bool:
     m = ASSIGN_RE.match(word)
+    if m and m[1] in TARGET_VARS:
+        return bool(LOCAL_SITE_RE.search(m[2].strip("'\"")))
     if not m or m[1] not in GUARDED_VARS:
         return False
     return m[2].strip("'\"").lower() not in (TRUE if m[1] == "PIP_REQUIRE_VIRTUALENV" else {"0", "false", "no", "off", "n", "f"})
@@ -92,15 +103,24 @@ def _pip_args(argv: list[str]) -> tuple[list[str], tuple[str, ...]] | None:
         return argv[1:], BANNED_OPTS
     if name == "uv" and argv[1:2] == ["pip"]:
         return argv[2:], UV_BANNED_OPTS
-    if PYTHON_RE.fullmatch(name):
-        for i, a in enumerate(argv[1:], 1):
-            if a in ("-m", "-mpip") or (a.startswith("-") and a.endswith("m") and not a.startswith("--")):
-                mod = "pip" if a == "-mpip" else argv[i + 1] if i + 1 < len(argv) else ""
-                if mod == "pip":
-                    return argv[i + (1 if a == "-mpip" else 2):], BANNED_OPTS
-                return None
-            if not a.startswith("-"):   # a script: not pip
-                return None
+    got = _py_module(argv)
+    return (got[1], BANNED_OPTS) if got and got[0] == "pip" else None
+
+
+def _py_module(argv: list[str]) -> tuple[str, list[str]] | None:
+    """(the module, its arguments) when `argv` runs `python -m <module>`, else None."""
+    if not PYTHON_RE.fullmatch(os.path.basename(argv[0])):
+        return None
+    skip = False
+    for i, a in enumerate(argv[1:], 1):
+        if skip:
+            skip = False
+        elif m := re.fullmatch(r"-[bBdEhiIOPqRsSuvV]*m(.*)", a):
+            return (m[1], argv[i + 1:]) if m[1] else (argv[i + 1] if i + 1 < len(argv) else "", argv[i + 2:])
+        elif a in ("-X", "-W"):   # their value is the next word
+            skip = True
+        elif not a.startswith("-") or a.startswith("-c"):   # a script or inline code: no module
+            return None
     return None
 
 
@@ -133,6 +153,10 @@ def _segment_refused(raw: list[str]) -> bool:
     if os.path.basename(argv[0]) == "easy_install" or (
             "setup.py" in map(os.path.basename, argv) and "install" in argv):
         return any(_banned(a, ("--user",)) for a in argv)
+    mod = _py_module(argv)
+    if mod and mod[0] == "ensurepip":
+        # ensurepip drops the PIP_* settings: the run's PIP_REQUIRE_VIRTUALENV does not stop it
+        return any(_banned(a, ("--user",)) or (LOCAL_SITE_RE.search(a) and _local_target(mod[1], a)) for a in mod[1])
     if not got:
         return False
     args, banned = got
@@ -145,7 +169,9 @@ def _segment_refused(raw: list[str]) -> bool:
     if sub == "config":
         words = [a for a in args if not a.startswith("-")]
         if words[1:2] in (["set"], ["unset"]) and len(words) > 2:
-            return words[2].rsplit(".", 1)[-1].lower() in CONFIG_NAMES
+            name = words[2].rsplit(".", 1)[-1].lower()
+            return name in CONFIG_NAMES or (name in ("target", "prefix", "root") and words[1] == "set"
+                                            and any(LOCAL_SITE_RE.search(w) for w in words[3:4]))
     return False
 
 
@@ -157,19 +183,52 @@ def _local_target(args: list[str], arg: str) -> bool:
     return i > 0 and args[i - 1] in ("--target", "--prefix", "--root", "-t")
 
 
+def _nested(raw: list[str]) -> list[list[str]]:
+    """The commands `raw` runs for each input: find's -exec, -execdir, -ok and -okdir, and what follows xargs
+    or parallel (with their options)."""
+    from .hook import _strip_prefix, _xargs_takes_next
+    out = []
+    argv = _strip_prefix(raw)
+    pre = len(raw) - len(argv)
+    k = next((i for i, w in enumerate(raw[:pre]) if os.path.basename(w) == "xargs"), None)
+    if k is not None:   # `xargs env PIP_USER=1 pip install`: the words after xargs keep their assignments
+        i = k + 1
+        while i < len(raw) and raw[i].startswith("-") and raw[i] != "-":
+            i += 2 if _xargs_takes_next(raw[i]) else 1
+        out.append(raw[i:])
+    name = os.path.basename(argv[0]) if argv else ""
+    if name == "find":
+        for i, w in enumerate(argv):
+            if w in FIND_EXEC:
+                out.append(argv[i + 1:next((j for j in range(i + 1, len(argv)) if argv[j] in (";", "+")), len(argv))])
+    elif name == "parallel":
+        i = 1
+        while i < len(argv) and argv[i].startswith("-"):
+            i += 2 if argv[i] in PARALLEL_VALUE_OPTS else 1
+        out.append(argv[i:next((j for j in range(i, len(argv)) if argv[j].startswith(":::")), len(argv))])
+    return [s for s in out if s]
+
+
+def _refused(raw: list[str], depth: int) -> bool:
+    from .hook import SHELLS, _strip_prefix
+    if _segment_refused(raw):
+        return True
+    argv = _strip_prefix(raw)
+    name = os.path.basename(argv[0]) if argv else ""
+    inner = next((argv[i + 1] for i, a in enumerate(argv[1:-1], 1) if re.fullmatch(r"-[a-z]*c[a-z]*", a)),
+                 None) if name in SHELLS else " ".join(argv[1:]) if name == "eval" else None
+    if depth >= 3:
+        return False
+    return bool(inner and refusal(inner, depth + 1)) or any(_refused(s, depth + 1) for s in _nested(raw))
+
+
 def refusal(commands: str, depth: int = 0) -> str | None:
     """Why `commands` is refused: an install into the user site, past the virtualenv rule, or a change to
     the variables that hold it. None when fine (a venv install, pip list, show, download, freeze)."""
-    from .hook import SHELLS, _segments, _strip_prefix
+    from .hook import _segments
     for raw in _segments(commands, strip=False):
-        if _segment_refused(raw):
+        if _refused(raw, depth):
             return WHY.format(key=KEY)
-        argv = _strip_prefix(raw)
-        name = os.path.basename(argv[0]) if argv else ""
-        inner = next((argv[i + 1] for i, a in enumerate(argv[1:-1], 1) if re.fullmatch(r"-[a-z]*c[a-z]*", a)),
-                     None) if name in SHELLS else " ".join(argv[1:]) if name == "eval" else None
-        if inner and depth < 3 and (why := refusal(inner, depth + 1)):
-            return why
     return None
 
 

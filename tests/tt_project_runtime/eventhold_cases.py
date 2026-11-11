@@ -5,9 +5,11 @@ from __future__ import annotations
 
 
 def _evhold_setup(env, monkeypatch, busy=2):
-    """_batch_setup with batch_s off (so only the event hold can hold) and a turn that just ended."""
+    """_batch_setup with batch_s and the wake gap off (so only the event hold can hold; the gap, which a
+    free slot does not end, is in wakegap_cases.py) and a turn that just ended."""
     p, d, clock, starts = _batch_setup(env, monkeypatch, busy=busy)
     p.set_config("coordinator.batch_s", 0)
+    p.set_config("coordinator.wake_gap_s", 0)
     d.cfg = p.config()
     p.db.x("INSERT INTO runs(role, started, ended, status) VALUES('coordinator', ?, ?, 'ok')",
            (clock[0] - 60, clock[0]))

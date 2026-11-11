@@ -1055,3 +1055,37 @@ def test_one_phrase_ack_covers_every_place_of_one_retirement_and_no_other_phrase
     p.db.add_task("late", "queue_gate_flag again")
     assert echoes.export(p)["counts"]["acknowledged"] == 5
 
+
+def test_a_phrase_the_live_superseding_entry_still_carries_is_no_echo_whatever_the_retirement_source(env):
+    from ttp import coordinator as coord, echoes
+    p = make(env)
+    phrase = "and you can pass everything without my word!"
+    live = p.add_memory(f"Merges: '{phrase}' Reviews still run first.", kind="decision")
+    copy = p.db.add_task("c", f"Recall the merge rule: {phrase}")
+
+    def hits(rid):
+        return {h["label"] for h in echoes.scan(p) if h["retirement"] == rid}
+    # (1) A retirement kept the phrase (its phrases given, or recorded before the superseder said it), but the
+    # live entry superseding the retired one still carries it: no echo, here or in the task's copy.
+    rec = echoes.record(p.db, "memory [merge-old] superseded by [" + live.stem + "]", f'Merges: "{phrase}"',
+                        found=[phrase], skip=[f"memory:{live.stem}"])
+    assert rec and phrase in rec["phrases"] and hits(rec["id"]) == set()
+    # (3) The retired entry's text (so the retirement's hash) changes: still quiet.
+    again = echoes.record(p.db, "memory [merge-old] superseded by [" + live.stem + "]",
+                          f'Merges, reworded: "{phrase.upper()}"', found=[phrase], skip=[f"memory:{live.stem}"])
+    assert again["id"] != rec["id"] and hits(again["id"]) == set()
+    # The superseder is itself superseded (the source changes) by an entry still saying it: still quiet.
+    keep = coord.apply(p, [{"type": "memory_add", "memory_kind": "decision", "supersedes": [live.stem],
+                            "text": f"Merges: '{phrase}' Reviews run first, then the push queue."}], turn=1)
+    assert keep == [] and live.stem not in {e["name"] for e in p._memory_entries()}
+    assert hits(rec["id"]) == hits(again["id"]) == set()
+    # (2) The live superseder dropped the phrase: the retired entry's copies are echoes again.
+    newest = [e["name"] for e in p._memory_entries() if phrase in e["body"]]
+    assert coord.apply(p, [{"type": "memory_add", "memory_kind": "decision", "supersedes": newest,
+                            "text": "Merges wait for the user's word after review."}], turn=2) == []
+    assert f"task #{copy} spec" in hits(rec["id"]) and f"task #{copy} spec" in hits(again["id"])
+    # A superseder that never carried it: a phrase found only in the retired entry is still flagged.
+    plain = p.add_memory("Merges need a green review.", kind="decision")
+    other = echoes.record(p.db, f"memory [merge-older] superseded by [{plain.stem}]", f'Old: "{phrase}"',
+                          found=[phrase], skip=[f"memory:{plain.stem}"])
+    assert f"task #{copy} spec" in hits(other["id"])

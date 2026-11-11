@@ -751,7 +751,7 @@ def _checks_problem(cwd: str | None = None) -> str | None:
         return "refused: open a PR only after the local checks pass; none are recorded for this run. " + CHECKS_HOW
     if rec.get("fast_path"):
         return ("refused: the checks recorded for this run are a fast-path pass (docs/data-only diff; the "
-                "project's checks did not run), which never counts for a PR. Run `ttp checks --full`, "
+                "project's checks did not run), which never counts for a PR. Run `ttp checks --fresh`, "
                 "or set delivery.checks_fast_globs to [] to turn the fast path off. " + CHECKS_HOW)
     if not candidate_record(rec):
         return ("refused: the checks recorded for this run are a harness qualification (`ttp checks --purpose "
@@ -1186,6 +1186,14 @@ def main(argv: list[str], own_dir: str) -> int:
     if not needs_stdin(args):
         _stdin_devnull()   # a parent's open pipe never reaches the hooks or the real gh
     why = run_gh_hooks(args, own_dir, real)   # the project's own checks first: they can only refuse
+    if not why and os.environ.get("TTP_RUN_DIR"):   # a run reading untrusted input writes nothing
+        from . import untrusted
+        if untrusted.active():
+            try:
+                if untrusted.gh_write(args) and not untrusted.writes_allowed():
+                    why = untrusted.write_refusal("gh")
+            except Exception as e:   # fails closed in such a run
+                why = f"refused: the untrusted-input guard failed ({type(e).__name__})"
     if why:
         print(f"gh (tt-project): {why}", file=sys.stderr)
         return 1

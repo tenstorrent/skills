@@ -70,6 +70,27 @@ WORKER_NICE = 10
 FD_LOST_EXIT = 97      # a worker's own exit when a test closed or replaced one of its pipe fds
 _SHARDED = "test_tt_project_"
 STACK_DUMP_S = 480.0   # a tt-project test running this long dumps its stacks (faulthandler; kills nothing)
+# A suite run inside a tt-project worker (`ttp checks`, a worker's own pytest) inherits the run's
+# variables: its task, run folder, project, device and hand-off guards, and the agent CLI's session.
+# Tests set what they need, so the session starts without them; the test-slot, port, check-output
+# and leak-pattern variables the checks harness passes the suite stay.
+_WORKER_ENV_KEEP = ("TTP_TEST_", "TTP_CHECKS_", "TTP_CHECK_OUTPUT_DIR", "TTP_PORT_", "TTP_BUILD_SLOTS_HELD",
+                    "TTP_LEAK_PATTERNS_FILE", "TTP_TX_GUARD", "TTP_ALLOW_VOLATILE_BASE", "TTP_DEVICE_NODES")
+_WORKER_ENV_CLEAR = ("TTP_", "CLAUDECODE", "CLAUDE_CODE_", "CLAUDE_ENV_FILE", "CLAUDE_PID", "CLAUDE_EFFORT",
+                     "CODEX_THREAD_ID", "CODEX_SANDBOX", "CODEX_CI", "CODEX_MANAGED_BY")
+
+
+def worker_env_cleared(env) -> dict:
+    """`env` without the worker run's variables (above)."""
+    return {k: v for k, v in env.items() if not k.startswith(_WORKER_ENV_CLEAR) or k.startswith(_WORKER_ENV_KEEP)}
+
+
+def _clear_worker_env() -> None:
+    for var in set(os.environ) - set(worker_env_cleared(os.environ)):
+        os.environ.pop(var, None)
+
+
+_clear_worker_env()
 # tt-project's db.tx() refuses a git network command (ls-remote, fetch, push) started inside a write
 # transaction while this is set: every test, and every process it starts, runs under that guard.
 os.environ.setdefault("TTP_TX_GUARD", "1")
@@ -261,6 +282,7 @@ def _host_guard():
 
 
 _HOSTSTATE = _host_guard()
+os.environ.setdefault("TTP_NO_HAIKU", "1")   # no test asks Claude Haiku for a decision (cheapdecide)
 
 _CRED_SCRIPT = ("import json, sys\nsys.path.insert(0, sys.argv[1])\nfrom ttp import credwatch\n"
                 "before = json.load(sys.stdin)\nnow = credwatch.snapshot()\n"
@@ -340,6 +362,7 @@ def _temp_home(tmp_path_factory, monkeypatch):
     import tempfile
     home = tempfile.mkdtemp(prefix="home-", dir=root)
     _point_home(home, monkeypatch.setenv, lambda var: monkeypatch.delenv(var, raising=False))
+    monkeypatch.setenv("TTP_TEST_NO_TAILSCALE", "1")   # unreachable-host messages never ask this host's Tailscale (tailnet.py)
     if os.environ.get("GIT_CONFIG_GLOBAL"):   # a `git config --global` of its own: tests never share one
         own = Path(home, ".gitconfig")   # a copy, not an include: see _git_global_config
         own.write_bytes(_session_git_config(os.environ["GIT_CONFIG_GLOBAL"]))
@@ -741,8 +764,32 @@ def _slowest_lines(reports, n: int = SLOWEST) -> list[str]:
     return [f"ttp-suite: slowest {len(top)} test calls:"] + [f"ttp-suite: {r.duration:8.2f}s {r.nodeid}" for r in top]
 
 
+SMOKE_LIST = Path(__file__).with_name("tt_project_smoke.txt")
+SMOKE_MARK = "tt_smoke"
+
+
+def smoke_ids(path: Path = SMOKE_LIST) -> set[str]:
+    """The test ids SMOKE_LIST names (file::test, every parametrization included); '#' starts a comment."""
+    try:
+        lines = path.read_text().splitlines()
+    except OSError:
+        return set()
+    return {s for line in lines if (s := line.split("#", 1)[0].strip())}
+
+
+def pytest_collection_modifyitems(config, items):
+    """Mark the tests SMOKE_LIST names `tt_smoke`: `pytest -m tt_smoke` runs the smoke suite a landing waits
+    for (delivery.push_checks); the rest run after landing (delivery.post_land_checks)."""
+    if not (ids := smoke_ids()):
+        return
+    for item in items:
+        if item.nodeid.split("[", 1)[0] in ids:
+            item.add_marker(SMOKE_MARK)
+
+
 @pytest.hookimpl(trylast=True)   # after pytest's own tmpdir plugin made the factory _use_tmpfs patches
 def pytest_configure(config):
+    config.addinivalue_line("markers", f"{SMOKE_MARK}: in the smoke suite a landing waits for ({SMOKE_LIST.name})")
     config._ttp_started = time.monotonic()
     _use_tmpfs(config)
     try:   # the real stderr: capture is suspended here, as for pytest's own faulthandler plugin

@@ -20,6 +20,8 @@ the project could have saved. Model-free; the review grades it.
   change, with their spend, and the code tasks a premise check (premise.py) closed before any run;
 - spend per finished task: the workers' own, and the coordinator's day spread over them; $ per
   done task by kind and tier;
+- plan-billed providers (planuse.py): their dollars are virtual list price, shown apart with the points
+  their plan's windows rose in the window (user msg #140);
 - tasks blocked or waiting longer than `blocked_h` hours now, longest first;
 - push queue: approval to landed per entry that landed in the window, median and p90 (pushq.landing_times);
 - review loops: per change whose review moved in the window, its review rounds and their spend
@@ -40,6 +42,8 @@ the project could have saved. Model-free; the review grades it.
   and the failures it caught before detaching (each a worker wake saved).
 - context gaps: what workers' hand-offs (`context_gaps`) said they needed and their spec and context
   block (ctxblock) lacked, counted per task.
+- with budget.daily_target_usd set: each local project's spend by class, real beside booked, and the
+  account total against the target (dailyspend.py);
 - the outward leak scan's refusals (outscan.record), counted by route: gh, git push, ttp note --to,
   ttp notify.
 
@@ -48,10 +52,11 @@ only the project's own database and harness files."""
 from __future__ import annotations
 
 import json
+import statistics
 import time
 from typing import Any
 
-from . import budget, chaincap, checkprestage, coordfix, coordmodel, correction, ends, gatejudge, obligations, outscan, plainreply, quietgate, relay, replan, reviewstats, route, rulecite, schedule, sharedchecks, stalegate, suitecost, sweepskip, timefmt, turngate, unblock, upstream
+from . import budget, chaincap, dailyspend, checkprestage, coordfix, coordmodel, correction, ends, gatejudge, gatetime, obligations, outscan, plainreply, planuse, quietgate, relay, replan, reviewstats, route, rulecite, schedule, sharedchecks, stalegate, suitecost, sweepskip, timefmt, turngate, unblock, upstream
 from .db import DB, continues_id, load_result
 from .project import Project
 
@@ -258,14 +263,21 @@ def context_gaps(db: DB, since: float) -> list[dict]:
 def no_change_code(db: DB, since: float) -> dict:
     """Code tasks done since `since` after a worker run that left nothing to review: no review covers
     them (an `auto_review:<id>` label or a dependency) and their result names no PR or published
-    change. Most were premise checks run at the code tier. With the code tasks a premise check
-    (premise.py) closed before any code run: {n, usd, rows, premise_closed}."""
-    rows = db.q("SELECT id, title, spent_usd, result, labels FROM tasks t WHERE kind='code' AND status='done' "
+    change. Most were premise checks run at the code tier. With the code tasks a premise check or
+    premise command (premise.py) closed before any code run, and the $ that saved, estimated at the
+    median spend of the window's done code tasks of the same tier that ran (any tier where it has none):
+    {n, usd, rows, premise_closed, premise_saved_usd}."""
+    rows = db.q("SELECT id, title, tier, spent_usd, result, labels FROM tasks t WHERE kind='code' AND status='done' "
                 "AND updated>=? AND EXISTS (SELECT 1 FROM runs r WHERE r.task=t.id AND r.role!='coordinator') "
                 "ORDER BY spent_usd DESC", (since,))
-    closed = db.one("SELECT COUNT(*) n FROM tasks t WHERE kind='code' AND status='done' AND updated>=? "
-                    "AND labels LIKE '%\"premise:%:fails\"%' AND NOT EXISTS "
-                    "(SELECT 1 FROM runs r WHERE r.task=t.id AND r.role!='coordinator')", (since,))
+    closed = db.q("SELECT tier FROM tasks t WHERE kind='code' AND status='done' AND updated>=? "
+                  "AND labels LIKE '%\"premise:%:fails\"%' AND NOT EXISTS "
+                  "(SELECT 1 FROM runs r WHERE r.task=t.id AND r.role!='coordinator')", (since,))
+    spent: dict[str, list[float]] = {}
+    for r in rows:
+        for key in {"", str(r["tier"] or "")}:
+            spent.setdefault(key, []).append(float(r["spent_usd"] or 0))
+    saved = sum(statistics.median(spent.get(str(c["tier"] or "")) or spent[""]) for c in closed) if rows else 0.0
     covered: set[int] = set()
     if rows:
         for r in db.q("SELECT labels, depends_on FROM tasks WHERE kind='review' AND id>?", (min(t["id"] for t in rows),)):
@@ -286,7 +298,7 @@ def no_change_code(db: DB, since: float) -> dict:
             continue
         out.append({"id": t["id"], "title": t["title"], "usd": float(t["spent_usd"] or 0)})
     return {"n": len(out), "usd": sum(t["usd"] for t in out), "rows": out,
-            "premise_closed": int((closed or {}).get("n") or 0)}
+            "premise_closed": len(closed), "premise_saved_usd": saved}
 
 
 def unpriced_runs(db: DB, done: list[dict]) -> dict[int, int]:
@@ -448,6 +460,19 @@ def _more(rows: list, shown: int = TOP) -> str:
     return f"; and {len(rows) - shown} more" if len(rows) > shown else ""
 
 
+def target_line(db: DB, cfg: dict) -> str:
+    """Today's whole-account Claude spend against budget.daily_target_usd, from the daemon's last gate
+    count (kv 'gates'); '' when no target is set or nothing was counted."""
+    from . import budget as bud
+    from .overview import _gate_global
+    try:
+        _, totals = _gate_global(db.conn)
+    except Exception:   # a busy or older database: the review goes on without the line
+        return ""
+    t = bud.target_text((cfg or {}).get("budget") or {}, totals)
+    return t.removeprefix(" · ") if t else ""
+
+
 def lines(db: DB, now: float | None = None, window_s: float = WINDOW_S, blocked_h: float = BLOCKED_H,
           p: Project | None = None) -> list[str]:
     """The daily review's 'Self-efficiency audit' lines for the last `window_s`; [NOTHING] on an empty
@@ -455,6 +480,13 @@ def lines(db: DB, now: float | None = None, window_s: float = WINDOW_S, blocked_
     now = time.time() if now is None else now
     since = now - window_s
     out: list[str] = []
+    if p is not None and (tl := target_line(db, p.config())):
+        out.append(tl)
+    if p is not None:
+        try:
+            out += dailyspend.lines(p.config().get("budget"), since, now)
+        except Exception:   # a busy or unreadable database: the review goes on without the split
+            pass
     sent = asks(db, since, now, p)
     for a in sent:
         rec = f"; recommended: {a['recommendation']}" if a["recommendation"] else ""
@@ -534,6 +566,10 @@ def lines(db: DB, now: float | None = None, window_s: float = WINDOW_S, blocked_
         out.append(suite)
     if landed := landing_line(db, since):
         out.append(landed)
+    if p is not None and (gate := gatetime.status_line(p.state, p.config(), now)):
+        out.append(gate)
+    if p is not None and (waits := gatetime.waits_line(db, p.state, now, landed=False)):
+        out.append(waits)   # approval to landed: landing_line
     if pre := checkprestage.audit_line(db, since):
         out.append(pre)
     if plain := plainreply.audit_line(db, since):
@@ -591,10 +627,15 @@ def lines(db: DB, now: float | None = None, window_s: float = WINDOW_S, blocked_
                 + (f" ({g['unpriced']} unpriced, routed)" if g["unpriced"] else "") for g in groups))
         if bases := cost_bases(db, done):
             out.append("$ per done task by provider and cost basis: " + bases_text(bases))
+    if plan := planuse.summary(db, since, now, p.config() if p is not None else None):
+        out.append("plan-billed (its $ are virtual list price, not billed; the plan's window points count): "
+                   + planuse.text(plan))
     idle = no_change_code(db, since)
     if idle["n"] or idle["premise_closed"]:
         out.append(f"code runs with no code change: {idle['n']}, ${idle['usd']:.2f}"
                    + (f"; {idle['premise_closed']} closed by a premise check before any code run"
+                      + (f" (about ${idle['premise_saved_usd']:.2f} saved at the tier's median code run)"
+                         if idle["premise_saved_usd"] else "")
                       if idle["premise_closed"] else "")
                    + "".join(f"{', ' if i else ': '}#{t['id']} {_short(t['title'], 50)} ${t['usd']:.2f}"
                              for i, t in enumerate(idle["rows"][:TOP])) + _more(idle["rows"]))
@@ -654,6 +695,12 @@ def lines(db: DB, now: float | None = None, window_s: float = WINDOW_S, blocked_
             c = 0
         if c:
             out.append(f"confirmation notes closed model-free ({upstream.CONFIRMATION}): {c}")
+        try:
+            c = upstream.close_reports_settled(p.name, since)
+        except OSError:
+            c = 0
+        if c:
+            out.append(f"machine change close reports settled model-free ({upstream.CLOSE_REPORT}): {c}")
         from . import restriction_audit
         least = int((p.config().get("review") or {}).get("rule_blocks_min", restriction_audit.BLOCKS_MIN))
         out += restriction_audit.only_blocks_lines(p, now, least)
@@ -678,6 +725,7 @@ def report(db: DB, now: float | None = None, window_s: float = WINDOW_S, blocked
             "coordinator_turns": coordinator_turns(db, since),
             "coordinator_cache": budget.coordinator_cache(db, now, window_s)["window"], "turns_skipped": turngate.skipped(db, since), "turns_quiet": quietgate.skipped(db, since), "sweeps": sweepskip.counts(db, since, now),
             "finished": done, "per_outcome": per_outcome(done, unpriced), "cost_bases": cost_bases(db, done),
+            "plan_usage": planuse.summary(db, since, now, p.config() if p is not None else None),
             "no_change_code": no_change_code(db, since), "stuck": stuck_long(db, now, blocked_h), "review_loops": review_loops(db, since),
             "reviews": {**reviewstats.summary(db, since), "rows": reviewstats.rows(db, since)},
             "overrides": overrides(p, db, now, blocked_h), "promises": obligations.promise_outcomes(db, since, now),

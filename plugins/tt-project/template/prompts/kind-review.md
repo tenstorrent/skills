@@ -17,6 +17,11 @@
   When only the verdict and its push (or approval) are left once they pass, put that final hand-off
   in `on_pass`: a pass on the same head records it without a model run, and a failure wakes the
   review at its tier with the output.
+- Judge the diff plus the gate results that already exist for the head you review (its required
+  checks, such as the suite and any smoke test, and the checks its task or the daemon recorded).
+  Never start or wait on a repeat of a test that already passed on that head: a further test you
+  want is a finding in your verdict, and the verdict still goes out. Only the required checks and
+  your verdict hold a landing.
 - A review that covers no commit (an external artifact or a hash-pinned report; the task header says
   so) has no `ttp checks` target: re-hash its artifacts against the manifest and rerun the commands
   behind its claims; a missing or changed hash or a nonzero exit is a `substantive` failure.

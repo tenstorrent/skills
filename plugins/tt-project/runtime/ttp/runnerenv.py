@@ -6,12 +6,16 @@ upgraded in the user site (~/.local, `pip install --user`) never changes what a 
 A check runs with PYTHONNOUSERSITE=1 (the user site never loads), PIP_USER unset, and PATH fronted
 by a harness-owned virtualenv's bin, so `python3`, `python3 -m pytest` and `pytest` resolve there.
 The virtualenv sees the system's site-packages (packages the OS installs, such as PyYAML) below its
-own, so its pinned pytest wins over any other.
+own, so its pinned pytest wins over any other. macOS Pythons ship no PyYAML, so LOCK pins it for
+sys_platform darwin only; a line for another platform leaves this host's env key unchanged (_for_host).
 
 Its packages come from a lock: `checks.python_lock` (a requirements file with exact pins, hashes
 where possible; relative to the checkout) when the project sets it, else LOCK beside this file
-(pytest and pytest-xdist). It is built once under TTP_HOME/checks-env, keyed by the lock's content
-and the base interpreter, and reused. A build goes to a fresh folder under a file lock, then the
+(pytest and pytest-xdist). A `# requires-python: >=3.10` line in the lock names the Pythons its pins
+install on: when the one running ttp is older (macOS's own /usr/bin/python3 is 3.9), the env is made
+from the first Python on PATH or in the usual install folders that meets it (interpreter), else
+nothing runs and the error names the Python needed and the one found. It is built once under
+TTP_HOME/checks-env, keyed by the lock's content and the base interpreter, and reused. A build goes to a fresh folder under a file lock, then the
 key's link moves to it in one rename, so a lock change builds beside the old env and a running
 check never sees one rebuilt under it. A build that fails stops the checks with what to fix, never
 a fallback to the user site: a host fault (fault, envfault) the checks wait on, unless the change
@@ -93,14 +97,43 @@ FAULT = "env:python-env:"   # an envfault signature: the pinned env cannot be ma
 
 def fault(lock: Path | None, err: object, cmd: str = "") -> dict:
     """The envfault fault of the env of `lock` that could not be made: the host's, not the change's,
-    so checks wait for it (envfault.record) and nothing is counted against a change."""
+    so checks wait for it (envfault.record) and nothing is counted against a change. Its signature
+    names the lock and the Python the env is made from (_python_of): a run under another Python
+    (ttp under macOS's own 3.9 while the daemon runs 3.12) faults on its own, never holding the rest."""
     lock = Path(lock or LOCK)
     try:
-        sig = hashlib.sha256(lock.read_bytes()).hexdigest()[:12]
+        text = lock.read_bytes()
+        sig = hashlib.sha256(text).hexdigest()[:12]
     except OSError:
-        sig = lock.name
-    return {"kind": "pyenv", "sig": FAULT + sig, "runner": "pinned Python env", "lock": str(lock),
+        text, sig = b"", lock.name
+    base, version = _python_of(text, lock)
+    py = hashlib.sha256(f"{os.path.realpath(base)}\n{version}".encode()).hexdigest()[:6]
+    return {"kind": "pyenv", "sig": f"{FAULT}{sig}-py{py}", "runner": "pinned Python env", "lock": str(lock),
+            "python": base, "python_version": version.split()[0] if version else "",
             "why": str(err)[-600:], "cmd": cmd or "python env"}
+
+
+def _python_of(text: bytes, lock: Path | str) -> tuple[str, str]:
+    """(base interpreter, its sys.version) this process makes the env of lock `text` from
+    (interpreter), or its own base when none meets the lock."""
+    try:
+        return interpreter(text, lock)
+    except Unavailable:
+        return _base_python(), sys.version
+
+
+def applies(f: dict) -> bool:
+    """Whether pinned-env fault `f` is this process's: its env would be made from the Python `f`
+    names. A fault recorded under another Python (one the lock does not allow) holds nothing here."""
+    if not f.get("python"):
+        return True   # recorded before faults named their Python: as before
+    lock = Path(str(f.get("lock") or LOCK))
+    try:
+        base, version = _python_of(lock.read_bytes(), lock)
+    except OSError:
+        return True
+    return (os.path.realpath(base), version.split()[0]) == (
+        os.path.realpath(str(f["python"])), str(f.get("python_version") or version.split()[0]))
 
 
 def ready(lock: Path | None) -> bool:
@@ -110,9 +143,10 @@ def ready(lock: Path | None) -> bool:
         return bool(_read(Path(test)))
     lock = Path(lock or LOCK)
     try:
-        key = key_of(lock.read_bytes(), _base_python())
-    except OSError:
+        base, version = interpreter(lock.read_bytes(), lock)
+    except (OSError, Unavailable):
         return False
+    key = key_of(lock.read_bytes(), base, version)
     home = root()
     if key in _ready or _read(home / key):
         return True
@@ -121,7 +155,7 @@ def ready(lock: Path | None) -> bool:
         with open(home / f".{key}.lock", "a") as fh:
             fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)   # held: a build runs already
         # own session: the env build outlives this call by design; its flock ends it once and a rerun reuses it
-        subprocess.Popen([_base_python(), "-I", __file__, str(lock.resolve())], stdin=subprocess.DEVNULL,
+        subprocess.Popen([base, "-I", __file__, str(lock.resolve())], stdin=subprocess.DEVNULL,
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
                          env=_clean(dict(os.environ)))
     except OSError:
@@ -146,10 +180,119 @@ def _base_python() -> str:
     return sys.executable
 
 
-def key_of(text: bytes, base: str) -> str:
-    """The env's key: the lock's content, and the base interpreter's path, version and machine."""
-    ident = f"{os.path.realpath(base)}\n{sys.version}\n{platform.machine()}\n".encode()
-    return hashlib.sha256(ident + text).hexdigest()[:16]
+def key_of(text: bytes, base: str, version: str | None = None) -> str:
+    """The env's key: the lock's content as this host reads it (_for_host), and the base interpreter's
+    path, version (its sys.version; default this one's) and machine."""
+    ident = f"{os.path.realpath(base)}\n{version or sys.version}\n{platform.machine()}\n".encode()
+    return hashlib.sha256(ident + _for_host(text)).hexdigest()[:16]
+
+
+_PLATFORM = re.compile(r"""\s*sys_platform\s*(==|!=)\s*["']([^"']*)["']\s*""")
+
+
+def _for_host(text: bytes) -> bytes:
+    """`text` without the requirements pip skips on this host for a lone `sys_platform` marker, each
+    with its continuation lines: a package pinned for one platform only (PyYAML on macOS, whose
+    Pythons ship none while Linux distributions do) leaves the other platforms' keys as they were, so
+    a host that cannot build a new env (a lab box without a package index) keeps the one it has."""
+    out, lines, i = [], text.splitlines(keepends=True), 0
+    while i < len(lines):
+        j = i
+        while lines[j].rstrip(b"\r\n").endswith(b"\\") and j + 1 < len(lines):
+            j += 1
+        req = b"".join(ln.rstrip(b"\r\n").rstrip(b"\\") for ln in lines[i:j + 1]).decode(errors="replace")
+        req = re.split(r"\s--hash[=\s]", req, maxsplit=1)[0]
+        m = None if req.lstrip().startswith("#") or ";" not in req else _PLATFORM.fullmatch(req.split(";", 1)[1])
+        if _REQUIRES.fullmatch(req.strip()):
+            pass   # picks the interpreter, which the key names itself: a lock gaining it keeps its envs
+        elif not m or (sys.platform == m.group(2)) == (m.group(1) == "=="):
+            out += lines[i:j + 1]
+        i = j + 1
+    return b"".join(out)
+
+
+_REQUIRES = re.compile(r"#\s*requires-python\s*:\s*(.*?)\s*", re.I)
+_CLAUSE = re.compile(r"(>=|<=|==|!=|>|<)\s*(\d+(?:\.\d+)*)")
+# Where a Python is looked for besides PATH (macOS installers, Homebrew, pyenv-free Linux defaults)
+_PY_DIRS = ("/opt/homebrew/bin", "/usr/local/bin", "/Library/Frameworks/Python.framework/Versions/Current/bin",
+            "/opt/homebrew/opt/python@3.*/bin", "/Library/Frameworks/Python.framework/Versions/3.*/bin", "/usr/bin")
+_found: dict[str, tuple[str, str, tuple] | None] = {}   # candidate path -> (base, sys.version, version_info)
+
+
+def requires(text: bytes, lock: Path | str = "the lock") -> list[tuple[str, tuple]] | None:
+    """The clauses of `text`'s `# requires-python:` line ([(">=", (3, 10))]), None without one.
+    Unavailable for a line it cannot read: the checks then name it, never guess a Python."""
+    for ln in text.decode(errors="replace").splitlines():
+        if m := _REQUIRES.fullmatch(ln.strip()):
+            parts = [c.strip() for c in m.group(1).split(",")]
+            got = [_CLAUSE.fullmatch(c) for c in parts]
+            if not parts or not all(got):
+                raise Unavailable(f"the requires-python line of {lock} ({ln.strip()!r}) is not a list of "
+                                  "comparisons such as `>=3.10` or `>=3.10, <3.14`; fix it in the lock")
+            return [(g.group(1), tuple(int(x) for x in g.group(2).split("."))) for g in got]
+    return None
+
+
+def _meets(v: tuple, spec: list[tuple[str, tuple]]) -> bool:
+    """Whether Python version `v` (3, 9, 6) meets every clause: == and != compare as many parts as
+    the clause gives (==3.10 is any 3.10.x), the others compare 3.10 as 3.10.0."""
+    for op, want in spec:
+        n = max(len(want), 3)
+        a, b = (tuple(v[:len(want)]), want) if op in ("==", "!=") else (
+            tuple(v[:n]) + (0,) * (n - len(v[:n])), want + (0,) * (n - len(want)))
+        if not {"==": a == b, "!=": a != b, ">=": a >= b, "<=": a <= b, ">": a > b, "<": a < b}[op]:
+            return False
+    return True
+
+
+def _candidates() -> list[str]:
+    """Pythons to try, in order: python3 then python3.N (newest first) in each PATH folder, then in
+    _PY_DIRS."""
+    import glob
+    dirs = [d for d in os.environ.get("PATH", "").split(os.pathsep) if d]
+    for d in _PY_DIRS:
+        dirs += sorted(glob.glob(d), key=lambda p: [int(x) if x.isdigit() else -1 for x in re.split(r"(\d+)", p)],
+                       reverse=True) if "*" in d else [d]
+    names = ["python3"] + [f"python3.{n}" for n in range(20, 7, -1)]
+    out, seen = [], set()
+    for d in dirs:
+        for n in names:
+            c = os.path.join(d, n)
+            if os.path.isfile(c) and os.access(c, os.X_OK) and c not in seen:
+                seen.add(c)
+                out.append(c)
+    return out
+
+
+def _probe(c: str) -> tuple[str, str, tuple] | None:
+    """(base interpreter, sys.version, version_info) of Python `c`, its base outside any venv as
+    _base_python finds it; None when it does not run (too old for this file, not a Python)."""
+    if c not in _found:
+        try:
+            r = subprocess.run([c, "-I", __file__, "--interpreter"], capture_output=True, text=True, timeout=30,
+                               env=_clean(dict(os.environ)), stdin=subprocess.DEVNULL)
+            base, version, info = json.loads(r.stdout.strip().splitlines()[-1]) if r.returncode == 0 else (0, 0, 0)
+            _found[c] = (base, version, tuple(info)) if base else None
+        except (OSError, ValueError, IndexError, TypeError, subprocess.SubprocessError):
+            _found[c] = None
+    return _found[c]
+
+
+def interpreter(text: bytes, lock: Path | str = "the lock") -> tuple[str, str]:
+    """(base interpreter, its sys.version) the env of lock `text` is made from: this one's base
+    (_base_python) when it meets the lock's requires-python or the lock names none, else the first
+    candidate that does. Unavailable naming the Python needed and the one found when none does."""
+    base, spec = _base_python(), requires(text, lock)
+    if spec is None or _meets(sys.version_info[:3], spec):
+        return base, sys.version
+    for c in _candidates():
+        if (got := _probe(c)) and _meets(got[2], spec):
+            return got[0], got[1]
+    need = ", ".join(op + ".".join(map(str, v)) for op, v in spec)
+    raise Unavailable(
+        f"the checks' Python lock {lock} needs Python {need} (its requires-python line), but ttp runs under "
+        f"Python {platform.python_version()} ({base}) and no Python on PATH or in {', '.join(_PY_DIRS)} meets "
+        f"it; install a Python {need} there (or run ttp with one: TTP_PYTHON) and run the checks again")
 
 
 def _clean(env: dict) -> dict:
@@ -181,8 +324,8 @@ def ensure(lock: Path | None = None) -> dict:
     except OSError as e:
         raise Unavailable(f"the checks' Python lock {lock} cannot be read ({e.strerror or e}); fix "
                           "checks.python_lock (`ttp config <project> checks.python_lock <file>`) or restore the file")
-    base = _base_python()
-    key = key_of(text, base)
+    base, version = interpreter(text, lock)
+    key = key_of(text, base, version)
     if key in _ready:
         return _ready[key]
     home = root()
@@ -247,7 +390,8 @@ def remote_lines(lock: Path | str | None, where: str, fail: str, home: str = "")
     `where` there, make or reuse the pinned env from them with that host's python3 (as ensure does
     here, under its TTP_HOME, or `home`, a shell word, when given), and put it in force as apply does.
     Where it cannot be made, they print why and run `fail`: the check never runs with that host's user
-    site. OSError when a file cannot be read."""
+    site. TTP_CHECKS_ENV_BIN names its bin, so a check behind a spill wrapper puts it first again
+    (remotecheck.REFRONT). OSError when a file cannot be read."""
     lock = Path(lock or LOCK)
     out, w = f"mkdir -p {shlex.quote(where)}\n", shlex.quote(where)
     for name, text in (("runnerenv.py", Path(__file__).read_text()), ("checks-python.lock", lock.read_text())):
@@ -255,7 +399,8 @@ def remote_lines(lock: Path | str | None, where: str, fail: str, home: str = "")
         out += f"cat > {w}/{name} <<'{end}'\n{text.rstrip(chr(10))}\n{end}\n"
     return (out + f'ttp_env=$({f"TTP_HOME={home} " if home else ""}python3 -I {w}/runnerenv.py "$PWD"/{w}/checks-python.lock) || {{ '
             f"echo 'ttp: the checks pinned Python env could not be made on this host; the check did not run' >&2; {fail}; }}\n"
-            'export PATH="$ttp_env/bin${PATH:+:$PATH}" PYTHONNOUSERSITE=1\nunset PIP_USER\n')
+            'export PATH="$ttp_env/bin${PATH:+:$PATH}" PYTHONNOUSERSITE=1 TTP_CHECKS_ENV_BIN="$ttp_env/bin"\n'
+            'unset PIP_USER\n')
 
 
 def _name(s: str) -> str:
@@ -277,7 +422,8 @@ def freeze(out: Path, lock: Path | None = None) -> list[str]:
     r = subprocess.run([_base_python(), "-c", "import site; print(site.getusersitepackages())"],
                        capture_output=True, text=True, timeout=60, env=env)
     usersite = r.stdout.strip()
-    pins = [re.split(r"\s--hash=", ln)[0].rstrip() for ln in text.splitlines() if ln.strip() and not ln.startswith("#")]
+    pins = [re.split(r"\s--hash=", ln)[0].rstrip() for ln in text.splitlines()
+            if ln.strip() and (not ln.startswith("#") or _REQUIRES.fullmatch(ln.strip()))]
     have = {_name(re.split(r"[=<>!~ ;\[]", p, maxsplit=1)[0]) for p in pins}
     added = {}
     for d in (metadata.distributions(path=[usersite]) if usersite and Path(usersite).is_dir() else ()):
@@ -299,6 +445,9 @@ def describe(info: dict) -> str:
 
 
 if __name__ == "__main__":   # on another host (remote_lines): print the env's folder, made first when missing
+    if sys.argv[1:] == ["--interpreter"]:   # _probe: this Python's base, sys.version and version_info
+        print(json.dumps([_base_python(), sys.version, list(sys.version_info[:3])]))
+        sys.exit(0)
     try:
         print(ensure(Path(sys.argv[1]))["path"])
     except Unavailable as e:

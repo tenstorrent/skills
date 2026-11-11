@@ -16,7 +16,8 @@ step is open, on the thread that opened it:
   (CRITICAL_WAIT_S when it names none).
 
 Every ssh started in an installed process gets ConnectTimeout and ServerAlive options unless it names
-its own. install() patches subprocess.Popen once per process (the daemon, at start); off a step, or on
+its own, and runs through the harness's ssh wrapper (connection reuse, sshmux.py) while ssh.reuse is
+on. install() patches subprocess.Popen once per process (the daemon, at start); off a step, or on
 another thread, a wait is left as it is.
 """
 from __future__ import annotations
@@ -28,6 +29,8 @@ import subprocess
 import threading
 import time
 from typing import Iterator
+
+from . import sshmux
 
 SSH_OPTS = ("-o", "ConnectTimeout=15", "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=4")
 CRITICAL_WAIT_S = 120   # a wait inside critical() that names no timeout
@@ -56,6 +59,33 @@ class _State:
 
 _s = _State()
 _orig: dict = {}
+# Children started in this process since spawns() last took them: {(step or thread name, program): n}.
+# The daemon logs them per window (Daemon._log_spawns): how much process churn each step causes.
+_spawned: dict[tuple[str, str], int] = {}
+_spawn_lock = threading.Lock()
+
+
+def _count_spawn(args) -> None:
+    """Count one child by the step (or thread) starting it and its program. Never in Popen's way."""
+    try:
+        if isinstance(args, (str, bytes, os.PathLike)):
+            prog = os.fsdecode(args).split(" ", 1)[0]
+        else:
+            prog = os.fsdecode(args[0]) if args else ""
+        prog = os.path.basename(prog) or "?"
+        who = _s.step if active() else threading.current_thread().name
+        with _spawn_lock:
+            _spawned[(who, prog)] = _spawned.get((who, prog), 0) + 1
+    except Exception:   # an odd argv is Popen's to reject, not the counter's
+        pass
+
+
+def spawns() -> dict[tuple[str, str], int]:
+    """The children started since the last call, {(step or thread, program): count}; resets the count."""
+    global _spawned
+    with _spawn_lock:
+        got, _spawned = _spawned, {}
+    return got
 
 
 def begin(name: str, budget_s: float, slack_s: float) -> None:
@@ -155,8 +185,9 @@ def ssh_argv(argv):
 
 
 def _init(self, args, *a, **kw):
+    _count_spawn(args)
     if not kw.get("shell"):
-        args = ssh_argv(args)
+        args = sshmux.argv(ssh_argv(args), kw.get("env"))
     _orig["init"](self, args, *a, **kw)
 
 

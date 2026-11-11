@@ -2111,7 +2111,7 @@ def test_coordinator_wire_schema_closes_nullable_heal_and_covers_prompt(env, tmp
     flag = '--output-schema' if provider == 'codex' else '--json-schema'
     raw = argv[argv.index(flag) + 1]
     wire = json.loads(pathlib.Path(raw).read_text() if provider == 'codex' else raw)
-    _assert_openai_strict_schema(wire)
+    _assert_openai_strict_schema(wire, all_required=provider == 'codex')
     item = wire['properties']['actions']['items']['properties']
     prompt = (RUNTIME.parent / 'template/prompts/coordinator.md').read_text()
     documented = set(re.findall(r'^\| `([a-z_]+)` \|', prompt, re.M))

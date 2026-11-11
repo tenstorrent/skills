@@ -18,7 +18,9 @@ argv alone, with no per-call-site knowledge:
   for at most VOLATILE_MAX_AGE_S.
 - once: an exit code other than 0 and 1, a timeout or an oversize output: served only up to the next
   round of the attempt that read it (gitmemo.strict), then dropped.
-Outside an attempt nothing is read from or kept here."""
+Outside an attempt, within gitmemo.kept_reads() (the daemon's tick loop), only immutable and
+ref-dependent answers are served and kept, so a ref or HEAD read the daemon repeats every tick runs
+git once per ref value; worktree, index and the other volatile reads always run git."""
 
 from __future__ import annotations
 
@@ -38,6 +40,8 @@ from . import gitcache
 MAX_BYTES = 256 * 1024 * 1024        # output kept in all
 MAX_ENTRY_BYTES = 4 * 1024 * 1024    # one answer larger is kept only for the next round ("once")
 VOLATILE_MAX_AGE_S = 30.0
+MAX_TICK_ENTRY_BYTES = 256 * 1024    # a larger answer a tick read (outside an attempt) is not kept
+MAX_TICK_BYTES = 32 * 1024 * 1024    # a tick read's answer is kept only with all output under this
 IMM, REF, VOL, ONCE = "immutable", "ref", "volatile", "once"
 # subprocess.run arguments a kept answer can stand in for
 _KW = frozenset({"capture_output", "stdout", "stderr", "stdin", "input", "text", "universal_newlines", "encoding",
@@ -293,6 +297,8 @@ def get(k: Key, att_id: int, round_no: int) -> Entry | None:
         e = _memo.get(k.k)
     if e is None:
         return None
+    if att_id is None and e.kind in (VOL, ONCE):
+        return None     # a tick read (gitmemo.kept_reads) never takes, nor drops, an attempt's own answer
     ok = True
     if e.kind in (VOL, ONCE) and e.att != att_id:
         ok = False
@@ -319,8 +325,10 @@ def _drop(kk) -> None:
         _bytes[0] -= e.size
 
 
-def put(k: Key, r: subprocess.CompletedProcess | None, att_id: int, round_no: int) -> None:
-    """Keep git's answer `r` to `k` (None: it timed out), classified by k.pre (read before it ran)."""
+def put(k: Key, r: subprocess.CompletedProcess | None, att_id: int | None, round_no: int) -> None:
+    """Keep git's answer `r` to `k` (None: it timed out), classified by k.pre (read before it ran).
+    Outside an attempt (`att_id` None: gitmemo.kept_reads) only an immutable or ref-dependent answer
+    up to MAX_TICK_ENTRY_BYTES is kept."""
     kind, deps, cstamp = k.pre or (VOL, (), None)
     rc = None if r is None else r.returncode
     out, err = (None, None) if r is None else (r.stdout, r.stderr)
@@ -331,6 +339,8 @@ def put(k: Key, r: subprocess.CompletedProcess | None, att_id: int, round_no: in
     e = Entry(kind, deps, cstamp, rc, out, err, att_id, time.monotonic(), round_no + 1)
     if e.size > MAX_ENTRY_BYTES:
         e.kind = ONCE
+    if att_id is None and (e.kind not in (IMM, REF) or e.size > MAX_TICK_ENTRY_BYTES):
+        return
     if e.kind in (IMM, REF) and not _valid(e, k.dirs):
         return      # a ref moved while git ran: the answer may be of either value
     with _lock:
@@ -338,7 +348,7 @@ def put(k: Key, r: subprocess.CompletedProcess | None, att_id: int, round_no: in
         _memo[k.k] = e
         _bytes[0] += e.size
         stats["kept"] += 1
-        while _bytes[0] > MAX_BYTES and len(_memo) > 1:
+        while _bytes[0] > (MAX_BYTES if att_id is not None else MAX_TICK_BYTES) and len(_memo) > 1:
             _drop(next(iter(_memo)))
 
 

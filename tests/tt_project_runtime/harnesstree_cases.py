@@ -383,31 +383,37 @@ def _ht_backups(p):
             if f.is_file()} if root.is_dir() else {}
 
 
-def test_a_dirty_checkout_copy_equal_to_the_branch_head_lands_with_a_backup(env):
-    """Before: git refused the merge ('would be overwritten') and the commits waited for a hand cleanup."""
+def test_a_dirty_checkout_copy_equal_to_the_branch_head_lands_as_it_is(env):
+    """Before: git refused the merge ('would be overwritten') and the commits waited for a hand cleanup;
+    then the copy was backed up and put back with `checkout HEAD --` before the merge rewrote it."""
     p = make(env)
     from ttp import harnesstree
     b, own = _ht_dirty_copy_setup(p)
     (p.harness / "prompts" / "shared.md").write_text("v2\n")   # someone copied the branch's file in
     (p.harness / "prompts" / "wip.md").write_text("half done\n")
+    ino = (p.harness / "prompts" / "shared.md").stat().st_ino
     assert harnesstree.land(p, b) == "merged"
     assert _hgit(p.harness, "show", "HEAD:prompts/shared.md") == "v2\n"
     assert (p.harness / "prompts" / "shared.md").read_text() == "v2\n"
+    assert (p.harness / "prompts" / "shared.md").stat().st_ino == ino   # never rewritten
     assert _hgit(p.harness, "status", "--porcelain", "--", "prompts").strip() == "?? prompts/wip.md"
-    assert _ht_backups(p) == {"prompts/shared.md": "v2\n"}
-    assert "harness-land-backups" in (p.logs / "daemon.log").read_text()
+    assert not _ht_backups(p)
+    assert "already held the merged content" in (p.logs / "daemon.log").read_text()
     assert not p.db.q("SELECT id FROM events WHERE kind='harness_merge_conflict'")
 
 
-def test_a_dirty_checkout_copy_equal_to_an_earlier_branch_version_lands_with_a_backup(env):
+def test_a_dirty_checkout_copy_equal_to_an_earlier_branch_version_is_left_and_the_land_refused(env):
+    """Before: the copy was backed up and put back with `checkout HEAD --`, then the merge rewrote it."""
     p = make(env)
     from ttp import harnesstree
     b, own = _ht_dirty_copy_setup(p)
     (p.harness / "prompts" / "shared.md").write_text("v1\n")   # the branch's version before its head
-    assert harnesstree.land(p, b) == "merged"
-    assert (p.harness / "prompts" / "shared.md").read_text() == "v2\n"
-    assert not _hgit(p.harness, "status", "--porcelain").strip()
-    assert _ht_backups(p) == {"prompts/shared.md": "v1\n"}
+    head = _hgit(p.harness, "rev-parse", "HEAD").strip()
+    assert harnesstree.land(p, b) == "conflict"
+    assert _hgit(p.harness, "rev-parse", "HEAD").strip() == head
+    assert (p.harness / "prompts" / "shared.md").read_text() == "v1\n" and not _ht_backups(p)
+    (ev,) = p.db.q("SELECT * FROM events WHERE kind='harness_merge_conflict'")
+    assert "would be overwritten" in ev["text"] and "prompts/shared.md" in ev["text"]
 
 
 def test_a_differing_dirty_checkout_copy_is_left_alone_and_the_land_refused_naming_it(env):
@@ -440,9 +446,10 @@ def test_a_refused_land_retried_each_pass_sets_nothing_aside(env):
     assert (p.harness / "prompts" / "new [x] y.md").read_text() == "new\n"
 
 
-def test_an_unrelated_staged_change_blocking_the_merge_sets_nothing_aside_on_any_pass(env):
+def test_an_unrelated_staged_change_never_stops_a_land_that_is_no_fast_forward(env):
     """Before: git refused the non-fast-forward merge over the staged prompts/other.md, yet each pass
-    set the equal untracked copy aside: a new backup folder, a log line and a checkout rewrite."""
+    set the equal untracked copy aside: a new backup folder, a log line and a checkout rewrite. Merged
+    aside, the checkout only moves forward: it lands, both copies as they were."""
     p = make(env)
     from ttp import harnesstree
     b, own = _ht_dirty_copy_setup(p)
@@ -450,11 +457,10 @@ def test_an_unrelated_staged_change_blocking_the_merge_sets_nothing_aside_on_any
     (p.harness / "prompts" / "other.md").write_text("staged o1\n")
     _hgit(p.harness, "add", "prompts/other.md")
     (p.harness / "prompts" / "new [x] y.md").write_text("new\n")
-    assert [harnesstree.land(p, b) for _ in range(3)] == ["conflict", "conflict-known", "conflict-known"]
+    assert harnesstree.land(p, b) == "merged"
     assert not _ht_backups(p)
-    log = p.logs / "daemon.log"
-    assert "set aside" not in (log.read_text() if log.exists() else "")
     assert (p.harness / "prompts" / "new [x] y.md").read_text() == "new\n"
+    assert _hgit(p.harness, "show", "HEAD:prompts/new [x] y.md") == "new\n"
     assert _hgit(p.harness, "show", ":prompts/other.md") == "staged o1\n"
     assert (p.harness / "prompts" / "other.md").read_text() == "staged o1\n"
 
@@ -468,7 +474,8 @@ def test_an_unrelated_staged_change_does_not_stop_a_fast_forward_land(env):
     (p.harness / "prompts" / "new [x] y.md").write_text("new\n")
     assert harnesstree.land(p, b) == "merged"
     assert _hgit(p.harness, "show", ":prompts/staged.md") == "staged\n"
-    assert _ht_backups(p) == {"prompts/new [x] y.md": "new\n"}
+    assert _hgit(p.harness, "status", "--porcelain", "--", "prompts").strip() == "A  prompts/staged.md"
+    assert not _ht_backups(p)
 
 
 def test_staged_content_differing_from_an_equal_working_copy_is_never_lost(env):
@@ -484,7 +491,7 @@ def test_staged_content_differing_from_an_equal_working_copy_is_never_lost(env):
     assert (p.harness / "prompts" / "shared.md").read_text() == "v2\n" and not _ht_backups(p)
 
 
-def test_an_untracked_checkout_copy_equal_to_a_file_the_branch_adds_lands_with_a_backup(env):
+def test_an_untracked_checkout_copy_equal_to_a_file_the_branch_adds_lands_as_it_is(env):
     p = make(env)
     from ttp import harnesstree
     b, own = _ht_dirty_copy_setup(p)
@@ -492,7 +499,7 @@ def test_an_untracked_checkout_copy_equal_to_a_file_the_branch_adds_lands_with_a
     assert harnesstree.land(p, b) == "merged"
     assert _hgit(p.harness, "show", "HEAD:prompts/new [x] y.md") == "new\n"
     assert not _hgit(p.harness, "status", "--porcelain").strip()
-    assert _ht_backups(p) == {"prompts/new [x] y.md": "new\n"}
+    assert not _ht_backups(p)
 
 
 def test_dirty_copies_are_never_set_aside_while_another_harness_run_works_in_the_checkout(env):
@@ -657,3 +664,113 @@ def test_a_done_harness_task_with_its_own_worktree_still_lands_from_its_own_bran
     assert (p.harness / "prompts" / "b.md").read_text() == "b\n" and not own.exists()
     assert _hgit(p.harness, "branch", "--list", f"ttp/harness-t{b}").strip() == ""
     assert not _ht_stranded_events(p)
+
+
+def _ht_git_calls(monkeypatch):
+    """Record every git command harnesstree and upjournal run: [(cwd, args)]."""
+    from ttp import harnesstree, upjournal
+    calls = []
+    for mod in (harnesstree, upjournal):
+        real = mod._git
+
+        def rec(cwd, *a, _real=real, **k):
+            calls.append((str(cwd), a))
+            return _real(cwd, *a, **k)
+        monkeypatch.setattr(mod, "_git", rec)
+    return calls
+
+
+def _ht_no_overwriting_git(p, calls):
+    for cwd, a in calls:
+        if cwd == str(p.harness):
+            assert not {"checkout", "reset", "stash", "restore", "--abort"} & set(a), a
+    assert not {"reset", "checkout"} & set(_hgit(p.harness, "reflog", "--format=%gs").split())
+
+
+def test_uncommitted_staged_and_untracked_edits_survive_a_land_whose_merge_touches_the_same_files(env, monkeypatch):
+    """Before: a copy equal to the branch's content was backed up and put back with `checkout HEAD --`, and
+    a fast-forward refused after writing put the touched files back the same way."""
+    p = make(env)
+    from ttp import harnesstree
+    calls = _ht_git_calls(monkeypatch)
+    _commit_in_harness_tree(p.harness, "prompts/edit.md", "e0\n", "edit e0")
+    _commit_in_harness_tree(p.harness, "prompts/staged.md", "s0\n", "staged s0")
+    a, b = _harness_task(p, "a"), _harness_task(p, "b")
+    _harness_run(p, a)
+    own = harnesstree.workdir(p, b)
+    p.db.x("UPDATE runs SET status='done'")
+    _commit_in_harness_tree(own, "prompts/edit.md", "e from b\n", "b: edit")
+    _commit_in_harness_tree(own, "prompts/staged.md", "s from b\n", "b: staged")
+    _commit_in_harness_tree(own, "prompts/untracked.md", "u from b\n", "b: untracked")
+    p.db.update_task(b, status="done")
+    h = p.harness / "prompts"
+    (h / "edit.md").write_text("e1, uncommitted\n")
+    (h / "staged.md").write_text("s1, staged\n")
+    _hgit(p.harness, "add", "prompts/staged.md")
+    (h / "staged.md").write_text("s2, on top of the staged s1\n")
+    (h / "untracked.md").write_text("u, my own\n")
+    head = _hgit(p.harness, "rev-parse", "HEAD").strip()
+
+    def kept(edit, staged_index, staged, untracked):
+        assert (h / "edit.md").read_text() == edit
+        assert _hgit(p.harness, "show", ":prompts/staged.md") == staged_index
+        assert (h / "staged.md").read_text() == staged
+        assert (h / "untracked.md").read_text() == untracked
+        _ht_no_overwriting_git(p, calls)
+    for want in ("conflict", "conflict-known"):
+        assert harnesstree.land(p, b) == want
+        assert _hgit(p.harness, "rev-parse", "HEAD").strip() == head
+        kept("e1, uncommitted\n", "s1, staged\n", "s2, on top of the staged s1\n", "u, my own\n")
+        assert _hgit(p.harness, "ls-files", "--others", "--", "prompts/untracked.md").strip()
+    (ev,) = p.db.q("SELECT * FROM events WHERE kind='harness_merge_conflict'")
+    assert all(f"prompts/{f}.md" in ev["text"] for f in ("edit", "staged", "untracked"))
+    assert not _ht_backups(p)
+    # each copy now holds the merged content (staged.md in the index, with an edit of its own on top)
+    (h / "edit.md").write_text("e from b\n")
+    (h / "staged.md").write_text("s from b\n")
+    _hgit(p.harness, "add", "prompts/staged.md")
+    (h / "staged.md").write_text("s from b, and more\n")
+    (h / "untracked.md").write_text("u from b\n")
+    _commit_in_harness_tree(own, "prompts/landed.md", "l\n", "b: landed")   # a new head: tried again
+    assert harnesstree.land(p, b) == "merged"
+    kept("e from b\n", "s from b\n", "s from b, and more\n", "u from b\n")
+    assert _hgit(p.harness, "show", "HEAD:prompts/staged.md") == "s from b\n"
+    assert (h / "landed.md").read_text() == "l\n"
+    assert _hgit(p.harness, "status", "--porcelain", "--", "prompts").strip() == "M prompts/staged.md"
+
+
+def test_a_refused_ref_update_writes_no_file_and_takes_its_staging_back(env, monkeypatch):
+    """Before: git wrote the touched files, the reference-transaction hook (the template guard) refused
+    the ref, and land put them back with `checkout HEAD --`. The ref now moves first."""
+    p = make(env)
+    from ttp import harnesstree
+    calls = _ht_git_calls(monkeypatch)
+    b, own = _ht_dirty_copy_setup(p)
+    hooks = Path(_hgit(p.harness, "rev-parse", "--path-format=absolute", "--git-path", "hooks").strip())
+    hooks.mkdir(parents=True, exist_ok=True)
+    (hooks / "reference-transaction").write_text('#!/bin/sh\n[ "$1" = prepared ] || exit 0\n'
+                                                 'grep -q " refs/heads/main$" && exit 1\nexit 0\n')
+    (hooks / "reference-transaction").chmod(0o755)
+    (p.harness / "prompts" / "new [x] y.md").write_text("new\n")   # equal to the merge's: staged, then taken back
+    head = _hgit(p.harness, "rev-parse", "HEAD").strip()
+    assert harnesstree.land(p, b) == "busy"
+    assert _hgit(p.harness, "rev-parse", "HEAD").strip() == head
+    assert (p.harness / "prompts" / "shared.md").read_text() == "v0\n"   # never written
+    assert _hgit(p.harness, "status", "--porcelain").strip() == "?? \"prompts/new [x] y.md\""
+    _ht_no_overwriting_git(p, calls)
+
+
+def test_a_deleted_or_symlinked_checkout_copy_of_a_file_the_merge_changes_stops_the_land(env):
+    import os
+    p = make(env)
+    from ttp import harnesstree
+    b, own = _ht_dirty_copy_setup(p)
+    shared = p.harness / "prompts" / "shared.md"
+    shared.unlink()   # deleted, not staged: the merge would write it back
+    head = _hgit(p.harness, "rev-parse", "HEAD").strip()
+    assert harnesstree.land(p, b) == "conflict" and not os.path.lexists(shared)
+    (p.harness / "elsewhere.md").write_text("v2\n")
+    shared.symlink_to(p.harness / "elsewhere.md")   # its target holds the merged content: not the file
+    _commit_in_harness_tree(own, "prompts/more.md", "m\n", "b: more")
+    assert harnesstree.land(p, b) == "conflict" and shared.is_symlink()
+    assert _hgit(p.harness, "rev-parse", "HEAD").strip() == head

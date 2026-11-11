@@ -20,7 +20,7 @@ import subprocess
 import time
 from pathlib import Path
 
-from . import gitmemo
+from . import gitmemo, runner
 from .project import Project, write_json
 from .providers import get_provider
 
@@ -29,6 +29,7 @@ RECENT = 30          # tool calls kept per run, for the failed count (of the las
 GIT_TTL_S = 300      # a cached file list is redone after this, even with HEAD and the index unchanged
 MAX_FILES = 50
 MAX_FAILS = 50       # failed commands counted per run (the most-failed kept)
+LEASE_STALE_S = 180   # a runner renews its lease every 30 s (as daemon.LEASE_STALE_S)
 TAIL_BYTES = 16384   # the end of progress.md and steer.md read for their last lines
 
 
@@ -99,7 +100,30 @@ def _entry(p: Project, r: dict, old: dict, now: float, base: list[str]) -> dict:
     e["wall"] = {"elapsed_s": round(now - started), "limit_s": limit,
                  "share": round((now - started) / float(limit), 3) if limit else None}
     e["steer"] = _steer(run_dir, r["provider"])
+    e["ended"] = ended(run_dir, r["provider"], now)
     return e
+
+
+def ended(run_dir: Path, provider: str, now: float) -> str | None:
+    """Why a run the database still calls running has already exited (not reaped yet): "exit.json", "result"
+    (its stream holds its final event) or "runner gone" (its lease is stale and its recorded runner no longer
+    runs). None while it may still run; drift.py flags no ended run."""
+    if (run_dir / "exit.json").exists():
+        return "exit.json"
+    try:
+        if get_provider(provider).stream_ended(run_dir / "output.jsonl"):
+            return "result"
+    except Exception:
+        pass
+    try:
+        pid_text, _, started = (run_dir / "runner.pid").read_text().partition("\n")
+        pid, started = int(pid_text), started.strip()
+    except (OSError, ValueError):
+        return None   # nothing recorded: no proof it ended
+    lease_at = max(_mtime(run_dir / "lease"), _mtime(run_dir / "runner.pid")) / 1e9
+    if started and now - lease_at > LEASE_STALE_S and runner.proc_start(pid) != started:
+        return "runner gone"
+    return None
 
 
 def _tail_lines(f: Path) -> list[str]:

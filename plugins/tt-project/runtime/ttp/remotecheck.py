@@ -18,7 +18,9 @@ project's, a shared or another project's pause; nothing reaches it over ssh): th
 exit FAULT_RC is reported as 1, so it never reads as a fault. A check spilled with a remote wrapper
 (--wrap: push.spill_to) runs behind it there; a wrapper missing or not executable on the host (a
 relative path in the copy of the commit, else a name on the host's PATH) is a fault too: the check
-never runs unwrapped. `--py` files (the tests gate's select plugin, cli._remote_select) are written into the
+never runs unwrapped. So is a wrapper that refuses the run (a busy host): it writes the file its
+TTP_WRAP_REFUSED variable names and exits FAULT_RC, and the check runs again elsewhere; exit FAULT_RC
+without that file still reads as 1. `--py` files (the tests gate's select plugin, cli._remote_select) are written into the
 run folder's .git, out of the tree the check sees, and put first on PYTHONPATH; `--literal` variables are
 exported as given, never expanded there.
 
@@ -36,11 +38,18 @@ import sys
 import time
 from pathlib import Path
 
+from . import sshagent, tailnet
+
 FAULT_RC = 75
 ENV_DIR = ".git/ttp-env"   # the pinned Python env's maker and lock in the run folder (runnerenv.remote_lines)
 SHIP_DIR = ".git/ttp-py"   # where shipped Python files go in the run folder: never in the tree the check sees
 NO_ENV = "no-env"     # ... and when the pinned Python env cannot be made there (runnerenv.remote_lines): a host fault
 NO_WRAP = "no-wrap"   # the exit marker's form when the remote wrapper is missing there: a host fault
+WRAP_REFUSED = "wrap-refused"   # ... and when the wrapper refused the run (WRAP_REFUSED_ENV): a host fault
+WRAP_REFUSED_ENV = "TTP_WRAP_REFUSED"   # the file a wrapper writes before it exits FAULT_RC to refuse a run
+# Behind a spill wrapper: the pinned checks env first on PATH again and the user site off (runnerenv.remote_lines)
+REFRONT = ('if [ -n "${TTP_CHECKS_ENV_BIN:-}" ]; then PATH="$TTP_CHECKS_ENV_BIN${PATH:+:$PATH}"; '
+           'PYTHONNOUSERSITE=1; export PATH PYTHONNOUSERSITE; unset PIP_USER; fi\n')
 LOCAL = "local"      # a check's `host` that keeps it here when delivery.checks_host is set
 HOST_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.@+:-]{0,252}")
 ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
@@ -55,7 +64,9 @@ DIRECT = ["-o", "ControlMaster=no", "-o", "ControlPath=none"]
 # tried again from the start on a connection of its own after each wait here, then it is a fault.
 MUX_REFUSED = "Session open refused by peer"
 MUX_BACKOFF_S = (2, 5)
-SETUP_TIMEOUT_S = 900
+# Under the checks' silence limit (checkwall.SILENT_S, 600 s): a copy that stalls is the host's fault
+# (another host or here takes the check), never a silent "hang" blamed on the change.
+SETUP_TIMEOUT_S = 540
 CLEANUP_TIMEOUT_S = 120
 PROBE_TIMEOUT_S = 45
 STOP_GRACE_S = 5   # a stopped command's TERM before KILL on the host
@@ -92,9 +103,11 @@ def argv(cmd: str, host: str, env: dict | None = None, commit: str = "", wrap: t
             *(["--literal", json.dumps(literal, sort_keys=True)] if literal else []), "--", cmd]
 
 
-def _ssh(host: str, script: str, direct: bool = False) -> list[str]:
+def _ssh(host: str, script: str, direct: bool = False, compress: bool = False) -> list[str]:
     # The login shell parses the command line: hand it one quoted word for sh, whatever that shell is.
-    return [*SSH, *(DIRECT if direct else []), host, f"sh -c {shlex.quote(script)}"]
+    # compress: the tree copy (a plain tar, about 3x smaller compressed) on a slow link.
+    return [*SSH, *(DIRECT if direct else []), *(["-o", "Compression=yes"] if compress else []), host,
+            f"sh -c {shlex.quote(script)}"]
 
 
 def paused(host: str, where: str | Path | None = None) -> str:
@@ -125,13 +138,18 @@ def reachable(host: str) -> str:
         r = subprocess.run(_ssh(host, "command -v git >/dev/null && command -v tar >/dev/null"),
                            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=PROBE_TIMEOUT_S)
     except subprocess.TimeoutExpired:
-        return f"ssh to {host} timed out after {PROBE_TIMEOUT_S} s"
+        if sshagent.password_manager():
+            return f"ssh to {host} timed out after {PROBE_TIMEOUT_S} s: {sshagent.WHY}"
+        return f"ssh to {host} timed out after {PROBE_TIMEOUT_S} s" + tailnet.suffix()
     except OSError as e:
         return f"cannot run ssh: {e}"
     if r.returncode == 0:
         return ""
+    if r.returncode == 255 and sshagent.locked(r.stderr):
+        return f"ssh to {host} failed: {sshagent.WHY}"
     if r.returncode == 255:
-        return f"ssh cannot reach {host}: {(r.stderr.strip().splitlines() or ['exit 255'])[-1][:200]}"
+        return (f"ssh cannot reach {host}: {(r.stderr.strip().splitlines() or ['exit 255'])[-1][:200]}"
+                + tailnet.suffix())
     return f"{host} lacks git or tar"
 
 
@@ -147,7 +165,9 @@ def _say(msg: str) -> None:
 
 
 def _fault(host: str, why: str) -> int:
-    _say(f"environment fault {SIG}{host}: {why}. This is the host, not the change")
+    agent = sshagent.WHY in why   # the ssh agent here (sshagent.py): neither the host nor the change
+    _say(f"environment fault {SIG}{host}: {why}. "
+         + ("Not the host and not the change: the run waits and retries" if agent else "This is the host, not the change"))
     return FAULT_RC
 
 
@@ -191,15 +211,22 @@ def _run_script(q: str, exports_: str, cmd: str, mark: str, wrap: tuple[str, ...
     then KILL after STOP_GRACE_S) once ssh's stdin ends: without a tty, ssh signals nothing when the
     local side stops or dies, and the command would run on. Then the exit-code marker, and the
     directory is removed. With `wrap`, the command runs behind it, and a wrapper that is missing or not
-    executable there prints the marker's NO_WRAP form instead of starting anything. With `prio`, it all
-    runs behind the host's `nice` and `ionice` (_priority)."""
+    executable there prints the marker's NO_WRAP form instead of starting anything, and one that exits
+    FAULT_RC after writing the file WRAP_REFUSED_ENV names prints its WRAP_REFUSED form. With `prio`, it all
+    runs behind the host's `nice` and `ionice` (_priority). Behind a wrapper the pinned checks env
+    (TTP_CHECKS_ENV_BIN, runnerenv.remote_lines) goes first on PATH again, so a wrapper that puts its own env first never hides it."""
+    if wrap:
+        cmd = REFRONT + cmd
     w = " ".join(map(shlex.quote, wrap))
     run = f"{w} bash -e -o pipefail -c {shlex.quote(cmd)}".lstrip()
     has = ""
     if wrap:
         exe = shlex.quote(wrap[0])
         test = f"[ -f {exe} ] && [ -x {exe} ]" if "/" in wrap[0] else f"command -v {exe} >/dev/null 2>&1"
-        has = f"if ! {{ {test}; }}; then printf '\\n%s%s\\n' {mark} {NO_WRAP}; exit 96; fi\n"
+        has = (f"if ! {{ {test}; }}; then printf '\\n%s%s\\n' {mark} {NO_WRAP}; exit 96; fi\n"
+               f"export {WRAP_REFUSED_ENV}={q}/.git/ttp-wrap-refused\n")
+    refused = (f"if [ \"$rc\" = {FAULT_RC} ] && [ -e \"${WRAP_REFUSED_ENV}\" ]; then "
+               f"printf '\\n%s%s\\n' {mark} {WRAP_REFUSED}; fi\n") if wrap else ""
     return (f"cd {q} || exit 97\ntrap 'cd / && rm -rf {q}' EXIT\n{exports_}{has}"
             f"if command -v bash >/dev/null 2>&1; then set -- {run}; else set -- {w} sh -e -c {shlex.quote(cmd)}; fi\n"
             f"{_priority(prio)}"
@@ -219,7 +246,7 @@ def _run_script(q: str, exports_: str, cmd: str, mark: str, wrap: tuple[str, ...
             f"sleep {STOP_GRACE_S}; kill -KILL -$pid 2>/dev/null || kill -KILL $pid 2>/dev/null) >/dev/null 2>&1 &\n"
             "watch=$!\nexec 3<&-\n"
             "wait $pid\nrc=$?\nkill $watch 2>/dev/null\ntrap '' PIPE\n"
-            f"printf '\\n%s%s\\n' {mark} \"$rc\"\nexit $rc\n")
+            f"{refused}printf '\\n%s%s\\n' {mark} \"$rc\"\nexit $rc\n")
 
 
 class _Stop(Exception):
@@ -259,6 +286,8 @@ def main(args: list[str]) -> int:
         _say(f"usage: --host <ssh alias> [--env <json>] -- <command> "
              f"({host_problem(host) or env_problem(env) or env_problem(literal)})")
         return 2
+    from . import testslots   # a fixed `-n N` above the host's worker grant (checkspill.workers_env) is lowered to it
+    cmd = testslots.clamp_for(cmd, literal)
     mark = f"ttp-remote-rc:{secrets.token_hex(8)}:"
     try:   # the pinned Python env there, as here (runnerenv): no env, no run (NO_ENV)
         from . import runnerenv
@@ -307,7 +336,8 @@ def _attempt(host, top, head, env, extra, cmd, mark, wrap, wait) -> tuple[int, s
             made = subprocess.run(_ssh(host, mktemp_cmd(), direct),
                                   stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=PROBE_TIMEOUT_S)
         except subprocess.TimeoutExpired:
-            return _fault(host, f"ssh timed out after {PROBE_TIMEOUT_S} s"), ""
+            return _fault(host, f"ssh timed out after {PROBE_TIMEOUT_S} s"
+                          + (f": {sshagent.WHY}" if sshagent.password_manager() else "")), ""
         tmp = made.stdout.strip()
         if made.returncode != 0 or not _TMP.fullmatch(tmp):
             tmp = ""
@@ -315,6 +345,8 @@ def _attempt(host, top, head, env, extra, cmd, mark, wrap, wait) -> tuple[int, s
                    f"{(made.stderr.strip().splitlines() or [''])[-1][:200]})")
             if made.returncode == 255 and _refused(made.stderr):
                 return FAULT_RC, why
+            if made.returncode == 255 and sshagent.locked(made.stderr):
+                why = f"ssh failed: {sshagent.WHY}"
             return _fault(host, why), ""
         _say(f"checking {head[:12]} on {host} in {tmp}")
         q = shlex.quote(tmp)
@@ -323,7 +355,7 @@ def _attempt(host, top, head, env, extra, cmd, mark, wrap, wait) -> tuple[int, s
                  f"--no-verify --allow-empty -m {shlex.quote('ttp check of ' + head)}")
         archive = subprocess.Popen(["git", "-C", top, "archive", "--format=tar", head], stdout=subprocess.PIPE)
         try:
-            copied = subprocess.run(_ssh(host, setup, direct), stdin=archive.stdout, capture_output=True, text=True,
+            copied = subprocess.run(_ssh(host, setup, direct, compress=True), stdin=archive.stdout, capture_output=True, text=True,
                                     timeout=SETUP_TIMEOUT_S)
         except subprocess.TimeoutExpired:
             archive.kill()
@@ -347,7 +379,7 @@ def _attempt(host, top, head, env, extra, cmd, mark, wrap, wait) -> tuple[int, s
         # stdin stays open and unwritten: its end on the host (we stopped, died or lost ssh) stops the command.
         proc = subprocess.Popen(_ssh(host, script, direct), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT)
-        rc, held, no_wrap, refused = None, b"", False, False
+        rc, held, no_wrap, refused, wrap_refused = None, b"", False, False, False
         out = sys.stdout.buffer
         for raw in iter(proc.stdout.readline, b""):
             text = raw.decode(errors="replace").strip()
@@ -355,6 +387,9 @@ def _attempt(host, top, head, env, extra, cmd, mark, wrap, wait) -> tuple[int, s
             if text.startswith(mark) and text[len(mark):].isdigit():
                 rc = int(text[len(mark):])
                 held = b""   # the blank line printed before the marker is ours
+                continue
+            if text == mark + WRAP_REFUSED:
+                wrap_refused, held = True, b""
                 continue
             if text in (mark + NO_WRAP, mark + NO_ENV):
                 no_wrap, held = text[len(mark):], b""
@@ -377,6 +412,10 @@ def _attempt(host, top, head, env, extra, cmd, mark, wrap, wait) -> tuple[int, s
             if proc.returncode == 255 and refused:
                 return FAULT_RC, why
             return _fault(host, why), ""
+        if rc == FAULT_RC and wrap_refused:
+            return _fault(host, f"the spill wrapper {wrap[0]!r} refused the run there (exit {FAULT_RC} and "
+                                f"{WRAP_REFUSED_ENV}; its reason, if any, is above), so the check did not run "
+                                "there"), ""
         if rc == FAULT_RC:
             _say(f"the command exited {FAULT_RC}; reported as 1, so it does not read as an unreachable host")
             return 1, ""

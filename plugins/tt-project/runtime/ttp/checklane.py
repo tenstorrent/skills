@@ -17,7 +17,7 @@ heavy checks of a project run at once, in task-priority order (#4065's order; on
 one-at-a-time slot). Lanes are per repository under check (testslots.repo_key), so checks of unrelated
 repos never share them. `checks.slots` sets it (project, then account, then TTP_CHECKS_SLOTS); unset, it
 follows the host now (capacity(), read again at every admission): the runs already holding a lane plus
-as many more as the spare cores (cores less the 1-minute load average) and the available memory fit,
+as many more as the spare cores (cores less the CPU demand, checkcap._load) and the available memory fit,
 at one run's cores (its test grant, at least CORES_PER_LANE) and GIB_PER_LANE each, at most the runs
 the cores hold; never below default_slots(), its floor: the runs its test pool fits side by side, at
 least 2 (each run is isolated: its own clean checkout, scratch, output folder and port block,
@@ -93,7 +93,7 @@ LIGHT_CMDS = (
     "ruff check", "ruff format --check", "black --check", "isort --check-only", "isort --check",
     "flake8", "pyflakes", "pycodestyle", "git diff --check", "shellcheck", "bash -n", "sh -n",
     "yamllint", "jq", "json_pp", "xmllint --noout", "clang-format --dry-run", "gofmt -l",
-    "prettier --check", "markdownlint",
+    "prettier --check", "markdownlint", "claude plugin validate",
 )
 CORES_PER_LANE = 8
 GIB_PER_LANE = 8
@@ -210,7 +210,7 @@ def run_cores(cfg: dict | None = None, n_cores: int | None = None) -> int:
 def capacity(cfg: dict | None = None, held: int = 0, n_cores: int | None = None, load: float | None = None,
              mem_gib: float | None = None, used: int | None = None) -> dict:
     """The lanes of one repository the host runs now with checks.slots unset (above): `held` running plus
-    the runs its spare cores (cores less the 1-minute load average, which counts the running ones) and
+    the runs its spare cores (cores less the CPU demand, checkcap._load, which counts the running ones) and
     available memory fit, at one run's cores (`run_cores`: its test grant, testslots.sizes, at least
     CORES_PER_LANE) and GIB_PER_LANE each; at most `top` (the runs the cores hold, and the runs the test pool
     fills at a full grant: testslots.pool_now with `used` of its slots held, over run_max), never below
@@ -590,17 +590,36 @@ def all_light(cmds: list, cfg: dict | None, declared=()) -> bool:
 
 
 def run_class(cmds: list, cfg: dict | None = None) -> int:
-    """LIGHT, OTHER or SUITE: the costliest of `cmds` (a test runner or build word anywhere is SUITE)."""
+    """LIGHT, OTHER or SUITE: the costliest of `cmds` (a test runner or build word anywhere, a shell's -c
+    script included, is SUITE)."""
     pats, out = light_patterns(cfg), LIGHT
     for c in cmds:
         if is_light(str(c), pats):
             continue
-        try:
-            words = [_word(w) for seg in testslots._segments(str(c)) for _, _, w in seg]
-        except (ValueError, IndexError):
-            words = []
-        out = max(out, SUITE if _SUITE_WORDS & set(words) else OTHER)
+        out = max(out, SUITE if _SUITE_WORDS & _words(str(c)) else OTHER)
     return out
+
+
+def _words(c: str, depth: int = 0) -> set[str]:
+    """The words of command line `c`, with those of a shell's -c script (`sh -c "pytest ... && claude ..."`,
+    `bash -lc ...`) read the same way checkspill.needs_cli reads them."""
+    from .checkspill import _SHELLS
+    try:
+        segs = testslots._segments(c)
+    except (ValueError, IndexError):
+        return set()
+    got = set()
+    for seg in segs:
+        words = [w for _, _, w in seg]
+        got.update(map(_word, words))
+        i = 0
+        while i < len(words) and (re.match(r"[A-Za-z_]\w*=|-|\d", words[i]) or testslots._base(words[i]) in testslots._WRAPPERS):
+            i += 1
+        if depth < 3 and i < len(words) and testslots._base(words[i]) in _SHELLS:
+            opt = next((j for j in range(i + 1, len(words)) if re.fullmatch(r"-[a-z]*c[a-z]*", words[j])), None)
+            if opt is not None and opt + 1 < len(words):
+                got |= _words(words[opt + 1], depth + 1)
+    return got
 
 
 def median_s(state: Path | None, key: str) -> float | None:
@@ -883,11 +902,7 @@ def _stalled(rec: dict, now: float, cfg: dict | None = None) -> str:
 
 
 def _ticket_task(t: Path) -> str:
-    try:
-        m = re.search(r"task #(\d+)", t.read_text())
-    except OSError:
-        return ""
-    return m.group(1) if m else ""
+    return locks.ticket_task(t)
 
 
 def waits(project_name: str, cfg: dict | None, now: float | None = None, over_s: float = 0.0) -> list[dict]:
@@ -1061,9 +1076,9 @@ def wake_text(why: list[str], events: list[dict], inc: dict, cfg: dict | None, n
 
 
 def _load_text() -> str:
-    """The host's 1-minute load on its cores for a person ("1-minute load 63.2 on 64 cores")."""
+    """The host's CPU demand on its cores for a person ("CPU demand 63.2 cores on 64 cores")."""
     ld, c = checkcap._load(), checkcap.cores()
-    return (f"1-minute load {ld:.1f} on {c} cores" if ld == ld and ld != float("inf")
+    return (f"CPU demand {ld:.1f} cores on {c} cores" if ld == ld and ld != float("inf")
             else f"load unknown, {c} cores")
 
 
@@ -1095,6 +1110,18 @@ def _precheck_of(text) -> str:
     """The run folder name (t<task>-<head>) of a daemon review precheck's lane label, else ''."""
     m = re.search(r"\brun (?:precheck-)?(t\d+-[0-9a-f]{7,40})\b", str(text or ""))
     return m.group(1) if m else ""
+
+
+def run_owners(project_name: str, run) -> list[dict]:
+    """The owner fields (checkcap.OWNER_KEYS) of project `project_name`'s lane holders whose run is `run`, as
+    lane_status names it: the run folder's name, also for checks the daemon started again under another
+    run_id (relaunch-t<task>). `ttp checks --preempt` finds that run's host-wide slot by them."""
+    out = []
+    for base in testslots.suite_bases(project_name):
+        for r in locks.holder_records(testslots._lanes_of(base)):
+            if str(run) and _run_of(r.get("holder")) == str(run) and r.get("pid"):
+                out.append({k: r.get(k) for k in checkcap.OWNER_KEYS})
+    return out
 
 
 def _run_of(text: str) -> str:
@@ -1130,7 +1157,7 @@ def lane_status(project_name: str, now: float | None = None, cfg: dict | None = 
         for r in recs[base]:
             t = holder_times(r, now)
             running = t["running_s"]
-            lanes.append({"task": str(r.get("task") or ""), "run": _run_of(r.get("holder")), "pid": r.get("pid"),
+            lanes.append({"task": _holder_task(r), "run": _run_of(r.get("holder")), "pid": r.get("pid"),
                           "priority": r.get("priority"), "age_s": t["held_s"], "queued_s": t["queued_s"],
                           "alive": r.get("alive"), "children": t["children"],
                           "running_s": running, "cap_s": float(r.get("cap_s") or 0),
@@ -1162,6 +1189,12 @@ def lane_status(project_name: str, now: float | None = None, cfg: dict | None = 
                         "kind": "wrapper lock" if key.startswith("w") else "repository" if key else "project",
                         "lanes": lanes, "waiters": waiters})
     return out
+
+
+def _holder_task(rec: dict) -> str:
+    """The task a lane holder runs for: its "task" field, else its run record's task_id (locks.run_ids)."""
+    task = str(rec.get("task") or rec.get("task_id") or "")
+    return task if task.isdigit() else ""
 
 
 def _why(text) -> str:

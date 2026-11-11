@@ -296,3 +296,28 @@ def test_web_api_config_empty_removes_and_a_mistyped_value_is_refused(env):
     assert "provider_failover_to" not in (p.raw_config().get("coordinator") or {})
     assert "daily_usd" not in (p.raw_config().get("budget") or {})
     assert post({"key": "budget.daily_usd", "value": ""}) == (200, {"ok": True, "removed": False})
+
+
+def test_an_unset_weekly_cap_is_seven_days_at_the_daily_cap_and_a_set_one_is_kept(env, capsys):
+    """An unset budget.weekly_usd once sat at $200 under a $300 daily cap and stopped work first. Unset,
+    it is now 7 times the daily cap in force (account or project); a weekly cap someone set is kept as
+    set, and `ttp config` warns when it is below the daily cap."""
+    from ttp import cli
+    from ttp.project import weekly_below_daily
+    p = make(env)
+    assert p.config()["budget"]["weekly_usd"] == 7 * p.config()["budget"]["daily_usd"]
+    cli.main(["config", "demo", "budget.daily_usd", "300"])
+    assert p.config()["budget"]["weekly_usd"] == 2100.0
+    assert "weekly_usd" not in p.raw_config()["budget"], "the default is computed, never written"
+    capsys.readouterr()
+    cli.main(["config", "demo", "budget.weekly_usd", "200"])
+    err = capsys.readouterr().err
+    assert "warning: budget.weekly_usd $200 is below budget.daily_usd $300" in err, err
+    assert p.config()["budget"]["weekly_usd"] == 200.0, "a set value is kept"
+    cli.main(["config", "demo", "budget.weekly_usd", "0"])
+    assert p.config()["budget"]["weekly_usd"] == 0, "0 (no weekly cap) is a set value too"
+    assert not weekly_below_daily(p.config()["budget"]), "no weekly cap is never below the daily one"
+    cli.main(["config", "demo", "budget.weekly_usd", "5000"])
+    assert "warning" not in capsys.readouterr().err
+    assert weekly_below_daily({"daily_usd": 300, "weekly_usd": 200})
+    assert not weekly_below_daily({"daily_usd": 0, "weekly_usd": 200}), "no daily cap: nothing to compare"

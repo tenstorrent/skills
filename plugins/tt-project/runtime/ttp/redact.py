@@ -11,14 +11,17 @@ becomes `[secret:<slot>]`, e.g. `[secret:endpoint/tt-cloud]`. One helper for eve
 - the database (Db.x): event, note, notify, message and hand-off text, so every `ttp` command and the
   chat relay that read it back never show a value;
 - a run's folder and its agent's own session transcript once the run ends (scrub_run: the runner,
-  and the daemon again before it reads the hand-off);
+  and the daemon again before it reads the hand-off, within STEP_FILE_BYTES per file and STEP_SCRUB_S
+  per run: what is left over is masked by a detached job, scrub_later);
 - text sent to a helper model or service (Jev, Slack) and endpoint client errors.
 
 Every private-key block (PEM, from its `BEGIN <type> PRIVATE KEY` line to its END line, PGP PRIVATE KEY
-BLOCK) becomes KEY_MASK the same way, stored or not, raw or JSON-escaped; one cut off before its END
-line (a lone BEGIN line too) is masked to the end of its string (the first character a key body never
-holds, such as the quote closing a JSON string), so JSONL stays valid; a lone END line is masked with
-the base64 lines right above it (a block whose start output trimming cut off).
+BLOCK) becomes KEY_MASK the same way, stored or not, raw or JSON-escaped. One cut off before its END
+line (a lone BEGIN line too) is masked: in raw text through the last key line after it (base64, or a
+header such as `Proc-Type: 4,ENCRYPTED`), so prose after a quoted marker line stays; inside a
+JSON-escaped string to the end of that string (the first character a key body never holds, such as the
+quote closing it), so JSONL stays valid. A lone END line is masked with the base64 lines right above it
+(a block whose start output trimming cut off).
 
 Nothing here prints or logs a value: callers get the masked text, or a count.
 """
@@ -27,21 +30,41 @@ from __future__ import annotations
 import json
 import os
 import re
+import subprocess
+import sys
+import time
 from pathlib import Path
 from typing import Any
 
 MIN_LEN = 8                      # shorter values would mask ordinary words
 SECRET_FIELD_RE = re.compile(r"key|token|secret|passw", re.I)
-MAX_FILE_BYTES = 256 << 20       # a run file bigger than this is left alone (never seen in practice)
+MAX_FILE_BYTES = 256 << 20       # a run file bigger than this is left alone, and named (never seen in practice)
+# Inside a daemon step (a run's end, the detached-job sweep): a file bigger than this, and every file not
+# reached within STEP_SCRUB_S of a run's scrub, is masked by a detached job (scrub_later), never read there.
+STEP_FILE_BYTES = 8 << 20
+STEP_SCRUB_S = 10.0
+SESSION_HEAD_BYTES = 4 << 20     # session_id reads no more of a run's output than this
 BUILTIN = ("jev", "slack")       # slots whose other fields (via, user_id, url) are not secret
-_cache: dict[str, Any] = {"sig": None, "pairs": []}
+_cache: dict[str, Any] = {"sig": None, "pairs": [], "error": None, "ever": False}
 KEY_MASK = "[private key redacted]"
 _KEY_TYPE = r"(?:[A-Z0-9]+ )*PRIVATE KEY(?: BLOCK)?"
 # A key body: base64, PEM and PGP armor headers (Proc-Type, DEK-Info, Version, Comment) and line ends,
 # raw or JSON-escaped (once or more: JSON in a JSON string); never a quote or a lone backslash.
 _KEY_BODY = r"(?:[A-Za-z0-9+/=:,.()\- \t\r\n]|\\+[nrt/]|\\+u[0-9a-fA-F]{4})"
-_KEY_RE = (rf"-{{4,5}} ?BEGIN {_KEY_TYPE} ?-{{4,5}}{_KEY_BODY}*?"
-           rf"(?:-{{4,5}} ?END {_KEY_TYPE} ?-{{4,5}}|(?!{_KEY_BODY}))")
+# Cut off inside a JSON-escaped string (an escaped line end after BEGIN): to the end of that string.
+_ESC_BODY = r"(?:[A-Za-z0-9+/=:,.()\- \t]|\\+[nrt/]|\\+u[0-9a-fA-F]{4})"
+_ESC_CUT = rf"{_ESC_BODY}*?\\+n{_ESC_BODY}*(?!{_ESC_BODY})"
+# Cut off in raw text: base64 on the BEGIN line, then each line that looks like a key line: base64 (a
+# partial one when cut mid-line: 16 or more of it) or a header (Name: value), after a line number as
+# `cat -n` or a file viewer prints it, if any; blank lines only before another key line. Prose stops it.
+# Each line matches one way only (spaces never split between two parts), so a failing line costs linear time.
+_B64 = r"[A-Za-z0-9+/=]"
+_LINE_START = r"\r?\n[ \t]*(?:[0-9]+(?:\t|\u2192)[ \t]*)?"
+_RAW_BLANK = rf"{_LINE_START}(?=\r?\n)"
+_RAW_LINE = rf"{_LINE_START}(?:{_B64}+[ \t]*(?=\r?\n|\Z)|{_B64}{{16,}}|[A-Za-z][A-Za-z0-9-]*:[ \t][^\r\n\"'`\\]*)"
+_RAW_CUT = rf"(?:[ \t]+{_B64}{{16,}})*(?:[ \t]+(?=\r?\n))?(?:(?:{_RAW_BLANK})*{_RAW_LINE})*"
+_KEY_RE = (rf"-{{4,5}} ?BEGIN {_KEY_TYPE} ?-{{4,5}}"
+           rf"(?:{_KEY_BODY}*?-{{4,5}} ?END {_KEY_TYPE} ?-{{4,5}}|{_ESC_CUT}|{_RAW_CUT})")
 KEY_RE = re.compile(_KEY_RE)
 _KEY_END_RE = re.compile(rf"-{{4,5}} ?END {_KEY_TYPE} ?-{{4,5}}")
 # One base64 line, raw or JSON-escaped, from a line start (or the text's) to its line end last.
@@ -52,14 +75,6 @@ def custom(slot: str) -> bool:
     """A slot `ttp secret set` or `generate` made: every string in it is secret."""
     from .endpoint import PREFIX
     return slot not in BUILTIN and not slot.startswith(PREFIX)
-
-
-def _sig(path: Path):
-    try:
-        st = path.stat()
-    except OSError:
-        return None
-    return (str(path), st.st_mtime_ns, st.st_size, st.st_ino)
 
 
 def _collect(slot: str, v: Any, field: str, out: list[tuple[str, str]], every: bool = False) -> None:
@@ -77,23 +92,39 @@ def pairs() -> list[tuple[str, str]]:
     """(value, slot) for every stored secret, longest first so a value inside another is masked whole.
     Re-read only when the store changes. Never raises: every DB write and daemon log line calls this,
     so a store it cannot read or parse (wrong owner or mode, a folder, bad bytes, not a JSON object)
-    keeps the last good pairs (none if never read) and is read again on the next call."""
-    from .project import load_secrets, secrets_path
+    keeps the last good pairs (none if never read) and is read again on the next call. Why that read
+    failed stays in store_error() until a read succeeds: masking that must not fail open (a run's last
+    scrub, an outbound scan) checks it and blind()."""
+    from .project import SecretsUnreadable, load_secrets
+    from . import secretstore
     try:
-        sig = _sig(secrets_path())
+        sig = secretstore.signature()   # the file's stat, or a time bucket for a keychain or fetched store
         if sig == _cache["sig"]:
             return _cache["pairs"]
         data = load_secrets() if sig else {}
         if not isinstance(data, dict):
+            _cache["error"] = "the secrets store is not a JSON object"
             return _cache["pairs"]
         out: list[tuple[str, str]] = []
         for slot, v in data.items():
             _collect(str(slot), v, "key" if isinstance(v, str) else "", out, custom(str(slot)))
-    except Exception:
+    except Exception as e:   # a SecretsUnreadable names a path or a command, never a value
+        _cache["error"] = str(e)[:300] if isinstance(e, SecretsUnreadable) else type(e).__name__
         return _cache["pairs"]
     _cache["pairs"] = sorted(set(out), key=lambda p: -len(p[0]))
-    _cache["sig"] = sig
+    _cache.update(sig=sig, error=None, ever=True)
     return _cache["pairs"]
+
+
+def store_error() -> str | None:
+    """Why the latest read of the secrets store failed (read again if due), or None once one succeeds."""
+    pairs()
+    return _cache["error"]
+
+
+def blind() -> bool:
+    """The store cannot be read and no value was ever read in this process: masking masks nothing."""
+    return bool(store_error()) and not _cache["ever"]
 
 
 def mask(slot: str) -> str:
@@ -155,14 +186,23 @@ def _variants(value: str) -> list[str]:
     return [value] if esc == value else [value, esc]
 
 
-def scrub_file(path: Path) -> int:
+def scrub_file(path: Path, cap: int = MAX_FILE_BYTES, left: list | None = None) -> int:
     """Masks every private-key block and stored secret value in the file, rewritten whole (same mode)
-    only when one is in it. Returns how many it masked; 0 for a missing, unreadable or oversized file."""
+    only when one is in it. Returns how many it masked; 0 for a missing, unreadable or oversized file.
+    It reads at most `cap` bytes: a bigger file is added to `left` (scrub_later, or named by the caller)."""
     found = pairs()
+    path = Path(path)
     try:
-        if not path.is_file() or path.is_symlink() or path.stat().st_size > MAX_FILE_BYTES:
+        if not path.is_file() or path.is_symlink():
             return 0
-        data = path.read_bytes()
+        data = None
+        if path.stat().st_size <= cap:
+            with open(path, "rb") as f:
+                data = f.read(cap + 1)
+        if data is None or len(data) > cap:   # over the cap, or grown past it since
+            if left is not None:
+                left.append(path)
+            return 0
     except OSError:
         return 0
     n = 0
@@ -188,32 +228,68 @@ def session_id(output: Path) -> str:
     """The agent's session id from the start of a run's output (Claude `session_id`, Codex `thread_id`)."""
     try:
         with open(output, "rb") as f:
-            for _ in range(50):
-                line = f.readline()
-                if not line:
-                    break
-                m = re.search(rb'"(?:session_id|thread_id)"\s*:\s*"([A-Za-z0-9-]{8,80})"', line)
-                if m:
-                    return m.group(1).decode()
+            head = f.read(SESSION_HEAD_BYTES)
     except OSError:
-        pass
+        return ""
+    for line in head.split(b"\n", 50)[:50]:
+        m = re.search(rb'"(?:session_id|thread_id)"\s*:\s*"([A-Za-z0-9-]{8,80})"', line)
+        if m:
+            return m.group(1).decode()
     return ""
 
 
-def scrub_run(run_dir: Path) -> int:
-    """Masks private keys and stored secrets in every file of a finished run's folder (output, logs,
-    hand-off) and in the agent's own session transcript for that run. Returns how many it masked; safe
-    to run twice."""
-    run_dir = Path(run_dir)
-    n = 0
-    try:
-        files = [f for f in run_dir.rglob("*") if f.is_file() and not f.is_symlink()]
-    except OSError:
-        files = []
+# A started or queued job in a run's folder (`ttp detach`: <name>.started or .queued; `ttp checks --detach`:
+# checks.pid) that has neither <name>.rc nor <name>.lost yet still writes <name>.log and <name>.out.
+_JOB_MARKS = (".started", ".queued")
+
+
+def live_job_logs(files: list[Path]) -> set[Path]:
+    """The logs among a folder's `files` a detached job still writes. A rewrite renames a new file over
+    one, so the job's later lines would go to the old, unlinked file: they are left for detach.close."""
+    out: set[Path] = set()
     for f in files:
-        n += scrub_file(f)
+        if f.suffix in _JOB_MARKS or f.name == "checks.pid":
+            stem = f.name[:-len(f.suffix)]
+            if not f.with_name(stem + ".rc").exists() and not f.with_name(stem + ".lost").exists():
+                out |= {f.with_name(stem + ".log"), f.with_name(stem + ".out")}
+    return out
+
+
+def scrub_run(run_dir: Path, step: bool = False, left: list | None = None) -> int:
+    """Masks private keys and stored secrets in every file of a finished run's folder (output, logs,
+    hand-off) but the logs a detached job still writes (live_job_logs), and in the agent's own session
+    transcript for that run. Returns how many it masked; safe to run twice.
+
+    The files it did not mask go to `left`: each over MAX_FILE_BYTES, and in a daemon `step` each over
+    STEP_FILE_BYTES, or, once past STEP_SCRUB_S, the folder itself in place of all of them; for scrub_later."""
+    run_dir = Path(run_dir)
+    cap, until = (STEP_FILE_BYTES, time.monotonic() + STEP_SCRUB_S) if step else (MAX_FILE_BYTES, None)
+    left = [] if left is None else left
+    n, files, start = 0, [], len(left)
+
+    def out_of_time() -> bool:   # then the detached job takes the whole folder (scrub_run again: safe twice)
+        if until is None or time.monotonic() <= until:
+            return False
+        del left[start:]
+        left.append(run_dir)
+        return True
     try:
-        spec = json.loads((run_dir / "run.json").read_text())
+        for f in run_dir.rglob("*"):
+            if out_of_time():
+                return n
+            if f.is_file() and not f.is_symlink():
+                files.append(f)
+        live = live_job_logs(files)
+    except OSError:
+        files, live = [], set()
+    for f in files:
+        if out_of_time():
+            return n
+        if f not in live:
+            n += scrub_file(f, cap, left)
+    try:
+        with open(run_dir / "run.json", "rb") as f:
+            spec = json.loads(f.read(cap))
     except (OSError, ValueError):
         spec = {}
     sid = session_id(run_dir / "output.jsonl")
@@ -225,8 +301,35 @@ def scrub_run(run_dir: Path) -> int:
         except Exception:
             paths = []
         for p in paths:
-            n += scrub_file(p)
+            if out_of_time():
+                return n
+            n += scrub_file(p, cap, left)
     return n
+
+
+def scrub_later(paths: list, log: Path) -> int | None:
+    """Masks `paths` (files, or a run's folder: scrub_run) in a detached `python -m ttp.redact` job with
+    no size cap or time limit, outside the daemon's tick; its counts, and any file it still had to leave
+    (over MAX_FILE_BYTES), go to `log`. The job's pid, or None when it could not start."""
+    if not paths:
+        return None
+    runtime = str(Path(__file__).resolve().parent.parent)
+    try:
+        with open(log, "ab") as out:   # own session: the masking job outlives the daemon tick that starts it
+            return subprocess.Popen([sys.executable, "-m", "ttp.redact", *map(str, paths)], cwd=runtime,
+                                    env={**os.environ, "PYTHONPATH": runtime}, stdin=subprocess.DEVNULL,
+                                    stdout=out, stderr=out, start_new_session=True).pid
+    except OSError:
+        return None
+
+
+def main(argv: list[str]) -> int:
+    left: list = []
+    n = sum(scrub_run(Path(a), left=left) if Path(a).is_dir() else scrub_file(Path(a), left=left) for a in argv)
+    print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} redact: masked {n} in {len(argv)} path(s)", flush=True)
+    for f in left:
+        print(f"redact: not masked, over {MAX_FILE_BYTES >> 20} MiB: {f}", flush=True)
+    return 1 if left else 0
 
 
 def private_dir(path: Path) -> Path:
@@ -235,3 +338,7 @@ def private_dir(path: Path) -> Path:
     path.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(path, 0o700)
     return path
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

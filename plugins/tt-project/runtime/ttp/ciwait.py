@@ -7,7 +7,8 @@ of their jobs has been in progress more than `factor` times the median duration 
 branch's recent successful runs (never under `floor_min`; `default_min` when neither the branch nor
 the repo has a finished run of it). Without that, a hung job keeps the task asleep until GitHub's
 6 h job limit. 1 while the runs go on normally or none exists yet; 75 when gh cannot answer (a
-network blip: "not yet"). One line per run says why, so the woken task runs it again and reports a
+network blip: "not yet"); 4 (gh's own code) when gh is not logged in: a broken probe, never "not yet",
+and the host-wide gh login check (ghauth) is asked to look now. One line per run says why, so the woken task runs it again and reports a
 `hung` line. `--no-hang` waits for completion only (for a task that saw the hang and still waits).
 """
 from __future__ import annotations
@@ -18,6 +19,8 @@ import subprocess
 import time
 from datetime import datetime
 
+from . import ghauth
+
 FACTOR = 3.0
 FLOOR_MIN = 10.0     # a job is never called hung before this, however short it usually is
 DEFAULT_MIN = 90.0   # the limit when no finished run of the workflow is known
@@ -25,11 +28,17 @@ HISTORY_RUNS = 3     # successful runs per workflow whose jobs make the median
 RUN_FIELDS = "databaseId,status,conclusion,headSha,workflowName,url,createdAt"
 
 
+class LoggedOut(Exception):
+    """gh failed for want of a login: no later call can answer either."""
+
+
 def _gh(args: list[str]) -> list | dict | None:
     try:
         out = subprocess.run(["gh", *args], capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL)
     except (OSError, subprocess.SubprocessError):
         return None
+    if ghauth.auth_failed(out.returncode, out.stderr):
+        raise LoggedOut((out.stderr.strip().splitlines() or [f"exit {out.returncode}"])[0][:200])
     if out.returncode != 0:
         return None
     try:
@@ -155,6 +164,14 @@ def history(repo: str | None, branch: str | None, workflows: set, skip: set) -> 
 
 def probe(repo: str | None = None, branch: str | None = None, sha: str | None = None, workflow: str | None = None,
           run: str | None = None, hang: bool = True, **kw) -> tuple[int, list[str]]:
+    try:
+        return _probe(repo, branch, sha, workflow, run, hang, **kw)
+    except LoggedOut as e:
+        ghauth.nudge()
+        return ghauth.AUTH_RC, [f"broken: gh is not logged in on this host ({e}); the user runs `gh auth login`"]
+
+
+def _probe(repo, branch, sha, workflow, run, hang, **kw) -> tuple[int, list[str]]:
     if run:
         one = _gh(["run", "view", str(run), *_repo(repo), "--json", RUN_FIELDS + ",headBranch"])
         if one is None:

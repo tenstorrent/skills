@@ -31,8 +31,8 @@ harness task comes, for up to a day; `digest_lines`). The daily review's efficie
 correction of the last 24 h and the task that fixed its class, or none, and counts the repeated
 instructions (`audit_line`).
 
-A worker's result rows that name a model or effort (`metrics`, or a `tried`, `cells` or `results` row
-with its `run`) carry what that run used, read from its runs row (`check_claims`); a mismatch is
+A worker's result rows that name an LLM model (`llm_model`, or `model` when it names one) or an effort
+(`metrics`, or a `tried`, `cells` or `results` row with its `run`) carry what that run used, read from its runs row (`check_claims`); a mismatch is
 flagged in the result and the hand-off's digest notes."""
 from __future__ import annotations
 
@@ -141,6 +141,10 @@ COMMON_MIN = 5
 _URL = re.compile(r"\b(?:https?://|www\.)\S+|\b[\w-]+(?:\.[\w-]+)+/\S*", re.I)
 _ASK_CITE = re.compile(r"\bask\s*[#:]\s*(\d+)\b", re.I)   # a record naming the ask it answered
 CLAIM_KEYS = ("tried", "cells", "results", "rows")   # hand-off fields whose dict rows may name a run
+LLM_KEY = "llm_model"   # a row's LLM, always compared with its run's model; `model` only when it names an LLM
+# Words of model ids that name no family (a version, size or mode): never what makes a value an LLM's.
+_NOT_FAMILY = frozenset("latest preview auto default mini nano pro max ultra fast high low medium turbo thinking "
+                        "reasoning chat instruct base large small lite flash".split())
 
 
 def phrase(text: str) -> str:
@@ -695,9 +699,27 @@ def _run_id(v) -> int | None:
     return int(m.group(1)) if m else None
 
 
+def _llm_families(db: DB) -> frozenset:
+    """The model family words the harness knows: from the price table, the providers' tier defaults and
+    every model this project's runs recorded (so a provider's new model counts once it has run)."""
+    from . import localspend, project   # lazily: both import more of the runtime
+    ids = [*localspend.PRICES, *(t.get("model") for prov in project.DEFAULT_CONFIG["providers"].values()
+                                 for t in (prov.get("tiers") or {}).values() if isinstance(t, dict)),
+           *(r["model"] for r in db.q("SELECT DISTINCT model FROM runs WHERE model IS NOT NULL AND model != ''"))]
+    return frozenset(w for i in ids for w in re.findall(r"[a-z]+", str(i or "").lower())
+                     if len(w) >= 3 and w not in _NOT_FAMILY)
+
+
+def _names_llm(value: str, families: frozenset) -> bool:
+    """Whether `value` names an LLM or provider model (not a deliverable's own model, such as a video model)."""
+    low = value.lower()
+    return bool(_MODEL.search(low)) or any(w in families for w in re.findall(r"[a-z]+", low))
+
+
 def check_claims(db: DB, result, run_id: int | None) -> tuple:
-    """(result, lines): a worker's result rows that name a `model` or `effort` given what the run used,
-    read from its runs row. The hand-off's `metrics` speak for its own run (`run_id`) unless they name a
+    """(result, lines): a worker's result rows that name an LLM model (LLM_KEY, or `model` when it names an
+    LLM or provider model: a video model under `model` is the deliverable's) or an `effort`, given what the
+    run used, read from its runs row. The hand-off's `metrics` speak for its own run (`run_id`) unless they name a
     `run`; a dict row of CLAIM_KEYS (a list, or a dict of rows such as `cells`) is checked only when it
     names its `run`. Each checked row gets `used` {model, effort} (the metrics: `metrics_used`); each mismatch a line, also kept in
     the result's `claim_mismatch`. A run with no record of the field is unknown, never a mismatch."""
@@ -712,8 +734,10 @@ def check_claims(db: DB, result, run_id: int | None) -> tuple:
         for name, row in items:
             if isinstance(row, dict) and "run" in row:
                 rows.append((f"{key}[{name!r}]" if isinstance(name, str) else f"{key}[{name}]", row, _run_id(row["run"])))
-    rows = [(w, r, rid) for w, r, rid in rows if rid and any(isinstance(r.get(k), str) and r[k].strip()
-                                                             for k in ("model", "effort"))]
+    said = lambda r, k: isinstance(r.get(k), str) and bool(r[k].strip())
+    families = _llm_families(db) if any(rid and said(r, "model") for _, r, rid in rows) else frozenset()
+    llm = lambda r: [k for k in (LLM_KEY, "model") if said(r, k) and (k == LLM_KEY or _names_llm(r[k], families))]
+    rows = [(w, r, rid) for w, r, rid in rows if rid and (said(r, "effort") or llm(r))]
     if not rows:
         return result, []
     have = {int(r["id"]): r for r in db.q(f"SELECT id, model, effort FROM runs WHERE id IN "
@@ -728,12 +752,11 @@ def check_claims(db: DB, result, run_id: int | None) -> tuple:
         else:
             row["used"] = used
         bad = []
-        if isinstance(row.get("effort"), str) and row["effort"].strip() and used["effort"] \
+        if said(row, "effort") and used["effort"] \
                 and _norm_effort(row["effort"]) != _norm_effort(used["effort"]):
             bad.append(f"effort {row['effort']!r}, run #{rid} recorded {used['effort']!r}")
-        if isinstance(row.get("model"), str) and row["model"].strip() and used["model"] \
-                and not _model_ok(row["model"], used["model"]):
-            bad.append(f"model {row['model']!r}, run #{rid} recorded {used['model']!r}")
+        bad += [f"{k} {row[k]!r}, run #{rid} recorded {used['model']!r}" for k in llm(row)
+                if used["model"] and not _model_ok(row[k], used["model"])]
         if bad:
             lines.append(f"result check: {where} claims " + " and ".join(bad)
                          + ": the row reports a run that did not use what it names; correct it or rerun")

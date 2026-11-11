@@ -22,6 +22,7 @@ def _no_sandbox_tools(monkeypatch):
     monkeypatch.setenv(sandbox.ENV, "1")
     monkeypatch.setattr(sandbox, "_STATE", {})
     monkeypatch.setattr(sandbox, "inside", lambda: False)
+    monkeypatch.setattr(sandbox.sys, "platform", "linux")   # on macOS the probe stops at "need Linux" first
     which = shutil.which
     monkeypatch.setattr(sandbox.shutil, "which", lambda name, *a, **k: None if name in ("unshare", "bwrap") else which(name, *a, **k))
     return sandbox
@@ -494,7 +495,8 @@ def test_drop_xdist_takes_out_worker_options_only_where_xdist_is_missing(tmp_pat
 def test_ttp_sandbox_and_clip_run_pytest_without_n_where_xdist_is_missing(tmp_path, tool):
     runtime = pathlib.Path(__import__("ttp").__file__).resolve().parent.parent
     env = {**os.environ, "PYTHONPATH": str(runtime)}
-    env.pop("TTP_RUN_DIR", None)
+    for var in ("TTP_RUN_DIR", "TTP_TEST_SLOTS"):   # outside a worker's run: no host test slots taken
+        env.pop(var, None)
     for rc, args in ((3, "-m pytest -q t.py"), (0, "-m pytest -q -n 4 t.py")):
         py = _fake_xdist_python(tmp_path, rc)
         r = subprocess.run([sys.executable, "-m", "ttp", tool, "--", py, "-m", "pytest", "-q", "-n", "4", "t.py"],

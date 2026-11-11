@@ -1,0 +1,96 @@
+#!/bin/sh
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+# SPDX-License-Identifier: Apache-2.0
+# tt-project ssh wrapper: the real ssh further down PATH, sharing one connection per host (OpenSSH
+# multiplexing), so probes, checks and workers that ssh to the same host many times authenticate
+# once (an ssh agent signs once, not per command). Options added before the caller's, which wins on
+# none of them: ControlMaster=auto, ControlPath=<dir>/%C, ControlPersist=600, ServerAliveInterval=15,
+# ServerAliveCountMax=3 (a dead shared connection ends within a minute instead of hanging).
+# <dir> is $TTP_SSH_CM_DIR, else ~/.tt-project/cm (mode 700), else /tmp/ttp-cm-<uid> when the home path
+# is too long for a socket path (104 bytes with its NUL on macOS: <dir>/ + 40 for %C + a 17-character
+# suffix ssh adds while it binds leaves 45 for <dir>).
+# The user's ~/.ssh is never read or written here; -F, ProxyJump and BatchMode pass through.
+# Left as is: TTP_SSH_REUSE=0 (config ssh.reuse off); a call that sets its own sharing (-S, -M, -O,
+# ControlMaster, ControlPath) or forwards ports or stdio (-L -R -D -W -w -N -f: a forward added to a
+# shared connection would outlive the command); -v (a verbose master keeps the caller's stderr open for
+# its 10 minutes, so a captured call would hang); -G, -V, -Q.
+# The real ssh replaces this script (exec), so the caller's pid is ssh's own: a kill of the caller
+# (SIGTERM, a timeout's SIGKILL) stops ssh and its remote command, never only the wrapper. A shared
+# connection that fails before the command starts is OpenSSH's own to handle: with ControlMaster=auto
+# it removes a stale socket and connects directly. A file in the folder that is no socket (ssh would
+# then run unshared on every call) is removed before ssh starts.
+set -f
+real=
+ifs=$IFS
+IFS=:
+for d in $PATH; do
+    if [ -n "$d" ] && [ -x "$d/ssh" ] && ! [ "$d/ssh" -ef "$0" ]; then
+        first=
+        IFS= read -r first < "$d/ssh" 2>/dev/null
+        case $first in
+        '#!'*) ! grep -qsF '# tt-project ssh wrapper' "$d/ssh" || continue ;;
+        esac
+        real=$d/ssh
+        break
+    fi
+done
+IFS=$ifs
+if [ -z "$real" ]; then
+    for c in /usr/bin/ssh /usr/local/bin/ssh /opt/homebrew/bin/ssh; do
+        [ -x "$c" ] && { real=$c; break; }
+    done
+fi
+if [ -z "$real" ]; then
+    echo "ssh: not found on PATH" >&2
+    exit 127
+fi
+[ "${TTP_SSH_REUSE:-1}" = 0 ] && exec "$real" "$@"
+ctl() {
+    case $1 in
+    [Cc][Oo][Nn][Tt][Rr][Oo][Ll][Mm][Aa][Ss][Tt][Ee][Rr]*|[Cc][Oo][Nn][Tt][Rr][Oo][Ll][Pp][Aa][Tt][Hh]*) return 0 ;;
+    esac
+    return 1
+}
+# The options before the destination: the remote command's words are never read as ssh's.
+want=
+for a in "$@"; do
+    if [ -n "$want" ]; then
+        want=
+        ! ctl "$a" || exec "$real" "$@"
+        continue
+    fi
+    case $a in
+    --) break ;;
+    -?*) flags=${a#-}
+        while [ -n "$flags" ]; do
+            c=${flags%"${flags#?}"}
+            flags=${flags#?}
+            case $c in
+            [SMOLRDWwNfGVQv]) exec "$real" "$@" ;;
+            o) if [ -n "$flags" ]; then ! ctl "$flags" || exec "$real" "$@"; else want=1; fi
+               break ;;
+            [BbcEeFIiJlmPp]) [ -n "$flags" ] || want=0
+               break ;;
+            esac
+        done
+        [ "$want" = 0 ] && want=v ;;
+    *) break ;;
+    esac
+done
+dir=${TTP_SSH_CM_DIR:-${HOME:-/nonexistent}/.tt-project/cm}
+if [ ${#dir} -gt 45 ] || ! { [ -d "$dir" ] || mkdir -p -m 700 "$dir" 2>/dev/null; }; then
+    dir=/tmp/ttp-cm-$(id -u)
+    [ -d "$dir" ] || mkdir -m 700 "$dir" 2>/dev/null
+fi
+# Only a folder of this user's that no one else can write holds the sockets.
+if ! [ -d "$dir" ] || ! [ -O "$dir" ] || [ -L "$dir" ] || ! chmod 700 "$dir" 2>/dev/null; then
+    exec "$real" "$@"
+fi
+mux="-o ControlMaster=auto -o ControlPath=$dir/%C -o ControlPersist=600 -o ServerAliveInterval=15 -o ServerAliveCountMax=3"
+set +f
+for f in "$dir"/* "$dir"/.[!.]*; do
+    [ -e "$f" ] || [ -L "$f" ] || continue
+    { [ -S "$f" ] && ! [ -L "$f" ]; } || [ -d "$f" ] || rm -f "$f"
+done
+set -f
+exec "$real" $mux "$@"

@@ -7,9 +7,10 @@ holding a host-wide checks slot here (checkcap: every project of the account on 
 the cap (checks.host_max, else its load-following default) and the checks running on spill hosts
 (checkspill claims). The host is overloaded by its test runs when all three hold:
 
-- its runnable CPU demand (checkcap.cpu_demand: busy cores and tasks waiting to run, not tasks waiting
-  on I/O in D state, which the load average counts) is above the load guard's threshold:
-  checks.load_guard times its cores (testslots.load_guard_factor; with the guard off, its cores);
+- its runnable CPU demand (checkcap.cpu_demand: busy cores and tasks waiting to run, measured from
+  /proc/stat or macOS's CPU ticks, not tasks waiting on I/O, which the load average counts) is above the
+  load guard's threshold: checks.load_guard times its cores (testslots.load_guard_factor; with the guard
+  off, its cores), or its memory is short (hostcpu.mem_short: under MEM_FREE_MIN free);
 - the local runs are at or near the cap: at least NEAR of it (one run with a cap of 1 or 2);
 - no spill host takes any run: no live spill claim from this host.
 
@@ -30,7 +31,7 @@ import math
 import os
 import time
 
-from . import checkcap, checkspill, locks, testslots
+from . import checkcap, checkspill, hostcpu, testslots
 
 KEY = "checks_host_overloaded"
 SOURCE = "daemon:checks-host-overloaded"
@@ -61,14 +62,14 @@ def snapshot(cfg: dict | None = None) -> dict:
     cap, c = checkcap.limit(), checkcap.cores()
     factor = testslots.load_guard_factor() or 1.0
     try:
-        running = len(locks.held_labels(checkcap.all_paths(cap))) if cap else 0
+        running = len(checkcap.host_holders(cap))   # the queue-wait report's count too
     except OSError:
         running = 0
     spilled: dict[str, int] = {}
     for r in checkspill.holders():
         spilled[r["host"]] = spilled.get(r["host"], 0) + 1
     return {"load": loads(), "demand": demand(), "cores": c, "factor": factor, "threshold": factor * c, "cap": cap,
-            "running": running, "spilled": spilled, "spill_hosts": checkspill.hosts(cfg)}
+            "running": running, "spilled": spilled, "spill_hosts": checkspill.hosts(cfg), "mem_free": hostcpu.mem_free()}
 
 
 def demand() -> float | None:
@@ -78,10 +79,16 @@ def demand() -> float | None:
 
 
 def overloaded(s: dict) -> bool:
-    """The CPU is over the threshold by its runnable demand while local runs sit near the cap and none
-    spill. A reading without "demand" (an older caller) judges by the 5-minute load."""
+    """The CPU is over the threshold by its runnable demand, or memory is short, while local runs sit near
+    the cap and none spill. A reading without "demand" (an older caller) judges by the 5-minute load."""
     d = s["demand"] if "demand" in s else (s["load"][1] if s["load"] else None)
-    return d is not None and d > s["threshold"] and near(s["running"], s["cap"]) and not s["spilled"]
+    busy = (d is not None and d > s["threshold"]) or bool(_mem(s))
+    return busy and near(s["running"], s["cap"]) and not s["spilled"]
+
+
+def _mem(s: dict) -> str:
+    """hostcpu.mem_short of the reading's "mem_free"; "" when it has none."""
+    return "" if s.get("mem_free") is None else hostcpu.mem_short(s["mem_free"])
 
 
 def _demand_text(s: dict) -> str:
@@ -102,9 +109,11 @@ def text(s: dict, held_s: float) -> str:
     else:
         move = ("no spill host is set: list idle machines this project may use in delivery.checks_spill_hosts "
                 "(`ttp config delivery.checks_spill_hosts '[\"<alias>\", ...]'`)")
+    mem = _mem(s)
     return (f"checks host overloaded: this host's runnable CPU demand {_demand_text(s)} (busy and waiting "
             f"to run; load 1/5/15 min {_load_text(s)}, which also counts tasks waiting on I/O) "
-            f"has stayed above {over} for {held_s / 60:.0f} min, with {s['running']} check runs here at or "
+            + (f"has run {mem} for {held_s / 60:.0f} min," if mem else
+               f"has stayed above {over} for {held_s / 60:.0f} min,") + f" with {s['running']} check runs here at or "
             f"near the cap of {s['cap']} (checks.host_max) and none on a spill host. To move runs off this "
             f"host: {move}. Runs only spill after waiting delivery.checks_spill_after_s for a slot here, so "
             f"also lower the account's checks.host_max (`ttp config --account checks.host_max N`) to what "
@@ -116,7 +125,7 @@ def lines(cfg: dict | None = None, s: dict | None = None) -> list[str]:
     s = s or snapshot(cfg)
     cap = f"cap {s['cap']}" if s["cap"] else "no cap"
     over = s.get("demand") is not None and s["demand"] > s["threshold"] and testslots.load_guard_factor()
-    flag = (", overloaded: CPU over its limit" if overloaded(s)
+    flag = (f", overloaded: {_mem(s) or 'CPU over its limit'}" if overloaded(s)
             else ", CPU over its limit: new suites wait" if over else "")
     out = [f"this host: {s['running']} check runs ({cap}), CPU demand {_demand_text(s)} (busy and waiting to "
            f"run) on {s['cores']} cores, CPU limit {s['threshold']:g} (checks.load_guard), load 1/5/15 min "

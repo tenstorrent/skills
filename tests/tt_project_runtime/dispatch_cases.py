@@ -604,55 +604,35 @@ def _dispatch_one(p, monkeypatch, flags, **kw):
     return _dispatch_claude_worker(p, monkeypatch, flags, **kw)
 
 
-def test_claude_workers_get_a_tool_allowlist_with_web_tools_only_where_the_task_needs_them(env, monkeypatch, tmp_path):
-    """Workers and reviewers on Claude run with --tools (the built-in tools workers use, Skill for the
-    plugin skills, ToolSearch so MCP tools stay deferred) instead of the long denylist. The web tools
-    come with every kind but a review; a review gets them only when its spec links a page off GitHub."""
+def test_claude_workers_and_reviewers_get_the_full_tool_set(env, monkeypatch, tmp_path):
+    """Workers and reviewers on Claude run on the full Claude Code harness (user msg #2302): no --tools
+    allowlist, Agent included; ttp.hook holds the rules. Only the web tools under no_internet and the
+    project's own denylist are withheld."""
     from ttp.providers import claude
-    lean = ["Bash", "Read", "Edit", "Write", "Skill", "ToolSearch"]
     p = make(env)
-    # Default worker (a code task): the allowlist with the web tools, and no built-in denylist.
-    argv, _, _ = _dispatch_one(p, monkeypatch, {}, kind="code")
-    assert _claude_tools(argv) == [*lean, "WebFetch", "WebSearch"]
-    assert argv.count("--tools") == 1 and "--disallowedTools" not in argv, "nothing left to deny"
-    assert argv[argv.index("--tools") + 2].startswith("--"), "--tools takes several values: a flag must follow"
-    # Review: no web tools.
-    argv, run_dir, _ = _dispatch_one(p, monkeypatch, {}, kind="review")
-    assert p.db.one("SELECT role FROM runs WHERE dir=?", (str(run_dir),))["role"] == "reviewer"
-    assert _claude_tools(argv) == lean
-    argv, _, _ = _dispatch_one(p, monkeypatch, {}, kind="review",
-                                         spec="Check https://github.com/o/r/pull/1 and https://api.github.com/x")
-    assert _claude_tools(argv) == lean, "GitHub links are read with gh"
-    # A web-needing review: its spec links a page elsewhere.
-    argv, _, _ = _dispatch_one(p, monkeypatch, {}, kind="review",
-                                         spec="Check the flag against https://docs.example.com/cli")
-    assert _claude_tools(argv) == [*lean, "WebFetch", "WebSearch"]
-    # The no_internet restriction wins over the task's kind.
+    for kind in ("code", "review", "question", "plan"):
+        argv, _, _ = _dispatch_one(p, monkeypatch, {}, kind=kind)
+        assert _claude_tools(argv) is None and "--disallowedTools" not in argv, kind
+        hooks = json.loads(argv[argv.index("--settings") + 1])["hooks"]["PreToolUse"]
+        assert [h["matcher"] for h in hooks] == ["*"], "every tool, subagents' too, meets the hook"
+    # The no_internet restriction withholds the web tools only.
     p.set_config("restrictions.no_internet", True)
-    argv, _, _ = _dispatch_one(p, monkeypatch, {}, kind="question")
-    assert _claude_tools(argv) == lean and "WebFetch" not in argv
+    argv, _, _ = _dispatch_one(p, monkeypatch, {}, kind="review")
+    assert argv[argv.index("--disallowedTools") + 1:argv.index("--settings")] == list(claude.WEB_TOOLS)
     p.set_config("restrictions.no_internet", False)
-    # A project with MCP servers for its workers: they come through --mcp-config; --tools only limits
-    # built-in tools, and ToolSearch keeps their schemas deferred. The project's own denylist stays.
+    # The project's own denylist stays; its MCP servers come through --mcp-config.
     _claude_mcp_config(tmp_path, monkeypatch, p)
     p.set_config("providers.claude.worker_isolation", True)
     p.set_config("providers.claude.mcp_servers", ["docs"])
     p.set_config("providers.claude.disallowed_tools", ["mcp__docs__write_page"])
     argv, _, _ = _dispatch_one(p, monkeypatch, {}, kind="work")
-    assert _claude_tools(argv) == [*lean, "WebFetch", "WebSearch"]
+    assert _claude_tools(argv) is None
     assert "--strict-mcp-config" in argv and "--mcp-config" in argv
     assert argv[argv.index("--disallowedTools") + 1:argv.index("--settings")] == ["mcp__docs__write_page"]
     pathlib.Path(argv[argv.index("--mcp-config") + 1]).unlink()
-    # A CLI without --tools keeps the old denylist, the web tools on it where the task does not need them.
-    argv, _, _ = _dispatch_one(p, monkeypatch, {claude.TOOLS: False}, kind="review")
-    assert "--tools" not in argv
-    denied = argv[argv.index("--disallowedTools") + 1:argv.index("--settings")]
-    assert denied == [*claude.WORKER_DENIED_TOOLS, "WebFetch", "WebSearch", "mcp__docs__write_page"]
-    pathlib.Path(argv[argv.index("--mcp-config") + 1]).unlink()
 
 
-def test_the_tool_allowlist_leaves_coordinator_turns_codex_and_cursor_alone(env, monkeypatch):
-    from ttp import daemon as dmod
+def test_the_tool_set_change_leaves_coordinator_turns_codex_and_cursor_alone(env, monkeypatch):
     from ttp.providers import claude, get_provider
     monkeypatch.setattr(claude, "_FLAGS", {claude.TOOLS: True})
     kw = dict(model="opus", effort="low", cwd=".", budget_usd=1.0, schema=None, restrictions={})
@@ -662,9 +642,6 @@ def test_the_tool_allowlist_leaves_coordinator_turns_codex_and_cursor_alone(env,
         for role, read_only in (("worker", False), ("reviewer", False), ("coordinator", True)):
             with_web = get_provider(name).build(role=role, read_only=read_only, web=True, **kw)
             assert get_provider(name).build(role=role, read_only=read_only, web=False, **kw) == with_web, name
-    assert dmod.web_needed("worker", None) and dmod.web_needed("worker", {"kind": "code", "spec": ""})
-    assert not dmod.web_needed("reviewer", {"kind": "review", "title": "review #1", "spec": "diff"})
-    assert dmod.web_needed("reviewer", {"kind": "review", "title": "see http://example.org/a", "spec": ""})
 
 
 def _stub_runner(monkeypatch):
@@ -2100,3 +2077,383 @@ def test_preemption_never_picks_urgent_work_a_review_a_harness_task_a_pushing_ta
     assert preempt.pick(p.db, "claude", {}, set())["task"]["id"] == holder[0], "only its lock spared the p5 run"
     p.db.x("UPDATE tasks SET status='done' WHERE id IN (?,?,?)", (holder[0], owner[0], p2[0]))
     assert preempt.pick(p.db, "claude", {}, set()) is None, f"never one of {spared}"
+
+
+def _closed_done(p, title, closes):
+    """A task that handed off done `closes` times (task_done events), then put back in the queue by an
+    unlogged write, as a stale row written back would."""
+    tid = p.db.add_task(title, "s", kind="plan", tier="light", origin="user", priority=2)
+    p.db.update_task(tid, status="done", attempts=closes, result=json.dumps({"status": "done", "summary": "done"}))
+    for _ in range(closes):
+        p.db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+               (time.time(), f"task:{tid}", "task_done", "normal", "done", "handled", tid))
+    p.db.x("UPDATE tasks SET status='queued' WHERE id=?", (tid,))
+    return tid
+
+
+def test_a_done_task_queued_again_without_a_requeue_is_not_dispatched_past_its_attempt_limit(
+        env, monkeypatch, tmp_path, reap_tmp_processes):
+    """Regression (upstream fp 6c6d0d95639c46a6): a plan closed done again and again was put back in the
+    queue by an unlogged write and redispatched each time (attempt 14 of 3). Dispatch refuses it, puts it
+    back to done and says why; an explicit requeue runs it again."""
+    p, d, drain, settle = _slot_setup(env, monkeypatch, tmp_path, slots=2)
+    try:
+        again = _closed_done(p, "a plan done three times", 3)
+        once = _closed_done(p, "a plan done once", 1)   # under its limit: a rework re-queue still runs
+        d.dispatch()
+        assert _slot_tasks(p) == [once], "a task closed done as often as its attempt limit was started again"
+        t = p.db.task(again)
+        assert t["status"] == "done" and t["attempts"] == 3
+        ev = p.db.one("SELECT text FROM events WHERE task=? AND kind='dispatch_refused'", (again,))
+        assert ev and "closed done 3 times" in ev["text"] and "attempts 3 of 3" in ev["text"]
+        assert f"task {again} not dispatched: it was already closed done 3 times" in \
+            (p.logs / "daemon.log").read_text()
+        settle(d)
+        assert p.db.requeue(again) == ""   # the user's decision: its done count starts again
+        assert p.db.one("SELECT id FROM events WHERE task=? AND kind='task_requeued'", (again,))
+        d.dispatch()
+        assert again in _slot_tasks(p), "an explicit requeue did not run the task again"
+    finally:
+        drain(d)
+        assert reap_tmp_processes(tmp_path) == [], "a stand-in run outlived the test"
+
+
+def test_a_task_cancelled_after_the_ready_read_is_not_started(env, monkeypatch, tmp_path, reap_tmp_processes):
+    """Dispatch reads the ready list once per tick; a task cancelled or closed done after that read
+    (a stale queued row in the list) is not started."""
+    from ttp import db as dbmod
+    p, d, drain, settle = _slot_setup(env, monkeypatch, tmp_path, slots=2)
+    try:
+        gone = p.db.add_task("cancelled after the read", "s", kind="work", tier="light", origin="user")
+        done = p.db.add_task("done after the read", "s", kind="work", tier="light", origin="user")
+        stale = [p.db.task(gone), p.db.task(done)]
+        p.db.update_task(gone, status="cancelled")
+        p.db.update_task(done, status="done")
+        monkeypatch.setattr(dbmod.DB, "ready_tasks", lambda self, later=False: [dict(t) for t in stale])
+        d.dispatch()
+        assert _slot_tasks(p) == []
+        assert (p.db.task(gone)["status"], p.db.task(done)["status"]) == ("cancelled", "done")
+        log_text = (p.logs / "daemon.log").read_text()
+        assert f"task {gone} not dispatched: it is cancelled now" in log_text
+        assert f"task {done} not dispatched: it is done now" in log_text
+    finally:
+        drain(d)
+        assert reap_tmp_processes(tmp_path) == [], "a stand-in run outlived the test"
+
+
+def test_a_recorded_requeue_restarts_the_done_count(env):
+    """A recorded explicit requeue resets dispatch's done count: the guard then lets the task run."""
+    from ttp import dispatchguard
+    p = make(env)
+    tid = _closed_done(p, "a chained code task", 3)
+    assert dispatchguard.refusal(p.db, p.db.task(tid))
+    dispatchguard.record_requeue(p.db, tid, "done", "continue")
+    assert dispatchguard.done_closes(p.db, tid) == 0 and dispatchguard.refusal(p.db, p.db.task(tid)) == ""
+
+
+def _requeues(p, tid):
+    return p.db.q("SELECT source FROM events WHERE task=? AND kind='task_requeued'", (tid,))
+
+
+def test_a_rejected_coordinator_requeue_records_nothing_and_an_accepted_one_does(env):
+    """Review #7495: the coordinator's status queued logs its requeue only once the update is written. A
+    rejected update (a start_when on a done task) leaves no task_requeued event, so the guard still
+    refuses the task after an unlogged re-queue; an accepted status queued records one and the task runs."""
+    from ttp import coordinator as coord, dispatchguard
+    p = make(env)
+    tid = _closed_done(p, "a plan done three times", 3)
+    p.db.update_task(tid, status="done")
+    assert coord.apply(p, [{"type": "task_update", "id": tid, "status": "queued", "start_when": "true"}])
+    assert p.db.task(tid)["status"] == "done" and _requeues(p, tid) == []
+    p.db.x("UPDATE tasks SET status='queued' WHERE id=?", (tid,))   # an unlogged write
+    assert "closed done 3 times" in dispatchguard.refusal(p.db, p.db.task(tid))
+    p.db.update_task(tid, status="done")
+    assert coord.apply(p, [{"type": "task_update", "id": tid, "status": "queued"}]) == []
+    assert p.db.task(tid)["status"] == "queued" and len(_requeues(p, tid)) == 1
+    assert dispatchguard.refusal(p.db, p.db.task(tid)) == ""
+
+
+def test_a_chain_continue_records_a_requeue(env):
+    """chaincap.requeue (a continue hop) records task_requeued, so dispatch's done count restarts after it.
+    The push queue's re-runs record theirs with their own text (push_cases)."""
+    from ttp import chaincap, dispatchguard
+    p = make(env)
+    tid = _closed_done(p, "a chained code task", 3)
+    p.db.update_task(tid, status="done", kind="code", branch="b")
+    p.set_config("chains.requeue", True)
+    assert chaincap.requeue(p, p.config(), p.db.task(tid), {"title": "continue: more", "spec": "x"}, "progress", 0)
+    assert [r["source"] for r in _requeues(p, tid)] == ["continue"]
+    assert dispatchguard.refusal(p.db, p.db.task(tid)) == ""
+
+
+def test_a_cancelled_task_queued_again_without_a_requeue_is_not_dispatched(
+        env, monkeypatch, tmp_path, reap_tmp_processes):
+    """Regression (upstream fp aed18d8ef1b1ecc7): a task cancelled for good (`ttp task cancel`, or the
+    coordinator's status cancelled) was put back in the queue by an unlogged write and dispatched at
+    attempt 35 of 3. Dispatch refuses it and puts it back to cancelled; an explicit requeue runs it."""
+    from ttp import coordinator as coord
+    p, d, drain, settle = _slot_setup(env, monkeypatch, tmp_path, slots=3)
+    try:
+        by_cli = p.db.add_task("cancelled by the user", "s", kind="work", tier="light", origin="user")
+        by_coord = p.db.add_task("cancelled by the coordinator", "s", kind="work", tier="light", origin="user")
+        live = p.db.add_task("still wanted", "s", kind="work", tier="light", origin="user")
+        assert p.db.cancel(by_cli) == ""
+        assert coord.apply(p, [{"type": "task_update", "id": by_coord, "status": "cancelled"}]) == []
+        for tid in (by_cli, by_coord):   # an unlogged write puts it back, far past its limit
+            p.db.x("UPDATE tasks SET status='queued', attempts=35 WHERE id=?", (tid,))
+        d.dispatch()
+        assert _slot_tasks(p) == [live], "a cancelled task was started again"
+        for tid in (by_cli, by_coord):
+            assert p.db.task(tid)["status"] == "cancelled"
+            ev = p.db.one("SELECT text FROM events WHERE task=? AND kind='dispatch_refused'", (tid,))
+            assert ev and "cancelled and queued again" in ev["text"] and "attempts 35 of 3" in ev["text"]
+        settle(d)
+        assert p.db.requeue(by_cli) == ""   # the user's decision: it runs again
+        d.dispatch()
+        assert by_cli in _slot_tasks(p) and by_coord not in _slot_tasks(p)
+    finally:
+        drain(d)
+        assert reap_tmp_processes(tmp_path) == [], "a stand-in run outlived the test"
+
+
+def test_a_done_task_with_a_start_when_probe_past_its_attempt_limit_is_not_redispatched(
+        env, monkeypatch, tmp_path, reap_tmp_processes):
+    """Regression (upstream fp ad88895e4aa49dda): a plan closed done (once by its last run, other closes
+    leaving no task_done event) kept a start_when probe from an old machine hold and was queued again
+    without a requeue, attempt 9 of 3. Its probe passing only makes it ready: dispatch refuses it, puts it
+    back to done and says why; an explicit requeue runs it again."""
+    from ttp.db import deferral
+    p, d, drain, settle = _slot_setup(env, monkeypatch, tmp_path, slots=2)
+    try:
+        held = _closed_done(p, "a plan held on a machine probe", 1)
+        now = time.time()
+        p.db.x("INSERT INTO runs(task,role,started,ended,status) VALUES(?,?,?,?,?)",
+               (held, "worker", now - 60, now - 1, "ok"))
+        p.db.update_task(held, attempts=9, labels=["start_when:true", f"deferred_since:{now:.0f}"])
+        fresh = _closed_done(p, "a plan done once, under its limit", 1)   # a rework re-queue still runs
+        d._start_verdict(p.db.task(held), 0, time.time())   # its start_when passed
+        assert not deferral(p.db.task(held))
+        d.dispatch()
+        assert _slot_tasks(p) == [fresh], "a done task past its attempt limit started again on its probe"
+        t = p.db.task(held)
+        assert (t["status"], t["attempts"]) == ("done", 9)
+        ev = p.db.one("SELECT text FROM events WHERE task=? AND kind='dispatch_refused'", (held,))
+        assert ev and "attempts 9 of 3" in ev["text"]
+        settle(d)
+        assert p.db.requeue(held) == ""   # the user's decision: it runs again
+        d.dispatch()
+        assert held in _slot_tasks(p), "an explicit requeue did not run the task again"
+    finally:
+        drain(d)
+        assert reap_tmp_processes(tmp_path) == [], "a stand-in run outlived the test"
+
+
+def test_a_run_that_queued_its_task_again_itself_is_not_refused_past_its_attempt_limit(env):
+    """The attempts branch needs a done end: a last run whose end queued the task again with no task_done
+    event after it (a push rework, a busy resource), or a done close followed by an explicit requeue, is
+    left to run."""
+    from ttp import dispatchguard
+    p = make(env)
+    tid = _closed_done(p, "a review re-run by the push queue", 1)
+    p.db.update_task(tid, attempts=5)
+    now = time.time()
+    p.db.x("INSERT INTO runs(task,role,started,ended,status) VALUES(?,?,?,?,?)", (tid, "worker", now, now + 600, "ok"))
+    assert dispatchguard.refusal(p.db, p.db.task(tid)) == "", "a later run's own requeue was refused"
+    p.db.x("UPDATE runs SET ended=? WHERE task=?", (now - 600, tid))
+    assert "attempts 5 of 3" in dispatchguard.refusal(p.db, p.db.task(tid))
+    dispatchguard.record_requeue(p.db, tid, "done", "requeue")
+    assert dispatchguard.refusal(p.db, p.db.task(tid)) == ""
+
+
+def _branch_calls(env, n):
+    """A project with `n` finished code-task branches, each committing pkg/lib.py, and a queued code task
+    whose spec names that file: (project, queued task id)."""
+    p = make(env)
+    (p.root / "pkg").mkdir(exist_ok=True)
+    (p.root / "pkg/lib.py").write_text("x = 0\n")
+    _git_out(p.root, "add", "pkg/lib.py")
+    _git_out(p.root, "commit", "-qm", "lib")
+    for i in range(n):
+        _tid, path, _branch = _code_task(p, f"done {i}")
+        (path / "pkg/lib.py").write_text(f"x = {i + 1}\n")
+        _git_out(path, "add", "pkg/lib.py")
+        _git_out(path, "commit", "-qm", f"lib {i}")
+    return p, p.db.add_task("Change lib", "Edit pkg/lib.py so it reads y.", kind="code", tier="light",
+                            origin="user")
+
+
+def test_a_workers_start_reads_no_git_per_unlanded_branch(env, monkeypatch):
+    """The start-time branch check (overlap.prompt_block) once ran two or more git calls per finished
+    branch at every worker start (~230 branches on one project): heads found not on the push branch are
+    kept for its tip, so a later start runs a fixed few git calls however many branches there are."""
+    from ttp import gitmemo, landed, overlap
+    p, q = _branch_calls(env, 12)
+    p.set_config("delivery.push_branch", "t79-push")
+    push_ref = landed._push_ref(p, p.root)
+    _git_out(p.root, "update-ref", push_ref, "HEAD")   # the push branch at the base, as on a project that pushed
+    calls = []
+    real = gitmemo.run
+    monkeypatch.setattr(gitmemo, "run", lambda argv, *a, **k: calls.append(argv) or real(argv, *a, **k))
+    first = overlap.prompt_block(p, p.db.task(q))
+    cold = len(calls)
+    calls.clear()
+    again = overlap.prompt_block(p, p.db.task(q))
+    assert again == first and again.count("\n- #") == overlap.MAX_BRANCHES, again
+    assert cold >= 24 and len(calls) <= 8, (cold, [" ".join(c[3:]) for c in calls])
+    # A new commit on the push branch's tip: the heads are read again, once.
+    (p.root / "other.txt").write_text("o\n")
+    _git_out(p.root, "add", "other.txt")
+    _git_out(p.root, "commit", "-qm", "other")
+    _git_out(p.root, "update-ref", push_ref, "HEAD")
+    calls.clear()
+    assert overlap.prompt_block(p, p.db.task(q)) == first and len(calls) >= 24
+    calls.clear()
+    overlap.prompt_block(p, p.db.task(q))
+    assert len(calls) <= 8, calls
+
+
+def test_slow_git_dispatch_starts_every_ready_task_in_one_step(env, monkeypatch, tmp_path, reap_tmp_processes):
+    """On a loaded machine each git call is slow; each start re-read the root checkout's head, branch and
+    status and fetched origin, so a dispatch step's budget ran out after a start or two and the rest
+    waited a tick each. Within one dispatch pass those reads and the fetch run once: 4 ready tasks and
+    4 free places all start within one step budget, the fetch and root reads run once."""
+    from ttp import stepclock
+    p, d, drain, settle = _slot_setup(env, monkeypatch, tmp_path, slots=4)
+    try:
+        for i in range(4):
+            p.db.add_task(f"urgent code {i}", "s", kind="code", tier="light", origin="user", priority=1)
+        calls = _slow_git(tmp_path, monkeypatch, 0.4)
+        monkeypatch.setattr(d, "_step_budget", lambda: 36.0)
+        stepclock.install()
+        try:
+            d._run_step(d.dispatch)
+        finally:
+            stepclock.uninstall()
+        assert sorted(_slot_tasks(p)) == [1, 2, 3, 4], "every ready task starts within one step"
+        said = [" ".join(line.split()[1:]) for line in calls.read_text().splitlines()]
+        root = f"-C {p.root} "
+        for read in ("fetch --quiet origin", "status --porcelain=v1", "symbolic-ref --quiet --short refs/remotes/origin/HEAD"):
+            assert sum(c.startswith(root + read) for c in said) == 1, (read, said)
+    finally:
+        drain(d)
+
+
+def test_slow_diff_reads_never_hold_ready_reviews_past_one_step(env, monkeypatch, tmp_path, reap_tmp_processes):
+    """The 2026-11-10 stall: each ready review's tier pick read its branch's `diff --numstat`, and on a
+    loaded machine one took most of the step budget, so the step stopped with urgent reviews and free
+    places left. A diff is now measured only while half the budget is left; later reviews start at their
+    given tier. Counted, not timed: one numstat runs and all four start (before: the step stopped first)."""
+    from ttp import stepclock, worktree
+    p, d, drain, settle = _slot_setup(env, monkeypatch, tmp_path, slots=4)
+    try:
+        g = lambda *a: subprocess.run(["git", "-C", str(p.root), *a], check=True, capture_output=True,  # noqa: E731
+                                      text=True).stdout.strip()
+        start = g("rev-parse", "HEAD")
+        for i in range(4):
+            g("checkout", "-q", "-b", f"ttp/t{90 + i}-work", start)
+            (p.root / f"w{i}.py").write_text("x = 1\n" * (i + 1))
+            g("add", f"w{i}.py")
+            g("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", f"work {i}")
+            sha = g("rev-parse", "HEAD")
+            g("checkout", "-q", "-")
+            p.db.add_task(f"Review #{90 + i}", f"Review branch ttp/t{90 + i}-work, head {sha}.", kind="review",
+                          tier="standard", origin="user", priority=1)
+        getattr(worktree, "_NUMSTAT", {}).clear()
+        calls = _slow_git(tmp_path, monkeypatch, 0.05, slow="*diff\\ --numstat*", slow_s=24)
+        monkeypatch.setattr(d, "_step_budget", lambda: 40.0)
+        stepclock.install()
+        try:
+            d._run_step(d.dispatch)
+        finally:
+            stepclock.uninstall()
+        said = calls.read_text()
+        assert said.count("diff --numstat") == 1, said
+        assert len(_slot_tasks(p)) == 4, "every ready review starts within one step"
+    finally:
+        drain(d)
+
+
+def test_diff_lines_reads_a_head_pair_once(env, monkeypatch, tmp_path):
+    """worktree.diff_lines keeps each (base commit, ref commit) numstat across calls: a review retried or
+    picked again on a later pass pays a slow diff once per head; a new head is read afresh."""
+    from ttp import worktree
+    p = make(env)
+    g = lambda *a: subprocess.run(["git", "-C", str(p.root), *a], check=True, capture_output=True,  # noqa: E731
+                                  text=True).stdout.strip()
+    base = g("rev-parse", "HEAD")
+    g("checkout", "-q", "-b", "feat")
+    (p.root / "f.py").write_text("a\n")
+    g("add", "f.py")
+    g("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "f")
+    g("checkout", "-q", "-")
+    worktree._NUMSTAT.clear()
+    calls = _slow_git(tmp_path, monkeypatch, 0)
+    n = lambda: calls.read_text().count("diff --numstat")  # noqa: E731
+    assert worktree.diff_lines(p, ["feat"], base=base) == {"f.py": 1}
+    assert worktree.diff_lines(p, ["feat"], base=base) == {"f.py": 1} and n() == 1
+    g("checkout", "-q", "feat")
+    (p.root / "f.py").write_text("a\nb\n")
+    g("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qam", "g")
+    g("checkout", "-q", "-")
+    assert worktree.diff_lines(p, ["feat"], base=base) == {"f.py": 2} and n() == 2
+
+
+def test_dispatch_pass_replays_a_failed_fetch(tmp_path, monkeypatch):
+    """A second fetch in a pass gets the first one's outcome: a failure's returncode (check=True raises)
+    and a timeout's TimeoutExpired, never a made-up success."""
+    from ttp import gitmemo
+    repo = tmp_path / "r"
+    subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+    calls = _slow_git(tmp_path, monkeypatch, 0)
+    fetch = ["git", "-C", str(repo), "fetch", "--quiet", "origin"]
+    with gitmemo.dispatch_pass():
+        first = gitmemo.run(fetch, capture_output=True, text=True)
+        assert first.returncode != 0
+        assert gitmemo.run(fetch, capture_output=True, text=True).returncode == first.returncode
+        with pytest.raises(subprocess.CalledProcessError):
+            gitmemo.run(fetch, capture_output=True, text=True, check=True)
+    assert calls.read_text().count("fetch --quiet origin") == 1
+    real = gitmemo._run
+    monkeypatch.setattr(gitmemo, "_run", lambda argv, **kw: (_ for _ in ()).throw(subprocess.TimeoutExpired(argv, 1)))
+    with gitmemo.dispatch_pass():
+        for _ in range(2):
+            with pytest.raises(subprocess.TimeoutExpired):
+                gitmemo.run(fetch, capture_output=True)
+        monkeypatch.setattr(gitmemo, "_run", real)
+        with pytest.raises(subprocess.TimeoutExpired):
+            gitmemo.run(fetch, capture_output=True)
+
+
+def test_dispatch_pass_memo_keeps_root_reads_until_a_move(tmp_path, monkeypatch):
+    """gitmemo.dispatch_pass(): a root read and the fetch run once; a checkout move drops the kept reads;
+    a kept failing read still raises under check=True; outside a pass nothing is kept."""
+    from ttp import gitmemo
+    repo = tmp_path / "r"
+    subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q",
+                    "--allow-empty", "-m", "a"], check=True)
+    calls = _slow_git(tmp_path, monkeypatch, 0)
+    head = ["git", "-C", str(repo), "symbolic-ref", "--quiet", "--short", "HEAD"]
+    n = lambda s: sum(s in line for line in calls.read_text().splitlines()) if calls.exists() else 0
+    with gitmemo.dispatch_pass():
+        for _ in range(2):
+            gitmemo.run(["git", "-C", str(repo), "fetch", "--quiet", "origin"], capture_output=True)
+        assert n("fetch --quiet origin") == 1, "a failed fetch is not retried within the pass either"
+        assert gitmemo.run(head, capture_output=True, text=True).stdout.strip() == "main"
+        assert gitmemo.run(head, capture_output=True, text=True).stdout.strip() == "main"
+        assert n("symbolic-ref --quiet --short HEAD") == 1
+        gitmemo.run(["git", "-C", str(repo), "worktree", "list", "--porcelain"], capture_output=True)
+        gitmemo.run(["git", "-C", str(repo), "update-ref", "refs/ttp/fork-point/t1", "HEAD"], check=True)
+        gitmemo.run(head, capture_output=True, text=True)
+        assert n("symbolic-ref --quiet --short HEAD") == 1, "a list or a harness ref leaves the root's head"
+        gitmemo.run(["git", "-C", str(repo), "checkout", "-q", "-b", "other"], check=True)
+        assert gitmemo.run(head, capture_output=True, text=True).stdout.strip() == "other"
+        assert n("symbolic-ref --quiet --short HEAD") == 2
+        gitmemo.run(["git", "-C", str(repo), "checkout", "-q", "--detach"], check=True)
+        for _ in range(2):
+            with pytest.raises(subprocess.CalledProcessError):
+                gitmemo.run(head, capture_output=True, text=True, check=True)
+        assert n("symbolic-ref --quiet --short HEAD") == 3
+    gitmemo.run(head, capture_output=True, text=True)
+    gitmemo.run(head, capture_output=True, text=True)
+    assert n("symbolic-ref --quiet --short HEAD") == 5, "outside a pass every read runs"

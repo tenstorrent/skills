@@ -21,7 +21,9 @@ to its first run, or to now for one still queued:
 - review_sweep: a code task's hand-off into review (its task_review or task_done event; else its last
   run's end, when a model-free on_pass finished it later) to its review task being queued. Limits
   review.sweep_after_s, judged only on the reviews the sweep queued (its review_swept events), and
-  review.unreviewed_per_pass (against the backlog of tasks in review now).
+  review.unreviewed_per_pass (against the backlog of tasks in review now). A review the unreviewed
+  backstop queued (its review_unqueued event: the finish queued none, Daemon.sweep_unreviewed found it
+  later) is counted apart (backstop): no limit holds it, so plan() names it whatever the provider gate.
 - review_stall: the same end to the review's first run, against coordinator.review_stall_s (the age at
   which a waiting review is raised). Reported only: plan() never lowers it, since a sooner alarm starts
   no review sooner. Its waits the checks did not hold (free) are reported apart, as information.
@@ -85,7 +87,8 @@ import re
 import time
 from pathlib import Path
 
-from .db import DB, deferral
+from . import loadcaps
+from .db import DB, START_PASSED, deferral
 
 KV = "throughput_changes"   # kv: [{"id", "ts", "key", "old", "new", "why", "undo", "trigger", "undone"}], newest last
 LAST_KV = "throughput_last"  # kv: the last measured review: {"ts", "trigger", "lanes", "changes", "kept"}
@@ -93,7 +96,7 @@ KEEP_S = 14 * 86400
 DAY = 86400
 P1_WAIT_S = 600       # a priority 1 task waiting minutes is slow
 WAIT_S = 1800         # any other task: tens of minutes, or one median run if runs are longer
-CPU_FREE = 0.75       # headroom: 1-minute load under this share of the host's cores
+CPU_FREE = 0.75       # headroom: measured CPU demand under this share of the host's cores
 ROWS = 5000
 SERIAL_S = 10.0   # a checks grant this close to a run's end, one run at a time: a serialized queue
 SUSTAIN_S = 600.0   # how long in all a count of checks runs at once must hold to count as the cap then
@@ -232,6 +235,32 @@ def thresholds(spans: list[tuple[float, float]]) -> tuple[float, float]:
 
 CAP_KEY = "checks.test_project_max"
 SLOTS_KEY = "checks.slots"
+TASK_TITLE = "throughput: "   # slowcomplaint's follow-up tasks: `throughput: <lane>[, <lane>] waits over threshold; ...`
+
+
+def _settled(db: DB, ln: dict, now: float) -> str:
+    """Why the checks lane opens no follow-up, or '': the tried-work ledger holds, from the last DAY, a
+    rejected 'raise <its limit key>' or a done follow-up task that listed the lane, and no wait held at the
+    project's own limits (own_wait_last, ck_holder) started after it."""
+    key, name = ln.get("limit_key"), ln["lane"]
+    raise_rx = re.compile(rf"\braise\w*\s+(?:the\s+)?{re.escape(key)}(?![\w.])", re.I) if key else None
+    try:
+        from . import tried
+        ledger = tried.entries(db, now=now, days=1)
+    except Exception:   # an unreadable ledger holds nothing back
+        return ""
+    for e in ledger:   # newest first
+        title = e["title"] or ""
+        lanes = title[len(TASK_TITLE):].split(" waits over threshold", 1)[0].split(", ") \
+            if title.startswith(TASK_TITLE) else []
+        if not (now - DAY <= e["ts"] <= now and (e["outcome"] == "rejected" and raise_rx and raise_rx.search(title)
+                                               or e["status"] == "done" and name in lanes)):
+            continue
+        if float(ln.get("own_wait_last") or 0) > e["ts"]:
+            return ""   # a new wait at the project's own limits since: new evidence
+        return (f"ledger #{e['id']} ({e['outcome']}: {title[:80]}) settled it on {e['date']} and no wait "
+                "held at the project's own limits started since: not reopened")
+    return ""
 
 
 def slot_limit(text: str) -> str:
@@ -377,6 +406,15 @@ def measure(db: DB, cfg: dict, since_s: float = DAY, now: float | None = None, g
             holds.setdefault(name, []).append((float((v or {}).get("since") or now), now))
     except Exception:   # an unreadable shared or fleet file leaves the ended pauses
         pass
+    # When a start_when gate ended (db.record_start_passed): its deferral labels are gone by then.
+    passed: dict[int, list[tuple[float, dict]]] = {}
+    for e in db.q("SELECT ts, task, data FROM events WHERE kind=? AND task IS NOT NULL AND ts>?",
+                  (START_PASSED, t0 - DAY)):
+        try:
+            v = json.loads(e["data"] or "{}")
+        except (ValueError, TypeError):
+            v = {}
+        passed.setdefault(e["task"], []).append((float(e["ts"]), v if isinstance(v, dict) else {}))
     res_held: dict[int, list[tuple[float, str]]] = {}
     for e in db.q("SELECT ts, task, data FROM events WHERE kind='dispatch_hold' AND task IS NOT NULL AND ts>?",
                   (t0 - DAY,)):
@@ -562,6 +600,14 @@ def measure(db: DB, cfg: dict, since_s: float = DAY, now: float | None = None, g
     for t in tasks:
         start = first.get(t["id"])
         d = deferral(t)
+        gate_end, gd = None, d
+        if not d.get("when"):
+            # A start_when that passed before this wait's end: the wait up to its passing was the gate's.
+            lim = first.get(t["id"]) if first.get(t["id"]) is not None else now
+            got = [(ts, v) for ts, v in passed.get(t["id"], ()) if ts <= lim]
+            if got:
+                gate_end, v = max(got, key=lambda x: x[0])
+                gd = {**d, "when": str(v.get("when") or "start_when"), "since": v.get("since")}
         prio = int(t["priority"] or 3)
         why = (t.get("blocked_reason") or "").lower()
         if (start is not None or (t["status"] in ("queued", "blocked") and t["id"] not in last_run)) \
@@ -571,6 +617,13 @@ def measure(db: DB, cfg: dict, since_s: float = DAY, now: float | None = None, g
             end, queued = (start if start is not None else now), start is None
             if not d.get("when") and None in dones:
                 add(lane("dependency", None, None), max(0.0, end - base), prio, base, end, None, queued)
+            elif gate_end is not None:
+                ready = max([base, *[x for x in dones if x is not None]])
+                by_rule(t, gd, why, ready, min(gate_end, end), prio, False)
+                if end > max(gate_end, ready):   # from the gate's passing to its start: a slot wait
+                    w0 = max(gate_end, ready)
+                    add(lane("worker_slots", "budget.max_parallel_workers", workers), end - w0, prio, w0,
+                        end, workers, queued)
             elif not by_rule(t, d, why, max([base, *[x for x in dones if x is not None]]), end, prio, queued):
                 ready = max([base, *[x for x in dones if x is not None]])
                 add(lane("worker_slots", "budget.max_parallel_workers", workers), max(0.0, end - ready), prio, ready,
@@ -609,7 +662,10 @@ def measure(db: DB, cfg: dict, since_s: float = DAY, now: float | None = None, g
                     ln[state] += bool(cap_n)
                     held = ln.setdefault("held_by", {"own": 0, HOST_CORES: 0, OTHER_PROJECTS: 0})
                     if key:
-                        held[ck_holder(t["id"], w0, w1, state)] += 1
+                        who = ck_holder(t["id"], w0, w1, state)
+                        held[who] += 1
+                        if who == "own" and state != "serialized":   # held at the project's own limits
+                            ln["own_wait_last"] = max(ln.get("own_wait_last", 0.0), w0)
             elif selfw or "detach" in reason or "ttp checks" in reason or "own job" in reason:
                 lane("own_job", None, None)["note"] = "the task's own detached job or checks ran: no limit"
                 add(lanes["own_job"], w1 - w0, prio, w0, w1, None, queued)
@@ -620,12 +676,14 @@ def measure(db: DB, cfg: dict, since_s: float = DAY, now: float | None = None, g
     # Reviews: a code task's last run ending to its review queued (sweep) and started (stall). A wait the
     # checks held is measured but judges neither limit (the swept and free lists plan() reads).
     sweep_s = float(_cfg(cfg, "review.sweep_after_s", 1800) or 0)
-    per_pass = int(_cfg(cfg, "review.unreviewed_per_pass", 2) or 0)
+    per_pass = loadcaps.unreviewed_per_pass(cfg)   # as the daemon reads it: unset is the worker slots, not off
     stall_s = float(_cfg(cfg, "coordinator.review_stall_s", 14400) or 0)
     rs, rt = lane("review_sweep", "review.sweep_after_s", sweep_s), lane("review_stall", "coordinator.review_stall_s", stall_s)
-    swept = {int(m.group(1)) for e in db.q("SELECT text FROM events WHERE kind='review_swept' AND ts>?", (t0,))
-             if (m := re.search(r"review #(\d+) queued", e["text"] or ""))}
-    rs["swept"], rs["slot_held"], rt["free"], rt["slot_held"] = [], 0, [], 0
+    queued_by = {kind: {int(m.group(1)) for e in db.q("SELECT text FROM events WHERE kind=? AND ts>?", (kind, t0))
+                        if (m := re.search(r"review #(\d+) queued", e["text"] or ""))}
+                 for kind in ("review_swept", "review_unqueued")}
+    swept, backstop = queued_by["review_swept"], queued_by["review_unqueued"]
+    rs["swept"], rs["backstop"], rs["slot_held"], rt["free"], rt["slot_held"] = [], [], 0, [], 0
     # A code task's hand-off into review: the task_review/task_done event Daemon's finish writes, which
     # a model-free on_pass may write long after its last run ended (its own checks ran in between).
     handoff: dict[int, list[float]] = {}
@@ -647,6 +705,8 @@ def measure(db: DB, cfg: dict, since_s: float = DAY, now: float | None = None, g
             rs["slot_held"] += 1
         elif t["id"] in swept:
             rs["swept"].append(float(t["created"]) - done)
+        elif t["id"] in backstop:
+            rs["backstop"].append(float(t["created"]) - done)
         start = first.get(t["id"])
         w1 = start if start is not None else now
         add(rt, w1 - done, prio, done, w1, None, start is None)
@@ -739,7 +799,7 @@ def measure(db: DB, cfg: dict, since_s: float = DAY, now: float | None = None, g
     out = []
     for ln in lanes.values():
         w, p1 = ln.pop("waits"), ln.pop("p1")
-        for k in ("swept", "window", "free"):
+        for k in ("swept", "backstop", "window", "free"):
             if k in ln:
                 v = ln.pop(k)
                 ln.update({f"{k}_count": len(v), f"{k}_p90_s": round(_pct(v, 0.9))})
@@ -757,13 +817,18 @@ def measure(db: DB, cfg: dict, since_s: float = DAY, now: float | None = None, g
 
 
 def cpu_free() -> tuple[bool, str]:
-    """(CPU free, why not): the host's 1-minute load under CPU_FREE of its cores."""
-    try:
-        load, cores = os.getloadavg()[0], os.cpu_count() or 1
-    except OSError:
+    """(CPU free, why not): the host's measured CPU demand (checkcap.cpu_demand: busy cores from /proc/stat
+    or macOS's CPU ticks, the 1-minute load only where those cannot be read) under CPU_FREE of its cores,
+    and its memory not short (hostcpu.mem_short). The load average alone counts tasks waiting on I/O, so a
+    mostly idle host read high by it."""
+    from . import checkcap, hostcpu
+    if mem := hostcpu.mem_short():
+        return False, f"the host is {mem}"
+    d, cores = checkcap.cpu_demand(), checkcap.cores()
+    if d != d or d == float("inf"):
         return True, ""
-    if load >= CPU_FREE * cores:
-        return False, f"host load {load:.1f} on {cores} cores leaves no CPU free"
+    if d >= CPU_FREE * cores:
+        return False, f"host CPU demand {d:.1f} cores on {cores} cores leaves no CPU free"
     return True, ""
 
 
@@ -781,7 +846,8 @@ def headroom(db: DB, cfg: dict, report: dict) -> tuple[bool, str]:
 
 def plan(db: DB, cfg: dict, report: dict) -> tuple[list[dict], list[dict]]:
     """(changes [{key, old, new, why}], kept [{lane, key, why, info?}]) for the slow lanes; `info` marks a
-    kept lane reported as information only (no change is ever proposed from it: it opens no task)."""
+    kept lane reported as information only (no change is ever proposed from it: it opens no task), as is the
+    checks lane the tried-work ledger settled in the last day with no own wait since (_settled)."""
     ok, why_not = headroom(db, cfg, report)
     try:
         paused = set(db.paused_resources())
@@ -806,6 +872,9 @@ def plan(db: DB, cfg: dict, report: dict) -> tuple[list[dict], list[dict]]:
             # Checks waits the host held, not the project's limits: information only, no raise, no task.
             kept.append({"lane": name, "key": None, "info": True, "why": ln["note"]})
             continue
+        if name == "checks_slots" and (why := _settled(db, ln, float(report.get("ts") or time.time()))):
+            kept.append({"lane": name, "key": key, "info": True, "why": why})
+            continue
         if name.split(":", 1)[0] in ("resource", "device") and name.split(":", 1)[1] in paused:
             kept.append({"lane": name, "key": key, "why": f"{name.split(':', 1)[1]} is paused: its lane is not raised"})
             continue
@@ -817,7 +886,7 @@ def plan(db: DB, cfg: dict, report: dict) -> tuple[list[dict], list[dict]]:
                 kept[-1]["why"] += (f"; {ln['serialized']} wait(s) serialized: runs went one at a time back to "
                                     "back, so the queue held them, not the cap")
             continue
-        if not ok:
+        if not ok and name != "review_sweep":
             kept.append({"lane": name, "key": key, "why": why_not})
             continue
         if name == "worker_slots":
@@ -837,22 +906,35 @@ def plan(db: DB, cfg: dict, report: dict) -> tuple[list[dict], list[dict]]:
                 else:
                     kept.append({"lane": name, "key": key, "why": f"already at the host's share of cores ({cur})"})
         elif name == "review_sweep":
-            per = ln.get("per_pass") or 0
+            # Its diagnosis stands whatever the provider gate; only a change it proposes waits on the gate.
+            mine, per = [], ln.get("per_pass") or 0
             if per and ln.get("backlog", 0) > per:
                 new = load_size(per, ln["backlog"] - per, ln["backlog"])
-                changes.append({"key": "review.unreviewed_per_pass", "old": per, "new": new,
-                                "why": f"{ln['backlog']} task(s) in review without one, {per} per pass; p90 {p90}s"})
+                mine.append({"key": "review.unreviewed_per_pass", "old": per, "new": new,
+                             "why": f"{ln['backlog']} task(s) in review without one, {per} per pass; p90 {p90}s"})
             n, sp90 = ln.get("swept_count", 0), ln.get("swept_p90_s", 0)
+            b, bp90 = ln.get("backstop_count", 0), ln.get("backstop_p90_s", 0)
+            why = ""
             if cur and cur > FLOORS[key] and n and sp90 > cur:
-                changes.append({"key": key, "old": int(cur), "new": int(max(FLOORS[key], cur // 2)),
-                                "why": f"{n} review(s) the sweep queued, p90 {sp90}s after the work ended, "
-                                       f"sweep every {int(cur)}s"})
+                mine.append({"key": key, "old": int(cur), "new": int(max(FLOORS[key], cur // 2)),
+                             "why": f"{n} review(s) the sweep queued, p90 {sp90}s after the work ended, "
+                                    f"sweep every {int(cur)}s"})
             else:
                 held = ln.get("slot_held", 0)
-                kept.append({"lane": name, "key": key, "why": f"{ln['count'] - n - held} of {ln['count']} review(s) "
-                             f"were queued at finish, not by the sweep, and {held} held by the checks ({n} swept, "
-                             f"p90 {sp90}s): {key} did not hold them" if cur and cur > FLOORS[key]
-                             else f"{key} is at its floor"})
+                why = (f"{ln['count'] - n - held - b} of {ln['count']} review(s) were queued at finish, not by the "
+                       f"sweep, and {held} held by the checks ({n} swept, p90 {sp90}s): {key} did not hold them"
+                       if cur and cur > FLOORS[key] else f"{key} is at its floor")
+                if b:
+                    why += (f"; {b} queued late by the unreviewed backstop (p90 {bp90}s): their finish queued no "
+                            "review (its git read timed out or the review cap was full) and sweep_unreviewed found "
+                            "them later: see the daemon log's 'no review queued' and 'tick step sweep_unreviewed "
+                            "stopped at its budget' lines")
+            if mine and not ok:
+                why = f"{why}; {why_not}" if why else why_not
+            else:
+                changes += mine
+            if why:
+                kept.append({"lane": name, "key": key, "why": why})
         elif name == "push_batch":
             n, wp90 = ln.get("window_count", 0), ln.get("window_p90_s", 0)
             target = max(FLOORS[key], int(cur // 2))

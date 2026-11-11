@@ -324,3 +324,409 @@ def test_ttp_new_on_another_host_quotes_every_forwarded_word_so_empty_or_spaced_
     cli.new_remote(a, "brief")
     assert shlex.split(seen[-1][-1]) == ["$HOME/stage dir/bin/ttp", "new", "demo", "--dir", "$HOME/my project/root",
                                          "--provider", "", "--no-service", "--describe-file", "-"], seen[-1]
+
+
+# ssh connection reuse (template/bin/ssh, sshmux.py). A fake "real ssh" further down PATH records its
+# argv; the wrapper is a copy of the template's.
+_FAKE_SSH = """#!/bin/sh
+printf '%s\\n' "$*" >> "$FAKE_LOG"
+case " $* " in *" -O stop "*) exit 0 ;; esac
+[ -n "$FAKE_PID" ] && { echo $$ > "$FAKE_PID"; exec sleep "${FAKE_SLEEP:-30}"; }
+case " $* " in *"ControlMaster=auto"*) [ -n "$FAKE_MUX_FAIL" ] && { echo "mux_client_hello_exchange: write packet: Broken pipe" >&2; exit 255; } ;; esac
+exit "${FAKE_RC:-0}"
+"""
+
+
+def _run_wrapper(tmp_path, args, **extra):
+    import shutil
+    import subprocess
+    wbin, rbin, home = tmp_path / "wbin", tmp_path / "rbin", tmp_path / "home"
+    for d in (wbin, rbin, home):
+        d.mkdir(exist_ok=True)
+    shutil.copy(RUNTIME.parent / "template" / "bin" / "ssh", wbin / "ssh")
+    (wbin / "ssh").chmod(0o755)
+    (rbin / "ssh").write_text(_FAKE_SSH)
+    (rbin / "ssh").chmod(0o755)
+    log = tmp_path / "log"
+    log.unlink(missing_ok=True)
+    e = {"PATH": f"{wbin}:{rbin}:/usr/bin:/bin", "HOME": str(home), "FAKE_LOG": str(log), "TMPDIR": str(tmp_path),
+         **{k: str(v) for k, v in extra.items()}}
+    r = subprocess.run([str(wbin / "ssh"), *args], env=e, capture_output=True, text=True, timeout=30)
+    return r, (log.read_text().splitlines() if log.exists() else [])
+
+
+def test_the_ssh_wrapper_adds_connection_reuse_in_a_private_folder(tmp_path):
+    import shutil
+    import stat
+    import tempfile
+    home = pathlib.Path(tempfile.mkdtemp(prefix="h", dir="/tmp"))   # short: a pytest tmp_path may be over 45
+    try:
+        r, log = _run_wrapper(tmp_path, ["-F", "cfg", "-J", "jump", "-o", "BatchMode=yes", "host-a", "true"],
+                              HOME=home)
+        cm = home / ".tt-project" / "cm"
+        mode = stat.S_IMODE(cm.stat().st_mode)
+    finally:
+        shutil.rmtree(home)
+    assert r.returncode == 0 and len(log) == 1
+    for opt in ("ControlMaster=auto", f"ControlPath={cm}/%C", "ControlPersist=600",
+                "ServerAliveInterval=15", "ServerAliveCountMax=3"):
+        assert f"-o {opt}" in log[0]
+    assert log[0].endswith("-F cfg -J jump -o BatchMode=yes host-a true")   # -F, ProxyJump, BatchMode kept
+    assert mode == 0o700
+    assert "/.ssh" not in log[0]
+    assert not list(tmp_path.glob("ttp-ssh.*"))                              # its stderr copy is removed
+
+
+@pytest.mark.parametrize("args,extra", [
+    (["host-a", "true"], {"TTP_SSH_REUSE": "0"}),
+    (["-S", "/x/sock", "host-a", "true"], {}),
+    (["-o", "ControlMaster=no", "host-a", "true"], {}),
+    (["-oControlPath=none", "host-a", "true"], {}),
+    (["-o", "controlpath=/x/%C", "host-a", "true"], {}),
+    (["-O", "check", "host-a"], {}),
+    (["-L", "8080:localhost:80", "host-a"], {}),
+    (["-N", "host-a"], {}),
+    (["-G", "host-a"], {}),
+    (["-p", "22", "-fN", "host-a"], {}),
+    (["-v", "host-a", "true"], {}),
+    (["-o", "BatchMode=yes", "-vvv", "host-a", "true"], {}),
+])
+def test_the_ssh_wrapper_leaves_calls_that_set_their_own_sharing_or_forward(tmp_path, args, extra):
+    r, log = _run_wrapper(tmp_path, args, **extra)
+    assert r.returncode == 0 and log == [" ".join(args)]
+
+
+def test_the_ssh_wrapper_reads_only_options_before_the_host(tmp_path):
+    """A remote command's words (-Rf) and an option's value (-i -N) are not read as ssh options."""
+    r, log = _run_wrapper(tmp_path, ["-i", "-N", "host-a", "rm", "-Rf", "/tmp/x"])
+    assert r.returncode == 0 and "ControlMaster=auto" in log[0]
+    assert log[0].endswith("-i -N host-a rm -Rf /tmp/x")
+
+
+def test_the_ssh_wrapper_passes_the_remote_exit_code_without_a_retry(tmp_path):
+    r, log = _run_wrapper(tmp_path, ["host-a", "exit 3"], FAKE_RC=3)
+    assert r.returncode == 3 and len(log) == 1
+    r, log = _run_wrapper(tmp_path, ["host-a", "false"], FAKE_RC=255)   # 255 without a sharing error
+    assert r.returncode == 255 and len(log) == 1
+
+
+def test_a_broken_shared_connection_is_left_to_ssh_itself(tmp_path):
+    """OpenSSH with ControlMaster=auto removes a stale socket and connects directly; the wrapper adds no retry
+    of its own and passes ssh's exit code and stderr through."""
+    r, log = _run_wrapper(tmp_path, ["-o", "BatchMode=yes", "host-a", "exit 4"], FAKE_MUX_FAIL=1, FAKE_RC=4)
+    assert r.returncode == 255 and len(log) == 1 and "ControlMaster=auto" in log[0]
+    assert "mux_client_hello" in r.stderr
+
+
+def _wrapper_env(tmp_path, **extra):
+    import shutil
+    wbin, rbin, home = tmp_path / "wbin", tmp_path / "rbin", tmp_path / "home"
+    for d in (wbin, rbin, home):
+        d.mkdir(exist_ok=True)
+    shutil.copy(RUNTIME.parent / "template" / "bin" / "ssh", wbin / "ssh")
+    (wbin / "ssh").chmod(0o755)
+    (rbin / "ssh").write_text(_FAKE_SSH)
+    (rbin / "ssh").chmod(0o755)
+    return wbin / "ssh", {"PATH": f"{wbin}:{rbin}:/usr/bin:/bin", "HOME": str(home), "FAKE_LOG": str(tmp_path / "log"),
+                          "TMPDIR": str(tmp_path), **{k: str(v) for k, v in extra.items()}}
+
+
+def _ssh_alive(pid):
+    import os
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def _ssh_pid_from(path, s=10.0):
+    import time
+    end = time.monotonic() + s
+    while time.monotonic() < end:
+        if path.exists() and path.read_text().strip():
+            return int(path.read_text())
+        time.sleep(0.02)
+    raise AssertionError(f"{path} never written")
+
+
+def test_a_sigterm_to_the_ssh_wrapper_stops_the_real_ssh_at_once(tmp_path):
+    """The wrapper execs the real ssh: the caller's pid is ssh's, so its SIGTERM reaches ssh, not a shell that
+    waits for its child (measured before the fix: 36 s for a 37 s child)."""
+    import signal
+    import subprocess
+    import time
+    w, e = _wrapper_env(tmp_path, FAKE_PID=tmp_path / "pid", FAKE_SLEEP=30)
+    proc = subprocess.Popen([str(w), "host-a", "sleep 30"], env=e)
+    try:
+        pid = _ssh_pid_from(tmp_path / "pid")
+        assert pid == proc.pid                     # exec: no wrapper process between the caller and ssh
+        t = time.monotonic()
+        proc.send_signal(signal.SIGTERM)
+        proc.wait(timeout=2)
+        assert time.monotonic() - t < 2 and not _ssh_alive(pid)
+    finally:
+        proc.kill()
+        proc.wait()
+
+
+def test_a_timeout_kill_of_the_ssh_wrapper_leaves_no_real_ssh_running(tmp_path):
+    """subprocess.run's timeout SIGKILLs the pid it started (stepclock.kill_tree on macOS has no /proc to
+    find descendants): that pid is the real ssh, so nothing is left under pid 1."""
+    import subprocess
+    w, e = _wrapper_env(tmp_path, FAKE_PID=tmp_path / "pid", FAKE_SLEEP=30)
+    with pytest.raises(subprocess.TimeoutExpired):
+        subprocess.run([str(w), "host-a", "sleep 30"], env=e, timeout=1)
+    pid = _ssh_pid_from(tmp_path / "pid")
+    assert not _ssh_alive(pid), f"real ssh {pid} outlived the kill"
+
+
+def test_the_ssh_wrapper_keeps_its_socket_path_under_the_unix_limit(tmp_path):
+    import os
+    r, log = _run_wrapper(tmp_path, ["host-a", "true"], TTP_SSH_CM_DIR=tmp_path / ("d" * 70))
+    want = f"/tmp/ttp-cm-{os.getuid()}"
+    assert r.returncode == 0 and f"ControlPath={want}/%C" in log[0]
+    # %C is 40 hex characters and ssh appends a 17-character suffix while it binds: a folder of at most
+    # 45 characters (the wrapper's limit) keeps the path and its NUL within macOS's 104-byte limit.
+    assert 45 + 1 + 40 + 17 + 1 <= 104 and len(want) <= 45
+    r, log = _run_wrapper(tmp_path, ["host-a", "true"], TTP_SSH_CM_DIR="/tmp/" + "d" * 40)   # 45: kept
+    assert f"ControlPath=/tmp/{'d' * 40}/%C" in log[0]
+    os.rmdir("/tmp/" + "d" * 40)
+
+
+def test_sshmux_routes_bare_ssh_to_the_wrapper_unless_reuse_is_off():
+    from ttp import sshmux
+    assert sshmux.enabled(None) and sshmux.enabled({"ssh": {"reuse": True}})
+    assert not sshmux.enabled({"ssh": {"reuse": False}}) and not sshmux.enabled({"ssh": {"reuse": "off"}})
+    assert sshmux.env({"ssh": {"reuse": False}}) == {"TTP_SSH_REUSE": "0"}
+    w = sshmux.wrapper()
+    assert w and w.endswith("/bin/ssh")
+    assert sshmux.argv(["ssh", "-o", "BatchMode=yes", "h", "true"], {}) == [w, "-o", "BatchMode=yes", "h", "true"]
+    assert sshmux.argv(["ssh", "h"], {"TTP_SSH_REUSE": "0"}) == ["ssh", "h"]
+    assert sshmux.argv(["/usr/bin/ssh", "h"], {}) == ["/usr/bin/ssh", "h"]
+    assert sshmux.argv("ssh h", {}) == "ssh h"
+
+
+def test_stepclock_sends_the_daemons_ssh_through_the_wrapper(monkeypatch):
+    from ttp import sshmux, stepclock
+    seen = []
+    monkeypatch.setitem(stepclock._orig, "init", lambda self, args, *a, **kw: seen.append(args))
+    stepclock._init(None, ["ssh", "h", "true"], env={"TTP_SSH_REUSE": "1"})
+    stepclock._init(None, ["ssh", "h", "true"], env={"TTP_SSH_REUSE": "0"})
+    assert seen[0][0] == sshmux.wrapper() and seen[1][0] == "ssh"
+
+
+def test_project_commands_carry_the_ssh_reuse_switch(env):
+    from ttp.project import command_env
+    p = _device_project(env, device=False)
+    assert command_env(p).get("TTP_SSH_REUSE") == "1"
+    p.set_config("ssh.reuse", False)
+    assert command_env(p).get("TTP_SSH_REUSE") == "0"
+
+
+def test_the_ssh_wrapper_removes_a_non_socket_left_in_its_socket_folder(tmp_path):
+    """ssh runs unshared past a plain file or symlink at the socket path: the wrapper removes those from its own
+    folder before ssh starts, and keeps sockets, subfolders and anything outside the folder."""
+    import shutil
+    import socket
+    import tempfile
+    cm = pathlib.Path(tempfile.mkdtemp(prefix="c", dir="/tmp"))   # short: the wrapper's folder limit is 45
+    s = socket.socket(socket.AF_UNIX)
+    try:
+        bad, link, hidden, outside = cm / ("a" * 40), cm / ("b" * 40), cm / ".x", tmp_path / "keep"
+        for f in (bad, hidden, outside):
+            f.write_text("")
+        link.symlink_to(outside)
+        s.bind(str(cm / ("c" * 40)))
+        (cm / "sub").mkdir()
+        r, log = _run_wrapper(tmp_path, ["host-a", "true"], TTP_SSH_CM_DIR=cm)
+        assert r.returncode == 0 and len(log) == 1
+        assert sorted(x.name for x in cm.iterdir()) == ["c" * 40, "sub"]
+        assert outside.exists()
+    finally:
+        s.close()
+        shutil.rmtree(cm)
+
+
+def test_ssh_reuse_off_reaches_the_daemons_own_ssh_calls(env, monkeypatch):
+    """launchd and systemd start the daemon without TTP_SSH_REUSE: each config load sets it from ssh.reuse, so a
+    daemon-side subprocess ssh with no env= runs the plain ssh while reuse is off and the wrapper while on."""
+    from ttp import daemon, sshmux, stepclock
+    seen = []
+    monkeypatch.setitem(stepclock._orig, "init", lambda self, args, *a, **kw: seen.append(args))
+    monkeypatch.setenv("TTP_SSH_REUSE", "1")   # recorded, so the value the daemon sets is undone after
+    monkeypatch.delenv("TTP_SSH_REUSE")
+    p = make(env)
+    p.set_config("ssh.reuse", False)
+    d = daemon.Daemon(p.base)
+    stepclock._init(None, ["ssh", "h", "true"])
+    assert seen[-1][0] == "ssh"
+    p.set_config("ssh.reuse", True)
+    d._load_config()
+    stepclock._init(None, ["ssh", "h", "true"])
+    assert seen[-1][0] == sshmux.wrapper()
+
+
+# A password manager's ssh agent that is locked or waits for approval (sshagent.py). Every test stubs
+# ssh and uses a made-up socket path: no real agent, key or ssh folder is read, and no key is made.
+_AGENT_ERR = ('sign_and_send_pubkey: signing failed for ED25519 "unattended" from agent: agent refused operation\n'
+              "box-a: Permission denied (publickey).")
+_PM_SOCK = "/fake-home/Group Containers/ABC.com.1password/t/agent.sock"
+
+
+def test_an_agent_refusal_is_the_ssh_agent_here_not_the_host(env, monkeypatch):
+    from types import SimpleNamespace
+    from ttp import hostmap, sshagent
+    assert sshagent.password_manager(_PM_SOCK) and sshagent.password_manager("/fake-home/bitwarden-agent")
+    assert not sshagent.password_manager("/tmp/ssh-XYZ/agent.123") and not sshagent.password_manager("")
+    # ssh's 255 with the agent's words: "not yet" (1), or 14 when classified; never auth (11) or unreachable
+    assert hostmap.classify(255, _AGENT_ERR) == 1
+    assert hostmap.classify(255, _AGENT_ERR, classified=True) == hostmap.AGENT_RC
+    assert hostmap.classify(255, "box-a: Permission denied (publickey).") == hostmap.AUTH_RC
+    assert hostmap.classify(255, "communication with agent failed") == 1
+    monkeypatch.setattr(hostmap.subprocess, "run", lambda argv, **k: SimpleNamespace(
+        returncode=255, stdout="", stderr=_AGENT_ERR))
+    assert hostmap.preflight("box-a", classified=True)[0] == hostmap.AGENT_RC
+
+    # A BatchMode ssh that hangs: the agent waits for approval when a password manager serves it
+    def hang(argv, **k):
+        raise subprocess.TimeoutExpired(argv, 1)
+    monkeypatch.setattr(hostmap.subprocess, "run", hang)
+    monkeypatch.setenv("SSH_AUTH_SOCK", _PM_SOCK)
+    rc, out = hostmap.preflight("box-a", timeout=1)
+    assert rc == 1 and sshagent.WHY in out
+    monkeypatch.setenv("SSH_AUTH_SOCK", "/tmp/ssh-XYZ/agent.123")
+    assert hostmap.preflight("box-a", timeout=1)[0] == 255   # a plain agent: the host did not answer
+
+
+def test_a_locked_agent_raises_one_alert_and_one_coordinator_offer_per_episode(env):
+    from ttp import alerts, sshagent
+    from ttp.daemon import Daemon
+    p = make(env)
+    d = Daemon(p.base)
+    now = time.time()
+    assert sshagent.seen(d, "task #1's probe", _AGENT_ERR, now)
+    assert not sshagent.seen(d, "task #2's probe", _AGENT_ERR, now + 60)   # the same episode
+    eps = p.db.q("SELECT * FROM alerts WHERE key=?", (sshagent.KEY,))
+    assert len(eps) == 1 and eps[0]["cleared"] is None and eps[0]["severity"] == "normal"
+    assert sshagent.WHY in eps[0]["text"] and "unlock the password manager" in eps[0]["text"]
+    assert alerts.holds(p.db, sshagent.KEY, now, now + 60)
+    evs = p.db.q("SELECT * FROM events WHERE kind=?", (sshagent.EVENT,))
+    assert len(evs) == 1
+    # the fallback goes only through the coordinator's ask path, and never as an unattended key
+    assert "ask_user (blocking access)" in evs[0]["text"] and "Never create a key unattended" in evs[0]["text"]
+    assert "IdentitiesOnly" in evs[0]["text"] and "never forwarded" in evs[0]["text"]
+    assert not sshagent.settle(d, now + 60 + sshagent.QUIET_S - 1)
+    assert sshagent.settle(d, now + 60 + sshagent.QUIET_S + 1)
+    assert p.db.one("SELECT cleared FROM alerts WHERE key=?", (sshagent.KEY,))["cleared"]
+    assert sshagent.seen(d, "task #1's probe", _AGENT_ERR, now + 2 * sshagent.QUIET_S + 120)   # a new episode
+    assert len(p.db.q("SELECT id FROM events WHERE kind=?", (sshagent.EVENT,))) == 2
+
+
+def test_a_waiting_probe_refused_by_the_agent_sleeps_on_without_a_host_fault(env, monkeypatch):
+    from ttp import daemon as dmod, sshagent
+    p = make(env)
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
+    b = p.harness / "bin"
+    b.mkdir(parents=True, exist_ok=True)
+    (b / "ssh").write_text("#!/bin/sh\nprintf '%s\\n' 'sign_and_send_pubkey: signing failed for ED25519 \"k\" from "
+                           "agent: agent refused operation' 'Permission denied (publickey).' >&2\nexit 255\n")
+    (b / "ssh").chmod(0o755)
+    d = dmod.Daemon(p.base)
+    hosts = []
+    monkeypatch.setattr(d, "_check_hosts", lambda h, now: hosts.extend(h))
+    tid = _due_waiting_task(p, "ssh -o BatchMode=yes box-a test -e /tmp/marker")
+    p.db.update_task(tid, not_before=time.time() + 3600)
+    _settle_probe(d, tid)
+    assert d._probe_rc[tid][0] == 1 and not _ready(p, tid)   # not yet: it sleeps on
+    assert hosts == [] and not p.db.kv("network_outage")       # no host checked, no outage counted
+    assert not p.db.q("SELECT id FROM alerts WHERE key LIKE 'machine%' OR key LIKE 'network%'")
+    assert len(p.db.q("SELECT id FROM alerts WHERE key=? AND cleared IS NULL", (sshagent.KEY,))) == 1
+    assert len(p.db.q("SELECT id FROM events WHERE kind=?", (sshagent.EVENT,))) == 1
+
+
+def _agent_stub_ssh(p, body):
+    b = p.harness / "bin"
+    b.mkdir(parents=True, exist_ok=True)
+    (b / "ssh").write_text("#!/bin/sh\n" + body)   # stub: never the real ssh, no key or agent read
+    (b / "ssh").chmod(0o755)
+    for tool in ("ssh-add", "ssh-keygen"):   # any call would be a bug: they leave a marker
+        (b / tool).write_text(f"#!/bin/sh\ntouch '{p.base}/{tool}-ran'\nexit 1\n")
+        (b / tool).chmod(0o755)
+
+
+def _assert_agent_not_host(p, d, tid):
+    from ttp import downwait, sshagent
+    assert d._probe_rc[tid][0] == 1 and not _ready(p, tid)   # not yet: it sleeps on
+    assert not downwait.episodes(p.db) and not p.db.kv("network_outage")
+    assert not p.db.q("SELECT id FROM events WHERE kind IN ('host_down','probe_broken')")
+    assert not p.db.q("SELECT id FROM alerts WHERE key LIKE 'machine%' OR key LIKE 'network%'")
+    assert len(p.db.q("SELECT id FROM alerts WHERE key=? AND cleared IS NULL", (sshagent.KEY,))) == 1
+    assert len(p.db.q("SELECT id FROM events WHERE kind=?", (sshagent.EVENT,))) == 1
+    assert not list(p.base.glob("ssh-*-ran"))
+
+
+def test_a_probe_that_drops_stderr_is_still_told_apart_by_the_daemons_own_host_check(env, monkeypatch):
+    """The probe's 255 carries no agent words (2>/dev/null): the daemon's confirm ssh (netwait.answers)
+    sees the agent's refusal, so the host is neither down nor up and the wait goes on."""
+    from ttp import daemon as dmod
+    p = make(env)
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
+    _agent_stub_ssh(p, "echo 'sign_and_send_pubkey: signing failed for ED25519 \"k\" from agent: "
+                       "agent refused operation' >&2\nexit 255\n")
+    d = dmod.Daemon(p.base)
+    tid = _due_waiting_task(p, "ssh box-a test -e /m 2>/dev/null")
+    p.db.update_task(tid, not_before=time.time() + 3600)
+    _settle_probe(d, tid)
+    _assert_agent_not_host(p, d, tid)
+
+
+def test_a_host_check_that_hangs_on_a_password_manager_agent_is_not_yet(env, monkeypatch):
+    """The probe exits 255 with no words; the confirm ssh hangs while SSH_AUTH_SOCK names a password
+    manager's agent (a made-up path): the agent waiting for approval, not the host."""
+    from ttp import daemon as dmod, netwait
+    p = make(env)
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
+    monkeypatch.setattr(netwait, "CONFIRM_TIMEOUT_S", -18)   # the confirm ssh is cut after 2 s
+    monkeypatch.setenv("SSH_AUTH_SOCK", "/fake-home/1password/agent.sock")
+    _agent_stub_ssh(p, 'case "$*" in *" true") exec sleep 30;; -G*) exit 0;; esac\nexit 255\n')
+    d = dmod.Daemon(p.base)
+    tid = _due_waiting_task(p, "ssh box-a test -e /m 2>/dev/null")
+    p.db.update_task(tid, not_before=time.time() + 3600)
+    _settle_probe(d, tid)
+    _assert_agent_not_host(p, d, tid)
+
+
+def test_a_heal_check_refused_by_the_agent_is_unknown_never_a_fault(env):
+    from ttp import heal, sshagent
+    p, d, up = _heal_setup(env)
+    spec, now = _heal_spec(p), time.time()
+    chk = "echo 'sign_and_send_pubkey: signing failed: agent refused operation' >&2; exit 255"
+    status, _ = heal.run(d, "svc", dict(spec, check=chk), now)
+    assert status.startswith("ok (unknown: the ssh agent here") and heal.state(p.db, "svc").get("status") != "unhealthy"
+    assert not up.exists() and not heal.state(p.db, "svc").get("task")   # no fix ran or was queued
+    assert len(p.db.q("SELECT id FROM alerts WHERE key=?", (sshagent.KEY,))) == 1
+
+
+def test_a_remote_check_refused_by_the_agent_is_an_environment_fault_naming_the_agent(monkeypatch):
+    from types import SimpleNamespace
+    from ttp import remotecheck, sshagent
+    monkeypatch.setattr(remotecheck.subprocess, "run", lambda argv, **k: SimpleNamespace(
+        returncode=255, stdout="", stderr=_AGENT_ERR))
+    why = remotecheck.reachable("box-a")
+    assert sshagent.WHY in why and "cannot reach" not in why
+    said = []
+    monkeypatch.setattr(remotecheck, "_say", said.append)
+    assert remotecheck._fault("box-a", why) == remotecheck.FAULT_RC   # waits and retries; the change never fails
+    assert "Not the host and not the change" in said[-1]
+
+
+def test_no_runtime_code_runs_ssh_keygen_or_ssh_add():
+    # Only the guards name them (to block or watch them); nothing in the runtime makes or loads a key.
+    import re as _re
+    import ttp
+    root = Path(ttp.__file__).parent
+    guards = {"credguard.py", "pathguard.py", "credwatch.py", "sidefx.py"}
+    call = _re.compile(r"""["']ssh-(?:keygen|add)["']\s*[,\]]|\bssh-keygen\s+-[tf]""")
+    hits = [f.name for f in root.rglob("*.py") if f.name not in guards and call.search(f.read_text())]
+    assert hits == [], hits

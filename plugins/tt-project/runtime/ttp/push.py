@@ -38,11 +38,12 @@ import sys
 import tempfile
 import threading
 import time
+from collections import deque
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import quote, unquote
 
-from . import (checkcap, checkdirs, checkwait, checklane, cleantree, envfault, gitcache, gitmemo, hoststate, landed, landmark, leakfile, locks, machines, pooladmit, prguard, prhead, remotecheck, repoid, runner, runnerenv,
+from . import (checkcap, checkdirs, checkspill, checkwait, checklane, cleantree, envfault, gatejudge, gatetime, gitcache, gitmemo, hoststate, landed, landmark, leakfile, locks, machines, outscan, pooladmit, prguard, prhead, remotecheck, remoteload, repoid, runner, runnerenv,
                sandbox, scriptwatch, settinghold, setupfault, shorttmp, slurmcheck, syntaxfault, testslots, timefmt, workerloss, worktree)
 from .budget import DOC_SUFFIXES
 from .db import continues_id, dependency_ids, load_result
@@ -68,12 +69,14 @@ POOL_STATUS_SUFFIX = ".pool"     # beside a detached push's marker: its check's 
 QUEUED = 1075                    # once()'s answer for a check still queued at its outer bound: never a process's code
 POOL_STARVED = 1124              # _timed_wait's answer for a check ended at its pool-wait bound: never a process's code
 POOL_BUSY = 1175                 # _timed_wait's answer for a check still waiting for a pool slot at its limit: never a process's code
+GATE_LINES = 20000                # a failed check's last output lines the tests gate reads its failing ids from (_gate)
 QUEUED_RETRY_S = 1800            # a push whose check stayed queued is tried again after this
 TIMINGS = "push_checks.json"   # under the project's state: how long the last full check run took
 BUMP_TRAILER = "Ttp-Version-Bump"   # marks the bump commit ttp push made, so a rerun replaces it
 VERSION_RE = re.compile(r"""(version(?:__)?["']?\s*[:=]\s*["'])(\d+)\.(\d+)\.(\d+)(["'])""", re.I)
 PROTECTED = {"HEAD", "main", "master"}
 OWN_BRANCH = re.compile(r"ttp/t(\d+)-\S+")   # a task's own branch, as worktree.ensure names it
+NAMED_BRANCH = re.compile(r"(?<![\w/.-])ttp/t(\d+)-[\w./-]*[\w-]")   # such a branch named in prose
 NOTES_BRANCH = re.compile(r"ttp/t(\d+)-(?:\S+-)?notes")   # a task's notes branch: ttp/t<id>-notes, ...-notes
 NO_CHECKS = ("set delivery.push_checks to the commands that must pass on the exact commit before it "
              "is pushed (a list, or one per line, e.g. the repository's test suite); the coordinator "
@@ -230,20 +233,38 @@ def with_host(checks: list, default: Any) -> list:
 WRAP_KEY = "checks.wrap_cmd"
 
 
-def wrap_of(cfg: dict | None) -> tuple[str, ...]:
+def wrap_of(cfg: dict | None, repo: Path | str | None = None, p: Project | None = None) -> tuple[str, ...]:
     """`checks.wrap_cmd` as argv words: a project's own lock or queue command that each command given
     after `--` to `ttp checks` (and the ones `ttp push --own` reruns from that record) runs behind, the
     command passed to it as separate arguments. () when unset or empty. ValueError when it is not a
-    string or its quoting does not parse; callers fail the checks then, never run the command unwrapped."""
+    string or its quoting does not parse; callers fail the checks then, never run the command unwrapped.
+    A map `{"cmd": "<command>", "repos": ["<repo key>", ...]}` scopes it to the repositories it serves,
+    keyed as delivery.push_checks_by_repo is (repo_named): with `repo` (the checked repository; `p` its
+    project) one it does not name gets (), so its checks run unwrapped. No `repo`: the wrapper itself,
+    whatever its scope (its lock's identity)."""
     v = ((cfg or {}).get("checks") or {}).get("wrap_cmd") if isinstance((cfg or {}).get("checks"), dict) else None
+    repos: list[str] | None = None
+    if isinstance(v, dict):
+        if bad := set(map(str, v)) - {"cmd", "repos"}:
+            raise ValueError(f"{WRAP_KEY} takes only cmd and repos, not {', '.join(sorted(bad))}")
+        repos = [v["repos"]] if isinstance(v.get("repos"), str) else v.get("repos")
+        if not isinstance(repos, list) or not repos or not all(isinstance(k, str) and k.strip() for k in repos):
+            raise ValueError(f"{WRAP_KEY}.repos must be a repo key or a non-empty list of them (as "
+                             f"delivery.{BY_REPO} keys: {HARNESS_KEY!r}, a path or a checkout's folder name)")
+        v = v.get("cmd")
+        if not isinstance(v, str) or not v.strip():
+            raise ValueError(f"{WRAP_KEY}.cmd must be a command string")
     if v is None or v == "":
         return ()
     if not isinstance(v, str):
-        raise ValueError(f"{WRAP_KEY} must be a command string, not {type(v).__name__}")
+        raise ValueError(f"{WRAP_KEY} must be a command string or a map of cmd and repos, not {type(v).__name__}")
     try:
-        return tuple(shlex.split(v))
+        words = tuple(shlex.split(v))
     except ValueError as e:
         raise ValueError(f"{WRAP_KEY} {v!r} does not parse: {e}") from e
+    if repos is not None and repo is not None and not repo_named(repos, Path(repo), p):
+        return ()
+    return words
 
 
 def wrap_problem(wrap: tuple[str, ...], cwd: str | Path, env: dict | None = None) -> str:
@@ -965,6 +986,67 @@ def check_slot(head: str, say: Callable[[str], None], who: str = "", priority: s
     return slot
 
 
+def run_slot(run: list, head: str, say: Callable[[str], None], priority: str = "",
+             proj: Project | None = None) -> checkcap.Slot:
+    """The slot a push's check run holds: check_slot only when one of `run` runs here and is no light
+    check (checklane.is_light). Checks run on another host (remote_host) use none of this machine's
+    CPU: they take no host-wide checks slot or test slots here and never wait for this machine's load
+    guard; they wait instead while their host is overloaded (remoteload.wait), at most
+    checks.push_load_wait_s, then go ahead."""
+    if proj is None and (base := os.environ.get("TTP_PROJECT")):
+        proj = Project(base)
+    cfg = proj.config() if proj else {}
+    if hosts := list(dict.fromkeys(h for c in run if (h := remote_host(c)))):
+        remoteload.wait(hosts, say, testslots.push_load_wait_s(cfg))
+    pats = checklane.light_patterns(cfg)
+    if any(not remote_host(c) and not checklane.is_light(str(c), pats) for c in run):
+        return check_slot(head, say, priority=priority, proj=proj)
+    return checkcap.Slot()
+
+
+def spill_slot(cmds: list, head: str, say: Callable[[str], None], proj: Project | None = None,
+               what: str = "push checks") -> tuple[Any, list]:
+    """With delivery.checks_spill_first on and spill hosts set, the push checks `cmds` go to a spill host
+    before any place here, as `ttp checks` and the push batch send theirs (checkspill.spill_run): (a slot
+    holding that host's claim and no slot here, `cmds` sent there; a check that may not spill but is cheap
+    runs here beside them), else (None, `cmds`): check_slot then. A check's own "host" stays its own. The
+    spill hosts are a speed-up: an error trying them keeps the checks here. Nested in a check that holds a
+    slot already (checkcap.HELD_ENV) it never spills. `proj` defaults to TTP_PROJECT's project."""
+    if proj is None and (base := os.environ.get("TTP_PROJECT")):
+        proj = Project(base)
+    if proj is None or not cmds or os.environ.get(checkcap.HELD_ENV):
+        return None, cmds
+    try:
+        claim, out = checkspill.spill_run(proj, proj.config(), cmds, say, f"{what} on {head[:10]}")
+    except Exception as e:   # noqa: BLE001
+        say(f"spill hosts not tried ({e}): the checks run here")
+        return None, cmds
+    if claim is None:
+        return None, cmds
+    slot = checkcap.Slot()
+    slot.spill = claim
+    return slot, out
+
+
+def _run_or_here(cmd: Any, repo: Path, env: dict, say: Callable[[str], None], seen: dict,
+                 here: Callable[[], Any]) -> tuple[Any, int]:
+    """_run_one, and a check spill_slot sent to a spill host that could not run it (BUSY: ssh, the host or
+    its pool, never the change) once more here, in the slot `here()` takes: (the check that ran last, its
+    exit code). A spill host's fault never holds the push."""
+    rc = _run_one(cmd, repo, env, say, seen)
+    if rc != BUSY or (was := getattr(cmd, "was", None)) is None:
+        return cmd, rc
+    say(f"spill host {remote_host(cmd)} could not run {was}: running it here")
+    seen.clear()
+    try:
+        slot = here()
+    except checkcap.Unavailable as e:
+        say(f"{e}; not pushing")
+        return was, CHECKS_FAILED
+    with slot:
+        return was, _run_one(was, repo, {**env, **slot.env()}, say, seen)
+
+
 def priority_key(repo: Path, remote: str, branch: str) -> str:
     """The push branch as one name host-wide, whichever project or clone pushes to it: the remote's
     URL (without a trailing .git or /) and the branch; the repository's path when it has no URL."""
@@ -1145,6 +1227,8 @@ def mirror_check(v: Any, push_branch: str) -> list[dict]:
 
 def _git_net(repo: Path, *args: str, timeout_s: float = MIRROR_TIMEOUT_S) -> subprocess.CompletedProcess:
     """git that talks to a remote: no prompt, no stdin, at most `timeout_s` (exit 124 when it runs past)."""
+    if args[:1] == ("push",):
+        _git_push_began()
     t = gitmemo.timeout(timeout_s, args)
     try:
         return gitmemo.run(["git", "-C", str(repo), *args], text=True, capture_output=True,
@@ -1725,6 +1809,8 @@ def unmatched_paths(repo: Path, remote: str, branch: str, checks: list[str]) -> 
 
 def _git(repo: Path, *args: str, quiet: bool = True) -> subprocess.CompletedProcess:
     """Run git; when not quiet its output goes to stderr, keeping stdout for the verdict."""
+    if args[:1] == ("push",):
+        _git_push_began()
     t = gitmemo.timeout(None, args)   # none of its own; capped within a daemon tick step or finish transaction
     if quiet:
         run = lambda: gitcache.run(repo, args, lambda: gitmemo.run(   # noqa: E731
@@ -1984,7 +2070,9 @@ def own_target(p: Project, repo: Path) -> tuple[str, str]:
                              f"not publishing")
         branch = onto
     elif m and task and m.group(1) != task and not _carries(p, task, m.group(1), branch):
-        raise ValueError(f"--own publishes only this task's own branch (ttp/t{task}-...), not {branch}")
+        raise ValueError(f"--own publishes only this task's own branch (ttp/t{task}-...), not {branch}, task "
+                         f"#{m.group(1)}'s branch, which this task does not carry: not pushing. If the work "
+                         f"must go onto {branch}, {pr_branch_route(branch)}")
     d = p.config().get("delivery") or {}
     remote, shared = target(p, repo) if str(d.get("push_branch") or "").strip() else ("origin", "")
     if configured := own_push_remote(d, repo):
@@ -2077,6 +2165,23 @@ def harness_repo(p: Project | None, repo: Path) -> bool:
     return bool(mine and theirs) and Path(mine).resolve() == Path(theirs).resolve()
 
 
+def _names(k: str, paths: list[Path], name: str, p: Project | None) -> bool:
+    """Whether repo key `k` (not `harness`) names the repository known by `paths` and `name` (_repo_keys):
+    its main checkout's folder name, or a path (absolute, ~, or relative to the project root)."""
+    path, root = Path(k).expanduser(), p.root if p is not None else None
+    return k == name or ("/" in k or k.startswith("~")) \
+        and (path if path.is_absolute() or root is None else root / path).resolve() in paths
+
+
+def repo_named(keys: list[str], repo: Path, p: Project | None = None) -> bool:
+    """Whether any of `keys` names `repo` as a delivery.push_checks_by_repo key would: `harness` for the
+    project's own harness repo, a path, or its main checkout's folder name."""
+    if HARNESS_KEY in keys and harness_repo(p, repo):
+        return True
+    paths, name = _repo_keys(repo)
+    return any(k != HARNESS_KEY and _names(k, paths, name, p) for k in keys)
+
+
 def repo_checks(d: dict, repo: Path, p: Project | None = None) -> tuple[Any, str]:
     """The check list for `repo` (delivery settings `d`) and where it came from. The
     delivery.push_checks_by_repo entry that names it: `harness` for the project's own harness repo,
@@ -2090,13 +2195,8 @@ def repo_checks(d: dict, repo: Path, p: Project | None = None) -> tuple[Any, str
         if harness and HARNESS_KEY in by:
             return by[HARNESS_KEY], f"delivery.{BY_REPO}.{HARNESS_KEY}"
         paths, name = _repo_keys(repo)
-        root = p.root if p is not None else None
         for k, v in by.items():
-            if k == HARNESS_KEY:
-                continue
-            path = Path(k).expanduser()
-            if k == name or ("/" in k or k.startswith("~")) \
-                    and (path if path.is_absolute() or root is None else root / path).resolve() in paths:
+            if k != HARNESS_KEY and _names(k, paths, name, p):
                 return v, f"delivery.{BY_REPO}[{k!r}]"
     if harness:
         return [c.config() for c in check_list(d.get("push_checks")) if c.purpose == "harness"], HARNESS_UNSET
@@ -2358,13 +2458,35 @@ def _move_local(repo: Path, branch: str, head: str, say: Callable[[str], None]) 
 
 def own_base(p: Project, repo: Path, remote: str) -> str | None:
     """The tip of the shared branch work leaves from (delivery.push_branch) that `ttp push --own`
-    compares with: fetched, or the local branch of that name in a repo with no git remote. None
-    when there is none."""
+    compares with: fetched, or the local branch of that name in a repo with no git remote. A worktree
+    of another repository, whose remote has no such branch, compares with that remote's own default
+    branch instead (_default_base). None when there is none."""
     try:
         tgt = target(p, repo)
     except ValueError:
         return None
-    return (_local_tip(repo, tgt[1]) if remote == LOCAL else _fetch(repo, *tgt)) or None
+    if remote == LOCAL:
+        return _local_tip(repo, tgt[1]) or None
+    return _fetch(repo, *tgt) or _default_base(repo, *tgt) or None
+
+
+def _default_base(repo: Path, remote: str, branch: str) -> str:
+    """The tip of `remote`'s default branch (its HEAD), fetched, when `remote` has no branch `branch`:
+    the repo is not the one the push branch belongs to. "" when it has that branch (its fetch failed
+    for another reason), names no default branch, or cannot be read."""
+    ls = _git(repo, "ls-remote", "--symref", remote, "HEAD", f"refs/heads/{branch}")
+    lines = ls.stdout.splitlines()
+    if ls.returncode != 0 or any(ln.endswith(f"\trefs/heads/{branch}") for ln in lines):
+        return ""
+    head = next((ln.split()[1].removeprefix("refs/heads/") for ln in lines
+                 if ln.startswith("ref: refs/heads/") and ln.endswith("\tHEAD")), "")
+    return _fetch(repo, remote, head) if head else ""
+
+
+def no_checks_hint(repo: Path) -> str:
+    """NO_CHECKS, plus the delivery.push_checks_by_repo key that gives `repo` checks of its own."""
+    return (f"{NO_CHECKS}; for this repository alone, set delivery.push_checks_by_repo"
+            f"[{_repo_keys(repo)[1]!r}] instead")
 
 
 def own_ff_only(branch: str) -> bool:
@@ -2516,7 +2638,7 @@ def own_gate(p: Project, repo: Path, remote: str, branch: str) -> None:
         raise ValueError(f"{remote} has no branch {branch}, and this project lets `ttp push --own` publish "
                          f"only onto a branch the remote already has ({setting}): not "
                          f"creating it. Never create it another way (no `git push`): "
-                         f"{own_route(p, cfg, branch) or own_landing(cfg)}")
+                         f"{own_route(p, cfg, branch) or work_route(p, branch) or own_landing(cfg)}")
 
 
 def own_route(p: Project, cfg: dict, branch: str) -> str:
@@ -2530,6 +2652,33 @@ def own_route(p: Project, cfg: dict, branch: str) -> str:
     return (f"deliver on this task's own branch instead, which may be created: commit on {own} (`git switch "
             f"-c {own}` if it is not checked out), run `ttp push --own-branch --detach` and open the PR "
             f"from {own}")
+
+
+def pr_branch_route(branch: str) -> str:
+    """How work gets onto another task's existing `branch`: only a task whose spec has a `pr_branch:`
+    line naming it publishes a fast-forward there with `ttp push --own`."""
+    return (f"hand off blocked naming {branch}: the coordinator then adds a task whose spec has the line "
+            f"`pr_branch: {branch}` and whose title has no 'rebase' (that would deliver on a new branch), "
+            f"and that task's `ttp push --own` fast-forwards the existing branch (task_update cannot set a "
+            f"running task's pr_branch)")
+
+
+def work_route(p: Project, branch: str) -> str:
+    """The route a running task that is neither a code task nor a review, refused publishing `branch`
+    the remote lacks, has, or "": it creates no branch, but a task with a `pr_branch:` line can deliver
+    onto the one other task's branch its spec names (or any existing branch)."""
+    task = os.environ.get("TTP_TASK")
+    t = _task_row(p, task) if task else None
+    if not t or (kind := str(t.get("kind") or "work")) in ("code", "review"):
+        return ""
+    named = {m.group(0) for m in NAMED_BRANCH.finditer(str(t.get("spec") or ""))
+             if m.group(1) != task and m.group(0) != branch}
+    if len(named) == 1:
+        onto = named.pop()
+        return f"a {kind} task creates no branch. If its work must go onto {onto}, which its spec names, " \
+               f"{pr_branch_route(onto)}"
+    return f"a {kind} task creates no branch. If its work must go onto another task's existing branch, " \
+           f"{pr_branch_route('<branch>')}"
 
 
 def own_pr_branch(p: Project, cfg: dict, branch: str) -> bool:
@@ -3241,6 +3390,7 @@ def record_check_s(p: Project, seconds: float) -> None:
     """Runs between passing checks and the push, so a failed write is logged and never stops it."""
     try:
         write_json(p.state / TIMINGS, {"last_s": round(seconds, 1), "at": time.time()})
+        gatetime.record(p.state, seconds)
     except OSError as e:
         print(f"ttp push: could not record the check time in {p.state / TIMINGS}: {e}", file=sys.stderr)
 
@@ -3618,7 +3768,8 @@ def publish(repo: Path, remote: str, branch: str, checks: list[str],
             base: str | None = None, ff_only: bool = False, recorded: dict | None = None,
             check_run_dir: str | None = None, reuse: Callable[[str, list, list], str] | None = None,
             host: str = "", lease: bool = False, start: str = "",
-            start_ref: str = "", never_force: bool = False, cfg: dict | None = None) -> int:
+            start_ref: str = "", never_force: bool = False, cfg: dict | None = None,
+            p: Project | None = None) -> int:
     """`ttp push --own`: run `checks` on HEAD as it is and push it to remote/branch, the task's own
     branch. No rebase and no version bump, so the pushed commit is the one reviewed; without force,
     so the remote takes only a fast-forward of what it has. Without checks, as for `ttp push`, only
@@ -3677,7 +3828,7 @@ def publish(repo: Path, remote: str, branch: str, checks: list[str],
     if not checks and (code := code_paths(repo, base) if base else ["(no push target to compare with)"]):
         more = f" and {len(code) - 3} more" if len(code) > 3 else ""
         say(f"no checks configured, and this change touches more than docs ({', '.join(code[:3])}{more}): "
-            + NO_CHECKS)
+            + no_checks_hint(repo))
         return REFUSED
     lock = hold() if hold else None
     if hold and lock is None:
@@ -3695,7 +3846,7 @@ def publish(repo: Path, remote: str, branch: str, checks: list[str],
             todo = extras = with_host(recorded_extras(recorded, head, checks), host)
             if todo:
                 try:
-                    wrap = wrap_of(cfg)
+                    wrap = wrap_of(cfg, repo, p)
                 except ValueError as e:
                     say(f"{e}; not pushing")
                     return CHECKS_FAILED
@@ -3720,7 +3871,9 @@ def publish(repo: Path, remote: str, branch: str, checks: list[str],
         if todo and (why := runner_wait(todo, repo, check_env("own", tip, check_run_dir, branch), say)):
             return why
         try:
-            slot = check_slot(head, say, priority=own_lane_key(repo, remote, cfg)) if todo else checkcap.Slot()
+            # Spill first (delivery.checks_spill_first): a spill host before the own-branch lane here.
+            slot, todo = spill_slot(todo, head, say, p)
+            slot = slot or run_slot(todo, head, say, priority=own_lane_key(repo, remote, cfg))
         except checkcap.Unavailable as e:
             say(f"{e}; not pushing")
             return CHECKS_FAILED
@@ -3729,12 +3882,21 @@ def publish(repo: Path, remote: str, branch: str, checks: list[str],
             env = {**check_env("own", tip, check_run_dir, branch), **slot.env()}
             for line in sandbox_lines(todo):
                 say(line)
+            excused = False
             for cmd in todo:
-                if (rc := _run_one(cmd, repo, env, say)) != 0:
+                cmd, rc = _run_or_here(cmd, repo, env, say, seen := {},
+                                       lambda: check_slot(head, say, priority=own_lane_key(repo, remote, cfg)))
+                if rc != 0:
+                    if rc == CHECKS_FAILED:
+                        rc = _gate_here(cmd, repo, env, say, head, base or "", seen, p,
+                                        lambda: check_slot(head, say, priority=own_lane_key(repo, remote, cfg)))
+                    if rc == 0:
+                        excused = True   # its reruns are no check time
+                        continue
                     if rc != BUSY:
                         say(f"check failed on {head[:10]}: {cmd}{where(cmd)}; not pushing")
                     return rc
-        if todo and timed:
+        if todo and timed and not excused:
             timed(time.time() - started)
         if _git(repo, "rev-parse", "HEAD").stdout.strip() != head:
             say(f"HEAD moved off {head[:10]} during the checks; not pushing")
@@ -3949,6 +4111,24 @@ def _land_squashed(repo: Path, tip: str, upstream: str, say: Callable[[str], Non
     return True
 
 
+def leak_step(repo: Path, tip: str, say: Callable[[str], None]) -> str | None:
+    """The secret-shape scan of what this push sends (tip..HEAD), run as its own first step, before the
+    rebase and the checks: a literal in the outgoing history fails in seconds, not after the smoke run
+    when the pre-push hook refuses it. A scan that cannot run is said and left to that hook."""
+    started = time.time()
+    try:
+        why = outscan.history_problem(repo, tip, "HEAD", outscan._project())
+    except Exception as e:
+        say(f"leak scan of the outgoing commits could not run ({type(e).__name__}: {str(e)[:200]}); "
+            "the pre-push hook still scans them")
+        return None
+    if why:
+        outscan.record("ttp push", why)
+        return why
+    say(f"leak scan: the outgoing commits hold no secret shape ({time.time() - started:.1f}s)")
+    return None
+
+
 def _rounds(repo: Path, remote: str, branch: str, checks: list[str], rounds: int,
             say: Callable[[str], None], version_bump: dict | None = None,
             timed: Callable[[float], None] | None = None, keep: str = "",
@@ -3975,6 +4155,9 @@ def _rounds(repo: Path, remote: str, branch: str, checks: list[str], rounds: int
         if bad := excluded(repo, tip, "HEAD", exclude or []):
             say(excluded_refusal(bad, upstream))
             return REFUSED
+        if rnd == 1 and (leak := leak_step(repo, tip, say)):
+            say(f"{leak}; not pushing")
+            return CHECKS_FAILED
         # A head built on a landed dependency's approved head leaves out its stale copies (--onto);
         # a conflict in its own commits then goes the usual way.
         ok = bool(dep := _dependency(repo, tip, landed or {}, say)) and _rebase(repo, tip, dep)
@@ -4024,7 +4207,9 @@ def _rounds(repo: Path, remote: str, branch: str, checks: list[str], rounds: int
         if run and (why := runner_wait(run, repo, check_env("target", tip, check_run_dir, branch), say)):
             return why
         try:
-            slot = check_slot(head, say, priority=priority_key(repo, remote, branch)) if run else checkcap.Slot()
+            # Spill first (delivery.checks_spill_first): a spill host before the push priority slot here.
+            slot, run = spill_slot(run, head, say)
+            slot = slot or run_slot(run, head, say, priority=priority_key(repo, remote, branch))
         except checkcap.Unavailable as e:
             say(f"{e}; not pushing")
             return CHECKS_FAILED
@@ -4034,14 +4219,24 @@ def _rounds(repo: Path, remote: str, branch: str, checks: list[str], rounds: int
             env = {**check_env("target", tip, check_run_dir, branch), **slot.env()}
             for line in sandbox_lines(run):
                 say(line)
+            excused = set()
             for cmd in run:
-                if (rc := _run_one(cmd, repo, env, say)) != 0:
+                cmd, rc = _run_or_here(cmd, repo, env, say, seen := {},
+                                       lambda: check_slot(head, say, priority=priority_key(repo, remote, branch)))
+                if rc != 0:
+                    if rc == CHECKS_FAILED:
+                        rc = _gate_here(cmd, repo, env, say, head, tip, seen, None,
+                                        lambda: check_slot(head, say, priority=priority_key(repo, remote, branch)))
+                    if rc == 0:
+                        excused.add(str(cmd))
+                        continue
                     if rc != BUSY:
                         say(f"check failed on {head[:10]}: {cmd}{where(cmd)}; not pushing")
                     return rc
-        if run and not carried and timed:
+        if run and not carried and timed and not excused:
             timed(time.time() - started)
-        passes = {str(cmd): (tip, head) for cmd in todo}
+        # A check the tests gate excused did not pass: no later round carries it.
+        passes = {str(cmd): (tip, head) for cmd in todo if str(cmd) not in excused}
         steps.go("push")
         if _fetch(repo, remote, branch) != tip:
             say(f"{upstream} moved during the checks; round {rnd + 1}")
@@ -4093,12 +4288,15 @@ def _end_group(pgid: int) -> None:
         pass
 
 
-def _copy_out(stream, collect: workerloss.Collector) -> None:
-    """A check's output into this process's output (the push log), each line also to `collect`."""
+def _copy_out(stream, collect: workerloss.Collector, keep: deque | None = None) -> None:
+    """A check's output into this process's output (the push log), each line also to `collect` (and its
+    last lines to `keep`, for the tests gate: _gate)."""
     try:
         for raw in iter(stream.readline, b""):
             line = raw.decode(errors="replace")
             collect.feed(line)
+            if keep is not None:
+                keep.append(line)
             try:
                 sys.stdout.write(line)
                 sys.stdout.flush()
@@ -4207,17 +4405,20 @@ def pool_status_words(marker: Path) -> str:
     return f"; check waited {s:.0f} s for a test-pool slot" if s >= 1 else ""
 
 
-def _run_one(cmd: Any, repo: Path, env: dict, say: Callable[[str], None]) -> int:
+def _run_one(cmd: Any, repo: Path, env: dict, say: Callable[[str], None], seen: dict | None = None) -> int:
     """Run one push check: 0 when it passes, CHECKS_FAILED when it fails, BUSY when it exits 75 itself (busy: a
     lock, a test pool or a tests gate's rerun gave it no slot, so it judged nothing), when its check host
     could not run it (an environment fault, recorded as runner_wait records a missing runner) or its
-    test workers were lost again on its one rerun, each exiting cleanly (workerloss): the host too."""
+    test workers were lost again on its one rerun, each exiting cleanly (workerloss): the host too.
+    A pass or failure fills `seen` with the check's own exit code and its last output lines (the tests gate: _gate)."""
     if remote_host(cmd):
         say(f"running {cmd}{where(cmd)}")
     collect = workerloss.Collector()
+    kept: deque = deque(maxlen=GATE_LINES)
 
     def once() -> int:
         collect.reset()
+        kept.clear()
         sys.stdout.flush()
         sys.stderr.flush()
         waits = Path(tempfile.mkdtemp(prefix="check-waits-", dir=env.get("TTP_RUN_DIR") or None)).resolve()
@@ -4240,7 +4441,7 @@ def _run_one(cmd: Any, repo: Path, env: dict, say: Callable[[str], None]) -> int
             if mark:
                 mark.close()
             raise
-        reader = threading.Thread(target=_copy_out, args=(proc.stdout, collect), daemon=True)
+        reader = threading.Thread(target=_copy_out, args=(proc.stdout, collect, kept), daemon=True)
         reader.start()
         try:
             rc = _timed_wait(proc, waits, cmd, say)
@@ -4265,6 +4466,8 @@ def _run_one(cmd: Any, repo: Path, env: dict, say: Callable[[str], None]) -> int
     while True:
         rc = scriptwatch.rerun(once, bool, None if remote_host(cmd) else str(cmd), repo, env, say, on_pass=True)
         if rc == 0:
+            if seen is not None:
+                seen.update(rc=0, text="".join(kept))
             return 0
         if rc in (QUEUED, POOL_BUSY):   # it never ran, or waited for a full pool at its limit: not the change
             say(f"{'queued, not run' if rc == QUEUED else 'busy, not failed'}: {cmd}{where(cmd)}; not pushing. "
@@ -4295,6 +4498,8 @@ def _run_one(cmd: Any, repo: Path, env: dict, say: Callable[[str], None]) -> int
         time.sleep(syntaxfault.SETTLE_S)
         rc = scriptwatch.rerun(once, bool, str(cmd), repo, env, say, on_pass=True)
         if rc == 0:
+            if seen is not None:
+                seen.update(rc=0, text="".join(kept))
             return 0
         if rc in (QUEUED, POOL_BUSY):
             say(f"{'queued, not run' if rc == QUEUED else 'busy, not failed'}: {cmd}{where(cmd)}; not pushing. "
@@ -4321,7 +4526,118 @@ def _run_one(cmd: Any, repo: Path, env: dict, say: Callable[[str], None]) -> int
         say(f"busy, not failed: {cmd}{where(cmd)} exited 75 (no free slot, lock or pool); not pushing. Hand off "
             f"`waiting`; retry_when: test \"$(date +%s)\" -ge {int(time.time()) + QUEUED_RETRY_S}")
         return BUSY
+    if seen is not None:
+        seen.update(rc=rc, text="".join(kept))
     return CHECKS_FAILED
+
+
+def _gated(cmd: Any) -> bool:
+    """Whether the tests gate (_gate) may judge check `cmd`: a local check that is no Slurm batch and runs
+    pytest once (pushpass.resumable), or a script whose pytest runs are not known (no `"pytest"` key, no pytest
+    in its words): its output tells, and its reruns select by the select plugin in PYTEST_ADDOPTS."""
+    if remote_host(cmd) or getattr(cmd, "slurm", None):
+        return False
+    said = getattr(cmd, "pytest", None)
+    return pushpass.resumable(cmd) or (said is None and pytest_runs(cmd) == 0
+                                       and not any(w in cmd for w in pushpass._OWN_ENV))
+
+
+def _gate(cmd: Any, repo: Path, env: dict, say: Callable[[str], None], head: str, target: str, seen: dict,
+          p: Project | None = None) -> int:
+    """The base-vs-head tests gate for a push check that failed (`seen`: _run_one's exit code and output), as
+    the push queue's batch and `ttp checks` judge one (gatejudge.judge): its failing pytest ids
+    (gatejudge.judgeable) rerun once at `head`, those failing again once at its merge base with `target` (the
+    push target's tip), in a temp checkout on this same host. 0 when none is new on the head (each flaky,
+    quarantined, or pre-existing: failing the same way on the base), each named; BUSY when a rerun found no
+    slot; else CHECKS_FAILED, the failure as it was. A failing id matching delivery.push_hard_tests (the leak
+    scan) is never excused. `p` (else TTP_PROJECT): its settings, base results and quarantine."""
+    if p is None and (at := os.environ.get("TTP_PROJECT")):
+        p = Project(at)
+    if p is None or not p.exists() or not _gated(cmd):
+        return CHECKS_FAILED
+    cfg = p.config()
+    ids = gatejudge.judgeable(seen.get("rc"), seen.get("text") or "", cfg)
+    if not ids:
+        return CHECKS_FAILED
+    s, now, host_ = gatejudge.settings(cfg), time.time(), gatejudge.host()
+    r = _git(repo, "merge-base", target, head) if target else None
+    mb = r.stdout.strip() if r is not None and r.returncode == 0 else ""
+    diff = _git(repo, "diff", "--name-only", f"{mb}..{head}") if mb else None
+    changed = diff.stdout.split() if diff is not None and diff.returncode == 0 else None
+
+    def touched(i: str) -> bool:   # the change touches the test's file (unknown: it does)
+        f = i.partition("::")[0]
+        return changed is None or any(x == f or x.endswith("/" + f) for x in changed)
+
+    say(f"judging the {len(ids)} failing test(s) on {head[:10]}: a rerun there, then on the base "
+        f"{mb[:10] or '(none)'} the ones failing again, on this host: {' '.join(ids)}")
+
+    def run(at: str, sel: list[str]) -> tuple[int | None, str]:
+        tree = None
+        try:
+            where_ = repo
+            if at == "base":
+                tree = cleantree.Checkout(repo, mb, env.get("TTP_RUN_DIR") or None)
+                worktree.prepare(p, tree.path)
+                where_ = tree.path
+            got: dict = {}
+            rc = _run_one(cmd, Path(where_), {**env, "PWD": str(where_), **gatejudge.select_env(sel, env)}, say, got)
+            return (BUSY if rc == BUSY else got.get("rc")), got.get("text") or ""
+        except (cleantree.Error, OSError, subprocess.SubprocessError) as e:
+            say(f"the rerun on the {at} could not tell: {e}")
+            return None, ""
+        finally:
+            if tree is not None:
+                tree.close()
+    v = gatejudge.judge(ids, run, p.state, mb, host_, now, touched, s["busy_tries"], s["busy_wait_s"])
+    rx = (cfg.get("delivery") or {}).get("push_hard_tests") or batch.HARD_TESTS
+    hard = [i for i in v["pre_existing"] + v["quarantined"] if _hard(rx, i)]
+    for k in ("pre_existing", "quarantined"):
+        v[k] = [i for i in v[k] if i not in hard]
+    v["new"] = v["new"] + hard
+    for line in gatejudge.lines(v):
+        say(line)
+    if hard:
+        say(f"never excused (delivery.push_hard_tests): {' '.join(hard)}")
+    if v["flaky"] and s["on"]:
+        new = gatejudge.quarantine(p.state, v["flaky"], {"head": head, "check": str(cmd), "host": host_,
+                                                         "task": os.environ.get("TTP_TASK") or ""}, now, s["days"])
+        if new:   # one fix note per newly quarantined test
+            # pushq._event's row, written here: pushq imports push (and landed) at import time, and a
+            # sibling import inside a function on the push path is refused
+            p.db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+                   (time.time(), "daemon", gatejudge.EVENT, "normal",
+                    gatejudge.note_text(new, head, str(cmd))[:6000], "queued", None))
+    if gatejudge.blocks(v):
+        say(f"new on {head[:10]}, the failure stands: {' '.join(v['new'])}")
+        return CHECKS_FAILED
+    if gatejudge.undecided(v):
+        return BUSY
+    say(f"none of the failing tests is new on {head[:10]}: {cmd}{where(cmd)} does not block the push")
+    return 0
+
+
+def _gate_here(cmd: Any, repo: Path, env: dict, say: Callable[[str], None], head: str, target: str, seen: dict,
+               p: Project | None, here: Callable[[], Any]) -> int:
+    """_gate for a push check that failed; one spill_slot sent to a spill host is judged as its local
+    original (`was`, as the push batch's Batch._judged does), its reruns here in the slot `here()` takes."""
+    was = getattr(cmd, "was", None)
+    if was is None or not getattr(cmd, "spilled", False):
+        return _gate(cmd, repo, env, say, head, target, seen, p)
+    try:
+        slot = here()
+    except checkcap.Unavailable as e:
+        say(f"{e}; not pushing")
+        return CHECKS_FAILED
+    with slot:
+        return _gate(was, repo, {**env, **slot.env()}, say, head, target, seen, p)
+
+
+def _hard(rx: str, test_id: str) -> bool:
+    try:
+        return bool(re.search(rx, test_id, re.I))
+    except (re.error, TypeError):
+        return bool(re.search(batch.HARD_TESTS, test_id, re.I))
 
 
 def run(p: Project, repo: Path, own: bool = False, recorded: dict | None = None, after: bool = True) -> int:
@@ -4445,7 +4761,7 @@ def _run(p: Project, repo: Path, own: bool = False, recorded: dict | None = None
                      ff_only=own_ff_only(branch) and not lease, lease=lease, start=start, start_ref=start_ref,
                      recorded=recorded or recorded_checks(os.environ.get("TTP_RUN_DIR")), check_run_dir=output,
                      reuse=lambda tree, cmds, envs, parts: _own_pass(p, tree, cmds, envs, parts), host=d.get("checks_host") or "",
-                     never_force=never_force_on(p.config()), cfg=p.config())
+                     never_force=never_force_on(p.config()), cfg=p.config(), p=p)
     else:
         rc = push(repo, remote, branch, checks, rounds, hold=lambda: take(p, remote, branch, wait_s),
                   version_bump=version_bump, timed=lambda s: record_check_s(p, s),
@@ -4602,7 +4918,8 @@ def _prune(folder: Path, now: float) -> int:
             continue
         if old and _read(marker).get("status") not in ("running", "queued"):
             n += 1
-            for f in (marker, marker.with_suffix(".log"), marker.with_suffix(POOL_STATUS_SUFFIX), _run_lock(marker)):
+            for f in (marker, marker.with_suffix(".log"), marker.with_suffix(POOL_STATUS_SUFFIX),
+                      marker.with_suffix(GIT_PUSH_SUFFIX), _run_lock(marker)):
                 try:
                     f.unlink()
                 except OSError:
@@ -4764,7 +5081,7 @@ def detach(p: Project, repo: Path, own: bool = False) -> int:
         if code := code_paths(top, base) if base else ["(no push target to compare with)"]:
             more = f" and {len(code) - 3} more" if len(code) > 3 else ""
             print(f"ttp push: no checks configured, and this change touches more than docs "
-                  f"({', '.join(code[:3])}{more}): " + NO_CHECKS, file=sys.stderr)
+                  f"({', '.join(code[:3])}{more}): " + no_checks_hint(top), file=sys.stderr)
             return REFUSED
     task = os.environ.get("TTP_TASK")
     rid = (f"t{task}-" if task else "") + time.strftime("%Y%m%d-%H%M%S") + f"-{os.getpid()}"
@@ -4818,7 +5135,28 @@ class _Stopped(Exception):
     pass
 
 
+GIT_PUSH_SUFFIX = ".gitpush"   # beside a detached push's marker once its process began a `git push` (stop_own)
+_marker_here: Path | None = None   # the marker of this process when it is a detached push (run_detached)
+_git_pushed = False   # this process began a `git push`: from here on a stop signal never interrupts it
+
+
+def _git_push_began() -> None:
+    """Mark that this process begins a `git push`, first in itself (so _stop no longer raises) and then
+    beside its marker (so `ttp push --stop` refuses it): a push to a remote is never interrupted, and once
+    one began the rest of the run (its outcome, a retry after a rejection) is short."""
+    global _git_pushed
+    _git_pushed = True
+    if _marker_here is not None:
+        try:
+            _marker_here.with_suffix(GIT_PUSH_SUFFIX).touch()
+        except OSError:
+            pass
+
+
 def _stop(sig, _frame) -> None:
+    if _git_pushed:   # os.write: a print here could re-enter a write the signal interrupted
+        os.write(2, f"ttp push: {signal.Signals(sig).name} after a git push began; not interrupting it\n".encode())
+        return
     raise _Stopped(f"stopped by {signal.Signals(sig).name}")
 
 
@@ -4847,8 +5185,9 @@ def run_detached(p: Project, repo: Path, marker: Path, own: bool = False) -> int
     except (OSError, ValueError):
         pass
     print(f"--- {time.strftime('%Y-%m-%dT%H:%M:%S')} detached push, marker {marker}", flush=True)
-    global pool_status
+    global pool_status, _marker_here
     pool_status = marker.with_suffix(POOL_STATUS_SUFFIX)
+    _marker_here = marker
     m = _read(marker)
     if m.get("status") == "running":
         m["alive"] = time.time()   # it began: a death from here on is not one at startup
@@ -5230,6 +5569,95 @@ def running(p: Project) -> list[dict]:
         if m.get("status") == "queued" or m.get("status") == "running" and not free:
             out.append({**m, "marker": str(marker), **({"lock_unknown": True} if free is None else {})})
     return out
+
+
+STOP_TERM_S = 15.0   # stop_own: how long a push has to end after SIGTERM before its group gets SIGKILL
+NOT_STOPPED = 1      # stop_own: the push began its `git push` (or did not end) and was left running
+
+
+def stop_own(p: Project, marker: Path, why: str = "") -> int:
+    """`ttp push --stop <marker>` (and `ttp detach --stop` on a push marker): end this task's own detached
+    push while it waits for its turn or runs its checks, so the push train can take its head, and remove
+    its marker, log and lock file. Refused (REFUSED) for a marker outside this project's pushes folder,
+    a push queue batch, and a push of another task or with no task. A queued push is recorded as not
+    started (jobstop.end_push). A running one gets SIGTERM to its process alone: it ends its lock wait or
+    its checks (their group leader ends them with it) and writes its outcome; SIGKILL to its group follows
+    after STOP_TERM_S only while it has not begun a `git push`. A push that began one is never signalled
+    and keeps its marker: NOT_STOPPED. Only what the push itself held is freed (its process ends, so its
+    run lock and any branch lock go with it); a push that already ended is left as it is (0)."""
+    from . import detach as job, jobstop   # `detach` here is this module's own function
+    say = lambda m: print(f"ttp push: {m}", file=sys.stderr)   # noqa: E731
+    marker = Path(marker).expanduser().resolve()
+    folder = (p.state / DETACHED).resolve()
+    mine = os.environ.get("TTP_PROJECT")
+    if mine and Path(mine).expanduser().resolve() != p.base.resolve():
+        say(f"refused: {marker} is a push of the project at {p.base}, not of this run's project ({mine})")
+        return REFUSED
+    if marker.parent != folder or marker.suffix != ".json":
+        say(f"refused: {marker} is not a detached push marker of this project ({folder}/<id>.json)")
+        return REFUSED
+    m = _read(marker)
+    if not m:
+        say(f"no detached push marker at {marker}")
+        return REFUSED
+    if m.get("kind") == "batch":
+        say("refused: that is the push queue's batch, not a task's push")
+        return REFUSED
+    me = os.environ.get("TTP_TASK") or ""
+    if not me or str(m.get("task") or "") != me:
+        say(f"refused: the push {marker.stem} is task #{m.get('task') or '?'}'s, "
+            + (f"not task #{me}'s" if me else "and only its own task's run may stop it"))
+        return REFUSED
+    why = why or f"task #{me} withdrew its own push"
+    side = marker.with_suffix(GIT_PUSH_SUFFIX)
+    m = _settle(marker)
+    if m.get("status") not in ("queued", "running"):
+        say(f"the push {marker.stem} already ended ({m.get('status') or 'no status'}); nothing to stop")
+        return 0
+    if m.get("status") == "running" and side.exists():
+        say(f"not stopped: the push {marker.stem} is in its git push, which is never interrupted; "
+            f"its outcome comes from {result_probe(marker, p)}")
+        return NOT_STOPPED
+    if m.get("status") == "queued":
+        if jobstop.end_push(p, marker, why, int(me)) is None and _read(marker).get("status") in ("queued", "running"):
+            say(f"not stopped: the daemon is starting the push {marker.stem} right now; run this again")
+            return NOT_STOPPED
+    else:
+        run_lock, pid = _run_lock(marker), m.get("pid")
+        if not (isinstance(pid, int) and pid > 1) or str(marker) not in jobstop._argv(pid):
+            say(f"not stopped: pid {pid} of the push {marker.stem} is not its push process")
+            return NOT_STOPPED
+        sent = []
+        for sig, group in ((signal.SIGTERM, False), (signal.SIGKILL, True)):
+            if group and side.exists():
+                break   # it began its git push meanwhile: never interrupted
+            try:
+                os.killpg(pid, sig) if group else os.kill(pid, sig)
+                sent.append(sig)
+            except OSError:
+                pass
+            deadline = time.monotonic() + STOP_TERM_S
+            while not locks.any_free([run_lock]) and time.monotonic() < deadline:
+                time.sleep(0.1)
+            if locks.any_free([run_lock]):
+                break
+        for sig in sent:
+            job.signalled(marker, sig, pid, "push.stop_own", why, by="push", group=sig == signal.SIGKILL,
+                             state=p.state, task=int(me))
+        if not locks.any_free([run_lock]):
+            say(f"not stopped: the push {marker.stem} " + ("began its git push, which is never interrupted"
+                if side.exists() else f"did not end within {STOP_TERM_S:.0f} s of SIGTERM"))
+            return NOT_STOPPED
+        if _read(marker).get("status") == "pushed":
+            say(f"not removed: the push {marker.stem} pushed before it ended; its marker stays for its result")
+            return NOT_STOPPED
+    for f in (marker, marker.with_suffix(".log"), marker.with_suffix(POOL_STATUS_SUFFIX), side, _run_lock(marker)):
+        try:
+            f.unlink()
+        except OSError:
+            pass
+    print(f"ttp push: stopped the push {marker.stem} (task #{me}) and removed its marker: {why}")
+    return 0
 
 
 def status_lines(p: Project) -> list[str]:

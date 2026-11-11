@@ -16,7 +16,9 @@ time though most carry no decision:
 - `machine_change_overdue` (machine_ledger.route): normal, high only for a change on a live serving
   machine (`serving_machine`) that is past its end with no until-probe or one that has not passed
   (`change_severity`). Each project hears of one change once per episode: its own event and pages
-  relayed from other projects' daemons share one fingerprint (`change_fingerprint`).
+  relayed from other projects' daemons share one fingerprint (`change_fingerprint`), also when several
+  arrive batched in one item (a handled row per further fingerprint). Only a risky change
+  (`machine_ledger.change_risk`) unhandled for 24 h reaches the user.
 
 Urgent (`urgent`): priority 1, an `urgent:` line in the spec, or a required owner of an open obligation.
 """
@@ -31,6 +33,9 @@ from . import anchors, obligations
 
 RIDE_ALONG = "ride_along"        # event data flag: starts no turn by itself (rides_along)
 RIDE_ALONG_MAX_S = 3600          # a ride-along event waits at most this long for a turn
+# A slow tick step's reports (Daemon._step_slow, _step_degrade, _step_incident): ride-alongs that never start a
+# turn, not even past RIDE_ALONG_MAX_S; the overseer's health line and the next turn carry them.
+TICK_KINDS = frozenset({"tick_step_slow", "tick_step_degraded", "tick_step_incident"})
 REPEAT_WINDOW_S = 6 * 3600       # task_blocked: the same (task, reason) again within this is a repeat
 URGENT_LINE = re.compile(r"^\s*urgent:", re.I | re.M)
 SERVING_TAG = re.compile(r"^(serving|live|server)$", re.I)   # machines.json tags of a live serving machine

@@ -1856,6 +1856,44 @@ def test_a_queued_wait_stale_for_a_wait_a_no_op_turn_met_is_settled_without_a_tu
     assert [e["id"] for e in d._stale_queued(rows, time.time())] == [other]   # no snapshot: kept
 
 
+@pytest.mark.parametrize("case,why", [
+    ("gone", "its task is gone"), ("running", "its task is running"), ("done", "its task is done"),
+    ("not_waiting", "its task no longer waits on a probe"), ("new_since", "its task handed off a new wait"),
+    ("woke", "its task was woken: retry_when probe passed"), ("probe", "its probe was changed"),
+    ("passed", "its probe passed"), ("unchanged", None)])
+def test_a_queued_wait_stale_whose_wait_ended_is_settled_without_a_turn_with_its_reason(env, case, why):
+    """A queued wait_stale is settled before a turn when its wait ended after it was raised, with no turn
+    recorded for that wait: its task is gone or left the queue, handed off a new wait or stopped waiting,
+    was woken, had its probe changed, or its probe passed. Handled, with the reason in its data; a wait
+    still unchanged and not yet keeps it for the turn."""
+    p, d, tid, since, raise_at, first = _stale_wait_setup(env)
+    res = json.loads(p.db.task(tid)["result"])
+    if case == "gone":
+        p.db.x("DELETE FROM tasks WHERE id=?", (tid,))
+    elif case in ("running", "done"):
+        p.db.update_task(tid, status=case)
+    elif case == "not_waiting":
+        p.db.update_task(tid, result=json.dumps({**res, "status": "done"}))
+    elif case == "new_since":
+        p.db.update_task(tid, result=json.dumps({**res, "waiting_since": since + 3600}))
+    elif case == "woke":
+        p.db.update_task(tid, result=json.dumps({**res, "woke": "retry_when probe passed"}))
+    elif case == "probe":
+        p.db.update_task(tid, result=json.dumps({**res, "retry_when": "test -e state/new || exit 1"}))
+    elif case == "passed":
+        d.answer(rc=0, out="ready")
+    row = lambda: p.db.q("SELECT id, ts, kind, severity, task, source, data, status FROM events WHERE id=?",
+                         (first[0],))
+    kept = d._stale_queued(row(), time.time())
+    got = row()[0]
+    if why is None:
+        assert [e["id"] for e in kept] == first and got["status"] == "queued"
+        return
+    assert kept == [] and got["status"] == "handled", case
+    data = json.loads(got["data"])
+    assert data["settled"]["why"] == why and data["wait_stale"]["wait"], data
+
+
 def test_a_wait_on_a_resource_the_user_paused_raises_no_probe_stall_until_the_lift_restarts_its_clock(env):
     """A wait whose probe is only `ttp lock --probe` of a resource the user paused (or a machine the user
     held for every project) ends only on the user's Resume: no probe stall. A coordinator's pause still counts. Once the user's pause lifts, the clock
@@ -1939,3 +1977,37 @@ def test_wait_stale_on_own_live_checks_folds_into_one_backlog_line_once_per_wait
     stale(a)
     rows = p.db.q("SELECT text FROM events WHERE kind='checks_backlog' AND status='queued'")
     assert len(rows) == 1 and rows[0]["text"].startswith("Checks backlog: 1 task(s)") and f"#{c} " in rows[0]["text"]
+
+
+def test_a_wait_on_a_live_detached_job_is_stale_only_once_its_log_stops_advancing(env):
+    """wait_stale judges a wait on a detached job by the job's own progress, never by the time since the
+    wait began: a gate waited on for days whose log advanced minutes ago raises nothing; one whose log
+    and start are older than max_hold_s raises once. Both jobs run (their job locks are held)."""
+    from ttp import locks as lk
+    from ttp.daemon import Daemon
+    p = make(env)
+    d, now = Daemon(p.base), time.time()
+    run_dir = p.runs / "41"
+    run_dir.mkdir(parents=True)
+    held, tids = [], {}
+    try:
+        for name, ago in (("moving", 300), ("silent", 8 * 3600)):
+            rc = (run_dir / f"{name}.rc").resolve()
+            held.append(lk.try_take([lk.job_lock(rc)], f"detached job {name}", "gate"))
+            assert held[-1] is not None
+            for f in (rc.with_suffix(".started"), rc.with_suffix(".log")):
+                f.write_text("30/248\n")
+                os.utime(f, (now - ago, now - ago))
+            tids[name] = _due_waiting_task(p, f"ttp detach --check {rc}", since_ago=7 * 24 * 3600)
+        for tid in tids.values():
+            _settle_probe(d, tid)
+        for tid in tids.values():
+            p.db.update_task(tid, not_before=time.time() - 1)
+        d.probe_waiting()
+        raised = {n: bool(p.db.q("SELECT id FROM events WHERE task=? AND kind='wait_stale'", (tid,)))
+                  for n, tid in tids.items()}
+        assert raised == {"moving": False, "silent": True}, raised
+        assert p.db.task(tids["moving"])["not_before"] <= now + 3600   # back at its timer, not held for good
+    finally:
+        for h in held:
+            h and h.close()

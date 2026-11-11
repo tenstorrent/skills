@@ -257,3 +257,84 @@ def test_daemon_watch_runs_writes_drift_flags_into_the_record_and_runs_live_show
     assert "Drift check" in (run_dir / "steer.md").read_text()
     cli.main(["runs", "live", p.name])
     assert "drift: repeat_fail: `make all` failed 3 times" in capsys.readouterr().out
+
+
+def _dr_pace_run(env, tmp_path):
+    """A run spending ahead of its wall clock: 75% of the budget at 17% of its wall limit."""
+    p, run_dir, t, rid = _dr_project(env, tmp_path, budget=4.0, cost=3.0)
+    (run_dir / "output.jsonl").write_text(_rw_claude_call("a", "Bash", command="make") + _rw_claude_result("a"))
+    return p, run_dir, t, rid
+
+
+def _dr_assert_unflagged(p, run_dir, rid, why):
+    from ttp.daemon import Daemon
+    Daemon(p.base).watch_runs()
+    e = json.loads((p.state / "runwatch.json").read_text())["runs"][str(rid)]
+    assert e["ended"] == why and e["flags"] == {} and not (e.get("drift") or {}).get("fired")
+    assert not (run_dir / "steer.md").exists()
+    assert p.db.one("SELECT COUNT(*) n FROM events WHERE kind IN ('worker_drift','steer')")["n"] == 0
+
+
+def test_drift_never_flags_a_run_whose_exit_json_is_written_before_it_is_reaped(env, tmp_path):
+    p, run_dir, t, rid = _dr_pace_run(env, tmp_path)
+    (run_dir / "exit.json").write_text(json.dumps({"rc": 0, "ended": time.time()}))
+    _dr_assert_unflagged(p, run_dir, rid, "exit.json")
+
+
+def test_drift_never_flags_a_run_whose_stream_holds_its_final_result_before_exit_json(env, tmp_path):
+    p, run_dir, t, rid = _dr_pace_run(env, tmp_path)
+    with open(run_dir / "output.jsonl", "a") as f:
+        f.write(_rw_line({"type": "result", "subtype": "success", "total_cost_usd": 3.0, "result": "done"}))
+    _dr_assert_unflagged(p, run_dir, rid, "result")
+
+
+def test_drift_never_flags_a_run_whose_runner_is_gone_and_lease_stale(env, tmp_path):
+    p, run_dir, t, rid = _dr_pace_run(env, tmp_path)
+    (run_dir / "runner.pid").write_text(f"{os.getpid()}\nnot-its-start\n")
+    os.utime(run_dir / "runner.pid", (time.time() - 600, time.time() - 600))
+    _dr_assert_unflagged(p, run_dir, rid, "runner gone")
+
+
+def test_drift_still_flags_pace_on_a_live_run_and_runwatch_ended_needs_proof(env, tmp_path):
+    from ttp import runner, runwatch
+    p, run_dir, t, rid = _dr_pace_run(env, tmp_path)
+    now = time.time()
+    # its runner lives (the recorded start matches), or its lease is fresh, or nothing was recorded: not ended
+    assert runwatch.ended(run_dir, "claude", now) is None
+    (run_dir / "runner.pid").write_text(f"{os.getpid()}\n{runner.proc_start(os.getpid())}\n")
+    os.utime(run_dir / "runner.pid", (now - 600, now - 600))
+    assert runwatch.ended(run_dir, "claude", now) is None
+    (run_dir / "runner.pid").write_text(f"{os.getpid()}\nnot-its-start\n")
+    (run_dir / "lease").write_text("")
+    assert runwatch.ended(run_dir, "claude", now) is None, "a fresh lease: its runner renews it"
+    os.utime(run_dir / "runner.pid", (now - 600, now - 600))
+    os.utime(run_dir / "lease", (now - 600, now - 600))
+    assert runwatch.ended(run_dir, "claude", now) == "runner gone"
+    (run_dir / "lease").touch()
+    data, ids = _dr_tick(p, time.time())
+    e = data["runs"][str(rid)]
+    assert e["ended"] is None and "pace" in e["flags"] and ids == []
+    assert "pace" in (run_dir / "steer.md").read_text()
+
+
+def test_stream_ended_reads_each_providers_final_event_and_nothing_else(tmp_path):
+    from ttp.providers import get_provider
+    out = tmp_path / "output.jsonl"
+    cases = {"claude": ({"type": "result", "result": "x"}, {"type": "user", "message": {"content": []}}),
+             "cursor": ({"type": "result", "result": "x"}, {"type": "tool_call", "tool_call": {}}),
+             "codex": ({"type": "turn.completed", "usage": {}}, {"type": "item.completed", "item": {"id": "a"}})}
+    for name, (final, other) in cases.items():
+        prov = get_provider(name)
+        out.write_text(_rw_line(other) + _rw_line(other))
+        assert not prov.stream_ended(out), name
+        out.write_text(_rw_line(other) + _rw_line(final))
+        assert prov.stream_ended(out), name
+        out.write_text(_rw_line(other) + _rw_line(final)[:-10])
+        assert not prov.stream_ended(out), f"{name}: a final line still being written does not count"
+        out.write_text(_rw_line({**other, "note": "y" * 70000}) + _rw_line(final))
+        assert prov.stream_ended(out), f"{name}: a huge line before it is cut at the tail"
+    codex = get_provider("codex")
+    out.write_text(_rw_line({"type": "turn.failed", "error": {}}))
+    assert codex.stream_ended(out)
+    assert not get_provider("claude").stream_ended(tmp_path / "missing.jsonl")
+    assert not get_provider("fake").stream_ended(out), "a provider naming no final event never ends early"

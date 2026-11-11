@@ -961,14 +961,14 @@ END""")
             self.pause_event(PAUSE_REPLACED_KIND if name in now else PAUSE_REMOVED_KIND, name, was[name], cause)
 
     def set_paused(self, on: bool, boot: str | None = None, by: str = "unknown", reason: str = "",
-                   via: str = "", end: str = "") -> None:
+                   via: str = "", end: str = "", user_msg: int | None = None) -> None:
         """Pause or resume the whole project, recording who (`by`: user, coordinator, daemon, a run or
         another project), through what (`via`) and why (projpause: required unless by the user). With
         boot (this host's boot id) the pause lasts until the daemon first ticks on another boot
         (Daemon.lift_boot_pause); any other pause or resume ends that."""
         from . import projpause
         if on:
-            projpause.pause(self, by, reason, via=via, end=end or ("until reboot" if boot else ""))
+            projpause.pause(self, by, reason, via=via, end=end or ("until reboot" if boot else ""), user_msg=user_msg)
         else:
             projpause.resume(self, by, via=via, reason=reason)
         self.set_kv("paused", bool(on))
@@ -1107,8 +1107,13 @@ END""")
             if k in kw and not isinstance(kw[k], str):
                 kw[k] = json.dumps(list(kw[k]))
         kw["updated"] = time.time()
+        # A start_when dropped by any path (its probe passed, an urgent release, an edit): recorded, as the
+        # labels that held the task are gone after.
+        old = self.task(task_id) if "labels" in kw else None
         sets = ",".join(f"{k}=?" for k in kw)
         self.x(f"UPDATE tasks SET {sets} WHERE id=?", [*kw.values(), task_id])
+        if old and (d := deferral(old)).get("when") and not deferral({"labels": kw["labels"]}).get("when"):
+            record_start_passed(self, old, d, kw["updated"])
 
     def requeue(self, task_id: int) -> str:
         """Put a task that is not running back in the queue (the user's decision to run it: the web app,
@@ -1129,6 +1134,9 @@ END""")
                 prev.pop("waiting_since", None)
                 prev.pop("stale_wakes", None)
                 self.x("UPDATE tasks SET result=? WHERE id=?", (dump_result(prev), task_id))
+            if t["status"] != "queued":   # logged; dispatch's done count restarts (dispatchguard)
+                from . import dispatchguard
+                dispatchguard.record_requeue(self, task_id, t["status"], "requeue")
             for key in (WORKSPACE_TRIES_KEY, WORKSPACE_LOCK_TRIES_KEY):
                 tries = self.kv(key, {}) or {}
                 if str(task_id) in tries:
@@ -1148,6 +1156,8 @@ END""")
                                      "AND status NOT IN ('done','failed','cancelled')",
                                      (time.time(), task_id)).rowcount:
                 return f"task #{task_id} is already {t['status']}"
+            from . import dispatchguard   # the cancel sticks: dispatch refuses it until a requeue
+            dispatchguard.record_cancel(self, task_id, t["status"], "cancel")
         return ""
 
     def task(self, task_id: int) -> dict | None:
@@ -1524,6 +1534,19 @@ def waiting_handoff(task) -> dict:
 
 def without_deferral(labels: list) -> list:
     return [lb for lb in labels if not (isinstance(lb, str) and lb.partition(":")[0] in DEFER_LABELS)]
+
+
+START_PASSED = "start_when_passed"
+
+
+def record_start_passed(db, task: dict, d: dict, now: float) -> None:
+    """Record, handled, that task's start_when gate ended at `now` (its probe passed or it was released):
+    clearing its deferral labels leaves no other trace, and the throughput review (`ttp throughput`)
+    reads this to book the wait before `now` to the landed_chain or deferral lane, not worker slots."""
+    data = json.dumps({"since": d.get("since") or task.get("created"), "when": str(d.get("when") or "")[:200]})
+    db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,data,status,task) VALUES(?,?,?,?,?,?,?,?,?)",
+         (now, "daemon", START_PASSED, f"{START_PASSED}:{task['id']}:{now:.0f}", "low",
+          f"#{task['id']} start_when passed", data, "handled", task["id"]))
 
 
 def _first_dead(deps: list, states: dict) -> tuple[Any, str] | None:

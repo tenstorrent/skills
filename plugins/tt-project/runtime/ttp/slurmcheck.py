@@ -443,16 +443,22 @@ def _digest(v: Any) -> str:
     return json.dumps(v, sort_keys=True)
 
 
-def _set_since(key_ts: float) -> bool:
-    """Whether the key was set (or cleared) again after `key_ts`, by the account settings log."""
+def _last_set() -> str:
+    """The account settings log's last line for the key (its digest; "" for none): a record keeps the one it
+    began under, so a new line re-arms it whatever the clocks say (the log rounds its stamps to the ms)."""
     from . import accountset
     rec = accountset.last(KEY)
-    return bool(rec) and float(rec.get("ts") or 0) > key_ts
+    return _digest(rec) if rec else ""
 
 
 def _armed(b: dict) -> bool:
     """Whether breaker record `b` is stale: the key's value changed, or it was set again, since it began."""
-    return _digest(_raw()) != b.get("value") or _set_since(float(b.get("since") or 0))
+    if _digest(_raw()) != b.get("value"):
+        return True
+    if "set" in b:
+        return _last_set() != b["set"]
+    from . import accountset   # a record from before "set" was kept: by the log line's stamp
+    return float((accountset.last(KEY) or {}).get("ts") or 0) > float(b.get("since") or 0)
 
 
 def tripped() -> dict | None:
@@ -481,7 +487,7 @@ def _breaker(start_fail: dict | None, now: float | None = None) -> dict | None:
         fcntl.flock(lk, fcntl.LOCK_EX)
         b = _read(d / BREAKER)
         if not b or _armed(b):
-            b = {"since": now, "value": _digest(_raw()), "count": 0, "jobs": []}
+            b = {"since": now, "value": _digest(_raw()), "set": _last_set(), "count": 0, "jobs": []}
         if b.get("tripped"):
             return None   # paused: only the user's setting re-arms it, never a job that still ended
         if start_fail is None:
@@ -544,8 +550,10 @@ def job_script(q: str, exports_: str, cmd: str, lock: str | None = None, home: s
     """The batch script, run on a compute node in folder `q`: unpack the tree into a git checkout, put
     the checks' pinned Python env made from `lock` (default runnerenv.LOCK) under `home` (a shell word:
     the shared workdir; default the node's TTP_HOME) in force, run the command, leave its exit code in
-    `rc` ("fault" when the node could not set the tree up, NO_ENV when it could not make the env)."""
+    `rc` ("fault" when the node could not set the tree up, NO_ENV when it could not make the env), and the
+    node's name in `node` first (jobs.jsonl's "node": sacct may be off, and scontrol forgets a job)."""
     return ("#!/bin/sh\nrc=fault\n"
+            f"printf '%s\\n' \"${{SLURMD_NODENAME:-$(hostname)}}\" > {q}/node 2>/dev/null\n"
             f"trap 'printf \"%s\\n\" \"$rc\" > {q}/rc.part && mv -f {q}/rc.part {q}/rc' EXIT\n"
             f"cd {q} || exit 1\nrm -rf src && mkdir src && tar -xf tree.tar -C src && cd src && "
             "git -c init.defaultBranch=main init -q && git add -A -f . && "
@@ -795,7 +803,7 @@ def main(args: list[str]) -> int:
                   f"--time={minutes} --nodes=1 --ntasks=1 --output={q}/out.log --chdir={q} {q}/job.sh")
         for attempt in (1, 2):
             try:
-                sub = _ssh(host, f"rm -f {q}/rc {q}/out.log; {sbatch}", CALL_TIMEOUT_S)
+                sub = _ssh(host, f"rm -f {q}/rc {q}/out.log {q}/node; {sbatch}", CALL_TIMEOUT_S)
             except subprocess.TimeoutExpired:
                 return _fault(host, "sbatch timed out")
             job = (sub.stdout.decode(errors="replace").strip().splitlines() or [""])[-1].split(";")[0].strip()
@@ -825,6 +833,7 @@ def main(args: list[str]) -> int:
                 _say(f"job {job} ended for the cluster's reasons ({why}): submitting it again once; "
                      "this is no test failure")
                 rec.pop("start", None)
+                rec.pop("node", None)
                 continue
             return _fault(host, f"job {job}: {why}")
         return _fault(host, "the job did not run")
@@ -852,12 +861,13 @@ def _follow(host: str, q: str, job: str, s: dict, poll: float, submitted: float,
     not report one: "cluster: ..." for an end the cluster caused, else the reason, what was seen of it:
     out_bytes, and for an end sacct read its exit code and elapsed_s)."""
     mark = f"ttp-slurm:{secrets.token_hex(6)}"
-    sent, last_ok, left, started = 0, time.time(), None, None
+    sent, last_ok, left, started, noted = 0, time.time(), None, None, ""
     out = sys.stdout.buffer
     jq = shlex.quote(job)
     while True:
         script = (f"s=$(squeue -h -j {jq} -o %T 2>/dev/null | head -n 1); r=$(head -n 1 {q}/rc 2>/dev/null); "
-                  f"printf '%s|%s|%s\\n' {mark} \"$s\" \"$r\"; tail -c +{sent + 1} {q}/out.log 2>/dev/null; exit 0")
+                  f"n=$(head -n 1 {q}/node 2>/dev/null); "
+                  f"printf '%s|%s|%s|%s\\n' {mark} \"$s\" \"$r\" \"$n\"; tail -c +{sent + 1} {q}/out.log 2>/dev/null; exit 0")
         try:
             got = _ssh(host, script, CALL_TIMEOUT_S)
         except (OSError, subprocess.SubprocessError):
@@ -875,6 +885,9 @@ def _follow(host: str, q: str, job: str, s: dict, poll: float, submitted: float,
             out.flush()
             sent += len(body)
         state, rc = (parts[1].strip().upper() if len(parts) > 1 else ""), (parts[2].strip() if len(parts) > 2 else "")
+        if len(parts) > 3 and (node := parts[3].strip()[:128]) and node != noted:   # the node the job runs on
+            noted = node
+            note(node=node)
         if state == "RUNNING" and started is None:
             started = time.time()
             note(state=state, start=started)

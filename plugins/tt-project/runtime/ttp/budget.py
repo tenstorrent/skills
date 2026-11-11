@@ -571,7 +571,22 @@ def caps_line(db: DB, gates: dict, b: dict, now: float, where=None) -> str:
                                m.get("global_resets_at"), now, where)
         parts.append(f"{prov} ${float(m['global_today']):.2f} of ${float(m.get('global_cap') or 0):.0f} today "
                      f"({m.get('global_includes') or 'this account'}{stale})" + (f", {ahead}" if ahead else ""))
-    return out + " · global daily cap (whole account, per provider): " + "; ".join(parts)
+    return out + " · global daily cap (whole account, per provider): " + "; ".join(parts) + target_text(b, dict(totals))
+
+
+def target_text(b: dict, totals: dict) -> str:
+    """' · daily target $T: Claude $X today, $D over|under' against budget.daily_target_usd, from the
+    gate's whole-account count (`totals`: provider -> gate numbers); '' when unset or uncounted."""
+    try:
+        t = float(b.get("daily_target_usd") or 0)
+    except (TypeError, ValueError):
+        return ""
+    m = totals.get("claude") or {}
+    if t <= 0 or "global_today" not in m:
+        return ""
+    usd = float(m.get("global_today") or 0)
+    return (f" · daily target ${t:.0f}: Claude ${usd:.2f} today, "
+            + (f"${usd - t:.2f} over" if usd > t else f"${t - usd:.2f} under"))
 
 
 def _caps(db: DB, g: Gate, b: dict, provider: str, windows: list[Window], last: dict, now: float,

@@ -3,9 +3,10 @@
 """A virtualenv of its own for each bench cell (`ttp bench run`), so nothing a cell runs installs into
 or imports from the user site (~/.local) that every project on the host shares.
 
-make() builds a fresh venv in the cell's own folder (`python -m venv --system-site-packages
---without-pip`: the OS's packages, pip among them, stay visible below its own; ensurepip adds pip
-where the OS has none) and copies into it the distributions it names that this interpreter has
+make() builds a fresh venv in the cell's own folder (`python -m venv --without-pip`, its pyvenv.cfg
+saying include-system-site-packages = false, so every pip version refuses `--user` there; a .pth
+file adds the OS's site directories below its own, so the OS's packages, pip among them, stay
+visible; ensurepip adds pip where the OS has none) and copies into it the distributions it names that this interpreter has
 installed, with what they require (pytest by default): the cell gets today's copy, never a live
 path into the user site. env() gives the environment every process of the cell runs with: the
 venv's bin first on PATH, VIRTUAL_ENV set, PYTHONNOUSERSITE=1 (the user site never loads),
@@ -39,10 +40,21 @@ def make(path: Path, seed=SEED, timeout_s: float = 300) -> Path:
         raise Unavailable(f"{path} already exists: a cell's venv is never reused")
     base = {k: v for k, v in os.environ.items() if k not in DROP}
     try:
-        r = subprocess.run([_base_python(), "-m", "venv", "--system-site-packages", "--without-pip", str(path)],
+        # Not --system-site-packages: pip refuses an explicit --user only in a venv that hides the
+        # global site (pip 22 lets it through in one that shows it, as a test host's system pip did).
+        r = subprocess.run([_base_python(), "-m", "venv", "--without-pip", str(path)],
                            capture_output=True, text=True, timeout=timeout_s, stdin=subprocess.DEVNULL, env=base)
         if r.returncode:
             raise Unavailable(f"python -m venv {path} failed: {(r.stderr or r.stdout).strip()[-500:]}")
+        r = subprocess.run([_base_python(), "-s", "-c", "import site; print(repr(site.getsitepackages()))"],
+                           capture_output=True, text=True, timeout=timeout_s, stdin=subprocess.DEVNULL, env=base)
+        if r.returncode:
+            raise Unavailable(f"the OS's site directories could not be read: {(r.stderr or r.stdout).strip()[-500:]}")
+        for site in path.glob("lib/python*/site-packages"):
+            # addsitedir, not bare paths: the OS's own .pth files (namespace packages) still apply. map,
+            # not a comprehension: before 3.12 one cannot see `site` in the exec'd line's scope.
+            (site / "ttp-system-site.pth").write_text(
+                f"import site; list(map(site.addsitedir, {r.stdout.strip()}))\n")
         cell = env(path, base)
         py = str(path / "bin" / "python")
         if subprocess.run([py, "-c", "import pip"], capture_output=True, timeout=timeout_s, env=cell).returncode:

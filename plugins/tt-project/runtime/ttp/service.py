@@ -25,6 +25,7 @@ import signal
 import subprocess
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 from . import poll_s
@@ -37,6 +38,66 @@ def unit_name(p: Project) -> str:
 
 
 WATCHDOG_EVERY_S = 300   # how often launchd and cron look for a stuck daemon
+# launchd's ProcessType Background runs an agent and every child (workers, git, pytest, ttp push) at
+# darwin background priority: efficiency cores only and throttled I/O. The daemon runs Standard; its
+# workers, reviewers and checks stay polite at runner.nice. The watchdog and tunnels stay Background.
+# An installed daemon plist lacking any of these keys is rewritten on upgrade (refresh).
+DAEMON_KEYS = {"ProcessType": "Standard", "AbandonProcessGroup": True}
+# Darwin background priority is inherited: a daemon started by hand from the watchdog (a Background agent)
+# runs at background priority too. launchd's ProcessType Background stays on its children through fork and
+# exec and no setpriority lifts it, so restart_service starts the daemon through launchd from its own plist;
+# leave_background() drops what it can (taskpolicy -b) and logs the priority the kernel applies.
+PRIO_DARWIN_PROCESS = 4   # <sys/resource.h>: the which of setpriority for darwin background state
+DARWIN_BG_PRI = 4         # `ps -o pri=` of a process at darwin background priority
+
+
+def _ps_pri(pid: int | None = None) -> int | None:
+    """A process's scheduling priority as the kernel applies it (`ps -o pri=`, 4 at darwin background
+    priority, whichever way it was set); None where ps cannot say."""
+    try:
+        r = subprocess.run(["ps", "-o", "pri=", "-p", str(pid or os.getpid())], capture_output=True,
+                           text=True, timeout=10)
+        return int(r.stdout.strip())
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+def _leave_darwin_bg() -> None:
+    """setpriority(PRIO_DARWIN_PROCESS, 0, 0): clears the background state taskpolicy -b sets; launchd's
+    Background process type is not cleared by it."""
+    try:
+        import ctypes
+        libc = ctypes.CDLL(None, use_errno=True)
+        libc.setpriority.argtypes = [ctypes.c_int, ctypes.c_uint, ctypes.c_int]
+        libc.setpriority(PRIO_DARWIN_PROCESS, 0, 0)
+    except (OSError, AttributeError):
+        pass
+
+
+def leave_background(plist: Path | None) -> str:
+    """Leave darwin background priority where it can, unless this process's launchd plist sets ProcessType
+    Background (a value the user or a coordinator set there is kept). Returns the priority it runs at, as
+    `ps` reads it, for the start log: a warning when it still runs background without its plist saying so."""
+    if sys.platform != "darwin":
+        return ""
+    try:
+        kept = bool(plist) and plistlib.loads(plist.read_bytes()).get("ProcessType") == "Background"
+    except (OSError, ValueError, AttributeError, plistlib.InvalidFileException):
+        kept = False
+    pri = _ps_pri()
+    if pri is None:
+        return "cpu priority: unknown (ps could not read it)"
+    if pri > DARWIN_BG_PRI:
+        return f"cpu priority: normal (pri {pri})"
+    if kept:
+        return f"cpu priority: background (pri {pri}; its launchd plist sets ProcessType Background)"
+    _leave_darwin_bg()
+    after = _ps_pri()
+    if after is not None and after > DARWIN_BG_PRI:
+        return f"cpu priority: normal (pri {after}; left the background priority it inherited from its starter)"
+    return (f"warning: cpu priority: background (pri {after}) though its launchd plist does not set ProcessType "
+            "Background: it inherited it from a background starter (a hand restart from the watchdog); "
+            "a restart through launchd (launchctl kickstart -k) runs it at its plist's priority")
 
 
 def daemon_argv(p: Project) -> list[str]:
@@ -45,6 +106,10 @@ def daemon_argv(p: Project) -> list[str]:
 
 def watchdog_argv(p: Project) -> list[str]:
     return [sys.executable, "-m", "ttp.watchdog", str(p.base)]
+
+
+def overseer_argv(p: Project) -> list[str]:
+    return [sys.executable, "-m", "ttp.overseer", str(p.base)]
 
 
 def launchd_label(p: Project, watchdog: bool = False) -> str:
@@ -222,6 +287,56 @@ WantedBy=default.target
 """
 
 
+def _overseer_unit(p: Project) -> Path:
+    return hoststate.unit_dir() / f"{unit_name(p)}-overseer.service"
+
+
+def _overseer_text(p: Project) -> str:
+    """The overseer's own service (ttp.overseer): no lock, process or tick step shared with the daemon."""
+    env = "\n".join(f"Environment={k}={v}" for k, v in _env(p).items())
+    return f"""[Unit]
+Description=tt-project overseer for {p.name}
+
+[Service]
+Type=simple
+WorkingDirectory={p.base}
+ExecStart={' '.join(shlex.quote(a) for a in overseer_argv(p))}
+{env}
+Restart=always
+RestartSec=10
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target
+"""
+
+
+def _write_overseer_unit(p: Project) -> bool:
+    path, text = _overseer_unit(p), _overseer_text(p)
+    if path.exists() and path.read_text(errors="replace") == text:
+        return False
+    durable_write(path, text)
+    return True
+
+
+def ensure_overseer(p: Project) -> str:
+    """Start the overseer again (the daemon calls this when its heartbeat is stale): through its systemd
+    unit where the daemon has one, else as a detached process. Its own lock keeps a second one out."""
+    if _unit(p).exists():
+        if _write_overseer_unit(p):
+            _run("systemctl", "--user", "daemon-reload")
+        r = _run("systemctl", "--user", "enable", "--now", _overseer_unit(p).name)
+        if r.returncode == 0:
+            r = _run("systemctl", "--user", "restart", _overseer_unit(p).name)
+        return "restarted its unit" if r.returncode == 0 else f"systemctl failed: {r.stderr.strip()[:200]}"
+    env = " ".join(f"{k}={shlex.quote(v)}" for k, v in _env(p).items())
+    cmd = (f"cd {shlex.quote(str(p.base))} && {env} {' '.join(shlex.quote(a) for a in overseer_argv(p))} "
+           f">> {shlex.quote(str(p.logs / 'overseer.out'))} 2>&1")
+    # own session: the overseer must outlive the daemon that starts it (it watches that daemon's loop)
+    subprocess.Popen(["sh", "-c", cmd], start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return "started a detached overseer"
+
+
 SYSTEMD_FAILED = "systemd failed"
 
 
@@ -229,17 +344,19 @@ def _install_systemd(p: Project) -> str:
     _unit(p).parent.mkdir(parents=True, exist_ok=True)
     durable_write(_unit(p), _unit_text(p))
     _write_watchdog_units(p)
+    _write_overseer_unit(p)
     _run("systemctl", "--user", "daemon-reload")
     r = _run("systemctl", "--user", "enable", "--now", f"{unit_name(p)}.service")
     if r.returncode != 0:
         # Remove the unit that never ran: installed(), refresh() and restart_service() go by its file,
         # and would treat the crontab watchdog that takes over as a systemd service.
         _run("systemctl", "--user", "disable", f"{unit_name(p)}.service")
-        for path in (_unit(p), *_watchdog_units(p)):
+        for path in (_unit(p), *_watchdog_units(p), _overseer_unit(p)):
             path.unlink(missing_ok=True)
         _run("systemctl", "--user", "daemon-reload")
         return SYSTEMD_FAILED + " (" + r.stderr.strip()[:200] + "); " + _install_cron(p)
     w = _run("systemctl", "--user", "enable", "--now", _watchdog_unit(p, "timer").name)
+    _run("systemctl", "--user", "enable", "--now", _overseer_unit(p).name)
     return f"systemd user unit {unit_name(p)}" + (" with a watchdog timer" if w.returncode == 0 else
                                                    f" (watchdog timer failed: {w.stderr.strip()[:200]})")
 
@@ -250,8 +367,8 @@ def _install_launchd(p: Project) -> str:
     plist.parent.mkdir(parents=True, exist_ok=True)
     p.logs.mkdir(parents=True, exist_ok=True)
     job = {"Label": label, "ProgramArguments": daemon_argv(p), "WorkingDirectory": str(p.base),
-           "EnvironmentVariables": _env(p), "RunAtLoad": True, "KeepAlive": True, "ProcessType": "Background",
-           "ThrottleInterval": 10, "AbandonProcessGroup": True, "StandardOutPath": str(p.logs / "launchd.log"),
+           "EnvironmentVariables": _env(p), "RunAtLoad": True, "KeepAlive": True, **DAEMON_KEYS,
+           "ThrottleInterval": 10, "StandardOutPath": str(p.logs / "launchd.log"),
            "StandardErrorPath": str(p.logs / "launchd.log")}
     durable_write(plist, plistlib.dumps(job))
     uid = os.getuid()
@@ -325,6 +442,9 @@ def uninstall(p: Project) -> str:
         _run("systemctl", "--user", "disable", "--now", _watchdog_unit(p, "timer").name)
     for ext in ("timer", "service"):
         _watchdog_unit(p, ext).unlink(missing_ok=True)
+    if _overseer_unit(p).exists():
+        _run("systemctl", "--user", "disable", "--now", _overseer_unit(p).name)
+        _overseer_unit(p).unlink()
     if unit.exists():
         _run("systemctl", "--user", "disable", "--now", unit.name)
         unit.unlink()
@@ -379,15 +499,50 @@ def down_note(p: Project) -> str:
 _WATCHDOG_SEEN: dict[str, tuple[float, str | None]] = {}
 
 
-def refresh(p: Project) -> None:
+def update_plist(path: Path, want: dict) -> bool:
+    """Set `want`'s keys in an installed agent's plist, keeping its other keys; True when it changed.
+    launchd reads a plist only at bootstrap: reload the agent after."""
+    try:
+        job = plistlib.loads(path.read_bytes())
+    except (OSError, ValueError, plistlib.InvalidFileException):
+        return False
+    if not isinstance(job, dict) or all(job.get(k) == v for k, v in want.items()):
+        return False
+    job.update(want)
+    durable_write(path, plistlib.dumps(job))
+    return True
+
+
+def _reload_agent(label: str, plist: Path, inside: bool) -> subprocess.CompletedProcess:
+    """bootout, then bootstrap: how launchd takes a changed plist (kickstart keeps the loaded one).
+    From inside that agent's job (`inside`) both run in a new session, which outlives the bootout."""
+    target, domain = f"gui/{os.getuid()}/{label}", f"gui/{os.getuid()}"
+    if inside:
+        subprocess.Popen(["sh", "-c", f"launchctl bootout {shlex.quote(target)}; "
+                                      f"launchctl bootstrap {domain} {shlex.quote(str(plist))}"],
+                         start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return subprocess.CompletedProcess([], 0, "", "")
+    _run("launchctl", "bootout", target)
+    return _run("launchctl", "bootstrap", domain, str(plist))
+
+
+def _inside(p: Project, label: str) -> bool:
+    """This process runs in launchd job `label` (launchd names it in XPC_SERVICE_NAME) or is the daemon."""
+    from .daemon import _read_pid
+    return os.environ.get("XPC_SERVICE_NAME") == label or _read_pid(p.state / "daemon.pid") == os.getpid()
+
+
+def refresh(p: Project) -> bool:
     """Bring an installed service up to date with this runtime (a service installed before the
-    watchdog existed gets it) without starting or stopping anything."""
+    watchdog existed gets it) without starting or stopping anything. True when it rewrote the
+    daemon's launchd plist to DAEMON_KEYS (an older Background one): restart_service reloads it."""
+    rewrote = sys.platform == "darwin" and update_plist(_agent(p), DAEMON_KEYS)
     unit = _unit(p)
     if unit.exists():
         changed = unit.read_text(errors="replace") != _unit_text(p)
         if changed:
             durable_write(unit, _unit_text(p))
-        if _write_watchdog_units(p) or changed:
+        if _write_overseer_unit(p) | _write_watchdog_units(p) or changed:
             _run("systemctl", "--user", "daemon-reload")
             _run("systemctl", "--user", "enable", "--now", _watchdog_unit(p, "timer").name)
     if sys.platform == "darwin" and _agent(p).exists() and not _agent(p, watchdog=True).exists():
@@ -400,19 +555,23 @@ def refresh(p: Project) -> None:
             keep += _cron_lines(p)
             subprocess.run(hoststate.argv(["crontab", "-"]), input="\n".join(keep) + "\n", text=True, capture_output=True)
     _WATCHDOG_SEEN.pop(str(p.base), None)
+    return rewrote
 
 
 def restart_service(p: Project) -> str:
-    """Restart the daemon process. Running workers are not touched: the new daemon adopts them."""
-    refresh(p)
+    """Restart the daemon process. Running workers are not touched: the new daemon adopts them (they
+    run in sessions of their own, and the agent's AbandonProcessGroup keeps them through a bootout)."""
+    rewrote = refresh(p)
     label = launchd_label(p)
     if sys.platform == "darwin" and _agent(p).exists():
-        r = _run("launchctl", "kickstart", "-k", f"gui/{os.getuid()}/{label}")
+        if rewrote:
+            r = _reload_agent(label, _agent(p), _inside(p, label))
+        else:
+            r = _run("launchctl", "kickstart", "-k", f"gui/{os.getuid()}/{label}")
         if r.returncode == 0:
             return "restarted"
-        # The agent is not loaded (its bootstrap failed): restart the daemon by hand like cron does.
-    unit = _unit(p)
-    if unit.exists():
+        # The agent is not loaded: stop the old daemon, then load the agent so launchd starts the new one.
+    elif (unit := _unit(p)).exists():
         try:
             r = _run("systemctl", "--user", "restart", unit.name)
         except subprocess.TimeoutExpired as e:
@@ -433,6 +592,21 @@ def restart_service(p: Project) -> str:
         while time.time() < deadline and _alive(pid):
             time.sleep(0.5)
     p.logs.mkdir(parents=True, exist_ok=True)
+    if sys.platform == "darwin":
+        why = "no launchd agent is installed"
+        if _agent(p).exists():
+            # launchd starts it at its plist's ProcessType; a hand start would run at the caller's
+            # priority, and the watchdog calling this runs Background.
+            domain = f"gui/{os.getuid()}"
+            r = _run("launchctl", "bootstrap", domain, str(_agent(p)))
+            if r.returncode == 0:
+                r = _run("launchctl", "kickstart", f"{domain}/{label}")
+            if r.returncode == 0:
+                return "restarted"
+            why = _manager_said("launchctl bootstrap and kickstart", r).replace("\n", " ")[:300]
+        with open(p.logs / "daemon.out", "a") as f:
+            f.write(f"{datetime.now():%Y-%m-%d %H:%M:%S} restart by hand ({why}): the daemon runs at its "
+                    f"starter's CPU priority (background when the watchdog started it)\n")
     _spawn(p)
     return "restarted"
 
@@ -453,6 +627,12 @@ RESTART_REQUEST, RESTART_RESULT = "restart.request", "restart.result"
 STOP_WAIT_CAP_S = 300
 STOP_MARGIN_S = 15
 LAUNCHD_EXIT_TIMEOUT_S = 20   # launchd's default ExitTimeOut: SIGKILL this long after SIGTERM (0: never)
+# The new daemon's start window (a restart's wait_s, from the moment the old daemon exited) stretches with
+# the host's load: with several runnable tasks per core its imports alone can take minutes (an upgrade on a
+# laptop at load 57-78 on 14 cores was rolled back 61 s in, yet the same runtime imported in 5 s from a
+# copy). It is wait_s times the highest 1-minute load per core seen while waiting (at least 1), at most
+# START_WAIT_CAP_S (a longer wait_s is kept).
+START_WAIT_CAP_S = 300
 # A restart deferred because the old daemon outlived its stop timeout (restart() could not judge the new
 # one) is recorded here; check_deferred judges the new daemon later, from the watchdog or its own start.
 RESTART_DEFERRED = "restart.deferred"
@@ -466,7 +646,7 @@ ROLLBACK_MIN_S = 90
 # daemon: its own handle says it ended, or its claim outlived HELPER_BOUND_S, longer than a restart's own
 # waits (the old daemon's stop, a new daemon's first tick, twice with a rollback, plus the service
 # manager's time).
-HELPER_BOUND_S = 2 * (STOP_WAIT_CAP_S + STOP_MARGIN_S + 60 + 300) + 300
+HELPER_BOUND_S = 2 * (STOP_WAIT_CAP_S + STOP_MARGIN_S + START_WAIT_CAP_S + 300) + 300
 HELPER_STARTED = "restart helper running"     # main() logs it first: the helper got past its imports
 _helpers: dict[str, subprocess.Popen] = {}    # the daemon's handle on the helper it started, per project
 # The service manager could not be reached from here, as opposed to it trying and the daemon failing.
@@ -672,17 +852,35 @@ def main() -> int:
     return 0 if out["outcome"] in ("running", "busy") else 1
 
 
+def load_per_core() -> float:
+    """The host's 1-minute load average per core (0 where it cannot be read)."""
+    try:
+        ld = os.getloadavg()[0]
+    except (OSError, AttributeError):
+        return 0.0
+    return ld / (os.cpu_count() or 1) if ld == ld and ld != float("inf") else 0.0
+
+
+def start_window_s(wait_s: float, load: float | None = None) -> float:
+    """How long a new daemon may take to start under `load` (per core; default: now): see START_WAIT_CAP_S."""
+    load = load_per_core() if load is None else load
+    return min(max(wait_s, START_WAIT_CAP_S), wait_s * max(1.0, load))
+
+
 def wait_for_start(p: Project, since: float, wait_s: float, tick_wait_s: float | None = None,
                    waits_from: float | None = None, until: float | None = None) -> str:
     """How a daemon started after `since` came up: "running" once it completed a tick; "busy" if it
     is alive and still in its first tick after tick_wait_s (a first tick may fetch and add worktrees),
     or if no new daemon started because the old one is still alive and holds the lock; otherwise
-    "broken": it did not start within wait_s, it exited, or its first tick failed twice. Both waits
-    count from `waits_from` (default `since`). "unconfirmed" when `until` passes before any of these."""
+    "broken": it did not start within its start window (wait_s stretched by the host's load, start_window_s),
+    it exited, or its first tick failed twice. Both waits count from `waits_from` (default `since`).
+    "unconfirmed" when `until` passes before any of these."""
     from .daemon import HEARTBEAT_STALE_S, _alive, _is_daemon, _read_pid, heartbeat, start_marker
     tick_wait_s = HEARTBEAT_STALE_S if tick_wait_s is None else tick_wait_s
     waits_from = since if waits_from is None else waits_from
+    window = wait_s
     while True:
+        window = max(window, start_window_s(wait_s))     # the highest load seen while it starts
         hb = heartbeat(p)
         if hb and float(hb.get("started") or 0) >= since:
             return "running"
@@ -694,7 +892,7 @@ def wait_for_start(p: Project, since: float, wait_s: float, tick_wait_s: float |
                 return "broken"
             if now >= waits_from + max(wait_s, tick_wait_s):
                 return "busy"
-        elif now >= waits_from + wait_s:
+        elif now >= waits_from + window:
             old = _read_pid(p.state / "daemon.pid")
             return "busy" if old and _is_daemon(old) or old_daemon_beats(p, since, after=since) else "broken"
         if until is not None and now >= until:
@@ -869,8 +1067,10 @@ def _roll_back(p: Project, msg: str, judged: float, stopped: float, stop_s: floa
         if _git(h, "restore", f"--source={good}", "--staged", "--worktree", "--", "runtime").returncode != 0:
             _git(h, "checkout", good, "--", "runtime")    # git older than 2.23
     _git(h, "commit", "-q", "-m", f"roll back runtime to {good[:10]}: the daemon did not start with it")
+    load = load_per_core()
     phase = (note + f"Failed phase: the new daemon was not ready {judged:.0f}s after the old one "
-             f"stopped (the old daemon took {stopped:.0f}s to stop; its service's stop timeout is {stop_s:.0f}s). ")
+             f"stopped (the old daemon took {stopped:.0f}s to stop; its service's stop timeout is {stop_s:.0f}s; "
+             f"the host's load is {load:.1f} per core, so its start window was {start_window_s(wait_s, load):.0f}s). ")
     stop_s, main = _manager_view(p)
     failed = _running_daemons(p, main)
     t1 = time.time()
@@ -956,7 +1156,7 @@ def check_deferred(p: Project, who: str = "watchdog", restart_fn=None, budget_s:
                 return "pending"
             path.unlink(missing_ok=True)
             return "busy"
-    elif now < gone + wait_s:
+    elif now < gone + start_window_s(wait_s):
         return "pending"
     until = None if budget_s is None else now + budget_s - JUDGE_MARGIN_S
     if until is not None and until - now < ROLLBACK_MIN_S:

@@ -39,6 +39,16 @@ QUIET_GAP_MIN = 90       # a median gap over this, with nothing running or due, 
 
 WORKER_TTLS = ("5m", "1h", "off")
 WORKER_DEFAULT = "5m"
+# Workers and reviews stay at 5m, and set it: Claude Code (2.1.285) reads CLAUDE_CODE_PROMPT_CACHE_TTL
+# for the main conversation, and unset it picks 1h on a Claude subscription (5m on an API key); its
+# subagents take CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL, 5m unset. A run's lifetime is fixed when it
+# starts, and a worker's calls mostly follow each other within seconds while its context grows, so 1h
+# doubles the price of the many writes for the few reads after a gap. A replay of a day of live runs
+# (75 coordinator, 86 worker, 27 review) priced each run at both lifetimes: 1h for every worker cost
+# 11% more (20 cold restarts saved), 1h for every review 27% more, and even picking 1h only for the
+# runs it would have paid for, known afterwards, saved 2% on workers and nothing on reviews. A resumed
+# run after a wait would read its predecessor's history at 1h, but that pays only the 1h price of the
+# predecessor's whole run: about even (17 resumed runs). So no start-time rule saves here.
 
 
 def worker_setting(budget: dict) -> str:

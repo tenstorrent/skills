@@ -12,7 +12,7 @@ from pathlib import Path
 
 from . import budget as bud
 from . import chaincap, conflictfix, ctxblock, overlap, relay, replymsg, settinghold, settled, taskfacts, tierfloor, timefmt
-from . import preempt, sidefx, streamguard
+from . import knownpaths, preempt, sidefx, specfold, streamguard
 from .db import continues_id, load_result
 from .hook import unread_update
 from .project import rebase_replace
@@ -279,6 +279,54 @@ def charter_sections(charter: str) -> list[tuple[str, list[str]]]:
     return out if out[0][1] else out[1:]
 
 
+# A heading that is the coordinator's own and so ends a Brief that has headings of its own: the template's
+# sections after the Brief and the dated ones charter_update adds
+BRIEF_END_HEADS = ("goal", "polic", "resource", "responsib")
+BRIEF_END_RE = re.compile(r"^\s*(?:<!--\s*)?\(?end of (?:the )?brief\)?\.?\s*(?:-->)?\s*$", re.I)
+
+
+def brief_lines(charter: str) -> list[bool]:
+    """Per line of `charter` (splitlines), whether it is the Brief's: from a `## Brief ...` heading up to
+    the next coordinator section (BRIEF_END_HEADS, a heading charter_update dated "(added ...)", or the
+    template's "Restrictions (binding on every task)") or an explicit end line (`<!-- end of Brief -->`,
+    "(end of Brief)"). A Brief that has `## ` headings of its own (Why, Deliverables, Restrictions ...)
+    keeps them: they are the user's words too. A `## Restrictions` heading ends a Brief that has none of
+    its own before it (a one-paragraph Brief, then the coordinator's Restrictions)."""
+    out, on, own = [], False, False
+    for line in charter.splitlines():
+        if line.startswith("## "):
+            name = " ".join(line[3:].split()).lower()
+            if name.startswith("brief"):
+                on, own = True, False
+            elif on and (name.startswith(BRIEF_END_HEADS) or "(added " in name or "binding on every task" in name
+                         or name.startswith("restriction") and not own):
+                on = False
+            elif on:
+                own = True
+        elif on and BRIEF_END_RE.match(line):
+            on = False
+        out.append(on)
+    return out
+
+
+def brief_text(charter: str) -> str:
+    """The Brief's lines (brief_lines), joined."""
+    return "\n".join(ln for ln, on in zip(charter.splitlines(), brief_lines(charter)) if on)
+
+
+def brief_restrictions(charter: str) -> set[str]:
+    """The items (whitespace-joined) of the Restrictions sections inside the Brief: they rest on the
+    Brief (origin Brief), not on a cite of their own."""
+    from .restriction_source import split_items
+    body, keep = [], False
+    for line, on in zip(charter.splitlines(), brief_lines(charter)):
+        if line.startswith("## "):
+            keep = on and line[3:].strip().lower().startswith("restriction")
+        elif keep and on:
+            body.append(line.rstrip())
+    return {" ".join(" ".join(it).split()) for it in split_items("\n".join(body))}
+
+
 def _placeholder(par: str) -> bool:
     """A paragraph the template left to be filled in: "(none stated yet)" (alone or ending a
     paragraph), "(to be ...)" or "(... to be filled in)". Other parenthesised paragraphs are real
@@ -320,7 +368,7 @@ def restrictions_block(p: Project, advisory: bool = True) -> str:
     ones apart, marked not binding (restriction_source)."""
     from .restriction_source import partition
     charter = p.charter_path.read_text() if p.charter_path.exists() else ""
-    binding, loose = partition(charter_restrictions(charter))
+    binding, loose = partition(charter_restrictions(charter), brief_restrictions(charter))
     out = [("# BINDING RESTRICTIONS (from the charter — override the task, the harness "
             "rules and your own judgement; if a step would break one, do not take it)\n" + binding)] if binding else []
     if loose and advisory:
@@ -707,26 +755,35 @@ def worker_corrections(p: Project) -> list[dict]:
 
 def worker_system(p: Project, task: dict | None = None) -> str:
     """The part of a worker's prompt shared by every worker and reviewer of the project until the
-    charter, memory or its machines change: sent as the system prompt where the agent allows it, so
-    the provider caches it across concurrent runs. It never reads `task` (kept for callers): the rules
-    and memory a task alone needs go in its own prompt (worker_rules)."""
+    charter, its rules or its machines change: sent as the system prompt where the agent allows it, so
+    the provider caches it across runs (back to back, same model). It never reads `task` (kept for
+    callers), nor memory, which changes far more often: worker_memory_block, in the run's own prompt."""
     f = p.harness / "prompts" / "worker.md"
-    parts = [restrictions_block(p), split_rules(f.read_text(), project_features(p), set())[0] if f.exists() else ""]
+    parts = [restrictions_block(p), split_rules(f.read_text(), project_features(p), set())[0] if f.exists() else "",
+             knownpaths.block(p)]
     # The one copy of the restrictions (the task prompt only points back at it); a second inside the
     # charter only costs tokens.
-    # The rest of the charter and memory is mostly the coordinator's: workers get their digest of it.
-    charter, mem, use = worker_context(p, reserve=WORKER_RANKED_MIN_CHARS)   # the task's own: worker_rules
+    # The rest of the charter is mostly the coordinator's: workers get their digest of it.
+    charter, _, use = worker_context(p, reserve=WORKER_RANKED_MIN_CHARS)
+    parts.append(_worker_heads(p, use["charter_dropped"], 0)[0] + (charter or "(none)"))
+    return "\n\n".join(x for x in parts if x.strip())
+
+
+def worker_memory_block(p: Project) -> str:
+    """The user's corrections and the project memory for workers (worker_context's task-free choice),
+    leading a run's own prompt: one new entry must not change the system prompt every worker and
+    reviewer shares, which would make each one's first call write the cache afresh (task #51)."""
+    _, mem, use = worker_context(p, reserve=WORKER_RANKED_MIN_CHARS)   # the task's own: worker_rules
     # The user's corrections come before the rest of memory, outside its budget (Project.user_corrections).
     fixed = worker_corrections(p)
     p.note_memory_shown([e["name"] for e in fixed + mem + use["pointers"]])
-    head, mem_head = _worker_heads(p, use["charter_dropped"], len(p._memory_entries()))
-    parts.append(head + (charter or "(none)"))
+    parts = []
     if fixed:
         parts.append(f"# {CORRECTIONS_HEADER.upper()}\n" + "\n".join(e["line"] for e in fixed))
     more = [_PINNED_MORE.format(path=p.memory_dir)] + [x["line"] for x in use["pointers"]] if use["pointers"] else []
     if mem or more:
-        parts.append(mem_head + "\n".join([e["line"] for e in mem] + more))
-    return "\n\n".join(x for x in parts if x.strip())
+        parts.append(_worker_heads(p, 0, len(p._memory_entries()))[1] + "\n".join([e["line"] for e in mem] + more))
+    return "\n\n".join(parts)
 
 
 def _zone_line(p: Project, now: float | None = None) -> str:
@@ -797,7 +854,7 @@ def worker_task(p: Project, task: dict, cwd: str, branch: str | None, wake: dict
     if conflict and cmark and conflict.get("tier") == "light":
         short = (delta_review_task(p, task, cwd, branch, cmark, conflict["model_free"])
                  if isinstance(conflict.get("model_free"), dict) else conflict_fix_task(p, task, cwd, branch, cmark))
-        return "\n\n".join(x for x in (worker_rules(p, task), short) if x.strip())
+        return "\n\n".join(x for x in (worker_memory_block(p), worker_rules(p, task), short) if x.strip())
     if prev:
         history = f"\nPrevious attempt ended '{prev.get('status')}': {str(prev.get('summary') or '')[:1500]}\n"
         if prev.get("woke"):
@@ -866,6 +923,8 @@ def worker_task(p: Project, task: dict, cwd: str, branch: str | None, wake: dict
                     + f": `git worktree add <dir>/t{task['id']} -b ttp/t{task['id']}-<topic> <start>`, <start> "
                     "the branch you build on. Never edit another task's worktree.\n")
     history += verified_line(p, task, cwd)
+    if kind in ("code", "review", "work", "harness"):
+        history += remote_only_line(cfg)
     if kind == "review":
         history += no_commit_line(p, task)
     own_off = own_push(cfg) == "off"
@@ -898,6 +957,7 @@ def worker_task(p: Project, task: dict, cwd: str, branch: str | None, wake: dict
         restart_block(p, prev),
         streamguard.prompt_block(prev),
         _sections(_raw(p, f"kind-{kind}.md"), cfg),
+        worker_memory_block(p),
         worker_rules(p, task),
         f"# YOUR TASK #{task['id']}: {task['title']}\n"
         f"kind: {kind} · tier: {task['tier']}" + (f" · this run: {run_tier} wake" if wake else "")
@@ -925,7 +985,7 @@ def worker_task(p: Project, task: dict, cwd: str, branch: str | None, wake: dict
            + ("refused; never push any branch but the push branch)" if own_off else
               "`ttp push --own` publishes only onto a branch the remote already has)")
            if own_push(cfg) != "on" and delivery.get("own_push") is not None else "") + "\n"
-        f"{history}\n## Spec\n{task['spec'] or task['title']}\n",
+        f"{history}\n## Spec\n{specfold.for_prompt(p.state, task)}\n",
         replymsg.prompt_block(dict(task)),
         settled.prompt_block(p, dict(task)),
         taskfacts.prompt_block(p, dict(task)),
@@ -1113,6 +1173,19 @@ def verified_line(p: Project, task: dict, cwd: str) -> str:
             f"if_changed checks the same way; the push checks still run in full on the final head.\n")
 
 
+def remote_only_line(cfg: dict) -> str:
+    """On a workstation whose heavy checks go to spill hosts (checkspill.remote_only), the worker is told to run
+    tests and builds only through `ttp checks`. "" elsewhere, or on error."""
+    from . import checkspill
+    try:
+        if not checkspill.remote_only(cfg):
+            return ""
+    except Exception:
+        return ""
+    return ("\nThis machine is a workstation whose heavy checks go to spill hosts (delivery.checks_remote_only): run "
+            "tests and builds only through `ttp checks`, never a plain pytest or build here.\n")
+
+
 def no_commit_line(p: Project, task: dict) -> str:
     """A review that covers no commit (worktree.reviewed_head None, no extchange published head: its
     target is an external artifact or a hash-pinned report) is told `ttp checks` has no target there,
@@ -1177,7 +1250,7 @@ def worker_resume(p: Project, task: dict, lost: dict) -> str:
                      f"under {lost['dir']}.\n")
         if lost.get("spec_sha") and lost["spec_sha"] != spec_digest(task):
             text += ("\nUpdate for your task from the project coordinator. Where it differs from the spec, it wins:\n"
-                     f"The spec changed:\n{task['spec'] or task['title']}\n")
+                     f"The spec changed:\n{specfold.for_prompt(p.state, task)}\n")
         return "\n\n".join(x for x in (text, restrictions_pointer(p)) if x.strip())
     why = {"reboot": "the host rebooted", "sleep": "the host slept",
            "network": "the network went away", "crash": "its process died without a result (a crash)"}.get(
@@ -1196,7 +1269,7 @@ def worker_resume(p: Project, task: dict, lost: dict) -> str:
                  f"$TTP_RUN_DIR/result.json, not under {old_dir} or any run dir named in earlier context.\n")
     update = []
     if lost.get("spec_sha") and lost["spec_sha"] != spec_digest(task):
-        update.append(f"The spec changed:\n{task['spec'] or task['title']}")
+        update.append(f"The spec changed:\n{specfold.for_prompt(p.state, task)}")
     steer = unread_update(Path(old_dir))[0] if old_dir else ""
     if steer:
         update.append(steer)

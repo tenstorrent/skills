@@ -476,11 +476,13 @@ def env(tmp_path, monkeypatch, _git_session, _short_tmp):
     monkeypatch.setenv("TTP_TEST_SHORT_TMP", _short_tmp)   # never the real /tmp/ttp-<uid>
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
     monkeypatch.setenv("TTP_HOST", "testhost")
+    monkeypatch.delenv("SSH_AUTH_SOCK", raising=False)   # a password manager's agent here never changes a timeout test
     monkeypatch.setenv("TTP_TEST_LOCAL_TZ", "UTC")   # home zones: never the zone of the machine running the tests
     monkeypatch.setenv("TTP_TEST_CLEAR_HOLD_S", "0")   # alerts clear on the first healthy sweep (alerts_cases tests the window)
     monkeypatch.setenv("TTP_TEST_BUDGET_SETTLE_S", "0")   # a budget red alerts on its first read (budget_cases tests the settle)
     monkeypatch.setenv("TTP_TEST_POLL_S", "0.05")   # wait loops (runner, ttp lock, listen) check often
     monkeypatch.setenv("TTP_CHECKS_LOAD_GUARD", "0")   # suites never wait on the load of the host running the tests (loadguard tests set it)
+    monkeypatch.setenv("TTP_TEST_REMOTE_ONLY", "0")   # a busy spill pool never holds checks on a laptop running the tests (checkspill.remote_only)
     monkeypatch.setenv("TTP_CHECKS_POOL_DIRS", str(tmp_path / "pool"))   # never this host's real pool runs (the suite's own run folder among them)
     monkeypatch.setenv("TTP_TEST_DISK_MOUNT", str(tmp_path))   # the disk guard's du stays in the test folder
     monkeypatch.setenv("TTP_TEST_SSH_CONFIG", str(tmp_path / "ssh_config"))   # never the user's own ssh config
@@ -505,13 +507,15 @@ def env(tmp_path, monkeypatch, _git_session, _short_tmp):
     # The outer checks' output directory and lifetime descriptor belong to that invocation.
     for var in ("TTP_RUN_DIR", "TTP_TASK", "TTP_RUN_ID", "TTP_PROJECT", "TTP_DETACHED", "TTP_OUTLIVES_RUN", "TTP_CHECK_WAITS", "TTP_LOCKS_HELD", "TTP_PIDNS",
                 "TTP_OUTLIVES_RUN", "TTP_CGROUP", "TTP_CHECK_OUTPUT_DIR", "TTP_CHECKS_TMP_FD", "TTP_PUSH_OWN_BRANCH", "TTP_DETACH_RC",
-                "TTP_CHECKS_SLOT", "TTP_CHECKS_HOST_MAX", "TTP_ROUTE_HOST_MAX", "TTP_WAITS_IDLE", "TTP_TEST_SLOTS_HELD", "TTP_TEST_POOL", "TTP_TEST_RUN_MAX",
+                "TTP_CHECKS_SLOT", "TTP_CHECKS_HOST_MAX", "TTP_ROUTE_HOST_MAX", "TTP_WAITS_IDLE", "TTP_TEST_SLOTS_HELD", "TTP_TEST_SLOTS", "TTP_TEST_POOL", "TTP_TEST_RUN_MAX",
                 "TTP_BUILD_SLOTS_HELD", "TTP_BUILD_POOL", "TTP_BUILD_RUN_MAX", "TTP_BUILD_PROJECT_MAX", "MAKEFLAGS",
                 "TTP_NO_USER_POST",   # a light-tier or chat-routed run's mark (workernotify.ENV)
                 "CMAKE_BUILD_PARALLEL_LEVEL"):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setenv("TTP_CHECKS_LOAD_EXTRA", "0")   # the checks cap never grows with this host's load
+    monkeypatch.setenv("TTP_TEST_NO_INHERIT", "1")   # `ttp checks` never takes the task of the run running the tests (checkcap.adopt_identity)
     monkeypatch.setenv("TTP_CHECKS_LIVE_CORES", "0")   # nor waits on this host's busy cores
+    monkeypatch.setenv("TTP_CHECKS_LOAD_SUSTAIN_S", "0")   # load tests read the demand now (sustain tests set it)
     monkeypatch.setenv("TTP_CHECKS_DIRTY_MAX_MB", "0")   # nor on its disk (diskgate)
     monkeypatch.setenv("TTP_CHECKS_IO_FULL_MAX", "0")
     monkeypatch.setenv("TTP_CHECKS_SLOTS", "1")   # one checks lane per repository, whatever this host's size
@@ -526,6 +530,13 @@ def env(tmp_path, monkeypatch, _git_session, _short_tmp):
     sys.path.insert(0, str(RUNTIME))
     for mod in [m for m in list(sys.modules) if m == "ttp" or m.startswith("ttp.")]:
         del sys.modules[mod]
+    from ttp import hostcpu   # the fresh module tests import
+    monkeypatch.setattr(hostcpu, "MEMINFO", tmp_path / "no-meminfo")   # memory reads as unknown: never this host's own
+    monkeypatch.setattr(hostcpu, "mach_mem_free", lambda: None)   # (memory tests set it)
+    monkeypatch.setattr(hostcpu, "mem_pressure", lambda: None)   # nor its memory pressure level
+    from ttp import machinecap   # the machine-wide worker limit: auto reads as a server (tests turn it on)
+    monkeypatch.setattr(machinecap, "DARWIN", False)
+    monkeypatch.setattr(machinecap, "has_battery", lambda root=None: False)
     monkeypatch.setattr(importlib.machinery.SourceFileLoader, "get_code",
                         _cached_get_code(importlib.machinery.SourceFileLoader.get_code))
     monkeypatch.setattr(gettext, "find", _cached_find(gettext.find))
@@ -729,6 +740,13 @@ def make(env, name="demo"):
     p = _clone_project(env, name)
     register(name, {"host": "testhost", "dir": str(p.root)})
     return p
+
+
+def _worker_text(p, task=None):
+    """The shared system prompt and the memory block that leads each run's own prompt (task #51), as one
+    text: what worker_system returned while it carried memory."""
+    from ttp.prompts import worker_memory_block, worker_system
+    return "\n\n".join(x for x in (worker_system(p, task), worker_memory_block(p)) if x)
 
 
 # make() bootstraps each project once per test process and clones it after that: a bootstrap is about
@@ -5294,6 +5312,11 @@ def test_a_waiting_hand_off_whose_probe_reads_another_tasks_worktree_logs_one_li
     assert log.count(f"task {tid} retry_when reads the worktree of task(s) #{other}: kept from pruning") == 1
 
 
+def _tier_of(wake: dict) -> dict:
+    """A run note's wake, tier and escalation only (it also records the reason and who chose the tier)."""
+    return {k: wake[k] for k in ("tier", "escalated")}
+
+
 def test_a_wake_runs_at_light_or_its_wake_tier_never_above_the_task_and_other_runs_are_unchanged(
         env, monkeypatch):
     p = make(env)
@@ -5320,13 +5343,13 @@ def test_a_wake_runs_at_light_or_its_wake_tier_never_above_the_task_and_other_ru
     failed_before = task("deep", {"status": "failed", "waiting_for": "a build"})
     for _ in range(4):   # a few start per tick
         d.dispatch()
-    assert started[waits_for][:2] == ("light", {"tier": "light", "escalated": False})
+    assert started[waits_for][:2] == ("light", {"tier": "light", "escalated": False, "reason": "timer", "gate": "none", "by": "rule"})
     assert "this run: light wake" in started[waits_for][2] and 'wake_tier: "standard"' in started[waits_for][2]
-    assert started[probes][:2] == ("light", {"tier": "light", "escalated": False})
+    assert (started[probes][0], _tier_of(started[probes][1])) == ("light", {"tier": "light", "escalated": False})
     assert started[asks_deep][0] == "standard", "a wake_tier above the task's own tier is capped"
     assert started[asks_std][0] == "standard"
     assert started[light_task][0] == "light"
-    assert started[says_nothing][:2] == ("standard", {"tier": "standard", "escalated": False})
+    assert (started[says_nothing][0], _tier_of(started[says_nothing][1])) == ("standard", {"tier": "standard", "escalated": False})
     assert "retry_after_s: 0" not in started[says_nothing][2], "a wake at the task's tier has nothing to escalate"
     for tid, tier in ((never_waited, "standard"), (failed_before, "deep")):
         assert started[tid][:2] == (tier, None)
@@ -5379,7 +5402,8 @@ def test_a_light_wake_escalates_once_at_once_and_free(env, monkeypatch):
     assert _run_until(d, p, lambda: len(runs()) == 2 and p.db.task(tid)["status"] == "queued"
                       and all(r["status"] != "running" for r in runs()))
     wakes = [json.loads(r["note"])["wake"] for r in runs()]
-    assert wakes == [{"tier": "light", "escalated": False}, {"tier": "standard", "escalated": True}]
+    assert [_tier_of(w) for w in wakes] == [{"tier": "light", "escalated": False}, {"tier": "standard", "escalated": True}]
+    assert wakes[1]["reason"] == "asked" and wakes[1]["by"] == "rule", "the escalation records why it woke"
     t = p.db.task(tid)
     # The escalated run asked again: that is an ordinary wait now, not a second free run.
     assert t["attempts"] == 0 and json.loads(t["result"])["waits"] == 3
@@ -5416,7 +5440,7 @@ def test_an_escalated_wake_that_keeps_a_retry_when_runs_only_once_its_probe_pass
     flag.write_text("")
     monkeypatch.delenv("TTP_FAKE_RESULT")
     assert _run_until(d, p, lambda: len(runs()) == 2)
-    assert json.loads(runs()[1]["note"])["wake"] == {"tier": "standard", "escalated": True}
+    assert _tier_of(json.loads(runs()[1]["note"])["wake"]) == {"tier": "standard", "escalated": True}
 
 
 def test_a_mechanical_wake_that_escalates_but_keeps_next_step_reruns_at_the_tasks_tier(env, monkeypatch):
@@ -5439,7 +5463,7 @@ def test_a_mechanical_wake_that_escalates_but_keeps_next_step_reruns_at_the_task
         return p.db.q("SELECT status, effort, note FROM runs WHERE task=? AND role='worker' ORDER BY id", (tid,))
 
     assert _run_until(d, p, lambda: len(runs()) == 2 and all(r["status"] != "running" for r in runs()))
-    assert [json.loads(r["note"])["wake"] for r in runs()] == [
+    assert [_tier_of(json.loads(r["note"])["wake"]) for r in runs()] == [
         {"tier": "light", "escalated": False}, {"tier": "standard", "escalated": True}]
     assert [r["effort"] for r in runs()] == ["low", "high"]
 
@@ -5499,7 +5523,6 @@ def test_claude_workers_get_the_update_hook_but_decisions_do_not(env):
 def test_claude_workers_get_a_lean_context_but_keep_plugin_skills(env, monkeypatch):
     from ttp.providers import claude, get_provider
     build = get_provider("claude").build
-    monkeypatch.setattr(claude, "_FLAGS", {claude.TOOLS: False})   # a CLI without --tools: the denylist
     worker, _ = build(role="worker", model="opus", effort="low", cwd=".", budget_usd=None, read_only=False,
                       schema=None, restrictions={"no_internet": True})
     settings = json.loads(worker[worker.index("--settings") + 1])
@@ -5510,15 +5533,11 @@ def test_claude_workers_get_a_lean_context_but_keep_plugin_skills(env, monkeypat
     assert settings["autoMemoryEnabled"] is False
     assert worker.count("--disallowedTools") == 1, "a second flag would hide part of the deny list"
     i = worker.index("--disallowedTools") + 1
-    denied = worker[i:worker.index("--settings", i)]
-    assert {"Workflow", "ScheduleWakeup", "CronCreate", "CronDelete", "CronList", "RemoteTrigger",
-            "PushNotification", "DesignSync", "NotebookEdit", "EnterWorktree", "ExitWorktree", "ListAgents",
-            "ReportFindings", "Task", "Agent", "SendMessage", "WebFetch", "WebSearch"} == set(denied)
-    # The tools workers do use stay, ToolSearch included (it loads deferred and MCP tools).
-    assert not {"Bash", "Read", "Edit", "Write", "Skill", "ToolSearch", "Monitor", "TaskStop"} & set(denied)
+    # The full tool set (user msg #2302): no_internet withholds only the web tools.
+    assert worker[i:worker.index("--settings", i)] == ["WebFetch", "WebSearch"] and "--tools" not in worker
     online, _ = build(role="worker", model="opus", effort="low", cwd=".", budget_usd=None, read_only=False,
                       schema=None, restrictions={})
-    assert "WebFetch" not in online and "Workflow" in online
+    assert "--disallowedTools" not in online and "--tools" not in online
     # Plugin skills (tt-project's own, a project's plugin dirs) are never overridden; of the namespaced
     # ones only the Anthropic skills a claude.ai account brings are.
     argv = online + get_provider("claude").plugin_args(["/p/plugin"])
@@ -5819,7 +5838,7 @@ def test_coordinator_turns_pass_the_cache_settings_through(env, monkeypatch):
     monkeypatch.setattr(claude.Claude, "own_cache_breakpoints", 3)   # an agent that leaves one free
 
     def start(ttl, supported=True):
-        monkeypatch.setattr(claude, "_FLAGS", {claude.INPUT_FORMAT: supported})
+        monkeypatch.setattr(claude, "_FLAGS", {claude.INPUT_FORMAT: supported, claude.APPEND_SYSTEM: True})
         rid = d.start_run("coordinator", "EVENTS", "claude", "standard", str(p.root), read_only=True,
                           schema=coord.ACTIONS_SCHEMA, system=head, context=context, cache_ttl=ttl)
         run = p.runs / str(rid)
@@ -5829,14 +5848,14 @@ def test_coordinator_turns_pass_the_cache_settings_through(env, monkeypatch):
     spec, run = start("1h")
     assert spec["env"].get("CLAUDE_CODE_PROMPT_CACHE_TTL") == "1h"
     assert spec["stdin"] == "input.jsonl"
-    assert "--input-format" in spec["argv"] and spec["argv"][spec["argv"].index("--system-prompt") + 1] == head
+    assert "--input-format" in spec["argv"] and spec["argv"][spec["argv"].index("--append-system-prompt") + 1] == head
     blocks = json.loads((run / "input.jsonl").read_text())["message"]["content"]
     assert [_unmoded(b["text"]) for b in blocks] == [context, "EVENTS"]
     for ttl, supported in (("off", True), ("1h", False)):
         spec, run = start(ttl, supported)
         assert "stdin" not in spec and not (run / "input.jsonl").exists()
         assert "--input-format" not in spec["argv"]
-        assert spec["argv"][spec["argv"].index("--system-prompt") + 1] == coord.join_prompt(head, context)
+        assert spec["argv"][spec["argv"].index("--append-system-prompt") + 1] == coord.join_prompt(head, context)
         assert spec["env"].get("CLAUDE_CODE_PROMPT_CACHE_TTL") == (None if ttl == "off" else ttl)
 
 
@@ -6028,7 +6047,7 @@ def test_largest_coordinator_turn_stays_within_four_cache_breakpoints(env, monke
     from ttp.daemon import Daemon
     from ttp import coordinator as coord
     monkeypatch.setattr(claude.Claude, "binary", lambda self: "/usr/bin/true")   # never a real agent
-    monkeypatch.setattr(claude, "_FLAGS", {claude.INPUT_FORMAT: True})
+    monkeypatch.setattr(claude, "_FLAGS", {claude.INPUT_FORMAT: True, claude.APPEND_SYSTEM: True})
     p = make(env)
     d = Daemon(p.base)
     # Every optional block: memory of each kind, a user message, a steer on a running task, events.
@@ -6054,7 +6073,7 @@ def test_largest_coordinator_turn_stays_within_four_cache_breakpoints(env, monke
         marks = _coordinator_marks(run)
         assert marks + own <= base.MAX_CACHE_BREAKPOINTS, (own, marks)
         argv = json.loads((run / "run.json").read_text())["argv"]
-        system = argv[argv.index("--system-prompt") + 1]
+        system = argv[argv.index("--append-system-prompt") + 1]
         if marks:
             assert system == head, "with a breakpoint to spare the stable block is its own"
         else:
@@ -6224,8 +6243,9 @@ def test_claude_workers_get_the_stable_prompt_as_a_cacheable_system_prompt(env, 
     assert argv[argv.index("--append-system-prompt-file") + 1] == str(run_dir / "system.md")
     system = (run_dir / "system.md").read_text()
     assert system.startswith("# BINDING RESTRICTIONS")
-    assert "Go fast." in system and "MEMORY-MARKER" in system and "TASK-SPEC-MARKER" not in system
-    assert "TASK-SPEC-MARKER" in prompt and "Go fast." not in prompt and "MEMORY-MARKER" not in prompt
+    assert "Go fast." in system and "MEMORY-MARKER" not in system and "TASK-SPEC-MARKER" not in system
+    # memory changes far more often than the charter: it leads the run's own prompt (task #51)
+    assert "TASK-SPEC-MARKER" in prompt and "Go fast." not in prompt and "MEMORY-MARKER" in prompt
     assert prompt.rstrip().endswith(restrictions_pointer(p)), "a pointer at the restrictions closes the prompt"
     assert "Never merge to main (user msg #1)." not in prompt, "the restrictions are in the system prompt only"
 
@@ -6264,8 +6284,9 @@ def test_every_worker_gets_the_same_system_prompt_so_its_cache_is_shared(env, mo
     assert set(dirs) == {a, b}, [p.db.task(t)["blocked_reason"] for t in (a, b)]
     sys_a, sys_b = ((dirs[t] / "system.md").read_bytes() for t in (a, b))
     assert sys_a == sys_b, "a per-task byte in the system prompt makes every worker re-write the cache"
-    assert b"MEMORY-MARKER" in sys_a and b"RULES" not in sys_a
+    assert b"Go fast." in sys_a and b"MEMORY-MARKER" not in sys_a and b"RULES" not in sys_a
     prompt_a, prompt_b = ((dirs[t] / "prompt.md").read_text() for t in (a, b))
+    assert "MEMORY-MARKER" in prompt_a and "MEMORY-MARKER" in prompt_b
     assert prompt_a.startswith("QUESTION-RULES") and "SPEC-A" in prompt_a and "PLAN-RULES" not in prompt_a
     assert prompt_b.startswith("PLAN-RULES") and "SPEC-B" in prompt_b
 
@@ -6421,7 +6442,6 @@ def test_a_claude_worker_is_denied_reading_the_web_token(env, monkeypatch):
 
 def test_disallowed_tools_extend_the_workers_denylist_and_never_the_coordinators(env, monkeypatch):
     from ttp.providers import claude, get_provider
-    monkeypatch.setattr(claude, "_FLAGS", {claude.TOOLS: False})   # a CLI without --tools
     kw = dict(role="worker", model="opus", effort="low", cwd=".", budget_usd=None, schema=None,
               restrictions={"no_internet": True})
 
@@ -6429,19 +6449,19 @@ def test_disallowed_tools_extend_the_workers_denylist_and_never_the_coordinators
         i = argv.index("--disallowedTools")
         return argv[i + 1:argv.index("--settings")]
     worker, _ = get_provider("claude").build(read_only=False, **kw)
-    assert denied(worker) == [*claude.WORKER_DENIED_TOOLS, "WebFetch", "WebSearch"], "unset: the defaults only"
+    assert denied(worker) == ["WebFetch", "WebSearch"], "unset: no_internet's web tools only"
     worker, _ = get_provider("claude").build(read_only=False, disallowed_tools=["mcp__mail__*", "Task",
                                                                                 "mcp__docs__write_page"], **kw)
-    assert denied(worker) == [*claude.WORKER_DENIED_TOOLS, "WebFetch", "WebSearch", "mcp__mail__*",
-                              "mcp__docs__write_page"], "the defaults stay, each tool once"
+    assert denied(worker) == ["WebFetch", "WebSearch", "mcp__mail__*", "Task",
+                              "mcp__docs__write_page"], "the web tools stay, each tool once"
     assert worker.count("--disallowedTools") == 1
     turn, _ = get_provider("claude").build(read_only=True, disallowed_tools=["mcp__mail__*"], **kw)
     assert "mcp__mail__*" not in turn
     for name in ("codex", "cursor", "fake"):
         get_provider(name).build(read_only=False, disallowed_tools=["mcp__mail__*"], **kw)
-    # With the --tools allowlist, only the project's own list is denied (MCP tools are not built-in).
-    monkeypatch.setattr(claude, "_FLAGS", {claude.TOOLS: True})
-    worker, _ = get_provider("claude").build(read_only=False, disallowed_tools=["mcp__mail__*"], **kw)
+    # Online, only the project's own list is denied.
+    worker, _ = get_provider("claude").build(read_only=False, disallowed_tools=["mcp__mail__*"],
+                                             **{**kw, "restrictions": {}})
     assert denied(worker) == ["mcp__mail__*"]
 
 
@@ -10604,37 +10624,59 @@ def test_an_upgrade_hands_two_versions_of_one_added_line_to_a_harness_task(env, 
     assert p.db.one("SELECT id FROM tasks WHERE kind='harness'")
 
 
-def test_a_conflicting_upgrade_queues_at_most_one_task_a_day(env, monkeypatch, capsys):
-    """Each release would otherwise queue its own model task for the same conflict: within a day of
-    the last one, the upgrade only records that it waits, and the daemon tries again after."""
+def test_a_conflicting_upgrade_queues_its_next_merge_task_at_once_on_any_change(env, monkeypatch, capsys):
+    """No timer holds a merge task off (it was up to 6 h): a newer release queues the next one at once
+    after the last ended, one stays open at a time, and only the same release on the same local files
+    waits, until the project's own files change."""
     from ttp import cli, release
     p, restarts = _conflicting_upgrade(env, monkeypatch)
+    harness = lambda: [t["id"] for t in p.db.q("SELECT id FROM tasks WHERE kind='harness' ORDER BY id")]
     with pytest.raises(SystemExit):
         cli.main(["upgrade", "demo"])
-    first = p.db.one("SELECT id FROM tasks WHERE kind='harness'")["id"]
+    first = harness()[0]
     p.db.update_task(first, status="done")
-    _next_release(env)      # the next release, the same conflict
+    p.db.x("UPDATE tasks SET updated=? WHERE id=?", (time.time() - 60, first))     # ended 1 minute ago
+    _next_release(env)
+    with pytest.raises(SystemExit) as e:
+        cli.main(["upgrade", "demo", "--auto", "--project-dir", str(p.base)])
+    tids = harness()
+    assert e.value.code == 75 and len(tids) == 2 and release.finish_holder(p)["task"] == tids[1]
+    _next_release(env)                                  # one open merge task at most: it is retargeted
+    with pytest.raises(SystemExit) as e:
+        cli.main(["upgrade", "demo"])
+    newest = cli._runtime_version(env["home"] / "lib" / "current" / "runtime")
+    assert e.value.code == 75 and harness() == tids
+    assert f"Target release: tt-project {newest} (" in p.db.task(tids[1])["spec"]
+    p.db.update_task(tids[1], status="failed")         # ends without landing; nothing changed since
     capsys.readouterr()
     with pytest.raises(SystemExit) as e:
         cli.main(["upgrade", "demo"])
     out = capsys.readouterr().out
-    assert e.value.code == 75 and f"Harness task #{first} took on a template merge" in out
-    assert "upgrade deferred" in out and "tries again after" in out and "owner: this project's daemon" in out
-    assert "resumes at" in out
-    assert [t["id"] for t in p.db.q("SELECT id FROM tasks WHERE kind='harness'")] == [first] and not restarts
+    assert e.value.code == 75 and harness() == tids, out
+    assert f"Harness task #{tids[1]} took on this merge" in out and "queues the next at once" in out
+    assert "upgrade deferred" in out and "looks again at" in out and "owner: this project's daemon" in out
     rec = p.db.kv(release.KV_AUTO)
-    assert rec["outcome"] == "deferred" and rec["key"].endswith(" bbbb2222") and rec["until"] > time.time()
-    d = {"key": rec["key"]}
-    assert "less than 6 h ago" in release.hold_reason(p, d)
-    p.db.set_kv(release.KV_RELEASE, {"installed": "x (bbbb2222)", "current": "y", "key": rec["key"], "newer": True})
-    assert "owner: this project's daemon; resumes at" in release.line(p, p.db, {})
-    # a day later the conflict gets a task of its own again
-    p.db.x("UPDATE tasks SET created=created-? WHERE id=?", (release.task_every_s({}) + 60, first))
-    p.db.set_kv(release.KV_AUTO, {**rec, "until": time.time() - 1})
-    assert release.hold_reason(p, d) == ""
-    with pytest.raises(SystemExit):
+    assert rec["outcome"] == "deferred" and time.time() < rec["until"] <= time.time() + release.CHECK_S + 5
+    assert "nothing changed since" in release.hold_reason(p, {"key": rec["key"]})
+    (p.harness / "prompts" / "worker.md").write_text("# Worker, edited here\n")    # a local edit
+    _git_out(p.harness, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qam", "local edit")
+    with pytest.raises(SystemExit) as e:
         cli.main(["upgrade", "demo"])
-    assert len(p.db.q("SELECT id FROM tasks WHERE kind='harness'")) == 2
+    assert e.value.code == 75 and len(harness()) == 3 and not restarts
+
+
+def test_no_runtime_code_reads_the_retired_merge_timers():
+    """upgrade.merge_retry_h and upgrade.task_every_h are gone: only the retired-key list names them,
+    so a project that still sets one gets one hint and nothing else."""
+    from ttp import project
+    rt = RUNTIME
+    hits = [f"{f.relative_to(rt)}:{n}" for f in sorted(rt.rglob("*.py"))
+            for n, line in enumerate(f.read_text().splitlines(), 1)
+            if ("merge_retry" in line or "task_every" in line) and f.name != "project.py"]
+    assert not hits, hits
+    assert {"upgrade.merge_retry_h", "upgrade.task_every_h"} <= set(project.RETIRED_KEYS)
+    found = project.config_problems({"upgrade": {"auto": True, "merge_retry_h": 6}})
+    assert [f for f in found if "upgrade.merge_retry_h is retired" in f], found
 
 
 def _next_release(env, newer=True):
@@ -10650,7 +10692,8 @@ def _next_release(env, newer=True):
 
 
 def _deferred_conflict(env, monkeypatch, name="demo", newer=True, source=None):
-    """A project whose template merge conflicts again within a day of its last harness task (done).
+    """A project whose template merge conflicts again on the release its last harness task took on and ended
+    (done) without landing, on the same local files: nothing changed, so no task is queued.
     `source` forces the source commit the harness records (as "unknown" outside a git checkout)."""
     import shutil
     from ttp import cli
@@ -10670,7 +10713,18 @@ def _deferred_conflict(env, monkeypatch, name="demo", newer=True, source=None):
     first = p.db.one("SELECT id FROM tasks WHERE kind='harness'")["id"]
     p.db.update_task(first, status="done")
     _next_release(env, newer)
+    _retargeted(p, env, first)
     return p, first
+
+
+def _retargeted(p, env, tid):
+    """Task `tid` was retargeted to the installed release (as an open task is by each new one)."""
+    import re
+    from ttp import cli
+    rt = env["home"] / "lib" / "current" / "runtime"
+    spec = re.sub(r"^Target release: .*$", f"Target release: tt-project {cli._runtime_version(rt)} "
+                  f"({cli.recorded_commit(rt)})", p.db.task(tid)["spec"], count=1, flags=re.M)
+    p.db.x("UPDATE tasks SET spec=? WHERE id=?", (spec, tid))
 
 
 def test_a_conflict_handed_to_a_harness_task_is_deferred_with_exit_75(env, monkeypatch, capsys):
@@ -10721,7 +10775,7 @@ def test_a_conflict_on_a_newer_version_is_deferred_as_the_daemon_retries_it(env,
     with pytest.raises(SystemExit) as e:
         cli.main(["upgrade", "demo"])
     out = capsys.readouterr().out
-    assert e.value.code == 75 and "upgrade deferred" in out and "tries again after" in out
+    assert e.value.code == 75 and "upgrade deferred" in out and "looks again at" in out
 
 
 def test_a_same_version_conflict_from_another_commit_is_a_failure_nothing_retries(env, monkeypatch, capsys):
@@ -10823,7 +10877,7 @@ def test_two_failed_harness_retries_of_the_same_conflict_are_reported_once(env, 
             tids.append(tid)
         assert len(_stuck_events(p)) == (1 if n >= 2 else 0), n
         p.db.update_task(tid, status="failed")
-        p.db.x("UPDATE tasks SET created=? WHERE id=?", (time.time() - 2 * release.task_every_s({}), tid))
+        _next_release(env)          # a newer release queues the next merge task at once
     assert len(tids) == 4
     text = _stuck_events(p)[0]["text"]
     assert f"#{tids[0]}, #{tids[1]} ended without landing it" in text and "0.0 days" in text
@@ -11068,7 +11122,7 @@ def test_the_finish_task_locks_the_live_harness_until_it_ends(env, monkeypatch, 
 
 def test_with_no_open_finish_task_a_conflict_queues_a_task_that_takes_the_lock(env, monkeypatch, capsys):
     """No open finish task: a conflict queues one as before (exit 75) and only then is the harness held;
-    once it ended more than a day ago, the next conflict queues a new task that takes the lock over."""
+    once it ended, the next release's conflict queues a new task at once that takes the lock over."""
     from ttp import cli, release
     p, restarts = _conflicting_upgrade(env, monkeypatch)
     assert release.finish_holder(p) is None and not release.finish_lock(p).exists()
@@ -11079,7 +11133,6 @@ def test_with_no_open_finish_task_a_conflict_queues_a_task_that_takes_the_lock(e
     assert e.value.code == 75 and f"Harness task #{tid} finishes it" in out and "now targets" not in out
     assert release.finish_holder(p)["task"] == tid and not restarts
     p.db.update_task(tid, status="failed")
-    p.db.x("UPDATE tasks SET created=? WHERE id=?", (time.time() - 2 * release.task_every_s({}), tid))
     _next_release(env)
     with pytest.raises(SystemExit) as e:
         cli.main(["upgrade", "demo"])
@@ -11273,38 +11326,6 @@ def test_a_paused_projects_stuck_merge_owner_is_taken_over_and_the_project_stays
     row = overview.deployed(names=["demo"])["projects"][0]
     assert "paused" in row["reason"] and row["resumes"] == "when demo is resumed", row["line"]
     assert "take it over" not in row["line"]
-
-
-def test_a_host_upgrade_queues_the_merge_task_once_the_last_ended_6h_ago(env, monkeypatch):
-    """The once-a-day merge task limit counted from the last task's creation, also for a host-side
-    upgrade: a project with local edits trailed each release by up to a day. Now a host-side upgrade
-    queues the task once the last one ended 6 h ago (upgrade.merge_retry_h); --auto keeps the daily
-    limit, and there is never more than one open merge task."""
-    from ttp import cli, release
-    p, restarts = _conflicting_upgrade(env, monkeypatch)
-    with pytest.raises(SystemExit):
-        cli.main(["upgrade", "demo"])
-    first = p.db.one("SELECT id FROM tasks WHERE kind='harness'")["id"]
-    p.db.update_task(first, status="done")
-    p.db.x("UPDATE tasks SET created=?, updated=? WHERE id=?", (time.time() - 8 * 3600, time.time() - 7 * 3600, first))
-    _next_release(env)
-    p.set_config("upgrade.task_every_h", 24)        # a window longer than merge_retry_h
-    harness = lambda: [t["id"] for t in p.db.q("SELECT id FROM tasks WHERE kind='harness' ORDER BY id")]
-    with pytest.raises(SystemExit) as e:
-        cli.main(["upgrade", "demo", "--auto", "--project-dir", str(p.base)])
-    assert e.value.code == 75 and harness() == [first]          # the daemon keeps its window
-    p.set_config("upgrade.merge_retry_h", 8)
-    with pytest.raises(SystemExit) as e:
-        cli.main(["upgrade", "demo"])
-    assert e.value.code == 75 and harness() == [first]          # configurable: 8 h not up yet
-    p.set_config("upgrade.merge_retry_h", 6)
-    with pytest.raises(SystemExit) as e:
-        cli.main(["upgrade", "demo"])
-    tids = harness()
-    assert e.value.code == 75 and len(tids) == 2 and release.finish_holder(p)["task"] == tids[1]
-    with pytest.raises(SystemExit) as e:                       # still one open merge task
-        cli.main(["upgrade", "demo"])
-    assert e.value.code == 75 and harness() == tids and not restarts
 
 
 def test_check_release_runs_on_the_first_tick_after_a_resume(env, monkeypatch):
@@ -11697,6 +11718,7 @@ def test_the_daemon_announces_and_takes_restart_requests_each_tick(env, monkeypa
     monkeypatch.setattr(dm.signal, "signal", lambda *a: None)
     monkeypatch.setattr(dm.time, "sleep", lambda s: None)
     monkeypatch.setattr(d, "_nap", lambda s: None)
+    monkeypatch.setattr(d, "_idle_nap", lambda s: None)
     assert d.run() == 0
     assert taken and set(taken) == {d._started}
     assert "restart_requests" in json.loads((p.state / "heartbeat").read_text())["takes"]
@@ -11824,6 +11846,7 @@ def test_a_failing_restart_reap_never_stops_a_new_restart_request(env, monkeypat
     monkeypatch.setattr(dm.signal, "signal", lambda *a: None)
     monkeypatch.setattr(dm.time, "sleep", lambda s: None)
     monkeypatch.setattr(d, "_nap", lambda s: None)
+    monkeypatch.setattr(d, "_idle_nap", lambda s: None)
     assert d.run() == 0
     assert taken == [d._started], "the restart request is still taken"
     text = (p.logs / "daemon.log").read_text()
@@ -11841,6 +11864,7 @@ def test_a_daemon_started_after_the_request_was_taken_clears_the_leftover_claim(
     monkeypatch.setattr(dm.signal, "signal", lambda *a: None)
     monkeypatch.setattr(dm.time, "sleep", lambda s: None)
     monkeypatch.setattr(d, "_nap", lambda s: None)
+    monkeypatch.setattr(d, "_idle_nap", lambda s: None)
     assert d.run() == 0
     res = service._restart_result(p, at)
     assert res and res["outcome"] == "running" and res["reaped"], res
@@ -11975,7 +11999,6 @@ def test_a_new_daemon_that_fails_under_the_manager_is_rolled_back_with_its_outpu
 def test_an_old_daemon_still_ticking_after_the_restart_is_never_rolled_back(env, monkeypatch):
     # The pid of the old daemon cannot be seen (a sandbox's own pid namespace) and the restart could not
     # end it: its heartbeat, still moving after the restart, shows it is alive and healthy.
-    import threading
     from ttp import daemon as dm, service
     p = make(env)
     monkeypatch.setattr(dm, "_alive", lambda pid: False)
@@ -11984,8 +12007,15 @@ def test_an_old_daemon_still_ticking_after_the_restart_is_never_rolled_back(env,
     hb.write_text(json.dumps({"pid": 4242, "started": time.time() - 3600}))
     p.db.set_kv("harness_good", {"commit": _git_out(p.harness, "rev-parse", "HEAD")})
     head = _runtime_change(p.harness)
-    threading.Timer(0.2, lambda: os.utime(hb, None)).start()
-    res = service.restart(p, wait_s=0.5, restart_fn=lambda p: "restarted")
+
+    def restart_fn(p):
+        # The old daemon ticks once the restart is made, before the new daemon is judged: no timer racing
+        # the wait. Its mtime is set past now, since a file system's coarse clock may stamp it before t0.
+        beat = time.time() + 1
+        os.utime(hb, (beat, beat))
+        return "restarted"
+
+    res = service.restart(p, wait_s=0.5, restart_fn=restart_fn)
     assert res.outcome == "deferred" and "old daemon has not exited" in res, res
     _no_rollback(p, head)
 
@@ -12092,8 +12122,10 @@ def test_a_macos_restart_uses_the_launchd_agent_and_falls_back_when_it_is_not_lo
     # A daemon agent installed before the watchdog existed gets its watchdog agent on restart.
     boot = [c for c in calls if c[:2] == ("launchctl", "bootstrap")]
     assert boot and boot[0][-1].endswith(".watchdog.plist"), calls
-    assert calls[-1] == ("launchctl", "kickstart", "-k", f"gui/{os.getuid()}/{label}")
-    assert bool(spawned) == bool(kickstart_rc), "a loaded agent restarts itself; an unloaded one is started by hand"
+    kick = calls.index(("launchctl", "kickstart", "-k", f"gui/{os.getuid()}/{label}"))
+    # A loaded agent restarts itself; an unloaded one is loaded from its plist, by hand only when launchd refuses.
+    assert calls[kick + 1:] == ([] if kickstart_rc == 0 else [("launchctl", "bootstrap", f"gui/{os.getuid()}", str(plist))])
+    assert bool(spawned) == bool(kickstart_rc)
 
 
 def _short_sock_path(name):
@@ -12134,6 +12166,7 @@ def test_systemd_restarts_a_stuck_daemon_through_its_watchdog(env, monkeypatch):
     monkeypatch.setattr(dm.signal, "signal", lambda *a: None)
     monkeypatch.setattr(dm.time, "sleep", lambda s: None)
     monkeypatch.setattr(d, "_nap", lambda s: None)
+    monkeypatch.setattr(d, "_idle_nap", lambda s: None)
     try:
         assert d.run() == 0
         assert [sock.recv(64), sock.recv(64)] == [b"WATCHDOG=1"] * 2, "each completed tick pings systemd"
@@ -12378,6 +12411,7 @@ def test_the_daemon_records_its_start_and_first_tick_failures(env, monkeypatch):
     monkeypatch.setattr(dm.signal, "signal", lambda *a: None)
     monkeypatch.setattr(dm.time, "sleep", lambda s: None)
     monkeypatch.setattr(d, "_nap", lambda s: None)
+    monkeypatch.setattr(d, "_idle_nap", lambda s: None)
     assert d.run() == 0
     marker = dm.start_marker(p)
     assert marker["pid"] == os.getpid() and marker["tick_errors"] == 2
@@ -15821,7 +15855,7 @@ def test_codex_failed_turn_is_an_attempt_and_says_why(env, monkeypatch):
     assert run["status"] == "failed" and run["exit_code"] == 1
     assert task["status"] == "queued" and task["attempts"] == 1
     assert "overloaded" in json.loads(task["result"])["summary"], "the failure's reason was lost"
-    assert run["cost_usd"] > 0 and run["cost_estimated"] == 1, "a run that reported no usage booked $0"
+    assert run["cost_usd"] == 0, "a turn that failed before any model call is not spend"
 
 
 def test_codex_usage_limit_pauses_the_provider_without_an_attempt(env, monkeypatch):
@@ -17360,7 +17394,7 @@ def test_a_charter_and_memory_heavy_project_keeps_the_worker_prompt_under_its_ca
     mem_chars = sum(len(e["line"]) + 1 for e in p._memory_entries())
     assert len(charter) > 11_000 and mem_chars > 9_000, (len(charter), mem_chars)
     spec = "SPEC-MARKER: follow up on fact-03 and fact-07"
-    for kind, cap in (("code", 31_800), ("question", 24_670)):   # code: +45 for where the harness hook runs; code: +128 for `probe_match` waits; code: +120 for the hand-off's measured `eta`; code: +135 for the `context_gaps` hand-off field; code: +265 for `then` wait stages; +155 both: a wake at the `ttp eta` expected finish; code: +20 for `ttp checks --result --passed`; +55 both: a fix confirmed by its ack alone; +265 both: relayed findings citing records; +30 both: the charter's source cites; code: +50 for the Galaxy reset rescan and recount, +15 for wait_kind user, +100 for `ttp detach --lock`, +150 for atomic script writes, +175 for `published`, +35 for the $TTP_TEST_SLOTS cap, +80 for the home-zone date, +400 for paid-model-API job guards, +125 for its spend cap, +110 for evidence manifests naming only immutable artifacts, +30 for the root .ignore line, +150 for one standing item per user step (`ttp notify --step`); +162 both: the Threads line (parallel subagents)
+    for kind, cap in (("code", 31_825 + 875), ("question", 24_670 + 875)):   # +875 both: the KNOWN PATHS block (user msg #212); code: +45 for where the harness hook runs; code: +128 for `probe_match` waits; code: +120 for the hand-off's measured `eta`; code: +135 for the `context_gaps` hand-off field; code: +265 for `then` wait stages; +155 both: a wake at the `ttp eta` expected finish; code: +20 for `ttp checks --result --passed`; +55 both: a fix confirmed by its ack alone; +265 both: relayed findings citing records; +30 both: the charter's source cites; code: +50 for the Galaxy reset rescan and recount, +15 for wait_kind user, +100 for `ttp detach --lock`, +150 for atomic script writes, +175 for `published`, +35 for the $TTP_TEST_SLOTS cap, +80 for the home-zone date, +400 for paid-model-API job guards, +125 for its spend cap, +110 for evidence manifests naming only immutable artifacts, +30 for the root .ignore line, +150 for one standing item per user step (`ttp notify --step`); +162 both: the Threads line (parallel subagents); code: +25 for the pytest -n clip and sandbox wrap
         tid = p.db.add_task(f"{kind} task", spec, kind=kind, tier="light", origin="user")
         prompt = worker_prompt(p, p.db.task(tid), str(p.root), "ttp/t1-x" if kind == "code" else None)
         assert spec in prompt and str(tmp_path) in prompt
@@ -17911,7 +17945,8 @@ def test_a_lock_wait_extends_the_wall_clock_at_most_by_the_limit(env, tmp_path):
     from ttp import locks
     from ttp.daemon import _cut_off_cost
     (run_dir / "run.json").write_text(json.dumps({"budget_usd": 6.0, "timeout_s": limit}))
-    (run_dir / "output.jsonl").write_text("{}\n")   # it did something; a silent run costs nothing
+    (run_dir / "output.jsonl").write_text(   # it called a model; a run that made no call costs nothing
+        json.dumps({"type": "assistant", "message": {"id": "m1", "model": "opus"}}) + "\n")
     # Booked on the time beyond at most one limit's worth of waiting, never below it.
     waited = locks.waited(run_dir, info["ended"])
     assert _cut_off_cost(run_dir, info) == pytest.approx(
@@ -19490,25 +19525,29 @@ def test_a_push_batch_takes_both_changes_of_adjacent_lines_and_sends_back_only_a
 def test_a_push_batch_sends_back_an_entry_whose_merged_changes_fail_the_checks(env, monkeypatch):
     """The checks fail only on the result of taking both sides' changes of different lines: the entry
     whose replay merged them goes back as a conflict (the merge may be the cause), not check_failed,
-    and counts as sent back, not as resolved."""
+    and counts as sent back, not as resolved. Entry 1 passed alone: it pushes at once and entry 2 goes
+    to the next train (user msg #2317), where it is judged on its own."""
     p, repo, origin, other = _push_setup(env, monkeypatch, ["! grep -q A1 notes.txt || ! grep -q B2 notes.txt"])
     _commit(other, "notes.txt", "a\nb\nc\n")
     _git_out(other, "push", "-q", "origin", "HEAD:proj")
     heads = [_entry(repo, "e1", {"notes.txt": "A1\nb\nc\n"}), _entry(repo, "e2", {"notes.txt": "a\nB2\nc\n"})]
     rc, m = _run_batch(p, _batch_marker(p, heads), monkeypatch)
-    assert m["outcome"] == "pushed" and _statuses(m) == ["pushed", "conflict"], m
-    d = m["results"][1]["detail"]
+    assert m["outcome"] == "pushed" and _statuses(m) == ["pushed", "requeued"], m
+    rc, m = _run_batch(p, _batch_marker(p, heads[1:], bid="b2"), monkeypatch)
+    assert _statuses(m) == ["conflict"], m
+    d = m["results"][0]["detail"]
     assert d["files"] == ["notes.txt"] and d["settled_by"] == ["hunks"] and d["cmd"].startswith("! grep"), d
     assert _git_out(origin, "show", "proj:notes.txt") == "A1\nb\nc"
-    assert m["conflicts"] == {"entries": 2, "conflicted": 1, "auto_resolved": 0, "by_hunks": 0, "sent_back": 1}
+    assert m["conflicts"] == {"entries": 1, "conflicted": 1, "auto_resolved": 0, "by_hunks": 0, "sent_back": 1}
 
 
 @pytest.mark.parametrize("passes", [True, False])
 def test_a_push_batch_keeps_parallel_test_additions_only_when_the_checks_pass(env, monkeypatch, passes):
     """Two changes each append a new test function at the end of one test file: a conflict to git
     that the batch settles without a model by keeping both. With checks that pass on the result both
-    land; when the checks fail only on the merged file, the second entry goes back as a conflict (for
-    a rebase), not check_failed, and the first lands alone."""
+    land; when the checks fail only on the merged file, the first lands alone at once and the second
+    goes to the next train (user msg #2317), where it goes back as a conflict (for a rebase), not
+    check_failed."""
     check = "true" if passes else "! (grep -q test_one test_x.py && grep -q test_two test_x.py)"
     p, repo, origin, other = _push_setup(env, monkeypatch, [check])
     _commit(other, "test_x.py", "def test_base():\n    assert True\n")
@@ -19523,8 +19562,10 @@ def test_a_push_batch_keeps_parallel_test_additions_only_when_the_checks_pass(en
         assert m["results"][1]["detail"] == {"settled": ["test_x.py"], "settled_by": ["added"]}
         assert "def test_one" in landed and "def test_two" in landed
     else:
-        assert _statuses(m) == ["pushed", "conflict"], m
-        d = m["results"][1]["detail"]
+        assert _statuses(m) == ["pushed", "requeued"], m
+        rc, m = _run_batch(p, _batch_marker(p, heads[1:], bid="b2"), monkeypatch)
+        assert _statuses(m) == ["conflict"], m
+        d = m["results"][0]["detail"]
         assert d["files"] == ["test_x.py"] and d["settled_by"] == ["added"] and d["cmd"] == check, d
         assert "def test_one" in landed and "def test_two" not in landed
         assert m["conflicts"]["sent_back"] == 1 and m["conflicts"]["auto_resolved"] == 0
@@ -19578,20 +19619,25 @@ def _reused(capsys, cmd):
 
 @pytest.mark.parametrize("bad", [1, 3, 4])
 def test_a_push_batch_blames_the_first_failing_entry_and_pushes_the_ones_before_it(env, monkeypatch, capsys, bad):
-    """Four entries, one of which breaks the checks: a binary search over prefixes finds it in at most
-    three more check runs (ceil(log2 4) + 1). The entries before it go, and the later ones too after
-    one more check of them replayed without it."""
+    """Four entries, one of which breaks the checks. Entry 1 breaking them: the search finds it in at
+    most three more check runs and the later ones go after one more check of them replayed without it.
+    A later one: the first prefix that passes (entries 1-2) pushes at once, no further check runs, and
+    the rest go untested and unblamed to the next train (user msg #2317)."""
     log = env["tmp"] / "checks.log"
     p, repo, origin, other = _bump_setup(env, monkeypatch, [f"echo run >> {log}", "test ! -e plugins/p/bad.txt"])
     heads = [_entry(repo, f"e{n}", {f"plugins/p/{'bad' if n == bad else f'f{n}'}.txt": f"{n}\n"}) for n in (1, 2, 3, 4)]
     rc, m = _run_batch(p, _batch_marker(p, heads), monkeypatch)
-    good = [n for n in (1, 2, 3, 4) if n != bad]
-    assert _statuses(m) == ["check_failed" if n == bad else "pushed" for n in (1, 2, 3, 4)], m
-    assert m["results"][bad - 1]["detail"]["cmd"] == "test ! -e plugins/p/bad.txt"
+    good = [2, 3, 4] if bad == 1 else [1, 2]
     runs = len(log.read_text().split()) + _reused(capsys, f"echo run >> {log}")   # a recheck of a tree reuses its passes
-    assert runs == m["checks"]["runs"] and runs - 1 <= 3 + (bad < 4), runs
+    assert runs == m["checks"]["runs"], runs
     if bad == 1:
-        assert m["tip_passed"] is True, "the tip passed alone: the queue may forget it as failing"
+        assert _statuses(m) == ["check_failed", "pushed", "pushed", "pushed"], m
+        assert m["results"][0]["detail"]["cmd"] == "test ! -e plugins/p/bad.txt"
+        assert runs - 1 <= 4 and m["tip_passed"] is True, "the tip passed alone: the queue may forget it as failing"
+    else:
+        assert _statuses(m) == ["pushed", "pushed", "requeued", "requeued"], m
+        assert runs == 2, "the full head, then prefix 2, which passed and pushed"
+        assert all(r["detail"] == {"untested": True} for r in m["results"][2:]), "requeued, never blamed"
     assert rc == 0 and m["outcome"] == "pushed" and _versions(origin) == ("0.1.1", "0.1.1")
     more = f"; +{len(good) - 1} more" if len(good) > 1 else ""
     assert _bump_commits(origin) == [f"p: 0.1.1 (e{good[0]}: edit plugins/p/f{good[0]}.txt{more})"]
@@ -22884,6 +22930,7 @@ def _run_once(d, monkeypatch, crash=False):
     monkeypatch.setattr(dm.signal, "signal", lambda *a: None)
     monkeypatch.setattr(dm.time, "sleep", lambda s: None)
     monkeypatch.setattr(d, "_nap", lambda s: None)
+    monkeypatch.setattr(d, "_idle_nap", lambda s: None)
     try:
         if crash:
             with pytest.raises(SystemExit):
@@ -23258,15 +23305,17 @@ def test_every_project_pause_path_records_who_and_why(env, monkeypatch, capsys):
     assert projpause.current(p.db) is None and p.db.kv(projpause.INFO_KEY) is None
     ev = _pause_events(p)[-1]
     assert ev["action"] == "resume" and ev["by"] == "user" and ev["paused"]["by"] == "user", ev
+    # After the user's resume a run pauses only for a newer user message (pausekeep_cases.py).
+    ask = p.db.x("INSERT INTO messages(ts,direction,text) VALUES(?,'in','pause it')", (time.time() + 1,))
     # The coordinator (a run of this project): a reason is required.
     rid = p.db.x("INSERT INTO runs(role,provider,started,status) VALUES('coordinator','claude',?,'running')",
                  (time.time(),))
     monkeypatch.setenv("TTP_RUN_ID", str(rid))
     monkeypatch.setenv("TTP_PROJECT", str(p.base))
     with pytest.raises(SystemExit):
-        cli.main(["pause", "demo"])
+        cli.main(["pause", "demo", "--user-msg", str(ask)])
     assert "needs a reason" in capsys.readouterr().err and not p.db.kv("paused", False)
-    cli.main(["pause", "demo", "--reason", "the user asked in chat"])
+    cli.main(["pause", "demo", "--reason", "the user asked in chat", "--user-msg", str(ask)])
     info = projpause.current(p.db)
     assert info["by"] == "coordinator" and info["reason"] == "the user asked in chat", info
     cli.main(["resume", "demo"])
@@ -24243,8 +24292,8 @@ def test_a_host_sleep_does_not_time_out_or_stall_a_run(env, tmp_path, monkeypatc
 
 
 # The agent prints its own nice level and its child's (a detached job it starts, say).
-_NICE_AGENT = ("import os, subprocess, sys; print(os.nice(0)); sys.stdout.flush(); "
-               "subprocess.run([sys.executable, '-c', 'import os; print(os.nice(0))'])")
+_NICE_AGENT = ("import os, subprocess, sys; print(os.getpriority(os.PRIO_PROCESS, 0)); sys.stdout.flush(); "
+               "subprocess.run([sys.executable, '-c', 'import os; print(os.getpriority(os.PRIO_PROCESS, 0))'])")
 
 
 def _nice_run(tmp_path, nice):
@@ -24261,12 +24310,35 @@ def _nice_run(tmp_path, nice):
 
 
 def test_a_workers_agent_and_all_it_starts_run_niced_below_the_runner(env, tmp_path):
-    base = os.nice(0)
+    base = os.getpriority(os.PRIO_PROCESS, 0)
     (agent, grandchild), recorded = _nice_run(tmp_path, 7)
-    assert agent == grandchild == recorded == min(base + 7, 19)
+    # a runner already at nice 19 or 20 (a niced Mac job) is never raised to a lower level
+    assert agent == grandchild == recorded == max(base, min(base + 7, 19))
     # runner.nice 0: the agent keeps the runner's priority.
     (agent, grandchild), recorded = _nice_run(tmp_path, 0)
     assert agent == grandchild == recorded == base
+
+
+def test_a_run_goes_on_when_os_nice_refuses_with_eperm(env, tmp_path, monkeypatch, capsys):
+    """macOS refuses os.nice with EPERM at some levels (under `nice -n 10`, say): the priority
+    check only informs, so the run ends normally, and renice still lowers a waiting child."""
+    from ttp import project
+
+    def refuse(n):
+        raise PermissionError(1, "Operation not permitted")
+    monkeypatch.setattr(os, "nice", refuse)
+    base = os.getpriority(os.PRIO_PROCESS, 0)
+    (agent, grandchild), recorded = _nice_run(tmp_path, 7)
+    assert agent == grandchild == recorded == base, "the agent could not be niced, so it keeps the runner's level"
+    if base < 19:   # at 19 or above there is nothing to lower, so no message
+        assert f"could not lower the agent's priority by 7 (it runs at nice {base})" in capsys.readouterr().out
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        project.renice(child.pid, 5)
+        assert os.getpriority(os.PRIO_PROCESS, child.pid) == max(base, min(base + 5, 19))   # at 20 macOS refuses to raise it back to 19
+    finally:
+        child.kill()
+        child.wait()
 
 
 def test_workers_and_reviewers_get_runner_nice_but_the_coordinator_does_not(env):
@@ -26759,18 +26831,18 @@ def test_the_light_tier_runs_a_cheaper_model_that_pins_config_and_retries_move_o
     assert run("standard") == ("opus", "high")
 
 
-def test_spending_caps_default_to_100_a_day_200_a_week_and_200_global(env, tmp_path):
+def test_spending_caps_default_to_100_a_day_700_a_week_and_200_global(env, tmp_path):
     """The documented defaults, and the lines `ttp setup` prints about them and about Jev."""
     from ttp.project import DEFAULT_CONFIG
     from ttp import cli
     b = DEFAULT_CONFIG["budget"]
-    assert (b["daily_usd"], b["weekly_usd"], b["global_daily_usd"]) == (100.0, 200.0, 200.0)
+    assert (b["daily_usd"], b["weekly_usd"], b["global_daily_usd"]) == (100.0, 700.0, 200.0)
     assert b["reserve_pct"] == 10 and b["reset_credits_auto"] is True
     r = subprocess.run([sys.executable, str(TTP), "setup", "--bin-dir", str(tmp_path / "bin")],
                        capture_output=True, text=True, timeout=60)
     assert r.returncode == 0, r.stderr
     out = " ".join(r.stdout.split())
-    assert "$100/day and $200/week per project, $200/day across all projects" in out
+    assert "$100/day and $700/week per project, $200/day across all projects" in out
     assert "used up to 90% of each window (budget.reserve_pct 10)" in out and "only that 10% is left" in out
     assert "free Codex window resets: used automatically, at most one per window" in out
     assert "Jev (optional add-on): off. It turns on only once you save a key" in out
@@ -27216,6 +27288,7 @@ def test_durable_write_syncs_renames_and_keeps_the_mode(env, monkeypatch):
 # else goes through project.durable_write / durable_append / write_json.
 DURABLE_EXEMPT = {
     ("shorttmp.py", "with os.fdopen(out, 'w') as f:"): "marks a check's scratch dir on the RAM disk with its allocation, which a reboot clears anyway; a lost mark only counts the dir as live for a few minutes",
+    ("cellenv.py", '(site / "ttp-system-site.pth").write_text('): "a .pth in a bench cell's own throwaway venv, made fresh with the venv; a cut file only fails that cell's setup, never project state",
     ("benchrun.py", 'open(run / "runner.log", "wb")'): "the supervisor's stdout in a bench cell's temp folder, copied out after the cell; a cut log costs only the log",
     ("ttp_pytest_durations.py", 'open(tmp, "w")'): "runs inside the checked repo's pytest, not the runtime: a timing note written whole to a temp file, then renamed; a lost one costs only the note",
     ("ttp_pytest_durations.py", "os.replace(tmp, self.path)"): "renames that timing note into place: a rename lost to a crash leaves the old note or none",
@@ -27248,6 +27321,7 @@ DURABLE_EXEMPT = {
     ("batch.py", "(Path(d) / name).write_bytes(text)"): "git merge-file --diff3's inputs to read a shared doc's conflict hunks (_doc_hunks), in a temporary directory removed after",
     ("batch.py", "open(f, 'w').writelines(keep)"): "the sequence editor of a batch's rebase rewrites git's own todo file of that rebase in the push worktree, which git reads right after; a crash aborts the rebase and the next batch makes the worktree anew",
     ("daemon.py", "runner.log"): "a log",
+    ("redact.py", 'with open(log, "ab") as out:'): "a detached masking job's log (scrub.log), appended to",
     ("daemon.py", "ON_PASS_LOG"): "a log (an on_pass command's output, read only for its tail)",
     ("daemon.py", "pidfile.write_text"): "names a process, which a reboot ends",
     ("live.py", 'os.replace(os.path.join(d, "rc.tmp")'): "the CLI watch's live row's exit code, written fsynced by its detached runner (WATCH_RUNNER, no runtime import); one lost to a crash is reported as a killed run once overdue",
@@ -27339,6 +27413,9 @@ DURABLE_EXEMPT = {
     ("hostshim.py", "os.replace(tmp, os.path.join(store, name))"): "places that fake store file atomically; same lifetime as above",
     ("hostshim.py", 'with open(tab + ".tmp", "w") as f'): "a test run's fake crontab, thrown away with the run; never state",
     ("hostshim.py", 'os.replace(tab + ".tmp", tab)'): "places that fake crontab atomically; same lifetime as above",
+    ("overseer.py", 'lock = open(p.state / LOCK_FILE, "a")'): "the overseer's flock guard file, never written",
+    ("modelbench.py", 'with open(d / LOCK, "a") as lk:'): "the host bench's flock guard file, never written",
+    ("untrusted.py", 'with open(path, "a") as f:'): "a run's untrusted-source marks in its own run dir, read when that run ends; a crash that loses one ends the run too; never project state",
 }
 
 
@@ -27435,6 +27512,7 @@ def test_an_empty_run_json_fails_the_run_without_crashing_its_supervisor(env):
     ("push_queue", [True, False], ["yes", 1]),
     ("push_batch_s", [0, 900, 1.5], [-1, "soon", True, None, float("nan"), float("inf")]),
     ("push_batch_max", [1, 8, 8.0], [0, 2.5, "eight", False]),
+    ("push_age_s", [0, 14400, 1.5], [-1, "4h", True, None]),
     ("after_push", [[], ["true", "./deploy.sh x"], "make deploy"], [["Deploy everything now"]]),
     ("after_push_timeout_s", [1, 1800], [0, -5, "long"]),
 ])
@@ -28312,7 +28390,7 @@ def _cap_holder(label):
 def test_checks_host_cap_default_follows_cores_and_the_account_setting_overrides_it(env, monkeypatch):
     from ttp import checkcap, project
     monkeypatch.setattr(checkcap, "cores", lambda: 64)
-    monkeypatch.setattr(checkcap.os, "getloadavg", lambda: (60.0, 0.0, 0.0))
+    monkeypatch.setattr(checkcap, "_load", lambda: 60.0)
     assert checkcap.limit() == 4, "a busy host gets the floor"
     monkeypatch.setattr(checkcap, "cores", lambda: 8)
     assert checkcap.limit() == 1, "a small host still runs one at a time"
@@ -29542,7 +29620,7 @@ def test_claude_hook_denies_ways_around_the_gh_guard(env, monkeypatch, tmp_path)
     worker, _ = get_provider("claude").build(role="worker", model="opus", effort="low", cwd=".", budget_usd=None,
                                              read_only=False, schema=None, restrictions={})
     pre = json.loads(worker[worker.index("--settings") + 1])["hooks"]["PreToolUse"][0]
-    assert pre["matcher"] == "Bash|Edit|Write|MultiEdit|NotebookEdit|Read|Grep|Glob|mcp__.*"
+    assert pre["matcher"] == "*", "every tool, subagents' calls included"
     assert pre["hooks"][0]["command"].endswith("ttp.hook PreToolUse")
 
 
@@ -32022,6 +32100,7 @@ def test_a_passed_review_names_its_consumers_for_a_spec_only_update(env):
 
 def test_a_failed_review_with_fixes_moves_its_dependents_onto_the_re_review(env):
     p = make(env)
+    p.set_config("review.auto_fix_rounds", 2)   # a project that allows a second automatic round
     from ttp import worktree
     from ttp.db import continues_id, dependency_ids
     code, branch, _, (rev,) = _finish_code(env, p, "feature", {"app.py": 40})
@@ -34109,7 +34188,7 @@ def test_a_cut_off_run_is_not_charged_for_the_time_the_host_slept(env, tmp_path)
     p = make(env)
     from ttp import daemon as dm
     (tmp_path / "run.json").write_text(json.dumps({"budget_usd": 10, "timeout_s": 3600, "argv": []}))
-    (tmp_path / "output.jsonl").write_text("not json\n")
+    (tmp_path / "output.jsonl").write_text(json.dumps({"type": "assistant", "message": {"id": "m1"}}) + "\n")
     info = {"rc": 1, "started": 1000.0, "ended": 1000.0 + 3600}
     assert dm._cut_off_cost(tmp_path, info) == pytest.approx(10)
     assert dm._cut_off_cost(tmp_path, {**info, "slept_s": 2700}) == pytest.approx(2.5)
@@ -37669,6 +37748,9 @@ class _FakeCaffeinate:
         return 0
 
 
+ON = {"runner": {"prevent_idle_sleep": "on"}}   # keep-awake is off by default (user msg #2295): these tests turn it on
+
+
 def _idle_hold(platform="darwin", ac=True, lid=None):
     from ttp import awake
     _FakeCaffeinate.started = []
@@ -37691,7 +37773,7 @@ def _idle_hold(platform="darwin", ac=True, lid=None):
 
 def test_idle_sleep_held_on_ac_with_work_by_caffeinate_i_s_tied_to_the_daemon(env):
     h, _, shown = _idle_hold()
-    h.update({}, lambda: True)
+    h.update(ON, lambda: True)
     [c] = _FakeCaffeinate.started
     assert c.argv == ["caffeinate", "-i", "-s", "-w", "777"], "idle and system (maintenance) sleep, on AC"
     assert not {"-d", "-u", "-m"} & set(c.argv), "the display may sleep and no user activity is faked"
@@ -37701,12 +37783,16 @@ def test_idle_sleep_held_on_ac_with_work_by_caffeinate_i_s_tied_to_the_daemon(en
 
 
 @pytest.mark.parametrize("platform,ac,work,cfg,why", [
-    ("darwin", False, True, {}, "on battery power"),
-    ("darwin", True, False, {}, ""),
+    ("darwin", False, True, ON, "on battery power"),
+    ("darwin", True, False, ON, ""),
     ("darwin", True, True, {"runner": {"prevent_idle_sleep": "off"}}, "off by config (runner.prevent_idle_sleep)"),
     ("darwin", True, True, {"runner": {"prevent_idle_sleep": False}}, "off by config (runner.prevent_idle_sleep)"),
     ("darwin", True, True, {"power": {"keep_awake": "off"}}, "off by config (runner.prevent_idle_sleep)"),
+    ("darwin", True, True, {}, "off by config (runner.prevent_idle_sleep)"),
+    ("darwin", True, True, {"runner": {"nice": 5}}, "off by config (runner.prevent_idle_sleep)"),
+    ("darwin", True, True, {"runner": {"prevent_idle_sleep": "sometimes"}}, "off by config (runner.prevent_idle_sleep)"),
     ("linux", True, True, {}, None),
+    ("linux", True, True, ON, None),
 ])
 def test_idle_sleep_not_held_on_battery_without_work_config_off_or_off_macos(env, platform, ac, work, cfg, why):
     h, power, shown = _idle_hold(platform, ac)
@@ -37723,29 +37809,29 @@ def test_idle_sleep_not_held_on_battery_without_work_config_off_or_off_macos(env
 def test_idle_sleep_released_when_work_ends_or_on_battery_and_never_held_twice(env):
     h, power, shown = _idle_hold()
     for _ in range(5):
-        h.update({}, lambda: True)
+        h.update(ON, lambda: True)
     assert len(_FakeCaffeinate.started) == 1, "one assertion at a time"
     first = _FakeCaffeinate.started[0]
     assert power["reads"] == 1, "the power source is read at most every POWER_EVERY_S"
-    h.update({}, lambda: False)
+    h.update(ON, lambda: False)
     assert first.ended and first.reaped and h.proc is None
     assert shown[-1] is None
-    h.update({}, lambda: True)
+    h.update(ON, lambda: True)
     second = _FakeCaffeinate.started[-1]
     assert len(_FakeCaffeinate.started) == 2 and not second.ended
     power["ac"] = False
     h._fresh()
-    h.update({}, lambda: True)
+    h.update(ON, lambda: True)
     assert second.ended and second.reaped and h.proc is None
     assert shown[-1]["why"] == "on battery power" and not shown[-1]["held"]
     h.update({"runner": {"prevent_idle_sleep": "on"}}, lambda: True)
     assert len(_FakeCaffeinate.started) == 2
     power["ac"] = True
     h._fresh()
-    h.update({}, lambda: True)
+    h.update(ON, lambda: True)
     third = _FakeCaffeinate.started[-1]
     third.ended = True   # someone killed it: the next tick holds again
-    h.update({}, lambda: True)
+    h.update(ON, lambda: True)
     assert len(_FakeCaffeinate.started) == 4 and not _FakeCaffeinate.started[-1].ended
     h.release()
     assert _FakeCaffeinate.started[-1].ended and _FakeCaffeinate.started[-1].reaped and shown[-1] is None
@@ -37805,13 +37891,13 @@ def test_lid_read_from_ioreg_and_unreadable_means_no_lid(env):
 def test_closed_lid_that_sleeps_the_mac_is_recorded_while_there_is_work(env, lid, ac, says):
     from ttp import awake
     h, power, shown = _idle_hold(ac=ac, lid=lid)
-    h.update({}, lambda: True)
+    h.update(ON, lambda: True)
     assert bool(shown and shown[-1] and shown[-1].get("lid_closed")) is says
     assert awake.pause_line(awake.line(shown[-1], 777)) is says
     assert ("battery" in awake.line(shown[-1], 777)) is (says and not ac), "a lid closed on battery says so"
     assert [c.argv for c in _FakeCaffeinate.started] == ([["caffeinate", "-i", "-s", "-w", "777"]] if ac else []), \
         "the lid changes what status says, not what is held"
-    h.update({}, lambda: False)
+    h.update(ON, lambda: False)
     assert shown[-1] is None, "no work, nothing to say about the lid"
 
 
@@ -37820,17 +37906,17 @@ def test_closed_lid_line_clears_when_the_lid_opens_and_off_by_config_still_says_
     h, power, shown = _idle_hold(lid={"closed": True, "causes_sleep": True})
     h.update({"runner": {"prevent_idle_sleep": "off"}}, lambda: True)
     assert _FakeCaffeinate.started == [] and awake.line(shown[-1], 777) == awake.LID_LINE
-    h.update({}, lambda: True)
+    h.update(ON, lambda: True)
     assert power["lid_reads"] == 1, "the lid is read at most every POWER_EVERY_S"
     assert awake.line(shown[-1], 777) == awake.LID_LINE and shown[-1]["held"]
     power["lid"] = {"closed": False, "causes_sleep": True}
     h._fresh()
-    h.update({}, lambda: True)
+    h.update(ON, lambda: True)
     assert "lid_closed" not in shown[-1]
     assert awake.line(shown[-1], 777).startswith("idle sleep: held while there is work")
     power["lid"] = {"closed": True, "causes_sleep": True}
     h._fresh()
-    h.update({}, lambda: True)
+    h.update(ON, lambda: True)
     h.release()
     assert shown[-1] is None, "shutdown clears the lid line too"
 
@@ -37865,7 +37951,7 @@ def test_idle_sleep_released_on_daemon_shutdown_and_shown_in_status(env, monkeyp
     seen = []
 
     def tick():
-        d._idle.update(d.cfg, lambda: True)
+        d._idle.update({**d.cfg, **ON}, lambda: True)
         seen.append(status_text(p))
         d.stopping = True
 
@@ -37874,6 +37960,7 @@ def test_idle_sleep_released_on_daemon_shutdown_and_shown_in_status(env, monkeyp
     monkeypatch.setattr(dm.signal, "signal", lambda *a: None)
     monkeypatch.setattr(dm.time, "sleep", lambda s: None)
     monkeypatch.setattr(d, "_nap", lambda s: None)
+    monkeypatch.setattr(d, "_idle_nap", lambda s: None)
     assert d.run() == 0
     [c] = _FakeCaffeinate.started
     assert f"idle sleep: held while there is work (caffeinate pid {c.pid})" in seen[0]
@@ -37914,14 +38001,14 @@ def test_closed_lid_says_work_pauses_in_status_and_web_instead_of_just_woke(env)
 def test_battery_power_is_named_as_why_keep_awake_is_not_held(env):
     from ttp import awake
     h, power, shown = _idle_hold(ac=False)
-    h.update({}, lambda: True)
+    h.update(ON, lambda: True)
     assert _FakeCaffeinate.started == [] and shown[-1]["why"] == awake.BATTERY
     assert awake.line(shown[-1], 777) == awake.BATTERY_LINE
     assert "AC power" in awake.BATTERY_LINE and not awake.pause_line(awake.BATTERY_LINE), \
         "an open lid on battery works until the Mac sleeps"
     power["lid"] = {"closed": True, "causes_sleep": True}
     h._fresh()
-    h.update({}, lambda: True)
+    h.update(ON, lambda: True)
     assert awake.line(shown[-1], 777) == awake.LID_BATTERY_LINE and awake.pause_line(awake.LID_BATTERY_LINE)
     assert "battery" in awake.LID_BATTERY_LINE and "battery" not in awake.LID_LINE
     assert awake.pause_line(awake.LID_LINE) and not awake.pause_line("")
@@ -37964,12 +38051,28 @@ def test_host_slept_alert_says_why_keep_awake_did_not_stop_the_sleep(env, state,
     assert says in al["text"] and not_says not in al["text"], al["text"]
 
 
+def test_idle_sleep_off_by_default_and_explicit_on_or_auto_still_holds(env):
+    """User msg #2295: tt-project never keeps a Mac awake unless the user sets the key; an explicit
+    value set before an upgrade keeps working."""
+    from ttp import awake, project as pj
+    assert awake.mode({}) == awake.mode(pj.DEFAULT_CONFIG) == "off"
+    for cfg in ({}, pj.deep_merge(pj.DEFAULT_CONFIG, {}), pj.deep_merge(pj.DEFAULT_CONFIG, {"runner": {"nice": 3}})):
+        h, _, shown = _idle_hold()
+        h.update(cfg, lambda: True)
+        assert _FakeCaffeinate.started == [] and h.proc is None, "no inhibitor by default"
+    for v in ("on", "auto", True):
+        h, _, shown = _idle_hold()
+        h.update(pj.deep_merge(pj.DEFAULT_CONFIG, {"runner": {"prevent_idle_sleep": v}}), lambda: True)
+        [c] = _FakeCaffeinate.started
+        assert c.argv[:3] == ["caffeinate", "-i", "-s"] and shown[-1]["held"] is True, v
+
+
 def test_idle_sleep_config_key_is_known_and_checked(env):
     from ttp import project as pj
-    assert pj.DEFAULT_CONFIG["runner"]["prevent_idle_sleep"] == "auto"
+    assert pj.DEFAULT_CONFIG["runner"]["prevent_idle_sleep"] == "off"
     assert pj.unknown_key_hint("runner.prevent_idle_sleep") is None
     assert pj.unknown_key_hint("power.keep_awake") is None, "older configs stay quiet"
-    assert "runner.prevent_idle_sleep: 'sometimes' is not auto, on or off; auto is used" in \
+    assert "runner.prevent_idle_sleep: 'sometimes' is not auto, on or off; off is used" in \
         pj.config_problems({"runner": {"prevent_idle_sleep": "sometimes"}})
     assert not [x for x in pj.config_problems({"runner": {"prevent_idle_sleep": "off"}}) if "idle" in x]
 
@@ -38564,6 +38667,9 @@ def test_a_work_task_with_its_own_worktree_is_guarded_like_a_code_task(env, monk
     head = _git_out(path, "rev-parse", "HEAD")
     more = p.db.add_task("more", "s", kind="work", tier="light", origin="user", labels=[f"continues:{work}"])
     assert worktree.continued_head(p, p.db.task(more)) == head
+    # While open it owns the work, as for a code task (Daemon._stale_source); cancelled, it owns nothing.
+    assert d._stale_source(p.db.task(work)) == f"open task #{more} continues it"
+    p.db.update_task(more, status="cancelled")
     # A done one is lined up for the backup push; an unfinished one's worktree is in the integrity check.
     p.set_config("delivery.backup_remote", "origin")
     d.cfg = p.config()
@@ -40085,14 +40191,16 @@ def test_an_overdue_machine_change_pages_its_project_then_the_owner(env):
     now = time.time()
     ml.add_change("box-a", "drop-in for a soak", "remove-drop-in", "gamma", expires="1h", now=now)
     assert ml.route(now + 60, able=lambda n: (True, "")) == []
-    able = {"gamma": (False, "it is paused"), "alpha": (True, "")}
+    able = {"gamma": (False, "its daemon is stopped"), "alpha": (True, "")}
     pages = ml.route(now + 3601, able=able.get)
     assert [(x["target"], x["kind"]) for x in pages] == [("gamma", "machine_change_overdue")]
-    assert "undo it with `remove-drop-in`" in pages[0]["text"]
+    assert "Undo: `remove-drop-in`" in pages[0]["text"] and "renew it" in pages[0]["text"]
     ml.route(now + 3700, able=able.get)
     pages = ml.route(now + 3700 + ml.UNAVAILABLE_S, able=able.get)
     assert [x["target"] for x in pages] == ["alpha"]
-    assert ml.route(now + 3700 + ml.UNAVAILABLE_S + ml.REPAGE_S, able=able.get)[0]["target"] == ml.USER
+    ml.delivered(pages[0])
+    # A harmless change (a soak's drop-in) stays with its projects: the user is never paged for it.
+    assert ml.route(now + 3700 + ml.UNAVAILABLE_S + 3 * ml.REPAGE_S, able=able.get) == []
     ml.close_change(1, "undone")
     assert ml.route(now + 4 * 86400, able=able.get) == []
 
@@ -44415,8 +44523,9 @@ def test_sweep_digest_and_budget_digest_list_credits_as_a_provider_holds_unblock
     assert "free window resets and paid credits are an unblock path" in " ".join(src.split())
 
 
-def _assert_openai_strict_schema(schema):
-    """Check the conservative subset used by every coordinator schema adapter."""
+def _assert_openai_strict_schema(schema, all_required=True):
+    """Check the conservative subset used by every coordinator schema adapter (all_required=False:
+    Claude's sparse form, which requires only each object's own fields)."""
     allowed = {'type', 'properties', 'required', 'additionalProperties', 'items', 'enum',
                'anyOf', '$defs', '$ref', 'description', 'title'}
     assert set(schema) <= allowed, schema
@@ -44424,15 +44533,18 @@ def _assert_openai_strict_schema(schema):
     types = [types] if isinstance(types, str) else types
     if 'object' in types or 'properties' in schema:
         assert schema.get('additionalProperties') is False, schema
-        assert set(schema.get('required', [])) == set(schema.get('properties', {})), schema
+        if all_required:
+            assert set(schema.get('required', [])) == set(schema.get('properties', {})), schema
+        else:
+            assert set(schema.get('required', [])) <= set(schema.get('properties', {})), schema
         for sub in schema.get('properties', {}).values():
-            _assert_openai_strict_schema(sub)
+            _assert_openai_strict_schema(sub, all_required)
     if 'items' in schema:
-        _assert_openai_strict_schema(schema['items'])
+        _assert_openai_strict_schema(schema['items'], all_required)
     for sub in schema.get('anyOf', []):
-        _assert_openai_strict_schema(sub)
+        _assert_openai_strict_schema(sub, all_required)
     for sub in schema.get('$defs', {}).values():
-        _assert_openai_strict_schema(sub)
+        _assert_openai_strict_schema(sub, all_required)
 
 
 def test_strict_schema_visits_anyof_definitions_and_refuses_free_objects():
@@ -48154,6 +48266,7 @@ def _turn_budget_rig(p, monkeypatch, cost_of, flaky=lambda note: False):
     from types import SimpleNamespace
     from ttp.daemon import Daemon
     p.set_config("coordinator.max_turns_per_hour", 100000)
+    p.set_config("coordinator.wake_gap_s", 0)   # back-to-back turns in real time: no wake gap (wakegap_cases.py)
     d = Daemon(p.base)
     turns = []
 
@@ -48636,7 +48749,7 @@ def test_prguard_fast_path_remedy_names_a_working_flag(env, tmp_path, monkeypatc
     cli, p, run, mark = _fast_cli(env, tmp_path, monkeypatch, {"docs/n.md": "hi\n"}, True)
     cli.main(["checks"])
     msg = prguard._checks_problem(os.getcwd())
-    assert "ttp checks --full" in msg and "unset" not in msg
+    assert "ttp checks --fresh" in msg and "unset" not in msg   # --full is refused with the push queue on (#7629)
 
 
 def test_fast_path_skipped_when_a_scoped_check_applies(env, tmp_path, monkeypatch, capsys):
@@ -49795,7 +49908,7 @@ def test_a_resume_of_a_forked_session_nets_against_its_reported_total(env):
                "VALUES(?,'worker','claude','opus',?,'running',?,?)",
                (tid, time.time() - 60, d.boot, json.dumps({"resumes": {"run": r["id"], "session": "F1"}})))
     again = db.one("SELECT * FROM runs WHERE id=?", (rid,))
-    u = _reported(14.89, output_tokens=400_000)   # the session added $2.00; its tokens price near it
+    u = _reported(14.89, output_tokens=20_000)   # the session added $2.00; its own tokens list at $1.50
     assert abs(d._net_of_session(again, u) - 2.0) < 1e-6, "the resume re-booked the parent's cost"
 
 

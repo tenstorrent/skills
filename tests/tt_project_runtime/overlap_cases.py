@@ -42,7 +42,7 @@ def test_task_add_warns_when_another_open_code_task_names_the_same_new_file(env)
     whose spec names a file an open code task's spec names is still added, and its result and its
     open-tasks line in the digest name the other task and the shared path; a file already on the base
     is no build dependency, so it runs beside; once it waits on that task the digest line drops the warning."""
-    from ttp import coordinator as coord
+    from ttp import coordinator as coord, overlap
     p = make(env)
     _on_base(p, "runtime/ttp/progress.py")
     first = p.db.add_task("progress check", "Add runtime/ttp/progress.py and tests/tt_project_runtime/"
@@ -53,11 +53,17 @@ def test_task_add_warns_when_another_open_code_task_names_the_same_new_file(env)
     want = f"overlaps #{first} (runtime/ttp/progress.py): {_plain()}"
     assert f"task_add: #{new} added; {want}" in p.db.kv(coord.NOTES_KEY)
     assert _labels(p, new) == [f"overlap:{first}:{want}"]
-    line = next(x for x in coord.digest(p, {}, [], []).splitlines() if x.startswith(f"- #{new} |"))
-    assert line.endswith(f"| driver reports | {want}"), line
+    text = coord.digest(p, {}, [], [])
+    line = next(x for x in text.splitlines() if x.startswith(f"- #{new} |"))
+    # The row names the task and path; the advice every overlap note repeats is said once, in the header.
+    assert line.endswith(f"| driver reports | overlaps #{first} (runtime/ttp/progress.py)"), line
+    head = next(x for x in text.splitlines() if x.startswith("## Open tasks"))
+    open_tasks = text.split("## Open tasks", 1)[1].split("\n## ", 1)[0]
+    assert head.endswith(f"; {overlap.ADVICE})") and open_tasks.count("conflicts settle at landing") == 1, head
     p.db.update_task(new, depends_on=json.dumps([first]))
-    line = next(x for x in coord.digest(p, {}, [], []).splitlines() if x.startswith(f"- #{new} |"))
-    assert "overlaps" not in line, line
+    text = coord.digest(p, {}, [], [])
+    line = next(x for x in text.splitlines() if x.startswith(f"- #{new} |"))
+    assert "overlaps" not in line and overlap.ADVICE not in text.split("## Open tasks", 1)[1].split("\n## ", 1)[0], line
     # A plan or question task, or a code task that names other files, gets no warning.
     for title, kind, spec in (("plan it", "plan", "Plan runtime/ttp/progress.py."),
                               ("other file", "code", "Change runtime/ttp/relay.py only.")):
@@ -520,6 +526,28 @@ def test_overlap_chain_never_waits_on_a_task_that_waits_on_the_new_tasks_own_lin
     # A task outside A's lineage never chains after C or B either: each waits itself (overlap.exempt).
     p.db.x("UPDATE tasks SET status='cancelled' WHERE id IN (?, ?)", (d, fix["id"]))
     assert not deferral(add("other", f"Extend {hot}."))
+
+
+def test_a_task_that_rebases_or_re_lands_a_change_never_waits_on_that_change_landing(env, monkeypatch):
+    """#28 "Rebase #6's integration ..." was chained on landed:#6 by an overlap label though it carries
+    #6's change itself. A task whose title rebases #A, or whose spec re-lands #A, is not chained on A;
+    a plain task on the same file still is."""
+    from ttp import coordinator as coord, reviewcap
+    from ttp.db import deferral
+    p = make(env)
+    p.set_config("delivery.landed_probe", "test -e landed/{id}")
+    hot = "runtime/ttp/progress.py"
+    _on_base(p, "runtime/ttp/relay.py")
+    monkeypatch.setattr(reviewcap, "main_file", lambda p, r: hot)
+
+    def add(title, spec):
+        assert coord.apply(p, [{"type": "task_add", "title": title, "kind": "code", "spec": spec}]) == []
+        return p.db.one("SELECT * FROM tasks WHERE title=?", (title,))
+
+    a = p.db.add_task("A", f"Add {hot}.", kind="code", status="queued")
+    assert not deferral(add(f"Rebase #{a}'s integration onto the push branch", f"Rebase {hot}."))
+    assert not deferral(add("Carry it over", f"Re-land #{a}'s change to {hot}."))
+    assert deferral(add("other", f"Extend {hot}.")).get("when", "").startswith("landed:#")
 
 
 def test_an_automatic_chain_uses_depends_on_where_no_landing_can_be_checked(env, monkeypatch):

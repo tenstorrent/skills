@@ -35,6 +35,7 @@ import re
 import sqlite3
 import time
 
+from . import untrusted
 from .db import TERMINAL_TASK_STATES, DB, review_subject
 
 SCHEMA = """
@@ -101,8 +102,9 @@ def stopped_early(output: str) -> bool:
     return bool(_STOPPED.search(output or ""))
 
 
-_HEADER = re.compile(r"^_{3,} (?:ERROR at (?:setup|teardown) of )?(\S.*?) _{3,}$", re.M)
-_BLOCK_END = re.compile(r"^(?:_{3,} \S.*? _{3,}|={3,}.*)$", re.M)
+# pytest pads a long test's header with one '_' a side; '_ _ _ _' (a traceback's frame separator) is none.
+_HEADER = re.compile(r"^_+ (?:ERROR at (?:setup|teardown) of )?([^\s_].*?) _+$", re.M)
+_BLOCK_END = re.compile(r"^(?:_+ [^\s_].*? _+|={3,}.*)$", re.M)
 _SUMMARY_MSG = re.compile(r"^(?:FAILED|ERROR) (\S+::[^\s\[]*(?:\[.*?\])?) - (.*)$", re.M)
 
 
@@ -255,7 +257,8 @@ def incident(db: DB, task: dict, ids: list[str], excerpt: str, now: float, cfg: 
     budget = float(((cfg.get("budget") or {}).get("task_default_usd") or {}).get(tier, 8.0))
     title = f"Fix shared check failure: {ids[0]}" + (f" (+{len(ids) - 1} more)" if len(ids) > 1 else "")
     fid = db.add_task(title[:200], _spec(ids, excerpt, [task["id"]], again), kind="code", tier=tier, priority=2,
-                      origin="daemon", budget_usd=budget)
+                      origin="daemon", budget_usd=budget,
+                      labels=[untrusted.LABEL])   # it quotes test output
     iid = db.x("INSERT INTO checks_incidents(ids,opened,last,fix_task,tasks) VALUES(?,?,?,?,?)",
                (json.dumps(ids), now, now, fid, json.dumps([task["id"]])))
     db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status,task) VALUES(?,?,?,?,?,?,?,?)",

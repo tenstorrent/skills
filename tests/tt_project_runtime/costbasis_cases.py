@@ -207,3 +207,199 @@ def test_a_cut_off_codex_run_priced_from_its_rollout_tokens_is_booked_as_tokens(
     assert run["cost_estimated"] == 1 and run["cost_basis"] == "tokens", dict(run)
     assert run["cost_usd"] == pytest.approx(priced), dict(run)
     assert run["cost_usd"] != pytest.approx(2.0), "priced from its tokens, not the elapsed half of its budget"
+
+
+# A Claude run's own tokens priced at the model its result names, never the alias it asked for -------
+
+def _alias_lines(model_usage, init="claude-opus-5-5", out_tokens=20_000, total=12.0):
+    """A Claude stream: init on `init`, a result reporting `total` and naming `model_usage` ids."""
+    return [{"type": "system", "subtype": "init", "session_id": "F1", "model": init},
+            {"type": "result", "subtype": "success", "total_cost_usd": total, "result": "ok",
+             "usage": {"input_tokens": 0, "output_tokens": out_tokens},
+             "modelUsage": {m: {"outputTokens": out_tokens - i, "inputTokens": 0} for i, m in enumerate(model_usage)}}]
+
+
+def test_an_opus_alias_fork_books_the_rates_of_the_model_its_result_names(env):
+    """A run that asked for 'opus' (no price row) books its own tokens at the row of the model its
+    result's modelUsage names, not the dearest row; an id the table lacks keeps the dearest row and is
+    told once."""
+    p = make(env)
+    from ttp import localspend
+    from ttp.daemon import Daemon
+    from ttp.providers import get_provider
+    d = Daemon(p.base)
+    _, r = _fork_run(d)
+    d.p.db.x("UPDATE runs SET model='opus' WHERE id=?", (r["id"],))
+    r = d.p.db.one("SELECT * FROM runs WHERE id=?", (r["id"],))
+    out = d.p.runs / "alias.jsonl"
+    out.write_text("".join(json.dumps(x) + "\n" for x in _alias_lines(["claude-opus-5-5", "claude-haiku-5-5"])))
+    u = get_provider("claude").parse(out)
+    assert u.extra["model_usage"] == ["claude-opus-5-5", "claude-haiku-5-5"]
+    want = 20_000 * 20.0 / 1e6   # Opus 5.5 output rate, not Opus 4's $75
+    assert abs(d._net_of_session(r, u) - want) < 1e-6, "the alias was priced at the dearest row"
+    # the session's own model wins over a more used subagent model; with no modelUsage the init model
+    u = _reported(12.0, output_tokens=20_000)
+    u.extra.update(model_usage=["claude-haiku-5-5", "claude-opus-5-5"], model="claude-opus-5-5")
+    assert abs(d._net_of_session(r, u) - want) < 1e-6
+    u = _reported(12.0, output_tokens=20_000)
+    u.extra.update(model="claude-opus-5-5")
+    assert abs(d._net_of_session(r, u) - want) < 1e-6
+    usd, est = localspend.price("claude-haiku-5-5", {"input_tokens": 1_000_000, "output_tokens": 1_000_000,
+                                                    "cache_read_input_tokens": 1_000_000})
+    assert not est and abs(usd - 0.61) < 1e-9
+    for _ in range(2):
+        u = _reported(30.0, output_tokens=20_000)
+        u.extra.update(model_usage=["claude-unheard-9"])
+        d._net_of_session(r, u)
+    told = d.p.db.q("SELECT * FROM messages WHERE kind='alert' AND text LIKE '%claude-unheard-9%'")
+    assert len(told) == 1 and told[0]["severity"] == "low"
+
+
+def test_alias_priced_fork_rows_are_re_booked_once_at_their_runs_time(env):
+    p = make(env)
+    import datetime
+    from ttp import daemon as dmod, timefmt
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    db = d.p.db
+    at = datetime.datetime(2026, 11, 8, 10, 0, tzinfo=timefmt.zone(p)).timestamp()
+    wrong, right = 20_000 * 75.0 / 1e6, 20_000 * 20.0 / 1e6
+
+    def booked(lines, ended=at, renet=True, model_used=None):
+        tid, r = _fork_run(d, cost=wrong, out_tokens=20_000, status="done")
+        note = json.loads(r["note"])
+        if renet:   # re-booked by the 0.2.978 fork re-net, at the dearest row
+            note.update(session_cost_usd=12.0, fork_base_usd=12.0 - wrong)
+        if model_used:
+            note["model_used"] = model_used
+        db.x("UPDATE runs SET model='opus', ended=?, note=? WHERE id=?", (ended, json.dumps(note), r["id"]))
+        run_dir = d.p.runs / str(r["id"])
+        run_dir.mkdir(parents=True)
+        (run_dir / "output.jsonl").write_text("".join(json.dumps(x) + "\n" for x in lines))
+        return tid, r["id"]
+
+    no_model = [{"type": "system", "subtype": "init", "session_id": "F1"}]
+    tid, fixed = booked(_alias_lines(["claude-opus-5-5"]))
+    _, init_only = booked(_alias_lines([])[:1], renet=False)   # 'opus' asked, the init event names claude-opus-5-5
+    _, noted = booked(no_model, model_used="claude-opus-5-5")   # only the note's model_used names it
+    _, renet_old = booked(_alias_lines(["claude-opus-5-5"]), ended=at - 3 * 86400)   # re-net row before the window
+    _, bare = booked(no_model)   # names no model: keeps its booking
+    _, old = booked(_alias_lines(["claude-opus-5-5"]), ended=at - 3 * 86400, renet=False)   # before the window
+    changed = d.reprice_alias_runs()
+    assert [c[0] for c in changed] == [fixed, init_only, noted, renet_old]
+    assert all(abs(c[2] - right) < 1e-6 for c in changed), changed
+    row = db.one("SELECT cost_usd, note FROM runs WHERE id=?", (fixed,))
+    note = json.loads(row["note"])
+    assert abs(row["cost_usd"] - right) < 1e-6 and note["repriced_model"] == "claude-opus-5-5"
+    assert abs(note["fork_base_usd"] - (12.0 - right)) < 1e-6
+    assert abs(db.task(tid)["spent_usd"] - right) < 1e-6, "the task kept the phantom spend"
+    fix = db.q("SELECT ts, usd FROM ledger WHERE usd<0 ORDER BY id")
+    assert [f["ts"] for f in fix] == [at, at, at, at - 3 * 86400], "a correction not at its run's own time"
+    assert all(abs(f["usd"] + (wrong - right)) < 1e-6 for f in fix)
+    for rid in (bare, old):
+        assert abs(db.one("SELECT cost_usd FROM runs WHERE id=?", (rid,))["cost_usd"] - wrong) < 1e-9
+    assert db.kv(dmod.MODEL_REPRICE_KEY)["runs"] == 4
+    assert d.reprice_alias_runs() is None, "a second pass ran again"
+    db.set_kv(dmod.MODEL_REPRICE_KEY, None)
+    assert d.reprice_alias_runs() == [], "a re-priced row was re-booked again"
+    assert len(db.q("SELECT 1 FROM ledger WHERE usd<0")) == 4
+
+
+# A CLI logged out or offline: it starts a turn, fails to reach its API and retries until the timeout.
+CODEX_NO_CALL = [{"type": "thread.started", "thread_id": "t1"}, {"type": "turn.started"},
+                 {"type": "error", "message": "Reconnecting... 1/5 (stream disconnected before completion)"},
+                 {"type": "error", "message": "stream disconnected before completion: error sending request"}]
+
+
+def _timed_out_run(d, provider, lines, *, took=2464.0):
+    """A worker run of `provider` cut off at its 2464 s timeout with a $3.59 budget (a logged-out case)."""
+    db = d.p.db
+    tid = db.add_task("build", "", kind="work", tier="standard", priority=3, budget_usd=8.0, labels=[])
+    db.update_task(tid, status="running")
+    rid = db.x("INSERT INTO runs(task,role,provider,model,started,status,boot_id) "
+               "VALUES(?,'worker',?,'gpt-5',?,'running',?)", (tid, provider, time.time() - took, d.boot))
+    run_dir = d.p.runs / str(rid)
+    run_dir.mkdir(parents=True)
+    db.x("UPDATE runs SET dir=? WHERE id=?", (str(run_dir), rid))
+    (run_dir / "output.jsonl").write_text("".join(json.dumps(x) + "\n" for x in lines))
+    (run_dir / "stderr.log").write_text("")
+    (run_dir / "run.json").write_text(json.dumps({"budget_usd": 3.59, "timeout_s": took, "argv": []}))
+    d.finish_run(db.one("SELECT * FROM runs WHERE id=?", (rid,)),
+                 {"rc": None, "started": time.time() - took, "ended": time.time(), "stopped": "timeout",
+                  "slept_s": 0})
+    return db.one("SELECT * FROM runs WHERE id=?", (rid,))
+
+
+def test_a_timed_out_run_that_made_no_model_call_books_0_and_counts_toward_no_cap(env):
+    """The logged-out case: Codex logged out with no internet timed out after 2464 s with 0 tokens and was
+    booked the elapsed share of its budget ($3.59) as spend. It made no call: $0, no cap moves."""
+    from ttp.daemon import Daemon
+    d = Daemon(make(env).base)
+    t0 = time.time() - 3600
+    run = _timed_out_run(d, "codex", CODEX_NO_CALL)
+    assert run["status"] == "timeout" and run["cost_usd"] == 0, dict(run)
+    assert d.p.db.task(run["task"])["spent_usd"] == 0
+    assert d.p.db.spent_since(t0) == 0 and d.p.db.spent_since(t0, billed=True) == 0
+    # The same cut-off run that got an answer keeps the elapsed estimate: it did spend.
+    answered = CODEX_NO_CALL[:2] + [{"type": "item.completed", "item": {"type": "agent_message", "text": "hi"}}]
+    run = _timed_out_run(d, "codex", answered)
+    assert run["cost_usd"] == pytest.approx(3.59, rel=0.05) and run["cost_estimated"] == 1, dict(run)
+
+
+@pytest.mark.parametrize("lines,called", [
+    ([], False),
+    (CODEX_NO_CALL, False),
+    ([{"type": "turn.failed", "error": {"message": "401 Unauthorized"}}], False),
+    ([{"id": "0", "msg": {"type": "task_started"}}, {"id": "0", "msg": {"type": "stream_error"}},
+      {"id": "0", "msg": {"type": "token_count", "info": None}}], False),
+    ([{"type": "system", "subtype": "init"},
+      {"type": "assistant", "message": {"model": "<synthetic>", "content": [{"type": "text", "text": "Not logged in"}]}},
+      {"type": "result", "is_error": True, "result": "Not logged in · Please run /login"}], False),
+    ([{"type": "assistant", "message": {"id": "m1", "model": "opus"}}], True),
+    ([{"type": "item.completed", "item": {"type": "reasoning"}}], True),
+    ([{"type": "turn.completed", "usage": {"input_tokens": 0}}], True),
+    ([{"id": "0", "msg": {"type": "agent_message", "message": "hi"}}], True),
+    ([{"type": "result", "subtype": "success", "is_error": False, "result": "done"}], True),
+    ([{"type": "something_new"}], True),   # an unknown stream keeps its estimate
+])
+def test_model_called_reads_a_call_from_any_providers_stream(tmp_path, lines, called):
+    from ttp.daemon import _model_called
+    out = tmp_path / "output.jsonl"
+    out.write_text("not json\n" + "".join(json.dumps(x) + "\n" for x in lines))
+    assert _model_called(out) is called
+    assert _model_called(tmp_path / "missing.jsonl") is False
+
+
+def test_the_no_call_rebook_takes_back_past_estimates_with_signed_rows_once(env):
+    from ttp.daemon import CALLS_REBOOK_DAYS, Daemon
+    d = Daemon(make(env).base)
+    db = d.p.db
+    now = time.time()
+
+    def booked(lines, ended):
+        tid = db.add_task("t", "", kind="work", tier="standard", priority=3, budget_usd=8.0, labels=[])
+        rid = db.x("INSERT INTO runs(task,role,provider,started,ended,status,cost_usd,cost_estimated) "
+                   "VALUES(?,'coordinator','codex',?,?,'timeout',3.59,1)", (tid, ended - 2464, ended))
+        run_dir = d.p.runs / str(rid)
+        run_dir.mkdir(parents=True)
+        db.x("UPDATE runs SET dir=? WHERE id=?", (str(run_dir), rid))
+        (run_dir / "output.jsonl").write_text("".join(json.dumps(x) + "\n" for x in lines))
+        db.x("UPDATE tasks SET spent_usd=3.59 WHERE id=?", (tid,))
+        db.spend("codex", 3.59, "t", estimated=True, ts=ended)
+        return rid, tid
+
+    wrong, wrong_task = booked(CODEX_NO_CALL, now - 86400)
+    called, _ = booked([{"type": "item.completed", "item": {"type": "agent_message"}}], now - 86400)
+    old, _ = booked(CODEX_NO_CALL, now - (CALLS_REBOOK_DAYS + 1) * 86400)
+    since = now - 2 * 86400
+    assert db.spent_since(since) == pytest.approx(7.18)
+    assert d.rebook_no_call(dry_run=True) == [(wrong, 3.59)] and db.spent_since(since) == pytest.approx(7.18)
+    assert d.rebook_no_call() == [(wrong, 3.59)]
+    assert db.one("SELECT cost_usd FROM runs WHERE id=?", (wrong,))["cost_usd"] == 0
+    assert json.loads(db.one("SELECT note FROM runs WHERE id=?", (wrong,))["note"])["no_call_rebooked"] == 3.59
+    assert db.task(wrong_task)["spent_usd"] == 0
+    assert db.one("SELECT usd FROM ledger WHERE usd<0")["usd"] == pytest.approx(-3.59)
+    assert db.spent_since(since) == pytest.approx(3.59), "only the run that called a model still counts"
+    assert db.one("SELECT cost_usd FROM runs WHERE id=?", (called,))["cost_usd"] == 3.59
+    assert db.one("SELECT cost_usd FROM runs WHERE id=?", (old,))["cost_usd"] == 3.59
+    assert d.rebook_no_call() is None, "it runs once"

@@ -901,8 +901,11 @@ def test_ttp_logs_reads_only_the_tail_and_spans_the_rotation(env, monkeypatch):
     assert cli.log_tail(p.logs, 5) == "éé"
     big = p.logs / "daemon.log"
     big.write_bytes(b"y" * 1_000_000 + b"\nthe end\n")
-    monkeypatch.setattr(pathlib.Path, "read_text", lambda *a, **k: pytest.fail("read the whole file"))
-    monkeypatch.setattr(pathlib.Path, "read_bytes", lambda *a, **k: pytest.fail("read the whole file"))
+    # Only the logs count: masking the tail reads the secret store's small config (item 7).
+    for name in ("read_text", "read_bytes"):
+        real = getattr(pathlib.Path, name)
+        monkeypatch.setattr(pathlib.Path, name, lambda self, *a, _real=real, **k: (
+            pytest.fail("read the whole file") if self.parent == p.logs else _real(self, *a, **k)))
     assert cli.log_tail(p.logs, 8) == "the end\n"
 
 
@@ -1182,6 +1185,84 @@ def test_gitreplay_answers_a_kept_read_without_git_and_drops_it_when_its_branch_
     with gitmemo.attempt():
         gitmemo.run(["git", "-C", str(repo), "status", "--porcelain"], capture_output=True, text=True)
     assert st.returncode == 0 and len(spawns) == n + 3, "a worktree read is kept only within its attempt"
+
+
+def test_kept_reads_answer_a_tick_s_repeated_ref_read_without_git_until_the_ref_moves(tmp_path, monkeypatch):
+    """The daemon's tick loop runs in gitmemo.kept_reads(): a HEAD, branch or full-id read repeated
+    across ticks spawns git once while the refs (read from their files) are unchanged, and again once
+    the branch moves. A worktree read (status) runs git every time, takes no attempt's kept answer and
+    leaves it in place. Outside the mode nothing is kept."""
+    from ttp import gitmemo, gitreplay
+    repo = tmp_path / "r"
+    env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t",
+           "GIT_COMMITTER_EMAIL": "t@t"}
+    sh = lambda *a: subprocess.run(["git", "-C", str(repo), *a], check=True, capture_output=True,   # noqa: E731
+                                   text=True, env=env).stdout.strip()
+    repo.mkdir()
+    sh("init", "-q", "-b", "main")
+    sh("commit", "-q", "--allow-empty", "-m", "one")
+    first = sh("rev-parse", "HEAD")
+    gitreplay.clear()
+    spawns = _record_spawns(monkeypatch)
+    git = lambda *a: gitmemo.run(["git", "-C", str(repo), *a], capture_output=True, text=True)   # noqa: E731
+    assert git("rev-parse", "HEAD").stdout.strip() == first and len(spawns) == 1
+    assert git("rev-parse", "HEAD").stdout.strip() == first and len(spawns) == 2, "outside the mode: no memo"
+    hits = gitmemo.kept_hits[0]
+    for _tick in range(3):
+        with gitmemo.kept_reads():
+            assert git("rev-parse", "HEAD").stdout.strip() == first
+            assert git("rev-parse", "HEAD^{tree}").returncode == 0
+            assert git("rev-parse", first).stdout.strip() == first
+    assert len(spawns) == 5 and gitmemo.kept_hits[0] == hits + 6, "each read ran git once over three ticks"
+    sh("commit", "-q", "--allow-empty", "-m", "two")
+    second = sh("rev-parse", "HEAD")
+    with gitmemo.kept_reads():
+        assert git("rev-parse", "HEAD").stdout.strip() == second and len(spawns) == 6, "the branch moved"
+        assert git("rev-parse", first).stdout.strip() == first and len(spawns) == 6, "a full id's answer stays"
+        with pytest.raises(subprocess.CalledProcessError):
+            gitmemo.run(["git", "-C", str(repo), "rev-parse", "--verify", "nope"], capture_output=True,
+                        text=True, check=True)
+    with gitmemo.attempt():
+        git("status", "--porcelain")
+        n = len(spawns)
+    with gitmemo.kept_reads():
+        git("status", "--porcelain")
+        git("status", "--porcelain")
+    assert len(spawns) == n + 2, "a worktree read runs git every time"
+    k = gitreplay.key(["git", "-C", str(repo), "status", "--porcelain"], {"capture_output": True, "text": True},
+                      gitmemo.is_read, gitmemo._OPTS_WITH_VALUE)
+    assert gitreplay._memo.get(k.k) is not None and gitreplay._memo[k.k].kind == gitreplay.VOL, \
+        "the attempt's own worktree answer is left to it"
+
+
+def test_kept_reads_keep_no_large_or_volatile_answer(tmp_path, monkeypatch):
+    """A tick read keeps only small immutable or ref-dependent answers (MAX_TICK_ENTRY_BYTES), so the
+    daemon's memory does not grow with what its loop reads."""
+    from ttp import gitmemo, gitreplay
+    repo = tmp_path / "r"
+    env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t",
+           "GIT_COMMITTER_EMAIL": "t@t"}
+    repo.mkdir()
+    subprocess.run(["git", "-C", str(repo), "init", "-q", "-b", "main"], check=True)
+    (repo / "f").write_text("x" * 64)
+    subprocess.run(["git", "-C", str(repo), "add", "f"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "one"], check=True, env=env)
+    gitreplay.clear()
+    spawns = _record_spawns(monkeypatch)
+    monkeypatch.setattr(gitreplay, "MAX_TICK_ENTRY_BYTES", 32)
+    show = ["git", "-C", str(repo), "show", "HEAD:f"]
+    with gitmemo.kept_reads():
+        for _ in range(2):
+            assert gitmemo.run(show, capture_output=True, text=True).stdout == "x" * 64
+        for _ in range(2):
+            gitmemo.run(["git", "-C", str(repo), "ls-files"], capture_output=True, text=True)
+    assert len(spawns) == 4 and not gitreplay._memo, "an answer over the cap and a volatile one are not kept"
+    monkeypatch.setattr(gitreplay, "MAX_TICK_ENTRY_BYTES", 1024)
+    monkeypatch.setattr(gitreplay, "MAX_TICK_BYTES", 400)
+    with gitmemo.kept_reads():
+        gitmemo.run(show, capture_output=True, text=True)
+        gitmemo.run(["git", "-C", str(repo), "cat-file", "-p", "HEAD:f"], capture_output=True, text=True)
+    assert len(gitreplay._memo) == 1 and gitreplay._bytes[0] <= 400, "all tick answers stay under MAX_TICK_BYTES"
 
 
 def _record_spawns(monkeypatch) -> list:
@@ -1924,3 +2005,248 @@ def test_every_way_a_step_waits_on_a_child_is_capped_and_the_child_killed_whole(
     assert _grandchild_gone(pidf)
     [ev] = p.db.q("SELECT * FROM events WHERE kind='tick_step_slow'")
     assert f"killed {exe}" in ev["text"]
+
+
+def test_a_cut_unreviewed_pass_that_queued_a_review_looks_again_sooner(env, monkeypatch):
+    p = make(env)
+    from ttp import daemon as dmod
+    d = dmod.Daemon(p.base)
+    old = time.time() - dmod.UNREVIEWED_GRACE_S - 60
+    for n in range(3):
+        tid = p.db.add_task(f"work {n}", "edit it", kind="code", tier="light", origin="coordinator")
+        p.db.update_task(tid, status="done", branch=f"ttp/t{tid}-work-{n}")
+        p.db.x("UPDATE tasks SET updated=? WHERE id=?", (old, tid))
+    monkeypatch.setattr(d, "_unreviewed_skip", lambda t, *a: "")
+    monkeypatch.setattr(d, "_auto_review", lambda t, *a, **k: (t["id"] + 100, True))
+    monkeypatch.setattr(dmod, "UNREVIEWED_PASS_S", -1)   # spent after each task: a backlog of three
+    clock = [time.time()]
+    monkeypatch.setattr(dmod.time, "time", lambda: clock[0])
+    assert len(d.sweep_unreviewed()) == 1
+    clock[0] += dmod.UNREVIEWED_BACKLOG_EVERY_S + 1
+    assert len(d.sweep_unreviewed()) == 1, "a cut pass that queued a review runs again after the backlog period"
+    # A pass that queued none, though cut, waits the full period: no backlog of reviews to queue.
+    monkeypatch.setattr(d, "_unreviewed_skip", lambda t, *a: "looked")
+    clock[0] += dmod.UNREVIEWED_BACKLOG_EVERY_S + 1
+    assert d.sweep_unreviewed() == []
+    clock[0] += dmod.UNREVIEWED_BACKLOG_EVERY_S + 1
+    assert d.sweep_unreviewed() == [] and d._unreviewed_swept < clock[0] - dmod.UNREVIEWED_BACKLOG_EVERY_S, \
+        "no pass ran before REVIEW_SWEEP_EVERY_S"
+    assert dmod.UNREVIEWED_BACKLOG_EVERY_S < dmod.REVIEW_SWEEP_EVERY_S
+
+
+def test_a_cut_off_unreviewed_sweep_resumes_after_the_task_it_stopped_at(env, monkeypatch):
+    p = make(env)
+    from ttp import daemon as dmod
+    d = dmod.Daemon(p.base)
+    old = time.time() - dmod.UNREVIEWED_GRACE_S - 60
+    tids = []
+    for n in range(3):
+        tid = p.db.add_task(f"work {n}", "edit it", kind="code", tier="light", origin="coordinator")
+        p.db.update_task(tid, status="done", branch=f"ttp/t{tid}-work-{n}")
+        p.db.x("UPDATE tasks SET updated=? WHERE id=?", (old, tid))
+        tids.append(tid)
+    seen = []
+    monkeypatch.setattr(d, "_unreviewed_skip", lambda t, *a: seen.append(t["id"]) or "looked")
+    monkeypatch.setattr(dmod, "UNREVIEWED_PASS_S", -1)   # spent after each task: one task a pass
+    for _ in range(4):
+        d.sweep_unreviewed(force=True)
+    assert seen == tids + tids[:1], f"each pass takes the next task, wrapping round: {seen}"
+    monkeypatch.setattr(dmod, "UNREVIEWED_PASS_S", 3600)
+    seen.clear()
+    d.sweep_unreviewed(force=True)
+    assert sorted(seen) == tids and d._unreviewed_at == 0, "an uncut pass looks at all and keeps no place"
+
+    def killed(t, *a):   # stopped at its budget mid-task: the next pass starts after that task
+        seen.append(t["id"])
+        raise dmod.StepBudgetSpent("sweep_unreviewed")
+    monkeypatch.setattr(d, "_unreviewed_skip", killed)
+    seen.clear()
+    with pytest.raises(dmod.StepBudgetSpent):
+        d.sweep_unreviewed(force=True)
+    monkeypatch.setattr(d, "_unreviewed_skip", lambda t, *a: seen.append(t["id"]) or "looked")
+    d.sweep_unreviewed(force=True)
+    assert seen == [tids[0], tids[1], tids[2], tids[0]], seen
+
+
+def test_repeated_overruns_of_one_step_are_one_queued_incident_naming_its_slowest_call(env, monkeypatch):
+    p = make(env)
+    from ttp import daemon as dmod
+    d = dmod.Daemon(p.base)
+    tid = _due_waiting_task(p, "exit 1")
+    monkeypatch.setattr(dmod, "STEP_BUDGET_S", 0.05)
+    naps = iter([0.06, 0.2, 0.06, 0.06, 0.06, 0.06])
+
+    def step():
+        d._step_over(f"task #{tid}'s retry_when probe", tid)
+        time.sleep(next(naps))
+    for _ in range(2):
+        d._run_step(step, "probe_waiting")
+    assert not p.db.q("SELECT * FROM events WHERE kind='tick_step_incident'"), "two overruns are no incident"
+    for _ in range(4):
+        d._run_step(step, "probe_waiting")
+    rows = p.db.q("SELECT * FROM events WHERE kind='tick_step_incident'")
+    assert len(rows) == 1, "one incident, not one per tick"
+    [ev] = rows
+    assert ev["status"] == "queued" and ev["task"] == tid, "a coordinator event"
+    assert "probe_waiting" in ev["text"] and "3 times" in ev["text"]
+    assert f"slowest call: task #{tid}'s retry_when probe" in ev["text"]
+    d._run_step(lambda: None, "probe_waiting")   # back in budget: the incident is over
+    monkeypatch.setattr(dmod, "STEP_SLOW_EVERY_S", 0)
+    naps = iter([0.06] * 3)
+    for _ in range(3):
+        d._run_step(step, "probe_waiting")
+    assert len(p.db.q("SELECT * FROM events WHERE kind='tick_step_incident'")) == 2, "a new incident after recovery"
+
+
+def _history(p, n: int) -> None:
+    """`n` past tasks, written in one transaction: done code tasks on branches, every 5th reviewed (the
+    review names the branch and depends on the task) and every 3rd a fix continuing a review or a
+    code task on its own branch with a pr_branch label."""
+    now, rows = time.time(), []
+    db = p.db
+    base = (db.one("SELECT max(id) m FROM tasks") or {}).get("m") or 0
+    for i in range(base + 1, base + n + 1):
+        kind, branch, labels, deps, spec = "code", f"ttp/t{i}-work", "[]", "[]", f"edit file {i}"
+        if i % 5 == 0:
+            kind, branch, deps, spec = "review", None, json.dumps([i - 1]), f"Review #{i - 1}: branch ttp/t{i - 1}-work."
+        elif i % 3 == 0:
+            prev = i - (i % 5) if i % 5 and i - (i % 5) > base else i - 1
+            labels = json.dumps([f"continues:{prev}", f"pr_branch:ttp/t{i - 1}-work"])
+        rows.append((i, now - 3600, now - 3600, f"task {i}", spec, kind, "done", branch, deps, labels))
+    with db.conn:
+        db.conn.executemany("INSERT INTO tasks(id,created,updated,title,spec,kind,status,branch,depends_on,labels) "
+                            "VALUES(?,?,?,?,?,?,?,?,?,?)", rows)
+
+
+def _per_call(p, monkeypatch, fn) -> tuple[int, int, int, float]:
+    """(db calls, rows they returned, git spawns, seconds) of one fn()."""
+    from ttp import gitmemo
+    calls, spawns = [0, 0], []
+    with pytest.MonkeyPatch.context() as mp:
+        for name in ("q", "one", "task"):
+            real = getattr(type(p.db), name)
+
+            def counted(self, *a, _real=real, **k):
+                out = _real(self, *a, **k)
+                calls[0] += 1
+                calls[1] += len(out) if isinstance(out, list) else int(out is not None)
+                return out
+            mp.setattr(type(p.db), name, counted)
+        real_spawn = gitmemo._spawn
+        mp.setattr(gitmemo, "_spawn", lambda argv, t, kw: spawns.append(argv) or real_spawn(argv, t, kw))
+        t0 = time.perf_counter()
+        fn()
+        took = time.perf_counter() - t0
+    return calls[0], calls[1], len(spawns), took
+
+
+def test_review_ref_lookups_cost_the_same_at_1000_and_10000_tasks(env, monkeypatch):
+    from ttp import worktree
+    p = make(env)
+    _history(p, 1000)
+    rid = p.db.add_task("Review #990: work", "Review #990: branch ttp/t989-work, and ttp/t988-work.",
+                        kind="review", tier="standard", origin="daemon", depends_on=[989])
+    monkeypatch.setattr(worktree, "_NAMED_MEMO", {})
+    # The fixes that carry the reviewed branches: one by its pr_branch label, one continuing a done review
+    # that names the branch, one continuing the code task; a failed one carries nothing.
+    fixes = {}
+    for n, (b, labels) in enumerate((("ttp/t989-work", ["pr_branch:ttp/t989-work"]), ("ttp/t988-work", ["continues:990"]),
+                      ("ttp/t989-work", ["continues:989"]), ("ttp/t988-work", ["pr_branch:ttp/t988-work"]))):
+        f = p.db.add_task(f"fix {b}", "fix it", kind="code", tier="light", origin="daemon")
+        p.db.update_task(f, status="failed" if n == 3 else "done", branch=f"ttp/t{f}-fix")
+        p.db.x("UPDATE tasks SET labels=? WHERE id=?", (json.dumps(labels), f))
+        fixes.setdefault(b, []).append(f"ttp/t{f}-fix")
+    p.db.x("UPDATE tasks SET spec=? WHERE id=990", ("Review #989: branch ttp/t988-work.",))
+    want = {fixes["ttp/t988-work"][0]: "ttp/t988-work", fixes["ttp/t989-work"][1]: "ttp/t989-work"}
+
+    def look():
+        r = p.db.task(rid)
+        refs = worktree.named_refs(p, r)
+        worktree.fix_branches(p, r, refs)
+        worktree.reviewed_refs(p, r)
+    look()   # warm
+    small = _per_call(p, monkeypatch, look)
+    monkeypatch.setattr(worktree, "_NAMED_MEMO", {})
+    _history(p, 9000)
+    look()
+    big = _per_call(p, monkeypatch, look)
+    assert big[:3] == small[:3], f"db calls, rows and git spawns per look grow with history: {small} -> {big}"
+    assert big[3] < 1.0, f"one look took {big[3]:.2f} s at 10,000 tasks"
+    r = p.db.task(rid)
+    assert set(worktree.named_refs(p, r)) == {"ttp/t989-work", "ttp/t988-work"}
+    assert worktree.fix_branches(p, r, worktree.named_refs(p, r)) == want, "the newest carrier of each branch"
+
+
+def test_the_step_budget_is_a_known_watchdog_key_set_alone(env):
+    p = make(env)
+    from ttp import daemon as dmod
+    from ttp import project
+    assert project.unknown_key_hint("watchdog.step_budget_s") is None, "`ttp config` refuses only unknown keys"
+    assert "unknown key" in (project.unknown_key_hint("watchdog.step_budget") or "")
+    p.set_config("watchdog.step_budget_s", 240)
+    assert not [x for x in project.config_problems(p.raw_config()) if "step_budget_s" in x]
+    assert p.config()["watchdog"]["step_budget_s"] == 240 and p.config()["watchdog"]["hang_s"] == 900
+    assert dmod.Daemon(p.base)._step_budget() == 240
+
+
+def test_finished_probes_a_cut_off_tick_leaves_are_handled_first_next_tick(env, monkeypatch):
+    p = make(env)
+    from ttp import daemon as dmod
+    d = dmod.Daemon(p.base)
+    tids = [_due_waiting_task(p, f"exit 1 # {n}") for n in range(3)]
+    d._run_step(d.probe_waiting)
+    assert sorted(d._probes) == tids
+    for proc, _, _ in list(d._probes.values()):
+        proc.wait(_load_scaled(30))
+    monkeypatch.setattr(dmod, "STEP_BUDGET_S", 0)   # spent at once: one verdict a tick
+    handled = []
+    for _ in range(3):
+        d._run_step(d.probe_waiting)
+        handled.append(sorted(d._probe_rc))
+    assert handled == [tids[:1], tids[:2], tids], "each tick handles one more verdict, none lost or repeated"
+    assert not d._probe_left and {d._probe_rc[t][0] for t in tids} == {1}
+    assert all(d._probe_diag.get(t) for t in tids), "a left verdict keeps what its run did"
+
+
+def test_probe_verdicts_cost_the_same_at_1000_and_10000_tasks(env, monkeypatch):
+    from ttp import daemon as dmod
+    p = make(env)
+    d = dmod.Daemon(p.base)
+
+    def checks_passed(task):   # a passed checks wait: its on_pass is recorded through the normal finish
+        if task["kind"] != "code":
+            return None
+        (run := p.base / "runs" / f"t{task['id']}").mkdir(parents=True, exist_ok=True)
+        rid = _run_row(p, task["id"], status="ok", run_dir=str(run))
+        return "pass", p.db.one("SELECT * FROM runs WHERE id=?", (rid,)), run, {"status": "done", "summary": "landed"}, "0" * 40
+    monkeypatch.setattr(d, "_checks_wait", checks_passed)
+
+    def verdict_tick():
+        # Passed ones record their on_pass through the normal finish, which reviews a code task.
+        tids = [_due_waiting_task(p, f"exit {n % 2} # {time.time()}", **({} if n % 2 else {
+            "on_pass": {"status": "done", "summary": "landed"}})) for n in range(4)]
+        for t in tids[::2]:
+            p.db.update_task(t, kind="code", branch=f"ttp/t{t}-work")
+        d._run_step(d.probe_waiting)
+        for proc, _, _ in list(d._probes.values()):
+            proc.wait(_load_scaled(30))
+        got = _per_call(p, monkeypatch, d.probe_waiting)
+        assert all(p.db.task(t)["status"] == "done" for t in tids[::2]), [(p.db.task(t)["status"], p.db.task(t)["result"][-400:]) for t in tids[::2]]
+        assert len(named) >= 2 * 3, "and each finish looked at every open review's refs"
+        named.clear()
+        assert not getattr(d, "_probe_left", None) and {t for t in tids if t % 2 == 0} <= set(d._probe_rc), "every verdict is handled"
+        p.db.x(f"UPDATE tasks SET status='done', not_before=NULL WHERE id IN ({','.join(map(str, tids))})")
+        d._probe_rc.clear()   # only history grows between the two measures, not the waiting set
+        return got
+    from ttp import worktree
+    named, real_named = [], worktree.named_refs
+    monkeypatch.setattr(worktree, "named_refs", lambda p_, t, *a, **k: named.append(t["id"]) or real_named(p_, t, *a, **k))
+    _history(p, 1000)
+    p.db.x("UPDATE tasks SET status='queued' WHERE id IN (990, 995, 1000)")   # open reviews the finishes look at
+    verdict_tick()   # warm
+    small = verdict_tick()
+    _history(p, 9000)
+    verdict_tick()
+    big = verdict_tick()
+    assert big[:3] == small[:3], f"db calls, rows and git spawns per verdict tick grow with history: {small} -> {big}"
+    assert big[3] < 1.0, f"one verdict tick took {big[3]:.2f} s at 10,000 tasks"

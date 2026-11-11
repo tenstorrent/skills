@@ -89,7 +89,7 @@ def wait_key(result: dict) -> str:
 @dataclass
 class Decision:
     wake: bool
-    by: str                    # event, cap, rule, jev, fallback
+    by: str                    # event, cap, rule, babysit (the chat watcher), jev, fallback
     reason: str
     delay_s: float = 0.0
     seen: str = ""
@@ -99,7 +99,9 @@ class Decision:
 
     def note(self, prev: dict, skips: list) -> dict:
         """What the dispatched run keeps (runs.note wake_gate) for settle_run and the next decision."""
-        return {"log": self.log_id, "by": self.by, "skips": skips, "seen": self.seen, "key": wait_key(prev)}
+        out = {"log": self.log_id, "by": self.by, "skips": skips, "seen": self.seen, "key": wait_key(prev)}
+        out.update({k: self.extra[k] for k in ("tier", "flag", "model") if self.extra.get(k)})
+        return out
 
 
 def pending(p, cfg: dict, probe: Any) -> str | None:
@@ -155,7 +157,8 @@ def own_checks(p, cfg: dict, result: dict) -> str | None:
 
 def log(db: DB, task: int, d: Decision, avoided_usd: float = 0.0, now: float | None = None) -> int:
     return db.x("INSERT INTO wake_gate(ts,task,decision,by,reason,jev_call,avoided_usd) VALUES(?,?,?,?,?,?,?)",
-                (time.time() if now is None else now, task, "wake" if d.wake else "skip", d.by, d.reason[:300],
+                (time.time() if now is None else now, task,   # a wait for Haiku's answer is no skip in the stats
+                 "wake" if d.wake else "wait" if d.extra.get("pending") else "skip", d.by, d.reason[:300],
                  d.jev_call, float(avoided_usd or 0)))
 
 
@@ -179,9 +182,41 @@ def _last_note(run: dict | None) -> str:
     return lines[-1][-500:] if lines else ""
 
 
+QUESTION = ("A task handed off `waiting` and is due to be woken. Would a model turn now find work to do, "
+            "rather than only finding the wait still on and handing it back? Wake it when the wait looks over, "
+            "something changed or failed, or the next step can be done now (the tier: light to check or report, "
+            "standard for real work). Skip when nothing is new: the thing waited on is plainly still in progress "
+            "or pending; a skip may name when to look next. Flag what looks wrong.")
+
+
+def _ask_watcher(db: DB, cfg: dict, jev, task: dict, state: str, now: float) -> Decision | None:
+    """The chat watcher's verb, acted on as given (babysit.Babysitter.decision); None when it did not
+    answer (it logged and counted the fallback): Jev's score decides then."""
+    ask = getattr(jev, "decision", None)
+    if ask is None:
+        return None
+    d = ask(state, QUESTION, target=str(task["id"]), purpose=USE)
+    if not d:
+        return None
+    skip, model = d["verb"] == "skip", str(d.get("model") or "")
+    what = d["verb"] + (f" {d['tier']}" if d["verb"] == "wake" else "") + (f": {d['reason']}" if d.get("reason") else "")
+    call = jevuse.record(db, USE, {"task": task["id"], "by": "babysit", "model": model, "verb": d["verb"],
+                                   "tier": d.get("tier") or "", "skip": skip}, 0.0,
+                         avoided_usd=wake_cost(db, cfg, now) if skip else 0.0, ref=f"task:{task['id']}",
+                         changed=skip, now=now)
+    extra = {"model": model}
+    if d["verb"] == "wake" and d.get("parsed"):
+        extra["tier"] = d["tier"]
+    if d["verb"] == "flag":
+        extra["flag"] = d["reason"]
+    if skip and d.get("delay_s"):
+        extra["delay_s"] = float(d["delay_s"])
+    return Decision(not skip, "babysit", f"babysit {model}: {what}"[:300], jev_call=call, extra=extra)
+
+
 def _ask_jev(db: DB, cfg: dict, s: dict, jev, task: dict, prev: dict, probe: tuple | None,
              last_run: dict | None, now: float) -> Decision | None:
-    if jev is None or not jev.enabled() or not jevuse.allowed(db, cfg, USE):
+    if jev is None:
         return None
     rc, out = probe if probe else (None, "")
     since = prev.get("waiting_since")
@@ -197,6 +232,17 @@ def _ask_jev(db: DB, cfg: dict, s: dict, jev, task: dict, prev: dict, probe: tup
         f"its last note: {_last_note(last_run)}",
         f"waiting since: {waited}; asked to be retried after {prev.get('retry_after_s')} s",
     ])
+    try:   # the chat watcher first: it costs nothing, so jevuse's pay check does not hold it
+        if got := _ask_watcher(db, cfg, jev, task, state, now):
+            return got
+    except Exception as e:   # the gate never loses a wake: an error wakes the model
+        return Decision(True, "fallback", f"watcher unavailable: {type(e).__name__}")
+    if hasattr(jev, "decision"):   # the watcher logged why it did not answer: Jev itself decides, never a re-ask
+        jev = jev.jev
+        if jev is None or not jev.enabled():
+            return Decision(True, "fallback", "the watcher gave no answer and Jev is off")
+    if not jev.enabled() or not jevuse.allowed(db, cfg, USE):
+        return None
     try:
         ans = jev.decide(state=state, questions={"needed": {
             "type": "noul",
@@ -208,6 +254,8 @@ def _ask_jev(db: DB, cfg: dict, s: dict, jev, task: dict, prev: dict, probe: tup
         }, purpose=USE, timeout=JEV_TIMEOUT_S)
     except Exception as e:   # the gate never loses a wake: an error wakes the model
         return Decision(True, "fallback", f"jev unavailable: {type(e).__name__}")
+    if not ans and getattr(jev, "pending", False):   # Haiku answers in the background: look again in a minute
+        return Decision(False, "haiku", "Haiku's answer is on its way", extra={"delay_s": 60.0, "pending": True})
     if not ans:
         return Decision(True, "fallback", "jev gave no answer")
     try:
@@ -278,15 +326,28 @@ def decide(p, cfg: dict, task: dict, prev: dict, now: float, probe: tuple | None
             d = Decision(False, "rule", why)
         else:
             d = _ask_jev(db, cfg, s, jev, task, prev, probe, last_run, now) or Decision(True, "fallback", "no rule or Jev decided")
+            if d.extra.get("pending") and gate.get("pending"):   # one wait for an answer per wait, never a loop
+                d = Decision(True, "fallback", "Haiku gave no answer within a minute")
     d.seen = seen
     if not d.wake:
         base = min(max(bud_retry_s(prev), float(s["backoff_s"])), float(s["max_backoff_s"]) or 3600)
         delay = min(base * 2 ** len(skips), float(s["max_backoff_s"]) or base)
         cap_at = ended + float(s["max_skip_h"]) * 3600
-        d.delay_s = max(60.0, min(delay, cap_at - now))
-    d.log_id = log(db, task["id"], d, wake_cost(db, cfg, now) if not d.wake else 0.0, now)
-    d.extra = {"skips": skips}
+        d.delay_s = max(60.0, min(float(d.extra.get("delay_s") or delay), cap_at - now))
+    d.log_id = log(db, task["id"], d, wake_cost(db, cfg, now) if not d.wake and not d.extra.get("pending") else 0.0, now)
+    d.extra = {**d.extra, "skips": skips}
     return d
+
+
+def steer(prev: dict, note: dict) -> dict:
+    """The hand-off a watcher's wake runs with: its tier as the wake's tier (budget.wake_tier still caps
+    it at the task's own) and its flag as why it woke, so the run reads it."""
+    out = dict(prev)
+    if note.get("tier"):
+        out["wake_tier"] = note["tier"]
+    if note.get("flag"):
+        out["woke"] = f"the watcher ({note.get('model') or 'chat model'}) flagged: {note['flag']}"[:500]
+    return out
 
 
 def _not_yet() -> tuple:
@@ -305,9 +366,12 @@ def skipped(prev: dict, d: Decision, now: float) -> dict:
     """The hand-off a skip leaves on the task: the same wait, no wake reason (the probe loop treats it
     as asleep again), and the gate's memory: its skips' log ids and the evidence it saw."""
     gate = prev.get("wake_gate") if isinstance(prev.get("wake_gate"), dict) else {}
-    out = {k: v for k, v in prev.items() if k not in ("woke",)}
-    out["wake_gate"] = {"log": list(gate.get("log") or []) + [d.log_id], "seen": d.seen,
+    out = {k: v for k, v in prev.items() if k not in ("woke", "wake_reason")}
+    pending = bool(d.extra.get("pending"))   # waiting for Haiku's answer is no skip: never counted as one
+    out["wake_gate"] = {"log": list(gate.get("log") or []) + ([] if pending else [d.log_id]), "seen": d.seen,
                         "since": gate.get("since") or now, "by": d.by, "reason": d.reason[:200]}
+    if pending:
+        out["wake_gate"]["pending"] = True
     return out
 
 
@@ -347,7 +411,7 @@ def settle_run(db: DB, note: dict, prev: dict, result: dict, waiting: bool, now:
         if w["jev_call"]:
             jevuse.resolve(db, int(w["jev_call"]), not back, "handed the wait back" if back else "found work", now=now)
         n += 1
-    soft = g.get("by") in ("cap", "jev", "fallback")
+    soft = g.get("by") in ("cap", "babysit", "jev", "fallback")
     for sid in g.get("skips") or []:
         r = rows.get(sid)
         if not r:
@@ -366,13 +430,13 @@ def stats(db: DB, cfg: dict, now: float | None = None) -> dict:
     now = time.time() if now is None else now
     since = now - jevuse.window_s(cfg)
     r = db.one("SELECT COUNT(*) n, SUM(decision='skip') skips, SUM(decision='skip' AND by='rule') rule_skips, "
-               "SUM(decision='skip' AND by='jev') jev_skips, SUM(decision='wake') wakes, "
+               "SUM(decision='skip' AND by='jev') jev_skips, SUM(decision='skip' AND by='babysit') babysit_skips, SUM(decision='wake') wakes, "
                "SUM(decision='skip' AND outcome='miss') skip_miss, SUM(decision='wake' AND outcome='miss') wake_miss, "
                "SUM(CASE WHEN decision='skip' AND COALESCE(outcome,'')!='miss' THEN avoided_usd ELSE 0 END) saved "
                "FROM wake_gate WHERE ts>=?", (since,))
     j = jevuse.stats(db, cfg, now).get(USE) or {}
     return {k: (float(r[k] or 0) if k == "saved" else int(r[k] or 0)) for k in
-            ("n", "skips", "rule_skips", "jev_skips", "wakes", "skip_miss", "wake_miss", "saved")} | {
+            ("n", "skips", "rule_skips", "jev_skips", "babysit_skips", "wakes", "skip_miss", "wake_miss", "saved")} | {
         "jev_calls": int(j.get("calls", 0)), "jev_cost": float(j.get("cost", 0.0))}
 
 
@@ -386,7 +450,7 @@ def line(db: DB, cfg: dict, now: float | None = None) -> str:
     per = f"{_usd(s['jev_cost'] / s['jev_calls'])} a Jev call" if s["jev_calls"] else "no Jev calls"
     off = USE in (db.kv(jevuse.OFF_KEY, {}) or {}) or jevuse.mode(cfg, USE) == "off"
     return (f"Wait-wake gate over the last {days:g} d: {s['n']} decisions, {s['skips']} skipped "
-            f"({s['rule_skips']} by rules, {s['jev_skips']} by Jev), {s['wakes']} woke; misses: "
+            f"({s['rule_skips']} by rules, {s['babysit_skips']} by the watcher, {s['jev_skips']} by Jev), {s['wakes']} woke; misses: "
             f"{s['skip_miss']} skips, {s['wake_miss']} wakes; Jev {s['jev_calls']} calls {_usd(s['jev_cost'])} "
             f"({per}){' (Jev step off)' if off else ''}; estimated saving {_usd(s['saved'])}, net {_usd(net)}"
             + (f", {_usd(net / s['skips'])} a skip" if s["skips"] else ""))

@@ -95,6 +95,8 @@ CLEARED_TEXT = {
     "coord-budget": "No coordinator item is parked over its per-turn budget any more.",
     "linger-off": "Linger is on again: the daemon starts at boot without a login.",
     "notifier": "Desktop notifications deliver again.",
+    "gh-auth": "gh is logged in again on this host: PR watching and CI waits read GitHub again.",
+    "ssh-agent": "ssh signs again here: the ssh agent is unlocked or no longer waits for approval.",
     "tick-step": "Daemon tick step {arg} runs again.",
     "pause-gone": "Machine change #{arg} is closed, or the resource pause its undo resumes is back.",
     "account-mismatch": "{arg}'s current account has plan readings of its own again, is known to be billed by use, or the old readings aged out.",
@@ -103,11 +105,13 @@ CLEARED_TEXT = {
 # high alert; their clearing is a low feed line, not a new notification (netwait.py).
 # linger-off: the systemd service would not start at boot without a login (downtime.py).
 # notifier: this machine's desktop notifications fail (notifier.py; a system setting or a missing tool).
+# gh-auth: this host's gh is logged out while a project here uses gh (ghauth.py; `gh auth login`).
 # fleethold: a hold the user set is past its expected end while tasks here wait on it (fleethold.passed_alerts).
 USER_BLOCKERS = ("network", "paused", "coord-budget", "linger-off", "notifier", "fleethold", "user-step",
-                 "slurm-paused")   # slurm-paused: the checks overflow's start-failure breaker (slurmcheck); paused: a long project pause (projpause); user-step: userstep.py
+                 "slurm-paused", "gh-auth", "model-ranking-key", "ssh-agent")   # ssh-agent: a locked or waiting password-manager agent here (sshagent.py); model-ranking-key: no Artificial Analysis key (rankfresh); slurm-paused: the checks overflow's start-failure breaker (slurmcheck); paused: a long project pause (projpause); user-step: userstep.py
 CLEARED_SEVERITY = {"network": "low", "paused": "low", "fleethold": "low", "coord-budget": "low", "account-mismatch": "low",
-                    "linger-off": "low", "notifier": "low", "user-step": "low", "slurm-paused": "low"}
+                    "linger-off": "low", "notifier": "low", "user-step": "low", "slurm-paused": "low", "gh-auth": "low",
+                    "model-ranking-key": "low", "ssh-agent": "low"}
 # Conditions that lift by themselves: below high they are a self-clearing feed line, never "needs you".
 # account-mismatch: the provider's login has no plan readings of its own yet (budget.evaluate); its next
 # run reports them, or it turns out billed by use.
@@ -217,6 +221,9 @@ def holds(db: DB, key: str, since: float, now: float) -> bool:
     if key == "slurm-paused":   # until the user sets checks.slurm_overflow again (slurmcheck.tripped)
         from . import slurmcheck
         return slurmcheck.tripped() is not None
+    if key == "model-ranking-key":   # until the refresher finds a key (rankfresh.api_key)
+        from .rankfresh import api_key
+        return api_key() is None
     if kind == "user-step":   # one standing item per task and user-only step (userstep.py)
         from . import userstep
         return userstep.holds(db, arg)
@@ -302,6 +309,11 @@ def holds(db: DB, key: str, since: float, now: float) -> bool:
         return turnsize.holds(db)
     if key == "linger-off":   # Daemon.check_linger keeps the flag while linger is off
         return bool(db.kv("linger_off"))
+    if key == "gh-auth":   # Daemon.check_gh_auth keeps the flag while the host's gh is logged out
+        return bool(db.kv("gh_auth_down"))
+    if kind == "ssh-agent":   # a sighting within sshagent.QUIET_S
+        from . import sshagent
+        return sshagent.holds(db)
     if key == "notifier":   # until a later desktop delivery on this machine succeeds
         from . import notifier
         return bool(notifier.failing())
@@ -344,7 +356,7 @@ def _checkable(key: str) -> bool:
                                          "push_rejected", "after_push_failed", "push_queue_dying", "push_not_landing", "push_tip_failing", "push_script_torn", "push_setup_fault",
                                          "push_scope", "heal",
                                          "heal-hold", "machine", "machine-change", "network", "deploy", "deploy-behind", "deploy-pending", "redeploy", "daemon-hang", "paused", "fleethold",
-                                         "coord-budget", "account-mismatch", "linger-off", "tick-step", "pause-gone", "notifier", "chat-silent", "user-step", "slurm-paused")
+                                         "coord-budget", "account-mismatch", "linger-off", "tick-step", "pause-gone", "notifier", "chat-silent", "user-step", "slurm-paused", "gh-auth", "ssh-agent")
 
 
 def _since(ep: dict) -> float:

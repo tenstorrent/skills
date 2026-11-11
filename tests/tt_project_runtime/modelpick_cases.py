@@ -102,7 +102,7 @@ def test_model_pick_jev_routes_open_work_logs_and_settles_it(env, monkeypatch):
     assert (prov, tier) == ("chat", "standard")
     assert note[route.KEY]["model"] == _MP_MODEL and note[route.KEY]["model_pick"] is True
     assert note[route.KEY]["pick_effort"] == "max" and note[route.KEY]["fallback"] == "none"
-    assert note[modelpick.KEY] == {"by": "jev", "pick": "routed-top", "p": 0.9}
+    assert note[modelpick.KEY] == {"by": "jev", "pick": "routed-top", "p": 0.9, "tier": "standard"}
     assert "effort_ab" not in note, "the option's effort is not overridden by an A/B arm"
     st, = d.jev.states
     assert len(st) <= modelpick.STATE_CHARS and secret not in st and "paths named: 1: a/b/notes.py" in st
@@ -172,7 +172,8 @@ def test_model_pick_without_jev_falls_back_to_core(env, monkeypatch):
     d.jev = _ModelJev(fail=JevUnavailable("HTTP 503"))
     tid, prov, tier, note = _mp_dispatch(p, d, monkeypatch)
     assert prov == d.cfg.get("core_provider") and route.KEY not in note
-    assert note[modelpick.KEY] == {"by": "rules", "pick": "core", "p": None, "why": "jev_unavailable"}
+    assert note[modelpick.KEY] == {"by": "rules", "pick": "core", "p": None, "why": "jev_unavailable",
+                                     "tier": "standard"}
     d.jev = None
     tid, prov, tier, note = _mp_dispatch(p, d, monkeypatch, title="Other")
     assert prov == d.cfg.get("core_provider") and note[modelpick.KEY]["why"] == "jev_unavailable"
@@ -180,7 +181,8 @@ def test_model_pick_without_jev_falls_back_to_core(env, monkeypatch):
     # A clear case never calls Jev; a light task keeps its tier's route.
     d.jev = _ModelJev()
     tid, prov, tier, note = _mp_dispatch(p, d, monkeypatch, title="Speed up", spec="Optimize the cache.")
-    assert prov == d.cfg.get("core_provider") and note[modelpick.KEY] == {"by": "rules", "pick": "core", "p": None, "why": "hard"}
+    assert prov == d.cfg.get("core_provider") and note[modelpick.KEY] == {"by": "rules", "pick": "core", "p": None,
+                                                                          "why": "hard", "tier": "standard"}
     tid, prov, tier, note = _mp_dispatch(p, d, monkeypatch, title="Look", kind="work", tier="light")
     assert prov == "chat" and modelpick.KEY not in note and "model_pick" not in note[route.KEY]
     assert d.jev.states == []
@@ -292,3 +294,175 @@ def test_model_pick_dispatch_keys_are_known_and_settable_with_ttp_config(env, ca
     cli.main(["config", "demo", "providers.chat.dispatch.enabled", "true"])
     cli.main(["config", "demo", "providers.chat.dispatch.min_p", "0.7"])
     assert p.raw_config()["providers"]["chat"]["dispatch"] == {"enabled": True, "min_p": 0.7}
+
+
+def _trip_task(p, side, bad=False, kind="code", labels=(), at=None, checks=None, why=None):
+    """One ended picked task: a routed or core sample of kind/standard; `bad` makes it fail; `why` makes
+    it a rules pick of that reason."""
+    from ttp import modelpick
+    from ttp.prguard import CHECKS_FILE
+    at = time.time() - 3600 if at is None else at
+    tid = p.db.add_task(f"{side} task", "Rename helpers.", kind=kind, tier="standard", priority=3, labels=list(labels))
+    p.db.update_task(tid, status="failed" if bad else "done")
+    note = {modelpick.KEY: {"by": "jev", "pick": "routed-top" if side == "routed" else "core", "p": 0.9,
+                            "tier": "standard"}}
+    if why:
+        note[modelpick.KEY].update(by="rules", p=None, why=why)
+    rid = p.db.x("INSERT INTO runs(task,role,provider,status,started,note) VALUES(?,'worker','claude','ok',?,?)",
+                 (tid, at, json.dumps(note)))
+    if checks is not None:
+        (p.runs / str(rid)).mkdir(parents=True, exist_ok=True)
+        (p.runs / str(rid) / CHECKS_FILE).write_text(json.dumps({"passed": checks}))
+    return tid
+
+
+def _trip_fill(p, routed_bad, routed_n, core_bad, core_n, **kw):
+    for side, bad, n in (("routed", routed_bad, routed_n), ("core", core_bad, core_n)):
+        for i in range(n):
+            _trip_task(p, side, bad=i < bad, **kw)
+
+
+def test_model_trip_holds_back_under_sample_within_margin_and_while_routing_is_off(env):
+    from ttp import modeltrip
+    p = make(env)
+    _trip_fill(p, 3, 10, 2, 10, kind="work")   # 30% against 20%: exactly the 10-point margin, not past it
+    _mp_config(p)
+    assert modeltrip.check(p, p.config()) == []
+    _trip_fill(p, 9, 9, 0, 9)   # every routed code task failed, but only 9 samples a side
+    assert modeltrip.check(p, p.config()) == [] and not p.db.kv(modeltrip.TRIPS)
+    _trip_fill(p, 0, 1, 0, 1)   # 10 a side: routed 9/10 bad against core 0/10
+    _mp_config(p, enabled=False)
+    assert modeltrip.check(p, p.config()) == [], "inactive while routing is off"
+    _mp_config(p, tripwire={"min_samples": 11})
+    assert modeltrip.check(p, p.config()) == [], "a configurable sample size"
+    _mp_config(p, tripwire={"margin_pts": 5})
+    assert [t["stratum"] for t in modeltrip.check(p, p.config())] == ["code/standard/*", "work/standard/*"], \
+        "a configurable margin"
+
+
+def test_model_trip_past_margin_routes_the_stratum_to_core_records_and_notifies(env, monkeypatch):
+    from ttp import modelpick, modeltrip
+    from ttp.daemon import Daemon
+    p = make(env)
+    _trip_fill(p, 4, 10, 1, 10, labels=["docs", "continues:99999"])
+    _trip_fill(p, 0, 10, 0, 10, kind="work")
+    _mp_config(p)
+    d = Daemon(p.base)
+    alerts = []
+    monkeypatch.setattr(d, "alert", lambda key, text, **k: alerts.append((key, text, k.get("severity"))))
+    d.trip_model_routing()
+    want = {"code/standard/*", "code/standard/docs"}   # an id label is no stratum; work stays routed
+    assert set(p.db.kv(modeltrip.TRIPS)) == want
+    assert {k for k, _, _ in alerts} == {f"model-trip:{s}" for s in want} and {s for *_, s in alerts} == {"low"}
+    assert "4/10 (40%)" in alerts[0][1] and "1/10 (10%)" in alerts[0][1]
+    mem = "\n".join(f.read_text() for f in p.memory_dir.glob("decision-*.md"))
+    assert "code/standard/*" in mem and "head-to-head" in mem
+    cfg = p.config()
+
+    def rules(**kw):
+        tid = p.db.add_task("Tidy notes", "Rename helpers.", **{"kind": "code", "tier": "standard", "priority": 3, **kw})
+        return modelpick.rules(p.db, cfg, p.db.task(tid), "standard")
+    assert rules() == "tripwire" and rules(labels=["docs"]) == "tripwire"
+    assert rules(kind="work") == "", "another stratum stays open"
+    d._model_trip_checked = 0.0
+    d.trip_model_routing()   # already tripped: no second notice or memory
+    assert len(alerts) == 2
+
+
+def test_model_trip_re_enables_only_on_a_newer_passing_head_to_head(env):
+    from ttp import modelpick, modeltrip
+    p = make(env)
+    now = time.time()
+    _trip_fill(p, 5, 10, 0, 10, at=now - 7200)
+    _mp_config(p)
+    assert [t["stratum"] for t in modeltrip.check(p, p.config(), now=now - 600)] == ["code/standard/*"]
+    task = {"kind": "code", "labels": "[]"}
+    modeltrip.head_to_head(p.db, "code/standard/*", True, "bench/old", now=now - 1200)
+    assert modeltrip.tripped(p.db, task, "standard"), "a result older than the trip"
+    modeltrip.head_to_head(p.db, "code/standard/*", False, "bench/worse", now=now - 300)
+    assert modeltrip.tripped(p.db, task, "standard"), "a worse result"
+    modeltrip.head_to_head(p.db, "code/standard/docs", True, "bench/other", now=now - 300)
+    assert modeltrip.tripped(p.db, task, "standard"), "another stratum's result"
+    assert modeltrip.check(p, p.config(), now=now) == [], "no new trip, nothing re-enabled by time alone"
+    modeltrip.head_to_head(p.db, "code/standard/*", True, "bench/new", now=now - 60)
+    assert modeltrip.tripped(p.db, task, "standard") is None
+    tid = p.db.add_task("Tidy notes", "Rename helpers.", kind="code", tier="standard", priority=3)
+    assert modelpick.rules(p.db, p.config(), p.db.task(tid), "standard") == ""
+    assert modeltrip.check(p, p.config(), now=now) == [], "samples before the head-to-head no longer count"
+    out = _ttp_run(p, "model-trip").stdout
+    assert "code/standard/*: routed" in out and "passed (bench/new)" in out and "code/standard/docs: routed" in out
+    assert _ttp_run(p, "model-trip", "--h2h", "code/standard/*", "--ok", "--worse", "--ref", "x").returncode == 2
+    r = _ttp_run(p, "model-trip", "--h2h", "code/standard/*", "--worse", "--ref", "bench/later")
+    assert r.returncode == 0 and "worse" in r.stdout and not p.db.kv(modeltrip.H2H)["code/standard/*"]["ok"]
+    modeltrip.head_to_head(p.db, "code/standard/*", True, "bench/new", now=now - 60)
+    _trip_fill(p, 5, 10, 0, 10, at=now - 30)
+    assert [t["stratum"] for t in modeltrip.check(p, p.config(), now=now)] == ["code/standard/*"], "it can trip again"
+
+
+def test_model_trip_counts_each_kind_of_bad_outcome(env):
+    from ttp import modeltrip
+    p = make(env)
+    _mp_config(p)
+    now = time.time()
+    good = _trip_task(p, "routed", checks=True)
+    failed = _trip_task(p, "routed", bad=True)
+    checks = _trip_task(p, "routed", checks=False)
+    reviewed = _trip_task(p, "routed")
+    rv = p.db.add_task(f"Review #{reviewed}", "s", kind="review", origin="daemon", labels=[f"auto_review:{reviewed}"])
+    p.db.x("INSERT INTO review_stats(task,ts,outcome) VALUES(?,?,?)", (rv, now - 300, "changes_needed"))
+    continued = _trip_task(p, "core")
+    p.db.add_task("continue: the rest", "s", kind="code", labels=[f"continues:{continued}"])
+    fixed = _trip_task(p, "core")
+    rv2 = p.db.add_task(f"Review #{fixed}", "s", kind="review", origin="daemon", labels=[f"auto_review:{fixed}"])
+    p.db.add_task(f"Fix review #{rv2}: x", "f", kind="code", labels=[f"review_fix:{rv2}"])
+    got = modeltrip.samples(p, p.config(), now - 86400, now)
+    assert {t: s["bad"] for t, s in got.items()} == {good: False, failed: True, checks: True, reviewed: True,
+                                                     continued: True, fixed: True}
+    assert got[good]["side"] == "routed" and got[fixed]["side"] == "core"
+
+
+def test_model_trip_counts_only_tasks_open_to_routing(env):
+    """Starts the rules force to core (hard, device, urgent, ...) are riskier by design: they count on
+    neither side, so they cannot hide a worse routed rate behind an inflated core one."""
+    from ttp import modelpick, modeltrip
+    p = make(env)
+    _mp_config(p)
+    now = time.time()
+    _trip_fill(p, 5, 10, 0, 10)
+    forced = [_trip_task(p, "core", bad=True, why=w)
+              for w in ("hard", "device", "urgent", "untrusted", "conclusion", "retry", "kind", "tier", "hard", "device")]
+    held = _trip_task(p, "core", why="tripwire")
+    no_jev = _trip_task(p, "core", why="jev_unavailable")
+    retried = _trip_task(p, "routed")   # a later retry start on core still counts against the routed pick
+    note = {modelpick.KEY: {"by": "rules", "pick": "core", "p": None, "why": "retry", "tier": "standard"}}
+    rid = p.db.x("INSERT INTO runs(task,role,provider,status,started,note) VALUES(?,'worker','claude','ok',?,?)",
+                 (retried, now - 1800, json.dumps(note)))
+    (p.runs / str(rid)).mkdir(parents=True, exist_ok=True)
+    (p.runs / str(rid) / "checks.json").write_text(json.dumps({"passed": False}))
+    got = modeltrip.samples(p, p.config(), now - 86400, now)
+    assert not set(forced) & set(got) and got[held]["side"] == got[no_jev]["side"] == "core"
+    assert got[retried]["side"] == "routed"
+    trips = modeltrip.check(p, p.config(), now=now)
+    assert [(t["stratum"], t["routed"], t["core"]) for t in trips] == [("code/standard/*", [6, 11], [0, 12])]
+
+
+def test_model_trip_margin_is_exact_and_settings_keep_a_sample_floor(env):
+    from ttp import modeltrip
+    p = make(env)
+    _trip_fill(p, 4, 10, 3, 10, kind="work")   # 40% against 30%: exactly the 10-point margin (float says past)
+    _trip_fill(p, 10, 10, 0, 0, kind="ask")    # routed only: no core side to compare against
+    _mp_config(p, tripwire={"min_samples": 0})
+    assert modeltrip.settings(p.config())["min_samples"] == 10, "a zero sample floor is ignored"
+    assert modeltrip.check(p, p.config()) == []
+    _mp_config(p, tripwire={"min_samples": 1, "margin_pts": 9.99})
+    assert [t["stratum"] for t in modeltrip.check(p, p.config())] == ["work/standard/*"]
+
+
+def test_model_trip_a_worse_head_to_head_keeps_the_sample_window(env):
+    from ttp import modeltrip
+    p = make(env)
+    now = time.time()
+    _trip_fill(p, 5, 10, 0, 10, at=now - 7200)
+    _mp_config(p)
+    modeltrip.head_to_head(p.db, "code/standard/*", False, "bench/worse", now=now - 600)
+    assert [t["stratum"] for t in modeltrip.check(p, p.config(), now=now)] == ["code/standard/*"]

@@ -19,6 +19,10 @@ keep 255, which keeps a waiting task asleep and counts towards the network-outag
 `ttp detach` job that sets it) and the host's ProxyCommand runs sudo: sudo dies at once and ssh says
 'kex_exchange_identification: Connection closed by remote host', which reads like the host refusing.
 Waiting cannot fix that, so 13 wakes a waiting task (tt-project-harness references/ssh-preflight.md).
+14 (with `classified=True`; else 1, "not yet", which keeps a waiting task asleep without counting
+towards the network-outage alert) when the ssh agent here is locked or waits for approval: a password
+manager's agent refused to sign, or a BatchMode ssh hung while one serves this machine (sshagent.py).
+That is not the host's fault.
 """
 from __future__ import annotations
 
@@ -33,6 +37,7 @@ HOST_KEY_RC = 10       # the host key did not verify: wakes a waiting task, wait
 AUTH_RC = 11           # authentication failed: likewise
 CLASSIFIED_UNREACHABLE_RC = 12
 NO_NEW_PRIVS_RC = 13      # no_new_privs here and a sudo ProxyCommand for the host: wakes a waiting task
+AGENT_RC = 14             # the ssh agent here is locked or waits for approval (sshagent.py); 1 unless `classified`
 SSH = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", "-o", "StrictHostKeyChecking=yes",
        "-o", "UpdateHostKeys=no", "-o", "LogLevel=ERROR",
        "-o", "ControlMaster=no", "-o", "ControlPath=none"]
@@ -95,9 +100,13 @@ def problems(cfg: dict) -> list[str]:
 
 def classify(rc: int, out: str, classified: bool = False) -> int:
     """The probe's exit for ssh's exit `rc` and output: ssh's own failure (255) becomes 10 (host
-    key), 11 (auth) or unreachable (255, or 12 when `classified`); any other exit is kept."""
+    key), 11 (auth), the agent here (14 when `classified`, else 1: not yet) or unreachable (255, or 12
+    when `classified`); any other exit is kept."""
     if rc != UNREACHABLE_RC:
         return rc
+    from . import sshagent
+    if sshagent.locked(out or ""):
+        return AGENT_RC if classified else 1
     if _HOST_KEY.search(out or ""):
         return HOST_KEY_RC
     if _AUTH.search(out or ""):
@@ -107,12 +116,17 @@ def classify(rc: int, out: str, classified: bool = False) -> int:
 
 def preflight(host: str, timeout: float = 30.0, classified: bool = False) -> tuple[int, str]:
     """(exit code, ssh's output) of `ssh <host> true`: 0 reachable, 10 host key not verified,
-    11 auth failed, 255 not reachable (12 when `classified`), 13 no_new_privs with a sudo ProxyCommand
+    11 auth failed, 255 not reachable (12 when `classified`), 14 (else 1) the agent here locked or
+    waiting, 13 no_new_privs with a sudo ProxyCommand
     (the output then says why and what to do)."""
     try:
         r = subprocess.run([*SSH, host, "true"], capture_output=True, text=True, timeout=timeout,
                            stdin=subprocess.DEVNULL)
     except subprocess.TimeoutExpired:
+        from . import sshagent
+        if sshagent.password_manager():   # a hung BatchMode ssh: the agent waits for approval
+            return (AGENT_RC if classified else 1), \
+                f"ssh to {host}: timed out after {timeout:g} s; {sshagent.WHY}"
         return classify(UNREACHABLE_RC, "", classified), \
             f"ssh: connect to host {host}: timed out after {timeout:g} s"
     except OSError as e:

@@ -83,7 +83,9 @@ Specs naming one (spec_check): a coordinator task_add or task_update spec that n
 (`o6` on a line that says "obligation") must name one that exists. A new task is attached as an owner of
 each open one it names; an updated task must already own it, or an `obligation` action of the same batch
 attach it, else the action is refused, so no worker is told it owns an obligation its records refuse.
-Keys of closed obligations (receipt or dropped) are history and pass.
+Keys of closed obligations (receipt or dropped) and delivered ones are citations and pass: only an open key
+claims ownership. An order's or promise's owner tasks (its `tasks`) own it as its attached owners do. The
+coordinator's STATE shows each open task's open keys (open_keys_by_task), so it sees what a task owns.
 """
 from __future__ import annotations
 
@@ -138,11 +140,11 @@ def spec_check(db, text: str, tid: int | None = None, attaching=()) -> list[str]
         o = st["items"].get(oid)
         if not o:
             unknown.append(oid)
-        elif o["receipt"] or o.get("dropped"):
-            continue
+        elif not _open(o) or o.get("delivered"):
+            continue   # a closed or delivered key is a citation: no owner is told to work on it
         elif tid is None:
             attach.append(oid)
-        elif str(tid) not in o["owners"] and (oid, int(tid)) not in attaching:
+        elif int(tid) not in _owner_ids(o) and (oid, int(tid)) not in attaching:
             unowned.append(oid)
     if unknown:
         raise ValueError(f"its spec names obligation {', '.join(unknown)}, which does not exist: record it first "
@@ -1263,6 +1265,17 @@ def owned_open(db, tid: int) -> list[str]:
     return [o["id"] for o in items(db) if _open(o) and str(tid) in o["owners"]]
 
 
+def open_keys_by_task(db) -> dict[int, list[str]]:
+    """Task id -> the open, undelivered obligation keys it owns (attached, or an order's or promise's
+    task), in key order: the keys a task_update spec may name as its own (spec_check)."""
+    out: dict[int, list[str]] = {}
+    for o in items(db):
+        if _open(o) and not o.get("delivered"):
+            for t in _owner_ids(o):
+                out.setdefault(t, []).append(o["id"])
+    return out
+
+
 def owner_due(db) -> dict[int, float]:
     """Task id -> the earliest due time of the open obligations it is a required owner of (owned_open's
     owners): an unreceipted milestone's due, else a promise's, else math.inf. Dispatch starts these
@@ -1408,10 +1421,11 @@ def _check_promise(p, o: dict, st: dict, now: float, raised: list[str]) -> bool:
         o["receipt"] = {"at": now, "task": None, "evidence": kept}
         _retire(p.db, now, "promise kept", prefix=fp)
         return True
+    stuck_changed = _check_landing_stuck(p, o, now, raised)
     if pr.get("order") is not None:
-        return _check_order(p, o, now, raised)
+        return _check_order(p, o, now, raised) or stuck_changed
     if now < pr["due"] or pr.get("raised") is not None:
-        return False
+        return stuck_changed
     from . import replan, timefmt
     pr["raised"] = now
     twice = replan.note_miss(pr, now) >= 2
@@ -1427,6 +1441,56 @@ def _check_promise(p, o: dict, st: dict, now: float, raised: list[str]) -> bool:
     if _raise(p.db, now, fp, PROMISE_KIND, text, pr["tasks"][0] if pr["tasks"] else None, _must(o, twice)):
         raised.append(fp)
     return True
+
+
+def _landing_stuck(p, o: dict, now: float) -> tuple[str, str, int | None] | None:
+    """(fingerprint, text, gated task) of the first owner of open promise or order `o` that waits on a landing
+    nothing can make (LANDING_STUCK_KIND), past the grace; None when none. Saved rows only. The fingerprint
+    sits under `obligation:<id>:promise`, so a kept, closed or dropped promise retires it."""
+    from . import deadwait, eta, landed
+    for tid in _owner_ids(o):
+        t = p.db.task(tid)
+        if not t or t["status"] in CLOSED or t["status"] == "running":
+            continue
+        for n in eta.landing_waits(t):
+            g = p.db.task(n)
+            if not g or g["status"] != "done" or landed.abandoned(p.db, n) or landed.recorded(p.db, n)[0]:
+                continue   # open work lands it, abandoned has its own notice, or it landed
+            if not (stuck := deadwait.stuck_by(p.db, n)):
+                continue
+            try:
+                grace = float((p.config().get("waiting") or {}).get("landed_wait_dead_s", deadwait.GRACE_S) or 0)
+            except Exception:
+                grace = float(deadwait.GRACE_S)
+            if now - stuck["at"] < grace:
+                continue   # a fix or re-review the same step queues gets its chance
+            held = {w["id"] for w in deadwait.waiters(p.db, {n})} | {tid}
+            if deadwait.path(p.db, n, held):
+                continue
+            ep = f"r{stuck['review']}" if stuck["row"] is None else f"q{stuck['row']}"
+            kind = "Order" if o["promise"].get("order") is not None else "Promise"
+            text = (f"{kind} {o['id']} cannot finish: its owner #{tid} waits on landed:#{n}, but #{n} {g['title'][:100]} "
+                    f"is done and not landed, {stuck['what']}, and no open review, fix, rebase or push carries it "
+                    f"on. Its ETA reads 'after landed:#{n}'. Act now: queue the fix and re-review (or the push) of "
+                    f"#{n}, re-point or clear #{tid}'s wait, or tell the user in chat {o['promise']['chat']} and "
+                    f"re-date or drop {o['id']} (`obligation` with key {o['id']}).")
+            return f"obligation:{o['id']}:promise:landing_stuck:{n}:{ep}", text, n
+    return None
+
+
+def _check_landing_stuck(p, o: dict, now: float, raised: list[str]) -> bool:
+    """One must-act event per episode for an open promise or order stuck behind a landing nothing can make
+    (_landing_stuck), retired once that clears. Returns whether `o` changed."""
+    got = _landing_stuck(p, o, now)
+    was = o.get("landing_stuck")
+    if got and got[0] == was:
+        return False
+    if was:
+        _retire(p.db, now, "landing path back", was)
+    o["landing_stuck"] = got[0] if got else None
+    if got and _raise(p.db, now, got[0], LANDING_STUCK_KIND, got[1], got[2], _must(o)):
+        raised.append(got[0])
+    return bool(got or was)
 
 
 def _promise_state(o: dict, now: float, where) -> str:
@@ -1584,10 +1648,16 @@ def deliver(p, sent: list[tuple[int, str | None, list]], now: float | None = Non
 ORDER_LATE_KIND = "order_late"
 ORDER_KIND = "order_overdue"
 CLAIM_KIND = "claim_failed"
-MUST_ACT_KINDS = (PROMISE_KIND, ORDER_LATE_KIND, ORDER_KIND, CLAIM_KIND)
+# An open promise or order whose owner waits on a landing (eta.landing_waits) that nothing can make:
+# the gated task is done, not landed, its last review failed or was cancelled (or its push row failed:
+# deadwait.stuck_by) and no open task carries it on (deadwait.path). One high event per episode (the
+# gate and the failed review or row), after waiting.landed_wait_dead_s; it is retired once a path appears.
+LANDING_STUCK_KIND = "order_landing_stuck"
+MUST_ACT_KINDS = (PROMISE_KIND, ORDER_LATE_KIND, ORDER_KIND, CLAIM_KIND, LANDING_STUCK_KIND)
 ORDER_CLASSES = ("read", "change", "device")
 ORDER_START_S = 1800          # an order with no start_by: its owner's run starts within this after the message
 CLAIM_WAIT_S = 1800           # a claim's probe that cannot answer (75, 255, timeout) past its due: failed after this
+CLAIM_HOPS_MAX = 50           # continuation hops a task claim's check walks from its named task (_continuations)
 CLAIM_WAITING = (75, 255, "timeout", None)
 # A change or device order is owned by a task that can make the change or run the job: a question,
 # plan or review task is refused as its owner, model-free (unfit_owner), when the coordinator names it.
@@ -1862,8 +1932,30 @@ def record_claims(p, sent: list[tuple[int, str | None, list]], new_tasks: dict[i
     return notes
 
 
+def _continuations(db, tid: int) -> list[dict]:
+    """The tasks that carry task `tid` on, hop by hop (chaincap.prev_of: a `continues:` or `follows:`
+    label, a `continue:` follow-up of its parent), in walk order: each once, at most CLAIM_HOPS_MAX."""
+    from .chaincap import prev_of
+    nxt: dict[int, list[dict]] = {}
+    for r in db.q("SELECT id, status, title, labels, parent FROM tasks WHERE labels LIKE '%continues:%' "
+                  "OR labels LIKE '%follows:%' OR (parent IS NOT NULL AND (title LIKE '%continue%:%' "
+                  "OR title LIKE '%mechanical%:%')) ORDER BY id"):
+        if (prev := prev_of(r)) is not None:
+            nxt.setdefault(prev, []).append(r)
+    out, seen, todo = [], {tid}, [tid]
+    while todo and len(out) < CLAIM_HOPS_MAX:
+        for r in nxt.get(todo.pop(0), []):
+            if r["id"] not in seen:
+                seen.add(r["id"])
+                out.append(r)
+                todo.append(r["id"])
+    return out[:CLAIM_HOPS_MAX]
+
+
 def _check_claim(p, o: dict, now: float, raised: list[str]) -> bool:
-    """Close a claim that holds, or raise its one claim_failed event. Returns whether `o` changed."""
+    """Close a claim that holds, or raise its one claim_failed event. Returns whether `o` changed. A named
+    task that failed, was cancelled or is gone still holds through a task that continues it
+    (_continuations) and ended done, and waits for its due time while one is open."""
     from . import replan, timefmt
     pr = o["promise"]
     c, db, fp = pr["claim"], p.db, f"obligation:{o['id']}:claim"   # + its due: a new due can fail once more
@@ -1875,7 +1967,21 @@ def _check_claim(p, o: dict, now: float, raised: list[str]) -> bool:
             _retire(db, now, "claim held", prefix=fp)
             return True
         if status in ("failed", "cancelled", "gone"):
-            miss = f"#{c['task']} is {status}"
+            hops = _continuations(db, int(c["task"]))
+            if done := next((h for h in hops if h["status"] == "done"), None):
+                o["receipt"] = {"at": now, "task": done["id"], "evidence": f"#{done['id']}, which continues "
+                                f"#{c['task']} ({status}), ended done"}
+                _retire(db, now, "claim held", prefix=fp)
+                return True
+            if live := [h for h in hops if h["status"] not in CLOSED]:
+                if now < pr["due"]:
+                    return False
+                miss = (f"#{c['task']} is {status} and its continuation #{live[0]['id']} is still "
+                        f"{live[0]['status']} at its due time")
+            else:
+                miss = f"#{c['task']} is {status}" + (
+                    f", and so is each task that continues it (#{', #'.join(str(h['id']) for h in hops)})"
+                    if hops else "")
         elif now >= pr["due"]:
             miss = f"#{c['task']} is still {status} at its due time"
         else:

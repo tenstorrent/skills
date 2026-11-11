@@ -23,6 +23,7 @@ import difflib
 import hashlib
 import json
 import re
+import subprocess
 import time
 from pathlib import Path
 
@@ -99,16 +100,20 @@ def tool_terms(old: str, new: str, charter: str = "",
     (changed_clause: the word diff of `old` against `new`), never from words both keep or from other
     items: identifiers (_TOOL_TERM_RE) that neither the new text nor the current `charter` (any section)
     still has, whole words (clause_words), and quoted phrases `new` and `charter` no longer have and
-    user-message cites `new` no longer has (exact_terms). A removal (no `new`, or a `new` of citation words only: "(User's word,
-    2026-10-05.)") keeps only its distinctive words (distinctive_words over the scanned tool `lines`)."""
+    user-message cites `new` no longer has (exact_terms). Words of the harness's own vocabulary (HARNESS_WORDS)
+    are never terms; values with a unit (value_terms) are. A removal (no `new`, or a `new` of citation words
+    only: "(User's word, 2026-10-05.)") keeps only its distinctive words: none the current `charter` still
+    states (machine and resource names aside: _name), none common on the scanned tool `lines`
+    (distinctive_words)."""
     changed = changed_clause(old, new)
     if not clause_words(new):
         changed, new = old, ""
     ids = tool_term_ids(changed)
     ids = {t for t in ids if t not in new and t not in charter and not re.fullmatch(r"[\d./-]+", t)}
-    words = clause_words(changed)
-    if not new:
-        words = distinctive_words(words, lines)
+    words = {w for w in clause_words(changed) if w not in HARNESS_WORDS} | value_terms(changed, new + "\n" + charter)
+    if not new:   # a word another charter item still states names that item's tools too (names aside)
+        low = charter.lower()
+        words = distinctive_words({w for w in words if _name(w) or not _whole(w, low)}, lines)
     # A cite the new text keeps names the item as it now stands: no sign of its old wording. Only "#N" cites:
     # exact_terms already drops a phrase `new` keeps, and a phrase is user text, never a regex.
     exact = {t for t in exact_terms(changed, new + "\n" + charter)
@@ -140,6 +145,14 @@ continue follow provide make take give come show call find look change report re
 valid applicable available possible current specific general certain normal usual necessary enough
 result model value status machine host node device system thing case part place time hour minute week
 work worker project task user requirement verification restoration validity application""".split())
+# Words of the harness's own vocabulary: charters, specs and tools all use them, so they never say which
+# rule a tool enforces (a removed power exception shared 'item', 'scope' and 'limit' with nearly every tool).
+HARNESS_WORDS = frozenset("""
+item items restriction restrictions exception exceptions excepted scope scoped scopes limit limits limited
+charter policy policies section sections binding spec specs harness retired retire""".split())
+# A value with a unit: '900 W', '2 hours', '50%', '4 chips'. Both forms ('900 w', '900w') are terms.
+_VALUE = re.compile(r"(?<![\w.])(\d+(?:\.\d+)?)\s?(%|[kmg]?w|watts?|v|volts?|°c|ms|secs?|seconds?|mins?|minutes?"
+                    r"|hrs?|hours?|days?|weeks?|[kmgt]i?b|chips?|cores?|nodes?|tray(?:s)?|hosts?|boxes)(?!\w)", re.I)
 _TOKEN = re.compile(r"\w+")
 # Letters and digits joined by '-', bounded by neither: box-a, tt-box-3 (a date has no letter: clause_words).
 _HYPHENATED = re.compile(r"(?<![\w-])[a-z0-9]+(?:-[a-z0-9]+)+(?![\w-])")
@@ -150,6 +163,23 @@ def _whole(w: str, low: str) -> bool:
     nor a '-' when `w` has one (box-a is never in my-box-a or box-a-2)."""
     b = r"[\w-]" if "-" in w else r"\w"
     return re.search(rf"(?<!{b}){re.escape(w)}(?!{b})", low) is not None
+
+
+def _name(w: str) -> bool:
+    """`w` is a machine or resource name or a value: hyphenated (box-a) or holding a digit (rack7, 900w)."""
+    return "-" in w or any(c.isdigit() for c in w)
+
+
+def value_terms(text: str, kept: str = "") -> set[str]:
+    """The values with a unit of `text` (_VALUE), lowercased, as '900 w' and '900w', where `kept` (the new
+    text and charter) states neither form."""
+    keep = " ".join(kept.lower().split())
+    out = set()
+    for m in _VALUE.finditer(text):
+        forms = {f"{m[1]} {m[2].lower()}", f"{m[1]}{m[2].lower()}"}
+        if not any(_whole(x, keep) for x in forms):
+            out |= forms
+    return out
 
 
 def generic_stems() -> frozenset[str]:
@@ -286,17 +316,15 @@ def tool_hit(line: str, ids: set[str], words: set[str], exact: set[str] = frozen
 
 def still_stated(charter: str, old: str) -> str:
     """The binding charter section that still states every item of retired advisory text `old` (one
-    Restrictions item or a replaced section's items): "Brief" when one paragraph or bullet of a `## Brief`
-    section, else "Restrictions" when one sourced Restrictions item (restriction_source.sourced), holds
-    all of the item's identifiers (_TOOL_TERM_RE) and at least two of its rule words, and at least two
-    thirds of them. "" when an item is stated nowhere, or `old` names nothing to compare."""
+    Restrictions item or a replaced section's items): "Brief" when one paragraph or bullet of the Brief
+    (prompts.brief_text: its own headed sections too), else "Restrictions" when one sourced Restrictions
+    item (restriction_source.sourced), holds all of the item's identifiers (_TOOL_TERM_RE) and at least
+    two of its rule words, and at least two thirds of them. "" when an item is stated nowhere, or `old` names nothing to compare."""
     from .coordinator import _rule_words
-    from .prompts import charter_restrictions, charter_sections
+    from .prompts import brief_text, charter_restrictions
     from .restriction_source import sourced, split_items
-    units: list[tuple[str, str]] = []
-    for head, body in charter_sections(charter):
-        if " ".join(head[3:].split()).lower().startswith("brief"):
-            units += [("Brief", " ".join(" ".join(it).split())) for it in split_items("\n".join(body))]
+    units = [("Brief", " ".join(" ".join(it).split())) for it in split_items(brief_text(charter))
+             if not it[0].startswith("## ")]
     units += [("Restrictions", t) for t in (" ".join(" ".join(it).split())
                                             for it in split_items(charter_restrictions(charter))) if sourced(t)]
     found = []
@@ -364,6 +392,45 @@ def replaced_items(body: str, text: str) -> list[tuple[str, str]]:
 AUDIT_BUDGET_S = 5.0   # wall clock of one restriction_tools call: it runs on the daemon's tick thread
 
 
+_OVER_TASK = re.compile(r"(?<![\w#])(?:task\s*#?|#)(\d+)(?!\d)", re.I)
+_OVER_SHA = re.compile(r"(?<![\w-])(?=[0-9a-f]*[a-f])(?=[0-9a-f]*\d)[0-9a-f]{7,40}(?![\w-])")
+FIX_KINDS = ("code", "harness")   # task kinds that change tools
+
+
+def landed_fix(p: Project, over: str, end: float | None = None) -> str:
+    """What `over` (the retirement note of a Restrictions item) names that already updated the tools: a done
+    or landed code or harness task ("task #12", "#12"; a user-message cite is no task), or a commit on HEAD of
+    the project root's or the harness's git repo (its first 4 hashes, each git call bounded by the time left
+    before `end`, a monotonic deadline). "" when it names none."""
+    from .restriction_source import CITE_RE
+    text = re.sub(r"\b(?:msgs?|messages?)\s*#\d+", " ", CITE_RE.sub(" ", over), flags=re.I)
+    ids = {int(m[1]) for m in _OVER_TASK.finditer(text)}
+    if ids:
+        from .tried import landed_tasks
+        landed = None
+        for t in filter(None, (p.db.task(i) for i in sorted(ids))):
+            if t["kind"] not in FIX_KINDS:
+                continue
+            if t["status"] == "done":
+                return f"task #{t['id']}"
+            landed = landed_tasks(p.db) if landed is None else landed
+            if t["id"] in landed:
+                return f"task #{t['id']}"
+    for sha in list(dict.fromkeys(_OVER_SHA.findall(text.lower())))[:4]:
+        for repo in (p.root, p.harness):
+            left = 30 if end is None else min(30, end - time.monotonic())
+            if left <= 0:
+                return ""
+            try:
+                r = subprocess.run(["git", "-C", str(repo), "merge-base", "--is-ancestor", sha, "HEAD"],
+                                   capture_output=True, timeout=left)
+            except (OSError, subprocess.TimeoutExpired):
+                continue
+            if r.returncode == 0:
+                return f"commit {sha}"
+    return ""
+
+
 def restriction_tools(p: Project, loosened: list[tuple], batch: list[int],
                       notes: list[str] | None = None, budget_s: float | None = None) -> list[str]:
     """After Restrictions items were loosened or removed, name the project's own tools that still carry
@@ -376,7 +443,9 @@ def restriction_tools(p: Project, loosened: list[tuple], batch: list[int],
     each named with the terms it matched. A disabled schedule, in the table or its schedules.json entry, is left out. `loosened`: (old item, new text, over[,
     advisory]), `over` empty for the user's word, else the end that retired the item; `advisory`: the dropped
     items were all unsourced (restriction_source.drops_unsourced), so whoever dropped them and with any `over`,
-    one the Brief or a sourced item still states is left out, as is `over` "unsourced". A file a task of this batch
+    one the Brief or a sourced item still states is left out, as is `over` "unsourced", and an `over` naming the
+    done fix that already updated the tools (landed_fix: a done or landed code or harness task, a commit on
+    HEAD) queues nothing. A file a task of this batch
     names (its title or spec has the file's path or name) is left out. Open tasks' start_when probes and
     schedule prechecks are scanned too. A purely additive item (an `excepts` exception, a `both_hold` text)
     changes no older item and is never passed in. One call is one change (the turn's): at most one
@@ -450,6 +519,8 @@ def restriction_tools(p: Project, loosened: list[tuple], batch: list[int],
         label = TASK_LABEL + hashlib.sha256(key.encode()).hexdigest()[:12]
         if label in labels or p.db.q("SELECT 1 FROM tasks WHERE labels LIKE ? LIMIT 1", (f'%"{label}"%',)):
             continue   # a task already covers this change: idempotent per change
+        if over and landed_fix(p, over, end):
+            continue   # its retirement names the done fix that already updated the tools
         ids, words, exact = tool_terms(old, new, charter, idx)
         rare = distinctive_words(words, idx)
         on = idx.hits(words)

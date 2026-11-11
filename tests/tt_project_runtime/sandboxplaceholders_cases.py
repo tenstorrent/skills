@@ -187,7 +187,8 @@ def test_bootstrap_copies_a_runtime_holding_special_entries_and_claude_folders_w
     assert "ttp/.claude" in err and "ttp/pipe" in err and "ttp/sub/fifo" in err
 
 
-def test_copy_tree_skips_a_socket_and_a_link_to_a_fifo_and_keeps_a_folder_merely_named_like_claude(tmp_path, capsys):
+def test_copy_tree_skips_a_socket_and_a_link_to_a_fifo_and_keeps_a_folder_merely_named_like_claude(tmp_path, capsys,
+                                                                                                   monkeypatch):
     from ttp import cli
     src, dst = tmp_path / "s", tmp_path / "d"
     (src / ".claude-plugin").mkdir(parents=True)
@@ -196,7 +197,8 @@ def test_copy_tree_skips_a_socket_and_a_link_to_a_fifo_and_keeps_a_folder_merely
     os.mkfifo(tmp_path / "fifo")
     (src / "to-fifo").symlink_to(tmp_path / "fifo")
     sock = socket.socket(socket.AF_UNIX)
-    sock.bind(str(src / "s.sock"))
+    monkeypatch.chdir(src)   # a relative name: macOS caps an AF_UNIX path at 104 bytes, under its long tmp path
+    sock.bind("s.sock")
     try:
         with _fails_after(30):
             cli._copy_tree(src, dst)

@@ -113,7 +113,8 @@ REF_WHY = ("refused: a run never writes git refs, tags, releases, file contents 
 
 def ssh_public(name: str) -> bool:
     """`name` (a path under ~/.ssh) holds no secret: a public key (a glob of them too), ssh's config or
-    host lists, or a control socket (cm-*, or a name with ssh's % tokens)."""
+    host lists (known_hosts anywhere in the file name: known_hosts_<site>, <site>_known_hosts), or a
+    control socket (cm-*, or a name with ssh's % tokens)."""
     if ".." in name.split("/"):
         return False
     base = name.rstrip("/").rsplit("/", 1)[-1]
@@ -121,7 +122,9 @@ def ssh_public(name: str) -> bool:
         return True
     if not base or re.search(r"[*?\[]", name):
         return False
-    return (base in SSH_PUBLIC or base.startswith(("cm-", "known_hosts")) or "%" in base
+    stem = base.split(".", 1)[0].rstrip("~")   # ssh's client config and its temp and backup copies: settings
+    return (base in SSH_PUBLIC or base.startswith(("cm-", "config-", "config~")) or "known_hosts" in base or "%" in base
+            or (stem == "config" or stem.endswith("_config")) and not base.endswith((".key", ".pem"))
             or name.split("/", 1)[0] == "config.d")
 
 

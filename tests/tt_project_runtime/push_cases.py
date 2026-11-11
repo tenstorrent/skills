@@ -1969,21 +1969,20 @@ def test_a_push_batch_pushes_the_entries_after_a_blamed_first_one_once_they_pass
 
 
 def test_a_push_batch_checks_the_entries_after_a_blamed_one_once_only(env, monkeypatch, capsys):
-    """Entries 2 and 4 of five both fail: entry 2 is blamed, 3..5 are checked once without it and fail
-    (entry 4); the batch tries no further round, pushes entry 1 and requeues 3..5 as tested."""
+    """Entries 1 and 3 of five both fail: entry 1 is blamed, 2..5 are checked once without it and fail
+    (entry 3); the batch tries no further round, pushes nothing and requeues 2..5 as tested."""
     log = env["tmp"] / "checks.log"
     p, repo, origin, other = _bump_setup(env, monkeypatch, [f"echo run >> {log}",
                                                             "test -z \"$(ls plugins/p | grep bad)\""])
-    heads = [_entry(repo, f"e{n}", {f"plugins/p/{'bad' if n in (2, 4) else 'f'}{n}.txt": f"{n}\n"})
+    heads = [_entry(repo, f"e{n}", {f"plugins/p/{'bad' if n in (1, 3) else 'f'}{n}.txt": f"{n}\n"})
              for n in range(1, 6)]
     rc, m = _run_batch(p, _batch_marker(p, heads), monkeypatch)
-    assert rc == 0 and m["outcome"] == "pushed", m
-    assert _statuses(m) == ["pushed", "check_failed", "requeued", "requeued", "requeued"], m
+    assert _statuses(m) == ["check_failed", "requeued", "requeued", "requeued", "requeued"], m
     out = capsys.readouterr().out
     assert out.count("without it") == 1 and "they fail too; requeued" in out
-    # full head, prefixes 2 and 1, then the one extra round
-    assert len(log.read_text().split()) == m["checks"]["runs"] == 4
-    assert all("untested" not in r["detail"] for r in m["results"][2:]), "they were checked without entry 2"
+    # full head, prefixes 2 and 1, the tip, then the one extra round
+    assert len(log.read_text().split()) == m["checks"]["runs"] == 5
+    assert all("untested" not in r["detail"] for r in m["results"][1:]), "they were checked without entry 1"
 
 
 def test_entries_after_a_blamed_one_are_requeued_untested_without_an_extra_round(env, monkeypatch):
@@ -1992,10 +1991,48 @@ def test_entries_after_a_blamed_one_are_requeued_untested_without_an_extra_round
     from ttp import batch
     monkeypatch.setattr(batch, "RESCUES", 0)
     p, repo, origin, other = _bump_setup(env, monkeypatch, ["test ! -e plugins/p/bad.txt"])
-    heads = [_entry(repo, f"e{n}", {f"plugins/p/{'bad' if n == 2 else f'f{n}'}.txt": f"{n}\n"}) for n in (1, 2, 3)]
+    heads = [_entry(repo, f"e{n}", {f"plugins/p/{'bad' if n == 1 else f'f{n}'}.txt": f"{n}\n"}) for n in (1, 2, 3)]
     rc, m = _run_batch(p, _batch_marker(p, heads), monkeypatch)
-    assert _statuses(m) == ["pushed", "check_failed", "requeued"] and m["results"][2]["detail"] == {"untested": True}, m
-    assert m["results"][0]["detail"] == {}
+    assert _statuses(m) == ["check_failed", "requeued", "requeued"], m
+    assert [r["detail"] for r in m["results"][1:]] == [{"untested": True}] * 2, m
+
+
+def test_a_push_batch_pushes_the_first_prefix_that_passes_at_once_and_sends_the_rest_to_the_next_train(env, monkeypatch,
+                                                                                                         capsys):
+    """User msg #2317: a batch that passed every check lands at once. Eight entries, the seventh breaks the
+    checks: the full head fails and the first prefix tried (4) passes, so it pushes with no further
+    check (2 runs). Entries 5-8 are requeued untested and unblamed for the next train on the new tip; no
+    entry joins the passed head and it is not checked again."""
+    log = env["tmp"] / "checks.log"
+    p, repo, origin, other = _bump_setup(env, monkeypatch, [f"echo run >> {log}", "test ! -e plugins/p/bad.txt"])
+    heads = [_entry(repo, f"e{n}", {f"plugins/p/{'bad' if n == 7 else f'f{n}'}.txt": f"{n}\n"}) for n in range(1, 9)]
+    rc, m = _run_batch(p, _batch_marker(p, heads), monkeypatch)
+    assert rc == 0 and m["outcome"] == "pushed" and _statuses(m) == ["pushed"] * 4 + ["requeued"] * 4, m
+    assert len(log.read_text().split()) == m["checks"]["runs"] == 2, "the full head and prefix 4, nothing after"
+    assert [r["detail"] for r in m["results"][4:]] == [{"untested": True}] * 4, "requeued, never blamed"
+    assert _git_out(origin, "rev-parse", "proj") == m["pushed_sha"], m
+    assert [_git_out(origin, "show", f"proj:plugins/p/f{n}.txt") for n in (1, 4)] == ["1", "4"]
+    out = capsys.readouterr().out
+    assert "passed every push check: pushing its 4 entries now; the other 4 go in the next train" in out, out
+    assert "without it" not in out and "checking again" not in out
+
+
+def test_a_push_batch_never_rescues_after_a_blamed_entry_once_a_prefix_passed(env, monkeypatch, capsys):
+    """User msg #2317, the rescue path: five entries, the third breaks the checks. Prefix 2 passes and
+    pushes at once: prefix 3 is never checked, no entry is blamed, and entries 3-5 are never checked
+    without one ("checking the 3 entries after ... without it" built a bigger head after a pass). With
+    a blamed entry after a passed prefix (the cap probes' verdict), _rescue checks nothing."""
+    from ttp import batch
+    log = env["tmp"] / "checks.log"
+    p, repo, origin, other = _bump_setup(env, monkeypatch, [f"echo run >> {log}", "test ! -e plugins/p/bad.txt"])
+    heads = [_entry(repo, f"e{n}", {f"plugins/p/{'bad' if n == 3 else f'f{n}'}.txt": f"{n}\n"}) for n in range(1, 6)]
+    rc, m = _run_batch(p, _batch_marker(p, heads), monkeypatch)
+    assert rc == 0 and _statuses(m) == ["pushed", "pushed", "requeued", "requeued", "requeued"], m
+    assert len(log.read_text().split()) == m["checks"]["runs"] == 2 and "without it" not in capsys.readouterr().out
+    b = batch.Batch.__new__(batch.Batch)
+    b.detail_tip, b.rescues = None, 0
+    monkeypatch.setattr(batch.Batch, "_check", lambda *a: pytest.fail("a check after a passed prefix"))
+    assert b._rescue("t" * 40, [(i, f"{i}" * 40) for i in range(5)], 2, ["true"]) is None
 
 
 def _approved_mid_search(p, monkeypatch, after, priority):
@@ -2019,8 +2056,9 @@ def _approved_mid_search(p, monkeypatch, after, priority):
     return ran
 
 
-def _bad_sixth(env, monkeypatch, wait_s=0, restarts=1):
-    """Eight entries, the sixth breaks the checks. `wait_s` sets delivery.push_yield_wait_s (0: an urgent
+def _bad_first(env, monkeypatch, wait_s=0, restarts=1):
+    """Eight entries, the first breaks the checks, so the search runs prefixes 4, 2 and 1 (none passes:
+    a prefix that passed would push at once, user msg #2317) and then the rescue checks 2-8 without it. `wait_s` sets delivery.push_yield_wait_s (0: an urgent
     approval never waits for the search's verdict; None: the default, which these millisecond checks meet),
     `restarts` delivery.push_yield_restarts (1: a search may stop once; None: the default, never)."""
     p, repo, origin, other = _bump_setup(env, monkeypatch, ["test ! -e plugins/p/bad.txt"])
@@ -2028,49 +2066,49 @@ def _bad_sixth(env, monkeypatch, wait_s=0, restarts=1):
         p.set_config("delivery.push_yield_wait_s", wait_s)
     if restarts is not None:
         p.set_config("delivery.push_yield_restarts", restarts)
-    heads = [_entry(repo, f"e{n}", {f"plugins/p/{'bad' if n == 6 else f'f{n}'}.txt": f"{n}\n"}) for n in range(1, 9)]
+    heads = [_entry(repo, f"e{n}", {f"plugins/p/{'bad' if n == 1 else f'f{n}'}.txt": f"{n}\n"}) for n in range(1, 9)]
     return p, repo, origin, heads
 
 
-@pytest.mark.parametrize("after,priority", [(2, 1), (4, 1), (2, 3)])
+@pytest.mark.parametrize("after,priority", [(2, 1), (5, 1), (2, 3)])
 def test_an_urgent_approval_arriving_mid_bisect_stops_the_search_after_the_check_it_is_on(env, monkeypatch, after,
                                                                                          priority):
-    """Eight entries, the sixth breaks the checks. An urgent (priority 1) approval arrives right after
-    the full head failed and the first probe (prefix 4) passed: the batch runs no further check, pushes
-    the 4 entries that passed and requeues the rest "yielded" (none blamed), so the urgent one waits
-    for the one check in flight, not the whole bisect. Arriving after the blame (the full head and
-    prefixes 4, 6 and 5 ran), entry 6 stays blamed and only the check of 7-8 without it is skipped. A
-    routine (priority 3) approval changes nothing: the search runs to the end and blames entry 6."""
-    p, repo, origin, heads = _bad_sixth(env, monkeypatch)
+    """Eight entries, the first breaks the checks. An urgent (priority 1) approval arriving right after
+    the full head and prefix 4 failed stops the search: no further check runs and all eight are requeued
+    "yielded" (none blamed), so the urgent one waits for the one check in flight, not the whole bisect.
+    Arriving after the blame (the full head, prefixes 4, 2 and 1 and the tip ran), entry 1 stays blamed
+    and only the check of 2-8 without it is skipped. A routine (priority 3) approval changes nothing:
+    the search runs to the end, blames entry 1 and lands the rest."""
+    p, repo, origin, heads = _bad_first(env, monkeypatch)
     ran = _approved_mid_search(p, monkeypatch, after, priority)
     rc, m = _run_batch(p, _batch_marker(p, heads), monkeypatch)
-    pushed = [_git_out(origin, "show", f"proj:plugins/p/f{n}.txt") for n in range(1, 5)]
-    assert rc == 0 and m["outcome"] == "pushed" and pushed == ["1", "2", "3", "4"], m
+    assert rc == 0, m
     if priority == 1 and after == 2:
         assert len(ran) == m["checks"]["runs"] == 2, "the full head and prefix 4: nothing after the approval"
-        assert _statuses(m) == ["pushed"] * 4 + ["requeued"] * 4 and m["yielded_to"] == [99], m
+        assert m["outcome"] == "yielded" and _statuses(m) == ["requeued"] * 8 and m["yielded_to"] == [99], m
         assert all({**r["detail"], "known_fail": None} == {"yielded": True, "restarts": 1, "known_fail": None}
-                   for r in m["results"][4:]), "requeued, never blamed"
+                   for r in m["results"]), "requeued, never blamed"
     elif priority == 1:
-        assert len(ran) == m["checks"]["runs"] == 4, "no check of entries 7-8 without entry 6"
-        assert _statuses(m) == ["pushed"] * 5 + ["check_failed", "requeued", "requeued"], m
-        assert [r["detail"] for r in m["results"][6:]] == [{"yielded": True, "restarts": 1}] * 2 and m["yielded_to"] == [99], m
+        assert len(ran) == m["checks"]["runs"] == 5, "no check of entries 2-8 without entry 1"
+        assert _statuses(m) == ["check_failed"] + ["requeued"] * 7 and m["yielded_to"] == [99], m
+        assert [r["detail"] for r in m["results"][1:]] == [{"yielded": True, "restarts": 1}] * 7, m
     else:
-        # full head, prefixes 4, 6 and 5, then entries 7-8 checked without entry 6 (the rescue)
-        assert len(ran) == m["checks"]["runs"] == 5 and not m.get("yielded_to"), m
-        assert _statuses(m) == ["pushed"] * 5 + ["check_failed", "pushed", "pushed"], m
+        # full head, prefixes 4, 2 and 1, the tip, then entries 2-8 checked without entry 1 (the rescue)
+        assert len(ran) == m["checks"]["runs"] == 6 and not m.get("yielded_to"), m
+        assert m["outcome"] == "pushed" and _statuses(m) == ["check_failed"] + ["pushed"] * 7, m
+        assert [_git_out(origin, "show", f"proj:plugins/p/f{n}.txt") for n in (2, 8)] == ["2", "8"]
 
 
 def test_an_urgent_approval_mid_search_waits_for_a_near_verdict_and_leads_the_next_batch(env, monkeypatch, capsys):
     """delivery.push_yield_wait_s (default 900 s): an urgent approval arriving mid-search, with the
-    search's verdict expected that soon, does not stop it. No entry loses its checks: entry 6 is blamed,
+    search's verdict expected that soon, does not stop it. No entry loses its checks: entry 1 is blamed,
     the rest land, nothing is requeued, and the urgent one, still approved, goes in the next batch."""
     from ttp import pushq
-    p, repo, origin, heads = _bad_sixth(env, monkeypatch, wait_s=None)
+    p, repo, origin, heads = _bad_first(env, monkeypatch, wait_s=None)
     ran = _approved_mid_search(p, monkeypatch, 2, 1)
     rc, m = _run_batch(p, _batch_marker(p, heads), monkeypatch)
-    assert rc == 0 and _statuses(m) == ["pushed"] * 5 + ["check_failed", "pushed", "pushed"], m
-    assert not m.get("yielded_to") and len(ran) == m["checks"]["runs"] == 5, m
+    assert rc == 0 and _statuses(m) == ["check_failed"] + ["pushed"] * 7, m
+    assert not m.get("yielded_to") and len(ran) == m["checks"]["runs"] == 6, m
     assert "urgent approval 99 joins this batch's next split" in (out := capsys.readouterr().out), out
     assert "after its verdict, expected in about 0 min" in out, out
     assert pushq.yields_to(p, "origin/proj") == [99], "the urgent one still waits, approved"
@@ -2082,15 +2120,15 @@ def test_an_urgent_approval_mid_search_waits_for_a_near_verdict_and_leads_the_ne
 def test_an_urgent_approval_joins_a_long_search_instead_of_stopping_it(env, monkeypatch, capsys):
     """With checks far longer than delivery.push_yield_wait_s (30 min each here) and the default
     delivery.push_yield_restarts, an urgent approval arriving after the full head failed does not stop
-    the search: every check runs once, entry 6 is blamed, the rest land, and the urgent one, still
+    the search: every check runs once, entry 1 is blamed, the rest land, and the urgent one, still
     approved, lands first in the next batch."""
     from ttp import batch, pushq
     monkeypatch.setattr(batch.Batch, "_verdict_s", lambda self, left: left * 1800.0)
-    p, repo, origin, heads = _bad_sixth(env, monkeypatch, wait_s=None, restarts=None)
+    p, repo, origin, heads = _bad_first(env, monkeypatch, wait_s=None, restarts=None)
     ran = _approved_mid_search(p, monkeypatch, 1, 1)
     rc, m = _run_batch(p, _batch_marker(p, heads), monkeypatch)
-    assert rc == 0 and _statuses(m) == ["pushed"] * 5 + ["check_failed", "pushed", "pushed"], m
-    assert not m.get("yielded_to") and len(ran) == m["checks"]["runs"] == 5, m
+    assert rc == 0 and _statuses(m) == ["check_failed"] + ["pushed"] * 7, m
+    assert not m.get("yielded_to") and len(ran) == m["checks"]["runs"] == 6, m
     assert "after its next check once the search ends" in capsys.readouterr().out
     assert pushq.yields_to(p, "origin/proj") == [99], "the urgent one leads the next batch"
     hot = _entry(repo, "hot", {"plugins/p/hot.txt": "h\n"})
@@ -2099,20 +2137,20 @@ def test_an_urgent_approval_joins_a_long_search_instead_of_stopping_it(env, monk
 
 
 def test_a_stopped_search_hands_its_full_head_failure_to_the_next_batch(env, monkeypatch, capsys):
-    """A forced stop (delivery.push_yield_restarts 1) after the full head failed and prefix 4 passed:
-    entries 5-8 are requeued with that failure ("known_fail"), and the next batch of exactly them runs
-    no full-head check: prefixes 5-6 and 5, entry 6 blamed, then 7-8 without it (3 checks, not 4). The
-    same failure on another set of entries, or one entry alone, is checked as usual."""
+    """A forced stop (delivery.push_yield_restarts 1) after the full head and prefix 4 failed: all eight
+    entries are requeued with the full head's failure ("known_fail"), and the next batch of exactly them
+    runs no full-head check: prefixes 4, 2 and 1 and the tip, entry 1 blamed, then 2-8 without it (5
+    checks, not 6). The same failure on another set of entries, or one entry alone, is checked as usual."""
     from ttp import batch, push
     from ttp.project import write_json
-    p, repo, origin, heads = _bad_sixth(env, monkeypatch, wait_s=1e-9, restarts=1)
+    p, repo, origin, heads = _bad_first(env, monkeypatch, wait_s=1e-9, restarts=1)
     real, ran = batch.Batch._check, []
     _approved_mid_search(p, monkeypatch, 2, 1)
     rc, m = _run_batch(p, _batch_marker(p, heads), monkeypatch)
-    assert m["yielded_to"] == [99] and _statuses(m) == ["pushed"] * 4 + ["requeued"] * 4, m
-    kf = m["results"][4]["detail"]["known_fail"]
-    assert kf["heads"] == [[n, heads[n - 1]] for n in range(5, 9)] and kf["cmd"], kf
-    assert all(r["detail"]["known_fail"] == kf for r in m["results"][4:]), m
+    assert m["yielded_to"] == [99] and _statuses(m) == ["requeued"] * 8, m
+    kf = m["results"][0]["detail"]["known_fail"]
+    assert kf["heads"] == [[n, heads[n - 1]] for n in range(1, 9)] and kf["cmd"], kf
+    assert all(r["detail"]["known_fail"] == kf for r in m["results"]), m
     p.db.x("DELETE FROM push_queue WHERE id=99")
     monkeypatch.setattr(batch.Batch, "_check", lambda self, head, checks: ran.append(head) or real(self, head, checks))
 
@@ -2123,20 +2161,20 @@ def test_a_stopped_search_hands_its_full_head_failure_to_the_next_batch(env, mon
             e["id"] = n
         write_json(marker, {**mk, "known_fail": kf})
         return marker
-    rc, m2 = _run_batch(p, resumed("b2", [5, 6, 7, 8]), monkeypatch)
-    assert rc == 0 and _statuses(m2) == ["pushed", "check_failed", "pushed", "pushed"], m2
-    assert len(ran) == m2["checks"]["runs"] == 3, "no full-head check it already knew the result of"
+    rc, m2 = _run_batch(p, resumed("b2", list(range(1, 9))), monkeypatch)
+    assert rc == 0 and _statuses(m2) == ["check_failed"] + ["pushed"] * 7, m2
+    assert len(ran) == m2["checks"]["runs"] == 5, "no full-head check it already knew the result of"
     assert "the search resumes without checking it again" in capsys.readouterr().out
     b = batch.Batch.__new__(batch.Batch)
-    b.m, b.entries = {"known_fail": kf}, [{"id": n, "head": heads[n - 1]} for n in range(5, 9)]
-    assert b._known_fail([(i, "h") for i in range(4)]) == (kf["cmd"], kf["tail"])
-    assert b._known_fail([(i, "h") for i in range(3)]) is None, "another set of entries"
-    assert b._known_fail([(1, "h"), (0, "h"), (2, "h"), (3, "h")]) is None, "another order"
+    b.m, b.entries = {"known_fail": kf}, [{"id": n, "head": heads[n - 1]} for n in range(1, 9)]
+    assert b._known_fail([(i, "h") for i in range(8)]) == (kf["cmd"], kf["tail"])
+    assert b._known_fail([(i, "h") for i in range(7)]) is None, "another set of entries"
+    assert b._known_fail([(1, "h"), (0, "h")] + [(i, "h") for i in range(2, 8)]) is None, "another order"
     b.m = {"known_fail": {**kf, "heads": kf["heads"][:1]}}
     assert b._known_fail([(0, "h")]) is None, "one entry alone is checked on its tip"
     b.entries[0]["head"] = "f" * 40
     b.m = {"known_fail": kf}
-    assert b._known_fail([(i, "h") for i in range(4)]) is None, "a new head of an entry"
+    assert b._known_fail([(i, "h") for i in range(8)]) is None, "a new head of an entry"
 
 
 def test_a_batch_marker_carries_a_stopped_searchs_failure_only_for_its_own_rows(env, monkeypatch):
@@ -2164,22 +2202,22 @@ def test_a_batch_marker_carries_a_stopped_searchs_failure_only_for_its_own_rows(
 def test_the_restarts_an_urgent_approval_causes_are_capped(env, monkeypatch, cap, before, stops):
     """delivery.push_yield_restarts (default 0) caps how often one set of approvals has its search
     stopped for urgent ones: a batch whose rows were requeued that often already finishes its search
-    (entry 6 blamed). A search whose verdict is further off than delivery.push_yield_wait_s stops, and
+    (entry 1 blamed). A search whose verdict is further off than delivery.push_yield_wait_s stops, and
     its requeued entries carry the count up by one."""
     from ttp import push
     from ttp.project import write_json
-    p, repo, origin, heads = _bad_sixth(env, monkeypatch, wait_s=1e-9, restarts=cap)
+    p, repo, origin, heads = _bad_first(env, monkeypatch, wait_s=1e-9, restarts=cap)
     _approved_mid_search(p, monkeypatch, 2, 1)
     marker = _batch_marker(p, heads)
     if before:
         write_json(marker, {**push._read(marker), "restarts": before})
     rc, m = _run_batch(p, marker, monkeypatch)
-    assert rc == 0 and m["outcome"] == "pushed", m
+    assert rc == 0, m
     if stops:
-        assert _statuses(m) == ["pushed"] * 4 + ["requeued"] * 4 and m["yielded_to"] == [99], m
-        assert [(r["detail"]["yielded"], r["detail"]["restarts"]) for r in m["results"][4:]] == [(True, before + 1)] * 4, m
+        assert m["outcome"] == "yielded" and _statuses(m) == ["requeued"] * 8 and m["yielded_to"] == [99], m
+        assert [(r["detail"]["yielded"], r["detail"]["restarts"]) for r in m["results"]] == [(True, before + 1)] * 8, m
     else:
-        assert _statuses(m) == ["pushed"] * 5 + ["check_failed", "pushed", "pushed"] and not m.get("yielded_to"), m
+        assert m["outcome"] == "pushed" and _statuses(m) == ["check_failed"] + ["pushed"] * 7 and not m.get("yielded_to"), m
 
 
 def test_the_daily_audit_names_the_time_from_approval_to_landing(env, monkeypatch):
@@ -2198,31 +2236,74 @@ def test_the_daily_audit_names_the_time_from_approval_to_landing(env, monkeypatc
     assert "approval to landing: 4 landed" in "\n".join(audit.lines(s.p.db, now=now))
 
 
+def test_a_rescue_requeues_only_the_entries_that_build_on_the_blamed_one_and_lands_the_rest(env, monkeypatch, capsys):
+    """The first entry breaks the checks and the second is built on its branch: without it the second
+    would replay its commits, so only the second is requeued; the independent third and fourth are
+    replayed onto the tip without them, checked once and pushed (never all requeued for one dependent)."""
+    p, repo, origin, other = _bump_setup(env, monkeypatch, ["test ! -e plugins/p/bad.txt"])
+    e1 = _entry(repo, "e1", {"plugins/p/bad.txt": "1\n"})
+    _git_out(repo, "checkout", "-q", "-B", "e2", e1)
+    (repo / "plugins/p/f2.txt").write_text("2\n")
+    _git_out(repo, "add", "plugins/p/f2.txt")
+    _git_out(repo, "commit", "-qm", "e2: on e1")
+    e2 = _git_out(repo, "rev-parse", "HEAD")
+    heads = [e1, e2] + [_entry(repo, f"e{n}", {f"plugins/p/f{n}.txt": f"{n}\n"}) for n in (3, 4)]
+    rc, m = _run_batch(p, _batch_marker(p, heads), monkeypatch)
+    assert rc == 0 and m["outcome"] == "pushed", m
+    assert _statuses(m) == ["check_failed", "requeued", "pushed", "pushed"], m
+    assert [_git_out(origin, "show", f"proj:plugins/p/f{n}.txt") for n in (3, 4)] == ["3", "4"]
+    assert _git_out(origin, "ls-tree", "--name-only", "proj", "plugins/p/").split() == [
+        "plugins/p/.claude-plugin", "plugins/p/f3.txt", "plugins/p/f4.txt", "plugins/p/rt"], "neither e1 nor e2"
+    out = capsys.readouterr().out
+    assert "entry 2 after 1 does not replay without it; requeued" in out
+    assert "checking the 2 entries after 1 without it" in out
+
+
+def test_a_rescue_lands_a_later_entry_not_built_on_the_blamed_one(env, monkeypatch):
+    """The blamed entry is the first (a prefix that passed would have pushed at once, user msg #2317):
+    a later entry built on the tip only goes, alone or built on another such entry; one built on the
+    blamed one is requeued."""
+    p, repo, origin, other = _bump_setup(env, monkeypatch, ["test ! -e plugins/p/bad.txt"])
+
+    def on(parent, name, path):
+        _git_out(repo, "checkout", "-q", "-B", name, parent)
+        (repo / path).write_text(name + "\n")
+        _git_out(repo, "add", path)
+        _git_out(repo, "commit", "-qm", f"{name}: {path}")
+        return _git_out(repo, "rev-parse", "HEAD")
+    e1 = _entry(repo, "e1", {"plugins/p/bad.txt": "e1\n"})
+    e2 = _entry(repo, "e2", {"plugins/p/f2.txt": "e2\n"})
+    heads = [e1, e2, on(e2, "e3", "plugins/p/f3.txt"), on(e1, "e4", "plugins/p/f4.txt")]
+    rc, m = _run_batch(p, _batch_marker(p, heads), monkeypatch)
+    assert rc == 0 and _statuses(m) == ["check_failed", "pushed", "pushed", "requeued"], m
+    assert [_git_out(origin, "show", f"proj:plugins/p/f{n}.txt") for n in (2, 3)] == ["e2", "e3"]
+
+
 def test_the_entries_an_urgent_approval_stopped_a_search_for_are_searched_again_and_the_culprit_blamed(env, monkeypatch):
     """Blame stays right: the entries a search stopped for an urgent approval go in a later batch of
     their own (the urgent one is never among them), whose search blames the entry that broke the checks."""
     from ttp import batch
-    p, repo, origin, heads = _bad_sixth(env, monkeypatch)
+    p, repo, origin, heads = _bad_first(env, monkeypatch)
     _approved_mid_search(p, monkeypatch, 2, 1)
     rc, m = _run_batch(p, _batch_marker(p, heads), monkeypatch)
-    assert _statuses(m) == ["pushed"] * 4 + ["requeued"] * 4, m
+    assert _statuses(m) == ["requeued"] * 8, m
     p.db.x("DELETE FROM push_queue WHERE id=99")   # the urgent one went in its own batch
-    rc, m = _run_batch(p, _batch_marker(p, heads[4:], bid="b2"), monkeypatch)
-    assert rc == 0 and _statuses(m) == ["pushed", "check_failed", "pushed", "pushed"], m
-    assert m["results"][1]["id"] == 2 and not m.get("yielded_to"), "entry 6, and only it, is blamed"
+    rc, m = _run_batch(p, _batch_marker(p, heads, bid="b2"), monkeypatch)
+    assert rc == 0 and _statuses(m) == ["check_failed"] + ["pushed"] * 7, m
+    assert m["results"][0]["id"] == 1 and not m.get("yielded_to"), "entry 1, and only it, is blamed"
     assert batch.EXIT["yielded"] == 0
 
 
 @pytest.mark.parametrize("why", ["after_yield", "restarts", "yield_skip", "all_urgent", "skip_other_tip"])
 def test_a_batch_never_stops_its_search_for_an_urgent_approval_the_next_batch_would_not_take(env, monkeypatch, why):
     """No yield loop: a batch stops its search only for an urgent approval the queue takes next, alone.
-    It finishes its search (entry 6 blamed) when it carries entries a batch before it requeued for an
+    It finishes its search (entry 1 blamed) when it carries entries a batch before it requeued for an
     urgent one ("after_yield"), when the waiting one was already tried on the failing tip it searches on
     (pushq.due leaves those out while the tip is unchanged: "yield_skip"), or when every entry is urgent
     itself. A "yield_skip" for another tip does not apply: the search stops as before."""
     from ttp import push
     from ttp.project import write_json
-    p, repo, origin, heads = _bad_sixth(env, monkeypatch)
+    p, repo, origin, heads = _bad_first(env, monkeypatch)
     _approved_mid_search(p, monkeypatch, 2, 1)
     marker = _batch_marker(p, heads)
     m = push._read(marker)
@@ -2238,11 +2319,11 @@ def test_a_batch_never_stops_its_search_for_an_urgent_approval_the_next_batch_wo
             e["task"] = p.db.add_task(f"fix {e['id']}", "s", kind="code", origin="coordinator", priority=1)
     write_json(marker, m)
     rc, m = _run_batch(p, marker, monkeypatch)
-    assert rc == 0 and m["outcome"] == "pushed", m
+    assert rc == 0, m
     if why == "skip_other_tip":
-        assert _statuses(m) == ["pushed"] * 4 + ["requeued"] * 4 and m["yielded_to"] == [99], m
+        assert m["outcome"] == "yielded" and _statuses(m) == ["requeued"] * 8 and m["yielded_to"] == [99], m
     else:
-        assert _statuses(m) == ["pushed"] * 5 + ["check_failed", "pushed", "pushed"] and not m.get("yielded_to"), m
+        assert m["outcome"] == "pushed" and _statuses(m) == ["check_failed"] + ["pushed"] * 7 and not m.get("yielded_to"), m
 
 
 @pytest.mark.parametrize("detail,restarts", [({"yielded": True}, 1), ({"yielded": True, "restarts": 2}, 2),
@@ -2289,17 +2370,17 @@ def test_after_a_batch_stopped_its_search_the_urgent_approval_goes_alone_then_th
 @pytest.mark.parametrize("grace", [None, 0])
 def test_an_urgent_approval_past_the_yield_grace_never_stops_the_batch(env, monkeypatch, grace):
     """delivery.push_yield_grace_s: an urgent approval made within it of the batch's first check stops
-    the search (default 300 s); one made later never does, so the batch blames entry 6 and lands the rest."""
-    p, repo, origin, heads = _bad_sixth(env, monkeypatch)
+    the search (default 300 s); one made later never does, so the batch blames entry 1 and lands the rest."""
+    p, repo, origin, heads = _bad_first(env, monkeypatch)
     if grace is not None:
         p.set_config("delivery.push_yield_grace_s", grace)
     _approved_mid_search(p, monkeypatch, 2, 1)
     rc, m = _run_batch(p, _batch_marker(p, heads), monkeypatch)
-    assert rc == 0 and m["outcome"] == "pushed", m
+    assert rc == 0, m
     if grace is None:
-        assert _statuses(m) == ["pushed"] * 4 + ["requeued"] * 4 and m["yielded_to"] == [99], m
+        assert m["outcome"] == "yielded" and _statuses(m) == ["requeued"] * 8 and m["yielded_to"] == [99], m
     else:
-        assert _statuses(m) == ["pushed"] * 5 + ["check_failed", "pushed", "pushed"] and not m.get("yielded_to"), m
+        assert m["outcome"] == "pushed" and _statuses(m) == ["check_failed"] + ["pushed"] * 7 and not m.get("yielded_to"), m
 
 
 def test_a_stream_of_urgent_approvals_every_few_minutes_still_lets_a_batch_land(env, monkeypatch):
@@ -2307,7 +2388,7 @@ def test_a_stream_of_urgent_approvals_every_few_minutes_still_lets_a_batch_land(
     the default grace): none stops the batch, which finishes its search and lands every entry but the
     culprit; the urgent ones wait for the next batch."""
     from ttp import batch
-    p, repo, origin, heads = _bad_sixth(env, monkeypatch)
+    p, repo, origin, heads = _bad_first(env, monkeypatch)
     real, ran = batch.Batch._check, []
 
     def check(self, head, checks):
@@ -2322,8 +2403,8 @@ def test_a_stream_of_urgent_approvals_every_few_minutes_still_lets_a_batch_land(
     monkeypatch.setattr(batch.Batch, "_check", check)
     rc, m = _run_batch(p, _batch_marker(p, heads), monkeypatch)
     assert rc == 0 and m["outcome"] == "pushed" and not m.get("yielded_to"), m
-    assert _statuses(m) == ["pushed"] * 5 + ["check_failed", "pushed", "pushed"], m
-    assert len(ran) == 5, "the full head, three probes and the rescue: never cut short"
+    assert _statuses(m) == ["check_failed"] + ["pushed"] * 7, m
+    assert len(ran) == 6, "the full head, three probes, the tip and the rescue: never cut short"
 
 
 def test_after_a_stopped_search_its_own_urgent_entries_never_take_the_place_of_the_ones_it_stopped_for(env, monkeypatch):
@@ -3364,9 +3445,9 @@ def test_the_daemon_leaves_a_push_batch_marker_to_the_batch(env, monkeypatch):
 
 
 @pytest.mark.parametrize("names, fresh, want, runs, tried", [
-    (["fix", "e2", "bad"], 1, ["pushed", "pushed", "check_failed"], 4, None),   # fixing prefix passes; search above
-    (["fix", "e2", "bad"], 3, ["pushed", "pushed", "check_failed"], 4, None),   # all untried: search the whole batch
-    (["fix", "bad", "e3"], 2, ["pushed", "check_failed", "pushed"], 4, None),    # the breaker is in the untried prefix
+    (["fix", "e2", "bad"], 1, ["pushed", "requeued", "requeued"], 2, None),     # fixing prefix passes: it goes at once
+    (["fix", "e2", "bad"], 3, ["pushed", "requeued", "requeued"], 2, None),     # all untried: search the whole batch
+    (["fix", "bad", "e3"], 2, ["pushed", "requeued", "requeued"], 3, None),     # the breaker is in the untried prefix
     (["e1", "fix", "bad"], 3, ["requeued"] * 3, 2, [1]),    # prefix 1 fails: only entry 1 is shown not to fix it
     (["e1", "e2"], 2, ["requeued", "requeued"], 2, [1]),                       # all untried, none fixes it
     (["e1", "fix"], 2, ["pushed", "pushed"], 1, None),                         # tip with the batch passes: it goes
@@ -3376,9 +3457,9 @@ def test_the_daemon_leaves_a_push_batch_marker_to_the_batch(env, monkeypatch):
 def test_a_push_batch_on_a_known_failing_tip_never_checks_it_alone_and_pushes_a_fix(env, monkeypatch, capsys, names,
                                                                                      fresh, want, runs, tried):
     """A tip the queue knows fails on its own (marker "bad_tip") is not checked alone again. The tip with
-    the batch, and the tip with the entries not yet tried on it, are; an entry that fixes the tip goes,
-    with the ones after it up to the first that breaks the checks. A batch that ends at prefix 1 failing
-    names only the entries it showed do not fix the tip ("tip_tried"): a fix after them stays untried."""
+    the batch, and the tip with the entries not yet tried on it, are; an entry that fixes the tip goes
+    as the first prefix that passes, at once (user msg #2317), the rest in the next train. A batch that
+    ends at prefix 1 failing names only the entries it showed do not fix the tip ("tip_tried"): a fix after them stays untried."""
     from ttp.project import write_json
     from ttp import push
     log = env["tmp"] / "checks.log"
@@ -3537,7 +3618,8 @@ def test_a_batch_is_due_after_the_window_at_the_cap_for_priority_one_or_with_no_
     s.p.db.x("DELETE FROM push_queue WHERE id IN (?,?,?)", (*first, later[0]))
     urgent = _pq_review(s, priority=1)[1]
     rows, why = pushq.due(s.p, now)
-    assert [r["id"] for r in rows] == [urgent] and "priority 1-2" in why, "priority 1 goes alone, ahead of routine ones"
+    assert [r["id"] for r in rows] == [urgent, later[1]] and "priority 1-2" in why and "1 more ride" in why, \
+        "priority 1 starts a train at once and leads it; the waiting routine one rides in it"
     s.p.db.x("DELETE FROM push_queue WHERE id=?", (urgent,))
     assert pushq.due(s.p, now)[0] == []
     s.p.db.update_task(s.review, status="done")
@@ -3562,7 +3644,8 @@ def test_a_batch_waits_push_min_gap_s_after_the_last_one_ended_unless_full_or_pr
     assert [r["id"] for r in pushq.due(s.p, now + 10 ** 6)[0]] == rows
     rows.append(_pq_review(s, priority=1)[1])
     got, why = pushq.due(s.p, now)
-    assert [r["id"] for r in got] == rows[1:] and "1 an urgent review" in why, "an urgent approval starts at once, alone"
+    assert [r["id"] for r in got] == rows[::-1] and "1 an urgent review" in why, \
+        "an urgent approval starts a train at once and leads it"
     s.p.db.x("DELETE FROM push_queue WHERE id=?", (rows.pop(),))
     rows += [_pq_review(s)[1], _pq_review(s)[1]]
     got, why = pushq.due(s.p, now)
@@ -3647,9 +3730,10 @@ def _pq_alone(s, name, priority=3, text=None):
     return row
 
 
-def test_an_independent_approval_goes_alone_at_once_through_the_gap_and_the_window(env, monkeypatch):
+def test_an_independent_approval_starts_a_train_at_once_through_the_gap_and_the_window(env, monkeypatch):
     """user msg #1221: an approval sharing no file with an earlier unlanded one, or of priority 1-2, starts a
-    batch of its own at once; routine ones that overlap still wait the gap (here 1200 s) or the window."""
+    train at once through the gap (here 1200 s) and the window, and leads it; every routine approval rides in
+    it (one train, user msg #2220). With no fast one the routine ones still wait the gap."""
     from ttp import pushq
     s = _pq(env, monkeypatch, push_batch_s=900)
     s.p.db.update_task(s.review, status="running")   # a review is at work: routine approvals wait for it
@@ -3660,14 +3744,15 @@ def test_an_independent_approval_goes_alone_at_once_through_the_gap_and_the_wind
     assert pushq.due(s.p, now) == ([], "1200 s left of the 1800 s gap since the last batch ended")
     alone = _pq_alone(s, "other.txt")
     got, why = pushq.due(s.p, now)
-    assert [r["id"] for r in got] == [alone] and "share no file with an earlier unlanded one" in why, why
+    assert [r["id"] for r in got] == [alone, routine] and "share no file with an earlier unlanded one" in why \
+        and "1 more ride in the train" in why, why
     stacked = _pq_alone(s, "feature.txt", text="another feature\n")   # same file as the earlier ones
     assert pushq.fast_ids(s.p, pushq._approved(s.p.db, "origin/proj"),
                           pushq._tracking_tip(s.p, "origin", "proj")) == {alone}, "overlap never goes fast"
     p2 = _pq_alone(s, "feature.txt", priority=2, text="a p2 fix\n")
     got, why = pushq.due(s.p, now)
-    assert [r["id"] for r in got] == [p2, alone] and "priority 1-2" in why, "priority first; routine ones wait"
-    assert routine not in {r["id"] for r in got} and stacked not in {r["id"] for r in got}
+    assert [r["id"] for r in got] == [p2, alone, routine, stacked] and "priority 1-2" in why, \
+        "priority first, then the independent one; the routine ones ride in the train"
     tip = pushq._tracking_tip(s.p, "origin", "proj")
     assert alone not in pushq.fast_ids(s.p, pushq._approved(s.p.db, "origin/proj"), tip, skip={alone}), \
         "an approval already tried on a failing tip is never fast"
@@ -3676,9 +3761,8 @@ def test_an_independent_approval_goes_alone_at_once_through_the_gap_and_the_wind
 
 
 def test_a_priority_one_approval_in_a_backlog_of_twenty_goes_in_the_next_batch_and_leads_it(env, monkeypatch):
-    """A backlog bigger than push_batch_max grows the batch after a clean one (up to BATCH_GROW times it),
-    and a priority 1-2 approval leads it whatever its age; after a batch that did not end clean the cap
-    stays push_batch_max, and the priority 1 one still leads."""
+    """One train takes the whole backlog, clean last batch or not (push_batch_max caps none), and a
+    priority 1-2 approval leads it whatever its age."""
     from ttp import pushq
     s = _pq(env, monkeypatch, push_batch_s=0, push_batch_max=4)
     s.p.db.update_task(s.review, status="done")
@@ -3688,11 +3772,11 @@ def test_a_priority_one_approval_in_a_backlog_of_twenty_goes_in_the_next_batch_a
     routine = [_pq_review(s)[1] for _ in range(19)]
     hot = _pq_review(s, priority=1)[1]
     got, why = pushq.due(s.p, now)
-    assert [r["id"] for r in got] == [hot] + routine[:4 * pushq.BATCH_GROW - 1], why
+    assert [r["id"] for r in got] == [hot] + routine, why
     s.p.db.x("UPDATE push_batches SET outcome='died', ended=?, finalized=?, after_finalized=?",
              (now - 4000, now - 4000, now - 4000))
     got, why = pushq.due(s.p, now)
-    assert [r["id"] for r in got] == [hot] + routine[:3], "no growth after a batch that did not end clean"
+    assert [r["id"] for r in got] == [hot] + routine, "the whole backlog after a batch that did not end clean too"
 
 
 def test_an_approval_sent_back_by_a_conflict_leads_its_priority_in_the_next_batch(env, monkeypatch):
@@ -3715,6 +3799,54 @@ def test_an_approval_sent_back_by_a_conflict_leads_its_priority_in_the_next_batc
                  (task, s.branch, s.head, "origin/proj", status, now - 600, now - 300))
     got, why = pushq.due(s.p, now)
     assert [r["id"] for r in got] == [hot, back, *older, carried], why
+
+
+def test_a_stream_of_priority_two_approvals_cannot_keep_an_old_priority_three_one_out_of_batches(env, monkeypatch):
+    """#6857: priority 3-4 approvals waited about 10.7 h while priority 1-2 approvals refilled every batch.
+    One train (#2220) takes every approval due, so the stream never keeps it out; delivery.push_age_s
+    ages it one priority per period waited, never past priority 2: once it reaches the priority-2 lane
+    it is older than the stream and leads the train; priority 1 still goes first."""
+    from ttp import pushq
+    s = _pq(env, monkeypatch, push_batch_s=0, push_batch_max=2, push_age_s=3600)
+    s.p.db.update_task(s.review, status="done")
+    now = time.time() + 1
+    _pq_last_batch(s, "tip_failed", now - 4000)   # past the gap; not clean, so the cap stays 2
+    _pq_earlier(s)                                # none independent: only priority and age decide
+    old = _pq_review(s, priority=3)[1]
+    s.p.db.x("UPDATE push_queue SET created=? WHERE id=?", (now, old))
+    for k in range(6):   # every 20 min two more priority-2 approvals arrive; each train takes them all
+        t = now + 1200 * k
+        for _ in range(2):
+            s.p.db.x("UPDATE push_queue SET created=? WHERE id=?", (t, _pq_review(s, priority=2)[1]))
+        got = [r["id"] for r in pushq.due(s.p, t)[0]]
+        assert old in got and len(got) == 3, "one train: the old approval rides with the stream"
+        assert (got[0] == old) == (k >= 3), "aged to priority 2 once it waited push_age_s, it leads the train"
+        s.p.db.x(f"DELETE FROM push_queue WHERE id IN ({','.join('?' * len(got))}) AND id != ?", (*got, old))
+    # Priority 1 (urgent) still goes first: an aged approval never passes priority 2.
+    s.p.db.x("UPDATE push_queue SET created=? WHERE id=?", (now - 10 * 3600, old))
+    hot = _pq_review(s, priority=1)[1]
+    got = [r["id"] for r in pushq.due(s.p, now)[0]]
+    assert got == [hot, old], got
+    assert [r["aged_priority"] for r in pushq._approved(s.p.db, "origin/proj", now, 3600)][:2] == [1, 2]
+    # Priority 4 needs two periods; push_age_s 0 turns aging off.
+    s.p.db.x("DELETE FROM push_queue WHERE id IN (?,?)", (hot, old))
+    four = _pq_review(s, priority=4)[1]
+    for age, rank in ((3599, 4), (3600, 3), (7200, 2), (10 ** 6, 2)):
+        s.p.db.x("UPDATE push_queue SET created=? WHERE id=?", (now - age, four))
+        [r] = [r for r in pushq._approved(s.p.db, "origin/proj", now, 3600) if r["id"] == four]
+        assert (r["priority"], r["aged_priority"]) == (4, rank), age
+        assert (pushq._prio(r) <= pushq.FAST_PRIORITY) == (rank == 2)
+    [r] = [r for r in pushq._approved(s.p.db, "origin/proj", now, 0) if r["id"] == four]
+    assert r["aged_priority"] == 4, "push_age_s 0: no aging"
+    s.p.db.x("UPDATE push_queue SET created=? WHERE id=?", (now + 7200, four))   # a clock step back
+    [r] = [r for r in pushq._approved(s.p.db, "origin/proj", now, 3600) if r["id"] == four]
+    assert r["aged_priority"] == 4, "a future approval time never makes it worse or better"
+    s.p.set_config("delivery.push_age_s", 0)
+    s.p.db.x("UPDATE push_queue SET created=? WHERE id=?", (now - 10 ** 6, four))
+    two = _pq_review(s, priority=2)[1]
+    s.p.db.x("UPDATE push_queue SET created=? WHERE id=?", (now, two))
+    got = [r["id"] for r in pushq.due(s.p, now)[0]]
+    assert got == [two, four], "off: no aging, it still rides in the train, behind the priority-2 approval"
 
 
 def test_an_approval_sent_back_by_a_conflict_keeps_its_lead_over_an_older_peer_sharing_its_files(env, monkeypatch):
@@ -3742,12 +3874,12 @@ def test_an_approval_sent_back_by_a_conflict_keeps_its_lead_over_an_older_peer_s
     got, why = pushq.due(s.p, now)
     assert [r["id"] for r in got] == [other, back], "_one_solo: the sent-back head leads, the peer waits"
     s.p.set_config("delivery.push_solo_paths", [])
-    s.p.db.update_task(s.review, status="running")   # the wait path sends only fast rows: never the peer
+    s.p.db.update_task(s.review, status="running")   # the wait path: the fast row leads, the peer stays behind
     s.p.db.x("DELETE FROM push_batches")
     _pq_last_batch(s, "tip_failed", now - 1)
     s.p.set_config("delivery.push_batch_s", 900)
     got, why = pushq.due(s.p, now)
-    assert [r["id"] for r in got] == [other], why
+    assert [r["id"] for r in got] == [other, back, peer], why
 
 
 def test_approvals_that_waited_out_the_last_batch_start_the_next_at_once(env, monkeypatch):
@@ -3768,15 +3900,34 @@ def test_approvals_that_waited_out_the_last_batch_start_the_next_at_once(env, mo
     assert got == [] and "waiting for more approvals" in why, "approved after the batch: the window applies"
 
 
-def test_batch_max_still_caps_a_batch_started_at_once(env, monkeypatch):
+def test_one_train_takes_every_approval_and_push_batch_max_only_starts_one(env, monkeypatch):
+    """Rule 1 of the one train (user msg #2220): every approval due at a train's start is in it;
+    delivery.push_batch_max (kept for compatibility) starts one at once and caps nothing."""
     from ttp import pushq
-    s = _pq(env, monkeypatch, push_batch_max=2)
-    s.p.db.update_task(s.review, status="done")
+    s = _pq(env, monkeypatch, push_batch_max=2, push_batch_s=10 ** 6)
+    s.p.db.update_task(s.review, status="running")
     _pq_last_batch(s, "pushed", time.time() - 60)
     _pq_earlier(s)
-    rows = [_pq_review(s)[1] for _ in range(2 * pushq.BATCH_GROW + 1)]
+    rows = [_pq_review(s)[1] for _ in range(7)]
     got, why = pushq.due(s.p)
-    assert [r["id"] for r in got] == rows[:2 * pushq.BATCH_GROW], "a backlog grows it up to BATCH_GROW times the max"
+    assert [r["id"] for r in got] == rows and "7 approvals" in why, why
+
+
+def test_approvals_that_waited_out_a_failed_train_start_the_next_as_it_ends(env, monkeypatch):
+    """Rule 1: approvals that arrived while a train ran join the next, which starts as soon as that
+    train ends, with no push_min_gap_s wait even when it did not end clean; one approved after it
+    still waits the gap."""
+    from ttp import pushq
+    s = _pq(env, monkeypatch, push_batch_s=0, push_min_gap_s=1800)
+    now = time.time()
+    _pq_last_batch(s, "tip_failed", now + 5)   # freed in 5 s: the approval below waited it out
+    _pq_earlier(s)
+    rid = _pq_review(s)[1]
+    got, why = pushq.due(s.p, now + 10)
+    assert [r["id"] for r in got] == [rid] and "waited out b1" in why, why
+    s.p.db.x("UPDATE push_batches SET ended=?, finalized=?, after_finalized=?", (now - 60, now - 60, now - 60))
+    got, why = pushq.due(s.p, now + 10)
+    assert got == [] and "gap" in why, why
 
 
 def test_the_next_batch_waits_for_the_last_ones_after_push_deploy(env, monkeypatch):
@@ -4344,8 +4495,8 @@ def test_a_tip_failing_only_where_the_queue_checks_it_stops_being_retried_and_a_
     """Replays a push branch tip whose checks fail only in the batch's own checkout (a path-dependent
     failure: they passed in the task's worktree) while more approvals wait than a batch takes. After
     TIP_FAILS tip_failed batches on that tip, one keyed alert is raised and the approvals already tried
-    on it wait, not run again and again. A new approval goes first; the tip with it passes, so it is
-    pushed, which clears the alert, and the waiting approval then lands on the fixed tip."""
+    on it wait, not run again and again. A new approval starts a train and leads it, the waiting approval
+    rides in it (one train); the tip with the fix passes, so both are pushed, which clears the alert."""
     from ttp import alerts, pushq
     check = 'case "$(pwd -P)" in */push) test -e fix.txt ;; esac'
     s = _pq_real(env, monkeypatch, push_min_gap_s=0, push_batch_max=1, push_checks=[check])
@@ -4371,16 +4522,14 @@ def test_a_tip_failing_only_where_the_queue_checks_it_stops_being_retried_and_a_
                       depends_on=[code])
     _pq_hand_off(env, s, task=fix, push=[{"branch": branch, "head": _git_out(path, "rev-parse", "HEAD")}])
     rows, why = pushq.due(s.p, time.time() + 60)
-    assert [r["task"] for r in rows] == [fix], why
+    assert [r["task"] for r in rows] == [fix, s.review], why
     bid = _pq_batch(s)
     m = json.loads((s.p.state / "pushes" / f"{bid}.json").read_text())
-    assert m["bad_tip"] == {"tip": tip, "fresh": 1, "cmd": check}, m
+    assert m["bad_tip"] == {"tip": tip, "fresh": 1, "cmd": check, "ids": []}, m
     assert m["outcome"] == "pushed" and m["checks"]["runs"] == 1, log(bid)
     _pq_tend(s)
     assert db.task(fix)["status"] == "done" and _git_out(s.origin, "show", "proj:fix.txt") == "fix"
     assert "bad_tip" not in db.kv("push_queue") and not alerts.holds(db, pushq.BAD_TIP_ALERT, 0, time.time())
-    bid = _pq_batch(s)
-    _pq_tend(s)
     assert db.task(s.review)["status"] == "done", log(bid)
     assert len(alerted()) == 1
 
@@ -4388,7 +4537,8 @@ def test_a_tip_failing_only_where_the_queue_checks_it_stops_being_retried_and_a_
 def test_a_fix_behind_an_entry_that_does_not_fix_a_known_failing_tip_lands_in_the_next_batch(env, monkeypatch):
     """On a known-bad tip, a batch [e1, fix, bad] fails at prefix 1 and ends tip_failed. Only e1 is then
     tried on that tip: fix and bad stay untried, go first in the next batch at once (not held), and that
-    batch pushes fix, blames bad, and pushes e1 too once it passes on the fixed tip without bad."""
+    batch pushes fix as soon as it passes (user msg #2317); e1 and bad go at once in the train after it,
+    which pushes e1 as it passes on the fixed tip, and the train after that blames bad."""
     from ttp import pushq
     s = _pq_real(env, monkeypatch, push_min_gap_s=0, push_batch_max=3,
                  push_checks=["test ! -e broken.txt || test -e fix.txt", "test ! -e bad.txt"])
@@ -4418,11 +4568,23 @@ def test_a_fix_behind_an_entry_that_does_not_fix_a_known_failing_tip_lands_in_th
     assert [r["task"] for r in rows] == [tasks["fix"], tasks["bad"], s.review], why
     bid = _pq_batch(s)
     m = json.loads((s.p.state / "pushes" / f"{bid}.json").read_text())
-    assert m["outcome"] == "pushed" and _statuses(m) == ["pushed", "check_failed", "pushed"], log(bid)
+    assert m["outcome"] == "pushed" and _statuses(m) == ["pushed", "requeued", "requeued"], log(bid)
+    assert "the other 2 go in the next train" in log(bid), "fix passed: it goes at once (user msg #2317)"
     _pq_tend(s)
     assert _git_out(s.origin, "show", "proj:fix.txt") == "fix" and "bad_tip" not in db.kv("push_queue")
-    assert db.task(tasks["fix"])["status"] == "done" and db.task(tasks["bad"])["status"] != "done"
+    assert db.task(tasks["fix"])["status"] == "done"
+    rows, why = pushq.due(s.p, time.time() + 60)
+    assert [r["task"] for r in rows] == [s.review, tasks["bad"]], "the next train, on the fixed tip, at once"
+    bid = _pq_batch(s)
+    m = json.loads((s.p.state / "pushes" / f"{bid}.json").read_text())
+    assert m["outcome"] == "pushed" and _statuses(m) == ["pushed", "requeued"], log(bid)
+    _pq_tend(s)
     assert db.task(s.review)["status"] == "done", log(bid)
+    bid = _pq_batch(s)
+    m = json.loads((s.p.state / "pushes" / f"{bid}.json").read_text())
+    assert _statuses(m) == ["check_failed"], log(bid)
+    _pq_tend(s)
+    assert db.task(tasks["bad"])["status"] != "done"
 
 
 def test_a_failing_push_tip_is_forgotten_once_the_branch_moves(env, monkeypatch):
@@ -7222,6 +7384,23 @@ def test_a_daemon_queued_review_names_the_rejected_commits_its_head_carries(env,
     assert added and "unreviewed commits" not in s.p.db.task(rid)["spec"]
 
 
+def test_no_daemon_review_is_queued_while_an_open_task_re_lands_the_change(env, monkeypatch):
+    """#29 (Review #6) was queued after #27 was cancelled while #28 "Rebase #6's integration ..."
+    re-landed #6, whose own review covers it. While such a task is open no review is queued; once it
+    is cancelled the change gets its review again."""
+    from ttp.daemon import Daemon
+    s = _pq(env, monkeypatch)
+    monkeypatch.setattr(Daemon, "_precheck", lambda self, task, head: None)
+    c, _, _, _ = _pq_stacked(s, "relanded")
+    redo = s.p.db.add_task(f"Rebase #{c}'s integration onto the push branch", "Rebase it.",
+                           kind="code", status="queued")
+    d = Daemon(s.p.base)
+    assert d._auto_review(s.p.db.task(c), "made the change") is None
+    s.p.db.update_task(redo, status="cancelled")
+    rid, added = d._auto_review(s.p.db.task(c), "made the change")
+    assert added and rid
+
+
 def _held_review(env, monkeypatch, fix_status="queued", s=None, name="rejected"):
     """A code task stacked on a rejected one (#x, review failed) whose fix is `fix_status`, and the
     daemon's review of it: (s, daemon, x, fix, review id). With `s`, in that _pq project."""
@@ -7857,6 +8036,17 @@ def test_batch_inherited_takes_only_the_named_fd(env, tmp_path, monkeypatch):
         os.close(mine)
 
 
+def test_ttp_checks_records_its_wall_and_cpu_seconds(env, tmp_path, monkeypatch, capsys):
+    """User msg #2220 (#2221): each checks run records its wall and CPU seconds (its check commands' CPU
+    included) in checks.json, so `ttp stats` can show CPU-hours per landed change."""
+    from ttp import cli
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    burn = "python3 -c 'import time; t=time.process_time()\nwhile time.process_time()-t<0.3: pass'"
+    cli.main(["checks", "--fresh", "--", burn])
+    rec = json.loads((run / "checks.json").read_text())
+    assert rec["passed"] and rec["cpu_s"] >= 0.3 and rec["wall_s"] >= rec["cpu_s"] - 0.5, rec
+
+
 def test_ttp_checks_drops_an_extra_command_the_project_checks_already_run(env, tmp_path, monkeypatch, capsys):
     from ttp import cli, push
     p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
@@ -8167,6 +8357,120 @@ def test_missing_program_resolves_the_program_a_launcher_runs_in_the_checks_env(
                 "mkdir -p x && mylint"):
         assert envfault.missing_program(cmd, tmp_path, off) == "", cmd
     assert envfault.missing_program("true && mylint", tmp_path, off) == "mylint"   # past a builtin
+
+
+def test_checks_wrap_cmd_scoped_to_its_repos_wraps_only_their_checks(env, tmp_path, monkeypatch, capsys):
+    """A wrapper scoped to the repositories it serves ({"cmd", "repos"}) wraps only their checks: a check in
+    another repository runs unwrapped and says so; a plain string still wraps every repository."""
+    from ttp import cli, project, push
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    log = tmp_path / "wrap.log"
+    wrapper = str(_arg_logging_wrapper(tmp_path / "lock.sh", log))
+    calls = lambda: log.read_text().splitlines().count("CALL") if log.exists() else 0
+    tree = subprocess.run([*git, "worktree", "add", "-q", "-b", "side", str(tmp_path / "side")], capture_output=True)
+    assert tree.returncode == 0, tree.stderr
+    # Scoped by folder name, by absolute path, by a path relative to the project root, or a list mixing them.
+    for repos in ("work", [str(repo)], [os.path.relpath(repo, p.root)], ["other", "work"]):
+        p.set_config("checks.wrap_cmd", {"cmd": wrapper, "repos": repos})
+        before = calls()
+        cli.main(["checks", "--fresh", "--", "true"])
+        assert calls() == before + 1, repos
+        assert "run behind checks.wrap_cmd" in capsys.readouterr().out
+    # A worktree of a named repository is that repository.
+    monkeypatch.chdir(tmp_path / "side")
+    before = calls()
+    cli.main(["checks", "--fresh", "--", "true"])
+    assert calls() == before + 1
+    monkeypatch.chdir(repo)
+    # Another repository's checks run unwrapped, even when the wrapper is missing.
+    for cmd in (wrapper, str(tmp_path / "nope.sh")):
+        p.set_config("checks.wrap_cmd", {"cmd": cmd, "repos": ["other-repo", str(tmp_path / "elsewhere")]})
+        capsys.readouterr()
+        before = calls()
+        cli.main(["checks", "--fresh", "--", "true"])
+        assert calls() == before and "scoped to other repositories" in capsys.readouterr().out
+        assert json.loads((run / "checks.json").read_text())["passed"] is True
+    # A plain string applies everywhere, as before.
+    p.set_config("checks.wrap_cmd", wrapper)
+    before = calls()
+    cli.main(["checks", "--fresh", "--", "true"])
+    assert calls() == before + 1
+    # Without a repository: the wrapper itself (its lock's identity), whatever its scope.
+    scoped = {"checks": {"wrap_cmd": {"cmd": "w --x", "repos": "work"}}}
+    assert push.wrap_of(scoped) == ("w", "--x") and push.wrap_of(scoped, repo, p) == ("w", "--x")
+    assert push.wrap_of(scoped, tmp_path, p) == ()
+    assert push.wrap_of({"checks": {"wrap_cmd": "w"}}, tmp_path, p) == ("w",)
+    # Malformed maps are refused by the config check, naming the key.
+    for bad in ({"cmd": "w"}, {"cmd": "w", "repos": []}, {"cmd": "w", "repos": [""]}, {"cmd": "", "repos": ["a"]},
+                {"cmd": "'unclosed", "repos": ["a"]}, {"cmd": "w", "repos": ["a"], "lane": "x"}, {"repos": ["a"]}):
+        assert any("checks.wrap_cmd" in x for x in project.config_problems({"checks": {"wrap_cmd": bad}})), bad
+    assert not [x for x in project.config_problems({"checks": {"wrap_cmd": {"cmd": "w", "repos": ["a"]}}})
+                if "wrap" in x]
+
+
+def test_push_own_runs_extras_unwrapped_in_a_repository_the_scoped_wrapper_does_not_serve(
+        env, monkeypatch, capsys, tmp_path):
+    p, repo, origin, other = _push_setup(env, monkeypatch, [COND])
+    run = tmp_path / "run"
+    run.mkdir()
+    monkeypatch.setenv("TTP_RUN_DIR", str(run))
+    monkeypatch.setenv("TTP_TASK", "60")
+    _git_out(repo, "checkout", "-q", "-b", "ttp/t60-exp")
+    _commit(repo, "mine.dat", "mine\n")
+    head = _git_out(repo, "rev-parse", "HEAD")
+    (run / "checks.json").write_text(json.dumps({"head": head, "passed": True, "commands": ["true"],
+                                                 "skipped": [], "ts": 0}))
+    # A missing wrapper scoped to another repository is not this one's: the extras run, unwrapped.
+    p.set_config("checks.wrap_cmd", {"cmd": str(tmp_path / "nope.sh"), "repos": ["not-this-repo"]})
+    assert _ttp("push", "--own") == 0
+    assert _git_out(origin, "rev-parse", "ttp/t60-exp") == head
+    # Scoped to this repository: it applies (a missing one fails, never runs unwrapped).
+    _commit(repo, "more.dat", "more\n")
+    head = _git_out(repo, "rev-parse", "HEAD")
+    (run / "checks.json").write_text(json.dumps({"head": head, "passed": True, "commands": ["true"],
+                                                 "skipped": [], "ts": 0}))
+    p.set_config("checks.wrap_cmd", {"cmd": str(tmp_path / "nope.sh"), "repos": [str(repo)]})
+    capsys.readouterr()
+    assert _ttp("push", "--own") == 4 and "checks.wrap_cmd" in capsys.readouterr().err
+
+
+def test_a_wrapped_check_the_wall_cap_stops_before_any_test_started_is_a_queue_timeout_not_a_failure(
+        env, tmp_path, monkeypatch, capsys):
+    from ttp import checkwall, cli
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    monkeypatch.setenv("TTP_TASK", "7")
+    p.set_config("checks.wall_cap_s", 2)
+    queue = tmp_path / "queue.sh"   # a wrapper that only says where it waits in its queue
+    queue.write_text('#!/bin/sh\nwhile :; do echo "waiting in the queue, position 8"; sleep 0.2; done\n')
+    queue.chmod(0o755)
+    p.set_config("checks.wrap_cmd", str(queue))
+    with pytest.raises(SystemExit) as e:
+        cli.main(["checks", "--", "true"])
+    err = capsys.readouterr().err
+    assert e.value.code == 75, err
+    assert "before any test started: a wrapper or queue timeout, not a test failure" in err, err
+    rec = json.loads((run / "checks.json").read_text())
+    assert rec["passed"] is False and rec["infra_fault"] == checkwall.QUEUED_INFRA and rec["timed_out"]["queued"]
+    assert checkwall.last_timeout(p.state, "7")["queued"]
+    # A wrapped check whose tests had started is a plain timeout of the run (exit 1), never a queue timeout.
+    started = tmp_path / "started.sh"
+    started.write_text('#!/bin/sh\necho "============ test session starts ============"\nexec sleep 300\n')
+    started.chmod(0o755)
+    p.set_config("checks.wrap_cmd", str(started))
+    with pytest.raises(SystemExit) as e:
+        cli.main(["checks", "--fresh", "--", "true"])
+    err = capsys.readouterr().err
+    assert e.value.code == 1 and "a wrapper or queue timeout" not in err, err
+    assert "queued" not in json.loads((run / "checks.json").read_text())["timed_out"]
+    # An unwrapped check stopped at the cap with no output is a plain timeout too.
+    p.set_config("checks.wrap_cmd", "")
+    with pytest.raises(SystemExit) as e:
+        cli.main(["checks", "--fresh", "--", "sleep 300"])
+    assert e.value.code == 1 and "a wrapper or queue timeout" not in capsys.readouterr().err
+    # What counts as a test start: a runner header, collection or a verdict; a queue's own words do not.
+    assert checkwall.test_started("collected 3 items\n") and checkwall.test_started("1 passed in 0.1s\n")
+    assert checkwall.test_started("1..4\nok 1\n")
+    assert not checkwall.test_started("waiting in the queue, position 8\nno verdict yet\n")
 
 
 def test_push_own_reruns_recorded_extras_behind_checks_wrap_cmd(env, monkeypatch, capsys, tmp_path):
@@ -12350,7 +12654,8 @@ def test_push_solo_paths_is_off_by_default_and_when_set_holds_a_routine_change_o
     """Prompt changes that fit a size cap alone but not together are found by the batch's cap probes, so
     by default a batch takes every prompt change. Set, delivery.push_solo_paths lets a batch take at most
     one routine approval touching it: the oldest leads the next batch, newer ones of a better priority
-    never pass it, and priority 1-2 ones are never held."""
+    never pass it, and priority 1-2 ones are never held. An approval aged to priority 2 (push_age_s; every
+    one here, 10**6 s on) is still held by its own priority, and leads the next batch after them."""
     from ttp import pushq
     s = _pq(env, monkeypatch, push_batch_max=3)
     _git_out(s.repo, "fetch", "-q", "origin")
@@ -12381,7 +12686,8 @@ def test_push_solo_paths_is_off_by_default_and_when_set_holds_a_routine_change_o
     assert [r["id"] for r in rows][:3] == [e, f, c] and g not in [r["id"] for r in rows], \
         "the held one leads the routine part of the next batch, after the fast ones; newer routine ones wait"
     s.p.set_config("delivery.push_solo_paths", [])
-    assert [r["id"] for r in pushq.due(s.p, time.time() + 10 ** 6)[0]] == [e, f, c, g]
+    assert [r["id"] for r in pushq.due(s.p, time.time() + 10 ** 6)[0]] == [e, c, f, g], \
+        "off: none held; aged to priority 2 (delivery.push_age_s), c is older than f and leads it"
 
 
 def test_cap_failure_reads_only_a_complete_list_of_prompt_cap_test_failures_and_their_overshoots():
@@ -12582,6 +12888,56 @@ def test_own_push_existing_only_refusal_of_another_tasks_branch_names_the_own_br
     assert _git_out(origin, "rev-parse", mine) == _git_out(repo, "rev-parse", "HEAD")
 
 
+def test_own_push_refusals_of_a_work_task_name_the_pr_branch_route(env, monkeypatch, capsys):
+    """A reported case, replayed: a work task told to push another task's ttp/t<id>-... branch was
+    refused by `ttp push --own` with text naming no route (only the push queue, or 'only this task's own
+    branch'). Each refusal now names the supported one: hand off blocked, and the coordinator adds a
+    task whose spec has a `pr_branch: <branch>` line. With that line, --own still fast-forwards the
+    existing branch; no branch is created on the way."""
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    p.set_config("delivery.own_push", None)
+    first = p.db.add_task("Fold the peak", "s", kind="code")
+    theirs = f"ttp/t{first}-fold-the-peak"
+    p.db.update_task(first, status="running", branch=theirs)
+    w = p.db.add_task("Push the fold", f"Fast-forward {theirs} to the tested commit and push the branch.",
+                     kind="work")
+    mine = f"ttp/t{w}-push-the-fold"
+    p.db.update_task(w, status="running", branch=mine)
+    heads = lambda: _git_out(origin, "for-each-ref", "--format=%(refname:short)", "refs/heads").split()
+    monkeypatch.setenv("TTP_TASK", str(w))
+    # (a) On its own branch, which the remote lacks: the spec's branch is named with its route.
+    _git_out(repo, "checkout", "-q", "-b", mine)
+    _commit(repo, "fold.txt", "fold\n")
+    capsys.readouterr()
+    assert _ttp("push", "--own") == 2
+    err = capsys.readouterr().err
+    assert "not creating it" in err and "work task creates no branch" in err and f"`pr_branch: {theirs}`" in err \
+        and "no 'rebase'" in err, err
+    # (b) No branch named: the route in general terms.
+    p.db.update_task(w, spec="Push the tested commit.")
+    assert _ttp("push", "--own") == 2
+    err = capsys.readouterr().err
+    assert "work task creates no branch" in err and "`pr_branch: <branch>`" in err, err
+    # (c) The other task's branch checked out, not carried: refused, naming the route.
+    _git_out(repo, "checkout", "-q", "-B", theirs)
+    assert _ttp("push", "--own") == 2
+    err = capsys.readouterr().err
+    assert "publishes only this task's own branch" in err and f"#{first}'s branch" in err \
+        and f"`pr_branch: {theirs}`" in err, err
+    assert heads() == ["proj"]
+    # (d) No regression: a work task with a `pr_branch:` line naming the existing remote branch
+    # fast-forwards it with --own.
+    _git_out(repo, "push", "-q", "origin", f"HEAD~1:refs/heads/{theirs}")
+    carrier = p.db.add_task("Push the fold, carried", f"pr_branch: {theirs}\nFast-forward it.", kind="work",
+                           labels=[f"pr_branch:{theirs}"])
+    p.db.update_task(first, status="done")
+    p.db.update_task(carrier, status="running", branch=theirs)
+    monkeypatch.setenv("TTP_TASK", str(carrier))
+    assert _ttp("push", "--own") == 0, capsys.readouterr().err
+    assert _git_out(origin, "rev-parse", theirs) == _git_out(repo, "rev-parse", "HEAD")
+    assert sorted(heads()) == sorted(["proj", theirs])
+
+
 def test_push_own_reuses_a_ttp_checks_pass_only_on_the_same_tree_commands_and_env(env, monkeypatch, tmp_path, capsys):
     """`ttp push --own` runs again no check `ttp checks` recorded passing on exactly HEAD's tree with the
     same commands (or more that start with them) and environment, and says it reused that pass. A
@@ -12678,9 +13034,9 @@ def _cap_suite_batch(env, monkeypatch):
 def test_a_batch_that_breaks_only_a_cap_finds_the_entry_on_cap_probes_and_runs_one_full_suite(env, monkeypatch, capsys):
     """A 5-entry batch that fails only a prompt size cap test: cap probes (only the cap tests) of the
     full head and each prefix find entry 4, one full suite runs on entries 1..3, which push; entry 4
-    is check_failed with a cap-only tail (pushq sends it back to be trimmed), and entry 5, which breaks
-    the cap without it too, is requeued after one more probe. Before, each of those heads ran the full
-    suite: five full runs."""
+    is check_failed with a cap-only tail (pushq sends it back to be trimmed), and entry 5 is requeued
+    untested for the next train: a prefix passed, so no probe or check runs after it (user msg #2317).
+    Before, each of those heads ran the full suite: five full runs."""
     from ttp import conflictfix, pushpass
     p, origin, heads, log = _cap_suite_batch(env, monkeypatch)
     rc, m = _run_batch(p, _batch_marker(p, heads), monkeypatch)
@@ -12688,18 +13044,20 @@ def test_a_batch_that_breaks_only_a_cap_finds_the_entry_on_cap_probes_and_runs_o
     assert _statuses(m) == ["pushed"] * 3 + ["check_failed", "requeued"], m
     ran = log.read_text().split()
     assert ran.count("full") == m["checks"]["runs"] == 1, ran
-    assert m["checks"]["cap_probes"] == 5 and ran.count("cap") == 6, (m["checks"], ran)   # 5 probes + the full run
+    assert m["checks"]["cap_probes"] == 4 and ran.count("cap") == 5, (m["checks"], ran)   # 4 probes + the full run
+    assert m["results"][4]["detail"] == {"untested": True}, m
     trim = conflictfix.cap_failure(m["results"][3]["detail"]["tail"])
     assert trim and trim["over"][0]["size"] == 8 and trim["over"][0]["cap"] == 7, m["results"][3]
     out = capsys.readouterr().out
-    assert "searching on the cap tests alone" in out and "they break a prompt size cap too" in out
-    assert len(json.loads((p.state / pushpass.CAPS).read_text())["probes"]) == 5
+    assert "searching on the cap tests alone" in out and "without it" not in out
+    assert len(json.loads((p.state / pushpass.CAPS).read_text())["probes"]) == 4
 
 
 def test_a_batch_rerun_after_a_reboot_reuses_the_cap_probes_it_already_ran(env, monkeypatch, capsys):
     """A batch dies in its full suite after the cap probes found the entry that breaks the cap (a
     reboot); the rerun, a new batch of the same entries on the same tip, reads the probes of those
-    prefixes back, failing ones included, and runs only the full suite and the one probe it never got to."""
+    prefixes back, failing ones included, and runs only the full suite: no probe is left to run, since a
+    passed prefix sends the entry after the culprit to the next train unchecked (user msg #2317)."""
     from ttp import batch
     p, origin, heads, log = _cap_suite_batch(env, monkeypatch)
 
@@ -12717,7 +13075,7 @@ def test_a_batch_rerun_after_a_reboot_reuses_the_cap_probes_it_already_ran(env, 
     monkeypatch.setattr(batch.Batch, "_check", real)
     rc, m = _run_batch(p, _batch_marker(p, heads, bid="b2"), monkeypatch)
     assert rc == 0 and _statuses(m) == ["pushed"] * 3 + ["check_failed", "requeued"], m
-    assert m["checks"]["cap_reused"] == 4 and m["checks"]["cap_probes"] == 1, m["checks"]
+    assert m["checks"]["cap_reused"] == 4 and not m["checks"].get("cap_probes"), m["checks"]
     assert log.read_text().split().count("full") == 1
     assert "failed in b1" in capsys.readouterr().out
 
@@ -15074,13 +15432,14 @@ def test_a_failed_review_with_no_fix_follow_ups_gets_no_fix_or_re_review_and_one
     assert only["id"] == ev["id"] and "No automatic fix: it proposed no fix follow-ups" in only["text"]
 
 
-def test_a_third_failed_review_round_gets_no_fix_or_re_review_and_one_nofix_event(env):
-    from ttp.daemon import AUTO_FIX_ROUNDS
+def test_a_failed_re_review_gets_no_third_round_only_one_nofix_event(env):
+    """A third review round on the same change goes to the coordinator as one event: the first failed
+    review gets its fix and re-review, a failed re-review gets neither."""
     p = make(env)
     p.set_config("review.area_fail_cap", 10)   # the round cap alone, not the area cap
     _, _, _, (rev,) = _finish_code(env, p, "feature", {"a.py": 40})
     rid = rev["id"]
-    for n in range(AUTO_FIX_ROUNDS):
+    for n in range(1):
         _fail_review(env, p, rid, [{"title": f"bug {n}", "spec": f"fix bug {n}"}])
         fid, rid = _fix_and_re_review(p, rid)
         _hop(env, p, fid, {f"fix{n}.py": 3}, {"status": "done", "summary": f"fixed bug {n}"})
@@ -15089,7 +15448,7 @@ def test_a_third_failed_review_round_gets_no_fix_or_re_review_and_one_nofix_even
     assert p.db.one("SELECT COUNT(*) n FROM tasks")["n"] == tasks, "a fix or re-review past the round cap"
     from ttp import deadwait
     nofix = [e for e in _review_events(p, rid) if e["kind"] == deadwait.NOFIX_EVENT]
-    assert len(nofix) == 1 and f"{AUTO_FIX_ROUNDS + 1} reviews of this stack failed" in nofix[0]["text"]
+    assert len(nofix) == 1 and "2 reviews of this stack failed" in nofix[0]["text"]
 
 
 def test_a_failed_review_at_the_review_area_cap_gets_no_fix_or_re_review_and_one_area_event(env):
@@ -15469,17 +15828,17 @@ def test_a_push_batch_pushes_both_entries_when_their_failing_test_fails_on_the_t
     assert _FLAKY_ID in ev["text"] and "pre-existing" in ev["text"] and tip[:7] in ev["text"], ev["text"]
 
 
-def test_a_push_batch_still_sends_back_a_later_entry_whose_failing_test_passes_on_the_tip_every_rerun(env, monkeypatch):
+def test_a_push_batch_still_sends_back_an_entry_whose_failing_test_passes_on_the_tip_every_rerun(env, monkeypatch):
     """The full head fails on a test that fails again at that head and passes on all TIP_RERUNS reruns on
-    the tip alone: new. The split probe of prefix 1 runs only that test and it passes; prefix 1 then
-    passes in full. Entry 2's own failure: it is sent back (check_failed); entry 1 goes."""
+    the tip alone: new. It fails at prefix 1 too: entry 1's own failure, so it is sent back
+    (check_failed) and entry 2 goes without it."""
     from ttp import batch
     p, repo, origin, other = _push_setup(env, monkeypatch, [_FLAKY_CHECK])
     tip = _git_out(origin, "rev-parse", "proj")
-    calls = _rerun_stub(monkeypatch, tip, lambda where, sel, tree: int((tree / "e2.txt").exists()))
+    calls = _rerun_stub(monkeypatch, tip, lambda where, sel, tree: int((tree / "e1.txt").exists()))
     heads = [_entry(repo, n, {f"{n}.txt": f"{n}\n"}) for n in ("e1", "e2")]
     rc, m = _run_batch(p, _batch_marker(p, heads), monkeypatch)
-    assert m["outcome"] == "pushed" and _statuses(m) == ["pushed", "check_failed"], m
+    assert m["outcome"] == "pushed" and _statuses(m) == ["check_failed", "pushed"], m
     assert not m.get("pre_existing") and m["checks"]["tip_reruns"] == batch.TIP_RERUNS
     assert calls.count(("tip", _SEL)) == batch.TIP_RERUNS, calls
     assert _git_out(origin, "rev-parse", "proj") == m["pushed_sha"] != tip
@@ -15488,11 +15847,12 @@ def test_a_push_batch_still_sends_back_a_later_entry_whose_failing_test_passes_o
 _NEW_ID = "tests/test_b.py::test_breaks_with_its_entry"
 
 
-def _ids_stub(monkeypatch, tip, failing):
+def _ids_stub(monkeypatch, tip, failing, how=lambda where, i: "broken"):
     """batch._stream stubbed as a check of the two tests _FLAKY_ID and _NEW_ID: `failing(tree, selected)`
     names the ids failing in worktree `tree` (selected: the run's TTP_PYTEST_SELECT, None for the full
-    check). Only the selected ids run: exit 1 with pytest's lines for those failing, 5 when none is
-    selected, else 0. Returns the calls (where, selected, the entries' files in the tree)."""
+    check). Only the selected ids run: exit 1 with pytest's lines for those failing (message
+    `how(where, id)`), 5 when none is selected, else 0. Returns the calls (where, selected, the entries'
+    files in the tree)."""
     from ttp import batch
     calls = []
 
@@ -15500,14 +15860,15 @@ def _ids_stub(monkeypatch, tip, failing):
         tree = pathlib.Path(cwd)
         head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(cwd), capture_output=True, text=True).stdout.strip()
         sel = (env or {}).get("TTP_PYTEST_SELECT")
-        calls.append(("tip" if head == tip else "head", sel, sorted(f.stem for f in tree.glob("e*.txt"))))
+        where = "tip" if head == tip else "head"
+        calls.append((where, sel, sorted(f.stem for f in tree.glob("e*.txt"))))
         run = [i for i in (_FLAKY_ID, _NEW_ID) if sel is None or re.match(sel, i.rpartition("::")[2])]
         bad = [i for i in (_FLAKY_ID, _NEW_ID) if i in run and i in failing(tree, sel)]
         if not run:
             return 5, "no tests ran in 0.01s", False
         if not bad:
             return 0, f"{'.' * len(run)}\n{len(run)} passed in 0.50s", False
-        return 1, ("F" * len(bad) + "\n" + "".join(f"FAILED {i} - AssertionError: broken\n" for i in bad)
+        return 1, ("F" * len(bad) + "\n" + "".join(f"FAILED {i} - AssertionError: {how(where, i)}\n" for i in bad)
                    + f"{len(bad)} failed, {len(run) - len(bad)} passed in 0.50s"), False
 
     monkeypatch.setattr(batch, "_stream", fake)
@@ -15520,35 +15881,101 @@ def _entries(repo, n):
 
 def test_a_push_batch_split_runs_only_the_new_failing_tests_at_the_prefix_heads(env, monkeypatch):
     """Cell split_failing_ids_only: entry 3 of 4 breaks one test. The search probes the prefixes with
-    only that test, never their whole suite: the full suite runs at the full head, at the prefix the
-    probes passed (once, before it is pushed) and at the entry after the blamed one (its rescue)."""
+    only that test, never their whole suite: the full suite runs at the full head and at the prefix the
+    probes showed passing (once, after they found entry 3), which then pushes at once; entries 3 and 4 go untested to the next train
+    (user msg #2317)."""
     p, repo, origin, other = _push_setup(env, monkeypatch, [_FLAKY_CHECK])
     tip = _git_out(origin, "rev-parse", "proj")
     calls = _ids_stub(monkeypatch, tip, lambda tree, sel: {_NEW_ID} if (tree / "e3.txt").exists() else set())
     rc, m = _run_batch(p, _batch_marker(p, _entries(repo, 4)), monkeypatch)
-    assert _statuses(m) == ["pushed", "pushed", "check_failed", "pushed"], m
+    assert _statuses(m) == ["pushed", "pushed", "requeued", "requeued"], m
     sel = "^(?:test_breaks_with_its_entry)$"
     full = [c[2] for c in calls if c[1] is None]
-    assert full == [["e1", "e2", "e3", "e4"], ["e1", "e2"], ["e1", "e2", "e4"]], calls
+    assert full == [["e1", "e2", "e3", "e4"], ["e1", "e2"]], calls
     probes = [c[2] for c in calls if c[1] == sel and c[0] == "head"]
     assert ["e1", "e2"] in probes and ["e1", "e2", "e3"] in probes, calls
     assert m["checks"]["id_probes"] == 2 and not m.get("pre_existing") and not m.get("flaky_tests")
 
 
 def test_a_push_batch_lands_the_passing_entries_when_the_tip_fails_a_test_too(env, monkeypatch):
-    """Cells base_fail_ignored and passing_entries_land: the tip fails _FLAKY_ID on its own, and entry 2
+    """Cells base_fail_ignored and passing_entries_land: the tip fails _FLAKY_ID on its own, and entry 1
     of 3 breaks _NEW_ID too. _FLAKY_ID is pre-existing at every head, never the tip's failure (no
-    tip_failed) and never blamed on an entry; only entry 2 is sent back, entries 1 and 3 land."""
+    tip_failed) and never blamed on an entry; only entry 1 is sent back, entries 2 and 3 land."""
     p, repo, origin, other = _push_setup(env, monkeypatch, [_FLAKY_CHECK])
     tip = _git_out(origin, "rev-parse", "proj")
     calls = _ids_stub(monkeypatch, tip,
-                      lambda tree, sel: {_FLAKY_ID} | ({_NEW_ID} if (tree / "e2.txt").exists() else set()))
+                      lambda tree, sel: {_FLAKY_ID} | ({_NEW_ID} if (tree / "e1.txt").exists() else set()))
     rc, m = _run_batch(p, _batch_marker(p, _entries(repo, 3)), monkeypatch)
-    assert m["outcome"] == "pushed" and _statuses(m) == ["pushed", "check_failed", "pushed"], m
+    assert m["outcome"] == "pushed" and _statuses(m) == ["check_failed", "pushed", "pushed"], m
     pushed = _git_out(origin, "show", "--name-only", "--format=", f"{tip}..proj").split()
-    assert "e1.txt" in pushed and "e3.txt" in pushed and "e2.txt" not in pushed, pushed
+    assert "e2.txt" in pushed and "e3.txt" in pushed and "e1.txt" not in pushed, pushed
     assert {i for f in m["pre_existing"] for i in f["ids"]} == {_FLAKY_ID}, m["pre_existing"]
     assert ("tip", None, []) not in calls, "the tip is not checked alone in full"
+
+
+
+def test_a_push_batch_whose_tip_fails_a_test_another_way_pushes_the_entries_that_pass_the_rest(env, monkeypatch, capsys):
+    """#7330: the tip fails _FLAKY_ID on its own, another way than at the heads (another message), and entry
+    1 of 3 breaks _NEW_ID. The tip's own failure is pre-existing in the batch: it blocks nothing and no
+    entry is blamed for it, so entries 2 and 3 land and only entry 1 goes back (before: tip_failed, none)."""
+    p, repo, origin, other = _push_setup(env, monkeypatch, [_FLAKY_CHECK])
+    tip = _git_out(origin, "rev-parse", "proj")
+    _ids_stub(monkeypatch, tip, lambda tree, sel: {_FLAKY_ID} | ({_NEW_ID} if (tree / "e1.txt").exists() else set()),
+              how=lambda where, i: f"{i} broke on the {where}")
+    rc, m = _run_batch(p, _batch_marker(p, _entries(repo, 3)), monkeypatch)
+    log = capsys.readouterr().out
+    assert m["outcome"] == "pushed" and _statuses(m) == ["check_failed", "pushed", "pushed"], log
+    assert [f["ids"] for f in m["pre_existing"] if f.get("tip_alone")] == [[_FLAKY_ID]], m["pre_existing"]
+    assert log.count("fails these tests on its own (another way than on this head), so no entry is blamed") == 1, log
+
+
+def test_a_push_batch_whose_tip_fails_a_test_on_its_rerun_searches_again_instead_of_ending_tip_failed(env, monkeypatch, capsys):
+    """#7330: no base judge (checks.judge false), so the batch learns only at prefix 1, rerunning _FLAKY_ID on
+    the tip alone, that the tip fails it on its own. It searches again with that test excused, judging each
+    failed run again rather than rerunning the suite, and pushes entries 2 and 3; entry 1 broke _NEW_ID,
+    which passes on the tip, so it still goes back."""
+    p, repo, origin, other = _push_setup(env, monkeypatch, [_FLAKY_CHECK])
+    p.set_config("checks.judge", False)
+    tip = _git_out(origin, "rev-parse", "proj")
+    calls = _ids_stub(monkeypatch, tip,
+                      lambda tree, sel: {_FLAKY_ID} | ({_NEW_ID} if (tree / "e1.txt").exists() else set()))
+    rc, m = _run_batch(p, _batch_marker(p, _entries(repo, 3)), monkeypatch)
+    log = capsys.readouterr().out
+    assert m["outcome"] == "pushed" and _statuses(m) == ["check_failed", "pushed", "pushed"], log
+    assert {i for f in m["pre_existing"] for i in f["ids"]} == {_FLAKY_ID}, m["pre_existing"]
+    assert "searching again with the tip's own failing tests excused (1 of" in log, log
+    assert "judging that run again" in log, log
+    full = [c[2] for c in calls if c[1] is None]
+    assert len(full) == len({tuple(f) for f in full}), f"no tree's full suite runs twice: {calls}"
+
+
+def test_a_push_batch_keeps_the_leak_scan_a_hard_block_when_the_tip_fails_it_too(env, monkeypatch, capsys):
+    """#7330: a test delivery.push_hard_tests names (by default the leak scan) blocks the head even when the
+    tip fails it the same way on its own: nothing is pushed and it is never pre-existing."""
+    p, repo, origin, other = _push_setup(env, monkeypatch, [_FLAKY_CHECK])
+    p.set_config("delivery.push_hard_tests", "waits_on_a_clock")
+    tip = _git_out(origin, "rev-parse", "proj")
+    _ids_stub(monkeypatch, tip, lambda tree, sel: {_FLAKY_ID})
+    rc, m = _run_batch(p, _batch_marker(p, _entries(repo, 2)), monkeypatch)
+    log = capsys.readouterr().out
+    assert m["outcome"] == "tip_failed" and _git_out(origin, "rev-parse", "proj") == tip, log
+    assert not m.get("pre_existing") and "the leak scan blocks even when the tip fails it too" in log, log
+
+
+def test_a_push_batch_on_a_tip_known_to_fail_only_tests_excuses_them_and_pushes(env, monkeypatch, capsys):
+    """#7330: the queue knows the tip fails _FLAKY_ID on its own (bad_tip with its ids) and no entry is
+    fresh. Before, the batch ended tip_failed at once; now that test is the tip's own and the entry lands."""
+    from ttp.project import write_json
+    from ttp import push
+    p, repo, origin, other = _push_setup(env, monkeypatch, [_FLAKY_CHECK])
+    tip = _git_out(origin, "rev-parse", "proj")
+    _ids_stub(monkeypatch, tip, lambda tree, sel: {_FLAKY_ID}, how=lambda where, i: f"broke on the {where}")
+    marker = _batch_marker(p, _entries(repo, 1))
+    write_json(marker, {**push._read(marker), "bad_tip": {"tip": tip, "fresh": 0, "cmd": _FLAKY_CHECK, "ids": [_FLAKY_ID]}})
+    rc, m = _run_batch(p, marker, monkeypatch)
+    log = capsys.readouterr().out
+    assert m["outcome"] == "pushed" and _statuses(m) == ["pushed"], log
+    assert "fails these tests on its own (in earlier batches)" in log, log
 
 
 def test_a_push_batch_reruns_each_failing_test_not_yet_judged_at_that_head(env, monkeypatch):
@@ -15565,7 +15992,8 @@ def test_a_push_batch_reruns_each_failing_test_not_yet_judged_at_that_head(env, 
     heads = [_entry(repo, "e1", {"e1.txt": "1\n", "tests/test_a.py": "# edited\n"}),
              _entry(repo, "e2", {"e2.txt": "2\n"})]
     rc, m = _run_batch(p, _batch_marker(p, heads), monkeypatch)
-    assert _statuses(m) == ["pushed", "check_failed"], m
+    assert _statuses(m) == ["pushed", "requeued"], m
+    assert m["results"][1]["detail"] == {"untested": True}, "prefix 1 passed: entry 2 waits for the next train"
     both = gatejudge.select_rx([_FLAKY_ID, _NEW_ID])
     assert ("head", both, ["e1", "e2"]) in calls, "both failing tests rerun together at the full head"
     assert ("head", _SEL, ["e1"]) in calls, "prefix 1's failing test reruns there too"
@@ -17132,7 +17560,7 @@ def test_a_push_claim_on_the_fork_head_is_confirmed_without_reading_its_default_
 
 def test_an_approval_from_the_review_of_an_urgent_task_starts_its_batch_at_once(env, monkeypatch):
     """The review is routine priority, but the task it reviews is urgent (an `urgent:` spec line): its
-    approval goes first and starts a batch while another review still runs; routine ones wait."""
+    approval starts a train at once while another review still runs and leads it; routine ones ride in it."""
     from ttp import pushq
     s = _pq(env, monkeypatch, push_batch_s=900)
     s.p.db.update_task(s.review, status="running")   # a review is still at work: approvals may wait for it
@@ -17148,7 +17576,8 @@ def test_an_approval_from_the_review_of_an_urgent_task_starts_its_batch_at_once(
         [row] = pushq.approve(s.p, rid, None, {"entries": [{"branch": s.branch, "head": s.head}],
                                                "target": "origin/proj"})
     rows, why = pushq.due(s.p, now)
-    assert [r["id"] for r in rows] == [row] and "an urgent review" in why, "alone: the routine one waits " + why
+    assert [r["id"] for r in rows] == [row, routine] and "an urgent review" in why and "1 more ride in the train" in why, \
+        "the urgent one leads, the routine one rides in its train: " + why
     s.p.db.update_task(hot, spec="Fix it.")   # no longer urgent: it waits like the rest
     assert pushq.due(s.p, now)[0] == []
 
@@ -17849,9 +18278,12 @@ def test_a_push_batch_settles_tests_both_sides_append_to_one_case_file_and_keeps
         assert got.index("def test_tip") < got.index("def test_change") and got.count("@pytest.mark.slow") == 2
         __import__("ast").parse(got)
     elif case == "check_fails":
-        # its detail names the failing checks: pushq._settle sends it to a standard conflict fix (no kept approval)
-        assert _statuses(m) == ["pushed", "conflict"], m
-        d = m["results"][1]["detail"]
+        # e1 passed alone and pushed at once (user msg #2317); e2 meets it in the next train, where its
+        # detail names the failing checks: pushq._settle sends it to a standard conflict fix (no kept approval)
+        assert _statuses(m) == ["pushed", "requeued"], m
+        rc, m = _run_batch(p, _batch_marker(p, heads[1:], bid="b2"), monkeypatch)
+        assert _statuses(m) == ["conflict"], m
+        d = m["results"][0]["detail"]
         assert d["settled"] == [_APPEND_FILE] and d["cmd"] == both and d["files"] == [_APPEND_FILE], d
         assert "test_change" not in _git_out(origin, "show", f"proj:{_APPEND_FILE}")
     else:
@@ -19184,6 +19616,62 @@ def test_a_first_conflict_or_a_capped_rebase_keeps_the_conflict_fix(env, monkeyp
     assert not s.p.db.q("SELECT id FROM tasks WHERE labels LIKE '%push_rebase:%'")
 
 
+def test_ttp_stats_landing_shows_runs_cpu_hours_and_dollars_per_landed_change(env):
+    """User msg #2220 (#2221): `ttp stats --landing` shows per day test runs and full suites, CPU-hours and $
+    per landed change, and approved to landed median and p90."""
+    import datetime as dt
+    from ttp import timefmt, trainstats
+    p, rid = _pq_rows(env)
+    tz = timefmt.home(p)
+    now = dt.datetime(2026, 11, 8, 12, tzinfo=timefmt.tzinfo(tz)).timestamp()   # noon: one home-zone day
+    for i, mins in enumerate((10, 30)):
+        _pq_batch_row(p, f"b{i}", now, age=3700, outcome="pushed", ended=now - 3600, check_runs=3 - 2 * i,
+                      check_s=1800.0)
+        _pq_row(p, rid, now, status="pushed", batch=f"b{i}", age=3600 + mins * 60)
+    for scope, cpu, cost in ((["c: targeted: 1 case files"], 360.0, 1.5), (["c: full: --full"], 3240.0, 2.5),
+                             (None, None, 1.0)):
+        run = p.db.x("INSERT INTO runs(task, role, started, ended, cost_usd) VALUES(?,?,?,?,?)",
+                     (rid, "worker", now - 1800, now - 1700, cost))
+        if scope is not None:
+            (p.runs / str(run)).mkdir(parents=True, exist_ok=True)
+            (p.runs / str(run) / "checks.json").write_text(json.dumps(
+                {"passed": True, "ts": now - 1700, "purpose": "candidate", "scope": scope, "cpu_s": cpu}))
+    r = trainstats.report(p.db, p.runs, tz, days=1, now=now)
+    (d,) = r["days"]
+    assert (d["day"], d["landed"], d["checks_runs"], d["full_runs"], d["trains"], d["train_check_runs"]) == (
+        timefmt.today(now, tz), 2, 2, 1, 2, 4), d
+    assert d["runs_per_landed"] == 3.0 and d["full_per_landed"] == 1.5 and d["cpu_h_per_landed"] == 0.5, d
+    assert d["usd_per_landed"] == 2.5 and d["landing_median_h"] == 0.3 and d["landing_p90_h"] == 0.5, d
+    out = trainstats.text(r, p.name)
+    assert "2 landed" in out and "$2.5/landed" in out and "0.5 CPU-h/landed" in out, out
+    p.db.x("DELETE FROM push_queue")
+
+
+def test_ttp_stats_landing_counts_a_review_that_landed_its_change_by_direct_push(env):
+    """A review that lands its change with `ttp push` (no push queue) leaves only a task_landings row:
+    `ttp stats --landing` counted 0 landed every day while such pushes landed. Each task counts once,
+    and a task the push queue already counted is not counted again."""
+    import datetime as dt
+    from ttp import timefmt, trainstats
+    p, rid = _pq_rows(env)
+    tz = timefmt.home(p)
+    now = dt.datetime(2026, 11, 8, 12, tzinfo=timefmt.tzinfo(tz)).timestamp()
+    other = p.db.add_task("review another", "spec", kind="review")
+    for marker, task, age in (("t1-a", rid, 3600), ("t1-b", rid, 1800), ("t2-a", other, 600),
+                              ("t2-old", other, 3 * 86400)):
+        p.db.x("INSERT INTO task_landings(marker, task, sha, target, ts) VALUES(?,?,?,?,?)",
+               (marker, task, "a" * 40, "origin/main", now - age))
+    (d,) = trainstats.report(p.db, p.runs, tz, days=1, now=now)["days"]
+    assert (d["landed"], d["direct"], d["landing_median_h"]) == (2, 2, None), d
+    assert "2 landed (2 by direct push)" in trainstats.text({"days": [d]}, p.name)
+    _pq_batch_row(p, "b0", now, age=3700, outcome="pushed", ended=now - 3600, check_runs=1, check_s=60.0)
+    _pq_row(p, rid, now, status="pushed", batch="b0", age=3660)
+    (d,) = trainstats.report(p.db, p.runs, tz, days=1, now=now)["days"]
+    assert (d["landed"], d["direct"]) == (2, 1), d
+    p.db.x("DELETE FROM push_queue")
+    p.db.x("DELETE FROM task_landings")
+
+
 def test_the_daily_audit_shows_approval_to_landed_median_and_p90(env):
     from ttp import audit, pushq
     p, rid = _pq_rows(env)
@@ -19201,3 +19689,247 @@ def test_the_daily_audit_shows_approval_to_landed_median_and_p90(env):
     assert audit.report(p.db, now)["approval_to_landed"]["n"] == 4
     p.db.x("DELETE FROM push_queue")
     assert not [x for x in audit.lines(p.db, now) if "approval to landed" in x]
+
+
+_GATE_CHECK = "python3 -m pytest -p no:cacheprovider -q tests/"
+_GATE_BASE = "def test_ok():\n    pass\n\n\ndef test_pre():\n    assert False, 'broken before'\n\n\ndef test_x():\n    pass\n"
+
+
+def _gate_push_setup(env, monkeypatch, tmp_path, head_body: str):
+    # The target `proj` has tests/test_gate.py with test_pre failing; the task branch `own` writes `head_body` there.
+    p, repo, origin, other = _push_setup(env, monkeypatch, [])
+    (tmp_path / "run").mkdir()
+    monkeypatch.setenv("TTP_RUN_DIR", str(tmp_path / "run"))
+    (repo / "tests").mkdir(exist_ok=True)
+    _commit(repo, "tests/test_gate.py", _GATE_BASE)
+    _git_out(repo, "push", "-q", "origin", "HEAD:refs/heads/proj")
+    base = _git_out(repo, "rev-parse", "HEAD")
+    _git_out(repo, "checkout", "-q", "-b", "own")
+    _commit(repo, "tests/test_gate.py", head_body)
+    return p, repo, base, _git_out(repo, "rev-parse", "HEAD")
+
+
+def test_push_own_pushes_past_a_test_failing_on_its_base_too_and_names_it_pre_existing(env, monkeypatch, tmp_path):
+    # Landing and spend: a failure on both base and head never blocks an own push; the excused id is named.
+    from ttp import gatejudge, push
+    p, repo, base, head = _gate_push_setup(env, monkeypatch, tmp_path, _GATE_BASE + "\n\ndef helper():\n    return 1\n")
+    said: list[str] = []
+    rc = push.publish(repo, "origin", "own", push.check_list([_GATE_CHECK]), say=said.append, base=base, p=p)
+    assert rc == 0, said
+    assert _git_out(repo, "rev-parse", "origin/own") == head
+    text = "\n".join(said)
+    assert "pre-existing on the base" in text and "tests/test_gate.py::test_pre" in text, text
+    assert "check failed" not in text and not gatejudge.active(p.state)
+
+
+def test_push_own_still_refuses_a_test_failing_only_on_its_head(env, monkeypatch, tmp_path):
+    from ttp import push
+    p, repo, base, head = _gate_push_setup(env, monkeypatch, tmp_path,
+                                           _GATE_BASE.replace("def test_x():\n    pass", "def test_x():\n    assert False"))
+    said: list[str] = []
+    rc = push.publish(repo, "origin", "own", push.check_list([_GATE_CHECK]), say=said.append, base=base, p=p)
+    assert rc == push.CHECKS_FAILED, said
+    text = "\n".join(said)
+    assert "new on" in text and "tests/test_gate.py::test_x" in text and "check failed on" in text, text
+    assert "tests/test_gate.py::test_pre" in text   # the pre-existing one is still named apart
+    assert subprocess.run(["git", "-C", str(repo), "rev-parse", "-q", "--verify", "origin/own"],
+                          capture_output=True).returncode != 0, "nothing pushed"
+
+
+def test_push_own_quarantines_a_test_that_passes_on_its_rerun_and_pushes(env, monkeypatch, tmp_path):
+    # Flaky: fails once, passes on the head rerun. Quarantined as the batch does, and the push goes.
+    from ttp import gatejudge, push
+    mark = tmp_path / "flaked"
+    body = ("import pathlib\n\n\ndef test_ok():\n    pass\n\n\ndef test_flaky():\n"
+            f"    m = pathlib.Path({str(mark)!r})\n    if not m.exists():\n        m.write_text('1')\n"
+            "        assert False, 'first run'\n")
+    p, repo, base, head = _gate_push_setup(env, monkeypatch, tmp_path, body)
+    said: list[str] = []
+    rc = push.publish(repo, "origin", "own", push.check_list([_GATE_CHECK]), say=said.append, base=base, p=p)
+    assert rc == 0, said
+    assert "tests/test_gate.py::test_flaky" in gatejudge.active(p.state)
+    assert any("flaky" in m for m in said)
+
+
+def test_a_direct_push_to_the_target_pushes_past_a_failure_its_tip_has_too(env, monkeypatch, tmp_path):
+    # _rounds (a direct `ttp push`): the base is the target's tip it rebased onto.
+    from ttp import push
+    p, repo, base, head = _gate_push_setup(env, monkeypatch, tmp_path, _GATE_BASE + "\n\ndef helper():\n    return 1\n")
+    said: list[str] = []
+    rc = push.push(repo, "origin", "proj", push.check_list([_GATE_CHECK]), 1, say=said.append)
+    assert rc == 0, said
+    assert _git_out(repo, "rev-parse", "origin/proj") == head
+    assert any("pre-existing on the base" in m and "test_pre" in m for m in said), said
+
+
+def test_push_own_never_excuses_a_leak_scan_failure_its_base_has_too(env, monkeypatch, tmp_path):
+    # delivery.push_hard_tests (default: the leak scan) blocks even when the base fails it the same way.
+    from ttp import push
+    body = _GATE_BASE.replace("test_pre", "test_leak_scan")
+    p, repo, base, head = _gate_push_setup(env, monkeypatch, tmp_path, body)
+    _git_out(repo, "checkout", "-q", "proj" if False else base)
+    _commit(repo, "tests/test_gate.py", body)
+    _git_out(repo, "push", "-q", "origin", "HEAD:refs/heads/proj")
+    base = _git_out(repo, "rev-parse", "HEAD")
+    _git_out(repo, "checkout", "-q", "-B", "own")
+    _commit(repo, "tests/test_gate.py", body + "\n\ndef helper():\n    return 1\n")
+    said: list[str] = []
+    rc = push.publish(repo, "origin", "own", push.check_list([_GATE_CHECK]), say=said.append, base=base, p=p)
+    assert rc == push.CHECKS_FAILED, said
+    assert any("never excused" in m and "test_leak_scan" in m for m in said), said
+
+
+def test_own_push_from_another_repository_compares_with_its_own_default_branch(env, monkeypatch, capsys):
+    """A task worktree cloned from a repository other than the push branch's: `ttp push --own` compares
+    with that repository's default branch (its remote has no push branch), runs the required checks
+    and publishes the task branch there. With no checks for it, a code change is refused, naming
+    delivery.push_checks_by_repo; nothing is pushed unchecked, and the push branch is not touched."""
+    from ttp import push
+    p, repo, origin, _ = _push_setup(env, monkeypatch, ["true"])
+    tmp = env["tmp"]
+    lib_origin, lib = tmp / "lib-origin.git", tmp / "lib"
+    _bare_init(env, lib_origin)
+    subprocess.run(["git", "clone", "-q", str(lib_origin), str(lib)], check=True, capture_output=True)
+    _commit(lib, "README.md", "lib\n")
+    _git_out(lib, "push", "-q", "origin", "HEAD:refs/heads/trunk")
+    _git_out(lib_origin, "symbolic-ref", "HEAD", "refs/heads/trunk")
+    trunk = _git_out(lib, "rev-parse", "HEAD")
+    _git_out(lib, "checkout", "-q", "-b", "ttp/t40-feature")
+    _commit(lib, "code.py", "x = 1\n")
+    monkeypatch.chdir(lib)
+    assert push.own_base(p, lib, "origin") == trunk
+    assert push.own_base(p, repo, "origin") == _git_out(origin, "rev-parse", "proj")
+    heads = lambda r: _git_out(r, "for-each-ref", "--format=%(refname:short)", "refs/heads").split()
+    p.set_config("delivery.push_checks", [])
+    assert _ttp("push", "--own") == 2
+    err = capsys.readouterr().err
+    assert "no checks configured" in err and "code.py" in err and "push_checks_by_repo['lib']" in err
+    assert "no push target to compare with" not in err
+    assert "ttp/t40-feature" not in heads(lib_origin)
+    p.set_config("delivery.push_checks", ["true"])
+    p.set_config("delivery.push_checks_by_repo", {"lib": ["false"]})
+    assert _ttp("push", "--own") != 0
+    capsys.readouterr()
+    assert "ttp/t40-feature" not in heads(lib_origin)
+    p.set_config("delivery.push_checks_by_repo", {"lib": ["true"]})
+    assert _ttp("push", "--own") == 0, capsys.readouterr().err
+    assert _git_out(lib_origin, "rev-parse", "ttp/t40-feature") == _git_out(lib, "rev-parse", "HEAD")
+    assert heads(origin) == ["proj"] and sorted(heads(lib_origin)) == ["trunk", "ttp/t40-feature"]
+
+
+def _stoppable_push(p, monkeypatch, task=7, status="queued", **more):
+    """A detached push marker of task #`task` in project `p`, with this run as task #7 of `p`."""
+    from ttp import push
+    monkeypatch.setenv("TTP_TASK", "7")
+    monkeypatch.setenv("TTP_PROJECT", str(p.base))
+    marker = (p.state / push.DETACHED / f"t{task}-20261110-1.json")
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text(json.dumps({"id": marker.stem, "task": task, "status": status, "repo": str(p.base),
+                                  "queued": time.time(), **more}))
+    marker.with_suffix(".log").write_text("waiting for the push lock\n")
+    return marker.resolve()
+
+
+def test_push_stop_withdraws_the_own_tasks_queued_push_and_removes_its_marker(env, monkeypatch, capsys):
+    p = make(env)
+    from ttp import locks, push
+    marker = _stoppable_push(p, monkeypatch)
+    assert push.stop_own(p, marker) == 0
+    assert not marker.exists() and not marker.with_suffix(".log").exists()
+    assert locks.any_free([push._run_lock(marker)])
+    assert "stopped the push" in capsys.readouterr().out
+
+
+def test_push_stop_refuses_another_tasks_or_projects_push_a_batch_and_a_path_outside_pushes(env, monkeypatch, tmp_path):
+    p = make(env)
+    from ttp import push
+    other = _stoppable_push(p, monkeypatch, task=8)
+    assert push.stop_own(p, other) == push.REFUSED and other.exists()
+    mine = _stoppable_push(p, monkeypatch)
+    monkeypatch.setenv("TTP_PROJECT", str(tmp_path / "another-project"))
+    assert push.stop_own(p, mine) == push.REFUSED and mine.exists()
+    monkeypatch.setenv("TTP_PROJECT", str(p.base))
+    monkeypatch.delenv("TTP_TASK")
+    assert push.stop_own(p, mine) == push.REFUSED and mine.exists()   # no task: nobody's own push
+    monkeypatch.setenv("TTP_TASK", "7")
+    batch = mine.with_name("batch-20261110-1.json")
+    batch.write_text(json.dumps({"kind": "batch", "task": 7, "status": "running"}))
+    assert push.stop_own(p, batch) == push.REFUSED and batch.exists()
+    outside = tmp_path / "t7-20261110-1.json"
+    outside.write_text(mine.read_text())
+    assert push.stop_own(p, outside) == push.REFUSED and outside.exists()
+
+
+def _waiting_push(marker):
+    """A process holding the push's run lock with the marker in its arguments, as `ttp push --detach` waiting
+    for the push lock does."""
+    from ttp import push
+    ready = marker.with_suffix(".ready")
+    code = ("import sys, time; from pathlib import Path; from ttp import locks\n"
+            "h = locks.try_take([Path(sys.argv[1])], 'detached push'); Path(sys.argv[2]).touch(); time.sleep(60)")
+    proc = subprocess.Popen([sys.executable, "-c", code, str(push._run_lock(marker)), str(ready), str(marker)],
+                            env={**os.environ, "PYTHONPATH": str(Path(push.__file__).parent.parent)},
+                            start_new_session=True)
+    deadline = time.monotonic() + 20
+    while not ready.exists() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert ready.exists()
+    ready.unlink()
+    return proc
+
+
+def test_push_stop_ends_the_own_tasks_running_push_waiting_for_the_lock(env, monkeypatch, capsys):
+    p = make(env)
+    from ttp import locks, push
+    marker = _stoppable_push(p, monkeypatch, status="running")
+    proc = _waiting_push(marker)
+    try:
+        data = json.loads(marker.read_text()) | {"pid": proc.pid}
+        marker.write_text(json.dumps(data))
+        assert push.stop_own(p, marker, "the train takes its head") == 0
+        assert proc.wait(timeout=10) == -signal.SIGTERM
+        assert not marker.exists() and locks.any_free([push._run_lock(marker)])
+        assert "the train takes its head" in capsys.readouterr().out
+    finally:
+        proc.kill()
+        proc.wait()
+
+
+def test_push_stop_never_interrupts_a_git_push_and_says_so(env, monkeypatch, capsys):
+    p = make(env)
+    from ttp import push
+    marker = _stoppable_push(p, monkeypatch, status="running")
+    proc = _waiting_push(marker)
+    try:
+        marker.write_text(json.dumps(json.loads(marker.read_text()) | {"pid": proc.pid}))
+        marker.with_suffix(push.GIT_PUSH_SUFFIX).touch()
+        assert push.stop_own(p, marker) == push.NOT_STOPPED == 1
+        assert proc.poll() is None and marker.exists()
+        assert "never interrupted" in capsys.readouterr().err
+    finally:
+        proc.kill()
+        proc.wait()
+
+
+def test_a_detached_push_ignores_a_stop_signal_once_its_git_push_began(monkeypatch):
+    from ttp import push
+    monkeypatch.setattr(push, "_git_pushed", False)
+    with pytest.raises(push._Stopped):
+        push._stop(signal.SIGTERM, None)
+    monkeypatch.setattr(push, "_git_pushed", True)
+    assert push._stop(signal.SIGTERM, None) is None
+
+
+def test_detach_stop_on_a_push_marker_stops_the_own_push(env, monkeypatch):
+    p = make(env)
+    from ttp import cli
+    marker = _stoppable_push(p, monkeypatch)
+    assert cli._detach_stop(str(marker)) == 0 and not marker.exists()
+    other = _stoppable_push(p, monkeypatch, task=8)
+    assert cli._detach_stop(str(other)) == 2 and other.exists()   # push.REFUSED
+
+
+def test_kill_guard_names_push_stop_and_lets_it_through(tmp_path):
+    from ttp import killguard
+    assert "ttp push --stop <marker>" in killguard.ADVICE
+    assert killguard.refusal(f"ttp push --stop {tmp_path}/state/pushes/t7-1.json", str(tmp_path), str(tmp_path)) is None

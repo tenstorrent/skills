@@ -15,6 +15,7 @@ write) and no lock is taken. Projects on other machines are listed as not checke
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import time
 from pathlib import Path
@@ -180,7 +181,8 @@ def overview(now: float | None = None) -> dict:
     for r in rows:
         r.pop("gate_ts", None)
         r.pop("gate_global", None)
-    g = {"cap": float(account.get("global_daily_usd") or 0), "label": "per 24h" if rolling else "today",
+    g = {"cap": float(account.get("global_daily_usd") or 0), "target": float(account.get("daily_target_usd") or 0),
+         "label": "per 24h" if rolling else "today",
          "local": {k: round(v, 2) for k, v in local.items() if round(v, 2)}, "local_projects": sum(1 for r in rows if r["ok"])}
     if counted and now - counted[0] <= GATE_FRESH_S:
         g["counted"] = {"by": counted[1], "age_s": round(now - counted[0]),
@@ -216,7 +218,26 @@ def line(r: dict) -> str:
             + "".join(f" · {x}" for x in r.get("slots") or []))
 
 
+def target_line(g: dict) -> str:
+    """Today's Claude spend against budget.daily_target_usd ('' when unset): every machine's count when
+    a daemon counted it lately, else this machine's."""
+    t = float(g.get("target") or 0)
+    if t <= 0:
+        return ""
+    c = (g.get("counted") or {}).get("providers") or {}
+    usd = float((c.get("claude") or {}).get("usd") or 0) if "claude" in c else float((g.get("local") or {}).get("claude") or 0)
+    where = "every machine" if "claude" in c else "this machine"
+    diff = f"{gcap.money(usd - t)} over" if usd > t else f"{gcap.money(t - usd)} under"
+    return f"daily target ${t:.0f}: Claude {gcap.money(usd)} {g['label']} ({where}), {diff}"
+
+
 def footer(g: dict) -> str:
+    if (tl := target_line(g)):
+        return _footer(g) + "\n" + tl
+    return _footer(g)
+
+
+def _footer(g: dict) -> str:
     if not g["cap"]:
         return "global daily cap: off (budget.global_daily_usd is 0)"
     c = g.get("counted")
@@ -404,6 +425,21 @@ def _contains(commit: str | None, running: str | None) -> bool | None:
     return {0: True, 1: False}.get(r.returncode)
 
 
+def _merge_unlanded(db: _RO, target: str, auto: dict) -> dict | None:
+    """The newest template-merge task when it ended (failed, done or cancelled by the project) without
+    landing `target`: {"task", "status", "files"}, the conflicting files (else the merge's problem), or None."""
+    from .release import FENCED_PREFIX, KV_STUCK, UPGRADE_TASK_TITLE
+    t = db.one("SELECT id, status, blocked_reason, spec FROM tasks WHERE kind='harness' AND title=? "
+               "ORDER BY id DESC LIMIT 1", (UPGRADE_TASK_TITLE,))
+    if (not t or t["status"] not in ("done", "failed", "cancelled")
+            or str(t["blocked_reason"] or "").startswith(FENCED_PREFIX)
+            or not re.search(rf"^Target release: tt-project {re.escape(target)} ", t["spec"] or "", re.M)):
+        return None
+    why = (db.kv(KV_STUCK)[0] or {}).get("why") or auto.get("why") or "unknown (see its logs/upgrade.log)"
+    m = re.match(r"the merge conflicts in (.+)", why)
+    return {"task": int(t["id"]), "status": t["status"], "files": f"conflicting files: {m[1].strip()}" if m else why}
+
+
 def deploy_status(name: str, entry: dict, target: str, commit: str | None, now: float, here: str,
                   fresh_s: float = DEPLOY_FRESH_S, allow_newer: bool = False) -> dict:
     """Whether project `name` runs `target` (and `commit`, when given): {"name", "state": OK, PENDING or
@@ -446,6 +482,8 @@ def deploy_status(name: str, entry: dict, target: str, commit: str | None, now: 
         # Its own upgrade restarts the daemon: down meanwhile is a step, not a fault (as release.line).
         row["upgrading"] = (auto.get("outcome") == "running" and bool(auto.get("key")) and
                             _concerns(auto, target, commit) and now - float(auto.get("ts") or 0) < UPGRADE_RUN_S)
+        if not tid and not at_target:
+            row["merge_unlanded"] = _merge_unlanded(db, target, cur)
         if tid:
             from .release import STALE_S, task_activity
             task, last = task_activity(db, tid)
@@ -516,9 +554,14 @@ def deploy_status(name: str, entry: dict, target: str, commit: str | None, now: 
                                  f"(over {_ago(fresh_s)}; daemon {daemon})", "this project's daemon",
                         "at its next completed tick")
         ago = _ago(max(now - tick, 0))
+        from . import overseer
+        try:
+            loop = "; " + overseer.line(json.loads((state / overseer.HEALTH_FILE).read_text()), now)
+        except (OSError, ValueError, AttributeError):
+            loop = "; " + overseer.line(None, now)
         if newer:
-            return done(OK, f"runs {rv} ({(rc or '?')[:12]}), which contains {target}, last tick {ago} ago")
-        return done(OK, f"running {target} ({(rc or '?')[:12]}), last tick {ago} ago")
+            return done(OK, f"runs {rv} ({(rc or '?')[:12]}), which contains {target}, last tick {ago} ago{loop}")
+        return done(OK, f"running {target} ({(rc or '?')[:12]}), last tick {ago} ago{loop}")
     except sqlite3.Error as e:
         return done(CANNOT, f"database unreadable: {e}")
     finally:

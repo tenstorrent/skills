@@ -554,7 +554,10 @@ def supervise(run_dir: Path) -> int:
     guard, watchdog = _start_watchdog(child.pid)
     (run_dir / "child.pid").write_text(f"{child.pid}\n{proc_start(child.pid) or ''}\n")
     niceness = _niceness(child.pid)
-    if nice and niceness is not None and niceness < min(os.nice(0) + nice, 19):
+    # The runner's own level by getpriority: macOS refuses os.nice(0) with EPERM at some levels,
+    # and this check only informs, so it never ends a run.
+    own = _niceness(0)
+    if nice and niceness is not None and own is not None and niceness < min(own + nice, 19):
         print(f"runner: could not lower the agent's priority by {nice} (it runs at nice {niceness})", flush=True)
     reason: list[str] = []
     # The system prompt check (check_instructions): open until it has a verdict.
@@ -725,13 +728,27 @@ def supervise(run_dir: Path) -> int:
             print(f"runner: credential files changed during the run: {changed}", flush=True)
     if bridge is not None:
         exit_info["bridge"] = bridge.stats()   # endpoint fault kinds for routing's fallback (route.py)
-    try:   # before exit.json: the daemon reads the run's output and hand-off only after it
-        from . import redact
-        redact.scrub_run(run_dir)
-    except Exception as e:
-        print(f"runner: could not mask stored secrets in the run: {type(e).__name__}", flush=True)
+    _mask_run(run_dir, exit_info)   # before exit.json: the daemon reads the run's output and hand-off only after it
     _write_exit(run_dir, exit_info)
     return rc
+
+
+def _mask_run(run_dir: Path, exit_info: dict) -> None:
+    """Mask stored secrets and private keys in the run's files. A store it could not read, with no value
+    ever read here, masks nothing: said in the run's log and flagged in exit_info["unmasked"] (the cause,
+    never a value) for the daemon, never passed as masked."""
+    try:
+        from . import redact
+        left: list = []
+        redact.scrub_run(run_dir, left=left)
+        for f in left:
+            print(f"runner: not masked, over {redact.MAX_FILE_BYTES >> 20} MiB: {f}", flush=True)
+        if redact.blind():
+            exit_info["unmasked"] = redact.store_error()
+    except Exception as e:
+        exit_info["unmasked"] = type(e).__name__
+    if exit_info.get("unmasked"):
+        print(f"runner: could not mask stored secrets in the run: {exit_info['unmasked']}", flush=True)
 
 
 def check_pin(run_dir: Path, spec: dict, env: dict) -> dict | None:

@@ -89,6 +89,39 @@ def test_a_user_order_holds_older_queued_tasks_at_dispatch_and_steers_older_runn
     assert not (other_dir / "steer.md").exists()   # a running task on another resource is not told
 
 
+@pytest.mark.parametrize("read", ["orders", "respecs", "task"])
+def test_an_unreadable_user_hold_state_holds_the_task_at_dispatch_until_it_reads_again(env, tmp_path, monkeypatch,
+                                                                                        read):
+    """An OSError reading the user orders, the re-specs or a task record holds every task with a resource
+    off it for that pass (fail closed), raised once however often it repeats; a good read frees them."""
+    from ttp import daemon as dmod
+    from ttp import userorder
+    p, ids, msg, _, _ = _ordered(env, tmp_path)
+    d = dmod.Daemon(p.base)
+    newer = p.db.task(ids["newer"])
+    assert d._resource_hold(newer) is None   # healthy: no order holds a task made after it
+    bare = p.db.add_task("no resource", "s", kind="work", tier="light")
+
+    def boom(*a, **k):
+        raise OSError(5, "Input/output error")
+    with monkeypatch.context() as m:
+        if read == "task":
+            m.setattr(d.p.db, "task", boom)
+        else:
+            m.setattr(userorder, {"orders": "_orders", "respecs": "_respecs"}[read], boom)
+        for _ in range(3):   # every pass holds it; one observation names the error
+            hold = d._resource_hold(newer)
+            assert hold and hold["kind"] == "order_unread" and hold["resource"] == "rig", hold
+            assert "OSError" in dmod.hold_reason(hold) and "Input/output error" in dmod.hold_reason(hold)
+        assert d._resource_hold(p.db.task(bare)) is None   # nothing to hold a task without resources off
+    obs = p.db.q("SELECT text FROM events WHERE source='daemon:user-orders'")
+    assert len(obs) == 1 and "OSError" in obs[0]["text"] and "Input/output error" in obs[0]["text"], obs
+    # Readable again: the hold is gone, no standing hold remains, and the gate is as before.
+    assert d._resource_hold(newer) is None
+    assert (d._resource_hold(p.db.task(ids["old"])) or {}).get("kind") == "order"
+    assert not p.db.paused_resources()
+
+
 def test_an_order_held_task_never_reserves_the_ordered_resource_ahead_of_the_orders_task(env):
     """An older exclusive task that outranks the order's task (better priority) and that the order holds
     off the resource is no slot contender there: it reserves nothing, so the order's task is free."""
@@ -392,3 +425,31 @@ def test_the_started_on_host_check_after_a_task_add_still_sees_the_rest_of_the_b
     assert p.db.task(1)["title"] == "power-cycle rig" and p.db.task(1)["status"] == "cancelled"
     assert [m["text"] for m in p.db.q("SELECT text FROM messages WHERE direction='out' AND chat='c1'")] == [text]
     assert not any("started-on-host check failed" in n for n in p.db.kv(coord.NOTES_KEY, []))
+
+
+def test_a_task_citing_a_user_message_on_another_topic_orders_only_the_resources_its_words_name(env):
+    """A task citing the user's message about prompt caching that lists the test boxes as resources is
+    no user order on them (it held every older task there); one naming a box orders that box only; a
+    task added with user_msg orders all its resources."""
+    from ttp import coordinator as coord, userorder
+    p = make(env)
+    coord.apply(p, [{"type": "task_add", "title": "old soak", "spec": "s", "resources": ["boxa", "boxb"]}])
+    old = p.db.one("SELECT id FROM tasks WHERE title='old soak'")["id"]
+    p.db.x("UPDATE tasks SET created=?", (time.time() - 600,))
+    msg = p.db.x("INSERT INTO messages(ts,direction,kind,text) VALUES(?,'in','user',?)",
+                 (time.time() - 60, "use the 5min cache for continuous work, the 1h cache otherwise"))
+    assert coord.apply(p, [{"type": "task_add", "title": "cache life", "spec": f"user msg #{msg}: cache life",
+                            "resources": ["boxa", "boxb"]}], messages=[msg]) == []
+    assert userorder.active(p.db) == {}
+    assert userorder.holding(p.db, p.config(), p.db.task(old), ["boxa", "boxb"]) is None
+    msg2 = p.db.x("INSERT INTO messages(ts,direction,kind,text) VALUES(?,'in','user',?)",
+                  (time.time() - 30, "reboot boxB-device, it hangs."))
+    assert coord.apply(p, [{"type": "task_add", "title": "reboot", "spec": f"user msg #{msg2}: reboot it",
+                            "resources": ["boxa", "boxb", "boxb-device"]}], messages=[msg2]) == []
+    assert sorted(userorder.active(p.db)) == ["boxb-device"]
+    assert userorder.named(p.db, None, msg2, ["boxb", "boxa", "box"]) == []
+    msg3 = p.db.x("INSERT INTO messages(ts,direction,kind,text) VALUES(?,'in','user',?)",
+                  (time.time() - 10, "do it now"))
+    assert coord.apply(p, [{"type": "task_add", "title": "now", "spec": "do it now", "resources": ["boxa"],
+                            "user_msg": msg3}]) == []
+    assert sorted(userorder.active(p.db)) == ["boxa", "boxb-device"]
