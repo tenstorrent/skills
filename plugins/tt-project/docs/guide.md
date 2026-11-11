@@ -4236,11 +4236,15 @@ Workers can read Slack links you paste, using your Slack connector if you have o
 - Not every feature works the same on every provider yet. The feature parity table in
   [providers.md](providers.md#feature-parity) says, per feature, where Codex, Cursor and the `chat`
   provider match Claude Code, where they differ or miss it, and which open task closes each gap.
-  Where the harness hook does not run (Cursor; Codex with hooks off or another hook source), its
-  guards, the Stop hand-off check and update hand-over by hook are absent: updates arrive through
-  `ttp note` and `ttp steer`: a run that ends without a valid hand-off resumes its session once
-  where the session can be resumed (Codex; `Daemon._handoff_resume`), and otherwise fails the
-  attempt (Cursor, whose chats the harness cannot resume; the next run starts cold).
+  Cursor worker and reviewer runs get the harness hook through the run's `.cursor/hooks.json`
+  (`preToolUse` for shell, edit and MCP calls, `postToolUse` for updates, `stop` for the hand-off
+  check; built from Cursor's bundled code, not run live); Cursor coordinator turns get none. Where
+  the harness hook does not run (Codex with hooks off or another hook source; a Cursor run before
+  the hook's first event), its guards, the Stop hand-off check and update hand-over by hook are
+  absent: updates arrive through `ttp note` and `ttp steer`: a run that ends without a valid
+  hand-off resumes its session once where the session can be resumed (Codex;
+  `Daemon._handoff_resume`), and otherwise fails the attempt (Cursor, whose chats the harness
+  cannot resume; the next run starts cold).
 - Codex and Cursor report tokens but no cost; their spend is estimated from a price table. Set
   your own rates in project.json as `"pricing": {"codex": {"<model>": [input, cached input,
   output]}}` in $ per million tokens (`"default"` covers other models; same for `cursor`).

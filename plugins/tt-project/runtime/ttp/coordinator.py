@@ -723,8 +723,8 @@ FINISHED_DETAIL = 3                  # newest finished tasks shown with a summar
 TITLE_CHARS = 120
 SENT_CHARS = 100
 MUTE_CHARS = 200
-# Every coordinator turn is a fresh session whose digest the provider writes to its cache whole.
-# Every turn, at any effort, sees these background sections as one line while they are as the
+# Every wake resumes the project's one persistent session (compacted in place), so each wake's digest
+# adds to the context it already holds. Every turn, at any effort, sees these background sections as one line while they are as the
 # previous turn saw them (`digest_seen`). The budget gate, open asks and tasks, new events, paused
 # resources and memory changes are always shown whole; the machine ledger collapses per line
 # (LEDGER_SEEN_KEY).
