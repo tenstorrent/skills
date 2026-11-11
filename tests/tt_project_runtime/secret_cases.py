@@ -2046,3 +2046,18 @@ def test_line_scrubber_drops_a_raw_blocks_body_and_keeps_what_follows():
     head = block.splitlines(keepends=True)[0]
     out = b"".join(s.line(x.encode()) for x in (head, "Not a key line.\n", "x\r\n")).decode()
     assert out == f"{redact.KEY_MASK}\nNot a key line.\nx\r\n"
+
+
+def test_output_pump_keeps_a_chunk_read_after_its_drain_deadline(monkeypatch):
+    import io
+    from ttp import runner
+    rfd, wfd = os.pipe()
+    os.write(wfd, b"last line\nno newline")
+    clock = iter([0.0, 5.0, 5.0, 5.0])
+    monkeypatch.setattr(runner.time, "monotonic", lambda: next(clock, 5.0))
+    out = io.BytesIO()
+    pump = runner.OutputPump(rfd, out)
+    pump.ending.set()
+    pump._pump()
+    os.close(rfd), os.close(wfd)
+    assert out.getvalue() == b"last line\nno newline"

@@ -505,7 +505,7 @@ class OutputPump(threading.Thread):
             if not ready and drain_until is None:
                 continue
             chunk = os.read(self.fd, 1 << 16) if ready else b""
-            if not chunk or (drain_until and time.monotonic() > drain_until):
+            if not chunk:
                 break
             self.buf += chunk
             if b"\n" in chunk:
@@ -514,6 +514,8 @@ class OutputPump(threading.Thread):
             if len(self.buf) > PUMP_PARTIAL_MAX:
                 buf, self.buf = self.buf, b""
                 self._put([buf], raw=True)
+            if drain_until and time.monotonic() > drain_until:   # after the chunk: no byte read is lost
+                break
         if self.buf:
             buf, self.buf = self.buf, b""
             self._put([buf])
