@@ -190,8 +190,25 @@ def _init(self, args, *a, **kw):
     _count_spawn(args)
     if not kw.get("shell"):
         args = sshmux.argv(ssh_argv(args), kw.get("env"))
-    with critical():   # a stop mid-spawn would leave a started child its caller never got to record
+    if not active() or _s.depth:
+        return _orig["init"](self, args, *a, **kw)
+    hold()   # a stop while the child starts would leave it running with no Popen to kill it by
+    try:
         _orig["init"](self, args, *a, **kw)
+    except BaseException:
+        release()
+        raise
+    _s.depth -= 1
+    if _s.pending and not _s.fired:   # the budget ran out while it started: stop the step, child and all
+        _s.pending, _s.fired = False, True
+        kill_tree(self)
+        with contextlib.suppress(Exception):
+            _orig["wait"](self, timeout=MIN_WAIT_S)
+        for f in (self.stdin, self.stdout, self.stderr):
+            if f:
+                with contextlib.suppress(OSError):
+                    f.close()
+        raise StepBudgetSpent(_s.step, _cmd(self))
 
 
 def _bounded(proc, call, timeout):
@@ -199,9 +216,10 @@ def _bounded(proc, call, timeout):
         return call(timeout)
     if _s.depth:   # a git write or a commit keeps its own timeout, never none
         return call(CRITICAL_WAIT_S if timeout is None else timeout)
-    room = max(_s.hard - time.monotonic(), MIN_WAIT_S)
-    capped = timeout is None or timeout > room
+    capped = True
     try:
+        room = max(_s.hard - time.monotonic(), MIN_WAIT_S)
+        capped = timeout is None or timeout > room
         return call(room if capped else timeout)
     except subprocess.TimeoutExpired:
         if not capped:
@@ -256,14 +274,24 @@ def _children() -> dict[int, list[int]]:
 
 
 def kill_tree(proc) -> None:
-    """SIGKILL `proc`, every descendant and, when it leads a group of its own, that whole group."""
+    """SIGKILL `proc`, every descendant and, when it leads a group of its own, that whole group. The tree
+    is stopped first, scan by scan until no new descendant shows, so none forks one past the kill."""
     if proc.returncode is not None:
         return
-    kids, tree, todo = _children(), [], [proc.pid]
-    while todo:
-        pid = todo.pop()
-        tree.append(pid)
-        todo.extend(kids.get(pid, ()))
+    tree: list[int] = []
+    for _ in range(5):
+        kids, todo, new = _children(), [proc.pid], []
+        while todo:
+            pid = todo.pop()
+            if pid not in tree:
+                new.append(pid)
+            todo.extend(kids.get(pid, ()))
+        for pid in new:
+            with contextlib.suppress(OSError):
+                os.kill(pid, signal.SIGSTOP)
+        tree += new
+        if not new:
+            break
     try:
         if os.getpgid(proc.pid) == proc.pid != os.getpgrp():
             os.killpg(proc.pid, signal.SIGKILL)

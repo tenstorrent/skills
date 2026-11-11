@@ -307,21 +307,20 @@ def _hung_child(tmp_path, name="hung"):
     return exe, pidf
 
 
-def _grandchild_gone(pidf):
+def _grandchild_gone(pidf, may_not_start=False):
+    """The grandchild `pidf` names has ended (gone or a zombie), waited on until it has, within a bound
+    scaled to the host's load. `may_not_start`: a child stopped before it forked one wrote no pid."""
+    if may_not_start and not (pidf.exists() and pidf.read_text().strip()):
+        return True
     pid = int(pidf.read_text().strip())
-    for _ in range(50):
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            return True
+
+    def gone():
         try:
             with open(f"/proc/{pid}/stat") as f:
-                if f.read().split(") ")[-1].startswith("Z"):
-                    return True
+                return f.read().split(") ")[-1].startswith("Z")
         except OSError:
             return True
-        time.sleep(0.1)
-    return False
+    return _wait_for(gone, _load_scaled(10))
 
 
 def test_a_hung_device_runner_start_is_killed_whole_within_its_bound(env, monkeypatch, tmp_path):
@@ -2150,7 +2149,8 @@ def test_every_tick_step_keeps_the_step_budget_with_a_hung_stub_and_runs_again_n
     assert not slow, f"steps held past the budget: {slow}"
     assert "probe_waiting" in first and "reap_runs" in first
     assert names == first, "the next tick runs every step again"
-    assert pids and all(_grandchild_gone(f) for f in pids), "a hung step's grandchild outlived it"
+    assert pids and all(_grandchild_gone(f, may_not_start=True) for f in pids), \
+        "a hung step's grandchild outlived it"
     said = argv.read_text()
     assert "ConnectTimeout=" in said and "ServerAliveInterval=" in said and "ServerAliveCountMax=" in said
 
@@ -2215,9 +2215,37 @@ def test_every_way_a_step_waits_on_a_child_is_capped_and_the_child_killed_whole(
         assert subprocess.run(["true"]).returncode == 0, "off a step a call is left as it is"
     finally:
         stepclock.uninstall()
-    assert _grandchild_gone(pidf)
+    assert _grandchild_gone(pidf, may_not_start=True)
     [ev] = p.db.q("SELECT * FROM events WHERE kind='tick_step_slow'")
     assert f"killed {exe}" in ev["text"]
+
+
+def test_a_step_stopped_while_its_child_starts_kills_that_child(monkeypatch, tmp_path):
+    """The budget running out inside Popen's start (the stop lands before there is a Popen to kill by)
+    waits until the child is up, then stops the step and kills the child's whole tree."""
+    from ttp import stepclock
+    exe, pidf = _hung_child(tmp_path)
+    started = []
+    stepclock.install()
+    real = stepclock._orig["init"]
+
+    def init(self, *a, **kw):
+        real(self, *a, **kw)
+        started.append(self)
+        stepclock._on_alarm(signal.SIGALRM, None)   # the step's stop, while the start still runs
+    monkeypatch.setitem(stepclock._orig, "init", init)
+    stepclock.begin("hung_start", 600, 600)
+    try:
+        with pytest.raises(stepclock.StepBudgetSpent) as e:
+            subprocess.run([str(exe)])
+    finally:
+        stepclock.end()
+        monkeypatch.setitem(stepclock._orig, "init", real)
+        stepclock.uninstall()
+    assert str(exe) in e.value.cmd
+    [proc] = started
+    assert proc.returncode is not None, "the child the stop caught starting was left running"
+    assert _grandchild_gone(pidf, may_not_start=True)
 
 
 def test_a_cut_unreviewed_pass_that_queued_a_review_looks_again_sooner(env, monkeypatch):
