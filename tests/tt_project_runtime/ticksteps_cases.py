@@ -130,6 +130,7 @@ def test_dispatch_cut_at_its_budget_reaches_the_tasks_it_did_not_walk_next_tick(
     from ttp import daemon as dmod
     p.db.x("UPDATE tasks SET status='done'")
     d = dmod.Daemon(p.base)
+    d.cfg["dispatch"] = {**(d.cfg.get("dispatch") or {}), "batch": False}   # this walks single starts
     held = p.db.add_task("held", "s", kind="code", tier="light", origin="user", priority=2)
     b = p.db.add_task("b", "s", kind="code", tier="light", origin="user", priority=2)
     c = p.db.add_task("c", "s", kind="code", tier="light", origin="user", priority=2)
@@ -165,6 +166,7 @@ def test_dispatch_cut_walk_keeps_an_urgent_task_it_walked_before_unreached_lower
     from ttp import daemon as dmod
     p.db.x("UPDATE tasks SET status='done'")
     d = dmod.Daemon(p.base)
+    d.cfg["dispatch"] = {**(d.cfg.get("dispatch") or {}), "batch": False}   # this walks single starts
     top = p.db.add_task("top", "s", kind="code", tier="light", origin="user", priority=1)
     low = p.db.add_task("low", "s", kind="code", tier="light", origin="user", priority=3)
     monkeypatch.setattr(d, "_workdir_for", lambda t: (str(p.base), None))
