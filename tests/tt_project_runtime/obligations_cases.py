@@ -848,3 +848,91 @@ def test_a_receipt_citing_only_an_owner_hand_off_that_leaves_acceptance_unmet_is
     _ob_handoff(p, other, "built it: 3 rows")
     assert "no longer owed" in ob.record(p, oid2, "receipt", f"#{other} built it", None, now=now)
     assert "no longer owed" in ob.record(p, oid, "receipt", "commit abc123 has the table", None, now=now)
+
+
+def test_an_order_whose_bounded_owner_hands_off_incomplete_stays_open_until_an_explicit_receipt(env, monkeypatch):
+    """The bounded owner ends done marked 'partial:' (delivery incomplete) and a full-delivery successor is
+    attached: the order stays open with its message and due through both and the successor's met finish
+    (the successor carries none of the owner's work), closes only on an explicit receipt, and keeps its
+    history once closed."""
+    import time as _t
+    from ttp import obligations as ob
+    p, d, now, tid, check, mid, raised = _order_setup(env, monkeypatch)
+    oid = ob.add_order(p, "build the deliverable", mid, [tid], due=now + 7200, action_class="change",
+                       now=now).split()[1]
+
+    def still_open():
+        o = ob.get(p.db, oid)
+        assert o["receipt"] is None and o["promise"]["order"] == mid and o["promise"]["due"] == now + 7200, o
+        return o
+    _ob_handoff(p, tid, "partial: 0 of 4 cases qualify, adoption incomplete")
+    p.db.post("out", "here is where it stands", chat="c1", kind="reply")
+    check(_t.time() + 60)
+    still_open()
+    full = p.db.add_task("deliver all 4 cases", "s", kind="work", tier="light")
+    ob.attach(p, oid, [full])
+    o = still_open()
+    assert {tid, full} <= set(ob._owner_ids(o)), o
+    _ob_handoff(p, full, "all 4 cases qualify; adoption done")
+    p.db.post("out", "all 4 cases are in", chat="c1", kind="reply")
+    check(_t.time() + 120)
+    still_open()
+    line = next(ln for ln in ob.lines(p.db) if ln.startswith(oid))
+    assert "held open:" in line and f"#{tid}" in line, line
+    ob.record(p, oid, "receipt", f"#{full} delivered all 4 cases; checked in its hand-off", None, now=now + 200)
+    o = ob.get(p.db, oid)
+    assert o["receipt"] is not None and o["promise"]["order"] == mid, o
+    assert any(ln.startswith(oid) for ln in ob.lines(p.db)), "closed history is kept"
+
+
+def test_an_acknowledgement_only_run_neither_closes_its_task_nor_submits_it_for_review(env, monkeypatch):
+    """A worker run that exits 0 with only an acknowledgement in its output and no hand-off is not done and
+    not in review: its order stays open with its original message and due."""
+    from ttp import obligations as ob
+    from ttp.daemon import Daemon
+    p = make(env)
+    _no_events(p)
+    d = Daemon(p.base)
+    now = time.time()
+    mid = p.db.post("in", "please build the deliverable", chat="c1")
+    tid = p.db.add_task("build the deliverable", "make it", kind="work", tier="light", origin="user")
+    oid = ob.add_order(p, "build the deliverable", mid, [tid], due=now + 7200, action_class="change",
+                       now=now).split()[1]
+    monkeypatch.setenv("TTP_FAKE_RESULT", "none")
+    monkeypatch.setenv("TTP_FAKE_SUMMARY", "Acknowledged; starting on it now.")
+    d.dispatch()
+    _finish_runs(p, d)
+    t = p.db.task(tid)
+    assert t["status"] not in ("done", "review"), dict(t)
+    o = ob.get(p.db, oid)
+    assert o["receipt"] is None and o["promise"]["order"] == mid and o["promise"]["due"] == now + 7200, o
+
+
+def test_an_on_pass_cmd_that_writes_a_review_hand_off_then_exits_nonzero_is_not_success(env, monkeypatch):
+    """A waiting hand-off's on_pass_cmd writes a needs_review hand-off to $TTP_RESULT and exits 1: the task
+    is woken at its own tier, not put in review or done, and its order stays open with its original due."""
+    from ttp import obligations as ob
+    from ttp.daemon import Daemon
+    p = make(env)
+    _sessions(env, monkeypatch, "s1")
+    d = Daemon(p.base)
+    now = time.time()
+    cmd = """printf '{"status": "needs_review", "summary": "acknowledged"}' > "$TTP_RESULT"; exit 1"""
+    monkeypatch.setenv("TTP_FAKE_SESSION", "s1")
+    monkeypatch.setenv("TTP_FAKE_RESULT", json.dumps({
+        "status": "waiting", "summary": "job runs", "waiting_for": "its job", "retry_when": "true",
+        "retry_after_s": 600, "on_pass_cmd": cmd}))
+    mid = p.db.post("in", "please build the deliverable", chat="c1")
+    tid = p.db.add_task("build the deliverable", "make it", kind="work", tier="light", origin="user")
+    oid = ob.add_order(p, "build the deliverable", mid, [tid], due=now + 7200, action_class="change",
+                       now=now).split()[1]
+    d.dispatch()
+    _finish_runs(p, d)
+    assert p.db.task(tid)["status"] == "queued", dict(p.db.task(tid))
+    assert d._start_on_pass(p.db.task(tid), time.time()) is True
+    assert _until_true(lambda: d._poll_on_pass(time.time()) or tid not in d._on_pass)
+    t = p.db.task(tid)
+    res = json.loads(t["result"])
+    assert t["status"] not in ("done", "review") and "exit 1" in res.get("woke", ""), (dict(t), res)
+    o = ob.get(p.db, oid)
+    assert o["receipt"] is None and o["promise"]["order"] == mid and o["promise"]["due"] == now + 7200, o
