@@ -1048,7 +1048,7 @@ def test_gate_judge_same_failure_ignores_a_venv_path_and_reads_long_pytest_heade
     calls = []
     v = gatejudge.judge([a], lambda at, ids: calls.append(at) or (head if at == "head" else base),
                         tmp_path / "e", "b1", "host-a", 1001.0)
-    assert calls == ["head", "base"] and v["pre_existing"] == [a], (calls, v)
+    assert calls == ["base", "head"] and v["pre_existing"] == [a], (calls, v)
 
 
 def _narrow_fails(i: str, line: str) -> tuple[int, str]:
@@ -1080,7 +1080,7 @@ def test_gate_judge_reads_a_narrow_terminals_failure_and_never_reuses_a_saved_ba
     gatejudge.save_base(tmp_path / "e", "host-a", "b1", {a: True}, 1000.0, {a: {"line": "", "msg": "", "src": "", "at": ""}})
     calls.clear()
     v = gatejudge.judge([a], run, tmp_path / "e", "b1", "host-a", 1001.0)
-    assert calls == ["head", "base"] and v["pre_existing"] == [a] and v["other_failure"] == []
+    assert calls == ["base", "head"] and v["pre_existing"] == [a] and v["other_failure"] == []
 
 
 _NESTED = '''import json, os, subprocess, sys
