@@ -46,6 +46,7 @@ from . import ackwait
 from . import charterset
 from . import claimcheck
 from . import dispatchguard
+from . import supersede
 from . import runclass
 from . import configwho
 from . import integrate
@@ -1307,6 +1308,7 @@ class Daemon:
         self._unreviewed_every = float(REVIEW_SWEEP_EVERY_S)   # until its next pass (UNREVIEWED_BACKLOG_EVERY_S on a backlog)
         self._continues_checked = 0.0   # when check_unqueued_continues last ran
         self._stale_checked = 0.0   # when check_stale_duplicates last ran
+        self._supersede_checked = 0.0   # when stop_superseded last ran
         self._queue_trimmed = 0.0   # when expire_queue last ran
         self._local_only_ok: dict[str, str] = {}   # branch -> head found on a remote: not looked at again
         self._local_only_job: dict | None = None   # the check running in its thread, applied by a later tick
@@ -2378,6 +2380,7 @@ class Daemon:
                 self.sweep_unreviewed,
                 self.check_unqueued_continues,
                 self.check_stale_duplicates,
+                self.stop_superseded,
                 self.expire_queue,
                 self.tend_mitigations,
                 self.failover_pinned,
@@ -11614,6 +11617,11 @@ class Daemon:
                 dispatchguard.refuse(db, task["id"], why)   # still queued: back to done, on record
                 fate[task["id"]] = "other"
                 continue
+            if why := supersede.dispatch_hold(db, task):   # a duplicate, or a step a newer order superseded
+                log(self.p, f"task {task['id']} held at dispatch: {why}")
+                supersede.hold(db, task, why)
+                fate[task["id"]] = "other"
+                continue
             # Before _start_hold, which may reserve the task's resource.
             if holds and self._setting_hold(task, holds, now):
                 fate[task["id"]] = "hold"
@@ -17532,6 +17540,20 @@ class Daemon:
             db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
                  (now, f"task:{t['id']}", STALE_DUPLICATE, "normal", text, "queued", t["id"]))
             log(self.p, f"task {t['id']}: {STALE_DUPLICATE} raised")
+
+    def stop_superseded(self) -> None:
+        """Model-free, every supersede.STOP_EVERY_S: a running task superseded since its run started (its
+        change landed through another task, a newer task continues it, every obligation it owns was dropped)
+        is cancelled and its run asked to stop at once; its worktree and branch stay (supersede.py)."""
+        now = time.time()
+        if now - self._supersede_checked < supersede.STOP_EVERY_S:
+            return
+        self._supersede_checked = now
+        for tid in supersede.stop_superseded(self.p.db):
+            for r in self.p.db.q("SELECT id, dir FROM runs WHERE task=? AND status='running'", (tid,)):
+                with contextlib.suppress(OSError):
+                    runner.request_stop(self._run_dir(r))
+            log(self.p, f"task {tid}: superseded while running; cancelled, its run asked to stop")
 
     def expire_queue(self) -> None:
         """Model-free, every queuetrim.EVERY_S: cancel never-started tasks of the stale queued tail

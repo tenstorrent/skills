@@ -138,6 +138,7 @@ from . import schedule as sched
 from . import workernotify
 from . import provallow
 from . import hostrun
+from . import supersede
 from . import userorder
 from . import turnrules
 from .db import (
@@ -5685,6 +5686,8 @@ def _fan_order(p: Project, oid: str | None, msg: int, steps) -> str:
     o = o or {}
     pr = o.get("promise") or {}
     words = o.get("text") or ""
+    if steps:   # queued tasks still carrying a superseded step are held at dispatch (supersede.py)
+        supersede.record_steps(p.db, msg, userorder._words(p.db, [msg])[2], steps)
     return userorder.fan_out(p, f"User order{' ' + o['id'] if o.get('id') else ''} (user msg #{msg}): {clip(words, 400)}",
                              msgs=[msg], owners=obligations._owner_ids(o) if o else (),
                              chat=pr.get("chat") if pr.get("order") == int(msg) else None,
