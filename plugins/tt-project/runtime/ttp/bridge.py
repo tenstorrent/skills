@@ -178,7 +178,9 @@ def remote_command(cfg: dict, agent: str) -> str:
     d = _remote(cfg["socket_dir"])
     sock = _remote(link(cfg, agent))
     return (f'[ -n "$SSH_AUTH_SOCK" ] || {{ echo "ttp bridge: no forwarded agent (the login key may not forward one)" >&2; exit 3; }}; '
-            f"umask 077; mkdir -p {d} && chmod 700 {d} && ln -sfn \"$SSH_AUTH_SOCK\" {sock} && "
+            f"umask 077; {{ [ -d {d} ] || mkdir -p {d}; }} && "
+            f"{{ [ \"$(ls -ld {d} | cut -c5-10)\" = ------ ] || chmod 700 {d}; }} && "
+            f"{{ [ \"$(readlink {sock})\" = \"$SSH_AUTH_SOCK\" ] || ln -sfn \"$SSH_AUTH_SOCK\" {sock}; }} && "
             f'echo "ttp bridge: {agent} agent linked"; while [ -S "$SSH_AUTH_SOCK" ]; do sleep 30; done')
 
 
@@ -384,12 +386,11 @@ def write_block(cfg: dict, box: str) -> str:
     if new == old:
         return "block already current"
     stamp = time.strftime("%Y%m%d-%H%M%S")
-    script = ('set -e; umask 077; mkdir -p "$HOME/.ssh"; c="$HOME/.ssh/config"; '
-              f'if [ -e "$c" ]; then cp -p "$c" "$c.bak-ttp-bridge-{stamp}"; fi; '
-              'cat > "$c.ttp-bridge.tmp"; chmod 600 "$c.ttp-bridge.tmp"; mv "$c.ttp-bridge.tmp" "$c"')
-    w = _box(box, script, inp=new)
+    w = _box(box, replace_config_script(stamp), inp=new)
     if w.returncode != 0:
         raise RuntimeError(f"could not write {box}'s ssh config: {w.stderr.strip()[:200]}")
+    if "unchanged" in w.stdout:
+        return "block already current"
     return f"block written (backup ~/.ssh/config.bak-ttp-bridge-{stamp})" if old else "block written (new config)"
 
 
@@ -398,9 +399,21 @@ def remove_block(box: str) -> str:
     if BEGIN not in r.stdout:
         return "no block"
     stamp = time.strftime("%Y%m%d-%H%M%S")
-    w = _box(box, f'set -e; c="$HOME/.ssh/config"; cp -p "$c" "$c.bak-ttp-bridge-{stamp}"; cat > "$c.ttp-bridge.tmp"; '
-                  'chmod 600 "$c.ttp-bridge.tmp"; mv "$c.ttp-bridge.tmp" "$c"', inp=strip(r.stdout))
-    return "block removed" if w.returncode == 0 else f"could not remove the block: {w.stderr.strip()[:200]}"
+    w = _box(box, replace_config_script(stamp), inp=strip(r.stdout))
+    if w.returncode != 0:
+        return f"could not remove the block: {w.stderr.strip()[:200]}"
+    return "no block" if "unchanged" in w.stdout else "block removed"
+
+
+def replace_config_script(stamp: str) -> str:
+    """Run on the box with the new ~/.ssh/config on stdin: staged outside ~/.ssh and compared there, so
+    a run that changes nothing writes nothing in ~/.ssh; else a backup, then an atomic rename."""
+    return ('set -e; umask 077; c="$HOME/.ssh/config"; t=$(mktemp "${TMPDIR:-/tmp}/ttp-bridge.XXXXXX"); '
+            'trap \'rm -f "$t"\' EXIT; cat > "$t"; '
+            'if [ -e "$c" ] && cmp -s "$t" "$c"; then echo unchanged; exit 0; fi; '
+            'mkdir -p "$HOME/.ssh"; '
+            f'if [ -e "$c" ]; then cp -p "$c" "$c.bak-ttp-bridge-{stamp}"; fi; '
+            'cp "$t" "$c.ttp-bridge.tmp"; chmod 600 "$c.ttp-bridge.tmp"; mv "$c.ttp-bridge.tmp" "$c"; echo written')
 
 
 def setup(cfg: dict, boxes: list[str], platform: str | None = None) -> list[str]:

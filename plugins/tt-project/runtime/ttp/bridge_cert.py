@@ -279,8 +279,10 @@ def install(box: str, c: dict, cert: str, to: int) -> None:
     p = paths(c)
     d, v = _remote(p["dir"]), _remote(p["valid"])
     script = (f"set -e; umask 077; d={d}; [ -f {_remote(p['key'])} ] || {{ echo 'no box key' >&2; exit 4; }}; "
-              f'cat > "$d/cert.tmp"; mv "$d/cert.tmp" {_remote(p["cert"])}; '
-              f"cat > \"$d/valid.tmp\" <<'TTPEOF'\n{valid_script(to, box)}TTPEOF\nmv \"$d/valid.tmp\" {v}")
+              f'cat > "$d/cert.tmp"; f={_remote(p["cert"])}; '
+              'if cmp -s "$d/cert.tmp" "$f"; then rm -f "$d/cert.tmp"; else mv "$d/cert.tmp" "$f"; fi; '
+              f"cat > \"$d/valid.tmp\" <<'TTPEOF'\n{valid_script(to, box)}TTPEOF\n"
+              f'f={v}; if cmp -s "$d/valid.tmp" "$f"; then rm -f "$d/valid.tmp"; else mv "$d/valid.tmp" "$f"; fi')
     r = _box(box, script, inp=cert.strip() + "\n")
     if r.returncode != 0:
         raise RuntimeError(f"could not put the certificate on {box}: {r.stderr.strip()[-200:]}")

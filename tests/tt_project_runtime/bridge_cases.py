@@ -471,3 +471,49 @@ def test_bridge_cert_config_is_checked_and_off_by_default(tmp_path, monkeypatch)
     for b in bad:
         with pytest.raises(bridge.BadConfig):
             bridge.parse({**raw, "cert": {**base, **b}})
+
+
+def test_bridge_writes_to_a_box_only_when_the_content_changed(tmp_path, monkeypatch):
+    # other projects watch the box's ssh folder: a re-run with nothing changed must write nothing there
+    import subprocess
+    from ttp import bridge
+    cfg, box = _cert_env(tmp_path, monkeypatch)
+    scratch = tmp_path / "boxtmp"
+    scratch.mkdir()
+    monkeypatch.setenv("TMPDIR", str(scratch))
+    sshd, conf = box / ".ssh", box / ".ssh" / "config"
+    assert bridge.write_block(cfg, "box-1") == "block written (new config)"
+    first = conf.read_text()
+
+    def frozen():
+        os.utime(conf, (1, 1))
+        os.utime(sshd, (1, 1))
+        return sorted(p.name for p in sshd.iterdir())
+
+    names = frozen()
+    assert bridge.write_block(cfg, "box-1") == "block already current"
+    r = bridge._box("box-1", bridge.replace_config_script("x"), inp=first)   # the box compares too
+    assert r.returncode == 0 and r.stdout.strip() == "unchanged"
+    assert sorted(p.name for p in sshd.iterdir()) == names and conf.read_text() == first
+    assert conf.stat().st_mtime == 1 and sshd.stat().st_mtime == 1 and not list(scratch.iterdir())
+    conf.write_text("Host mine\n  User me\n\n" + first)
+    assert bridge.write_block(cfg, "box-1").startswith("block written (backup")
+    assert conf.read_text().startswith("Host mine") and any(".bak-ttp-bridge-" in n for n in os.listdir(sshd))
+    assert not [n for n in os.listdir(sshd) if n.endswith(".tmp")] and not list(scratch.iterdir())
+    assert bridge.remove_block("box-1") == "block removed" and bridge.BEGIN not in conf.read_text()
+    assert bridge.remove_block("box-1") == "no block"
+    # the agent link: made once, left alone while it already points at this session's agent
+    env = {**os.environ, "HOME": str(box), "SSH_AUTH_SOCK": str(tmp_path / "agent-1")}
+    cmd = bridge.remote_command(cfg, "auto")
+    assert subprocess.run(["sh", "-c", cmd], env=env, capture_output=True, timeout=20).returncode == 0
+    assert cfg["socket_dir"].startswith("~/")
+    d = box / cfg["socket_dir"][2:]
+    ln = d / "auto.sock"
+    assert os.readlink(ln) == env["SSH_AUTH_SOCK"] and oct(d.stat().st_mode & 0o777) == "0o700"
+    os.utime(ln, (1, 1), follow_symlinks=False)
+    os.utime(d, (1, 1))
+    assert subprocess.run(["sh", "-c", cmd], env=env, capture_output=True, timeout=20).returncode == 0
+    assert ln.lstat().st_mtime == 1 and d.stat().st_mtime == 1
+    env["SSH_AUTH_SOCK"] = str(tmp_path / "agent-2")
+    assert subprocess.run(["sh", "-c", cmd], env=env, capture_output=True, timeout=20).returncode == 0
+    assert os.readlink(ln) == env["SSH_AUTH_SOCK"]
