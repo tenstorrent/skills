@@ -123,6 +123,9 @@ FAULT_RETRY_S = 600   # for this long, or until the checks config changes; then 
 ENV_FAULT_HOSTS = 2   # the checks failed at import this often on spill hosts: one fault of the spill env config
 ENV_RETRY_S = 900   # after which (or once the checks config changes) a run tries the spill hosts again
 PROBE_TIMEOUT_S = 30
+LOAD_NEAR = 0.8   # no check starts on a spill host whose 1-minute load (with this machine's runs not yet in it) is this x its cores
+LOAD_LAG_S = 90.0   # a claim this recent may not show in its host's 1-minute load yet: its cores count as load
+BACKOFF_S, BACKOFF_MAX_S = 60.0, 900.0   # an unreachable host is not probed again for this long, doubling per failure
 DEVICE_SUFFIX = "-device"
 DEVICE_WHY = "a device job runs there: "   # how a device-busy reason starts (device_busy, _device_holders)
 BROKER_TIMEOUT_S = 10.0   # one read of a broker's status; past it the device locks alone decide
@@ -742,19 +745,19 @@ def probe(alias: str, beside_device: bool = False) -> tuple[int, str, str]:
         r = subprocess.run(remotecheck._ssh(alias, _probe_script()), stdin=subprocess.DEVNULL, capture_output=True,
                            text=True, timeout=PROBE_TIMEOUT_S)
     except subprocess.TimeoutExpired:
-        return 0, f"ssh timed out after {PROBE_TIMEOUT_S} s", ""
+        return _failed(alias, f"ssh timed out after {PROBE_TIMEOUT_S} s")
     except OSError as e:
-        return 0, f"cannot run ssh: {e}", ""
+        return _failed(alias, f"cannot run ssh: {e}")
     if r.returncode == 255:
         from . import sshagent
         if sshagent.locked(r.stderr or ""):
-            return 0, f"ssh cannot reach it: {sshagent.WHY}", ""
-        return 0, f"ssh cannot reach it: {(r.stderr.strip().splitlines() or ['exit 255'])[-1][:200]}", ""
+            return 0, f"ssh cannot reach it: {sshagent.WHY}", ""   # this machine's agent, not the host
+        return _failed(alias, f"ssh cannot reach it: {(r.stderr.strip().splitlines() or ['exit 255'])[-1][:200]}")
     if r.returncode == 3:
         return 0, "it lacks git or tar", ""
     m = re.search(r"^ttp-spill (\d+) (\d+) (\d+)(?: (\d+(?:\.\d+)?|-))?$", r.stdout, re.M)
     if r.returncode != 0 or not m:
-        return 0, f"its probe failed (exit {r.returncode})", ""
+        return _failed(alias, f"its probe failed (exit {r.returncode})")
     busy, note = _device_holders(r.stdout)
     if busy and not beside_device:
         return 0, busy, ""
@@ -762,12 +765,27 @@ def probe(alias: str, beside_device: bool = False) -> tuple[int, str, str]:
     cores, mem_kib, running = (int(x) for x in m.groups()[:3])
     load = float(m[4]) if m[4] and m[4] != "-" else None
     _READ[alias] = (cores, load)
-    n = checklane.host_slots(cores, mem_kib / (1024 * 1024) if mem_kib else None, load, running)
+    _note_host(alias, cores=cores, load=load)
+    # This machine's runs started there in the last LOAD_LAG_S count as load already: many picks at once
+    # each see the same 1-minute load, which shows none of them yet.
+    seen = None if load is None else load + _pending_cores(alias, cores)
+    if seen is not None and cores > 0 and seen >= LOAD_NEAR * cores:
+        return 0, (f"its load is near its cores (load {load:g}"
+                   + (f", {seen - load:g} more for this machine's runs just started" if seen > load else "")
+                   + f", of {cores} cores; no check starts at {LOAD_NEAR:g} x or above, "
+                   f"{running} check(s) running)"), note
+    n = checklane.host_slots(cores, mem_kib / (1024 * 1024) if mem_kib else None, seen, running)
     if n > 0:
         return n, "", note
     return 0, (f"its {running} running check(s) fill it" if load is None
                else f"its idle cores and memory fit no check now (load {load:g} of {cores} cores, "
                     f"{running} check(s) running)"), note
+
+
+def _failed(alias: str, why: str) -> tuple[int, str, str]:
+    """probe's answer for a host that did not answer: backed off (_note_host)."""
+    _note_host(alias, failed=why)
+    return 0, why, ""
 
 
 _OUT_OF_REACH = ("ssh ", "cannot run ssh", "it lacks", "its probe failed", "its pre-run hook error")   # probe and hook
@@ -980,6 +998,17 @@ class Claim:
         self.lock = lock
         self.workers = 0   # the test workers the run takes there (workers); 0: it sizes itself
 
+    def note(self, rec: dict) -> None:
+        """Rewrite its claim file's record as `rec`."""
+        if self.f is not None:
+            try:
+                self.f.seek(0)
+                self.f.truncate(0)
+                self.f.write(json.dumps(rec))
+                self.f.flush()
+            except OSError:
+                pass
+
     def close(self) -> None:
         if self.lock is not None:
             self.lock.close()
@@ -1014,6 +1043,83 @@ def _claim(alias: str, free: int, rec: dict) -> Claim | None:
 def _ours(alias: str) -> int:
     """This machine's live claims on `alias`: they are among the host's running checks already."""
     return sum(1 for r in holders() if r.get("host") == alias)
+
+
+def _state_file(host: str) -> Path:
+    return claim_dir() / f"{host}.state"   # not *.json: holders reads those as claims
+
+
+def host_state(host: str) -> dict:
+    """What this machine last learned of spill host `host` (_note_host): its cores and load at `at`, and
+    while it failed to answer, `fails` in a row and `until` (no probe before)."""
+    try:
+        r = json.loads(_state_file(host).read_text() or "{}")
+    except (OSError, ValueError):
+        return {}
+    return r if isinstance(r, dict) else {}
+
+
+def _note_host(host: str, cores: int = 0, load: float | None = None, failed: str = "",
+               now: float | None = None) -> None:
+    """Record a probe of `host`: its cores and load (which ends a back-off), or `failed` (why it did not
+    answer), which backs it off BACKOFF_S, doubling per failure in a row up to BACKOFF_MAX_S. Shared by
+    every project of this machine, so one unreachable host costs one probe timeout per back-off, not one
+    per pick."""
+    now = time.time() if now is None else now
+    st = host_state(host)
+    if failed:
+        n = int(st.get("fails") or 0) + 1
+        st.update(fails=n, why=failed[:200], until=now + min(BACKOFF_MAX_S, BACKOFF_S * 2 ** (n - 1)))
+    else:
+        st = {"cores": cores, "load": load, "at": now}
+    try:
+        claim_dir().mkdir(parents=True, exist_ok=True)
+        from . import project
+        project.durable_write(_state_file(host), json.dumps(st), sync=False)
+    except OSError:
+        pass
+
+
+def backed_off(host: str, now: float | None = None) -> str:
+    """Why `host` is not probed now (its last probes failed: _note_host), else ""."""
+    now = time.time() if now is None else now
+    st = host_state(host)
+    if not st.get("fails") or float(st.get("until") or 0) <= now:
+        return ""
+    from . import timefmt
+    return (f"{st.get('why') or 'ssh cannot reach it'}; backing off after {st['fails']} failed probe(s), "
+            f"next try at {timefmt.clock(now=float(st['until']))}")
+
+
+def _run_cores(r: dict, cores: int) -> int:
+    """The cores claim `r` takes on a host of `cores`: its test workers, else one run's (checklane.run_cores)."""
+    from . import checklane
+    return int(r.get("workers") or 0) or checklane.run_cores(None, cores or None)
+
+
+def _pending_cores(host: str, cores: int, now: float | None = None) -> int:
+    """The cores of this machine's claims on `host` from the last LOAD_LAG_S: not in its 1-minute load yet."""
+    now = time.time() if now is None else now
+    return sum(_run_cores(r, cores) for r in holders()
+               if r.get("host") == host and now - float(r.get("since") or 0) < LOAD_LAG_S)
+
+
+def used_share(host: str, recs: list | None = None, now: float | None = None) -> float:
+    """How full `host` looks from here, 0 to 1 or more: its load at the last probe (if recent) plus the cores
+    of this machine's claims there since, over its cores. pick tries the emptiest host first, so a share of
+    runs follows each host's free cores and no one host takes them all. Unknown cores: its claims count."""
+    now = time.time() if now is None else now
+    recs = holders() if recs is None else recs
+    st = host_state(host)
+    cores = int(st.get("cores") or 0)
+    ours = [r for r in recs if r.get("host") == host]
+    if cores <= 0:
+        return float(len(ours))
+    at = float(st.get("at") or 0)
+    fresh = now - at < 300 and st.get("load") is not None
+    since = at - LOAD_LAG_S if fresh else 0.0   # runs just before the probe may not show in its load yet
+    load = float(st["load"]) if fresh else 0.0
+    return (load + sum(_run_cores(r, cores) for r in ours if float(r.get("since") or 0) >= since)) / cores
 
 
 def all_off(off: str) -> bool:
@@ -1113,10 +1219,12 @@ def pick(p, cfg: dict, tell, what: str = "", off: str = "", why_here: str = "") 
         tell(f"no spill host could take the checks, waiting here: {env}")
         _note_pick(p.name, "", [f"{alias} ({env})" for alias in hosts(cfg)])
         return None
-    mine = [r.get("host") for r in holders()]
+    mine, now = holders(), time.time()
     tried = [e.rpartition(":")[0] for e in off.split(",")]
-    # Spread: hosts these checks did not fail on yet, then those running fewer of this machine's checks, first.
-    for alias in sorted(hosts(cfg), key=lambda h: (h in tried, mine.count(h))):
+    # Spread: hosts these checks did not fail on yet, then those not backed off, then the emptiest (its load
+    # and this machine's runs there over its cores: used_share) first, so runs follow free cores.
+    for alias in sorted(hosts(cfg), key=lambda h: (h in tried, bool(backed_off(target(h)[1], now)),
+                                                  used_share(target(h)[1], mine, now))):
         machine, host = target(alias)
         if alias in keep or host in keep:
             skipped.append(f"{alias} (these checks did not pass there in this run)")
@@ -1124,7 +1232,7 @@ def pick(p, cfg: dict, tell, what: str = "", off: str = "", why_here: str = "") 
         beside = beside_device(cfg, alias)   # the project lets its checks run there beside a device job
         why = allowed(p, cfg, alias)
         usable = not why   # past `allowed`, a skip is the host being busy unless it is out of reach
-        why, dev = why or lock_busy(p, cfg, alias), ""
+        why, dev = why or backed_off(host, now) or lock_busy(p, cfg, alias), ""
         if not why and beside:
             dev = device_busy(p, cfg, host)
             _note_skip(host, "", p.name, own_only=True)   # this project's earlier skip no longer holds
@@ -1153,6 +1261,8 @@ def pick(p, cfg: dict, tell, what: str = "", off: str = "", why_here: str = "") 
             from . import testslots
             top = testslots.sizes(cfg, cores) if cores > 0 else None   # one run's limit, sized to that host
             got.workers = workers(cores, load, max(0, _ours(host) - 1), top[1] if top else 0)
+            got.note({**rec, "host": host, **({"beside": dev[:300]} if dev else {}),
+                      **({"workers": got.workers} if got.workers else {})})   # its cores, for used_share
             note_here(p.name, "")   # this run is on a spill host now: no reason to show it here
             tell(f"spilling to {alias}: "
                  + (why_here or f"the slots here stayed busy for {after_s(cfg):g} s")

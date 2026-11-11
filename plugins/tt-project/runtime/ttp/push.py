@@ -991,8 +991,8 @@ def run_slot(run: list, head: str, say: Callable[[str], None], priority: str = "
     """The slot a push's check run holds: check_slot only when one of `run` runs here and is no light
     check (checklane.is_light). Checks run on another host (remote_host) use none of this machine's
     CPU: they take no host-wide checks slot or test slots here and never wait for this machine's load
-    guard; they wait instead while their host is overloaded (remoteload.wait), at most
-    checks.push_load_wait_s, then go ahead."""
+    guard; they wait instead while their host's demand is near its cores (remoteload.wait), never
+    starting there while it is."""
     if proj is None and (base := os.environ.get("TTP_PROJECT")):
         proj = Project(base)
     cfg = proj.config() if proj else {}

@@ -5358,7 +5358,7 @@ def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: boo
     from . import push
     # Checks that run on other hosts (push.remote_host), with at most light ones here, use none of this
     # machine's CPU: no checks slot or test slots here, no wait for its load guard; they wait while
-    # their host is overloaded instead (remoteload.wait), at most checks.push_load_wait_s.
+    # their host's demand is near its cores instead (remoteload.wait), never starting there while it is.
     pats = checklane.light_patterns(cfg)
     if (hosts := list(dict.fromkeys(h for c in cmds or () if (h := push.remote_host(c))))) and all(
             push.remote_host(c) or checklane.is_light(str(c), pats) for c in cmds):

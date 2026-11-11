@@ -2340,10 +2340,87 @@ def test_spill_host_slots_follow_idle_cores_and_memory_and_the_probe_reads_its_l
     assert checkspill.probe("h") == (checklane.default_slots(64, 200), "", ""), "an unread load: '-'"
     out["line"] = f"ttp-spill 64 {200 * gib} 2 60"
     n, why, _ = checkspill.probe("h")
-    assert n == 0 and "load 60 of 64 cores" in why, why
+    assert n == 0 and "load 60, of 64 cores" in why and "0.8 x" in why, why
     out["line"] = "ttp-spill 64 x 2"
     assert checkspill.probe("h")[0] == 0 and "probe failed" in checkspill.probe("h")[1]
 
+
+
+def _spill_hosts_read(monkeypatch, loads: dict, cores=64, mem_gib=200):
+    """The spill probe over ssh answers per host from `loads` ({alias: 1-minute load, or None: ssh cannot
+    reach it}); every other command runs as before. Returns the probes run per host."""
+    from ttp import checkspill, remotecheck
+    real, real_ssh, seen = subprocess.run, remotecheck._ssh, {}
+    monkeypatch.setattr(remotecheck, "_ssh", lambda alias, script, *a, **k: (
+        ["fake-spill-probe", alias] if script == checkspill._probe_script() else real_ssh(alias, script, *a, **k)))
+
+    def run(cmd, *a, **k):
+        if not (isinstance(cmd, list) and cmd[:1] == ["fake-spill-probe"]):
+            return real(cmd, *a, **k)
+        host = cmd[1]
+        seen[host] = seen.get(host, 0) + 1
+        if loads[host] is None:
+            return subprocess.CompletedProcess(cmd, 255, "", f"ssh: connect to host {host}: No route to host\n")
+        return subprocess.CompletedProcess(
+            cmd, 0, f"ttp-spill {cores} {mem_gib * 1024 * 1024} 0 {loads[host]}\nttp-spill-dev-end none\n", "")
+    monkeypatch.setattr(checkspill.subprocess, "run", run)
+    return seen
+
+
+def test_spill_never_starts_a_check_on_a_host_whose_load_is_near_its_cores(env, tmp_path, monkeypatch):
+    """#8016 (user msg #2469: runs kept choking one box): a host whose 1-minute load is at or above
+    checkspill.LOAD_NEAR x its cores gets no new check, whatever its slots; this machine's runs started there
+    within LOAD_LAG_S count as load already (the 1-minute load shows them late), so a burst of picks fills a
+    host only to the gate and then waits, never piling on."""
+    from ttp import checkspill
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a", "check-host-b"])
+    _spill_hosts_read(monkeypatch, {"check-host-a": 52, "check-host-b": 4})
+    n, why, _ = checkspill.probe("check-host-a")
+    assert n == 0 and "load 52, of 64 cores" in why and "0.8 x" in why, why
+    told, got = [], []
+    try:
+        while len(got) < 20 and (c := checkspill.pick(p, p.config(), told.append, "pytest -q")) is not None:
+            got.append(c)
+        assert got and {c.host for c in got} == {"check-host-b"}, told
+        assert len(got) < 20, "the gate held the burst"
+        assert "check-host-a (its load is near its cores (load 52, of 64 cores" in told[-1], told[-1]
+        assert "more for this machine's runs just started" in told[-1], told[-1]
+        assert 4 + checkspill._pending_cores("check-host-b", 64) >= checkspill.LOAD_NEAR * 64
+        later = time.time() + checkspill.LOAD_LAG_S + 1
+        assert checkspill._pending_cores("check-host-b", 64, now=later) == 0, "the load shows them by then"
+    finally:
+        for c in got:
+            c.close()
+
+
+def test_an_unreachable_spill_host_backs_off_and_its_share_spreads_over_the_others(env, tmp_path, monkeypatch):
+    """#8016: a host whose probe fails backs off (60 s, doubling to 900 s; a state file every project here
+    reads) and is tried last until then, never probed at each pick; the runs it would take spread over the
+    other hosts by their free cores, never all to one."""
+    from ttp import checkspill
+    names = ["down", "check-host-a", "check-host-b", "check-host-c"]
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, names, charter=names)
+    probes = _spill_hosts_read(monkeypatch, {"down": None, "check-host-a": 0, "check-host-b": 0, "check-host-c": 0})
+    told, got = [], []
+    try:
+        for _ in range(6):
+            got.append(checkspill.pick(p, p.config(), told.append, "pytest -q"))
+        hosts = [c.host for c in got if c is not None]
+        assert len(hosts) == 6 and {h: hosts.count(h) for h in set(hosts)} == \
+            {"check-host-a": 2, "check-host-b": 2, "check-host-c": 2}, (hosts, told)
+        assert probes["down"] == 1, probes
+        why = checkspill.backed_off("down")
+        assert "ssh cannot reach it" in why and "backing off after 1 failed probe" in why, why
+        assert checkspill.probe("down")[0] == 0
+        st = checkspill.host_state("down")
+        assert st["fails"] == 2 and 100 < st["until"] - time.time() <= 2 * checkspill.BACKOFF_S, st
+        assert checkspill.backed_off("down", now=time.time() + checkspill.BACKOFF_MAX_S + 1) == ""
+        # A probe that reads again ends the back-off.
+        _spill_hosts_read(monkeypatch, {"down": 0})
+        assert checkspill.probe("down")[0] > 0 and checkspill.backed_off("down") == ""
+    finally:
+        for c in got:
+            c and c.close()
 
 # The account's Slurm overflow (slurmcheck): fake sbatch, squeue, sacct and scancel run through the fake
 # ssh. FAKE_SLURM=<dir> holds their logs and job states; FAKE_SLURM_MODE: run (the job runs at once and
@@ -3274,13 +3351,14 @@ def test_spill_pick_spreads_runs_across_hosts_with_room_and_checks_status_says_w
     p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["down", "check-host-a", "check-host-b"])
     told = []
     first = checkspill.pick(p, p.config(), told.append, "pytest -q")
+    lines = checkspill.pick_lines(p.name)
+    assert any(line.startswith("  spill host down took no run: ssh cannot reach it") for line in lines), lines
     second = checkspill.pick(p, p.config(), told.append, "pytest -q")
     try:
         assert first is not None and second is not None
         assert (first.host, second.host) == ("check-host-a", "check-host-b"), told
         lines = checkspill.pick_lines(p.name)
-        assert lines[0] == "last spill pick (0 min ago) took check-host-b", lines
-        assert any(line.startswith("  spill host down took no run: ssh cannot reach it") for line in lines), lines
+        assert lines == ["last spill pick (0 min ago) took check-host-b"], "the unreachable host backs off: tried last"
         off = ",".join(f"{h}:fail" for h in ("down", "check-host-a", "check-host-b"))
         assert checkspill.pick(p, p.config(), told.append, "pytest -q", off) is None
         lines = checkspill.pick_lines(p.name)

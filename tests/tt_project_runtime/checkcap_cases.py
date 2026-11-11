@@ -11424,7 +11424,7 @@ def _remote_load(monkeypatch, readings: dict):
     from ttp import remoteload
     monkeypatch.setenv("TTP_CHECKS_LOAD_GUARD", "1")
     monkeypatch.setattr(remoteload, "reading",
-                        lambda h: readings[h].pop(0) if len(readings[h]) > 1 else readings[h][0])
+                        lambda h, **k: readings[h].pop(0) if len(readings[h]) > 1 else readings[h][0])
     monkeypatch.setattr(remoteload, "POLL_S", 0.01)
 
 
@@ -11451,8 +11451,9 @@ def test_push_checks_on_a_remote_host_skip_this_hosts_load_guard_checks_slot_and
 
 
 def test_push_checks_on_an_overloaded_remote_host_wait_for_it_and_say_so(env, monkeypatch):
-    """#153: checks run on a host whose runnable demand is above checks.load_guard x its cores wait for it
-    to drop and say which host and why; past checks.push_load_wait_s they go ahead anyway."""
+    """#153, #8016: checks run on a host whose runnable demand is near its cores (checks.load_guard, at most
+    checkspill.LOAD_NEAR x) wait for it to drop and say which host and why; they never start there anyway,
+    however long it stays overloaded, and say so again past checks.push_load_wait_s."""
     from ttp import push, remoteload
     p = make(env)
     monkeypatch.setattr(push, "check_slot", lambda *a, **k: pytest.fail("no local checks slot"))
@@ -11463,14 +11464,33 @@ def test_push_checks_on_an_overloaded_remote_host_wait_for_it_and_say_so(env, mo
     assert slot.f is None and len(told) == 1, told
     assert "check host checkhost's CPU is overloaded" in told[0] and "90.0 cores" in told[0] and "64 cores" in told[0]
     assert "waiting for it to drop" in told[0] and "300s" in told[0]
-    # Past the bound it starts anyway; an unreadable host never holds it.
-    monkeypatch.setenv(testslots_env := "TTP_CHECKS_PUSH_LOAD_WAIT_S", "0")
-    _remote_load(monkeypatch, {"checkhost": [(90.0, 64)]})
-    told = []
-    assert remoteload.wait(["checkhost"], told.append, push.testslots.push_load_wait_s({})) and "starting anyway" in told[-1]
-    monkeypatch.delenv(testslots_env)
+    # 55 of 64 cores is past 0.8 x even with checks.load_guard 1: it waits.
+    assert remoteload.factor() == 0.8
+    _remote_load(monkeypatch, {"checkhost": [(55.0, 64)] * 6 + [(20.0, 64)]})
+    told, now = [], [0.0]
+    def sleep(_s):
+        now[0] += 100
+    assert remoteload.wait(["checkhost"], told.append, 0, sleep=sleep, clock=lambda: now[0]) == ""
+    assert now[0] >= 500 and not any("anyway" in t for t in told), told
+    assert any("still waiting after" in t for t in told), told
     _remote_load(monkeypatch, {"checkhost": [None]})
-    assert remoteload.wait(["checkhost"], told.append, None) == ""
+    assert remoteload.wait(["checkhost"], told.append, None) == "", "an unreadable host never holds it"
+
+
+def test_remote_checks_started_just_now_count_as_load_so_parallel_starts_never_pile_on_one_host(env, monkeypatch):
+    """#8016: the 1-minute load shows none of the runs started there in the last minute, so each start from
+    this machine is recorded and counts one run's cores (checklane.run_cores) until it shows: a host at 3 of
+    64 cores takes a few starts, then holds the next until its earlier ones age out."""
+    from ttp import checklane, remoteload
+    make(env)
+    _remote_load(monkeypatch, {"checkhost": [(3.0, 64)]})
+    per = checklane.run_cores(None, 64)
+    fits = sum(1 for _ in range(40) if not remoteload.held("checkhost", start=True))
+    assert 1 <= fits < 40 and fits == sum(1 for k in range(40) if 3 + k * per < 0.8 * 64), (fits, per)
+    why = remoteload.held("checkhost")
+    assert why and "just started there from this machine" in why, why
+    later = time.time() + remoteload.LAG_S + 1
+    assert remoteload.held("checkhost", now=lambda: later) == "", "older starts show in the load by then"
 
 
 def test_local_push_checks_still_take_a_checks_slot_and_never_read_a_remote_host(env, monkeypatch):

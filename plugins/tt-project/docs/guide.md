@@ -2164,8 +2164,10 @@ session and stateless coordinators on every provider.
   Checks that run on another host (a check's own `"host"`, `delivery.checks_host` or a spill host), with at most
   light checks here, use none of this host's CPU: push checks and `ttp checks` take no host-wide checks slot or
   test slots here and never wait for this host's guard. They wait instead while their host's runnable demand,
-  read over ssh from its `/proc/stat` (cached 30 s), is above `checks.load_guard` times its cores, at most
-  `checks.push_load_wait_s`, and say which host holds them; an unreadable host never holds them.
+  read over ssh from its `/proc/stat` (cached 30 s, read fresh just before a start), with one run's cores for
+  each run this machine started there in the last 90 s (the load shows them late), is at or above 0.8 x its
+  cores (`checks.load_guard` x if lower), and say which host holds them, again every `checks.push_load_wait_s`;
+  they never start there while it is, however long that takes. An unreadable host never holds them.
   Waiters are served first-come: one whose project is at its budget lets other projects go first but keeps its
   place in its project's line, where the most urgent task priority goes first, then arrival, so that waiter gets
   the next freed slots. A priority-1 check whose project's budget is held only by less urgent runs takes one extra
@@ -2227,10 +2229,13 @@ session and stateless coordinators on every provider.
   `delivery.checks_spill_hosts` (an ordered list of ssh aliases, default empty: checks never leave this machine)
   lets a run that may spill try those hosts before it takes a place here (`delivery.checks_spill_first`, default
   true; false: only after waiting `delivery.checks_spill_after_s`, default 60 s, here) and run, with the test
-  workers that host's idle cores give it (cores less its 1-minute load), on the first listed host the
+  workers that host's idle cores give it (cores less its 1-minute load), on the emptiest host (its load plus
+  this machine's runs there, over its cores; no fixed per-host cap) the
   charter names, the machines list holds, no pause covers and whose `ttp lock <alias>` nobody else holds (the run
-  holds it shared while it runs), where no device job runs, that ssh reaches and that has a free slot; others
-  are skipped with the reason and the run keeps its place here. On a workstation or laptop,
+  holds it shared while it runs), where no device job runs, that ssh reaches, whose 1-minute load (with this
+  machine's runs started there in the last 90 s) is under 0.8 x its cores and that has a free slot; others
+  are skipped with the reason and the run keeps its place here. A host whose probe fails backs off (60 s,
+  doubling to 15 min, for every project on the machine) and is tried last until then. On a workstation or laptop,
   `delivery.checks_remote_only` (default `auto`: on there; `true`/`false` overrides) makes a heavy run wait
   for a busy spill host instead of taking a place here; it runs here, niced, only when every host is out of
   reach. Light checks (plugin validate, quick lints) stay here. A check that runs an agent CLI (`claude`, `codex`,
