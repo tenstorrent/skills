@@ -3086,6 +3086,14 @@ session and stateless coordinators on every provider.
   1 the push failed; each move is logged to `state/channel_tags.jsonl`. Creating a tag is unchanged.
   The coordinator may set `new_branch` and `never_force` true itself, `lease` only on the user's
   word.
+- `delivery.integration_branch` (`ttp/integration` when unset) is the one branch per repo that
+  compatible reviewed changes land on when the project has no `delivery.push_branch` (a PR project,
+  through one draft PR); with a push branch, the push branch is the integration branch. A code task
+  that finishes on a branch a queued review already covers (a `pr_branch:` task stacked on it, a
+  batch) joins that review rather than getting its own: the review lists each member with its
+  acceptance criteria and each finding names its member (`task #<id>:`). A change that conflicts on
+  the integration branch (`git merge-tree`) or has a `no_push:` line keeps its own branch, and
+  `ttp status` shows the integration branch, what waits on it and each change kept apart with why.
 - `delivery.own_push` (`existing_only` when unset) says which remote branches besides the push branch
   `ttp push --own` may push to, and every push that publishes as with `--own` (a notes branch, a
   `pr_branch:` or `rebases:` task). The branch is the one the task was built on (its latest

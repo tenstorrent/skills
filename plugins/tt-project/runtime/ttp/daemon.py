@@ -48,6 +48,7 @@ from . import claimcheck
 from . import dispatchguard
 from . import runclass
 from . import configwho
+from . import integrate
 from . import sidefx
 from . import looks
 from . import machinecap
@@ -18084,6 +18085,7 @@ class Daemon:
                     if ext:
                         self._name_external_head(task, t, ext)
                     else:
+                        self._join_shared_review(task, t)
                         self._name_new_head(task, t)
                         self._precheck_open(task, t)
                     return t["id"], False
@@ -18123,6 +18125,7 @@ class Daemon:
             else:
                 changes = worktree.diff_lines(self.p, [branch]) if branch else None
                 full = worktree._git(self.p.root, "rev-parse", branch) if changes else ""
+                integrate.record_member_head(self.p.root, task["id"], full)
             head = full[:12]
         except Exception as e:
             log(self.p, f"task {task['id']}: no review queued, its diff was not read: {e}")
@@ -18464,6 +18467,45 @@ class Daemon:
                 f"({checks / 'checks.log'} has it all). A pass is recorded, so `ttp checks` there reuses it. "
                 f"The push queue runs the full checks again on the commit it pushes: run only focused tests "
                 f"of what changed.")
+
+    def _join_shared_review(self, task: dict, review: dict) -> None:
+        """Code task `task` finished on a branch a still queued review already covers for another
+        member (a batch, `pr_branch:` lines, overlap routing): it joins that review rather than getting
+        one of its own (user msgs #2407, #2414). The review then depends on it too, records the head it
+        handed off (integrate.record_member_head: its commits are fork point..that head) and lists every
+        member with its acceptance criteria (integrate.members_block), so each finding names its task.
+        A fix of a failed review is no new member: its re-review already covers it."""
+        db, branch = self.p.db, task.get("branch")
+        deps = dependency_ids(review)
+        if review["status"] != "queued" or review["kind"] != "review" or not branch or task["id"] in deps \
+                or str(task.get("title") or "").startswith("Fix review #") or task.get("kind") != "code":
+            return
+        # It shares the branch when it works on a member's branch, or on its own branch built on one
+        # (`pr_branch:`: the member's worktree still holds that branch, worktree.fix_branches).
+        on = {branch, worktree.carried_branch(task)} - {""}
+        others = [m for m in integrate.members(db, review) if m.get("branch") in on]
+        if not others:
+            return
+        try:
+            full = worktree._git(self.p.root, "rev-parse", branch)
+            integrate.record_member_head(self.p.root, task["id"], full)
+        except Exception as e:
+            log(self.p, f"task {task['id']}: its head on {branch} not recorded for review #{review['id']}: {e}")
+            return
+        with db.tx():
+            fresh = db.task(review["id"])
+            if not fresh or fresh["status"] != "queued":
+                return
+            deps = dependency_ids(fresh)
+            if task["id"] in deps:
+                return
+            deps = [*deps, task["id"]]
+            spec = integrate.with_members(fresh.get("spec") or "", [*integrate.members(db, fresh), task],
+                                          tip=(branch, full))
+            db.update_task(review["id"], depends_on=deps, spec=spec)
+        review.update(depends_on=json.dumps(deps), spec=spec)
+        log(self.p, f"task {task['id']}: joined review #{review['id']} of shared branch {branch} "
+                    f"(members {', '.join(f'#{i}' for i in deps if isinstance(i, int))})")
 
     def _name_new_head(self, task: dict, review: dict) -> None:
         """A queued re-review of a failed review gets the new head its fix ended on, and the size of

@@ -688,6 +688,7 @@ EXTRA_KEYS = {
                  "pr_body_check",   # a project's own PR body check before gh pr create/edit (prbody)
                  "ai_tag",   # the AI-authorship tag a post to others ends with (aitag)
                  "rebase_replace", "never_force",   # whether a rebase replaces its branch (rebase_replace)
+                 "integration_branch",   # where reviewed changes land on a project with no push branch (integrate)
                  "channel_tags"},   # release-channel tags a forward move may update under never_force (channeltag)
     "jev": {"via", "url", "model"},
     "effort_ab": {"winner", "decided_at"},   # the end rule's result, written by effortab.conclude

@@ -1854,6 +1854,8 @@ def status_text(p: Project, verbose: bool = False) -> str:
         lines.append(pq)
     from . import push
     lines.extend(push.status_lines(p))
+    from . import integrate
+    lines.extend(integrate.status_lines(db, cfg, quiet=True))
     if rows:
         lines.append("waiting:")
     for tid, r in rows.items():

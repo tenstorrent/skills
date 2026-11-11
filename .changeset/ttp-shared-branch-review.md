@@ -1,0 +1,5 @@
+---
+"tt-project": patch
+---
+
+`tt-project`: compatible changes on one shared branch get one review (part 1 of shared-branch integration). Before, a code task that finished on a branch another task's queued review already covered shared that review silently: the reviewer saw only the first task's spec. Now the second task joins the review. The review depends on both, and its spec lists each member's id, title and acceptance criteria, plus the head that carries them all. Each finding names the member it is about. The daemon records each member's handed-off head, so a member's own commits are known. A new `integrate` module can revert one member's commits forward on the shared branch, without rewriting history, so the others can land. It also checks whether a change merges cleanly onto the integration branch or must keep its own branch (a real conflict, or a `no_push:` line). The integration branch is the push branch; a project with no push branch uses the new `delivery.integration_branch` setting (default `ttp/integration`). `ttp status` shows the integration branch with what is on it and not landed yet, and any change kept on its own branch with why.
