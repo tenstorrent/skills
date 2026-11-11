@@ -1629,6 +1629,68 @@ def test_the_account_pool_spills_every_project_after_its_own_list_and_an_empty_o
     assert checkspill.account_hosts() == [] and checkspill.hosts({}) == []
 
 
+def test_a_project_excludes_a_pool_host_by_alias_or_machines_list_hostname(env, tmp_path, monkeypatch):
+    """delivery.checks_spill_exclude keeps named hosts out of every spill route, the account's pool and
+    checks.spill_beside_device included: an alias or the machines list's hostname (full or short) matches, the
+    run spills to the next host and its log names the setting; `ttp checks status` lists the excluded hosts."""
+    from ttp import checkspill, cli, machines, project
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, [], charter=())
+    raw = json.loads(p.config_path.read_text())
+    raw["delivery"].pop("checks_spill_hosts")
+    p.config_path.write_text(json.dumps(raw))
+    project.set_account_setting(checkspill.ACCOUNT_KEY, ["pool-a", "pool-b", "pool-c"])
+    machines.add("pool-a", hostname="serve-a.example.test")
+    machines.add("pool-b")
+    machines.add("pool-c")
+    p.set_config("checks.spill_beside_device", "*")
+    p.set_config("delivery.checks_spill_exclude", ["SERVE-A", "pool-c"])   # a short host name, any case; an alias
+    assert checkspill.hosts(p.config()) == ["pool-b"]
+    assert checkspill.excluded_hosts(p.config()) == ["pool-a", "pool-c"]
+    for h in ("pool-a", "pool-c"):
+        assert checkspill.allowed(p, p.config(), h) == "excluded by the project (delivery.checks_spill_exclude)"
+    assert checkspill.exclude_lines(p.config()) == [
+        "spill hosts excluded by the project (delivery.checks_spill_exclude): pool-a, pool-c"]
+    p.set_config("delivery.checks_spill_exclude", ["serve-a.example.test"])   # the full host name matches too
+    assert checkspill.hosts(p.config()) == ["pool-b", "pool-c"]
+    p.set_config("delivery.checks_spill_exclude", ["pool-a"])
+    log = tmp_path / "where.log"
+    p.set_config("delivery.push_checks", [f"pwd >> {log}"])
+    lane = _spill_lane(p, repo)
+    try:
+        cli.main(["checks", "--fresh"])
+    finally:
+        lane.close()
+    rec = json.loads((run / "checks.json").read_text())
+    assert rec["passed"] is True and rec["spilled_to"] == "pool-b", rec
+    assert "pool-a (excluded by the project: delivery.checks_spill_exclude)" in (run / "checks.log").read_text()
+    lines = checkspill.pick_lines(p.name)
+    assert any("pool-a took no run: excluded by the project" in x for x in lines), lines
+
+
+def test_spill_exclude_default_and_settings(env, tmp_path, monkeypatch):
+    """The empty default changes no host set; a project's own list is excluded from as the pool is; a malformed
+    exclude list is named by the config check and excludes nothing; the coordinator may set it."""
+    from ttp import checkspill, coordinator, machines, project
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a", "check-host-b"], charter=())
+    machines.add("check-host-a")
+    before = checkspill.hosts(p.config())
+    assert before == ["check-host-a", "check-host-b"]
+    p.set_config("delivery.checks_spill_exclude", [])
+    assert checkspill.hosts(p.config()) == before and checkspill.excluded_hosts(p.config()) == []
+    assert checkspill.exclude_lines(p.config()) == [] and checkspill.allowed(p, p.config(), "check-host-a") == ""
+    p.set_config("delivery.checks_spill_exclude", ["check-host-b"])
+    assert checkspill.hosts(p.config()) == ["check-host-a"]
+    for bad in ("check-host-a", 3, ["a b"]):
+        assert any("delivery.checks_spill_exclude" in x
+                   for x in project.config_problems({"delivery": {"checks_spill_exclude": bad}})), bad
+        assert checkspill.hosts({"delivery": {"checks_spill_hosts": ["check-host-a"],
+                                              "checks_spill_exclude": bad}}) == ["check-host-a"], bad
+    settable = coordinator.settable("delivery.checks_spill_exclude")
+    assert settable('["host-a"]') == ["host-a"] and settable([]) == []
+    with pytest.raises(ValueError):
+        settable("host-a")
+
+
 def test_spill_gate_reads_only_structured_settings_never_charter_wording(env, tmp_path, monkeypatch):
     """allowed() decides from delivery.checks_spill_hosts and the account's pool, never the charter: a listed
     host with no charter line is allowed, a host the charter names but no setting lists is refused with the

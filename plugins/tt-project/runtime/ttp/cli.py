@@ -5476,7 +5476,7 @@ def _checks_lane_status(as_json: bool) -> int:
                          indent=2))
     else:
         print(checklane.status_text(p.name, p.config(), here_repo, names=names, db=p.db))
-        for line in [*checkspill.no_spill_lines(), *checkspill.status_lines(p.name), *checkspill.pick_lines(p.name), *checkspill.here_lines(p.name), *checkspill.limit_lines(p.name), *slurmcheck.probe_lines(), *slurmcheck.status_lines(p.name),
+        for line in [*checkspill.no_spill_lines(), *checkspill.status_lines(p.name), *checkspill.exclude_lines(p.config()), *checkspill.pick_lines(p.name), *checkspill.here_lines(p.name), *checkspill.limit_lines(p.name), *slurmcheck.probe_lines(), *slurmcheck.status_lines(p.name),
                      *filter(None, [slurmcheck.paused_line()])]:
             print(f"  {line}")
         print("check runs per host:")

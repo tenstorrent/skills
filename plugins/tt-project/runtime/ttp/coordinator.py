@@ -464,6 +464,8 @@ USER_SETTABLE = {
     "delivery.gh_route": lambda v: ghroute.value_of(v),
     # Ordered ssh aliases a run whose slots here stay busy may spill to (checkspill); a list, never a scalar.
     "delivery.checks_spill_hosts": lambda v: checkspill.settable_hosts(v),
+    # Spill hosts (ssh aliases or host names) the project keeps out of every spill route, the pool included.
+    "delivery.checks_spill_exclude": lambda v: checkspill.excludes_of(v),
     "delivery.checks_spill_after_s": lambda v: checkspill.after_of(v),
     # Whether a run that may spill tries the spill hosts before a place here (checkspill.first; default true).
     "delivery.checks_spill_first": lambda v: checkspill.first_of(v),

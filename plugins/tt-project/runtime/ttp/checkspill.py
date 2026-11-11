@@ -9,7 +9,10 @@ without a list of its own. No machines-list tag adds a host. The account's ban l
 (`ttp config --account checks.no_spill_hosts '["host-x"]'`, ssh aliases or host names, which a run may only add
 to), keeps a host out of every project's spill on this machine: an alias, its machine or ssh host, or the
 machines list's `hostname` for it (full or short name) matches (banned), a project or pool list naming one is
-refused at config time, and `ttp checks status` shows the list. A project's own empty list (`[]`)
+refused at config time, and `ttp checks status` shows the list. `delivery.checks_spill_exclude` (ssh aliases or
+host names, default none) keeps named hosts out of this project's routes, the pool and checks.spill_beside_device
+included: an alias or the machines list's `hostname` for it matches (excluded), and the pick says it skipped them.
+A project's own empty list (`[]`)
 keeps its checks here, the pool too; with neither, checks never leave this machine. A `ttp checks` run that may spill tries the listed hosts in
 order before it takes a place here (`delivery.checks_spill_first`, default true: first), so this machine keeps
 only the checks that cannot spill, and runs on the first that is allowed, reachable and has a free slot, as a
@@ -110,6 +113,7 @@ from typing import Any
 from . import remotecheck
 
 KEY = "checks_spill_hosts"
+EXCLUDE_KEY = "checks_spill_exclude"   # delivery.checks_spill_exclude: hosts the project keeps out of every route (excluded)
 ACCOUNT_KEY = "checks.spill_hosts"   # the account's pool (project.ACCOUNT_KEYS), after a project's own list
 NO_SPILL_KEY = "checks.no_spill_hosts"   # the account's ban list: hosts no project's checks spill to (banned)
 BESIDE_KEY = "spill_beside_device"   # checks.spill_beside_device: hosts a device job keeps no spill off (beside_device)
@@ -243,6 +247,62 @@ def hosts_of(v: Any) -> list[str]:
     return list(dict.fromkeys(out))
 
 
+def excludes_of(v: Any) -> list[str]:
+    """A `delivery.checks_spill_exclude` value set by `ttp config`: a list (or a JSON-encoded list) of ssh aliases
+    or host names. ValueError for anything else."""
+    if isinstance(v, str) and v.strip().startswith("["):
+        try:
+            v = json.loads(v)
+        except ValueError:
+            pass
+    if not isinstance(v, (list, tuple)):
+        raise ValueError(f"delivery.{EXCLUDE_KEY}: {v!r} is not a list of ssh aliases or host names "
+                         "(e.g. [\"check-host-a\"]); nothing was changed")
+    out = [str(x).strip() if isinstance(x, str) else x for x in v]
+    if bad := [why for x in out if (why := remotecheck.host_problem(x))]:
+        raise ValueError(f"delivery.{EXCLUDE_KEY}: " + "; ".join(bad) + "; nothing was changed")
+    return list(dict.fromkeys(out))
+
+
+def _excludes(cfg: dict | None) -> set[str]:
+    """The project's delivery.checks_spill_exclude, lower-cased; empty when unset or malformed (problems names it)."""
+    try:
+        return {x.lower() for x in excludes_of(((cfg or {}).get("delivery") or {}).get(EXCLUDE_KEY) or [])}
+    except ValueError:
+        return set()
+
+
+def excluded(cfg: dict | None, alias: str, known: dict | None = None) -> bool:
+    """Whether delivery.checks_spill_exclude keeps spill host `alias` out: it names the alias, its machine or
+    ssh host (target), or the machines list's `hostname` for either (full or short name)."""
+    out = _excludes(cfg)
+    if not out:
+        return False
+    from . import machines
+    known = machines.load() if known is None else known
+    machine, host = target(alias, known)
+    names = {alias, machine, host}
+    for n in (machine, host):
+        if h := str((known.get(n) or {}).get("hostname") or "").strip():
+            names |= {h, h.split(".")[0]}
+    return bool({n.lower() for n in names} & out)
+
+
+def excluded_hosts(cfg: dict | None) -> list[str]:
+    """The listed spill hosts (the project's own, then the pool) that delivery.checks_spill_exclude keeps out."""
+    if not _excludes(cfg):
+        return []
+    from . import machines
+    known = machines.load()
+    return [h for h in _listed(cfg) if excluded(cfg, h, known)]
+
+
+def exclude_lines(cfg: dict | None) -> list[str]:
+    """`ttp checks status` line: the listed spill hosts delivery.checks_spill_exclude keeps out."""
+    got = excluded_hosts(cfg)
+    return [f"spill hosts excluded by the project (delivery.{EXCLUDE_KEY}): {', '.join(got)}"] if got else []
+
+
 def _host_problem(x: Any) -> str:
     if x == remotecheck.LOCAL:
         return f"{x!r} is this machine, not a host to spill to"
@@ -261,6 +321,11 @@ def problems(delivery: dict) -> list[str]:
         if bad := banned_in(v):
             out.append(f"delivery.{KEY}: {', '.join(bad)} is banned by the account's {NO_SPILL_KEY}; "
                        "its checks never spill there")
+    if (x := (delivery or {}).get(EXCLUDE_KEY)) is not None:
+        try:
+            excludes_of(x)
+        except ValueError as e:
+            out.append(str(e).replace("; nothing was changed", ""))
     a = (delivery or {}).get(AFTER_KEY)
     if a is not None and (isinstance(a, bool) or not isinstance(a, (int, float)) or a < 0):
         out.append(f"delivery.{AFTER_KEY}: {a!r} is not a number of seconds")
@@ -373,8 +438,19 @@ def account_hosts() -> list[str]:
 
 
 def hosts(cfg: dict | None) -> list[str]:
-    """The project's spill hosts in order, then the account's pool, less those checks.no_spill_hosts bans;
-    [] when the project's own list is empty (it keeps its checks here) or malformed (config_problems names it)."""
+    """The project's spill hosts in order, then the account's pool, less those checks.no_spill_hosts bans and
+    those delivery.checks_spill_exclude keeps out (excluded); [] when the project's own list is empty (it keeps
+    its checks here) or malformed (config_problems names it)."""
+    listed = _listed(cfg)
+    if not listed or not _excludes(cfg):
+        return listed
+    from . import machines
+    known = machines.load()
+    return [h for h in listed if not excluded(cfg, h, known)]
+
+
+def _listed(cfg: dict | None) -> list[str]:
+    """hosts() before delivery.checks_spill_exclude."""
     own = ((cfg or {}).get("delivery") or {}).get(KEY)
     try:
         mine = hosts_of(own) if own is not None else []
@@ -829,6 +905,8 @@ def allowed(p, cfg: dict, alias: str) -> str:
         return "retired in the machines list"
     if ban := banned(alias, known):
         return f"banned for every project by the account's {NO_SPILL_KEY} ({ban})"
+    if excluded(cfg, alias, known):
+        return f"excluded by the project (delivery.{EXCLUDE_KEY})"
     if alias not in _own(cfg) and alias not in account_hosts() and machine not in account_hosts():
         name = getattr(p, "name", "") or "<project>"
         return (f"not a spill host of this project (add it with `ttp config {name} delivery.{KEY} "
@@ -1419,7 +1497,8 @@ def pick(p, cfg: dict, tell, what: str = "", off: str = "", why_here: str = "") 
     LAST_BUSY.clear()
     rec = {"project": p.name, "task": os.environ.get("TTP_TASK") or "", "run": os.environ.get("TTP_RUN_ID") or "",
            "pid": os.getpid(), "since": time.time(), "what": what[:300]}
-    skipped, keep = [f"{h} (banned by the account's {NO_SPILL_KEY})" for h in banned_listed(cfg)], kept_off(off, cfg)
+    skipped, keep = [*(f"{h} (banned by the account's {NO_SPILL_KEY})" for h in banned_listed(cfg)),
+                     *(f"{h} (excluded by the project: delivery.{EXCLUDE_KEY})" for h in excluded_hosts(cfg))], kept_off(off, cfg)
     if env := env_off(off, cfg):
         tell(f"no spill host could take the checks, waiting here: {env}")
         _note_pick(p.name, "", [f"{alias} ({env})" for alias in hosts(cfg)])

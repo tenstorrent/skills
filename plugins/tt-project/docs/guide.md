@@ -2390,7 +2390,11 @@ session and stateless coordinators on every provider.
   (`ttp config --account checks.spill_hosts '["pool-a", "pool-b"]'`; only the user sets it, a run may only
   clear it with `[]`), follows each project's own list, so every project on the machine spills to it without a
   list of its own; its hosts need no charter line but must be in the machines list. A project's own `[]` keeps
-  its runs here, pool included. The account's ban list, `checks.no_spill_hosts`
+  its runs here, pool included. `delivery.checks_spill_exclude` (a list of ssh aliases or host names, default
+  `[]`) keeps named hosts out of every route: the project's own list, the account pool and
+  `checks.spill_beside_device`; an alias or the machines list's host name for it matches, the coordinator may
+  set it, and the pick and `ttp checks status` list those hosts as `excluded by the project
+  (delivery.checks_spill_exclude)`. The account's ban list, `checks.no_spill_hosts`
   (`ttp config --account checks.no_spill_hosts '["host-x"]'`; ssh aliases or host names; a run may add to it but
   never remove a host), keeps those machines out of every project's spill on this machine: a host matches by its
   alias, its machine, or the machines list's `hostname` (full or short name). Setting a project list or the pool
