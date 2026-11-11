@@ -786,7 +786,13 @@ GIT_HELPER_OWN_TIMEOUT = {
     ("remotecheck.py", "_git"): "only remotecheck.main, the check process `ttp checks` starts (_BOOT)",
     ("checktree.py", "_git_run"): "only `ttp checks` (cli.py) naming the tree it checks, 20 s, its own process",
     ("outscan.py", "_git"): "only outscan.push_problem in the pre-push hook git starts for a run's push (gitguard.HOOK), 60 s (its type lookup more with the tip count)",
+    ("cli.py", "git"): "only `ttp upgrade` (cli._undo_template_rollback), its own process, on the project's harness repo",
 }
+
+
+# Modules whose functions a tick step or the finish transaction reaches (settled area sa33): no raw
+# subprocess git anywhere in them, whatever the function's name (pushq._reach_ok once ran one).
+GIT_TICK_MODULES = ("daemon.py", "pushq.py")
 
 
 def _git_calls(node, owner: str) -> list:
@@ -808,7 +814,9 @@ def test_every_git_helper_takes_gitmemos_cap():
         src = f.read_text()
         tree = ast.parse(src)
         for c in _git_calls(tree, "subprocess"):
-            if "gitmemo.timeout(" in ast.get_source_segment(src, c):
+            if f.name in GIT_TICK_MODULES:
+                bad.append(f"{f.name}:{c.lineno} raw subprocess git in a module tick steps reach (use gitmemo.run)")
+            elif "gitmemo.timeout(" in ast.get_source_segment(src, c):
                 bad.append(f"{f.name}:{c.lineno} subprocess git with gitmemo.timeout() (use gitmemo.run)")
         for fn in ast.walk(tree):
             if not isinstance(fn, ast.FunctionDef) or not re.fullmatch(r"_?git(_\w+)?", fn.name):

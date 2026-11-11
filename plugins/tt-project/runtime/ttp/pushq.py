@@ -1828,7 +1828,9 @@ def _note_unreachable(st: dict, b: dict, m: dict, now: float) -> dict | None:
 def _reach_ok(p: Project, name: str, now: float | None = None) -> bool:
     """False while UNREACH_AFTER batches in a row could not reach the remote of target `name`: no
     batch starts, so the queue does not loop on a remote that is down or wrong. The remote is asked
-    (a bounded ls-remote) at most every UNREACH_PROBE_S; once it answers, the hold and its alert end."""
+    (a bounded ls-remote through _git) at most every UNREACH_PROBE_S; once it answers with the branch, the
+    hold and its alert end. A remote that answers without the branch (a misspelled delivery.push_branch)
+    keeps the hold, and the coordinator hears so once (push_target_missing)."""
     db = p.db
     st = _state(db)
     un = st.get("unreachable")
@@ -1840,12 +1842,18 @@ def _reach_ok(p: Project, name: str, now: float | None = None) -> bool:
     un["probe_at"] = now
     db.set_kv(KV, st)
     remote, _, branch = name.partition("/")
-    try:
-        ok = subprocess.run(["git", "-C", str(p.root), "ls-remote", "--heads", remote, f"refs/heads/{branch}"],
-                            stdin=subprocess.DEVNULL, capture_output=True, timeout=UNREACH_PROBE_TIMEOUT_S,
-                            env={**os.environ, "GIT_TERMINAL_PROMPT": "0"}).returncode == 0
+    try:   # --exit-code: 2 when the remote answers but has no such branch (plain ls-remote exits 0 then)
+        rc = _git(p, "ls-remote", "--exit-code", "--heads", remote, f"refs/heads/{branch}",
+                  timeout=UNREACH_PROBE_TIMEOUT_S).returncode
     except (OSError, subprocess.SubprocessError):
-        ok = False
+        rc = None
+    ok = rc == 0
+    if rc == 2 and not un.get("missing"):   # the hold stays: a batch would fail to fetch it again
+        un.update(missing=now, why=f"the remote answers, but has no branch `{branch}`")
+        db.set_kv(KV, st)
+        _event(db, None, "push_target_missing",
+               f"the push target {name}: the remote `{remote}` answers, but has no branch `{branch}`; push "
+               f"batches stay stopped until delivery.push_branch names a branch it has", queued=False)
     if ok:
         _reached(db)
         _event(db, None, "push_target_reachable", f"the push target {name} answers again; push batches go on",
@@ -2062,9 +2070,10 @@ def _died_db(p: Project, b: dict, m: dict, alert: Callable, why: str, now: float
     if tell:
         setting = str(_delivery(p).get("push_branch") or "").strip() or "(unset)"
         alert(UNREACH_ALERT, f"Push batches to {un['target']} failed {un['n']} times in a row because the remote "
-                             f"`{un['remote']}` cannot be reached ({un['why'][:200]}). delivery.push_branch is "
+                             f"`{un['remote']}` cannot be reached or has no branch `{un['target'].partition('/')[2]}` "
+                             f"({un['why'][:200]}). delivery.push_branch is "
                              f"`{setting}`. The push queue starts no more batches for it: it asks the remote every "
-                             f"{UNREACH_PROBE_S // 60} min without a model call and goes on once it answers or "
+                             f"{UNREACH_PROBE_S // 60} min without a model call and goes on once it answers with the branch or "
                              f"delivery.push_branch changes. If the remote is wrong, the coordinator points "
                              f"delivery.push_branch at one that can be reached.", severity="high")
     elif stop:
@@ -2080,19 +2089,19 @@ def _on_remote(repo: Path, remote: str, branch: str, sha: str, fetch: bool) -> b
     then a bounded fetch when asked. None when the branch cannot be read."""
     if fetch:
         try:
-            if subprocess.run(["git", "-C", str(repo), "fetch", "-q", remote,
-                               f"+refs/heads/{branch}:refs/remotes/{remote}/{branch}"], stdin=subprocess.DEVNULL,
-                              capture_output=True, timeout=RECOVER_FETCH_S,
-                              env={**os.environ, "GIT_TERMINAL_PROMPT": "0"}).returncode != 0:
+            if gitmemo.run(["git", "-C", str(repo), "fetch", "-q", remote,
+                            f"+refs/heads/{branch}:refs/remotes/{remote}/{branch}"], stdin=subprocess.DEVNULL,
+                            capture_output=True, timeout=RECOVER_FETCH_S,
+                            env={**os.environ, "GIT_TERMINAL_PROMPT": "0"}).returncode != 0:
                 return None
         except (OSError, subprocess.TimeoutExpired):
             return None
-    tip = subprocess.run(["git", "-C", str(repo), "rev-parse", "--verify", "--quiet",
-                          f"refs/remotes/{remote}/{branch}^{{commit}}"], text=True, capture_output=True,
-                         stdin=subprocess.DEVNULL).stdout.strip()
-    if not tip:
-        return None
     try:
+        tip = gitmemo.run(["git", "-C", str(repo), "rev-parse", "--verify", "--quiet",
+                           f"refs/remotes/{remote}/{branch}^{{commit}}"], text=True, capture_output=True,
+                          stdin=subprocess.DEVNULL).stdout.strip()
+        if not tip:
+            return None
         return on_branch(repo, sha, tip)
     except (OSError, subprocess.SubprocessError):
         return None

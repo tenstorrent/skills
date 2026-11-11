@@ -20736,6 +20736,34 @@ def test_landed_entry_drop_the_batch_on_the_new_target_drops_what_it_already_has
     assert _git_out(relay, "show", "proj:f2.txt") == "2" and _git_out(relay, "merge-base", "--is-ancestor", h1, "proj") == ""
 
 
+@pytest.mark.parametrize("relay_tip", ["diverged", "has_it"])
+def test_retarget_keeps_landed_only_where_the_new_target_has_the_entry(env, monkeypatch, relay_tip):
+    """Round 1 finds the entry on the old target (landed) and the target moves; delivery.push_branch
+    changes before round 2, which stops the batch (`retargeted`). A new target that does not have the
+    entry's head gets it back requeued, so its work is not lost; one that has it keeps it landed."""
+    from ttp import batch
+    p, repo, origin, relay = _relay_setup(env, monkeypatch)
+    p.set_config("delivery.push_branch", "origin/proj")
+    h1 = _entry(repo, "e1", {"f1.txt": "1\n"})
+    _git_out(repo, "push", "-q", "origin", f"{h1}:refs/heads/proj")
+    if relay_tip == "diverged":
+        _git_out(repo, "checkout", "-q", "--orphan", "lone")
+        _commit(repo, "lone.txt", "lone\n")
+        _git_out(repo, "push", "-q", "-f", "relay", "lone:refs/heads/proj")
+    else:
+        _git_out(repo, "push", "-q", "-f", "relay", f"{h1}:refs/heads/proj")
+
+    def round_one(self, tip, checks):
+        self._set(0, "landed")
+        self.landed_at[0] = h1
+        p.set_config("delivery.push_branch", "relay/proj")
+        return "moved"
+    monkeypatch.setattr(batch.Batch, "_round", round_one)
+    rc, m = _run_batch(p, _batch_marker(p, [h1]), monkeypatch)
+    assert m["outcome"] == "retargeted", m
+    assert _statuses(m) == (["requeued"] if relay_tip == "diverged" else ["landed"]), m
+
+
 @pytest.mark.parametrize("end", ["probe", "setting"])
 def test_unreachable_alarm_batches_that_cannot_reach_the_remote_alert_once_and_stop(env, monkeypatch, end):
     """UNREACH_AFTER batches in a row that fail with 'cannot reach <remote>' raise one high alert naming
@@ -20770,6 +20798,32 @@ def test_unreachable_alarm_batches_that_cannot_reach_the_remote_alert_once_and_s
         pushq.schedule(s.p)
     assert "unreachable" not in s.p.db.kv(pushq.KV)
     assert not alerts.holds(s.p.db, pushq.UNREACH_ALERT, since, time.time())
+
+
+def test_unreachable_alarm_a_remote_without_the_branch_keeps_the_hold_and_alerts_once(env, monkeypatch):
+    """The probe asks with --exit-code: a remote that answers but has no such branch (a misspelled
+    delivery.push_branch, a deleted branch) keeps the hold. The alert stays the one high alert, and the
+    coordinator hears once that the branch is missing, however many probes run."""
+    from ttp import alerts, pushq
+    s = _pq(env, monkeypatch)
+    _pq_plan(s, outcome="error", message="cannot reach origin: fatal: could not read from remote repository")
+    _pq_hand_off(env, s)
+    since = time.time()
+    for _ in range(pushq.UNREACH_AFTER):
+        _pq_batch(s)
+        _pq_tend(s)
+    _git_out(s.origin, "update-ref", "-d", "refs/heads/proj")
+    for k in range(1, 4):
+        assert not pushq._reach_ok(s.p, "origin/proj", time.time() + k * 3600), "no branch: the hold stays"
+    assert "no branch `proj`" in s.p.db.kv(pushq.KV)["unreachable"]["why"]
+    assert len(s.p.db.q("SELECT id FROM events WHERE kind='push_target_missing'")) == 1
+    assert not s.p.db.q("SELECT id FROM events WHERE kind='push_target_reachable'")
+    sent = s.p.db.q("SELECT text FROM messages WHERE kind='alert' AND ref=?", (pushq.UNREACH_ALERT,))
+    assert len(sent) == 1 and "has no branch `proj`" in sent[0]["text"], sent
+    assert alerts.holds(s.p.db, pushq.UNREACH_ALERT, since, time.time())
+    _git_out(s.other, "push", "-q", str(s.origin), "HEAD:refs/heads/proj")
+    assert pushq._reach_ok(s.p, "origin/proj", time.time() + 5 * 3600), "the branch is back"
+    assert "unreachable" not in s.p.db.kv(pushq.KV)
 
 
 @pytest.mark.parametrize("relay_tip", ["same", "ahead", "diverged"])

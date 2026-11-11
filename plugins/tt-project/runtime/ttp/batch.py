@@ -1577,7 +1577,17 @@ class Batch:
         """delivery.push_branch is `now`, not the target this batch (or the batch a reboot cut short,
         rerun on its marker) began with: it stops before another check or a push, and its rows go back
         approved with no try counted (pushq.finalize). pushq.retarget then moves their approvals to the
-        new target and the next batch, started on it, lands them; nothing alarms per row."""
+        new target and the next batch, started on it, lands them; nothing alarms per row. An entry an
+        earlier round landed on the old target stays landed only where the new target's tip has it (its
+        head or the commit it landed as); else it goes back too, so its work is not lost to the new one."""
+        if landed := [i for i, st in self.status.items() if st == "landed"]:
+            remote, _, branch = (now or "").partition("/")
+            tip = push._fetch(self.repo, remote, branch) if remote and branch else ""
+            for i in landed:
+                shas = {str(self.entries[i].get("head") or ""), str(self.landed_at.get(i) or "")} - {""}
+                if not (tip and any(push.descends(self.repo, h, tip) for h in shas)):
+                    self._set(i, "requeued")
+                    self.landed_at.pop(i, None)
         return self._all("requeued", "retargeted", keep=("landed",), message=f"delivery.push_branch is {now or '(none)'}, not "
                                                    f"{self.target or '(none)'}: the batch stops and hands its "
                                                    f"entries back for a batch on {now or 'the new target'}")
