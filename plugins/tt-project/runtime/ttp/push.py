@@ -5809,15 +5809,38 @@ def _pid_alive(pid: Any) -> bool:
     return True
 
 
+_ENDED: dict[str, dict[str, tuple]] = {}   # running(): per pushes folder, marker name -> stat key of an ended one
+
+
+def _stat_key(marker: Path) -> tuple | None:
+    try:
+        st = marker.stat()
+    except OSError:
+        return None
+    return (st.st_ino, st.st_mtime_ns, st.st_size)
+
+
 def running(p: Project) -> list[dict]:
     """Markers of this project's detached pushes that are still running or queued. A running one whose
-    run lock does not open (locks.free_state None) counts, with `lock_unknown`."""
+    run lock does not open (locks.free_state None) counts, with `lock_unknown`. A marker read once with
+    an ended status is not read again while its inode, mtime and size stay the same (_ENDED): an ended
+    push's marker is never rewritten in place, so a large pushes history costs one stat per marker."""
     out = []
-    for marker in sorted((p.state / DETACHED).glob("*.json")):
+    folder = p.state / DETACHED
+    ended = _ENDED.get(str(folder), {})
+    seen: dict[str, tuple] = {}
+    for marker in sorted(folder.glob("*.json")):
+        key = _stat_key(marker)
+        if key is not None and ended.get(marker.name) == key:
+            seen[marker.name] = key
+            continue
         m = _read(marker)
+        if key is not None and isinstance(m.get("status"), str) and m["status"] not in ("running", "queued"):
+            seen[marker.name] = key
         free = locks.free_state(_run_lock(marker)) if m.get("status") == "running" else True
         if m.get("status") == "queued" or m.get("status") == "running" and not free:
             out.append({**m, "marker": str(marker), **({"lock_unknown": True} if free is None else {})})
+    _ENDED[str(folder)] = seen
     return out
 
 

@@ -229,3 +229,63 @@ def test_the_worktree_sweep_runs_no_git_call_per_registered_worktree(env, monkey
     d._last_prune -= daemon_mod.PRUNE_TICK_MIN_S
     d.tick_prune_worktrees()
     assert swept == [1]
+
+
+def test_the_worktree_sweep_reads_each_push_marker_once_and_ended_ones_not_again(env, monkeypatch):
+    """The tick's sweep read every pushes/*.json marker once per worktree it judged (1109 markers times
+    311 worktrees stalled dispatch): now one snapshot per sweep, and an ended marker is not read again
+    while unchanged. A push that is queued in a worktree still keeps it, and one that starts after the
+    snapshot is seen by the live check before the worktree goes."""
+    from ttp import push, worktree
+    from ttp.daemon import Daemon
+    _no_grace(monkeypatch)
+    p = make(env)
+    paths = [_code_task(p, f"kept {i}")[1] for i in range(4)]
+    folder = p.state / push.DETACHED
+    folder.mkdir(parents=True, exist_ok=True)
+    for i in range(30):
+        (folder / f"old{i:02d}.json").write_text(json.dumps({"id": f"old{i:02d}", "status": "pushed",
+                                                            "repo": str(paths[i % 4])}))
+    (folder / "live.json").write_text(json.dumps({"id": "live", "status": "queued", "repo": str(paths[0])}))
+    reads = []
+    real = push._read
+    monkeypatch.setattr(push, "_read", lambda m: reads.append(m.name) or real(m))
+    d = Daemon(p.base)
+    res = {r["path"]: r for r in d.prune_worktrees(every_s=0, force=True)}
+    assert res[str(paths[0])]["why"] == "a detached `ttp push` runs in it", res[str(paths[0])]
+    # One snapshot per sweep; removals recheck live, reading only the queued marker again.
+    assert [r for r in reads if r.startswith("old")] == sorted(f"old{i:02d}.json" for i in range(30)), reads
+    reads.clear()
+    d.prune_worktrees(every_s=0, force=True)
+    assert not [r for r in reads if r.startswith("old")], reads
+    # An ended marker rewritten (a requeue) is read again.
+    (folder / "old05.json").write_text(json.dumps({"id": "old05", "status": "queued", "repo": str(paths[1])}))
+    reads.clear()
+    assert [m["id"] for m in push.running(p)] == ["live", "old05"]
+    assert [r for r in reads if r.startswith("old")] == ["old05.json"], reads
+    # Held verdicts are the same with a snapshot as with a live read.
+    task = p.db.task(int(paths[1].name[1:]))
+    assert worktree.held_by(p, task, [], time.time(), pushes=push.running(p)) \
+        == worktree.held_by(p, task, [], time.time()) == "a detached `ttp push` runs in it"
+    assert worktree.held_by(p, task, [], time.time(), pushes=[]) is None
+
+
+def test_a_push_that_starts_after_the_sweeps_snapshot_still_keeps_its_worktree(env, monkeypatch):
+    from ttp import push, worktree
+    from ttp.daemon import Daemon
+    _no_grace(monkeypatch)
+    p = make(env)
+    _tid, path, _branch = _code_task(p, "pushing late")
+    snaps = []
+    real = push.running
+
+    def late(proj):
+        snaps.append(1)
+        return [] if len(snaps) == 1 else [{"id": "late", "status": "queued", "repo": str(path)}]
+    monkeypatch.setattr(push, "running", late)
+    removed = []
+    monkeypatch.setattr(worktree, "remove", lambda *a, **k: removed.append(a))
+    res = {r["path"]: r for r in Daemon(p.base).prune_worktrees(every_s=0, force=True)}
+    assert res[str(path)]["why"] == "a detached `ttp push` runs in it" and res[str(path)].get("held"), res
+    assert not removed and path.is_dir()
+    monkeypatch.setattr(push, "running", real)
