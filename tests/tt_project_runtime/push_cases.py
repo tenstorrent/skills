@@ -20252,6 +20252,7 @@ def test_precheck_hold_skips_an_urgent_review(tmp_path, monkeypatch):
     out.mkdir(parents=True)
     monkeypatch.setattr(cli, "_read_checks_pid", lambda o: {"ts": 1000.0})
     monkeypatch.setattr(cli, "_checks_alive", lambda info: True)
+    (out / cli.CHECKS_RUNNING).write_text(json.dumps({"since": 1000.5}))   # the precheck runs on a host
     task = {"id": 2, "kind": "review", "priority": 3, "spec": "check it",
             "labels": json.dumps([PRECHECK_LABEL + "t1-abc"])}
     assert daemon.precheck_holds(tmp_path, task, 1001.0), "a routine review waits"
