@@ -552,6 +552,44 @@ def _read_prs(order: list[dict], root: str, workers: int, pr_timeout: float) -> 
     return results
 
 
+def _read_anon(daemon, order: list[dict], results: dict[str, dict]) -> tuple[int, set[str], str]:
+    """Read anonymously (ghanon) each PR of `order` gh did not read, into `results`, before the run's
+    deadline. No GraphQL, so bot findings keep their last value (data None). Each repo it cannot read is
+    observed once under a stable key. Returns (PRs read anonymously, repos unreadable, why it stopped)."""
+    from . import ghanon
+    cfg = (getattr(daemon, "cfg", None) or {}).get("watchers") or {}
+    raw = cfg.get("gh_anon_cap", ghanon.CAP)
+    cap = int(raw) if isinstance(raw, (int, float)) and not isinstance(raw, bool) and raw >= 0 else ghanon.CAP
+    n, unread, spent = 0, set(), ""
+    for t in order:
+        r = results.get(t["pr_url"])
+        if r is not None and r["pr"] is not None:
+            continue
+        key = prguard.pr_key(t["pr_url"])
+        if not key or _over() or not cap:   # gh_anon_cap 0: no anonymous reads
+            continue
+        repo, number = key.split("#")
+        t0 = _now()
+        try:
+            pr = ghanon.pr_view(repo, int(number), cap=cap)
+        except ghanon.Unreadable as e:
+            if repo not in unread:
+                daemon.observe("pr", f"pr-watch cannot read {repo} without a GitHub login ({e}): its PRs are "
+                               "not watched while gh is logged out on this host", "normal", key=f"pr:anon-unreadable:{repo}")
+            unread.add(repo)
+            results[t["pr_url"]] = {"pr": None, "data": None, "calls": ["anonymous: not readable"], "cut": None}
+            continue
+        except ghanon.Spent as e:
+            spent = str(e)
+            break
+        except OSError as e:
+            results[t["pr_url"]] = {"pr": None, "data": None, "calls": [f"anonymous: {e}"[:120]], "cut": None}
+            continue
+        results[t["pr_url"]] = {"pr": pr, "data": None, "calls": [f"anonymous {_now() - t0:.1f} s"], "cut": None}
+        n += 1
+    return n, unread, spent
+
+
 def _log(daemon, msg: str) -> None:
     try:
         from .daemon import log
@@ -584,17 +622,24 @@ def watch_prs(daemon, payload: dict | None = None) -> str:
     stint = max(tried.values(), default=0) + 1
     order = sorted(watch, key=lambda t: tried.get(t["pr_url"], 0))
     t0 = _now()
+    # gh cannot read and no delivery.gh_route alias answers its calls (a queue for the workstation is no
+    # answer now): public PRs are read anonymously (ghanon)
+    via = ghroute.route(getattr(daemon, "cfg", None), str(daemon.p.base))
+    logged_out = ghauth.down() is not None and via in ("", ghroute.WORKSTATION)
     auth_token = _AUTH.set(auth := [])
+    results, spawned = {}, 0
     try:
-        with pr_cycle() as cycle:   # one batched read per repo; later asks in the cycle reuse it
-            spawned = cycle.spawned
-            cycle.plan(t["pr_url"] for t in order)
-            results = _read_prs(order, root, workers, pr_timeout)
-            spawned = cycle.spawned - spawned
+        if not logged_out:
+            with pr_cycle() as cycle:   # one batched read per repo; later asks in the cycle reuse it
+                spawned = cycle.spawned
+                cycle.plan(t["pr_url"] for t in order)
+                results = _read_prs(order, root, workers, pr_timeout)
+                spawned = cycle.spawned - spawned
     finally:
         _AUTH.reset(auth_token)
     from . import schedrun
     schedrun.check_stopped()   # a daemon stop (or the timeout's kill) killed its reads: no result to save
+    anon = _read_anon(daemon, order, results) if logged_out or auth else None
     read, missed, timings = 0, [], []
     for t in order:
         r = results.get(t["pr_url"])
@@ -669,6 +714,18 @@ def watch_prs(daemon, payload: dict | None = None) -> str:
          f"gh reads); gh calls: "
          + ("; ".join(timings) or "none") + (f"; not checked: {'; '.join(missed)}" if missed else ""))
     unapproved = f", {len(flagged)} out of draft unapproved" if flagged else ""
+    if anon is not None:   # the host-wide gh login check (ghauth) is asked to look now and alerts once
+        if auth:
+            ghauth.nudge()
+        n, unread, spent = anon
+        why = f" ({ghroute.quiet(auth[0])})" if auth else ""
+        if all((results.get(t["pr_url"]) or {}).get("pr") is not None for t in order):
+            return f"ok ({len(order)} PRs read anonymously while gh is logged out, {changed} changed{unapproved})"
+        return (f"error: degraded: gh has no login on this host{why} and {ghroute.SETTING} "
+                f"{ghroute.how(cwd=str(daemon.p.base))}: {n} of {len(order)} PRs read anonymously"
+                + (f", not readable without a login: {', '.join(sorted(unread))}" if unread else "")
+                + (f"; {spent}" if spent else "")
+                + f"; {ghroute.SETTING} (an ssh alias where gh is logged in) routes the rest")
     if auth:   # never ok: the host-wide gh login check (ghauth) is asked to look now and alerts once
         ghauth.nudge()
         return (f"error: degraded: gh has no login on this host ({ghroute.quiet(auth[0])}) and {ghroute.SETTING} "

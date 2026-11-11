@@ -623,3 +623,115 @@ def test_bridge_gh_pull_is_a_per_box_switch():
     assert bridge.parse({"boxes": {"b": {"agents": agents}}})["boxes"]["b"]["gh_pull"] is False
     with pytest.raises(bridge.BadConfig):
         bridge.parse({"boxes": {"b": {"agents": agents, "gh_pull": "yes"}}})
+
+
+def _anon_github(env, monkeypatch, routes):
+    """A local stand-in for GitHub's REST API (TTP_GH_ANON_API) answering `routes` {path: (status, body,
+    headers)}; returns the list of (path, request headers) it was asked."""
+    import http.server
+    asked = []
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            asked.append((self.path, dict(self.headers)))
+            status, body, headers = routes.get(self.path.split("?")[0], (404, {"message": "Not Found"}, {}))
+            data = json.dumps(body).encode()
+            self.send_response(status)
+            for k, v in {"Content-Type": "application/json", **headers}.items():
+                self.send_header(k, v)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    monkeypatch.setenv("TTP_GH_ANON_API", f"http://127.0.0.1:{srv.server_address[1]}")
+    import atexit as _ax
+    _ax.register(srv.shutdown)
+    return asked
+
+
+def _logged_out():
+    from ttp import ghauth
+    now = time.time()
+    ghauth._write(None, {"ok": False, "since": now, "checked_at": now, "error": "not logged in"})
+
+
+def test_pr_watch_reads_a_public_pr_anonymously_while_gh_is_logged_out(env, monkeypatch):
+    """gh logged out: pr-watch reads a public PR over REST with no auth header, its head by `git ls-remote`
+    (its check runs pinned to that sha), runs no gh, and a second run is served from the cache."""
+    from ttp import watchers
+    from ttp.daemon import Daemon
+    _, calls = _stub_gh(env, monkeypatch, rc=4, err="To get started with GitHub CLI, please run:  gh auth login")
+    _logged_out()
+    remote = env["tmp"] / "gitbase" / "acme" / "widgets"
+    remote.mkdir(parents=True)
+    git = ["git", "-C", str(remote), "-c", "user.name=t", "-c", "user.email=t@example.com"]
+    subprocess.run(["git", "init", "-q", str(remote)], check=True)
+    subprocess.run(git + ["commit", "-q", "--allow-empty", "-m", "x"], check=True)
+    sha = subprocess.run(git + ["rev-parse", "HEAD"], capture_output=True, text=True, check=True).stdout.strip()
+    subprocess.run(git + ["update-ref", "refs/pull/3/head", sha], check=True)
+    monkeypatch.setenv("TTP_GH_ANON_GIT", str(env["tmp"] / "gitbase"))
+    pull = {"state": "open", "draft": True, "mergeable": True, "html_url": "https://github.com/acme/widgets/pull/3",
+            "title": "t", "user": {"login": "a"}, "updated_at": "2026-01-01T00:00:00Z",
+            "head": {"ref": "b", "sha": "f" * 40}}
+    asked = _anon_github(env, monkeypatch, {
+        "/repos/acme/widgets/pulls/3": (200, pull, {"X-RateLimit-Remaining": "50", "X-RateLimit-Reset": "0"}),
+        "/repos/acme/widgets/issues/3/comments": (200, [{"user": {"login": "h"}, "body": "hi"}], {}),
+        "/repos/acme/widgets/pulls/3/reviews": (200, [{"user": {"login": "r"}, "state": "APPROVED"}], {}),
+        f"/repos/acme/widgets/commits/{sha}/check-runs": (
+            200, {"check_runs": [{"name": "ci", "status": "completed", "conclusion": "failure"}]}, {})})
+    p = make(env)
+    url = "https://github.com/acme/widgets/pull/3"
+    p.db.x("INSERT INTO tasks(title,kind,status,pr_url,created) VALUES('t','code','waiting',?,?)", (url, time.time()))
+    status = watchers.watch_prs(Daemon(p.base))
+    assert status.startswith("ok (1 PRs read anonymously"), status
+    assert not _gh_calls(calls), "gh was called while logged out"
+    sig = p.db.kv("pr_signatures")[url]
+    assert sig["draft"] is True and sig["decision"] == "APPROVED" and sig["failing"] == ["ci"], sig
+    assert sig["mergeable"] == "MERGEABLE" and sig["n_human"] == 2, sig
+    assert len(asked) == 4 and not any("authorization" in {k.lower() for k in h} for _, h in asked), asked
+    assert watchers.watch_prs(Daemon(p.base)).startswith("ok (1 PRs read anonymously") and len(asked) == 4, asked
+
+
+def test_anonymous_reads_hold_the_host_cap_and_githubs_last_calls(env, monkeypatch):
+    """At most `cap` calls an hour leave the host; over it a cached answer is served stale, else Spent.
+    GitHub's own remaining count at FLOOR or below stops calls until its reset."""
+    from ttp import ghanon
+    routes = {f"/x/{i}": (200, {"i": i}, {}) for i in range(5)}
+    asked = _anon_github(env, monkeypatch, routes)
+    assert [ghanon.get(f"x/{i}", 60, cap=3) for i in range(3)] == [{"i": 0}, {"i": 1}, {"i": 2}]
+    with pytest.raises(ghanon.Spent):
+        ghanon.get("x/3", 60, cap=3)
+    assert len(asked) == 3 and ghanon.calls_last_hour() == 3
+    assert ghanon.get("x/0", 0, cap=3) == {"i": 0} and len(asked) == 3, "a spent budget serves the stale answer"
+    routes["/x/4"] = (200, {"i": 4}, {"X-RateLimit-Remaining": str(ghanon.FLOOR),
+                                      "X-RateLimit-Reset": str(int(time.time()) + 600)})
+    assert ghanon.get("x/4", 60, cap=10) == {"i": 4}
+    with pytest.raises(ghanon.Spent):
+        ghanon.get("x/3", 60, cap=10)
+    assert len(asked) == 4, "a call went out with GitHub's last calls left"
+
+
+def test_no_login_hint_while_gh_is_logged_out_and_a_private_repo_is_observed_once(env, monkeypatch):
+    """A logged-out lab host is never told to log in: pr-watch and `ttp ci` say what is limited and name the
+    route setting; a private repo gets one observation under a stable key."""
+    from ttp import ciwait, watchers
+    from ttp.daemon import Daemon
+    _stub_gh(env, monkeypatch, rc=4, err="not logged into any GitHub hosts")
+    rc, lines = ciwait.probe(repo="acme/widgets", sha="0" * 40)
+    assert rc == 4 and "gh auth login" not in lines[0], lines
+    _logged_out()
+    _anon_github(env, monkeypatch, {})   # every repo answers 404, as a private one does
+    p = make(env)
+    p.db.x("INSERT INTO tasks(title,kind,status,pr_url,created) VALUES('t','code','waiting',?,?)",
+           ("https://github.com/acme/hidden/pull/1", time.time()))
+    d = Daemon(p.base)
+    seen = []
+    monkeypatch.setattr(d, "observe", lambda *a, **k: seen.append((a, k)))
+    status = watchers.watch_prs(d)
+    assert status.startswith("error:") and "acme/hidden" in status and "gh auth login" not in status, status
+    assert [k["key"] for _, k in seen] == ["pr:anon-unreadable:acme/hidden"], seen
