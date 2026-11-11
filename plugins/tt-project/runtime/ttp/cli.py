@@ -3987,6 +3987,7 @@ def cmd_checks(a) -> None:
         # This run's wait was already recorded by the run it reruns (set again only for that rerun),
         # taken out of the environment so no check command or later in-process run inherits it.
         wait_kept = os.environ.pop(_WAIT_KEPT_ENV, "")
+        retry = _retry_ids_of(os.environ.pop(_RETRY_IDS_ENV, ""))
         from . import checkjoin, checklane, checkspill
         # A rerun of checks that did not pass on a spill host keeps off that host (checkspill.kept_off);
         # "1" keeps them off every spill host.
@@ -4155,14 +4156,24 @@ def cmd_checks(a) -> None:
                        **({pooladmit.WALL_ENV: f"{ran_since:.0f}:{wall:.0f}"} if deadline else {})}
                 judge_env = dict(env)   # a rerun of the failing tests records no suite durations
                 # A plain local pytest run records the files it passed: a preempted run's rerun skips them.
-                resume_vars, resumed_files = _checks_resume(p, top, tree, c, run_env)
+                resume_vars, resumed_files = ({}, 0) if retry else _checks_resume(p, top, tree, c, run_env)
                 env |= resume_vars
+                if retry.get("n") == n:   # only what failed on the spill host runs again, here or on another one
+                    pick = gatejudge.select_env(retry["ids"], env)
+                    if push.remote_host(c):
+                        c = _remote_select(c, pick)
+                    else:
+                        env |= pick
+                    line = (f"running only the {len(retry['ids'])} test(s) that failed on spill host "
+                            f"{retry.get('host') or '?'}: the rest passed there; their failing again fails the run")
+                    print(f"ttp checks: {line}", flush=True)
+                    out.write(f"ttp checks: {line}\n")
                 if resumed_files:
                     line = (f"resuming {c}: {resumed_files} test file(s) passed on tree {tree[:12]} before the preemption; "
                             "running the rest")
                     print(f"ttp checks: {line}", flush=True)
                     out.write(f"ttp checks: {line}\n")
-                if pushpass.resumable(c) and not push.remote_host(c):   # one plain local pytest run
+                if pushpass.resumable(c) and not push.remote_host(c) and not retry:   # one plain local pytest run
                     env |= slowtests.env(Path(run_dir) / slowtests.FILE, env)
                 def said(line: str) -> None:   # a script it runs was rewritten as it ran: once more
                     nonlocal check_start
@@ -4392,7 +4403,7 @@ def cmd_checks(a) -> None:
             elif timed_out:
                 checkwall.record_timeout(p.state, os.environ.get("TTP_TASK"), timed_out)
             elif executed:
-                if not reused:   # a run that skipped checks is no sample of their cost or wall time
+                if not reused and not retry:   # a run that skipped checks (or ran some tests) is no sample of their cost or wall time
                     if not spilled:   # its cost on this host, process churn included, prices a check (checkcap.check_load)
                         checkcap.record_cost(checkcap.child_cpu_s() - ran_cpu, time.time() - ran_since)
                     checkwall.record_run(p.state, time.time() - ran_since, passed,
@@ -4419,12 +4430,13 @@ def cmd_checks(a) -> None:
         elif spilled and not passed and (executed or timed_out) and not _CHECK_STOP.get("stopped") \
                 and not (failed in todo and not getattr(failed, "spill_host", "")):
             how = f"past the {timed_out['cap_s']:g} s wall-time cap" if timed_out else f"exit {rc}"
-            env_why = ""
+            env_why = ran_out = ""
             if not timed_out:   # a package missing there: a fault of the spill env config (checkspill.env_off)
                 try:
                     with open(log, "rb") as f:
                         f.seek(start)
-                        env_why = push.env_problem(f.read().decode("utf-8", errors="replace"), top) or ""
+                        ran_out = f.read().decode("utf-8", errors="replace")
+                        env_why = push.env_problem(ran_out, top) or ""
                 except OSError:
                     pass
             no_spill = checkspill.spill_off_add(no_spill, spilled.host, rc == 75 and not timed_out,
@@ -4447,6 +4459,8 @@ def cmd_checks(a) -> None:
             if wait_kept:
                 os.environ[_WAIT_KEPT_ENV] = wait_kept
             os.environ[checkspill.OFF_ENV] = no_spill
+            if not timed_out and not env_why and failed in todo and (ids := _spill_failed_ids(rc, ran_out)):
+                os.environ[_RETRY_IDS_ENV] = json.dumps({"n": todo.index(failed), "ids": ids, "host": spilled.host})
             if join_rec:   # the run here registers again; its followers queue again and join that one (checkjoin)
                 checkjoin.forget(p.state)
             return cmd_checks(a)
@@ -4839,6 +4853,28 @@ CHECKS_DROPPED = "checks.dropped"
 
 
 _WAIT_KEPT_ENV = "TTP_CHECKS_WAIT_KEPT"   # a rerun's wait is its first run's (cmd_checks; never inherited)
+# A rerun of checks that failed tests on a spill host runs only those tests (_spill_failed_ids; never inherited).
+_RETRY_IDS_ENV = "TTP_CHECKS_RETRY_IDS"
+_RETRY_IDS_MAX = 1000   # more failed there than this: the whole check runs again
+
+
+def _spill_failed_ids(rc: int, output: str) -> list[str]:
+    """The test ids a check that exited 1 on a spill host failed, when its output lists them all (pytest ran
+    to the end), else []: its rerun runs only these, the rest having passed there."""
+    from . import sharedchecks
+    if rc != 1 or sharedchecks.stopped_early(output):
+        return []
+    ids, complete = sharedchecks.failing_ids(output)
+    return ids if complete and len(ids) <= _RETRY_IDS_MAX else []
+
+
+def _retry_ids_of(raw: str) -> dict:
+    """The rerun selection _RETRY_IDS_ENV carries ({"n": check index, "ids": [...]}), or {}."""
+    try:
+        got = json.loads(raw) if raw else {}
+        return got if isinstance(got.get("n"), int) and got.get("ids") else {}
+    except (ValueError, AttributeError):
+        return {}
 
 
 def _checks_arrived() -> float:

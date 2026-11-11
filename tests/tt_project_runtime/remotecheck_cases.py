@@ -725,6 +725,44 @@ def test_a_run_with_the_host_wide_cap_full_spills_to_a_free_host_past_a_paused_o
     assert "check-host-c (paused: user hold)" in text and "spilling to check-host-a" in text, text
 
 
+def test_a_run_that_fails_tests_on_a_spill_host_reruns_only_those_tests_here_and_their_failing_again_counts(
+        env, tmp_path, monkeypatch):
+    """A suite that failed some tests on a spill host (exit 1, every failure listed) does not run whole
+    again here: the rerun selects only the failed ids (TTP_PYTEST_SELECT_IDS), their pass here passes the
+    run, and their failing here too fails it. One that stopped early (-x) runs whole again."""
+    import threading
+    from ttp import cli
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a"])
+    log, mark = tmp_path / "where.log", tmp_path / "fail-here"
+    fail = ("printf 'FAILED tests/test_x.py::test_a - boom\\nFAILED tests/test_y.py::test_b - boom\\n"
+            "%s\\n' \"$TAIL\"; exit 1")
+    cmd = (f'echo "$PWD ids=$(printf %s \"$TTP_PYTEST_SELECT_IDS\" | tr \'\\n\' ,)" >> {log}; '
+           f'case "$PWD" in */ttp-check.*) {fail};; esac; test -e {mark} && {{ {fail}; }}; exit 0')
+    p.set_config("delivery.push_checks", [cmd])
+    for tail, fails_here, passed, ids in (
+            ("2 failed, 9 passed in 0.10s", False, True, "tests/test_x.py::test_a,tests/test_y.py::test_b"),
+            ("2 failed, 9 passed in 0.10s", True, False, "tests/test_x.py::test_a,tests/test_y.py::test_b"),
+            ("!!!!!!!!!! stopping after 2 failures !!!!!!!!!!", False, True, "")):
+        monkeypatch.setenv("TAIL", tail)
+        mark.touch() if fails_here else mark.unlink(missing_ok=True)
+        log.write_text("")
+        seen = len((run / "checks.log").read_text()) if (run / "checks.log").exists() else 0
+        lane = _spill_lane(p, repo)
+        threading.Timer(2.0, lane.close).start()
+        try:
+            cli.main(["checks", "--fresh"])
+        except SystemExit as e:
+            assert not passed and e.code == 1, e.code
+        rec = json.loads((run / "checks.json").read_text())
+        assert rec["passed"] is passed and "spilled_to" not in rec, (tail, fails_here, rec)
+        text = (run / "checks.log").read_text()[seen:]   # this run's part of the log
+        assert "did not pass on spill host check-host-a (exit 1)" in text, text
+        assert ("running only the 2 test(s)" in text) is bool(ids), text
+        where = log.read_text().splitlines()
+        assert "/ttp-check." in where[0] and "/ttp-check." not in where[-1], where
+        assert where[-1].endswith(f"ids={ids}"), where
+
+
 @_LINUX_TMP
 def test_a_rerun_after_a_spill_host_keeps_off_only_the_host_it_failed_on(env, tmp_path, monkeypatch):
     """#6379: checks that fail on one spill host run again on the next free one (a pass there counts),
