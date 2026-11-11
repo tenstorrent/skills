@@ -690,28 +690,40 @@ def supervise(run_dir: Path) -> int:
         progress = ProgressWatch(out_path, run_dir)
         waits_idle = bool(spec.get("waits_idle"))
         from . import streamguard
-        guard = {"on": streamguard.active(prov, argv, env, pre_hooked), "offset": 0}
+        guard = {"on": streamguard.active(prov, argv, env, pre_hooked), "offset": 0, "done": set(), "todo": []}
+
+        def read_calls() -> None:
+            calls, guard["offset"] = prov.activity(out_path, guard["offset"])
+            streamguard.finished(calls, guard["done"])
+            guard["todo"] += [c for c in calls if c.get("kind") == "call"]
 
         def check_calls() -> None:
             # A run the harness hook does not reach: each tool call it starts is checked as the hook would.
             # Decided once, from the marker as it was before launch: the agent could write one itself.
-            calls, guard["offset"] = prov.activity(out_path, guard["offset"])
-            # A call whose result is already in the stream has run: stopping the run then protects nothing.
-            done = {c["id"] for c in calls if c.get("kind") == "result" and c.get("id")}
-            for c in (c for c in calls if c.get("kind") == "call"):
+            # A refused call whose result is in the stream by the end of the check had already run: stopping
+            # the run then prevents nothing, so it is logged and reported and the run goes on (a secret
+            # refusal of an untrusted run still stops it: streamguard.must_stop).
+            read_calls()
+            while guard["todo"]:
+                c = guard["todo"].pop(0)
+                cid = str(c.get("id") or "")
                 for payload in c.get("payloads") or []:
-                    why = streamguard.refusal(payload, env, cwd)
-                    if why and c.get("id") in done and not streamguard.must_stop(why):
-                        streamguard.warn(run_dir, why, str(payload.get("tool_name") or ""), c.get("input_head") or "")
-                        print(f"runner: stream guard: a {payload.get('tool_name')} call it refuses had already "
-                              f"finished; the run goes on: {why}", flush=True)
-                    elif why:
-                        guard["on"] = False
-                        streamguard.record(run_dir, why, str(payload.get("tool_name") or ""))
-                        print(f"runner: stream guard stopped the run at a {payload.get('tool_name')} call: {why}",
-                              flush=True)
-                        threading.Thread(target=stop, args=("guard",), daemon=True).start()
-                        return
+                    tool = str(payload.get("tool_name") or "")
+                    why = streamguard.refusal(payload, env, cwd, cid)
+                    if not why:
+                        continue
+                    read_calls()
+                    if cid and cid in guard["done"] and not streamguard.must_stop(why):
+                        streamguard.warn(run_dir, why, tool, c.get("input_head") or "", cid)
+                        print(f"runner: stream guard: a {tool} call (id {cid}) it refuses had already finished; "
+                              f"logged, the run goes on: {why}", flush=True)
+                        continue
+                    guard["on"] = False
+                    streamguard.record(run_dir, why, tool, cid)
+                    print(f"runner: stream guard stopped the run at a {tool} call (id {cid or 'none'}): {why}",
+                          flush=True)
+                    threading.Thread(target=stop, args=("guard",), daemon=True).start()
+                    return
 
         def look() -> None:
             now, up = time.time(), awake.tick()

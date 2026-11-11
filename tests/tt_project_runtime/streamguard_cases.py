@@ -111,6 +111,53 @@ def test_a_hookless_codex_run_is_stopped_at_a_refused_command(tmp_path, monkeypa
     got = streamguard.take(run_dir)
     assert got["tool"] == "Bash" and "web token" in got["why"] and "web.token" not in json.dumps(got).replace(
         "web token", ""), "the guard names the reason, not the command"
+    assert got["id"] == "item_1" and got["stage"] == "started", "the record names the call it judged"
+    log = [json.loads(x) for x in (run_dir / streamguard.GUARD_LOG).read_text().splitlines()]
+    assert [(x["id"], x["stage"]) for x in log] == [("item_1", "started")]
+
+
+def test_a_refused_command_that_already_finished_is_logged_and_never_stops_the_run(tmp_path, monkeypatch):
+    """The command ran before the check ended: a stop would prevent nothing, so the run goes on. A later
+    refused call that is still running is stopped as before."""
+    from ttp import streamguard
+    ex, run_dir = _sg_run(tmp_path, monkeypatch, "codex", [_sg_codex_line(SG_DENIED),
+                                                           _sg_codex_line(SG_DENIED, "item.completed")])
+    assert ex["stopped"] is None and ex["rc"] == 0, ex
+    assert streamguard.take(run_dir) is None, "no stop record, so the daemon never requeues it"
+    log = [json.loads(x) for x in (run_dir / streamguard.GUARD_LOG).read_text().splitlines()]
+    assert [(x["id"], x["stage"], x["tool"]) for x in log] == [("item_1", "finished", "Bash")]
+    assert "web token" in log[0]["why"] and "(id item_1)" in (run_dir / "progress.md").read_text()
+    d = tmp_path / "then"
+    d.mkdir()
+    running = _sg_codex_line(SG_DENIED).replace('"item_1"', '"item_2"')
+    ex, run_dir = _sg_run(d, monkeypatch, "codex", [_sg_codex_line(SG_DENIED),
+                                                    _sg_codex_line(SG_DENIED, "item.completed"), running])
+    assert ex["stopped"] == "guard" and streamguard.take(run_dir)["id"] == "item_2"
+    log = [json.loads(x) for x in (run_dir / streamguard.GUARD_LOG).read_text().splitlines()]
+    assert [(x["id"], x["stage"]) for x in log] == [("item_1", "finished"), ("item_2", "started")]
+
+
+def test_a_finished_refused_cursor_call_never_stops_the_run(tmp_path, monkeypatch):
+    from ttp import streamguard
+    ex, run_dir = _sg_run(tmp_path, monkeypatch, "cursor", [
+        _sg_cursor_line("shellToolCall", {"command": SG_DENIED}),
+        _sg_cursor_line("shellToolCall", {"command": SG_DENIED}, "completed", {"success": {"exitCode": 0}})])
+    assert ex["stopped"] is None and streamguard.take(run_dir) is None
+    log = [json.loads(x) for x in (run_dir / streamguard.GUARD_LOG).read_text().splitlines()]
+    assert [(x["id"], x["stage"]) for x in log] == [("c1", "finished")]
+
+
+def test_hook_refusal_records_name_the_call_id_and_stage(env, monkeypatch, tmp_path):
+    """The hook judges a call before it runs; the stream guard's child, once it has started."""
+    from ttp import streamguard
+    hook, repo, run, denied = _suite_hook(env, monkeypatch, tmp_path, [SUITE])
+    bash = {"tool_name": "Bash", "tool_input": {"command": SUITE}, "cwd": str(repo)}
+    out, _ = hook.pre_tool_use({**bash, "tool_use_id": "toolu_7"})
+    assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert streamguard.refusal(bash, dict(os.environ), str(repo), "item_9")
+    lines = [json.loads(x) for x in (run / hook.REFUSALS_FILE).read_text().splitlines()]
+    assert [(x["kind"], x["id"], x["stage"]) for x in lines] == [("full_suite", "toolu_7", "before"),
+                                                                 ("full_suite", "item_9", "started")]
 
 
 def test_a_codex_command_that_already_finished_is_warned_about_and_the_run_kept(tmp_path, monkeypatch):

@@ -219,9 +219,13 @@ passed again for Claude Code with workers in the write fence (38 s, $0.12).
 - Codex: the harness hook runs only where hooks are on and no other hook source exists.
   Otherwise a worker sees an update only when it reads `steer.md` between steps.
 - Stream guard (Codex without the hook, Cursor): weaker than a hook's deny. It reads the call
-  from the output stream once the call has started, so a quick command may already have run; it
-  then stops the run and requeues the task once with the refusal on top of its next prompt (no
-  attempt spent; a second stop in a row blocks the task). The hook's rewrites and hints are not
+  from the output stream once the call has started, so a quick command may already have run. A
+  call whose result is in the stream when the check ends has finished: the guard logs it
+  (`guard.jsonl` in the run dir, stage `finished`) and notes it in progress.md, and the run goes on,
+  since a stop would prevent nothing. Otherwise it stops the run and requeues the task once with the
+  refusal on top of its next prompt (no attempt spent; a second stop in a row blocks the task). Each
+  guard record (`GUARD`, `guard.jsonl`, the hook's `refusals.jsonl`) names the call's id and its
+  stage (`before`: the hook, the call has not run; `started`; `finished`). The hook's rewrites and hints are not
   applied. Cursor's stream-json tool call shapes are from its docs, not checked live.
 - Codex: the docs give no version for `developer_instructions` or
   `model_auto_compact_token_limit`. A build that ignores an unknown `-c` key would run a worker

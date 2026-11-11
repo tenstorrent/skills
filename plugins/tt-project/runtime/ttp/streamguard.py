@@ -11,9 +11,11 @@ task once more with that reason at the top of its next prompt, no attempt spent;
 blocks it for the coordinator.
 
 This is weaker than a hook's deny: the call is stopped once it has started, so a quick command may have
-run. A call whose result the runner reads in the same look as its start has finished, so stopping the run
-then protects nothing and loses its work: the runner records a warning instead (WARN_FILE), the run goes
-on (a secret refusal of an untrusted run still stops it: must_stop), and the daemon turns the warnings into one event when the run ends. Rewrites and hints the hook would add are not applied. Runs whose provider passes the harness hook
+run. A call whose result is already in the stream when the check ends (the command finished) never stops
+the run: the runner records a warning instead (WARN_FILE, also GUARD_LOG and progress.md), the run goes on
+(a secret refusal of an untrusted run still stops it: must_stop), and the daemon turns the warnings into
+one event when the run ends. Every record names the call's id and its stage (started: stopped while it
+ran; finished: it had already run). Rewrites and hints the hook would add are not applied. Runs whose provider passes the harness hook
 (Provider.harness_hook) or whose hook already ran when it started (hook.HOOKED_FILE) are left alone; the
 marker is read before the agent starts, since the agent could write it itself."""
 from __future__ import annotations
@@ -25,7 +27,8 @@ import sys
 import time
 from pathlib import Path
 
-GUARD_FILE = "GUARD"     # in the run dir: why the runner stopped it ({"why", "tool", "at"})
+GUARD_FILE = "GUARD"     # in the run dir: why the runner stopped it ({"why", "tool", "id", "stage", "at"})
+GUARD_LOG = "guard.jsonl"   # in the run dir: one line per refused call, stopped or finished, same fields
 WARN_FILE = "GUARD_WARNINGS"   # in the run dir: refused calls that had already finished (JSON lines)
 KEY = "guard_stop"       # in the task's result: the refusal its next run's prompt starts with
 CHECK_TIMEOUT_S = 20     # as the hook's own timeout: a check that hangs lets the call through
@@ -37,9 +40,12 @@ def active(prov, argv: list[str], env: dict, hooked: bool) -> bool:
     return bool(env.get("TTP_TASK")) and not prov.harness_hook(argv) and not hooked
 
 
-def refusal(payload: dict, env: dict, cwd: str) -> str | None:
-    """hook.pre_tool_use's deny reason for `payload`, asked in a child with the run's environment;
-    None when it allows it (or the check fails: the hook also lets a call through on an error)."""
+def refusal(payload: dict, env: dict, cwd: str, call_id: str = "") -> str | None:
+    """hook.pre_tool_use's deny reason for `payload` (call `call_id`, named in the hook's refusal records),
+    asked in a child with the run's environment; None when it allows it (or the check fails: the hook also
+    lets a call through on an error)."""
+    if call_id and not payload.get("tool_use_id"):
+        payload = {**payload, "tool_use_id": call_id}
     from .providers.base import isolated_module_argv
     runtime = str(Path(__file__).resolve().parents[1])
     child_env = {**env, "PYTHONPATH": runtime}
@@ -52,9 +58,21 @@ def refusal(payload: dict, env: dict, cwd: str) -> str | None:
     return out.stdout.strip() or None
 
 
-def record(run_dir: Path, why: str, tool: str) -> None:
-    from .project import durable_write
-    durable_write(run_dir / GUARD_FILE, json.dumps({"why": why, "tool": tool, "at": time.time()}))
+def _entry(why: str, tool: str, call_id: str, stage: str) -> dict:
+    return {"why": why, "tool": tool, "id": call_id, "stage": stage, "at": time.time()}
+
+
+def record(run_dir: Path, why: str, tool: str, call_id: str = "") -> None:
+    """The run is being stopped at call `call_id`, which had started and not finished."""
+    from .project import durable_append, durable_write
+    got = _entry(why, tool, call_id, "started")
+    durable_write(run_dir / GUARD_FILE, json.dumps(got))
+    durable_append(run_dir / GUARD_LOG, json.dumps(got) + "\n")
+
+
+def finished(calls: list[dict], done: set[str]) -> None:
+    """Add the ids of the calls `calls` (Provider.activity events) shows finished to `done`."""
+    done.update(str(c["id"]) for c in calls if c.get("kind") == "result" and c.get("id"))
 
 
 def must_stop(why: str) -> bool:
@@ -65,13 +83,23 @@ def must_stop(why: str) -> bool:
     return untrusted.secret_refusal(why)
 
 
-def warn(run_dir: Path, why: str, tool: str, head: str = "") -> None:
-    """Record a call the hook refuses that had already finished when the runner read it (fsync'd)."""
+def warn(run_dir: Path, why: str, tool: str, head: str = "", call_id: str = "") -> None:
+    """Record a call the hook refuses that had already finished when the runner read it (fsync'd): the
+    warning file the daemon reports from, the guard log and progress.md. Never a stop, so no GUARD_FILE."""
+    from . import timefmt
+    from .project import durable_append
+    got = _entry(why, tool, call_id, "finished")
     try:
         with open(run_dir / WARN_FILE, "a") as f:
-            f.write(json.dumps({"why": why, "tool": tool, "head": head[:200], "at": time.time()}) + "\n")
+            f.write(json.dumps({**got, "head": head[:200]}) + "\n")
             f.flush()
             os.fsync(f.fileno())
+    except OSError:
+        pass
+    try:
+        durable_append(run_dir / GUARD_LOG, json.dumps(got) + "\n")
+        durable_append(run_dir / "progress.md", f"{timefmt.clock()} guard: a {tool or 'tool'} call (id {call_id or 'none'}) "
+                                                f"the harness refuses had already finished, so the run goes on: {why[:300]}\n")
     except OSError:
         pass
 
@@ -119,7 +147,7 @@ def _main() -> int:
     from . import hook
     try:
         payload = json.loads(sys.stdin.read() or "{}")
-        out, _ = hook.pre_tool_use(payload)
+        out, _ = hook.pre_tool_use(payload, stage="started")
     except Exception:
         return 0
     spec = (out or {}).get("hookSpecificOutput") or {}

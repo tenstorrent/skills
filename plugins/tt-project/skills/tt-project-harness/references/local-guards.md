@@ -76,5 +76,6 @@ Every provider path asks the same guards through `hook.local_guard`:
   every file edit is `Write`, `MCP:<tool>` is `mcp__cursor__<tool>`).
 - Runs without the hook (Cursor or Codex with hooks off): the runner-side tool guard asks the same check
   about each call it reads from the run's output and stops the run on a refusal. The call has started by
-  then, so a quick command may have run.
+  then, so a quick command may have run; one already finished when the check ends is logged
+  (`guard.jsonl`, stage `finished`) and the run goes on. Each record names the call's id and stage.
 - Session coordinators, read-only and full tools, Read, Grep and Glob included.

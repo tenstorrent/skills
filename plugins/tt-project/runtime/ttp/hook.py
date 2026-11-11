@@ -1210,9 +1210,15 @@ def _deny(why: str) -> dict:
                                    "permissionDecisionReason": f"tt-project: {why}."}}
 
 
-def pre_tool_use(payload: dict) -> tuple[dict | None, None]:
+# The call being judged, named in every refusal record (_log_refusal): its id (the provider's tool call
+# id) and stage: "before" from the hook (the call has not run), "started" from the runner's stream guard.
+CALL = {"id": "", "stage": "before"}
+
+
+def pre_tool_use(payload: dict, stage: str = "before") -> tuple[dict | None, None]:
     if not os.environ.get("TTP_RUN_DIR"):
         return None, None
+    CALL.update(id=str(payload.get("tool_use_id") or payload.get("call_id") or payload.get("id") or ""), stage=stage)
     from . import pathguard, untrusted
     if why := untrusted.mark_refusal(str(payload.get("tool_name") or ""), payload.get("tool_input") or {}):
         return _deny(why), None   # the run's untrusted-input mark, marked or not
@@ -1795,8 +1801,8 @@ def _log_refusal(cmd: str, kind: str, **extra: str) -> None:
     import time
     try:
         with open(Path(os.environ["TTP_RUN_DIR"]) / REFUSALS_FILE, "a") as f:
-            f.write(json.dumps({"ts": time.time(), "kind": kind, **{k: v[:500] for k, v in extra.items()},
-                                "command": cmd[:500]}) + "\n")
+            f.write(json.dumps({"ts": time.time(), "kind": kind, "id": CALL["id"], "stage": CALL["stage"],
+                                **{k: v[:500] for k, v in extra.items()}, "command": cmd[:500]}) + "\n")
     except OSError:
         pass
 
