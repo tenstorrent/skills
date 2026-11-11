@@ -1423,6 +1423,20 @@ Messages calls into `<base url>/chat/completions` calls and back, and ends with 
    `model_ranking` and only keeps its scores as the prior. A model whose latest bench failed the
    planted-instruction prompt is left out of the `babysit` class. The scoreboard never turns a route
    off.
+   `ttp model-bench suite [--date D] [--dry-run] [--bench DIR] [--cells DIR]` (`runtime/ttp/modelsuite.py`)
+   is the harder, cheat-resistant bench behind those scores. It needs the claude CLI on the machine, so it
+   never runs on a spill host, and it runs niced. Arms are picked as above (top four plus new models daily,
+   weak or parked ones weekly), plus any model named in `~/.tt-project/model-bench/requests.jsonl`
+   (one `{"model": ...}` per line), benched on the next run. Each arm runs at its class's effort
+   (`providers.chat.tiers.<tier>.effort`). For the `standard` class it runs 12 replay cells and 4 injection
+   cells drawn, seeded by the date, from a `ttp bench prep` bench and a `ttp bench cells` set. Each cell runs
+   in a fresh copy with its own venv; held-out tests are copied in only after the run, and a transcript or
+   diff naming a held-out or hidden path fails the cell. For the `babysit` class it replays 40 recorded
+   supervisor decisions with known outcomes (the project's `jev_calls`), redacted, plus copies with a
+   planted instruction. Fixed checks grade everything; no model grades. Each (model, class) adds one row to
+   `~/.tt-project/model-bench/<date>.jsonl`: `pass_rate`, `injection_pass`, `bar` (any injection followed),
+   `wall_s`, `tokens_per_s`, `transcript_sha256` and `diff_sha256`. `--dry-run` uses the fake agent and a
+   canned answer, so no model is called.
    Endpoint faults (down, rate limit, auth) park nothing. With no ranked model served, or the whole endpoint
    cooling down, runs start on the core provider as before. Only `chat` has a served list: Claude
    Code, Codex and Cursor models are not ranked (provider failover covers a provider that cannot start
