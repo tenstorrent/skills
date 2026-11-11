@@ -255,6 +255,52 @@ def test_an_untrusted_input_run_pushes_to_a_temp_bare_repo_of_its_own_and_nowher
     assert out.returncode == 0 and "dashboard" in refs(outside), out.stderr
 
 
+def test_an_untrusted_input_run_pushes_any_ref_to_a_local_repo_and_refuses_a_remote_name_or_pushurl_naming_a_network_url(
+        env, tmp_path, monkeypatch):
+    """A test's push to a bare repo in the pytest tmp dir sends nothing off
+    the host, so an untrusted_input run's pre-push hook lets it update any ref (a plain path or a file:///
+    URL in the run's temp dir or run folder). A network remote (ssh URL, scp form, a remote name or a
+    pushurl naming one), a symlink out of the temp dir and a repo outside it stay refused."""
+    _untrusted_run(env, tmp_path, monkeypatch, ["untrusted_input"])
+    tmp, outside = tmp_path / "tmp", tmp_path / "outside"
+    tmp.mkdir()
+    (tmp_path / "run").mkdir()
+    repo = tmp / "repo"
+    subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+    for k, v in (("user.name", "Test"), ("user.email", "test@example.com"), ("commit.gpgsign", "false")):
+        _git_out(repo, "config", k, v)
+    _commit(repo, "README.md", "hello\n")
+    for d in (tmp / "origin.git", outside / "origin.git", outside / "net.git"):
+        subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(d)], check=True)
+    (tmp / "link.git").symlink_to(outside / "origin.git")
+    # a fake ssh that serves every ssh URL from a local bare repo: no test reaches the network
+    fake = tmp_path / "fake-ssh"
+    fake.write_text(f"#!/bin/sh\nexec git-receive-pack '{outside / 'net.git'}'\n")
+    fake.chmod(0o755)
+    _git_out(repo, "remote", "add", "net", "ssh://git.example.invalid/o/r.git")
+    _git_out(repo, "remote", "add", "split", str(tmp / "origin.git"))
+    _git_out(repo, "remote", "set-url", "--push", "split", "git@git.example.invalid:o/r.git")
+    wrapper = RUNTIME.parent / "template" / "bin" / "git"
+
+    def push(*args):
+        run_env = {**os.environ, "TTP_PYTHON": sys.executable, "TTP_RUN_DIR": str(tmp_path / "run"),
+                   "GIT_SSH_COMMAND": str(fake), **dict.fromkeys(("TMPDIR", "TEMP", "TMP"), str(tmp))}
+        return subprocess.run([str(wrapper), "push", *args], cwd=repo, env=run_env, capture_output=True,
+                              text=True, timeout=60)
+    for target in (str(tmp / "origin.git"), f"file://{tmp / 'origin.git'}"):
+        out = push(target, "HEAD:refs/heads/main", "HEAD:refs/heads/other")
+        assert out.returncode == 0, (target, out.stderr)
+    assert "refs/heads/other" in _git_out(tmp / "origin.git", "for-each-ref")
+    for args in ((str(tmp / "link.git"), "HEAD:refs/heads/main"), (str(outside / "origin.git"), "HEAD:main"),
+                 ("net", "HEAD:refs/heads/main"), ("ssh://git.example.invalid/o/r.git", "HEAD:main"),
+                 ("git@git.example.invalid:o/r.git", "HEAD:main"), ("split", "HEAD:refs/heads/main")):
+        out = push(*args)
+        assert out.returncode != 0 and "untrusted_input" in out.stderr, (args, out.stderr)
+    for d in ("origin.git", "net.git"):
+        assert _git_out(outside / d, "for-each-ref") == "", d
+    assert push("net", "HEAD:ttp/t1-own").returncode == 0, "its own branch still goes to a network remote"
+
+
 def _reviewed(p, tid, head, status="done"):
     """A review of task `tid` with `status` whose verdict recorded `head`: its id."""
     rid = p.db.add_task(f"Review #{tid}: the change", "review it", kind="review", status=status,
