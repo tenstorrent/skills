@@ -321,6 +321,68 @@ def test_a_finish_whose_diff_read_timed_out_gets_its_review_on_the_next_tick(env
     assert len(p.db.q("SELECT id FROM tasks WHERE kind='review'")) == 1
 
 
+def _cut_split_reads(monkeypatch, cut):
+    """worktree.diff_lines raises TimeoutExpired when the split gate (_split_back) reads it while cut["n"]
+    is left (None: always); the review's own read is never cut."""
+    import subprocess
+    import sys
+    from ttp import worktree
+    real = worktree.diff_lines
+
+    def slow(*a, **k):
+        f = sys._getframe(1)
+        while f and f.f_code.co_name != "_split_back":
+            f = f.f_back
+        if f and (cut["n"] is None or cut["n"] > 0):
+            if cut["n"]:
+                cut["n"] -= 1
+            raise subprocess.TimeoutExpired(["git", "diff"], 0)
+        return real(*a, **k)
+    monkeypatch.setattr(worktree, "diff_lines", slow)
+
+
+def test_a_timed_out_split_read_defers_the_review_and_the_next_tick_queues_it_split_checked(env, monkeypatch):
+    """A hand-off whose split-gate diff read times out queues no review then (it is never reviewed unsplit
+    unjudged): the next tick's retry_unread_reviews judges its size first, sends an oversized change back
+    for its split and queues the review of one under chains.split_lines."""
+    from ttp import splitgate
+    from ttp.daemon import Daemon, KV_REVIEW_UNREAD, KV_SPLIT_UNREAD, SPLIT_UNREAD_LINE
+    p = make(env)
+    _with_origin(env, clone=False)
+    cut = {"n": 2}
+    _cut_split_reads(monkeypatch, cut)
+    small, _, done, reviews = _finish_code(env, p, "small cut", {"app.py": 5})
+    assert not reviews and SPLIT_UNREAD_LINE in done["text"] and p.db.task(small)["status"] == "done"
+    big, _, done, reviews = _finish_code(env, p, "big cut", {"big.py": 260})
+    assert not reviews and SPLIT_UNREAD_LINE in done["text"] and p.db.task(big)["status"] == "done"
+    assert p.db.kv(KV_REVIEW_UNREAD) == [small, big] and p.db.kv(KV_SPLIT_UNREAD) == {str(small): 1, str(big): 1}
+    (rid,) = Daemon(p.base).retry_unread_reviews()
+    assert p.db.task(rid)["title"] == f"Review #{small}: small cut"
+    t = p.db.task(big)
+    assert t["status"] == "queued" and "Split order" in t["spec"] and splitgate.returned(t)
+    assert len(p.db.q("SELECT id FROM tasks WHERE kind='review'")) == 1
+    assert p.db.kv(KV_REVIEW_UNREAD) == [] and p.db.kv(KV_SPLIT_UNREAD) == {}
+
+
+def test_a_split_read_that_keeps_timing_out_still_gets_its_review_after_the_bounded_tries(env, monkeypatch):
+    """A split read that times out on every try holds the review only SPLIT_UNREAD_TRIES reads: then the
+    review is queued unsplit and the log says the split gate could not judge it."""
+    from ttp.daemon import Daemon, KV_REVIEW_UNREAD, KV_SPLIT_UNREAD, SPLIT_UNREAD_TRIES
+    p = make(env)
+    _with_origin(env, clone=False)
+    _cut_split_reads(monkeypatch, {"n": None})
+    tid, _, _, reviews = _finish_code(env, p, "always cut", {"big.py": 260})
+    assert not reviews and p.db.kv(KV_REVIEW_UNREAD) == [tid]
+    d = Daemon(p.base)
+    for _ in range(SPLIT_UNREAD_TRIES - 2):
+        assert d.retry_unread_reviews() == [] and p.db.kv(KV_REVIEW_UNREAD) == [tid]
+    (rid,) = d.retry_unread_reviews()
+    assert p.db.task(rid)["title"] == f"Review #{tid}: always cut" and p.db.task(tid)["status"] == "done"
+    assert p.db.kv(KV_REVIEW_UNREAD) == [] and p.db.kv(KV_SPLIT_UNREAD) == {}
+    assert f"task {tid}: the split gate could not judge it" in (p.logs / "daemon.log").read_text()
+    assert d.retry_unread_reviews() == []
+
+
 def test_a_finish_with_its_round_slice_or_git_budget_spent_defers_its_review_to_the_next_tick(env):
     # #7690: a finish's last round (one that never aborts) past its strict slice gave _auto_review's
     # rev-parse a 0 s timeout. It still runs no git under the lock past the slice: the read is not started

@@ -201,6 +201,8 @@ def test_7144_a_failed_review_read_is_retried_first_by_the_sweep_outside_its_cap
     from ttp import daemon as dm
     p = _owner_project(env)
     p.set_config("review.unreviewed_per_pass", 1)
+    # The review's own read: a timed-out split read defers the review first (reviewsweep_cases).
+    p.set_config("chains.split_lines", 0)
     older, _ = _owner_unreviewed(env, p, "older backlog")
     real = worktree.diff_lines
     def expired(*a, **k):

@@ -797,6 +797,11 @@ KV_UNREVIEWED_COUNTED = "unreviewed_counted"   # kv: the runtime version whose f
 KV_REVIEW_UNREAD = "review_unread"   # kv: task ids whose review a timed-out git read left unqueued (retry_unread_reviews)
 KV_REVIEW_RETRY = "review_read_retry"   # kv: {task id: first failure} of code tasks whose review's diff read failed
 REVIEW_RETRY_KEEP_S = 7 * 86400   # a read retry the sweep has not settled by then is dropped (logged)
+KV_SPLIT_UNREAD = "split_unread"   # kv: {task id: timed-out split reads} of reviews the split gate deferred
+SPLIT_UNREAD_TRIES = 3   # a split read that times out this often is given up: the review is queued unjudged (logged)
+SPLIT_UNREAD_LINE = ("Review deferred to the next tick: the split check's diff read timed out, so the size of "
+                     "this change is checked again before its review is queued.")
+dbmod.DICT_KV.add(KV_SPLIT_UNREAD)
 PUSH_REFS_EVERY_S = 600   # how often the push queue's pins (refs/ttp/push/<id>) of settled rows are pruned
 
 
@@ -8422,8 +8427,13 @@ class Daemon:
         # it would get: only a hand-off that review would follow, so a needs_review request is never swallowed.
         resplit = self._split_back(task, result, int(task["attempts"] or 0)) \
             if reviewable and not split and not requeued and self._code_change(task) else ""
+        # A split read that timed out defers the review to the next tick (retry_unread_reviews), which judges
+        # the size again first: the change is neither returned nor reviewed unsplit on this hand-off.
+        unread = resplit == SPLIT_UNREAD_LINE
         if resplit:
             text += f"\n{resplit}"
+        if unread:
+            resplit = ""
         # Accepted gap: _auto_review (and _fix_without_commits below) still run a few local ref-metadata git
         # reads inside this transaction (rev-parse, the diff base, rev-list --count), each milliseconds; they
         # are not warmed by gitmemo. All git in this transaction ends within gitmemo.TX_GIT_S (_finish_tx).
@@ -8433,7 +8443,8 @@ class Daemon:
         # review pending for the next tick (retry_unread_reviews), never the transaction's whole budget.
         with gitmemo.bounded(gitmemo.FINISH_REVIEW_GIT_S):
             review = self._auto_review(dict(task, **upd), summary) \
-                if reviewable and not split and not requeued and not resplit and self._code_change(task) else None
+                if reviewable and not split and not requeued and not resplit and not unread \
+                and self._code_change(task) else None
         # A fix of a failed review that adds no commit to the head that review saw leaves its re-review
         # nothing new to check: the re-review is blocked, never run on the same head, and the coordinator
         # decides.
@@ -18755,6 +18766,10 @@ class Daemon:
             t = db.task(tid) if isinstance(tid, int) else None
             if not t or t["status"] not in ("done", "review") or not self._code_change(t):
                 continue
+            # The split gate judges it first: a read that times out again keeps it pending (bounded,
+            # SPLIT_UNREAD_TRIES); a change over chains.split_lines goes back to its worker, unreviewed.
+            if self._split_back(t, load_result(t["result"]), int(t["attempts"] or 0)):
+                continue
             review = self._auto_review(t, str(load_result(t["result"]).get("summary") or ""), add=True)
             if review and review[1]:
                 queued.append(review[0])
@@ -20248,12 +20263,35 @@ class Daemon:
         """splitgate at the hand-off of task `task` (its row before this hand-off; `result` the new one):
         the line for its event when its change went back once for a split, else '' (its review is queued
         as before). A change already approved, landed or superseded is not returned; a miss never stops
-        the hand-off."""
+        the hand-off. A diff read that times out returns SPLIT_UNREAD_LINE with the review pending for the
+        next tick (KV_REVIEW_UNREAD, retry_unread_reviews); after SPLIT_UNREAD_TRIES such reads it returns ''
+        and logs that the split gate could not judge the change, so its review is queued unsplit."""
         branch = task.get("branch")
         if not branch or not splitgate.split_lines(self.cfg) or task.get("kind") != "code":
             return ""
+        db, key = self.p.db, str(task["id"])
         try:
             changes = gitmemo.cached(("worktree.diff_lines", branch), lambda: worktree.diff_lines(self.p, [branch]))
+        except subprocess.TimeoutExpired as e:
+            tries, _ = db.kv_dict(KV_SPLIT_UNREAD)
+            n = int(tries.pop(key, 0) or 0) + 1
+            if n < SPLIT_UNREAD_TRIES:
+                db.set_kv(KV_SPLIT_UNREAD, {**tries, key: n})
+                self._review_pending(task["id"])
+                log(self.p, f"task {task['id']}: split check's diff read timed out ({e}): review deferred to the "
+                            f"next tick ({n}/{SPLIT_UNREAD_TRIES})")
+                return SPLIT_UNREAD_LINE
+            db.set_kv(KV_SPLIT_UNREAD, tries)
+            log(self.p, f"task {task['id']}: the split gate could not judge it, its diff read timed out {n} times: "
+                        f"reviewed unsplit")
+            return ""
+        except Exception:
+            log(self.p, f"split check of #{task['id']}: " + traceback.format_exc().replace("\n", " | ")[:1000])
+            return ""
+        tries, _ = db.kv_dict(KV_SPLIT_UNREAD)
+        if tries.pop(key, None) is not None:
+            db.set_kv(KV_SPLIT_UNREAD, tries)
+        try:
             hit = splitgate.check(self.cfg, task, changes, result, load_result(task.get("result")))
             if hit is None:
                 return ""
