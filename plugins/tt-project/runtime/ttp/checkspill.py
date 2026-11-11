@@ -145,6 +145,8 @@ HOST_FAULT_TRIES = 2   # a spill host whose own fault (exit 75) ended a run this
 FAULT_RETRY_S = 600   # for this long, or until the checks config changes; then it is tried again
 FAIL_VERDICT_HOSTS = 2   # on a workstation (remote_only), checks that failed on this many spill hosts failed: no rerun
 SLOW = "slow"   # spill_off_add's mark of a host whose tree copy timed out (remotecheck.COPY_TIMEOUT): kept off at once
+WRAP_ENV = "TTP_CHECKS_WRAP_REFUSED"   # this run's spill hosts whose wrapper refused it, each with why (wrap_refused)
+WRAP_SAME_HOSTS = 3   # this many spill hosts (or every one listed) refusing a run for one reason: the wrapper's setting
 ENV_FAULT_HOSTS = 2   # the checks failed at import this often on spill hosts: one fault of the spill env config
 ENV_RETRY_S = 900   # after which (or once the checks config changes) a run tries the spill hosts again
 FAILS_FILE = "checks-spill-fails.json"   # in the project state: where each head's checks failed on a spill host (fails)
@@ -1734,6 +1736,41 @@ def env_event(db, off: str, cfg: dict) -> bool:
               f"(checks.spill_wrap_cmd, the pinned checks env) and restore a working value.", "queued"))
     except (OSError, sqlite3.Error):   # an event is a courtesy: never a reason for the checks run to fail
         return False
+    return True
+
+
+def wrap_refused(p, host: str, why: str, what: str = "", cfg: dict | None = None) -> bool:
+    """Record that `host`'s spill wrapper refused this run, or is missing there, for `why` (remotecheck.wrap_fault),
+    in WRAP_ENV. Once every host that refused it gave the one reason and WRAP_SAME_HOSTS of them (or every
+    spill host listed, two or more) did, it is the wrapper's setting, not the hosts: one limit line and one coordinator event
+    (once per checks config and reason) name that reason and checks.spill_wrap_cmd. Else the host's own limit
+    line. True when it is the setting. The run still goes on elsewhere or here, as for any host fault."""
+    try:
+        seen = json.loads(os.environ.get(WRAP_ENV) or "{}")
+        seen = seen if isinstance(seen, dict) else {}
+    except ValueError:
+        seen = {}
+    seen[host] = why
+    os.environ[WRAP_ENV] = json.dumps(seen)
+    listed = set(hosts(cfg)) if cfg is not None else set()
+    if len(set(seen.values())) != 1 or len(seen) < 2 or not (len(seen) >= WRAP_SAME_HOSTS or listed <= set(seen)):
+        note_limit(p.name, f"spill host {host}: {why}; its checks run again on another host or here", what)
+        return False
+    said = (f"the spill wrapper refused these checks on every spill host they went to ({len(seen)}: "
+            f"{', '.join(seen)}) for one reason: {why}. That is the wrapper's setting (checks.spill_wrap_cmd), "
+            "not the hosts")
+    note_limit(p.name, f"{said}; the checks run here or on another host", what)
+    import hashlib
+    import sqlite3
+    fp = f"checkspill:wrap:{_env_key(cfg)}:{hashlib.sha1(why.encode()).hexdigest()[:8]}"
+    try:
+        if not p.db.q("SELECT 1 FROM events WHERE fingerprint=? LIMIT 1", (fp,)):
+            p.db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status) VALUES(?,?,?,?,?,?,?)",
+                   (time.time(), "daemon", "observation", fp, "high",
+                    f"Spilled checks never run: {said}. Check how checks.spill_wrap_cmd (or a check's own "
+                    "spill_wrap_cmd) finds its wrapper on those hosts and fix the setting or the hosts.", "queued"))
+    except (OSError, sqlite3.Error, AttributeError):   # an event is a courtesy: never a reason for the run to fail
+        pass
     return True
 
 

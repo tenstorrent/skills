@@ -59,10 +59,13 @@ def read(host: str, wrap: list[str]) -> dict:
 
 def script(wrap: list[str]) -> str:
     refused = f"{WHERE}/refused"
+    # As a check run (remotecheck._run_script): the wrapper under the real HOME, what it runs under the scratch one.
+    run = (f'env HOME="${{{remotecheck.REAL_HOME}:-$HOME}}" {shlex.join(wrap)} env HOME="$HOME" ' if wrap else "") \
+        + shlex.join(["python3", "-c", "import pytest"])
     return ("command -v python3 >/dev/null 2>&1 || { echo 'no python3 on PATH'; exit 4; }\n"
             + runnerenv.remote_lines(None, WHERE, "exit 5")
             + f"mkdir -p {WHERE}; rm -f {refused}; export {remotecheck.WRAP_REFUSED_ENV}=\"$PWD\"/{refused}\n"
-            + f"out=$({shlex.join([*wrap, 'python3', '-c', 'import pytest'])} 2>&1); rc=$?\n"
+            + f"out=$({run} 2>&1); rc=$?\n"
             + "printf '%s\\n' \"$out\" | tail -n 3\n"
             + f"[ \"$rc\" = {remotecheck.FAULT_RC} ] && {{ [ -e {refused} ] && exit 75; exit 76; }}\n"
             + "exit $rc\n")

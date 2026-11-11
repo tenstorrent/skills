@@ -229,3 +229,70 @@ def test_a_spilled_check_runs_in_a_scratch_home_in_its_run_folder_there(tmp_path
     assert (rhome / ".cache" / "w").exists() and _rc_left(tmp_path) == []
     rc, said = _rc_run(tmp_path, repo, f'printf "%s" "$HOME" > {out}', HOME=str(rhome))
     assert rc == 0 and out.read_text() == str(rhome), said
+
+
+_FIND_WRAP = 'w="$HOME/wrap.sh"; [ -x "$w" ] && exec "$w" "$@"; exit 75'   # a spill wrapper found through $HOME
+
+
+def test_a_spill_wrapper_found_through_home_runs_with_the_real_home_and_its_check_in_the_scratch_one(tmp_path):
+    # wrap_real_home (#8367): the wrapper sees the host's real HOME, so "$HOME/..." finds it; the check it
+    # execs sees the throwaway HOME. A wrapper that refuses says why, and that reason reaches the fault line.
+    from ttp import remotecheck, scratchhome, spillhealth
+    repo = _rc_repo(tmp_path)
+    rhome = tmp_path / "rhome"
+    rhome.mkdir()
+    seen, wrapper_home = tmp_path / "seen", tmp_path / "wrapper-home"
+    (rhome / "wrap.sh").write_text(f'#!/bin/sh\nprintf "%s" "$HOME" > {wrapper_home}\nexec "$@"\n')
+    (rhome / "wrap.sh").chmod(0o755)
+    bin_, remote = _rc_fake_ssh(tmp_path)
+
+    def go(wrap):
+        penv = {**os.environ, "PATH": f"{bin_}{os.pathsep}{os.environ['PATH']}", "FAKE_REMOTE_TMP": str(remote),
+                "HOME": str(rhome), "XDG_CACHE_HOME": "", "TTP_HOME": "", scratchhome.FILES_ENV: "[]"}
+        r = subprocess.run(remotecheck.argv(f'printf "%s\\n%s\\n" "$HOME" "$XDG_CONFIG_HOME" > {seen}', "box1", {},
+                                            "", wrap), cwd=repo, env=penv, capture_output=True, text=True, timeout=60)
+        return r.returncode, r.stdout + r.stderr
+    rc, out = go(("sh", "-c", _FIND_WRAP, "spill-wrap"))
+    assert rc == 0, out
+    assert wrapper_home.read_text() == str(rhome), "the wrapper ran with the real HOME"
+    home, xdg = seen.read_text().splitlines()
+    assert "/.git/ttp-env/home." in home and home != str(rhome) and xdg == f"{home}/.config", "the check: scratch"
+    assert _rc_left(tmp_path) == []
+    # Not there: it refuses with its reason, which the fault (and so status) names with the setting.
+    (rhome / "wrap.sh").unlink()
+    rc, out = go(("sh", "-c", _FIND_WRAP.replace("exit 75", 'echo "no spill wrapper on this host" > "$TTP_WRAP_REFUSED"; '
+                                                 "exit 75"), "spill-wrap"))
+    host, why = remotecheck.wrap_fault(out)
+    assert rc == remotecheck.FAULT_RC and host == "box1", out
+    assert why.endswith("(checks.spill_wrap_cmd, or the check's own spill_wrap_cmd): no spill wrapper on this host"), why
+    # The spill hosts' health probe runs its wrapper the same way.
+    assert 'env HOME="${ttp_real_home:-$HOME}" sh -c ' in spillhealth.script(["sh", "-c", _FIND_WRAP, "spill-wrap"])
+    assert "env HOME=" not in spillhealth.script([])
+
+
+def test_a_spill_wrapper_refusing_on_every_spill_host_for_one_reason_is_one_event_naming_its_setting(env, monkeypatch):
+    # all_hosts_refused_event (#8367): one event and one status line naming the reason and
+    # checks.spill_wrap_cmd, not a host fault per host; once per checks config and reason.
+    from ttp import checkspill
+    p = make(env)
+    monkeypatch.delenv(checkspill.WRAP_ENV, raising=False)
+    p.set_config("delivery.checks_spill_hosts", ["check-host-a", "check-host-b"])
+    why = ("the spill wrapper 'sh' refused the run there (checks.spill_wrap_cmd, or the check's own spill_wrap_cmd): "
+           "no spill wrapper on this host")
+    events = lambda: p.db.q("SELECT text FROM events WHERE fingerprint LIKE 'checkspill:wrap:%'")   # noqa: E731
+    assert checkspill.wrap_refused(p, "check-host-a", why, "smoke", p.config()) is False and not events()
+    assert any("limited: spill host check-host-a:" in x for x in checkspill.limit_lines(p.name)), checkspill.limit_lines(p.name)
+    assert checkspill.wrap_refused(p, "check-host-b", why, "smoke", p.config()) is True
+    assert checkspill.wrap_refused(p, "check-host-b", why, "smoke", p.config()) is True
+    ev = events()
+    assert len(ev) == 1 and "checks.spill_wrap_cmd" in ev[0]["text"] and "no spill wrapper on this host" in ev[0]["text"]
+    assert "check-host-a, check-host-b" in ev[0]["text"], ev[0]["text"]
+    lines = checkspill.limit_lines(p.name)
+    assert len(lines) == 1 and "every spill host" in lines[0] and "checks.spill_wrap_cmd" in lines[0], lines
+    # Different reasons on different hosts: each host's own fault, no event.
+    monkeypatch.delenv(checkspill.WRAP_ENV)
+    p.set_config("delivery.checks_spill_hosts", ["check-host-c", "check-host-d"])
+    checkspill.wrap_refused(p, "check-host-c", why, "smoke", p.config())
+    assert checkspill.wrap_refused(p, "check-host-d", why.replace("no spill", "busy, no"), "smoke", p.config()) is False
+    assert len(events()) == 1
+    checkspill.note_limit(p.name, "")

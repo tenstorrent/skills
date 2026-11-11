@@ -4929,9 +4929,9 @@ def cmd_checks(a) -> None:
                 slow = rc == remotecheck.FAULT_RC and not env_why and remotecheck.COPY_TIMEOUT in ran_out
             if rc == 75 and not timed_out:   # its spill wrapper refused it or is missing: status names it (a limit line)
                 from . import checklane, checkspill, remotecheck
-                if (wrapped := remotecheck.wrap_fault(ran_out))[1]:
-                    checkspill.note_limit(p.name, f"spill host {wrapped[0] or spilled.host}: {wrapped[1]}; its "
-                                          "checks run again on another host or here", checklane.scope_text(todo)[:300])
+                if (wrapped := remotecheck.wrap_fault(ran_out))[1]:   # every host refusing alike: one event (wrap_refused)
+                    checkspill.wrap_refused(p, wrapped[0] or spilled.host, wrapped[1], checklane.scope_text(todo)[:300],
+                                            p.config())
             env_cfg = p.config() if env_why and not real else None
             key = _commands_hash(todo)
             spent = bool(env_cfg) and checkspill.env_rerun_spent(checkspill.fails(p.state, head, key), env_cfg)

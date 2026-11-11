@@ -70,6 +70,7 @@ NO_ENV = "no-env"     # ... and when the pinned Python env cannot be made there 
 NO_WRAP = "no-wrap"   # the exit marker's form when the remote wrapper is missing there: a host fault
 WRAP_REFUSED = "wrap-refused"   # ... and when the wrapper refused the run (WRAP_REFUSED_ENV): a host fault
 WRAP_REFUSED_ENV = "TTP_WRAP_REFUSED"   # the file a wrapper writes before it exits FAULT_RC to refuse a run
+REAL_HOME = "ttp_real_home"   # the remote shell variable scratchhome.remote_lines keeps the real HOME in
 # Behind a spill wrapper: the pinned checks env first on PATH again and the user site off (runnerenv.remote_lines)
 REFRONT = ('if [ -n "${TTP_CHECKS_ENV_BIN:-}" ]; then PATH="$TTP_CHECKS_ENV_BIN${PATH:+:$PATH}"; '
            'PYTHONNOUSERSITE=1; export PATH PYTHONNOUSERSITE; unset PIP_USER; fi\n')
@@ -382,6 +383,8 @@ def _run_script(q: str, exports_: str, cmd: str, mark: str, wrap: tuple[str, ...
     if wrap:
         cmd = REFRONT + cmd
     w = " ".join(map(shlex.quote, wrap))
+    if wrap:   # the wrapper finds its own files under the account's real HOME; the check runs in the scratch one
+        w = f'env HOME="${{{REAL_HOME}:-$HOME}}" {w} env HOME="$HOME"'
     run = f"{w} bash -e -o pipefail -c {shlex.quote(cmd)}".lstrip()
     has = ""
     if wrap:
@@ -390,7 +393,8 @@ def _run_script(q: str, exports_: str, cmd: str, mark: str, wrap: tuple[str, ...
         has = (f"if ! {{ {test}; }}; then printf '\\n%s%s\\n' {mark} {NO_WRAP}; exit 96; fi\n"
                f"export {WRAP_REFUSED_ENV}={q}/.git/ttp-wrap-refused\n")
     refused = (f"if [ \"$rc\" = {FAULT_RC} ] && [ -e \"${WRAP_REFUSED_ENV}\" ]; then "
-               f"printf '\\n%s%s\\n' {mark} {WRAP_REFUSED}; fi\n") if wrap else ""
+               f"printf '\\n%s%s %s\\n' {mark} {WRAP_REFUSED} \"$(head -n 1 \"${WRAP_REFUSED_ENV}\" | "
+               "tr -d '\\r' | cut -c 1-200)\"; fi\n") if wrap else ""
     from . import orphanchecks
     # Who owns the run: once that process is gone, orphanchecks stops what still runs here.
     owner = f"printf '%s\\n' {shlex.quote(orphanchecks.owner_line())} > {orphanchecks.OWNER_FILE}\n"
@@ -925,8 +929,8 @@ def _attempt(host, top, head, env, extra, cmd, mark, wrap, wait) -> tuple[int, s
                 rc = int(text[len(mark):])
                 held = b""   # the blank line printed before the marker is ours
                 continue
-            if text == mark + WRAP_REFUSED:
-                wrap_refused, held = True, b""
+            if text.startswith(mark + WRAP_REFUSED):   # the wrapper's reason after it, if it wrote one
+                wrap_refused, held = " ".join(text[len(mark + WRAP_REFUSED):].split()) or True, b""
                 continue
             if text in (mark + NO_WRAP, mark + NO_ENV):
                 no_wrap, held = text[len(mark):], b""
@@ -956,9 +960,10 @@ def _attempt(host, top, head, env, extra, cmd, mark, wrap, wait) -> tuple[int, s
                 return FAULT_RC, why
             return _fault(host, why), ""
         if rc == FAULT_RC and wrap_refused:
-            return _fault(host, f"the spill wrapper {wrap[0]!r} refused the run there {WRAP_SETTING} (exit {FAULT_RC} and "
-                                f"{WRAP_REFUSED_ENV}; its reason, if any, is above), so the check did not run "
-                                "there"), ""
+            said = f": {wrap_refused}" if isinstance(wrap_refused, str) else ""
+            return _fault(host, f"the spill wrapper {wrap[0]!r} refused the run there {WRAP_SETTING}{said} (exit "
+                                f"{FAULT_RC} and {WRAP_REFUSED_ENV}; its reason, if any, is above), so the check did not "
+                                "run there"), ""
         if rc == FAULT_RC:
             _say(f"the command exited {FAULT_RC}; reported as 1, so it does not read as an unreachable host")
             return 1, ""
