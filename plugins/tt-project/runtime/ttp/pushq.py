@@ -530,6 +530,34 @@ def _patch_ids(p: Project, shas: list[str]) -> dict[str, str]:
     return {f[0]: f[1] for f in (line.split() for line in pid.stdout.splitlines()) if len(f) == 2}
 
 
+def _change_id(p: Project, head: str, base: str) -> str:
+    """The patch id (git patch-id --stable) of merge-base(head, base)..head as one diff, "" when empty or
+    unknown: equal for a rebase of the same change onto a moved base."""
+    mb = _git(p, "merge-base", head, base, timeout=INHERIT_GIT_S)
+    if mb.returncode != 0 or not mb.stdout.strip():
+        return ""
+    diff = _git(p, "diff", "--no-color", "--no-ext-diff", mb.stdout.strip(), head, timeout=INHERIT_GIT_S)
+    if diff.returncode != 0 or not diff.stdout.strip():
+        return ""
+    pid = gitmemo.run(["git", "-C", str(p.root), "patch-id", "--stable"], input=diff.stdout, text=True,
+                      capture_output=True, timeout=INHERIT_GIT_S)
+    return (pid.stdout.split() or [""])[0] if pid.returncode == 0 else ""
+
+
+def _same_change(p: Project, head: str, reviewed: list[str], tgt: tuple[str, str]) -> bool:
+    """Whether `head` carries exactly the change of one of the `reviewed` commits over the target's tip:
+    the same patch id (_change_id), as a review's rebase of its reviewed ref onto a moved tip has. Nothing
+    looser: a head with any other diff is not a reviewed change."""
+    tip = _tracking_tip(p, *tgt) if reviewed else ""
+    if not tip:
+        return False
+    try:
+        mine = _change_id(p, head, tip)
+        return bool(mine) and any(_change_id(p, r, tip) == mine for r in reviewed)
+    except subprocess.TimeoutExpired:
+        return False   # git hung: refuse; the review can approve again
+
+
 def _inherited(p: Project, task: dict, entries: list[dict], tip: str, now: float) -> dict[str, dict[int, list[str]]]:
     """Commits each head adds over the target's `tip` that come from another task whose latest review
     failed: {head: {task id: ["<short sha> <subject>", ...]}}. A commit counts by its hash or by its
@@ -682,8 +710,10 @@ def check_approval(p: Project, task: dict, entries: Any, cfg: dict | None = None
         return {"invalid": 'list the approved commits as "push": [{"branch": ..., "head": <40-hex sha>}]'}
     rows = p.db.q("SELECT status, head, created FROM push_queue WHERE task=? ORDER BY id", (task["id"],))
     conflicted = [r["head"] for r in rows if r["created"] == rows[-1]["created"] and r["status"] == "conflict"]
-    if not rows and (h := rebase_head(task)):
-        conflicted = [h]   # a rebase review (auto_rebase) re-approves the head its predecessor could not land
+    if not conflicted and (h := rebase_head(task)) and not any(r["status"] in OPEN_ROWS for r in rows):
+        # A rebase review (auto_rebase) re-approves the head its predecessor could not land, also once an
+        # earlier row of its own was cancelled or sent back (a moved target): none is live or in conflict.
+        conflicted = [h]
     reviewed: list[str] | None = None
     built: list[tuple[str, str]] = []
     out, added, accepted = [], {}, {}
@@ -705,7 +735,8 @@ def check_approval(p: Project, task: dict, entries: Any, cfg: dict | None = None
                          if tip and on]
                 names = ", ".join(refs + list(fixes)) or "none"
             if not _contains(p, reviewed, head) and \
-                    not any(_contains(p, [tip], head) and _contains(p, [head], on) for tip, on in built):
+                    not any(_contains(p, [tip], head) and _contains(p, [head], on) for tip, on in built) and \
+                    not _same_change(p, head, reviewed, tgt):
                 return {"invalid": f"{head} is none of the reviewed refs ({names}) nor an ancestor of one"}
         out.append(_entry(e))
         ids = e.get("inherited") if isinstance(e.get("inherited"), list) else []

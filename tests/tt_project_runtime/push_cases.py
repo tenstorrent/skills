@@ -4376,6 +4376,62 @@ def test_a_conflicting_head_gets_no_rebase_review_past_the_review_cap_or_after_o
     assert pushq.rebase_head(s.p.db.task(first)) == s.head
 
 
+def _pq_moved_tip(s, name="other.txt"):
+    """The target's tracking tip moves on by one commit of another change: {the new tip}."""
+    _git_out(s.path, "checkout", "-q", "-b", f"tip-{name}", "refs/remotes/origin/proj")
+    _commit(s.path, name, "someone else's change\n")
+    tip = _git_out(s.path, "rev-parse", "HEAD")
+    _git_out(s.repo, "update-ref", "refs/remotes/origin/proj", tip)
+    _git_out(s.path, "checkout", "-q", s.branch)
+    return tip
+
+
+def _pq_on(s, base, name, *changes):
+    """A head on `base` with one commit per (file, text) of `changes`."""
+    _git_out(s.path, "checkout", "-q", "-b", name, base)
+    for path, text in changes:
+        _commit(s.path, path, text)
+    head = _git_out(s.path, "rev-parse", "HEAD")
+    _git_out(s.path, "checkout", "-q", s.branch)
+    return head
+
+
+@pytest.mark.parametrize("earlier", ["cancelled", "check_failed", "approved"])
+def test_a_rebase_review_re_approves_its_head_after_its_own_earlier_row_left_the_queue(env, monkeypatch, earlier):
+    """A rebase review (push_rebase:<head>) whose own earlier row was cancelled (the push target moved) or
+    sent back re-approves its rebased head: that head is none of its named refs, but the rebase it was
+    queued for. While one of its rows is still live, the label adds nothing."""
+    from ttp import pushq
+    s = _pq(env, monkeypatch)
+    tip = _pq_moved_tip(s)
+    rebased = _pq_on(s, tip, "rebased", ("feature.txt", "feature\n"))
+    rb = s.p.db.add_task("Rebase the feature", "rebase it", kind="review", origin="daemon",
+                         labels=[f"{pushq.REBASE_LABEL}{s.head}"])
+    s.p.db.x("INSERT INTO push_queue(task, branch, head, target, status, created, updated) VALUES(?,?,?,?,?,?,?)",
+             (rb, s.branch, s.head, "origin/proj", earlier, time.time() - 60, time.time()))
+    check = pushq.check_approval(s.p, s.p.db.task(rb), [{"branch": "rebased", "head": rebased}])
+    if earlier == "approved":
+        assert "none of the reviewed refs" in check["invalid"]
+    else:
+        assert check.get("entries"), check
+
+
+def test_a_review_re_approves_its_own_rebase_of_the_reviewed_change_and_nothing_else(env, monkeypatch):
+    """A review that rebases its reviewed ref onto a moved tip re-approves the rebased head when its change
+    has the same patch id as the reviewed one; a head with any other diff stays refused."""
+    from ttp import pushq
+    s = _pq(env, monkeypatch)
+    tip = _pq_moved_tip(s)
+    same = _pq_on(s, tip, "same", ("feature.txt", "feature\n"))
+    assert pushq.check_approval(s.p, s.p.db.task(s.review), [{"branch": s.branch, "head": same}]).get("entries")
+    for name, changes in (("changed", [("feature.txt", "feature, edited\n")]),
+                          ("more", [("feature.txt", "feature\n"), ("extra.txt", "unreviewed\n")]),
+                          ("none", [])):
+        head = _pq_on(s, tip, name, *changes)
+        check = pushq.check_approval(s.p, s.p.db.task(s.review), [{"branch": s.branch, "head": head}])
+        assert "none of the reviewed refs" in check.get("invalid", ""), (name, check)
+
+
 def test_the_daemon_closes_code_tasks_left_in_review_whose_latest_review_pushed_them(env):
     """Clean-up of tasks left behind: only a task whose latest covering review is done and pushed its
     work after the task entered review is closed, once."""
