@@ -243,7 +243,15 @@ def _restart(p: Project, pid: int, grace_s: float) -> tuple[bool, str]:
         return start == "ok" and not _alive(pid), how
     if not _end(pid, grace_s):
         return False, f"pid {pid} survived SIGTERM and SIGKILL"
-    if svc:   # cron starts a new one right after this; launchd's KeepAlive at once
+    if svc and svc["kind"] == "launchd":
+        # KeepAlive starts a new one at once, but only while its agent is loaded: a bootout whose
+        # bootstrap failed leaves it unloaded, and then nothing would.
+        loaded = service.ensure_loaded(p)
+        if loaded and not loaded.startswith("bootstrapped"):
+            return False, f"ended pid {pid}; its launchd agent is not loaded: {loaded}"
+        return True, f"ended pid {pid}; " + (f"{loaded}, which starts a new daemon" if loaded
+                                              else "its launchd service starts a new daemon")
+    if svc:   # cron starts a new one right after this
         return True, f"ended pid {pid}; its {svc['kind']} service starts a new daemon"
     service._spawn(p)   # a daemon started by hand: started again the way cron does
     return True, f"ended pid {pid} and started a new daemon (no service installed)"
@@ -273,6 +281,14 @@ def main() -> int:
         found = check(p)
         if found not in ("ok", "not running"):   # it runs every few minutes: log only what matters
             print(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} watchdog: {found}")
+        if found == "not running":
+            try:   # no daemon: KeepAlive starts one only while its launchd agent is loaded
+                from . import service
+                loaded = service.ensure_loaded(p)
+            except Exception as e:  # never in the way of the hang check
+                loaded = f"error: {type(e).__name__}: {e}"
+            if loaded:
+                print(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} watchdog: no daemon running; {loaded}")
         try:   # a restart deferred past the old daemon's stop timeout: judge its new daemon now
             from . import service
             judged = service.check_deferred(p, budget_s=service.WATCHDOG_RUN_S - (time.time() - began))

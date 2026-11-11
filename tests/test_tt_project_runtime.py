@@ -12139,28 +12139,30 @@ def test_the_upgrade_task_spec_says_what_each_apply_exit_code_means():
     assert "restart.request" not in bullets["0"] + bullets["1"]
 
 
-@pytest.mark.parametrize("kickstart_rc", [0, 1])
-def test_a_macos_restart_uses_the_launchd_agent_and_falls_back_when_it_is_not_loaded(env, monkeypatch, kickstart_rc):
+@pytest.mark.parametrize("loaded", [True, False])
+def test_a_macos_restart_uses_the_launchd_agent_and_falls_back_when_it_is_not_loaded(env, monkeypatch, loaded):
+    import plistlib
     p = make(env)
     from ttp import service
     monkeypatch.setenv("HOME", str(env["tmp"] / "userhome"))
-    monkeypatch.setattr(service.sys, "platform", "darwin")
+    monkeypatch.delenv("XPC_SERVICE_NAME", raising=False)
     label = f"com.tt-project.{service.unit_name(p)}"
     plist = env["tmp"] / "userhome" / "Library" / "LaunchAgents" / f"{label}.plist"
     plist.parent.mkdir(parents=True)
-    plist.write_text("")
-    calls, spawned = [], []
-    monkeypatch.setattr(service, "_run",
-                        lambda *a: calls.append(a) or subprocess.CompletedProcess(a, kickstart_rc, "", ""))
+    plist.write_bytes(plistlib.dumps({"Label": label, **service.DAEMON_KEYS}))
+    target = f"gui/{os.getuid()}/{label}"
+    calls = _launchd_calls(monkeypatch, _FakeLaunchd(loaded={target} if loaded else ()))   # servicestop_cases
+    spawned = []
     monkeypatch.setattr(service, "_spawn", lambda p: spawned.append(p))
     assert service.restart_service(p) == "restarted"
     # A daemon agent installed before the watchdog existed gets its watchdog agent on restart.
     boot = [c for c in calls if c[:2] == ("launchctl", "bootstrap")]
     assert boot and boot[0][-1].endswith(".watchdog.plist"), calls
-    kick = calls.index(("launchctl", "kickstart", "-k", f"gui/{os.getuid()}/{label}"))
-    # A loaded agent restarts itself; an unloaded one is loaded from its plist, by hand only when launchd refuses.
-    assert calls[kick + 1:] == ([] if kickstart_rc == 0 else [("launchctl", "bootstrap", f"gui/{os.getuid()}", str(plist))])
-    assert bool(spawned) == bool(kickstart_rc)
+    kick = calls.index(("launchctl", "kickstart", "-k", target))
+    # A loaded agent restarts itself; an unloaded one is loaded from its plist and started by launchd, never by hand.
+    assert calls[kick + 1:] == ([] if loaded else [("launchctl", "bootstrap", f"gui/{os.getuid()}", str(plist)),
+                                                   ("launchctl", "kickstart", target)]), calls
+    assert not spawned
 
 
 def _short_sock_path(name):
@@ -12387,8 +12389,9 @@ def test_launchd_and_cron_run_the_watchdog_and_old_installs_get_it(env, monkeypa
     tab = {"text": f"0 1 * * * other job\n@reboot {service._cron_cmd(p)} {tag}\n*/5 * * * * {service._cron_cmd(p)} {tag}\n"}
     monkeypatch.setattr(service.shutil, "which", lambda name: "/usr/bin/" + name if name == "crontab" else None)
 
-    def run(*argv):
-        return subprocess.CompletedProcess(argv, 0, tab["text"] if argv[:2] == ("crontab", "-l") else "", "")
+    def run(*argv):   # launchctl print: no such job, as after a bootout
+        return subprocess.CompletedProcess(argv, 113 if argv[:2] == ("launchctl", "print") else 0,
+                                           tab["text"] if argv[:2] == ("crontab", "-l") else "", "")
 
     def write(argv, input=None, **kw):
         if argv == ["crontab", "-"]:
