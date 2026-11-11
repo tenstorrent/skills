@@ -51,14 +51,22 @@ RUN_VARS = ("TTP_RUN_DIR", "TTP_TASK", "TTP_TASK_ID", "TTP_RUN_ID", "TTP_PROJECT
             "TTP_LOCKS_HELD", "TTP_DETACHED", "TTP_OUTLIVES_RUN")
 
 
-def ticker(base: str) -> None:
+def ticker(base: str, cap_usd: float = CAP_USD) -> None:
     """One daemon with the STUBBED steps off, ticking once per line read from stdin and answering with
     a DONE line. One process, as in the service: a waiting task's background probe and an on_pass
-    check are read back on a later tick of the same daemon (fresh-process ticks lost them all)."""
+    check are read back on a later tick of the same daemon (fresh-process ticks lost them all).
+    It dispatches nothing once the runs spent more than `cap_usd`: a run ending in a tick can queue
+    a review that the same tick would start, past the cap run() checks between ticks."""
     from .daemon import Daemon
     d = Daemon(base)
     for name in STUBBED:
         setattr(d, name, lambda *a, **k: None)
+    dispatch = d.dispatch
+
+    def capped() -> None:
+        if float(d.p.db.one("SELECT COALESCE(SUM(cost_usd),0) s FROM runs")["s"] or 0) <= cap_usd:
+            dispatch()
+    d.dispatch = capped
     for _ in sys.stdin:
         d._review_swept = 0   # the review sweep runs each tick (REVIEW_SWEEP_EVERY_S in the service)
         try:
@@ -71,12 +79,13 @@ def ticker(base: str) -> None:
 class Ticker:
     """The check's one daemon process; tick() waits up to TICK_TIMEOUT_S for its answer."""
 
-    def __init__(self, base: Path):
-        code = "import sys; sys.path.insert(0, sys.argv[1]); from ttp import loopcheck; loopcheck.ticker(sys.argv[2])"
+    def __init__(self, base: Path, cap_usd: float = CAP_USD):
+        code = ("import sys; sys.path.insert(0, sys.argv[1]); from ttp import loopcheck; "
+                "loopcheck.ticker(sys.argv[2], float(sys.argv[3]))")
         env = {k: v for k, v in os.environ.items() if k not in RUN_VARS}
         self.proc = subprocess.Popen([sys.executable, "-c", code, str(Path(__file__).resolve().parent.parent),
-                                      str(base)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                     stderr=subprocess.STDOUT, env=env)
+                                      str(base), repr(float(cap_usd))], stdin=subprocess.PIPE,
+                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env)
         self.buf, self.tail = b"", []
 
     def tick(self) -> None:
@@ -319,7 +328,7 @@ def run(provider: str, *, home: Path | None = None, cap_s: float = CAP_S, cap_us
         w = Watch(p, remote, tid, word, emit)
         w.emit(f"    0s  queued   task #{tid}: add `loop check {word}` to NOTES.md, land it on {BRANCH}")
         outcome = None
-        ticker = Ticker(p.base)
+        ticker = Ticker(p.base, cap_usd)
         while outcome is None:
             try:
                 ticker.tick()
