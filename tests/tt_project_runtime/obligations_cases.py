@@ -764,3 +764,87 @@ def test_a_claim_on_a_superseded_review_holds_through_the_review_that_covers_it(
     o = ob.get(p.db, oid)
     assert o["receipt"]["task"] == tid and "superseded by review #99" in o["receipt"]["evidence"], o
     assert events() == [] and SUPERSEDED in ob.CLOSED
+
+
+def _ob_handoff(p, tid, summary, status="done", handoff="done"):
+    import json
+    p.db.update_task(tid, status=status, result=json.dumps({"status": handoff, "summary": summary}))
+
+
+def test_an_order_is_not_kept_by_its_owner_ending_with_a_hand_off_that_leaves_acceptance_unmet(env, monkeypatch):
+    """_kept: the order's owner ended done but its checked hand-off is 'partial:', 'cells unreported:' or
+    blocked, and a reply went to the chat: the order stays owed and lines() says why. A met continuation
+    of that owner keeps it, as does a met hand-off."""
+    import time as _t
+    from ttp import obligations as ob
+    p, d, now, tid, check, mid, raised = _order_setup(env, monkeypatch)
+    oid = ob.add_order(p, "build the deliverable", mid, [tid], due=now + 7200, action_class="change",
+                       now=now).split()[1]
+    for summary, handoff in (("partial: 0 of 3 cases qualify, the table does not exist yet", "done"),
+                             ("cells unreported: a, b", "done"), ("the input is missing", "blocked")):
+        _ob_handoff(p, tid, summary, handoff=handoff)
+        p.db.post("out", "here is where it stands", chat="c1", kind="reply")
+        check(_t.time() + 60)
+        o = ob.get(p.db, oid)
+        assert o["receipt"] is None, (summary, o["receipt"])
+        line = next(ln for ln in ob.lines(p.db) if ln.startswith(oid))
+        assert "held open:" in line and f"#{tid}" in line, line
+    hop = p.db.add_task("finish the deliverable", "s", kind="work", tier="light", labels=[f"continues:{tid}"])
+    ob.attach(p, oid, [hop])
+    _ob_handoff(p, hop, "the table is built: 3 cases qualify")
+    p.db.post("out", "the table is posted", chat="c1", kind="reply")
+    check(_t.time() + 120)
+    assert ob.get(p.db, oid)["receipt"] is not None
+
+
+def test_a_met_order_owner_still_keeps_the_order(env, monkeypatch):
+    import time as _t
+    from ttp import obligations as ob
+    p, d, now, tid, check, mid, raised = _order_setup(env, monkeypatch)
+    oid = ob.add_order(p, "build the deliverable", mid, [tid], due=now + 7200, action_class="change",
+                       now=now).split()[1]
+    _ob_handoff(p, tid, "built it; the table has 3 rows")
+    p.db.post("out", "the table is posted", chat="c1", kind="reply")
+    check(_t.time() + 60)
+    assert ob.get(p.db, oid)["receipt"] is not None
+
+
+def test_a_delivered_obligation_is_not_closed_when_its_owner_hand_off_leaves_acceptance_unmet(env, monkeypatch):
+    """_delivered/deliver(): a reply's `delivers` names the obligation and its owner ended, but failed or
+    with a blocked hand-off: the obligation stays owed, the note says why, check() leaves it open."""
+    import time as _t
+    from ttp import obligations as ob
+    p, d, now, tid, check = _ob_setup(env, monkeypatch)
+    oid = ob.add(p, "build the deliverable", [tid], now=now)
+    _ob_handoff(p, tid, "the input does not exist yet", handoff="blocked")
+    mid = p.db.post("out", "done", chat="c1", kind="reply")
+    [note] = ob.deliver(p, [(mid, "c1", [oid])], now=now + 10)
+    assert "not closed" in note and f"#{tid}" in note, note
+    check(_t.time() + 60)
+    assert ob.get(p.db, oid)["receipt"] is None
+    _ob_handoff(p, tid, "tried", status="failed", handoff="failed")
+    check(_t.time() + 120)
+    assert ob.get(p.db, oid)["receipt"] is None
+    _ob_handoff(p, tid, "built it")
+    check(_t.time() + 180)
+    assert ob.get(p.db, oid)["receipt"] is not None
+
+
+def test_a_receipt_citing_only_an_owner_hand_off_that_leaves_acceptance_unmet_is_refused(env, monkeypatch):
+    """record(): a receipt whose evidence names only owners whose hand-off is partial, or filed by an owner
+    task that ended so, is refused naming why; evidence naming a met owner or no owner is taken."""
+    import pytest
+    from ttp import obligations as ob
+    p, d, now, tid, check = _ob_setup(env, monkeypatch)
+    oid = ob.add(p, "build the deliverable", [tid], now=now)
+    _ob_handoff(p, tid, "partial: 0 cases qualify")
+    with pytest.raises(ValueError, match=f"receipt refused: #{tid}'s hand-off is marked"):
+        ob.record(p, oid, "receipt", f"#{tid} finished", None, now=now)
+    with pytest.raises(ValueError, match="acceptance is not met"):
+        ob.record(p, oid, "receipt", "done", tid, now=now)
+    assert ob.get(p.db, oid)["receipt"] is None
+    other = p.db.add_task("build it again", "s", kind="work", tier="light")
+    oid2 = ob.add(p, "build it again", [other], now=now)
+    _ob_handoff(p, other, "built it: 3 rows")
+    assert "no longer owed" in ob.record(p, oid2, "receipt", f"#{other} built it", None, now=now)
+    assert "no longer owed" in ob.record(p, oid, "receipt", "commit abc123 has the table", None, now=now)

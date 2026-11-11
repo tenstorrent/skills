@@ -493,12 +493,27 @@ def record(p, oid: str, kind: str, evidence: str, task: int | None, now: float |
             _record_progress(own, evidence, now)
             msg = f"progress on {oid} recorded for #{task}"
         else:
+            if _accepts(o) and (why := _receipt_unmet(p.db, o, evidence, task)):
+                raise ValueError(f"{oid}: receipt refused: {why}, so the acceptance is not met. Record it once an "
+                                 f"owner meets it, or give evidence that does (a commit, a file, a met hand-off)")
             o["receipt"] = {"at": now, "task": task, "evidence": evidence}
             _retire(p.db, now, "obligation receipt", prefix=f"obligation:{oid}:milestone:")
             _retire(p.db, now, "promise kept", prefix=f"obligation:{oid}:promise")
             msg = f"{oid} has its receipt; it is no longer owed"
         p.db.set_kv(KV, st)
     return msg
+
+
+def _receipt_unmet(db, o: dict, evidence: str, task: int | None) -> str | None:
+    """Why a receipt for `o` cites an owner hand-off that leaves the acceptance unmet: the filing task
+    itself ended so, or every owner task the evidence names (#<id>) did (unmet_handoff, the other owners
+    as carriers). Evidence naming no owner (a commit, a file, a URL) is the recorder's word."""
+    ids = _owner_ids(o)
+    if task is not None and (why := unmet_handoff(db, ids, only=[int(task)])):
+        return why
+    cited = list(dict.fromkeys(int(t) for t in TASK_REF.findall(evidence or "") if int(t) in ids))
+    whys = [unmet_handoff(db, ids, only=[t]) for t in cited]
+    return "; ".join(whys) if cited and all(whys) else None
 
 
 def append_run(run_dir: Path, oid: str, kind: str, evidence: str, task: str, milestone: str | None = None) -> None:
@@ -1138,8 +1153,21 @@ def lines(db, now: float | None = None, where=None, open_only: bool = False) -> 
                 state += f"; next milestone {m['key']} due {timefmt.long(m['due'], where)}"
                 if now >= m["due"]:
                     state += " OVERDUE"
+        if _open(o) and (why := _held_open(db, o)):
+            state += f"; held open: {why}, acceptance not met"
         out.append(f"{o['id']}  {o['text'][:100]}  [{state}]")
     return out
+
+
+def _held_open(db, o: dict) -> str | None:
+    """Why `o`, every owner ended, is not closed by its owners finishing (unmet_handoff), for lines()."""
+    ids = _owner_ids(o)
+    if not ids or not _accepts(o):
+        return None
+    rows = db.q(f"SELECT status FROM tasks WHERE id IN ({','.join('?' * len(ids))})", ids)
+    if len(rows) < len(ids) or any(r["status"] not in CLOSED for r in rows):
+        return None
+    return unmet_handoff(db, ids)
 
 
 def _owner_state(tid: str, own: dict, cover: tuple[str, str] | None, late: set, now: float) -> str:
@@ -1424,6 +1452,8 @@ def _kept(db, o: dict, st: dict) -> str | None:
     rows = db.q(f"SELECT id, status, updated FROM tasks WHERE id IN ({','.join('?' * len(pr['tasks']))})", pr["tasks"])
     if len(rows) < len(pr["tasks"]) or any(r["status"] not in CLOSED for r in rows):
         return None
+    if _accepts(o) and unmet_handoff(db, pr["tasks"]):   # an order's owners ended, its acceptance unmet
+        return None
     finished = max(float(r["updated"] or 0) for r in rows)
     chat = None if pr["chat"] == "all" else pr["chat"]
     m = db.one("SELECT id FROM messages WHERE direction='out' AND kind='reply' AND id>? AND ts>=? "
@@ -1595,8 +1625,56 @@ def _owner_ids(o: dict) -> list[int]:
     return sorted({int(t) for t in o["owners"]} | set((o.get("promise") or {}).get("tasks") or []))
 
 
+def _accepts(o: dict) -> bool:
+    """Whether `o` owes a result its owners' hand-offs must meet: an obligation or an order, not a plain
+    promise or claim (a promise to report is kept by the report)."""
+    pr = o.get("promise")
+    return not pr or pr.get("order") is not None
+
+
+# An owner's checked hand-off that leaves its acceptance unmet keeps the obligation open: its owners
+# finishing is no receipt (unmet_handoff). It counts for a task that ended (or is blocked) with a hand-off
+# whose status is one of UNMET_STATUSES, or whose summary starts with the cells mark (cells.marked:
+# 'partial:' or 'cells unreported:'), or that failed. One excused: another owner that ended met carries
+# its work on (_carried: a continue, fix or re-review hop). Prose is not read for it (no keyword list):
+# a worker says so by its hand-off's status or a 'partial:' start. Fails open: an extra overdue wake costs a
+# coordinator turn, a false close loses the order.
+UNMET_STATUSES = ("blocked", "failed", "waiting")
+
+
+def _handoff_unmet(t) -> str | None:
+    """Why task row `t`'s own hand-off leaves its acceptance unmet, or None."""
+    from . import cells
+    from .db import load_result
+    if t["status"] not in CLOSED + ("blocked",):
+        return None
+    res = load_result(t["result"])
+    hs, summary = str(res.get("status") or ""), " ".join(str(res.get("summary") or "").split())
+    if cells.marked(summary):
+        return f"#{t['id']}'s hand-off is marked {summary[:120]!r}"
+    if t["status"] == "failed" or hs in UNMET_STATUSES:
+        return f"#{t['id']} ended {t['status']} with a {hs or 'no'} hand-off" + (f": {summary[:120]!r}" if summary else "")
+    return None
+
+
+def unmet_handoff(db, ids, only=None) -> str | None:
+    """Why the owners `ids` leave the acceptance unmet: the first one (of `only`, when given) whose checked
+    hand-off does (_handoff_unmet) and that no other owner, ended met, carries on; None when none does."""
+    ids = sorted({int(t) for t in ids or []} | set(only or []))
+    if not ids:
+        return None
+    rows = db.q(f"SELECT id, status, result, title, labels, parent FROM tasks "
+                f"WHERE id IN ({','.join('?' * len(ids))})", ids)
+    why = {int(r["id"]): _handoff_unmet(r) for r in rows}
+    carried = {c for r in rows if r["status"] == "done" and not why[int(r["id"])]
+               for c, how in _carried(r).items() if how != "reviews"}   # a review passing meets nothing
+    return next((why[t] for t in sorted(why) if why[t] and str(t) not in carried
+                 and (only is None or t in only)), None)
+
+
 def _delivered(db, o: dict) -> str | None:
-    """Evidence that a coordinator reply delivered `o` (its `delivers` named it) and every owner finished."""
+    """Evidence that a coordinator reply delivered `o` (its `delivers` named it) and every owner finished,
+    none leaving the acceptance unmet (unmet_handoff; a plain promise's report is its deliverable)."""
     dv = o.get("delivered")
     if not dv or not _open(o):
         return None
@@ -1604,6 +1682,8 @@ def _delivered(db, o: dict) -> str | None:
     if ids:
         rows = db.q(f"SELECT status FROM tasks WHERE id IN ({','.join('?' * len(ids))})", ids)
         if len(rows) < len(ids) or any(r["status"] not in CLOSED for r in rows):
+            return None
+        if _accepts(o) and unmet_handoff(db, ids):
             return None
     return f"reply #{dv['message']} delivered it" + (f"; #{', #'.join(map(str, ids))} finished" if ids else "")
 
@@ -1647,6 +1727,9 @@ def deliver(p, sent: list[tuple[int, str | None, list]], now: float | None = Non
                     if ev:
                         _close(p.db, o, now, ev)
                         notes.append(f"{o['id']} delivered by reply #{mid}; it is no longer owed")
+                    elif _accepts(o) and (why := unmet_handoff(p.db, _owner_ids(o))):
+                        notes.append(f"{o['id']} not closed by reply #{mid}: {why}, so the acceptance is not met; "
+                                     f"it stays owed until an owner meets it (or `obligation` with `why` drops it)")
                     else:
                         notes.append(f"{o['id']} delivered by reply #{mid}; it closes once "
                                      f"#{', #'.join(map(str, _owner_ids(o)))} finish")
