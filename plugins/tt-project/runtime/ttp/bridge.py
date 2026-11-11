@@ -21,7 +21,10 @@ It fails closed. When this computer sleeps, loses the network or stops the sessi
 forwards close and the agent link dangles, so a login through it fails; nothing is cached on the
 box. Every process of the box account can use a forwarded agent while its session is up: forward
 only agents whose keys that account may use, and prefer agents with confirmation or destination
-limits where the agent offers them.
+limits where the agent offers them. The link folder must be a private folder of the box account
+(its own, 0700, not a symlink) or the session exits. Reverse forwards bind the box's loopback only:
+other accounts on the box can open those ports, which reach the hosts' sshd and still need a key.
+On this computer the interface relay listens only on unix sockets (folder 0700, sockets 0600).
 
 The config is JSON (`~/.config/tt-project/bridge.json`, or --config); see
 docs/access-bridge.example.json.
@@ -188,13 +191,17 @@ def _opt(key: str, value: str) -> str:
 
 def remote_command(cfg: dict, agent: str) -> str:
     """Run on the box: link the forwarded agent to its stable path and stay up while it exists.
-    Exit 3 when the box's sshd gave no agent (the login key's authorized_keys line forbids it)."""
+    Exit 3 when the box's sshd gave no agent (the login key's authorized_keys line forbids it), 4 when
+    the link folder is not a private folder of the box account (its own, 0700, not a symlink).
+    The folder and link are touched only when they change: a reconnect to the same path leaves them."""
     d = _remote(cfg["socket_dir"])
     sock = _remote(link(cfg, agent))
+    private = f'[ -n "$(find {d} -prune -type d -user "$(id -u)" -perm 700)" ]'
+    refuse = f'{{ echo "ttp bridge: {cfg["socket_dir"]} is not a private folder of this account" >&2; exit 4; }}'
     return (f'[ -n "$SSH_AUTH_SOCK" ] || {{ echo "ttp bridge: no forwarded agent (the login key may not forward one)" >&2; exit 3; }}; '
-            f"umask 077; {{ [ -d {d} ] || mkdir -p {d}; }} && "
-            f"{{ [ \"$(ls -ld {d} | cut -c5-10)\" = ------ ] || chmod 700 {d}; }} && "
-            f"{{ [ \"$(readlink {sock})\" = \"$SSH_AUTH_SOCK\" ] || ln -sfn \"$SSH_AUTH_SOCK\" {sock}; }} && "
+            f"umask 077; [ ! -L {d} ] || {refuse}; [ -d {d} ] || mkdir -p {d}; "
+            f"{private} || chmod 700 {d} 2>/dev/null; {private} || {refuse}; "
+            f'[ "$(readlink {sock} 2>/dev/null)" = "$SSH_AUTH_SOCK" ] || ln -sfn "$SSH_AUTH_SOCK" {sock} || exit 4; '
             f'echo "ttp bridge: {agent} agent linked"; while [ -S "$SSH_AUTH_SOCK" ]; do sleep 30; done')
 
 
@@ -248,7 +255,14 @@ def service_argv(cfg: dict, box: str, agent: str, ssh: str | None = None) -> lis
 
 
 def install_relay() -> None:
-    durable_write(RELAY, (Path(__file__).with_name("bridge_relay.py")).read_bytes())
+    """Copy bridge_relay.py where the service runs it, only when its content changed."""
+    data = Path(__file__).with_name("bridge_relay.py").read_bytes()
+    try:
+        if RELAY.read_bytes() == data:
+            return
+    except OSError:
+        pass
+    durable_write(RELAY, data, mode=0o600)
 
 
 def render_block(cfg: dict, box: str) -> str:

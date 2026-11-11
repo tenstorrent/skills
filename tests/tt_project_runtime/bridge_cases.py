@@ -585,3 +585,92 @@ def test_bridge_writes_to_a_box_only_when_the_content_changed(tmp_path, monkeypa
     env["SSH_AUTH_SOCK"] = str(tmp_path / "agent-2")
     assert subprocess.run(["sh", "-c", cmd], env=env, capture_output=True, timeout=20).returncode == 0
     assert os.readlink(ln) == env["SSH_AUTH_SOCK"]
+
+
+def _box_sh(home, script, inp=None, **env):
+    """A box's shell, faked locally: the script runs with HOME at a scratch folder."""
+    return subprocess.run(["sh", "-c", script], input=inp, capture_output=True, text=True, timeout=20,
+                          env={"HOME": str(home), "PATH": os.environ.get("PATH", "/usr/bin:/bin"), **env})
+
+
+def test_bridge_box_link_is_touched_only_on_change_and_fails_closed(tmp_path):
+    from ttp import bridge
+    home = tmp_path / "box-home"
+    home.mkdir()
+    agent = socket.socket(socket.AF_UNIX)
+    agent.bind(str(tmp_path / "a.sock"))
+    remote = bridge.remote_command(_bridge_cfg(), "auto")
+    assert remote.count("ln -sfn") == 1 and 'readlink "$HOME/.ssh/tt-agent/auto.sock"' in remote
+    link_part = remote.split("while [")[0] + "true"   # without the stay-up loop
+    run = lambda: _box_sh(home, link_part, SSH_AUTH_SOCK=str(tmp_path / "a.sock"))
+    d = home / ".ssh" / "tt-agent"
+    assert run().returncode == 0
+    assert os.readlink(d / "auto.sock") == str(tmp_path / "a.sock") and stat.S_IMODE(os.stat(d).st_mode) == 0o700
+    seen = lambda: (os.lstat(d / "auto.sock").st_ino, os.lstat(d / "auto.sock").st_mtime_ns, os.stat(d).st_ctime_ns)
+    before = seen()
+    assert run().returncode == 0 and seen() == before   # a reconnect to the same agent path changes nothing
+    os.chmod(d, 0o755)
+    assert run().returncode == 0 and stat.S_IMODE(os.stat(d).st_mode) == 0o700   # a loosened folder is tightened
+    shutil.rmtree(d)
+    other = tmp_path / "other"
+    other.mkdir(mode=0o755)
+    os.symlink(other, d)
+    r = run()
+    assert r.returncode == 4 and "not a private folder" in r.stderr
+    assert not (other / "auto.sock").exists() and stat.S_IMODE(os.stat(other).st_mode) == 0o755
+
+
+def test_bridge_box_config_is_written_only_when_its_content_changes(tmp_path, monkeypatch):
+    from ttp import bridge
+    home = tmp_path / "box-home"
+    home.mkdir()
+    reads = []
+
+    def box(name, script, timeout=40, inp=None):
+        r = _box_sh(home, script, inp)
+        if inp is None and reads:
+            r.stdout = reads.pop(0)   # a stale read: the file changed after it was read
+        return r
+
+    monkeypatch.setattr(bridge, "_box", box)
+    cfg = _bridge_cfg()
+    conf = home / ".ssh" / "config"
+    assert bridge.write_block(cfg, "box-1") == "block written (new config)"
+    assert stat.S_IMODE(conf.stat().st_mode) == 0o600 and bridge.BEGIN in conf.read_text()
+    st = conf.stat()
+    assert bridge.write_block(cfg, "box-1") == "block already current"
+    reads.append("")
+    assert bridge.write_block(cfg, "box-1") == "block already current"   # compared on the box as well
+    assert (conf.stat().st_ino, conf.stat().st_mtime_ns) == (st.st_ino, st.st_mtime_ns)
+    assert sorted(p.name for p in conf.parent.iterdir()) == ["config"]   # no backup, no temp file left
+    conf.write_text("Host other\n  User someone\n")
+    assert bridge.write_block(cfg, "box-1").startswith("block written (backup")
+    assert conf.read_text().startswith(bridge.BEGIN) and conf.read_text().endswith("Host other\n  User someone\n")
+    assert len(list(conf.parent.glob("config.bak-ttp-bridge-*"))) == 1
+    assert bridge.remove_block("box-1") == "block removed" and conf.read_text() == "Host other\n  User someone\n"
+
+
+def test_bridge_relay_refuses_a_shared_or_linked_socket_dir_and_installs_on_change(tmp_path, monkeypatch):
+    from ttp import bridge, bridge_relay
+    d = tmp_path / "relay"
+    d.mkdir(mode=0o755)
+    assert bridge_relay.private_dir(str(d)) and stat.S_IMODE(d.stat().st_mode) == 0o700   # tightened
+    other = tmp_path / "elsewhere"
+    other.mkdir(mode=0o700)
+    os.symlink(other, tmp_path / "linked")
+    assert not bridge_relay.private_dir(str(tmp_path / "linked"))
+    (tmp_path / "file").write_text("")
+    assert not bridge_relay.private_dir(str(tmp_path / "file"))
+    ran = tmp_path / "ran"
+    rc = bridge_relay.main([str(tmp_path / "linked"), "x=10.0.0.3%vpn0", "--", "touch", str(ran)])
+    assert rc == 4 and not ran.exists() and not (other / "x.sock").exists()   # fails closed, no session
+    monkeypatch.setattr(bridge, "RELAY", tmp_path / "copy" / "bridge_relay.py")
+    bridge.install_relay()
+    st = bridge.RELAY.stat()
+    assert bridge.RELAY.read_bytes() == pathlib.Path(bridge.__file__).with_name("bridge_relay.py").read_bytes()
+    bridge.install_relay()
+    assert (bridge.RELAY.stat().st_ino, bridge.RELAY.stat().st_mtime_ns) == (st.st_ino, st.st_mtime_ns)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    argv = bridge.ssh_argv(_bridge_cfg(), "box-1", "auto", ssh="ssh")
+    binds = [argv[i + 1] for i, a in enumerate(argv) if a == "-R"]
+    assert binds and all(b.startswith("127.0.0.1:") for b in binds)   # never a non-loopback listener

@@ -3412,8 +3412,14 @@ Workers can read Slack links you paste, using your Slack connector if you have o
     and the link dangles, so those logins fail. A run that needs them waits or hands off.
   - It carries ssh only. The GitHub API (`gh`: PRs, CI, comments) is not bridged; read that from
     the workstation side.
-  - Every process of the box account can use a forwarded agent while its session is up, so forward
-    only agents whose keys that account may use.
+  - What is exposed: every process of the box account can use a forwarded agent while its session
+    is up, so forward only agents whose keys that account may use. Other accounts on the box can
+    open the loopback ports, which reach only the hosts' sshd and still need a key. Nothing listens
+    on a non-loopback interface. The link folder must be the box account's own, mode 0700 and no
+    symlink, or the session exits; the workstation relay listens only on unix sockets (folder 0700,
+    sockets 0600) and stops on the same check.
+  - The link and the box's ssh config are rewritten only when they change, so a reconnect touches
+    nothing on the box.
   - The session's own login key must be allowed to forward an agent: an `authorized_keys` line with
     `restrict` and no `agent-forwarding` gives none (`doctor` says so). Name a key that may forward
     under `login`.

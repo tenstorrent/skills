@@ -10,13 +10,16 @@ each connection to that host's port 22 bound to the interface. Nothing else is c
 usage: bridge_relay.py <socket dir> <name>=<host>%<interface> ... -- <ssh argv...>
 
 It listens on <socket dir>/<name>.sock (mode 600, the directory 700), runs the ssh session, and
-exits with it, removing its sockets: the relay lives exactly as long as the session.
+exits with it, removing its sockets: the relay lives exactly as long as the session. It exits 4
+before listening when the socket directory is not a private one of this account (its own, 700,
+not a symlink).
 """
 from __future__ import annotations
 
 import os
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import threading
@@ -89,6 +92,20 @@ def _handle(conn: socket.socket, host: str, iface: str) -> None:
     up.close()
 
 
+def private_dir(d: str) -> bool:
+    """Fail closed: the socket directory is a real directory of this account that only it can open."""
+    try:
+        st = os.lstat(d)
+        if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
+            return False
+        if st.st_mode & 0o077:
+            os.chmod(d, 0o700)
+            st = os.lstat(d)
+    except OSError:
+        return False
+    return st.st_mode & 0o777 == 0o700
+
+
 def listen(path: str, host: str, iface: str) -> socket.socket:
     if os.path.lexists(path):
         os.unlink(path)
@@ -119,7 +136,10 @@ def main(argv: list[str]) -> int:
     cut = argv.index("--")
     d, specs, ssh = argv[0], argv[1:cut], argv[cut + 1:]
     os.makedirs(d, mode=0o700, exist_ok=True)
-    os.chmod(d, 0o700)
+    if not private_dir(d):
+        print(f"bridge_relay: {d} is not a private directory of this account (its own, 700, not a symlink)",
+              file=sys.stderr)
+        return 4
     paths = []
     for spec in specs:
         name, host, iface = parse_spec(spec)
