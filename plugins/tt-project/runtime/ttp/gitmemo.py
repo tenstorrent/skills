@@ -284,6 +284,13 @@ def _pure(args: tuple) -> bool:
     return False
 
 
+def _replayable(args: tuple) -> bool:
+    """A read an attempt keeps and replays: a READS verb, or a config read of the remotes (git remote,
+    get-url, -v), kept per attempt as a volatile answer: push.target's `git remote` once ran live in the
+    finish round whenever the config changed within gitcache.RACY_S, the warm-up's answer not kept."""
+    return is_read(args) or (bool(args) and args[0] == "remote" and _pure(args))
+
+
 def _spawn(argv, t: float | None, kw: dict) -> subprocess.CompletedProcess:
     token = _own.set(True)
     args = git_args(argv)   # a write keeps its own timeout: a tick step's budget never cuts it midway
@@ -484,7 +491,7 @@ keeps its own cap and makes the round's point of no return)."""
     rd = a.strict
     if rd:
         rd.raw_close()
-    k = gitreplay.key(argv, kw, is_read, _OPTS_WITH_VALUE)
+    k = gitreplay.key(argv, kw, _replayable, _OPTS_WITH_VALUE)
     if k is not None:
         e = gitreplay.get(k, a.id, a.round)
         if e is not None:
