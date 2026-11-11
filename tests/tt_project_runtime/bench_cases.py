@@ -588,6 +588,31 @@ def test_bench_audit_flags_saved_sessions_named_by_a_relative_path_or_reached_wi
                  ran("git diff .claude-plugin/plugin.json"), ran("ls .codex && pytest tests/test_projects.py"), said):
         assert benchrun.audit(line, task, hidden, session=own) == [], line
 
+    def tool(name, **inp):
+        return json.dumps({"type": "assistant", "message": {"content": [{"type": "tool_use", "name": name,
+                                                                          "input": inp}]}})
+    # Only where a call reaches counts: an edit whose text, or a grep whose pattern, names the folder is honest.
+    for line in (tool("Edit", file_path="docs/guide.md", old_string="a", new_string="see ~/.claude/projects"),
+                 tool("Write", file_path="x.py", content="cd ~/.claude && ls projects\ncat .codex/sessions/a"),
+                 tool("Grep", pattern=r"\.claude/projects|\.codex/sessions", path="plugins"),
+                 tool("Grep", pattern="cd ~/.claude; ls projects", path=".")):
+        assert benchrun.audit(line, task, hidden, session=own) == [], line
+    for line in (tool("Read", file_path=".claude/projects/-x/s.jsonl"), tool("Glob", pattern=".codex/sessions/**"),
+                 tool("Grep", pattern="secret", path=".claude/projects"),
+                 json.dumps({"type": "function_call", "name": "shell",
+                             "arguments": json.dumps({"command": ["cat", ".codex/sessions/a.jsonl"]})})):
+        assert any("relative" in f for f in benchrun.audit(line, task, hidden, session=own)), line
+    # Claude's Bash keeps its cwd: a cd in one call and the read in a later one is the same reach.
+    for cmds in (["cd ~/.claude", "cat projects/-x/s.jsonl"], ["cd ~/.claude", "cd projects", "cat -x/s.jsonl"],
+                 ["cd $HOME/.codex/", "ls", "ls sessions/2026"]):
+        assert any("relative" in f for f in benchrun.audit("\n".join(map(ran, cmds)), task, hidden, session=own)), cmds
+    assert benchrun.audit("\n".join(map(ran, [f"cd {own[-1]}", "cat ../-x/s.jsonl"])), task, hidden, session=own) \
+        == ["climbs out of its own session folder with .."]
+    # A cd elsewhere in between ends it.
+    for cmds in (["cd ~/.claude", "cd /tmp/ws", "ls tests/projects"], [f"cd {own[-1]}/s", "cd ~/work", "ls .."],
+                 ["cd .claude", "cd", "cd src && ls ../projects"]):
+        assert benchrun.audit("\n".join(map(ran, cmds)), task, hidden, session=own) == [], cmds
+
 
 def test_bench_cell_gets_a_config_folder_of_its_own_with_no_earlier_transcripts(env, tmp_path, monkeypatch):
     from ttp import benchrun
@@ -596,6 +621,7 @@ def test_bench_cell_gets_a_config_folder_of_its_own_with_no_earlier_transcripts(
     claude, codex = tmp_path / "claude", tmp_path / "codex"
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude))
     monkeypatch.setenv("CODEX_HOME", str(codex))
+    monkeypatch.delenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", raising=False)
     for d in (claude / "projects" / "-old", codex / "sessions" / "2026"):
         d.mkdir(parents=True)
         (d / "s.jsonl").write_text("earlier transcript\n")
@@ -608,6 +634,9 @@ def test_bench_cell_gets_a_config_folder_of_its_own_with_no_earlier_transcripts(
     out = tmp_path / "h2h"
     rows = benchrun.run(tmp_path / "bench", out, arms, 1, 1, _bench_opts(tmp_path), p.config())
     assert [r["outcome"] for r in rows] == ["pass", "pass"], rows
+    # Claude Code names its macOS keychain entry after the config folder: the cell keeps the real one's.
+    assert json.loads((out / "cells" / f"{tid}-r1-a" / "run.json").read_text())["env"][
+        "CLAUDE_SECURESTORAGE_CONFIG_DIR"] == str(claude)
     for arm, var, real, tag in (("a", "CLAUDE_CONFIG_DIR", claude, "C"), ("b", "CODEX_HOME", codex, "X")):
         cell = out / "cells" / f"{tid}-r1-{arm}"
         mine = json.loads((cell / "run.json").read_text())["env"][var]
@@ -625,7 +654,12 @@ def test_bench_cell_gets_a_config_folder_of_its_own_with_no_earlier_transcripts(
     # Off on request: the CLIs' own folders, as before.
     rows = benchrun.run(tmp_path / "bench", tmp_path / "h2h-off", arms, 1, 1, _bench_opts(tmp_path, scratch_home=False),
                         p.config())
-    assert "CLAUDE_CONFIG_DIR" not in json.loads((tmp_path / "h2h-off" / "cells" / f"{tid}-r1-a" / "run.json").read_text())["env"]
+    off = json.loads((tmp_path / "h2h-off" / "cells" / f"{tid}-r1-a" / "run.json").read_text())["env"]
+    assert "CLAUDE_CONFIG_DIR" not in off and "CLAUDE_SECURESTORAGE_CONFIG_DIR" not in off
+    monkeypatch.setenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", str(tmp_path / "kept"))   # one already set stays
+    conf, _ = benchrun.scratch_home("claude", Path(tempfile.mkdtemp(prefix="cell-", dir=tmp_path)), False)
+    assert "CLAUDE_SECURESTORAGE_CONFIG_DIR" not in conf
+    monkeypatch.delenv("CLAUDE_SECURESTORAGE_CONFIG_DIR")
     # A real cell links each login in, so the CLI reads the live one; a token refresh (a new file in the
     # cell's folder, not written through the link) goes back to the real file only while that is unchanged.
     for name, real in (("claude", claude), ("codex", codex)):

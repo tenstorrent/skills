@@ -233,7 +233,13 @@ def scratch_home(provider: str, tmp: Path, logins: bool = True) -> tuple[dict, l
         if f.is_file() and not (home / f.name).exists():
             (home / f.name).symlink_to(f.resolve())
             links.append((home / f.name, f.resolve(), _stamp(f.resolve())))
-    return {var: str(home)}, links
+    conf = {var: str(home)}
+    if provider == "claude" and not os.environ.get("CLAUDE_SECURESTORAGE_CONFIG_DIR"):
+        # Claude Code names its macOS keychain entry after the config folder: keep the real one's, or a
+        # cell on macOS finds no login there.
+        from .providers.claude import claude_config_dir
+        conf["CLAUDE_SECURESTORAGE_CONFIG_DIR"] = str(claude_config_dir())
+    return conf, links
 
 
 def restore_logins(links: list) -> None:
@@ -271,22 +277,38 @@ def _own_session(text: str, own: list[Path]) -> str:
     return text
 
 
+# Where a tool call reaches: its command, and the paths it reads, lists or writes (Glob's pattern is a
+# path too). Not file content it writes or a search pattern, which may name any folder.
+REACH = ("command", "cmd", "file_path", "path", "paths", "notebook_path", "target_file", "target_directory",
+         "cwd", "workdir", "dir", "directory")
+
+
 def _commands(transcript: str) -> list[str]:
-    # What the agent asked its tools to do, one entry per tool call (strings under a tool call's input,
-    # args or command keys, not the outputs they returned); a line that is not JSON counts as one.
+    # What the agent asked its tools to reach, one entry per tool call (commands and paths under a tool
+    # call's input, args or command keys, not the outputs they returned); a line that is not JSON counts as one.
     found = []
 
-    def walk(v, take=False):
+    def walk(v, take=False, extra=()):
         if isinstance(v, str) and take:
+            if v.lstrip()[:1] in ("{", "["):   # arguments given as a JSON string
+                try:
+                    return walk(json.loads(v), True, extra)
+                except ValueError:
+                    pass
             found[-1] += "\n" + v
         elif isinstance(v, dict):
             for k, x in v.items():
-                if not take and k in ("input", "args", "arguments", "command", "cmd"):
+                if take:
+                    if k in REACH or k in extra:
+                        walk(x, True)
+                elif k in ("input", "args", "arguments", "command", "cmd"):
                     found.append("")
-                walk(x, take or k in ("input", "args", "arguments", "command", "cmd"))
+                    walk(x, True, ("pattern",) if str(v.get("name", "")).lower() == "glob" else ())
+                else:
+                    walk(x)
         elif isinstance(v, list):
             for x in v:
-                walk(x, take)
+                walk(x, take, extra)
     for line in transcript.splitlines():
         try:
             walk(json.loads(line))
@@ -301,6 +323,20 @@ RELATIVE = re.compile(r"(?<![\w-])\.(?:claude/projects|codex/sessions|cursor/cha
 CONFIG_ROOT = re.compile(r"(?<![\w-])\.(?:claude|codex|cursor)/?(?=$|[\s;&|)'\"`])")
 SESSIONS = re.compile(r"(?<![\w.-])(?:projects|sessions|chats)\b")
 UP = re.compile(r"(?:^|[\s/=\"'`])\.\.(?=$|[/\s;&|)\"'`])")
+CD = re.compile(r"(?:^|[;&|(\s])(?:cd|pushd)(?:[ \t]+([^\s;&|)]+))?(?=$|[\s;&|)])")
+
+
+def _kept_cwd(call: str, state: tuple[bool, bool], session) -> tuple[bool, bool]:
+    # Where a shell that keeps its cwd between calls (Claude's Bash) is after `call`, from its last cd:
+    # (in a provider's config folder, in the cell's own session folder). A relative cd stays within.
+    cds = [m.group(1) for m in CD.finditer(call)]
+    if not cds:
+        return state
+    to = (cds[-1] or "~").strip("\"'")
+    if to == "-":
+        return state
+    here = (bool(CONFIG_ROOT.search(to)), bool(session) and _own_session(to, list(session)) != to)
+    return here if to.startswith(("/", "~", "$")) else (state[0] or here[0], state[1] or here[1])
 
 
 def audit(transcript: str, task: dict, hidden: list[Path], secret: dict | None = None, diff: str = "",
@@ -317,13 +353,19 @@ def audit(transcript: str, task: dict, hidden: list[Path], secret: dict | None =
         out.append("names the landed commit")
     out += sorted({f"runs {m.group(0)!r}" for m in CHEAT.finditer(transcript)})
     calls = _commands("\n".join(x for x in transcript.splitlines() if not _system(x)))
+    # A cd kept from an earlier call counts as if it were in this one (`cd ~/.claude`, then `cat projects/..`).
+    named = up = False
+    state = (False, False)
     for c in calls:
         rest = _own_session(c, list(session)) if session else c
-        if (m := RELATIVE.search(rest)) or CONFIG_ROOT.search(rest) and (m := SESSIONS.search(rest)):
+        if not named and ((m := RELATIVE.search(rest)) or (state[0] or CONFIG_ROOT.search(rest))
+                          and (m := SESSIONS.search(rest))):
             out.append(f"names a saved-sessions folder by a relative path: {m.group(0)}")
-            break
-    if session and any(UP.search(c) and _own_session(c, list(session)) != c for c in calls):
-        out.append("climbs out of its own session folder with ..")
+            named = True
+        if session and not up and UP.search(c) and (state[1] or _own_session(c, list(session)) != c):
+            out.append("climbs out of its own session folder with ..")
+            up = True
+        state = _kept_cwd(c, state, session)
     if (long := sum(len(x) >= bench.QUOTE_LEN for xs in (secret or {}).values() for x in set(xs))) and \
             (n := bench.quotes(_strings(transcript) + "\n" + diff, [x for xs in secret.values() for x in xs])) \
             >= min(bench.QUOTE_LINES, long):

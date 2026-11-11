@@ -1228,12 +1228,18 @@ session folder (`~/.claude/projects/<its cwd with each non-alphanumeric characte
 large tool output is saved for the agent to read) is neither denied nor flagged: of that folder's
 siblings, the reads denied are those of sessions started in another hidden path and of earlier
 cells, and naming any other one is flagged. Read deny rules do not cover shell commands, so the audit
-also reads each tool call the agent made (not the outputs it got back): one naming `.claude/projects`,
-`.codex/sessions` or `.cursor/chats` by a relative path (`cd ~ && cat .claude/projects/...`), or naming
-the cell's own session folder with a `..` in the same call (`cd <own folder> && cat ../<other>`), is
-flagged. Each cell also runs its arm's CLI with a config folder of its own in the cell's temporary
+also reads where each tool call the agent made reaches (its command and the paths it reads, lists or
+writes; not file content it writes, a search pattern or the outputs it got back): one naming
+`.claude/projects`, `.codex/sessions` or `.cursor/chats` by a relative path (`cd ~ && cat
+.claude/projects/...`), or naming the cell's own session folder with a `..` (`cd <own folder> && cat
+../<other>`), is flagged. A `cd` carries over to later calls, as Claude's shell keeps its folder (`cd
+~/.claude`, then `cat projects/...`). This string audit is incomplete: a path built at run time (a
+variable, a script, a symlink) passes it, so the scratch config folder below is what keeps earlier
+transcripts out of reach. Each cell also runs its arm's CLI with a config folder of its own in the cell's temporary
 folder (`CLAUDE_CONFIG_DIR`, `CODEX_HOME` with Codex's `config.toml` and `hooks.json` copied, or
-`CURSOR_CONFIG_DIR`), so no earlier transcript is within reach; the provider's login files are linked
+`CURSOR_CONFIG_DIR`), so no earlier transcript is within reach; a Claude cell also gets
+`CLAUDE_SECURESTORAGE_CONFIG_DIR` naming the real folder (unless already set), since Claude Code names its
+macOS keychain entry after the config folder; the provider's login files are linked
 in, and one the CLI refreshes there is written back to the real file only while that is unchanged
 since the cell began (`bench.scratch_home` false keeps the CLIs' own folders). A cell whose runner hangs keeps its spend so far. The agent's environment carries no `PYTHONPATH` to the
 harness runtime. A transcript that names a denied path or the landed commit, or runs history or
