@@ -14065,29 +14065,19 @@ def test_setting_setup_question_fires_once_per_setting_state(env):
 
 
 @pytest.mark.parametrize("user_text,provenance", [("auto-merge acme/widgets", None), (None, None), ("hi", "system")])
-def test_auto_merge_line_from_any_source_is_reported_never_applied(env, user_text, provenance):
-    """A Policies auto-merge line, whether logged with the user's message, written by the coordinator on
-    its own, or in a turn whose only message the harness posted, never changes delivery.auto_merge_repos
-    (only the coordinator's config_set in the user's turn does): one keyed mismatch defect across ticks
-    and restarts, no alert, no grant_applied event, nothing asked, no bookkeeping."""
-    from ttp import coordinator as coord
+def test_auto_merge_line_from_any_source_is_never_read_or_applied(env, user_text, provenance):
+    """A Policies auto-merge line, however it got there, changes nothing and raises nothing: the daemon
+    reads no charter wording (only the coordinator's config_set in the user's turn sets the setting)."""
     from ttp import grants
     from ttp.daemon import Daemon
     p = make(env)
     _policies_line(p, "- Auto-merge repositories: acme/widgets.", user_text, provenance)
     d = Daemon(p.base)
     d.sweep_holds()
-    d.sweep_holds()
     Daemon(p.base).sweep_holds()
     assert p.config()["delivery"]["auto_merge_repos"] == []
-    ev = _grant_events(p)
-    assert len(ev) == 1 and "auto_merge_repos" in ev[0]["text"] and "Not an ask" in ev[0]["text"]
-    assert "report-only" in ev[0]["text"]
-    assert coord.EFFORT_EVENT_TRIGGERS[grants.EVENT] == "conflict"
-    assert p.db.q("SELECT id FROM messages WHERE kind='ask'") == []
-    assert _grant_events(p, grants.APPLIED) == []
-    assert p.db.q("SELECT id FROM messages WHERE kind='alert' AND text LIKE '%auto_merge_repos%'") == []
-    assert grants.AUTO_MERGE not in (p.db.kv(grants.APPLIED_KV) or {})
+    assert _grant_events(p) == [] and p.db.q("SELECT id FROM messages WHERE kind IN ('ask','alert') "
+                                             "AND text LIKE '%auto_merge_repos%'") == []
 
 
 

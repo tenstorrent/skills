@@ -2058,6 +2058,13 @@ the pick order, so it takes the first starts. A resumed resource ramps only its 
   list a user or coordinator set is never touched). The charter's `Forbidden data` patterns move
   into `memory.forbidden_patterns` the same way, before their first read, so none lapses.
   Nothing moves that the old reader did not use; `delivery.push_branch` is never written.
+  Granted settings are applied by the coordinator with `config_set` in the turn that carries the user's
+  word; the daemon reads no charter wording for them. Its one check: `delivery.push_allowed`,
+  `delivery.allow_protected_push_branch` or `delivery.auto_merge_repos`, last set by the user and changed
+  since, raises one `grant_mismatch` event (never an ask, never a write). A setting hold
+  (`delivery.allow_protected_push_branch` off) sends one low-severity proposal per setting state naming
+  the setting, the held tasks and the `ttp config` change that would release them; other ready work keeps
+  dispatching.
   Other kinds run in the project root unless `worktree.kinds` lists them (say `["work"]`); they
   must not move its HEAD. A run that leaves the root on another branch or with new uncommitted
   changes raises an alert naming it. Before a worktree is made, a root left detached or off its

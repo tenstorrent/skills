@@ -14199,6 +14199,7 @@ class Daemon:
         held = [(t, settinghold.held_key(t)) for t in rows]
         held = [(t, k) for t, k in held if k]
         db = self.p.db
+        settinghold.held_proposals(db, self.cfg, [t for t, _ in held])
         names = sorted({k.rpartition(".")[2] for k in settinghold.SETTINGS})
         loose = db.q("SELECT * FROM tasks WHERE status='blocked' AND labels NOT LIKE '%\"waits:%' AND ("
                      + " OR ".join("blocked_reason LIKE ? OR result LIKE ?" for _ in names) + ")",

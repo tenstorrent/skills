@@ -47,6 +47,7 @@ LAND_ON = r"\bland(?:s|ing)?\b[^.!?\n]{{0,80}}?\bon[ \t]+`?(?:the[ \t]+(?:config
 NEGATION = re.compile(r"\b(?:not|never|no|without)\b|n't\b", re.I)
 SENTENCE_END = re.compile(r"[.!?;](?:\s|$)|\n")
 SETUP_EVENT = "setup_question"
+PROPOSAL_KEY = "setting_proposed"   # kv {setting: fingerprint of the state a proposal was sent for}
 SETUP_KEY = "setting_setup_asked"   # kv {setting: fingerprint of the setting state it was raised for}
 _SENTENCE = re.compile(r"(?<=[.!?])\s+|\n+")
 _PUSH = re.compile(r"\bpush(?:es|ed|ing)?\b", re.I)
@@ -283,6 +284,42 @@ def setup_question(db, cfg: dict, charter: str, now: float, repo: Path | None = 
               f"Do not ask again; when the user answers yes, config_set {key} true in that turn and resolve "
               f"#{mid}; on no, resolve it and keep landing work review only.", "queued"))
     return text
+
+
+def propose(db, key: str, state: str, tasks: list[dict], change: str) -> bool:
+    """One low-severity, non-blocking proposal per setting state (`state`: any string that changes when
+    the setting, or what blocks on it, changes): names the setting, the blocked tasks and the config
+    change that would unblock them. Not an ask: other ready work keeps dispatching. False when this
+    state was already proposed or nothing is blocked."""
+    if not tasks:
+        return False
+    fp = hashlib.sha256(f"{key}\n{state}".encode()).hexdigest()[:16]
+    with db.tx():
+        seen = db.kv(PROPOSAL_KEY, {}) or {}
+        if seen.get(key) == fp:
+            return False
+        seen[key] = fp
+        db.set_kv(PROPOSAL_KEY, seen)
+        ids = ", ".join(f"#{t['id']}" for t in tasks)
+        db.post("out", (f"Proposal (no answer needed; other work goes on): {key} blocks task(s) {ids}. To unblock "
+                        f"them: {change}.")[:1500], chat=None, kind="alert", severity="low")
+    return True
+
+
+def held_proposals(db, cfg: dict, tasks: list[dict]) -> list[str]:
+    """Send the proposal for each setting that holds tasks in `tasks` (the blocked ones); returns the keys."""
+    by: dict[str, list[dict]] = {}
+    for t in tasks:
+        key = held_key(t)
+        if key:
+            by.setdefault(key, []).append(t)
+    sent = []
+    for key, ts in sorted(by.items()):
+        change = f"`ttp config <project> {key} true` (the user's call: it is off now)"
+        if propose(db, key, f"{_push_branch(cfg)}\n{(cfg.get('delivery') or {}).get(key.rpartition('.')[2])}",
+                   ts, change):
+            sent.append(key)
+    return sent
 
 
 def held_key(task: dict) -> str | None:
