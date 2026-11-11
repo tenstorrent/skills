@@ -2059,7 +2059,9 @@ the pick order, so it takes the first starts. A resumed resource ramps only its 
   into `memory.forbidden_patterns` the same way, before their first read, so none lapses.
   Nothing moves that the old reader did not use; `delivery.push_branch` is never written.
   Granted settings are applied by the coordinator with `config_set` in the turn that carries the user's
-  word; the daemon reads no charter wording for them. Its one check: `delivery.push_allowed`,
+  word; push permission (`delivery.push_allowed`) and the machine allowlist (`machines.allowed`) are the
+  user's own, which `config_set` refuses, so the coordinator's reply names the exact `ttp config` command
+  instead. The daemon reads no charter wording for them. Its one check: `delivery.push_allowed`,
   `delivery.allow_protected_push_branch` or `delivery.auto_merge_repos`, last set by the user and changed
   since, raises one `grant_mismatch` event (never an ask, never a write). A setting hold
   (`delivery.allow_protected_push_branch` off) sends one low-severity proposal per setting state naming

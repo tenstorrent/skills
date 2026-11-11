@@ -316,7 +316,8 @@ def held_proposals(db, cfg: dict, tasks: list[dict]) -> list[str]:
     sent = []
     for key, ts in sorted(by.items()):
         change = f"`ttp config <project> {key} true` (the user's call: it is off now)"
-        if propose(db, key, f"{_push_branch(cfg)}\n{(cfg.get('delivery') or {}).get(key.rpartition('.')[2])}",
+        ids = ",".join(str(i) for i in sorted(int(t["id"]) for t in ts))
+        if propose(db, key, f"{_push_branch(cfg)}\n{(cfg.get('delivery') or {}).get(key.rpartition('.')[2])}\n{ids}",
                    ts, change):
             sent.append(key)
     return sent

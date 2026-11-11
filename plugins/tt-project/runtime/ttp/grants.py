@@ -3,7 +3,8 @@
 """Granted delivery settings against the config: the daemon checks records, never charter prose.
 
 The coordinator applies a setting the user grants with config_set, in the turn that carries the user's
-word (the setter record keeps who set it: configwho). `reconcile` keeps only a model-free check of the
+word (the setter record keeps who set it: configwho); push permission is the user's own (config_set refuses
+it), so its reply names the exact `ttp config` command instead. `reconcile` keeps only a model-free check of the
 last recorded grant, for the settings only the user grants (push permission, the protected push branch,
 auto-merge repositories): a setting whose last recorded setter was the user but whose value in
 project.json changed after that record (a hand edit, a revert) is one keyed event (EVENT, fingerprint
@@ -71,6 +72,7 @@ def reconcile(p, db, cfg: dict, now: float, repo=None) -> list[str]:
              (now, "harness", EVENT, fp, "normal",
               f"Harness defect: {key} was last set by the user ({configwho.describe(rec)}) but it changed "
               f"since ({_flat(now_rec.get('why'))}). Not an ask and not changed by the daemon: if the user's "
-              f"word still stands, restore it with config_set in a turn that carries it; else leave it.",
+              f"word still stands, restore it in a turn that carries it (config_set, or for {PUSH}, which config_set "
+              f"refuses, the reply names the exact `ttp config <project> {key} <value>`); else leave it.",
               "queued"))
     return []

@@ -17958,6 +17958,35 @@ def test_forbidden_data_patterns_refuse_memory_and_charter_writes_and_never_reac
     assert not list(p.memory_dir.glob("*anything*.md"))
 
 
+
+def test_the_grant_line_names_only_keys_config_set_accepts_and_the_user_only_ones_as_refused():
+    """Review #7994: every key the coordinator prompt's grant line has it config_set passes config_set's
+    validator; push permission and the machine allowlist are named only as the user's own (refused)."""
+    import re
+    from ttp import coordinator as coord
+    text = (RUNTIME.parent / "template" / "prompts" / "coordinator.md").read_text()
+    line = next(l for l in text.splitlines() if l.startswith("- A setting the user grants"))
+    for key in ("delivery.allow_protected_push_branch", "delivery.auto_merge_repos", "delivery.checks_spill_hosts"):
+        coord.settable(key)
+    own = line.split("are the user's own", 1)
+    assert len(own) == 2 and "`config_set` refuses them" in own[1]
+    for key in re.findall(r"`((?:delivery|machines)\.[\w.]+)`", own[0].rsplit(". ", 1)[-1]):
+        with pytest.raises(ValueError):
+            coord.settable(key)
+    for key in re.findall(r"`((?:delivery|machines|checks)\.[\w.]+)`", own[0].rsplit(". ", 1)[0]):
+        coord.settable(key)
+
+
+def test_a_forbidden_data_subsection_in_a_restrictions_update_is_found_and_others_are_not():
+    """Review #7994: a "### Forbidden data" subsection in another section's charter_update text merges its
+    patterns; a later subsection's spans are not patterns."""
+    from ttp import charterset
+    from ttp import coordinator as coord
+    body = coord._forbidden_body("Restrictions", "- keep it generic\n### Forbidden data\n- card numbers: `\\d{16}`\n### Other\n- run `make test`")
+    assert [i["regex"] for i in charterset.forbidden_patterns(body)] == ["\\d{16}"]
+    assert coord._forbidden_body("Restrictions", "- run `make test`") == ""
+    assert coord._forbidden_body("Forbidden data", "- x: `y`").startswith("## Forbidden data\n")
+
 def test_a_machine_change_until_task_ends_with_its_task_and_a_continuation_re_extends_it(env, monkeypatch, capsys):
     """`--until-task <id>`: the entry is overdue once that task of its project is done, failed, cancelled
     or gone (marked by that project's daemon), at the latest after PROBE_END_S; a continuation re-extends it

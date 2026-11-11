@@ -67,4 +67,4 @@
 +214: old orders line: record each order's reason, retire one whose reason is gone (oldorders.py, user msg #2484)
 +255: Short path rule (ttp express) and the session prompt's `ttp push --land` of a reviewed fix (user msgs #2482, #2484)
 +651: chat digest: post only results, decisions, outages and asks; routine updates wait for the chat's digest (chatdigest.py, user msg #2441)
-+420: a granted setting is applied by the coordinator with config_set; the daemon reads no charter wording (grants.py, plan #2119 P4 item 4)
++630: a granted setting is applied by the coordinator with config_set, the user-only push permission and machine allowlist by the `ttp config` its reply names (review #7994); the daemon reads no charter wording (grants.py, plan #2119 P4 item 4)

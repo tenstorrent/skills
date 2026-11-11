@@ -39463,6 +39463,9 @@ def test_a_setting_hold_sends_one_low_proposal_per_state_and_other_work_still_di
     assert settinghold.held_proposals(p.db, p.config(), [p.db.task(held)]) == []
     p.set_config("delivery.push_branch", "origin/other")   # a new state is proposed once more
     assert settinghold.held_proposals(p.db, p.config(), [p.db.task(held)]) == ["delivery.allow_protected_push_branch"]
+    two = [p.db.task(held), {**p.db.task(held), "id": other}]   # what blocks on it changed: proposed again
+    assert settinghold.held_proposals(p.db, p.config(), two) == ["delivery.allow_protected_push_branch"]
+    assert settinghold.held_proposals(p.db, p.config(), two[::-1]) == []   # the same set, in any order
 
 
 def test_a_review_with_a_push_step_runs_review_only_while_a_setting_hold_stands(env):

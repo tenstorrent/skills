@@ -586,6 +586,16 @@ ALIASES = {"checks.suite_concurrency": "checks.slots"}
 places to read. `checks.suite_concurrency` (the setting's spec name) is `checks.slots`."""
 
 
+def _forbidden_body(section: str, text: str) -> str:
+    """A charter_update's text as charter sections holding its Forbidden data patterns, or "" (none):
+    the Forbidden data section itself, or a Forbidden data subsection inside another section's text
+    (each of its headings read as a section heading, so a later subsection's spans are not taken)."""
+    if forbidden.is_section(section):
+        return f"## Forbidden data\n{text}\n"
+    body = re.sub(r"(?m)^#{2,6}[ \t]+", "## ", text)
+    return body if any(forbidden.is_section(line) for line in body.splitlines() if line.startswith("## ")) else ""
+
+
 def settable(key: str):
     """The validator config_set applies to `key` (USER_SETTABLE, else a provider key chatset.py accepts:
     per-tier routing, the saved endpoint's alias); ValueError saying why when chat may not set it, and
@@ -3857,9 +3867,9 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                             raise ValueError(_queue_cited_restriction(p, queue, cited_agent, section, quote,
                                                                       replaces, text, end, str(e))) from None
                         raise
-                    if forbidden.is_section(section) and text:   # forbidden.declared reads the config only
+                    if text and (body := _forbidden_body(section, text)):   # forbidden.declared reads the config only
                         from .charterset import forbidden_merged
-                        if (pats := forbidden_merged(p, f"## Forbidden data\n{text}\n")) is not None:
+                        if (pats := forbidden_merged(p, body)) is not None:
                             p.set_config("memory.forbidden_patterns", pats,
                                          by=configwho.by("coordinator", via="charter_update Forbidden data"))
                     if quote or replaced:   # the retired text, searched for in what still binds (echoes)
