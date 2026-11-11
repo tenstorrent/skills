@@ -577,6 +577,75 @@ def checks_consumer(p: Project, run_dir: Path) -> str | None:
     return checks_waiter(p, run_dir) or checks_joiner(p.state, run_dir)
 
 
+def waiting_checks(run_dir: Path) -> dict | None:
+    """The checks.pid record of the run's detached checks while they still wait in the checks queue (their
+    own live checks-slot.wait: for a lane, a host slot or test slots), else None: none run, or they hold
+    a slot and run their commands."""
+    from .cli import CHECKS_SLOT_WAIT, _checks_alive, _read_checks_pid
+    try:
+        wait = json.loads((Path(run_dir) / CHECKS_SLOT_WAIT).read_text())
+    except (OSError, ValueError):
+        return None
+    info = _read_checks_pid(Path(run_dir))
+    if not isinstance(wait, dict) or wait.get("pid") != info.get("pid") or not _checks_alive(info):
+        return None
+    return info
+
+
+def ask_drop(run_dir: Path, info: dict, why: str) -> bool:
+    """Ask the run's waiting checks (`info`, waiting_checks) to leave the queue with `why`: a cancel request
+    (cli.CHECKS_SLOT_CANCEL) only that process honours, only while it waits; it records checks.dropped and
+    exits, so `ttp checks --result` says it was dropped and why. False when the same request stands.
+    Raises OSError when it cannot be written."""
+    from .cli import CHECKS_SLOT_CANCEL
+    req = {"pid": info["pid"], "started": info["started"], "why": why}
+    try:
+        if json.loads((Path(run_dir) / CHECKS_SLOT_CANCEL).read_text()) == req:
+            return False
+    except (OSError, ValueError):
+        pass
+    durable_write(Path(run_dir) / CHECKS_SLOT_CANCEL, json.dumps(req))
+    return True
+
+
+ADOPT_HOPS = 20   # checks_adopter follows a chain of continues this long at most
+
+
+def checks_adopter(p: Project, task: int, info: dict) -> str | None:
+    """What adopts an ended task's detached checks (checks.pid `info`), or None: an open task that continues
+    it, or continues a continue of it, whose branch still holds their head (a queued one without a branch
+    yet starts from the nearest branch up its chain). It will read their result, so they are not dropped."""
+    from .db import continues_id
+    head, tree = str(info.get("head") or ""), info.get("worktree")
+    repo = Path(tree) if tree and Path(tree).is_dir() else Path(p.root)
+    holds: dict[str, bool] = {}
+
+    def has(branch: str) -> bool:
+        if branch not in holds:
+            try:
+                holds[branch] = subprocess.run(["git", "-C", str(repo), "merge-base", "--is-ancestor", head, branch],
+                                               capture_output=True, timeout=20).returncode == 0
+            except (OSError, subprocess.SubprocessError):
+                holds[branch] = False
+        return holds[branch]
+    root = p.db.task(task)
+    level, seen = [(task, (root or {}).get("branch") or "")], {task}
+    for _ in range(ADOPT_HOPS):
+        nxt = []
+        for tid, branch in level:
+            for t in p.db.q("SELECT id, status, branch, labels FROM tasks WHERE labels LIKE ?", (f'%"continues:{tid}"%',)):
+                if t["id"] in seen or continues_id(t) != tid:
+                    continue
+                seen.add(t["id"])
+                own = t["branch"] or branch
+                if t["status"] not in OPEN_WAITER_SKIP and (not head or (own and has(own))):
+                    return f"open task #{t['id']} continues #{tid} on a branch that holds their head"
+                nxt.append((t["id"], own))
+        if not (level := nxt):
+            break
+    return None
+
+
 def checks_waiter(p: Project, run_dir: Path) -> str | None:
     """checks_consumer's database half: an open task whose hand-off names the run's detached checks."""
     from .cli import CHECKS_RC
@@ -1008,6 +1077,24 @@ def run_of(p: Project, rc: Path) -> int | None:
     return r["id"] if r else None
 
 
+def _end_ended_checks(p: Project, run_dir: Path, task: int, status: str) -> dict | None:
+    """sweep's step for one run of a task in ENDED: its detached checks stay while an open task reads their
+    result (checks_consumer) or adopts their head (checks_adopter); still waiting in the checks queue they
+    are asked to leave it (ask_drop: they exit cleanly and record why, never a signal mid-wait, which left
+    `ttp checks --result` with a bare exit code 143); running ones are stopped (end_checks)."""
+    from .cli import _checks_alive, _read_checks_pid
+    info = _read_checks_pid(run_dir)
+    if not _checks_alive(info) or checks_consumer(p, run_dir) or checks_adopter(p, task, info):
+        return None
+    if waiting_checks(run_dir) is not None:
+        try:
+            ask_drop(run_dir, info, f"task #{task} ended ({status})")
+        except OSError:
+            pass
+        return None
+    return end_checks(p, run_dir, f"task #{task} is {status}", task)
+
+
 def sweep(p: Project, now: float | None = None) -> list[dict]:
     """The daemon's pass: stop each running job, detached checks and detached push of a task in ENDED that
     no open task waits on, ask the hosts of such a task's `ttp detach --remote` jobs whether they still run
@@ -1025,8 +1112,7 @@ def sweep(p: Project, now: float | None = None) -> list[dict]:
         if row["dir"] in seen:
             continue
         seen.add(row["dir"])
-        r = end_checks(p, Path(row["dir"]), f"task #{row['id']} is {row['status']}", row["id"])
-        if r:
+        if r := _end_ended_checks(p, Path(row["dir"]), row["id"], row["status"]):
             out.append(r)
         try:
             jobs = json.loads(reg.read_text())

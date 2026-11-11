@@ -5620,6 +5620,7 @@ def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: boo
                      "at": float(lane_wait["at"]) if lane_wait.get("at") is not None else None}
     except (ValueError, KeyError, TypeError):
         lane_wait = {"s": 0.0, "pool": 0.0, "at": None}
+    moved = _TaskEnded(p, run_dir, moved)   # and so does its task ending with nobody to adopt them
     while True:
         limit = max(0.0, checkcap.FOREGROUND_WAIT_S - (time.time() - start)) if foreground and p else None
         spill_cfg = p.config() if spill_to else {}
@@ -5765,6 +5766,35 @@ class _HeadMoved:
             return ""
         return (f"its task replaced head {self.head[:12]} with {tip[:12]} on {self.ref.removeprefix('refs/heads/')} "
                 "while it waited: checks of the old head could land nothing (run them again for the new head)")
+
+
+class _TaskEnded:
+    """Asked with _HeadMoved (`inner`) while a task's checks wait for a slot: "" while its task (TTP_TASK) is
+    open, or ended but an open task still reads their result or adopts their head (jobstop.checks_consumer,
+    jobstop.checks_adopter), else why the run leaves the queue: a failed, cancelled or exhausted task's
+    checks would only hold a place others wait behind. The database is asked at most every TASK_ENDED_S."""
+    TASK_ENDED_S = 30.0
+
+    def __init__(self, p, run_dir: Path, inner):
+        self.p, self.run_dir, self.inner, self.at = p, Path(run_dir), inner, 0.0
+        tid = os.environ.get("TTP_TASK") or ""
+        self.task = int(tid) if tid.isdigit() and p is not None else None
+
+    def __call__(self) -> str:
+        if why := self.inner():
+            return why
+        if self.task is None or time.time() - self.at < self.TASK_ENDED_S:
+            return ""
+        self.at = time.time()
+        from . import jobstop
+        try:
+            t = self.p.db.task(self.task)
+            if not t or t["status"] not in jobstop.ENDED or jobstop.checks_consumer(self.p, self.run_dir) \
+                    or jobstop.checks_adopter(self.p, self.task, _read_checks_pid(self.run_dir)):
+                return ""
+        except Exception:   # a busy or unreadable database never ends a wait
+            return ""
+        return f"task #{self.task} ended ({t['status']})"
 
 
 def _git_out(top: str, *args: str) -> str:

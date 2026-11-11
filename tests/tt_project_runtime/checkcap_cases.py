@@ -12524,3 +12524,116 @@ def test_a_preempted_checks_runs_rerun_logs_its_wait_as_cut_by_the_preempting_pr
     assert rows[1]["cut_by"] == "other-project" and rows[0]["granted_at"] - 1 <= rows[1]["cut_at"], rows
     assert all(r["lane_s"] >= 0 and 0 <= r["pool_s"] <= r["lane_s"] for r in rows), rows
     assert checkcap.CUT_ENV in checkcap.RUN_ONLY_ENV and checkcap.LANE_WAIT_ENV in checkcap.RUN_ONLY_ENV
+
+
+def _adopt_queue(env, tmp_path):
+    """A project, a repository whose branch `lane` holds the checks' head, and run_of: a run of a task in a
+    status whose detached checks (one live process) wait in the checks queue, or run (waits=False)."""
+    from ttp import cli
+    from ttp.runner import proc_start
+    p = make(env)
+    repo = tmp_path / "lanes"
+    git = ["git", "-C", str(repo), "-c", "user.email=t@example.com", "-c", "user.name=t"]
+    subprocess.run(["git", "init", "-q", "-b", "lane", str(repo)], check=True)
+    subprocess.run([*git, "commit", "-q", "--allow-empty", "-m", "a"], check=True)
+    head = subprocess.run([*git, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+    subprocess.run([*git, "checkout", "-q", "--orphan", "other"], check=True)
+    subprocess.run([*git, "commit", "-q", "--allow-empty", "-m", "b"], check=True)
+    proc = subprocess.Popen(["sleep", "60"])
+    started = proc_start(proc.pid)
+
+    def run_of(status, waits=True, branch="lane"):
+        tid = p.db.add_task("t", "s", kind="code")
+        p.db.x("UPDATE tasks SET status=?, branch=?, updated=? WHERE id=?", (status, branch, time.time(), tid))
+        run_dir = tmp_path / f"run-{tid}"
+        run_dir.mkdir()
+        p.db.x("INSERT INTO runs(task,role,provider,started,status,dir) VALUES(?,?,?,?,?,?)",
+               (tid, "worker", "fake", time.time(), "ok", str(run_dir)))
+        (run_dir / cli.CHECKS_PID).write_text(json.dumps({"pid": proc.pid, "started": started, "head": head,
+                                                           "worktree": str(repo), "branch": branch}))
+        if waits:
+            (run_dir / cli.CHECKS_SLOT_WAIT).write_text(json.dumps({"pid": proc.pid}))
+        return tid, run_dir
+    return p, proc, run_of
+
+
+def _continue(p, tid, status="queued", branch=None):
+    """An open task that continues #tid, queued as the coordinator queues one (task_add with continues)."""
+    from ttp import coordinator as coord
+    title = f"continue: t{tid} {status} {branch}"
+    assert not coord.apply(p, [{"type": "task_add", "title": title, "spec": "Go on.", "kind": "code",
+                                "continues": tid, "force": True}])
+    new = p.db.one("SELECT * FROM tasks WHERE title=?", (title,))
+    assert new and f'"continues:{tid}"' in new["labels"]
+    p.db.x("UPDATE tasks SET status=?, branch=? WHERE id=?", (status, branch, new["id"]))
+    return new["id"]
+
+
+def test_an_ended_tasks_waiting_checks_leave_the_queue_unless_an_open_continue_adopts_their_head(env, tmp_path):
+    # #7885: a failed task's waiting checks held the host-wide queue, and the one that an open continue
+    # collected (it continues the failed task on the same head) was killed with the rest.
+    from ttp import cli, jobstop
+    from ttp.daemon import Daemon
+    p, proc, run_of = _adopt_queue(env, tmp_path)
+    try:
+        failed, cancelled, exhausted = run_of("failed"), run_of("cancelled"), run_of("exhausted")
+        moved_off = run_of("failed")   # its continue works on a branch that no longer holds the head
+        _continue(p, moved_off[0], branch="other")
+        adopted = run_of("failed")      # #7884 continues #7866 and collects its run's checks
+        _continue(p, adopted[0])
+        chained = run_of("cancelled")   # a continue of a continue adopts them too
+        _continue(p, _continue(p, chained[0], status="failed", branch="lane"), status="running", branch="lane")
+        running = run_of("failed", waits=False)   # holds its slot and runs its commands
+        Daemon(p.base).reap_waiting_checks(every_s=0)
+        why = lambda r: json.loads((r[1] / cli.CHECKS_SLOT_CANCEL).read_text())["why"]   # noqa: E731
+        for (tid, _), status in ((failed, "failed"), (cancelled, "cancelled"), (exhausted, "exhausted"),
+                                 (moved_off, "failed")):
+            assert why((tid, _)) == f"task #{tid} ended ({status})"
+        for r in (adopted, chained, running):
+            assert not (r[1] / cli.CHECKS_SLOT_CANCEL).exists(), r
+        assert jobstop.checks_adopter(p, adopted[0], json.loads((adopted[1] / cli.CHECKS_PID).read_text()))
+        # The daemon's job sweep leaves adopted checks alone and asks waiting ones to leave the queue rather
+        # than signal them mid-wait (a bare exit code 143 with no reason).
+        for r in (failed, adopted):
+            (r[1] / cli.CHECKS_SLOT_CANCEL).unlink(missing_ok=True)
+            assert jobstop._end_ended_checks(p, r[1], r[0], "failed") is None
+        assert proc.poll() is None, "no lane was signalled"
+        assert why(failed) == f"task #{failed[0]} ended (failed)"
+        assert not (adopted[1] / cli.CHECKS_SLOT_CANCEL).exists()
+    finally:
+        proc.kill()
+        proc.wait()
+
+
+def test_a_failed_tasks_waiting_checks_drop_themselves_and_their_result_says_why(env, tmp_path, monkeypatch, capsys):
+    from ttp import cli
+    from ttp.daemon import Daemon
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "1")
+    results = []
+    for by in ("daemon", "itself"):
+        tid = p.db.add_task("t", "s", kind="code")
+        monkeypatch.setenv("TTP_TASK", str(tid))
+        p.db.x("INSERT INTO runs(task,role,provider,started,status,dir) VALUES(?,?,?,?,?,?)",
+               (tid, "worker", "fake", time.time(), "ok", str(run)))
+        for name in (cli.CHECKS_RC, cli.CHECKS_DROPPED, cli.CHECKS_SLOT_CANCEL, cli.CHECKS_SLOT_WAIT):
+            (run / name).unlink(missing_ok=True)
+        if by == "itself":   # ended before its checks asked for a slot: it never takes one
+            p.db.x("UPDATE tasks SET status='failed' WHERE id=?", (tid,))
+        holder = _cap_holder(by)
+        try:
+            cli.main(["checks", "--detach", "--", "true"])
+            if by == "daemon":
+                assert _wait_for(lambda: (run / cli.CHECKS_SLOT_WAIT).exists())
+                p.db.x("UPDATE tasks SET status='failed' WHERE id=?", (tid,))
+                Daemon(p.base).reap_waiting_checks(every_s=0)
+            assert _wait_for(lambda: (run / cli.CHECKS_RC).exists()), by
+        finally:
+            holder.kill()
+            holder.wait()
+        capsys.readouterr()
+        with pytest.raises(SystemExit):
+            cli.main(["checks", "--result", str(run)])
+        results.append(capsys.readouterr().out)
+        assert f"dropped: task #{tid} ended (failed)" in results[-1], (by, results[-1])
+        assert "lost" not in results[-1]

@@ -4300,33 +4300,31 @@ class Daemon:
         if now - getattr(self, "_reaped_checks", 0.0) < every_s:
             return
         self._reaped_checks = now
-        from .cli import CHECKS_SLOT_CANCEL, CHECKS_SLOT_WAIT, _checks_alive, _read_checks_pid
-        marks = ",".join("?" * len(TERMINAL_TASK_STATES))
+        from . import jobstop
+        ended = (*TERMINAL_TASK_STATES, "exhausted")
+        marks = ",".join("?" * len(ended))
         for r in self.p.db.q(f"SELECT runs.id, runs.dir, runs.task, tasks.status FROM runs LEFT JOIN tasks ON tasks.id=runs.task "
                              f"WHERE runs.started > ? AND (tasks.status IN ({marks}) OR (tasks.id IS NULL AND "
                              "(runs.task IS NOT NULL OR runs.status != 'running')))",
-                             (now - REAP_CHECKS_WINDOW_S, *TERMINAL_TASK_STATES)) + self._moved_checks(now):
+                             (now - REAP_CHECKS_WINDOW_S, *ended)) + self._moved_checks(now):
             run_dir = self._run_dir(r)
-            try:
-                wait = json.loads((run_dir / CHECKS_SLOT_WAIT).read_text())
-            except (OSError, ValueError):
-                continue
-            info = _read_checks_pid(run_dir)
-            if not isinstance(wait, dict) or wait.get("pid") != info.get("pid") or not _checks_alive(info):
+            if (info := jobstop.waiting_checks(run_dir)) is None:
                 continue
             if r.get("newer") and self._checks_still_wanted(run_dir, info):
                 continue
+            # An ended task's checks an open continue adopts (it collects their result on its branch): kept.
+            if not r.get("newer") and r["status"] and (jobstop.checks_consumer(self.p, run_dir)
+                                                       or jobstop.checks_adopter(self.p, r["task"], info)):
+                continue
+            abandoned = r["status"] == "done" and r["task"] is not None and \
+                self.p.db.one("SELECT 1 FROM task_abandoned WHERE task=?", (r["task"],))
             why = f"task #{r['task']} moved to run {r['newer']}" if r.get("newer") else \
+                f"task #{r['task']} ended (abandoned)" if abandoned else \
                 f"task #{r['task']} ended ({r['status']})" if r["status"] else \
                 f"task #{r['task']} is gone" if r["task"] is not None else f"run {r['id']} ended and has no task"
-            req = {"pid": info["pid"], "started": info["started"], "why": why}
             try:
-                if json.loads((run_dir / CHECKS_SLOT_CANCEL).read_text()) == req:
+                if not jobstop.ask_drop(run_dir, info, why):
                     continue
-            except (OSError, ValueError):
-                pass
-            try:
-                durable_write(run_dir / CHECKS_SLOT_CANCEL, json.dumps(req))
             except OSError as e:
                 log(self.p, f"run {r['id']}: waiting checks not stopped ({why}): {e}")
                 continue
