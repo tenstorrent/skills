@@ -32,6 +32,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -301,12 +302,14 @@ def line(f: dict) -> str:
             "not the change: nothing is counted against it")
 
 
-def _selfcheck_dir(env: dict | None = None) -> Path:
+def _selfcheck_dir(env: dict | None = None, platform: str | None = None) -> Path:
     env = os.environ if env is None else env
     if env.get("PIP_CACHE_DIR"):
         return Path(env["PIP_CACHE_DIR"]) / "selfcheck"
-    cache = env.get("XDG_CACHE_HOME") or str(Path(env.get("HOME") or Path.home()) / ".cache")
-    return Path(cache) / "pip" / "selfcheck"
+    home = Path(env.get("HOME") or Path.home())
+    if not env.get("XDG_CACHE_HOME") and (platform or sys.platform) == "darwin":
+        return home / "Library" / "Caches" / "pip" / "selfcheck"   # pip's default cache on macOS
+    return Path(env.get("XDG_CACHE_HOME") or home / ".cache") / "pip" / "selfcheck"
 
 
 def _stamp(v) -> float | None:

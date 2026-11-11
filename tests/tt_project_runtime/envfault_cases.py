@@ -94,3 +94,12 @@ def test_a_runner_fault_whose_pip_cache_is_unreadable_says_so_and_is_still_recor
     assert envfault.record(p, {"sig": "env:check-host:box", "kind": "host", "host": "box", "cmd": "x"})
     rows = p.db.q("SELECT text FROM events WHERE kind='observation' AND fingerprint LIKE 'env:check-host:%'")
     assert rows and "Likely cause" not in rows[0]["text"], rows
+
+
+def test_the_pip_selfcheck_cache_is_found_where_pip_keeps_it_on_each_platform(tmp_path):
+    from ttp import envfault
+    h = str(tmp_path)
+    assert envfault._selfcheck_dir({"HOME": h}, "linux") == tmp_path / ".cache/pip/selfcheck"
+    assert envfault._selfcheck_dir({"HOME": h}, "darwin") == tmp_path / "Library/Caches/pip/selfcheck"
+    assert envfault._selfcheck_dir({"HOME": h, "XDG_CACHE_HOME": h + "/x"}, "darwin") == tmp_path / "x/pip/selfcheck"
+    assert envfault._selfcheck_dir({"HOME": h, "PIP_CACHE_DIR": h + "/p"}, "darwin") == tmp_path / "p/selfcheck"
