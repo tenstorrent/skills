@@ -607,7 +607,11 @@ def lines(db: DB, now: float | None = None, window_s: float = WINDOW_S, blocked_
     if p is not None and (lifted := gatejudge.lifts(p.state, since)):
         out.append(f"tests lifted from the flaky-test quarantine: {len(lifted)}: " + "; ".join(
             f"{e.get('id')} ({e.get('why')}, by {e.get('by')})" for e in lifted[:TOP]) + _more(lifted))
-    if p is not None and (missing := sorted(gatejudge.not_found(p, gatejudge.active(p.state, now)))):
+    try:
+        missing = sorted(gatejudge.not_found(p, gatejudge.active(p.state, now))) if p is not None else []
+    except Exception:   # a push-ref or git error: the audit goes on without the line
+        missing = []
+    if missing:
         out.append(f"quarantined tests {gatejudge.NOT_FOUND}: {len(missing)}: " + "; ".join(missing[:TOP])
                    + _more(missing))
     turns = coordinator_turns(db, since)

@@ -127,3 +127,35 @@ def test_daily_review_carries_the_waste_ledger_alerts_low_and_queues_one_fix_tas
     assert f"#{f}" in fixes[0]["spec"] and "upstream:" in fixes[0]["spec"]
     assert "still open" in d._waste_ledger(p.db)                     # one fix task at a time
     assert len(p.db.q("SELECT id FROM tasks WHERE labels LIKE '%waste_fix:%'")) == 1
+
+
+def test_the_daily_review_spec_carries_the_waste_ledger_through_the_schedule_path(env):
+    import time as _time
+    from ttp import daemon as dmod
+    p = make(env)
+    p.db.x("DELETE FROM messages")
+    f = _waste_task(p, "broken idea", status="failed")
+    _waste_run(p, f, 5.0, _time.time())
+    d = dmod.Daemon(p.base)
+    d.cfg = p.config()
+    d.alert = lambda *a, **k: None
+    s = {"name": "daily-review", "budget_usd_day": None, "last_run": None, "description": "review"}
+    assert d._schedule_llm(s, {}) == "queued"
+    spec = p.db.one("SELECT spec FROM tasks WHERE origin='schedule'")["spec"]
+    assert "Self-efficiency audit (last 24 h):" in spec
+    assert "Waste ledger (last 24 h; `ttp waste` for more): demo: avoidable $5.00 of $5.00" in spec
+    assert spec.index("Self-efficiency audit (last 24 h):") < spec.index("Waste ledger (last 24 h")
+
+
+def test_the_self_efficiency_audit_survives_a_push_ref_error(env, monkeypatch):
+    from ttp import audit, landed
+    p = make(env)
+
+    def boom(*a, **k):
+        raise RuntimeError("git: no such ref")
+    monkeypatch.setattr(landed, "_push_ref", boom)
+    import time as _time
+    from ttp import gatejudge
+    gatejudge.quarantine(p.state, ["tests/x.py::test_gone"], {"why": "flaky"}, _time.time())
+    out = audit.lines(p.db, p=p)                                     # the push-ref error costs only its line
+    assert out and not any(gatejudge.NOT_FOUND in line for line in out)
