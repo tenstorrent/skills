@@ -212,7 +212,7 @@ def drive(p: Project, job: dict, say=print) -> dict:
     checks = push.check_list(job["checks"] if "checks" in job else
                              (p.config().get("delivery") or {}).get("post_land_checks"))
     try:
-        env = push.check_env("target", job.get("good") or "", base)
+        env = push.check_env("target", job.get("good") or "", base, cfg=p.config())
     except Exception:
         env = dict(os.environ)
 

@@ -193,7 +193,7 @@ def test_a_spilled_check_runs_in_a_scratch_home_in_its_run_folder_there(tmp_path
     seen = out.read_text().splitlines()
     assert "/ttp-check." in seen[0] and "/.git/ttp-env/home." in seen[0] and seen[1] == f"{seen[0]}/.config"
     assert "x" in seen and "y" in seen and "\tname = There" in seen and ".netrc" not in seen
-    assert seen[2].startswith(str(rhome))   # the shared cache stays on the host's real HOME
+    assert seen[2].endswith("/host-home/checks-cache") and not seen[2].startswith(seen[0])   # the shared cache stays with the host's tt-project folder
     assert _home_marks(rhome) == before and _rc_left(tmp_path) == []
     # that host's own .cache is linked in as the scratch HOME's (scratchhome.cache_link), and outlives the run
     (rhome / ".cache").mkdir()
