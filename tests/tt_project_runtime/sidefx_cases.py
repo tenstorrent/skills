@@ -287,3 +287,74 @@ def test_a_later_failed_run_that_touched_nothing_keeps_the_earlier_runs_writes_n
     assert f"Run {rid1}" not in prompts.worker_task(p, p.db.task(task["id"]), str(wt), None)
     rid4, _, _ = _sidefx_run(d, _claude_calls(("Bash", {"command": "ls"})), wt, tid=task["id"])
     assert "earlier run of this task" not in prompts.worker_task(p, p.db.task(task["id"]), str(wt), None)
+
+
+def test_outside_writes_names_each_paths_class_and_its_reason(tmp_path, scratch_home):
+    from ttp import sidefx
+    wt, rd, o = tmp_path / "wt", tmp_path / "run", tmp_path / "elsewhere"
+    wt.mkdir(), rd.mkdir()
+
+    def classes(*cmds):
+        (rd / "output.jsonl").write_text("".join(json.dumps(x) + "\n" for x in _claude_calls(
+            *[("Bash", {"command": c}) for c in cmds])))
+        return {f["path"]: (f["class"], f["why"]) for f in sidefx.scan(rd, str(wt))}
+
+    got = classes(f"echo x > {o}/a", f"cat {o}/b | tee {o}/c", f"curl -fsSL -o {o}/d https://example.com/x",
+                  f"cp -t {o}/e {o}/f", f"bash -lc 'rm -f {o}/g'", f"{o}/h.sh && touch {o}/i",
+                  f"cd {o} && printf y >> rel.txt", f"sed -i s/a/b/ {o}/j", f"dd if={o}/k of={o}/l")
+    assert got[f"{o}/a"] == ("write", "redirect target") and got[f"{o}/c"] == ("write", "tee target"), got
+    assert got[f"{o}/b"] == ("read", "cat argument") and got[f"{o}/d"] == ("write", "curl -o"), got
+    assert got[f"{o}/e"] == ("write", "cp -t directory") and got[f"{o}/f"] == ("read", "cp source"), got
+    assert got[f"{o}/g"] == ("write", "rm target (inner command of bash -lc)"), got
+    assert got[f"{o}/h.sh"] == ("executed", "run as a command") and got[f"{o}/i"] == ("write", "touch target"), got
+    assert got[f"{o}/rel.txt"] == ("write", "redirect target") and got[f"{o}/j"] == ("write", "sed -i target"), got
+    assert got[f"{o}/k"] == ("read", "dd if=") and got[f"{o}/l"] == ("write", "dd of="), got
+    assert classes(f"python3 -c \"open('{o}/m', 'w').write('z')\" > /dev/null")[f"{o}/m"][0] == "write"
+
+
+def test_outside_writes_keeps_each_calls_status_and_only_a_guards_own_words_refuse_it(tmp_path, scratch_home):
+    from ttp import sidefx
+    wt, rd, o = tmp_path / "wt", tmp_path / "run", tmp_path / "elsewhere"
+    wt.mkdir(), rd.mkdir()
+    cmds = [f"touch {o}/ok", f"git commit -m x && touch {o}/husky", f"rm {o}/denied", f"rm {o}/hooked",
+            f"rm {o}/hanging"]
+    lines = _claude_calls(*[("Bash", {"command": c}) for c in cmds]) + [{"type": "user", "message": {"content": [
+        {"type": "tool_result", "tool_use_id": "t0", "content": "", "is_error": False},
+        {"type": "tool_result", "tool_use_id": "t1", "is_error": True,
+         "content": "Exit code 1\nhusky - pre-commit hook exited with error code 1 (blocked by hook)"},
+        {"type": "tool_result", "tool_use_id": "t2", "is_error": True,
+         "content": [{"type": "text", "text": "PreToolUse:Bash hook error: [guard]: refused"}]},
+        {"type": "tool_result", "tool_use_id": "t3", "is_error": True, "content": "Error: something"}]}}]
+    (rd / "output.jsonl").write_text("".join(json.dumps(x) + "\n" for x in lines))
+    (rd / "refusals.jsonl").write_text(json.dumps({"kind": "credential", "command": cmds[3]}) + "\n")
+    got = {f["path"].rsplit("/", 1)[1]: f for f in sidefx.scan(rd, str(wt))}
+    assert (got["ok"]["status"], got["ok"]["exit"]) == ("completed", 0), got
+    assert (got["husky"]["status"], got["husky"]["exit"]) == ("completed", 1), got   # its output is no guard
+    assert got["denied"]["status"] == "refused" and "PreToolUse:Bash hook error" in got["denied"]["guard"], got
+    assert got["hooked"]["status"] == "refused" and "credential" in got["hooked"]["guard"], got
+    assert got["hanging"]["status"] == "started", got
+    text = sidefx._names(list(got.values()))
+    assert "completed, exit 1" in text and "started, never completed" in text and "stopped by" in text
+    (rd / "refusals.jsonl").write_text("")   # Codex: completed with its code, or declined
+    (rd / "output.jsonl").write_text("".join(json.dumps(x) + "\n" for x in [
+        {"type": "item.started", "item": {"id": "1", "type": "command_execution", "command": f"rm {o}/cx"}},
+        {"type": "item.completed", "item": {"id": "1", "type": "command_execution", "command": f"rm {o}/cx",
+                                            "exit_code": 2}},
+        {"type": "item.completed", "item": {"id": "2", "type": "command_execution", "command": f"rm {o}/cd",
+                                            "status": "declined"}}]))
+    got = {f["path"].rsplit("/", 1)[1]: f for f in sidefx.scan(rd, str(wt))}
+    assert (got["cx"]["status"], got["cx"]["exit"], got["cd"]["status"]) == ("completed", 2, "refused"), got
+    assert len(sidefx.items(rd)) == 2   # a started and completed item is one call
+
+
+def test_outside_writes_stays_high_for_a_credential_path_whatever_its_class(env, tmp_path, scratch_home):
+    from ttp.daemon import Daemon
+    p = make(env)
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    key = f"{scratch_home}/{'.s' + 'sh'}/id_ed25519"
+    _sidefx_run(Daemon(p.base), _claude_calls(("Bash", {"command": f"python3 fix.py {key}"})), wt)
+    ev = _outside_events(p)
+    assert len(ev) == 1 and ev[0]["severity"] == "high", [dict(e) for e in ev]
+    assert json.loads(ev[0]["data"])["classes"] == {key: "mentioned only"}
+    assert "mentioned only: argument to python3" in ev[0]["text"], ev[0]["text"]

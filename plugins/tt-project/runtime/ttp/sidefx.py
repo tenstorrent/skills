@@ -17,7 +17,9 @@ Claude Code's saved large tool output (~/.claude/projects/*/tool-results), which
 The list (paths only, never a command's text or a file's contents) goes to the run dir's
 outside.json, to the next run of the task as one prompt block (still named when a later run also ends
 without a hand-off and touches nothing), and to the coordinator as an
-`outside_writes` event, high when a path is under those folders."""
+`outside_writes` event, high when a path is under those folders in a call no guard refused. Each path
+carries its class (classify_paths: probable write, executed, read or mentioned only, with the reason)
+and its call's status (items: started, completed with its exit code, or refused by which guard)."""
 from __future__ import annotations
 
 import json
@@ -282,6 +284,208 @@ def event_calls(ev: dict) -> list[tuple[str, str, str]]:
     return out
 
 
+# What a blocked call's result starts with when a guard stopped it before it ran: a hook's refusal or a
+# permission denial. Only these, at the start of the result, never a word in a command's own output.
+DENY_RE = re.compile(r"\s*(?:PreToolUse:\w+ hook error:|\w+ operation blocked by hook|Permission to use \S+ has been "
+                     r"denied|The user doesn't want to (?:proceed|take this action))")
+EXIT_RE = re.compile(r"\s*Exit code (\d+)")
+
+
+def _result_text(content) -> str:
+    if isinstance(content, list):
+        return "".join(str(b.get("text") or "") for b in content if isinstance(b, dict))
+    return str(content or "")
+
+
+def items(run_dir: Path) -> list[dict]:
+    """calls() with each call's status: [{"tool", "kind", "what", "status", "exit", "guard"}], status
+    `started` (no result seen), `completed` (exit: its code, or None when the provider gives none) or
+    `refused` (guard: which guard stopped it before it ran: the deny text Claude Code puts at the start of
+    the result, Codex's declined approval, Cursor's rejection, or the hook's own refusals.jsonl record)."""
+    out: list[dict] = []
+    by_id: dict[str, list[dict]] = {}
+
+    def add(ev: dict, key: str, text: str = "") -> list[dict]:
+        new = [{"tool": t, "kind": k, "what": w, "status": "started", "exit": None, "guard": "", "text": text}
+               for t, k, w in event_calls(ev)]
+        out.extend(new)
+        if key:
+            by_id.setdefault(key, []).extend(new)
+        return new
+
+    for ev in _jsonl(Path(run_dir) / "output.jsonl"):
+        content = (ev.get("message") or {}).get("content") if isinstance(ev.get("message"), dict) else None
+        for b in content if isinstance(content, list) else []:   # Claude Code, the chat bridge
+            if not isinstance(b, dict):
+                continue
+            if b.get("type") == "tool_use":
+                name, inp = str(b.get("name") or ""), b.get("input") or {}
+                text = str(inp.get("command") or "") if name == "Bash" else f"{name} {json.dumps(inp)[:400]}"
+                add({"message": {"content": [b]}}, f"c:{b.get('id') or ''}", text[:500])
+            elif b.get("type") == "tool_result":
+                res = _result_text(b.get("content"))
+                for it in by_id.get(f"c:{b.get('tool_use_id') or ''}", []):
+                    if DENY_RE.match(res):
+                        it.update(status="refused", guard=res.strip().split("\n", 1)[0][:80])
+                    else:
+                        m = EXIT_RE.match(res) if b.get("is_error") else None
+                        it.update(status="completed", exit=int(m.group(1)) if m else None if b.get("is_error") else 0)
+        item = ev.get("item") if isinstance(ev.get("item"), dict) else None
+        if item and ev.get("type") in ("item.started", "item.completed"):   # Codex
+            key = f"x:{item.get('id') or ''}"
+            got = by_id.get(key) if item.get("id") else None
+            got = got if got is not None else add({"type": ev["type"], "item": item}, key if item.get("id") else "")
+            if ev["type"] == "item.completed":
+                for it in got:
+                    if item.get("status") == "declined":
+                        it.update(status="refused", guard="Codex approval declined")
+                    else:
+                        code = item.get("exit_code")
+                        it.update(status="completed", exit=code if isinstance(code, int) else None)
+        tc = ev.get("tool_call") if ev.get("type") == "tool_call" and isinstance(ev.get("tool_call"), dict) else None
+        if tc:   # Cursor: started, then completed with its result
+            key = f"u:{ev.get('call_id') or ''}"
+            got = by_id.get(key) if ev.get("call_id") else None
+            got = got if got is not None else add(ev, key if ev.get("call_id") else "")
+            body = next(iter(tc.values()), {})
+            res = body.get("result") if isinstance(body, dict) and isinstance(body.get("result"), dict) else None
+            if ev.get("subtype") == "completed" and res is not None:
+                for it in got:
+                    if "rejected" in res:
+                        it.update(status="refused", guard="Cursor rejected the call")
+                    else:
+                        code = (res.get("success") or {}).get("exitCode") if isinstance(res.get("success"), dict) else None
+                        it.update(status="completed", exit=code if isinstance(code, int) else 0 if "success" in res else None)
+    for ev in _jsonl(Path(run_dir) / "refusals.jsonl"):   # the hook's log
+        if ev.get("kind") == "rewrite" and isinstance(ev.get("rewritten"), str):   # the rewritten command ran
+            out.append({"tool": "hook rewrite", "kind": "shell", "what": ev["rewritten"], "status": "started",
+                        "exit": None, "guard": "", "text": ""})
+        elif isinstance(ev.get("command"), str):   # refused before it ran: the first unrefused call it names
+            it = next((i for i in out if i["text"] == ev["command"] and i["status"] != "refused"
+                       and not (i["status"] == "completed" and i["exit"] == 0)), None)
+            if it:
+                it.update(status="refused", guard=f"tt-project hook ({ev.get('kind') or 'refusal'})")
+    for it in out:
+        it.pop("text")
+    return out
+
+
+STRENGTH = {"write": 3, "executed": 2, "read": 1, "mentioned": 0}
+LABEL = {"write": "probable write", "executed": "executed", "read": "read", "mentioned": "mentioned only"}
+REMOVERS = {"rm", "rmdir", "mkdir", "touch", "chmod", "chown", "chgrp", "truncate", "shred", "unlink"}
+COPIERS = {"cp", "mv", "install", "rsync", "scp", "ln"}
+READERS = {"cat", "head", "tail", "less", "more", "ls", "stat", "wc", "diff", "cmp", "file", "md5sum", "sha256sum",
+           "find", "test", "[", "jq", "sort", "uniq", "cut", "readlink", "realpath", "du", "tree"} | GREPS | PROGS
+INTERPS = {"python", "python3", "node", "perl", "ruby", "php"}
+OUTPUT_OPTS = {"-o", "--output", "--output-file", "--output-document", "--out"}
+CODE_WRITE_RE = re.compile(r"""open\([^)]*['"][wax]|\.write(?:_text|_bytes)?\(|unlink|remove\(|rmtree|rename\(|"""
+                           r"""replace\(|mkdir|chmod|writeFile|appendFile|copyfile|shutil\.(?:copy|move)""")
+
+
+def classify_paths(cmd: str, home: str, cwd: str, run_dir: str, depth: int = 0) -> dict[str, tuple[str, str]]:
+    """{path: (class, why)} for the paths a shell command names: `write` (a redirect, tee or output-flag
+    target, a writing verb's target, a copy's destination, inline code that writes), `executed` (the
+    command word, a script an interpreter runs), `read` (an input redirect, a reader's or copy's source)
+    or `mentioned` (any other argument); the strongest per path. A `bash -c` script is read the same way,
+    its reasons naming it. {} when the shell cannot split it."""
+    try:
+        lex = shlex.shlex(cmd, posix=True, punctuation_chars="();<>|&\n")
+        lex.whitespace, lex.whitespace_split, lex.commenters = " \t\r", True, ""
+        toks = list(lex)
+    except ValueError:
+        return {}
+    punct = [all(c in "();<>|&\n" for c in t) for t in toks]
+    out: dict[str, tuple[str, str]] = {}
+    base: str | None = None
+
+    def put(word: str, cls: str, why: str, target: bool = False) -> None:
+        found = [m.group(0) for m in SHELL_PATH_RE.finditer(word) if not REGEX_PATH_RE.search(m.group(0))]
+        if not found and target and word and not word.startswith("-"):
+            found = [word]   # a relative target, under the last cd
+        for w in found:
+            p = _expand(w, home, cwd, run_dir, base)
+            if p not in out or STRENGTH[cls] > STRENGTH[out[p][0]]:
+                out[p] = (cls, why)
+
+    starts = _commands(toks, punct)
+    for i, t in enumerate(toks):   # in order, so a relative path resolves under the cd before it
+        if punct[i] and i + 1 < len(toks) and not punct[i + 1] and not t.endswith("("):
+            if ">" in t:
+                put(toks[i + 1], "write", "redirect target", True)
+            elif "<" in t:
+                put(toks[i + 1], "read", "input redirect")
+        if i not in starts:
+            continue
+        name = toks[i].rsplit("/", 1)[-1]
+        args, j = [], i + 1
+        while j < len(toks) and not punct[j]:
+            args.append(toks[j])
+            j += 1
+        put(toks[i], "executed", "run as a command")
+        if name == "cd":
+            base = _expand(args[0], home, cwd, run_dir) if args else None
+            continue
+        if name in SHELLS:
+            for k, a in enumerate(args[:-1]):
+                if re.fullmatch(r"-\w*c", a) and depth < 3:
+                    for p, (cls, why) in classify_paths(args[k + 1], home, cwd, run_dir, depth + 1).items():
+                        if p not in out or STRENGTH[cls] > STRENGTH[out[p][0]]:
+                            out[p] = (cls, f"{why} (inner command of {name} {a})")
+                    break
+            continue
+        k, paths, tdir = 0, [], None
+        while k < len(args):
+            a = args[k]
+            flag, _, val = a.partition("=")
+            if flag in OUTPUT_OPTS:
+                put(val if val else args[k + 1] if k + 1 < len(args) else "", "write", f"{name} {flag}", True)
+                k += 1 if val else 2
+                continue
+            if name in COPIERS and flag in ("-t", "--target-directory"):
+                tdir = val or (args[k + 1] if k + 1 < len(args) else "")
+                k += 1 if val else 2
+                continue
+            if name in INTERPS and a in ("-c", "-e") and k + 1 < len(args):
+                code = args[k + 1]
+                cls, why = ("write", f"{name} {a} inline code that writes") if CODE_WRITE_RE.search(code) \
+                    else ("mentioned", f"in {name} {a} inline code")
+                put(code, cls, why)
+                k += 2
+                continue
+            if name == "dd" and flag in ("of", "if"):
+                put(val, "write" if flag == "of" else "read", f"dd {flag}=", True)
+            elif not a.startswith("-"):
+                paths.append(a)
+            k += 1
+        if name in INTERPS and paths:
+            put(paths[0], "executed", f"script {name} runs")
+            for a in paths[1:]:
+                put(a, "mentioned", f"argument to {name}")
+        elif name == "tee":
+            for a in paths:
+                put(a, "write", "tee target", True)
+        elif name in REMOVERS:
+            for a in paths:
+                put(a, "write", f"{name} target", True)
+        elif name in COPIERS:
+            if tdir is not None:
+                put(tdir, "write", f"{name} -t directory", True)
+            elif paths:
+                put(paths.pop(), "write", f"{name} destination", True)
+            for a in paths:
+                put(a, "write" if name == "mv" else "read", f"{name} source")
+        elif name == "sed" and any(re.fullmatch(r"-\w*i\S*|--in-place\S*", a) for a in args):
+            for a in paths:
+                put(a, "write", "sed -i target")
+        elif name in ("source", "."):
+            for a in paths[:1]:
+                put(a, "executed", f"{name} runs it")
+        else:
+            for a in paths:
+                put(a, "read" if name in READERS else "mentioned", f"{name} argument")
+    return out
+
+
 def _jsonl(path: Path):
     try:
         with open(path, errors="replace") as f:
@@ -297,40 +501,81 @@ def _jsonl(path: Path):
         return
 
 
+def _classes(it: dict, home: str, cwd: str, rd: str) -> dict[str, tuple[str, str]]:
+    """{path: (class, why)} of one items() call, for the paths scan() lists."""
+    if it["kind"] == "file":
+        return {_expand(it["what"], home, cwd, rd): ("write", f"{it['tool']} edit")}
+    what = _local_text(it["what"])
+    named = _shell_paths(what, home, cwd, rd)
+    writes = bool(WRITE_RE.search(what) or REDIRECT_RE.search(what))
+    cls = classify_paths(what, home, cwd, rd)
+    return {p: cls.get(p) or ("write", "redirect or tee target") if writes else cls.get(p) or ("mentioned", "named")
+            for p in named if writes or sensitive(p, home)}
+
+
 def scan(run_dir: Path, cwd: str, home: str | None = None) -> list[dict]:
-    """The run's calls that touched paths outside `cwd` and `run_dir`: [{"tool", "path"}], each path
-    once, in call order."""
+    """The run's calls that touched paths outside `cwd` and `run_dir`: [{"tool", "path", "class", "why",
+    "status", "exit", "guard"}], each path once, in call order, from its strongest call that a guard did
+    not refuse (class and why: classify_paths(); status, exit and guard: items())."""
     home = os.path.normpath(home or os.path.expanduser("~"))
     rd = str(run_dir)
     roots = [os.path.realpath(x) for x in (cwd, rd) if x] + [os.path.normpath(x) for x in (cwd, rd) if x]
-    found: dict[str, str] = {}
-    for tool, kind, what in calls(Path(run_dir)):
-        if kind == "file":
-            paths = [_expand(what, home, cwd, rd)]
+    found: dict[str, dict] = {}
+    for it in items(Path(run_dir)):
+        for p, (cls, why) in _classes(it, home, cwd, rd).items():
+            if _inside(p, roots):
+                continue
+            f = {"tool": it["tool"], "path": p, "class": cls, "why": why,
+                 **{k: it[k] for k in ("status", "exit", "guard")}}
+            old = found.get(p)
+            if old is None or ((old["status"] == "refused", -STRENGTH[old["class"]])
+                               > (f["status"] == "refused", -STRENGTH[cls])):
+                found[p] = f
+    return list(found.values())
+
+
+def touches(run_dir: Path, path: str, home: str, cwd: str = "") -> list[dict]:
+    """Each items() call naming `path`, with its class and why for it: what credwatch reads to tell a
+    run that wrote a credential file from one that only named, read or tried to."""
+    rd = str(run_dir)
+    out = []
+    for it in items(Path(run_dir)):
+        if it["kind"] == "file":
+            cls = {_expand(it["what"], home, cwd or rd, rd): ("write", f"{it['tool']} edit")}
         else:
-            what = _local_text(what)
-            named = _shell_paths(what, home, cwd, rd)
-            writes = bool(WRITE_RE.search(what) or REDIRECT_RE.search(what))
-            paths = [p for p in named if writes or sensitive(p, home)]
-        for p in paths:
-            if not _inside(p, roots):
-                found.setdefault(p, tool)
-    return [{"tool": t, "path": p} for p, t in found.items()]
+            cls = classify_paths(_local_text(it["what"]), home, cwd or rd, rd)
+        if path in cls:
+            out.append({**it, "class": cls[path][0], "why": cls[path][1]})
+    return out
+
+
+def _state(f: dict) -> str:
+    if f.get("status") == "refused":
+        return f"stopped by {f.get('guard') or 'a guard'} before it ran"
+    if f.get("status") == "completed":
+        return "completed" + (f", exit {f['exit']}" if f.get("exit") is not None else "")
+    return "started, never completed" if f.get("status") == "started" else ""
 
 
 def _names(found: list[dict]) -> str:
-    text = ", ".join(f"{f['path']} ({f['tool']})" for f in found[:MAX_PATHS])
+    def one(f: dict) -> str:
+        bits = [f["tool"]] + ([f"{LABEL.get(f['class'], f['class'])}: {f.get('why')}"] if f.get("class") else []) \
+            + ([_state(f)] if _state(f) else [])
+        return f"{f['path']} ({'; '.join(bits)})"
+    text = ", ".join(one(f) for f in found[:MAX_PATHS])
     return text + (f", and {len(found) - MAX_PATHS} more" if len(found) > MAX_PATHS else "")
 
 
 def record(run_dir: Path, run_id: int, cwd: str, home: str | None = None) -> dict | None:
     """Scan a run that ended without a valid hand-off and write its outside.json; the record, or None
-    when it touched nothing outside its folders."""
+    when it touched nothing outside its folders. High for a sensitive path in any call a guard did not
+    refuse before it ran, whatever its class: the class only words it."""
     home = os.path.normpath(home or os.path.expanduser("~"))
     found = scan(run_dir, cwd, home)
     if not found:
         return None
-    rec = {"run": run_id, "found": found, "high": any(sensitive(f["path"], home) for f in found)}
+    rec = {"run": run_id, "found": found,
+           "high": any(sensitive(f["path"], home) and f["status"] != "refused" for f in found)}
     from .project import durable_write
     durable_write(Path(run_dir) / FILE, json.dumps(rec, indent=1))
     return rec

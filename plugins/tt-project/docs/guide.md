@@ -3844,6 +3844,20 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   one clause that governs another ("Never post: results from box-a or box-b" edited to drop box-b), is
   read only where it stands, so that edit goes in.
 - Text from logs, issues and chats is treated as data, not instructions.
+- Outside writes (sidefx): when a run ends without a valid hand-off, its transcript is read model-free
+  for paths it touched outside its working directory and run dir. Each path gets a class and its
+  reason: `probable write` (a redirect or tee target, an output flag such as `curl -o`, a writing
+  verb's target, a copy's destination or `cp -t` directory, `sed -i`, `dd of=`, inline code that
+  writes), `executed` (the command word, a script an interpreter runs), `read` (an input redirect, a
+  reader's or copy's source) or `mentioned only`; a `bash -lc` or `sh -c` script is read the same way,
+  its reason naming it. Each call keeps its status: started (no result), completed with its exit code,
+  or stopped by which guard before it ran. A call counts as stopped only from the deny text Claude Code
+  puts at the start of a blocked call's result (`PreToolUse:<Tool> hook error:`, a permission denial),
+  Codex's declined approval, Cursor's rejection or the hook's own refusals.jsonl record, never from
+  words in a command's output. The list goes to outside.json, to the task's next run and to the
+  coordinator as an `outside_writes` event naming each path's class (`classes` in its data); the
+  event is high for any path under the home's config or credential folders in a call a guard did not
+  stop, whatever its class: the class changes only the wording.
 - Credential tripwire (credwatch): the runner stats your credential files as each run's agent starts
   and once it ended: gh's hosts file, `~/.git-credentials`, `~/.netrc`, the ssh private keys in `~/.ssh`
   and each provider's login file, plus every file under the write guard's protected paths (its defaults

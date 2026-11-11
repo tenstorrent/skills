@@ -6121,7 +6121,9 @@ class Daemon:
             task = db.task(r["task"]) or {"id": r["task"], "title": ""}
             db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,data,status,task) VALUES(?,?,?,?,?,?,?,?,?)",
                  (time.time(), "daemon", sidefx.KIND, fp, "high" if rec["high"] else "normal",
-                  sidefx.event_text(task, rec), json.dumps({"run": r["id"], "paths": [f["path"] for f in rec["found"]]}),
+                  sidefx.event_text(task, rec), json.dumps({"run": r["id"], "paths": [f["path"] for f in rec["found"]],
+                                                         "classes": {f["path"]: sidefx.LABEL.get(f["class"], f["class"])
+                                                                     for f in rec["found"]}}),
                   "queued", r["task"]))
         except Exception:   # the scan only discloses: a failure never costs the run its end
             log(self.p, f"run {r['id']}: outside-writes scan failed\n" + traceback.format_exc())
