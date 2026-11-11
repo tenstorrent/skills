@@ -24,7 +24,10 @@ plugin's own test sessions (tests/conftest.py) get three things, with no namespa
   of the run's own folders (its run dir, scratch TMPDIR, fake store, the test session's temp folder).
   Anything else (another process installing a unit while runs overlap, a path a live machine change
   names, a removed file or line) is reported in one line naming the paths and the run, and left in
-  place: the guard never deletes what the run cannot prove it created.
+  place: the guard never deletes what the run cannot prove it created. One removal is the run's
+  without proof: the whole real crontab gone (`crontab -r` by path wipes every project's lines) while
+  no open machine change names a removal. It fails the run and every line comes back, the harness's own
+  included: re-adding a line deletes nothing.
 
 The snapshot leaves out the harness's own entries (crontab lines tagged `# tt-project:`, units named
 tt-project-*), which its daemons rewrite while tests run; under the marker its installers never touch
@@ -36,6 +39,7 @@ import hashlib
 import json
 import os
 import pwd
+import re
 import shlex
 import shutil
 import subprocess
@@ -70,6 +74,7 @@ def _share_dir() -> Path:
 
 
 SHARE_KEY = "share_units"
+WIPED_KEY = "crontab_wiped"   # own(): the whole real crontab removed; holds its text before the run
 
 
 def _unit_dirs() -> dict:
@@ -232,6 +237,17 @@ def _ledger_named() -> list[str]:
         return []
 
 
+WIPE_NAMED = re.compile(r"crontab\s+-r\b|\b(remov|delet|wip|clear|reset)\w*\s+(the\s+)?(\w+\s+)?crontab\b", re.I)
+
+
+def wiped(before: dict, after: dict, named=None) -> bool:
+    """The real crontab went from lines to none during the run, and no open machine change a person or
+    project made names removing it: nothing else empties every project's crontab at once."""
+    if not (isinstance(before.get("crontab"), str) and before["crontab"].strip() and after.get("crontab") is None):
+        return False
+    return not any(WIPE_NAMED.search(n) for n in (_ledger_named() if named is None else named))
+
+
 def own(before: dict, after: dict, d: dict, tokens=(), recorded=None) -> tuple[dict, dict]:
     """`d` split into (what the run provably made, what it cannot prove it made)."""
     recorded, named = set(recorded or ()), _ledger_named()
@@ -243,11 +259,15 @@ def own(before: dict, after: dict, d: dict, tokens=(), recorded=None) -> tuple[d
     def is_named(text, name="") -> bool:
         return any(text in n or (len(name) > 3 and name in n) for n in named)
 
+    if wiped(before, after, named):
+        mine[WIPED_KEY] = before["crontab"]
     if "crontab" in d:
         added, removed = d["crontab"]
         ok = [ln for ln in added if says(ln) and not is_named(ln.strip())]
         rest = list((Counter(added) - Counter(ok)).elements())
-        if ok:
+        if WIPED_KEY in mine:   # the wipe's lines come back with it
+            removed, mine["crontab"] = [], (ok, removed)
+        elif ok:
             mine["crontab"] = (ok, [])
         if rest or removed:
             theirs["crontab"] = (rest, removed)
@@ -281,8 +301,8 @@ def restore(before: dict, d: dict) -> list[str]:
     """Put each changed crontab line and unit path back as `before` had it, on top of what is there now
     (a concurrent change elsewhere stays). Returns the problems."""
     errors = []
-    if "crontab" in d:
-        added, removed = d["crontab"]
+    if "crontab" in d or WIPED_KEY in d:
+        added, removed = d.get("crontab", ([], []))
         cur = _crontab()
         if cur is False:
             errors.append("the crontab could not be read back")
@@ -293,6 +313,13 @@ def restore(before: dict, d: dict) -> list[str]:
                     drop[ln] -= 1
                 else:
                     keep.insert(0, ln)
+            if back := (d.get(WIPED_KEY) or "").splitlines():   # a wipe: every missing line, in its old order
+                missing, put = Counter(back) - Counter(keep), []
+                for ln in back:
+                    if missing[ln] > 0:
+                        missing[ln] -= 1
+                        put.append(ln)
+                keep = put + keep
             keep += list((Counter(removed) - Counter(keep)).elements())
             real = _real("crontab")
             r = _run([real, "-"], input="".join(f"{ln}\n" for ln in keep)) \
@@ -324,6 +351,8 @@ def restore(before: dict, d: dict) -> list[str]:
 
 def describe(d: dict) -> str:
     parts = []
+    if WIPED_KEY in d:
+        parts.append(f"real crontab removed ({len(d[WIPED_KEY].splitlines())} lines; `crontab -r` by path)")
     if "crontab" in d:
         added, removed = d["crontab"]
         parts += [f"crontab line added: {ln[:120]!r}" for ln in added[:5]]

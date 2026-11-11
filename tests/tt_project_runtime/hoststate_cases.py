@@ -209,6 +209,68 @@ def test_a_host_restore_keeps_a_concurrent_unrelated_crontab_line(tmp_path, monk
     assert hoststate.diff({"crontab": "a\n", "units": {}}, {"crontab": "a\n# tt-project: x\n", "units": {}}) == {}
 
 
+def test_a_run_wiping_the_real_crontab_by_path_fails_and_every_line_comes_back(tmp_path, monkeypatch):
+    """`crontab -r` by absolute path removes every project's lines, which no write log or folder name
+    proves: the whole crontab going from lines to none, with no open machine change naming it, is the
+    run's. It fails and each line comes back (the harness's own included), next to a line written since."""
+    from ttp import hoststate, machine_ledger, push
+    tab = "0 1 * * * keep\n@reboot bash ~/.x/resume.sh # series-resume:a\n0 3 * * * job # tt-project: d\n"
+    cron, tabf, _ = _fake_host(tmp_path, monkeypatch, tab)
+    got = _ledger(monkeypatch)
+    monkeypatch.setattr(machine_ledger, "changes", lambda *a, **kw: [
+        {"what": "a test run changed the real crontab -r", "undo": "none: restored", "test": True}])
+    guard = hoststate.Guard(push.check_env("checks", run_dir=str(tmp_path / "run")))
+    subprocess.run([str(cron), "-r"], check=True)
+    assert not tabf.exists()
+    changed, said = guard.end()
+    assert changed and any("host guard: FAILED" in s and "real crontab removed (3 lines" in s for s in said), said
+    assert tabf.read_text() == tab
+    assert got and got[0][1]["test"] is True
+    assert not any("left in place" in s for s in said), said
+    # A line another process writes between the wipe and the restore stays, after the old ones
+    guard = hoststate.Guard(push.check_env("checks", run_dir=str(tmp_path / "run")))
+    tabf.unlink()
+    monkeypatch.setattr(hoststate, "snapshot", lambda: {"crontab": None, "units": {}, hoststate.SHARE_KEY: {}})
+    real = hoststate._crontab
+    monkeypatch.setattr(hoststate, "_crontab", lambda: (tabf.write_text("0 4 * * * new\n"), real())[1])
+    assert guard.end()[0]
+    assert tabf.read_text() == tab + "0 4 * * * new\n"
+
+
+def test_a_crontab_removal_a_machine_change_names_or_one_line_going_is_left_in_place(tmp_path, monkeypatch):
+    """Not a wipe: a crontab removed with an open machine change naming it, an empty crontab, and lines
+    their owner or an overlapping run took out or added (a series' own @reboot resume line) are reported,
+    never put back or deleted, and pass the run."""
+    from ttp import hoststate, machine_ledger, push
+    _, tabf, _ = _fake_host(tmp_path, monkeypatch, "0 1 * * * keep\n")
+    got = _ledger(monkeypatch)
+    ledger = [{"what": "cleared the box: crontab -r", "undo": "none", "test": False}]
+    monkeypatch.setattr(machine_ledger, "changes", lambda *a, **kw: ledger)
+    env = push.check_env("checks", run_dir=str(tmp_path / "run"))
+    guard = hoststate.Guard(env)
+    tabf.unlink()
+    changed, said = guard.end()
+    assert not changed and not got and not tabf.exists(), said
+    assert any("left in place" in s and "keep" in s for s in said), said
+    ledger.clear()
+    tabf.write_text("")   # an empty crontab removed: nothing to wipe
+    guard = hoststate.Guard(env)
+    tabf.unlink()
+    assert guard.end() == (False, []) and not tabf.exists()
+    resume = "@reboot bash ~/.x/{0}/resume.sh # series-resume:{0}"
+    tabf.write_text("0 1 * * * keep\n" + resume.format("a") + "\n" + resume.format("b") + "\n")
+    guard = hoststate.Guard(env)
+    tabf.write_text("0 1 * * * keep\n" + resume.format("b") + "\n" + resume.format("c") + "\n")
+    changed, said = guard.end()
+    assert not changed and not got, said
+    assert tabf.read_text() == "0 1 * * * keep\n" + resume.format("b") + "\n" + resume.format("c") + "\n"
+    [line] = [s for s in said if "left in place" in s]
+    assert "series-resume:a" in line and "series-resume:c" in line, line
+    assert hoststate.wiped({"crontab": "x\n"}, {"crontab": None}, ["deleted the user crontab on purpose"]) is False
+    assert hoststate.wiped({"crontab": "x\n"}, {"crontab": None}, ["edited crontab line y"]) is True
+    assert hoststate.wiped({"crontab": "x\n"}, {"crontab": False}, []) is False   # unreadable: no claim
+
+
 def test_a_unit_another_process_installs_during_an_overlapping_run_survives_and_is_reported(tmp_path, monkeypatch):
     """Runs overlap: another project installs its unit (with a machine change) while this run's guard is
     open. It is not the run's: reported once, naming the paths and the run, and never deleted."""
