@@ -385,7 +385,7 @@ def test_a_second_bad_then_or_waits_only_hand_off_is_taken_as_before(env, monkey
         p = make(env)
         _sessions(env, monkeypatch, "s1")
         d = Daemon(p.base)
-        t = _no_handoff_run(env, p, d, monkeypatch, result=json.dumps(bad))
+        t = _no_handoff_run(env, p, d, monkeypatch, result=json.dumps(bad), title=f"build it {len(p.db.q('SELECT id FROM tasks'))}")
         assert HANDOFF_RESUME_KEY in load_result(t["result"])
         d.dispatch()
         _finish_runs(p, d)
@@ -407,7 +407,7 @@ def test_a_provider_with_a_stop_hook_takes_a_bad_then_or_waits_only_hand_off_as_
         d = Daemon(p.base)
         with monkeypatch.context() as m:
             m.setattr(Fake, "stop_hook", True, raising=False)
-            t = _no_handoff_run(env, p, d, m, result=json.dumps(bad))
+            t = _no_handoff_run(env, p, d, m, result=json.dumps(bad), title=f"build it {len(p.db.q('SELECT id FROM tasks'))}")
         res = load_result(t["result"])
         assert HANDOFF_RESUME_KEY not in res and "woke" not in res and len(_task_runs(p, t["id"])) == 1, dict(t)
         if bad is BAD_THEN:

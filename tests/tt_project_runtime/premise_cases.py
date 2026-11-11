@@ -11,8 +11,9 @@ def _premise_project(env):
     return p
 
 
-def _code(p, spec="Goal: add the retry.\npremise: `ttp task show` has no retry line yet\nChange: add it.", **kw):
-    return p.db.add_task("add the retry line", spec, kind="code", **kw)
+def _code(p, spec="Goal: add the retry.\npremise: `ttp task show` has no retry line yet\nChange: add it.",
+          title="add the retry line", **kw):
+    return p.db.add_task(title, spec, kind="code", **kw)
 
 
 def _end_check(p, qid, status="done", **result):
@@ -443,7 +444,8 @@ def test_a_premise_command_with_another_exit_or_a_timeout_falls_back_to_the_ligh
     assert "premise command `test -d / && exit 3`" in q["spec"]
     assert p.db.one("SELECT 1 FROM events WHERE kind='premise_check' AND text LIKE '%exit 3%'")
     # a timeout: killed, then the same fallback; a later dispatch never reruns it
-    p2, d2, runs2, cid2 = _cmd_daemon(env, monkeypatch, tmp_path / "t", "sleep 30", priority=1)
+    p2, d2, runs2, cid2 = _cmd_daemon(env, monkeypatch, tmp_path / "t", "sleep 30", priority=1,
+                                    title="add the retry line, take 2")   # same project: a repeated title is held (5bbc457c2)
     d2.dispatch()
     proc = d2._premise_runs[cid2][0]
     d2._premise_cmds(time.time() + premise.CMD_TIMEOUT_S + 1)

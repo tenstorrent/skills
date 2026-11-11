@@ -65,7 +65,7 @@ def test_a_task_woken_by_a_spec_change_that_sleeps_again_on_that_spec_stays_asle
     monkeypatch.setenv("TTP_FAKE_RESULT", json.dumps(
         {"status": "waiting", "summary": "job running", "waiting_for": "the job", "retry_after_s": 3600,
          "retry_when": "exit 1", "spec_seen": "a worker cannot set this", "spec_wakes": []}))
-    tid = p.db.add_task("run the long job", "start the job", kind="work", tier="light", origin="user")
+    tid = p.db.add_task(f"run the long job {len(p.db.q('SELECT id FROM tasks'))}", "start the job", kind="work", tier="light", origin="user")
     d = dmod.Daemon(p.base)
     runs = lambda: len(p.db.q("SELECT id FROM runs WHERE task=?", (tid,)))
     idle = lambda: p.db.task(tid)["status"] == "queued" and (p.db.task(tid)["not_before"] or 0) > time.time() \
@@ -292,7 +292,7 @@ def _deferred_flow(p, monkeypatch, tmp_path, tier="standard", hand_off=None):
     monkeypatch.setenv("TTP_FAKE_RESULT", json.dumps(
         {"status": "waiting", "summary": "job running", "waiting_for": "the job", "retry_after_s": 3600,
          "retry_when": f"test -e {flag}", **(hand_off or {})}))
-    tid = p.db.add_task("run the long job", "start the job", kind="work", tier=tier, origin="user")
+    tid = p.db.add_task(f"run the long job {len(p.db.q('SELECT id FROM tasks'))}", "start the job", kind="work", tier=tier, origin="user")
     d = dmod.Daemon(p.base)
     runs = lambda: len(p.db.q("SELECT id FROM runs WHERE task=?", (tid,)))
     idle = lambda: p.db.task(tid)["status"] == "queued" and (p.db.task(tid)["not_before"] or 0) > time.time() \

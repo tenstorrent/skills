@@ -14066,8 +14066,9 @@ def test_a_setting_hold_ends_when_its_ask_is_resolved_and_follows_a_newer_ask(en
     p = make(env)
     _remote_origin(p)
     p.set_config("delivery.push_branch", "origin/main")
-    tids = [p.db.add_task(f"Land {n}", "land on main with `ttp push`", kind="code", tier="light", origin="user")
-            for n in ("a", "b")]
+    p.set_config("dispatch.batch", False)   # each task its own run: batch runs (1ed160fc4) would fold them into one
+    tids = [p.db.add_task(f"Land {n} ({i + 1})", "land on main with `ttp push`", kind="code", tier="light", origin="user")
+            for i, n in enumerate(("a", "b"))]
     p.db.x("UPDATE messages SET handled=1 WHERE direction='in'")
     first = _setting_ask(p)
     d, started = _paused_dispatch(p, monkeypatch)

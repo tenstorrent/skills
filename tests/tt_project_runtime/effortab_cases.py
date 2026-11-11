@@ -9,11 +9,15 @@ def _ab_on(p, **extra):
     return cfg
 
 
+_AB_N = iter(range(1, 10**6))
+
+
 def _ab_task(p, arm, **kw):
     """A new code task queued at standard whose lineage lands in `arm`."""
     from ttp import effortab
     while True:
-        tid = p.db.add_task("Port the parser", "Make it faster.", kind="code", tier="standard",
+        # distinct titles: a repeated one is held at dispatch as a duplicate (5bbc457c2)
+        tid = p.db.add_task(f"Port the parser, part {next(_AB_N)}", "Make it faster.", kind="code", tier="standard",
                             origin="coordinator", provider="claude", budget_usd=8.0, **kw)
         if effortab.arm_of(tid) == arm:
             return tid
@@ -74,6 +78,7 @@ def test_effort_ab_arm_goes_in_the_run_note_and_the_run_starts_at_its_effort(env
     from ttp.daemon import Daemon
     p = make(env)
     p.set_config("effort_ab.enabled", True)
+    p.set_config("dispatch.batch", False)   # each task its own run: batch runs (1ed160fc4) would fold them into one
     d = Daemon(p.base)
     d.jev = None
     monkeypatch.setattr(d, "_workdir_for", lambda t: (str(p.base), None))

@@ -986,7 +986,7 @@ def test_a_rule_routes_a_standard_code_run_by_kind_and_keeps_every_exclusion(env
     core = d.cfg.get("core_provider", "claude")
 
     def start(**kw):
-        tid = p.db.add_task(kw.pop("title", "t"), kw.pop("spec", "s"), budget_usd=8.0,
+        tid = p.db.add_task(kw.pop("title", f"t{len(p.db.q('SELECT id FROM tasks'))}"), kw.pop("spec", "s"), budget_usd=8.0,
                             **{"kind": "code", "tier": "standard", "priority": 2, "labels": [], **kw})
         return _dispatch_task(p, d, monkeypatch, tid)
 

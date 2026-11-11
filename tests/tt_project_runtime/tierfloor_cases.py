@@ -470,7 +470,7 @@ def test_a_worker_wake_of_a_code_task_with_a_conclusion_line_starts_at_its_class
     waits = {"status": "waiting", "summary": "x", "retry_when": "test -e /nonexistent/done", "waiting_for": "x"}
 
     def run(kind, result=None, **kw):
-        t = p.db.add_task("Measure the fix", spec, kind=kind, tier="standard", origin="coordinator",
+        t = p.db.add_task(f"Measure the fix {len(p.db.q('SELECT id FROM tasks'))}", spec, kind=kind, tier="standard", origin="coordinator",
                           provider="claude", budget_usd=8.0, **kw)
         if result is not None:
             p.db.update_task(t, status="queued", result=json.dumps({**result, SPEC_SEEN_KEY: spec_digest(p.db.task(t))}))

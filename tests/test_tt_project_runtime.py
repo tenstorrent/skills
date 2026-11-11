@@ -2274,7 +2274,7 @@ def test_the_daemon_records_whether_a_wait_is_self_or_external(env, monkeypatch,
                           {"wait": "external", "why": "other", "for": "task #7's review and ask #3",
                            "probe": "test -e /m", "owner": "task:7 ask:3"})):
         monkeypatch.setenv("TTP_FAKE_RESULT", json.dumps({"status": "waiting", "summary": "later", **result}))
-        tid = p.db.add_task(f"waits {want['why']}", "s", kind="work", tier="light", origin="user")
+        tid = p.db.add_task(f"waits {len(p.db.q('SELECT id FROM tasks'))} {want['why']}", "s", kind="work", tier="light", origin="user")
         assert _run_until(d, p, lambda: p.db.one("SELECT id FROM events WHERE kind='task_waiting' AND task=?", (tid,)))
         ev = p.db.one("SELECT data FROM events WHERE kind='task_waiting' AND task=?", (tid,))
         assert json.loads(ev["data"]) == want
@@ -5352,7 +5352,7 @@ def test_a_wake_runs_at_light_or_its_wake_tier_never_above_the_task_and_other_ru
         {k["task"]["id"]: (tier, k["note"].get("wake"), prompt)}))
 
     def task(tier, result=None):
-        tid = p.db.add_task(f"t{len(started)}-{tier}-{result}", "s", kind="work", tier=tier, origin="user")
+        tid = p.db.add_task(f"t{len(p.db.q('SELECT id FROM tasks'))}-{tier}-{result}", "s", kind="work", tier=tier, origin="user")
         if result:
             p.db.update_task(tid, result=dump_result({"summary": "earlier", **result}))
         return tid
@@ -20884,7 +20884,7 @@ def test_a_review_runs_at_the_tier_its_diff_needs(env, monkeypatch):
     big, _, big_commit = change("big", {"app.py": 200})
 
     def review(spec, **kw):
-        return p.db.add_task(f"review {len(started)}", spec, kind="review", origin="coordinator", **kw)
+        return p.db.add_task(f"review {len(p.db.q('SELECT id FROM tasks'))}", spec, kind="review", origin="coordinator", **kw)
 
     by_branch = review(f"Review branch {small_branch}.", tier="standard")
     by_dep = review("Review the change.", tier="standard", depends_on=[small])
