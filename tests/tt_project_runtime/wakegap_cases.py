@@ -8,12 +8,14 @@ _WG_CHAT = {"endpoint": "placeholder", "base_url": "https://chat.example.invalid
             "tiers": {"light": {"model": "example-org/small-model", "route": True}}}
 
 
-def _wg_setup(env, monkeypatch, busy=0, chat=False, haiku=False):
-    """A turn that just ended, batch_s off, a free worker slot by default; `chat` turns the watcher on,
-    `haiku` sets the Haiku fallback (coordinator.wake_triage_fallback, on by default) explicitly."""
+def _wg_setup(env, monkeypatch, busy=0, chat=False, haiku=False, batch=0):
+    """A turn that just ended, batch_s off (`batch` None: the default), a free worker slot by default;
+    `chat` turns the watcher on, `haiku` sets the Haiku fallback (coordinator.wake_triage_fallback, on by
+    default) explicitly."""
     from ttp import configwho
     p, d, clock, starts = _batch_setup(env, monkeypatch, busy=busy)
-    p.set_config("coordinator.batch_s", 0)
+    if batch is not None:
+        p.set_config("coordinator.batch_s", batch)
     if chat:
         p.set_config("providers.chat", _WG_CHAT, by=configwho.by("user", via="cli"))
     if haiku:
@@ -31,13 +33,13 @@ def _wg_setup(env, monkeypatch, busy=0, chat=False, haiku=False):
 def test_wakegap_routine_events_in_the_gap_share_one_wake_even_with_a_free_slot(env, monkeypatch):
     p, d, clock, starts, _ = _wg_setup(env, monkeypatch, busy=0)
     ended = clock[0]
-    assert float(p.config()["coordinator"]["wake_gap_s"]) == 300
+    assert float(p.config()["coordinator"]["wake_gap_s"]) == 900
     for kind in ("task_done", "task_failed", "blocker_sweep", "urgent_check_wait"):
-        clock[0] += 40   # events at +40, +110, +180 and +250 s, each checked for 30 s
+        clock[0] += 180   # events at +180, +390, +600 and +810 s, each checked for 30 s
         _event(p, clock, kind)
-        assert not _turn_within(d, clock, starts, 30), f"{kind} woke the coordinator inside the wake gap"
+        assert not _turn_within(d, clock, starts, 30, step=10), f"{kind} woke the coordinator inside the wake gap"
     assert _turn_within(d, clock, starts, 120), "the wake gap ran past wake_gap_s"
-    assert len(starts) == 1 and starts[0] >= ended + 300
+    assert len(starts) == 1 and starts[0] >= ended + 900
 
 
 def test_wakegap_user_messages_and_urgent_events_wake_at_once(env, monkeypatch):
@@ -56,6 +58,36 @@ def test_wakegap_user_messages_and_urgent_events_wake_at_once(env, monkeypatch):
         assert _turn_within(d, clock, starts, 60), f"{kind}/{sev} waited on the wake gap"
 
 
+def test_wakegap_defaults_hold_a_plain_task_end_up_to_900s_but_not_a_user_message_or_urgent_end(env, monkeypatch):
+    def setup():
+        p, d, clock, starts, _ = _wg_setup(env, monkeypatch, batch=None)   # every default, batch_s included
+        c = p.config()["coordinator"]
+        assert [float(c[k]) for k in ("batch_s", "event_hold_s", "wake_gap_s")] == [900, 900, 900]
+        return p, d, clock, starts
+
+    def end(p, clock, spec, **kw):   # a task end with a blocked dependent, so no plain-done hold applies
+        tid = p.db.add_task("t", spec, status="done", **kw)
+        p.db.add_task("next", "s", status="blocked", depends_on=[tid])
+        p.db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+               (clock[0], f"task:{tid}", "task_done", "normal", "done", "queued", tid))
+
+    p, d, clock, starts = setup()   # routine priority 1 alone is not urgent: it waits for the gap
+    ended = clock[0]
+    clock[0] += 10
+    end(p, clock, "s", priority=1)
+    assert not _turn_within(d, clock, starts, 800, step=20), "a plain task end woke inside the 900 s gap"
+    assert _turn_within(d, clock, starts, 200, step=10), "a plain task end waited past 900 s"
+    assert ended + 900 <= starts[0] <= ended + 960
+    p, d, clock, starts = setup()
+    clock[0] += 10
+    end(p, clock, "urgent: the user is waiting on this\ns", priority=1)
+    assert _turn_within(d, clock, starts, 60), "an urgent task's end waited on the wake holds"
+    p, d, clock, starts = setup()
+    clock[0] += 10
+    p.db.x("INSERT INTO messages(ts,direction,chat,text,handled) VALUES(?,?,?,?,0)", (clock[0], "in", "web", "hi"))
+    assert _turn_within(d, clock, starts, 60), "a user message waited on the wake holds"
+
+
 def test_wakegap_off_wakes_a_free_slot_at_once(env, monkeypatch):
     p, d, clock, starts, _ = _wg_setup(env, monkeypatch)
     p.set_config("coordinator.wake_gap_s", 0)
@@ -71,7 +103,7 @@ def test_waketriage_skip_folds_the_batch_into_the_next_wake(env, monkeypatch):
     asked = []
     monkeypatch.setattr(babysit, "_post", lambda s, messages, timeout: (asked.append(messages), {
         "choices": [{"message": {"content": "skip"}}], "usage": {"prompt_tokens": 40, "completion_tokens": 1}})[1])
-    clock[0] += 400   # past the wake gap
+    clock[0] += 1000   # past the wake gap
     _event(p, clock, "task_done")
     eid = p.db.one("SELECT MAX(id) n FROM events")["n"]
     assert not _turn_within(d, clock, starts, 300), "a watcher skip still woke the coordinator"
@@ -84,7 +116,7 @@ def test_waketriage_skip_folds_the_batch_into_the_next_wake(env, monkeypatch):
     assert eid in notes[-1], "the folded event was missing from the next wake's digest"
     # Left folded, the batch still wakes once its oldest event is wake_triage_max_s old.
     p, d, clock, starts, notes = _wg_setup(env, monkeypatch, chat=True)
-    clock[0] += 400
+    clock[0] += 1000
     _event(p, clock, "task_done")
     assert not _turn_within(d, clock, starts, 600)
     assert _turn_within(d, clock, starts, 1300), "a folded batch never woke the coordinator"
@@ -99,7 +131,7 @@ def test_waketriage_a_watcher_error_wakes_and_logs_the_model(env, monkeypatch, c
     def down(s, messages, timeout):
         raise babysit.Unavailable("HTTP 503")
     monkeypatch.setattr(babysit, "_post", down)
-    clock[0] += 400
+    clock[0] += 1000
     _event(p, clock, "task_done")
     assert _turn_within(d, clock, starts, 60), "a watcher error held the wake"
     assert any("triage failed" in t and "example-org/small-model" in t and "HTTP 503" in t for t in lines), lines
@@ -124,7 +156,7 @@ def test_waketriage_without_a_chat_provider_haiku_holds_routine_events_until_max
     calls = _wg_haiku(monkeypatch)
     p, d, clock, starts, notes = _wg_setup(env, monkeypatch, haiku=True)
     assert not (d.cfg.get("providers") or {}).get("chat") and waketriage.on(d.cfg)
-    clock[0] += 400   # past the wake gap
+    clock[0] += 1000   # past the wake gap
     _event(p, clock, "task_done")
     _event(p, clock, "upstream_note")
     assert not _turn_within(d, clock, starts, 600), "a Haiku skip still woke the coordinator"
@@ -135,7 +167,7 @@ def test_waketriage_without_a_chat_provider_haiku_holds_routine_events_until_max
     assert len(calls) == 1
     # A user message wakes at once, without asking.
     p, d, clock, starts, notes = _wg_setup(env, monkeypatch, haiku=True)
-    clock[0] += 400
+    clock[0] += 1000
     _event(p, clock, "task_done")
     assert not _turn_within(d, clock, starts, 60)
     n = len(calls)
@@ -144,7 +176,7 @@ def test_waketriage_without_a_chat_provider_haiku_holds_routine_events_until_max
     # A high event or an ask_ kind is never held.
     for kind, sev in (("task_done", "high"), ("ask_timeout", "normal")):
         p, d, clock, starts, _ = _wg_setup(env, monkeypatch, haiku=True)
-        clock[0] += 400
+        clock[0] += 1000
         _event(p, clock, kind, sev)
         n = len(calls)
         assert _turn_within(d, clock, starts, 60) and len(calls) == n, (kind, sev)
@@ -154,7 +186,7 @@ def test_waketriage_haiku_wake_answer_wakes_and_the_fallback_switch_turns_it_off
     from ttp import configwho, waketriage
     calls = _wg_haiku(monkeypatch, answer="wake: yes")
     p, d, clock, starts, _ = _wg_setup(env, monkeypatch, haiku=True)
-    clock[0] += 400
+    clock[0] += 1000
     _event(p, clock, "task_done")
     assert _turn_within(d, clock, starts, 60) and len(calls) == 1
     p.set_config("coordinator.wake_triage_fallback", False, by=configwho.by("user", via="cli"))
@@ -168,7 +200,7 @@ def test_waketriage_haiku_fallback_is_on_by_default_and_its_off_switch_wakes_wit
     # On by default: with no config set, Haiku is asked and folds a routine event-only batch.
     p, d, clock, starts, _ = _wg_setup(env, monkeypatch)
     assert waketriage.fallback_on(d.cfg)
-    clock[0] += 400   # past the wake gap
+    clock[0] += 1000   # past the wake gap
     _event(p, clock, "task_done")
     assert not _turn_within(d, clock, starts, 60) and len(calls) == 1
     # Off-switch: coordinator.wake_triage_fallback false wakes without asking Haiku.
@@ -177,7 +209,7 @@ def test_waketriage_haiku_fallback_is_on_by_default_and_its_off_switch_wakes_wit
     d.cfg = p.config()
     assert not waketriage.fallback_on(d.cfg)
     n = len(calls)
-    clock[0] += 400
+    clock[0] += 1000
     _event(p, clock, "task_done")
     assert _turn_within(d, clock, starts, 60) and len(calls) == n, "Haiku decided a wake after its off-switch"
 

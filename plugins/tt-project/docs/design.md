@@ -52,12 +52,14 @@ disk untouched, with no migration; nothing else is reclaimed by check recovery.
    queued; user messages, failed, blocked or review hand-offs, high events and an idle slot with
    nothing to run wake it at once. A batch of only task_done, followup_proposed, upstream_note,
    checks_slot_wait or task_waiting events at routine severity also waits until
-   `coordinator.event_hold_s` (300 s) after the last turn ended, unless a slot is free with nothing
+   `coordinator.event_hold_s` (900 s) after the last turn ended, unless a slot is free with nothing
    ready to fill it (eventhold.py). That exception stays even for batches of only plain hand-offs,
    checks_slot_wait and task_waiting: replayed, turns of only those events still queued work, replied
    or updated tasks (`python3 -m ttp.replay --event-hold-s 300 --quiet-hold`). Under both, the wake
    gap: an event-only batch with no immediate event (high or critical, must-act, asks, overdue
-   obligations, safety and outage kinds: eventhold.IMMEDIATE_KINDS) wakes at most once per `coordinator.wake_gap_s` (300 s) after the last turn ended, a free slot included
+   obligations, safety and outage kinds: eventhold.IMMEDIATE_KINDS, and the end or hand-off of a task
+   with a fresh `urgent:` line or owning an open obligation: eventhold.hot, which also skip the holds
+   above) wakes at most once per `coordinator.wake_gap_s` (900 s) after the last turn ended, a free slot included
    (dispatch starts ready work without a model run meanwhile), and before that wake the watcher model
    (`babysit.ask`, target coordinator; without a chat provider Claude Haiku at low effort, on by default, off with
    `ttp config <project> coordinator.wake_triage_fallback false`, booked as `haiku:wake_decision`; it never answers in the coordinator's place) may fold it into the next wake: the events stay queued and ride

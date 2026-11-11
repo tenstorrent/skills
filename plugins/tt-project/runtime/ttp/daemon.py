@@ -11799,8 +11799,10 @@ class Daemon:
         # Ride-along events (pagesev.rides_along) start no turn: they join the next one something else
         # starts, or start one themselves RIDE_ALONG_MAX_S after the oldest was raised.
         rides = [e for e in evs if pagesev.rides_along(e)]
+        # An event of a task a deadline hangs on (eventhold.hot) skips every hold below and the triage.
+        hot = not msgs and not rerun and eventhold.hot(db, [e for e in evs if not pagesev.rides_along(e)], now)
         # So do plain hand-offs (_plain_done_held), up to coordinator.plain_done_hold_max_s.
-        held = [] if msgs or unsized[0] or rerun or len(rides) == len(evs) else \
+        held = [] if msgs or unsized[0] or rerun or hot or len(rides) == len(evs) else \
             self._plain_done_held(evs, now, unsized[1])
         # A slow tick step's report (pagesev.TICK_KINDS) never ages into a turn of its own.
         aging = [e for e in rides if e["kind"] not in pagesev.TICK_KINDS]
@@ -11830,7 +11832,7 @@ class Daemon:
             own = [e for e in queued if not pagesev.rides_along(e)]   # ride-alongs neither hold nor start a turn
             # An overdue promise or order, or a failed claim, wakes the coordinator at once (mustact.py);
             # a must-act item that rides along (a host-held queue wait) holds like any other ride-along.
-            urgent = any(e["kind"] in mustact.KINDS and not pagesev.rides_along(e) for e in evs)
+            urgent = hot or any(e["kind"] in mustact.KINDS and not pagesev.rides_along(e) for e in evs)
             # Relayed messages with no order or question wait out the relay window, so a burst is one turn.
             if msgs and not rerun and not any(eventhold.immediate(e) for e in evs) and self._relay_hold(msgs, now):
                 return
@@ -11898,7 +11900,7 @@ class Daemon:
                 log(self.p, "coordinator turn gate failed: " + traceback.format_exc().replace("\n", " | ")[:1500])
                 seen_now = {}
         triage = [e for e in evs if not pagesev.rides_along(e)]
-        if triage and not msgs and not rerun and w is None and waketriage.on(self.cfg) and \
+        if triage and not msgs and not rerun and not hot and w is None and waketriage.on(self.cfg) and \
                 eventhold.can_wait(triage) and not any(e["kind"] in coord.UNBLOCK_KINDS for e in triage):
             try:   # the watcher model decides whether this routine batch needs the coordinator now
                 folded, line = waketriage.fold(db, self.cfg, triage, now)

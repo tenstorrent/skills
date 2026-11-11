@@ -21,7 +21,7 @@ def test_eventhold_two_routine_wakes_60s_apart_share_one_turn_after_the_hold(env
     from ttp.daemon import Daemon
     p, d, clock, starts = _evhold_setup(env, monkeypatch)
     hold = float(p.config()["coordinator"]["event_hold_s"])
-    assert hold == 300
+    assert hold == 900
     ended = clock[0]
     clock[0] += 10
     _event(p, clock, "upstream_note")
@@ -93,7 +93,7 @@ def test_eventhold_until_reads_only_routine_batches():
     assert eventhold.until(cfg, [], ev, None, 1100.0) is None
     assert eventhold.until(cfg, [], ev + [{"kind": "stall", "severity": "normal"}], 1000.0, 1100.0) is None
     assert eventhold.until(cfg, [], [{"kind": "task_done", "severity": None}], 1000.0, 1100.0) is None
-    assert eventhold.until({"coordinator": {"event_hold_s": "x"}}, [], ev, 1000.0, 1100.0) == 1300.0
+    assert eventhold.until({"coordinator": {"event_hold_s": "x"}}, [], ev, 1000.0, 1100.0) == 1900.0
     assert eventhold.until({"coordinator": {"event_hold_s": -5}}, [], ev, 1000.0, 1100.0) is None
 
 
@@ -170,3 +170,19 @@ def test_eventhold_replay_quiet_rule_holds_only_plain_batches_through_a_free_slo
     assert "quiet_held_turns" not in replay.report(history(), 0, 2, event_hold_s=300)
     assert "quiet_held_turns" not in replay.report(history(), 0, 2, quiet_hold=True)
     assert replay.main([str(db.path), "--days", "1", "--slots", "2", "--event-hold-s", "300", "--quiet-hold"]) == 0
+
+
+def test_eventhold_hot_marks_fresh_urgent_and_obligation_owner_ends_not_priority_alone(env, monkeypatch):
+    from ttp import eventhold, obligations
+    p = make(env)
+    now = time.time()
+    plain = p.db.add_task("plain", "s", priority=1)
+    hot = p.db.add_task("hot", "urgent: the user waits\ns")
+    owner = p.db.add_task("owner", "s")
+    ev = lambda tid: [{"kind": "task_done", "severity": "normal", "task": tid}]
+    monkeypatch.setattr(obligations, "owner_due", lambda db: {owner: now + 3600})
+    assert not eventhold.hot(p.db, ev(plain), now)
+    assert eventhold.hot(p.db, ev(hot), now) and eventhold.hot(p.db, ev(owner), now)
+    assert not eventhold.hot(p.db, [{"kind": "task_done", "severity": "normal"}], now)
+    monkeypatch.setattr(obligations, "owner_due", lambda db: 1 / 0)
+    assert not eventhold.hot(p.db, ev(owner), now), "a failure holds as before"

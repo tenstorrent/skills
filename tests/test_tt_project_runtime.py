@@ -31157,7 +31157,7 @@ def _turn_within(d, clock, starts, seconds, step=5):
 def test_routine_events_wait_for_company_while_every_slot_is_busy(env, monkeypatch):
     p, d, clock, starts = _batch_setup(env, monkeypatch, busy=2)
     batch = float(p.config()["coordinator"]["batch_s"])
-    assert batch == 300
+    assert batch == 900
     _event(p, clock, "task_done")
     _event(p, clock, "followup_proposed")
     assert not _turn_within(d, clock, starts, 120), "a routine hand-off woke a turn while every slot was busy"

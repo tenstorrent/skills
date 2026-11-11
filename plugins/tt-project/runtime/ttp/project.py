@@ -295,8 +295,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
                     # Only devices a task named in the last idle_capacity_use_days count (0: all).
                     "idle_capacity_s": 1500, "idle_capacity_rearm_s": 21600, "idle_capacity_use_days": 7,
                     # Routine events (task done, follow-ups, notes, normal observations) wait up to
-                    # this long for company while every worker slot is busy or runnable work is queued.
-                    "batch_s": 300,
+                    # this long for company while every worker slot is busy or runnable work is queued
+                    # (900 s, measured on three projects: about a fifth fewer turns than 300 s).
+                    "batch_s": 900,
                     # A batch of only plain hand-offs (a normal task_done of no review with nothing to
                     # queue or decide) starts no turn: it joins the next wake of any other cause or the
                     # idle wake, at most this long after its oldest event (the idle_wake_s default; 0: off).
@@ -310,11 +311,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
                     # Routine event-only turns (task done, follow-ups, upstream notes, check-slot waits,
                     # waits) start no sooner than this long after the last turn ended, unless a slot is
                     # free with nothing ready to fill it (eventhold.py; 0: off).
-                    "event_hold_s": 300,
+                    "event_hold_s": 900,
                     # Event-only batches with no immediate event (task ends, hand-offs, timers, waits)
                     # wake at most once per this long after the last turn ended, a free slot included;
-                    # user messages and immediate events wake at once (eventhold.gap_until; 0: off).
-                    "wake_gap_s": 300,
+                    # user messages, immediate events and the ends of hot tasks (a fresh urgent: line or
+                    # an open obligation's owner; eventhold.hot) wake at once (eventhold.gap_until; 0: off).
+                    "wake_gap_s": 900,
                     # Relayed messages (`ttp say` from another agent) with no order or question wait up to
                     # this long after the oldest, so a burst starts one turn; an order or a question, and
                     # the user's own channels, wake at the debounce (msgwake.py; 0: off).
