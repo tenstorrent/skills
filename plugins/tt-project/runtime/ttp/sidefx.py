@@ -297,11 +297,32 @@ def _result_text(content) -> str:
     return str(content or "")
 
 
-def items(run_dir: Path) -> list[dict]:
+def _fork_prompt(ev: dict) -> bool:
+    """Whether `ev` is the user line that hands a forked run its task (ctxfork.FORK_HEAD in its own text,
+    never in a tool's output): the lines before it are the coordinator's inherited session."""
+    from .ctxfork import FORK_HEAD
+    msg = ev.get("message") if ev.get("type") == "user" and isinstance(ev.get("message"), dict) else None
+    c = msg.get("content") if msg else None
+    if isinstance(c, str):
+        return FORK_HEAD in c
+    return isinstance(c, list) and any(isinstance(b, dict) and b.get("type") == "text" and FORK_HEAD in
+                                       str(b.get("text") or "") for b in c)
+
+
+def own_events(run_dir: Path) -> list[dict]:
+    """The run's own transcript events: those after a fork's task prompt (_fork_prompt; the inherited
+    coordinator lines and their tool calls before it are not this run's), without replayed ones."""
+    evs = list(_jsonl(Path(run_dir) / "output.jsonl"))
+    cut = next((i for i, ev in enumerate(evs) if _fork_prompt(ev)), -1)
+    return [ev for ev in evs[cut + 1:] if not ev.get("isReplay")]
+
+
+def items(run_dir: Path, own_only: bool = False) -> list[dict]:
     """calls() with each call's status: [{"tool", "kind", "what", "status", "exit", "guard"}], status
     `started` (no result seen), `completed` (exit: its code, or None when the provider gives none) or
     `refused` (guard: which guard stopped it before it ran: the deny text Claude Code puts at the start of
-    the result, Codex's declined approval, Cursor's rejection, or the hook's own refusals.jsonl record)."""
+    the result, Codex's declined approval, Cursor's rejection, or the hook's own refusals.jsonl record).
+    `own_only`: only the run's own calls (own_events), never a fork's inherited ones."""
     out: list[dict] = []
     by_id: dict[str, list[dict]] = {}
 
@@ -313,7 +334,7 @@ def items(run_dir: Path) -> list[dict]:
             by_id.setdefault(key, []).extend(new)
         return new
 
-    for ev in _jsonl(Path(run_dir) / "output.jsonl"):
+    for ev in own_events(run_dir) if own_only else _jsonl(Path(run_dir) / "output.jsonl"):
         content = (ev.get("message") or {}).get("content") if isinstance(ev.get("message"), dict) else None
         for b in content if isinstance(content, list) else []:   # Claude Code, the chat bridge
             if not isinstance(b, dict):
@@ -534,12 +555,13 @@ def scan(run_dir: Path, cwd: str, home: str | None = None) -> list[dict]:
     return list(found.values())
 
 
-def touches(run_dir: Path, path: str, home: str, cwd: str = "") -> list[dict]:
-    """Each items() call naming `path`, with its class and why for it: what credwatch reads to tell a
-    run that wrote a credential file from one that only named, read or tried to."""
+def touches(run_dir: Path, path: str, home: str, cwd: str = "", own_only: bool = False) -> list[dict]:
+    """Each items() call naming `path` (own_only: only the run's own calls), with its class and why for
+    it: what credwatch reads to tell a run that wrote a credential file from one that only named, read
+    or tried to."""
     rd = str(run_dir)
     out = []
-    for it in items(Path(run_dir)):
+    for it in items(Path(run_dir), own_only):
         if it["kind"] == "file":
             cls = {_expand(it["what"], home, cwd or rd, rd): ("write", f"{it['tool']} edit")}
         else:
