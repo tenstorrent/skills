@@ -4163,16 +4163,15 @@ def test_no_batch_starts_while_something_holds_the_push(env, monkeypatch, blocke
     from ttp import locks, push, pushq
     from ttp.db import PAUSED_RESOURCES_KEY
     s = _pq(env, monkeypatch)
-    rid, row = _pq_review(s, priority=1)
+    rid, row = _pq_review(s, priority=2)
     now = time.time()
-    assert pushq.due(s.p, now)[0], "the priority-1 approval alone is due"
+    assert pushq.due(s.p, now)[0], "the approval alone is due"
     held = None
     if blocker.startswith("paused"):
         name = push.lock_name("origin", "proj") if blocker == "paused branch" else "push"
         s.p.db.set_kv(PAUSED_RESOURCES_KEY, {name: {"reason": "user", "since": now, "by": "user"}})
-    elif blocker == "live batch":   # its deploy included
-        s.p.db.x("INSERT INTO push_batches(id,marker,target,started,finalized) VALUES('b','m','origin/proj',?,?)",
-                 (now, now))
+    elif blocker == "live batch":   # still in its push phase: only the deploy no longer holds the next batch
+        s.p.db.x("INSERT INTO push_batches(id,marker,target,started) VALUES('b','m','origin/proj',?)", (now,))
     elif blocker == "busy branch":
         held = locks.try_take(push.lock_paths(s.p, "origin", "proj"), "someone's ttp push")
     elif blocker == "detached push":
@@ -14943,7 +14942,7 @@ def test_only_a_review_precheck_s_checks_wait_asks_the_push_queue_for_its_head(e
     with pytest.raises(Seen) as e:
         cli._checks_slot(p, tmp_path, io.StringIO(), "a" * 40, detached=True)
     moved = e.value.args[0]
-    assert isinstance(moved, cli._HeadMoved)
+    assert isinstance(moved, cli._TaskEnded) and isinstance(moved.inner, cli._HeadMoved)
     assert isinstance(moved.queued, cli._QueuedHead) == run_id.startswith("precheck-")
 
 
@@ -16655,7 +16654,7 @@ def test_a_push_batch_blames_the_change_when_its_failing_test_fails_twice_on_it_
     assert m["checks"]["tip_reruns"] == batch.TIP_RERUNS
     assert calls.count(("tip", _SEL)) == batch.TIP_RERUNS, calls
     assert ("tip", None) not in calls, "the tip is not checked alone in full"
-    assert calls.count(("head", None)) == 2, "the full head and the rescue of entry 2; prefix 1 ran only the test"
+    assert calls.count(("head", None)) == 1, "one full head check: the prefix and entry-2 rescue probes run only the failing test"
     assert _git_out(origin, "rev-parse", "proj") == tip
 
 
@@ -16897,8 +16896,9 @@ def test_a_push_batch_reruns_each_failing_test_not_yet_judged_at_that_head(env, 
     assert m["results"][1]["detail"] == {"untested": True}, "prefix 1 passed: entry 2 waits for the next train"
     both = gatejudge.select_rx([_FLAKY_ID, _NEW_ID])
     assert ("head", both, ["e1", "e2"]) in calls, "both failing tests rerun together at the full head"
-    assert ("head", _SEL, ["e1"]) in calls, "prefix 1's failing test reruns there too"
-    assert [f["ids"] for f in m["flaky_tests"]] == [[_FLAKY_ID], [_FLAKY_ID]], m["flaky_tests"]
+    assert ("head", gatejudge.select_rx([_NEW_ID]), ["e1"]) in calls, \
+        "prefix 1's probe reruns only the new failing test: _FLAKY_ID was already judged (passed its rerun) at the full head"
+    assert [f["ids"] for f in m["flaky_tests"]] == [[_FLAKY_ID]], m["flaky_tests"]   # judged once, at the full head
     assert _FLAKY_ID in gatejudge.active(p.state, time.time())
     calls.clear()
     rc, m2 = _run_batch(p, _batch_marker(p, [_entry(repo, "e3", {"e3.txt": "3\n"})], bid="b2"), monkeypatch)
@@ -20141,8 +20141,8 @@ def test_push_queue_batch_checks_run_at_nice_19_and_idle_io_like_ttp_checks(env,
     streamed = [n.args[0] for n in ast.walk(ast.parse(src))
                 if isinstance(n, ast.Call) and getattr(n.func, "id", "") == "_stream" and n.args]
     checks = [a for a in streamed if isinstance(a, ast.Call)]
-    assert len(checks) == 3 and all(getattr(a.func, "id", "") == "_check_argv" for a in checks), \
-        "the batch run, rerun and cap probe all stream a _check_argv"
+    assert len(checks) >= 3 and all(getattr(a.func, "id", "") == "_check_argv" for a in checks), \
+        "every batch stream (entry checks, run, rerun, cap probe, split probe) is a _check_argv"
     argv = batch._check_argv("x", tmp_path)
     assert argv[len(argv) - len(push.check_argv("x", tmp_path)):] == push.check_argv("x", tmp_path)
     if not (shutil.which("nice") and shutil.which("ionice")):

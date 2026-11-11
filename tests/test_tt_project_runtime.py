@@ -31431,7 +31431,8 @@ def test_a_review_held_for_its_checks_does_not_fill_a_slot_for_the_turn_batch(en
     out = p.state / PRECHECKS_DIR / "t1-abc"
     out.mkdir(parents=True)
     (out / cli.CHECKS_PID).write_text(json.dumps({"pid": os.getpid(), "started": proc_start(os.getpid()),
-                                                  "ts": time.time()}))
+                                                  "ts": time.time() - 60}))
+    (out / cli.CHECKS_RUNNING).write_text(json.dumps({"since": time.time() - 30}))   # on a host, not queued
     rid = p.db.add_task("Review #1: x", "s", kind="review", tier="standard", origin="daemon",
                         labels=[PRECHECK_LABEL + out.name])
     d = Daemon(p.base)

@@ -560,3 +560,6 @@ def test_while_a_probe_announces_a_cycle_no_push_batch_checks_or_detached_job_st
     _cycle_probe(s.p, "next: nothing scheduled\n")
     assert pushq.schedule(s.p, log=said.append), "the batch starts once the announcement clears"
     assert s.p.db.kv(pushq.CYCLE_SAID_KEY) is None
+    (env["tmp"] / "go").write_text("")   # the stub batch waits for its release file: let it end before teardown
+    for child in list(pushq._children.values()):
+        child.wait(timeout=30)

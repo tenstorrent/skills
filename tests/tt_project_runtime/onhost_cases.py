@@ -69,10 +69,10 @@ def test_a_notify_keeps_held_worker_notifies_only_its_status_line_names(env):
     a = p.db.add_task("tidy the docs", "s", kind="work", status="done")
     b = _oh_task(p, chat=None)
     assert workernotify.hold(p.db, p.db.task(b), "box1 is wedged", "r9", "21:00 PST", 900)
-    coord.apply(p, [{"type": "notify", "text": f"#{a} finished; power cycling the box now."},
+    coord.apply(p, [{"type": "notify", "text": f"#{a} finished; power cycling box1 now."},
                     {"type": "task_update", "id": b, "priority": 1}], turn=1)
     alert = p.db.q("SELECT text FROM messages WHERE direction='out' AND kind='alert' ORDER BY id DESC LIMIT 1")[0]["text"]
-    assert f"{onhost.MARK} power cycling the box now." in alert and f"Status now: #{b}: queued" in alert, alert
+    assert f"{onhost.MARK} power cycling box1 now." in alert and f"Status now: #{b}: queued" in alert, alert
     # The coordinator never named #b: its held notify still goes to the user.
     assert [e["task"] for e in workernotify._entries(p.db)] == [b]
 

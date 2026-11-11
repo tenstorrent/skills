@@ -2152,7 +2152,7 @@ def test_every_checks_key_the_runtime_reads_is_an_account_key_and_settable(env):
     read |= set(re.findall(r'get\("checks"\) or \{\}\)\.get\("([a-z_]+)"', src))
     for kind in (testslots.TESTS, testslots.BUILDS):
         read |= {kind.setting(s)[1] for s in ("pool", "run_max", "project_max")}
-    read -= {"dropped", "json", "log", "out", "pid", "queued", "rc", "running", "stalled"}   # file names (checks.json), not keys
+    read -= {"dropped", "json", "log", "out", "pid", "queued", "rc", "running", "stalled", "spill_"}   # file names (checks.json) and the key prefix configwho.SPILL_KEYS, not keys
     # project-only: the project's own lock or queue wrapper (and the one its checks run behind on a spill host),
     # set by the user per project, its fallback lane, the spill hosts its user lets it share with device jobs,
     # the Python lock its checks' pinned env is built from, the strikes that quarantine a spill host for it, and a

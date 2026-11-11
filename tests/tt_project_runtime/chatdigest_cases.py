@@ -64,7 +64,7 @@ def test_the_status_footer_leaves_a_sent_post_for_the_digest(env, monkeypatch):
     p = make(env)
     tid = p.db.add_task("power cycle the box", "s", kind="work", status="queued", reply_chat="c1",
                         labels=["resource:box1-device"])
-    coord.apply(p, [{"type": "reply", "chat": "c1", "text": "Power cycling it now, nothing else touches the box.",
+    coord.apply(p, [{"type": "reply", "chat": "c1", "text": "Power cycling box1 now, nothing else touches it.",
                      "owners": [tid]}], turn=1)
     (got,) = _cd_out(p)
     assert onhost.MARK in got and "Status now:" not in got   # the honesty mark stays, the footer goes

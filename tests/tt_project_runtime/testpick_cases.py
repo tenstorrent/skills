@@ -542,9 +542,11 @@ def test_only_a_tasks_ttp_checks_narrows_so_every_push_batch_runs_the_full_suite
     root = pathlib.Path(ttp.__file__).parent
     users = sorted(p.name for p in root.rglob("*.py") if p.name != "testpick.py"
                    and re.search(r"import testpick|testpick\.narrow\(", p.read_text(encoding="utf-8", errors="replace")))
-    assert users == ["cli.py"]
-    from ttp import cli
+    # batch.py narrows only an express landing's smoke checks (_express_checks); a normal batch runs the full set
+    assert users == ["batch.py", "cli.py"]
+    from ttp import batch, cli
     import inspect
+    assert inspect.getsource(batch).count("testpick.narrow(") == 1 and "testpick.narrow(" in inspect.getsource(batch.Batch._express_checks)
     assert inspect.getsource(cli).count("testpick.narrow(") == 1 and "testpick.narrow(" in inspect.getsource(cli.cmd_checks)
 
 
