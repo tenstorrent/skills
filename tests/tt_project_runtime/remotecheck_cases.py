@@ -763,6 +763,36 @@ def test_a_run_that_fails_tests_on_a_spill_host_reruns_only_those_tests_here_and
         assert where[-1].endswith(f"ids={ids}"), where
 
 
+@pytest.mark.skipif(not os.path.isdir("/proc/self"), reason="the probe reads running checks from /proc")
+def test_the_spill_probe_counts_only_checks_a_live_process_runs_and_removes_a_cut_runs_leftover(tmp_path):
+    """A cut run (this machine rebooted) leaves its ttp-check.* folder on the spill host with no process in
+    it: the probe counts it for no running check, so the host still takes runs, and removes it once
+    LEFTOVER_REAP_MIN old. A folder a live process works in counts however old; one just made (its copy,
+    no process yet) counts for RUNNING_GRACE_MIN."""
+    import re
+    import subprocess
+    import time
+    from ttp import checkspill
+    t = tmp_path / "t"
+    ago = lambda d, m: os.utime(d, (time.time() - m * 60,) * 2)
+    live, fresh, old, mid = (t / f"ttp-check.{n}" for n in ("live", "fresh", "old", "mid"))
+    for d in (live / "work", fresh, old, mid):
+        d.mkdir(parents=True)
+    ago(live, 3 * checkspill.LEFTOVER_REAP_MIN)
+    ago(old, 2 * checkspill.LEFTOVER_REAP_MIN)
+    ago(mid, (checkspill.RUNNING_GRACE_MIN + checkspill.LEFTOVER_REAP_MIN) / 2)
+    runner = subprocess.Popen(["sleep", "60"], cwd=live / "work")
+    try:
+        r = subprocess.run(["sh", "-c", checkspill._PROBE], capture_output=True, text=True, timeout=30,
+                           env={**os.environ, "TMPDIR": f"{t}/"})
+    finally:
+        runner.kill()
+        runner.wait()
+    m = re.search(r"^ttp-spill \d+ \d+ (\d+)", r.stdout, re.M)
+    assert m and int(m.group(1)) == 2, r
+    assert live.is_dir() and fresh.is_dir() and mid.is_dir() and not old.exists()
+
+
 @_LINUX_TMP
 def test_a_rerun_after_a_spill_host_keeps_off_only_the_host_it_failed_on(env, tmp_path, monkeypatch):
     """#6379: checks that fail on one spill host run again on the next free one (a pass there counts),

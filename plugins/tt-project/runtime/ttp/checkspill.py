@@ -51,7 +51,8 @@ is what ssh reaches, what its own pause, lock and device checks name, and where 
 Runs already on the host go on. The skip shows in one line in `ttp status` and the web app (skip_lines)
 while it is fresh (SKIP_SHOW_S). Its slots follow what it has idle now (checklane.host_slots): the runs
 its idle cores (cores less the 1-minute load average) and available memory fit, at most the runs its
-cores hold less the remote checks running there from any machine (their ttp-check.* folders), not a
+cores hold less the remote checks running there from any machine (their ttp-check.* folders a live process
+works in, or just made: _RUNNING_COUNT; a cut run's leftover folder counts for none and is removed), not a
 small fixed count; a host whose load does not read gets checklane.default_slots less those. This machine also holds one claim file
 per slot it uses there (spill/<alias>.<n>.json in the checks slot folder), so its own runs never
 take more. A claim whose remote ttp-check.* folder is not made yet (the few seconds of its copy) is
@@ -135,11 +136,33 @@ _SHELLS = ("sh", "bash", "dash", "zsh")   # needs_cli reads their -c script too
 # Absolute paths every host has: a check naming only these may still spill (host_path).
 _SYSTEM_DIRS = ("/usr/", "/bin/", "/sbin/", "/lib/", "/lib64/", "/lib32/", "/etc/", "/dev/", "/proc/", "/sys/")
 RUNNING_MAX_AGE_MIN = 720   # a remote ttp-check.* folder older than this is a leftover, not a running check
+RUNNING_GRACE_MIN = 10   # where /proc reads: a folder no process works in counts as running this long (its copy)
+LEFTOVER_REAP_MIN = 60   # and is removed, a leftover of a cut run (a reboot here), once this old
+# The running checks on a host: its ttp-check.* folders a live process works in (cwd under it, read from /proc),
+# or made in the last RUNNING_GRACE_MIN; one with neither is a leftover, removed once LEFTOVER_REAP_MIN old. Without
+# /proc (macOS) every folder younger than RUNNING_MAX_AGE_MIN counts.
+_RUNNING_COUNT = (
+    "t=${TMPDIR:-/tmp}; t=${t%/}\n"
+    "if [ -r /proc/self/cwd ]; then\n"
+    "  r=$(cd \"$t\" 2>/dev/null && pwd -P); w=$(for q in /proc/[0-9]*; do readlink \"$q/cwd\" 2>/dev/null; done)\n"
+    "  n=0\n"
+    "  for d in \"$t\"/ttp-check.?*; do\n"
+    "    [ -d \"$d\" ] || continue\n"
+    "    x=\"$r/${d##*/}\"\n"
+    "    if printf '%s\\n' \"$w\" | grep -q -F -x -e \"$x\" -e \"$d\" || printf '%s\\n' \"$w\" | grep -q -F -e \"$x/\" -e \"$d/\"; then\n"
+    "      n=$((n+1))\n"
+    f"    elif [ -n \"$(find \"$d\" -maxdepth 0 -mmin -{RUNNING_GRACE_MIN} 2>/dev/null)\" ]; then n=$((n+1))\n"
+    f"    elif [ -n \"$(find \"$d\" -maxdepth 0 -mmin +{LEFTOVER_REAP_MIN} 2>/dev/null)\" ]; then rm -rf -- \"$d\"\n"
+    "    fi\n"
+    "  done\n"
+    "else\n"
+    "  n=$(find \"$t\" -maxdepth 1 -name 'ttp-check.*' -type d "
+    f"-mmin -{RUNNING_MAX_AGE_MIN} 2>/dev/null | wc -l)\n"
+    "fi\n")
 _PROBE = ("command -v git >/dev/null 2>&1 && command -v tar >/dev/null 2>&1 || exit 3\n"
           "c=$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)\n"
           "m=$(awk '/^MemAvailable:/{print $2}' /proc/meminfo 2>/dev/null)\n"
-          "n=$(find \"${TMPDIR:-/tmp}\" -maxdepth 1 -name 'ttp-check.*' -type d "
-          f"-mmin -{RUNNING_MAX_AGE_MIN} 2>/dev/null | wc -l)\n"
+          + _RUNNING_COUNT +
           "l=$(cut -d' ' -f1 /proc/loadavg 2>/dev/null)\n"
           "echo \"ttp-spill $c ${m:-0} $n ${l:--}\"\n")
 DEVICE_NODES = "/dev/tenstorrent*"   # a host's Tenstorrent device nodes (a glob); a process holding one open is a tenant
