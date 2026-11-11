@@ -9,7 +9,8 @@ folder there (remote_lines), else (no managed scratch) in one of the process's o
 The cache in force (XDG_CACHE_HOME where set, else the real HOME's .cache) is linked in as the
 scratch HOME's .cache, and XDG_CACHE_HOME names it, so tools that write under $HOME/.cache (pip,
 uv, pre-commit, plugin caches) reuse it and runs stay as fast as with the real HOME (cache_link). With
-no such cache, or one holding a credential store, nothing is linked and XDG_CACHE_HOME stays where it
+no such cache, or one that is or holds the real HOME or is, is in or holds a credential store
+(on another host too), nothing is linked and XDG_CACHE_HOME stays where it
 was set, else a cache folder shared by every check run (TTP_HOME/checks-cache). Removing the run's
 folder only unlinks the link (checkdirs, rm -rf), never what it points to. Toolchains that find themselves under HOME
 (KEEP: rustup, cargo, pyenv, go, nvm, the Hugging Face cache) keep their real folder where it exists
@@ -88,10 +89,12 @@ def cache_dir() -> Path:
 
 def cache_link(env: dict, real: Path) -> Path | None:
     """The cache a scratch HOME's .cache links to: `env`'s XDG_CACHE_HOME where set, else `real`'s
-    .cache; None where that is no folder, or it is or holds a credential store (credguard)."""
+    .cache; None where that is no folder, is or holds `real` itself, or is, is in or holds a credential
+    store (credguard; remote_lines checks the same on another host)."""
     from . import credguard
     cache = Path(env.get("XDG_CACHE_HOME") or real / ".cache")
-    if not cache.is_absolute() or not cache.is_dir() or credguard.read_refusal(str(cache), search=True, home=real):
+    if (not cache.is_absolute() or not cache.is_dir() or Path(os.path.realpath(real)).is_relative_to(cache.resolve())
+            or credguard.read_refusal(str(cache), search=True, home=real)):
         return None
     return cache
 
@@ -126,6 +129,53 @@ def apply(env: dict, folder: str | Path, files: list[str]) -> dict:
     return out
 
 
+class _Marks(dict):
+    """An environ for credguard._stores that names each variable it reads (`seen`) and sets those in
+    `mark` to "/<name>", so a store's path shows the variable it comes from."""
+    def __init__(self, mark=()):
+        super().__init__()
+        self.mark, self.seen = set(mark), []
+
+    def get(self, key, default=None):
+        self.seen.append(key)
+        return "/" + key if key in self.mark else default
+
+
+def _remote_stores() -> str:
+    """credguard's credential locations on another host, one per line for a shell here-document: each
+    under that host's real HOME (ttp_real_home), and where a variable set there moves it (a
+    colon-separated list of files split)."""
+    from . import credguard
+    base = PurePosixPath("/H")
+    esc = lambda s: "".join("\\" + c if c in '\\$`"' else c for c in s)   # noqa: E731
+    probe = _Marks()
+    lines = [f"$ttp_real_home/{esc(str(PurePosixPath(p).relative_to(base)))}" for p in credguard._stores(base, probe)]
+    lines.append("$ttp_real_home/.ssh")
+    for var in dict.fromkeys(probe.seen):
+        for p in credguard._stores(base, _Marks([var])):
+            first, _, rest = str(p).lstrip("/").partition("/")
+            if first == var:
+                lines.append(f"${{{var}:+${var}{esc('/' + rest) if rest else ''}}}" if rest else
+                             f'$(printf "%s\\n" "${{{var}:-}}" | tr : "\\n")')
+    return "\n".join(dict.fromkeys(lines))
+
+
+def _remote_guard() -> str:
+    """A shell function for another host: `ttp_cred_refused <folder>` exits 0 where the folder is not
+    one, is or holds the real HOME, or is, is in or holds a credential store there (as cache_link)."""
+    return ('ttp_cred_refused() {\n'
+            '  ttp_c=$(cd "$1" 2>/dev/null && pwd -P) || return 0\n  ttp_c=${ttp_c%/}\n'
+            '  ttp_h=$(cd "$ttp_real_home" 2>/dev/null && pwd -P) || ttp_h=$ttp_real_home\n'
+            '  case "${ttp_h%/}/" in "$ttp_c"/*) return 0;; esac\n'
+            '  while IFS= read -r ttp_s; do\n'
+            '    [ -n "$ttp_s" ] && { [ -e "$ttp_s" ] || [ -L "$ttp_s" ]; } || continue\n'
+            '    ttp_r=$(readlink -f -- "$ttp_s" 2>/dev/null) || ttp_r=$ttp_s\n'
+            '    case "${ttp_r%/}/" in "$ttp_c"/*) return 0;; esac\n'
+            '    case "$ttp_c/" in "${ttp_r%/}"/*) return 0;; esac\n'
+            f'  done <<ttp_stores_end\n{_remote_stores()}\nttp_stores_end\n'
+            '  return 1\n}\n')
+
+
 def remote_lines(where: str, fail: str = "exit 1") -> str:
     """Shell lines for another host (runnerenv.remote_lines), after its pinned env is made: the same
     scratch HOME there, in a fresh folder inside `where` (the run's folder, removed with it), when this
@@ -141,11 +191,14 @@ def remote_lines(where: str, fail: str = "exit 1") -> str:
     out = (f'ttp_real_home="$HOME"\nttp_home=$(mktemp -d "$PWD"/{w}/{FOLDER}.XXXXXXXX) || '
            f"{{ echo 'ttp: no scratch HOME could be made on this host; the check did not run' >&2; {fail}; }}\n"
            'export TTP_HOME="${TTP_HOME:-$ttp_real_home/.tt-project}"\n'
-           # the cache in force linked in as .cache (cache_link), else the shared checks cache
-           'if [ -n "${XDG_CACHE_HOME:-}" ] && [ -d "$XDG_CACHE_HOME" ]; then ln -s "$XDG_CACHE_HOME" "$ttp_home"/.cache\n'
-           'elif [ -z "${XDG_CACHE_HOME:-}" ] && [ -d "$ttp_real_home"/.cache ]; then '
+           + _remote_guard() +
+           # the cache in force linked in as .cache (cache_link: an absolute folder, no credential
+           # store), else the shared checks cache
+           'if [ -n "${XDG_CACHE_HOME:-}" ]; then case "$XDG_CACHE_HOME" in /*) '
+           'ttp_cred_refused "$XDG_CACHE_HOME" || ln -s "$XDG_CACHE_HOME" "$ttp_home"/.cache;; esac\n'
+           'elif ! ttp_cred_refused "$ttp_real_home"/.cache; then '
            'export XDG_CACHE_HOME="$ttp_real_home"/.cache && ln -s "$XDG_CACHE_HOME" "$ttp_home"/.cache\n'
-           'else export XDG_CACHE_HOME="${XDG_CACHE_HOME:-$TTP_HOME/checks-cache}"; fi\n')
+           'else export XDG_CACHE_HOME="$TTP_HOME/checks-cache"; fi\n')
     for var, rel in KEEP.items():
         out += f'[ -z "${{{var}:-}}" ] && [ -e "$ttp_real_home"/{shlex.quote(rel)} ] && export {var}="$ttp_real_home"/{shlex.quote(rel)}\n'
     for f in files:

@@ -177,6 +177,10 @@ def test_a_check_in_the_scratch_home_reuses_the_real_tool_cache(env, tmp_path, m
     for i, bad in enumerate((home, secret, "relative/cache")):   # holds one (also by a link), is one, not absolute
         got = scratchhome.apply({"HOME": str(home), "XDG_CACHE_HOME": str(bad)}, tmp_path / f"run{i}", [".gitconfig"])
         assert not (Path(got["HOME"]) / ".cache").is_symlink() and got["XDG_CACHE_HOME"] == str(bad)
+    bare = tmp_path / "bare"   # holds a HOME with no credential store in it: refused all the same
+    (bare / "h").mkdir(parents=True)
+    assert scratchhome.cache_link({"XDG_CACHE_HOME": str(bare)}, bare / "h") is None
+    assert scratchhome.cache_link({"XDG_CACHE_HOME": str(xdg)}, bare / "h") == xdg
     (tmp_path / "homelink").symlink_to(home)
     (home / ".cache").rename(tmp_path / "cache-aside")
     (home / ".cache").symlink_to(tmp_path / "homelink")
@@ -227,6 +231,35 @@ def test_a_spilled_check_runs_in_a_scratch_home_in_its_run_folder_there(tmp_path
     assert rc == 0, said
     assert out.read_text().splitlines() == [str(rhome / ".cache"), "warm", str(rhome / ".cache")]
     assert (rhome / ".cache" / "w").exists() and _rc_left(tmp_path) == []
+    # never a cache that is or holds that host's HOME, or is, is in or holds a credential store there
+    # (as cache_link), also where a variable moves the store, nor a relative one: no link, the cache stays
+    probe = f'printf "%s\\n" "$XDG_CACHE_HOME" > {out} && (readlink "$HOME"/.cache || echo none) >> {out}'
+    (rhome / ".config" / "gh").mkdir(parents=True)
+    (rhome / ".config" / "gh" / "hosts.yml").write_text("token: x\n")
+    (rhome / ".ssh").mkdir()
+    moved = tmp_path / "moved"
+    (moved / "gh").mkdir(parents=True)
+    (moved / "gh" / "hosts.yml").write_text("token: x\n")
+    (tmp_path / "via").symlink_to(rhome / ".config")
+    for cache, extra in ((str(rhome), {}), (str(tmp_path), {}), (str(rhome / ".config"), {}),
+                         (str(tmp_path / "via"), {}), (str(rhome / ".ssh"), {}), (str(rhome / ".config" / "gh"), {}),
+                         (str(moved), {"GH_CONFIG_DIR": str(moved / "gh")}), ("rel/cache", {})):
+        rc, said = _rc_run(tmp_path, repo, probe, HOME=str(rhome), XDG_CACHE_HOME=cache, TTP_HOME="",
+                           **extra, **{scratchhome.FILES_ENV: files})
+        assert rc == 0 and out.read_text().splitlines() == [cache, "none"], (cache, said)
+    # a real .cache that is a link to that HOME: the shared checks cache instead, not linked in
+    (rhome / ".cache" / "w").unlink()
+    (rhome / ".cache").rmdir()
+    (rhome / ".cache").symlink_to(rhome)
+    rc, said = _rc_run(tmp_path, repo, probe, HOME=str(rhome), XDG_CACHE_HOME="", TTP_HOME="",
+                       **{scratchhome.FILES_ENV: files})
+    assert rc == 0 and out.read_text().splitlines() == [str(rhome / ".tt-project" / "checks-cache"), "none"], said
+    # a folder beside the stores is still linked
+    (moved / "c").mkdir()
+    rc, said = _rc_run(tmp_path, repo, probe, HOME=str(rhome), XDG_CACHE_HOME=str(moved / "c"), TTP_HOME="",
+                       GH_CONFIG_DIR=str(moved / "gh"), **{scratchhome.FILES_ENV: files})
+    assert rc == 0 and out.read_text().splitlines() == [str(moved / "c")] * 2, said
+    assert _rc_left(tmp_path) == []
     rc, said = _rc_run(tmp_path, repo, f'printf "%s" "$HOME" > {out}', HOME=str(rhome))
     assert rc == 0 and out.read_text() == str(rhome), said
 
@@ -296,3 +329,15 @@ def test_a_spill_wrapper_refusing_on_every_spill_host_for_one_reason_is_one_even
     assert checkspill.wrap_refused(p, "check-host-d", why.replace("no spill", "busy, no"), "smoke", p.config()) is False
     assert len(events()) == 1
     checkspill.note_limit(p.name, "")
+
+
+def test_a_spilled_checks_credential_store_list_follows_credguard():
+    # remote_lines' guard lists every store credguard knows, under that host's HOME and where each
+    # variable credguard reads moves it, so a store added to credguard is refused there too
+    from ttp import credguard, scratchhome
+    from pathlib import PurePosixPath
+    listed = scratchhome._remote_stores().splitlines()
+    probe = scratchhome._Marks()
+    for p in credguard._stores(PurePosixPath("/H"), probe):
+        assert f"$ttp_real_home/{PurePosixPath(p).relative_to('/H')}" in listed
+    assert probe.seen and all(any(f"${v}" in line or f"${{{v}:-}}" in line for line in listed) for v in probe.seen)

@@ -191,9 +191,10 @@ def dir_public(store: str, name: str) -> bool:
     return not any(fnmatchcase(n, first) for n in DIR_STORES[store][1])
 
 
-def _stores(home: Path) -> list[Path]:
-    """The credential files and folders but ~/.ssh's, where their variables put them (missing ones too)."""
-    env = os.environ.get
+def _stores(home: Path, environ=None) -> list[Path]:
+    """The credential files and folders but ~/.ssh's, where their variables (in `environ`, default
+    os.environ) put them (missing ones too)."""
+    env = (os.environ if environ is None else environ).get
     config = Path(env("XDG_CONFIG_HOME") or home / ".config")
     out = [Path(env("GH_CONFIG_DIR") or config / "gh") / "hosts.yml", home / ".git-credentials", home / ".netrc",
            Path(env("CLAUDE_CONFIG_DIR") or home / ".claude") / ".credentials.json",
