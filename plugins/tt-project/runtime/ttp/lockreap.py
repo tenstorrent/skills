@@ -139,9 +139,7 @@ def verdict(h: dict) -> tuple[str, str]:
     return "alive", f"pid {pid} alive"
 
 
-def _held(path: Path) -> str:
-    """"free", "shared" (read locks only) or "held" (an exclusive lock) for slot file `path`; "" when
-    it cannot be opened."""
+def _probe(path: Path) -> str:
     import fcntl
     try:
         with open(path) as f:
@@ -154,6 +152,28 @@ def _held(path: Path) -> str:
             return "held"
     except OSError:
         return ""
+
+
+def _held(path: Path) -> str:
+    """"free", "shared" (read locks only) or "held" (an exclusive lock) for slot file `path`; "" when
+    it cannot be opened. Every daemon on the host probes the same slot files, so a slot whose label
+    names no live holder (locks.holder_live) is probed locks.PROBE_TRIES times: free in any of them is
+    free, and another reader's momentary probe never makes its stale label a holder."""
+    state = _probe(path)
+    if state in ("free", ""):
+        return state
+    try:
+        if locks.holder_live(locks.read_label(path)):
+            return state
+    except (OSError, ValueError):
+        pass
+    for _ in range(locks.PROBE_TRIES - 1):
+        time.sleep(locks.PROBE_GAP_S)
+        again = _probe(path)
+        if again in ("free", ""):
+            return again
+        state = "held" if "held" in (state, again) else again
+    return state
 
 
 def label(path: Path) -> dict:

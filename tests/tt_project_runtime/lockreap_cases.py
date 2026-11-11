@@ -888,3 +888,173 @@ def test_two_projects_with_same_named_harness_folders_are_told_apart_in_lock_rec
     h = {"job_rc": str(rc), "task_id": str(tid), "project": "tt-project"}
     assert lockreap.ended_job(a, {**h, "project_root": str(a.base)})
     assert not lockreap.ended_job(a, {**h, "project_root": str(b_base)})
+
+
+_DEAD_TAKER = ("import sys; from pathlib import Path; from ttp import locks; "
+               "f = locks.try_take([Path(sys.argv[1])], sys.argv[2], 'ttp checks -- pytest'); "
+               "sys.exit(0 if f else 3)")
+
+
+def _taken_by_a_dead_process(path, holder="task #9 (run 90)"):
+    """Slot file `path` labelled by the real writer (locks.try_take) in a process that then exited: a free
+    slot whose record names a gone pid, as one a crashed or killed holder leaves."""
+    env = {k: v for k, v in os.environ.items() if k not in ("TTP_PIDNS", "TTP_RUN_DIR")}
+    subprocess.run([sys.executable, "-c", _DEAD_TAKER, str(path), holder], check=True, timeout=60,
+                   env={**env, "PYTHONPATH": str(RUNTIME)})
+    h = json.loads(path.read_text())
+    assert h["holder"] == holder and h["pid"] and h.get("pid_start")
+    return h
+
+
+def _probe_storm(path, stop):
+    """Another reader on the host probing `path` again and again: an exclusive flock held for an instant."""
+    import fcntl
+    while not stop.is_set():
+        with open(path) as f:
+            try:
+                fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                time.sleep(0.0005)
+            except OSError:
+                pass
+        time.sleep(0.002)
+
+
+def test_free_lock_dead_pid_not_holder(env, monkeypatch, tmp_path):
+    import threading
+    from ttp import checkcap, locks, lockreap
+    sd = tmp_path / "check-slots"
+    monkeypatch.setattr(checkcap, "slot_dir", lambda: sd)
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "2")
+    path = checkcap.all_paths()[0]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _taken_by_a_dead_process(path)
+    stop = threading.Event()
+    storm = threading.Thread(target=_probe_storm, args=(path, stop))
+    storm.start()
+    try:
+        for _ in range(25):   # every reader, while other readers' probes collide with its own
+            assert locks._slot_labels([path]) == []
+            assert locks.holder_records([path]) == []
+            assert lockreap._held(path) == "free"
+            s = checkcap.state()
+            assert s["running"] == [] and s["held"] == [], s
+    finally:
+        stop.set()
+        storm.join(10)
+    assert "task #9" not in checkcap.line()
+
+
+def test_live_holder_shown(env, monkeypatch, tmp_path):
+    from ttp import checkcap, locks, lockreap
+    sd = tmp_path / "check-slots"
+    monkeypatch.setattr(checkcap, "slot_dir", lambda: sd)
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "2")
+    path = checkcap.all_paths()[0]
+    f = locks.try_take([path], "task #4 (run 40)", "ttp checks -- pytest")
+    try:
+        assert locks.holder_live(locks.read_label(path))
+        assert locks._slot_labels([path]) == ["task #4 (run 40)"]
+        assert [r["holder"] for r in locks.holder_records([path])] == ["task #4 (run 40)"]
+        assert lockreap._held(path) == "held"
+        assert checkcap.state()["running"] == ["task #4 (run 40)"]
+        # A holder that died while a process it left keeps the lock is still named (lockreap frees it).
+        locks.relabel(f, {"pid": 4100, "pid_start": "11"})
+        monkeypatch.setattr(locks, "_alive", lambda pid: int(pid) != 4100)
+        assert locks._slot_labels([path]) == ["task #4 (run 40)"]
+        assert lockreap._held(path) == "held"
+    finally:
+        f.close()
+
+
+def test_tick_clears_under_lock(env, monkeypatch, tmp_path):
+    from ttp import checkcap, daemon as dm, locks
+    p = make(env)
+    sd = tmp_path / "check-slots"
+    monkeypatch.setattr(checkcap, "slot_dir", lambda: sd)
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "2")
+    stale, live = checkcap.all_paths()[:2]
+    stale.parent.mkdir(parents=True, exist_ok=True)
+    h = _taken_by_a_dead_process(stale)
+    f = locks.try_take([live], "task #4 (run 40)", "ttp checks -- pytest")
+    took = []
+    real = locks.write_label
+
+    def spy(fh, label):
+        import fcntl
+        with open(fh.name) as g:   # the clear holds the slot's own lock while it writes
+            try:
+                fcntl.flock(g, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                took.append(True)
+            except OSError:
+                took.append(False)
+        return real(fh, label)
+    monkeypatch.setattr(locks, "write_label", spy)
+    logged = []
+    real_log = dm.log
+    monkeypatch.setattr(dm, "log", lambda proj, text, *a, **k: logged.append(text) or real_log(proj, text, *a, **k))
+    try:
+        dm.Daemon(p.base).reap_locks()
+        assert any(f"cleared the stale record of free checks slot {stale.name} (task #9 (run 90), pid {h['pid']}" in t
+                   for t in logged), logged
+        assert took == [False], "written only under the slot's lock"
+        assert stale.read_text() == "{}" and json.loads(stale.read_text() or "{}") == {}, \
+            "an empty object: what older releases read as no holder"
+        assert locks.read_label(stale) == {}
+        assert locks.read_label(live)["holder"] == "task #4 (run 40)", "a live holder's record stays"
+        assert locks.clear_stale([stale, live]) == [], "nothing left to clear"
+    finally:
+        f.close()
+
+
+def test_no_race_with_acquirer(env, monkeypatch, tmp_path):
+    from ttp import locks
+    a, b = tmp_path / "checks.0.lock", tmp_path / "checks.1.lock"
+    _taken_by_a_dead_process(a)
+    # A held slot whose record names a dead pid (a holder that left a process keeping the lock) is left alone.
+    held = locks.try_take([b], "task #4 (run 40)")
+    locks.relabel(held, {"pid": 4100, "pid_start": "11"})
+    real_alive = locks._alive
+    monkeypatch.setattr(locks, "_alive", lambda pid: int(pid) != 4100 and real_alive(pid))
+    before = b.read_text()
+    assert [h["path"] for h in locks.clear_stale([a, b])] == [str(a)]
+    assert b.read_text() == before
+    held.close()
+    # A taker arriving while the clear holds a slot finds it taken and takes the next: its record is never wiped.
+    _taken_by_a_dead_process(a)
+    got = []
+    real = locks.write_label
+
+    def acquirer_meanwhile(fh, label):
+        if not got:
+            got.append(None)   # the take below writes its own label through here too
+            got[0] = locks.try_take([a, b], "task #5 (run 50)")
+        return real(fh, label)
+    monkeypatch.setattr(locks, "write_label", acquirer_meanwhile)
+    try:
+        assert [h["path"] for h in locks.clear_stale([a, b])] == [str(a)]
+        assert got[0] is not None and got[0].name == str(b)
+        assert locks.read_label(b)["holder"] == "task #5 (run 50)"
+        assert locks.read_label(a) == {}
+    finally:
+        if got and got[0]:
+            got[0].close()
+
+
+def test_running_count_live_only(env, monkeypatch, tmp_path):
+    from ttp import checkcap, locks
+    sd = tmp_path / "check-slots"
+    monkeypatch.setattr(checkcap, "slot_dir", lambda: sd)
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "3")
+    monkeypatch.setenv("TTP_CHECKS_LOAD_EXTRA", "0")
+    paths = checkcap.all_paths()
+    paths[0].parent.mkdir(parents=True, exist_ok=True)
+    for x in paths[:2]:
+        _taken_by_a_dead_process(x)
+    f = locks.try_take(paths[2:3], "task #4 (run 40)", "ttp checks -- pytest")
+    try:
+        s = checkcap.state()
+        assert s["running"] == ["task #4 (run 40)"], s
+        assert "1 running (cap 3" in checkcap.line(), checkcap.line()
+        assert "task #9" not in checkcap.line(activity=True)
+    finally:
+        f.close()

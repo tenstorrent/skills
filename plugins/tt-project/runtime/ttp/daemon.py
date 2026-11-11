@@ -12724,6 +12724,11 @@ class Daemon:
         reaper = getattr(self, "_lock_reaper", None) or lockreap.Reaper(ended=lambda h: lockreap.ended_job(self.p, h), project=self.p.base)
         self._lock_reaper = reaper
         got = reaper.sweep(lockreap.slot_files(own + shared_dirs + [checkcap.slot_dir()]), now)
+        # A free checks slot whose record still names a gone holder: cleared under that slot's lock, so
+        # no reader on the host (other projects' too, older releases included) names it again.
+        for h in locks.clear_stale(lockreap.slot_files([checkcap.slot_dir()])):
+            log(self.p, f"cleared the stale record of free checks slot {Path(h['path']).name} "
+                        f"({h.get('holder') or 'no holder'}, pid {h.get('pid') or '?'}, gone)")
         if got["released"]:
             lockreap.record(db, got["released"], now)
             for r in got["released"]:

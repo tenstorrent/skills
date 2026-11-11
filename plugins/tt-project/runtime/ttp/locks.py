@@ -889,23 +889,115 @@ def read_label(path: Path) -> dict:
     return {}
 
 
+PROBE_TRIES = 4      # slot_taken's probes of a slot whose label names no live holder
+PROBE_GAP_S = 0.015  # between them: another reader's own probe holds a free slot for microseconds
+
+
+def holder_live(h: dict) -> bool:
+    """Whether the process a slot label names lives and is the one that took it (on Linux its start time
+    matches pid_start, when the label recorded one). False for no pid, a gone or reused one, or one this
+    process cannot judge (another host or PID namespace). Cheap on purpose (no `ps`): a reader asks it of
+    every taken slot."""
+    if not _judgeable(h):
+        return False
+    try:
+        pid = int(h.get("pid") or 0)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass
+    except OSError:
+        return False
+    rec = h.get("pid_start")
+    if rec and sys.platform.startswith("linux"):
+        return str(start_time(pid) or "") == str(rec)
+    return True
+
+
+def _probe_taken(path: Path) -> bool | None:
+    try:
+        with open(path) as f:
+            try:
+                fcntl.flock(f, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                return False
+            except OSError:
+                return True
+    except OSError:
+        return None
+
+
+def slot_taken(path: Path) -> tuple[bool | None, dict | None]:
+    """(taken, label) for slot file `path`: taken when its lock is held right now (None when it cannot be
+    opened), with the label read once (None while not read; {} when it does not parse). A slot keeps its
+    last label after release and every daemon on the host probes the same files, so a failed probe on a
+    slot whose label names no live holder (holder_live) is retried PROBE_TRIES times: one free in any of
+    them is free, so another reader's momentary probe never makes a stale label a holder. A lock that
+    stays taken is held (a dead taker's lock kept by a process it left counts)."""
+    h = None
+    for i in range(PROBE_TRIES):
+        got = _probe_taken(path)
+        if not got:
+            return got, h
+        if h is None:
+            try:
+                h = read_label(path)
+            except ValueError:
+                h = {}
+            except OSError:
+                return None, None
+            if holder_live(h):
+                return True, h
+        if i < PROBE_TRIES - 1:
+            time.sleep(PROBE_GAP_S)
+    return True, h
+
+
 def _slot_labels(paths: list[Path]) -> list[str]:
-    """The holder labels of the slots among paths whose lock is taken right now (not shared); "" for a
-    taken slot whose label does not read: it is held all the same."""
+    """The holder labels of the slots among paths whose lock is taken right now (slot_taken; not
+    shared); "" for a taken slot whose label does not read: it is held all the same."""
+    out = []
+    for path in paths:
+        taken, h = slot_taken(path)
+        if taken:
+            out.append(str((h or {}).get("holder") or ""))
+    return out
+
+
+def clear_stale(paths: list[Path]) -> list[dict]:
+    """Clears the label of each slot among paths that is free and still names a holder that is gone
+    (pid_alive False, or its pid now another process's): the label becomes {} (what every release reads
+    as no holder). Only while holding that slot's lock (taken non-blocking, released at once), so a real
+    taker is never raced: one taking it meanwhile finds it taken and tries the next slot, and a slot
+    taken already is left alone. Returns the cleared labels."""
     out = []
     for path in paths:
         try:
-            with open(path) as f:
-                try:
-                    fcntl.flock(f, fcntl.LOCK_SH | fcntl.LOCK_NB)
-                    continue
-                except OSError:
-                    pass
-            out.append(str(read_label(path).get("holder") or ""))
-        except ValueError:
-            out.append("")
+            f = open(path, "a+")
         except OSError:
             continue
+        with f:
+            try:
+                fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                continue
+            try:
+                f.seek(0)
+                h = json.loads(f.read() or "{}")
+            except (OSError, ValueError):
+                continue
+            if not isinstance(h, dict) or not h or pid_alive(h) is None or holder_live(h):
+                continue
+            try:
+                write_label(f, {})
+            except OSError:
+                continue
+            out.append({**h, "path": str(path)})
     return out
 
 

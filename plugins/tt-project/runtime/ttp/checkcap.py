@@ -885,7 +885,7 @@ def shard_runs() -> list[Path]:
         found = sorted(shard_dir().glob("run.*"))
     except OSError:
         return []
-    return [f for f in found if locks.free_state(f) is False]
+    return [f for f in found if locks.slot_taken(f)[0]]   # a stale record on a free shard never counts
 
 
 @contextlib.contextmanager
