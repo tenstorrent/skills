@@ -46,6 +46,7 @@ CONFIG = Path.home() / ".config" / "tt-project" / "bridge.json"
 SOCKET_DIR = "~/.ssh/tt-agent"
 BEGIN = "# >>> tt-project access bridge (ttp bridge; managed, edits inside are replaced) >>>"
 END = "# <<< tt-project access bridge <<<"
+ENV_AGENT = "TTP_BRIDGE_AGENT"
 NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$")
 # Words that never belong in the box's block: a key file, key text, or a route that would carry
 # traffic other than one ssh login (a SOCKS proxy, a jump through this computer).
@@ -72,7 +73,8 @@ def _port(v, what: str) -> int:
 def parse(data: dict) -> dict:
     """The checked config: {"socket_dir", "boxes": {box: {"login": {...}, "agents": {agent: {...}}}}}.
     Each agent: {"agent": "env" or a socket path on this computer, "forward": [host...], "direct": [host...]}.
-    A forwarded host: {"name", "aliases", "target", "port", "adopt", "user", "host_key_alias"}; a direct
+    A forwarded host: {"name", "aliases", "target", "port", "adopt", "user", "host_key_alias", "interface"}
+    ("interface": this computer reaches the target only bound to that interface; see bridge_relay); a direct
     one: {"name", "aliases", "user"}. Raises BadConfig naming the first problem."""
     if not isinstance(data, dict):
         raise BadConfig("the config is a JSON object")
@@ -117,7 +119,8 @@ def parse(data: dict) -> dict:
                 fwd.append({"name": hn, "aliases": [_name(x, f"host {hn}: alias") for x in h.get("aliases") or []],
                             "target": target, "port": port, "adopt": bool(h.get("adopt")),
                             "user": _name(h["user"], f"host {hn}: user") if h.get("user") else "",
-                            "host_key_alias": _name(h.get("host_key_alias") or target, f"host {hn}: host_key_alias")})
+                            "host_key_alias": _name(h.get("host_key_alias") or target, f"host {hn}: host_key_alias"),
+                            "interface": _name(h["interface"], f"host {hn}: interface") if h.get("interface") else ""})
             for h in a.get("direct") or []:
                 if not isinstance(h, dict):
                     raise BadConfig(f"box {box} agent {an}: each direct entry is an object")
@@ -191,11 +194,42 @@ def ssh_argv(cfg: dict, box: str, agent: str, ssh: str | None = None) -> list[st
         argv += ["-o", _opt("IdentityAgent", _local_path(b["login"]["agent"]))]
     if b["login"]["identity"]:
         argv += ["-o", "IdentitiesOnly=yes", "-o", _opt("IdentityFile", _local_path(b["login"]["identity"]))]
-    argv += ["-o", "ForwardAgent=yes" if a["agent"] == "env" else _opt("ForwardAgent", _local_path(a["agent"]))]
+    if a["agent"] == "env":
+        # ssh points SSH_AUTH_SOCK at its IdentityAgent, so ForwardAgent=yes would forward the login's
+        # agent; the service's own agent goes under a name of its own instead.
+        argv = ["/bin/sh", "-c", f'{ENV_AGENT}="$SSH_AUTH_SOCK"; export {ENV_AGENT}; exec "$@"', "ttp-bridge",
+                *argv, "-o", f"ForwardAgent=${{{ENV_AGENT}}}"]
+    else:
+        argv += ["-o", _opt("ForwardAgent", _local_path(a["agent"]))]
     for h in a["forward"]:
-        if not h["adopt"]:
-            argv += ["-R", f"127.0.0.1:{h['port']}:{h['target']}:22"]
+        if h["adopt"]:
+            continue
+        dest = str(relay_dir(box, agent) / f"{h['name']}.sock") if h["interface"] else f"{h['target']}:22"
+        argv += ["-R", f"127.0.0.1:{h['port']}:{dest}"]
     return argv + ["--", box, remote_command(cfg, agent)]
+
+
+def relay_dir(box: str, agent: str) -> Path:
+    return HOME_DIR / "bridge-relay" / f"{box}.{agent}"
+
+
+RELAY = HOME_DIR / "bridge_relay.py"
+
+
+def service_argv(cfg: dict, box: str, agent: str, ssh: str | None = None) -> list[str]:
+    """What the service runs: the session, wrapped in the interface relay (a copy of bridge_relay.py,
+    installed by setup) when a host of it is reached through one interface."""
+    argv = ssh_argv(cfg, box, agent, ssh)
+    bound = [h for h in cfg["boxes"][box]["agents"][agent]["forward"] if h["interface"] and not h["adopt"]]
+    if not bound:
+        return argv
+    py = "/usr/bin/python3" if os.path.exists("/usr/bin/python3") else sys.executable
+    return [py, str(RELAY), str(relay_dir(box, agent)),
+            *[f"{h['name']}={h['target']}%{h['interface']}" for h in bound], "--", *argv]
+
+
+def install_relay() -> None:
+    durable_write(RELAY, (Path(__file__).with_name("bridge_relay.py")).read_bytes())
 
 
 def render_block(cfg: dict, box: str) -> str:
@@ -363,7 +397,10 @@ def setup(cfg: dict, boxes: list[str], platform: str | None = None) -> list[str]
     for box in boxes:
         out.append(f"{box}: {write_block(cfg, box)}")
         for an in cfg["boxes"][box]["agents"]:
-            out.append(f"{box} {an}: {start(box, an, ssh_argv(cfg, box, an), platform)}")
+            argv = service_argv(cfg, box, an)
+            if argv[1:2] == [str(RELAY)]:
+                install_relay()
+            out.append(f"{box} {an}: {start(box, an, argv, platform)}")
     return out
 
 

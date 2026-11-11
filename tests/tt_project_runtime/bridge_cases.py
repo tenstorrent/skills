@@ -51,7 +51,9 @@ def test_bridge_session_forwards_one_agent_and_only_ssh_ports_on_its_own_connect
     argv = bridge.ssh_argv(cfg, "box-1", "auto", ssh="ssh")
     line = " ".join(argv)
     assert "ControlMaster=no" in line and "ControlPath=none" in line and "ExitOnForwardFailure=yes" in line
-    assert "ForwardAgent=yes" in argv   # 'env': this computer's SSH_AUTH_SOCK
+    # 'env': the service's own SSH_AUTH_SOCK, under a name ssh's IdentityAgent does not overwrite
+    assert argv[:2] == ["/bin/sh", "-c"] and 'TTP_BRIDGE_AGENT="$SSH_AUTH_SOCK"' in argv[2] and argv[4] == "ssh"
+    assert "ForwardAgent=${TTP_BRIDGE_AGENT}" in argv and "ForwardAgent=yes" not in argv
     assert argv[argv.index("-R") + 1] == "127.0.0.1:2301:build-a.example.com:22"
     assert argv.count("-R") == 1   # the adopted port is someone else's forward
     assert "-D" not in argv and "-L" not in argv and "ProxyJump" not in line   # no route for other traffic
@@ -129,3 +131,54 @@ def test_bridge_service_runs_the_session_and_restarts_it(tmp_path, monkeypatch):
     assert pl["Label"] == "com.tt-project.bridge.box-1.auto" and pl["KeepAlive"] and pl["ProgramArguments"] == argv
     unit = bridge.systemd_unit("box-1", "auto", argv)
     assert "Restart=always" in unit and "$$SSH_AUTH_SOCK" in unit   # systemd would expand a bare $VAR
+
+
+def test_bridge_interface_hosts_go_through_the_relay_socket(tmp_path, monkeypatch):
+    from ttp import bridge
+    monkeypatch.setattr(bridge, "HOME_DIR", tmp_path)
+    monkeypatch.setattr(bridge, "RELAY", tmp_path / "bridge_relay.py")
+    cfg = _bridge_cfg()
+    cfg["boxes"]["box-1"]["agents"]["auto"]["forward"][0]["interface"] = "vpn0"
+    argv = bridge.ssh_argv(cfg, "box-1", "auto", ssh="ssh")
+    sock = tmp_path / "bridge-relay" / "box-1.auto" / "build-a.sock"
+    assert argv[argv.index("-R") + 1] == f"127.0.0.1:2301:{sock}"
+    svc = bridge.service_argv(cfg, "box-1", "auto", ssh="ssh")
+    assert svc[1:4] == [str(tmp_path / "bridge_relay.py"), str(sock.parent), "build-a=build-a.example.com%vpn0"]
+    assert svc[svc.index("--") + 1:] == argv
+    assert bridge.service_argv(_bridge_cfg(), "box-1", "auto", ssh="ssh")[0] == "/bin/sh"   # no relay without one
+
+
+def test_bridge_relay_carries_one_connection_and_exits_with_its_session(tmp_path, monkeypatch):
+    import socket
+    import threading
+    from ttp import bridge_relay
+    assert bridge_relay.parse_spec("h=10.0.0.2%vpn0") == ("h", "10.0.0.2", "vpn0")
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    port = srv.getsockname()[1]
+
+    def echo():
+        c, _ = srv.accept()
+        c.sendall(b"SSH-2.0-test\r\n" + c.recv(10))
+        c.close()
+
+    threading.Thread(target=echo, daemon=True).start()
+    seen = []
+    monkeypatch.setattr(bridge_relay, "bound_connect",
+                        lambda host, iface: seen.append((host, iface)) or socket.create_connection(("127.0.0.1", port)))
+    path = str(tmp_path / "h.sock")
+    bridge_relay.listen(path, "10.0.0.2", "vpn0")
+    assert oct(os.stat(path).st_mode & 0o777) == "0o600"
+    c = socket.socket(socket.AF_UNIX)
+    c.connect(path)
+    c.sendall(b"ping")
+    data = b""
+    while len(data) < 18:
+        chunk = c.recv(64)
+        if not chunk:
+            break
+        data += chunk
+    assert data == b"SSH-2.0-test\r\nping" and seen == [("10.0.0.2", "vpn0")]
+    rc = bridge_relay.main([str(tmp_path / "d"), "x=10.0.0.3%vpn0", "--", sys.executable, "-c", "raise SystemExit(7)"])
+    assert rc == 7 and not (tmp_path / "d" / "x.sock").exists()

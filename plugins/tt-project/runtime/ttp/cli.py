@@ -2313,7 +2313,7 @@ def cmd_bridge(a) -> None:
             print(bridge.render_block(cfg, box))
             for an in cfg["boxes"][box]["agents"]:
                 print(f"# {box} {an}: session command")
-                print(" ".join(shlex.quote(w) for w in bridge.ssh_argv(cfg, box, an)))
+                print(" ".join(shlex.quote(w) for w in bridge.service_argv(cfg, box, an)))
         return
     if a.action == "setup":
         try:
