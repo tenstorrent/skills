@@ -1259,7 +1259,10 @@ def check_env(mode: str, tip: str = "", run_dir: str | None = None, branch: str 
     except ValueError:
         on, files = True, []
     if on:
-        env = scratchhome.apply(env, checkdirs.scratch(env) or scratchhome.own_folder(), files)
+        # A process that is itself a check (FILES_ENV: a harness test, a nested `ttp checks`) inherits its run's
+        # managed scratch, whose HOME is the one it runs under: its own checks get a HOME of their own.
+        inside = os.environ.get(scratchhome.FILES_ENV) is not None
+        env = scratchhome.apply(env, (None if inside else checkdirs.scratch(env)) or scratchhome.own_folder(), files)
     return runnerenv.apply(env, lock or check_lock)
 
 

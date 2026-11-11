@@ -104,6 +104,29 @@ def test_every_check_env_caller_passes_the_project_config_or_runs_where_check_cf
             assert "cfg=" in call, f"{f.name}: push.check_env({call}"
 
 
+def test_check_env_inside_a_check_never_builds_its_home_in_the_runs_scratch_home(tmp_path, monkeypatch):
+    # A harness test under a guarded `ttp checks` inherits the run's guard, output dir and FILES_ENV: a
+    # check_env it calls gets a HOME of its own, never the run's scratch HOME the test session runs under,
+    # whose .gitconfig stays as it was.
+    from ttp import checkdirs, push, scratchhome
+    home = _real_home(tmp_path, monkeypatch)
+    output = tmp_path / "check-reports" / "r1"
+    output.mkdir(parents=True)
+    (tmp_path / "run").mkdir()
+    outer = tmp_path / checkdirs.FOLDER / "r1" / checkdirs.SCRATCH / scratchhome.FOLDER
+    outer.mkdir(parents=True)
+    (outer / ".gitconfig").write_text("[user]\n\tname = Outer Run\n")
+    monkeypatch.setenv("TTP_CHECKS_TMP_FD", "9")
+    monkeypatch.setenv("TTP_CHECK_OUTPUT_DIR", str(output))
+    monkeypatch.setenv(scratchhome.FILES_ENV, '[".gitconfig"]')
+    got = push.check_env("checks", run_dir=str(tmp_path / "run"), cfg={})
+    assert got["HOME"] == f"{scratchhome.own_folder()}/home" and got["HOME"] != str(outer)
+    assert (outer / ".gitconfig").read_text() == "[user]\n\tname = Outer Run\n"
+    assert Path(got["HOME"], ".gitconfig").read_text() == (home / ".gitconfig").read_text()
+    monkeypatch.delenv(scratchhome.FILES_ENV)   # the run's own process (`ttp checks`): the managed scratch
+    assert push.check_env("checks", run_dir=str(tmp_path / "run"), cfg={})["HOME"] == str(outer)
+
+
 def test_checks_home_files_refuses_credentials_ssh_gh_and_paths_outside_home(tmp_path, monkeypatch):
     # (c) a credential store (also by a symlink or a folder holding one), ~/.ssh, gh's config and a path
     # leaving HOME are refused by the setting and never copied by apply, given one anyway.

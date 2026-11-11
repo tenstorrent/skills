@@ -1155,6 +1155,23 @@ def test_gate_judge_reads_a_narrow_terminals_failure_and_never_reuses_a_saved_ba
     assert calls == ["base", "head"] and v["pre_existing"] == [a] and v["other_failure"] == []
 
 
+
+def test_gate_judge_matches_identical_teardown_errors_that_have_no_e_line_or_location():
+    # A teardown ERROR a fixture raised with pytest.fail shows only its message: base and head showing the same
+    # one (in their own temp folders) fail the same way; a different message is another way.
+    from ttp import gatejudge
+    t = "tests/test_a.py::test_x"
+
+    def out(where, what="a child of this test was handed the account's home {w}/home"):
+        return ("==== ERRORS ====\n____ ERROR at teardown of test_x ____\n" + what.format(w=where) +
+                "\n---- Captured stdout call ----\nnoise\n==== short test summary info ====\n")
+    head = gatejudge.marks(out("/dev/shm/ttp-3014/199bfcbc"), [t])[t]
+    base = gatejudge.marks(out("/dev/shm/ttp-3015/7a0e4c21"), [t])[t]
+    assert head["line"] and gatejudge.same_failure(head, base), (head, base)
+    other = gatejudge.marks(out("/dev/shm/ttp-3014/199bfcbc", "tests wrote outside their temp folders: {w}"), [t])[t]
+    assert not gatejudge.same_failure(head, other), (head, other)
+    assert not gatejudge.same_failure(gatejudge.marks("", [t])[t], gatejudge.marks("", [t])[t])
+
 _NESTED = '''import json, os, subprocess, sys
 
 

@@ -231,13 +231,16 @@ def marks(output: str, ids: list[str]) -> dict[str, dict]:
     """How each of `ids` failed in a rerun's output: {"line": its traceback's first `E` line, "msg": its
     summary message, "src": the statement that failed (the traceback's last `>` line), "at": its last
     `file:line: Error` location (file name only, the checkouts differ)}, each '' when the output does not
-    show it."""
+    show it. A block with no `E` line and no location (a teardown or setup ERROR a fixture raised with
+    pytest.fail) has its first non-empty line as "line" instead, normalised like the rest."""
     blocks, msgs = sharedchecks.failure_blocks(output, ids), sharedchecks.summary_msgs(output)
     got = {}
     for i in ids:
         b = blocks[i]
         line = next((ln[1:] for ln in b.splitlines() if ln.startswith("E ")), "")
         at = _AT.findall(b)
+        if not line and not at:
+            line = next((ln for ln in b.splitlines() if ln.strip()), "")
         src = [ln[1:] for ln in b.splitlines() if ln.startswith(">")]
         got[i] = {"line": _mark_norm(line), "msg": _mark_norm(msgs.get(i, "")), "src": _mark_norm(src[-1] if src else ""),
                   "at": f"{Path(at[-1][0]).name}:{at[-1][1]}: {at[-1][2]}" if at else ""}
