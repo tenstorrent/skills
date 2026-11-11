@@ -21,7 +21,7 @@ import shlex
 import subprocess
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -2011,6 +2011,14 @@ def parse_start_after(raw: Any, now: float | None = None, tz: str | None = None)
         zone = ZoneInfo(timefmt.valid(tz)) if timefmt.valid(tz) else None
         day = datetime.fromtimestamp(now, zone).date().isoformat()
         s = f"{day}T{int(clock[1]):02d}:{clock[2]}{clock[3] or ''}"
+    if isinstance(raw, str) and (hm := re.fullmatch(r"([0-9]{1,2}):([0-9]{2})( [A-Za-z]{2,5})?", s)):
+        # A clock time alone (user msg #2116: the meaning is clear): its next time in the home zone.
+        zone = ZoneInfo(timefmt.valid(tz)) if timefmt.valid(tz) else None
+        day = datetime.fromtimestamp(now, zone).date()
+        for d in (day, day + timedelta(days=1)):
+            if (at := parse_start_after(f"{d.isoformat()}T{int(hm[1]):02}:{hm[2]}{hm[3] or ''}", now, tz)):
+                return at
+        return None
     if not isinstance(raw, str) or not re.fullmatch(START_AFTER_RE, s):
         raise ValueError(f"start_after {raw!r}: use a delay such as 90m, 6h or 3d, an ISO date or time "
                          f"such as 2026-10-05T09:00, or now")
@@ -3071,10 +3079,11 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 if why := cells.problem(a.get("spec")):
                     raise ValueError(f"task_add rejected: {why}")
                 kind, pr_ask = _delivery_kind(a.get("kind") or "work", title + "\n" + (a.get("spec") or ""))
-                for oid in owes:   # an order its spec names is one this kind can carry (obligations.unfit_owner)
+                for oid in list(owes):   # an order its spec names that this kind cannot carry: named, not owned
                     if why := obligations.unfit_owner(db, ((obligations.get(db, oid) or {}).get("promise") or {})
                                                       .get("class"), [], kind=kind):
-                        raise ValueError(f"task_add rejected: its spec names order {oid}, and {why}")
+                        owes.remove(oid)
+                        notes.append(f"task_add: its spec names order {oid}, but it is not attached as an owner: {why}")
                 pin = _task_pin(cfg, a, pin_of(old or followup))
                 labels += _pin_mark(db, a.get("pin_required"), pin, old or followup)
                 if a.get("untrusted_input") is True or untrusted.spec_sources(a.get("spec") or ""):
@@ -3394,8 +3403,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     why = prguard.spec_problem(db, spec)
                     if why:
                         raise DraftGateRejection(f"#{task['id']} rejected: {why}")
-                    try:
-                        obligations.spec_check(db, spec, task["id"], attaching)
+                    try:   # a named key it does not own yet: attached once the spec is written (below)
+                        adopt = obligations.spec_check(db, spec, task["id"], attaching, adopt=True)
                     except ValueError as e:
                         raise ValueError(f"#{task['id']} rejected: {e}") from None
                     if why := cells.problem(spec):
@@ -3464,6 +3473,15 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                          (time.time(), "coordinator", untrusted.CLEARED_KIND, "low",
                           f"#{task['id']}: {untrusted.LABEL} cleared: {cleared}"[:1000],
                           json.dumps({"why": cleared}), "handled", task["id"]))
+                for oid in adopt if spec else []:   # its spec names it: it owns it, unless it cannot (fit_owners)
+                    o = obligations.get(db, oid)
+                    fit, left = obligations.fit_owners(db, [task["id"]], (o.get("promise") or {}).get("class"),
+                                                       o["owners"])
+                    if fit:
+                        obligations.attach(p, oid, fit)
+                        batch_obls.append(oid)
+                    notes.append(f"task_update: #{task['id']} " + (f"attached as an owner of obligation {oid}, which "
+                                 f"its spec names" if fit else f"names obligation {oid}: {left[0]}"))
                 for h in history:   # the append-only history of what the live spec no longer says
                     db.x("INSERT INTO events(ts,source,kind,severity,text,data,status,task) VALUES(?,?,?,?,?,?,?,?)",
                          (time.time(), "coordinator", STEP_REPLACED_KIND, "low",
@@ -4170,6 +4188,20 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                                      f"words, with its msg #N; put names and terms in backticks, or record it "
                                      f"without the user's-words label")
                 oid, owners = str(a.get("key") or "").strip(), [int(x) for x in a.get("owners") or []]
+                if oid and a.get("order") is not None and (o := obligations.get(db, oid)) \
+                        and not obligations._open(o):   # closed: the order is a new one (user msg #2116)
+                    notes.append(f"obligation {oid} is closed: the order of message #{a['order']} is recorded "
+                                 f"as a new one")
+                    a = {**a, "text": a.get("text") or o["text"],
+                         "action_class": a.get("action_class") or (o.get("promise") or {}).get("class")}
+                    oid = ""
+                if owners:   # a closed or unfit owner is left out with a note, never the whole action
+                    o = obligations.open_order(db, int(a["order"])) if a.get("order") is not None and not oid \
+                        else obligations.get(db, oid) if oid else None
+                    cls = a.get("action_class") if a.get("order") is not None and not oid \
+                        else ((o or {}).get("promise") or {}).get("class")
+                    owners, left = obligations.fit_owners(db, owners, cls, (o or {}).get("owners") or {})
+                    notes += [f"obligation {oid or '(order)'}: {x}" for x in left]
                 if a.get("order") is not None and not oid:   # the order a user message carries
                     had = obligations.open_order(db, int(a["order"]))
                     move = had is not None and a.get("due") not in (None, "") \
@@ -4188,7 +4220,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                             obligations.attach(p, oid, owners)
                             batch_obls.append(oid)
                     fan_orders.append((oid, int(a["order"]), a.get("supersedes") or []))
-                elif a.get("due") not in (None, "") and oid and not owners \
+                elif a.get("due") not in (None, "") and oid and not a.get("owners") \
                         and not any(str(a.get(f) or "").strip() for f in ("evidence", "why")):
                     due_moves.append((i, a, oid, None))   # after the batch: a missed one needs its plan change (replan)
                 elif not oid:
@@ -4207,6 +4239,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     # Delivered already: an owner or milestone more changes nothing owed (no rejection).
                     notes.append(f"obligation {oid} already has its receipt: owners and milestones not added, "
                                  f"nothing is owed")
+                elif a.get("owners") and not owners and not a.get("milestones"):
+                    pass   # every owner was left out, each with its note
                 elif owners or a.get("milestones"):
                     with db.tx():
                         if a.get("milestones"):
@@ -7949,6 +7983,8 @@ def _apply_due_moves(p: Project, actions: list, moves: list, failed: set, proble
             notes.append(obligations.set_due(p, oid, a["due"], plan=plans.get(oid) or own, user=user))
             if str(a.get("justify") or "").strip():
                 notes.append(eta.justify(p, oid, str(a["justify"])))
+        except obligations.DueNote as e:   # nothing owed changes: a note, not a rejection (user msg #2116)
+            notes.append(f"obligation: {e}")
         except Exception as e:
             failed.add(i)
             problems.append(f"obligation: {e}")

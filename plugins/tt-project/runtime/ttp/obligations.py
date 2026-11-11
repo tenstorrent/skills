@@ -132,10 +132,11 @@ def named(text: str) -> list[str]:
     return keys
 
 
-def spec_check(db, text: str, tid: int | None = None, attaching=()) -> list[str]:
+def spec_check(db, text: str, tid: int | None = None, attaching=(), adopt: bool = False) -> list[str]:
     """For a coordinator task_add (`tid` None) or task_update spec: the open obligations it names that a new
     task is to be attached to. Raises ValueError for a key that does not exist, or one an updated task does
-    not own and no `(key, tid)` in `attaching` (the same batch's obligation actions) attaches."""
+    not own and no `(key, tid)` in `attaching` (the same batch's obligation actions) attaches; with `adopt`,
+    returns those instead, for the caller to attach (user msg #2116: the meaning is clear)."""
     st, attach, unknown, unowned = _load(db), [], [], []
     for oid in named(text):
         o = st["items"].get(oid)
@@ -150,6 +151,8 @@ def spec_check(db, text: str, tid: int | None = None, attaching=()) -> list[str]
     if unknown:
         raise ValueError(f"its spec names obligation {', '.join(unknown)}, which does not exist: record it first "
                          f"(an `obligation` action with `text`, then name the key it gets), or drop the key")
+    if unowned and adopt:
+        return unowned
     if unowned:
         raise ValueError(f"its spec names obligation {', '.join(unowned)}, which #{tid} does not own: attach it in "
                          f"the same batch (an `obligation` action with `key` and `owners`: [{tid}]), or drop the key")
@@ -477,7 +480,8 @@ def record(p, oid: str, kind: str, evidence: str, task: int | None, now: float |
                 raise ValueError("a milestone requires a receipt, not general progress")
             m = (o.get("milestones") or {}).get(milestone)
             if not m:
-                raise ValueError(f"no milestone {milestone} on {oid}")
+                raise ValueError(f"no milestone {milestone} on {oid}; its milestones: "
+                                 f"{', '.join(sorted(o.get('milestones') or {})) or 'none'}")
             if not m["receipt"]:
                 m["receipt"] = {"at": now, "task": task, "evidence": evidence}
                 if m["raised"] is not None:
@@ -1856,6 +1860,27 @@ def _hours(p) -> float:
         return PROMISE_DEFAULT_H
 
 
+class DueNote(ValueError):
+    """A due move that changes nothing owed (the obligation is closed, or has no due to move): the
+    coordinator records it as a note, never a rejection (user msg #2116); the CLI still refuses it."""
+
+
+def fit_owners(db, tids, cls: str | None, owned=()) -> tuple[list[int], list[str]]:
+    """The tasks among `tids` that can own an obligation (of order class `cls`; `owned`: its owners now),
+    and why each other one cannot: a closed task not yet an owner, or a kind that cannot carry the order
+    (unfit_owner). The coordinator attaches the fit ones and notes the rest, never refusing the action."""
+    keep, out = [], []
+    for tid in tids or []:
+        t = db.task(int(tid))
+        if t and str(tid) not in {str(x) for x in owned} and t["status"] in CLOSED:
+            out.append(f"#{tid} is {t['status']}, so not attached: attach the task that will produce it")
+        elif t and (why := unfit_owner(db, cls, [tid])):
+            out.append(f"not attached: {why}")
+        else:
+            keep.append(int(tid))
+    return keep, out
+
+
 def unfit_owner(db, cls: str | None, tids, kind: str | None = None) -> str | None:
     """Why tasks `tids` cannot own an order of class `cls`, or None when they fit. `kind`: the kind of a
     task not added yet (a task_add naming the order), checked instead of reading `tids`."""
@@ -2259,10 +2284,11 @@ def set_due(p, oid: str, due, now: float | None = None, plan: str | None = None,
         st = _load(p.db)
         o = _need(st, oid)
         if _open(o) and not o.get("promise"):   # still owed: retrying the move cannot help, closing can
-            raise ValueError(f"{oid} is open but has no promise or due to move: close it with evidence "
+            raise DueNote(f"{oid} is open but has no promise or due to move: close it with evidence "
                              f"(receipt) or why (drop)")
-        if not o.get("promise") or not _open(o):
-            raise ValueError(f"{oid} is not an open order, promise or claim")
+        if not _open(o):
+            raise DueNote(f"{oid} is already closed ({'dropped' if o.get('dropped') else 'receipt recorded'}): "
+                          f"its due was not moved, and nothing is owed")
         pr = o["promise"]
         late = replan.missed(pr, now)
         refused = late and not plan and user is None

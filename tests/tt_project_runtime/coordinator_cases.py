@@ -15170,10 +15170,12 @@ def test_obligation_add_with_a_refused_owner_leaves_nothing_and_drop_withdraws(e
         with pytest.raises(ValueError):
             ob.add(p, "the urgent report", owners, now=now)
     assert ob.items(p.db) == [] and p.db.task(tid)["spec"] == spec, "a refused add writes nothing"
-    assert coord.apply(p, [{"type": "obligation", "text": "the urgent report", "owners": [closed]}]) != []
-    assert ob.items(p.db) == []
     oid = ob.add(p, "the urgent report", [tid], now=now)
     assert oid == "o1", "a refused add uses no id"
+    # The coordinator's add leaves the finished owner out with a note and records the rest (#2116).
+    assert coord.apply(p, [{"type": "obligation", "text": "another report", "owners": [closed, tid]}]) == []
+    assert list(ob.get(p.db, "o2")["owners"]) == [str(tid)] and f"#{closed} is done" in " ".join(p.db.kv(coord.NOTES_KEY))
+    ob.drop(p, "o2", "a test fixture")
     monkeypatch.chdir(p.root)
     cli.main(["obligation", "drop", oid, "recorded by mistake", "--project", p.name])
     assert ob.get(p.db, oid)["dropped"]["why"] == "recorded by mistake"
@@ -15181,9 +15183,9 @@ def test_obligation_add_with_a_refused_owner_leaves_nothing_and_drop_withdraws(e
     assert "dropped" in ob.lines(p.db)[0]
     with pytest.raises(ValueError, match="dropped"):
         ob.attach(p, oid, [tid])
-    o2 = ob.add(p, "another", now=now)
-    assert coord.apply(p, [{"type": "obligation", "key": o2, "why": "no longer wanted"}]) == []
-    assert ob.get(p.db, o2)["dropped"]["by"] == "coordinator"
+    o3 = ob.add(p, "another", now=now)
+    assert coord.apply(p, [{"type": "obligation", "key": o3, "why": "no longer wanted"}]) == []
+    assert ob.get(p.db, o3)["dropped"]["by"] == "coordinator"
 
 
 
@@ -15219,13 +15221,18 @@ def test_task_spec_naming_an_obligation_needs_it_to_exist_and_be_owned(env, monk
     assert str(new) in ob.get(p.db, oid)["owners"] and f"## Obligation {oid} " in p.db.task(new)["spec"]
     assert "progress" in ob.record(p, oid, "progress", "commit abc123", new)
 
-    spec = p.db.task(tid)["spec"]
+    # An updated task whose spec names a key it does not own is attached to it (#2116), as the batch's
+    # own attach would; a review task cannot carry a change order: named only, with a note.
     out = coord.apply(p, [{"type": "task_update", "id": tid, "spec": f"Also record obligation {oid} progress."}])
-    assert len(out) == 1 and "does not own" in out[0] and p.db.task(tid)["spec"] == spec
-    assert str(tid) not in ob.get(p.db, oid)["owners"]
-    assert coord.apply(p, [{"type": "task_update", "id": tid, "spec": f"Also record obligation {oid} progress."},
-                           {"type": "obligation", "key": oid, "owners": [tid]}]) == [], "the batch attaches it"
-    assert str(tid) in ob.get(p.db, oid)["owners"] and "Also record obligation" in p.db.task(tid)["spec"]
+    assert out == [] and str(tid) in ob.get(p.db, oid)["owners"], out
+    assert "Also record obligation" in p.db.task(tid)["spec"] and f"## Obligation {oid} " in p.db.task(tid)["spec"]
+    assert f"#{tid} attached as an owner of obligation {oid}" in " ".join(p.db.kv(coord.NOTES_KEY) or [])
+    rev = p.db.add_task("a review", "s", kind="review", tier="light", origin="coordinator")
+    m = p.db.post("in", "change the report", chat="c1")
+    order = ob.add_order(p, "change it", m, [tid], action_class="change").split()[1]
+    assert coord.apply(p, [{"type": "task_update", "id": rev, "spec": f"Check the work for obligation {order}."}]) == []
+    assert rev not in ob.get(p.db, order)["promise"]["tasks"] and str(rev) not in ob.get(p.db, order)["owners"]
+    assert "is a review task" in " ".join(p.db.kv(coord.NOTES_KEY) or [])
     assert coord.apply(p, [{"type": "task_update", "id": tid, "spec": f"Obligation {oid}: hurry."}]) == []
 
     gone = ob.add(p, "no longer wanted", now=now)
@@ -15540,6 +15547,23 @@ def test_a_bare_clock_time_is_read_in_the_home_zone_never_refused(env):
     p = make(env)
     assert coord.apply(p, [{"type": "look", "at": "23:59", "text": "check the soak"}]) == []
     assert len(looks.pending(p.db)) == 1
+
+
+
+def test_start_after_reads_a_bare_clock_time_as_its_next_time_in_the_home_zone(env):
+    """Two `look` actions in a day were refused for '15:17': a clock time alone means its next time in the
+    home zone (#2116), today if still ahead, else tomorrow; a wrong zone or a bad time still refuses."""
+    from datetime import datetime, timezone
+    from ttp import coordinator
+    tz, now = "America/Los_Angeles", datetime(2026, 10, 13, 22, 0, tzinfo=timezone.utc).timestamp()   # 15:00 PDT
+    assert coordinator.parse_start_after("15:17", now=now, tz=tz) == now + 17 * 60
+    assert coordinator.parse_start_after("15:17 PDT", now=now, tz=tz) == now + 17 * 60
+    assert coordinator.parse_start_after("9:05", now=now, tz=tz) == \
+        datetime(2026, 10, 14, 16, 5, tzinfo=timezone.utc).timestamp()
+    with pytest.raises(ValueError, match="not the home zone"):
+        coordinator.parse_start_after("15:17 EDT", now=now, tz=tz)
+    with pytest.raises(ValueError):
+        coordinator.parse_start_after("25:99", now=now, tz=tz)
 
 
 
@@ -21266,11 +21290,13 @@ def test_obligation_actions_on_a_delivered_obligation_are_noted_not_rejected(env
         assert "receipt" in " ".join(p.db.kv(coord.NOTES_KEY) or []), a
     assert ob.get(p.db, oid) == before, "nothing changed"
     assert coord.effort_triggers(p.db, p.config(), [], None)[0] == []
-    # Still refused: an obligation that is owed cannot take a finished task as its producer.
+    # An owed obligation never takes a finished task as its producer: left out with a note, not a rejection.
     owed = ob.add(p, "another report", now=now)
-    out = coord.apply(p, [{"type": "obligation", "key": owed, "owners": [tid]}])
-    assert len(out) == 1 and "attach the task that will produce it" in out[0]
-    assert not coord.informational_rejection(out[0])
+    assert coord.apply(p, [{"type": "obligation", "key": owed, "owners": [tid]}]) == []
+    assert "attach the task that will produce it" in " ".join(p.db.kv(coord.NOTES_KEY) or [])
+    assert ob.get(p.db, owed)["owners"] == {}
+    with pytest.raises(ValueError, match="attach the task that will produce it"):   # the CLI still refuses it
+        ob.attach(p, owed, [tid])
 
 
 def test_information_only_refusals_ride_along_and_real_rules_still_raise_a_turn(env):
@@ -24033,9 +24059,9 @@ def test_a_spec_naming_a_closed_delivered_or_order_owned_key_is_a_citation(env, 
         spec = f"Background: obligation {key} was settled earlier."
         assert coord.apply(p, [{"type": "task_update", "id": tid, "spec": spec}]) == [], key
     assert coord.apply(p, [{"type": "task_update", "id": other, "spec": f"Record obligation {owed} progress."}]) == []
-    out = coord.apply(p, [{"type": "task_update", "id": tid, "spec": f"Also obligation {owed}."}])
-    assert len(out) == 1 and "does not own" in out[0], "an open key still needs its owner"
     assert ob.open_keys_by_task(p.db) == {other: [owed]}
+    out = coord.apply(p, [{"type": "task_update", "id": tid, "spec": f"Also obligation {owed}."}])
+    assert out == [] and str(tid) in ob.get(p.db, owed)["owners"], "an open key it names: attached (#2116)"
     row = next(x for x in coord.digest(p, {}, [], []).splitlines() if x.startswith(f"- #{other} |"))
     assert f"(owns {owed})" in row
 

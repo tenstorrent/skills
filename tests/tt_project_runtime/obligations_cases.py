@@ -140,10 +140,10 @@ def test_obligation_with_every_owner_ended_is_reowned_once_its_wake_was_handled(
         p.db.update_task(t, status="done")
     t0 = now + 2 * 3600 + 60
     assert len(check(t0)) == 1, "the no-live-owner wake"
-    # Its turn names a task that finished meanwhile: the attach is rejected, nothing is attached.
+    # Its turn names a task that finished meanwhile: left out with a note (#2116), nothing is attached.
     late = p.db.add_task("continue: CI read", "s", kind="work", tier="light", status="done")
-    problems = coord.apply(p, [{"type": "obligation", "key": oid, "owners": [late]}])
-    assert problems and "is done" in problems[0], problems
+    assert coord.apply(p, [{"type": "obligation", "key": oid, "owners": [late]}]) == []
+    assert f"#{late} is done" in " ".join(p.db.kv(coord.NOTES_KEY) or [])
     assert len(check(t0 + 600)) == 1, "an unanswered wake: the daemon waits for the turn"
     _handle_overdue(p)
     p.db.x("INSERT INTO runs(task, role, status, started) VALUES(NULL, 'coordinator', 'running', ?)", (t0,))
@@ -449,13 +449,16 @@ def test_a_change_or_device_order_is_never_owned_by_a_question_plan_or_review_ta
     note = ob.add_order(p, "change it", mid, [kinds["code"], tid], action_class="change")
     oid = note.split()[1]
     # A later attach through the coordinator's action, and a task_add whose spec names the order.
-    probs = coord.apply(p, [{"type": "obligation", "key": oid, "owners": [kinds["plan"]]}])
-    assert len(probs) == 1 and "is a plan task, which cannot carry a change order" in probs[0], probs
+    # The coordinator leaves the unfit owner out with a note, never rejecting the action (user msg #2116).
+    assert coord.apply(p, [{"type": "obligation", "key": oid, "owners": [kinds["plan"]]}]) == []
+    assert "is a plan task, which cannot carry a change order" in " ".join(p.db.kv(coord.NOTES_KEY) or [])
     assert str(kinds["plan"]) not in ob.get(p.db, oid)["owners"]
     n = p.db.one("SELECT COUNT(*) n FROM tasks")["n"]
-    probs = coord.apply(p, [{"type": "task_add", "title": "look at it", "spec": f"answer for obligation {oid}", "kind": "question"}])
-    assert len(probs) == 1 and f"its spec names order {oid}" in probs[0], probs
-    assert p.db.one("SELECT COUNT(*) n FROM tasks")["n"] == n, "the refused task_add created a task"
+    assert coord.apply(p, [{"type": "task_add", "title": "look at it", "spec": f"answer for obligation {oid}",
+                            "kind": "question"}]) == []
+    assert f"its spec names order {oid}, but it is not attached" in " ".join(p.db.kv(coord.NOTES_KEY) or [])
+    assert p.db.one("SELECT COUNT(*) n FROM tasks")["n"] == n + 1, "the task_add was dropped"
+    assert ob.get(p.db, oid)["promise"]["tasks"] == sorted([kinds["code"], tid])
     assert coord.apply(p, [{"type": "obligation", "key": oid, "owners": [kinds["harness"]]}]) == []
     # The same message's order turned into a device order keeps the fit of the owners it has.
     q = p.db.post("in", "read the log", chat="c1")
@@ -521,7 +524,7 @@ def test_the_daily_audit_counts_user_orders_unstarted_past_30_minutes_over_7_day
 
 def test_set_due_refusal_says_a_plain_open_obligation_is_open_and_how_to_close_it(env, monkeypatch):
     """A due move on an open obligation with no promise names it open and the way to close it (evidence
-    or why); an unknown or closed key keeps the old message; an order's due still moves."""
+    or why); a closed one says it is closed; an unknown key is refused; an order's due still moves."""
     from ttp import obligations as ob
     p, d, now, tid, check, mid, raised = _order_setup(env, monkeypatch)
     plain = ob.add(p, "ship the report", [tid], by="coordinator", now=now)
@@ -533,11 +536,11 @@ def test_set_due_refusal_says_a_plain_open_obligation_is_open_and_how_to_close_i
     with pytest.raises(ValueError, match="no obligation"):
         ob.set_due(p, "o999", now + 3600, now=now)
     ob.drop(p, plain, "recorded by mistake", by="coordinator", now=now)
-    with pytest.raises(ValueError, match="is not an open order, promise or claim"):
+    with pytest.raises(ob.DueNote, match="already closed \\(dropped\\)"):
         ob.set_due(p, plain, now + 3600, now=now)
     oid = ob.add_order(p, "build it", mid, [tid], due=now + 7200, action_class="change", now=now).split()[1]
     ob.record(p, oid, "receipt", "built: commit abc123", None)
-    with pytest.raises(ValueError, match="is not an open order, promise or claim"):
+    with pytest.raises(ob.DueNote, match="already closed \\(receipt recorded\\)"):
         ob.set_due(p, oid, now + 3600, now=now)
     mid2 = p.db.post("in", "please build another", chat="c1")
     open_order = ob.add_order(p, "build another", mid2, [tid], due=now + 7200, action_class="change",
@@ -1027,3 +1030,58 @@ def test_a_condition_in_another_clause_leaves_an_unconditional_promise(env):
     now = time.time()
     assert len(_ob_said(p, "c1", "I will report back and tell you if it fails.", {}, now)) == 1
     assert _ob_said(p, "c2", "If the rerun passes, I'll post the numbers here.", {}, now + 1) == []
+
+
+def test_obligation_actions_that_change_nothing_owed_are_notes_and_kept_gates_still_refuse(env, monkeypatch):
+    """#2116 part 2: an obligation action whose wording was off but whose meaning is clear goes through
+    or is noted, never rejected: a due move on a closed obligation or one with no due, an order linked to
+    a closed key (recorded as a new order), and finished or unfit owners (left out, the rest attached).
+    Still refused in the same batch: a missed due with no plan change, an unknown milestone, a
+    Restrictions change without the user's word and a task_update touching a guard line."""
+    from ttp import coordinator as coord, obligations as ob
+    p, d, now, tid, check, mid, raised = _order_setup(env, monkeypatch)
+    p.charter_path.write_text("# demo\n\n## Restrictions\n- Never merge. (user msg #1)\n")
+
+    def notes():
+        return " ".join(p.db.kv(coord.NOTES_KEY) or [])
+    done = p.db.add_task("finished", "s", kind="code", tier="light", origin="coordinator")
+    p.db.update_task(done, status="done")
+    rev = p.db.add_task("a review", "s", kind="review", tier="light", origin="coordinator")
+    code = p.db.add_task("the change", "s", kind="code", tier="light", origin="coordinator")
+    # An order whose owners include a finished and a review task: recorded with the code task only.
+    assert coord.apply(p, [{"type": "obligation", "order": mid, "text": "build it", "action_class": "change",
+                            "owners": [done, rev, code]}]) == []
+    oid = ob.open_order(p.db, mid)["id"]
+    assert ob.get(p.db, oid)["promise"]["tasks"] == [code]
+    assert f"#{done} is done, so not attached" in notes() and "is a review task" in notes()
+    # Due moves that change nothing owed: closed (receipt, dropped) and open with no due to move.
+    plain = ob.add(p, "a plain one", [tid], now=now)
+    gone = ob.add(p, "dropped one", [tid], now=now)
+    ob.drop(p, gone, "by mistake", by="coordinator")
+    for key, why in ((plain, "is open but has no promise"), (gone, "is already closed (dropped)")):
+        assert coord.apply(p, [{"type": "obligation", "key": key, "due": now + 3 * 3600}]) == [], key
+        assert f"{key} {why}" in notes()
+    # An order linked to a closed key is recorded as a new order, its text and class carried over.
+    ob.record(p, oid, "receipt", "commit abc", None)
+    again = p.db.post("in", "build it again", chat="c1")
+    assert coord.apply(p, [{"type": "obligation", "key": oid, "order": again, "owners": [code]}]) == []
+    new = ob.open_order(p.db, again)
+    assert new and new["id"] != oid and new["promise"]["class"] == "change" and new["text"] == "build it"
+    assert f"obligation {oid} is closed: the order of message #{again} is recorded as a new one" in notes()
+    # Kept: a missed due with no plan change, an unknown milestone, a Restrictions change without a
+    # source and a task_update replacing a guard line.
+    late = p.db.post("in", "and ship it", chat="c1")
+    ob.add_order(p, "ship it", late, [code], due=now - 60, action_class="change", now=now - 7200)
+    lid = ob.open_order(p.db, late)["id"]
+    guarded = p.db.add_task("loader", "1. load\n\nRestrictions:\n- never push to main\n", kind="work")
+    before = p.charter_path.read_text()
+    probs = coord.apply(p, [
+        {"type": "obligation", "key": lid, "due": now + 7200},
+        {"type": "obligation", "key": plain, "evidence": "done", "milestone": "nope"},
+        {"type": "charter_update", "section": "Restrictions", "quote": "Never merge.", "text": "Merging is fine."},
+        {"type": "task_update", "id": guarded, "replace": {"old": "- never push to main", "new": ""}}])
+    assert len(probs) == 4, probs
+    assert any("a new time alone is refused" in x for x in probs), probs
+    assert any("no milestone nope" in x and "its milestones: none" in x for x in probs), probs
+    assert any(x.startswith("charter_update") for x in probs) and p.charter_path.read_text() == before
+    assert any("touches a safety line" in x for x in probs), probs
