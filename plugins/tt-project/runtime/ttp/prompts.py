@@ -1291,9 +1291,10 @@ def worker_resume(p: Project, task: dict, lost: dict) -> str:
                      f"The spec changed:\n{specfold.for_prompt(p.state, task)}\n")
         return "\n\n".join(x for x in (text, restrictions_pointer(p)) if x.strip())
     why = {"reboot": "the host rebooted", "sleep": "the host slept",
-           "network": "the network went away", "crash": "its process died without a result (a crash)"}.get(
+           "network": "the network went away", "crash": "its process died without a result (a crash)",
+           "auth": "its provider's login failed; a login check has passed since"}.get(
         lost.get("cause"), "its supervisor was lost")
-    free = lost.get("cause") in ("reboot", "sleep", "network", "crash")
+    free = lost.get("cause") in ("reboot", "sleep", "network", "crash", "auth")
     text = (f"# Continue task #{task['id']}: {task['title']}\n"
             f"Your run was cut off at about {when}: {why}. This continues your session"
             + (" and does not count as an attempt" if free else "")

@@ -2080,6 +2080,52 @@ def test_a_resume_that_cannot_start_falls_back_to_a_fresh_start_at_no_attempt(en
 
 
 
+def test_a_run_its_providers_logout_cut_short_resumes_its_session_once_a_login_check_passes(env, tmp_path, monkeypatch):
+    # An auth end is a free end (no attempt spent) and the auth breaker holds the queue: once the login is
+    # back, the run's own session resumes, never a fresh start that redoes its work. A run refused before
+    # it had a session, or one that handed off, starts fresh as before.
+    p = make(env)
+    from ttp import alerts
+    from ttp.daemon import Daemon
+    _sessions(env, monkeypatch, "a1", "h1")
+    login = env["tmp"] / "logged-in"
+    monkeypatch.setenv("TTP_FAKE_LOGIN", str(login))
+    d = Daemon(p.base)
+    tid = p.db.add_task("build", "build the thing", kind="work", tier="light", origin="user")
+    cut = []
+    for task, sid in ((tid, "a1"), (p.db.add_task("no session", "s", kind="work", tier="light", origin="user"), ""),
+                      (p.db.add_task("handed off", "s", kind="work", tier="light", origin="user"), "h1")):
+        run_dir = _lost_with_session(p, d, tmp_path, task, name=f"r{task}", session=sid or "x", cost=0.2,
+                                     took=120, status="auth")
+        p.db.x("UPDATE runs SET note=?, cost_usd=0.2, ended=? WHERE dir=?",
+               (json.dumps({"session_id": sid} if sid else {}), time.time(), str(run_dir)))
+        p.db.update_task(task, status="queued")
+        cut.append(task)
+    (tmp_path / f"r{cut[2]}" / "result.json").write_text(json.dumps({"status": "waiting", "summary": "job"}))
+    got = d._resumable(p.db.task(tid), "fake")
+    assert got["session"] == "a1" and got["cause"] == "auth", got
+    assert d._resumable(p.db.task(cut[1]), "fake") is None and d._resumable(p.db.task(cut[2]), "fake") is None
+    d.open_breaker("fake", "401")
+    d.dispatch()
+    assert p.db.one("SELECT COUNT(*) n FROM runs")["n"] == 3, "a run started while the provider was logged out"
+    login.write_text("")
+    p.db.set_kv("auth_breaker:fake", {**alerts.breaker(p.db, "fake"), "next_check": time.time() - 1})
+    d.sweep_alerts()
+    assert not d._logged_out("fake")
+    d.dispatch()
+    run = p.db.one("SELECT * FROM runs WHERE task=? ORDER BY id DESC LIMIT 1", (tid,))
+    assert json.loads(run["note"])["resumes"]["session"] == "a1", run["note"]
+    run_dir = pathlib.Path(run["dir"])
+    assert json.loads((run_dir / "run.json").read_text())["argv"][-2:] == ["--resume", "a1"]
+    prompt = (run_dir / "prompt.md").read_text()
+    assert "login failed" in prompt and "does not count as an attempt" in prompt and "## Spec" not in prompt, prompt
+    for task in cut[1:]:
+        r = p.db.one("SELECT * FROM runs WHERE task=? ORDER BY id DESC LIMIT 1", (task,))
+        assert "resumes" not in json.loads(r["note"]) and "## Spec" in (pathlib.Path(r["dir"]) / "prompt.md").read_text()
+    _finish_runs(p, d)
+    assert p.db.task(tid)["status"] == "done" and p.db.task(tid)["attempts"] == 1
+
+
 def test_a_failed_resume_that_printed_events_but_no_tokens_is_free(env, monkeypatch):
     from ttp import budget as bud
     out = _codex_events({"type": "error", "message": f"no rollout found for thread id {THREAD}"})

@@ -13223,8 +13223,8 @@ class Daemon:
         return {"run": r["id"], "session": session, "text": text[:1500]}
 
     def _resumable(self, task: dict, provider: str) -> dict | None:
-        """The task's last run, when the host took it away (reboot, sleep, lost supervisor) after
-        real progress and its agent session can be continued in the same working directory: a fresh
+        """The task's last run, when the host took it away (reboot, sleep, lost supervisor) or its
+        provider logged out mid-run (status auth), after real progress and its agent session can be continued in the same working directory: a fresh
         start would pay again for everything that run read and did. None otherwise: failed,
         timed-out and finished runs never resume, nor does a run whose hand-off stands, except one
         handed back because its on_pass_cmd's dry run found it cannot run (onpassdry.KEY)."""
@@ -13259,9 +13259,12 @@ class Daemon:
             return None
         r = self.p.db.one("SELECT * FROM runs WHERE task=? AND role!='coordinator' ORDER BY id DESC LIMIT 1",
                           (task["id"],))
-        if not r or r["status"] != "lost" or r["provider"] != provider or not r["dir"]:
+        # An auth end (its provider logged out mid-run) is held by the auth gate until a login check
+        # passes, then resumes its own session like a lost run: a fresh start would redo its work.
+        if not r or r["status"] not in ("lost", "auth") or r["provider"] != provider or not r["dir"]:
             return None
         note = json.loads(r["note"] or "{}")
+        cut = r["status"] == "auth" or note.get("lost_to_reboot") or note.get("lost_to_crash")
         session = note.get("session_id")
         run_dir = Path(r["dir"])
         if not session or (_read_result(run_dir / RESULT_FILE) or {}).get("status") in HANDOFF_STATES:
@@ -13274,9 +13277,8 @@ class Daemon:
             took += float(prev["ended"] or 0) - float(prev["started"] or 0)
             back = (json.loads(prev["note"] or "{}").get("resumes") or {}).get("run")
             prev = self.p.db.one("SELECT * FROM runs WHERE id=?", (back,)) if back else None
-        # A reboot or a crash cut a live run short: it resumes whatever it cost, its session kept.
-        if cost < float(want.get("min_usd", 0.5)) and took < float(want.get("min_s", 600)) \
-                and not (note.get("lost_to_reboot") or note.get("lost_to_crash")):
+        # A reboot, a crash or a logout cut a live run short: it resumes whatever it cost, its session kept.
+        if cost < float(want.get("min_usd", 0.5)) and took < float(want.get("min_s", 600)) and not cut:
             return None
         spec = _read_result(run_dir / "run.json") or {}
         cwd, run_env = str(spec.get("cwd") or ""), spec.get("env") if isinstance(spec.get("env"), dict) else {}
@@ -13284,7 +13286,8 @@ class Daemon:
         if not cwd or not Path(cwd).is_dir() or not prov.resume_args(session) or \
                 not prov.session_saved(session, cwd, run_env):
             return None
-        cause = "reboot" if note.get("lost_to_reboot") else "crash" if note.get("lost_to_crash") \
+        cause = "auth" if r["status"] == "auth" else "reboot" if note.get("lost_to_reboot") \
+            else "crash" if note.get("lost_to_crash") \
             else "sleep" if note.get("lost_to_sleep") else "network" if note.get("lost_to_network") else "lost"
         return {"run": r["id"], "session": session, "cwd": cwd, "dir": str(run_dir), "ended": r["ended"],
                 "cause": cause, "spec_sha": note.get("spec_sha")}
