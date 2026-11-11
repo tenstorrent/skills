@@ -27295,6 +27295,9 @@ def test_durable_write_syncs_renames_and_keeps_the_mode(env, monkeypatch):
 # Every place the runtime writes a file directly, and why it need not survive a power cut. Anything
 # else goes through project.durable_write / durable_append / write_json.
 DURABLE_EXEMPT = {
+    ("bridge_cert.py", 'f.write_text(pub.strip() + "\\n")'): "a key line for ssh-keygen -l in a TemporaryDirectory removed right after; nothing is kept",
+    ("bridge_cert.py", 'f.write_text(cert.strip() + "\\n")'): "a certificate line for ssh-keygen -L in a TemporaryDirectory removed right after; nothing is kept",
+    ("bridge_cert.py", 'f.write_text(box_pub.strip() + "\\n")'): "the box's public key for ssh-keygen -s in a TemporaryDirectory; the certificate is read back from stdout and the folder removed",
     ("shorttmp.py", "with os.fdopen(out, 'w') as f:"): "marks a check's scratch dir on the RAM disk with its allocation, which a reboot clears anyway; a lost mark only counts the dir as live for a few minutes",
     ("cellenv.py", '(site / "ttp-system-site.pth").write_text('): "a .pth in a bench cell's own throwaway venv, made fresh with the venv; a cut file only fails that cell's setup, never project state",
     ("benchrun.py", 'open(run / "runner.log", "wb")'): "the supervisor's stdout in a bench cell's temp folder, copied out after the cell; a cut log costs only the log",
