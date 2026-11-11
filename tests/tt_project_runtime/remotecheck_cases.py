@@ -2293,7 +2293,7 @@ def test_a_suite_of_a_project_with_a_checks_host_spills_and_runs_on_the_spill_ho
                            "check-host-a")
     assert suite[0].default_host == "check-host-a" and push.remote_host(suite[0]) == "check-host-a"
     assert checkspill.check_spills(suite[0]) and not checkspill.check_spills(suite[1])
-    assert checkspill.spillable(suite[:1]) and not checkspill.spillable(suite)
+    assert checkspill.spillable(suite[:1]) and checkspill.spillable(suite)   # the host-pinned check runs beside it
     spilled = push.spill_to(suite[:1], "spill-host-a", None)
     assert push.remote_host(spilled[0]) == "spill-host-a" and not checkspill.check_spills(spilled[0])
 
@@ -3733,7 +3733,7 @@ def test_a_parked_run_re_executed_for_an_upgrade_tries_every_spill_host_again(en
     monkeypatch.setattr(cli.os, "execv", fake_exec)
     off = "host-a:fail,host-b:fail"
     with pytest.raises(_Exec) as e:
-        cli._checks_reexec("2" if rerank else "99.0.0", time.time(), 3, lambda _l: None, io.StringIO(),
+        cli._checks_reexec("2" if rerank else "99.0.0", time.time(), 3, True, lambda _l: None, io.StringIO(),
                            rerank=rerank, spill_off=off)
     assert e.value.args[0] == (off if rerank else None)
 
