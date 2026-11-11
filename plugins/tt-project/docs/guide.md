@@ -421,7 +421,10 @@ coordinator with that evidence.
   the coordinator, so the same head is never re-reviewed (`review.auto_fix_rounds`, default 1,
   rounds per stack: a failed re-review, which would start a third review round, goes to the
   coordinator as one `review_nofix` event instead of being queued; a failure without fix follow-ups still blocks them, and `upstream:` notes and
-  deferred follow-ups stay with the coordinator). Across stacks, once `review.area_fail_cap` (3; 0
+  deferred follow-ups stay with the coordinator). Each fix resumes the session of the task it
+  continues (or, where its provider cannot, starts from the coordinator's context), at most
+  `review.hop_max` (2; 0 off) resumed hops deep in one lineage; past it the fix starts fresh and the
+  coordinator gets one `review_hop_cap` event. Across stacks, once `review.area_fail_cap` (3; 0
   off) reviews of one area failed within 48 h (a lineage linked by `continues`, follow-ups,
   `depends_on` and `Review #N` / `Fix review #N` titles, or overlapping changes to the same main file), the
   daemon queues no more fixes there and raises a tricky coordinator turn (one the turn gates never skip) to re-plan it

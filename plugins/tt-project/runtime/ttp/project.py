@@ -417,7 +417,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # such review's spec. With area_fail_cap (0 off) reviews of one area failed within 48 h, across
     # stacks, the daemon queues no automatic fix for it and the coordinator re-plans (reviewcap).
     # A failed review gets its fix and re-review from the daemon auto_fix_rounds times per stack (1: a
-    # failed re-review goes to the coordinator as one review_nofix event, not a third round).
+    # failed re-review goes to the coordinator as one review_nofix event, not a third round). Each fix
+    # resumes the session of the task it continues, at most hop_max resumed hops deep in one lineage
+    # (0: no cap); past it the fix starts fresh and the coordinator gets one review_hop_cap event (ctxfork).
     # The daily review's self-efficiency audit lists tasks blocked longer than blocked_long_h hours.
     # It also lists each Restrictions item that only blocked work over 7 days: at least rule_blocks_min
     # blocked runs and asks citing it, and no refused action citing it (restriction_audit).
@@ -432,7 +434,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "review": {"light_max_lines": 80, "risky_paths": [], "light_paths": [], "auto": True, "auto_notes": "",
                "area_fail_cap": 3, "blocked_long_h": 12, "rule_blocks_min": 3, "sweep_after_s": 300,
                "unreviewed_per_pass": None, "unreviewed_max_age_h": 72, "unreviewed_wait_s": 1800,
-               "carried_hold_max_h": 24, "auto_fix_rounds": 1,
+               "carried_hold_max_h": 24, "auto_fix_rounds": 1, "hop_max": 2,
                "fork_target": 0.9},   # hourly.py: the share of worker and review runs started from a fork or resume
     # Continue chains (chaincap): a task_add that continues a lineage past max_hops hops, max_stalls
     # failed or no-progress hops in a row or max_usd spent (0 turns one off), or one in an area under

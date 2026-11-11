@@ -25,6 +25,10 @@ original session is never written; the prompt leads with the coordinator's conte
 (delta_block). A first review continues no task, so it never resumes its author's session. Where that
 session cannot be copied, the run falls back to the coordinator fork, then to disk. In mode "disk" or
 "off" no session is copied.
+A daemon review fix (a `review_fix:<id>` label) resumes at most review.hop_max hops deep (hops): each
+resume of another task's run in its lineage is one hop, and a fresh start ends the count. Past the cap
+the fix starts fresh (the coordinator fork, else disk) and the coordinator gets one `review_hop_cap`
+event per fix task (HOP_CAP_KIND). 0 turns the cap off.
 
 A continued run (a lost run's own session) keeps its session and gets neither. The run note's KEY
 records how the run started ({"how": "fork" | "resume" | "disk" | "none", "why", "session", "tokens",
@@ -59,6 +63,8 @@ MODES = ("fork", "disk", "off")
 FORK_HEAD = "# FORKED FROM THE COORDINATOR'S SESSION"
 RESUME_HEAD = "# RESUMED FROM AN EARLIER RUN'S SESSION"
 DISK_HEAD = "# COORDINATOR CONTEXT (from disk)"
+HOP_CAP_KIND = "review_hop_cap"
+HOP_MAX = 2   # review.hop_max unset or unreadable
 
 
 def mode(cfg: dict) -> str:
@@ -253,7 +259,7 @@ def prepare(p, cfg: dict, prov, provider: str, cwd: str, env: dict | None, now: 
         try:
             src = follow_source(p, task)
             gap = _resume_gap(src, prov, provider) or _cross_model(src, model) or _fork_rejected(p, task, "resume") \
-                if src else ""
+                or _hop_capped(p, cfg, src, task) if src else ""
             if src and not gap:
                 new = str(uuid.uuid4())
                 gap = prov.start_from_session(src["provider"] or provider, src["session"], cwd, env, new)
@@ -312,6 +318,60 @@ def _cross_model(src: dict, model: str | None) -> str:
     if model and src.get("model") and not same_model(model, src["model"]):
         return f"run {src['run']} ran on {src['model']}, this run on {model}, whose cache cannot read its history"
     return ""
+
+
+def hop_max(cfg: dict) -> int:
+    try:
+        return max(0, int((cfg.get("review") or {}).get("hop_max", HOP_MAX)))
+    except (TypeError, ValueError):
+        return HOP_MAX
+
+
+def hops(p, src: dict, task: int | None) -> int:
+    """How many resumed hops deep a run of `task` resuming `src` would be: one for resuming another
+    task's run, plus each resume of another task's run behind it, read from the run notes. A run of the
+    same task (a later run of the follow-up) adds none; a run that did not resume ends the count."""
+    import json
+    n, run, owner, seen = (1 if src["task"] != task else 0), src["run"], src["task"], set()
+    while run not in seen and len(seen) < 100:
+        seen.add(run)
+        r = p.db.one("SELECT note FROM runs WHERE id=?", (run,))
+        try:
+            got = json.loads((r and r["note"]) or "{}").get(KEY)
+        except ValueError:
+            got = None
+        if not (isinstance(got, dict) and got.get("how") == "resume" and got.get("run")):
+            break
+        prev = p.db.one("SELECT task FROM runs WHERE id=?", (got["run"],))
+        if not prev:
+            break
+        n += prev["task"] != owner
+        run, owner = got["run"], prev["task"]
+    return n
+
+
+def _hop_capped(p, cfg: dict, src: dict, task: int | None) -> str:
+    """Why a daemon review fix starts fresh instead of resuming `src` ("" when it resumes): its lineage
+    would pass review.hop_max resumed hops. Raises one HOP_CAP_KIND event per fix task."""
+    import json
+    t = p.db.task(task) if task is not None else None
+    cap = hop_max(cfg)
+    if not t or not cap or '"review_fix:' not in (t.get("labels") or ""):
+        return ""
+    n = hops(p, src, task)
+    if n <= cap:
+        return ""
+    why = f"review.hop_max {cap}: resuming run {src['run']} would be hop {n} of its lineage, so it starts fresh"
+    fp = f"{HOP_CAP_KIND}:{task}"
+    if not p.db.one("SELECT id FROM events WHERE fingerprint=?", (fp,)):
+        p.db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,data,status,task) "
+               "VALUES(?,?,?,?,?,?,?,?,?)",
+               (time.time(), f"task:{task}", HOP_CAP_KIND, fp, "normal",
+                f"Fix task #{task} {t['title']} starts fresh, from the coordinator's context, instead of resuming "
+                f"#{src['task']}'s session: its lineage reached review.hop_max ({cap}) resumed hops. Nothing to do "
+                f"unless the fix stalls; raise review.hop_max to resume deeper.",
+                json.dumps({"hops": n, "cap": cap, "run": src["run"], "source_task": src["task"]}), "queued", task))
+    return why
 
 
 def _fork_rejected(p, task: int | None, how: str = "fork") -> str:

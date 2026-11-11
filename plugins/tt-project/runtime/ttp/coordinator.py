@@ -666,7 +666,7 @@ EFFORT_EVENT_TRIGGERS = {
     obligations.ORDER_KIND: "stuck", obligations.ORDER_LATE_KIND: "stuck", obligations.CLAIM_KIND: "stuck",
     obligations.LANDING_STUCK_KIND: "stuck",
     "must_act_rewake": "stuck",
-    "review_stall": "stuck", "review_failed_unhandled": "stuck", "review_nofix": "stuck", "review_unqueued": "stuck", "landed_wait_dead": "stuck", "lane_wait": "stuck", askrethink.KIND: "stuck", selfblock.KIND: "stuck",
+    "review_stall": "stuck", "review_failed_unhandled": "stuck", "review_nofix": "stuck", "review_hop_cap": "stuck", "review_unqueued": "stuck", "landed_wait_dead": "stuck", "lane_wait": "stuck", askrethink.KIND: "stuck", selfblock.KIND: "stuck",
     "wait_stale": "stuck", "hold_probe_broken": "stuck", "probe_never_passes": "stuck",
     "start_resource_stale": "resource", "job_underuse": "resource",
     "resource_trouble": "resource", "machine_condition": "resource", "machine_change_overdue": "resource", "machine_outage_overdue": "resource", "change_probe_broken": "resource",

@@ -397,6 +397,127 @@ def test_a_follow_up_falls_back_to_the_coordinator_fork_then_disk(env, monkeypat
     assert seen == ["resume", "fork", "disk"], seen
 
 
+def _resumed_run(p, cfg_dir, tmp_path, tid, src_run, how="resume"):
+    """An ok run of `tid` that started by `how` (resuming run `src_run`), its transcript on disk."""
+    from ttp import ctxfork
+    sid = str(uuid.uuid4())
+    _worker_session(cfg_dir, tmp_path / f"wt-{tid}", sid, f"task {tid} handed off")
+    rid = _ok_run(p, tid, sid)
+    got = {"how": how, "why": "x", "session": sid}
+    if how == "resume":
+        got["run"] = src_run
+    p.db.x("UPDATE runs SET note=? WHERE id=?", (json.dumps({"session_id": sid, ctxfork.KEY: got}), rid))
+    return rid
+
+
+def _fix_chain(p, cfg_dir, tmp_path):
+    """A code task with an ok run, and a daemon review fix that continues it, ready to start."""
+    code = p.db.add_task("the change", "do it", kind="code", origin="user")
+    s = str(uuid.uuid4())
+    _worker_session(cfg_dir, tmp_path / "wt-code", s)
+    r_code = _ok_run(p, code, s, ended=time.time() - 3600)
+    return code, r_code
+
+
+def _fix(p, prev, n):
+    review = p.db.add_task(f"Review #{prev}", "review it", kind="review", origin="daemon",
+                           labels=[f"auto_review:{prev}"])
+    return p.db.add_task(f"Fix review #{review}: the change ({n})", "fix", kind="code", origin="daemon",
+                         labels=[f"continues:{prev}", f"review_fix:{review}"])
+
+
+def test_a_review_fix_resumes_the_code_tasks_session_and_counts_its_hops(env, monkeypatch, tmp_path):
+    """#7754 (b): a daemon fix resumes the session of the task it fixes; a later round's fix resumes the
+    earlier fix's session, one hop deeper, while within review.hop_max (default 2)."""
+    from ttp import coordsession, ctxfork
+    p, d, cfg_dir, _run = _fork_daemon(env, monkeypatch, tmp_path)
+    coord = str(uuid.uuid4())
+    _fork_transcript(cfg_dir, p.base, coord)
+    p.db.set_kv(coordsession.KEY, {"id": coord, "provider": "claude", "context_tokens": 5000})
+    assert ctxfork.hop_max(d.cfg) == 2
+    code, r_code = _fix_chain(p, cfg_dir, tmp_path)
+    fix1 = _fix(p, code, 1)
+    got = _start(p, d, fix1)[3]
+    assert got["how"] == "resume" and got["run"] == r_code, got
+    assert ctxfork.hops(p, ctxfork.follow_source(p, fix1), fix1) == 1
+    r_fix1 = _resumed_run(p, cfg_dir, tmp_path, fix1, r_code)
+    fix2 = _fix(p, fix1, 2)
+    assert ctxfork.hops(p, ctxfork.follow_source(p, fix2), fix2) == 2
+    got = _start(p, d, fix2)[3]
+    assert got["how"] == "resume" and got["run"] == r_fix1, got
+    # A later run of the same fix resumes its own run: no extra hop.
+    r_fix2 = _resumed_run(p, cfg_dir, tmp_path, fix2, r_fix1)
+    assert ctxfork.hops(p, ctxfork.follow_source(p, fix2), fix2) == 2
+    assert _start(p, d, fix2)[3]["run"] == r_fix2
+    assert not p.db.one("SELECT id FROM events WHERE kind=?", (ctxfork.HOP_CAP_KIND,))
+
+
+def test_a_review_fix_past_the_hop_cap_starts_fresh_and_raises_one_event(env, monkeypatch, tmp_path):
+    """Past review.hop_max resumed hops the fix starts from the coordinator's context (fork, else disk),
+    and the coordinator gets one review_hop_cap event per fix task, however often it starts."""
+    from ttp import coordsession, ctxfork
+    p, d, cfg_dir, _run = _fork_daemon(env, monkeypatch, tmp_path)
+    coord = str(uuid.uuid4())
+    _fork_transcript(cfg_dir, p.base, coord)
+    p.db.set_kv(coordsession.KEY, {"id": coord, "provider": "claude", "context_tokens": 5000})
+    code, r_code = _fix_chain(p, cfg_dir, tmp_path)
+    fix1 = _fix(p, code, 1)
+    r_fix1 = _resumed_run(p, cfg_dir, tmp_path, fix1, r_code)
+    fix2 = _fix(p, fix1, 2)
+    r_fix2 = _resumed_run(p, cfg_dir, tmp_path, fix2, r_fix1)
+    fix3 = _fix(p, fix2, 3)
+    got = _start(p, d, fix3)[3]
+    assert got["how"] == "fork" and "run" not in got, got
+    assert "review.hop_max 2" in got["why"] and f"resuming run {r_fix2} would be hop 3" in got["why"], got
+    ev = p.db.q("SELECT * FROM events WHERE kind=?", (ctxfork.HOP_CAP_KIND,))
+    assert len(ev) == 1 and ev[0]["task"] == fix3 and ev[0]["status"] == "queued", ev
+    assert f"#{fix3}" in ev[0]["text"] and f"#{fix2}" in ev[0]["text"]
+    assert json.loads(ev[0]["data"]) == {"hops": 3, "cap": 2, "run": r_fix2, "source_task": fix2}
+    # No coordinator session either: the disk block, still no second event.
+    p.db.set_kv(coordsession.KEY, {})
+    got = _start(p, d, fix3)[3]
+    assert got["how"] == "disk" and "review.hop_max 2" in got["why"], got
+    assert len(p.db.q("SELECT id FROM events WHERE kind=?", (ctxfork.HOP_CAP_KIND,))) == 1
+    # A coordinator's own continue hop is not capped; review.hop_max 0 turns the cap off.
+    hop = p.db.add_task("continue: the change", "more", kind="code", origin="coordinator",
+                        labels=[f"continues:{fix2}"])
+    assert _start(p, d, hop)[3]["how"] == "resume"
+    d.cfg.setdefault("review", {})["hop_max"] = 0
+    assert _start(p, d, fix3)[3]["how"] == "resume"
+
+
+def test_a_review_fix_on_a_provider_without_resume_falls_back_and_a_fresh_start_resets_the_count(
+        env, monkeypatch, tmp_path):
+    """Provider parity (user msg #1828): a fix on a provider that cannot resume the code task's session
+    (Cursor, or another session format) takes the coordinator fork, else disk, like any follow-up; a fix
+    that started fresh ends its lineage's count, so the next round's fix resumes it as hop 1."""
+    from ttp import coordsession, ctxfork
+    from ttp import daemon as dmod
+    p, d, cfg_dir, _run = _fork_daemon(env, monkeypatch, tmp_path)
+    coord = str(uuid.uuid4())
+    _fork_transcript(cfg_dir, p.base, coord)
+    p.db.set_kv(coordsession.KEY, {"id": coord, "provider": "claude", "context_tokens": 5000})
+    code, r_code = _fix_chain(p, cfg_dir, tmp_path)
+    fix1 = _fix(p, code, 1)
+    cursor = dmod.get_provider("cursor")
+    got = ctxfork.prepare(p, d.cfg, cursor, "cursor", str(p.root), None, task=fix1)
+    assert got["how"] in ("fork", "disk") and "run" not in got and "no resume" in got["why"], got
+    codex = dmod.get_provider("codex")
+    got = ctxfork.prepare(p, d.cfg, codex, "codex", str(p.root), None, task=fix1)
+    assert got["how"] in ("fork", "disk") and f"no resume: run {r_code} ran on claude" in got["why"], got
+    # The chat provider runs Claude Code: it resumes the same session format.
+    assert ctxfork.prepare(p, d.cfg, dmod.get_provider("chat"), "chat", str(p.root), None,
+                           task=fix1)["how"] == "resume"
+    r_fix1 = _resumed_run(p, cfg_dir, tmp_path, fix1, None, how="fork")
+    fix2 = _fix(p, fix1, 2)
+    r_fix2 = _resumed_run(p, cfg_dir, tmp_path, fix2, r_fix1)
+    fix3 = _fix(p, fix2, 3)
+    assert ctxfork.hops(p, ctxfork.follow_source(p, fix3), fix3) == 2
+    got = _start(p, d, fix3)[3]
+    assert got["how"] == "resume" and got["run"] == r_fix2, got
+    assert not p.db.one("SELECT id FROM events WHERE kind=?", (ctxfork.HOP_CAP_KIND,))
+
+
 def test_stats_show_how_worker_runs_started_and_follow_ups_resumed(env):
     from ttp import coordstats, ctxfork
     p = make(env)
