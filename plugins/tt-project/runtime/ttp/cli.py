@@ -4382,6 +4382,10 @@ def cmd_checks(a) -> None:
         # A rerun of checks that did not pass on a spill host keeps off that host (checkspill.kept_off);
         # "1" keeps them off every spill host.
         no_spill = os.environ.pop(checkspill.OFF_ENV, "")
+        # Nor an unchanged head back to a spill host its checks already failed on, in this run or an earlier one.
+        spill_fails = checkspill.fails(p.state, head, _commands_hash(todo)) if p and todo else []
+        if spill_fails and not checkspill.all_off(no_spill):
+            no_spill = checkspill.fails_off(no_spill, spill_fails, p.config())
         spill_ok = not checkspill.all_off(no_spill) and checkspill.spillable(todo, cfg)
         if p and todo and not spill_ok and checkspill.hosts(cfg):   # `ttp checks status` says why it stays here
             checkspill.note_here(p.name, "kept off every spill host" if checkspill.all_off(no_spill) else
@@ -4860,55 +4864,81 @@ def cmd_checks(a) -> None:
         elif spilled and not passed and (executed or timed_out) and not _CHECK_STOP.get("stopped") \
                 and not (failed in todo and not getattr(failed, "spill_host", "")):
             how = f"past the {timed_out['cap_s']:g} s wall-time cap" if timed_out else f"exit {rc}"
-            env_why = ran_out = ""
+            env_why, real, ran_out = "", [], ""
             slow = False
             if not timed_out:   # a package missing there: a fault of the spill env config (checkspill.env_off)
                 try:
                     with open(log, "rb") as f:
                         f.seek(start)
                         ran_out = f.read().decode("utf-8", errors="replace")
-                    env_why = push.env_problem(ran_out, top) or ""
-                    # Its tree copy timed out: that host is kept off now, never a second full timeout there.
-                    from . import remotecheck
-                    slow = rc == remotecheck.FAULT_RC and not env_why and remotecheck.COPY_TIMEOUT in ran_out
                 except OSError:
                     pass
+                env_why = push.env_problem(ran_out, top) or ""
+                # Tests that also failed for a reason of their own make it the change's failure, never the env's.
+                real = push.assertion_failures(ran_out, top) if env_why else []
+                # Its tree copy timed out: that host is kept off now, never a second full timeout there.
+                from . import remotecheck
+                slow = rc == remotecheck.FAULT_RC and not env_why and remotecheck.COPY_TIMEOUT in ran_out
             if rc == 75 and not timed_out:   # its spill wrapper refused it or is missing: status names it (a limit line)
                 from . import checklane, checkspill, remotecheck
                 if (wrapped := remotecheck.wrap_fault(ran_out))[1]:
                     checkspill.note_limit(p.name, f"spill host {wrapped[0] or spilled.host}: {wrapped[1]}; its "
                                           "checks run again on another host or here", checklane.scope_text(todo)[:300])
-            no_spill = checkspill.spill_off_add(no_spill, spilled.host, rc == 75 and not timed_out,
-                                                p.config() if env_why else None, cfg=p.config(), slow=slow)
-            if slow:
-                from . import remotecheck
-                how += f": {remotecheck.COPY_TIMEOUT}, so that host is kept off this run"
-            if env_why:
-                checkspill.env_event(p.db, no_spill, p.config())
-            elif executed and not timed_out and rc != 75:   # a strike there if the head then passes elsewhere
+            env_cfg = p.config() if env_why and not real else None
+            key = _commands_hash(todo)
+            spent = bool(env_cfg) and checkspill.env_rerun_spent(checkspill.fails(p.state, head, key), env_cfg)
+            if not timed_out and rc != 75:   # a host fault or timeout is the host's: never this head's record
+                from . import sharedchecks
+                ids = sharedchecks.failing_ids(ran_out)[0]
+                checkspill.fail_add(p.state, head, key, spilled.host,
+                                    f"import:{env_why.partition(' not installed')[0]}" if env_cfg else
+                                    "ids:" + hashlib.sha1("\n".join(ids).encode()).hexdigest()[:12] if ids
+                                    else f"exit {rc}", env_cfg)
+            if real:
+                said = (f"the checks failed on spill host {spilled.host} ({how}) with tests that failed on their own: "
+                        + ", ".join(real[:10]) + (f" and {len(real) - 10} more" if len(real) > 10 else "")
+                        + f"; not run again: fix them and commit (that host's checks env also lacks "
+                        f"{env_why.partition(' not installed')[0]}, noted for it)")
+            elif spent:
+                no_spill = checkspill.spill_off_add(no_spill, spilled.host, False, env_cfg, cfg=p.config())
+                checkspill.env_event(p.db, no_spill, env_cfg)
+                said = (f"the checks failed at import on spill host {spilled.host} again ({env_why.partition(';')[0]}): "
+                        "an import failure runs again once per head, so this result counts; not run again")
+            if real or spent:
+                out.write(f"ttp checks: {said}\n")
                 out.flush()
-                checkspill.strike_fail(p, spilled.host, head, remotecheck.fail_sig(_log_tail(log), rc))
-            said = (f"the checks did not pass on spill host {spilled.host} ({how}"
-                    + (f": {env_why.partition(';')[0]}, a fault of the spill env, not the change" if env_why else "")
-                    + "); running them again on this machine, whose result counts, or on a free spill host "
-                    + (("they did not fail on" + (f" (that one again once the checks config changes or in "
-                        f"{checkspill.FAULT_RETRY_S // 60} min: the host's own fault ended them there)"
-                        if rc == 75 and not timed_out and not slow else ""))
-                       if spilled.host in checkspill.kept_off(no_spill, p.config())
-                       else "(that one again once free: the fault was the host's)" if not env_why
-                       else "(any one, until the same import fails on another)"))
-            out.write(f"ttp checks: {said}\n")
-            out.flush()
-            print(f"ttp checks: {said}", flush=True)
-            os.environ[checkcap.ARRIVED_ENV] = str(arrived)
-            if wait_kept:
-                os.environ[_WAIT_KEPT_ENV] = wait_kept
-            os.environ[checkspill.OFF_ENV] = no_spill
-            if not timed_out and not env_why and failed in todo and (ids := _spill_failed_ids(rc, ran_out)):
-                os.environ[_RETRY_IDS_ENV] = json.dumps({"n": todo.index(failed), "ids": ids, "host": spilled.host})
-            if join_rec:   # the run here registers again; its followers queue again and join that one (checkjoin)
-                checkjoin.forget(p.state)
-            return cmd_checks(a)
+                print(f"ttp checks: {said}", flush=True)
+            else:
+                no_spill = checkspill.spill_off_add(no_spill, spilled.host, rc == 75 and not timed_out,
+                                                    env_cfg, cfg=p.config(), slow=slow)
+                if slow:
+                    how += f": {remotecheck.COPY_TIMEOUT}, so that host is kept off this run"
+                if env_why:
+                    checkspill.env_event(p.db, no_spill, env_cfg)
+                elif executed and not timed_out and rc != 75:   # a strike there if the head then passes elsewhere
+                    out.flush()
+                    checkspill.strike_fail(p, spilled.host, head, remotecheck.fail_sig(_log_tail(log), rc))
+                said = (f"the checks did not pass on spill host {spilled.host} ({how}"
+                        + (f": {env_why.partition(';')[0]}, a fault of the spill env, not the change" if env_why else "")
+                        + "); running them again on this machine, whose result counts, or on a free spill host "
+                        + (("they did not fail on" + (f" (that one again once the checks config changes or in "
+                            f"{checkspill.FAULT_RETRY_S // 60} min: the host's own fault ended them there)"
+                            if rc == 75 and not timed_out and not slow else ""))
+                           if spilled.host in checkspill.kept_off(no_spill, p.config())
+                           else "(that one again once free: the fault was the host's)" if not env_why
+                           else "(once: an import failure runs again once per head)"))
+                out.write(f"ttp checks: {said}\n")
+                out.flush()
+                print(f"ttp checks: {said}", flush=True)
+                os.environ[checkcap.ARRIVED_ENV] = str(arrived)
+                if wait_kept:
+                    os.environ[_WAIT_KEPT_ENV] = wait_kept
+                os.environ[checkspill.OFF_ENV] = no_spill
+                if not timed_out and not env_why and failed in todo and (ids := _spill_failed_ids(rc, ran_out)):
+                    os.environ[_RETRY_IDS_ENV] = json.dumps({"n": todo.index(failed), "ids": ids, "host": spilled.host})
+                if join_rec:   # the run here registers again; its followers queue again and join that one (checkjoin)
+                    checkjoin.forget(p.state)
+                return cmd_checks(a)
         # Its clean checkout went while a check ran (its TMPDIR removed, a sweep): the run was killed,
         # so the waits run the checks again; no test it reports failed says anything of the change.
         if tree_gone and not passed and not _CHECK_STOP.get("stopped"):
@@ -5023,7 +5053,9 @@ def cmd_checks(a) -> None:
             f.seek(start)
             text = f.read().decode("utf-8", errors="replace")
         env_problem = push.env_problem(text, top) if failed in todo else None
-        also = bool(env_problem) and push.test_failures(text)
+        also = bool(env_problem) and bool(push.assertion_failures(text, top))
+        if env_problem and spilled:   # a note about that host's checks env, not about this machine's
+            env_problem = f"{env_problem} (on spill host {spilled.host})"
         ran, output = failed in todo and rc is not None, text
         if ran:
             with open(log, "rb") as f:
@@ -5044,7 +5076,8 @@ def cmd_checks(a) -> None:
                            "output": output[-8000:], "unrelated": False}),
             "purpose": purpose, "not_executed": not_executed,
             **({"timed_out": timed_out} if timed_out else {}),
-            **({"env_problem": env_problem} if env_problem else {}),
+            # Tests failed on their own too: a test failure of the change, its missing package only a note.
+            **({"env_note" if also else "env_problem": env_problem} if env_problem else {}),
             **({"flaky": rerun.get("flaky") or []} if rerun and failed is py_check else {})})
     write_json(Path(run_dir) / prguard.CHECKS_FILE, {"head": head, "worktree": top, "passed": passed,
                                                      "commands": todo, "skipped": skipped, "ts": time.time(),

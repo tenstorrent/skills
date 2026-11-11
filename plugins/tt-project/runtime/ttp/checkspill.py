@@ -83,7 +83,10 @@ as any run does and may spill to another listed host, never back to one its chec
 there (exit 75: the host paused, its lock or a tool gone mid-run) leaves that host one more try, once pick finds it free,
 and a host its own fault kept off is tried again once the checks config changes (a new checks.spill_wrap_cmd) or
 after FAULT_RETRY_S. Each bound of its wait here tries them all again, so a waiting run moves to the first that can take it.
-With none left it runs here, whose result counts.
+With none left it runs here, whose result counts. Reruns are bounded (FAILS_FILE, kept across runs): an unchanged
+head (same commit and check commands) never runs again on a spill host its checks failed on; a failure at import
+(push.env_problem) reruns once per head in all, then the result counts; and one where tests also failed for a reason
+of their own (push.assertion_failures) is the change's failure at once, its missing package only a note.
 
 A check that runs an agent CLI (AGENT_CLIS, the claude CLI among them, in command position after its
 wrappers: needs_cli), which a spill host neither has nor is logged in to, never spills unless it says
@@ -135,6 +138,8 @@ FAIL_VERDICT_HOSTS = 2   # on a workstation (remote_only), checks that failed on
 SLOW = "slow"   # spill_off_add's mark of a host whose tree copy timed out (remotecheck.COPY_TIMEOUT): kept off at once
 ENV_FAULT_HOSTS = 2   # the checks failed at import this often on spill hosts: one fault of the spill env config
 ENV_RETRY_S = 900   # after which (or once the checks config changes) a run tries the spill hosts again
+FAILS_FILE = "checks-spill-fails.json"   # in the project state: where each head's checks failed on a spill host (fails)
+FAILS_KEEP_S = 2 * 86400
 PROBE_TIMEOUT_S = 30
 LOAD_NEAR = 0.8   # no check starts on a spill host whose 1-minute load (with this machine's runs not yet in it) is this x its cores
 LOAD_LAG_S = 90.0   # a claim this recent may not show in its host's 1-minute load yet: its cores count as load
@@ -1525,6 +1530,53 @@ def kept_off(off: str, cfg: dict | None = None, now: float | None = None) -> set
     seen = [e.rpartition(":") for e in off.split(",") if e and e != "1"]
     return {h for h, _, why in seen if not why.startswith("env.") and (
             why in ("fail", SLOW) or sum(1 for h2, _, w2 in seen if h2 == h and _fault_counts(w2, key, now)) >= HOST_FAULT_TRIES)}
+
+
+def fails(state: Path, head: str, key: str) -> list[dict]:
+    """The spill failures FAILS_FILE in project state `state` records for head `head` under the check commands
+    whose hash is `key` (cli._commands_hash): {host, sig, env (the checks config key of an import failure, else
+    ""), ts} each."""
+    try:
+        recs = json.loads((Path(state) / FAILS_FILE).read_text())
+    except (OSError, ValueError):
+        return []
+    return [r for r in recs if isinstance(r, dict) and r.get("head") == head and r.get("key") == key] \
+        if isinstance(recs, list) else []
+
+
+def fail_add(state: Path, head: str, key: str, host: str, sig: str, env_cfg: dict | None = None) -> None:
+    """Record in FAILS_FILE that head `head`'s checks (`key`) failed on spill host `host` with `sig` (its failing
+    ids or missing import); `env_cfg`: it failed at import under that checks config. Entries past FAILS_KEEP_S go."""
+    path, now = Path(state) / FAILS_FILE, time.time()
+    try:
+        with open(path.with_name(path.name + ".lock"), "a") as lk:
+            fcntl.flock(lk, fcntl.LOCK_EX)
+            try:
+                recs = json.loads(path.read_text())
+            except (OSError, ValueError):
+                recs = []
+            recs = [r for r in (recs if isinstance(recs, list) else [])
+                    if isinstance(r, dict) and now - float(r.get("ts") or 0) <= FAILS_KEEP_S]
+            recs.append({"head": head, "key": key, "host": host, "sig": sig,
+                         "env": _env_key(env_cfg) if env_cfg is not None else "", "ts": now})
+            tmp = path.with_name(f".{path.name}.{os.getpid()}")
+            tmp.write_text(json.dumps(recs[-500:]))
+            os.replace(tmp, path)
+    except OSError:   # a record is a bound on reruns: never a reason for the checks run to fail
+        pass
+
+
+def fails_off(off: str, recs: list[dict], cfg: dict) -> str:
+    """OFF_ENV's value `off` keeping a run off each spill host `recs` (fails) shows its head's checks failed on:
+    an import failure only while the checks config `cfg` is the one it failed under (a fixed env is tried again)."""
+    hosts = [r["host"] for r in recs if r.get("host") and (not r.get("env") or r["env"] == _env_key(cfg))]
+    return ",".join([*(e for e in off.split(",") if e and e != "1"), *(f"{h}:fail" for h in dict.fromkeys(hosts))])
+
+
+def env_rerun_spent(recs: list[dict], cfg: dict) -> bool:
+    """Whether a head's checks already failed at import on a spill host under the checks config `cfg` (fails):
+    an import failure reruns once per head, so the next one counts."""
+    return any(r.get("env") == _env_key(cfg) for r in recs)
 
 
 def _env_key(cfg: dict | None) -> str:

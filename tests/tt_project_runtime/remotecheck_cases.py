@@ -3924,12 +3924,11 @@ def test_a_parked_run_re_executed_for_an_upgrade_tries_every_spill_host_again(en
 
 
 @_LINUX_TMP
-def test_the_same_import_failing_on_every_spill_host_is_one_config_fault_told_once_not_hosts_kept_off(
-        env, tmp_path, monkeypatch):
-    """A package the spill hosts' checks env lacks fails the checks at collection on each spill host: that is
-    one fault of the spill env config, never of the hosts or the change. The first failure keeps no host off;
-    once it fails the same way on a second host the run says so once and waits here, and every spill host is
-    tried again once the checks config changes or ENV_RETRY_S passes."""
+def test_import_only_failure_reruns_once(env, tmp_path, monkeypatch):
+    """A package the spill hosts' checks env lacks fails the checks at collection on a spill host: a fault of
+    the spill env config, never of the change, so it runs again once elsewhere. Failing the same way on the
+    second host, that result counts (an import failure reruns once per head) and the coordinator is told once of
+    the config fault; every spill host is tried again once the checks config changes or ENV_RETRY_S passes."""
     import threading
     from ttp import checkspill, cli
     p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a", "check-host-b"])
@@ -3941,18 +3940,28 @@ def test_the_same_import_failing_on_every_spill_host_is_one_config_fault_told_on
     p.set_config("delivery.push_checks", [cmd])
     lane = _spill_lane(p, repo)
     threading.Timer(6, lane.close).start()
-    cli.main(["checks", "--fresh"])
+    with pytest.raises(SystemExit):
+        cli.main(["checks", "--fresh"])
     rec = json.loads((run / "checks.json").read_text())
-    assert rec["passed"] is True and "spilled_to" not in rec, rec
+    assert rec["passed"] is False and rec["spilled_to"] == "check-host-b", rec
+    assert "nosuchpkg not installed" in rec["env_problem"] and "check-host-b" in rec["env_problem"], rec
+    fail = json.loads((run / "check_failure.json").read_text())
+    assert "nosuchpkg" in fail["env_problem"] and "env_note" not in fail, fail   # the env's failure, not the change's
     text = (run / "checks.log").read_text()
-    assert "spilling to check-host-a" in text and "spilling to check-host-b" in text, text
+    assert text.count("spilling to check-host-a") == 1 and text.count("spilling to check-host-b") == 1, text
     assert "nosuchpkg not installed for the python the check ran with, a fault of the spill env" in text, text
-    assert text.count("one fault of the spill hosts' checks env") == 1, text
-    assert "these checks did not pass there" not in text, "no host kept off for it"
+    assert "(once: an import failure runs again once per head)" in text, text
+    assert "an import failure runs again once per head, so this result counts; not run again" in text, text
     ev = p.db.q("SELECT severity, text FROM events WHERE fingerprint LIKE 'checkspill:env:%'")
     assert len(ev) == 1 and "failing at import" in ev[0]["text"], ev   # the coordinator is told at once, once
-    # Unit level: the marks and their release.
+    # The record: both hosts, under this checks config; a fixed config tries them again.
     cfg = p.config()
+    recs = checkspill.fails(p.state, rec["head"], cli._commands_hash([cmd]))
+    assert [r["host"] for r in recs] == ["check-host-a", "check-host-b"] and checkspill.env_rerun_spent(recs, cfg), recs
+    assert checkspill.kept_off(checkspill.fails_off("", recs, cfg)) == {"check-host-a", "check-host-b"}
+    p.set_config("checks.spill_wrap_cmd", "env FIXED=1")
+    assert not checkspill.env_rerun_spent(recs, p.config()) and checkspill.fails_off("", recs, p.config()) == ""
+    # Unit level: the env marks and their release.
     off = checkspill.spill_off_add("", "check-host-a", False, cfg)
     assert checkspill.kept_off(off) == set() and checkspill.env_off(off, cfg) == "", "one host: not yet"
     off = checkspill.spill_off_add(off, "check-host-b", False, cfg)
@@ -3961,13 +3970,86 @@ def test_the_same_import_failing_on_every_spill_host_is_one_config_fault_told_on
     assert checkspill.pick(p, cfg, told.append, "pytest -q", off) is None and len(told) == 1, told
     assert any("took no run: the checks failed at import" in x for x in checkspill.pick_lines(p.name))
     assert checkspill.env_off(off, cfg, now=time.time() + checkspill.ENV_RETRY_S + 1) == "", "time passed"
-    p.set_config("checks.spill_wrap_cmd", "env FIXED=1")
     assert checkspill.env_off(off, p.config()) == "", "the checks config changed"
     got = checkspill.pick(p, p.config(), told.append, "pytest -q", off)
     try:
         assert got is not None
     finally:
         got and got.close()
+
+
+def _assertion_and_import_log(n=30):
+    """pytest output with `n` tests failing on assertions and one failing on an import of 'yaml'."""
+    return ("=================================== FAILURES ===================================\n"
+            "___________________________________ test_imp ___________________________________\n"
+            "    import yaml\nE   ModuleNotFoundError: No module named 'yaml'\n"
+            + "".join(f"___________________________________ test_{i} ___________________________________\n"
+                      f"    assert 1 == 2\nE   AssertionError: assert 1 == 2\n" for i in range(n))
+            + "=========================== short test summary info ============================\n"
+            + "".join(f"FAILED tests/test_a.py::test_{i} - AssertionError: assert 1 == 2\n" for i in range(n))
+            + "FAILED tests/test_a.py::test_imp - ModuleNotFoundError: No module named 'yaml'\n"
+            + f"========================= {n + 1} failed, 100 passed in 1.00s =========================\n")
+
+
+@_LINUX_TMP
+def test_assertion_failures_not_env(env, tmp_path, monkeypatch):
+    """30 tests failing on assertions beside one failing on a missing package, on a spill host: the change's
+    failure, kept with its failing ids and not run again, never called a fault of the spill env; the missing
+    package is one note about that host's checks env."""
+    import threading
+    from ttp import cli, push
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a", "check-host-b"])
+    out = _assertion_and_import_log()
+    top = str(repo)
+    assert push.env_problem(out, top) and len(push.assertion_failures(out, top)) == 30, "the reproduction"
+    only = out.replace("FAILED tests/test_a.py::test_", "PASSED tests/test_a.py::test_").replace(
+        "PASSED tests/test_a.py::test_imp", "FAILED tests/test_a.py::test_imp").replace("31 failed", "1 failed")
+    assert push.env_problem(only, top) and push.assertion_failures(only, top) == [], "the import alone: env's"
+    (tmp_path / "out.txt").write_text(out)
+    script = tmp_path / "check.sh"
+    script.write_text(f'case "$(pwd)" in */ttp-check.*) cat {tmp_path / "out.txt"}; exit 1;; esac\n')
+    cmd = f"sh {script}"
+    p.set_config("delivery.push_checks", [cmd])
+    lane = _spill_lane(p, repo)
+    threading.Timer(6, lane.close).start()
+    with pytest.raises(SystemExit):
+        cli.main(["checks", "--fresh"])
+    rec = json.loads((run / "checks.json").read_text())
+    assert rec["passed"] is False and rec["spilled_to"] == "check-host-a", rec
+    fail = json.loads((run / "check_failure.json").read_text())
+    assert "env_problem" not in fail and "yaml not installed" in fail["env_note"], fail   # a test failure of the change
+    assert "test_a.py::test_29" in fail["output"], fail
+    text = (run / "checks.log").read_text()
+    assert "spilling to check-host-b" not in text and "running them again" not in text, text
+    assert "a fault of the spill env" not in text, text
+    assert "with tests that failed on their own: tests/test_a.py::test_0" in text and "and 20 more" in text, text
+    note = json.loads((p.state / cli.CHECKS_ENV).read_text())
+    assert note["also"] is True and "yaml" in note["problem"] and "check-host-a" in note["problem"], note
+
+
+@_LINUX_TMP
+def test_same_failure_same_host_not_rerun(env, tmp_path, monkeypatch):
+    """Checks that failed on a spill host run again here (only a pass there counts); a later run of the same
+    head and commands is never sent to that host again, where it would only fail the same way."""
+    import threading
+    from ttp import checkspill, cli
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a"])
+    script = tmp_path / "check.sh"
+    script.write_text('case "$(pwd)" in */ttp-check.*)\n'
+                      "  printf 'FAILED tests/test_a.py::test_x - AssertionError\\n1 failed in 1s\\n'; exit 1;;\nesac\n")
+    cmd = f"sh {script}"
+    p.set_config("delivery.push_checks", [cmd])
+    for n in (1, 2):
+        lane = _spill_lane(p, repo)
+        threading.Timer(3, lane.close).start()
+        cli.main(["checks", "--fresh"])
+        rec = json.loads((run / "checks.json").read_text())
+        assert rec["passed"] is True and "spilled_to" not in rec, rec
+        text = (run / "checks.log").read_text()
+        assert text.count("spilling to check-host-a") == 1, (n, text)   # the first run's only, never again
+    recs = checkspill.fails(p.state, rec["head"], cli._commands_hash([cmd]))
+    assert [(r["host"], r["env"]) for r in recs] == [("check-host-a", "")] and recs[0]["sig"].startswith("ids:"), recs
+    assert checkspill.fails(p.state, "0" * 40, cli._commands_hash([cmd])) == [], "another head: free to go there"
 
 
 def test_a_spilled_checks_fixed_n_is_lowered_to_the_hosts_worker_grant(tmp_path):

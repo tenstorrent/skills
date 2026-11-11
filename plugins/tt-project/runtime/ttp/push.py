@@ -933,6 +933,25 @@ def test_failures(output: str) -> bool:
     return bool(_TEST_FAILED.search(output))
 
 
+def assertion_failures(output: str, top: str) -> list[str]:
+    """The tests a run's output shows failing for a reason of their own, not on an import of a package the
+    repo lacks (env_problem): each failing id whose traceback and summary message name no such module, or
+    ["(failed tests)"] when tests failed and pytest named none. Any one of them makes the run a real
+    failure of the change, its missing package only a note about that checks env."""
+    if not test_failures(output):
+        return []
+    from . import sharedchecks
+    ids, _ = sharedchecks.failing_ids(output)
+    if not ids:
+        return ["(failed tests)"]
+    blocks, msgs, lacked = sharedchecks.failure_blocks(output, ids), sharedchecks.summary_msgs(output), {}
+
+    def env_only(text: str) -> bool:
+        names = _NO_MODULE.findall(text)
+        return bool(names) and all(lacked.setdefault(n, not _in_repo(n, top)) for n in names)
+    return [i for i in ids if not env_only("\n".join(x for x in (blocks.get(i), msgs.get(i)) if x))]
+
+
 def _in_repo(name: str, top: str | Path) -> bool:
     """The repository has a module or package `name` (its own code, so a failed import is the head's)."""
     r = _git(Path(top), "ls-files")
