@@ -1404,9 +1404,20 @@ def _gap_left(db, now: float, gap: float) -> float:
 def _tip_fix(p: Project, rows: list[dict], bad: dict) -> dict | None:
     """The first of `rows` (approved, not yet tried on the failing tip of `bad`, state "bad_tip") that
     fixes that tip: its change touches the test files the tip fails (bad["ids"]), or its review's or
-    the reviewed task's spec or hand-off says it fixes the tip or the failing tests (TIP_FIX_RE). due
-    pushes it alone first, so the others are not bisected against a tip that fails on its own."""
-    files = {str(i).split("::")[0] for i in bad.get("ids") or [] if str(i).split("::")[0].endswith(".py")}
+    the reviewed task's spec or hand-off says it fixes the tip or the failing tests (TIP_FIX_RE) and
+    also names this tip (its sha) or one of its failing tests (an id, its file or its test name): fix
+    words alone match routine specs. due pushes it alone first, so the others are not bisected
+    against a tip that fails on its own."""
+    ids = [str(i) for i in bad.get("ids") or []]
+    files = {i.split("::")[0] for i in ids if i.split("::")[0].endswith(".py")}
+    names = {n for i in ids if "::" in i and len(n := i.rsplit("::", 1)[1].split("[")[0]) >= 6}
+    tip = str(bad.get("tip") or "").lower()
+
+    def names_tip(x: str) -> bool:
+        if tip and any(tip.startswith(h.lower()) for h in re.findall(r"\b[0-9a-fA-F]{7,40}\b", x)):
+            return True
+        return any(w in x for w in (*ids, *files)) or any(re.search(rf"\b{re.escape(n)}\b", x) for n in names)
+
     for r in rows:
         if files and (got := _changed(p, bad["tip"], r["head"])) and files & got:
             return r
@@ -1415,7 +1426,7 @@ def _tip_fix(p: Project, rows: list[dict], bad: dict) -> dict | None:
         for dep in t.get("depends_on") or [] if isinstance(t.get("depends_on"), list) else []:
             if (d := p.db.task(dep)) is not None:
                 texts += [str(d.get("title") or ""), str(d.get("spec") or "")[:4000], str(d.get("result") or "")[:4000]]
-        if any(TIP_FIX_RE.search(x) for x in texts):
+        if any(TIP_FIX_RE.search(x) for x in texts) and any(names_tip(x) for x in texts):
             return r
     return None
 
@@ -1515,7 +1526,7 @@ def due(p: Project, now: float | None = None, cfg: dict | None = None, lock: boo
         tried = set(bad.get("tried") or [])
         fresh = [r for r in rows if r["id"] not in tried]
         if fix := _tip_fix(p, fresh, bad):
-            return [fix], (f"approval #{fix['id']} (review #{fix['task']}) fixes the failing tip {_short(bad['tip'])}: "
+            return [{**fix, "tip_fix": True}], (f"approval #{fix['id']} (review #{fix['task']}) fixes the failing tip {_short(bad['tip'])}: "
                            f"it goes alone first, then the rest rebuild on the new tip")
         if not fresh and now < (until := _bad_until(bad)):
             return [], (f"held: the tip {_short(bad['tip'])} fails its checks on its own and every approval was "
@@ -1815,6 +1826,10 @@ def start(p: Project, rows: list[dict], name: str, now: float | None = None, ext
         m["target"] = name
         if bad := _known_bad(db, rows):
             m["bad_tip"] = bad
+        if len(rows) == 1 and rows[0].get("tip_fix") and (tb := _state(db).get("bad_tip") or {}).get("tip"):
+            # the lone tip fix (due): its checks also run the tip's failing tests by id (batch.tip_fix_check)
+            m["tip_fix"] = {"tip": tb["tip"], "cmd": tb.get("cmd"),
+                            "ids": [str(i) for i in tb.get("ids") or []] if isinstance(tb.get("ids"), list) else []}
         if (st_bad := _state(db).get("bad_tip") or {}).get("tip") and st_bad.get("tried"):
             # due leaves these out of its urgent-first pick while the tip is this one: the batch never
             # stops its search for them (batch.Batch._yield_now), or the next batch would stop again

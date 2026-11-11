@@ -116,6 +116,25 @@ def say(msg: str) -> None:
         pass
 
 
+def tip_fix_check(m: dict, checks: list) -> list:
+    """`checks` plus, for the lone tip fix (pushq.start's marker "tip_fix"), one check running the
+    failing tip's test ids by name: the smoke suite may leave them out, so the fix is checked against
+    the tests it fixes. It runs like the failing check (its pytest command, host and env), unscoped."""
+    tf = m.get("tip_fix") if isinstance(m.get("tip_fix"), dict) else {}
+    ids = [str(i) for i in tf.get("ids") or [] if str(i).strip()] if isinstance(tf.get("ids"), list) else []
+    if not ids:
+        return list(checks)
+    like = next((c for c in checks if str(c) == str(tf.get("cmd") or "")), None) or \
+        next((c for c in checks if re.search(r"\bpytest\b", str(c))), None)
+    words = shlex.split(str(like)) if like is not None else []
+    at = next((n for n, w in enumerate(words) if w == "pytest" or w.endswith("/pytest")), None)
+    lead = words[:at + 1] if at is not None else ["python3", "-m", "pytest"]
+    c = push.Check(shlex.join([*lead, "-q", *ids]))
+    if isinstance(like, push.Check):
+        c.__dict__.update({k: v for k, v in like.__dict__.items() if k not in ("if_exists", "if_changed")})
+    return [*checks, c]
+
+
 def _git(cwd: Path, *args: str, env: dict | None = None) -> subprocess.CompletedProcess:
     """git with its output captured. No editor opens (a rebase continues with the message it has),
     and no recorded resolution (rerere) settles a conflict behind the resolver's back."""
@@ -1657,7 +1676,7 @@ class Batch:
         if not (allowed is None or allowed is True or str(allowed).strip().lower() in ("1", "true", "yes", "on")):
             return self._all("refused", "refused", "this project does not allow pushing (delivery.push_allowed)")
         try:
-            checks = push.with_host(push.check_list(push.repo_checks(self.d, self.repo, self.p)[0]),
+            checks = push.with_host(tip_fix_check(self.m, push.check_list(push.repo_checks(self.d, self.repo, self.p)[0])),
                                     self.d.get("checks_host"))
             rounds = push.rounds_of(self.d.get("push_rounds"))
             self.cfg = push.bump_of(self.d.get("version_bump"))

@@ -21463,8 +21463,8 @@ def test_an_approval_that_fixes_the_failing_tip_goes_alone_first(env, monkeypatc
     from ttp import pushq
     s = _pq(env, monkeypatch)
     _, routine = _pq_review(s)
-    fid = s.p.db.add_task("review the tip fix", "Review #9: fix the pre-existing failures on the push tip", kind="review",
-                          origin="coordinator")
+    fid = s.p.db.add_task("review the tip fix", "Review #9: fix the pre-existing failures on the push tip "
+                          "(tests/test_other.py::test_a)", kind="review", origin="coordinator")
     s.p.db.update_task(fid, status="pushing")
     with s.p.db.tx():
         [fix] = pushq.approve(s.p, fid, None, {"entries": [{"branch": s.branch, "head": s.head}], "target": "origin/proj"})
@@ -22027,3 +22027,46 @@ def test_a_batch_deploy_waits_for_the_earlier_one_and_a_newer_waiting_deploy_sup
     held.close()
     t.join(10)
     assert res == {"status": "ok"} and ran == ["b3"] and not nxt.exists(), (res, ran)
+
+
+def test_fix_words_alone_do_not_make_an_approval_the_tip_fix(env, monkeypatch):
+    from ttp import pushq
+    s = _pq(env, monkeypatch)
+    monkeypatch.setattr(pushq, "_changed", lambda p, a, b: frozenset({"docs/unrelated.md"}))
+    fid = s.p.db.add_task("review", "Review #9: fixes the failing tests in the web app", kind="review", origin="coordinator")
+    s.p.db.update_task(fid, status="pushing")
+    with s.p.db.tx():
+        [row] = pushq.approve(s.p, fid, None, {"entries": [{"branch": s.branch, "head": s.head}], "target": "origin/proj"})
+    tip = pushq._tracking_tip(s.p, "origin", "proj")
+    bad = {"tip": tip, "fails": 2, "tried": [], "at": time.time(), "ids": ["tests/test_other.py::test_alpha_case[2]"]}
+    rows = s.p.db.q("SELECT * FROM push_queue WHERE id=?", (row,))
+    assert pushq._tip_fix(s.p, rows, bad) is None, "fix words with unrelated files and no tip or test named"
+    for named in (f"fixes the failing tip {tip[:9]}", "fixes the failing tests: test_alpha_case",
+                  "fixes the pre-existing failures in tests/test_other.py"):
+        s.p.db.update_task(fid, spec=named)
+        assert pushq._tip_fix(s.p, rows, bad), named
+    s.p.db.update_task(fid, spec="fixes the failing tip 0000000")
+    assert pushq._tip_fix(s.p, rows, bad) is None, "another tip's sha"
+
+
+def test_the_lone_tip_fix_batch_also_runs_the_failing_ids(env, monkeypatch):
+    from ttp import batch, push, pushq
+    s = _pq(env, monkeypatch)
+    fid = s.p.db.add_task("review", "Review #9: fixes the failing tip (tests/test_other.py::test_a)", kind="review",
+                          origin="coordinator")
+    s.p.db.update_task(fid, status="pushing")
+    with s.p.db.tx():
+        [fix] = pushq.approve(s.p, fid, None, {"entries": [{"branch": s.branch, "head": s.head}], "target": "origin/proj"})
+    tip = pushq._tracking_tip(s.p, "origin", "proj")
+    cmd = "python3 -m pytest -q -m tt_smoke tests/test_a.py"
+    s.p.db.set_kv(pushq.KV, {"bad_tip": {"tip": tip, "fails": 2, "tried": [], "at": time.time(), "cmd": cmd,
+                                         "ids": ["tests/test_other.py::test_a"]}})
+    rows, why = pushq.due(s.p, time.time() + 10 ** 6)
+    assert [r["id"] for r in rows] == [fix], why
+    bid = pushq.start(s.p, rows, "origin/proj")
+    m = push._read(s.p.state / push.DETACHED / f"{bid}.json")
+    assert m["tip_fix"]["ids"] == ["tests/test_other.py::test_a"], m
+    checks = batch.tip_fix_check(m, push.check_list([cmd, {"host": "local", "run": "claude plugin validate x --strict"}]))
+    assert [str(c) for c in checks] == [cmd, "claude plugin validate x --strict",
+                                        "python3 -m pytest -q tests/test_other.py::test_a"], checks
+    assert batch.tip_fix_check({}, checks[:2]) == checks[:2]
