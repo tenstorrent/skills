@@ -5714,3 +5714,57 @@ def test_a_dns_failure_holds_coordinator_turns_across_daemons_and_one_turn_start
     up[0] = True
     d.maybe_coordinate()
     assert started == ["coordinator"] and p.db.kv(dm.NET_HOLDS_KEY) is None
+
+
+def test_a_net_hold_whose_lookup_never_passes_still_lets_one_coordinator_turn_try_every_net_hold_max_s(
+        env, monkeypatch):
+    """Review #8135: the CLI reaches the API through a proxy only it knows, so the API host never resolves
+    here; a host sleep held the core provider and no worker task runs on it. A user message must still be
+    answered: one coordinator turn starts once the hold is NET_HOLD_MAX_S old, none before, and the next
+    only NET_HOLD_MAX_S after that try, through tick too and after a restart (the hold is kept in kv)."""
+    from ttp import daemon as dm
+    p = make(env)
+    monkeypatch.setattr(dm, "_proxied", lambda: False)
+    monkeypatch.setattr(dm, "_background", lambda fn: fn())
+    monkeypatch.setattr(dm, "REACH_EVERY_S", 0)
+    monkeypatch.setattr(dm, "_resolves", lambda host: False)
+    clock = [10_000.0]
+    monkeypatch.setattr(dm.time, "monotonic", lambda: clock[0])
+    d = dm.Daemon(p.base)
+    core = d.cfg.get("core_provider") or "claude"
+    monkeypatch.setattr(type(dm.get_provider(core)), "reach_host", lambda self, env=None: "api.example.com")
+    started = []
+
+    def start_run(role, prompt, *a, **k):
+        started.append(role)
+        p.db.x("UPDATE messages SET handled=1")
+        return p.db.x("INSERT INTO runs(role,started,status) VALUES('coordinator',?,'ok')", (time.time(),))
+
+    def ask(text):
+        p.db.x("INSERT INTO messages(ts,direction,chat,text,handled) VALUES(?,?,?,?,0)",
+               (time.time() - 600, "in", "web", text))
+    d.hold_offline(core, "the host slept")
+    ask("hi")
+    monkeypatch.setattr(d, "start_run", start_run)
+    for _ in range(3):
+        d.maybe_coordinate()
+    clock[0] += dm.NET_HOLD_MAX_S - 1
+    d.maybe_coordinate()
+    assert started == []
+    clock[0] += 1
+    d.maybe_coordinate()
+    d.maybe_coordinate()
+    assert started == ["coordinator"] and p.db.kv(dm.NET_HOLDS_KEY)[core]["host"] == "api.example.com"
+    ask("still there?")
+    clock[0] += dm.NET_HOLD_MAX_S - 1
+    d.maybe_coordinate()
+    assert started == ["coordinator"]
+    # A restart (or the overseer's wake) restores the hold from kv and, the hold being old, tries once.
+    saved = p.db.kv(dm.NET_HOLDS_KEY)   # the fake monotonic clock moved; wall time did not: age it as it would
+    p.db.set_kv(dm.NET_HOLDS_KEY, {core: {**saved[core], "at": time.time() - 2 * dm.NET_HOLD_MAX_S}})
+    wake = dm.Daemon(p.base)
+    monkeypatch.setattr(wake, "start_run", start_run)
+    assert wake.net_held(core) and wake._net_may_probe(core)
+    wake.maybe_coordinate()
+    wake.maybe_coordinate()
+    assert started == ["coordinator"] * 2

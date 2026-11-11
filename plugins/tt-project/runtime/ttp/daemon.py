@@ -2338,9 +2338,12 @@ class Daemon:
         self._run_step(lambda: configwho.watch(self.p), "config_breakage")   # a config change that broke the checks
         settling = self._run_step(self.settling, default=False)
         core = self.cfg.get("core_provider") or "claude"
-        # A coordinator turn never tries the network for a held provider (_net_may_probe is for workers):
-        # each would be a lost turn. The held events and messages fold into the one turn after it resolves.
-        core_held = self._run_step(lambda: self.net_held(core), "net_held", default=False)
+        # No coordinator turn starts for a held core provider (each would be a lost turn) but the one
+        # every NET_HOLD_MAX_S that tries the network (_net_may_probe), so a lookup that keeps failing
+        # while the API is reachable (a proxy only the CLI knows) never stops turns for good. A lost
+        # turn books $0. The held events and messages fold into the turn that gets through.
+        core_held = self._run_step(lambda: self.net_held(core) and not self._net_may_probe(core), "net_held",
+                                   default=False)
         cycle = self._run_step(lambda: self.host_cycle_held(now), "host_cycle_held", default=False)
         for step in (   # one step per line: two changes adding steps merge without a conflict
                 self.run_schedules,
@@ -11260,8 +11263,9 @@ class Daemon:
     def _maybe_coordinate(self) -> None:
         if not self.lease_held():
             return
-        if self.net_held(self.cfg.get("core_provider") or "claude"):
-            return   # its API host does not resolve: the turn that starts once it does folds in what waits
+        core = self.cfg.get("core_provider") or "claude"
+        if self.net_held(core) and not self._net_may_probe(core):
+            return   # its API host does not resolve: the turn that gets through folds in what waits
         db, c = self.p.db, self.cfg["coordinator"]
         if db.one("SELECT id FROM runs WHERE role='coordinator' AND status='running'"):
             return
@@ -11468,6 +11472,8 @@ class Daemon:
             session_prompt = {"system": s_head, "context": s_context, "cached": cached}
             context = coord.with_cached(context, cached)
             burst = bursthold.carried(db, evs)
+            if provider in self._net_holds:   # this turn is the held provider's one try (as in start_run)
+                self._net_holds[provider]["probe"] = time.monotonic()
             rid = self.start_run("coordinator", prompt, provider, c.get("tier", "light"), str(self.p.base),
                            read_only=True, schema=coordsession.schema(),
                            system=head, context=context, session_prompt=session_prompt,
