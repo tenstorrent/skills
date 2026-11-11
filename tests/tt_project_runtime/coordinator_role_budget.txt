@@ -65,3 +65,4 @@
 +203: machine_change_overdue: the project's expired entries come batched; renew, close or undo them without the user's word; only a risky one left 24 h reaches the user
 +120: task_update check_plan: a task's own planned checks of its waits (waketier.py, user msgs #2231, #2245)
 +214: old orders line: record each order's reason, retire one whose reason is gone (oldorders.py, user msg #2484)
++255: Short path rule (ttp express) and the session prompt's `ttp push --land` of a reviewed fix (user msgs #2482, #2484)

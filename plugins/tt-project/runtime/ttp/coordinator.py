@@ -506,7 +506,9 @@ USER_SETTABLE = {
     # Lets ttp push and the push queue publish to a push branch that is main, master or the remote's default.
     "delivery.allow_protected_push_branch": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
     # Code tasks whose spec asks for it land on delivery.push_branch with `ttp push` themselves.
-    "delivery.code_tasks_may_push": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
+    # "approved": they and the coordinator land only heads an independent review approved (the default).
+    "delivery.code_tasks_may_push": lambda v: "approved" if str(v).strip().lower() == "approved"
+    else str(v).lower() in ("1", "true", "yes", "on"),
     # Repos whose PRs the project may merge itself. Set only in the turn carrying the user's own message,
     # and only added to (_only_adds_repos); a charter line or a quote never opens it.
     MERGE_KEY: _repo_list,

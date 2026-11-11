@@ -50,15 +50,15 @@ def find(db, ref: str) -> dict | None:
     task whose branch it is) or a head sha (7+ hex digits); the newest first."""
     from .db import dependency_ids
     ref = str(ref).strip().lstrip("#")
-    for r in db.q("SELECT * FROM push_queue WHERE status='approved' ORDER BY id DESC"):
-        if ref.isdigit():
-            task = db.task(int(r["task"])) or {"depends_on": None}
-            if int(ref) == r["task"] or str(r["branch"]).startswith(f"ttp/t{ref}-") \
-                    or int(ref) in dependency_ids(task):
-                return r
-        elif len(ref) >= 7 and str(r["head"]).startswith(ref.lower()):
+    rows = db.q("SELECT * FROM push_queue WHERE status='approved' ORDER BY id DESC")
+    for r in rows if ref.isdigit() else ():
+        task = db.task(int(r["task"])) or {"depends_on": None}
+        if int(ref) == r["task"] or str(r["branch"]).startswith(f"ttp/t{ref}-") \
+                or int(ref) in dependency_ids(task):
             return r
-    return None
+    # a sha prefix, all digits too (one in about 40 eight-digit prefixes is)
+    hexed = len(ref) >= 7 and all(ch in "0123456789abcdef" for ch in ref.lower())
+    return next((r for r in rows if hexed and str(r["head"]).startswith(ref.lower())), None)
 
 
 def _urgent(p: Project, row: dict) -> bool:

@@ -81,6 +81,11 @@ def test_an_express_landing_runs_only_the_tests_its_diff_reaches(env, monkeypatc
     assert rc == 0 and m["outcome"] == "pushed", m
     assert "express: " + check + ": targeted: " in capsys.readouterr().out
     assert log.read_text().split() == ["two"], "only the changed test ran"
+    # The override is audited (marker and a handled event); delivery.push_checks stays as set.
+    assert m["check_override"]["configured"] == [check] and m["check_override"]["used"] == [{"check": check, "targeted": True}], m
+    ev = p.db.one("SELECT status, text FROM events WHERE kind='push_check_override'")
+    assert ev and ev["status"] == "handled" and "delivery.push_checks unchanged" in ev["text"], ev
+    assert p.config()["delivery"]["push_checks"] == [check]
 
 
 def test_an_express_landing_goes_past_a_failing_test_that_also_fails_on_the_tip(env, monkeypatch):
@@ -118,6 +123,9 @@ def test_express_refuses_an_unreviewed_routine_or_oversized_head_with_its_reason
     assert express.main(s.p, str(s.code), "fix", dry_run=True, say=said.append) == 2
     assert f"task #{s.review} is not urgent" in said[-1]
     s.p.db.update_task(s.code, priority=1)
+    s.p.db.x("UPDATE push_queue SET head=? WHERE id=?", ("12345678" + s.head[8:], row))   # an all-digit prefix
+    assert express.find(s.p.db, "12345678")["id"] == row
+    s.p.db.x("UPDATE push_queue SET head=? WHERE id=?", (s.head, row))
     for ref in (str(s.code), str(s.review), f"#{s.code}", s.head[:8]):
         got, why = express.eligible(s.p, ref)
         assert got["id"] == row and why == [], (ref, why)
@@ -174,3 +182,25 @@ def test_an_express_landing_gets_the_full_checks_after_it_lands_and_a_failure_re
     [row] = p.db.q("SELECT * FROM push_queue WHERE task=?", (rev["id"],))
     assert g("rev-parse", f"{row['head']}^") == pushed and g("diff", "--name-only", pushed, row["head"]) == "pl0.txt"
     assert postland.tend(p, p.config()) == "", "checked once"
+
+
+def test_the_push_queue_lands_a_priority_1_approval_express_while_a_regular_batch_runs(env, monkeypatch):
+    """User msg #2482: a priority-1 approved head lands alone, ahead of a push batch that is running, with
+    only its targeted checks; the running batch is neither waited for nor stopped."""
+    from ttp import express, push, pushq
+    s = _pq(env, monkeypatch)
+    s.p.db.update_task(s.code, priority=1)
+    row = _express_row(s)
+    running = s.p.state / push.DETACHED / "batch-running.json"
+    running.parent.mkdir(parents=True, exist_ok=True)
+    from ttp.project import write_json
+    write_json(running, {"phase": "checking", "entries": [], "target": "origin/proj"})
+    real = pushq.alive
+    monkeypatch.setattr(pushq, "alive", lambda m: (True, push._read(m)) if Path(m) == running else real(m))
+    logs: list[str] = []
+    bid = pushq.schedule(s.p, log=logs.append)
+    assert bid and express.is_express(bid) and "alone, ahead of any running or queued batch" in logs[-1], logs
+    m = express.wait(s.p, bid, 60)
+    assert m.get("outcome") == "pushed", m
+    assert [e["id"] for e in m["entries"]] == [row]
+    assert push._read(running)["phase"] == "checking", "the running batch was left alone"

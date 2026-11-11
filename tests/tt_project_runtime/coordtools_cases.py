@@ -763,15 +763,16 @@ def test_session_tools_key_loosens_only_on_the_users_word():
 
 
 def test_full_tools_coordinator_lands_nothing_and_moves_no_tag(tmp_path, monkeypatch):
-    # The hook: every landing `ttp push`, also wrapped or nested; only the forms that move nothing pass.
+    # The hook: a tag move, an own branch, a batch, any nested landing and any raw `git push`; a plain
+    # landing of the worktree's HEAD goes on to `ttp push`, which lands only a head a review approved.
     _full_env(tmp_path, monkeypatch)
-    for cmd in ("cd wt && ttp push --detach", "ttp push --move-tag someone/x-dogfood abc123", "ttp push",
-                "ttp push --land --detach", "ttp push --own", "ttp clip -- ttp push", "env A=1 ttp push --batch m",
+    for cmd in ("ttp push --move-tag someone/x-dogfood abc123", "ttp push --own", "env A=1 ttp push --batch m",
                 "sh -c 'cd wt && ttp push'", "ssh box1 'ttp push --detach'", "ttp push --free --move-tag t c",
-                "ttp push --queue --detach", "/x/bin/ttp push --marker m"):
+                "/x/bin/ttp push --marker m", "git push origin HEAD:x", "cd wt && git push"):
         assert _decide(tmp_path, "Bash", command=cmd) == "deny", cmd
     for cmd in ("ttp push --queue", "ttp push --free", "ttp push --result /r/m", "ttp push --result /r/m --pushed",
-                "ttp task demo add 'push the fix'"):
+                "ttp task demo add 'push the fix'", "cd wt && ttp push --land --detach", "ttp push",
+                "ttp clip -- ttp push --land"):
         assert _decide(tmp_path, "Bash", command=cmd) == "allow", cmd
 
 

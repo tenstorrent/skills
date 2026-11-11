@@ -3111,7 +3111,8 @@ def cmd_push(a) -> None:
     if a.result:
         sys.exit(push.result(Path(a.result), pushed_only=a.pushed))
     from . import coordtools
-    if coordtools.coordinator_run() and not (a.queue or a.stop or a.cancel or (a.free and not a.move_tag)):
+    coord = coordtools.coordinator_run() and not (a.queue or a.stop or a.cancel or (a.free and not a.move_tag))
+    if coord and (a.move_tag or a.own or a.own_branch or a.batch):
         die(f"ttp push: {coordtools.PUSH_REFUSAL}")   # also past the hook's text check (coordtools.py)
     if a.own_branch:   # read by push.own_target, also in the detached process (inherited, or QUEUE_ENV)
         a.own = True
@@ -3125,6 +3126,8 @@ def cmd_push(a) -> None:
                                          if (c := Project(d)).exists()), None)
     if not p or not p.exists():
         die("ttp push: no tt-project project here (run it inside a run or a project's worktree)")
+    if coord and (why := push.approved_landing(p, Path.cwd())[1]):   # only a head a review approved
+        die(f"ttp push: {coordtools.PUSH_REFUSAL}: {why}")
     if a.queue:
         from . import pushq
         print(pushq.queue_text(p))

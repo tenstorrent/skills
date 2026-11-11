@@ -165,8 +165,10 @@ $0.21). Cursor agent: installed, not measured (no login on the test machine). On
 passed again for Claude Code with workers in the write fence (38 s, $0.12).
 
 - Any provider: a code task's raw `git push` to the push branch is refused by the harness's
-  pre-push hook (`runtime/ttp/gitguard.py`) while `delivery.code_tasks_may_push` is off, and
-  `ttp push` refuses the same landing. Before that guard, on 2026-10-21, a Claude Code worker whose
+  pre-push hook (`runtime/ttp/gitguard.py`) unless `delivery.code_tasks_may_push` is true, and
+  `ttp push` refuses the same landing. Under the default `"approved"`, a code task's or the
+  coordinator's `ttp push` lands a head an independent review approved (an approved push queue row
+  at that commit), with the push checks, and refuses any other head. Before that guard, on 2026-10-21, a Claude Code worker whose
   task said to land its change pushed it straight to the remote; `ttp doctor --loop` still fails
   such a landing.
 - A code task's plain `needs_review` hand-off gets its review from the daemon's review sweep,

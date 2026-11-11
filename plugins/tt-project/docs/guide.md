@@ -2024,6 +2024,14 @@ session and stateless coordinators on every provider.
   running batch rather than behind it. Its pytest push checks run only the tests its diff reaches; a
   failure the unchanged tip shares does not block it. After it lands the daemon runs the full push
   checks and `delivery.post_land_checks` on it, and a failure there reverts that commit forward.
+  The narrowing is a per-push override: `delivery.push_checks` stays as set, and the batch marker and
+  a `push_check_override` event record which checks ran narrowed. The push queue starts an urgent
+  approval this way by itself, beside a running batch.
+- Reviewed fixes land without the queue: under `delivery.code_tasks_may_push: "approved"` (the
+  default) a code task, or the coordinator in its own worktree, runs `ttp push --land` on a head an
+  independent review approved; the push checks run as for any push, an unreviewed head is refused,
+  and a raw `git push` stays refused. `true` lets code tasks land unreviewed work (the user's word
+  only); `false` leaves landing to reviews and the push queue.
 - Where reviewed changes go straight to a shared branch, `ttp push` publishes them guarded: it
   refuses uncommitted changes, rebases onto the latest tip, runs `delivery.push_checks` on the
   exact commit it pushes, starts over if the branch moved meanwhile, and never forces. A

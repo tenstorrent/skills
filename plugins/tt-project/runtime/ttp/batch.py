@@ -38,6 +38,7 @@ from __future__ import annotations
 import ast
 import difflib
 import fcntl
+import json
 import os
 import re
 import secrets
@@ -1689,7 +1690,28 @@ class Batch:
             self._checkout(tip)
         for line in lines:
             say(f"express: {line}")
+        self._audit_override(checks, out, lines)
         return out
+
+    def _audit_override(self, configured: list, used: list, lines: list) -> None:
+        """Record this push's check override (an express landing's narrowed smoke checks) in the batch
+        marker and as a handled `push_check_override` event: delivery.push_checks itself stays as set."""
+        rec = {"at": time.time(), "configured": [str(c) for c in configured],
+               "used": [{"check": str(c), "targeted": bool(getattr(c, "targeted", False))} for c in used],
+               "why": list(lines),
+               "head": str(self.entries[0].get("head") or "") if self.entries else ""}
+        try:
+            m = push._read(self.marker) or self.m
+            m["check_override"] = rec
+            write_json(self.marker, m)
+            self.p.db.x("INSERT INTO events(ts,source,kind,severity,text,status,data) VALUES(?,?,?,?,?,?,?)",
+                        (rec["at"], f"push:{self.marker.stem}", "push_check_override", "low",
+                         f"express {self.marker.stem} checks {rec['head'][:10]} with "
+                         f"{sum(u['targeted'] for u in rec['used'])} of {len(configured)} push checks narrowed to "
+                         "the tests its diff reaches; delivery.push_checks unchanged; full checks after landing",
+                         "handled", json.dumps(rec, default=str)))
+        except Exception as e:   # the audit record never stops the landing
+            say(f"express: could not record the check override: {e}")
 
     def _prepare(self, tip: str) -> None:
         """A clean checkout of `tip` in the batch's own worktree, made anew when broken or dirty."""

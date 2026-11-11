@@ -2,6 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """A code task's run never pushes to the push branch while delivery.code_tasks_may_push is off.
 
+With it "approved" (the default) a code task's or the coordinator's `ttp push` of a head an
+independent review approved goes through (approved_push: push.APPROVED_ENV names a head the push
+queue holds approved); any other push from them, a raw `git push` included, is refused as below.
+
 The harness's `bin/git` comes first on every run's PATH. Inside a run it hands any call naming
 `push` to main() here; every other call goes straight to the real git. `ttp push` refuses the same
 landing (push.code_run_landing); this covers a raw `git push` a worker runs because its spec says
@@ -198,6 +202,21 @@ def never_force_refusal(args: list[str], env: dict, git: str = "git") -> str:
             f"or deliver a rewritten history on a new branch.{hint}")
 
 
+def approved_push(env: dict) -> bool:
+    """Whether this push comes from a `ttp push` landing a head an independent review approved: it set
+    push.APPROVED_ENV to that head (push.approved_landing), and the project's push queue still has it
+    approved. A raw `git push` sets no such head and is not one."""
+    from . import push
+    from .project import Project, approved_heads_may_push
+    head, base = env.get(push.APPROVED_ENV, ""), env.get("TTP_PROJECT", "")
+    if not head or not base:
+        return False
+    p = Project(base)
+    if not (p.state / "project.db").is_file() or not approved_heads_may_push(p.config()):
+        return False
+    return push.approved_head(p, head) is not None
+
+
 def guarded_branch(env: dict) -> tuple[str, str]:
     """(push branch, why) when this run must not push to the push branch, else ("", "")."""
     task, base = env.get("TTP_TASK", ""), env.get("TTP_PROJECT", "")
@@ -209,7 +228,7 @@ def guarded_branch(env: dict) -> tuple[str, str]:
         return "", ""
     cfg = p.config()
     branch = str((cfg.get("delivery") or {}).get("push_branch") or "").strip()
-    if not branch or code_tasks_may_push(cfg):
+    if not branch or code_tasks_may_push(cfg) or approved_push(env):
         return "", ""
     t = p.db.task(int(task))
     if not t or t.get("kind") != "code":
@@ -376,9 +395,10 @@ def main(argv: list[str]) -> int:
               file=sys.stderr)
         return 1
     if split(resolved)[1] == "push" or bypass_refusal(resolved, shell):
-        try:   # a coordinator run pushes nothing, however the command was built (coordtools.py)
+        try:   # a coordinator run pushes only an approved head through `ttp push` (coordtools.py)
             from . import coordtools
-            coord = coordtools.coordinator_run()
+            coord = coordtools.coordinator_run() and not (split(resolved)[1] == "push"
+                                                          and approved_push(dict(os.environ)))
         except Exception:
             print("tt-project: the coordinator push check failed: no push", file=sys.stderr)
             return 1

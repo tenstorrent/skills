@@ -2495,7 +2495,7 @@ def test_codex_session_coordinator_gets_its_tools_through_its_own_hooks(env, mon
         assert out.returncode == 0, out.stderr
         return json.loads(out.stdout)["hookSpecificOutput"] if out.stdout.strip() else None
 
-    for bad in ("git push origin HEAD", f"echo x > {p.charter_path}", "ttp push --land"):
+    for bad in ("git push origin HEAD", f"echo x > {p.charter_path}", "ttp push --own"):
         got = call("PreToolUse", bad)
         assert got and got["permissionDecision"] == "deny", bad
     assert call("PreToolUse", "ls") is None

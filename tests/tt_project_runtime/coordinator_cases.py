@@ -11840,7 +11840,8 @@ def test_code_tasks_land_their_own_work_only_when_the_project_opts_in(env):
     from ttp import coordinator as coord
     from ttp.project import DEFAULT_CONFIG, code_tasks_may_push, config_problems, unknown_key_hint
     from ttp.prompts import worker_task
-    assert DEFAULT_CONFIG["delivery"]["code_tasks_may_push"] is False
+    # Default "approved" (user msg #2484): a code task lands only a head a review approved (push.py).
+    assert DEFAULT_CONFIG["delivery"]["code_tasks_may_push"] == "approved"
     assert unknown_key_hint("delivery.code_tasks_may_push") is None
     code = p.db.add_task("fix it", "s", kind="code", tier="light", origin="user")
     review = p.db.add_task("review it", "s", kind="review", tier="light", origin="user")
@@ -11851,7 +11852,7 @@ def test_code_tasks_land_their_own_work_only_when_the_project_opts_in(env):
     def state():   # the STANDING block; the prompt's rules always name `## Delivery` as an example
         return "\n".join(coord.standing_lines(p))
 
-    # Default: off, and nothing in the prompts says otherwise.
+    # Default: no unreviewed landing, and nothing in the prompts says otherwise.
     p.set_config("delivery.push_branch", "work")
     assert not code_tasks_may_push(p.config()) and config_problems(p.raw_config()) == []
     assert "land on work with ttp push=True" not in worker(code) and "## Delivery" not in state()
@@ -11859,7 +11860,7 @@ def test_code_tasks_land_their_own_work_only_when_the_project_opts_in(env):
     p.set_config("delivery.code_tasks_may_push", "yes")
     assert not code_tasks_may_push(p.config())
     assert config_problems(p.raw_config()) == [
-        "delivery.code_tasks_may_push: 'yes' is not true or false; code tasks do not push"]
+        "delivery.code_tasks_may_push: 'yes' is not true, false or \"approved\"; code tasks do not push"]
     # On without a push branch: still off.
     p.set_config("delivery.code_tasks_may_push", True)
     p.set_config("delivery.push_branch", "")
@@ -11884,7 +11885,7 @@ def test_code_tasks_may_push_is_turned_on_only_on_the_users_word(env):
     off = {**on, "value": "false"}
     notes = coord.apply(p, [on])
     assert len(notes) == 1 and "ask_user (blocking review)" in notes[0], notes
-    assert p.config()["delivery"]["code_tasks_may_push"] is False
+    assert p.config()["delivery"]["code_tasks_may_push"] == "approved"
     assert coord.apply(p, [on], user_turn=True) == []
     assert p.config()["delivery"]["code_tasks_may_push"] is True
     assert coord.apply(p, [off]) == []

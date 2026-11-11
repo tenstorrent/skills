@@ -375,12 +375,14 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # `ttp listen` holds broadcast alerts this long to print them together; lease_s: another relayer
     # is refused a chat id whose relayer listened this recently (relayers.py).
     "relay": {"gone_after_s": 86400, "batch_s": 120, "lease_s": 600},
-    # code_tasks_may_push: a code task whose spec asks it to land on delivery.push_branch may run
-    # `ttp push` itself, so no separate landing task is needed. Off: only review tasks push.
+    # code_tasks_may_push: true: a code task whose spec asks it to land on delivery.push_branch may run
+    # `ttp push` itself, so no separate landing task is needed. "approved" (the default): a code task
+    # or the coordinator lands a head an independent review approved (approved_heads_may_push). Off:
+    # only review tasks and the push queue push.
     # drafts_during_freeze: opening and updating draft PRs needs no ask even under a code freeze.
     # Off: a draft PR under a code freeze needs the user's word (coordinator prompt and ask gate).
     "delivery": {"draft_prs": True, "review_before_pr": True, "auto_merge_repos": [],
-                 "push_allowed": True, "code_tasks_may_push": False, "drafts_during_freeze": True},
+                 "push_allowed": True, "code_tasks_may_push": "approved", "drafts_during_freeze": True},
     # Review tasks run light when the diff under review touches no risky_paths glob and no code file
     # with a risky name (risky_names, default budget.RISKY_NAMES) and is docs and tests only or at
     # most light_max_lines non-doc lines; otherwise standard. A re-review after a failed review applies
@@ -1000,6 +1002,18 @@ def code_tasks_may_push(cfg: dict) -> bool:
     return d.get("code_tasks_may_push") is True and bool(str(d.get("push_branch") or "").strip())
 
 
+APPROVED_PUSH = "approved"   # delivery.code_tasks_may_push: only heads an independent review approved
+
+
+def approved_heads_may_push(cfg: dict) -> bool:
+    """Whether a code task or the coordinator may land a head an independent review approved with
+    `ttp push` (push.approved_head): delivery.code_tasks_may_push is true or "approved" (the default)
+    and delivery.push_branch is set."""
+    d = cfg.get("delivery") or {}
+    v = d.get("code_tasks_may_push", APPROVED_PUSH)
+    return (v is True or str(v).strip().lower() == APPROVED_PUSH) and bool(str(d.get("push_branch") or "").strip())
+
+
 # delivery.push_queue on: reviews approve into the daemon's queue, which pushes approved heads in
 # batches (a batch starts at once when no review is running or ready, else once the oldest approval
 # waited push_batch_s, push_batch_max are waiting or approvals waited out the last batch; after a batch
@@ -1295,9 +1309,10 @@ def config_problems(raw: dict, root: Path | None = None) -> list[str]:
         if ceiling and isinstance(jt, (int, float)) and not isinstance(jt, bool) and jt > ceiling:
             out.append(f"device.runners.{name}.job_timeout_s: {jt} is above runner.device_timeout_max_s "
                        f"({ceiling}); jobs without their own --timeout get {ceiling}")
-    may_push = delivery.get("code_tasks_may_push", False)
-    if not isinstance(may_push, bool):
-        out.append(f"delivery.code_tasks_may_push: {may_push!r} is not true or false; code tasks do not push")
+    may_push = delivery.get("code_tasks_may_push", APPROVED_PUSH)
+    if not isinstance(may_push, bool) and str(may_push).strip().lower() != APPROVED_PUSH:
+        out.append(f"delivery.code_tasks_may_push: {may_push!r} is not true, false or \"{APPROVED_PUSH}\"; "
+                   "code tasks do not push")
     own = delivery.get("own_push")
     if own is not None and not isinstance(own, bool) and \
             str(own).strip().lower().replace("-", "_") not in OWN_PUSH_MODES + ("existing", "true", "false", "yes", "no"):
