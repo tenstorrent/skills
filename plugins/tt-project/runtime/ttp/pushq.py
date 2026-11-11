@@ -26,6 +26,7 @@ from . import (   # one name per line: two changes adding names merge without a 
     coordinator as coord,
     cyclenotice,
     envfault,
+    lanewait,
     locks,
     msgparts,
     overlap,
@@ -65,7 +66,7 @@ from .project import (
     renice,
     write_json,
 )
-from .worktree import fix_branches, named_refs
+from .worktree import FORK_POINT_REF, fix_branches, named_refs
 
 REF_PREFIX = "refs/ttp/push/"   # + row id: pins the approved commit until its row is settled
 KV = "push_queue"               # kv: {"backoff_until", "deaths", "bad_tip": {"tip", "fails", "tried", "at", ...}, "tips_told"}
@@ -563,11 +564,36 @@ def _inherited(p: Project, task: dict, entries: list[dict], tip: str, now: float
     failed: {head: {task id: ["<short sha> <subject>", ...]}}. A commit counts by its hash or by its
     patch-id, so a rebased or cherry-picked copy of a rejected commit is caught too. A rejected
     branch's commits that a passed task's branch also holds are that task's (it was stacked on it).
+    Only a rejected task's own work counts as its own: what its starts reach (_bases: the commit it
+    started from, its dependencies' branches, its fork point) is not, so a dependent's failed review
+    never blocks its prerequisite.
     Within a gitmemo scope the answer is kept by task, heads and tip: prefetch_git reads it before the
     transaction that judges a hand-off, so its git (`git show -p` among it) never holds the write lock."""
     key = ("pushq.inherited", task["id"], str(task.get("depends_on") or ""),
            tuple((e.get("branch"), e["head"]) for e in entries), tip)
     return gitmemo.cached(key, lambda: _read_inherited(p, task, entries, tip, now))
+
+
+def _bases(p: Project, tid: int, have: set[str], forks: set[str]) -> list[str]:
+    """What task `tid`'s own work starts on: the commit it started from (lanewait.START_FROM), the
+    branches of the tasks it depends on or started early on (lanewait.EARLY) and its fork point
+    (FORK_POINT_REF), where present, also those of the tasks it continues (it carries their start),
+    never their own commits. What these reach is never `tid`'s own commits."""
+    out, seen, t = [], set(), p.db.task(tid)
+    while t and t["id"] not in seen and len(seen) < 20:
+        seen.add(t["id"])
+        if f"{FORK_POINT_REF}{t['id']}" in forks:
+            out.append(f"{FORK_POINT_REF}{t['id']}")
+        early = (lanewait.label_value(t, lanewait.EARLY) or "").partition(":")[0]
+        for d in dependency_ids(t) + ([int(early)] if early.isdigit() else []):
+            if d and d != tid and (dt := p.db.task(d)) and dt.get("branch") in have:
+                out.append(dt["branch"])
+        sha = lanewait.label_value(t, lanewait.START_FROM) or ""
+        if _HEX40.fullmatch(sha) and _git(p, "rev-parse", "--verify", "--quiet", f"{sha}^{{commit}}",
+                                          timeout=INHERIT_GIT_S).returncode == 0:
+            out.append(sha)
+        t = p.db.task(c) if (c := continues_id(t)) else None
+    return out
 
 
 def _read_inherited(p: Project, task: dict, entries: list[dict], tip: str, now: float) -> dict[str, dict[int, list[str]]]:
@@ -578,7 +604,13 @@ def _read_inherited(p: Project, task: dict, entries: list[dict], tip: str, now: 
     if not bad:
         return {}
     good = [branch_of[t] for t in passed if branch_of.get(t) in have]
-    rejected = _git(p, "rev-list", "--no-merges", *bad, "--not", tip, *good, timeout=INHERIT_GIT_S).stdout.split()
+    forks = set(_git(p, "for-each-ref", "--format=%(refname)", FORK_POINT_REF.rsplit("/", 1)[0] + "/",
+                     timeout=INHERIT_GIT_S).stdout.split())
+    by_task: dict[int, set[str]] = {}
+    for b, t in bad.items():
+        by_task.setdefault(t, set()).update(_git(p, "rev-list", "--no-merges", b, "--not", tip, *good,
+                                                 *_bases(p, t, have, forks), timeout=INHERIT_GIT_S).stdout.split())
+    rejected = sorted(set().union(*by_task.values()))
     if not rejected:
         return {}
     rejected_set, rejected_ids = set(rejected), _patch_ids(p, rejected)
@@ -590,10 +622,8 @@ def _read_inherited(p: Project, task: dict, entries: list[dict], tip: str, now: 
         rest = [c for c in adds if c not in hits]
         hits |= {c: rejected_ids[i] for i, c in _patch_ids(p, rest).items() if i in rejected_ids}
         for c, src in hits.items():
-            holders = _git(p, "for-each-ref", "--contains", src, "--format=%(refname:short)", "refs/heads/",
-                           timeout=INHERIT_GIT_S).stdout.split()
             subject = _git(p, "log", "-1", "--format=%h %s", c, timeout=INHERIT_GIT_S).stdout.strip()
-            for tid in sorted({bad[b] for b in holders if b in bad}):
+            for tid in sorted(t for t, own in by_task.items() if src in own):
                 out.setdefault(e["head"], {}).setdefault(tid, []).append(subject)
     return out
 
@@ -661,6 +691,21 @@ def _markers(p: Project, head: str, tip: str) -> list[str]:
         str(p.root), "--cherry-pick", "--right-only", f"{tip}...{head}"))
 
 
+def _push_conflict(p: Project, task: dict, rows: list[dict]) -> str:
+    """The head of the task's latest direct `ttp push` (its marker under state/pushes) when that push
+    stopped on a rebase conflict and no push queue row of the task came after it, else ""."""
+    last, at = {}, 0.0
+    for marker in (p.state / push.DETACHED).glob(f"t{task['id']}-*.json"):
+        m = push._read(marker)
+        started = m.get("started") if isinstance(m.get("started"), (int, float)) else 0.0
+        if str(m.get("task")) == str(task["id"]) and started >= at:
+            last, at = m, started
+    head = str(last.get("head") or "")
+    if last.get("exit") != push.CONFLICT or not _HEX40.fullmatch(head):
+        return ""
+    return "" if rows and (rows[-1]["created"] or 0) > at else head
+
+
 def check_approval(p: Project, task: dict, entries: Any, cfg: dict | None = None) -> dict:
     """Validate a review's `push` list with fast local git: {"ignored": why} in a project that does
     not push or, while the queue is off, for anything but a list of approvals; {"invalid": why} (also
@@ -671,7 +716,8 @@ def check_approval(p: Project, task: dict, entries: Any, cfg: dict | None = None
     (worktree.fix_branches: a re-plan that committed on its own branch, not the reviewed one) that
     contains the reviewed branch it builds on. Only the commit the review names is pinned and
     pushed, so a head the reviewer did not name never goes out. A re-approval after a push conflict
-    may name any commit; the commits it adds over the conflicting head are listed for the event. A
+    may name any commit, also after the review's own `ttp push` conflicted while the queue was off
+    (_push_conflict); the commits it adds over the conflicting head are listed for the event. A
     head that carries commits of another task whose latest review failed (see _inherited) is invalid
     unless its entry lists that task under "inherited": the review judged them; "inherited" then
     names them per head for the event. A task of the review's own lineage (reviewcap.lineage) that an
@@ -714,6 +760,8 @@ def check_approval(p: Project, task: dict, entries: Any, cfg: dict | None = None
         # A rebase review (auto_rebase) re-approves the head its predecessor could not land, also once an
         # earlier row of its own was cancelled or sent back (a moved target): none is live or in conflict.
         conflicted = [h]
+    if not conflicted and (h := _push_conflict(p, task, rows)):
+        conflicted = [h]   # its own `ttp push` (the queue off) stopped on a rebase conflict
     reviewed: list[str] | None = None
     built: list[tuple[str, str]] = []
     out, added, accepted = [], {}, {}

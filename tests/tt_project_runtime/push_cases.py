@@ -4416,6 +4416,46 @@ def test_a_rebase_review_re_approves_its_head_after_its_own_earlier_row_left_the
         assert check.get("entries"), check
 
 
+@pytest.mark.parametrize("start", ["start_from", "depends_on", "continues"])
+def test_a_dependents_failed_review_never_blocks_its_prerequisites_approval(env, monkeypatch, start):
+    """A task B built on task A's head (started from it, depending on it, or continuing a task that
+    started from it) whose review failed: A's commits are A's own, so A's approval is accepted with
+    nothing inherited from B."""
+    from ttp import pushq
+    s = _pq(env, monkeypatch)
+    b, _, _, _ = _pq_stacked(s, "dependent", on=s.branch, review="failed")
+    if start == "depends_on":
+        s.p.db.update_task(b, depends_on=json.dumps([s.code]))
+    else:
+        first = s.p.db.add_task("first try", "s", kind="code", origin="coordinator") if start == "continues" else b
+        s.p.db.update_task(first, labels=json.dumps([f"start_from:{s.head}", f"early_start:{s.code}:1"]))
+        if first != b:
+            s.p.db.update_task(b, labels=json.dumps([f"continues:{first}"]))
+    check = pushq.check_approval(s.p, s.p.db.task(s.review), [{"branch": s.branch, "head": s.head}])
+    assert check.get("entries") and not check.get("inherited"), check
+
+
+def test_a_review_re_approves_its_rebased_head_after_its_own_direct_push_conflicted(env, monkeypatch):
+    """A review whose own `ttp push` (the queue off) stopped on a rebase conflict re-approves its rebased
+    head once the queue is on, the added commits listed; without a conflict recorded it stays refused."""
+    from ttp import pushq
+    s = _pq(env, monkeypatch)
+    tip = _pq_moved_tip(s)
+    rebased = _pq_on(s, tip, "rebased", ("feature.txt", "feature, resolved\n"))
+    approve = lambda: pushq.check_approval(s.p, s.p.db.task(s.review), [{"branch": "rebased", "head": rebased}])
+    assert "none of the reviewed refs" in approve()["invalid"]
+    folder = s.p.state / "pushes"
+    folder.mkdir(parents=True, exist_ok=True)
+    marker = folder / f"t{s.review}-20261111-000000-1.json"
+    marker.write_text(json.dumps({"task": str(s.review), "status": "failed", "exit": 4, "head": s.head,
+                                  "started": time.time() - 60}))
+    assert "none of the reviewed refs" in approve()["invalid"]   # its checks failed: no conflict
+    marker.write_text(json.dumps({"task": str(s.review), "status": "failed", "exit": 3, "head": s.head,
+                                  "started": time.time() - 60}))
+    check = approve()
+    assert check.get("entries") and check["added"][rebased], check
+
+
 def test_a_review_re_approves_its_own_rebase_of_the_reviewed_change_and_nothing_else(env, monkeypatch):
     """A review that rebases its reviewed ref onto a moved tip re-approves the rebased head when its change
     has the same patch id as the reviewed one; a head with any other diff stays refused."""
