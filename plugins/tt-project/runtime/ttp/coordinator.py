@@ -1666,10 +1666,13 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
     lines = []
     chats = db.q("SELECT id, label, last_active FROM chats ORDER BY last_active DESC LIMIT ?",
                  (coordsession.CHATS_SHOWN,))
-    if chats:
+    from . import relayers
+    clash = relayers.conflicts(db, now)   # a relayer on another chat's id takes that chat's replies
+    if chats or clash:
         lines.append("## Chats attached")
     for c in chats:
         lines.append(f"- {c['id']} ({c['label'] or 'chat'}), active {(now - (c['last_active'] or now)) / 60:.0f} min ago")
+    lines += [f"- relay: {c}" for c in clash]
     section("chats", lines)
     lines = []
     if any(e["kind"] == "upstream_note" or e["kind"] in ("followup_proposed", "task_notes")

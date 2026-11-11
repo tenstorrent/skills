@@ -369,8 +369,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
                     "conclusion_floor": {"tier": "standard", "effort": "high"}},
     "notify": {"slack": False, "slack_min_severity": "high", "chat_min_severity": "normal"},
     # gone_after_s: a relay chat with no `ttp listen` running that left a message unread this long
-    # stops counting as a reader of asks and alerts until it reads again (chatgone.py).
-    "relay": {"gone_after_s": 86400},
+    # stops counting as a reader of asks and alerts until it reads again (chatgone.py). batch_s:
+    # `ttp listen` holds broadcast alerts this long to print them together; lease_s: another relayer
+    # is refused a chat id whose relayer listened this recently (relayers.py).
+    "relay": {"gone_after_s": 86400, "batch_s": 120, "lease_s": 600},
     # code_tasks_may_push: a code task whose spec asks it to land on delivery.push_branch may run
     # `ttp push` itself, so no separate landing task is needed. Off: only review tasks push.
     # drafts_during_freeze: opening and updating draft PRs needs no ask even under a code freeze.

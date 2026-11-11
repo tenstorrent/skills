@@ -543,7 +543,9 @@ def need(name: str, argv: list[str]) -> Project:
     p, entry = resolve(name)
     if entry:
         if argv and argv[0] == "listen":
-            sys.exit(forward_listen(entry, argv, name))
+            from .relayers import holder_id
+            who = [] if "--holder" in argv or not holder_id() else ["--holder", holder_id()]
+            sys.exit(forward_listen(entry, [*argv, *who], name))
         failed = flush_outbox(name, entry)
         if failed is None or failed.returncode != 255:   # a message stuck for its own reason: run the command anyway
             rc = forward(entry, argv)
@@ -1004,7 +1006,10 @@ def web_line(p: Project) -> str:
 def cmd_connect(a) -> None:
     p, entry = resolve(a.name)
     if entry:
-        argv = ["connect", a.name, *(["--chat", a.chat] if a.chat else []), *(["--label", a.label] if a.label else [])]
+        from .relayers import holder_id
+        who = getattr(a, "holder", None) or holder_id()
+        argv = ["connect", a.name, *(["--chat", a.chat] if a.chat else []), *(["--label", a.label] if a.label else []),
+                *(["--holder", who] if who else [])]
         sys.exit(connect_remote(a.name, entry, argv))
     p = need(a.name, sys.argv[1:])
     # The home zone follows the user: the zone a workstation sent, or this machine's own when the
@@ -1015,6 +1020,16 @@ def cmd_connect(a) -> None:
     if tz:
         timefmt.set_home(p, tz, src, f"ttp connect from {src}" if src else "ttp connect")
     chat = a.chat or f"c{pysecrets.token_hex(3)}"
+    # One relayer per chat id: reusing another relayer's chat would take its replies (relayers.claim).
+    from . import relayers
+    lock = p.state / f"listen-{chat}.pid"
+    try:
+        live = _listener_alive(int(lock.read_text()), chat)
+    except (OSError, ValueError):
+        live = False
+    refused, _ = relayers.claim(p, p.db, chat, getattr(a, "holder", None) or relayers.holder_id(), live)
+    if refused:
+        die(refused)
     p.db.x("INSERT INTO chats(id,created,label,host,last_active,last_read) VALUES(?,?,?,?,?,"
            "(SELECT COALESCE(MAX(id),0) FROM messages)) ON CONFLICT(id) DO UPDATE SET last_active=excluded.last_active",
            (chat, time.time(), a.label or "", os.environ.get("TTP_CLIENT_HOST", ""), time.time()))
@@ -1425,10 +1440,25 @@ def cmd_listen(a) -> None:
         die(f"unknown chat {a.chat}; run `ttp connect {a.name}` first")
     floor = chat_floor(row["min_severity"], p.config()["notify"].get("chat_min_severity"))
     after = int(row["last_read"] or 0)
-    # One listener per chat, and the newest wins. Two would race for the same messages, and one
+    # One relayer per chat id (relayers.claim): another relayer's listener is refused, so it never
+    # takes this chat's replies; what one took over a lapsed lease is delivered again to the owner.
+    from . import relayers
+    a.holder = getattr(a, "holder", None) or relayers.holder_id()
+    lock = p.state / f"listen-{a.chat}.pid"
+    try:
+        live = _listener_alive(int(lock.read_text()), a.chat)
+    except (OSError, ValueError):
+        live = False
+    refused, rewind = relayers.claim(p, db, a.chat, a.holder, live)
+    if refused:
+        die(refused)
+    if rewind is not None and rewind < after:
+        after = rewind
+        _listen_write(db, "UPDATE chats SET last_read=MIN(COALESCE(last_read,0), ?) WHERE id=?", (rewind, a.chat),
+                      f"delivering again from #{rewind + 1}")
+    # One listener per chat, and the newest of its relayer wins. Two would race for the same messages, and one
     # printing to nowhere (a lost background task, a dropped ssh session) would silently mark them
     # read. Whoever arms a listener last is the one that wants the messages.
-    lock = p.state / f"listen-{a.chat}.pid"
     try:
         other = int(lock.read_text())
     except (OSError, ValueError):
@@ -1520,9 +1550,16 @@ def _listener_state(pid: int, chat: str) -> str:
 
 
 def _listen_loop(p: Project, db, a, after: int, floor: str) -> None:
+    """Print what is meant for the user (relayers.wakes): this chat's own messages, asks and urgent
+    ones at once, broadcast alerts batched over relay.batch_s (--batch), routine updates never
+    (--all prints everything). Each printed line wakes a relayer chat, so fewer lines cost less."""
     from .web import cleared
+    from . import relayers
     deadline = time.time() + a.timeout if a.timeout else None
     parent = _STARTED_BY[1] if _STARTED_BY[0] == os.getpid() else os.getppid()
+    window = relayers.batch_s(p.config(), getattr(a, "batch", None))
+    pending: list = []
+    read, beat = after, time.time()
     while True:
         if os.getppid() != parent:
             return      # whoever started this listener is gone; nobody would read what it prints
@@ -1530,20 +1567,33 @@ def _listen_loop(p: Project, db, a, after: int, floor: str) -> None:
         # never skipped as if it had been read.
         top = db.one("SELECT COALESCE(MAX(id),0) m FROM messages")["m"]
         msgs = [m for m in db.unread_for_chat(a.chat, after, floor, upto=top) if not cleared(db, m, time.time())]
+        after = max(after, top)
+        ready = []
         for m in msgs:
-            print(_listen_line(p, m), flush=True)
-        if top > after:
-            after = top
-            # With --ack, only an acknowledgement marks messages read, so what was printed to a
-            # reader that is gone comes back on the next listen.
+            how = "now" if getattr(a, "all", False) else relayers.wakes(m, a.chat)
+            (ready if how == "now" else pending if how == "batch" else []).append(m)
+        late = deadline and time.time() > deadline
+        if ready or (pending and (late or time.time() >= min(m["ts"] for m in pending) + window)):
+            ready, pending = sorted(ready + pending, key=lambda m: m["id"]), []
+            for m in ready:
+                print(_listen_line(p, m), flush=True)
+        # Read up to the newest message, short of one still waiting for its batch: a listener that
+        # ends before printing it leaves it for the next one. With --ack, only an acknowledgement
+        # marks messages read, so what was printed to a reader that is gone comes back.
+        upto = min(m["id"] for m in pending) - 1 if pending else after
+        if upto > read:
+            read = upto
             if a.ack is None:
-                _listen_write(db, "UPDATE chats SET last_read=? WHERE id=?", (after, a.chat), f"marking #{after} read")
-        if msgs:
+                _listen_write(db, "UPDATE chats SET last_read=? WHERE id=?", (read, a.chat), f"marking #{read} read")
+        if ready:
             _listen_write(db, "UPDATE chats SET last_active=? WHERE id=?", (time.time(), a.chat), "noting activity")
             if a.once:
                 return
-        if deadline and time.time() > deadline:
+        if late:
             return
+        if time.time() - beat > 60:
+            beat = time.time()
+            relayers.touch(p, a.chat, getattr(a, "holder", ""), beat)
         time.sleep(poll_s(2))
 
 
@@ -1620,6 +1670,9 @@ def status_text(p: Project, verbose: bool = False) -> str:
         lines.append(f"  needs you (#{t['id']}, {t['wait']['age_text']}): {t['title']} — {t['wait']['text']}")
         if t["wait"].get("asks"):
             whole.add(lines[-1])
+    # A relayer on another chat's id takes that chat's replies (relayers.claim).
+    from . import relayers
+    lines += [f"  relay: {c}" for c in relayers.conflicts(p.db, now)]
     # Then what stops work (holds, pauses, breakers, a full disk), then alerts no chat or web view read.
     from . import hostcycle
     if cyc := hostcycle.hold(p, now):
@@ -13710,6 +13763,7 @@ def main(argv: list[str] | None = None) -> None:
             s.add_argument("--label", help="a name for the chat, shown in the web app")
             s.add_argument("--home-tz", help=argparse.SUPPRESS)     # the connecting workstation's zone
             s.add_argument("--home-from", help=argparse.SUPPRESS)   # and its name
+            s.add_argument("--holder", help=argparse.SUPPRESS)      # the relayer connecting (relayers.holder_id)
         if name in ("status", "paths"):
             s.add_argument("--json", action="store_true", help=f"print the {name} as JSON")
         if name == "status":
@@ -13756,6 +13810,7 @@ def main(argv: list[str] | None = None) -> None:
                    "kept apart from the user's words")
     s.add_argument("--finding", default="", help="a relayer's own findings, sent with no user's words; shown to "
                    "the coordinator as data, never the user's word")
+    s.add_argument("--holder", help=argparse.SUPPRESS)   # the relayer listening (relayers.holder_id)
     s.add_argument("--all", action="store_true", help="send to every project `ttp list` shows, once each: "
                    "a resend within 24 h reaches only those that did not get it yet")
     s.add_argument("--except", dest="except_", metavar="P,Q", help="with --all: projects to leave out")
@@ -13764,11 +13819,13 @@ def main(argv: list[str] | None = None) -> None:
     s.set_defaults(fn=cmd_say)
 
     s = sub.add_parser("listen", help="print messages for a chat as they arrive", description=(
-        "Print messages for a chat as they arrive. For a project on another machine the listen runs "
+        "Print messages for a chat as they arrive: this chat's replies, asks and high or critical "
+        "alerts at once, other alerts batched over relay.batch_s, routine updates not at all "
+        "(they stay in `ttp status` and the web app; --all prints them). For a project on another machine the listen runs "
         "there over ssh; a dropped connection (ssh exit 255, or a signal ending the session) is "
         "retried after 5 s, doubling to 2 min, and each message is printed once per listener. "
         "Exit codes: 0 messages shown (--once) or --timeout reached; 2 the project refused it "
-        "(unknown chat or project); 3 a newer listener for the chat replaced this one (not retried); "
+        "(unknown chat or project, or another relayer's chat id); 3 a newer listener for the chat replaced this one (not retried); "
         "75 the project stayed unreachable until --timeout ran out; "
         "any other code is the project's own ttp failing."))
     s.add_argument("name", help="the project")
@@ -13778,6 +13835,12 @@ def main(argv: list[str] | None = None) -> None:
                    help="stop after this many seconds (0: never); also bounds reconnecting")
     s.add_argument("--ack", type=int, metavar="ID",
                    help="mark messages up to ID read; later ones stay unread until acknowledged")
+    s.add_argument("--batch", type=float, metavar="S",
+                   help="hold broadcast alerts up to S seconds to print them together (default relay.batch_s, 120)")
+    s.add_argument("--holder", help=argparse.SUPPRESS)   # the relayer listening (relayers.holder_id)
+    s.add_argument("--all", action="store_true",
+                   help="print every message at once, routine updates included (default: only replies, asks "
+                        "and alerts, which are what a relayer passes on)")
     s.set_defaults(fn=cmd_listen)
 
     s = sub.add_parser("steer", help="print the coordinator's unread update for this run (also printed by ttp note)")
@@ -14655,6 +14718,7 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--status", help="list: only tasks in these statuses, comma-separated (queued,running,waiting,"
                    "blocked,review,done,failed,changes_needed,superseded,cancelled, ...); filtered before any cap, so every match "
                    "shows unless --limit is given")
+    s.add_argument("--holder", help=argparse.SUPPRESS)   # the relayer listening (relayers.holder_id)
     s.add_argument("--all", action="store_true", help="list: every task, not only the newest 50")
     s.add_argument("--limit", type=int, help="list: at most this many, newest first (default 50 with no --status; "
                    "a cut list says so on stderr)")

@@ -24,7 +24,7 @@ description: "Start, connect to, and talk with a long-running tt-project: a loca
 | 1. Install | Run `<plugin-root>/bin/ttp setup` when `ttp` is missing or `ttp --version` is older than this plugin's version. Afterwards use `ttp`; projects pick up the new release by themselves. Setup also adds the plain `/tt-project` command for Claude Code (`ttp setup --no-shortcut` removes it). |
 | 2. Name | Get the project name. `ttp find <name>` says whether it exists. |
 | 3a. New | Follow `create.md`. |
-| 3b. Existing | `ttp connect <name> --label "<short chat label>"`. Keep the printed `chat:` id. |
+| 3b. Existing | `ttp connect <name> --label "<short chat label>"`. Keep the printed `chat:` id: it is this chat's own. Never listen or `--chat` on an id another chat printed: that relayer's replies would come here instead (the project refuses it). One relayer chat per project chat. |
 | 3c. Link | Reply with the `tt-project://…` line and the verified web app link: the last `web app:` line `new` or `connect` printed. They open a remote project's kept local forward and check the link first. |
 | 4. Listen | Start the listener for this host: `hosts.md`. |
 | 5. Relay | User message for the project → `ttp say <name> --chat <id> "<the user's words, verbatim>"`, your own context only in `--context "<text>"`. |

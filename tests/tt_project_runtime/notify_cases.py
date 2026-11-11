@@ -765,3 +765,103 @@ def test_a_long_once_listen_blocks_in_one_call_and_returns_at_the_first_reply_or
     last = p.db.one("SELECT MAX(id) m FROM messages")["m"]
     cli.main(["listen", "demo", "--chat", "c1", "--once", "--timeout", "10", "--ack", str(last)])
     assert capsys.readouterr().out == "" and 4 <= len(naps) <= 7, naps
+
+
+def _fake_clock(cli, monkeypatch, step=2.0, on_nap=None):
+    real_time, clock, naps = time.time, [0.0], []
+
+    def nap(s):
+        naps.append(s)
+        clock[0] += step
+        if on_nap:
+            on_nap(len(naps))
+    monkeypatch.setattr(cli.time, "time", lambda: real_time() + clock[0])
+    monkeypatch.setattr(cli.time, "sleep", nap)
+    return clock, naps
+
+
+def test_listen_wakes_a_relayer_only_for_user_facing_messages_and_batches_broadcast_alerts(env, monkeypatch, capsys):
+    """Each printed line wakes a relayer chat: routine updates are not printed, a broadcast alert waits
+    up to --batch for company, and this chat's own reply prints at once with what was waiting."""
+    from ttp import cli
+    p = make(env)
+    _relay_chat(p)
+    monkeypatch.setattr(cli, "here", lambda: None)
+    p.db.post("out", "task 4 done", kind="info")
+    p.db.post("out", "ask 2 resolved", kind="resolved")
+    alert = p.db.post("out", "disk nearly full", kind="alert")
+    clock, naps = _fake_clock(cli, monkeypatch)
+    capsys.readouterr()
+    cli.main(["listen", "demo", "--chat", "c1", "--once", "--batch", "60", "--holder", "h/a"])
+    out = capsys.readouterr().out
+    assert "disk nearly full" in out and "task 4 done" not in out and "resolved" not in out, out
+    assert 29 <= len(naps) <= 31, len(naps)      # held for the 60 s window, not printed at once
+    # A reply to this chat prints at once and brings the alert waiting for its window along.
+    alert2 = p.db.post("out", "box rebooted", kind="alert")
+    p.db.post("out", "here is the answer", kind="reply", chat="c1")
+    naps.clear()
+    cli.main(["listen", "demo", "--chat", "c1", "--once", "--batch", "600", "--holder", "h/a"])
+    out = capsys.readouterr().out
+    assert out.index("box rebooted") < out.index("here is the answer") and not naps, (out, naps)
+    # An ask and a high alert never wait; --all prints routine updates too.
+    p.db.post("out", "Which board?", kind="ask")
+    cli.main(["listen", "demo", "--chat", "c1", "--once", "--batch", "600", "--holder", "h/a"])
+    assert "Which board?" in capsys.readouterr().out and not naps
+    p.db.post("out", "task 5 done", kind="info")
+    cli.main(["listen", "demo", "--chat", "c1", "--once", "--all", "--holder", "h/a"])
+    assert "task 5 done" in capsys.readouterr().out
+    assert alert < alert2
+
+
+def test_listen_never_marks_an_alert_still_waiting_for_its_batch_read(env, monkeypatch, capsys):
+    """A listener that ends before its batch window leaves the waiting alert for the next one."""
+    from ttp import cli
+    p = make(env)
+    _relay_chat(p)
+    monkeypatch.setattr(cli, "here", lambda: None)
+    info = p.db.post("out", "task 4 done", kind="info")
+    alert = p.db.post("out", "disk nearly full", kind="alert")
+    ppid = [os.getppid()]
+    monkeypatch.setattr(cli.os, "getppid", lambda: ppid[0])
+    _fake_clock(cli, monkeypatch, on_nap=lambda n: ppid.__setitem__(0, -1))
+    cli.main(["listen", "demo", "--chat", "c1", "--batch", "600", "--holder", "h/a"])
+    assert "disk nearly full" not in capsys.readouterr().out
+    assert p.db.one("SELECT last_read FROM chats WHERE id='c1'")["last_read"] == info < alert
+
+
+def test_one_relayer_per_chat_id_refuses_another_and_redelivers_what_a_takeover_took(env, monkeypatch, capsys):
+    """A relayer listening on another chat's id would take that chat's replies: it is refused while the
+    chat's relayer listens, status names it, and what it took after a lapsed lease goes to the owner again."""
+    from ttp import cli, relayers
+    from ttp.cli import status_text
+    p = make(env)
+    _relay_chat(p)
+    _relay_chat(p, "c2", label="relay-b")
+    monkeypatch.setattr(cli, "here", lambda: None)
+    clock, _ = _fake_clock(cli, monkeypatch)
+    cli.main(["listen", "demo", "--chat", "c1", "--once", "--timeout", "1", "--holder", "mac/a"])
+    capsys.readouterr()
+    with pytest.raises(SystemExit) as ex:
+        cli.main(["listen", "demo", "--chat", "c1", "--once", "--timeout", "1", "--holder", "mac/b"])
+    err = capsys.readouterr().err
+    assert ex.value.code == 2 and "mac/a" in err and "own chat id" in err, err
+    with pytest.raises(SystemExit):     # nor by reusing the id at connect
+        cli.main(["connect", "demo", "--chat", "c1", "--holder", "mac/b"])
+    assert any("mac/b" in ln and "chat c1" in ln and "close that relayer chat" in ln
+               for ln in status_text(p).splitlines()), status_text(p)
+    from ttp import coordinator as coord
+    assert "- relay: a second relayer (mac/b) listened on chat c1" in coord.digest(p, {}, [], [])
+    # A listener gets only its own chat's replies (and broadcasts).
+    p.db.post("out", "for the other chat", kind="reply", chat="c2")
+    cli.main(["listen", "demo", "--chat", "c1", "--once", "--timeout", "1", "--holder", "mac/a"])
+    assert "for the other chat" not in capsys.readouterr().out
+    # The lease lapses; another relayer takes the chat and a reply; the owner gets it again.
+    clock[0] += relayers.LEASE_S + 60
+    cli.main(["listen", "demo", "--chat", "c1", "--once", "--timeout", "1", "--holder", "mac/b"])
+    p.db.post("out", "the answer", kind="reply", chat="c1")
+    cli.main(["listen", "demo", "--chat", "c1", "--once", "--timeout", "1", "--holder", "mac/b"])
+    assert "the answer" in capsys.readouterr().out
+    cli.main(["listen", "demo", "--chat", "c1", "--once", "--timeout", "1", "--holder", "mac/a"])
+    assert "the answer" in capsys.readouterr().out
+    with pytest.raises(SystemExit):     # and the chat is the owner's again
+        cli.main(["listen", "demo", "--chat", "c1", "--once", "--timeout", "1", "--holder", "mac/b"])
