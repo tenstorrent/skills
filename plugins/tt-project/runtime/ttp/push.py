@@ -10,7 +10,9 @@ tree with the same commands and environment (_own_pass).
 Pushes of one project to one branch take turns: each holds the lock `push:<remote>/<branch>` from
 its first fetch to its push, so two reviewers never race each other through rounds. The lock is an
 OS file lock (locks.py): a killed push or a reboot frees it. A waiting push waits as long as the
-last measured check run takes, with a margin, up to 2 h (`delivery.push_wait_s` overrides it).
+last measured check run takes, with a margin, up to 2 h (`delivery.push_wait_s` overrides it), counted
+from when it is first in line: waiters queue beside the lock, an urgent or user-ordered task's first,
+then by age (take).
 Each check runs at most four times the last measured check run, at least 4 h
 (`delivery.push_checks_timeout_s` overrides it, 0 for no limit), counting its run time, wall time less its waits for a grant
 and for a test-pool slot (checkwait, `ttp pool-wait`): one that ran past it is ended and fails the push. One still waiting for a
@@ -3627,9 +3629,14 @@ def lock_name(remote: str, branch: str) -> str:
     return f"push:{remote}/{branch}"
 
 
+def lock_resource(remote: str, branch: str) -> str:
+    """The lock's resource name; the branch is quoted so its slashes stay in one name."""
+    return "push:" + quote(f"{remote}/{branch}", safe="")
+
+
 def lock_paths(p: Project, remote: str, branch: str) -> list[Path]:
-    """The lock file of pushes to remote/branch; the branch is quoted so its slashes stay in one name."""
-    return locks.slot_paths(p.state / "locks", "push:" + quote(f"{remote}/{branch}", safe=""), 1)
+    """The lock file of pushes to remote/branch."""
+    return locks.slot_paths(p.state / "locks", lock_resource(remote, branch), 1)
 
 
 def free_probe(p: Project) -> str:
@@ -3639,30 +3646,72 @@ def free_probe(p: Project) -> str:
     return f"{shlex.quote(str(ttp)) if ttp.is_file() else 'ttp'} push --free"
 
 
+STALL_S = 30   # the lock free this long while a waiter ahead does not take it: the next one takes it
+
+
+def _priority(p: Project) -> int | None:
+    try:
+        return checkcap.task_priority(p)
+    except Exception:   # an unreadable task only loses the ordering, never the wait
+        return None
+
+
 def take(p: Project, remote: str, branch: str, wait_s: float, poll_s: float = 1.0,
          say: Callable[[str], None] = lambda m: print(f"ttp push: {m}", file=sys.stderr),
          who: str | None = None):
-    """The held push lock of remote/branch, waiting up to `wait_s` for it; None when it stayed busy.
-    Inside a run the wait is recorded, so it does not count against the run's wall clock. `who`
-    labels the holder (default: the task and run, else the pid)."""
+    """The held push lock of remote/branch, waiting for it; None when it stayed busy.
+    Waiters queue beside the lock (locks.enqueue, with the task's priority): when it frees, the first
+    live one in turn takes it, an urgent or user-ordered task's (locks.my_turn) before the rest, each
+    in arrival order; a dead waiter's ticket drops out of the queue. `wait_s` counts from when this
+    waiter is first in line, so one behind others is never failed for their turns; one that stays
+    first in line while the lock stays busy gives up after `wait_s`. A waiter ahead that leaves the
+    lock free for STALL_S loses its turn to the next. `wait_s` 0: one try, no queue (the push queue's
+    batch). Inside a run the wait is recorded, so it does not count against the run's wall clock.
+    `who` labels the holder (default: the task and run, else the pid)."""
     paths = lock_paths(p, remote, branch)
+    locks_dir, resource = p.state / "locks", lock_resource(remote, branch)
     who = who or (f"task #{os.environ['TTP_TASK']} (run {os.environ.get('TTP_RUN_ID') or '?'})"
                   if os.environ.get("TTP_TASK") else f"pid {os.getpid()}")
-    f = locks.try_take(paths, who, "ttp push")
-    if f:
-        return f
+    if wait_s <= 0 or not locks.queued(locks_dir, resource):
+        f = locks.try_take(paths, who, "ttp push")
+        if f or wait_s <= 0:
+            return f
     name = lock_name(remote, branch)
-    say(f"waiting up to {wait_s:.0f} s for {name} (held by {', '.join(locks.holders_now(paths, p)) or 'another push'})")
-    run_dir = Path(os.environ["TTP_RUN_DIR"]) if os.environ.get("TTP_RUN_DIR") else None
     started = time.time()
+    try:
+        ticket = locks.enqueue(locks_dir, resource, who, since=started, priority=_priority(p))
+    except OSError:   # no queue: plain polling, in no fixed order
+        ticket = None
+    mine = ticket
+    waiting = len(locks.queued(locks_dir, resource)) - 1 if ticket else 0
+    say(f"waiting up to {wait_s:.0f} s, counted once first in line, for {name} (held by "
+        f"{', '.join(locks.holders_now(paths, p)) or 'another push'}"
+        + (f"; {waiting} other push(es) waiting" if waiting > 0 else "") + ")")
+    run_dir = Path(os.environ["TTP_RUN_DIR"]) if os.environ.get("TTP_RUN_DIR") else None
     key = f"push:{os.getpid()}:{started}"
     if run_dir:
         locks.record_wait(run_dir, key, started, None)
+    f, first_at, free_since = None, None, None
     try:
-        while not f and time.time() - started < wait_s:
-            time.sleep(max(0.0, min(poll_s, wait_s - (time.time() - started))))
-            f = locks.try_take(paths, who, "ttp push")
+        while True:
+            if ticket is not None and locks.dropped(ticket):
+                ticket = None
+            first = ticket is None or locks.my_turn(locks_dir, resource, ticket, 1)
+            now = time.time()
+            if first and first_at is None:
+                first_at = now
+                if ticket is not None and now - started >= poll_s:
+                    say(f"first in line for {name} after {now - started:.0f} s")
+            elif not first:
+                first_at = None   # a more urgent waiter came in ahead: its turn is not this one's wait
+            free_since = (free_since or now) if not first and locks.any_free(paths) else None
+            if first or (free_since and now - free_since >= STALL_S):
+                f = locks.try_take(paths, who, "ttp push")
+            if f or (first_at is not None and now - first_at >= wait_s):
+                break
+            time.sleep(max(0.0, poll_s if first_at is None else min(poll_s, wait_s - (now - first_at))))
     finally:
+        locks.dequeue(mine)
         if run_dir:
             locks.record_wait(run_dir, key, started, time.time())
     if f:

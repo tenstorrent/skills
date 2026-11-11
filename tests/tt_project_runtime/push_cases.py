@@ -20490,3 +20490,77 @@ def test_an_approval_that_fixes_the_failing_tip_goes_alone_first(env, monkeypatc
     monkeypatch.setattr(pushq, "_changed", lambda p, a, b: frozenset({"tests/test_other.py"}))
     rows, why = pushq.due(s.p, time.time() + 10 ** 6)
     assert [r["id"] for r in rows] == [routine], "the first approval whose change touches the failing tests"
+
+
+def _push_waiters(p, monkeypatch, prios, wait_s=30):
+    """One thread per (name, task priority) calling push.take on a held push lock, started in that
+    order once the one before is queued; returns (threads, order the lock was taken in, the holder)."""
+    from ttp import checkcap, locks, push
+    local = threading.local()
+    monkeypatch.setattr(checkcap, "task_priority", lambda _p: getattr(local, "prio", None))
+    held = locks.try_take(push.lock_paths(p, "origin", "proj"), "the holder", "ttp push")
+    order, threads = [], []
+
+    def wait(name, prio):
+        local.prio = prio
+        f = push.take(p, "origin", "proj", wait_s, poll_s=0.05, say=lambda _m: None, who=name)
+        order.append(name if f else f"{name}: gave up")
+        time.sleep(0.5)   # holds it a moment: the next waiter's turn comes after this one's
+        if f:
+            f.close()
+
+    resource = push.lock_resource("origin", "proj")
+    for name, prio in prios:
+        t = threading.Thread(target=wait, args=(name, prio), daemon=True)
+        t.start()
+        threads.append(t)
+        assert _wait_for(lambda: len(locks.queued(p.state / "locks", resource)) == len(threads))
+    return threads, order, held
+
+
+def test_push_waiters_take_the_lock_urgent_first_then_by_age(env, monkeypatch):
+    """Three pushes wait for one push lock; on release the urgent task's (priority 1) takes it, then
+    the oldest of the rest, not in random order. The last one waits longer than its 1 s in all, but
+    under 1 s once first in line: it is not failed for the others' turns."""
+    from ttp import locks, push
+    p = make(env)
+    threads, order, held = _push_waiters(p, monkeypatch, [("old", 3), ("plain", None), ("urgent", 1)], wait_s=1)
+    time.sleep(0.7)
+    held.close()
+    for t in threads:
+        t.join(timeout=30)
+    assert order == ["urgent", "old", "plain"], order
+    assert not locks.queued(p.state / "locks", push.lock_resource("origin", "proj")), "a ticket stayed queued"
+
+
+def test_a_dead_push_waiter_is_skipped_and_a_late_turn_gets_its_full_wait(env, monkeypatch, tmp_path):
+    """A user-ordered waiter ahead dies while it waits: on release the next live waiter takes the lock
+    at once, not after the stall guard. A waiter behind others gets its whole wait once first in line."""
+    from ttp import locks, push
+    p = make(env)
+    resource = push.lock_resource("origin", "proj")
+    queued_mark = tmp_path / "queued"
+    dead = subprocess.Popen([sys.executable, "-c",
+                             "import sys, time, pathlib; from ttp import locks; "
+                             "locks.enqueue(pathlib.Path(sys.argv[1]), sys.argv[2], 'dead push', priority=0); "
+                             "pathlib.Path(sys.argv[3]).touch(); time.sleep(600)",
+                             str(p.state / "locks"), resource, str(queued_mark)],
+                            env={**os.environ, "PYTHONPATH": str(RUNTIME)})
+    try:
+        assert _wait_for(lambda: queued_mark.exists())
+        held = locks.try_take(push.lock_paths(p, "origin", "proj"), "the holder", "ttp push")
+        got = []
+        t = threading.Thread(target=lambda: got.append(push.take(p, "origin", "proj", 2, poll_s=0.05,
+                                                                 say=lambda _m: None, who="live")), daemon=True)
+        t.start()
+        assert _wait_for(lambda: len(locks.queued(p.state / "locks", resource)) == 2)
+        time.sleep(2.5)   # longer than its wait, all of it behind the dead waiter: not failed for that
+        assert t.is_alive(), "a waiter behind another was failed for waiting"
+    finally:
+        dead.kill()
+        dead.wait(timeout=30)
+    t0 = time.time()
+    held.close()
+    t.join(timeout=30)
+    assert got and got[0] is not None and time.time() - t0 < push.STALL_S / 2, (got, time.time() - t0)
+    got[0].close()
