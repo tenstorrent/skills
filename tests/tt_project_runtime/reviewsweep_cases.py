@@ -328,13 +328,21 @@ def test_a_finish_with_the_review_cap_full_gets_its_review_once_the_cap_allows_o
 def test_a_finish_reads_git_for_its_review_under_its_own_short_cap(env, monkeypatch):
     """The finish's review read runs under gitmemo.FINISH_REVIEW_GIT_S, not the finish transaction's whole
     budget: a slow read leaves the review to the next tick."""
+    import sys
     from ttp import gitmemo, worktree
     from ttp.daemon import KV_REVIEW_UNREAD
     p = make(env)
     _with_origin(env, clone=False)
     caps, diff = [], worktree.diff_lines
-    monkeypatch.setattr(worktree, "diff_lines",
-                        lambda *a, **k: caps.append(gitmemo.timeout(None, read=True)) or diff(*a, **k))
+
+    def read(*a, **k):   # the review's own reads only: the split gate's memoized read runs before it
+        f, mine = sys._getframe(1), False
+        while f is not None and not mine:
+            f, mine = f.f_back, f.f_code.co_name == "_auto_review"
+        if mine:
+            caps.append(gitmemo.timeout(None, read=True))
+        return diff(*a, **k)
+    monkeypatch.setattr(worktree, "diff_lines", read)
     tid, _, _, reviews = _finish_code(env, p, "short read", {"app.py": 5})
     assert reviews and caps and all(c is not None and c <= gitmemo.FINISH_REVIEW_GIT_S for c in caps), caps
     assert gitmemo.FINISH_REVIEW_GIT_S < gitmemo.TX_GIT_S and not p.db.kv(KV_REVIEW_UNREAD)
