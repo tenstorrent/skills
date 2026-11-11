@@ -484,6 +484,22 @@ def _pins(cell: Path) -> dict[str, str]:
     return {str(p.relative_to(cell)): _sha(p) for p in sorted(files + ([hook] if hook.is_file() else []))}
 
 
+def _held_cmd(test_cmd: str, tests: list[str]) -> list[str]:
+    """`test_cmd` running only the held-out `tests` ("path::name"). A plain pytest run selects them with
+    the ttp_pytest_select plugin, so a case file's test runs where its aggregator collects it: a file
+    pytest collects by its name is passed itself, any other its top directory. Other commands get the ids."""
+    from . import addedtests, pushpass
+    if not addedtests.eligible(test_cmd):
+        return [*shlex.split(test_cmd), *tests]
+    files = dict.fromkeys(t.partition("::")[0] for t in tests)
+    paths = dict.fromkeys(f if re.fullmatch(r"test_.*\.py|.*_test\.py", Path(f).name) else Path(f).parts[0]
+                          for f in files)
+    pp = os.pathsep.join(filter(None, (str(pushpass.PLUGIN_DIR), os.environ.get("PYTHONPATH", ""))))
+    opts = " ".join(filter(None, (os.environ.get("PYTEST_ADDOPTS", ""), f"-p {pushpass.SELECT_PLUGIN}")))
+    return ["env", f"PYTHONPATH={pp}", f"PYTEST_ADDOPTS={opts}", "TTP_PYTEST_SELECT_FILES=" + "\n".join(tests),
+            *shlex.split(test_cmd), *paths]
+
+
 def cells(bench_dir: Path, out: Path, repo: Path | None = None, seeded: int = 0, test_cmd: str = TEST_CMD,
           tries: int = 20, timeout: float = TEST_TIMEOUT) -> dict:
     """Build seeded-bug and prompt-injection cells (benchcells) in `out` (new) from the `ttp bench prep`
@@ -507,7 +523,7 @@ def cells(bench_dir: Path, out: Path, repo: Path | None = None, seeded: int = 0,
         targets = _targets(repo, k["base"], k["head"])
         if not targets:
             return k, None, "its landed change touches no non-test Python line"
-        cmd = [*shlex.split(test_cmd), *k["tests"]]
+        cmd = _held_cmd(test_cmd, k["tests"])
         with tempfile.TemporaryDirectory(prefix="ttp-cells-") as tmp:
             src = Path(tmp) / "head"
             _archive(repo, k["head"], src)

@@ -10,7 +10,8 @@ tests with one of those ids (as pytest's node id or relative to the current dire
 prints them; set but empty: none), so a same-named test in another file never runs.
 TTP_PYTEST_SELECT_FILES, one entry per line (testpick, a task's targeted `ttp checks`), keeps only the
 tests matching an entry: a path keeps the tests defined in that file (a case file an aggregator test
-file executes, or a test file), `path::name` the test function `name` of test file `path`. The filters
+file executes, or a test file), `path::name` the test function `name` of test file `path` (or of the
+case file `path`, wherever it is collected). The filters
 combine (a test must pass each one set). A run that keeps none exits 5, pytest's "no tests" status.
 It acts only in the pytest process it was loaded into and its xdist workers: it takes its load, its
 TTP_PYTEST_SELECT* settings and its folder on PYTHONPATH out of the environment, so a pytest a test
@@ -123,7 +124,7 @@ def _in_files(item, paths: set, tests: set) -> bool:
         code = ""
     name = getattr(item, "originalname", None) or item.name.partition("[")[0]
     return any(_ends(code, p) or _ends(where, p) for p in paths) \
-        or any(n == name and _ends(where, p) for p, n in tests)
+        or any(n == name and (_ends(where, p) or _ends(code, p)) for p, n in tests)
 
 
 def _cwd_relative(config, nodeid: str) -> str:

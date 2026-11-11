@@ -235,3 +235,21 @@ def test_bench_cells_refuses_a_changed_bench_and_caps_seeded_cells(env, tmp_path
     with pytest.raises(ValueError, match="manifest.sha256"):
         bench.cells(b, tmp_path / "c2")
     assert not (tmp_path / "c2").exists()
+
+
+def test_bench_cells_runs_a_held_out_case_file_test_where_its_aggregator_collects_it(tmp_path):
+    from ttp import bench
+    (tmp_path / "tests" / "cases").mkdir(parents=True)
+    (tmp_path / "tests" / "cases" / "x_cases.py").write_text("def test_a():\n    pass\n\n\ndef test_b():\n    assert False\n")
+    (tmp_path / "tests" / "test_agg.py").write_text(
+        "from pathlib import Path\n_p = Path(__file__).parent / 'cases' / 'x_cases.py'\n"
+        "exec(compile(_p.read_text(), str(_p), 'exec'))\n\n\ndef test_c():\n    assert False\n")
+    cmd = f"{sys.executable} -m pytest -q -p no:cacheprovider"
+    run = lambda ids: subprocess.run(bench._held_cmd(cmd, ids), cwd=tmp_path, capture_output=True, text=True)
+    # Only the named test of the case file runs (test_c of the aggregator and test_b do not).
+    ok = run(["tests/cases/x_cases.py::test_a"])
+    assert ok.returncode == 0 and "1 passed" in ok.stdout
+    assert run(["tests/cases/x_cases.py::test_b"]).returncode == 1
+    assert run(["tests/test_agg.py::test_c"]).returncode == 1
+    # A command that is not one plain pytest run gets the ids appended.
+    assert bench._held_cmd("make check", ["t.py::x"]) == ["make", "check", "t.py::x"]

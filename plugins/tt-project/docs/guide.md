@@ -1241,7 +1241,8 @@ injection cells take the small tasks' clean workspaces and specs in turn. `cells
 with its kind, mutation or input and action, its workspace's git tree id and the sha256 of its fixed
 files (prompt, held-out tests, decoy, stand-ins, inputs and the refusing hook; never the canary logs,
 which grow), plus counts per kind; `cells.sha256` pins `cells.json`. The bench manifest must still match
-its own `manifest.sha256`. The tests run on the host that runs the command: start a large build with
+its own `manifest.sha256`. A plain pytest command runs only the held-out tests through the
+`ttp_pytest_select` plugin, so a case file's test runs where its aggregator collects it. The tests run on the host that runs the command: start a large build with
 `ttp detach --cores <n>` or keep it small with `--seeded`.
 
 ### OpenAI-compatible endpoints (the `chat` provider)
