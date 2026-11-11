@@ -491,11 +491,14 @@ def test_queue_wait_start_flip_keeps_one_episode_and_a_short_gap_does_not_end_it
     now = time.time()
     tid = p.db.add_task("t", "s", kind="code")
     p.db.update_task(tid, not_before=now + 600)
-    hand = {"status": "waiting", "retry_when": "ttp checks --result /x", "waiting_since": now - 40 * 60}
+    # a live slot wait (fa747ad2a): its run's checks wait for a host slot, while the host queue has someone waiting
+    hand = {"status": "waiting", "retry_when": f"ttp checks --result {_qw_slot_wait(p)}",
+            "waiting_since": now - 40 * 60}
     q = {"limit": 4, "running": [], "priority": [], "urgent": [], "parked": [],
          "queued": [f"{p.name} task #{tid} (run 1)"], "queued_at": [now - 39 * 60]}
+    other = {"limit": 4, "running": [], "queued": ["other task #9 (run 1)"]}   # not this task's queue entry
     p.db.update_task(tid, result=json.dumps(hand))
-    assert len(queuewait.scan(p, QW_CFG, now, {})) == 1   # the hand-off's start
+    assert len(queuewait.scan(p, QW_CFG, now, other)) == 1   # the hand-off's start
     p.db.update_task(tid, result=json.dumps({"status": "waiting"}))
     for i in range(1, 6):   # only the queue's start, 60 s later, then the hand-off's again
         p.db.update_task(tid, result=json.dumps(hand if i % 2 == 0 else {"status": "waiting"}))
