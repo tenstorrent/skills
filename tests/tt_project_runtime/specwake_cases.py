@@ -337,7 +337,7 @@ def test_an_urgent_or_wake_now_spec_update_wakes_a_sleeping_task_at_once(env, mo
         if how.startswith("wake_now"):
             act["wake_now"] = True
         assert coord.apply(p, [act]) == [], how
-        assert _run_until(d, p, lambda: runs() == 2), f"{how}: no run at once"
+        assert _run_until(d, p, lambda: runs() == 2 and idle()), f"{how}: no run at once"
         wake = _last_wake(p, tid)
         assert wake.get("tier") == "standard" and wake.get("escalated") is True, (how, wake)
         assert "wake_now" not in json.loads(p.db.task(tid)["result"]), f"{how}: the request outlived its wake"
@@ -710,7 +710,7 @@ def test_a_spec_wake_that_hands_back_the_same_wait_holds_the_next_spec_wakes_unt
     # The hold ends: the held wake_now wakes it once, with every update since.
     res = json.loads(t["result"])
     p.db.update_task(tid, result=json.dumps({**res, "spec_hold": {**res["spec_hold"], "until": time.time() - 1}}))
-    assert _run_until(d, p, lambda: runs() == 3), "the wake_now held through the hold did not wake it after"
+    assert _run_until(d, p, lambda: runs() == 3 and idle()), "the wake_now held through the hold did not wake it after"
 
 
 def test_a_spec_wake_that_hands_back_a_different_wait_holds_nothing(env, monkeypatch, tmp_path):
@@ -722,7 +722,7 @@ def test_a_spec_wake_that_hands_back_a_different_wait_holds_nothing(env, monkeyp
     d, tid, flag, runs, idle = _spec_wake_flow(p, monkeypatch, tmp_path, second=other)
     assert "spec_hold" not in json.loads(p.db.task(tid)["result"])
     _edit_spec(p, tid, "and the wall time")
-    assert _run_until(d, p, lambda: runs() == 3), "a changed wait kept the next spec wake out"
+    assert _run_until(d, p, lambda: runs() == 3 and idle()), "a changed wait kept the next spec wake out"
 
 
 def test_the_spec_wake_hold_leaves_the_tasks_own_retry_when_wake_alone(env, monkeypatch, tmp_path):
@@ -732,7 +732,7 @@ def test_the_spec_wake_hold_leaves_the_tasks_own_retry_when_wake_alone(env, monk
     assert json.loads(p.db.task(tid)["result"])["spec_hold"]
     monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
     flag.write_text("")
-    assert _run_until(d, p, lambda: runs() == 3), "the hold kept its own probe pass from waking it"
+    assert _run_until(d, p, lambda: runs() == 3 and idle()), "the hold kept its own probe pass from waking it"
 
 
 def test_the_spec_wake_hold_is_a_setting_and_zero_turns_it_off(env, monkeypatch, tmp_path):
