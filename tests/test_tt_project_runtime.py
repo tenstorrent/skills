@@ -19691,7 +19691,7 @@ def test_a_push_batch_refuses_main_the_remotes_default_branch_and_a_changed_targ
     assert rc == 2 and _statuses(m) == ["refused"] and "default branch" in m["message"], m
     # The configured target changed after the batch was made: its entries wait for a batch to the new one.
     rc, m = _run_batch(p, _batch_marker(p, heads, bid="b3", target="origin/old"), monkeypatch)
-    assert rc == 2 and m["outcome"] == "refused" and _statuses(m) == ["requeued"], m
+    assert m["outcome"] == "retargeted" and _statuses(m) == ["requeued"], m
     assert _git_out(origin, "rev-parse", "proj") == before
     assert subprocess.run(["git", "-C", str(origin), "rev-parse", "-q", "--verify", "main"]).returncode != 0
 
