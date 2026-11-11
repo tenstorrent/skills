@@ -15,7 +15,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import overview, project, timefmt
+from . import overview, project, service, timefmt
 from .db import SEVERITY_RANK
 
 CHECKS = "deploy_checks"
@@ -528,8 +528,12 @@ def tick(p, alert, now: float | None = None) -> None:
                 continue
             rec["next_probe"] = now + PROBE_S
             changed = True
-            outcome, kind, reason = _judge(p, rec, _probe(rec, now), takeovers.setdefault(rec["name"], {}), now,
-                                           start=True)
+            row = _probe(rec, now)
+            if service.stopped_at(rec["name"], rec.get("entry") or {}, row):   # stopped on purpose: closed quietly
+                _settle(rec, "stopped", now)
+                rec["closed"] = now
+                continue
+            outcome, kind, reason = _judge(p, rec, row, takeovers.setdefault(rec["name"], {}), now, start=True)
             _settle(rec, outcome, now)
             if outcome == "failed" and _mark(rec, kind, now):
                 failing.append((rec, kind, reason))

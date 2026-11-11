@@ -663,3 +663,40 @@ def test_an_upgrade_never_starts_a_stopped_daemon_and_asks_another_projects_runn
     monkeypatch.setattr(upjournal, "_touched", lambda *a: [])
     line = upjournal.recover(p, restart=lambda q: pytest.fail("recover started the daemon"), log=lambda m: None)
     assert "not started" in line, line
+
+
+def test_a_project_stopped_on_purpose_is_left_out_of_deploys_rollout_counts_and_deploy_alerts(env, tmp_path, monkeypatch):
+    """A project whose daemon was stopped on purpose (no service, no daemon) gets no verdict, no place in
+    `ttp deployed`'s count and no deploy alert: one "stopped on purpose" line instead, until it starts again."""
+    from ttp import deploy, overview, service
+    p = make(env)
+    monkeypatch.setattr(service, "installed", lambda q: None)
+    monkeypatch.setattr(service, "daemon_stopped", lambda q: True)
+    assert service.stopped_on_purpose(p)
+    monkeypatch.setattr(service, "installed", lambda q: {"kind": "systemd", "watchdog": True})
+    assert not service.stopped_on_purpose(p), "a service keeps it: not stopped on purpose"
+    monkeypatch.setattr(service, "installed", lambda q: None)
+    real = service.stopped_at.real
+    assert not real("x", {}, {}) and not real("x", {"dir": "/nowhere"}, {"daemon_alive": True})
+    assert not real("x", {"dir": "/nowhere"}, {"upgrading": True}), "its own upgrade restarts it"
+    assert real("x", {"dir": "/nowhere"}, {"daemon_alive": False})
+    _deploy_lib("0.5.0")
+    _deploy_project(tmp_path, "alpha", "0.4.9")
+    _deploy_project(tmp_path, "beta", "0.4.9")
+    stopped = set()
+    monkeypatch.setattr(service, "stopped_at", lambda n, e, row: n in stopped)
+    now = time.time()
+    deploy.record(p, overview.deployed(names=["alpha", "beta"]), now)   # beta's check opens while it runs
+    stopped.add("beta")
+    report = overview.deployed()
+    names = [r["name"] for r in report["projects"]]
+    assert "alpha" in names and "beta" not in names and report["stopped"] == ["beta"]
+    assert f"beta\t{service.STOPPED_ON_PURPOSE}" in report["text"]
+    assert f" of {len(names)} running it" in report["text"] or f"all {len(names)} project" in report["text"]
+    pages = []
+    deploy.tick(p, lambda key, text, severity, **_: pages.append(key), now + 10 * deploy.GRACE_S)
+    beta = [r for r in (p.db.kv(deploy.CHECKS) or {}).values() if r.get("name") == "beta"]
+    assert beta and all(r.get("closed") and r.get("outcome") == "stopped" for r in beta)
+    assert not any("beta" in k for k in pages) and not deploy.holds_behind(p.db, "beta", now + 10 * deploy.GRACE_S)
+    named = overview.deployed(names=["beta"])
+    assert [r["name"] for r in named["projects"]] == ["beta"], "named on purpose: still checked"

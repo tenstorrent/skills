@@ -587,14 +587,19 @@ def deployed(target: str | None = None, commit: str | None = None, names: list[s
         return {**out, "rc": CANNOT, "text": "cannot tell: no version given and no release installed (`ttp setup`)"}
     reg = project.load_registry().get("projects") or {}
     pick = sorted(reg) if not names else names
-    rows = []
+    rows, stopped = [], []
+    from . import service
     for n in pick:
         e = reg.get(n)
         if not isinstance(e, dict):
             rows.append({"name": n, "state": CANNOT, "reason": "not registered on this machine",
                          "line": f"{n}\tcannot tell: not registered on this machine"})
         elif names or e.get("host") in (None, here):
-            rows.append(deploy_status(n, e, target, commit, now, here, fresh_s, allow_newer))
+            row = deploy_status(n, e, target, commit, now, here, fresh_s, allow_newer)
+            if not names and service.stopped_at(n, e, row):
+                stopped.append(n)   # stopped on purpose: no verdict, count or alert until it is started again
+            else:
+                rows.append(row)
     rc = max((r["state"] for r in rows), default=OK)
     head = f"tt-project {target}" + (f" ({commit[:12]})" if commit else "")
     counts = {s: sum(1 for r in rows if r["state"] == s) for s in (OK, PENDING, CANNOT)}
@@ -604,4 +609,5 @@ def deployed(target: str | None = None, commit: str | None = None, names: list[s
     if not rows:
         first = f"{head}: no projects registered on this machine"
     lines = [first] + [r["line"] for r in sorted(rows, key=lambda r: -r["state"])]   # what holds it back first
-    return {**out, "rc": rc, "projects": rows, "text": "\n".join(lines)}
+    lines += [f"{n}\t{service.STOPPED_ON_PURPOSE}" for n in stopped]
+    return {**out, "rc": rc, "projects": rows, "stopped": stopped, "text": "\n".join(lines)}

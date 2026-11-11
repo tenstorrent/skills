@@ -542,6 +542,9 @@ def env(tmp_path, monkeypatch, _git_session, _short_tmp):
     running = lambda p: False   # an upgrade's restart (restart_running) finds a test project's daemon up; .real checks
     running.real = service.daemon_stopped
     monkeypatch.setattr(service, "daemon_stopped", running)
+    kept = lambda name, entry, row: False   # a test project has no service: its daemon faults, not stopped on purpose
+    kept.real = service.stopped_at
+    monkeypatch.setattr(service, "stopped_at", kept)
     monkeypatch.setattr(importlib.machinery.SourceFileLoader, "get_code",
                         _cached_get_code(importlib.machinery.SourceFileLoader.get_code))
     monkeypatch.setattr(gettext, "find", _cached_find(gettext.find))

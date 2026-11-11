@@ -1047,6 +1047,31 @@ def _judge_start(p: Project, t0: float, old: set[int], stop_s: float, wait_s: fl
     return wait_for_start(p, t0, wait_s, tick_wait_s, waits_from=time.time(), until=until), stopped, left
 
 
+STOPPED_ON_PURPOSE = ("stopped on purpose: left out of deploys, rollout counts and health alerts until it is "
+                      "started again (`ttp start`)")
+
+
+def stopped_on_purpose(p: Project) -> bool:
+    """Its daemon was stopped on purpose: no service keeps it running (`ttp stop`, or services its user
+    removed) and no daemon runs. Deploys leave it out until it is started again. Read only."""
+    try:
+        return not installed(p) and daemon_stopped(p)
+    except (OSError, ValueError):
+        return False
+
+
+def stopped_at(name: str, entry: dict, row: dict) -> bool:
+    """stopped_on_purpose for registered project `name` from its deploy row (overview.deploy_status: its
+    daemon is not alive and not mid-upgrade) and its registry entry. Read only: the project is not opened."""
+    if not isinstance(entry, dict) or not entry.get("dir") or row.get("daemon_alive") or row.get("upgrading"):
+        return False
+    from types import SimpleNamespace
+    try:
+        return installed(SimpleNamespace(name=name, base=Path(str(entry["dir"])) / "tt-project")) is None
+    except (OSError, ValueError):
+        return False
+
+
 def daemon_stopped(p: Project) -> bool:
     """No daemon of p runs: no live daemon process and no heartbeat that still ticks."""
     _, main = _manager_view(p)
