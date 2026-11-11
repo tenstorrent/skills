@@ -896,8 +896,8 @@ def lane_tasks(p: Project) -> set[int]:
 
 def sweep_superseded_checks(p: Project, now: float | None = None) -> list[dict]:
     """Stop the detached checks an open task's run started under a superseded check set: checks.pid
-    records the configured set's id (push.checks_set_id) and delivery.push_checks has changed since, so
-    their result would no longer qualify the head. Each is ended (end_checks) and dropped (cli._checks_drop
+    records the configured set's id (push.checks_set_id; of task_checks for a run that can take them,
+    `checks_task`) and that set has changed since, so their result would no longer qualify the head. Each is ended (end_checks) and dropped (cli._checks_drop
     writes checks.rc 1 and why), so the task wakes and reruns its checks under the current set. Runs of
     named commands or harness checks record no set and are left alone; a group checks_refused names is never
     signalled."""
@@ -905,7 +905,8 @@ def sweep_superseded_checks(p: Project, now: float | None = None) -> list[dict]:
     from .push import checks_set_id
     now = time.time() if now is None else now
     try:
-        current = checks_set_id(p.config().get("delivery") or {})
+        delivery = p.config().get("delivery") or {}
+        ids = {task: checks_set_id(delivery, task) for task in (False, True)}
     except Exception:
         return []
     marks = ",".join("?" * len(ENDED + HANDED_OFF))
@@ -918,12 +919,13 @@ def sweep_superseded_checks(p: Project, now: float | None = None) -> list[dict]:
             continue
         seen.add(row["dir"])
         info = _read_checks_pid(d)
-        old = info.get("checks_set")
+        old, current = info.get("checks_set"), ids[bool(info.get("checks_task"))]
         if not old or old == current or (d / CHECKS_RC).exists() or not _checks_alive(info):
             continue
         if checks_refused(p, d, row["id"]):
             continue
-        why = (f"they started under a superseded check set ({old}); delivery.push_checks is now {current}, "
+        why = (f"they started under a superseded check set ({old}); "
+               f"delivery.{'task_checks' if info.get('checks_task') else 'push_checks'} is now {current}, "
                "so rerun them under the current set")
         r = end_checks(p, d, why, row["id"])
         if r:

@@ -5365,14 +5365,20 @@ def _harness_purpose(a) -> dict:
     return {"purpose": "harness"} if getattr(a, "purpose", None) == "harness" else {}
 
 
-def _checks_set(a, base: str) -> dict:
+def _checks_set(a, base: str, top: str = "") -> dict:
     """The check set a detached `ttp checks` run of the configured checks starts under (push.checks_set_id),
-    so the daemon stops it once delivery.push_checks changes; none for named commands or harness checks."""
+    so the daemon stops it once that set changes; none for named commands or harness checks. A run that
+    can take delivery.task_checks (testpick.task_set's rule) records `checks_task`, so its set is the task
+    set while one is configured."""
     if a.cmd or getattr(a, "purpose", None) == "harness":
         return {}
     from . import push
     try:
-        return {"checks_set": push.checks_set_id(Project(base).config().get("delivery") or {})}
+        p = Project(base)
+        d = p.config().get("delivery") or {}
+        task = (getattr(a, "purpose", None) or "candidate") == "candidate" and not getattr(a, "release", False) \
+            and push.repo_checks(d, Path(top or os.getcwd()), p)[1] == "delivery.push_checks"
+        return {"checks_set": push.checks_set_id(d, task), **({"checks_task": True} if task else {})}
     except Exception:   # an unreadable config: the run is never counted superseded
         return {}
 
@@ -7241,7 +7247,7 @@ def _checks_start(a, run_dir: Path, top: str, head: str, env: dict, req: str = "
                                               "light": bool(getattr(a, "light", False)),
                                               "no_device": bool(getattr(a, "no_device", False)),
                                               "release": bool(getattr(a, "release", False)),
-                                              **_harness_purpose(a), **_checks_set(a, base),
+                                              **_harness_purpose(a), **_checks_set(a, base, top),
                                               "req": req, "pidns": pid_ns(), "arrived": arrived,
                                               "check_run_dir": str(output), "check_report_dir": str(checkdirs.reports(output))})
         except BaseException:

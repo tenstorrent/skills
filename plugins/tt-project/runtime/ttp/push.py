@@ -2401,10 +2401,15 @@ def checks_config(d: dict) -> Any:
     return [d.get("push_checks"), by] if by else d.get("push_checks")
 
 
-def checks_set_id(d: dict) -> str:
-    """A short fingerprint of the check set (checks_config) a detached `ttp checks` run starts under: a
-    run whose recorded id differs from the current one ran a superseded set (jobstop.sweep_superseded_checks)."""
-    return hashlib.sha256(json.dumps(checks_config(d), sort_keys=True, default=str).encode()).hexdigest()[:16]
+def checks_set_id(d: dict, task: bool = False) -> str:
+    """A short fingerprint of the check set a detached `ttp checks` run starts under: a run whose recorded
+    id differs from the current one ran a superseded set (jobstop.sweep_superseded_checks). `task`: the run
+    could take delivery.task_checks (testpick.task_set: a candidate run of a single-repo project's own
+    checks, not --release), so the id covers task_checks while it is set, else the push checks it falls
+    back to (checks_config). Like is compared with like: a task-checks run ignores push_checks edits."""
+    from .testpick import TASK_KEY
+    cfg = ["task", d[TASK_KEY]] if task and d.get(TASK_KEY) else checks_config(d)
+    return hashlib.sha256(json.dumps(cfg, sort_keys=True, default=str).encode()).hexdigest()[:16]
 
 
 def by_repo_problems(v: Any) -> list[str]:

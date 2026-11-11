@@ -85,9 +85,42 @@ def test_a_detached_checks_run_records_its_check_set_only_for_configured_checks(
     p = make(env)
     p.set_config("delivery.push_checks", ["make smoke"])
     want = push.checks_set_id(p.config().get("delivery") or {})
-    assert cli._checks_set(argparse.Namespace(cmd=[], purpose=None), str(p.base)) == {"checks_set": want}
+    assert cli._checks_set(argparse.Namespace(cmd=[], purpose=None, release=True), str(p.base)) == {"checks_set": want}
     assert cli._checks_set(argparse.Namespace(cmd=["make t"], purpose=None), "/x") == {}
     assert cli._checks_set(argparse.Namespace(cmd=[], purpose="harness"), "/x") == {}
+
+
+def test_a_task_checks_run_is_superseded_by_a_task_checks_edit_not_a_push_checks_edit(env, tmp_path):
+    """With delivery.task_checks set, a candidate run records the task set's id (checks_task): editing
+    push_checks leaves it running, editing task_checks stops it. A --release run keeps the push checks'
+    id, so a push_checks edit stops it (#8330)."""
+    import argparse
+    from ttp import cli, jobstop
+    p = make(env)
+    p.set_config("delivery.push_checks", ["pytest -q tests"])
+    p.set_config("delivery.task_checks", ["pytest -q tests/smoke"])
+    task = cli._checks_set(argparse.Namespace(cmd=[], purpose=None), str(p.base), str(tmp_path))
+    release = cli._checks_set(argparse.Namespace(cmd=[], purpose=None, release=True), str(p.base), str(tmp_path))
+    assert task.get("checks_task") is True and "checks_task" not in release and task["checks_set"] != release["checks_set"]
+    tid = p.db.add_task("t", "s", kind="code", tier="light", origin="user")
+    p.db.update_task(tid, status="waiting")
+    runs = {}
+    try:
+        for name, mark in (("task", task), ("release", release)):
+            d, _, proc = _json_checks_run(p, tid, f"checks-{name}")
+            (d / "checks.pid").write_text(json.dumps({**json.loads((d / "checks.pid").read_text()), **mark}))
+            runs[name] = (d, proc)
+        assert jobstop.sweep_superseded_checks(p) == []
+        p.set_config("delivery.push_checks", ["pytest -q tests/other"])
+        (out,) = jobstop.sweep_superseded_checks(p)
+        assert runs["release"][1].wait(timeout=10) is not None and "push_checks" in out["text"]
+        assert runs["task"][1].poll() is None, "a push_checks edit leaves a task-checks run alone"
+        p.set_config("delivery.task_checks", ["pytest -q tests/smoke2"])
+        (out,) = jobstop.sweep_superseded_checks(p)
+        assert runs["task"][1].wait(timeout=10) is not None and "task_checks" in out["text"]
+    finally:
+        for _, proc in runs.values():
+            _stop_checks_group(proc)
 
 
 def test_no_remote_check_starts_on_a_host_taken_off_the_spill_list(env, tmp_path, monkeypatch):
