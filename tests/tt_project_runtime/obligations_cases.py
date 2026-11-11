@@ -982,3 +982,48 @@ def test_obligation_refuses_a_forged_user_order_and_keeps_a_verbatim_one_and_pla
     assert coord.apply(p, [{"type": "obligation", "text": sysrow}])
     texts = " ".join(str(o) for o in ob.items(p.db))
     assert all(x in texts for x in ("main pushed", "fine now")) and "Push to main now." not in texts
+
+
+def _ob_said(p, chat, text, tasks, now):
+    """Record one sent reply's promises; return the new open promises from it."""
+    from ttp import obligations as ob
+    mid = p.db.x("INSERT INTO messages(ts,direction,kind,text,handled) VALUES(?,?,?,?,?)", (now, "out", "reply", text, 1))
+    ob.record_promises(p, [(mid, chat, text)], tasks, now=now)
+    return [o for o in ob.open_promises(p.db) if o["promise"]["message"] == mid]
+
+
+def test_a_plan_on_a_condition_with_no_time_is_never_a_promise_but_a_timed_one_is(env):
+    """'If the rerun passes, I'll post the numbers' commits to no time: no promise. One naming a time
+    ('by 17:00') is a promise due then; 'even if' is no condition."""
+    from datetime import datetime, timedelta
+    from ttp import obligations as ob, timefmt
+    for s in ("If the rerun passes, I'll post the numbers here.", "I'll post the numbers if the rerun passes.",
+              "Unless the box is busy, I'll start the soak.", "In case it fails, I will rerun it."):
+        assert ob.commitments(s) == [], s
+    assert ob.commitments("I'll post the numbers even if the run fails.")
+    p = make(env)
+    tz = timefmt.tzinfo(p)
+    base = datetime.now(tz).replace(hour=9, minute=0, second=0, microsecond=0)
+    now = base.timestamp()
+    at_17 = base.replace(hour=17).timestamp()
+    assert _ob_said(p, "c1", "If the rerun passes, I'll post the numbers here.", {}, now) == []
+    for i, s in enumerate(("If the checks pass, I'll report back by 17:00.", "I'll report back by 17:00.")):
+        got = _ob_said(p, f"c{i + 2}", s, {}, now + i)
+        assert len(got) == 1 and got[0]["promise"]["timed"] and got[0]["promise"]["due"] == at_17, s
+
+
+def test_a_condition_in_another_clause_leaves_an_unconditional_promise(env):
+    """Only a condition gating the commitment itself drops it: one leading the sentence or right after the
+    commitment in its own clause. A trailing condition on another clause keeps the promise (fail open)."""
+    from ttp import obligations as ob
+    for s in ("I will report back and tell you if it fails.", "I'll report back; if the check fails I'll rerun it.",
+              "I'll post the numbers here, and flag anything if it fails.",
+              "I'll report back; I'll rerun it if the check fails."):
+        assert ob.commitments(s) == [s], s
+    for s in ("If the rerun passes, I'll post the numbers here.", "And if the rerun passes, I'll post the numbers.",
+              "I'll post the numbers if the rerun passes.", "Unless the box is busy, I'll start the soak."):
+        assert ob.commitments(s) == [], s
+    p = make(env)
+    now = time.time()
+    assert len(_ob_said(p, "c1", "I will report back and tell you if it fails.", {}, now)) == 1
+    assert _ob_said(p, "c2", "If the rerun passes, I'll post the numbers here.", {}, now + 1) == []

@@ -1200,6 +1200,12 @@ _GOES_UP = (r"(?<!\bif\s)(?<!\bwhen\s)(?<!\bwhether\s)(?<!\bunless\s)"
 COMMIT_RE = re.compile(_FUTURE + r"(?:[\w'’-]+\s+){0,3}?(?:" + _DELIVER + "|" + _SEND + ")|" + _GOES_UP, re.I)
 FUTURE_RE = re.compile(_FUTURE + r"|\byou(?:'ll|’ll|\s+will)\s+(?:have|get|see|hear)\b", re.I)
 ETA_RE = re.compile(r"\bETA\b", re.I)
+# "If the rerun passes, I'll post the numbers": a plan on a condition, not a commitment unless it names a time
+COND_RE = re.compile(r"(?<!\beven\s)(?<!\bas\s)\b(?:if|unless|in case)\b", re.I)
+# what ends the clause a commitment is in: a condition after it gates another clause ("I'll report back and
+# tell you if it fails", "I'll report back; if it fails I'll rerun it"), never the commitment
+_CLAUSE_END = re.compile(r"[,;:\u2013\u2014]|\b(?:and|but|then|also|plus|or)\b", re.I)
+_LEAD = re.compile(r"^\W*(?:(?:and|but|so|then|otherwise)\b\W*)?$", re.I)
 OFFER_RE = re.compile(r"\b(?:if you (?:want|like|wish|prefer|agree|approve|say so)|if you'd like|should I|want\s+me\s+to|"
                       r"shall\s+I|would you like)\b", re.I)
 CLOCK_RE = re.compile(r"\b(?P<h>2[0-3]|[01]?\d)(?::(?P<m>[0-5]\d))?\s*(?P<ap>[ap]\.?m\b\.?)?(?:\s*(?P<utc>UTC|GMT)\b)?", re.I)
@@ -1236,16 +1242,33 @@ def commitments(text: str) -> list[str]:
     """The sentences of `text` that commit the sender to a deliverable or a time: first-person future with
     a delivery verb ("I'll report back") or a send verb and its object ("I'll post each result here"),
     "it goes up as the draft PR", first-person future with a time ("we'll have it by 15:00"), or
-    an ETA with a time. Never a question or an offer ("if you want, I'll ..."), and never a line the
-    harness appended (authored): a runtime footer's ETA is no promise anyone made."""
+    an ETA with a time. Never a question or an offer ("if you want, I'll ..."), never a line the
+    harness appended (authored): a runtime footer's ETA is no promise anyone made, and never a plan on a
+    condition that names no time ("if the rerun passes, I'll post the numbers")."""
     out = []
     for s in _sentences(authored(text)):
         if s.endswith("?") or OFFER_RE.search(s):
             continue
         timed = _has_time(s)
+        if not timed and _conditional(s):
+            continue
         if COMMIT_RE.search(s) or (timed and (FUTURE_RE.search(s) or ETA_RE.search(s))):
             out.append(s)
     return out
+
+
+def _conditional(s: str) -> bool:
+    """The sentence's commitment itself rests on a condition: one leads the sentence ("If the rerun passes,
+    I'll post ...") or follows the first commitment in its own clause ("I'll post the numbers if it passes").
+    A condition in another clause leaves it a commitment; when unsure, it is one (fail open: a missed
+    promise loses owed work)."""
+    m = COND_RE.search(s)
+    if not m:
+        return False
+    if _LEAD.match(s[:m.start()]):
+        return True
+    c = COMMIT_RE.search(s[:m.start()])
+    return bool(c) and not _CLAUSE_END.search(s[c.end():m.start()])
 
 
 def promise_due(text: str, now: float, tz) -> float | None:
