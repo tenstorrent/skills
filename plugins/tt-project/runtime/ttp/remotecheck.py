@@ -753,8 +753,8 @@ def _attempt(host, top, head, env, extra, cmd, mark, wrap, wait) -> tuple[int, s
                 # Not a bare `rm -rf`: a run whose ssh broke goes on there with its folder gone, owned by
                 # nothing. Its own process groups are stopped first, then the folder goes.
                 from . import orphanchecks
-                subprocess.run(_ssh(host, orphanchecks.reap_script([tmp], STOP_GRACE_S)
-                                    + (f"; {_mirror_cleanup(*cleanup_ref)}" if cleanup_ref else ""), direct),
+                subprocess.run(_ssh(host, (f"{_mirror_cleanup(*cleanup_ref)}\n" if cleanup_ref else "")
+                                    + orphanchecks.reap_script([tmp], STOP_GRACE_S), direct),
                                stdin=subprocess.DEVNULL,
                                capture_output=True, timeout=CLEANUP_TIMEOUT_S)
             except (OSError, subprocess.SubprocessError):
