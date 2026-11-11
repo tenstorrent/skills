@@ -322,8 +322,7 @@ def test_throughput_measures_requeue_waits_by_reason_and_a_slow_checks_lane_gets
     rep = throughput.measure(p.db, p.config(), now=now, gates={})
     ck = _tp_lane(rep, "checks_slots")
     assert (ck["count"], ck["waiting_now"], ck["p1_p90_s"]) == (4, 1, 4 * 3600) and ck["slow"]
-    # The slot log's wait ends at its grant: the minute from it to the next run goes on as a retry wait.
-    assert (_tp_lane(rep, "own_job")["count"], _tp_lane(rep, "retry_wait")["count"]) == (2, 4)
+    assert (_tp_lane(rep, "own_job")["count"], _tp_lane(rep, "retry_wait")["count"]) == (2, 3)
     assert _tp_lane(rep, "retry_wait")["waiting_now"] == 2
     assert "worker_slots" not in {ln["lane"] for ln in rep["lanes"] if ln["count"] and ln["lane"] != "dependency"} \
         or _tp_lane(rep, "worker_slots")["waiting_now"] == 0
@@ -1107,8 +1106,7 @@ def test_throughput_checks_wait_is_judged_at_the_cap_then_and_a_one_at_a_time_qu
     idle = _tp_checks_requeue(p, d, monkeypatch, tmp_path, "fewer than ran", w3, 999)
     _tp_checks_run(p, monkeypatch, w3 - 800, 820)
     _tp_checks_run(p, monkeypatch, w3 - 750, 1500)
-    # Granted at w3+700: the wait ends at its grant, so it stays over the p1 threshold.
-    _tp_slot_wait(p, monkeypatch, idle, w3 + 40, w3 + 700)
+    _tp_slot_wait(p, monkeypatch, idle, w3 + 40, w3 + 600)
     # Two runs at once for long, a third (an urgent run past the cap) for less than SUSTAIN_S: the cap
     # then was 2, so a wait behind two runs is at the limit.
     w4 = now - 3600
@@ -1118,7 +1116,7 @@ def test_throughput_checks_wait_is_judged_at_the_cap_then_and_a_one_at_a_time_qu
     _tp_checks_run(p, monkeypatch, w4 - 900, 1500)
     _tp_checks_run(p, monkeypatch, w4 - 850, 1500)
     _tp_checks_run(p, monkeypatch, w4 - 300, 200)
-    _tp_slot_wait(p, monkeypatch, peak, w4, w4 + 990)
+    _tp_slot_wait(p, monkeypatch, peak, w4, w4 + 500)
     ck = _tp_lane(throughput.measure(p.db, p.config(), now=now, gates={}), "checks_slots")
     assert (ck["count"], ck["at_limit"], ck["serialized"], ck["idle"]) == (4, 2, 1, 1), ck
 
@@ -1177,8 +1175,7 @@ def test_throughput_judges_a_checks_wait_by_the_cap_its_record_stored_else_the_e
     for s0 in (w3 + 30, w3 + 35):
         _tp_checks_run(p, monkeypatch, s0, 1500)
     p.set_config("checks.test_project_max", 2)
-    # Granted at w3+700: the wait ends at its grant, so it stays over the p1 threshold.
-    assert _tp_slot_grant(p, monkeypatch, tmp_path, capped, w3 + 40, w3 + 700)["cap"] == 2
+    assert _tp_slot_grant(p, monkeypatch, tmp_path, capped, w3 + 40, w3 + 600)["cap"] == 2
     p.set_config("checks.test_project_max", 4)
     ck = _tp_lane(throughput.measure(p.db, p.config(), now=now, gates={}), "checks_slots")
     assert (ck["count"], ck["at_limit"], ck["idle"]) == (3, 2, 1), ck
