@@ -6906,7 +6906,9 @@ class Daemon:
             return state
         if text:
             log(self.p, f"coordinator run {r['id']}: {text}")
-            self.alert("coord-wake-cost", text, "normal", every_s=0)
+            from . import chatdigest as _chatdigest   # the web app only, unless notify.chat_cost_alarm or it needs the user
+            self.alert("coord-wake-cost", text, "normal", every_s=0,
+                       quiet=not (_chatdigest.to_chat(self.cfg, "cost_alarm") or _chatdigest.urgent(text)))
         return state
 
     def _session_context(self, r: dict, usage) -> dict | None:

@@ -450,6 +450,8 @@ USER_SETTABLE = {
     "budget.reset_credit_min_hours": float, "budget.reset_credit_expiry_hours": float,
     "budget.reset_credit_expiry_use_pct": float, "notify.slack": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
     "notify.slack_min_severity": str, "notify.chat_min_severity": str, "core_provider": str,
+    "notify.chat_status": lambda v: str(v).lower() in ("1", "true", "yes", "on"),   # chatdigest.to_chat
+    "notify.chat_cost_alarm": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
     "coordinator.tier": str, "coordinator.model": str, "coordinator.model_tier": str, "coordinator.effort": str,
     "jev.enabled": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
     # The effort A/B of standard-tier code tasks and Jev's effort pick (effortab.py).

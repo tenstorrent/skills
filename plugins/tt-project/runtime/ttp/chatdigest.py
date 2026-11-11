@@ -13,6 +13,8 @@ sentence it marked as planned stays. The daemon's own model-free must-act update
 unless urgent(): an outage or a blocker only the user can clear posts at once.
 Held text is kept whole, so a reminder of a pending user action keeps its full command and options.
 `coordinator.chat_digest_h` 0 sends every post at once. counts() feeds `ttp stats --chat`.
+The digest itself stays in the web app by default (recorded with no chat, on the quiet channel):
+`notify.chat_status` true sends it, and the hourly status table, to the chats too (to_chat).
 
 Status pace: a status post (progress, counts, ETAs; never an answer to the user's question, an ask, an outage
 or a result: is_status) goes to a chat at most once per `coordinator.chat_status_gap_h` hours (default 1;
@@ -70,6 +72,12 @@ def asks_user(text: str) -> bool:
 def urgent(text: str) -> bool:
     """A model-free update that must reach the chat at once: an outage, or a blocker only the user can clear."""
     return bool(_OUTAGE.search(str(text or "")) or asks_user(text))
+
+
+def to_chat(cfg: dict | None, what: str) -> bool:
+    """Whether a status digest ('status': the digest and the hourly table) or the coordinator's cost alarm
+    ('cost_alarm') also goes to chats: `notify.chat_<what>`, default off (the web app only)."""
+    return bool(((cfg or {}).get("notify") or {}).get(f"chat_{what}", False))
 
 
 def every_s(cfg: dict | None, chat: str | None = None) -> float:
@@ -291,7 +299,13 @@ def flush(p, cfg: dict | None, now: float | None = None) -> list[int]:
                      for i in items]
             text = (f"Digest: {len(items)} routine update{'s' * (len(items) != 1)} since "
                     f"{timefmt.short(float(items[0]['ts']), where, now)}\n" + "\n".join(lines))
-            out += msgparts.post(db, text, chat=None if chat == "all" else chat, kind="info", severity="normal")
+            if to_chat(cfg, "status"):
+                out += msgparts.post(db, text, chat=None if chat == "all" else chat, kind="info", severity="normal")
+            else:   # the web app only: no chat, the quiet channel
+                from . import alerts
+                where_to = "" if chat == "all" else f" (for chat {chat})"
+                out += msgparts.post(db, text.replace("\n", where_to + "\n", 1), chat=None, channel=alerts.QUIET,
+                                     kind="info", severity="normal")
             held[chat], last[chat] = [], now
             _count(st, chat, "digests")
         db.set_kv(KV, st)

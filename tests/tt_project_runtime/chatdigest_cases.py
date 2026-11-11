@@ -77,6 +77,7 @@ def test_the_digest_goes_at_most_every_n_hours_and_only_with_content(env, monkey
     monkeypatch.setenv("TTP_TEST_CHAT_DIGEST", "on")
     p = make(env)
     p.set_config("coordinator.chat_digest_h", 2)
+    p.set_config("notify.chat_status", True)   # the opt-in: the digest goes to the chat
     cfg, t0 = p.config(), 1_800_000_000.0
     assert chatdigest.flush(p, cfg, t0) == []   # nothing held: no digest
     chatdigest.hold(p.db, "c1", "#12 is queued for a worker.", "progress", t0)
@@ -90,6 +91,22 @@ def test_the_digest_goes_at_most_every_n_hours_and_only_with_content(env, monkey
     assert chatdigest.flush(p, cfg, t0 + 3 * 3600 + 120) == []   # 2 h since the last digest not yet passed
     assert len(chatdigest.flush(p, cfg, t0 + 4 * 3600 + 60)) == 1
     assert chatdigest.counts(p.db)["c1"] == {"sent": 0, "held": 3, "digests": 2, "waiting": 0, "deduped": 0}
+
+
+def test_the_digest_stays_in_the_web_app_by_default(env, monkeypatch):
+    """#8356: without notify.chat_status the digest is recorded for the web app only: no chat, the quiet
+    channel, so no relay delivers it; it names the chat it was for."""
+    from ttp import alerts, chatdigest
+    monkeypatch.setenv("TTP_TEST_CHAT_DIGEST", "on")
+    p = make(env)
+    p.set_config("coordinator.chat_digest_h", 2)
+    t0 = 1_800_000_000.0
+    chatdigest.hold(p.db, "c1", "#12 is queued for a worker.", "progress", t0)
+    [mid] = chatdigest.flush(p, p.config(), t0 + 2 * 3600)
+    m = p.db.one("SELECT * FROM messages WHERE id=?", (mid,))
+    assert m["chat"] is None and m["channel"] == alerts.QUIET and "(for chat c1)" in m["text"]
+    assert "#12 is queued for a worker." in m["text"] and _cd_out(p) == []
+    assert not p.db.unread_for_chat("c1", 0)   # no relay delivers it
 
 
 def test_a_held_reminder_keeps_its_full_command_in_the_digest(env, monkeypatch):

@@ -68,6 +68,7 @@ def test_the_spill_row_counts_runs_placed_passed_and_run_again_here(env):
 def test_the_table_posts_hourly_or_at_a_milestone_and_only_when_a_row_changed(env):
     from ttp import hourly
     p = make(env)
+    p.set_config("notify.chat_status", True)   # the opt-in: the table goes to the main chat
     p.db.post("in", "hello", chat="main")
     now = time.time() - 3600
     assert hourly.post(p, now - 3700) is None, "the first pass only sets the baseline"
@@ -86,6 +87,21 @@ def test_the_table_posts_hourly_or_at_a_milestone_and_only_when_a_row_changed(en
     assert second and "(a batch landed)" in p.db.one("SELECT text FROM messages WHERE id=?", (second,))["text"]
     assert hourly.post(p, now + 400) is None, "one post per milestone"
     assert p.db.one("SELECT COUNT(*) n FROM messages WHERE ref=?", (hourly.REF,))["n"] == 2
+
+
+def test_the_table_stays_in_the_web_app_by_default_and_its_test_line_has_no_dollars(env):
+    """#8356: without notify.chat_status the hourly table is recorded for the web app only (no chat, the
+    quiet channel), with no main chat too; its test runs are CPU work, with no $ figure."""
+    from ttp import alerts, hourly
+    p = make(env)
+    now = time.time() - 3600
+    assert hourly.post(p, now - 3700) is None, "baseline"
+    p.db.add_task("first", "spec")
+    m = p.db.one("SELECT * FROM messages WHERE id=?", (hourly.post(p, now),))
+    assert m["chat"] is None and m["channel"] == alerts.QUIET and m["ref"] == hourly.REF
+    (tests,) = [r for r in m["text"].split("\n") if r.startswith("Tests in 24 h")]
+    runs, _, woken = tests.partition(". Model spend of runs woken")   # only the wakes' model spend has a $
+    assert "CPU work, no model spend" in runs and "$" not in runs and woken
 
 
 def test_a_spill_off_whose_rerun_went_to_another_spill_host_is_not_run_again_here(env):

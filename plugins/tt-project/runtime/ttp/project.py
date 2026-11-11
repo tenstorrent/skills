@@ -400,7 +400,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
                     # on the chat provider ('standard/high'; 'off' turns the floor off).
                     "conclusion_floor": {"tier": "standard", "effort": "high"}},
     "notify": {"slack": False, "slack_min_severity": "high", "chat_min_severity": "normal",
-               "hourly_status": True},   # hourly.py: the hourly status table in the main chat
+               "hourly_status": True,   # hourly.py: the hourly status table (web app; main chat with chat_status)
+               # chat_status: the chat digest and the hourly table go to chats too; chat_cost_alarm: the
+               # coordinator's cost-per-wake alarm too. Off: the web app only (chatdigest.to_chat).
+               "chat_status": False, "chat_cost_alarm": False},
     # gone_after_s: a relay chat with no `ttp listen` running that left a message unread this long
     # stops counting as a reader of asks and alerts until it reads again (chatgone.py). batch_s:
     # `ttp listen` holds broadcast alerts this long to print them together; lease_s: another relayer

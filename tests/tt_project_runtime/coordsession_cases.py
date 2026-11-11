@@ -3509,6 +3509,31 @@ def test_wakecost_daemon_alarms_once_and_asks_the_same_session_to_shrink(env, mo
     assert p.db.kv("alerts_sent")["coord-wake-cost"] == sent   # one alarm per episode, not one per wake
 
 
+def test_wakecost_alarm_stays_in_the_web_app_unless_opted_in_or_it_needs_the_user(env, monkeypatch):
+    """#8356: the cost-per-wake alarm is recorded for the web app only (no chat, the quiet channel); with
+    notify.chat_cost_alarm, or a text that needs the user, it goes to the chats too."""
+    from ttp import alerts, wakecost
+    from ttp.daemon import Daemon
+    p = make(env)
+    d = Daemon(p.base)
+    said = {"text": "Coordinator cost per wake is high: the median of the last 5 wakes is $1.50."}
+    monkeypatch.setattr(wakecost, "current_row", lambda *a: {})
+    monkeypatch.setattr(wakecost, "check", lambda *a: ({"lean": True}, said["text"]))
+
+    def alarm():
+        p.db.set_kv("alerts_sent", {})
+        d.cfg = p.config()
+        assert d._wake_cost({"id": 1}, None, {}, {}) == {"lean": True}   # the shrink/lean state is unchanged
+        return p.db.one("SELECT chat, channel FROM messages WHERE direction='out' ORDER BY id DESC LIMIT 1")
+    m = alarm()
+    assert m["chat"] is None and m["channel"] == alerts.QUIET
+    said["text"] = "Coordinator cost per wake is high and needs your approval to raise the cap."
+    assert alarm()["channel"] != alerts.QUIET
+    said["text"] = "Coordinator cost per wake is high: the median of the last 5 wakes is $1.50."
+    p.set_config("notify.chat_cost_alarm", True)
+    assert alarm()["channel"] != alerts.QUIET
+
+
 def test_the_mid_run_lines_of_both_coordinator_prompts_name_only_real_action_fields():
     """#6313: what the coordinator prompts say about mid-run updates, restarts and order fan-out names
     only real things: each backticked name is an action type, an ACTIONS_SCHEMA field or the event kind

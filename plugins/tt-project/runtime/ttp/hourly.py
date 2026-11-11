@@ -309,17 +309,21 @@ def _key(rs: list[str]) -> list[str]:
 
 
 def post(p, now: float | None = None) -> int | None:
-    """Post the table to the main chat when due; the message id, else None."""
+    """Record the table for the web app when due, and post it to the main chat too with notify.chat_status;
+    the message id, else None."""
     now = time.time() if now is None else now
     if not (p.config().get("notify") or {}).get("hourly_status", True) or not (got := due(p, now)):
         return None
-    if not (chat := main_chat(p.db)):
-        return None
-    from . import chatdigest   # the chat's status pace binds this table too: it waits, never stacks
-    if chatdigest.status_wait(p.db, p.config(), chat, now) > 0:
-        return None
-    mid = p.db.post("out", got[0], chat=chat, kind="info", severity="low", ref=REF)
-    chatdigest.mark_status(p.db, chat, now)
+    from . import alerts, chatdigest
+    if not chatdigest.to_chat(p.config(), "status"):   # the web app only (notify.chat_status: chats too)
+        mid = p.db.post("out", got[0], chat=None, channel=alerts.QUIET, kind="info", severity="low", ref=REF)
+    else:
+        if not (chat := main_chat(p.db)):
+            return None
+        if chatdigest.status_wait(p.db, p.config(), chat, now) > 0:   # the chat's status pace: waits, never stacks
+            return None
+        mid = p.db.post("out", got[0], chat=chat, kind="info", severity="low", ref=REF)
+        chatdigest.mark_status(p.db, chat, now)
     try:
         st = json.loads((p.state / STATE_FILE).read_text())
     except (OSError, ValueError):

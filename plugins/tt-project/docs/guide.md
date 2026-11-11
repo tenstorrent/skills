@@ -621,7 +621,8 @@ coordinator with that evidence.
   age is resent whole too.
   `wake_cost_alarm_usd` (default 1.0; 0 or `off`: no check) checks cost per wake without a model
   call after each session wake (wakecost.py): when the median of the last 5 new or resumed wakes is
-  above it, one alarm goes out for the episode naming its cause (context tokens, digest size or tool
+  above it, one alarm is recorded for the episode in the web app (in chats too only when it needs you,
+  or with `notify.chat_cost_alarm` `true`) naming its cause (context tokens, digest size or tool
   calls), the same session compacts in place on its next wake (once; again only after a further 5
   wakes still over, and only once its context is at least 100k tokens and 20k over its seed), and the
   digest sends any section whose only change is an age as unchanged. Never a new or stateless
@@ -3839,6 +3840,8 @@ corrected forecast waits, whole, for one digest per chat, posted at most every
 content. The 'Status now' line the harness adds to a post naming unstarted work goes in the
 digest too, and so does the harness's own update on a late item the coordinator did not act on.
 A reminder of a step waiting on you keeps its full command and options in the digest.
+The digest stays in the web app by default (it names the chat it was for);
+`ttp config <name> notify.chat_status true` sends it to the chats too, and the hourly status table with it.
 `ttp stats --chat` counts per chat the posts sent at once, held, digests posted, repeats not sent and held now.
 
 Status pace. A status post (progress, counts, ETAs) goes to a chat at most once per
@@ -3855,9 +3858,10 @@ project's chats count as one user's unless `coordinator.chat_users` `{chat: user
 Hourly status table: `ttp status --hourly` prints one table, built without a model call: the fork rate
 (worker and review runs started from a copy of a saved session, last hour and today, per provider,
 against `review.fork_target`, default 0.9), the project host's load per core and each spill host's use
-in 24 h (by machines-list alias), test runs, CPU-hours and $ per landed change, the queue (open tasks,
+in 24 h (by machines-list alias), test runs and CPU-hours per landed change (CPU work, no model
+spend; only runs woken while waiting on their checks show a $ figure), the queue (open tasks,
 push queue entries, oldest approval) and the approved-to-landed median with tasks created in 24 h. The
-daemon posts it to the main chat at most once an hour, sooner when a batch lands, a deploy finishes or
+daemon records it in the web app (in the main chat too with `notify.chat_status` `true`) at most once an hour, sooner when a batch lands, a deploy finishes or
 an order closes, and only when a row changed (the load reading alone does not count).
 `ttp config <name> notify.hourly_status false` turns the post off.
 
