@@ -121,13 +121,70 @@ def test_queue_wait_covers_worker_slots_and_polled_checks(env):
     p.db.x("UPDATE tasks SET created=? WHERE id=?", (now - 45 * 60, ready))
     poll = p.db.add_task("poll", "s", kind="code")
     p.db.update_task(poll, not_before=now + 300, blocked_reason="next try 12:00", result=json.dumps(
-        {"status": "waiting", "retry_when": "ttp checks --result /tmp/x", "waiting_since": now - 35 * 60}))
+        {"status": "waiting", "retry_when": f"ttp checks --result {_qw_slot_wait(p)}", "waiting_since": now - 35 * 60}))
     cfg = {**QW_CFG, "budget": {"max_parallel_workers": 1}}
-    got = {(w["task"], w["queue"]) for w in queuewait.collect(p, cfg, now, {})}
+    full = {"limit": 4, "running": [f"other task #{i} (run 1)" for i in range(4)], "queued": ["other task #9 (run 1)"]}
+    got = {(w["task"], w["queue"]) for w in queuewait.collect(p, cfg, now, full)}
     assert (ready, "workers") in got and (poll, "checks") in got, got
-    host = {"running": [f"{p.name} task #{poll} (run 2) ttp checks"], "limit": 4}
+    host = {"running": [f"{p.name} task #{poll} (run 2) ttp checks"], "limit": 4, "queued": ["other task #9 (run 1)"]}
     assert (poll, "checks") not in {(w["task"], w["queue"]) for w in queuewait.collect(p, cfg, now, host)}
-    assert len(queuewait.scan(p, cfg, now, {})) == 2
+    assert len(queuewait.scan(p, cfg, now, full)) == 2
+
+
+def _qw_slot_wait(p, rc=False, slot=True, pid=None):
+    """A run dir whose detached checks wait for a host-wide slot: checks.pid naming a live process (this
+    one, or `pid`), checks-slot.wait, and checks.rc only when `rc` (its checks finished)."""
+    from ttp import cli
+    from ttp.runner import proc_start
+    d = p.state / "runs" / f"qw-{len(list((p.state / 'runs').glob('qw-*'))) if (p.state / 'runs').exists() else 0}"
+    d.mkdir(parents=True, exist_ok=True)
+    pid = os.getpid() if pid is None else pid
+    (d / cli.CHECKS_PID).write_text(json.dumps({"pid": pid, "started": proc_start(pid) or "gone"}))
+    if slot:
+        (d / cli.CHECKS_SLOT_WAIT).write_text("{}")
+    if rc:
+        (d / cli.CHECKS_RC).write_text("0\n")
+    return d
+
+
+def test_queue_wait_checks_needs_an_open_task_with_a_live_slot_wait_and_a_nonempty_queue(env):
+    """A false '#N has waited 99 min on the checks queue: 3 running (cap 4), 0 queued' (#7815: done, its
+    checks long finished, the holders another project's). A checks wait is raised only for an open task
+    with a live wait record (its checks queued or waiting for a slot) while the host queue has someone
+    waiting: a done task, a run whose checks finished, ran or died, and a queue with 0 queued raise nothing;
+    a real wait still raises one."""
+    from ttp import queuewait
+    p = make(env)
+    now = time.time()
+    full = {"limit": 4, "running": [f"other task #{i} (run 1)" for i in range(3)], "queued": ["other task #9 (run 1)"]}
+    empty = {**full, "queued": []}
+
+    def wait(name, run_dir, status=None):
+        tid = p.db.add_task(name, "s", kind="code")
+        p.db.update_task(tid, not_before=now + 300, blocked_reason="waiting for checks; its probe says not yet" + NT,
+                         result=json.dumps({"status": "waiting", "retry_when": f"ttp checks --result {run_dir}",
+                                            "waiting_since": now - 99 * 60}))
+        if status:
+            p.db.update_task(tid, status=status)
+        return tid
+
+    def got(host):
+        return {w["task"] for w in queuewait.collect(p, QW_CFG, now, host) if w["queue"] == "checks"}
+
+    real = wait("real", _qw_slot_wait(p))
+    done = wait("done", _qw_slot_wait(p), "done")
+    gone = wait("cancelled", _qw_slot_wait(p), "cancelled")
+    finished = wait("finished", _qw_slot_wait(p, rc=True))
+    running = wait("running", _qw_slot_wait(p, slot=False))
+    dead = wait("dead", _qw_slot_wait(p, pid=2 ** 22 + 7))
+    nodir = wait("nodir", p.state / "runs" / "absent")
+    assert got(full) == {real}, got(full)
+    assert got(empty) == set(), "0 queued on the host: no checks slot to wait for"
+    queuewait.scan(p, QW_CFG, now, empty)
+    assert _qw_events(p) == []
+    queuewait.scan(p, QW_CFG, now, full)
+    assert [e["text"].split(":", 1)[0] for e in _qw_events(p)] == [f"qwait-{real}-checks"], _qw_events(p)
+    assert {done, gone, finished, running, dead, nodir}.isdisjoint(got(full))
 
 
 NT = "; next try 07:10 PST"   # the tail the daemon puts on every waiting task's reason (daemon.py, sweepskip.NEXT_TRY)
@@ -371,7 +428,9 @@ def test_queue_wait_workers_counts_dispatch_live_slots_and_names_the_precheck_ga
     p.db.x("UPDATE tasks SET created=? WHERE id IN (?,?)", (now - 50 * 60, rev, ready))
     monkeypatch.setattr(d, "_precheck_holds", lambda t, now: t["id"] == rev)
     cfg = {**QW_CFG, "budget": {"max_parallel_workers": 2}}
-    got = {(w["task"], w["queue"]) for w in queuewait.collect(p, cfg, now, {}, hold=d._queue_hold(now))}
+    slot = {"limit": 4, "running": [f"other task #{i} (run 1)" for i in range(4)], "queued": [f"{p.name} {out.name}"]}
+    assert queuewait.collect(p, cfg, now, {}, hold=d._queue_hold(now)) == [], "0 queued on the host: no slot wait"
+    got = {(w["task"], w["queue"]) for w in queuewait.collect(p, cfg, now, slot, hold=d._queue_hold(now))}
     assert got == {(rev, "checks")}, got   # 1 live run of 2 on its provider: dispatch starts `ready`
     assert {(w["task"], w["queue"]) for w in queuewait.collect(p, cfg, now, {})} == {(rev, "workers")}, \
         "the plain count (4 runs on two providers against 2) is the false item the hold removes"
@@ -379,7 +438,7 @@ def test_queue_wait_workers_counts_dispatch_live_slots_and_names_the_precheck_ga
     p.db.update_task(full, status="running")
     p.db.x("INSERT INTO runs(task,role,started,status,provider) VALUES(?,?,?,'running',?)",
            (full, "worker", now - 60, core))
-    w = {x["queue"]: x for x in queuewait.collect(p, cfg, now, {}, hold=d._queue_hold(now))}
+    w = {x["queue"]: x for x in queuewait.collect(p, cfg, now, slot, hold=d._queue_hold(now))}
     assert set(w) == {"checks", "workers"} and w["workers"]["task"] == ready and w["workers"]["cap"] == 2, w
     assert sorted(w["workers"]["running"]) == sorted(f"{p.name} task #{t} (priority 3)" for t in (live, full)), w
     assert queuewait.options(p.db, {**w["workers"], "cap_why": "4 configured; the budget gate allows 2"},
@@ -390,11 +449,11 @@ def test_queue_wait_workers_counts_dispatch_live_slots_and_names_the_precheck_ga
     from ttp import budget as bud
     gate = bud.evaluate(p.db, d.cfg, core, bud.plan_windows(p.db))
     monkeypatch.setitem(d.gates, core, dataclasses.replace(gate, allow_new_work=False))
-    got = {(x["task"], x["queue"]) for x in queuewait.collect(p, cfg, now, {}, hold=d._queue_hold(now))}
+    got = {(x["task"], x["queue"]) for x in queuewait.collect(p, cfg, now, slot, hold=d._queue_hold(now))}
     assert got == {(rev, "checks")}, f"the spend gate holds it, not the slots: {got}"
     monkeypatch.setitem(d.gates, core, gate)
     from ttp import checkcap
-    monkeypatch.setattr(checkcap, "state", lambda: {"limit": 4, "running": [], "queued": [], "parked": []})
+    monkeypatch.setattr(checkcap, "state", lambda: {"limit": 4, "running": [], "queued": slot["queued"], "parked": []})
     d.cfg.setdefault("coordinator", {})["queue_wait_escalate_min"] = 30
     d.check_queue_waits(every_s=0)   # the daemon's own scan passes its dispatch hold
     assert {(e["task"], json.loads(e["data"])["must_act"]["key"]) for e in _qw_events(p)} == \

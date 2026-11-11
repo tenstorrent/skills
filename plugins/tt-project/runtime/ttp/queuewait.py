@@ -26,6 +26,7 @@ import hashlib
 import json
 import re
 import time
+from pathlib import Path
 
 from . import msgparts, obligations
 
@@ -90,7 +91,9 @@ def collect(p, cfg: dict, now: float, host: dict | None = None, device: set | No
     take), {"queue": "checks", "since"} (a review's daemon pre-checks wait for a host checks slot) or any
     other hold (a pause, a lock, the spend gate: their own alarms name those). Only the first ready task
     held by full slots raises a workers wait; a task parked on its own checks or a detached wait runs no
-    worker and never counts as a slot holder."""
+    worker and never counts as a slot holder. A checks wait needs an open task with a live wait record (its
+    label queued or parked on the host, its own run's checks waiting for a slot: _checks_waiting, or dispatch's
+    hold) while the host queue has someone waiting: finished checks or 0 queued raise nothing."""
     from .db import TERMINAL_TASK_STATES, load_result
     db, name, out = p.db, p.name, {}
     host = host or {}
@@ -118,6 +121,8 @@ def collect(p, cfg: dict, now: float, host: dict | None = None, device: set | No
         if prev.get("status") != "waiting" or not isinstance(prev.get("waiting_since"), (int, float)):
             continue
         got = classify(prev.get("retry_when") or "", t["blocked_reason"] or "", device)
+        if got and got[0] == "checks" and not (queued and _checks_waiting(p, prev.get("retry_when"))):
+            continue   # its checks finished, run or never queued, or the host queue is empty: no slot to wait for
         if got and not (got[0] == "checks" and t["id"] in busy):
             info = checks if got[0] == "checks" else _holders(db, p, got[0], got[1], cfg, now)
             if not info.pop("live", False):   # a push in its turn, alive and in its time limit: a fair wait
@@ -127,7 +132,8 @@ def collect(p, cfg: dict, now: float, host: dict | None = None, device: set | No
         if got is None:
             break   # dispatch starts it: no ready task behind it waits on a slot
         if got.get("queue") == "checks":   # a review held by its daemon pre-checks waiting for a host slot
-            add(t["id"], "checks", "", got.get("since"), checks)
+            if queued:   # 0 queued on the host: the slot is not what holds it
+                add(t["id"], "checks", "", got.get("since"), checks)
         elif got.get("queue") == "workers":   # the head of the line: more capacity unblocks every one behind it
             prov = got.get("provider")
             run = db.q("SELECT r.task, t.priority FROM runs r JOIN tasks t ON t.id=r.task WHERE r.role!='coordinator' "
@@ -139,6 +145,23 @@ def collect(p, cfg: dict, now: float, host: dict | None = None, device: set | No
                  "running": [f"{name} task #{r['task']} (priority {r['priority']})" for r in run]})
             break
     return list(out.values())
+
+
+def _checks_waiting(p, probe) -> bool:
+    """A worker's `ttp checks --result <run dir>` wait has a live record of waiting for a host-wide checks
+    slot: no checks.rc yet, its checks process alive (or in a PID namespace this one cannot judge) and its
+    checks-slot.wait file present. Read-only (never cli._checks_result, which settles the run). A run whose
+    checks finished, run or are gone, or a probe naming no run dir, has none."""
+    from . import cli
+    m = re.search(r"\bttp checks\b[^;|&]*?--result\s+('[^']*'|\"[^\"]*\"|[^\s;|&]+)", str(probe or ""))
+    if not m or "$" in m[1]:
+        return False
+    d = Path(m[1].strip("'\"")).expanduser()
+    d = d if d.is_absolute() else p.base / d
+    if (d / cli.CHECKS_RC).exists() or not (d / cli.CHECKS_SLOT_WAIT).exists():
+        return False
+    info = cli._read_checks_pid(d)
+    return bool(info) and (cli._checks_alive(info) or cli._checks_elsewhere(info))
 
 
 def _config_hold(db, cfg: dict) -> dict | None:
