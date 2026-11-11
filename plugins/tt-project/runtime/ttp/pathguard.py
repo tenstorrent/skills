@@ -690,13 +690,14 @@ def _key_refusal(cmd: str, commands: str, ctx) -> str | None:
 def _ssh_key(argv: list[str], ctx) -> tuple[str | None, bool]:
     """(a protected path the options of ssh, scp or sftp `argv` name, whether they follow credguard's class rule:
     no option runs a local program, and each naming a protected path is its key, -i or -o IdentityFile). A control
-    socket or host list ssh keeps itself (-S, -o ControlPath=, credguard.ssh_public) is none, and so is a settings
-    file ssh reads itself (-F, -o UserKnownHostsFile=, GlobalKnownHostsFile=, credguard.ssh_files)."""
+    socket ssh keeps itself (-S, -o ControlPath=, credguard.ssh_public) is none, and so is a settings file or host
+    list ssh reads itself (-F, -o UserKnownHostsFile=, GlobalKnownHostsFile=, credguard.ssh_files)."""
     from . import credguard
     keys, hit, ok = credguard.ssh_keys(argv), None, not credguard.ssh_runs_local(argv)
     files = credguard.ssh_files(argv)
     for o, val, word in credguard.ssh_options(argv):
-        own = word in files or o in "So" and word not in keys and credguard.ssh_public(
+        hosts = credguard.SSH_HOSTS_OPTION_RE.match(val) if o == "o" else None
+        own = word in files or o in "So" and not hosts and word not in keys and credguard.ssh_public(
             os.path.basename(re.split(r"[\s=]", val)[-1]))
         if not own and (h := _names(val, ctx)):
             hit, ok = hit or h, ok and word in keys

@@ -420,6 +420,8 @@ SSH_OWN_FILE_ALLOWED = [
     "rsync -e 'ssh -F ~/.ssh/site.conf' a box:/tmp/", "rsync -e 'ssh -F ~/.ssh/site.conf -i ~/.ssh/work-key' a box:",
     "git -c core.sshCommand='ssh -F ~/.ssh/site.conf' fetch origin",
     "GIT_SSH_COMMAND='ssh -F ~/.ssh/site.conf -i ~/.ssh/work-key' git fetch origin",
+    # comments, blank lines, Match, key=value, hashed and marked host lines are ssh's own shapes
+    "ssh -F ~/.ssh/full.conf box", "ssh -o UserKnownHostsFile=~/.ssh/full-hosts box",
 ]
 SSH_OWN_FILE_REFUSED = [
     # reads, copies and writes of the same files
@@ -431,6 +433,13 @@ SSH_OWN_FILE_REFUSED = [
     "ssh -F ~/.ssh/id_ed25519 box", "ssh -F ~/.ssh/work-key box", "ssh -F ~/.ssh/../.ssh/id_ed25519 box",
     "ssh -o UserKnownHostsFile=~/.ssh/id_ed25519 box", "ssh -o 'UserKnownHostsFile ~/.ssh/site-hosts ~/.ssh/work-key' box",
     "ssh -F ~/.ssh/key-link box", "ssh -F ~/.ssh/missing.conf box", "ssh -F ~/.ssh/si*.conf box",
+    # any other secret, or a file not shaped like that option's file (fail closed: ssh prints the first word of
+    # each config line it cannot parse, and adds host lines to a host list)
+    "ssh -F ~/.ssh/vault -G box", "ssh -F ~/.ssh/token box", "ssh -F ~/.ssh/odd.conf box",
+    "ssh -o UserKnownHostsFile=~/.ssh/vault -o StrictHostKeyChecking=accept-new box",
+    "ssh -o UserKnownHostsFile=~/.ssh/token box", "ssh -o GlobalKnownHostsFile=~/.ssh/site.conf box",
+    "ssh -o 'UserKnownHostsFile ~/.ssh/site-hosts ~/.ssh/vault' box", "ssh -F ~/.ssh/site-hosts box",
+    "rsync -e 'ssh -F ~/.ssh/token' a box:", "GIT_SSH_COMMAND='ssh -o UserKnownHostsFile=~/.ssh/vault' git fetch",
     # the key still passes only when nothing runs a local program, a config from outside ~/.ssh included
     "ssh -F ~/.ssh/site.conf -o ProxyCommand='cat ~/.ssh/id_ed25519' box", "ssh -F /tmp/c -i ~/.ssh/work-key box",
     "rsync -e 'ssh -F ~/.ssh/site.conf -i ~/.ssh/work-key $(true)' a box:",
@@ -444,6 +453,13 @@ def _own_file_home(tmp_path, monkeypatch):
     (home / ".ssh" / "site-hosts").write_text("box ssh-ed25519 AAAA\n")
     (home / ".ssh" / "work-key").write_text("-----BEGIN OPENSSH " + "PRIVATE KEY-----\nx\n")   # split so this file holds no key header
     (home / ".ssh" / "key-link").symlink_to(home / ".ssh" / "id_ed25519")
+    (home / ".ssh" / "full.conf").write_text("# site\n\nMatch host box\n  user=me\nHost *\n\tServerAliveInterval 30\n")
+    (home / ".ssh" / "full-hosts").write_text("# hosts\n|1|abc=|def= ssh-ed25519 AAAA\n"
+                                              "@cert-authority *.site ssh-rsa AAAB3x== ca\n[box]:2222,10.0.0.1 "
+                                              "ecdsa-sha2-nistp256 AAAAE2V=\n")
+    (home / ".ssh" / "odd.conf").write_text("Host box\n  User me\nnot-a-keyword x\n")
+    (home / ".ssh" / "vault").write_text("AGE-SECRET-" + "KEY-1QQQFAKESECRETVALUE\n")   # split: no secret shape here
+    (home / ".ssh" / "token").write_text("gh" + "p_FAKETOKEN123\n")
     return home
 
 

@@ -231,6 +231,10 @@ def test_pathguard_lets_ssh_read_its_own_config_and_host_lists_by_option(cred_ho
     (ssh / "site.conf").write_text("Host box\n")
     (ssh / "site-hosts").write_text("box ssh-ed25519 AAAA\n")
     (ssh / "k").write_text("-----BEGIN OPENSSH " + "PRIVATE KEY-----\n")   # split so this file holds no key header
+    (ssh / "vault").write_text("AGE-SECRET-" + "KEY-1QQQFAKESECRETVALUE\n")   # split: no secret shape here
+    (ssh / "token").write_text("gh" + "p_FAKETOKEN123\n")
+    (ssh / "config").write_text("Host *\n")
+    (ssh / "authorized_keys").write_text("ssh-ed25519 AAAA x\n")
     for cmd in ("ssh -F ~/.ssh/site.conf box true", "ssh -F ~/.ssh/site.conf -i ~/.ssh/k box true",
                 "ssh -o UserKnownHostsFile=~/.ssh/site-hosts -o GlobalKnownHostsFile=~/.ssh/site-hosts box",
                 "scp -F ~/.ssh/site.conf -i ~/.ssh/k a box:", "rsync -e 'ssh -F ~/.ssh/site.conf -i ~/.ssh/k' a box:",
@@ -239,8 +243,18 @@ def test_pathguard_lets_ssh_read_its_own_config_and_host_lists_by_option(cred_ho
         assert pathguard_why(_pg_bash(cmd, cred_home.work)) is None, cmd
     for cmd in ("ssh -F ~/.ssh/k box", "ssh -o UserKnownHostsFile=~/.ssh/k box",
                 "ssh -F ~/.ssh/site.conf box true > ~/.ssh/site.conf", "ssh -F ~/.ssh/site.conf box; cp a ~/.ssh/site.conf",
-                "ssh -F ~/.ssh/site.conf -o ProxyCommand=true -i ~/.ssh/k box"):
+                "ssh -F ~/.ssh/site.conf -o ProxyCommand=true -i ~/.ssh/k box",
+                # a secret, or a file not shaped like the option's (ssh prints config lines, adds to host lists)
+                "ssh -F ~/.ssh/vault -G box", "ssh -F ~/.ssh/token box",
+                "ssh -o UserKnownHostsFile=~/.ssh/vault -o StrictHostKeyChecking=accept-new box",
+                "ssh -o UserKnownHostsFile=~/.ssh/token box",
+                "ssh -o UserKnownHostsFile=~/.ssh/config -o HostKeyAlias=ProxyCommand -o StrictHostKeyChecking=accept-new box",
+                "ssh -o GlobalKnownHostsFile=~/.ssh/authorized_keys box",
+                "ssh -o 'UserKnownHostsFile ~/.ssh/config ~/.ssh/known_hosts' box"):
         assert pathguard_why(_pg_bash(cmd, cred_home.work)), cmd
+    for cmd in ("ssh -o UserKnownHostsFile=~/.ssh/known_hosts box", "ssh -o UserKnownHostsFile=~/.ssh/known_hosts2 box",
+                "ssh -S ~/.ssh/cm-box box"):   # ssh's own host lists by name, made if missing, and its sockets
+        assert pathguard_why(_pg_bash(cmd, cred_home.work)) is None, cmd
 
 
 def pathguard_why(payload, cfg=None):

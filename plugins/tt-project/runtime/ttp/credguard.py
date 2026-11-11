@@ -22,8 +22,10 @@ stays in the run's log and transcript, so the stores are kept out of tool calls 
   inside the ssh command, no git option that runs one (GIT_RUNS_RE). Every other mention of a key
   path is refused (an exported GIT_SSH_COMMAND too). The same calls may name ssh's own settings files
   in ~/.ssh by any name (ssh_files): the direct value of `-F` or of `-o UserKnownHostsFile=` or
-  `GlobalKnownHostsFile=`, when each file exists and is no private key (ssh_own_file); any other
-  mention of such a file is refused like a key's. Also passing: a key path handed to ssh-add or
+  `GlobalKnownHostsFile=`, when each file exists, is no private key and is shaped like that option's
+  file (ssh_own_file: ssh_config keyword lines for -F, known_hosts entries for a host list); a host
+  list may also be a missing file named like ssh's own (ssh_host_list). Any other mention of such a
+  file is refused like a key's. Also passing: a key path handed to ssh-add or
   ssh-keygen, a config given by its tool's option (`kubectl --kubeconfig`, CONFIG_OPTIONS) or
   variable (`KUBECONFIG=`, CONFIG_VARS), mkdir, chmod, chown, touch and test of them, and ls or stat
   of a store folder itself (any other mention of the folder, or a glob naming it, does not);
@@ -87,6 +89,27 @@ SSH_KEY_OPTION_RE = re.compile(r"\s*IdentityFile[\s=]", re.I)
 # the host lists ssh reads (and adds to) itself: one or more files after the option name
 SSH_HOSTS_OPTION_RE = re.compile(r"(?i)\s*(?:user|global)knownhostsfile(?:\s*=\s*|\s+)(.*)")
 SSH_KEY_NAME_RE = re.compile(r"^id_(?!.*\.pub$)|\.(?:pem|key|ppk|p12|pfx)$")
+# The ssh_config(5) keywords: every line of a file passed as ssh -F starts with one (ssh_own_file)
+SSH_CONFIG_WORDS = frozenset(w.lower() for w in """
+    Host Match AddKeysToAgent AddressFamily BatchMode BindAddress BindInterface CanonicalDomains
+    CanonicalizeFallbackLocal CanonicalizeHostname CanonicalizeMaxDots CanonicalizePermittedCNAMEs
+    CASignatureAlgorithms CertificateFile ChannelTimeout CheckHostIP Ciphers ClearAllForwardings Compression
+    ConnectionAttempts ConnectTimeout ControlMaster ControlPath ControlPersist DynamicForward EnableEscapeCommandline
+    EnableSSHKeysign EscapeChar ExitOnForwardFailure FingerprintHash ForkAfterAuthentication ForwardAgent
+    ForwardX11 ForwardX11Timeout ForwardX11Trusted GatewayPorts GlobalKnownHostsFile GSSAPIAuthentication
+    GSSAPIDelegateCredentials HashKnownHosts HostbasedAcceptedAlgorithms HostbasedAuthentication
+    HostKeyAlgorithms HostKeyAlias Hostname IdentitiesOnly IdentityAgent IdentityFile IgnoreUnknown Include
+    IPQoS KbdInteractiveAuthentication KbdInteractiveDevices KexAlgorithms KnownHostsCommand LocalCommand
+    LocalForward LogLevel LogVerbose MACs NoHostAuthenticationForLocalhost NumberOfPasswordPrompts
+    ObscureKeystrokeTiming PasswordAuthentication PermitLocalCommand PermitRemoteOpen PKCS11Provider Port
+    PreferredAuthentications ProxyCommand ProxyJump ProxyUseFdpass PubkeyAcceptedAlgorithms
+    PubkeyAuthentication RekeyLimit RemoteCommand RemoteForward RequestTTY RequiredRSASize RevokedHostKeys
+    SecurityKeyProvider SendEnv ServerAliveCountMax ServerAliveInterval SessionType SetEnv StdinNull
+    StreamLocalBindMask StreamLocalBindUnlink StrictHostKeyChecking SyslogFacility TCPKeepAlive Tag Tunnel
+    TunnelDevice UpdateHostKeys User UserKnownHostsFile VerifyHostKeyDNS VisualHostKey XAuthLocation""".split())
+# One known_hosts(5) entry: an optional marker, host patterns or a |1| hash, a key type and its base64 key
+SSH_HOSTS_LINE_RE = re.compile(r"(?:@(?:cert-authority|revoked)\s+)?\S+\s+(?:ssh|ecdsa|sk|rsa)-[\w@.-]+"
+                               r"\s+[A-Za-z0-9+/]+={0,2}(?:\s.*)?")
 # ssh -o options that run a local program or read another config or library
 SSH_RUNS_RE = re.compile(r"(?i)\s*(?:proxycommand|localcommand|permitlocalcommand|knownhostscommand|match|include"
                          r"|pkcs11provider|securitykeyprovider|xauthlocation)\b")
@@ -239,10 +262,13 @@ def ssh_options(argv: list[str]) -> list[tuple[str, str, str]]:
     return out
 
 
-def ssh_own_file(value: str) -> bool:
-    """`value` names one of ssh's own settings files in ~/.ssh (a config or host list), which a run cannot
-    write (pathguard), as ~/, $HOME/ or an absolute path, and the file is no private key, neither by its
-    name (id_*, *.pem, *.key, ...) nor by its first bytes (ssh would print the lines it cannot parse)."""
+def ssh_own_file(value: str, kind: str = "config") -> bool:
+    """`value` names one of ssh's own settings files in ~/.ssh, as ~/, $HOME/ or an absolute path, shaped like
+    the option it is given to (fail closed): for `kind` "config" (-F) every line that is not blank or a comment
+    starts with an ssh_config keyword, for "hosts" (UserKnownHostsFile, GlobalKnownHostsFile) every such line is
+    a known_hosts entry. Any other file, a token or age key too, is refused: ssh prints the first word of each
+    config line it cannot parse, and it adds host lines to a host list. The file is no private key either,
+    neither by its name (id_*, *.pem, *.key, ...) nor by its content."""
     home = os.path.expanduser("~")
     path = re.sub(r"^\$(?:HOME|\{HOME\})(?=/)", lambda _: home, value)
     if not path.startswith(("~/", "/")) or re.search(r"[*?\[%$`]", path):
@@ -252,20 +278,40 @@ def ssh_own_file(value: str) -> bool:
         return False
     try:
         with open(real, "rb") as f:
-            head = f.read(4096)
+            data = f.read(1 << 20)
+            if f.read(1):   # over 1 MiB: no settings file ssh keeps
+                return False
     except OSError:   # missing or unreadable: none (ssh would make a new host list there)
         return False
-    return b"PRIVATE KEY" not in head and b"PuTTY-User-Key" not in head
+    if b"PRIVATE KEY" in data or b"PuTTY-User-Key" in data:
+        return False
+    lines = [ln.strip() for ln in data.decode("latin-1").splitlines()]
+    lines = [ln for ln in lines if ln and not ln.startswith("#")]
+    if kind == "hosts":
+        return all(SSH_HOSTS_LINE_RE.fullmatch(ln) for ln in lines)
+    return all(re.split(r"[\s=]", ln, maxsplit=1)[0].lower() in SSH_CONFIG_WORDS for ln in lines)
+
+
+def ssh_host_list(value: str) -> bool:
+    """`value` is a host list ssh may read and add to: a known_hosts-shaped file in ~/.ssh (ssh_own_file), or one
+    named as ssh names its host lists (known_hosts in the file name, ssh_public), which ssh makes if missing. ssh's
+    config, authorized_keys and any other file are no host list: ssh would add host lines to them."""
+    if ssh_own_file(value, "hosts"):
+        return True
+    path = re.sub(r"^(?:~|\$(?:HOME|\{HOME\}))/", "", value)
+    base = os.path.basename(path)
+    return (path != value and path.startswith(".ssh/") and "known_hosts" in base and ssh_public(path[5:])
+            and not re.search(r"[*?\[%$`]", path))
 
 
 def ssh_files(argv: list[str]) -> list[str]:
     """The words naming ssh's own settings files in an ssh, scp or sftp call: the value of -F, or of
-    -o UserKnownHostsFile= or GlobalKnownHostsFile=, when each file it names passes ssh_own_file."""
+    -o UserKnownHostsFile= or GlobalKnownHostsFile=, when each file it names passes ssh_own_file for that option."""
     out = []
     for o, v, word in ssh_options(argv):
         m = SSH_HOSTS_OPTION_RE.match(v) if o == "o" else None
         files = [v] if o == "F" else m[1].split() if m else []
-        if files and all(map(ssh_own_file, files)):
+        if files and all(ssh_own_file(f, "config") if o == "F" else ssh_host_list(f) for f in files):
             out.append(word)
     return out
 

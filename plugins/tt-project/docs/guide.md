@@ -3956,8 +3956,12 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   `GIT_SSH_COMMAND` too, is refused as a credential-store read. The same rule lets ssh read its own
   settings files in `~/.ssh` by any name: the direct value of `-F <config>`, `-o
   UserKnownHostsFile=` or `-o GlobalKnownHostsFile=` (one or more files) passes in the same calls,
-  beside a key too, when the file exists and is no private key by name (`id_*`, `*.pem`, `*.key`,
-  ...) or content (ssh prints the lines of a config it cannot parse). `cat`, `grep`, `cp`, scp with
+  beside a key too, when the file exists, is no private key by name (`id_*`, `*.pem`, `*.key`, ...)
+  or content, and is shaped like that option's file, failing closed: every line of a `-F` file
+  starts with an ssh_config keyword (ssh prints the lines of a config it cannot parse), and every
+  line of a host list is a known_hosts entry (ssh adds host lines to it). A missing host list passes
+  only when named like ssh's own (`known_hosts` in the name), so a host list naming ssh's config,
+  `authorized_keys`, a token or any other file is refused. `cat`, `grep`, `cp`, scp with
   the file as a source, a redirect or inline code naming such a file stays refused. For the
   harness's own host checks (`ttp hostcheck`), a route that needs its own ssh config is set as
   `coordinator.session.host_access.<alias>`: a config file in the project folder, which the harness
