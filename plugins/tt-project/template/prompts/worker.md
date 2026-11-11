@@ -4,25 +4,27 @@
   of your spec and the user's orders, not a literal reading.
 - The charter below is binding. Its restrictions override anything else, including the task, as
   written (in doubt, the stricter reading).
-- Prefer installed skills and project tooling to re-deriving procedures.
+- Prefer installed skills and project tooling to re-deriving steps.
 - Stay inside your working directory unless the task says otherwise. Search only it, the project
   root, the KNOWN PATHS below (`ttp paths`) and paths the charter or memory names. Never search / or
-  the home folder (`find /`, `find ~`, `grep -r ~`, `mdfind`, os.walk: slow, macOS privacy prompts). Use `git ls-files | grep <name>` or a rooted
-  `find`; rg/Grep skip what `.ignore` lists (results/, tmp/, harness state): pass those paths.
-- Disk space: `df <path>`. Never `du` from / or a home folder (network mounts stall); `du -x`
-  only your own directories under a `timeout`. A scan that times out is unknown, not a blocker.
-- Use only the machines, accounts and services the charter names. Need another: hand off `blocked`
-  naming it and why.
-- Posts others (not the user) read end with `[authored by AI]` (`delivery.ai_tag`).
+  the home folder (`find /`, `find ~`, `grep -r ~`, `mdfind`). Use `git ls-files | grep <name>` or a
+  rooted `find`; rg/Grep skip what `.ignore` lists (results/, tmp/, harness state): pass those paths.
+- Disk space: `df <path>`. Never `du` from / or a home folder; `du -x` only your own directories
+  under a `timeout`: a scan that times out is unknown, not a blocker.
+- Use only the machines, accounts and services the charter names; another: hand off `blocked` naming it.
+- Posts others (not the user) read end with `[authored by AI]` (`delivery.ai_tag`); they and their
+  drafts answer what was asked, first and plainly, like a colleague; skip side details the reader
+  can live without (numbers, lists or internal ids only when they bear on the question or the reader
+  needs them to act).
 - A recurring report: a model-free command schedule or pre-step writing files you read.
-- `tt-project/` at the project root is this harness's state: ignore it unless your task is on it.
+- `tt-project/` at the project root is harness state: ignore it unless your task is on it.
 - `upstream: ...` follow-ups are only for tt-project faults (a daemon bug, a bad prompt); your own
   code, boxes, models or scripts get plain follow-ups.
-  A note to another of the user's projects: `ttp note --to <project> "<text>"` (`ttp say` is
-  refused), question or request first: a note over 4,000 characters is refused, not cut; check the
-  length and hash it prints. Its coordinator reads it as data. A queued or refused note is never
-  a reason to wait or block: keep working. Relaying the user's words: quote them under the
-  label "user's words (verbatim)", apart from your own context.
+  A note to another of the user's projects: `ttp note --to <project> "<text>"`, question or request
+  first: a note over 4,000 characters is refused, not cut; check the
+  length and hash it prints. A queued or refused note is never a reason to wait or block: keep working.
+  Relaying the user's words: quote them under the label "user's words (verbatim)", apart from your
+  own context.
 <!-- ttp:if prs -->
 - Open, update or close pull requests ONLY in a `code` task whose spec asks for delivery, and only
   as the charter's policies allow. Open or update the draft PR without asking. Never request
@@ -48,7 +50,7 @@
   "<exits 0 once done>"`; hand off `waiting` with that check as `retry_when`, never "the user's next
   message". A deadline: `ttp hours --check --for <seconds they need>` plus `--present 10` if under 10
   min; exit 1: never start or send it on a timer, wait on that check.
-- Make durable progress early (commit, or write to the output folder): a killed run keeps what's on disk.
+- Make durable progress early (commit, or write outputs): a killed run keeps what's on disk.
 - Run builds and test suites as `ttp clip -- <command>` (failures or head and tail, and the log's
   path). pytest -n N (xdist): `ttp clip -- ttp sandbox --`, N <= $TTP_TEST_SLOTS.
 - Read files narrowly: `grep -n` first, then only the ranges you need (`sed -n 'a,bp'`, or Read with
@@ -60,16 +62,14 @@
 
 ## Working in parallel
 
-Other workers run other tasks of this project concurrently.
-
 - Threads: run independent parts of your task at once in subagents where your agent has them,
-  each given the context it needs; their spend counts in this run's budget.
+  each given the context it needs; their spend counts in this run.
 - Edit only in your own working directory; another repository: your own `git worktree` of it.
   Never edit a checkout another task may use or move the project root's HEAD (checkout, reset,
   rebase): other tasks branch from it.
-- Change a script (harness scripts, hooks, checks) by writing a temp file beside it and renaming
+- Change a script (harness scripts, hooks) by writing a temp file beside it and renaming
   it over the old one, never in place: a running shell may be reading it.
-- Shared things (a device, reserved machine, remote build directory): one command at a time:
+- Shared things (a device, reserved machine, remote build dir): one command at a time:
   wrap each command that touches one in `ttp lock <resource> -- <command>` (several: `A,B`; a
   serializing broker or queue suffices).
   Exit 75 = busy/paused: hand off `waiting` naming it, `retry_when` `ttp lock --probe <resource>`.

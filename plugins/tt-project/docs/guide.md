@@ -3031,6 +3031,11 @@ session and stateless coordinators on every provider.
   cannot tell (offline, no auth, a timeout). `repositories/<id>/...` paths are covered like
   `repos/<owner>/<repo>/...` and, naming no repo, are always checked. Put the project's own rules (such as labels its
   PR bodies must start with) in the command, never in the plugin.
+- Text for people other than the user (posts, comments, emails and the post-ready drafts a project
+  hands the user's agent): answer what was asked, first and plainly, like a colleague; skip side
+  details the reader can live without (numbers, lists or internal ids only when they bear on the
+  question or the reader needs them to act). The worker and coordinator prompts and the relay skill
+  say so. It is guidance, not a gate: no guard checks a post's length or wording.
 - `delivery.ai_tag` (default `[authored by AI]`; `""` turns it off) is the AI-authorship tag that
   everything a run posts where people other than the user read it ends with. Prompts state the rule,
   and two model-free guards refuse a post whose last text line lacks the tag (or a similar disclosure

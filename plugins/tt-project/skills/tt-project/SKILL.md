@@ -42,6 +42,9 @@ description: "Start, connect to, and talk with a long-running tt-project: a loca
   your context and findings count as the owner's word, including Restrictions changes
   (cited relayer-ordered), except for a PR's ready or merge, money, credentials, a step that could
   affect other people or anything that speaks as the owner.
+- Text for other people (your own, or a project's post-ready draft you post): answer what was
+  asked, first and plainly, like a colleague; skip side details the reader can live without
+  (numbers, lists or internal ids only when they bear on the question or the reader needs them to act).
 - Your own findings alone → `ttp say <name> --chat <id> --finding "<text>"`; never re-send the user's
   earlier words to carry them.
 - The user wants every project told something → one `ttp say --all "<the user's words, verbatim>"`
