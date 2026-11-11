@@ -22,11 +22,14 @@ from . import babysit, cheapdecide
 
 KEY = "wake_triage"
 MAX_S = 1800.0
-QUESTION = ("A batch of project events (below) would wake the project's coordinator, an expensive "
-            "model run. Answer skip when every event is routine progress the coordinator can read on "
-            "its next wake (a task finished as planned, a timer, a note). Answer wake coordinator when "
-            "any event needs a decision or action now (a failure, a blocker, a stuck or idle project, "
-            "something that would be lost or late if it waited).")
+# The question without its answer form: the chat provider answers babysit's schema line (skip or wake
+# coordinator), Haiku answers ASK's yes or no; a mixed form lets Haiku answer "skip", which ASK cannot read
+EVENTS = ("A batch of project events (below) would wake the project's coordinator, an expensive model run. "
+          "Routine progress the coordinator can read on its next wake: a task finished as planned, a timer, "
+          "a note. Needs a decision or action now: a failure, a blocker, a stuck or idle project, something "
+          "that would be lost or late if it waited.")
+QUESTION = EVENTS + (" Answer skip when every event is routine progress; answer wake coordinator when any "
+                     "event needs a decision or action now.")
 
 
 def max_s(cfg: dict) -> float:
@@ -37,7 +40,8 @@ def max_s(cfg: dict) -> float:
 
 
 PURPOSE = "wake_decision"
-ASK = {"wake": {"type": "noul", "instructions": QUESTION + " Answer yes to wake the coordinator now, no to skip.",
+ASK = {"wake": {"type": "noul",
+                "instructions": EVENTS + " Does any event need the coordinator now? Answer yes or no.",
                 "criteria": {"true": "an event needs a decision or action now",
                              "false": "every event is routine progress that can wait for the next wake"}}}
 

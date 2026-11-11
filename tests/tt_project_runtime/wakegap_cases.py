@@ -182,6 +182,27 @@ def test_waketriage_haiku_fallback_is_on_by_default_and_its_off_switch_wakes_wit
     assert _turn_within(d, clock, starts, 60) and len(calls) == n, "Haiku decided a wake after its off-switch"
 
 
+def test_waketriage_haiku_is_asked_yes_or_no_only_and_its_no_folds_the_batch(env, monkeypatch):
+    """Haiku's question carries only ASK's yes/no form: the chat provider's skip/wake schema words in it let
+    Haiku answer "skip", which ASK cannot read, so the coordinator woke anyway and the call was wasted."""
+    from ttp import cheapdecide, waketriage
+    ask = waketriage.ASK["wake"]["instructions"]
+    assert "yes or no" in ask and not re.search(r"(?i)answer skip|wake coordinator", ask), ask
+    assert "skip" in waketriage.QUESTION and "wake coordinator" in waketriage.QUESTION   # babysit's schema
+    assert cheapdecide._read(waketriage.ASK, {"result": "skip"}) is None   # why the form must not offer it
+    for answer, folded_want in (("no", True), ("wake: no", True), ("No.", True), ("yes", False)):
+        with monkeypatch.context() as m:
+            calls = _wg_haiku(m, answer=answer)
+            p = make(env)
+            p.db.x("DELETE FROM kv WHERE key=?", (waketriage.KEY,))
+            p.db.x("INSERT INTO events(ts,source,kind,severity,text,status) "
+                   "VALUES(100,'task:1','task_done','normal','x','queued')")
+            evs = [dict(r) for r in p.db.q("SELECT * FROM events")][-1:]
+            folded, line = waketriage.fold(p.db, dict(p.config(), providers={}), evs, 160)
+        assert len(calls) == 1 and not re.search(r"(?i)answer skip|wake coordinator", calls[0][1]), calls
+        assert folded is folded_want and "triage failed" not in line, (answer, line)
+
+
 def test_waketriage_haiku_pending_holds_the_batch_but_never_past_max_s(env):
     from ttp import waketriage
     p = make(env)
