@@ -298,7 +298,7 @@ def test_pathguard_lets_message_text_that_names_a_path_pass(cred_home, cmd):
     from ttp import hook
     assert pathguard_why(_pg_bash(cmd, cred_home.work)) is None, cmd
     out, _ = hook.pre_tool_use(_pg_bash(cmd, cred_home.work))
-    assert "credential" not in str(out), cmd
+    assert "credential folders" not in str(out), cmd   # credguard still reads a store path named in text
 
 
 @pytest.mark.parametrize("cmd", PG_MESSAGE_WRITES)

@@ -4217,7 +4217,8 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   other variable before it, no command substitution, no redirect to a built target, and beside it
   only plain commands such as `cd`, `echo`, `cat` or a `ttp note|notify|say`; otherwise it is refused as a credential-store
   read. A message's text is data: a `ttp note`, `notify` or `say` whose words only
-  name one of these paths passes, also with interpreter code elsewhere in the line. Command
+  name one of these paths passes this guard (the credential-read guard still refuses a store path
+  named in text), also with interpreter code elsewhere in the line. Command
   substitutions (`$(...)` and backticks, inside double quotes too) run, so they are read like any
   command, and one inside a message that names one of these paths is refused even to read, since the
   message would send what it prints. Text ssh runs on another host is read too (its remote command, a
