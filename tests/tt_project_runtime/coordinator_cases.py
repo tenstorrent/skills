@@ -1239,7 +1239,7 @@ def test_a_routine_digest_collapses_unchanged_background_and_keeps_what_decides_
     full, seen = coord.digest_parts(p, gates, [ev], [])
     keys = [k for k, _ in full]
     assert set(coord.COLLAPSIBLE) <= set(keys) and set(seen) == set(coord.COLLAPSIBLE) | {coord.LEDGER_SEEN_KEY,
-                                                                                         coord.TASK_ROWS_SEEN_KEY}
+                                                                                         coord.TASK_ROWS_SEEN_KEY, "task_results"}
     full_text = "\n".join(t for _, t in full)
     # The next routine turn, nothing changed: each background section is one line, with no reasons.
     short, again = coord.digest_parts(p, gates, [ev], [], seen)

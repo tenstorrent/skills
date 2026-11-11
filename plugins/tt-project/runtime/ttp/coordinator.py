@@ -38,6 +38,7 @@ from . import (   # one name per line: two changes adding names merge without a 
     cachettl,
     causefix,
     cells,
+    digestresults,
     chaincap,
     channeltag,
     chatdigest,
@@ -600,6 +601,8 @@ USER_SETTABLE = {
     "coordinator.session.tools": lambda v: coordtools.tools_mode_of(v),
     # Per-row updates of the keyed digest lists on resumed session wakes: true (default) or false.
     "coordinator.session.row_delta": lambda v: coordsession.row_delta_of(v),
+    # Task results and the last push batch in the digest (digestresults.py): true (default) or false.
+    "coordinator.digest_results": lambda v: digestresults.of(v),
     # The median cost of the last 5 session wakes at which one alarm goes out and the session shrinks
     # itself in place (wakecost.py): dollars, 0 or off for no check.
     "coordinator.wake_cost_alarm_usd": lambda v: wakecost.threshold_of(v),
@@ -1415,6 +1418,14 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
     uncollapsed: list[tuple[str, list[str]]] = []
     shas: dict = {}
     tag = spans.new_tag()   # this turn's delimiter: workers' and relayers' text below is enclosed with it
+    # Tasks this wake's events and messages name: a section naming one is never folded.
+    said_now = " ".join(f"{e['source']} {e['text'] or ''}" for e in db.q(
+        f"SELECT source, text FROM events WHERE id IN ({','.join('?' * len(event_ids))})", list(event_ids))) \
+        if event_ids else ""
+    if msg_ids:
+        said_now += " " + " ".join(str(m["text"] or "") for m in db.q(
+            f"SELECT text FROM messages WHERE id IN ({','.join('?' * len(msg_ids))})", list(msg_ids)))
+    named_now = digestresults.named(said_now)
 
     def section(key: str, body: list[str], ident: str | None = None, short: str | None = None,
                 full: list[str] | None = None) -> None:
@@ -1427,7 +1438,8 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
             return
         if key in COLLAPSIBLE and ident is not None:
             shas[key] = _sha(ident)
-            if seen is not None and short and seen.get(key) == shas[key]:
+            if seen is not None and short and seen.get(key) == shas[key] \
+                    and not named_now & digestresults.named("\n".join(body)):
                 body = [short]
         shown.append((key, body))
 
@@ -1679,6 +1691,9 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
                      + verified.handoff_line(load_result(t["result"])) + (f" — {summary}" if summary else "")
                      + (claimcheck.handoff_mark(load_result(t["result"])) if summary else ""))
     section("finished", lines)
+    if digestresults.on(p.config()):
+        lines, res_whole, shas[digestresults.KEY] = digestresults.lines(p, events, said_now, seen, now, tag, in_events)
+        section("results", lines, full=res_whole)
     said = " ".join(str(e["text"] or "") for e in events)
     if msg_ids:
         said += " " + " ".join(str(m["text"] or "") for m in db.q(
