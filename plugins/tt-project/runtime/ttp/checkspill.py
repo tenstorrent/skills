@@ -115,6 +115,7 @@ get a copy of the commit only, so it never spills either; it splits off to run h
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -144,6 +145,8 @@ OFF_ENV = "TTP_CHECKS_NO_SPILL"   # "1": these checks never spill; else the host
 HOST_FAULT_TRIES = 2   # a spill host whose own fault (exit 75) ended a run this often is kept off its rerun
 FAULT_RETRY_S = 600   # for this long, or until the checks config changes; then it is tried again
 FAIL_VERDICT_HOSTS = 2   # on a workstation (remote_only), checks that failed on this many spill hosts failed: no rerun
+HANG_VERDICT_HOSTS = 2   # one check command stopped by its silence limit on this many spill hosts hangs: no rerun
+HANG = "hang."   # spill_off_add's mark of a host where a check command hung (hang_mark): kept off, as a failure
 SLOW = "slow"   # spill_off_add's mark of a host whose tree copy timed out (remotecheck.COPY_TIMEOUT): kept off at once
 WRAP_ENV = "TTP_CHECKS_WRAP_REFUSED"   # this run's spill hosts whose wrapper refused it, each with why (wrap_refused)
 WRAP_SAME_HOSTS = 3   # this many spill hosts (or every one listed) refusing a run for one reason: the wrapper's setting
@@ -1606,15 +1609,17 @@ def all_off(off: str) -> bool:
 
 
 def spill_off_add(off: str, host: str, fault: bool, env_cfg: dict | None = None, cfg: dict | None = None,
-                  slow: bool = False) -> str:
+                  slow: bool = False, hang: str = "") -> str:
     """OFF_ENV's value after the checks did not pass on spill host `host`: `fault` when the host's own fault
     ended them (exit 75), else they failed or timed out there. `env_cfg`: they failed at import for want of a
     package (push.env_problem), a fault of the spill env config `env_cfg` (env_off), never of the host.
     A fault is marked with its time and the checks config `cfg` it ran under, so it expires (kept_off).
     `slow`: the copy of the tree there timed out (remotecheck.COPY_TIMEOUT), a fault kept off at once (kept_off):
-    another full copy timeout on the same link would only add to the wait; the rerun goes elsewhere or here."""
+    another full copy timeout on the same link would only add to the wait; the rerun goes elsewhere or here.
+    `hang`: check command `hang` was stopped there by its silence limit (checkwall.Silent): marked per command
+    (hang_mark), so the same command hanging on HANG_VERDICT_HOSTS hosts is the change's (hang_hosts)."""
     mark = (f"env.{_env_key(env_cfg)}.{int(time.time())}" if env_cfg is not None
-            else SLOW if slow else f"fault.{_env_key(cfg) if cfg is not None else ''}.{int(time.time())}" if fault else "fail")
+            else SLOW if slow else hang_mark(hang) if hang else f"fault.{_env_key(cfg) if cfg is not None else ''}.{int(time.time())}" if fault else "fail")
     return ",".join([*(e for e in off.split(",") if e and e != "1"), f"{host}:{mark}"])
 
 
@@ -1623,7 +1628,22 @@ def fail_hosts(off: str) -> list[str]:
     host's own fault nor its env), in order, each once."""
     seen: list[str] = []
     for h, _, why in (e.rpartition(":") for e in off.split(",") if e and e != "1"):
-        if why == "fail" and h not in seen:
+        if (why == "fail" or why.startswith(HANG)) and h not in seen:
+            seen.append(h)
+    return seen
+
+
+def hang_mark(check: str) -> str:
+    """spill_off_add's mark of a host where check command `check` hung: HANG and a short hash of the command."""
+    return HANG + hashlib.sha1(str(check).encode()).hexdigest()[:12]
+
+
+def hang_hosts(off: str, check: str) -> list[str]:
+    """The spill hosts OFF_ENV's value `off` records check command `check` as hung on (hang_mark), in order,
+    each once: HANG_VERDICT_HOSTS of them make the hang the change's, never a host's."""
+    mark, seen = hang_mark(check), []
+    for h, _, why in (e.rpartition(":") for e in off.split(",") if e and e != "1"):
+        if why == mark and h not in seen:
             seen.append(h)
     return seen
 
@@ -1648,7 +1668,7 @@ def kept_off(off: str, cfg: dict | None = None, now: float | None = None) -> set
     key = None if cfg is None else _env_key(cfg)
     seen = [e.rpartition(":") for e in off.split(",") if e and e != "1"]
     return {h for h, _, why in seen if not why.startswith("env.") and (
-            why in ("fail", SLOW) or sum(1 for h2, _, w2 in seen if h2 == h and _fault_counts(w2, key, now)) >= HOST_FAULT_TRIES)}
+            why in ("fail", SLOW) or why.startswith(HANG) or sum(1 for h2, _, w2 in seen if h2 == h and _fault_counts(w2, key, now)) >= HOST_FAULT_TRIES)}
 
 
 def fails(state: Path, head: str, key: str) -> list[dict]:

@@ -4868,8 +4868,18 @@ def cmd_checks(a) -> None:
             if join_rec:
                 checkjoin.forget(p.state)
             return cmd_checks(a)
+        # The same check command stopped by its silence limit (checkwall.Silent) on HANG_VERDICT_HOSTS spill hosts:
+        # a hang of the change's, not a host's (a slow host or a stalled link meets the wall-time cap instead), so
+        # the run fails as is: never on to a third host or here (checkspill.hang_hosts).
+        hung_on: list[str] = []
+        if spilled and not passed and timed_out and timed_out.get("silent_s") and getattr(failed, "spill_host", "") \
+                and not _CHECK_STOP.get("stopped"):
+            from . import checkspill
+            hung_on = checkspill.hang_hosts(checkspill.spill_off_add(no_spill, spilled.host, False, hang=str(failed)),
+                                            str(failed))
+            hung_on = hung_on if len(hung_on) >= checkspill.HANG_VERDICT_HOSTS else []
         if ran_since and p:
-            if timed_out and spilled:
+            if timed_out and spilled and not hung_on:
                 pass   # a spill host's wall time (a slower host, a stalled link) is no timeout of the task's: rerun here
             elif timed_out:
                 checkwall.record_timeout(p.state, os.environ.get("TTP_TASK"), timed_out)
@@ -4891,7 +4901,14 @@ def cmd_checks(a) -> None:
         # counts, or on another spill host that is free (checkspill.kept_off), where only a pass counts.
         # Not when the tests gate proved its failures new there (the base passed them on that host): the host's
         # environment is ruled out, so a rerun here would only fail again holding a slot (gatejudge.known_new).
-        if spilled and proven_new and not passed and not timed_out:
+        if hung_on:
+            said = (f"the check {str(failed)[:200]!r} stopped with no output for {timed_out['silent_s']:g} s (a hang) "
+                    f"on spill hosts {', '.join(hung_on)}: the same command hanging on two hosts is the change's "
+                    "failure, not a host's; not run again: fix it and commit (the hung test's stack is in the log above)")
+            out.write(f"ttp checks: {said}\n")
+            out.flush()
+            print(f"ttp checks: {said}", flush=True)
+        elif spilled and proven_new and not passed and not timed_out:
             said = (f"the checks failed on spill host {spilled.host} with tests the base passes on that host: "
                     + ", ".join(i for v in proven_new for i in gatejudge.proven(v))
                     + "; not run again here: fix them and commit")
@@ -4911,7 +4928,9 @@ def cmd_checks(a) -> None:
         # Nor when a check split off to run here failed or timed out (checkspill.stays_here): that counts as is.
         elif spilled and not passed and (executed or timed_out) and not _CHECK_STOP.get("stopped") \
                 and not (failed in todo and not getattr(failed, "spill_host", "")):
-            how = f"past the {timed_out['cap_s']:g} s wall-time cap" if timed_out else f"exit {rc}"
+            hang = str(failed) if timed_out and timed_out.get("silent_s") else ""
+            how = (f"no output for {timed_out['silent_s']:g} s: a hang, stopped" if hang
+                   else f"past the {timed_out['cap_s']:g} s wall-time cap" if timed_out else f"exit {rc}")
             env_why, real, ran_out = "", [], ""
             slow = False
             if not timed_out:   # a package missing there: a fault of the spill env config (checkspill.env_off)
@@ -4958,7 +4977,7 @@ def cmd_checks(a) -> None:
                 print(f"ttp checks: {said}", flush=True)
             else:
                 no_spill = checkspill.spill_off_add(no_spill, spilled.host, rc == 75 and not timed_out,
-                                                    env_cfg, cfg=p.config(), slow=slow)
+                                                    env_cfg, cfg=p.config(), slow=slow, hang=hang)
                 if slow:
                     how += f": {remotecheck.COPY_TIMEOUT}, so that host is kept off this run"
                 if env_why:

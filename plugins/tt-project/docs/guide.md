@@ -2612,7 +2612,9 @@ the pick order, so it takes the first starts. A resumed resource ramps only its 
   the same order, keeping off the hosts its checks failed on (one whose own fault ended them, such as a pause
   taken mid-run, gets one more try once free); a pass on another spill host counts, else the result here does.
   A workstation (`delivery.checks_remote_only`), which runs nothing here while a host is busy, fails the run
-  once its tests failed on two spill hosts instead.
+  once its tests failed on two spill hosts instead. A check command its silence limit (`silent_s`) stopped on
+  two spill hosts hangs in the change, not the hosts: the run fails after the second, never on to a third host
+  or here, and its log says so beside the hung test's stack; one such hang after a host fault still moves on once.
   A run whose failures the tests gate (below) proved new on that spill host, the base passing them there, fails
   at once instead: the host is ruled out, so a rerun would only fail again while holding a slot.
   A host whose own environment keeps failing runs is quarantined, per project and model-free: a spilled failure

@@ -907,6 +907,81 @@ def test_checks_that_fail_on_a_spill_host_run_again_only_here_and_a_host_fault_s
     assert checkspill.holders(p.name) == []
 
 
+@_LINUX_TMP
+def test_the_same_check_hanging_on_two_spill_hosts_fails_the_run_and_a_host_fault_then_one_hang_moves_on(
+        env, tmp_path, monkeypatch):
+    """#8416: a check command stopped by its silence limit on one spill host and again on a second is a hang of
+    the change's: the run fails after the second, never on to a third host or here, and says it hung. A host's
+    own fault (exit 75) and one hang still move on once, as any single timeout there does."""
+    import threading
+    from ttp import checkspill, checkwall, cli
+    hosts = ["check-host-a", "check-host-b", "check-host-c"]
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, hosts, charter=hosts)
+    p.set_config("delivery.checks_remote_only", False)
+    monkeypatch.setattr(checkwall, "POLL_S", 0.1)
+    monkeypatch.setenv("TTP_TASK", "8416")
+    log = tmp_path / "where.log"
+    p.set_config("delivery.push_checks", [{"run": f'pwd >> {log}; case "$PWD" in */ttp-check.*) sleep 30;; esac',
+                                           "silent_s": 2}])
+    lane = _spill_lane(p, repo)
+    threading.Timer(_load_scaled(90), lane.close).start()   # bounded: a run that never fails here frees it
+    try:
+        with pytest.raises(SystemExit) as e:
+            cli.main(["checks", "--fresh"])
+    finally:
+        lane.close()
+    assert e.value.code == 1
+    rec = json.loads((run / "checks.json").read_text())
+    assert rec["passed"] is False, rec
+    text = (run / "checks.log").read_text()
+    verdict = [ln for ln in text.splitlines() if "(a hang) on spill hosts" in ln]
+    assert len(verdict) == 1 and "check-host-c" not in verdict[0] and "not run again" in verdict[0], text
+    assert "spilling to check-host-c" not in text and "running them again" in text, text
+    where = log.read_text().splitlines()
+    assert len(where) == 2 and all("/ttp-check." in w for w in where), "two spill hosts, then no rerun anywhere"
+    assert checkwall.last_timeout(p.state, "8416"), "the hang is the task's timeout"
+    # A host's fault, then one hang: on once more, where it passes.
+    git = ["git", "-C", str(repo), "-c", "user.email=t@example.com", "-c", "user.name=t"]
+    mark, count = tmp_path / "refused-once", tmp_path / "count"
+    (repo / "refuse-once.sh").write_text(f'#!/bin/sh\ntest -e {mark} && exec "$@"\ntouch {mark}\n'
+                                         ': > "$TTP_WRAP_REFUSED"\nexit 75\n')
+    (repo / "refuse-once.sh").chmod(0o755)
+    subprocess.run([*git, "add", "-A"], check=True)
+    subprocess.run([*git, "commit", "-qm", "wrap"], check=True)
+    log.write_text("")
+    seen = len((run / "checks.log").read_text())
+    p.set_config("delivery.push_checks", [{"run": f"pwd >> {log}; echo x >> {count}; "
+                                                  f'test "$(wc -l < {count})" -gt 1 || sleep 30',
+                                           "host": "local", "spill": True, "spill_wrap_cmd": "./refuse-once.sh",
+                                           "silent_s": 2}])
+    lane = _spill_lane(p, repo)
+    threading.Timer(_load_scaled(90), lane.close).start()
+    try:
+        cli.main(["checks", "--fresh"])
+    finally:
+        lane.close()
+    rec = json.loads((run / "checks.json").read_text())
+    text = (run / "checks.log").read_text()[seen:]
+    assert rec["passed"] is True, (rec, text)
+    assert "(exit 75)" in text and "(no output for 2 s: a hang, stopped)" in text, text
+    assert "(a hang) on spill hosts" not in text, text
+    assert len(log.read_text().splitlines()) == 2 and mark.exists()
+    assert checkspill.holders(p.name) == []
+
+
+def test_a_hang_mark_is_per_command_keeps_its_host_off_and_counts_for_the_workstation_verdict():
+    """#8416: spill_off_add's hang mark names the command, so only the same command hanging on two hosts is a
+    verdict (hang_hosts); a hung host is kept off like a failed one, and fail_hosts counts it as before."""
+    from ttp import checkspill
+    off = checkspill.spill_off_add("", "host-a", False, hang="make test")
+    off = checkspill.spill_off_add(off, "host-b", False, hang="make other")
+    assert checkspill.hang_hosts(off, "make test") == ["host-a"] and checkspill.kept_off(off) == {"host-a", "host-b"}
+    off = checkspill.spill_off_add(off, "host-c", fault=True)
+    off = checkspill.spill_off_add(off, "host-b", False, hang="make test")
+    assert checkspill.hang_hosts(off, "make test") == ["host-a", "host-b"]
+    assert checkspill.fail_hosts(off) == ["host-a", "host-b"]
+
+
 def test_spill_off_keeps_a_failed_host_off_and_a_faulted_one_after_its_second_fault():
     """#6379: OFF_ENV's value names the hosts a rerun keeps off: a host the checks failed on at once, one
     whose own fault (exit 75) ended them only after HOST_FAULT_TRIES faults; "1" keeps every host off."""
