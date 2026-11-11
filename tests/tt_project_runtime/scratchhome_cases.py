@@ -253,7 +253,7 @@ def test_a_spilled_check_runs_in_a_scratch_home_in_its_run_folder_there(tmp_path
     (rhome / ".cache").symlink_to(rhome)
     rc, said = _rc_run(tmp_path, repo, probe, HOME=str(rhome), XDG_CACHE_HOME="", TTP_HOME="",
                        **{scratchhome.FILES_ENV: files})
-    assert rc == 0 and out.read_text().splitlines() == [str(rhome / ".tt-project" / "checks-cache"), "none"], said
+    assert rc == 0 and out.read_text().splitlines() == [f"{tmp_path}/remote/../host-home/checks-cache", "none"], said
     # a folder beside the stores is still linked
     (moved / "c").mkdir()
     rc, said = _rc_run(tmp_path, repo, probe, HOME=str(rhome), XDG_CACHE_HOME=str(moved / "c"), TTP_HOME="",
