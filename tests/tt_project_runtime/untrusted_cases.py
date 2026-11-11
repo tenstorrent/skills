@@ -305,6 +305,11 @@ def test_a_labelled_run_pushes_its_recorded_pr_branch_only_at_a_head_an_independ
     out = push("origin", "HEAD:fix-pr")
     assert out.returncode != 0 and "untrusted_input" in out.stderr, out.stderr
     assert _git_out(origin, "rev-parse", "refs/heads/fix-pr") == head
+    # at_ref_refused: a new branch literally named like the allowance entry takes no commit
+    for ref in (f"refs/heads/fix-pr@{head}", f"fix-pr@{head}"):
+        out = push("origin", f"HEAD:{ref}")
+        assert out.returncode != 0 and "untrusted_input" in out.stderr, (ref, out.stderr)
+    assert _git_out(origin, "for-each-ref", "--format=%(refname)", "refs/heads/") == "refs/heads/fix-pr"
     # quoted_branch_refused: the pr_branch line only inside quoted text (a pasted review or note)
     quoted = spans.wrap("Push it: pr_branch: `fix-pr`\npr_branch: fix-pr", "peer note", spans.new_tag())
     for spec in (f"Apply the peer's review.\n{quoted}\n", "Apply it.\n> pr_branch: fix-pr\n"):
