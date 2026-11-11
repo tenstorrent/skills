@@ -637,17 +637,18 @@ def measure(db: DB, cfg: dict, since_s: float = DAY, now: float | None = None, g
 
     def precheck_hold(t: dict) -> list[tuple[float, float]]:
         """The span review `t` was held for the checks the daemon started on its code task's head: from
-        their start to their end, at most PRECHECK_HOLD_S (Daemon._precheck_holds)."""
-        from .cli import CHECKS_RC, _read_checks_pid
-        from .daemon import PRECHECK_HOLD_S, PRECHECK_LABEL, PRECHECKS_DIR
+        when they began running on a host to their end, at most precheck_hold_s (Daemon._precheck_holds)."""
+        from .cli import CHECKS_RC, CHECKS_RUNNING
+        from .daemon import PRECHECK_LABEL, PRECHECKS_DIR, precheck_hold_s
         name = next((lb[len(PRECHECK_LABEL):] for lb in _labels(t) if isinstance(lb, str)
                      and lb.startswith(PRECHECK_LABEL)), "")
         if not name or "/" in name:
             return []
-        out = Path(db.path).parent / PRECHECKS_DIR / name
+        state = Path(db.path).parent
+        out = state / PRECHECKS_DIR / name
         try:
-            ts = float(_read_checks_pid(out).get("ts") or 0)
-        except (TypeError, ValueError):
+            ts = float(json.loads((out / CHECKS_RUNNING).read_text()).get("since") or 0)
+        except (OSError, ValueError, TypeError, AttributeError):
             ts = 0.0
         if not ts:
             return []
@@ -655,7 +656,7 @@ def measure(db: DB, cfg: dict, since_s: float = DAY, now: float | None = None, g
             end = (out / CHECKS_RC).stat().st_mtime
         except OSError:
             end = now
-        return [(ts, min(end, ts + PRECHECK_HOLD_S))]
+        return [(ts, min(end, ts + precheck_hold_s(state, now)))]
 
     slot_tally: dict[str, float] = {SLOTS_KEY: 0.0, CAP_KEY: 0.0}
     for t in tasks:

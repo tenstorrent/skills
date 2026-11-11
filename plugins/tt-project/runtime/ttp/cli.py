@@ -4208,6 +4208,11 @@ def cmd_checks(a) -> None:
             wait_kept = "1"
         if join_rec and todo and not hit and not handover:
             checkjoin.update(join_rec, phase=checkjoin.RUNNING, run_since=time.time())
+        if todo and not hit and not handover:
+            try:   # the checks run on a host now, past every queue (daemon.precheck_holds)
+                write_json(Path(run_dir) / CHECKS_RUNNING, {"since": time.time(), "pid": os.getpid()})
+            except OSError:
+                pass
         child_env = {"PWD": top, **venv_vars, **(slot.env() if slot else {})}
         run_env = {**push.check_env("checks", run_dir=getattr(a, "check_run_dir", None), lock=lock), **child_env}
         # The priority its checks run at here, with its settings, once per run (a remote host's: remotecheck).
@@ -4992,6 +4997,7 @@ CHECKS_HANDOVER = ("every host-wide checks slot stayed busy, so they did not run
                    "detached instead, in the same place in the queue (exit 75): hand off waiting with the "
                    "retry_when above")
 CHECKS_SLOT_WAIT = "checks-slot.wait"   # in the run's directory while its checks wait for a host-wide slot
+CHECKS_RUNNING = "checks.running"   # in the run's directory once its checks run on a host ({since, pid})
 # The daemon's request that the run's checks stop waiting for a slot ({pid, started}): their task ended
 # (Daemon.reap_waiting_checks). Only a waiter with that pid and start time honours it, and only while it waits.
 CHECKS_SLOT_CANCEL = "checks-slot.cancel"

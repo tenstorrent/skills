@@ -79,17 +79,12 @@ def test_a_dispatch_hold_on_urgent_work_is_no_results_failure(env, monkeypatch):
     assert overseer.measure(p, now)["failing"] == ["urgent work ready with a free slot for 15 min"]
 
 
-def test_an_urgent_review_held_on_its_running_prechecks_is_no_results_failure(env, monkeypatch):
-    """The daemon keeps a review out of dispatch while the checks it started on its head run (no rc,
-    pid alive), for up to PRECHECK_HOLD_S: the overseer reads the same hold, so no FAILING and no
-    incident. Once the checks ended or the hold ran out, the waiting review fails as before."""
-    from ttp import overseer
-    from ttp.cli import CHECKS_PID, CHECKS_RC
-    from ttp.daemon import PRECHECK_HOLD_S, PRECHECKS_DIR, Daemon
+def _running_precheck_review(env, now):
+    """A stalled project (_stalled_loop) whose one task is a review labelled with the daemon's precheck
+    folder, which it returns with a writer of their checks.pid (alive: this process)."""
+    from ttp.cli import CHECKS_PID
+    from ttp.daemon import PRECHECKS_DIR
     from ttp.runner import proc_start
-    now = time.time()
-    dumps = []
-    monkeypatch.setattr(overseer, "capture_stacks", lambda p, now, why: dumps.append(why))
     p = _stalled_loop(env, now)
     p.db.x("UPDATE runs SET status='done'")   # only the urgent wait is left to judge
     tid = p.db.one("SELECT id FROM tasks")["id"]
@@ -98,21 +93,66 @@ def test_an_urgent_review_held_on_its_running_prechecks_is_no_results_failure(en
     out = p.state / PRECHECKS_DIR / name
     out.mkdir(parents=True)
 
-    def started(ts):
-        (out / CHECKS_PID).write_text(json.dumps({"pid": os.getpid(), "started": proc_start(os.getpid()), "ts": ts}))
+    def started(ts, pid=None):
+        (out / CHECKS_PID).write_text(json.dumps({"pid": pid or os.getpid(), "ts": ts,
+                                                   "started": proc_start(os.getpid()) if pid is None else "gone"}))
+    return p, tid, out, started
 
+
+def test_a_review_waits_for_its_prechecks_only_while_they_run_on_a_host_for_a_median_run(env):
+    """Six urgent reviews were held 10-20 min while their pre-checks queued 15 deep for a host checks
+    slot: a review now waits for them only once they run on a host (cli.CHECKS_RUNNING), never while
+    they wait for a slot, a lane or another run (cli.CHECKS_SLOT_WAIT), and only for the median of the
+    project's recent checks runs (checkwall), not an hour."""
+    from ttp import checkwall
+    from ttp.cli import CHECKS_RC, CHECKS_RUNNING, CHECKS_SLOT_WAIT
+    from ttp.daemon import PRECHECK_HOLD_S, Daemon, precheck_hold_s
+    now = time.time()
+    p, tid, out, started = _running_precheck_review(env, now)
+    p.db.x("UPDATE tasks SET priority=3, spec='review it' WHERE id=?", (tid,))   # not urgent, owes nothing
+    d = Daemon(p.base)
+    held = lambda: d._precheck_holds(p.db.task(tid), now)   # noqa: E731
     started(now - 600)
-    stalled = ["urgent work ready with a free slot for 15 min"]
-    # An urgent review is never held behind a precheck (it starts at once), so the overseer sees it ready.
-    assert not Daemon(p.base)._precheck_holds(p.db.task(tid), now), "the daemon holds no urgent review"
-    assert overseer.measure(p, now)["failing"] == stalled
-    p.db.x("UPDATE tasks SET priority=5, spec='routine' WHERE id=?", (tid,))
-    assert Daemon(p.base)._precheck_holds(p.db.task(tid), now), "a routine review is held: the same test"
+    (out / CHECKS_SLOT_WAIT).write_text(json.dumps({"since": now - 600, "pid": os.getpid()}))
+    assert not held(), "held while its checks wait in the host checks queue"
+    (out / CHECKS_SLOT_WAIT).unlink()
+    assert not held(), "held before its checks ran"
+    (out / CHECKS_RUNNING).write_text(json.dumps({"since": now - 60}))
+    assert precheck_hold_s(p.state, now) == PRECHECK_HOLD_S and held(), "no runs measured: the hour still caps it"
+    for s_ in (100, 120, 900):
+        checkwall.record_run(p.state, s_, True)
+    assert precheck_hold_s(p.state, now) == 120 and held()
+    (out / CHECKS_RUNNING).write_text(json.dumps({"since": now - 200}))
+    assert not held(), "held past the median checks run"
+    (out / CHECKS_RUNNING).write_text(json.dumps({"since": now - 700}))   # an older run's marker
+    assert not held()
+    (out / CHECKS_RUNNING).write_text(json.dumps({"since": now - 60}))
     (out / CHECKS_RC).write_text("0\n")
-    assert not Daemon(p.base)._precheck_holds(p.db.task(tid), now)
-    (out / CHECKS_RC).unlink()
-    started(now - PRECHECK_HOLD_S - 1)
-    assert not Daemon(p.base)._precheck_holds(p.db.task(tid), now), "the hold ran out"
+    assert not held(), "held after its checks ended"
+
+
+def test_an_urgent_or_owed_review_never_waits_for_its_prechecks(env, monkeypatch):
+    """A review at priority 1 (or with an `urgent:` line), or one owning an open obligation, starts at
+    once while its pre-checks run and reads their result only if it is there: neither the daemon nor
+    the overseer holds it, so a stall of it is FAILING."""
+    from ttp import obligations, overseer
+    from ttp.cli import CHECKS_RUNNING
+    from ttp.daemon import Daemon
+    now = time.time()
+    monkeypatch.setattr(overseer, "capture_stacks", lambda p, now, why: None)
+    p, tid, out, started = _running_precheck_review(env, now)
+    d = Daemon(p.base)
+    held = lambda: d._precheck_holds(p.db.task(tid), now)   # noqa: E731
+    started(now - 600)
+    (out / CHECKS_RUNNING).write_text(json.dumps({"since": now - 60}))
+    assert not held(), "an urgent review was held for its running pre-checks"
+    assert overseer.measure(p, now)["failing"] == ["urgent work ready with a free slot for 15 min"]
+    p.db.x("UPDATE tasks SET priority=3, spec='review it' WHERE id=?", (tid,))
+    assert held(), "a routine review still waits for running pre-checks"
+    oid = obligations.add(p, "land the fix (user msg #1)", owners=[tid])
+    assert not held(), "a review owing an obligation was held"
+    obligations.drop(p, oid, "recorded by mistake")
+    assert held(), "the obligation is gone: it waits again"
 
 
 def test_the_health_line_reaches_the_digest_status_and_deployed(env, monkeypatch):

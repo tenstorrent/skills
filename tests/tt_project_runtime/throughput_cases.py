@@ -513,7 +513,7 @@ def test_throughput_review_sweep_is_not_lowered_for_waits_the_checks_held(env, m
            (t0 + 3600, "daemon", "review_swept", "normal", f"#{code} x; review #{rv} queued by the daemon.", "handled", code))
     _tp_slot_wait(p, monkeypatch, code, t0 + 60, t0 + 3000)
     _tp_slot_wait(p, monkeypatch, code, t0 + 3700, t0 + 13500)
-    # Queued at finish, held about an hour by its precheck (its checks.pid start to its checks.rc).
+    # Queued at finish, held about an hour by its precheck (from when it ran on a host to its checks.rc).
     t1 = now - 3 * 3600
     code2, rv2 = _tp_review(p, t1 - 1800, t1, t1 + 100, t1 + 5000)
     name = f"t{code2}-0123456789ab"
@@ -521,6 +521,7 @@ def test_throughput_review_sweep_is_not_lowered_for_waits_the_checks_held(env, m
     pc = state / "prechecks" / name
     pc.mkdir(parents=True)
     (pc / "checks.pid").write_text(json.dumps({"pid": 1, "ts": t1 + 100}))
+    (pc / "checks.running").write_text(json.dumps({"since": t1 + 100}))
     (pc / "checks.rc").write_text("0")
     os.utime(pc / "checks.rc", (t1 + 3600, t1 + 3600))
     levers = ("coordinator.review_stall_s", "review.sweep_after_s")

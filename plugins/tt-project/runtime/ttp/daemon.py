@@ -413,8 +413,8 @@ MAX_FOLLOWUPS, FOLLOWUP_SPEC_CHARS = 12, 4000   # per hand-off; each follow-up i
 # What a review the daemon queues repeats of the code task's spec and hand-off.
 AUTO_REVIEW_SPEC_CHARS, AUTO_REVIEW_SUMMARY_CHARS = 2000, 1000
 # With the push queue on, the daemon starts the project's checks on a code task's head as it queues
-# its review (Daemon._precheck): their folder under the project's state, how long the review waits
-# for them before it starts anyway, and how long finished ones are kept.
+# its review (Daemon._precheck): their folder under the project's state, the most a review waits for
+# them once they run (precheck_hold_s measures less), and how long finished ones are kept.
 PRECHECKS_DIR, PRECHECK_LABEL = "prechecks", "precheck:"
 
 
@@ -425,20 +425,52 @@ def precheck_run_id(out: Path) -> str:
 PRECHECK_HOLD_S, PRECHECK_KEEP_S = 3600, 7 * 86400
 
 
-def precheck_holds(state: Path, task: dict, now: float) -> bool:
-    """Review `task` waits for the checks the daemon started on its head (Daemon._precheck) while they
-    run, at most PRECHECK_HOLD_S after they started. Read-only: files under `state` only, so the
-    overseer reads the same hold (Daemon._precheck_holds)."""
-    if task["kind"] != "review" or urgent.is_urgent(task):
-        return False   # an urgent review never queues behind routine work (its precheck still runs)
+def precheck_hold_s(state: Path, now: float | None = None) -> float:
+    """How long a review waits at most for its pre-checks once they run on a host: the median wall time
+    of the project's last completed checks runs (checkwall.recent), never over PRECHECK_HOLD_S, which is
+    also the limit before any run is measured."""
+    import statistics
+    from . import checkwall
+    runs = [x for x in checkwall.recent(state, now) if x > 0]
+    return min(PRECHECK_HOLD_S, statistics.median(runs)) if runs else PRECHECK_HOLD_S
+
+
+def precheck_holds(state: Path, task: dict, now: float, db=None) -> bool:
+    """Review `task` waits for the checks the daemon started on its head (Daemon._precheck) only while
+    they run on a host (cli.CHECKS_RUNNING, written once they left every queue), never while they wait
+    for a host checks slot, a lane or another run (cli.CHECKS_SLOT_WAIT), and at most precheck_hold_s
+    after they began running. An urgent review (urgent.is_urgent) or one owning an open obligation (with
+    `db`) is never held: it starts at once and reads their result only if it is there. Read-only: files
+    under `state` and `db` only, so the overseer reads the same hold (Daemon._precheck_holds)."""
+    if task["kind"] != "review":
+        return False
     name = next((x[len(PRECHECK_LABEL):] for x in push._labels(task) if x.startswith(PRECHECK_LABEL)), "")
     if not name or "/" in name:
         return False
-    from .cli import CHECKS_RC, _checks_alive, _read_checks_pid
+    from . import urgent
+    if urgent.is_urgent(task):
+        return False
+    from .cli import CHECKS_RC, CHECKS_RUNNING, CHECKS_SLOT_WAIT, _checks_alive, _read_checks_pid
     out = Path(state) / PRECHECKS_DIR / name
+    if (out / CHECKS_RC).exists() or (out / CHECKS_SLOT_WAIT).exists():
+        return False
     info = _read_checks_pid(out)
-    return (not (out / CHECKS_RC).exists() and _checks_alive(info)
-            and now - float(info.get("ts") or 0) < PRECHECK_HOLD_S)
+    try:
+        since = float(json.loads((out / CHECKS_RUNNING).read_text()).get("since") or 0)
+    except (OSError, ValueError, TypeError, AttributeError):
+        return False
+    if not _checks_alive(info) or since < float(info.get("ts") or 0) or now - since >= precheck_hold_s(state, now):
+        return False
+    if db is not None:
+        from . import obligations
+        try:
+            if obligations.owned_open(db, task["id"]):
+                return False
+        except Exception:
+            pass
+    return True
+
+
 # A failed review with fix specs gets its fix and re-review from the daemon this many rounds per stack
 # (review.auto_fix_rounds, unset or unreadable): one, so a failed re-review (a third round) goes to the
 # coordinator as one review_nofix event instead of being queued; the re-review repeats the failed
@@ -18427,10 +18459,10 @@ class Daemon:
                     + "The push queue runs the full checks again on the commit it pushes: run only focused tests "
                       "of what changed.")
         return (f"The daemon started the project's checks (`ttp checks`) on head {head} in "
-                f"{self.p.worktrees / ('t' + str(task['id']))} as #{task['id']} finished, and "
-                + ("does not hold this urgent review for them: it starts at once, so read their result when "
-                   "they end: " if urgent.is_urgent(task) else "starts this review once they end: ")
-                + f"`ttp checks --result {checks}` prints their exit code and output tail "
+                f"{self.p.worktrees / ('t' + str(task['id']))} as #{task['id']} finished. This review waits for them "
+                f"only while they run on a host, at most a typical checks run, and an urgent or owed review "
+                f"not at all: if they have not ended, judge the diff and run focused tests without them. "
+                f"Once they end, `ttp checks --result {checks}` prints their exit code and output tail "
                 f"({checks / 'checks.log'} has it all). A pass is recorded, so `ttp checks` there reuses it. "
                 f"The push queue runs the full checks again on the commit it pushes: run only focused tests "
                 f"of what changed.")
@@ -18548,9 +18580,10 @@ class Daemon:
                 shutil.rmtree(x, ignore_errors=True)
 
     def _precheck_holds(self, task: dict, now: float) -> bool:
-        """A review waits for the checks the daemon started on its head (_precheck) while they run,
-        at most PRECHECK_HOLD_S after they started: the reviewer then reads their result at once."""
-        return precheck_holds(self.p.state, task, now)
+        """A review waits for the checks the daemon started on its head (_precheck) while they run on a
+        host, at most precheck_hold_s after they began, unless it is urgent or owed (precheck_holds): the
+        reviewer then reads their result at once."""
+        return precheck_holds(self.p.state, task, now, self.p.db)
 
     def _precheck_words(self, task: dict) -> str:
         """What the checks _precheck_holds waits for are doing, in words: waiting for a host checks slot
