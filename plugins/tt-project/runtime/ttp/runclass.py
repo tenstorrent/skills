@@ -35,7 +35,8 @@ Routine (ROUTINE): standard-tier work, question and harness runs and reviews up 
 cheaper class takes run on Sonnet at high effort on the Claude core provider (CORE_CHEAP), never on the chat
 provider unless `route.classes` sends them there. Opus keeps code, plan, device, deep and user_deep runs,
 needs_deep, urgent and review_fix tasks, tier-up retries and pinned runs (provider, model or effort).
-Off: `route.classes.routine` "core" (or `route.core_cheap.routine` false). Quality alarm
+Opt-in, off by default: `route.core_cheap.routine` true (ROUTINE_MODEL) or {"model", "effort"} turns it
+on; unset, false or `route.classes.routine` "core", routine runs keep their tier's model. Quality alarm
 (routine_quality): when routine's failed and needs_review share over QUALITY_WINDOW_S beats hard's by more
 than QUALITY_GAP, with ALARM_MIN runs in each, the daemon raises one run_class_quality event per window.
 
@@ -77,8 +78,9 @@ CORE_CHEAP = {"wake_decision": {"model": "haiku", "effort": "low"},
               "worker_wake": {"model": "sonnet", "effort": "low"},
               "status_report": {"model": "sonnet", "effort": "low"},
               "rebase": {"model": "sonnet", "effort": "low"},
-              "review_small": {"model": "sonnet", "effort": "low"},
-              ROUTINE: {"model": "sonnet", "effort": "high"}}
+              "review_small": {"model": "sonnet", "effort": "low"}}
+# Routine's model once a project opts in (`route.core_cheap.routine` true, or its own {"model", "effort"}).
+ROUTINE_MODEL = {"model": "sonnet", "effort": "high"}
 CHEAP_PROVIDER = "claude"
 REPORT = re.compile(r"(?i)\b(status|report|measure(?:d|ment|s)?|count|stats|summar(?:y|ise|ize)|digest|brief)\b")
 
@@ -191,7 +193,7 @@ def target(cfg: dict, task: dict, tier: str, cls: str, picked: dict | None = Non
 
 def cheap_models(cfg: dict) -> dict[str, dict]:
     """{class: {"model", "effort"}}: CORE_CHEAP under `route.core_cheap` (a class set to false, or the whole
-    key false, has none)."""
+    key false, has none; routine has one only once set true or to its own model)."""
     got = (cfg.get("route") or {}).get("core_cheap")
     if got is False:
         return {}
@@ -202,6 +204,8 @@ def cheap_models(cfg: dict) -> dict[str, dict]:
                 continue
             if v is False:
                 out.pop(c, None)
+            elif v is True and c == ROUTINE:
+                out[c] = dict(ROUTINE_MODEL)
             elif isinstance(v, dict) and isinstance(v.get("model"), str) and v["model"]:
                 out[c] = {"model": v["model"], "effort": str(v.get("effort") or "")}
     return out

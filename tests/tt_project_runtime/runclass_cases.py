@@ -36,7 +36,7 @@ def test_run_classes_cover_every_kind_of_run():
     assert c({"kind": "code", "tier": "standard", "title": "x"}, {"note": '{"run_class": "bogus"}'}) == "hard"
 
 
-def test_routine_runs_take_sonnet_at_high_effort_and_opus_keeps_hard_pinned_urgent_and_retried_work():
+def test_routine_runs_take_sonnet_at_high_effort_once_opted_in_and_opus_keeps_hard_pinned_urgent_and_retried_work():
     from ttp import runclass
     c = runclass.classify
     for kind in ("work", "question", "harness"):
@@ -51,17 +51,24 @@ def test_routine_runs_take_sonnet_at_high_effort_and_opus_keeps_hard_pinned_urge
                                                                 "spec": "run it on the device (tt-smi reset)"}):
         assert c(t) == "hard", t
     t = {"kind": "harness", "tier": "standard", "title": "tidy", "labels": "[]"}
-    got = runclass.core_cheap({}, t, "routine", "standard", "claude")
+    # Off by default: a routine run keeps its tier's model until route.core_cheap.routine is set.
+    assert runclass.core_cheap({}, t, "routine", "standard", "claude") is None
+    assert "routine" not in runclass.cheap_models({})
+    on = {"route": {"core_cheap": {"routine": True}}}
+    own = runclass.core_cheap({"route": {"core_cheap": {"routine": {"model": "haiku", "effort": "low"}}}},
+                              t, "routine", "standard", "claude")
+    assert (own["model"], own["effort"]) == ("haiku", "low")
+    got = runclass.core_cheap(on, t, "routine", "standard", "claude")
     assert (got["model"], got["effort"], got["class"], got["why"]) == ("sonnet", "high", "routine", "routine work")
     # Opus keeps: other tiers, pins (provider, model, effort), tier-up retries, urgent, deep asks and review fixes.
-    assert runclass.core_cheap({}, t, "routine", "deep", "claude") is None
-    assert runclass.core_cheap({}, t, "routine", "standard", "claude", None, {"by": "retry"}) is None
+    assert runclass.core_cheap(on, t, "routine", "deep", "claude") is None
+    assert runclass.core_cheap(on, t, "routine", "standard", "claude", None, {"by": "retry"}) is None
     for extra in ({"model": "opus"}, {"provider": "claude"}, {"effort": "xhigh"}, {"priority": 0},
                   {"labels": '["needs_deep"]'}, {"labels": '["user_deep"]'}, {"labels": '["review_fix:12"]'},
                   {"spec": "urgent: the user is waiting"}):
-        assert runclass.core_cheap({}, {**t, **extra}, "routine", "standard", "claude") is None, extra
+        assert runclass.core_cheap(on, {**t, **extra}, "routine", "standard", "claude") is None, extra
     # Off-switch: route.classes.routine core (or route.core_cheap.routine false).
-    assert runclass.core_cheap({"route": {"classes": {"routine": "core"}}}, t, "routine", "standard", "claude") is None
+    assert runclass.core_cheap({"route": {"core_cheap": {"routine": True}, "classes": {"routine": "core"}}}, t, "routine", "standard", "claude") is None
     assert runclass.core_cheap({"route": {"core_cheap": {"routine": False}}}, t, "routine", "standard", "claude") is None
     # It stays on core with a chat provider too (not a CHAT class).
     assert runclass.routes(_rc_cfg())["routine"] == "core"
