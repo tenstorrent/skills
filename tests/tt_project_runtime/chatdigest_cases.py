@@ -14,7 +14,7 @@ def test_ack_progress_and_forecast_correction_replies_wait_for_the_digest(env, m
     p = make(env)
     routine = ["Got it, on it.",
                "#12 is queued for a worker; expected finish 14:10 PST.",
-               "Correction: the ETA is now 15:40 PST, not 14:10 PST.",
+               "Correction: #12 needs two passes on the checks queue, not one.",
                "#12 still waits on the checks queue, which runs 4 at a time."]
     coord.apply(p, [{"type": "reply", "chat": "c1", "text": t} for t in routine], turn=1)
     assert _cd_out(p) == []
@@ -123,6 +123,42 @@ def test_an_unacted_must_act_item_reaches_the_digest_not_the_chat(env, monkeypat
     assert told and told[0][2] == f"must-act:{ev['fingerprint']}"
     [mid] = chatdigest.flush(p, p.config(), held["ts"] + 3 * 3600)
     assert "promise overdue" in p.db.one("SELECT text FROM messages WHERE id=?", (mid,))["text"]
+
+
+def test_promises_claims_and_steps_for_the_user_go_at_once_and_are_tracked(env, monkeypatch):
+    """A post that commits to a time, carries claims or asks the user to act is never held: a held promise
+    would skip promise tracking, and a held ask would leave the user's step unseen for hours."""
+    from ttp import chatdigest, coordinator as coord, obligations
+    monkeypatch.setenv("TTP_TEST_CHAT_DIGEST", "on")
+    p = make(env)
+    posts = ["Got it; I'll send the table by 02:00 PST.",
+             "Queued for a worker, ETA 02:10 PST.",
+             "Correction: the ETA is now 15:40 PST, not 14:10 PST.",
+             "Waiting on your sign-in: run `gh auth login` on your laptop, then reply here.",
+             "Still waiting: run `make setup` in your checkout so the worker can start."]
+    for t in posts:
+        assert chatdigest.why_hold(p.db, t, {"type": "reply"}, "c1") == "", t
+    coord.apply(p, [{"type": "reply", "chat": "c1", "text": posts[0]}], turn=1)
+    assert _cd_out(p) == [posts[0]]
+    assert [o for o in obligations.items(p.db) if (o.get("promise") or {}).get("due")]   # tracked as a promise
+    claims = {"type": "reply", "chat": "c1", "text": "#12 still waits on the checks queue.",
+              "claims": [{"text": "#12 waits on the checks queue", "expect": "true"}]}
+    assert chatdigest.why_hold(p.db, claims["text"], claims, "c1") == ""
+
+
+def test_an_unacted_outage_item_reaches_the_chat_at_once(env, monkeypatch):
+    """A must-act item about an outage, ignored for two turns, is posted to its chat at once, not held."""
+    from ttp import chatdigest, mustact, obligations
+    monkeypatch.setenv("TTP_TEST_CHAT_DIGEST", "on")
+    p, d, ev, o, turn, told, check = _must_act_setup(env, monkeypatch)
+    st = p.db.kv(obligations.KV)
+    st["items"][mustact.item(ev)["key"]]["text"] += " The build host is down."
+    p.db.set_kv(obligations.KV, st)
+    turn([{"type": "noop"}])
+    turn([{"type": "noop"}])
+    assert p.db.q("SELECT id FROM messages WHERE direction='out' AND chat='c1' AND text LIKE 'Automatic%'")
+    assert not ((p.db.kv(chatdigest.KV) or {}).get("held") or {}).get("c1")
+    assert told and "told model-free" in told[0][1]
 
 
 def test_an_unacted_queue_wait_reaches_no_chat(env):

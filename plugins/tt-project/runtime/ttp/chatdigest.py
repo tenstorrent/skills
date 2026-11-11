@@ -2,13 +2,15 @@
 
 A coordinator reply or notify reaches its chat at once only when it matters: a finished result
 (`delivers`, `cites`, words naming one), a decision the user may want to override, an outage, an ask or
-question to the user, an answer to the user's question, or a high or critical severity. A post that is
+question to the user, an answer to the user's question, a promise or claim (a time it commits to, `claims`),
+a step it asks the user to take (a command for them, a sign-in or approval), or a high or critical severity. A post that is
 only an acknowledgement ('Got it', 'On it'), only progress or queue waits ('queued', 'waits on', 'ETA'),
 or only a correction of a forecast is held (why_hold) and never dropped: hold() keeps it on disk, and
 flush() posts every held item of a chat as one digest once the oldest has waited
 `coordinator.chat_digest_h` hours (default 3) and the chat's last digest is that old too. The status
 footer onhost.guard appends ('Status now: ...') leaves a post that is sent and goes in the digest; the
-sentence it marked as planned stays. The daemon's own model-free must-act update goes in the digest too.
+sentence it marked as planned stays. The daemon's own model-free must-act update goes in the digest too,
+unless urgent(): an outage or a blocker only the user can clear posts at once.
 Held text is kept whole, so a reminder of a pending user action keeps its full command and options.
 `coordinator.chat_digest_h` 0 sends every post at once. counts() feeds `ttp stats --chat`."""
 from __future__ import annotations
@@ -33,6 +35,25 @@ _PROGRESS = re.compile(
 _CORRECTION = re.compile(
     r"\b(?:correction|corrected|earlier (?:i|we) said|(?:new|revised|updated) (?:eta|time|forecast)|"
     r"eta (?:is )?now|now (?:due|expected))\b", re.I)
+
+# A step the user is asked to take: sign-in, approval, a credential, 'reply here'.
+_USER_STEP = re.compile(
+    r"\b(?:approv\w*|sign(?:ed)?[- ]?in|log(?:ged)?[- ]?in|login|credentials?|passwords?|reply (?:here|to this)|"
+    r"only you|only the user|your (?:sign|approval|login|step))\b", re.I)
+_YOU = re.compile(r"\b(?:you|your)\b", re.I)
+_OUTAGE = re.compile(r"\b(?:outage|down|unreachable|offline|crash(?:ed|es)?|dead|not responding)\b", re.I)
+
+
+def asks_user(text: str) -> bool:
+    """`text` asks the user to act: a backticked command addressed to them, or sign-in, approval or
+    credential wording. Such a post is an ask, never routine."""
+    body = str(text or "")
+    return bool(_USER_STEP.search(body) or ("`" in body and re.search(r"`[^`\n]+`", body) and _YOU.search(body)))
+
+
+def urgent(text: str) -> bool:
+    """A model-free update that must reach the chat at once: an outage, or a blocker only the user can clear."""
+    return bool(_OUTAGE.search(str(text or "")) or asks_user(text))
 
 
 def every_s(cfg: dict | None, chat: str | None = None) -> float:
@@ -60,11 +81,14 @@ def _asked(db, chat: str | None) -> bool:
 
 def why_hold(db, text: str, a: dict, chat: str | None) -> str:
     """Why this post waits for the digest ('ack', 'progress', 'forecast correction'); '' sends it now."""
-    if (a.get("delivers") or a.get("cites") or a.get("outage") is True
+    if (a.get("delivers") or a.get("cites") or a.get("claims") or a.get("outage") is True
             or str(a.get("severity") or "").lower() in ("high", "critical")):
         return ""
     body = str(text or "").split(FOOTER, 1)[0].strip()
-    if not body or _MATTERS.search(body) or _asked(db, chat):
+    if not body or _MATTERS.search(body) or asks_user(body) or _asked(db, chat):
+        return ""
+    from . import obligations   # a promise the user relies on is not routine: it goes now and is tracked
+    if obligations.commitments(body):
         return ""
     if _ACK.match(body) and len(body) <= 160:
         return "ack"
@@ -92,9 +116,10 @@ def hold(db, chat: str | None, text: str, why: str, now: float | None = None) ->
         db.set_kv(KV, st)
 
 
-def routine(p, chat: str | None, text: str, why: str, now: float | None = None) -> bool:
-    """A model-free routine update: held for the chat's digest (True), or posted now with the digest off."""
-    if every_s(p.config(), chat) > 0:
+def routine(p, chat: str | None, text: str, why: str, now: float | None = None, at_once: bool = False) -> bool:
+    """A model-free routine update: held for the chat's digest (True), or posted now with the digest off or
+    `at_once` (an outage or a blocker only the user can clear)."""
+    if not at_once and every_s(p.config(), chat) > 0:
         hold(p.db, chat, text, why, now)
         return True
     from . import msgparts

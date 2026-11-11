@@ -177,22 +177,30 @@ def settle(p, ids, actions, applied, now: float | None = None) -> list[tuple[str
                                f"Not acted on last turn. {ev['text'] or ''}", ev["task"], data)
             continue
         first = str(it.get("of") or fp)
-        with db.tx():
+        if first in ((db.kv(KV) or {}).get("told") or {}):
+            continue
+        text = (f"Automatic update from the project's records (the coordinator did not act on this in two "
+                f"turns): {_status(p, it)}")
+        chat = obligations._chat(it.get("chat"))
+        from . import chatdigest   # routine: the chat's next digest carries it; an outage or user-only blocker goes now
+        owners = [i for i in (it.get("tasks") or []) if str(i).isdigit()]
+        blocked = [str(t["blocked_reason"] or "") for t in db.q(
+            f"SELECT blocked_reason FROM tasks WHERE status='blocked' AND id IN ({','.join('?' * len(owners))})",
+            owners)] if owners else []
+        now_ = (it.get("kind") == obligations.CLAIM_KIND or it.get("outage") is True
+                or chatdigest.urgent(" ".join([str((o or {}).get("text") or ""), *blocked])))   # not the event:
+        # its text is the coordinator's instructions, not what the user was told
+        heard = ("its chat's next digest carries the update from the records"
+                 if chatdigest.routine(p, chat, text, "must-act not acted on", now, at_once=now_)
+                 else "its chat was told model-free")
+        with db.tx():   # marked only once held or posted: a failed hold is tried again next turn
             st = db.kv(KV) or {}
             told = st.setdefault("told", {})
-            if first in told:
-                continue
             told[first] = now
             if len(told) > TOLD_KEPT:
                 for k in sorted(told, key=told.get)[:len(told) - TOLD_KEPT]:
                     del told[k]
             db.set_kv(KV, st)
-            text = (f"Automatic update from the project's records (the coordinator did not act on this in two "
-                    f"turns): {_status(p, it)}")
-            chat = obligations._chat(it.get("chat"))
-        from . import chatdigest   # routine: the chat's next digest carries it
-        heard = ("its chat's next digest carries the update from the records"
-                if chatdigest.routine(p, chat, text, "must-act not acted on", now) else "its chat was told model-free")
         issues.append((f"must-act:{first}", f"must-act item {it['key']} ({LATE.get(it.get('kind'), 'late')}) "
                                              f"got no action in two coordinator turns; {heard}. Event {first}."))
     return issues
