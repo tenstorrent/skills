@@ -1853,16 +1853,16 @@ def test_a_model_left_out_of_the_served_list_is_ranked_and_an_empty_ranking_chan
     assert prov != "chat" and note[route.KEY]["fallback"] == "down" and modelrank.KEY not in note[route.KEY]
     p.db.x("DELETE FROM kv WHERE key=?", (route.COOL + "chat",))
     # Empty ranking: today's behaviour, held or unlisted alike.
-    for empty in ([], "", None):
+    for n, empty in enumerate(([], "", None)):   # numbered titles: "empty []" and "empty ''" read alike
         _route_config(p, model_ranking=empty)
         d._load_config()
         assert modelrank.ranking(d.cfg) == [] and modelrank.down(p.db, d.cfg, p.state, _RT_MODEL, time.time()) == ""
-        assert _route_dispatch(p, d, monkeypatch, title=f"empty {empty!r}", force=True)[2][route.KEY] == \
+        assert _route_dispatch(p, d, monkeypatch, title=f"empty {n} {empty!r}", force=True)[2][route.KEY] == \
             {"tier": "light", "to": "chat", "model": _RT_MODEL, "fallback": "none"}
         route.hold(p.db, "light", _RT_MODEL, 1, time.time())
-        prov, _, note = _route_dispatch(p, d, monkeypatch, title=f"held {empty!r}", force=True)
+        prov, _, note = _route_dispatch(p, d, monkeypatch, title=f"held {n} {empty!r}", force=True)
         assert prov != "chat" and note[route.KEY]["fallback"] == "model_missing" and modelrank.KEY not in note[route.KEY]
-        p.db.x("DELETE FROM kv WHERE key=?", (route.MISSING + "light",))
+        p.db.x("DELETE FROM kv WHERE key=?", (route.MISSING + "light|" + _RT_MODEL,))   # per tier and model (bd168325e)
     assert len(alerts) == 1
     # The setting is checked: a malformed ranking is named and ranks nothing.
     assert modelrank.ranking_of("a, b,a") == ["a", "b"]
