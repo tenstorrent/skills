@@ -7,7 +7,9 @@ At dispatch (`dispatch_hold`, just before a run starts), a queued task is held (
   re-reviews, continues) count too. Not a duplicate: a task of its own lineage (one it continues, at any
   hop), one either depends on, a review of another subject, a spec saying `differs from #<id>`, a task
   owing other obligations (the owner note the harness appends reads alike for any two), and a
-  schedule's runs (origin 'schedule': each run of a recurring schedule repeats the last by design);
+  schedule's runs (origin 'schedule': each run of a recurring schedule repeats the last by design),
+  nor a template-finish task (release.UPGRADE_TASK_TITLE) repeating an ended one: `ttp upgrade` queues a
+  new one only for a merge still left to finish, so holding it leaves that merge unfinished for good;
 - predates a user order whose `supersedes` steps (STEPS_KEY, recorded with the order) its spec still
   carries, and was not re-specified since.
 A task is held once: queued again after its hold (the coordinator looked), it runs.
@@ -68,11 +70,13 @@ def duplicate_of(db, task: dict) -> dict | None:
     """An earlier open task, or one done in the last DUP_DONE_DAYS, that `task` repeats."""
     from .coordinator import looks_same
     from .db import dependency_ids, review_subject
+    from .release import UPGRADE_TASK_TITLE
     if task.get("origin") == "schedule":   # a recurring schedule's next run is never a duplicate of its last
         return None
     skip = _lineage(db, task) | {int(d) for d in dependency_ids(task) if str(d).isdigit()} \
         | {int(i) for i in _DIFFERS.findall(task.get("spec") or "")}
     title, spec = task.get("title") or "", task.get("spec") or ""
+    finish = task.get("kind") == "harness" and _norm(title) == _norm(UPGRADE_TASK_TITLE)
     since = time.time() - DUP_DONE_DAYS * 86400
     for o in db.q("SELECT * FROM tasks WHERE id<? AND kind=? AND (status NOT IN ('done','failed','cancelled') "
                   "OR (status='done' AND COALESCE(updated, created, 0) >= ?)) AND origin!='schedule' ORDER BY id DESC",
@@ -80,6 +84,8 @@ def duplicate_of(db, task: dict) -> dict | None:
         if not (_norm(title) == _norm(o["title"]) or looks_same(title, spec, o["title"] or "", o["spec"] or "")):
             continue
         if o["id"] in skip or task["id"] in dependency_ids(o) or task["id"] in _lineage(db, o):
+            continue
+        if finish and o["status"] == "done":   # it finished another merge; this one is still open
             continue
         if (owes := set(_OWES.findall(spec))) and owes != set(_OWES.findall(o["spec"] or "")):
             continue   # it owes another deliverable

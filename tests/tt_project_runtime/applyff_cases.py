@@ -541,3 +541,23 @@ def test_apply_over_an_uncommitted_edit_git_refuses_exits_busy_with_nothing_chan
     assert applyff.local_changes("error: Your local changes to the following files would be overwritten by merge")
     assert applyff.local_changes("untracked working tree files would be overwritten by merge")
     assert not applyff.local_changes("fatal: not possible to fast-forward, aborting")
+
+
+def test_apply_with_take_over_from_fences_a_blocked_holder_then_lands_the_merge(env, monkeypatch, tmp_path, capsys):
+    """A merge resolved outside the blocked finish task: `--apply` alone was refused (exit 75) while that task held
+    the upgrade, and `--take-over-from` was read only without `--apply`, so the merge never landed. Naming the
+    holder now fences it and applies; naming another task is still refused."""
+    from ttp import cli, release
+    p, merged, base, restarts = _apply_ready(env, monkeypatch, tmp_path)
+    monkeypatch.delenv("TTP_TASK")
+    tid = release.finish_holder(p)["task"]
+    p.db.update_task(tid, status="blocked", blocked_reason="needs a template merge it cannot finish")
+    for args in ([], ["--take-over-from", str(tid + 1)]):
+        with pytest.raises(SystemExit) as e:
+            cli.main(["upgrade", "demo", "--apply", merged, *args])
+        assert e.value.code == 75 and _git_out(p.harness, "rev-parse", "HEAD") == base and not restarts
+    capsys.readouterr()
+    cli.main(["upgrade", "demo", "--apply", merged, "--take-over-from", str(tid)])
+    assert "takes it over" in capsys.readouterr().out
+    assert p.db.task(tid)["status"] == "cancelled" and release.fenced(p, tid)
+    assert _git_out(p.harness, "rev-parse", "HEAD") == merged and restarts == [1]

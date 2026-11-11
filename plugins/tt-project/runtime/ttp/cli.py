@@ -12735,10 +12735,12 @@ def cmd_upgrade(a) -> None:
         tid = holder["task"] if holder else None
         mine = bool(tid) and os.environ.get("TTP_TASK") == str(tid)
         took, parked = False, None
-        if tid and not mine and a.apply is None and not a.auto and not own:
+        named = getattr(a, "take_over_from", None) == tid
+        if tid and not mine and (a.apply is None or named) and not a.auto and not own:
             # A blocked or idle task cannot hold off a host-side upgrade, paused or not: the pause stays and
-            # a conflict queues the merge task again, held by the pause like any other task.
-            took = _take_over_finish(p, holder, overdue=getattr(a, "take_over_from", None) == tid)
+            # a conflict queues the merge task again, held by the pause like any other task. `--apply` lands
+            # a merge resolved elsewhere: it fences only the holder `--take-over-from` names.
+            took = _take_over_finish(p, holder, overdue=named)
             if took:
                 holder, tid = None, None
         if tid and not mine and a.apply is None and not a.auto and not own and p.db.kv("paused", False):
@@ -15954,7 +15956,8 @@ def main(argv: list[str] | None = None) -> None:
                    help="go ahead although a device broker announced a power cycle of this host (a warning is printed)")
     s.add_argument("--take-over-from", metavar="TASK", type=int,
                    help="host-side takeover: harness task TASK missed its takeover deadline, so this upgrade "
-                        "takes the template merge over from it even while it still shows activity")
+                        "takes the template merge over from it even while it still shows activity; with --apply, "
+                        "fences TASK when it is blocked or past that deadline, then applies the merge")
     s.set_defaults(fn=cmd_upgrade)
 
     s = sub.add_parser("alerts", help="list broadcast alerts or acknowledge one")

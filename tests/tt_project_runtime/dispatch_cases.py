@@ -2642,6 +2642,25 @@ def test_dispatch_never_holds_owners_of_different_obligations_as_duplicates(env)
     assert "duplicates #" in supersede.dispatch_hold(p.db, p.db.task(d))
 
 
+def test_dispatch_never_holds_a_template_finish_task_as_a_repeat_of_a_done_one(env):
+    """Each template upgrade that conflicts queues its own finish task; the second was held as a duplicate of the
+    first, done one, so that merge never finished. An earlier open finish task, and any other task repeating a
+    done one, are still held."""
+    from ttp import release, supersede
+    p = make(env)
+    spec = "Merge the template.\nTarget release: tt-project {}\n"
+    p.db.add_task(release.UPGRADE_TASK_TITLE, spec.format("0.1.1 (aaaa)"), kind="harness", status="done")
+    new = p.db.add_task(release.UPGRADE_TASK_TITLE, spec.format("0.1.2 (bbbb)"), kind="harness")
+    assert supersede.dispatch_hold(p.db, p.db.task(new)) == ""
+    again = p.db.add_task(release.UPGRADE_TASK_TITLE, spec.format("0.1.2 (bbbb)"), kind="harness")
+    supersede._clear.clear()
+    assert f"duplicates #{new}" in supersede.dispatch_hold(p.db, p.db.task(again))
+    p.db.add_task("tidy the notes", "tidy them", kind="harness", status="done")
+    supersede._clear.clear()
+    assert "duplicates #" in supersede.dispatch_hold(p.db, p.db.task(p.db.add_task("tidy the notes", "tidy them",
+                                                                                     kind="harness")))
+
+
 def test_dispatch_holds_an_open_review_only_of_the_same_subject_and_target(env):
     """Two open reviews of one code task are duplicates only while their specs name the same other-repository
     heads and packets (path + sha256); a done one's exact repeat is left to verdict reuse at start."""
