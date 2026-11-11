@@ -292,8 +292,10 @@ def test_bench_seeded_cell_stores_no_host_path_and_scores_with_the_plugin_dir_of
     assert benchcells.score_seeded(cell, fixed, timeout=120)["pass"] is False
 
 
-def test_bench_cells_in_a_worker_run_builds_as_one_admitted_detached_job(tmp_path, monkeypatch):
+def test_bench_cells_in_a_worker_run_builds_as_one_admitted_detached_job(env, tmp_path, monkeypatch):
     from ttp import bench, cli
+    # The test's own project: the checks host has none around the checkout (`ttp bench` needs one).
+    monkeypatch.setenv("TTP_PROJECT", str(make(env).base))
     monkeypatch.setenv("TTP_RUN_DIR", str(tmp_path / "run"))
     monkeypatch.delenv("TTP_DETACHED", raising=False)
     calls = []
