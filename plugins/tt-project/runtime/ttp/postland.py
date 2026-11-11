@@ -16,6 +16,8 @@ holding the queue. Each daemon pass (tend()):
   failing ids, goes in as ttp/postland-revert-<sha>. The daemon approves it into the push queue (it lands
   with the next batch, after the smoke checks) and queues one code task to fix the change on its failing
   tests alone. Anything it cannot tell or attribute goes to the coordinator as one observation.
+- An express landing (express.py, batch id express-*) checked only its smoke and touched tests: its job
+  runs the full push checks and the post-landing checks, also where post_land_checks is unset.
 """
 from __future__ import annotations
 
@@ -58,13 +60,19 @@ def _event(db, text: str, kind: str = "observation", queued: bool = True) -> Non
 def tend(p: Project, cfg: dict, now: float | None = None) -> str:
     """One daemon pass: settle a finished run, else start one for what landed since the last. Returns
     what it did ('' when nothing)."""
-    from . import push
+    from . import express, push
     now = time.time() if now is None else now
-    if not push.check_list((cfg.get("delivery") or {}).get("post_land_checks")):
-        return ""
+    d = cfg.get("delivery") or {}
+    plc = push.check_list(d.get("post_land_checks"))
     db = p.db
     st = db.kv(KEY, {}) or {}
     job = st.get("job")
+    # An express landing ran only its smoke and touched tests: its full push checks run here even in a
+    # project with no post-landing checks of its own.
+    only = "" if plc else f" AND id LIKE '{express.PREFIX}%'"
+    if not plc and not job and not db.one(f"SELECT 1 FROM push_batches WHERE outcome='pushed' AND finalized IS NOT "
+                                          f"NULL AND ended>?{only}", (st.get("since") or 0,)):
+        return ""
     if job:
         res = Path(job["path"]).with_suffix(".result.json")
         if res.exists():
@@ -85,11 +93,13 @@ def tend(p: Project, cfg: dict, now: float | None = None) -> str:
             got = {"outcome": "unattributed", "why": f"the test lock stayed busy for {busy} passes"}
         db.set_kv(KEY, {**st, "job": None, "busy": 0, "since": job["ended"], "last": {**got, "sha": job["sha"]}})
         return apply(p, job, got)
-    batches = db.q("SELECT * FROM push_batches WHERE outcome='pushed' AND finalized IS NOT NULL AND ended>? "
+    batches = db.q(f"SELECT * FROM push_batches WHERE outcome='pushed' AND finalized IS NOT NULL AND ended>?{only} "
                    "ORDER BY ended, started", (st.get("since") or 0,))
     if not batches:
         return ""
-    if "since" not in st:
+    if not plc:
+        batches = batches[:1]    # express landings only: one at a time, its own range
+    elif "since" not in st:
         batches = batches[-1:]   # first run: this landing only, not the project's history
     points = []
     for b in batches:   # by position on the branch (a batch replays in priority order, not id order)
@@ -110,6 +120,9 @@ def tend(p: Project, cfg: dict, now: float | None = None) -> str:
     path = folder / f"{batches[-1]['id']}.json"
     job = {"path": str(path), "batch": batches[-1]["id"], "sha": batches[-1]["pushed_sha"], "good": batches[0]["tip"] or "", "points": points,
            "target": batches[-1]["target"], "ended": batches[-1]["ended"], "repo": str(p.root)}
+    if any(express.is_express(b["id"]) for b in batches):
+        full = push.check_list(push.repo_checks(d, p.root, p)[0])
+        job["checks"] = [c.config() for c in full + plc]
     durable_write(path, json.dumps(job))
     job["pid"] = spawn(p, path)
     db.set_kv(KEY, {**st, "job": job, "since": st.get("since", 0)})
@@ -195,7 +208,8 @@ def drive(p: Project, job: dict, say=print) -> dict:
     from . import cleantree, gatejudge, push, sharedchecks, worktree
     repo = Path(job["repo"])
     base = str(Path(job["path"]).parent)
-    checks = push.check_list((p.config().get("delivery") or {}).get("post_land_checks"))
+    checks = push.check_list(job["checks"] if "checks" in job else
+                             (p.config().get("delivery") or {}).get("post_land_checks"))
     try:
         env = push.check_env("target", job.get("good") or "", base)
     except Exception:

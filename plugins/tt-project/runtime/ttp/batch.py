@@ -1471,7 +1471,8 @@ class Batch:
         self.d = p.config().get("delivery") or {}
         self.mechanical = mechanical_paths(self.d)   # shared docs settle_union may settle
         self.entries = [e for e in m.get("entries") or [] if isinstance(e, dict)]
-        self.wt = p.worktrees / WORKTREE
+        self.express = isinstance(m.get("express"), dict)   # express.start: one urgent head, ahead of the queue
+        self.wt = p.worktrees / (f"{WORKTREE}-express" if self.express else WORKTREE)
         self.status: dict[int, str] = {}       # entry index -> status
         self.detail: dict[int, dict] = {}
         self.landed_at: dict[int, str] = {}    # entry index -> its own commit on the branch (pushed or landed)
@@ -1606,7 +1607,11 @@ class Batch:
                                      who=f"push batch {self.id}")
         if self.target_lock is None:
             who = ", ".join(locks.holders_now(push.lock_paths(self.p, self.remote, self.branch), self.p)) or "another push"
-            return self._all("requeued", "busy", f"{push.lock_name(self.remote, self.branch)} is busy (held by {who})")
+            if not self.express:
+                return self._all("requeued", "busy", f"{push.lock_name(self.remote, self.branch)} is busy (held by {who})")
+            # An express landing never waits behind a batch: it checks beside it, and its push (no --force)
+            # takes only a fast-forward of the tip it checked; a tip the batch moved is another round.
+            say(f"{push.lock_name(self.remote, self.branch)} is held by {who}: the express landing checks beside it")
         self.steps = push.Steps(self.target_lock, say)
         why = push.refusal(self.repo, self.remote, self.branch, push.allow_protected(self.d))
         if why.startswith("refusing"):
@@ -1633,7 +1638,7 @@ class Batch:
                 self._set(i, "scope_held", **d)
             self._prepare(tip)
             try:
-                outcome = self._round(tip, checks)
+                outcome = self._round(tip, self._express_checks(tip, checks) if self.express else checks)
             except envfault.Fault as e:
                 # The host, not an entry: every entry goes back to the queue untouched, which holds
                 # until the runner is back (pushq.due); the coordinator hears of it once.
@@ -1669,6 +1674,22 @@ class Batch:
             say(f"{self.target} moved; round {rnd + 1}")
         return self._all("requeued", "moved", f"{self.target} kept moving for {rounds} rounds",
                          keep=("landed", "refused"))
+
+    def _express_checks(self, tip: str, checks: list) -> list:
+        """An express landing's checks: the smoke push checks, each pytest one narrowed to the tests the
+        entry's diff reaches (testpick.narrow). The full checks run after it lands (postland)."""
+        from . import testpick
+        head = str(self.entries[0].get("head") or "") if self.entries else ""
+        if not head:
+            return checks
+        self._checkout(head)   # the tests are read from the entry's own tree, then the round starts on the tip
+        try:
+            out, lines = testpick.narrow(self.wt, tip, head, checks, checks, self.p.config())
+        finally:
+            self._checkout(tip)
+        for line in lines:
+            say(f"express: {line}")
+        return out
 
     def _prepare(self, tip: str) -> None:
         """A clean checkout of `tip` in the batch's own worktree, made anew when broken or dirty."""
@@ -1716,6 +1737,10 @@ class Batch:
         if head is None:
             return self._close(0, "yielded" if self.yielded_to else "tip_failed" if failed is None else "nothing",
                                carried, failed)
+        if self.express and self.target_lock is None:   # the batch it ran beside may be done: hold the lock to push
+            self.target_lock = push.take(self.p, self.remote, self.branch, 0, say=lambda _m: None,
+                                         who=f"push batch {self.id}")
+            self.steps = push.Steps(self.target_lock, say)
         self.steps.go("push")
         if push._fetch(self.repo, self.remote, self.branch) != tip:
             return "moved"
@@ -2289,7 +2314,8 @@ class Batch:
         past upgrade.push_hold_min may go then; once it is held the checks step is marked."""
         self.steps.between()
         slot = push.check_slot(at, say, checkcap.label(self.p.name, f"push batch {self.id}"),
-                               priority=push.priority_key(self.repo, self.remote, self.branch), proj=self.p)
+                               priority=push.priority_key(self.repo, self.remote, self.branch)
+                               + (" express" if self.express else ""), proj=self.p)   # its own slot beside a batch's
         self.steps.go("checks")
         return slot
 

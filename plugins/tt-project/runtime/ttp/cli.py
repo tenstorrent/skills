@@ -8281,6 +8281,16 @@ def cmd_land(a) -> None:
     sys.exit(land.run(p, a))
 
 
+def cmd_express(a) -> None:
+    """Land one small, urgent, reviewed head alone, ahead of the push queue (express.py): 0 started or
+    landed, 2 refused (each reason printed), 1 failed."""
+    from . import express
+    p = here()
+    if not p:
+        die("ttp express: no project here (run it in a project or with TTP_PROJECT set)")
+    sys.exit(express.main(p, a.ref, a.why, dry_run=a.dry_run, wait_s=a.wait))
+
+
 def cmd_model_bench(a) -> None:
     """`ttp model-bench run|show`: the host's shared daily chat model bench (modelbench.py)."""
     import time as _t
@@ -13718,7 +13728,7 @@ COMMAND_GROUPS = (
                   "memory", "obligation", "config", "pause", "resume", "drain", "alerts", "issues", "mute",
                   "quarantine", "machines", "runs", "logs", "doctor")),
     ("inside a run", ("note", "steer", "notify", "progress", "checks", "checks-shard", "checks-yield", "lock",
-                      "host-run", "detach", "devq", "push", "land", "clip", "sandbox", "pool-wait", "pool-admit",
+                      "host-run", "detach", "devq", "push", "land", "express", "clip", "sandbox", "pool-wait", "pool-admit",
                       "pool-shard", "skill", "killscan", "svcscan", "leftover-procs", "said", "hostcheck", "paths")),
     ("probes (retry_when, start_when)", ("landed", "alive", "eta", "ci", "ack-wait", "ssh-preflight", "broker-released",
                                          "deployed", "goal", "hours")),
@@ -14573,6 +14583,15 @@ def main(argv: list[str] | None = None) -> None:
                    "it would write; exits as a landing would")
     s.set_defaults(fn=cmd_land)
 
+    s = sub.add_parser("express", help="land one small urgent reviewed head alone, now: its smoke and touched tests "
+                                       "beside any running batch, one bump, the full checks after it lands "
+                                       "(delivery.express, express_max_lines, express_max_files); 0 started, 2 refused")
+    s.add_argument("ref", help="the task (code or review) or head sha whose approved head lands")
+    s.add_argument("--why", required=True, help="what makes it urgent (kept on the batch)")
+    s.add_argument("--dry-run", action="store_true", help="check eligibility only")
+    s.add_argument("--wait", type=float, default=0.0, metavar="S", help="wait up to S seconds for the landing")
+    s.set_defaults(fn=cmd_express)
+
     s = sub.add_parser("landed", help="exit 0 once a commit or a task's landing is on the push branch, even "
                                       "rebased (same patch-id or author/date/subject), 1 while not yet, 2 if it "
                                       "cannot tell (for start_when; `landed:#<id>` runs it)")
@@ -15292,7 +15311,7 @@ def dry_run_stub(a) -> None:
             or (cmd == "detach" and a.check is None):
         print(f"ttp {cmd}: refused in an on_pass_cmd dry run ({ENV}=1)", file=sys.stderr)
         sys.exit(75)
-    if cmd in ("note", "notify", "push", "land"):
+    if cmd in ("note", "notify", "push", "land", "express"):
         print(f"ttp {cmd}: skipped in an on_pass_cmd dry run ({ENV}=1)", file=sys.stderr)
         sys.exit(0)
 

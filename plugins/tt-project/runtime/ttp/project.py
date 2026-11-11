@@ -715,7 +715,8 @@ EXTRA_KEYS = {
                  "max_open_branches", "max_work_threads", "delete_landed_branches", "dead_branch_days",   # open-branch soft cap (branchcap)
                  "rebase_replace", "never_force",   # whether a rebase replaces its branch (rebase_replace)
                  "integration_branch",   # where reviewed changes land on a project with no push branch (integrate)
-                 "channel_tags"},   # release-channel tags a forward move may update under never_force (channeltag)
+                 "channel_tags",   # release-channel tags a forward move may update under never_force (channeltag)
+                 "express", "express_max_lines", "express_max_files"},   # `ttp express`: one small urgent head lands alone (express)
     "jev": {"via", "url", "model"},
     "effort_ab": {"winner", "decided_at"},   # the end rule's result, written by effortab.conclude
     # launcher_stops: {glob of a project launcher's job folders: stop command} `ttp detach --stop <job

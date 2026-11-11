@@ -2014,6 +2014,16 @@ session and stateless coordinators on every provider.
   `checks.smoke_max_s` (default 600 s) the project's coordinator gets one observation a day naming the
   slowest tests (push-checks reference, "Smoke before landing"). `ttp status` also shows the waits:
   checks wait to start and approval to landed (median and p90, last 24 h).
+- Short path (`ttp express <task|head> --why "<why>"`): a small urgent change lands alone, now,
+  instead of waiting for the next push queue batch. It is allowed, without a model, only when an
+  independent review approved that head, the change is urgent (priority 1, an `urgent:` line or a
+  user's order) and its diff is at most `delivery.express_max_lines` (200) changed lines in at most
+  `delivery.express_max_files` (8) files; a refusal names every reason. `delivery.express: false`
+  turns it off; `--dry-run` only checks. It goes through the same push path as every batch (the push
+  branch, never forced, the leak scan, one version bump and changeset), in its own worktree beside a
+  running batch rather than behind it. Its pytest push checks run only the tests its diff reaches; a
+  failure the unchanged tip shares does not block it. After it lands the daemon runs the full push
+  checks and `delivery.post_land_checks` on it, and a failure there reverts that commit forward.
 - Where reviewed changes go straight to a shared branch, `ttp push` publishes them guarded: it
   refuses uncommitted changes, rebases onto the latest tip, runs `delivery.push_checks` on the
   exact commit it pushes, starts over if the branch moved meanwhile, and never forces. A

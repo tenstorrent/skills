@@ -1706,15 +1706,17 @@ def _spawn(p: Project, bid: str, marker: Path, lock) -> subprocess.Popen:
         checkdirs.cleanup(output, whole=True)
 
 
-def start(p: Project, rows: list[dict], name: str, now: float | None = None) -> str | None:
+def start(p: Project, rows: list[dict], name: str, now: float | None = None, extra: dict | None = None,
+          prefix: str = "batch-") -> str | None:
     """Start a batch for `rows` (see due): marker, run lock, rows `batched`, a push_batches row,
-    then the detached process. Returns the batch id, or None when nothing started."""
+    then the detached process. Returns the batch id, or None when nothing started. `extra` goes on the
+    marker and `prefix` starts the id (express.start: an express landing's "express" and "express-")."""
     now = time.time() if now is None else now
     db = p.db
     folder = p.state / push.DETACHED
     folder.mkdir(parents=True, exist_ok=True)
     push._prune(folder, now)
-    bid = base = "batch-" + time.strftime("%Y%m%d-%H%M%S", time.localtime(now)) + f"-{os.getpid()}"
+    bid = base = prefix + time.strftime("%Y%m%d-%H%M%S", time.localtime(now)) + f"-{os.getpid()}"
     n = 1
     while (folder / f"{bid}.json").exists() or db.one("SELECT id FROM push_batches WHERE id=?", (bid,)):
         n += 1
@@ -1728,7 +1730,7 @@ def start(p: Project, rows: list[dict], name: str, now: float | None = None) -> 
         m = {"v": 1, "kind": "batch", "id": bid, "status": "running", "phase": "push", "pid": None, "started": now,
              "repo": str(p.root), "target": name, "log": str(marker.with_suffix(".log")), "lock": str(lock_path),
              "entries": [{"id": r["id"], "task": r["task"], "branch": r["branch"], "head": r["head"],
-                          "ref": f"{REF_PREFIX}{r['id']}"} for r in rows]}
+                          "ref": f"{REF_PREFIX}{r['id']}"} for r in rows], **(extra or {})}
         if cur := target(p):
             name = f"{cur[0]}/{cur[1]}"     # delivery.push_branch as it is now, whatever the caller read
         m["target"] = name
@@ -1864,6 +1866,9 @@ def schedule(p: Project, cfg: dict | None = None, log: Callable[[str], None] = l
         return None
     if retarget(p, name):
         log(f"push queue: approvals for an old target sent back to their reviews (target now {name})")
+    from . import express
+    if bid := express.auto(p, name, log):
+        return bid
     rows, why = due(p, cfg=cfg)
     if not rows:
         return None

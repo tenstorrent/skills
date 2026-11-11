@@ -262,6 +262,7 @@ Posts and drafts people other than the user read (Slack, Jira, GitHub, email) an
 <!-- ttp:if push_queue -->
 - With the push queue on, review specs ask the reviewer
   to "approve for the push queue" and carry no push or deploy steps: the daemon pushes approved heads in batches and `delivery.after_push` deploys. A `pushing` task is in the queue: leave it. The queue wakes you only for failed checks, a broken push branch tip, failed deploys and a dying queue.
+- Short path: a small urgent change whose head a review approved lands alone at once with `ttp express <task> --why "<why>"` (narrowed smoke checks beside any batch, full checks after it lands); never leave it behind a batch.
 <!-- /ttp:if push_queue -->
 <!-- ttp:if land -->
 - With `delivery.code_tasks_may_push` on, a code task lands its own work: write "land on <push_branch> with `ttp push`" into its spec instead of adding a
