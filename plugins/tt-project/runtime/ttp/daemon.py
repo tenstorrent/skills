@@ -7408,6 +7408,8 @@ class Daemon:
                 fups = [f for f in result.get("followups") or [] if isinstance(f, dict)]
                 if result.get("status") == "done":
                     self._prefetch_hop(dict(task, result=dump_result(result)), fups)
+                    if task["kind"] == "code" and not task.get("pr"):   # _auto_review's _external_change
+                        worktree.worktree_branch(self.p, task)
                 if result.get("status") == "done" and self._lone_continue(task, fups) \
                         and isinstance(fups[0].get("spec"), str) and fups[0]["spec"].strip():
                     spec = chaincap.hop_spec(self.p, task, fups[0])   # the one hop the body may queue
@@ -7445,6 +7447,8 @@ class Daemon:
         sweep_unreviewed queues it on a later tick)."""
         stack = contextlib.ExitStack()
         stack.enter_context(gitmemo.scope(self._git_memo.pop(task_id, None)))
+        # the warm-up's reads are kept in its attempt (gitreplay), not the scope: without it each ran live here
+        stack.enter_context(gitmemo.attempt(self._git_attempts.pop(task_id, None) or gitmemo.Attempt()))
         stack.enter_context(self.p.db.tx())
         stack.enter_context(gitmemo.bounded(gitmemo.TX_GIT_S, gitmemo.TX_GIT_S))
         return stack
@@ -7469,7 +7473,7 @@ class Daemon:
         t0, final = time.monotonic(), False
         try:
             if not FINISH_STRICT or self.p.db.conn.in_transaction:
-                self._git_memo[task_id] = memo
+                self._git_memo[task_id], self._git_attempts[task_id] = memo, att
                 yield self._finish_tx(task_id)
                 return
             memo = {} if memo is None else memo
