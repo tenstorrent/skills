@@ -500,7 +500,7 @@ def test_coordinator_stores_pointers_not_figures_when_data_stays_out_of_git():
     coordinator = " ".join((PLUGIN / "template" / "prompts" / "coordinator.md").read_text(encoding="utf-8").split())
     for phrase in ("When the charter keeps the project's data out of git",
                    "carry pointers (the work file's path, what it holds), never the figures",
-                   "`Forbidden data` patterns is refused"):
+                   "`memory.forbidden_patterns`"):
         assert phrase in coordinator, phrase
     skill = PLUGIN / "skills" / "tt-project-harness"
     harness = (skill / "SKILL.md").read_text(encoding="utf-8")
