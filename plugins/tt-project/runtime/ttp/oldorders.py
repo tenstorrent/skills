@@ -10,10 +10,11 @@ forever.
   entry's own `expires` / `until_probe` (ends.py), which retires it by itself.
 - scan: memory entries that cite a user message (`user msg #N`), are preferences or standing rules, are
   older than AGE_S and have no end of their own, plus open orders older than AGE_S, whose reason is
-  unknown (none recorded) or over (every task it names is finished). Restrictions are never listed:
+  unknown (none recorded), over (every task it names is finished) or unchecked (prose naming no task:
+  the coordinator judges it by intent). A reason naming a task still open holds. Restrictions are never listed:
   they loosen only on the user's word. Each item lists the holds citing it: a blocked task's reason, a
   deferred task's `why` and an open ask, naming the entry, its rule id (rulecite), its `oN` or one of
-  its user messages. An order no hold cites is listed only when its reason is over.
+  its user messages. An open order no hold cites is listed only when its reason is over or unchecked.
 - digest_lines: the 'Re-read by intent' section, on a blocker sweep (held items) and once per RECHECK_S
   per item (the daily review), at most MAX_LINES lines. coursecheck flags each held item every turn.
 """
@@ -49,6 +50,19 @@ def user_msgs(text: str) -> list[int]:
     return list(dict.fromkeys(out))
 
 
+def clean_context(p, context: str) -> str:
+    """`context` (harness-attached user words), or "" when it matches a declared forbidden-data pattern
+    or a pattern is invalid: dropped, never refused (the caller's own text is checked as before) and
+    never written anywhere."""
+    if not context:
+        return ""
+    from .forbidden import matches
+    try:
+        return "" if matches(p, context) else context
+    except ValueError:
+        return ""
+
+
 def context_for(db, text: str, message: int | None = None) -> str:
     """The user's own words behind an order: `message` (else the first user message `text` cites),
     with its date, as one line; "" when none is on record."""
@@ -62,13 +76,16 @@ def context_for(db, text: str, message: int | None = None) -> str:
 
 
 def _state(p, reason: str) -> str:
-    """'unknown' (no reason), 'over (#1: done)' (every task it names finished) or "" (still holds)."""
+    """'unknown' (no reason), 'over (#1: done)' (every task it names finished), 'unchecked' (a prose
+    reason naming no task: only the coordinator can judge it by intent) or "" (a task it names is open)."""
     if not reason:
         return "unknown"
     from .ends import task_states
     states = task_states(p, reason)
-    parts = [s.split(": ", 1)[-1] for s in states.split("; ")] if states else []
-    return f"over ({states})" if parts and all(s in _FINISHED for s in parts) else ""
+    if not states:
+        return "unchecked"
+    parts = [s.split(": ", 1)[-1] for s in states.split("; ")]
+    return f"over ({states})" if all(s in _FINISHED for s in parts) else ""
 
 
 def _holds(db) -> list[dict]:

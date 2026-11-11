@@ -1784,7 +1784,7 @@ def add_order(p, text: str, message: int, owners=(), due=None, start_by=None, ac
                             "timed": due_at is not None, "tasks": ids, "obligations": [], "raised": None,
                             "set_at": now, "order": int(message), "class": action_class, "start_by": start_at,
                             "started": None, "late": None, "reason": oldorders.one_line(reason),
-                            "context": oldorders.context_for(p.db, "", int(message))}}
+                            "context": oldorders.clean_context(p, oldorders.context_for(p.db, "", int(message)))}}
             note = f"order {oid} recorded from message #{message}"
         pr = o["promise"]
         p.db.set_kv(KV, st)

@@ -51,16 +51,22 @@ def test_old_orders_lists_only_old_user_orders_whose_reason_is_over_or_unknown(e
     unknown = p.add_memory(f"Run only urgent work (user msg #{msg}).", kind="preference", standing=True)
     over = p.add_memory(f"Skip the long soak (user msg #{msg}).", kind="preference",
                         reason=f"host overloaded until #{fix} lands")
-    holds = p.add_memory(f"Prefer the small runner (owner's msg #{msg}).", kind="preference",
-                         reason="the large runner is shared")   # a reason that still holds
+    prose = p.add_memory(f"Prefer the small runner (owner's msg #{msg}).", kind="preference",
+                         reason="the large runner is shared")   # prose: only the coordinator can judge it
+    gate = p.db.add_task("free the large runner", "s", origin="user")
+    holds = p.add_memory(f"Skip the big build (user msg #{msg}).", kind="preference",
+                         reason=f"runner busy until #{gate} ends")   # a task it names is still open
     p.add_memory(f"Never push to main (user msg #{msg}).", kind="restriction")   # only the user loosens one
     p.add_memory("Prefer short specs.", kind="preference")                          # cites no user message
     ended = p.add_memory(f"Hold the deploy (user msg #{msg}).", kind="preference", end={"expires": time.time() + 3 * 86400})
-    for f in (unknown, over, holds, ended):
+    for f in (unknown, over, prose, holds, ended):
         _oo_age(f, 2)
     young = p.add_memory(f"Batch small fixes (user msg #{msg}).", kind="preference")   # under a day old
-    keys = [i["key"] for i in oldorders.scan(p)]
+    items = {i["key"]: i for i in oldorders.scan(p)}
+    keys = list(items)
     assert unknown.stem in keys and over.stem not in keys and holds.stem not in keys and young.stem not in keys
+    assert items[prose.stem]["state"] == "unchecked" and items[prose.stem]["reason"] == "the large runner is shared"
+    assert "reason unchecked: the large runner is shared" in oldorders.line(items[prose.stem])
     assert ended.stem not in keys and not any(k.startswith("restriction-") for k in keys)
     p.db.update_task(fix, status="done")   # its reason ended: listed as over
     items = {i["key"]: i for i in oldorders.scan(p)}
@@ -140,3 +146,44 @@ def test_course_check_flags_a_hold_that_cites_an_old_order(env):
     assert ident == f"old_order:{rule.stem}:blocked #{t}"
     p.set_config("coordinator.course_check", {"old_orders": 0})   # turned off
     assert coursecheck.lines(p.db, p.config(), p.state / push.DETACHED)[0] == []
+
+
+def test_an_old_order_with_a_prose_reason_is_flagged_when_it_holds_work(env):
+    """Review #8079 finding 1: a reason naming no task is 'unchecked', never 'still holds': the order the
+    prompt tells the coordinator to record with its reason still surfaces once it holds work."""
+    from ttp import coursecheck, obligations, oldorders, push
+    p = make(env)
+    msg = _oo_msg(p, "my laptop is overloaded, stop expensive work")
+    rule = p.add_memory(f"Run only urgent work (user msg #{msg}).", kind="preference", standing=True,
+                        reason="the user's laptop was overloaded")
+    _oo_age(rule, 5)
+    t = p.db.add_task("soak", "s", origin="user")
+    p.db.update_task(t, status="blocked", blocked_reason=f"held by [{rule.stem}]")
+    item = next(i for i in oldorders.scan(p) if i["key"] == rule.stem)
+    assert item["state"] == "unchecked" and item["held"] == [f"blocked #{t}"]
+    lines, _ = coursecheck.lines(p.db, p.config(), p.state / push.DETACHED)
+    assert len(lines) == 1 and "reason unchecked: the user's laptop was overloaded" in lines[0]
+    # An open order with a prose reason is listed too (held or not), never an open one with no reason.
+    omsg = _oo_msg(p, "keep the queue drained while the release is out")
+    obligations.add_order(p, "keep the queue drained", omsg, action_class="change", reason="release week",
+                          now=time.time() - 3 * 86400)
+    oid = obligations.open_order(p.db, omsg)["id"]
+    assert next(i for i in oldorders.scan(p) if i["key"] == oid)["state"] == "unchecked"
+
+
+def test_forbidden_user_words_drop_the_context_never_refuse_the_memory(env):
+    """Review #8079 finding 2: the harness-attached user words never make a clean memory_add fail."""
+    from ttp import coordinator as coord, obligations
+    p = make(env)
+    p.set_config("memory.forbidden_patterns", [{"name": "client names", "regex": "(?i)\\bacme\\b"}])
+    msg = _oo_msg(p, "for acme, stop expensive work")
+    assert coord.apply(p, [{"type": "memory_add", "memory_kind": "preference", "standing": True,
+                            "text": f"Run only urgent work (user msg #{msg})."}]) == []
+    e = next(e for e in p._memory_entries() if e["kind"] == "preference")
+    assert e["context"] == ""
+    assert not any("acme" in f.read_text().lower() for f in p.memory_dir.glob("*.md"))
+    # The coordinator's own text is still checked.
+    assert coord.apply(p, [{"type": "memory_add", "memory_kind": "fact", "text": "Acme uses the cache."}])
+    obligations.add_order(p, "stop expensive work", msg, action_class="change")
+    pr = obligations.open_order(p.db, msg)["promise"]
+    assert pr["context"] == "" and "acme" not in json.dumps(pr).lower()

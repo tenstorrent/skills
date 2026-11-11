@@ -31,8 +31,8 @@ so an idle project's digest does not grow. Each reuses a signal the harness alre
   done `harness` or `code` task citing it (not the fix task, not a schedule's own run), no recorded later
   fix. Its line stays open until one of those exists. Under the `recurring` key.
 
-- old_orders: a blocked task, a deferred task or an open ask citing an old user order whose reason is over
-  or unknown (oldorders.py, its last scan): the order may be read literally after its cause ended.
+- old_orders: a blocked task, a deferred task or an open ask citing an old user order whose reason is over,
+  unknown or unchecked (oldorders.py, its last scan): the order may be read literally after its cause ended.
 
 `coordinator.course_check` keys of the same names set the thresholds (0 turns one off)."""
 from __future__ import annotations

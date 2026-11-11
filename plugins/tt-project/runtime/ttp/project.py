@@ -2030,9 +2030,10 @@ class Project:
         intent once that reason is gone (see oldorders)."""
         from .ends import front_matter
         from .forbidden import check
-        from .oldorders import one_line
+        from .oldorders import clean_context, one_line
         reason, context = one_line(reason), one_line(context)
-        check(self, "memory", text, title or "", reason or "", context or "")   # before any write: nothing refused reaches git
+        check(self, "memory", text, title or "", reason or "")   # before any write: nothing refused reaches git
+        context = clean_context(self, context)   # harness-attached user words: dropped when forbidden, never refused
         if standing and kind not in PINNED_MEMORY_KINDS:
             kind = "preference"
         if not dry_run:
