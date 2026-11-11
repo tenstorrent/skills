@@ -234,6 +234,16 @@ def _arg_paths(args) -> list[str]:
 def calls(run_dir: Path) -> list[tuple[str, str, str]]:
     """(tool, 'shell' or 'file', command text or path) of each call in the run's transcript, in any
     shipped provider's format, plus the hook's rewritten commands."""
+    out = [c for ev in _jsonl(run_dir / "output.jsonl") for c in event_calls(ev)]
+    for ev in _jsonl(run_dir / "refusals.jsonl"):   # the hook's log: a rewritten command ran
+        if ev.get("kind") == "rewrite" and isinstance(ev.get("rewritten"), str):
+            out.append(("hook rewrite", "shell", ev["rewritten"]))
+    return out
+
+
+def event_calls(ev: dict) -> list[tuple[str, str, str]]:
+    """calls() of one transcript event: the commands and file writes the agent issued in it, never tool
+    output or text."""
     out: list[tuple[str, str, str]] = []
 
     def tool_use(name: str, inp: dict) -> None:
@@ -247,32 +257,28 @@ def calls(run_dir: Path) -> list[tuple[str, str, str]]:
             text = next((v for k in ("input", "patch", "command") if isinstance(v := inp.get(k), str)), "")
             out.extend((name, "file", p) for p in _patch_paths(text))
 
-    for ev in _jsonl(run_dir / "output.jsonl"):
-        content = (ev.get("message") or {}).get("content") if isinstance(ev.get("message"), dict) else None
-        for b in content if isinstance(content, list) else []:   # Claude Code, the chat bridge, Cursor text
-            if isinstance(b, dict) and b.get("type") == "tool_use":
-                tool_use(str(b.get("name") or ""), b.get("input") or {})
-        item = ev.get("item") if isinstance(ev.get("item"), dict) else None
-        if item and ev.get("type") in ("item.started", "item.completed"):   # Codex
-            kind = item.get("type") or item.get("item_type") or ""
-            if kind == "command_execution" and isinstance(item.get("command"), str):
-                out.append(("shell", "shell", item["command"]))
-            elif kind == "file_change":
-                out += [("file_change", "file", str(c["path"])) for c in item.get("changes") or []
-                        if isinstance(c, dict) and c.get("path")]
-            elif kind == "mcp_tool_call" and MCP_WRITE_RE.search(str(item.get("tool") or "")):
-                out += [(f"{item.get('server') or ''}.{item.get('tool')}", "file", p)
-                        for p in _arg_paths(item.get("arguments"))]
-        tc = ev.get("tool_call") if ev.get("type") == "tool_call" and isinstance(ev.get("tool_call"), dict) else None
-        for name, body in (tc or {}).items():   # Cursor: {"shellToolCall": {"args": {...}}, ...}
-            args = body.get("args") if isinstance(body, dict) and isinstance(body.get("args"), dict) else {}
-            if isinstance(args.get("command"), str):
-                out.append((name, "shell", args["command"]))
-            elif re.search(r"write|edit|delete|patch", name, re.I):
-                out += [(name, "file", p) for p in _arg_paths(args)]
-    for ev in _jsonl(run_dir / "refusals.jsonl"):   # the hook's log: a rewritten command ran
-        if ev.get("kind") == "rewrite" and isinstance(ev.get("rewritten"), str):
-            out.append(("hook rewrite", "shell", ev["rewritten"]))
+    content = (ev.get("message") or {}).get("content") if isinstance(ev.get("message"), dict) else None
+    for b in content if isinstance(content, list) else []:   # Claude Code, the chat bridge, Cursor text
+        if isinstance(b, dict) and b.get("type") == "tool_use":
+            tool_use(str(b.get("name") or ""), b.get("input") or {})
+    item = ev.get("item") if isinstance(ev.get("item"), dict) else None
+    if item and ev.get("type") in ("item.started", "item.completed"):   # Codex
+        kind = item.get("type") or item.get("item_type") or ""
+        if kind == "command_execution" and isinstance(item.get("command"), str):
+            out.append(("shell", "shell", item["command"]))
+        elif kind == "file_change":
+            out += [("file_change", "file", str(c["path"])) for c in item.get("changes") or []
+                    if isinstance(c, dict) and c.get("path")]
+        elif kind == "mcp_tool_call" and MCP_WRITE_RE.search(str(item.get("tool") or "")):
+            out += [(f"{item.get('server') or ''}.{item.get('tool')}", "file", p)
+                    for p in _arg_paths(item.get("arguments"))]
+    tc = ev.get("tool_call") if ev.get("type") == "tool_call" and isinstance(ev.get("tool_call"), dict) else None
+    for name, body in (tc or {}).items():   # Cursor: {"shellToolCall": {"args": {...}}, ...}
+        args = body.get("args") if isinstance(body, dict) and isinstance(body.get("args"), dict) else {}
+        if isinstance(args.get("command"), str):
+            out.append((name, "shell", args["command"]))
+        elif re.search(r"write|edit|delete|patch", name, re.I):
+            out += [(name, "file", p) for p in _arg_paths(args)]
     return out
 
 

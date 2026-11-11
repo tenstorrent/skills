@@ -5964,14 +5964,12 @@ class Daemon:
             log(self.p, f"run {r['id']}: outside-writes scan failed\n" + traceback.format_exc())
 
     def _cred_verdicts(self, r: dict, exit_info: dict, run_dir: Path) -> dict:
-        """credwatch.classify() of the run's credential changes against every project's runs on this host,
-        stored in the run dir for the hand-off check (_cred_changed), before any finish transaction. Always
-        rewritten, so a file the agent left there excuses nothing."""
-        own = self.p.state / "project.db"
-        dbs = [own] + [d for _, d in gcap.local_projects(skip=str(own.resolve()))]
+        """credwatch.classify() of the run's credential changes (the machine's change ledger and the run's
+        own transcript), stored in the run dir for the hand-off check (_cred_changed), before any finish
+        transaction. Always rewritten, so a file the agent left there excuses nothing."""
         try:
             got = credwatch.classify(exit_info["cred_changed"], exit_info.get("cred_marks") or {},
-                                     r.get("started"), time.time(), dbs, (str(own), r.get("id")), run_dir)
+                                     r.get("started"), time.time(), run_dir)
             durable_write(run_dir / credwatch.VERDICTS, json.dumps(got))
             return got
         except Exception:   # every change fails the run, as before
@@ -6022,8 +6020,8 @@ class Daemon:
                      (time.time(), "daemon", "secrets_unmasked", "high", text[:500], "queued", r["task"]))
         if exit_info.get("cred_changed"):
             try:
-                credwatch.observe(db, r, exit_info["cred_changed"], time.time(), run_dir, p,
-                                  self._cred_verdicts(r, exit_info, run_dir))
+                credwatch.observe(db, r, exit_info["cred_changed"], time.time(),
+                                  self._cred_verdicts(r, exit_info, run_dir), p)
             except Exception:
                 log(p, f"run {r['id']}: credential change observation failed\n" + traceback.format_exc())
         prov = get_provider(r["provider"]).use(r["model"] or "", (self.cfg.get("pricing") or {}).get(r["provider"]))
@@ -7406,9 +7404,9 @@ class Daemon:
         if rejects:
             rstatus, result = "failed", dict(result, status=CHANGES_NEEDED)
         if own and rstatus in HANDOFF_STATES and rstatus != "failed" and (
-                cred := credwatch.unrecorded(_cred_changed(run_dir), r.get("started"), time.time())):
-            # The run changed a credential file (credwatch, observed above) that no change ledger entry
-            # records as made while it ran: its hand-off never stands.
+                cred := _cred_changed(run_dir)):
+            # The run's own transcript shows it changed a credential file (credwatch.classify, observed
+            # above): its hand-off never stands.
             rstatus, result = "failed", dict(result, status="failed", handoff_status=rstatus, cred_changed=cred,
                                              summary=f"Failed: credential files changed during the run "
                                                      f"({'; '.join(f'{p} {h}' for p, h in cred)[:400]}). Its "
@@ -20642,7 +20640,7 @@ def _read_result(path: Path) -> dict | None:
 def _cred_changed(run_dir: Path) -> list:
     """The credential changes (credwatch) the runner wrote to the run's exit.json; [] when none."""
     got = (_read_result(run_dir / "exit.json") or {}).get("cred_changed")
-    held = credwatch.held(run_dir)   # metadata-only, or seen by several runs (credwatch.classify): no failure
+    held = credwatch.excused(credwatch.held(run_dir))   # not shown by the run's transcript (credwatch.classify)
     return [c for c in got if isinstance(c, list) and len(c) == 2 and c[0] not in held] if isinstance(got, list) else []
 
 

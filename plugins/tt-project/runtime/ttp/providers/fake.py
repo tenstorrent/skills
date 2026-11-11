@@ -136,6 +136,8 @@ def _main(role: str, args: list[str] | None = None) -> int:
                 "status": "done", "summary": f"fake {role} finished", "followups": []}
             (run_dir / "result.json").write_text(json.dumps(result))
         out = {"ok": True}
+        if os.environ.get("TTP_FAKE_SHELL"):
+            out["_shell"] = os.environ["TTP_FAKE_SHELL"]   # in the transcript, as a real agent's tool call is
     out["_cost"] = cost
     out["_session"] = session
     if os.environ.get("TTP_FAKE_MODEL"):   # the model the session reports (claude: its init event)

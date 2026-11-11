@@ -3645,21 +3645,18 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   and each provider's login file, plus every file under the write guard's protected paths (its defaults
   and `guards.protected_paths`, in HOME and the account's own home; known_hosts, gh's state file and
   cache folders left out). Only size, mtime, ctime and inode are compared, never contents: no key or
-  token is opened or hashed, and ctime still shows a same-size rewrite. A change queues one
-  observation for the coordinator naming the run and the path (one per path and minute when several
-  overlapping runs saw it). When this machine's change ledger (`ttp machines change list --all`) has
-  an entry made while the run ran that names the path, the change was a recorded, deliberate one: the
-  observation is normal severity, names the entry, its project and task, asks for no urgent work, and
-  the run's hand-off stands. A change of ctime alone (a chmod: same size, mtime and inode) is told at
-  normal severity and fails no run. A change made while another run of any project on the host was open
-  too (the file's new ctime falls inside both runs' windows, `credwatch.classify`) is told once as
-  changed outside these runs and fails no run: at normal severity when rewritten in place at the same
-  size, high when the file is new, replaced or resized. Otherwise it is high and quotes the first line
-  of the run's transcript that names the path or runs a command that writes such a file (ssh-keygen
-  without a scratch `-f`, `gh auth`, `git credential`), or, with none, says the run's commands did not
-  show it and gives the file's time, so the search starts there; and the run's hand-off is stored
-  failed (a removal, or a change only this run was open for). Provider login
-  files count only when removed or
+  token is opened or hashed, and ctime still shows a same-size rewrite. A run's hand-off is stored
+  failed only for a change its own transcript shows: a line that names the path or runs a command that
+  writes such a file (`gh auth login`, `refresh`, `switch` or `logout`, ssh-keygen without a scratch
+  `-f`, `git credential`). That run gets one high observation quoting each line. Every other change is
+  told once for the whole host, whichever run of any project ends first (a claim per path and change
+  minute in the account's tt-project home), in one observation per run that fails no run: a change of
+  ctime alone (a chmod), one this machine's change ledger (`ttp machines change list --all`) records as
+  made while the run ran (named with its entry, project and task), and one no transcript shows (you,
+  your agent, or another process). It is high when a file is new, removed, replaced or resized, else
+  normal, and says how to record a deliberate change (`ttp machines change add <alias> "<what> <path>"
+  --undo 'none: deliberate'`) so later runs are not blamed. A write a run makes through a script whose
+  command line does not name the path is told, not failed. Provider login files count only when removed or
   rewritten to under half their size, since their CLIs rewrite them on every token refresh. Nothing is
   restored automatically: without reading contents the harness cannot tell damage from a real change (a new
   `gh auth login`, a refreshed token, a rotated key, by you or another run at the same time), a restore
