@@ -1748,7 +1748,6 @@ def test_a_pure_git_check_after_slow_python_in_a_strict_round_still_runs(env, tm
     with gitmemo.bounded(gitmemo.TX_GIT_S, 0.01), gitmemo.attempt(), gitmemo.strict(0.1) as rd:
         rd.pnr, rd.live_s = True, 5.0   # past its point of no return, its slice spent
         time.sleep(0.05)                # and past the scope's deadline
-        worktree._VALID_BRANCHES.pop("ttp/t1-a-pr-branch", None)
         assert worktree.valid_branch("ttp/t1-a-pr-branch")
         r = gitmemo.run(["git", "check-ref-format", "--branch", "ttp/t2-another"], capture_output=True, text=True)
         assert (r.returncode, r.stdout.strip()) == (0, "ttp/t2-another"), r

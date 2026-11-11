@@ -219,9 +219,9 @@ disk untouched, with no migration; nothing else is reclaimed by check recovery.
   turn's user messages, so a cited user order is still recorded; a `waits_on ask:new` is stored
   re-pointed to the ask its turn sent, and rejected at once when none went through). Other
   action types, and one that wrote before it timed out, are still rejected, with the timeout as the
-  reason. A spent deadline still refuses every new git call, local reads included (no floor: a
-  finish transaction's cap bounds how long it holds the write lock); branch names are checked
-  in-process (`worktree.valid_branch`), so the coordinator's branch checks spawn no git.
+  reason. A spent deadline still refuses every new git call except the repository-free checks
+  (`gitmemo._CHECKS`, which get `gitmemo.PURE_FLOOR_S`); branch names are checked in-process
+  (`worktree.valid_branch`), so the coordinator's branch checks spawn no git.
 
 - A wait on another project of this machine gets nothing extra from the daemon: no note to that
   project, no default end, no matching of project names in `waiting_for`. The worker tells the
