@@ -126,6 +126,25 @@ def _mark_report_only(item: dict, found: list[dict]) -> dict:
     return item
 
 
+PR_WORD_RE = re.compile(r"\b(?:pulls?|prs?)\b", re.I)
+
+
+def pr_item(url: str, prs_on: list[str], found: list[dict]) -> dict:
+    """The inventory item of the open PR `url`. The built-in PR watcher covers it; else a command watcher
+    whose text names the PR (its URL or owner/repo#N), or its repo (owner/repo) beside a PR word (`gh pr
+    list -R owner/repo`, `.../repos/owner/repo/pulls`), covers it, report-only: a project that may keep no
+    gh login on its host watches its PRs with its own command watcher, and those PRs are not missing."""
+    if prs_on:
+        return {"kind": "pr", "name": url, "covered_by": [f"builtin: PR watcher {prs_on[0]}"]}
+    key = prguard.pr_key(url) or ""
+    repo = key.split("#", 1)[0]
+    names = [w["name"] for w in found if not w["heal"] and key
+             and (key in prguard.pr_keys(w["text"])
+                  or (re.search(r"(?<![\w.-])" + re.escape(repo) + r"(?![\w.-]|/(?!pulls?\b))", w["text"], re.I)
+                      and PR_WORD_RE.search(w["text"])))]
+    return _mark_report_only({"kind": "pr", "name": url, "covered_by": names}, found)
+
+
 # The inventory ------------------------------------------------------------------------------------
 def inventory(p, cfg: dict | None = None, db=None, now: float | None = None) -> list[dict]:
     """[{kind, name, covered_by: [check names or 'builtin: ...']}], in KINDS order."""
@@ -196,7 +215,7 @@ def inventory(p, cfg: dict | None = None, db=None, now: float | None = None) -> 
                    if prguard.is_pr(t["pr_url"])
                    and str((seen.get(t["pr_url"]) or {}).get("state") or "").upper() not in DONE_PR})
     for url in urls:
-        items.append({"kind": "pr", "name": url, "covered_by": [f"builtin: PR watcher {prs_on[0]}"] if prs_on else []})
+        items.append(pr_item(url, prs_on, found))
     for t in db.q("SELECT id, result FROM tasks WHERE status='waiting' ORDER BY id"):
         try:
             probe = str((json.loads(t["result"] or "{}") or {}).get("retry_when") or "")

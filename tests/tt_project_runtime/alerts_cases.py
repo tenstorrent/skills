@@ -1375,6 +1375,36 @@ def test_pr_watch_drops_flags_for_cancelled_tasks_and_prs_it_cannot_read(env, mo
 
 
 
+def test_health_counts_a_command_watcher_naming_a_pr_or_its_repo_as_pr_coverage(env):
+    """A project that may keep no gh login on its host watches its open PRs with its own command watcher:
+    one naming the PR, or its repo beside a PR word, covers it (report-only), so health never lists those
+    PRs as missing forever. A watcher naming only another repo, or the repo without any PR word, does not."""
+    from ttp import responsibilities
+    p = make(env)
+    p.db.x("DELETE FROM schedules WHERE kind='watcher'")
+    urls = ["https://github.com/example-org/widgets/pull/7", "https://github.com/example-org/gadgets/pull/3",
+            "https://github.com/example-org/other/pull/5"]
+    for url in urls:
+        p.db.x("INSERT INTO tasks(title,kind,status,pr_url,created) VALUES(?,?,?,?,?)",
+               ("t", "code", "done", url, time.time()))
+
+    def pr_items():
+        return {i["name"]: i for i in responsibilities.inventory(p) if i["kind"] == "pr"}
+    assert all(not i["covered_by"] for i in pr_items().values())
+    for name, cmd in (("one-pr", "bin/pr_state.sh example-org/widgets#7"),
+                      ("repo-prs", "curl -s https://api.github.com/repos/example-org/gadgets/pulls"),
+                      ("repo-ci", "bin/ci_state.sh example-org/other/actions"),
+                      ("near-miss", "gh pr list -R example-org/other-fork")):
+        p.db.x("INSERT INTO schedules(name,kind,every_s,enabled,payload) VALUES(?,'command',600,1,?)",
+               (name, json.dumps({"command": cmd})))
+    items = pr_items()
+    assert items[urls[0]]["covered_by"] == ["one-pr"] and items[urls[0]].get("report_only")
+    assert items[urls[1]]["covered_by"] == ["repo-prs"] and items[urls[1]].get("report_only")
+    assert items[urls[2]]["covered_by"] == [], items[urls[2]]
+    p.db.x("INSERT INTO schedules(name,kind,every_s,enabled,payload) VALUES('prs','watcher',600,1,'{}')")
+    assert all(i["covered_by"] == ["builtin: PR watcher prs"] for i in pr_items().values())
+
+
 def test_pr_watch_reads_only_real_pr_urls_and_a_hand_off_stores_no_other(env, monkeypatch):
     """Only a /pull/<n> URL or owner/repo#N is watched and counted as a PR: 'none', a branch tree URL or
     an empty value never gets a signature, so it is skipped before any gh call, not re-read every run.
