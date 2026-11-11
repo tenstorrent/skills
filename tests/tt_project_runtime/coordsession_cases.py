@@ -850,6 +850,32 @@ def test_a_resumed_session_gets_the_system_prompt_diff_only_where_the_resume_kee
     assert get_provider("codex").resume_new_prompt == "diff"
 
 
+def test_a_failing_prompt_record_write_still_launches_the_session_wake(env, monkeypatch):
+    """#7724: the run row is written before the run dir's prompt record; a failing write there must not
+    leave the row running with no pid. The wake runs, and with nothing to acknowledge the saved copy stays,
+    so the next wake sends the changes again."""
+    from ttp import coordsession, daemon as dmod
+    p, d, sessions, wake = _cs_session_project(env, monkeypatch)
+    first, _, _ = wake("one")
+    acked = coordsession.acked_prefix(p)
+    p.charter_path.write_text(_CS_CHARTER.replace("Ship v1.", "Ship v2."))
+    real = dmod.durable_write
+
+    def flaky(path, data, *a, **k):
+        if Path(path).name == coordsession.PREFIX_FILE and Path(path).parent.parent == p.runs:
+            raise OSError(28, "No space left on device")
+        return real(path, data, *a, **k)
+    monkeypatch.setattr(dmod, "durable_write", flaky)
+    second, _, prompt2 = wake("two")   # asserts the run ended ok
+    assert second["why"] == "prompt changed" and coordsession.CHANGED_HEAD in prompt2
+    assert coordsession.acked_prefix(p) == acked, "nothing saved, nothing acknowledged"
+    assert not p.db.q("SELECT id FROM runs WHERE status='running'")
+    assert "its prompt record was not saved" in (p.state / "logs" / "daemon.log").read_text()
+    monkeypatch.setattr(dmod, "durable_write", real)
+    _, _, prompt3 = wake("three")
+    assert coordsession.CHANGED_HEAD in prompt3 and "Ship v2." in prompt3
+
+
 def test_both_coordinator_modes_and_the_planner_pass_the_worker_the_context_it_cannot_see(env):
     """User msg #1785: a worker or planner sees none of the coordinator's context, so each spec, plan
     brief and mid-run correction carries a Context block; a plan gives its own tasks the same block."""

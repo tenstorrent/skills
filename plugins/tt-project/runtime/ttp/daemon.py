@@ -3899,8 +3899,11 @@ class Daemon:
         run_dir = self.p.runs / str(run_id)
         prompt = prompt.replace(RUN_DIR_MARK, str(run_dir))
         if prefix_now is not None:   # acknowledged once the wake ends ok (coordsession.ack_prefix)
-            run_dir.mkdir(parents=True, exist_ok=True)
-            durable_write(run_dir / coordsession.PREFIX_FILE, json.dumps(prefix_now))
+            try:
+                run_dir.mkdir(parents=True, exist_ok=True)
+                durable_write(run_dir / coordsession.PREFIX_FILE, json.dumps(prefix_now))
+            except OSError as e:   # the wake still runs; unacknowledged, the next wake sends the changes again
+                log(self.p, f"run {run_id}: its prompt record was not saved: {e}")
         # Raising from here on means nothing was launched: the run row must not stay "running".
         tmp_env: dict = {}
         try:
