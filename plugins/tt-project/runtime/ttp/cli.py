@@ -6219,8 +6219,9 @@ def _checks_tip_ref(p: Project | None, top: Path) -> str:
 
 
 def _checks_base(p: Project | None, top: Path, cmds: list) -> str:
-    """What `ttp checks` compares `if_changed` scopes with: the push target as last fetched, or ""
-    (no project, no push target or no copy of it here), and then those checks run."""
+    """What `ttp checks` compares `if_changed` scopes with: the push target as last fetched; in a repo
+    with no git remote at all, the local push branch; else "" (no project, no push target or no copy
+    of it here), and then those checks run."""
     from . import push
     if not p:
         return ""
@@ -6228,9 +6229,16 @@ def _checks_base(p: Project | None, top: Path, cmds: list) -> str:
         remote, branch = push.target(p, top)
     except ValueError:
         return ""
-    r = subprocess.run(["git", "-C", str(top), "rev-parse", "--verify", "-q", f"refs/remotes/{remote}/{branch}"],
-                       capture_output=True, text=True)
-    return r.stdout.strip() if r.returncode == 0 else ""
+
+    def rev(ref: str) -> str:
+        r = subprocess.run(["git", "-C", str(top), "rev-parse", "--verify", "-q", ref],
+                           capture_output=True, text=True)
+        return r.stdout.strip() if r.returncode == 0 else ""
+
+    if base := rev(f"refs/remotes/{remote}/{branch}"):
+        return base
+    r = subprocess.run(["git", "-C", str(top), "remote"], capture_output=True, text=True)
+    return rev(f"refs/heads/{branch}") if r.returncode == 0 and not r.stdout.strip() else ""
 
 
 def _checks_judge_base(p: Project, top: str, head: str, base: str) -> tuple[str, str]:

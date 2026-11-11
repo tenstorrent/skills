@@ -6306,6 +6306,41 @@ def test_push_runs_an_if_changed_check_only_when_the_diff_touches_its_paths(env,
     assert push.skip_reason(repo, "HEAD", check[0], base) is None   # after_push scopes the same way
 
 
+def test_checks_base_is_the_local_push_branch_only_in_a_repo_with_no_remote(env, monkeypatch, capsys):
+    """`ttp checks` scopes if_changed checks by the push target as last fetched. A repo with no git
+    remote has no such copy: its local push branch is the base, so an untouched scope skips (reported
+    as skipped, never as passed). A repo with a remote keeps the old rule: no fetched copy, no base."""
+    from ttp import cli, push
+    for var, val in (("GIT_AUTHOR_NAME", "t"), ("GIT_AUTHOR_EMAIL", "t@t"),
+                     ("GIT_COMMITTER_NAME", "t"), ("GIT_COMMITTER_EMAIL", "t@t")):
+        monkeypatch.setenv(var, val)
+    p = make(env)
+    repo = env["repo"]
+    assert _git_out(repo, "remote") == ""
+    p.set_config("delivery.push_branch", "proj")
+    assert cli._checks_base(p, repo, []) == "", "no push branch here yet: no base"
+    _git_out(repo, "branch", "proj")
+    tip = _git_out(repo, "rev-parse", "proj")
+    _commit(repo, "notes.txt", "notes\n")
+    assert cli._checks_base(p, repo, []) == tip
+    check = push.check_list([SCOPED])
+    todo, skipped = push.applicable(repo, "HEAD", check, print, cli._checks_base(p, repo, []))
+    assert todo == [] and len(skipped) == 1 and skipped[0].scoped
+    assert "skipped (not applicable:" in skipped[0] and "changes nothing under src/**, fail.sh since" in skipped[0]
+    _commit(repo, "fail.sh", "exit 1\n")
+    assert push.applicable(repo, "HEAD", check, print, cli._checks_base(p, repo, []))[0] == check
+    # With a remote, the local branch is never the base: only the fetched copy of the target is.
+    origin = env["tmp"] / "origin.git"
+    _bare_init(env, origin)
+    _remote_add(repo, origin)
+    assert cli._checks_base(p, repo, []) == ""
+    _git_out(repo, "push", "-q", "origin", f"{tip}:refs/heads/proj")
+    _git_out(repo, "fetch", "-q", "origin")
+    _git_out(repo, "update-ref", "refs/heads/proj", "HEAD")   # the local branch moved on: not the base
+    assert cli._checks_base(p, repo, []) == tip
+    assert cli._checks_base(None, repo, []) == ""
+
+
 def test_an_if_changed_check_fails_when_git_cannot_give_the_diff(env, monkeypatch, tmp_path):
     from ttp import push
     p, repo, origin, other = _push_setup(env, monkeypatch, [SCOPED])
