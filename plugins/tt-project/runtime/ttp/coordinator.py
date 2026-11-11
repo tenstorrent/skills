@@ -4366,7 +4366,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     if not str(a.get("at") or "").strip():
                         raise ValueError("look: give `at`: a delay such as 45m or a time in the home zone")
                     at = parse_start_after(str(a["at"]), tz=timefmt.home(p)) or time.time()
-                    looks.add(db, at, str(a.get("text") or ""), a.get("precheck"))
+                    text = str(a.get("text") or "")
+                    looks.add(db, at, text, a.get("precheck"), state=looks.snapshot(p, text, a.get("precheck")))
             elif t in ("noop", None):
                 pass
             else:

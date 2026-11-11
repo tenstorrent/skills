@@ -75,7 +75,7 @@ The table lists fields; the section named has their rules.
 <!-- ttp:if !obligations -->
 | `obligation` | `text`, `owners` (task ids), optional `milestones` (`{key, due, evidence_required}`) | an urgent deliverable the user asked for: record it with its producing tasks in the same batch (full rules show while one is open) |
 <!-- /ttp:if !obligations -->
-| `look` | `at` (a delay such as `45m`, or a home-zone time), `text` (what to check and why), optional `precheck` (shell; exit 0 skips the wake); `enabled: false` clears them | your own next check-in: a pending look replaces the fixed idle wake. Pick the time that wastes least |
+| `look` | `at` (a delay such as `45m`, or a home-zone time), `text` (what to check and why), optional `precheck` (shell; exit 0 skips the wake; none: a look naming only tasks `#id` is skipped while they, the open asks and the push tip are unchanged); `enabled: false` clears them | your own next check-in: a pending look replaces the fixed idle wake; a turn reads looks due within the wake gap early. Pick the time that wastes least |
 | `sweep` | as the digest's `Blocker sweep` section says | one per item there not marked CARRIED |
 | `noop` | — | nothing to do |
 

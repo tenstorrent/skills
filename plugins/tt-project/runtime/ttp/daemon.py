@@ -11774,8 +11774,9 @@ class Daemon:
         now = time.time()
         if now < float(db.kv("coordinator_backoff_until", 0)):
             return
-        # Due looks the coordinator set itself (looks.py); a look whose check exits 0 is skipped.
-        fire = looks.screen(db, self.p.base, looks.due(db, now), now) if looks.pending(db) else []
+        # Due looks the coordinator set itself (looks.py); a look whose check exits 0, or whose snapshot
+        # state is unchanged (look_trim), is skipped.
+        fire = looks.screen(db, self.p.base, looks.due(db, now), now, self.p) if looks.pending(db) else []
         msgs = db.q("SELECT id, ts, chat, provenance, text, context FROM messages WHERE direction='in' AND handled=0 "
                     "ORDER BY id")
         queued = db.q("SELECT id, ts, kind, severity, task, source, data FROM events WHERE status='queued' ORDER BY id")
@@ -11975,7 +11976,11 @@ class Daemon:
             must = mustact.block(db, [e["id"] for e in evs])
             parts = ([(mustact.SECTION, must)] if must else []) + parts
             parts += [(slowcomplaint.SECTION, speed)] if speed else []
-            seen_looks = [("looks", looks.digest(fire, lambda t: timefmt.short(t, self.p)))] if fire else []
+            # Looks due within the wake gap ride this turn, so none starts a wake of its own (look_trim).
+            fire = fire + looks.ahead(db, self.cfg, now, {x["id"] for x in fire})
+            quiet_looks = looks.unchanged_since(db, float(db.kv("last_coordinator_turn", 0)))
+            seen_looks = [("looks", looks.digest(fire, lambda t: timefmt.short(t, self.p), now, quiet_looks))] \
+                if fire or quiet_looks else []
             parts += seen_looks
             prompt = "\n".join(text for _, text in parts)
             # A session wake may send only what changed.

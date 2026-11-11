@@ -324,3 +324,80 @@ def test_a_tick_step_incident_rides_along(env, monkeypatch):
         d._step_incident("probe", time.time() + i)
     (ev,) = d.p.db.q("SELECT severity, data FROM events WHERE kind='tick_step_incident'")
     assert pagesev.rides_along(dict(ev)) and json.loads(ev["data"])["step"] == "probe"
+
+
+def test_look_default_check_skips_an_unchanged_look_and_fires_a_changed_one(env):
+    """A look with no check of its own snapshots the tasks it names (status, last note), the open asks and,
+    when it names landing, the push tip; at its due time an unchanged state skips it (listed next turn)."""
+    from ttp import coordinator as coord, looks
+    p = make(env)
+    tid = p.db.add_task("soak", "s")
+    now = time.time()
+    assert coord.apply(p, [{"type": "look", "at": "10m", "text": f"Look at #{tid}'s result"}]) == []
+    assert looks.pending(p.db)[0]["state"]["tasks"][str(tid)][0] == "queued"
+    assert looks.screen(p.db, p.root, looks.pending(p.db), now + 3600, p) == []
+    assert p.db.kv(looks.DONE_KEY)[-1]["status"] == "unchanged" and not looks.pending(p.db)
+    assert f"skipped, its tasks, asks and push tip unchanged: Look at #{tid}" in \
+        looks.digest([], None, now, looks.unchanged_since(p.db, now - 1))
+    # A changed status, a new note in its run, or a new open ask fires it.
+    for change in ("status", "note", "ask"):
+        assert coord.apply(p, [{"type": "look", "at": "10m", "text": f"Look at #{tid}'s result"}]) == []
+        if change == "status":
+            p.db.x("UPDATE tasks SET status='running' WHERE id=?", (tid,))
+        elif change == "note":
+            d = p.runs / "note-run"
+            d.mkdir(parents=True, exist_ok=True)
+            (d / "progress.md").write_text("old\n")
+            p.db.x("INSERT INTO runs(task, role, started, status, dir) VALUES(?,?,?,?,?)",
+                   (tid, "worker", now, "running", str(d)))
+            assert coord.apply(p, [{"type": "look", "at": "10m", "text": f"Look at #{tid}'s result"}]) == []
+            p.db.set_kv(looks.KEY, looks.pending(p.db)[-1:])
+            (d / "progress.md").write_text("old\nnew step\n")
+        else:
+            p.db.x("INSERT INTO messages(ts,direction,chat,kind,text,handled) VALUES(?,?,?,?,?,0)",
+                   (now, "out", "web", "ask", "which?"))
+        fired = looks.screen(p.db, p.root, looks.pending(p.db), now + 3600, p)
+        assert len(fired) == 1, change
+        looks.settle(p.db, [fired[0]["id"]], "woken")
+    # Wording that makes an unchanged state the reason to act, or names state outside the records: no default.
+    for text in (f"if #{tid} is still queued, cancel it", f"o3: check #{tid}", f"#{tid} deadline 15:00",
+                 f"read #{tid}'s log on the host", f"#{tid}: tail state/runs/1/out", "check the soak"):
+        assert looks.snapshot(p, text, None) is None, text
+
+
+def test_look_explicit_precheck_still_decides_and_look_trim_turns_it_off(env):
+    from ttp import coordinator as coord, looks
+    p = make(env)
+    tid = p.db.add_task("soak", "s")
+    now = time.time()
+    for rc, fires in ((1, True), (0, False)):
+        assert coord.apply(p, [{"type": "look", "at": "10m", "text": f"#{tid}", "precheck": f"exit {rc}"}]) == []
+        assert "state" not in looks.pending(p.db)[0]
+        assert bool(looks.screen(p.db, p.root, looks.pending(p.db), now + 3600, p)) is fires
+        looks.clear(p.db)
+    assert p.config()["coordinator"]["look_trim"] is True
+    p.set_config("coordinator.look_trim", False)
+    assert looks.snapshot(p, f"#{tid}", None) is None
+    looks.add(p.db, now, f"#{tid}", state=looks.fingerprint(p.db, f"#{tid}"))   # set while it was on
+    assert len(looks.screen(p.db, p.root, looks.pending(p.db), now + 3600, p)) == 1, "off: the look fires"
+    assert looks.ahead(p.db, p.config(), now, set()) == []
+
+
+def test_looks_due_within_the_wake_gap_share_one_wake(env, monkeypatch):
+    """Two looks 9 minutes apart start one turn, which reads both; with look_trim off each wakes."""
+    from ttp import looks
+    for on in (True, False):
+        p, d, clock, starts, _ = _wg_setup(env, monkeypatch)
+        p.set_config("coordinator.look_trim", on)
+        d.cfg = p.config()
+        p.db.set_kv(looks.DONE_KEY, [])
+        looks.add(p.db, clock[0] + 60, "check the soak")
+        looks.add(p.db, clock[0] + 600, "check the second soak")
+        assert _turn_within(d, clock, starts, 120), "the first look did not wake"
+        woke = [x for x in p.db.kv(looks.DONE_KEY) or [] if x["status"] == "woken"]
+        if on:
+            assert len(woke) == 2 and not looks.pending(p.db)
+            assert not _turn_within(d, clock, starts, 700), "a merged look woke again"
+        else:
+            assert len(woke) == 1 and len(looks.pending(p.db)) == 1
+            assert _turn_within(d, clock, starts, 700), "with look_trim off the second look wakes"

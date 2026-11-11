@@ -324,6 +324,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
                     # user messages, immediate events and the ends of hot tasks (a fresh urgent: line or
                     # an open obligation's owner; eventhold.hot) wake at once (eventhold.gap_until; 0: off).
                     "wake_gap_s": 900,
+                    # A look with no check of its own is skipped when the tasks, asks and push tip its text
+                    # names are unchanged since it was set, and a turn reads every look due within
+                    # wake_gap_s, so close looks share one wake (looks.py; False: off).
+                    "look_trim": True,
                     # Relayed messages (`ttp say` from another agent) with no order or question wait up to
                     # this long after the oldest, so a burst starts one turn; an order or a question, and
                     # the user's own channels, wake at the debounce (msgwake.py; 0: off).
