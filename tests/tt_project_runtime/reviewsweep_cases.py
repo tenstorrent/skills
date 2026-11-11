@@ -301,3 +301,61 @@ def test_a_finish_with_its_round_slice_or_git_budget_spent_defers_its_review_to_
     assert "after 0 seconds" not in (p.logs / "daemon.log").read_text()
     assert len(d.retry_unread_reviews()) == 2, "the next tick queues both"
     assert len(_daemon_reviews(p, sliced)) == 1 and len(_daemon_reviews(p, later)) == 1
+
+
+def test_a_finish_with_the_review_cap_full_gets_its_review_once_the_cap_allows_one(env, monkeypatch):
+    """A finish whose review the rolling review cap holds marks the task review-pending (KV_REVIEW_UNREAD):
+    while the cap stays full the next tick keeps it without a git read, and the first tick the cap allows
+    queues its review, not the unreviewed sweep hours later."""
+    from ttp import coordinator, worktree
+    from ttp.daemon import Daemon, KV_REVIEW_UNREAD
+    p = make(env)
+    _with_origin(env, clone=False)
+    real, full = coordinator.next_task_slot, {"on": True}
+    monkeypatch.setattr(coordinator, "next_task_slot", lambda db, cap, now=None, review=False:
+                        time.time() + 60 if review and full["on"] else real(db, cap, now, review))
+    tid, _, done, reviews = _finish_code(env, p, "capped fix", {"app.py": 5})
+    assert not reviews and p.db.kv(KV_REVIEW_UNREAD) == [tid]
+    reads, diff = [], worktree.diff_lines
+    monkeypatch.setattr(worktree, "diff_lines", lambda *a, **k: reads.append(1) or diff(*a, **k))
+    d = Daemon(p.base)
+    assert d.retry_unread_reviews() == [] and p.db.kv(KV_REVIEW_UNREAD) == [tid] and not reads
+    full["on"] = False
+    (rid,) = d.retry_unread_reviews()
+    assert p.db.task(rid)["title"] == f"Review #{tid}: capped fix" and p.db.kv(KV_REVIEW_UNREAD) == []
+
+
+def test_a_finish_reads_git_for_its_review_under_its_own_short_cap(env, monkeypatch):
+    """The finish's review read runs under gitmemo.FINISH_REVIEW_GIT_S, not the finish transaction's whole
+    budget: a slow read leaves the review to the next tick."""
+    from ttp import gitmemo, worktree
+    from ttp.daemon import KV_REVIEW_UNREAD
+    p = make(env)
+    _with_origin(env, clone=False)
+    caps, diff = [], worktree.diff_lines
+    monkeypatch.setattr(worktree, "diff_lines",
+                        lambda *a, **k: caps.append(gitmemo.timeout(None, read=True)) or diff(*a, **k))
+    tid, _, _, reviews = _finish_code(env, p, "short read", {"app.py": 5})
+    assert reviews and caps and all(c is not None and c <= gitmemo.FINISH_REVIEW_GIT_S for c in caps), caps
+    assert gitmemo.FINISH_REVIEW_GIT_S < gitmemo.TX_GIT_S and not p.db.kv(KV_REVIEW_UNREAD)
+
+
+def test_the_unreviewed_sweep_reads_every_head_in_one_git_call(env, monkeypatch):
+    """sweep_unreviewed reads its tasks' branch heads in one batched cat-file (worktree.branch_heads),
+    never one rev-parse per task, and still finds each task unreviewed."""
+    import sys
+    from ttp import daemon as dm, worktree
+    p = make(env)
+    tids = [_unreviewed(env, p, f"batched {n}")[0] for n in range(3)]
+    calls, git, batches, heads = [], worktree._git, [], worktree.branch_heads
+    monkeypatch.setattr(worktree, "_git", lambda *a, **k: (sys._getframe(1).f_code.co_name == "_unreviewed_skip"
+                                                           and calls.append(a)) or git(*a, **k))
+    monkeypatch.setattr(worktree, "branch_heads", lambda pr, b: batches.append(b) or heads(pr, b))
+    d = dm.Daemon(p.base)
+    d.cfg.setdefault("review", {})["unreviewed_per_pass"] = 5
+    queued = []   # _auto_review reads its own head: only the sweep's own reads are counted
+    monkeypatch.setattr(d, "_auto_review", lambda t, *a, **k: queued.append(t["id"]))
+    d.sweep_unreviewed()
+    assert sorted(queued) == tids
+    assert len(batches) == 1 and sorted(batches[0]) == sorted(p.db.task(t)["branch"] for t in tids)
+    assert not calls, "the sweep read a head on its own"

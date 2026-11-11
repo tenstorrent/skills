@@ -2500,6 +2500,25 @@ def _resolve(p: Project | None, names: list[str], root: Path | None = None) -> d
     return {n: ln.split()[0] for n, ln in zip(names, lines) if ln.endswith(" commit")}
 
 
+def branch_heads(p: Project, branches: list[str]) -> dict[str, str] | None:
+    """{branch: its head commit} for the `branches` that name a commit here, in one `cat-file --batch-check`
+    (a sweep that ran `rev-parse` per branch made one git call per task). None when the read failed or
+    timed out: the caller then reads each head on its own."""
+    names = list(dict.fromkeys(b for b in branches if b and not any(c in b for c in "\n\r")))
+    if not names:
+        return {}
+    try:
+        out = gitmemo.run(["git", "-C", str(p.root), "cat-file", "--batch-check=%(objectname) %(objecttype)"],
+                          input="".join(f"{b}^{{commit}}\n" for b in names), capture_output=True, text=True,
+                          timeout=120, read=True)
+    except subprocess.TimeoutExpired:
+        return None
+    lines = (out.stdout or "").splitlines() if out.returncode == 0 else []
+    if len(lines) != len(names):
+        return None
+    return {b: ln.split()[0] for b, ln in zip(names, lines) if ln.endswith(" commit")}
+
+
 def _branch_head(p: Project, branch: str) -> str:
     for cand in (branch, f"origin/{branch}"):
         if head := _git(p.root, "rev-parse", "--verify", "--quiet", f"{cand}^{{commit}}", check=False):

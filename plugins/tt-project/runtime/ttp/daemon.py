@@ -1325,6 +1325,7 @@ class Daemon:
         self._unreviewed_swept = 0.0   # when sweep_unreviewed last ran
         self._unreviewed_at = 0   # the task sweep_unreviewed stopped at (time or budget): the next pass resumes after it
         self._unreviewed_every = float(REVIEW_SWEEP_EVERY_S)   # until its next pass (UNREVIEWED_BACKLOG_EVERY_S on a backlog)
+        self._unreviewed_seen: set[int] = set()   # the tasks this round of cut passes looked at (sweep_unreviewed)
         self._unreviewed_why: dict[int, str] = {}   # urgent or owed tasks' last skip reason sweep_unreviewed logged
         self._continues_checked = 0.0   # when check_unqueued_continues last ran
         self._stale_checked = 0.0   # when check_stale_duplicates last ran
@@ -2043,7 +2044,10 @@ class Daemon:
             return default
         if self._degraded.get(name):   # it kept overrunning: it sits out a few ticks (_step_degrade)
             self._degraded[name] -= 1
-            return default
+            # The unreviewed sweep with work left runs anyway: it resumes where it stopped, so sitting out
+            # would only leave finished changes unreviewed longer.
+            if not (name == "sweep_unreviewed" and self._unreviewed_pending()):
+                return default
         self._step_name = name
         self._step_began = self._step_mark = time.monotonic()
         self._step_holder, self._step_task, self._step_worst = "", None, (0.0, "", None)
@@ -8406,8 +8410,11 @@ class Daemon:
         # are not warmed by gitmemo. All git in this transaction ends within gitmemo.TX_GIT_S (_finish_tx).
         # One predicate, _code_change, gates the split above, this review, the fix check below and the
         # `changes` line: a code task, or a work task whose branch changes anything.
-        review = self._auto_review(dict(task, **upd), summary) \
-            if reviewable and not split and not requeued and not resplit and self._code_change(task) else None
+        # Its git reads get a short timeout of their own (gitmemo.FINISH_REVIEW_GIT_S): a slow one marks the
+        # review pending for the next tick (retry_unread_reviews), never the transaction's whole budget.
+        with gitmemo.bounded(gitmemo.FINISH_REVIEW_GIT_S):
+            review = self._auto_review(dict(task, **upd), summary) \
+                if reviewable and not split and not requeued and not resplit and self._code_change(task) else None
         # A fix of a failed review that adds no commit to the head that review saw leaves its re-review
         # nothing new to check: the re-review is blocked, never run on the same head, and the coordinator
         # decides.
@@ -18713,6 +18720,8 @@ class Daemon:
         tick after; one no longer done, in review or a code change is dropped. The review ids queued."""
         db, queued = self.p.db, []
         ids = db.kv(KV_REVIEW_UNREAD, [])
+        if ids and coord.next_task_slot(db, coord.task_cap(self.cfg, True), review=True) is not None:
+            return []   # the review cap is still full: they stay pending, no git read until it allows one
         for tid in (ids if isinstance(ids, list) else []):
             if queued and stepclock.over():
                 break
@@ -18726,6 +18735,19 @@ class Daemon:
                 queued.append(review[0])
                 log(self.p, f"task {tid}: queued review #{review[0]} on the tick after its diff read timed out")
         return queued
+
+    def _review_pending(self, tid: int) -> None:
+        """Mark task `tid`'s review pending (KV_REVIEW_UNREAD): retry_unread_reviews queues it on a later tick."""
+        ids = self.p.db.kv(KV_REVIEW_UNREAD, [])
+        self.p.db.set_kv(KV_REVIEW_UNREAD, sorted({*(ids if isinstance(ids, list) else []), tid}))
+
+    def _unreviewed_pending(self) -> bool:
+        """Whether the unreviewed sweep has work left: a pass cut short with tasks still to look at, or a review
+        pending a retry (KV_REVIEW_UNREAD, KV_REVIEW_RETRY). Such a sweep never sits out a degrade."""
+        if self._unreviewed_at:
+            return True
+        db = self.p.db
+        return bool(db.kv(KV_REVIEW_UNREAD, [])) or bool(db.kv_dict(KV_REVIEW_RETRY)[0])
 
     def sweep_unreviewed(self, force: bool = False) -> list[int]:
         """Model-free invariant backstop: a code task that is done, or has waited externally for
@@ -18771,7 +18793,10 @@ class Daemon:
             self._count_unreviewed(todo)
             todo, retry = self._read_retries(todo, now)
             if not todo:
+                self._unreviewed_at = 0
                 return []
+            # Every head in one git read (worktree.branch_heads); None (it failed) reads each on its own.
+            heads = worktree.branch_heads(self.p, [r["branch"] for r in todo])
             code = pushq.BranchIndex(db.q("SELECT id, branch, labels FROM tasks WHERE kind='code' "
                                           "AND branch IS NOT NULL AND branch!=''"))
             reviews = db.q("SELECT * FROM tasks WHERE kind='review' AND status!='cancelled' AND id>? ORDER BY id",
@@ -18793,6 +18818,11 @@ class Daemon:
         # A pass cut off (UNREVIEWED_PASS_S, the step's budget, or stopped mid-task) resumes after the task
         # it stopped at, wrapping round, so a slow early task never keeps the later ones from their turn.
         at, last = self._unreviewed_at, None
+        if not at:
+            self._unreviewed_seen = set()
+        # A pass stopped at the step's budget mid-task (StepBudgetSpent) resumes on the next tick, not a full
+        # interval later; an uncut pass sets the interval back below.
+        self._unreviewed_every = 0.0
         # A task whose review's diff read failed (_auto_review, KV_REVIEW_RETRY) goes first: a backlog behind
         # the per-pass cap once kept one unreviewed for 14 h.
         order = urgent.first([r for r in todo if r["id"] > at] + [r for r in todo if r["id"] <= at])
@@ -18800,13 +18830,19 @@ class Daemon:
             if len(done) - hot >= cap and not urgent.is_urgent(t) and t["id"] not in retry or last is not None and (
                     time.time() - now > UNREVIEWED_PASS_S or stepclock.over()):   # each pass gets one task further
                 self._unreviewed_at = at if last is None else last
-                if done:   # cut with more to look at after queuing one: a backlog, so look again sooner
-                    self._unreviewed_every = float(UNREVIEWED_BACKLOG_EVERY_S)
+                # Cut with more to look at: the next tick resumes after the task it stopped at (a time or
+                # budget cut), or soon after a cut at the per-pass cap (a backlog), never a full interval later.
+                # A round of cut passes that has looked at every task waits the full interval.
+                self._unreviewed_every = 0.0 if len(done) - hot < cap or urgent.is_urgent(t) or t["id"] in retry \
+                    else float(UNREVIEWED_BACKLOG_EVERY_S)
+                if self._unreviewed_every == 0.0 and {r["id"] for r in todo} <= self._unreviewed_seen:
+                    self._unreviewed_at, self._unreviewed_every = 0, float(REVIEW_SWEEP_EVERY_S)
                 break
             last = self._unreviewed_at = t["id"]   # kept if the step is stopped mid-task
+            self._unreviewed_seen.add(t["id"])
             try:
                 why = self._unreviewed_skip(t, reviews, rows, covers, code, live, ref, never,
-                                            0 if urgent.is_urgent(t) else waited, now)
+                                            0 if urgent.is_urgent(t) else waited, now, heads)
                 if why and self._unreviewed_why.get(t["id"]) != why and (
                         urgent.is_urgent(t) or obligations.owned_open(db, t["id"])):
                     self._unreviewed_why[t["id"]] = why
@@ -18830,6 +18866,7 @@ class Daemon:
                       f"review #{review[0]} queued by the daemon.", "handled", t["id"]))
         else:
             self._unreviewed_at = 0   # an uncut pass leaves no place to resume at
+            self._unreviewed_every = float(REVIEW_SWEEP_EVERY_S)
         return done
 
     def _read_retries(self, todo: list[dict], now: float) -> tuple[list[dict], set[int]]:
@@ -18902,9 +18939,10 @@ class Daemon:
         db.set_kv(KV_UNREVIEWED_COUNTED, __version__)
 
     def _unreviewed_skip(self, t: dict, reviews: list[dict], rows: dict, covers: dict, code, live: list[dict],
-                         ref: str, never: str, waited: float, now: float) -> str:
+                         ref: str, never: str, waited: float, now: float, heads: dict | None = None) -> str:
         """Why sweep_unreviewed leaves code task `t` alone, or "" when it needs its review now. Cheap
-        record checks first, git last."""
+        record checks first, git last. `heads` ({branch: head}, worktree.branch_heads) is the pass's one
+        batched read of every head; None reads this task's head on its own."""
         db, d, tid = self.p.db, self.cfg.get("delivery") or {}, t["id"]
         result = load_result(t["result"])
         if t["status"] == "queued":
@@ -18935,7 +18973,8 @@ class Daemon:
                 for x in db.q("SELECT * FROM tasks WHERE labels LIKE ? AND status!='cancelled'",
                               (f'%"continues:{tid}"%',))):
             return "a later hop of its split chain carries it"
-        tip = worktree._git(self.p.root, "rev-parse", "--verify", "--quiet", f"{t['branch']}^{{commit}}", check=False)
+        tip = heads.get(t["branch"], "") if heads is not None else worktree._git(
+            self.p.root, "rev-parse", "--verify", "--quiet", f"{t['branch']}^{{commit}}", check=False)
         if not tip:
             return "no branch"
         if gone := self._cancelled_review(t, tip):
@@ -19162,14 +19201,20 @@ class Daemon:
             # A git read cut off by the step budget or a slow disk says nothing about the change: the next
             # tick reads it again (retry_unread_reviews), not the unreviewed sweep hours later.
             if add and isinstance(e, subprocess.TimeoutExpired):
-                ids = db.kv(KV_REVIEW_UNREAD, [])
-                db.set_kv(KV_REVIEW_UNREAD, sorted({*(ids if isinstance(ids, list) else []), task["id"]}))
+                self._review_pending(task["id"])
             if add and task.get("id"):   # the unreviewed sweep retries it first, outside its cap and age window
                 retry, _ = db.kv_dict(KV_REVIEW_RETRY)
                 retry.setdefault(str(task["id"]), time.time())
                 db.set_kv(KV_REVIEW_RETRY, retry)
             return None
-        if (not changes and not ext) or coord.next_task_slot(db, coord.task_cap(cfg, True), review=True) is not None:
+        if not changes and not ext:
+            return None
+        if coord.next_task_slot(db, coord.task_cap(cfg, True), review=True) is not None:
+            # The review cap is full: the review is pending, retried each tick until the cap allows it
+            # (retry_unread_reviews), not left to the unreviewed sweep's next pass.
+            if add and task.get("id"):
+                self._review_pending(task["id"])
+                log(self.p, f"task {task['id']}: review pending, the review cap is full; retried on the next tick")
             return None
         title = f"Review #{task['id']}: {task['title']}"[:200]
         dup = db.one("SELECT id FROM tasks WHERE title=? AND status NOT IN ('done','failed','cancelled')", (title,))

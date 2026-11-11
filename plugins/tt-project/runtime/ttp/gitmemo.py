@@ -56,6 +56,8 @@ _cap: contextvars.ContextVar[tuple[float, float | None, float] | None] = context
 
 TICK_GIT_S = 25.0   # one git read a daemon tick step makes, at most (Daemon._run_step)
 TX_GIT_S = 20.0     # all git a finish write transaction makes, together (Daemon._finish_tx)
+FINISH_REVIEW_GIT_S = 5.0   # each git read a finish makes to queue its review (Daemon._auto_review): a slow one
+#   leaves the review to the next tick (KV_REVIEW_UNREAD), never the finish transaction's whole budget
 HOLD_SLICE_S = 1.5  # live git one strict round of a finish transaction may run (strict())
 MAX_ROUNDS = 50     # rounds of one finish before its last, which never aborts (Daemon._finish_rounds)
 FINISH_WALL_S = 90.0    # nor past this long: the reads it learns between rounds share this wall too

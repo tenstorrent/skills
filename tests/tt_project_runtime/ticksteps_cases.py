@@ -2308,7 +2308,7 @@ def test_a_cut_unreviewed_pass_that_queued_a_review_looks_again_sooner(env, monk
     assert len(d.sweep_unreviewed()) == 1
     clock[0] += dmod.UNREVIEWED_BACKLOG_EVERY_S + 1
     assert len(d.sweep_unreviewed()) == 1, "a cut pass that queued a review runs again after the backlog period"
-    # A pass that queued none, though cut, waits the full period: no backlog of reviews to queue.
+    # The cut pass that looks at the last task left in the round ends it: the next waits the full period.
     monkeypatch.setattr(d, "_unreviewed_skip", lambda t, *a: "looked")
     clock[0] += dmod.UNREVIEWED_BACKLOG_EVERY_S + 1
     assert d.sweep_unreviewed() == []
@@ -2648,3 +2648,47 @@ def test_a_first_probe_verdict_past_the_step_budget_is_named_by_the_slow_step_ev
     d._run_step(d.probe_waiting, "probe_waiting")
     [ev] = p.db.q("SELECT * FROM events WHERE kind='tick_step_slow'")
     assert ev["task"] == tid and f"task #{tid}'s probe result" in ev["text"], ev["text"]
+
+
+def test_a_time_cut_unreviewed_pass_resumes_on_the_next_tick_until_the_round_is_done(env, monkeypatch):
+    """A pass cut at its time (or step) budget resumes after the task it stopped at on the very next tick,
+    never a full REVIEW_SWEEP_EVERY_S later; the pass that looks at the last task of the round ends it."""
+    p = make(env)
+    from ttp import daemon as dmod
+    d = dmod.Daemon(p.base)
+    old = time.time() - dmod.UNREVIEWED_GRACE_S - 60
+    tids = []
+    for n in range(3):
+        tid = p.db.add_task(f"work {n}", "edit it", kind="code", tier="light", origin="coordinator")
+        p.db.update_task(tid, status="done", branch=f"ttp/t{tid}-work-{n}")
+        p.db.x("UPDATE tasks SET updated=? WHERE id=?", (old, tid))
+        tids.append(tid)
+    seen = []
+    monkeypatch.setattr(d, "_unreviewed_skip", lambda t, *a: seen.append(t["id"]) or "looked")
+    monkeypatch.setattr(dmod, "UNREVIEWED_PASS_S", -1)   # spent after each task: one task a pass
+    clock = [time.time()]
+    monkeypatch.setattr(dmod.time, "time", lambda: clock[0])
+    for n in range(3):
+        d.sweep_unreviewed()
+        assert seen == tids[:n + 1], "a cut pass waited before resuming"
+    assert not d._unreviewed_at and d._unreviewed_every == dmod.REVIEW_SWEEP_EVERY_S
+    d.sweep_unreviewed()
+    assert seen == tids, "a finished round ran again before REVIEW_SWEEP_EVERY_S"
+
+
+def test_a_degraded_unreviewed_sweep_with_work_left_still_runs(env):
+    """A degraded step sits out a few ticks, but sweep_unreviewed with a cut pass to resume or a review
+    pending a retry runs anyway; with nothing pending it sits out like any step."""
+    p = make(env)
+    from ttp import daemon as dmod
+    d = dmod.Daemon(p.base)
+    ran = []
+    d._degraded["sweep_unreviewed"] = 3
+    d._run_step(lambda: ran.append(1), "sweep_unreviewed")
+    assert ran == [], "a degraded sweep with nothing pending ran"
+    p.db.set_kv(dmod.KV_REVIEW_UNREAD, [7])
+    d._run_step(lambda: ran.append(1), "sweep_unreviewed")
+    p.db.set_kv(dmod.KV_REVIEW_UNREAD, [])
+    d._unreviewed_at = 7
+    d._run_step(lambda: ran.append(1), "sweep_unreviewed")
+    assert ran == [1, 1] and not d._degraded["sweep_unreviewed"]
