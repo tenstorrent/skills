@@ -322,7 +322,8 @@ def test_throughput_measures_requeue_waits_by_reason_and_a_slow_checks_lane_gets
     rep = throughput.measure(p.db, p.config(), now=now, gates={})
     ck = _tp_lane(rep, "checks_slots")
     assert (ck["count"], ck["waiting_now"], ck["p1_p90_s"]) == (4, 1, 4 * 3600) and ck["slow"]
-    assert (_tp_lane(rep, "own_job")["count"], _tp_lane(rep, "retry_wait")["count"]) == (2, 3)
+    # The slot log's wait ends at its grant: the minute from it to the next run goes on as a retry wait.
+    assert (_tp_lane(rep, "own_job")["count"], _tp_lane(rep, "retry_wait")["count"]) == (2, 4)
     assert _tp_lane(rep, "retry_wait")["waiting_now"] == 2
     assert "worker_slots" not in {ln["lane"] for ln in rep["lanes"] if ln["count"] and ln["lane"] != "dependency"} \
         or _tp_lane(rep, "worker_slots")["waiting_now"] == 0
@@ -1106,7 +1107,8 @@ def test_throughput_checks_wait_is_judged_at_the_cap_then_and_a_one_at_a_time_qu
     idle = _tp_checks_requeue(p, d, monkeypatch, tmp_path, "fewer than ran", w3, 999)
     _tp_checks_run(p, monkeypatch, w3 - 800, 820)
     _tp_checks_run(p, monkeypatch, w3 - 750, 1500)
-    _tp_slot_wait(p, monkeypatch, idle, w3 + 40, w3 + 600)
+    # Granted at w3+700: the wait ends at its grant, so it stays over the p1 threshold.
+    _tp_slot_wait(p, monkeypatch, idle, w3 + 40, w3 + 700)
     # Two runs at once for long, a third (an urgent run past the cap) for less than SUSTAIN_S: the cap
     # then was 2, so a wait behind two runs is at the limit.
     w4 = now - 3600
@@ -1116,7 +1118,7 @@ def test_throughput_checks_wait_is_judged_at_the_cap_then_and_a_one_at_a_time_qu
     _tp_checks_run(p, monkeypatch, w4 - 900, 1500)
     _tp_checks_run(p, monkeypatch, w4 - 850, 1500)
     _tp_checks_run(p, monkeypatch, w4 - 300, 200)
-    _tp_slot_wait(p, monkeypatch, peak, w4, w4 + 500)
+    _tp_slot_wait(p, monkeypatch, peak, w4, w4 + 990)
     ck = _tp_lane(throughput.measure(p.db, p.config(), now=now, gates={}), "checks_slots")
     assert (ck["count"], ck["at_limit"], ck["serialized"], ck["idle"]) == (4, 2, 1, 1), ck
 
@@ -1175,7 +1177,8 @@ def test_throughput_judges_a_checks_wait_by_the_cap_its_record_stored_else_the_e
     for s0 in (w3 + 30, w3 + 35):
         _tp_checks_run(p, monkeypatch, s0, 1500)
     p.set_config("checks.test_project_max", 2)
-    assert _tp_slot_grant(p, monkeypatch, tmp_path, capped, w3 + 40, w3 + 600)["cap"] == 2
+    # Granted at w3+700: the wait ends at its grant, so it stays over the p1 threshold.
+    assert _tp_slot_grant(p, monkeypatch, tmp_path, capped, w3 + 40, w3 + 700)["cap"] == 2
     p.set_config("checks.test_project_max", 4)
     ck = _tp_lane(throughput.measure(p.db, p.config(), now=now, gates={}), "checks_slots")
     assert (ck["count"], ck["at_limit"], ck["idle"]) == (3, 2, 1), ck
@@ -1682,3 +1685,44 @@ def test_throughput_a_true_own_lane_wait_still_books_own(env, monkeypatch, tmp_p
     ck = _tp_lane(throughput.measure(p.db, p.config(), now=now, gates={}), "checks_slots")
     assert ck["slow"] and ck["held_by"]["own"] == 2, ck
     assert "holder" not in ck and ck["limit_key"] == "checks.slots", ck
+
+
+def test_throughput_checks_waits_on_host_sized_lanes_name_the_host_load_not_checks_slots(env, monkeypatch, tmp_path):
+    """Note 2d305145f4bb498c: with checks.slots unset the repository's lanes are what the host's load fits
+    (checklane.capacity), so a wait its own lanes held names the host's load as its holder and plan()
+    proposes no checks.slots raise."""
+    from ttp import checkcap, throughput
+    from ttp.daemon import Daemon
+    monkeypatch.setattr(checkcap, "grants_dir", lambda: tmp_path / "host")
+    monkeypatch.delenv("TTP_CHECKS_SLOTS", raising=False)
+    p = make(env)
+    d, now = Daemon(p.base), time.time()
+    p.set_config("checks.test_project_max", 3)
+    for i, w0 in enumerate((now - 5 * 3600, now - 3 * 3600)):
+        t = _tp_checks_requeue(p, d, monkeypatch, tmp_path, f"lane wait {i}", w0, 700)
+        _tp_slot_wait(p, monkeypatch, t, w0, w0 + 690, cap=3, lane_at=w0 + 690)
+    rep = throughput.measure(p.db, p.config(), now=now, gates={})
+    ck = _tp_lane(rep, "checks_slots")
+    assert ck["count"] == 2 and (ck["holder"], ck["limit_key"]) == (throughput.HOST_CORES, None), ck
+    assert "checks.slots is unset" in ck["note"], ck
+    changes, _ = throughput.plan(p.db, p.config(), rep)
+    assert not [c for c in changes if c["key"] == "checks.slots"], changes
+
+
+def test_throughput_checks_waits_behind_a_one_at_a_time_wrapper_lock_are_serialized_not_at_limit(
+        env, monkeypatch, tmp_path):
+    """Note 2d305145f4bb498c: the project's checks go behind a one-at-a-time lock (checks.wrap_cmd). A wait
+    queued while three of its checks ran at the cap of 3 is serialized: no cap raise frees it."""
+    from ttp import throughput
+    from ttp.daemon import Daemon
+    p = make(env)
+    p.set_config("checks.test_project_max", 3)
+    p.set_config("checks.wrap_cmd", ["flock", "/tmp/suite.lock"])
+    d, now = Daemon(p.base), time.time()
+    w1 = now - 3 * 3600
+    q = _tp_checks_requeue(p, d, monkeypatch, tmp_path, "behind the lock", w1, 999)
+    for _ in range(3):
+        _tp_checks_run(p, monkeypatch, w1 - 60, 1200)
+    _tp_slot_wait(p, monkeypatch, q, w1, w1 + 700)
+    ck = _tp_lane(throughput.measure(p.db, p.config(), now=now, gates={}), "checks_slots")
+    assert (ck["count"], ck["at_limit"], ck["serialized"]) == (1, 0, 1), ck

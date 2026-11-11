@@ -60,7 +60,10 @@ to its first run, or to now for one still queued:
   checks wait only up to that grant and the rest goes on by its reason as below (its own checks run, its
   retry condition, a worker slot), unless that rest is under the lane's threshold;
   `serialized` when they ran one at a time back to back, each start and the grant within SERIAL_S of a
-  run's end, a queue served one run at a time rather than the cap; a wait over threshold neither is
+  run's end, a queue served one run at a time rather than the cap, and every wait behind a one-at-a-time
+  wrapper lock (checks.wrap_cmd, or an event naming such a lane: a script's own lock goes there); a checks
+  wait ends at its last slot grant; with checks.slots unset the lanes are host-sized (checklane.capacity), so
+  a wait its lanes held names the host's load as `holder`, never a checks.slots raise; a wait over threshold neither is
   `held_by` the host when its waits-log time before the grant, or its events' lane holders all waiting
   for a host-wide gate, show it: other projects' host test grants when another project's grant
   (checkcap.grant_records) fell inside it, else the host's free-cores gate; with none at the limit and
@@ -523,12 +526,15 @@ def measure(db: DB, cfg: dict, since_s: float = DAY, now: float | None = None, g
         ev_waits.setdefault(e["task"], []).append(e)
     slot_ev: dict[int, list[tuple[float, str]]] = {}
     slot_host: dict[int, list[tuple[float, bool | None]]] = {}   # each event: did the host hold its lane holders
+    slot_serial: dict[int, list[float]] = {}   # events naming a one-at-a-time wrapper lock's lane
     for e in db.q("SELECT ts, task, text FROM events WHERE kind='checks_slot_wait' AND task IS NOT NULL AND ts>?",
                   (t0 - DAY,)):
         key = slot_limit(e["text"] or "")
         slot_ev.setdefault(e["task"], []).append((float(e["ts"]), key))
         # an event about to start ("": no cap) names no holder: ck_holder skips it
         slot_host.setdefault(e["task"], []).append((float(e["ts"]), host_held(e["text"] or "") if key else None))
+        if "one at a time" in (e["text"] or ""):
+            slot_serial.setdefault(e["task"], []).append(float(e["ts"]))
     slot_log: dict[int, list[tuple[float, float]]] = {}
     slot_cap: dict[tuple[int, float, float], int] = {}   # the cap in force a record stored at its grant
     slot_lane: dict[tuple[int, float, float], float] = {}   # when the record's run got its repository's lane
@@ -590,9 +596,11 @@ def measure(db: DB, cfg: dict, since_s: float = DAY, now: float | None = None, g
         at most checklane.project_cap (a cap raised since then is not today's); a record that stored the
         cap in force at its grant ("cap", 0: none) is judged by that, not the estimate; "serialized" when
         they ran one at a time back to back, each start and the grant within
-        SERIAL_S of a run's end (a queue served one run at a time, not the cap); else "idle". No grant
+        SERIAL_S of a run's end (a queue served one run at a time, not the cap), or when its runs go behind
+        a one-at-a-time wrapper lock (checks.wrap_cmd, or a checks_slot_wait event in the wait naming such a
+        lane: a script's own lock, declared there), which no cap raise frees; else "idle". No grant
         record, or one granted at once: not at the limit."""
-        serial = False
+        serial = bool(_cfg(cfg, "checks.wrap_cmd", None)) or any(w0 <= x <= w1 for x in slot_serial.get(task, ()))
         for q, g in slot_log.get(task, ()):
             a, b = max(q, w0), min(g, w1)
             cap = slot_cap.get((task, q, g), cap_n)
@@ -602,7 +610,7 @@ def measure(db: DB, cfg: dict, since_s: float = DAY, now: float | None = None, g
                 seen = max((ck_held(x0, x1) for x0, x1 in busy if x0 <= q and g <= x1), default=0)
                 cap = min(cap, seen) if seen >= 2 else cap
             k = ck_peak(a, b)
-            if k >= cap:
+            if k >= cap and not serial:
                 return "at_limit"
             ends = [e for _, e in ck_runs]
             serial = serial or (k <= 1 and all(any(abs(x - e) <= SERIAL_S for e in ends)
@@ -902,6 +910,12 @@ def measure(db: DB, cfg: dict, since_s: float = DAY, now: float | None = None, g
     elif host:
         ck_lane["note"] += "".join(f"; {n} wait(s) {HELD_NOTE[k].split(':')[0]}, not by the project's limits"
                                    for k, n in host.items())
+    # With checks.slots unset its lanes are what the host's load and memory fit (checklane.capacity): the
+    # host's load held such a wait, and raising checks.slots is no fix the lane names.
+    if ck_lane["limit_key"] == SLOTS_KEY and not ck_lane.get("holder") and ck_lane["waits"] \
+            and lanes_n is not None and checklane._explicit_slots(cfg) is None:
+        ck_lane.update(holder=HOST_CORES, held_text=HOLDERS[HOST_CORES], limit_key=None, limit=None,
+                       note=HELD_NOTE[HOST_CORES] + "; checks.slots is unset, so the host's load sized its lanes")
     # A set test-worker budget (checks.test_project_slots: the project's, the account's or its environment
     # variable) that admits fewer full runs at once than both checks limits holds the lane instead: each
     # full run starts with at least checks.test_run_min workers (testslots.run_min), so raising
