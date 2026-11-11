@@ -12553,7 +12553,7 @@ def _undo_template_rollback(h: Path, ident: list[str]) -> str:
     from .runtimeload import ROLLBACK_RE
 
     def git(*args: str) -> subprocess.CompletedProcess:
-        return subprocess.run(["git", "-C", str(h), *args], capture_output=True, text=True)
+        return gitmemo.run(["git", "-C", str(h), *args], capture_output=True, text=True)
 
     last = git("log", "-1", "--format=%H%x00%s", "HEAD", "--", "runtime").stdout.strip()
     sha, _, subject = last.partition("\0")

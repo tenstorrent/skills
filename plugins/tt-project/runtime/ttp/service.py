@@ -518,6 +518,7 @@ def _reload_agent(label: str, plist: Path, inside: bool) -> subprocess.Completed
     From inside that agent's job (`inside`) both run in a new session, which outlives the bootout."""
     target, domain = f"gui/{os.getuid()}/{label}", f"gui/{os.getuid()}"
     if inside:
+        # own session: the bootstrap must outlive the bootout of the agent job that runs it
         subprocess.Popen(["sh", "-c", f"launchctl bootout {shlex.quote(target)}; "
                                       f"launchctl bootstrap {domain} {shlex.quote(str(plist))}"],
                          start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)

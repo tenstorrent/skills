@@ -5585,7 +5585,6 @@ def stop_own(p: Project, marker: Path, why: str = "") -> int:
     after STOP_TERM_S only while it has not begun a `git push`. A push that began one is never signalled
     and keeps its marker: NOT_STOPPED. Only what the push itself held is freed (its process ends, so its
     run lock and any branch lock go with it); a push that already ended is left as it is (0)."""
-    from . import detach as job, jobstop   # `detach` here is this module's own function
     say = lambda m: print(f"ttp push: {m}", file=sys.stderr)   # noqa: E731
     marker = Path(marker).expanduser().resolve()
     folder = (p.state / DETACHED).resolve()
@@ -5642,7 +5641,7 @@ def stop_own(p: Project, marker: Path, why: str = "") -> int:
             if locks.any_free([run_lock]):
                 break
         for sig in sent:
-            job.signalled(marker, sig, pid, "push.stop_own", why, by="push", group=sig == signal.SIGKILL,
+            detachjob.signalled(marker, sig, pid, "push.stop_own", why, by="push", group=sig == signal.SIGKILL,
                              state=p.state, task=int(me))
         if not locks.any_free([run_lock]):
             say(f"not stopped: the push {marker.stem} " + ("began its git push, which is never interrupted"
@@ -5678,6 +5677,7 @@ def status_lines(p: Project) -> list[str]:
 # never inside a function: a push that outlives an upgrade of runtime/ must not import a newer batch
 # that calls into this older push (after_push would fail on a missing attribute). cli and pushpass
 # (for `ttp push --own` reusing a `ttp checks` pass) likewise: pushpass imports push at import time.
-from . import batch, cli, pushpass, verdictcarry  # noqa: E402
+from . import batch, cli, jobstop, pushpass, verdictcarry  # noqa: E402
+from . import detach as detachjob  # noqa: E402  (this module has its own `detach` function)
 
 # --- project-local imports below ---
