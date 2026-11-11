@@ -4385,7 +4385,7 @@ def cmd_checks(a) -> None:
         spill_ok = not checkspill.all_off(no_spill) and checkspill.spillable(todo, cfg)
         if p and todo and not spill_ok and checkspill.hosts(cfg):   # `ttp checks status` says why it stays here
             checkspill.note_here(p.name, "kept off every spill host" if checkspill.all_off(no_spill) else
-                                 "its checks cannot spill (an agent CLI, \"host\": \"local\" or a wrapper)")
+                                 checkspill.here_why(todo, cfg))
         fresh_ok = not a.fresh
         slot = None
         light = bool(todo) and checklane.all_light(todo, cfg, mine + [h for _, h in held] if getattr(a, "light", False) else ())
@@ -4447,6 +4447,11 @@ def cmd_checks(a) -> None:
             for c in todo if p and not slurm else []:   # each start checks the host is still listed (checkspill.off_list)
                 if getattr(c, "spill_host", "") == spilled.host:
                     c.spill_project = str(p.base)
+            for c in todo:   # a check split off to run here says why (checkspill.why_here)
+                if not push.remote_host(c) and (why := checkspill.why_here(c, cfg)):
+                    said = f"{str(c)[:120]} runs here, not on {spilled.host}: {why}"
+                    print(f"ttp checks: {said}", flush=True)
+                    out.write(f"ttp checks: {said}\n")
             for c in todo if slurm else []:
                 if getattr(c, "spill_host", ""):   # a check split off to run here stays off Slurm
                     c.slurm, c.time_min = slurm, minutes

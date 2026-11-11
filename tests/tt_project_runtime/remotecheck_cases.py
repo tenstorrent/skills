@@ -2263,6 +2263,44 @@ def test_a_check_naming_a_path_of_this_machine_never_spills_and_splits_off_to_ru
     assert push.remote_host(out[0]) == "check-host-a" and push.remote_host(out[1]) == "" and push.where(out[1]) == ""
 
 
+def test_a_check_kept_here_for_a_path_of_this_machine_says_why_in_the_run_log_and_status(env, tmp_path, monkeypatch):
+    """A check running a script of this machine by absolute path (outside the checkout and the system folders,
+    as a project's harness scanner: its Slurm jobs ended 127) runs here while the rest of its run spills, and
+    the run's log says so and why; a run that cannot spill names each check that keeps it here and its reason
+    for `ttp checks status` (checkspill.here_why)."""
+    from ttp import checkspill, cli, push
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a"])
+    monkeypatch.setattr(checkspill, "_SYSTEM_DIRS", tuple(d for d in checkspill._SYSTEM_DIRS
+                                                        if not str(tmp_path).startswith(d)))   # tmp under /dev/shm
+    scan = tmp_path / "harness-bin" / "scan"
+    scan.parent.mkdir()
+    scan.write_text("#!/bin/sh\necho scanned\n")
+    scan.chmod(0o755)
+    log = tmp_path / "where.log"
+    test = f"pwd >> {log}"
+    p.set_config("delivery.push_checks", [test, str(scan)])
+    lane = _spill_lane(p, repo)
+    try:
+        cli.main(["checks", "--fresh"])
+    finally:
+        lane.close()
+    rec = json.loads((run / "checks.json").read_text())
+    assert rec["passed"] is True and rec["spilled_to"] == "check-host-a", rec
+    text = (run / "checks.log").read_text()
+    assert f"{scan} runs here, not on check-host-a: it names a path of this machine" in text, text
+    assert f"{test} runs here" not in text and "/ttp-check." in log.read_text()
+    assert checkspill.why_here(push.check_list([str(scan)])[0]).startswith("it names a path of this machine")
+    assert checkspill.why_here(push.check_list([test])[0]) == ""
+    suite = "python3 -m pytest -q --rootdir=/srv/proj tests/"
+    why = checkspill.here_why(push.check_list([suite, "make lint"]))
+    assert why.startswith("its checks cannot spill (") and suite in why and "path of this machine" in why, why
+    assert "make lint" not in why, "a check that may spill is not named"
+    assert checkspill.here_why(push.check_list(["make lint", str(scan)])) == "", "a split run spills"
+    for c, said in (("claude plugin validate . --strict", "agent CLI"), ({"run": "make lint", "host": "local"},
+                    '"host": "local"'), ({"run": "make lint", "spill": False}, '"spill": false')):
+        assert said in checkspill.why_here(push.check_list([c])[0]), c
+
+
 def test_a_shell_c_script_running_a_test_suite_counts_as_a_test_suite():
     """checklane.run_class reads a shell's -c script as checkspill.needs_cli does: `sh -c 'pytest ... &&
     claude ...'` is a test suite, as the same chain is unwrapped."""

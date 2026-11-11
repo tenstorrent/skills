@@ -828,6 +828,41 @@ def check_spills(c: Any, cfg: dict | None = None) -> bool:
     return bool(remote_wrap) or wrapped_ok(cfg) or not getattr(c, "wrap", ())
 
 
+def why_here(c: Any, cfg: dict | None = None) -> str:
+    """Why check `c` may not spill (check_spills false), for the run's log and `ttp checks status`; "" when
+    it may. Model-free, read in check_spills' order."""
+    from . import cleantree, push
+    opt = getattr(c, "spill", None)
+    if opt is False or getattr(c, "keep_here", False):
+        return 'it says "spill": false'
+    if push.remote_host(c):
+        return f"it runs on its own host {push.remote_host(c)}"
+    if cleantree.authoring(c):
+        return 'it runs in the authoring worktree ("cwd": "authoring")'
+    if opt is not True:
+        if getattr(c, "host", "") == remotecheck.LOCAL:
+            return 'it says "host": "local"'
+        if needs_cli(c):
+            return "it runs an agent CLI, which spill hosts lack"
+        if needs_history(c):
+            return "it reads commits with git, which the one-commit copy there lacks"
+    if host_path(c):
+        return ("it names a path of this machine (outside the system folders), which a spill host or Slurm "
+                "node, given a copy of the commit only, lacks")
+    if check_spills(c, cfg):
+        return ""
+    return "it runs behind a wrapper that has no spill wrapper (checks.spill_wrap_cmd) for spill hosts"
+
+
+def here_why(cmds: list, cfg: dict | None = None) -> str:
+    """Why a run of `cmds` stays on this machine (spillable false): each check that may not spill and its
+    reason (why_here), else that none may; "" when it may spill."""
+    if spillable(cmds, cfg):
+        return ""
+    whys = [f"{str(c)[:80]}: {w}" for c in cmds if (w := why_here(c, cfg))]
+    return "its checks cannot spill (" + ("; ".join(whys[:3]) if whys else "none may") + ")"
+
+
 def needs_cli(c: Any) -> bool:
     """Whether a simple command of check `c` runs an agent CLI (AGENT_CLIS) after its wrappers, or in a
     shell's -c script; a line that does not parse counts (it stays here). A script file that runs one is
@@ -1820,7 +1855,7 @@ def spill_run(p, cfg: dict, cmds: list, tell, what: str = "", off: str = "", why
         return None, cmds
     why = ("spill first is off (delivery." + FIRST_KEY + ")" if not first(cfg) else
            "kept off every spill host" if all_off(off) else
-           "" if spillable(cmds, cfg) else "its checks cannot spill (an agent CLI, \"host\": \"local\" or a wrapper)")
+           here_why(cmds, cfg))
     if why:
         note_here(p.name, why, what)
         return None, cmds
