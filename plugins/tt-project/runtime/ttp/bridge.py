@@ -85,7 +85,8 @@ def parse(data: dict) -> dict:
     ("interface": this computer reaches the target only bound to that interface; see bridge_relay); a direct
     one: {"name", "aliases", "user", "target", "host_key_alias"}. A box's optional "hold_check": a command on
     the box, run as `<it> %n %h`, exiting 0 for a host someone holds (its refusal is a proxy set further down,
-    which the block then leaves in place). (the last two optional: the HostName to dial
+    which the block then leaves in place) and 1 for a free one; any other exit (a missing or broken check)
+    counts as held, so the check can only keep a hold, never lift one). (the last two optional: the HostName to dial
     and the known-hosts name to check it by, for a host whose older config entries elsewhere name others).
     Raises BadConfig naming the first problem."""
     if not isinstance(data, dict):
@@ -295,7 +296,8 @@ def render_block(cfg: dict, box: str) -> str:
     if hold:   # the proxy goes off only for a host its hold check does not hold, so a hold keeps refusing
         names = [n for a in cfg["boxes"][box]["agents"].values() for h in a["forward"] for n in [h["name"], *h["aliases"]]]
         if names:
-            lines += ["", f"Match originalhost {','.join(names)} !exec \"{hold} %n %h\"", PROXY_NONE]
+            # only a clear "not held" (exit 1) lifts the proxy: a missing or failing check keeps the hold
+            lines += ["", f"Match originalhost {','.join(names)} exec \"sh -c '{hold} %n %h; [ $? -eq 1 ]'\"", PROXY_NONE]
     block = "\n".join(lines + ["", "Match all", END]) + "\n"
     check_block(block, allowed)
     return block

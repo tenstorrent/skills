@@ -67,7 +67,8 @@ def test_bridge_hold_check_keeps_a_held_host_refused():
     fwd = block[block.index("Host build-a"):block.index("Host build-b")]
     assert "ProxyCommand" not in fwd
     tail = block[block.index("Match originalhost"):]
-    assert tail.startswith('Match originalhost build-a,') and '!exec "/opt/hold/ssh-hold-match %n %h"\n  ProxyCommand none\n' in tail
+    assert tail.startswith('Match originalhost build-a,') and \
+        'exec "sh -c \'/opt/hold/ssh-hold-match %n %h; [ $? -eq 1 ]\'"\n  ProxyCommand none\n' in tail
     for bad in ("relative/hold", "/opt/x; rm", '/opt/"x"'):
         with pytest.raises(bridge.BadConfig):
             bridge.parse({"boxes": {"b": {"hold_check": bad, "agents": {"a": {"agent": "env",
@@ -160,6 +161,39 @@ def test_bridge_probe_reads_agents_ports_and_stray_files():
                  "ports": {2301: True, 2302: False}, "other_files": ["id_ed25519"]}
     script = bridge.probe_script(_bridge_cfg(), "box-1")
     assert script.startswith("bash -c ") and "/dev/tcp/127.0.0.1/2301" in script and "ssh-add -l" in script
+
+
+def test_bridge_hold_check_lifts_the_refusing_proxy_only_on_a_clear_not_held(tmp_path):
+    # cells: hold-check-fail-closed
+    # ssh itself reads the block (ssh -G, no connection, a scratch home and config): exit 1 lifts the older
+    # entry's refusing proxy; exit 0 (held), a failing check and a missing one all keep it
+    import shutil
+    import subprocess
+    import pytest
+    from ttp import bridge
+    if not shutil.which("ssh"):
+        pytest.skip("no ssh client")
+    home = tmp_path / "h"
+    home.mkdir()
+    check = tmp_path / "hold-check"
+    cfg = _bridge_cfg()
+    cfg["boxes"]["box-1"]["hold_check"] = str(check)
+    conf = tmp_path / "config"
+    conf.write_text(bridge.render_block(cfg, "box-1") + "\nHost build-a\n  ProxyCommand false held\n")
+    env = {"HOME": str(home), "PATH": os.environ.get("PATH", "/usr/bin:/bin"), "SHELL": "/bin/sh"}
+
+    def proxy() -> str:
+        r = subprocess.run(["ssh", "-G", "-F", str(conf), "build-a"], capture_output=True, text=True, env=env, timeout=30)
+        assert r.returncode == 0, r.stderr
+        return next((ln.split(None, 1)[1] for ln in r.stdout.splitlines() if ln.startswith("proxycommand ")), "")
+
+    for rc, held in ((1, False), (0, True), (2, True), (None, True)):
+        if rc is None:
+            check.unlink()
+        else:
+            check.write_text(f"#!/bin/sh\nexit {rc}\n")
+            check.chmod(0o755)
+        assert (proxy() == "false held") is held, rc
 
 
 def test_bridge_example_config_parses_with_placeholder_hosts_only():

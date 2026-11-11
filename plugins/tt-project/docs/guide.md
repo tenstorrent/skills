@@ -3406,7 +3406,12 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   - The box's `~/.ssh/config` gets one marked block at the top, written after a backup with the
     rest of the file kept. It holds a `Host` entry per host with its `127.0.0.1` port and
     `IdentityAgent ~/.ssh/tt-agent/<agent>.sock`, and nothing else. The tool refuses a block with an
-    `IdentityFile`, key text or a proxy.
+    `IdentityFile`, key text or a proxy; its one proxy line, `ProxyCommand none`, turns off an older
+    entry's proxy for the names it forwards.
+  - A box's optional `hold_check` (an absolute path on the box, run as `<it> %n %h`) keeps a host
+    someone holds refused: it exits 0 for a held host and 1 for a free one, and only that 1 lifts
+    the older entry's refusing proxy. A missing or failing check counts as held, so the check can
+    keep a hold but never lift one.
   - A project on the box just runs `ssh <host>` or `git` over ssh as usual.
   - It fails closed. While the workstation sleeps or its session is down, the forwards are closed
     and the link dangles, so those logins fail. A run that needs them waits or hands off.
