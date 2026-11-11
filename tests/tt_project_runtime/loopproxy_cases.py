@@ -76,9 +76,41 @@ def test_loopproxy_script_sources_an_inherited_env_file_after_its_rewrite(tmp_pa
 
 def test_loopproxy_env_file_keeps_an_inherited_one():
     from ttp.loopproxy import PREV_ENV, SCRIPT, env_file
-    assert env_file({}) == {"CLAUDE_ENV_FILE": str(SCRIPT)}
+    assert env_file({}) == {"CLAUDE_ENV_FILE": str(SCRIPT), PREV_ENV: ""}
     assert env_file({"CLAUDE_ENV_FILE": "/x/env.sh"}) == {"CLAUDE_ENV_FILE": str(SCRIPT), PREV_ENV: "/x/env.sh"}
-    assert env_file({"CLAUDE_ENV_FILE": str(SCRIPT)}) == {"CLAUDE_ENV_FILE": str(SCRIPT)}
+    assert env_file({"CLAUDE_ENV_FILE": str(SCRIPT)}) == {"CLAUDE_ENV_FILE": str(SCRIPT), PREV_ENV: ""}
+
+
+def test_loopproxy_env_file_never_chains_to_another_projects_copy():
+    """A daemon started from another project's worker shell inherits that project's CLAUDE_ENV_FILE (its
+    own loopproxy.sh) and PREV_ENV naming the same file: chaining to it made every worker Bash call
+    source that copy forever (exit 1, no output). Another copy is skipped for the file it chains to;
+    the inherited PREV_ENV is always overridden."""
+    from ttp.loopproxy import PREV_ENV, SCRIPT, env_file
+    other = "/other/project/tt-project/harness/runtime/ttp/loopproxy.sh"
+    assert env_file({"CLAUDE_ENV_FILE": other, PREV_ENV: other}) == {"CLAUDE_ENV_FILE": str(SCRIPT), PREV_ENV: ""}
+    assert env_file({"CLAUDE_ENV_FILE": other, PREV_ENV: "/x/env.sh"}) == \
+        {"CLAUDE_ENV_FILE": str(SCRIPT), PREV_ENV: "/x/env.sh"}
+    assert env_file({PREV_ENV: other}) == {"CLAUDE_ENV_FILE": str(SCRIPT), PREV_ENV: ""}
+
+
+@pytest.mark.parametrize("shell", ["bash", "dash"])
+def test_loopproxy_script_never_sources_itself_forever(tmp_path, shell):
+    """PREV_ENV naming this script, or another copy whose own PREV_ENV is the same file, ends after one
+    pass: the variable is unset while the previous file runs, and restored afterwards."""
+    if not shutil.which(shell):
+        pytest.skip(f"no {shell}")
+    from ttp.loopproxy import PREV_ENV, SCRIPT
+    other = tmp_path / "ttp" / "loopproxy.sh"
+    other.parent.mkdir()
+    other.write_text(SCRIPT.read_text())
+    for prev in (str(SCRIPT), str(other)):
+        got = _sourced(shell, {"HTTPS_PROXY": "http://localhost:3128", PREV_ENV: prev})
+        assert got["HTTPS_PROXY"] == "http://127.0.0.1:3128"
+        out = subprocess.run([shell, "-c", f'. "$1"; printf "%s" "${{{PREV_ENV}-}}"', "sh", str(SCRIPT)],
+                             capture_output=True, text=True, env={"PATH": os.environ["PATH"], PREV_ENV: prev},
+                             timeout=30)
+        assert out.returncode == 0 and out.stdout == prev, out.stderr[-500:]
 
 
 def test_loopproxy_claude_worker_env_names_the_script(monkeypatch):

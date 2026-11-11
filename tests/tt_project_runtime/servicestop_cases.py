@@ -563,3 +563,31 @@ def test_every_restart_route_outside_launchd_starts_the_daemon_module(env, monke
     assert argv[:2] == ["sh", "-c"] and daemon in argv[2], argv
     assert service.daemon_argv(p)[1:3] == ["-m", "ttp.daemon"]
     assert all(daemon in line for line in service._cron_lines(p))
+
+
+def test_a_hand_started_daemon_never_inherits_its_starters_run_env(env, monkeypatch):
+    """A restart or upgrade run from another project's worker or coordinator shell starts this project's
+    daemon by hand (no service): it must not inherit that run's TTP_ variables (role, run id, project)
+    or its agent's per-command env file, as a service or cron start would not. An inherited
+    CLAUDE_ENV_FILE naming the starter's loopproxy.sh broke every Bash call of the new daemon's workers."""
+    from ttp import hoststate, service
+    p = make(env)
+    popen = []
+    monkeypatch.setattr(service.subprocess, "Popen", lambda argv, **kw: popen.append((argv, kw)))
+    leaked = {"TTP_ROLE": "reviewer", "TTP_RUN_ID": "16596", "TTP_PROJECT": "/other/tt-project",
+              "TTP_RUN_DIR": "/other/run", "CLAUDE_ENV_FILE": "/other/ttp/loopproxy.sh",
+              "TTP_PREV_CLAUDE_ENV_FILE": "/other/ttp/loopproxy.sh", "CLAUDECODE": "1",
+              "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1"}
+    for k, v in leaked.items():
+        monkeypatch.setenv(k, v)
+    monkeypatch.setenv("SSH_AUTH_SOCK", "/tmp/agent.sock")
+    monkeypatch.setenv(hoststate.MARKER, str(env["tmp"] / "hoststate"))
+    service._spawn(p)
+    [(argv, kw)] = popen
+    assert argv[:2] == ["sh", "-c"] and kw["start_new_session"] is True
+    assert not set(leaked) & set(kw["env"]), sorted(set(leaked) & set(kw["env"]))
+    assert kw["env"]["SSH_AUTH_SOCK"] == "/tmp/agent.sock"
+    assert kw["env"][hoststate.MARKER] == str(env["tmp"] / "hoststate")   # a test's fake host state stays
+    monkeypatch.setenv("TTP_HOME", str(env["tmp"] / "home"))
+    service._spawn(p)
+    assert popen[-1][1]["env"]["TTP_HOME"] == str(env["tmp"] / "home")   # a host-wide setting stays

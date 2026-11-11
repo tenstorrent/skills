@@ -78,12 +78,19 @@ def sandbox_only(env: dict) -> list[str]:
 
 def env_file(environ: dict) -> dict[str, str]:
     """CLAUDE_ENV_FILE naming loopproxy.sh, plus PREV_ENV naming the CLAUDE_ENV_FILE `environ` already
-    had (the script sources it after its own lines)."""
+    had (the script sources it after its own lines). A daemon started from another project's run inherits
+    that project's copy of this script and its PREV_ENV: a copy is never chained (it would source its
+    PREV_ENV, itself, forever), only the file it chained to. PREV_ENV is always set, so an inherited one
+    never survives."""
     prev = environ.get("CLAUDE_ENV_FILE") or ""
-    out = {"CLAUDE_ENV_FILE": str(SCRIPT)}
-    if prev and prev != str(SCRIPT):
-        out[PREV_ENV] = prev
-    return out
+    if _copy(prev):
+        prev = environ.get(PREV_ENV) or ""
+    return {"CLAUDE_ENV_FILE": str(SCRIPT), PREV_ENV: "" if _copy(prev) else prev}
+
+
+def _copy(path: str) -> bool:
+    """This script or any project's copy of it."""
+    return bool(path) and os.path.basename(path) == SCRIPT.name
 
 
 # Host loopback ports. The Linux Bash sandbox runs each command in its own network namespace (bwrap

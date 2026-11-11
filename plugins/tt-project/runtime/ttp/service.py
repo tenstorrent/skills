@@ -420,7 +420,25 @@ def _cron_lines(p: Project) -> list[str]:
 
 def _spawn(p: Project) -> None:
     subprocess.Popen(["sh", "-c", _cron_cmd(p)], start_new_session=True, stdout=subprocess.DEVNULL,
-                     stderr=subprocess.DEVNULL)
+                     stderr=subprocess.DEVNULL, env=_spawn_env())
+
+
+# A run's own variables: the agent's per-command env file and session markers (CLAUDECODE, CLAUDE_CODE_*).
+RUN_ENV = ("CLAUDE_ENV_FILE", "CLAUDECODE")
+RUN_ENV_PREFIXES = ("TTP_", "CLAUDE_CODE_")
+# Host-wide settings and test doubles a service start would see too.
+HOST_ENV = ("TTP_HOME", "TTP_HOST", hoststate.MARKER)
+HOST_ENV_PREFIXES = ("TTP_TEST_", "TTP_FAKE_")
+
+
+def _spawn_env() -> dict:
+    """The caller's env without the variables a run sets for itself (TTP_ROLE, TTP_RUN_ID, TTP_PROJECT, the
+    agent's CLAUDE_ENV_FILE...), as a service or cron start would have it: a restart or upgrade run from
+    another project's worker shell must not hand them to this project's daemon and its workers (an
+    inherited CLAUDE_ENV_FILE made every worker Bash call fail). Host settings and test doubles stay."""
+    return {k: v for k, v in os.environ.items()
+            if k in HOST_ENV or k.startswith(HOST_ENV_PREFIXES)
+            or not (k in RUN_ENV or k.startswith(RUN_ENV_PREFIXES))}
 
 
 def _cron_cmd(p: Project, argv: list[str] | None = None) -> str:

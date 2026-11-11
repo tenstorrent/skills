@@ -52,6 +52,11 @@ if [ -n "${TTP_LOOPBACK_PORTS-}" ] && [ -n "${TTP_HOST_NETNS-}" ] && [ -r /proc/
   done
 fi
 if [ -n "${TTP_PREV_CLAUDE_ENV_FILE-}" ] && [ -r "$TTP_PREV_CLAUDE_ENV_FILE" ]; then
-  . "$TTP_PREV_CLAUDE_ENV_FILE"
+  # Unset while it runs, so a previous file that is a copy of this script ends after one pass.
+  _ttp_p=$TTP_PREV_CLAUDE_ENV_FILE
+  unset TTP_PREV_CLAUDE_ENV_FILE
+  . "$_ttp_p"
+  TTP_PREV_CLAUDE_ENV_FILE=$_ttp_p; export TTP_PREV_CLAUDE_ENV_FILE
+  unset _ttp_p
 fi
 unset _ttp_v _ttp_x _ttp_s _ttp_r _ttp_a _ttp_u _ttp_h _ttp_l
