@@ -3204,3 +3204,115 @@ def test_coordsession_installed_docs_say_restart_resumes_and_full_context_compac
     for path in ("README.md", "skills/tt-project-harness/SKILL.md"):
         assert "resumes the same session" in texts[path] and "compacts in place" in texts[path], path
     assert "same session (coordsession.fail)" in texts["runtime/ttp/coordtools.py"]
+
+
+def _wc_wake(p, cost, ctx=150000, sent_chars=4000, tools=2):
+    """An ended resumed session wake costing `cost`, with its context, digest size and tool calls."""
+    rid = _cstat_run(p, time.time(), cost, session="resume", fc=ctx, tools=tools)
+    note = json.loads(p.db.one("SELECT note FROM runs WHERE id=?", (rid,))["note"])
+    note["turn"]["session"]["sent_chars"] = sent_chars
+    p.db.x("UPDATE runs SET note=? WHERE id=?", (json.dumps(note), rid))
+    return rid
+
+
+def test_wakecost_alarms_once_per_episode_on_the_median_names_the_cause_and_rearms(env):
+    """coordinator.wake_cost_alarm_usd (default 1.0): the median of the last 5 session wakes over it raises
+    one alarm naming the cause, asks the session to compact in place and to send a leaner digest; later
+    expensive wakes raise no second alarm; a median back under it ends the episode and clears both."""
+    from ttp import wakecost
+    p = make(env)
+    cfg, st = p.config(), {"id": "s1"}
+    assert wakecost.threshold(cfg) == 1.0
+    for c in (0.2, 3.0, 3.0, 3.0):   # fewer than 5 wakes: no verdict yet
+        _wc_wake(p, c)
+        st, text = wakecost.check(cfg, p.db, p.runs, st)
+        assert text == "" and "shrink" not in st
+    _wc_wake(p, 0.4)   # one cheap wake among dear ones: the median, not the last wake, decides
+    st, text = wakecost.check(cfg, p.db, p.runs, st)
+    assert "median of the last 5 wakes is $3.00" in text and "Cause: context tokens" in text, text
+    assert "150000 context tokens" in text and st["shrink"] and st["lean"]
+    st.pop("shrink")   # the compaction it asked for ran
+    for _ in range(3):
+        _wc_wake(p, 5.0)
+        st, text = wakecost.check(cfg, p.db, p.runs, st)
+        assert text == "" and st["lean"] and "shrink" not in st   # no alarm per wake, no compaction loop
+    _wc_wake(p, 5.0)
+    _wc_wake(p, 5.0)
+    st, _ = wakecost.check(cfg, p.db, p.runs, st)
+    st, text = wakecost.check(cfg, p.db, p.runs, st)
+    assert text == "" and st["shrink"]   # a whole further window still over: one more compaction
+    for _ in range(3):
+        _wc_wake(p, 0.3)
+        st, text = wakecost.check(cfg, p.db, p.runs, st)
+    assert text == "" and "shrink" not in st and "lean" not in st and not p.db.kv(wakecost.KEY)["alarmed"]
+    for _ in range(5):   # a new episode alarms again, naming its own cause
+        _wc_wake(p, 2.0, ctx=40000, sent_chars=4 * 30000)
+    assert "Cause: digest size" in wakecost.check(cfg, p.db, p.runs, {})[1]
+    p.db.set_kv(wakecost.KEY, {})
+    for _ in range(5):
+        _wc_wake(p, 2.0, tools=14)
+    assert "Cause: tool calls" in wakecost.check(cfg, p.db, p.runs, {})[1]
+    p.db.set_kv(wakecost.KEY, {})
+    assert wakecost.check({"coordinator": {"wake_cost_alarm_usd": 0}}, p.db, p.runs, {}) == ({}, "")
+    assert wakecost.threshold_of("off") == 0 and wakecost.threshold_of("2.5") == 2.5
+    with pytest.raises(ValueError):
+        wakecost.threshold_of("-1")
+
+
+def test_wakecost_shrink_compacts_the_same_session_in_place_once():
+    """A shrink request makes the next wake resume the same session as a compaction (never a new or
+    stateless one), lowers the agent's compaction switch to the session's size, and any compaction
+    ends it; a session too small to free anything is left alone."""
+    from types import SimpleNamespace
+    from ttp import coordsession as cs
+    st = _cs_state(context_tokens=150000, base_tokens=60000, shrink=True)
+    assert cs.decide(_cs_cfg(), st, "k1", "m", "high", lambda s: True, 0) == ("resume", "compact")
+    assert cs.limit(_cs_cfg(), st) == 150000 < cs.limit(_cs_cfg(), {**st, "shrink": False})
+    assert cs.decide(_cs_cfg(), {**st, "shrink": False}, "k1", "m", "high", lambda s: True, 0)[1] == "continued"
+    for small in ({"context_tokens": 70000}, {"compact_floor": 140000}):
+        assert cs.decide(_cs_cfg(), {**st, **small}, "k1", "m", "high", lambda s: True, 0)[1] == "continued"
+    usage = SimpleNamespace(input_tokens=1, cache_read_tokens=70000, cache_write_tokens=0, output_tokens=10,
+                            session_id="s1", extra={})
+    turn = {"mode": "resume", "why": "compact", "key": "k1", "model": "m", "effort": "high", "provider": "fake"}
+    got = cs.record(st, usage, "s1", turn, True, 1.0)
+    assert "shrink" not in got and got["id"] == "s1" and got["restore"]
+    assert cs.decide(_cs_cfg(), got, "k1", "m", "high", lambda s: True, 0) == ("resume", "continued")
+
+
+def test_wakecost_lean_digest_repeats_no_section_whose_only_change_is_an_age():
+    """While over the alarm ("lean"), a section that changed only in its ages counts as unchanged: one line
+    names it. Otherwise it goes whole, and a real change always does."""
+    from ttp import coordsession as cs
+    parts = lambda age, extra="": [("budget", "# STATE at 10:00\n## Project budget\n- ok"),
+                                   ("paused", f"## Paused resources (held)\n- box: paused {age} ago{extra}"),
+                                   ("events", "\n# NEW EVENTS\n- (none)")]
+    ack = cs.wake_digest("new", None, parts("5m"), parts("5m"), "s0", "s1", "g1")[1]
+    for lean, whole in ((False, True), (True, False)):
+        sent, _, _ = cs.wake_digest("resume", {cs.DIGEST: ack, "lean": lean}, parts("2h"), parts("2h"),
+                                    "s1", "s2", "g1")
+        assert ("paused" in dict(sent)) is whole, sent
+    sent, _, _ = cs.wake_digest("resume", {cs.DIGEST: ack, "lean": True}, parts("2h", " (until 12:00)"),
+                                parts("2h"), "s1", "s2", "g1")
+    assert "paused" in dict(sent)
+    sent = cs.wake_digest("resume", {cs.DIGEST: ack, "lean": True}, parts("9m"), parts("9m"), "s1", "s2", "g1")[0]
+    assert "their ages grown since" in dict(sent)[cs.DELTA]
+
+
+def test_wakecost_daemon_alarms_once_and_asks_the_same_session_to_shrink(env, monkeypatch):
+    """After each session wake the daemon checks the cost per wake without a model call: five dear wakes
+    raise one alarm and leave the same session asked to compact in place and to send a lean digest."""
+    from ttp import coordsession as cs, wakecost
+    p, holder, sessions, turn, head, context = _cs_daemon(env, monkeypatch)
+    sids = set()
+    for n in range(6):   # the agent reports its session's running total: each wake books $1.50
+        monkeypatch.setenv("TTP_FAKE_COST", str(1.5 * (n + 1)))
+        r, _, _, note = turn()
+        assert r["status"] == "ok" and note["mode"] in ("new", "resume")
+        sids.add(p.db.kv(cs.KEY)["id"])
+    st = p.db.kv(cs.KEY)
+    assert len(sids) == 1 and st["lean"] and p.db.kv(wakecost.KEY)["alarmed"]
+    assert "coord-wake-cost" in p.db.kv("alerts_sent", {})
+    sent = p.db.kv("alerts_sent")["coord-wake-cost"]
+    monkeypatch.setenv("TTP_FAKE_COST", "12")
+    turn()
+    assert p.db.kv("alerts_sent")["coord-wake-cost"] == sent   # one alarm per episode, not one per wake

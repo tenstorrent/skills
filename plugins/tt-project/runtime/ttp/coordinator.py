@@ -131,6 +131,7 @@ from . import claimcheck
 from . import reach
 from . import coordsession
 from . import oldorders
+from . import wakecost
 from . import spans
 from . import coordtools
 from . import pointers
@@ -572,6 +573,9 @@ USER_SETTABLE = {
     "coordinator.session.tools": lambda v: coordtools.tools_mode_of(v),
     # Per-row updates of the keyed digest lists on resumed session wakes: true (default) or false.
     "coordinator.session.row_delta": lambda v: coordsession.row_delta_of(v),
+    # The median cost of the last 5 session wakes at which one alarm goes out and the session shrinks
+    # itself in place (wakecost.py): dollars, 0 or off for no check.
+    "coordinator.wake_cost_alarm_usd": lambda v: wakecost.threshold_of(v),
 }
 
 

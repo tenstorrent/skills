@@ -229,6 +229,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
                     "debounce_s": 15, "max_events_per_turn": 40,
                     "max_turns_per_hour": 30, "max_new_tasks_per_day": 200, "idle_wake_s": 3000,
                     "starve_wake_s": 300,
+                    # The median cost of the last 5 session wakes over which one alarm names the cause
+                    # and the session compacts in place and sends a leaner digest (wakecost.py; 0: off).
+                    "wake_cost_alarm_usd": 1.0,
                     # An event batch that a turn which decided nothing already met, against the same
                     # state, is settled without a model run for this long after it (turngate.py; 0: off).
                     "skip_repeat_window_s": 86400,

@@ -603,6 +603,13 @@ coordinator with that evidence.
   resources and the like) is compared as raw text and sent whole on any change, so one changed
   line there resends the section. Accepted gap: a chats or promises section whose only change is an
   age is resent whole too.
+  `wake_cost_alarm_usd` (default 1.0; 0 or `off`: no check) checks cost per wake without a model
+  call after each session wake (wakecost.py): when the median of the last 5 new or resumed wakes is
+  above it, one alarm goes out for the episode naming its cause (context tokens, digest size or tool
+  calls), the same session compacts in place on its next wake (once; again only after a further 5
+  wakes still over, and only once its context is at least 100k tokens and 20k over its seed), and the
+  digest sends any section whose only change is an age as unchanged. Never a new or stateless
+  session. Both end once the median is back at or under the alarm.
   A new session, a daemon restart (the digest then goes whole into the same resumed session), a
   failed or compacted wake since, or the action `{"type": "noop", "key": "full_digest"}` sends the whole
   digest on the next wake. A session wake's answer is checked before its turn ends: an action the

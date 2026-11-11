@@ -40,6 +40,7 @@ from . import runtimeload   # first of its own: its LOADED_AT is when the daemon
 from . import untrusted
 from . import branchcap
 from . import sshmux
+from . import wakecost
 from . import tailnet
 from . import sshagent
 from . import probewake
@@ -3753,6 +3754,8 @@ class Daemon:
                 src = (state or {}) if session_mode == "resume" else {}
                 compact_at = int(coordsession.limit(
                     self.cfg, {**src, "base_tokens": max(int(src.get("base_tokens") or 0), fixed)}, model) or 0)
+                if coordsession.shrink_due(src):   # over the wake-cost alarm (wakecost.py): compact now
+                    compact_at = min(compact_at, int(src.get("context_tokens") or 0)) or compact_at
                 env = {**env, **prov.compact_env(compact_at)}
                 argv = _before_stdin(argv, prov.compact_args(compact_at))
             seed_usd = None
@@ -6786,6 +6789,7 @@ class Daemon:
                                         noted=noted)
             if ok and session.get("mode") in ("new", "resume"):
                 coordsession.ack_prefix(self.p, r.get("dir") or self.p.runs / str(r["id"]))
+                state = self._wake_cost(r, usage, session, state)
             if ok and (state.get("compactions") or [{}])[-1].get("at") == now:
                 c = state["compactions"][-1]
                 log(self.p, f"coordinator run {r['id']}: session {c['session'][:8]} compacted in place "
@@ -6794,6 +6798,21 @@ class Daemon:
         except Exception:   # bookkeeping: the next wake decides from what is saved
             log(self.p, "coordinator session record failed: " + traceback.format_exc().replace("\n", " | ")[:1000])
         return False
+
+    def _wake_cost(self, r: dict, usage, session: dict, state: dict) -> dict:
+        """The session state after the model-free cost-per-wake check (wakecost.py): over
+        coordinator.wake_cost_alarm_usd, one alarm per episode naming its cause, and the session asked to
+        compact in place and send a leaner digest. Never a new session."""
+        try:
+            cur = wakecost.current_row(r, usage, session, self.p.runs)
+            state, text = wakecost.check(self.cfg, self.p.db, self.p.runs, state, cur)
+        except Exception:   # bookkeeping: the next wake checks again
+            log(self.p, "coordinator wake-cost check failed: " + traceback.format_exc().replace("\n", " | ")[:1000])
+            return state
+        if text:
+            log(self.p, f"coordinator run {r['id']}: {text}")
+            self.alert("coord-wake-cost", text, "normal", every_s=0)
+        return state
 
     def _session_context(self, r: dict, usage) -> dict | None:
         """The session's size after a wake from the agent's own saved session (Provider.session_context),
