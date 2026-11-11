@@ -426,8 +426,8 @@ def precheck_holds(state: Path, task: dict, now: float) -> bool:
     """Review `task` waits for the checks the daemon started on its head (Daemon._precheck) while they
     run, at most PRECHECK_HOLD_S after they started. Read-only: files under `state` only, so the
     overseer reads the same hold (Daemon._precheck_holds)."""
-    if task["kind"] != "review":
-        return False
+    if task["kind"] != "review" or urgent.is_urgent(task):
+        return False   # an urgent review never queues behind routine work (its precheck still runs)
     name = next((x[len(PRECHECK_LABEL):] for x in push._labels(task) if x.startswith(PRECHECK_LABEL)), "")
     if not name or "/" in name:
         return False
@@ -18194,8 +18194,10 @@ class Daemon:
                     + "The push queue runs the full checks again on the commit it pushes: run only focused tests "
                       "of what changed.")
         return (f"The daemon started the project's checks (`ttp checks`) on head {head} in "
-                f"{self.p.worktrees / ('t' + str(task['id']))} as #{task['id']} finished, and starts this review "
-                f"once they end: `ttp checks --result {checks}` prints their exit code and output tail "
+                f"{self.p.worktrees / ('t' + str(task['id']))} as #{task['id']} finished, and "
+                + ("does not hold this urgent review for them: it starts at once, so read their result when "
+                   "they end: " if urgent.is_urgent(task) else "starts this review once they end: ")
+                + f"`ttp checks --result {checks}` prints their exit code and output tail "
                 f"({checks / 'checks.log'} has it all). A pass is recorded, so `ttp checks` there reuses it. "
                 f"The push queue runs the full checks again on the commit it pushes: run only focused tests "
                 f"of what changed.")

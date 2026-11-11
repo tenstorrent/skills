@@ -20141,3 +20141,19 @@ def test_retarget_keeps_the_review_approval_of_an_unchanged_head(env, monkeypatc
     assert push._read(s.p.state / push.DETACHED / f"{bid}.json")["target"] == "relay/proj"
     (env["tmp"] / "never").write_text("")
     pushq._children[bid].wait(timeout=30)
+
+
+def test_precheck_hold_skips_an_urgent_review(tmp_path, monkeypatch):
+    """A routine review waits for its running precheck; an urgent one (priority 1 or `urgent:`) never does,
+    and its spec line says it starts at once."""
+    from ttp import cli, daemon
+    from ttp.daemon import PRECHECK_LABEL
+    out = tmp_path / daemon.PRECHECKS_DIR / "t1-abc"
+    out.mkdir(parents=True)
+    monkeypatch.setattr(cli, "_read_checks_pid", lambda o: {"ts": 1000.0})
+    monkeypatch.setattr(cli, "_checks_alive", lambda info: True)
+    task = {"id": 2, "kind": "review", "priority": 3, "spec": "check it",
+            "labels": json.dumps([PRECHECK_LABEL + "t1-abc"])}
+    assert daemon.precheck_holds(tmp_path, task, 1001.0), "a routine review waits"
+    assert not daemon.precheck_holds(tmp_path, dict(task, priority=1), 1001.0)
+    assert not daemon.precheck_holds(tmp_path, dict(task, spec="urgent: landing"), 1001.0)

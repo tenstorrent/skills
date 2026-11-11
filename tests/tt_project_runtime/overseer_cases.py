@@ -102,21 +102,17 @@ def test_an_urgent_review_held_on_its_running_prechecks_is_no_results_failure(en
         (out / CHECKS_PID).write_text(json.dumps({"pid": os.getpid(), "started": proc_start(os.getpid()), "ts": ts}))
 
     started(now - 600)
-    assert Daemon(p.base)._precheck_holds(p.db.task(tid), now), "the daemon holds it: the same test"
-    h = overseer.check(p, now)
-    text = overseer.line(h, now)
-    assert h["failing"] == [] and (h["urgent_ready"], h["urgent_held"]) == (1, 1), h
-    assert "urgent ready 1 (1 held: its review's prechecks are running)" in text and "FAILING" not in text, text
-    assert dumps == [] and not (p.state / overseer.INCIDENTS_FILE).exists()
     stalled = ["urgent work ready with a free slot for 15 min"]
-    (out / CHECKS_RC).write_text("0\n")   # the checks ended: the reviewer should have started
+    # An urgent review is never held behind a precheck (it starts at once), so the overseer sees it ready.
+    assert not Daemon(p.base)._precheck_holds(p.db.task(tid), now), "the daemon holds no urgent review"
     assert overseer.measure(p, now)["failing"] == stalled
+    p.db.x("UPDATE tasks SET priority=5, spec='routine' WHERE id=?", (tid,))
+    assert Daemon(p.base)._precheck_holds(p.db.task(tid), now), "a routine review is held: the same test"
+    (out / CHECKS_RC).write_text("0\n")
+    assert not Daemon(p.base)._precheck_holds(p.db.task(tid), now)
     (out / CHECKS_RC).unlink()
-    started(now - PRECHECK_HOLD_S - 1)   # still running, but the daemon no longer waits for them
-    assert overseer.measure(p, now)["failing"] == stalled
-    started(now - 600)
-    (out / CHECKS_PID).write_text(json.dumps({"pid": os.getpid(), "started": "not this process", "ts": now - 600}))
-    assert overseer.measure(p, now)["failing"] == stalled   # their process is gone
+    started(now - PRECHECK_HOLD_S - 1)
+    assert not Daemon(p.base)._precheck_holds(p.db.task(tid), now), "the hold ran out"
 
 
 def test_the_health_line_reaches_the_digest_status_and_deployed(env, monkeypatch):
