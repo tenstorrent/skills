@@ -1924,6 +1924,49 @@ def test_a_run_holding_a_test_slot_grant_starts_one_worker_per_slot_never_more()
     assert c._auto_jobs(64, {"TTP_TEST_SLOTS": "x", "TTP_TEST_SLOTS_HELD": "8"}) == 4
 
 
+def test_the_local_test_runner_never_starts_more_workers_than_the_load_leaves_cpus_free():
+    c = _test_conftest()
+    assert c._auto_jobs(64, {}, 0.0) == 4 and c._auto_jobs(64, {}, 61.6) == 2
+    assert c._auto_jobs(64, {}, 64.0) == 1 and c._auto_jobs(64, {}, 90.0) == 1, "a full host: one worker"
+    assert c._auto_jobs(8, {}, 5.2) == 3
+    held = {"TTP_TEST_SLOTS": "6", "TTP_TEST_SLOTS_HELD": "6"}
+    assert c._auto_jobs(64, held, 64.0) == 6, "a held grant is already sized to free cores"
+    assert c._auto_jobs(64, {"CI": "true"}, 64.0) == 8
+
+
+def test_a_forked_run_hands_out_the_slowest_tests_first_and_a_full_run_saves_their_times(tmp_path):
+    c = _test_conftest()
+
+    class Item:
+        def __init__(self, nodeid):
+            self.nodeid = nodeid
+
+    class Rep:
+        def __init__(self, nodeid, when, duration):
+            self.nodeid, self.when, self.duration = nodeid, when, duration
+
+    units = [[Item("tests/test_plugin_catalogue.py::a"), Item("tests/test_plugin_catalogue.py::b")]] + \
+        [[Item(f"tests/test_tt_project_runtime.py::t{n}")] for n in range(4)]
+    assert c._order(units, {}) == [0, 1, 2, 3, 4], "no times: the usual order"
+    times = {"tests/test_tt_project_runtime.py::t2": 30.0, "tests/test_tt_project_runtime.py::t0": 5.0,
+             "tests/test_plugin_catalogue.py::a": 0.1, "tests/test_plugin_catalogue.py::b": 0.1}
+    assert c._order(units, times) == [3, 1, 2, 4, 0], "slowest first; untimed ones keep their order"
+    assert os.environ["TTP_TEST_DURATIONS"] == "off" and c._durations(pathlib.Path("off")) == {}, \
+        "a suite a test starts neither reads nor writes this host's times"
+    path = tmp_path / "durations.json"
+    few = [Rep("tests/test_tt_project_runtime.py::t0", "call", 2.0)]
+    c._save_durations(few, path)
+    assert not path.exists(), "a small run saves nothing"
+    reps = [Rep(f"tests/test_tt_project_runtime.py::t{n}", when, 1.0)
+            for n in range(c.MIN_ITEMS) for when in ("setup", "call", "teardown")]
+    path.write_text('{"tests/test_tt_project_runtime.py::old": 9.0}')
+    c._save_durations(reps, path)
+    got = c._durations(path)
+    assert got["tests/test_tt_project_runtime.py::t0"] == 3.0 and got["tests/test_tt_project_runtime.py::old"] == 9.0
+    path.write_text("not json")
+    assert c._durations(path) == {}
+
+
 class _IniConfig:
     def __init__(self, timeout=0.0, fd=7):
         self.timeout, self._ttp_dump_fd = timeout, fd
