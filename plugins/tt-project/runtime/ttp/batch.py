@@ -106,7 +106,37 @@ LEAD_KEY = re.compile(r"""["']?([A-Za-z_][\w.-]*)["']?[ \t]*[:=](?![=/])""")   #
 TOP_START = re.compile(r"(?:@|(?:async[ \t]+)?def[ \t]|class[ \t])")
 EXIT = {"pushed": 0, "landed": 0, "nothing": 0, "busy": push.BUSY, "env_fault": push.BUSY, "moved": push.KEPT_MOVING,
         "worker_loss": push.BUSY, "script_torn": push.BUSY, "setup_fault": push.BUSY, "rejected": push.REJECTED, "refused": push.REFUSED, "tip_failed": push.CHECKS_FAILED,
-        "yielded": 0}
+        "yielded": 0, "stopped": push.BUSY}
+STOP_SUFFIX = ".stop"              # beside a batch's marker: a stop request (`ttp push --stop-batch`, push.stop_batch)
+STOP_SIGNAL = signal.SIGUSR1       # what push.stop_batch sends a batch whose marker names it (stop_signal)
+_STOP = {"file": None, "wait": 0, "pushing": False}   # this process's batch: its request file, inside a stoppable wait, in its git push
+
+
+class Stopped(BaseException):
+    """A stop request (`ttp push --stop-batch`) reached a safe point of this batch. A BaseException, so no
+    step's `except Exception` takes it for its own failure."""
+
+
+def stop_request(marker: Path) -> dict | None:
+    """The stop request beside `marker` ({why, by, at}), or None."""
+    try:
+        r = push._read(Path(marker).with_suffix(STOP_SUFFIX))
+    except Exception:
+        return None
+    return r if isinstance(r, dict) and r else None
+
+
+def _honour_stop() -> None:
+    """A safe point: raise Stopped when this batch has a stop request, unless its git push began."""
+    if _STOP["file"] is not None and not _STOP["pushing"] and (r := stop_request(_STOP["file"])):
+        raise Stopped(str(r.get("why") or "stopped by request"))
+
+
+def _on_stop(_sig, _frame) -> None:
+    """STOP_SIGNAL: inside a stoppable wait (a check's run), stop now; anywhere else the next safe point
+    does, so no marker write or git step is cut in half."""
+    if _STOP["wait"]:
+        _honour_stop()
 
 
 def say(msg: str) -> None:
@@ -290,6 +320,55 @@ def _kill(proc: subprocess.Popen) -> None:
         pass
 
 
+def _tree(pid: int) -> list[int]:
+    """The processes below `pid` (its children, theirs and so on), from `ps`; none where it cannot run."""
+    try:
+        out = subprocess.run(["ps", "-A", "-o", "pid=,ppid="], capture_output=True, text=True, timeout=10).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    kids: dict[int, list[int]] = {}
+    for line in out.splitlines():
+        try:
+            c, parent = map(int, line.split())
+        except ValueError:
+            continue
+        kids.setdefault(parent, []).append(c)
+    found, todo = [], [pid]
+    while todo:
+        for c in kids.get(todo.pop(), []):
+            if c not in found:
+                found.append(c)
+                todo.append(c)
+    return found
+
+
+def _kill_tree(proc: subprocess.Popen) -> None:
+    """End `proc` and every process below it (a check run in this process's group: its pytest and
+    workers), by pid: TERM, a short grace, then KILL whatever is left."""
+    pids = [proc.pid, *_tree(proc.pid)]
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        for pid in pids:
+            try:
+                os.kill(pid, sig)
+            except OSError:
+                pass
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+        deadline = time.monotonic() + 5
+        while sig == signal.SIGTERM and time.monotonic() < deadline and any(_alive(x) for x in pids[1:]):
+            time.sleep(0.1)
+
+
+def _alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
 def _here(cmd):
     """The check `cmd` stands for here: a spilled one's local original (checkspill: `was`), judged and
     rerun as that original is; any other check itself (one with its own host keeps it)."""
@@ -357,12 +436,17 @@ def _streamed(cmd, cwd: Path, env: dict | None, timeout: float | None, group: bo
     reader.start()
     timed_out = False
     try:
-        proc.wait(timeout=timeout)
+        _STOP["wait"] += 1   # a stop request (_on_stop) ends the run from here on
+        try:
+            _honour_stop()
+            proc.wait(timeout=timeout)
+        finally:
+            _STOP["wait"] -= 1
     except subprocess.TimeoutExpired:
         timed_out = True
         _kill(proc)
-    except BaseException:   # stopped: the command ends with it, and a change it made is still put back
-        _kill(proc) if group else proc.kill()
+    except BaseException as e:   # stopped: the command ends with it, and a change it made is still put back
+        _kill(proc) if group else _kill_tree(proc) if isinstance(e, Stopped) else proc.kill()
         try:
             proc.wait(timeout=10)
         except BaseException:
@@ -1637,6 +1721,20 @@ class Batch:
             say(message)
         return outcome
 
+    def stopped(self, why: str) -> str:
+        """`ttp push --stop-batch` stopped the push phase before its git push: every entry not landed or
+        refused goes back to approved, with no try counted and no backoff (pushq._apply), and the batch is
+        never resumed."""
+        if self.pushed_sha:
+            return "pushed"
+        self.yielded_to = []
+        say(f"stopped by request: {why}")
+        for i in range(len(self.entries)):
+            if self.status.get(i) not in ("landed", "refused") and i not in self.held:
+                self._set(i, "requeued", stopped=why)
+        self.message = f"stopped by request: {why}"
+        return "stopped"
+
     def error(self, e: BaseException) -> str:
         if self.pushed_sha:             # pushed already: that stays the outcome
             return "pushed"
@@ -1845,6 +1943,7 @@ class Batch:
             self.target_lock = push.take(self.p, self.remote, self.branch, 0, say=lambda _m: None,
                                          who=f"push batch {self.id}")
             self.steps = push.Steps(self.target_lock, say)
+        _honour_stop()   # the last safe point: from the git push on, a stop request is refused
         self.steps.go("push", check=True)
         t0 = time.monotonic()
         try:
@@ -1917,6 +2016,12 @@ class Batch:
         write_json(self.marker, m)
 
     def _push_head(self, tip: str, head: str, k: int, carried: list, failed: tuple | None):
+        _honour_stop()
+        _STOP["pushing"] = True
+        try:
+            self.marker.with_suffix(push.GIT_PUSH_SUFFIX).touch()   # push.stop_batch refuses from here on
+        except OSError:
+            pass
         self._mark_pushing(tip, head, k, carried, failed)
         # Without --force the remote takes only a fast-forward of the tip the checks ran on.
         return _git(self.repo, "push", self.remote, f"{head}:refs/heads/{self.branch}")
@@ -2446,10 +2551,15 @@ class Batch:
         """The host-wide checks slot for commit `at`. Its wait is between steps (push.Steps), so an upgrade
         past upgrade.push_hold_min may go then; once it is held the checks step is marked."""
         self.steps.between()
-        slot = push.check_slot(at, say, checkcap.label(self.p.name, f"push batch {self.id}"),
-                               priority=push.priority_key(self.repo, self.remote, self.branch)
-                               + (" express" if self.express else ""), proj=self.p,   # its own slot beside a batch's
-                               repo=self.repo)
+        _STOP["wait"] += 1   # a stop request ends the slot wait too
+        try:
+            _honour_stop()
+            slot = push.check_slot(at, say, checkcap.label(self.p.name, f"push batch {self.id}"),
+                                   priority=push.priority_key(self.repo, self.remote, self.branch)
+                                   + (" express" if self.express else ""), proj=self.p,   # its own slot beside a batch's
+                                   repo=self.repo)
+        finally:
+            _STOP["wait"] -= 1
         self.steps.go("checks")
         return slot
 
@@ -3668,13 +3778,19 @@ def run_batch(p: Project, marker: Path) -> int:
         say(f"another process holds the run lock of batch {bid}; leaving the batch to it")
         return push.BUSY
     b = Batch(p, marker, m)
+    stop, asked = _arm_stop(marker), None
     try:
         b.check_run_dir = str(checkdirs.reports(checkdirs.restore(p.state, b.check_run_dir)))
         if os.environ.get("TTP_RUN_DIR") != b.check_run_dir:
             raise OSError("TTP_RUN_DIR is missing or differs from the queued check output directory")
         outcome = b.push_phase()
+    except Stopped as e:        # `ttp push --stop-batch`: every entry back to approved, no try counted
+        asked = stop_request(marker) or {"why": str(e)}
+        outcome = b.stopped(str(e))
     except Exception as e:      # recorded, never left without an outcome
         outcome = b.error(e)
+    finally:
+        _disarm_stop(marker, stop)
     ff = []
     if b.pushed_sha and (also := push.fast_forward_list(b.d.get("fast_forward_also"))):
         try:                    # still under the target's push lock; a failure never undoes the push
@@ -3713,6 +3829,8 @@ def run_batch(p: Project, marker: Path) -> int:
         m["tip_tried"] = [e.get("id") for e in b.entries[:b.tip_tried]]
     if b.tip_passed:
         m["tip_passed"] = True
+    if outcome == "stopped":
+        m["stop"] = {**(asked or {}), "honoured": time.time()}
     write_json(marker, m)
     say(f"batch {bid}: {outcome}" + (f" ({b.message})" if b.message and outcome != "pushed" else ""))
     # Hand over: the deploy runs under its own lock, so upgrades no longer wait (push_in_flight).
@@ -3735,6 +3853,33 @@ def run_batch(p: Project, marker: Path) -> int:
             after = {"status": "failed", "exit": None, "tail": f"{type(e).__name__}: {e}", "ended": time.time()}
     _finish(p, marker, m, after, ap_lock)
     return EXIT.get(outcome, 1)
+
+
+def _arm_stop(marker: Path):
+    """Let `ttp push --stop-batch` stop this batch: its marker names STOP_SIGNAL (push.stop_batch sends it
+    only then) and the handler (_on_stop) is installed. The handler it replaces, to put back. Only the
+    main thread can install one; elsewhere the safe points alone honour a request."""
+    _STOP.update(file=Path(marker), wait=0, pushing=False)
+    try:
+        old = signal.signal(STOP_SIGNAL, _on_stop)
+    except ValueError:
+        return None
+    m = push._read(marker) or {}
+    m["stop_signal"] = STOP_SIGNAL.name
+    write_json(marker, m)
+    return old
+
+
+def _disarm_stop(marker: Path, old) -> None:
+    """The push phase ended: no stop from here on (its outcome is written next, and after_push is short)."""
+    _STOP.update(file=None, wait=0, pushing=False)
+    if old is not None:
+        signal.signal(STOP_SIGNAL, old)
+    for f in (Path(marker).with_suffix(STOP_SUFFIX), Path(marker).with_suffix(push.GIT_PUSH_SUFFIX)):
+        try:
+            f.unlink()
+        except OSError:
+            pass
 
 
 def _resume(p: Project, marker: Path, m: dict, bid: str) -> int:

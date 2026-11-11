@@ -3192,7 +3192,7 @@ def cmd_push(a) -> None:
     if a.result:
         sys.exit(push.result(Path(a.result), pushed_only=a.pushed))
     from . import coordtools
-    coord = coordtools.coordinator_run() and not (a.queue or a.stop or a.cancel or (a.free and not a.move_tag))
+    coord = coordtools.coordinator_run() and not (a.queue or a.stop or a.cancel or a.stop_batch or (a.free and not a.move_tag))
     if coord and (a.move_tag or a.own or a.own_branch or a.batch):
         die(f"ttp push: {coordtools.PUSH_REFUSAL}")   # also past the hook's text check (coordtools.py)
     if a.own_branch:   # read by push.own_target, also in the detached process (inherited, or QUEUE_ENV)
@@ -3213,8 +3213,10 @@ def cmd_push(a) -> None:
         from . import pushq
         print(pushq.queue_text(p))
         return
+    if a.stop_batch:
+        sys.exit(push.stop_batch(p, Path(a.stop_batch), a.why or ""))
     if a.stop:
-        sys.exit(push.stop_own(p, Path(a.stop)))
+        sys.exit(push.stop_own(p, Path(a.stop), a.why or ""))
     if a.cancel:
         sys.exit(push.cancel(p, Path(a.cancel)))
     if a.move_tag:
@@ -14711,6 +14713,13 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--cancel", metavar="MARKER",
                    help="push nothing new: stop the detached push of MARKER (queued or running, its checks too) "
                         "before it lands; only the task that queued it, or the project's coordinator")
+    s.add_argument("--stop-batch", metavar="MARKER", dest="stop_batch",
+                   help="stop a running push queue batch (its marker) at its next safe point, ending its checks: "
+                        "its entries go back to approved with no try counted, and it is never resumed; for the "
+                        "coordinator and any task of this project; needs --why; never one in its git push (exit 1); "
+                        "0 once stopped, requested or already ended")
+    s.add_argument("--why", metavar="TEXT",
+                   help="with --stop-batch (required) or --stop: the reason recorded with the stop")
     s.add_argument("--pushed", action="store_true",
                    help="with --result: exit 0 only if the push landed, 1 while it runs, 3 if it finished "
                         "without pushing (for an on_pass_cmd; no grep needed)")

@@ -6361,6 +6361,89 @@ def stop_own(p: Project, marker: Path, why: str = "") -> int:
     return 0
 
 
+STOP_BATCH_WAIT_S = 30.0   # stop_batch: how long it waits to see the batch write its 'stopped' outcome
+
+
+def stop_batch(p: Project, marker: Path, why: str) -> int:
+    """`ttp push --stop-batch <marker> --why <text>`: the supported stop of a running push queue batch
+    (one aimed at a dead target, or failing the tip's own tests), for the coordinator and any task of
+    this project. It writes a stop request beside the marker (batch.STOP_SUFFIX: why, by, at) and, when
+    the marker names the batch's stop signal (batch.STOP_SIGNAL), sends it to the batch process alone.
+    The batch honours it at its next safe point: a check it runs ends with its processes, the slot wait
+    ends, and it records the outcome 'stopped'; the queue puts its entries back to approved with no try
+    counted and no backoff, and never resumes it (pushq._apply). Refused (REFUSED) without a why, for a
+    marker outside this project's pushes folder and for one that is not a batch. A batch in its git push
+    (its .gitpush side file, or `pushing` in its marker) is never interrupted: NOT_STOPPED. One that has
+    its outcome already is left as it is (0). Each stop is recorded in the project's audit stream
+    (detach.signalled) and the batch's log, with its why. The process-group kill guard is untouched:
+    this is the route that needs no signal to the batch's group."""
+    from . import batch, detach as job, jobstop   # `detach` here is this module's own function
+    say = lambda m: print(f"ttp push: {m}", file=sys.stderr)   # noqa: E731
+    marker = Path(marker).expanduser().resolve()
+    folder = (p.state / DETACHED).resolve()
+    mine = os.environ.get("TTP_PROJECT")
+    why = " ".join(str(why or "").split())
+    if not why:
+        say("refused: say why the batch stops (--why <text>); it is recorded with the stop")
+        return REFUSED
+    if mine and Path(mine).expanduser().resolve() != p.base.resolve():
+        say(f"refused: {marker} is a batch of the project at {p.base}, not of this run's project ({mine})")
+        return REFUSED
+    if marker.parent != folder or marker.suffix != ".json":
+        say(f"refused: {marker} is not a push batch marker of this project ({folder}/<id>.json)")
+        return REFUSED
+    m = _read(marker)
+    if not m or m.get("kind") != "batch":
+        say(f"refused: no push queue batch at {marker}" + (" (a task's own push stops with `ttp push --stop`)"
+                                                          if m else ""))
+        return REFUSED
+    if m.get("outcome") or m.get("phase") in ("after_push", "finished"):
+        say(f"the batch {m.get('id') or marker.stem} ended already ({m.get('outcome') or m.get('phase')}); "
+            "nothing to stop")
+        return 0
+    side = marker.with_suffix(GIT_PUSH_SUFFIX)
+    if side.exists() or m.get("pushing"):
+        say(f"not stopped: the batch {m.get('id') or marker.stem} is in its git push, which is never "
+            "interrupted; its outcome follows in moments")
+        return NOT_STOPPED
+    task = os.environ.get("TTP_TASK") or ""
+    by = f"task #{task}" if task else "coordinator"
+    req = marker.with_suffix(batch.STOP_SUFFIX)
+    durable_write(req, json.dumps({"why": why, "by": by, "at": time.time()}) + "\n")
+    pid, sent = m.get("pid"), False
+    if m.get("stop_signal") == batch.STOP_SIGNAL.name and isinstance(pid, int) and pid > 1 \
+            and str(marker) in jobstop._argv(pid):
+        try:
+            os.kill(pid, batch.STOP_SIGNAL)   # the batch process alone: it ends its own checks
+            sent = True
+        except OSError:
+            pass
+    # The audit: one row in the project's signal stream and one line in the batch's log, with the why.
+    job.signalled(marker, batch.STOP_SIGNAL if sent else 0, pid if isinstance(pid, int) else 0,
+                  "push.stop_batch" if sent else "push.stop_batch (request only, honoured at a safe point)",
+                  why, by=by, group=False, state=p.state, task=int(task) if task.isdigit() else None)
+    deadline = time.monotonic() + STOP_BATCH_WAIT_S
+    while time.monotonic() < deadline:
+        now = _read(marker)
+        if now.get("outcome"):
+            break
+        if now.get("pushing"):
+            say(f"not stopped: the batch {m.get('id') or marker.stem} began its git push before the stop; "
+                "it is never interrupted")
+            return NOT_STOPPED
+        time.sleep(0.2)
+    now = _read(marker)
+    bid = m.get("id") or marker.stem
+    if now.get("outcome") == "stopped":
+        print(f"ttp push: stopped the batch {bid}; its entries go back to approved: {why}")
+    elif now.get("outcome"):
+        print(f"ttp push: the batch {bid} ended {now.get('outcome')} before the stop took effect")
+    else:
+        print(f"ttp push: stop requested for the batch {bid}; it stops at its next safe point "
+              f"(the end of its current step): {why}")
+    return 0
+
+
 def status_lines(p: Project) -> list[str]:
     """`ttp status`: a line per running or queued detached push that has retried, naming its attempt
     and the causes, so the coordinator and the user see a push that tries again by itself."""

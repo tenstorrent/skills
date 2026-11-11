@@ -1726,6 +1726,16 @@ running work is interrupted only by the preemption below:
   Later urgent approvals lead the next batch, which starts as soon as the running one ends; after a
   stop, the next batch takes the urgent approvals it stopped for, never the stopped batch's own
   entries again.
+- Stopping a running push batch: `ttp push --stop-batch <marker> --why <text>` (the coordinator or
+  any task of the project; the marker is the batch's `state/pushes/<id>.json`) stops a batch aimed at
+  a dead target, or one failing the tip's own tests, so it no longer holds the push lock, the
+  priority slot and the test slots. It writes a stop request beside the marker and signals the batch
+  process alone (never its group: the kill guard is unchanged); the batch honours it at its next safe
+  point, ending a running check with its child processes, and records the outcome `stopped`. Its
+  entries go back to approved with no try counted and no backoff, and a stopped batch is never
+  resumed. A batch in its git push is never interrupted: the stop is refused (exit 1) and the push's
+  own outcome follows. Each stop, with its why and who sent it, is recorded in the batch's log and
+  the project's signal audit stream.
 - Landing checks: a `ttp checks` run under a landing mark (a push batch's or `ttp push`'s checks) or
   the coordinator's own run for no task never waits behind the project's task checks for
   `checks.test_project_max`: one at a time takes the project's landing lane past its lanes and cap.

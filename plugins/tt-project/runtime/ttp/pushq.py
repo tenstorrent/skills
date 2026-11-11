@@ -2728,9 +2728,12 @@ def _apply(p: Project, b: dict, m: dict, alert: Callable, now: float) -> None:
         # In the transaction that finalizes the batch: a crash before it commits records them again.
         _resolve_upstream(p, shipped, version)
         if outcome in ("moved", "busy", "env_fault", "worker_loss", "script_torn", "setup_fault", "rejected", "nothing", "landed", "pushed",
-                       "tip_failed", "yielded", "retargeted") and back:
+                       "tip_failed", "yielded", "retargeted", "stopped") and back:
+            stop = m.get("stop") if outcome == "stopped" and isinstance(m.get("stop"), dict) else {}
             _event(db, None, "push_requeued", f"push batch {b['id']} ended {outcome}: {len(back)} approval"
-                                              f"{'s' if len(back) != 1 else ''} back in the queue", queued=False)
+                                              f"{'s' if len(back) != 1 else ''} back in the queue"
+                                              + (f" (stopped by {stop.get('by') or 'request'}: {stop.get('why')})"
+                                                 if stop.get("why") else ""), queued=False)
     for key, text, sev in later:
         alert(key, text, severity=sev)
 
@@ -3440,7 +3443,7 @@ OUTCOME_WORDS = {"pushed": "pushed", "landed": "already on the branch", "nothing
                  "conflict": "conflicted", "tip_failed": "the branch tip fails its checks", "moved": "the branch kept moving",
                  "busy": "another push held the branch", "rejected": "rejected by the remote", "refused": "refused",
                  "died": "ended before finishing", "rebooted": "cut short by a reboot", "error": "failed",
-                 "yielded": "stopped for an urgent approval",
+                 "yielded": "stopped for an urgent approval", "stopped": "stopped by request (ttp push --stop-batch)",
                  "retargeted": "stopped: delivery.push_branch changed",
                  "script_torn": "held: a script outside the change was rewritten as its check ran",
                  "setup_fault": "held: a check failed before any test ran (setup or pool)"}
