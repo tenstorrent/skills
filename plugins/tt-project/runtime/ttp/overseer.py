@@ -21,11 +21,14 @@ lock), reads the run folders and writes RESULTS to state/HEALTH_FILE:
   and the oldest one's age;
 - overruns_h: tick_step_slow reports in the last hour (the daemon raises at most one per step per
   STEP_SLOW_EVERY_S, so this counts the slow steps, a floor on the overruns);
-- heartbeat_s: the daemon heartbeat's age.
+- heartbeat_s: the daemon heartbeat's age; hb_asleep_s: how much of it the host spent asleep (a
+  suspended host stops the daemon too, so that part is no stall), from slept_total, the host's sleep
+  since boot (slept_since_boot) at each pass, kept in the health file across overseer restarts.
 
 `line` turns that into one line, shown in every coordinator digest, `ttp status` and `ttp deployed`.
 A RESULTS FAILURE is ready urgent work with a free slot, a finished run unreaped or an answer
-unapplied for over FAIL_S, or a stale heartbeat. On its first pass in a failure the overseer captures
+unapplied for over FAIL_S, or a heartbeat stale in awake time (sleep taken out: the line says
+`host asleep` instead). On its first pass in a failure the overseer captures
 the daemon's stacks (py-spy dump when installed, else the faulthandler dump the daemon registers on
 SIGUSR1) under state/incidents/ and records one incident line (in the health file and appended to
 INCIDENTS_FILE); the incident closes when the results are good again. The daemon in turn restarts
@@ -99,14 +102,46 @@ def _hold(d, task: dict, since: float, cfg: dict, state: Path, now: float) -> st
     return (ev["text"] or "a resource it needs is held")[:80] if ev else ""
 
 
-def measure(p: Project, now: float | None = None) -> dict:
-    """The loop's results now (module doc), or {"error": ...} when the database cannot be read."""
+def slept_since_boot() -> float | None:
+    """Seconds this host has slept (suspended) since boot: the gap between a kernel clock that runs
+    through a suspend and one that stops (Linux BOOTTIME and MONOTONIC, macOS MONOTONIC and
+    UPTIME_RAW). None where the host has no such pair."""
+    names = ("CLOCK_MONOTONIC", "CLOCK_UPTIME_RAW") if sys.platform == "darwin" else ("CLOCK_BOOTTIME", "CLOCK_MONOTONIC")
+    try:
+        on, off = (time.clock_gettime(getattr(time, n)) for n in names)
+    except (AttributeError, OSError):
+        return None
+    return max(0.0, on - off)
+
+
+def _asleep(h: dict, prev: dict, slept: float | None) -> None:
+    """Set h's hb_asleep_s: the host's sleep since the daemon last wrote its heartbeat. The sleep since
+    the previous pass (slept_total then and now, at most the wall time between them; a reboot resets
+    it) adds to what that pass counted when the heartbeat is the same one, else counts alone; never more
+    than the heartbeat's age."""
+    age = h.get("heartbeat_s")
+    if slept is None or age is None:
+        return
+    hb_at = time.time() - age   # the heartbeat file's mtime
+    before, at = prev.get("slept_total"), prev.get("at")
+    gap = 0.0
+    if before is not None and at is not None and slept >= float(before):
+        gap = min(slept - float(before), max(0.0, h["at"] - float(at)))
+    same = prev.get("hb_at") is not None and abs(float(prev["hb_at"]) - hb_at) < 2
+    h["slept_total"], h["hb_at"] = slept, hb_at
+    h["hb_asleep_s"] = min(age, (float(prev.get("hb_asleep_s") or 0) if same else 0.0) + gap)
+
+
+def measure(p: Project, now: float | None = None, prev: dict | None = None) -> dict:
+    """The loop's results now (module doc), or {"error": ...} when the database cannot be read.
+    `prev` is the last pass's reading (check), from which the host's sleep is counted."""
     from . import urgent
     from .daemon import heartbeat
     now = time.time() if now is None else now
     h: dict = {"at": now}
     hb = heartbeat(p) or {}
     h["heartbeat_s"] = hb.get("age")
+    _asleep(h, prev or {}, slept_since_boot())
     try:
         d = _ro_db(p.state / "project.db")
     except sqlite3.Error as e:
@@ -164,8 +199,8 @@ def failures(h: dict) -> list[str]:
         out.append(f"{h['unreaped']} finished run(s) unreaped for {_mins(h['unreaped_s'])}")
     if (h.get("unapplied_s") or 0) > FAIL_S:
         out.append(f"{h['unapplied']} coordinator answer(s) unapplied for {_mins(h['unapplied_s'])}")
-    if h.get("heartbeat_s") is not None and h["heartbeat_s"] > HEARTBEAT_STALE_S:
-        out.append(f"loop heartbeat stale for {_mins(h['heartbeat_s'])}")
+    if h.get("heartbeat_s") is not None and h["heartbeat_s"] - (h.get("hb_asleep_s") or 0) > HEARTBEAT_STALE_S:
+        out.append(f"loop heartbeat stale for {_mins(h['heartbeat_s'] - (h.get('hb_asleep_s') or 0))} awake")
     return out
 
 
@@ -191,6 +226,9 @@ def line(h: dict | None, now: float | None = None) -> str:
     text = "loop health: " + ", ".join(parts)
     if h.get("failing"):
         text += "; FAILING: " + "; ".join(h["failing"])
+    from .daemon import HEARTBEAT_STALE_S
+    if (h.get("heartbeat_s") or 0) > HEARTBEAT_STALE_S and h.get("hb_asleep_s"):
+        text += f"; host asleep {_mins(h['hb_asleep_s'])} of the heartbeat's {_mins(h['heartbeat_s'])} age"
     inc = h.get("incident")
     if inc:
         text += f"; incident since {time.strftime('%H:%M', time.localtime(inc['at']))}, stacks {inc.get('stacks')}"
@@ -245,8 +283,8 @@ def capture_stacks(p: Project, now: float, why: str) -> Path | None:
 def check(p: Project, now: float | None = None) -> dict:
     """One pass: measure, open or close the incident, write the health file and the heartbeat."""
     now = time.time() if now is None else now
-    h = measure(p, now)
     prev = read(p) or {}
+    h = measure(p, now, prev)
     inc = prev.get("incident")
     if h.get("failing") and not inc:
         why = "; ".join(h["failing"])

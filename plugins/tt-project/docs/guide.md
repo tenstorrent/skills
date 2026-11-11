@@ -112,7 +112,9 @@ judges the tick loop by its results, not its heartbeat: the last dispatch, urgen
 a free slot, finished runs not reaped, coordinator answers not applied, events not delivered and
 slow tick steps per hour. That reading is one `loop health:` line in every coordinator digest,
 `ttp status` and `ttp deployed`. Urgent work waiting with a free slot, a run unreaped or an answer
-unapplied for over 5 min, or a stale heartbeat, is a results failure: the overseer saves the
+unapplied for over 5 min, or a heartbeat over 5 min old in awake time, is a results failure (time
+the host spent asleep, such as a closed laptop lid, is taken out of the heartbeat's age and the line
+says `host asleep` instead; Linux and macOS read it from their kernel clocks): the overseer saves the
 daemon's stacks under `state/incidents/` (py-spy when installed, else the daemon's own stack dump)
 and records one incident in that line until the results are good again. The daemon restarts an
 overseer whose heartbeat is over 5 min old. Idle cost: no model call, a few read-only queries a

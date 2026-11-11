@@ -445,3 +445,73 @@ def test_only_observe_only_tick_steps_may_be_degraded(env):
     bad = [s for s in DEGRADE_OK if s.startswith("reap_") or any(w in s for w in ("push", "meter", "dispatch", "start",
                                                                                   "deliver", "coordinat"))]
     assert not bad, f"steps the loop needs are allowed to sit out ticks: {bad}"
+
+
+def test_a_heartbeat_aged_by_host_sleep_is_no_stall_but_an_awake_stall_still_raises(env, monkeypatch):
+    """A suspended host stops the daemon too: the heartbeat's age less the host's sleep is what counts."""
+    from ttp import overseer
+    t0 = time.time()
+    clock, slept = [t0], [100.0]
+    monkeypatch.setattr(overseer.time, "time", lambda: clock[0])
+    monkeypatch.setattr(overseer, "slept_since_boot", lambda: slept[0])
+
+    p = make(env)
+
+    def project(name):   # a fresh start: the heartbeat written at t0, no reading or incident yet
+        hb = p.state / "heartbeat"
+        hb.write_text(json.dumps({"pid": 1}))
+        os.utime(hb, (t0, t0))
+        for f in (overseer.HEALTH_FILE, overseer.INCIDENTS_FILE):
+            (p.state / f).unlink(missing_ok=True)
+        return p
+
+    def at(p, s, total):
+        clock[0], slept[0] = t0 + s, total
+        return overseer.check(p, t0 + s)
+
+    # Asleep: the daemon wrote its heartbeat, the overseer looked, then the host slept an hour.
+    p = project("asleep")
+    assert at(p, 30, 100.0)["failing"] == []
+    h = at(p, 3660, 3700.0)
+    assert h["heartbeat_s"] == pytest.approx(3660) and h["hb_asleep_s"] == pytest.approx(3600)
+    assert h["failing"] == [] and "incident" not in h
+    assert not (p.state / overseer.INCIDENTS_FILE).exists()
+    assert "host asleep 60 min of the heartbeat's 61 min age" in overseer.line(h, t0 + 3660)
+    # Awake again and still no new heartbeat: that is a stall, counted in awake time only.
+    h = at(p, 3660 + 300, 3700.0)
+    assert h["failing"] == ["loop heartbeat stale for 6 min awake"] and h["incident"]
+    # A fresh heartbeat after the wake clears it.
+    os.utime(p.state / "heartbeat", (t0 + 4000, t0 + 4000))
+    h = at(p, 4010, 3700.0)
+    assert h["failing"] == [] and "incident" not in h and "host asleep" not in overseer.line(h, t0 + 4010)
+
+    # Awake the whole hour: the same gap is a stall.
+    q = project("awake")
+    assert at(q, 30, 100.0)["failing"] == []
+    h = at(q, 3660, 100.0)
+    assert h["failing"] == ["loop heartbeat stale for 61 min awake"] and "host asleep" not in overseer.line(h, t0 + 3660)
+
+    # A reboot resets the host's sleep count: no sleep is inferred from it, and no sleep counts for
+    # more wall time than passed between the two passes.
+    r = project("reboot")
+    at(r, 30, 5000.0)
+    assert at(r, 3660, 10.0)["failing"] == ["loop heartbeat stale for 61 min awake"]
+    s = project("bounded")
+    at(s, 30, 100.0)
+    h = at(s, 400, 99999.0)
+    assert h["hb_asleep_s"] == pytest.approx(370) and h["failing"] == []
+
+
+def test_the_host_sleep_since_boot_reads_the_clock_pair_each_os_has(monkeypatch):
+    from ttp import overseer
+    clocks = {"CLOCK_BOOTTIME": 1, "CLOCK_MONOTONIC": 2, "CLOCK_UPTIME_RAW": 3}
+    for name, cid in clocks.items():
+        monkeypatch.setattr(overseer.time, name, cid, raising=False)
+    read = {1: 1000.0, 2: 400.0, 3: 150.0}
+    monkeypatch.setattr(overseer.time, "clock_gettime", lambda cid: read[cid])
+    monkeypatch.setattr(overseer.sys, "platform", "linux")
+    assert overseer.slept_since_boot() == 600.0     # BOOTTIME runs through a suspend, MONOTONIC stops
+    monkeypatch.setattr(overseer.sys, "platform", "darwin")
+    assert overseer.slept_since_boot() == 250.0     # macOS: MONOTONIC runs through sleep, UPTIME_RAW stops
+    monkeypatch.delattr(overseer.time, "CLOCK_UPTIME_RAW")
+    assert overseer.slept_since_boot() is None      # no such pair: no sleep is taken out
