@@ -19,6 +19,10 @@ check() judges each claim sentence, first backing that applies:
   that is ambiguous is unverified, never false): a task running for 'running'/'restarted', started for
   'started', not running for 'stopped', done for the rest; a run running, any run for 'started', ended for
   the rest. A worker notify's own task and run (relayed after its run ended) count as running then.
+A sentence saying a machine cannot be reached ('unreachable', "can't reach", 'no route to'; _reach, not
+hedged before the phrase) is judged apart, by a matching `claims` probe that exited 0 or else by the
+machines' reach record (reach.judge): false when a machine it names answered ssh within
+ssh.reach_fresh_min, unverified when no probe of it is that fresh. With a status verb too, any false wins.
 A claim that does not hold is not sent as written: it goes prefixed with what is true (FALSE_MARK), and
 the caller wakes the coordinator with a high `claim_false` event. A claim nothing could check goes with
 UNVERIFIED after it. Callers: coordinator.apply (replies and notifies, turn and session mode) and
@@ -64,6 +68,8 @@ _ATTACH = _FILLER | {"on", "in", "for", "at"}
 _CLAUSE = re.compile(r"(?i)[,;]|\s(?:and|but)\s")
 _SPLIT = re.compile(r"((?<=[.!?;])[ \t]+|\n)")
 _WORD = re.compile(r"[a-z0-9]{3,}")
+_REACH = re.compile(r"(?i)\b(?:unreachable|not reachable|(?:can(?:no|['’])t|could(?: not|n['’]t)|unable to) (?:be )?reach(?:ed)?|"
+                    r"no route to)\b")
 
 
 def _verb(sentence: str) -> str | None:
@@ -74,6 +80,22 @@ def _verb(sentence: str) -> str | None:
     for m in _verbs(s):
         return m["v"].lower()
     return None
+
+
+def _reach(sentence: str) -> bool:
+    """`sentence` says a machine cannot be reached, as a claim (not a question, plan or condition)."""
+    s = _CODE.sub(" ", sentence)
+    if not s.strip() or s.rstrip().endswith("?") or onhost.MARK in s or s.lstrip().startswith(FALSE_MARK):
+        return False
+    return any(not _HEDGE.search(s[:m.start()]) for m in _REACH.finditer(s))
+
+
+def _judge_reach(p, sentence: str, claims: list, now: float) -> tuple[str, str]:
+    c = _entry(sentence, claims)
+    if c and c.get("_rc") == 0:
+        return "ok", "its check exited 0"
+    from . import reach
+    return reach.judge(p, sentence, now)
 
 
 def _verbs(s: str) -> list:
@@ -231,10 +253,14 @@ def check(p, text: str, claims: list | None = None, now: float | None = None,
         parts = _SPLIT.split(head)
         false, unverified = [], 0
         for k in range(0, len(parts), 2):
-            verb = _verb(parts[k])
-            if not verb:
+            verb, cut_off = _verb(parts[k]), _reach(parts[k])
+            if not verb and not cut_off:
                 continue
-            got, why = _judge(p, parts[k], verb, claims or [], now, own)
+            got = [_judge(p, parts[k], verb, claims or [], now, own)] if verb else []
+            got += [_judge_reach(p, parts[k], claims or [], now)] if cut_off else []
+            bad = [w for g, w in got if g == "false"]
+            got, why = ("false", "; ".join(bad)) if bad else ("ok", "") if all(g == "ok" for g, _ in got) \
+                else ("unverified", "")
             lead = parts[k][:len(parts[k]) - len(parts[k].lstrip())]
             if got == "false":
                 false.append((parts[k].strip(), why))

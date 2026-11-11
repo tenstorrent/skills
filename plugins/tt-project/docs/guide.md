@@ -1758,6 +1758,11 @@ session and stateless coordinators on every provider.
   changed, and `-F`, ProxyJump and BatchMode work as before. A call that sets its own sharing or
   forwards ports is left as it is, and a shared connection that fails before the command starts
   falls back to a direct one (OpenSSH's own). Turn it off with `ttp config <name> ssh.reuse false`.
+- Each machine in `ttp machines` gets a harmless `ssh <alias> true` at most every 20 minutes
+  (`ssh.reach_probe_s`). The answer and its time are kept for every project on the host and shown in
+  the coordinator's digest. A reply or notify saying a machine can't be reached is marked false when
+  that machine answered within the last 30 minutes (`ssh.reach_fresh_min`), and unverified when no
+  probe is that recent.
 - A shared device or machine is taken per command, through its own queue (for example a device
   broker) or `ttp lock <resource> -- <command>`, so the rest of each task runs in parallel. A task
   marked exclusive holds the resource's lock for its whole run; while it waits for a slot, new

@@ -185,6 +185,7 @@ from . import upjournal
 from . import machine_ledger
 from . import accountset
 from . import netwait
+from . import reach
 from . import obligations
 from . import mustact
 from . import onpassdry
@@ -1393,6 +1394,7 @@ class Daemon:
         self._reboot_told = False
         self._linger_at, self._linger_off = 0.0, False   # linger last looked at, and what it said
         self._gh_auth: threading.Thread | None = None   # the host-wide gh login check in flight (ghauth.py)
+        self._reach: threading.Thread | None = None     # the machines' ssh reach probe in flight (reach.py)
         self._last_stop: dict = {}   # the clean-stop record this daemon found at start
         self._boot_woken = False
         self._cycles: dict[str, dict | None] = {}   # earlier boot -> its planned host cycle record
@@ -2297,7 +2299,7 @@ class Daemon:
                      self.sweep_alerts, self.check_release, self.sync_shared_pauses, self.check_pause_ends,
                      self.check_integrity, self.heal_harness_git,
                      self.sync_schedules, self.lint_charter, self.tend_holds, self.record_ttr, self.alert_long_pause,
-                     self.check_linger, self.check_notifier, self.check_overseer, self.alert_slurm_paused, self.check_gh_auth, self.check_chats,
+                     self.check_linger, self.check_notifier, self.check_overseer, self.alert_slurm_paused, self.check_gh_auth, self.check_reach, self.check_chats,
                      self.probe_mcp):
             if step in lease_off:
                 continue
@@ -4803,6 +4805,16 @@ class Daemon:
             self.alert(ghauth.KEY, ghauth.text(st, hostname(), when, self.cfg), severity="normal")
         elif db.kv(ghauth.KV) and (st.get("ok") or ghroute.works()):
             db.x("DELETE FROM kv WHERE key=?", (ghauth.KV,))
+
+    def check_reach(self) -> None:
+        """The listed machines' ssh reach probe (reach.py) in a thread when one is due: the digest's reach
+        record and the claim check of "can't reach" read it."""
+        due = reach.due(time.time(), reach.probe_every(self.p))
+        if due and not (self._reach and self._reach.is_alive()) \
+                and (not os.environ.get("PYTEST_CURRENT_TEST") or os.environ.get("TTP_TEST_REACH")):
+            self._reach = threading.Thread(target=reach.probe, args=(due, self._probe_env()), daemon=True,
+                                           name="machine-reach")
+            self._reach.start()
 
     def check_chats(self) -> None:
         """One low status line per relay chat that stopped reading with no listener running (chatgone)."""
@@ -14273,7 +14285,9 @@ class Daemon:
         stale = [h for h in dict.fromkeys(hosts) if now - self._host_up.get(h, (False, -1e18))[1] >= 60]
         if stale:
             env = self._probe_env()
-            self._host_up.update((h, (ok, now)) for h, ok in netwait.reach(stale, env).items())
+            got = netwait.reach(stale, env)
+            self._host_up.update((h, (ok, now)) for h, ok in got.items())
+            reach.record(got, now)
 
     def _drop_stale_probe(self, tid: int, probe: str) -> None:
         """The task's probe was re-pointed (`ttp task set-when`): kill a run of the old one and forget

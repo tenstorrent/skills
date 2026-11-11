@@ -126,6 +126,7 @@ from . import topup
 from . import probevars
 from . import onhost
 from . import claimcheck
+from . import reach
 from . import coordsession
 from . import spans
 from . import coordtools
@@ -677,7 +678,7 @@ MUTE_CHARS = 200
 # (LEDGER_SEEN_KEY).
 DIGEST_SEEN_KEY = "digest_seen"   # kv: {section: hash of what the previous turn's digest showed}
 COLLAPSIBLE = ("recurring", "muted", "memory_budget", "memory_pinned", "tried", "settled_areas", "course_check",
-               "progress", "user_words")
+               "progress", "user_words", "machine_reach")
 # The shared machine ledger collapses per line: co-tenants reword its lines often ('seen by', 'page
 # held', outage ends), so a turn with no machine_* event shows only the new or reworded ones, and the
 # whole ledger again after a machine event (ledger_section). The seen lines are keyed on the ledger
@@ -1442,6 +1443,10 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
     section("paused", lines)
     section("urgent_spend_held", urgent.spend_held_lines(p, db, now))
     section("resources", machines.digest_lines(db, paused, now))
+    if got := reach.digest_lines(p, now):
+        section("machine_reach", ["## Machine reach (last `ssh <alias> true` per machine; a \"can't reach\" claim "
+                                  "needs one this fresh, else it is marked)"] + got,
+                "\n".join(got), f"## Machine reach: {len(got)} machines (as last turn)")
     lines = []
     for res, got in shared.mismatches(p).items():
         lines.append(f"## Shared resource {res}: projects give different slot counts ("

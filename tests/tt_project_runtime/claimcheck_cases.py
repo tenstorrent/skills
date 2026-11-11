@@ -250,3 +250,73 @@ def test_a_pgrep_f_probe_never_matches_the_shell_running_it(env):
     got = schedrun.run_group(f"env | grep -c {probespawn.PROBE_ENV}= ; exit 7", cwd=str(p.root), timeout=10, env=None)
     assert (got.returncode, got.stdout.strip()) == (7, "0")
     assert os.environ.get(probespawn.PROBE_ENV) is None
+
+
+def test_a_cant_reach_claim_is_judged_by_each_machines_last_ssh_probe(env):
+    """Upstream note 9c67e8613069a76c: a coordinator repeated an untested 'workers can't reach these boxes'
+    note and every box answered when probed. The reach record (reach.py) keeps each listed machine's last
+    `ssh <alias> true` answer and time; a reply saying a machine cannot be reached is false when it answered
+    within ssh.reach_fresh_min, unverified with no probe that fresh, and sent as written when it failed one."""
+    from ttp import claimcheck, coordinator as coord, machines, reach
+    p = make(env)
+    now = time.time()
+    for h in ("box-a", "box-b", "box-c"):
+        machines.add(h, hostname=f"{h}.example" if h == "box-c" else None)
+    reach.record({"box-a": True, "box-b": False, "box-c": "agent", "not-listed": True}, now - 60)
+    st = reach.read()
+    assert st["box-a"]["ok"] is True and st["box-b"]["ok"] is False and set(st) == {"box-a", "box-b"}
+    reach.record({"box-a": False}, now - 600)   # an older answer never overwrites a newer one
+    assert reach.read()["box-a"]["ok"] is True
+    got, false, unv = claimcheck.check(p, "Workers can't reach box-a or box-b.", now=now)
+    assert got.startswith(f"{claimcheck.FALSE_MARK} (box-a answered ssh at ") and len(false) == 1 and not unv, got
+    assert claimcheck.check(p, "box-b is unreachable.", now=now) == ("box-b is unreachable.", [], 0)
+    # No probe of it (the agent answer was never kept), no machine named, or a probe past the window: unverified.
+    for text in ("box-c.example is not reachable.", "The boxes are unreachable.", "box-a cannot be reached."):
+        at = now + 31 * 60 if text.startswith("box-a") else now
+        got, false, unv = claimcheck.check(p, text, now=at)
+        assert unv == 1 and not false and claimcheck.UNVERIFIED in got, (text, got)
+    # A setting widens the window; a question, a condition, code and a probe that held stay as written.
+    p.set_config("ssh.reach_fresh_min", 60)
+    assert claimcheck.check(p, "box-a cannot be reached.", now=now + 40 * 60)[1], "40 min old is fresh under 60"
+    for text in ("Can workers not reach box-a?", "If box-a is unreachable, retry later.", "Ran `ssh box-a || echo unreachable`."):
+        assert claimcheck.check(p, text, now=now) == (text, [], 0), text
+    claims = [{"text": "box-a is unreachable", "expect": "true", "_rc": 0}]
+    assert claimcheck.check(p, "box-a is unreachable.", claims, now=now)[1] == []
+    # A status verb and a reach phrase in one sentence: the false one wins.
+    tid = p.db.add_task("t", "s", kind="work", status="running")
+    got, false, _ = claimcheck.check(p, f"Task #{tid} is running but box-a is unreachable.", now=now)
+    assert got.startswith(claimcheck.FALSE_MARK) and "box-a answered ssh" in false[0][1]
+    # Through apply: the reply goes marked and the coordinator gets the high claim_false event.
+    coord.apply(p, [{"type": "reply", "text": "Workers can't reach box-a.", "chat": "c1"}], turn=1)
+    assert _cc_sent(p)[-1].startswith(claimcheck.FALSE_MARK) and _cc_false_events(p)
+
+
+def test_the_digest_shows_each_machines_reach_and_the_daemon_probes_due_machines(env, monkeypatch):
+    from ttp import coordinator as coord, daemon as dm, machines, netwait, reach
+    p = make(env)
+    now = time.time()
+    for h in ("box-a", "box-b", "box-old"):
+        machines.add(h, tags="retired" if h == "box-old" else None)
+    assert reach.due(now) == ["box-a", "box-b"]
+    reach.record({"box-a": True}, now - 60)
+    assert reach.due(now) == ["box-b"] and reach.due(now + 1200) == ["box-a", "box-b"]
+    lines = reach.digest_lines(p, now)
+    assert lines[0].startswith("- box-a: answered ssh at ") and lines[1] == "- box-b: never probed"
+    assert len(lines) == 2, "a retired machine is left out"
+    d = coord.digest(p, {}, [], [])
+    assert "## Machine reach" in d and "- box-a: answered ssh at " in d
+    # The daemon's step probes only the due machines, in a thread, with a harmless `true`.
+    asked = []
+    monkeypatch.setattr(netwait, "reach", lambda names, env=None: asked.append(list(names)) or {n: False for n in names})
+    monkeypatch.setenv("TTP_TEST_REACH", "1")
+    d = dm.Daemon(p.base)
+    d.check_reach()
+    d._reach.join(5)
+    assert asked == [["box-b"]] and reach.read()["box-b"]["ok"] is False
+    d.check_reach()
+    assert d._reach is None or not d._reach.is_alive() and asked == [["box-b"]]
+    # The daemon's own probe of a waiting task's host is kept too.
+    d._host_up.clear()
+    monkeypatch.setattr(netwait, "reach", lambda names, env=None: {n: True for n in names})
+    d._check_hosts(["box-b"], time.time())
+    assert reach.read()["box-b"]["ok"] is True
