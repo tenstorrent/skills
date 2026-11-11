@@ -99,6 +99,13 @@ AUTH_RE = re.compile(r"could not read (?:Username|Password)|Authentication faile
                      r"Invalid username or password|terminal prompts disabled|requested URL returned error: 40[13]",
                      re.I)   # a push rejection that is the credential's, not the change's
 DYING_AFTER = 3                 # batches that die in a row before push_queue_dying is raised
+REACH_RE = re.compile(r"cannot reach|unable to access|Could not resolve|Failed to connect|Connection (?:timed out|refused|"
+                      r"reset|closed)|Network is unreachable|Operation timed out|early EOF", re.I)   # the remote, not the change
+SAME_FAIL_AFTER = 2             # pushes or batches in a row failing to one target the same way before push_same_failure
+SAME_FAIL_HOLD_S = 6 * 3600     # an unchanged queue held on a same failure that no probe can clear is tried again after this
+URGENT_WAIT_S = 900.0           # an urgent approval waiting this long behind a running batch raises push_urgent_waiting
+TIP_FIX_RE = re.compile(r"\bfix(?:es|ing)?\b[^.\n]{0,80}?\b(?:tip|pre-?existing (?:test )?failures?|failing tests?)\b",
+                        re.I)   # a spec or hand-off saying its change fixes the failing tip
 DEFAULT_LANDING_ALERT_H = 4     # delivery.push_landing_alert_h: approvals waiting this long with no landing alert (high)
 LANDING_ALERT = "push_not_landing"   # the keyed alert while nothing lands despite batches (alerts.holds)
 UNREACH_ALERT = "push_target_unreachable"   # the keyed alert while the target's remote cannot be reached (alerts.holds)
@@ -270,6 +277,79 @@ def _auth_probe(p: Project, remote: str, branch: str) -> bool:
         return False
     out = f"{r.stdout or ''}\n{r.stderr or ''}"
     return r.returncode == 0 or (not AUTH_RE.search(out) and "rejected" in out)
+
+
+def _fail_sig(text: str) -> str:
+    """A failure message with what changes between tries (shas, numbers, times) taken out: two
+    failures with the same sig failed the same way."""
+    t = re.sub(r"\b[0-9a-f]{7,40}\b", "<sha>", str(text or ""))
+    return re.sub(r"\s+", " ", re.sub(r"\d+", "N", t)).strip()[:200]
+
+
+def _queue_key(rows: list[dict]) -> str:
+    """What a batch would take: the approvals' ids and heads; a change ends a same-failure hold."""
+    return hashlib.sha1(json.dumps(sorted([r["id"], r["head"]] for r in rows)).encode()).hexdigest()[:16]
+
+
+def _streak(db, st: dict, target: str, outcome: str, why: str, now: float, tip: str | None) -> str | None:
+    """Count a push or batch to `target` that failed before landing (died, error, rejected) in
+    st["fail_streak"]. The SAME_FAIL_AFTER-th one in a row failing the same way (_fail_sig) returns the
+    text of the one push_same_failure event for it, and due holds the queue on it (_same_held) instead
+    of retrying blindly every backoff; None otherwise. Any other outcome ends the streak (_apply)."""
+    sig = _fail_sig(why)
+    fs = st.get("fail_streak") if isinstance(st.get("fail_streak"), dict) else {}
+    if fs.get("target") == target and fs.get("sig") == sig:
+        fs["count"] = int(fs.get("count") or 0) + 1
+    else:
+        fs = {"target": target, "sig": sig, "count": 1, "since": now}
+    fs.update(why=str(why)[:600], outcome=outcome, last=now, probed=now,
+              key=_queue_key(db.q("SELECT id, head FROM push_queue WHERE status='approved'")), tip=tip or None)
+    fs["reach"] = bool(REACH_RE.search(why) or AUTH_RE.search(why))
+    st["fail_streak"] = fs
+    if fs["count"] < SAME_FAIL_AFTER:
+        return None
+    fs["told"] = now    # due holds on it (_same_held)
+    if fs.get("told_sig") == sig:
+        return None     # one event per failure: a retry failing the same way only holds again
+    fs["told_sig"] = sig
+    return (f"The last {fs['count']} push batches to {target} failed the same way ({outcome}): {fs['why']}. "
+            f"Failing since {time.strftime('%Y-%m-%d %H:%M %Z', time.localtime(float(fs['since'])))}. The queue "
+            f"no longer retries on a timer: " + (
+                f"it retries once a dry-run push to the remote works (checked every {AUTH_PROBE_S / 60:g} min)."
+                if fs["reach"] else
+                f"it retries when the tip or the approvals change, or after {SAME_FAIL_HOLD_S // 3600} h.")
+            + " Fix the cause (the remote, the host's network or credential, or the batch's error) to land now.")
+
+
+def _same_held(p: Project, st: dict, remote: str, branch: str, rows: list[dict], tip: str, now: float) -> str:
+    """Why due holds the queue on a same failure st["fail_streak"] told the coordinator about (_streak),
+    or "" once it may run: for a remote that could not be reached or authenticated, once a model-free
+    dry-run push works (_auth_probe, at most every AUTH_PROBE_S, never in a transaction); for any other
+    failure, once the tip or the approvals change or SAME_FAIL_HOLD_S passed."""
+    fs = st.get("fail_streak")
+    if not isinstance(fs, dict) or not fs.get("told") or fs.get("target") != f"{remote}/{branch}":
+        return ""
+    if fs.get("reach"):
+        ok = False
+        if not p.db.conn.in_transaction and now - float(fs.get("probed") or 0) >= AUTH_PROBE_S:
+            fs["probed"] = now
+            ok = _auth_probe(p, remote, branch)
+            p.db.set_kv(KV, st)
+    else:
+        ok = _queue_key(rows) != fs.get("key") or bool(fs.get("tip") and tip and tip != fs["tip"]) \
+            or now >= float(fs["told"]) + SAME_FAIL_HOLD_S
+    if not ok:
+        return (f"held: the last {fs['count']} push batches failed the same way ({str(fs.get('why'))[:200]}); "
+                + ("retried once a dry-run push to the remote works" if fs.get("reach") else
+                   f"retried when the tip or the approvals change, or {_at(float(fs['told']) + SAME_FAIL_HOLD_S, now, p)}"))
+    fs["told"] = None   # one more try; failing the same way it holds again at once, without another event
+    if fs.get("reach"):
+        st.pop("backoff_until", None)   # the remote answers: no reason left to wait
+    p.db.set_kv(KV, st)
+    _event(p.db, None, "push_same_failure_cleared", f"the push queue retries {remote}/{branch} now: "
+                                                    f"{'the remote answers again' if fs.get('reach') else 'the tip or the approvals changed or the hold ended'}",
+           queued=False)
+    return ""
 
 
 def _state(db) -> dict:
@@ -1249,6 +1329,51 @@ def _gap_left(db, now: float, gap: float) -> float:
     return 0.0 if t is None or t > now else max(0.0, t + gap - now)
 
 
+def _tip_fix(p: Project, rows: list[dict], bad: dict) -> dict | None:
+    """The first of `rows` (approved, not yet tried on the failing tip of `bad`, state "bad_tip") that
+    fixes that tip: its change touches the test files the tip fails (bad["ids"]), or its review's or
+    the reviewed task's spec or hand-off says it fixes the tip or the failing tests (TIP_FIX_RE). due
+    pushes it alone first, so the others are not bisected against a tip that fails on its own."""
+    files = {str(i).split("::")[0] for i in bad.get("ids") or [] if str(i).split("::")[0].endswith(".py")}
+    for r in rows:
+        if files and (got := _changed(p, bad["tip"], r["head"])) and files & got:
+            return r
+        t = p.db.task(r["task"]) or {}
+        texts = [str(t.get("title") or ""), str(t.get("spec") or "")]
+        for dep in t.get("depends_on") or [] if isinstance(t.get("depends_on"), list) else []:
+            if (d := p.db.task(dep)) is not None:
+                texts += [str(d.get("title") or ""), str(d.get("spec") or "")[:4000], str(d.get("result") or "")[:4000]]
+        if any(TIP_FIX_RE.search(x) for x in texts):
+            return r
+    return None
+
+
+def _urgent_waits(p: Project, live: str, now: float) -> None:
+    """One push_urgent_waiting event to the coordinator per urgent approval (urgent.covers_urgent, or
+    priority 1) that waited URGENT_WAIT_S behind the running batch `live`; DB reads only."""
+    db = p.db
+    rows = db.q("SELECT id, task, created FROM push_queue WHERE status='approved' AND created<=?",
+                (now - URGENT_WAIT_S,))
+    st = _state(db)
+    told = [i for i in st.get("urgent_told") or [] if i in {r["id"] for r in rows}]
+    new = []
+    for r in rows:
+        if r["id"] in told:
+            continue
+        t = db.task(r["task"])
+        if t and (urgent.covers_urgent(db, t) or int(t.get("priority") or 5) <= 1):
+            new.append(r)
+    if not new and told == (st.get("urgent_told") or []):
+        return
+    st["urgent_told"] = told + [r["id"] for r in new]
+    db.set_kv(KV, st)
+    for r in new:
+        _event(db, db.task(r["task"]), "push_urgent_waiting",
+               f"urgent approval of review #{r['task']} has waited {(now - float(r['created'])) / 60:.0f} min "
+               f"behind the running push batch {live}: stop that batch or push this one alone if it cannot wait",
+               queued=True, severity="high")
+
+
 def due(p: Project, now: float | None = None, cfg: dict | None = None) -> tuple[list[dict], str]:
     """The approved rows a batch (a push train) should take now and why; or ([], why not). A train takes
     every approval due at its start, best priority first: delivery.push_batch_max only starts one at
@@ -1274,6 +1399,7 @@ def due(p: Project, now: float | None = None, cfg: dict | None = None) -> tuple[
     db = p.db
     live = db.one("SELECT id FROM push_batches WHERE after_finalized IS NULL ORDER BY started LIMIT 1")
     if live:
+        _urgent_waits(p, live["id"], now)
         return [], f"batch {live['id']} is still going"
     d = _delivery(p, cfg)
     rows = _approved(db, f"{remote}/{branch}", now, _num(d.get("push_age_s"), DEFAULT_AGE_S, float, 0))
@@ -1292,6 +1418,8 @@ def due(p: Project, now: float | None = None, cfg: dict | None = None) -> tuple[
     if push.lock_name(remote, branch) in paused or "push" in paused:
         return [], "the push resource is paused"
     st = _state(db)
+    if held := _same_held(p, st, remote, branch, rows, _tracking_tip(p, remote, branch), now):
+        return [], held
     if float(st.get("backoff_until") or 0) > now and not _auth_back(p, st, remote, branch, now):
         why = " (the last push was rejected for authentication: it retries once push access works)" \
             if st.get("auth_wait") else ""
@@ -1308,6 +1436,9 @@ def due(p: Project, now: float | None = None, cfg: dict | None = None) -> tuple[
         # tried ones wait, so the same tip is not checked again and again.
         tried = set(bad.get("tried") or [])
         fresh = [r for r in rows if r["id"] not in tried]
+        if fix := _tip_fix(p, fresh, bad):
+            return [fix], (f"approval #{fix['id']} (review #{fix['task']}) fixes the failing tip {_short(bad['tip'])}: "
+                           f"it goes alone first, then the rest rebuild on the new tip")
         if not fresh and now < (until := _bad_until(bad)):
             return [], (f"held: the tip {_short(bad['tip'])} fails its checks on its own and every approval was "
                         f"tried on it; next try {_at(until, now, p)} unless the tip or the approvals change")
@@ -1889,7 +2020,10 @@ def _died_db(p: Project, b: dict, m: dict, alert: Callable, why: str, now: float
         tell = stop and not un.get("alerted")
         if tell:
             un["alerted"] = now
+        same = _streak(db, st, b["target"], outcome, why, now, m.get("tip"))
         db.set_kv(KV, st)
+        if same:
+            _event(db, None, "push_same_failure", same, queued=True, severity="high")
         _event(db, None, "push_batch_died",
                f"push batch {b['id']} {why}; {len(rows)} approval{'s' if len(rows) != 1 else ''} back in the queue, "
                + (f"no batch starts until its remote answers (asked every {UNREACH_PROBE_S // 60} min)" if stop
@@ -2343,6 +2477,8 @@ def _apply(p: Project, b: dict, m: dict, alert: Callable, now: float) -> None:
                      (1 if outcome == "moved" else 0, text, now, r["id"]))
         st = _state(db)
         st["deaths"] = 0
+        if outcome != "rejected":
+            st.pop("fail_streak", None)   # a batch that got further than the last one: no same failure in a row
         back = [r["id"] for r in db.q("SELECT id FROM push_queue WHERE batch=? AND status='approved'", (b["id"],))]
         st.pop("hold", None)   # the time-boxed hold of older releases; bad_tip replaces it
         bad = st.get("bad_tip") or {}
@@ -2395,6 +2531,8 @@ def _apply(p: Project, b: dict, m: dict, alert: Callable, now: float) -> None:
         if outcome == "rejected":
             st["backoff_until"] = now + BACKOFF_MAX_S
             why = str(m.get('message') or _tail_of(m, None, 5))[:1500]
+            if same := _streak(db, st, b["target"], outcome, why, now, tip):
+                _event(db, None, "push_same_failure", same, queued=True, severity="high")
             if auth := bool(AUTH_RE.search(why)):   # the credential: retried once push access works (_auth_back)
                 st["auth_wait"] = {"at": now}
             else:

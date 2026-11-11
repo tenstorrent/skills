@@ -4822,7 +4822,8 @@ def test_dead_batches_retry_with_a_growing_pause_and_three_in_a_row_raise_an_ale
         sent = s.p.db.q("SELECT severity FROM messages WHERE kind='alert' AND ref='push_queue_dying'")
         assert len(sent) == (1 if n == 3 else 0)
     assert [b["outcome"] for b in s.p.db.q("SELECT outcome FROM push_batches")] == ["died"] * 3
-    assert not [e for e in _pq_events(s.p, mark) if e["status"] == "queued"]
+    assert [e["kind"] for e in _pq_events(s.p, mark) if e["status"] == "queued"] == ["push_same_failure"], \
+        "the second death the same way tells the coordinator once; the third only holds"
     assert s.p.db.task(s.review)["status"] == "pushing" and s.p.db.one("SELECT COUNT(*) n FROM runs")["n"] == 0
     assert alerts.holds(s.p.db, "push_queue_dying", before, time.time())
     _pq_plan(s, outcome="pushed", sha="ab" * 20)
@@ -20386,3 +20387,106 @@ def test_a_takeover_that_defers_to_a_live_merge_task_waits_for_it_then_reports_i
     db.update_task(tid, status='cancelled')     # the owner ended without landing it: the takeover goes on
     deploy.tick(p, page, t + 4 * deploy.PROBE_S)
     assert len(launched) == 2, "the wait spent no try"
+
+
+def _pq_same(p, mark):
+    return [e for e in _pq_events(p, mark) if e["kind"] == "push_same_failure"]
+
+
+def test_two_batches_that_cannot_reach_the_remote_tell_the_coordinator_once_and_wait_for_the_remote(env, monkeypatch):
+    # The 47 h of silent retries: every batch ended "cannot reach origin" and was retried every 30 min.
+    # The second such batch in a row raises one high event to the coordinator; then the queue waits for a
+    # model-free dry-run push to work instead of retrying on a timer, and a third failure the same way
+    # only holds again (timings in the message differ: the same failure all the same).
+    from ttp import pushq
+    s = _pq(env, monkeypatch)
+    _pq_hand_off(env, s)
+    mark = _pq_mark(s.p)
+    for ms in (133136, 131002):
+        _pq_plan(s, outcome="error", message=f"cannot reach origin: fatal: unable to access 'https://example.com/r.git/': "
+                                             f"Failed to connect to example.com port 443 after {ms} ms")
+        _pq_batch(s)
+        _pq_tend(s)
+    ev, = _pq_same(s.p, mark)
+    assert ev["status"] == "queued" and "Failed to connect" in ev["text"] and "dry-run push" in ev["text"], ev
+    assert s.p.db.one("SELECT severity FROM events WHERE kind='push_same_failure'")["severity"] == "high"
+    probes, ok = [], {"v": False}
+    monkeypatch.setattr(pushq, "_auth_probe", lambda p, remote, branch: probes.append(1) or ok["v"])
+    now = time.time() + 3 * pushq.BACKOFF_MAX_S   # past any backoff: no timer retries it
+    rows, why = pushq.due(s.p, now)
+    assert rows == [] and why.startswith("held: the last 2 push batches failed the same way") and probes == [1], why
+    assert pushq.due(s.p, now + 10)[0] == [] and probes == [1], "probed at most every AUTH_PROBE_S"
+    ok["v"] = True
+    rows, why = pushq.due(s.p, now + pushq.AUTH_PROBE_S)
+    assert rows, why
+    _pq_batch(s)   # still failing the same way: held again, no second event
+    _pq_tend(s)
+    assert len(_pq_same(s.p, mark)) == 1
+    ok["v"] = False
+    assert pushq.due(s.p, time.time() + 3 * pushq.BACKOFF_MAX_S)[1].startswith("held: the last 3 push batches")
+
+
+def test_two_pushes_rejected_the_same_way_hold_until_the_approvals_change_and_a_landing_ends_the_streak(
+        env, monkeypatch):
+    from ttp import pushq
+    s = _pq(env, monkeypatch)
+    _pq_hand_off(env, s)
+    mark = _pq_mark(s.p)
+    for sha in ("ab" * 20, "cd" * 20):
+        _pq_plan(s, outcome="rejected", row="requeued",
+                 message=f"! [remote rejected] {sha} -> proj (protected branch hook declined)")
+        _pq_batch(s)
+        _pq_tend(s)
+    assert len(_pq_same(s.p, mark)) == 1
+    now = time.time() + 3 * pushq.BACKOFF_MAX_S
+    rows, why = pushq.due(s.p, now)
+    assert rows == [] and "retried when the tip or the approvals change" in why, why
+    _pq_review(s)   # a new approval: worth one more try
+    rows, why = pushq.due(s.p, now)
+    assert rows, why
+    _pq_plan(s, outcome="pushed", sha="ef" * 20)
+    _pq_batch(s)
+    _pq_tend(s)
+    assert "fail_streak" not in s.p.db.kv(pushq.KV)
+
+
+def test_a_failure_signature_ignores_shas_and_numbers_but_not_the_error():
+    from ttp import pushq
+    a = pushq._fail_sig("failed: ab12cd34ef after 1200 ms on try 3")
+    assert a == pushq._fail_sig("failed: 99ffee0011 after 87 ms on try 4")
+    assert a != pushq._fail_sig("failed: ab12cd34ef: protected branch")
+
+
+def test_an_urgent_approval_waiting_behind_a_running_batch_for_15_min_tells_the_coordinator_once(env, monkeypatch):
+    from ttp import pushq
+    s = _pq(env, monkeypatch)
+    now = time.time()
+    _pq_last_batch(s, None, now - 60, after_done=False)   # still running
+    _, slow = _pq_review(s, priority=3)
+    _, hot = _pq_review(s, priority=1)
+    s.p.db.x("UPDATE push_queue SET created=?", (now - pushq.URGENT_WAIT_S - 60,))
+    mark = _pq_mark(s.p)
+    assert "still going" in pushq.due(s.p, now)[1]
+    assert pushq.due(s.p, now + 60)[0] == []
+    ev = [e for e in _pq_events(s.p, mark) if e["kind"] == "push_urgent_waiting"]
+    assert len(ev) == 1 and ev[0]["status"] == "queued" and "b1" in ev[0]["text"], ev
+    assert s.p.db.kv(pushq.KV)["urgent_told"] == [hot]
+
+
+def test_an_approval_that_fixes_the_failing_tip_goes_alone_first(env, monkeypatch):
+    from ttp import pushq
+    s = _pq(env, monkeypatch)
+    _, routine = _pq_review(s)
+    fid = s.p.db.add_task("review the tip fix", "Review #9: fix the pre-existing failures on the push tip", kind="review",
+                          origin="coordinator")
+    s.p.db.update_task(fid, status="pushing")
+    with s.p.db.tx():
+        [fix] = pushq.approve(s.p, fid, None, {"entries": [{"branch": s.branch, "head": s.head}], "target": "origin/proj"})
+    tip = pushq._tracking_tip(s.p, "origin", "proj")
+    s.p.db.set_kv(pushq.KV, {"bad_tip": {"tip": tip, "fails": 2, "tried": [], "at": time.time(),
+                                         "ids": ["tests/test_other.py::test_a"]}})
+    rows, why = pushq.due(s.p, time.time() + 10 ** 6)
+    assert [r["id"] for r in rows] == [fix] and "fixes the failing tip" in why, why
+    monkeypatch.setattr(pushq, "_changed", lambda p, a, b: frozenset({"tests/test_other.py"}))
+    rows, why = pushq.due(s.p, time.time() + 10 ** 6)
+    assert [r["id"] for r in rows] == [routine], "the first approval whose change touches the failing tests"
