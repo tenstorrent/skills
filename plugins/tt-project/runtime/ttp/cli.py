@@ -1702,6 +1702,7 @@ def status_text(p: Project, verbose: bool = False) -> str:
         lines.extend(testslots.use_lines())
         lines.extend(checklane.lane_lines(p.name, p.config(), now))
     lines.extend(checklane.long_wait_lines(p.name, p.config(), now))
+    lines.extend(checkspill.limit_lines(p.name))   # the limit each live checks run is under: always shown
     lines.extend(checkspill.skip_lines(now))   # a spill host kept off for a device job: always shown
     if paused := slurmcheck.paused_line(now):   # the Slurm overflow's start-failure breaker: always shown
         lines.append(paused)
@@ -5316,7 +5317,7 @@ def _checks_lane_status(as_json: bool) -> int:
                          indent=2))
     else:
         print(checklane.status_text(p.name, p.config(), here_repo, names=names, db=p.db))
-        for line in [*checkspill.no_spill_lines(), *checkspill.status_lines(p.name), *checkspill.pick_lines(p.name), *checkspill.here_lines(p.name), *slurmcheck.probe_lines(), *slurmcheck.status_lines(p.name),
+        for line in [*checkspill.no_spill_lines(), *checkspill.status_lines(p.name), *checkspill.pick_lines(p.name), *checkspill.here_lines(p.name), *checkspill.limit_lines(p.name), *slurmcheck.probe_lines(), *slurmcheck.status_lines(p.name),
                      *filter(None, [slurmcheck.paused_line()])]:
             print(f"  {line}")
         print("check runs per host:")
@@ -5399,10 +5400,21 @@ def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: boo
     pats = checklane.light_patterns(cfg)
     if (hosts := list(dict.fromkeys(h for c in cmds or () if (h := push.remote_host(c))))) and all(
             push.remote_host(c) or checklane.is_light(str(c), pats) for c in cmds):
-        from . import remoteload, testslots
-        remoteload.wait(hosts, tell, testslots.push_load_wait_s(cfg))
-        tell(f"checks run on {', '.join(hosts)}: running now, outside this machine's checks slot and test slots")
-        return checkcap.Slot()
+        from . import remoteload
+        # A task's checks never start on an overloaded check host (only push checks keep a bounded start):
+        # in the foreground the wait hands over to detached checks after FOREGROUND_WAIT_S, detached it waits.
+        bound = checkcap.FOREGROUND_WAIT_S if foreground and p else None
+        if remoteload.wait(hosts, tell, bound, anyway=False):
+            return None
+        # Each host's check slots are claimed as a spill pick claims them, so runs here never overshoot it.
+        if (claims := checkspill.admit_pinned(p, hosts, tell, what=checklane.scope_text(cmds)[:300],
+                                              bound=bound)) is None:
+            return None
+        tell(f"checks run on {', '.join(hosts)}: running now, outside this machine's checks slot and test slots"
+             + (f", holding {len(claims)} check slot(s) there" if claims else ""))
+        slot = checkcap.Slot()
+        slot.pinned = claims
+        return slot
     prio, owns = checkcap.task_rank(p or checkcap.adopted_project())
     from . import testslots
     repo = testslots.repo_key(top) if p else ""
@@ -5707,7 +5719,7 @@ def _checks_slot_take(p, run_dir: Path, out, head: str, tell, waiting, limit: fl
                                     waiting, left, arrived,
                                     checkcap.queue_name(p), prio, same, done, stop,
                                     p.state if p else None, owns, cap=checklane.project_cap(cfg), lane_at=lane_at,
-                                    startable=startable,
+                                    startable=startable, why=lambda: getattr(suite, "gate", "") or "",
                                     parks=lambda on: testslots.lane_waits(
                                         suite, testslots.PARKED_WAITS if on else "a host-wide checks slot"),
                                     urgent=urgent, preemptible=checkcap.preemptible(cmds, lock),

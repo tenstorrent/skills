@@ -614,6 +614,46 @@ def workers(cores: int, load: float | None, others: int = 0, cap: int = 0) -> in
     return max(1, min(cap or cores, cores, idle))
 
 
+def workers_why(cores: int, load: float | None, others: int = 0, cap: int = 0) -> tuple[int, str]:
+    """workers(), and what sized it, for the spill line and status (no silent throttling): the host's idle
+    cores, those kept for this machine's `others` runs there, one run's limit `cap` (checks.test_run_max), and
+    why a run gets a single worker."""
+    n = workers(cores, load, others, cap)
+    if not n:
+        return 0, "test workers it sizes itself (the host's load did not read)"
+    from . import checklane
+    raw = int(cores - load)
+    kept = others * checklane.run_cores(None, cores)
+    why = f"{n} test worker(s), its idle cores (load {load:g} of {cores})"
+    if others:
+        why += f", less {kept} kept for {others} other run(s) of this machine there"
+    if cap and n == cap and cap < min(cores, raw - kept):
+        why += f", at most {cap} per run (limit checks.test_run_max)"
+    if raw - kept < 1:
+        why += (f"; only 1 because {max(0, raw)} core(s) are idle"
+                + (f" and {kept} are kept for this machine's other runs there" if others else ""))
+    return n, why
+
+
+def _size(cfg: dict, host: str) -> tuple[int, str]:
+    """workers_why for a run to `host` from its last probe (_READ), before this run's claim there."""
+    from . import testslots
+    cores, load = _READ.get(host, (0, None))
+    top = testslots.sizes(cfg, cores) if cores > 0 else None   # one run's limit, sized to that host
+    return workers_why(cores, load, _ours(host), top[1] if top else 0)
+
+
+def _probe_all(items: list[tuple[str, bool]]) -> dict:
+    """probe() of each (host, beside_device), at once: a pick compares them all, so none waits on another's ssh."""
+    items = list(dict.fromkeys(items))
+    if len(items) <= 1:
+        return {h: probe(h, b) for h, b in items}
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=min(8, len(items))) as ex:
+        got = list(ex.map(lambda hb: probe(*hb), items))
+    return {h: r for (h, _), r in zip(items, got)}
+
+
 def workers_env(n: int) -> dict:
     """The grant a spilled run's commands see for `n` workers (testslots: what xdist's `-n auto` and a held
     grant read); {} for 0."""
@@ -868,6 +908,7 @@ def probe(alias: str, beside_device: bool = False) -> tuple[int, str, str]:
     load = float(m[4]) if m[4] and m[4] != "-" else None
     _READ[alias] = (cores, load)
     _note_host(alias, cores=cores, load=load)
+    _CHECKS_RUNNING[alias] = running
     # This machine's runs started there in the last LOAD_LAG_S count as load already: many picks at once
     # each see the same 1-minute load, which shows none of them yet.
     seen = None if load is None else load + _pending_cores(alias, cores)
@@ -893,6 +934,8 @@ def _failed(alias: str, why: str) -> tuple[int, str, str]:
 _OUT_OF_REACH = ("ssh ", "cannot run ssh", "it lacks", "its probe failed", "its pre-run hook error")   # probe and hook
 LAST_BUSY: list[str] = []   # the hosts the last pick skipped only as busy (remote_only waits for them)
 _READ: dict[str, tuple[int, float | None]] = {}   # the last probe's (cores, load) per host: pick sizes a run's workers from it
+_CHECKS_RUNNING: dict[str, int] = {}   # the last probe's running checks per host: _claim counts in-flight claims beyond them
+PINNED_POLL_S = 15.0   # how often a run pinned to a full host probes it again (admit_pinned)
 
 
 def claim_dir() -> Path:
@@ -1112,6 +1155,7 @@ class Claim:
                 pass
 
     def close(self) -> None:
+        note_limit("", "")   # off the host: its limit line leaves status
         if self.lock is not None:
             self.lock.close()
             self.lock = None
@@ -1127,7 +1171,13 @@ class Claim:
 def _claim(alias: str, free: int, rec: dict) -> Claim | None:
     d = claim_dir()
     d.mkdir(parents=True, exist_ok=True)
-    for i in range(max(0, free) + _ours(alias)):
+    # This machine's claims are among the host's running checks only once their runs started there: one
+    # beyond the probe's count is still in flight and takes a free slot too, so concurrent pickers in any
+    # project here never claim more than the host fits.
+    ours = _ours(alias)
+    if (running := _CHECKS_RUNNING.get(alias)) is not None:
+        ours = min(ours, running)
+    for i in range(max(0, free) + ours):
         f = open(d / f"{alias}.{i}.json", "a+")
         try:
             fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -1140,6 +1190,49 @@ def _claim(alias: str, free: int, rec: dict) -> Claim | None:
         f.flush()
         return Claim(alias, f)
     return None
+
+
+def admit_pinned(p, hosts: list[str], tell, what: str = "", bound: float | None = None,
+                 sleep=time.sleep, clock=time.monotonic) -> list[Claim] | None:
+    """A claim on each host checks are pinned to (delivery.checks_host or a check's own "host"), taken as a
+    spill pick takes one (probe's free slots, _claim counting this machine's in-flight claims), so the runs of
+    every project here never start more checks there than it fits. While a host is full the run waits, told
+    once per reason with its numbers and shown in status (note_limit), at most `bound` seconds (None: until
+    all are claimed): None then, holding nothing. A host the probe cannot read holds no run (its checks then
+    fail or pass on their own), as remoteload.held never does."""
+    rec = {"project": getattr(p, "name", ""), "task": os.environ.get("TTP_TASK") or "",
+           "run": os.environ.get("TTP_RUN_ID") or "", "pid": os.getpid(), "since": time.time(),
+           "what": what[:300], "pinned": True}
+    got: dict[str, Claim] = {}
+    start, said = clock(), {}
+    while True:
+        for host in hosts:
+            if host in got:
+                continue
+            free, why, _ = probe(host, True)
+            if why.startswith(_OUT_OF_REACH):
+                got[host] = Claim(host, None)   # nothing to count it by: no hold
+                continue
+            if not why and (c := _claim(host, free, {**rec, "host": host})) is not None:
+                got[host] = c
+                continue
+            why = why or (f"its {free} free check slot(s) are claimed by this machine's "
+                          f"{_ours(host)} run(s) there")
+            if said.get(host) != why:
+                line = f"checks pinned to {host} wait for a check slot there: {why}"
+                tell(line + (f" (at most {bound:.0f}s)" if bound is not None else ""))
+                if p is not None:
+                    note_limit(p.name, line, what)
+                said[host] = why
+        if len(got) == len(hosts):
+            if said and p is not None:
+                note_limit(p.name, "")
+            return [c for c in got.values() if c.f is not None]
+        if bound is not None and clock() - start >= bound:
+            for c in got.values():
+                c.close()
+            return None
+        sleep(PINNED_POLL_S)
 
 
 def _ours(alias: str) -> int:
@@ -1222,6 +1315,14 @@ def used_share(host: str, recs: list | None = None, now: float | None = None) ->
     since = at - LOAD_LAG_S if fresh else 0.0   # runs just before the probe may not show in its load yet
     load = float(st["load"]) if fresh else 0.0
     return (load + sum(_run_cores(r, cores) for r in ours if float(r.get("since") or 0) >= since)) / cores
+
+
+def _inflight(alias: str) -> int:
+    """This machine's claims on `alias` its last probe did not see running yet (_CHECKS_RUNNING): they take
+    free slots there too."""
+    ours = _ours(alias)
+    running = _CHECKS_RUNNING.get(alias)
+    return ours if running is None else max(0, ours - running)
 
 
 def all_off(off: str) -> bool:
@@ -1325,6 +1426,7 @@ def pick(p, cfg: dict, tell, what: str = "", off: str = "", why_here: str = "") 
     tried = [e.rpartition(":")[0] for e in off.split(",")]
     # Spread: hosts these checks did not fail on yet, then those not backed off, then the emptiest (its load
     # and this machine's runs there over its cores: used_share) first, so runs follow free cores.
+    gated = []   # (alias, machine, host, why before the probe, usable, dev, beside)
     for alias in sorted(hosts(cfg), key=lambda h: (h in tried, bool(backed_off(target(h)[1], now)),
                                                   used_share(target(h)[1], mine, now))):
         machine, host = target(alias)
@@ -1343,14 +1445,28 @@ def pick(p, cfg: dict, tell, what: str = "", off: str = "", why_here: str = "") 
             _note_skip(host, why, p.name)
         if not why and (why := pre_check(p, cfg, alias)):
             _note_skip(host, why, p.name)
-        free, note = 0, ""
+        gated.append((alias, machine, host, why, usable, dev, beside))
+    # Every host left is probed (at once), and the run goes to the one with the most free capacity: the
+    # most free slots less this machine's claims not yet running there (_inflight), then the most test
+    # workers it would get there (workers_why); ties keep the spread order above.
+    probed = _probe_all([(host, beside) for _, _, host, why, _, _, beside in gated if not why])
+    cands = []
+    for i, (alias, machine, host, why, usable, dev, beside) in enumerate(gated):
+        free, note, size = 0, "", (0, "")
         if not why:
-            free, why, note = probe(host, beside)
+            free, why, note = probed[host]
             if why.startswith(DEVICE_WHY):
                 _note_skip(host, why, p.name)
             if note.startswith(DEVICE_WHY):
                 dev, note = dev or note, ""
+            if not why:
+                size = _size(cfg, host)
         dev = dev[len(DEVICE_WHY):] if dev.startswith(DEVICE_WHY) else dev
+        cands.append((alias, machine, host, why, usable, dev, free, note, size, i))
+    first = [c for c in cands if not c[3]]
+    # The hosts that cannot take it go first, only to be told as skipped; then the free ones, most free first.
+    order = [c for c in cands if c[3]] + sorted(first, key=lambda c: (-(c[6] - _inflight(c[2])), -c[8][0], c[9]))
+    for alias, machine, host, why, usable, dev, free, note, size, _ in order:
         if not why and (got := _claim(host, free, {**rec, "host": host,
                                                    **({"beside": dev[:300]} if dev else {})})) is not None:
             got.lock = _hold(p, cfg, machine, what)
@@ -1359,21 +1475,20 @@ def pick(p, cfg: dict, tell, what: str = "", off: str = "", why_here: str = "") 
                 skipped.append(f"{alias} (busy: its lock was taken just now)")
                 LAST_BUSY.append(alias)
                 continue
-            cores, load = _READ.pop(host, (0, None))
-            from . import testslots
-            top = testslots.sizes(cfg, cores) if cores > 0 else None   # one run's limit, sized to that host
-            got.workers = workers(cores, load, max(0, _ours(host) - 1), top[1] if top else 0)
+            got.workers, sized = size
             got.note({**rec, "host": host, **({"beside": dev[:300]} if dev else {}),
                       **({"workers": got.workers} if got.workers else {})})   # its cores, for used_share
             note_here(p.name, "")   # this run is on a spill host now: no reason to show it here
+            more = [c[0] for c in first if c[0] != alias]
             tell(f"spilling to {alias}: "
                  + (why_here or f"the slots here stayed busy for {after_s(cfg):g} s")
                  + f" ({_source(cfg, alias)}); the checks run there on a copy of the commit"
-                 + (f" with {got.workers} test worker(s), its idle cores (load {load:g} of {cores})"
-                    if got.workers else "")
+                 + (f" with {sized}" if sized else "")
+                 + (f"; the most free of {len(more) + 1} usable spill hosts" if more else "")
                  + (f"; {note}, so its device locks alone decided" if note else "")
                  + (f"; beside a device job (checks.{BESIDE_KEY} lists it): {dev}" if dev else "")
                  + (f"; skipped: {'; '.join(skipped)}" if skipped else ""))
+            note_limit(p.name, f"spill host {alias}: {sized}", what)
             _note_pick(p.name, alias, skipped)
             return got
         if usable and not why.startswith(_OUT_OF_REACH):
@@ -1427,15 +1542,32 @@ def _alive(pid: Any) -> bool:
     return pid_state(pid) != DEAD
 
 
+def _held(path: Path) -> bool:
+    """Whether a run still holds claim file `path` (its flock, _claim). A record a killed run left (a crash or a
+    reboot: its flock went with it) is no claim, even when its pid was reused or cannot be judged; such
+    records counted as this machine's runs there shrank a spilled run to one test worker (workers)."""
+    try:
+        with open(path) as f:
+            try:
+                fcntl.flock(f, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            except OSError:
+                return True
+            fcntl.flock(f, fcntl.LOCK_UN)
+            return False
+    except OSError:
+        return False
+
+
 def holders(project_name: str | None = None) -> list[dict]:
-    """The live claims on spill hosts (of `project_name`'s runs when given). Read only."""
+    """The live claims on spill hosts (of `project_name`'s runs when given): a held claim file (_held) whose pid
+    is not known dead. Read only."""
     out = []
     for f in sorted(claim_dir().glob("*.json")) if claim_dir().is_dir() else []:
         try:
             r = json.loads(f.read_text() or "{}")
         except (OSError, ValueError):
             continue
-        if isinstance(r, dict) and r.get("host") and _alive(r.get("pid")) \
+        if isinstance(r, dict) and r.get("host") and _alive(r.get("pid")) and _held(f) \
                 and (project_name is None or r.get("project") == project_name):
             out.append(r)
     return out
@@ -1480,6 +1612,47 @@ def note_here(project_name: str, why: str, what: str = "") -> None:
                                              "at": time.time()}), sync=False)
     except OSError:
         pass
+
+
+def limit_dir() -> Path:
+    from . import checkcap
+    return checkcap.slot_dir() / "limits"
+
+
+def note_limit(project_name: str, line: str, what: str = "") -> None:
+    """Record the limit that slows or holds this process's checks run now (its name, value and setting, as its
+    checks log says it): limit_lines shows it in `ttp status` and the web app's checks view while the process
+    lives; "" clears it. Records of dead processes go at each write. Never raises."""
+    d = limit_dir()
+    try:
+        for g in d.glob("*.json") if d.is_dir() else []:
+            if g.stem != str(os.getpid()) and g.stem.isdigit() and not _alive(int(g.stem)):
+                g.unlink(missing_ok=True)
+        f = d / f"{os.getpid()}.json"
+        if not line:
+            f.unlink(missing_ok=True)
+            return
+        d.mkdir(parents=True, exist_ok=True)
+        from . import project
+        project.durable_write(f, json.dumps({"project": project_name, "task": os.environ.get("TTP_TASK") or "",
+                                             "pid": os.getpid(), "why": line[:400], "what": what[:200],
+                                             "at": time.time()}), sync=False)
+    except OSError:
+        pass
+
+
+def limit_lines(project_name: str) -> list[str]:
+    """`ttp status` and `ttp checks status` lines: the limit each live checks run of `project_name` is under."""
+    out = []
+    for f in sorted(limit_dir().glob("*.json")) if limit_dir().is_dir() else []:
+        try:
+            r = json.loads(f.read_text() or "{}")
+        except (OSError, ValueError):
+            continue
+        if isinstance(r, dict) and r.get("project") == project_name and r.get("why") and _alive(r.get("pid")):
+            who = f"task #{r['task']}" if r.get("task") else f"pid {r.get('pid')}"
+            out.append(f"checks of {who} limited: {r['why']}")
+    return out
 
 
 def here_records(project_name: str) -> list[dict]:

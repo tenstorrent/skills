@@ -1301,7 +1301,7 @@ def pool_gate(cfg: dict | None, project_name: str | None, full: bool = False, pr
     used = _held(paths(max(s[0], checkcap.cores())))
     pool = pool_now(cfg, s[0], used)
     if used >= pool:
-        return f"the host's test pool is full: {used} of {pool} held"
+        return f"the host's test pool is full: {used} of {pool} held (limit checks.test_pool)"
     if (q := locks.queued(checkcap.slot_dir(), TESTS.resource)):
         return f"{len(q)} waiter(s) ahead in the host's test-slot line"
     own = own_paths(project_name, project_max(cfg, (pool, s[1]), project_name=project_name))
@@ -1316,12 +1316,14 @@ def pool_gate(cfg: dict | None, project_name: str | None, full: bool = False, pr
         own_free = _free(urgent)
     if own and own_free < need:
         return (f"{BUDGET_GATE}{own_free} of {len(own)} free, a run needs {need}"
-                f" (held by {checkcap._some(list(dict.fromkeys(locks.held_labels(own))))})")
+                f" (held by {checkcap._some(list(dict.fromkeys(locks.held_labels(own))))};"
+                f" limits checks.test_project_slots, checks.test_run_min)")
     kept = need * urgent_parked(project_name, priority, since, budget=project_max(cfg, (pool, s[1])), need=need,
                                  run_max=s[1], room=pool - used)
     if min(s[1], pool - used - kept) < need:
         return (f"the host's test pool: {pool - used} of {pool} free, a run needs {need}"
-                + (f", {kept} kept for {kept // need} urgent run(s) of other projects parked ahead" if kept else ""))
+                + (f", {kept} kept for {kept // need} urgent run(s) of other projects parked ahead" if kept else "")
+                + " (limits checks.test_pool, checks.test_run_min)")
     room = min(own_free if own else pool, pool - used - kept)
     if (n := own_urgent_parked(project_name, priority, room // need)) and room - need * n < need:
         return f"{room} test slot(s) free, a run needs {need}, {need * n} {OWN_RESERVE} ({n})"

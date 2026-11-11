@@ -28571,7 +28571,8 @@ def test_checks_host_cap_serves_projects_round_robin(env, monkeypatch):
         waiters[-1].start()
         assert _wait_for(lambda: len(checkcap.state()["queued"]) == i + 1)
     assert _wait_for(lambda: told)
-    assert "queued for a host-wide checks slot: 1 of 1 running, 2 ahead, 3 projects" in told[0]
+    assert "queued for a host-wide checks slot: 1 of 1 running, cap 1" in told[0], told[0]
+    assert ", 2 ahead, 3 projects" in told[0], told[0]
     assert checkcap.state()["queued"] == ["a1", "b1", "c1", "a2", "b2", "a3"], "status lists them in serving order"
     assert "1 running of cap 1, 6 queued: a1; b1; c1; a2; ... (running: h)" in checkcap.line()
     assert checkcap.line().endswith("; next per project: a1 0 ahead, b1 1 ahead, c1 2 ahead"), \

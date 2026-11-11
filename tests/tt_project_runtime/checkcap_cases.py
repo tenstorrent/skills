@@ -11582,6 +11582,8 @@ def test_push_checks_on_an_overloaded_remote_host_wait_for_it_and_say_so(env, mo
     p = make(env)
     monkeypatch.setattr(push, "check_slot", lambda *a, **k: pytest.fail("no local checks slot"))
     _remote_load(monkeypatch, {"checkhost": [(90.0, 64), (90.0, 64), (20.0, 64)]})
+    from ttp import checkspill   # its check slots there: a fake probe, no ssh
+    monkeypatch.setattr(checkspill, "probe", lambda h, b=False: (0, "ssh cannot reach it: exit 255", ""))
     run = push.check_list([{"run": "pytest -n 16 tests", "host": "checkhost"}])
     told = []
     slot = push.run_slot(run, "abc", told.append, proj=p)
@@ -11640,6 +11642,8 @@ def test_ttp_checks_run_only_on_a_remote_host_take_no_local_checks_slot(env, mon
     monkeypatch.setattr(testslots, "load_guard", lambda: "the host's CPU is overloaded")
     monkeypatch.setattr(checkcap, "acquire", lambda *a, **k: pytest.fail("no local checks slot"))
     _remote_load(monkeypatch, {"checkhost": [(3.0, 64)]})
+    from ttp import checkspill   # its check slots there: a fake probe, no ssh
+    monkeypatch.setattr(checkspill, "probe", lambda h, b=False: (0, "ssh cannot reach it: exit 255", ""))
     out = io.StringIO()
     cmds = push.check_list([{"run": "pytest -n 16 tests", "host": "checkhost"}, "git diff --check"])
     slot = cli._checks_slot(p, tmp_path, out, "a" * 40, cmds=cmds, top=str(p.root))

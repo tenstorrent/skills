@@ -393,6 +393,15 @@ def _set_limit() -> int | None:
     return None
 
 
+def cap_text(n: int) -> str:
+    """The host-wide cap `n` with where it comes from, for a wait line: the setting, else the free-core fit."""
+    if os.environ.get("TTP_CHECKS_HOST_MAX") not in (None, "") and _set_limit() is not None:
+        return f"cap {n} (TTP_CHECKS_HOST_MAX)"
+    if _set_limit() is not None:
+        return f"cap {n} (checks.host_max)" if n else "no cap (checks.host_max 0)"
+    return f"cap {n}: the free-core fit (checks.host_max unset)"
+
+
 def limit() -> int:
     """Slots on this host: TTP_CHECKS_HOST_MAX, else the account's checks.host_max, else the
     default from the core count and load (default_limit()). 0 means no cap; an unreadable value is the default."""
@@ -1320,6 +1329,7 @@ class Slot:
         self.waiters: set[int] = set()   # the processes that asked it to: once all died, the yield ends
         self.tests = None   # the run's test slots (testslots.Grant), held and freed with this slot
         self.spill = None   # a claim on a spill host the checks run on instead (checkspill.Claim)
+        self.pinned: list = []   # claims on the hosts its checks are pinned to (checkspill.admit_pinned)
         self.urgent = False   # a reserved urgent slot beyond the cap (acquire's `urgent`, urgent_key)
         self.since = time.time()   # when it was granted: an older preempt request is not for it (preempted)
         self.fell_back = False   # a push's ordinary turn, taken after its priority slot stayed held (acquire_priority)
@@ -1346,6 +1356,9 @@ class Slot:
         if self.spill is not None:
             self.spill.close()
             self.spill = None
+        for c in self.pinned:
+            c.close()
+        self.pinned = []
 
     def let_go(self) -> None:
         """Free the host-wide slot alone (its test slots and spill claim stay); a second call frees nothing."""
@@ -1435,7 +1448,8 @@ def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = No
             owns: list[str] | tuple = (), cap: int | None = None, lane_at: float | None = None,
             startable: Callable[[], bool] | None = None,
             parks: Callable[[bool], None] | None = None, urgent: bool = False,
-            preemptible: bool = False, small: bool = False, progress: str = "") -> Slot | None:
+            preemptible: bool = False, small: bool = False, progress: str = "",
+            why: Callable[[], str] | None = None) -> Slot | None:
     """Take a host-wide checks slot, waiting while all are held. Waiters take turns by project
     (`project_name`; none form their own group), within one by task priority (`priority`, 1 first;
     OBLIGATION_PRIORITY before it, its ticket marked OBLIGATION_MARK; none last), then arrival (locks.fair_order),
@@ -1508,8 +1522,9 @@ def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = No
         ticket = None if parked else locks.enqueue(slot_dir(), RESOURCE, queued_as, since, group=project_name,
                                                    priority=priority, requeued=was_preempted, small=small)
         uwait = _urgent_wait(urgent and is_urgent(priority) and not twin, None, queued_as, since, owns)
+        said = ""   # the limit last told while parked (parked_line): told again when another one holds it
         if parked and tell:   # told once a wait: its pool's room may come and go
-            tell(PARKED_LINE)
+            said = _tell_parked(tell, project_name, why)
         park = _park(parked, None, queued_as, since, project_name, priority, small)
         if parked and parks:
             parks(True)
@@ -1541,9 +1556,13 @@ def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = No
                 locks.dequeue(ticket)
                 ticket = None
                 if tell and (twin or not parked_told):
-                    tell(f"the same checks run now ({twin}); waiting for their result, keeping this place in the queue"
-                         if twin else PARKED_LINE)
+                    if twin:
+                        tell(f"the same checks run now ({twin}); waiting for their result, keeping this place in the queue")
+                    else:
+                        said = _tell_parked(tell, project_name, why)
                 parked_told = parked_told or parked
+            elif tell and parked and parked_told and _limit_name(now_why := _why(why)) != _limit_name(said):
+                said = _tell_parked(tell, project_name, why, now_why)   # another limit holds it now: no silent throttling
             elif not twin and not parked and ticket is None:
                 try:
                     ticket = locks.enqueue(slot_dir(), RESOURCE, queued_as, since, group=project_name,
@@ -1603,10 +1622,12 @@ def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = No
                     ahead = q.index(ticket) if ticket in q else 0
                     groups = len({locks.ticket_group(t) for t in q} | {locks.ticket_group(ticket)})
                     tell(f"queued for a host-wide checks slot: {len(locks.held_labels(every))} of {n + extra(n)} running, "
-                         f"{ahead} ahead, {groups} project{'s' if groups != 1 else ''}"
+                         f"{cap_text(n)}, {ahead} ahead, {groups} project{'s' if groups != 1 else ''}"
                          + (", first in its project as an open obligation's owner" if queued_as != holder else "")
                          + (f"; waiting for free cores: {short}" if (short := cores_short(every)) else "")
                          + (f"; waiting for the disk: {disk}" if (disk := diskgate.saturated()) else ""))
+                    _note_limit(f"waits for a host-wide checks slot: {len(locks.held_labels(every))} running, "
+                                f"{cap_text(n)}", project_name)
                 if not told and waiting:
                     waiting(True)
                 told = time.time()
@@ -1620,6 +1641,8 @@ def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = No
         locks.dequeue(uwait)
         drop_claim(claim)   # taken, or given up: the asked run need not stop for it any more (preempted)
         _park(False, park, "", 0.0, None, None)
+        if parked_told:
+            _note_limit("")   # parked no more: its limit line leaves status
         if told and waiting:
             waiting(False)
 
@@ -2034,6 +2057,40 @@ DONE_S = 30.0   # how often a waiter reads whether a recorded pass made its run 
 PARKED_LINE = ("no test slots free for this run (its project's test-worker budget or the host's pool is full, "
                "fewer than checks.test_run_min are free, or the host's load is above checks.load_guard): "
                "waiting outside the queue for a host-wide checks slot, keeping this place")
+
+
+def _why(why: Callable[[], str] | None) -> str:
+    try:
+        return str(why() or "") if why else ""
+    except Exception:   # a reason that cannot be read costs only the reason, never the wait
+        return ""
+
+
+def _limit_name(why: str) -> str:
+    """The limit a parked reason names, without its changing numbers: re-told only when this changes."""
+    return re.sub(r"\d+(\.\d+)?", "N", why.split(":", 1)[0])
+
+
+def _note_limit(line: str, project_name: str | None = None) -> None:
+    from . import checkspill
+    checkspill.note_limit(project_name or "", line)
+
+
+def _tell_parked(tell, project_name: str | None, why: Callable[[], str] | None, now: str | None = None) -> str:
+    """Tell parked_line with the limit that holds the run now, and show it in status (checkspill.note_limit);
+    the limit told."""
+    said = _why(why) if now is None else now
+    tell(parked_line(said))
+    _note_limit(f"waits for its test slots: {said or 'its project budget or the host pool is full'}", project_name)
+    return said
+
+
+def parked_line(why: str = "") -> str:
+    """PARKED_LINE, ending with the limit that holds the run now (testslots.pool_gate's reason: its name,
+    value and setting) when the waiter knows it (acquire's `why`)."""
+    return f"{PARKED_LINE}; limit now: {why}" if why else PARKED_LINE
+
+
 GRANT_TELL_S = 5.0   # a slot taken longer than this after its arrival is told (grant_line)
 
 

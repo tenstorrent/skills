@@ -996,12 +996,26 @@ def run_slot(run: list, head: str, say: Callable[[str], None], priority: str = "
     if proj is None and (base := os.environ.get("TTP_PROJECT")):
         proj = Project(base)
     cfg = proj.config() if proj else {}
+    claims: list = []
     if hosts := list(dict.fromkeys(h for c in run if (h := remote_host(c)))):
-        remoteload.wait(hosts, say, testslots.push_load_wait_s(cfg))
+        bound = testslots.push_load_wait_s(cfg)
+        remoteload.wait(hosts, say, bound)
+        from . import checkspill   # the host's check slots, claimed as `ttp checks` claims them (bounded here)
+        if (claims := checkspill.admit_pinned(proj, hosts, say, "push checks", bound=bound)) is None:
+            say(f"no check slot freed on {', '.join(hosts)} in {bound:.0f}s (checks.push_load_wait_s), "
+                "starting anyway")
+            claims = []
     pats = checklane.light_patterns(cfg)
     if any(not remote_host(c) and not checklane.is_light(str(c), pats) for c in run):
-        return check_slot(head, say, priority=priority, proj=proj)
-    return checkcap.Slot()
+        slot = check_slot(head, say, priority=priority, proj=proj)
+    else:
+        slot = checkcap.Slot()
+    if slot is not None and hasattr(slot, "pinned"):
+        slot.pinned = claims
+    else:
+        for c in claims:
+            c.close()
+    return slot
 
 
 def spill_slot(cmds: list, head: str, say: Callable[[str], None], proj: Project | None = None,

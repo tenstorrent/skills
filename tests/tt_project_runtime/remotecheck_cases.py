@@ -3393,6 +3393,196 @@ def test_a_spilled_run_gets_test_workers_sized_to_the_hosts_idle_cores_outside_i
     assert dict(cli._spill_to([own], "check-host-a", p.config(), 5)[0].literal_env)[testslots.SLOTS_ENV] == "2"
 
 
+def test_a_queued_run_spills_to_the_most_free_host_with_workers_sized_to_its_free_cores(env, tmp_path, monkeypatch):
+    """#7996 (pick_most_free_host, spill_workers_sized): every usable spill host is probed and the run goes to the
+    one with the most free capacity, not the first listed; its workers fit that host's idle cores, and the tell
+    and the run's limit record (ttp status, the web app) say so."""
+    from ttp import checkspill
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a", "check-host-b"])
+    loads = {"check-host-a": 60.0, "check-host-b": 4.0}
+
+    def fake_probe(host, beside=False):
+        checkspill._READ[host] = (64, loads[host])
+        return 2, "", ""
+    monkeypatch.setattr(checkspill, "probe", fake_probe)
+    p.set_config("checks.test_run_max", 32)
+    told = []
+    got = checkspill.pick(p, p.config(), told.append, "task #1 checks")
+    try:
+        assert got is not None and got.host == "check-host-b", told
+        assert 1 < got.workers <= 32, got.workers
+        line = told[-1]
+        assert "spilling to check-host-b" in line and "the most free of 2 usable spill hosts" in line, line
+        assert f"with {got.workers} test worker(s), its idle cores (load 4 of 64)" in line, line
+        assert "limit checks.test_run_max" in line or got.workers < 32, line
+        assert any("limited: spill host check-host-b:" in x for x in checkspill.limit_lines(p.name))
+    finally:
+        got and got.close()
+    assert not any("check-host-b" in x for x in checkspill.limit_lines(p.name)), "freed with the claim"
+
+
+def test_the_spill_pick_spreads_counting_claims_not_yet_running_against_free_slots(env, tmp_path, monkeypatch):
+    """#7996 (spill_pick_spreads, user msg #2469): the pick goes to the host with the most free slots less this
+    machine's claims there that its probe did not see running yet, not the first host with any slot."""
+    from ttp import checkspill
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a", "check-host-b"])
+    frees = {"check-host-a": 3, "check-host-b": 2}
+
+    def fake_probe(host, beside=False):
+        checkspill._READ[host], checkspill._CHECKS_RUNNING[host] = (64, 4.0), 0
+        return frees[host], "", ""
+    monkeypatch.setattr(checkspill, "probe", fake_probe)
+    monkeypatch.setattr(checkspill, "_ours", lambda h: 2 if h == "check-host-a" else 0)
+    p.set_config("checks.test_run_max", 2)   # both hosts size a run alike: only the free slots decide
+    told = []
+    got = checkspill.pick(p, p.config(), told.append, "task #1 checks")
+    try:
+        assert got is not None and got.host == "check-host-b", told
+    finally:
+        got and got.close()
+    assert checkspill._inflight("check-host-a") == 2
+    monkeypatch.setitem(checkspill._CHECKS_RUNNING, "check-host-a", 2)
+    assert checkspill._inflight("check-host-a") == 0, "claims seen running there are in its load already"
+
+
+def test_a_host_wide_checks_wait_names_its_cap_and_where_the_cap_comes_from(monkeypatch):
+    """#7996 (user msg #2469): the host-wide cap in a wait line says its number and source: the setting, or the
+    free-core fit while checks.host_max is unset."""
+    from ttp import checkcap
+    monkeypatch.delenv("TTP_CHECKS_HOST_MAX", raising=False)
+    monkeypatch.setattr(checkcap, "_set_limit", lambda: None)
+    assert checkcap.cap_text(12) == "cap 12: the free-core fit (checks.host_max unset)"
+    monkeypatch.setattr(checkcap, "_set_limit", lambda: 6)
+    assert checkcap.cap_text(6) == "cap 6 (checks.host_max)"
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "6")
+    assert checkcap.cap_text(6) == "cap 6 (TTP_CHECKS_HOST_MAX)"
+
+
+def test_a_spilled_run_held_to_one_worker_says_why(env, tmp_path, monkeypatch):
+    """#7996 (single_worker_logged): a spill host sized to 1 test worker says which cores are idle and which
+    are kept, and a run's per-run cap names its setting; an unread load says the run sizes itself."""
+    from ttp import checkspill
+    n, why = checkspill.workers_why(4, 9.0)
+    assert n == 1 and "only 1 because 0 core(s) are idle" in why, why
+    n, why = checkspill.workers_why(10, 4.0, others=1)
+    assert n == 1 and "kept for 1 other run(s)" in why and "only 1 because" in why, why
+    n, why = checkspill.workers_why(64, 0.0, cap=8)
+    assert n == 8 and "at most 8 per run (limit checks.test_run_max)" in why, why
+    assert checkspill.workers_why(16, None)[1].startswith("test workers it sizes itself")
+
+
+def test_a_claim_record_no_live_holder_locks_counts_for_no_run(env, tmp_path, monkeypatch):
+    """#7996: a claim record left by a run a reboot killed (its pid since reused by another process) holds no
+    lock: it is no holder and keeps no cores off the next run's workers (it once sized a spill to 1 worker)."""
+    from ttp import checkspill
+    d = checkspill.claim_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    stale = d / "check-host-a.0.json"
+    stale.write_text(json.dumps({"project": "other", "pid": os.getpid(), "host": "check-host-a", "since": 1.0}))
+    assert not any(r.get("host") == "check-host-a" for r in checkspill.holders())
+    assert checkspill._ours("check-host-a") == 0
+
+
+def test_a_parked_checks_run_names_the_limit_its_value_and_setting(env, tmp_path, monkeypatch):
+    """#7996 (limit_reason_logged, status_shows_limit): a run parked on a limit writes the limit, its value and
+    its setting to its log, and the same line shows in ttp status and the web app's checks view until it ends."""
+    import contextlib
+    import io
+    from ttp import checkcap, checkspill, cli, web
+    p = make(env)
+    why = "the host's test pool: 0 of 8 free, a run needs 2 (limits checks.test_pool, checks.test_run_min)"
+    told = []
+    checkcap._tell_parked(told.append, p.name, lambda: why)
+    assert told == [checkcap.parked_line(why)] and checkcap.PARKED_LINE in told[0] and why in told[0]
+    lines = checkspill.limit_lines(p.name)
+    assert lines and "limited: waits for its test slots: " + why in lines[0], lines
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        cli.main(["status", p.name])
+    assert "limited: waits for its test slots:" in out.getvalue()
+    import time
+    assert any("checks.test_pool" in r["text"] for r in web.slots_feed(time.time(), p)), "web feed"
+    checkcap._note_limit("", p.name)
+    assert checkspill.limit_lines(p.name) == []
+
+
+def _full_after(monkeypatch, free=1, running=0):
+    """checkspill.probe for fake hosts: `free` check slots, `running` checks there (no ssh)."""
+    from ttp import checkspill
+
+    def fake(host, beside=False):
+        checkspill._READ[host], checkspill._CHECKS_RUNNING[host] = (64, 0.0), running
+        return free, "", ""
+    monkeypatch.setattr(checkspill, "probe", fake)
+
+
+def test_checks_pinned_to_a_host_take_its_check_slots_as_a_spill_pick_does(env, tmp_path, monkeypatch):
+    """#7996 (pinned_host_admission, no_overshoot_concurrent_picks): checks pinned to a host claim its check
+    slots in the shared claim folder, so runs of any project here (pinned or spilled) never start more there
+    than its probe's free slots, claims still in flight (no check running there yet) included; a run that
+    waits says why with its numbers, and status shows it."""
+    import threading
+    from ttp import checkspill
+    p = make(env)
+    monkeypatch.setitem(checkspill._CHECKS_RUNNING, "check-host-a", 0)   # the last probe: no check running there yet
+    got, lock = [], threading.Lock()
+
+    def take():
+        c = checkspill._claim("check-host-a", 2, {"project": p.name, "pid": os.getpid(), "host": "check-host-a"})
+        with lock:
+            got.append(c)
+    ts = [threading.Thread(target=take) for _ in range(6)]
+    [t.start() for t in ts]
+    [t.join(10) for t in ts]
+    held = [c for c in got if c is not None]
+    assert len(held) == 2, "6 pickers at once, 2 free slots: no overshoot"
+    for c in held:
+        c.close()
+    _full_after(monkeypatch, free=1)
+    first = checkspill.admit_pinned(p, ["check-host-a"], print, "task #1 checks")
+    assert first and len(first) == 1
+    told = []
+    assert checkspill.admit_pinned(p, ["check-host-a"], told.append, "task #2 checks", bound=0,
+                                   sleep=lambda s: None) is None
+    assert told and "checks pinned to check-host-a wait for a check slot there: its 1 free check slot(s) are " \
+        "claimed by this machine's 1 run(s) there" in told[0], told
+    assert any("limited: checks pinned to check-host-a" in x for x in checkspill.limit_lines(p.name))
+    for c in first:
+        c.close()
+    again = checkspill.admit_pinned(p, ["check-host-a"], print, "task #2 checks", bound=0)
+    assert again and len(again) == 1
+    again[0].close()
+    monkeypatch.setattr(checkspill, "probe", lambda h, b=False: (0, "ssh cannot reach it: exit 255", ""))
+    assert checkspill.admit_pinned(p, ["check-host-a"], print, bound=0) == [], "an unreadable host holds no run"
+
+
+def test_a_tasks_checks_never_start_anyway_on_an_overloaded_pinned_host(env, tmp_path, monkeypatch):
+    """#7996 (no_start_anyway_task_checks): `ttp checks` pinned to an overloaded host never start there past
+    the bound: the wait says why with its numbers and hands over (None); push checks keep their bounded start."""
+    import io
+    from ttp import checkcap, checkspill, cli, push, remoteload
+    p = make(env)
+    monkeypatch.delenv("TTP_DETACHED", raising=False)
+    monkeypatch.setattr(checkcap, "FOREGROUND_WAIT_S", 0.0)
+    monkeypatch.setattr(checkspill, "probe", lambda h, b=False: pytest.fail("no admission while overloaded"))
+    why = "the check host check-host-a's CPU is overloaded: its runnable demand of 298.0 cores is above its 64 cores"
+    monkeypatch.setattr(remoteload, "held", lambda h: why)
+    out = io.StringIO()
+    cmds = push.check_list([{"run": "pytest -n 16 tests", "host": "check-host-a"}])
+    assert cli._checks_slot(p, tmp_path, out, "a" * 40, cmds=cmds, top=str(p.root)) is None
+    assert why in out.getvalue() and "not starting there while it is" in out.getvalue()
+    assert "starting anyway" not in out.getvalue() and "running now" not in out.getvalue()
+    told = []
+    assert remoteload.wait(["check-host-a"], told.append, 0) == why and "starting anyway" in told[-1]
+    monkeypatch.setattr(remoteload, "held", lambda h: "")
+    _full_after(monkeypatch, free=1)
+    out = io.StringIO()
+    slot = cli._checks_slot(p, tmp_path, out, "a" * 40, cmds=cmds, top=str(p.root))
+    assert slot is not None and len(slot.pinned) == 1 and "holding 1 check slot(s) there" in out.getvalue()
+    slot.close()
+    assert slot.pinned == [] and checkspill._ours("check-host-a") == 0
+
+
 def test_a_check_reading_git_history_stays_here_and_the_rest_of_its_run_spills(env, tmp_path, monkeypatch):
     """Upstream note 92664c3b34114013: a spill host's copy has one commit, so `git diff --check <base>` exited 128
     there. A check that runs a git command reading commits (any form: options, an env prefix, a shell -c, an

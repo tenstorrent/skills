@@ -1,0 +1,5 @@
+---
+"tt-project": patch
+---
+
+`tt-project`: checks are never slowed or held without saying why. Each limit that holds a checks run (the test-slot pool, the project's test-worker budget, the host-wide checks cap, a spill host's free cores, a pinned host's check slots) writes one line naming the limit, its number and its setting, and the same line shows in `ttp status`, `ttp checks status` and the web app's checks view. The host-wide cap says whether it comes from `checks.host_max` or, unset, from the free-core fit. A spilled run's test workers fit the spill host's idle cores, and a run held to 1 worker says why. A queued run spills to the host with the most free slots, less this machine's claims there not yet running, so runs spread across hosts. Claim records with no live holder no longer count as runs. Checks pinned to a host take a check slot there through the same shared claim as a spill pick, so concurrent runs from any project cannot overshoot it. A task's checks never start anyway on an overloaded remote host: they wait with the reason shown, or hand over to detached checks; only push checks keep the bounded start.
