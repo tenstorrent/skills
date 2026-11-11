@@ -450,9 +450,23 @@ def _used(c: dict, r: dict) -> bool:
         return True
     if not r["host"]:
         return False
-    if key == SPILL_WRAP_KEY and "wrap" in r:
-        return r["wrap"] == str(c.get("nh") or digest(c["new"] if "new" in c else _ABSENT))
-    return True
+    if key == SPILL_WRAP_KEY:
+        return r["wrap"] == str(c.get("nh") or digest(c["new"] if "new" in c else _ABSENT)) if "wrap" in r else True
+    moved = _hosts_moved(c)
+    return True if moved is None else r["host"] in moved
+
+
+def _hosts_moved(c: dict) -> set | None:
+    """The hosts a change of a host-list setting added or removed (old and new as lists or one string);
+    None when either value is no host list or names "*" (every host: any spill run could be affected)."""
+    vals = []
+    for k in ("old", "new"):
+        v = c.get(k, [])
+        v = [v] if isinstance(v, str) else v
+        if not isinstance(v, list) or "*" in v or not all(isinstance(h, str) for h in v):
+            return None
+        vals.append(set(v))
+    return vals[0] ^ vals[1] if vals[0] or vals[1] else None
 
 
 def _known_failures(p, r: dict, now: float) -> bool:

@@ -286,6 +286,26 @@ def test_config_breakage_counts_only_runs_that_could_have_used_the_spill_setting
     assert configwho.watch(p, now=other + 300) == [f"config_breakage:checks.timeout_s:{other}"], "any key: local runs count"
 
 
+def test_config_breakage_blames_a_spill_host_list_only_for_runs_on_hosts_it_added_or_removed(env, monkeypatch):
+    """Replays a false alarm: checks.spill_beside_device gained two hosts, then spill runs on other hosts
+    failed. The added hosts ran nothing, so no event; failures on an added host raise it."""
+    from ttp import configwho
+    p = make(env)
+    _config_clear_run_env(monkeypatch)
+    p.set_config("checks.spill_beside_device", ["spill-a"])
+    change, put = _breakage_setup(p, "checks.spill_beside_device", ["spill-a", "new-1", "new-2"],
+                                  configwho.by("user", via="config"))
+    put((60, False, "spill-a", "3", {}), (90, False, "spill-b", "4", {}), (120, False, "", "5", {}))
+    assert configwho.watch(p, now=change + 300) == [], "no failing run used a host the change added"
+    p.set_config("checks.spill_beside_device", ["spill-a"])
+    change, put = _breakage_setup(p, "checks.spill_beside_device", ["spill-a", "new-1", "new-2"],
+                                  configwho.by("user", via="config"))
+    put((-700, True, "new-1", "6", {}), (-650, True, "new-2", "6", {}),
+        (60, False, "new-1", "3", {}), (90, False, "new-2", "4", {}), (120, False, "new-1", "5", {}))
+    assert configwho.watch(p, now=change + 300) == [f"config_breakage:checks.spill_beside_device:{change}"]
+    assert "undo" not in _config_events(p, "config_breakage")[0]["text"].split("The user set")[0].split("since")[-1]
+
+
 def test_config_breakage_skips_failures_known_on_the_base_flaky_or_proven_new(env, monkeypatch):
     """Failed runs whose failing ids also failed on a base on the same host (the push-branch tip the gate
     reran), are quarantined as flaky, or that the gate proved new against the base at the same config,
