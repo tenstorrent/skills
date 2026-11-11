@@ -9469,7 +9469,7 @@ def test_macos_boot_checks_read_sysctl_in_process_and_spawn_nothing(env, tmp_pat
     assert runner.boot_id() == "1700000000" and not spawned
     # Neither readable: unknown, never a process either.
     lib.values.clear()
-    assert runner.boot_id() == "unknown" and runner.boot_time() is None and not spawned
+    assert runner.boot_id() == "unknown" and runner._boottime_secs() == "" and not spawned
 
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="macOS sysctlbyname")

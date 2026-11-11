@@ -2343,7 +2343,7 @@ def _branch_calls(env, n):
 
 
 def _branch_calls_named(env, n, name):
-    p = make(env, name)
+    p = make(env, name) if name == "demo" else _second_project(env, name)
     (p.root / "pkg").mkdir(exist_ok=True)
     (p.root / "pkg/lib.py").write_text("x = 0\n")
     _git_out(p.root, "add", "pkg/lib.py")
