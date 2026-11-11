@@ -45,3 +45,7 @@ question +115: a remote test (`ttp lock <box> --`, ssh) or a slow poll runs deta
 every +115: a remote test (`ttp lock <box> --`, ssh) or a slow poll runs detached and the worker hands off waiting, freeing its slot (msg #223)
 system +115: a remote test (`ttp lock <box> --`, ssh) or a slow poll runs detached and the worker hands off waiting, freeing its slot (msg #223)
 every +130: a long queue for CPU-only work runs on another allowed host with room, rather than wait (user msg #2010)
+code +101: a failed try inside a route's grace is a retry, not a finding (command schedule grace_min)
+question +101: a failed try inside a route's grace is a retry, not a finding (command schedule grace_min)
+every +101: a failed try inside a route's grace is a retry, not a finding (command schedule grace_min)
+system +101: a failed try inside a route's grace is a retry, not a finding (command schedule grace_min)
