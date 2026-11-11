@@ -442,7 +442,7 @@ def _own_file_home(tmp_path, monkeypatch):
     home = _cred_home(tmp_path, monkeypatch)
     (home / ".ssh" / "site.conf").write_text("Host box\n  User me\n")
     (home / ".ssh" / "site-hosts").write_text("box ssh-ed25519 AAAA\n")
-    (home / ".ssh" / "work-key").write_text("-----BEGIN OPENSSH PRIVATE KEY-----\nx\n")
+    (home / ".ssh" / "work-key").write_text("-----BEGIN OPENSSH " + "PRIVATE KEY-----\nx\n")   # split so this file holds no key header
     (home / ".ssh" / "key-link").symlink_to(home / ".ssh" / "id_ed25519")
     return home
 

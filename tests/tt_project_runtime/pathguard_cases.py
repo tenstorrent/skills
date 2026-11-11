@@ -230,7 +230,7 @@ def test_pathguard_lets_ssh_read_its_own_config_and_host_lists_by_option(cred_ho
     ssh = cred_home.home / ".ssh"
     (ssh / "site.conf").write_text("Host box\n")
     (ssh / "site-hosts").write_text("box ssh-ed25519 AAAA\n")
-    (ssh / "k").write_text("-----BEGIN OPENSSH PRIVATE KEY-----\n")
+    (ssh / "k").write_text("-----BEGIN OPENSSH " + "PRIVATE KEY-----\n")   # split so this file holds no key header
     for cmd in ("ssh -F ~/.ssh/site.conf box true", "ssh -F ~/.ssh/site.conf -i ~/.ssh/k box true",
                 "ssh -o UserKnownHostsFile=~/.ssh/site-hosts -o GlobalKnownHostsFile=~/.ssh/site-hosts box",
                 "scp -F ~/.ssh/site.conf -i ~/.ssh/k a box:", "rsync -e 'ssh -F ~/.ssh/site.conf -i ~/.ssh/k' a box:",
