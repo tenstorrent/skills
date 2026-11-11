@@ -11873,7 +11873,7 @@ class Daemon:
                 seen_now = {}
         triage = [e for e in evs if not pagesev.rides_along(e)]
         if triage and not msgs and not rerun and w is None and waketriage.on(self.cfg) and \
-                eventhold.can_wait(triage):
+                eventhold.can_wait(triage) and not any(e["kind"] in coord.UNBLOCK_KINDS for e in triage):
             try:   # the watcher model decides whether this routine batch needs the coordinator now
                 folded, line = waketriage.fold(db, self.cfg, triage, now)
             except Exception:   # the triage only saves money: a failure runs the turn

@@ -5,10 +5,19 @@ batch: no turn starts, the events stay queued on disk and ride the next wake's d
 not asked again, and it wakes without asking once its oldest event is coordinator.wake_triage_max_s old
 (default 1800). A new event changes the set and asks again. "wake" or "flag" wakes as before; the
 coordinator's effort tier never changes here. Any watcher error wakes and logs the model and the error.
-Off with coordinator.wake_triage false or without a chat provider (babysit.settings is None)."""
+Off with coordinator.wake_triage false.
+
+Without a chat provider (babysit.settings is None) the core provider's cheap model decides instead
+(cheapdecide.Haiku: Claude Haiku at low effort, no tools), unless coordinator.wake_triage_fallback is
+false or Haiku is off (cheapdecide.settings is None). Its call runs in the background: while the answer
+is on its way the batch waits (never past wake_triage_max_s), and a later tick reads it. Its cost is
+booked by Haiku's own path under purpose wake_decision. The same exclusions hold for both: the daemon
+asks only for an event-only batch (no user message) that may wait (eventhold.can_wait: no high or
+critical event, no ask_, charter_, obligation_, pause_, machine_, resource_, provider_ or must-act
+kind) and holds no unblock event (coordinator.UNBLOCK_KINDS)."""
 from __future__ import annotations
 
-from . import babysit
+from . import babysit, cheapdecide
 
 KEY = "wake_triage"
 MAX_S = 1800.0
@@ -26,9 +35,36 @@ def max_s(cfg: dict) -> float:
         return MAX_S
 
 
+PURPOSE = "wake_decision"
+ASK = {"wake": {"type": "noul", "instructions": QUESTION + " Answer yes to wake the coordinator now, no to skip.",
+                "criteria": {"true": "an event needs a decision or action now",
+                             "false": "every event is routine progress that can wait for the next wake"}}}
+
+
+def fallback_on(cfg: dict) -> bool:
+    """Whether Haiku decides because there is no chat provider."""
+    return babysit.settings(cfg) is None and \
+        (cfg.get("coordinator") or {}).get("wake_triage_fallback", True) is not False and \
+        cheapdecide.settings(cfg) is not None
+
+
 def on(cfg: dict) -> bool:
     return (cfg.get("coordinator") or {}).get("wake_triage", True) is not False and \
-        babysit.settings(cfg) is not None
+        (babysit.settings(cfg) is not None or fallback_on(cfg))
+
+
+def _haiku_ask(haiku):
+    """babysit.ask's shape from Haiku: {"verb", "model"}; {"verb": "pending"} while the answer is on its way."""
+    def ask(cfg, text, question, target="coordinator", db=None, purpose=PURPOSE):
+        h = haiku or cheapdecide.Haiku(cfg, db)
+        model = (cheapdecide.settings(cfg) or {}).get("model") or "haiku"
+        ans = h.decide(text, ASK, purpose=PURPOSE)
+        if ans is None:
+            if getattr(h, "pending", False):
+                return {"verb": "pending", "model": model}
+            raise babysit.Unavailable("Haiku gave no answer")
+        return {"verb": "wake" if float(ans["wake"].get("noul", 1.0)) >= 0.5 else "skip", "model": model}
+    return ask
 
 
 def state(db, ids: list[int]) -> str:
@@ -39,19 +75,25 @@ def state(db, ids: list[int]) -> str:
     return "\n".join(lines)[:6000]
 
 
-def fold(db, cfg: dict, evs: list[dict], now: float, ask=babysit.ask) -> tuple[bool, str]:
+def fold(db, cfg: dict, evs: list[dict], now: float, ask=None, haiku=None) -> tuple[bool, str]:
     """(True, log line) when this batch folds into the next wake, else (False, log line or "")."""
+    fallback = ask is None and fallback_on(cfg)
+    ask = ask or (_haiku_ask(haiku) if fallback else babysit.ask)
     ids = sorted(e["id"] for e in evs)
     seen = db.kv(KEY, {}) or {}
     if seen.get("ids") == ids and seen.get("verb") == "skip":
         if now - min(e["ts"] for e in evs) < max_s(cfg):
             return True, ""
         return False, f"coordinator wake: events {ids} waited {int(max_s(cfg))} s after a watcher skip, waking"
-    model = (babysit.settings(cfg) or {}).get("model") or "none"
+    model = ((cheapdecide.settings(cfg) if fallback else babysit.settings(cfg)) or {}).get("model") or "none"
     try:
         d = ask(cfg, state(db, ids), QUESTION, target="coordinator", db=db, purpose="coordinator_wake")
     except Exception as e:   # the watcher only saves money: any error wakes
         return False, f"coordinator wake triage failed, waking ({model}): {type(e).__name__}: {str(e)[:300]}"
+    if d["verb"] == "pending":   # Haiku's answer is on its way: wait for it, never past max_s
+        if now - min(e["ts"] for e in evs) < max_s(cfg):
+            return True, ""
+        return False, f"coordinator wake: events {ids} waited {int(max_s(cfg))} s for the watcher, waking"
     db.set_kv(KEY, {"ids": ids, "verb": d["verb"], "at": now, "model": d.get("model") or model})
     if d["verb"] == "skip":
         return True, (f"coordinator wake folded by the watcher ({d.get('model') or model}): events {ids} "

@@ -59,7 +59,8 @@ disk untouched, with no migration; nothing else is reclaimed by check recovery.
    gap: an event-only batch with no immediate event (high or critical, must-act, asks, overdue
    obligations, safety and outage kinds: eventhold.IMMEDIATE_KINDS) wakes at most once per `coordinator.wake_gap_s` (300 s) after the last turn ended, a free slot included
    (dispatch starts ready work without a model run meanwhile), and before that wake the watcher model
-   (`babysit.ask`, target coordinator) may fold it into the next wake: the events stay queued and ride
+   (`babysit.ask`, target coordinator; without a chat provider Claude Haiku at low effort,
+   `coordinator.wake_triage_fallback`, booked as `haiku:wake_decision`) may fold it into the next wake: the events stay queued and ride
    the next digest, at most `coordinator.wake_triage_max_s` (1800 s); a watcher error wakes and logs
    (eventhold.gap_until, waketriage.py). A ride-along event (data flag `ride_along`: a forgotten
    `continue:` follow-up, a repeat block of a non-urgent task) starts no turn alone: it joins the

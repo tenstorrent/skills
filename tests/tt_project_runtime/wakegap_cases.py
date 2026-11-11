@@ -102,6 +102,82 @@ def test_waketriage_a_watcher_error_wakes_and_logs_the_model(env, monkeypatch, c
     assert any("triage failed" in t and "example-org/small-model" in t and "HTTP 503" in t for t in lines), lines
 
 
+def _wg_haiku(monkeypatch, answer="wake: no"):
+    """No chat provider; Haiku on, answering `answer` at once (no background thread); its calls listed."""
+    from ttp import cheapdecide
+    monkeypatch.delenv(cheapdecide.OFF_ENV, raising=False)
+    real_settings = cheapdecide.settings   # the test project's core provider is fake; Claude's otherwise
+    monkeypatch.setattr(cheapdecide, "settings", lambda cfg: real_settings(dict(cfg or {}, core_provider="claude")))
+    monkeypatch.setattr(cheapdecide.Haiku, "binary", lambda self: "claude")
+    real, calls = cheapdecide.Haiku, []
+    monkeypatch.setattr(cheapdecide, "Haiku", lambda cfg, db=None, **k: real(
+        cfg, db, run=lambda argv, text, timeout: (calls.append((argv, text)), {
+            "result": answer, "usage": {"input_tokens": 300, "output_tokens": 2}})[1], background=False))
+    return calls
+
+
+def test_waketriage_without_a_chat_provider_haiku_holds_routine_events_until_max_s(env, monkeypatch):
+    from ttp import waketriage
+    calls = _wg_haiku(monkeypatch)
+    p, d, clock, starts, notes = _wg_setup(env, monkeypatch)
+    assert not (d.cfg.get("providers") or {}).get("chat") and waketriage.on(d.cfg)
+    clock[0] += 400   # past the wake gap
+    _event(p, clock, "task_done")
+    _event(p, clock, "upstream_note")
+    assert not _turn_within(d, clock, starts, 600), "a Haiku skip still woke the coordinator"
+    assert len(calls) == 1 and "--model" in calls[0][0] and "low" in calls[0][0]
+    assert "task_done happened" in calls[0][1] and "upstream_note happened" in calls[0][1]
+    assert p.db.one("SELECT COUNT(*) n FROM ledger WHERE source='haiku:wake_decision'")["n"] == 1
+    assert _turn_within(d, clock, starts, 1300), "a folded batch never woke the coordinator"
+    assert len(calls) == 1
+    # A user message wakes at once, without asking.
+    p, d, clock, starts, notes = _wg_setup(env, monkeypatch)
+    clock[0] += 400
+    _event(p, clock, "task_done")
+    assert not _turn_within(d, clock, starts, 60)
+    n = len(calls)
+    p.db.x("INSERT INTO messages(ts,direction,chat,text,handled) VALUES(?,?,?,?,0)", (clock[0], "in", "web", "hi"))
+    assert _turn_within(d, clock, starts, 30) and len(calls) == n
+    # A high event or an ask_ kind is never held.
+    for kind, sev in (("task_done", "high"), ("ask_timeout", "normal")):
+        p, d, clock, starts, _ = _wg_setup(env, monkeypatch)
+        clock[0] += 400
+        _event(p, clock, kind, sev)
+        n = len(calls)
+        assert _turn_within(d, clock, starts, 60) and len(calls) == n, (kind, sev)
+
+
+def test_waketriage_haiku_wake_answer_wakes_and_the_fallback_switch_turns_it_off(env, monkeypatch):
+    from ttp import configwho, waketriage
+    calls = _wg_haiku(monkeypatch, answer="wake: yes")
+    p, d, clock, starts, _ = _wg_setup(env, monkeypatch)
+    clock[0] += 400
+    _event(p, clock, "task_done")
+    assert _turn_within(d, clock, starts, 60) and len(calls) == 1
+    p.set_config("coordinator.wake_triage_fallback", False, by=configwho.by("user", via="cli"))
+    assert not waketriage.on(p.config())
+
+
+def test_waketriage_haiku_pending_holds_the_batch_but_never_past_max_s(env):
+    from ttp import waketriage
+    p = make(env)
+    p.db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(100,'task:1','task_done','normal','x','queued')")
+    evs = [dict(r) for r in p.db.q("SELECT * FROM events")]
+
+    class Pending:
+        pending = True
+
+        def decide(self, *a, **k):
+            return None
+    cfg = dict(p.config(), providers={})
+    assert waketriage.fold(p.db, cfg, evs, 160, ask=waketriage._haiku_ask(Pending())) == (True, "")
+    folded, line = waketriage.fold(p.db, cfg, evs, 100 + waketriage.MAX_S, ask=waketriage._haiku_ask(Pending()))
+    assert not folded and "waited" in line
+    Pending.pending = False   # no answer and none on its way: wake
+    folded, line = waketriage.fold(p.db, cfg, evs, 160, ask=waketriage._haiku_ask(Pending()))
+    assert not folded and "triage failed" in line
+
+
 def _wg_msg(p, clock, text, provenance="cli-peer", context=None):
     p.db.x("INSERT INTO messages(ts,direction,chat,text,handled,provenance,context) VALUES(?,?,?,?,0,?,?)",
            (clock[0], "in", "web", text, provenance, context))
