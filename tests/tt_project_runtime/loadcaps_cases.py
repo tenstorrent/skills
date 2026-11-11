@@ -469,3 +469,33 @@ def test_machine_limit_publish_alone_binds_a_lower_base_and_records_its_limit(tm
     mc.publish("small", _mcap_cfg(on="off", top=2), 0, now=now, home=home)
     entry = json.loads((home / mc.STATE).read_text())["projects"]["small"]
     assert "base" not in entry and "limit" not in entry and entry["running"] == 0
+
+
+def test_machine_limit_publish_follows_a_changed_max_workers_without_a_new_claim(tmp_path):
+    """A project whose last claim published a low limit (14 x 0.75 = 10 under moderate memory pressure)
+    publishes the limit from its current machine.max_workers on its next dispatch pass, with no new claim:
+    raised to 20 it publishes 15 and no longer holds the others at 10; lowered to 8 it publishes 6 and binds
+    them at once; a dead daemon's entry still counts for nothing."""
+    from ttp import machinecap as mc
+    home, now = tmp_path / "mhome", time.time()
+    sig = dict(_IDLE, psi=6, at=now)   # memory moderate: x0.75
+    assert mc.levels(sig) == {"memory": "moderate"}
+    assert mc.check("a", _mcap_cfg(top=14), 2, claim=True, now=now, home=home, read=lambda: sig) is None
+    entry = json.loads((home / mc.STATE).read_text())["projects"]["a"]
+    assert entry["base"] == 14 and entry["limit"] == 10, entry
+    mc.publish("a", _mcap_cfg(top=20), 3, now=now, home=home)   # raised, nothing started
+    entry = json.loads((home / mc.STATE).read_text())["projects"]["a"]
+    assert entry["base"] == 20 and entry["limit"] == 15 and entry["running"] == 3, entry
+    assert mc.check("b", _mcap_cfg(top=20), 9, now=now, home=home, read=lambda: sig) is None, "12 of 15"
+    why = mc.check("b", _mcap_cfg(top=20), 12, now=now, home=home, read=lambda: sig)
+    assert why and "15 of 15" in why, why
+    mc.publish("a", _mcap_cfg(top=8), 3, now=now, home=home)    # lowered, nothing started
+    entry = json.loads((home / mc.STATE).read_text())["projects"]["a"]
+    assert entry["base"] == 8 and entry["limit"] == 6, entry
+    why = mc.check("b", _mcap_cfg(top=20), 3, now=now, home=home, read=lambda: sig)
+    assert why and "6 of 6" in why, why
+    data = json.loads((home / mc.STATE).read_text())
+    data["projects"]["a"]["pid"] = 2 ** 22 + 12345   # a's daemon is gone: its low base binds nobody
+    (home / mc.STATE).write_text(json.dumps(data))
+    assert mc.check("b", _mcap_cfg(top=20), 14, now=now, home=home, read=lambda: sig) is None, "14 of 15"
+    assert "a" not in json.loads((home / mc.STATE).read_text())["projects"]
