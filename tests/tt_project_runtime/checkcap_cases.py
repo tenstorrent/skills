@@ -352,7 +352,7 @@ def test_checks_extra_slots_follow_the_load_and_never_pass_the_cap_plus_extra(en
     for t in threads:
         t.join(30)
     assert len(held) == 3 and len(locks.held_labels(checkcap.all_paths())) == 3, "racing takers stop at cap plus extra"
-    assert "3 running (cap 1 +2 while the load is low)" in checkcap.line()
+    assert "host checks: 3 running of cap 1 +2 while the load is low" in checkcap.line()
     load[0] = 9.0
     held.pop().close()
     assert checkcap.acquire("late", max_wait_s=1) is None, "no new slot beyond the cap once the load rose"
@@ -953,6 +953,7 @@ def test_test_slots_a_full_run_waits_for_its_minimum_grant_others_start_with_one
     with at least that many; a pre-stage or light run and a push check still start with what is free."""
     import threading
     from ttp import testslots
+    monkeypatch.setenv("TTP_CHECKS_PRIORITY_BEYOND_CAP", "1")   # #7068: the old overflow, off by default
     monkeypatch.setenv("TTP_TEST_POOL", "8")
     monkeypatch.setenv("TTP_TEST_RUN_MAX", "8")
     monkeypatch.setattr(testslots, "POLL_S", 0.05)
@@ -1144,6 +1145,7 @@ def test_test_slots_one_project_holds_at_most_its_budget_and_never_blocks_the_ot
 
 def test_push_checks_take_a_reserved_test_slot_when_task_checks_fill_the_pool(env, monkeypatch):
     from ttp import locks, testslots
+    monkeypatch.setenv("TTP_CHECKS_PRIORITY_BEYOND_CAP", "1")   # #7068: the old overflow, off by default
     monkeypatch.setenv("TTP_TEST_POOL", "4")
     monkeypatch.setenv("TTP_TEST_RUN_MAX", "2")
     monkeypatch.setenv("TTP_TEST_POLL_S", "0.05")
@@ -1176,6 +1178,7 @@ def test_push_checks_take_a_reserved_test_slot_when_task_checks_fill_the_pool(en
 
 def test_push_checks_get_a_full_runs_grant_when_task_checks_hold_the_project_budget(env, monkeypatch):
     from ttp import locks, testslots
+    monkeypatch.setenv("TTP_CHECKS_PRIORITY_BEYOND_CAP", "1")   # #7068: the old overflow, off by default
     monkeypatch.setenv("TTP_TEST_POOL", "16")
     monkeypatch.setenv("TTP_TEST_RUN_MAX", "8")
     monkeypatch.setenv("TTP_TEST_PROJECT_SLOTS", "8")
@@ -4360,7 +4363,7 @@ def test_urgent_and_p1_runs_reach_the_host_queue_past_lanes_held_by_runs_only_qu
         t = threading.Thread(target=lambda: got.append(checkcap.acquire(
             "urgent run", priority=0, urgent=True, tell=told.append, max_wait_s=30)))
         t.start()
-        assert _wait_for(lambda: checkcap.PREEMPT_LINE.format("routine") in told), told
+        assert _wait_for(lambda: checkcap.preempt_line("routine") in told), told
         host.pop().close()
         t.join(30)
         assert got and got[0] is not None and got[0].f is not None
@@ -6933,6 +6936,7 @@ def test_a_project_s_concurrent_suites_share_its_worker_ceiling_and_its_push_lan
     environment (the check command's text is unchanged); other projects keep theirs. A push check's
     reserved lane makes up only the project's per-run grant, never the account's run_max."""
     from ttp import testslots
+    monkeypatch.setenv("TTP_CHECKS_PRIORITY_BEYOND_CAP", "1")   # #7068: the old overflow, off by default
     _slot_sizes(monkeypatch, 32, 8, TTP_TEST_PROJECT_WORKERS=4)
     assert testslots.project_max() == 4
     a = testslots.acquire("a", project_name="pa", wait_s=0)
@@ -7887,6 +7891,7 @@ def test_push_checks_hold_no_shared_test_slots_while_another_run_waits_for_them(
     # outside the checks queue for them. With any run waiting for test slots a push runs on its branch's
     # reserved lane alone; with nobody waiting it takes pool slots as before.
     from ttp import checkcap, locks, testslots
+    monkeypatch.setenv("TTP_CHECKS_PRIORITY_BEYOND_CAP", "1")   # #7068: the old overflow, off by default
     monkeypatch.setenv("TTP_TEST_POOL", "8")
     monkeypatch.setenv("TTP_TEST_RUN_MAX", "4")
     push = testslots.acquire("push", project_name="pa", push_key="remote main", wait_s=0)
@@ -8240,6 +8245,7 @@ def test_aged_routine_waiters_take_routine_turns_and_nothing_changes_without_a_b
 def test_checks_status_names_the_push_priority_holder_and_each_waiters_wait(env, monkeypatch):
     import json
     from ttp import checkcap, locks
+    monkeypatch.setenv("TTP_CHECKS_PRIORITY_BEYOND_CAP", "1")   # #7068: the old overflow, off by default
     monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "1")
     held = checkcap.acquire("h")
     key = "git@example:org/repo#main"
@@ -8350,6 +8356,7 @@ def test_own_push_checks_take_the_own_branch_lane_at_once_while_a_long_run_holds
     (tmp_path / "run").mkdir()
     monkeypatch.setenv("TTP_RUN_DIR", str(tmp_path / "run"))
     monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "1")
+    monkeypatch.setenv(checkcap.BEYOND_CAP_ENV, "1")  # the opt-in overflow; the default counts it in the cap
     monkeypatch.setenv("TTP_TEST_POLL_S", "0.05")
     monkeypatch.setattr(testslots, "load_guard", lambda: "")
     _budget_of_one(monkeypatch)
@@ -8398,6 +8405,7 @@ def test_a_push_lanes_load_guard_wait_ends_at_its_bound_on_the_reserved_lane_alo
     checks, priority-1 ones included, keep waiting; "off" restores the unbounded wait. That bound is for
     while another urgent or push run holds the one load pass (load_passes, #5992)."""
     from ttp import locks, project, testslots
+    monkeypatch.setenv("TTP_CHECKS_PRIORITY_BEYOND_CAP", "1")   # #7068: the old overflow, off by default
     _slot_sizes(monkeypatch, 8, 2)
     monkeypatch.delenv(testslots.PUSH_LOAD_WAIT_ENV, raising=False)
     monkeypatch.setattr(testslots, "load_guard", lambda: "the host is overloaded")
@@ -9003,7 +9011,7 @@ def test_a_parked_urgent_run_whose_ask_lapsed_asks_again_and_takes_the_routine_h
 
     def tell(line):
         told.append(line)
-        if line == checkcap.PREEMPT_LINE.format("routine 5"):
+        if line == checkcap.preempt_line("routine 5"):
             asked_at.append(time.time())
     t = threading.Thread(target=lambda: got.append(checkcap.acquire(
         "urgent", priority=0, urgent=True, tell=tell, max_wait_s=30,
@@ -9435,6 +9443,7 @@ def test_an_urgent_checks_run_takes_the_reserved_urgent_slot_beyond_a_full_cap(e
     """#6149 (b): with every slot of the cap held (or the run parked), an urgent run takes the reserved
     urgent slot at once; one only (checks.urgent_slots), never a routine run's, and 0 turns it off."""
     from ttp import checkcap
+    monkeypatch.setenv("TTP_CHECKS_PRIORITY_BEYOND_CAP", "1")   # #7068: the old overflow, off by default
     monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "1")
     monkeypatch.delenv(checkcap.URGENT_SLOTS_ENV, raising=False)
     assert checkcap.urgent_slots() == checkcap.URGENT_SLOTS == 1
@@ -9478,7 +9487,7 @@ def test_an_urgent_checks_run_with_no_urgent_slot_preempts_the_lowest_priority_r
                                                                     tell=told.append, max_wait_s=30)))
     t.start()
     try:
-        assert _wait_for(lambda: any(checkcap.PREEMPT_LINE.format("routine 5") == m for m in told)), told
+        assert _wait_for(lambda: any(checkcap.preempt_line("routine 5") == m for m in told)), told
         assert checkcap.preempted(hold[2].since) == "urgent urgent", "no task: named by its holder"
         assert checkcap.preempted(time.time() + 60) == "", "a request older than the slot is not for it"
         hold[2].close()
@@ -9518,7 +9527,7 @@ def test_a_parked_urgent_run_gets_the_slot_its_preempt_frees_at_once_not_at_its_
         startable=lambda: checkcap.FREEING.get() is not None or freed[0])), at.append(time.time())))
     t.start()
     try:
-        assert _wait_for(lambda: checkcap.PREEMPT_LINE.format("routine 5") in told, 10), told
+        assert _wait_for(lambda: checkcap.preempt_line("routine 5") in told, 10), told
         assert checkcap.PARKED_LINE in told, "it asked while parked"
         time.sleep(2.0)   # past CLAIM_S: a parked asker's claim, and with it the request, must not lapse
         assert checkcap.preempted(victim.since) == "urgent urgent", "the asked run is still asked"
@@ -9559,7 +9568,7 @@ def test_a_parked_asker_that_still_cannot_start_lets_the_freed_slot_go_to_the_ne
     ta.start()
     tw = None
     try:
-        assert _wait_for(lambda: checkcap.PREEMPT_LINE.format("routine 5") in told, 10), told
+        assert _wait_for(lambda: checkcap.preempt_line("routine 5") in told, 10), told
         tw = threading.Thread(target=lambda: (waiter.append(checkcap.acquire("routine 3", priority=3, max_wait_s=30)),
                                               at.append(time.time())))
         tw.start()
@@ -9644,6 +9653,7 @@ def test_an_urgent_checks_run_past_its_grace_preempts_one_routine_run_of_its_own
     it takes the slot that run frees. The asked run sees `urgent #<task>` and its queue entry says so."""
     import threading
     from ttp import checkcap
+    monkeypatch.setenv("TTP_CHECKS_PRIORITY_BEYOND_CAP", "1")   # #7068: the old overflow, off by default
     monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "2")
     monkeypatch.setenv("TTP_CHECKS_LOAD_EXTRA", "0")
     monkeypatch.setenv(checkcap.URGENT_SLOTS_ENV, "1")
@@ -9661,7 +9671,7 @@ def test_an_urgent_checks_run_past_its_grace_preempts_one_routine_run_of_its_own
         "urgent", project_name="mine", priority=1, urgent=True, tell=told.append, since=since, max_wait_s=30)))
     t.start()
     try:
-        assert _wait_for(lambda: any(checkcap.PREEMPT_LINE.format("mine p2") == m for m in told)), told
+        assert _wait_for(lambda: any(checkcap.preempt_line("mine p2") == m for m in told)), told
         assert time.time() - since >= 0.5, "not before its grace"
         assert checkcap.preempted(mine.since) == "urgent #6198"
         monkeypatch.setenv(checkcap.PREEMPTED_ENV, checkcap.preempted(mine.since))
@@ -9692,6 +9702,7 @@ def test_push_priority_urgent_and_lock_holding_checks_runs_are_never_preempted(e
     priority slot held, an urgent waiter past its grace asks nobody; preemptible() refuses a wrapper lock and
     commands that take a lock or device queue themselves."""
     from ttp import checkcap
+    monkeypatch.setenv("TTP_CHECKS_PRIORITY_BEYOND_CAP", "1")   # #7068: the old overflow, off by default
     monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "2")
     monkeypatch.setenv("TTP_CHECKS_LOAD_EXTRA", "0")
     monkeypatch.setenv(checkcap.URGENT_SLOTS_ENV, "0")
@@ -9743,7 +9754,7 @@ def test_an_owed_checks_run_preempts_an_urgent_holder_that_owes_nothing_after_ev
         t = threading.Thread(target=lambda: got.append(checkcap.acquire(
             "owed", project_name="mine", priority=0, owns=["o1"], urgent=True, tell=told.append, max_wait_s=30)))
         t.start()
-        assert _wait_for(lambda: checkcap.PREEMPT_LINE.format("urgent late") in told), told
+        assert _wait_for(lambda: checkcap.preempt_line("urgent late") in told), told
         assert checkcap.preempted(hold[2].since) == "urgent owed"
         hold[2].close()
         t.join(30)
@@ -9760,7 +9771,7 @@ def test_an_owed_checks_run_preempts_an_urgent_holder_that_owes_nothing_after_ev
     try:
         assert checkcap.acquire("owed", project_name="mine", priority=0, owns=["o1"], urgent=True,
                                 tell=told.append, max_wait_s=1.0) is None
-        assert checkcap.PREEMPT_LINE.format("routine other") in told, told
+        assert checkcap.preempt_line("routine other") in told, told
     finally:
         checkcap.clear_preempt()
         for h in (routine, urgent, owed):
@@ -9973,7 +9984,7 @@ def test_no_preemption_within_the_grace_and_it_counts_from_the_arrival(env, monk
         assert not list(checkcap.slot_dir().glob(f"{checkcap.PREEMPT}.*.json"))
         assert checkcap.acquire("urgent", priority=1, urgent=True, tell=told.append, since=time.time() - 6,
                                 max_wait_s=1.0) is None
-        assert checkcap.PREEMPT_LINE.format("routine") in told, told
+        assert checkcap.preempt_line("routine") in told, told
     finally:
         checkcap.clear_preempt()
         routine.close()
@@ -10373,7 +10384,7 @@ def test_the_slot_a_preempted_run_frees_goes_to_the_urgent_run_that_asked_not_th
         "urgent", project_name="pa", priority=1, urgent=True, tell=told.append, max_wait_s=30)))
     t.start()
     try:
-        assert _wait_for(lambda: checkcap.PREEMPT_LINE.format("routine") in told), told
+        assert _wait_for(lambda: checkcap.preempt_line("routine") in told), told
         assert checkcap.claims() == 1 and len(list(checkcap.slot_dir().glob(f"{checkcap.CLAIM}.*.json"))) == 1
         routine.close()
         t.join(30)
@@ -10486,7 +10497,7 @@ def test_a_parked_asker_keeps_its_claim_while_the_asked_run_takes_longer_than_cl
         max_wait_s=30)))
     t.start()
     try:
-        assert _wait_for(lambda: checkcap.PREEMPT_LINE.format("routine") in told), told
+        assert _wait_for(lambda: checkcap.preempt_line("routine") in told), told
         assert checkcap.PARKED_LINE in told, "the asker waits for its test slots"
         time.sleep(3 * checkcap.CLAIM_S)   # the asked run is slow to end its command
         assert checkcap.claims() == 1, "renewed while parked and the asked run holds its slot"
@@ -10535,8 +10546,8 @@ def test_a_parked_urgent_run_preempts_only_a_run_whose_stop_lets_it_start(env, m
             "urgent", priority=1, urgent=True, tell=told.append, startable=startable, max_wait_s=1.0)))
         t.start()
         t.join(30)
-        assert checkcap.PREEMPT_LINE.format("big") in told, told
-        assert checkcap.PREEMPT_LINE.format("small") not in told
+        assert checkcap.preempt_line("big") in told, told
+        assert checkcap.preempt_line("small") not in told
         assert checkcap.FREEING.get() is None, "the weighing ends with the call"
     finally:
         checkcap.clear_preempt()
@@ -11563,3 +11574,171 @@ def test_the_load_guard_holds_on_sustained_demand_or_memory_pressure_but_not_on_
     monkeypatch.setenv("TTP_CHECKS_LOAD_SUSTAIN_S", "0")
     demand[0] = 30.0
     assert checkcap.cores_short([]) and "overloaded" in testslots.load_guard(), "0 reads the demand now"
+
+
+def _within_cap_env(monkeypatch, host_max):
+    from ttp import checkcap
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", str(host_max))
+    monkeypatch.setenv("TTP_CHECKS_LOAD_EXTRA", "0")
+    monkeypatch.delenv(checkcap.BEYOND_CAP_ENV, raising=False)
+    monkeypatch.setenv(checkcap.PREEMPT_AFTER_ENV, "0")
+    monkeypatch.setenv(checkcap.PREEMPT_ASKED_ENV, "")
+    monkeypatch.setattr(checkcap, "POLL_S", 0.05)
+
+
+def test_checks_priority_beyond_cap_is_off_unless_set(env, monkeypatch):
+    """#7068: checks.priority_beyond_cap (TTP_CHECKS_PRIORITY_BEYOND_CAP) defaults off; true or 1 turns it on,
+    and the environment wins over the account setting."""
+    from ttp import checkcap
+    monkeypatch.delenv(checkcap.BEYOND_CAP_ENV, raising=False)
+    assert checkcap.priority_beyond_cap() is False
+    for v, want in (("1", True), ("true", True), ("off", False), ("0", False), ("junk", False)):
+        monkeypatch.setenv(checkcap.BEYOND_CAP_ENV, v)
+        assert checkcap.priority_beyond_cap() is want, v
+
+
+def test_a_held_push_priority_slot_counts_toward_the_host_checks_cap(env, monkeypatch):
+    """#7068 (a): with host_max 2, a push run on its priority slot plus one run on a cap slot fill the cap:
+    a third run does not start, and starts once the push ends."""
+    from ttp import checkcap
+    _within_cap_env(monkeypatch, 2)
+    push = checkcap.acquire_priority("origin/branch", "push checks")
+    a = checkcap.acquire("task a", priority=3)
+    try:
+        assert push.f is not None and a.f is not None
+        assert checkcap.acquire("task b", priority=3, max_wait_s=0.5) is None, "push + cap slot fill a cap of 2"
+        push.close()
+        b = checkcap.acquire("task b", priority=3, max_wait_s=10)
+        assert b is not None and b.f is not None
+        b.close()
+    finally:
+        push.close()
+        a.close()
+
+
+def test_an_urgent_waiter_with_the_cap_full_preempts_a_routine_run_and_never_starts_beyond_the_cap(env, monkeypatch):
+    """#7068 (b): the cap full of a routine run, an urgent run (an urgent slot free) asks the routine run to
+    give its slot up and does not take the urgent slot beyond the cap; it starts once the slot frees."""
+    import threading
+    from ttp import checkcap, locks
+    _within_cap_env(monkeypatch, 1)
+    monkeypatch.setenv(checkcap.URGENT_SLOTS_ENV, "1")
+    routine = checkcap.acquire("routine", priority=5, preemptible=True)
+    told, got = [], []
+    t = threading.Thread(target=lambda: got.append(checkcap.acquire("urgent", priority=0, urgent=True,
+                                                                    tell=told.append, max_wait_s=30)))
+    t.start()
+    try:
+        assert _wait_for(lambda: checkcap.preempt_line("routine") in told), told
+        assert not locks.held_labels(checkcap.urgent_paths()) and not got, "no start beyond the cap"
+        assert checkcap.state()["total"] == 1
+        routine.close()
+        t.join(30)
+        assert got and got[0] is not None and got[0].f is not None
+        assert checkcap.state()["total"] == 1, "the urgent run took the one slot of the cap"
+    finally:
+        checkcap.clear_preempt()
+        for h in [routine] + got:
+            if h is not None:
+                h.close()
+
+
+def test_a_waiting_push_and_an_urgent_runs_preempt_claim_never_leave_the_freed_slot_idle(env, monkeypatch):
+    """Review #7516: the cap full of routine runs, a push waiting on its priority slot and an urgent run that
+    asked a routine run to give its slot up: the slot it frees goes to exactly one of them (the urgent claim
+    wins), never past the cap, and the other takes the next slot that frees."""
+    import threading
+    from ttp import checkcap
+    _within_cap_env(monkeypatch, 2)
+    monkeypatch.setenv(checkcap.URGENT_SLOTS_ENV, "1")
+    r1 = checkcap.acquire("routine", priority=5, preemptible=True)
+    r2 = checkcap.acquire("routine two", priority=5, preemptible=True)
+    pushed, told, got = [], [], []
+    p = threading.Thread(target=lambda: pushed.append(checkcap.acquire_priority("origin/b", "push checks")))
+    p.start()
+    held = [r1, r2]
+    try:
+        assert _wait_for(lambda: checkcap.state()["priority_waiting"]), checkcap.state()
+        u = threading.Thread(target=lambda: got.append(checkcap.acquire("urgent", priority=0, urgent=True,
+                                                                        tell=told.append, max_wait_s=8)))
+        u.start()
+        assert _wait_for(lambda: any(m.startswith("urgent checks with every host-wide checks slot busy: asked ")
+                                     for m in told)), told
+        asked = next(m for m in told if m.startswith("urgent checks with every host-wide checks slot busy: "))
+        assert "beyond the cap" not in asked, "the cap is enforced: no urgent slot beyond it"
+        (r1 if "asked routine " in asked else r2).close()
+        u.join(5)
+        assert got and got[0] is not None and got[0].f is not None, (told, got)
+        assert p.is_alive() and not pushed, "the push takes the next slot, not this one"
+        assert checkcap.state()["total"] <= 2
+        held.append(got[0])
+        got[0].close()
+        p.join(5)
+        assert pushed and pushed[0].f is not None, "the push took the slot the urgent run freed"
+        held.append(pushed[0])
+        assert checkcap.state()["total"] <= 2
+    finally:
+        checkcap.clear_preempt()
+        for h in held + pushed + got:
+            if h is not None:
+                h.close()
+        p.join(10)
+
+
+def test_checks_status_line_counts_push_and_urgent_holders_in_the_total(env, monkeypatch):
+    """#7068 (c): line() says how many checks runs hold a slot of any kind and how many of them are push and
+    urgent runs; state() gives the same total."""
+    from ttp import checkcap, locks
+    _within_cap_env(monkeypatch, 4)
+    monkeypatch.setenv(checkcap.URGENT_SLOTS_ENV, "1")
+    a = checkcap.acquire("task a", priority=3)
+    push = checkcap.acquire_priority("origin/branch", "push checks")
+    urgent = locks.try_take(checkcap.urgent_paths(), "urgent run", "")
+    try:
+        assert urgent is not None
+        s = checkcap.state()
+        assert s["total"] == 3 and s["priority"] == ["push checks"] and s["urgent"] == ["urgent run"]
+        out = checkcap.line()
+        assert out.startswith("host checks: 3 running of cap 4 (incl. push 1, urgent 1)"), out
+        assert "beyond the cap" not in out
+        monkeypatch.setenv(checkcap.BEYOND_CAP_ENV, "1")
+        assert "(incl. push 1, urgent 1 beyond the cap)" in checkcap.line()
+    finally:
+        urgent.close()
+        push.close()
+        a.close()
+
+
+def test_a_push_run_takes_the_next_free_slot_ahead_of_queued_task_checks(env, monkeypatch):
+    """#7068 (d): with the defaults and the cap full, a push run that arrives after a queued task run holds
+    its priority slot as next in line: the slot that frees is the push run's, and the task run starts only
+    once the push run ends."""
+    import threading
+    from ttp import checkcap
+    _within_cap_env(monkeypatch, 1)
+    held = checkcap.acquire("running", priority=3)
+    task, push = [], []
+    tt = threading.Thread(target=lambda: task.append(checkcap.acquire("task", priority=1, max_wait_s=30)))
+    tt.start()
+    try:
+        assert _wait_for(lambda: checkcap.state()["queued"] == ["task"])
+        told = []
+        tp = threading.Thread(target=lambda: push.append(checkcap.acquire_priority("origin/b", "push checks",
+                                                                                   tell=told.append)))
+        tp.start()
+        assert _wait_for(lambda: checkcap.state()["priority_waiting"] == ["push checks"])
+        assert "push checks next for a slot: push checks" in checkcap.line()
+        held.close()
+        tp.join(30)
+        assert push and push[0].f is not None and any("within the host-wide cap of 1" in m for m in told), told
+        time.sleep(0.5)
+        assert not task, "the task run waits behind the push run"
+        assert checkcap.state()["priority"] == ["push checks"] and checkcap.state()["total"] == 1
+        push[0].close()
+        tt.join(30)
+        assert task and task[0] is not None and task[0].f is not None
+    finally:
+        held.close()
+        for h in task + push:
+            if h is not None:
+                h.close()

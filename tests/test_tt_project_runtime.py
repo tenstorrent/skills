@@ -19080,6 +19080,7 @@ def test_a_push_batch_runs_its_checks_on_the_priority_slot_while_task_checks_que
     log = env["tmp"] / "checks.log"
     p, repo, origin, other = _bump_setup(env, monkeypatch, [f'echo "${{{checkcap.HELD_ENV}:-none}}" >> {log}'])
     monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "1")
+    monkeypatch.setenv(checkcap.BEYOND_CAP_ENV, "1")  # the opt-in overflow; the default counts it in the cap
     heads = [_entry(repo, "e1", {"plugins/p/f1.txt": "1\n"})]
     holder = _cap_holder("other project task #3 (run 9)")
     got = []
@@ -28432,7 +28433,7 @@ def test_checks_host_cap_enforces_the_limit_and_serves_waiters_in_order(env, mon
     time.sleep(0.3)
     assert got == [], "nobody runs past the cap"
     assert checkcap.state()["running"] == ["a", "b"]
-    assert "2 running (cap 2), 2 queued: c; d" in checkcap.line()
+    assert "host checks: 2 running of cap 2, 2 queued: c; d" in checkcap.line()
     assert any("queued for a host-wide checks slot: 2 of 2 running" in t for t in told) and waits[0] is True
     a.close()
     first.join(10)
@@ -28550,7 +28551,7 @@ def test_checks_host_cap_serves_projects_round_robin(env, monkeypatch):
     assert _wait_for(lambda: told)
     assert "queued for a host-wide checks slot: 1 of 1 running, 2 ahead, 3 projects" in told[0]
     assert checkcap.state()["queued"] == ["a1", "b1", "c1", "a2", "b2", "a3"], "status lists them in serving order"
-    assert "1 running (cap 1), 6 queued: a1; b1; c1; a2; ... (running: h)" in checkcap.line()
+    assert "1 running of cap 1, 6 queued: a1; b1; c1; a2; ... (running: h)" in checkcap.line()
     assert checkcap.line().endswith("; next per project: a1 0 ahead, b1 1 ahead, c1 2 ahead"), \
         "each project's next waiter shows how many are served before it"
     held.close()
@@ -28595,6 +28596,7 @@ def test_push_checks_take_a_priority_slot_ahead_of_every_queued_task_check(env, 
     import threading
     from ttp import checkcap, locks
     monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "2")
+    monkeypatch.setenv(checkcap.BEYOND_CAP_ENV, "1")  # the opt-in overflow; the default counts it in the cap
     full = [checkcap.acquire("a"), checkcap.acquire("b")]
     got = []
 
@@ -28678,7 +28680,7 @@ def test_checks_host_cap_queues_detached_checks_and_starts_them_once_the_holder_
         assert "queued for a host-wide checks slot" in out and "other project task #3 (run 9)" in out
         assert "queued for a host-wide checks slot" in (run / "progress.md").read_text()
         assert "host checks:" not in cli.status_text(p), "routine: only --verbose shows it"
-        assert "host checks: 1 running (cap 1), 1 queued:" in cli.status_text(p, verbose=True)
+        assert "host checks: 1 running of cap 1, 1 queued:" in cli.status_text(p, verbose=True)
         assert "(running: other project task #3 (run 9))" in cli.status_text(p, verbose=True), "it still lists the holders"
         assert f"{p.name} task #7 (run 41)" in checkcap.line()
         assert not ran.exists(), "nothing runs over the cap"

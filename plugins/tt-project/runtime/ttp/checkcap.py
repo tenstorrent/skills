@@ -29,8 +29,12 @@ work (`--resume`); the run's next command never starts without one (Slot.hold_ag
 
 Push checks (the push queue's batches and `ttp push` to the push branch) hold the push lock, so every
 approved change waits on them: they never queue behind task checks. Each push branch has one priority
-slot of its own beyond the cap (`acquire_priority`), keyed by the remote and branch so it is one per
-branch host-wide, across projects. `ttp land`'s checks take one too, keyed by the repository's path
+slot of its own (`acquire_priority`), keyed by the remote and branch so it is one per
+branch host-wide, across projects. It counts toward the cap: a push holds it while it waits for room, so the
+next slot that frees is its, ahead of every waiter, and it starts once the runs on the cap's slots, the
+running push checks, those waiting on theirs since before it and the urgent slots' holders leave room (_room,
+_counted, _priority_turn). `checks.priority_beyond_cap` true (TTP_CHECKS_PRIORITY_BEYOND_CAP; default off) instead
+runs push checks and urgent runs beyond the cap and their reserved test lanes beyond the test pool, as an overflow. `ttp land`'s checks take one too, keyed by the repository's path
 and the local branch it moves (push.priority_key with no remote). Task checks keep their cap and their order: the priority slot never
 takes one of theirs. It is an OS file lock like the others, so a killed push frees it too. A push waiting
 behind another holder of its priority slot waits `checks.push_priority_wait_s` (TTP_CHECKS_PRIORITY_WAIT_S,
@@ -62,11 +66,13 @@ An urgent run (priority locks.URGENT_PRIORITY or better: an obligation owner, a 
 that would wait with every slot busy (all held, a queue ahead of it, or parked for its test slots) never waits
 behind routine runs. `ttp checks` first tries the account's test pool at once (checkspill.pick with no bounded
 wait first, cli._checks_slot); with no pool host free it takes a reserved urgent slot (acquire's `urgent`):
-`checks.urgent_slots` (TTP_CHECKS_URGENT_SLOTS, default URGENT_SLOTS; 0 turns them off) slots of their own
-beyond the cap and the load's extras, as push checks have one per branch, each with a reserved test lane
-(testslots' reserved lane keyed urgent_key) and past its project's cap of running checks. Only urgent runs take
-one, so at most that many run above the cap at once; the cores and disk gates do not hold it (as for push checks).
-With those held too, an urgent waiter that has waited preempt_after_s() since its arrival asks, one live ask at a time
+`checks.urgent_slots` (TTP_CHECKS_URGENT_SLOTS, default URGENT_SLOTS; 0 turns them off) slots of their own,
+as push checks have one per branch, each taking test slots ahead of the queue (testslots' push lane keyed
+urgent_key) and past its project's cap of running checks. They count toward the cap: one is taken only while the
+cap has room, the next slot that frees ahead of every waiter (with checks.priority_beyond_cap true, beyond the
+cap and the load's extras with a reserved test lane, at most that many above the cap at once). Only urgent runs
+take one; the cores and disk gates do not hold it (as for push checks).
+With those held or the cap full, an urgent waiter that has waited preempt_after_s() since its arrival asks, one live ask at a time
 (PREEMPT_ASKED_ENV, kept over a re-execution; again preempt_after_s() after one lapsed), one routine run on a cap slot to step back (preempt): one never
 preempted before first, then its own project's, then the least urgent, then the latest granted (it loses the least
 work). It ends its command, lets its slots go and queues again at its old arrival, ahead of every later arrival at
@@ -177,7 +183,7 @@ AGED_TURNS = 3   # default urgent turns an aged routine run lets go before its o
 STARVE_ENV = "TTP_CHECKS_STARVE_S"
 SMALL_TESTS = 500   # default checks.small_tests: a targeted run of fewer tests is short (is_small)
 SMALL_ENV = "TTP_CHECKS_SMALL_TESTS"
-URGENT = "checks-urgent"   # check-slots/checks-urgent.<n>.lock: the reserved urgent slots beyond the cap (urgent_paths)
+URGENT = "checks-urgent"   # check-slots/checks-urgent.<n>.lock: the reserved urgent slots (urgent_paths)
 URGENT_SLOTS = 1   # default checks.urgent_slots: urgent runs at once above the cap
 URGENT_SLOTS_ENV = "TTP_CHECKS_URGENT_SLOTS"
 PREEMPT_AFTER_S = 120.0   # default checks.preempt_after_s: an urgent waiter's grace before it asks a routine run
@@ -413,12 +419,31 @@ def priority_turns() -> int:
 
 
 def urgent_slots() -> int:
-    """Reserved urgent slots beyond the cap: TTP_CHECKS_URGENT_SLOTS, else the account's checks.urgent_slots,
+    """Reserved urgent slots (beyond the cap only with priority_beyond_cap()): TTP_CHECKS_URGENT_SLOTS, else the account's checks.urgent_slots,
     else URGENT_SLOTS; 0 turns them off, an unreadable value is the default."""
     for v in (os.environ.get(URGENT_SLOTS_ENV), (project.load_account_settings().get("checks") or {}).get("urgent_slots")):
         if v not in (None, "") and (n := _number(v)) is not None:
             return n
     return URGENT_SLOTS
+
+
+BEYOND_CAP_ENV = "TTP_CHECKS_PRIORITY_BEYOND_CAP"
+
+
+def priority_beyond_cap() -> bool:
+    """Whether push checks' priority slots and the reserved urgent slots run beyond the cap, and their reserved
+    test lanes beyond the test pool, as an overflow: TTP_CHECKS_PRIORITY_BEYOND_CAP, else the account's
+    checks.priority_beyond_cap (true/on/1 or false/off/0). Off by default: they count toward the cap (_room,
+    _counted) and draw on the test pool (testslots.acquire), still ahead of every waiter."""
+    for v in (os.environ.get(BEYOND_CAP_ENV),
+              (project.load_account_settings().get("checks") or {}).get("priority_beyond_cap")):
+        if isinstance(v, bool):
+            return v
+        if (w := str(v if v is not None else "").strip().lower()) in ("1", "true", "on", "yes"):
+            return True
+        if w in ("0", "false", "off", "no"):
+            return False
+    return False
 
 
 def preempt_after_s() -> float:
@@ -1084,13 +1109,18 @@ def host_holders(n: int | None = None) -> list[str]:
 
 
 def state() -> dict:
-    """Who runs checks host-wide now and who waits: {"limit", "running": [labels], "queued": [labels],
-    "priority": [labels of push checks on their priority slots], "held": [every slot holder once]
-    (host_holders: what reports count as running)}."""
+    """Who runs checks host-wide now and who waits: {"limit", "running": [labels on cap slots], "queued": [labels],
+    "priority": [labels of push checks running on their priority slots], "priority_waiting": [those holding one
+    while they wait for room in the cap], "urgent": [labels on reserved urgent slots], "total": every run
+    running, "beyond": whether push and urgent runs run beyond the cap (priority_beyond_cap), "held": [every
+    slot holder once] (host_holders: what reports count as running)}."""
     n = limit()
     running = locks.held_labels(all_paths(n)) if n else []
-    priority = locks.held_labels(priority_paths()) if n else []
-    since = [float(r.get("since") or 0) for r in locks.holder_records(priority_paths())] if priority else []
+    recs = locks.holder_records(priority_paths()) if n else []
+    priority = [str(r.get("holder") or "") for r in recs if not r.get("waiting")]
+    held_waiting = [str(r.get("holder") or "") for r in recs if r.get("waiting")]
+    since = [float(r.get("since") or 0) for r in recs if not r.get("waiting")]
+    urgent_held = locks.held_labels(urgent_paths()) if n else []
     queued, ahead, groups, arrived = [], {}, set(), []
     for t in locks.fair_order(slot_dir(), RESOURCE, **order()):
         try:
@@ -1109,7 +1139,8 @@ def state() -> dict:
             continue
     return {"limit": n, "extra": extra(n), "running": running, "queued": queued, "priority": priority,
             "ahead": ahead, "queued_at": arrived, "priority_since": since, "parked": parked,
-            "pool": len(pool_runs()) if n else 0, "urgent": locks.held_labels(urgent_paths()) if n else [],
+            "pool": len(pool_runs()) if n else 0, "urgent": urgent_held, "priority_waiting": held_waiting,
+            "total": len(running) + len(priority) + len(urgent_held), "beyond": priority_beyond_cap(),
             "held": host_holders(n)}
 
 
@@ -1186,17 +1217,24 @@ def line(activity: bool = False) -> str:
     """One status line, or "" when nothing runs or waits. With `activity` it also names each slot holder that
     has held its slot idle_hold_s() or longer with no test running (holder_activity)."""
     s = state()
-    if not s["running"] and not s["queued"] and not s["priority"] and not s["parked"] and not s["urgent"]:
+    waiting = s.get("priority_waiting") or []
+    if not s["running"] and not s["queued"] and not s["priority"] and not s["parked"] and not s["urgent"] \
+            and not waiting:
         return ""
     now = time.time()
     cap = (f"cap {s['limit']}" + (f" +{s['extra']} while the load is low" if s["extra"] else "")
            if s["limit"] else "no cap")
-    out = f"host checks: {len(s['running'])} running ({cap})"
+    total = s.get("total", len(s["running"]) + len(s["priority"]) + len(s["urgent"]))
+    incl = ", ".join(f"{k} {len(s[v])}" for k, v in (("push", "priority"), ("urgent", "urgent")) if s[v])
+    beyond = " beyond the cap" if s.get("beyond") and incl else ""
+    out = f"host checks: {total} running of {cap}" + (f" (incl. {incl}{beyond})" if incl else "")
     if s["priority"]:
         out += ", push priority slot: " + _some([_aged(h, t, now, "held") for h, t in
                                                  zip(s["priority"], s["priority_since"] or [0.0] * len(s["priority"]))])
+    if waiting:
+        out += f", push checks next for a slot: {_some(waiting)}"
     if s["urgent"]:
-        out += f", urgent slot beyond the cap: {_some(s['urgent'])}"
+        out += f", urgent slot{beyond}: {_some(s['urgent'])}"
     if s["queued"]:
         out += f", {len(s['queued'])} queued: " + _some([_aged(h, t, now) for h, t in zip(s["queued"], s["queued_at"])])
     if s["parked"]:
@@ -1416,7 +1454,8 @@ def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = No
             locks.mark_turn(slot_dir(), RESOURCE, None)
             _granted(tell, state, project_name, priority, owns, since, cap=cap, lane_at=lane_at)
             return Slot(f, again=again)
-        if f := _urgent_take(urgent, priority, every, held_as, what, same, owns, rank=_urgent_rank(owns, since)):
+        if f := _urgent_take(urgent, priority, every, held_as, what, same, owns, rank=_urgent_rank(owns, since),
+                             n=n, claim=claim):
             drop_claim(claim)
             return _urgent_granted(f, tell, state, project_name, priority, owns, since, cap, lane_at)
         ticket = None if parked else locks.enqueue(slot_dir(), RESOURCE, queued_as, since, group=project_name,
@@ -1475,7 +1514,7 @@ def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = No
                 except OSError:
                     f = None
             if not f and not twin and (f := _urgent_take(urgent, priority, every, held_as, what, same, owns,
-                                                         mine=uwait)):
+                                                         mine=uwait, n=n, claim=claim)):
                 return _urgent_granted(f, tell, state, project_name, priority, owns, since, cap, lane_at)
             if not f and asked and not twin and not parked:   # the slot a preempted run gave up is this run's
                 f = _take(n, paths(n), every, held_as, what, same, label=label, mine=claim)
@@ -1503,7 +1542,7 @@ def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = No
                     os.environ[PREEMPT_ASKED_ENV] = json.dumps({"since": since, "asked": asked, "claim": claim,
                                                                 **({"parked": True} if parked else {})})
                     if tell:
-                        tell(PREEMPT_LINE.format(asked))
+                        tell(preempt_line(asked))
                 else:
                     claim = ""
             if f:
@@ -1540,13 +1579,19 @@ def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = No
 
 URGENT_LINE = ("urgent checks with every host-wide checks slot busy: running now on a reserved urgent slot beyond "
                "the cap (checks.urgent_slots), with its reserved test lane")
+URGENT_IN_CAP_LINE = ("urgent checks: running now on a reserved urgent slot, the next free one of the cap ahead of "
+                      "every waiter (checks.urgent_slots), with test slots ahead of the queue")
 
 
 def _urgent_take(urgent: bool, priority: int | None, every: list[Path], holder: str, what: str, same: str,
-                 owns=(), mine: Path | None = None, rank: tuple | None = None):
+                 owns=(), mine: Path | None = None, rank: tuple | None = None, n: int = 0, claim: str = ""):
     """A free reserved urgent slot for an urgent run (acquire's `urgent`), else None: none while an urgent
-    waiter ranked before it waits for one (_urgent_ahead; `mine` its own URGENT_WAIT ticket, else its `rank`)."""
+    waiter ranked before it waits for one (_urgent_ahead; `mine` its own URGENT_WAIT ticket, else its `rank`).
+    Unless priority_beyond_cap(), only while the cap `n` has room (_room, `claim` its own preempt claim): it
+    takes the next free slot ahead of every waiter, never one beyond the cap."""
     if not urgent or not is_urgent(priority) or _running(every, same) or _urgent_ahead(mine, rank):
+        return None
+    if not priority_beyond_cap() and _room(n, every, claim) <= 0:
         return None
     return locks.try_take(urgent_paths(), holder, what, key=same,
                           extra={"priority": priority, "urgent": True, "owed": bool(owns)})
@@ -1589,15 +1634,21 @@ def _urgent_granted(f, tell, state, project_name, priority, owns, since, cap, la
     are not marked: it took no slot of the cap."""
     _granted(tell, state, project_name, priority, owns, since, cap=cap, lane_at=lane_at)
     if tell:
-        tell(URGENT_LINE)
+        tell(URGENT_LINE if priority_beyond_cap() else URGENT_IN_CAP_LINE)
     slot = Slot(f)
     slot.urgent = True
     return slot
 
 
 PREEMPT = "preempt"
-PREEMPT_LINE = ("urgent checks with every host-wide checks slot busy and no urgent slot free: asked {} to give up "
-                "its slot and queue again at its place (checks.preempt_after_s)")
+PREEMPT_LINE = ("urgent checks with every host-wide checks slot busy{}: asked {} "
+                "to give up its slot and queue again at its place (checks.preempt_after_s)")
+
+
+def preempt_line(asked: str) -> str:
+    """PREEMPT_LINE for the run `asked`; it names the busy urgent slots only where urgent runs may run
+    beyond the cap (priority_beyond_cap)."""
+    return PREEMPT_LINE.format(" (beyond the cap: an urgent slot too)" if priority_beyond_cap() else "", asked)
 
 
 class Preempted(BaseException):
@@ -1978,8 +2029,42 @@ def _running(every: list[Path], same: str) -> str:
 
 
 def _room(n: int, every: list[Path], mine: str = "") -> int:
-    """Slots a waiter may take: the cap and extra(), less those held, pool runs and others' live claims."""
-    return n + extra(n) - len(locks.held_labels(every)) - len(pool_runs()) - claims(mine)
+    """Slots a waiter may take: the cap and extra(), less those held, push and urgent holders (_counted),
+    pool runs and others' live claims. A live claim `mine` wins the slot its preempted run frees over a
+    push waiting on its priority slot: the waiting push is not counted against its asker, and that push's
+    turn (_priority_turn) counts the claim, so exactly one of them takes the slot (the claim caused the
+    preemption) and the push takes the next one."""
+    return (n + extra(n) - len(locks.held_labels(every)) - _counted(claimant=claim_live(mine)) - len(pool_runs())
+            - claims(mine))
+
+
+def _counted(skip: Path | None = None, claimant: bool = False) -> int:
+    """Push priority slots (a push waiting on one holds it, so the next free slot is its) and reserved urgent
+    slots held now, which count toward the cap unless priority_beyond_cap(). With `skip` (a push's own
+    waiting priority slot) only the other pushes that run or waited before it count, so waiting pushes
+    of several branches start in arrival order and never block one another. With `claimant` (the asker
+    of a live claim, _room) no waiting push counts."""
+    if priority_beyond_cap():
+        return 0
+    n = len(locks.held_labels(urgent_paths()))
+    mine = _label(skip) if skip is not None else {}
+    for path in priority_paths():
+        if path == skip or not locks.held_labels([path]):
+            continue
+        if claimant:
+            n += not _label(path).get("waiting")
+            continue
+        h = _label(path) if skip is not None else {}
+        n += not (h.get("waiting") and (float(h.get("since") or 0), path.name)
+                  > (float(mine.get("since") or 0), skip.name))
+    return n
+
+
+def _label(path: Path) -> dict:
+    try:
+        return locks.read_label(path)
+    except (OSError, ValueError):
+        return {}
 
 
 def _take(n: int, ps: list[Path], every: list[Path], holder: str, what: str, same: str, room: int | None = None,
@@ -2011,8 +2096,8 @@ def _take_in_turn(n: int, ticket: Path, ps: list[Path], every: list[Path], holde
 def acquire_priority(key: str, holder: str, what: str = "", tell: Callable[[str], None] | None = None,
                      project_name: str | None = None, state: Path | None = None,
                      fallback: Callable[[], Slot] | None = None) -> Slot:
-    """Take the priority slot of the push branch `key` (beyond the cap, ahead of every task waiting in
-    the queue), saying so through `tell`. Only another push to the same branch can hold it; then this
+    """Take the priority slot of the push branch `key` (ahead of every task waiting in the queue, then the
+    next room in the cap: _priority_turn; beyond it with priority_beyond_cap()), saying so through `tell`. Only another push to the same branch can hold it; then this
     waits for that one alone, priority_wait_s() at most when `fallback` is given: past that it says who
     held it and returns `fallback()` (an ordinary turn), marked `fell_back`. Cap off or nested: no slot,
     run at once. An unwritable slot directory raises Unavailable. With `state` the slot taken is logged
@@ -2023,15 +2108,19 @@ def acquire_priority(key: str, holder: str, what: str = "", tell: Callable[[str]
     path = priority_path(key)
     started, told = time.time(), 0.0
     while True:
+        beyond = priority_beyond_cap()
         try:
-            f = locks.try_take([path], holder, what)
+            f = locks.try_take([path], holder, what, extra=None if beyond else {"waiting": True})
+            if f and not beyond:
+                told = _priority_turn(f, path, n, tell) or told
         except OSError as e:
             raise _unavailable(e) from e
         if f:
             if tell:
                 q = len(locks.queued(slot_dir(), RESOURCE))
-                tell(f"push checks took the push priority slot (beyond the host-wide cap of {n}: "
-                     f"{len(locks.held_labels(all_paths(n)))} task checks running"
+                tell(f"push checks took the push priority slot ("
+                     + (f"beyond the host-wide cap of {n}: " if beyond else f"within the host-wide cap of {n}: ")
+                     + f"{len(locks.held_labels(all_paths(n)))} task checks running"
                      + (f", {q} queued behind" if q else "") + ")"
                      + (f" after {(time.time() - started) / 60:.1f} min" if told else ""))
             record_wait(state, project_name, None, started, time.time(), "push")
@@ -2049,6 +2138,29 @@ def acquire_priority(key: str, holder: str, what: str = "", tell: Callable[[str]
                  f"{_some(locks.held_labels([path])) or 'unknown'}")
             told = time.time()
         time.sleep(poll_s(POLL_S))
+
+
+def _priority_turn(f, path: Path, n: int, tell: Callable[[str], None] | None = None) -> float:
+    """Hold the push priority slot `f` (labelled waiting) until the cap has room for it, then mark it running.
+    While it waits it counts toward the cap (_counted), so no other waiter takes the slot that frees next.
+    Returns when it was last told about the wait (0.0: no wait). Its slot is let go if the wait is cut short."""
+    told = 0.0
+    try:
+        while True:
+            m = limit() or n
+            every = all_paths(m)
+            if m + extra(m) - len(locks.held_labels(every)) - _counted(path) - len(pool_runs()) - claims() > 0:
+                locks.relabel(f, {"waiting": False, "since": time.time()})
+                return told
+            if tell and time.time() - told >= TELL_S:
+                tell(f"push checks hold their push priority slot and take the next free host-wide checks slot ahead of "
+                     f"every waiter (cap {m}, checks.priority_beyond_cap off): {_some(locks.held_labels(every))}")
+                told = time.time()
+            time.sleep(poll_s(POLL_S))
+            project.ps_cycle()
+    except BaseException:
+        f.close()
+        raise
 
 
 # Each slot taken, logged in the taker's project state as one JSON line: {"project", "task", "run",

@@ -13866,6 +13866,7 @@ def test_ttp_land_checks_take_their_branch_priority_slot_ahead_of_an_earlier_wai
     _git_out(repo, "worktree", "add", "-q", "--detach", str(side))
     assert land._slot_key(repo, "proj") == land._slot_key(side, "proj") == key == f"{repo.resolve()}#proj"
     monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "1")
+    monkeypatch.setenv(checkcap.BEYOND_CAP_ENV, "1")  # the opt-in overflow; the default counts it in the cap
     held = checkcap.acquire("suite of another project", project_name="other")
     earlier = locks.enqueue(checkcap.slot_dir(), checkcap.RESOURCE, "earlier task check", since=1000.0, group="other")
     said, got = [], []

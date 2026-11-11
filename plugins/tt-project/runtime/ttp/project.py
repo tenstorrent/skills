@@ -3053,6 +3053,7 @@ ACCOUNT_KEYS = {"budget": {"global_daily_usd", "daily_target_usd", "day_start", 
                            "wait_escalate_s", "wait_hang_factor", "done_holder_flag_s", "done_holder_grace_s", "stall_s", "starve_s", "small_tests",
                            "push_load_wait_s",
                            "push_priority_wait_s",   # a push's longest wait behind another priority holder (checkcap.priority_wait_s)
+                           "priority_beyond_cap",   # push and urgent runs beyond checks.host_max (checkcap.priority_beyond_cap)
                            "dirty_max_mb", "io_full_max",   # the disk gate on new local runs (diskgate)
                            "spill_hosts",   # the spill pool every project's checks may use (checkspill.account_hosts)
                            "slurm_overflow",   # a Slurm cluster the pool's overflow runs on (slurmcheck)

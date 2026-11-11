@@ -2382,9 +2382,16 @@ session and stateless coordinators on every provider.
   `state/logs/churn.jsonl`, rotated to `churn.jsonl.1` past 1 MB. It never stops a process. A
   `ttp checks` or push inside a check command does not wait for its parent's slot. Checks that
   gate a push to the push branch (the push queue's batches and `ttp push`) hold the push lock, so
-  they never queue behind task checks: each push branch has one priority slot of its own beyond the
-  cap, shared host-wide across projects. Task checks keep their cap and their order. The batch log
-  and `ttp status` say when a push holds it (`push priority slot: ...`); a killed push frees it too.
+  they never queue behind task checks: each push branch has one priority slot of its own, shared
+  host-wide across projects. It counts toward the cap: a push holds it while it waits, so the next
+  slot that frees is its, ahead of every waiter, and no new run of any kind starts while the cap's
+  runs, push runs and urgent runs together fill the cap. Its tests take the test pool's free slots
+  ahead of the queue (fewer workers while the pool is busy), never a lane beyond the pool. Set
+  `checks.priority_beyond_cap` true (account-level, env `TTP_CHECKS_PRIORITY_BEYOND_CAP`, default
+  off) to run push and urgent checks beyond the cap, each with a reserved test lane beyond the pool,
+  as before. The batch log and `ttp status` say when a push holds it (`push priority slot: ...`,
+  `push checks next for a slot: ...` while it waits for room); a killed push frees it too. The
+  status line counts every run: `host checks: N running of cap M (incl. push P, urgent U)`.
   A push waiting behind another holder of its slot waits `checks.push_priority_wait_s` at most
   (account-level, default 1800 s), then says who held it and takes an ordinary host-wide turn instead.
   Waiters take turns by project, within one by task priority. Checks of priority-1 tasks (live-impact
@@ -2405,9 +2412,10 @@ session and stateless coordinators on every provider.
   still holds it); the cap and every other rule hold it as any run. An urgent run (priority 0 or 1: a task owed to the user,
   live-impact work) that would wait with every slot busy starts within about a minute, in this order:
   on a free host of the account's test pool at once (no `checks_spill_after_s` wait first; a paused
-  host is never picked); else on a reserved urgent slot beyond the cap, with a reserved test lane past
-  its project's cap (`checks.urgent_slots`, account-level, env `TTP_CHECKS_URGENT_SLOTS`, default 1, so
-  at most that many urgent runs above the cap at once; 0 turns them off); else, once it has waited
+  host is never picked); else on a reserved urgent slot, the next one free within the cap ahead of
+  every waiter, taking test slots ahead of the queue past its project's cap (`checks.urgent_slots`,
+  account-level, env `TTP_CHECKS_URGENT_SLOTS`, default 1; 0 turns them off; with
+  `checks.priority_beyond_cap` true they run beyond the cap, at most that many at once); else, once it has waited
   `checks.preempt_after_s` from its arrival (account-level, env `TTP_CHECKS_PREEMPT_AFTER_S`, default
   120; 0 asks at once), it asks one routine run on a cap slot to step back, once per request: a run of
   its own project first, then the least urgent, then the latest started. That run ends its current
