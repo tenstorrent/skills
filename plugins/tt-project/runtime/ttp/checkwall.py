@@ -142,11 +142,13 @@ def cap(p, now: float | None = None) -> tuple[float, str]:
 
 
 def record_run(state: Path | None, seconds: float, passed: bool, key: str = "", scratch: str = "",
-               host: str = "", task: str = "") -> None:
+               host: str = "", task: str = "", fails: list | None = None, proven: bool = False,
+               wrap: str | None = None) -> None:
     """Keep one completed run's wall time for cap(), with `key` (its command list's hash, for
     checklane.median_s), `scratch` (where its scratch was: 'tmpfs' or 'disk'), `host` (the spill host
     it ran on; none: this one) and `task` when given, for configwho.watch too, which also keeps its own
-    longer per-host record (configwho.note_run); a failed write only loses a sample. Older rows lack them."""
+    longer per-host record (configwho.note_run) with a failed run's `fails`, `proven` and `wrap` (what its
+    watch reads to blame a change); a failed write only loses a sample. Older rows lack them."""
     if state is None or seconds <= 0:
         return
     path = Path(state) / RUNS_LOG
@@ -160,7 +162,7 @@ def record_run(state: Path | None, seconds: float, passed: bool, key: str = "", 
                                             **({"host": host} if host else {}),
                                             **({"task": str(task)} if task else {})}) + "\n")
         from .configwho import note_run
-        note_run(state, ts, passed, host, task)
+        note_run(state, ts, passed, host, task, fails=fails, proven=proven, wrap=wrap)
     except OSError:
         pass
 

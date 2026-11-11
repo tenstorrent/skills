@@ -3401,6 +3401,15 @@ def _commands_hash(cmds: list) -> str:
     return hashlib.sha256(json.dumps([_command_key(c) for c in cmds]).encode()).hexdigest()
 
 
+def _spill_wrap_digest(todo: list, cfg: dict | None) -> str:
+    """The digest (configwho.digest) of the checks.spill_wrap_cmd value the checks of `todo` that spill run
+    behind, 'own' when each has its own spill_wrap_cmd: whether a change of that key could break this run."""
+    from . import checkspill, configwho, push
+    if any(checkspill.check_spills(c, cfg) and not getattr(c, "spill_wrap_cmd", "") for c in todo):
+        return configwho.digest(configwho.at(cfg or {}, push.SPILL_WRAP_KEY))
+    return "own"
+
+
 def _spill_to(todo: list, host: str, cfg: dict | None = None, workers: int = 0) -> list:
     """`todo` run on spill host `host` (checkspill, push.spill_to), with `workers` test workers there when
     given (checkspill.workers_env, exported as is and no part of the pass key), each local check marked `spilled`: its
@@ -4162,6 +4171,8 @@ def cmd_checks(a) -> None:
     join_rec, joined = None, None   # this run's checkjoin record; the run it followed and how
     excused = []   # checks whose failing tests the gate judged not new on this head (gatejudge): landing only
     proven_new = []   # the gate's verdicts with ids proven new (gatejudge.proven): the base passing them on that host
+    fail_ids = []   # the failing check's pytest ids, when its output names them all (configwho.watch)
+    run_wrap = None   # on a spill host, the digest of the checks.spill_wrap_cmd it ran behind (configwho.watch)
     base = _checks_base(p, Path(top), cmds)
     (Path(run_dir) / "check_failure.json").unlink(missing_ok=True)
     (Path(run_dir) / slowtests.FILE).unlink(missing_ok=True)   # this run's slowest tests only
@@ -4393,6 +4404,7 @@ def cmd_checks(a) -> None:
         if spilled:
             if slurm := getattr(spilled, "slurm", None):   # one batch job per check, --time from the run's median
                 minutes = slurmcheck.time_min(checklane.median_s(p.state, _commands_hash(todo)), slurm)
+            run_wrap = _spill_wrap_digest(todo, cfg)
             todo = _spill_to(todo, spilled.host, cfg, getattr(spilled, "workers", 0))
             for c in todo if slurm else []:
                 if getattr(c, "spill_host", ""):   # a check split off to run here stays off Slurm
@@ -4627,6 +4639,9 @@ def cmd_checks(a) -> None:
                     break
                 if rc != 0:
                     passed, failed = False, c
+                    from . import sharedchecks
+                    ids, complete = sharedchecks.failing_ids(_log_since(out, log, check_start))
+                    fail_ids = ids if complete else []
                     if cwd != top and not clean.path.is_dir():
                         tree_gone = _tree_gone(clean, c, head)
                         out.write(f"ttp checks: {tree_gone}\n")
@@ -4767,7 +4782,8 @@ def cmd_checks(a) -> None:
                     checkwall.record_run(p.state, time.time() - ran_since, passed,
                                          _commands_hash(todo) if passed and executed == todo else "",
                                          "" if spilled else "tmpfs" if shorttmp.on_tmpfs(run_env.get("TMPDIR")) else "disk",
-                                         spilled.host if spilled else "", os.environ.get("TTP_TASK") or "")
+                                         spilled.host if spilled else "", os.environ.get("TTP_TASK") or "",
+                                         fails=fail_ids, proven=bool(proven_new), wrap=run_wrap)
                 # A completed run no longer reports the task's old wall-time timeout (TIMEOUTS entry).
                 checkwall.clear_timeout(p.state, os.environ.get("TTP_TASK"))
         if slot and not passed:

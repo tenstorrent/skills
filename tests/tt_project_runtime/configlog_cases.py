@@ -239,6 +239,104 @@ def test_config_breakage_watch_raises_one_event_naming_the_change_and_its_undo(e
     assert configwho.watch(p, now=change + configwho.WATCH_S + 1) == [], "an old change is not watched"
 
 
+def _breakage_setup(p, key, value, setter, wrap_old="/opt/example/old-wrap.sh"):
+    """A watched change of `key` with two spill hosts and this host passing before it; returns (change, put)
+    where put(*runs) writes the watch's own run record: (ts offset, passed, host, task, extra fields)."""
+    from ttp import configwho
+    from ttp.project import durable_append
+    if key == "checks.spill_wrap_cmd":
+        p.set_config(key, wrap_old)
+    p.set_config(key, value, by=setter)
+    change = float(configwho.history(p, key)[-1]["ts"])
+
+    def put(*rs):
+        (p.state / configwho.RUNS).unlink(missing_ok=True)
+        for dt, passed, host, task, extra in [(-900, True, "spill-a", "1", {}), (-850, True, "spill-b", "1", {}),
+                                              (-800, True, "", "2", {}), *rs]:
+            durable_append(p.state / configwho.RUNS, json.dumps({"ts": change + dt, "passed": passed, "host": host, "task": task,
+                                                                   **extra}) + "\n")
+    return change, put
+
+
+def test_config_breakage_counts_only_runs_that_could_have_used_the_spill_setting(env, monkeypatch):
+    """Replays a false alarm: checks.spill_wrap_cmd changed, then three local runs of two tasks failed. A
+    local run never runs behind the spill wrapper, so no event; nor for spill runs behind another
+    wrapper value (the change's digest differs: a check with its own wrapper, or a later change). The
+    same failures behind the new value raise it; a non-spill key still counts local runs."""
+    from ttp import configwho
+    p = make(env)
+    _config_clear_run_env(monkeypatch)
+    change, put = _breakage_setup(p, "checks.spill_wrap_cmd", "/opt/example/wrap.sh",
+                                  configwho.by("coordinator", via="config_set"))
+    put((60, False, "", "3", {}), (90, False, "", "4", {}), (120, False, "", "5", {}))
+    assert configwho.watch(p, now=change + 300) == [], "local runs never use the spill wrapper"
+    new = configwho.history(p, "checks.spill_wrap_cmd")[-1]["nh"]
+    assert new == configwho.digest("/opt/example/wrap.sh")
+    put(*[(dt, False, h, t, {"wrap": "own"}) for dt, h, t in ((60, "spill-a", "3"), (90, "spill-b", "4"), (120, "spill-a", "5"))])
+    assert configwho.watch(p, now=change + 300) == [], "every check ran behind its own wrapper"
+    put(*[(dt, False, h, t, {"wrap": new}) for dt, h, t in ((60, "spill-a", "3"), (90, "spill-b", "4"), (120, "spill-a", "5"))])
+    assert configwho.watch(p, now=change + 300) == [f"config_breakage:checks.spill_wrap_cmd:{change}"]
+    assert "3 check runs of 3 tasks failed on spill-a, spill-b" in _config_events(p, "config_breakage")[0]["text"]
+
+    p.set_config("checks.timeout_s", 99, by=configwho.by("coordinator", via="config_set"))
+    other = float(configwho.history(p, "checks.timeout_s")[-1]["ts"])
+    from ttp.project import durable_append
+    for dt, t in ((60, "6"), (90, "7"), (120, "8")):
+        durable_append(p.state / configwho.RUNS, json.dumps({"ts": other + dt, "passed": False, "task": t}) + "\n")
+    assert configwho.watch(p, now=other + 300) == [f"config_breakage:checks.timeout_s:{other}"], "any key: local runs count"
+
+
+def test_config_breakage_skips_failures_known_on_the_base_flaky_or_proven_new(env, monkeypatch):
+    """Failed runs whose failing ids also failed on a base on the same host (the push-branch tip the gate
+    reran), are quarantined as flaky, or that the gate proved new against the base at the same config,
+    never blame a change; one unknown failing id in a run does."""
+    from ttp import configwho, gatejudge
+    p = make(env)
+    _config_clear_run_env(monkeypatch)
+    change, put = _breakage_setup(p, "checks.timeout_s", 99, configwho.by("coordinator", via="config_set"))
+    known, flaky = "tests/test_a.py::test_old", "tests/test_a.py::test_flaky"
+    gatejudge.save_base(p.state, gatejudge.host(), "abc123", {known: True, "tests/test_a.py::test_fine": False}, change)
+    gatejudge.quarantine(p.state, [flaky], {"why": "test"}, change)
+    put((60, False, "", "3", {"fails": [known]}), (90, False, "", "4", {"fails": [known, flaky]}),
+        (120, False, "", "5", {"fails": [flaky]}))
+    assert configwho.watch(p, now=change + 300) == [], "every failure known without the change"
+    put((60, False, "", "3", {"proven": True}), (90, False, "", "4", {"proven": True}), (120, False, "", "5", {"proven": True}))
+    assert configwho.watch(p, now=change + 300) == [], "proven new against the base at the same config: the code"
+    gatejudge.save_base(p.state, "spill-a", "abc123", {"tests/test_a.py::test_spill": True}, change)
+    put((60, False, "", "3", {"fails": ["tests/test_a.py::test_spill"]}), (90, False, "", "4", {"fails": [known]}),
+        (120, False, "", "5", {"fails": [known]}))
+    assert configwho.watch(p, now=change + 300) == [], "another host's base never counts, so 1 run is too few"
+    put((60, False, "", "3", {"fails": [known, "tests/test_a.py::test_fine"]}), (90, False, "", "4", {"fails": [known]}),
+        (120, False, "", "5", {}), (150, False, "", "5", {"fails": ["tests/test_a.py::test_new"]}))
+    assert configwho.watch(p, now=change + 300) == [f"config_breakage:checks.timeout_s:{change}"]
+    assert "3 check runs of 2 tasks" in _config_events(p, "config_breakage")[0]["text"]
+
+
+def test_config_breakage_of_a_user_set_value_names_the_user_and_gives_no_undo(env, monkeypatch):
+    """A value the user set: the event still reports the numbers, says the user set it and to look for
+    the other cause, and carries no undo command for it or for user changes in its 'also changed' list."""
+    from ttp import configwho
+    p = make(env)
+    _config_clear_run_env(monkeypatch)
+    p.set_config("checks.retries", 2, by=configwho.by("user", msgs=[12], via="chat"))
+    change, put = _breakage_setup(p, "checks.timeout_s", 99, configwho.by("user", msgs=[14], via="chat"))
+    put((60, False, "", "3", {}), (90, False, "", "4", {}), (120, False, "", "5", {}))
+    assert configwho.watch(p, now=change + 300) == [f"config_breakage:checks.timeout_s:{change}"]
+    text = _config_events(p, "config_breakage")[0]["text"]
+    assert "3 check runs of 3 tasks failed on this host" in text and "user (message #14)" in text
+    assert "The user set this value" in text and "Undo it" not in text and "undo:" not in text, text
+
+
+def test_check_runs_keep_failing_ids_proof_and_wrapper_for_the_breakage_watch(env):
+    from ttp import checkwall, configwho
+    p = make(env)
+    checkwall.record_run(p.state, 12.0, False, host="spill-a", task="9", fails=["t::a"], proven=True, wrap="d1")
+    checkwall.record_run(p.state, 12.0, True, fails=["t::b"], proven=True, wrap="d2")
+    a, b = configwho._rows(p.state / configwho.RUNS)
+    assert (a["fails"], a["proven"], a["wrap"]) == (["t::a"], True, "d1")
+    assert not {"fails", "proven", "wrap"} & set(b), "a pass keeps none; a local run no wrapper"
+
+
 def test_check_runs_record_their_spill_host_and_task(env):
     from ttp import checkwall
     p = make(env)

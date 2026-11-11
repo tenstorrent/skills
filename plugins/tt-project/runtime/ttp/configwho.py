@@ -241,6 +241,7 @@ def _row(p, key: str, setter: dict | None, before, after, now: float, **extra) -
         row["old"] = shown(key, old)
     if new is not _ABSENT:
         row["new"] = shown(key, new)
+    row["nh"] = digest(new)
     row["undo"] = undo_cmd(p.name, key, old)
     return row
 
@@ -280,14 +281,14 @@ def history(p, key: str | None = None, since: float = 0.0) -> list[dict]:
     return out
 
 
-def line(r: dict, where=None) -> str:
-    """One log line in words: 'KEY: OLD -> NEW by SETTER (undo: ...)'."""
+def line(r: dict, where=None, undo: bool = True) -> str:
+    """One log line in words: 'KEY: OLD -> NEW by SETTER (undo: ...)'; without `undo`, no undo command."""
     old = json.dumps(r["old"]) if "old" in r else "(not set)"
     new = json.dumps(r["new"]) if "new" in r else "(removed)"
     head = f"{r.get('key')}: {old} -> {new} by {describe(r, where)}"
     if r.get("refused"):
         return f"{head}: REFUSED ({r['refused']})"
-    return f"{head}; undo: {r.get('undo')}"
+    return f"{head}; undo: {r.get('undo')}" if undo else head
 
 
 def _event(p, kind: str, fp: str, text: str, every_s: float | None = None) -> bool:
@@ -377,23 +378,41 @@ def _rows(path) -> list[dict]:
     for text in lines:
         try:
             r = json.loads(text)
-            out.append({"ts": float(r["ts"]), "passed": bool(r["passed"]), "host": str(r.get("host") or ""),
-                        "task": str(r.get("task") or "")})
+            row = {"ts": float(r["ts"]), "passed": bool(r["passed"]), "host": str(r.get("host") or ""),
+                   "task": str(r.get("task") or "")}
+            if isinstance(r.get("fails"), list):
+                row["fails"] = [str(i) for i in r["fails"]]
+            if r.get("proven"):
+                row["proven"] = True
+            if isinstance(r.get("wrap"), str):
+                row["wrap"] = r["wrap"]
+            out.append(row)
         except (ValueError, KeyError, TypeError, AttributeError):
             continue
     return out
 
 
-def note_run(state, ts: float, passed: bool, host: str = "", task: str = "") -> None:
+def _run_line(r: dict) -> str:
+    return json.dumps({"ts": r["ts"], "passed": bool(r["passed"]), **({"host": r["host"]} if r.get("host") else {}),
+                       **({"task": str(r["task"])} if r.get("task") else {}),
+                       **{k: r[k] for k in ("fails", "proven", "wrap") if r.get(k) is not None and r.get(k) is not False}}) + "\n"
+
+
+def note_run(state, ts: float, passed: bool, host: str = "", task: str = "", fails: list | None = None,
+             proven: bool = False, wrap: str | None = None) -> None:
     """Keep one completed check run (checkwall.record_run) in the watch's own record, RUNS: RUNS_LOG keeps
     only its last RECENT rows across all hosts once it grows, which with many spill hosts can drop a
     host's last pass before a change. Past RUNS_MAX_BYTES this record keeps the runs of the last WATCH_S
-    (every run after a watched change) and each host's last pass. Raises OSError."""
+    (every run after a watched change) and each host's last pass. A failed run also keeps `fails` (its
+    failing test ids, when the list was complete), `proven` (the tests gate proved a failure new on the head
+    against the base on the same host, at the same config) and, on a spill host, `wrap` (the digest of the
+    checks.spill_wrap_cmd value it ran behind; '' for none): what watch() reads to blame a change. Raises OSError."""
     from pathlib import Path
     from .project import durable_append, durable_write
     path = Path(state) / RUNS
-    durable_append(path, json.dumps({"ts": ts, "passed": bool(passed), **({"host": host} if host else {}),
-                                     **({"task": str(task)} if task else {})}) + "\n")
+    durable_append(path, _run_line({"ts": ts, "passed": passed, "host": host, "task": task,
+                                    "fails": list(fails) if fails and not passed else None,
+                                    "proven": bool(proven) and not passed, "wrap": wrap if host else None}))
     if path.stat().st_size <= RUNS_MAX_BYTES:
         return
     rows = _rows(path)
@@ -402,16 +421,14 @@ def note_run(state, ts: float, passed: bool, host: str = "", task: str = "") -> 
         if r["passed"] and r["ts"] >= last.get(r["host"], float("-inf")):
             last[r["host"]] = r["ts"]
     keep = [r for r in rows if r["ts"] >= ts - WATCH_S or (r["passed"] and last.get(r["host"]) == r["ts"])]
-    durable_write(path, "".join(json.dumps({"ts": r["ts"], "passed": r["passed"],
-                                            **({"host": r["host"]} if r["host"] else {}),
-                                            **({"task": r["task"]} if r["task"] else {})}) + "\n" for r in keep))
+    durable_write(path, "".join(_run_line(r) for r in keep))
 
 
 def _runs(p) -> list[dict]:
     """The check runs the watch reads: its own record (note_run) with RUNS_LOG's rows (from before it)."""
     from .checkwall import RUNS_LOG
     seen, out = set(), []
-    for r in _rows(p.state / RUNS) + _rows(p.state / RUNS_LOG):
+    for r in _rows(p.state / RUNS) + _rows(p.state / RUNS_LOG):   # its own record first: the fuller row
         k = (r["ts"], r["passed"], r["host"], r["task"])
         if k not in seen:
             seen.add(k)
@@ -419,11 +436,52 @@ def _runs(p) -> list[dict]:
     return sorted(out, key=lambda r: r["ts"])
 
 
+SPILL_KEYS = ("checks.spill_", "delivery.checks_spill_")   # shape only the runs that spill to another host
+
+
+def _used(c: dict, r: dict) -> bool:
+    """Whether check run `r` could have used change `c`'s new value. A spill setting (SPILL_KEYS) shapes
+    only a run on a spill host; checks.spill_wrap_cmd only one that ran behind the new value there (its
+    recorded `wrap` digest, 'own' when every check had its own wrapper; a row without one, from before it
+    was kept, may have). Any other key, a whole section's change included: yes."""
+    from .push import SPILL_WRAP_KEY
+    key = str(c.get("key") or "")
+    if not key.startswith(SPILL_KEYS):
+        return True
+    if not r["host"]:
+        return False
+    if key == SPILL_WRAP_KEY and "wrap" in r:
+        return r["wrap"] == str(c.get("nh") or digest(c["new"] if "new" in c else _ABSENT))
+    return True
+
+
+def _known_failures(p, r: dict, now: float) -> bool:
+    """Whether failed run `r` failed only with tests known to fail apart from any config change: each of
+    its failing ids quarantined as flaky (gatejudge.active) or saved as failing on a base on the same host
+    (gatejudge BASE_FILE: the base or push-branch tip the tests gate reran), or the gate proved one new
+    against the base on that host at the same config (`proven`: the change's code, not the config)."""
+    if r.get("proven"):
+        return True
+    ids = r.get("fails") or []
+    if not ids:
+        return False
+    from . import gatejudge
+    flaky = gatejudge.active(p.state, now)
+    where = r["host"] or gatejudge.host()
+    bases = {k.split("|", 2)[-1] for k, e in gatejudge._load(p.state / gatejudge.BASE_FILE).items()
+             if isinstance(e, dict) and e.get("failed") and e.get("host") == where
+             and now - float(e.get("ts") or 0) < gatejudge.BASE_KEEP_S}
+    return all(i in flaky or i in bases for i in ids)
+
+
 def watch(p, now: float | None = None) -> list[str]:
     """Model-free, each daemon tick: a config change in the last WATCH_S after which FAIL_RUNS check runs
     of at least FAIL_TASKS tasks failed on hosts that passed in the HEALTHY_S before it, and none of
     those hosts passed since, raises one coordinator event (per change) naming the change and its undo;
-    the other changes since those hosts last passed are named with it. The fingerprints raised."""
+    the other changes since those hosts last passed are named with it. Only runs that could have used the
+    change count (_used: a spill setting never blames a run on this host), and none that failed only with
+    tests known to fail without it (_known_failures). A change the user made is named as theirs with no undo:
+    only the user changes it, so the event says to find the failures' other cause. The fingerprints raised."""
     now = time.time() if now is None else now
     changes = [r for r in history(p, since=now - WATCH_S) if not r.get("refused")]
     if not changes:
@@ -431,22 +489,27 @@ def watch(p, now: float | None = None) -> list[str]:
     runs = _runs(p)
     for c in sorted(changes, key=lambda r: -float(r["ts"])):
         ts = float(c["ts"])
-        after = [r for r in runs if ts < r["ts"] <= now]
+        after = [r for r in runs if ts < r["ts"] <= now and _used(c, r)
+                 and (r["passed"] or not _known_failures(p, r, now))]
         failing = {h for h in {r["host"] for r in after}
                    if not any(r["passed"] for r in after if r["host"] == h)
                    and any(r["passed"] and ts - HEALTHY_S <= r["ts"] <= ts for r in runs if r["host"] == h)}
         fails = [r for r in after if r["host"] in failing]
-        if len(fails) < FAIL_RUNS or len({r["task"] or f"run@{r['ts']}" for r in fails}) < FAIL_TASKS:
+        tasks = {r["task"] or f"run@{r['ts']}" for r in fails}
+        if len(fails) < FAIL_RUNS or len(tasks) < FAIL_TASKS:
             continue
         fp = f"config_breakage:{c['key']}:{ts}"
         if p.db.one("SELECT 1 FROM events WHERE fingerprint=?", (fp,)):
             return []
         last_pass = max((r["ts"] for r in runs if r["passed"] and r["host"] in failing and r["ts"] <= ts), default=ts)
-        also = [line(r, p) for r in changes if last_pass < float(r["ts"]) < ts]
+        also = [line(r, p, undo=role(r) != "user") for r in changes if last_pass < float(r["ts"]) < ts]
         hosts = ", ".join(sorted(h or "this host" for h in failing))
+        users = role(c) == "user"
         text = (f"Config change broke the checks: {len(fails)} check runs of "
-                f"{len({r['task'] for r in fails})} tasks failed on {hosts} since {line(c, p)}, and none passed "
-                "there since. Undo it unless the failures have another cause."
+                f"{len(tasks)} tasks failed on {hosts} "
+                f"since {line(c, p, undo=not users)}, and none passed there since. "
+                + ("The user set this value: keep it (only the user changes it) and find the failures' other cause."
+                   if users else "Undo it unless the failures have another cause.")
                 + (" Also changed since those hosts last passed: " + "; ".join(also) if also else ""))
         _event(p, "config_breakage", fp, text)
         return [fp]
