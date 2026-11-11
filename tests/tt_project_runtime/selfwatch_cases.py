@@ -143,14 +143,26 @@ def test_the_daemon_stops_its_own_runaway_marks_the_task_and_notifies_once(env, 
     procs = {pid: (pp, pg, t, mine if e and e.get("TTP_TASK_ID") else e) for pid, (pp, pg, t, e) in procs.items()}
     _sw_proc(root, 0, procs)
     sent = []
-    monkeypatch.setattr(os, "killpg", lambda t, sig: sent.append(("group", t, sig)))
     monkeypatch.setattr(os, "kill", lambda t, sig: sent.append(("pid", t, sig)))
+    import fcntl
+    import json as _json
+    from ttp import selfaudit
+    lockf = p.state / "locks" / "dev.0.lock"
+    lockf.parent.mkdir(parents=True, exist_ok=True)
+    lockf.write_text(_json.dumps({"run_id": "7", "task_id": "42", "project_root": str(p.base)}))
+    held = open(lockf)
+    fcntl.flock(held, fcntl.LOCK_EX)   # the run's lock, let go once its processes are signalled
+    monkeypatch.setattr(os, "killpg", lambda t, sig: (sent.append(("group", t, sig)), held.close()))
     d = Daemon(p.base)
     d._selfwatch = selfwatch.Watch(p.base, proc=root, daemon_pid=100, cores=64)
+    tag = f"# tt-project:{p.base}"
+    d._selfaudit = selfaudit.Audit(p.base, "tt-project-x", crontab=lambda: [f"@reboot start {tag}"],
+                                   units=lambda: [], ssh=lambda alias: None)
     d.check_self_watch()
     assert {t for _k, t, _s in sent} == {500, 951}, sent
     ev = p.db.q("SELECT * FROM events WHERE kind='selfwatch_runaway'")
     assert len(ev) == 1 and ev[0]["task"] == 42 and "22 processes (limit 10)" in ev[0]["text"], ev
+    assert "1 of its 1 lock(s) released." in ev[0]["text"], ev
     out = [m["text"] for m in p.db.q("SELECT text FROM messages WHERE text LIKE 'Self-watch stopped%'")]
     assert len(out) == 1, out
     d._selfwatch_at = 0.0
@@ -159,6 +171,7 @@ def test_the_daemon_stops_its_own_runaway_marks_the_task_and_notifies_once(env, 
     snap = p.db.kv(selfwatch.KV)
     assert snap["stopped"]["run"] == "7" and "runaway" not in snap
     assert "stopped runaway run 7 (task #42)" in state_payload(p, p.db)["selfwatch"]
+    assert "installed: 1 crontab entry, units none" in state_payload(p, p.db)["selfwatch"]
 
 
 def test_selfwatch_never_puts_a_storm_it_does_not_see_its_run_make_on_that_run(tmp_path):
@@ -233,3 +246,99 @@ def test_selfwatch_never_stops_a_run_with_long_lived_new_processes_beside_unseen
         assert snap["host"]["forks_s"] == 3000.0 and snap["top"]["spawn_s"] == 2.5, snap["top"]
         assert not snap["breach"] and snap["runaway"] == [] and snap["churn"] == "unattributed", snap
     assert "unattributed churn: 2997.5 new processes/s" in selfwatch.line(snap, 90.0)
+
+
+def _sa_probe(procs, cores=8, load="3.5", mem_kb=16 * 2**20, disk_kb=100 * 2**20):
+    return (f"{cores}\n{load} 2.0 1.0 3/400 999\nprocesses {procs}\nMemAvailable: {mem_kb} kB\n"
+            f"/dev/sda1 {disk_kb * 2} {disk_kb} {disk_kb} 50% /home\n")
+
+
+def test_selfaudit_probes_held_machines_never_a_paused_one_and_skips_an_unreachable_one():
+    from ttp import selfaudit
+    asked, counter = [], {"a": 1000}
+    def ssh(alias):
+        asked.append(alias)
+        if alias == "c":
+            return None
+        counter["a"] += 500
+        return _sa_probe(counter["a"])
+    a = selfaudit.Audit("/x/tt-project", "tt-project-x", crontab=lambda: [], units=lambda: [], ssh=ssh)
+    a.probe(0.0, ["a", "b", "c"], held=lambda alias: alias == "b")
+    a.wait()
+    got = a.probe(10.0, ["a", "b", "c"], held=lambda alias: alias == "b")   # not due: last results
+    assert asked == ["a", "c"], "a paused or held machine is never probed"
+    assert got["b"] == {"skipped": "paused or held"} and got["c"] == {"skipped": "unreachable"}
+    assert got["a"]["cores"] == 8 and got["a"]["load1"] == 3.5 and got["a"]["mem_avail_gb"] == 16.0
+    assert got["a"]["disk_free_gb"] == 100.0 and got["a"]["forks_s"] is None, "one probe gives no rate yet"
+    a.probe(selfaudit.PROBE_EVERY_S, ["a"], held=lambda alias: False)
+    a.wait()
+    got = a.probe(selfaudit.PROBE_EVERY_S + 1, ["a"], held=lambda alias: False)
+    assert set(got) == {"a"}, "a machine no running task names any more leaves the line"
+    assert got["a"]["forks_s"] and got["a"]["forks_s"] > 0, got
+    line = selfaudit.line({"machines": {**got, "c": {"skipped": "unreachable"}}})
+    assert line.startswith("held machines: a load 3.5 on 8 cores,") and "c unreachable" in line, line
+    assert selfaudit.parse_probe("garbage") is None and selfaudit.line({}) == ""
+
+
+def test_selfaudit_lists_its_own_installed_entries_and_flags_a_new_one_with_the_run_it_appeared_during():
+    from ttp import selfaudit
+    tag = "# tt-project:/x/tt-project"
+    cron = [f"@reboot start {tag}", f"@reboot other # tt-project:/x/tt-project-two", "0 * * * * user-own"]
+    units = ["tt-project-x.service", "tt-project-x-watchdog.timer", "tt-project-x-two.service"]
+    a = selfaudit.Audit("/x/tt-project", "tt-project-x", crontab=lambda: list(cron), units=lambda: list(units),
+                        ssh=lambda alias: None)
+    got = a.entries(0.0, {"7"})
+    assert got == {"crontab": 1, "units": ["tt-project-x-watchdog.timer", "tt-project-x.service"], "new": []}, \
+        "the first read is the baseline; another project's tag or unit is not ours"
+    cron.append("* * * * * runaway-loop")
+    units.append("stray.timer")
+    assert a.entries(30.0, {"7"})["new"] == [], "read at most every ENTRIES_EVERY_S"
+    got = a.entries(selfaudit.ENTRIES_EVERY_S, {"7", "12"})
+    assert [(n["kind"], n["entry"], n["runs"]) for n in got["new"]] == [
+        ("crontab", "* * * * * runaway-loop", ["7", "12"]), ("unit", "stray.timer", ["7", "12"])], got
+    a.entries(2 * selfaudit.ENTRIES_EVERY_S, set())   # run 12 was still running at the last read: nothing new
+    cron.append("5 * * * * the-users-own")
+    got = a.entries(3 * selfaudit.ENTRIES_EVERY_S, set())
+    assert len(got["new"]) == 2, "an entry that appears while no run of ours runs is not flagged"
+    line = selfaudit.line({"installed": got})
+    assert "installed: 1 crontab entry, units tt-project-x-watchdog.timer, tt-project-x.service" in line, line
+    assert "new crontab entry during run(s) 7, 12: * * * * * runaway-loop" in line, line
+
+
+def test_selfaudit_default_readers_never_read_the_real_crontab_units_or_hosts_under_the_suite(env):
+    from ttp import selfaudit
+    assert os.environ.get("TTP_TEST_NO_SELFAUDIT_READ") == "1"
+    assert selfaudit.read_crontab() is None and selfaudit.read_units() is None and selfaudit.ssh_probe("a") is None
+
+
+def test_selfaudit_holdings_count_only_this_projects_held_locks_its_keeper_holds_and_live_jobs(env, monkeypatch, tmp_path):
+    import fcntl
+    import json as _json
+    from ttp import locks, selfaudit
+    p = make(env)
+    d = tmp_path / "locks"
+    d.mkdir()
+    fds = []
+    def slot(name, label, held):
+        f = d / name
+        f.write_text(_json.dumps(label))
+        if held:
+            fh = open(f)
+            fcntl.flock(fh, fcntl.LOCK_EX)
+            fds.append(fh)
+    slot("dev.0.lock", {"run_id": "7", "task_id": "42", "project_root": str(p.base)}, True)
+    slot("dev.1.lock", {"run_id": "8", "project_root": str(p.base)}, False)
+    slot("box.0.lock", {"run_id": "7", "project_root": str(tmp_path / "other" / "tt-project")}, True)
+    rd = tmp_path / "run7"
+    rd.mkdir()
+    (rd / "detached.json").write_text(_json.dumps([{"rc": str(rd / "a.rc")}, {"rc": str(rd / "done.rc")}]))
+    monkeypatch.setattr(locks, "job_ended", lambda rc: "done" in str(rc))
+    try:
+        assert [x["lock"] for x in selfaudit.run_locks([d], p.base, "7")] == ["dev"]
+        got = selfaudit.holdings([d], p.base, tmp_path / "holds", [rd])
+        assert got == {"locks": ["dev"], "holds": 0, "jobs": 1}, got
+        assert "holding 1 lock(s) (dev), 0 keeper hold(s), 1 detached job(s)" in selfaudit.line({"holding": got})
+    finally:
+        for fh in fds:
+            fh.close()
+    assert selfaudit.run_locks([d], p.base, "7") == [], "a lock its holder let go is not held"

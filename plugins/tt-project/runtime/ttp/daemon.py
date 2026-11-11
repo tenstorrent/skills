@@ -9880,7 +9880,7 @@ class Daemon:
         (spawn rate, processes or load share past selfwatch.* for its window) is stopped: its own
         process groups TERM then KILL, one event on its task and one notify. Never signals a process
         this project does not own."""
-        from . import selfwatch
+        from . import selfaudit, selfwatch
         now, s = time.time(), selfwatch.settings(self.cfg)
         due = selfwatch.BREACH_EVERY_S if getattr(self, "_selfwatch_breach", False) else s["every_s"]
         if not s["every_s"] or now - getattr(self, "_selfwatch_at", 0.0) < due:
@@ -9890,6 +9890,11 @@ class Daemon:
         snap = w.step(s, now)
         self._selfwatch_breach = bool(snap["breach"])
         db = self.p.db
+        dirs = self._slot_dirs()
+        try:
+            snap.update(self._self_audit(now, dirs))
+        except Exception:
+            log(self.p, "self-watch audit: " + traceback.format_exc().replace("\n", " | ")[:1000])
         snap["stopped"] = (db.kv(selfwatch.KV) or {}).get("stopped")
         if snap.pop("churn_new", False):
             log(self.p, f"self-watch: unattributed churn, {snap['churn_s']:g} new processes/s on the host that this "
@@ -9909,10 +9914,17 @@ class Daemon:
                     runner.request_stop(self._run_dir(run), f"selfwatch: {r['why']}")
                 except OSError:
                     pass
+            held = selfaudit.run_locks(dirs, self.p.base, r["run"])
             done = selfwatch.stop(w, r, s["grace_s"])
+            try:   # the reaper clears and logs the labels the stopped processes left
+                self.reap_locks()
+            except Exception:
+                log(self.p, "self-watch lock release: " + traceback.format_exc().replace("\n", " | ")[:1000])
+            left = selfaudit.run_locks(dirs, self.p.base, r["run"])
             text = (f"Self-watch stopped {what}: {r['why']} for {s['window_s']:g} s ({numbers}). TERM to process "
                     f"group(s) {done['groups'] or '-'} and pid(s) {done['pids'] or '-'}, KILL to {done['killed'] or '-'}; "
-                    f"their locks are released with them.")
+                    f"{len(held) - len(left)} of its {len(held)} lock(s) released"
+                    + (f", still held: {', '.join(x['lock'] for x in left)}." if left else "."))
             log(self.p, text)
             task = int(r["task"]) if str(r["task"] or "").isdigit() else None
             db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
@@ -9920,6 +9932,28 @@ class Daemon:
             self.alert(f"selfwatch:runaway:{r['run']}", text, severity="normal", every_s=0)
             snap["stopped"] = {"ts": now, "run": r["run"], "task": r["task"], "why": r["why"]}
         db.set_kv(selfwatch.KV, snap)
+
+    def _slot_dirs(self) -> list:
+        """The slot-lock folders the project's runs take locks in: its own, its shared resources' and the
+        check slots (reap_locks sweeps the same)."""
+        from . import checkcap
+        return [self.p.state / "locks", *(shared.root() / r for r in sorted(shared.names(self.cfg))),
+                checkcap.slot_dir()]
+
+    def _self_audit(self, now: float, dirs: list) -> dict:
+        """selfaudit's part of the self-watch snapshot: held machines probed (never one paused or held),
+        the crontab entries and user units installed (new ones during a run flagged with its id) and what
+        the project holds."""
+        from . import lockprobe, machines, selfaudit
+        a = self.__dict__.setdefault("_selfaudit", selfaudit.Audit(self.p.base, service.unit_name(self.p)))
+        rows = self.p.db.q("SELECT r.id, r.dir, t.labels FROM runs r LEFT JOIN tasks t ON t.id=r.task "
+                           "WHERE r.status='running'")
+        known = machines.load()
+        aliases = sorted({x for r in rows for x in coord.task_resources({"labels": r["labels"]}) if x in known})
+        held = lambda alias: lockprobe.pause_in(self.p.db, self.cfg, alias)
+        return {"machines": a.probe(now, aliases, held), "installed": a.entries(now, {str(r["id"]) for r in rows}),
+                "holding": selfaudit.holdings(dirs, self.p.base, self.p.state / "holds",
+                                              [self._run_dir(r) for r in rows])}
 
     def retire_coord_guard(self) -> None:
         """Once per daemon start: the coordinator session spend guard is gone (every wake resumes the

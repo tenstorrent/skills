@@ -31,7 +31,8 @@ act), else env TTP_SELFWATCH_<KEY>; 0 turns a limit off, act false only reports.
 well above a heavy build or test suite (make -j64 starts some hundreds of processes a second and keeps
 a few hundred alive; pytest -n 64 a few hundred) and well below a fork storm (thousands a second).
 The last snapshot goes to db kv KV; line() is its one line in ttp status, the web app and the
-coordinator's Host section. Linux only: without /proc nothing is sampled."""
+coordinator's Host section, with selfaudit's held machines, installed entries and holdings. Linux only:
+without /proc nothing is sampled."""
 from __future__ import annotations
 
 import os
@@ -296,6 +297,9 @@ def line(snap: dict | None, now: float | None = None) -> str:
     if snap.get("churn") == "unattributed":
         out += (f"; unattributed churn: {gb(snap.get('churn_s'))} new processes/s on the host that this project's "
                 "own counted processes do not explain (reported, not acted on)")
+    from .selfaudit import line as audit_line
+    if extra := audit_line(snap):   # held machines, installed entries, holdings (selfaudit)
+        out += "; " + extra
     last = snap.get("stopped") or {}
     if last and now - float(last.get("ts", 0)) < 3600:
         out += f"; stopped runaway run {last['run']} (task #{last.get('task')}): {last['why']}"

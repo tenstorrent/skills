@@ -2618,7 +2618,12 @@ the pick order, so it takes the first starts. A resumed resource ramps only its 
   `selfwatch.act: false` only reports. Host churn at or above the spawn limit that the runs' own counted rates do not
   explain is reported once per episode as unattributed churn, never acted on. Known gap: a run's storm of processes
   that each live shorter than the gap between two pid listings (about 50 ms) may be under-counted and then shows
-  only as unattributed churn. Its one line is in `ttp status`, the web app and the coordinator's Host section. A
+  only as unattributed churn. The reaper sweeps right after a stop, and the stop text says how many of the run's
+  locks were released. The same line also shows (selfaudit.py) a read-only ssh probe about every 2 min of each
+  machine a running task names (load, processes/s, memory, disk; never one paused or held; unreachable ones
+  skipped), the crontab entries and systemd user units the project installed, with any new entry that appeared
+  while one of its runs ran flagged with the run ids, and the locks, keeper holds and detached jobs it holds.
+  Its one line is in `ttp status`, the web app and the coordinator's Host section. A
   `ttp checks` or push inside a check command does not wait for its parent's slot. Checks that
   gate a push to the push branch (the push queue's batches and `ttp push`) hold the push lock, so
   they never queue behind task checks: each push branch has one priority slot of its own, shared

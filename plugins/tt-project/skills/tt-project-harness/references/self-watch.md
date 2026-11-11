@@ -33,6 +33,23 @@ storm of processes that each live shorter than the gap between two pid listings 
 under-counted, and then shows only as unattributed churn; a storm whose processes live 2 s, or that is still
 running at a sample, is counted and stopped at the default limits.
 
+The same line shows what the project holds and installed past its own host (runtime `selfaudit.py`):
+
+- Held machines: each machine alias (`ttp machines`) a running task names in its resources gets a read-only
+  probe over its own ssh route about every 2 min (BatchMode, a 5 s connect timeout, 8 s at most, from a
+  thread of its own): load against its cores, processes created per second (the /proc/stat `processes`
+  delta between two probes), available memory and free disk. A machine under a pause or hold (the user's,
+  a shared pause or a fleet hold) is never probed; one that does not answer shows as unreachable.
+- Installed entries: about every minute `crontab -l` and the systemd user unit files are read. The line
+  lists the project's own (crontab lines with its `# tt-project:<folder>` tag, its daemon and watchdog
+  units); an entry that appears between two reads while one of its runs ran is flagged with those run ids.
+  The first read is the baseline.
+- Holdings: the slot locks labelled with this project's runs, the keeper holds kept for detached jobs and
+  the live detached jobs of its running runs. A stopped runaway's locks are released at once (a lock-reaper
+  sweep right after the stop), and the stop text says how many of its locks were released and names any
+  still held.
+
 The snapshot is db kv `selfwatch`; its one line shows in `ttp status`, the web app and the coordinator digest's
 Host section. Tests feed a fake /proc tree and a fake signal function; the suite's `env` fixture sets
-`TTP_SELFWATCH_EVERY_S=0` so test daemons never scan the real host.
+`TTP_SELFWATCH_EVERY_S=0` so test daemons never scan the real host, and `TTP_TEST_NO_SELFAUDIT_READ=1`
+so nothing reads the real crontab, systemd units or held hosts (tests inject their own readers).
