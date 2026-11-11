@@ -507,14 +507,17 @@ def delivery_of(where) -> dict | None:
 
 def obligation_estimate(db, o: dict, now: float | None = None, est: _Est | None = None,
                         core: str | None = None, delivery: dict | None = None) -> dict:
-    """The expected finish of an obligation or promise: the latest landing of its owner tasks
-    (`core`: the project's core provider, for owner tasks with none, and `delivery` its delivery
-    config, when no `est` is given)."""
-    from .obligations import _owner_ids
+    """The expected finish of an obligation or promise: the latest landing of its live owner tasks
+    (obligations.live_owner_ids; `core`: the project's core provider, for owner tasks with none, and
+    `delivery` its delivery config, when no `est` is given)."""
+    from .obligations import _owner_ids, live_owner_ids
     est = est or _Est(db, time.time() if now is None else now, core=core, delivery=delivery)
-    ids = _owner_ids(o)
-    if not ids:
+    if not _owner_ids(o):
         return {"done": None, "end": None, "path": [], "legs": [], "why": "no owner task", "overrun": False}
+    ids = live_owner_ids(db, o)   # a cancelled or replaced owner never hides a live one's estimate
+    if not ids:
+        return {"done": None, "end": None, "path": [], "legs": [], "overrun": False,
+                "why": "no live owner task (all cancelled or replaced)"}
     worst = None
     for tid in ids:
         e = est.task(tid)
@@ -566,8 +569,8 @@ def _threshold(cfg: dict | None) -> float:
 
 def _urgent_owner(db, o: dict) -> bool:
     from . import urgent
-    from .obligations import _owner_ids
-    return any(urgent.is_urgent(db.task(t)) for t in _owner_ids(o))
+    from .obligations import live_owner_ids
+    return any(urgent.is_urgent(db.task(t)) for t in live_owner_ids(db, o))
 
 
 def long_promises(db, cfg: dict | None, now: float | None = None) -> list[dict]:

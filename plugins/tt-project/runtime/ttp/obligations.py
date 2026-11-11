@@ -1673,6 +1673,32 @@ def unmet_handoff(db, ids, only=None) -> str | None:
                  and (only is None or t in only)), None)
 
 
+def live_owner_ids(db, o: dict) -> list[int]:
+    """The owners of `o` that can still deliver it, for judging its progress (ETA, urgency); the stored
+    owner list (_owner_ids) keeps every one as its history. Left out: an owner that is gone, cancelled,
+    abandoned or superseded (`ttp task abandon`/`superseded`). A failed or cancelled owner whose work a
+    continuation carries on (_continuations, not itself failed or cancelled) stands for that continuation;
+    a failed one with none stays, so its estimate names the failure."""
+    from .landed import abandoned, superseded
+    ids = _owner_ids(o)
+    rows = {t["id"]: t for t in db.q(f"SELECT id, status FROM tasks WHERE id IN ({','.join('?' * len(ids))})",
+                                     ids)} if ids else {}
+    replaced = superseded(db, ids)
+    out: set[int] = set()
+    for tid in ids:
+        t = rows.get(tid)
+        if t is None or tid in replaced or abandoned(db, tid):
+            continue
+        if t["status"] in ("failed", "cancelled"):
+            if carry := [r["id"] for r in _continuations(db, tid) if r["status"] not in ("failed", "cancelled")]:
+                out.update(carry)
+            elif t["status"] == "failed":
+                out.add(tid)
+            continue
+        out.add(tid)
+    return sorted(out)
+
+
 def _delivered(db, o: dict) -> str | None:
     """Evidence that a coordinator reply delivered `o` (its `delivers` named it) and every owner finished,
     none leaving the acceptance unmet (unmet_handoff; a plain promise's report is its deliverable)."""

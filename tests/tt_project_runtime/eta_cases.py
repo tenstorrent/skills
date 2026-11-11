@@ -741,3 +741,61 @@ def test_eta_merge_gate_reads_after_the_pr_merges_or_closes(env):
     # Not a merge gate: a PR's CI checks, or a probe naming no state.
     for probe in ("gh pr checks 12 --repo o/r", "gh pr view 12 --json title"):
         assert eta.merge_gate(probe) is None, probe
+
+
+def test_eta_order_skips_a_cancelled_owner_for_its_live_one(env):
+    from ttp import eta
+    from ttp import obligations as ob
+    p = make(env)
+    now = time.time()
+    _eta_history(p, now)
+    a = p.db.add_task("first try", "s", kind="work")
+    b = p.db.add_task("second try", "s", kind="work")
+    oid = ob.add(p, "ship the fix", owners=[a, b], now=now)
+    p.db.update_task(a, status="cancelled")
+    live = eta.estimate(p.db, b, now)
+    assert live["why"] is None and live["end"] > now
+    # cancelled_owner_skipped: the cancelled owner no longer hides the live one's measured ETA.
+    assert eta.obligation_estimate(p.db, ob.get(p.db, oid), now)["end"] == pytest.approx(live["end"])
+    # An abandoned or superseded owner is skipped the same way.
+    c = p.db.add_task("third try", "s", kind="work")
+    d = p.db.add_task("fourth try", "s", kind="work")
+    ob.attach(p, oid, [c, d], now=now)
+    p.db.update_task(c, status="done")
+    p.db.update_task(d, status="done")
+    p.db.x("INSERT INTO task_abandoned(task, why, ts) VALUES(?,?,?)", (c, "dropped by a re-plan", now))
+    p.db.x("INSERT INTO task_superseded(task, head, sha, ts) VALUES(?,?,?,?)", (d, "h", "abc123", now))
+    assert ob.live_owner_ids(p.db, ob.get(p.db, oid)) == [b]
+    # A failed owner whose continuation carries the work on follows that continuation, an owner or not.
+    f = p.db.add_task("failed try", "s", kind="work")
+    o2 = ob.add(p, "ship the other fix", owners=[f], now=now)
+    p.db.update_task(f, status="failed")
+    assert eta.obligation_estimate(p.db, ob.get(p.db, o2), now)["why"] == f"#{f} failed"
+    g = p.db.add_task("continue: failed try", "s", kind="work", labels=[f"continues:{f}"])
+    assert ob.live_owner_ids(p.db, ob.get(p.db, o2)) == [g]
+    assert eta.obligation_estimate(p.db, ob.get(p.db, o2), now)["end"] == pytest.approx(
+        eta.estimate(p.db, g, now)["end"])
+
+
+def test_eta_order_with_all_owners_dead_says_no_live_owner(env):
+    from ttp import eta
+    from ttp import obligations as ob
+    p = make(env)
+    now = time.time()
+    _eta_history(p, now)
+    a = p.db.add_task("first try", "s", kind="work", priority=1, reply_chat="c1")
+    o = _eta_promise(p, a, "c1", "I'll post the result here.", now)
+    b = p.db.add_task("second try", "s", kind="work", priority=1)
+    ob.attach(p, o["id"], [b], now=now)
+    p.db.update_task(a, status="cancelled")
+    p.db.update_task(b, status="cancelled")
+    o = ob.get(p.db, o["id"])
+    e = eta.obligation_estimate(p.db, o, now)
+    # all_owners_dead_says_no_live_owner
+    assert e["end"] is None and e["why"] == "no live owner task (all cancelled or replaced)"
+    assert "no live owner task" in eta.field(e, p, now)
+    # Its only urgent owners are dead: no long-promise line on urgent work.
+    assert not eta._urgent_owner(p.db, o)
+    # history_kept: the stored owners and the ledger line still list the dead owners.
+    assert {a, b} <= set(ob._owner_ids(o)) and a in o["promise"]["tasks"] and str(b) in o["owners"]
+    assert any(f"#{a}" in line for line in ob.promise_lines(p.db, now))
