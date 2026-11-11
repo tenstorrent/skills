@@ -11556,7 +11556,7 @@ def cmd_config(a) -> None:
         except ValueError as e:
             die(str(e), 2)
     from . import configwho
-    setter = configwho.from_env()
+    setter, grant = configwho.from_env(), None
     if run and (k := _user_only_change(p.raw_config(), a.key, val, p)):
         # A run can be steered by text it reads; these change only in a coordinator turn that carries
         # the user's yes (coordinator.NEEDS_USER), as `ttp say` is refused inside a run, or for a dollar
@@ -11569,15 +11569,16 @@ def cmd_config(a) -> None:
                 die(f"{k}: --user-msg refused: {why}")
             _refuse_user_only_in_run(k)
         mid = int(str(a.user_msg).lstrip("#"))
-        setter = configwho.by("user", msgs=[mid], task=setter.get("task"), run=setter.get("run"), via="user-msg")
-        p.db.x("INSERT INTO events(ts,source,kind,severity,text,data,status) VALUES(?,?,?,?,?,?,?)",
-               (time.time(), "cli", "config_grant", "low", f"ttp config {k} {json.dumps(val)} on the user's word "
-                f"in message #{mid}", json.dumps({"key": k, "value": val, "messages": [mid]}), "handled"))
+        setter, grant = configwho.by("user", msgs=[mid], task=setter.get("task"), run=setter.get("run"), via="user-msg"), mid
     try:
         p.set_config(a.key, val, by=setter)
     except (RuntimeError, ValueError) as e:   # project.json unreadable with no last good copy; a section given
         # one value; a list- or object-typed key given another form (key_type_problem)
         die(str(e))
+    if grant is not None:   # logged only once the set took effect
+        p.db.x("INSERT INTO events(ts,source,kind,severity,text,data,status) VALUES(?,?,?,?,?,?,?)",
+               (time.time(), "cli", "config_grant", "low", f"ttp config {a.key} {json.dumps(val)} on the user's word "
+                f"in message #{grant}", json.dumps({"key": a.key, "value": val, "messages": [grant]}), "handled"))
     print(f"{a.key} = {json.dumps(val)}")
     if a.key in ("budget", "budget.daily_usd", "budget.weekly_usd"):
         from .project import weekly_below_daily

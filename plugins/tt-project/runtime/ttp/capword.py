@@ -11,8 +11,8 @@ relayer's context) carry the setting itself, the cap's full key and that one val
 400`, `budget.weekly_usd=$400`, as `ttp config` takes it; grants()). Prose about a cap ('raise the
 weekly cap to $400') grants nothing: no gate reads the meaning of the user's wording (user msg #2116),
 so such an order goes to the coordinator, which sets the cap in a turn that carries the user's yes. A
-later recorded set of the same key by the user or the coordinator wins: an older message never
-overwrites it. The setter is recorded as the user, with that message id. Every other user-only key
+later recorded set of the same key by the user or the coordinator, or a later message of the user's
+giving the key another value, wins: an older message never overwrites the user's newest word. The setter is recorded as the user, with that message id. Every other user-only key
 still changes only in a coordinator turn that carries the user's yes.
 """
 from __future__ import annotations
@@ -54,6 +54,17 @@ def problem(db, key: str, value, msg_id, now: float | None = None) -> str | None
                 + (" alone" if amount in values else "")
                 + "; a cap the user ordered in words is set by the coordinator in a turn that carries their yes: "
                   "name the value in your hand-off")
+    # The user's newest word wins: a later message of theirs setting this key to another value (or to
+    # several) means the older message grants nothing.
+    for later in db.q("SELECT id, text, provenance FROM messages WHERE direction='in' AND kind='user' "
+                      "AND (ts > ? OR (ts = ? AND id > ?)) AND ts <= ? AND text LIKE ? ORDER BY ts DESC, id DESC",
+                      (row["ts"], row["ts"], mid, now, f"%{key}%")):
+        if (later.get("provenance") or "") == "system":
+            continue
+        said = grants(relay.split(later.get("text") or "")[0], key)
+        if said and said != {amount}:
+            return (f"message #{later['id']} set {key} to {', '.join(f'{v:g}' for v in sorted(said))} later; "
+                    "that value stands")
     rec = configwho.get(db, key) or {}
     if rec.get("by") in ("user", "coordinator") and float(rec.get("ts") or 0) > float(row["ts"]):
         return f"the {rec['by']} set {key} again after message #{mid}; that later value stands"

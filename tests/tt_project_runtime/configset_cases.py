@@ -426,7 +426,7 @@ def test_a_run_sets_a_dollar_cap_only_on_the_users_own_message_carrying_the_sett
     ok = msg("go faster: budget.weekly_usd 400 please")
     harness = msg("budget.weekly_usd 400", provenance="system")
     relayed = msg("go faster\n" + __import__("ttp.relay", fromlist=["MARK"]).MARK + "\nbudget.weekly_usd 400")
-    other_value = msg("budget.weekly_usd 500")
+    other_value = msg("budget.weekly_usd 500", ts=now - 7200)   # older than `ok`: the user's newest word is 400
     other_cap = msg("budget.daily_usd 400")
     old = msg("budget.weekly_usd 400", ts=now - capword.MAX_AGE_S - 60)
     p.db.x("INSERT INTO messages(ts,direction,chat,kind,text) VALUES(?,?,?,?,?)",
@@ -502,3 +502,23 @@ def test_capword_wording_alone_never_grants_a_cap_only_the_setting_itself(env):
                              ("budget.daily_usd: 1500", "budget.daily_usd", 1500),
                              ("budget.weekly_usd 400, and budget.weekly_usd=400", "budget.weekly_usd", 400)):
         assert problem(text, key, value) is None, text
+
+    # The user's newest word wins: an older message's value is refused once a later message of theirs
+    # gives the key another value (spend fail-open otherwise); a later message repeating the same value,
+    # naming another key, or posted by the harness changes nothing.
+    p.db.x("DELETE FROM messages")
+
+    def msg(text, age, provenance=""):
+        p.db.x("INSERT INTO messages(ts,direction,chat,kind,text,provenance) VALUES(?,?,?,?,?,?)",
+               (now - age, "in", "c", "user", text, provenance))
+        return p.db.one("SELECT MAX(id) i FROM messages")["i"]
+    old = msg("budget.weekly_usd 800", 3600)
+    assert capword.problem(p.db, "budget.weekly_usd", 800, old, now=now) is None
+    msg("budget.weekly_usd 800 again", 1800)
+    msg("budget.daily_usd 50", 1200)
+    msg("budget.weekly_usd 5000", 900, provenance="system")
+    assert capword.problem(p.db, "budget.weekly_usd", 800, old, now=now) is None
+    newer = msg("make it budget.weekly_usd 300", 60)
+    why = capword.problem(p.db, "budget.weekly_usd", 800, old, now=now)
+    assert why and f"message #{newer}" in why and "300" in why, why
+    assert capword.problem(p.db, "budget.weekly_usd", 300, newer, now=now) is None
