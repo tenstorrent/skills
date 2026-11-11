@@ -674,6 +674,9 @@ def test_no_git_call_gets_a_timeout_of_0_s_or_less_from_a_spent_slice_or_deadlin
             assert rd.left() <= 0
             if raw:
                 assert worktree.valid_branch("ttp/t1-a-valid-branch"), "task_add's branch check with no slice left"
+                # valid_branch checks in process since d02dc50aa: raw pure git itself still runs
+                assert subprocess.run(["git", "check-ref-format", "--branch", "ttp/t1-a-valid-branch"],
+                                      capture_output=True).returncode == 0
                 with pytest.raises(gitmemo.Spent) as spent:
                     subprocess.run(["git", "-C", str(repo), "status"], capture_output=True)
             else:
