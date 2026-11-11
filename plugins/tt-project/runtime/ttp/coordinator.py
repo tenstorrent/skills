@@ -108,6 +108,7 @@ from . import (   # one name per line: two changes adding names merge without a 
     startbreaker,
     sweep,
     throughmute,
+    throughput,
     tierfloor,
     timefmt,
     tried,
@@ -1563,6 +1564,8 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
     prog_lines, prog_id = progress.digest_lines(db, now)
     section("progress", prog_lines, prog_id,
             f"## Progress: {len(prog_lines) - 1} stuck (as last turn; act on each or say why it is fine)")
+    if daily := throughput.daily_line(db, p.config(), now):
+        section("daily_tasks", [daily])
     mem = memory_budget_line(p)
     if mem:
         section("memory_budget", [mem], mem, mem.split(";")[0] + " (as last turn)")

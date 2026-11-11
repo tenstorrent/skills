@@ -1206,6 +1206,7 @@ def review(p, cfg: dict, since_s: float = DAY, do_apply: bool = False, trigger: 
         rep["changes"] = []
     rep["earlier_changes"] = earlier
     rep["trigger"] = trigger
+    rep["daily_tasks"] = daily_line(p.db, cfg, now)
     p.db.set_kv(LAST_KV, {k: rep[k] for k in ("ts", "trigger", "changes", "kept", "earlier_changes")}
                 | {"slow": [ln["lane"] for ln in rep["lanes"] if ln["slow"]]})
     return rep
@@ -1290,7 +1291,31 @@ def text(rep: dict) -> str:
                    + (" (undone)" if c.get("undone") else "") + f"; undo: {c.get('undo')}")
     if not any(ln["slow"] for ln in rep["lanes"]):
         out.append("No lane is slow.")
+    if rep.get("daily_tasks"):
+        out.append(rep["daily_tasks"])
     return "\n".join(out)
+
+
+def daily_target(cfg: dict) -> int:
+    """tasks.daily_target as a count; 0 when unset or not a number."""
+    try:
+        return max(0, int(float((cfg.get("tasks") or {}).get("daily_target") or 0)))
+    except (TypeError, ValueError):
+        return 0
+
+
+def daily_line(db: DB, cfg: dict, now: float | None = None) -> str:
+    """'Tasks created in the last 24 h: N of target T' (reviews among them), or '' while
+    tasks.daily_target is unset. Fewer, bigger tasks is the aim: a count over target says so."""
+    target = daily_target(cfg)
+    if not target:
+        return ""
+    now = time.time() if now is None else now
+    row = db.q("SELECT COUNT(*) AS n, SUM(kind='review') AS r FROM tasks WHERE created>=?", (now - DAY,))[0]
+    n, r = int(row["n"] or 0), int(row["r"] or 0)
+    return (f"Tasks created in the last 24 h: {n} of target {target} (tasks.daily_target)"
+            + (f", {r} of them reviews" if r else "")
+            + (f"; {n - target} over: batch related work into fewer tasks" if n > target else ""))
 
 
 def status_line(db: DB, now: float | None = None) -> str:

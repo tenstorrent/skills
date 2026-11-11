@@ -1723,3 +1723,24 @@ def test_throughput_checks_waits_behind_a_one_at_a_time_wrapper_lock_are_seriali
     _tp_slot_wait(p, monkeypatch, q, w1, w1 + 700)
     ck = _tp_lane(throughput.measure(p.db, p.config(), now=now, gates={}), "checks_slots")
     assert (ck["count"], ck["at_limit"], ck["serialized"]) == (1, 0, 1), ck
+
+
+def test_throughput_daily_task_count_shows_only_with_a_target_in_throughput_and_state(env):
+    """tasks.daily_target unset: no line anywhere. Set to 2 with three tasks created in the last 24 h
+    (one a review) and one older: `ttp throughput`'s text and the coordinator's STATE both say 3 of
+    target 2, the review among them and 1 over; a non-number target is unset."""
+    from ttp import coordinator as coord, throughput
+    p = make(env)
+    now = time.time()
+    for i, kind in enumerate(("code", "code", "review")):
+        _tp_task(p, f"new {i}", now - 3600 * (i + 1), kind=kind)
+    _tp_task(p, "old", now - 2 * 86400)
+    assert throughput.daily_line(p.db, p.config(), now) == ""
+    assert "Tasks created in the last 24 h" not in coord.digest(p, {}, [], [])
+    p.set_config("tasks.daily_target", 2)
+    line = throughput.daily_line(p.db, p.config(), now)
+    assert line == ("Tasks created in the last 24 h: 3 of target 2 (tasks.daily_target), 1 of them reviews; "
+                    "1 over: batch related work into fewer tasks")
+    assert line in throughput.text(throughput.review(p, p.config(), now=now))
+    assert line.split(";")[0] in coord.digest(p, {}, [], [])
+    assert throughput.daily_target({"tasks": {"daily_target": "many"}}) == 0

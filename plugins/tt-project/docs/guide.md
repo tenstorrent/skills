@@ -948,6 +948,12 @@ coordinator with that evidence.
   `retry_when` probe that is not only a time, a paused resource, a dependency that is running or
   waiting) raises nothing. It clears once an owner starts or the promise closes; one per promise or
   task, and only for those under a day old. It holds no dispatch.
+- Folded follow-ups (model-free): a done task's follow-up that names the same branch, files or task
+  lineage as an open task of its kind is appended to that task's spec (and sent to its running run as a
+  mid-run update) instead of becoming a new task; upstream notes, deferred, `continue:`, `mechanical:`
+  and post-landing follow-ups never fold. `chains.fold_followups` false turns it off. With
+  `tasks.daily_target` set (default 0, off), `ttp throughput` and the coordinator's state show tasks
+  created in the last 24 h against that target.
 - Ready, not started (model-free): a queued task with no unmet dependency, deferral, pause or
   resource hold, while a worker slot of its provider is free, that has not started 10 min after it
   became ready (2 min at priority 1) raises one `ready_not_started` event naming what holds it. Full

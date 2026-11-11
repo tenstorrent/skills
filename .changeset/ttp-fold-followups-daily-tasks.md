@@ -1,0 +1,5 @@
+---
+"tt-project": patch
+---
+
+`tt-project`: fewer, bigger tasks. A done task's follow-up that names the same branch, the same files or the same task lineage as an open task of its kind is folded into that task (appended to its spec, and sent to its running run as a mid-run update) instead of being proposed as a new task. Upstream notes, deferred, `continue:`/`mechanical:` and post-landing follow-ups, and those of reviews or approvals, never fold; one that matches nothing stays proposed, and each fold is logged and named in the hand-off. `chains.fold_followups` false turns it off. New `tasks.daily_target` (default 0, off): when set, `ttp throughput` and the coordinator's state show the tasks created in the last 24 h against it, with how many were reviews.

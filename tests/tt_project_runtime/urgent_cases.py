@@ -768,6 +768,62 @@ def test_an_urgent_follow_up_of_another_kind_stays_with_the_coordinator(env):
     assert ev["status"] == "queued" and "its kind question is not" in ev["text"], ev["text"]
 
 
+def test_a_follow_up_on_an_open_tasks_file_branch_or_lineage_folds_into_it(env):
+    """fupfold: a routine task's follow-up naming a file a queued task of its kind names is appended to that
+    task's spec, not proposed as a new task; the hand-off and followup_proposed events say 'folded into #N'
+    and are handled. A running task gets it as a mid-run update in its run's steer.md too. A branch match
+    (pr_branch:) beats a file match; a lineage match (it continues the done task) folds with nothing else."""
+    import json
+    p = make(env)
+    other = p.db.add_task("other docs", "Touch plugins/x/runtime/ttp/b.py.", kind="harness", origin="coordinator")
+    target = p.db.add_task("guide work", "Edit plugins/x/docs/guide.md.", kind="harness", origin="coordinator")
+    tid = _urgent_done(env, p, "Tidy the guide", [
+        {"title": "next step: fix the guide's table", "spec": "The table in docs/guide.md is stale."}])
+    assert not p.db.q("SELECT id FROM tasks WHERE parent=?", (tid,))
+    spec = p.db.task(target)["spec"]
+    assert f"Folded follow-up from #{tid} (same file docs/guide.md): next step: fix the guide's table" in spec
+    assert "The table in docs/guide.md is stale." in spec and "Folded" not in p.db.task(other)["spec"]
+    (ev,) = _proposed(p, tid)
+    assert ev["status"] == "handled" and f"(folded into #{target}: same file docs/guide.md)" in ev["text"], ev["text"]
+    (done,) = p.db.q("SELECT text, status FROM events WHERE kind='task_done' AND task=?", (tid,))
+    assert f"Follow-up folded into #{target} (same file docs/guide.md)" in done["text"] and done["status"] == "handled"
+    # Running, on the follow-up's branch: the stored spec and the run's steer.md both get it.
+    run_dir = env["tmp"] / "run-live"
+    run_dir.mkdir()
+    live = p.db.add_task("live work", "Work.", kind="harness", origin="coordinator",
+                         labels=["pr_branch:ttp/t1-live"])
+    p.db.update_task(live, status="running")
+    p.db.x("INSERT INTO runs(task, role, started, status, dir) VALUES(?,?,?,?,?)",
+           (live, "worker", time.time(), "running", str(run_dir)))
+    tid2 = _urgent_done(env, p, "Branch work", [
+        {"title": "next step: one more test", "spec": "pr_branch: ttp/t1-live\nAdd it beside docs/guide.md."}])
+    assert "Folded follow-up from #%d (same branch ttp/t1-live)" % tid2 in p.db.task(live)["spec"]
+    assert "same branch ttp/t1-live" in (run_dir / "steer.md").read_text()
+    # Lineage: a queued task continuing the done one takes its follow-up.
+    root = p.db.add_task("root", "Root.", kind="harness", origin="coordinator")
+    hop = p.db.add_task("root, part 2", "More.", kind="harness", origin="coordinator", labels=[f"continues:{root}"])
+    p.db.update_task(root, status="running")
+    _urgent_hand_off(env, p, root, "root", [{"title": "next step: tidy up", "spec": "Tidy."}])
+    assert f"Folded follow-up from #{root} (same lineage (#{root}))" in p.db.task(hop)["spec"], p.db.task(hop)["spec"]
+    assert json.loads(p.db.task(hop)["labels"]) == [f"continues:{root}"]
+
+
+def test_a_follow_up_that_matches_no_open_task_or_may_not_fold_stays_proposed(env):
+    """Never dropped: a `continue:` follow-up, a deferred one, one of another kind and any with
+    chains.fold_followups off stay proposed (queued) and the open task's spec is unchanged."""
+    p = make(env)
+    target = p.db.add_task("guide work", "Edit plugins/x/docs/guide.md.", kind="harness", origin="coordinator")
+    tid = _urgent_done(env, p, "Tidy the guide", [
+        {"title": "continue: tidy the guide, part 2", "spec": "docs/guide.md again."},
+        {"title": "next step: later", "spec": "docs/guide.md later.", "start_after": "1d"},
+        {"title": "next step: ask", "spec": "docs/guide.md?", "kind": "question"}])
+    assert all(e["status"] == "queued" and "folded" not in e["text"] for e in _proposed(p, tid))
+    p.set_config("chains.fold_followups", False)
+    tid = _urgent_done(env, p, "Tidy more", [{"title": "next step: fix it", "spec": "docs/guide.md."}])
+    assert [e["status"] for e in _proposed(p, tid)] == ["queued"]
+    assert p.db.task(target)["spec"] == "Edit plugins/x/docs/guide.md."
+
+
 def test_an_urgent_gate_made_only_of_landed_checks_is_a_dependency_and_stays(env):
     """A start_when made only of `landed:#<id>` and `ttp landed --task <id>` terms joined by && waits on
     other tasks' landed work: an urgent task keeps it whatever its why says, at task_add, task_update and

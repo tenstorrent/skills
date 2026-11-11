@@ -436,6 +436,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # runs spent money with no hand-off and no commit, is not started again (0 turns one off): it is
     # blocked and the coordinator gets one run_cap event summing up its runs (runcap).
     "chains": {"max_hops": 8, "max_stalls": 2, "max_usd": 40.0, "auto": True, "urgent_followups": True,
+               "fold_followups": True,
                "requeue": True, "split_lines": 200, "max_task_runs": 4, "max_idle_runs": 2},
     # Each Jev use (e.g. "screen") is switched off once its net saving over window_days is not
     # positive, judged after min_calls calls or once its first call is a window old, or once idle_calls
@@ -503,6 +504,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # dead_dep_h blocked on a failed or cancelled dependency (0: off). Urgent, user-ordered, review and
     # obligation-owner tasks never expire.
     "queue": {"expire_h": 48, "dead_dep_h": 24},
+    # Tasks created per day (throughput.daily_line): with daily_target set, `ttp throughput` and the
+    # coordinator's STATE show the tasks created in the last 24 h against it (0: unset, no line).
+    "tasks": {"daily_target": 0},
     # A code task's `premise_cmd:` (premise.py) runs model-free before each dispatch, killed after
     # cmd_timeout_s; an exit 0 lets the task dispatch for recheck_min minutes, then it runs again.
     "premise": {"cmd_timeout_s": 60, "recheck_min": 30},

@@ -62,6 +62,7 @@ from . import pausegone
 from . import usersite
 from . import gatejudge
 from . import urgentfup
+from . import fupfold
 from . import topup
 from . import cursortiers
 from . import ctxfork
@@ -8412,9 +8413,14 @@ class Daemon:
         refused: list[str] = []
         hop = self._auto_continue(db.task(task["id"]) or dict(task, **upd), fups, ready, refused) \
             if ready and not requeued and not fix and (review or split or not changes or landed_now) else None
+        # A follow-up on an open task's branch, files or lineage goes into that task, not a new one (fupfold).
+        hopped = {id(fups[0])} if hop or requeued else set()
+        folds = fupfold.fold(self.p, self.cfg, db.task(task["id"]) or dict(task, **upd), fups, hopped,
+                             lambda m: log(self.p, m)) \
+            if new == "done" and not approval and task["kind"] != "review" and fups else {}
         # An urgent task's (or an obligation owner's) next steps are queued now, under the same caps (urgentfup).
         quick, unqueued = self._urgent_followups(db.task(task["id"]) or dict(task, **upd), fups,
-                                                 {id(fups[0])} if hop or requeued else set()) \
+                                                 hopped | set(folds)) \
             if new == "done" and not approval and task["kind"] != "review" and fups else ([], {})
         if not ready and not quick and new == "done" and task["kind"] == "code" and not approval and not notes \
                 and sev == "normal" and self._lone_continue(task, fups):
@@ -8429,6 +8435,10 @@ class Daemon:
             folded.add(id(fups[0]))
             text += f"\nContinue hop #{hop[0]} queued by the daemon ({hop[1]})" + (
                 f"; it builds on #{task['id']}'s branch and starts now." if split else ".")
+        for f in fups:
+            if id(f) in folds:
+                folded.add(id(f))
+                text += f"\nFollow-up folded into #{folds[id(f)][0]} ({folds[id(f)][1]}): {str(f['title'])[:120]}."
         for f, nid in quick:
             folded.add(id(f))
             text += f"\nFollow-up #{nid} queued by the daemon ({urgentfup.why(db, task)}): {str(f['title'])[:120]}."
@@ -8448,14 +8458,14 @@ class Daemon:
             text += (f"\nNo continue hop finishes its split head: add one with continues #{task['id']} (it builds "
                      f"on this branch), or a review of it if the work is complete.")
         # Every proposal queued as an urgent next step and nothing else to read: no turn either.
-        settled = bool(quick) and len(fups) <= MAX_FOLLOWUPS and all(id(f) in folded for f in fups) \
+        settled = bool(quick or folds) and len(fups) <= MAX_FOLLOWUPS and all(id(f) in folded for f in fups) \
             and not notes and sev == "normal" and not hcheck_text
         routine = ((review is not None and plain) or fix is not None or hop is not None or requeued or settled) \
             and not stale
         # The summary takes what the digest's cap leaves after the header, push note and daemon lines.
         room = min(1200, coord.EVENT_CHARS - len(head) - len(push_note) - len(text))
         text = f"{head}{_cut(summary, max(200, room), where)}{claimcheck.handoff_mark(result)}{push_note}{text}"
-        if hop or requeued or quick:
+        if hop or requeued or quick or folds:
             chaincap.add_notice(db, text)
         if not approval:   # an approval has its push_queued event; the batch's outcome closes the task
             # A plain needs_review hand-off: the daemon reviews it, so it raises no effort (coordinator._routine_review).
@@ -8488,7 +8498,8 @@ class Daemon:
                 if id(f) not in folded and (chaincap.CONT_TITLE.match(str(f["title"])) or held) else ""
             db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
                  (time.time(), f"task:{task['id']}", "followup_proposed", "normal",
-                  f"proposed follow-up{tag}: "
+                  f"proposed follow-up{tag}"
+                  + (f" (folded into #{folds[id(f)][0]}: {folds[id(f)][1]})" if id(f) in folds else "") + ": "
                   f"{str(f['title'])[:200]}{f' [{start}]' if start else ''} — "
                   f"{_cut(str(f.get('spec', '')), FOLLOWUP_SPEC_CHARS, where)}",
                   "handled" if id(f) in folded else "queued", task["id"]))
