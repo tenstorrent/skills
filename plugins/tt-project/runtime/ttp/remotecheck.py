@@ -236,7 +236,10 @@ def _run_script(q: str, exports_: str, cmd: str, mark: str, wrap: tuple[str, ...
                f"export {WRAP_REFUSED_ENV}={q}/.git/ttp-wrap-refused\n")
     refused = (f"if [ \"$rc\" = {FAULT_RC} ] && [ -e \"${WRAP_REFUSED_ENV}\" ]; then "
                f"printf '\\n%s%s\\n' {mark} {WRAP_REFUSED}; fi\n") if wrap else ""
-    return (f"cd {q} || exit 97\ntrap 'cd / && rm -rf {q}' EXIT\n{exports_}{has}"
+    from . import orphanchecks
+    # Who owns the run: once that process is gone, orphanchecks stops what still runs here.
+    owner = f"printf '%s\\n' {shlex.quote(orphanchecks.owner_line())} > {orphanchecks.OWNER_FILE}\n"
+    return (f"cd {q} || exit 97\n{owner}trap 'cd / && rm -rf {q}' EXIT\n{exports_}{has}"
             f"if command -v bash >/dev/null 2>&1; then set -- {run}; else set -- {w} sh -e -c {shlex.quote(cmd)}; fi\n"
             f"{_priority(prio)}"
             # A background job's stdin is /dev/null unless redirected: the watcher reads ssh's from fd 3.
@@ -747,7 +750,10 @@ def _attempt(host, top, head, env, extra, cmd, mark, wrap, wait) -> tuple[int, s
             proc.stdin.close()
         if tmp:
             try:
-                subprocess.run(_ssh(host, f"rm -rf {shlex.quote(tmp)}"
+                # Not a bare `rm -rf`: a run whose ssh broke goes on there with its folder gone, owned by
+                # nothing. Its own process groups are stopped first, then the folder goes.
+                from . import orphanchecks
+                subprocess.run(_ssh(host, orphanchecks.reap_script([tmp], STOP_GRACE_S)
                                     + (f"; {_mirror_cleanup(*cleanup_ref)}" if cleanup_ref else ""), direct),
                                stdin=subprocess.DEVNULL,
                                capture_output=True, timeout=CLEANUP_TIMEOUT_S)

@@ -2309,6 +2309,7 @@ class Daemon:
                 self.check_queue_waits,
                 self.check_checks_owner,
                 self.reap_leftover_checks,
+                self.reap_orphan_checks,
                 self.check_checks_stall,
                 self.check_gate_time,
                 self.check_cap_wait,
@@ -10339,6 +10340,35 @@ class Daemon:
                 break
             for rec in leftoverchecks.reap_one(self.p, r["id"], slots, guarded):
                 log(self.p, rec["text"])
+
+    def reap_orphan_checks(self, every_s: float = 60, now: float | None = None, wait: bool = False) -> None:
+        """Model-free, at most every `every_s`: stop this machine's `ttp checks` runs on the project's check
+        hosts whose local owner is gone or whose checkout was removed under them (orphanchecks: their own
+        process groups, by number; the folder removed; one line here each). Each host is scanned at most
+        once per orphanchecks.EVERY_S by all of this user's projects; the ssh calls run on a thread of
+        their own (one at a time), so an unreachable host never holds the tick. `wait`: in the tick (tests)."""
+        from . import orphanchecks
+        now = time.time() if now is None else now
+        if now - getattr(self, "_orphan_checks_at", 0.0) < every_s:
+            return
+        busy = getattr(self, "_orphan_checks_thread", None)
+        if busy is not None and busy.is_alive():
+            return
+        self._orphan_checks_at = now
+        cfg = getattr(self, "cfg", None)
+
+        def run() -> None:
+            try:
+                for rec in orphanchecks.sweep(cfg, now=now):
+                    log(self.p, rec["text"])
+            except Exception as e:   # a scan's fault is logged, never the daemon's end
+                log(self.p, f"orphaned check scan failed: {e}")
+
+        if wait:
+            run()
+            return
+        self._orphan_checks_thread = threading.Thread(target=run, name="ttp-orphan-checks", daemon=True)
+        self._orphan_checks_thread.start()
 
     def check_checks_owner(self, every_s: float = 60, now: float | None = None) -> None:
         """Model-free: a checks lane held by a check whose task has ended (checklane.finished_holders)
