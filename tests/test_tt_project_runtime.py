@@ -32784,8 +32784,13 @@ def test_a_daemon_queued_continue_hop_carries_its_parent_branch_head_and_changed
     assert len(wide) == chaincap.BRIEF_MAX_LINES and wide[-1] == f"+{60 - (len(wide) - 3)} more files", wide
     assert "60 files" in wide[1] and wide[2] == "- m00.py (+1 -0): 1"
     # No branch to read (its ref is gone): the commit in its own worktree still queues the hop, its spec
-    # as the follow-up wrote it.
-    gone = lambda tid, _head: p.db.update_task(tid, branch="no-such-branch")
+    # as the follow-up wrote it. The ref is really deleted (worktree detached at its head), so the
+    # daemon's own-worktree branch recovery (#8386) finds nothing to restore either.
+    def gone(tid, head):
+        path, ref = p.worktrees / f"t{tid}", p.db.task(tid)["branch"]
+        _git_out(path, "checkout", "-q", "--detach", head)
+        _git_out(path, "branch", "-q", "-D", ref)
+        p.db.update_task(tid, branch="no-such-branch")
     root3, *_ = _finish_code(env, p, "gone", {"c.py": 2}, result=_cont("gone"), before=gone)
     (hop3,) = p.db.q("SELECT * FROM tasks WHERE parent=?", (root3,))
     assert hop3["spec"] == "Carry on with gone from its branch.", hop3["spec"]
