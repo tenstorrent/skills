@@ -3934,10 +3934,16 @@ Workers can read Slack links you paste, using your Slack connector if you have o
 - A run whose task carries the `untrusted_input` label (its input, such as a PR comment, an issue body
   or a CI log, may carry planted instructions) gets three more guards, model-free (untrusted.py). The
   label is read from the task's record; `TTP_UNTRUSTED_INPUT=1` also turns them on (a benchmark cell
-  without a project) and nothing turns them off. A run without the label is unchanged.
+  without a project). Only the coordinator turns them off, with a task_update `untrusted_input: false`
+  whose `text` names who vouched for the source: the task keeps the label `untrusted_cleared` and an
+  `untrusted_cleared` event holds the why; a task run cannot clear it. A note from another project of
+  the same owner still sets the label, since it can quote PR comments, logs or web pages. A run
+  without the label is unchanged.
   - Pushes: git's pre-push hook refuses every ref but the task's own branch (its recorded branch) and
     the push branch, so a new branch, a tag or a delete is refused, and the hook refuses a raw
-    `git push` naming the push branch: that branch is reached only through `ttp push`.
+    `git push` naming the push branch: that branch is reached only through `ttp push`. One more: the
+    pr_branch the coordinator recorded for the task (a spec `pr_branch:` line or a task_update's,
+    never one only inside quoted text), at exactly a commit an independent review of the task passed.
   - Writes: `gh api` with a write method, a field or input body or a GraphQL mutation; every other gh
     subcommand but reads (`view`, `list`, `diff`, `checks`, `status` and the like), so `gh pr comment`,
     `gh issue create` and `gh pr review`; curl with a method other than GET, HEAD or OPTIONS, a data

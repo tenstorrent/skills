@@ -2687,6 +2687,34 @@ def _claims_checked(p: Project, a: dict, notes: list) -> tuple[str, list]:
     return text, false
 
 
+def untrusted_update(task: dict, a: dict, upd: dict) -> str:
+    """A task_update's `untrusted_input` (untrusted.py): true adds the label; false clears it, only with a
+    `text` naming who vouched for the task's source, and never from inside a task run (a worker's
+    process). Writes upd["labels"]; returns the why of a clear, else ""."""
+    want = a.get("untrusted_input")
+    if want is None:
+        return ""
+    if not isinstance(want, bool):
+        raise ValueError(f"#{task['id']} rejected: untrusted_input is true or false")
+    labels = upd.get("labels")
+    labels = json.loads(task["labels"] or "[]") if labels is None else labels
+    if want:
+        if untrusted.LABEL not in labels:
+            upd["labels"] = labels + [untrusted.LABEL]
+        return ""
+    if os.environ.get("TTP_TASK") and not coordtools.coordinator_run():
+        raise ValueError(f"#{task['id']} rejected: a task run cannot clear {untrusted.LABEL}; only the coordinator can")
+    why = " ".join(str(a.get("text") or "").split())
+    if not why:
+        raise ValueError(f"#{task['id']} rejected: untrusted_input false needs `text` naming who vouched for "
+                         f"the task's source and why it is safe")
+    if untrusted.LABEL not in labels:
+        return ""
+    upd["labels"] = [lb for lb in labels if lb != untrusted.LABEL] + \
+        ([untrusted.CLEARED_LABEL] if untrusted.CLEARED_LABEL not in labels else [])
+    return why
+
+
 def apply(p: Project, actions: list[dict], default_chat: str | None = None, user_turn: bool = False,
           turn: int | None = None, messages: list[int] | None = None, lean: bool = False,
           applied: list | None = None, skip_actions: frozenset | set = frozenset(),
@@ -3260,6 +3288,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                         raise ValueError(f"task #{task['id']} rejected: pr_branch {want!r} is not one valid branch name")
                     upd["labels"] = _branch_labels(upd.get("labels", json.loads(task["labels"] or "[]")), want)
                     branch_line = f"pr_branch: `{want}`" if want else 'pr_branch: ""'
+                cleared = untrusted_update(task, a, upd)
                 if a.get("start_after") is not None or a.get("start_when") is not None \
                         or (a.get("why") is not None and deferral(task).get("when")):
                     if task["status"] in ("running", *TERMINAL_TASK_STATES):
@@ -3396,6 +3425,11 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     if waits or anchors.without(labels) != labels:
                         upd["labels"] = anchors.without(labels) + ([waits] if waits else [])
                 db.update_task(task["id"], **upd)
+                if cleared:   # the audit trail of who vouched for the task's source
+                    db.x("INSERT INTO events(ts,source,kind,severity,text,data,status,task) VALUES(?,?,?,?,?,?,?,?)",
+                         (time.time(), "coordinator", untrusted.CLEARED_KIND, "low",
+                          f"#{task['id']}: {untrusted.LABEL} cleared: {cleared}"[:1000],
+                          json.dumps({"why": cleared}), "handled", task["id"]))
                 for h in history:   # the append-only history of what the live spec no longer says
                     db.x("INSERT INTO events(ts,source,kind,severity,text,data,status,task) VALUES(?,?,?,?,?,?,?,?)",
                          (time.time(), "coordinator", STEP_REPLACED_KIND, "low",

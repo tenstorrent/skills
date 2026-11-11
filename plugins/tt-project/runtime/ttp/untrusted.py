@@ -10,7 +10,9 @@ set TTP_UNTRUSTED_INPUT=1 (a benchmark cell without a project). Then, model-free
 (the worker hook, the runner's stream guard, and the run's bin/git and bin/gh, which scripts reach too):
 - git push updates only the task's own work branch (its recorded branch) or the push branch, and
   the push branch only through `ttp push`: the run's pre-push hook (gitguard) refuses any other ref
-  git names, tags and deletes too, and the hook refuses a raw `git push` naming the push branch;
+  git names, tags and deletes too, and the hook refuses a raw `git push` naming the push branch.
+  One more: the pr_branch the coordinator recorded for the task (never one named only in quoted
+  text), at exactly a head an independent review passed (reviewed_pr_pushes);
 - gh and curl calls that write are refused (write_refusal): `gh api` with a write method, a field or
   input body, or a GraphQL mutation; every other gh subcommand but the reads READ_VERBS names (so
   `gh pr comment`, `gh issue create`, `gh pr review`); curl with -X/--request other than GET or HEAD,
@@ -45,6 +47,10 @@ import shlex
 
 LABEL = "untrusted_input"   # modelpick.UNTRUSTED
 WRITE_LABEL = "untrusted_write"
+# A coordinator task_update `untrusted_input: false` with a `text` naming who vouched for the source
+# clears LABEL (coordinator.untrusted_update): the task keeps CLEARED_LABEL, an event of CLEARED_KIND
+# holds the why. A task run cannot clear it.
+CLEARED_LABEL, CLEARED_KIND = "untrusted_cleared", "untrusted_cleared"
 ENV = "TTP_UNTRUSTED_INPUT"
 KEY = LABEL                    # the run note's entry
 RUN_MARK = "untrusted-input"   # in the run dir: one source per line (web, connector, download), read by the hook and the daemon
@@ -182,13 +188,70 @@ def push_branch(raw: bool = False) -> str:
     return ref if raw else ref.split("/", 1)[1] if ref.startswith("origin/") else ref
 
 
+# A span of quoted text (spans.wrap) with its contents, or an unclosed one to the end; and a `>` quote line.
+_SPAN = re.compile(r"⟦([0-9a-f]{8}) data: [^⟧]*⟧.*?(?:⟦/\1⟧|\Z)", re.S)
+_QUOTE_LINE = re.compile(r"^[ \t]*>.*$", re.M)
+
+
+def unquoted(spec: str) -> str:
+    """`spec` without the text it quotes: data spans with their contents, and `>` quote lines."""
+    return _QUOTE_LINE.sub("", _SPAN.sub("", spec or ""))
+
+
+def recorded_pr_branch(task: dict) -> str:
+    """The pr_branch the coordinator recorded for `task` (worktree.recorded_pr_branch: a spec `pr_branch:`
+    line or a task_update's), or "": also when that branch is named only inside quoted text (unquoted),
+    since a pasted review or note can carry any `pr_branch:` line."""
+    from . import worktree
+    branch = worktree.recorded_pr_branch(task) or ""
+    if not branch or not worktree.valid_branch(branch):
+        return ""
+    return branch if worktree.spec_names_pr_branch(unquoted(str(task.get("spec") or "")), branch) else ""
+
+
+def reviewed_heads(db, task: dict) -> list[str]:
+    """The full commits an independent review that passed approved for `task`: a review whose subject is
+    the task (db.review_subject) or, naming none, that depends on it; its head from the push queue or
+    review_stats."""
+    from . import reviewsup
+    from .db import dependency_ids, review_subject
+    heads = []
+    for r in db.q("SELECT * FROM tasks WHERE kind='review' AND id!=? ORDER BY id", (task["id"],)):
+        r = dict(r)
+        subject = review_subject(r)
+        if not reviewsup.passed(r) or (subject != task["id"] if subject is not None
+                                       else task["id"] not in dependency_ids(r)):
+            continue
+        for row in (db.one("SELECT head FROM push_queue WHERE task=? ORDER BY id DESC LIMIT 1", (r["id"],)),
+                    db.one("SELECT head FROM review_stats WHERE task=?", (r["id"],))):
+            if row and re.fullmatch(r"[0-9a-f]{40}", str(row["head"] or "")):
+                heads.append(row["head"])
+    return list(dict.fromkeys(heads))
+
+
+def reviewed_pr_pushes(env: dict | None = None) -> list[str]:
+    """`refs/heads/<branch>@<sha>` for each head of this run's task an independent review passed
+    (reviewed_heads), on the pr_branch the coordinator recorded for it (recorded_pr_branch): the only
+    push to a branch not the task's own a labelled run may make. [] when it has none."""
+    task, base = _task(env)
+    if not task.isdigit() or not base:
+        return []
+    from .project import Project
+    db = Project(base).db
+    t = db.task(int(task))
+    branch = recorded_pr_branch(t) if t else ""
+    return [f"refs/heads/{branch}@{sha}" for sha in reviewed_heads(db, t)] if branch else []
+
+
 def push_refs(env: dict, name=lambda ref: ref) -> list[str]:
     """The refs an untrusted run's push may update (gitguard's pre-push hook), or [] when the run is no
-    such run. `name` maps delivery.push_branch to its branch (gitguard._branch_name)."""
+    such run: its own branch, the push branch, and its recorded pr_branch only at a reviewed head
+    (`ref@sha`: reviewed_pr_pushes). `name` maps delivery.push_branch to its branch (gitguard._branch_name)."""
     if not active(env):
         return []
     branches = (own_branch(env), name(b) if (b := push_branch(raw=True)) else "")
-    return [f"refs/heads/{b}" for b in dict.fromkeys(branches) if b] or ["(none)"]
+    refs = [f"refs/heads/{b}" for b in dict.fromkeys(branches) if b] + reviewed_pr_pushes(env)
+    return refs or ["(none)"]
 
 
 def _strip_repo(args: list[str]) -> list[str]:

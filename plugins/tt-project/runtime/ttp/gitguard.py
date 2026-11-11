@@ -21,8 +21,9 @@ own: a push that would send a stored secret, a credential shape or a forbidden-d
 commit message, an added line or a tag message, is refused (outscan.py). A fault setting the scan up
 refuses the push; a fault reading the push branch guard's project skips only that guard.
 In a run whose task reads untrusted input (untrusted.active) the same hook refuses every ref but the
-task's own branch and the push branch (untrusted.push_refs, passed as TTP_PUSH_ONLY_REFS); a fault
-reading them there refuses the push. One more push passes that hook there: one to a local repository
+task's own branch, the push branch and its recorded pr_branch at a reviewed head (`ref@sha`:
+untrusted.push_refs, passed as TTP_PUSH_ONLY_REFS); a fault reading them there refuses the push.
+One more push passes that hook there: one to a local repository
 under the run's own temp folders (temp_remote), such as a bare repo a test made for itself; never a
 network remote, a path elsewhere or the project's own repository.
 
@@ -65,7 +66,7 @@ if [ -n "$TTP_PUSH_GUARD_REF" ] &&
     exit 1
 fi
 if [ -n "$TTP_PUSH_ONLY_REFS" ] &&
-    printf '%s' "$input${input:+$nl}" | awk -v r=" $TTP_PUSH_ONLY_REFS " 'NF >= 3 && index(r, " " $3 " ") == 0 { f = 1 } END { exit !f }' &&
+    printf '%s' "$input${input:+$nl}" | awk -v r=" $TTP_PUSH_ONLY_REFS " 'NF >= 3 && index(r, " " $3 " ") == 0 && index(r, " " $3 "@" $2 " ") == 0 { f = 1 } END { exit !f }' &&
     ! { [ -n "$TTP_PUSH_ONLY_RT" ] && "$TTP_PUSH_SCAN_PY" -I -c \\
         'import sys; sys.path.insert(0, sys.argv[1]); from ttp.gitguard import temp_remote; sys.exit(not temp_remote(sys.argv[2]))' \\
         "$TTP_PUSH_ONLY_RT" "$2" 2>/dev/null; }; then
