@@ -38,6 +38,7 @@ from pathlib import Path
 
 from . import runtimeload   # first of its own: its LOADED_AT is when the daemon imported its code
 from . import untrusted
+from . import branchcap
 from . import sshmux
 from . import tailnet
 from . import sshagent
@@ -1294,6 +1295,8 @@ class Daemon:
         self._overrun: dict | None = None   # the running or last tick that passed TICK_OVERRUN_S or stalled
         self._last_prune = 0.0
         self._last_leftovers = 0.0   # when prune_leftovers last ran
+        self._last_branchcap = 0.0   # when branch_cap last ran
+        self._branchcap_backlog = False   # its last sweep stopped at a limit: the next comes sooner
         self._prune_more: str | None = None   # "plain" or "force": worktrees were left to archive, sweep next tick
         self._release_due = 0.0   # when the installed tt-project release is next compared with the harness
         self._root_checked = 0.0   # when clear_root_checkout last looked at the project root
@@ -2298,7 +2301,7 @@ class Daemon:
         for step in (self.lift_boot_pause, self.reap_runs, self.reap_waiting_checks, self.wake_after_reboot, self.meter_running, self.rebook_per_call_step, self.rebook_no_call_step, self.watch_runs, self.check_steer_reads, self.relay_escalations, self.post_held_notifies, self.reconcile_tasks, self.retry_workspaces, self.tend_pushes,
                      self.sweep_sandbox_trees,
                      self.verify_pushes,
-                     self.tick_prune_worktrees, self.prune_leftovers, self.land_harness_worktrees, self.backup_branches, self.replicate_state, self.check_local_only, self.check_disk,
+                     self.tick_prune_worktrees, self.prune_leftovers, self.branch_cap, self.land_harness_worktrees, self.backup_branches, self.replicate_state, self.check_local_only, self.check_disk,
                      self.sweep_alerts, self.check_release, self.sync_shared_pauses, self.check_pause_ends,
                      self.check_integrity, self.heal_harness_git,
                      self.sync_schedules, self.lint_charter, self.tend_holds, self.record_ttr, self.alert_long_pause,
@@ -13500,6 +13503,22 @@ class Daemon:
                         f"{', '.join(gone[:10])}")
         return gone
 
+    def branch_cap(self, every_s: float = 3600, backlog_s: float = 600) -> list[dict]:
+        """Hourly (every `backlog_s` while a sweep stopped at its limit, so a backlog drains): delete landed tasks' local branches whose worktree is gone (branchcap.sweep, each
+        written to state/branch-deletions.jsonl), then count open code branches and running workers for
+        `ttp status`, the web app and the Course check's alarm (branchcap.scan). No model call."""
+        now, start = time.time(), time.monotonic()
+        if now - self._last_branchcap < (backlog_s if self._branchcap_backlog else every_s):
+            return []
+        self._last_branchcap = now
+        gone = branchcap.sweep(self.p, self.cfg, now)
+        self._branchcap_backlog = len(gone) >= branchcap.SWEEP_MAX or time.monotonic() - start > branchcap.TIME_MAX_S
+        if gone:
+            log(self.p, f"deleted {len(gone)} landed task branch(es), recovery list state/{branchcap.RECOVERY}: "
+                        f"{', '.join(r['branch'] for r in gone[:10])}")
+        branchcap.scan(self.p, now)
+        return gone
+
     def tick_prune_worktrees(self) -> list[dict]:
         """The tick's prune_worktrees: at most every PRUNE_TICK_MIN_S even while tasks keep finishing
         (each finish used to sweep at the next tick), except a forced or deferred archive pass still due."""
@@ -13513,7 +13532,7 @@ class Daemon:
         removal (null, the default: no delay beyond worktree.held_by; 0 or less: never tidy, as
         before). A worktree kept for a reason is checked again when its task changes or after
         KEEP_RECHECK_S, or at once with `force` (the disk guard's sweep), except one whose sweep failed
-        (`why` 'error: ...'), so a forced re-sweep does not retry it every tick. Branches are never deleted.
+        (`why` 'error: ...'), so a forced re-sweep does not retry it every tick. This sweep deletes no branch (branch_cap does, once landed).
         Removals are cheap and all done at once; archiving (worktree.sweep's costly part) is done for
         at most one worktree per call, and the sweep runs again at the next tick (forced again after a
         forced one) until none is left deferred. Returns the sweep's results."""

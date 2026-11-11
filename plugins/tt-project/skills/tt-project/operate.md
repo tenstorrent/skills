@@ -238,7 +238,9 @@
   `state/archive/worktrees/<folder>/` (with a patch of tracked changes), more keeps it. An open
   task's are never touched, nor anything in another project's folder. Other worktrees stay.
   `ttp prune <name>` sweeps now (`--dry-run` lists what it would do) and reports worktrees removed,
-  GB freed and why each other one was kept. Each keep reason is logged once.
+  GB freed and why each other one was kept. Each keep reason is logged once. It then deletes landed
+  tasks' local branches whose worktree is gone, as the daemon does hourly (recovery list
+  `state/branch-deletions.jsonl`; `delivery.delete_landed_branches`, docs/guide.md).
 - Workers and reviewers run with the project's Python venv active (`VIRTUAL_ENV`, `PATH`; their
   prompt names it), so a fresh worktree does not rebuild one. `worktree.venv`: `auto` (default) finds
   `.venv` or `venv` in the project root, a path names another, `""` turns it off. A worktree with a

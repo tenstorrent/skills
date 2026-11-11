@@ -119,6 +119,7 @@ from . import (   # one name per line: two changes adding names merge without a 
     yesask,
 )
 from . import untrusted
+from . import branchcap
 from . import urgent
 from . import waketier
 from . import replan
@@ -1510,6 +1511,9 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
     if unplain := plainreply.digest_lines(db, now):
         course_lines = (course_lines or [course.HEADER]) + unplain
         course_id += "\nplainreply:" + unplain[0].split(" | ")[0]
+    if overcap := branchcap.digest_lines(db, p.config()):
+        course_lines = (course_lines or [course.HEADER]) + overcap
+        course_id += "\nbranchcap:" + overcap[0].split(" (latest:")[0].split(" | ")[0]
     section("course_check", course_lines, course_id,
             f"## Course check: {len(course_lines) - 1} lines (as last turn; correct course or say why it is fine)")
     prog_lines, prog_id = progress.digest_lines(db, now)

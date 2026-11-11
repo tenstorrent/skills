@@ -3041,6 +3041,21 @@ session and stateless coordinators on every provider.
   ... interpreter, version differ`). The push queue keys its own passes the same way. Only the task's own branch is pushed that way: the push branch
   always gets its own checks. Records live under the project's state
   (`push_check_passes.json`, newest 200 within 14 days; `push_check_resume/`, newest 20 within 3 days).
+- Open branches and work threads: the daemon counts, hourly and without a model call, each
+  project's open code branches (task branches with commits not on the push branch, of tasks not
+  landed, cancelled or failed) and running workers. `ttp status`, the web app (`branches` in the
+  state payload) and the coordinator's Course check show them. Over `delivery.max_open_branches`
+  (default 8) or `delivery.max_work_threads` (default 6; 0 turns a cap off) one alarm line asks the
+  coordinator to give new non-urgent code work that overlaps an open code task that task's branch
+  (`pr_branch:`) or fold it into its spec, and to land open branches before opening more. The caps
+  are soft: they hold no work, urgent and user-ordered work runs as before, and the dollar caps stay
+  the hard limits.
+- Landed branch cleanup: once a finished task's change is on the push branch and its worktree is
+  gone, the daemon (and `ttp prune`) deletes its local branch and appends branch, sha and task to
+  `state/branch-deletions.jsonl` (`git branch <branch> <sha>` restores one). A branch an unfinished
+  task uses, one on a remote other than `delivery.backup_remote`, one whose task has a PR and one
+  with a commit by an author other than the repository's `user.email` are kept.
+  `delivery.delete_landed_branches: false` turns this off.
 - `delivery.backup_remote` (off by default) names a git remote that each finished code task's
   branch (`ttp/t<id>-...`) is pushed to under the same name, fast-forward only: never forced, never
   to `main`, `master`, the push branch or `delivery.base_ref` (a value naming one is refused). A

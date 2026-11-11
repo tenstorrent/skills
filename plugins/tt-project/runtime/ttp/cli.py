@@ -1984,6 +1984,9 @@ def cmd_status(a) -> None:
         from . import gatetime
         if ln := gatetime.status_line(p.state, p.config()):
             print(ln)
+        from . import branchcap
+        if ln := branchcap.status_line(p.db, p.config()):
+            print(ln)
         if ln := gatetime.waits_line(p.db, p.state):
             print(ln)
         from . import notifier
@@ -9806,7 +9809,8 @@ def cmd_prune(a) -> None:
     directories (state/runs/<id>/...), with the daemon's checks: clear build and cache
     directories, archive hand-off artifacts and large untracked files (state/archive/tasks/<id>/),
     move small untracked leftovers to the task's last run directory, clear a stale `git worktree
-    add` lock, and remove the worktree when nothing is lost. Branches stay. Prints each worktree's
+    add` lock, and remove the worktree when nothing is lost. Then delete landed tasks' local branches
+    whose worktree is gone (branchcap.sweep, each listed in state/branch-deletions.jsonl). Prints each worktree's
     outcome (the reason for each one kept), how many went and the space freed. --dry-run changes
     nothing and lists what would happen. --archived <task> lists a task's archive; with --restore
     <dir> it extracts the archived files there."""
@@ -9865,12 +9869,21 @@ def cmd_prune(a) -> None:
                                                    if r["why"] is None else f"kept: {r['why']}") + cleared)
     if not res:
         print("no finished task's worktree to tidy")
-        return
-    gone = sum(1 for r in res if r["why"] is None)
-    line = f"{'would remove' if dry else 'removed'} {gone} worktree(s), kept {len(res) - gone}"
-    if before and not dry:
-        line += f"; freed {max(shutil.disk_usage(p.worktrees).free - before, 0) / 1e9:.1f} GB"
-    print(line)
+    else:
+        gone = sum(1 for r in res if r["why"] is None)
+        line = f"{'would remove' if dry else 'removed'} {gone} worktree(s), kept {len(res) - gone}"
+        if before and not dry:
+            line += f"; freed {max(shutil.disk_usage(p.worktrees).free - before, 0) / 1e9:.1f} GB"
+        print(line)
+    from . import branchcap   # then the landed tasks' branches whose worktree is gone, as the daemon does hourly
+    deleted = branchcap.sweep(p, p.config(), dry=dry, limit=10_000, time_max=120)
+    for r in deleted:
+        print(f"#{r['task']}: branch {r['branch']} ({r['sha'][:12]}) landed: {'would be deleted' if dry else 'deleted'}")
+    if deleted and not dry:
+        print(f"deleted {len(deleted)} landed branch(es); each is in {p.state / branchcap.RECOVERY} "
+              "(restore: git branch <branch> <sha>)")
+    if not dry:
+        branchcap.scan(p)
 
 
 def _memory_room(p, dry: str = "", added: bool = True) -> None:

@@ -817,6 +817,7 @@ def state_payload(p: Project, db: DB) -> dict:
         "heartbeat": heartbeat(p), "runtime": health_now["runtime"], "heartbeat_stale_s": HEARTBEAT_STALE_S, "watchdog_s": int(watchdog_settings(p)["hang_s"]),
         "service": installed(p), "disk_low": db.kv("disk_low"),
         "disk": db.kv("disk"), "worktrees_kept": db.kv("worktrees_kept"),
+        "branches": db.kv("branchcap"),
         "tasks": tasks, "task_counts": db.status_counts(), "runs": runs,
         "issues": db.q("SELECT id,source,title,severity,status,count,first_seen,last_seen,task FROM issues "
                        "WHERE status IN ('open','tracking') ORDER BY last_seen DESC LIMIT 100"),

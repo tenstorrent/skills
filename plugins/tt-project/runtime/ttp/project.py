@@ -671,6 +671,10 @@ EXTRA_KEYS = {
     # `landed:#<id>` (landed.landed_probe); unset there, the harness chains with depends_on instead.
     # push_checks_timeout_s: the run-time limit of each `ttp push` check, grant and test-pool waits left out (push.check_limit_of; 0: none).
     # push_pool_wait_s: how long one push check may wait for test-pool slots in all (push.pool_wait_of; 0: no bound).
+    # max_open_branches, max_work_threads: soft caps on open code branches (task branches with commits not on
+    # the push branch) and running workers; over one, the Course check and `ttp status` raise one alarm line
+    # (branchcap.CAPS defaults, 0: no cap). delete_landed_branches (default on): the daemon deletes a landed
+    # task's local branch once its worktree is gone, recorded in state/branch-deletions.jsonl.
     # push_retries: how often a detached push retries a cause it clears itself, a non-fast-forward
     # (--own) or a reboot that cut it short (push.retries_of; default 2, 0: never).
     "delivery": {"base_ref", "push_branch", "landed_probe", "push_checks", "post_land_checks", "push_checks_by_repo", "push_exclude_paths", "push_rounds", "push_wait_s",
@@ -690,6 +694,7 @@ EXTRA_KEYS = {
                  "check_prestage",   # a short foreground run before `ttp checks --detach` (checkprestage)
                  "pr_body_check",   # a project's own PR body check before gh pr create/edit (prbody)
                  "ai_tag",   # the AI-authorship tag a post to others ends with (aitag)
+                 "max_open_branches", "max_work_threads", "delete_landed_branches",   # open-branch soft cap (branchcap)
                  "rebase_replace", "never_force",   # whether a rebase replaces its branch (rebase_replace)
                  "integration_branch",   # where reviewed changes land on a project with no push branch (integrate)
                  "channel_tags"},   # release-channel tags a forward move may update under never_force (channeltag)
