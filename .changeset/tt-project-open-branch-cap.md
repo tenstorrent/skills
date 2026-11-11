@@ -7,4 +7,5 @@ shows them in `ttp status`, the web app and the coordinator's Course check, with
 the soft caps `delivery.max_open_branches` and `delivery.max_work_threads` asking to fold new work
 onto open branches (urgent and user-ordered work is never held). Landed tasks' local branches are
 deleted once their worktree is gone, each tip saved as `refs/ttp-archive/<branch>` and recorded in
-`state/branch-deletions.jsonl`.
+`state/branch-deletions.jsonl`. Dead branches (tasks all ended over `delivery.dead_branch_days` ago, never approved, nothing
+unfinished depending on them) are deleted the same way, and only live work counts as open.

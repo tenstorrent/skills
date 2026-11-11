@@ -3042,8 +3042,9 @@ session and stateless coordinators on every provider.
   always gets its own checks. Records live under the project's state
   (`push_check_passes.json`, newest 200 within 14 days; `push_check_resume/`, newest 20 within 3 days).
 - Open branches and work threads: the daemon counts, hourly and without a model call, each
-  project's open code branches (task branches with commits not on the push branch, of tasks not
-  landed, cancelled or failed) and running workers. `ttp status`, the web app (`branches` in the
+  project's open code branches (task branches with commits not on the push branch, not landed, of
+  an unfinished task, a done task awaiting its push or one an unfinished task depends on) and
+  running workers. `ttp status`, the web app (`branches` in the
   state payload) and the coordinator's Course check show them. Over `delivery.max_open_branches`
   (default 6) or `delivery.max_work_threads` (default 4; 0 turns a cap off) one alarm line asks the
   coordinator to give new non-urgent code work that overlaps an open code task that task's branch
@@ -3057,6 +3058,11 @@ session and stateless coordinators on every provider.
   task uses, one on a remote other than `delivery.backup_remote`, one whose task has a PR and one
   with a commit by an author other than the repository's `user.email` are kept.
   `delivery.delete_landed_branches: false` turns this off.
+  A dead branch, whose tasks all ended (done, cancelled or failed) more than
+  `delivery.dead_branch_days` ago (default 3; 0 turns it off) without a push queue approval and
+  with no unfinished task depending on them, is deleted the same way, with the same keeps (also
+  never one checked out in any worktree), and recorded with `why: dead`. Such branches, and those
+  of cancelled or failed tasks, are not counted as open.
 - `delivery.backup_remote` (off by default) names a git remote that each finished code task's
   branch (`ttp/t<id>-...`) is pushed to under the same name, fast-forward only: never forced, never
   to `main`, `master`, the push branch or `delivery.base_ref` (a value naming one is refused). A
