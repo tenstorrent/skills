@@ -647,7 +647,8 @@ def test_bridge_box_link_is_touched_only_on_change_and_fails_closed(tmp_path):
     assert run().returncode == 0 and stat.S_IMODE(os.stat(d).st_mode) == 0o700   # a loosened folder is tightened
     shutil.rmtree(d)
     other = tmp_path / "other"
-    other.mkdir(mode=0o755)
+    other.mkdir()
+    os.chmod(other, 0o755)   # explicit: a host umask such as 027 would trim mkdir's mode
     os.symlink(other, d)
     r = run()
     assert r.returncode == 4 and "not a private folder" in r.stderr
