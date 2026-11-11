@@ -957,8 +957,8 @@ def _report_machine(host: Any, name: str, spec: dict, now: float) -> None:
             return
         # Only the route failed: this project's own problem, so nothing is reported (an earlier report clears).
         want, grace = [alias, spec.get("condition") or "down"] if alias and not st.get("route_only") else None, 0
-    elif st.get("finding"):
-        pass   # the box is up: nothing to report, and an earlier down report clears
+    elif st.get("finding") or st.get("user_only"):
+        pass   # the box is up (a user-only step is no outage): nothing to report, and an earlier down report clears
     elif alias and st.get("status") == "unhealthy" and (spec.get("outage") or not _known_fault(spec, st, now)):
         if spec.get("condition"):
             want = [alias, spec["condition"]]

@@ -827,6 +827,25 @@ def test_heal_user_only_stays_quiet_under_a_known_fault_and_hands_back_without_t
     assert up.exists() and "user_only" not in heal.state(p.db, "svc")
 
 
+def test_heal_user_only_reports_nothing_to_the_machine_ledger_and_clears_an_earlier_down_report(env):
+    from ttp import heal
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    mm.add("box-a")
+    p, d, up = _heal_setup(env, machine="box-a", fix=None, grace_s=0, outage=True)
+    spec, now = _heal_spec(p), time.time()
+    only = dict(spec, check="echo 'ttp-heal: user-only token expired'; exit 1")
+    # A credential only the user holds is no outage: the box is up, so nothing goes to the ledger.
+    assert heal.run(d, "svc", only, now) == ("unhealthy (only the user can act: alerted)", None)
+    assert "machine_reported" not in heal.state(p.db, "svc") and "box-a:down" not in ml.conditions()
+    assert p.db.q("SELECT count(*) n FROM alerts WHERE key='heal:svc'")[0]["n"] == 1
+    # An ordinary failure reports the box down; a user-only run after it clears that report.
+    heal.run(d, "svc", spec, now + 60)
+    assert heal.state(p.db, "svc")["machine_reported"] == ["box-a", "down"] and "box-a:down" in ml.conditions()
+    heal.run(d, "svc", only, now + 120)
+    assert "machine_reported" not in heal.state(p.db, "svc") and "box-a:down" not in ml.conditions()
+
+
 def test_heal_known_owned_runs_never_tell_fix_or_queue_and_a_run_without_the_line_is_unknown_again(env):
     from ttp import heal
     p, d, up = _heal_setup(env, grace_s=300, unknown_cap_s=3600, escalate="coordinator")
