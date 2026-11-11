@@ -1017,25 +1017,80 @@ def run_slot(run: list, head: str, say: Callable[[str], None], priority: str = "
         proj = Project(base)
     cfg = proj.config() if proj else {}
     claims: list = []
+    moved: list = []
+
+    def move(host: str) -> list[str] | None:
+        if moved:
+            return None
+        got, out = move_off(run, host, head, say, proj)
+        if got is None:
+            return None
+        moved.append(got)
+        run[:] = out
+        return list(dict.fromkeys(h for c in run if not getattr(c, "spill_host", "") and (h := remote_host(c))))
+
     if hosts := list(dict.fromkeys(h for c in run if (h := remote_host(c)))):
         bound = testslots.push_load_wait_s(cfg)
-        remoteload.wait(hosts, say, bound)
+        remoteload.wait(hosts, say, bound, move=move)
         from . import checkspill   # the host's check slots, claimed as `ttp checks` claims them (bounded here)
-        if (claims := checkspill.admit_pinned(proj, hosts, say, "push checks", bound=bound)) is None:
+        if not moved and (claims := checkspill.admit_pinned(proj, hosts, say, "push checks", bound=bound)) is None:
             say(f"no check slot freed on {', '.join(hosts)} in {bound:.0f}s (checks.push_load_wait_s), "
                 "starting anyway")
             claims = []
     pats = checklane.light_patterns(cfg)
-    if any(not remote_host(c) and not checklane.is_light(str(c), pats) for c in run):
-        slot = check_slot(head, say, priority=priority, proj=proj)
-    else:
-        slot = checkcap.Slot()
-    if slot is not None and hasattr(slot, "pinned"):
+    slot = (check_slot(head, say, priority=priority, proj=proj)
+            if any(not remote_host(c) and not checklane.is_light(str(c), pats) for c in run) else checkcap.Slot())
+    if moved:
+        slot.spill, moved[0].spill = moved[0].spill, None
+    if hasattr(slot, "pinned"):
         slot.pinned = claims
     else:
         for c in claims:
             c.close()
     return slot
+
+
+def move_off(cmds: list, host: str, head: str, say: Callable[[str], None], proj: Project | None = None,
+             what: str = "push checks") -> tuple[Any, list]:
+    """For checks waiting on overloaded check host `host` (remoteload.wait) that took it as
+    delivery.checks_host's default (with_host): (a slot holding the claim of a spill host with free cores,
+    checkspill.pick, `cmds` with those sent there and the rest as they were), else (None, `cmds`): they keep
+    waiting, never starting on `host`. A light one of those that may not spill (checklane.is_light) runs here
+    beside them; a check whose own "host" names `host`, or a heavy one that may not spill, stays."""
+    from .cli import _spill_to
+    if proj is None and (base := os.environ.get("TTP_PROJECT")):
+        proj = Project(base)
+    if proj is None or os.environ.get(checkcap.HELD_ENV):
+        return None, cmds
+    cfg = proj.config()
+    pats = checklane.light_patterns(cfg)
+    free, here = [], []
+    for c in cmds:
+        c2 = None
+        if isinstance(c, Check) and c.default_host == host and not c.host and not getattr(c, "spill_host", ""):
+            c2 = Check(str(c))
+            c2.__dict__.update(c.__dict__)
+            c2.default_host = ""
+        spills = c2 is not None and checkspill.check_spills(c2, cfg)
+        free.append(c2 if spills else None)
+        here.append(c2 if c2 is not None and not spills and checklane.is_light(str(c2), pats) else None)
+    if not any(free) or not checkspill.hosts(cfg):
+        return None, cmds
+    try:
+        claim = checkspill.pick(proj, cfg, say, f"{what} on {head[:10]}", f"{host}:fail",
+                                f"the check host {host} stayed overloaded")
+    except Exception as e:   # noqa: BLE001
+        say(f"spill hosts not tried ({e}): waiting for {host}")
+        return None, cmds
+    if claim is None:
+        return None, cmds
+    out = [(h or c) if f is None else checkspill._unspilled(_spill_to([f], claim.host, cfg, claim.workers)[0], f)
+           for c, f, h in zip(cmds, free, here)]
+    say(f"the check host {host} stayed overloaded: {sum(1 for f in free if f)} check(s) moved to spill host "
+        f"{claim.host}, which has free cores")
+    slot = checkcap.Slot()
+    slot.spill = claim
+    return slot, out
 
 
 def spill_slot(cmds: list, head: str, say: Callable[[str], None], proj: Project | None = None,

@@ -5674,9 +5674,26 @@ def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: boo
         from . import remoteload, testslots
         # The pinned-host admission below hands over to detached checks after FOREGROUND_WAIT_S in the foreground.
         bound = checkcap.FOREGROUND_WAIT_S if foreground and p else None
+        moved: list = []
+
+        def move(host: str) -> list[str] | None:
+            # Past the wait, checks that took the overloaded host as delivery.checks_host's default go to a
+            # spill host with free cores (push.move_off); `cmds` is the caller's list, rewritten in place.
+            if moved or not isinstance(cmds, list):
+                return None
+            got, new = push.move_off(cmds, host, head, tell, p, "ttp checks")
+            if got is None:
+                return None
+            moved.append(got)
+            cmds[:] = new
+            return list(dict.fromkeys(h for c in cmds if not getattr(c, "spill_host", "")
+                                      and (h := push.remote_host(c))))
+
         # While it waits, status names the guard and its setting (a limit line), cleared once the wait ends.
         note = (lambda line: checkspill.note_limit(p.name, line, checklane.scope_text(cmds)[:300])) if p else None
-        remoteload.wait(hosts, tell, testslots.push_load_wait_s(cfg), note=note)   # never starts on an overloaded host
+        remoteload.wait(hosts, tell, testslots.push_load_wait_s(cfg), note=note, move=move)   # never starts on an overloaded host
+        if moved:
+            return moved[0]
         # Each host's check slots are claimed as a spill pick claims them, so runs here never overshoot it.
         if (claims := checkspill.admit_pinned(p, hosts, tell, what=checklane.scope_text(cmds)[:300],
                                               bound=bound)) is None:

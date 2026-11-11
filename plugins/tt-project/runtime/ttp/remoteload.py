@@ -136,12 +136,16 @@ def guard_line(why: str, bound: float | None) -> str:
 
 def wait(hosts: list[str], say: Callable[[str], None], bound: float | None,
          sleep: Callable[[float], None] = time.sleep, clock: Callable[[], float] = time.monotonic,
-         note: Callable[[str], None] | None = None) -> str:
+         note: Callable[[str], None] | None = None,
+         move: Callable[[str], list[str] | None] | None = None) -> str:
     """Wait while one of `hosts` is overloaded (held): never start on one that is. `bound` (seconds; None:
     once) is how often the wait is told again. "" once all may start, each start recorded (held's `start`).
     `note` (a limit line for status, e.g. checkspill.note_limit) names the guard and its settings while it
-    waits, and gets "" once the wait ends."""
-    start, said, told_at, noted = clock(), "", clock(), ""
+    waits, and gets "" once the wait ends.
+    `move(host)`, tried each `bound` the wait lasts, may route the checks waiting on held `host` elsewhere (a
+    spill host with free cores): it returns the hosts still to wait for (None: nothing moved, keep waiting);
+    "moved" once none are left."""
+    start, said, told_at, noted, tried_at = clock(), "", clock(), "", clock()
     try:
         while True:
             host, why = next(((h, w) for h in hosts if (w := held(h))), ("", ""))
@@ -149,6 +153,13 @@ def wait(hosts: list[str], say: Callable[[str], None], bound: float | None,
                 host, why = next(((h, w) for h in hosts if (w := held(h, start=True, fresh=True))), ("", ""))
                 if not why:
                     return ""
+            if move is not None and bound is not None and clock() - tried_at >= bound:
+                tried_at = clock()
+                if (left := move(host)) is not None:
+                    hosts, said = list(left), ""
+                    if not hosts:
+                        return "moved"
+                    continue
             if note and host != noted:
                 note(guard_line(why, bound))
                 noted = host

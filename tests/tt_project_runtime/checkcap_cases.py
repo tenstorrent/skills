@@ -11894,6 +11894,101 @@ def test_push_checks_on_an_overloaded_remote_host_wait_for_it_and_say_so(env, mo
     assert remoteload.wait(["checkhost"], told.append, None) == "", "an unreadable host never holds it"
 
 
+def _move_spill(monkeypatch, picked):
+    """checkspill with one spill host whose pick hands out a claim on it (None: no free host), each pick's
+    `off` and why recorded in `picked`."""
+    from ttp import checkspill
+    monkeypatch.setattr(checkspill, "hosts", lambda cfg: ["spillhost"])
+
+    def pick(p, cfg, tell, what="", off="", why_here=""):
+        picked.append((off, why_here))
+        return checkspill.Claim("spillhost", None) if picked[0] != "none" else None
+    monkeypatch.setattr(checkspill, "pick", pick)
+
+
+def test_push_checks_on_an_overloaded_default_check_host_move_to_a_free_spill_host(env, monkeypatch):
+    """#8232: push checks that took delivery.checks_host as their default, on a host that stays overloaded
+    past checks.push_load_wait_s, go to a spill host with free cores (checkspill.pick, the overloaded host
+    kept off) instead of starting anyway; the run holds that host's claim and never starts on the
+    overloaded one. A check whose own "host" names it keeps waiting there."""
+    from ttp import push
+    p = make(env)
+    monkeypatch.setattr(push, "check_slot", lambda *a, **k: pytest.fail("no local checks slot"))
+    monkeypatch.setenv("TTP_CHECKS_PUSH_LOAD_WAIT_S", "0")
+    _remote_load(monkeypatch, {"checkhost": [(90.0, 64)]})
+    picked = []
+    _move_spill(monkeypatch, picked)
+    run = push.with_host(push.check_list(["pytest -n 16 tests"]), "checkhost")
+    told = []
+    slot = push.run_slot(run, "abc", told.append, proj=p)
+    assert slot.spill is not None and slot.spill.host == "spillhost" and slot.f is None
+    assert push.remote_host(run[0]) == "spillhost" and str(run[0]) == "pytest -n 16 tests"
+    assert picked and picked[0][0] == "checkhost:fail" and "checkhost stayed overloaded" in picked[0][1]
+    assert any("moved to spill host spillhost" in t for t in told), told
+    assert not any("anyway" in t for t in told), told
+    # Its own "host" stays its own: it waits until the load drops, never moving and never starting before.
+    _remote_load(monkeypatch, {"checkhost": [(90.0, 64)] * 8 + [(20.0, 64)]})
+    picked.clear()
+    run = push.check_list([{"run": "pytest -n 16 tests", "host": "checkhost"}])
+    slot = push.run_slot(run, "abc", told.append, proj=p)
+    assert slot.spill is None and push.remote_host(run[0]) == "checkhost" and picked == []
+
+
+def test_push_checks_wait_when_no_spill_host_is_free_and_never_start_on_the_overloaded_host(env, monkeypatch):
+    """#8232: with no spill host free (pick finds none), checks on an overloaded default check host keep
+    waiting there, trying again each wait, and start only once its load drops: never anyway."""
+    from ttp import push, remoteload
+    p = make(env)
+    monkeypatch.setattr(push, "check_slot", lambda *a, **k: pytest.fail("no local checks slot"))
+    monkeypatch.setenv("TTP_CHECKS_PUSH_LOAD_WAIT_S", "0")
+    reads = [(90.0, 64)] * 10 + [(20.0, 64)]
+    _remote_load(monkeypatch, {"checkhost": reads})
+    picked = ["none"]
+    _move_spill(monkeypatch, picked)
+    run = push.with_host(push.check_list(["pytest -n 16 tests"]), "checkhost")
+    told = []
+    slot = push.run_slot(run, "abc", told.append, proj=p)
+    assert slot.spill is None and push.remote_host(run[0]) == "checkhost" and len(picked) > 1
+    assert reads == [(20.0, 64)], "it started only once the load dropped"
+    assert not any("anyway" in t for t in told), told
+
+
+def test_ttp_checks_on_an_overloaded_default_check_host_move_to_a_free_spill_host(env, monkeypatch, tmp_path):
+    """#8232: `ttp checks` whose checks took an overloaded delivery.checks_host as default move them to a free
+    spill host past the wait: the caller's list is rewritten in place and the slot holds the spill claim; a
+    light check there that may not spill (git diff --check) runs here instead of waiting for that host."""
+    import io
+    from ttp import checkcap, cli, push
+    p = make(env)
+    monkeypatch.setattr(checkcap, "acquire", lambda *a, **k: pytest.fail("no local checks slot"))
+    monkeypatch.setenv("TTP_CHECKS_PUSH_LOAD_WAIT_S", "0")
+    _remote_load(monkeypatch, {"checkhost": [(90.0, 64)]})
+    _move_spill(monkeypatch, [])
+    out = io.StringIO()
+    cmds = push.with_host(push.check_list(["pytest -n 16 tests", "git diff --check"]), "checkhost")
+    slot = cli._checks_slot(p, tmp_path, out, "a" * 40, cmds=cmds, top=str(p.root))
+    assert slot.spill is not None and slot.spill.host == "spillhost"
+    assert [push.remote_host(c) for c in cmds] == ["spillhost", ""], "a light check that cannot spill runs here"
+    assert "moved to spill host spillhost" in out.getvalue() and "running now" not in out.getvalue()
+
+
+def test_a_timing_failure_on_an_overloaded_check_host_is_a_host_fault_not_the_changes(monkeypatch, capsys):
+    """#8232: a remote check that fails with a timing-sensitive test's failure (a timeout, an elapsed-time
+    assert) while its host is overloaded is an environment fault of the host (FAULT_RC), so it runs again
+    elsewhere or later; any other failure, or one on a host with free cores, stays the change's."""
+    from ttp import remotecheck
+    _remote_load(monkeypatch, {"busy": [(90.0, 64)], "free": [(10.0, 64)], "gone": [None]})
+    assert remotecheck.TIMING.search("E   subprocess.TimeoutExpired: Command 'x' timed out after 5 seconds")
+    assert remotecheck.TIMING.search("E   assert elapsed < 2.0")
+    assert not remotecheck.TIMING.search("E   assert 1 == 2")
+    assert remotecheck.judged("busy", 1, True) == remotecheck.FAULT_RC
+    assert "environment fault" in capsys.readouterr().out
+    assert remotecheck.judged("busy", 1, False) == 1
+    assert remotecheck.judged("free", 1, True) == 1
+    assert remotecheck.judged("gone", 1, True) == 1
+    assert remotecheck.judged("busy", 0, True) == 0
+
+
 def test_remote_checks_started_just_now_count_as_load_so_parallel_starts_never_pile_on_one_host(env, monkeypatch):
     """#8016: the 1-minute load shows none of the runs started there in the last minute, so each start from
     this machine is recorded and counts one run's cores (checklane.run_cores) until it shows: a host at 3 of

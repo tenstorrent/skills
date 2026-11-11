@@ -51,6 +51,10 @@ from typing import Any
 from . import sshagent, tailnet
 
 FAULT_RC = 75
+# A failure line of a timing-sensitive test (a timeout, a deadline, an elapsed-time assert): such a failure on
+# a host whose CPU demand is near its cores at the end of the run is the host's load, not the change (_fault).
+TIMING = re.compile(r"Timeout(Error|Expired)?\b|timed out|took too long|too slow|deadline exceeded|\belapsed\b",
+                    re.I)
 ENV_DIR = ".git/ttp-env"   # the pinned Python env's maker and lock in the run folder (runnerenv.remote_lines)
 SHIP_DIR = ".git/ttp-py"   # where shipped Python files go in the run folder: never in the tree the check sees
 NO_ENV = "no-env"     # ... and when the pinned Python env cannot be made there (runnerenv.remote_lines): a host fault
@@ -221,6 +225,25 @@ def wrap_fault(text: str) -> tuple[str, str]:
         if sep and why.startswith("the spill wrapper ") and WRAP_SETTING in why:
             found = (host, why.partition(", so the check")[0].partition(" (exit ")[0])
     return found
+
+
+def overloaded(host: str) -> str:
+    """Why `host` is overloaded now (a fresh remoteload reading: demand at or above remoteload.factor() x its
+    cores), or "": not, unreadable, or the load guard off."""
+    from . import remoteload
+    if not (f := remoteload.factor()) or (r := remoteload.reading(host, fresh=True)) is None or r[0] < f * r[1]:
+        return ""
+    return f"its CPU was overloaded (runnable demand {r[0]:.1f} cores, near its {r[1]} cores)"
+
+
+def judged(host: str, rc: int, timing: bool) -> int:
+    """The check's exit `rc` on `host`, or FAULT_RC (an environment fault: the host, not the change) when it
+    failed with a timing-sensitive test's failure in its output (`timing`: TIMING) while `host` is
+    overloaded at its end (overloaded): load alone fails such tests, so the run goes again elsewhere or
+    once the host's load drops, never failing the change."""
+    if rc in (0, 143) or not timing or not (why := overloaded(host)):
+        return rc
+    return _fault(host, f"timing-sensitive tests failed while {why}: load alone fails them")
 
 
 def _fault(host: str, why: str) -> int:
@@ -774,11 +797,12 @@ def _attempt(host, top, head, env, extra, cmd, mark, wrap, wait) -> tuple[int, s
         # stdin stays open and unwritten: its end on the host (we stopped, died or lost ssh) stops the command.
         proc = subprocess.Popen(_ssh(host, script, direct), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT)
-        rc, held, no_wrap, refused, wrap_refused = None, b"", False, False, False
+        rc, held, no_wrap, refused, wrap_refused, timing = None, b"", False, False, False, False
         out = sys.stdout.buffer
         for raw in iter(proc.stdout.readline, b""):
             text = raw.decode(errors="replace").strip()
             refused = refused or _refused(text)
+            timing = timing or bool(TIMING.search(text))
             if text.startswith(mark) and text[len(mark):].isdigit():
                 rc = int(text[len(mark):])
                 held = b""   # the blank line printed before the marker is ours
@@ -814,7 +838,7 @@ def _attempt(host, top, head, env, extra, cmd, mark, wrap, wait) -> tuple[int, s
         if rc == FAULT_RC:
             _say(f"the command exited {FAULT_RC}; reported as 1, so it does not read as an unreachable host")
             return 1, ""
-        return rc, ""
+        return judged(host, rc, timing), ""
     except _Stop:
         return 143, ""
     finally:
