@@ -148,10 +148,15 @@ def test_bridge_interface_hosts_go_through_the_relay_socket(tmp_path, monkeypatc
     assert bridge.service_argv(_bridge_cfg(), "box-1", "auto", ssh="ssh")[0] == "/bin/sh"   # no relay without one
 
 
-def test_bridge_relay_carries_one_connection_and_exits_with_its_session(tmp_path, monkeypatch):
+def test_bridge_relay_carries_one_connection_and_exits_with_its_session(monkeypatch, request):
+    import shutil
     import socket
+    import tempfile
     import threading
     from ttp import bridge_relay
+    # a short folder: macOS's per-user temp path makes a unix socket path too long
+    tmp_path = Path(tempfile.mkdtemp(prefix="br", dir="/tmp"))
+    request.addfinalizer(lambda: shutil.rmtree(tmp_path, ignore_errors=True))
     assert bridge_relay.parse_spec("h=10.0.0.2%vpn0") == ("h", "10.0.0.2", "vpn0")
     srv = socket.socket()
     srv.bind(("127.0.0.1", 0))
