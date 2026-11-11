@@ -489,7 +489,8 @@ def test_a_chat_pause_without_a_saved_key_starts_no_probe_runs(env, monkeypatch)
     endpoint.save("cloud", "https://other.example.com/v1", _CB_KEY, True, "HTTP 200")
     assert chat.login_state(d.cfg) is False, "the bridge sends the key only to its own URL"
     endpoint.save("cloud", "https://api.example.com/v1", _CB_KEY, True, "HTTP 200")
-    assert chat.login_state(d.cfg) is None
+    monkeypatch.setattr(endpoint, "verify", lambda *a, **k: (False, "cannot reach the endpoint: timed out"))
+    assert chat.login_state(d.cfg) is None   # saved for its URL; the endpoint does not answer
     d.check_logins()   # the saved key changed the store's stamp: the pause ends at once
     assert not d._logged_out("chat")
 

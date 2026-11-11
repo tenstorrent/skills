@@ -94,22 +94,20 @@ class Chat(Claude):
         return False if re.match(r"HTTP (401|403)\b", msg) else None
 
     def login_state(self, cfg: dict | None = None) -> bool | None:
-        # No key saved for the configured alias, or one saved for another URL: the bridge refuses every
-        # run (chatbridge.Bridge.from_settings), so a probe run every AUTH_PROBE_S would only fail
-        # again. False until a key is saved (its stamp then ends the pause); else one run asks the endpoint.
-        from .. import endpoint
-        s = ((cfg or {}).get("providers") or {}).get(self.name)
-        alias = s.get("endpoint") if isinstance(s, dict) else ""
-        if not alias:
+        # The daemon's logged-out breaker reads this, so it runs login_check on the project's own
+        # providers.chat settings: no key saved for the alias, or one saved for another URL (the bridge
+        # refuses every run, chatbridge.Bridge.from_settings), or a key the endpoint refuses is False and
+        # starts no probe run; a key it takes is True. None without an endpoint alias: a run then checks.
+        s = ((cfg or {}).get("providers") or {}).get(self.name) if cfg is not None else self.entry
+        if not isinstance(s, dict) or not s.get("endpoint"):
             return None
+        prev, self.entry = self.entry, dict(s)
         try:
-            got = endpoint.credentials(alias)
-            if not got:
-                return False
-            url = s.get("base_url") or ""
-            return None if not url or endpoint.base_url(url) == endpoint.base_url(got[1]) else False
-        except Exception:   # an unreadable store or a bad URL: a run reports it
+            return self.login_check()
+        except Exception:   # a bad URL or setting: a run reports it
             return None
+        finally:
+            self.entry = prev
 
     def resolved_session(self, argv, cwd, env=None):
         # The bridge sends every request to the model the run was built with (start_run passes the

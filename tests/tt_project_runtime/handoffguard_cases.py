@@ -234,10 +234,11 @@ def test_only_a_branchless_code_worker_run_gets_the_no_branch_flag(env, monkeypa
 # Providers without a Stop hook (Codex; the fake agent here): a run that ends without a valid hand-off
 # continues its session once to write it (Daemon._handoff_resume), instead of a counted attempt and a cold rerun.
 
-def _no_handoff_run(env, p, d, monkeypatch, result="none"):
+def _no_handoff_run(env, p, d, monkeypatch, result="none", title="build it"):
+    # Several runs in one project take numbered titles: a repeated title is held at dispatch (supersede.py).
     monkeypatch.setenv("TTP_FAKE_SESSION", "s1")
     monkeypatch.setenv("TTP_FAKE_RESULT", result)
-    tid = p.db.add_task("build it", "build the thing", kind="work", tier="light", origin="user")
+    tid = p.db.add_task(title, "build the thing", kind="work", tier="light", origin="user")
     d.dispatch()
     _finish_runs(p, d)
     return p.db.task(tid)
@@ -297,7 +298,7 @@ def test_no_resume_for_a_provider_with_a_stop_hook_an_unsaved_session_or_a_spent
     assert Claude.stop_hook and not Fake.stop_hook
     p = make(env)
     d = Daemon(p.base)
-    for case in ("stop_hook", "unsaved", "budget"):
+    for n, case in enumerate(("stop_hook", "unsaved", "budget"), 1):
         with monkeypatch.context() as m:
             if case != "unsaved":
                 _sessions(env, m, "s1")
@@ -305,7 +306,7 @@ def test_no_resume_for_a_provider_with_a_stop_hook_an_unsaved_session_or_a_spent
                 m.setattr(Fake, "stop_hook", True, raising=False)
             if case == "budget":
                 m.setenv("TTP_FAKE_COST", "50")
-            t = _no_handoff_run(env, p, d, m)
+            t = _no_handoff_run(env, p, d, m, title=f"build it {n}")
         res = load_result(t["result"])
         assert HANDOFF_RESUME_KEY not in res and t["attempts"] == 1, (case, dict(t))
         assert res.get("run_status") == "no_handoff" or "without a hand-off" in res["summary"], (case, res)
@@ -352,14 +353,14 @@ WAITS_ONLY = {"status": "done", "summary": "built", "followups": [
 def test_a_bad_then_or_a_waits_only_follow_up_resumes_the_session_once_without_a_stop_hook(env, monkeypatch, tmp_path):
     from ttp.daemon import Daemon, HANDOFF_RESUME_KEY
     from ttp.hook import handoff_problem
-    for bad, said in ((BAD_THEN, "`then` must be a non-empty list"), (WAITS_ONLY, "only waits")):
+    for n, (bad, said) in enumerate(((BAD_THEN, "`then` must be a non-empty list"), (WAITS_ONLY, "only waits")), 1):
         (tmp_path / "result.json").write_text(json.dumps(bad))
         why = handoff_problem(tmp_path / "result.json")
         assert why and said in why, why
         p = make(env)
         _sessions(env, monkeypatch, "s1")
         d = Daemon(p.base)
-        t = _no_handoff_run(env, p, d, monkeypatch, result=json.dumps(bad))
+        t = _no_handoff_run(env, p, d, monkeypatch, result=json.dumps(bad), title=f"build it {n}")
         res = load_result(t["result"])
         # Not taken: no stored `then`, no follow-up task, no attempt; told the Stop hook's own text.
         assert t["status"] == "queued" and t["attempts"] == 0, (said, dict(t))
