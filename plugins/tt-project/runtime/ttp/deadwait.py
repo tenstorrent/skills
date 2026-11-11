@@ -55,9 +55,10 @@ def names(tasks: list[dict], cap: int = 8) -> str:
     return s + (f" and {len(tasks) - cap} more" if len(tasks) > cap else "")
 
 
-def raise_nofix(db, review: dict, why: str, branch: str) -> int | None:
+def raise_nofix(db, review: dict, why: str, branch: str, unlanded: list[str] | None = None) -> int | None:
     """One `review_nofix` event for failed review `review` (none when one exists): the coordinator
-    queues the fix and re-review itself, re-plans, or cancels what waits."""
+    queues the fix and re-review itself, re-plans, or cancels what waits. `unlanded` names approved
+    heads left unlanded (reviewreuse.unlanded)."""
     fp = f"{NOFIX_EVENT}:{review['id']}"
     if db.one("SELECT id FROM events WHERE fingerprint=?", (fp,)):
         return None
@@ -65,11 +66,13 @@ def raise_nofix(db, review: dict, why: str, branch: str) -> int | None:
     held = waiters(db, code | {review["id"]})
     text = (f"Review #{review['id']} {review['title']} failed and the daemon queued no fix or re-review: {why}. "
             f"Branch: {branch or 'none found'}. Waiting on it or its change: {names(held)}. Decide: queue the fix "
-            f"(continues the reviewed task) and its re-review, re-plan the change, or re-point or cancel what waits.")
+            f"(continues the reviewed task) and its re-review, re-plan the change, or re-point or cancel what waits."
+            + (f" Approved but not landed: {'; '.join(unlanded)}." if unlanded else ""))
     return db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,data,status,task) "
                 "VALUES(?,?,?,?,?,?,?,?,?)",
                 (time.time(), f"task:{review['id']}", NOFIX_EVENT, fp, "normal", text,
-                 json.dumps({"why": why, "branch": branch, "held": [t["id"] for t in held]}), "queued",
+                 json.dumps({"why": why, "branch": branch, "held": [t["id"] for t in held],
+                            **({"unlanded": unlanded} if unlanded else {})}), "queued",
                  review["id"]))
 
 

@@ -19542,10 +19542,13 @@ class Daemon:
         records the head and check set it starts on, so a later review of that head can reuse it; a
         review forced past an accepted one runs, as does a review of an external change (extchange). A head
         a review already failed with a finding keeps that verdict: closed failed with no run and no fix
-        round, and one review_nofix event (reviewreuse.judged, carry). False whenever it runs."""
+        round, and one review_nofix event naming any approved push of it left unlanded (reviewreuse.judged,
+        carry, unlanded). A push-conflict rebase (pushq.rebase_head) always runs. False whenever it runs."""
         db = self.p.db
         if extchange.heads(push._labels(task)):
             return False   # its change lives in another repository: the project's git holds no head of it
+        if pushq.rebase_head(task):
+            return False   # a push-conflict rebase makes the new head: it runs whatever its old head's verdict
         try:
             sha = worktree.reviewed_head(self.p, task)
         except Exception as e:
@@ -19568,7 +19571,7 @@ class Daemon:
         if failed:   # the unchanged head keeps its failed verdict: no run, and the coordinator decides
             with db.tx():
                 why = reviewreuse.carry(db, task, failed, sha, key)
-                deadwait.raise_nofix(db, db.task(task["id"]), why, "")
+                deadwait.raise_nofix(db, db.task(task["id"]), why, "", reviewreuse.unlanded(db, sha))
             log(self.p, f"review {task['id']}: kept review #{failed['id']}'s failed verdict on {sha[:12]}; no run")
             return True
         if not prior:

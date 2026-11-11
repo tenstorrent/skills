@@ -2392,8 +2392,11 @@ def _settle(p: Project, tid: int, b: dict, m: dict, now: float) -> None:
             elif held:
                 text += f"; rebase task #{held} is still open for it, so no second one was queued"
             db.update_task(tid, status="failed", blocked_reason=None, result=dump_result(
-                {**prev, "status": "failed", "summary": text[:1500], **({"auto_rebase": rebase or held}
-                                                                        if rebase or held else {})}))
+                {**prev, "status": "failed", "summary": text[:1500],
+                 # a push conflict, not a verdict: the unchanged-head rule never keeps it (reviewreuse.judged)
+                 "push_conflict": {"branch": r["branch"] or "", "head": str(r["head"] or ""),
+                                   "files": [str(f) for f in (d.get("files") or [])[:20]]},
+                 **({"auto_rebase": rebase or held} if rebase or held else {})}))
             # With a rebase queued, nothing is the coordinator's to decide yet: its own failure is.
             _event(db, task, "task_failed", f"#{tid} {task['title']} → failed: {text}", queued=not (rebase or held))
             if not rebase:

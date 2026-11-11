@@ -24176,6 +24176,97 @@ def test_a_review_of_a_head_already_failed_keeps_that_verdict_with_no_run_and_no
     assert started == [first, forced["id"]], "a forced review runs"
 
 
+def _push_conflicted_review(p, tid, d, head):
+    """A first review of `head` that approved it, then failed by the push queue for a push conflict
+    (its reviewer's follow-ups kept, as pushq's conflict path does)."""
+    first = _reuse_review(p, tid)
+    d.dispatch()
+    p.db.update_task(first, status="failed", result=json.dumps(
+        {"status": "failed", "summary": f"push conflict: b at {head[:12]} conflicts with relay/x in a.py",
+         "followups": [{"title": "tidy the docstring", "spec": "x"}],
+         "push_conflict": {"branch": "b", "head": head, "files": ["a.py"]}}))
+    return first
+
+
+def test_a_push_conflict_rebase_task_runs_even_on_a_head_an_earlier_review_failed(env, monkeypatch):
+    """Cell rebase_not_short_circuited: a push-conflict rebase review (pushq.REBASE_LABEL) makes the new
+    head, so the unchanged-head rule (user msg #2495) never closes it at dispatch, even when an earlier
+    review of that head failed with a finding."""
+    from ttp import deadwait, pushq
+    p = make(env)
+    tid, path, branch = _code_task(p, "make it")
+    _commit_file(path, "a")
+    head = _git_out(path, "rev-parse", "HEAD")
+    d, started = _reuse_daemon(p, monkeypatch)
+    first = _reuse_review(p, tid)
+    d.dispatch()
+    p.db.update_task(first, status="failed", result=json.dumps(
+        {"status": "changes_needed", "summary": "the loop never ends", "followups": [{"title": "fix", "spec": "x"}]}))
+    rebase = _reuse_review(p, tid, f"Rebase {branch} onto relay/x after push conflicts (review #{first})")
+    p.db.update_task(rebase, labels=json.dumps([f"continues:{first}", f"{pushq.REBASE_LABEL}{head}"]))
+    d.dispatch()
+    assert started == [first, rebase], "the rebase task runs"
+    assert p.db.task(rebase)["status"] != "failed"
+    assert not p.db.q("SELECT id FROM events WHERE kind=?", (deadwait.NOFIX_EVENT,))
+
+
+def test_a_review_failed_only_by_a_push_conflict_is_not_a_failed_verdict(env, monkeypatch):
+    """Cell push_conflict_not_a_verdict: a review that approved a head and was failed only by a push
+    conflict is no failed verdict for the unchanged-head rule: a later review of that head runs, and
+    task_add does not refuse one. Older records (auto_rebase, a 'push conflict:' summary) count too."""
+    from ttp import coordinator as coord, reviewreuse
+    p = make(env)
+    tid, path, branch = _code_task(p, "make it")
+    _commit_file(path, "a")
+    head = _git_out(path, "rev-parse", "HEAD")
+    d, started = _reuse_daemon(p, monkeypatch)
+    key = reviewreuse.check_key(d.cfg)
+    first = _push_conflicted_review(p, tid, d, head)
+    assert reviewreuse.judged(p.db, head, key) is None
+    p.db.update_task(first, result=json.dumps({"status": "failed", "summary": "it keeps conflicting",
+                                               "followups": [{"title": "t", "spec": "x"}], "auto_rebase": 99}))
+    assert reviewreuse.judged(p.db, head, key) is None, "an older conflict record with auto_rebase"
+    add = {"type": "task_add", "title": f"Review #{tid} once more", "kind": "review", "spec": "check it",
+           "depends_on": [tid]}
+    assert coord.apply(p, [add]) == []
+    again = p.db.one("SELECT id FROM tasks WHERE title=?", (add["title"],))["id"]
+    p.db.update_task(again, provider="claude")
+    d.dispatch()
+    assert started == [first, again], "the head's review runs"
+    p.db.update_task(first, result=json.dumps({"status": "changes_needed", "summary": "the loop never ends",
+                                               "followups": [{"title": "fix", "spec": "x"}]}))
+    assert reviewreuse.judged(p.db, head, key)["id"] == first, "a real verdict still counts"
+
+
+def test_a_kept_failed_verdict_raises_one_event_naming_the_task_and_an_unlanded_approved_head(env, monkeypatch):
+    """Cell short_circuit_event: when the unchanged-head rule closes a review, the coordinator gets one
+    review_nofix event naming that review and each approved push of the head left unlanded."""
+    from ttp import deadwait
+    p = make(env)
+    tid, path, branch = _code_task(p, "make it")
+    _commit_file(path, "a")
+    head = _git_out(path, "rev-parse", "HEAD")
+    d, started = _reuse_daemon(p, monkeypatch)
+    first = _reuse_review(p, tid)
+    d.dispatch()
+    p.db.update_task(first, status="failed", result=json.dumps(
+        {"status": "changes_needed", "summary": "the loop never ends", "followups": [{"title": "fix", "spec": "x"}]}))
+    p.db.x("INSERT INTO push_queue(task,branch,head,target,status,created,updated) VALUES(?,?,?,?,?,?,?)",
+           (first, branch, head, "relay/x", "conflict", time.time(), time.time()))
+    again = _reuse_review(p, tid, "Review it again")
+    d.dispatch()
+    assert started == [first] and p.db.task(again)["status"] == "failed"
+    ev = p.db.q("SELECT * FROM events WHERE kind=?", (deadwait.NOFIX_EVENT,))
+    assert [e["task"] for e in ev] == [again]
+    assert f"Review #{again}" in ev[0]["text"]
+    assert f"{branch} at {head[:12]}, approved by review #{first}, push queue: conflict" in ev[0]["text"]
+    assert json.loads(ev[0]["data"])["unlanded"] == [f"{branch} at {head[:12]}, approved by review #{first}, "
+                                                     f"push queue: conflict"]
+    p.db.x("UPDATE push_queue SET status='landed'")
+    from ttp import reviewreuse
+    assert reviewreuse.unlanded(p.db, head) == [], "a landed push leaves nothing unlanded"
+
+
 def test_a_task_add_whose_git_check_times_out_is_deferred_never_rejected(env, monkeypatch):
     """A task_add continuing a task with a branch is applied under a spent git deadline, or deferred and
     applied on the next tick (actdefer.retry), never rejected for the timeout; a malformed branch is

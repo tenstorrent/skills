@@ -150,10 +150,35 @@ def judged(db, sha: str, key: str, skip: int | None = None) -> dict | None:
     for r in db.q("SELECT * FROM tasks WHERE kind='review' AND status='failed' AND labels LIKE ? ORDER BY id DESC",
                   (f'%"{head_label(sha, key)}"%',)):
         res = _result(r)
+        if conflicted(res):
+            continue   # its approval stood and only the push conflicted: no verdict to keep
         if r["id"] != skip and not unjudged(r) and (res.get("followups") or res.get("status") == "changes_needed"
                                                      or res.get("reused_review")):
             return r
     return None
+
+
+def conflicted(res: dict) -> bool:
+    """A review result the push queue failed only for a push conflict (pushq marks it `push_conflict`;
+    older ones carry `auto_rebase` or a 'push conflict:' summary): the reviewer approved the head."""
+    return bool(res.get("push_conflict") or res.get("auto_rebase")
+                or str(res.get("summary") or "").startswith("push conflict:"))
+
+
+def unlanded(db, sha: str) -> list[str]:
+    """Each approved push of `sha` left unlanded ('<branch> at <sha12>, approved by review #N, push
+    queue: <status>'), none when one of them pushed or landed. Database reads only."""
+    if not sha:
+        return []
+    rows = [r for r in db.q("SELECT task, branch, head, status FROM push_queue WHERE head LIKE ? ORDER BY id",
+                            (f"{sha[:12]}%",)) if sha.startswith(str(r["head"])) or str(r["head"]).startswith(sha)]
+    if any(r["status"] in ("pushed", "landed") for r in rows):
+        return []
+    last = {}
+    for r in rows:
+        last[r["task"]] = r
+    return [f"{r['branch'] or '?'} at {sha[:12]}, approved by review #{r['task']}, push queue: {r['status']}"
+            for r in last.values()]
 
 
 def carry(db, review: dict, prior: dict, sha: str, key: str) -> str:
