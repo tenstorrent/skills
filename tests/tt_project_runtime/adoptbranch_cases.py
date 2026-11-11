@@ -72,7 +72,8 @@ def test_adopt_branch_refuses_a_running_task_an_unrelated_owner_a_foreign_head_o
     p.db.update_task(tid, status="running")
     refused(shared, "is running")
     p.db.update_task(tid, status="done", result=json.dumps({"head": head}))
-    user = p.db.add_task("follow-up", f"Builds on #{tid}.", kind="code", tier="light", origin="user")
+    user = p.db.add_task("follow-up", f"Builds on #{tid}.", kind="code", tier="light", origin="user",
+                         labels=[f"continues:{tid}"])
     p.db.update_task(user, status="running")
     refused(shared, f"task {user} is running")
     p.db.update_task(user, status="cancelled")
@@ -91,3 +92,25 @@ def test_adopt_branch_refuses_a_running_task_an_unrelated_owner_a_foreign_head_o
     p.db.update_task(code, branch=None)
     refused("foreign", "neither task")
     assert not p.db.one("SELECT 1 FROM events WHERE kind='branch_adopted'")
+
+
+def test_adopt_branch_is_not_refused_by_a_running_task_that_only_mentions_the_task(env):
+    """A running task blocks adopt-branch only when it really works on that branch (it is recorded on it,
+    delivers onto it with pr_branch:, or continues the task); one whose spec only names the task does not."""
+    p = make(env)
+    from ttp import worktree
+    code, shared, rev, tid = _ab_chain(p, worktree)
+    path, own = worktree.ensure(p, p.db.task(tid))
+    _git_out(path, "checkout", "-q", shared)
+    head = _commit_file_in(path, "fix.txt")
+    p.db.update_task(tid, status="done", result=json.dumps({"head": head}))
+    onto = p.db.add_task("fix on it", f"pr_branch: {shared}\nFix it.", kind="code", tier="light", origin="user",
+                         labels=[f"pr_branch:{shared}"])
+    p.db.update_task(onto, status="running")
+    with pytest.raises(ValueError, match=f"task {onto} is running and works on"):
+        worktree.adopt_branch(p, tid, shared)
+    p.db.update_task(onto, status="cancelled")
+    note = p.db.add_task("adopt it", f"Run `ttp task adopt-branch {tid} {shared}`; task {tid} and #{tid}.",
+                         kind="work", tier="light", origin="coordinator")
+    p.db.update_task(note, status="running")
+    assert worktree.adopt_branch(p, tid, shared, "saved work") and p.db.task(tid)["branch"] == shared

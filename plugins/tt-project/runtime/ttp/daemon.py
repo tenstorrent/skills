@@ -12560,6 +12560,8 @@ class Daemon:
                     note["batch"] = {"id": f"b{task['id']}", "members": [m["id"] for m in members]}
                     prompt += batchrun.prompt_block(self.p, task, members, branch)
                     remaining = batchrun.budget(self.cfg, task, remaining, members)
+                # Never clear a branch on record: a root git cannot read now still keeps the task's branch.
+                branch = branch or (task.get("branch") if worktree.own_worktree(task) else None)
                 db.update_task(task["id"], status="running", branch=branch, blocked_reason=None)
                 run_id = self.start_run("worker" if task["kind"] != "review" else "reviewer", prompt, run_prov, tier, cwd,
                                         task=task, budget_usd=max(remaining, 0.5) if task["budget_usd"] or members
@@ -19151,10 +19153,10 @@ class Daemon:
         if landed.abandoned(db, task["id"]):
             log(self.p, f"task {task['id']}: no review queued, its work is abandoned (ttp task abandon)")
             return None
-        branch = task.get("branch")
         try:
             self._fold_split_review(task)
-            ext = self._external_change(task)
+            ext = self._external_change(task)   # may record a lost branch found in the project's own git
+            branch = task.get("branch")
             if ext and branch and worktree.diff_lines(self.p, [branch]):
                 ext = None   # a change in the project's own git is reviewed there, as before
             for t in db.q("SELECT * FROM tasks WHERE kind='review' AND status NOT IN ('done','failed','cancelled')"):
@@ -19455,6 +19457,14 @@ class Daemon:
         field = extchange.FIELD
         if ch is None and not why and not task.get("branch") and not prguard.task_pr(task):
             (ch, why), field = extchange.top_level(res), "branch` + `head"
+            if ch and not ch.get("repo") and (own := worktree.local_change(self.p, ch)):
+                # In the project's own git (its branch record was lost): reviewed and pushed here, as any change.
+                if task.get("id") and (cur := self.p.db.task(task["id"])) and not cur.get("branch"):
+                    self.p.db.update_task(task["id"], branch=own)
+                    log(self.p, f"task {task['id']}: its hand-off's branch {own} is in the project's own git; "
+                                f"recorded it as the task's branch, not an external change")
+                task["branch"] = own
+                return None
         if why:
             log(self.p, f"task {task['id']}: hand-off `{field}` ignored: {why}")
         return ch
@@ -20922,6 +20932,9 @@ class Daemon:
                 return str(self.p.root), None
         # A task carrying a branch (pr_branch:) works on it in a worktree, whatever its kind.
         carries = worktree.carried_branch(task) and task["kind"] not in worktree.NEVER_OWN_KINDS
+        if (worktree.gets_worktree(self.p, task["kind"]) or carries) and worktree.unbare_root(self.p):
+            log(self.p, f"task {task['id']}: the project root's .git said core.bare=true, so git saw no work "
+                        f"tree there; set it back to false (undo: git config core.bare true)")
         if (worktree.gets_worktree(self.p, task["kind"]) or carries) and worktree.is_git(self.p.root):
             self.guard_root_head()   # never a worktree branched from a HEAD a task moved the root to
             path, branch = worktree.ensure(self.p, task)

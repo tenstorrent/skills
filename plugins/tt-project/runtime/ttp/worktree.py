@@ -47,6 +47,38 @@ def is_git(path: Path) -> bool:
         return False
 
 
+def unbare_root(p: Project) -> bool:
+    """Heal a project root whose own .git directory says `core.bare = true` (written by something outside
+    the harness): git then sees no work tree there, is_git is False, and code tasks would start in the root
+    with no worktree and lose their branch record. Sets it back to false; True when it healed the root."""
+    root = Path(p.root)
+    try:
+        if not (root / ".git").is_dir() or is_git(root) \
+                or _git(root, "config", "--local", "--get", "core.bare", check=False) != "true":
+            return False
+        _git(root, "config", "--local", "core.bare", "false")
+    except (RuntimeError, OSError, subprocess.SubprocessError):
+        return False
+    return is_git(root)
+
+
+def local_change(p: Project, ch: dict) -> str:
+    """The local branch of the project's own git holding change `ch` ({"branch", "head"}, as a hand-off's
+    top-level fields name it): its branch when that is a local branch and its head is a commit here, else
+    a local branch containing that head (one of the task's own first), else "" (not in this project's git)."""
+    root, head, name = Path(p.root), (ch.get("head") or "").strip(), (ch.get("branch") or "").strip()
+    try:
+        if not head or not _git(root, "rev-parse", "--verify", "--quiet", f"{head}^{{commit}}", check=False):
+            return ""
+        if name and _git(root, "rev-parse", "--verify", "--quiet", f"refs/heads/{name}", check=False):
+            return name
+        have = _git(root, "for-each-ref", "--contains", head, "--format=%(refname:short)", "refs/heads/",
+                    check=False).splitlines()
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return next((b for b in have if b == name), next(iter(have), ""))
+
+
 def git_dirs(path: Path) -> list[str]:
     """The git metadata a commit in `path` writes: the worktree's own gitdir (its index, HEAD and
     locks, under <common>/worktrees/<name>) and the shared .git directory, in that order, without
@@ -294,11 +326,38 @@ def _owns(p: Project, task: dict, name: str) -> bool:
     return any(name.startswith(f"ttp/t{i}-") or t["branch"] == name for i, t in lineage(p, task).items())
 
 
+def works_on(p: Project, task: dict, name: str, live: list[dict]):
+    """The running tasks in `live` that really work on task's branch (its recorded one or `name`): one
+    recorded on or delivering onto (pr_branch) it, one whose lineage (continues chain, reviewed task)
+    holds the task, or one whose run works in a worktree of that branch or the task's own. A task whose
+    spec only mentions the task or its branch does not (unlike needers)."""
+    branches = {b for b in (task.get("branch"), name) if b}
+    paths = {str(p.worktrees / f"t{task['id']}")}
+    try:
+        paths |= {r["path"] for r in _records(p).values() if r["branch"] in branches}
+    except (RuntimeError, OSError, subprocess.SubprocessError):
+        pass
+    for t in live:
+        if t["id"] == task["id"]:
+            continue
+        if t.get("branch") in branches or carried_branch(t) in branches or task["id"] in lineage(p, t):
+            yield t
+            continue
+        for r in p.db.q("SELECT dir FROM runs WHERE task=? AND status='running'", (t["id"],)):
+            try:
+                cwd = json.loads((Path(r["dir"] or "") / "run.json").read_text()).get("cwd")
+            except (OSError, ValueError, AttributeError):
+                continue
+            if cwd and any(cwd == q or cwd.startswith(q.rstrip("/") + "/") for q in paths):
+                yield t
+                break
+
+
 def adopt_branch(p: Project, tid: int, name: str, why: str = "") -> str:
     """Bind task `tid` to branch `name`, a reviewed branch its saved work is on, with a
     `branch_adopted` event. Only the task's branch changes: no checkout, delete or rename; the
     delivery target, continues link, holds and checks stay. Raises ValueError, touching nothing, when
-    the task is running or used by a running task or a pending push, the branch is missing, checked
+    the task is running, a running task works on its branch (works_on) or a push is pending, the branch is missing, checked
     out with uncommitted changes, held by an open task outside the lineage, or its head is neither
     the saved result's head nor built on a lineage branch."""
     from .db import TERMINAL_TASK_STATES, load_result
@@ -310,9 +369,10 @@ def adopt_branch(p: Project, tid: int, name: str, why: str = "") -> str:
     if task["status"] == "running" or p.db.one("SELECT 1 FROM runs WHERE task=? AND status='running'", (tid,)):
         raise ValueError(f"task {tid} is running; adopt the branch once its run ends")
     live = p.db.q("SELECT * FROM tasks WHERE status='running'")
-    user = next(needers(task, live), None)
+    user = next(works_on(p, task, name, live), None)
     if user:
-        raise ValueError(f"task {user['id']} is running and uses task {tid}; adopt the branch once it ends")
+        raise ValueError(f"task {user['id']} is running and works on task {tid}'s branch; "
+                         f"adopt the branch once it ends")
     if p.db.one("SELECT 1 FROM push_queue WHERE task=? AND status IN ('approved','held','batched')", (tid,)):
         raise ValueError(f"task {tid} has a push pending; adopt the branch once it lands or is dropped")
     t = git_timeout(p)

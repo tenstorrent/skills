@@ -179,6 +179,46 @@ def test_a_branchless_hand_off_s_top_level_branch_and_head_queue_exactly_one_rev
 
 
 
+def test_a_hand_off_s_branch_in_the_project_s_own_git_is_no_external_change_and_is_recorded(env):
+    """A code task whose branch record was lost names its branch and head at the top level of its
+    hand-off: both are in the project's own git, so its review is a normal one (pushable, no no_push or
+    'not in this project's git' wording) and the branch is recorded on the task again."""
+    from ttp.daemon import Daemon
+    from ttp import extchange, worktree
+    p = make(env)
+    tid = p.db.add_task("lost its branch", "spec", kind="code", origin="coordinator")
+    path, own = worktree.ensure(p, p.db.task(tid))
+    head = _commit_file_in(path, "fix.txt")
+    p.db.update_task(tid, branch=None, status="review", result=json.dumps({
+        "status": "done", "summary": "ok", "branch": own, "head": head}))
+    _ran(p, tid, time.time() - 1900)
+    d = Daemon(p.base)
+    assert d._external_change(p.db.task(tid)) is None and p.db.task(tid)["branch"] == own
+    p.db.update_task(tid, branch=None)
+    _sweep(d)
+    (rev,) = _daemon_reviews(p, tid)
+    assert extchange.NO_PUSH_LINE not in rev["spec"] and extchange.REVIEW_ONLY not in rev["spec"]
+    assert "not in this project's git" not in rev["spec"] and "external repository" not in rev["spec"]
+    assert f"branch {own}" in rev["spec"] and p.db.task(tid)["branch"] == own
+
+
+def test_a_root_git_config_saying_bare_is_healed_and_dispatch_keeps_a_recorded_branch(env):
+    """A project root whose .git says core.bare=true (written outside the harness) made code tasks start in
+    the root with no worktree, and dispatch then cleared their recorded branch: _workdir_for sets it back
+    to false and gives the task its worktree on its branch."""
+    from ttp.daemon import Daemon
+    from ttp import worktree
+    p = make(env)
+    tid = p.db.add_task("keeps its branch", "spec", kind="code", origin="coordinator")
+    path, own = worktree.ensure(p, p.db.task(tid))
+    p.db.update_task(tid, branch=own)
+    _git_out(p.root, "config", "core.bare", "true")
+    assert not worktree.is_git(p.root)
+    assert Daemon(p.base)._workdir_for(p.db.task(tid)) == (str(path), own)
+    assert worktree.is_git(p.root) and _git_out(p.root, "config", "core.bare") == "false"
+    assert "core.bare=true" in (p.logs / "daemon.log").read_text()
+
+
 def test_a_work_task_with_a_branch_commit_gets_one_review_at_hand_off_and_one_without_a_diff_none(env):
     """A done work task whose branch changes anything gets exactly one review at its hand-off, as a code
     task does; one that changes nothing gets none, and the review sweep adds or raises nothing."""
