@@ -82,6 +82,8 @@ MUX_BACKOFF_S = (2, 5)
 # Under the checks' silence limit (checkwall.SILENT_S, 600 s): a copy that stalls is the host's fault
 # (another host or here takes the check), never a silent "hang" blamed on the change.
 SETUP_TIMEOUT_S = 540
+COPY_TIMEOUT_ENV = "TTP_REMOTE_COPY_TIMEOUT_S"   # a shorter copy timeout (_copy_timeout_s), never a longer one
+COPY_TIMEOUT = "copying the tree timed out"   # the fault said when a bulk copy overran or stalled: that host is kept off the rerun (checkspill.SLOW)
 CLEANUP_TIMEOUT_S = 120
 PROBE_TIMEOUT_S = 45
 # After a tree copy timed out (STAGE_TIMED_OUT), the host's fault clears only once a sample copy of
@@ -469,6 +471,14 @@ def main(args: list[str]) -> int:
                         f"{1 + len(MUX_BACKOFF_S)} tries")
 
 
+def _copy_timeout_s() -> float:
+    """SETUP_TIMEOUT_S, or less with COPY_TIMEOUT_ENV (the tests' fake slow host): never more."""
+    try:
+        return min(SETUP_TIMEOUT_S, float(os.environ.get(COPY_TIMEOUT_ENV) or SETUP_TIMEOUT_S))
+    except ValueError:
+        return SETUP_TIMEOUT_S
+
+
 def _refused(text: str | bytes) -> bool:
     return MUX_REFUSED in (text.decode(errors="replace") if isinstance(text, bytes) else text or "")
 
@@ -646,6 +656,8 @@ def _copy(host, source: list[str], script: str, direct: bool, deadline: float, l
         pumper.start()
         why = _watch(proc, lambda: f"{sent[0] / 1e6:.2f} MB sent", label, deadline,
                      _knob("TTP_REMOTE_COPY_STALL_S", STALL_S))
+        if why:   # the link to that host is slow or stalled: its fault names it, and that host is kept off the rerun
+            why = f"{LINK}{COPY_TIMEOUT}: {why[len(LINK):]}"
         if why or proc.returncode:
             src.kill()
         pumper.join(timeout=10)
@@ -784,7 +796,7 @@ def _attempt(host, top, head, env, extra, cmd, mark, wrap, wait) -> tuple[int, s
             mirror = ""
         _say(f"checking {head[:12]} on {host} in {tmp}")
         q = shlex.quote(tmp)
-        deadline = time.monotonic() + _knob("TTP_REMOTE_COPY_LIMIT_S", SETUP_TIMEOUT_S)
+        deadline = time.monotonic() + min(_knob("TTP_REMOTE_COPY_LIMIT_S", SETUP_TIMEOUT_S), _copy_timeout_s())
         tree_copy = _knob("TTP_REMOTE_TREE_COPY", 0) == 1
         copied = False
         if mirror and not bases and (seed := seed_path(host)):   # a new mirror: from the clone there first

@@ -13292,3 +13292,59 @@ def test_a_run_with_neither_a_task_nor_a_push_batch_still_shows_as_having_no_own
         assert "batch" not in w, w
     finally:
         push.close()
+
+
+
+
+def _slot_status(cli, capsys, as_json=True):
+    with pytest.raises(SystemExit) as e:
+        cli.main(["checks", "--slot-status", *(["--json"] if as_json else [])])
+    assert e.value.code == 0
+    out = capsys.readouterr().out
+    return json.loads(out) if as_json else out
+
+
+def test_slot_status_lists_a_spilled_run_with_its_host_and_pid_though_it_holds_no_lane(env, tmp_path, monkeypatch,
+                                                                                       capsys):
+    """cells: slot_status_spilled. A run on a spill host (a push batch or an after-landing run: no lane here) is a
+    live run in slot-status's `runs`, with its host and pid, and in the text; with nothing live it says none."""
+    from ttp import checkspill, cli
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    assert _slot_status(cli, capsys)["runs"] == []
+    assert "live check runs: none running or waiting" in _slot_status(cli, capsys, False)
+    claim = checkspill._claim("spill-a", 1, {"project": p.name, "task": "7", "run": "99", "pid": os.getpid(),
+                                             "since": time.time(), "what": "pytest -q", "host": "spill-a"})
+    try:
+        d = _slot_status(cli, capsys)
+        assert d["repos"] == [], d["repos"]   # no lane: the old view showed nothing
+        assert [(r["state"], r["host"], r["pid"], r["run"], r["task"]) for r in d["runs"]] == [
+            ("spilled", "spill-a", os.getpid(), "99", "7")], d["runs"]
+        text = _slot_status(cli, capsys, False)
+        assert "live check runs: 0 running here, 1 on spill hosts, 0 waiting" in text, text
+        assert f"spilled: #7 run 99 pid {os.getpid()} on spill-a" in text, text
+    finally:
+        claim.close()
+
+
+def test_slot_status_lists_a_run_waiting_for_a_slot_with_what_holds_it(env, tmp_path, monkeypatch, capsys):
+    """cells: slot_status_waiting. A run whose checks wait for a slot here (its CHECKS_SLOT_WAIT, its pid live)
+    is in slot-status's `runs` as waiting, with what holds it, though no lane ticket shows it."""
+    from ttp import cli
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    tid = p.db.add_task("t", "s", kind="code")
+    rid = p.db.x("INSERT INTO runs(task,role,provider,started,status) VALUES(?,?,?,?,?)",
+                 (tid, "worker", "claude", time.time(), "running"))
+    wdir = Path(p.runs) / str(rid)
+    wdir.mkdir(parents=True)
+    p.db.x("UPDATE runs SET dir=? WHERE id=?", (str(wdir), rid))
+    (wdir / cli.CHECKS_SLOT_WAIT).write_text(json.dumps({"since": time.time() - 60, "pid": os.getpid(), "head": "ab12"}))
+    d = _slot_status(cli, capsys)
+    assert d["repos"] == [], d["repos"]
+    w = [r for r in d["runs"] if r["state"] == "waiting"]
+    assert len(w) == 1 and w[0]["task"] == tid and w[0]["pid"] == os.getpid(), d["runs"]
+    assert w[0]["holds"].startswith("a checks slot here"), w
+    (wdir / cli.CHECKS_SLOT_WAIT).write_text(json.dumps({"since": time.time(), "pid": os.getpid(), "head": "ab12",
+                                                         "suite": "full", "limit": 2}))
+    text = _slot_status(cli, capsys, False)
+    assert "live check runs: 0 running here, 0 on spill hosts, 1 waiting" in text, text
+    assert f"waiting: #{tid} run {rid} pid {os.getpid()}, held by the test slots of suite full (limit 2)" in text

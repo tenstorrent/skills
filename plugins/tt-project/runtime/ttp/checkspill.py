@@ -132,6 +132,7 @@ OFF_ENV = "TTP_CHECKS_NO_SPILL"   # "1": these checks never spill; else the host
 HOST_FAULT_TRIES = 2   # a spill host whose own fault (exit 75) ended a run this often is kept off its rerun
 FAULT_RETRY_S = 600   # for this long, or until the checks config changes; then it is tried again
 FAIL_VERDICT_HOSTS = 2   # on a workstation (remote_only), checks that failed on this many spill hosts failed: no rerun
+SLOW = "slow"   # spill_off_add's mark of a host whose tree copy timed out (remotecheck.COPY_TIMEOUT): kept off at once
 ENV_FAULT_HOSTS = 2   # the checks failed at import this often on spill hosts: one fault of the spill env config
 ENV_RETRY_S = 900   # after which (or once the checks config changes) a run tries the spill hosts again
 PROBE_TIMEOUT_S = 30
@@ -1420,13 +1421,16 @@ def all_off(off: str) -> bool:
     return off == "1"
 
 
-def spill_off_add(off: str, host: str, fault: bool, env_cfg: dict | None = None, cfg: dict | None = None) -> str:
+def spill_off_add(off: str, host: str, fault: bool, env_cfg: dict | None = None, cfg: dict | None = None,
+                  slow: bool = False) -> str:
     """OFF_ENV's value after the checks did not pass on spill host `host`: `fault` when the host's own fault
     ended them (exit 75), else they failed or timed out there. `env_cfg`: they failed at import for want of a
     package (push.env_problem), a fault of the spill env config `env_cfg` (env_off), never of the host.
-    A fault is marked with its time and the checks config `cfg` it ran under, so it expires (kept_off)."""
+    A fault is marked with its time and the checks config `cfg` it ran under, so it expires (kept_off).
+    `slow`: the copy of the tree there timed out (remotecheck.COPY_TIMEOUT), a fault kept off at once (kept_off):
+    another full copy timeout on the same link would only add to the wait; the rerun goes elsewhere or here."""
     mark = (f"env.{_env_key(env_cfg)}.{int(time.time())}" if env_cfg is not None
-            else f"fault.{_env_key(cfg) if cfg is not None else ''}.{int(time.time())}" if fault else "fail")
+            else SLOW if slow else f"fault.{_env_key(cfg) if cfg is not None else ''}.{int(time.time())}" if fault else "fail")
     return ",".join([*(e for e in off.split(",") if e and e != "1"), f"{host}:{mark}"])
 
 
@@ -1454,13 +1458,13 @@ def _fault_counts(why: str, key: str | None, now: float) -> bool:
 def kept_off(off: str, cfg: dict | None = None, now: float | None = None) -> set[str]:
     """The spill hosts OFF_ENV's value `off` keeps a rerun off: each its checks failed on, and each whose own
     fault ended them HOST_FAULT_TRIES times under the checks config `cfg` has now (None: any) within the last
-    FAULT_RETRY_S; once that config changes (a fixed checks.spill_wrap_cmd) or the time passes, it is tried
-    again. An import failure keeps no host off (env_off)."""
+    FAULT_RETRY_S (once that config changes, a fixed checks.spill_wrap_cmd, or the time passes, it is tried
+    again), and each its tree copy timed out on once (SLOW). An import failure keeps no host off (env_off)."""
     now = time.time() if now is None else now
     key = None if cfg is None else _env_key(cfg)
     seen = [e.rpartition(":") for e in off.split(",") if e and e != "1"]
     return {h for h, _, why in seen if not why.startswith("env.") and (
-            why == "fail" or sum(1 for h2, _, w2 in seen if h2 == h and _fault_counts(w2, key, now)) >= HOST_FAULT_TRIES)}
+            why in ("fail", SLOW) or sum(1 for h2, _, w2 in seen if h2 == h and _fault_counts(w2, key, now)) >= HOST_FAULT_TRIES)}
 
 
 def _env_key(cfg: dict | None) -> str:

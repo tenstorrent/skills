@@ -277,7 +277,8 @@ def queued(p) -> list[dict]:
                     "urgent": bool(t and checkcap.is_urgent(t.get("priority"))), "owed": owed,
                     "kind": "push batch" if push_batch(info) else ("review precheck" if kind == "precheck" else "task"),
                     "since": arrival(info), "parked": note(info["wait"]["parked"])
-                    if isinstance(info["wait"].get("parked"), dict) else ""})
+                    if isinstance(info["wait"].get("parked"), dict) else "", "pid": info.get("pid"),
+                    "holds": _holds(info["wait"])})
     return sorted(out, key=lambda e: e.get("since") or 0)
 
 
@@ -299,6 +300,63 @@ def arrival(info: dict) -> float | None:
         if 0 < t <= now:
             good.append(t)
     return min(good) if good else None
+
+
+def _holds(wait: dict) -> str:
+    """What holds a waiting run, from its CHECKS_SLOT_WAIT `wait`: parked, following another run, its suite's
+    test slots, else a checks slot here (a lane or the host-wide slot, with the load guard)."""
+    if isinstance(wait.get("parked"), dict):
+        return f"parked: {note(wait['parked'])}"
+    if wait.get("follows"):
+        return f"follows another run of its task: {str(wait['follows'])[:200]}"
+    if wait.get("suite"):
+        return f"the test slots of suite {wait['suite']}" + (f" (limit {wait['limit']})" if wait.get("limit") else "")
+    return "a checks slot here (its lane or the host-wide slot, with the load guard)"
+
+
+def live_runs(repos: list[dict], spilled: list[dict], waiting: list[dict]) -> list[dict]:
+    """`ttp checks status`'s one list of every live check run of the project: each lane holder running here,
+    each run on a spill host (checkspill.holders: host and pid) and each waiting one, a lane's ticket or a run
+    waiting for a slot (queued), with what holds it. One entry per run; empty only when nothing runs or waits."""
+    out, seen = [], set()
+
+    def add(e: dict) -> None:
+        key = ("run", e["run"]) if e.get("run") else ("pid", e.get("pid"))
+        if key in seen:
+            return
+        seen.add(key)
+        out.append(e)
+    for c in spilled:
+        add({"state": "spilled", "task": c.get("task") or None, "run": str(c.get("run") or ""), "pid": c.get("pid"),
+             "host": c.get("host"), "since": c.get("since"), "what": c.get("what") or ""})
+    for g in repos:
+        for h in g.get("lanes") or ():
+            run = not h.get("waits_on")   # a holder not started yet names what it waits on (lane_status)
+            add({"state": "running" if run else "waiting", "task": h.get("task") or None, "run": str(h.get("run") or ""),
+                 "pid": h.get("pid"), "lane": g.get("label"), "what": h.get("command") or h.get("why") or "",
+                 **({} if run else {"holds": h.get("waits_on") or f"lane {g.get('label')}: not started"})})
+        for w in g.get("waiters") or ():
+            add({"state": "waiting", "task": w.get("task") or None, "run": str(w.get("run") or ""), "pid": w.get("pid"),
+                 "lane": g.get("label"), "position": w.get("position"),
+                 "holds": w.get("waits_on") or f"lane {g.get('label')}, place {w.get('position')}"})
+    for w in waiting:
+        add({"state": "waiting", "task": w.get("task"), "run": str(w.get("run") or ""), "pid": w.get("pid"),
+             "since": w.get("since"), "kind": w.get("kind"), "holds": w.get("holds") or ""})
+    return out
+
+
+def live_runs_lines(runs: list[dict]) -> list[str]:
+    """The text lines of live_runs: a count, then one line per run."""
+    if not runs:
+        return ["live check runs: none running or waiting"]
+    n = {s: sum(1 for r in runs if r["state"] == s) for s in ("running", "spilled", "waiting")}
+    lines = [f"live check runs: {n['running']} running here, {n['spilled']} on spill hosts, {n['waiting']} waiting"]
+    for r in runs:
+        who = " ".join(x for x in (f"#{r['task']}" if r.get("task") else "no task",
+                                   f"run {r['run']}" if r.get("run") else "", f"pid {r['pid']}" if r.get("pid") else "") if x)
+        lines.append(f"  {r['state']}: {who}" + (f" on {r['host']}" if r.get("host") else "")
+                     + (f", held by {r['holds']}" if r.get("holds") else ""))
+    return lines
 
 
 def main(p, argv: list[str]) -> int:

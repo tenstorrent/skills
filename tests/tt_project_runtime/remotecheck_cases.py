@@ -40,6 +40,8 @@ if [ -n "$FAKE_SSH_MUX" ]; then
     fi;;
   esac
 fi
+# FAKE_SSH_SLOW=<host>: the tree copy to that host never ends (a stalled link).
+[ "$host" = "${FAKE_SSH_SLOW:-@none@}" ] && case "$1" in *"tar -xf -"*) exec sleep 5;; esac
 case "$1" in *"${FAKE_SSH_FAIL:-@none@}"*) echo "ssh: connection to $host lost" >&2; exit 255;; esac
 case "$1" in *"${FAKE_SSH_DROP:-@none@}"*) sh -c "$1" | sed '/ttp-remote-rc:/d'; exit 255;; esac
 exec sh -c "$1"
@@ -5329,3 +5331,48 @@ def test_health_results_for_part_of_the_spill_hosts_neither_take_out_nor_lift_no
     assert checkspill.quarantined(p, "check-host-a") and checkspill.quarantined(p, "check-host-b")
     assert not _spill_events(p, "Every spill host failed")
     assert len(_spill_events(p, "Spill host check-host-a failed its health check")) == 1
+
+
+def test_a_spill_host_whose_tree_copy_timed_out_is_kept_off_at_once_and_the_rerun_goes_to_the_next(env, tmp_path,
+                                                                                                  monkeypatch):
+    """cells: spill_copy_failover. One tree-copy timeout on a spill host (a stalled link) keeps that host off the
+    rerun at once (checkspill.SLOW), never a second full timeout there: the checks run on the next free spill
+    host, and the log records the cause with what was sent."""
+    from ttp import checkspill, cli, remotecheck
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["slow-host", "check-host-b"],
+                                        charter=("slow-host", "check-host-b"))
+    calls = tmp_path / "ssh.log"
+    monkeypatch.setenv("FAKE_SSH_SLOW", "slow-host")
+    monkeypatch.setenv("FAKE_SSH_ARGS", str(calls))
+    monkeypatch.setenv(remotecheck.COPY_TIMEOUT_ENV, "1")
+    p.set_config("delivery.push_checks", ["true"])
+    lane = _spill_lane(p, repo)
+    try:
+        cli.main(["checks", "--fresh"])
+    finally:
+        lane.close()
+    rec = json.loads((run / "checks.json").read_text())
+    assert rec["passed"] is True and rec["spilled_to"] == "check-host-b", rec
+    text = (run / "checks.log").read_text()
+    assert "copying the tree timed out: " in text and "overran its limit after" in text and "MB sent" in text, text
+    assert "copying the tree timed out, so that host is kept off this run" in text, text
+    copies = [c for c in calls.read_text().splitlines() if "slow-host" in c and ("tar -xf -" in c or "cat > " in c)]
+    assert len(copies) == 1, "one copy there, never a second full timeout"
+
+
+def test_a_copy_timeout_keeps_its_host_off_after_one_try_a_plain_host_fault_after_two(env, tmp_path, monkeypatch):
+    """cells: spill_copy_failover. kept_off: a host whose tree copy timed out once (SLOW) is off the rerun, so
+    with no other spill host the rerun is admitted here; a plain host fault keeps it off only after
+    HOST_FAULT_TRIES."""
+    from ttp import checkspill
+    slow = checkspill.spill_off_add("", "h1", True, slow=True)
+    assert slow == "h1:slow" and checkspill.kept_off(slow) == {"h1"}
+    fault = checkspill.spill_off_add("", "h1", True)
+    assert checkspill.kept_off(fault) == set()
+    assert checkspill.kept_off(checkspill.spill_off_add(fault, "h1", True)) == {"h1"}
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a"])
+    told = []
+    assert checkspill.pick(p, p.config(), told.append, "pytest -q", off="check-host-a:slow") is None, told
+    claim = checkspill.pick(p, p.config(), told.append, "pytest -q", off="check-host-a:fault")
+    assert claim is not None and claim.host == "check-host-a", told
+    claim.close()

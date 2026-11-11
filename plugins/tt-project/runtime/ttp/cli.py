@@ -4853,12 +4853,16 @@ def cmd_checks(a) -> None:
                 and not (failed in todo and not getattr(failed, "spill_host", "")):
             how = f"past the {timed_out['cap_s']:g} s wall-time cap" if timed_out else f"exit {rc}"
             env_why = ran_out = ""
+            slow = False
             if not timed_out:   # a package missing there: a fault of the spill env config (checkspill.env_off)
                 try:
                     with open(log, "rb") as f:
                         f.seek(start)
                         ran_out = f.read().decode("utf-8", errors="replace")
-                        env_why = push.env_problem(ran_out, top) or ""
+                    env_why = push.env_problem(ran_out, top) or ""
+                    # Its tree copy timed out: that host is kept off now, never a second full timeout there.
+                    from . import remotecheck
+                    slow = rc == remotecheck.FAULT_RC and not env_why and remotecheck.COPY_TIMEOUT in ran_out
                 except OSError:
                     pass
             if rc == 75 and not timed_out:   # its spill wrapper refused it or is missing: status names it (a limit line)
@@ -4867,7 +4871,10 @@ def cmd_checks(a) -> None:
                     checkspill.note_limit(p.name, f"spill host {wrapped[0] or spilled.host}: {wrapped[1]}; its "
                                           "checks run again on another host or here", checklane.scope_text(todo)[:300])
             no_spill = checkspill.spill_off_add(no_spill, spilled.host, rc == 75 and not timed_out,
-                                                p.config() if env_why else None, cfg=p.config())
+                                                p.config() if env_why else None, cfg=p.config(), slow=slow)
+            if slow:
+                from . import remotecheck
+                how += f": {remotecheck.COPY_TIMEOUT}, so that host is kept off this run"
             if env_why:
                 checkspill.env_event(p.db, no_spill, p.config())
             elif executed and not timed_out and rc != 75:   # a strike there if the head then passes elsewhere
@@ -4878,7 +4885,7 @@ def cmd_checks(a) -> None:
                     + "); running them again on this machine, whose result counts, or on a free spill host "
                     + (("they did not fail on" + (f" (that one again once the checks config changes or in "
                         f"{checkspill.FAULT_RETRY_S // 60} min: the host's own fault ended them there)"
-                        if rc == 75 and not timed_out else ""))
+                        if rc == 75 and not timed_out and not slow else ""))
                        if spilled.host in checkspill.kept_off(no_spill, p.config())
                        else "(that one again once free: the fault was the host's)" if not env_why
                        else "(any one, until the same import fails on another)"))
@@ -5607,11 +5614,13 @@ def _checks_lane_status(as_json: bool) -> int:
     disk = diskgate.reading()   # new local runs held while the disk is saturated: why, with the values   # joined or superseded waiters: they run no suite of their own
     load = hostload.snapshot(p.config())
     names = {"": p.root.name, **({here_repo: testslots.repo_name(top) or here_repo} if here_repo else {})}
+    repos, spilled = checklane.lane_status(p.name, cfg=p.config(), names=names, db=p.db), checkspill.holders(p.name)
+    # Every live run in one list, those with no lane too (a spilled push batch, a wait for the host-wide slot).
+    runs = checksqueue.live_runs(repos, spilled, checksqueue.queued(p))
     if as_json:
         print(json.dumps({"project": p.name, "slots": checklane.slots(p.config()),
                           "project_max": checklane.project_cap(p.config()), "this_repo": here_repo,
-                          "repos": checklane.lane_status(p.name, cfg=p.config(), names=names, db=p.db),
-                          "spilled": checkspill.holders(p.name), "push": push_rows,
+                          "runs": runs, "repos": repos, "spilled": spilled, "push": push_rows,
                           "no_spill_hosts": checkspill.no_spill(),
                           "here": checkspill.here_records(p.name),
                           "slurm_overflow": slurmcheck.holders(p.name),
@@ -5623,6 +5632,7 @@ def _checks_lane_status(as_json: bool) -> int:
                           "followers": [x.strip() for x in followers]},
                          indent=2))
     else:
+        print("\n".join(checksqueue.live_runs_lines(runs)))
         print(checklane.status_text(p.name, p.config(), here_repo, names=names, db=p.db))
         if push_rows:
             print("push checks host-wide (push priority slot, or an ordinary turn after it stayed held):")
