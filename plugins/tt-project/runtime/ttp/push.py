@@ -3651,7 +3651,7 @@ STALL_S = 30   # the lock free this long while a waiter ahead does not take it: 
 
 def _priority(p: Project) -> int | None:
     try:
-        return checkcap.task_priority(p)
+        return checkcap.task_priority(p) if p else None
     except Exception:   # an unreadable task only loses the ordering, never the wait
         return None
 
@@ -3669,7 +3669,7 @@ def take(p: Project, remote: str, branch: str, wait_s: float, poll_s: float = 1.
     batch). Inside a run the wait is recorded, so it does not count against the run's wall clock.
     `who` labels the holder (default: the task and run, else the pid)."""
     paths = lock_paths(p, remote, branch)
-    locks_dir, resource = p.state / "locks", lock_resource(remote, branch)
+    locks_dir, resource = (p.state / "locks" if p else paths[0].parent), lock_resource(remote, branch)
     who = who or (f"task #{os.environ['TTP_TASK']} (run {os.environ.get('TTP_RUN_ID') or '?'})"
                   if os.environ.get("TTP_TASK") else f"pid {os.getpid()}")
     if wait_s <= 0 or not locks.queued(locks_dir, resource):
