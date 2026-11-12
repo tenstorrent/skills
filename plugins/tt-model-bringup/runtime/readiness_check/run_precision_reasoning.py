@@ -525,20 +525,27 @@ def scores_path(model_dir: Path, cid: str) -> Path:
     return model_dir / SCORES_DIR / f"{cid}.pt"
 
 
-def load_scores(model_dir: Path, cid: str, sha: str, kwargs: dict) -> Optional[list]:
+def load_scores(model_dir: Path, cid: str, sha: str, kwargs: dict, against: Optional[dict]) -> Optional[list]:
+    """Cached rows for ``cid`` when the text, its build kwargs and its role match.
+
+    ``against`` is None for the reference (rows hold its top-k) and
+    ``{"id", "kwargs"}`` of the reference for a candidate (rows hold KL against
+    it), so a run with a different ``--reference`` rescores instead of reusing
+    rows of the wrong kind.
+    """
     path = scores_path(model_dir, cid)
     if not path.is_file():
         return None
     blob = torch.load(path, weights_only=False)
-    if blob.get("text_sha") != sha or blob.get("build_kwargs") != kwargs:
+    if blob.get("text_sha") != sha or blob.get("build_kwargs") != kwargs or blob.get("scored_against") != against:
         return None
     return blob["texts"]
 
 
-def save_scores(model_dir: Path, cid: str, sha: str, kwargs: dict, rows: list) -> None:
+def save_scores(model_dir: Path, cid: str, sha: str, kwargs: dict, against: Optional[dict], rows: list) -> None:
     path = scores_path(model_dir, cid)
     path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({"text_sha": sha, "build_kwargs": kwargs, "texts": rows}, path)
+    torch.save({"text_sha": sha, "build_kwargs": kwargs, "scored_against": against, "texts": rows}, path)
 
 
 def _fmt(cid: str, s: Dict[str, Any], ok: bool) -> str:
@@ -585,7 +592,8 @@ def run(
 
     for cid in order:
         kwargs = candidates[cid]
-        cached = load_scores(model_dir, cid, sha, kwargs) if texts else None
+        against = None if cid == ref_id else {"id": ref_id, "kwargs": candidates[ref_id]}
+        cached = load_scores(model_dir, cid, sha, kwargs, against) if texts else None
         if cached is not None:
             scores[cid] = cached
             continue
@@ -617,7 +625,7 @@ def run(
                 gen, texts, topk=args.topk, ref_scores=scores.get(ref_id) if cid != ref_id else None,
                 decode_tokens=args.decode_tokens, decode_texts=args.decode_texts,
             )
-            save_scores(model_dir, cid, sha, kwargs, rows)
+            save_scores(model_dir, cid, sha, kwargs, against, rows)
             scores[cid] = rows
         except SystemExit:
             raise

@@ -135,6 +135,27 @@ def test_bad_candidate_is_caught_and_equal_candidate_passes(tmp_path):
     assert gate.main(["--model-dir", str(tmp_path), "--stage", "datatype-sweep"]) == gate.EXIT_PASS
 
 
+def test_changing_the_reference_rescores_instead_of_reusing_rows_of_the_wrong_kind(tmp_path):
+    p1.run(args_for(tmp_path, "--selected", "bad"), build_generator=build, tokenizer=FakeTokenizer())
+    calls = []
+
+    def counting_build(**kw):
+        calls.append(kw)
+        return build(**kw)
+
+    # Same text, new reference: its cached rows were scored as a candidate (no top-k), so every
+    # candidate is rescored against it, and KL is measured against the new reference.
+    code = p1.run(args_for(tmp_path, "--reference", "equal", "--selected", "bad", "--hf-positions", "300",
+                           "--hf-model", "fake/hf"),
+                  build_generator=counting_build, tokenizer=FakeTokenizer(),
+                  hf_loader=lambda name: SimpleNamespace(), hf_fit=lambda name: "skip HF here")
+    body = result(tmp_path)
+    assert code == 2 and len(calls) == 3
+    assert body["data"]["reference"] == "equal"
+    assert body["data"]["candidates"]["ref"]["kl_x1000"] < 1.0
+    assert body["data"]["candidates"]["bad"]["within_noise"] is False
+
+
 def test_waiver_downgrades_required_to_fit_loss(tmp_path):
     p1.run(args_for(tmp_path, "--selected", "bad"), build_generator=build, tokenizer=FakeTokenizer())
     (tmp_path / "doc/eval_readiness/limitations.json").write_text(json.dumps({"items": [{

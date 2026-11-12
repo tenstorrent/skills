@@ -57,7 +57,7 @@ P1 measures exactly this, on the model's generator, before vLLM.
      `{"messages": [...], "response": "<thinking and answer text>"}`.
    - Token ids are cached in `doc/eval_readiness/precision_reasoning/text.jsonl`
      and each candidate's scores in `.../scores/<id>.pt`; reruns score only what
-     changed. Delete `text.jsonl` to regenerate the text.
+     changed (text, kwargs, or the `--reference` a candidate was scored against). Delete `text.jsonl` to regenerate the text.
    - If building several generators in one process fails (device memory not
      released), run one candidate per process with `--only <id>`; the last run
      aggregates the cache.
