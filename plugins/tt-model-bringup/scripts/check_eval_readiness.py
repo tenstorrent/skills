@@ -40,7 +40,9 @@ one evidence path exists, and either the original (HF) model shows the same
 behaviour (``original_model == "same"``) or the fix time box was spent
 (``fix_hours >= FIX_TIME_BOX_HOURS``).
 
-Exit 0 pass, 1 advisory, 2 critical, 3 error. Output stays under about 40
+A malformed limitations file is critical (no waivers apply until it is fixed).
+
+Exit 0 pass, 1 advisory, 2 critical, 3 error (bad arguments). Output stays under about 40
 lines; the result files hold the detail.
 """
 
@@ -183,7 +185,12 @@ def evaluate(model_dir: Path, probes: tuple[str, ...]) -> tuple[int, list[str]]:
     critical: list[str] = []
     advisory: list[str] = []
     passed: list[str] = []
-    limitations = load_limitations(model_dir)
+    try:
+        limitations = load_limitations(model_dir)
+    except CheckError as exc:
+        # A broken limitations file is the agent's to fix, not a gate error.
+        limitations = []
+        critical.append(f"limitations: {exc}; fix it to the schema in check_eval_readiness.py")
     for probe in probes:
         path = model_dir / RESULT_DIR / f"{probe}.json"
         if not path.is_file():

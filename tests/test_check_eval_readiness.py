@@ -89,3 +89,16 @@ def test_output_is_short(tmp_path, capsys):
     write(tmp_path, "precision_reasoning", [writer.check(f"c{i}", False, detail="d") for i in range(100)])
     gate.main(["--model-dir", str(tmp_path), "--stage", "datatype-sweep"])
     assert len(capsys.readouterr().out.splitlines()) <= 40
+
+
+@pytest.mark.parametrize("content", ["{not json", json.dumps({"items": "x"}), json.dumps([1])])
+def test_malformed_limitations_is_critical_not_error(tmp_path, capsys, content):
+    write(tmp_path, "precision_reasoning", [writer.check("p1", True)])
+    (tmp_path / "doc/eval_readiness/limitations.json").write_text(content)
+    assert gate.main(["--model-dir", str(tmp_path), "--stage", "datatype-sweep"]) == 2
+    out = capsys.readouterr().out
+    assert "CRITICAL limitations:" in out
+
+
+def test_missing_scope_is_argument_error(capsys):
+    assert gate.main(["--stage", "datatype-sweep"]) == 3
