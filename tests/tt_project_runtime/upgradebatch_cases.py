@@ -3,7 +3,7 @@
 # a temporary project and a temporary installed release (make, _install_template), never a real harness.
 from __future__ import annotations
 
-_UP_IMPORTS = "from . import ackwait, startgate, userpause\n"
+_UP_IMPORTS = "from . import ackwait, routinedefault, startgate, userpause\n"
 
 
 def _release_with_new_import(env):
@@ -12,7 +12,7 @@ def _release_with_new_import(env):
     f = env["home"] / "lib" / "current" / "runtime" / "ttp" / "progress.py"
     text = f.read_text()
     assert text.count(_UP_IMPORTS) == 1
-    f.write_text(text.replace(_UP_IMPORTS, "from . import ackwait, startgate, timefmt, userpause\n"))
+    f.write_text(text.replace(_UP_IMPORTS, "from . import ackwait, routinedefault, startgate, timefmt, userpause\n"))
 
 
 def _harness_tasks(p):
@@ -33,7 +33,7 @@ def test_project_imports_at_the_file_end_merge_model_free_and_inside_upstreams_l
     if where == "file end":
         f.write_text(f.read_text() + "\n\n# project-local imports\nfrom . import release as _local_release  # noqa\n")
     else:
-        f.write_text(f.read_text().replace(_UP_IMPORTS, "from . import ackwait, release, startgate, userpause\n"))
+        f.write_text(f.read_text().replace(_UP_IMPORTS, "from . import ackwait, release, routinedefault, startgate, userpause\n"))
     _git_out(p.harness, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qam", "local import")
     _release_with_new_import(env)
     capsys.readouterr()
@@ -55,7 +55,7 @@ def test_project_imports_at_the_file_end_merge_model_free_and_inside_upstreams_l
             cli.main(argv)
         assert e.value.code == 75
     assert len(_harness_tasks(p)) == 1 and not restarts
-    assert "from . import ackwait, release, startgate, userpause" in f.read_text(), "the live harness is untouched"
+    assert "from . import ackwait, release, routinedefault, startgate, userpause" in f.read_text(), "the live harness is untouched"
 
 
 def test_a_clean_merge_that_fails_the_runtime_check_takes_one_task_and_leaves_the_harness_clean(

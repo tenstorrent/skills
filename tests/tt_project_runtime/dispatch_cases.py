@@ -1936,7 +1936,9 @@ def test_a_coordinator_past_the_old_hourly_limit_still_gets_its_next_self_starte
     core = d.cfg.get("core_provider", "claude")
     assert not d.gates[core].coord_hold and d.gates[core].allow_new_work, d.gates[core].as_dict()
     _event(p, clock, "task_done")
-    assert _turn_within(d, clock, starts, 600, step=30), "the coordinator's next wake was deferred"
+    # The routine holds (batch_s, event_hold_s, wake_gap_s) bound the wait, never the old hourly limit.
+    hold = max(float(d.cfg["coordinator"][k]) for k in ("batch_s", "event_hold_s", "wake_gap_s"))
+    assert _turn_within(d, clock, starts, hold + 300, step=30), "the coordinator's next wake was deferred"
     # A dollar cap reached still stops its self-started turns.
     p.db.x("UPDATE events SET status='handled'")
     p.set_config("budget.daily_usd", 1)

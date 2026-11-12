@@ -31664,7 +31664,8 @@ def test_a_hand_off_with_follow_ups_gets_its_review_in_the_same_step(env):
     d.update_gates()
     queued = p.db.q("SELECT * FROM events WHERE status='queued'")
     assert {e["kind"] for e in queued} >= {"task_done", "followup_proposed"}, "the follow-ups left the coordinator"
-    assert not d._batch_hold(queued, max(e["ts"] for e in queued) + 301)
+    batch = float(p.config()["coordinator"]["batch_s"])
+    assert not d._batch_hold(queued, max(e["ts"] for e in queued) + batch + 1)
     assert d.sweep_unreviewed(force=True) == [] and len(p.db.q("SELECT id FROM tasks WHERE kind='review'")) == 1
 
 

@@ -15627,7 +15627,9 @@ def test_a_plain_task_done_waits_for_company_even_with_an_idle_slot(env):
     done = p.db.add_task("finished", "s", status="done")
     ev = {"ts": now - 10, "kind": "task_done", "severity": "normal", "task": done}
     assert d._batch_hold([ev], now), "a plain hand-off with idle slots and no queued work waits for batch_s"
-    assert not d._batch_hold([ev], now + 400), "batch_s still bounds the wait"
+    batch = float(p.config()["coordinator"]["batch_s"])
+    assert d._batch_hold([ev], now + batch - 20), "it waits for company up to batch_s"
+    assert not d._batch_hold([ev], now + batch + 100), "batch_s still bounds the wait"
     assert not d._batch_hold([dict(ev, severity="high")], now)
     assert not d._batch_hold([dict(ev, task=None)], now)
     # A proposed follow-up is work the turn could queue into the idle slot.
