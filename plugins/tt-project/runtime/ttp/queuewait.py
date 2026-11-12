@@ -120,6 +120,14 @@ def collect(p, cfg: dict, now: float, host: dict | None = None, device: set | No
     queued = list(host.get("queued") or []) + [h for h, _ in host.get("parked") or []]
     checks = {"cap": host.get("limit"), "running": running, "queued": queued, "cap_set": bool(host.get("limit_set"))}
     busy = {_task_of(x, name) for x in running}
+    marks = None
+
+    def push_marks():
+        from . import push
+        try:
+            return push.running(p)
+        except OSError:
+            return []
 
     def add(tid, queue, res, since, info):
         k = (tid, queue)
@@ -140,10 +148,19 @@ def collect(p, cfg: dict, now: float, host: dict | None = None, device: set | No
         got = classify(prev.get("retry_when") or "", t["blocked_reason"] or "", device)
         if got and got[0] == "checks" and not (queued and _checks_waiting(p, prev.get("retry_when"))):
             continue   # its checks finished, run or never queued, or the host queue is empty: no slot to wait for
+        since = prev["waiting_since"]
+        if got and got[0] == "checks":   # from its checks run's arrival, as gatetime's checks to start counts
+            d = _run_dir(p, prev.get("retry_when"))
+            since = _slot_since(d) or since
+        elif got and got[0] == "push":
+            marks = push_marks() if marks is None else marks
+            if (since := _push_since(p, t["id"], marks, since)) is None:
+                continue   # its own push runs: a self-wait, no queue holds it
         if got and not (got[0] == "checks" and t["id"] in busy):
             info = checks if got[0] == "checks" else _holders(db, p, got[0], got[1], cfg, now)
             if not info.pop("live", False):   # a push in its turn, alive and in its time limit: a fair wait
-                add(t["id"], got[0], got[1], prev["waiting_since"], info)
+                add(t["id"], got[0], got[1], since,
+                    {**info, "dir": str(d)} if got[0] == "checks" and d else info)
     for t in db.ready_tasks():
         got = hold(t) if hold else _config_hold(db, cfg)
         if got is None:
@@ -164,17 +181,84 @@ def collect(p, cfg: dict, now: float, host: dict | None = None, device: set | No
     return list(out.values())
 
 
+def _run_dir(p, probe) -> Path | None:
+    """The run dir a `ttp checks --result <run dir>` probe names; None for any other probe."""
+    m = re.search(r"\bttp checks\b[^;|&]*?--result\s+('[^']*'|\"[^\"]*\"|[^\s;|&]+)", str(probe or ""))
+    if not m or "$" in m[1]:
+        return None
+    d = Path(m[1].strip("'\"")).expanduser()
+    return d if d.is_absolute() else p.base / d
+
+
+def _slot_since(d: Path | None) -> float | None:
+    """When run dir `d`'s checks arrived in the host checks queue (checks-slot.wait's arrived, the queue place
+    a handed-over run keeps, else its since), or None."""
+    from . import cli
+    try:
+        rec = json.loads((d / cli.CHECKS_SLOT_WAIT).read_text()) if d else {}
+        v = [x for x in (rec.get("arrived"), rec.get("since")) if isinstance(x, (int, float)) and x > 0]
+        return float(v[0]) if v else None
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def _push_self(p, tid) -> bool:
+    """Task `tid` holds a live branch push lock: its own push runs, so it waits on no queue (a self-wait)."""
+    from . import locks
+    try:
+        paths = [x for x in sorted((p.state / "locks").glob("push:*.lock")) if not x.name.startswith("push:run-")]
+        recs = locks.holder_records(paths, p)
+    except OSError:
+        return False
+    return any(re.search(rf"\btask #{int(tid)}\b", str(h.get("holder") or "")) for h in recs
+               if h.get("alive") is not False and not h.get("stale"))
+
+
+def _push_since(p, tid: int, marks: list, fallback) -> float | None:
+    """When task `tid`'s push entered a queue it still waits in: its push-queue row approved and not yet in a
+    batch (the row's created), or its own detached push queued or waiting for the branch push lock (the
+    marker's queued or started); `fallback` (its hand-off) when no record of either is left. None while it
+    holds the push lock itself: its push runs, a self-wait no queue causes."""
+    if _push_self(p, tid):
+        return None
+    row = p.db.one("SELECT created FROM push_queue WHERE task=? AND status='approved' ORDER BY id LIMIT 1", (tid,))
+    at = [float(row["created"])] if row and row["created"] else []
+    for m in marks:
+        if str(m.get("task")) == str(tid) and m.get("status") in ("queued", "running"):
+            v = m.get("queued") or m.get("started")
+            if isinstance(v, (int, float)) and v:
+                at.append(float(v))
+    return min(at) if at else fallback
+
+
+def _began(p, rec: dict, host: dict) -> bool:
+    """Episode `rec`'s run started (or ended): a worker run of the task since the wait began, its checks
+    holding a host slot or past their slot wait, or its push out of the queue. Its mark closes then,
+    not after GRACE_S."""
+    from . import cli
+    db, tid, q, since = p.db, rec["task"], rec.get("queue"), float(rec.get("since") or 0)
+    if q == "workers":
+        return bool(db.one("SELECT 1 FROM runs WHERE task=? AND role!='coordinator' AND started>=?", (tid, since)))
+    if q == "checks":
+        held = list(host["held"]) if "held" in host else [
+            *(host.get("running") or []), *(host.get("priority") or []), *(host.get("urgent") or [])]
+        d = Path(rec["dir"]) if rec.get("dir") else None
+        return any(_task_of(x, p.name) == tid for x in held) or bool(
+            d and d.is_dir() and not (d / cli.CHECKS_SLOT_WAIT).exists())
+    if q == "push":   # its push holds the branch lock, or its row went into a batch
+        return _push_self(p, tid) or bool(db.one(
+            "SELECT 1 FROM push_queue WHERE task=? AND status IN ('pushing','pushed') AND updated>=?", (tid, since)))
+    return False
+
+
 def _checks_waiting(p, probe) -> bool:
     """A worker's `ttp checks --result <run dir>` wait has a live record of waiting for a host-wide checks
     slot: no checks.rc yet, its checks process alive (or in a PID namespace this one cannot judge) and its
     checks-slot.wait file present. Read-only (never cli._checks_result, which settles the run). A run whose
     checks finished, run or are gone, or a probe naming no run dir, has none."""
     from . import cli
-    m = re.search(r"\bttp checks\b[^;|&]*?--result\s+('[^']*'|\"[^\"]*\"|[^\s;|&]+)", str(probe or ""))
-    if not m or "$" in m[1]:
+    if (d := _run_dir(p, probe)) is None:
         return False
-    d = Path(m[1].strip("'\"")).expanduser()
-    d = d if d.is_absolute() else p.base / d
     if (d / cli.CHECKS_RC).exists() or not (d / cli.CHECKS_SLOT_WAIT).exists():
         return False
     info = cli._read_checks_pid(d)
@@ -405,6 +489,8 @@ def scan(p, cfg: dict, now: float | None = None, host: dict | None = None, devic
         if (rec := opened.get(ep)) is not None:   # the same wait: its earliest start, seen now
             live.add(ep)
             rec["since"], rec["seen"] = min(float(rec["since"]), w["since"]), now
+            if w.get("dir"):
+                rec["dir"] = w["dir"]
             if parked := rec.pop("parked", None):   # back within the grace: its unread item is queued again
                 db.x("UPDATE events SET status='queued' WHERE id=? AND status='handled'", (parked,))
             w = {**w, "since": rec["since"]}
@@ -417,7 +503,8 @@ def scan(p, cfg: dict, now: float | None = None, host: dict | None = None, devic
         ep = episode(w)
         live.add(ep)
         rec = opened.setdefault(ep, {"task": w["task"], "queue": w["queue"], "res": w["res"], "since": w["since"],
-                                     "opened": int(now), "seen": now, "acted": None})
+                                     "opened": int(now), "seen": now, "acted": None,
+                                     **({"dir": w["dir"]} if w.get("dir") else {})})
         if rec.get("acted"):
             continue
         k = key(w)
@@ -468,7 +555,8 @@ def scan(p, cfg: dict, now: float | None = None, host: dict | None = None, devic
                           kind="info", severity="normal")
     for ep in [e for e in opened if e not in live]:
         rec = opened[ep]
-        if now - float(rec.get("seen") or rec["since"]) < GRACE_S and _open(db, rec["task"]):
+        if now - float(rec.get("seen") or rec["since"]) < GRACE_S and _open(db, rec["task"]) and \
+                not _began(p, rec, host or {}):
             # a gap shorter than the grace: the same wait if it shows again; its unread item waits parked
             if not rec.get("parked") and (ev := db.one(
                     "SELECT id FROM events WHERE kind=? AND status='queued' AND data LIKE ?",

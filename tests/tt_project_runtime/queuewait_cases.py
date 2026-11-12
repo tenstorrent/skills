@@ -811,3 +811,56 @@ def test_queue_wait_answered_key_stays_settled_across_a_new_episode(env):
     assert queuewait.scan(p, QW_CFG, gap + 60, both) == []
     p.db.update_task(a, priority=1)
     assert [fp.split(":")[1] for fp in queuewait.scan(p, QW_CFG, gap + 120, both)] == [str(a)]
+
+def test_queue_wait_counts_from_the_checks_run_arrival_and_closes_when_the_run_starts(env):
+    """#8438: marks counted from the worker's hand-off (300 over 30 min a day while checks to start was 0 min)
+    and stayed open 30 min after the run started. A checks wait counts from its run's arrival (checks-slot.wait's
+    since, as checks to start does): a run that started at once raises no mark however old its hand-off, one
+    that waited 40 min raises one, and the mark closes the moment the slot is granted, with no grace."""
+    from ttp import cli, queuewait
+    p = make(env)
+    now = time.time()
+    full = {"limit": 4, "running": [f"other task #{i} (run 1)" for i in range(4)], "queued": ["other task #9 (run 1)"]}
+
+    def wait(name, arrived):
+        d = _qw_slot_wait(p)
+        (d / cli.CHECKS_SLOT_WAIT).write_text(json.dumps({"since": arrived, "pid": os.getpid()}))
+        tid = p.db.add_task(name, "s", kind="code")
+        p.db.update_task(tid, not_before=now + 300, blocked_reason="waiting for checks; its probe says not yet" + NT,
+                         result=json.dumps({"status": "waiting", "retry_when": f"ttp checks --result {d}",
+                                            "waiting_since": now - 99 * 60}))
+        return tid, d
+
+    quick, _ = wait("quick", now - 60)
+    slow, d = wait("slow", now - 40 * 60)
+    got = {w["task"]: w["since"] for w in queuewait.collect(p, QW_CFG, now, full)}
+    assert got == {quick: now - 60, slow: now - 40 * 60}, got
+    queuewait.scan(p, QW_CFG, now, full)
+    assert [e["text"].split(":", 1)[0] for e in _qw_events(p)] == [f"qwait-{slow}-checks"], _qw_events(p)
+    assert set(p.db.kv(queuewait.KV)["open"]) == {f"{slow}:checks"}
+    (d / cli.CHECKS_SLOT_WAIT).unlink()   # its slot granted: the run started
+    queuewait.scan(p, QW_CFG, now + 60, full)
+    st = p.db.kv(queuewait.KV)
+    assert st["open"] == {} and [h["task"] for h in st["hist"]] == [slow], st
+    assert st["hist"][0]["end"] - st["hist"][0]["since"] == 40 * 60, "closed when its run started, not 30 min on"
+
+
+def test_queue_wait_skips_a_push_whose_own_run_holds_the_push_lock(env):
+    """#8438: a task waiting on its own detached push while that push holds the branch push lock is a
+    self-wait: no queue holds it, so no mark; another task's push waiting behind it still counts."""
+    from ttp import locks, push, queuewait
+    p = make(env)
+    now = time.time()
+    ids = []
+    for name in ("self", "behind"):
+        tid = p.db.add_task(name, "s", kind="review")
+        p.db.update_task(tid, not_before=now + 600, result=json.dumps(
+            {"status": "waiting", "retry_when": "ttp push --result /r/m", "waiting_since": now - 40 * 60}))
+        ids.append(tid)
+    f = locks.try_take(push.lock_paths(p, "origin", "team/feature"), f"task #{ids[0]} (run 2)", "ttp push")
+    try:
+        locks.relabel(f, {"since": now - 5 * 3600})   # overdue, so the wait behind it raises
+        got = [w["task"] for w in queuewait.collect(p, QW_CFG, now) if w["queue"] == "push"]
+        assert got == [ids[1]], got
+    finally:
+        f.close()

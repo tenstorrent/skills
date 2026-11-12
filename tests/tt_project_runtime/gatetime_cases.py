@@ -392,3 +392,19 @@ def test_push_checks_running_only_a_marked_subset_with_no_post_land_checks_raise
     d.check_gate_time(now=later + 2 * 86400)
     assert p.db.one("SELECT id FROM events WHERE kind='observation' AND fingerprint=?",
                     (f"checks_subset:{time.strftime('%Y-%m-%d', time.gmtime(later + 2 * 86400))}",))
+
+
+def test_checks_to_start_counts_the_host_slot_wait_the_queue_wait_marks_count(env):
+    """#8438: 'checks to start' read 0 min over 321 runs while 209 checks queue-wait marks passed 30 min.
+    With slot waits logged (checkcap's WAITS_LOG: arrival to grant, the span queuewait counts) the metric
+    takes them, ordinary ("queue") slots only; a push batch's slot and the older WAIT_LOG samples do not."""
+    from ttp import checkcap, gatetime
+    p = make(env)
+    now = time.time()
+    gatetime.record_wait(p.state, 1.5, now=now - 60)
+    rows = [("queue", 0), ("queue", 40 * 60), ("queue", 50 * 60), ("push", 0), ("push", 0)]
+    (p.state / checkcap.WAITS_LOG).write_text("".join(
+        json.dumps({"project": p.name, "slot": slot, "queued_at": now - 7200 - s, "granted_at": now - 7200}) + "\n"
+        for slot, s in rows))
+    line = gatetime.waits_line(p.db, p.state, now, landed=False)
+    assert line == "waits (24 h): checks to start median 40 min, p90 50 min (3 runs)", line

@@ -17,8 +17,9 @@ never holding the queue.
   --durations lines) and suggests a smoke split; the project changes its own push checks. With it, one
   priority-1 test speed-up task (labelled SPEED_LABEL, naming those tests) is queued for the project, never
   while another is still open.
-- Waits (waits_line()): how long full `ttp checks` runs waited to start (WAIT_LOG, record_wait(), from the run's
-  arrival to its start here or on a spill host) and approval to landed (pushq.landing_times), median and p90
+- Waits (waits_line()): how long full `ttp checks` runs waited to start: from the run's arrival in the host checks
+  queue to its slot's grant (checkcap's WAITS_LOG, the span queuewait's checks marks count), else WAIT_LOG
+  (record_wait(), from the run's arrival to its start here or on a spill host) and approval to landed (pushq.landing_times), median and p90
   over the last 24 h: the hours a slow landing spends queued, not testing.
 - Subset (subset_flag(), each daemon pass, model-free): while a delivery.push_checks pytest run selects only a
   marked subset (`-m` or `-k`) and delivery.post_land_checks is empty, nothing ever runs the rest of the suite:
@@ -159,13 +160,26 @@ def _hm(s: float) -> str:
     return f"{s / 60:.0f} min" if s < 3600 else f"{int(s // 3600)} h {int(s % 3600 // 60):02d} min"
 
 
+def _slot_waits(state: Path | None, now: float) -> list[float]:
+    """The last 24 h's host checks slot waits of ordinary checks runs (checkcap's WAITS_LOG, slot "queue":
+    arrival to grant), the span queuewait's checks marks count; [] with none logged (WAIT_LOG then)."""
+    from . import checkcap
+    if state is None:
+        return []
+    try:
+        recs = checkcap.wait_records(Path(state), now, DAY_S)
+    except OSError:
+        return []
+    return [max(0.0, r["granted_at"] - r["queued_at"]) for r in recs if r.get("slot", "queue") == "queue"]
+
+
 def waits_line(db, state: Path | None, now: float | None = None, landed: bool = True) -> str:
     """The last 24 h's waits: full checks runs' wait to start and (`landed`) approval to landed, median and
     p90 each; '' with neither."""
     from . import pushq
     now = time.time() if now is None else now
     parts = []
-    if w := _summary([s for ts, s in _rows(state, WAIT_LOG) if now - DAY_S <= ts <= now]):
+    if w := _summary(_slot_waits(state, now) or [s for ts, s in _rows(state, WAIT_LOG) if now - DAY_S <= ts <= now]):
         parts.append(f"checks to start median {_hm(w['median_s'])}, p90 {_hm(w['p90_s'])} ({w['n']} runs)")
     if landed and db is not None and (lt := pushq.landing_times(db, now - DAY_S))["n"]:
         parts.append(f"approved to landed median {_hm(lt['median_s'])}, p90 {_hm(lt['p90_s'])} ({lt['n']} changes)")

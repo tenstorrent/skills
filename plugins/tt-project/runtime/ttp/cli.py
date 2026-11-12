@@ -5848,6 +5848,7 @@ def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: boo
         try:
             if on:
                 write_json(run_dir / CHECKS_SLOT_WAIT, {"since": time.time(), "pid": os.getpid(), "head": head,
+                                                        **({"arrived": arrived} if arrived else {}),
                                                         **({"suite": suite} if suite else {}),
                                                         **({"limit": limit} if suite and limit else {}),
                                                         **({"limit_from": limit_from} if suite and limit_from else {}),
