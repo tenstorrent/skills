@@ -1,0 +1,260 @@
+#!/usr/bin/env python3
+"""Block until a process exits, a log line matches, or a timeout passes.
+
+One call replaces a loop of sleep/tail polls: every poll an agent makes
+resends its whole context, so waiting inside one tool call is much cheaper.
+
+Usage:
+  wait_for --pid P [--file LOG] [--pattern REGEX] [--timeout 3600] [--tail 30]
+  wait_for --file LOG --pattern REGEX [--fail-pattern REGEX] [--new-only]
+  wait_for --cmd "pytest ... " [--file LOG] [--timeout 3600] [--tail 30]
+
+Several conditions may be combined; the first one met ends the wait. A --cmd
+that is still running when its --pattern matches keeps running (e.g. a server);
+on timeout it is killed.
+Output: one status line, then at most --tail lines (capped at 200, each line
+cut to 300 characters) from --file or the command output.
+
+Exit codes:
+  0   pattern matched, or the process/command exited 0 (a --pid that is not
+      our child exits with an unknown status, reported as 0)
+  1   the command exited non-zero, or --fail-pattern matched
+  2   usage error
+  124 timeout
+"""
+
+from __future__ import annotations
+
+import argparse
+import collections
+import os
+import pathlib
+import re
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+
+MAX_TAIL = 200
+MAX_LINE_CHARS = 300
+EXIT_OK = 0
+EXIT_FAILED = 1
+EXIT_TIMEOUT = 124
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="wait_for",
+        description="Wait for a process, a log pattern or a command, then print a short tail.",
+    )
+    parser.add_argument("--pid", type=int, help="Wait until this process exits.")
+    parser.add_argument("--file", type=pathlib.Path, help="Log file to watch and tail.")
+    parser.add_argument("--pattern", help="Regex; a matching line in --file ends the wait (exit 0).")
+    parser.add_argument("--fail-pattern", help="Regex; a matching line in --file ends the wait (exit 1).")
+    parser.add_argument("--cmd", help="Shell command to run and wait for; output goes to --file or a temp log.")
+    parser.add_argument("--timeout", type=float, default=3600, help="Seconds to wait (default 3600).")
+    parser.add_argument("--tail", type=int, default=30, help=f"Lines to print at the end (default 30, max {MAX_TAIL}).")
+    parser.add_argument("--interval", type=float, default=2.0, help="Poll interval in seconds (default 2).")
+    parser.add_argument(
+        "--new-only",
+        action="store_true",
+        help="Match only lines written after wait_for starts (default: scan the whole file).",
+    )
+    args = parser.parse_args(argv)
+    if args.pid is None and args.cmd is None and args.pattern is None:
+        parser.error("give --pid, --cmd, or --file with --pattern")
+    if args.pid is not None and args.cmd is not None:
+        parser.error("--pid and --cmd are exclusive")
+    if (args.pattern or args.fail_pattern) and args.file is None:
+        parser.error("--pattern/--fail-pattern need --file")
+    if args.timeout <= 0:
+        parser.error("--timeout must be > 0")
+    args.tail = max(0, min(args.tail, MAX_TAIL))
+    try:
+        args.pattern_re = re.compile(args.pattern) if args.pattern else None
+        args.fail_re = re.compile(args.fail_pattern) if args.fail_pattern else None
+    except re.error as exc:
+        parser.error(f"bad regex: {exc}")
+    return args
+
+
+def pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    # A zombie has exited; only its parent can reap it.
+    try:
+        stat = pathlib.Path(f"/proc/{pid}/stat").read_text()
+        return stat.rsplit(")", 1)[1].split()[0] != "Z"
+    except (OSError, IndexError):
+        return True
+
+
+class LogWatcher:
+    """Incrementally read new complete lines from a file that may not exist yet."""
+
+    def __init__(self, path: pathlib.Path, new_only: bool) -> None:
+        self.path = path
+        self.offset = 0
+        self.line_number = 0
+        self.partial = b""
+        if new_only and path.exists():
+            self.offset = path.stat().st_size
+            self.line_number = None  # unknown when skipping existing content
+
+    def new_lines(self) -> list[str]:
+        try:
+            size = self.path.stat().st_size
+        except FileNotFoundError:
+            return []
+        if size < self.offset:  # truncated or rotated: start over
+            self.offset, self.partial = 0, b""
+        if size == self.offset:
+            return []
+        with self.path.open("rb") as handle:
+            handle.seek(self.offset)
+            data = handle.read(size - self.offset)
+        self.offset = size
+        data = self.partial + data
+        *lines, self.partial = data.split(b"\n")
+        decoded = [line.decode("utf-8", "replace").rstrip("\r") for line in lines]
+        if self.line_number is not None:
+            self.line_number += len(decoded)
+        return decoded
+
+    def flush(self) -> list[str]:
+        rest, self.partial = self.partial, b""
+        return [rest.decode("utf-8", "replace")] if rest else []
+
+
+def tail_lines(path: pathlib.Path | None, count: int) -> list[str]:
+    if path is None or count <= 0 or not path.exists():
+        return []
+    window: collections.deque[str] = collections.deque(maxlen=count)
+    with path.open("rb") as handle:
+        for raw in handle:
+            window.append(raw.decode("utf-8", "replace").rstrip("\r\n"))
+    return list(window)
+
+
+def clip(line: str) -> str:
+    return line if len(line) <= MAX_LINE_CHARS else line[: MAX_LINE_CHARS - 3] + "..."
+
+
+def stop_command(proc: subprocess.Popen) -> None:
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+        proc.wait(timeout=10)
+    except (ProcessLookupError, subprocess.TimeoutExpired):
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        proc.wait()
+
+
+def run(args: argparse.Namespace) -> int:
+    start = time.monotonic()
+    deadline = start + args.timeout
+    log_path = args.file
+    proc: subprocess.Popen | None = None
+    cleanup: pathlib.Path | None = None
+    if args.cmd is not None:
+        if log_path is None:
+            handle, name = tempfile.mkstemp(prefix="wait_for-", suffix=".log")
+            os.close(handle)
+            log_path = cleanup = pathlib.Path(name)
+        out = log_path.open("ab")
+        proc = subprocess.Popen(
+            args.cmd, shell=True, stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, start_new_session=True
+        )
+        out.close()
+    watcher = LogWatcher(args.file, args.new_only) if (args.pattern_re or args.fail_re) else None
+
+    def elapsed() -> str:
+        return f"{time.monotonic() - start:.0f}s"
+
+    def check_lines(lines: list[str]) -> tuple[int, str] | None:
+        for line in lines:
+            if args.fail_re and args.fail_re.search(line):
+                return EXIT_FAILED, f"fail-pattern matched after {elapsed()}: {clip(line)}"
+            if args.pattern_re and args.pattern_re.search(line):
+                return EXIT_OK, f"pattern matched after {elapsed()}: {clip(line)}"
+        return None
+
+    status: tuple[int, str] | None = None
+    try:
+        while status is None:
+            if watcher is not None:
+                status = check_lines(watcher.new_lines())
+                if status:
+                    break
+            if proc is not None and proc.poll() is not None:
+                if watcher is not None:
+                    status = check_lines(watcher.new_lines() + watcher.flush())
+                    if status:
+                        break
+                code = proc.returncode
+                status = (EXIT_OK if code == 0 else EXIT_FAILED, f"command exited {code} after {elapsed()}")
+                break
+            if args.pid is not None and not pid_alive(args.pid):
+                if watcher is not None:
+                    status = check_lines(watcher.new_lines() + watcher.flush())
+                    if status:
+                        break
+                status = (EXIT_OK, f"process {args.pid} exited after {elapsed()} (exit status unknown: not our child)")
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                what = []
+                if args.pid is not None:
+                    what.append(f"pid {args.pid} still running")
+                if proc is not None:
+                    what.append(f"command still running (killed, pid {proc.pid})")
+                if args.pattern:
+                    what.append(f"no match for {args.pattern!r}")
+                status = (EXIT_TIMEOUT, f"timeout after {args.timeout:g}s: " + "; ".join(what))
+                if proc is not None:
+                    stop_command(proc)
+                break
+            if proc is not None:
+                try:
+                    proc.wait(timeout=min(args.interval, remaining))
+                except subprocess.TimeoutExpired:
+                    pass
+            else:
+                time.sleep(min(args.interval, remaining))
+    except KeyboardInterrupt:
+        if proc is not None:
+            stop_command(proc)
+        raise
+
+    code, message = status
+    if proc is not None and proc.poll() is None:
+        message += f" (command still running, pid {proc.pid}, output {log_path})"
+    label = {EXIT_OK: "OK", EXIT_FAILED: "FAILED", EXIT_TIMEOUT: "TIMEOUT"}[code]
+    lines = tail_lines(log_path, args.tail)
+    source = "command output" if cleanup is not None else str(log_path) if log_path else None
+    print(f"wait_for {label}: {message}")
+    if lines:
+        print(f"--- last {len(lines)} lines of {source} ---")
+        for line in lines:
+            print(clip(line))
+    if cleanup is not None:
+        if code == EXIT_OK:
+            cleanup.unlink(missing_ok=True)
+        else:
+            print(f"(full command output kept at {cleanup}; read it with tail/grep, not cat)")
+    return code
+
+
+def main(argv: list[str] | None = None) -> int:
+    return run(parse_args(argv))
+
+
+if __name__ == "__main__":
+    sys.exit(main())
