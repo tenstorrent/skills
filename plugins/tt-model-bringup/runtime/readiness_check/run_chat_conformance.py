@@ -60,7 +60,7 @@ from readiness_check.served_api import (
 
 PROBE = "chat_conformance"
 NOT_WAIVABLE = ("c01", "c02")
-DEFAULT_MAX_TOKENS = 4096
+DEFAULT_MAX_TOKENS = 8192
 DEFAULT_SHORT_MAX_TOKENS = 512
 DEFAULT_LONG_SYSTEM_TOKENS = 4096
 THINKING_HINT = re.compile(r"enable_thinking|reasoning_content|<think>|thinking|reasoning_effort")
@@ -170,8 +170,12 @@ def _answer_checks(ctx: Ctx, body: Any, *, need_reasoning: bool, expect: Optiona
     msg = _message(body)
     content, reasoning = msg.get("content") or "", _reasoning(msg)
     if not content.strip():
-        why = " (finish_reason length: raise --max-tokens)" if _finish(body) == "length" else ""
-        hard.append(f"empty content{why}")
+        if _finish(body) == "length":
+            # The model was still thinking at the probe's budget: a probe budget limit,
+            # not a serving defect. Report it, and rerun with a larger --max-tokens.
+            soft.append("empty content at the token budget (finish_reason length: raise --max-tokens)")
+        else:
+            hard.append("empty content")
     if need_reasoning and not reasoning.strip():
         hard.append("empty reasoning_content/reasoning (is --reasoning-parser set for this family?)")
     leaked = _leaks(content, ctx.tags)

@@ -215,6 +215,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--plain-profile", default="plain", help="reference profile for the host-sampling ratio")
     p.add_argument("--users", type=int, default=32)
     p.add_argument("--max-tokens", type=int, default=6000)
+    p.add_argument("--stop-at-eos", action="store_true", help="let answers end at EOS (default: run to --max-tokens)")
     p.add_argument("--prompts-file", type=Path, default=DEFAULT_PROMPTS)
     p.add_argument("--bucket-tokens", type=int, default=1000)
     p.add_argument("--compare-tokens", type=int, default=256, help="output length of the host-sampling comparison")
@@ -245,7 +246,9 @@ def run(args: argparse.Namespace) -> Path:
     profile = sp.load_profile(args.profile, args.profiles_file, hf_model=args.hf_model or None, revision=args.revision)
     plain = sp.load_profile(args.plain_profile, args.profiles_file, hf_model=args.hf_model or None, revision=args.revision)
     prompts = load_prompts(args.prompts_file, args.users)
-    ignore_eos = sp.profile_ignores_eos(profile)
+    # Speed and memory at length matter here, not answer content: run every answer to
+    # --max-tokens unless --stop-at-eos asks for natural lengths.
+    ignore_eos = sp.profile_ignores_eos(profile) or not args.stop_at_eos
     raw_dir = Path(args.model_dir) / RESULT_DIR / PROBE
     log = sp.ServerLog(args.server_log)
     checks: list[dict] = []

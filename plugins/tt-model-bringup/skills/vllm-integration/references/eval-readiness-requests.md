@@ -124,7 +124,7 @@ wrong answer or a missing finish reason.
 | Failure | Usual meaning | Fix |
 |---|---|---|
 | c02/c11 empty reasoning, or tags in content | no or wrong reasoning parser | pick vLLM's built-in `--reasoning-parser` for the family; a model-folder parser via `--reasoning-parser-plugin` only when none fits |
-| c02 empty content, finish `length` | thinking ran out of `--max-tokens` | raise `--max-tokens`; if the model never ends thinking, it is a model or template issue |
+| empty content, finish `length` (any thinking case; advisory) | thinking ran out of `--max-tokens` (default 8192) | raise `--max-tokens`; if the model never ends thinking, it is a model or template issue |
 | c04 no tool_calls | auto tool choice off or wrong parser | `--enable-auto-tool-choice --tool-call-parser <family>` |
 | c04 `content is dict` | the parser decodes JSON-looking strings regardless of schema | a schema-aware parser in the model folder via `--tool-parser-plugin` (Muse did this) |
 | c01 empty or wrong answer, `render_c01` differs | content-format detection renders list parts as nothing | `--chat-template-content-format string` (K2-7B: fixed all-zero chat evals) |

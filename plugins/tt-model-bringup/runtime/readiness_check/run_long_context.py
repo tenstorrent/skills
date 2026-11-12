@@ -310,13 +310,16 @@ def run_timing(args, server: str, model: str, max_len: Optional[int], log: sp.Se
         checks.append(check("ttft_127_vs_128", False, severity="advisory", detail="TTFT for 127/128 not measured"))
     cliffs = []
     for a, b in zip(rows, rows[1:]):
-        if a["tpot_ms"] and b["tpot_ms"] and b["tpot_ms"] > args.cliff_ratio * a["tpot_ms"]:
+        # Decode that reads the KV cache grows at most linearly with context, so a jump
+        # is a cliff only when it beats both the cliff ratio and the length ratio.
+        bound = max(args.cliff_ratio, b["length"] / a["length"])
+        if a["tpot_ms"] and b["tpot_ms"] and b["tpot_ms"] > bound * a["tpot_ms"]:
             cliffs.append(f"{a['length']}->{b['length']}: {a['tpot_ms']}->{b['tpot_ms']} ms")
     measured = [row for row in rows if row["tpot_ms"]]
     checks.append(check(
         "tpot_cliff", not cliffs and len(measured) == len(rows), severity="advisory", value=len(cliffs),
         threshold=args.cliff_ratio,
-        detail=("TPOT jumps > {:g}x: {}; look for a slow long-context kernel path (time box 2 h)".format(args.cliff_ratio, "; ".join(cliffs))
+        detail=("TPOT grows faster than both {:g}x and the context ratio: {}; look for a slow long-context kernel path (time box 2 h)".format(args.cliff_ratio, "; ".join(cliffs))
                 if cliffs else ("TPOT measured at every length, no cliff" if len(measured) == len(rows)
                                 else "TPOT missing at some lengths"))))
 

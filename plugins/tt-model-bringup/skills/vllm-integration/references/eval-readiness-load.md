@@ -42,7 +42,7 @@ Accuracy (stage 9): a needle fact ("the secret passphrase for the lighthouse kee
 
 Timing (stage 10): `--part timing` measures single-user decode ms/token at 1K, 8K, 32K and 128K (32 output tokens, `ignore_eos`), and TTFT for 127- against 128-token prompts.
 
-- `tpot_cliff` (advisory): TPOT more than 2x between adjacent lengths. Evidence: one model took 13 ms at 32K, 229 ms at 64K and 1.75 s at 512K; 8 of 10 agentic tasks then timed out, and the fix (an existing fast kernel) took a week of CI runs.
+- `tpot_cliff` (advisory): TPOT grows between adjacent lengths by more than both 2x and the length ratio (decode that reads the KV cache grows at most linearly with context; MoVA went 61 → 145 ms from 32K to 128K, which is normal). Evidence: one model took 13 ms at 32K, 229 ms at 64K and 1.75 s at 512K; 8 of 10 agentic tasks then timed out, and the fix (an existing fast kernel) took a week of CI runs.
 - `ttft_127_vs_128` (advisory): ratio above 1.5. Evidence: one model took 556 ms for a non-power-of-two prompt and 190 ms for an aligned one, because the unaligned prompt ran several prefill passes.
 - `timing_requests_completed` (critical): any timing request failed.
 
@@ -75,7 +75,7 @@ The probe first runs a short burst with the eval profile and one with the plain 
 | `preemptions` | critical, waivable | more than 1 preemption while the KV pool fits users x (prompt + answer) | pool size (`gpu_memory_utilization`, `num_gpu_blocks`), scheduler budget; advisory when the pool does not fit |
 | `functional_floor` | critical | per-user tok/s in the first answer bucket below the floor | host sampling, per-row loops, a slow MoE layout |
 | `context_slowdown` | advisory | last-bucket aggregate below half the first | long-context decode path |
-| `answer_length` | advisory | median answer below half of `--max-tokens` | harder prompts or an `ignore_eos` profile |
+| `answer_length` | advisory | median answer below half of `--max-tokens` (only with `--stop-at-eos`; by default every answer runs to `--max-tokens`) | harder prompts |
 | `eval_forecast` | advisory | an eval or the total over 80% of the CI cap | run the suggested subset or output cap |
 
 Floor: the FUNCTIONAL bar is single-user decode at 10% or more of the theoretical roofline ($optimize, "Theoretical roofline"). Decode is weight-bandwidth bound, so a batch should not drop each user below 10% of the theoretical per-user rate at that batch. Pass `--theoretical-tps` as the roofline at 32 users (for MoE, count the experts 32 users touch), or the floor itself with `--functional-floor-tps`. Without either, the check is an advisory reminder.
