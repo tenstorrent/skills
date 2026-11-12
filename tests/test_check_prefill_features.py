@@ -192,20 +192,27 @@ def test_excluded_model_with_a_passing_served_check_is_a_contract_defect(tmp_pat
     assert 'fix the contract' in result.stderr
 
 
-def test_burst_gate_is_advisory_in_vllm_and_critical_when_required(tmp_path):
+def test_burst_gate_is_advisory_at_both_stages_unless_burst_critical(tmp_path):
     model = tmp_path / 'model'
     full_evidence(model, burst=burst(ratio=0.8))
     advisory = run(model, '--stage', 'vllm')
     assert advisory.returncode == 1, advisory.stderr
     assert 'exceeds 0.6' in advisory.stderr
-    required = run(model, '--stage', 'optimized-vllm', '--require-burst')
-    assert required.returncode == 2
+    # D5: the Stage 10 check script still passes --require-burst; the ratio is recorded, not required.
+    stage10 = run(model, '--stage', 'optimized-vllm', '--require-burst')
+    assert stage10.returncode == 1, stage10.stderr
+    assert 'advisory: prefill burst p99 TTFT ratio' in stage10.stderr
+    assert run(model, '--stage', 'optimized-vllm', '--burst-critical').returncode == 2
     missing = tmp_path / 'other'
     full_evidence(missing, burst=None)
-    assert run(missing, '--require-burst').returncode == 2
+    result = run(missing, '--stage', 'optimized-vllm', '--require-burst')
+    assert result.returncode == 1, result.stderr
+    assert 'vllm_prefill_burst_benchmark.json is missing' in result.stderr
+    assert run(missing, '--burst-critical').returncode == 2
     no_reference = tmp_path / 'noref'
     full_evidence(no_reference, burst=burst(with_reference=False))
-    result = run(no_reference, '--require-burst')
+    assert run(no_reference, '--require-burst').returncode == 1
+    result = run(no_reference, '--burst-critical')
     assert result.returncode == 2
     assert 'serial_reference' in result.stderr
 
@@ -213,14 +220,33 @@ def test_burst_gate_is_advisory_in_vllm_and_critical_when_required(tmp_path):
 def test_burst_mean_ratio_and_config_mismatch_are_gated(tmp_path):
     model = tmp_path / 'mean'
     full_evidence(model, burst=burst(ratio=0.4, mean_ratio=0.7))
-    result = run(model, '--require-burst')
+    assert run(model, '--require-burst').returncode == 1
+    result = run(model, '--burst-critical')
     assert result.returncode == 2
     assert 'mean TTFT ratio' in result.stderr
     mismatch = tmp_path / 'mismatch'
     full_evidence(mismatch, burst=burst(config_matches=False))
-    result = run(mismatch, '--require-burst')
+    result = run(mismatch, '--burst-critical')
     assert result.returncode == 2
     assert 'different workload config' in result.stderr
+
+
+def test_enabled_batched_prefill_needs_batched_equals_solo_evidence(tmp_path):
+    data = contract()
+    data['rows'].append({'item': 'batched_prefill', 'kind': 'call', 'status': 'supported',
+                         'evidence': 'readiness/batched_equals_solo.log'})
+    model = tmp_path / 'model'
+    full_evidence(model, contract=data)
+    result = run(model, '--stage', 'optimized-vllm', '--require-burst')
+    assert result.returncode == 2, result.stderr
+    assert 'batched-equals-solo evidence readiness/batched_equals_solo.log does not exist' in result.stderr
+    write(model / 'readiness/batched_equals_solo.log', 'all rows bit-equal\n')
+    assert run(model, '--stage', 'optimized-vllm', '--require-burst').returncode == 0
+    data['rows'][-1] = {'item': 'batched_prefill', 'kind': 'call', 'status': 'not_supported',
+                        'declaration': 'per-row prefill', 'reason': 'optional (D5)'}
+    off = tmp_path / 'off'
+    full_evidence(off, contract=data)
+    assert run(off, '--stage', 'optimized-vllm', '--require-burst').returncode == 0
 
 
 def test_plugin_owned_prefix_caching_is_blocked_not_failed(tmp_path):
