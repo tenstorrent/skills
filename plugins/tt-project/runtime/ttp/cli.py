@@ -8909,6 +8909,9 @@ def _model_suite(p, a, now: float) -> None:
         else:
             print(f"model-bench suite: no complete `ttp bench prep` and `ttp bench cells` folder pair under "
                   f"{modelbench.home()}: the replay and injection cells run 0 tasks (babysit only)", file=sys.stderr)
+    if a.harbor and not a.dry_run:   # Terminal-Bench: the endpoint reaches harbor's environment only
+        from .harborslice import settings
+        opts.update(terminalbench=settings(cfg), endpoint_url=got.url, endpoint_key=got.key)
     try:
         rows = modelsuite.run(p.db, cfg, served, modelrank.parked_models(p.db), now, date=a.date or "",
                               bench_dir=bench_dir, cells_dir=cells_dir, opts=opts, ask=ask)

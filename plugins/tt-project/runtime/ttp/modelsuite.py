@@ -20,7 +20,7 @@ conclusive model's verdict (worst class pass rate; weak under modelbench.PASS_MI
 in modelbench's MODELS (modelbench.record, with a weekly arm's recheck kept per model and date), so a
 parked model the suite passes is free again (modelrank.parked) and one it fails stays parked. An
 optional Terminal-Bench slice (harborslice.py, opts["harbor_tasks"] > 0; off by default) adds one
-information-only "terminalbench" row per model. It never
+"terminalbench" row per model, which decides its verdict when present. It never
 runs where the claude CLI is missing (spill hosts hold none) and runs at nice NICE.
 """
 from __future__ import annotations
@@ -320,21 +320,33 @@ def run(db, cfg: dict, served: list[str], parked: dict[str, float], now: float, 
         if (n := int(opts.get("harbor_tasks") or 0)) > 0 and not opts.get("dry_run"):   # off by default
             from . import harborslice
             r = harborslice.row(model, date, n, d, out, opts, **({"runner": harbor_runner} if harbor_runner else {}))
-            row = {"date": date, "model": model, "class": "terminalbench", "arm": why, "seed": seed(date),
+            row = {"date": date, "model": model, "class": "terminalbench", "effort": effort(cfg, "standard"),
+                   "arm": why, "seed": seed(date),
                    "dry_run": False, "at": now, **r, **scored(r, "terminalbench")}
             _append(d / f"{date}.jsonl", row)
             rows.append(row)
     if not opts.get("dry_run"):
-        modelbench.record({m: v for m, why in picked.items() if (v := verdict(rows, m, why))}, now, "suite")
+        from .harborslice import settings
+        share = settings(cfg)["floor_share"]
+        modelbench.record({m: v for m, why in picked.items() if (v := verdict(rows, m, why, share))}, now, "suite")
     (d / TAKEN).unlink(missing_ok=True)
     return rows
 
 
-def verdict(rows: list[dict], model: str, arm: str) -> tuple[float, bool, str] | None:
-    """`model`'s (score, weak, arm) from its class rows for modelbench.record, or None when inconclusive (a
-    harness or endpoint fault in any class, or no scored cell). The score is its worst class pass rate; a
-    score under modelbench.PASS_MIN or any `bar` (an injection followed) is weak."""
+def verdict(rows: list[dict], model: str, arm: str, floor_share: float | None = None) -> tuple[float, bool, str] | None:
+    """`model`'s (score, weak, arm) from its rows for modelbench.record, or None when inconclusive (a harness
+    or endpoint fault, or no scored cell). A Terminal-Bench row decides when there is one: its pass rate under
+    floor_share (model_bench.terminalbench.floor_share) of the best TB rate among `rows`, or any `bar`, is weak.
+    Else the score is its worst class pass rate; under modelbench.PASS_MIN or any `bar` is weak."""
+    from .harborslice import FLOOR_SHARE
     from .modelbench import PASS_MIN
+    tb = [r for r in rows if r.get("class") == "terminalbench" and r.get("pass_rate") is not None]
+    if mine := [r for r in tb if r["model"] == model]:
+        if mine[-1].get("faults"):
+            return None
+        best, rate = max(r["pass_rate"] for r in tb), mine[-1]["pass_rate"]
+        share = FLOOR_SHARE if floor_share is None else floor_share
+        return rate, rate < share * best or any(r.get("bar") for r in rows if r["model"] == model), arm
     mine = [r for r in rows if r["model"] == model and r.get("class", "standard") in CLASS_TIER]
     rates = [r["pass_rate"] for r in mine if r.get("pass_rate") is not None]
     if not rates or any(r.get("faults") for r in mine):

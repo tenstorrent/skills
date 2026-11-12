@@ -961,11 +961,8 @@ def test_model_suite_harbor_slice_is_off_by_default_and_installs_only_into_its_o
 
     def runner(cmd, env, timeout):   # a fake venv, pip and harbor: task-a passes, the rest fail
         calls.append((cmd, env))
-        if cmd[0] == "harbor":
-            jobs = Path(cmd[cmd.index("--jobs-dir") + 1])
-            reward = 1.0 if cmd[cmd.index("--task-name") + 1] == "task-a" else 0.0
-            (jobs / "trial-1").mkdir(parents=True)
-            (jobs / "trial-1" / "result.json").write_text(json.dumps({"verifier_result": {"rewards": {"reward": reward}}}))
+        if cmd[0] == "nice":
+            _fake_trial(cmd, 1.0 if cmd[cmd.index("-i") + 1] == "task-a" else 0.0)
         return 0, ""
     cfg = {"providers": {"chat": {"model_ranking": ["m-a"]}}}
     go = lambda date, opts: modelsuite.run(p.db, cfg, ["m-a"], {}, 1e7, date=date, opts=opts, ask=lambda m, q: "skip",
@@ -984,7 +981,7 @@ def test_model_suite_harbor_slice_is_off_by_default_and_installs_only_into_its_o
     assert "--user" not in pip and pip_env["PIP_REQUIRE_VIRTUALENV"] == "1" and pip_env["PYTHONNOUSERSITE"] == "1"
     assert "PIP_USER" not in pip_env and pip_env["VIRTUAL_ENV"] == str(venv)
     assert all(e["PATH"].startswith(str(venv / "bin")) for c, e in calls[2:]), "harbor runs from the run's own venv"
-    assert modelsuite.verdict(rows, "m-a", "daily") == (1.0, False, "daily"), "the slice never feeds the verdict"
+    assert modelsuite.verdict(rows, "m-a", "daily") == (round(1 / 3, 3), False, "daily"), "the TB row decides the verdict"
     calls.clear()
     go("2026-11-10", {"harbor_tasks": 3})
     assert [c for c, e in calls if "pip" in c] == [], "an installed venv is reused"
@@ -1005,7 +1002,95 @@ def test_harbor_slice_failed_install_skips_it_without_another_route(env, tmp_pat
     assert harborslice.row("m-a", "2026-11-10", 2, d, tmp_path / "cells", {}, runner)["skipped"] == r["skipped"]
     assert len(calls) == 2, "a failed install is never retried"
     (d / harborslice.TASKS).unlink()
-    assert "no task names" in harborslice.row("m-a", "2026-11-10", 2, d, tmp_path / "c2", {}, runner)["skipped"]
+    assert harborslice.tasks(d, harborslice.settings({})) == list(harborslice.DEFAULT_TASKS), "no names: the public subset"
+
+
+def _fake_trial(cmd, reward=None, exc=None, finished=True):
+    """What a fake `harbor run` leaves: the job's result.json and one trial's result.json."""
+    job = Path(cmd[cmd.index("-o") + 1]) / cmd[cmd.index("--job-name") + 1]
+    (job / "t-1").mkdir(parents=True, exist_ok=True)
+    (job / "config.json").write_text("{}")
+    t = {"started_at": "2026-11-12T10:00:00Z", "finished_at": "2026-11-12T10:06:00Z",
+         "verifier_result": None if reward is None else {"rewards": {"reward": reward}}, "exception_info": exc}
+    (job / "t-1" / "result.json").write_text(json.dumps(t))
+    (job / "result.json").write_text(json.dumps({"finished_at": "x" if finished else None}))
+    return job
+
+
+def test_terminalbench_trial_runs_terminus2_with_the_key_in_env_only_and_resumes(tmp_path):
+    from ttp import harborslice
+    st = {**harborslice.settings({"model_bench": {"terminalbench": {"concurrency": 2, "limit_s": 900}}})}
+    ds = tmp_path / "ds"
+    (ds / "t-a").mkdir(parents=True)
+    (ds / "t-a" / "task.toml").write_text("[agent]\ntimeout_sec = 1800.0\n")
+    st["dataset"] = str(ds)
+    env = {"OPENAI_BASE_URL": "http://endpoint.invalid/v1", "OPENAI_API_KEY": "fake-key"}
+    calls = []
+
+    def runner(cmd, e, timeout):
+        calls.append(cmd)
+        _fake_trial(cmd, 1.0)
+        return 0, ""
+    got = harborslice.trial("org/m-a", "t-a", tmp_path / "jobs", env, st, runner, sleep=lambda s: None)
+    cmd = calls[0]
+    assert cmd[:3] == ["nice", "-n", "10"] and cmd[3:5] == ["harbor", "run"]
+    assert cmd[cmd.index("-a") + 1] == "terminus-2" and cmd[cmd.index("-m") + 1] == "openai/org/m-a"
+    assert cmd[cmd.index("-n", 3) + 1] == "1" and cmd[cmd.index("-i") + 1] == "t-a"
+    assert cmd[cmd.index("--agent-timeout-multiplier") + 1] == "0.5", "900 s of the task's own 1800 s"
+    assert 'llm_call_kwargs={"num_retries":8}' in cmd and not any("fake-key" in w or "endpoint" in w for w in cmd)
+    assert got == {"reward": 1.0, "min": 6.0, "error": None}
+    assert harborslice.trial("org/m-a", "t-a", tmp_path / "jobs", env, st, runner) == got and len(calls) == 1, \
+        "a finished job is read, not rerun"
+    job = _fake_trial(["-o", str(tmp_path / "jobs" / "org-m-a"), "--job-name", "t-b"], finished=False)
+    harborslice.trial("org/m-a", "t-b", tmp_path / "jobs", env, st, lambda c, e, t: (calls.append(c), _fake_trial(
+        ["-o", str(job.parent), "--job-name", "t-b"], 0.0))[0] or (0, ""), sleep=lambda s: None)
+    assert calls[-1][3:] == ["harbor", "job", "resume", "-p", str(job)], "an unfinished job resumes after a restart"
+    env_ = harborslice.child_env(tmp_path / "venv", "http://endpoint.invalid/v1", "fake-key")
+    assert env_["OPENAI_API_KEY"] == "fake-key" and env_["OPENAI_BASE_URL"].endswith("/v1")
+
+
+def test_terminalbench_429_is_waited_out_and_a_setup_error_reruns_once(tmp_path):
+    from ttp import harborslice
+    st = {**harborslice.settings({}), "concurrency": 1}
+    script, slept = [("rate", None), ("ok", 1.0)], []
+
+    def runner(cmd, e, t):
+        kind, r = script.pop(0)
+        exc = {"exception_type": "RateLimitError", "exception_message": "429 Too Many Requests, retry after 7 s"}
+        _fake_trial(cmd, r, exc if kind == "rate" else {"exception_type": "EnvironmentStartTimeoutError"}
+                    if kind == "setup" else None)
+        return 0, ""
+    got = harborslice.trial("m", "t", tmp_path / "j", {}, st, runner, sleep=slept.append)
+    assert got["reward"] == 1.0 and slept == [7.0] and not script, "a 429 is waited out, then rerun"
+    script[:] = [("setup", None), ("ok", 0.0)]
+    assert harborslice.trial("m", "t2", tmp_path / "j", {}, st, runner, sleep=slept.append)["reward"] == 0.0
+    script[:] = [("setup", None), ("setup", None)]
+    fault = harborslice.trial("m", "t3", tmp_path / "j", {}, st, runner, sleep=slept.append)
+    assert fault["reward"] is None and fault["error"] == "EnvironmentStartTimeoutError" and not script
+    assert harborslice.score([got, {"reward": 0.0, "min": 2.0}, fault]) == \
+        {"passed": 1, "trials": 2, "pass_rate": 0.5, "median_min": 4.0, "faults": 1}, "a fault is no trial"
+
+
+def test_terminalbench_ranks_first_and_decides_the_verdict(env, monkeypatch):
+    from ttp import modelscore, modelsuite
+    d = _suite_home(env, monkeypatch)
+    rows = [{"model": "m-a", "class": "terminalbench", "suite": "terminalbench", "score": 0.4, "at": 1},
+            {"model": "m-b", "class": "terminalbench", "suite": "terminalbench", "score": 0.6, "at": 1},
+            {"model": "m-c", "class": "terminalbench", "suite": "terminalbench", "score": 0.4, "at": 1},
+            {"model": "m-a", "class": "standard", "suite": "suite", "score": 0.9, "at": 1},
+            {"model": "m-c", "class": "standard", "suite": "suite", "score": 0.5, "at": 1},
+            {"model": "m-d", "class": "standard", "suite": "suite", "score": 1.0, "at": 1}]
+    (d / "2026-11-12.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+    bd = modelscore.board({}, modelscore.bench(), {}, ["m-a", "m-b", "m-c", "m-d", "m-e"])
+    assert bd["m-a"]["standard"]["tb"] == 40.0 and bd["m-a"]["standard"]["bench"] == 90.0, "TB stays out of the mean"
+    assert modelscore.order(bd, "standard", "smart") == ["m-b", "m-a", "m-c", "m-d", "m-e"], \
+        "TB rate first; a tie goes to quality; models without TB after; unscored last"
+    tb = lambda m, rate, faults=0: {"model": m, "class": "terminalbench", "pass_rate": rate, "faults": faults}
+    day = [tb("m-a", 0.6), tb("m-b", 0.2), tb("m-c", 0.5, faults=1)]
+    assert modelsuite.verdict(day, "m-a", "daily") == (0.6, False, "daily"), "the best passes: freed"
+    assert modelsuite.verdict(day, "m-b", "daily") == (0.2, True, "daily"), "under half the best: parked"
+    assert modelsuite.verdict(day, "m-c", "daily") is None, "an endpoint fault: inconclusive"
+    assert modelsuite.verdict(day, "m-b", "daily", floor_share=0.3) == (0.2, False, "daily"), "the floor is a setting"
 
 
 def test_model_suite_decisions_map_verb_records_and_faults_never_set_the_bar(env, tmp_path):

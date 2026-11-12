@@ -1490,9 +1490,17 @@ Messages calls into `<base url>/chat/completions` calls and back, and ends with 
    `~/.tt-project/model-bench/harbor-tasks.txt` (one per line) run per model through Harbor, which is
    installed only into a venv in that day's cells folder (`python3 -m venv`, then that venv's pip, never
    `pip install --user`). If the install fails, for example because outbound access is blocked, the
-   slice is skipped with the reason and no other route is tried. Its `terminalbench` row is for
-   information only and never feeds a verdict. The adapter is tested with fakes only; its reading of
-   Harbor's trial results has not been checked against a real Harbor run.
+   slice is skipped with the reason and no other route is tried. The slice runs Harbor's `terminus-2`
+   agent against the `chat` endpoint (its URL and key only in the child's environment), one trial per
+   task, each (model, task) its own Harbor job that resumes after a restart; HTTP 429 answers are waited
+   out and never scored, and a setup error reruns once, then counts as a fault. A host-wide trial cap is
+   sized to free cores. Its `terminalbench` row (passed/trials, median minutes per trial) is the main
+   ranking input: served models rank by Terminal-Bench pass rate first, then live outcomes, the 6-cell
+   bench and the public index. It decides the verdict: under `floor_share` of the best served model's
+   rate parks the model, a pass frees it, and endpoint faults leave it inconclusive. Settings live under
+   `model_bench.terminalbench` (`on`, `tasks_file`, `agent`, `limit_s` default 900, `concurrency` 0 =
+   free cores / 4, `floor_share` default 0.5, `dataset` default `terminal-bench@2.0`); with no tasks file a
+   shipped public 20-task subset is used. The adapter is tested with fakes only.
    Endpoint faults (down, rate limit, auth) park nothing. With no ranked model served, or the whole endpoint
    cooling down, runs start on the core provider as before. Only `chat` has a served list: Claude
    Code, Codex and Cursor models are not ranked (provider failover covers a provider that cannot start

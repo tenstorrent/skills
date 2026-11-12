@@ -18,6 +18,8 @@ prompt-injection cell}); a model's bench score is the mean of its latest score p
 row names one. A failed injection cell bars the model from babysit (and from untrusted_input work: barred).
 Prior: the Artificial Analysis index (rankfresh.py's state), only for a model with no bench score.
 
+Terminal-Bench (board's "tb"): a model's latest suite TB pass rate (harborslice.py), kept out of the bench
+mean. Order (order): models with a TB rate first, highest first; ties, and models without one, by quality.
 Quality (board) = the bench score (else the prior) weighted against the live good share (first-try done and
 not bad) by sample count: live weighs n / (n + live_k) (providers.chat.class_prefs.live_k, default LIVE_K);
 with neither bench nor prior, live alone. Orders per class (order): smart, highest quality first; fast, the
@@ -38,6 +40,8 @@ import statistics
 from pathlib import Path
 
 from . import route
+
+TB = "terminalbench"   # the Terminal-Bench suite (harborslice.py): the ranking's first key
 
 CLASSES = ("babysit", "light", "standard", "review")
 FAST_CLASSES = ("babysit",)          # auto means fast here (latency-bound)
@@ -219,8 +223,11 @@ def board(live: dict, benched: dict, prior: dict[str, float], models, live_k: fl
         b = benched.get(m) or {}
         for cls in CLASSES:
             s = (live.get(m) or {}).get(cls) or {}
-            suites = (b.get("scores") or {}).get(cls) or (b.get("scores") or {}).get("*") or {}
+            sc = b.get("scores") or {}
+            suites = {k: v for k, v in (sc.get(cls) or sc.get("*") or {}).items() if k != TB}
             bs = statistics.fmean(v[1] for v in suites.values()) if suites else None
+            tbs = [v for c in sc.values() for k, v in c.items() if k == TB]
+            tb = max(tbs)[1] if tbs else None   # the latest Terminal-Bench pass rate, any class
             base = bs if bs is not None else prior.get(m)
             n, good = int(s.get("n") or 0), int(s.get("good") or 0)
             lq = 100.0 * good / n if n else None
@@ -229,6 +236,7 @@ def board(live: dict, benched: dict, prior: dict[str, float], models, live_k: fl
             tok = float(s.get("out_tokens") or 0) / float(s["tok_wall_s"]) if s.get("tok_wall_s") else None
             out.setdefault(m, {})[cls] = {"quality": None if q is None else round(q, 2), "n": n, "good": good,
                                           "bench": None if bs is None else round(bs, 1), "prior": prior.get(m),
+                                          "tb": None if tb is None else round(tb, 1),
                                           "wall_s": s.get("wall_med_s"), "tok_s": None if tok is None else round(tok, 1)}
     return out
 
@@ -238,12 +246,14 @@ def order(bd: dict, cls: str, prefer: str, margin: float = MARGIN_PTS, floor: fl
     """`cls`'s models, best first by `prefer` (smart or fast); unscored ones last in `known`'s order."""
     pos = {m: i for i, m in enumerate(known or [])}
     ms = [m for m in bd if not (cls == "babysit" and m in barred)]
-    scored = sorted((m for m in ms if bd[m][cls]["quality"] is not None), key=lambda m: (-bd[m][cls]["quality"], m))
-    rest = sorted((m for m in ms if bd[m][cls]["quality"] is None), key=lambda m: (pos.get(m, len(pos)), m))
+    has = lambda m: bd[m][cls]["quality"] is not None or bd[m][cls].get("tb") is not None
+    scored = sorted((m for m in ms if has(m)), key=lambda m: (bd[m][cls].get("tb") is None, -(bd[m][cls].get("tb") or 0),
+                                                              -(bd[m][cls]["quality"] or 0), m))
+    rest = sorted((m for m in ms if not has(m)), key=lambda m: (pos.get(m, len(pos)), m))
     if prefer != "fast" or not scored:
         return scored + rest
-    best = bd[scored[0]][cls]["quality"]
-    elig = [m for m in scored if bd[m][cls]["quality"] >= max(best - margin, floor)]
+    best = bd[scored[0]][cls]["quality"] or 0
+    elig = [m for m in scored if (bd[m][cls]["quality"] or 0) >= max(best - margin, floor)]
 
     def speed(m):
         r = bd[m][cls]
