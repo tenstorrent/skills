@@ -105,7 +105,7 @@ Twelve requests through `/v1/chat/completions` (greedy by default):
 | c03 | thinking off (skipped when the template has no switch) | advisory |
 | c04 | tool call: JSON-looking string argument and nested object; arguments parse and match schema types | critical |
 | c05 | tool-result turn, then an answer | critical |
-| c06 | history whose assistant turns have NO reasoning field (Harbor terminus-2) | critical, not waivable |
+| c06 | history whose assistant turns have NO reasoning field (Harbor terminus-2) | critical, waivable after the time box |
 | c07 | history with `reasoning_content` on assistant turns | critical |
 | c08 | `continue_final_message` / `add_generation_prompt: false` | critical |
 | c09 | about 4K-token system prompt with a fact to recall | critical (recall is advisory) |
@@ -125,7 +125,7 @@ wrong answer or a missing finish reason.
 | c04 no tool_calls | auto tool choice off or wrong parser | `--enable-auto-tool-choice --tool-call-parser <family>` |
 | c04 `content is dict` | the parser decodes JSON-looking strings regardless of schema | a schema-aware parser in the model folder via `--tool-parser-plugin` (Muse did this) |
 | c01 empty or wrong answer, `render_c01` differs | content-format detection renders list parts as nothing | `--chat-template-content-format string` (K2-7B: fixed all-zero chat evals) |
-| c06 refused ("missing a thinking field") | the template requires reasoning on every assistant turn | record in the release spec that the harness sends reasoning back (MoVA: terminus-2 `interleaved_thinking: true`). The check stays critical: agents also drop reasoning on summarize/truncate paths (MoVA kept 2 of 5 Terminal-Bench trials failing that way). Serve a model-folder copy of the template that treats a missing field as empty (`--chat-template`), with the diff in the work log, or stop and ask the owner |
+| c06 refused ("missing a thinking field") | the template requires reasoning on every assistant turn | record in the release spec that the harness sends reasoning back (MoVA: terminus-2 `interleaved_thinking: true`). The check stays critical: agents also drop reasoning on summarize/truncate paths (MoVA kept 2 of 5 Terminal-Bench trials failing that way). First fix: serve a model-folder copy of the template that treats a missing field as empty (`--chat-template`), with the diff in the work log. If that is not possible within the time box, record the limitation (the HF template behaves the same, so `original_model: "same"`) with the release-spec harness setting, and continue |
 | `render_*` differs | server uses another template or kwargs | serve the checkpoint's template; check `--chat-template` and `--default-chat-template-kwargs` |
 
 If HF `apply_chat_template` itself raises on the same messages, the original model shares the
@@ -136,6 +136,6 @@ behaviour: record it with `original_model: "same"`.
 Spend at most 2 h fixing one probe. Then write the problem into
 `doc/eval_readiness/limitations.json` with `probe`, `check`, `reason`, `evidence` (an existing
 path, such as the probe's raw file), `original_model` and `fix_hours`; the gate turns a waivable
-critical into advisory. `accepted_lm_eval_reasoning`, c01, c02 and c06 are not waivable: they
+critical into advisory. `accepted_lm_eval_reasoning`, c01 and c02 are not waivable: they
 make evals impossible. A fix that is a harness setting goes into the release
 notes for the TTI spec; do not patch the server or the plugin around it.

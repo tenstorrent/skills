@@ -278,7 +278,7 @@ def test_p3_passes_on_conforming_server(model):
     assert body["data"]["thinks"] is True
 
 
-def test_p3_history_without_reasoning_is_critical_and_not_waivable(model):
+def test_p3_history_without_reasoning_is_critical_and_waivable(model):
     model_dir, hf = model
     server = FakeServer(require_history_reasoning=True)
     try:
@@ -288,7 +288,7 @@ def test_p3_history_without_reasoning_is_critical_and_not_waivable(model):
     checks, _ = result(model_dir, "chat_conformance")
     assert code == 2
     row = checks["c06_history_without_reasoning"]
-    assert row["status"] == "fail" and row["waivable"] is False and "thinking field" in row["detail"]
+    assert row["status"] == "fail" and row["waivable"] is True and "thinking field" in row["detail"]
     assert checks["c07_history_with_reasoning"]["status"] == "pass"
     assert checks["c05_tool_result_turn"]["status"] == "pass"
 

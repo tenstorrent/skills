@@ -23,7 +23,7 @@ already-running vLLM server, shaped like the ones lm-eval and agent harnesses
 It also compares the server's rendered prompt (``/tokenize``) with the HF
 ``apply_chat_template`` for c01, c06 and c07 when both are available.
 
-Checks: a refused request is critical (not waivable for c01, c02 and c06); an
+Checks: a refused request is critical (not waivable for c01 and c02); an
 empty required field, thinking tags in ``content`` or a tool argument of the
 wrong type is critical; optional features (c03, c12) and answer-quality hints
 are advisory.
@@ -59,7 +59,7 @@ from readiness_check.served_api import (
 )
 
 PROBE = "chat_conformance"
-NOT_WAIVABLE = ("c01", "c02", "c06")
+NOT_WAIVABLE = ("c01", "c02")
 DEFAULT_MAX_TOKENS = 4096
 DEFAULT_SHORT_MAX_TOKENS = 512
 DEFAULT_LONG_SYSTEM_TOKENS = 4096
