@@ -2,10 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Routine defaults: the daemon settles three routine coordinator triggers itself, without a model call.
 
-- A project's own expired machine change whose task is still open, or whose until-probe still says
-  not yet, is renewed for a bounded time (machine_ledger.Probes._renew), at most RENEW_MAX times per
-  entry; it never runs an undo. A no-op undo still closes the entry (machine_ledger.auto_close_rule);
-  anything else still pages.
+- A project's own machine change about to expire (within a tenth of its span) whose task is still open,
+  or whose until-probe still says not yet, is renewed by its original span (machine_ledger.Probes._renew):
+  while its until-task or until-probe holds, and at most RENEW_MAX times for one kept open only by the
+  task that made it; it never runs an undo. A no-op undo still closes the entry
+  (machine_ledger.auto_close_rule); anything else still pages.
 - A task at its run cap is held, blocked, with its summary (runcap.check); it wakes the coordinator
   only when the same task reaches its cap again.
 - A new probe stall re-runs its probe first (progress.check): a pass ends the stall, and only a probe

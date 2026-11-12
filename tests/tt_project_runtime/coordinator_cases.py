@@ -18155,9 +18155,11 @@ def test_a_machine_change_until_task_ends_with_its_task_and_a_continuation_re_ex
         if end != "gone":
             ml.edit_change(c["id"], p.name, until_task=cont, now=now + 20 + i)
             p.db.x("UPDATE tasks SET status='running' WHERE id=?", (cont,))
-    # Switching to another end drops the until-task.
+    # --expires alone moves the time and keeps the until-task; --expires-only switches to a plain time end.
     got = ml.edit_change(c["id"], p.name, expires="2h", now=now + 30)
-    assert got["until_task"] is None and "task_ended" not in got and "ends " in ml.change_line(got, now + 30)
+    assert got["until_task"] == cont
+    got = ml.edit_change(c["id"], p.name, expires="2h", now=now + 31, expires_only=True)
+    assert got["until_task"] is None and "task_ended" not in got and "ends " in ml.change_line(got, now + 31)
     # The CLI takes only an open task of the project it runs in.
     monkeypatch.setenv("TTP_PROJECT", str(p.base))
     monkeypatch.chdir(p.root)

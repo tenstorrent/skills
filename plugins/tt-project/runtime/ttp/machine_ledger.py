@@ -164,7 +164,9 @@ UNWRITABLE = (errno.EROFS, errno.EACCES, errno.EPERM)   # the shared ledger is f
 CLAIM_S = 120               # a pending page one daemon took and did not mark delivered is retried after this
 UNAVAILABLE_S = 1800         # a target that cannot act this long is passed over
 REPAGE_S = 86400             # an item still open this long after its page is paged again, one step on
-RENEW_LEAD_S = 600           # an own entry this close to expiry may be renewed (Probes._renew)
+# Probes._renew: an own entry may be renewed this close to its expiry: a tenth of its span, within these
+RENEW_LEAD_MIN_S, RENEW_LEAD_MAX_S = 600, 6 * 3600
+RENEW_KEPT = 10              # renewals listed per entry (auto_renewed); one kept open by its end renews on
 USER_AFTER_S = 86400         # a risky expired change still open this long after its first page is re-paged high
 
 # Risk rule for an expired change record (change_risk): a risky one's daily re-page to its last project is high once
@@ -690,9 +692,11 @@ def _set_test(cid: int, by: str, test: bool, now: float) -> dict:
 def edit_change(cid: int, by: str, what: str | None = None, undo: str | None = None, expires: Any = None,
                 until_probe: str | None = None, now: float | None = None, until_task: int | None = None,
                 where=None, auto_undo: bool | None = None, project=None, allow_met_probe: bool = False,
-                warn: Callable[[str], None] | None = None, queue: Path | None = None) -> dict:
+                warn: Callable[[str], None] | None = None, queue: Path | None = None,
+                expires_only: bool = False) -> dict:
     """Correct open entry #cid in place: its text, undo command or end (--expires, --until-probe or
-    --until-task, as add_change takes them, an --until-probe with an --expires too; the same until-task again
+    --until-task, as add_change takes them, an --until-probe with an --expires too; an --expires alone moves
+    only the time and keeps the entry's until-probe or until-task, `expires_only` drops them; the same until-task again
     restarts its PROBE_END_S, so a continuation task re-extends the entry, and the same until-probe again keeps
     its end but is judged afresh). Keeps its id, alias, author and creation time; records who edited it, when
     and the values it replaced in `edits`. A new end starts afresh (`page_from`): its until-probe result and overdue
@@ -706,6 +710,8 @@ def edit_change(cid: int, by: str, what: str | None = None, undo: str | None = N
     now = time.time() if now is None else now
     if sum(map(bool, (expires, until_probe, until_task))) > 1 and not (expires and until_probe and not until_task):
         raise ValueError("give one end: --expires, --until-probe (with or without --expires) or --until-task")
+    if expires_only and (not expires or until_probe or until_task):
+        raise ValueError("--expires-only goes with --expires alone")
     new: dict[str, Any] = {}
     if what is not None:
         new["what"] = _one_line(what)
@@ -723,9 +729,11 @@ def edit_change(cid: int, by: str, what: str | None = None, undo: str | None = N
                    float(expires) if isinstance(expires, (int, float)) else ends.parse_expires(expires, now, where=where))
     elif until_task:
         new.update(probe=None, until_task=int(until_task), expires=now + PROBE_END_S)
-    elif expires:
-        new.update(probe=None, until_task=None, expires=float(expires) if isinstance(expires, (int, float))
+    elif expires:   # the time alone: its until-probe or until-task stays unless --expires-only drops it
+        new.update(expires=float(expires) if isinstance(expires, (int, float))
                    else ends.parse_expires(expires, now, where=where))
+        if expires_only:
+            new.update(probe=None, until_task=None)
     if auto_undo is not None:
         new["auto_undo"] = bool(auto_undo)
     if not new:
@@ -744,7 +752,8 @@ def edit_change(cid: int, by: str, what: str | None = None, undo: str | None = N
     cur = _edit(fields, where, dry=True)   # refuses here what the daemon would refuse (unknown, closed, no change)
     # keyed on the arguments and the entry's edits so far: a repeat queues nothing more, a later run edits anew
     given = {"id": cid, "by": by, "what": what, "undo": undo, "expires": expires, "until_probe": until_probe,
-             "until_task": until_task, "auto_undo": auto_undo, "edits": len(cur.get("edits") or [])}
+             "until_task": until_task, "auto_undo": auto_undo, "edits": len(cur.get("edits") or []),
+             **({"expires_only": True} if expires_only else {})}
     return _queue(queue, "edit", fields, given)
 
 
@@ -793,8 +802,14 @@ def _edit(f: dict, where=None, dry: bool = False, request: str | None = None) ->
         if "expires" in was or reprobe or {"undo", "auto_undo"} & set(was):
             for k in AUTO_UNDO_STATE:   # a new undo or end gets its tries afresh (its runs stay in the history)
                 c.pop(k, None)
+        if "expires" in was:
+            c.pop("renew_span", None)   # the next auto-renewal measures the new span
         if "expires" in was or reprobe:
-            for k in ("probe_passed", "probe_job_failed", "probe_out", "task_ended", "task_status", "page"):
+            # a time-only edit (no end kind named) keeps the result of the end it kept (its probe's pass, its task's end)
+            kept = "expires" in was and not reprobe and not {"probe", "until_task"} & set(new) \
+                and bool(c.get("probe") or c.get("until_task"))
+            for k in ("page",) if kept else ("probe_passed", "probe_job_failed", "probe_out", "task_ended",
+                                             "task_status", "page"):
                 c.pop(k, None)
             c["page_from"] = now   # a new page episode: its pages get ids of their own, not the delivered ones'
         c.setdefault("edits", []).append({"at": now, "by": by, "was": was, **({"request": request} if request else {})})
@@ -897,6 +912,30 @@ def _due(c: dict, now: float) -> str:
     if c.get("until_task"):
         return ""
     return "expired" if float(c.get("expires") or 0) <= now else ""
+
+
+def _span(c: dict) -> float:
+    """Entry `c`'s original span: creation, or its last time edit, to its first end (kept in c["renew_span"]
+    once renewed, so trimmed renewal records never change it)."""
+    if c.get("renew_span"):
+        return float(c["renew_span"])
+    edits = [float(e["at"]) for e in c.get("edits") or [] if isinstance(e, dict) and "expires" in (e.get("was") or {})]
+    start = max(edits or [float(c.get("added") or 0)])
+    first = float(((c.get("auto_renewed") or [{}])[0]).get("from") or c.get("expires") or start)
+    return max(60.0, first - start)
+
+
+def renew_span(c: dict) -> float:
+    """One auto-renewal of entry `c` (Probes._renew): its original span, never more, and at most
+    routinedefault.RENEW_MAX_S."""
+    from . import routinedefault as rd
+    return min(_span(c), float(rd.RENEW_MAX_S))
+
+
+def renew_lead(c: dict) -> float:
+    """How close to its expiry entry `c` may be renewed: a tenth of its original span, RENEW_LEAD_MIN_S to
+    RENEW_LEAD_MAX_S, and never more than one renewal (a short one is not renewed every tick)."""
+    return min(max(_span(c) / 10, RENEW_LEAD_MIN_S), RENEW_LEAD_MAX_S, renew_span(c))
 
 
 def auto_close_rule(c: dict, now: float) -> str:
@@ -2052,10 +2091,12 @@ class Probes:
             _write(LEDGER, doc)
 
     def _renew(self, now: float) -> None:
-        """Routine default (routinedefault.py): renew this project's open entries about to expire, or
-        expired, whose own task is still open or whose until-probe still says not yet, by the entry's own
-        span (RENEW_MIN_S to RENEW_MAX_S), at most RENEW_MAX times each, so no page wakes the coordinator.
-        Never runs an undo: a no-op undo still auto-closes in route, and anything else pages."""
+        """Routine default (routinedefault.py): renew this project's open entries about to expire (within
+        renew_lead: a tenth of the span), or expired, whose own task is still open or whose until-probe still
+        says not yet, by the entry's own span (renew_span). One whose until-task is open or whose until-probe
+        fails renews as long as that holds; one kept open only by the task that made it, at most RENEW_MAX
+        times. Its end (the task ended, the probe passed) stops the renewals and goes the usual way: a no-op
+        undo or --auto-undo closes it, anything else pages. Never runs an undo itself."""
         from . import routinedefault as rd
         try:
             cfg = self.p.config() if callable(getattr(self.p, "config", None)) else {}
@@ -2068,19 +2109,18 @@ class Probes:
             if c.get("by") != self.p.name or c.get("closed") or c.get("kind") == POWER_CYCLE \
                     or c.get("kind") in EXPIRY_UNDO_KINDS or c.get("auto_undo") or noop_undo(c.get("undo")) \
                     or c.get("probe_passed") or c.get("probe_job_failed") or c.get("task_ended") \
-                    or not c.get("expires") or float(c["expires"]) - now > RENEW_LEAD_S \
-                    or len(c.get("auto_renewed") or []) >= rd.RENEW_MAX:
+                    or not c.get("expires") or float(c["expires"]) - now > renew_lead(c):
                 continue
-            why = ""
-            for tid in (c.get("task"), c.get("until_task")):
+            why, held = "", False   # held: its own end (until-task, until-probe) keeps it needed, no cap
+            for tid, own_end in ((c.get("until_task"), True), (c.get("task"), False)):
                 row = self.p.db.task(int(tid)) if str(tid or "").isdigit() else None
                 if row is not None and row["status"] not in TERMINAL_TASK_STATES:
-                    why = f"its task #{tid} is still {row['status']}"
+                    why, held = f"its {'until-' if own_end else ''}task #{tid} is still {row['status']}", own_end
                     break
-            if not why and c.get("probe") and not trivial_probe(c) and c.get("id") not in self._reported:
-                why = "its until-probe still says not yet"
-            if why:
-                due[c["id"]] = why
+            if not held and c.get("probe") and not trivial_probe(c) and c.get("id") not in self._reported:
+                why, held = "its until-probe still says not yet", True
+            if why and (held or int(c.get("renewals") or len(c.get("auto_renewed") or [])) < rd.RENEW_MAX):
+                due[c["id"]] = (why, held)
         if not due:
             return
         done = []
@@ -2090,17 +2130,20 @@ class Probes:
                 if c.get("id") not in due or c.get("closed") or c.get("by") != self.p.name:
                     continue
                 old = float(c["expires"])
-                span = min(max(old - float(c.get("added") or old), rd.RENEW_MIN_S), rd.RENEW_MAX_S)
+                c["renew_span"] = _span(c)   # kept: each renewal is the original span, never the grown one
+                span = renew_span(c)
                 c["expires"] = max(old, now) + span
-                c.setdefault("auto_renewed", []).append({"at": now, "from": old, "why": due[c["id"]]})
+                c["renewals"] = int(c.get("renewals") or len(c.get("auto_renewed") or [])) + 1
+                c["auto_renewed"] = [*(c.get("auto_renewed") or []),
+                                     {"at": now, "from": old, "why": due[c["id"]][0]}][-RENEW_KEPT:]
                 if c.pop("page", None) is not None:
                     c["page_from"] = now   # a later expiry starts a new page episode
                 done.append(c)
             _write(LEDGER, doc)
         for c in done:
-            n = len(c["auto_renewed"])
+            n, (why, held) = c["renewals"], due[c["id"]]
             msg = (f"renewed #{c['id']} on {c['alias']} to {ends.shown(c['expires'], self.p)} "
-                   f"({n} of {rd.RENEW_MAX}): {due[c['id']]}: {c['what']}")
+                   f"({f'renewal {n}, until its end' if held else f'{n} of {rd.RENEW_MAX}'}): {why}: {c['what']}")
             self.log(f"machine change {msg}")
             with contextlib.suppress(Exception):   # the renewal stands even if its record cannot be written
                 rd.record(self.p.db, "renew", f"machine-change:{c['id']}", msg,

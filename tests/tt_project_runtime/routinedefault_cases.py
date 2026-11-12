@@ -115,3 +115,61 @@ def test_a_new_probe_stall_reruns_its_probe_and_wakes_only_if_it_still_says_not_
     progress.check(p.db, p.config(), p.base, now, current_probe=lambda t: None,
                    recheck=lambda probe, key: seen.append(probe) or 0)
     assert seen == [], "off: no re-run"
+
+
+def test_an_own_machine_change_renews_by_a_tenth_of_its_span_and_while_its_end_holds(env):
+    """Upstream note f14996ca3b6afc0d: the renewal lead is a tenth of the entry's span (10 min to 6 h); an
+    entry whose until-task is open or whose until-probe still fails renews past RENEW_MAX, each time by its
+    original span; once its task ends or its probe passed it renews no more and goes the usual way (it pages;
+    no undo runs)."""
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    from ttp import routinedefault as rd
+    p = make(env)
+    mm.add("box-a", tags="device")
+    now = time.time()
+    day = 86400.0
+    soak = p.db.add_task("soak", "s", kind="work", tier="light", origin="user")
+    long_ = ml.add_change("box-a", "fan floor for the soak", "fanctl reset", p.name, expires=now + 3 * day,
+                          until_task=soak, now=now)
+    short = ml.add_change("box-a", "pinned clocks", "clk reset", p.name, expires=now + 3600, task=soak, now=now)
+    assert ml.renew_lead(long_) == ml.RENEW_LEAD_MAX_S and ml.renew_lead(short) == ml.RENEW_LEAD_MIN_S
+    assert ml.renew_lead({"added": now, "expires": now + 20 * 3600}) == pytest.approx(2 * 3600)
+    probes = ml.Probes(p, log=lambda m: None)
+
+    def get(c):
+        return [x for x in ml.changes(open_only=False) if x["id"] == c["id"]][0]
+
+    probes._renew(now + 3 * day - 7 * 3600)   # 7 h before its end: outside the 6 h lead
+    assert "auto_renewed" not in get(long_)
+    end = now + 3 * day
+    for n in range(1, rd.RENEW_MAX + 3):   # past RENEW_MAX while its until-task is open
+        probes._renew(end - 5 * 3600)
+        got = get(long_)
+        assert got["renewals"] == n and got["expires"] == pytest.approx(end + min(3 * day, rd.RENEW_MAX_S))
+        end = got["expires"]
+    assert "until-task" in got["auto_renewed"][-1]["why"]
+    p.db.x("UPDATE tasks SET status='done' WHERE id=?", (soak,))
+    probes._tasks(end - 60)
+    probes._renew(end - 60)
+    got = get(long_)
+    assert got["renewals"] == rd.RENEW_MAX + 2 and got["task_ended"]
+    assert ml.overdue(got, end + 1) and not got.get("closed"), "past its end it pages; its undo waits"
+    # A probe that still fails keeps one renewing; its pass stops it.
+    flag = p.base / "soak-done"
+    probed = ml.add_change("box-a", "raised fan floor", "fanctl reset", p.name, expires=now + 7200,
+                           until_probe=f"test -e {flag}", now=now)
+    for _ in range(rd.RENEW_MAX + 1):
+        probes._renew(float(get(probed)["expires"]) - 60)
+    assert get(probed)["renewals"] == rd.RENEW_MAX + 1
+    assert get(probed)["expires"] - get(probed)["auto_renewed"][-1]["from"] == pytest.approx(7200)
+    with ml._locked():
+        doc = ml._read(ml.LEDGER, {})
+        next(c for c in doc["changes"] if c["id"] == probed["id"])["probe_passed"] = now
+        ml._write(ml.LEDGER, doc)
+    probes._renew(float(get(probed)["expires"]) - 60)
+    assert get(probed)["renewals"] == rd.RENEW_MAX + 1
+    # Neither an until-task nor a probe: today's bounded renewals.
+    for _ in range(rd.RENEW_MAX + 2):
+        probes._renew(float(get(short)["expires"]) - 60)
+    assert get(short)["renewals"] == rd.RENEW_MAX

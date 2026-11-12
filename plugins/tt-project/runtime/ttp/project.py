@@ -219,6 +219,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # Machines in the user's list (ttp machines) this project uses, beside those its resources and
     # shared_resources name: the change ledger, health coverage and idle capacity read only these.
     "machines": {"allowed": []},
+    # The access bridge's agent links on this host (bridgewatch.py): a link down for 2 min shows a low
+    # status line only; still down after agent_alert_grace_min, the user gets a low alert (normal
+    # past an hour). Cleared when the agent answers again.
+    "bridge": {"agent_alert_grace_min": 15},
     # model / effort, when set, override the coordinator's defaults. Unset, every coordinator turn
     # runs at coordinator.DEFAULT_EFFORT (xhigh, or the provider's highest effort below it) on
     # model_tier's model: the strongest tier's ("deep", read from the provider's tier table; "" = its

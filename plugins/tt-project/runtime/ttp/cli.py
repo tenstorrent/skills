@@ -11231,7 +11231,7 @@ def _machine_change(a) -> None:
             c = ml.edit_change(a.id, by or "user", a.what, a.undo, a.expires, a.until_probe, until_task=a.until_task,
                                where=p, auto_undo=a.auto_undo, allow_met_probe=a.allow_met_probe,
                                project=(p if p and p.name == owner else local_project(owner) or p)
-                               if a.until_probe else None, queue=queue)
+                               if a.until_probe else None, queue=queue, expires_only=a.expires_only)
         except ValueError as e:
             die(str(e))
         except OSError as e:
@@ -15876,8 +15876,11 @@ def main(argv: list[str] | None = None) -> None:
     c.add_argument("--what", help="the new text: what changed and why, one line")
     c.add_argument("--undo", help="the new command that undoes it")
     c.add_argument("--expires", help="a new end: a delay (6h, 3d) or an ISO time (home zone unless it names "
-                                     "one); with --until-probe, at the latest")
+                                     "one); with --until-probe, at the latest. Alone it moves only the time: "
+                                     "the entry keeps its until-probe or until-task (--expires-only drops them)")
     end = c.add_mutually_exclusive_group()
+    end.add_argument("--expires-only", dest="expires_only", action="store_true",
+                     help="with --expires: end at that time only, dropping the entry's until-probe or until-task")
     end.add_argument("--until-probe", dest="until_probe",
                      help="a new end: a command that exits 0 once the change should be undone; the same "
                           "one again is judged afresh; it must still fail now: edit runs it once and refuses one "

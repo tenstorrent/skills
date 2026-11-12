@@ -3952,7 +3952,8 @@ def test_machine_change_edit_stores_an_until_probe_that_cannot_run_with_a_warnin
 
 
 def test_machine_change_edit_without_an_until_probe_runs_no_probe(env, monkeypatch, capsys):
-    """Edits of the text, undo, --expires or --until-task run no probe, nor do edits of a closed or unknown id."""
+    """Edits of the text, undo, --expires or --until-task run no probe, nor do edits of a closed or unknown id.
+    --expires alone keeps the until-probe (note f14996ca3b6afc0d)."""
     from ttp import ends
     from ttp import machine_ledger as ml
     from ttp import machines as mm
@@ -3968,7 +3969,7 @@ def test_machine_change_edit_without_an_until_probe_runs_no_probe(env, monkeypat
         out, err = capsys.readouterr()
         assert out.startswith("edited ") and not err, (out, err)
     c = ml.changes()[0]
-    assert (c["what"], c["undo"], c["probe"]) == ("paused the queue", "resume-queue", None)
+    assert (c["what"], c["undo"], c["probe"]) == ("paused the queue", "resume-queue", "test -e /no/such")
     ml.close_change(1, "done", p.name)
     for cid, says in (("1", "is closed"), ("9", "no machine change #9")):
         with pytest.raises(SystemExit):
@@ -4847,3 +4848,35 @@ def test_local_address_is_never_loopback_or_a_foreign_address(env):
     from ttp import machines as mm
     assert not mm._local_address("127.0.0.1", 2) and not mm._local_address("::1", 2)
     assert not mm._local_address("192.0.2.1", 2), "TEST-NET-1 is no address of this machine"
+
+
+def test_machine_change_edit_expires_alone_keeps_its_until_probe_and_task(env, monkeypatch, capsys):
+    """Upstream note f14996ca3b6afc0d: `change edit --expires` alone moves only the time; the entry keeps its
+    until-probe or until-task. --expires-only drops them, and --help says so."""
+    from ttp import cli
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    p = make(env)
+    mm.add("box-a", tags="device")
+    now = time.time()
+    t = p.db.add_task("soak", "s", kind="work", tier="light", origin="user")
+    probed = ml.add_change("box-a", "fan floor", "fanctl reset", p.name, expires=now + 3600,
+                           until_probe="test -e /nonexistent-flag", now=now)
+    tasked = ml.add_change("box-a", "pinned clocks", "clk reset", p.name, until_task=t, now=now)
+    for c in (probed, tasked):
+        got = ml.edit_change(c["id"], p.name, expires=now + 5 * 86400, now=now + 10)
+        assert got["expires"] == pytest.approx(now + 5 * 86400)
+        assert got["probe"] == c["probe"] and got.get("until_task") == c.get("until_task")
+    got = ml.edit_change(probed["id"], p.name, expires=now + 6 * 86400, now=now + 20, expires_only=True)
+    assert got["probe"] is None and got.get("until_task") is None
+    with pytest.raises(ValueError, match="--expires-only goes with --expires"):
+        ml.edit_change(tasked["id"], p.name, until_task=t, expires_only=True)
+    monkeypatch.setenv("TTP_PROJECT", str(p.base))
+    monkeypatch.chdir(p.root)
+    cli.main(["machines", "change", "edit", str(tasked["id"]), "--expires", "2d", "--expires-only"])
+    assert [c for c in ml.changes() if c["id"] == tasked["id"]][0].get("until_task") is None
+    capsys.readouterr()
+    with pytest.raises(SystemExit):
+        cli.main(["machines", "change", "edit", "--help"])
+    out = " ".join(capsys.readouterr().out.split())
+    assert "keeps its until-probe or until-task" in out and "--expires-only" in out
