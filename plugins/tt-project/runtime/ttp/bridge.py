@@ -39,6 +39,15 @@ second forward failure in a row exits, so the service's restart pacing applies. 
 account, no untagged or interactive session, no box sshd change. `ttp setup` and upgrades re-install
 services whose command changed, so an older workstation picks this up with no step of its own.
 
+A dead agent behind a live-looking link recovers too. A session whose workstation agent died keeps
+its forwarded socket file, so a link that only checks the file looks fine while every login through
+it fails with 'Permission denied (publickey)'. The box-side loop asks the agents for their keys every
+30 s: a link whose agent does not answer while this session's does is relinked to this session's;
+this session's own agent failing twice in a row ends the session, and the wrapper reconnects
+(within about a minute of the agent dying, then bounded retries). The box's daemon checks each link
+the block names once a minute on its own (bridgewatch.py) and raises one alert per outage past
+2 minutes, naming the bridge's agent and hosts.
+
 The config is JSON (`~/.config/tt-project/bridge.json`, or --config); see
 docs/access-bridge.example.json.
 """
@@ -205,8 +214,21 @@ def _opt(key: str, value: str) -> str:
     return f'{key}="{value}"' if re.search(r"\s", value) else f"{key}={value}"
 
 
+CHECK_S = 30     # how often the box-side loop asks the agent behind the link for its keys
+AGENT_DEAD = 5   # its exit after two checks in a row found its own forwarded agent dead: the wrapper reconnects
+# `ok <socket>`: the agent there answers (ssh-add -l exits 0, or 1 with no keys); 2, a timeout or a
+# failed exchange is a dead agent. A session whose workstation agent died keeps its socket file, so
+# `-S` alone never notices.
+AGENT_OK = ("ok() { t=; command -v timeout >/dev/null 2>&1 && t='timeout 10'; "
+            'o=$(SSH_AUTH_SOCK="$1" $t ssh-add -l 2>&1); r=$?; [ $r -eq 0 ] || { [ $r -eq 1 ] && '
+            "! printf '%s' \"$o\" | grep -qiE 'error fetching|communication with agent'; }; }")
+
+
 def remote_command(cfg: dict, agent: str) -> str:
-    """Run on the box: link the forwarded agent to its stable path and stay up while it exists.
+    """Run on the box: link the forwarded agent to its stable path and stay up while it answers.
+    Every CHECK_S it asks the agents for their keys: a link whose agent does not answer while this
+    session's does is relinked here; this session's own agent failing twice in a row exits AGENT_DEAD,
+    so the wrapper reconnects (a dead agent is noticed within about a minute).
     Exit 3 when the box's sshd gave no agent (the login key's authorized_keys line forbids it), 4 when
     the link folder is not a private folder of the box account (its own, 0700, not a symlink).
     The folder and link are touched only when they change: a reconnect to the same path leaves them."""
@@ -218,7 +240,11 @@ def remote_command(cfg: dict, agent: str) -> str:
             f"umask 077; [ ! -L {d} ] || {refuse}; [ -d {d} ] || mkdir -p {d}; "
             f"{private} || chmod 700 {d} 2>/dev/null; {private} || {refuse}; "
             f'[ "$(readlink {sock} 2>/dev/null)" = "$SSH_AUTH_SOCK" ] || ln -sfn "$SSH_AUTH_SOCK" {sock} || exit 4; '
-            f'echo "ttp bridge: {agent} agent linked"; while [ -S "$SSH_AUTH_SOCK" ]; do sleep 30; done')
+            f'echo "ttp bridge: {agent} agent linked"; {AGENT_OK}; n=0; while [ -S "$SSH_AUTH_SOCK" ]; do sleep {CHECK_S}; '
+            f'if ok "$SSH_AUTH_SOCK"; then n=0; [ "$(readlink {sock} 2>/dev/null)" = "$SSH_AUTH_SOCK" ] || ok {sock} || '
+            f'{{ ln -sfn "$SSH_AUTH_SOCK" {sock} && echo "ttp bridge: {agent} agent relinked (the link\'s agent did not answer)"; }}; '
+            f'else n=$((n+1)); [ $n -lt 2 ] || {{ echo "ttp bridge: {agent} forwarded agent stopped answering; reconnecting" >&2; '
+            f'exit {AGENT_DEAD}; }}; fi; done')
 
 
 def ssh_argv(cfg: dict, box: str, agent: str, ssh: str | None = None) -> list[str]:

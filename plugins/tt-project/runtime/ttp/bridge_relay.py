@@ -25,6 +25,10 @@ computer's tag for the same box and agent (this computer's session for them has 
 such a session has no live peer here): SIGTERM, then SIGKILL after 5 s. It never uses sudo and
 leaves untagged, interactive and other accounts' sessions alone. The session then starts again at
 once; a second forward failure in a row exits nonzero, so the service's own restart pacing applies.
+
+When the box-side loop finds this session's forwarded agent dead (exit 5: two failed `ssh-add -l`
+in a row, 30 s apart), the session reconnects after 5, 20, then 60 s; a fourth dead agent within
+10 min of the last exits, so the service's restart pacing applies.
 """
 from __future__ import annotations
 
@@ -149,6 +153,9 @@ FORWARD_FAILED = "remote port forwarding failed"
 TAG = "ttp-bridge-tag="
 CLEAN_TIMEOUT = 45
 STEADY_S = 60   # a session that stayed up this long starts a fresh count of forward failures
+AGENT_DEAD = 5  # the box-side loop's exit when this session's forwarded agent stopped answering (bridge.py)
+AGENT_RETRY_S = (5, 20, 60)   # reconnects after a dead agent, then the service's own restart pacing
+AGENT_STEADY_S = 600   # a session that stayed up this long starts a fresh count of dead-agent reconnects
 
 # On the box (POSIX sh; ss, else /proc): $1 the tag prefix, then the ports. Prints `ended <port>
 # <pid> <age s>` per session it ends and `kept <port> <pid> <why>` per listener it leaves.
@@ -263,6 +270,13 @@ def session(ssh: list[str], state: dict) -> tuple[int, bool]:
     return child.wait(), failed
 
 
+def wait(seconds: float, state: dict) -> None:
+    """Sleep, ending early once the service is stopped."""
+    end = time.monotonic() + seconds
+    while not state["stop"] and time.monotonic() < end:
+        time.sleep(min(1.0, end - time.monotonic()))
+
+
 def main(argv: list[str]) -> int:
     tag = ""
     if argv[:1] == ["--tag"] and len(argv) > 1:
@@ -296,12 +310,24 @@ def main(argv: list[str]) -> int:
         if not tag:
             state["child"] = subprocess.Popen(ssh)
             return state["child"].wait()
-        prefix, ports, cleaned = f"{computer_id(d)}/{tag}/", forward_ports(ssh), False
+        prefix, ports, cleaned, dead = f"{computer_id(d)}/{tag}/", forward_ports(ssh), False, 0
         while True:
             t0 = time.monotonic()
             rc, failed = session(tagged(ssh, prefix + secrets.token_hex(4)), state)
             if time.monotonic() - t0 >= STEADY_S:
                 cleaned = False
+            if time.monotonic() - t0 >= AGENT_STEADY_S:
+                dead = 0
+            if rc == AGENT_DEAD and not state["stop"]:
+                if dead >= len(AGENT_RETRY_S):
+                    print("ttp bridge: the forwarded agent died again after each reconnect; exiting (the service "
+                          "restarts the session)", file=sys.stderr, flush=True)
+                    return rc
+                print(f"ttp bridge: the forwarded agent stopped answering; reconnecting in {AGENT_RETRY_S[dead]}s",
+                      file=sys.stderr, flush=True)
+                wait(AGENT_RETRY_S[dead], state)
+                dead += 1
+                continue
             if state["stop"] or rc != 255 or not failed or not ports:
                 return rc
             if cleaned:

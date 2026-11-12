@@ -2365,6 +2365,7 @@ class Daemon:
         self._run_step(self.trip_model_routing)
         self._run_step(self.watch_run_classes)
         self._run_step(self.watch_cli_versions)
+        self._run_step(self.watch_bridge_agents)
         self._run_step(self.reap_locks)
         self._run_step(self.reap_task_records)
         self._run_step(lambda: configwho.watch(self.p), "config_breakage")   # a config change that broke the checks
@@ -4852,6 +4853,17 @@ class Daemon:
                 log(self.p, f"claude mcp list: unknown ({e.get('error')})")
         self._mcp_probe = threading.Thread(target=work, daemon=True, name="mcp-probe")
         self._mcp_probe.start()
+
+    def watch_bridge_agents(self) -> None:
+        """Model-free, about once a minute: each agent link an access bridge registered in this account's
+        ssh config still answers; one normal alert per outage past 2 min, cleared on recovery (bridgewatch.py)."""
+        from . import bridgewatch
+        now = time.time()
+        if now - getattr(self, "_bridge_watched", 0.0) < bridgewatch.EVERY_S or (
+                os.environ.get("PYTEST_CURRENT_TEST") and not os.environ.get("TTP_TEST_BRIDGE_WATCH")):
+            return   # daemons under test never read the real ssh config
+        self._bridge_watched = now
+        bridgewatch.check(self, now)
 
     def watch_cli_versions(self, every_s: float = 600) -> None:
         """Model-free: report each finished live row this project's daemon started (one observation per row
@@ -21278,7 +21290,7 @@ class Daemon:
         """The per-user claim key of a condition every project on this machine sees alike: a
         logged-out CLI, a lost VPN or network sign-in (netwait), linger off (downtime), or a low disk on the filesystem the
         guard found short. None otherwise."""
-        if key.startswith(("auth:", "account-mismatch:")) or key in (netwait.KEY, downtime.LINGER_KEY, "notifier", "gh-auth",
+        if key.startswith(("auth:", "account-mismatch:", "bridge-agent:")) or key in (netwait.KEY, downtime.LINGER_KEY, "notifier", "gh-auth",
                                                                      "model-ranking-key"):
             return f"{hostname()}|{key}"
         if key == "disk":

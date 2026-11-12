@@ -3969,6 +3969,15 @@ Workers can read Slack links you paste, using your Slack connector if you have o
     No sudo, no other account's process, no sshd config change. `status --deep` names a port held by a
     stale session. `ttp setup` and the upgrade re-install bridge services whose command changed, so
     nothing needs running by hand on the workstation.
+  - A dead agent behind a live-looking link recovers too. Every 30 s the session asks its forwarded
+    agent and the link's agent for their keys (`ssh-add -l`; exit 2 or a failed exchange is dead).
+    A link whose agent is dead while the session's answers is relinked at once; the session's own
+    agent failing twice in a row (within about a minute) ends the session, which reconnects after
+    5 s, then 20 s and 60 s, and then leaves the restart to the supervisor. On the box, the daemon checks
+    each link the bridge registered about once a minute; one down for 2 minutes raises one alert
+    at normal severity per outage, naming the agent and its hosts and saying the workstation's
+    bridge reconnects by itself once that workstation is awake and online. It clears when the
+    agent answers again. The box never relinks a link itself.
   - The session's own login key must be allowed to forward an agent: an `authorized_keys` line with
     `restrict` and no `agent-forwarding` gives none (`doctor` says so). Name a key that may forward
     under `login`.

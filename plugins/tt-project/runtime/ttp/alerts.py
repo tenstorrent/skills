@@ -58,6 +58,7 @@ LOGOUT_REMIND_S = (3600.0, 4 * 3600.0, 12 * 3600.0)   # a logout is reminded thi
 WAITER_TTL = 1800.0     # a project's report into a logout claim counts this long (it renews every few minutes)
 # What the chat hears once an episode clears.
 CLEARED_TEXT = {
+    "bridge-agent": "The access bridge's {arg} agent on this host answers again.",
     "budget": "Budget for {arg}: no dollar cap or spend limit holds new work any more.",
     "lock-wait": "Nobody has waited long on lock {arg} any more.",
     "lock-cycle": "The lock-order cycle {arg} broke: a party let go, the others go on.",
@@ -123,7 +124,7 @@ CLEARED_SEVERITY = {"network": "low", "paused": "low", "fleethold": "low", "coor
 # pause-gone: an open machine-ledger entry resumes a project pause that is gone (pausegone.py); the entry
 # closing or the pause coming back clears it.
 STATUS_CONDITIONS = ("budget", "limit", "deploy", "deploy-behind", "deploy-pending", "daemon-hang", "account-mismatch",
-                     "tick-step", "chat-silent", "lock-wait", "pause-gone", "push_no_batch")
+                     "tick-step", "chat-silent", "lock-wait", "pause-gone", "push_no_batch", "bridge-agent")
 
 
 def _urgent(severity: str | None) -> bool:
@@ -319,6 +320,9 @@ def holds(db: DB, key: str, since: float, now: float) -> bool:
         return bool(db.kv("linger_off"))
     if key == "gh-auth":   # Daemon.check_gh_auth keeps the flag while the host's gh is logged out
         return bool(db.kv("gh_auth_down"))
+    if kind == "bridge-agent":   # the access bridge's agent link here still fails (bridgewatch.check)
+        from . import bridgewatch
+        return bridgewatch.holds(db, arg)
     if kind == "ssh-agent":   # a sighting within sshagent.QUIET_S
         from . import sshagent
         return sshagent.holds(db)
@@ -368,7 +372,7 @@ def _checkable(key: str) -> bool:
                                          "push_rejected", "after_push_failed", "push_queue_dying", "push_not_landing", "push_no_batch", "push_tip_failing", "push_target_unreachable", "push_script_torn", "push_setup_fault",
                                          "push_scope", "heal",
                                          "heal-hold", "machine", "machine-change", "network", "deploy", "deploy-behind", "deploy-pending", "redeploy", "daemon-hang", "paused", "fleethold",
-                                         "coord-budget", "account-mismatch", "linger-off", "tick-step", "pause-gone", "notifier", "chat-silent", "user-step", "slurm-paused", "gh-auth", "ssh-agent")
+                                         "coord-budget", "account-mismatch", "linger-off", "tick-step", "pause-gone", "notifier", "chat-silent", "user-step", "slurm-paused", "gh-auth", "ssh-agent", "bridge-agent")
 
 
 def _since(ep: dict) -> float:

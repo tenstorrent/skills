@@ -637,7 +637,7 @@ def test_bridge_box_link_is_touched_only_on_change_and_fails_closed(tmp_path):
     agent = socket.socket(socket.AF_UNIX)
     agent.bind(str(tmp_path / "a.sock"))
     remote = bridge.remote_command(_bridge_cfg(), "auto")
-    assert remote.count("ln -sfn") == 1 and 'readlink "$HOME/.ssh/tt-agent/auto.sock"' in remote
+    assert remote.split("while [")[0].count("ln -sfn") == 1 and 'readlink "$HOME/.ssh/tt-agent/auto.sock"' in remote
     link_part = remote.split("while [")[0] + "true"   # without the stay-up loop
     run = lambda: _box_sh(home, link_part, SSH_AUTH_SOCK=str(tmp_path / "a.sock"))
     d = home / ".ssh" / "tt-agent"
@@ -731,6 +731,9 @@ step = json.load(open(os.path.join(d, 'plan.json')))[sum(1 for c in calls if 'tt
 if step == 'fwd':
     sys.stderr.write('Error: remote port forwarding failed for listen port 2301\\n')
     sys.exit(255)
+if step == 'agentdead':
+    sys.stderr.write('ttp bridge: auto forwarded agent stopped answering; reconnecting\\n')
+    sys.exit(5)
 if step == 'auth':
     sys.stderr.write('user@box-a: Permission denied (publickey).\\n')
     sys.exit(255)
@@ -873,3 +876,132 @@ def test_bridge_refresh_reinstalls_a_service_whose_command_changed(tmp_path, mon
     assert bridge.installed_argv("box-1", "auto", "linux") == new
     monkeypatch.setenv("TTP_TEST_NO_BRIDGE_REFRESH", "1")
     assert bridge.refresh("darwin", conf) == []
+
+
+# --- a dead agent behind a live-looking link (box loop, wrapper reconnect, host watch) --------------
+# A stub ssh-add answers by marker files next to the socket it is asked about: <sock>.dead (exit 2),
+# <sock>.fetch (exit 1, a failed exchange), <sock>.empty (exit 1, no keys). No real agent or key.
+
+_STUB_SSH_ADD = """#!/bin/sh
+t=$SSH_AUTH_SOCK
+[ -L "$t" ] && t=$(readlink "$t")
+[ -e "$t.dead" ] && { echo "Could not open a connection to your authentication agent." >&2; exit 2; }
+[ -e "$t.fetch" ] && { echo "error fetching identities: communication with agent failed" >&2; exit 1; }
+[ -e "$t.empty" ] && { echo "The agent has no identities."; exit 1; }
+echo "256 SHA256:stub test (ED25519)"
+"""
+
+
+def _stub_agents(tmp_path, *names):
+    """A stub ssh-add first on PATH, and a listening Unix socket per agent name."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    (bin_dir / "ssh-add").write_text(_STUB_SSH_ADD)
+    (bin_dir / "ssh-add").chmod(0o755)
+    socks = []
+    for n in names:
+        s = socket.socket(socket.AF_UNIX)
+        s.bind(str(tmp_path / f"{n}.sock"))
+        s.listen(1)
+        socks.append(s)
+    return f"{bin_dir}:{os.environ.get('PATH', '/usr/bin:/bin')}", socks
+
+
+def _box_loop(tmp_path, monkeypatch, own, linked):
+    """The box side's stay-up loop with a link already pointing at `linked` (its first link step off)."""
+    from ttp import bridge
+    monkeypatch.setattr(bridge, "CHECK_S", 0.1)
+    home = tmp_path / "box-home"
+    d = home / ".ssh" / "tt-agent"
+    d.mkdir(parents=True)
+    d.chmod(0o700)
+    os.symlink(tmp_path / f"{linked}.sock", d / "auto.sock")
+    remote = bridge.remote_command(_bridge_cfg(), "auto").replace("ln -sfn", "true", 1)
+    path, socks = _stub_agents(tmp_path, own, linked)
+    proc = subprocess.Popen(["sh", "-c", remote], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            env={"HOME": str(home), "PATH": path, "SSH_AUTH_SOCK": str(tmp_path / f"{own}.sock")})
+    return proc, d / "auto.sock", socks
+
+
+def _wait_for(cond, timeout=15.0):
+    end = time.time() + timeout
+    while time.time() < end:
+        if cond():
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def test_bridge_box_loop_relinks_a_dead_link_and_exits_when_its_own_agent_dies(tmp_path, monkeypatch):
+    # cells: box-relink, box-own-dead
+    from ttp import bridge
+    (tmp_path / "old.sock.dead").touch()   # an earlier session's link whose agent died
+    proc, ln, _socks = _box_loop(tmp_path, monkeypatch, "mine", "old")
+    try:
+        assert _wait_for(lambda: os.readlink(ln) == str(tmp_path / "mine.sock"))
+        (tmp_path / "mine.sock.fetch").touch()   # exit 1 with a failed exchange is a dead agent too
+        rc = proc.wait(timeout=15)
+    finally:
+        proc.kill()
+    out, err = proc.communicate()
+    assert rc == bridge.AGENT_DEAD and "relinked" in out and "stopped answering; reconnecting" in err
+
+
+def test_bridge_box_loop_leaves_a_link_whose_agent_answers(tmp_path, monkeypatch):
+    # cells: box-live-kept
+    (tmp_path / "newer.sock.empty").touch()   # a newer session's live agent, holding no keys
+    proc, ln, _socks = _box_loop(tmp_path, monkeypatch, "mine", "newer")
+    try:
+        time.sleep(1.0)   # about ten checks
+        assert proc.poll() is None and os.readlink(ln) == str(tmp_path / "newer.sock")
+    finally:
+        proc.kill()
+        proc.communicate(timeout=5)
+
+
+def test_bridge_dead_agent_reconnects_with_bounded_retries(tmp_path, monkeypatch, capfd):
+    # cells: relay-reconnect, relay-bounded
+    from ttp import bridge_relay
+    monkeypatch.setattr(bridge_relay, "AGENT_RETRY_S", (0, 0, 0))
+    argv = _fake_relay_ssh(tmp_path / "s", ["agentdead", "ok"])
+    rc = bridge_relay.main(["--tag", "box-a/auto", str(tmp_path / "relay" / "box-a.auto"), "--", *argv])
+    calls = _calls(tmp_path / "s")
+    assert rc == 0 and len(calls) == 2 and not any("ttp-bridge-clean" in c[-1] for c in calls)
+    assert "stopped answering; reconnecting" in capfd.readouterr().err
+    argv = _fake_relay_ssh(tmp_path / "t", ["agentdead"] * 5)
+    rc = bridge_relay.main(["--tag", "box-a/auto", str(tmp_path / "relay" / "box-a.auto"), "--", *argv])
+    assert rc == bridge_relay.AGENT_DEAD and len(_calls(tmp_path / "t")) == 4
+    assert "died again after each reconnect" in capfd.readouterr().err
+
+
+def test_bridge_host_watch_alerts_by_name_after_two_minutes_and_clears(env, tmp_path, monkeypatch):
+    # cells: host-alert, host-clear, host-quiet
+    from ttp import alerts, bridge, bridgewatch
+    from ttp.daemon import Daemon
+    path, _socks = _stub_agents(tmp_path, "auto")
+    monkeypatch.setenv("PATH", path)
+    link = str(tmp_path / "auto.sock")
+    cfg = tmp_path / "ssh-config"
+    cfg.write_text(f"Host other\n  IdentityAgent {tmp_path / 'elsewhere.sock'}\n\n{bridge.BEGIN}\n\n"
+                   f"Host build-a ba\n  HostName 127.0.0.1\n  IdentityAgent {link}\n\n"
+                   f"Host build-b\n  IdentityAgent {link}\n{bridge.END}\n")
+    assert bridgewatch.links(cfg.read_text()) == {link: ["build-a", "ba", "build-b"]}
+    p = make(env)
+    d = Daemon(p.base)
+    key = "bridge-agent:auto"
+    now = time.time()
+    assert bridgewatch.check(d, now, cfg) == [] and not p.db.q("SELECT id FROM alerts")   # answers: quiet
+    (tmp_path / "auto.sock.dead").touch()
+    assert bridgewatch.check(d, now + 60, cfg) == []   # down under 2 min: no alert yet
+    assert bridgewatch.check(d, now + 181, cfg) == [key]
+    eps = p.db.q("SELECT * FROM alerts WHERE key=?", (key,))
+    assert len(eps) == 1 and eps[0]["cleared"] is None and eps[0]["severity"] == "normal"
+    assert "build-a, ba, build-b" in eps[0]["text"] and "reconnects by itself" in eps[0]["text"]
+    assert "127.0.0.1" not in eps[0]["text"] and "VPN" not in eps[0]["text"]
+    assert alerts.holds(p.db, key, now + 181, now + 200)
+    assert bridgewatch.check(d, now + 300, cfg) == []   # once per outage
+    assert len(p.db.q("SELECT id FROM alerts WHERE key=?", (key,))) == 1
+    (tmp_path / "auto.sock.dead").unlink()
+    assert bridgewatch.check(d, now + 360, cfg) == []
+    assert p.db.one("SELECT cleared FROM alerts WHERE key=?", (key,))["cleared"]
+    assert not alerts.holds(p.db, key, now + 181, now + 400)
